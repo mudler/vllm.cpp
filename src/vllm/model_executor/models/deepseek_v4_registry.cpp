@@ -27,8 +27,11 @@
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
@@ -125,25 +128,220 @@ const ModelFactory kDeepseekV4Factory{
 
 v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
                                         int num_blocks) {
-  // STUB (W3): V4's TRUE KV topology is the fp8_ds_mla UE8M0 576B-paged latent
-  // (attention.py:89) PLUS the DSA indexer/compressor caches — a multi-cache
-  // geometry not yet representable. We emit ONE placeholder MLA group sized to
-  // the compressed latent + rope so the arch RESOLVES and the spec builder is
-  // wired; the real topology (and the indexer/compressor caches) is a named W3
-  // residual. Never exercised this pass — the forward VT_CHECKs pending.
+  // KV-DSV4-MULTICACHE W2 (#1973): the REAL topology, replacing the one
+  // placeholder `"mla"` group this function used to emit.
+  //
+  // DeepSeek-V4 publishes one cache per (layer x cache role), not one per
+  // layer. Four upstream construction sites produce them, and for
+  // DeepSeek-V4-Flash's 43 layers they resolve to 167 entries in SEVEN groups
+  // (one group per distinct published spec, which is upstream's own grouping
+  // rule):
+  //
+  //   (a) `DeepseekV4Attention.get_kv_cache_spec` — the compressed MLA latent,
+  //       `MLAAttentionSpec`, on the 41 layers with compress_ratio > 1 and
+  //       `None` on the other two (`vllm/models/deepseek_v4/attention.py:626-645`).
+  //       Splits by ratio: 21 at C4A, 20 at C128A.
+  //   (b) `DeepseekV4IndexerCache.get_kv_cache_spec` — the indexer key cache,
+  //       `MLAAttentionSpec`, on the 21 layers with ratio == 4 (`:669-684`),
+  //       built at `k_cache_head_dim` bytes rather than a semantic width
+  //       (`:751-760`).
+  //   (c) `DeepseekV4SWACache.get_kv_cache_spec` — the sliding-window cache,
+  //       `SlidingWindowMLASpec`, on ALL 43 attention layers including the two
+  //       that have no MLA cache at all
+  //       (`vllm/v1/attention/backends/mla/sparse_swa.py:87-102`, constructed
+  //       unconditionally at `attention.py:315-321`).
+  //   (d) `CompressorStateCache.get_kv_cache_spec` — the compressor state,
+  //       `SlidingWindowMLASpec`, f32, once per compressor
+  //       (`vllm/models/deepseek_v4/compressor.py:188-200`). TWO populations:
+  //       the attention layer's own compressor (41, `attention.py:333-343`,
+  //       head_dim 512) and the indexer's (21, `attention.py:768-777`,
+  //       head_dim 128). The attention population splits by ratio into 21 + 20.
+  //
+  // 21 + 20 + 21 + 43 + 21 + 21 + 20 = 167.
+  //
+  // NOTHING CONSUMES THIS. No runner allocates any of these groups and
+  // `DeepseekV4Model::Forward` still discards `attn_kv`; the runner REFUSES a
+  // group it cannot allocate (`src/vllm/v1/worker/gpu/runner.cpp`, #1973)
+  // rather than dropping it in silence, so a DeepSeek-V4 engine now refuses to
+  // construct instead of allocating a subset of this topology and saying
+  // nothing. Carrying the groups is row KV-DSV4-MULTICACHE W3; reading them is
+  // W5. Both are tracked under #1925 and listed under `## Owed` in
+  // `.agents/specs/kv-dsv4-multicache.md`.
   const DeepseekV4Params p = ParseDeepseekV4Params(config);
-  // Placeholder latent width: the wkv-compressed KV (num_key_value_heads * 512
-  // rows in the checkpoint) is head-independent for MLA; use head_dim + rope as
-  // an honest per-page upper bound until the fp8_ds_mla geometry lands.
-  const int head_size =
-      static_cast<int>(p.head_dim + p.qk_rope_head_dim);  // 512 + 64 = 576 (W3 TODO)
+
+  // THE fp8_ds_mla ARM, and why it is published unconditionally.
+  // `DeepseekV4Attention.use_fp8_ds_mla_layout` is `ClassVar[bool] = True` on
+  // the base (`attention.py:140`); only the FlashInfer-sparse SM120 subclass
+  // sets it False (`vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:163`).
+  // `_resolve_dsv4_kv_cache_dtype` then writes `cache_config.cache_dtype =
+  // "fp8_ds_mla"` back onto the cache config and returns `torch.uint8`
+  // (`attention.py:89-119`), so the DEFAULT DeepSeek-V4 cache format upstream
+  // is fp8_ds_mla and that is the arm mirrored here. Our factory signature
+  // carries no cache dtype and `ParseCacheDType` refuses the string by name
+  // (`include/vllm/v1/kv_cache_dtype.h:87-90`), so the 512B-aligned plain
+  // bf16/fp8 arm is NOT published — owed to W5 with the store path.
+  const std::string kCacheDtypeStr = "fp8_ds_mla";
+  const std::string kModelVersion = "deepseek_v4";
+  constexpr int kAlignment = 576;   // `sparse_swa.py:99`, `attention.py:642`
+  constexpr int kSwaBlockSize = 64; // `sparse_swa.py:82`, fixed by tensor sharing
+  // 1-byte storage, mirroring upstream's `torch.uint8`. `SizeOf(kI8) == 1` is
+  // what the indexer's element formula needs; the 584-byte branch does not read
+  // the dtype at all.
+  const vt::DType kByteDType = vt::DType::kI8;
+
+  // `get_kv_quant_mode(cache_dtype)` returns FP8_PER_TENSOR for any string
+  // starting with "fp8" (`vllm/v1/kv_cache_interface.py:70-71`), and upstream
+  // passes it on EXACTLY TWO of the four sites: the SWA cache
+  // (`sparse_swa.py:100`) and the compressed latent (`attention.py:644`). The
+  // indexer key cache and the compressor state pass nothing and default to
+  // NONE. Mirrored exactly, including the asymmetry — which is also what makes
+  // this topology exercise W1's branch order, since those two specs carry a
+  // non-NONE quant mode AND `cache_dtype_str == "fp8_ds_mla"` and must reach
+  // the 584-byte branch before the quant-mode guard throws.
+  const v1::KVQuantMode kLatentQuantMode = v1::KVQuantMode::kFp8PerTensor;
+
+  // The published module path, which is what `LayerIndexOfName`
+  // (`src/vllm/v1/worker/gpu/runner.cpp`) resolves back to a layer index once
+  // W3 reads these names. THE SEGMENT IS `attn`, NOT `self_attn`:
+  // `DeepseekV4DecoderLayer` builds its attention as `prefix=f"{prefix}.attn"`
+  // (`vllm/models/deepseek_v4/nvidia/model.py:808-813`) under
+  // `prefix=f"{prefix}.layers"` (`:1015`) and `maybe_prefix(prefix, "model")`
+  // (`:1409`). Every other architecture in this tree spells it `self_attn`, so
+  // this is worth stating rather than pattern-matching.
+  const auto attn_prefix = [](int64_t l) {
+    return "model.layers." + std::to_string(l) + ".attn";
+  };
+
+  // Per-group layer-name lists, filled by ONE walk over the layers.
+  std::vector<std::string> c4a_latent, c128a_latent, indexer_key, swa;
+  std::vector<std::string> c4_attn_state, c4_indexer_state, c128_attn_state;
+  bool has_c4 = false, has_c128 = false;
+
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    // `max(1, config.compress_ratios[layer_id])` — upstream's own guard, and
+    // the value every downstream branch tests against (`attention.py:205-212`).
+    // Our parser keeps the raw 0 for layers 0 and 1.
+    const int64_t raw = p.compress_ratio(l);
+    const int64_t ratio = raw < 1 ? 1 : raw;
+    VT_CHECK(ratio == 1 || ratio == 4 || ratio == 128,
+             std::string("deepseek-v4 kv-cache: unsupported compress_ratio ") +
+                 std::to_string(ratio) + " on layer " + std::to_string(l) +
+                 "; upstream accepts 1, 4 or 128 only "
+                 "(vllm/v1/attention/backends/mla/sparse_swa.py:44-55)");
+
+    // (c) Every attention layer has a SWA cache, unconditionally.
+    swa.push_back(attn_prefix(l) + ".swa_cache");
+
+    if (ratio == 1) continue;  // `attention.py:626-630` returns None: no MLA cache.
+
+    // (a) The compressed latent. `head_size = self.head_dim` (512) — NOT
+    // head_dim + rope, which is what the placeholder this replaces used.
+    (ratio == 4 ? c4a_latent : c128a_latent).push_back(attn_prefix(l));
+    // (d) The attention layer's own compressor state.
+    (ratio == 4 ? c4_attn_state : c128_attn_state)
+        .push_back(attn_prefix(l) + ".compressor.state_cache");
+    if (ratio == 4) {
+      has_c4 = true;
+      // (b) + (d) The indexer's key cache and its own compressor state.
+      indexer_key.push_back(attn_prefix(l) + ".indexer.k_cache");
+      c4_indexer_state.push_back(attn_prefix(l) +
+                                 ".indexer.compressor.state_cache");
+    } else {
+      has_c128 = true;
+    }
+  }
+
+  // `storage_block_size` is `block_size / compress_ratio`, so a block size that
+  // is not a multiple of the ratio gives a truncated page and one that is
+  // smaller than the ratio gives a ZERO-byte page. Upstream has no such check
+  // because its own comments derive the whole geometry at 256
+  // (`sparse_swa.py:76-83` and `compressor.py:174-178` both spell
+  // `[256//4, head_dim] = [64, head_dim]`). Refuse by name rather than publish
+  // a pool that cannot hold a token.
+  const auto check_ratio_fits = [&](int ratio) {
+    VT_CHECK(block_size % ratio == 0 && block_size / ratio >= 1,
+             std::string("deepseek-v4 kv-cache: block_size ") +
+                 std::to_string(block_size) +
+                 " cannot express a compress_ratio-" + std::to_string(ratio) +
+                 " page (storage_block_size = block_size / compress_ratio "
+                 "would be " + std::to_string(block_size / ratio) +
+                 "). Upstream derives this geometry at block_size 256 "
+                 "(vllm/v1/attention/backends/mla/sparse_swa.py:76-83, "
+                 "vllm/models/deepseek_v4/compressor.py:174-178)");
+  };
+  if (has_c4) check_ratio_fits(4);
+  if (has_c128) check_ratio_fits(128);
+
+  // `head_dim bytes = 128 fp8 + 4 fp32 scale = 132` (`attention.py:756-759`),
+  // with `quant_block_size = 128` (`:738`). The MXFP4 68-byte arm is selected by
+  // `attention_config.use_fp4_indexer_cache`, whose default is False
+  // (`vllm/config/attention.py:64`), so the FP8 width is the default and the
+  // other arm is owed to W5.
+  constexpr int64_t kIndexerQuantBlock = 128;
+  const int indexer_head_size = static_cast<int>(
+      p.index_head_dim + p.index_head_dim / kIndexerQuantBlock * 4);
+
+  const int head_size = static_cast<int>(p.head_dim);              // 512
+  const int swa_window = static_cast<int>(p.sliding_window);       // 128
+
+  // `state_dim = 2 * coff * head_dim` with `coff = 1 + (compress_ratio == 4)`,
+  // `sliding_window = coff * compress_ratio`, and block_size 4 for ratio 4 / 8
+  // for ratio 128 (`compressor.py:168-200`). dtype is f32, which upstream
+  // asserts (`:170`).
+  const int c4_attn_state_dim = static_cast<int>(2 * 2 * p.head_dim);        // 2048
+  const int c4_indexer_state_dim = static_cast<int>(2 * 2 * p.index_head_dim);  // 512
+  const int c128_state_dim = static_cast<int>(2 * 1 * p.head_dim);           // 1024
 
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"mla"},
-      std::make_shared<v1::MLAAttentionSpec>(block_size, head_size,
-                                             v1::ResolveKvCacheDType()));
+
+  const auto add_mla = [&](std::vector<std::string> names, int hs, int ratio,
+                           bool ds_mla_layout) {
+    if (names.empty()) return;
+    kv.kv_cache_groups.emplace_back(
+        std::move(names),
+        std::make_shared<v1::MLAAttentionSpec>(
+            block_size, hs, kByteDType, /*num_kv_heads=*/1,
+            ds_mla_layout ? kLatentQuantMode : v1::KVQuantMode::kNone,
+            /*page_size_padded=*/std::nullopt,
+            /*indexes_kv_by_block_stride=*/false,
+            ds_mla_layout ? std::optional<std::string>(kCacheDtypeStr)
+                          : std::nullopt,
+            kAlignment, ratio,
+            ds_mla_layout ? std::optional<std::string>(kModelVersion)
+                          : std::nullopt));
+  };
+  const auto add_swa_mla = [&](std::vector<std::string> names, int bs, int hs,
+                               vt::DType dt, int window, bool ds_mla_layout) {
+    if (names.empty()) return;
+    kv.kv_cache_groups.emplace_back(
+        std::move(names),
+        std::make_shared<v1::SlidingWindowMLASpec>(
+            bs, /*num_kv_heads=*/1, hs, dt, window,
+            ds_mla_layout ? std::optional<std::string>(kCacheDtypeStr)
+                          : std::nullopt,
+            kAlignment, /*compress_ratio=*/1,
+            ds_mla_layout ? std::optional<std::string>(kModelVersion)
+                          : std::nullopt,
+            ds_mla_layout ? kLatentQuantMode : v1::KVQuantMode::kNone));
+  };
+
+  // Group order is ours and is documented rather than incidental: the
+  // `MLAAttentionSpec` groups first (latent by ratio, then the indexer key),
+  // then the `SlidingWindowMLASpec` groups (SWA, then the three compressor
+  // state populations).
+  add_mla(std::move(c4a_latent), head_size, /*ratio=*/4, /*ds_mla_layout=*/true);
+  add_mla(std::move(c128a_latent), head_size, /*ratio=*/128, true);
+  add_mla(std::move(indexer_key), indexer_head_size, /*ratio=*/4,
+          /*ds_mla_layout=*/false);
+  add_swa_mla(std::move(swa), kSwaBlockSize, head_size, kByteDType, swa_window,
+              /*ds_mla_layout=*/true);
+  add_swa_mla(std::move(c4_attn_state), /*bs=*/4, c4_attn_state_dim,
+              vt::DType::kF32, /*window=*/8, /*ds_mla_layout=*/false);
+  add_swa_mla(std::move(c4_indexer_state), /*bs=*/4, c4_indexer_state_dim,
+              vt::DType::kF32, /*window=*/8, /*ds_mla_layout=*/false);
+  add_swa_mla(std::move(c128_attn_state), /*bs=*/8, c128_state_dim,
+              vt::DType::kF32, /*window=*/128, /*ds_mla_layout=*/false);
   return kv;
 }
 

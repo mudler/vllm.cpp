@@ -29,9 +29,14 @@ bool NameHasSuffix(const std::string& name, std::string_view suffix) {
   return name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-// The staged size of one tensor: `min(gguf_bytes, elems * model_dtype_bytes)`.
-// See the header for why the minimum is the defensible term.
-size_t StagedBytes(const GgufTensorInfo& t, size_t model_dtype_bytes) {
+// The staged size of one tensor. `min(gguf_bytes, elems * model_dtype_bytes)`
+// unless `policy_forces_full_expand` is set — see the header on
+// `GgufStagedWeightFootprint` for why that condition makes `min` unnecessary
+// rather than merely optional: `RouteGgufTensor`'s totality guarantee leaves
+// `kExpandBf16` as the only possible residency for every tensor once it holds,
+// whatever the tensor's role, dtype or shape.
+size_t StagedBytes(const GgufTensorInfo& t, size_t model_dtype_bytes,
+                   bool policy_forces_full_expand) {
   size_t elems = 1;
   for (const int64_t d : t.shape) {
     if (d <= 0) {  // A malformed dim cannot be reasoned about; contribute the
@@ -41,8 +46,10 @@ size_t StagedBytes(const GgufTensorInfo& t, size_t model_dtype_bytes) {
     elems *= static_cast<size_t>(d);
   }
   // The expanded size, when it is knowable. `elems == 0` means the shape was
-  // unusable, and then the on-disk size is the only defensible term.
+  // unusable, and then the on-disk size is the only defensible term even under
+  // a forced-expand policy: there is no expanded size to charge instead.
   const size_t expanded = elems == 0 ? t.nbytes : elems * model_dtype_bytes;
+  if (elems != 0 && policy_forces_full_expand) return expanded;
   return expanded < t.nbytes ? expanded : t.nbytes;
 }
 
@@ -94,7 +101,8 @@ bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
 
 GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
                                               size_t model_dtype_bytes,
-                                              const StreamedExpertLane& lane) {
+                                              const StreamedExpertLane& lane,
+                                              bool policy_forces_full_expand) {
   GgufStagedFootprint out;
   for (const GgufTensorInfo& t : gguf.Tensors()) {
     // W0d: a tensor the slot lane serves is never staged, so it contributes
@@ -103,10 +111,12 @@ GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
     // left out and how much of it there was.
     if (NameHasSuffix(t.name, lane.tensor_name_suffix)) {
       ++out.streamed_tensor_count;
-      out.streamed_bytes += StagedBytes(t, model_dtype_bytes);
+      out.streamed_bytes +=
+          StagedBytes(t, model_dtype_bytes, policy_forces_full_expand);
       continue;
     }
-    const size_t staged = StagedBytes(t, model_dtype_bytes);
+    const size_t staged =
+        StagedBytes(t, model_dtype_bytes, policy_forces_full_expand);
     out.lower_bound_bytes += staged;
     ++out.tensor_count;
     if (staged > out.largest_tensor_bytes) {
@@ -147,7 +157,8 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      bool needs_weight_staging,
                                      size_t budget_bytes,
                                      size_t model_dtype_bytes,
-                                     const StreamedExpertLane& lane) {
+                                     const StreamedExpertLane& lane,
+                                     bool policy_forces_full_expand) {
   DeviceWeightFit fit;
   fit.budget_bytes = budget_bytes;
   // A platform that does not stage weights reads them where they already are, so
@@ -159,8 +170,8 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
   // reported a budget would break every device whose budget nothing probes.
   if (budget_bytes == 0) return fit;
 
-  const GgufStagedFootprint fp =
-      GgufStagedWeightFootprint(gguf, model_dtype_bytes, lane);
+  const GgufStagedFootprint fp = GgufStagedWeightFootprint(
+      gguf, model_dtype_bytes, lane, policy_forces_full_expand);
   fit.needed_bytes = fp.lower_bound_bytes;
   if (fp.lower_bound_bytes <= budget_bytes) return fit;
 
@@ -188,6 +199,26 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
       "--offload-config '{\"vllm_cpp\":{\"device_fit\":"
       "{\"weight_budget_bytes\":0}}}', suppresses this refusal "
       "and restores that late failure; it does not make the model fit.";
+  // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870). `policy_forces_full_expand` means
+  // EVERY tensor in the figure above is charged its expanded size because
+  // `RouteGgufTensor` cannot produce anything else with every residency flag
+  // off — most commonly `VT_GGUF_KEEP_QUANT=0` on a device with no keep-f16 or
+  // native-fp4 arm, which is #1870's reproduced case. Named explicitly, per
+  // that issue, rather than left for the operator to infer from the byte
+  // counts alone: turning keep-quant back on is the one knob among the ones
+  // this message already lists that would actually SHRINK the footprint
+  // instead of merely suppressing the refusal.
+  if (policy_forces_full_expand) {
+    fit.message +=
+        " NOTE: VT_GGUF_KEEP_QUANT=0 (or an equivalent absence of any "
+        "residency-shrinking flag on this device) forced EVERY tensor above "
+        "to its expanded size — there is no keep-quant, keep-f16 or native-fp4 "
+        "arm active, so RouteGgufTensor's residency decision leaves no other "
+        "outcome. Unlike VT_DEVICE_WEIGHT_BUDGET_BYTES, re-enabling one of "
+        "those (VT_GGUF_KEEP_QUANT=1, when this device registers "
+        "kMatmulBTQuant) shrinks the figure above instead of merely "
+        "suppressing this refusal.";
+  }
   // W0d. With the lane ON the message above is misleading in its most important
   // sentence — the device streaming lane is exactly what IS running — so the
   // correction is appended rather than left to be read as a stale claim. The

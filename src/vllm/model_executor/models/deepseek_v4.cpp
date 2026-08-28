@@ -130,6 +130,13 @@ struct V4Backend {
   // `VT_V4_GROUPED_MOE=0` rolls back to the per-expert GemmRowSlice loop. The CPU
   // grouped provider loops the same kMatmulBTQuant kernel ⇒ byte-identical.
   bool grouped_moe = true;
+  // MODEL-DSV4-EXL3 W2. The TP1-coalesced EXL3 routed-expert tower, when the
+  // load took that arm. Non-null makes MoeBlock dispatch the routed experts
+  // through `vt::Exl3Gemm` instead of the host/keep-quant GEMMs; the ROUTER and
+  // the SHARED expert are unaffected, because the SparkInfer artifact
+  // re-quantized the routed experts ONLY (its `carried-*` shards keep everything
+  // else as the source `deepseek_v4_fp8` tensors).
+  const DeepseekV4Exl3Weights* exl3 = nullptr;
 };
 
 // Drain the queue's stream after a keep-quant GEMM. This host-orchestrated GGUF
@@ -638,6 +645,105 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 }
 
 // ── 512-wide MLA attention block (W3 + W4 primitives) : [T,H] -> [T,H] ────────
+// #1970 — THE LENGTH CHECK THE DSA PATH NEVER HAD.
+//
+// `AttentionBlock` indexes the DSA tensors at the COLLAPSED synthetic geometry:
+// `comp_wgate` as [head_dim, hidden_size], `comp_ape` as [compress_ratio,
+// head_dim], `idx_wq` as [index_n_heads*index_head_dim, hidden_size], `idx_wk`
+// as [index_head_dim, hidden_size]. Since #1970 the EXL3 loader materializes
+// them at the width the REAL artifact stores — upstream's
+// `coff = 1 + (compress_ratio == 4)` (vllm/models/deepseek_v4/compressor.py:247-248)
+// — so the two can now disagree.
+//
+// AND A DISAGREEMENT HERE IS ANONYMOUS, NOT SILENT. Be exact about what this
+// buys, because overstating it is the defect #1964 was filed for. `Gemm`'s host
+// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:413`
+// is a plain `VT_CHECK`, a throw rather than an `assert`, so `NDEBUG` does not
+// remove it — and its keep-quant arm checks the shape too. A [2*head_dim,
+// hidden_size] weight read at a [head_dim, hidden_size] stride therefore does NOT
+// produce a plausible wrong number. It throws
+//
+//     vt: MatVec weight size mismatch at deepseek_v4.cpp:413
+//
+// which names no tensor, no layer, no geometry and no missing capability, from
+// the middle of a forward, on a checkpoint that loaded successfully.
+//
+// So this is a DIAGNOSTICS improvement, and that is the whole of it: it replaces
+// an anonymous crash with a precise named refusal, listing EVERY mismatched
+// tensor with both counts and naming the composition that is missing. It is not
+// the difference between wrong tokens and a refusal, and it must not be described
+// as one.
+//
+// EVERY mismatch is collected and reported together, not just the first. A
+// refusal that stopped at the first would make the remaining checks
+// unfalsifiable: deleting any one of them would still throw on an earlier one,
+// so a mutation could not tell a live check from a dead one.
+void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
+                                const DeepseekV4Params& p, int64_t layer,
+                                bool is_comp, bool is_indexer) {
+  const int64_t H = p.hidden_size;
+  const int64_t hd = p.head_dim;
+  std::string bad;
+  auto want = [&](const char* tensor, const char* indexed_as, size_t got,
+                  int64_t expect) {
+    if (static_cast<int64_t>(got) == expect) return;
+    bad += "\n    - attn." + std::string(tensor) + ": this forward indexes it as " +
+           indexed_as + " = " + std::to_string(expect) +
+           " elements, the checkpoint carries " + std::to_string(got);
+  };
+  if (is_comp) {
+    const int64_t cr = p.compress_ratio(layer);
+    want("compressor.ape", "[compress_ratio, head_dim]", L.comp_ape.size(), cr * hd);
+    want("compressor.wgate.weight", "[head_dim, hidden_size]", L.comp_wgate.size(),
+         hd * H);
+    want("compressor.norm.weight", "[head_dim]", L.comp_norm_weight.size(), hd);
+  }
+  if (is_indexer) {
+    const int64_t inh = p.index_n_heads;
+    const int64_t ihd = p.index_head_dim;
+    want("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
+         L.idx_wq.size(), inh * ihd * H);
+    want("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
+         L.idx_wk.size(), ihd * H);
+    want("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
+         L.idx_wproj.size(), inh * H);
+  }
+  VT_CHECK(
+      bad.empty(),
+      std::string("DeepseekV4 forward: REFUSING the DSA path on layer ") +
+          std::to_string(layer) +
+          " — the checkpoint carries this layer's DSA tensors at a geometry this "
+          "forward does not implement. Reading the widened `comp_wgate` at the "
+          "width it DOES index throws an anonymous `MatVec weight size mismatch` "
+          "from inside the forward (deepseek_v4.cpp:413) that names none of this. "
+          "(That is the message the REAL geometry produces, because `comp_wgate`'s "
+          "Gemm runs first. A `comp_ape`- or `comp_norm_weight`-only mismatch "
+          "instead throws `ape size mismatch` / `rms_weight size mismatch` from "
+          "CompressorSaveScoreApe / CompressorPoolNorm "
+          "(deepseek_v4_compressor.cpp:23,54) — equally anonymous.) Refusing on:" + bad +
+          "\n  WHAT IS MISSING: upstream's DSA composition. The extra width is "
+          "`coff = 1 + (compress_ratio == 4)` "
+          "(vllm/models/deepseek_v4/compressor.py:247-248), and its two halves "
+          "are the two OVERLAPPING compression windows a token belongs to — a "
+          "role a row acquires only relative to the window gathering it "
+          "(common/ops/fused_compress_quant_cache.py:164-183), never recoverable "
+          "from the tensor alone. Reaching it needs the coff-overlapped window "
+          "with head_offset role selection, emission at boundary tokens only "
+          "((position + 1) % compress_ratio == 0) into a SEPARATE compressed KV "
+          "cache beside a sliding-window raw cache, and the indexer's query "
+          "projected from `qr` (q_lora_rank) instead of the hidden state "
+          "(vllm/models/deepseek_v4/attention.py:721-726, :835). None of that is "
+          "implemented here, and dense MLA is NOT a substitute for it at any "
+          "sequence length "
+          "(https://github.com/mudler/vllm.cpp/issues/1964).\n"
+          "  The loader accepts this geometry ON PURPOSE, so every NON-DSA "
+          "capability of the artifact is reachable rather than blocked behind a "
+          "path none of them use (MODEL-DSV4-EXL3 option C, "
+          "https://github.com/mudler/vllm.cpp/issues/1970). The DSA port itself "
+          "is OWED and has no owning row — see "
+          ".agents/specs/dsv4-dsa-loader-accept-forward-refuse.md `## Owed`.");
+}
+
 std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
                                   const DeepseekV4GgufLayerWeights* Lq,
                                   const DeepseekV4Params& p,
@@ -670,6 +776,13 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const bool dsa_dense = (be.gguf != nullptr);
   const bool is_indexer = p.has_indexer(layer) && !dsa_dense;
   const bool is_comp = p.has_compressor(layer) && !dsa_dense;
+
+  // Gated on the predicates above, so it fires only where this forward is about
+  // to READ one of these tensors. A layer that does not enter the DSA path reads
+  // none of them, and the GGUF arm (`dsa_dense`) enters it on no layer at all —
+  // so that arm's behaviour is byte for byte unchanged by #1970, and its own
+  // separate defect stays owed under #1964.
+  RequireDsaGeometryOrRefuse(L, p, layer, is_comp, is_indexer);
 
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
@@ -890,8 +1003,244 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
 }
 
 // ── DeepSeek-V4 MoE block (W6 primitives) : [T,H] -> [T,H] ────────────────────
+// ── MODEL-DSV4-EXL3 W2: ONE routed-expert projection through the trellis GEMM ──
+//
+// `vt::Exl3Gemm` is the fused chain (input Hadamard + sign/scale, the trellis
+// matmul, output Hadamard + sign/scale) — the whole EXL3 linear in one op, which
+// is what upstream's own `LinearEXL3.forward` is (`exl3.py:114-139`). It is
+// dispatched on the QUEUE's device, so a CPU queue runs the portable arm and a
+// CUDA queue runs the ported kernels through the same call.
+//
+// FP16 IN AND OUT, and the row's spec says why: upstream's default output dtype
+// is `torch.half` (`exl3.py:72`) and the tensor-core fragments leave `A` no
+// choice at all. The surrounding V4 composition is f32, so this converts at the
+// boundary rather than widening the kernel — which is exactly the "dtype too
+// wide" defect a token gate cannot see (AGENTS.md, "Inherit vLLM defaults").
+//
+// THE DEVICE-RESIDENCY GATE. `DeepseekV4Exl3Linear` holds HOST vectors: W1b
+// coalesces TP4 -> TP1 into host owner buffers, and making the destination
+// device-resident is recorded under the row's `## Owed`. Handing a host pointer
+// to a CUDA kernel is the #844 / #1435 crash, so a non-CPU queue is admitted
+// ONLY when its backend reports `DeviceMemoryIsHostAddressable()`; otherwise the
+// arm refuses BY NAME and says which item owes the fix. It never silently
+// dereferences.
+std::vector<float> Exl3Linear(const V4Backend& be, const DeepseekV4Exl3Linear& lin,
+                              const float* xin, int64_t k, int64_t n) {
+  VT_CHECK(lin.in_features == k && lin.out_features == n,
+           "deepseek-v4 exl3: expert linear is [" + std::to_string(lin.in_features) + "," +
+               std::to_string(lin.out_features) + "] but the block needs [" +
+               std::to_string(k) + "," + std::to_string(n) + "]");
+  vt::Queue* q = be.q;
+  vt::Queue local{};
+  bool own_local = false;
+  if (q == nullptr) {
+    local = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+    own_local = true;
+    q = &local;
+  }
+  if (q->device.type != vt::DeviceType::kCPU) {
+    VT_CHECK(vt::GetBackend(q->device).DeviceMemoryIsHostAddressable(),
+             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies "
+             "each TP1 linear into a host owner buffer) and this device cannot dereference "
+             "host pointers. The device-resident tower is MODEL-DSV4-EXL3's owed "
+             "'Real-checkpoint residency for the coalesced tower'; run the EXL3 arm on a "
+             "CPU queue until it lands.");
+  }
+  const vt::Device dev = q->device;
+
+  std::vector<uint16_t> a(static_cast<size_t>(k));
+  for (int64_t i = 0; i < k; ++i) a[static_cast<size_t>(i)] = vt::F32ToF16(xin[i]);
+  std::vector<uint16_t> a_had(static_cast<size_t>(k), 0);
+  std::vector<uint16_t> c(static_cast<size_t>(n), 0);
+
+  vt::Tensor ta = vt::Tensor::Contiguous(a.data(), vt::DType::kF16, dev, {1, k});
+  vt::Tensor tah = vt::Tensor::Contiguous(a_had.data(), vt::DType::kF16, dev, {1, k});
+  vt::Tensor tc = vt::Tensor::Contiguous(c.data(), vt::DType::kF16, dev, {1, n});
+  vt::Tensor tb = vt::Tensor::Contiguous(
+      const_cast<uint16_t*>(lin.trellis.data()), vt::DType::kI8, dev,
+      {k / 16, n / 16, 32 * static_cast<int64_t>(lin.bits)});
+  vt::Tensor tsuh =
+      vt::Tensor::Contiguous(const_cast<uint16_t*>(lin.suh.data()), vt::DType::kF16, dev, {k});
+  vt::Tensor tsvh =
+      vt::Tensor::Contiguous(const_cast<uint16_t*>(lin.svh.data()), vt::DType::kF16, dev, {n});
+
+  vt::Exl3GemmArgs args;
+  args.bits = lin.bits;
+  args.codebook = 1;  // mcg; the loader refuses any other marker by name
+  vt::Exl3Gemm(*q, tc, ta, tb, tsuh, tsvh, tah, args);
+  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
+  if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+
+  std::vector<float> out(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::F16ToF32(c[static_cast<size_t>(i)]);
+  return out;
+}
+
+// Process-cached read of `VT_DSV4_EXL3_FUSED_MOE` (default ON; a '0'-leading
+// value falls back to the per-expert loop). The parse itself lives in the header
+// as `Dsv4Exl3FusedMoeFlagIsOn` so it is unit-testable without touching the
+// environment; only the one getenv is here, read once per process the way every
+// other `VT_*` knob on this model is.
+bool Dsv4Exl3FusedMoe() {
+  static const bool on = Dsv4Exl3FusedMoeFlagIsOn(std::getenv("VT_DSV4_EXL3_FUSED_MOE"));
+  return on;
+}
+
+// ── MODEL-DSV4-EXL3 W2d: the fused routed-expert pass ────────────────────────
+//
+// `vt::Exl3MoeMlp` replaces `3 * topk * T` `vt::Exl3Gemm` calls with one. Its
+// arguments are upstream's (`exl3_moe.cu:99-137`) and everything host-side —
+// the bincount, the grouping, the active-expert count — comes from
+// `vt::Exl3MoeSortTokensByExpert`, which is pure and gated in
+// `tests/vt/test_exl3_moe.cpp`.
+//
+// THE ACTIVATION IS vLLM's. `Exl3MoeAct::kSiluAndMulClamp` clamps BEFORE the
+// silu, which is `SiluAndMulWithClamp` (`activation.py:197-201`) and is what
+// every other arm of this model computes; upstream's own `kSilu` clamps after.
+// See `.agents/specs/model-dsv4-exl3.md` `## W2cd design` W2d-2 for the number.
+//
+// THE DEVICE-RESIDENCY GATE is the same one `Exl3Linear` carries and for the
+// same reason: the coalesced tower is HOST-resident, and the fused kernel
+// dereferences the per-expert pointer tables on the device.
+//
+// Returns a per-expert flag: 1 where the fused arm accumulated that expert's
+// contribution into `out`, 0 where the caller still owes it. Empty means the
+// pass did not run at all.
+std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3LayerWeights& Le,
+                                   const DeepseekV4Params& p, const std::vector<float>& x,
+                                   const MoeRouteResult& route, int64_t T, int64_t H, int64_t mi,
+                                   int64_t topk, float lim, std::vector<float>* out) {
+  const int64_t ne = static_cast<int64_t>(Le.experts.size());
+  if (ne == 0 || T == 0) return {};
+
+  vt::Queue* q = be.q;
+  vt::Queue local{};
+  bool own_local = false;
+  if (q == nullptr) {
+    local = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+    own_local = true;
+    q = &local;
+  }
+  if (q->device.type != vt::DeviceType::kCPU &&
+      !vt::GetBackend(q->device).DeviceMemoryIsHostAddressable()) {
+    VT_CHECK(false,
+             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies each "
+             "TP1 linear into a host owner buffer) and this device cannot dereference host "
+             "pointers. The device-resident tower is MODEL-DSV4-EXL3's owed 'Real-checkpoint "
+             "residency for the coalesced tower'; run the EXL3 arm on a CPU queue until it "
+             "lands.");
+  }
+  const vt::Device dev = q->device;
+
+  // The nine per-expert pointer tables. Every expert must agree on shape and
+  // bit width, because the tables carry ONE `K` per projection: a tower that
+  // disagreed would decode some expert with another's width, and that is a
+  // wrong number rather than a crash.
+  std::vector<int64_t> g_tr(ne), g_su(ne), g_sv(ne), u_tr(ne), u_su(ne), u_sv(ne), d_tr(ne),
+      d_su(ne), d_sv(ne);
+  const DeepseekV4Exl3Expert& e0 = Le.experts[0];
+  for (int64_t e = 0; e < ne; ++e) {
+    const DeepseekV4Exl3Expert& xe = Le.experts[static_cast<size_t>(e)];
+    VT_CHECK(xe.w1.in_features == H && xe.w1.out_features == mi &&
+                 xe.w3.in_features == H && xe.w3.out_features == mi &&
+                 xe.w2.in_features == mi && xe.w2.out_features == H,
+             "deepseek-v4 exl3: expert " + std::to_string(e) +
+                 " does not have this layer's [H, mi] shape");
+    VT_CHECK(xe.w1.bits == e0.w1.bits && xe.w3.bits == e0.w3.bits && xe.w2.bits == e0.w2.bits,
+             "deepseek-v4 exl3: the fused MoE op carries ONE bit width per projection "
+             "(exl3_moe.cu:114-116) and expert " + std::to_string(e) + " disagrees");
+    const size_t i = static_cast<size_t>(e);
+    g_tr[i] = reinterpret_cast<int64_t>(xe.w1.trellis.data());
+    g_su[i] = reinterpret_cast<int64_t>(xe.w1.suh.data());
+    g_sv[i] = reinterpret_cast<int64_t>(xe.w1.svh.data());
+    u_tr[i] = reinterpret_cast<int64_t>(xe.w3.trellis.data());
+    u_su[i] = reinterpret_cast<int64_t>(xe.w3.suh.data());
+    u_sv[i] = reinterpret_cast<int64_t>(xe.w3.svh.data());
+    d_tr[i] = reinterpret_cast<int64_t>(xe.w2.trellis.data());
+    d_su[i] = reinterpret_cast<int64_t>(xe.w2.suh.data());
+    d_sv[i] = reinterpret_cast<int64_t>(xe.w2.svh.data());
+  }
+
+  const int64_t assignments = T * topk;
+  std::vector<int64_t> expert_count(static_cast<size_t>(ne + 1), 0);
+  std::vector<int64_t> token_sorted(static_cast<size_t>(assignments), 0);
+  std::vector<uint16_t> weight_sorted(static_cast<size_t>(assignments), 0);
+  const int64_t max_rows = vt::kExl3MoeTempRowsFused;
+  // `MoeRouteResult::topk_ids` is i32 and upstream's `selected_experts` is i64
+  // (torch long, `exl3_moe.cu:158`). Widening `assignments` ints per layer is
+  // the cheap side of that mismatch; narrowing the op would put a second
+  // convention on a surface that already has upstream's.
+  std::vector<int64_t> ids64(static_cast<size_t>(assignments));
+  for (int64_t i = 0; i < assignments; ++i)
+    ids64[static_cast<size_t>(i)] = route.topk_ids[static_cast<size_t>(i)];
+  const int num_active = vt::Exl3MoeSortTokensByExpert(
+      ids64.data(), route.topk_weights.data(), T, topk, ne, max_rows,
+      expert_count.data(), token_sorted.data(), weight_sorted.data());
+
+  std::vector<char> taken(static_cast<size_t>(ne), 0);
+  for (int64_t e = 0; e < ne; ++e)
+    taken[static_cast<size_t>(e)] =
+        (expert_count[static_cast<size_t>(e)] > 0 &&
+         expert_count[static_cast<size_t>(e)] <= max_rows)
+            ? 1
+            : 0;
+  if (num_active == 0) return taken;  // nothing fused; every expert stays owed
+
+  std::vector<uint16_t> hidden(static_cast<size_t>(T * H));
+  for (int64_t i = 0; i < T * H; ++i)
+    hidden[static_cast<size_t>(i)] = vt::F32ToF16(x[static_cast<size_t>(i)]);
+
+  // One group. `Exl3MoeMaxConcurrency` sizes a DEVICE launch's buffer count, and
+  // sizing for it here would allocate `concurrency` copies of a staging tower
+  // per layer per step. Widening this is part of the owed device-resident
+  // tower, not of this wave.
+  std::vector<uint16_t> st_g(static_cast<size_t>(max_rows * H), 0);
+  std::vector<uint16_t> st_u(st_g.size(), 0);
+  std::vector<uint16_t> in_g(static_cast<size_t>(max_rows * mi), 0);
+  std::vector<uint16_t> in_u(in_g.size(), 0);
+
+  vt::Tensor t_out = vt::Tensor::Contiguous(out->data(), vt::DType::kF32, dev, {T, H});
+  vt::Tensor t_hid = vt::Tensor::Contiguous(hidden.data(), vt::DType::kF16, dev, {T, H});
+  auto pt = [&](std::vector<int64_t>& v) {
+    return vt::Tensor::Contiguous(v.data(), vt::DType::kI64, dev, {ne});
+  };
+  vt::Tensor tg1 = pt(g_tr), tg2 = pt(g_su), tg3 = pt(g_sv);
+  vt::Tensor tu1 = pt(u_tr), tu2 = pt(u_su), tu3 = pt(u_sv);
+  vt::Tensor td1 = pt(d_tr), td2 = pt(d_su), td3 = pt(d_sv);
+  vt::Exl3MoeExpertTables tables{&tg1, &tg2, &tg3, &tu1, &tu2, &tu3, &td1, &td2, &td3};
+
+  vt::Tensor t_cnt =
+      vt::Tensor::Contiguous(expert_count.data(), vt::DType::kI64, dev, {ne + 1});
+  vt::Tensor t_tok =
+      vt::Tensor::Contiguous(token_sorted.data(), vt::DType::kI64, dev, {assignments});
+  vt::Tensor t_wgt =
+      vt::Tensor::Contiguous(weight_sorted.data(), vt::DType::kF16, dev, {assignments});
+  vt::Exl3MoeRouting routing{&t_cnt, &t_tok, &t_wgt};
+
+  vt::Tensor s_g = vt::Tensor::Contiguous(st_g.data(), vt::DType::kF16, dev, {1, max_rows, H});
+  vt::Tensor s_u = vt::Tensor::Contiguous(st_u.data(), vt::DType::kF16, dev, {1, max_rows, H});
+  vt::Tensor i_g = vt::Tensor::Contiguous(in_g.data(), vt::DType::kF16, dev, {1, max_rows, mi});
+  vt::Tensor i_u = vt::Tensor::Contiguous(in_u.data(), vt::DType::kF16, dev, {1, max_rows, mi});
+  vt::Exl3MoeTemps temps{&s_g, &s_u, &i_g, &i_u};
+
+  vt::Exl3MoeArgs args;
+  args.bits_gate = e0.w1.bits;
+  args.bits_up = e0.w3.bits;
+  args.bits_down = e0.w2.bits;
+  args.codebook = 1;  // mcg; the loader refuses any other marker by name
+  args.act = vt::Exl3MoeAct::kSiluAndMulClamp;
+  args.act_limit = lim;
+  args.num_active = num_active;
+  vt::Exl3MoeMlp(*q, t_out, t_hid, tables, routing, temps, args);
+  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
+  if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+  (void)p;
+  return taken;
+}
+
 std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
                             const DeepseekV4GgufLayerWeights* Lq,
+                            const DeepseekV4Exl3LayerWeights* Le,
                             const DeepseekV4Params& p, const std::vector<float>& x,
                             const std::vector<int32_t>& token_ids, int64_t layer,
                             V4Miswire miswire, V4ForwardTrace* trace, const V4Backend& be) {
@@ -904,6 +1253,19 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   const bool cfg_hash = p.is_hash_layer(layer);
   const bool hash_route = cfg_hash && miswire != V4Miswire::kAllLayersGated;
   const bool kq = be.gguf != nullptr && Lq != nullptr;
+  // MODEL-DSV4-EXL3 W1c. Neither keep-quant source: the routed experts must then
+  // be in the f32 host tower, and this is the ONE state where they can be absent
+  // — an EXL3 load leaves `exp_w*` empty on purpose, because its routed experts
+  // are the trellis tower. `expert_f32` below indexes those vectors with no
+  // length check, so without this the reachability mutation that deletes the
+  // EXL3 dispatch reads freed memory instead of failing. A refusal is the
+  // verdict; a segfault is not one.
+  VT_CHECK(kq || Le != nullptr || !L.exp_w1.empty(),
+           "DeepseekV4 MoE: no routed-expert weights for this layer. Neither the "
+           "GGUF keep-quant tower nor an EXL3 trellis tower was supplied, and the "
+           "f32 host tower's `exp_w1` is empty. An EXL3 load populates the trellis "
+           "tower and leaves `exp_w*` empty by design (MODEL-DSV4-EXL3 W1c), so "
+           "reaching here over one means the EXL3 dispatch was not taken.");
 
   // router gating logits [T, ne] (keep-quant moe_gate).
   const std::vector<float> gating =
@@ -957,6 +1319,26 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   };
 
   std::vector<float> out(static_cast<size_t>(T) * H, 0.0f);
+
+  // ── MODEL-DSV4-EXL3 W2d: the FUSED routed-expert pass, hoisted out of the
+  //    per-token loop because that is the shape the op has. ONE `vt::Exl3MoeMlp`
+  //    covers every routed expert of every token in this block, where the W2b
+  //    arm below costs one `vt::Exl3Gemm` per (token, expert, projection) —
+  //    `3 * topk * T` calls against one.
+  //
+  //    `exl3_fused_expert[e]` records which experts the fused arm took, so the
+  //    loop below skips exactly those and still runs the rest. That is not a
+  //    fallback bolted on: it is upstream's own arrangement
+  //    (`block_sparse_mlp.py:1141,1151-1156`), because the fused kernel declines
+  //    an expert with more tokens than the temp buffers hold.
+  //    The `!kq` is the token loop's OWN branch order (`if (kq) ... else if (Le
+  //    != nullptr) ...`) restated here, so a load that somehow carried both a
+  //    keep-quant tower and a trellis tower cannot have its routed experts
+  //    accumulated twice.
+  std::vector<char> exl3_fused_expert;
+  if (!kq && Le != nullptr && Dsv4Exl3FusedMoe())
+    exl3_fused_expert = Exl3FusedMoePass(be, *Le, p, x, route, T, H, mi, topk, lim, &out);
+
   for (int64_t t = 0; t < T; ++t) {
     const std::vector<float> x1(x.begin() + t * H, x.begin() + (t + 1) * H);
     const bool dbg = std::getenv("VT_DUMP_ACT") != nullptr && t == 0;
@@ -1050,6 +1432,32 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
         }
         std::fprintf(stderr, "  [moe L%02lld] shared_rms=%.3f routed_rms=%.3f wmax=%.3f expert_out_rmax=%.3f\n",
                      static_cast<long long>(layer), sh_r, std::sqrt(rt_r / H), wmax, eo_rmax);
+      }
+    } else if (Le != nullptr) {
+      // ── MODEL-DSV4-EXL3 W2: the routed experts are EXL3 trellis linears and
+      //    run through `vt::Exl3Gemm`, one call per (expert, projection). That
+      //    is the "first slice loops the dense GEMM per active expert" shape the
+      //    row's `## Work breakdown` allows before the fused `exl3_moe.cu` mgemm
+      //    (W2d, owed). The SHARED expert and the router stay on the host tower,
+      //    because the SparkInfer artifact re-quantized the ROUTED experts only.
+      const std::vector<float> sh = expert_f32(L.shared_w1.data(), L.shared_w3.data(),
+                                               L.shared_w2.data(), &x[t * H]);
+      for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += sh[static_cast<size_t>(hh)];
+      for (int64_t j = 0; j < topk; ++j) {
+        const int64_t e = route.topk_ids[t * topk + j];
+        const float w = route.topk_weights[t * topk + j];
+        VT_CHECK(e >= 0 && e < static_cast<int64_t>(Le->experts.size()),
+                 "deepseek-v4 exl3: routed expert id out of range for the trellis tower");
+        // Already accumulated by the fused pass above. The loop still owns every
+        // expert the fused arm declined, which is what makes it upstream's tail
+        // path rather than dead code behind a flag.
+        if (!exl3_fused_expert.empty() && exl3_fused_expert[static_cast<size_t>(e)] != 0) continue;
+        const DeepseekV4Exl3Expert& xe = Le->experts[static_cast<size_t>(e)];
+        const std::vector<float> g = Exl3Linear(be, xe.w1, &x[t * H], H, mi);
+        const std::vector<float> u = Exl3Linear(be, xe.w3, &x[t * H], H, mi);
+        const std::vector<float> act = swiglu(g, u);
+        const std::vector<float> eo = Exl3Linear(be, xe.w2, act.data(), mi, H);
+        for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += w * eo[static_cast<size_t>(hh)];
       }
     } else {
       // f32 host path (unchanged): pure host Dot, no device queue / sync.
@@ -2026,11 +2434,19 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
   if (kq_src)
     VT_CHECK(static_cast<int64_t>(be.gguf->layers.size()) == nlayers,
              "deepseek-v4 keep-quant: gguf layer count mismatch");
+  const bool exl3_src = be.exl3 != nullptr;
+  if (exl3_src)
+    VT_CHECK(static_cast<int64_t>(be.exl3->layers.size()) == nlayers,
+             "deepseek-v4 exl3: trellis layer count mismatch");
 
   for (int64_t layer = 0; layer < nlayers; ++layer) {
     const DeepseekV4LayerHostWeights& L = hw.layers[static_cast<size_t>(layer)];
     const DeepseekV4GgufLayerWeights* Lq =
         kq_src ? &be.gguf->layers[static_cast<size_t>(layer)] : nullptr;
+    // MODEL-DSV4-EXL3 W2: the routed-expert trellis tower for this layer, when
+    // the load took the EXL3 arm.
+    const DeepseekV4Exl3LayerWeights* Le =
+        exl3_src ? &be.exl3->layers[static_cast<size_t>(layer)] : nullptr;
 
     // ── attn sub-block MHC-pre: first layer BROADCAST-expands [T,H] -> [T,hc,H];
     //    subsequent layers fuse MhcPost(prev-ffn-out) + MhcPre(attn) (model.py:878-933).
@@ -2092,7 +2508,7 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
       char nm[64]; std::snprintf(nm, sizeof(nm), "ours_moein_L%02lld", static_cast<long long>(layer));
       DumpAct(nm, Slice(x, 0, H));
     }
-    x = MoeBlock(L, Lq, p, x, token_ids, layer, miswire, trace, be);
+    x = MoeBlock(L, Lq, Le, p, x, token_ids, layer, miswire, trace, be);
     if (std::getenv("VT_DUMP_ACT") != nullptr) {
       double rm = 0, rp = 0;
       for (int64_t h = 0; h < H; ++h) { rm += x[h] * x[h]; rp += x_pre_moe[h] * x_pre_moe[h]; }
@@ -2290,7 +2706,7 @@ std::vector<float> DeepseekV4MtpDraftLogitsHost(
       res_mix[t * hc * hc + i] = pre.comb_mix[static_cast<size_t>(i)];
     for (int64_t h = 0; h < H; ++h) x[t * H + h] = pre.layer_input[static_cast<size_t>(h)];
   }
-  x = MoeBlock(L, /*Lq=*/nullptr, p, x, input_ids, mtp_layer, V4Miswire::kNone,
+  x = MoeBlock(L, /*Lq=*/nullptr, /*Le=*/nullptr, p, x, input_ids, mtp_layer, V4Miswire::kNone,
                /*trace=*/nullptr, be);
 
   // 5. compute_logits: final MhcPost -> mw.hc_head collapse -> shared norm -> lm_head
@@ -2551,6 +2967,33 @@ void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
   }
 }
 
+// MODEL-DSV4-EXL3 W2. The forward over an EXL3 load: the routed experts come
+// from the trellis tower through `vt::Exl3Gemm`, everything else from the same
+// composition every other source uses. This is what makes the tower REACHABLE —
+// before W2, `LoadDeepseekV4Exl3` coalesced a tower nothing consumed and a
+// forward refused through a `has_host_weights` guard whose message did not even
+// name this row.
+static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights,
+                                                vt::Queue& queue,
+                                                const std::vector<int32_t>& token_ids,
+                                                const std::vector<int32_t>& positions,
+                                                const std::vector<int32_t>& logits_indices) {
+  VT_CHECK(weights.has_exl3_weights,
+           "DeepseekV4ForwardExl3: no EXL3 tower (the load did not take that arm)");
+  // W1b's EXL3-specific `has_host_weights` refusal stood HERE and is DELETED as
+  // dead (#1923, `## W1c design` W1c-5). It was already unreachable on the
+  // default path — the runner's default `gather` routes to `ForwardDevice`,
+  // whose generic `kHostPending` check fires first — and W1c makes it
+  // unreachable on every path: `LoadDeepseekV4Exl3` is the only arm that sets
+  // `has_exl3_weights`, and it now materializes the carried tower and sets
+  // `has_host_weights` in the same function before returning, so
+  // `has_exl3_weights && !has_host_weights` cannot come out of a load.
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.exl3 = &weights.exl3;
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
+                            V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
 std::vector<float> DeepseekV4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
@@ -2558,6 +3001,12 @@ std::vector<float> DeepseekV4Model::Forward(
     vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
   (void)attn_meta;
   (void)attn_kv;
+  // EXL3 source: the routed experts are trellis linears and dispatch through the
+  // W2 kernels. Checked FIRST because an EXL3 load carries no GGUF tower and its
+  // refusals must name this row rather than the generic host-tower one.
+  if (weights.has_exl3_weights) {
+    return DeepseekV4ForwardExl3(weights, queue, token_ids, positions, logits_indices);
+  }
   // GGUF source: consume the keep-quant tower (memory-bounded — no ~1 TiB f32
   // tower). Safetensors/NVFP4 + the tiny-synthetic gate: the f32 host oracle.
   if (weights.has_gguf_weights) {
@@ -2626,10 +3075,15 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
   VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending);
-  std::vector<float> flat = ForwardComposeImpl(
-      weights.host, weights.params, token_ids, positions, logits_indices,
-      V4Miswire::kNone, /*trace=*/nullptr,
-      V4Backend{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr});
+  // MODEL-DSV4-EXL3 W2: the device entry point routes the routed experts through
+  // the same trellis op rather than carrying a second policy. `Exl3Linear`
+  // refuses BY NAME when the queue's device cannot dereference the host-resident
+  // tower, which is the owed residency item and not a silent wrong number.
+  V4Backend dev_be{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr};
+  if (weights.has_exl3_weights) dev_be.exl3 = &weights.exl3;
+  std::vector<float> flat =
+      ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
+                         V4Miswire::kNone, /*trace=*/nullptr, dev_be);
   const int64_t vocab = weights.params.vocab_size;
   const int64_t rows =
       vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;

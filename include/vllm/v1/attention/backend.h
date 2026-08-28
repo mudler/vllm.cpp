@@ -141,6 +141,18 @@ struct CommonAttentionMetadata {
   // T0 uses the scalar form only).
   bool causal = true;
 
+  // SPEC-DFLASH2 W10 (#1857): the step's uniform speculative verify length,
+  // CLASSIFIED onto the decode attention class by `SpecAsDecodeQueryLen`
+  // below, or 0. Set by the runner off `GraphEligibleQueryLen`'s answer (the
+  // verified uniform width: uniform by arithmetic AND every request verifying
+  // at exactly q-1 drafts), never derived from shape inside a kernel -- a
+  // ragged batch can alias a uniform product (2 requests at lengths 1+3 sum
+  // like 2x2). Mirrors the upstream polarity: the metadata builder owns the
+  // reorder-threshold decode split (backend.py:718-736 @ b389ac2946) and the
+  // kernels trust the metadata. 0 on every non-verify step keeps every
+  // existing consumer byte-identical.
+  int uniform_spec_query_len = 0;
+
   // Upstream: self.seq_lens.shape[0].
   int batch_size() const { return static_cast<int>(seq_lens.size()); }
 
@@ -148,6 +160,49 @@ struct CommonAttentionMetadata {
   // assumes a query ends where the next one starts.
   std::vector<int32_t> naive_query_lens() const;
 };
+
+// ─── spec-as-decode (SPEC-DFLASH2 W10, #1857) ────────────────────────────────
+//
+// The decode-reorder threshold for a backend whose decode kernel supports
+// spec-as-decode. Exact mirror of
+// `AttentionMetadataBuilder._init_reorder_batch_threshold`
+// (vllm/v1/attention/backend.py:718-736 @ b389ac2946; byte-identical at the
+// parity pin 5559679229, backend.py:657-687):
+//
+//   max_num_queries_for_spec =
+//       1 + (2 if speculative_config.parallel_drafting else 1)
+//         * speculative_config.num_speculative_tokens
+//
+// so a parallel-drafting speculator (dflash/dspark, speculative.py:1064-1065)
+// raises the threshold to 1 + 2*K. Returns 1 -- the plain single-token decode
+// threshold -- when speculation is off (k <= 0), which is upstream's
+// `reorder_batch_threshold` default.
+inline int64_t SpecAsDecodeReorderThreshold(int64_t num_speculative_tokens,
+                                            bool parallel_drafting) {
+  if (num_speculative_tokens <= 0) return 1;
+  return 1 + (parallel_drafting ? 2 : 1) * num_speculative_tokens;
+}
+
+// The spec-as-decode classification of a UNIFORM batch: FlashInfer keeps a
+// request whose query length is at most the reorder threshold on the DECODE
+// kernel (`supports_spec_as_decode`, flashinfer.py:852-860 @ b389ac2946, with
+// the packed draft mask `_make_xqa_draft_block_mask` :114-140 supplying the
+// intra-step causal semantics). This engine's verify batches are uniform, so
+// the classification takes the step's verified uniform query length --
+// `GraphEligibleQueryLen`'s answer, never a raw shape -- and returns it when
+// `1 < uniform_query_len <= threshold`, else 0. A length of exactly 1 returns
+// 0 because a pure decode already routes decode by shape; classifying it would
+// say nothing.
+inline int64_t SpecAsDecodeQueryLen(int64_t uniform_query_len,
+                                    int64_t num_speculative_tokens,
+                                    bool parallel_drafting) {
+  if (uniform_query_len <= 1) return 0;
+  if (uniform_query_len >
+      SpecAsDecodeReorderThreshold(num_speculative_tokens, parallel_drafting)) {
+    return 0;
+  }
+  return uniform_query_len;
+}
 
 // Build a CommonAttentionMetadata from the M1.5 step-inputs + a block table.
 // Mirrors upstream `create_common_attn_metadata` (tests/v1/attention/utils.py):
@@ -588,6 +643,24 @@ class TritonMLAImpl final : public AttentionImpl {
   // but serializing — fine for unit tests, wrong for the hot path. W7 wires the
   // runner's queue in when the DeepSeek-V2 forward lands.
   vt::Queue* queue = nullptr;
+
+  // ─── the SLIDING-WINDOW arm (dots3-note W4b-2, #699) ──────────────────────
+  // Upstream expresses this as a SUBCLASS: `Dots3NoteTritonMLAImpl(
+  // TritonMLAImpl)` passes `sliding_window=None` up to the base — so the base's
+  // own rejection at `triton_mla.py:165-171` still fires for everyone else —
+  // and keeps the value on itself as `self.sliding_window`
+  // (`vllm/models/dots3_note/nvidia/attention.py:439-468` @ `bc2d63e650`),
+  // which `_forward_swa_mqa` (`:470-563`) then reads. This tree has one MLA
+  // impl and a registry that hands it out, so the subclass is expressed as a
+  // FIELD whose absent state is 0 — the additive shape used for every other
+  // family-specific MLA extension here.
+  //
+  // 0 leaves `MlaDecodeAttentionArgs::window_size` at `std::nullopt`, i.e. the
+  // full-context decode every DeepSeek / MiniCPM3 / Kimi-Linear caller gets.
+  // `layer.window_size` — the per-LAYER window on `AttentionLayer` — stays
+  // REFUSED in `forward_mqa`, because that is the base class's rejection and
+  // dots3-note does not set it either.
+  int64_t sliding_window = 0;
 
   // The DECODE entry point — the 1:1 counterpart of `forward_mqa`
   // (triton_mla.py:189-260). `q` is the already-concatenated

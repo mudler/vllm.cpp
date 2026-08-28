@@ -80,8 +80,28 @@ void MlaDecodeAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& qu
   std::vector<float> acc(static_cast<size_t>(v_head_dim));
   std::vector<float> q_row(static_cast<size_t>(head_size));
 
+  // The SLIDING-WINDOW start bound (dots3-note W4b-2, #699). An MLA decode
+  // query is the LAST position of its own sequence, `p = seq_len - 1`, so
+  // `AttentionWindow{left, 0}` admits keys `[p - left, p]` — i.e. the loop
+  // START moves and nothing else does. Absent (`std::nullopt`, which is every
+  // DeepSeek / MiniCPM3 / Kimi-Linear caller) the start stays 0 and this
+  // kernel is the byte-identical full-context loop it was.
+  //
+  // UPSTREAM computes the same set the other way round: `_forward_swa_mqa`
+  // gathers `[max(seq_len - GATHER_LEN, 0), ...)` into a workspace
+  // (`vllm/models/dots3_note/nvidia/attention.py:76-79` @ `bc2d63e650`) and
+  // then masks with `kv_positions >= query_position - WINDOW_SIZE + 1` (`:152`)
+  // and `kv_positions <= query_position` (`:151`). GATHER_LEN is rounded up to
+  // the Triton tile (`:484`), so the gather is a SUPERSET and the mask is what
+  // makes it exact; walking the block table directly needs no superset and no
+  // mask, and reaches the identical key set.
+  const int64_t win_left = args.window_size.has_value() ? args.window_size->left : -1;
+
   for (int64_t b = 0; b < batch; ++b) {
     const int64_t seq_len = seq[b];
+    // `p - left` with `p = seq_len - 1`, clamped at 0.
+    const int64_t j_start =
+        win_left < 0 ? int64_t{0} : std::max<int64_t>(0, seq_len - 1 - win_left);
     for (int64_t h = 0; h < heads; ++h) {
       const int64_t q_off = b * query.stride[0] + h * query.stride[1];
       for (int64_t d = 0; d < head_size; ++d) q_row[static_cast<size_t>(d)] = LoadF(query.data, query.dtype, q_off + d);
@@ -91,7 +111,7 @@ void MlaDecodeAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& qu
       float l = 0.0f;
       std::fill(acc.begin(), acc.end(), 0.0f);
 
-      for (int64_t j = 0; j < seq_len; ++j) {
+      for (int64_t j = j_start; j < seq_len; ++j) {
         const int64_t blk_slot = j / block_size;
         VT_CHECK(blk_slot < max_blocks,
                  "cpu mla_decode_attention: seq_len exceeds the block_table row");

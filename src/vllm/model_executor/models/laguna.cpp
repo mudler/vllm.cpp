@@ -991,6 +991,84 @@ inline bool LagunaGroupedMoeEnabled() {
   return on;
 }
 
+// The fused gate+up+SwiGLU grouped call: ONE launch, ONE activation quantize,
+// producing the same `eact` the two-call arm builds with `GateUpSilu`.
+//
+// `limit = +inf` is the whole reason this substitution is legal at all. The shared
+// op applies a CLAMPED SwiGLU, and its own contract records that an infinite limit
+// reduces it to plain `silu(gate) * up` — which is exactly what Laguna's
+// `GateUpSilu` computes. A finite limit here would silently clamp activations
+// Laguna never clamped.
+std::vector<float> LqGemmGroupedFusedGateUp(vt::Queue& q, const OwnedTensor& gate_w,
+                                            const OwnedTensor& up_w,
+                                            const std::vector<float>& act,
+                                            const std::vector<int32_t>& expert_ids,
+                                            int64_t P, int64_t N, int64_t K) {
+  VT_CHECK(gate_w.dtype == up_w.dtype,
+           "laguna fused gate/up: both expert towers must share a block-quant dtype");
+  VT_CHECK(vt::IsBlockQuant(gate_w.dtype) && !gate_w.repacked && !up_w.repacked,
+           "laguna fused gate/up requires non-repacked block-quant stacked weights");
+  VT_CHECK(gate_w.rank == 2 && gate_w.shape[1] == K && up_w.rank == 2 && up_w.shape[1] == K,
+           "laguna fused gate/up: weight K mismatch");
+  VT_CHECK(static_cast<int64_t>(act.size()) == P * K,
+           "laguna fused gate/up: act size mismatch");
+  VT_CHECK(static_cast<int64_t>(expert_ids.size()) == P,
+           "laguna fused gate/up: expert_ids size mismatch");
+
+  std::vector<float> out(static_cast<size_t>(P) * N);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = q.device.type != vt::DeviceType::kCPU;
+  vt::Queue& gq = on_dev ? q : cpuq;
+  std::vector<int32_t> eids = expert_ids;  // stable buffer for the (unified) tensor
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(act.data()),
+                                        vt::DType::kF32, gq.device, {P, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {P, N});
+  vt::Tensor eid =
+      vt::Tensor::Contiguous(eids.data(), vt::DType::kI32, gq.device, {P});
+  vt::Tensor gw = gate_w.View();
+  vt::Tensor uw = up_w.View();
+  gw.device = gq.device;  // unified-memory block view retag, as LqGemmGrouped does
+  uw.device = gq.device;
+  vt::MoeGateUpSwiGLUGrouped(gq, o, a, gw, uw, eid,
+                             std::numeric_limits<float>::infinity());
+  if (on_dev) DrainQueue(gq);
+  return out;
+}
+
+// PERF-LAGUNA-FUSED-GATEUP W2 (#2061): route the grouped gate+up pair through the
+// FUSED `vt::MoeGateUpSwiGLUGrouped`, which quantizes the activation ONCE where the
+// two-call arm quantizes it twice. W11 measured `QuantizeQ8KKernel` at 12.4% of
+// decode GPU time and half of that is the duplicate.
+//
+// DEFAULT-OFF, and the reason is measured rather than cautious. The fused epilogue
+// is NOT bit-identical to `GateUpSilu`: the shared op computes
+// `g * (1.0f/d) * u` while Laguna computes `(g/d) * u`, a reciprocal-then-multiply
+// against a divide, which is two roundings against one. Sampled over 2e6 plausible
+// pre-activations: 20.3% of values differ, max 2 ULP, max relative 2.4e-7. Making
+// them byte-identical would mean changing the SHARED op's epilogue, which
+// DeepSeek-V4 is also gated against, so the divergence is accepted and bounded
+// here instead — and the arm stays off until a TOKEN gate says the difference does
+// not move an output token.
+inline bool LagunaFusedGateUpEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_FUSED_GATEUP");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  return on;
+}
+
+// The fused arm's PRECONDITION, checked per call because it is a property of the
+// CHECKPOINT rather than of the build. `vt::MoeGateUpSwiGLUGrouped` requires both
+// expert towers in the SAME block-quant dtype, and a UD quant varies type per
+// tensor by design. W1 measured `Laguna-S-2.1 UD-Q4_K_XL` and found gate and up
+// paired on all 47 expert layers, including the one layer that deviates to Q5_K on
+// both — but that is one checkpoint, not a guarantee, so a mismatch falls back to
+// the two-call arm rather than refusing the load.
+inline bool LagunaFusedGateUpUsable(const OwnedTensor& gate_w, const OwnedTensor& up_w) {
+  return gate_w.dtype == up_w.dtype && vt::IsBlockQuant(gate_w.dtype) &&
+         !gate_w.repacked && !up_w.repacked;
+}
+
 // Grouped keep-quant expert GEMM over the stacked [E*N,K] tower: out[P,N] where
 // out[p,:] = act[p,:] · weight[expert_ids[p]*N .. +N] (the block row-slice for that
 // expert). ONE vt::MatmulBTQuantGrouped launch replaces P per-expert LqGemmRowSlice
@@ -1163,11 +1241,20 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
       for (int64_t s = 0; s < Pk; ++s)
         std::memcpy(arep.data() + static_cast<size_t>(s) * H, hrow.data(),
                     static_cast<size_t>(H) * sizeof(float));
-      const std::vector<float> eg =
-          LqGemmGrouped(q, lw.moe.experts_gate, arep, eids, Pk, moe_I, H);
-      const std::vector<float> eu =
-          LqGemmGrouped(q, lw.moe.experts_up, arep, eids, Pk, moe_I, H);
-      const std::vector<float> eact = GateUpSilu(eg, eu, Pk, moe_I);
+      // W2: one fused launch when the arm is on AND the towers pair; otherwise the
+      // two-call arm, unchanged and still the reference.
+      std::vector<float> eact;
+      if (LagunaFusedGateUpEnabled() &&
+          LagunaFusedGateUpUsable(lw.moe.experts_gate, lw.moe.experts_up)) {
+        eact = LqGemmGroupedFusedGateUp(q, lw.moe.experts_gate, lw.moe.experts_up,
+                                        arep, eids, Pk, moe_I, H);
+      } else {
+        const std::vector<float> eg =
+            LqGemmGrouped(q, lw.moe.experts_gate, arep, eids, Pk, moe_I, H);
+        const std::vector<float> eu =
+            LqGemmGrouped(q, lw.moe.experts_up, arep, eids, Pk, moe_I, H);
+        eact = GateUpSilu(eg, eu, Pk, moe_I);
+      }
       const std::vector<float> eo =
           LqGemmGrouped(q, lw.moe.experts_down, eact, eids, Pk, H, moe_I);
       for (int64_t s = 0; s < Pk; ++s) {

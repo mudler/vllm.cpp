@@ -51,10 +51,12 @@ enum class SplitPattern {
             // its comment above, run in reverse: kGpt4o KEEPS the o200k
             // contraction group and KEEPS \p{N}{1,3}. See
             // src/vllm/tokenizer/pretokenizer.cpp for the verbatim pattern.
-  kDeepSeek,  // DeepSeek family (DeepSeek-V2/V2-Lite/V3). STRUCTURALLY UNLIKE
-              // every pattern above: not ONE alternation regex but a HF
-              // `Sequence` PIPELINE of seven pre-tokenizers, each further
-              // splitting the pieces the previous one produced — five
+  kDeepSeek,  // DeepSeek-V2 family (DeepSeek-V2, V2-Lite, and every GGUF
+              // tagged `tokenizer.ggml.pre = "deepseek-llm"`; llama.cpp's
+              // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM). STRUCTURALLY UNLIKE every
+              // pattern above: not ONE alternation regex but a HF `Sequence`
+              // PIPELINE of seven pre-tokenizers, each further splitting the
+              // pieces the previous one produced — five
               // `Split(behavior=Isolated)` stages over EXPLICIT codepoint
               // classes (newlines; cased letters; ASCII+fullwidth+CJK
               // punctuation; trailing whitespace; CJK/Hangul), then
@@ -63,6 +65,24 @@ enum class SplitPattern {
               // are enumerated codepoint ranges in the checkpoint rather than
               // `\p{...}` properties, so they are transcribed verbatim in
               // src/vllm/tokenizer/pretokenizer.cpp with their provenance.
+              //
+              // NOT DeepSeek-V3. This comment used to claim V3 as well and it
+              // was wrong: V3 ships a different pipeline, kDeepSeekV3 below.
+  kDeepSeekV3,  // DeepSeek-V3 family (DeepSeek-V3, DeepSeek-R1,
+                // DeepSeek-V4-Flash, and every GGUF tagged
+                // `tokenizer.ggml.pre = "deepseek-v3"` or `"joyai-llm"`;
+                // llama.cpp's LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM). Also a HF
+                // `Sequence` PIPELINE, and a genuinely SEPARATE family from
+                // kDeepSeek rather than a variant of it: FOUR stages, not
+                // seven — `Split(\p{N}{1,3})`, `Split([<kana+CJK>]+)`, a
+                // `Split` over a six-alternative regex, then
+                // `ByteLevel(use_regex=false)`. It has no `Digits` stage, no
+                // trailing-whitespace stage, no Hangul in its CJK class, and
+                // its word/punctuation rules are `\p{...}` properties rather
+                // than enumerated ranges. Aliasing either onto the other, or
+                // onto kLlama3 because both group digits `\p{N}{1,3}`,
+                // mis-tokenizes silently (#1924). Pipeline and provenance in
+                // src/vllm/tokenizer/pretokenizer.cpp.
 };
 
 // Splits `text` into pretoken byte spans [first, second), exactly as HF

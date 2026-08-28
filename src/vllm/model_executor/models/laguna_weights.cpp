@@ -42,7 +42,9 @@
 namespace vllm {
 namespace {
 
-// --- raw (nlohmann::json) readers, mirroring deepseek_v4_weights.cpp:84-100 ---
+// --- raw (nlohmann::json) readers, mirroring the deepseek_v4_weights.cpp helpers
+// `RawInt`/`RawDouble`/`RawBool`/`RawString` (cited by SYMBOL: the line range this
+// comment used to name went stale the moment ds4 grew a loader arm above it) ------
 int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   auto it = doc.find(key);
   return (it != doc.end() && it->is_number()) ? it->get<int64_t>() : fallback;
@@ -475,7 +477,9 @@ LagunaWeights LoadLagunaForCausalLMWeights(
 // ════════════════════════════════════════════════════════════════════════════
 // W5 — the REAL multi-shard GGUF keep-quant tower materialization.
 //
-// Mirrors the ds4 V4GgufCtx keep-quant loader (deepseek_v4_weights.cpp:410-852):
+// Mirrors the ds4 keep-quant loader — `struct V4GgufCtx` through
+// `LoadDeepseekV4FromGguf` in `src/vllm/model_executor/models/deepseek_v4_weights.cpp`,
+// cited by SYMBOL because a line range there does not survive a new loader arm:
 // the big GEMM weights (attn q/k/v/o/gate Q8_0, dense-L0 ffn Q8_0, routed experts
 // Q4_K/Q5_K, shared experts Q8_0, lm_head Q8_0) stay block-COMPRESSED via
 // OwnGgufQuantBlocks (the memory enabler — a bf16 expansion of the 256 experts is
@@ -706,11 +710,26 @@ struct LagunaGgufCtx {
     return MakeBf16Owned(DequantGgufRowToBf16(t->ggml_type, t->data, rows * k),
                          {rows, k}, /*nk=*/true);
   }
-  // A value/table tensor (norm/bias/router/embed): NEVER keep-quant, dequant f32.
+  // A value tensor (norm/bias/router): NEVER keep-quant, dequant f32.
   OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
+    return VecWith(pol, name, role);
+  }
+  // `token_embd.weight`. Laguna gathers it as a flat host f32 array
+  // (`LagunaEmbed`, laguna.cpp:1594) and, on a TIED file, feeds the same f32
+  // image to the final projection (`MatmulNK(src, ReadF32(weights.embed), ...)`,
+  // laguna.cpp:1281), so it cannot read a table that keeps its ggml blocks —
+  // which is what the SHARED policy elects for every published quantized laguna
+  // checkpoint since MODEL-MM-QWEN4-EXP W6a (#1989). The narrowing is stated by
+  // name here; see `NoKeepQuant`. A keep-quant gather for this model is owed to
+  // #1978.
+  OwnedTensor EmbedF32(const std::string& name) {
+    return VecWith(NoKeepQuant(pol), name, GgufTensorRole::kEmbeddingTable);
+  }
+  OwnedTensor VecWith(const GgufLoadPolicy& p, const std::string& name,
+                      GgufTensorRole role) {
     auto [g, t] = Take(name);
     (void)g;
-    VT_CHECK(pol.Route(*t, role) == GgufResidency::kExpandBf16,
+    VT_CHECK(p.Route(*t, role) == GgufResidency::kExpandBf16,
              std::string("laguna gguf: a ") + Name(role) +
                  " tensor must not keep quant blocks: " + name);
     int64_t numel = 1;
@@ -752,7 +771,7 @@ LagunaWeights LoadLagunaFromGgufShards(const std::vector<const GgufFile*>& shard
   }
 
   // ── model level ──────────────────────────────────────────────────────────
-  w.embed = ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable);  // f32 gather
+  w.embed = ctx.EmbedF32("token_embd.weight");  // f32 gather (and tied head)
   w.norm = ctx.Vec("output_norm.weight", GgufTensorRole::kVector);
   w.lm_head = tied ? OwnedTensor{} : ctx.Mw("output.weight");  // keep-quant Q8_0
 

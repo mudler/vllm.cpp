@@ -106,10 +106,15 @@ ratio.
 | FastAPI/Pydantic validation | existing cpp-httplib dispatch exception-to-400 seam in `src/vllm/entrypoints/openai/api_server.cpp` |
 
 The local pull-stream state machines retain one explicit pending-usage state
-between the final choice and `[DONE]`. Chat continuous usage may buffer the
-first `RequestOutput` long enough to know the prompt-ID count before emitting
-the role frame; this mirrors upstream, which emits that role frame only after
-the first result arrives.
+between the final choice and `[DONE]`. Chat buffers the first `RequestOutput`
+before it emits the role frame, in every usage mode; this mirrors upstream,
+which emits that role frame only after the first result arrives.
+
+**Corrected 2026-08-26, [#1982](https://github.com/mudler/vllm.cpp/issues/1982).**
+This paragraph scoped the buffering to continuous usage, and the code did the
+same. Continuous usage needs the prompt-ID count, but that is not upstream's
+only reason for the ordering, so the narrow reading was wrong. See
+[chat-role-frame-ordering.md](chat-role-frame-ordering.md).
 
 ## Tests to port
 
@@ -194,8 +199,15 @@ hardware checkpoint after the implementation commit.
 - The final usage frame follows the finish-reason choice and precedes `[DONE]`.
   Emitting it after `[DONE]`, attaching it only to the finish choice, or
   estimating it from text would not be wire-compatible.
-- Chat's role frame must not invent a prompt count. In continuous mode it waits
-  for/buffers the first engine result, matching upstream's first-iteration
-  ordering rather than reporting zero.
+- Chat's role frame must not invent a prompt count. It waits for and buffers
+  the first engine result in every usage mode, matching upstream's
+  first-iteration ordering rather than reporting zero. **Corrected 2026-08-26,
+  [#1982](https://github.com/mudler/vllm.cpp/issues/1982):** this bullet said
+  "in continuous mode", and the default path emitted the role frame before it
+  read the engine. Upstream orders the role frame after the first result so an
+  exception can be the first response, which no usage mode changes, and
+  `vllm/benchmarks/lib/endpoint_request_func.py:404-408` stamps TTFT on the
+  first `choices`-bearing frame whatever its content holds. See
+  [chat-role-frame-ordering.md](chat-role-frame-ordering.md).
 - The failed `8289cbd` arm is diagnostic only. It cannot be patched in place or
   reused after the implementation changes the commit SHA.

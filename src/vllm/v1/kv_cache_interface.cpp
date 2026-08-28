@@ -1,8 +1,9 @@
-// Ported from: vllm/v1/kv_cache_interface.py @ e24d1b24
+// Ported from: vllm/v1/kv_cache_interface.py @ e24d1b24, with the DeepSeek-V4
+// spec surface re-read at the parity pin 5559679229bc961848b121ccdeaa8fa5d79bec98.
 //
 // The page_size_bytes / real_page_size_bytes math for FullAttentionSpec,
-// SlidingWindowSpec and MambaSpec. See kv_cache_interface.h for the formulas
-// and deferred-spec notes.
+// SlidingWindowSpec, MLAAttentionSpec, SlidingWindowMLASpec and MambaSpec. See
+// kv_cache_interface.h for the formulas and deferred-spec notes.
 #include "vllm/v1/kv_cache_interface.h"
 
 #include <algorithm>
@@ -19,7 +20,65 @@ bool needs_deferred_quant_math(KVQuantMode mode) {
   return mode != KVQuantMode::kNone;
 }
 
+// The `cache_dtype` string and the `model_version` that together select the
+// DeepSeek-V4 page, written once. Upstream compares these literals in four
+// places (`kv_cache_interface.py:398-405`, `:628-636`).
+constexpr const char* kFp8DsMlaCacheDType = "fp8_ds_mla";
+constexpr const char* kDeepseekV4ModelVersion = "deepseek_v4";
+
+// 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token, upstream's own
+// arithmetic in its own comment (`kv_cache_interface.py:399-401`, `:629-632`).
+// We already hold this layout element for element: `Fp8DsMlaLayout` records
+// nope 448 + rope 64*2 = 576 plus an 8-byte scale row
+// (`include/vllm/model_executor/models/deepseek_v4_compressor.h:113-125`).
+constexpr int64_t kFp8DsMlaV4TokenBytes = 584;
+
+// V3.2 main MLA: a 656-byte custom layout over the 576-wide latent
+// (kv_lora_rank 512 + qk_rope_head_dim 64), off BLOCK_SIZE and not
+// storage_block_size (`kv_cache_interface.py:402-405`).
+constexpr int64_t kFp8DsMlaV32TokenBytes = 656;
+
+bool is_fp8_ds_mla(const std::optional<std::string>& cache_dtype_str) {
+  return cache_dtype_str.has_value() &&
+         *cache_dtype_str == kFp8DsMlaCacheDType;
+}
+
+bool is_deepseek_v4(const std::optional<std::string>& model_version) {
+  return model_version.has_value() &&
+         *model_version == kDeepseekV4ModelVersion;
+}
+
 }  // namespace
+
+void CheckMlaCacheFields(int compress_ratio, std::optional<int> alignment) {
+  VT_CHECK(compress_ratio >= 1,
+           "kv cache spec: compress_ratio must be >= 1 (upstream's model path "
+           "applies max(1, compress_ratios[layer_id]), attention.py:205-212); "
+           "0 would divide by zero in storage_block_size()");
+  VT_CHECK(!alignment.has_value() || *alignment > 0,
+           "kv cache spec: alignment must be > 0 when set (upstream's None "
+           "means no padding, kv_cache_interface.py:383)");
+}
+
+int64_t RoundUp(int64_t x, int64_t y) {
+  VT_CHECK(y > 0, "RoundUp: the divisor must be > 0");
+  return ((x + y - 1) / y) * y;
+}
+
+void ApplyAlignmentPadding(AttentionSpec& spec, std::optional<int> alignment) {
+  // Upstream `_apply_alignment_padding` (kv_cache_interface.py:345-351).
+  if (!alignment.has_value()) {
+    return;
+  }
+  const int64_t actual_page_size = spec.real_page_size_bytes();
+  const int64_t padded_page_size = RoundUp(actual_page_size, *alignment);
+  // Upstream writes ONLY when the rounding changed the number, so an already
+  // aligned page keeps `page_size_padded` unset rather than gaining a value
+  // equal to the real page.
+  if (padded_page_size != actual_page_size) {
+    spec.page_size_padded = padded_page_size;
+  }
+}
 
 int64_t AttentionSpec::real_page_size_bytes() const {
   if (needs_deferred_quant_math(kv_quant_mode)) {
@@ -57,17 +116,65 @@ int64_t FullAttentionSpec::real_page_size_bytes() const {
          static_cast<int64_t>(vt::SizeOf(dtype));
 }
 
-// Upstream kv_cache_interface.py:397-398 — the MLA page formula. ONE latent row
+// Upstream kv_cache_interface.py:396-410 — the MLA page formula. ONE latent row
 // per token (kv_lora_rank + qk_rope_head_dim wide), num_kv_heads == 1, and NO
 // separate V: the factor 2 every other attention spec carries is absent.
 int64_t MLAAttentionSpec::real_page_size_bytes() const {
+  // THE BRANCH ORDER IS LOAD-BEARING, and it is the one thing a careless port
+  // gets wrong. `DeepseekV4Attention.get_kv_cache_spec` builds its spec with
+  // `kv_quant_mode=get_kv_quant_mode("fp8_ds_mla")`
+  // (`vllm/models/deepseek_v4/attention.py:644`), and `get_kv_quant_mode` maps
+  // ANY string starting with "fp8" to FP8_PER_TENSOR
+  // (`kv_cache_interface.py:70-71`). So every real DeepSeek-V4 MLA spec carries
+  // a non-NONE quant mode, and the guard below would throw on all of them.
+  // Upstream returns from this branch (`:398-405`) before it ever reads
+  // `kv_quant_mode`; so do we.
+  if (is_fp8_ds_mla(cache_dtype_str)) {
+    if (is_deepseek_v4(model_version)) {
+      // head_size stays SEMANTIC (512); the bytes are determined here.
+      return static_cast<int64_t>(storage_block_size()) * kFp8DsMlaV4TokenBytes;
+    }
+    // NOTE: block_size, not storage_block_size — upstream's V3.2 line has no
+    // compression in it (`:404-405`).
+    return static_cast<int64_t>(block_size) * kFp8DsMlaV32TokenBytes;
+  }
   if (needs_deferred_quant_math(kv_quant_mode)) {
-    // Upstream's fp8_ds_mla (V3.2 656 B/token, V4 584 B/token) and INT4
-    // per-token-head layouts (kv_cache_interface.py:381-390) are OUT OF SCOPE
-    // for this campaign; throw loudly rather than silently mis-size.
+    // Upstream's INT4 per-token-head layout (`:406-407`) is still OUT OF SCOPE;
+    // throw loudly rather than silently mis-size. Unchanged from before
+    // KV-DSV4-MULTICACHE W1: a spec with no `fp8_ds_mla` marker takes this
+    // path exactly as it did.
     throw std::runtime_error(
-        "MLAAttentionSpec: kv_quant_mode != NONE page-size math (fp8_ds_mla / "
-        "int4) is out of scope");
+        "MLAAttentionSpec: kv_quant_mode != NONE page-size math (int4 "
+        "per-token-head) is out of scope; the fp8_ds_mla layouts are selected "
+        "by cache_dtype_str, not by the quant mode");
+  }
+  return static_cast<int64_t>(storage_block_size()) * num_kv_heads * head_size *
+         static_cast<int64_t>(vt::SizeOf(dtype));
+}
+
+// Upstream kv_cache_interface.py:627-642. ONE vector instead of K + V
+// (`vllm/models/deepseek_v4/compressor.py:193`), so `head_size` alone and NOT
+// `head_size + head_size_v` — and off `storage_block_size`, not `block_size`.
+int64_t SlidingWindowMLASpec::real_page_size_bytes() const {
+  // Same branch order, and for the same reason, as MLAAttentionSpec above:
+  // `DeepseekV4SWACache` passes `kv_quant_mode=get_kv_quant_mode(cache_dtype)`
+  // (`vllm/v1/attention/backends/mla/sparse_swa.py:100`), which is
+  // FP8_PER_TENSOR whenever this branch is the right one.
+  if (is_deepseek_v4(model_version) && is_fp8_ds_mla(cache_dtype_str)) {
+    return static_cast<int64_t>(storage_block_size()) * kFp8DsMlaV4TokenBytes;
+  }
+  // Upstream asserts the version set before the element formula (`:634-636`).
+  VT_CHECK(!model_version.has_value() || is_deepseek_v4(model_version),
+           "SlidingWindowMLASpec: unsupported model version");
+  if (needs_deferred_quant_math(kv_quant_mode)) {
+    // The FlashInfer contiguous bf16 arm reaches the element formula with
+    // kv_quant_mode NONE. An fp8 arm that did NOT set cache_dtype_str would
+    // need the per-token-head scale bytes upstream adds in
+    // `unpadded_page_size_bytes` (`kv_cache_interface.py:202-211`), which this
+    // port defers for every spec in this file. Refuse rather than mis-size.
+    throw std::runtime_error(
+        "SlidingWindowMLASpec: kv_quant_mode != NONE page-size math is "
+        "deferred (T1) unless cache_dtype_str selects the fp8_ds_mla layout");
   }
   return static_cast<int64_t>(storage_block_size()) * num_kv_heads * head_size *
          static_cast<int64_t>(vt::SizeOf(dtype));
@@ -159,6 +266,104 @@ int64_t KVBytesPerBlock(const KVCacheConfig& config) {
   return bytes;
 }
 
+// See kv_cache_interface.h for the argument. Body moved verbatim from
+// `gpu/runner.cpp`'s `LayerIndexOfName`.
+std::optional<int64_t> KVCacheLayerIndexOfName(std::string_view name) {
+  constexpr std::string_view kSep = ".layers.";
+  const size_t at = name.find(kSep);
+  if (at == std::string_view::npos) return std::nullopt;
+  size_t i = at + kSep.size();
+  const size_t start = i;
+  int64_t value = 0;
+  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+    value = value * 10 + (name[i] - '0');
+    if (value > (1 << 20)) return std::nullopt;  // not a layer index
+    ++i;
+  }
+  if (i == start) return std::nullopt;                         // ".layers.mixer"
+  if (i < name.size() && name[i] != '.') return std::nullopt;   // ".layers.5x"
+  return value;
+}
+
+void ResolveKVCacheGroupLayerNames(
+    KVCacheConfig& config, int64_t num_hidden_layers,
+    const std::vector<std::string>& layer_types) {
+  // Nothing to name. A caller with no layer count cannot be given one here, and
+  // inventing one is how the placeholder count became a layer count in the
+  // first place.
+  if (num_hidden_layers <= 0) return;
+
+  // A registry that already publishes REAL names knows more than the fallback
+  // classification below: NemotronH's `layer_types` is EMPTY and its MoE blocks
+  // register no attention module at all, so overwriting it would re-introduce
+  // exactly the 52-against-6 mis-classification #810 removed. One resolvable
+  // name anywhere is the whole config's answer, which also makes this
+  // idempotent.
+  for (const KVCacheGroupSpec& group : config.kv_cache_groups) {
+    for (const std::string& name : group.layer_names) {
+      if (KVCacheLayerIndexOfName(name).has_value()) return;
+    }
+  }
+
+  bool has_mamba_group = false;
+  for (const KVCacheGroupSpec& group : config.kv_cache_groups) {
+    if (group.kv_cache_spec != nullptr &&
+        group.kv_cache_spec->kind() == KVCacheSpecKind::kMamba) {
+      has_mamba_group = true;
+    }
+  }
+
+  // The runner's own `is_gdn` fallback predicate, and nothing else. A dense
+  // model (no Mamba group) and a hybrid whose config does not spell
+  // `layer_types` both classify every layer as attention here, which is what the
+  // runner does with them too.
+  std::vector<std::string> recurrent;
+  std::vector<std::string> attention;
+  for (int64_t l = 0; l < num_hidden_layers; ++l) {
+    const size_t idx = static_cast<size_t>(l);
+    const bool is_gdn = has_mamba_group && idx < layer_types.size() &&
+                        layer_types[idx] == "linear_attention";
+    if (is_gdn) {
+      recurrent.push_back("model.layers." + std::to_string(l) + ".linear_attn");
+    } else {
+      attention.push_back("model.layers." + std::to_string(l) +
+                          ".self_attn.attn");
+    }
+  }
+
+  bool target_named = false;
+  bool draft_named = false;
+  for (KVCacheGroupSpec& group : config.kv_cache_groups) {
+    if (group.kv_cache_spec == nullptr) continue;
+    const KVCacheSpecKind kind = group.kv_cache_spec->kind();
+    if (kind == KVCacheSpecKind::kMamba) {
+      group.layer_names = recurrent;
+      continue;
+    }
+    if (dynamic_cast<const AttentionSpec*>(group.kv_cache_spec.get()) ==
+        nullptr) {
+      continue;  // not an attention group and not recurrent: leave it alone.
+    }
+    if (!group.is_eagle_group && !target_named) {
+      group.layer_names = attention;
+      target_named = true;
+    } else if (!draft_named) {
+      // The speculative draft layer. Upstream registers the MTP head as one
+      // extra decoder layer at index num_hidden_layers
+      // (`qwen3_5_mtp.py:105-112`), and the runner allocates exactly one buffer
+      // for it before breaking out of its search.
+      group.layer_names = {"model.layers." +
+                           std::to_string(num_hidden_layers) +
+                           ".self_attn.attn"};
+      draft_named = true;
+    } else {
+      // The runner allocates NO buffer for a further attention group, so the
+      // honest weight is zero. Unreachable for every registry shipping today.
+      group.layer_names.clear();
+    }
+  }
+}
+
 namespace {
 
 // The ONE arithmetic statement W3 makes about block sizing, written where it can
@@ -170,11 +375,20 @@ namespace {
 // here rather than assumed.
 void RetypeAttentionSpec(AttentionSpec& spec, const ResolvedCacheDType& resolved,
                          float k_scale, float v_scale) {
+  // KV-DSV4-MULTICACHE W1 (#1960) landed the fp8_ds_mla PAGE FORMULA on
+  // `MLAAttentionSpec` and `SlidingWindowMLASpec`, and it landed nothing on the
+  // store or the read. So the refusal stays and only its reason narrows:
+  // accepting `--kv-cache-dtype fp8_ds_mla` here would size every MLA page at
+  // 584 bytes per token while the attention block still writes a bf16 latent
+  // into it, which is wrong tokens rather than a crash. `ParseCacheDType`
+  // refuses the string one level up (`kv_cache_dtype.h:87-90`); this is the
+  // second door. Owed to W5, the wave that lands the read and write side.
   VT_CHECK(dynamic_cast<const MLAAttentionSpec*>(&spec) == nullptr,
            "cache_dtype: an MLA KV cache has its own quantized page formula "
-           "upstream (fp8_ds_mla, kv_cache_interface.py:398-410) and no "
-           "cache_dtype override is wired for it; run the MLA model on "
-           "--kv-cache-dtype auto");
+           "upstream (fp8_ds_mla, kv_cache_interface.py:398-410). W1 landed "
+           "that page formula but no fp8_ds_mla store or read, so requesting "
+           "it here would size the page for bytes nothing writes; run the MLA "
+           "model on --kv-cache-dtype auto");
   if (resolved.is_fp8) {
     VT_CHECK(resolved.storage == vt::DType::kI8,
              "cache_dtype: an fp8 KV cache stores 1 byte per element "

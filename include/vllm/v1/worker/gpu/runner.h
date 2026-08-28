@@ -355,6 +355,21 @@ class GPUModelRunner final : public ModelRunnerBase {
   // value the old HF-config arithmetic could not.
   int64_t fa_page_size_bytes() const { return fa_page_size_bytes_; }
 
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). What `initialize_kv_cache`
+  // ALLOCATED, summed over every buffer it created, so a gate can compare the
+  // sizing arithmetic against the allocation rather than against a second copy
+  // of the same formula. Both are 0 before `initialize_kv_cache` runs.
+  //
+  //   ...paged_bytes() — the block-scaled half: one buffer per full-attention
+  //     layer plus the speculative draft layer's. This is the half a
+  //     `--kv-cache-memory` budget is supposed to bound, and
+  //     `KVBytesPerBlock(cfg) * cfg.num_blocks` is supposed to equal it.
+  //   ...allocated_bytes() — that plus the recurrent (GDN/Mamba) conv and SSM
+  //     state, which is sized per sequence slot and not per block, and which
+  //     `recurrent_state_bytes(cfg, max_num_reqs)` is supposed to equal.
+  int64_t kv_cache_allocated_paged_bytes() const;
+  int64_t kv_cache_allocated_bytes() const;
+
   // #810: the per-layer KV class `initialize_kv_cache` RESOLVED, index == model
   // layer index, one entry per hidden layer. `kNone` is a layer that no KV
   // cache group named and that therefore caches nothing — NemotronH's 23
@@ -363,13 +378,54 @@ class GPUModelRunner final : public ModelRunnerBase {
   // otherwise observable only as buffer COUNTS, and a count cannot see a
   // routing inversion: 3 recurrent + 1 attention has the same counts whichever
   // three layers got which.
+  //
+  // KV-DSV4-MULTICACHE W3 (#2068) adds the fourth value. `kMultiCache` means
+  // THIS LAYER'S CACHES ARE NOT DESCRIBED BY THE POSITIONAL `attn_kv[fa_idx]`
+  // CONVENTION — read `layer_attn_kv_indices()[l]` instead. A DeepSeek-V4 C4A
+  // layer has four entries there; layers 0 and 1 have exactly one (the SWA cache
+  // alone, since `get_kv_cache_spec` returns None for `compress_ratio <= 1`,
+  // `vllm/models/deepseek_v4/attention.py:626-630`) and are STILL kMultiCache,
+  // because one cache reached by name is not the same thing as one cache reached
+  // by position.
   enum class LayerKvClass : uint8_t {
     kNone = 0,
     kFullAttention = 1,
     kRecurrent = 2,
+    kMultiCache = 3,
   };
   const std::vector<LayerKvClass>& layer_kv_class() const {
     return layer_kv_class_;
+  }
+
+  // KV-DSV4-MULTICACHE W3 (#2068): the published groups this runner carries.
+  //
+  // `attn_group_ids()` lists EVERY non-eagle group whose spec is an
+  // `AttentionSpec`, in publication order; `recurrent_group_ids()` lists every
+  // `kMamba` group. `full_attn_group_id()` and `gdn_group_id()` keep their old
+  // meanings and their old values — the FIRST non-eagle full-attention/MLA group
+  // and a Mamba group — because eleven call sites read them and none of them
+  // means anything different.
+  const std::vector<int>& attn_group_ids() const { return attn_group_ids_; }
+  const std::vector<int>& recurrent_group_ids() const {
+    return recurrent_group_ids_;
+  }
+
+  // KV-DSV4-MULTICACHE W3 (#2068): per-layer indices into `attn_kv()`, index ==
+  // model layer index. EMPTY for every topology the positional convention can
+  // express, which is the same empty-means-unchanged contract
+  // `per_layer_attn_specs` states (`include/vllm/v1/kv_cache_interface.h`).
+  const std::vector<std::vector<int32_t>>& layer_attn_kv_indices() const {
+    return layer_attn_kv_indices_;
+  }
+  // The name each entry of `attn_kv()` was PUBLISHED under — upstream's
+  // `static_forward_context` key. EMPTY on every uniform topology.
+  const std::vector<std::string>& attn_kv_layer_names() const {
+    return attn_kv_layer_names_;
+  }
+  // The third forward channel exactly as `ModelRegistry::Forward` receives it.
+  // `size() == 0` on every uniform topology.
+  const vllm::MultiKvCacheIndex& multi_kv_index() const {
+    return multi_kv_index_;
   }
 
   // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
@@ -469,9 +525,15 @@ class GPUModelRunner final : public ModelRunnerBase {
       return backend_resident_ ? backend_data_ : host_data_.data();
     }
 
+    // The byte size this buffer was constructed with — what the allocation
+    // COST, not what a formula predicts it cost. `kv_cache_allocated_bytes()`
+    // below sums these (FIX-KV-GROUP-LAYER-COUNT, #1963).
+    size_t bytes() const { return bytes_; }
+
    private:
     vt::Device device_;
     bool backend_resident_ = false;
+    size_t bytes_ = 0;
     void* backend_data_ = nullptr;
     std::vector<uint8_t> host_data_;
   };
@@ -570,6 +632,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;
+  // KV-DSV4-MULTICACHE W3 (#2068): the generalized group layout. See the
+  // accessors above. `multi_cache_topology_` is TRUE only when the published
+  // group set leaves groups over after the target attention group, the recurrent
+  // group and the `fa_draft` slot — the same set the W2 refusal computes — so it
+  // is FALSE for every model shipping today and the members below stay empty.
+  std::vector<int> attn_group_ids_;
+  std::vector<int> recurrent_group_ids_;
+  bool multi_cache_topology_ = false;
+  std::vector<std::vector<int32_t>> layer_attn_kv_indices_;
+  std::vector<std::string> attn_kv_layer_names_;
+  std::vector<int32_t> attn_kv_group_ids_;
+  std::vector<int32_t> attn_kv_layer_indices_;
+  vllm::MultiKvCacheIndex multi_kv_index_;
   int64_t num_blocks_ = 0;
   // Per-block attention-cache bytes as reported by the KV spec (see the
   // fa_page_size_bytes() accessor).
@@ -744,6 +819,33 @@ class GPUModelRunner final : public ModelRunnerBase {
                ? spec_config_->ResolvedNumSpeculativeTokens()
                : 0;
   }
+  // The DECODE-REORDER THRESHOLD this step's batch is split on — upstream's
+  // resolved `self.reorder_batch_threshold`, which `_may_reorder_batch` passes
+  // into `reorder_batch_to_split_decodes_and_prefills`
+  // (gpu_model_runner.py:1126-1130 @ pin 5559679229). Upstream resolves it as
+  // the min over the attention groups' builders once the builders exist
+  // (`calculate_reorder_batch_threshold`, :7194-7212), and a builder that
+  // supports spec-as-decode raises it to `1 + (2 if parallel_drafting else 1) *
+  // k` (`_init_reorder_batch_threshold`, backend.py:657-687), which
+  // gdn_attn.py:112 requests for every speculative configuration via
+  // `supports_spec_as_decode=self.use_spec_decode`. We have one runner-level
+  // reorder and no per-group builder registry to take a min over, so the
+  // speculative raise IS the resolved value here.
+  //
+  // `parallel_drafting` is READ, never assumed: the resolvers set it for
+  // `dflash` and `dspark` and for nothing else (speculative.py:963-964,
+  // mirrored at include/vllm/config/speculative.h ResolveDflash/ResolveDspark),
+  // so `mtp`, `ngram` and `draft_model` give `1 + k` and the block drafters
+  // give `1 + 2k`.
+  //
+  // BYTE-IDENTICAL WITHOUT A SPECULATOR: `num_spec()` is 0 there and
+  // `SpecAsDecodeReorderThreshold` returns 1, which is the value the reorder's
+  // declaration already defaulted to.
+  int reorder_batch_threshold() const {
+    return static_cast<int>(SpecAsDecodeReorderThreshold(
+        num_spec(),
+        spec_config_.has_value() && spec_config_->parallel_drafting));
+  }
   // Run the k=1 MTP propose after this step's sampling and stash the drafts for
   // take_draft_token_ids (gpu/model_runner.py:1455-1489). Uses the stashed target
   // hidden tap + verify attn metadata; `num_sampled`/`num_rejected` are the
@@ -833,25 +935,76 @@ class GPUModelRunner final : public ModelRunnerBase {
   bool dspark_sample_from_anchor_ = true;
   bool use_dspark() const { return dspark_weights_ != nullptr; }
   // Per-request PERSISTENT context KV store (D9 persistent paged draft-KV — the
-  // perf form of vLLM's incrementally-written draft KV cache). dflash_kv_store_[i]
-  // holds request i's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
-  // committed positions 0..L_i-1 (L_i = dflash_ctx_len_[i]). Each verify step
-  // projects ONLY the newly-accepted rows (AppendContextKVHost) and APPENDS them,
-  // instead of re-projecting the whole growing context (the D5/D7 O(context^2)
-  // recompute). Bit-identical to the recompute by per-row projection independence.
-  // dflash_ctx_reqid_[i] tracks the occupant so a reused batch slot resets its
-  // store; rejected drafts' rows are never appended (rollback = don't-append).
-  // Indexed by the runner's condensed-dense batch row. Sized on set_dflash_draft.
-  // D11 A-wire: the store is now the DEVICE-RESIDENT append-only draft-KV store
-  // (DflashDeviceKVStore, opaque, one shared_ptr per condensed-dense batch row).
-  // AppendContextKVDevice keeps the projected bf16 K/V on-device (no D<->H round
-  // trip) and ForwardBlockLogitsWithDeviceKV runs the block forward straight off
-  // the device store — bit-identical to the D9 host path, and the capture-ready
-  // substrate for Parts B/C. shared_ptr-to-incomplete is safe: MakeDeviceKVStore
-  // constructs the control block (with its deleter) in qwen3_dflash.cpp.
-  std::vector<std::shared_ptr<vllm::DflashDeviceKVStore>> dflash_kv_store_;
-  std::vector<int32_t> dflash_ctx_len_;
-  std::vector<std::string> dflash_ctx_reqid_;
+  // perf form of vLLM's incrementally-written draft KV cache). One entry holds
+  // that request's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
+  // committed positions 0..ctx_len-1. Each verify step projects ONLY the
+  // newly-accepted rows (AppendContextKVDeviceRows) and APPENDS them, instead of
+  // re-projecting the whole growing context (the D5/D7 O(context^2) recompute).
+  // Bit-identical to the recompute by per-row projection independence; rejected
+  // drafts' rows are never appended (rollback = don't-append).
+  //
+  // D11 A-wire: the store is the DEVICE-RESIDENT append-only draft-KV store
+  // (DflashDeviceKVStore, opaque). AppendContextKVDevice keeps the projected bf16
+  // K/V on-device (no D<->H round trip) and ForwardBlockLogitsWithDeviceKV runs
+  // the block forward straight off it — bit-identical to the D9 host path, and
+  // the capture-ready substrate for Parts B/C. shared_ptr-to-incomplete is safe:
+  // MakeDeviceKVStore constructs the control block (with its deleter) in
+  // qwen3_dflash.cpp.
+  //
+  // KEYED BY REQUEST ID, NOT BY BATCH ROW (#2008). These three fields were three
+  // arrays indexed by the runner's condensed-dense batch row, with a fourth
+  // recording each row's occupant so a reused slot could reset. A row index is
+  // not stable for a request's lifetime here: `InputBatch::condense` slides a
+  // live request down into the hole a finished neighbour left, and `swap_states`
+  // exchanges two live rows. Both permute every per-slot array they own —
+  // including the block-table rows — and neither knows these exist, because they
+  // live on the runner rather than in `InputBatch`. So the survivor of a
+  // completed pair met the departed request's bookkeeping, the occupant test
+  // read a changed id, the store was reset to EMPTY under a request still using
+  // it, and `propose_drafts_block`'s position invariant then refused. #2008
+  // measured what that costs: DFlash2 served c=1 at 24.70 out tok/s and VOIDed
+  // at c=2 with ok=1, after which every later request on that server came back
+  // `[request submitted to a stopped AsyncLLM]`.
+  //
+  // Upstream keys the same state to the request on both of its paths. Its V2
+  // runner, where DFlash2 lives, has no `condense` at all — a finished request's
+  // slot returns to a free list and stays that request's for its lifetime
+  // (`vllm/v1/worker/gpu/states.py:29,100,132` @ `b389ac2946`) — and every
+  // cross-step speculator tensor is indexed through
+  // `req_state_idx = idx_mapping[req_idx]`
+  // (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:536`). Its legacy V1
+  // runner does condense, and there the draft's block-table row moves with the
+  // request (`vllm/v1/worker/gpu_input_batch.py:786` ->
+  // `vllm/v1/worker/block_table.py:367-373`). A request id is the key that
+  // survives any reordering of OUR batch, so every permutation the batch can
+  // perform is a no-op here — which is the property that makes upstream's
+  // speculator indifferent to row order in the first place.
+  //
+  // Entries are pruned each propose against `InputBatch`'s own membership, so a
+  // finished or preempted request releases its device store on the step after it
+  // leaves the batch.
+  struct DflashReqCtx {
+    std::shared_ptr<vllm::DflashDeviceKVStore> store;
+    // Committed context length L. Kept in lockstep with the store's own num_ctx,
+    // and asserted against it every propose (SPEC-DFLASH2 W8, #1838).
+    int32_t ctx_len = 0;
+    // #1919: this request no longer fits the store and runs on the target alone.
+    // STICKY for the request's lifetime, and that is forced rather than chosen:
+    // `propose_drafts_block` keeps `ctx_len` in lockstep with the store's
+    // `num_ctx` and asserts both against the target's committed positions, so a
+    // step that declines to append breaks that lockstep and every later step for
+    // the same request must decline too. Upstream's own skip is monotone in the
+    // same way: its `num_tokens >= max_model_len` condition only ever becomes
+    // true (`vllm/v1/spec_decode/ngram_proposer.py:156-159`). Being a property
+    // of the REQUEST — which the row-indexed form could only approximate, and
+    // its comment already claimed — it now simply ends with the request.
+    bool disabled = false;
+  };
+  std::unordered_map<std::string, DflashReqCtx> dflash_ctx_;
+  // #1919: the store's resolved capacity, taken ONCE at set_dflash_draft from
+  // this engine's own max_model_len. The "no longer fits" flag it pairs with is
+  // `DflashReqCtx::disabled` above.
+  vllm::Qwen3DFlashModel::DflashCtxStoreSizing dflash_ctx_sizing_;
   // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and
   // allocated in initialize_kv_cache when spec is on. draft_attn_kv_ (declared
   // above) views into these buffers. Empty on the default path.

@@ -70,6 +70,43 @@ struct DflashDraft {
   int k = 0;
 };
 
+// REBIND the draft's embedding lookup onto the TARGET's table, so the two share
+// one OwnedTensor and therefore one device upload (#1946).
+//
+// THE DEFECT. The draft owns no table; the loader read the target's a second
+// time into `draft.weights.embed_tokens`. `ResidentWeight` caches its
+// host->device upload on the OwnedTensor (the `if (!w.d_dev)` guard in
+// `include/vllm/model_executor/models/dense_attn_block.h::ResidentWeight`),
+// so two tensors are two allocations of identical
+// bytes no matter how the HOST bytes are shared — which is why W9's (#1849)
+// borrow-first host read did not close this. On the 27B that is BF16
+// [248320, 5120] = 2,542,796,800 B held twice, out of GB10's unified pool.
+//
+// UPSTREAM does the same rebind by reference, at
+// vllm/v1/worker/gpu/spec_decode/dflash/utils.py:64-74 @
+// b389ac29465b33f9e9c534df221ea3c129e9793f: `del draft_inner.embed_tokens;
+// draft_inner.embed_tokens = target_embed`. `_should_share`
+// (eagle/utils.py:12-25 @ the same head) shares UNCONDITIONALLY when the draft
+// declares no own table, which is this lane, and only compares bytes when it
+// does. So no byte comparison here either — provenance already says these are
+// the same tensor of the same file, and comparing 2.5 GB at load would fault in
+// every page of a table the load has otherwise never read.
+//
+// WHAT IT REFUSES TO BIND, and why the check is not decorative. A GGUF target
+// may KEEP its table F16 in place (`LoadEmbedAndHead`'s kKeepF16 arm) while the
+// draft's shared read always produces BF16. Those are different bytes and must
+// never be aliased, so a dtype/rank/shape disagreement leaves both tables
+// standing — today's behaviour, correct tokens, no dedup — and says so on
+// stderr rather than failing the load. A DSpark draft is skipped outright: its
+// backbone owns its table by value and is a separate lane.
+//
+// EXPORTED, not file-local, for the reason W9 gave when it exported
+// `LoadDflashSharedEmbedBf16`: a deletion mutation can remove this lever
+// silently, so the gate has to reach the exact function production calls.
+// Returns true when it rebound. Called from the ONE LoadedEngine constructor
+// that every draft loader funnels into.
+bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target);
+
 // vLLM CacheConfig.gpu_memory_utilization's own default (vllm/config/cache.py:68
 // @ 555967922). Named because EngineParams carries the knob as an optional, so
 // "the caller chose nothing" and "the caller chose 0.92" are different states
@@ -441,6 +478,26 @@ class LoadedEngine {
                                 const HfConfig& config,
                                 const vllm::v1::KVCacheConfig& kv_cfg,
                                 int block_size);
+  // The serving `max_num_seqs`, resolved AGAINST the recurrent-state budget the
+  // KV pool affords (issue #1983). `max_num_seqs` sizes no allocation anywhere
+  // in vLLM; here it multiplied the GDN state pool
+  // (`gdn_state_slots_ = max_num_reqs * (num_spec + 1)`, one conv and one SSM
+  // buffer per GDN layer, zeroed at construction) on an axis no memory flag
+  // bounded. Upstream unifies the mamba page with the attention page and draws
+  // both from ONE budgeted pool, so its recurrent allocation is a function of
+  // available memory and never of the concurrency cap; this resolves the same
+  // property through `vllm::v1::ComputeHybridKvBudget`.
+  //
+  // Attention-only models and pure-recurrent models both pass the configured
+  // value through unchanged (the budget reports `kStateSeqsUnbounded`), so every
+  // non-hybrid engine is byte-identical to before this existed. A reduction is
+  // LOGGED, never silent, and never refuses: refusing belongs to the #371 state
+  // guard, which still runs afterwards against this resolved value.
+  //
+  // Exposed, like the two resolvers above, so the policy is gateable without a
+  // disk load.
+  static int ResolveMaxNumSeqs(const EngineParams& params,
+                               const vllm::v1::KVCacheConfig& kv_cfg);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
   // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
@@ -519,6 +576,10 @@ class LoadedEngine {
   // selected. Exposed so a gate reads what the loader actually sized instead of
   // re-deriving the arithmetic it is supposed to be checking.
   const vllm::v1::KVCacheConfig& kv_cache_config() const { return kv_cfg_; }
+  // The RESOLVED serving concurrency: `--max-num-seqs` after the recurrent-state
+  // budget clamp (issue #1983). Equal to the configured value on every
+  // attention-only model.
+  int max_num_seqs() const { return max_num_seqs_; }
 
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
   // none was configured. Exposed so the output-invariance gate can read the
@@ -678,13 +739,28 @@ class LoadedEngine {
   // the engine-core draft pull all read it. nullopt ⇒ every spec path is inert
   // and the engine is byte-identical to the pre-spec engine.
   std::optional<vllm::SpeculativeConfig> resolved_spec_config_;
+  // Concrete weights and model-specific runtime state behind the central
+  // registry contract. Declared before runner_ so its borrow remains live.
+  //
+  // #1946 moved it AHEAD of dflash_draft_, and the order is now load-bearing in
+  // both directions. Construction: the draft's embedding table is rebound onto
+  // this model's table in the initialiser list, so the model must already
+  // exist. Destruction: members die in reverse declaration order, so the draft
+  // -- which now holds a BORROWED pointer into this model's weights -- dies
+  // first.
+  //
+  // The old order was not ITSELF a use-after-free, and #1946 first said it was.
+  // `DflashDraft` has no user-declared destructor and destroying it never
+  // DEREFERENCES `weights.shared_embed_tokens`, so the dangling pointer was
+  // never read. What the old order left was a WINDOW: anything later added to
+  // that teardown -- a device-residency release, a flush, a log of the table --
+  // would have read freed memory. The new order closes the window; it did not
+  // fix a live bug.
+  std::unique_ptr<LoadedModel> model_;
   // SPEC-DFLASH D5: the owned DFlash draft (null unless method=="dflash").
   // Declared before runner_ so the borrow the runner holds stays live for the
   // runner's whole lifetime. Set in the ctor body via runner_.set_dflash_draft.
   std::unique_ptr<DflashDraft> dflash_draft_;
-  // Concrete weights and model-specific runtime state behind the central
-  // registry contract. Declared before runner_ so its borrow remains live.
-  std::unique_ptr<LoadedModel> model_;
   // KV-EXTERNAL-CACHE (LMCache): the owned external KV connector (null unless
   // EngineParams::kv_transfer_config selects one). Declared BEFORE runner_ /
   // scheduler_ so it outlives the non-owning pointers they hold to it. Built in
@@ -704,6 +780,10 @@ class LoadedEngine {
   // depends only on model_/config_/resolved_spec_config_, all declared above.
   vllm::v1::KVCacheConfig kv_cfg_;
   int max_model_len_;
+  // Declared AFTER kv_cfg_ (it is resolved against the KV pool's recurrent-state
+  // budget) and BEFORE runner_ / scheduler_ / structured_output_manager_, every
+  // one of which takes the already-resolved value. See ResolveMaxNumSeqs.
+  int max_num_seqs_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
   // ENG-SGLANG-BEHAVIOR-FLAG SW3: jump-forward enable, resolved once from

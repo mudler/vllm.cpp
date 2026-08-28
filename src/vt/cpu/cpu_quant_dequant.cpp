@@ -62,6 +62,46 @@ void DequantQ4_0(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+// block_q5_0 = { f16 d; u8 qh[4]; u8 qs[16]; }  (22 bytes)
+// llama.cpp @ b10451 ggml/src/ggml-quants.c:500 dequantize_row_q5_0, ported
+// verbatim including the shift order (the two halves read qh bits j and j+16
+// through DIFFERENT shift expressions, and swapping them silently corrupts the
+// upper half of every block).
+void DequantQ5_0(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 32;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 22;
+    const float d = ReadF16(blk);
+    uint32_t qh = 0;
+    std::memcpy(&qh, blk + 2, sizeof(qh));
+    const uint8_t* qs = blk + 6;
+    for (int j = 0; j < qk / 2; ++j) {
+      const uint8_t xh_0 = static_cast<uint8_t>(((qh >> (j + 0)) << 4) & 0x10);
+      const uint8_t xh_1 = static_cast<uint8_t>((qh >> (j + 12)) & 0x10);
+      const int32_t x0 = ((qs[j] & 0x0F) | xh_0) - 16;
+      const int32_t x1 = ((qs[j] >> 4) | xh_1) - 16;
+      y[i * qk + j + 0] = x0 * d;
+      y[i * qk + j + qk / 2] = x1 * d;
+    }
+  }
+}
+
+// block_iq4_nl = { f16 d; u8 qs[16]; }  (18 bytes)
+// llama.cpp @ b10451 ggml/src/ggml-quants.c:2725 dequantize_row_iq4_nl.
+// Q4_0's loop with the codebook lookup where the `- 8` used to be.
+void DequantIQ4_NL(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 32;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 18;
+    const float d = ReadF16(blk);
+    const uint8_t* qs = blk + 2;
+    for (int j = 0; j < qk / 2; ++j) {
+      y[i * qk + j + 0] = d * kValuesIq4nl[qs[j] & 0x0F];
+      y[i * qk + j + qk / 2] = d * kValuesIq4nl[qs[j] >> 4];
+    }
+  }
+}
+
 // block_q8_0 = { f16 d; i8 qs[32]; }  (34 bytes)   dequantize_row_q8_0:495
 void DequantQ8_0(const uint8_t* data, int64_t nb, float* y) {
   constexpr int qk = 32;
@@ -462,6 +502,7 @@ void ToFloatAdapter(const void* x, float* y, int64_t k) {
 ToFloatFn BlockToFloat(DType dtype) {
   switch (dtype) {
     case DType::kQ4_0: return &ToFloatAdapter<&DequantQ4_0, 32>;
+    case DType::kQ5_0: return &ToFloatAdapter<&DequantQ5_0, 32>;
     case DType::kQ8_0: return &ToFloatAdapter<&DequantQ8_0, 32>;
     case DType::kQ2_K: return &ToFloatAdapter<&DequantQ2_K, 256>;
     case DType::kQ3_K: return &ToFloatAdapter<&DequantQ3_K, 256>;
@@ -474,6 +515,7 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kIQ2_S: return &ToFloatAdapter<&DequantIQ2_S, 256>;
     case DType::kIQ1_S: return &ToFloatAdapter<&DequantIQ1_S, 256>;
     case DType::kIQ1_XXXS: return &ToFloatAdapter<&DequantIQ1_XXXS, 256>;
+    case DType::kIQ4_NL: return &ToFloatAdapter<&DequantIQ4_NL, 32>;
     case DType::kMXFP4: return &ToFloatAdapter<&DequantMXFP4, 32>;
     default: return nullptr;
   }

@@ -75,13 +75,24 @@ using vt::Tensor;
 
 // cuBLASLt FP8 dense GEMM toggle (VT_DENSE_CUBLASLT_FP8, DEFAULT ON when the fp8
 // weights are resident). Routes the fp8 dense projections through vt::
-// MatmulFp8CublasLt (cuBLASLt e4m3 — the native equivalent of vLLM's measured-
-// FASTER nvjet_sm121_qqtst fp8 kernels) instead of vt::MatmulFp8Cutlass (our
-// cutlass sm120 fp8 GEMM, measured NEUTRAL vs bf16 at M=64/sm_121a). The
-// activation quant + fp8-resident weight are IDENTICAL for both — only the GEMM
-// backend differs, so both are the same fp8 W8A8 math (vLLM's scheme).
+// MatmulFp8CublasLt (cuBLASLt e4m3) instead of vt::MatmulFp8Cutlass (our cutlass
+// sm120 fp8 GEMM, measured NEUTRAL vs bf16 at M=64/sm_121a). The activation
+// quant + fp8-resident weight are IDENTICAL for both — only the GEMM backend
+// differs, so both are the same fp8 W8A8 math (vLLM's scheme).
 // VT_DENSE_CUBLASLT_FP8=0 restores the cutlass fp8 GEMM (the previous, validated
 // path) for the parent's authoritative A/B.
+//
+// THE DEFAULT'S RECORDED JUSTIFICATION IS REFUTED, and the default has not
+// moved (PERF-FP8-SMALL-M-DISPATCH, #1866). This comment used to call the
+// cuBLASLt arm "the native equivalent of vLLM's measured-FASTER
+// nvjet_sm121_qqtst fp8 kernels". At the pin vLLM runs `cutlass_scaled_mm` for
+// this GEMM and no cuBLASLt at all, and #1857's artifact-verified GB10 profile
+// measured our cuBLASLt arm resolving to `sm89_xmma ... tilesize32x64x64`, not
+// nvjet — see the correction beside the kernel in `src/vt/cuda/cuda_matmul.cu`.
+// The CUTLASS arm has since regained upstream's M16/M32 rungs, which is what
+// makes the A/B this flag exists for a fair one for the first time at decode M.
+// Flipping the default is a MEASUREMENT's decision and is `## Owed` in
+// .agents/specs/perf-fp8-small-m-dispatch.md; nothing here presumes it.
 inline bool DenseCublasLtFp8Enabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_DENSE_CUBLASLT_FP8");
@@ -110,8 +121,9 @@ inline Tensor ResidentFp8(DevT d, const Fp8Weight& w) {
 // GEMM: static per-tensor activation quant (vt::QuantFp8Static with the
 // checkpoint input_scale) then an fp8 GEMM with the folded alpha
 // (= input_scale·weight_scale). By DEFAULT the GEMM is cuBLASLt fp8 (vt::
-// MatmulFp8CublasLt — mirrors vLLM's nvjet_qqtst fp8 dense); VT_DENSE_CUBLASLT_
-// FP8=0 selects the cutlass sm120 fp8 GEMM (vt::MatmulFp8Cutlass). out dtype f32
+// MatmulFp8CublasLt — a vt original, NOT a vLLM mirror; see the flag above);
+// VT_DENSE_CUBLASLT_FP8=0 selects the cutlass sm120 fp8 GEMM, which IS the
+// mirror (vt::MatmulFp8Cutlass). out dtype f32
 // (q/k/v, in_proj_qkv/z sinks) or bf16 (o/out_proj residual sinks). CUDA-only
 // (the 35B W8A8 path is CUDA-resident — fp8 fields are populated by DEFAULT on
 // the CUDA+cutlass load, VT_DENSE_NATIVE).

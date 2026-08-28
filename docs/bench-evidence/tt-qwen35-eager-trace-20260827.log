@@ -1,0 +1,106 @@
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+INFO recurrent-state budget: reduced max_num_seqs from 32 to 15. The KV pool (256 blocks) holds 15 unified pages of 544 tokens (one page = one 1085440-byte GDN state), and each sequence owns 1 of them. Raise --num-blocks / --kv-cache-memory for more concurrent sequences, or lower num_speculative_tokens.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[TT-TRACE] device->device copy (capture-safe) dst=0xfff4b8ced540 src=0xfff4b8003380 bytes=22528 frames=8
+[TT-TRACE]   bt[1]=0xfffdfe3c83b8 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0xdd83b8) [0xfffdfe3c83b8]
+[TT-TRACE]   bt[2]=0xfffdfd7be374 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1ce374) [0xfffdfd7be374]
+[TT-TRACE]   bt[3]=0xfffdfd7c4548 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1d4548) [0xfffdfd7c4548]
+[TT-TRACE]   bt[4]=0xfffdfd7c51f8 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1d51f8) [0xfffdfd7c51f8]
+[TT-TRACE]   bt[5]=0xfffdfd7efe20 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1ffe20) [0xfffdfd7efe20]
+[TT-TRACE]   bt[6]=0xfffdfddff290 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x80f290) [0xfffdfddff290]
+[TT-TRACE]   bt[7]=0xfffdfdfd4548 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x9e4548) [0xfffdfdfd4548]
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] device->device copy (capture-safe) dst=0xfff39bffd880 src=0xfff39bf1f0c0 bytes=2048 frames=8
+[TT-TRACE]   bt[1]=0xfffdfe3c83b8 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0xdd83b8) [0xfffdfe3c83b8]
+[TT-TRACE]   bt[2]=0xfffdfd7be374 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1ce374) [0xfffdfd7be374]
+[TT-TRACE]   bt[3]=0xfffdfd7c4548 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1d4548) [0xfffdfd7c4548]
+[TT-TRACE]   bt[4]=0xfffdfd7c51f8 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1d51f8) [0xfffdfd7c51f8]
+[TT-TRACE]   bt[5]=0xfffdfd7efe20 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x1ffe20) [0xfffdfd7efe20]
+[TT-TRACE]   bt[6]=0xfffdfddff290 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x80f290) [0xfffdfddff290]
+[TT-TRACE]   bt[7]=0xfffdfdfd4548 /home/lu_zero/Sources/vllmcpp-tt-q35prof/build/libvllm.so.0(+0x9e4548) [0xfffdfdfd4548]
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+[TT-TRACE] TryRACDevice called capturing=0
+[TT-TRACE] RAC kv shadow k_ptr=0xfff3abf22d80 sk=0xfff3819dbcb8 dc=0 val=0 | v_ptr=0xfff382178680 sv=0xfff381bac688 dc=1 val=1
+[TT-TRACE] TryPADecode entered cap=0
+[TT-TRACE] PA reached EnsurePagedKvTtnn cap=0 used_nb=2
+[TT-TRACE] PA shadow miss: k_dc=0 k_dev=0 k_nb=2/2 v_dc=0 v_dev=0 v_nb=2/2
+[TT-TRACE] PA device decode FAILED: vt: EnsurePagedKvTtnn: contiguous rank-4 NHD cache at /home/lu_zero/Sources/vllmcpp-tt-q35prof/src/vt/tenstorrent/tenstorrent_ops.cpp:927
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=11 completion_tokens=3 secs=29.403 tok_s=0.102
+vllm-cli: run=1/1 generate_start_unix=1787848758.943107 generate_end_unix=1787848788.346194

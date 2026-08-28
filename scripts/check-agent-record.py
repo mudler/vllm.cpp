@@ -130,7 +130,40 @@ MATRICES = {
     # vllm#51255, still being patched), carries no pinned-registry target, and
     # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
     # because two rows EXIST, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 377),
+    # 378 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
+    # forward: +1 for `MODEL-MM-qwen4-exp-qwen4-exp-for-conditional-generation`
+    # (`Qwen4ExpForConditionalGeneration`, `Qwen/Qwen3.8-Flash-Next`), landing
+    # `READY` with its spec committed (#1978). ONE row and not two: the MTP head
+    # is a `mtp` block inside the same text config, not a separately registered
+    # architecture, so this is not the IndexTTS-2.5 / dots3-note shape that moved
+    # this pin by two. Beyond-pin in the strongest sense yet recorded here -- the
+    # Muse Glimmer, Qwen3.5-text-only and dots3-note entries above are all
+    # architectures vLLM registers on `main` AFTER `555967922`, whereas this one
+    # vLLM does not implement at ANY revision: read live 2026-08-26 at
+    # `origin/main` = `6a5e8f5979`, there is no `qwen4*` path, no `registry.py`
+    # entry, and a repository-wide search for `qwen4` returns zero results. Its
+    # Upstream cell therefore carries no pinned module/class target and its
+    # algorithm source is transformers#48337, so the at-the-pin static invariants
+    # (324/373/356/310/261) are UNCHANGED. Bumped because one row EXISTS, never to
+    # make a transition pass.
+    # 379 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
+    # forward: +1 for `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`
+    # (`Glm5NextForConditionalGeneration`, `zai-org/GLM-5.3-Flash`), landing
+    # `READY` with its spec committed (#1998). ONE row and not three, which is
+    # the arithmetic this comment exists to justify: the OPEN vllm#53906 would
+    # register `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` AND
+    # `Glm5NextMTPModel`, so the IndexTTS-2.5 / dots3-note two-row shape is the
+    # tempting read. It does not apply. None of the three names is registered at
+    # ANY vLLM revision, and the only architecture a published artifact declares
+    # is `Glm5NextForConditionalGeneration` -- the MTP head is `layers.45` inside
+    # the same checkpoint, which the transformers reference discards outright at
+    # `modular_glm5_next.py:1235`. Beyond-pin in the same strongest sense as the
+    # qwen4-exp row above: read live 2026-08-26, `git grep "Glm5\|glm5_next"`
+    # returns zero hits at `555967922` and at `origin/main` = `c71f6f8a81`. Its
+    # Upstream cell therefore carries no pinned module/class target and the
+    # at-the-pin static invariants (324/373/356/310/261) are UNCHANGED. Bumped
+    # because one row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 379),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -333,7 +366,21 @@ MATRICES = {
     # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
     # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
     # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 57),
+    # 58 since 2026-08-25 (#1451): +`KERNEL-LTX2-VAE`, the ten stages of the
+    # LTX-2.5 conv video VAE decode that sit BETWEEN its convolutions, as one
+    # `vt::OpId::kLtx2Vae` provider payload. A separate family from
+    # `KERNEL-CONV3D` rather than more entries on it, on the same axis that
+    # separates the rows above: `KERNEL-CONV3D` is a dense CONTRACTION whose
+    # difficulty is a reduction and whose accumulation order is its contract,
+    # while these ten are elementwise affines, normalisations and pure GATHERS
+    # whose contract is an index expression -- and the two are gated differently
+    # in consequence, the convolution against an independent scalar reference and
+    # these against the committed decode goldens they were transcribed from.
+    # Bumped because the row EXISTS, never to make a state transition pass; it is
+    # `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
+    # anywhere in this project's reach (spec `## Owed`, inheriting #1452) and
+    # because `AttnBlock3d` remains the declared staged remainder.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 58),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -389,7 +436,7 @@ MATRICES = {
      # linear-attention op chain as native TT kernels — the hard prerequisite
      # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
      # implementation yet.
-    "BACKEND": (AGENTS / "backend-matrix.md", 86),
+    "BACKEND": (AGENTS / "backend-matrix.md", 87),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -705,7 +752,38 @@ ENGINE_PREFIXES = (
 # limited its size except httplib's 100 MB default. `GATING`, spec
 # `specs/serve-request-length-guard.md`. Bumped for a real new row, never to make
 # a failing state transition pass.
-ENGINE_ROWS = 170
+# 171 since 2026-08-24: +`ENG-UPSTREAM-LTX2-PIN` (pin `Lightricks/LTX-2`, the
+# LTX-2.5 lane's actual reference and a third repository, #1433). A genuinely-new
+# row rather than a state move: the oracle registry named nine upstreams and this
+# lane's own was not one of them, so `check-oracle-pins.py` reported
+# `oracle-pins ok (9 oracles pinned)` while the repository every LTX anchor
+# resolves in had no file, no table row and no pin. `READY`, spec
+# `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
+# state transition pass.
+# 172 since 2026-08-25: +`KV-DSV4-MULTICACHE` (DeepSeek-V4's real KV topology,
+# #1925). A genuinely-new row rather than a state move: no KV-* row and no
+# DeepSeek-V4 row owned the cache topology, `MODEL-TEXT-deepseek-v4-...` promises
+# "paged attention/KV" in its scope string while both its forwards discard
+# `attn_kv`, and the work was tracked only as prose calling itself
+# multi-Spark-blocked. `READY`, spec `specs/kv-dsv4-multicache.md`. Bumped for a
+# real new row, never to make a failing state transition pass.
+# 173 since 2026-08-26: +`ENG-POOL-BEST-FIT` (the shared device scratch pool
+# could only hand a freed block back to a request in the block's OWN size class,
+# so retention was a function of how many distinct shapes the traffic had shown
+# rather than of how much one step concurrently needs, #1922). A genuinely-new
+# row rather than a state move: `POOL-DEVICE-KEY` is `DONE` and owned the pool's
+# DEVICE key, nothing owned its REUSE policy, and no engine row covered
+# per-request memory growth at all. `ACTIVE`, spec
+# `specs/pool-best-fit-retention.md`.
+#
+# 172 AND 173 ARE THE SAME NIGHT, and the pair is why this is 173 and not 172.
+# #1925 and #1922 each added ONE engine row and each bumped this pin 171 -> 172
+# on its own branch, so the two sides carry an IDENTICAL `ENGINE_ROWS = 172`
+# line. A three-way merge sees no conflict on that line and keeps 172, which
+# counts one of the two new rows and silently drops the other. The counter is
+# the union, so it is 173. Bumped for real new rows, never to make a failing
+# state transition pass.
+ENGINE_ROWS = 173
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

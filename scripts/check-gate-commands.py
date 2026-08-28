@@ -427,7 +427,30 @@ def audit() -> list[dict]:
 # suite invocations that genuinely fail on a broken guard -- the same three the
 # implementing branch's red-then-green evidence was taken from -- so the credit is
 # the row's own and not inherited.
+# 2026-08-24: +ENG-UPSTREAM-LTX2-PIN enters the runnable population when its spec
+# lands (#1433). GROWTH, so the set is re-pinned in the same change, per the note
+# above. The credit is the row's OWN and is not inherited: its `## Gates` names
+# `scripts/check-oracle-pins.py`, its `--self-test`, `scripts/check-agent-record.py`
+# and two pytest suites, and the first genuinely fails on a broken record rather
+# than exiting 0 in any tree. That was proved by mutation in the same change, both
+# directions: deleting `.agents/oracles/ltx-2.md` reds with `admitted by the
+# AGENTS.md table but has no .agents/oracles/ record`, and deleting the AGENTS.md
+# table row reds with `pinned in .agents/oracles/ but absent from the AGENTS.md
+# table`. A record row is credited for the checker that reads the record, which is
+# the only thing a record row can execute.
+# 2026-08-25: +ENG-POOL-BEST-FIT enters the runnable population when its spec
+# lands (#1922). GROWTH, so the set is re-pinned in the same change, per the note
+# above. The credit is the row's OWN: its `## Gates` names a configure, the
+# focused target, TWO invocations of the SAME binary whose verdicts must
+# DIFFER -- `./build/tests/test_engine_scratch_steady_state` must pass and
+# `VT_POOL_BORROW=0 ./build/tests/test_engine_scratch_steady_state` must fail --
+# then the full build and `ctest`. A gate that names both arms of a same-binary
+# A/B cannot be satisfied by a tree in which the guard does nothing, which is
+# exactly what "genuinely fails on a broken guard" asks for, and it was proved by
+# three mutations in the same change rather than asserted.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-POOL-BEST-FIT",
+    "ENG-UPSTREAM-LTX2-PIN",
     "SERVE-REQUEST-LENGTH-GUARD",
     "ENG-CUDAGRAPH-BREAK",
     "ENG-HF-MODEL-DOWNLOAD",
@@ -486,6 +509,21 @@ RUNNABLE_BASELINE = frozenset({
     # W1/W2 not implemented), so this is an inherited credit in the exact
     # shape the #1541 note describes, not a certificate.
     "BACKEND-TENSTORRENT-GDN",
+    # LTX25-VAE-DEVICE-RESIDENCY (2026-08-25, issue #1451): GROWTH, re-pinned in
+    # the same change. `KERNEL-LTX2-VAE` is a NEW row rather than an existing one
+    # that changed shape, and it enters the runnable population because its
+    # Gates section names two test binaries and a ctest sweep that can fail --
+    # `test_diffusion_device_seam` (the residency assertion, a host-device
+    # transfer COUNT on a fake accelerator) and `test_ltx2_vae` (the committed
+    # decode goldens the ten kernel arms were transcribed from). Neither is a
+    # `git diff`, so the row earns the entry rather than being carried by one.
+    "KERNEL-LTX2-VAE",
+    # 2026-08-23: +BACKEND-TENSTORRENT-QWEN35 enters the runnable population
+    # when its spec lands (#1715 wiring row). Same inherited-credit shape as
+    # BACKEND-TENSTORRENT-GDN above: the credit is the pre-existing full TT
+    # suite, CPU gate, and agent-preflight.sh; the row's own sweep/e2e gates
+    # are owed (spec-first).
+    "BACKEND-TENSTORRENT-QWEN35",
 })
 
 

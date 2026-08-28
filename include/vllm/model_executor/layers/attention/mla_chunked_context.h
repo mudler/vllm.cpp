@@ -320,6 +320,13 @@ inline void ComputeMlaPrefillContext(vt::Queue& q, const vt::Tensor& query,
 // The final merge is PREFIX = context, SUFFIX = new tokens (:2413-2420) — the
 // order matters, and it carries `prefill_tokens_with_context` so query rows
 // belonging to context-free requests take the suffix verbatim.
+//
+// `sliding_window` (dots3-note W4b-2, #699) is 0 for every DeepSeek / MiniCPM3 /
+// Kimi-Linear caller, which leaves `window_size` at `std::nullopt` and this
+// function byte-identical. > 0 is `sliding_window_size`, and it reaches the
+// new-tokens call as the `AttentionWindow{W - 1, 0}` pair upstream hands
+// FlashAttention (`vllm/models/dots3_note/nvidia/attention.py:300` @
+// `bc2d63e650`).
 inline void ForwardMlaPrefillMha(vt::Queue& q, vt::Tensor& output, const vt::Tensor& query,
                                  const vt::Tensor& key, const vt::Tensor& value,
                                  const vt::Tensor& kv_cache, const vt::Tensor& block_table,
@@ -328,8 +335,22 @@ inline void ForwardMlaPrefillMha(vt::Queue& q, vt::Tensor& output, const vt::Ten
                                  const MlaUpProjectFn& up_project, float scale,
                                  int32_t max_query_len, int32_t prefill_tokens_with_context,
                                  MlaPrefillContextBuffers& bufs, vt::Tensor& suffix_output,
-                                 vt::Tensor& suffix_lse) {
+                                 vt::Tensor& suffix_lse, int64_t sliding_window = 0) {
   const bool has_context = !chunks.empty();
+  // A windowed prefill that ALSO has chunked context has no upstream form to
+  // mirror: a sliding layer gathers only `min(seq_len, query_len + W - 1)` keys
+  // and runs one varlen call per request group (attention.py:206, :594-654), so
+  // the LSE merge below never runs windowed upstream. Refuse rather than merge
+  // an unwindowed context into a windowed suffix, which is a silently wrong
+  // answer and exactly the class this row keeps naming.
+  if (sliding_window > 0 && has_context) {
+    throw std::invalid_argument(
+        "MLA prefill: a SLIDING-WINDOW layer with chunked CONTEXT is not ported. "
+        "Upstream's windowed prefill caps the gather at the window instead of "
+        "merging context chunks (dots3-note attention.py:206, :594-654), so there "
+        "is no windowed form of this merge to mirror. See "
+        ".agents/specs/dots3-note.md `## Owed` and issue #699.");
+  }
 
   // ":2381-2392" — the causal pass over the new tokens. `return_softmax_lse` is
   // True exactly when there is context to merge with (:2385).
@@ -338,6 +359,9 @@ inline void ForwardMlaPrefillMha(vt::Queue& q, vt::Tensor& output, const vt::Ten
   args.causal = true;
   args.max_seqlen_q = max_query_len;
   args.max_seqlen_k = max_query_len;
+  if (sliding_window > 0) {
+    args.window_size = vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
+  }
   vt::Tensor& new_out = has_context ? suffix_output : output;
   vt::MlaPrefillAttention(q, new_out, has_context ? &suffix_lse : nullptr, query, key, value,
                           cu_seqlens_q, cu_seqlens_q, args);

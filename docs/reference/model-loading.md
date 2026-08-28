@@ -24,7 +24,7 @@ build/examples/vllm-cli \
 | `--seed S` | (unset) | RNG seed (enables seeded sampling) |
 | `--stream` | off | Stream token deltas to stdout |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. Every key is checked and none is dropped: an unknown or misspelled name is refused at startup by name, and a real vLLM key this engine does not implement is refused as such ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)). See [the speculative decoding guide](../SPECULATIVE-DECODING.md) |
-| `--offload-config '<json>'` | (unset) | Weight placement, the same JSON document `vllm-server` takes and the same C ABI field. Both halves: vLLM's mirrored `uva`/`prefetch` device-to-host weight offload, and vllm.cpp's `vllm_cpp` key for the host-to-disk residency tier that makes a checkpoint larger than host RAM loadable. An unknown key at any level of the document is refused at startup by name. Added by [#1135](https://github.com/mudler/vllm.cpp/issues/1135); see the [expert streaming guide](../guides/expert-streaming.md) |
+| `--offload-config '<json>'` | (unset) | Configure weight residency and placement through the same JSON document as `vllm-server` and the C ABI. It accepts vLLM's mirrored `uva`/`prefetch` fields and the `vllm_cpp` extension for disk residency and hybrid CPU/GPU expert placement. An unknown key at any level is refused at startup. See [Weight offload and placement](../WEIGHT-OFFLOAD.md) and [Expert streaming](../guides/expert-streaming.md) |
 | `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
@@ -52,8 +52,11 @@ Two more example binaries ship alongside it:
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
   GGUF `tokenizer.ggml.pre` names accepted: `qwen35`, `qwen2`, `llama-bpe`,
   `gpt-4o` / `llama4` / `kanana2` / `talkie` (the GPT-4o / o200k family),
-  `joyai-llm`, `deepseek-llm`, `deepseek-v3`, `laguna`. Any other name is
-  refused by name rather than aliased onto a near-miss regex.
+  `deepseek-llm` (DeepSeek-V2), `deepseek-v3` / `joyai-llm` / `hunyuan-dense`
+  (DeepSeek-V3), `laguna`. Any other name is refused by name rather than aliased
+  onto a near-miss regex. Every name but `laguna` resolves to the EXACT
+  pre-tokenizer llama.cpp resolves it onto; `laguna` is an approximation because
+  llama.cpp has no such pre name, and its row says so.
 
 ## Which HF tokenizers load
 
@@ -69,7 +72,8 @@ name, so a checkpoint from any vendor loads if it carries one of these:
 | Tekken (Mistral) | case-aware letter runs, single-codepoint `\p{N}`, `/` in the punct tail | Mistral-Nemo-Instruct-2407 |
 | GPT-4o / o200k | the same case-aware letter runs, plus o200k's contraction SUFFIX and `\p{N}{1,3}` | Muse Glimmer (pre `llama4`), GPT-4o |
 | GPT-2 byte-level | `ByteLevel(use_regex=true)` with no explicit `Split` | OPT, GPT-2 |
-| DeepSeek | a seven-stage `Sequence` pipeline, not one alternation | DeepSeek-V2/V3 |
+| DeepSeek-V2 | a seven-stage `Sequence` pipeline, not one alternation: five `Split`s over enumerated codepoint ranges, `Digits`, `ByteLevel` | DeepSeek-V2, V2-Lite (pre `deepseek-llm`) |
+| DeepSeek-V3 | a FOUR-stage `Sequence` pipeline: `\p{N}{1,3}`, a kana/CJK class, a six-alternative word regex, `ByteLevel`. A separate family from DeepSeek-V2, sharing no stage with it | DeepSeek-V3, R1, V4-Flash (pre `deepseek-v3` / `joyai-llm`) |
 | SentencePiece | `Metaspace` + byte-fallback vocab | Mistral-7B-v0.3 |
 
 An unrecognised one fails loudly at load with `tokenizer: unrecognized

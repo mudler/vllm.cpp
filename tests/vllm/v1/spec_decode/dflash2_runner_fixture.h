@@ -100,7 +100,12 @@ OwnedTensor MakeOwned(DType dt, std::vector<int64_t> shape, uint64_t seed) {
 constexpr int kVocab = 24;      // == the tiny BPE fixture's ids 0..23, no holes.
 constexpr int kMaxModelLen = 32;
 
-HfConfig MakeDenseConfig() {
+// `max_pos` is the target's `max_position_embeddings`, and so the engine's
+// default `max_model_len`. Defaulted to `kMaxModelLen`, so every existing
+// construction is byte-for-byte what it was; #1919's long-context case raises
+// it, because a store sized from `max_model_len` can only be SHOWN to be sized
+// from it by a `max_model_len` that differs from the constant it replaced.
+HfConfig MakeDenseConfig(int max_pos = kMaxModelLen) {
   HfConfig c;
   c.model_type = "qwen3_5_text";
   c.architectures = {"Qwen3_5ForConditionalGeneration"};
@@ -122,7 +127,7 @@ HfConfig MakeDenseConfig() {
   c.rope_theta = 10000.0;
   c.rotary_dim = 4;
   c.rms_norm_eps = 1e-6;
-  c.max_position_embeddings = kMaxModelLen;
+  c.max_position_embeddings = max_pos;
   // mtp_num_hidden_layers == 1, which is what both gate checkpoints ship and
   // what LoadedEngine::ResolveSpecConfig reads to resolve n_predict.
   c.raw = json::object();
@@ -386,11 +391,40 @@ std::unique_ptr<DflashDraft> MakeDflash2Draft(const HfConfig& target,
   draft->weights = vllm::LoadQwen3DFlash(
       store.Resolver(), c, taps_fc,
       /*mask_token_id=*/static_cast<int32_t>(V - 1));
-  // What the loader's SharedHeadSource does: the draft SHARES the target's
+  // What the loader's SharedHeadSource does: the draft reads the target's
   // embed_tokens and lm_head. Built to the same shapes the safetensors arm
   // produces -- [vocab, H] with nk=false for the gather table and the same
   // [vocab, H] with nk=true for the MatmulBT head.
-  draft->weights.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 950);
+  //
+  // ONLY THE EMBED HALF IS ACTUALLY SHARED HERE, and this comment claimed both
+  // (#1946). The head below is seed 951 in [V, H] nk=true while the target's is
+  // seed 13 in [H, V] (MakeDenseWeights), so the two are different bytes in
+  // different orientations and no rebind relates them. The `lm_head` device
+  // dedup is owed under the spec's `## Owed` O1/O3 and nothing here touches it,
+  // so the fixture keeps its own head deliberately rather than by oversight.
+  //
+  // SEED 11, which is MakeDenseWeights' own embed seed, and not an arbitrary
+  // one (#1946). "SHARES the target's embed_tokens" is what this line has
+  // always claimed and what seed 950 made false: every DFlash2 gate in this tree
+  // was driving a draft/target pair no production load can produce, because both
+  // reads name the same tensor of the same file.
+  //
+  // WHAT THE SEED IS AND IS NOT DOING, because the first version of this comment
+  // had it backwards. On the GREEN tree it is a NO-OP:
+  // `BindDflashDraftSharedEmbed` clears this field at engine construction and
+  // every gather goes through `EmbedTable()`, so seed 950 here yields
+  // byte-identical drafted blocks and the same 8 cases / 144 assertions in
+  // test_dflash2_runner_reach. Measured on two builds, not reasoned.
+  //
+  // It matters for the RED runs. With seed 950 the pre-change state is "two
+  // DIFFERENT tables", which no production load can reach; with seed 11 it is
+  // "two copies of the SAME table", which is the defect #1946 describes. So the
+  // red-before legs measure the real duplication rather than a fixture artefact.
+  // It also makes this file read the same on both sides of the change -- at the
+  // parent commit seed 950 gave 8/162 and seed 11 gave 8/144 -- so a future
+  // revert of the production change no longer moves what these gates draft from
+  // for a reason belonging to the fixture rather than to the engine.
+  draft->weights.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 11);
   draft->weights.lm_head = MakeOwned(DType::kBF16, {V, H}, 951);
   draft->weights.lm_head.nk = true;
   draft->weights.draft_vocab_size = V;
@@ -433,8 +467,17 @@ class ScratchDraftDir {
   std::filesystem::path dir_;
 };
 
-EngineParams DflashSpecParams(const ScratchDraftDir& dir) {
+// `max_model_len` and `max_num_seqs` default to 0, which is `EngineParams`' own
+// "unset" on both fields, so an existing call resolves exactly as it did before
+// this signature grew (#1919).
+EngineParams DflashSpecParams(const ScratchDraftDir& dir, int max_model_len = 0,
+                              int max_num_seqs = 0, int max_num_batched_tokens = 0,
+                              int num_blocks = 0) {
   EngineParams p;
+  if (max_model_len > 0) p.max_model_len = max_model_len;
+  if (max_num_seqs > 0) p.max_num_seqs = max_num_seqs;
+  if (max_num_batched_tokens > 0) p.max_num_batched_tokens = max_num_batched_tokens;
+  if (num_blocks > 0) p.num_blocks = num_blocks;
   p.speculative_config = vllm::ParseSpeculativeConfigJson(
       R"({"method":"dflash","num_speculative_tokens":)" +
       std::to_string(kSpecTokens) + R"(,"model":")" + dir.path() + R"("})");
@@ -512,17 +555,34 @@ std::vector<std::string> DraftedBlocks(const std::string& captured) {
 namespace {
 
 // One engine run, returning the drafted blocks the production trace reported.
-std::vector<std::string> RunAndCollectDrafts(bool muse_glimmer_scalars,
-                                             std::string* threw) {
+//
+// `[[maybe_unused]]` because this header serves binaries that drive the engine
+// for a reason OTHER than the drafted tokens -- #1946's reachability binary
+// reads the loader's own stderr and never proposes -- and an anonymous-namespace
+// function nobody calls is a -Werror=unused-function failure there. The
+// attribute is scoped to this one entry point on purpose: everything it calls
+// stays gated by ordinary use.
+// `captured_out`, when non-null, receives the WHOLE captured stderr rather than
+// only the `first=[...]` payloads. SPEC-DFLASH2 W13 (#2117, #2112) needs it: the
+// production readout it gates is a LINE, and `DraftedBlocks` throws every line
+// that is not a propose trace away.
+// `prompt` defaults to the single-token "hello" every case before W13 used. A
+// LONGER prompt is what makes the first step RAGGED: at one token the prefill is
+// uniform at query length 1 and the runner never reaches the ragged arm at all,
+// so W13's classifier would have no production step to classify.
+[[maybe_unused]] std::vector<std::string> RunAndCollectDrafts(
+    bool muse_glimmer_scalars, std::string* threw,
+    std::string* captured_out = nullptr, const char* prompt = "hello") {
   const HfConfig target = MakeDenseConfig();
   const ScratchDraftDir dir;
   std::string what;
   std::string captured = CaptureStderr([&] {
     LoadedEngine eng(target, MakeDenseWeights(target), BuildFixture(),
                      DflashSpecParams(dir), MakeDflash2Draft(target, muse_glimmer_scalars));
-    what = GenerateAndCatch(eng, "hello");
+    what = GenerateAndCatch(eng, prompt);
   });
   if (threw != nullptr) *threw = what;
+  if (captured_out != nullptr) *captured_out = captured;
   return DraftedBlocks(captured);
 }
 

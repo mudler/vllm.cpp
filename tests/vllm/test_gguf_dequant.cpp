@@ -493,6 +493,32 @@ TEST_CASE("DequantGgufRowToF32 IQ1_XXXS row matches the pinned FORK oracle") {
                                 std::size(vllm_test::kIq1xxxsGoldenBits));
 }
 
+// --- IQ4_NL (20) / Q5_0 (6): the two 32-element encodings added for
+// `qwen4exp` (Qwen3.8-Flash-Next). IQ4_NL is what the shipped UD-IQ1_S uses for
+// all 48 `ffn_down_exps` AND for the 20M-entry `per_layer_token_embd` n-gram
+// table, because `moe_intermediate_size` 640 and the table row 160 are not
+// multiples of 256 and no K-quant can encode them. Q5_0 is the sibling landing
+// spot of llama.cpp's own `Q4_K -> Q5_0` row-size fallback.
+//
+// Gated against ORACLE-produced goldens, not against "does not throw" and not
+// against a hand-transcribed expectation: IQ4_NL's 16-entry codebook and Q5_0's
+// split `qh` bit plane are both fields a transcription can get wrong while
+// every self-consistent check in this tree stays green.
+// Provenance in tests/vt/iq4nl_q5_0_golden_vectors.h.
+#include "../vt/iq4nl_q5_0_golden_vectors.h"
+
+TEST_CASE("DequantGgufRowToF32 IQ4_NL row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(20, vllm_test::kIq4nlGoldenBlocks,
+                                vllm_test::kIq4nlGoldenBits,
+                                std::size(vllm_test::kIq4nlGoldenBits));
+}
+
+TEST_CASE("DequantGgufRowToF32 Q5_0 row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(6, vllm_test::kQ50GoldenBlocks,
+                                vllm_test::kQ50GoldenBits,
+                                std::size(vllm_test::kQ50GoldenBits));
+}
+
 TEST_CASE("DequantGgufRowToF32 IQ3_XXS row matches the pinned oracle") {
   // Same omission, found by the same review, in the same shared branch, so it
   // is fixed in the same flow rather than filed and deferred (issue #1023).

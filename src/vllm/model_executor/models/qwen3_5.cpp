@@ -19,10 +19,15 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
+#include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
+#include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/device_placement.h"
+#include "vllm/model_executor/moe_placement_seam.h"
+#include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // RunGdnBlockPaged (W5b seam, #2110)
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
@@ -691,32 +696,34 @@ using v1::CommonAttentionMetadata;
 using v1::GDNAttentionMetadata;
 
 // Backend + queue bundle threaded through every helper.
-struct Dev {
-  Backend& b;
-  Queue& q;
-};
+// ENG-QWEN35-SHARED-GLUE: `Dev`, `DBuf`, `MakeTensor`, `Reshape` and the
+// device-pool policy resolver were PRIVATE COPIES here and are now the shared
+// ones from `dense_device_glue.h`. This file kept its own set, which is the
+// off-framework divergence its `ResidentWeight` comment records — a repair
+// landed in the shared glue for 25 model files and never reached this one.
+// Keeping a private `Dev`/`DBuf` also gave them INTERNAL LINKAGE, so nothing
+// this file returned could be declared in a header, which is what forced the
+// MoE placement seam to carry two spellings.
+//
+// The two definitions were compared line by line before this change. They
+// differed in exactly one behaviour, and the shared one is the safer: it
+// guards `bytes_ > 0` before a host copy, where the private one issued a
+// zero-byte `Copy`. Everything else was comments and ordering.
+//
+// `ResidentWeight` and `ResidentWeightF32` stay private ON PURPOSE. They carry
+// behaviour the shared ones do not (the i8mm repack marker, the elementwise
+// transpose marker, keep-quant residency and the host-alias report), so
+// migrating them is a separate change with its own gate.
+using dense_attn::DBuf;
+using dense_attn::Dev;
+using dense_attn::MakeTensor;
+using dense_attn::Reshape;
+using dense_attn::ResolveDevicePoolPolicy;
 
-Tensor MakeTensor(void* data, DType dt, vt::Device dev,
-                  const std::vector<int64_t>& shape) {
-  Tensor t;
-  t.data = data;
-  t.dtype = dt;
-  t.device = dev;
-  t.rank = static_cast<int>(shape.size());
-  int64_t acc = 1;
-  for (int i = t.rank - 1; i >= 0; --i) {
-    t.shape[i] = shape[static_cast<size_t>(i)];
-    t.stride[i] = acc;
-    acc *= t.shape[i];
-  }
-  return t;
-}
+
 
 // Contiguous reinterpret of a device tensor's buffer at a new shape (same numel,
 // same dtype/device). Used to view [T,H,D] as [T*H,D] etc. for rank-2 ops.
-Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
-  return MakeTensor(src.data, src.dtype, src.device, shape);
-}
 
 // DevicePool / Pool() / AuxPool() / ActivePool() / ActivePoolScope now live in
 // the shared header include/vllm/model_executor/models/device_pool.h (extracted
@@ -735,23 +742,6 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // carries the identical repair). A backend whose platform was never REGISTERED
 // therefore throws out of GetPlatform rather than inheriting the first device's
 // cap — a cap read off another platform is a wrong number, not a default.
-struct DevicePoolPolicy {
-  size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
-};
-DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
-  // cap+1, so 0 means "not resolved yet" and a genuine cap of 0 (every platform
-  // today) still caches. Racing threads resolve the same type to the same value.
-  static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
-  // Same bound platforms::Index() applies to this identical value before
-  // indexing ITS registry (src/vllm/platforms/platform.cpp).
-  const size_t idx = static_cast<size_t>(d.q.device.type);
-  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
-  const size_t seen = cached[idx].load(std::memory_order_relaxed);
-  if (seen != 0) return DevicePoolPolicy{seen - 1};
-  const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
-  cached[idx].store(rp.device_pool_cap_bytes + 1, std::memory_order_relaxed);
-  return DevicePoolPolicy{rp.device_pool_cap_bytes};
-}
 
 // --- Fused-MoE per-layer resident constants (M2.5 Phase 2, CUDA-graph unblock) -
 // MoeBlockFusedCuda used to rebuild + re-upload, EVERY forward step, a set of
@@ -952,98 +942,6 @@ bool MoeFusedW13Enabled() {
 // malloc/memcpy; on CUDA they are cudaMalloc / h2d-d2h on the queue's stream.
 // Allocation is routed through the DevicePool so the buffer's storage is reused
 // rather than freed to the driver (avoiding the cudaMalloc/cudaFree sync).
-class DBuf {
- public:
-  DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
-       const void* host = nullptr)
-      : b_(&d.b) {
-    int64_t numel = 1;
-    for (int64_t s : shape) numel *= s;
-    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
-    // Device-scratch soft cap comes from the platform residency policy
-    // (BACKEND-PLATFORM item 2), not an inline constant. 0 == uncapped (GB10
-    // today) ⇒ pool behavior is byte-for-byte unchanged.
-    cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    // Draw from THIS DEVICE's pool (Pool(b)) unless an ActivePoolScope overrides
-    // it for the shared-expert overlap region (AuxPool(b)), and REMEMBER the
-    // pool so the block returns to the one it came from even when this DBuf
-    // outlives the scope (the aux region returns sd/gl, destroyed after the
-    // join). See AuxPool().
-    pool_ = &ActivePool(*b_);
-    p_ = pool_->Get(*b_, alloc_bytes_);
-    t_ = MakeTensor(p_, dt, d.q.device, shape);
-    if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
-  }
-  ~DBuf() { if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_); }
-  DBuf(const DBuf&) = delete;
-  DBuf& operator=(const DBuf&) = delete;
-  // Movable so device-resident block helpers can RETURN a DBuf (the buffer
-  // ownership transfers; the moved-from buffer is not returned to the pool).
-  DBuf(DBuf&& o) noexcept
-      : b_(o.b_), pool_(o.pool_), p_(o.p_), bytes_(o.bytes_),
-        alloc_bytes_(o.alloc_bytes_), cap_(o.cap_), t_(o.t_) {
-    o.p_ = nullptr;
-  }
-  DBuf& operator=(DBuf&& o) noexcept {
-    if (this != &o) {
-      if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_);
-      b_ = o.b_;
-      pool_ = o.pool_;
-      p_ = o.p_;
-      bytes_ = o.bytes_;
-      alloc_bytes_ = o.alloc_bytes_;
-      cap_ = o.cap_;
-      t_ = o.t_;
-      o.p_ = nullptr;
-    }
-    return *this;
-  }
-
-  Tensor& t() { return t_; }
-  const Tensor& t() const { return t_; }
-  void* ptr() { return p_; }
-  size_t bytes() const { return bytes_; }
-  size_t alloc_bytes() const { return alloc_bytes_; }
-  // Relinquish ownership of the pool block WITHOUT returning it (the dtor becomes
-  // a no-op). The caller takes over the Put obligation for `alloc_bytes()`.
-  // The Tensor view (t()) still holds the raw data pointer after this. Prefer
-  // ReleaseShared(), which discharges that obligation correctly by construction.
-  void* Release() {
-    void* p = p_;
-    p_ = nullptr;
-    return p;
-  }
-
-  // Move the block into a shared_ptr that returns it to THIS buffer's own pool
-  // and backend. Replaces the hand-written deleter that closed over the byte
-  // count alone and called `Pool().Put(alloc, q)`, naming neither the device nor
-  // the pool — so it returned another device's block, and an aux-stream block,
-  // to the main device's free list (#516; see dense_device_glue.h).
-  std::shared_ptr<void> ReleaseShared() {
-    DevicePool* const pool = pool_;
-    Backend* const b = b_;
-    const size_t alloc = alloc_bytes_;
-    void* const p = Release();
-    if (p == nullptr) return {};
-    return std::shared_ptr<void>(p, [pool, b, alloc](void* q) { pool->Put(*b, alloc, q); });
-  }
-  void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
-  // Copies the buffer back to host and blocks until the queue is idle.
-  void Download(Dev d, void* host) {
-    b_->Copy(d.q, host, p_, bytes_);
-    b_->Synchronize(d.q);
-  }
-
- private:
-  Backend* b_;
-  DevicePool* pool_ = nullptr;  // owning scratch pool (this device's Pool() or AuxPool())
-  void* p_ = nullptr;
-  size_t bytes_ = 0;
-  size_t alloc_bytes_ = 0;
-  size_t cap_ = 0;  // device-pool soft cap from residency_policy() (0 == uncapped)
-  Tensor t_;
-};
 
 float SizeF(int64_t n) { return static_cast<float>(n); }
 float Silu(float x) { return x / (1.0F + std::exp(-x)); }
@@ -1294,6 +1192,22 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   }
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
+
+}  // namespace (closed so the bridge below has EXTERNAL linkage; the unnamed
+   // namespace reopens immediately after, and its names stay visible)
+
+// See qwen3_5.h. One line of body on purpose: this is a NAME for the bridge the
+// forward already used, not a new path. Making it nameable is what lets the
+// reachability gate enter through the same call the forward makes instead of
+// hand-building the operand one step later.
+Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
+                             const OwnedTensor& embed_tokens, int64_t vocab,
+                             int64_t hidden) {
+  Dev d{backend, queue};
+  return ResidentWeight(d, embed_tokens, {vocab, hidden});
+}
+
+namespace {
 
 // Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
 // CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
@@ -2046,6 +1960,22 @@ bool Fa2PrefillOn() {
 bool Fa2DecodeOn() {
 #ifdef VLLM_CPP_FLASH_ATTN
   const char* e = std::getenv("VT_FA2_DECODE");
+  return e == nullptr || e[0] != '0';
+#else
+  return false;
+#endif
+}
+
+// SPEC-DFLASH2 W10 repair (#1865): the model-side half of the spec-as-decode
+// toggle. MUST match cuda_paged_attn.cu Fa2SpecDecodeEnabled() — the CUDA
+// admission requires a bf16 query, so the model side must select bf16 for a
+// classified verify under exactly the switch the admission reads, or the lane
+// dies at the dtype conjunct with every counter green (the #1865 failure:
+// VT_FA2_SPEC_DECODE flips were a no-op because the verify's dtype rode
+// VT_FA2_PREFILL instead). Read fresh so in-process tests can flip it.
+bool Fa2SpecDecodeOn() {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const char* e = std::getenv("VT_FA2_SPEC_DECODE");
   return e == nullptr || e[0] != '0';
 #else
   return false;
@@ -3623,6 +3553,42 @@ DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
   VT_CHECK(weight.shape[1] == x.shape[1],
            "qwen3_5 merged GDN proj: input/weight K mismatch");
   DBuf out(d, out_dtype, {x.shape[0], weight.shape[0]});
+  if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+    static std::atomic<int> mmseq{0};
+    const int call = mmseq.fetch_add(1, std::memory_order_relaxed);
+    auto cap = [&](const char* tag, const void* bytes, size_t n) {
+      std::FILE* f = std::fopen(
+          (std::string(qdir) + "/mm" + std::to_string(call) + "_" + tag + ".bin")
+              .c_str(), "wb");
+      if (f) { std::fwrite(bytes, 1, n, f); std::fclose(f); }
+    };
+    // In-process arbitration: hash-and-capture x BEFORE, run the REAL GEMM,
+    // capture out, then run a SHADOW GEMM from the same tensor and capture
+    // its output, then re-read x. Answers, without cross-process
+    // assumptions: did the real GEMM consume these bytes, is consumption
+    // deterministic, and does x change across the op?
+    std::vector<uint8_t> xpre(static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, xpre.data(), x.data, xpre.size());
+    vt::MatmulBT(d.q, out.t(), x, weight);
+    std::vector<uint8_t> ore(static_cast<size_t>(out.t().Numel()) *
+                             vt::SizeOf(out_dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, ore.data(), out.t().data, ore.size());
+    std::vector<uint8_t> xpost(static_cast<size_t>(x.Numel()) * vt::SizeOf(x.dtype));
+    d.b.Copy(d.q, xpost.data(), x.data, xpost.size());
+    DBuf shadow(d, out_dtype, {x.shape[0], weight.shape[0]});
+    vt::MatmulBT(d.q, shadow.t(), x, weight);
+    std::vector<uint8_t> osh(static_cast<size_t>(shadow.t().Numel()) *
+                             vt::SizeOf(out_dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, osh.data(), shadow.t().data, osh.size());
+    cap("xpre", xpre.data(), xpre.size());
+    cap("xpost", xpost.data(), xpost.size());
+    cap("out_real", ore.data(), ore.size());
+    cap("out_shadow", osh.data(), osh.size());
+    return out;
+  }
   vt::MatmulBT(d.q, out.t(), x, weight);
   return out;
 }
@@ -3645,6 +3611,19 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
                  weights.in_proj_ba.shape[1] == hidden.shape[1],
              "qwen3_5 merged GDN BA: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, weights.in_proj_ba);
+    if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+      static std::atomic<int> baseq{0};
+      const int call = baseq.fetch_add(1, std::memory_order_relaxed);
+      if (call == 0) {
+        std::vector<uint8_t> raw(static_cast<size_t>(packed_weight.Numel()) *
+                                 vt::SizeOf(packed_weight.dtype));
+        DBuf tmp(d, packed_weight.dtype, {packed_weight.Numel()}, packed_weight.data);
+        d.b.Copy(d.q, tmp.ptr(), packed_weight.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen((std::string(qdir) + "/w_ba.bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+    }
     if (MergedGdnBaEnabled(d)) {
       out.packed_owner.emplace(
           MatmulBTRawD(d, hidden, packed_weight,
@@ -3652,6 +3631,17 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
       Tensor packed = out.packed_owner->t();
       out.b = packed.Slice(1, 0, value_heads);
       out.a = packed.Slice(1, value_heads, 2 * value_heads);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+        static std::atomic<int> ba_seq{0};
+        if (ba_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+          // Device truth of the packed matmul result and of the interior
+          // a-window, captured through the same verified instrument the
+          // kernel-side probes use.
+          vt::tenstorrent::TrustDump(d.q, td, "ba_packed_dev", packed);
+          vt::tenstorrent::TrustDump(d.q, td, "ba_a_win_dev", out.a);
+          vt::tenstorrent::TrustDump(d.q, td, "ba_b_win_dev", out.b);
+        }
+      }
       return out;
     }
 
@@ -3667,6 +3657,16 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   }
   out.b = out.b_owner->t();
   out.a = out.a_owner->t();
+  if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+    static std::atomic<int> bas_seq{0};
+    if (bas_seq.fetch_add(1, std::memory_order_relaxed) == 0) {
+      vt::tenstorrent::TrustDump(d.q, td, "sba_a_dev", out.a);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_b_dev", out.b);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_h_dev", hidden);
+      Tensor sba_wa = ResidentWeight(d, weights.in_proj_a);
+      vt::tenstorrent::TrustDump(d.q, td, "sba_wa_dev", sba_wa);
+    }
+  }
   return out;
 }
 
@@ -3906,6 +3906,48 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                  w.in_proj_qkvz.shape[1] == h.shape[1],
              "qwen3_5 merged GDN qkvz: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, w.in_proj_qkvz);
+    if (const char* qdir = std::getenv("VT_DUMP_QKVZ")) {
+      // Per-invocation replay capture (the engine WARMS UP with a dummy
+      // forward, so the FIRST call is not the real step): h per invocation,
+      // the resident merged weight once (device-independent).
+      static std::atomic<int> qseq{0};
+      const int call = qseq.fetch_add(1, std::memory_order_relaxed);
+      const std::string dir = qdir;
+      if (call == 0) {
+        const Tensor& wt = packed_weight;
+        // HOST master bytes...
+        std::vector<uint8_t> raw(static_cast<size_t>(wt.Numel()) * vt::SizeOf(wt.dtype));
+        DBuf tmp(d, wt.dtype, {wt.Numel()}, wt.data);
+        d.b.Copy(d.q, tmp.ptr(), wt.data, raw.size());
+        tmp.Download(d, raw.data());
+        std::FILE* f = std::fopen((dir + "/w_host.bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+        // ...and the DEVICE-STAGED copy the GEMM will actually consume,
+        // read back through ttnn via the ops seam.
+        {
+          std::vector<float> vec =
+              vt::tenstorrent::DebugDeviceReadbackF32(d.q, wt);
+          std::FILE* f2 = std::fopen((dir + "/w_device.bin").c_str(), "wb");
+          if (f2) {
+            std::fwrite(vec.data(), 4, vec.size(), f2);
+            std::fclose(f2);
+          }
+        }
+      }
+      {
+        if (call == 0)
+          std::fprintf(stderr, "[TT-DUMP] qkvz-h0 ptr=%p rows=%lld\n",
+                       static_cast<const void*>(h.data), (long long)h.shape[0]);
+        // NO DBuf here: a pool-backed tmp aliases live blocks (see the
+        // capture-reliability finding); read straight into a host vector.
+        std::vector<uint8_t> raw(static_cast<size_t>(h.Numel()) * vt::SizeOf(h.dtype));
+        d.b.Synchronize(d.q);
+        d.b.Copy(d.q, raw.data(), h.data, raw.size());
+        std::FILE* f = std::fopen(
+            (dir + "/h" + std::to_string(call) + ".bin").c_str(), "wb");
+        if (f) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+      }
+    }
     if (detail::ShouldUseMergedGdnQkvz(detail::GdnMergedQkvzEligibility{
             MergedGdnQkvzEnabled(d),
             vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
@@ -3915,6 +3957,8 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
       out.mixed = packed.Slice(1, 0, conv_dim);
       out.z = packed.Slice(1, conv_dim, conv_dim + value_dim);
       return out;
+    if (const char* td = std::getenv("VT_DUMP_TRUST"))
+      vt::tenstorrent::TrustDump(d.q, td, "packed", packed);
     }
     Tensor qkv_weight = packed_weight.Slice(0, 0, conv_dim);
     Tensor z_weight = packed_weight.Slice(0, conv_dim, conv_dim + value_dim);
@@ -3923,6 +3967,10 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.mixed = out.mixed_owner->t();
     out.z = out.z_owner->t();
     return out;
+    if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+      vt::tenstorrent::TrustDump(d.q, td, "mixed", out.mixed);
+      vt::tenstorrent::TrustDump(d.q, td, "z", out.z);
+    }
   }
   // PERF-FP8-ALPHA-FOLD / #417 — the output dtype of the merged fp8 in_proj leaf.
   // vLLM's ModelOpt fp8 linear emits the model dtype (bf16); ours hardcoded f32,
@@ -4716,6 +4764,24 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
+// VT_DUMP_ACT stage probe (GDN): dump named intermediates per invocation so a
+// layer-level divergence can be pinned to one kernel. Debug-only; Download
+// syncs, never set on capture paths.
+void DumpGdnStage(Dev d, const char* stage, const Tensor& t) {
+  if (std::getenv("VT_DUMP_ACT") == nullptr) return;
+  static std::atomic<int> gdn_seq{0};
+  const int call = gdn_seq.fetch_add(1, std::memory_order_relaxed);
+  const int64_t n = t.Numel();
+  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
+  DBuf tmp(d, t.dtype, {n}, t.data);
+  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+  tmp.Download(d, raw.data());
+  const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/gdn" +
+                           std::to_string(call) + "_" + stage + ".bin";
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+}
+
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const StepDevInputs& sdi,
                    const GDNAttentionMetadata& meta,
@@ -4897,6 +4963,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), sdi.gdn_non_spec_qsl.t(),
                           sdi.gdn_has_initial.t(),
                           conv_args);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "conv", dconv.t());
+      DumpGdnStage(d, "conv", dconv.t());
       Tensor conv_cache = state.conv_state;
       vt::GdnStateScatter(d.q, conv_cache, dcs.t(),
                           sdi.gdn_state_idx.t());
@@ -4912,6 +4980,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                           dcs.t(), dqsl.t(), dhis.t(),
                           conv_args);
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "conv", dconv.t());
+      DumpGdnStage(d, "conv2", dconv.t());
     }
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
@@ -4982,6 +5052,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(),
                       dconv.t(), araw, braw, a_log_dev, dt_bias_dev,
                       vt::L2NormArgs{1e-6F});
+      DumpGdnStage(d, "mixed", mixed);
+      DumpGdnStage(d, "postconv_q", dql2.t());
+      DumpGdnStage(d, "postconv_v", vf.t());
+      if (const char* td = std::getenv("VT_DUMP_TRUST")) {
+        vt::tenstorrent::TrustDump(d.q, td, "pc_q", dql2.t());
+        vt::tenstorrent::TrustDump(d.q, td, "pc_v", vf.t());
+      }
     } else {
       DBuf qf(d, actdt, {T, Hk, Dk});
       DBuf kf(d, actdt, {T, Hk, Dk});
@@ -5087,6 +5164,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
                        dss.t(), sdi.gdn_prefill_qsl.t(), gdn_args);
         Tensor ssm_cache = state.ssm_state;
+        DumpGdnStage(d, "core", o_pre);
+        if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "core", o_pre);
         vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
                             sdi.gdn_prefill_state_idx.t());
       } else {
@@ -5094,6 +5173,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
                        dss.t(), dpqsl.t(), gdn_args);
         ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems);
+        if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "core", o_pre);
       }
     }
     }  // end non-spec recurrence
@@ -5153,6 +5233,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
     vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
+    DumpGdnStage(d, "gated", gated_bf16.t());
+    if (const char* td = std::getenv("VT_DUMP_TRUST")) vt::tenstorrent::TrustDump(d.q, td, "gated", gated_bf16.t());
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
@@ -5357,20 +5439,29 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // fallback.
   const bool fa2_platform =
       vllm::platforms::GetPlatform(d.q.device.type).supports_fa2_attention();
-  const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
-                           fa2_platform &&
-                           kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
-  const bool fa2_decode_r4 = Hq == 16 && Hkv == 4 && Fa2Decode4BOn();
-  const bool fa2_decode_r6 = Hq == 24 && Hkv == 4 && Fa2DecodeOn();
-  const bool fa2_decode_r8 = Hq == 16 && Hkv == 2 && Fa2Decode35BOn();
-  const bool fa2_decode =
-      (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
-      FuseAttnPreambleOn(fp4) &&
-                          sdi.has_attn_cos_sin &&
-                          fa2_platform &&
-                          kv.dtype == DType::kBF16 && kv.block_size % 16 == 0 &&
-                          Dh == 256 && T == meta.num_reqs && meta.causal;
-  const bool fa2_attention = fa2_prefill || fa2_decode;
+  // W10 repair (#1865): the FA-2 dtype/lane class is a host-testable seam
+  // (ClassifyDenseFa2, qwen3_5_internal.h) instead of an inline predicate the
+  // CPU tier could never red. Same inputs, same conjuncts; the spec-as-decode
+  // arm selects bf16 through the SPEC lane's own toggles so the verify cannot
+  // be starved to f32 by the PREFILL lever (the #1865 dead link).
+  const DenseFa2Eligibility fa2_elig{
+      /*num_q_heads=*/Hq,
+      /*num_kv_heads=*/Hkv,
+      /*head_dim=*/Dh,
+      /*num_tokens=*/T,
+      /*num_reqs=*/meta.num_reqs,
+      /*uniform_spec_query_len=*/meta.uniform_spec_query_len,
+      /*causal=*/meta.causal,
+      /*kv_cache_bf16=*/kv.dtype == DType::kBF16,
+      /*kv_block_multiple_16=*/kv.block_size % 16 == 0,
+      /*preamble_with_cos_sin=*/FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin,
+      /*fa2_platform=*/fa2_platform,
+      /*prefill_on=*/Fa2PrefillOn(),
+      /*decode_r4_on=*/Fa2Decode4BOn(),
+      /*decode_r6_on=*/Fa2DecodeOn(),
+      /*decode_r8_on=*/Fa2Decode35BOn(),
+      /*spec_decode_on=*/Fa2SpecDecodeOn()};
+  const bool fa2_attention = ClassifyDenseFa2(fa2_elig) != DenseFa2Class::kNone;
   const DType attn_dt = fa2_attention ? DType::kBF16 : DType::kF32;
   DBuf dq3(d, attn_dt, {T, Hq, Dh});
   DBuf dk3(d, attn_dt, {T, Hkv, Dh});
@@ -5489,6 +5580,10 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   vt::PagedAttentionArgs pa_args{scale, meta.causal};
   pa_args.query_start_loc_host = meta.query_start_loc.data();
   pa_args.max_seq_len = meta.max_seq_len;
+  // SPEC-DFLASH2 W10 (#1857): the runner's spec-as-decode classification — a
+  // uniform-qlen verify stays on the FA-2 split-KV DECODE lane instead of the
+  // num_splits=1 prefill ladder. 0 on every non-verify step (routing unchanged).
+  pa_args.uniform_spec_query_len = meta.uniform_spec_query_len;
   dense_attn::ApplyKvCacheQuant(pa_args, kv);
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
@@ -7296,7 +7391,7 @@ std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer
 //   hidden = mlp(h2)                            # MoE block; returned as delta
 void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const std::vector<int32_t>& positions,
-              int64_t T) {
+              int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7312,7 +7407,12 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                        [&](Dev p, const Tensor& h) {
+                          return MoeBlock(p, layer.moe, cfg, h, T);
+                        });
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7538,7 +7638,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
                    const CommonAttentionMetadata& attn_meta,
                    const GDNAttentionMetadata& gdn_meta,
                    const PagedKvCache* attn_kv, const GdnStateCache* gdn_state,
-                   int64_t T) {
+                   int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7570,7 +7670,12 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
     vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   }
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                        [&](Dev p, const Tensor& h) {
+                          return MoeBlock(p, layer.moe, cfg, h, T);
+                        });
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -7608,7 +7713,23 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
+    std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
+                 static_cast<const void*>(dhn.t().data), (long long)T);
   DumpStage("post_input_norm", dhn);
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
+    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if
+    // these two disagree, the download patterns themselves diverge.
+    std::vector<uint8_t> rawD(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                              vt::SizeOf(dhn.t().dtype));
+    d.b.Synchronize(d.q);
+    d.b.Copy(d.q, rawD.data(), dhn.t().data, rawD.size());
+    const std::string pd = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                           "/layer_" + std::to_string(dump_layer_idx) +
+                           "_post_input_norm_DIRECT.bin";
+    std::FILE* fd = std::fopen(pd.c_str(), "wb");
+    if (fd != nullptr) { std::fwrite(rawD.data(), 1, rawD.size(), fd); std::fclose(fd); }
+  }
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
@@ -7623,6 +7744,21 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   }();
   DumpStage("block_out", attn);
 
+  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
+    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer
+    // ran. If it differs from the pre-mixer dump, something between them
+    // writes it; if equal, the earlier disagreement is a download artifact.
+    std::vector<uint8_t> raw2(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                              vt::SizeOf(dhn.t().dtype));
+    DBuf tmp2(d, dhn.t().dtype, {T * H}, dhn.t().data);
+    d.b.Copy(d.q, tmp2.ptr(), dhn.t().data, raw2.size());
+    tmp2.Download(d, raw2.data());
+    const std::string p2 = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
+                           "/layer_" + std::to_string(dump_layer_idx) +
+                           "_post_input_norm_RECHECK.bin";
+    std::FILE* f2 = std::fopen(p2.c_str(), "wb");
+    if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
+  }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
@@ -7648,8 +7784,8 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
   const int64_t vocab_size = config.vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
 
-  Tensor embedding_table =
-      ResidentWeight(device, embed_tokens, {vocab_size, hidden_size});
+  Tensor embedding_table = Qwen3_5EmbeddingTable(device.b, device.q, embed_tokens,
+                                                vocab_size, hidden_size);
   DBuf device_ids(device, DType::kI32, {tokens}, input_ids.data());
   DBuf embedding(device, DType::kBF16, {tokens, hidden_size});
   vt::Embedding(device.q, embedding.t(), embedding_table, device_ids.t());
@@ -7945,6 +8081,101 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
+                                 vt::DeviceType placement_device,
+                                 const MoeBlockWeights& weights,
+                                 const HfConfig& config, const vt::Tensor& dh,
+                                 int64_t T) {
+  Dev engine{vt::GetBackend(engine_queue.device.type), engine_queue};
+
+  // The fp4-resident arm is REFUSED rather than served slowly. Its device Marlin
+  // residents are built eagerly at load by `PrepareMarlinResident`, so placing it
+  // would upload every expert and then compute on the host across the bus —
+  // strictly worse than not placing, and invisible to a token gate because the
+  // tokens would still be right. Refuse by name, as an unimplemented arm must.
+  if (!weights.expert_gate_fp4.empty()) {
+    throw std::invalid_argument(
+        "device placement: this checkpoint's routed experts are fp4-resident, "
+        "and their device residents are built at load, so placing them would "
+        "upload every expert and then compute across the bus — slower than not "
+        "placing at all. Placement supports the bf16 and keep-quant expert arms "
+        "(what a GGUF load brings); use one of those or drop the placement");
+  }
+
+  const int64_t H = config.hidden_size;
+  const size_t bytes =
+      static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
+
+  // DOWN: the hidden state to the host. `Download` synchronises, which it must:
+  // the placed backend is about to read these bytes and knows nothing about the
+  // engine's stream.
+  std::vector<uint8_t> staging(bytes);
+  {
+    Tensor src = dh;
+    engine.b.Copy(engine.q, staging.data(), src.data, bytes);
+    engine.b.Synchronize(engine.q);
+  }
+
+  // ACROSS: run the block on the placement device. `RunMoeBlock` derives its
+  // backend from the queue it is handed, and `ResidentWeight` aliases the host
+  // weight bytes for a CPU `Dev`, so nothing is uploaded anywhere by this call.
+  vt::Queue& placed_queue = PlacementQueue(placement_device);
+  Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
+  DBuf placed_in(placed, DType::kBF16, {T, H}, staging.data());
+  MoeBlockOutput placed_out =
+      RunMoeBlock(placed_queue, weights, config, placed_in.t(), T);
+
+  // BACK UP: the combined output to the engine's device, into a buffer from the
+  // ENGINE's pool so the composing forward owns it exactly as it owns an
+  // unplaced block's output.
+  placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
+  placed.b.Synchronize(placed.q);
+  DBuf back(engine, DType::kBF16, {T, H}, staging.data());
+
+  MoeBlockOutput r;
+  r.tensor = back.t();
+  r.storage = back.ReleaseShared();
+  return r;
+}
+
+// Exposed wrapper over the anon-ns `GdnBlockPaged` (row MODEL-MM-QWEN4-EXP W5b,
+// issue #2110) so a hybrid architecture in another TU — Qwen4-Exp, whose
+// `kLinearAttention` layers ARE this block — reuses the exact same GDN layer.
+// Mirrors `RunMoeBlock` above, for the identical reason and in the identical
+// shape: build the internal Dev, run the block, release the pooled DBuf into an
+// owning GdnBlockOutput. The Qwen3.5/3.6 forward never calls this — it is a pure
+// ADD, so that path stays byte-identical. See qwen3_5_gdn_block.h.
+GdnStepInputs BuildGdnStepInputs(vt::Queue& queue,
+                                 const std::vector<int32_t>& positions,
+                                 const CommonAttentionMetadata& attn_meta,
+                                 const GDNAttentionMetadata& gdn_meta,
+                                 int64_t gdn_state_slots) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  GdnStepInputs s;
+  s.impl = std::make_shared<StepDevInputs>(
+      BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+  return s;
+}
+
+GdnBlockOutput RunGdnBlockPaged(vt::Queue& queue, const GdnLayerWeights& weights,
+                                const HfConfig& config, const vt::Tensor& dh,
+                                const GdnStepInputs& step,
+                                const GDNAttentionMetadata& gdn_meta,
+                                const GdnStateCache& state, int64_t T,
+                                const vt::Tensor* dh_fp8) {
+  VT_CHECK(step.impl != nullptr,
+           "RunGdnBlockPaged: the step inputs are empty; build them once per "
+           "step with BuildGdnStepInputs and keep the handle alive across the "
+           "layer loop");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const auto& sdi = *static_cast<const StepDevInputs*>(step.impl.get());
+  DBuf out = GdnBlockPaged(d, weights, config, dh, sdi, gdn_meta, state, T, dh_fp8);
+  GdnBlockOutput r;
+  r.tensor = out.t();
+  r.storage = out.ReleaseShared();
+  return r;
+}
+
 // ENG-EXPERT-STREAM (#912): the streamed-expert lane seen from outside this TU.
 // See qwen3_5_internal.h for why a benchmark and a gate both need to reach it.
 detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
@@ -8033,7 +8264,8 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   // ENG-ASYNC-SCHED W4: when the async runner has already placed this step's
   // input ids on the device (and spliced each decode row's sampled token into
   // them there), embed straight from that buffer. `token_ids` is stale for
@@ -8210,14 +8442,28 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   }
 
   int64_t fa_idx = 0, gdn_idx = 0;
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+    for (int which = 0; which < 2; ++which) {
+      const Tensor& t = which == 0 ? hidden.t() : res.t();
+      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
+                               vt::SizeOf(t.dtype));
+      DBuf tmp(d, t.dtype, {T * H}, t.data);
+      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+      tmp.Download(d, raw.data());
+      const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/layer_-1_" +
+                               (which == 0 ? "hidden" : "res") + ".bin";
+      std::FILE* f = std::fopen(path.c_str(), "wb");
+      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    }
+  }
+for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5MoeLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     const PagedKvCache* kv =
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
-                  kv, gs, T);
+                  kv, gs, T, /*layer_index=*/l);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -8665,7 +8911,8 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -8675,7 +8922,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
-             positions, T);
+             positions, T, /*layer_index=*/l);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
@@ -8711,7 +8958,8 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   // For a TEXT-only step the three mRoPE position streams are identical, so the
   // partial NeoX RoPE in FullAttnBlock degenerates to 1-D RoPE over `positions`
   // (notes §2). The vision tower / image-video merger are DEFERRED.
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -8820,7 +9068,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                   residual, positions, tokens);
   } else {
     RunLayer(device, weights_->moe_layers[layer_index], *config_, hidden,
-             residual, positions, tokens);
+             residual, positions, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -8885,7 +9133,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   } else {
     RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
                   residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
-                  /*gdn_state=*/nullptr, tokens);
+                  /*gdn_state=*/nullptr, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -9009,7 +9257,8 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -9813,7 +10062,12 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   hidden.Zero(d);
-  RunLayer(d, layer, config, hidden, res, positions, T);
+  // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
+  // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
+  // the engine device, which is the inert path — a replay must reproduce the
+  // layer's arithmetic, and silently placing it would change which device the
+  // replay measured.
+  RunLayer(d, layer, config, hidden, res, positions, T, /*layer_index=*/-1);
 
   // Combined stream out = residual + hidden (f32), directly comparable to the
   // layer golden's `out`.
@@ -10006,6 +10260,9 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
   am_out.num_reqs = static_cast<int>(S);
   am_out.num_actual_tokens = static_cast<int>(S);
   am_out.max_query_len = 1;  // pure decode
+  // W10 (#1857): a pure-decode rewrite is never spec-classified. Belt on the
+  // vt shape guard's braces (S == q*S only at q == 1).
+  am_out.uniform_spec_query_len = 0;
   am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
   std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
             am_out.slot_mapping.begin());
@@ -10378,6 +10635,9 @@ struct Qwen3_5DecodeGraph::Impl {
       attn_meta.max_seq_len = am.max_seq_len;
       attn_meta.block_table_num_cols = am.block_table_num_cols;
       attn_meta.causal = am.causal;
+      // W10 (#1857): the spec-as-decode classification must survive the slot
+      // copy, or the captured verify silently re-routes onto the prefill lane.
+      attn_meta.uniform_spec_query_len = am.uniform_spec_query_len;
       CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
                   gm.non_spec_state_indices_tensor);
       CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
@@ -10645,33 +10905,58 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the layer region once, instantiate the graph, then launch it.
   if (s.warm) {
+    // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+    // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+    // block, on the reasoning that the capture RETAINS its logits while the
+    // other ring slot still holds its own, so the free list is one short. The
+    // retention half is right and the "one block of that shape" half is not:
+    // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+    // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+    // ring slot's capture died in `dconv`, the GDN causal-conv output
+    // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+    // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+    // inside a captured region aborts the capture. An alloc-and-free grows the
+    // pool only when that class's free list is EMPTY, so with one block free
+    // and TWO needed live at once it grew nothing at all.
+    //
+    // So the driver stops naming a tensor and asks the pool for the demand the
+    // EAGER step at this shape actually made (`s.demand`, taken at the end of
+    // the cold step). Working scratch is still freed at ForwardLayers return and
+    // still SAFELY shared between the two graphs -- they replay sequentially on
+    // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+    // legal, and it is a no-op once the free list is deep enough.
+    //
+    // #2029: IT RUNS BEFORE EVERY CAPTURE, and until this line moved it ran
+    // before almost none of them. It sat inside the `if (dbuf)` below, and
+    // `dbuf` is `impl_->dbuf || spec_step` -- the `VT_ASYNC_EXECUTOR` parity
+    // ring, or a speculative step. The DEFAULT server sets neither, so the lane
+    // a user gets by omitting `--speculative-config` opened its capture over a
+    // pool nobody had prepared, and #1380's own failure came back at c=8 as
+    // `cudaMalloc: operation not permitted when stream is capturing` while the
+    // SAME binary with a speculative config served. The guard was never about
+    // the pre-grow: that block exists for the parity ring's drain and its
+    // persistent step inputs, and #1393 replaced the pre-grow in place without
+    // revisiting what it sat under.
+    //
+    // The `!dbuf` arm needs this at least as much as the `dbuf` arm. It passes
+    // `persistent_sdi == nullptr` to ForwardLayers, so `BuildStepDevInputs`
+    // and `MaybeBuildAttnCosSin` run from the MAIN pool INSIDE the captured
+    // region -- and that is also what makes `s.demand` exact for it, because the
+    // cold step takes the identical `nullptr` branch. On the `dbuf` arm the
+    // captured region's main-pool demand is a strict SUBSET of the cold step's,
+    // which is the containment #1393 recorded.
+    //
+    // Ordering: this now precedes the `b.Synchronize` below rather than
+    // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
+    // enqueues no work and reads no in-flight buffer -- and the drain still
+    // happens before `BeginCapture`, which is the property it was added for.
+    Pool(b).PreGrowForCapture(b, s.demand);
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
-      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
-      // block, on the reasoning that the capture RETAINS its logits while the
-      // other ring slot still holds its own, so the free list is one short. The
-      // retention half is right and the "one block of that shape" half is not:
-      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
-      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
-      // ring slot's capture died in `dconv`, the GDN causal-conv output
-      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
-      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture. An alloc-and-free grows the
-      // pool only when that class's free list is EMPTY, so with one block free
-      // and TWO needed live at once it grew nothing at all.
-      //
-      // So the driver stops naming a tensor and asks the pool for the demand the
-      // EAGER step at this shape actually made (`s.demand`, taken at the end of
-      // the cold step). Working scratch is still freed at ForwardLayers return and
-      // still SAFELY shared between the two graphs -- they replay sequentially on
-      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
-      // legal, and it is a no-op once the free list is deep enough.
-      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture. BuildStepDevInputs fills s.dev from the refreshed host vectors so
       // the capture step reads correct inputs; the persistent cos|sin (fused-preamble
@@ -10928,6 +11213,9 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       attn_meta.max_seq_len = am.max_seq_len;
       attn_meta.block_table_num_cols = am.block_table_num_cols;
       attn_meta.causal = am.causal;
+      // W10 (#1857): the spec-as-decode classification must survive the slot
+      // copy, or the captured verify silently re-routes onto the prefill lane.
+      attn_meta.uniform_spec_query_len = am.uniform_spec_query_len;
       CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
                   gm.non_spec_state_indices_tensor);
       CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
@@ -11196,33 +11484,58 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the dense layer region once, instantiate the graph, launch it.
   if (s.warm) {
+    // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+    // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+    // block, on the reasoning that the capture RETAINS its logits while the
+    // other ring slot still holds its own, so the free list is one short. The
+    // retention half is right and the "one block of that shape" half is not:
+    // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+    // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+    // ring slot's capture died in `dconv`, the GDN causal-conv output
+    // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+    // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+    // inside a captured region aborts the capture. An alloc-and-free grows the
+    // pool only when that class's free list is EMPTY, so with one block free
+    // and TWO needed live at once it grew nothing at all.
+    //
+    // So the driver stops naming a tensor and asks the pool for the demand the
+    // EAGER step at this shape actually made (`s.demand`, taken at the end of
+    // the cold step). Working scratch is still freed at DenseForwardLayers return and
+    // still SAFELY shared between the two graphs -- they replay sequentially on
+    // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+    // legal, and it is a no-op once the free list is deep enough.
+    //
+    // #2029: IT RUNS BEFORE EVERY CAPTURE, and until this line moved it ran
+    // before almost none of them. It sat inside the `if (dbuf)` below, and
+    // `dbuf` is `impl_->dbuf || spec_step` -- the `VT_ASYNC_EXECUTOR` parity
+    // ring, or a speculative step. The DEFAULT server sets neither, so the lane
+    // a user gets by omitting `--speculative-config` opened its capture over a
+    // pool nobody had prepared, and #1380's own failure came back at c=8 as
+    // `cudaMalloc: operation not permitted when stream is capturing` while the
+    // SAME binary with a speculative config served. The guard was never about
+    // the pre-grow: that block exists for the parity ring's drain and its
+    // persistent step inputs, and #1393 replaced the pre-grow in place without
+    // revisiting what it sat under.
+    //
+    // The `!dbuf` arm needs this at least as much as the `dbuf` arm. It passes
+    // `persistent_sdi == nullptr` to DenseForwardLayers, so `BuildStepDevInputs`
+    // and `MaybeBuildAttnCosSin` run from the MAIN pool INSIDE the captured
+    // region -- and that is also what makes `s.demand` exact for it, because the
+    // cold step takes the identical `nullptr` branch. On the `dbuf` arm the
+    // captured region's main-pool demand is a strict SUBSET of the cold step's,
+    // which is the containment #1393 recorded.
+    //
+    // Ordering: this now precedes the `b.Synchronize` below rather than
+    // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
+    // enqueues no work and reads no in-flight buffer -- and the drain still
+    // happens before `BeginCapture`, which is the property it was added for.
+    Pool(b).PreGrowForCapture(b, s.demand);
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
-      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
-      // block, on the reasoning that the capture RETAINS its logits while the
-      // other ring slot still holds its own, so the free list is one short. The
-      // retention half is right and the "one block of that shape" half is not:
-      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
-      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
-      // ring slot's capture died in `dconv`, the GDN causal-conv output
-      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
-      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture. An alloc-and-free grows the
-      // pool only when that class's free list is EMPTY, so with one block free
-      // and TWO needed live at once it grew nothing at all.
-      //
-      // So the driver stops naming a tensor and asks the pool for the demand the
-      // EAGER step at this shape actually made (`s.demand`, taken at the end of
-      // the cold step). Working scratch is still freed at DenseForwardLayers return and
-      // still SAFELY shared between the two graphs -- they replay sequentially on
-      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
-      // legal, and it is a no-op once the free list is deep enough.
-      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture (see the 35B driver). The dense fused-preamble arch (27B W4A4)
       // allocates + fills the persistent cos|sin here (pre-capture); the captured

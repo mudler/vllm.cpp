@@ -43,11 +43,13 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "vllm/model_executor/models/device_pool.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/multimodal/ltx2_video.h"
 #include "vllm/multimodal/minimax_h3_video.h"
@@ -60,20 +62,60 @@
 
 namespace {
 
+// The backend COUNTS ITS TRANSFERS, and classifies each by direction, because
+// that count is the only instrument this project has for the residency claim in
+// #1451 and it must be readable on a box with no GPU.
+//
+// Direction is derived from the live allocation table rather than passed in:
+// `vt::Backend::Copy` takes two raw pointers and no direction argument, so a
+// pointer inside a range this backend handed out is DEVICE memory and anything
+// else is host memory. That is exact here — `Alloc` is the only source of device
+// pointers — and it is what lets the test say "the volume is never downloaded
+// mid-decode" rather than the much weaker "some copies happened".
 class FakeXpuBackend final : public vt::Backend {
  public:
-  void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
-  void Free(void* p) override { std::free(p); }
+  void* Alloc(size_t bytes) override {
+    const size_t n = bytes == 0 ? 1 : bytes;
+    void* p = std::malloc(n);
+    ++allocs;
+    live_[p] = n;
+    return p;
+  }
+  void Free(void* p) override {
+    live_.erase(p);
+    std::free(p);
+  }
   void Memset(vt::Queue&, void* p, int value, size_t bytes) override {
     std::memset(p, value, bytes);
   }
   void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    const bool dst_dev = IsDevice(dst);
+    const bool src_dev = IsDevice(src);
+    if (dst_dev && !src_dev) ++h2d;
+    else if (!dst_dev && src_dev) ++d2h;
+    else if (dst_dev && src_dev) ++d2d;
+    else ++h2h;
     std::memcpy(dst, src, bytes);
   }
+
+  void ResetCounters() { h2d = d2h = d2d = h2h = allocs = 0; }
+
+  unsigned h2d = 0, d2h = 0, d2d = 0, h2h = 0, allocs = 0;
   vt::Queue CreateQueue() override {
     return vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
   }
   bool UnifiedMemory() const override { return true; }
+
+ private:
+  bool IsDevice(const void* p) const {
+    const char* c = static_cast<const char*>(p);
+    for (const auto& kv : live_) {
+      const char* base = static_cast<const char*>(kv.first);
+      if (c >= base && c < base + kv.second) return true;
+    }
+    return false;
+  }
+  std::map<void*, size_t> live_;
 };
 
 // A PARTIAL backend, shaped exactly like MetalPlatform and TenstorrentPlatform:
@@ -101,6 +143,19 @@ class PartialXpuPlatform final : public vllm::platforms::Platform {
  private:
   FakeXpuBackend& backend_;
 };
+
+// THE BYPASS LANE IS A REAL CONFIGURATION OF THIS REPOSITORY, not a debugging
+// curiosity, and two cases below have to know which lane they are in.
+// `.github/workflows/ci.yml:1605` sets `VT_POOL_BYPASS: "1"` for BOTH
+// `sanitize-cpu` legs, so every assertion about pool hits and misses is
+// unavailable there by construction. Spelled exactly as `DevicePool::Bypass()`
+// spells it ("=1", first character only) and as `tests/vllm/models/
+// test_device_pool.cpp` already spells it, so this file cannot disagree with the
+// header about which lane a process is in.
+bool PoolBypassed() {
+  const char* e = std::getenv("VT_POOL_BYPASS");
+  return e != nullptr && e[0] == '1';
+}
 
 FakeXpuBackend& Backend() {
   static FakeXpuBackend backend;
@@ -236,6 +291,373 @@ TinyDecoder MakeTinyDecoder() {
 
 }  // namespace
 
+// A decoder with STAGES BETWEEN ITS CONVOLUTIONS, which the W5 fixture above
+// deliberately does not have (`decoder_blocks = {}`). The residency claim is
+// about what happens BETWEEN two convolutions, so a fixture with one stage
+// cannot discriminate: it needs resnet blocks, a norm, an ada-LN-free SiLU and a
+// depth-to-space upsample in the walk.
+TinyDecoder MakeStagedDecoder() {
+  TinyDecoder d = MakeTinyDecoder();
+  d.cfg.prefix = "r1451.dev.";
+  d.cfg.base_channels = 4;
+  // GROUPNORM, TIMESTEP CONDITIONING AND NOISE INJECTION ARE ALL ON, and each
+  // one is here because its absence hid a defect. With `kPixelNorm` and no
+  // conditioning the fixture never reaches `group_norm`, `ada_ln` or
+  // `spatial_noise` at all, and the first draft of this change passed every one
+  // of them a HOST pointer into a kernel dispatched on the queue's device --
+  // which the `FakeXpuBackend` below executes without complaint, because it is a
+  // `memcpy` over `malloc` and its "device" memory IS host memory. A discrete
+  // GPU would have read unmapped memory. A fixture that does not enter a path
+  // cannot gate it.
+  d.cfg.norm_layer = vllm::Ltx2NormLayer::kGroupNorm;
+  d.cfg.norm_num_groups = 2;
+  d.cfg.timestep_conditioning = true;
+  d.cfg.decode_timestep = 0.05;
+  d.cfg.decode_noise_scale = 0.025;
+  d.cfg.decoder_blocks = {{"res_x", 2, 0, true, false}, {"compress_space", 1, 1, false, false}};
+
+  uint64_t seed = 14512026ULL;
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>((seed >> 33) % 20001) / 10000.0f - 1.0f;
+  };
+  auto fill = [&next](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = next();
+    return v;
+  };
+  const std::string p = d.cfg.prefix;
+  const int64_t mid = 4;  // base_channels * multiplier, with compress_space's multiplier 1
+  d.weights.tensors.clear();
+  d.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  d.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+  d.weights.tensors[p + "timestep_scale_multiplier"] = {1000.0f};
+  d.weights.tensors[p + "conv_in.conv.weight"] = fill(static_cast<size_t>(mid * 1 * 27));
+  d.weights.tensors[p + "conv_in.conv.bias"] = fill(static_cast<size_t>(mid));
+  // up_blocks.0 is the LAST entry of decoder_blocks, walked in reverse: compress_space.
+  d.weights.tensors[p + "up_blocks.0.conv.conv.weight"] =
+      fill(static_cast<size_t>(mid * 4 * mid * 27));
+  d.weights.tensors[p + "up_blocks.0.conv.conv.bias"] = fill(static_cast<size_t>(mid * 4));
+  // up_blocks.1 is res_x: a per-block timestep embedder, then two res_blocks that
+  // each carry two GroupNorms, an ada-LN table and two per-channel noise scales.
+  const std::string tb = p + "up_blocks.1.time_embedder.timestep_embedder.";
+  d.weights.tensors[tb + "linear_1.weight"] = fill(static_cast<size_t>(mid * 4 * 256));
+  d.weights.tensors[tb + "linear_1.bias"] = fill(static_cast<size_t>(mid * 4));
+  d.weights.tensors[tb + "linear_2.weight"] = fill(static_cast<size_t>(mid * 4 * mid * 4));
+  d.weights.tensors[tb + "linear_2.bias"] = fill(static_cast<size_t>(mid * 4));
+  for (int i = 0; i < 2; ++i) {
+    const std::string b = p + "up_blocks.1.res_blocks." + std::to_string(i);
+    d.weights.tensors[b + ".norm1.weight"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".norm1.bias"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".norm2.weight"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".norm2.bias"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".scale_shift_table"] = fill(static_cast<size_t>(4 * mid));
+    d.weights.tensors[b + ".per_channel_scale1"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".per_channel_scale2"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".conv1.conv.weight"] = fill(static_cast<size_t>(mid * mid * 27));
+    d.weights.tensors[b + ".conv1.conv.bias"] = fill(static_cast<size_t>(mid));
+    d.weights.tensors[b + ".conv2.conv.weight"] = fill(static_cast<size_t>(mid * mid * 27));
+    d.weights.tensors[b + ".conv2.conv.bias"] = fill(static_cast<size_t>(mid));
+  }
+  d.weights.tensors[p + "conv_norm_out.weight"] = fill(static_cast<size_t>(mid));
+  d.weights.tensors[p + "conv_norm_out.bias"] = fill(static_cast<size_t>(mid));
+  const std::string lb = p + "last_time_embedder.timestep_embedder.";
+  d.weights.tensors[lb + "linear_1.weight"] = fill(static_cast<size_t>(mid * 2 * 256));
+  d.weights.tensors[lb + "linear_1.bias"] = fill(static_cast<size_t>(mid * 2));
+  d.weights.tensors[lb + "linear_2.weight"] = fill(static_cast<size_t>(mid * 2 * mid * 2));
+  d.weights.tensors[lb + "linear_2.bias"] = fill(static_cast<size_t>(mid * 2));
+  d.weights.tensors[p + "last_scale_shift_table"] = fill(static_cast<size_t>(2 * mid));
+  d.weights.tensors[p + "conv_out.conv.weight"] = fill(static_cast<size_t>(1 * mid * 27));
+  d.weights.tensors[p + "conv_out.conv.bias"] = fill(1);
+  d.latent = fill(static_cast<size_t>(d.lt * d.lh * d.lw));
+  return d;
+}
+
+// The two arms must see the SAME draws, or the pixels differ for a reason that
+// has nothing to do with residency. `Ltx2NoiseStream` is the reproducibility
+// seam and it stays on the host on both arms, so a deterministic sequence here
+// is the whole of what the comparison needs.
+class CountingNoise final : public vllm::Ltx2NoiseStream {
+ public:
+  std::vector<float> Draw(int64_t count) override {
+    ++draws;
+    std::vector<float> v(static_cast<size_t>(count));
+    for (int64_t i = 0; i < count; ++i) {
+      seed_ = seed_ * 6364136223846793005ULL + 1442695040888963407ULL;
+      v[static_cast<size_t>(i)] =
+          static_cast<float>((seed_ >> 33) % 20001) / 10000.0f - 1.0f;
+    }
+    return v;
+  }
+  int draws = 0;
+
+ private:
+  uint64_t seed_ = 987654321ULL;
+};
+
+// The COMPLEMENT of MakeStagedDecoder, and it exists because measurement said the
+// first fixture was not enough. Instrumenting each CPU arm with its queue's
+// device type showed only six of the ten kernels ever reached a non-CPU queue:
+// `pixel_norm`, `frame_slice`, `channel_repeat` and `linear_cn` were exercised by
+// the goldens on the host and by NOTHING on a device. A kernel table whose arms
+// are never dispatched on the device they were written for is the `## Nothing
+// lands dead` failure one level down from the usual one.
+//
+// This config reaches all four:
+//   * `norm_layer = kPixelNorm`          -> pixel_norm (and NO norm weights, because
+//                                           PixelNorm is parameter-free)
+//   * a `res_x_y` block that HALVES the channels -> the shortcut path, so
+//                                           `norm3` (a one-group GroupNorm) and
+//                                           `Linear3d` -> linear_cn
+//   * `compress_all` with `residual` and a temporal stride of 2
+//                                        -> channel_repeat AND frame_slice
+TinyDecoder MakeShortcutDecoder() {
+  TinyDecoder d = MakeTinyDecoder();
+  d.cfg.prefix = "r1451.alt.";
+  d.cfg.base_channels = 4;
+  d.cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  d.cfg.timestep_conditioning = false;
+  // Walked in REVERSE, so up_blocks.0 is the LAST entry here: compress_all runs
+  // FIRST, while the volume is still 8 channels. That order is forced, not
+  // cosmetic -- `compress_all`'s residual rearranges the INPUT by the same
+  // 2x2x2, so the input channel count must be divisible by 8 (sampling.py:98-110).
+  // Running it after res_x_y halved the volume to 4 makes `expand` divide 4 by 8
+  // and produce a zero-channel skip, which the shape check catches by name.
+  d.cfg.decoder_blocks = {{"res_x_y", 1, 2, false, false},
+                          {"compress_all", 1, 1, false, /*residual=*/true}};
+
+  uint64_t seed = 20260825ULL;
+  auto next = [&seed]() {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>((seed >> 33) % 20001) / 10000.0f - 1.0f;
+  };
+  auto fill = [&next](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = next();
+    return v;
+  };
+  const std::string p = d.cfg.prefix;
+  // conv_in widens to base_channels * multiplier; multiplier is 2 (res_x_y)
+  // times 1 (compress_all), so the bottleneck is 8 and res_x_y halves it to 4.
+  const int64_t wide = 8, narrow = 4;
+  d.weights.tensors.clear();
+  d.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  d.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+  d.weights.tensors[p + "conv_in.conv.weight"] = fill(static_cast<size_t>(wide * 1 * 27));
+  d.weights.tensors[p + "conv_in.conv.bias"] = fill(static_cast<size_t>(wide));
+  // up_blocks.0 = compress_all, stride 2x2x2 over the 8-channel volume,
+  // reduction 1: conv widens to 8*8/1 = 64, expand divides by 8 back to 8, and
+  // the residual repeats its own 1-channel expansion 8 times to match.
+  d.weights.tensors[p + "up_blocks.0.conv.conv.weight"] =
+      fill(static_cast<size_t>(64 * wide * 27));
+  d.weights.tensors[p + "up_blocks.0.conv.conv.bias"] = fill(64);
+  // up_blocks.1 = res_x_y: 8 -> 4, so the shortcut branch is taken.
+  const std::string b = p + "up_blocks.1";
+  d.weights.tensors[b + ".conv1.conv.weight"] = fill(static_cast<size_t>(narrow * wide * 27));
+  d.weights.tensors[b + ".conv1.conv.bias"] = fill(static_cast<size_t>(narrow));
+  d.weights.tensors[b + ".conv2.conv.weight"] = fill(static_cast<size_t>(narrow * narrow * 27));
+  d.weights.tensors[b + ".conv2.conv.bias"] = fill(static_cast<size_t>(narrow));
+  d.weights.tensors[b + ".norm3.weight"] = fill(static_cast<size_t>(wide));
+  d.weights.tensors[b + ".norm3.bias"] = fill(static_cast<size_t>(wide));
+  d.weights.tensors[b + ".conv_shortcut.weight"] = fill(static_cast<size_t>(narrow * wide));
+  d.weights.tensors[b + ".conv_shortcut.bias"] = fill(static_cast<size_t>(narrow));
+  d.weights.tensors[p + "conv_out.conv.weight"] = fill(static_cast<size_t>(1 * narrow * 27));
+  d.weights.tensors[p + "conv_out.conv.bias"] = fill(1);
+  d.latent = fill(static_cast<size_t>(d.lt * d.lh * d.lw));
+  return d;
+}
+
+TEST_CASE("ltx2 vae: the SHORTCUT and RESIDUAL-UPSAMPLE stages are resident too") {
+  // #1451. Companion to the case below, covering the four kernels that one does
+  // not reach on a device queue. THREE assertions matter here, and the third is
+  // the one a fresh review had to add: the volume comes back exactly once, the
+  // pixels match the host arm bit for bit, and no stage fell back to the CPU
+  // queue. The first two cannot see the third -- see the note beside it.
+  const TinyDecoder d = MakeShortcutDecoder();
+
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+  Backend().ResetCounters();
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  const vllm::Ltx2VideoFrames dev =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                /*noise=*/nullptr, /*timestep=*/nullptr, &q);
+
+  const vt::OpProviderStats xpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+  const vt::OpProviderStats cpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+
+  INFO("host<-device transfers: " << Backend().d2h << ", host->device: " << Backend().h2d);
+  CHECK(Backend().d2h == 1u);
+
+  // EXCLUSIVE DISPATCH, and this case needs it as much as its sibling does.
+  // Without the `kCPU == 0` half, a stage that quietly took the CPU queue --
+  // `PixelNorm(nullptr, ...)` instead of `PixelNorm(config.queue, ...)`, say --
+  // still produces the right pixels on a unified-memory backend and still
+  // downloads exactly once, so `d2h` and the `memcmp` both stay green. A fresh
+  // review proved that against the first draft of this case: that one mutation
+  // left the whole seam suite passing 9 of 9. The stages this fixture owns are
+  // pixel-norm, the one-group GroupNorm of the shortcut, `Linear3d`,
+  // depth-to-space, the channel repeat and the frame slice, and this pair is
+  // what keeps them on the queue the decode was handed.
+  INFO("kLtx2Vae dispatches: xpu=" << xpu.selections << " cpu=" << cpu.selections);
+  CHECK(xpu.selections > 0u);
+  CHECK(cpu.selections == 0u);
+
+  REQUIRE(dev.channels == host.channels);
+  REQUIRE(dev.frames == host.frames);
+  REQUIRE(dev.data.size() == host.data.size());
+  CHECK(std::memcmp(dev.data.data(), host.data.data(), host.data.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("ltx2 vae: the video decode's VOLUME IS NEVER DOWNLOADED between two convolutions") {
+  // #1451, LTX25-VAE-DEVICE-RESIDENCY. W5 (#1007) put the CONVOLUTION on the
+  // device and left every stage between two convolutions as a host loop, so the
+  // decode uploaded its input, its weight and its bias and DOWNLOADED ITS
+  // OUTPUT once per `nn.Conv3d` call.
+  //
+  // THIS IS A DIVERGENCE AND NOT ONLY A COST, and that is why the assertion is
+  // on the DOWNLOAD count rather than on a wall clock. Upstream never moves the
+  // tensor back: Lightricks/LTX-2 @ fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
+  // builds the decoder onto a device once
+  // (packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py:273),
+  // the latent follows the weights
+  // (packages/ltx-core/src/ltx_core/model/video_vae/conv_video_decoder.py:283-284),
+  // and a grep for `.cpu()` over that whole package returns only the checkpoint
+  // loader and the DIFFUSION decoder's timestep schedule -- the conv decoder's
+  // forward contains no host round-trip at all.
+  //
+  // WHAT THIS CASE CAN AND CANNOT ESTABLISH. `FakeXpuBackend` is a `memcpy` over
+  // `malloc`, so the count below is a STRUCTURAL fact and its cost is zero. This
+  // case proves the volume stays in device memory across the whole walk. It
+  // proves NOTHING about speed, and nothing about any CUDA kernel: no lease was
+  // taken for this row and #1452 records that no `.cu` on this lane has ever been
+  // compiled or executed in this project's reach. See
+  // .agents/specs/ltx25-vae-device-residency.md
+  // `## What a CPU-only run can and cannot establish`.
+  const TinyDecoder d = MakeStagedDecoder();
+
+  CountingNoise host_noise;
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &host_noise, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+  // The fixture must actually REACH the noise-injection and timestep paths -- a
+  // config that quietly skipped them would make the whole comparison vacuous.
+  REQUIRE(host_noise.draws > 0);
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  // The two residual accumulates route through the SHARED `vt::Add` rather than
+  // an eleventh VAE kernel, so the fake accelerator needs it too. Its absence is
+  // not a silent fallback here -- `vt::GetOp` refuses by name, because this
+  // backend reports unified memory but NOT host-addressable device memory, and
+  // the portable CPU reference tier correctly declines to dereference what it
+  // did not allocate.
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+  REQUIRE(vt::OpRegistered(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU));
+
+  vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+  Backend().ResetCounters();
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  CountingNoise dev_noise;
+  const vllm::Ltx2VideoFrames dev =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &dev_noise, /*timestep=*/nullptr, &q);
+  REQUIRE(dev_noise.draws == host_noise.draws);
+
+  const unsigned d2h = Backend().d2h;
+  const unsigned h2d = Backend().h2d;
+  const vt::OpProviderStats xpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU);
+  const vt::OpProviderStats cpu =
+      vt::GetOpProviderStats(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU);
+  vt::EnableOpProviderCallStats(false);
+
+  // THE RESIDENCY ASSERTION. Exactly ONE device-to-host transfer for the whole
+  // decode: the finished frames. Any stage that computes on the host needs the
+  // volume back, so a second download is the defect this issue names, stated as
+  // a number a box with no GPU can read.
+  INFO("host<-device transfers: " << d2h << ", host->device transfers: " << h2d);
+  CHECK(d2h == 1u);
+
+  // AND THE WEIGHTS ARE STAGED ONCE. The upload count is a function of the
+  // DISTINCT TENSOR COUNT, not of the convolution count or the stage count, and
+  // the arithmetic is written out so the number is checkable rather than
+  // recorded:
+  //
+  //    1  the latent, uploaded once after the host prologue
+  //    2  conv_in                  .conv.weight + .conv.bias
+  //    2  up_blocks.0              .conv.conv.weight + .conv.conv.bias
+  //   22  up_blocks.1.res_blocks   two blocks x eleven tensors each
+  //          (norm1 w+b, norm2 w+b, scale_shift_table,
+  //           per_channel_scale1+2, conv1 w+b, conv2 w+b)
+  //    2  conv_norm_out            .weight + .bias
+  //    1  last_scale_shift_table
+  //    2  conv_out                 .conv.weight + .conv.bias
+  //    5  the timestep embeddings, which are COMPUTED per ada-LN call on the
+  //          host and so are per-call scratch rather than cached weights:
+  //          four inside the two res_blocks, one for the tail
+  //    4  the spatial-noise planes, drawn per injection site by
+  //          `Ltx2NoiseStream`, which stays on the host by design
+  //  ---
+  //   41
+  //
+  // THE CACHE IS GENUINELY EXERCISED HERE, and it was not by the first version
+  // of this fixture. `scale_shift_table` is fetched TWICE per res_block --
+  // rows (0,1) before the first convolution and rows (2,3) before the second
+  // (resnet.py:135-148) -- so four fetches resolve to two uploads. A fixture in
+  // which no tensor is fetched twice cannot tell a cache from no cache at all,
+  // and the mutation that deletes the cache lookup passed against exactly such a
+  // fixture before this one replaced it.
+  //
+  // W5 re-sent a weight AND its bias on every `nn.Conv3d` call, and uploaded the
+  // whole volume as well, so this number grew with the convolution count.
+  // Upstream stages the decoder's parameters at BUILD time and never moves them
+  // again (single_gpu_model_builder.py:273).
+  CHECK(h2d == 41u);
+
+  // Every between-convolution stage dispatched on the QUEUE'S device. Asserting
+  // only that the xpu counter moved would pass an implementation that ran both
+  // arms; the cpu counter staying at zero is what makes it exclusive. That is
+  // the same argument the W5 case above makes for kConv3d.
+  INFO("kLtx2Vae dispatches: xpu=" << xpu.selections << " cpu=" << cpu.selections);
+  CHECK(xpu.selections > 0u);
+  CHECK(cpu.selections == 0u);
+
+  // And the pixels are the same ones. A resident arm that is fast and wrong is
+  // not a port.
+  REQUIRE(dev.data.size() == host.data.size());
+  CHECK(std::memcmp(dev.data.data(), host.data.data(), host.data.size() * sizeof(float)) == 0);
+}
+
 TEST_CASE("ltx2 vae: the video decode RUNS ITS CONVOLUTION on a non-CPU queue, byte-identically") {
   // W5, #1007. The LTX-2.5 video VAE decode had no device arm at all: `vt` had
   // no 3-D convolution on any device, so the ~7.25 TFLOP of dense 3x3x3
@@ -310,6 +732,315 @@ TEST_CASE("ltx2 vae: the video decode RUNS ITS CONVOLUTION on a non-CPU queue, b
   REQUIRE(dev.width == host.width);
   REQUIRE(dev.data.size() == host.data.size());
   CHECK(std::memcmp(dev.data.data(), host.data.data(), host.data.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("ltx2 vae: the video decode's DEVICE ALLOCATIONS are drawn from the shared DevicePool") {
+  // #1904. The video VAE owned its device memory by hand: `VaeStore::Alloc` and
+  // `VaeWeightCache::Get` called `vt::Backend::Alloc` and `Free` directly, so
+  // every buffer a decode used was invisible to `vllm::Pool` -- this tree's
+  // shared caching device allocator (device_pool.h) and the thing
+  // `dense_attn::DBuf` exists to draw from. AGENTS.md `## Shared seams` forbids
+  // the hand-written parallel path, and no exception was recorded for this one.
+  //
+  // WHAT THIS ASSERTS, AND WHY IT IS NOT A RENAME CHECK. Asserting that the
+  // member is spelled `DBuf` would pass on a typedef. What the pool BUYS is
+  // that a driver allocation happens once and is then reused, so this case
+  // measures the two observable consequences instead:
+  //
+  //   1. the pool's own counters MOVE during a decode (the allocations reached
+  //      it at all), and
+  //   2. a SECOND decode of the same shapes makes no new driver allocation --
+  //      `FakeXpuBackend::allocs` is unchanged across it, while the pool's hit
+  //      counter rises by the same traffic.
+  //
+  // (2) is the whole point. Both `cudaMalloc` and `cudaFree` synchronise the
+  // device, and a tiled render calls this decode once per tile
+  // (ltx2_video_vae_tiled.cpp:123), so before this change tile N+1 re-paid every
+  // allocation tile N had just freed.
+  //
+  // THE PLATFORM IS REGISTERED HERE ON PURPOSE. `DBuf` resolves
+  // `residency_policy().device_pool_cap_bytes` through
+  // `platforms::GetPlatform`, so a pooled decode needs a registered platform for
+  // its queue's device type. The case below pins what happens without one, and
+  // `## Outcome -- #1904` in the row's spec records why the production chain
+  // always has one.
+  const TinyDecoder d = MakeStagedDecoder();
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  vllm::DevicePool& pool = vllm::Pool(Backend());
+
+  // DELTAS, not absolutes: this executable runs other decodes on the same
+  // backend, and doctest gives no case order it is safe to depend on.
+  const vllm::DevicePool::Stats before = pool.stats();
+  const unsigned allocs_before = Backend().allocs;
+
+  // A FRESH `CountingNoise` per decode. It is seeded at construction and never
+  // reseeded, so two instances replay the identical draws -- which is what makes
+  // the first-vs-second `memcmp` at the end of this case a statement about the
+  // MEMORY and not about the noise.
+  CountingNoise noise_first;
+  const vllm::Ltx2VideoFrames first =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &noise_first, /*timestep=*/nullptr, &q);
+  REQUIRE(!first.data.empty());
+  REQUIRE(noise_first.draws > 0);
+
+  const vllm::DevicePool::Stats after_first = pool.stats();
+  const unsigned allocs_first = Backend().allocs;
+
+  // (1) The decode's allocations REACHED the pool. A miss is a pool-mediated
+  // driver allocation; zero of them means the decode allocated behind its back.
+  INFO("pool misses: " << before.misses << " -> " << after_first.misses
+                       << ", driver allocs: " << allocs_before << " -> " << allocs_first);
+  if (!PoolBypassed()) {
+    CHECK(after_first.misses > before.misses);
+  } else {
+    // UNDER BYPASS THE POOL IS NEVER CONSULTED: `DevicePool::Get` returns
+    // `b.Alloc(bytes)` before it touches a counter (device_pool.h:126) and `Put`
+    // calls `b.Free(p)` the same way. So the pooled number is not merely
+    // different here, it does not exist -- and asserting its ABSENCE is the
+    // check that the bypass lane bypasses.
+    CHECK(after_first.misses == before.misses);
+    CHECK(after_first.hits == before.hits);
+  }
+  // TRUE IN BOTH LANES, and the reason this line is outside the branch: the
+  // first decode must reach the driver either way, because a cold pool misses.
+  CHECK(allocs_first > allocs_before);
+
+  CountingNoise noise_second;
+  const vllm::Ltx2VideoFrames second =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &noise_second, /*timestep=*/nullptr, &q);
+  REQUIRE(noise_second.draws == noise_first.draws);
+  const vllm::DevicePool::Stats after_second = pool.stats();
+  const unsigned allocs_second = Backend().allocs;
+
+  // (2) The second decode is served ENTIRELY out of the pool: its buffers are
+  // hits, and the driver is not asked once. This is the assertion that goes red
+  // on the hand-rolled owner, which re-allocates every buffer per decode.
+  INFO("second decode -- pool hits: " << after_first.hits << " -> " << after_second.hits
+                                      << ", pool misses: " << after_first.misses << " -> "
+                                      << after_second.misses << ", driver allocs: " << allocs_first
+                                      << " -> " << allocs_second);
+  if (!PoolBypassed()) {
+    CHECK(after_second.hits > after_first.hits);
+    CHECK(after_second.misses == after_first.misses);
+    CHECK(allocs_second == allocs_first);
+  } else {
+    // THE INVERSE, AND IT IS A GATE RATHER THAN A SKIP. With the pool bypassed
+    // nothing is reused, so the second decode must re-allocate its whole working
+    // set from the driver -- the SAME count as the first, because the two
+    // decodes request identical shapes. That is a sharper statement than "some
+    // allocations happened": it says the bypass reuses NOTHING and that the
+    // decode's allocation count is stable at whatever it is. Both `CHECK`s can
+    // fail, so this lane measures the decode rather than skipping it.
+    //
+    // A SKIP HERE WOULD BE WORSE THAN A FAILURE. `ctest` scores a skipped case
+    // as a pass, so a case that quietly returned under bypass would leave both
+    // `sanitize-cpu` legs green while asserting nothing at all.
+    CHECK(after_second.hits == after_first.hits);
+    CHECK(after_second.misses == after_first.misses);
+    CHECK(allocs_second - allocs_first == allocs_first - allocs_before);
+    CHECK(allocs_second > allocs_first);
+  }
+
+  // AND THE PIXELS DID NOT MOVE. A pooled block carries the PREVIOUS decode's
+  // bytes where a fresh `malloc` from the operating system carries zeros, so a
+  // stage that silently relied on zero-initialised device memory would show up
+  // here as the second decode disagreeing with the first. Nothing else in this
+  // suite can see that: the goldens run the CPU arm, whose `VaeStore` host
+  // backing IS value-initialised.
+  REQUIRE(second.data.size() == first.data.size());
+  CHECK(std::memcmp(second.data.data(), first.data.data(),
+                    first.data.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twice") {
+  // #1904 fresh review, finding 1. Pooling made an existing invariant
+  // load-bearing on memory that now deterministically carries the LAST decode's
+  // bytes, and nothing in this tree could see it.
+  //
+  // THE INVARIANT. `CausalConv3d` allocates `padded` and hands it to the `pad`
+  // kernel, which is the ONE consumer in this decode that does not write every
+  // element of its output: under `kZeros` the gather does
+  // `if (zero_h || zero_w) continue;` (src/vt/cpu/cpu_ltx2_vae.cpp) and leaves
+  // those destinations alone. Both arms therefore zero the buffer first -- the
+  // CPU arm with `std::fill`, the CUDA arm with `cudaMemsetAsync`
+  // (src/vt/cuda/cuda_ltx2_vae.cu, whose comment says exactly why). Every other
+  // allocation in the decode is fully written by its consumer: `vt::Conv3d`
+  // seeds each output with the bias, and `linear_cn`, `depth_to_space`,
+  // `frame_slice`, `channel_repeat` and `unpatchify` are bijections.
+  //
+  // THIS CASE GATES THE CPU ARM ONLY, and a fresh review is the reason that is
+  // written down rather than left to be assumed. The fixture registers the CPU
+  // kernels for `kXPU`, so the `pad` that runs here is always
+  // `cpu_ltx2_vae.cpp::Pad` whatever the queue's device says. The CUDA
+  // `cudaMemsetAsync` is never dispatched by any test in this tree and stays
+  // exactly as unguarded as it was; it is owed, and the row's spec says so.
+  //
+  // WHY NOTHING SAW IT. Every `kZeros` case in the tree is in `test_ltx2_vae`,
+  // which runs the CPU arm, where `VaeStore`'s backing is a value-initialised
+  // `std::vector<float>` and the fill is redundant. The seam suite's device
+  // fixtures are all `kReflect`, which has no skipped taps. Deleting the fill
+  // from both arms leaves `test_diffusion_device_seam` at 11/83 and
+  // `test_ltx2_vae` at 45/3152.
+  //
+  // WHY TWICE, AND WHAT MEASUREMENT SAID ABOUT IT. The intent was that only the
+  // second decode would get a recycled block. It is stronger than that: deleting
+  // the fill reds BOTH `memcmp`s, even with this case run alone
+  // (`-tc="*RECYCLED pool block*"` -- the wildcard form, because doctest's `-tc`
+  // SPLITS ON COMMAS and this case's name contains one, so the literal name
+  // matches nothing and exits 0 with every case skipped). The decoder calls
+  // `CausalConv3d` many times per decode
+  // and the pool recycles `padded` BETWEEN those calls -- 21 of the first
+  // decode's 61 requests are already hits -- so the dirt appears within one
+  // decode. The second decode stays, for two reasons that are not the dirt: it
+  // lets the case ASSERT its own instrument's precondition (the pool served it,
+  // below), and it is the cross-call reuse #1904 introduced, which is the shape
+  // a tiled render actually runs.
+  TinyDecoder d = MakeStagedDecoder();
+  d.cfg.prefix = "r1904.zeros.";
+  d.cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
+  {
+    // Re-key the weights under this case's own prefix, so this fixture is
+    // identifiable in a failure message rather than sharing `MakeStagedDecoder`'s.
+    // It is NOT for staging isolation -- a fresh review corrected that: the
+    // `VaeWeightCache` is constructed and destroyed INSIDE `Ltx2ConvVideoDecode`
+    // (see its "ITS LIFETIME IS THE DECODE" note), so no staging is ever shared
+    // between cases and there is nothing to be isolated from. A mangled prefix
+    // is not silent either: `Ltx2VaeWeights::Get` is a `VT_CHECK`, so the decode
+    // throws `missing parameter ...` rather than decoding something consistent
+    // and meaningless.
+    std::map<std::string, std::vector<float>> rekeyed;
+    for (const auto& kv : d.weights.tensors) {
+      const std::string suffix = kv.first.substr(std::string("r1451.dev.").size());
+      rekeyed[d.cfg.prefix + suffix] = kv.second;
+    }
+    d.weights.tensors = rekeyed;
+  }
+
+  CountingNoise host_noise;
+  const vllm::Ltx2VideoFrames host =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &host_noise, /*timestep=*/nullptr, /*queue=*/nullptr);
+  REQUIRE(!host.data.empty());
+  REQUIRE(host_noise.draws > 0);
+
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kXPU,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+
+  vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  vllm::DevicePool& pool = vllm::Pool(Backend());
+
+  CountingNoise noise_first;
+  const vllm::Ltx2VideoFrames dev_first =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &noise_first, /*timestep=*/nullptr, &q);
+  const vllm::DevicePool::Stats after_first = pool.stats();
+
+  CountingNoise noise_second;
+  const vllm::Ltx2VideoFrames dev_second =
+      vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
+                                &noise_second, /*timestep=*/nullptr, &q);
+  const vllm::DevicePool::Stats after_second = pool.stats();
+
+  // THE PRECONDITION OF THIS INSTRUMENT, checked rather than assumed. If the
+  // second decode were not served from the pool, its `padded` would be fresh
+  // memory and the comparison below would prove nothing about the fill.
+  INFO("pool hits " << after_first.hits << " -> " << after_second.hits << ", misses "
+                    << after_first.misses << " -> " << after_second.misses);
+  if (!PoolBypassed()) {
+    REQUIRE(after_second.hits > after_first.hits);
+    REQUIRE(after_second.misses == after_first.misses);
+  } else {
+    // UNDER BYPASS THIS CASE DOES NOT GATE THE ZERO-FILL, and saying so is the
+    // point of writing the branch instead of skipping. Every allocation is a
+    // fresh driver block there, so no recycled dirt exists and deleting the fill
+    // would leave these `memcmp`s green -- the very blindness the pooled lane
+    // was added to remove. What the case still gates here is the arm's
+    // CORRECTNESS: the device decode must equal the host decode, twice. Those
+    // assertions are below and are not conditional, so this lane is not a skip.
+    REQUIRE(after_second.hits == after_first.hits);
+    REQUIRE(after_second.misses == after_first.misses);
+  }
+
+  REQUIRE(dev_first.data.size() == host.data.size());
+  REQUIRE(dev_second.data.size() == host.data.size());
+  CHECK(std::memcmp(dev_first.data.data(), host.data.data(),
+                    host.data.size() * sizeof(float)) == 0);
+  // Both of these go red when the CPU arm's zero-fill is deleted. NO BYTE COUNT
+  // is asserted or recorded: `memcmp` returns the signed difference of the first
+  // differing byte, not a count, and on this backend the recycled block's
+  // contents depend on the process's whole allocation history, so the value
+  // moves when an unrelated line is added. Non-zero is the claim.
+  CHECK(std::memcmp(dev_second.data.data(), host.data.data(),
+                    host.data.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by name") {
+  // #1904's stated obstacle, made executable. Routing the decode's memory
+  // through `DBuf` makes a registered PLATFORM a precondition it did not have
+  // before, because `ResolveDevicePoolPolicy` reads the pool's soft cap off
+  // `platforms::GetPlatform(device.type)`. The audit that says this is safe is
+  // about the PRODUCTION chain -- `Ltx2VideoEngine::Load` takes its device type
+  // from `platforms::CurrentPlatform().device_type()`
+  // (src/vllm/multimodal/ltx2_video.cpp:827-828), which by construction returns
+  // a type the platform registry holds -- and an audit is not a gate. This is
+  // the gate: a caller that gets there anyway is refused with a message that
+  // names the device, the platform registry and the pool, instead of dying
+  // inside a lookup three headers down that names none of them.
+  //
+  // kROCM, NOT kXPU. The platform registry is process-wide and has no
+  // unregister, so a case that depended on kXPU still being platform-less would
+  // depend on doctest's case order. Nothing in this executable ever registers a
+  // ROCm PLATFORM, so the precondition holds however the cases are scheduled.
+  vt::RegisterBackend(vt::DeviceType::kROCM, &Backend());
+  // EVERY kernel the decode needs is registered, so the platform is the ONLY
+  // thing missing. Without this the decode is refused by the op provider before
+  // it allocates anything, and the case would pass on a message that has nothing
+  // to do with what it claims to gate.
+  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kROCM,
+                 vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kROCM,
+                 vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kROCM,
+                 vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
+  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kROCM,
+                 vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+  REQUIRE(vt::TryGetBackend(vt::Device{vt::DeviceType::kROCM, 0}) != nullptr);
+  REQUIRE_FALSE(vllm::platforms::HasPlatform(vt::DeviceType::kROCM));
+
+  const TinyDecoder d = MakeTinyDecoder();
+  vt::Queue q{vt::Device{vt::DeviceType::kROCM, 0}, nullptr};
+  std::string msg;
+  try {
+    (void)vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh,
+                                    d.lw, /*noise=*/nullptr, /*timestep=*/nullptr, &q);
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  CHECK(msg.find("rocm") != std::string::npos);
+  CHECK(msg.find("platform") != std::string::npos);
+  CHECK(msg.find("pool") != std::string::npos);
 }
 
 TEST_CASE("ltx2 video: a platform that DECLINES the architecture refuses device 1 by name") {

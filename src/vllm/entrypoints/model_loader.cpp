@@ -24,6 +24,7 @@
 
 #include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -31,7 +32,9 @@
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"  // LOAD-GGUF-MMPROJ, #821
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
+#include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
+#include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
@@ -40,7 +43,9 @@
 #include "vllm/transformers_utils/hf_cache.h"  // ENG-HF-MODEL-DOWNLOAD (#1280)
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
+#include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
+#include "vllm/v1/kv_cache_interface.h"  // FIX-KV-GROUP-LAYER-COUNT resolver
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
 #include "vt/dtype.h"
@@ -151,11 +156,49 @@ vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
   return resolved.device;
 }
 
+// ENG-HYBRID-PLACEMENT W2 (#2023): build the resolved placement and SAY it.
+//
+// Called from `SelectQueueForModel`, which is the one function every load path
+// goes through and which already owns the device decision — its neighbour comment
+// records that it and `ResolveModelDeviceType` cannot answer differently. That
+// makes this "at model build" in the only sense the spec means, and it covers the
+// GGUF and safetensors paths with one call site rather than three.
+//
+// W2 RESOLVES AND REPORTS; IT MOVES NOTHING. The returned placement is dropped
+// here on purpose: W3 owns the routing that reads it. What lands today is the
+// refusal of an impossible placement and the line an operator needs to attribute
+// a slow run, and a placement that changes nothing prints nothing at all, so an
+// ordinary load is byte-identical on stderr as well as in behaviour.
+void ReportDevicePlacement(vt::DeviceType engine_device) {
+  const std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  if (overrides.empty()) return;
+  const vllm::DevicePlacement placement =
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device);
+  const std::string described = placement.Describe();
+  if (described.empty()) {
+    // Non-empty overrides that place NOTHING away from this device: `cpu_moe` on
+    // a CPU engine is exactly this. Say so, because the operator asked for
+    // something and is entitled to know it was inert rather than ignored.
+    std::cerr << "engine: device placement: " << overrides.size()
+              << (overrides.size() == 1 ? " override resolves"
+                                        : " overrides resolve")
+              << " to the engine's own device (" << vt::DeviceTypeName(engine_device)
+              << "), so nothing is placed" << std::endl;
+    return;
+  }
+  std::cerr << "engine: device placement: " << described << std::endl;
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vt::DeviceType resolved =
         ResolveModelDeviceType(architecture, device);
+    // NOT reported here. An EXPLICIT device is reported far earlier, in
+    // `FromModelDir`'s up-front device-resolution block, because that is ahead of
+    // all path and weight I/O and is therefore where an operator still sees the
+    // line when the load then fails. Reporting in both places would print twice.
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -163,6 +206,11 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
     // be created must FAIL the load loudly, never silently serve on CPU.
     return vt::GetBackend(resolved).CreateQueue();
   }
+  // The AUTO path reports here and not earlier: the architecture participates in
+  // the answer (`ResolveAutoDevice`), so the up-front block cannot know it yet.
+  // The explicit path is the other way round and is reported there.
+  ReportDevicePlacement(ResolveModelDeviceType(architecture, device));
+
   // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
   // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
   // on-device instead of the CPU dequant reference.
@@ -964,6 +1012,16 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    sliding_window_pattern (muse_glimmer_gguf_weights.h).
 //  * the three qwen3_5 keys -> HfConfigFromGguf, which owns all three itself
 //    (qwen3_5_gguf_weights.cpp).
+//  * `qwen4exp` -> Qwen4ExpHfConfigFromGguf. It does NOT reuse HfConfigFromGguf,
+//    which asserts its own three architectures by name; a fourth family routed
+//    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
+//    #809 defect this table exists to prevent (see the default arm below).
+//  * `glm5next` -> Glm5NextHfConfigFromGguf, whose builder synthesizes an
+//    HF-shaped config and hands it to the SAME `ParseGlm5NextParams` a
+//    config.json descends through, so both sources meet one validator. This is
+//    the row that discharges O9: `scripts/convert-glm5-next-gguf.py` is the
+//    only writer of that container -- no upstream tool can produce one -- and
+//    until this row existed the file it wrote was refused as unrecognized.
 struct GgufArchArm {
   const char* arch;
   HfConfig (*build)(const vllm::GgufFile&);
@@ -975,6 +1033,8 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen35", &vllm::HfConfigFromGguf},
     {"qwen35moe", &vllm::HfConfigFromGguf},
     {"qwen3next", &vllm::HfConfigFromGguf},
+    {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
+    {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {
@@ -1394,14 +1454,43 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
     const LoadedModel& model, const HfConfig& config, int block_size,
     int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec) {
+  vllm::v1::KVCacheConfig kv;
   if (spec.has_value()) {
     // Speculation is Qwen3.5/3.6-only at this pin (both gate checkpoints); build
     // the widened spec KV directly (extra GDN k+1 state slots + widened conv row
     // + the `fa_draft` full-attn group). MakeQwen3_5KVCacheSpec(num_spec>0).
-    return vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
-                                        spec->ResolvedNumSpeculativeTokens());
+    kv = vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
+                                      spec->ResolvedNumSpeculativeTokens());
+  } else {
+    kv = ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
   }
-  return ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
+  // FIX-KV-GROUP-LAYER-COUNT (#1963, #1966). THE single funnel: both branches
+  // above return through here, so one call reaches every architecture and both
+  // the probe and the resized config MakeKVCacheResolved builds.
+  //
+  // Thirty-three of the thirty-four registries publish ONE placeholder name per
+  // KV group, and `KVBytesPerBlock` / `recurrent_state_bytes` read
+  // `layer_names.size()` as the layer count. Without this line a
+  // `--kv-cache-memory` budget is divided by ONE layer's page and then
+  // multiplied by every layer when the runner allocates: 1 GiB in, 8.5 GiB
+  // allocated on the 27B, and the #371 recurrent-state OOM guard reads 0.90 GiB
+  // against a 43.40 GiB allocation. Upstream cannot have that bug because the
+  // count that divides the budget and the count that sizes the allocation are
+  // the same expression over the same list (`kv_cache_utils.py:1399`,
+  // `:1005-1008`, `:1409-1416`).
+  //
+  // ORDERING, against `ResolveMaxNumSeqs` (#1983, which landed first): that
+  // resolver reads `kv_cfg_`, which is `MakeKVCacheResolved`'s result, so it
+  // always sees names this call has already resolved. Its seat count is
+  // `num_blocks`-linear, and `num_blocks` is the one input of its arithmetic
+  // this change moves — which is the point: upstream's `num_blocks` is
+  // per-layer (`kv_cache_utils.py:1008` divides by `num_layers`), and that is
+  // the meaning its unification against one attention page assumes. Before this
+  // line the byte-budget path handed it a count inflated by the layer count, so
+  // its clamp was too permissive. The two fixes agree; they do not fight.
+  vllm::v1::ResolveKVCacheGroupLayerNames(kv, config.num_hidden_layers,
+                                          config.layer_types);
+  return kv;
 }
 
 int LoadedEngine::ResolveNumBlocks(const EngineParams& params,
@@ -1555,6 +1644,38 @@ void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
   vllm::v1::ApplyCacheDType(cfg, resolved, k_scale, v_scale);
 }
 
+int LoadedEngine::ResolveMaxNumSeqs(const EngineParams& params,
+                                    const vllm::v1::KVCacheConfig& kv_cfg) {
+  const int configured = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+  const vllm::v1::HybridKvBudget budget =
+      vllm::v1::ComputeHybridKvBudget(kv_cfg);
+  const int resolved =
+      vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  if (resolved >= configured) {
+    // Attention-only models, pure-recurrent models, and every hybrid whose
+    // budget already holds the configured concurrency land here: no line, no
+    // change, byte-identical to before this resolver existed.
+    return configured;
+  }
+  // A reduction is never silent. Upstream logs its own block-size raise and its
+  // auto-fit for the same reason: a number the operator did not choose, that
+  // changes what the engine serves, has to appear in the engine's own output.
+  // It names WHAT was compared against WHAT, because a bound whose wiring is
+  // invisible in the report cannot be audited.
+  std::cerr << "INFO recurrent-state budget: reduced max_num_seqs from "
+            << configured << " to " << resolved << ". The KV pool ("
+            << kv_cfg.num_blocks << " blocks) holds "
+            << budget.unified_num_blocks
+            << " unified pages of " << budget.unified_block_tokens
+            << " tokens (one page = one " << budget.mamba_page_bytes
+            << "-byte GDN state), and each sequence owns "
+            << budget.slots_per_seq
+            << " of them. Raise --num-blocks / --kv-cache-memory for more"
+               " concurrent sequences, or lower num_speculative_tokens.\n";
+  std::cerr.flush();
+  return resolved;
+}
+
 int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
                                      const HfConfig& config,
                                      const vllm::v1::KVCacheConfig& kv_cfg,
@@ -1618,6 +1739,101 @@ std::unique_ptr<LoadedModel> AttachMtp(std::unique_ptr<LoadedModel> model,
   return model;
 }
 
+// #1946. The header carries the argument; this is the mechanism.
+bool BindDflashDraftSharedEmbed(DflashDraft& draft, const LoadedModel& target) {
+  // The DSpark lane is NOT this lane. A DSpark checkpoint usually ships its own
+  // table and keeps it by value inside Qwen3DSparkWeights, and the loader's
+  // fallback fills THAT rather than `weights.embed_tokens` -- so binding here
+  // would rebind a field the DSpark forward never reads while leaving the copy
+  // that costs the memory in place. Skipped by name, and owed as its own row.
+  if (draft.dspark != nullptr) return false;
+  const OwnedTensor* shared = target.shared_embed_tokens();
+  if (shared == nullptr) return false;
+  const OwnedTensor& own = draft.weights.embed_tokens;
+  // Nothing was read into the draft (an in-memory draft built without one), or
+  // it is ALREADY the target's tensor. Either way there is no second copy and
+  // no rebind to make; returning false keeps `EmbedTable()` on whatever the
+  // caller set up.
+  if (own.Empty() || shared == &own) return false;
+
+  // The one discriminator, and it is load-bearing rather than defensive: a GGUF
+  // target may keep its table F16 in place (`LoadEmbedAndHead`'s kKeepF16 arm)
+  // while `LoadGgufSharedEmbedAndHeadBf16` always hands the draft BF16. Those
+  // are different bytes at different widths, and aliasing them would make the
+  // draft gather f16 rows through a bf16 view -- silently wrong tokens, which no
+  // memory gate would ever see.
+  bool same = own.dtype == shared->dtype && own.rank == shared->rank;
+  for (int i = 0; same && i < own.rank; ++i) same = own.shape[i] == shared->shape[i];
+  if (!same) {
+    const auto describe = [](const OwnedTensor& w) {
+      std::string s(vt::Name(w.dtype));
+      s += " [";
+      for (int i = 0; i < w.rank; ++i) {
+        if (i != 0) s += ", ";
+        s += std::to_string(w.shape[i]);
+      }
+      return s + "]";
+    };
+    std::cerr << "vllm.cpp: DFlash draft embed NOT shared with the target: the "
+                 "draft read "
+              << describe(own) << " and the target holds " << describe(*shared)
+              << ". Both tables stay resident; tokens are unaffected.\n";
+    return false;
+  }
+
+  // The bytes this rebind stops uploading a second time. Read from the draft's
+  // OWN copy, which is the allocation that goes away, and read BEFORE the clear.
+  //
+  // DERIVED FROM THE GEOMETRY, not from `bytes.size()` (#1946 review). The two
+  // agree for every table this arm can see, because the guard above has just
+  // proved dtype/rank/shape equal on both sides. They stop agreeing the moment a
+  // buffer is a BORROWED view that is longer than its tensor -- an over-long
+  // safetensors mapping slice, a shared bf16 expansion -- and then the number on
+  // stderr would be the buffer's length rather than the table's. `RowSizeBytes`
+  // is what the DEVICE allocation will be, which is the quantity the line
+  // claims, and it is defined for block-quant and elementwise dtypes alike.
+  const size_t saved = vt::RowSizeBytes(own.dtype, own.Numel());
+  draft.weights.shared_embed_tokens = shared;
+  // `del draft_inner.embed_tokens` (utils.py:73). Not tidiness: leaving the
+  // draft's OwnedTensor populated leaves a second `d_dev` FIELD reachable, so a
+  // future call site that reads `weights.embed_tokens` instead of `EmbedTable()`
+  // would re-open the whole 2.5 GB with every gate green. An empty table makes
+  // that call site refuse at its first `ResidentWeight` instead, by name.
+  //
+  // THAT REFUSAL IS A CHECK, NOT A PROPERTY OF THE EMPTY TENSOR (#1953).
+  // This comment used to say `vt::Embedding` would refuse an empty table. It
+  // would not have: `vt::Embedding` validates ranks, shapes, dtypes, contiguity
+  // and device, and `ResidentWeight` takes the shape from the caller, so an empty
+  // tensor passed every one of those and the failure was a SIGSEGV on the host
+  // arm and a zero-byte allocation read out of bounds on a device arm. The
+  // refusal now lives in `ResidentWeight` itself (dense_attn_block.h), and
+  // `test_dflash2_embed_dedup.cpp` drives this exact call site to gate it.
+  draft.weights.embed_tokens = OwnedTensor{};
+  std::cerr << "vllm.cpp: DFlash draft embed SHARED with the target (one device "
+               "copy, "
+            << saved << " B saved)\n";
+  return true;
+}
+
+// #1946: the member-initialiser wrapper for BindDflashDraftSharedEmbed, so the
+// rebind happens WHILE the engine is being built rather than in a body that a
+// later member could forward before. Null model or null draft passes through
+// untouched, which is every non-speculative load.
+//
+// `static`, because it is generically named, sits in the public
+// `vllm::entrypoints` namespace and no header declares it: without this it was
+// an external symbol (`nm -C` reported `T vllm::entrypoints::BindSharedEmbed`)
+// that a future translation unit could collide with. `BindDflashDraftSharedEmbed`
+// is the exported lever, and it is exported deliberately so the gate reaches the
+// function production calls; this wrapper is not.
+static std::unique_ptr<DflashDraft> BindSharedEmbed(
+    std::unique_ptr<DflashDraft> draft, const LoadedModel* target) {
+  if (draft != nullptr && target != nullptr) {
+    (void)BindDflashDraftSharedEmbed(*draft, *target);
+  }
+  return draft;
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params,
                            std::optional<Qwen3_5MTPWeights> mtp_weights)
@@ -1666,9 +1882,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
-      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
-      dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
+      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
+      // #1946: rebound onto the target's embedding table on the way in, which is
+      // why `model_` is initialised (and declared) first. THE PRODUCTION CALL
+      // SITE: all three draft loaders -- the GGUF branch, the two safetensors
+      // branches, and the in-memory W3 overload -- funnel into this constructor,
+      // and it is the first point at which the target and the draft both exist.
+      dflash_draft_(BindSharedEmbed(std::move(dflash_draft), model_.get())),
       tokenizer_(std::move(tokenizer)),
       // #607 L2: carry the multimodal input limits onto the engine, so the ONE
       // config object every consumer asks (GetLimitPerPrompt) is the one the
@@ -1686,6 +1907,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
       max_model_len_(ResolveMaxModelLen(
           params, config_, kv_cfg_,
           params.block_size > 0 ? params.block_size : 32)),
+      // The serving concurrency, clamped to the recurrent-state budget the KV
+      // pool affords. See ResolveMaxNumSeqs (issue #1983).
+      max_num_seqs_(ResolveMaxNumSeqs(params, kv_cfg_)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
@@ -1706,7 +1930,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
                   ? *preselected_queue
                   : SelectQueueForModel(model_->registration().architecture,
                                         params.device),
-              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              /*max_num_reqs=*/max_num_seqs_,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
               resolved_spec_config_,
@@ -1734,17 +1958,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // pre-W7 `!resolved_spec_config_.has_value() &&` form.
       async_scheduling_enabled_(ResolveAsyncEnabled(
           MakeSchedulerConfig(
-              max_model_len_,
-              params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           runner_.runner_supports_async(),
           model_->registration().info.is_pooling_model,
           /*spec_decode_incompatible=*/resolved_spec_config_.has_value() &&
               !resolved_spec_config_->async_scheduling_compatible())),
       max_concurrent_batches_(MakeSchedulerConfig(
-                                  max_model_len_,
-                                  params.max_num_seqs > 0 ? params.max_num_seqs
-                                                          : 8,
+                                  max_model_len_, max_num_seqs_,
                                   max_num_batched_tokens_, params.policy)
                                   .MaxConcurrentBatches(async_scheduling_enabled_)),
       // The engine-wide structured-output manager, native backend over the
@@ -1752,14 +1973,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // core.py:134). Wired into the scheduler + engine cores below so
       // response_format / C-ABI structured constraints gate decoding.
       structured_output_manager_(
-          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+          max_num_seqs_,
           vllm::v1::MakeNativeBackendFactory(
               tokenizer_, static_cast<int>(config_.vocab_size))),
       // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
       scheduler_(MakeScheduler(
           async_scheduling_enabled_,
           MakeSchedulerConfig(
-              max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
           kv_cfg_, params.block_size > 0 ? params.block_size : 32,
           /*enable_caching=*/prefix_caching_enabled_,
@@ -1794,7 +2015,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
   //
   // An UNKNOWN budget (MemAvailable unreadable) never refuses.
   {
-    const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+    // The RESOLVED concurrency, not the configured one: the guard must weigh
+    // what the runner allocates (issue #1983). ResolveMaxNumSeqs is the single
+    // source of truth for that number.
+    const int seqs = max_num_seqs_;
     const int64_t state_needed =
         vllm::v1::recurrent_state_bytes(kv_cfg_, seqs);
     const int64_t host_available = vllm::v1::host_available_memory_bytes();
@@ -2061,6 +2285,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   << shadowed << std::endl;
       }
     }
+    // ENG-HYBRID-PLACEMENT (#2018): the one pairing inside this key that is legal
+    // and slow rather than legal and fine. Printed unconditionally of
+    // `installed.empty()`, because the placement can come from the environment
+    // alone, in which case the installed DOCUMENT is empty and the collision is
+    // still real.
+    const std::string collision = vllm::DescribePlacementResidencyCollision();
+    if (!collision.empty()) {
+      std::cerr << "engine: weight residency: " << collision << std::endl;
+    }
   }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at
@@ -2106,6 +2339,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (params.device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(params.device));
+    // ENG-HYBRID-PLACEMENT W2 (#2023): the EXPLICIT device is fully known here,
+    // because `ResolveModelDeviceType` ignores the architecture on this branch, so
+    // the placement can be resolved and reported ahead of all path and weight I/O
+    // — which is where an operator still reads the line when the load then fails.
+    ReportDevicePlacement(ResolveModelDeviceType(/*architecture=*/"",
+                                                 params.device));
     (void)ResolveExplicitDeviceType(
         params.device, named_platform == nullptr
                            ? std::nullopt
@@ -2226,6 +2465,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // that call LATCHES: moving a non-latching file scan in front of it would
       // change which loads fix the process's streaming answer, and this repair
       // has no business moving that.
+      //
+      // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870): resolved ONCE and reused below by
+      // `CheckDeviceWeightFit` as well, so the two calls that ask this process's
+      // residency policy about this file can never resolve two different
+      // answers to the same `getenv` reads.
+      const GgufLoadPolicy gguf_load_policy = GgufLoadPolicy::FromEnv();
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
@@ -2234,7 +2479,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           gguf_arch.factory->streams_routed_experts &&
           ResolveExpertStreamRequested() &&
           GgufExpertTowersReachSlotLane(gguf, kStreamedExpertSuffix,
-                                        GgufLoadPolicy::FromEnv())) {
+                                        gguf_load_policy)) {
         // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
         // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
         // writes. The arena is the store's own arithmetic — `slots *
@@ -2252,12 +2497,20 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                   ResolveExpertStreamSlotBytes(static_cast<int64_t>(slice)));
         }
       }
+      // GGUF-DEVICE-FIT-EXPAND-POLICY (#1870): `RouteGgufTensor`'s own totality
+      // guarantee ("anything else is kExpandBf16") makes this condition an
+      // EXACT description of every tensor's residency, not a guess — see the
+      // header on `GgufStagedWeightFootprint`. `cpu_ref` needs no term of its
+      // own: it is a CPU-only oracle switch, and `needs_weight_staging` above
+      // already excludes every load it could apply to.
+      const bool policy_forces_full_expand =
+          GgufPolicyForcesFullExpand(gguf_load_policy);
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.needs_weight_staging(),
           DeviceWeightBudgetBytes(
               target.residency_policy().device_memory_total_bytes),
-          /*model_dtype_bytes=*/2, lane);
+          /*model_dtype_bytes=*/2, lane, policy_forces_full_expand);
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
     // QUANT-QWEN38-27B-GGUF-ARM (#821): refuse a qwen3_5-family GGUF carrying

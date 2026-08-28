@@ -243,6 +243,96 @@ void ParsePpmHeader(const std::string& bytes, int* width, int* height, size_t* p
 
 }  // namespace
 
+// ── the fixture distilled/IC adapter, hoisted ───────────────────────────────
+//
+// DEFINED HERE rather than beside the IC-LoRA cases that first needed it,
+// because row LTX25-DISTILLED-LORA-REQUIRED (#1445) made `res2s_two_stage` and
+// `dfr` refuse a load that carries no adapter, and the DFR canvas and HQ sampler
+// cases above those definitions now have to supply one. A pure relocation: the
+// body is unchanged.
+namespace {
+
+// Write an IC-LoRA adapter targeting one REAL tensor of the reduced DiT
+// contract, with its shape derived from the contract rather than hard-coded, so
+// a fixture geometry change cannot leave this silently targeting nothing.
+std::string WriteFixtureLora(const std::string& path, const std::string& target,
+                             float scale,
+                             const std::map<std::string, std::string>& metadata = {}) {
+  const vllm::Ltx2DitParams params = ltx2_fixture::ReducedDitParams();
+  std::vector<int64_t> shape;
+  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
+    if (spec.name == target) shape = spec.shape;
+  }
+  REQUIRE_MESSAGE(shape.size() == 2,
+                  "the fixture LoRA target '", target,
+                  "' is not a rank-2 tensor of the reduced DiT contract");
+  const int64_t out_features = shape[0];
+  const int64_t in_features = shape[1];
+  const int64_t rank = 2;
+
+  // B [out, rank] and A [rank, in], both constant, so the delta is a uniform
+  // `scale * rank` on every element — large enough that the render cannot be
+  // numerically indistinguishable from the unfused one.
+  std::vector<ltx2_fixture::Entry> entries = {
+      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
+           ".lora_A.weight",
+       "BF16",
+       {rank, in_features},
+       std::vector<float>(static_cast<size_t>(rank * in_features), 1.0F),
+       {}},
+      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
+           ".lora_B.weight",
+       "BF16",
+       {out_features, rank},
+       std::vector<float>(static_cast<size_t>(out_features * rank), scale),
+       {}},
+  };
+  std::string metadata_json;
+  if (!metadata.empty()) {
+    metadata_json = "{";
+    bool first = true;
+    for (const auto& kv : metadata) {
+      if (!first) metadata_json += ",";
+      first = false;
+      metadata_json += "\"" + kv.first + "\":\"" + kv.second + "\"";
+    }
+    metadata_json += "}";
+  }
+  ltx2_fixture::WriteSafetensors(entries, metadata_json, path);
+  return path;
+}
+
+// The target every case uses: the first block's query projection, which every
+// render must read.
+const char* const kFixtureLoraTarget = "transformer_blocks.0.attn1.to_q.weight";
+
+// Give a load the distilled adapter its recipe REFUSES to start without (row
+// LTX25-DISTILLED-LORA-REQUIRED, #1445), and give it to no other load.
+//
+// DERIVED FROM THE RECIPE, exactly as `FixtureCheckpointClass` above is, and for
+// the same reason: a per-case list of "kinds that need an adapter" here would be
+// a second copy of the recipe table, the two could disagree, and nothing would
+// say so. A case that supplies an adapter the recipe does not require would also
+// be quietly changing the weights it renders on.
+void SupplyRequiredAdapter(vllm::multimodal::VideoModelParams* mp, const std::string& kind,
+                           const std::string& path) {
+  for (const char* version : {"2.5", "2.4", "2.3", "2"}) {
+    vllm::Ltx2PipelineRecipe recipe;
+    try {
+      recipe = vllm::ResolveLtx2PipelineRecipe(kind, version);
+    } catch (const std::exception&) {
+      continue;
+    }
+    if (recipe.requires_distilled_lora) {
+      mp->extras[vllm::multimodal::kLtx2LoraPathExtra] =
+          WriteFixtureLora(path, kFixtureLoraTarget, 1.0F);
+    }
+    return;
+  }
+}
+
+}  // namespace
+
 // ─── registration and detection ─────────────────────────────────────────────
 
 TEST_CASE("ltx2 video: the family self-registers under its stable name") {
@@ -2037,6 +2127,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
   mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+  SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_canvas_lora.safetensors");
   // Phase 0 only: phase 1 needs the latent spatial upsampler, and this case is
   // about the canvas and the slots rather than about the detailing stage.
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -2129,6 +2220,7 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     vllm::multimodal::VideoModelParams two = FixtureParams(ws.paths);
     two.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
     two.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&two, "dfr", ws.root + "/dfr_two_phase_lora.safetensors");
     two.extras["upsampler_path"] = ws.paths.upsampler;
     const std::unique_ptr<vllm::multimodal::VideoEngine> full =
         vllm::multimodal::LoadVideoEngine(two);
@@ -2462,6 +2554,7 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
     mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_rounds_lora.safetensors");
     mp.extras["upsampler_path"] = ws.paths.upsampler;  // stage 2, the SPATIAL arm
     if (with_temporal) {
       mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = temporal_path;
@@ -4003,9 +4096,55 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // `artifacts.frames` (0.90-61.0 ms over both renders) and `decode.video`'s two
   // short reopen records (0.019-5.66 ms), and both are named in
   // `### Owed out of W0` rather than left to be found.
+  //
+  // AND THE CHECK IS MADE ONCE PER LEAF, NOT ONCE PER RESOLVABLE RECORD, WHICH
+  // IS WHAT ISSUE #1885 IS ABOUT. `span_bound < kSpanSlackPerRecord` is the
+  // resolution test, and it is a comparison against a WALL-CLOCK DURATION: a
+  // record of 61 ms takes the checking branch and the same record at 59 ms takes
+  // the skip. So the NUMBER OF ASSERTIONS this suite executes used to be decided
+  // by the box rather than by the tree, and that is not a hypothetical margin --
+  // the longest record skipped here measures 26.3 ms while `artifacts.frames`
+  // over both renders has been measured at 0.90 ms to 61.0 ms on this project's
+  // own hosts, which is the far side of 60 ms.
+  //
+  // This repository quotes assertion totals as evidence, so a total that moves
+  // on its own makes every count comparison across a diff measure noise, and it
+  // fails in the direction that reads as a result: a reviewer who sees six fewer
+  // assertions looks for six the diff deleted, and there are none.
+  //
+  // NOTHING IS GIVEN UP BY AGGREGATING, and the reason is that the bound does not
+  // vary over the checked set. A record is checked exactly when `span_bound ==
+  // kSpanSlackPerRecord`, so "every checked record is within the bound" and "the
+  // WORST checked record is within the bound" are the same statement about the
+  // same constant. The failure message carries the record index, so a red still
+  // names which record.
+  //
+  // A LEAF WITH NO RESOLVABLE RECORD LEAVES `worst_resolvable_slack` AT 0 AND THE
+  // CHECK PASSES ON NOTHING. That is exactly what the per-record form did on such
+  // a leaf -- it ran no assertion at all -- so nothing is lost here, but the
+  // escape is real and it is stated rather than papered over: a fresh review
+  // forced every record below the resolution and drove a genuine 40 ms swallow
+  // straight through, green, at the same 813 assertions.
+  //
+  // THE PARTITION CHECK BELOW DOES NOT CLOSE THAT, and an earlier version of this
+  // comment claimed it did. `span_checked + span_unresolvable == leaves.size()`
+  // is satisfied by `0 + N == N`, so a leaf that resolved nothing looks exactly
+  // like a leaf that resolved everything. What the partition check holds is that
+  // no record leaves this loop by a THIRD path; what reports the resolution is
+  // the `MESSAGE` below, as it always did. On the runs measured for this row, 3
+  // to 5 of the 12 aggregate checks passed on nothing.
+  //
+  // AND IT CANNOT BE ASSERTED WITHOUT PUTTING THE CLOCK BACK. "At least one
+  // record of this leaf is resolvable" is a statement about a wall-clock
+  // duration, so it would red on a fast box for being fast -- which is the defect
+  // this whole block exists to remove. The escape is listed under `## Owed` in
+  // `.agents/specs/ltx25-test-determinism.md` instead, where a bound that does
+  // not need 60 ms of record to resolve is what would close it.
   size_t span_checked = 0;
   size_t span_unresolvable = 0;
   double worst_span_slack = 0.0;
+  double worst_resolvable_slack = 0.0;
+  size_t worst_resolvable_record = 0;
   for (size_t li = 0; li < leaves.size(); ++li) {
     INFO("leaf record " << (li + 1) << " of " << leaves.size());
     const double lo = leaves[li]["start_seconds"].get<double>();
@@ -4057,25 +4196,42 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
       continue;
     }
     ++span_checked;
+    if (span_slack > worst_resolvable_slack) {
+      worst_resolvable_slack = span_slack;
+      worst_resolvable_record = li + 1;
+    }
     MESSAGE("  " << c.leaf << " record " << (li + 1) << " span slack = " << span_slack << "s of "
                  << record_seconds << "s (" << (100.0 * span_slack / record_seconds)
                  << "%), bound " << span_bound << "s");
-    CHECK_MESSAGE(span_slack <= span_bound,
-                  "record " << (li + 1) << " of '" << c.leaf << "' spends " << span_slack
-                      << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
-                         "occupy, over a bound of " << span_bound
-                      << "s. A leaf that opened before its work began, or stayed open after it "
-                         "ended, is carrying a phase nobody named under this one's name. This "
-                         "quantity is TWO INSTRUMENT BOUNDARIES and it does not grow with the "
-                         "render -- but it does move with the box and with the build: measured "
-                         "over one build configuration on one host it spans 402x, so read "
-                         "a red here against the run's own load before reading it as a swallowed "
-                         "phase");
   }
   MESSAGE("  " << c.leaf << " span slack: " << span_checked << " of " << leaves.size()
                << " leaf record(s) checked at " << kSpanSlackPerRecord << "s, "
                << span_unresolvable << " below this instrument's resolution; worst "
                << worst_span_slack << "s");
+  // THE SKIP IS ARITHMETIC A READER CAN CHECK, not a branch nobody counts. Before
+  // this line a record that fell below the resolution left no trace in any
+  // assertion, only in a `MESSAGE` -- a skip wearing a pass. There is no clock in
+  // this comparison, so no box can move its verdict, and an edit that ever makes
+  // the loop drop a record on some third path reds here.
+  CHECK_MESSAGE(span_checked + span_unresolvable == leaves.size(),
+                "the span-slack loop accounted for " << (span_checked + span_unresolvable)
+                    << " of the '" << c.leaf << "' leaf's " << leaves.size()
+                    << " records, so a record left the loop by neither the checked nor the "
+                       "below-resolution path");
+  CHECK_MESSAGE(worst_resolvable_slack <= kSpanSlackPerRecord,
+                "record " << worst_resolvable_record << " of '" << c.leaf << "' spends "
+                    << worst_resolvable_slack
+                    << "s inside its own leaf record but OUTSIDE the span its sub-scopes "
+                       "occupy, over a bound of " << kSpanSlackPerRecord << "s. It is the worst "
+                    << "of the " << span_checked
+                    << " record(s) of this leaf the bound can resolve, and every one of them "
+                       "carries this same bound. A leaf that opened before its work began, or "
+                       "stayed open after it ended, is carrying a phase nobody named under this "
+                       "one's name. This quantity is TWO INSTRUMENT BOUNDARIES and it does not "
+                       "grow with the render -- but it does move with the box and with the "
+                       "build: measured over one build configuration on one host it spans 402x, "
+                       "so read a red here against the run's own load before reading it as a "
+                       "swallowed phase");
 
   // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
   // named would satisfy containment while still hiding time.
@@ -4291,6 +4447,14 @@ void CheckRenderPhases(const nlohmann::json& table,
   REQUIRE(trace.completed);
   REQUIRE(trace.dit_evaluations > 0);
   REQUIRE(trace.video_decode_chunks > 0);
+  // AND THE THIRD ONE, which `denoise.update` is checked against below. Asserted
+  // rather than assumed: a counter that stayed at zero would make assertion (0)
+  // over that name read "emitted 0 times, and the render did the work 0 times",
+  // which is a vacuous pass wearing a green tick. This fixture renders on the
+  // first-order arm, where every step takes exactly one sampler update.
+  REQUIRE_MESSAGE(trace.sampler_updates > 0,
+                  "the render counted no sampler updates at all, so the `denoise.update` count "
+                  "below has nothing to falsify it");
 
   // AND THE CHUNK COUNT IS RE-DERIVED rather than taken on faith, in the shape
   // the multi-chunk case above already uses: the tiling algebra the decoder runs
@@ -4425,15 +4589,35 @@ void CheckRenderPhases(const nlohmann::json& table,
   // The audio decode is exactly one mel pass and one vocoder pass.
   const std::vector<Carrying> carrying = {
       {"denoise",
-       {"denoise.step"},
+       {"denoise.step", "denoise.update"},
        denoise_min_coverage,
        {},
-       {trace.dit_evaluations},
-       "Ltx2ConditioningTrace::dit_evaluations",
-       // ONE part, so (2) already IS the per-part assertion and a second copy of
-       // it would only be noise. `denoise.step`'s own placement debt is the
-       // third row of the anchor table in `### Owed out of W0`.
-       {0.0},
+       {trace.dit_evaluations, trace.sampler_updates},
+       "Ltx2ConditioningTrace::dit_evaluations and ::sampler_updates",
+       // TWO parts now, so (1b) stops being vacuous on this leaf — which is what
+       // the holding-action note above asked for. **(2b) does NOT**, and saying
+       // it did was wrong: both floors below are 0.0, and the loop that checks
+       // (2b) does `if (c.part_min_coverage[i] <= 0.0) continue;`, so it
+       // executes zero CHECKs here. `decode.audio` remains the only leaf where
+       // (2b) asserts anything. What this leaf gains is (1b), the count, and a
+       // reported share in the MESSAGE — not a second gated floor.
+       // `denoise.step`'s own placement debt is the third row of the anchor
+       // table in `### Owed out of W0`.
+       //
+       // NEITHER CARRIES A FLOOR, and for `denoise.update` that 0.0 is MEASURED
+       // debt rather than an oversight, in exactly the shape `decode.audio.mel`
+       // records beside it. The row's spec measured this name's honest share at
+       // 0.45% to 11.15% across four boxes, and the transfer it would have to
+       // catch — `denoise.step` left open across the post-process, with
+       // `denoise.update` emitted empty after it — puts it at ~0%. The two
+       // distributions therefore OVERLAP, and any floor that reds the transfer
+       // also reds an honest render this row has already produced. That is
+       // #1568, and it stays open here rather than being closed by a constant
+       // that cannot be justified. What binds this name instead is (0): the
+       // count comes from `Ltx2ConditioningTrace::sampler_updates`, which the
+       // RENDER maintains beside the update it counts, so no placement of a
+       // phase scope can move it.
+       {0.0, 0.0},
        render},
       {"decode.video",
        {"decode.video.chunk"},
@@ -4611,6 +4795,106 @@ void CheckRenderPhases(const nlohmann::json& table,
   }
 }
 
+// ── A SEAM ANCHOR: the name that fills the hole between two named leaves ────
+//
+// Row LTX25-PHASE-RESIDUE (#1668). `phase-log.json` carries a `gaps` array
+// (#1571, landed by `LTX25-PHASE-INSTRUMENT`) that decomposes the residue into
+// the intervals between consecutive leaves, and on the fixture render it names
+// the regions nobody anchored. Two of them are anchored here, and this is the
+// assertion that says the anchor went where the gap was.
+//
+// IT IS STRUCTURAL AND CARRIES NO TOLERANCE, which is deliberate and is the
+// shape the note on the withdrawn `residue <= 2 * instrument` bound argues for.
+// A seam anchor's guarantee is not "it measures at least X seconds" — its
+// honest share is a property of the box, which is exactly what made that bound
+// unusable. Its guarantee is a POSITION: the anchor lies inside the seam its
+// two neighbours leave, and the seam holds nothing else. Under a correct
+// placement all of that holds by construction; under any wrong one at least one
+// clause fails outright, whatever the clock did:
+//
+//   * opened before the previous leaf closes -> the anchor overlaps it, and
+//     `PhaseLog::Open` marks the INNER record `nested` besides;
+//   * left open across the next leaf -> the NEXT leaf is marked `nested` and
+//     leaves `sum_leaf_seconds` entirely, which is the failure mode the
+//     `load.setup`/`load.open` note in the driver warns about;
+//   * moved onto some other region -> it is no longer between these two names,
+//     and the leaf it landed beside shows up inside the seam.
+//
+// So no constant separates honest from defective here; the ORDER does.
+void CheckSeamAnchor(const nlohmann::json& table, const std::string& previous,
+                     const std::string& anchor, const std::string& next, int64_t render) {
+  INFO("seam anchor = " << anchor << ", between '" << previous << "' and '" << next << "'");
+  const std::vector<nlohmann::json> found = RecordsNamed(table, anchor, render);
+  REQUIRE_MESSAGE(found.size() == 1u,
+                  "'" << anchor << "' was emitted " << found.size()
+                      << " time(s) and the driver opens it exactly once. A region named zero "
+                         "times is the un-named time this row was filed to name");
+  const nlohmann::json& r = found.front();
+  // A SEAM ANCHOR IS A LEAF, not a span and not nested. A span is skipped by
+  // `Sum`, so naming the seam with one would leave `sum_leaf_seconds` exactly
+  // where it was and change only the reader's impression that it had moved.
+  CHECK_MESSAGE(!r.value("span", false),
+                "'" << anchor << "' is a SPAN, so `Sum` skips it and the seconds it names are "
+                       "still outside every leaf in the table's own sum");
+  CHECK_MESSAGE(!r.value("nested", false),
+                "'" << anchor << "' is marked `nested`, so a leaf was still live when it "
+                       "opened. Its seconds are dropped from `sum_leaf_seconds` and the seam is "
+                       "still un-named");
+  const double start = r["start_seconds"].get<double>();
+  const double end = r["end_seconds"].get<double>();
+  CHECK(end >= start);
+
+  // The two neighbours that DEFINE the seam. Absent means this fixture does not
+  // run that phase, and the clause it would carry is skipped rather than faked;
+  // `REQUIRE(bounded)` below makes a call in which BOTH are absent a red instead
+  // of a vacuous pass.
+  bool bounded = false;
+  const std::vector<nlohmann::json> before = RecordsNamed(table, previous, render);
+  if (!before.empty()) {
+    double previous_end = 0.0;
+    for (const nlohmann::json& p : before) {
+      previous_end = std::max(previous_end, p["end_seconds"].get<double>());
+    }
+    CHECK_MESSAGE(start >= previous_end - 1e-9,
+                  "'" << anchor << "' opens at " << start << " and '" << previous
+                      << "' is still running until " << previous_end
+                      << ". The anchor is not filling the seam after that leaf — it is inside "
+                         "it, charging a phase that already has a name");
+    bounded = true;
+  }
+  const std::vector<nlohmann::json> after = RecordsNamed(table, next, render);
+  if (!after.empty()) {
+    double next_start = std::numeric_limits<double>::max();
+    for (const nlohmann::json& n : after) {
+      next_start = std::min(next_start, n["start_seconds"].get<double>());
+    }
+    CHECK_MESSAGE(end <= next_start + 1e-9,
+                  "'" << anchor << "' is still open at " << end << " and '" << next
+                      << "' starts at " << next_start
+                      << ". A leaf opened while this one is live is marked `nested` and leaves "
+                         "`sum_leaf_seconds` altogether, so this placement REMOVES a phase from "
+                         "the sum instead of adding one to it");
+    bounded = true;
+  }
+  REQUIRE_MESSAGE(bounded, "neither '" << previous << "' nor '" << next
+                               << "' is in this table, so this seam has no boundary and the "
+                                  "assertions above are vacuous");
+
+  // ...AND THE SEAM HOLDS NOTHING ELSE. Without this clause the two bounds above
+  // are satisfied by an anchor that moved anywhere into the interval, including
+  // on top of a THIRD leaf that happens to sit there — which is the transfer the
+  // rest of this file spends its length catching one level down.
+  for (const NamedInterval& iv : LeafIntervals(table, render)) {
+    if (iv.name == anchor) continue;
+    const bool outside = iv.end <= start + 1e-9 || iv.start >= end - 1e-9;
+    CHECK_MESSAGE(outside, "the leaf '"
+                               << iv.name << "' runs [" << iv.start << ", " << iv.end
+                               << "], inside the window '" << anchor << "' claims [" << start
+                               << ", " << end << "]. The seam this anchor names is not empty, so "
+                                                 "one of the two names is on the other's work");
+  }
+}
+
 }  // namespace
 
 TEST_CASE("ltx2 video: the three carrying phases contain their work and the load keeps its order") {
@@ -4682,9 +4966,9 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
   // swallow a NEIGHBOUR, which the four above cannot: see the note on
   // `CheckOnlyAnchorsAreNested`.
-  CheckOnlyAnchorsAreNested(table, {"denoise.step", "decode.video.chunk", "decode.video.vae",
-                                    "decode.audio.mel", "decode.audio.vocoder",
-                                    "artifacts.frames.ppm"});
+  CheckOnlyAnchorsAreNested(table, {"denoise.step", "denoise.update", "decode.video.chunk",
+                                    "decode.video.vae", "decode.audio.mel",
+                                    "decode.audio.vocoder", "artifacts.frames.ppm"});
 
   // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the
   // note above this case for why it is not tightened toward the measured share.
@@ -4731,10 +5015,9 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // every leaf in that state, and W2 and W3 must read it before they act on
   // `load.dit`.
   {
-    const std::vector<std::string> load_order = {"load.open",      "load.dit",
-                                                 "load.video_vae", "load.audio_vae",
-                                                 "load.upsampler", "load.text_encoder",
-                                                 "load.prompt_embeds"};
+    const std::vector<std::string> load_order = {
+        "load.open",       "load.dit",         "load.dit_config",   "load.video_vae",
+        "load.audio_vae",  "load.upsampler",   "load.text_encoder", "load.prompt_embeds"};
     double previous = -1.0;
     std::string previous_name;
     int64_t seen = 0;
@@ -4759,6 +5042,50 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
     }
     REQUIRE_MESSAGE(seen >= 4, "this fixture load names only " << seen
                                    << " load phases; the order it checks is vacuous");
+  }
+
+  // (7) AND THE TWO SEAMS THE `gaps` DECOMPOSITION NAMED ARE ANCHORED.
+  //
+  // Row LTX25-PHASE-RESIDUE (#1668). The order above is a WEAK assertion by its
+  // own account, and it is weak in a specific direction: it constrains the
+  // leaves that exist and says nothing about the intervals BETWEEN them. That is
+  // where this render's residue actually was. #1571's gap decomposition, landed
+  // by `LTX25-PHASE-INSTRUMENT`, measured it on this fixture: after the load
+  // prologue — which `519303d15` named `load.open` — the largest remaining hole
+  // is `load.dit` -> `load.video_vae`, and the tail after `artifacts.audio` is
+  // the last one before the writer reads the clock. Both are now names rather
+  // than residue, and `CheckSeamAnchor` holds each to its position.
+  //
+  // THE LOAD RUNS ONCE, so its seam is read at render 0 like the order above.
+  CheckSeamAnchor(table, "load.dit", "load.dit_config", "load.video_vae", 0);
+
+  // ...and the TAIL, which is checked on both renders because it is per-render.
+  // Its `next` is empty for a reason no other anchor here has: nothing follows
+  // it. `artifacts.mux` closes one statement before `WritePhaseLog` reads the
+  // clock, so the region it names is the last thing in the render and the seam
+  // has no leaf on its far side. The clause that would have bounded it is
+  // replaced by the stronger one below.
+  for (const int64_t r : {render_one, render_two}) {
+    CheckSeamAnchor(table, "artifacts.audio", "artifacts.mux", /*next=*/"", r);
+    // AND IT IS THE LAST LEAF OF ITS RENDER. This is what `next` cannot say. An
+    // `artifacts.mux` that opened early — around the audio write, say — still
+    // satisfies "after `artifacts.audio` ends" if the write is short, and still
+    // finds an empty window if it is narrow. It cannot satisfy this: some other
+    // leaf would then start after it, and the tail it claims to name would still
+    // be outside every leaf in the table.
+    const std::vector<nlohmann::json> mux = RecordsNamed(table, "artifacts.mux", r);
+    REQUIRE(mux.size() == 1u);
+    const double mux_start = mux.front()["start_seconds"].get<double>();
+    for (const NamedInterval& iv : LeafIntervals(table, r)) {
+      if (iv.name == "artifacts.mux") continue;
+      CHECK_MESSAGE(iv.start <= mux_start + 1e-9,
+                    "the leaf '" << iv.name << "' starts at " << iv.start << ", after '"
+                        << "artifacts.mux" << "' opened at " << mux_start
+                        << ". This anchor exists to name the render's TAIL — the result "
+                           "assembly and the mux argv build that ran after the last named leaf "
+                           "and before the table read the clock — and a leaf that follows it "
+                           "means the tail is somewhere else");
+    }
   }
 }
 
@@ -6700,63 +7027,6 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
 // `ltx2_video.cpp`; that leaves the fuser and its whole unit suite green and
 // REDs the cases below, which is the difference between measuring a class and
 // measuring a capability.
-namespace {
-
-// Write an IC-LoRA adapter targeting one REAL tensor of the reduced DiT
-// contract, with its shape derived from the contract rather than hard-coded, so
-// a fixture geometry change cannot leave this silently targeting nothing.
-std::string WriteFixtureLora(const std::string& path, const std::string& target,
-                             float scale,
-                             const std::map<std::string, std::string>& metadata = {}) {
-  const vllm::Ltx2DitParams params = ltx2_fixture::ReducedDitParams();
-  std::vector<int64_t> shape;
-  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
-    if (spec.name == target) shape = spec.shape;
-  }
-  REQUIRE_MESSAGE(shape.size() == 2,
-                  "the fixture LoRA target '", target,
-                  "' is not a rank-2 tensor of the reduced DiT contract");
-  const int64_t out_features = shape[0];
-  const int64_t in_features = shape[1];
-  const int64_t rank = 2;
-
-  // B [out, rank] and A [rank, in], both constant, so the delta is a uniform
-  // `scale * rank` on every element — large enough that the render cannot be
-  // numerically indistinguishable from the unfused one.
-  std::vector<ltx2_fixture::Entry> entries = {
-      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
-           ".lora_A.weight",
-       "BF16",
-       {rank, in_features},
-       std::vector<float>(static_cast<size_t>(rank * in_features), 1.0F),
-       {}},
-      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
-           ".lora_B.weight",
-       "BF16",
-       {out_features, rank},
-       std::vector<float>(static_cast<size_t>(out_features * rank), scale),
-       {}},
-  };
-  std::string metadata_json;
-  if (!metadata.empty()) {
-    metadata_json = "{";
-    bool first = true;
-    for (const auto& kv : metadata) {
-      if (!first) metadata_json += ",";
-      first = false;
-      metadata_json += "\"" + kv.first + "\":\"" + kv.second + "\"";
-    }
-    metadata_json += "}";
-  }
-  ltx2_fixture::WriteSafetensors(entries, metadata_json, path);
-  return path;
-}
-
-// The target every case uses: the first block's query projection, which every
-// render must read.
-const char* const kFixtureLoraTarget = "transformer_blocks.0.attn1.to_q.weight";
-
-}  // namespace
 
 TEST_CASE("ltx2 video: an IC-LoRA supplied through the LOAD EXTRA reaches the PIXELS") {
   // THE WITNESS IS THE RENDERED ARTIFACT, not `last_conditioning()`. The
@@ -8811,6 +9081,7 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
     mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
+    SupplyRequiredAdapter(&mp, kind, ws.root + "/" + tag + "_lora.safetensors");
     // Stage 1 only. Both recipes' second phase needs the latent spatial
     // upsampler, which the fixture does not carry and which is refused BY NAME
     // in its own case above — that refusal is not what this case is about.
@@ -8855,6 +9126,38 @@ TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
   // A ZERO WOULD ALSO BE "not equal to the Euler count", and zero is what a
   // build that never ran the loop reports. Ruled out explicitly.
   CHECK(euler3.dit_evaluations > 0);
+
+  // ── AND `sampler_updates` IS A DIFFERENT NUMBER (row LTX25-PHASE-RESIDUE,
+  // #1668) ──────────────────────────────────────────────────────────────────
+  //
+  // `denoise.update`'s count assertion is taken from this counter, so the
+  // counter has to be worth taking. On the FIRST-ORDER arm the two agree — one
+  // sampler update per denoiser evaluation — and a counter that were merely a
+  // second name for `dit_evaluations` would agree there too, so that arm cannot
+  // tell them apart. THIS is where they separate: `res2s_two_stage` runs its
+  // post-process and step inside `Ltx2Res2sDenoisingLoop` behind
+  // `Ltx2Res2sHooks`, which the first-order arm's statement never reaches, so it
+  // counts 7 and 11 evaluations against ZERO updates.
+  //
+  // The zero is recorded rather than hidden, and it is #1567: anchoring that arm
+  // needs a hook rather than a statement. IT WOULD NOT LAND DEAD, and the
+  // sentence here that said so was FALSE: THIS CASE renders that arm through
+  // `LoadVideoEngine` and `VideoEngine::Generate`, and its `hq3` and `hq5`
+  // tables already carry `denoise` and 7 and 11 `denoise.step` records. What
+  // this case makes non-vacuous is that the counter counts the SAMPLER'S OWN
+  // WORK and not evaluations under another name.
+  INFO("sampler updates: res2s 3 -> " << hq3.sampler_updates << ", 5 -> " << hq5.sampler_updates
+                                      << "; euler 3 -> " << euler3.sampler_updates << ", 5 -> "
+                                      << euler5.sampler_updates);
+  CHECK(euler3.sampler_updates == 3);
+  CHECK(euler5.sampler_updates == 5);
+  // The DISCRIMINATOR. Same request, same fixture, same binary; the counters
+  // agree on one arm and disagree on the other, which no copy of
+  // `dit_evaluations` can do.
+  CHECK(euler3.sampler_updates == euler3.dit_evaluations);
+  CHECK(hq3.sampler_updates != hq3.dit_evaluations);
+  CHECK(hq3.sampler_updates == 0);
+  CHECK(hq5.sampler_updates == 0);
 
   // THE BONG REFINEMENT IS REACHED ON THE PRODUCTION SCHEDULE, not only on the
   // hand-built fixtures in test_ltx2_pipeline. It changes the latent without
@@ -8921,6 +9224,7 @@ TEST_CASE("ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per eva
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
     mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
+    SupplyRequiredAdapter(&mp, kind, ws.root + "/" + tag + "_lora.safetensors");
     // Stage 1 only, for the reason the case above gives: the second phase needs
     // the latent spatial upsampler the fixture does not carry.
     mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
@@ -9021,6 +9325,7 @@ TEST_CASE("ltx2 video: the res_2s SUBSTEP converts x0 against the midpoint, not 
   mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
   mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
       FixtureCheckpointClass("res2s_two_stage");
+  SupplyRequiredAdapter(&mp, "res2s_two_stage", ws.root + "/substep_lora.safetensors");
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -9214,6 +9519,46 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
   CHECK(t.video_guidance_stg_scale == row.stg_scale);
   CHECK(t.video_guidance_rescale_scale == row.rescale_scale);
   CHECK(t.video_guidance_modality_scale == row.modality_scale);
+
+  // ── THE AUDIO ROW OF THE SAME PHASE (#1510) ───────────────────────────────
+  //
+  // WHY IT IS HERE AND NOT ONLY IN THE PARAMS SUITE. Two cases already pin the
+  // audio guider params -- `test_ltx2_pipeline.cpp`'s recipe table and this
+  // file's `Ltx2DetectPipelineParams("2.5")` case -- and both read the params
+  // FUNCTION. Neither goes through a render, so neither can see a render that
+  // resolved something else. MEASURED before this block existed: setting
+  // `params.audio_guider.rescale_scale` to 0.0 in `Ltx2Params20` left this case
+  // GREEN at 67/67 assertions with the target relinked, so the audio arm of the
+  // shipped one_stage path had no render-level assertion at all.
+  //
+  // AND WHY THE FOUR TRACE CHECKS COMPARE AGAINST LITERALS RATHER THAN AGAINST
+  // `audio_row`. The video block above asserts `trace == row`, which compares
+  // two reads of ONE source and stays green whenever a change moves both. The
+  // audio block asserts the upstream VALUES, so a mutation of `Ltx2Params20`
+  // reds here even though the recipe and the trace still agree with each other.
+  const vllm::Ltx2MultiModalGuiderParams audio_row = recipe.phases[0].audio_guidance;
+  CHECK(audio_row.cfg_scale == 7.0);
+  CHECK(audio_row.stg_scale == 1.0);
+  CHECK(audio_row.rescale_scale == 0.7);
+  CHECK(audio_row.modality_scale == 3.0);
+  // constants.py:59-68 @ fd4ded7f, `PipelineParams.audio_guider_params`, reached
+  // for a 2.5 checkpoint through `_PARAMS_SINCE_VERSION` at :130-133. The 2.3
+  // and 2.4 rows replace only `stg_blocks` and the image CRF, so all four scales
+  // below hold across the whole 2.3-to-2.5 lineage. vLLM-Omni ships the same
+  // four in `_official_guidance` (ltx2_recipes.py:99-105 @ a4ea67a2).
+  CHECK_MESSAGE(t.audio_guidance_cfg_scale == 7.0,
+                "the render resolved an audio `cfg_scale` other than upstream's 7.0 "
+                "(constants.py:61); note the VIDEO arm's is 3.0, so a copied row reads 3.0 here");
+  CHECK_MESSAGE(t.audio_guidance_stg_scale == 1.0,
+                "the render resolved an audio `stg_scale` other than upstream's 1.0 "
+                "(constants.py:62)");
+  CHECK_MESSAGE(t.audio_guidance_rescale_scale == 0.7,
+                "the render resolved an audio `rescale_scale` other than upstream's 0.7 "
+                "(constants.py:63) -- 0.0 disables the standard-deviation renormalization "
+                "at guiders.py:268-271 outright");
+  CHECK_MESSAGE(t.audio_guidance_modality_scale == 3.0,
+                "the render resolved an audio `modality_scale` other than upstream's 3.0 "
+                "(constants.py:64)");
 
   // The perturbations REACHED the DiT, read off the mask that was handed over
   // rather than off the guider params. A config that is BUILT and not HANDED
@@ -9459,6 +9804,223 @@ TEST_CASE("ltx2 one_stage: all four guidance arms are combined in X0 space (#109
                   "the latent `Ltx2EulerStep` wrote is not the step over the recorded denoised "
                   "prediction, so the sampler was handed some other tensor (#1039): residual "
                       << worst << " against a tolerance of " << (1e-5 * scale));
+  }
+
+  // ── THE AUDIO GUIDER WAS HANDED THE AUDIO ROW, and its result was passed on
+  //    UNTOUCHED (#1510) ────────────────────
+  //
+  // WHY THIS BLOCK IS LAST IN THE CASE, and why it has to stay last. Its first
+  // assertion is a `REQUIRE` rather than a `CHECK`, because the four size reads
+  // under it and the `.data()` calls below them index a vector this render may
+  // not have filled -- and doctest ABORTS THE WHOLE CASE at a failed `REQUIRE`.
+  // Placed anywhere earlier it therefore truncates every VIDEO assertion after
+  // it, which is an audio-side absence hiding video-side coverage.
+  //
+  // MEASURED ON BOTH TREES, with the five `audio_first_*` assignments deleted
+  // in `RecordFirstGuidedStep`. With this block in the MIDDLE the case ran 64
+  // of its 91 assertions and the rebuilt-velocity, stepper-input and Euler
+  // blocks never reported. With it here it runs 76, and 76 is not just the
+  // larger number: the block holds 16 assertions, so `91 - 16 + 1 = 76` is
+  // every video assertion passing before the abort, exactly. Downgrading the
+  // guard to a `CHECK` is not the fix -- that trades a clean abort for reading
+  // an empty vector -- so the ORDER is.
+  //
+  // WHAT THIS CATCHES THAT THE FOUR `audio_guidance_*` CHECKS ABOVE DO NOT. Those
+  // four read what the ENGINE RESOLVED. `denoise_in.audio_guider` is a separate
+  // assignment one screen further down the same function, and nothing observed
+  // it. MEASURED before this block existed: replacing that assignment with a
+  // copy carrying `cfg_scale = 1.0, rescale_scale = 0.0` -- CFG off and the
+  // standard-deviation renormalization disabled, which is exactly what #1510
+  // asks about -- left this case, `test_ltx2_dfr`, `test_ltx2_retake`,
+  // `test_video_engine` and `test_diffusion_device_seam` all GREEN, while the
+  // same replacement on `denoise_in.video_guider` red three cases and five
+  // assertions. The difference was that the video arms are recorded and the
+  // audio arms were not, so the replay below had no inputs.
+  //
+  // It is `audio_row` and not `t.audio_guidance_*` on purpose, for decision D3's
+  // reason: a replay fed the trace's own scales would agree with the pipeline
+  // whenever a change moved BOTH, which is the shape a cross-wired trace field
+  // has.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0,
+                    "this render carried no audio stream, so the audio guider ran on nothing and "
+                    "nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    const double audio_span = MaxAbsOf(t.audio_first_cond);
+    REQUIRE_MESSAGE(audio_span > 1e-6,
+                    "the audio conditional prediction is identically zero, so every guidance term "
+                    "is zero whatever the scales were");
+
+    // Each audio arm is a DIFFERENT forward, said here for the same reason the
+    // video block says it: an arm whose context or perturbation never reached the
+    // DiT contributes a guidance term of exactly zero and is invisible in the
+    // combination.
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_uncond, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the unconditional pass returned the conditional pass's own AUDIO tensor, so "
+                  "the negative context did not reach the forward");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_perturbed, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the perturbed pass returned the conditional pass's own AUDIO tensor");
+    CHECK_MESSAGE(MaxAbsDiffOf(t.audio_first_modality, t.audio_first_cond) > 1e-6 * audio_span,
+                  "the isolated-modality pass returned the conditional pass's own AUDIO tensor");
+
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed audio guidance - audio_first_denoised| = " << worst);
+    // EXACT, for the video replay's reason: the same function over the same f32
+    // inputs. Any non-zero residual means the denoiser was handed scales other
+    // than the recipe's, or something else was applied to its result.
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` over the four recorded "
+                  "AUDIO arms at the recipe's own audio scales, so the denoiser was handed a "
+                  "different `audio_guider` than the render resolved (#1510)");
+    // And the combination MOVED what it was handed. `cfg 1.0 / stg 0.0 /
+    // modality 1.0 / rescale 0.0` returns `cond` unchanged, so this is the check
+    // that reds when the audio arm is guided by nothing at all.
+    CHECK_MESSAGE(t.audio_first_denoised != t.audio_first_cond,
+                  "the audio guider returned its conditional input unchanged, so no guidance term "
+                  "moved it (guiders.py:261-266)");
+  }
+}
+
+TEST_CASE("ltx2 one_stage: the four AUDIO guidance overrides reach the render and the trace (#1510)") {
+  // TWO DEFECTS THIS CASE EXISTS FOR, and neither was visible before it.
+  //
+  // 1. THE TRACE COULD REPORT THE PRE-OVERRIDE ROW. `Ltx2ConditioningTrace`'s
+  //    header says the four `audio_guidance_*` fields are set AFTER
+  //    `ApplyGuidanceOverrides`, so a request override is what they report.
+  //    MEASURED before this case existed: pointing all four at
+  //    `recipe.phases[i].audio_guidance` -- the row BEFORE the overrides -- left
+  //    the whole `test_ltx2_video` binary green. The identical mutation on the
+  //    VIDEO four reds, in the a2vid override case below, because that case
+  //    overrides a video scale and reads it back. Nothing did that on the audio
+  //    side.
+  //
+  // 2. A CROSS-WIRE WAS CAUGHT ON ONE FIELD OF FOUR. At the recipe's own
+  //    defaults the two arms differ in `cfg_scale` alone -- 3.0 video against
+  //    7.0 audio -- while `stg 1.0`, `rescale 0.7` and `modality 3.0` are
+  //    identical across the whole 2.3-to-2.5 lineage. So wiring all four audio
+  //    trace fields to `video_guidance` moved exactly one assertion in the
+  //    #1092 case: three quarters of that cross-wire read as correct because the
+  //    wrong source carried the right number. The four values below are chosen
+  //    to differ from the video row on EVERY field, which is what makes the
+  //    cross-wire observable on all four.
+  //
+  // WHY AN OVERRIDE RENDER RATHER THAN A SECOND DEFAULT ONE. Only a request can
+  // make the two arms differ on more than `cfg_scale` without changing a shipped
+  // default, and changing a shipped default is what row
+  // LTX25-AUDIO-GUIDANCE-DEFAULTS exists to say this port must not do.
+  Workspace ws;
+
+  const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5");
+  REQUIRE(recipe.phases.size() == 1);
+  const vllm::Ltx2MultiModalGuiderParams video_row = recipe.phases[0].video_guidance;
+  const vllm::Ltx2MultiModalGuiderParams audio_row = recipe.phases[0].audio_guidance;
+
+  // Each one differs from BOTH rows, and each keeps its own pass running:
+  // `cfg != 1` runs the unconditional forward (guiders.py:275-277), `stg != 0`
+  // the perturbed one and `modality != 1` the isolated-modality one, so this
+  // render assembles the same four passes the default one does.
+  const double kCfg = 2.0;
+  const double kStg = 0.5;
+  const double kRescale = 0.25;
+  const double kModality = 2.0;
+  const char* const kNames[] = {"cfg_scale", "stg_scale", "rescale_scale", "modality_scale"};
+  const double kWanted[] = {kCfg, kStg, kRescale, kModality};
+  const double kVideoRow[] = {video_row.cfg_scale, video_row.stg_scale, video_row.rescale_scale,
+                              video_row.modality_scale};
+  const double kAudioRow[] = {audio_row.cfg_scale, audio_row.stg_scale, audio_row.rescale_scale,
+                              audio_row.modality_scale};
+  for (size_t i = 0; i < 4; ++i) {
+    INFO("field = " << std::string(kNames[i]));
+    // THE INSTRUMENT'S OWN PRECONDITION, asserted rather than assumed. If either
+    // row ever grows one of these values, the corresponding check below stops
+    // discriminating and would keep passing while saying nothing.
+    REQUIRE_MESSAGE(kWanted[i] != kVideoRow[i],
+                    "the override value equals the VIDEO row's, so a trace field cross-wired to "
+                    "`video_guidance` reads correct on this field");
+    REQUIRE_MESSAGE(kWanted[i] != kAudioRow[i],
+                    "the override value equals the AUDIO row's own default, so a trace field "
+                    "that reported the PRE-override row reads correct on this field");
+  }
+
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(OneStageParams(ws.paths));
+  REQUIRE(engine != nullptr);
+  vllm::multimodal::VideoGenParams gen = OneStageGen(ws.root + "/audio_override");
+  gen.extras[vllm::multimodal::kLtx2AudioCfgScaleExtra] = "2.0";
+  gen.extras[vllm::multimodal::kLtx2AudioStgScaleExtra] = "0.5";
+  gen.extras[vllm::multimodal::kLtx2AudioRescaleScaleExtra] = "0.25";
+  gen.extras[vllm::multimodal::kLtx2V2aGuidanceScaleExtra] = "2.0";
+  CHECK_NOTHROW((void)engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+
+  // ── the trace reports the OVERRIDDEN row ────────────────────────
+  CHECK_MESSAGE(t.audio_guidance_cfg_scale == kCfg,
+                "`--audio-cfg-guidance-scale` did not reach the trace; the recipe's own value is "
+                "7.0 and the video row's is 3.0");
+  CHECK_MESSAGE(t.audio_guidance_stg_scale == kStg,
+                "`--audio-stg-guidance-scale` did not reach the trace; both rows ship 1.0");
+  CHECK_MESSAGE(t.audio_guidance_rescale_scale == kRescale,
+                "`--audio-rescale-scale` did not reach the trace; both rows ship 0.7");
+  CHECK_MESSAGE(t.audio_guidance_modality_scale == kModality,
+                "`--v2a-guidance-scale` did not reach the trace; both rows ship 3.0");
+
+  // THE CONTROL: the four audio extras are audio-scoped. Without this the case
+  // above passes on a build that applied every override to both arms.
+  CHECK(t.video_guidance_cfg_scale == video_row.cfg_scale);
+  CHECK(t.video_guidance_stg_scale == video_row.stg_scale);
+  CHECK(t.video_guidance_rescale_scale == video_row.rescale_scale);
+  CHECK(t.video_guidance_modality_scale == video_row.modality_scale);
+
+  // ── and the DENOISER was handed the overridden row, not only the trace ──
+  //
+  // The trace records what the engine RESOLVED. `denoise_in.audio_guider` is a
+  // separate assignment, so a build that resolved the override and handed the
+  // denoiser the recipe row would satisfy every check above. The replay is the
+  // same one the #1092 case runs, over this render's own overridden scales.
+  {
+    const size_t an = t.audio_first_cond.size();
+    REQUIRE_MESSAGE(an > 0, "this render carried no audio stream, so nothing below discriminates");
+    REQUIRE(t.audio_first_uncond.size() == an);
+    REQUIRE(t.audio_first_perturbed.size() == an);
+    REQUIRE(t.audio_first_modality.size() == an);
+    REQUIRE(t.audio_first_denoised.size() == an);
+    REQUIRE(MaxAbsOf(t.audio_first_cond) > 1e-6);
+
+    vllm::Ltx2MultiModalGuiderParams overridden = audio_row;
+    overridden.cfg_scale = kCfg;
+    overridden.stg_scale = kStg;
+    overridden.rescale_scale = kRescale;
+    overridden.modality_scale = kModality;
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        overridden, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    REQUIRE(replayed.size() == an);
+    const double worst = MaxAbsDiffOf(replayed, t.audio_first_denoised);
+    INFO("max|replayed overridden audio guidance - audio_first_denoised| = " << worst);
+    CHECK_MESSAGE(worst == 0.0,
+                  "`audio_first_denoised` is not `Ltx2MultiModalGuidance` at the OVERRIDDEN audio "
+                  "scales, so the overrides reached the trace and not the denoiser (#1510)");
+
+    // AND THE RECIPE'S OWN ROW WOULD HAVE PRODUCED SOMETHING ELSE. Without this
+    // the check above passes on a render the overrides never moved at all.
+    const std::vector<float> at_defaults = vllm::Ltx2MultiModalGuidance(
+        audio_row, t.audio_first_cond.data(), t.audio_first_uncond.data(),
+        t.audio_first_perturbed.data(), t.audio_first_modality.data(), static_cast<int64_t>(an));
+    CHECK_MESSAGE(MaxAbsDiffOf(at_defaults, t.audio_first_denoised) > 0.0,
+                  "the overridden replay and the DEFAULT replay agree, so this render cannot say "
+                  "which of the two the denoiser used");
   }
 }
 
@@ -11352,6 +11914,197 @@ TEST_CASE("ltx2 keyframe: the distilled-LoRA requirement refuses BY WHAT IS MISS
   CHECK_NOTHROW((void)engine->Generate(KeyframeGen(ws.root + "/no_take")));
 }
 
+// ─── LTX25-DISTILLED-LORA-REQUIRED (#1445) ───────────────────────────────────
+//
+// THE TWO REMAINING TWO-STAGE NON-DISTILLED ARMS. Upstream states the rule once,
+// for the whole class, at `packages/ltx-pipelines/CLAUDE.md:48` (Lightricks/LTX-2
+// @ `fd4ded7f`, pinned by row `ENG-UPSTREAM-LTX2-PIN`): "Two-stage non-distilled
+// pipelines require `distilled_lora` (applied to stage 2 only in
+// TI2Vid/A2Vid/Keyframe)". The parenthetical scopes WHERE the adapter runs for
+// three of them; `:49` and `:50-51` scope the other two, and neither sentence
+// weakens the REQUIREMENT in the first half.
+//
+// So `res2s_two_stage` and `dfr` are the same rule as the three cases above, and
+// until this row they were the two that did not carry it.
+namespace {
+
+// `res2s_two_stage` — `TI2VidTwoStagesHQPipeline`. `distilled_lora` is a
+// POSITIONAL, non-defaulted parameter (ti2vid_two_stages_hq.py:74) which the
+// constructor immediately INDEXES at `:93`, so upstream cannot even build this
+// pipeline without one. `--distilled-lora` is `required=True`
+// (utils/args.py:1140-1155) on `default_2_stage_arg_parser` (`:1123`), which
+// `hq_2_stage_arg_parser` (`:1168`) builds on at `:1172` and `:346` selects.
+vllm::multimodal::VideoModelParams Res2sParams(const ltx2_fixture::Paths& paths,
+                                               const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "res2s_two_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] =
+      FixtureCheckpointClass("res2s_two_stage");
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+// `dfr` — `DFRPipeline`. `distilled_lora` is a POSITIONAL, non-defaulted
+// parameter (dfr_pipeline.py:173), the docstring at `:157` says the base is "a
+// keyframe-slot-capable SFT base plus a distilled LoRA", and `main` selects
+// `default_2_stage_arg_parser` at `:568` — the same `--distilled-lora
+// required=True` the three gated arms cite.
+vllm::multimodal::VideoModelParams DfrParams(const ltx2_fixture::Paths& paths,
+                                             const std::string& lora) {
+  vllm::multimodal::VideoModelParams mp = ConditioningParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  return mp;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 res2s: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
+  // RED-FIRST. Before this row this exact load SUCCEEDED and rendered. Nothing
+  // about the checkpoint or the schedule changed; what changed is that the
+  // engine now asks for the adapter its stage 2 was distilled for.
+  //
+  // WHY IT MATTERS HERE SPECIFICALLY: this recipe's stage 2 takes
+  // `stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS` as a DEFAULT
+  // ARGUMENT (ti2vid_two_stages_hq.py:193) and re-noises to its first element
+  // (`:327`, `:332`). So a FULL transformer ran a distilled three-sigma
+  // refinement with no adapter, and the clip that came back had the right size,
+  // the right frame count and the right sample rate. No pixel, RMS, windowed-
+  // energy or spectral check in this suite can see that.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  vllm::multimodal::VideoModelParams mp = Res2sParams(ws.paths, lora);
+  mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    FAIL_CHECK("a res2s_two_stage load with no distilled LoRA must be refused");
+  } catch (const std::exception& e) {
+    const std::string message = e.what();
+    INFO("message = " << message);
+    // It names the PIPELINE that was asked for, which is what makes the refusal
+    // actionable rather than generic.
+    CHECK(message.find("res2s_two_stage") != std::string::npos);
+    CHECK(message.find("distilled LoRA") != std::string::npos);
+    CHECK(message.find("lora_path") != std::string::npos);
+    // ...and the anchor it cites is the SHARED parser (#1151), not any one
+    // pipeline's source. This recipe is the FOURTH user of the flag.
+    CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py") == std::string::npos);
+    CHECK(message.find("ti2vid_two_stages.py") == std::string::npos);
+    // THE SCOPE SENTENCE IS DERIVED FROM THE RECIPE, and this arm is the reason
+    // it had to become derived. `CLAUDE.md:49` has HQ apply the adapter to BOTH
+    // stages (ti2vid_two_stages_hq.py:154 and :165), so the message that told
+    // the three earlier arms "stage 2 alone" would have been FALSE here — a
+    // refusal that names the wrong phase sends the reader to the wrong file.
+    CHECK(message.find("generate_lowres_hq") != std::string::npos);
+    CHECK(message.find("refine_hq") != std::string::npos);
+  }
+
+  // THE CONTROL: the same load WITH the adapter is accepted, so the case is
+  // about the requirement and not about any load failure.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(Res2sParams(ws.paths, lora)));
+  // THE SECOND CONTROL: the DEFAULT kind is still fine without an adapter, so
+  // this is this recipe's requirement and not a new global one.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths)));
+  // THE THIRD CONTROL: no AUDIO TAKE is demanded. `a2vid_two_stage` shares this
+  // flag and adds `requires_audio_input`, so a recipe written by copying that
+  // one would refuse every render here. `ti2vid_two_stages_hq.py:171-196` takes
+  // `images`, not a waveform.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(Res2sParams(ws.paths, lora));
+  CHECK_NOTHROW((void)engine->Generate(FixtureGen(ws.root + "/res2s_no_take")));
+}
+
+TEST_CASE("ltx2 dfr: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
+  // RED-FIRST, and for the same reason as the case above: `DfrRecipe` IS
+  // `DistilledTwoStageRecipe` with two phases renamed, so stage 1 carries
+  // `DISTILLED_SIGMAS` and stage 2 `STAGE_2_DISTILLED_SIGMAS`
+  // (dfr_pipeline.py:281-282) on a base that CLAUDE.md:25 calls `Keyframe-slot
+  // SFT` — a non-distilled checkpoint. Both stages ran a distilled schedule with
+  // no adapter and the render finished.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  vllm::multimodal::VideoModelParams mp = DfrParams(ws.paths, lora);
+  mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+  try {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    FAIL_CHECK("a dfr load with no distilled LoRA must be refused");
+  } catch (const std::exception& e) {
+    const std::string message = e.what();
+    INFO("message = " << message);
+    CHECK(message.find("'dfr'") != std::string::npos);
+    CHECK(message.find("distilled LoRA") != std::string::npos);
+    CHECK(message.find("lora_path") != std::string::npos);
+    CHECK(message.find("default_2_stage_arg_parser") != std::string::npos);
+    // IT IS THE ADAPTER REFUSAL AND NOT THE CLASS ONE. `dfr` needs a
+    // `keyframe_slot_sft` base that nobody publishes, so this load has two
+    // reasons to fail and the ORDER decides which the caller reads. The adapter
+    // message names a file they can go and fetch.
+    CHECK(message.find("checkpoint_class") == std::string::npos);
+    // THE SCOPE SENTENCE, derived: `CLAUDE.md:50-51` says DFR "also applies
+    // distilled LoRA to **both** stages", which is `dfr_pipeline.py:212` folding
+    // it into the shared `stage_loras` both phases run.
+    CHECK(message.find("dfr_base") != std::string::npos);
+    CHECK(message.find("dfr_detail") != std::string::npos);
+  }
+
+  // THE CONTROL: with the adapter this load is accepted.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(DfrParams(ws.paths, lora)));
+  // THE SECOND CONTROL, as above.
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths)));
+}
+
+TEST_CASE("ltx2 distilled LoRA: the phase scope in the refusal is READ OFF the recipe") {
+  // THE MUTATION THIS CASE EXISTS FOR. The scope sentence used to be a string
+  // literal that said "stage 2 alone" for every arm off this parser. That was
+  // true of the only three arms that carried the flag, and it becomes FALSE the
+  // moment a both-stages arm carries it — which is exactly what this row does.
+  //
+  // So the two polarities are asserted TOGETHER, on one instrument, and the
+  // difference between them is what proves the sentence is derived rather than
+  // matched: `ti2vid_two_stage` names ONE phase and `res2s_two_stage` names TWO,
+  // mirroring `CLAUDE.md:48` against `:49`.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const auto refusal = [&ws](vllm::multimodal::VideoModelParams mp) {
+    mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  const std::string stage2_only = refusal(Ti2VidParams(ws.paths, lora));
+  INFO("ti2vid = " << stage2_only);
+  REQUIRE_FALSE(stage2_only.empty());
+  // `ti2vid_two_stages.py:140` builds stage 1 with `loras=tuple(loras)` against
+  // `:151`'s `(*loras, *distilled_lora)`, so ONE of its two phases runs it. The
+  // recipe names them `stage_1` and `stage_2`, and only the second is listed.
+  CHECK(stage2_only.find("stage_2") != std::string::npos);
+  CHECK(stage2_only.find("stage_1") == std::string::npos);
+
+  const std::string both_stages = refusal(Res2sParams(ws.paths, lora));
+  INFO("res2s = " << both_stages);
+  REQUIRE_FALSE(both_stages.empty());
+  CHECK(both_stages.find("generate_lowres_hq") != std::string::npos);
+  CHECK(both_stages.find("refine_hq") != std::string::npos);
+
+  // AND THE TWO MESSAGES DIFFER IN THAT SENTENCE. A literal would make them
+  // agree, and a reader could not tell the two scopes apart.
+  CHECK(stage2_only != both_stages);
+}
+
 
 // The conditioning half of the same instrument, which the case above cannot
 // reach: that engine conditions from a prompt-embeds FILE, so the tower and the
@@ -11460,7 +12213,7 @@ TEST_CASE("ltx2 checkpoint class: a FULL-model arm refuses a distilled declarati
   CHECK(LoadRefusal(honest).empty());
 
   // AND THE OTHER POLARITY, so this is not a one-way test. `distilled_two_stage`
-  // is `DistilledPipeline`, `Distilled only` (CLAUDE.md:25), and it refuses the
+  // is `DistilledPipeline`, `Distilled only` (CLAUDE.md:26), and it refuses the
   // full model just as hard.
   vllm::multimodal::VideoModelParams reversed =
       UndeclaredParams(ws.paths, "distilled_two_stage");
@@ -11484,7 +12237,12 @@ TEST_CASE("ltx2 checkpoint class: an UNDECLARED load refuses instead of renderin
   // `requires_distilled_lora` one deliberately: a two-stage load with no adapter
   // fails both, and the adapter message names a missing file the caller can go
   // and fetch, while a class message would send the same reader to a different
-  // question. So the three kinds that demand an adapter get a REAL one here.
+  // question. So the kinds that demand an adapter get a REAL one here.
+  //
+  // FIVE OF THEM SINCE #1445, not three: `res2s_two_stage` and `dfr` carry
+  // `requires_distilled_lora` too, and flipping their column here is how this
+  // case keeps gating the CLASS refusal instead of silently gating the adapter
+  // one — the same message, for two arms, twice over.
   //
   // A real file and not a placeholder path, and that is measured rather than
   // assumed: the load builds and READS the adapter before it resolves the
@@ -11499,7 +12257,7 @@ TEST_CASE("ltx2 checkpoint class: an UNDECLARED load refuses instead of renderin
   for (const Arm arm : {Arm{"one_stage", false}, Arm{"distilled_two_stage", false},
                         Arm{"t2a_one_stage", false}, Arm{"a2vid_two_stage", true},
                         Arm{"ti2vid_two_stage", true}, Arm{"keyframe_interpolation", true},
-                        Arm{"res2s_two_stage", false}, Arm{"dfr", false},
+                        Arm{"res2s_two_stage", true}, Arm{"dfr", true},
                         Arm{"retake", false}}) {
     INFO("kind = " << std::string(arm.kind));
     vllm::multimodal::VideoModelParams mp = UndeclaredParams(ws.paths, arm.kind);

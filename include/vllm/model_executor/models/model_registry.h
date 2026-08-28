@@ -35,6 +35,10 @@ struct ForwardLogits;
 struct TensorParallel;
 struct GdnStateCache;
 struct PagedKvCache;
+// One owned host tensor (qwen3_5_weights.h). Forward-declared for the same
+// reason every other weights type here is: `LoadedModel::shared_embed_tokens`
+// hands out a BORROWED pointer to one and never needs its layout (#1946).
+struct OwnedTensor;
 struct Qwen3_5DenseWeights;
 struct Qwen3_5MoeWeights;
 // SPEC-MTP I5d-pre: the checkpoint-owned MTP draft weights, the drafter's
@@ -186,6 +190,39 @@ class LoadedModel {
   // the Qwen3.5/3.6 dense + MoE forwards override it.
   virtual bool supports_aux_multi_tap() const { return false; }
 
+  // This target's embedding table, for a block drafter that SHARES it rather
+  // than owning one (#1946).
+  //
+  // WHY THE BASE CARRIES THIS. A DFlash/DFlash2 draft ships no embed_tokens; it
+  // runs the target's table over its own hidden states, which is why upstream
+  // rebinds the MODULE by reference — `del draft_inner.embed_tokens;
+  // draft_inner.embed_tokens = target_embed`
+  // (vllm/v1/worker/gpu/spec_decode/dflash/utils.py:64-74 @ b389ac29465b33f9e9c534df221ea3c129e9793f).
+  // Our loader read the target's tensor a SECOND time into the draft's own
+  // OwnedTensor instead, and `ResidentWeight` caches its device upload on the
+  // OwnedTensor (dense_attn_block.h `if (!w.d_dev)`), so the 27B's BF16
+  // [248320, 5120] table — 2,542,796,800 B — was uploaded twice. On GB10 a
+  // device allocation IS host RAM, so that is 2.543 GB the KV pool cannot have.
+  //
+  // Null on every model that has no table to lend, which is every default. The
+  // two Qwen3.5/3.6 forwards override it, and they are exactly the targets the
+  // DFlash loader admits (it refuses anything without `supports_aux_multi_tap`
+  // by name). BORROWED: it points into the model's own weights, so a holder must
+  // not outlive them — which is why LoadedEngine declares `model_` ahead of
+  // `dflash_draft_`.
+  //
+  // "THE MODEL'S OWN WEIGHTS" IS NOT ALWAYS THE MODEL'S OWN STORAGE, and the
+  // ordering argument above only covers the case where it is. A model built
+  // through a `BorrowedWeightsTag` constructor (qwen3_5_dense.cpp,
+  // qwen3_5_moe.cpp; reached from GPUModelRunner's borrowing constructors,
+  // src/vllm/v1/worker/gpu/runner.cpp) points at weights some CALLER owns, and
+  // outliving the LoadedModel then says nothing about outliving the table. No
+  // path constructs a DFlash draft over a borrowed target today — the engine
+  // owns its model — so this is a constraint on a future caller rather than a
+  // live defect: a borrowing target must keep its weights alive for as long as
+  // any draft rebound onto them.
+  virtual const OwnedTensor* shared_embed_tokens() const { return nullptr; }
+
   // Retain the checkpoint's loaded `mtp.*` draft weights (the 15/19 BF16 tensors
   // LoadQwen3_5MTP produced) inside the concrete model so the draft can be built
   // on demand with a stable lifetime. Default: unsupported (throws), because a
@@ -297,6 +334,49 @@ struct MultiModalForwardInput {
   const std::vector<int32_t>* ple_token_ids = nullptr;
 };
 
+// KV-DSV4-MULTICACHE W3 (#2068): THE THIRD FORWARD CHANNEL — the name each paged
+// cache was published under, carried beside the cache itself.
+//
+// `ModelForwardInput::attn_kv` is POSITIONAL: entry `i` is the i-th
+// full-attention layer. That is the only thing a position CAN be while a layer
+// has at most one cache. DeepSeek-V4 gives one C4A layer FOUR — the compressed
+// MLA latent, the sliding-window cache, the indexer key cache and two compressor
+// states — and a position cannot say which of them it is.
+//
+// Upstream never had this problem, and what is mirrored here is its KEY rather
+// than a new invention. Every cache upstream is an `AttentionLayerBase`
+// registered under its own prefix in `compilation_config.static_forward_context`
+// (`vllm/models/deepseek_v4/attention.py:315-321`, `:761-767`,
+// `vllm/models/deepseek_v4/compressor.py:290-295`), and `get_kv_cache_spec()`
+// returns a `dict[str, KVCacheSpec]` keyed by that prefix
+// (`vllm/v1/worker/gpu_model_runner.py:7785-7801`). A cache is addressed BY NAME
+// upstream, so this struct carries the name.
+//
+// `layer_names`, `group_ids` and `layer_indices` are PARALLEL to
+// `ModelForwardInput::attn_kv`: entry `i` describes `attn_kv[i]`. The vectors are
+// owned by the runner and stay valid for the forward's duration.
+//
+// NULL on `ModelForwardInput` for every model whose topology the positional
+// convention can express — which is every model in the tree except DeepSeek-V4 —
+// so every existing forward is byte-identical by construction.
+struct MultiKvCacheIndex {
+  const std::vector<std::string>* layer_names = nullptr;
+  const std::vector<int32_t>* group_ids = nullptr;
+  const std::vector<int32_t>* layer_indices = nullptr;
+
+  // How many caches arrived. 0 when the channel is empty.
+  size_t size() const;
+  // How many DISTINCT published groups they came from.
+  int num_groups() const;
+  // The first published name, for a diagnostic. Empty when the channel is empty.
+  std::string_view first_name() const;
+  // The index into `attn_kv` of the cache published under `layer_name`, or -1.
+  // LINEAR: the list is 167 entries at DeepSeek-V4-Flash and a forward looks a
+  // name up once per layer per role, so an index structure would be premature.
+  // Recorded as a decision rather than left as an oversight.
+  int64_t Find(std::string_view layer_name) const;
+};
+
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
 // concrete LoadedModel rather than leaking concrete weight types into runner.
@@ -375,6 +455,13 @@ struct ModelForwardInput {
   // only sets it on the discrete-CUDA async path, which the Qwen3.5 gate vehicle
   // owns). Null on every other path, so every other forward is byte-identical.
   const int32_t* device_token_ids = nullptr;
+  // KV-DSV4-MULTICACHE W3 (#2068): the THIRD cache channel. Non-null only when
+  // the runner allocated a MULTI-CACHE topology — one whose published groups the
+  // positional `attn_kv` convention cannot address, which today is DeepSeek-V4
+  // and nothing else. NULL on every other step, so every other forward is
+  // byte-identical. Set after aggregate construction, like `device_token_ids`
+  // above, so no positional initializer moves.
+  const MultiKvCacheIndex* multi_kv = nullptr;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);

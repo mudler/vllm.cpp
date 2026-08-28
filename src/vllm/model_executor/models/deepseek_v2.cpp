@@ -74,6 +74,7 @@
 
 #include "vllm/model_executor/layers/attention/mla_chunked_context.h"
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight glue
 #include "vllm/model_executor/models/device_pool.h"
@@ -86,7 +87,6 @@
 #include "vt/ops.h"
 
 namespace vllm {
-namespace {
 
 using vt::Backend;
 using vt::DType;
@@ -96,22 +96,11 @@ using v1::CommonAttentionMetadata;
 
 using namespace dense_attn;  // Dev / DBuf / MakeTensor / Reshape / ResidentWeight
 
-// ─── per-step device inputs the MLA block needs ─────────────────────────────
-// Everything that is per-STEP (not per-layer) is uploaded once and shared by
-// every layer: positions, slot_mapping, and the whole MlaBlockMetadata (decode
-// block table / seq lens, prefill cu_seqlens_q / block table, chunk descriptors).
-// The DBufs live here so the Tensor views inside `meta` stay valid for the
-// duration of the forward.
-struct MlaStep {
-  std::vector<DBuf> owned;
-  Tensor positions;
-  Tensor slot_mapping;
-  mla::MlaBlockMetadata meta;
-  MlaBatchSplit split;
-  // The per-MODEL YaRN [cos|sin] cache (device view), set by the caller once —
-  // it is shared by every layer and every step, unlike everything above.
-  const Tensor* rope_cache = nullptr;
-};
+namespace {
+
+// `MlaStep` — the per-step device inputs the MLA block needs — moved to
+// `deepseek_v2.h` at #699 W4a, so a second MLA model can drive the same build
+// instead of re-deriving it. The comment that documented it moved with it.
 
 // ─── W8 diagnostic counters (deepseek_v2.h `MlaBatchSplitStats`) ─────────────
 // Written once per forward from the runner's single forward thread; read only by
@@ -177,7 +166,16 @@ Tensor UploadRange(Dev d, std::vector<DBuf>& owned, DType dt,
   return owned.back().t();
 }
 
+}  // namespace
+
 // `MLACommonMetadataBuilder.build` (mla_attention.py:1652-1830), non-DCP branch.
+//
+// EXPORTED (declared in deepseek_v2.h) rather than file-local since #699 W4a:
+// dots3-note's full-attention layer is `Dots3NoteFullAttention(
+// DeepseekV2MLAAttention)` upstream and drives the SAME `mla::
+// ForwardMlaAttentionBlock` over the same paged MLA cache, so it needs the same
+// per-step metadata. Re-deriving it in a second TU would be the hand-rolled
+// parallel path AGENTS.md forbids. Nothing about the body changed in the move.
 MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
                      const CommonAttentionMetadata& am, int64_t block_size,
                      int64_t max_model_len) {
@@ -255,6 +253,8 @@ MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
   }
   return s;
 }
+
+namespace {
 
 // The MLA block's DEVICE-resident weight views for one layer. ResidentWeight
 // uploads once on first touch and memoizes on the OwnedTensor, so this is a
@@ -484,7 +484,7 @@ DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
 void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params& p,
               Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
               const MlaStep& step, Tensor& kv_cache, v1::TritonMLAImpl& impl,
-              int64_t T) {
+              int64_t T, int64_t layer_index) {
   const int64_t H = p.hidden_size;
   const float eps = p.rms_norm_eps;
 
@@ -511,8 +511,15 @@ void RunLayer(Dev d, const DeepseekV2LayerWeights& layer, const DeepseekV2Params
   }
 
   // `self.mlp(hidden_states)` — MoE or dense, per first_k_dense_replace (:1214).
-  DBuf mlp = layer.is_moe ? MoeBlock(d, layer.moe, p, dh2.t(), T)
-                          : DenseMlp(d, layer.dense, dh2.t(), T, H, p.intermediate_size);
+  // ENG-HYBRID-PLACEMENT W3d: the MoE arm goes through the shared seam, inert by
+  // construction when this layer is not placed. The DENSE arm is untouched —
+  // placement moves ROUTED EXPERTS, and a dense MLP has none.
+  DBuf mlp = layer.is_moe
+                 ? vllm::RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                                      [&](Dev pd, const Tensor& h) {
+                                        return MoeBlock(pd, layer.moe, p, h, T);
+                                      })
+                 : DenseMlp(d, layer.dense, dh2.t(), T, H, p.intermediate_size);
   // The MLP output becomes the new residual-stream delta; keep its storage alive
   // until the next producer replaces it.
   auto* held = new DBuf(std::move(mlp));
@@ -610,7 +617,7 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     Tensor kv_cache = MakeTensor(kv.data, kv.dtype, d.q.device,
                                  {kv.num_blocks, kv.block_size, head_size});
     RunLayer(d, weights.layers[static_cast<size_t>(l)], p, hidden, hidden_hold, res,
-             step, kv_cache, impl, T);
+             step, kv_cache, impl, T, /*layer_index=*/l);
   }
 
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
@@ -739,6 +746,9 @@ void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
   am_out.num_reqs = static_cast<int>(S);
   am_out.num_actual_tokens = static_cast<int>(S);
   am_out.max_query_len = 1;  // pure decode
+  // W10 (#1857): a pure-decode rewrite is never spec-classified. Belt on the
+  // vt shape guard's braces (S == q*S only at q == 1).
+  am_out.uniform_spec_query_len = 0;
   am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
   std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
             am_out.slot_mapping.begin());

@@ -31,6 +31,25 @@
 namespace vllm::entrypoints {
 namespace {
 
+nlohmann::ordered_json DecodeHistoricalToolArguments(
+    const std::string& encoded, size_t tool_call_index,
+    const std::string& function_name) {
+  if (encoded.empty()) return nlohmann::ordered_json::object();
+
+  nlohmann::ordered_json decoded;
+  try {
+    decoded = nlohmann::ordered_json::parse(encoded);
+  } catch (const nlohmann::json::parse_error&) {
+    // Do not echo arbitrary client-supplied argument contents into server logs.
+    throw ChatTemplateError(
+        "assistant tool_calls[" + std::to_string(tool_call_index) +
+        "].function.arguments for function '" + function_name +
+        "' is not valid JSON");
+  }
+  return decoded.is_null() ? nlohmann::ordered_json::object()
+                           : std::move(decoded);
+}
+
 // Build the `messages` variable minja exposes to the template, mirroring what
 // transformers passes to `apply_chat_template`: a list of {role, content} maps,
 // carrying `tool_calls` (OpenAI shape) when a ChatMessage has them. ordered_json
@@ -56,13 +75,20 @@ nlohmann::ordered_json BuildMessages(
     if (m.reasoning.has_value()) o["reasoning"] = *m.reasoning;
     if (m.tool_calls.has_value()) {
       nlohmann::ordered_json calls = nlohmann::ordered_json::array();
-      for (const openai::ToolCall& tc : *m.tool_calls) {
+      for (size_t i = 0; i < m.tool_calls->size(); ++i) {
+        const openai::ToolCall& tc = (*m.tool_calls)[i];
         nlohmann::ordered_json fn = nlohmann::ordered_json::object();
         fn["name"] = tc.function.name;
-        // OpenAI carries arguments as a JSON-encoded STRING. minja's
-        // chat-template wrapper polyfills string->object when the template
-        // requires object arguments (requires_object_arguments caps).
-        fn["arguments"] = tc.function.arguments;
+        // Keep FunctionCall::arguments as an OpenAI JSON string on the wire,
+        // but mirror pinned vLLM's _postprocess_messages contract at the
+        // protocol-to-template boundary: historical assistant tool arguments
+        // are structured values in Jinja, empty/null become {}, and malformed
+        // JSON fails before generation. Non-assistant messages stay strings.
+        fn["arguments"] =
+            m.role == "assistant"
+                ? DecodeHistoricalToolArguments(tc.function.arguments, i,
+                                                tc.function.name)
+                : nlohmann::ordered_json(tc.function.arguments);
         nlohmann::ordered_json call = nlohmann::ordered_json::object();
         call["id"] = tc.id;
         call["type"] = tc.type;

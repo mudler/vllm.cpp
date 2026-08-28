@@ -1,0 +1,101 @@
+# Qwen3.5-0.8B on TT P150 — FIRST speed measurements, 2026-08-26
+# binary 21fe11cf1 bench build via production vllm-cli --device auto (W2a allow-list dispatch)
+# warm probes after a JIT-caching cold proc; every leg fresh process, lock held
+# VERDICT: warm steady ~0.089 tok/s BOTH arms -> host-free polarity irrelevant here
+
+===== probe.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/3 finish_reason=length prompt_tokens=11 completion_tokens=12 secs=149.178 tok_s=0.080
+vllm-cli: run=1/3 generate_start_unix=1787773249.649285 generate_end_unix=1787773398.827122
+vllm-cli: run=2/3 finish_reason=length prompt_tokens=11 completion_tokens=12 secs=134.295 tok_s=0.089
+vllm-cli: run=2/3 generate_start_unix=1787773398.827173 generate_end_unix=1787773533.122094
+vllm-cli: run=3/3 finish_reason=length prompt_tokens=11 completion_tokens=12 secs=134.310 tok_s=0.089
+vllm-cli: run=3/3 generate_start_unix=1787773533.122234 generate_end_unix=1787773667.431844
+
+===== probe.out =====
+2026-08-26 21:40:48.407 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-08-26 21:40:48.407 | info     |             UMD | Cluster constructor started. (cluster.cpp:389)
+2026-08-26 21:40:48.408 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:96)
+2026-08-26 21:40:48.408 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:115)
+2026-08-26 21:40:48.412 | info     |             UMD | Established firmware bundle version: 19.7.1 (topology_discovery.cpp:575)
+2026-08-26 21:40:48.412 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:119)
+2026-08-26 21:40:48.459 | warning  |             UMD | Sysmem (0x40000000 bytes) using regular pages; pre-allocate hugepages for better DMA performance (e.g. 1 × 1GB or 512 × 2MB; on AArch64 also 2 × 512MB). (silicon_sysmem_manager.cpp:106)
+2026-08-26 21:40:48.460 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:173)
+2026-08-26 21:40:48.460 | info     |             UMD | IOMMU: enabled (cluster.cpp:147)
+2026-08-26 21:40:48.460 | info     |             UMD | KMD version: 2.10.1 (cluster.cpp:150)
+2026-08-26 21:40:48.460 | info     |             UMD | Cluster constructor completed. (cluster.cpp:648)
+2026-08-26 21:40:48.461 | info     |             UMD | Starting devices in cluster (cluster.cpp:1184)
+2026-08-26 21:40:48.463 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1192)
+2026-08-26 21:40:49.650 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-08-26 21:40:49.650 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-08-26 21:40:49.650 | warning  |          Always | Unknown motherboard 'AMPONED8-2T/BCM' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:119)
+2026-08-26 21:40:49.651 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2410)
+2026-08-26 21:40:49.651 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2418)
+2026-08-26 21:40:50.360 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1066)
+<think>
+</think>
+The hum of the machine's internal
+2026-08-26 21:47:47.608 | info     |    BuildKernels | JIT cache stats: 462/462 hits (100.0%) [462 cached, 229 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-08-26 21:47:47.608 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-08-26 21:47:47.627 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-08-26 21:47:47.627 | info     |             UMD | Closing devices in cluster (cluster.cpp:1197)
+2026-08-26 21:47:47.693 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1206)
+2026-08-26 21:47:47.693 | info     |             UMD | Cluster destructor started. (cluster.cpp:912)
+2026-08-26 21:47:47.693 | info     |             UMD | Cluster destructor completed. (cluster.cpp:915)
+
+===== probe-off.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/3 finish_reason=length prompt_tokens=11 completion_tokens=12 secs=149.779 tok_s=0.080
+vllm-cli: run=1/3 generate_start_unix=1787773682.183884 generate_end_unix=1787773831.962392
+vllm-cli: run=2/3 finish_reason=length prompt_tokens=11 completion_tokens=12 secs=133.900 tok_s=0.090
+vllm-cli: run=2/3 generate_start_unix=1787773831.962449 generate_end_unix=1787773965.862443
+vllm-cli: run=3/3 finish_reason=length prompt_tokens=11 completion_tokens=12 secs=134.204 tok_s=0.089
+vllm-cli: run=3/3 generate_start_unix=1787773965.862512 generate_end_unix=1787774100.066304
+
+===== probe-off.out =====
+2026-08-26 21:48:00.348 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-08-26 21:48:00.348 | info     |             UMD | Cluster constructor started. (cluster.cpp:389)
+2026-08-26 21:48:00.348 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:96)
+2026-08-26 21:48:00.348 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:115)
+2026-08-26 21:48:00.353 | info     |             UMD | Established firmware bundle version: 19.7.1 (topology_discovery.cpp:575)
+2026-08-26 21:48:00.353 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:119)
+2026-08-26 21:48:00.395 | warning  |             UMD | Sysmem (0x40000000 bytes) using regular pages; pre-allocate hugepages for better DMA performance (e.g. 1 × 1GB or 512 × 2MB; on AArch64 also 2 × 512MB). (silicon_sysmem_manager.cpp:106)
+2026-08-26 21:48:00.396 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:173)
+2026-08-26 21:48:00.396 | info     |             UMD | IOMMU: enabled (cluster.cpp:147)
+2026-08-26 21:48:00.396 | info     |             UMD | KMD version: 2.10.1 (cluster.cpp:150)
+2026-08-26 21:48:00.396 | info     |             UMD | Cluster constructor completed. (cluster.cpp:648)
+2026-08-26 21:48:00.397 | info     |             UMD | Starting devices in cluster (cluster.cpp:1184)
+2026-08-26 21:48:00.460 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1192)
+2026-08-26 21:48:02.270 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-08-26 21:48:02.270 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-08-26 21:48:02.270 | warning  |          Always | Unknown motherboard 'AMPONED8-2T/BCM' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:119)
+2026-08-26 21:48:02.270 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2410)
+2026-08-26 21:48:02.270 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2418)
+<think>
+</think>
+The hum of the machine was the
+2026-08-26 21:55:00.230 | info     |    BuildKernels | JIT cache stats: 412/412 hits (100.0%) [412 cached, 216 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-08-26 21:55:00.230 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-08-26 21:55:00.243 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-08-26 21:55:00.243 | info     |             UMD | Closing devices in cluster (cluster.cpp:1197)
+2026-08-26 21:55:00.326 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1206)
+2026-08-26 21:55:00.326 | info     |             UMD | Cluster destructor started. (cluster.cpp:912)
+2026-08-26 21:55:00.326 | info     |             UMD | Cluster destructor completed. (cluster.cpp:915)
+
+===== q-on-w1.err =====
+vllm-cli: loading model from /home/lu_zero/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=1148.239 tok_s=0.084
+vllm-cli: run=1/5 generate_start_unix=1787771958.893955 generate_end_unix=1787773107.133430
+
+===== sampler.log =====
+wrote /tmp/tt-clock/q35-legs/w-on-1.json: n=52 busy=52
+wrote /tmp/tt-clock/q35-legs/w-on-1.json: n=53 busy=53
+
+===== w1 out completion head =====
+

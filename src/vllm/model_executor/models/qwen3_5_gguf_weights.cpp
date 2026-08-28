@@ -773,16 +773,34 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   const GgufResidency embed_r =
       pol.Route(et, GgufTensorRole::kEmbeddingTable);  // the embed's audit event
 
-  // Build the gather table in its chosen residency: keep-f16 in place, else the
-  // historical bf16 expansion. A quantized embedding is never keep-eligible.
-  if (embed_r == GgufResidency::kKeepF16) {
+  // Build the gather table in its chosen residency: keep-quant blocks, keep-f16
+  // in place, else the historical bf16 expansion.
+  //
+  // The keep-quant arm is MODEL-MM-QWEN4-EXP W6a. Until the dequantizing gather
+  // existed this branch was a hard refusal, and the refusal was RIGHT: a kept
+  // table would have been bytes no op in the tree could read. `vt::Embedding`
+  // now decodes one row per gathered id, so the table's residency follows the
+  // same policy every other tensor's does.
+  if (embed_r == GgufResidency::kKeepQuant) {
+    VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
+    // NEITHER repack applies, and both would be silent corruption rather than a
+    // slowdown: the i8mm interleave and the CUDA coalesced-load permutation
+    // rewrite the bytes INSIDE a row for a vec_dot to consume, and the gather
+    // decodes the row in its ggml order. `nk` stays false for the same reason
+    // it does on the f16 arm — this tensor is a table, not a [N,K] GEMM weight.
+    *embed = OwnGgufQuantBlocks(et, et.shape[0], et.shape[1], /*row_offset=*/0,
+                                MmapSrc(g, pol), /*repack=*/false,
+                                /*cuda_align=*/false);
+    embed->nk = false;
+  } else if (embed_r == GgufResidency::kKeepF16) {
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
     // Embedding gather table: never repacked (EmbeddingKernel reads it row-wise).
     *embed = OwnGgufF16(et, et.shape[0], et.shape[1], 0, MmapSrc(g, pol),
                         /*nk=*/false, /*elem_kn_repack=*/false);
   } else {
     VT_CHECK(embed_r == GgufResidency::kExpandBf16,
-             "qwen3_5 gguf: the embedding table cannot keep quant blocks");
+             "qwen3_5 gguf: unexpected embedding-table residency " +
+                 std::string(Name(embed_r)));
     *embed = OwnBf16(g, kEmbed, et.shape);
   }
 
@@ -800,6 +818,15 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   // The two coincide (share one buffer) iff both kept f16, OR both expanded in
   // the file's own [N, K] order (expand_nk). share_tied_head already implies
   // expand_nk (FromEnv), which is why the bf16 arm needs no extra check.
+  //
+  // A tied KEEP-QUANT pair deliberately does NOT share, even though the file
+  // bytes are the same bytes: the head goes through `OwnMatmulWeight`, which
+  // may REPACK the slice for i8mm or for the CUDA coalesced load, and a table
+  // sharing a repacked buffer would gather permuted rows. The cost is one
+  // duplicated block image on a tied quantized file; the alternative is a
+  // corruption that only appears on the hosts where a repack is live. Making
+  // them share correctly needs the repack decision hoisted, which is a change to
+  // `OwnMatmulWeight` and not to this function.
   const bool f16_share = embed_r == GgufResidency::kKeepF16 &&
                          head_r == GgufResidency::kKeepF16;
   const bool bf16_share = embed_r == GgufResidency::kExpandBf16 &&

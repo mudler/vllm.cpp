@@ -20,18 +20,25 @@
 // numerically identical to rebuilding it — exactly what a captured graph does.
 // Verified byte-exact vs a fresh-plan GEMM in test_ops_fp8_cutlass.cpp.
 //
-// DEFAULT OFF (opt-in, VT_FP8_PLAN_CACHE=1). The lever's premise — that the
-// per-call cublasLtMatmulAlgoGetHeuristic + descriptor/layout rebuild is a
+// DEFAULT ON (VT_FP8_PLAN_CACHE=0 disables) — flipped by #1843, the same
+// polarity as gemm_plan_cache.h (#1741). The 2026-07-18 measurement
+// (CLAIM-FP8-PLAN-CACHE-1) still stands: the lever's original premise — that
+// the per-call cublasLtMatmulAlgoGetHeuristic + descriptor/layout rebuild is a
 // removable ~0.8 ms host gap before the fp8 GEMM — was NOT reproduced on GB10
-// (2026-07-18, CLAIM-FP8-PLAN-CACHE-1): a same-binary 35B A/B is wall-clock
-// NEUTRAL on prefill TTFT (async on AND off) and c1/c4 decode TPOT, and nsys
-// shows the pre-fp8-GEMM GPU-timeline gap is UNCHANGED by the cache (~210 µs
-// with cache off vs ~204 µs on) — the heuristic host cost is negligible/hidden
-// (prefill is GPU-bound so it overlaps GPU work; decode is CUDA-graph-captured
-// so the heuristic runs once at capture, not per replay-step). The cache is a
-// correct, bit-exact structural mirror of vLLM's in-graph plan reuse kept behind
-// an opt-in flag for eager/non-graph regimes; it does not flip the default
-// because the "faster" condition is unmet.
+// (a same-binary 35B A/B is wall-clock NEUTRAL on prefill TTFT (async on AND
+// off) and c1/c4 decode TPOT, and nsys shows the pre-fp8-GEMM GPU-timeline gap
+// is UNCHANGED by the cache: ~210 µs with cache off vs ~204 µs on). That
+// measurement no longer decides the default, because the cache is not a
+// performance knob any more: on CUDA 13.3 the UNCACHED path is WRONG under
+// CUDA-graph capture — cublasLtMatmulAlgoGetHeuristic fails in-capture (#1732,
+// its fp8 half, measured in #1843 on GB10 with lease-staged CUDA 13.3.73), and
+// this lane queried it on EVERY call, so the default (graphs-on) decode on an
+// fp8-tower model died at the first in-capture fp8 GEMM even with #1741's
+// bf16/f32 cache in the tree. With the cache ON, the engine's eager warm step
+// builds every decode shape's plan BEFORE capture, so cuBLASLt is never
+// queried under capture. ON is therefore the only safe default;
+// VT_FP8_PLAN_CACHE=0 stays as the rollback / same-binary A/B arm (it
+// reproduces the in-capture failure), not as a supported configuration.
 #ifndef VT_CUDA_FP8_PLAN_CACHE_H_
 #define VT_CUDA_FP8_PLAN_CACHE_H_
 
@@ -42,12 +49,15 @@
 
 namespace vt::cuda {
 
-// Pure predicate for the VT_FP8_PLAN_CACHE contract: the cache is OFF by default
-// and ENABLED only for the exact value "1" (the opt-in). nullptr (unset) and
-// every other value are OFF. Kept separate from the cached getter below so the
-// parse is unit-testable without touching the process-global cache.
+// Pure predicate for the VT_FP8_PLAN_CACHE contract: the cache is ON by default
+// and DISABLED only for the exact value "0" (the rollback / A/B arm). nullptr
+// (unset) and every other value — including typos like "00" or "false" — leave
+// it ON, so a misspelled escape hatch cannot resurrect the capture bug (#1843),
+// the same shape as GemmPlanCacheFlagIsOn (#1741). Kept separate from the
+// cached getter below so the parse is unit-testable without touching the
+// process-global cache.
 inline bool Fp8PlanCacheFlagIsOn(const char* env_value) {
-  return env_value != nullptr && std::string_view(env_value) == "1";
+  return !(env_value != nullptr && std::string_view(env_value) == "0");
 }
 
 // Process-cached gate, read from the environment exactly once (getenv on the

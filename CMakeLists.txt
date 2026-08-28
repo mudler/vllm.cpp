@@ -737,9 +737,11 @@ add_library(vllm STATIC
   src/vllm/config/cache.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
+  src/vllm/config/generation.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/config/weight_residency.cpp
+  src/vllm/model_executor/device_placement.cpp
   src/vllm/model_executor/weight_offloader.cpp
   src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/model_executor/expert_slot_cache.cpp
@@ -772,6 +774,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_5_common.cpp
   src/vllm/model_executor/models/qwen3_5_dense.cpp
   src/vllm/model_executor/models/qwen3_5_moe.cpp
+  # Qwen4-Exp (Qwen3.8-Flash-Next) W4: Qwen Sparse Attention. Host reference
+  # math for the indexer, its side cache and the GATHER consumer (#1991).
+  src/vllm/model_executor/models/qwen4_exp_qsa.cpp
   src/vllm/model_executor/models/qwen3_dense.cpp
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
@@ -784,6 +789,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
   src/vllm/model_executor/models/qwen3_moe_weights.cpp
   src/vllm/model_executor/models/qwen3_moe.cpp
+  src/vllm/model_executor/models/qwen4_exp_hc.cpp
   src/vllm/model_executor/models/deepseek_v2_registry.cpp
   src/vllm/model_executor/models/deepseek_v2_weights.cpp
   src/vllm/model_executor/models/deepseek_v2.cpp
@@ -796,7 +802,15 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/dots3_note.cpp
+  src/vllm/model_executor/models/dots3_note_attn.cpp
+  src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
+  src/vllm/model_executor/models/qwen4_exp_ple.cpp
+  src/vllm/model_executor/models/qwen4_exp.cpp
+  src/vllm/model_executor/models/qwen4_exp_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_registry.cpp
+  src/vllm/model_executor/models/glm5_next.cpp
+  src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
   src/vllm/model_executor/models/interfaces.cpp
@@ -807,6 +821,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_registry.cpp
   src/vllm/model_executor/models/muse_glimmer_weights.cpp
   src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
+  src/vllm/model_executor/models/glm5_next_weights.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp
@@ -878,6 +894,7 @@ add_library(vllm STATIC
   # the (kLtx2, device) resolver. The resolver is its own TU so the vt::GetOp cast
   # links in CPU-only builds, exactly as minimax_h3_device_resolve.cpp is.
   src/vllm/model_executor/models/ltx2_device_resolve.cpp
+  src/vllm/model_executor/models/ltx2_video_vae_device_resolve.cpp
   src/vllm/model_executor/models/ltx2_device.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L4): the Conv video VAE, the audio
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
@@ -1103,6 +1120,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/spec_decode/dspark/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
+  src/vllm/v1/core/hybrid_kv_budget.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
   src/vllm/distributed/kv_events.cpp
   src/vllm/v1/core/block_pool.cpp
@@ -1280,6 +1298,7 @@ add_library(vllm STATIC
   src/vt/op_provider.cpp
   src/vt/communicator.cpp
   src/vt/ops.cpp
+  src/vt/exl3_policy.cpp
   src/vt/fused_ops.cpp
   src/vt/merged_gemm.cpp
   src/vt/cpu/cpu_backend.cpp
@@ -1287,10 +1306,13 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
+  src/vt/cpu/cpu_ltx2_vae.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
+  src/vt/cpu/cpu_exl3_dequant.cpp
+  src/vt/cpu/cpu_exl3_kernels.cpp
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
   src/vt/cpu/cpu_quant_dot_sdot.cpp
@@ -1773,9 +1795,11 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
+    src/vt/cuda/cuda_exl3.cu
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu
+    src/vt/cuda/cuda_ltx2_vae.cu
     # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
     # convolution in the tree on any device.
     src/vt/cuda/cuda_conv1d_general.cu

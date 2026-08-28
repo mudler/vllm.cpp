@@ -363,6 +363,137 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
 
+    def test_dropping_the_pool_best_fit_row_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1922 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and the equality assertion above has to go red, which is what
+        # proves the row was pinned because it ENTERED the population and not to
+        # quiet a gate. Same shape and reason as the two cases beside it.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-POOL-BEST-FIT"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-POOL-BEST-FIT"})
+
+    def test_the_pool_best_fit_row_is_credited_for_a_two_arm_gate(self):
+        # The entry in RUNNABLE_BASELINE is the WHOLE of what this row changed in
+        # the checker, so without a case that reads the SPEC the constant is the
+        # only artifact and the credit is plausible rather than checkable --
+        # which `scripts/check-pr-size.py`'s `governance_checker` contract
+        # refuses.
+        #
+        # The load-bearing assertion is the LAST one. A gate that only ran the
+        # test would be satisfied by a tree in which the borrow does nothing,
+        # because the invariant would hold trivially. This row's `## Gates` names
+        # BOTH arms of a same-binary A/B -- the default run and the
+        # `VT_POOL_BORROW=0` run, whose verdicts must DIFFER -- so a tree with an
+        # inert guard cannot satisfy it.
+        self.assertIn("ENG-POOL-BEST-FIT", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-POOL-BEST-FIT"), "runnable")
+        spec = (
+            gates.ROOT / ".agents/specs/pool-best-fit-retention.md"
+        ).read_text(encoding="utf-8")
+        # Split on the HEADING, not on the string: other sections name `## Gates`
+        # in prose, and splitting on the bare text takes that mention instead of
+        # the section.
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("test_engine_scratch_steady_state", gate_section)
+        self.assertIn("ctest --test-dir build", gate_section)
+        self.assertIn("VT_POOL_BORROW=0", gate_section)
+
+    def test_dropping_the_ltx2_pin_row_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1433 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and the equality assertion above has to go red, which is what
+        # proves the row was pinned because it ENTERED the population and not to
+        # quiet a gate. Same shape and reason as SERVE-REQUEST-LENGTH-GUARD below.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-UPSTREAM-LTX2-PIN"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-UPSTREAM-LTX2-PIN"})
+
+    def test_dropping_the_ltx2_vae_row_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved (#1451):
+        # `KERNEL-LTX2-VAE` entered the runnable population when its spec grew a
+        # `## Gates` section, and the entry added for it must be what keeps the
+        # exact pin agreeing with the audit. Remove it and the equality
+        # assertion has to go red, which is what proves the row was pinned
+        # because it ENTERED the population and not to quiet a gate -- the
+        # twelve red RatchetTests that this row's own section rename produced.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"KERNEL-LTX2-VAE"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"KERNEL-LTX2-VAE"})
+
+    def test_adding_a_row_that_is_not_runnable_also_breaks_the_pin(self):
+        # THE OTHER DIRECTION, and it is the one a removal test cannot cover.
+        # A pin that only reds when an entry goes missing would let the set GROW
+        # silently, which is how a row that carries no failing command gets
+        # credited as gated. `KERNEL-CONV3D` is the honest probe: it is this
+        # row's sibling, it is a real KERNEL row, and it is deliberately NOT in
+        # the runnable population, so adding it is exactly the mistake the
+        # ratchet exists to catch rather than an invented identifier.
+        self.assertNotIn("KERNEL-CONV3D", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertNotEqual(verdicts.get("KERNEL-CONV3D"), "runnable")
+        inflated = set(gates.RUNNABLE_BASELINE) | {"KERNEL-CONV3D"}
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, inflated)
+        self.assertEqual(inflated - runnable, {"KERNEL-CONV3D"})
+
+    def test_the_ltx2_vae_row_is_credited_for_real_commands(self):
+        # The entry in RUNNABLE_BASELINE is the WHOLE of what this row changed
+        # in this checker, so without a case that reads the SPEC the constant is
+        # the only artifact and the credit is plausible rather than checkable --
+        # which `scripts/check-pr-size.py`'s `governance_checker` contract
+        # refuses.
+        #
+        # The load-bearing assertions are the last two: the `## Gates` section
+        # must name test binaries that genuinely fail on a broken tree, and must
+        # NOT be carried into the population by a `git diff`, which exits 0 in
+        # any tree and gates nothing.
+        self.assertIn("KERNEL-LTX2-VAE", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("KERNEL-LTX2-VAE"), "runnable")
+        spec = (
+            gates.ROOT / ".agents/specs/ltx25-vae-device-residency.md"
+        ).read_text(encoding="utf-8")
+        # Split on the HEADING, not on the string: other sections name
+        # `## Gates` in prose, and splitting on the bare text takes that
+        # mention instead of the section.
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("test_diffusion_device_seam", gate_section)
+        self.assertIn("test_ltx2_vae", gate_section)
+        self.assertNotIn("git diff", gate_section)
+
+    def test_the_ltx2_pin_row_is_credited_for_real_commands(self):
+        # The entry in RUNNABLE_BASELINE is the WHOLE of what this row changed in
+        # the checker, so without a case that reads the SPEC the constant is the
+        # only artifact and the credit is plausible rather than checkable --
+        # which `scripts/check-pr-size.py`'s `governance_checker` contract
+        # refuses.
+        #
+        # A record row can only ever be credited for the checker that reads the
+        # record, so the third assertion below is the load-bearing one: the
+        # `## Gates` section must name `scripts/check-oracle-pins.py`, which
+        # genuinely fails on a broken record, rather than a command that exits 0
+        # in any tree.
+        self.assertIn("ENG-UPSTREAM-LTX2-PIN", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-UPSTREAM-LTX2-PIN"), "runnable")
+        spec = (
+            gates.ROOT / ".agents/specs/oracle-ltx-2-pin.md"
+        ).read_text(encoding="utf-8")
+        # Split on the HEADING, not on the string: other sections name
+        # `## Gates` in prose, and splitting on the bare text takes that
+        # mention instead of the section.
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("scripts/check-oracle-pins.py", gate_section)
+        self.assertIn("scripts/check-agent-record.py", gate_section)
+
     def test_dropping_the_request_length_guard_from_the_pin_breaks_it(self):
         # MUTATION, in the direction this re-pin actually moved: the entry added
         # for #1541 must be what keeps the exact pin agreeing with the audit.
@@ -875,3 +1006,44 @@ class RatchetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Qwen35GdnRunnablePopulationTests(unittest.TestCase):
+    """The BACKEND-TENSTORRENT-QWEN35 entry is the whole of what #1715's wiring
+    row changed in this checker, so the credit has to be checkable rather than
+    plausible: the row must be IN the pinned population, its audit verdict must
+    be earned by the record (not merely asserted), and removing the entry must
+    break the exact pin -- which is what proves the row was pinned because it
+    ENTERED the runnable population and not to quiet a gate."""
+
+    ROW = "BACKEND-TENSTORRENT-QWEN35"
+
+    def test_the_row_is_pinned_and_its_verdict_is_runnable(self):
+        self.assertIn(self.ROW, gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get(self.ROW), "runnable")
+
+    def test_dropping_the_qwen35_gdn_entry_breaks_the_pin(self):
+        # MUTATION, in the direction this pin actually moved (#1715): remove the
+        # entry and the exact-population equality inside the checker has to go
+        # red, because the audit still reports the row as runnable from its spec.
+        reduced = set(gates.RUNNABLE_BASELINE) - {self.ROW}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {self.ROW})
+
+    def test_the_qwen35_gdn_row_is_credited_for_real_commands(self):
+        # A record row can only be credited for the checker that reads the
+        # record, so the load-bearing assertion is the last one: the `## Gates`
+        # section of the row's own spec must name commands that genuinely fail
+        # on a broken tree -- the parity binary and the preflight chain -- not
+        # a command that exits 0 in any tree (`git diff`).
+        self.assertIn(self.ROW, gates.RUNNABLE_BASELINE)
+        spec = (
+            gates.ROOT / ".agents/specs/tenstorrent-qwen35.md"
+        ).read_text(encoding="utf-8")
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("tests/test_qwen35_paged_engine", gate_section)
+        self.assertIn("scripts/agent-preflight.sh", gate_section)
+        self.assertNotIn("git diff", gate_section)

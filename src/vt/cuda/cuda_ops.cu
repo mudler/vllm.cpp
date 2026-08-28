@@ -1548,6 +1548,40 @@ void AttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tenso
   }
 }
 
+// SPEC-DFLASH2 W12 D1 (#2087) — resolve one GLOBAL query row to the KEY span it
+// attends over and to its COMBINED intra-block offset. `qcu` is the query cu and
+// `cu` the key cu; every kernel below reads BOTH through this one function so a
+// query-cu that is honoured in four kernels and forgotten in the fifth is not a
+// shape a reviewer has to find by reading five mask derivations (spec R2).
+//
+// The launcher passes the SAME pointer for both when the caller set no query cu.
+// Then `ke - ks == qcu[r+1] - qcu[r]` and `ic == i - qcu[r]`, i.e. exactly the
+// `ii` these kernels computed before, so the null case is not a branch — it is
+// the same arithmetic with a zero offset.
+struct DFlashRowSpan {
+  int64_t ks;  // first GLOBAL key row of this query's request
+  int64_t ke;  // one past the last
+  int64_t ic;  // this query's COMBINED intra-block offset, 0-based within [ks,ke)
+};
+__device__ __forceinline__ DFlashRowSpan DFlashResolveRow(const int32_t* qcu,
+                                                          const int32_t* cu, int num_reqs,
+                                                          int64_t i) {
+  DFlashRowSpan sp;
+  sp.ks = 0;
+  sp.ke = 0;
+  sp.ic = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= qcu[r] && i < qcu[r + 1]) {
+      sp.ks = cu[r];
+      sp.ke = cu[r + 1];
+      // The query block is the BOTTOM-RIGHT suffix of the key block.
+      sp.ic = (sp.ke - sp.ks) - (qcu[r + 1] - qcu[r]) + (i - qcu[r]);
+      break;
+    }
+  }
+  return sp;
+}
+
 // ---------------------------------------------------------------------------
 // DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the project's FIRST
 // non-causal / bidirectional attention CUDA kernel. Mirrors AttentionKernel's
@@ -1560,23 +1594,18 @@ void AttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tenso
 // (num_reqs+1); each block linearly finds its request (num_reqs is small).
 template <typename Tin, typename Tout>
 __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Tin* key,
-                                           const Tin* value, const int32_t* cu, int num_reqs,
-                                           int64_t hq, int64_t hk, int64_t d, float scale,
-                                           bool causal, int64_t window) {
+                                           const Tin* value, const int32_t* cu,
+                                           const int32_t* qcu, int num_reqs, int64_t hq,
+                                           int64_t hk, int64_t d, float scale, bool causal,
+                                           int64_t window) {
   const int64_t i = blockIdx.x;  // GLOBAL query row
   const int64_t h = blockIdx.y;  // q-head
   const int64_t g = h / (hq / hk);
-  // Find the request block owning row i (small num_reqs; the uniform DFlash case
-  // is num_reqs blocks of 1+k). qs/qe are GLOBAL row bounds of the block.
-  int64_t qs = 0, qe = 0;
-  for (int r = 0; r < num_reqs; ++r) {
-    if (i >= cu[r] && i < cu[r + 1]) {
-      qs = cu[r];
-      qe = cu[r + 1];
-      break;
-    }
-  }
-  const int64_t ii = i - qs;                       // intra-block query offset
+  // Find the request block owning query row i (small num_reqs; the uniform DFlash
+  // case is num_reqs blocks of 1+k). qs/qe are GLOBAL KEY bounds of the block.
+  const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
+  const int64_t qs = sp.ks, qe = sp.ke;
+  const int64_t ii = sp.ic;                        // combined intra-block offset
   const int64_t jhi = causal ? ii : (qe - qs - 1);  // last visible intra-block key
   int64_t jlo = 0;
   if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
@@ -1686,9 +1715,9 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
 // recurrence, same f32 accumulation -- so this is a scheduling change.
 template <typename Tin, typename Tout, int kPerLane, int kQ>
 __global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* key,
-                                       const Tin* value, const int32_t* cu, int num_reqs,
-                                       int64_t rows, int64_t hq, int64_t hk, int64_t d,
-                                       float scale, bool causal, int64_t window) {
+                                       const Tin* value, const int32_t* cu, const int32_t* qcu,
+                                       int num_reqs, int64_t rows, int64_t hq, int64_t hk,
+                                       int64_t d, float scale, bool causal, int64_t window) {
   const int lane = threadIdx.x & 31;
   const int64_t wid =
       (static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5)) + (threadIdx.x >> 5);
@@ -1713,11 +1742,9 @@ __global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* k
     jlo[u] = 0;
     jhi[u] = -1;
     if (!act[u]) continue;
-    int64_t qs = 0, qe = rows;
-    for (int r = 0; r < num_reqs; ++r) {
-      if (i >= cu[r] && i < cu[r + 1]) { qs = cu[r]; qe = cu[r + 1]; break; }
-    }
-    const int64_t ii = i - qs;
+    const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
+    const int64_t qs = sp.ks, qe = sp.ke;
+    const int64_t ii = sp.ic;
     const int64_t rel_hi = causal ? ii : (qe - qs - 1);
     int64_t rel_lo = 0;
     if (causal && window > 0) rel_lo = (ii - (window - 1) > 0) ? ii - (window - 1) : 0;
@@ -1774,9 +1801,10 @@ __global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* k
 
 template <typename Tin, typename Tout, int kPerLane>
 __global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, const Tin* key,
-                                              const Tin* value, const int32_t* cu, int num_reqs,
-                                              int64_t hq, int64_t hk, int64_t d, float scale,
-                                              bool causal, int64_t window) {
+                                              const Tin* value, const int32_t* cu,
+                                              const int32_t* qcu, int num_reqs, int64_t hq,
+                                              int64_t hk, int64_t d, float scale, bool causal,
+                                              int64_t window) {
   const int lane = threadIdx.x & 31;
   const int64_t warp_id =
       (static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5)) + (threadIdx.x >> 5);
@@ -1784,19 +1812,13 @@ __global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, cons
   (void)total;
   const int64_t i = warp_id;        // GLOBAL query row
   const int64_t h = blockIdx.y;     // q-head
-  const int64_t rows = cu[num_reqs];
+  const int64_t rows = qcu[num_reqs];  // QUERY rows: what this grid covers
   if (i >= rows) return;
   const int64_t g = h / (hq / hk);
 
-  int64_t qs = 0, qe = 0;
-  for (int r = 0; r < num_reqs; ++r) {
-    if (i >= cu[r] && i < cu[r + 1]) {
-      qs = cu[r];
-      qe = cu[r + 1];
-      break;
-    }
-  }
-  const int64_t ii = i - qs;
+  const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
+  const int64_t qs = sp.ks, qe = sp.ke;
+  const int64_t ii = sp.ic;
   const int64_t jhi = causal ? ii : (qe - qs - 1);
   int64_t jlo = 0;
   if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
@@ -1939,9 +1961,9 @@ inline bool UseDflashAttnKeyLaneKernel() {
 // stayed green; there is no such guard in this one.)
 template <typename Tin, typename Tout, int kPerLane>
 __global__ void DFlashAttnKeyLaneKernel(Tout* out, const Tin* query, const Tin* key,
-                                        const Tin* value, const int32_t* cu, int num_reqs,
-                                        int64_t hq, int64_t hk, float scale, bool causal,
-                                        int64_t window) {
+                                        const Tin* value, const int32_t* cu, const int32_t* qcu,
+                                        int num_reqs, int64_t hq, int64_t hk, float scale,
+                                        bool causal, int64_t window) {
   constexpr int kD = kPerLane * 32;  // head_dim, compile-time (dispatch guarantees it)
   extern __shared__ float dfa_smem[];
 
@@ -1952,20 +1974,14 @@ __global__ void DFlashAttnKeyLaneKernel(Tout* out, const Tin* query, const Tin* 
   float* psh = qsh + kD;
 
   const int64_t i = static_cast<int64_t>(blockIdx.x) * warps + warp;  // GLOBAL query row
-  const int64_t rows = cu[num_reqs];
+  const int64_t rows = qcu[num_reqs];  // QUERY rows: what this grid covers
   if (i >= rows) return;  // whole-warp exit; this kernel never uses __syncthreads
   const int64_t h = blockIdx.y;
   const int64_t g = h / (hq / hk);
 
-  int64_t qs = 0, qe = 0;
-  for (int r = 0; r < num_reqs; ++r) {
-    if (i >= cu[r] && i < cu[r + 1]) {
-      qs = cu[r];
-      qe = cu[r + 1];
-      break;
-    }
-  }
-  const int64_t ii = i - qs;
+  const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
+  const int64_t qs = sp.ks, qe = sp.ke;
+  const int64_t ii = sp.ic;
   const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
   int64_t jlo = qs;
   if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
@@ -2224,9 +2240,9 @@ __device__ inline void DFlashAttnChunk(const Tin* key, const Tin* value, int64_t
 
 template <typename Tin, typename Tout, int kPerLane>
 __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* key,
-                                      const Tin* value, const int32_t* cu, int num_reqs,
-                                      int64_t hq, int64_t hk, float scale, bool causal,
-                                      int64_t window) {
+                                      const Tin* value, const int32_t* cu, const int32_t* qcu,
+                                      int num_reqs, int64_t hq, int64_t hk, float scale,
+                                      bool causal, int64_t window) {
   constexpr int kD = kPerLane * 32;  // head_dim, compile-time (dispatch guarantees it)
   extern __shared__ float dfa_smem[];
 
@@ -2236,20 +2252,14 @@ __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* ke
   float* psh = dfa_smem + static_cast<size_t>(warp) * 32;
 
   const int64_t i = static_cast<int64_t>(blockIdx.x) * warps + warp;  // GLOBAL query row
-  const int64_t rows = cu[num_reqs];
+  const int64_t rows = qcu[num_reqs];  // QUERY rows: what this grid covers
   if (i >= rows) return;  // whole-warp exit; this kernel never uses __syncthreads
   const int64_t h = blockIdx.y;
   const int64_t g = h / (hq / hk);
 
-  int64_t qs = 0, qe = 0;
-  for (int r = 0; r < num_reqs; ++r) {
-    if (i >= cu[r] && i < cu[r + 1]) {
-      qs = cu[r];
-      qe = cu[r + 1];
-      break;
-    }
-  }
-  const int64_t ii = i - qs;
+  const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
+  const int64_t qs = sp.ks, qe = sp.ke;
+  const int64_t ii = sp.ic;
   const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
   int64_t jlo = qs;
   if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
@@ -2333,8 +2343,10 @@ __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* ke
 // (cu_seqlens) all work, including a warp whose 16 rows straddle a document
 // boundary. The block walks the UNION of its 64 rows' key ranges so the staged
 // tile is block-uniform (every barrier is reached by every warp), and rows mask
-// out what they cannot see. Query rows past cu[num_reqs] clamp their row index
-// and skip the store.
+// out what they cannot see. Query rows past qcu[num_reqs] clamp their row index
+// and skip the store. Since W12 D1 (#2087) the query grid and the key span are
+// counted SEPARATELY here (`qrows` and `krows`), because a caller may hand this
+// op fewer query rows than key rows.
 //
 // NUMERICS. Q, K and V are already bf16 in the production stream, so QKᵀ loses
 // NOTHING (bf16 in, f32 accumulate — the CUDA-core path converts the same bf16 to
@@ -2368,8 +2380,8 @@ constexpr int kMmaPad = 8;     // shared row padding, in elements (see SHARED BA
 template <typename Tout, int kDT>
 __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
     Tout* out, const __nv_bfloat16* query, const __nv_bfloat16* key,
-    const __nv_bfloat16* value, const int32_t* cu, int num_reqs, int64_t hq, int64_t hk,
-    float scale, bool causal, int64_t window) {
+    const __nv_bfloat16* value, const int32_t* cu, const int32_t* qcu, int num_reqs,
+    int64_t hq, int64_t hk, float scale, bool causal, int64_t window) {
 #if __CUDA_ARCH__ >= 800
   constexpr int kD = kDT * 16;        // head_dim
   constexpr int kNT = kD / 8;         // P·V n-tiles (8 output columns each)
@@ -2386,24 +2398,30 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
   const int gid = lane >> 2;  // 0..7 : which of the 8 row-pairs this lane owns
   const int tig = lane & 3;   // 0..3 : which column pair
 
-  const int64_t rows = cu[num_reqs];
+  // D1 (#2087): TWO row counts now. `qrows` bounds the query grid and every
+  // query-side clamp; `krows` bounds the KEY staging clamp. They are equal
+  // whenever the caller set no query cu, which is why one name sufficed before.
+  const int64_t qrows = qcu[num_reqs];
+  const int64_t krows = cu[num_reqs];
   const int64_t h = blockIdx.y;
   const int64_t g = h / (hq / hk);
   const int64_t qblk = static_cast<int64_t>(blockIdx.x) * (kMmaWarps * kMmaQ);
-  if (qblk >= rows) return;  // block-uniform
+  if (qblk >= qrows) return;  // block-uniform
 
   // --- block-wide key range: the UNION over this block's 64 query rows ------
-  const int64_t qend = (qblk + kMmaWarps * kMmaQ < rows) ? (qblk + kMmaWarps * kMmaQ) : rows;
-  int64_t klo = rows, khi = -1;
+  const int64_t qend = (qblk + kMmaWarps * kMmaQ < qrows) ? (qblk + kMmaWarps * kMmaQ) : qrows;
+  int64_t klo = krows, khi = -1;
   for (int r = 0; r < num_reqs; ++r) {
-    const int64_t rs = cu[r], re = cu[r + 1];
-    const int64_t lo = rs > qblk ? rs : qblk;
-    const int64_t hi = (re < qend ? re : qend) - 1;
+    const int64_t qrs = qcu[r], qre = qcu[r + 1];  // this request's QUERY rows
+    const int64_t rs = cu[r], re = cu[r + 1];      // this request's KEY rows
+    const int64_t lo = qrs > qblk ? qrs : qblk;
+    const int64_t hi = (qre < qend ? qre : qend) - 1;
     if (lo > hi) continue;
-    const int64_t jhi = causal ? hi : (re - 1);
+    const int64_t off = (re - rs) - (qre - qrs);  // bottom-right anchor
+    const int64_t jhi = causal ? (rs + off + (hi - qrs)) : (re - 1);
     int64_t jlo = rs;
     if (causal && window > 0) {
-      const int64_t ii = lo - rs;
+      const int64_t ii = off + (lo - qrs);
       jlo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
     }
     if (jlo < klo) klo = jlo;
@@ -2418,18 +2436,12 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
 #pragma unroll
   for (int u = 0; u < 2; ++u) {
     const int64_t i = qbase + gid + 8 * u;
-    live[u] = i < rows;
-    const int64_t ic = live[u] ? i : (rows - 1);  // clamp: reads stay in bounds
+    live[u] = i < qrows;
+    const int64_t ic = live[u] ? i : (qrows - 1);  // clamp: reads stay in bounds
     qrow[u] = ic;
-    int64_t qs = 0, qe = 0;
-    for (int r = 0; r < num_reqs; ++r) {
-      if (ic >= cu[r] && ic < cu[r + 1]) {
-        qs = cu[r];
-        qe = cu[r + 1];
-        break;
-      }
-    }
-    const int64_t ii = ic - qs;
+    const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, ic);
+    const int64_t qs = sp.ks, qe = sp.ke;
+    const int64_t ii = sp.ic;
     rhi[u] = qs + (causal ? ii : (qe - qs - 1));
     rlo[u] = qs;
     if (causal && window > 0) rlo[u] = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
@@ -2463,7 +2475,7 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
     for (int idx = tid * 8; idx < kMmaKeys * kD; idx += static_cast<int>(blockDim.x) * 8) {
       const int kk = idx / kD, col = idx % kD;
       const int64_t j = base + kk;
-      const int64_t jc = j < rows ? j : (rows - 1);  // clamp; masked keys score -inf
+      const int64_t jc = j < krows ? j : (krows - 1);  // clamp; masked keys score -inf
       const int64_t off = (jc * hk + g) * kD + col;
       const int sh = kk * kStride + col;
       *reinterpret_cast<uint4*>(ksh + sh) = *reinterpret_cast<const uint4*>(key + off);
@@ -2590,8 +2602,8 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
     }
   }
 #else
-  (void)out; (void)query; (void)key; (void)value; (void)cu; (void)num_reqs; (void)hq;
-  (void)hk; (void)scale; (void)causal; (void)window;
+  (void)out; (void)query; (void)key; (void)value; (void)cu; (void)qcu; (void)num_reqs;
+  (void)hq; (void)hk; (void)scale; (void)causal; (void)window;
   __trap();  // never launched below sm_80 (host gate: DFlashMmaSupported)
 #endif
 }
@@ -2631,15 +2643,29 @@ template <typename Tin>
 void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query,
                                 const Tensor& key, const Tensor& value,
                                 const DFlashBlockAttentionArgs& args) {
+  // D1 (#2087): the grid runs over the QUERY rows, which are no longer the key
+  // rows. `t` is the query count -- every grid expression below already used
+  // query.shape[0], which is why the grid shrinks with no change to its shape.
   const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
   const int64_t hk = key.shape[1];
   if (t == 0 || hq == 0 || d == 0) return;
-  // Upload cu_seqlens (host, num_reqs+1) to a stream-ordered device scratch.
-  const size_t cub = static_cast<size_t>(args.num_reqs + 1) * sizeof(int32_t);
+  // Upload cu_seqlens (host, num_reqs+1) to a stream-ordered device scratch, and
+  // the query cu right behind it in the SAME allocation. When the caller set no
+  // query cu the kernels get the same pointer twice, so the null case costs no
+  // extra byte and takes no branch inside a kernel.
+  const size_t cun = static_cast<size_t>(args.num_reqs) + 1;
+  const bool split_q = args.cu_seqlens_q != nullptr;
+  const size_t cub = cun * sizeof(int32_t);
   int32_t* d_cu = nullptr;
-  Check(cudaMallocAsync(&d_cu, cub, s), "dflash-block-attn cu malloc");
+  Check(cudaMallocAsync(&d_cu, split_q ? 2 * cub : cub, s), "dflash-block-attn cu malloc");
   Check(cudaMemcpyAsync(d_cu, args.cu_seqlens, cub, cudaMemcpyHostToDevice, s),
         "dflash-block-attn cu upload");
+  int32_t* d_qcu = d_cu;
+  if (split_q) {
+    d_qcu = d_cu + cun;
+    Check(cudaMemcpyAsync(d_qcu, args.cu_seqlens_q, cub, cudaMemcpyHostToDevice, s),
+          "dflash-block-attn query cu upload");
+  }
   const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
   // TENSOR-CORE fast path: bf16 in, head_dim a multiple of the MMA's k (16), up to
   // 128 (the largest head this port uses). f32 streams stay on the CUDA-core kernel
@@ -2658,14 +2684,14 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
       DFlashAttnMmaKernel<float, DT><<<mgrid, mblock, mshmem, s>>>(                           \
           out.Ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(query.data),               \
           reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
-          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, args.num_reqs, hq, hk,    \
-          args.scale, args.causal, args.sliding_window);                                      \
+          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, d_qcu, args.num_reqs,     \
+          hq, hk, args.scale, args.causal, args.sliding_window);                              \
     } else {                                                                                  \
       DFlashAttnMmaKernel<__nv_bfloat16, DT><<<mgrid, mblock, mshmem, s>>>(                   \
           out.Ptr<__nv_bfloat16>(), reinterpret_cast<const __nv_bfloat16*>(query.data),       \
           reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
-          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, args.num_reqs, hq, hk,    \
-          args.scale, args.causal, args.sliding_window);                                      \
+          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, d_qcu, args.num_reqs,     \
+          hq, hk, args.scale, args.causal, args.sliding_window);                              \
     }                                                                                         \
   } while (0)
     switch (d / 16) {
@@ -2701,12 +2727,12 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   do {                                                                                          \
     if (out.dtype == DType::kF32) {                                                             \
       DFlashAttnChunkKernel<Tin, float, PER_LANE><<<kgrid, kblock, kshmem, s>>>(                \
-          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,           \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, d_qcu,    \
           args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
     } else {                                                                                    \
       DFlashAttnChunkKernel<Tin, __nv_bfloat16, PER_LANE><<<kgrid, kblock, kshmem, s>>>(        \
           out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,   \
-          args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
+          d_qcu, args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);          \
     }                                                                                           \
   } while (0)
     if (!keylane) {
@@ -2725,12 +2751,12 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   do {                                                                                          \
     if (out.dtype == DType::kF32) {                                                             \
       DFlashAttnKeyLaneKernel<Tin, float, PER_LANE><<<kgrid, kblock, kshmem, s>>>(              \
-          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,           \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, d_qcu,    \
           args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
     } else {                                                                                    \
       DFlashAttnKeyLaneKernel<Tin, __nv_bfloat16, PER_LANE><<<kgrid, kblock, kshmem, s>>>(      \
           out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,   \
-          args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
+          d_qcu, args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);          \
     }                                                                                           \
   } while (0)
     switch (d / 32) {
@@ -2753,12 +2779,12 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   do {                                                                                        \
     if (out.dtype == DType::kF32) {                                                           \
       DFlashBlockAttentionWarpKernel<Tin, float, PER_LANE><<<wgrid, wblock, 0, s>>>(          \
-          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,         \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, d_qcu,  \
           args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);            \
     } else {                                                                                  \
       DFlashBlockAttentionWarpKernel<Tin, __nv_bfloat16, PER_LANE><<<wgrid, wblock, 0, s>>>(  \
           out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, \
-          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);            \
+          d_qcu, args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);     \
     }                                                                                         \
   } while (0)
     switch (d / 32) {
@@ -2777,13 +2803,13 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   switch (out.dtype) {
     case DType::kF32:
       DFlashBlockAttentionKernel<Tin, float><<<grid, kBlock, shmem, s>>>(
-          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, d_qcu,
           args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);
       break;
     case DType::kBF16:
       DFlashBlockAttentionKernel<Tin, __nv_bfloat16><<<grid, kBlock, shmem, s>>>(
           out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,
-          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);
+          d_qcu, args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);
       break;
     default: VT_CHECK(false, "cuda dflash-block-attn: unsupported out dtype");
   }

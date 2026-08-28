@@ -888,9 +888,14 @@ compressor width `deepseek_v4.cpp` already documents at the `dsa_dense` comment
 
 So the loader REFUSES BY NAME on those three shapes and names the residual. It
 does not improvise, and it does not widen the host slot to a shape the forward
-would then mis-index: `Gemm`'s host arm is a `MatVec` with no length check, so a
-`[2*hd, H]` buffer read as `[hd, H]` is a silently wrong number, which is the
-`.agents/verification.md` failure this project exists to avoid.
+would then mis-index. WITHDRAWN AS WRITTEN by #1970, and recorded here because
+this sentence is where the claim started: it said `Gemm`'s host arm is a `MatVec`
+with no length check, so a `[2*hd, H]` buffer read as `[hd, H]` is a silently
+wrong number. `deepseek_v4.cpp:413` is an unconditional `VT_CHECK` and `Gemm`'s
+keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
+`vt: MatVec weight size mismatch` naming no tensor and no layer. Refusing by name
+buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
+and it is not the difference between wrong tokens and a refusal.
 
 **The obvious fix is wrong and the reason is worth recording.** The GGUF arm
 dodges the same geometry by setting `dsa_dense = (be.gguf != nullptr)` and
@@ -1869,15 +1874,32 @@ which is precisely how this landed green locally in the first place.
   `.agents/oracles/exllamav3.md` file with its `gateable` verdict AND the
   AGENTS.md table row — and neither was edited here: this dispatch is W2a+W2b,
   and AGENTS.md is the binding policy file, not a helper's to widen.
-- **The CUDA arm compiles nowhere yet.** `src/vt/cuda/cuda_exl3.cu` has never
-  been through `nvcc`: the implementer host has no toolkit and `dgx.casa` is
-  down. First verdict comes from `cuda-fat-build` or from
-  `cmake -S . -B build-cuda -G Ninja -DVLLM_CPP_CUDA=ON
-  -DVLLM_CPP_CUDA_ARCHITECTURES=121a && cmake --build build-cuda --target vllm -j 4`.
-- **Every W2 device measurement.** The byte gate for `had_r_128`, the tier-3
-  bound for `exl3_gemm`, and the shape the device actually takes. All three are
-  one command once the box returns:
-  `rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V`.
+- ~~**The CUDA arm compiles nowhere yet.**~~ **RETIRED 2026-08-28.**
+  `src/vt/cuda/cuda_exl3.cu` compiles and its object carries an `sm_121a` cubin
+  (MEASURED 2026-08-28 on `dgx:gpu0` (GB10 `sm_121a`, driver 580.173.02, nvcc 13.0.88, worker `rc-worker-4b8lj`, tree `525d2b991`, Release), with `cuda_exl3.cu.o` carrying one `cuda_exl3.cu.1.sm_121a.cubin`). CI's `cuda-fat-build` compiles the same
+  translation unit for ten architectures and has been green on `main` since at
+  least 2026-08-27T23:54:55Z (run 33121667815), so this was already stale when
+  it was measured directly.
+- **Every W2 device measurement — PARTLY TAKEN 2026-08-28, and the residue is
+  named rather than rounded up to "done".** MEASURED 2026-08-28 on `dgx:gpu0` (GB10 `sm_121a`, driver 580.173.02, nvcc 13.0.88, worker `rc-worker-4b8lj`, tree `525d2b991`, Release), with `cuda_exl3.cu.o` carrying one `cuda_exl3.cu.1.sm_121a.cubin`:
+  - W2a `had_r_128` CUDA vs CPU: **BYTE-IDENTICAL** (`mismatches == 0`). MET.
+  - W2b `exl3_gemm` vs the f64 reference: **`rel_rms 5.538e-4`** against the
+    stated `1.0e-3`, worst `0.0334` against 8 ulp `0.0625`. MET.
+  - W2c tier 3c on the GEMV arm: **`rel_rms 5.160e-4`** against `6.0e-3`, worst
+    `0.125` against 64 ulp `1.0`. MET — but the case FORCES the arm through
+    `force_gemv`, deliberately, so what is measured is the arm's NUMERICS and
+    not whether the heuristic would choose it. See `narrow_coresident` below,
+    which is still owed.
+  - W2d tier 4 on the fused MoE arm: **STILL OWED, and it cannot be taken on
+    this code.** The case skips on `CudaBackend::DeviceMemoryIsHostAddressable()`,
+    which answers `false` BY DESIGN (`cuda_backend.cu:330-366`, #1635: a
+    `cudaMalloc` pointer is not host-dereferenceable even on GB10), and the
+    fused kernel dereferences its per-expert pointer tables on the device. So
+    the arm whose whole rationale is `3 * topk * T` launches -> 1 per layer has
+    never run on a GPU and cannot until the device-resident tower below lands.
+    The suite still reports 8/8 because the skip asserts its own precondition.
+  - The real-checkpoint spot anchors: **STILL OWED.** That run decoded ZERO real
+    tensors — `test_exl3_dequant` reported `SKIPPED: no readable EXL3 shard`.
   No speed number was attempted and none is quoted.
 - **The CUDA arm instantiates `bits == 3`, `codebook == 1` (mcg) ONLY.** Eight
   template instantiations rather than 64 in a TU the fat build compiles for ten
@@ -1928,6 +1950,30 @@ which is precisely how this landed green locally in the first place.
   entry is for; it is deliberately NOT attached to
   [#1923](https://github.com/mudler/vllm.cpp/issues/1923), because that issue is
   the loader defect and W1c closes it.
+- **The real artifact's DSA geometry now LOADS, and the forward REFUSES on it —
+  [#1970](https://github.com/mudler/vllm.cpp/issues/1970), option C of
+  [#1961](https://github.com/mudler/vllm.cpp/issues/1961).** This SUPERSEDES the
+  dense-MLA-policy entry above: the answer is not a shared dense-MLA selector,
+  because dense MLA is not upstream's attention on a `cr > 0` layer at any
+  sequence length ([#1964](https://github.com/mudler/vllm.cpp/issues/1964)), so
+  routing the EXL3 arm there would have been a wrong-but-plausible path rather
+  than a policy. The loader now derives every DSA width as upstream does
+  (`coff = 1 + (compress_ratio == 4)`, `vllm/models/deepseek_v4/compressor.py:247-248`)
+  and `AttentionBlock` refuses BY NAME when a materialized width is not the one
+  its arithmetic indexes. What stays OWED is the DSA composition itself — the
+  `coff`-overlapped window with `head_offset` role selection, boundary-only
+  emission, a compressed KV cache beside a SWA(128) raw cache, the indexer on
+  `qr` over compressed rows, one joint softmax over the union. **No row owns that
+  port**; `MODEL-DSV4-EXL3` carries it here until one does, and it needs the
+  cache topology [#1960](https://github.com/mudler/vllm.cpp/issues/1960) and
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925) are scoping. Also owed
+  and NOT closed by #1970: the GGUF arm's `dsa_dense` still runs the same wrong
+  attention on 41 of 43 real layers (#1964, excluded from #1970's scope), the
+  `cr == 128` EXL3 layers pass the width check while their `win = 2` pooling is
+  still not upstream's 128-wide boundary-emitted compressor, and the
+  `indexer.wq_b` input-space defect (`x` where upstream uses `qr`) is real at any
+  geometry. Design, anchors and mutations in
+  [`specs/dsv4-dsa-loader-accept-forward-refuse.md`](dsv4-dsa-loader-accept-forward-refuse.md).
 - **Real-checkpoint residency for the coalesced tower — W2.** W1b copies each
   TP1-coalesced linear into host owner buffers. That is right for the fixture
   and for W2's byte-parity gate, and it is ~100 GB on the real 216-expert

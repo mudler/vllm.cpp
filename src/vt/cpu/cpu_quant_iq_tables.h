@@ -1027,6 +1027,15 @@ inline constexpr int8_t kValuesMxfp4[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 };
 
+// llama.cpp @ b10451 ggml-common.h:1120 kvalues_iq4nl — IQ4_NL's 16-entry
+// NON-LINEAR codebook. The nibble is an INDEX here, not a quant: this is the
+// only difference between IQ4_NL and Q4_0, which share a block layout byte for
+// byte. Shared by the `to_float` decoder and the keep-quant `vec_dot`, so there
+// is one definition rather than two that can drift.
+inline constexpr int8_t kValuesIq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
 // ggml_e8m0_to_fp32_half (ggml-impl.h:477) — decode an E8M0 (8-bit unsigned
 // exponent) MXFP4 block scale to 0.5 * 2^(byte-127) == 2^(byte-128). The half
 // convention pairs with kValuesMxfp4 (= 2 * e2m1) so their product is the fp4

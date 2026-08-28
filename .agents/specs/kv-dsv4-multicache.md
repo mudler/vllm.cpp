@@ -13,14 +13,31 @@ recorded at `include/vllm/model_executor/models/deepseek_v4.h:13`.
 
 ## Now
 
-`ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) is
-claimed and its design is `### W1 design — allocation metadata`. W1 changes the
-KV-cache spec hierarchy only: it adds `SlidingWindowMLASpec`, the four
-DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()` overrides,
-both `real_page_size_bytes` special cases and the alignment-padding helper.
-**Nothing constructs either spec outside tests**, so no topology is published
-and nothing is reachable from a production entry point yet; W2 owns publication
-and W3 owns consumption. W2 through W7 remain proposals with no owner.
+`ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) landed
+as `c1e6f3fb9`: the KV-cache spec hierarchy gained `SlidingWindowMLASpec`, the
+four DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()`
+overrides, both `real_page_size_bytes` special cases and the alignment-padding
+helper, and published none of it.
+
+W2 ([#1973](https://github.com/mudler/vllm.cpp/issues/1973)) landed as
+`6b18829bc`: `MakeDeepseekV4KVCache` publishes DeepSeek-V4's seven groups / 167
+cache entries, `GPUModelRunner::initialize_kv_cache` REFUSES a published group it
+does not allocate rather than dropping it in silence, and `spec_equal`'s missing
+MLA arms ([#1974](https://github.com/mudler/vllm.cpp/issues/1974)) are fixed in
+flow. Nothing consumed the topology, so that refusal was what a DeepSeek-V4
+engine hit.
+
+W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)) is claimed and its
+design is `### W3 design — the runner carries every published group, and a third
+forward channel`. It makes the runner allocate a buffer for every published cache
+instead of one per hidden layer, generalizes `full_attn_group_id_` /
+`gdn_group_id_` and the three-valued `LayerKvClass`, and adds the third
+`ModelForwardInput` channel. **This is the wave that touches every model**, so
+its obligation is byte-neutrality for the uniform case and its full gate includes
+the SACRED `test_qwen35_paged_engine` regression. **Still nothing reads a
+cache** — a DeepSeek-V4 engine now constructs and allocates all 167 buffers and
+its first forward refuses, naming W5. W4 through W7 remain proposals with no
+owner.
 
 ## Scope
 
@@ -176,7 +193,7 @@ is an `MLAAttentionSpec` with `dtype=torch.uint8`, `compress_ratio=4`,
 
 **(d) The compressor state caches — 41 + 21 of them.**
 Every `DeepseekCompressor` owns a `CompressorStateCache`
-(`compressor.py:288-293`) whose `state_dim = 2 * coff * head_dim`, `coff = 1 +
+(`compressor.py:290-295`) whose `state_dim = 2 * coff * head_dim`, `coff = 1 +
 (compress_ratio == 4)`, dtype **f32**, and whose `block_size` is **4** for
 ratio 4 and **8** for ratio 128 (`compressor.py:168-183`), with
 `sliding_window = coff * compress_ratio`. Its spec is a `SlidingWindowMLASpec`
@@ -376,7 +393,7 @@ section is load-bearing: it says which seam each piece routes through.
 | `:381-395` `MLAAttentionSpec` `compress_ratio` / `alignment` / `cache_dtype_str` / `model_version` + `storage_block_size` | fields on `MLAAttentionSpec` (`kv_cache_interface.h:242-261`) (W1) |
 | `:396-405`, `:627-635` the `deepseek_v4` + `fp8_ds_mla` 584-byte page formula | `real_page_size_bytes()` overrides in `src/vllm/v1/kv_cache_interface.cpp` (W1) |
 | `:345-351` `_apply_alignment_padding` | page-size padding helper writing `page_size_padded` (W1) |
-| `attention.py:315-321,626-645,669-684,761-777` + `compressor.py:288-293` the four declaration sites | `MakeDeepseekV4KVCache` (`src/vllm/model_executor/models/deepseek_v4_registry.cpp:126-148`) (W2) |
+| `attention.py:315-321,626-645,669-684,761-777` + `compressor.py:290-295` the four declaration sites | `MakeDeepseekV4KVCache` (`src/vllm/model_executor/models/deepseek_v4_registry.cpp:126-148`) (W2) |
 | `vllm/v1/worker/gpu_model_runner.py` per-layer KV allocation over N groups | `src/vllm/v1/worker/gpu/runner.cpp:577-597,882-1005` (W3) |
 | `attention.py:122-131` sparse-MLA forward consuming the caches | `DeepseekV4Model::Forward` / `ForwardDevice` (`deepseek_v4.cpp:2886,2959`) (W5) |
 | `fused_compress_quant_cache.py:238-297` store / SGLang `dequant_k_cache.py` read | ALREADY LANDED as `Fp8DsMlaEncodeToken` / `Fp8DsMlaDecodeToken` (`include/vllm/model_executor/models/deepseek_v4_compressor.h:134-160`) — reused, not re-ported |
@@ -488,7 +505,7 @@ plus the registry entry for the new kind in
    upstream returns `storage_block_size * num_kv_heads * head_size *
    dtype_size` — `head_size` alone, no `head_size_v`, and `storage_block_size`
    rather than `block_size` — because the cache holds one vector instead of
-   K + V (`compressor.py:194` says so in its own comment). Its `kind()` is the
+   K + V (`compressor.py:193` says so in its own comment). Its `kind()` is the
    already-declared `KVCacheSpecKind::kSlidingWindowMla`. Upstream also asserts
    `model_version in (None, "deepseek_v4")` before the element formula
    (`:634-636`); we mirror that as a `VT_CHECK`.
@@ -648,6 +665,208 @@ the page formula; it does not supply the store. The refusal therefore stays and
 its message is sharpened to say which half now exists, and the obligation moves
 to **W5**, the wave that lands the read and write side.
 
+### W2 design — publishing the topology, and the refusal that makes it safe ([#1973](https://github.com/mudler/vllm.cpp/issues/1973))
+
+Committed before the implementation. Every value below was read from
+`/home/mudler/_git/vllm` at the pin `5559679229bc961848b121ccdeaa8fa5d79bec98`,
+and where this section and `## The geometry, derived from source` disagree,
+upstream wins and the disagreement is named.
+
+**The blocking question this wave had to answer first.** W1 declined to publish
+because `src/vllm/v1/worker/gpu/runner.cpp:577-597` drops an unrecognised group
+with no diagnostic. That reading is CORRECT and the situation is worse than it
+records, which is why the answer is not "publish anyway" and not "defer W2 behind
+W3" but "publish, and make the drop impossible to take silently".
+
+Traced end to end rather than read off one loop:
+
+1. `MakeDeepseekV4KVCache` is `ModelFactory::make_kv_cache`
+   (`deepseek_v4_registry.cpp:120`), reached from a production entry point —
+   `LoadedEngine`'s constructor through `MakeKVCacheResolved` /
+   `MakeKVCacheMaybeSpec` (`src/vllm/entrypoints/model_loader.cpp:1394-1404`,
+   `:1681`) and `ModelRegistry::MakeKVCache`
+   (`src/vllm/model_executor/models/model_registry.cpp:380-386`). What it
+   publishes reaches `GPUModelRunner::initialize_kv_cache` unfiltered.
+2. The selection loop has two arms and no `else`: the FIRST non-eagle
+   `kFullAttention`/`kMlaAttention` group becomes `full_attn_group_id_`, a
+   `kMamba` group becomes `gdn_group_id_`. A `kSlidingWindowMla` group matches
+   nothing. A SECOND `kMlaAttention` group is passed over by the
+   `full_attn_group_id_ < 0` guard. Both ids are plain `int`s
+   (`runner.h:571-572`).
+3. **The allocation loop then does not even see the groups.**
+   `membership_by_name` is set only when the model has a recurrent group
+   (`runner.cpp:820-845` — `gdn_layer_mask` is computed inside
+   `if (has_mamba_group)` and `membership_by_name = gdn_layer_mask.has_value()`).
+   DeepSeek-V4 has no Mamba group, so the loop falls into the historical
+   predicate `is_full_attn = !is_gdn` and allocates ONE `CacheBuffer` per HIDDEN
+   LAYER, every one sized from the target group's `page_size_bytes()`
+   (`runner.cpp:895-995`). Publishing the seven groups below without the refusal
+   allocates 43 buffers of ONE page for a model that needs 167 buffers of seven
+   different pages — and reports nothing.
+
+That is a silently short KV allocation, which is a wrong-tokens failure and not
+a crash. `AGENTS.md` requires an unimplemented arm to refuse with a message that
+names the missing part, so the refusal is policy, not taste.
+
+**What the refusal costs, stated rather than implied.** DeepSeek-V4 on the
+server path stops constructing an engine. Today it loads and produces correct
+tokens by full recompute, because `Forward`/`ForwardDevice` discard `attn_kv`
+(`deepseek_v4.cpp:2886-2887`, `:2959-2960`) — so what is lost is a path that has
+no decode step and whose tok/s `### The speed question, answered` already says is
+not a decode rate. `examples/deepseek_v4_gen` does not go through the runner
+(`DeepseekV4ForwardGgufCached`, `main.cpp:198`) and is unaffected. Recorded here
+because it is a user-visible behaviour change that a reader must be able to find
+without reading the diff.
+
+**What lands.**
+
+1. **The runner refuses a published group it does not allocate.** After the
+   selection loop, every group is one of exactly four things: the target
+   attention group, the recurrent group, the single `fa_draft` draft-KV slot
+   (the second `kFullAttention` group, allocated at `runner.cpp:1115-1150`), or
+   a defect. The fourth case becomes a `VT_CHECK` naming the group index, its
+   spec kind and its first layer name. Byte-neutral for every model shipping
+   today: each publishes exactly the groups the runner consumes, which the
+   byte-neutrality pins below assert directly rather than infer.
+
+   The draft slot is tolerated on its KIND rather than on `spec_on()`, mirroring
+   the allocation loop's own predicate (`runner.cpp:1128-1130` skips any group
+   whose kind is not `kFullAttention`). A `kFullAttention` group published with
+   speculation OFF is therefore still tolerated and still unallocated; tightening
+   that is W3's, and it is listed under `## Owed` rather than left to be found.
+
+2. **`MakeDeepseekV4KVCache` publishes the real topology.** Seven groups, 167
+   entries, one group per distinct published spec — which is upstream's own
+   grouping rule and, for DeepSeek-V4-Flash, resolves to seven.
+
+   **Which dtype arm, and why it is not the one our cache-dtype resolution can
+   reach.** `DeepseekV4Attention.use_fp8_ds_mla_layout` is
+   `ClassVar[bool] = True` on the base class (`attention.py:140`) and only the
+   FlashInfer-sparse SM120 subclass sets it `False`
+   (`nvidia/flashinfer_sparse.py:163`); `_resolve_dsv4_kv_cache_dtype` then
+   writes `cache_config.cache_dtype = "fp8_ds_mla"` back onto the cache config
+   and returns `torch.uint8` (`attention.py:89-119`). The default DeepSeek-V4
+   cache format upstream IS `fp8_ds_mla`, so that is the arm this wave mirrors:
+   `cache_dtype_str = "fp8_ds_mla"`, `alignment = 576`, 1-byte storage. Our
+   `ParseCacheDType` refuses the string `fp8_ds_mla` by name
+   (`include/vllm/v1/kv_cache_dtype.h:87-90`) and our factory signature carries
+   no cache dtype at all, so the arm is published unconditionally rather than
+   selected — the `alignment = 512` non-`fp8_ds_mla` arm is NOT published, and
+   that omission is named under `## Owed` against W5, which owns lifting the
+   refusal together with the store path.
+
+3. **`spec_equal` gains the two MLA arms**
+   ([#1974](https://github.com/mudler/vllm.cpp/issues/1974)) — the observation
+   W1 recorded and correctly declined to act on. Verified: every upstream spec
+   class is `@dataclass(frozen=True, kw_only=True)`
+   (`kv_cache_interface.py:380-381`, `:610-611`), so `__eq__` is generated over
+   all fields and two identical `MLAAttentionSpec`s are equal, while
+   `src/vllm/v1/core/kv_cache_coordinator.cpp:17-67` returns `false` for them
+   from its `default:` arm. Fixed in flow.
+
+**The seven groups, with the upstream site each value came from.**
+
+| # | group | spec class | upstream site | `block_size` | `head_size` | dtype | window | layers |
+|---:|---|---|---|---:|---:|---|---:|---:|
+| 1 | C4A compressed latent | `MLAAttentionSpec` | `attention.py:631-645` | `cache_config.block_size` | 512 | u8 | — | 21 |
+| 2 | C128A compressed latent | `MLAAttentionSpec` | same site, ratio 128 | `cache_config.block_size` | 512 | u8 | — | 20 |
+| 3 | indexer key cache | `MLAAttentionSpec` | `attention.py:669-684` | `cache_config.block_size` | 132 | u8 | — | 21 |
+| 4 | SWA cache | `SlidingWindowMLASpec` | `sparse_swa.py:86-101` | 64 | 512 | u8 | 128 | 43 |
+| 5 | C4 attention-compressor state | `SlidingWindowMLASpec` | `compressor.py:188-200` | 4 | 2048 | f32 | 8 | 21 |
+| 6 | C4 indexer-compressor state | `SlidingWindowMLASpec` | same site at `head_dim=128` (`attention.py:768-777`) | 4 | 512 | f32 | 8 | 21 |
+| 7 | C128 compressor state | `SlidingWindowMLASpec` | same site at ratio 128 | 8 | 1024 | f32 | 128 | 20 |
+
+21 + 20 + 21 + 43 + 21 + 21 + 20 = **167**.
+
+**Four upstream details a careless port gets wrong, each read rather than
+assumed.**
+
+- **The prefix is `attn`, not `self_attn`.** `DeepseekV4DecoderLayer` builds its
+  attention as `prefix=f"{prefix}.attn"`
+  (`vllm/models/deepseek_v4/nvidia/model.py:808-813`) under
+  `prefix=f"{prefix}.layers"` (`:1015`) and `maybe_prefix(prefix, "model")`
+  (`:1409`). Every published name is therefore `model.layers.<N>.attn...`, and
+  `LayerIndexOfName` (`runner.cpp:343-359`) resolves each to `<N>`. This is the
+  same class of trap as W1's branch order: the `## The geometry, derived from
+  source` section of this document says `{layer}.swa_cache` without fixing what
+  `{layer}` is, and the answer is not the `self_attn` every other architecture
+  in this tree uses.
+- **`kv_quant_mode` is passed on two of the four construction sites and not the
+  other two.** The SWA cache (`sparse_swa.py:100`) and the compressed latent
+  (`attention.py:644`) pass `get_kv_quant_mode(...)`, which returns
+  `FP8_PER_TENSOR` for any string starting with `fp8`
+  (`kv_cache_interface.py:70-71`). The indexer key cache (`attention.py:669-684`)
+  and the compressor state (`compressor.py:188-200`) pass nothing and default to
+  `NONE`. Mirrored exactly. This is what makes the published topology exercise
+  W1's branch-order guarantee on the real geometry: those two specs carry a
+  non-NONE quant mode AND `cache_dtype_str == "fp8_ds_mla"`, and our
+  `real_page_size_bytes` must reach the 584-byte branch before the quant-mode
+  guard throws.
+- **The indexer key cache and the compressor state carry NO `model_version` and
+  NO `cache_dtype_str`.** Both take the element formula, not the 584-byte
+  branch: `64 * 1 * 132 * 1 = 8448` and `4 * 1 * 2048 * 4 = 32768`. Only
+  `alignment` is passed on those two sites.
+- **The indexer key width is 132, not 68.** `use_fp4_kv` reads
+  `attention_config.use_fp4_indexer_cache`, whose default is `False`
+  (`vllm/config/attention.py:64`), so the FP8 branch
+  `head_dim + head_dim // quant_block_size * 4 = 128 + 128 // 128 * 4 = 132`
+  is the default (`attention.py:738`, `:751-760`). The MXFP4 68-byte arm is not
+  published and is named under `## Owed`.
+
+**The published page sizes, as literals, at `block_size = 256`.** The
+configured block size is 256 on this geometry for the reason
+`sparse_swa.py:76-83` and `compressor.py:174-178` both state: the C4A KV block
+shape `[256//4, head_dim] = [64, head_dim]` is what fixes the SWA block size at
+64 and the compressor block sizes at 4 and 8. Every number below is the value
+W1's formulas produce from the constructor arguments in the table above, and the
+test states them as literals so a change to any of them is a red test rather
+than a silently different pool.
+
+| # | `storage_block_size` | `real_page_size_bytes` | `page_size_bytes` (padded) |
+|---:|---:|---:|---:|
+| 1 | 64 | `64*584 = 37376` | 37440 |
+| 2 | 2 | `2*584 = 1168` | 1728 |
+| 3 | 64 | `64*1*132*1 = 8448` | 8640 |
+| 4 | 64 | `64*584 = 37376` | 37440 |
+| 5 | 4 | `4*1*2048*4 = 32768` | 32832 |
+| 6 | 4 | `4*1*512*4 = 8192` | 8640 |
+| 7 | 8 | `8*1*1024*4 = 32768` | 32832 |
+
+Groups 1 and 4 reach 37440 by different routes — an `MLAAttentionSpec` at
+`block_size=256, compress_ratio=4` and a `SlidingWindowMLASpec` at
+`block_size=64, compress_ratio=1` — and upstream fixes the SWA block size at 64
+precisely so that they agree (`sparse_swa.py:76-83`, the shared physical
+tensor). The test asserts the equality directly, not only the two values.
+
+**`block_size` is refused rather than mis-sized.** `storage_block_size` is
+`block_size / compress_ratio`, so a `block_size` that is not a multiple of 128
+gives the C128A group a `storage_block_size` of 0 and a zero-byte page.
+Upstream has no such check because its own comments derive the whole geometry at
+256; ours refuses by name in `MakeDeepseekV4KVCache`, naming 128 and the two
+upstream comments. That refusal is the reason a wrong engine block size is a
+loud failure here rather than a zero-sized pool.
+
+**Byte-neutrality, proved rather than asserted.** This wave changes no spec
+class and no page formula, so no existing page size can move; what could move is
+the runner's behaviour for every model and `spec_equal`'s partition. Both are
+pinned directly:
+
+- The tolerated group shapes are enumerated in a test: `{target attention}`,
+  `{target attention, recurrent}`, `{target attention, recurrent, fa_draft}`
+  all construct, and each of `kSlidingWindowMla`, `kSlidingWindow`,
+  `kChunkedLocalAttention` and a second `kMlaAttention` group refuses.
+- Every KV-cache factory shipping today publishes exactly the groups the runner
+  consumes — asserted as literals over the seven `MLAAttentionSpec` call sites'
+  registries plus the hybrid registries, so the refusal cannot fire for them.
+- `spec_equal`'s existing arms keep their answers; the two new arms are red-first
+  from a pair of identical specs that compares unequal today.
+
+**Nothing published is consumed, and the commit says so.** No `attn_kv` reaches
+`DeepseekV4Model::Forward`, no runner allocates any of the seven groups, and the
+refusal is what makes that visible rather than silent. Reachability is owed to
+W3 and W5 under [#1925](https://github.com/mudler/vllm.cpp/issues/1925), and
+listed under `## Owed`.
+
 ### The speed question, answered
 
 **No. A server-side tok/s measurement of DeepSeek-V4 is not meaningful before
@@ -692,6 +911,355 @@ the two vehicles do not compute the same function.
 Deliberately not stated: how much faster a cached path would be. Nothing here
 measured anything, no GPU was leased for this spike, and an estimate would be the
 "a number quoted often becomes treated as measured" failure.
+
+### W2 gate result — G1's oracle side was NOT run, and is PENDING on a named resource ([#1973](https://github.com/mudler/vllm.cpp/issues/1973))
+
+`## Gates` declares **G1** as the gate available at W2 and calls it "the gate
+that would have caught the stub". G1 has two sides: dump upstream's 167-entry
+spec set by instantiating the four `get_kv_cache_spec` sites, and dump ours from
+`MakeDeepseekV4KVCache`, then compare entry for entry.
+
+**Only our side was executed.** `tests/vllm/models/test_deepseek_v4_scaffold.cpp`
+runs `MakeDeepseekV4KVCache` and pins every published entry as a LITERAL — group
+count, layer names, `block_size`, `storage_block_size`, `head_size`, dtype,
+`sliding_window`, `compress_ratio`, `alignment`, `cache_dtype_str`,
+`model_version`, `kv_quant_mode`, `real_page_size_bytes`, `page_size_bytes` —
+and its case comment calls itself G1 "on the half that needs no checkpoint, no
+GPU and no forward". That framing is worth tightening rather than repeating: the
+expected values are READ from upstream construction sites at the pin, and
+`RealConfig()` is itself a transcription of the artifact's `config.json`. Both
+sides of that comparison are therefore source inspection. It is real evidence
+against a stub and against drift, and it is not the oracle execution `AGENTS.md`
+asks for when it says to check every change in two ways.
+
+MEASURED on 2026-08-26, on the host this wave was gated on, rather than assumed:
+
+- **`vllm.models.deepseek_v4.attention` does not import here.** `cbor2`,
+  `pyzmq`, `msgspec` and `cloudpickle` are absent from the ambient environment
+  and were installed into a scratch virtual environment; the import then stops
+  at `ImportError: cannot import name 'ALLOWED_LAYER_TYPES' from
+  'transformers.configuration_utils'`, because the installed `transformers`
+  predates the API the pin uses. Repairing that is a dependency resolution
+  against the pin, not a step this wave can take incidentally.
+- **No DeepSeek-V4-Flash `config.json` is present.** Neither the host's
+  HuggingFace cache nor the NAS mount carries one, so the config G1 is a pure
+  function of is not on this box either. `docs/USAGE.md` names the artifact repo
+  `0xSero/deepseek-v4-flash-0731-spark` @
+  `22f28d32b9b29b4352eaa380ff8c2c170b2847ab`.
+
+So G1's result at W2 is **PENDING on a named resource** — a vLLM environment at
+the pin that imports `vllm.models.deepseek_v4`, plus that repo's `config.json`.
+It is not satisfied, and it is not waived. Listed under `## Owed`.
+
+### W3 design — the runner carries every published group, and a third forward channel ([#2068](https://github.com/mudler/vllm.cpp/issues/2068))
+
+Committed before the implementation. Upstream paths are under
+`/home/mudler/_git/vllm` at the pin `5559679229bc961848b121ccdeaa8fa5d79bec98`.
+
+**What W3 changes, and what it deliberately does not.** It makes
+`GPUModelRunner::initialize_kv_cache` allocate a buffer for **every published
+cache** rather than one per hidden layer, generalizes the two group ids and the
+three-valued `LayerKvClass` that record the routing, and adds the third
+`ModelForwardInput` channel that `## Why our KV interface cannot represent it`
+item (5) says is absent. It does **not** make any model read a cache (W5), and
+it does not touch the block-table geometry or the uniform-`block_size`
+assertion in `HybridKVCacheCoordinator` (W4).
+
+**Upstream has no equivalent generalization to port, and that is the reason the
+design is ours.** Upstream's runner allocates per registered layer NAME from the
+start: `get_kv_cache_spec()` walks every `AttentionLayerBase` in
+`compilation_config.static_forward_context` and returns a `dict[str, KVCacheSpec]`
+keyed by prefix (`vllm/v1/worker/gpu_model_runner.py:7785-7801`), and one C4A
+layer contributes four separate keys —
+`{layer}`, `{layer}.swa_cache`, `{layer}.indexer.k_cache`,
+`{layer}.compressor.state_cache`. There is no "one cache per layer" assumption
+anywhere to relax. Ours indexes buffers by layer POSITION, so what is mirrored
+here is the KEY: the third channel carries the upstream
+`static_forward_context` name beside each cache, because that is what upstream
+addresses a cache by and it is the only key that can distinguish four caches on
+one layer.
+
+#### 1. The entry predicate, and why byte-neutrality is by construction
+
+The generalized path is entered **only** when the published topology is one the
+old path could not carry. The predicate is exactly the set W2's refusal already
+computes (`src/vllm/v1/worker/gpu/runner.cpp:630-690`): after selecting the
+target attention group, the recurrent group and the single `fa_draft` slot, is
+any published group left over?
+
+- **No leftovers ⇒ the legacy path runs, unchanged.** Every model shipping
+  today lands here, so its allocation, its views, its backend selection, its
+  `layer_kv_class()` and its `ModelForwardInput` are byte-for-byte what they are
+  before this change. This is the `per_layer_attn_specs` contract
+  (`include/vllm/v1/kv_cache_interface.h:538-556`) applied to the group set
+  instead of the layer list: empty means "nothing new", and nothing new means no
+  new code runs.
+- **Leftovers ⇒ the multi-cache path runs.** DeepSeek-V4 is the only producer in
+  the tree.
+
+**The shipped population, re-derived by sweep at base `c714b0234` rather than
+inherited from W2's record:** 36 group-emplacement sites across 31 factory files
+— **25 `FullAttentionSpec`, 7 `MLAAttentionSpec`, 3 `MambaSpec`, 1
+`SlidingWindowMLASpec`**. By runtime shape: 27 single-group factory FILES,
+`kimi_linear` (MLA + Mamba), `nemotron_h` (FA + Mamba), `qwen3_5_common`
+(FA + Mamba + a `"fa_draft"` FA behind `if (num_spec > 0)`) and `deepseek_v4`
+(up to seven groups from two `emplace_back` sites inside the `add_mla` /
+`add_swa_mla` lambdas). The count differs from W2's `34 across 32` because W2
+itself added the two DeepSeek-V4 sites. Only `deepseek_v4` has leftovers.
+
+**FILES, not architectures, and the difference is 7.** Several single-group
+files back more than one `REGISTER_VLLM_MODEL`: `gemma4`/`gemma4_unified`,
+`olmo2`/`olmo3`, `llama_dense`/`internlm3_llama`,
+`muse_glimmer`/`muse_glimmer_mm`, the three parakeets, and
+`llama_model_embedding` reusing `MakeLlamaForCausalLMKVCache`. Counted by
+REGISTERED ARCHITECTURE the population is **42 total = 34 single-group + 7
+multi-group + 1 that publishes nothing** (`qwen4_exp`, whose `MakeQwen4ExpKVCache`
+throws by name). The 7 multi-group archs are the four `qwen3_5_*` registrations
+sharing `qwen3_5_common`, plus `nemotron_h`, `kimi_linear` and `deepseek_v4`.
+Both denominators are stated because the byte-neutrality argument is about
+FACTORIES (the code that emplaces groups) while the blast radius is about
+ARCHITECTURES (what a user can actually load).
+
+**Every reachable `deepseek_v4` config is multi-cache, and seven is the MAXIMUM
+rather than the count.** `add_mla` / `add_swa_mla` return early on an empty name
+list, so the published group count is a function of the checkpoint's
+`compress_ratios`: it ranges over **1..7**. The floor is not a uniform topology
+— a config whose every layer has `ratio == 1` publishes ONE group, the SWA
+group, and that group is a `SlidingWindowMLASpec`, so `full_attn_group_id_`
+never binds to it and it is itself the leftover that turns the entry predicate
+on. There is no DeepSeek-V4 config that takes the legacy path.
+
+#### 2. The generalized ids
+
+`attn_group_ids_` (`std::vector<int>`) holds every non-eagle group whose spec is
+an `AttentionSpec`, in publication order; `recurrent_group_ids_` holds every
+`kMamba` group. `full_attn_group_id_` and `gdn_group_id_` survive as the FIRST
+of each — the same value they hold today on every uniform topology, since today
+they are already "the first non-eagle attention group" and "a Mamba group". They
+are kept rather than replaced because eleven call sites outside
+`initialize_kv_cache` read them and none of them means anything different.
+
+#### 3. `LayerKvClass` gains a fourth value, and a per-layer index list
+
+`kMultiCache = 3` means: **this layer's caches are not described by the
+positional `attn_kv[fa_idx]` convention** — read `layer_attn_kv_indices()[l]`
+instead, which lists this layer's indices into `attn_kv()`. A DeepSeek-V4 C4A
+layer has four entries there; layers 0 and 1 have one (the SWA cache alone,
+`attention.py:626-630` returning `None` for `compress_ratio <= 1`) and are still
+`kMultiCache`, because one cache reached by name is not the same thing as one
+cache reached by position. `layer_attn_kv_indices()` is **EMPTY on the uniform
+path**, which is the same empty-means-unchanged contract as (1).
+
+#### 4. Allocation over every published group
+
+For each attention group `g` and each of its published layer names, in
+publication order: one `CacheBuffer` of `num_blocks * spec->page_size_bytes()`,
+and one `PagedKvCache` view carrying **that group's own** `block_size`,
+`num_kv_heads`, `head_size` and `dtype`. The per-entry `block_size` is the one
+new field on the runner's internal `FaDims`; in the legacy path every entry gets
+the single `fa_block_size` it uses today, so the view is byte-identical.
+
+`page_size_bytes()` is the single allocation accessor every `AttentionSpec`
+inherits and **none of them overrides**, so the rule here is
+`dynamic_cast<const AttentionSpec*>` rather than a kind whitelist. It is defined
+once, on `AttentionSpec` itself (`vllm/v1/kv_cache_interface.py:196-201`), and
+all eleven `AttentionSpec` subclasses at the pin take it as inherited. The
+anchor is stated **with its class** rather than by line alone because the name
+is not unique in that file: `page_size_bytes` is also defined on `KVCacheSpec`
+(`:109`), `MambaSpec` (`:699`) and `UniformTypeKVCacheSpecs` (`:828`), beside
+the confusable `unpadded_page_size_bytes` (`:185`) and `real_page_size_bytes`
+(`:204`). The VALUE it returns is emphatically kind-**dependent** — five
+subclasses override `real_page_size_bytes`, and `_apply_alignment_padding`
+(`:345-351`) is typed `MLAAttentionSpec | SlidingWindowMLASpec`, an MLA-only
+hook. A uniform ACCESSOR over a kind-dependent value is precisely what makes
+the cast a sound stand-in for a whitelist; "kind-independent", which an earlier
+draft of this section and of `runner.cpp` said, would have been an argument
+against it.
+That is also what makes the path additive for `kSlidingWindow` and
+`kChunkedLocalAttention`, which no registry builds today.
+
+A `kMamba` group in a multi-cache topology keeps the existing recurrent
+allocation, driven by `gdn_group_id_` and its by-name layer mask; its layers stay
+`kRecurrent`. Nothing in the tree publishes that shape, and it is supported
+rather than refused because expressing it costs one loop split and refusing it
+would be a hole the next hybrid falls into.
+
+`fa_page_size_bytes()` keeps reporting the TARGET group's page, and
+`kv_cache_allocated_paged_bytes()` sums every buffer allocated, which on the
+multi-cache path is all 167 of them.
+
+#### 5. `is_mla` means "fused single-vector cache", not "kind is kMlaAttention"
+
+The view loop's `is_mla` flag selects the fused 3-dim expected KV shape and the
+tolerant MLA backend resolution over the dense NHD 5-dim and the loud dense
+resolution. `SlidingWindowMLASpec` holds one vector rather than K + V —
+`compressor.py:193` says exactly that beside the constructor, and W1's
+`real_page_size_bytes` multiplies `head_size` alone for it — so it belongs on the
+fused side. The flag therefore becomes `kMlaAttention || kSlidingWindowMla`.
+Unreachable on the legacy path, because a `kSlidingWindowMla` group there is a
+leftover and the leftover set is what selects the other path.
+
+#### 6. The third channel
+
+```
+struct MultiKvCacheIndex {   // model_registry.h, beside MultiModalForwardInput
+  const std::vector<std::string>* layer_names;   // parallel to attn_kv
+  const std::vector<int32_t>* group_ids;         // parallel to attn_kv
+  const std::vector<int32_t>* layer_indices;     // parallel to attn_kv
+  int64_t Find(std::string_view layer_name) const;   // -1 when absent
+};
+```
+
+and `const MultiKvCacheIndex* multi_kv = nullptr;` on `ModelForwardInput`, set
+after aggregate construction exactly as `device_token_ids` is, so no positional
+initializer moves. `nullptr` on every uniform model, which is what keeps every
+existing forward byte-identical.
+
+`layer_names[i]` is upstream's `static_forward_context` key verbatim — the same
+string `MakeDeepseekV4KVCache` publishes, e.g. `model.layers.7.attn.indexer.k_cache`.
+`Find` is a linear scan; the list is 167 entries and a forward looks a name up
+once per layer per role, so an index structure would be premature. Recorded so
+it is a decision rather than an oversight.
+
+#### 7. The channel is READ by production code, and that is what keeps it alive
+
+A channel nobody reads is dead code with a disclosure attached. `ModelRegistry::Forward`
+(`src/vllm/model_executor/models/model_registry.cpp:376-379`) — the shared
+decode seam AGENTS.md routes every forward through — therefore **refuses** when a
+multi-cache index arrives, because no registered forward consumes one yet. The
+refusal reads the channel's payload rather than its nullness: it names how many
+caches arrived, how many distinct groups they came from, and the first layer
+name, so a mutation that empties the channel changes the message.
+
+**What this changes for a DeepSeek-V4 run, stated rather than implied.** Before
+W3, `LoadedEngine` construction throws inside `GPUModelRunner::initialize_kv_cache`.
+After W3 it constructs and allocates all 167 buffers, and the FIRST forward
+refuses naming W5. The engine still cannot serve, and it is one seam further
+along, with the allocation now genuinely exercised on a production path rather
+than gated as a function. (At the default `--block-size` 32 neither refusal is
+what a run reads: `check_ratio_fits(128)` in the factory throws first, as
+`### W2 design` records. `--block-size` 128 or 256 reaches this path.)
+
+#### 8. W2's refusal is kept, and here is what still reaches it
+
+It becomes unreachable for DeepSeek-V4 and stays reachable for a topology the
+generalized path cannot represent:
+
+- a group whose published layer names do not ALL resolve to distinct in-range
+  layer indices (`GroupLayerMask` is all-or-nothing by design);
+- a second `kMamba` group;
+- a group whose spec is neither an `AttentionSpec` nor a `MambaSpec`.
+
+It is not deleted, and the reason is not caution: those three shapes are
+reachable from any future registry and a silently short KV allocation is a
+wrong-tokens failure rather than a crash. Its message gains the three cases
+above so it names what it now means.
+
+#### 9. Tests, each red before the implementation
+
+In `tests/vllm/v1/worker/test_runner.cpp` (the runner's own production
+constructor — `LoadedEngine` builds a `GPUModelRunner` through it and
+`initialize_kv_cache` is private) and
+`tests/vllm/models/test_deepseek_v4_scaffold.cpp` (through
+`reg.factory->make_kv_cache`, the pointer `MakeKVCacheResolved` dereferences).
+
+| case | what it pins |
+|---|---|
+| a DeepSeek-V4-shaped multi-cache config allocates EVERY published cache | `attn_kv().size()` == the sum of the groups' name counts, not the hidden-layer count |
+| each cache's view geometry is its OWN group's | `block_size`, `num_kv_heads`, `head_size`, `dtype` per entry, as literals |
+| per-layer routing | `layer_kv_class()` == `kMultiCache` on named layers, `kNone` on unnamed; `layer_attn_kv_indices()[l]` lists exactly that layer's caches |
+| the generalized ids | `attn_group_ids()` lists every attention group; `full_attn_group_id()` is still its first |
+| byte-neutrality, the four shipped shapes | the four `## the group shapes shipped today still construct` subcases keep `attn_kv().size()`, `layer_kv_class()`, `fa_page_size_bytes()` and `kv_cache_allocated_paged_bytes()` at LITERAL values |
+| the legacy path is not entered by the new code | `layer_attn_kv_indices()` EMPTY and `multi_kv` null for every uniform config |
+| the third channel arrives populated | names parallel to `attn_kv`, `Find` resolves a published name and returns -1 for an absent one |
+| `ModelRegistry::Forward` refuses a multi-cache index | the message names the count, the group count and the first name |
+| W2's refusal still fires | an unresolvable-name group, a second `kMamba` group |
+| the real topology, end to end | `reg.factory->make_kv_cache(RealConfig(), 256, N)` fed to the runner constructor allocates 167 buffers whose page sizes are the literals W2 pinned |
+
+**Reachability mutation** (`.agents/reachability.md`): repoint the entry
+predicate at "always uniform" in a scratch copy and the focused gate goes red,
+because the 167 buffers become 43. That is the production call site, not a
+`-Werror unused-function` artefact.
+
+**The full gate includes the SACRED `test_qwen35_paged_engine` regression**,
+because the byte-neutrality obligation of this wave reaches every model.
+
+**W3 evidence.** Measured in
+`/home/mudler/.cache/sdd/mudler-vllm.cpp/kv-w3` on the implementation tree,
+CPU Release, `cmake -DVLLM_CPP_CUDA=OFF`, named targets only.
+
+| what | result |
+|---|---|
+| red before, API | `ninja rc=1` at step `511/513`; `'class vllm::v1::GPUModelRunner' has no member named 'attn_kv_layer_names'`, `... 'multi_kv_index'`, `... 'layer_attn_kv_indices'`, `... 'attn_group_ids'; did you mean 'gdn_group_id'?`, `... 'recurrent_group_ids'`, and `'kMultiCache' is not a member of 'LKC'` |
+| red before, BEHAVIOUR (the API landed, the logic did not) | `ninja rc=0` at `128/128`; 5 cases red / 2 assertions failed, four of them the W2 refusal firing: `runner: 6 published KV cache group(s) get NO cache from this runner ... group 3 kind=kSlidingWindowMla layers=43 first='model.layers.0.attn.swa_cache' page_size_bytes=37440` |
+| green after | `ninja rc=0` at `3/3`; `test_runner` 27 cases / 784 assertions, 0 failed |
+| affected suites | the 49 buildable suites that include `worker/gpu/runner.h` or `models/model_registry.h` plus the KV-cache and speculative suites: `ninja rc=0` at `84/84`, `ctest rc=0`, 48 passed and 1 Skipped. **Four report ZERO doctest assertions** and are checkpoint-gated skips wearing a pass: `test_deepseek_v2_paged_engine`, `test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e` and `test_qwen35_paged_engine`. The 45 that carry assertions are the evidence, led by `test_dots3_note_scaffold` 110819, `test_single_type_kv_cache_manager` 77643, `test_qwen3_8_text_only` 67855, `test_nemotron_h_scaffold` 38311, `test_muse_glimmer_wiring` 10317, `test_nemotron_h_paged_forward` 3269, `test_model_registry` 958, `test_runner` 784, `test_deepseek_v4_scaffold` 669 |
+| SACRED `test_qwen35_paged_engine` | **SKIPPED (exit 77), which is NOT a pass.** Its own message: `qwen3.5-0.8B: models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision 2fc06364 not cached — this gate runs where the ROCm oracle was captured (gfx1100)`. Neither the checkpoint nor the NAS mount is on this host and the gate's own host is a different box, so it is PENDING on a named resource rather than satisfied |
+| full `ctest` | NOT run. The tree has 593 test targets and a bare `ninja -C build` links every one of them; the disk stood at 77-78 GiB free and this box has hit ENOSPC on that before. Stated rather than implied |
+| byte-neutrality, structurally | `git diff -w` on `runner.cpp` is `241 insertions(+), 18 deletions(-)` against `341/118` without `-w`: the whole legacy allocation loop is unchanged content that moved one indentation level into an `else` |
+
+Twelve mutations, each verified by grep to have LANDED before building, each
+recorded with ninja's rc AND its step count because a build that failed would
+re-run the previous binary and read as a pass, each restored with sha256 verified
+equal and rebuilt. The gate is `test_runner` unless stated.
+
+| mutation | ninja | run | verdict |
+|---|---|---|---|
+| **REACHABILITY** the entry predicate always answers "uniform" | rc=0, 3 steps | 3 cases red, 22 assertions failed, then SIGSEGV | RED |
+| **REACHABILITY** `forward_input.multi_kv = &multi_kv_index_` deleted | rc=0, 3 steps | 1 case red, 4 assertions failed | RED |
+| **REACHABILITY** `.make_kv_cache` repointed at a pre-W2 one-group placeholder | rc=0, 4 steps | `test_runner` 1 case / 1 assertion; `test_deepseek_v4_scaffold` 3 cases / 6 assertions | RED |
+| every entry is sized from the TARGET group's page | rc=0, 3 steps | 2 cases red, 3 assertions failed | RED |
+| the view uses the single `fa_block_size` | rc=0, 3 steps | 1 case red, 7 assertions failed | RED |
+| a multi-cache layer is classed `kFullAttention` | rc=0, 3 steps | 3 cases red, 49 assertions failed | RED |
+| the group refusal is always true | rc=0, 3 steps | 1 case red, 14 assertions failed | RED |
+| the channel is published on the UNIFORM path too | rc=0, 3 steps | 21 cases red | RED |
+| the group predicate is a kind whitelist instead of `AttentionSpec` | rc=0, 3 steps | 4 cases red, 15 assertions failed | RED |
+| the multi-cache path drops its recurrent group | rc=0, 3 steps | 1 case red, 2 assertions failed | RED |
+| every entry is published under the same name | rc=0, 3 steps | 3 cases red, 23 assertions failed | RED |
+| `ModelRegistry::Forward`'s refusal is disabled | rc=0, 3 steps | 1 case red, 4 assertions failed | RED |
+
+The first reachability mutation SIGSEGVs rather than failing cleanly, and that is
+recorded rather than smoothed: with the predicate off, the ten-cache config
+allocates four buffers and the views and the block table no longer describe the
+same object. It is still a red — the gate does not go green — and it is the shape
+of the failure the predicate prevents.
+
+
+### W3 repair-round evidence
+
+The fresh review PASSED the code change and returned six findings. Measured on
+the REPAIR head, which carries both `origin/main` merges (`94238fc52` and
+`f586757d8`, the second bringing #2008's request-scoped draft context and with it
+a relevant suite the implementation round did not have,
+`test_dflash2_concurrency`). Same host, same CPU Release configuration, named
+targets only.
+
+| what | result |
+|---|---|
+| red before the eagle clause (#2084) | `ninja` reached its link step at `2/2` — the exit code was NOT captured on that one invocation (a `zsh` `PIPESTATUS` slip), and it is recorded that way rather than asserted; the stronger proof that the binary was not stale is that the run REPORTED THE NEW SUBCASE BY NAME. `test_runner` 1 case red / 5 assertions failed, led by `CHECK_THROWS_AS( construct(kv), std::runtime_error ) did NOT throw at all!` — the silent-subset shape arriving as a NON-REFUSAL rather than as a wrong count. The mutation row below is the properly instrumented form of the same red |
+| green after | `ninja rc=0` at `3/3`; `test_runner` **27 cases / 791 assertions**, 0 failed. The `+7` against the implementation round's 784 is exactly the new subcase's seven checks; the case count is unchanged because a `SUBCASE` adds no case |
+| the eagle clause, mutated back out of the LANDED tree | mutation verified to have landed by sha256 delta (`868e3dc0…` → `4ef5bbb0…`); `ninja rc=0` at `3/3`; **1 case red / 5 assertions failed**; restored, sha256 verified equal to `868e3dc0…`, rebuilt `rc=0` at `3/3`, back to 27/791 |
+| affected suites, re-derived on THIS head | 71 targets — the 68 buildable suites including `worker/gpu/runner.h`, `models/model_registry.h` or `v1/kv_cache_interface.h`, plus `test_dflash2_concurrency`, `test_qwen35_paged_engine` and `test_deepseek_v2_paged_engine`. Run TWICE, and the second run is the one that counts: first at the repair tree before the third `origin/main` merge (`ninja rc=0` at `131/131` then `5/5`), then again on the merged head **`223dc1446`** after #2071 landed `dots3_note.cpp` and `test_ops_mla_prefill.cpp` into it (`ninja rc=0` at `64/64`). **Both runs: 70 exit 0, 1 exits 77, the same three zero-assertion suites.** Re-run rather than carried forward, because the finding this round repairs is precisely a gate result quoted against a tree it was not measured on. Disk 90-95 GiB free throughout |
+| zero-assertion passes | **THREE**, named rather than counted as evidence: `test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e`, `test_deepseek_v2_paged_engine`. Fewer than the implementation round's four only because `test_qwen35_paged_engine` is on its own line below |
+| SACRED `test_qwen35_paged_engine` | **STILL SKIPPED (exit 77), which is NOT a pass**, and unchanged by this round: `qwen3.5-0.8B: models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision 2fc06364 not cached — this gate runs where the ROCm oracle was captured (gfx1100)`. PENDING on a named resource |
+| baselines preserved | `test_deepseek_v4_scaffold` 8/669, `test_model_registry` 24/958, `test_kv_cache_coordinator` 21/142, `test_kv_cache_interface` 43/225, `test_dflash2_concurrency` 2/21 — each the count it held before the repair. `test_runner` is the ONLY suite whose count moved, and the delta is accounted above |
+| `scripts/agent-preflight.sh` | rc=0, no FAIL line, both plain and `--staged` |
+| `test_dots3_note_scaffold`, `test_ops_mla_prefill` | the two suites #2071 moves, re-run on the merged head: 26 cases / 110819 assertions and 7 cases / 329772 assertions, both `rc=0` |
+| full `ctest` | STILL NOT run, for the same reason: the tree has 601 test targets and a bare `ninja -C build` links every one |
+
+**What each finding cost.** Finding 1 (#2084) is the only one that changed
+behaviour — one `else if` clause, one subcase, and the "three shapes" comment.
+Finding 2 rewrote a comment that claimed a refusal the code does not perform and
+added an `## Owed` item, rather than a `VT_CHECK` that no test surface can drive
+red. Finding 3 re-anchored `page_size_bytes` from `:337-351` to `:196-201` and
+replaced "kind-independent", which the cited region actually argues against;
+`compressor.py:194`→`:193` and `:288-293`→`:290-295` were corrected in all five
+files that carry them rather than only in W3's own prose, because a repaired
+anchor beside four unrepaired copies of the same one is worse than either.
+Findings 4 and 5 are record repairs, made while the append-only index row is
+still correctable. Finding 6 is #2085, owed with its own line.
+
+
 
 ## Gates
 
@@ -790,6 +1358,133 @@ config parse and upstream's disagree about the layer partition (that would be a
   exist. W1 landed the page formula the refusal names as missing.
 - [#1960](https://github.com/mudler/vllm.cpp/issues/1960) — W1. Owned by this
   row, closed by W1.
+- [#1973](https://github.com/mudler/vllm.cpp/issues/1973) — W2. Owned by this
+  row, closed by W2.
+- [#1974](https://github.com/mudler/vllm.cpp/issues/1974) — `spec_equal`'s
+  missing `kMlaAttention` / `kSlidingWindowMla` arms. Owned by this row, FIXED
+  IN FLOW with W2 and closed by it. Listed rather than omitted because the index
+  row has to name an owner.
+- **The published topology is ALLOCATED by W3 and still UNREAD.** W2 wrote this
+  item as "UNREACHED": nothing allocated the seven groups and nothing read them.
+  W3 closes the first half — the runner now builds a `PagedKvCache` for each of
+  the 167 entries and hands them to the forward through
+  `ModelForwardInput::multi_kv` — and leaves the second: `DeepseekV4Model::Forward`
+  still discards `attn_kv`, and `ModelRegistry::Forward` refuses rather than let a
+  multi-cache topology be silently ignored. Owned by this row, remainder falls due
+  at **W5**. Tracked under
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+  [#1973](https://github.com/mudler/vllm.cpp/issues/1973) and
+  [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
+- **The runner tolerates a second `kFullAttention` group on its KIND, not on
+  `spec_on()`.** W2's refusal mirrors the draft-KV allocation loop's own
+  predicate (`src/vllm/v1/worker/gpu/runner.cpp:1128-1130`), so a `fa_draft`
+  group published with speculation OFF is still tolerated and still unallocated.
+  Owned by this row. W2 dated this **W3**; **W3 did NOT close it**, and that is
+  recorded rather than quietly dropped. W3's generalized path is entered only when
+  a topology has groups the legacy path leaves over, and a `fa_draft` group
+  published with speculation OFF is still absorbed by the kind-based draft-slot
+  arm, so the legacy path still runs and the group is still unallocated. Closing
+  it means making the draft slot depend on `spec_on()`, which changes behaviour on
+  the SACRED speculative path and belongs to a wave that gates that path rather
+  than to one whose obligation is that nothing about it moves. **Re-dated to
+  W4.**
+- **Only the `fp8_ds_mla` arm of the topology is published.** Upstream selects
+  between a 576B-aligned `fp8_ds_mla` geometry and a 512B-aligned plain
+  bf16/fp8 geometry on `use_fp8_ds_mla_layout` (`attention.py:140`,
+  `nvidia/flashinfer_sparse.py:163`); W2 publishes the default `fp8_ds_mla` arm
+  unconditionally because our factory signature carries no cache dtype and
+  `ParseCacheDType` refuses the string by name
+  (`include/vllm/v1/kv_cache_dtype.h:87-90`). The second arm, and the MXFP4
+  68-byte indexer width (`attention.py:751-755`), are owed to **W5** together
+  with the store path.
+- **G1, this row's own topology gate, has NOT been run.** `## Gates` calls it
+  "the gate that would have caught the stub", and W2 published the topology
+  gated by literals read from upstream source rather than by a dump from the
+  running oracle. PENDING on a named resource — a vLLM environment at the pin
+  that imports `vllm.models.deepseek_v4`, plus the artifact repo's
+  `config.json`, neither of which is on the host this wave was gated on. The
+  blockers are measured in `### W2 gate result — G1's oracle side was NOT run,
+  and is PENDING on a named resource`. Owned by this row; falls due at the next wave that has
+  that environment, and W7 needs it anyway. Tracked under
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925).
+
+- [#2068](https://github.com/mudler/vllm.cpp/issues/2068) — W3. Owned by this
+  row, closed by W3.
+- [#2076](https://github.com/mudler/vllm.cpp/issues/2076) — `ENG-MOE-LOADSTREAM`
+  cites `model_registry.cpp:411` for `ModelSource::FromSafetensorsOwned`, a
+  symbol that at base `c714b0234` sits at line **211** in a **392**-line file, so
+  the cited line is **19** lines past the end of the file. PRE-EXISTING; W3's 63
+  added lines pushed the file past 411 (and moved the symbol to **213**, which is
+  the value the repaired citation carries), so the anchor moved from the `broken`
+  bucket to the `stale` one and the ratchet fired. Owned by this row, FIXED IN
+  FLOW with W3 and closed by it. Listed rather than omitted because the index row
+  has to name an owner. **The three numbers in this entry were wrong when first
+  written** — "402-line file", "198 lines past the end", and line 213 attributed
+  to the base rather than to W3's head — and 198 is in fact the distance from the
+  symbol at W3's head to 411, not any distance to the end of the file. Corrected
+  here, in `.agents/issue-index.md` and in the pull request body before the squash
+  made the index row uncorrectable.
+- **The third forward channel is CARRIED and READ, but no model CONSUMES it.**
+  `ModelForwardInput::multi_kv` reaches every registered forward and
+  `ModelRegistry::Forward` refuses when one arrives, because no forward knows
+  what to do with a cache set keyed by layer name. Owned by this row, falls due
+  at **W5**, which replaces the refusal with `DeepseekV4Model::Forward` /
+  `ForwardDevice` reading the caches instead of `(void)attn_kv`. Tracked under
+  [#1925](https://github.com/mudler/vllm.cpp/issues/1925) and
+  [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
+- **The KV sizing helpers still count one page per hidden layer.**
+  `KVBytesPerBlock` and `recurrent_state_bytes` (FIX-KV-GROUP-LAYER-COUNT,
+  [#1963](https://github.com/mudler/vllm.cpp/issues/1963) /
+  [#1966](https://github.com/mudler/vllm.cpp/issues/1966)) derive the pool budget
+  from the layer count, which is 43 where W3 now allocates 167 buffers at four
+  different page sizes. Nothing regresses today, because a DeepSeek-V4 engine
+  refuses at its first forward and no other model has a multi-cache topology, but
+  a `--kv-cache-memory` budget on the multi-cache path would be wrong. Owned by
+  this row, falls due at **W4** with the rest of the non-uniform-`block_size`
+  geometry. Tracked under [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
+- [#2084](https://github.com/mudler/vllm.cpp/issues/2084) — an EAGLE
+  `AttentionSpec` group on a multi-cache topology passed W3's narrowed refusal
+  and then received no buffer, because `attn_group_ids_` excludes
+  `is_eagle_group` and the refusal loop never tested it: nine of ten published
+  caches allocated, in silence. A fourth shape, where the comment said three.
+  Owned by this row, FIXED IN FLOW with W3 and closed by it — the refusal gained
+  an eagle clause and `test_runner`'s refusal case gained a subcase that is red
+  without it. Listed rather than omitted because the index row has to name an
+  owner.
+- [#2085](https://github.com/mudler/vllm.cpp/issues/2085) — **the multi-cache
+  view geometry contradicts the page it is built over.** Each buffer is
+  `num_blocks * spec->page_size_bytes()` while its `FaDims` view is built from
+  `spec->block_size`, and for a spec whose page derives from a
+  `storage_block_size` the two disagree: the DeepSeek-V4 C4A latent
+  (`block_size` 256, `compress_ratio` 4) has a **37440**-byte page while the view
+  declares `{num_blocks, 256, 512}` = **131072** bytes per block, 3.5x what the
+  page holds. `CheckKvCacheShape` cannot see it, because it compares the
+  backend's declared shape against that same view metadata and so measures
+  self-consistency rather than agreement with the allocation. INERT today:
+  `ModelRegistry::Forward` refuses a multi-cache index before any kernel reads a
+  view. Owned by this row, falls due at **W5** with the store path, because
+  resolving it is entangled with two things W3 cannot settle — the `fp8_ds_mla`
+  584 B/token layout is not expressible in `PagedKvCache` at all, and
+  `tests/vllm/v1/worker/test_runner.cpp:1881` pins `block_size == 256` for that
+  entry as a literal, a value the resolution may have to contradict. Given its
+  own entry rather than folded into the W4 non-uniform-`block_size` item above:
+  that item is about POOL BUDGETING (`KVBytesPerBlock` counting one page per
+  layer) and this one is about the VIEW a kernel would index off.
+- **Speculation turns ITSELF off on a multi-cache topology, and says nothing.**
+  The draft-KV block is guarded by `!multi_cache_topology` so it cannot
+  double-allocate a group the generalized loop already allocated; with
+  `multi_cache_topology && spec_on()` the consequence is that `draft_attn_buf_`
+  stays empty and `propose_drafts_block` returns early on
+  `draft_attn_kv_.empty()`. That costs throughput and never tokens — no drafts
+  means ordinary decode, which is the output the speculative path is required to
+  produce — but it is a silent degradation, and W3's comment originally called
+  the guard a refusal it is not. The comment now states the behaviour; making it
+  a real `VT_CHECK` is owed, and is not done at W3 because no test surface can
+  reach `spec_on()` on this path (the weights-based `GPUModelRunner` ctor takes
+  no `SpeculativeConfig`), so the refusal could not be driven red. Owned by this
+  row, falls due at **W4** with the `fa_draft`-on-`spec_on()` item above, which
+  is the same seam. Tracked under
+  [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
 ## Evidence
 

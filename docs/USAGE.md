@@ -57,6 +57,25 @@ build/examples/vllm-server \
   --max-num-seqs 32
 ```
 
+On a hybrid model -- one that interleaves linear-attention (GDN/Mamba) layers
+with full-attention layers, such as the Qwen3.5 and Qwen3.6 families --
+`--max-num-seqs` is a ceiling rather than a promise. Each concurrently served
+sequence owns one recurrent state per linear-attention layer, and under
+speculative decoding it owns `num_speculative_tokens + 1` of them, so the engine
+bounds the number of seats by what the KV pool holds and reports any reduction
+on standard error:
+
+```text
+INFO recurrent-state budget: reduced max_num_seqs from 32 to 13. The KV pool
+(3072 blocks) holds 118 unified pages of 832 tokens (one page = one 3371008-byte
+GDN state), and each sequence owns 9 of them. Raise --num-blocks /
+--kv-cache-memory for more concurrent sequences, or lower
+num_speculative_tokens.
+```
+
+Raise `--num-blocks` or `--kv-cache-memory` to buy more seats, or lower
+`num_speculative_tokens`. A model with no recurrent state is never reduced.
+
 Send a completion request from another terminal:
 
 ```sh
@@ -188,6 +207,24 @@ engine turns fp8 KV on for it and the flag has to be typed.
 Note that `--kv-cache-memory` is what turns the halved block into twice the
 pool. Without it the server falls back to a fixed block count, and `fp8` then
 halves the KV bytes for the same context instead.
+
+**`--kv-cache-memory` now bounds the whole pool, and it did not before.** The
+value is an absolute budget for the paged KV cache, and the engine sizes the
+block count so that everything it allocates fits inside it — which is what vLLM
+means by the flag. Until #1963 the divisor counted one layer per KV group while
+the engine allocated a buffer per layer, so the same number bought as many times
+the memory as the model has attention layers: 8.5 GiB of buffers for
+`--kv-cache-memory 1073741824` on the 27B. If you tuned this flag against the
+old behaviour, the same value now gives a shorter served context; raise it, and
+the auto-fit line on stderr tells you what it settled on.
+
+`--num-blocks` is unaffected: it names a per-layer block count and always did,
+so a launch line that sizes the pool that way means exactly what it meant
+before. Only the byte budget converts differently. The recurrent-state clamp
+(#1983) reads the resolved block count, so at a fixed `--kv-cache-memory` it
+now seats fewer concurrent sequences than it did — it is being told the pool's
+true size for the first time, and the `INFO recurrent-state budget:` line names
+what it compared.
 
 **It costs you the fast attention kernels, and we have not measured the net.**
 An fp8 KV cache is read by the tiled prefill and block decode kernels only.
@@ -555,12 +592,13 @@ repository in this project's history.
 | MiniMax-H3 tokenizer | `FL2VA/tokenizer/tokenizer.json` | 7,032,403 bytes | `MiniMaxAI/MiniMax-H3` @ `42ed227ee7df40d41602854ae760620d6eb651fe` | n/a (non-quantized) | Official tokenizer for the five-file recipe | No separate arm is recorded |
 | MiniMax-Music3 | Diffusers checkpoint tree | about 28.5 GB resident | `MiniMaxAI/MiniMax-Music3` @ `fbdf52fbaaca799592917417eb05f1899f1255ec` | n/a (non-quantized) | bf16 language model, depth decoder, condition encoder; fp32 transformer and vocoder | Native `.pth` layout |
 | MiniMax-Music3 depth decoder | `rvq_depth_decoder_q4_k.gguf` | 405,752,480 bytes | `audio-cpp/MiniMax-Music3-GGUF` @ `c36aaeed683f33b05796788e4204f4eeba8fa547` | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` | GGUF Q4_K depth decoder | Other GGUF components and third-party lineages |
-| LTX-2.5 full DiT | `diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Full bf16 DiT; declare `--checkpoint-class full` | A mismatched or missing required class is refused |
+| LTX-2.5 full DiT | `diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | `792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584` (non-quantized; hashed anyway, see the note above this table — derived 2026-08-27 from the bytes the upstream oracle render loaded) | Full bf16 DiT; declare `--checkpoint-class full` | A mismatched or missing required class is refused |
 | LTX-2.5 distilled DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | Distilled bf16 DiT; declare `--checkpoint-class distilled` | A mismatched or missing required class is refused |
 | LTX-2.5 distilled NVFP4 DiT | `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,432,024 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `f9c4c2ae9a6aa8f732eb02a1c4c3b34888caad3dd35bb65deaf3b5043cda78fa` | Distilled NVFP4 DiT, 7876 tensors | The same path at `6c7e5e57...` is a different artefact, and the next section gives both value sets |
 | LTX-2.5 distilled LoRA | `loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` | n/a (non-quantized) | REQUIRED by every non-distilled two-stage recipe — `ti2vid_two_stage`, `keyframe_interpolation`, `a2vid_two_stage`, `res2s_two_stage` and `dfr` — and applied to both stages on the last two; rank and alpha 450; version 2.5.0 | A load that omits it on those five arms is refused by name; distinct from the 327,322,640-byte IC-LoRA |
 | LTX-2.5 video VAE | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 1,452,269,922 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d` (non-quantized; hashed anyway, see the note above this table) | The `--video-vae` argument of every render; the CONV VAE, which is what the shipped recipes pass | The DiffVAE sibling `ltx-2.5-video-vae-bf16.safetensors` is refused by name rather than silently downgraded |
 | LTX-2.5 audio VAE | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 364,866,540 bytes | `Lightricks/LTX-2.5` @ `8a4ff96f581e72bedc1b44367581c49d544a05f1` | `c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5` (non-quantized; hashed anyway, see the note above this table) | The `--audio-vae` argument of every render | No quantized arm is recorded |
+| LTX-2.5 Gemma-4 12B text encoder, bf16 | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | 26,263,858,182 bytes | `Lightricks/LTX-2.5` @ `6c7e5e573ac1667efc83407806fe9b0b93730e60` (gated) | `ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1` (non-quantized; hashed anyway, and derived three independent times — the download's `x-linked-etag`, a CIFS read, and the worker's local disk during the render) | The **upstream oracle's** text tower, and the only one it accepts: `tools/oracle/ltx2_oracle.py` and #1864's reference render. This project's loader now reads it too: its two caption projections are stored BF16 [4096, 188160] and [2048, 188160] with no scale tensor in the file, and until [#2140](https://github.com/mudler/vllm.cpp/issues/2140) the loader doubled that already logical width to 376320 and refused. That refusal was MEASURED and LOCALISED on 2026-08-27 (`rc` job `001c36e9`): the 12 B tower itself loaded in bf16 in 34.815 s, and only the two caption projections refused. Measured on these bytes, not inferred | Unlike the torchao row below, this file DOES carry a `__metadata__` block, so `--encoder-config` is not required beside it. Our renders still take the NVFP4 torchao tower in the row below: no render has yet been gated on this one, and #1854's arm-matched comparison is what will do it. Upstream reads no torchao tensor at pin `fd4ded7f`, so the two are not interchangeable in either direction |
 | LTX-2.5 Gemma-4 12B text encoder | `text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors` | 7,423,624,178 bytes | `vonkaiser/LTX-2.5-FP8-NVFP4` @ `5a40ba9ab209a90ddb7943d1e3d374c51cfd3256` | `12132b7157925332d2b21de9fc6f507c14f4f0cbc7081484d1968ebf8a19b4bf` | The `--encoder` argument of every render, NVFP4 torchao | This file carries NO `__metadata__` block, so `--encoder-config` is REQUIRED beside it and the loader refuses by name without it (`ltx2_text_encoder.cpp`) |
 | Qwen3.8-27B GGUF language model | `Qwen3.8-27B-Q4_K_M.gguf` | 17,106,775,008 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169` | Q4_K_M text model loads through `--model` and decodes on CPU | **The token gate against llama.cpp `b10451` FAILED** on 2026-08-23: tokenizer exact 6/6, generation divergent 5/6 ([evidence](bench-evidence/qwen38-27b-q4km-token-gate-20260823.md), #821). GGUF multimodal forward is missing |
 | Qwen3.8-27B GGUF projector | `mmproj-BF16.gguf` | 931,146,432 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` | BF16 `clip` projector loads and validates through `--mmproj` | No request path runs the loaded projector |
@@ -571,9 +609,72 @@ repository in this project's history.
 | Qwen3.8-27B ModelOpt NVFP4 shard 3 of 4 | `model-00003-of-00004.safetensors` | 1,120,886,516 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; #821 | Same arms as shard 1 | The declared FP8 KV cache is unread; #1593 |
 | Qwen3.8-27B ModelOpt MTP drafter | `model-00004-of-00004.safetensors` | 849,400,592 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; #821 | Fifteen BF16 MTP tensors are present and unquantized | MTP execution is owed |
 | Qwen3.8-2.4T-A95B | `UD-Q1_0` ten-file GGUF split | about 370 GiB | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` (shard 1); `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` (shard 2) | CPU expert streaming from disk | CUDA refuses a checkpoint that exceeds device capacity |
-| DeepSeek-V4-Flash EXL3 trellis shard 1 of 172 | `exl3-layer-000-tp4-rank0.safetensors` | 515,850,920 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `2ed7ae798a794019810b027fe2609e2cf4ad78d70b49c47b2970d03a0a7aaadf` | The rank-sliced EXL3 routed-expert tower LOADS (TP4 coalesced to TP1) and its experts EXECUTE through `vt::Exl3Gemm` on a CPU queue | The CUDA arm has passed no compiler and no GPU, so no device arm is claimed. A SYNTHETIC rank-sliced checkpoint now loads and emits logits end to end; THIS artifact still does not, because its DSA compressor and indexer tensors are stored at twice the width the host forward indexes (`compressor.wgate` `[2*head_dim, H]`) and the loader refuses them BY NAME, and because its tokenizer is not read ([#1924](https://github.com/mudler/vllm.cpp/issues/1924)) |
+| DeepSeek-V4-Flash EXL3 trellis shard 1 of 172 | `exl3-layer-000-tp4-rank0.safetensors` | 515,850,920 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `2ed7ae798a794019810b027fe2609e2cf4ad78d70b49c47b2970d03a0a7aaadf` | The rank-sliced EXL3 routed-expert tower LOADS (TP4 coalesced to TP1) and its experts EXECUTE through `vt::Exl3Gemm` on a CPU queue | The CUDA arm compiles for `sm_121a` and its numeric gates PASSED on GB10 on 2026-08-28 (`had_r_128` byte-identical, `exl3_gemm` `rel_rms 5.538e-4`, GEMV tier 3c `5.160e-4`); the FUSED MoE device arm still cannot run, because it needs a device-resident tower, so the routed experts execute on a CPU queue. That run decoded ZERO tensors of THIS artifact -- it found no readable shard -- so nothing here is a claim about these weights on a device. A SYNTHETIC rank-sliced checkpoint now loads and emits logits end to end; THIS artifact still does not, because its DSA compressor and indexer tensors are stored at twice the width the host forward indexes (`compressor.wgate` `[2*head_dim, H]`) and the loader refuses them BY NAME, and because its tokenizer is not read ([#1924](https://github.com/mudler/vllm.cpp/issues/1924)) |
 | DeepSeek-V4-Flash EXL3 carried tower shard 1 of 5 | `carried-001.safetensors` | 4,288,630,252 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `3b67ae29f1e75c2ecadfcafd3b0eecec640b06fd60b832f77e6bd3c2a8c85ccf` | The un-requantized `deepseek_v4_fp8` attention, router, shared-expert, compressor and embedding tensors, MATERIALIZED at load into the host-float tower the forward composes with — block-wise FP8 (`F8_E4M3` + `F8_E8M0` over 128x128 blocks) decoded to f32, BF16 norms and embeddings widened, I64 `tid2eid` narrowed to int32 | The DSA compressor and indexer tensors of this artifact are `2 * head_dim` / `2 * index_head_dim` wide and the loader refuses them by name (41 of its 43 layers carry a compressor); the 3,985 `mtp.*` NVFP4 draft tensors are skipped and counted, never silently dropped |
+| GLM-5.3-Flash FP8 source | `model-000{01..62}-of-00062.safetensors` | 328,326,771,576 bytes total (305.78 GiB) | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-26 | Owed: no byte of payload has been fetched, so no local hash exists to state, and an unauthenticated tree hash is not a pin here | Declared source of `scripts/convert-glm5-next-gguf.py`. Only the safetensors HEADERS were read, by HTTP RANGE over all 62 shards: 76,108 tensors, `F8_E4M3` block-quantized at `weight_block_size: [128, 128]` with `weight_scale_inv` companions, plus BF16 and F32 scales | **Nothing has been converted.** The download needs explicit developer authority and a box with room for 305.78 GiB of source and ~100.35 GiB of output at once; owed as O7 on [#2011](https://github.com/mudler/vllm.cpp/issues/2011). The revision is a branch name and not a commit, which is NOT a pin: it is what was read, and W7b re-reads and records the commit when it stages the bytes |
+| GLM-5.3-Flash GGUF | none exists | n/a | `unsloth/GLM-5.3-Flash-GGUF`, `AtomicChat/GLM-5.3-Flash-GGUF`, `aj9o9/GLM-5.3-Flash-GGUF`, `vcruz305/GLM-5.3-Flash-GGUF`, all read 2026-08-26 | n/a | none | **All four repositories named `*-GGUF` contain ZERO `.gguf` files** — READMEs, a `.gitattributes` and four PNGs between them. A repository name is not an artifact, and this row exists so the next reader does not go looking again. llama.cpp cannot produce one either: no `glm5_next` at `origin/master` `539f24529` or at our pin `b10451` |
+| GLM-5.3-Flash config | `config.json` | 69,416 bytes | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-27 | sha256 `bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f` | The ONLY byte of this checkpoint any change on this row has consumed. Checked in verbatim as `tests/vllm/models/fixtures/glm5_next/config.json` and used as W1's gate fixture, so the config layer is gated against what the checkpoint says rather than against what a port's author believed it says | **Arms refused by name:** every arm. `Glm5NextForConditionalGeneration` is REGISTERED and its config RESOLVES; the weight loader, the forward and the KV-cache spec all refuse, naming the wave that owes each ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)). The revision is a branch name and not a commit, which is NOT a pin for the WEIGHTS; for this one file the sha256 above is the pin |
+| Qwen3.5-0.8B (Tenstorrent P150 arm) | `model.safetensors-00001-of-00001.safetensors` | 1,746,942,600 bytes | `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, authorized 2026-08-23 | `04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696` (non-quantized; hashed anyway from the local bytes the gates and the eager profile consumed) | bf16 on the Tenstorrent P150: the sacred greedy pair, both ambient legs, and the #1715/#2107 profile legs all ran from this snapshot | **Arms refused by name:** GGUF k-quant arms on TT — no TT kernels exist for them, refused at load; Qwen3.8-27B on TT — no arm fits the P150 (bf16 53.8 GB), refused at load |
 <!-- checkpoint-registry:end -->
+
+### Convert a GLM-5.3-Flash checkpoint to GGUF
+
+`zai-org/GLM-5.3-Flash` (`Glm5NextForConditionalGeneration` / `glm5_next`)
+publishes no arm that fits any device this project reaches, and no upstream tool
+can make one: llama.cpp has no `glm5_next` at our pin `b10451` or at its
+`master`, and `gguf-py`'s `Q2_K` has a dequantizer and **no** quantizer. So the
+converter ships here.
+
+```sh
+# Read the headers and print the plan, without writing a byte.
+scripts/convert-glm5-next-gguf.py --src /path/to/GLM-5.3-Flash --arm q2_k --dry-run
+
+# Write the arm.
+scripts/convert-glm5-next-gguf.py --src /path/to/GLM-5.3-Flash \
+    --dst GLM-5.3-Flash-Q2_K.gguf --arm q2_k
+```
+
+numpy is its only dependency. It streams shard by shard, so peak resident memory
+is one tensor rather than one shard, but the output is written in one pass and
+needs its full size free on the destination.
+
+| `--arm` | what the experts get | everything else | weights on the real model |
+|---|---|---|---|
+| `q2_k` | Q2_K | Q6_K | **100.35 GiB** — the only arm that fits ~119.63 GiB |
+| `q6_k` | Q6_K | Q6_K | 239.89 GiB |
+| `q8_0` | Q8_0 | Q8_0 | 310.67 GiB |
+| `bf16`, `f16`, `f32` | passthrough | passthrough | 584.67 GiB at bf16 |
+
+Routed and shared experts are 97% of this model, so the arm name is the expert
+type and the remaining 3% rides at a finer one almost for free. Figures are the
+converter's own per-tensor plan over the real topology (1719 tensors, 313.89B
+parameters after the layer-45 MTP block is dropped), not bits-per-weight times a
+parameter count.
+
+**Refused by name, each with the missing part.** Every i-quant — `iq1_s`,
+`iq2_xxs`, `iq2_s`, `iq3_xxs`, `iq4_xs`, `iq1_xxxs` — needs an importance
+matrix, an importance matrix needs a forward pass over the model, and the
+smallest published artifact is 181.32 GiB, so the dependency is circular on this
+fleet. `q3_k`, `q4_k` and `q5_k` are refused because those encoders are not
+ported: only Q2_K, Q6_K and Q8_0 are ported from `ggml/src/ggml-quants.c` at the
+pinned llama.cpp `b10451` and gated byte-for-byte against it.
+`--keep-mtp` is refused because nothing here reads an MTP tail.
+
+**The file it writes is now OPENED by this tree, and it still does not load.**
+W1 ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)) gave `glm5next` its
+`general.architecture` dispatch row and registered
+`Glm5NextForConditionalGeneration`, so passing such a file to a `.gguf` entry
+point reads its metadata, cross-checks its per-layer schedule against its tensor
+inventory, and validates its config — through the same parser a `config.json`
+descends through. It then **refuses by name** at weight materialization, because
+no weight tower, forward or KV-cache spec is ported (W5 owes them). What changed
+is the refusal: it names the wave that owes the work instead of reporting the
+file's architecture as unrecognized.
+
+**And no artifact exists to try it on.** The converter has never been run
+against the real 305.78 GiB checkpoint; that needs explicit developer authority
+for the download and a box with room for source and output at once
+([#2011](https://github.com/mudler/vllm.cpp/issues/2011)).
 
 ### The distilled NVFP4 DiT was re-quantized under an unchanged name
 

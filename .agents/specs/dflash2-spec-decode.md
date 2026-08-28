@@ -3051,6 +3051,38 @@ list items.
   the SM on this box is not in hand and needs a lease. It is not needed for the
   retraction, and it IS needed before anybody claims the forward JIT is free.
 
+- **O-W12a — [#2088](https://github.com/mudler/vllm.cpp/issues/2088): a
+  non-causal SWA draft layer runs with NO sliding window.** Found while reading
+  the `P > 1` propose route for W12
+  ([dflash2-batch-propose.md](dflash2-batch-propose.md)), not fixed there.
+  Upstream resolves `(sliding_window, causal)` independently and passes
+  `per_layer_sliding_window` to `Attention` with no reference to causality
+  (`vllm/model_executor/models/qwen3_dflash.py:86-146`, `:229`, `:234` at pin
+  `5559679229`), consuming `causal` one level out as attention metadata
+  (`:720`). We condition the window on causality everywhere —
+  `src/vllm/model_executor/models/qwen3_dflash_internal.h:125`,
+  `src/vt/cuda/cuda_ops.cu:1582`, `:1802`, `:1971`, `:2255`, `:2405`, `:2435`,
+  `src/vt/cpu/cpu_ops.cpp:2951`, `:3029` — so a declared `is_causal false`
+  beside `sliding_attention` layers drops the window on all of them. That makes
+  row 2 of the [dflash2-draft-block-fa2.md](dflash2-draft-block-fa2.md)
+  dispatch table unreachable from production. Acceptance-only and therefore
+  invisible to a token gate, exactly the D4 failure class. **NOT FIXED HERE**
+  because it needs the campaign draft's own `config.json` read first: if its
+  five layers resolve `sliding_window == 0` the issue is inert for this
+  checkpoint and live only for the MiMo and Gemma-4 drafts upstream's docstring
+  names. That read is W12's experiment E5.
+- **O-W12b — [#2089](https://github.com/mudler/vllm.cpp/issues/2089): the W11
+  draft-block route counters are blind to the production `P > 1` lane.** Both
+  `NoteDflashBlockRoute` increments sit inside the `P == 1` branch
+  (`src/vllm/model_executor/models/qwen3_dflash.cpp:1487`, `:1502`); the
+  materialized fallback at `:1888-1930` increments neither, so at every
+  concurrency above one both counters read zero while production runs a third
+  route nothing names. W11 put the counter inside the branch precisely so it
+  would measure a capability rather than a class; this is the hole that
+  argument left, and it is why the `P > 1` route's cost went unremarked through
+  three profiled waves. **NOT FIXED HERE** because it should land with or
+  before the W12 route change it exists to gate.
+
 ## Now
 
 **W6 TOOK THE GATES on 2026-08-21, on `dgx:gpu0` through an `rc` lease, and G2

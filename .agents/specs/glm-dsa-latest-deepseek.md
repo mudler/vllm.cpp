@@ -221,8 +221,11 @@ plan. In dependency order:
    structural copies of deepseek_v2. The only GLM-specific piece is
    `Glm4MoeLite = Glm4MoE` (`:86-87`). **If the MLA campaign lands, this is nearly
    free** — and per C2 it is the better gate vehicle.
-2. **`GlmMoeDsaForCausalLM` is DeepSeek-V3.2, verbatim.** `deepseek_v2.py:1917-1918`
-   is `class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM): pass`. The only
+2. **`GlmMoeDsaForCausalLM` is DeepSeek-V3.2, verbatim at the pin this section was
+   written against.** `deepseek_v2.py:1917-1918` @ `e24d1b24`
+   is `class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM): pass`. At the CURRENT
+   parity pin `555967922` the same class is `:1930-1931`, and on vLLM `main` the
+   architecture is no longer verbatim at all. See §2. The only
    behavioural special case anywhere is fp32 router dtype forced by
    `model_type == "glm_moe_dsa"` (`deepseek_v2.py:120-130`), because older GLM-5
    configs omit `moe_router_dtype`. Two numerical deltas live in the newer tree:
@@ -552,7 +555,7 @@ since its base `b4f14ee`. Verified current values in this tree:
 | `registry.py:113` `Glm4ForCausalLM` (`glm4.py:55,180-187`) | **NEW** `include/vllm/model_executor/models/glm4.h` + `src/vllm/model_executor/models/{glm4_registry,glm4_weights,glm4}.cpp` |
 | `registry.py:114` `Glm4MoeForCausalLM` (`glm4_moe.py:121,232`) | **NEW** `glm4_moe.{h,cpp}` — composes the new GLM attention block + `RunMoeBlock` + the extended router. HW-BLOCKED e2e; loader/unit only |
 | `registry.py:115` `Glm4MoeLiteForCausalLM` (`glm4_moe_lite.py:82-99`) | **NEW** `glm4_moe_lite.{h,cpp}` — MLA attention from the campaign's W6 block + `RunMoeBlock` + extended router. **The gate vehicle** |
-| `registry.py:116` `GlmMoeDsaForCausalLM` (`deepseek_v2.py:1917-1918`) | **NEW** alias registration over the DeepSeek-V3 TU + the `glm_moe_dsa` fp32-router special case (`deepseek_v2.py:120-130`). DEP-BLOCKED + HW-BLOCKED; registry/config resolution only |
+| `registry.py:116` `GlmMoeDsaForCausalLM` (`deepseek_v2.py:1917-1918`) @ `e24d1b24`; `:117` and `:1930` at the current pin `555967922`, see §2 | **NEW** alias registration over the DeepSeek-V3 TU + the `glm_moe_dsa` fp32-router special case (`deepseek_v2.py:120-130`). DEP-BLOCKED + HW-BLOCKED; registry/config resolution only |
 | `registry.py:82-83` ChatGLM (`chatglm.py:46,60-63`) | **NEW** `chatglm.{h,cpp}` + out-of-tree config handling. Lowest priority |
 | `glm4.py:86-92,119` partial + non-NeoX rope; `chatglm.py:103` | **NEW** `partial_rotary_factor` support in `src/vllm/model_executor/layers/rotary_embedding/` — rope a leading `rotary_dim` slice, pass the tail through, both NeoX and interleaved. **Shared primitive** |
 | `glm4.py:180-187,206,211` sandwich norms | **NEW** post-sublayer norm hooks in the GLM attention/MLP block (output-normed before residual add). **Shared primitive** |
@@ -805,3 +808,219 @@ appears in upstream's text-generation correctness list; GLM-4/4.5/4.7/5 have
 initialization and registry smoke tests only. Our gates therefore rest entirely on
 our own pinned-vLLM oracle comparison. That is the project's standard practice and
 is sufficient, but it must not be mistaken for inheriting upstream guarantees.
+
+---
+
+## 2. Reconcile of `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` against `zai-org/GLM-5.3` (2026-08-28)
+
+**Issue:** [#2194](https://github.com/mudler/vllm.cpp/issues/2194).
+**Scope:** records only. The row stays `BLOCKED`. No product code, no pin advance,
+no second matrix row. `GlmMoeDsaForCausalLM` has exactly one row and keeps it.
+**Not touched:** `MODEL-MM-GLM53-FLASH` and
+[`glm5-next-flash.md`](glm5-next-flash.md), which own the different architecture
+`glm5_next` and are edited by another claim.
+
+**Secondary oracle:** `llama-cpp`
+
+### 2.1 Both upstream anchors were stale at our own parity pin
+
+The row carried `registry.py:116` and `deepseek_v2.py:1917-1918`. Measured at the
+current parity pin `5559679229bc961848b121ccdeaa8fa5d79bec98`:
+
+| The row said | What is there at the current pin | Correct at the current pin |
+|---|---|---|
+| `registry.py:116` | `"Glm4MoeLiteForCausalLM": ("glm4_moe_lite", …)`, a DIFFERENT model | `registry.py:117` |
+| `deepseek_v2.py:1917-1918` | `def load_weights(...)` / `loader = AutoWeightsLoader(self)` | `deepseek_v2.py:1930-1931` |
+
+The registry anchor is the dangerous shape. Line 116 holds a plausible GLM entry
+for another architecture, so a reader who checks it casually confirms it and
+stops.
+
+Both corrected anchors are UNIQUE, which is the property that matters. At the pin
+`grep -n GlmMoeDsaForCausalLM` over `registry.py` returns one line, `:117`, and
+over `deepseek_v2.py` returns one line, `:1930`. `grep -n glm_moe_dsa` over
+`deepseek_v2.py` also returns one line, `:127`, inside `_get_moe_router_dtype`.
+That last anchor sharpens the row's older `:120-130` range.
+
+**Neither number was wrong when it was written.** Both are exact at the PRIOR pin
+`e24d1b24`: `registry.py:116` and `deepseek_v2.py:1917`. That is the revision
+this spike's `### Upstream chain` names, and that section is still honest. The
+2026-07-26 advance to `555967922` moved `registry.py` by one line and
+`deepseek_v2.py` by thirteen. The matrix row copied the coordinates without the
+revision label, so nothing could see them drift. Every anchor this section adds
+therefore carries the revision it was measured at.
+
+Commands:
+
+```sh
+git show 5559679229bc961848b121ccdeaa8fa5d79bec98:vllm/model_executor/models/registry.py \
+  | grep -n 'GlmMoeDsaForCausalLM\|Glm4MoeLiteForCausalLM'
+git show 5559679229bc961848b121ccdeaa8fa5d79bec98:vllm/model_executor/models/deepseek_v2.py \
+  | grep -n 'GlmMoeDsa\|glm_moe_dsa'
+git show e24d1b24fe:vllm/model_executor/models/registry.py | grep -n 'GlmMoeDsaForCausalLM'
+```
+
+Read every object with `git show <revision>:<path>`, never from a working tree.
+The local vLLM checkout can be dirty, and a dirty tree is not a revision.
+
+### 2.2 "GLM-5.x is DeepSeek-V3.2 VERBATIM" holds at the pin and nowhere later
+
+At `555967922` the claim is exact. `deepseek_v2.py:1930-1931` is
+`class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM): pass`, and the only
+behavioural special case is the fp32 router dtype forced by
+`model_type == "glm_moe_dsa"` in `_get_moe_router_dtype` (`deepseek_v2.py:127`).
+
+On vLLM `main` `d1922cb5a7` (read 2026-08-28) three things diverge:
+
+1. `registry.py:118` re-homes the alias to `vllm.models.deepseek_v32`. That
+   package's `__init__.py:17-29` binds `GlmMoeDsaForCausalLM` to
+   `DeepseekV32ForCausalLM` from `nvidia/model.py` under CUDA, and keeps the
+   `deepseek_v2` subclass on ROCm, XPU and CPU. So under CUDA the architecture no
+   longer resolves to the `deepseek_v2` class at all.
+2. The architecture gains its own `VerifyAndUpdateConfig`,
+   `vllm/model_executor/models/config.py::GlmMoeDsaForCausalLM` at `:43`,
+   registered in the dispatch table at `:936`. It calls
+   `parallel_config.set_dcp_defaults(comm_backend="a2a", q_replicate=True)`, which
+   is a decode-context-parallel default this architecture alone selects.
+3. `vllm/config/vllm.py:81` names it in
+   `DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES`.
+
+None of the three exists at the pin: `git show <pin>:…/config.py` and
+`git show <pin>:vllm/config/vllm.py` return no `GlmMoeDsa` match at all. Reaching
+any of it needs a pin advance, and this reconcile takes none. The row's
+DEP-blocked reason now says "verbatim AT THE PIN" and names what diverges.
+
+### 2.3 The GLM-5.3 checkpoint, and the blocker arithmetic
+
+`zai-org/GLM-5.3`, revision `935644c05e76fc198714f4cca449fd8b970ff6d7`, read from
+the HuggingFace API on 2026-08-28.
+
+| Property | Value |
+|---|---|
+| `model_type` / `architectures` | `glm_moe_dsa` / `["GlmMoeDsaForCausalLM"]` |
+| `dtype` | `bfloat16` |
+| `quantization_config` | `quant_method: fp8`, `fmt: e4m3`, dynamic activations, `weight_block_size [128, 128]` |
+| layers / hidden / vocab | 78 / 6144 / 154880 |
+| routed + shared experts, top-k | 256 + 1, top-8 |
+| `q_lora_rank` / `kv_lora_rank` | 2048 / 512 |
+| `qk_rope_head_dim` | 64 |
+| indexer | `index_topk 2048`, `index_n_heads 32`, `index_topk_freq 4`, `indexer_rope_interleave: true` |
+| MTP | `num_nextn_predict_layers: 1` |
+| shards / on-disk size | 141 safetensors / 755,632,050,320 B = **703.74 GiB** |
+| parameters (API `safetensors.total`) | **753,329,940,480** = 751,226,191,872 `F8_E4M3` + 2,103,729,152 `BF16` + 19,456 `F32` |
+
+This is NOT the `glm5_next` of `MODEL-MM-GLM53-FLASH`. The two differ on
+`model_type`, layer count, hidden size, expert count, `q_lora_rank`, RoPE
+presence, the mHC stream, the indexer k-pool and modality. The rows stay
+separate.
+
+The measured parameter count confirms the 753.9B this row already carried. It
+also gives **1403.2 GiB** at bf16, where the row said 1404.2 GiB. The difference
+is small and the corrected value is the one measured here.
+
+One detail retires part of the fp32-router special case for this checkpoint.
+GLM-5.3 DOES expose `moe_router_dtype: float32`, so the upstream comment "Older
+GLM-5/5.2 configs require fp32 routing but do not expose `moe_router_dtype` yet"
+no longer describes the newest artifact. The forced branch still fires first, so
+behaviour is unchanged.
+
+**The arithmetic, so nobody redoes it.** `dgx:gpu0` reports
+128,452,956,160 B = 119.631 GiB from `cudaMemGetInfo`. Fitting 753,329,940,480
+parameters in that budget needs **1.3641 bits per weight**, before any KV cache.
+
+| Rate | GLM-5.3 size | Fits `dgx:gpu0` |
+|---|---|---|
+| 2.32 bpw, the rate of the smallest arm that fits anything comparable | 203.5 GiB | no |
+| 1.70 bpw, aggressive sub-IQ1 | 149.1 GiB | no |
+| 1.50 bpw, below anything published | 131.5 GiB | no |
+
+The 2.32 bpw reference is `unsloth/GLM-5.3-Flash-GGUF` `UD-IQ1_S`, 86.69 GiB over
+321.32B parameters, which is a different model and is cited only for the rate.
+
+GGUF conversion of GLM-5.3 has started and does not change the verdict. Re-read
+on 2026-08-28: `unsloth/GLM-5.3-GGUF` (revision `8cf52b13b130`, modified
+16:14 UTC) holds one complete arm, `UD-Q3_K_XL`, 9 files, **319.41 GiB**, which is
+3.64 bpw. `AtomicChat/GLM-5.3-GGUF` and `MaliAir/GLM-5.3-MXFP4-MOE-Q8_0-GGUF`
+hold ZERO `.gguf` files. That repository is being populated live, so re-read it
+rather than quoting this line.
+
+`rc devices` on 2026-08-28 listed `dgx:gpu0`, `orin:gpu0`, `strix:gpu0` and
+`thor:gpu0`. None is larger than `dgx:gpu0`. No single fleet device holds this
+model at any published or plausible quantization, so the row's `🚫` is correct
+rather than stale.
+
+### 2.4 Oracles: both already registered, and neither needs a new file
+
+**vLLM is the primary and reaches this architecture AT OUR PIN.** The entry is
+`registry.py:117` and the class is `deepseek_v2.py:1930`, both at
+`555967922`. No pin advance is needed, and no new oracle file is written. Three
+reasons, in order of force:
+
+1. `scripts/check-oracle-pins.py` requires exactly one `role = primary` record
+   and requires it to be `vllm`. A second vLLM file is refused by the gate.
+2. `.agents/oracles/README.md` states that `vllm.md` points at
+   `.agents/upstream-sync.md` rather than restating the pin, "because a pin
+   transcribed twice is a pin that drifts". A per-model vLLM file would be that
+   second transcription. §2.1 above is a live instance of exactly that failure.
+3. The registry files carry oracle IDENTITY, not per-model reach. Adding an id
+   would also force an edit to the AGENTS.md admissible-oracle table, which is a
+   shared file this reconcile has no reason to lock.
+
+**llama.cpp reaches it at our STOCK release pin `b10451`.** Verified in a fresh
+bare clone of `ggml-org/llama.cpp`, never a working tree:
+
+```sh
+git init --bare && git remote add origin https://github.com/ggml-org/llama.cpp.git
+git fetch --depth 1 origin 10bf611e533d81f739128304991c5e133c6aebd8
+git ls-remote --tags origin refs/tags/b10451   # -> 10bf611e533d81f739128304991c5e133c6aebd8
+git show 10bf611e533d81f739128304991c5e133c6aebd8:src/llama-arch.cpp | grep -n GLM_DSA
+```
+
+| What | Where, at `b10451` |
+|---|---|
+| architecture name | `src/llama-arch.cpp:85`, `{ LLM_ARCH_GLM_DSA, "glm-dsa" }` |
+| the case that reaches it | `src/llama-arch.cpp:1051` |
+| graph | `src/models/glm-dsa.cpp` |
+| GGUF constant | `gguf-py/gguf/constants.py:534`, name at `:1249` |
+| converter registration | `conversion/glm.py:274-276`, `@ModelBase.register("GlmMoeDsaForCausalLM")`, `class GlmMoeDsaModel(DeepseekV2Model)`, `model_arch = GLM_DSA`; dispatch row `conversion/__init__.py:99` |
+
+`grep -n GLM_DSA` over `src/llama-arch.cpp` returns exactly those two lines, so
+both anchors are unique. The converter mirrors the vLLM structure: a
+`DeepseekV2Model` subclass, the same relation the vLLM class has to
+`DeepseekV2ForCausalLM`.
+
+**So no scoped PR-oracle file is needed here, and that contrast is the useful
+finding.** `llama-cpp-qwen4exp` exists because `qwen4exp` is defined by an open
+llama.cpp PR and by no release, and the `llama-cpp-glm5next` proposed in
+[#2178](https://github.com/mudler/vllm.cpp/issues/2178) exists for the same
+reason. A scoped file buys a denominator that the stock pin cannot supply. Here
+the stock pin supplies it, so a scoped file would add a second llama.cpp pin that
+answers a question the first one already answers.
+
+**Both oracles are `gateable = no` FOR THIS MODEL, and the reason is MEMORY.**
+Not missing support: both build the architecture and would run it on a device
+large enough to hold it. That distinction is the whole point of this section. It
+separates this row, blocked on hardware, from `MODEL-MM-GLM53-FLASH`, which is
+blocked because no SERVING oracle registers `glm5_next` at any revision — not
+vLLM, not vllm-omni, not SGLang, not llama.cpp. That row is not without a
+reference: `transformers` **v5.16.1** implements the architecture, and W4
+([#2098](https://github.com/mudler/vllm.cpp/issues/2098), landed on `main`
+2026-08-28 as `6c715de00`) gates its mHC arm by RUNNING that module. So the two
+rows are blocked on opposite things — GLM-5.3-Flash can be gated piecewise
+against a reference nobody serves, and this row cannot be gated at all, because
+the oracles that DO serve it cannot fit it.
+
+This per-model verdict lives on the row and in this spec, never in
+`.agents/oracles/*.md`. The `gateable` key there is a property of the ORACLE, and
+both oracles are `gateable = yes` as oracles. Writing `no` into either file to
+express one blocked checkpoint would retract a measured property of the oracle
+across every other row that uses it.
+
+### 2.5 What this reconcile did NOT do
+
+- It did not advance any pin, and it measured nothing on a GPU.
+- It did not add a matrix row. The architecture has one row and keeps it.
+- It did not add an oracle file, for the reasons in §2.4.
+- It did not change the row's state. `BLOCKED` is still correct, and §2.3 is the
+  arithmetic that keeps it correct.
+- It did not touch `MODEL-MM-GLM53-FLASH` or its spec.

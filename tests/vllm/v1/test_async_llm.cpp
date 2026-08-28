@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/multimodal/inputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -552,6 +553,81 @@ TEST_CASE("async_llm concurrent shutdown accepts or rejects a complete wave") {
                       vllm::v1::EngineDeadError);
     }
     CHECK_FALSE(output.has_unfinished_requests());
+  }
+}
+
+// SAMPLE-N-ASYNC (#1816): the parallel-sampling fan-out is called from all
+// THREE add_request overloads, and the socket gate in test_api_server.cpp only
+// reaches the string one — /v1/completions has no pre-tokenized or multimodal
+// route. Deleting the fan-out from the tokens or the mm overload therefore left
+// every suite green. This case measures those two call sites directly, which is
+// the seam an ABI client (include/vllm.h) and the MM serving path use.
+//
+// The child count is what #1816 names: one RequestOutput carrying n
+// CompletionOutputs with distinct indices, not one. RunnerStub samples a canned
+// token regardless of SamplingParams, so temperature only has to clear the
+// greedy guard (sampling_params.cpp:190 refuses n > 1 under greedy sampling).
+TEST_CASE("async_llm fans n>1 out on the tokens and multimodal overloads") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+  auto scheduler = CreateScheduler();
+  RunnerStub runner;
+  Executor executor(runner);
+  InputProcessor input(tokenizer, config);
+  OutputProcessor output(&tokenizer);
+  AsyncLLM engine(input, *scheduler, executor, output,
+                  get_request_block_hasher(16, sha256_cbor));
+
+  constexpr int kN = 3;
+  constexpr int kMaxTokens = 4;
+  const std::vector<int32_t> prompt_ids = tokenizer.Encode("hello world");
+  REQUIRE_FALSE(prompt_ids.empty());
+
+  SamplingParams params = Params(kMaxTokens, RequestOutputKind::kFinalOnly);
+  params.n = kN;
+  params.temperature = 1.0;  // n > 1 is rejected under greedy sampling
+
+  SUBCASE("tokens overload") {
+    AsyncRequest request =
+        engine.add_request("tokens-n", prompt_ids, params, /*priority=*/0);
+    // The PARENT id comes back, not a child's ("{idx}_{parent}").
+    CHECK(request.request_id == "tokens-n");
+    RequestOutput final_output = engine.get_output(request);
+    CHECK(final_output.finished);
+    CHECK(final_output.request_id == "tokens-n");
+    // THE assertion: n children were registered against the ONE collector and
+    // aggregated into a single RequestOutput. Without the fan-out this is 1.
+    REQUIRE(final_output.outputs.size() == static_cast<std::size_t>(kN));
+    for (int idx = 0; idx < kN; ++idx) {
+      const vllm::CompletionOutput& out =
+          final_output.outputs[static_cast<std::size_t>(idx)];
+      CHECK(out.index == idx);
+      CHECK(out.token_ids.size() == static_cast<std::size_t>(kMaxTokens));
+      REQUIRE(out.finish_reason.has_value());
+      CHECK(*out.finish_reason == "length");
+    }
+    CHECK_FALSE(engine.has_unfinished_requests());
+  }
+
+  SUBCASE("multimodal overload") {
+    // Empty mm_features: the mm overload's only delta from the tokens path is
+    // that mm_features rides onto the EngineCoreRequest (async_llm.h:152-159),
+    // and the fan-out copies it onto every child. The fan-out call site is the
+    // same either way, and an empty feature list keeps the case model-free.
+    vllm::multimodal::MultiModalInputs mm_inputs;
+    mm_inputs.prompt_token_ids = prompt_ids;
+    AsyncRequest request =
+        engine.add_request("mm-n", mm_inputs, params, /*priority=*/0);
+    CHECK(request.request_id == "mm-n");
+    RequestOutput final_output = engine.get_output(request);
+    CHECK(final_output.finished);
+    CHECK(final_output.request_id == "mm-n");
+    REQUIRE(final_output.outputs.size() == static_cast<std::size_t>(kN));
+    for (int idx = 0; idx < kN; ++idx) {
+      CHECK(final_output.outputs[static_cast<std::size_t>(idx)].index == idx);
+    }
+    CHECK_FALSE(engine.has_unfinished_requests());
   }
 }
 

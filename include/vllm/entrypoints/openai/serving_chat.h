@@ -245,6 +245,14 @@ class OpenAIServingChat {
   // the IDENTICAL chat template as chat-completions instead of reinventing it.
   const ChatPromptFn& prompt_fn() const { return prompt_fn_; }
 
+  // See OpenAIServingCompletion::set_default_sampling_params (#1985).
+  void set_default_sampling_params(vllm::DefaultSamplingParams defaults) {
+    default_sampling_params_ = std::move(defaults);
+  }
+  const vllm::DefaultSamplingParams& default_sampling_params() const {
+    return default_sampling_params_;
+  }
+
  private:
   // Build the per-request tool parser (get_tool_parser) when ToolsEnabled and a
   // parser name is configured; else nullptr. ONE instance per request (the
@@ -279,6 +287,9 @@ class OpenAIServingChat {
   // unavailable on this handler.
   const vllm::tok::Tokenizer* beam_tokenizer_ = nullptr;
   std::optional<int32_t> beam_eos_token_id_;
+  // See set_default_sampling_params. Empty => every knob falls to the neutral
+  // OpenAI default, byte-identical to the behaviour before #1985.
+  vllm::DefaultSamplingParams default_sampling_params_;
   // Multimodal chat seam (see set_multimodal_chat_fn). Null => the text-only
   // path runs unchanged (mm parts drop to the joined-text content).
   MultiModalChatFn mm_chat_fn_;

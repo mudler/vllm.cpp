@@ -146,7 +146,24 @@ MATRICES = {
     # algorithm source is transformers#48337, so the at-the-pin static invariants
     # (324/373/356/310/261) are UNCHANGED. Bumped because one row EXISTS, never to
     # make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 378),
+    # 379 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
+    # forward: +1 for `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`
+    # (`Glm5NextForConditionalGeneration`, `zai-org/GLM-5.3-Flash`), landing
+    # `READY` with its spec committed (#1998). ONE row and not three, which is
+    # the arithmetic this comment exists to justify: the OPEN vllm#53906 would
+    # register `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` AND
+    # `Glm5NextMTPModel`, so the IndexTTS-2.5 / dots3-note two-row shape is the
+    # tempting read. It does not apply. None of the three names is registered at
+    # ANY vLLM revision, and the only architecture a published artifact declares
+    # is `Glm5NextForConditionalGeneration` -- the MTP head is `layers.45` inside
+    # the same checkpoint, which the transformers reference discards outright at
+    # `modular_glm5_next.py:1235`. Beyond-pin in the same strongest sense as the
+    # qwen4-exp row above: read live 2026-08-26, `git grep "Glm5\|glm5_next"`
+    # returns zero hits at `555967922` and at `origin/main` = `c71f6f8a81`. Its
+    # Upstream cell therefore carries no pinned module/class target and the
+    # at-the-pin static invariants (324/373/356/310/261) are UNCHANGED. Bumped
+    # because one row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 379),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -169,7 +186,16 @@ MATRICES = {
     # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
     # encoding rather than on a checkpoint. Both `READY`, spec
     # `specs/qwen38-27b-quant-arms.md`, issue #821.
-    "QUANT": (AGENTS / "quantization-matrix.md", 84),
+    # 85 since 2026-08-28: +`QUANT-EXL3`, the exllamav3 trellis format (a QTIP
+    # variant: MCG codebook, blockwise Hadamard-128 with sign vectors, and NO
+    # scales). A genuinely new scheme rather than a state transition -- it is
+    # expressible by no row in sections 1 or 2, which are keyed on GGUF encodings
+    # and on vLLM-registered methods, and vLLM registers no EXL3 at the parity
+    # pin, so its mirror source is the pinned secondary oracle `exllamav3`. The
+    # kernels have existed since `MODEL-DSV4-EXL3` W2 and are device-proven, but
+    # the ONLY consumer is the DeepSeek-V4 loader, so no other architecture can
+    # reach the scheme -- which is what the row is for (#2181).
+    "QUANT": (AGENTS / "quantization-matrix.md", 85),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block

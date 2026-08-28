@@ -6,8 +6,15 @@
 // The Qwen3.6-35B forward (`Qwen3_5Model::Forward`) calls `MoeBlock` internally,
 // but a NEW full-attention MoE — Qwen3-Coder `Qwen3MoeForCausalLM` (qwen3_moe.cpp,
 // W3) — must reuse the SAME block from a DIFFERENT translation unit. `MoeBlock`
-// takes/returns the qwen3_5.cpp-internal `Dev`/`DBuf` types (which each TU
-// defines privately), so it cannot be called cross-TU directly. This header
+// has INTERNAL LINKAGE (it sits in that anonymous namespace), so it cannot be
+// called cross-TU directly. THIS SENTENCE USED TO GIVE A DIFFERENT REASON —
+// that `MoeBlock` "takes/returns the qwen3_5.cpp-internal `Dev`/`DBuf` types
+// (which each TU defines privately)" — and that reason was true when this
+// header was written (`7c96dd9fc`) and stopped being true at `f730eb11c`
+// (ENG-HYBRID-PLACEMENT, #2046), which replaced qwen3_5.cpp's private copies
+// with `vllm::dense_attn::Dev` / `DBuf` from the public `dense_device_glue.h`.
+// Corrected here because `qwen3_5_gdn_block.h` copied the stale claim from it.
+// This header
 // exposes a thin public wrapper (`RunMoeBlock`) over primitive vt:: types: it
 // builds the internal `Dev`, calls `MoeBlock`, and hands back the combined
 // device buffer as an owning `MoeBlockOutput` whose deleter returns the pool
@@ -44,5 +51,30 @@ struct MoeBlockOutput {
 // the shared expert (SEAM GAP #3); `> 0` (the 35B) runs it unchanged.
 MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
                            const HfConfig& config, const vt::Tensor& dh, int64_t T);
+
+// Run the sparse-MoE block for a PLACED layer: on `placement_device` instead of
+// the engine's own, with the activation round trip at the boundary.
+// `ENG-HYBRID-PLACEMENT` W3b (issue #2026).
+//
+// THE WEIGHTS FOLLOW THE COMPUTE FOR FREE ON THIS PATH, and that is the whole
+// reason the routing is this small. `MoeBlockWeights` holds `OwnedTensor`s, and
+// `ResidentWeight` ALIASES their host bytes when the `Dev` is CPU and uploads
+// otherwise, caching the upload on the tensor. So a layer whose block is only
+// ever called with a CPU `Dev` is never staged to the accelerator at all: no
+// upload happens rather than one happening and being ignored. That is the
+// difference between freeing the device memory and merely computing elsewhere,
+// and it is why a token gate alone cannot check this row — assert the residency.
+//
+// This holds for the bf16 and keep-quant expert arms, which are what a GGUF load
+// and therefore a `-cmoe` command line brings. It does NOT hold for the
+// fp4-resident arm, whose device Marlin residents are built EAGERLY at load by
+// `PrepareMarlinResident` regardless of any placement; placing that arm would
+// upload and then compute across the bus, which is worse than not placing. The
+// caller refuses it rather than serving it slowly.
+MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
+                                 vt::DeviceType placement_device,
+                                 const MoeBlockWeights& weights,
+                                 const HfConfig& config, const vt::Tensor& dh,
+                                 int64_t T);
 
 }  // namespace vllm

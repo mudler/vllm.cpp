@@ -326,6 +326,15 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **The default-polarity question reopened by
+  [#2003](https://github.com/mudler/vllm.cpp/issues/2003).** At post-W2c
+  `21fe11cf1` the host-hybrid opt-out outperforms the shipped eager default
+  1.24x on the P150 (Qwen3-0.6B b1, order-alternated pairs ×3, clock
+  unattributed — see `.agents/benchmark-record.md`, 2026-08-26 entry); the
+  default arm is unchanged against its #1604 figures and the opt-out improved
+  ~2.5x unattributed. Owed: a per-op delta of the host-hybrid path from
+  `b86e3705f` to current main, then a polarity decision that carries a clock
+  window per arm.
 - **No case pins `HostFreeDecodeEnabled()`'s no-caching contract on the RAC
   path ([#1688](https://github.com/mudler/vllm.cpp/issues/1688)).** The R5
   fresh review found `ReshapeAndCacheKernel` still latching the flag in a
@@ -405,13 +414,16 @@ not a process-global `GraphCapturesCounter`. Tracked on
   longest request finishes — the old `>` let the else-branch
   `copy_to_device` TT_FATAL on a shape mismatch), mirroring the driver's
   `cols_changed !=` reset.
-- **`test_tenstorrent_backend` exits 139 after a fully green doctest summary**
-  (23/23 cases, 831/831 assertions): static `std::optional<ttnn::Tensor>` cache
-  fields are destroyed after the UMD device closes and `deallocate_impl` reaches
-  a torn-down `GraphTracker`. Proven pre-existing at `origin/main` by an A/B
-  stash/build/run during the [#1476](https://github.com/mudler/vllm.cpp/issues/1476)
-  gate. Owned by
-  [#1486](https://github.com/mudler/vllm.cpp/issues/1486).
+- **RESOLVED 2026-08-27 — `test_tenstorrent_backend` exited 139 after a fully
+  green doctest summary** (23/23 cases, 831/831 assertions): static
+  `std::optional<ttnn::Tensor>` cache fields are destroyed after the UMD device
+  closes and `deallocate_impl` reaches a torn-down `GraphTracker`. Proven
+  pre-existing at `origin/main` by an A/B stash/build/run during the
+  [#1476](https://github.com/mudler/vllm.cpp/issues/1476) gate. Fixed by
+  [#1486](https://github.com/mudler/vllm.cpp/issues/1486): every process-lifetime
+  TT cache in `tenstorrent_ops.cpp` is now heap-allocated and deliberately never
+  destroyed, so no `ttnn::Tensor` destructor can run after tt-metal teardown.
+  Suite and e2e binaries exit 0 (mutation: reverting one accessor re-adds the 139).
 - **`test_release_metadata` is red on every aarch64 host**: the fixture stages
   the host `/bin/true` into an `x86_64`-named archive, so `agent-preflight`
   cannot go green on the TT dev fleet. Found while running this row's preflight.

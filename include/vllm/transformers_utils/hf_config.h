@@ -66,6 +66,29 @@ struct RopeParameters {
 // `text_config` sub-dict; LoadHfConfig resolves that nested object as the source
 // of the text fields, mirroring upstream PretrainedConfig.get_text_config().
 // `model_type` and `architectures` are always read from the top-level wrapper.
+// The sampling keys of ONE generation_config.json, as
+// ModelConfig.try_get_generation_config (vllm/config/model.py) surfaces them.
+//
+// Upstream returns `GenerationConfig.to_diff_dict()`, i.e. only the keys that
+// differ from a bare `GenerationConfig()`. The pinned floor is
+// `transformers >= 5.5.3` (vLLM requirements/common.txt:10), and at 5.x every
+// sampling field of a bare GenerationConfig is None, so every key the JSON
+// declares survives the diff and reading the file literally is exact. Measured
+// against transformers 5.3.0 on a Qwen-shaped file: repetition_penalty 1.05,
+// temperature 1.0, top_k 20 and top_p 0.95 all survive. If the pin's floor ever
+// moves back to transformers 4.x -- whose defaults were temperature 1.0,
+// top_k 50, top_p 1.0 -- this parse becomes wrong and has to grow that table.
+struct GenerationConfigSampling {
+  std::optional<double> repetition_penalty;
+  std::optional<double> temperature;
+  std::optional<int> top_k;
+  std::optional<double> top_p;
+  std::optional<double> min_p;
+  // Upstream renames this to max_tokens when it narrows; kept under its HF name
+  // here because this struct is the FILE, not the narrowed result.
+  std::optional<int> max_new_tokens;
+};
+
 struct HfConfig {
   std::string model_type;
   std::vector<std::string> architectures;
@@ -126,11 +149,31 @@ struct HfConfig {
   // secondary stop ids gated on ignore_eos. Empty when the file is absent,
   // unparseable, or carries no eos_token_id.
   std::vector<int32_t> generation_config_eos_ids;
+  // The six SAMPLING keys of the same sibling generation_config.json, which
+  // upstream reads through the same one file read and then narrows in
+  // ModelConfig.get_diff_sampling_param (config/model.py). Every field is unset
+  // when the file is absent, unparseable, or does not declare that key, which
+  // is what makes "the checkpoint said nothing" distinguishable from "the
+  // checkpoint said the neutral value" -- the distinction the whole defaulting
+  // rule turns on. See include/vllm/config/generation.h for the narrowing and
+  // for the --generation-config selector that can point somewhere else.
+  GenerationConfigSampling generation_config_sampling;
 };
 
 // Loads and parses `path`. Throws std::runtime_error (message includes the
 // path) on missing file, malformed JSON, or missing required fields.
 HfConfig LoadHfConfig(const std::string& path);
+
+// Reads the sampling keys of the generation_config.json at `path`. Mirrors
+// ModelConfig.try_get_generation_config's failure polarity exactly: a missing
+// file, unparseable JSON, a non-object document, a null value and a
+// wrong-typed value each leave the corresponding field unset rather than
+// throwing, because upstream's loader returns {} and never raises.
+//
+// Exposed because --generation-config can name a DIRECTORY other than the
+// checkpoint's, which is the one case the sibling read on HfConfig cannot
+// serve.
+GenerationConfigSampling ReadGenerationConfigSamplingFile(const std::string& path);
 
 // The same parse, from a config object already in hand. `source` appears in
 // every error message exactly where the path would, so a refusal still names

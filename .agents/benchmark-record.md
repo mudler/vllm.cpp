@@ -28723,8 +28723,13 @@ killed every measured leg mid-load on the previous attempt.
    0.774 GiB on disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp`
    widens it to host f32 —
    [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which also affects
-   the Qwen3.6-27B path. Fixing #1359 should roughly HALVE this saving, and the
-   smaller figure will be the correct one.
+   the Qwen3.6-27B path. #1359's Qwen3-VL half has since LANDED, so this leg
+   rerun should read about 0.774 GiB rather than 1.542, and that HALVING IS
+   CORRECT rather than a regression — the flag now frees the tower the
+   checkpoint ships instead of the tower plus our widening. The figure recorded
+   here stands as what the run at `41ab550b9` measured; `muse-glimmer-30b` still
+   widens, blocked on
+   [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
 2. **Load-time residency, not a served request.**
    `ForwardQwen3VLForConditionalGeneration` `VT_CHECK`s `input.mm.has_value()`,
    so the `qwen3-vl` arms cannot run a completion and stop at `/health`. That is
@@ -28751,3 +28756,315 @@ the repository: `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log`
 (the harness report verbatim) and
 `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.legs.log` (five
 `/usr/bin/time -v` records, four server logs, the cmake configure).
+
+## TT P150 refresh at post-W2c main: the host-hybrid opt-out OUTPERFORMS the host-free eager DEFAULT 1.24x — the #1604 flip premise inverted (#2003); Mistral-7B eager warm reproduced at 9.8 tok/s (2026-08-26, `bench/tenstorrent-p150-refresh`, P150 `thalia`)
+
+Base `21fe11cf1` (origin/main, post-BACKEND-TENSTORRENT-QWEN35 W2a–W2c,
+#1715). TT Release build against
+`/home/lu_zero/Sources/tt/tt-metal/build_Release/lib64/cmake` +
+`.../share/cmake` — **the #1604-era `-DCMAKE_PREFIX_PATH=.../build_Release`
+recipe is STALE**: after the tt-metal rebase (`a3d33028975`, still carrying our
+`copy_default_tilized` patches) the exported configs moved to install layout
+and the stale top-level `tt-metalium-config.cmake` shadows `find_package`.
+One `$HOME/gpu.lock` hold across every leg, `tt-smi -r` inside it first; an
+idle leftover `vllm-server` (Qwen3.5-0.8B b32 on :8123) held that lock for
+3h08m and was stopped before any leg. Evidence:
+[`../docs/bench-evidence/tt-p150-refresh-20260826.log`](../docs/bench-evidence/tt-p150-refresh-20260826.log)
+(verbatim per-leg stderr). Workload. Workload: greedy, batch 1,
+prompt = "Write a short story about a robot learning to paint.".
+
+**L1 Qwen3-0.6B host-free A/B (`--repeat 5`, in-process run 1 discarded;
+order-alternated pairs ×3):** default host-free eager **median 10.822 tok/s**
+(n=12, 10.51–11.03) vs `VT_TT_HOST_FREE_DECODE=0` host-hybrid
+**median 13.369** (n=12; 13.09–13.55 across 11 of 12 legs, one 11.49 outlier).
+**The opt-out wins 1.24×** — the #1604 default-rate result read the other way.
+The DEFAULT arm is unchanged against its 2026-08-21 figures (10.94–11.06),
+within what no-clock-attribution can resolve, so the movement since then is a
+~2.5× improvement of the OPT-OUT arm with mechanism UNATTRIBUTED;
+[#2003](https://github.com/mudler/vllm.cpp/issues/2003) owns it and its next
+traceable step is a per-op delta of the host-hybrid path from `b86e3705f` to
+here. No clock window was sampled for ANY figure in this entry
+(`tools/bench/gpu_clock_state.py` is NVIDIA-only); ordering was alternated to
+cancel drift, but every number below is clock-unattributed and quotable only
+as such.
+
+**L2 Mistral-7B-v0.3 default arm (`--repeat 6`, whole-process JIT leg
+discarded per process, ~128 s each cold proc): warm median 9.817 tok/s**
+(n=15, 9.46–9.94), coherent greedy prose throughout. This REPLACES the
+2026-08-12 single-run 4.26 tok/s anecdote as the row's standing figure: that
+run had a different prompt and no lock or repetition discipline, so the ~2.3×
+difference is a reproduction-class upgrade rather than an attributable delta.
+No vLLM ratio exists or can: vLLM has no Tenstorrent backend.
+Checkpoint pin: `mistralai/Mistral-7B-v0.3` snapshot
+`caa1feb0e54d415e2df31207e5f4e273e33509b1`, 3 shards totalling
+14,496,080,928 bytes (bf16 arm; correctness standing on this line is the
+refreshed golden gate green at `c31cad9c1`). Qwen checkpoint =
+the documented `docs/USAGE.md` pin `c1899de289a04d12100db370d81485cdf75e47ca`.
+
+**L3 `kGdnDecode` op microbench (op-level ONLY — production-unreached until
+the #1715 wiring row): composed 1.148 ms/step vs
+`VT_TT_GDN_DECODE=chunked` 3.356** (B=8, GQA 2:8, Dk=Dv=128, 50 steps) —
+composed stays the right default at **2.92×**, agreeing with the W2 decision
+measured 2026-08-23 (1.139 vs 3.164). Steady-state traffic h2d=0 d2h=0 on BOTH
+arms (state shadow residency holds under load). Not published to the speed-gap
+rows: not an end-to-end number.
+
+Not retested here: the captured opt-in arm (27.1 tok/s single-request on the
+old tree) — multi-request capture still hangs
+([#1625](https://github.com/mudler/vllm.cpp/issues/1625)), TT async readback
+remains [#1627](https://github.com/mudler/vllm.cpp/issues/1627).
+## TT P150 #2003 RE-ADJUDICATED CLOCK-ATTRIBUTED: the inversion stands at governor parity — every busy sample of both arms at the 1350 MHz cap; tt_clock_state lands as the TT sibling of gpu_clock_state (#2005) (2026-08-26, `bench/tt-clock-state`, P150 `thalia`)
+
+Same binary (`21fe11cf1` bench build), workload, order-alternation, and lock
+discipline as the same-day unattributed entry above, PLUS a
+`tools/bench/tt_clock_state.py sample --leg-pid <pid>` window per arm
+(interval 1 s, duration 75 s, 53 samples each). Evidence:
+[`../docs/bench-evidence/tt-p150-clock-attributed-20260826.log`](../docs/bench-evidence/tt-p150-clock-attributed-20260826.log)
+(raw windows, judge verdicts, busy census).
+
+**Throughput (12 warm samples per arm):** default host-free eager
+**median 10.880** tok/s (mean 10.838) vs `VT_TT_HOST_FREE_DECODE=0`
+**median 13.645** (mean 13.520) — **ratio 1.254 median / 1.247 mean**,
+confirming the morning's 10.822-vs-13.369 unattributed result.
+
+**The clock finding that upgrades attribution.** The Blackhole P150 AICLK
+governor is TWO-STATE on this telemetry: 800 idle, pegged 1350 under load.
+Raw windows contain an idle pre-open head, so all six refuse within-run
+spread (40.74%) — correctly under rules written for quasi-continuous clocks.
+But the busy column was recorded LIVE per interval from pid-held
+/dev/tenstorrent fds, a criterion independent of outcome values: refolding
+to busy-only slices gives **six windows whose distinct AICLK set is exactly
+{1350} — min=median=max, spread 0.00%, cross-arm offsets 0/0% — and the
+pair judge returns PASS with zero reasons**
+(`tools/bench/tt_refold_busy.py`, rc=0). Both arms ran compute at identical,
+cap-pegged clocks. The inverted ratio is real at clock parity, not a clock
+excursion: **#2003 stays open as a genuine hybrid-path performance win owed
+a per-op delta explanation**, with the polarity question sharper than ever.
+
+Knowns recorded deliberately: claimed-max 1350 carries provenance
+"UNVERIFIED pin owed" in every summary; raw-window spread refusals are kept
+in the evidence log rather than hidden; the throttle-unobservability caveat
+ships inside every judged window until TT exposes a live bitmap.
+
+## Qwen3.5-0.8B on TT P150 — FIRST speed numbers: warm decode ~0.089 tok/s (~11.2 s/token), both host-free arms identical; the hybrid-GDN family runs ~100x slower than a 7B dense on the SAME board and the wall is neither polarity nor kernel-mode (2026-08-26, `bench/tt-clock-state`, P150 `thalia`)
+
+Row [`BACKEND-TENSTORRENT-QWEN35`](https://github.com/mudler/vllm.cpp/issues/1715)
+context, base `21fe11cf1`, production entry point (`vllm-cli --device auto`
+→ W2a allow-list dispatch, tt_cluster UMD lines in evidence). Every leg a
+fresh process under one `$HOME/gpu.lock`; one earlier unlogged JIT-warm probe was discarded before logging started. Evidence:
+[`../docs/bench-evidence/tt-qwen35-first-speed-20260826.log`](../docs/bench-evidence/tt-qwen35-first-speed-20260826.log).
+
+**Numbers (greedy b1):** default arm 12-token runs **0.080 / 0.089 / 0.089
+tok/s** — warm steady ≈ 11.2 s/token, reproduced exactly; opt-out arm
+(`VT_TT_HOST_FREE_DECODE=0`) **0.080 / 0.090 / 0.089 — IDENTICAL**, so the
+#2003/#1604 polarity question does not even arise for this family. One
+96-token generation at 0.084 tok/s (1148 s) is consistent with steady state,
+not a JIT artifact. Output coherent ("The hum of the machine's internal …"),
+finish_reason=length everywhere.
+
+**The finding.** Same board, same day: Mistral-7B bf16 decodes at 9.817
+tok/s and Qwen3-0.6B at 10.8–13.6; Qwen3.5-**0.8B** decodes at 0.089 —
+roughly **two orders of magnitude below a model 9x its size** running the
+identical backend build. The W2a paged-engine gate proves mixed-execution
+CORRECTNESS for this family (golden pairs committed), so device work is
+happening somewhere; nothing until today measured how much of the step runs
+off-device. Ranked hypotheses for the wall, unattributed by intent: (1) a
+per-layer host/reference fallback inside the hybrid-GDN stack dominates each
+step — plausible candidates are reference-matmul projections or attention
+paths lacking kTENSTORRENT providers, since 11.2 s/token over ~28 layers
+≈ 400 ms/layer-token, microseconds-scale per GDN kernel; (2) the host-staged
+KV path of `kPagedAttention`/`kReshapeAndCache` (`tenstorrent_ops.cpp:14`)
+paying per-step upload/download — but that lane carries Mistral to 9.8 tok/s,
+so it alone cannot explain 3 orders; (3) NOT the host-free polarity (A/B
+identical above) and NOT GDN kernel mode (composed vs chunked differ by
+milliseconds against an 11,000 ms step).
+
+Clock attribution: these figures are UNATTRIBUTED (no sampler window on the
+probes); given ~100% duty cycles over minutes-long steps both arms were near
+certainly cap-pegged throughout, which only sharpens the two-order gap.
+
+Owns the next lever: profile ONE eager decode step of this family on TT and
+name the dominant op before anyone registers more kernels blindly
+([#1715](https://github.com/mudler/vllm.cpp/issues/1715); captured tracing
+stays blocked behind #1625, so the first pass is eager-side).
+
+## QWEN3.5-0.8B TT EAGER STEP PROFILED: the wall is host-side staging around the TT matmul, not device kernels — `vt::Tensor::Numel()` alone is 27% of samples (#1715) (2026-08-27, `bench/tt-qwen35-profile`, P150 `thalia`)
+
+One eager decode step perf-sampled on the same production entry point as the first speed record
+(`vllm-cli --device auto`, JIT discard first, one `$HOME/gpu.lock` hold, greedy 3-token leg).
+Evidence: [`../docs/bench-evidence/tt-qwen35-eager-profile-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-profile-20260827.log)
+and its trace twin
+[`../docs/bench-evidence/tt-qwen35-eager-trace-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-trace-20260827.log). Leg: **28.934 s / 3 tokens = 0.104 tok/s**, reproducing the 0.089 first record
+at `a0db99b31` — the KV-GDN-STATE-BUDGET landing (`2a42cb369`) did not move this wall.
+
+**Attribution.** No device kernel appears in the top ranks. The flat profile is host dispatch
+wrapped around the TT GEMM: `vt::Tensor::Numel()` **27.09%** (called hot inside the staging path),
+CPU threadpool spin (`PollForWork`+`ThreadReady`) 11.4%, `memcpy` 7.0%, repeated TT-Metal
+context/device discovery (`MetalContext::instance` 5.8%, `Cluster::get_chip` 3.3%,
+`get_closest_mmio_capable_chip` 3.0%, `DeviceManager::get_active_device` 2.5%),
+`EnsureDevice2D` 4.1%, `bfloat16::from_float` 2.6%, CQ host bookkeeping ~5%.
+The trace leg adds one corroborating observation: paged attention falls back to the host
+every decode step (12x `PA device decode FAILED`, `tenstorrent_ops.cpp:927`).
+Call graph: **24.1% sits in `EnsureDevice2D` under `MatmulBTKernel`**, fed by `MatmulBf16D` —
+`DenseMlpBlock` 9.44% and `DenseLogitsF32D` 9.32%. The named ops are the dense-MLP bf16 GEMMs
+and the f32 logits GEMM; the cost is the host staging around each per-layer dispatch.
+
+**Control.** The same tree built without the TT backend runs the identical leg at **7.521 tok/s**
+(self-reported from the first, mistakenly CPU-built leg of this lever; its raw output was not
+retained — a sizing bound, not a gate result). The CPU fallback is ~73x faster than the current
+TT path for this model, bounding the fix:
+three orders of magnitude of host-side headroom before any device kernel is worth touching.
+
+Next lever inside #1715: cache the resolved context/device/chip handles across calls, remove the
+`Numel()` hot path (hoist shape math out of per-call staging), and batch per-layer staging.
+
+## QWEN3.5-0.8B TT EAGER DECODE W4: bulk bf16 staging + single-slot resolution moved the wall 0.104 -> 0.177 tok/s (+70%); `Numel()` 27% -> 1.8%; the residual lead is tt-metal's own per-upload context/UMD/CQ work, which our file set cannot cache (#2107) (2026-08-27, `bench/tt-qwen35-profile-w4`, P150 `thalia`)
+
+Levers 1+2 of the W4 breakdown, landed on `row/BACKEND-TENSTORRENT-QWEN35`:
+
+- **Lever 1 (bulk the staging loop).** `EnsureDevice2D` stages a contiguous bf16
+  master as ONE `ttnn::Tensor::from_span<bfloat16>` over the master's own bytes
+  (`UploadRowsBf16`): no `std::vector<float>` intermediate, no per-element
+  `LoadElemF32` dispatch, no `Numel()` in the loop condition, no extra copy in
+  `UploadRows`, and no host-side f32->bf16 pass (tt-metal's `to_dtype`
+  short-circuits on a matching dtype). Bit-identical by construction: bf16->f32
+  widening is exact and packing a zero-low-half value back to bf16 returns the
+  same bits. f16/f32 masters keep the f32 reference arm; the f32 logits GEMM
+  output keeps its declared dtype.
+- **Lever 2 (cache resolved handles behind the slot structures).** ONE locked
+  probe in `EnsureDevice2D` now resolves the tracked fast paths (exact-shape
+  hit, same-numel reshape), the interior-view refusal and the host-refresh flag
+  — the pre-W4 shape re-probed the slot map under the mutex up to four times
+  per call. The device handle was already the cached `SharedMeshDevice()`.
+- **Lever 3 (batch per-layer staging): NOT taken.** The wall moved, and the
+  re-profile attributes the residual to per-upload tt-metal-internal work
+  inside `from_span`->`to_device` (fresh device-buffer allocation, cluster
+  queries, CQ completion polling) and to CPU-threadpool spin — neither is
+  per-layer batching. The next traceable hypothesis is a per-slot persistent
+  device buffer written through the mesh command queue (allocation-free
+  upload), which needs the tt-metal-internal half of lever 2.
+
+**Measurement** — same method as the #1715 before record: production entry
+point (`vllm-cli --device auto`), JIT-discard run first, one `$HOME/gpu.lock`
+hold, greedy 3-token leg, `perf record -F 199 -g`. Before: 28.934 s / 3 =
+**0.104 tok/s**. After: 16.961 s / 3 = **0.177 tok/s** (+70%).
+
+**Attribution shift** (before -> after, `--no-children`):
+`vt::Tensor::Numel()` 27.09% -> 1.76%; `EnsureDevice2D` flat 4.14% -> below the
+0.5% limit; the `EnsureDevice2D`->`MatmulBTKernel` 24.1% call-graph chain ->
+gone from the top; `bfloat16::from_float` 2.62% -> 1.09% (download-side
+residual); `transform_buffers<float,bfloat16>` 2.63% -> 0.97%. What is now the
+lead: TT context/UMD discovery + CQ bookkeeping — `MetalContext::instance`
+9.11%, `DeviceManager::get_active_device` 6.49%, `Cluster::get_chip` 5.24%,
+`get_closest_mmio_capable_chip` 2.17%, `read_cq_host_ptr` 4.93% — ~14.5% of the
+bigger before-pie became ~23% of a 41% smaller pie (absolute seconds ~flat),
+plus CPU threadpool spin (`PollForWork`+`ThreadReady`) 11.4% -> 19.2%.
+Evidence: [`../docs/bench-evidence/tt-qwen35-eager-profile-w4-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-profile-w4-20260827.log)
+(top flat section + the complete callgraphs of the top three entries, verbatim).
+
+**Gates.** Focused doctest green (new W4 case, 1353 assertions; the route is
+pinned by new `vt::tenstorrent` staging counters — a deleted bulk branch, an
+unwired counter, a corrupted payload and a view-staging-the-base window each
+went red and were restored byte-for-byte). Full TT suite 40/40 cases, 3757
+assertions. Sacred e2e, ambient leg: **16/16 prompts PASS, 0 forward-divergent,
+max gap 375 milli-nats <= 500**. `VT_TT_HOST_FREE_DECODE=0` leg: **anchor
+drift, and it is PRE-EXISTING, not W4** — prompt[2] tok=1 engine=15039 vs
+committed anchor 1814 reproduces byte-identically on base `0ac84a486` with the
+W4 change stashed and the binary rebuilt from it. Evidence:
+[`../docs/bench-evidence/tt-qwen35-eager-leg2-anchor-drift-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-leg2-anchor-drift-20260827.log).
+Reported per the spec's stop conditions, not tuned, not waived: the eager
+leg-2 gate is honestly failing at this base and needs an owner outside the W4
+file set (engine/model layer, or a tt-metal pin move).
+
+**Open gaps.** The wall moved materially, so the Qwen3.5 TT row's next-gate
+cell in `docs/benchmarks/open-gaps.md` was updated with what moved and the
+per-slot-device-buffer hypothesis.
+## ROCM-KQUANT-NWARPS-DECODE — Q6_K decode gains a cooperative-warp arm, Q4_K/Q5_K measured and rejected (2026-08-26, `row/ROCM-KQUANT-NWARPS-DECODE`, [#1910](https://github.com/mudler/vllm.cpp/issues/1910))
+
+**Why this was measured.** #1910 found `KQuantGemmK` (RX 9060 XT, gfx1200,
+ROCm 7.2.3) idles 16 of 32 lanes on 195 of 259 decode dispatches, because
+`nsb = K/256 < 32`. The issue's own hypothesis (pack multiple outputs per
+warp) turned out to be the wrong port target: llama.cpp disables that path on
+every RDNA table and never benchmarked it there either way (`## Upstream
+anchor` in the row's spec). What llama.cpp does measure on RDNA4, for
+`ncols_dst == 1`, is `nwarps = 8` for `Q4_K`/`Q5_K`/`Q6_K` — that is what this
+row ports and measures against our own `Dot*K` bodies.
+
+**Full sweep, provenance, and every rejected width are in the row's own spec**,
+[`rocm-kquant-nwarps-decode.md`](specs/rocm-kquant-nwarps-decode.md)
+`## Outcome`, one `rocprofv3 --kernel-trace --stats` run per (format, shape),
+100 timed iterations after 20 warm-up, RX 9060 XT / gfx1200 / ROCm 7.2.3.
+That table is the primary record; this entry states only the shipped result
+and does not re-derive the sweep.
+
+**Result: `nwarps=8` ships for Q6_K only.** Q4_K and Q5_K lose 1.5x to 1.8x at
+every width {2, 4, 8} and every `nsb <= 32` shape measured, and the loss does
+not shrink as the split narrows — splitting a superblock re-reads its header
+once per warp and breaks one 128-byte contiguous quant read into eight
+32-byte ones, which costs a bandwidth-bound GEMV more than the extra resident
+warps buy. Q6_K wins because its per-lane dequant is register/scratch-heavy
+enough (272 B/thread scratch, 152 VGPRs single-warp vs 0 scratch, 72 VGPRs
+cooperative) that the occupancy gain outweighs the same traffic cost.
+`DotQ4K`/`DotQ5K`/`DotQ6K` are byte-for-byte the pre-row bodies; only Q6_K
+decode dispatches at `m == 1 && nsb <= 32` take the new
+`KQuantGemmKCoopQ6K<OutT, 8>` kernel.
+
+**End-to-end**, `rocprofv3` differencing `--max-tokens 4` against
+`--max-tokens 36` over 32 tokens, `Ornith-1.5-9B-Q4_K_M.gguf`, prompt "The
+capital of France is", batch 1, three runs per arm, spread under 0.9%:
+
+| | pre-row | this row | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmK<bf16, Q6_K>` family | 12.296 ms/tok | 11.154 | **1.102x** |
+| `KQuantGemm*` total | 22.566 | 21.459 | 1.052x |
+| total decode GPU time | 54.340 | 53.311 | 1.019x |
+
+The `nsb=48` shapes (`n=4096 k=12288`) keep their pre-row kernel and launch
+config unchanged, measured 345.9 -> 349.6 us/call, inside run-to-run spread —
+the no-regression bar `## Gate` set.
+
+**The issue's own 593 us/call figure was an average over three shapes and
+understated the true outlier 11x.** Bucketed by grid size: `nsb=48` at 345.9
+us/call (16 calls/tok), `n=1024` at 41.3 (4 calls/tok), and lm_head
+(`n=248320`, one call/tok) at **6562.7** — 53% of that bucket's time and 12%
+of all decode GPU time in one dispatch. After this row: lm_head 6562.7 ->
+5425.3 us/call (1.21x), `n=1024` 41.3 -> 27.1 (1.52x).
+
+**Correctness is byte-identity, not the family's NMSE tolerance.** The
+cross-warp reduction carries the integer `dp4a` accumulator, so partial sums
+reassemble exactly across warps and the one f32 scale expression per
+superblock is unchanged; `-ffp-contract=off` removes the remaining way two
+spellings could diverge. Verified host-side (80,000 random split
+combinations, 0 mismatches) and on hardware (`m==1` cooperative vs `m==2`
+single-warp on the identical activation row return identical bytes, Q4_K/
+Q5_K/Q6_K at `nsb` 16 and 48). Independently reproduced by a fresh review
+within 1% on every number above.
+
+**Standing gap, unrelated to this row's kernel.** `test_backend_cross_device`
+is red on gfx1200 before and after this row (`MoeSiluMul` bf16 exactness,
+proven pre-existing by reverting to the parent commit and rebuilding). Filed
+as [#1954](https://github.com/mudler/vllm.cpp/issues/1954); this row's gate
+is reported as one expected pre-existing failure, never as a clean pass.
+
+**Not established, and not claimed.** No ceiling. `QuantizeQ8KK`
+(#1876) is now the single largest decode kernel at 12.87 ms/tok, 24.2% of
+decode, unmoved by this row. `GroupedKQ8K` (the MoE path) and `Q8_0GemmK`
+are the same defect class and untouched. Row-packing (`rows_per_cuda_block`)
+for Q4_K/Q5_K is the open next hypothesis, not yet its own row. One model,
+one prompt, batch 1, gfx1200 only.
+
+### Reproduce
+
+```sh
+nix develop .#rocm-shell --command bash -c '
+  cmake -S . -B build-hip -G Ninja -DVLLM_CPP_HIP=ON \
+    -DVLLM_CPP_HIP_ARCHITECTURES=gfx1200 -DROCM_PATH=$ROCM_PATH \
+    -DCMAKE_BUILD_TYPE=Release &&
+  cmake --build build-hip -j4 &&
+  flock $HOME/gpu.lock -c '\''rocprofv3 --kernel-trace --stats \
+    -- build-hip/examples/vllm-cli --model Ornith-1.5-9B-Q4_K_M.gguf \
+    --max-tokens 4 --device auto'\'''
+```
+Differenced against the identical invocation at `--max-tokens 36`; both legs
+under the same `flock`, never interleaved with unrelated GPU work on this
+non-fleet box.

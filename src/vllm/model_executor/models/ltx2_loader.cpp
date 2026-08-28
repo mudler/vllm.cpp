@@ -923,9 +923,27 @@ const StTensor* Find(const SafetensorsFile& file, const std::string& name) {
   return &file.Get(name);
 }
 
-// Load one caption projection: the U8/NVFP4 weight AND the BF16 bias, which sit
-// on different dtype paths — the split ltx2_text_encoder.h:264-269 names as the
-// one a loader silently half-does.
+// Load one caption projection: the weight AND the BF16 bias, which sit on
+// different dtype paths — the split ltx2_text_encoder.h:264-269 names as the one
+// a loader silently half-does.
+//
+// The weight's STORAGE FORMAT is resolved from the file, never assumed, because
+// both shipped text encoders reach this function and they disagree about it. The
+// torchao file stores `video_aggregate_embed.weight` as U8 [4096, 94080] beside
+// a scale pair; the bf16 file stores it as BF16 [4096, 188160] with no scale
+// tensor anywhere in its 686 tensors. Assuming the first is what #2140 is: the
+// unconditional `* 2` doubled the bf16 file's already-logical 188160 to 376320
+// and the geometry check below then fired on this function's own arithmetic.
+//
+// The rule is upstream's, not a local heuristic. `_discover_nvfp4_layers`
+// (packages/ltx-core/src/ltx_core/quantization/nvfp4/prequant.py:30-50 at pin
+// fd4ded7f) selects a layer as NVFP4 only when `.weight_scale` and
+// `.weight_scale_2` are BOTH present (:35-36, :42-43) and the dtype triple is
+// U8 / F8_E4M3 / F32 (:47-48), and it treats exactly one of the pair as an error
+// rather than a fallback (:37-41). Everything the discovery does not select
+// stays the plain `torch.nn.Linear(flat_dim, video_inner_dim, bias=True)` that
+// built it (encoder_configurator.py:206-208), which stores ONE value per
+// element — so on that arm the stored width IS the logical width.
 Ltx2TextProjection LoadProjection(const SafetensorsFile& file, const std::string& module,
                                   int64_t in_features) {
   const StTensor* w = Find(file, module + ".weight");
@@ -934,33 +952,87 @@ Ltx2TextProjection LoadProjection(const SafetensorsFile& file, const std::string
     Fail("'" + module + ".weight' is rank " + std::to_string(w->shape.size()) +
          "; a caption projection is rank 2");
   }
-  Ltx2TextProjection proj;
-  proj.out_features = w->shape[0];
-  proj.in_features = w->shape[1] * 2;  // NVFP4 packs TWO values per byte
-  if (proj.in_features != in_features) {
-    Fail("'" + module + ".weight' unpacks to in_features " +
-         std::to_string(proj.in_features) + " but the Gemma geometry gives " +
-         std::to_string(in_features) +
-         " (hidden_size * (num_hidden_layers + 1), feature_extractor.py:120). Reading "
-         "the STORED U8 width as logical is what halves it.");
-  }
   const StTensor* s = Find(file, module + ".weight_scale");
   const StTensor* g = Find(file, module + ".weight_scale_2");
-  if (s == nullptr) Fail("the text encoder is missing '" + module + ".weight_scale'");
-  if (g == nullptr) Fail("the text encoder is missing '" + module + ".weight_scale_2'");
-  // Resolved, not assumed — even though this file is torchao and its marker is
-  // present. Hard-coding kTorchao here would make the projections the one NVFP4
-  // path in the loader that cannot notice a producer change.
-  const StTensor* m = Find(file, module + kLtx2TorchaoNvfp4MarkerSuffix);
-  Ltx2TorchaoNvfp4Marker marker;
-  if (m != nullptr) marker = ParseLtx2TorchaoNvfp4Marker(module, *m);
-  const Ltx2Nvfp4Producer producer = Ltx2ResolveNvfp4Producer(
-      module, m != nullptr ? &marker : nullptr, s->shape, proj.out_features,
-      proj.in_features);
-  proj.weight_bf16.resize(static_cast<size_t>(proj.out_features) *
-                          static_cast<size_t>(proj.in_features));
-  Ltx2DequantNvfp4ToBf16(module, *w, *s, *g, proj.out_features, proj.in_features,
-                         producer, proj.weight_bf16.data());
+  // prequant.py:37-41, verbatim in intent: "expected both or neither (NVFP4
+  // checkpoints pair them 1:1:1)". Half a pair is neither arm, and picking one
+  // would read real bytes under the other one's rule.
+  if ((s == nullptr) != (g == nullptr)) {
+    Fail("'" + module + "' carries '.weight_scale" +
+         std::string(s == nullptr ? "_2" : "") +
+         "' without its partner '.weight_scale" + std::string(s == nullptr ? "" : "_2") +
+         "'. An NVFP4 checkpoint pairs weight / weight_scale / weight_scale_2 1:1:1 "
+         "(_discover_nvfp4_layers, prequant.py:37-41), so this module is neither the "
+         "quantized form nor the plain BF16 one, and reading it under either rule "
+         "would read real bytes as the wrong values.");
+  }
+
+  Ltx2TextProjection proj;
+  proj.out_features = w->shape[0];
+
+  if (s == nullptr) {
+    // The plain arm. Upstream reaches it by never running the NVFP4 discovery
+    // over this module at all: `get_prequant_swap_module_ops` scopes its swap to
+    // `isinstance(model, LTXModel)` (prequant.py:204), which is the transformer
+    // and not the text encoder.
+    if (w->dtype != "BF16") {
+      Fail("'" + module + ".weight' is stored as " + w->dtype +
+           " with no '.weight_scale'/'.weight_scale_2' pair, so it is neither the "
+           "BF16 form nor the torchao-NVFP4 form this loader understands. Refusing "
+           "rather than reading its bytes as whichever of the two happens to parse.");
+    }
+    proj.in_features = w->shape[1];  // one value per element, so stored == logical
+    if (proj.in_features != in_features) {
+      Fail("'" + module + ".weight' is BF16 and stores in_features " +
+           std::to_string(proj.in_features) + ", but the Gemma geometry gives " +
+           std::to_string(in_features) +
+           " (hidden_size * (num_hidden_layers + 1), feature_extractor.py:120). An "
+           "UNQUANTIZED projection's stored width is already its logical one "
+           "(encoder_configurator.py:206-208), so this is not a packing question.");
+    }
+    const size_t bytes = static_cast<size_t>(proj.out_features) *
+                         static_cast<size_t>(proj.in_features) * sizeof(uint16_t);
+    if (w->nbytes != bytes) {
+      Fail("'" + module + ".weight' is BF16 " + ShapeText(w->shape) + " but holds " +
+           std::to_string(w->nbytes) + " bytes, not the " + std::to_string(bytes) +
+           " that shape requires");
+    }
+    proj.weight_bf16.resize(bytes / sizeof(uint16_t));
+    std::memcpy(proj.weight_bf16.data(), w->data, bytes);
+  } else {
+    // The NVFP4 arm, unchanged in every byte it reads. The U8 requirement is
+    // prequant.py:47-48's third clause, stated here rather than left implicit:
+    // upstream `continue`s past a mismatched triple and fails later inside
+    // `load_state_dict`, and this loader refuses by name instead, in the shape
+    // `TowerModule` already uses for the tower.
+    if (w->dtype != "U8") {
+      Fail("'" + module + ".weight' is " + w->dtype +
+           " beside a '.weight_scale'/'.weight_scale_2' pair; an NVFP4 weight is U8 "
+           "(prequant.py:47-48). Refusing rather than dequantizing bytes that were "
+           "never packed.");
+    }
+    proj.in_features = w->shape[1] * 2;  // NVFP4 packs TWO values per byte
+    if (proj.in_features != in_features) {
+      Fail("'" + module + ".weight' unpacks to in_features " +
+           std::to_string(proj.in_features) + " but the Gemma geometry gives " +
+           std::to_string(in_features) +
+           " (hidden_size * (num_hidden_layers + 1), feature_extractor.py:120). Reading "
+           "the STORED U8 width as logical is what halves it.");
+    }
+    // Resolved, not assumed — even though this file is torchao and its marker is
+    // present. Hard-coding kTorchao here would make the projections the one NVFP4
+    // path in the loader that cannot notice a producer change.
+    const StTensor* m = Find(file, module + kLtx2TorchaoNvfp4MarkerSuffix);
+    Ltx2TorchaoNvfp4Marker marker;
+    if (m != nullptr) marker = ParseLtx2TorchaoNvfp4Marker(module, *m);
+    const Ltx2Nvfp4Producer producer = Ltx2ResolveNvfp4Producer(
+        module, m != nullptr ? &marker : nullptr, s->shape, proj.out_features,
+        proj.in_features);
+    proj.weight_bf16.resize(static_cast<size_t>(proj.out_features) *
+                            static_cast<size_t>(proj.in_features));
+    Ltx2DequantNvfp4ToBf16(module, *w, *s, *g, proj.out_features, proj.in_features,
+                           producer, proj.weight_bf16.data());
+  }
 
   const StTensor* b = Find(file, module + ".bias");
   if (b != nullptr) {

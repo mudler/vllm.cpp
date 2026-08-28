@@ -24,6 +24,7 @@
 #define VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vt/ops.h"
@@ -41,6 +42,15 @@ enum class DflashBlockAttnRoute {
   // over `[0, ctx_len + tq)`. The block K/V become resident, which is the ONE
   // property that kept the draft off every split-KV lane (#1890).
   kPagedSeam = 1,
+  // THE THIRD ROUTE (#2089). `ForwardWithCtxKVDev` materializes one combined
+  // `[context ; block]` K/V per layer and calls `vt::DFlashBlockAttention` over
+  // it. This is what PRODUCTION runs at every `P > 1`, i.e. at every serving
+  // concurrency above one, and until W12 NOTHING counted it: both increments
+  // sat inside the `P == 1` branch, so a route gate read zero on both lanes
+  // while a third lane ran. `ClassifyDflashBlockAttn` never returns this value
+  // — the route is chosen by the caller's `P`, one level up — so it is noted at
+  // the call site by `NoteDflashCombinedAttn` and not by the classifier.
+  kMaterializedCombined = 2,
 };
 
 // Everything the decision reads, gathered on the caller so the predicate itself
@@ -301,10 +311,26 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
 struct DflashBlockRouteStats {
   int64_t paged_seam_calls = 0;
   int64_t block_kernel_calls = 0;
+  // #2089: the P>1 production lane, which had no counter at all.
+  int64_t materialized_combined_calls = 0;
+  // SPEC-DFLASH2 W12 D1 (#2087): the LAUNCH SHAPE of the last combined
+  // attention, read off the tensors that were actually passed. A count alone
+  // cannot see D1 — the lane is taken either way and the tokens are identical —
+  // so the gateable property is that the query spans the (1+k) BLOCK rows and
+  // not the `C + Tq` combined rows. Reverting D1 puts `Ncomb` in the first
+  // field and the assertion goes red on the shape, which is the only thing a
+  // CPU gate can see about a cost this large.
+  int64_t last_combined_query_rows = 0;
+  int64_t last_combined_key_rows = 0;
 };
 DflashBlockRouteStats GetDflashBlockRouteStats();
+// SPEC-DFLASH2 W13, closing #2112: the `[dflash-route]` line, without a trailing
+// newline. The second of the two counter families #2112 names as unreadable from
+// a server; the runner emits it beside `[graph-dispatch]` on the same cadence.
+std::string FormatDflashBlockRouteStats(const DflashBlockRouteStats& s);
 void ResetDflashBlockRouteStats();
 void NoteDflashBlockRoute(DflashBlockAttnRoute route);
+void NoteDflashCombinedAttn(int64_t query_rows, int64_t key_rows);
 
 }  // namespace detail
 }  // namespace vllm

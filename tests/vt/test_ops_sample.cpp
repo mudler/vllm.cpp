@@ -18,6 +18,16 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/sample_common.h"
+
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 
 using vt::Backend;
 using vt::Device;
@@ -936,4 +946,372 @@ TEST_CASE("ROCm apply_min_p / penalties surface matches CPU mask pattern") {
     if (std::isinf(lc[i])) CHECK(std::isinf(out[i]));
     else CHECK(out[i] == doctest::Approx(lc[i]).epsilon(1e-5));
   }
+}
+
+// ===========================================================================
+// #1984 — the parallel Gumbel draw selects the SAME token as the serial scan.
+//
+// The CUDA kernel cannot be compiled, let alone run, on a CPU-only host, so the
+// property it depends on is gated here instead, on the PRODUCTION code it
+// depends on: `vt::sample::ArgReduce`, `vt::sample::GumbelScore` and
+// `vt::sample::ArgBlocksPerRow` are the same inlines src/vt/cuda/cuda_sample.cu
+// compiles. A test that re-typed the reduction would prove the transcription
+// rather than the function, which is why they live in a shared header at all.
+//
+// What is NOT claimed here: that the kernel launches correctly, that its shared
+// memory is sized right, or that its scratch is safe. Those need a device, and
+// the CUDA equality case further down is what asks them.
+namespace {
+
+using vt::sample::ArgBlocksPerRow;
+using vt::sample::ArgReduce;
+using vt::sample::GumbelScore;
+using vt::sample::kArgSentinel;
+
+struct ArgPair {
+  float v;
+  int64_t i;
+};
+
+// The serial left-to-right scan the CPU reference performs, expressed over the
+// same operator, so "order-independent" is checked against the order that
+// actually defines the answer.
+ArgPair SerialReduce(const std::vector<float>& scores) {
+  ArgPair a{kNegInf, kArgSentinel};
+  for (int64_t j = 0; j < static_cast<int64_t>(scores.size()); ++j) {
+    ArgReduce(a.v, a.i, scores[static_cast<size_t>(j)], j);
+  }
+  return a;
+}
+
+// The EXACT two-pass decomposition src/vt/cuda/cuda_sample.cu launches: pass 1
+// gives block `blk` the elements `blk*block + t` strided by `blocks_per_row *
+// block` and reduces them within the block; pass 2 reduces the per-block
+// partials. `block` mirrors the kernel's kBlock.
+ArgPair TwoPassReduce(const std::vector<float>& scores, int block) {
+  const int64_t v = static_cast<int64_t>(scores.size());
+  const int bpr = ArgBlocksPerRow(v, block);
+  std::vector<ArgPair> partials;
+  partials.reserve(static_cast<size_t>(bpr));
+  for (int blk = 0; blk < bpr; ++blk) {
+    // Per-thread accumulation, then the in-block tree reduction.
+    std::vector<ArgPair> lanes(static_cast<size_t>(block), ArgPair{kNegInf, kArgSentinel});
+    const int64_t stride = static_cast<int64_t>(bpr) * block;
+    for (int t = 0; t < block; ++t) {
+      ArgPair& lane = lanes[static_cast<size_t>(t)];
+      for (int64_t j = static_cast<int64_t>(blk) * block + t; j < v; j += stride) {
+        ArgReduce(lane.v, lane.i, scores[static_cast<size_t>(j)], j);
+      }
+    }
+    for (int s = block / 2; s > 0; s >>= 1) {
+      for (int t = 0; t < s; ++t) {
+        ArgReduce(lanes[static_cast<size_t>(t)].v, lanes[static_cast<size_t>(t)].i,
+                  lanes[static_cast<size_t>(t + s)].v, lanes[static_cast<size_t>(t + s)].i);
+      }
+    }
+    partials.push_back(lanes[0]);
+  }
+  std::vector<ArgPair> lanes(static_cast<size_t>(block), ArgPair{kNegInf, kArgSentinel});
+  for (int t = 0; t < block; ++t) {
+    for (int j = t; j < bpr; j += block) {
+      ArgReduce(lanes[static_cast<size_t>(t)].v, lanes[static_cast<size_t>(t)].i,
+                partials[static_cast<size_t>(j)].v, partials[static_cast<size_t>(j)].i);
+    }
+  }
+  for (int s = block / 2; s > 0; s >>= 1) {
+    for (int t = 0; t < s; ++t) {
+      ArgReduce(lanes[static_cast<size_t>(t)].v, lanes[static_cast<size_t>(t)].i,
+                lanes[static_cast<size_t>(t + s)].v, lanes[static_cast<size_t>(t + s)].i);
+    }
+  }
+  return lanes[0];
+}
+
+// A deterministic 32-bit mixer, so the cases below need no <random> and repeat
+// byte for byte on every platform.
+uint32_t Mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+// The row shapes that break a careless parallel argmax, plus one ordinary one.
+enum class RowKind { kAllEqual, kOneHot, kTopKMasked, kSoftmax, kAllZero, kTailMax };
+
+std::vector<float> MakeProbRow(RowKind kind, int64_t v, uint32_t salt) {
+  std::vector<float> row(static_cast<size_t>(v), 0.0f);
+  switch (kind) {
+    case RowKind::kAllEqual:
+      // Every prob identical => the score ordering is decided purely by the
+      // noise, and equal probs are where a tie-break bug is most likely.
+      for (auto& x : row) x = 1.0f / static_cast<float>(v);
+      break;
+    case RowKind::kOneHot:
+      row[static_cast<size_t>(Mix32(salt) % static_cast<uint32_t>(v))] = 1.0f;
+      break;
+    case RowKind::kTopKMasked:
+      // What #1985 makes the common case: top-k has zeroed all but 20 entries,
+      // so almost every score is an exact 0.0f and the winner is far from
+      // index 0.
+      for (int k = 0; k < 20; ++k) {
+        const auto idx = static_cast<size_t>(Mix32(salt + static_cast<uint32_t>(k)) %
+                                             static_cast<uint32_t>(v));
+        row[idx] = 0.05f;
+      }
+      break;
+    case RowKind::kSoftmax: {
+      float sum = 0.0f;
+      for (int64_t j = 0; j < v; ++j) {
+        const float e = std::exp(
+            static_cast<float>(Mix32(salt + static_cast<uint32_t>(j)) % 1000u) / 250.0f);
+        row[static_cast<size_t>(j)] = e;
+        sum += e;
+      }
+      for (auto& x : row) x /= sum;
+      break;
+    }
+    case RowKind::kAllZero:
+      // Every score is 0/q == 0: a whole row of ties. The answer must be index
+      // 0, exactly as the serial scan gives.
+      break;
+    case RowKind::kTailMax:
+      // The winner is the LAST element, so a decomposition that drops the ragged
+      // tail of a row cannot pass.
+      row[static_cast<size_t>(v - 1)] = 1.0f;
+      break;
+  }
+  return row;
+}
+
+}  // namespace
+
+TEST_CASE("ArgReduce is order-independent, including on exact ties") {
+  // The defect a careless parallelisation introduces: translate the serial
+  // rule as `if (b.v > a.v) a = b;` and the answer becomes order-DEPENDENT,
+  // because reducing right-to-left then keeps the HIGHEST tied index. Deleting
+  // the `bi < ai` clause in vt/sample_common.h must turn this case red.
+  for (uint32_t salt = 0; salt < 8; ++salt) {
+    std::vector<float> scores(97);
+    for (size_t j = 0; j < scores.size(); ++j) {
+      // Deliberately coarse, so exact ties are the common case rather than a
+      // measure-zero accident.
+      scores[j] = static_cast<float>(Mix32(salt * 31u + static_cast<uint32_t>(j)) % 5u);
+    }
+    const ArgPair forward = SerialReduce(scores);
+
+    std::vector<float> reversed(scores.rbegin(), scores.rend());
+    ArgPair backward{kNegInf, kArgSentinel};
+    for (int64_t j = static_cast<int64_t>(scores.size()) - 1; j >= 0; --j) {
+      ArgReduce(backward.v, backward.i, scores[static_cast<size_t>(j)], j);
+    }
+    CAPTURE(salt);
+    CHECK(backward.i == forward.i);
+    CHECK(backward.v == forward.v);
+
+    // ...and the same under the kernel's own decomposition, at several block
+    // widths, so the answer cannot depend on how the row was cut up.
+    for (const int block : {1, 2, 8, 32, 256}) {
+      CAPTURE(block);
+      CHECK(TwoPassReduce(scores, block).i == forward.i);
+    }
+  }
+
+  // An unfilled lane never wins, even against an all -inf row: the sentinel is
+  // what makes index 0 the answer for a fully masked row.
+  const std::vector<float> all_neg_inf(300, kNegInf);
+  CHECK(SerialReduce(all_neg_inf).i == 0);
+  CHECK(TwoPassReduce(all_neg_inf, 256).i == 0);
+}
+
+TEST_CASE("random_sample: the two-pass decomposition equals the serial reference") {
+  // Every row shape, every vocabulary width that straddles a block boundary,
+  // several seeds. The reference is `vt::RandomSample` on the CPU backend --
+  // the production op, not a re-typed scan.
+  const std::vector<int64_t> widths = {1, 2, 3, 255, 256, 257, 511, 1000, 65536, 248320};
+  const std::vector<RowKind> kinds = {RowKind::kAllEqual,    RowKind::kOneHot,
+                                      RowKind::kTopKMasked,  RowKind::kSoftmax,
+                                      RowKind::kAllZero,     RowKind::kTailMax};
+  for (const int64_t v : widths) {
+    for (size_t ki = 0; ki < kinds.size(); ++ki) {
+      for (const int64_t seed : {int64_t{0}, int64_t{1}, int64_t{700}, int64_t{-9}}) {
+        CAPTURE(v);
+        CAPTURE(ki);
+        CAPTURE(seed);
+        const std::vector<float> row =
+            MakeProbRow(kinds[ki], v, static_cast<uint32_t>(v * 7 + ki));
+
+        // The reference: the CPU op, one row.
+        std::vector<float> probs = row;
+        std::vector<int64_t> seeds = {seed};
+        std::vector<int64_t> out = {-1};
+        Tensor tp = F32_2(probs, 1, v);
+        Tensor ts = I64_1(seeds, 1);
+        Tensor to = I64_1(out, 1);
+        Queue q = Q();
+        vt::RandomSample(q, to, tp, ts);
+
+        // The decomposition, over the same production score expression.
+        std::vector<float> scores(static_cast<size_t>(v));
+        for (int64_t j = 0; j < v; ++j) {
+          scores[static_cast<size_t>(j)] =
+              GumbelScore(row[static_cast<size_t>(j)], static_cast<uint64_t>(seed), 0, j);
+        }
+        CHECK(TwoPassReduce(scores, 256).i == out[0]);
+      }
+    }
+  }
+}
+
+TEST_CASE("random_sample: a batch reduces row by row, and rows do not interfere") {
+  // The kernel gives each row its own blockIdx.y and its own scratch slice, so
+  // the batched answer has to equal the per-row answers computed alone. A
+  // decomposition that indexed the scratch by block alone would pass every
+  // single-row case above and fail here.
+  const int64_t n = 5, v = 1000;
+  std::vector<float> probs(static_cast<size_t>(n * v));
+  std::vector<int64_t> seeds(static_cast<size_t>(n));
+  const std::vector<RowKind> kinds = {RowKind::kAllEqual, RowKind::kTopKMasked,
+                                      RowKind::kSoftmax, RowKind::kAllZero,
+                                      RowKind::kTailMax};
+  for (int64_t i = 0; i < n; ++i) {
+    seeds[static_cast<size_t>(i)] = 100 + i;
+    const std::vector<float> row =
+        MakeProbRow(kinds[static_cast<size_t>(i)], v, static_cast<uint32_t>(i));
+    std::copy(row.begin(), row.end(), probs.begin() + static_cast<size_t>(i * v));
+  }
+  std::vector<int64_t> out(static_cast<size_t>(n), -1);
+  Tensor tp = F32_2(probs, n, v);
+  Tensor ts = I64_1(seeds, n);
+  Tensor to = I64_1(out, n);
+  Queue q = Q();
+  vt::RandomSample(q, to, tp, ts);
+
+  for (int64_t i = 0; i < n; ++i) {
+    CAPTURE(i);
+    std::vector<float> scores(static_cast<size_t>(v));
+    for (int64_t j = 0; j < v; ++j) {
+      scores[static_cast<size_t>(j)] =
+          GumbelScore(probs[static_cast<size_t>(i * v + j)],
+                      static_cast<uint64_t>(seeds[static_cast<size_t>(i)]), i, j);
+    }
+    CHECK(TwoPassReduce(scores, 256).i == out[static_cast<size_t>(i)]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CUDA: the parallel path and the RETAINED serial path must agree EXACTLY.
+//
+// Why this is a subprocess A/B rather than two calls. `VT_FAST_RANDOM_SAMPLE`
+// is latched in a function-local static on first use (as VT_FAST_ARGMAX is), so
+// one process can only ever exercise one arm. The parent below therefore
+// re-execs THIS binary twice, once per arm, and requires the printed token ids
+// to be byte-identical. That is a same-binary A/B in the sense AGENTS.md means:
+// one build, one input, two selections of the code under test.
+//
+// It has to be exact rather than statistical, and the distinction matters. The
+// CPU-vs-CUDA case above can only be statistical, because host and device
+// evaluate `-log(u)` through different libm and IEEE-754 does not require a
+// correctly-rounded transcendental, so a near-tied row can flip on one ULP.
+// Here both arms are the same device libm on the same inputs and differ only in
+// the ORDER the identical floats are combined -- and ArgReduce is
+// order-independent -- so any difference at all is a defect.
+//
+// Both cases print WHICH arm they measured, in words, in their own output.
+namespace {
+
+// The shapes the child reports on, in one place so both arms enumerate the same
+// ones. 248320 is Qwen3.8-27B's vocabulary, the width #1984 is about.
+const std::vector<int64_t> kAbWidths = {1, 2, 255, 256, 257, 1000, 65536, 248320};
+
+std::string RunSelf(const char* arm) {
+  char exe[4096];
+  const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  REQUIRE(n > 0);
+  exe[n] = '\0';
+  const std::string cmd = "VT_FAST_RANDOM_SAMPLE=" + std::string(arm) + " " +
+                          std::string(exe) +
+                          " --no-skip --test-case='random_sample_ab_child' 2>&1";
+  FILE* pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  std::string out;
+  std::array<char, 4096> buf{};
+  while (std::fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) out += buf.data();
+  REQUIRE(::pclose(pipe) != -1);
+  // Keep only the payload lines, so a doctest banner or a device warning cannot
+  // make the two arms differ for a reason that is not the kernel.
+  std::string ids;
+  size_t pos = 0;
+  while (pos < out.size()) {
+    const size_t eol = out.find('\n', pos);
+    const std::string line = out.substr(pos, eol == std::string::npos ? eol : eol - pos);
+    if (line.rfind("IDS ", 0) == 0) ids += line + "\n";
+    if (eol == std::string::npos) break;
+    pos = eol + 1;
+  }
+  return ids;
+}
+
+}  // namespace
+
+// The CHILD. Skipped in a normal run; the parent re-execs it by name.
+TEST_CASE("random_sample_ab_child" * doctest::skip()) {
+  if (!HasCuda()) {
+    std::cout << "IDS no-cuda\n" << std::flush;
+    std::exit(0);
+  }
+  const char* arm = std::getenv("VT_FAST_RANDOM_SAMPLE");
+  std::cout << "IDS arm=" << (arm == nullptr ? "unset(fast)" : arm) << "\n";
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  const std::vector<RowKind> kinds = {RowKind::kAllEqual, RowKind::kTopKMasked,
+                                      RowKind::kSoftmax, RowKind::kAllZero};
+  for (const int64_t v : kAbWidths) {
+    const int64_t n = 4;
+    std::vector<float> probs(static_cast<size_t>(n * v));
+    std::vector<int64_t> seeds(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      seeds[static_cast<size_t>(i)] = 700 + i;
+      const std::vector<float> row =
+          MakeProbRow(kinds[static_cast<size_t>(i)], v, static_cast<uint32_t>(v + i));
+      std::copy(row.begin(), row.end(), probs.begin() + static_cast<size_t>(i * v));
+    }
+    QueueGuard gq(gpu);
+    DeviceTensor dp(gpu, gq.q, DType::kF32, {n, v}, probs.data());
+    DeviceTensor ds(gpu, gq.q, DType::kI64, {n}, seeds.data());
+    DeviceTensor did(gpu, gq.q, DType::kI64, {n});
+    vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
+    std::vector<int64_t> ids(static_cast<size_t>(n));
+    did.Download(gq.q, ids.data());
+    std::cout << "IDS v=" << v;
+    for (const int64_t id : ids) std::cout << " " << id;
+    std::cout << "\n";
+  }
+  std::cout << std::flush;
+  std::exit(0);
+}
+
+TEST_CASE("CUDA random_sample: the parallel path is BIT-IDENTICAL to the serial one") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping (GPU-pending)");
+    return;
+  }
+  const std::string parallel = RunSelf("1");
+  const std::string serial = RunSelf("0");
+  MESSAGE("compared VT_FAST_RANDOM_SAMPLE=1 (the two-pass reduction) against "
+          "VT_FAST_RANDOM_SAMPLE=0 (the retained single-thread scan), same binary");
+  INFO("parallel arm:\n" << parallel << "serial arm:\n" << serial);
+  REQUIRE_FALSE(parallel.empty());
+  REQUIRE(parallel.find("IDS v=248320") != std::string::npos);
+  // Only the arm label may differ.
+  std::string a = parallel, b = serial;
+  const auto strip_arm = [](std::string& t) {
+    const size_t p = t.find("IDS arm=");
+    if (p == std::string::npos) return;
+    t.erase(p, t.find('\n', p) - p + 1);
+  };
+  strip_arm(a);
+  strip_arm(b);
+  CHECK(a == b);
 }

@@ -28,6 +28,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/config/generation.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -1971,4 +1972,343 @@ TEST_CASE("serving_chat: streaming with tools but content-only is unchanged") {
   CHECK_FALSE(streamed.empty());
   REQUIRE(last_finish.has_value());
   CHECK(*last_finish == "length");  // engine finish, NOT "tool_calls"
+}
+
+// ─── REACHABILITY: the checkpoint's sampling defaults reach the sampler (#1985) ─
+//
+// AGENTS.md `## Nothing lands dead`, and .agents/reachability.md's method: a
+// unit test that hands `to_sampling_params` a hand-built DefaultSamplingParams
+// proves the resolution works and says nothing about whether a served request
+// ever meets one. So this block never constructs the defaults itself. It reads a
+// real generation_config.json off disk with the production `LoadHfConfig`,
+// narrows it with the production `GetDiffSamplingParam`, and then enters through
+// `OpenAIServingCompletion::create_completion` / `create_chat_completion` — the
+// handler entry the HTTP layer calls.
+//
+// THE REACHABILITY MUTATION: turn either
+//   request.to_sampling_params(std::nullopt, &default_sampling_params_)
+// back into `request.to_sampling_params()` in serving_completion.cpp or
+// serving_chat.cpp, and these cases go RED.
+//
+// The observable is deliberately generative rather than a getter. A checkpoint
+// that ships `"temperature": 0.0` makes an omitted-temperature request GREEDY,
+// and greedy output is exactly computable by asking the same engine with an
+// explicit temperature 0. If the defaults do not reach the sampler the request
+// resolves to temperature 1.0 and samples instead, so the two texts part.
+namespace {
+
+// A checkpoint directory holding only a generation_config.json — everything the
+// production read needs, since LoadHfConfig takes the config.json path and reads
+// its SIBLING.
+class TempGenerationConfigDir {
+ public:
+  explicit TempGenerationConfigDir(const std::string& gen_body) {
+    static int counter = 0;
+    dir_ = (std::filesystem::temp_directory_path() /
+            ("vllm_serving_gencfg_" + std::to_string(counter++)))
+               .string();
+    std::filesystem::create_directories(dir_);
+    std::ofstream(dir_ + "/config.json", std::ios::binary) << R"({
+      "model_type": "llama",
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 8,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "vocab_size": 32,
+      "max_position_embeddings": 128
+    })";
+    std::ofstream(dir_ + "/generation_config.json", std::ios::binary) << gen_body;
+  }
+  ~TempGenerationConfigDir() { std::filesystem::remove_all(dir_); }
+  std::string config_path() const { return dir_ + "/config.json"; }
+
+ private:
+  std::string dir_;
+};
+
+// The production chain, with nothing hand-built: file -> HfConfig -> narrowing.
+vllm::DefaultSamplingParams DefaultsFromDisk(const std::string& gen_body) {
+  TempGenerationConfigDir ckpt(gen_body);
+  return vllm::GetDiffSamplingParam(vllm::LoadHfConfig(ckpt.config_path()),
+                                    vllm::kGenerationConfigAuto);
+}
+
+}  // namespace
+
+TEST_CASE("serving_completion: the checkpoint's sampling defaults reach the sampler") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 6;
+
+  // The checkpoint asks for greedy decoding and a top-k, exactly as a real
+  // generation_config.json does; only `temperature` is observable in the text.
+  const vllm::DefaultSamplingParams d =
+      DefaultsFromDisk(R"({"temperature": 0.0, "top_k": 20, "top_p": 0.95})");
+  REQUIRE(d.temperature.has_value());
+  REQUIRE(*d.temperature == doctest::Approx(0.0));
+
+  Harness h(c, w, tok);
+
+  // The reference: the same engine asked EXPLICITLY for greedy.
+  OpenAIServingCompletion reference(h.engine, "test-model");
+  CompletionRequest explicit_greedy;
+  explicit_greedy.prompt = "hello";
+  explicit_greedy.max_tokens = kN;
+  explicit_greedy.temperature = 0.0;
+  CompletionResult ref = reference.create_completion(explicit_greedy);
+  REQUIRE(ref.response.has_value());
+  const std::string greedy_text = ref.response->choices.at(0).text;
+  REQUIRE_FALSE(greedy_text.empty());
+
+  // The request `vllm bench serve` now sends: no temperature, no top_k, no
+  // top_p. It must resolve to the checkpoint's values and therefore reproduce
+  // the greedy text.
+  OpenAIServingCompletion serving(h.engine, "test-model");
+  serving.set_default_sampling_params(d);
+  CompletionRequest omitted;
+  omitted.prompt = "hello";
+  omitted.max_tokens = kN;
+  CompletionResult res = serving.create_completion(omitted);
+  REQUIRE(res.response.has_value());
+  CHECK(res.response->choices.at(0).text == greedy_text);
+
+  // And an EXPLICIT request value still wins over the checkpoint: asking for
+  // top_k = 1 keeps the draw deterministic while leaving temperature at the
+  // checkpoint's 0.0, so the text is unchanged; asking for a temperature the
+  // checkpoint did not name is what a client is entitled to do.
+  OpenAIServingCompletion overridden(h.engine, "test-model");
+  overridden.set_default_sampling_params(d);
+  CompletionRequest explicit_topk;
+  explicit_topk.prompt = "hello";
+  explicit_topk.max_tokens = kN;
+  explicit_topk.top_k = 1;
+  CompletionResult over = overridden.create_completion(explicit_topk);
+  REQUIRE(over.response.has_value());
+  CHECK(over.response->choices.at(0).text == greedy_text);
+}
+
+TEST_CASE("serving_chat: the checkpoint's sampling defaults reach the sampler") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 6;
+
+  const vllm::DefaultSamplingParams d =
+      DefaultsFromDisk(R"({"temperature": 0.0, "top_k": 20})");
+  Harness h(c, w, tok);
+
+  const auto ask = [&](bool wire_defaults, bool explicit_greedy) {
+    OpenAIServingChat chat(h.engine, "test-model", InVocabChatPrompt);
+    if (wire_defaults) chat.set_default_sampling_params(d);
+    ChatCompletionRequest req;
+    req.messages.push_back(ChatMessage{"user", "hello", {}, {}, {}});
+    req.max_tokens = kN;
+    if (explicit_greedy) req.temperature = 0.0;
+    ChatCompletionResult r = chat.create_chat_completion(req);
+    REQUIRE(r.response.has_value());
+    REQUIRE_FALSE(r.response->choices.empty());
+    const auto& content = r.response->choices.at(0).message.content;
+    REQUIRE(content.has_value());
+    return *content;
+  };
+
+  const std::string greedy_text = ask(/*wire_defaults=*/false, /*explicit_greedy=*/true);
+  REQUIRE_FALSE(greedy_text.empty());
+  CHECK(ask(/*wire_defaults=*/true, /*explicit_greedy=*/false) == greedy_text);
+}
+
+TEST_CASE("serving: no server defaults leaves the resolution exactly as it was") {
+  // --generation-config vllm, and every handler constructed before #1985: the
+  // knob-free request must resolve the way it always did. This is the inertness
+  // half of the gate above -- without it, a wiring that ALWAYS applied some
+  // default would pass the positive case.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+  CHECK(serving.default_sampling_params().empty());
+
+  // GetDiffSamplingParam("vllm") is what the flag resolves to, and it must be
+  // empty even when the checkpoint ships a full file.
+  TempGenerationConfigDir ckpt(R"({"temperature": 0.0, "top_k": 20, "top_p": 0.95})");
+  const HfConfig loaded = vllm::LoadHfConfig(ckpt.config_path());
+  CHECK(vllm::GetDiffSamplingParam(loaded, vllm::kGenerationConfigNone).empty());
+  CHECK_FALSE(vllm::GetDiffSamplingParam(loaded, vllm::kGenerationConfigAuto).empty());
+}
+
+// ─── #1817: the ClampPromptLogprobs CALL SITES, measured ─────────────────────
+// clamp_prompt_logprobs (vllm/entrypoints/generate/base/serving.py:305-317 @
+// 555967922) rewrites a -inf prompt logprob to -9999.0, because JSON has no
+// spelling for infinity. The FUNCTION is gated in test_protocol.cpp. Its two
+// CALL SITES -- serving_completion.cpp:355 and serving_chat.cpp:1055 -- were
+// reached and NOT measured: deleting either one kept this gate green (#1815
+// mutation M6), because no fixture here ever produced a -inf.
+//
+// Upstream produces one at logits_processor.py:183, which masks the vocabulary
+// padding columns to -inf; a full-vocabulary prompt_logprobs request then
+// carries them. This tree has no vocabulary padding, and
+// ComputeLogprobsKernel (src/vt/cpu/cpu_sample.cpp:172-185) computes
+// `row[j] - lse`, which is finite for finite logits. So the fixture below puts
+// the -inf in the logits themselves, and pins its SIGN by construction:
+//
+//   * lm_head is bf16 [H, V] and logit(t) = sum_h hidden[h] * lm_head[h][t].
+//     Row h0 of column t holds bf16 -inf and every other row of that column
+//     holds 0, so the logit is `-inf * hidden[h0]` and nothing else.
+//   * hidden[h0] must be POSITIVE at every prompt position. A negative one
+//     makes the logit +inf, the row maximum +inf, and log_softmax returns NaN
+//     for that whole position. So every embed_tokens row carries +100.0 at h0
+//     -- the residual stream then holds +100 at h0 for every token, against
+//     layer outputs of order 0.1 -- and final_norm[h0] is +1.0. RMS norm keeps
+//     the sign, so the product is negative infinity at every position.
+//
+// Measured while writing this: with the embedding left alone, 26 of the 32
+// choices of h0 gave NaN at one or more of the four scored positions of a
+// five-token prompt, because hidden[h0] changed sign between positions. The
+// embedding pin is what removes that, and a drift that defeats it still shows
+// up as NaN, which fails the exact comparison below rather than passing it.
+//
+// The request asks for `prompt_logprobs: -1` (the whole vocabulary), so the
+// poisoned entry appears at EVERY scored position instead of only where it
+// happens to be the position's target token.
+namespace {
+
+constexpr int32_t kNegInfTokenId = 5;   // "r" in the tiny BPE fixture.
+constexpr int kNegInfHiddenDim = 0;     // h0.
+constexpr float kNegInfResidualPin = 100.0f;
+
+Qwen3_5MoeWeights MakeNegInfLogitWeights(const HfConfig& c) {
+  Qwen3_5MoeWeights w = MakeWeights(c);
+  const size_t H = static_cast<size_t>(c.hidden_size);
+  const size_t V = static_cast<size_t>(c.vocab_size);
+  const size_t h0 = static_cast<size_t>(kNegInfHiddenDim);
+  const size_t t = static_cast<size_t>(kNegInfTokenId);
+
+  // embed_tokens is bf16 [vocab, H]: pin column h0 of every row.
+  auto* embed = reinterpret_cast<uint16_t*>(w.embed_tokens.bytes.data());
+  for (size_t v = 0; v < V; ++v)
+    embed[v * H + h0] = vt::F32ToBF16(kNegInfResidualPin);
+
+  // final_norm is bf16 [H]: a positive scale keeps the pinned sign.
+  auto* norm = reinterpret_cast<uint16_t*>(w.final_norm.bytes.data());
+  norm[h0] = vt::F32ToBF16(1.0f);
+
+  // lm_head is bf16 [H, vocab]: column t is -inf at h0 and zero elsewhere.
+  auto* head = reinterpret_cast<uint16_t*>(w.lm_head.bytes.data());
+  for (size_t h = 0; h < H; ++h)
+    head[h * V + t] = (h == h0)
+        ? vt::F32ToBF16(-std::numeric_limits<float>::infinity())
+        : vt::F32ToBF16(0.0f);
+  return w;
+}
+
+// The shared assertions over one served payload: the poisoned entry carries the
+// clamp's exact constant at every scored position, and its neighbours do not.
+void CheckClampedPromptLogprobs(const vllm::PromptLogprobs& plp) {
+  REQUIRE(plp.size() >= 2u);
+  CHECK_FALSE(plp[0].has_value());  // the first prompt token has no predecessor
+  for (size_t pos = 1; pos < plp.size(); ++pos) {
+    REQUIRE(plp[pos].has_value());
+    const vllm::Logprob* poisoned = plp[pos]->find(kNegInfTokenId);
+    REQUIRE(poisoned != nullptr);
+    // The assertion the deleted call site fails, and it fails as -inf.
+    CHECK(std::isfinite(poisoned->logprob));
+    // Exact, not doctest::Approx: the clamp ASSIGNS this constant, and Approx
+    // at this scale accepts anything within about 0.12 of it.
+    CHECK(poisoned->logprob == -9999.0f);
+
+    // A clamp that rewrote the whole position would be red here: every other
+    // entry keeps its own finite log-probability.
+    size_t others = 0;
+    for (const int32_t id : plp[pos]->order) {
+      if (id == kNegInfTokenId) continue;
+      const vllm::Logprob* lp = plp[pos]->find(id);
+      REQUIRE(lp != nullptr);
+      CHECK(std::isfinite(lp->logprob));
+      CHECK(lp->logprob < 0.0f);
+      CHECK(lp->logprob > -9000.0f);
+      ++others;
+    }
+    CHECK(others > 0u);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("serving_completion: a -inf prompt logprob is served as -9999.0") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeNegInfLogitWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+
+  CompletionRequest req;
+  req.prompt = "hello world hello world";
+  req.max_tokens = 2;
+  req.temperature = 0.0;
+  req.stream = false;
+  req.prompt_logprobs = -1;  // the whole vocabulary
+
+  CompletionResult res = serving.create_completion(req);
+  REQUIRE(res.response.has_value());
+  REQUIRE_FALSE(res.response->choices.empty());
+  REQUIRE(res.response->choices[0].prompt_logprobs.has_value());
+  CheckClampedPromptLogprobs(*res.response->choices[0].prompt_logprobs);
+
+  // The reason the clamp exists: nlohmann::json DUMPS a non-finite float as
+  // `null`, so an unclamped payload loses the value AND its type over the wire.
+  // The round trip through dump() is the point -- the in-memory json still
+  // holds -inf as a number, and only the serialized bytes show the loss.
+  const json j = json::parse(json(*res.response).dump());
+  const json& plp = j.at("choices").at(0).at("prompt_logprobs");
+  REQUIRE(plp.is_array());
+  REQUIRE(plp.size() >= 2u);
+  CHECK(plp.at(0).is_null());  // no predecessor for the first prompt token
+  const json& entry =
+      plp.at(1).at(std::to_string(kNegInfTokenId)).at("logprob");
+  REQUIRE(entry.is_number());
+  // Exact, for the same reason the struct assertion above is exact: the clamp
+  // ASSIGNS the constant, `dump()` round-trips a double without loss, and
+  // doctest::Approx at this scale would accept anything within about 0.12.
+  CHECK(entry.get<double>() == -9999.0);
+}
+
+TEST_CASE("serving_chat: a -inf prompt logprob is served as -9999.0") {
+  // The chat call site is a SECOND one (serving_chat.cpp:1055) over a
+  // TOP-LEVEL response field (chat_completion/protocol.py:126), so the
+  // completion case above cannot cover it.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeNegInfLogitWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  OpenAIServingChat serving(h.engine, "test-model", InVocabChatPrompt);
+
+  ChatCompletionRequest req;
+  req.messages.push_back(ChatMessage{"user", "hello world hello world", {}, {}, {}});
+  req.max_tokens = 2;
+  req.temperature = 0.0;
+  req.prompt_logprobs = -1;  // the chat validator accepts -1 (protocol.py:784-790)
+
+  ChatCompletionResult res = serving.create_chat_completion(req);
+  REQUIRE(res.response.has_value());
+  REQUIRE(res.response->prompt_logprobs.has_value());
+  CheckClampedPromptLogprobs(*res.response->prompt_logprobs);
+
+  // The same wire round trip as the completion case above.
+  const json j = json::parse(json(*res.response).dump());
+  const json& plp = j.at("prompt_logprobs");
+  REQUIRE(plp.is_array());
+  REQUIRE(plp.size() >= 2u);
+  CHECK(plp.at(0).is_null());
+  const json& entry =
+      plp.at(1).at(std::to_string(kNegInfTokenId)).at("logprob");
+  REQUIRE(entry.is_number());
+  // Exact, for the same reason the struct assertion above is exact: the clamp
+  // ASSIGNS the constant, `dump()` round-trips a double without loss, and
+  // doctest::Approx at this scale would accept anything within about 0.12.
+  CHECK(entry.get<double>() == -9999.0);
 }

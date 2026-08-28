@@ -47,6 +47,9 @@ PASSING_CI = """jobs:
         run: |
           python3 scripts/check-test-registration.py
           python3 tests/scripts/test_check_test_registration.py
+      - name: The SGLang lease identity gate detects a tree that is not the pin
+        run: |
+          python3 tests/scripts/test_sglang_lease_identity.py
 """
 
 PASSING_PREFLIGHT = """CHECKERS=(
@@ -54,6 +57,7 @@ PASSING_PREFLIGHT = """CHECKERS=(
 )
 SUITES=(
   test_check_test_registration
+  test_sglang_lease_identity
 )
 for checker in "${CHECKERS[@]}"; do
   python3 "scripts/$checker.py"
@@ -304,6 +308,28 @@ class WiringMutationTests(unittest.TestCase):
             "          python3 tests/scripts/test_check_test_registration.py\n", ""
         )
         self.assert_wiring_error(self.preflight, mutated, "CI mutation suite")
+
+    # The pinned-suite lane (#1833).  Before it, deleting either registration of
+    # `test_sglang_lease_identity` left `check-test-registration.py` at rc=0 --
+    # and so did deleting an unrelated entry from the same array, which is what
+    # makes the finding a property of `SUITES` rather than of that one suite.
+    def test_M56_deleting_the_pinned_preflight_suite_fails(self) -> None:
+        mutated = self.preflight.replace("  test_sglang_lease_identity\n", "")
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(
+            mutated, self.ci, "test_sglang_lease_identity is missing from preflight SUITES"
+        )
+
+    def test_M57_deleting_the_pinned_ci_suite_fails(self) -> None:
+        mutated = self.ci.replace(
+            "          python3 tests/scripts/test_sglang_lease_identity.py\n", ""
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(
+            self.preflight,
+            mutated,
+            "test_sglang_lease_identity is missing from the CI suite lane",
+        )
 
     def test_M18_ci_commands_behind_false_shell_branch_fail(self) -> None:
         mutated = self.ci.replace(

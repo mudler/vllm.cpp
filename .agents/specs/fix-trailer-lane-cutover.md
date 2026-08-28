@@ -28,7 +28,7 @@ error.
 `AGENTS.md` forbids a force push of `main` without exception.
 
 **It does not clear itself.** The main lane at
-[`.github/workflows/ci.yml:596-623`](../../.github/workflows/ci.yml) walks
+[`.github/workflows/ci.yml:899-927`](../../.github/workflows/ci.yml) walks
 `LAST_GREEN..head`, and `LAST_GREEN` is the last **successfully** gated commit.
 A red run never advances it, so every later push re-walks a range that still
 contains `281b4bc76` and reports the same red. `ci.yml:74` states that design
@@ -41,7 +41,7 @@ is the property that makes an unrepairable red permanent.
 The four branch commits were verified and were correct. The repository sets
 `squash_merge_commit_message = PR_BODY`, so the landed message came from the
 pull request body, which still held the pre-repair value. The guard that reads
-the body is `ci.yml:626-635` in `commit-protocol-tag`: it writes `$PR_BODY` to a
+the body is `ci.yml:935-939` in `commit-protocol-tag`: it writes `$PR_BODY` to a
 file and runs this same checker with `--filled`, so body and commit are held to
 one rule by one implementation (#848). At merge time that job was `pending`
 because the runner pool was saturated. **It did not fail. It never ran.**
@@ -94,7 +94,7 @@ caught.
 one-line sha change cannot see what it newly covers.
 
 **No caller passes it on the failing lane.** `ci.yml` invokes the checker with
-`--range` alone at `:620` and `:623`; only `scripts/agent-integration.py:107`
+`--range` alone at `:924` and `:927`; only `scripts/agent-integration.py:106-110`
 passes `--cutover`, from `.agents/policy-cutover`, **a file that does not exist
 in the tree**. Reaching for `--cutover` therefore means adding a blanket to the
 main lane that has never been there, not using one that is already wired.
@@ -186,12 +186,36 @@ requires it to fail, so the red-before is gated rather than asserted.
 The operator-side pre-merge check is **not** in this row and needs its own:
 piping `gh pr view --json body` through `check-commit-trailers.py
 --message-file - --filled` before a squash merge. The CI guard at
-`ci.yml:626-635` is the right check and it can be outrun by a queued runner,
+`ci.yml:935-939` is the right check and it can be outrun by a queued runner,
 which is exactly what happened here, so a local belt to that brace is worth
 having. It is separated because it changes an operator procedure and a gate
 command rather than a checker rule, so it carries its own red-first evidence and
 its own reviewer, and because it is not needed to clear the lane. Filed as
 [#1263](https://github.com/mudler/vllm.cpp/issues/1263) and owed here.
+
+**The range walk holds a MERGE COMMIT to the authored-commit contract, and the CI
+job that calls it skips merge commits fifty lines earlier.** `validate_range`
+walks `rev-list --reverse base..head` at
+[`scripts/check-commit-trailers.py:463`](../../scripts/check-commit-trailers.py)
+with no `--no-merges` and no parent-count test, so a plain `git merge origin/main`
+on a task branch — git's own default subject, empty body — fails three rules.
+`commit-protocol-tag`'s own marker loop skips exactly that commit class
+(`.github/workflows/ci.yml:873`, "Skip merge commits (>1 parent) — they are not
+authored content") before calling the checker at `:927`, so one job carries two
+opposite rules and only one of them is written down. Measured: `--range
+a0f12b727..d05723f8e` is `rc=1` with nine findings across three merge OIDs, and
+the isolating control is that the same range's three NON-merge commits all pass.
+CI agrees on PR #2134 (job 98706339787) over `0d8962500cc1`, two parents and a
+0-byte body. Nothing reaches `main`, because `squash_merge_commit_message =
+PR_BODY` means a branch merge commit never becomes a landed message and the
+`--filled` body guard (`ci.yml:938`) checks the bytes that do; the cost is a red
+gate plus a forced branch rewrite on every branch that syncs, which AGENTS.md
+§ *Landing work* instructs as the routine response to a rejected push. Measured
+here and NOT fixed here: excluding merges narrows what the gate accepts, so under
+AGENTS.md § *Changing the rules or a checker* it owes its own spec, red-before
+evidence and reviewer, and the developer chose on 2026-08-28 to authorize
+`row/*` force-push instead of changing the checker. Filed as
+[#2157](https://github.com/mudler/vllm.cpp/issues/2157) and owed here.
 
 ## Outcome
 

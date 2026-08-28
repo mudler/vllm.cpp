@@ -4028,3 +4028,119 @@ TEST_CASE("kTENSTORRENT kMatmulBT bf16 inputs to F32 output") {
   CHECK(worst < 1.0);
   backend.Free(ma); backend.Free(mb); backend.Free(mo);
 }
+
+// ==== BACKEND-TENSTORRENT-QWEN35 W4 (#2107): bulk bf16 staging ==============
+// The #1715 profile put the 0.104 tok/s eager-decode wall in EnsureDevice2D's
+// host staging: a per-element f32 gather of a master that is ALREADY bf16,
+// then a second f32→bf16 conversion inside ttnn's from_vector. W4 lever 1
+// stages the raw bf16 bytes (one from_span, no f32 intermediate); lever 2
+// resolves the slot once per call instead of four locked FindSlot probes.
+//
+// This case pins the ROUTE (the staging counter — a deleted bulk branch or an
+// unwired counter cannot pass it), the BYTES (the device copy equals the
+// per-element f32 reference bit-for-bit: exact widen-then-pack round trip,
+// ±0, denormals, ±inf included) and the INTERIOR-VIEW class (the W2c
+// defect): a view stages from its OWN window bytes, never the base slot's,
+// even when another slice of the same base is already staged. The f32 path
+// stays the reference arm — an f32 master must NOT take the bulk route (the
+// f32 logits GEMM output keeps its declared dtype, neither widened nor
+// narrowed by staging).
+TEST_CASE("kTENSTORRENT W4 EnsureDevice2D bulk bf16 staging: route, bytes, views") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  constexpr int64_t M = 5, K = 64, N = 16;
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f; std::memcpy(&f, &bits, 4); return f;
+  };
+  auto f32bits = [](float f) {
+    uint32_t b; std::memcpy(&b, &f, 4); return b;
+  };
+
+  // 1) Route + bytes: a fresh bf16 master stages through the bulk route and
+  //    the device copy matches the per-element f32 reference bit-for-bit.
+  const uint16_t edges[] = {0x0000, 0x8000, 0x7F80, 0xFF80, 0x0001, 0x8001,
+                            0x007F, 0x7F7F, 0x3F80, 0xBF80, 0x3E80, 0xC000};
+  std::vector<uint16_t> hb(M * K), wb(N * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = edges[i % 12];
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3C00 + (i % 7));
+  void* ma = backend.Alloc(M * K * 2);
+  void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+
+  ResetStagingStats();
+  mm(q, o, a, b);  // both operands are fresh bf16 masters → both stage
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 2,
+                "both bf16 operands must stage through the bulk route, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.staged_bulk_bf16_bytes ==
+                    static_cast<uint64_t>((M * K + N * K) * 2),
+                "bulk bytes: got " << s.staged_bulk_bf16_bytes);
+  CHECK_MESSAGE(s.staged_f32_elems == 0,
+                "bf16 masters must not re-enter the f32 path, got "
+                    << s.staged_f32_elems);
+  std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a);
+  REQUIRE(static_cast<int64_t>(dev.size()) == M * K);
+  for (int64_t i = 0; i < M * K; ++i)
+    CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(hb[static_cast<size_t>(i)])),
+                  "device byte " << i << " diverges from the per-element reference");
+
+  // 2) Interior view (W2c class): stage half 0, then half 1 of the same
+  //    base. Half 1 must stage ITS OWN window bytes — not the base's, not
+  //    half 0's — even with a same-shape staging resident on the base's
+  //    behalf.
+  std::vector<uint16_t> pb(2 * N * K);
+  for (size_t i = 0; i < pb.size(); ++i)
+    pb[i] = static_cast<uint16_t>(i < pb.size() / 2 ? 0x3F80 : 0xC000);
+  void* mpb = backend.Alloc(2 * N * K * 2);
+  backend.Copy(q, mpb, pb.data(), 2 * N * K * 2);
+  Tensor packed = Tensor::Contiguous(mpb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {2 * N, K});
+  Tensor v0 = packed.Slice(0, 0, N);
+  Tensor v1 = packed.Slice(0, N, 2 * N);
+  ResetStagingStats();
+  mm(q, o, a, v0);
+  mm(q, o, a, v1);
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 2,
+                "each view stage is its own bulk upload, got "
+                    << s.uploads_bulk_bf16);
+  dev = vt::tenstorrent::DebugDeviceReadbackF32(q, v1);
+  REQUIRE(static_cast<int64_t>(dev.size()) == N * K);
+  for (int64_t i = 0; i < N * K; ++i)
+    CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) ==
+                          f32bits(widen(pb[static_cast<size_t>(N * K + i)])),
+                  "view staged the wrong window at byte " << i
+                  << " — base staging leaked into an interior view");
+
+  // 3) f32 master keeps the f32 reference arm: staged, never bulk-routed.
+  std::vector<float> a32(M * K);
+  for (size_t i = 0; i < a32.size(); ++i) a32[i] = widen(hb[i]);
+  void* ma32 = backend.Alloc(M * K * 4);
+  backend.Copy(q, ma32, a32.data(), M * K * 4);
+  Tensor a32t = Tensor::Contiguous(ma32, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  ResetStagingStats();
+  mm(q, o, a32t, b);  // b is already staged; only a32 stages
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 0,
+                "an f32 master must not take the bulk bf16 route, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.staged_f32_elems == static_cast<uint64_t>(M * K),
+                "f32 master stages through the f32 path, got "
+                    << s.staged_f32_elems);
+  backend.Free(ma); backend.Free(mb); backend.Free(mo); backend.Free(mpb);
+  backend.Free(ma32);
+}

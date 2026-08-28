@@ -35,11 +35,27 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
+#include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/fp8_kv.h"  // KV-FP8 W3: the PagedKvCache fp8 interpretation
 #include "vt/tensor.h"
 
 namespace vllm {
+
+// THE production bridge from a loaded embedding TABLE to the gather op's
+// operand. Every embed in qwen3_5.cpp goes through it, so it is the one place a
+// block-quantized `token_embd` becomes a `vt::Tensor`: on a host-addressable
+// device it ALIASES the block bytes and never computes a per-element size,
+// which is precisely the property a keep-quant gather table depends on.
+//
+// It is declared here because nothing pinned that property. #1989's review (F4)
+// found the W6a reachability case hand-building the tensor from
+// `w.embed_tokens.bytes` instead, so a change to the bridge could break every
+// block-table forward with the gate still green. The gate now enters HERE.
+vt::Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
+                                 const OwnedTensor& embed_tokens, int64_t vocab,
+                                 int64_t hidden);
+
 
 // Process-wide count of MIXED spec+non-spec GDN batch invocations
 // (GdnBlockPagedMixedSpec), incremented per GDN layer per mixed step. A nonzero
@@ -93,6 +109,29 @@ struct GdnStateCache {
   // every model boundary honors the declared F16/BF16/F32 dtype independently.
   vt::Tensor ssm_state;   // [num_state_blocks, Hv, Dv, Dk], in/out
   vt::Tensor conv_state;  // [num_state_blocks, conv_dim, K-1], in/out
+
+  // ENG-RECURRENT-MULTISTATE (#2131): the layer's COMPLETE ordered state list,
+  // one entry per `MambaSpec::shapes` entry, each with the slot dim prepended.
+  // This is the mirror of upstream's carrier — `MambaBase.kv_cache` is
+  // `tuple[torch.Tensor, ...]` (`vllm/model_executor/layers/mamba/abstract.py:26`
+  // @ pin 5559679229) and `bind_kv_cache` (`:29-43`) fills it by zipping
+  // `get_state_shape()` against `get_state_dtype()` at a running byte offset, so
+  // N is whatever the layer publishes: 1 for `ShortConv` (`short_conv.py:87`), 2
+  // for Mamba2/GDN, 5 for Mamba2 with the ReplaySSM ring
+  // (`mamba_mixer2.py:517-520`, unpacked at `:722-724`).
+  //
+  // `conv_state` and `ssm_state` are `states[0]` and `states[1]` and are kept as
+  // the names every model consumer in this tree reads. They are not a second
+  // source of truth: the runner assigns all three from one loop over the spec.
+  //
+  // FILLED BY `GPUModelRunner::initialize_kv_cache` ONLY. A cache built by hand
+  // — the host-path scaffolds in `qwen3_5.cpp` and several test fixtures —
+  // sets the two named fields and leaves this EMPTY, which is correct and inert
+  // while nothing outside the runner reads it. A consumer that starts reading
+  // `states` must therefore handle an empty list, or those builders grow the
+  // assignment with it. Recorded rather than asserted, because a `VT_CHECK` here
+  // would refuse every scaffold that legitimately caches two states by name.
+  std::vector<vt::Tensor> states;
 };
 
 // Forward result carrier (M-logits-on-device). The default hot path keeps the

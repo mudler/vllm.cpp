@@ -5,13 +5,14 @@ larger than the device can still load. It is a different subject from
 [KV offload](KV-OFFLOAD.md), which keeps **KV blocks** outside the paged cache.
 The two use separate flags and do not interact.
 
-Selection mirrors vLLM's own configuration: `--offload-config '<json>'`, taking
-the same JSON object vLLM's `OffloadConfig` takes, so a config written for vLLM
-is accepted here.
+The `--offload-config '<json>'` flag accepts vLLM's `OffloadConfig` fields. It
+also accepts a `vllm_cpp` extension for disk residency and device placement. A
+config that contains only vLLM fields remains valid here.
 
-> **Enabling weight offload fails startup today, on every model.** No loader
-> consults the offloader yet, so the engine refuses the configuration rather
-> than accept a budget that would free nothing. Read
+> **Enabling vLLM-style weight offload fails startup today, on every model.**
+> No loader consults that offloader yet. The engine refuses the configuration
+> instead of accepting a budget that would free nothing. The `vllm_cpp`
+> extension is live and is not subject to this refusal. Read
 > [What works today](#what-works-today) before you enable anything.
 
 ## What works today
@@ -24,6 +25,7 @@ is accepted here.
 | A loader that asks the offloader and keeps a weight off the device | **Not wired.** This is the part that frees memory, and it does not exist yet |
 | A model that accepts an enabled offload | **None.** Every architecture is refused at startup, see [What the engine refuses](#what-the-engine-refuses-and-what-it-only-warns-about) |
 | Pinned host copies and device views | Not built |
+| `vllm_cpp.placement` | Runs routed experts on the CPU for four architecture families. End-to-end token and speed gates are pending |
 
 So the honest summary is: you can write and validate a weight-offload
 configuration, and you cannot yet run with one enabled. A budget that silently
@@ -46,6 +48,60 @@ vllm-server --model /path/to/model \
 The same document is available through the C API as the `offload_config` field
 of `vllm_model_params` (ABI v21). `NULL` or an empty string means no offload,
 which is the default engine.
+
+## Place routed experts on the CPU
+
+The `vllm_cpp.placement` object keeps attention and dense layers on the
+selected accelerator. It moves routed-expert computation to the CPU. This can
+reduce device-memory use on a discrete GPU, but the engine has not measured the
+end-to-end speed yet.
+
+The following example places every routed expert on the CPU:
+
+```sh
+vllm-server --model /path/to/model \
+  --offload-config '{"vllm_cpp":{"placement":{"cpu_moe":true}}}'
+```
+
+The same flag works with `vllm-cli`. C callers set the identical JSON string in
+`vllm_model_params.offload_config`.
+
+Placement supports these fields:
+
+| Field | llama.cpp equivalent | Meaning |
+|---|---|---|
+| `cpu_moe` | `-cmoe` | Place every routed-expert layer on the CPU |
+| `n_cpu_moe` | `-ncmoe N` | Place routed experts from the first `N` layers on the CPU. `0` selects none |
+| `overrides` | `-ot` | Apply ordered regular-expression overrides. The first matching entry wins |
+| `fit` | `--fit` | Derive placement from available device memory. Do not combine it with manual placement |
+
+An explicit override contains a tensor-name pattern and a device name:
+
+```json
+{
+  "vllm_cpp": {
+    "placement": {
+      "overrides": [
+        {"pattern": "blk\\.0\\..*ffn_.*_exps", "device": "cpu"}
+      ]
+    }
+  }
+}
+```
+
+The placement target must be `cpu`. The engine refuses accelerator targets.
+It also refuses placement for eagerly resident FP4 experts. Placement is wired
+for Qwen3-MoE, Qwen3.5/3.6, Nemotron-H, and DeepSeek-V2. Laguna and DeepSeek-V4
+do not use the shared placement seam. Kimi-Linear already runs its MoE on the
+host, so this setting does not move its computation.
+
+GGUF mmap residency is often active when weights remain quantized. The engine
+warns when mmap and CPU placement are both active because routed experts can
+then cause slow, router-ordered page faults. The combination remains valid.
+
+Unit and device-boundary round-trip tests cover the placement mechanism. No
+model has completed an end-to-end run with placement enabled. Treat it as an
+experimental capacity feature until the token and speed gates finish.
 
 ### Fields
 

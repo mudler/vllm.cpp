@@ -5,6 +5,7 @@
 // grid-stride kernels matching the CPU reference math in src/vt/cpu/cpu_ops.cpp
 // element for element. All math is f32; dims are inferred from tensor shapes.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -37,6 +38,7 @@ __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
+__device__ inline void Store(__half* p, int64_t i, float v) { p[i] = __float2half(v); }
 
 __device__ inline float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -62,6 +64,38 @@ void CastBf16KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   CastBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(out.Ptr<__nv_bfloat16>(), in.Ptr<float>(),
                                                          n, row_size, in.stride[0]);
   Check(cudaGetLastError(), "cast_bf16 launch");
+}
+
+// cast_f16: out[i] = f16(in[i]), from an f32 OR bf16 source. QUANT-EXL3 W1a
+// (#2181) — the narrowing cast an EXL3 linear needs on the way in, because
+// `Exl3Gemm` reads its activation as fp16 and nothing else. Templated on the
+// source so the bf16 arm widens exactly through f32 before the single rounding
+// store, rather than reinterpreting. Same packed-view row handling as the two
+// casts either side of it.
+template <typename Src>
+__global__ void CastF16Kernel(__half* out, const Src* in, int64_t n, int64_t row_size,
+                              int64_t row_stride) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
+    const int64_t row = i / row_size;
+    const int64_t col = i - row * row_size;
+    Store(out, i, Load(in, row * row_stride + col));
+  }
+}
+
+void CastF16KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
+  const int64_t n = out.Numel();
+  if (n == 0) return;
+  const int64_t rows = in.shape[0];
+  const int64_t row_size = n / rows;
+  if (in.dtype == DType::kF32) {
+    CastF16Kernel<float><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<__half>(), in.Ptr<float>(), n, row_size, in.stride[0]);
+  } else {
+    CastF16Kernel<__nv_bfloat16><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<__half>(), in.Ptr<__nv_bfloat16>(), n, row_size, in.stride[0]);
+  }
+  Check(cudaGetLastError(), "cast_f16 launch");
 }
 
 // cast_f32: bf16 -> f32 upcast. Input may be a torch.split-style packed view:
@@ -405,6 +439,8 @@ struct Registrar {
   Registrar() {
     RegisterOp(OpId::kCastBf16, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16KernelCuda)));
+    RegisterOp(OpId::kCastF16, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<CastF16Fn>(&CastF16KernelCuda)));
     RegisterOp(OpId::kCastF32, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32KernelCuda)));
     RegisterOp(OpId::kMulColVecF32, DeviceType::kCUDA,

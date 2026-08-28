@@ -300,9 +300,10 @@ ShapedChatMessage ShapeChatMessageEngine(
 namespace {
 
 // chat_completion_stream_generator (serving.py:404-802) as W2's live,
-// pull-based SSE source. Continuous usage waits for and buffers the first
-// result so the role frame carries a native prompt-token count; subsequent
-// calls block only on this request's collector.
+// pull-based SSE source. It waits for and buffers the first result before the
+// role frame, in every usage mode, mirroring upstream's first-iteration
+// ordering (#1982); continuous usage reads that result's native prompt-token
+// count. Subsequent calls block only on this request's collector.
 class ChatSseStream final : public SseStream {
  public:
   ChatSseStream(v1::AsyncLLM& engine, v1::AsyncRequest async_request,
@@ -345,22 +346,37 @@ class ChatSseStream final : public SseStream {
   bool next(std::string& chunk) override {
     if (complete_) return false;
     if (role_pending_) {
-      // Upstream emits the role frame on the first engine result. We only need
-      // to buffer that result when continuous usage requires its native prompt
-      // count; the default path retains its immediately available role frame.
-      if (usage_.include_continuous_usage) {
-        for (;;) {
-          RequestOutput response;
-          if (!WaitOutput(response, chunk)) {
-            // WaitOutput filled chunk with a pure SSE ping — return it first.
-            return true;
-          }
-          prompt_tokens_ =
-              static_cast<int>(response.prompt_token_ids.size());
-          if (!response.outputs.empty() || response.finished) {
-            buffered_response_ = std::move(response);
-            break;
-          }
+      // Upstream emits the role frame on the FIRST ENGINE RESULT, in every
+      // usage mode: chat_completion/serving.py:487 builds the role chunk under
+      // `if first_iteration:` inside `async for res in result_generator:`
+      // (:477). Its comment at :484-486 gives the reason — "if there are
+      // exceptions in the result_generator, it needs to be sent as the FIRST
+      // response (by the try...catch)" — and that reason does not depend on
+      // usage. So this buffering runs unconditionally (#1982).
+      //
+      // It was scoped to continuous usage, which needs the native prompt count
+      // for the frame it attaches. The narrow reading cost two things. A
+      // request that died before its first token had already been answered 200
+      // with a role frame, so the error could not be the first response. And
+      // `vllm/benchmarks/lib/endpoint_request_func.py:404-408` stamps TTFT on
+      // the first chunk carrying a `choices` key whatever `delta.content`
+      // holds, so `vllm bench serve --backend openai-chat` measured the HTTP
+      // round trip to this empty frame instead of a time to first token.
+      //
+      // The frame itself is unchanged, including its position ahead of every
+      // content frame. Only its arrival time moves, and the first TOKEN is not
+      // delayed: the token that used to ride in frame two now rides in frame
+      // three, at the same instant, out of the result buffered right here.
+      for (;;) {
+        RequestOutput response;
+        if (!WaitOutput(response, chunk)) {
+          // WaitOutput filled chunk with a pure SSE ping — return it first.
+          return true;
+        }
+        prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
+        if (!response.outputs.empty() || response.finished) {
+          buffered_response_ = std::move(response);
+          break;
         }
       }
       role_pending_ = false;
@@ -718,7 +734,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
         request.max_completion_tokens.has_value()
             ? *request.max_completion_tokens
             : request.max_tokens.value_or(16);
-    const BeamSearchParams params = request.to_beam_search_params(max_tok);
+    const BeamSearchParams params =
+        request.to_beam_search_params(max_tok, &default_sampling_params_);
     const std::vector<int32_t> prompt_ids = beam_tokenizer_->Encode(prompt);
     const BeamSearchOutput beams =
         async_engine_ != nullptr
@@ -770,7 +787,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       engine_parser != nullptr ? nullptr : MakeReasoningParser();
   const bool named_tool_choice = IsNamedToolChoice(request);
 
-  SamplingParams sampling_params = request.to_sampling_params();
+  SamplingParams sampling_params =
+      request.to_sampling_params(std::nullopt, &default_sampling_params_);
   if (kMaxNewTokensCap > 0) {
     const int before = sampling_params.max_tokens.value_or(kMaxNewTokensCap);
     if (before > kMaxNewTokensCap) {
@@ -997,6 +1015,18 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   // SAMPLE-BEST-OF: keep the top-n children by cumulative logprob when best_of >
   // n. Guarded on request.best_of so the default (and plain n>1) path binds
   // `outs` to final_res.outputs with NO copy/re-rank (child indices preserved).
+  //
+  // NO STREAM DOWNGRADE HERE, and that is DELIBERATE, not an omission.
+  // /v1/completions downgrades `best_of != n` + `stream` to a single-frame
+  // non-streamed response (serving_completion.cpp), mirroring
+  // serving_completion.py:253-260 @ 56e96b37e4^. Chat has no such rule
+  // upstream: at that same revision ChatCompletionRequest DOES carry `best_of`
+  // (protocol.py:568, class at :528) and DOES forward it to SamplingParams
+  // (:892), yet serving_chat.py:355 branches on the RAW `if request.stream:`
+  // with no best_of and no beam-search guard at all. Only the completions route
+  // ever downgraded, so adding one here would invent a rule vLLM declined to
+  // write. The asymmetry is gated in test_api_server.cpp and recorded in
+  // .agents/specs/async-parallel-sampling.md.
   std::vector<CompletionOutput> selected_outputs;
   const bool trim_best_of =
       request.best_of.has_value() && *request.best_of > request.n.value_or(1);

@@ -362,11 +362,12 @@ with a SINGLE COLD oracle invocation per paired run, so the denominator paid
 compile-JIT the numerator did not; with the oracle warm and generation length
 matched, the paired measurement is **0.834x**. Those two cannot be differenced
 directly, because the gate host was reimaged in between and is no longer the same
-machine. The deciding experiment, a single cold oracle invocation on the CURRENT
-box, is specified in the benchmark record and has not yet run. Until it does, no
-speed claim in either direction is supportable. The acceptance-rate band and the
-other target families remain owed. A GGUF target, and a target architecture with no aux
-multi-tap, are both refused by name.
+machine. The deciding experiment is a single cold oracle invocation on the
+current box. The [speculative-decoding benchmark page](benchmarks/speculative-decoding.md)
+records the pending run. Until it runs, no speed claim in either direction is
+supportable. The acceptance-rate band and the other target families remain
+owed. The loader refuses a GGUF target or a target architecture without an
+auxiliary multi-tap by name.
 
 ```bash
 main --model /models/Qwen3-4B \
@@ -457,8 +458,9 @@ Speculation helps both engines about 1.5 to 1.6x at this operating point, and ou
 engine is already about 4% faster than vLLM with speculation off, so the lead is
 preserved with it on. The extra state speculation needs (a doubled recurrent-state
 slot at k=1, plus the draft cache and head) costs about 3.6 GB, well inside the
-box's unified memory. The full A/B, including the higher-concurrency numbers, is
-in [the benchmark record](BENCHMARKS.md).
+box's unified memory. The [speculative-decoding benchmark page](benchmarks/speculative-decoding.md)
+carries every speculator's current published position. The higher-concurrency legs of this
+particular A/B are not among them and stay owed.
 
 ## Concurrency above 1
 

@@ -19,11 +19,15 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
+#include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 #include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/device_placement.h"
+#include "vllm/model_executor/moe_placement_seam.h"
+#include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // RunGdnBlockPaged (W5b seam, #2110)
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
@@ -692,32 +696,34 @@ using v1::CommonAttentionMetadata;
 using v1::GDNAttentionMetadata;
 
 // Backend + queue bundle threaded through every helper.
-struct Dev {
-  Backend& b;
-  Queue& q;
-};
+// ENG-QWEN35-SHARED-GLUE: `Dev`, `DBuf`, `MakeTensor`, `Reshape` and the
+// device-pool policy resolver were PRIVATE COPIES here and are now the shared
+// ones from `dense_device_glue.h`. This file kept its own set, which is the
+// off-framework divergence its `ResidentWeight` comment records — a repair
+// landed in the shared glue for 25 model files and never reached this one.
+// Keeping a private `Dev`/`DBuf` also gave them INTERNAL LINKAGE, so nothing
+// this file returned could be declared in a header, which is what forced the
+// MoE placement seam to carry two spellings.
+//
+// The two definitions were compared line by line before this change. They
+// differed in exactly one behaviour, and the shared one is the safer: it
+// guards `bytes_ > 0` before a host copy, where the private one issued a
+// zero-byte `Copy`. Everything else was comments and ordering.
+//
+// `ResidentWeight` and `ResidentWeightF32` stay private ON PURPOSE. They carry
+// behaviour the shared ones do not (the i8mm repack marker, the elementwise
+// transpose marker, keep-quant residency and the host-alias report), so
+// migrating them is a separate change with its own gate.
+using dense_attn::DBuf;
+using dense_attn::Dev;
+using dense_attn::MakeTensor;
+using dense_attn::Reshape;
+using dense_attn::ResolveDevicePoolPolicy;
 
-Tensor MakeTensor(void* data, DType dt, vt::Device dev,
-                  const std::vector<int64_t>& shape) {
-  Tensor t;
-  t.data = data;
-  t.dtype = dt;
-  t.device = dev;
-  t.rank = static_cast<int>(shape.size());
-  int64_t acc = 1;
-  for (int i = t.rank - 1; i >= 0; --i) {
-    t.shape[i] = shape[static_cast<size_t>(i)];
-    t.stride[i] = acc;
-    acc *= t.shape[i];
-  }
-  return t;
-}
+
 
 // Contiguous reinterpret of a device tensor's buffer at a new shape (same numel,
 // same dtype/device). Used to view [T,H,D] as [T*H,D] etc. for rank-2 ops.
-Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
-  return MakeTensor(src.data, src.dtype, src.device, shape);
-}
 
 // DevicePool / Pool() / AuxPool() / ActivePool() / ActivePoolScope now live in
 // the shared header include/vllm/model_executor/models/device_pool.h (extracted
@@ -736,23 +742,6 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // carries the identical repair). A backend whose platform was never REGISTERED
 // therefore throws out of GetPlatform rather than inheriting the first device's
 // cap — a cap read off another platform is a wrong number, not a default.
-struct DevicePoolPolicy {
-  size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
-};
-DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
-  // cap+1, so 0 means "not resolved yet" and a genuine cap of 0 (every platform
-  // today) still caches. Racing threads resolve the same type to the same value.
-  static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
-  // Same bound platforms::Index() applies to this identical value before
-  // indexing ITS registry (src/vllm/platforms/platform.cpp).
-  const size_t idx = static_cast<size_t>(d.q.device.type);
-  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
-  const size_t seen = cached[idx].load(std::memory_order_relaxed);
-  if (seen != 0) return DevicePoolPolicy{seen - 1};
-  const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
-  cached[idx].store(rp.device_pool_cap_bytes + 1, std::memory_order_relaxed);
-  return DevicePoolPolicy{rp.device_pool_cap_bytes};
-}
 
 // --- Fused-MoE per-layer resident constants (M2.5 Phase 2, CUDA-graph unblock) -
 // MoeBlockFusedCuda used to rebuild + re-upload, EVERY forward step, a set of
@@ -953,98 +942,6 @@ bool MoeFusedW13Enabled() {
 // malloc/memcpy; on CUDA they are cudaMalloc / h2d-d2h on the queue's stream.
 // Allocation is routed through the DevicePool so the buffer's storage is reused
 // rather than freed to the driver (avoiding the cudaMalloc/cudaFree sync).
-class DBuf {
- public:
-  DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
-       const void* host = nullptr)
-      : b_(&d.b) {
-    int64_t numel = 1;
-    for (int64_t s : shape) numel *= s;
-    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
-    // Device-scratch soft cap comes from the platform residency policy
-    // (BACKEND-PLATFORM item 2), not an inline constant. 0 == uncapped (GB10
-    // today) ⇒ pool behavior is byte-for-byte unchanged.
-    cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    // Draw from THIS DEVICE's pool (Pool(b)) unless an ActivePoolScope overrides
-    // it for the shared-expert overlap region (AuxPool(b)), and REMEMBER the
-    // pool so the block returns to the one it came from even when this DBuf
-    // outlives the scope (the aux region returns sd/gl, destroyed after the
-    // join). See AuxPool().
-    pool_ = &ActivePool(*b_);
-    p_ = pool_->Get(*b_, alloc_bytes_);
-    t_ = MakeTensor(p_, dt, d.q.device, shape);
-    if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
-  }
-  ~DBuf() { if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_); }
-  DBuf(const DBuf&) = delete;
-  DBuf& operator=(const DBuf&) = delete;
-  // Movable so device-resident block helpers can RETURN a DBuf (the buffer
-  // ownership transfers; the moved-from buffer is not returned to the pool).
-  DBuf(DBuf&& o) noexcept
-      : b_(o.b_), pool_(o.pool_), p_(o.p_), bytes_(o.bytes_),
-        alloc_bytes_(o.alloc_bytes_), cap_(o.cap_), t_(o.t_) {
-    o.p_ = nullptr;
-  }
-  DBuf& operator=(DBuf&& o) noexcept {
-    if (this != &o) {
-      if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_);
-      b_ = o.b_;
-      pool_ = o.pool_;
-      p_ = o.p_;
-      bytes_ = o.bytes_;
-      alloc_bytes_ = o.alloc_bytes_;
-      cap_ = o.cap_;
-      t_ = o.t_;
-      o.p_ = nullptr;
-    }
-    return *this;
-  }
-
-  Tensor& t() { return t_; }
-  const Tensor& t() const { return t_; }
-  void* ptr() { return p_; }
-  size_t bytes() const { return bytes_; }
-  size_t alloc_bytes() const { return alloc_bytes_; }
-  // Relinquish ownership of the pool block WITHOUT returning it (the dtor becomes
-  // a no-op). The caller takes over the Put obligation for `alloc_bytes()`.
-  // The Tensor view (t()) still holds the raw data pointer after this. Prefer
-  // ReleaseShared(), which discharges that obligation correctly by construction.
-  void* Release() {
-    void* p = p_;
-    p_ = nullptr;
-    return p;
-  }
-
-  // Move the block into a shared_ptr that returns it to THIS buffer's own pool
-  // and backend. Replaces the hand-written deleter that closed over the byte
-  // count alone and called `Pool().Put(alloc, q)`, naming neither the device nor
-  // the pool — so it returned another device's block, and an aux-stream block,
-  // to the main device's free list (#516; see dense_device_glue.h).
-  std::shared_ptr<void> ReleaseShared() {
-    DevicePool* const pool = pool_;
-    Backend* const b = b_;
-    const size_t alloc = alloc_bytes_;
-    void* const p = Release();
-    if (p == nullptr) return {};
-    return std::shared_ptr<void>(p, [pool, b, alloc](void* q) { pool->Put(*b, alloc, q); });
-  }
-  void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
-  // Copies the buffer back to host and blocks until the queue is idle.
-  void Download(Dev d, void* host) {
-    b_->Copy(d.q, host, p_, bytes_);
-    b_->Synchronize(d.q);
-  }
-
- private:
-  Backend* b_;
-  DevicePool* pool_ = nullptr;  // owning scratch pool (this device's Pool() or AuxPool())
-  void* p_ = nullptr;
-  size_t bytes_ = 0;
-  size_t alloc_bytes_ = 0;
-  size_t cap_ = 0;  // device-pool soft cap from residency_policy() (0 == uncapped)
-  Tensor t_;
-};
 
 float SizeF(int64_t n) { return static_cast<float>(n); }
 float Silu(float x) { return x / (1.0F + std::exp(-x)); }
@@ -1295,6 +1192,22 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   }
   return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
 }
+
+}  // namespace (closed so the bridge below has EXTERNAL linkage; the unnamed
+   // namespace reopens immediately after, and its names stay visible)
+
+// See qwen3_5.h. One line of body on purpose: this is a NAME for the bridge the
+// forward already used, not a new path. Making it nameable is what lets the
+// reachability gate enter through the same call the forward makes instead of
+// hand-building the operand one step later.
+Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
+                             const OwnedTensor& embed_tokens, int64_t vocab,
+                             int64_t hidden) {
+  Dev d{backend, queue};
+  return ResidentWeight(d, embed_tokens, {vocab, hidden});
+}
+
+namespace {
 
 // Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
 // CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
@@ -4016,7 +3929,13 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
               vt::tenstorrent::DebugDeviceReadbackF32(d.q, wt);
           std::FILE* f2 = std::fopen((dir + "/w_device.bin").c_str(), "wb");
           if (f2) {
-            std::fwrite(vec.data(), 4, vec.size(), f2);
+            // issue #2021: `vec` may be empty, in which case `data()` may
+            // return `nullptr` -- well-defined for a size-0 `fwrite` by the
+            // C standard, but `fwrite`'s `nonnull` attribute makes GCC 15
+            // flag the call itself under -Werror=nonnull regardless of the
+            // runtime size. Guard rather than silence: there is nothing to
+            // write for an empty readback either way.
+            if (!vec.empty()) std::fwrite(vec.data(), 4, vec.size(), f2);
             std::fclose(f2);
           }
         }
@@ -7478,7 +7397,7 @@ std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer
 //   hidden = mlp(h2)                            # MoE block; returned as delta
 void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const std::vector<int32_t>& positions,
-              int64_t T) {
+              int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7494,7 +7413,12 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   DBuf dh2(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                        [&](Dev p, const Tensor& h) {
+                          return MoeBlock(p, layer.moe, cfg, h, T);
+                        });
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7720,7 +7644,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
                    const CommonAttentionMetadata& attn_meta,
                    const GDNAttentionMetadata& gdn_meta,
                    const PagedKvCache* attn_kv, const GdnStateCache* gdn_state,
-                   int64_t T) {
+                   int64_t T, int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -7752,7 +7676,12 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
     vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   }
 
-  hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
+  // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
+  // this layer is not placed — it resolves to the same `MoeBlock` call.
+  hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
+                        [&](Dev p, const Tensor& h) {
+                          return MoeBlock(p, layer.moe, cfg, h, T);
+                        });
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -7861,8 +7790,8 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
   const int64_t vocab_size = config.vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
 
-  Tensor embedding_table =
-      ResidentWeight(device, embed_tokens, {vocab_size, hidden_size});
+  Tensor embedding_table = Qwen3_5EmbeddingTable(device.b, device.q, embed_tokens,
+                                                vocab_size, hidden_size);
   DBuf device_ids(device, DType::kI32, {tokens}, input_ids.data());
   DBuf embedding(device, DType::kBF16, {tokens, hidden_size});
   vt::Embedding(device.q, embedding.t(), embedding_table, device_ids.t());
@@ -8158,6 +8087,101 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
+                                 vt::DeviceType placement_device,
+                                 const MoeBlockWeights& weights,
+                                 const HfConfig& config, const vt::Tensor& dh,
+                                 int64_t T) {
+  Dev engine{vt::GetBackend(engine_queue.device.type), engine_queue};
+
+  // The fp4-resident arm is REFUSED rather than served slowly. Its device Marlin
+  // residents are built eagerly at load by `PrepareMarlinResident`, so placing it
+  // would upload every expert and then compute on the host across the bus —
+  // strictly worse than not placing, and invisible to a token gate because the
+  // tokens would still be right. Refuse by name, as an unimplemented arm must.
+  if (!weights.expert_gate_fp4.empty()) {
+    throw std::invalid_argument(
+        "device placement: this checkpoint's routed experts are fp4-resident, "
+        "and their device residents are built at load, so placing them would "
+        "upload every expert and then compute across the bus — slower than not "
+        "placing at all. Placement supports the bf16 and keep-quant expert arms "
+        "(what a GGUF load brings); use one of those or drop the placement");
+  }
+
+  const int64_t H = config.hidden_size;
+  const size_t bytes =
+      static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
+
+  // DOWN: the hidden state to the host. `Download` synchronises, which it must:
+  // the placed backend is about to read these bytes and knows nothing about the
+  // engine's stream.
+  std::vector<uint8_t> staging(bytes);
+  {
+    Tensor src = dh;
+    engine.b.Copy(engine.q, staging.data(), src.data, bytes);
+    engine.b.Synchronize(engine.q);
+  }
+
+  // ACROSS: run the block on the placement device. `RunMoeBlock` derives its
+  // backend from the queue it is handed, and `ResidentWeight` aliases the host
+  // weight bytes for a CPU `Dev`, so nothing is uploaded anywhere by this call.
+  vt::Queue& placed_queue = PlacementQueue(placement_device);
+  Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
+  DBuf placed_in(placed, DType::kBF16, {T, H}, staging.data());
+  MoeBlockOutput placed_out =
+      RunMoeBlock(placed_queue, weights, config, placed_in.t(), T);
+
+  // BACK UP: the combined output to the engine's device, into a buffer from the
+  // ENGINE's pool so the composing forward owns it exactly as it owns an
+  // unplaced block's output.
+  placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
+  placed.b.Synchronize(placed.q);
+  DBuf back(engine, DType::kBF16, {T, H}, staging.data());
+
+  MoeBlockOutput r;
+  r.tensor = back.t();
+  r.storage = back.ReleaseShared();
+  return r;
+}
+
+// Exposed wrapper over the anon-ns `GdnBlockPaged` (row MODEL-MM-QWEN4-EXP W5b,
+// issue #2110) so a hybrid architecture in another TU — Qwen4-Exp, whose
+// `kLinearAttention` layers ARE this block — reuses the exact same GDN layer.
+// Mirrors `RunMoeBlock` above, for the identical reason and in the identical
+// shape: build the internal Dev, run the block, release the pooled DBuf into an
+// owning GdnBlockOutput. The Qwen3.5/3.6 forward never calls this — it is a pure
+// ADD, so that path stays byte-identical. See qwen3_5_gdn_block.h.
+GdnStepInputs BuildGdnStepInputs(vt::Queue& queue,
+                                 const std::vector<int32_t>& positions,
+                                 const CommonAttentionMetadata& attn_meta,
+                                 const GDNAttentionMetadata& gdn_meta,
+                                 int64_t gdn_state_slots) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  GdnStepInputs s;
+  s.impl = std::make_shared<StepDevInputs>(
+      BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+  return s;
+}
+
+GdnBlockOutput RunGdnBlockPaged(vt::Queue& queue, const GdnLayerWeights& weights,
+                                const HfConfig& config, const vt::Tensor& dh,
+                                const GdnStepInputs& step,
+                                const GDNAttentionMetadata& gdn_meta,
+                                const GdnStateCache& state, int64_t T,
+                                const vt::Tensor* dh_fp8) {
+  VT_CHECK(step.impl != nullptr,
+           "RunGdnBlockPaged: the step inputs are empty; build them once per "
+           "step with BuildGdnStepInputs and keep the handle alive across the "
+           "layer loop");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const auto& sdi = *static_cast<const StepDevInputs*>(step.impl.get());
+  DBuf out = GdnBlockPaged(d, weights, config, dh, sdi, gdn_meta, state, T, dh_fp8);
+  GdnBlockOutput r;
+  r.tensor = out.t();
+  r.storage = out.ReleaseShared();
+  return r;
+}
+
 // ENG-EXPERT-STREAM (#912): the streamed-expert lane seen from outside this TU.
 // See qwen3_5_internal.h for why a benchmark and a gate both need to reach it.
 detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
@@ -8246,7 +8270,8 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   // ENG-ASYNC-SCHED W4: when the async runner has already placed this step's
   // input ids on the device (and spliced each decode row's sampled token into
   // them there), embed straight from that buffer. `token_ids` is stale for
@@ -8444,7 +8469,7 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
-                  kv, gs, T);
+                  kv, gs, T, /*layer_index=*/l);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -8892,7 +8917,8 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -8902,7 +8928,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
-             positions, T);
+             positions, T, /*layer_index=*/l);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
@@ -8938,7 +8964,8 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   // For a TEXT-only step the three mRoPE position streams are identical, so the
   // partial NeoX RoPE in FullAttnBlock degenerates to 1-D RoPE over `positions`
   // (notes §2). The vision tower / image-video merger are DEFERRED.
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -9047,7 +9074,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                   residual, positions, tokens);
   } else {
     RunLayer(device, weights_->moe_layers[layer_index], *config_, hidden,
-             residual, positions, tokens);
+             residual, positions, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -9112,7 +9139,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   } else {
     RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
                   residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
-                  /*gdn_state=*/nullptr, tokens);
+                  /*gdn_state=*/nullptr, tokens, layer_index);
   }
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
@@ -9236,7 +9263,8 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
@@ -10040,7 +10068,12 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   hidden.Zero(d);
-  RunLayer(d, layer, config, hidden, res, positions, T);
+  // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
+  // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
+  // the engine device, which is the inert path — a replay must reproduce the
+  // layer's arithmetic, and silently placing it would change which device the
+  // replay measured.
+  RunLayer(d, layer, config, hidden, res, positions, T, /*layer_index=*/-1);
 
   // Combined stream out = residual + hidden (f32), directly comparable to the
   // layer golden's `out`.
@@ -10878,33 +10911,58 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the layer region once, instantiate the graph, then launch it.
   if (s.warm) {
+    // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+    // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+    // block, on the reasoning that the capture RETAINS its logits while the
+    // other ring slot still holds its own, so the free list is one short. The
+    // retention half is right and the "one block of that shape" half is not:
+    // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+    // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+    // ring slot's capture died in `dconv`, the GDN causal-conv output
+    // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+    // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+    // inside a captured region aborts the capture. An alloc-and-free grows the
+    // pool only when that class's free list is EMPTY, so with one block free
+    // and TWO needed live at once it grew nothing at all.
+    //
+    // So the driver stops naming a tensor and asks the pool for the demand the
+    // EAGER step at this shape actually made (`s.demand`, taken at the end of
+    // the cold step). Working scratch is still freed at ForwardLayers return and
+    // still SAFELY shared between the two graphs -- they replay sequentially on
+    // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+    // legal, and it is a no-op once the free list is deep enough.
+    //
+    // #2029: IT RUNS BEFORE EVERY CAPTURE, and until this line moved it ran
+    // before almost none of them. It sat inside the `if (dbuf)` below, and
+    // `dbuf` is `impl_->dbuf || spec_step` -- the `VT_ASYNC_EXECUTOR` parity
+    // ring, or a speculative step. The DEFAULT server sets neither, so the lane
+    // a user gets by omitting `--speculative-config` opened its capture over a
+    // pool nobody had prepared, and #1380's own failure came back at c=8 as
+    // `cudaMalloc: operation not permitted when stream is capturing` while the
+    // SAME binary with a speculative config served. The guard was never about
+    // the pre-grow: that block exists for the parity ring's drain and its
+    // persistent step inputs, and #1393 replaced the pre-grow in place without
+    // revisiting what it sat under.
+    //
+    // The `!dbuf` arm needs this at least as much as the `dbuf` arm. It passes
+    // `persistent_sdi == nullptr` to ForwardLayers, so `BuildStepDevInputs`
+    // and `MaybeBuildAttnCosSin` run from the MAIN pool INSIDE the captured
+    // region -- and that is also what makes `s.demand` exact for it, because the
+    // cold step takes the identical `nullptr` branch. On the `dbuf` arm the
+    // captured region's main-pool demand is a strict SUBSET of the cold step's,
+    // which is the containment #1393 recorded.
+    //
+    // Ordering: this now precedes the `b.Synchronize` below rather than
+    // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
+    // enqueues no work and reads no in-flight buffer -- and the drain still
+    // happens before `BeginCapture`, which is the property it was added for.
+    Pool(b).PreGrowForCapture(b, s.demand);
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
-      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
-      // block, on the reasoning that the capture RETAINS its logits while the
-      // other ring slot still holds its own, so the free list is one short. The
-      // retention half is right and the "one block of that shape" half is not:
-      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
-      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
-      // ring slot's capture died in `dconv`, the GDN causal-conv output
-      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
-      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture. An alloc-and-free grows the
-      // pool only when that class's free list is EMPTY, so with one block free
-      // and TWO needed live at once it grew nothing at all.
-      //
-      // So the driver stops naming a tensor and asks the pool for the demand the
-      // EAGER step at this shape actually made (`s.demand`, taken at the end of
-      // the cold step). Working scratch is still freed at ForwardLayers return and
-      // still SAFELY shared between the two graphs -- they replay sequentially on
-      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
-      // legal, and it is a no-op once the free list is deep enough.
-      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture. BuildStepDevInputs fills s.dev from the refreshed host vectors so
       // the capture step reads correct inputs; the persistent cos|sin (fused-preamble
@@ -11432,33 +11490,58 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the dense layer region once, instantiate the graph, launch it.
   if (s.warm) {
+    // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+    // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+    // block, on the reasoning that the capture RETAINS its logits while the
+    // other ring slot still holds its own, so the free list is one short. The
+    // retention half is right and the "one block of that shape" half is not:
+    // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+    // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+    // ring slot's capture died in `dconv`, the GDN causal-conv output
+    // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+    // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+    // inside a captured region aborts the capture. An alloc-and-free grows the
+    // pool only when that class's free list is EMPTY, so with one block free
+    // and TWO needed live at once it grew nothing at all.
+    //
+    // So the driver stops naming a tensor and asks the pool for the demand the
+    // EAGER step at this shape actually made (`s.demand`, taken at the end of
+    // the cold step). Working scratch is still freed at DenseForwardLayers return and
+    // still SAFELY shared between the two graphs -- they replay sequentially on
+    // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+    // legal, and it is a no-op once the free list is deep enough.
+    //
+    // #2029: IT RUNS BEFORE EVERY CAPTURE, and until this line moved it ran
+    // before almost none of them. It sat inside the `if (dbuf)` below, and
+    // `dbuf` is `impl_->dbuf || spec_step` -- the `VT_ASYNC_EXECUTOR` parity
+    // ring, or a speculative step. The DEFAULT server sets neither, so the lane
+    // a user gets by omitting `--speculative-config` opened its capture over a
+    // pool nobody had prepared, and #1380's own failure came back at c=8 as
+    // `cudaMalloc: operation not permitted when stream is capturing` while the
+    // SAME binary with a speculative config served. The guard was never about
+    // the pre-grow: that block exists for the parity ring's drain and its
+    // persistent step inputs, and #1393 replaced the pre-grow in place without
+    // revisiting what it sat under.
+    //
+    // The `!dbuf` arm needs this at least as much as the `dbuf` arm. It passes
+    // `persistent_sdi == nullptr` to DenseForwardLayers, so `BuildStepDevInputs`
+    // and `MaybeBuildAttnCosSin` run from the MAIN pool INSIDE the captured
+    // region -- and that is also what makes `s.demand` exact for it, because the
+    // cold step takes the identical `nullptr` branch. On the `dbuf` arm the
+    // captured region's main-pool demand is a strict SUBSET of the cold step's,
+    // which is the containment #1393 recorded.
+    //
+    // Ordering: this now precedes the `b.Synchronize` below rather than
+    // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
+    // enqueues no work and reads no in-flight buffer -- and the drain still
+    // happens before `BeginCapture`, which is the property it was added for.
+    Pool(b).PreGrowForCapture(b, s.demand);
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
-      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
-      // block, on the reasoning that the capture RETAINS its logits while the
-      // other ring slot still holds its own, so the free list is one short. The
-      // retention half is right and the "one block of that shape" half is not:
-      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
-      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
-      // ring slot's capture died in `dconv`, the GDN causal-conv output
-      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
-      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture. An alloc-and-free grows the
-      // pool only when that class's free list is EMPTY, so with one block free
-      // and TWO needed live at once it grew nothing at all.
-      //
-      // So the driver stops naming a tensor and asks the pool for the demand the
-      // EAGER step at this shape actually made (`s.demand`, taken at the end of
-      // the cold step). Working scratch is still freed at DenseForwardLayers return and
-      // still SAFELY shared between the two graphs -- they replay sequentially on
-      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
-      // legal, and it is a no-op once the free list is deep enough.
-      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture (see the 35B driver). The dense fused-preamble arch (27B W4A4)
       // allocates + fills the persistent cos|sin here (pre-capture); the captured

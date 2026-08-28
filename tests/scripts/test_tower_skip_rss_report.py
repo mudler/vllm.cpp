@@ -19,7 +19,7 @@ Three properties this suite exists for, each of which was once absent:
   saving, and a run with no second pair at all (the pre-repair on-disk shape) is
   VOID rather than a pass.
 * **The threshold is per model.** Muse Glimmer's 7.161 GiB does not describe
-  Qwen3-VL's 1.547 GiB tower, so a missing kind is REFUSED rather than
+  Qwen3-VL's 0.7736 GiB tower, so a missing kind is REFUSED rather than
   defaulted, and the two declared byte counts are pinned against the spec that
   declares them.
 
@@ -349,7 +349,7 @@ class BoundaryTests(unittest.TestCase):
       equal to the threshold exists and `-ge` vs `-gt` is a real distinction
       this suite can make. It is made below, and it is the only case that reds
       when the comparison is loosened.
-    * `need("qwen3-vl") == 1495251763` is not a whole kilobyte, so no run can
+    * `need("qwen3-vl") == 747625881` is not a whole kilobyte, so no run can
       land on it. The tightest expressible pair straddling it is asserted
       instead -- the next kilobyte up is MET, the next one down is FAILING --
       which is the strongest statement that input can support.
@@ -574,7 +574,13 @@ class DeclarationTests(unittest.TestCase):
         )
         claimed = {}
         for kind in ONDISK:
-            owning = [b for b in blocks if str(need(kind)) in b]
+            # `= <n> B`, not a bare `<n>`: the declaration states the
+            # threshold in that exact form, so requiring it rejects a
+            # block that merely MENTIONS the number -- a superseded
+            # figure recalled in prose inside the same 240-char window
+            # would otherwise satisfy a presence test while the
+            # declaration itself said something else.
+            owning = [b for b in blocks if f"= {need(kind)} B" in b]
             if len(owning) != 1:
                 self.fail(
                     "%s computes a %s threshold of %d B; %s carries that number "

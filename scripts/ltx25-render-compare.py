@@ -75,6 +75,28 @@ what this file does.
 USAGE
     ltx25-render-compare.py --a <dir> --b <dir> [--control <dir>] \
         [--control-of a|b] [--label-a naive] [--label-b flash] [--json out.json]
+    ltx25-render-compare.py --a <dir> --reference <mp4|dir> [--json out.json]
+
+`--reference` is the ABSOLUTE question, and #1854 is the issue that refused to
+answer it until an oracle existed. It now does: #1864 pinned `ltx-2`, ran it on
+the real bf16 checkpoints, and committed the render to
+`tests/parity/goldens/ltx2_oracle/`. Passing it turns the 8-grid and 32-grid
+blockiness ratios of the panel below from REPORTED into CHECKED, against a band
+recomputed from that render's own frames on every run. Nothing about the bound is
+written down here, and the two remaining panel statistics stay reported for
+reasons `.agents/specs/ltx25-oracle-absolute.md` section 5 measures rather than
+asserts.
+
+`--b` is OPTIONAL when `--reference` is given, and the second form above is what
+a single render uses. The absolute question is about ONE render; requiring a
+second would make this tool demand a comparison it does not use, and both ways of
+faking one are worse than the extra entry point. `_absolute_only` records them.
+
+WHAT `--reference` STILL DOES NOT ANSWER. Prompt adherence. Nothing in this tree
+scores frames against a prompt, that needs a vision-language model pinned as an
+oracle, and #1854's first sub-question stays open. A run that passes says the
+render is no worse than upstream's on two blockiness ratios at one geometry. It
+does not say the render depicts what was asked for.
 
 `--control` is a THIRD render that repeats ONE of the two arms with nothing
 changed. It measures the noise floor: run-to-run nondeterminism of the same
@@ -131,7 +153,9 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
+import tempfile
 import wave
 
 import numpy as np
@@ -848,8 +872,8 @@ def audio_correspondence(a_path: str, b_path: str,
             "reason": None}
 
 
-def absolute_quality(d: str, audio: str | None) -> dict:
-    """REPORTED, and NOT CHECKED. Section 11.5 GAP 2, filed as #1854.
+def absolute_quality(d: str, audio: str | None, gated: bool = False) -> dict:
+    """The panel. REPORTED, and CHECKED only where a reference supplies a bound.
 
     Everything else in this file is a difference between two renders. This is
     the only block that is about ONE render in absolute terms, and no threshold
@@ -859,9 +883,23 @@ def absolute_quality(d: str, audio: str | None) -> dict:
     when it is working. So the numbers are printed for the next reader and none
     of them is a check. Inventing one would be a gate that passes a wrong
     artefact.
+
+    `gated` says a reference was supplied and the two blockiness ratios are now
+    checked against it (`reference_checks`). The remaining three statistics stay
+    reported EVEN THEN, and `checked_statistics` names which is which, because a
+    bare `"checked": true` over a panel where half the entries decide nothing
+    would tell a reader something the report does not mean.
     """
     paths = frame_paths(d)
     sharp, b8, b32, clipped, total = [], [], [], 0, 0
+    # COLLAPSED BANDS, COUNTED. `blockiness_bands` returns 0.0 for a band whose
+    # OFF-grid step is zero, which is what a fully flat block grid produces --
+    # the worst artefact this statistic can be shown, reading as the smallest
+    # possible value. A ceiling alone would pass it, so the count is carried out
+    # of here and checked. It is a count and not a threshold: the ratio of two
+    # non-negative means is 0.0 only when the numerator or the denominator has
+    # collapsed, and neither happens to a render with a picture in it.
+    zero8, zero32, bands8, bands32 = 0, 0, 0, 0
     for p in paths:
         a = read_ppm(p)
         l = luma(a).astype(np.float64)
@@ -870,8 +908,10 @@ def absolute_quality(d: str, audio: str | None) -> dict:
         r32 = blockiness_bands(l, grid=ALT_GRID)
         if r8.size:
             b8.append(float(r8.mean()))
+            zero8 += int((r8 == 0.0).sum()); bands8 += int(r8.size)
         if r32.size:
             b32.append(float(r32.mean()))
+            zero32 += int((r32 == 0.0).sum()); bands32 += int(r32.size)
         clipped += int(((a == 0) | (a == 255)).sum())
         total += int(a.size)
     out = {
@@ -879,16 +919,361 @@ def absolute_quality(d: str, audio: str | None) -> dict:
         "blockiness_grid8": float(np.mean(b8)) if b8 else None,
         "blockiness_grid32": float(np.mean(b32)) if b32 else None,
         "clipped_fraction": clipped / total if total else None,
-        "checked": False,
-        "why_not_checked": "absolute render quality is not gateable in this tree "
-                           "(#1854): prompt adherence needs a model and "
-                           "artefact-freedom needs an absolute reference render",
+        "blockiness_grid8_collapsed_bands": zero8,
+        "blockiness_grid32_collapsed_bands": zero32,
+        "blockiness_grid8_bands": bands8,
+        "blockiness_grid32_bands": bands32,
+        "checked": bool(gated),
+        "checked_statistics": list(REFERENCE_GATED) if gated else [],
+        "reported_statistics": (list(REFERENCE_REPORTED) if gated
+                                else list(REFERENCE_GATED) + list(REFERENCE_REPORTED)),
+        "why_not_checked": (
+            "prompt adherence still needs a pinned scoring model, and sharpness, "
+            "the clipped fraction and audio RMS have no bound the committed "
+            "reference can supply (spec ltx25-oracle-absolute.md section 5)"
+            if gated else
+            "absolute render quality is not gateable in this tree "
+            "(#1854): prompt adherence needs a model and "
+            "artefact-freedom needs an absolute reference render"),
     }
     if audio and os.path.exists(audio):
         t = audio_rms_terms(audio)
         out["audio_rms_mean"] = float(t.mean()) if t.size else None
         out["audio_rms_min"] = float(t.min()) if t.size else None
     return out
+
+
+
+# --- the absolute reference (#1854) -------------------------------------------
+# EVERYTHING ABOVE THIS LINE IS A DIFFERENCE BETWEEN TWO RENDERS. This block is
+# the one place a render is judged on its own, and #1854 is precise about the
+# only shape that is admissible for it: "worse than the oracle on this
+# statistic", **because that is a comparison and not a convention**. It filed
+# itself rather than shipping a proxy, on the grounds that "a proxy for
+# perceptual quality that measures nothing is worse than a declared gap".
+#
+# So no number below is written down. Every bound is RECOMPUTED from the
+# reference render's own frames on each run. A transcribed bound could not
+# survive a change to `blockiness_bands`, and comparing a new definition of a
+# statistic against an old definition's recorded value is the failure
+# `a-transcription-cannot-gate-the-function-it-transcribes` names.
+#
+# WHICH STATISTIC GATES, AND WHY IT IS THE ONLY ONE. Of the four panel
+# statistics, blockiness is the one whose value is anchored by construction
+# rather than by content: it is the ratio of the mean luma step ON the block
+# grid to the mean step off it, so a render with no block structure sits near
+# 1.0 whatever it depicts, because the grid has no special status in it. The
+# reference confirms that empirically rather than by assertion -- its 25 frames
+# read 1.042812 on grid 8 with per-frame values from 0.947454 to 1.143393, so
+# its healthy excess over the null is SMALLER than its own scatter and its
+# frames straddle 1.0.
+#
+# Sharpness, the clipped fraction and audio RMS stay REPORTED, and
+# `.agents/specs/ltx25-oracle-absolute.md` section 5 gives the derivation that
+# failed for each: sharpness has no structural null and our render is not the
+# same picture as the reference; the clipped fraction is content-driven AND does
+# not survive the committed mp4's yuv420p round trip (0.001650 to 0.001391, 16%
+# relative); and the reference's `audio.wav` is not committed at all, so there
+# is no bytes-exact audio reference in this tree to derive a bound from.
+GOLDEN_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 os.pardir, "tests", "parity", "goldens", "ltx2_oracle"))
+DEFAULT_REFERENCE_SUMS = os.path.join(GOLDEN_DIR, "SHA256SUMS")
+
+# The gated statistics, and the direction "worse" runs in. `higher_is_worse` is
+# recorded rather than assumed because the LOWER edge of each band is not a
+# quality claim and must not be read as one; see `reference_checks`.
+REFERENCE_GATED = ("blockiness_grid8", "blockiness_grid32")
+REFERENCE_REPORTED = ("sharpness_mean", "clipped_fraction",
+                      "audio_rms_mean", "audio_rms_min")
+
+
+def parse_sha256sums(path: str) -> dict[str, str]:
+    """`name -> digest` out of a `sha256sum` file, comments and blanks dropped."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise UnreadableInput(f"{path}: cannot read the reference digest list ({exc})")
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, _, name = line.partition("  ")
+        digest, name = digest.strip(), name.strip()
+        if len(digest) == 64 and name:
+            out[name] = digest
+    if not out:
+        raise UnreadableInput(f"{path}: no sha256 lines, so nothing anchors the reference")
+    return out
+
+
+def load_reference(path: str, sums_path: str) -> tuple[dict, list[np.ndarray]]:
+    """The oracle render, IDENTITY-ASSERTED BEFORE A PIXEL IS READ.
+
+    A reference a caller can point anywhere is not a reference. Pointed at the
+    render under test it would pass by construction, which is exactly the
+    `oracle-identity-must-be-asserted` failure, and this gate's entire claim is
+    that the bound came from upstream rather than from us. So the digests decide
+    admission, and they are the ones committed in
+    `tests/parity/goldens/ltx2_oracle/SHA256SUMS` by #1864 -- a file
+    `tests/scripts/test_ltx2_oracle_goldens.py` already recomputes for the two
+    artefacts that are in the tree.
+
+    Two forms, and both are anchored by the same list:
+
+      an .mp4    the committed `upstream-render.mp4`, decoded with ffmpeg. This
+                 needs nothing outside the tree. That an H.264 file can carry the
+                 very block artefact this gate looks for is a real objection, and
+                 it is answered by MEASUREMENT rather than by argument: on this
+                 render the decoded frames give `blockiness_grid8` bounds that
+                 differ from the true PPM frames' by 2.66e-04 relative and
+                 `blockiness_grid32` by 7.56e-04. Section 2 of the spec carries
+                 the table. `clipped_fraction` does NOT survive the round trip,
+                 which is one of the reasons it is not gated.
+
+      a directory of `frame_*.ppm`, the exact form. Every frame's digest must
+                 appear in the list. These are the frames #1864's job wrote to
+                 the NAS at `/workspace/ltx2-oracle/out/upstream_frames`, and
+                 SHA256SUMS' own preamble says their digests are recorded "so a
+                 later copy of them is checkable against this run rather than
+                 trusted". This is that check.
+
+    A digest that is absent from the list is refused at EXIT_UNREADABLE and never
+    at EXIT_FAIL: an unverifiable reference means NOTHING was compared, and a 1
+    would say the render is worse than a reference that was never established.
+    """
+    sums = parse_sha256sums(sums_path)
+    known = set(sums.values())
+    if os.path.isdir(path):
+        paths = frame_paths(path)
+        checked = []
+        for p in paths:
+            digest = sha256_file(p)
+            name = os.path.basename(p)
+            if sums.get(name) != digest:
+                raise UnreadableInput(
+                    f"{p}: sha256 {digest} is not what {os.path.basename(sums_path)} "
+                    f"records for {name} ({sums.get(name, 'no entry at all')}). This is "
+                    f"not the #1864 reference render, and a bound taken from it would be "
+                    f"a bound taken from an unknown file")
+            checked.append(name)
+        frames = [read_ppm(p) for p in paths]
+        form, digest_count, source_digest = "frames", len(checked), None
+    elif os.path.isfile(path):
+        source_digest = sha256_file(path)
+        if source_digest not in known:
+            raise UnreadableInput(
+                f"{path}: sha256 {source_digest} appears nowhere in "
+                f"{os.path.basename(sums_path)}, so it is not the #1864 reference render")
+        frames = decode_reference_video(path)
+        form, digest_count = "mp4", 1
+    else:
+        raise UnreadableInput(f"{path}: not a directory of frames and not a file")
+    if not frames:
+        raise UnreadableInput(f"{path}: the reference decoded to zero frames")
+    return {"source": os.path.abspath(path), "form": form,
+            "sums": os.path.abspath(sums_path), "digests_verified": digest_count,
+            "source_sha256": source_digest, "frames": len(frames)}, frames
+
+
+def decode_reference_video(path: str) -> list[np.ndarray]:
+    """ffmpeg to `rgb24` PPM, in a temporary directory that is always removed.
+
+    Written out rather than piped because the PPM reader above is the one this
+    file already trusts, and a second frame decoder inside the same tool would be
+    a second definition of what a pixel is.
+    """
+    with tempfile.TemporaryDirectory(prefix="ltx25-ref-") as tmp:
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", path, "-pix_fmt", "rgb24",
+               os.path.join(tmp, "frame_%06d.ppm")]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except OSError as exc:
+            raise UnreadableInput(
+                f"{path}: cannot run ffmpeg to decode the reference ({exc}). Pass a "
+                f"directory of frame_*.ppm instead, or install ffmpeg")
+        if proc.returncode != 0:
+            raise UnreadableInput(
+                f"{path}: ffmpeg exited {proc.returncode} decoding the reference: "
+                f"{proc.stderr.strip()[:400]}")
+        return [read_ppm(p) for p in frame_paths(tmp)]
+
+
+def reference_bounds(frames: list[np.ndarray]) -> dict:
+    """The band each gated statistic must lie in, COMPUTED from the reference.
+
+    Per frame, then reduced. `frame_min` and `frame_max` are the reference's own
+    observed range; `mean` and `sd` are printed beside them so a reader can see
+    how far our value sits from the reference in the reference's own units,
+    rather than only whether it cleared a line.
+    """
+    per: dict[str, list[float]] = {name: [] for name in
+                                   ("sharpness_mean", "blockiness_grid8",
+                                    "blockiness_grid32", "clipped_fraction")}
+    # THE INSTRUMENT'S OWN PRECONDITION, checked before its reading is used. A
+    # reference whose bands collapsed has a ceiling of 0.0, which every render
+    # would then fail; a reference that is itself degenerate is a broken
+    # instrument and not a strict oracle. It has never happened to the #1864
+    # render and it is checked anyway, because the cost of finding out inside a
+    # GPU lease is a lease.
+    collapsed = 0
+    for a in frames:
+        l = luma(a).astype(np.float64)
+        per["sharpness_mean"].append(float(sharpness_map(l).mean()))
+        r8 = blockiness_bands(l, grid=BLOCK_GRID)
+        r32 = blockiness_bands(l, grid=ALT_GRID)
+        collapsed += int((r8 == 0.0).sum()) + int((r32 == 0.0).sum())
+        if r8.size:
+            per["blockiness_grid8"].append(float(r8.mean()))
+        if r32.size:
+            per["blockiness_grid32"].append(float(r32.mean()))
+        per["clipped_fraction"].append(float(((a == 0) | (a == 255)).sum()) / a.size)
+    if collapsed:
+        raise UnreadableInput(
+            f"the reference has {collapsed} blockiness bands reading 0.0, so its own "
+            f"off-grid denominator collapsed. A degenerate reference supplies a "
+            f"degenerate bound, and nothing may be measured against it")
+    out: dict[str, dict] = {}
+    for name, vals in per.items():
+        v = np.asarray(vals, dtype=np.float64)
+        if v.size == 0:
+            out[name] = {"n": 0, "mean": None, "sd": None,
+                         "frame_min": None, "frame_max": None}
+            continue
+        out[name] = {
+            "n": int(v.size),
+            "mean": float(v.mean()),
+            "sd": float(v.std(ddof=1)) if v.size > 1 else 0.0,
+            "frame_min": float(v.min()),
+            "frame_max": float(v.max()),
+        }
+    return out
+
+
+def reference_checks(label: str, panel: dict, bounds: dict) -> list[tuple]:
+    """One check per gated statistic, as `(name, pass, detail, judges)` tuples.
+
+    THE BOUND IS THE REFERENCE'S OWN PER-FRAME RANGE, and the asymmetry in it is
+    deliberate. Our MEAN is held against the reference's per-frame MAX rather
+    than against its mean, because mean-against-mean has no margin at all and
+    would fire on the difference in CONTENT between two renders of the same
+    prompt by two different engines. It is not held against the reference's per
+    frame max by our own per-frame max either: with 25 frames on each side and no
+    real difference, the probability that our maximum exceeds theirs is about one
+    half, and a gate that fires on a coin toss is not a gate. Our mean against
+    their max fires when our render exceeds the reference by roughly two of the
+    reference's own per-frame standard deviations, and that number is a
+    consequence of the construction rather than a constant anyone picked.
+
+    THE CEILING ALONE WOULD BE A MUTE SWITCH, and the guard beside it is a COUNT
+    rather than a second edge. `blockiness_bands` divides the on-grid step by the
+    off-grid step and returns 0.0 for a band whose denominator collapsed, which
+    is what a fully flat block grid produces: the worst artefact this statistic
+    can be shown, reading as the smallest possible value and clearing any
+    ceiling. Measured on the reference's own frames, flattening them completely
+    onto the 8x8 grid takes `blockiness_grid8` to exactly 0.0000.
+
+    A TWO-SIDED BAND WAS THE FIRST DESIGN AND IT WAS WRONG. Holding the value
+    inside the reference's per-frame range makes "much LESS blocky than the
+    reference" a failure, and less blocky is not worse. A test caught it rather
+    than a reading of the code: one render at 1.185808 against a deliberately
+    blocky reference whose band was [1.892608, 2.161415] FAILED, on the side
+    where it was better. So the quality claim is one-sided -- `v <= frame_max` --
+    and the degeneracy it needed a floor for is checked directly, by requiring
+    that NO band collapsed. That count is not a threshold: the ratio of two
+    non-negative means is 0.0 only when one of them has collapsed, and neither
+    collapses in a render with a picture in it.
+    """
+    out: list[tuple] = []
+    for name in REFERENCE_GATED:
+        b = bounds.get(name) or {}
+        v = panel.get(name)
+        hi = b.get("frame_max")
+        if v is None or hi is None:
+            out.append((f"absolute.{label}.{name}", False,
+                        f"not computed (arm {v}, reference ceiling {hi})", "treatment"))
+            continue
+        out.append((
+            f"absolute.{label}.{name}", v <= hi,
+            f"{v:.6f} <= {hi:.6f}, the reference's per-frame maximum "
+            f"(reference mean {b['mean']:.6f}, per-frame sd {b['sd']:.6f}, "
+            f"n={b['n']}); margin {hi - v:+.6f}; "
+            + ("worse than the oracle on this statistic" if v > hi
+               else "no worse than the oracle on this statistic"),
+            "treatment"))
+        collapsed = panel.get(f"{name}_collapsed_bands")
+        total = panel.get(f"{name}_bands")
+        out.append((
+            f"absolute.{label}.{name}_defined", collapsed == 0,
+            f"{collapsed} of {total} bands read 0.0, which is the off-grid "
+            f"denominator collapsing; a flat block grid reads as the SMALLEST "
+            f"possible value and would clear the ceiling above",
+            "treatment"))
+    return out
+
+
+def content_checks(content: dict, label: str, judges: str) -> list[tuple]:
+    """C0 for ONE render, judged on its own content before anything is subtracted.
+
+    Three checks, not four: "frames written" used to be a fourth and it could
+    never be False, because `frame_paths` refuses an empty directory at
+    EXIT_UNREADABLE long before this runs, and a row that cannot fail is a
+    decoration in a table whose entire value is that every row can.
+
+    Module level rather than a closure inside `_compare`, because the
+    absolute-only path judges the same content by the same rule and two
+    definitions of C0 could drift apart without anything noticing.
+    """
+    c = content
+    return [
+        (f"content.{label}.not_uniform", c["near_uniform_frames"] == 0,
+         f"near-uniform frames {c['near_uniform_frames']} == 0 "
+         f"(min per-frame variance {c['per_frame_var_min']:.3f})", judges),
+        (f"content.{label}.distinct_frames",
+         c["distinct_frame_hashes"] == c["frames"],
+         f"{c['distinct_frame_hashes']} distinct of {c['frames']}", judges),
+        (f"content.{label}.motion",
+         c["zero_motion_pairs"] == 0 and c["adjacent_frame_mad_mean"] > 0.0,
+         f"zero-motion pairs {c['zero_motion_pairs']}, "
+         f"mean adjacent MAD {c['adjacent_frame_mad_mean']:.4f}", judges),
+    ]
+
+
+def print_absolute_panel(report: dict, gated: bool) -> None:
+    """The panel, and a heading that says which of the two states it is in.
+
+    #1854 shipped this block declaring itself unchecked, and the declaration was
+    the point: a reader had to be able to see that the numbers decided nothing.
+    The same obligation runs the other way now, so the heading changes with the
+    fact rather than staying the reassuring one.
+    """
+    if not gated:
+        print("--- absolute quality: REPORTED, and NOT CHECKED (#1854) ---")
+        print("no threshold over these means anything without an oracle that renders "
+              "LTX-2.5 or a pinned scoring model; pass --reference to gate the two "
+              "blockiness ratios against the committed #1864 reference render")
+    else:
+        ref = report["reference"]
+        print("--- absolute quality: the blockiness ratios are CHECKED against the "
+              "#1864 reference (#1854) ---")
+        print(f"reference {ref['source']}")
+        print(f"  form {ref['form']}, {ref['frames']} frames, "
+              f"{ref['digests_verified']} digest(s) verified against "
+              f"{os.path.basename(ref['sums'])}")
+        for name in REFERENCE_GATED:
+            b = ref["bounds"][name]
+            print(f"  {name:18s} reference mean {b['mean']:.6f}  per-frame "
+                  f"[{b['frame_min']:.6f}, {b['frame_max']:.6f}]  sd {b['sd']:.6f}  "
+                  f"n {b['n']}")
+        print("  sharpness, the clipped fraction and audio RMS stay REPORTED: "
+              "spec ltx25-oracle-absolute.md section 5")
+    for lbl, q in report["absolute_quality"].items():
+        print(f"{lbl:12s} sharpness={q['sharpness_mean']} "
+              f"block8={q['blockiness_grid8']} block32={q['blockiness_grid32']} "
+              f"clipped={q['clipped_fraction']} "
+              f"audio_rms={q.get('audio_rms_mean')}")
 
 
 def structural_report(dir_a: str, dir_b: str, audio_name: str) -> dict:
@@ -926,7 +1311,13 @@ def structural_report(dir_a: str, dir_b: str, audio_name: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--a", required=True, help="arm A render directory (the reference)")
-    ap.add_argument("--b", required=True, help="arm B render directory (the change under test)")
+    # OPTIONAL SINCE #1854. The absolute question is about ONE render, and the
+    # tool used to be unable to ask it. `_absolute_only` records why neither
+    # workaround -- passing arm A twice, or making the reference arm B -- is
+    # admissible.
+    ap.add_argument("--b", default=None,
+                    help="arm B render directory (the change under test); omit it to "
+                         "judge ONE render against --reference")
     ap.add_argument("--control", default=None,
                     help="a repeat of ONE arm, unchanged: the run-to-run noise floor")
     ap.add_argument("--control-of", choices=("a", "b"), default="a",
@@ -946,7 +1337,25 @@ def main() -> int:
     ap.add_argument("--max-coherence", type=float, default=DEFAULT_MAX_COHERENCE,
                     help="section 11.3: the coherence ratio K above which the "
                          "difference has a DIRECTION rather than only a size")
+    # THE ABSOLUTE REFERENCE (#1854). Not a threshold: a render, whose identity is
+    # asserted against the committed digests before a pixel of it is read, and
+    # from whose own frames every bound is recomputed on each run.
+    ap.add_argument("--reference", default=None,
+                    help="the #1864 oracle render: the committed "
+                         "tests/parity/goldens/ltx2_oracle/upstream-render.mp4, or a "
+                         "directory of its frame_*.ppm. Every byte is checked against "
+                         "SHA256SUMS before it is read")
+    ap.add_argument("--reference-sums", default=DEFAULT_REFERENCE_SUMS,
+                    help="the digest list the reference must appear in "
+                         "(default: the committed one, resolved from this script)")
     args = ap.parse_args()
+    if args.b is None and args.reference is None:
+        ap.error("--b or --reference is required: without either there is nothing "
+                 "to compare this render against, and a tool that compared a render "
+                 "with nothing would report a pass nobody may read")
+    if args.b is None and args.control is not None:
+        ap.error("--control repeats one of TWO arms and calibrates the delta between "
+                 "them; with no --b there is no delta for it to calibrate")
 
     # ONE place turns an unreadable input into the status that says so. Every
     # refusal below raises rather than returning a number, so a new one cannot
@@ -965,7 +1374,132 @@ def main() -> int:
         return EXIT_UNREADABLE
 
 
+
+def _absolute_only(args: argparse.Namespace) -> int:
+    """ONE render, judged against the #1864 reference. No arm B anywhere.
+
+    #1854 asks an ABSOLUTE question -- is this a good render of this prompt --
+    and this tool could not ask it, because `--b` was required and the caller had
+    to supply a comparison the absolute question does not use. Two ways around
+    that were considered and both are worse than a second entry point:
+
+      PASS THE RENDER AS BOTH ARMS. Every check then passes by construction:
+      `bit_identical` short-circuits the identity block, `coherence` returns
+      `k = 0.0` on a zero difference, and each alignment check matches a frame to
+      itself. Landing that as the gate's invocation is
+      `gate-comparing-shared-helper-proves-consistency-not-correctness` with both
+      sides of the comparison the same directory.
+
+      MAKE THE REFERENCE ARM B. #1743 relocated the identity bounds out of the
+      verdict, but NOT `align.*` and `coherence.*`, which still decide it. Two
+      renders of one prompt by two different engines are two different pictures,
+      so those checks fail by construction and the run would exit 1 for a reason
+      that is not a finding.
+
+    What is judged here: C0 on the render's own content, then the reference
+    checks. C0 first and for the reason it is first in `_compare` -- an arm that
+    rendered nothing, rendered one colour or rendered one frame 25 times would
+    otherwise produce a blockiness number and clear a band with it. A blank frame
+    has no off-grid step either.
+
+    The exit statuses keep their meanings exactly. 0 every check passed, 1 a
+    check failed, 2 an input could not be read -- which is where an unverifiable
+    reference lands, because a 1 would say this render is worse than a reference
+    that was never established.
+    """
+    if not os.path.isdir(args.a):
+        raise UnreadableInput(f"not a directory: {args.a}")
+
+    meta, ref_frames = load_reference(args.reference, args.reference_sums)
+    bounds = reference_bounds(ref_frames)
+    meta["bounds"] = bounds
+    meta["gated"] = list(REFERENCE_GATED)
+    meta["reported"] = list(REFERENCE_REPORTED)
+
+    report: dict = {
+        "mode": "absolute_only",
+        "thresholds": {},
+        "inputs": {"a": os.path.abspath(args.a), "b": None, "control": None},
+        "control_of": None,
+        "reference": meta,
+    }
+    report["content"] = {args.label_a: arm_content(args.a)}
+    report["absolute_quality"] = {
+        args.label_a: absolute_quality(args.a, os.path.join(args.a, args.audio_name),
+                                       gated=True)
+    }
+
+    checks: list[tuple[str, bool, str, str]] = []
+    checks.extend(content_checks(report["content"][args.label_a], args.label_a,
+                                 "treatment"))
+    checks.extend(reference_checks(args.label_a, report["absolute_quality"][args.label_a],
+                                   bounds))
+
+    report["checks"] = [{"name": n, "pass": p, "detail": d, "judges": j}
+                        for n, p, d, j in checks]
+    treatment = [c for c in checks if c[3] == "treatment"]
+    ok = all(c[1] for c in treatment)
+    report["treatment_verdict"] = "PASS" if ok else "FAIL"
+    # NO IDENTITY VERDICT AND NO CONTROL VERDICT, rather than a null one: both
+    # are statements about a second render, and there is no second render. A
+    # field carrying `IDENTICAL` here would answer a question nobody asked.
+    report["identity_verdict"] = None
+    report["identity_failed"] = []
+    report["control_verdict"] = None
+
+    c0_failed = [c[0] for c in treatment if c[0].startswith("content.") and not c[1]]
+    abs_failed = [c[0] for c in treatment if c[0].startswith("absolute.") and not c[1]]
+    if c0_failed:
+        reading = "CONTENT_DEGENERATE"
+    elif abs_failed:
+        reading = "WORSE_THAN_ORACLE"
+    else:
+        # NAMED FOR EXACTLY WHAT WAS MEASURED. Not "as good as the oracle" and
+        # not "a good render": two of the four panel statistics sit inside the
+        # reference's own per-frame band, on one request at one geometry, and
+        # #1854's prompt-adherence half is untouched and still open.
+        reading = "NO_WORSE_THAN_ORACLE_ON_BLOCKINESS"
+    report["reading"] = reading
+    report["verdict"] = "PASS" if ok else "FAIL"
+    status = EXIT_PASS if ok else EXIT_FAIL
+
+    print("=== ONE render, against the #1864 oracle reference (#1854) ===")
+    print("this run makes NO arm-to-arm comparison: there is no arm B, so nothing "
+          "here is about")
+    print("identity, correspondence or coherence, and no check below is one of "
+          "those.")
+    for label, c in report["content"].items():
+        print(f"{label:12s} frames={c['frames']} distinct={c['distinct_frame_hashes']} "
+              f"mean={c['pixel_mean']:.3f} min_var={c['per_frame_var_min']:.1f} "
+              f"near_uniform={c['near_uniform_frames']} "
+              f"adj_mad={c['adjacent_frame_mad_mean']:.4f} "
+              f"zero_motion_pairs={c['zero_motion_pairs']}")
+    print_absolute_panel(report, gated=True)
+    print("--- checks ---")
+    for n, p, d, j in treatment:
+        print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
+    print("PROMPT ADHERENCE IS NOT MEASURED HERE and is not measured anywhere in "
+          "this tree (#1854).")
+    print("It needs a vision-language model pinned as an oracle. Nothing above "
+          "says the render depicts")
+    print("what the prompt asked for.")
+    print(f"READING {report['reading']}")
+    print(f"VERDICT {report['verdict']} (exit {status})")
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(report, fh, indent=2, sort_keys=True)
+        print(f"wrote {args.json}")
+    return status
+
+
 def _compare(args: argparse.Namespace) -> int:
+    # ONE RENDER OR TWO, decided here and nowhere else. The A/B body below is
+    # unchanged by #1854 -- `--b` present runs exactly the code it ran before --
+    # and the single-render question gets its own function rather than a hundred
+    # guards threaded through this one.
+    if args.b is None:
+        return _absolute_only(args)
     for d in (args.a, args.b) + ((args.control,) if args.control else ()):
         if not os.path.isdir(d):
             raise UnreadableInput(f"not a directory: {d}")
@@ -1052,9 +1586,20 @@ def _compare(args: argparse.Namespace) -> int:
     # check is built so that a reader of the JSON has the numbers whether or not
     # the corresponding check fired.
     report["structural"] = structural_report(args.a, args.b, args.audio_name)
-    # AND THE ABSOLUTE PANEL, which is instrumentation and not a gate (#1854).
+    # AND THE ABSOLUTE PANEL. Instrumentation without `--reference` (#1854 as
+    # filed), and a gate on the two blockiness ratios with one.
+    report["reference"] = None
+    ref_bounds: dict = {}
+    if args.reference:
+        meta, ref_frames = load_reference(args.reference, args.reference_sums)
+        ref_bounds = reference_bounds(ref_frames)
+        meta["bounds"] = ref_bounds
+        meta["gated"] = list(REFERENCE_GATED)
+        meta["reported"] = list(REFERENCE_REPORTED)
+        report["reference"] = meta
     report["absolute_quality"] = {
-        lbl: absolute_quality(d, os.path.join(d, args.audio_name))
+        lbl: absolute_quality(d, os.path.join(d, args.audio_name),
+                              gated=bool(args.reference))
         for lbl, d in ((args.label_a, args.a), (args.label_b, args.b))
     }
 
@@ -1069,27 +1614,10 @@ def _compare(args: argparse.Namespace) -> int:
     checks: list[tuple[str, bool, str, str]] = []
 
     def c0_checks(label: str, judges: str) -> None:
-        """C0 for ONE render, judged on its own content before anything is
-        subtracted. Three checks, not four: "frames written" used to be a fourth
-        and it could never be False, because `frame_paths` refuses an empty
-        directory at EXIT_UNREADABLE long before this runs, and a row that
-        cannot fail is a decoration in a table whose entire value is that every
-        row can."""
-        c = report["content"][label]
-        checks.append((f"content.{label}.not_uniform",
-                       c["near_uniform_frames"] == 0,
-                       f"near-uniform frames {c['near_uniform_frames']} == 0 "
-                       f"(min per-frame variance {c['per_frame_var_min']:.3f})",
-                       judges))
-        checks.append((f"content.{label}.distinct_frames",
-                       c["distinct_frame_hashes"] == c["frames"],
-                       f"{c['distinct_frame_hashes']} distinct of {c['frames']}",
-                       judges))
-        checks.append((f"content.{label}.motion",
-                       c["zero_motion_pairs"] == 0 and c["adjacent_frame_mad_mean"] > 0.0,
-                       f"zero-motion pairs {c['zero_motion_pairs']}, "
-                       f"mean adjacent MAD {c['adjacent_frame_mad_mean']:.4f}",
-                       judges))
+        """C0 for ONE render. ONE definition, at module scope, because the
+        absolute-only path judges the same content by the same rule and two
+        copies of a criterion drift without anything noticing."""
+        checks.extend(content_checks(report["content"][label], label, judges))
 
     # C0 FIRST, and it is not a formality. Everything after this line is a
     # DIFFERENCE, and every difference check passes vacuously when both arms are
@@ -1198,6 +1726,15 @@ def _compare(args: argparse.Namespace) -> int:
                   f"means {co.get('mean_a'):.6g} / {co.get('mean_b'):.6g})")
         checks.append((f"coherence.{name}", k <= args.max_coherence, detail, "treatment"))
 
+    # THE ABSOLUTE CHECKS (#1854). Registered LAST among the treatment entries so
+    # that a reader meets the two-render question first and the one-render
+    # question second, which is the order the report has always been argued in.
+    # They are absent, not vacuously true, when no reference was supplied.
+    if args.reference:
+        for lbl in (args.label_a, args.label_b):
+            checks.extend(reference_checks(lbl, report["absolute_quality"][lbl],
+                                           ref_bounds))
+
     report["checks"] = [{"name": n, "pass": p, "detail": d, "judges": j}
                         for n, p, d, j in checks]
     treatment = [c for c in checks if c[3] == "treatment"]
@@ -1220,10 +1757,19 @@ def _compare(args: argparse.Namespace) -> int:
                  if c[0].startswith("content.") and not c[1]]
     align_failed = [c[0] for c in treatment if c[0].startswith("align.") and not c[1]]
     coh_failed = [c[0] for c in treatment if c[0].startswith("coherence.") and not c[1]]
+    abs_failed = [c[0] for c in treatment if c[0].startswith("absolute.") and not c[1]]
     other_failed = [c[0] for c in treatment if not c[1]
-                    and c[0] not in c0_failed + align_failed + coh_failed]
+                    and c[0] not in c0_failed + align_failed + coh_failed + abs_failed]
     if c0_failed:
         reading = "CONTENT_DEGENERATE"
+    elif abs_failed:
+        # THE STRONGEST STATEMENT THIS TOOL CAN MAKE, so it outranks every
+        # relative one. `align.*` and `coherence.*` compare the two arms with each
+        # other; this compares an arm with upstream's own render of the same
+        # request. An arm outside the reference's own band is worse than the
+        # oracle whatever the other arm does, and burying that under MISALIGNED
+        # would report the smaller finding.
+        reading = "WORSE_THAN_ORACLE"
     elif other_failed:
         reading = "ARTEFACT_MISSING"
     elif align_failed:
@@ -1403,14 +1949,7 @@ def _compare(args: argparse.Namespace) -> int:
               f"means {co.get('mean_a'):.6g} / {co.get('mean_b'):.6g}  "
               f"direction {co.get('direction')} in "
               f"{co.get('majority_fraction'):.3f} of terms  top10%={share_s}")
-    print("--- absolute quality: REPORTED, and NOT CHECKED (#1854) ---")
-    print("no threshold over these means anything without an oracle that renders "
-          "LTX-2.5 or a pinned scoring model, and this tree has neither")
-    for lbl, q in report["absolute_quality"].items():
-        print(f"{lbl:12s} sharpness={q['sharpness_mean']} "
-              f"block8={q['blockiness_grid8']} block32={q['blockiness_grid32']} "
-              f"clipped={q['clipped_fraction']} "
-              f"audio_rms={q.get('audio_rms_mean')}")
+    print_absolute_panel(report, gated=report["reference"] is not None)
     print("--- checks ---")
     print(f"  these decide the verdict: does the {args.label_b} render CORRESPOND "
           f"to the {args.label_a} render, and is their difference DIRECTIONAL")

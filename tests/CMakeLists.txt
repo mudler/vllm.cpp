@@ -3258,6 +3258,16 @@ target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen4_exp_qsa_device vllm/models/test_qwen4_exp_qsa_device.cpp)
 target_include_directories(test_qwen4_exp_qsa_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5b-5 (#2211) — `Qwen4ExpTextAttention` as ONE production
+# block, and the first place under src/ that COMPOSES the QSA indexer. Gated
+# against the lane-pinned oracle's own `Qwen4ExpTextAttention.forward` and, for
+# the two settings no selection can see, against the oracle's own pre-top-k
+# `scores` tensor BY VALUE. Carries the NaN-poison probe at the BLOCK layer and
+# a released-config case past the 2048 indexer budget. CPU only. Reaches the
+# model-private qwen4_exp_qsa_block.h / qwen4_exp_weights.h, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_qsa_block vllm/models/test_qwen4_exp_qsa_block.cpp)
+target_include_directories(test_qwen4_exp_qsa_block PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # MODEL-MM-QWEN4-EXP W5b-2 (#2031) — the DEVICE arm of the same stream:
 # vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME
 # lane-pinned goldens the host reference is gated on, so the two arms answer to

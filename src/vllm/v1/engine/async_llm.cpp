@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "vllm/v1/engine/parallel_sampling.h"
 #include "vllm/v1/metrics/loggers.h"  // PrometheusStatLogger::Record
 #include "vllm/v1/metrics/stats.h"    // IterationStats
 #include "vllm/v1/request.h"
@@ -57,6 +58,18 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
       priority);
   auto collector = std::make_shared<RequestOutputCollector>(
       request.sampling_params.output_kind, request.request_id);
+
+  // async_llm.py:382-399 parallel-sampling fan-out. n == 1 falls through to the
+  // single-sequence path below (byte-identical); n > 1 expands into n children
+  // that share this one collector and each COPY the prompt tokens.
+  // `EngineCoreRequest child = request` is a deep copy here, not upstream's
+  // shallow `copy(request)` (async_llm.py:393), because
+  // EngineCoreRequest::prompt_token_ids is a std::vector<int32_t> BY VALUE
+  // (types.h:79) — O(n * prompt_len). Tracked as #2145; the cheap mirror is a
+  // shared immutable token buffer, which is not a change this row makes.
+  if (request.sampling_params.n > 1) {
+    return PublishParallelSampling(request, prompt, std::move(collector));
+  }
 
   // Build the core Request before publishing the OutputProcessor state so an
   // allocation/factory failure cannot leave a consumer waiting forever.
@@ -107,6 +120,12 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
       /*arrival_time=*/std::nullopt, priority);
   auto collector = std::make_shared<RequestOutputCollector>(
       request.sampling_params.output_kind, request.request_id);
+
+  // Parallel-sampling fan-out (see the string overload).
+  if (request.sampling_params.n > 1) {
+    return PublishParallelSampling(request, /*prompt=*/std::nullopt,
+                                   std::move(collector));
+  }
 
   auto core_request = std::make_unique<Request>(
       Request::FromEngineCoreRequest(request, block_hasher_));
@@ -266,6 +285,19 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   auto collector = std::make_shared<RequestOutputCollector>(
       request.sampling_params.output_kind, request.request_id);
 
+  // Parallel-sampling fan-out: each child COPIES the parent EngineCoreRequest,
+  // mm_features included. What is and is not shared, exactly: the ENCODER
+  // PAYLOAD is shared, because MultiModalFeatureSpec holds it behind
+  // std::shared_ptr<ImageKwargs>/<AudioKwargs> (multimodal/inputs.h:80-81) and
+  // the copy only bumps the refcount. The spec VECTOR and its two strings per
+  // spec are copied per child (types.h:93), as is prompt_token_ids — and on
+  // this path that is the placeholder-EXPANDED prompt, so #2145's per-child
+  // prompt copy costs MORE here than on the text path, not less.
+  if (request.sampling_params.n > 1) {
+    return PublishParallelSampling(request, /*prompt=*/std::nullopt,
+                                   std::move(collector));
+  }
+
   auto core_request = std::make_unique<Request>(
       Request::FromEngineCoreRequest(request, block_hasher_));
 
@@ -286,6 +318,101 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   }
 
   return AsyncRequest{request.request_id, std::move(collector)};
+}
+
+AsyncRequest AsyncLLM::PublishParallelSampling(
+    const EngineCoreRequest& request, std::optional<std::string> prompt,
+    std::shared_ptr<RequestOutputCollector> collector) {
+  // async_llm.py:386-399. One shared ParentRequest, n children named
+  // "{idx}_{parent}" with n == 1 sampling params (seed + idx when the parent is
+  // seeded), all registered against the ONE collector this request hands back.
+  const std::string parent_id = request.request_id;
+  auto parent = std::make_shared<ParentRequest>(request);
+  const int n = request.sampling_params.n;
+
+  // Build every child and its core Request BEFORE taking the lock, mirroring
+  // the single-sequence path's ordering rule: nothing that can throw runs
+  // between the first frontend registration and the core enqueue.
+  std::vector<EngineCoreRequest> children;
+  std::vector<std::unique_ptr<Request>> core_requests;
+  children.reserve(static_cast<std::size_t>(n));
+  core_requests.reserve(static_cast<std::size_t>(n));
+  for (int idx = 0; idx < n; ++idx) {
+    std::pair<std::string, SamplingParams> child_info =
+        parent->get_child_info(idx);
+    // A DEEP copy: EngineCoreRequest holds prompt_token_ids by value
+    // (types.h:79), so each child owns its own copy of the prompt, and
+    // FromEngineCoreRequest below makes a second one per child. Upstream's
+    // `copy(request)` (:393) is SHALLOW — the n children share one Python list
+    // and the last child reuses the parent object outright — so we move
+    // O(n * prompt_len) bytes where upstream moves none. Deliberate here: the
+    // cheap mirror needs a shared immutable token buffer on EngineCoreRequest,
+    // which every engine path reads. Owed, #2145.
+    EngineCoreRequest child = request;
+    child.request_id = std::move(child_info.first);
+    child.sampling_params = std::move(child_info.second);
+    core_requests.push_back(std::make_unique<Request>(
+        Request::FromEngineCoreRequest(child, block_hasher_)));
+    children.push_back(std::move(child));
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(output_processor_mutex_);
+    // The same admission check the single-sequence overloads make under this
+    // lock: a submitter that passed the fast check must not publish after
+    // shutdown has already swept the request table.
+    if (shutdown_started_.load() || errored_.load() ||
+        engine_core_.engine_dead()) {
+      throw EngineDeadError("request submitted to a stopped AsyncLLM");
+    }
+    // Reject every collision BEFORE creating the first new frontend state, the
+    // same guard PublishPreparedWave makes above. add_request throws on a
+    // "duplicate live request id", and the rollback below erases by id — so
+    // without this pre-check a colliding child id would put the PRE-EXISTING
+    // request into the rollback set and destroy state its own caller still
+    // holds. Unreachable over HTTP today (the serving layer mints the parent
+    // id), but the fan-out is also an ABI seam where the caller names the id.
+    for (const EngineCoreRequest& child : children) {
+      if (output_processor_.has_request(child.request_id)) {
+        throw std::invalid_argument("duplicate live request id: " +
+                                    child.request_id);
+      }
+    }
+
+    std::vector<std::string> registered;
+    registered.reserve(children.size());
+    try {
+      // :401-414 _add_request: OutputProcessor registration precedes the
+      // EngineCore enqueue, so an immediately produced frame finds its state.
+      for (std::size_t idx = 0; idx < children.size(); ++idx) {
+        // Include the id BEFORE registering: add_request can insert one of its
+        // maps and then throw.
+        registered.push_back(children[idx].request_id);
+        output_processor_.add_request(children[idx], prompt,
+                                      /*request_index=*/static_cast<int>(idx),
+                                      collector, parent);
+      }
+      // DEVIATION from upstream's per-child `await engine_core.add_request_async`
+      // (:413): one batched enqueue. A mid-loop enqueue failure would otherwise
+      // leave earlier children running in EngineCore with no frontend state,
+      // which OutputProcessor::process_outputs ignores forever
+      // (output_processor.cpp:401-405) — the request would burn KV blocks until
+      // shutdown. The batch keeps the admission a single transaction, as
+      // PublishPreparedWave already does.
+      engine_core_.add_requests_async(std::move(core_requests));
+    } catch (...) {
+      // Roll the whole parent back: every registered child and the parent entry
+      // it published, without manufacturing terminal output for a request the
+      // caller never saw.
+      output_processor_.rollback_requests(registered);
+      throw;
+    }
+  }
+
+  // The PARENT id, not a child's: it is what RequestOutput::request_id carries
+  // (RequestState::make_request_output reads parent_req->external_req_id()) and
+  // what abort() must be given to reach all n children.
+  return AsyncRequest{parent_id, std::move(collector)};
 }
 
 RequestOutput AsyncLLM::get_output(const AsyncRequest& request) {

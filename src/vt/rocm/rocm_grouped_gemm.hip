@@ -16,6 +16,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -289,6 +290,66 @@ __device__ inline float DotQ6K(const BlockQ6_K* xb, const BlockQ8_K* yb) {
   return d * isum;
 }
 
+// Q6_K integer core over a SUB-BLOCK RANGE, for the cooperative decode arm
+// (`KQuantGemmKCoopQ6K`, issue #1910). A K-quant superblock is kQK_K = 256
+// weights in kSubBlocks = 8 groups of 32; this returns the dp4a accumulator for
+// half-open group range [s0, s1) so several warps can each take a share of one
+// output row's superblock.
+//
+// It hands back the raw INTEGER accumulator, never a float. That is what makes
+// the cooperative arm safe: integer addition is exact and associative, so the
+// partial `isum` a shared-memory reduction reassembles across warps equals the
+// single-warp arm's accumulator bit for bit, `d * isum` still runs once per
+// superblock, and no reassociation of the f32 scale product is introduced.
+// Splitting the FLOATS instead would have cost token-exactness for what is only
+// a launch-shape change.
+//
+// This is a SECOND body rather than a range parameter on `DotQ6K`, because
+// making `DotQ6K` call it at [0, 8) measured 642.59 us/call against 371.90 for
+// the donor loop on the n=4096 k=12288 shape (1.73x): the donor's two fixed
+// 128-wide chunks unroll into registers where a loop over a runtime group range
+// does not. The two bodies are held equal by the byte-equality case in
+// tests/vt/test_backend_cross_device.cpp, which runs the same activation row
+// through the cooperative arm (m == 1) and the single-warp arm (m == 2) and
+// demands identical bytes — so a drift between them reds a gate rather than
+// quietly changing a token.
+//
+// Index map, read off the donor's 128-wide chunks: group g covers weights
+// [32*g, 32*g+32). Chunk c = g / 4 supplies ql[64*c ..] and qh[32*c ..], and
+// r = g % 4 selects the donor's four lines: r picks the ql half (r odd => the
+// +32 half) and the nibble (r >= 2 => the high one), and shifts qh by 2*r.
+constexpr int kSubBlocks = kQK_K / 32;
+
+__device__ inline int DotQ6KIsumRange(const BlockQ6_K* xb, const BlockQ8_K* yb, int s0, int s1) {
+  int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int g = s0; g < s1; ++g) {
+    const uint8_t* q4 = xb->ql + (g / 4) * 64;
+    const uint8_t* qh = xb->qh + (g / 4) * 32;
+    const int r = g & 3;
+    const uint8_t* q4b = q4 + ((r & 1) ? 32 : 0);
+    const int nib_shift = (r >= 2) ? 4 : 0;
+    const int qh_shift = 2 * r;
+    int8_t aux8[32];
+    for (int l = 0; l < 32; ++l)
+      aux8[l] = static_cast<int8_t>(
+          static_cast<int8_t>(((q4b[l] >> nib_shift) & 0xF) | (((qh[l] >> qh_shift) & 3) << 4)) -
+          32);
+    // Two 16-wide scale groups per 32-wide sub-block, the donor's `is` order.
+    const int8_t* q8p = yb->qs + g * 32;
+    const int8_t* a = aux8;
+    for (int t = 0; t < 2; ++t) {
+      const int scale = xb->scales[g * 2 + t];
+      for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8p[l] * a[l]);
+      q8p += 8; a += 8;
+      for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8p[l] * a[l]);
+      q8p += 8; a += 8;
+    }
+  }
+  int isum = 0;
+  for (int l = 0; l < 8; ++l) isum += aux32[l];
+  return isum;
+}
+
 // ---- grouped kernels ----
 template <typename OutT>
 __global__ void GroupedQ8_0K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
@@ -377,6 +438,98 @@ __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ 
   }
 }
 
+// --- cooperative decode arm of KQuantGemmK, Q6_K only (issue #1910) ---
+//
+// `nsb` = K / 256, so a 4096-wide projection gives 16 superblocks and the loop
+// above hands lanes 16..31 nothing while the 5-round reduction still runs. On
+// the issue's model that is 195 of 259 decode dispatches.
+//
+// llama.cpp answers this on RDNA4 by putting NWarps warps on ONE output row and
+// splitting each K block across them: `calc_nwarps` returns 8 for
+// Q4_K/Q5_K/Q6_K at ncols_dst == 1 (ggml/src/ggml-cuda/mmvq.cu:385-408) — pin
+// b10451, 10bf611e533d81f739128304991c5e133c6aebd8. Upstream's other lever,
+// `rows_per_cuda_block` row-packing, is off for every RDNA table (:460-478,
+// :898), but per the spec's `## Upstream anchor` correction that exclusion was
+// never benchmarked on RDNA hardware, so it is not evidence against packing —
+// it is only the reason this arm, which does have an RDNA4 benchmark behind
+// it, is the one ported here.
+//
+// Warp w takes sub-block range [w*8/NWarps, (w+1)*8/NWarps) of whichever
+// superblocks its lane holds, and each iteration reduces the INTEGER
+// accumulators across warps through shared memory before warp 0 applies the
+// superblock's f32 scale. That is why this arm is bit-identical to
+// `KQuantGemmK` rather than merely close — see the `DotQ6KIsumRange` note.
+//
+// Q6_K ONLY, and that is a measured restriction rather than a scoping choice.
+// Splitting a superblock across warps re-reads its header on every warp and
+// breaks the contiguity of the quant read, which for a bandwidth-bound GEMV
+// costs more than the extra warps buy. Q4_K and Q5_K lose 1.5x to 1.8x at every
+// nsb <= 32 shape and every width in {2, 4, 8}; only Q6_K, whose per-lane
+// reconstruction is heavy enough to hide the extra traffic, comes out ahead.
+// The sweep is in .agents/specs/rocm-kquant-nwarps-decode.md `## Outcome`.
+template <typename OutT, int NWarps>
+__global__ void KQuantGemmKCoopQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                   const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                   int64_t nsb, size_t w_row_bytes, size_t w_block_bytes) {
+  static_assert(NWarps > 1 && NWarps <= kSubBlocks && kSubBlocks % NWarps == 0,
+                "NWarps must divide the superblock's sub-blocks evenly");
+  constexpr int kPerWarp = kSubBlocks / NWarps;
+  __shared__ int sh_isum[(NWarps - 1) * 32];
+
+  // One block per output element: `elem` is block-uniform, so every
+  // __syncthreads() below is reached by the whole block.
+  const int64_t elem = static_cast<int64_t>(blockIdx.x);
+  if (elem >= m * n) return;
+  const int64_t i = elem / n;
+  const int64_t j = elem % n;
+  const int lane = threadIdx.x;
+  const int wid = threadIdx.y;
+  const int s0 = wid * kPerWarp, s1 = s0 + kPerWarp;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  const BlockQ8_K* a_row = act + i * nsb;
+
+  // Trip count is block-uniform for the same reason: it depends only on nsb.
+  const int64_t iters = (nsb + 31) / 32;
+  float partial = 0.0f;
+  for (int64_t it = 0; it < iters; ++it) {
+    // Clamped so the address arithmetic stays inside the row on the tail
+    // iteration; every read below is still gated on the unclamped `sb < nsb`.
+    const int64_t sb = it * 32 + lane;
+    const int64_t sb_safe = sb < nsb ? sb : 0;
+    const BlockQ6_K* xb =
+        reinterpret_cast<const BlockQ6_K*>(w_row + static_cast<size_t>(sb_safe) * w_block_bytes);
+    const BlockQ8_K* a_sb = a_row + sb_safe;
+    int isum = sb < nsb ? DotQ6KIsumRange(xb, a_sb, s0, s1) : 0;
+    if (wid > 0) sh_isum[(wid - 1) * 32 + lane] = isum;
+    __syncthreads();
+    if (wid == 0) {
+#pragma unroll
+      for (int w = 0; w < NWarps - 1; ++w) isum += sh_isum[w * 32 + lane];
+      // One f32 scale product per superblock, exactly as the single-warp arm
+      // does it, applied to an integer sum that is exact however it was split.
+      if (sb < nsb) partial += (DF16ToF32(xb->d) * a_sb->d) * isum;
+    }
+    // Warps 1.. must not overwrite the shared partials before warp 0 has read
+    // them, so a second iteration would wait here rather than race.
+    //
+    // THAT SECOND ITERATION IS UNREACHABLE TODAY, and the fact is written
+    // here rather than left to be re-derived from the dispatch guard:
+    // KQuantDecodeCoopWarps returns a cooperative width only for nsb <= 32,
+    // so `iters` is always exactly 1 and the loop never comes back round.
+    // Deleting this barrier therefore leaves the suite green, which says the
+    // race is untested rather than that the barrier is redundant. It becomes
+    // load-bearing the moment that nsb bound moves.
+    __syncthreads();
+  }
+  if (wid != 0) return;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
 template <typename OutT>
 __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                           const BlockQ8_0* __restrict__ act, int64_t m, int64_t n,
@@ -440,8 +593,42 @@ void* EnsureQuantScratch(size_t need, hipStream_t s) {
   return sc.buf;
 }
 
+// How many dense K-quant dispatches took the cooperative arm. Host-side and
+// relaxed: nothing reads it on the decode path, and the ROCm decode gate reads
+// it to prove the call site below is REACHED rather than merely compiled
+// (AGENTS.md "Nothing lands dead" — the arm is bit-identical to the single-warp
+// one by construction, so no output comparison can witness the dispatch).
+std::atomic<uint64_t> g_kq_coop_dispatches{0};
+
 }  // namespace
 
+// Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
+// the single-warp `KQuantGemmK` the path has always had.
+//
+// Every value here is MEASURED on this tree's `Dot*K` bodies rather than copied
+// from llama.cpp's RDNA4 table, and the measurement disagreed with that table.
+// Upstream's `vec_dot_q*_K_q8_1` already splits a superblock 16 ways where ours
+// does all 256 weights in one lane, so the traffic a warp split adds is a
+// different quantity here: re-reading each superblock's header per warp and
+// breaking the quant read's contiguity costs a bandwidth-bound GEMV more than
+// the extra resident warps buy. Q4_K and Q5_K therefore keep the single-warp
+// arm at every width tried. `## Outcome` in the spec has the full sweep.
+int KQuantDecodeCoopWarps(DType wdt, int64_t m, int64_t nsb) {
+  // Decode only. The spec's `## Scope` keeps prefill on the arm it already has:
+  // one block per output element costs m*n blocks, and m > 1 is not the regime
+  // where a row's lanes run out of superblocks to chew on.
+  if (m != 1) return 1;
+  // nsb > 32 already fills all 32 lanes of a single warp (the k=12288 shapes in
+  // the issue's table), and `## Gate` requires those to keep the kernel and the
+  // launch config they had.
+  if (nsb > 32) return 1;
+  // Q6_K at 8: the one arm the sweep put ahead of the single-warp kernel.
+  return wdt == DType::kQ6_K ? 8 : 1;
+}
+
+uint64_t KQuantCoopDispatchCount() {
+  return g_kq_coop_dispatches.load(std::memory_order_relaxed);
+}
 
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   EnsureQueueDevice(q);
@@ -481,9 +668,19 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     Check(hipGetLastError(), "q8_K quant");
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
+    const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
+      if (coop == 8 && fmt == 2) {
+        // One block per output element, eight warps deep. Only the measured
+        // width is instantiated; anything else falls through to the single-warp
+        // arm rather than silently launching a shape nothing was measured on.
+        g_kq_coop_dispatches.fetch_add(1, std::memory_order_relaxed);
+        KQuantGemmKCoopQ6K<OutT, 8><<<static_cast<unsigned>(m * n), dim3(32, 8), 0, s>>>(
+            o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        return;
+      }
       if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
       else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
       else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);

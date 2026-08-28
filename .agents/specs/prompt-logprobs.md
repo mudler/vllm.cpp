@@ -547,13 +547,15 @@ because `BuildCompletionLogProbs`'s `idx > -1` breaks on the first entry.
   this row, and it is why the `-1` arm of
   `tests/entrypoints/openai/completion/test_completion.py:281-308` is ported as a
   PARSE assertion rather than as upstream's `BadRequestError`.
-- **The n>1 arm of that same upstream test is not ported over the socket.**
-  `AsyncLLM` never fans a request out into `n` children, so an `n>1` completion
-  returns one choice there regardless of this row
+- **The n>1 arm of that same upstream test was not ported over the socket.**
+  `AsyncLLM` never fanned a request out into `n` children, so an `n>1` completion
+  returned one choice there regardless of this row
   ([#1816](https://github.com/mudler/vllm.cpp/issues/1816)). Measured, not
-  assumed: the identical body without `prompt_logprobs` also returns one choice.
-  The per-choice property is gated instead over the SYNC `LLMEngine`, which does
-  fan out.
+  assumed: the identical body without `prompt_logprobs` also returned one choice.
+  The per-choice property was gated instead over the SYNC `LLMEngine`, which does
+  fan out. SUPERSEDED: `SAMPLE-N-ASYNC`
+  ([async-parallel-sampling.md](async-parallel-sampling.md)) landed the fan-out on
+  the served engine, and the socket arm is now ported beside the `choices[0]` one.
 
 ## W2 tests ported
 
@@ -611,7 +613,8 @@ M8 is the reason the split exists, gated rather than argued.
 - [#1816](https://github.com/mudler/vllm.cpp/issues/1816) — `AsyncLLM` never fans
   out `n>1`, so every `n > 1` request to the production server is silently served
   as `n = 1`. Found here, not fixed here: it needs its own row, spec and fresh
-  review rather than an in-flow repair.
+  review rather than an in-flow repair. DISCHARGED by `SAMPLE-N-ASYNC`
+  ([async-parallel-sampling.md](async-parallel-sampling.md)).
 - [#1817](https://github.com/mudler/vllm.cpp/issues/1817) — the
   `ClampPromptLogprobs` call sites are reached but not measured (mutation M6 stays
   green). The function itself is gated directly; no CPU fixture here can produce

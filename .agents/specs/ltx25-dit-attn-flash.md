@@ -1744,6 +1744,19 @@ It is instrumentation for the next reader, declared as such in the tool's own
 output, in the same way `R` is declared. Making it a gate is owed and is filed as
 [#1854](https://github.com/mudler/vllm.cpp/issues/1854).
 
+**SUPERSEDED IN PART, 2026-08-27.** The paragraph above describes the tool as
+this row shipped it and that is still what it does with no `--reference`. The
+blocker it names is gone:
+[#1864](https://github.com/mudler/vllm.cpp/issues/1864) pinned `ltx-2` at
+`gateable = yes` and committed a real-weights reference render, so
+`--reference` now CHECKS the two blockiness ratios against a band recomputed
+from that render's own frames. Row `LTX25-ORACLE-ABSOLUTE` owns it, spec
+[`ltx25-oracle-absolute.md`](ltx25-oracle-absolute.md). What is NOT superseded:
+the clipped fraction and the mean sharpness are still reported and still
+unbounded, for reasons that spec's section 5 measures; and **prompt adherence is
+untouched**, so the sentence above about a vision-language model stands exactly
+as written.
+
 ### 11.6 How each outcome will be read, stated before there is one
 
 - **Every correspondence and coherence check passes.** The verdict is
@@ -2744,7 +2757,7 @@ statistics.
 not the one this section first gave.** An earlier draft said the §11 coherence
 terms "cannot see a uniform contraction at all". A fresh review falsified that
 from the tool's own text: `K = |SUM(s_A - s_B)| / SUM|s_A - s_B|`
-(`scripts/ltx25-render-compare.py:509-522`) "is 1 EXACTLY when every term moves
+(`scripts/ltx25-render-compare.py:533-546`) "is 1 EXACTLY when every term moves
 the same way", which is precisely what a uniform contraction does. The tool
 states the real limit two sentences later: "K is magnitude-weighted rather than
 a sign test, so a bias that is small against the per-tile variation does not
@@ -2948,7 +2961,7 @@ and the between-class gaps clear it anyway.
   reproduces the audio's class ordering at one tenth the size, and that the §11
   coherence terms do not fire on it because `K` is magnitude-weighted rather than
   because they are blind to a contraction
-  (`scripts/ltx25-render-compare.py:509-522`) -- a SCALE term is therefore a
+  (`scripts/ltx25-render-compare.py:533-546`) -- a SCALE term is therefore a
   candidate the criterion row has to weigh, and "the video is directionless" was
   measured with terms that are insensitive here rather than terms that cannot
   see. Moving the CHECKED set is still a criterion
@@ -2989,6 +3002,15 @@ and the between-class gaps clear it anyway.
   form needs either an oracle that renders LTX-2.5 or a pinned scoring model,
   and this tree has neither. An absolute quality panel is computed, printed and
   explicitly NOT checked, rather than a proxy being invented for it.
+  **HALF DISCHARGED 2026-08-27, and the ownership of the half that remains
+  MOVES.** The oracle arrived ([#1864](https://github.com/mudler/vllm.cpp/issues/1864)),
+  and row `LTX25-ORACLE-ABSOLUTE` gates the two blockiness ratios against its
+  render. The artefact-freedom half is therefore no longer owed here. The
+  **prompt-adherence** half is still owed and is still unowned by any
+  implementation: it needs a vision-language model pinned as an oracle with its
+  own gateability measurement, and it is listed under `## Owed` in
+  [`ltx25-oracle-absolute.md`](ltx25-oracle-absolute.md) rather than duplicated
+  as a second obligation here.
 
 - **DISCHARGED 2026-08-23: this row's two harnesses carried
   [#1734](https://github.com/mudler/vllm.cpp/issues/1734)'s memory-watchdog
@@ -3085,9 +3107,16 @@ and the between-class gaps clear it anyway.
   warp-per-query recurrence. Owner: row `LTX25-DIT-ATTN-FA2-HD128`, spec
   [`ltx25-dit-attn-fa2-hd128.md`](ltx25-dit-attn-fa2-hd128.md). Issue:
   [#1551](https://github.com/mudler/vllm.cpp/issues/1551).
-- **The other `vt::Attention` callers.** §3's defect shape is not LTX-specific.
-  A sweep of every remaining non-decode `vt::Attention` call site belongs to its
-  own row with its own issue. Owner: this row until that row exists. Issue:
+- **The other `vt::Attention` callers. HANDED OFF, not still owed here.** §3's
+  defect shape is not LTX-specific, and the sweep it asks for now has its own row
+  and its own spec:
+  [`eng-attn-optin-sweep.md`](eng-attn-optin-sweep.md). That row enumerates all
+  eight remaining sites with head_dim and runtime sequence length, records why
+  each stays on `kAttention` — it routes none, and §2.2 there gives the reason
+  per site — and widens the rung checker's population from two directories to
+  the compiled tree. The seam question #1552's third deliverable asks is
+  ESCALATED rather than answered, in that spec's §4. Owner: row
+  KERNEL-ATTN-DENSE-FLASH. Issue:
   [#1552](https://github.com/mudler/vllm.cpp/issues/1552).
 
 ## Outcome

@@ -3264,3 +3264,13 @@ vllm_cpp_add_test(test_qwen4_exp_ple vllm/models/test_qwen4_exp_ple.cpp)
 # qwen4_exp_ple.h is a MODEL-PRIVATE header under src/, same arrangement as the
 # dots3-note gates above: W2 ships nothing on the public ABI.
 target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5b-3 (#2156) — the DEVICE arm of the same convolution:
+# vt::Qwen4ExpPleConv against the SAME lane-pinned goldens the W2 host reference
+# is gated on, so the two arms answer to one oracle rather than to each other,
+# plus a MODEL-WIDTH (10240 channels) agreement check the golden shapes cannot
+# make. CPU only: no CUDA arm of this op exists and one written on a CPU host
+# could not be gated. Reaches the model-private `qwen4_exp_ple.h`, hence the
+# src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_ple_device vllm/models/test_qwen4_exp_ple_device.cpp)
+target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}/src)

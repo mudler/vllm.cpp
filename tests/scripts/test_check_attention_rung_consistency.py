@@ -473,9 +473,9 @@ class GreenReportTests(unittest.TestCase):
         )
         self.assertEqual(
             report.strip(),
-            "OK (attention rung): 3 vt::Attention call site(s) in 2 model source "
-            "file(s); 2 carry a recorded reason, 1 unmarked and excused by 1 "
-            "allowlisted in-flight stem(s).",
+            "OK (attention rung): 3 vt::Attention call site(s) in 2 source "
+            "file(s) under 3 scanned root(s); 2 carry a recorded reason, "
+            "1 unmarked and excused by 1 allowlisted in-flight stem(s).",
         )
 
     def test_the_ok_line_reports_zero_when_no_stem_is_allowlisted(self) -> None:
@@ -489,9 +489,9 @@ class GreenReportTests(unittest.TestCase):
         )
         self.assertEqual(
             report.strip(),
-            "OK (attention rung): 1 vt::Attention call site(s) in 1 model source "
-            "file(s); 1 carry a recorded reason, 0 unmarked and excused by 0 "
-            "allowlisted in-flight stem(s).",
+            "OK (attention rung): 1 vt::Attention call site(s) in 1 source "
+            "file(s) under 3 scanned root(s); 1 carry a recorded reason, "
+            "0 unmarked and excused by 0 allowlisted in-flight stem(s).",
         )
 
     def test_the_ok_line_reports_the_excused_sites(self) -> None:
@@ -552,3 +552,105 @@ class GreenReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PopulationTests(unittest.TestCase):
+    """The population is the tree, not two directories (#1552).
+
+    Until this row the scan was `models_dir.glob("*.cpp")` and `glob("*.h")` over
+    exactly `src/vllm/model_executor/models` and its include sibling. Three shapes
+    escaped it, and two of them were measured on the shipped tree at `f9af269f9`
+    by appending a live unmarked `vt::Attention(` call and running the checker: it
+    exited 0 and its OK line still reported the same 8 sites in both arms. That is
+    the failure #1552 names -- "a caller that never opts in is never told" -- one
+    layer up, because a caller the scanner cannot see is never told either.
+
+    Every case below drives the DEFAULT population through a synthetic root, not
+    a hand-built dict, because the defect is in which files are read and a dict
+    built by hand has already answered that question.
+    """
+
+    @staticmethod
+    def write(root: Path, rel: str, body: str) -> Path:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_a_call_outside_the_model_directories_is_a_site(self) -> None:
+        # MEASURED on the shipped tree: an unmarked call appended to
+        # src/vllm/v1/attention/backend.cpp left the checker at rc=0. The engine
+        # and the multimodal pipeline are ordinary places for an attention call --
+        # src/vllm/multimodal/ltx2_video.cpp already drives the LTX-2.5 denoise
+        # loop from outside models/ -- so this is not a hypothetical shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root, "vllm/v1/attention/backend.cpp", UNMARKED)
+            scanned = mod.scan_models((root,))
+        self.assertEqual(
+            [sites for _, sites in sorted(scanned.items())], [[(2, False)]]
+        )
+
+    def test_a_call_in_a_SUBDIRECTORY_of_a_model_root_is_a_site(self) -> None:
+        # The non-recursive glob. A model that grows a subdirectory for its
+        # kernels takes its naive call out of the population by moving a file.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root, "newarch/attention.cpp", UNMARKED)
+            scanned = mod.scan_models((root,))
+        self.assertEqual(
+            [sites for _, sites in sorted(scanned.items())], [[(2, False)]]
+        )
+
+    def test_a_cuda_translation_unit_is_a_site(self) -> None:
+        # `*.cpp` and `*.h` only. A model kernel in a .cu is not exotic: the whole
+        # naive/fast distinction this checker guards lives in one.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root, "some_tower_kernels.cu", UNMARKED)
+            scanned = mod.scan_models((root,))
+        self.assertEqual(
+            [sites for _, sites in sorted(scanned.items())], [[(2, False)]]
+        )
+
+    def test_a_tests_directory_is_excluded_and_its_sibling_is_not(self) -> None:
+        # Asserted as a PAIR on purpose. `tests/` must stay out -- this very suite
+        # writes unmarked calls as fixtures, and a checker that refuses its own
+        # tests is unusable -- but an exclusion asserted alone passes for the
+        # wrong reason on a scanner that reads nothing at all. The sibling is what
+        # separates "excluded" from "blind".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root, "tests/vt/test_ops_attention.cpp", UNMARKED)
+            kept = self.write(root, "vt/ops_caller.cpp", UNMARKED)
+            scanned = mod.scan_models((root,))
+        self.assertEqual(sorted(scanned), [str(kept)])
+
+    def test_the_default_roots_cover_the_compiled_source_tree(self) -> None:
+        # A configuration pin, not a mutation. It names the roots so that removing
+        # one is a visible diff here rather than a silent narrowing there.
+        names = {path.name for path in mod.SCAN_ROOTS}
+        self.assertEqual(names, {"src", "include", "examples"})
+        self.assertIn(".cu", mod.SOURCE_SUFFIXES)
+
+    def test_widening_the_population_moves_no_present_verdict(self) -> None:
+        # NOT a mutation, and labelled so rather than left to look like one: it
+        # asserts that this change adds enforcement for the future WITHOUT moving
+        # a single verdict on the tree it lands on. The eight paths are named
+        # rather than counted, because a count of the model tree stored in this
+        # file is the drift lock #1629 removed and must not come back: naming them
+        # reds only when one of these specific files changes, which is the review
+        # this case wants, while a total reds on any unrelated addition.
+        self.assertEqual(
+            sorted(mod.scan_models()),
+            [
+                f"{MODELS}/kimi_linear_device.cpp",
+                f"{MODELS}/ltx2.cpp",
+                f"{MODELS}/ltx2_device.cpp",
+                f"{MODELS}/nemotron_h.cpp",
+                f"{MODELS}/nemotron_h_device.cpp",
+                f"{MODELS}/qwen3_5.cpp",
+                f"{MODELS}/qwen3_vl_vision.cpp",
+                f"{MODELS}/whisper_audio.cpp",
+            ],
+        )

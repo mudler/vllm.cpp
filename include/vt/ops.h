@@ -501,6 +501,49 @@ enum class OpId : uint8_t {
   // the KERNELS rather than the port; resolved via ltx2_vae::Ltx2VaeDevice().
   // Appended before kCount so no existing op's id shifts.
   kLtx2Vae,
+  // MODEL-MM-QWEN4-EXP W5b-3 (#2156) — the PLE DILATED depthwise causal conv,
+  // `Qwen4ExpTextPLELayer._short_conv` (transformers v5.16.0
+  // modeling_qwen4_exp.py:1150-1167). kernel 4, dilation 3, so output t reads
+  // lags {9, 6, 3, 0} and the persistent state is a 9-deep history read at
+  // stride 3.
+  //
+  // WHY A NEW OpId AND NOT A `dilation` FIELD ON `CausalConv1dArgs`. That was
+  // weighed and rejected on evidence, not on taste:
+  //
+  //   * `CausalConv1dArgs` is READ BY FIVE BACKENDS — cpu_ops.cpp,
+  //     cuda_gdn.cu, rocm_gdn_conv.hip, vulkan_ops.cpp and
+  //     tenstorrent_ops.cpp — across kCausalConv1dFwd, kCausalConv1dUpdate and
+  //     kCausalConv1dSpecUpdate. A new field is silently IGNORED by every
+  //     kernel that does not read it, and this is a CPU-only host: four of
+  //     those five arms could not be gated here, so the field would ship as a
+  //     live wrong-answer path on the Mamba/GDN/KDA/Kimi conv rather than as a
+  //     refusal.
+  //   * The state WIDTH is welded to `K - 1` where it is USED, and naming the
+  //     wrong site would overstate this, so name both. The shared checker's
+  //     width test (`CheckConvCommon`, src/vt/ops.cpp:1732) is
+  //     `conv_state.shape[2] >= k - 1` — a LOWER bound, already widened once so
+  //     the spec-decode cache's `(K-1)+num_spec` row fits. It is NOT the weld: a
+  //     nine-column PLE state passes it (9 >= 3). The weld is
+  //     `const int64_t max_query_len = state_len - (k - 1) + 1;`
+  //     (src/vt/ops.cpp:1997), which reads the state width as `K - 1` plus
+  //     spec-decode slack. Hand it a nine-column dilated state at K = 4 and it
+  //     computes 9 - 3 + 1 = 7, a bound that means nothing, and then feeds that
+  //     nonsense to the per-request query-length and accepted-token checks at
+  //     :2007 and :2009. PLE needs `(K - 1) * dilation`, and there is no value
+  //     of `max_query_len` that describes both geometries. Re-deriving it per
+  //     mode weakens the guard for every existing caller, which is the "never
+  //     make a red gate green by widening its scope" failure.
+  //   * There is nothing to mirror. vLLM has no dilated conv anywhere
+  //     (`git grep -in dilat` at origin/main 6a5e8f5979: zero hits in
+  //     `layers/mamba/`, zero in `csrc/`), so the fused op is not a divergence
+  //     from an upstream that merged the two — upstream hand-rolled this one
+  //     too, saying so: "We cannot use the usual functions/kernels here for the
+  //     short conv as the conv1d has dilation".
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
+  // OWED, not written: it cannot be gated on a CPU-only host.
+  // Appended before kCount so no existing op's id shifts.
+  kQwen4ExpPleConv,
   // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
   // hyper-connection stream, the one structure the whole forward is threaded
   // through: `Qwen4ExpTextDecoderLayer` reads it twice per layer (attention and
@@ -766,6 +809,21 @@ struct CausalConv1dArgs {
   // CPU keeps its scalar reference.
   const Tensor* batch_ptr = nullptr;
   const Tensor* token_chunk_offset_ptr = nullptr;
+};
+
+// Qwen4-Exp PLE short-conv args. SIBLING of CausalConv1dArgs, deliberately not
+// a mode of it — see the kQwen4ExpPleConv comment for the five-backend reason.
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextPLELayer._short_conv`
+// (:1150-1167), with `conv_dilation = config.ngram_size` (:1134) and
+// `short_conv_state_len = (conv_kernel_size - 1) * conv_dilation` (:1135).
+struct Qwen4ExpPleConvArgs {
+  // `config.ngram_size`; 3 in the released `Qwen/Qwen3.8-Flash-Next` config.
+  // Cross-checked against the state width rather than derived from it: a
+  // `conv_state` whose last dim is not `(K - 1) * dilation` is a caller that
+  // believes a different geometry, and deriving would make that agreement
+  // unfalsifiable.
+  int64_t dilation = 1;
 };
 
 struct L2NormArgs {
@@ -1779,6 +1837,15 @@ using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
 using CausalConv1dUpdateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                       const Tensor*, Tensor&, const Tensor*,
                                       const CausalConv1dArgs&);
+// Qwen4-Exp PLE dilated depthwise causal conv (vt::Qwen4ExpPleConv). The
+// `conv_state_indices` pointer is the PER-SEQUENCE cache row, nullable, named
+// for `CausalConv1dUpdate`'s parameter of the same axis; see the declaration
+// for why upstream's own `state_idx` is a different axis entirely.
+using Qwen4ExpPleConvFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                   const Tensor& /*weight*/, Tensor& /*conv_state*/,
+                                   const Tensor& /*query_start_loc*/,
+                                   const Tensor* /*conv_state_indices*/,
+                                   const Qwen4ExpPleConvArgs&);
 using L2NormFn = void (*)(Queue&, Tensor&, const Tensor&, const L2NormArgs&);
 using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                 const RmsNormGatedArgs&);
@@ -2975,6 +3042,65 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                         const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args,
                         const Tensor* conv_state_indices = nullptr);
+
+// QWEN4-EXP PLE DILATED DEPTHWISE CAUSAL CONV, batched over sequences.
+// `Qwen4ExpTextPLELayer._short_conv` (transformers v5.16.0
+// modeling_qwen4_exp.py:1150-1167) end to end, including the state read and the
+// state write-back that `cache_utils.py::LinearAttentionLayer.update_conv_state`
+// (:1036-1075) performs around it. Per channel c and output position t:
+//
+//   out[t, c] = silu( sum_{k=0..K-1} weight[c, k] * hist[t - (K-1-k)*dilation] )
+//
+// with `hist` the concatenation of `conv_state` and this call's `x`, so
+// `weight[c, K-1]` multiplies the CURRENT token and the op is causal by that
+// tap. At the released config (K = 4, dilation = `ngram_size` = 3) the taps are
+// lags {9, 6, 3, 0}: a span of ten tokens for four multiply-accumulates, and a
+// genuine 9-deep history read at stride 3 that CANNOT be compressed to three
+// columns even though any one step touches only three of them.
+//
+// SILU IS UNCONDITIONAL and there is no activation switch, because upstream has
+// none: the line is `F.silu(self.conv1d(hidden_states))`, full stop. Mirroring
+// that is the point; a knob nobody can set is a divergence with extra steps.
+//
+// THERE IS NO `has_initial_state`, AND THAT IS AN ARGUMENT RATHER THAN AN
+// OMISSION. `CausalConv1dFwd` needs one because its state is undefined before
+// the first chunk. Here upstream's first call takes the `has_previous_state`
+// false branch and LEFT-ZERO-PADS (cache_utils.py:1053-1060), which is
+// arithmetically identical to running the steady path against a zeroed state.
+// A zero-initialised `conv_state` is therefore bit-identical to a first call,
+// and a flag would only add a way to disagree with upstream.
+//
+// SHAPES. x [T, C] (the NORMED conv input — never the raw hidden state, see the
+// fork at modeling_qwen4_exp.py:1184-1188); out [T, C]; weight [C, K] depthwise,
+// K >= 2; conv_state [N, C, L] f32 READ-WRITE with L == (K - 1) * dilation;
+// query_start_loc [B + 1] i32 cumulative token offsets, sequence s spanning
+// [qsl[s], qsl[s+1]); conv_state_indices [B] i32 or nullptr.
+//
+// `conv_state_indices` IS THE PER-SEQUENCE CACHE ROW, and the name is
+// deliberate: this op does NOT call it `state_idx`, because upstream already
+// uses that name for a different axis and the collision would read as agreement.
+// Upstream writes `update_conv_state(..., state_idx=1, ...)`, where
+// 1 selects the PLE conv out of the three states a PLE layer owns — the GDN
+// conv, this conv, and the n-gram token history. Those three cannot be planes of
+// one tensor: `cache_utils.py` keeps `conv_states` as a LIST with a per-entry
+// `conv_kernel_size[state_idx]`, and the three widths here are 4, 9 and 2, over
+// different channel counts and, for the third, over integers rather than floats.
+// Upstream's selector is therefore resolved by the CALLER passing this op the
+// right tensor, which is what taking the state as an explicit operand buys.
+// What is left is the axis a batched engine actually needs and upstream does not
+// have: which ROW of a shared cache each sequence owns. That is exactly what
+// `CausalConv1dUpdate`'s `conv_state_indices` names, so this op spells it the
+// same way rather than reusing upstream's word for somebody else's axis. Null
+// means row s for sequence s, again as that sibling does.
+//
+// PRECISION. f32 interior, taps accumulated in DOUBLE — the same house
+// convention the W2 host reference (`qwen4_exp_ple.cpp`) uses, kept so the two
+// arms answer to one oracle. Four terms is a short reduction, so this is cheap
+// insurance rather than a load-bearing width; a CUDA arm may accumulate in f32
+// and must be gated against the oracle to say so.
+void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     Tensor& conv_state, const Tensor& query_start_loc,
+                     const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args);
 
 // SPECULATIVE multi-token conv step (SPEC-MTP I4). Ported from
 // vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24

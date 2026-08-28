@@ -965,6 +965,61 @@ mutation that never built leaves the STALE binary printing green. Read the build
 RC before any test result. The fresh review hit exactly this and read a false
 7 / 74 pass.
 
+## Mutation record — W5b-3 (#2156)
+
+The PLE dilated depthwise conv as `vt::Qwen4ExpPleConv`. Sixteen mutations, one
+at a time, each proved APPLIED by a sha256 that moved, each build's exit status
+read BEFORE any test result, and the tree restored byte-for-byte and re-verified
+by sha256 after every one. Re-measured on the final head. Suites:
+`test_qwen4_exp_ple_device` (the new device gate, 10 cases / 538 assertions
+green) and `test_qwen4_exp_ple` (the W2 host suite, 9 / 395 green), the second
+present as a control that no mutation of the device arm can move.
+
+**Five of the sixteen failed to BUILD on the first pass, and that is a result
+about the harness rather than about the code.** `-Werror` turns "the mutation
+made a variable unused" into a link that never happens, the runner then executes
+the STALE binary, and a stale binary prints green. M1, M2, M5, M7 and M13 each
+did exactly that. They are re-run with the one `(void)x;` or `[[maybe_unused]]`
+that silences the warning and changes nothing the mutation is about, and only
+the second reading is recorded. This is the third time in this campaign that a
+build failure has presented as a pass; reading the build rc first is what caught
+it.
+
+| # | mutation | file | verdict |
+|---|---|---|---|
+| M1 | `hist[t + k * dilation]` → `hist[t + k]`: the taps read at unit stride | kernel | **RED, 5 of 10 cases, 7 of 544 assertions** |
+| M2 | `dilation = args.dilation` → `dilation = 1`: the arg is never read | kernel | **RED, 5 of 10 cases, 7 of 544** |
+| M3 | the tap order reversed, `weight[c*K + k]` → `weight[c*K + (K-1-k)]` | kernel | **RED, 5 of 10 cases, 9 of 546** |
+| M4 | the state write-back one column early, `hist[tokens+j]` → `hist[tokens+j-1]` | kernel | **RED, 4 of 10 cases, 263 of 538** |
+| M5 | the silu dropped from the store | kernel | **RED, 5 of 10 cases, 9 of 546** |
+| M6 | the state keeps the ACTIVATED value instead of the raw conv input | kernel | **RED, 4 of 10 cases, 263 of 538** |
+| M7 | `conv_state_indices` ignored: row `s` for sequence `s` unconditionally | kernel | **RED, 1 of 10 cases, 3 of 538** |
+| M8 | the per-sequence token offset dropped on the `x` load | kernel | **RED, 1 of 10 cases, 113 of 538** |
+| M9 | the tap accumulator narrowed from `double` to `float` | kernel | **RED, 1 of 10 cases, 1 of 538** — the model-width case, which asserts BIT-IDENTITY with the host reference by `memcmp`. No golden comparison at C = 16 can see this; the 10240-channel agreement check is the only thing that does |
+| M10 | the empty-segment early-out removed | kernel | **SURVIVED — and it is an EQUIVALENT MUTANT, not a gate hole.** With `tokens == 0` the span is `state_len`, the window loop does not execute, and the write-back reads `hist[0 + j]`, which is the column it then writes: the two programs compute the same function. The dispatcher refuses a decreasing `query_start_loc`, so `0` is the only value that reaches the branch. It is kept as a PERFORMANCE early-out — at 10240 channels a padded batch row would otherwise cost 184k pointless float copies per layer — and the kernel comment says that in those words, because the comment that stood there first claimed it stopped the cache being shifted and it does not. The repair is M16, which mutates the same territory in a way a test can see |
+| M11 | the `(K-1)*dilation` state-width check widened to `>= K-1` | dispatcher | **RED, 1 of 10 cases, 1 of 538** — the Mamba-shaped-state refusal |
+| M12 | the `query_start_loc` bounds check removed | dispatcher | **RED, 1 of 10 cases, 1 of 538** |
+| M13 | the `conv_state_indices` range check removed | dispatcher | **RED, rc = 134 (SIGABRT), 1 of 10 cases, 1 of 535** — the refusal assertion reports `did NOT throw at all!`, and the unchecked row index (7 into a cache of 3) then writes past the allocation, which glibc catches as `double free or corruption (out)` and turns into `SIGABRT`; doctest prints `FATAL ERROR: test case CRASHED: SIGABRT`. **The SIGNAL is not stable and the row must not be read as if it were.** The first record here said `rc = -6`, which was a negative `WTERMSIG` written where a shell exit status belongs; the fresh reviewer of this wave measured `rc = 139` (`SIGSEGV`, core dumped) on the same case and the same 1-of-10 / 1-of-535 counts; this re-run measured 134. All three are the same defect. An out-of-range row index writes at `row_stride * 7` past a three-row cache, and whether that lands in unmapped memory (`SIGSEGV`) or in allocator bookkeeping the next free checks (`SIGABRT`) is a property of the heap layout, not of the mutation. What is stable, and what the row is actually evidence for, is the assertion count: the refusal is the ONLY thing standing between a caller error and undefined behaviour, which is why it is a check rather than a comment. The re-run deleted the whole `if (conv_state_indices != nullptr)` block, declaration included, so unlike the first pass it needed no `(void)` silencer and built at rc 0 — the build rc was read before the run rc, because a stale binary prints green |
+| M15 | the segment loop stops after the first sequence | kernel | **RED, 2 of 10 cases, 114 of 538** |
+| M16 | an empty segment RESETS its cache row instead of leaving it | kernel | **RED, 1 of 10 cases, 1 of 538** — M10's repair: the plausible defect in that territory is clobbering a padded row, and the empty-segment case sees it |
+| M14 | **REACHABILITY**: the `RegisterOp(OpId::kQwen4ExpPleConv, DeviceType::kCPU, ...)` line deleted | kernel | **RED, 9 of 10 cases, only 9 assertions reached** — every case that calls the op throws `vt: no kernel for op Qwen4ExpPleConv (id 134) on device cpu`. `[[maybe_unused]]` on the kernel is required or `-Werror=unused-function` fails the build and the stale binary reads green |
+
+The M14 shape is the load-bearing reachability proof AVAILABLE AT THIS LAYER,
+and it is not the one AGENTS.md `## Nothing lands dead` really wants. Deleting a
+production call site is impossible here because there is no production call site
+— see `## Owed` — so what M14 proves is that the tests enter the op through the
+dispatcher and the registry rather than through the kernel function, which is
+the strongest statement this slice can make.
+
+**The RED that came first.** Before the kernel existed, with the OpId, the args
+struct, the dispatcher and the test all present, `test_qwen4_exp_ple_device`
+reported 8 of 9 cases failing with
+`vt: no kernel for op Qwen4ExpPleConv (id 134) on device cpu (type 0)` at
+`src/vt/op_provider.cpp:577`. The one case that passed was the refusals case,
+whose subcases all throw in the dispatcher before reaching `GetOp` — which is
+itself the evidence that the geometry checks are in the dispatcher and not in
+the kernel.
+
 ## Mutation record — W5b-2 (#2123)
 
 The device arm of the gated-residual stream, `vt::Qwen4ExpGatedResidual` and
@@ -1268,6 +1323,44 @@ is listed under `## Owed`.
   reassembly, and the prefix-caching decision for a conv state written by a
   chunked prefill shorter than 9 columns, which `## Design` records as
   AMBIGUOUS and not resolvable from upstream.
+- **W5b-3 ([#2156](https://github.com/mudler/vllm.cpp/issues/2156)) lands
+  UNREACHED, by AGENTS.md "Nothing lands dead".** `vt::Qwen4ExpPleConv` and
+  `src/vt/cpu/cpu_qwen4_exp_ple.cpp` are reached only from
+  `tests/vllm/models/test_qwen4_exp_ple_device.cpp`. No production entry point
+  calls them: the architecture's only one is `ModelRegistry::Forward`, which is
+  all-or-nothing, and it has no `qwen4_exp` arm. The wiring is owned by row
+  `MODEL-MM-QWEN4-EXP`, tracked by
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) (the forward) under
+  campaign issue [#1978](https://github.com/mudler/vllm.cpp/issues/1978).
+  Also owed from that wave:
+  - **The CUDA arm.** Not written, because it cannot be gated on a CPU-only
+    host, and an ungated kernel is worse than an absent one. It inherits one
+    decision: this CPU kernel accumulates its four taps in `double` and the
+    device gate asserts BIT-IDENTITY with the W2 host reference at the model's
+    10240-channel width. An f32-accumulating CUDA kernel does not inherit that
+    identity — mutation M9 measures exactly this — so it must either accumulate
+    wider or be gated against the pinned oracle directly.
+  - **A bf16 `conv_state`.** The dispatcher refuses one by name.
+    `CausalConv1dSpecUpdate` admits bf16 state on CUDA because a CUDA kernel
+    there writes it; here nothing does, and admitting a dtype no arm can produce
+    would be a promise with no kernel behind it. It is owed with the CUDA arm.
+  - **Reaching the op from the runner's recurrent cache.** The op takes its state
+    as an explicit `[N, C, (K-1)*dilation]` operand plus a per-sequence row
+    index. That parameter is called `conv_state_indices`, after
+    `CausalConv1dUpdate`'s parameter for the same axis, and it is deliberately
+    NOT spelled `state_idx`, because upstream's `state_idx` selects
+    one of a PLE layer's three states, and those three cannot be planes of one
+    tensor because `cache_utils.py` keeps `conv_states` as a list with a
+    per-entry `conv_kernel_size[state_idx]` and the widths are 4, 9 and 2, over
+    different channel counts and, for the third, over integers. Resolving that
+    selector is the caller's job, and the caller cannot exist until
+    [#2131](https://github.com/mudler/vllm.cpp/issues/2131) generalises the
+    runner's one-group/two-shape `MambaSpec`.
+  - **The prefix-caching decision** for a conv state written by a chunked prefill
+    shorter than nine columns, which `## Design` records as AMBIGUOUS and not
+    resolvable from upstream, is untouched by this wave. This op reproduces
+    upstream's zero-pad exactly; it does not decide what a cache HIT should
+    restore.
 - **W2's float path has never been compared at MODEL WIDTH, and that is the one
   gap its own gate cannot close.** `tests/vllm/models/test_qwen4_exp_ple.cpp`
   runs at `hidden_size = 8`, `hc_count = 2`, `heads_per_ngram = 2`,

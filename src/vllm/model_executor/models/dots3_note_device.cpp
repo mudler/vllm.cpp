@@ -38,10 +38,14 @@
 // grouped args, and `vt::MoeCombine`'s optional `shared` term IS upstream's
 // `+ self.shared_experts(x)` (model.py:125-127).
 //
-// The RELEASED config still refuses, now at its NEXTN tail rather than at its
-// first MoE layer — and that branch is STRICTER THAN UPSTREAM, which #2176
-// removes in the next commit. **Lifting the MoE branch is not the same as
-// making this model runnable.**
+// W5c removed the NEXTN branch too, and that one was a defect rather than a
+// gap: it was STRICTER than upstream. vLLM drops `model.layers.{N+i}.*` and
+// `model.mtp.*` from the main model (utils.py:542 -> deepseek_v2.py:1618-1620;
+// model.py:624) instead of refusing. They are now a NAMED W10 deferral with
+// their own accounting bucket (#2176).
+//
+// So `Dots3NoteDeviceRefusal` returns "" for the RELEASED
+// `dots-studio/dots3-note-prev` config. **That is not the same as runnable.**
 // The MoE is 545.82 GB of the checkpoint's 576.89 GB (94.62%; the routed
 // experts alone are 543.58 GB / 94.23%), measured over the committed full
 // index, and nothing this project owns holds it. The ~290 GB fp8 sibling does
@@ -870,16 +874,27 @@ std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
   // `vt::MoeRouterTopK` / `vt::MoeSiluMul` / `vt::MoeCombine` ops the DeepSeek
   // path uses, at n_group=1 / topk_group=1. No `vt` op changed.
   //
-  // The nextn tail. `Dots3NoteMTPModel` is deliberately not registered and the
-  // backbone forward has no place to put an extra block, so a checkpoint that
-  // ships one is refused rather than silently having it enumerated, loaded and
-  // never run. **This branch is STRICTER THAN UPSTREAM and #2176 removes it in
-  // the next commit** — vLLM drops those weights from the main model instead of
-  // refusing.
-  if (p.num_nextn_predict_layers > 0) {
-    return "the checkpoint ships " + std::to_string(p.num_nextn_predict_layers) +
-           " nextn layer(s) — `Dots3NoteMTPModel` over the speculator seam is W10";
-  }
+  // ─── LIFTED at W5c (#2176): the nextn tail ────────────────────────────────
+  // This branch was STRICTER THAN UPSTREAM and that is why it is gone rather
+  // than merely satisfied. vLLM does not refuse a checkpoint that ships nextn
+  // weights; it DROPS them from the main model —
+  // `get_spec_layer_idx_from_weight_name` (utils.py:542, matching
+  // `model.layers.{base+i}.` at :559) consulted at deepseek_v2.py:1618-1620
+  // `if spec_layer is not None: continue  # skip spec decode layers for main
+  // model`, and `if name.startswith("mtp."): continue` at model.py:624 inside
+  // `Dots3NoteModel._adapt_weights`. `Dots3NoteLanguageModelForCausalLM`
+  // (model.py:681) subclasses `DeepseekV32ForCausalLM`, so the second of those
+  // is the load path this architecture runs. All three re-derived at
+  // `bc2d63e650`.
+  //
+  // The tensors are not silently dropped here either: they stay ENUMERATED by
+  // `EnumerateDots3NoteTensors` (so an absent one still refuses) and
+  // `AccountDots3NoteTensors` counts them into their own `nextn` bucket, which
+  // is the deferral shape `vision_encoder.*` and `audio_encoder.*` already use.
+  // `Dots3NoteMTPModel` over the speculator seam is still W10.
+  //
+  // WHAT THAT LEAVES: nothing. This function now returns "" for the RELEASED
+  // `dots-studio/dots3-note-prev` config, which is what W5 is for.
   return "";
 }
 

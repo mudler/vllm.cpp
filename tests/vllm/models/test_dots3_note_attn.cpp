@@ -1275,15 +1275,23 @@ TEST_CASE("dots3-note W3: the layer refuses a weight of the wrong size BY NAME")
 }
 
 TEST_CASE(
-    "dots3-note W3/W4a: the DEVICE forward still refuses the RELEASED config") {
-  // The honest boundary, made executable, and its subject has MOVED TWICE. W3
-  // read "nothing is on the decode path". W4a put the FULL-attention layer
+    "dots3-note W3/W4a/W5: the RELEASED config is no longer refused, and an "
+    "UNMATERIALIZED handle still is") {
+  // The honest boundary, made executable, and its subject has MOVED TWICE.
+  // W3 read "nothing is on the decode path". W4a put the FULL-attention layer
   // there and this case pinned the released config still being refused, at
-  // layer 1 (MoE, W5) and layer 2 (sliding, W4b). **W5 lifted the MoE branch**,
-  // so what refuses now is the NEXTN tail — which #2176 removes in the next
-  // commit, because that branch is stricter than upstream. Reached through the
-  // REAL model the factory returns, never a fabricated LoadedModel subclass,
-  // which is undefined behaviour the moment the handle is opened (#730/#775).
+  // layer 1 (MoE, W5) and layer 2 (sliding, W4b). **W5 lifted the last two
+  // branches** — the MoE layer and the nextn tail (W5c, #2176) — so
+  // `Dots3NoteDeviceRefusal` over the real released `config.json` is EMPTY, and
+  // the assertion below is the `true -> false` flip that says so rather than a
+  // deleted case.
+  //
+  // What the forward still refuses on THIS handle is the other guard, and it is
+  // the reason the case survives: `weights.materialized` is false here, and a
+  // forward over an unmaterialized tower would read uninitialised weights and
+  // emit a plausible token. Reached through the REAL model the factory returns,
+  // never a fabricated LoadedModel subclass, which is undefined behaviour the
+  // moment the handle is opened (#730/#775).
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
@@ -1299,12 +1307,13 @@ TEST_CASE(
   vllm::v1::CommonAttentionMetadata meta{};
   const std::vector<vllm::PagedKvCache> kv;
   const std::vector<int32_t> logits_indices{0};
+  // THE W5 FLIP, asserted where a reader following W3/W4a's evidence lands.
+  CHECK(vllm::Dots3NoteDeviceRefusal(weights.params).empty());
   CHECK_THROWS_WITH_AS(
       (void)vllm::Dots3NoteModel::ForwardDevice(ids, pos, meta, kv, weights,
                                                 queue, logits_indices),
-      doctest::Contains("nextn"), std::runtime_error);
+      doctest::Contains("not materialized"), std::runtime_error);
 }
-
 
 // ════════════════════════════════════════════════════════════════════════════
 // W4a — the FULL-attention layer ON THE DECODE PATH (#699).
@@ -2094,13 +2103,13 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (c) the RELEASED config — its MoE layer was LIFTED at W5, so what it trips
-  //     on now is the NEXTN tail, which #2176 removes next.
+  // (c) the RELEASED config — LIFTED at W5 (the MoE layer) and W5c (the nextn
+  //     tail, #2176). It is EMPTY now, which is the row's headline and is
+  //     asserted here as the `true -> false` flip rather than deleted.
   {
     TempConfig cfg(FixtureConfigDoc());
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("nextn") != std::string::npos);
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
   // (d) a sequence past `index_topk` — LIFTED at W4b-3c for a SINGLE-SHOT
   //     prefill, and kept here as an ACCEPTANCE for the same reason as (a) and
@@ -2129,18 +2138,22 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     REQUIRE(p.physical_latent_row() > p.full.latent_row());
     CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (f) a nextn tail — W10. **STRICTER THAN UPSTREAM, and #2176 removes it in
-  //     the next commit**: vLLM does not turn a checkpoint with nextn weights
-  //     away, it DROPS them from the main model.
+  // (f) a nextn tail — LIFTED at W5c (#2176), and this one was a DEFECT rather
+  //     than a gap: the refusal was STRICTER THAN UPSTREAM. vLLM does not turn
+  //     a checkpoint with nextn weights away, it DROPS them from the main model
+  //     (utils.py:542 -> deepseek_v2.py:1618-1620; model.py:624 @ bc2d63e650).
+  //     They are a NAMED W10 deferral in the accounting now, which is what
+  //     `Dots3NoteIsNextnTensor` is for.
   {
     w4a::DeviceSpec s;
     nlohmann::json doc = w4a::DeviceConfigDoc(s);
     doc["num_nextn_predict_layers"] = 1;
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("nextn") != std::string::npos);
-    CHECK(why.find("W10") != std::string::npos);
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
+    CHECK(vllm::Dots3NoteIsNextnTensor(
+        p, "model.layers." + std::to_string(p.num_hidden_layers) + ".enorm.weight"));
+    CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.mtp.embed_tokens.weight"));
   }
   // (g) a KV cache whose row disagrees with the config it was built from. The
   //     config-level check above cannot see this — an engine allocates the
@@ -3462,8 +3475,8 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "dots3-note W4b-1/W4b-2/W5: the NEXTN tail is what this bench's config is "
-    "refused on, and each other branch names the brick that lifted it") {
+    "dots3-note W4b-1/W4b-2/W5: this bench's config is refused by NOTHING any "
+    "more, and each branch names the brick that lifted it") {
   // W4b-1 wrote HOST code and lifted nothing. This case recorded the boundary
   // it left: the sliding layer and the PADDED physical row were both refused
   // by `Dots3NoteDeviceRefusal`. **W4b-2 lifted both**, and **W5 lifted the MoE
@@ -3475,21 +3488,20 @@ TEST_CASE(
   // and sliding from layer 2, plus the §4-trap-3 nextn default of 1. Every one
   // of those was a refusal at some brick and none is one now.
   const std::string why = vllm::Dots3NoteDeviceRefusal(b.params);
-  MESSAGE("device refusal, bench config: " << why);
-  CHECK(why.find("nextn") != std::string::npos);
+  MESSAGE("device refusal, bench config: '" << why << "' (empty)");
+  CHECK(why.empty());
   REQUIRE(b.params.is_moe_layer(1));
   REQUIRE(b.params.num_nextn_predict_layers == 1);
 
-  // The same config with every layer DENSE trips the SAME branch, which says
-  // the MoE acceptance is real rather than standing in for something else.
+  // The same config with every layer DENSE is also empty, which says the MoE
+  // acceptance above is not standing in for something else.
   nlohmann::json d = w4b::SwaConfigDoc(b.spec);
   d["first_k_dense_replace"] = 4;  // every layer dense
   TempConfig cfg_nextn(d);
   const Dots3NoteParams p_nextn = ParseDots3NoteParams(LoadHfConfig(cfg_nextn.path()));
   const std::string why_nextn = vllm::Dots3NoteDeviceRefusal(p_nextn);
-  MESSAGE("with no MoE layer, the refusal is: " << why_nextn);
-  CHECK(why_nextn.find("nextn") != std::string::npos);
-  CHECK(why_nextn.find("W10") != std::string::npos);
+  MESSAGE("with no MoE layer, the refusal is: '" << why_nextn << "' (empty)");
+  CHECK(why_nextn.empty());
   d["num_nextn_predict_layers"] = 0;
   TempConfig cfg_swa(d);
   const Dots3NoteParams p_swa = ParseDots3NoteParams(LoadHfConfig(cfg_swa.path()));
@@ -4293,14 +4305,17 @@ TEST_CASE("dots3-note W4b-2/W5: what the device path refuses, by name") {
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     CHECK(w4b2::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (b) the RELEASED config — its MoE layer was LIFTED at W5, so W4b-2's
-  //     `why.find("MoE")` is now the NEXTN tail, which #2176 removes next.
+  // (b) the RELEASED config — LIFTED at W5 (the MoE layer) and W5c (the nextn
+  //     tail, #2176). W4b-2 asserted `why.find("MoE") != npos` here; that
+  //     `true -> false` flip is the row's headline and is asserted rather than
+  //     deleted. It is NOT a claim that the model runs: the MoE is 545.82 GB of
+  //     a 576.89 GB checkpoint (94.62%), and nothing this project owns holds it.
   {
     TempConfig cfg(FixtureConfigDoc());
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
-    MESSAGE("W5 released-config refusal: " << why);
-    CHECK(why.find("nextn") != std::string::npos);
+    MESSAGE("W5 released-config refusal: '" << why << "' (empty)");
+    CHECK(why.empty());
   }
   // (c) a sequence past `index_topk`, on a config that HAS a full layer. The
   //     DSA selection is still not on the device path (W4b-3).
@@ -4326,15 +4341,15 @@ TEST_CASE("dots3-note W4b-2/W5: what the device path refuses, by name") {
     CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());
     CHECK_NOTHROW((void)b.RunPrefillThenDecode());
   }
-  // (e) a nextn tail — W10, and STRICTER THAN UPSTREAM; #2176 removes it next.
+  // (e) a nextn tail — LIFTED at W5c (#2176), because the refusal was STRICTER
+  //     than upstream: vLLM drops those weights from the main model rather than
+  //     turning the checkpoint away.
   {
     nlohmann::json doc = w4b2::ConfigDoc(w4b2::Spec{});
     doc["num_nextn_predict_layers"] = 1;
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("nextn") != std::string::npos);
-    CHECK(why.find("W10") != std::string::npos);
+    CHECK(w4b2::Dots3NoteDeviceRefusal(p).empty());
   }
   // (f) a KV cache whose row disagrees with the config it was built from. The
   //     config-level checks cannot see this — an engine allocates the cache
@@ -5786,6 +5801,57 @@ TEST_CASE(
   const Dots3NoteParams rp = ParseDots3NoteParams(LoadHfConfig(released.path()));
   CHECK_FALSE(rp.has_blockwise_quant());
   CHECK(rp.quant_method.empty());
+}
+
+TEST_CASE(
+    "dots3-note W5c: the RELEASED config no longer refuses, and the nextn tail "
+    "is a NAMED W10 deferral instead") {
+  // THE HEADLINE. `Dots3NoteDeviceRefusal` over the real released
+  // `config.json` was non-empty at every brick from W1 to W4b-3c — W4b-2's own
+  // case asserts `why.find("MoE") != npos` — and it is empty now. Two branches
+  // went: the MoE layer (W5) and the nextn tail (W5c, #2176).
+  TempConfig cfg(FixtureConfigDoc());
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const Dots3NoteParams p = ParseDots3NoteParams(config);
+  // The released config really does have both features, so the flip is not the
+  // fixture quietly losing them.
+  REQUIRE(p.num_hidden_layers == 46);
+  REQUIRE(p.n_routed_experts == 256);
+  REQUIRE(p.num_experts_per_tok == 8);
+  REQUIRE(p.first_k_dense_replace == 1);
+  REQUIRE(p.is_moe_layer(1));
+  // §4 trap 3: the key is ABSENT and defaults to 1, which is what made the
+  // nextn branch fire on every released checkpoint.
+  REQUIRE_FALSE(FixtureConfigDoc().contains("num_nextn_predict_layers"));
+  REQUIRE(p.num_nextn_predict_layers == 1);
+
+  const std::string why = vllm::Dots3NoteDeviceRefusal(p);
+  MESSAGE("W5 released-config refusal is now: '" << why << "' (empty)");
+  CHECK(why.empty());
+
+  // The nextn tensors are DEFERRED, not silently dropped: the predicate names
+  // exactly the 19 the release ships, and the accounting counts them.
+  CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.layers.46.input_layernorm.weight"));
+  CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.layers.46.eh_proj.weight"));
+  CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.mtp.embed_tokens.weight"));
+  // ...and it claims NOTHING the backbone reads. 46 is the tail; 45 is the last
+  // backbone layer and must not be swept up with it.
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "model.layers.45.input_layernorm.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "model.layers.4.mlp.gate.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "model.embed_tokens.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "vision_encoder.blocks.0.attn.qkv.weight"));
+  // A config with NO nextn tail claims nothing at all, so the predicate cannot
+  // steal a backbone layer from a checkpoint that ships none.
+  Dots3NoteParams none = p;
+  none.num_nextn_predict_layers = 0;
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(none, "model.layers.46.input_layernorm.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(none, "model.mtp.embed_tokens.weight"));
+
+  // What is STILL refused, so the flip above is not read as "the model runs".
+  // The blockwise-fp8 arm has its own case; here it is the honest scale.
+  MESSAGE("W5: the released config is REPRESENTABLE, which is not RUNNABLE — "
+          "the MoE is 545.82 GB of a 576.89 GB checkpoint (94.62%), and the "
+          "~290 GB fp8 sibling is refused by name (W9)");
 }
 
 TEST_CASE("dots3-note W5: the mixed dense+MoE device forward is DETERMINISTIC") {

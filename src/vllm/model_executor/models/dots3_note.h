@@ -293,13 +293,36 @@ const Dots3NoteDeferredTower* Dots3NoteDeferralFor(const std::string& name);
 // over" is also true of a classifier that claims the towers as language.
 struct Dots3NoteAccounting {
   int64_t language = 0;  // claimed by a named language-tower consumer
+  // The nextn (MTP) tail: `model.layers.{num_hidden_layers + i}.*` and
+  // `model.mtp.*`, deferred to W10 (W5c, #2176). It is a SEPARATE bucket rather
+  // than part of `language` for the reason the tower buckets exist: the
+  // language forward never reads these tensors, and folding them into the
+  // language count leaves "100% accounted" green over 19 weights nobody loads.
+  // They stay ENUMERATED, so `missing` still refuses a checkpoint that claims a
+  // nextn layer and does not ship it — only the bucket moved.
+  int64_t nextn = 0;
   int64_t vision = 0;    // `vision_encoder.*`, deferred to W6
   int64_t audio = 0;     // `audio_encoder.*`, deferred to W7
   std::vector<std::string> unaccounted;  // on disk, claimed by nobody
   std::vector<std::string> missing;      // enumerated, not on disk
   std::vector<std::string> duplicated;   // enumerated more than once
-  int64_t total() const { return language + vision + audio; }
+  int64_t total() const { return language + nextn + vision + audio; }
 };
+
+// Is `name` part of the nextn (MTP) tail this port defers to W10? (W5c, #2176.)
+//
+// A PREDICATE rather than a `Dots3NoteDeferredTowers()` row, and the reason is
+// the data rather than a preference: a tower's prefix is a literal, while the
+// nextn tail's is CONFIG-DERIVED — `model.layers.{num_hidden_layers + i}.` for
+// `i` in `[0, num_nextn_predict_layers)`, plus the flat `model.mtp.`. A static
+// table cannot spell the first one.
+//
+// Upstream skips exactly these names when it loads the MAIN model:
+// `get_spec_layer_idx_from_weight_name` (`utils.py:542`, matching
+// `model.layers.{base+i}.` or `layers.{base+i}.` at `:559`), consulted at
+// `deepseek_v2.py:1618-1620`; and `if name.startswith("mtp."): continue` inside
+// `Dots3NoteModel._adapt_weights` (`model.py:624`). Both at `bc2d63e650`.
+bool Dots3NoteIsNextnTensor(const Dots3NoteParams& params, const std::string& name);
 
 // Classify every name in `present` against what `params` says the language
 // tower ships. `expected_layers` is the backbone layer set to enumerate; pass
@@ -466,10 +489,13 @@ struct Dots3NoteWeights {
 // per projection, while `dense_loaders::MaterializeBf16Source` reads a
 // per-tensor or per-output-ROW `<name>_scale` and would otherwise fail with a
 // bare "tensor not found".
-// — and the NEXTN tail, which is W10.
 //
-// The vision and audio towers (W6/W7) are NAMED DEFERRALS in the accounting
-// rather than refusals here, through `Dots3NoteDeferredTowers()`.
+// The vision and audio towers (W6/W7) and the nextn tail (W10) are NAMED
+// DEFERRALS in the accounting rather than refusals here — the towers through
+// `Dots3NoteDeferredTowers()`, the nextn tail through
+// `Dots3NoteIsNextnTensor`. The nextn branch used to refuse, which was
+// STRICTER than upstream: vLLM drops those weights from the main model
+// (utils.py:542 -> deepseek_v2.py:1618-1620; model.py:624). See #2176.
 //
 // NOTE what this function does NOT decide. The `seq_len > index_topk` question
 // is a property of the STEP, not of the config, so it lives in the forward

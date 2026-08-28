@@ -314,10 +314,20 @@ Stated here before code, per risk 1:
   but the four missing arms fall due with W1b, which is what makes the op
   reachable. Named here because a gap nobody wrote down is the one discovered by
   a red gate on somebody else's row.
-- **The CUDA arm of `vt::CastF16` has not been compiled or run.** It is
-  registered in `cuda_glue.cu` beside its two siblings and the CPU arm is gated;
-  the device verdict comes from `cuda-fat-build` or from
-  `rc run --device dgx:gpu0`.
+- ~~**The CUDA arm of `vt::CastF16` has not been compiled or run.**~~
+  **RETIRED 2026-08-28**, before this row's first merge rather than after it.
+  Measured in an `rc` lease on `dgx:gpu0` (GB10, worker `rc-worker-4b8lj`,
+  boot_id `bc7ae2cb`, nvcc 13.0.88, tree `026d27e99`, Release,
+  `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`): `BUILD_RC=0`, and
+  `cuda_glue.cu.o` carries one `sm_121a` cubin. All five suites then RAN on that
+  device: `test_cast_f16` 3/3 (18 assertions), `test_exl3_linear_method` 7/7
+  (275), `test_exl3_gemm` 13/13 (**201**, two more than the CPU run's 199,
+  which is the device cases executing rather than skipping),
+  `test_exl3_gemv` 6/6 (44), `test_exl3_moe` 8/8 (41).
+  **One instrument caveat, recorded because it would otherwise read as
+  evidence**: the runner printed `exit=0` after each suite from a `$?` taken
+  AFTER a pipe, so it reports the exit status of `grep` and not of the test. The
+  doctest `0 failed` counters are the verdict; those `exit=0` strings are not.
 - The oracle token gate (#1901).
 - W4: `MODEL-DSV4-EXL3`'s private `Exl3Linear` still exists after W1.
 - `docs/FEATURES.md` and `docs/USAGE.md` rows, including the checkpoint's file

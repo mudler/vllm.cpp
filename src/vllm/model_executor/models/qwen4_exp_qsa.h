@@ -43,11 +43,10 @@
 //                                _factor) must fit indexer_head_dim)
 //  QsaSideCacheSpec          <- Cache.update_indexer
 //                             + v1/kv_cache_interface.py MLAAttentionSpec with
-//                               tokens_per_state, read through
-//                               v1/attention/backends/mla/indexer.py :624-628
-//                               ("MLA compression is a whole number of tokens
-//                                per state"). Key-only: one vector per state,
-//                               not 2x for K+V.
+//                               compress_ratio (:386), whose page runs off
+//                               storage_block_size = block_size //
+//                               compress_ratio (:393-395). Key-only: one
+//                               vector per state, not 2x for K+V.
 //  QsaCompressedSlot         <- v1/attention/backends/mla/compressor_utils.py
 //                               :49-61 `_compressed_slot_mapping_kernel`
 //                               (`(pos + 1) % COMPRESS_RATIO == 0` boundary,
@@ -158,17 +157,37 @@ void QsaValidateConfig(const QsaConfig& cfg);
 // ── The side cache ───────────────────────────────────────────────────────────
 
 // `MLAAttentionSpec(num_kv_heads=1, head_size=index_head_dim,
-//                   tokens_per_state=compress_ratio)`.
+//                   compress_ratio=compress_ratio)`.
 //
 // `MLAAttentionSpec` is NOT an MLA claim. MiniMax-M3 is plain GQA and uses it
 // for its own indexer cache, with the upstream comment "Key-only:
 // MLAAttentionSpec budgets one vector/token (not 2x for K+V)". It is a BUDGET
-// shape. `tokens_per_state` is the first-class field documented as "Ints > 1
-// compress multiple tokens into one state (DSv4 sparse MLA)", read back at
-// v1/attention/backends/mla/indexer.py :624-628.
+// shape.
+//
+// CORRECTED IN FLOW AT W5c, issue
+// [#2198](https://github.com/mudler/vllm.cpp/issues/2198). The two comments
+// this replaces named a field called `tokens_per_state` and anchored it at
+// `v1/attention/backends/mla/indexer.py:624-628`. `grep -rn tokens_per_state`
+// over the pinned vLLM tree (`5559679229`) returns ZERO hits, tree-wide, and
+// so does a search for the docstring they quoted; the cited anchor is
+// `_prepare_decode_tensors` and is unrelated. The real field is
+// **`compress_ratio`** (`vllm/v1/kv_cache_interface.py:386`, defaulted to 1),
+// and the page runs off `storage_block_size = block_size // compress_ratio`
+// (`:393-395`). `MLAAttentionSpec.merge` (`:424-435`) asserts ONE
+// `compress_ratio` per KV group, which is why W5c publishes a single spec for
+// all twelve QSA layers. This tree was already correct where it counts —
+// `include/vllm/v1/kv_cache_interface.h` spells it `compress_ratio` — so the
+// defect was a citation that would have sent the wave writing the KV spec
+// looking for a field that does not exist.
 struct QsaSideCacheSpec {
   int64_t num_kv_heads = 1;
   int64_t head_size = 128;
+  // A LOCAL name with no upstream referent, deliberately left alone by #2198:
+  // its arithmetic is right (64 B/token/layer, pinned by
+  // `tests/vllm/models/test_qwen4_exp_qsa.cpp`) and it matches
+  // `MLAAttentionSpec::real_page_size_bytes()` exactly, so renaming it would
+  // churn this TU and its suite to fix a citation the comments above now carry.
+  // The spec that reaches the runner spells it `compress_ratio`.
   int64_t tokens_per_state = 4;
   int64_t elem_bytes = 2;  // bf16
 

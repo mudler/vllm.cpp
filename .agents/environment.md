@@ -484,6 +484,56 @@ container is REUSED between jobs**, so a repair inside a staging branch is
 skipped on the next run and reports `nvcc already in place`. Write an
 environment repair unconditionally, and assert its postcondition.
 
+### A staged CUDA toolkit links only if its SONAMEs were rebuilt, measured 2026-08-28
+
+The section above records that CIFS stores no symlink and that a copied toolkit
+therefore loses its library links, with CMake reporting
+`Could NOT find CUDA` as the symptom. **There is a second, quieter symptom of the
+same cause, and it costs a whole build rather than eleven seconds.**
+
+A staging branch that rebuilds `libcudart.so` and `libcublasLt.so` -- the
+DEVELOPMENT links -- satisfies CMake completely. `Found CUDAToolkit` succeeds,
+every CUDA translation unit compiles, and the job dies ~21 minutes later linking
+the first consumer:
+
+```
+/usr/bin/ld: libvllm.so.0.0.3: undefined reference to `cudaStreamSynchronize@libcudart.so.13'
+/usr/bin/ld: libvllm.so.0.0.3: undefined reference to `cublasLtMatmul@libcublasLt.so.13'
+... 38 in total, every one @libcudart.so.13 or @libcublasLt.so.13
+```
+
+`libcudart.so.13` is the **SONAME**, a THIRD name distinct from both
+`libcudart.so` and `libcudart.so.13.3.29`, and it is the name the linker resolves
+versioned undefined symbols against. In a real install it is a symlink, so CIFS
+does not carry it and a staging branch must recreate it explicitly.
+
+**The trap inside the trap is the parameter expansion.** `${f#*.so.}` strips the
+SHORTEST prefix, so for `libcudart.so.13.3.29` it yields `13.3.29` and not `13`:
+
+```sh
+b=${f%%.so.*}; ln -sf "$f" "$b.so.${f#*.so.}"   # links the file to ITSELF
+```
+
+That line looks like it makes the version link and makes nothing. Take the major
+with `v=${f#*.so.}; ${v%%.*}`, or better, let `ldconfig -n <libdir>` read each
+object's own `DT_SONAME` so the name cannot disagree with what the linker asks
+for. `ldconfig -n` does NOT create the `.so` development link, so both are needed.
+
+**Assert the postcondition, and assert the one the failure depends on.** The
+harness that hit this checked `[ -f .../libcublasLt.so ]`, which is precisely the
+link its own reconstruction created correctly -- so the precondition passed on a
+toolkit that could not be linked against. Check that `<stem>.so` resolves AND
+that `<stem>.so.<MAJOR>` exists, for `libcudart` and `libcublasLt` both. That
+check costs a second and it discriminates: run against the CIFS source tree it
+FAILS, which is the correct answer.
+
+**This is latent on any box that already has a toolkit.** The staging branch is a
+fallback. `dgx:gpu0` carried `/usr/local/cuda` 13.0.88 for every earlier lease and
+the fallback was never taken; the box went `unhealthy … worker_lost` for 3h20m on
+2026-08-28 and came back without it, which exercised the branch for the first
+time. `rc` job `1ad519b1-4e75-41d7-9386-9932076390f1`, exit 34,
+[#2220](https://github.com/mudler/vllm.cpp/issues/2220).
+
 ### Two packages a DFlash2 oracle lease needs, and the lease variable that exists, measured 2026-08-22
 
 Measured on `dgx:gpu0` across leases `11cee02a`, `52ac5673` and `a03f34e4`

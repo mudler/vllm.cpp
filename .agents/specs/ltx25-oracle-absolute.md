@@ -469,13 +469,13 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 and W2 are complete. W3's first attempt refused at the checkpoint
-load and that refusal became
-[#2140](https://github.com/mudler/vllm.cpp/issues/2140), which is now CLOSED.
-W3's second attempt did not reach a lease: `dgx:gpu0` is `unhealthy` and out of
-the pool. Everything W3 can establish without a GPU is established and is in
-`## Outcome` — both bf16 towers resolve, all four checkpoints are digest-verified
-— and the reading itself stays `PENDING` under `## Owed`.
+`ACTIVE`. W1 and W2 are complete. W3 has now failed three times, each at a
+DIFFERENT and further stage, and each failure is located rather than guessed: the
+checkpoint load ([#2140](https://github.com/mudler/vllm.cpp/issues/2140), CLOSED),
+then the fleet (`dgx:gpu0` `unhealthy ... worker_lost` for 3h20m), then the BUILD
+([#2220](https://github.com/mudler/vllm.cpp/issues/2220), a defect in this row's
+own harness, fixed in this change). Everything W3 can establish without a GPU is
+established and is in `## Outcome`. The reading itself stays `PENDING`.
 
 ## Outcome
 
@@ -555,6 +555,49 @@ a later reader would propose.
 **What this row does not claim.** One request, one geometry, one seed, bf16 only,
 25 frames. Two of four panel statistics. Prompt adherence is untouched and open.
 A pure-noise render passes, and a test says so.
+
+### W3, third attempt: the build died at the link, and the cause was our own harness
+
+`rc` job `1ad519b1-4e75-41d7-9386-9932076390f1` on `dgx:gpu0` reached the device,
+cleared the memory floor at 115.0 GiB against 78.0 GiB, passed all three source
+guards, and **failed at [D] build after 21 minutes** with 38
+`undefined reference to ...@libcudart.so.13`. It never reached staging or the
+render.
+
+**The cause is [#2220](https://github.com/mudler/vllm.cpp/issues/2220), a defect
+in THIS row's own harness.** `/workspace` is CIFS and stores no symlink, so the
+staged toolkit carries only `libcudart.so.13.3.29`. The reconstruction used
+`${f#*.so.}`, which strips the SHORTEST prefix and yields `13.3.29` rather than
+`13` — so it linked the file to ITSELF and never created `libcudart.so.13`, the
+SONAME the linker resolves versioned undefined symbols against. `need_ok` then
+tested `libcublasLt.so`, the one link the loop DID create correctly, so the
+precondition passed on a toolkit that could not be linked against.
+
+**It was latent, and the A/B is in the two runs' own configure logs.** The staging
+branch is a FALLBACK; every earlier lease found `/usr/local/cuda` and never took
+it.
+
+| run | toolkit | version | build |
+|---|---|---|---|
+| `20260827T220845Z` | `/usr/local/cuda` | 13.0.88 | succeeded, 1192 s |
+| `20260828T224529Z` | `/root/cudatk`, staged | 13.3.73 | **failed at link** |
+
+`dgx:gpu0` went out of the pool for 3h20m the same day and returned without a
+toolkit, which exercised the branch for the first time.
+
+**Fixed, with red-before/green-after on a replica of the CIFS layout.** Take the
+MAJOR; prefer `ldconfig -n`, which reads each object's own `DT_SONAME` so the name
+cannot disagree with what the linker will ask for; and assert the postcondition in
+seconds instead of after a 21-minute build. Measured: the old loop creates no
+`.so.13` at all, the new logic creates both. The guard FAILS on the old layout,
+PASSES on the new, and FAILS on the real NAS source tree — so it discriminates
+rather than passing by construction, which is precisely the defect it replaces.
+The resolved SONAMEs are printed and written to `PROVENANCE`, so a later reader
+can see which toolkit the artefacts were linked against.
+
+Recorded in [`environment.md`](../environment.md) as well as here: a staged CUDA
+runtime whose SONAME links did not survive CIFS is a lease-environment fact that
+will bite the next row, not a property of this one.
 
 ### W3, second attempt: no lease, and the port is no longer what blocks it
 

@@ -246,7 +246,10 @@ TEST_CASE("voxtral PermuteQKBf16 permutes a BF16 tensor at an ODD offset (#772)"
 
 // ─── qwen3_vl.cpp:85 — LoadVisionBf16 ───────────────────────────────────────
 //
-// UBSan-VISIBLE (cast then `p[i]` inside Bf16BitsToF32). Driven through the
+// UBSan-VISIBLE. The shape the spec's table records is a cast then `p[i]` inside
+// `Bf16BitsToF32`; since #1359 `LoadVisionBf16` calls `vt::LoadUnaligned`
+// directly and `Bf16BitsToF32` is no longer on this path at all. The site and
+// the reason it is visible are unchanged. Driven through the
 // PRODUCTION entry point `LoadQwen3VLVisionWeights`: with `depth = 0` and no
 // deepstack indexes the tower needs exactly the nine tensors below, which is the
 // smallest checkpoint that reaches the loader without a copy of it. Qwen3.6-27B

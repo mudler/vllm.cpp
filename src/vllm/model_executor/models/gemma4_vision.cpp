@@ -124,7 +124,17 @@ DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<uint16_t>& bf,
     d.t.stride[i] = stride;
     stride *= shape[static_cast<size_t>(i)];
   }
-  if (bytes != 0) b.Copy(q, d.p, bf.data(), bf.size() * sizeof(uint16_t));
+  // The copy length is the ALLOCATED length, not the store's, and the store is
+  // checked against it first. Copying `bf.size() * sizeof(uint16_t)` into a
+  // `bytes`-sized allocation overruns it whenever a weight's shape and its store
+  // disagree — a loader bug would land as heap corruption rather than as a
+  // named refusal. The twin `qwen3_vl_vision.cpp` MakeDevBf16 grew this guard in
+  // #1359; this one did not, and #2174 is the issue that names the asymmetry.
+  // Behaviour is unchanged on every shape the loaders actually produce, where
+  // the two lengths are equal.
+  VT_CHECK(bf.size() * sizeof(uint16_t) >= bytes,
+           "gemma-4 vision: weight store is smaller than its declared shape");
+  if (bytes != 0) b.Copy(q, d.p, bf.data(), bytes);
   return d;
 }
 

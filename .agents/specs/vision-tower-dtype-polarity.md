@@ -251,13 +251,50 @@ reference, absorbed by its own tolerance.
    genuine f32 that would lose bits before the host interp. §4.3 keeps it f32
    deliberately; a sweeping type change over the struct would take it silently.
 3. **The `kF32` arm.** §4.4.
-4. **A designed red.** `tests/scripts/test_tower_skip_rss_report.py:512-516`
-   asserts `1661390848` and `7687383040` appear in `multimodal-track.md`. Those
-   are the *widened* residents, and this row makes them wrong. The script's
-   `TOWER_RESIDENT_BYTES=$((TOWER_ONDISK_BYTES * 2))`
-   (`scripts/mm/tower_skip_rss.sh:429-431`) and the test's `resident()`
-   (`tests/scripts/test_tower_skip_rss_report.py:113-120`) carry the same `* 2`.
-   All four surfaces move in ONE commit or the suite is red. §8.
+4. **A designed red — WHICH DID NOT FIRE, and that is the finding.**
+   `test_spec_carries_both_resident_figures` asserted that `resident(kind)`
+   appears in `multimodal-track.md`, and was meant to force that document to move
+   with the `* 2`. It could not. Post-fix `resident("qwen3-vl")` collapses onto
+   `ondisk("qwen3-vl")`, and `830695424` was ALREADY in that file as the ON-DISK
+   figure — so the assertion became a tautology satisfied by a sentence about a
+   different quantity. It measured 60/60 green while `multimodal-track.md` went
+   on declaring the pre-fix threshold `1495251763 B`, a number a post-#1359 run
+   cannot reach, against which a correct change would have been recorded as a
+   FAILING axis.
+
+   The repair replaces it with
+   `test_spec_carries_the_threshold_the_instrument_applies`, which asserts
+   `need(kind) = resident(kind) * MIN_SAVING_FRACTION_PCT / 100` — the quantity a
+   run is judged against, present in the spec for no other reason, and therefore
+   unable to collapse onto an existing figure the way `resident` did. It is
+   scoped to the half-1 DECLARATION rather than to the file, because the spec
+   legitimately retains superseded thresholds as the record of runs measured
+   against them, and an unscoped search has a false negative there: with the
+   widening mutated back to `2` on both the script and the suite's mirror,
+   `need("qwen3-vl")` becomes `1495251763`, a number the file still carries as
+   the 2026-08-24 figure, and the unscoped form returned OK. Measured, then
+   fixed. It still asserts `resident(kind)`, but only where that is not the
+   on-disk figure, so the vacuous case is a stated condition rather than
+   something that looks like a pass.
+
+   RED-first and mutation evidence, all four restored byte-for-byte by
+   `sha256sum -c`:
+
+   | tree | result |
+   |---|---|
+   | the committed spec, still declaring `1495251763` | **RED**, both kinds, `747625881` and `6918644736` absent |
+   | the repaired spec, threshold mutated back to `1495251763` | **RED**: "carries that number in 0 of its 2 half-1 declarations" |
+   | the same mutated tree, under the RETIRED assertion re-created verbatim | **GREEN** — which is why it never fired |
+   | `WIDEN["qwen3-vl"]` back to `2` in script and mirror, spec untouched | **RED** (unscoped form: green) |
+
+   The general shape is worth keeping: an assertion whose expected value is
+   derived from the same quantity the document already states elsewhere stops
+   being an assertion the moment those two quantities become equal, and nothing
+   in a green run says so.
+
+   The script's `TOWER_RESIDENT_BYTES` (`scripts/mm/tower_skip_rss.sh:451-461`)
+   and the test's `resident()` are now per-kind rather than a blanket `* 2`. All
+   four surfaces still move in ONE commit or the suite is red. §8.
 5. **Peak RSS is not allocation size.** The measurement is
    `/usr/bin/time -v` peak (`scripts/mm/tower_skip_rss.sh:576-581`), so the
    mmap'd source pages and `MaybeReleaseSourcePages` timing sit inside it. If
@@ -455,9 +492,12 @@ a hard red rather than a silent drift.
   checkpoint's bytes are unchanged.
 - `tests/scripts/test_tower_skip_rss_report.py:113-120` — the mirrored
   `resident()` helper, and the boundary constants its `BoundaryTests` derive.
-- `.agents/specs/multimodal-track.md` — `test_spec_carries_both_resident_figures`
-  (`test_tower_skip_rss_report.py:512-516`) asserts `1661390848` and
-  `7687383040` appear there.
+- `.agents/specs/multimodal-track.md` — the DECLARED THRESHOLD, not only the
+  resident figure. `test_spec_carries_the_threshold_the_instrument_applies`
+  asserts that `need(kind)` appears there for both kinds: `747625881` for
+  `qwen3-vl` and `6918644736` for `muse-glimmer`. It replaces
+  `test_spec_carries_both_resident_figures`, which went tautological on the
+  fixed kind and could no longer fail — see §5 risk 4.
 
 **Prose that would otherwise read the halving as a loss:**
 
@@ -570,6 +610,33 @@ parent, and applies §6.1's two halves to the per-leg `peak RSS default` and
   separately on the ~56 GB of worker-local disk its RSS leg wants (§10).
 - Both §6.1 halves, §6.2's re-declared skip threshold and §6.3's latency band
   are PENDING a leased host. Nothing in this row has been measured.
+- [#2173](https://github.com/mudler/vllm.cpp/issues/2173) — **the whole Gemma-4
+  vision tower this row narrowed is UNREACHED, and it lands that way.**
+  `Gemma4VisionForward` and `Gemma4VisionWeights` have no caller outside
+  `tests/vllm/multimodal/test_gemma4_vision_tower.cpp` and
+  `test_gemma4_registry_e2e.cpp`; `grep -rn 'gemma4_vision.h' src/ include/`
+  returns only `gemma4_vision.cpp` including its own header. It is unreached
+  twice over, because the driver that consumes tower output —
+  `Gemma4GenerateGreedyViaRegistry`, `gemma4_mm.cpp:165` — takes `mm_projected`
+  as a caller-supplied argument, masked-scatters it at `:250-252` without calling
+  the tower, and is itself only called from `test_gemma4_registry_e2e.cpp:244`.
+  Per `.agents/reachability.md` there is no production call site to delete, so
+  the mutation has already answered the question. The `Gemma4VisionWeights` half
+  of this row is therefore a storage-dtype correction to a class rather than to a
+  capability, and it is landed as a staged slice under AGENTS.md
+  §"Nothing lands dead". Owning row for the wiring:
+  `MODEL-MM-gemma4-mm-gemma4-for-conditional-generation`. The Qwen3-VL half is
+  NOT in this state: its tower is loaded on the production load path
+  (`LoadQwen3VLWeights` -> `LoadQwen3VLVisionWeights`, proven by the
+  call-site-deletion mutation that reds `test_tower_skip`), even though nothing
+  reads it back yet ([#1358](https://github.com/mudler/vllm.cpp/issues/1358)) —
+  and the bytes this row removes are the bytes that load allocates.
+- [#2174](https://github.com/mudler/vllm.cpp/issues/2174) — FIXED IN FLOW, listed
+  because it was found here rather than because it is outstanding.
+  `gemma4_vision.cpp`'s `MakeDevBf16` copied `bf.size() * sizeof(uint16_t)` into
+  a `bytes`-sized allocation with no guard, while the twin it was copied from
+  (`qwen3_vl_vision.cpp:137`) grew one in this row. Pre-existing and
+  behaviourally unchanged; the guard now mirrors the twin.
 - Gemma-4's `Gemma4VisionWeights::position_embedding_table` keeps its host f32
   store for the same reason `pos_embed_w` does — `Gemma4VisionForward` sums its
   x and y rows on the host (`gemma4_vision.cpp:199-210`) and narrows only the

@@ -9,8 +9,13 @@
 // wide: the tokens match, the tower goldens pass, and the path moves twice the
 // bytes (AGENTS.md, "Inherit vLLM defaults"). The only instrument that can see
 // it is one that counts bytes, so that is what every case below does — the
-// `scripts/mm/tower_skip_rss.sh` peak-RSS gate at unit scale, over the two
-// production loaders, with no host or checkpoint needed.
+// `scripts/mm/tower_skip_rss.sh` peak-RSS gate at unit scale, over the
+// production loader `LoadQwen3VLVisionWeights`, with no host or checkpoint
+// needed. ONE loader, not two: an earlier draft of this suite also drove the
+// Muse Glimmer loader, and that half was reverted with the rest of the Muse
+// Glimmer change (#2166 owns it). Gemma-4's tower loader is not covered here
+// either, and its own reason is different — nothing in production calls it
+// (#2173).
 //
 // THE MEASUREMENT, NOT A RESTATEMENT OF THE TYPE. `StoreBytes` and `Bits` are
 // written generically so that every case compiles against EITHER storage type.
@@ -288,7 +293,12 @@ TEST_CASE("vision tower dtype: F32ToBF16(BF16ToF32(b)) == b for every bf16 patte
 //
 // This case is the one that does not. It pins the rule itself, on four f32 bit
 // patterns whose low 16 bits are NOT zero, so it is stated independently of the
-// function under test. Under `u >> 16` three of the four move.
+// function under test. Under `u >> 16` two of the four move: 0x3F80C000 (which
+// must round UP to 0x3F81 and truncates to 0x3F80) and 0x3F818000 (the odd-tie,
+// which must round up to 0x3F82 and truncates to 0x3F81). The other two already
+// truncate to their correct answer, which is why a four-case table is the
+// smallest one that separates the rules rather than the smallest one that
+// exercises them.
 TEST_CASE("vision tower dtype: F32ToBF16 rounds to nearest EVEN, it does not truncate") {
   struct Case {
     uint32_t f32_bits;

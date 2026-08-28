@@ -104,6 +104,12 @@ NINJA_TARGET = "vllm-server"
 EXAMPLES_FLAG = "-DVLLM_CPP_BUILD_EXAMPLES=ON"
 SERVER_RELPATH = "examples/vllm-server"
 
+# The half-1 declaration opener, verbatim from the spec. Each kind's threshold
+# has to appear in the 240 characters that follow ITS OWN opener, which is what
+# keeps a superseded figure recorded elsewhere in the file from satisfying the
+# assertion.
+HALF_ONE_MARKER = "peak_rss(default) - peak_rss(--language-model-only) >="
+
 SKIP_LINE = (
     "server: multimodal towers NOT loaded (every modality they serve is at "
     "limit 0): vision_tower\n"
@@ -518,11 +524,88 @@ class DeclarationTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertIn(str(value), text)
 
-    def test_spec_carries_both_resident_figures(self) -> None:
+    def test_spec_carries_the_threshold_the_instrument_applies(self) -> None:
+        """The number the operator reads off the spec must be the number the
+        harness computes.
+
+        This REPLACES `test_spec_carries_both_resident_figures`, which asserted
+        that `resident(kind)` appears somewhere in the spec. That assertion was
+        load-bearing while every kind widened, because `resident` was then
+        always `2 x ondisk` and so a figure the spec carried nowhere else.
+        #1359 made `resident("qwen3-vl") == ondisk("qwen3-vl") == 830695424`,
+        and 830695424 is ALREADY in the spec as the ON-DISK figure — so for that
+        kind the assertion became a tautology satisfied by a line about a
+        different quantity, and it could no longer fail. It stayed green through
+        the whole of #1359 while the spec went on declaring the pre-fix
+        threshold.
+
+        `need(kind)` cannot go tautological the same way: it is `resident` times
+        `MIN_SAVING_FRACTION_PCT`, it is the quantity a run is actually judged
+        against, and it appears in the spec for no other reason. If the storage
+        dtype, the on-disk figure or the fraction moves and the spec does not,
+        this reds.
+
+        `resident(kind)` is still asserted, but only for a kind where it is not
+        the on-disk figure — stated as a condition rather than left implicit, so
+        that a future kind whose widening returns is covered and a kind whose
+        widening is gone is not silently vacuous.
+        """
+
         text = SPEC.read_text(encoding="utf-8")
+
+        # Scoped to the DECLARATION, not to the file. The spec legitimately
+        # retains superseded thresholds as the record of runs measured against
+        # them -- 1495251763 B is still in there, correctly, as what the
+        # 2026-08-24 run cleared. A whole-file substring search therefore has a
+        # false negative: restoring the `* 2` widening would make `need()` equal
+        # a number the file already carries for another reason, and the
+        # assertion would pass. Measured, not reasoned: with the widening
+        # mutated back to 2 on both the script and this suite's mirror, the
+        # unscoped form returned OK.
+        blocks = [
+            text[i : i + 240]
+            for i in range(len(text))
+            if text.startswith(HALF_ONE_MARKER, i)
+        ]
+        self.assertEqual(
+            len(blocks),
+            len(ONDISK),
+            "expected exactly one half-1 declaration per kind in %s" % SPEC.name,
+        )
+        claimed = {}
         for kind in ONDISK:
-            with self.subTest(kind=kind):
-                self.assertIn(str(resident(kind)), text)
+            owning = [b for b in blocks if str(need(kind)) in b]
+            if len(owning) != 1:
+                self.fail(
+                    "%s computes a %s threshold of %d B; %s carries that number "
+                    "in %d of its %d half-1 declarations, expected exactly 1. An "
+                    "operator reading the spec would apply a threshold the "
+                    "harness never computes."
+                    % (
+                        SCRIPT.name,
+                        kind,
+                        need(kind),
+                        SPEC.name,
+                        len(owning),
+                        len(blocks),
+                    )
+                )
+            claimed[kind] = owning[0]
+        self.assertEqual(
+            len(set(claimed.values())),
+            len(ONDISK),
+            "two kinds resolved to the SAME declaration in %s" % SPEC.name,
+        )
+
+        # The retired assertion, kept where it is still capable of failing: on a
+        # kind whose resident figure is NOT its on-disk figure. On the fixed kind
+        # the two are equal and asserting it proves nothing, which is the whole
+        # of this docstring's point, so that case is skipped by CONDITION rather
+        # than left to look like a pass.
+        for kind in ONDISK:
+            if resident(kind) != ondisk(kind):
+                with self.subTest(kind=kind, figure="resident"):
+                    self.assertIn(str(resident(kind)), text)
 
     def test_the_widening_defect_is_named_where_the_thresholds_are(self) -> None:
         """A large saving is partly a large widening; both files must say so."""

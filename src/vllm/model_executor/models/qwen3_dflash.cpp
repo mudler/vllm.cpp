@@ -1941,23 +1941,32 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
                "ForwardBlockLogitsWithDeviceKV: store layer count mismatch");
       const int64_t cr = st.num_ctx;
       if (cr == 0) continue;
-      const int64_t max_slots = st.max_pages * st.block_size;
-      std::vector<int32_t> gidx(static_cast<size_t>(cr)), didx(static_cast<size_t>(cr));
-      for (int64_t i = 0; i < cr; ++i) {
-        gidx[static_cast<size_t>(i)] = static_cast<int32_t>(i);         // paged slot i
-        didx[static_cast<size_t>(i)] = static_cast<int32_t>(off + i);   // combined row
-      }
-      DBuf gidx_d(d, DType::kI32, {cr}, gidx.data());
-      DBuf didx_d(d, DType::kI32, {cr}, didx.data());
+      // #2202: BOTH index maps are the identity, so this is a contiguous copy.
+      //
+      // The gather was `gidx[i] = i` over `[0, cr)` and the scatter
+      // `didx[i] = off + i`. A store's paged rows `[0, num_ctx)` are contiguous
+      // by construction — its block table is the identity, slot `p` holds
+      // position `p` — so selecting rows `0..cr-1` yields the first `cr * kdim`
+      // elements of the pool, and writing rows `off..off+cr-1` fills a
+      // contiguous span of the combined buffer. Neither map ever permuted
+      // anything; they described a memcpy in index form.
+      //
+      // Four device ops per (request, layer) become one `Backend::Copy` each for
+      // K and V, and the two `[cr, kdim]` temporaries disappear. At P=8, L=5
+      // that is 160 index kernels plus 16 index-map uploads replaced by 80
+      // device-to-device copies, and the bytes drop from 24 to 16 per element
+      // (the staging read and write are gone).
+      //
+      // BYTE-FOR-BYTE IDENTICAL: same source elements, same destination
+      // offsets, no arithmetic anywhere in the path.
+      const size_t row_bytes = static_cast<size_t>(kdim) * vt::SizeOf(DType::kBF16);
+      const size_t span_bytes = static_cast<size_t>(cr) * row_bytes;
+      const size_t dst_off = static_cast<size_t>(off) * row_bytes;
       for (int64_t l = 0; l < L; ++l) {
-        Tensor srck = Reshape(st.pool_k[static_cast<size_t>(l)].t(), {max_slots, kdim});
-        Tensor srcv = Reshape(st.pool_v[static_cast<size_t>(l)].t(), {max_slots, kdim});
-        DBuf tmpk(d, DType::kBF16, {cr, kdim});
-        DBuf tmpv(d, DType::kBF16, {cr, kdim});
-        vt::IndexSelect(d.q, tmpk.t(), srck, gidx_d.t());
-        vt::IndexSelect(d.q, tmpv.t(), srcv, gidx_d.t());
-        vt::IndexCopy(d.q, ckv.k[static_cast<size_t>(l)].t(), tmpk.t(), didx_d.t());
-        vt::IndexCopy(d.q, ckv.v[static_cast<size_t>(l)].t(), tmpv.t(), didx_d.t());
+        d.b.Copy(d.q, static_cast<char*>(ckv.k[static_cast<size_t>(l)].ptr()) + dst_off,
+                 st.pool_k[static_cast<size_t>(l)].ptr(), span_bytes);
+        d.b.Copy(d.q, static_cast<char*>(ckv.v[static_cast<size_t>(l)].ptr()) + dst_off,
+                 st.pool_v[static_cast<size_t>(l)].ptr(), span_bytes);
       }
       off += cr;
     }

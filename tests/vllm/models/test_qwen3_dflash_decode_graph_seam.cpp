@@ -159,6 +159,77 @@ std::vector<float> Ctx(int64_t rows, int64_t H) {
 // full target verify runs between two draft steps and perturbs the shared pool),
 // then replay on every later one. So after N proposes the seam must report ONE
 // closed segment and N-1 replays.
+// #2202. EVERY other case in this file builds `{store.get()}` — ONE store — so
+// the `P > 1` lane has never executed under test, while production runs it on
+// every step at c>1. `ForwardBlockLogitsWithDeviceKV` gates its paged fast path
+// on `P == 1` and falls through to a materialised combined-context forward
+// above that, and the fallback's own comment claims the two are
+// "Bit-identical to the paged path". Nothing checked that claim.
+//
+// This is the check: run two requests ALONE (each `P == 1`, the paged lane) and
+// then TOGETHER (`P == 2`, the materialised lane), and require each request's
+// logits to be unchanged by the presence of the other. Batching a request
+// beside another must not move its output.
+//
+// It is also the gate for #2202's contiguous-context change: that change
+// replaces the per-(request, layer) `IndexSelect`+`IndexCopy` pairs with one
+// `Backend::Copy` each for K and V, on the argument that both index maps were
+// the identity. If that argument is wrong the copy lands the wrong bytes and
+// the second request — the one at a non-zero offset into the combined buffer —
+// is what catches it.
+TEST_CASE("dflash draft: a request's logits do not change when batched beside another") {
+  Dims dm;
+  HfConfig cfg = MakeConfig(dm);
+  Qwen3DFlashWeights w = MakeWeights(dm);
+  vt::Queue q = Cpu();
+  const int64_t H = dm.H;
+
+  // Two stores with DIFFERENT context lengths, so the second sits at a non-zero
+  // offset in the combined buffer and a wrong offset cannot cancel out.
+  auto s0 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
+  auto s1 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
+  Qwen3DFlashModel::AppendContextKVDevice(*s0, Ctx(3, H), {0, 1, 2}, w, cfg, q);
+  Qwen3DFlashModel::AppendContextKVDevice(*s1, Ctx(2, H), {0, 1}, w, cfg, q);
+  REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*s0) == 3);
+  REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*s1) == 2);
+
+  const std::vector<int32_t> ids0 = {2, 7, 7}, pos0 = {3, 4, 5};
+  const std::vector<int32_t> ids1 = {5, 7, 7}, pos1 = {2, 3, 4};
+
+  std::vector<DflashDeviceKVStore*> only0 = {s0.get()};
+  std::vector<DflashDeviceKVStore*> only1 = {s1.get()};
+  const std::vector<float> alone0 = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      only0, {0, 3}, ids0, pos0, {0, 3}, w, cfg, q);
+  const std::vector<float> alone1 = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      only1, {0, 2}, ids1, pos1, {0, 3}, w, cfg, q);
+  REQUIRE(alone0.size() == static_cast<size_t>(3) * dm.vocab);
+  REQUIRE(alone1.size() == static_cast<size_t>(3) * dm.vocab);
+
+  // TOGETHER: ctx_cu accumulates 3 then 3+2, block_cu accumulates 3 then 6.
+  std::vector<DflashDeviceKVStore*> both = {s0.get(), s1.get()};
+  std::vector<int32_t> ids_both = ids0;
+  ids_both.insert(ids_both.end(), ids1.begin(), ids1.end());
+  std::vector<int32_t> pos_both = pos0;
+  pos_both.insert(pos_both.end(), pos1.begin(), pos1.end());
+  const std::vector<float> batched = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      both, {0, 3, 5}, ids_both, pos_both, {0, 3, 6}, w, cfg, q);
+  REQUIRE(batched.size() == static_cast<size_t>(6) * dm.vocab);
+
+  const size_t V = static_cast<size_t>(dm.vocab);
+  for (size_t r = 0; r < 3; ++r) {
+    for (size_t c = 0; c < V; ++c) {
+      INFO("request 0, row ", r, ", vocab ", c);
+      CHECK(batched[r * V + c] == doctest::Approx(alone0[r * V + c]));
+    }
+  }
+  for (size_t r = 0; r < 3; ++r) {
+    for (size_t c = 0; c < V; ++c) {
+      INFO("request 1, row ", r, ", vocab ", c);
+      CHECK(batched[(3 + r) * V + c] == doctest::Approx(alone1[r * V + c]));
+    }
+  }
+}
+
 TEST_CASE("dflash draft graph: the capture and every replay go through vt::BreakableGraph") {
   vllm_test::StaticGraphCpu graph_cpu;  // capture-capable CPU backend + static-graph platform
 

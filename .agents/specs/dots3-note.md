@@ -3803,6 +3803,38 @@ inert and is therefore in the red table: `num_expert_group = 0` selects
 `_padded_mlp_size` has no row at all — it is deliberately not ported, so there
 is no line to mutate, and the absence is recorded rather than shown as a green.
 
+#### The residency defect the fresh review found, and what a mutation CAN say about it
+
+W5 shipped `Dots3NoteMoePtrsFor` as a process-lifetime `static std::map<const
+Dots3NoteMoeWeights*, Dots3NoteMoePtrs>`, the pre-#237 shape, and cited #237's
+own repair as its warrant (review F1,
+[#2193](https://github.com/mudler/vllm.cpp/issues/2193)). It now builds into a
+`ResidentSlot` the weights own. Two mutations, run through the same harness on
+the repaired head, and the pair is what makes the claim honest rather than the
+first row alone:
+
+| # | mutation | test | built | cc errors | run exit | cases / asserts failed | verdict |
+|---|---|---|---|---:|---:|---|---|
+| F1-a | the accessor keys on the WEIGHT'S ADDRESS again | `test_moe_resident_lifetime` | YES | 0 | 0 | 0 / 0 | **SURVIVED** |
+| F1-b | the same edit | `test_dots3_note_attn` | YES | 0 | 0 | 0 / 0 | **SURVIVED** |
+| F1-c | CONTROL: `static inline ResidentSlot resident_moe` — one slot shared by every block | `test_moe_resident_lifetime` | YES | 0 | 1 | 2 / 3 | DETECTED |
+
+**F1-a and F1-b survived, and that is a property of the arm rather than a weak
+gate.** `Dots3NoteMoePtrsFor` is file-local to `dots3_note_device.cpp` and is
+called only from inside `Dots3NoteGroupedMoeEligible`, which requires a NATIVE
+`vt::OpId::kMoeGroupedGemmBf16`. That op is registered for CUDA only
+(`src/vt/cuda/cuda_matmul_nvfp4.cu:2722`) and has no CPU reference tier, so no
+CPU gate can call the accessor at all. Reverting its body is unobservable here
+by construction, and it rides the device run the grouped arm already owes under
+`## Owed`.
+
+**F1-c is the positive control, and it is why the two survivals are readable.**
+Without it, `SURVIVED` is indistinguishable from a dead harness or an assertion
+that never ran. The control mutates the ONE property the CPU cases do pin —
+that residency is owned per BLOCK — by making the slot shared, and the suite
+reds at 2 cases / 3 assertions with exit 1. So the instrument is armed, the
+cases discriminate, and what they cannot reach is named rather than implied.
+
 #### Reachability
 
 Three deletion mutations, all red, all through

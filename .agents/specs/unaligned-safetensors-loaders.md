@@ -51,6 +51,19 @@ Four loaders formed a `const uint16_t*` over that address:
 | `qwen3_vl.cpp:78` `LoadVisionF32` | cast, then `p[i]` in `Bf16BitsToF32` | YES |
 | `qwen3_5_mtp.cpp:71` `CopyRawNK` | cast, `+ offset`, then `memcpy` | **NO** |
 
+**`LoadVisionF32` no longer exists, and the table is left as it was measured.**
+[#1359](https://github.com/mudler/vllm.cpp/issues/1359) renamed it
+`LoadVisionBf16` (`qwen3_vl.cpp:85`) and made it store the checkpoint's own bf16
+bits, so it now calls `vt::LoadUnaligned<uint16_t>` directly rather than through
+`Bf16BitsToF32`. `Bf16BitsToF32` survives at `qwen3_vl.cpp:58` serving the text
+embed-merge path, over an ALIGNED `std::vector<uint16_t>` rather than over the
+mmap, so it is no longer one of these four sites at all. The row's finding is
+about which SHAPES a sanitizer can see, and that does not move with a rename, so
+the table records the sites as this row measured them. Everywhere below, read
+`LoadVisionF32` as `LoadVisionBf16` and read `Bf16BitsToF32` under it as the
+`vt::LoadUnaligned` loop that replaced it. The fix this row asked for is still in
+place and `tests/vllm/models/test_loader_unaligned_offsets.cpp` still gates it.
+
 **The two `NO` rows are the finding.** Forming and advancing a misaligned
 `uint16_t*` is undefined in its own right, but both of them then launder every
 access through `std::memcpy`, which reads bytes — so `-fsanitize=alignment`
@@ -138,7 +151,7 @@ RED, at base + the `voxtral.h` export and nothing else, under
   short unsigned int', which requires 2 byte alignment`, in
   `vllm::VoxtralStBf16ToF32`.
 - `qwen3_vl.cpp:58` — the same diagnostic, in `Bf16BitsToF32` under
-  `LoadVisionF32`.
+  `LoadVisionF32` (both renamed since; see the note under the four-site table).
 - `PermuteQKBf16`, `CopyRawNK` and the minimax loop — **pass**, which is the
   point being pinned: the sanitizer cannot see them.
 

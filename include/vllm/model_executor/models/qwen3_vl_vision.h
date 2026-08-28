@@ -55,28 +55,50 @@ struct Qwen3VLVisionConfig {
   }
 };
 
-// All weights are host-side row-major f32 (as stored by torch: Linear weight is
-// [out, in]). LayerNorm weight/bias are [dim].
+// All weights are host-side row-major RAW BF16 BITS (`uint16_t`, as stored by
+// torch: a Linear weight is [out, in]). LayerNorm weight/bias are [dim].
+//
+// BF16, NOT f32, and that is the model dtype rather than a compression (#1359).
+// Upstream has no ViT dtype of its own: `Qwen3_VisionTransformer.dtype` IS
+// `patch_embed.proj.weight.dtype` (qwen3_vl.py:633-634) under
+// `set_default_torch_dtype(model_config.dtype)` (base_loader.py:53), so the
+// tower is whatever the all-BF16 checkpoint loaded as. These stores held f32
+// until #1359 and every consumer narrowed them straight back with
+// `vt::F32ToBF16` before its first GEMM, so the widening cost exactly 2x the
+// checkpoint's bytes and bought nothing. Narrowing is BIT-IDENTICAL, not merely
+// within tolerance: `BF16ToF32` is a 16-bit shift, so `F32ToBF16`'s
+// round-to-nearest-even addend cannot carry back into bit 16
+// (`src/vt/dtype.cpp:317-326`; proven exhaustively in
+// `tests/vllm/models/test_vision_tower_dtype.cpp`).
 struct VisionBlockWeights {
-  std::vector<float> norm1_w, norm1_b;   // [hidden]
-  std::vector<float> norm2_w, norm2_b;   // [hidden]
-  std::vector<float> qkv_w, qkv_b;       // qkv_w [3*hidden, hidden], qkv_b [3*hidden]
-  std::vector<float> proj_w, proj_b;     // [hidden, hidden], [hidden]
-  std::vector<float> fc1_w, fc1_b;       // [inter, hidden], [inter]
-  std::vector<float> fc2_w, fc2_b;       // [hidden, inter], [hidden]
+  std::vector<uint16_t> norm1_w, norm1_b;   // [hidden]
+  std::vector<uint16_t> norm2_w, norm2_b;   // [hidden]
+  std::vector<uint16_t> qkv_w, qkv_b;       // qkv_w [3*hidden, hidden], qkv_b [3*hidden]
+  std::vector<uint16_t> proj_w, proj_b;     // [hidden, hidden], [hidden]
+  std::vector<uint16_t> fc1_w, fc1_b;       // [inter, hidden], [inter]
+  std::vector<uint16_t> fc2_w, fc2_b;       // [hidden, inter], [hidden]
 };
 
 struct VisionMergerWeights {
-  bool use_postshuffle_norm = false;     // main merger false; deepstack true
-  std::vector<float> norm_w, norm_b;     // [context_dim] (false) or [4*context] (true)
-  std::vector<float> fc1_w, fc1_b;       // [4*context, 4*context]
-  std::vector<float> fc2_w, fc2_b;       // [out_hidden, 4*context], [out_hidden]
+  bool use_postshuffle_norm = false;        // main merger false; deepstack true
+  std::vector<uint16_t> norm_w, norm_b;     // [context_dim] (false) or [4*context] (true)
+  std::vector<uint16_t> fc1_w, fc1_b;       // [4*context, 4*context]
+  std::vector<uint16_t> fc2_w, fc2_b;       // [out_hidden, 4*context], [out_hidden]
 };
 
 struct Qwen3VLVisionWeights {
-  std::vector<float> patch_proj_w, patch_proj_b;  // [hidden, C*tp*p*p], [hidden]
-  std::vector<float> pos_embed_w;                 // [num_position_embeddings, hidden]
-  std::vector<VisionBlockWeights> blocks;         // depth
+  std::vector<uint16_t> patch_proj_w, patch_proj_b;  // [hidden, C*tp*p*p], [hidden]
+  // f32, DELIBERATELY, and the only such field here: the pos-embed table is the
+  // one weight whose values reach arithmetic before anything narrows them —
+  // `VisionPosEmbedInterpolate` runs the bilinear gather and sum on the host in
+  // f32 (mirroring pos_embed_interpolate_native, qwen3_vl.py:277-344) — so
+  // narrowing the store would move the interpolated table. 9,437,184 B on
+  // Qwen3-VL-4B, 0.57% of the tower. This is WIDER than upstream, which casts
+  // the coefficients down to the model dtype at :335 and gathers a model-dtype
+  // embedding at :337; reconciling it onto the mirror moves tower numbers and is
+  // owed separately (`.agents/specs/vision-tower-dtype-polarity.md` §4.3).
+  std::vector<float> pos_embed_w;                    // [num_position_embeddings, hidden]
+  std::vector<VisionBlockWeights> blocks;            // depth
   VisionMergerWeights merger;
   std::vector<VisionMergerWeights> deepstack_mergers;  // len(deepstack_visual_indexes)
 };

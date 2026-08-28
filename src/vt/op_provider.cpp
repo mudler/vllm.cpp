@@ -398,6 +398,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeRelu2";
     case OpId::kCastBf16:
       return "CastBf16";
+    case OpId::kCastF16:
+      return "CastF16";
     case OpId::kCastF32:
       return "CastF32";
     case OpId::kMulColVecF32:
@@ -525,10 +527,16 @@ const char* OpNameImpl(OpId op) {
       return "Ltx2";
     case OpId::kLtx2Vae:
       return "Ltx2Vae";
+    case OpId::kQwen4ExpPleConv:
+      return "Qwen4ExpPleConv";
     case OpId::kQwen4ExpGatedResidual:
       return "Qwen4ExpGatedResidual";
     case OpId::kQwen4ExpGatedResidualWriteBack:
       return "Qwen4ExpGatedResidualWriteBack";
+    case OpId::kQwen4ExpQsaCompress:
+      return "Qwen4ExpQsaCompress";
+    case OpId::kQwen4ExpQsaGatherAttention:
+      return "Qwen4ExpQsaGatherAttention";
     case OpId::kConv2d:
       return "Conv2d";
     case OpId::kDepthwiseConv1d:

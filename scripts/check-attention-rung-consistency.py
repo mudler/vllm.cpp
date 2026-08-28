@@ -45,9 +45,9 @@ That normalization is position-preserving, so every reported `file:line` still
 describes the original file.
 
 What this checker DETECTS, stated as a limit rather than implied by a green:
-one literal spelling, `vt::Attention(`, in a model `.cpp` or `.h`. Four spellings
-reach the same kernel and are NOT detected, each verified to leave the checker
-green with a live unmarked call:
+one literal spelling, `vt::Attention(`, anywhere under `src/`, `include/` or
+`examples/`. Four spellings reach the same kernel and are NOT detected, each
+verified to leave the checker green with a live unmarked call:
 
     using vt::Attention;   then a bare  Attention(...)
     namespace vv = vt;     then         vv::Attention(...)
@@ -61,8 +61,30 @@ would demand a marker beside exactly the calls this checker wants people to make
 and no regex reaches a call through a function pointer at all. What closes it is a
 compiler-side population — the CUDA op registry, or a clang tooling pass over the
 real translation unit — which is a different instrument, not a longer pattern. A
-green here therefore means "no unmarked `vt::Attention(` call", never "no model is
-on the naive rung".
+green here therefore means "no unmarked `vt::Attention(` call in the scanned
+population", never "no model is on the naive rung".
+
+THE POPULATION IS THE COMPILED TREE, and it was not always (#1552). This scan
+read `src/vllm/model_executor/models` and its include sibling, NON-recursively,
+over `*.cpp` and `*.h` only. Three shapes escaped it, and two were measured on
+`f9af269f9` by appending a live unmarked call and running this file: an unmarked
+`vt::Attention(` in `src/vllm/v1/attention/backend.cpp`, and one in a new
+subdirectory of the model directory, each left rc=0 with the OK line still
+reporting the same 8 sites. Neither shape is exotic — `src/vllm/multimodal/`
+already drives the LTX-2.5 denoise loop from outside `models/`, and a model that
+grows a kernels subdirectory takes its call out of the population by moving a
+file. So the roots are now `src/`, `include/` and `examples/`, walked
+recursively over every C++ suffix this repository compiles.
+
+`tests/` is excluded BY NAME, at any depth. The suite for this checker writes
+unmarked `vt::Attention(` calls as fixtures, and a checker that refuses its own
+tests cannot be run. `tests/scripts/test_check_attention_rung_consistency.py`
+::PopulationTests asserts the exclusion together with a sibling that IS scanned,
+because an exclusion asserted alone also passes on a scanner that reads nothing.
+
+`MODEL_DIRS` survives the widening and still means what it meant: it is how the
+allowlist resolves a model STEM to a source file, which is a model-scoped
+question and not the scan population.
 
 The validation logic is pure functions (`scan_file`, `drift_sites`,
 `stale_allowlist_entries`) so it is unit- and mutation-testable
@@ -81,13 +103,34 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from checker_text import normalize_source  # noqa: E402
 
-# Both halves of a model's sources. A header is scanned too, because a call moved
-# into an inline function or a template there would otherwise leave the checker
-# green — the population is what makes a green meaningful.
+# Both halves of a model's sources. NOT the scan population any more (#1552, see
+# the module docstring): this pair is how `stale_allowlist_entries`' companion
+# test resolves an allowlisted STEM to a real source file, which is a
+# model-scoped question. Widening it would change which stems are resolvable,
+# not which files are read.
 MODEL_DIRS = (
     ROOT / "src/vllm/model_executor/models",
     ROOT / "include/vllm/model_executor/models",
 )
+
+# THE SCAN POPULATION. Every root the compiler sees, walked recursively. A header
+# is scanned for the same reason it always was — a call moved into an inline
+# function or a template would otherwise leave the checker green — and a `.cu` is
+# scanned because the naive/fast distinction this file guards lives in one.
+SCAN_ROOTS = (
+    ROOT / "src",
+    ROOT / "include",
+    ROOT / "examples",
+)
+SOURCE_SUFFIXES = (".cpp", ".cc", ".cu", ".cuh", ".h", ".hpp")
+
+# Excluded at any depth, by directory NAME. `tests/` writes unmarked calls as
+# fixtures on purpose; so does this checker's own suite. A checker that refuses
+# its own tests cannot be run, and that is the whole of the exclusion — it is not
+# a general escape hatch, and adding a name here removes a directory from every
+# green this file ever prints.
+EXCLUDED_DIR_NAMES = frozenset({"tests"})
+
 ALLOWLIST = ROOT / "scripts/attention-rung-allowlist.txt"
 
 # `vt::Attention(` and nothing else. The word boundary is load-bearing: without it
@@ -145,23 +188,41 @@ def scan_file(text: str) -> list[tuple[int, bool]]:
     return out
 
 
-def scan_models(model_dirs=MODEL_DIRS) -> dict[str, list[tuple[int, bool]]]:
-    """Map repo-relative model source path -> its `vt::Attention(` sites.
+def scan_models(roots=SCAN_ROOTS) -> dict[str, list[tuple[int, bool]]]:
+    """Map repo-relative source path -> its `vt::Attention(` sites.
+
+    Walks each root RECURSIVELY over SOURCE_SUFFIXES, skipping any path with an
+    EXCLUDED_DIR_NAMES component. Before #1552 this globbed two directories
+    non-recursively over two suffixes, and a call one directory to the side was
+    invisible to it; the module docstring records the two shapes that were
+    measured escaping.
 
     Keyed on the PATH, not the stem: `ltx2.cpp` and `ltx2.h` share a stem and would
     otherwise overwrite each other, reporting one file's sites under the other's
     name. The allowlist still matches on the stem, so one entry covers a model's
     whole translation unit.
+
+    The key is repo-relative when the file is inside the repository and absolute
+    when it is not, so a synthetic root under a temporary directory reports a
+    usable path instead of raising. Every shipped root is inside ROOT, so nothing
+    the gate reads takes the second branch.
     """
     out: dict[str, list[tuple[int, bool]]] = {}
-    for models_dir in model_dirs:
-        if not models_dir.is_dir():
+    for root in roots:
+        if not root.is_dir():
             continue
-        for pattern in ("*.cpp", "*.h"):
-            for path in sorted(models_dir.glob(pattern)):
-                sites = scan_file(path.read_text(encoding="utf-8", errors="ignore"))
-                if sites:
-                    out[str(path.relative_to(ROOT))] = sites
+        for path in sorted(root.rglob("*")):
+            if path.suffix not in SOURCE_SUFFIXES or not path.is_file():
+                continue
+            if EXCLUDED_DIR_NAMES.intersection(path.parts):
+                continue
+            sites = scan_file(path.read_text(encoding="utf-8", errors="ignore"))
+            if sites:
+                try:
+                    key = str(path.relative_to(ROOT))
+                except ValueError:
+                    key = str(path)
+                out[key] = sites
     return out
 
 
@@ -225,7 +286,10 @@ def main() -> int:
 
     if drift:
         print(
-            "ERROR: model forward(s) call vt::Attention — the naive, "
+            # "call site(s)", not "model forward(s)": since #1552 the population
+            # is `src/`, `include/` and `examples/`, so this message can now name
+            # a file that is not a model forward at all.
+            "ERROR: call site(s) name vt::Attention — the naive, "
             "correctness-grade attention kernel (up to ~500x the cost of "
             "vt::AttentionDenseFlash; issue #1544) — with no recorded reason:",
             file=sys.stderr,
@@ -262,7 +326,8 @@ def main() -> int:
     )
     print(
         f"OK (attention rung): {sites} vt::Attention call site(s) in "
-        f"{len(scanned)} model source file(s); {marked} carry a recorded reason, "
+        f"{len(scanned)} source file(s) under {len(SCAN_ROOTS)} scanned root(s); "
+        f"{marked} carry a recorded reason, "
         f"{excused} unmarked and excused by "
         f"{len(allowlisted)} allowlisted in-flight stem(s)."
     )

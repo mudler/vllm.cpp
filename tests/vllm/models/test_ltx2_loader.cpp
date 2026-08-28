@@ -2354,6 +2354,252 @@ TEST_CASE("ltx2 loader: require_config mirrors upstream's refusal of a metadata-
 }
 
 // ===========================================================================
+// 7b. The same loader on a BF16 text encoder, which is the OTHER shipped arm
+// ===========================================================================
+
+namespace {
+
+// The bf16 caption-projection arm at reduced dimensions, built from the SHAPE
+// RULES the shipped `gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` actually
+// has. Its header was read rather than reasoned about: that file stores
+// `text_embedding_projection.video_aggregate_embed.weight` as BF16
+// [4096, 188160] = [out, hidden * (layers + 1)] beside a BF16 bias, and carries
+// ZERO `.weight_scale` tensors and ZERO `torchao_nvfp4` markers across all 686
+// of its tensors. So the stored width IS the logical width here, exactly as upstream's
+// own `torch.nn.Linear(flat_dim, video_inner_dim, bias=True)`
+// (encoder_configurator.py:206-208 at pin fd4ded7f) stores it, and the file has
+// no quantized module for the marker loop to validate.
+//
+// `vision_model.patch_dense` is present and unquantized for the same reason it
+// is present and quantized in `BuildSyntheticTe`: the real file ships a
+// multimodal tower, and a loader that chokes on it cannot read the checkpoint.
+std::vector<StEntry> BuildSyntheticTeBf16(int64_t hidden, int64_t layers, int64_t video_out,
+                                          int64_t audio_out,
+                                          std::map<std::string, std::vector<uint16_t>>* expected) {
+  std::vector<StEntry> entries;
+  const std::vector<float> norm(static_cast<size_t>(hidden), 1.0F);
+  entries.push_back({"model.norm.weight", "BF16", {hidden}, PackBf16(norm)});
+  for (int64_t l = 0; l < layers; ++l) {
+    const std::string b = "model.layers." + std::to_string(l);
+    entries.push_back({b + ".input_layernorm.weight", "BF16", {hidden}, PackBf16(norm)});
+  }
+  const int64_t in_features = hidden * (layers + 1);
+
+  struct P {
+    const char* module;
+    int64_t out;
+  };
+  const P projections[] = {
+      {"text_embedding_projection.video_aggregate_embed", video_out},
+      {"text_embedding_projection.audio_aggregate_embed", audio_out},
+      {"vision_model.patch_dense", 128},  // present, out of scope, must not choke
+  };
+  for (const P& pr : projections) {
+    const std::string m = pr.module;
+    const std::string weight = m + ".weight";
+    std::vector<float> values(static_cast<size_t>(pr.out) * static_cast<size_t>(in_features));
+    for (size_t i = 0; i < values.size(); ++i) values[i] = TrueValue(weight, i);
+    entries.push_back({weight, "BF16", {pr.out, in_features}, PackBf16(values)});
+    if (m.rfind("text_embedding_projection", 0) != 0) continue;
+    if (expected != nullptr) {
+      std::vector<uint16_t> want(values.size());
+      for (size_t i = 0; i < values.size(); ++i) want[i] = F32ToBf16(values[i]);
+      (*expected)[m] = want;
+    }
+    std::vector<float> bias(static_cast<size_t>(pr.out));
+    for (size_t i = 0; i < bias.size(); ++i) bias[i] = TrueValue(m + ".bias", i);
+    entries.push_back({m + ".bias", "BF16", {pr.out}, PackBf16(bias)});
+  }
+  entries.push_back({"tokenizer_json", "U8", {5}, std::string("{\"a\":")});
+  entries.push_back({"hf_asset__tokenizer_config.json", "U8", {2}, std::string("{}")});
+  entries.push_back({"hf_asset__processor_config.json", "U8", {2}, std::string("{}")});
+  return entries;
+}
+
+// Replace one entry of a fixture, so a refusal case differs from the loading
+// case by exactly the byte under test.
+std::vector<StEntry> ReplaceEntry(const std::vector<StEntry>& entries, const std::string& name,
+                                  const StEntry& with) {
+  std::vector<StEntry> out;
+  bool replaced = false;
+  for (const StEntry& e : entries) {
+    if (e.name == name) {
+      out.push_back(with);
+      replaced = true;
+    } else {
+      out.push_back(e);
+    }
+  }
+  REQUIRE(replaced);
+  return out;
+}
+
+std::string LoadTeFailure(const std::vector<StEntry>& entries, const char* stem) {
+  const std::string path = TmpPath(stem);
+  WriteSafetensors(entries, path);
+  std::string what;
+  {
+    const SafetensorsFile file = SafetensorsFile::Open(path);
+    try {
+      vllm::Ltx2LoadTextEncoderFromSafetensors(file);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+  }
+  std::remove(path.c_str());
+  return what;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 loader: the BF16 caption projections load at their STORED width") {
+  const int64_t hidden = 128, layers = 3, video_out = 256, audio_out = 128;
+  std::map<std::string, std::vector<uint16_t>> expected;
+  const std::vector<StEntry> entries =
+      BuildSyntheticTeBf16(hidden, layers, video_out, audio_out, &expected);
+  const std::string path = TmpPath("te_bf16");
+  WriteSafetensors(entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  const vllm::Ltx2TextEncoderCheckpoint ck =
+      vllm::Ltx2LoadTextEncoderFromSafetensors(file);
+  CHECK(ck.gemma_hidden_size == hidden);
+  CHECK(ck.gemma_num_hidden_layers == layers);
+  // THE assertion of this row. Doubling a stored bf16 width gives 1024 here and
+  // 376320 on the shipped file, and the geometry check then fires on the
+  // loader's own arithmetic (#2140).
+  CHECK(ck.video.in_features == hidden * (layers + 1));
+  CHECK(ck.audio.in_features == hidden * (layers + 1));
+  CHECK(ck.video.out_features == video_out);
+  CHECK(ck.audio.out_features == audio_out);
+  // The bias comes off the same dtype path on BOTH arms, and dropping it is the
+  // half-done load ltx2_text_encoder.h:264-269 names.
+  CHECK(ck.video.bias_bf16.size() == static_cast<size_t>(video_out));
+  CHECK(ck.audio.bias_bf16.size() == static_cast<size_t>(audio_out));
+  // Nothing in this file is quantized, and an empty inventory is the correct
+  // answer rather than a missing one.
+  CHECK(ck.quantized_modules.empty());
+  CHECK(ck.assets.tokenizer_json.size() == 5);
+
+  // Byte-for-byte, because a plain arm that merely has the right SHAPE can still
+  // read the rows through the wrong stride.
+  int64_t bad = 0, checked = 0;
+  for (const auto& kv : expected) {
+    const std::vector<uint16_t>& want = kv.second;
+    const std::vector<uint16_t>& got =
+        kv.first.find("video") != std::string::npos ? ck.video.weight_bf16
+                                                    : ck.audio.weight_bf16;
+    REQUIRE(got.size() == want.size());
+    for (size_t i = 0; i < want.size(); ++i) {
+      ++checked;
+      if (got[i] != want[i]) ++bad;
+    }
+  }
+  INFO("te bf16 checked=" << checked << " bad=" << bad);
+  CHECK(checked > 0);
+  CHECK(bad == 0);
+
+  // The f32 widening carries the same widths through. It reads no file shape and
+  // no dtype, so it is correct for this arm exactly when the load is -- and a
+  // wrong in_features would arrive here unchanged.
+  const vllm::Ltx2TextEncoderWeights w = vllm::Ltx2WidenTextProjectionsToF32(ck);
+  CHECK(w.video.in_features == hidden * (layers + 1));
+  CHECK(w.audio.in_features == hidden * (layers + 1));
+  CHECK(w.video.out_features == video_out);
+  CHECK(w.video.bias.size() == static_cast<size_t>(video_out));
+  REQUIRE(w.video.weight.size() == ck.video.weight_bf16.size());
+  std::vector<float> want_f32(w.video.weight.size(), 0.0F);
+  for (size_t i = 0; i < want_f32.size(); ++i) {
+    want_f32[i] = Bf16ToF32(ck.video.weight_bf16[i]);
+  }
+  const double max_abs = vllm_test::MaxAbsDiff(w.video.weight, want_f32);
+  INFO("te bf16 widen max abs = " << max_abs);
+  CHECK(max_abs == 0.0);
+  std::remove(path.c_str());
+}
+
+TEST_CASE("ltx2 loader: a caption projection with exactly ONE of the scale pair is refused") {
+  // prequant.py:37-41 at pin fd4ded7f: "expected both or neither (NVFP4
+  // checkpoints pair them 1:1:1)". Upstream raises rather than falling back to
+  // the plain form, and so does this loader, because either fallback reads real
+  // bytes under the wrong rule.
+  const std::vector<StEntry> base = BuildSyntheticTeBf16(128, 3, 256, 128, nullptr);
+  const std::string module = "text_embedding_projection.video_aggregate_embed";
+
+  SUBCASE("weight_scale alone") {
+    std::vector<StEntry> entries = base;
+    entries.push_back({module + ".weight_scale", "F8_E4M3", {64, 128},
+                       PackBytes(std::vector<uint8_t>(64 * 128, 0x38))});
+    const std::string what = LoadTeFailure(entries, "te_bf16_half_pair_a");
+    INFO("what: " << what);
+    CHECK(what.find(module) != std::string::npos);
+    CHECK(what.find("weight_scale_2") != std::string::npos);
+  }
+
+  SUBCASE("weight_scale_2 alone") {
+    std::vector<StEntry> entries = base;
+    const float scale2 = 0.0078125F;
+    entries.push_back({module + ".weight_scale_2", "F32", {},
+                       std::string(reinterpret_cast<const char*>(&scale2), 4)});
+    const std::string what = LoadTeFailure(entries, "te_bf16_half_pair_b");
+    INFO("what: " << what);
+    CHECK(what.find(module) != std::string::npos);
+    CHECK(what.find("weight_scale") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 loader: an unscaled caption projection this loader cannot read refuses BY NAME") {
+  const std::vector<StEntry> base = BuildSyntheticTeBf16(128, 3, 256, 128, nullptr);
+  const std::string module = "text_embedding_projection.video_aggregate_embed";
+  const int64_t in_features = 128 * 4;
+
+  SUBCASE("a U8 weight with no scales is not silently read as NVFP4") {
+    // The dangerous one. Read as NVFP4 it would need scales that are absent;
+    // read as bf16 it would be half the width. Neither is a guess this loader
+    // gets to make.
+    const std::vector<StEntry> entries = ReplaceEntry(
+        base, module + ".weight",
+        {module + ".weight", "U8", {256, in_features / 2},
+         PackBytes(RandBytes("u8w", static_cast<size_t>(256 * in_features / 2)))});
+    const std::string what = LoadTeFailure(entries, "te_bf16_u8_noscale");
+    INFO("what: " << what);
+    CHECK(what.find(module) != std::string::npos);
+    CHECK(what.find("U8") != std::string::npos);
+  }
+
+  SUBCASE("an F32 weight is refused rather than read as bf16") {
+    std::vector<float> values(static_cast<size_t>(256) * static_cast<size_t>(in_features), 0.5F);
+    std::string bytes(values.size() * sizeof(float), '\0');
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    const std::vector<StEntry> entries =
+        ReplaceEntry(base, module + ".weight",
+                     {module + ".weight", "F32", {256, in_features}, bytes});
+    const std::string what = LoadTeFailure(entries, "te_bf16_f32");
+    INFO("what: " << what);
+    CHECK(what.find(module) != std::string::npos);
+    CHECK(what.find("F32") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 loader: a BF16 caption projection of the WRONG width still refuses") {
+  // Dropping the doubling must not drop the geometry check with it: a stored
+  // width that disagrees with `hidden * (layers + 1)` is still a refusal, and
+  // the halved width is exactly the shape the old code would have ACCEPTED.
+  const std::vector<StEntry> base = BuildSyntheticTeBf16(128, 3, 256, 128, nullptr);
+  const std::string module = "text_embedding_projection.video_aggregate_embed";
+  const int64_t half = 128 * 4 / 2;
+  std::vector<float> values(static_cast<size_t>(256) * static_cast<size_t>(half), 0.25F);
+  const std::vector<StEntry> entries =
+      ReplaceEntry(base, module + ".weight",
+                   {module + ".weight", "BF16", {256, half}, PackBf16(values)});
+  const std::string what = LoadTeFailure(entries, "te_bf16_halfwidth");
+  INFO("what: " << what);
+  CHECK(what.find(module) != std::string::npos);
+  CHECK(what.find("256") != std::string::npos);  // the width it read
+  CHECK(what.find("512") != std::string::npos);  // the geometry it wanted
+}
+
+// ===========================================================================
 // 8. The contract's OWN refusal, which ltx2.h:228-232 promises and did not give
 // ===========================================================================
 

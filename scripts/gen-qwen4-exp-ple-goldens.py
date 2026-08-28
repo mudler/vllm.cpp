@@ -411,6 +411,73 @@ W("static const unsigned char kPleConvMask[%d] = {%s};\n"
   % (len(CONV_MASK), ", ".join(str(m) for m in CONV_MASK)))
 dump_tensor("kPleMaskedExpectedOutput", masked_single)
 
+# ------------- I. the dilated conv ALONE, with the DILATION as the variable
+# W5b-3 (#2156). The device op `vt::Qwen4ExpPleConv` is `_short_conv` and
+# nothing else, so it needs a golden that is `_short_conv` and nothing else:
+# section F's impulse is one-hot per channel, which cannot see an accumulation
+# defect, and section G's golden is the whole layer, which cannot localise one.
+#
+# THE DILATION IS THE VARIABLE, AND THE ORACLE SUPPLIES BOTH SIDES. The same
+# upstream method, the same input and the SAME conv weight are run at dilation
+# 3 (the model's `ngram_size`), 2 and 1, by swapping only the `nn.Conv1d` and
+# the `short_conv_state_len` that upstream itself derives from it. A test
+# fixture in which dilation 3 and dilation 1 agree would gate nothing, so the
+# separation between the three is asserted here, at generation time, and the
+# measured value is written into the file for the reader.
+CONV_LEN = 12
+CONV_SPLIT = (7, 1, 4)  # prefill(7) + decode(1) + prefill(4)
+assert sum(CONV_SPLIT) == CONV_LEN
+CONV_DILATIONS = (1, 2, 3)
+conv_in = torch.empty(1, CONV_LEN, H * HC).uniform_(-1.0, 1.0)
+conv_out = {}
+for _dil in CONV_DILATIONS:
+    probe = PLE(TINY, layer_idx=0, ple_layer_index=0)
+    with torch.no_grad():
+        # Only the conv and the state width change. `_short_conv` itself is the
+        # upstream method, unmodified and executed, not re-implemented.
+        probe.conv1d = nn.Conv1d(H * HC, H * HC, kernel_size=TINY.ple_conv_kernel_size,
+                                 groups=H * HC, dilation=_dil, bias=False)
+        probe.conv1d.weight.copy_(ple2.conv1d.weight)
+        probe.short_conv_state_len = (TINY.ple_conv_kernel_size - 1) * _dil
+        single_conv = probe._short_conv(conv_in, None)
+        cache = Cache(num_layers=1, n_states=3)
+        parts, lo = [], 0
+        for count in CONV_SPLIT:
+            parts.append(probe._short_conv(conv_in[:, lo:lo + count], cache))
+            lo += count
+        inc_conv = torch.cat(parts, dim=1)
+    assert torch.allclose(single_conv, inc_conv, atol=1e-6), \
+        f"the {(TINY.ple_conv_kernel_size - 1) * _dil}-column state must make " \
+        f"chunked equal single-shot at dilation {_dil}"
+    conv_out[_dil] = single_conv
+
+_seps = {}
+for _i, _a in enumerate(CONV_DILATIONS):
+    for _b in CONV_DILATIONS[_i + 1:]:
+        _seps[(_a, _b)] = (conv_out[_a] - conv_out[_b]).abs().max().item()
+assert min(_seps.values()) > 1e-2, \
+    f"the dilations must separate or the fixture gates nothing: {_seps}"
+
+W("// modeling_qwen4_exp.py:1150-1167  _short_conv ALONE, dense weight (the same\n")
+W("// kPleConv1dWeight above), dense input, at THREE dilations. The upstream\n")
+W("// method is executed unmodified; only its `nn.Conv1d` and the\n")
+W("// `short_conv_state_len` upstream derives from it are swapped, so the\n")
+W("// dilation is the ONLY variable. State width is (kernel - 1) * dilation:\n")
+W("// 3, 6 and 9 columns. Each was additionally checked to survive a\n")
+W("// prefill(7)+decode(1)+prefill(4) chunking through the cache.\n")
+W("// MEASURED pairwise max|difference| between the three answers: "
+  + ", ".join(f"d{a} vs d{b} {v:.6g}" for (a, b), v in _seps.items()) + ".\n")
+W("// A fixture whose dilations agreed would gate nothing; these do not.\n")
+W(f"static const int64_t kConvSeqLen = {CONV_LEN};\n")
+W("static const int64_t kConvChunks[%d] = {%s};\n"
+  % (len(CONV_SPLIT), ", ".join(f"{c}LL" for c in CONV_SPLIT)))
+W("static const int64_t kConvDilations[%d] = {%s};\n"
+  % (len(CONV_DILATIONS), ", ".join(f"{d}LL" for d in CONV_DILATIONS)))
+dump_tensor("kConvInput", conv_in)
+for _dil in CONV_DILATIONS:
+    dump_tensor(f"kConvExpectedD{_dil}", conv_out[_dil])
+W("\n")
+
 OUT_PATH.write_text(OUT.getvalue())
 print(f"wrote {OUT_PATH} ({len(OUT.getvalue().splitlines())} lines) from transformers {TAG}")
 print(f"layer_multipliers at the real config: {real_mults}")

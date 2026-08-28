@@ -1881,6 +1881,76 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
       q, out, x, weight, bias, conv_state, conv_state_indices, args);
 }
 
+void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     Tensor& conv_state, const Tensor& query_start_loc,
+                     const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args) {
+  constexpr const char* name = "qwen4_exp_ple_conv";
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 2 && conv_state.rank == 3,
+           std::string(name) +
+               ": x/out [T,C], weight [C,K], conv_state [N,C,(K-1)*dilation]");
+  const int64_t T = x.shape[0], c = x.shape[1], k = weight.shape[1];
+  VT_CHECK(out.shape[0] == T && out.shape[1] == c,
+           std::string(name) + ": out shape must match x");
+  VT_CHECK(weight.shape[0] == c, std::string(name) + ": weight channel dim mismatch");
+  VT_CHECK(k >= 2, std::string(name) + ": kernel width must be >= 2");
+  VT_CHECK(args.dilation >= 1,
+           std::string(name) + ": dilation must be >= 1, got " +
+               std::to_string(args.dilation));
+  // THE ONE CHECK THIS OP EXISTS FOR. `CausalConv1dFwd` welds the state width to
+  // `K - 1`; here it is `(K - 1) * dilation`, and the two agree only at
+  // dilation 1. A caller that sized its cache with the Mamba formula and then
+  // asked for dilation 3 gets a message naming both numbers, rather than a
+  // plausible answer computed off nine columns of which six are somebody else's.
+  const int64_t want_state = (k - 1) * args.dilation;
+  VT_CHECK(conv_state.shape[1] == c && conv_state.shape[2] == want_state,
+           std::string(name) + ": conv_state must be [N,C,(K-1)*dilation] = [N," +
+               std::to_string(c) + "," + std::to_string(want_state) + "], got [N," +
+               std::to_string(conv_state.shape[1]) + "," +
+               std::to_string(conv_state.shape[2]) + "]");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float x/weight, f32/bf16 out");
+  // f32 state ONLY. `CausalConv1dSpecUpdate` admits bf16 on CUDA because a CUDA
+  // kernel there writes it; no CUDA arm of this op exists, so admitting a dtype
+  // nothing can produce would be a promise with no kernel behind it.
+  VT_CHECK(conv_state.dtype == DType::kF32,
+           std::string(name) + ": conv_state must be f32");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
+               conv_state.IsContiguous(),
+           std::string(name) + ": x/out/weight/conv_state must be contiguous");
+  VT_CHECK(x.device == q.device && out.device == q.device && weight.device == q.device &&
+               conv_state.device == q.device,
+           std::string(name) + ": device mismatch (x/out/weight/conv_state/queue)");
+  VT_CHECK(query_start_loc.rank == 1 && query_start_loc.shape[0] >= 2,
+           std::string(name) + ": query_start_loc must be i32 [num_seqs + 1]");
+  const int64_t n_seqs = query_start_loc.shape[0] - 1;
+  CheckI32Meta(q, query_start_loc, n_seqs + 1, name, "query_start_loc");
+  if (conv_state_indices != nullptr) {
+    CheckI32Meta(q, *conv_state_indices, n_seqs, name, "conv_state_indices");
+  } else {
+    VT_CHECK(conv_state.shape[0] >= n_seqs,
+             std::string(name) +
+                 ": without conv_state_indices the cache needs one row per sequence");
+  }
+  if (q.device.type == DeviceType::kCPU) {
+    const int32_t* qsl = query_start_loc.Ptr<int32_t>();
+    VT_CHECK(qsl[0] == 0 && qsl[n_seqs] == T,
+             std::string(name) + ": query_start_loc must run from 0 to T");
+    for (int64_t i = 0; i < n_seqs; ++i) {
+      VT_CHECK(qsl[i + 1] >= qsl[i],
+               std::string(name) + ": query_start_loc must be non-decreasing");
+    }
+    if (conv_state_indices != nullptr) {
+      const int32_t* rows = conv_state_indices->Ptr<int32_t>();
+      for (int64_t i = 0; i < n_seqs; ++i) {
+        VT_CHECK(rows[i] >= 0 && rows[i] < conv_state.shape[0],
+                 std::string(name) + ": conv_state_indices out of range");
+      }
+    }
+  }
+  reinterpret_cast<Qwen4ExpPleConvFn>(GetOp(OpId::kQwen4ExpPleConv, q.device.type))(
+      q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
+}
+
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                             const Tensor* bias, Tensor& conv_state,
                             const Tensor& conv_state_indices,
@@ -2415,6 +2485,127 @@ void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block
   reinterpret_cast<Qwen4ExpGatedResidualWriteBackFn>(
       GetOp(OpId::kQwen4ExpGatedResidualWriteBack, q.device.type))(q, hyper, block_out,
                                                                   injection, args);
+}
+
+namespace {
+
+// The operand checks both QSA ops share. Split out for the same reason the
+// gated-residual pair shares one: two entry points that disagree about what
+// "contiguous, float, on this queue" means is how a caller silently reads
+// somebody else's device memory.
+void CheckQsaOperand(const Queue& q, const Tensor& t, const char* name, const char* what,
+                     bool is_out) {
+  VT_CHECK(IsFloat(t.dtype) && (!is_out || IsOutFloat(t.dtype)),
+           std::string(name) + ": " + what + " must be float (f32/bf16 for outputs)");
+  VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+  VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
+}
+
+}  // namespace
+
+void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
+                         const Tensor& k_norm_weight, const Tensor& cos, const Tensor& sin,
+                         const Qwen4ExpQsaCompressArgs& args) {
+  constexpr const char* name = "qwen4_exp_qsa_compress";
+  VT_CHECK(args.compress_ratio > 1,
+           std::string(name) +
+               ": compress_ratio must be > 1 (a ratio of 1 stores one state per token and "
+               "is not a compressor), got " +
+               std::to_string(args.compress_ratio));
+  VT_CHECK(args.eps > 0.0f, std::string(name) + ": eps must be > 0");
+  VT_CHECK(raw_keys.rank == 2 && k_norm_weight.rank == 1 && block_keys.rank == 2,
+           std::string(name) + ": raw_keys/block_keys must be 2-D and k_norm_weight 1-D");
+  const int64_t num_keys = raw_keys.shape[0];
+  const int64_t D = raw_keys.shape[1];
+  // configuration_qwen4_exp.py:225-231 — `rotary_dim = int(head_dim *
+  // partial_rotary_factor)` must FIT the index head, and `rotate_half` needs an
+  // even span. Both are refused here rather than at the read.
+  VT_CHECK(args.rotary_dim >= 0 && args.rotary_dim <= D,
+           std::string(name) + ": rotary_dim must fit the index head dim, got " +
+               std::to_string(args.rotary_dim) + " for head dim " + std::to_string(D));
+  VT_CHECK(args.rotary_dim % 2 == 0,
+           std::string(name) + ": rotary_dim must be even (rotate_half), got " +
+               std::to_string(args.rotary_dim));
+  // The compressor early-exits unless `(position + 1) % compress_ratio == 0`
+  // (compressor_utils.py:52), so a partial block writes NO state. A caller that
+  // handed one in has confused the ragged tail — which is attended from the raw
+  // KV — with a block, and would silently pool across the end of its own
+  // sequence.
+  VT_CHECK(num_keys % args.compress_ratio == 0,
+           std::string(name) +
+               ": raw_keys must be a whole number of COMPLETE blocks; the ragged tail is "
+               "attended from the raw KV and writes no state. Got " +
+               std::to_string(num_keys) + " keys at compress_ratio " +
+               std::to_string(args.compress_ratio));
+  const int64_t nb = num_keys / args.compress_ratio;
+  VT_CHECK(block_keys.shape[0] == nb && block_keys.shape[1] == D,
+           std::string(name) + ": block_keys must be [num_keys / compress_ratio, head_dim]");
+  VT_CHECK(k_norm_weight.shape[0] == D,
+           std::string(name) + ": k_layernorm weight must be [head_dim]");
+  VT_CHECK(cos.rank == 2 && sin.rank == 2 && cos.shape[1] == args.rotary_dim &&
+               sin.shape[1] == args.rotary_dim,
+           std::string(name) + ": cos/sin must be [positions, rotary_dim]");
+  // The tables are indexed at the BLOCK-START position `compress_ratio * b`, so
+  // they have to cover every key position the caller handed in, not just nb rows.
+  VT_CHECK(cos.shape[0] >= num_keys && sin.shape[0] >= num_keys,
+           std::string(name) +
+               ": cos/sin must cover every key position (the rope reads row "
+               "compress_ratio * b)");
+  CheckQsaOperand(q, raw_keys, name, "raw_keys", false);
+  CheckQsaOperand(q, k_norm_weight, name, "k_layernorm weight", false);
+  CheckQsaOperand(q, cos, name, "cos", false);
+  CheckQsaOperand(q, sin, name, "sin", false);
+  CheckQsaOperand(q, block_keys, name, "block_keys", true);
+  VT_CHECK(cos.dtype == DType::kF32 && sin.dtype == DType::kF32,
+           std::string(name) + ": cos/sin must be f32");
+  reinterpret_cast<Qwen4ExpQsaCompressFn>(
+      GetOp(OpId::kQwen4ExpQsaCompress, q.device.type))(q, block_keys, raw_keys,
+                                                        k_norm_weight, cos, sin, args);
+}
+
+void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                                const Tensor& value, const Tensor& block_ids,
+                                const Tensor& kv_lens, const Qwen4ExpQsaAttnArgs& args) {
+  constexpr const char* name = "qwen4_exp_qsa_gather_attention";
+  VT_CHECK(args.scale > 0.0f,
+           std::string(name) + ": scale must be set explicitly (> 0), the head_dim^-0.5 of "
+                               "the MODEL's attention head, not the indexer's");
+  VT_CHECK(args.compress_ratio > 1,
+           std::string(name) + ": compress_ratio must be > 1, got " +
+               std::to_string(args.compress_ratio));
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           std::string(name) + ": query/key/value/out must be [tokens, heads, head_dim]");
+  const int64_t T = query.shape[0];
+  const int64_t HQ = query.shape[1];
+  const int64_t DH = query.shape[2];
+  const int64_t HKV = key.shape[1];
+  VT_CHECK(HQ > 0 && HKV > 0 && DH > 0, std::string(name) + ": bad attention shape");
+  VT_CHECK(HQ % HKV == 0,
+           std::string(name) + ": GQA needs num_q_heads divisible by num_kv_heads, got " +
+               std::to_string(HQ) + " over " + std::to_string(HKV));
+  VT_CHECK(key.shape[0] == value.shape[0] && value.shape[1] == HKV && key.shape[2] == DH &&
+               value.shape[2] == DH,
+           std::string(name) + ": key/value must be [max_kv, num_kv_heads, head_dim]");
+  VT_CHECK(out.shape[0] == T && out.shape[1] == HQ && out.shape[2] == DH,
+           std::string(name) + ": out must match query's shape");
+  VT_CHECK(block_ids.rank == 2 && block_ids.shape[0] == T,
+           std::string(name) + ": block_ids must be [tokens, block_topk]");
+  VT_CHECK(block_ids.dtype == DType::kI32,
+           std::string(name) + ": block_ids must be i32 (vt::DsaTopkSelect's output)");
+  VT_CHECK(kv_lens.rank == 1 && kv_lens.shape[0] == T,
+           std::string(name) + ": kv_lens must be [tokens]");
+  VT_CHECK(kv_lens.dtype == DType::kI32, std::string(name) + ": kv_lens must be i32");
+  CheckQsaOperand(q, query, name, "query", false);
+  CheckQsaOperand(q, key, name, "key", false);
+  CheckQsaOperand(q, value, name, "value", false);
+  CheckQsaOperand(q, out, name, "out", true);
+  VT_CHECK(block_ids.IsContiguous() && kv_lens.IsContiguous(),
+           std::string(name) + ": block_ids/kv_lens must be contiguous");
+  VT_CHECK(block_ids.device == q.device && kv_lens.device == q.device,
+           std::string(name) + ": block_ids/kv_lens device mismatch");
+  reinterpret_cast<Qwen4ExpQsaGatherAttentionFn>(
+      GetOp(OpId::kQwen4ExpQsaGatherAttention, q.device.type))(q, out, query, key, value,
+                                                               block_ids, kv_lens, args);
 }
 
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
@@ -4463,6 +4654,27 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in) {
   VT_CHECK(out.device == q.device && in.device == q.device,
            "cast_bf16: device mismatch (out/in/queue)");
   reinterpret_cast<CastBf16Fn>(GetOp(OpId::kCastBf16, q.device.type))(q, out, in);
+}
+
+void CastF16(Queue& q, Tensor& out, const Tensor& in) {
+  VT_CHECK(out.dtype == DType::kF16, "cast_f16: out must be f16");
+  VT_CHECK(in.dtype == DType::kF32 || in.dtype == DType::kBF16,
+           "cast_f16: in must be f32 or bf16 (an f16 source is refused rather than copied)");
+  VT_CHECK(out.Numel() == in.Numel(), "cast_f16: out/in must have the same element count");
+  // Same packed-view tolerance as CastBf16: each logical row is dense while the
+  // row stride may span a parent tensor (the merged-QKV shape).
+  int64_t inner = 1;
+  bool inner_contiguous = true;
+  for (int dim = in.rank - 1; dim >= 1; --dim) {
+    inner_contiguous = inner_contiguous && in.stride[dim] == inner;
+    inner *= in.shape[dim];
+  }
+  inner_contiguous = inner_contiguous && in.rank >= 1 && in.stride[0] >= inner;
+  VT_CHECK(out.IsContiguous() && inner_contiguous,
+           "cast_f16: out must be contiguous and input rows inner-contiguous");
+  VT_CHECK(out.device == q.device && in.device == q.device,
+           "cast_f16: device mismatch (out/in/queue)");
+  reinterpret_cast<CastF16Fn>(GetOp(OpId::kCastF16, q.device.type))(q, out, in);
 }
 
 void CastF32(Queue& q, Tensor& out, const Tensor& in) {

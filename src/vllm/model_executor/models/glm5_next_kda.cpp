@@ -7,7 +7,8 @@
 #include <algorithm>  // std::copy
 #include <cmath>
 #include <stdexcept>
-#include <utility>    // std::move
+#include <string>    // std::to_string
+#include <utility>   // std::move
 
 #include "vt/dtype.h"  // VT_CHECK, F32ToBF16, BF16ToF32
 
@@ -91,9 +92,18 @@ std::vector<float> Glm5NextForgetGate(
            "glm5_next kda: forget-gate g1 size mismatch");
   VT_CHECK(static_cast<int64_t>(a_log.size()) == num_heads,
            "glm5_next kda: forget-gate A_log size mismatch");
-  const bool has_bias = !dt_bias.empty();
-  VT_CHECK(!has_bias || static_cast<int64_t>(dt_bias.size()) == hd,
-           "glm5_next kda: forget-gate dt_bias size mismatch");
+  // `self.dt_bias = nn.Parameter(torch.empty(self.qkv_dim))` (:384) is
+  // UNCONDITIONAL and :393 always adds it, so this model has no biasless mode
+  // to mirror. An absent or misshaped tensor is refused by name rather than
+  // treated as a zero bias: silently ignoring the field and adding nothing
+  // computes a DIFFERENT gate that stays finite and plausible, which is the
+  // same failure the non-`silu` `hidden_act` refusal below exists to prevent.
+  VT_CHECK(static_cast<int64_t>(dt_bias.size()) == hd,
+           "glm5_next kda: the forget gate needs a dt_bias of "
+           "num_heads*head_dim = " + std::to_string(hd) + ", and got " +
+               std::to_string(dt_bias.size()) +
+               " (modular_glm5_next.py:384 declares `dt_bias` unconditionally "
+               "and :393 always adds it, so there is no biasless mode)");
   // Upstream multiplies by `self.safe_gate_lower_bound` unnegated (:399), so a
   // non-negative bound yields a non-negative LOG-decay and the recurrent state
   // grows without bound. `ParseGlm5NextParams` refuses that at config time; a
@@ -117,7 +127,7 @@ std::vector<float> Glm5NextForgetGate(
       float* y_t = &y[t * hd + h * head_dim];
       for (int64_t d = 0; d < head_dim; ++d) {
         double g = g_t[d];
-        if (has_bias) g += dt_bias[h * head_dim + d];
+        g += dt_bias[h * head_dim + d];
         const double out = safe_gate_lower_bound.has_value()
                                ? *safe_gate_lower_bound * Sigmoid(decay_rate * g)
                                : -decay_rate * Softplus20(g);

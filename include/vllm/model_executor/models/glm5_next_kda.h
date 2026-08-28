@@ -104,7 +104,7 @@ namespace vllm::glm5_next_kda {
 // value. Per (token, head h, channel d), with `g1` the low-rank projection
 // `f_b_proj(f_a_proj(x))`:
 //
-//     g          = g1[t, h, d] + dt_bias[h*D + d]        (dt_bias optional)
+//     g          = g1[t, h, d] + dt_bias[h*D + d]        (:393, always added)
 //     decay_rate = exp(A_log[h])                          (POSITIVE, per head)
 //     bound present : out = bound * sigmoid(decay_rate * g)
 //     bound absent  : out = -decay_rate * softplus20(g)
@@ -126,7 +126,7 @@ namespace vllm::glm5_next_kda {
 //
 //   g1      : [num_tokens, num_heads*head_dim]   row-major
 //   a_log   : [num_heads]                        row-major
-//   dt_bias : [num_heads*head_dim] or empty      row-major
+//   dt_bias : [num_heads*head_dim]               row-major, REQUIRED (:384)
 // Returns  : [num_tokens, num_heads, head_dim]   row-major
 std::vector<float> Glm5NextForgetGate(
     const std::vector<float>& g1, const std::vector<float>& a_log,

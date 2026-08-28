@@ -69,12 +69,15 @@ std::vector<float> Rand(size_t n, uint32_t seed, float lo = -1.0f, float hi = 1.
 // ═══ (1) THE FORGET GATE — the sigmoid branch ════════════════════════════════
 
 TEST_CASE("glm5_next kda: the forget gate is the SIGMOID branch") {
-  // H=1, D=2, A_log=[0] -> decay_rate = exp(0) = 1. dt_bias absent.
+  // H=1, D=2, A_log=[0] -> decay_rate = exp(0) = 1. dt_bias is ZERO, and it
+  // is PASSED: upstream declares it unconditionally (:384) and always adds it
+  // (:393), so there is no biasless mode to exercise.
   // g1 = [0, ln 3]:  sigmoid(1*0) = 1/2 -> -5.0 * 1/2 = -2.5
   //                  sigmoid(1*ln 3) = 3/4 -> -5.0 * 3/4 = -3.75
   const std::vector<float> g1 = {0.0f, static_cast<float>(std::log(3.0))};
   const std::vector<float> a_log = {0.0f};
-  const std::vector<float> y = Glm5NextForgetGate(g1, a_log, {}, 1, 1, 2, -5.0);
+  const std::vector<float> y =
+      Glm5NextForgetGate(g1, a_log, {0.0f, 0.0f}, 1, 1, 2, -5.0);
   REQUIRE(y.size() == 2);
   CHECK(y[0] == doctest::Approx(-2.5));
   CHECK(y[1] == doctest::Approx(-3.75));
@@ -85,15 +88,18 @@ TEST_CASE("glm5_next kda: the gate CANNOT leave [bound, 0]") {
   // floored at the bound, so no single step can annihilate the state. The
   // softplus branch has no such floor and returns -100 for g1 = 100.
   const std::vector<float> a_log = {0.0f};
-  const std::vector<float> hi = Glm5NextForgetGate({10.0f}, a_log, {}, 1, 1, 1, -5.0);
-  const std::vector<float> lo = Glm5NextForgetGate({-10.0f}, a_log, {}, 1, 1, 1, -5.0);
+  const std::vector<float> hi =
+      Glm5NextForgetGate({10.0f}, a_log, {0.0f}, 1, 1, 1, -5.0);
+  const std::vector<float> lo =
+      Glm5NextForgetGate({-10.0f}, a_log, {0.0f}, 1, 1, 1, -5.0);
   CHECK(hi[0] > -5.0f);
   CHECK(hi[0] == doctest::Approx(-5.0).epsilon(1e-4));
   CHECK(lo[0] < 0.0f);
   CHECK(lo[0] == doctest::Approx(-5.0 / (1.0 + std::exp(10.0))));
   // Saturated in f32, the bound is REACHED and never passed. The softplus
   // branch's answer for the same input is -100.
-  const std::vector<float> sat = Glm5NextForgetGate({100.0f}, a_log, {}, 1, 1, 1, -5.0);
+  const std::vector<float> sat =
+      Glm5NextForgetGate({100.0f}, a_log, {0.0f}, 1, 1, 1, -5.0);
   CHECK(sat[0] == -5.0f);
   CHECK(vllm::kimi_kda::KdaDecayGate({100.0f}, a_log, {}, 1, 1, 1)[0] ==
         doctest::Approx(-100.0));
@@ -106,7 +112,8 @@ TEST_CASE("glm5_next kda: decay_rate is POSITIVE inside the sigmoid") {
   // softplus branch uses (:405) — gives sigmoid(+10) and -4.99977, four orders
   // of magnitude away, with no NaN anywhere to reveal it.
   const std::vector<float> a_log = {static_cast<float>(std::log(10.0))};
-  const std::vector<float> y = Glm5NextForgetGate({-1.0f}, a_log, {}, 1, 1, 1, -5.0);
+  const std::vector<float> y =
+      Glm5NextForgetGate({-1.0f}, a_log, {0.0f}, 1, 1, 1, -5.0);
   CHECK(y[0] == doctest::Approx(-5.0 / (1.0 + std::exp(10.0))));
   CHECK(y[0] != doctest::Approx(-5.0 / (1.0 + std::exp(-10.0))));
 }
@@ -134,13 +141,14 @@ TEST_CASE("glm5_next kda: an absent bound mirrors upstream's softplus fallback")
   // * where(g > 20, g, log1p(exp(g))).
   const std::vector<float> a_log0 = {0.0f};
   const std::vector<float> y =
-      Glm5NextForgetGate({0.0f, 100.0f}, a_log0, {}, 1, 1, 2, std::nullopt);
+      Glm5NextForgetGate({0.0f, 100.0f}, a_log0, {0.0f, 0.0f}, 1, 1, 2,
+                         std::nullopt);
   REQUIRE(y.size() == 2);
   CHECK(y[0] == doctest::Approx(-std::log(2.0)));
   CHECK(y[1] == doctest::Approx(-100.0));  // linearised above the 20.0 literal
   const std::vector<float> a_log2 = {static_cast<float>(std::log(2.0))};
   const std::vector<float> y2 =
-      Glm5NextForgetGate({0.0f}, a_log2, {}, 1, 1, 1, std::nullopt);
+      Glm5NextForgetGate({0.0f}, a_log2, {0.0f}, 1, 1, 1, std::nullopt);
   CHECK(y2[0] == doctest::Approx(-2.0 * std::log(2.0)));
 }
 
@@ -200,10 +208,39 @@ TEST_CASE("glm5_next kda: forget gate vs an independent double reference") {
   CHECK(RelL2(Glm5NextForgetGate(g1, a_log, dt, T, H, D, -5.0), ref) < 1e-6);
 }
 
+TEST_CASE("glm5_next kda: a missing or misshaped dt_bias is refused by name") {
+  // `self.dt_bias = nn.Parameter(torch.empty(self.qkv_dim))` (:384) is
+  // unconditional and :393 always adds it, so this model has no biasless mode.
+  // Treating an empty vector as "no bias" would silently compute a DIFFERENT
+  // gate from a checkpoint whose tensor failed to load, and the values stay
+  // finite and plausible, so nothing downstream would report it.
+  for (const std::vector<float>& bad :
+       {std::vector<float>{}, std::vector<float>{0.1f}}) {  // absent, then short
+    bool threw = false;
+    try {
+      Glm5NextForgetGate({0.2f, 0.3f}, {0.0f}, bad, 1, 1, 2, -5.0);
+    } catch (const std::exception& e) {
+      threw = true;
+      CHECK(std::string(e.what()).find("dt_bias") != std::string::npos);
+    }
+    CHECK(threw);
+  }
+  // And the correctly sized one is accepted and USED: the same g1 with a zero
+  // bias and with a 0.1 bias are different answers, which is what makes the
+  // refusal worth having.
+  const std::vector<float> zero =
+      Glm5NextForgetGate({0.2f, 0.3f}, {0.0f}, {0.0f, 0.0f}, 1, 1, 2, -5.0);
+  const std::vector<float> biased =
+      Glm5NextForgetGate({0.2f, 0.3f}, {0.0f}, {0.1f, 0.1f}, 1, 1, 2, -5.0);
+  REQUIRE(zero.size() == 2);
+  CHECK(zero[0] != doctest::Approx(biased[0]));
+  CHECK(biased[0] == doctest::Approx(-5.0 * Sig(0.3)));
+}
+
 TEST_CASE("glm5_next kda: a non-negative gate bound is refused by name") {
   bool threw = false;
   try {
-    Glm5NextForgetGate({0.0f}, {0.0f}, {}, 1, 1, 1, 5.0);
+    Glm5NextForgetGate({0.0f}, {0.0f}, {0.0f}, 1, 1, 1, 5.0);
   } catch (const std::exception& e) {
     threw = true;
     CHECK(std::string(e.what()).find("gate_lower_bound") != std::string::npos);
@@ -430,6 +467,14 @@ TinyLayer MakeTiny(int64_t T, uint32_t seed) {
   return L;
 }
 
+// Which order the checkpoint's three separate depthwise conv weights are
+// concatenated into the reference's ONE grouped conv. The mixed stream is
+// ALWAYS [q; k; v] (:655-661), so anything but kQKV pairs a channel block with
+// another projection's filter — which is the mistake. Note that this is not the
+// same experiment as swapping two of the layer's own weight TENSORS: that moves
+// the answer under any fixed concat order and so gates nothing.
+enum class ConvWeightOrder { kQKV, kQVK, kKQV };
+
 // A from-first-principles double reference that mirrors
 // `Glm5NextTextLinearAttention.forward` (:641-746) and
 // `recurrent_kimi_delta_attention` (:441-491) in THEIR line order and THEIR
@@ -439,7 +484,8 @@ TinyLayer MakeTiny(int64_t T, uint32_t seed) {
 // `gate_source` selects where g, beta and the output gate read from: `true`
 // mirrors upstream (the PRE-conv hidden states) and `false` is the plausible
 // fusion mistake, present so the test can prove it would be visible.
-std::vector<double> TinyRef(const TinyLayer& L, int64_t T, bool gate_from_pre_conv) {
+std::vector<double> TinyRef(const TinyLayer& L, int64_t T, bool gate_from_pre_conv,
+                            ConvWeightOrder cw_order = ConvWeightOrder::kQKV) {
   const int64_t H = L.dims.hidden_size, nh = L.dims.num_heads, hd = L.dims.head_dim;
   const int64_t proj = nh * hd, K = L.dims.conv_kernel_size, C = 3 * proj;
   const auto& w = L.w;
@@ -471,10 +517,16 @@ std::vector<double> TinyRef(const TinyLayer& L, int64_t T, bool gate_from_pre_co
     }
 
   // one grouped depthwise causal conv, silu                     (:621-628,:687)
+  const std::vector<float>* cwo[3] = {&w.q_conv1d, &w.k_conv1d, &w.v_conv1d};
+  if (cw_order == ConvWeightOrder::kQVK) {
+    cwo[1] = &w.v_conv1d;
+    cwo[2] = &w.k_conv1d;
+  } else if (cw_order == ConvWeightOrder::kKQV) {
+    cwo[0] = &w.k_conv1d;
+    cwo[1] = &w.q_conv1d;
+  }
   std::vector<float> cw;
-  cw.insert(cw.end(), w.q_conv1d.begin(), w.q_conv1d.end());
-  cw.insert(cw.end(), w.k_conv1d.begin(), w.k_conv1d.end());
-  cw.insert(cw.end(), w.v_conv1d.begin(), w.v_conv1d.end());
+  for (const std::vector<float>* c : cwo) cw.insert(cw.end(), c->begin(), c->end());
   std::vector<double> conv(static_cast<size_t>(T) * C, 0.0);
   for (int64_t t = 0; t < T; ++t)
     for (int64_t c = 0; c < C; ++c) {
@@ -616,15 +668,25 @@ TEST_CASE("glm5_next kda: g, beta and the output gate read the PRE-CONV states")
 }
 
 TEST_CASE("glm5_next kda: q/k/v conv order is load-bearing in the layer") {
+  // The guard for layout fact 1, and it has to be a reference built with the
+  // WRONG pairing. Swapping two of the layer's own conv weights and watching
+  // the answer move proves nothing: it moves under ANY fixed concat order, so
+  // that experiment stays green under the very mutation it claims to catch.
+  // What discriminates is a [q; k; v] stream convolved with [q_w; v_w; k_w]:
+  // reorder the implementation's concat and `got` LEAVES the kQKV reference
+  // and JOINS the reordered one, so the first check and one of the other two
+  // both red.
   const int64_t T = 6;
-  TinyLayer L = MakeTiny(T, 909);
+  const TinyLayer L = MakeTiny(T, 909);
   vt::Queue q = CpuQ();
   const std::vector<float> got =
       Glm5NextKdaLayerForward(L.w, L.x, L.dims, T, nullptr, q);
-  std::swap(L.w.q_conv1d, L.w.k_conv1d);  // the k, q, v ordering mistake
-  const std::vector<float> swapped =
-      Glm5NextKdaLayerForward(L.w, L.x, L.dims, T, nullptr, q);
-  CHECK(RelL2F(swapped, got) > 1e-2);
+  CHECK(RelL2(got, TinyRef(L, T, /*gate_from_pre_conv=*/true,
+                           ConvWeightOrder::kQKV)) < 1e-5);
+  CHECK(RelL2(got, TinyRef(L, T, /*gate_from_pre_conv=*/true,
+                           ConvWeightOrder::kQVK)) > 1e-2);
+  CHECK(RelL2(got, TinyRef(L, T, /*gate_from_pre_conv=*/true,
+                           ConvWeightOrder::kKQV)) > 1e-2);
 }
 
 TEST_CASE("glm5_next kda: the cache carries conv AND recurrent state across steps") {

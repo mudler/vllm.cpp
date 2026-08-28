@@ -1496,7 +1496,13 @@ W2 ([#2097](https://github.com/mudler/vllm.cpp/issues/2097),
 SIGMOID branch, the strict-fp32 `RMSNormGated`, `l2norm`, the checkpoint's three
 depthwise convs concatenated into the reference's one grouped conv, and the
 assembled host layer on the `vt::KdaGatedDeltaRule` seam — gated RED-first
-against `kimi_kda.cpp:60`'s softplus branch. That code is **not reached** from
+against `kimi_kda.cpp:60`'s softplus branch. The fresh review found two
+defects and both are repaired on this branch: the conv-order case swapped two
+weight TENSORS and so moved under any fixed concat order — it is now gated
+against references built with the wrong PAIRING, and it reds under a q,v,k and
+under a k,q,v mutation — and `dt_bias` was optional, which upstream has no
+mode for (`:384` declares it unconditionally, `:393` always adds it), so an
+absent or misshaped tensor is now refused by name. That code is **not reached** from
 any production entry point (O15) and `vt::KdaChunkPrefill` cannot serve this
 model (O14). W0 has since landed the lane pin on `main`, so the next actions
 are W3 and W4, and, whenever the developer grants a large-asset download, W7b.

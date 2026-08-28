@@ -31,8 +31,15 @@
 #include <string>
 #include <vector>
 
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/model_executor/models/llama.h"
+#include "vllm/transformers_utils/hf_config.h"
+#include "vllm/models/dsv4_exl3_fixture.h"  // WriteSafetensors/StEntry, reused
 
 namespace {
 
@@ -145,4 +152,124 @@ TEST_CASE("exl3 native loader: a transposed sign vector REFUSES BY NAME") {
   }
   INFO("refusal: " << what);
   CHECK(what.find("suh") != std::string::npos);
+}
+
+// ── the loader, driven from an actual file ──────────────────────────────────
+//
+// Everything above exercises `LoadExl3` through a hand-built resolver. This
+// case goes through `LoadLlamaForCausalLMWeights`, which is the production
+// entry point, and it exists for one thing the resolver cases cannot reach:
+// `LoadF16AsBf16Direct`, the F16 -> BF16 widening applied to the UNQUANTIZED
+// remainder of an EXL3 checkpoint — the layernorms, the final norm and the
+// whole embedding table.
+//
+// A fresh review replaced that conversion with a bare bit-copy — reinterpreting
+// every F16 pattern as BF16, corrupting every norm and the embedding table —
+// and the entire declared gate stayed GREEN. Nothing executed the function.
+namespace {
+
+std::vector<uint8_t> F16Bytes(const std::vector<float>& v) {
+  std::vector<uint8_t> b(v.size() * 2);
+  auto* p = reinterpret_cast<uint16_t*>(b.data());
+  for (size_t i = 0; i < v.size(); ++i) p[i] = vt::F32ToF16(v[i]);
+  return b;
+}
+
+std::vector<uint8_t> TrellisBytes(int64_t k, int64_t n, int bits, uint32_t seed) {
+  std::vector<uint8_t> b(static_cast<size_t>(k / 16) * (n / 16) * 16 * bits * 2);
+  uint32_t s = seed | 1u;
+  for (auto& x : b) {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+    x = static_cast<uint8_t>(s & 0xffu);
+  }
+  return b;
+}
+
+}  // namespace
+
+TEST_CASE("exl3 native loader: the F16 remainder is CONVERTED to bf16, not reinterpreted") {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "exl3_native_loader_fixture";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  const int64_t H = 128, I = 128, V = 128, Hq = 4, Hkv = 2, Dh = 64;
+  const int64_t qdim = Hq * Dh, kvdim = Hkv * Dh;
+
+  // Values chosen so a REINTERPRET is visibly wrong: each survives F16 exactly,
+  // and its F16 bit pattern read as BF16 is a different number.
+  const std::vector<float> norm_vals = [&] {
+    std::vector<float> v(static_cast<size_t>(H));
+    for (size_t i = 0; i < v.size(); ++i) v[i] = 0.5f + 0.015625f * static_cast<float>(i % 32);
+    return v;
+  }();
+
+  std::vector<dsv4_exl3_fixture::StEntry> e;
+  const auto add_proj = [&](const std::string& p, int64_t k, int64_t n, uint32_t seed) {
+    e.push_back({p + ".trellis", "I16", {k / 16, n / 16, 48}, TrellisBytes(k, n, 3, seed)});
+    e.push_back({p + ".suh", "F16", {k}, F16Bytes(std::vector<float>(static_cast<size_t>(k), 1.0f))});
+    e.push_back({p + ".svh", "F16", {n}, F16Bytes(std::vector<float>(static_cast<size_t>(n), -1.0f))});
+  };
+  e.push_back({"model.embed_tokens.weight", "F16", {V, H},
+               F16Bytes(std::vector<float>(static_cast<size_t>(V * H), 0.25f))});
+  e.push_back({"model.norm.weight", "F16", {H}, F16Bytes(norm_vals)});
+  e.push_back({"model.layers.0.input_layernorm.weight", "F16", {H}, F16Bytes(norm_vals)});
+  e.push_back({"model.layers.0.post_attention_layernorm.weight", "F16", {H}, F16Bytes(norm_vals)});
+  add_proj("model.layers.0.self_attn.q_proj", H, qdim, 11);
+  add_proj("model.layers.0.self_attn.k_proj", H, kvdim, 12);
+  add_proj("model.layers.0.self_attn.v_proj", H, kvdim, 13);
+  add_proj("model.layers.0.self_attn.o_proj", qdim, H, 14);
+  add_proj("model.layers.0.mlp.gate_proj", H, I, 15);
+  add_proj("model.layers.0.mlp.up_proj", H, I, 16);
+  add_proj("model.layers.0.mlp.down_proj", I, H, 17);
+  add_proj("lm_head", H, V, 18);
+  const std::string st =
+      dsv4_exl3_fixture::WriteSafetensors(dir / "model.safetensors", e);
+
+  {
+    std::ofstream cfg(dir / "config.json");
+    cfg << R"({"architectures":["LlamaForCausalLM"],"model_type":"llama",)"
+        << R"("hidden_size":128,"num_hidden_layers":1,"num_attention_heads":4,)"
+        << R"("num_key_value_heads":2,"head_dim":64,"intermediate_size":128,)"
+        << R"("vocab_size":128,"rms_norm_eps":1e-5,"rope_theta":500000.0,)"
+        << R"("torch_dtype":"bfloat16","tie_word_embeddings":true,)"
+        << R"("quantization_config":{"quant_method":"exl3","bits":3.0}})";
+  }
+
+  const vllm::HfConfig config = vllm::LoadHfConfig((dir / "config.json").string());
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(st));
+  const vllm::LlamaWeights w = vllm::LoadLlamaForCausalLMWeights(shards, config);
+
+  // The EXL3 arm was taken by the PRODUCTION loader, not by a hand-built struct.
+  REQUIRE(w.layers.size() == 1);
+  CHECK(w.layers[0].attn.IsExl3());
+  CHECK(w.layers[0].mlp.IsExl3());
+  CHECK_FALSE(w.lm_head_exl3.Empty());
+  // Absence of a marker means codebook 0, on the production path too.
+  CHECK(w.layers[0].attn.q_proj_exl3.codebook == 0);
+
+  // THE ASSERTION THIS CASE EXISTS FOR. Every value must be the bf16 ROUNDING
+  // of the F16 value, which is what a conversion produces and what a
+  // reinterpret cannot: reading the F16 pattern as BF16 changes the exponent
+  // field and yields a wildly different number.
+  REQUIRE(w.final_norm.dtype == vt::DType::kBF16);
+  REQUIRE(w.final_norm.bytes.size() == static_cast<size_t>(H) * 2);
+  const auto* got = reinterpret_cast<const uint16_t*>(w.final_norm.bytes.data());
+  int reinterpreted = 0;
+  for (int64_t i = 0; i < H; ++i) {
+    CHECK(got[i] == vt::F32ToBF16(vt::F16ToF32(vt::F32ToF16(norm_vals[i]))));
+    if (got[i] == vt::F32ToF16(norm_vals[i])) ++reinterpreted;
+  }
+  // Not vacuous: the two readings must actually DIFFER for these values, or the
+  // check above would pass on a bit-copy too.
+  CHECK(reinterpreted == 0);
+
+  // The embedding table takes the same path and is the largest thing that would
+  // be silently corrupted.
+  REQUIRE(w.embed_tokens.dtype == vt::DType::kBF16);
+  const auto* emb = reinterpret_cast<const uint16_t*>(w.embed_tokens.bytes.data());
+  CHECK(emb[0] == vt::F32ToBF16(0.25f));
+
+  fs::remove_all(dir);
 }

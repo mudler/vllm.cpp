@@ -477,9 +477,16 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   //    wide, tensor-core-efficient GEMM. Byte-affecting (near-tie-gated).
   //  - 3-SHARD (VT_QWEN3_QKV_MERGE=0): slice the owner's output rows and project
   //    each shard separately (the byte-identical baseline for the A/B).
-  DBuf q(d, adt, {T, qdim});
-  DBuf k(d, adt, {T, kdim});
-  DBuf v(d, adt, {T, kdim});
+  // The EXL3 arm PRODUCES q/k/v rather than filling them, so it declares them
+  // empty and move-assigns; every other arm needs them allocated up front.
+  // Allocating unconditionally cost three pooled blocks per attention block per
+  // step that were never read.
+  DBuf q, k, v;
+  if (!w.IsExl3()) {
+    q = DBuf(d, adt, {T, qdim});
+    k = DBuf(d, adt, {T, kdim});
+    v = DBuf(d, adt, {T, kdim});
+  }
   if (w.IsExl3()) {
     // QUANT-EXL3 (#2181). THREE projections, not one merged operand, because
     // that is how an EXL3 checkpoint stores them: the trellis is

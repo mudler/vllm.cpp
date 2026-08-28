@@ -150,11 +150,14 @@ LlamaWeights LoadLlamaForCausalLMWeights(
   // lm_head.weight is SKIPPED (mirrors vLLM skip_prefixes=["lm_head."]). Only the
   // untied case loads a standalone lm_head (Matmul-B [H, vocab]).
   if (exl3 && IsExl3Projection(has, "lm_head")) {
-    // The EXL3 head is a REAL quantized tensor and is NOT tied: this artifact
-    // sets `tie_word_embeddings: false` where the bf16 Llama-3.2-1B ties them,
-    // so the bf16 arm's `skip_prefixes(["lm_head."])` must not reach here. Its
-    // width is its own -- 6-bit against the body's 3 in the published 3.0bpw
-    // quant -- which the reader takes from the tensor.
+    // The EXL3 head is a REAL quantized tensor, and it is preferred over the
+    // tied embedding table EVEN THOUGH the artifact declares
+    // `tie_word_embeddings: true`. That is a deliberate divergence from the
+    // bf16 arm's reading of the same flag, argued at the field's declaration in
+    // `qwen3.h`: the publisher quantized a separate head at its own width, so
+    // the head is what it intends to be used. Its width is its own -- 6-bit
+    // against the body's 3 in the published 3.0bpw quant -- which the reader
+    // takes from the tensor and never from a config scalar.
     w.lm_head_exl3 = LoadExl3(get, has, "lm_head");
   } else if (!w.tie_word_embeddings) {
     w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
@@ -187,8 +190,7 @@ LlamaWeights LoadLlamaModelEmbeddingWeights(
   // The same two-layout probe the resolver below performs, so an EXL3 embedding
   // checkpoint is DETECTED the same way it would be RESOLVED. A probe that
   // checked only the prefixed name would answer "not EXL3" for a bare `*Model`
-  // layout and silently take the bf16 arm, which then refuses on a dtype rather
-  // than naming the real cause.
+  // layout and silently take the bf16 arm.
   const std::function<bool(const std::string&)> has =
       [&where](const std::string& name) {
         if (where.find(name) != where.end()) return true;
@@ -212,6 +214,17 @@ LlamaWeights LoadLlamaModelEmbeddingWeights(
   LlamaWeights w;
   w.tie_word_embeddings = true;  // no output layer on the pooling forward
   w.attention_bias = RawBool(config.raw, "attention_bias", false);
+
+  // QUANT-EXL3 (#2181): this arm has NOT been given the EXL3 reader that
+  // `LoadLlamaForCausalLMWeights` has, so an EXL3 embedding checkpoint would
+  // otherwise refuse further down on an F16 dtype and name a tensor rather than
+  // the cause. Refuse it here, where the cause is still in hand. Wiring the arm
+  // is a wave of its own: an embedding model has no lm_head and no forward to
+  // gate against, so it needs a different equivalence than the causal-LM arm.
+  VT_CHECK(!IsExl3Projection(has, "model.layers.0.self_attn.q_proj"),
+           "llama embedding: this checkpoint is EXL3-quantized, and the embedding "
+           "loader implements the bf16 arm only (QUANT-EXL3, #2181). The causal-LM "
+           "loader reads EXL3; this one does not.");
 
   w.embed_tokens = LoadBf16Direct(get, "model.embed_tokens.weight");
   w.final_norm = LoadBf16Direct(get, "model.norm.weight");

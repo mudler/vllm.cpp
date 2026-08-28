@@ -320,6 +320,14 @@ Stated here before code, per risk 1:
 - **`vt::CastF16` is registered on two backends where its siblings have six**
   (CPU and CUDA against CPU/CUDA/ROCm/Vulkan/Metal/Tenstorrent). Now REACHED, so
   this is no longer theoretical for a non-CUDA device build.
+- **The two codebook resolutions disagree BY CONSTRUCTION, and W4 owns it.**
+  `LoadExl3` reads tensor PRESENCE, which is what `LinearEXL3` does;
+  `deepseek_v4_weights.cpp` reads the config string
+  `quantization_config.codebook`, which is what the SparkInfer artifact happens
+  to declare. Both are correct for their own artifact and neither generalizes:
+  a stock checkpoint has no such config key, and a rank-sliced one may ship a
+  marker its config does not name. Reconciling them onto presence is part of
+  routing DeepSeek-V4 through this seam.
 - **No speed number.** The e2e run is 0.040 tok/s on a CPU queue at batch 1.
   That is a functional result and is not offered as a performance one.
 - **`vt::CastF16` is registered on TWO backends where its siblings have SIX.**

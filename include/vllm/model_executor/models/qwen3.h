@@ -145,8 +145,6 @@ struct Qwen3DenseWeights {
   // the device arm is W3.
   Exl3Weight lm_head_exl3;   // [K=H, N=vocab]
 
-  bool IsExl3() const { return !lm_head_exl3.Empty() || (!layers.empty() && layers[0].mlp.IsExl3()); }
-
   std::vector<Qwen3DenseLayerWeights> layers;
 };
 

@@ -50,6 +50,11 @@ namespace layers = vllm::layers;
 // The fixture's three arrays, wrapped as the OwnedTensors a loader would fill.
 vllm::Exl3Weight WrapFixture(const Exl3Fixture& f) {
   vllm::Exl3Weight w;
+  // EXPLICIT: the struct no longer defaults, because an implicit codebook is
+  // what shipped a wrong decode. These fixtures are random bytes, so any
+  // codebook is self-consistent; cb 1 is what the synthetic suites have always
+  // used and `test_exl3_real_decode` is what gates the arithmetic.
+  w.codebook = 1;
   const auto bytes_of = [](const std::vector<uint16_t>& v) {
     return vllm::OwnedBytes(std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(v.data()),

@@ -512,7 +512,12 @@ struct Exl3Weight {
   OwnedTensor trellis;
   OwnedTensor suh;   // F16 [k]  input-side Hadamard sign vector
   OwnedTensor svh;   // F16 [n]  output-side Hadamard sign vector
-  int codebook = 1;  // cb; 1 == MCG, `LinearEXL3`'s own default
+  // NO DEFAULT ON PURPOSE. An implicit codebook is exactly what shipped a
+  // wrong decode: `= 1` here would silently give MCG to every hand-constructed
+  // `Exl3Weight`, which is the same shape as reading marker ABSENCE as MCG.
+  // -1 is not a codebook, so anything that forgets to set it refuses at
+  // `Exl3DecodeCodeword` by name instead of decoding to plausible garbage.
+  int codebook = -1;  // 0 == 3INST, 1 == MCG; SET IT EXPLICITLY
 
   bool Empty() const { return trellis.Empty(); }
 

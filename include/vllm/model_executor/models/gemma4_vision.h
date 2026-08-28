@@ -74,22 +74,32 @@ struct Clip {
   float out_min = -3.4e38f, out_max = 3.4e38f;
 };
 
-// All weights host-side row-major f32 (as torch stores: Linear weight [out,in]).
+// All weights host-side row-major RAW BF16 BITS (`uint16_t`, as torch stores:
+// a Linear weight is [out,in]). bf16 because `Gemma4VisionForward` puts every
+// one of them through `MakeDevBf16` before its first GEMM, so an f32 store would
+// cost 2x the checkpoint's bytes and buy nothing (#1359, and see
+// `qwen3_vl_vision.h` for the mirror argument and the bit-identity proof).
 struct Gemma4VisionBlockWeights {
-  std::vector<float> input_ln, post_attn_ln, pre_ff_ln, post_ff_ln;  // [H]
-  std::vector<float> q_proj, k_proj, v_proj, o_proj;  // [H,H]  (nh*head_dim==H)
-  std::vector<float> q_norm, k_norm;                  // [head_dim]
-  std::vector<float> gate_proj, up_proj;              // [I,H]
-  std::vector<float> down_proj;                       // [H,I]
+  std::vector<uint16_t> input_ln, post_attn_ln, pre_ff_ln, post_ff_ln;  // [H]
+  std::vector<uint16_t> q_proj, k_proj, v_proj, o_proj;  // [H,H]  (nh*head_dim==H)
+  std::vector<uint16_t> q_norm, k_norm;                  // [head_dim]
+  std::vector<uint16_t> gate_proj, up_proj;              // [I,H]
+  std::vector<uint16_t> down_proj;                       // [H,I]
   // QAT clamps (q/k/v share in-clamp; gate/up share in- AND out-clamp).
   Clip q_clip, k_clip, v_clip, o_clip, gate_clip, up_clip, down_clip;
 };
 
 struct Gemma4VisionWeights {
-  std::vector<float> input_proj;              // [H, patch_dim]  (768x768)
-  std::vector<float> position_embedding_table;  // [2*pos_embed_size*H]
+  std::vector<uint16_t> input_proj;              // [H, patch_dim]  (768x768)
+  // f32, DELIBERATELY, and the only such field here — the same exception
+  // `Qwen3VLVisionWeights::pos_embed_w` carries. `Gemma4VisionForward` SUMS the
+  // x and y rows of this table on the host (`gemma4_vision.cpp:199-210`) and
+  // narrows only the sum, so the stored values reach arithmetic and narrowing
+  // the store would move the result. Reconciling it onto the mirror is owed
+  // with the Qwen3-VL one (`.agents/specs/vision-tower-dtype-polarity.md` §4.3).
+  std::vector<float> position_embedding_table;   // [2*pos_embed_size*H]
   std::vector<Gemma4VisionBlockWeights> blocks;  // depth
-  std::vector<float> embed_projection;        // [text_hidden, H]  (2560x768)
+  std::vector<uint16_t> embed_projection;        // [text_hidden, H]  (2560x768)
 };
 
 // Per-stage captures for the G2-impl unit gates (all host f32, valid rows only).

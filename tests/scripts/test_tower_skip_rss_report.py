@@ -114,10 +114,19 @@ def ondisk(kind: str) -> int:
     return ONDISK[kind][1]
 
 
-def resident(kind: str) -> int:
-    """The loader widens bf16 -> host f32 on both kinds (#1359)."""
+# The widening factor, per kind, mirroring `declare_model` in the script.
+#
+# #1359 removed it on the Qwen3-VL loader, which now stores the tower in the
+# checkpoint's own bf16, so resident == on disk there. The Muse Glimmer loader
+# still widens to host f32 and so is still 2x; that half is blocked on its
+# `compute_dtype = kF32` per-stage gate and is tracked by #2166.
+WIDEN = {"muse-glimmer": 2, "qwen3-vl": 1}
 
-    return ondisk(kind) * 2
+
+def resident(kind: str) -> int:
+    """What the tower occupies once loaded, which is what the skip frees."""
+
+    return ondisk(kind) * WIDEN[kind]
 
 
 def need(kind: str) -> int:

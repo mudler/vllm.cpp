@@ -426,9 +426,27 @@ declare_model() {
       return 2
       ;;
   esac
-  # The loader widens bf16 -> host f32 on BOTH kinds (#1359). This factor is the
-  # defect, not an estimate: see the header.
-  TOWER_RESIDENT_BYTES=$((TOWER_ONDISK_BYTES * 2))
+  # What the tower actually OCCUPIES once loaded, which is the quantity the skip
+  # frees — not what the checkpoint stores.
+  #
+  # These differ PER KIND now, and the difference is #1359. The Qwen3-VL loader
+  # stores the tower in the checkpoint's own bf16, so resident == on disk. The
+  # Muse Glimmer loader still widens bf16 -> host f32, so resident is twice on
+  # disk. That is not two policies: it is one defect, fixed on one of the two
+  # kinds. The Muse Glimmer half is blocked on its `compute_dtype = kF32`
+  # per-stage gate, which computes on the stored values and whose torch
+  # reference would have to move with it (#2166).
+  #
+  # The Qwen3-VL saving this harness reports therefore FALLS by about half — the
+  # 1,655,791,616 B (1.542 GiB) measured on `thor:gpu0` 2026-08-24 becomes about
+  # 830,695,424 B (0.7736 GiB) — and that is CORRECT, not a regression. The flag
+  # now frees the tower the checkpoint ships instead of the tower plus our
+  # widening. The threshold below moves with it, and the pre-declaration that
+  # authorises the move is `.agents/specs/vision-tower-dtype-polarity.md` §6.2.
+  case "$MODEL_KIND" in
+    qwen3-vl)      TOWER_RESIDENT_BYTES=$TOWER_ONDISK_BYTES ;;
+    muse-glimmer)  TOWER_RESIDENT_BYTES=$((TOWER_ONDISK_BYTES * 2)) ;;
+  esac
   return 0
 }
 

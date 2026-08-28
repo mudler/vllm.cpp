@@ -103,7 +103,11 @@ struct DevW {
   const Tensor& tensor() const { return t; }
 };
 
-DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<float>& f, std::vector<int64_t> shape) {
+// Upload host bf16 bits once as a device-resident buffer. Since #1359 the host
+// store IS bf16, so this is a straight `Copy` of the checkpoint's own bytes
+// rather than an N-element `F32ToBF16` pass per weight per forward.
+DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<uint16_t>& bf,
+                 std::vector<int64_t> shape) {
   DevW d;
   d.b = &b;
   int64_t numel = 1;
@@ -120,7 +124,6 @@ DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<float>& f, std::vector<
     d.t.stride[i] = stride;
     stride *= shape[static_cast<size_t>(i)];
   }
-  const auto bf = ToBf16(f);
   if (bytes != 0) b.Copy(q, d.p, bf.data(), bf.size() * sizeof(uint16_t));
   return d;
 }
@@ -262,26 +265,26 @@ std::vector<float> Gemma4VisionForward(const std::vector<float>& pixel_values,
     // contiguous QkvSplit. Mirrors the existing gate_up concat below. BIT-exact
     // vs three separate [H,H] GEMMs (same bf16 bytes, per-slice output clamp
     // stays on the split outputs in the forward).
-    std::vector<float> qkv(bw.q_proj.size() + bw.k_proj.size() + bw.v_proj.size());
-    std::memcpy(qkv.data(), bw.q_proj.data(), bw.q_proj.size() * sizeof(float));
+    std::vector<uint16_t> qkv(bw.q_proj.size() + bw.k_proj.size() + bw.v_proj.size());
+    std::memcpy(qkv.data(), bw.q_proj.data(), bw.q_proj.size() * sizeof(uint16_t));
     std::memcpy(qkv.data() + bw.q_proj.size(), bw.k_proj.data(),
-                bw.k_proj.size() * sizeof(float));
+                bw.k_proj.size() * sizeof(uint16_t));
     std::memcpy(qkv.data() + bw.q_proj.size() + bw.k_proj.size(), bw.v_proj.data(),
-                bw.v_proj.size() * sizeof(float));
+                bw.v_proj.size() * sizeof(uint16_t));
     d.qkv_proj = MakeDevBf16(b, q, qkv, {3 * H, H});
     d.o_proj = MakeDevBf16(b, q, bw.o_proj, {H, H});
     d.q_norm = MakeDevBf16(b, q, bw.q_norm, {hd});
     d.k_norm = MakeDevBf16(b, q, bw.k_norm, {hd});
-    std::vector<float> gate_up(bw.gate_proj.size() + bw.up_proj.size());
-    std::memcpy(gate_up.data(), bw.gate_proj.data(), bw.gate_proj.size() * sizeof(float));
+    std::vector<uint16_t> gate_up(bw.gate_proj.size() + bw.up_proj.size());
+    std::memcpy(gate_up.data(), bw.gate_proj.data(), bw.gate_proj.size() * sizeof(uint16_t));
     std::memcpy(gate_up.data() + bw.gate_proj.size(), bw.up_proj.data(),
-                bw.up_proj.size() * sizeof(float));
+                bw.up_proj.size() * sizeof(uint16_t));
     d.gate_up = MakeDevBf16(b, q, gate_up, {2 * I, H});
     d.down_proj = MakeDevBf16(b, q, bw.down_proj, {H, I});
   }
   // weight-less norms (v_norm on head_dim, projector pre-norm on H): ones vectors.
-  const std::vector<float> ones_hd(static_cast<size_t>(hd), 1.0f);
-  const std::vector<float> ones_h(static_cast<size_t>(H), 1.0f);
+  const std::vector<uint16_t> ones_hd(static_cast<size_t>(hd), vt::F32ToBF16(1.0f));
+  const std::vector<uint16_t> ones_h(static_cast<size_t>(H), vt::F32ToBF16(1.0f));
   DevW v_norm = MakeDevBf16(b, q, ones_hd, {hd});
   DevW proj_norm = MakeDevBf16(b, q, ones_h, {H});
 

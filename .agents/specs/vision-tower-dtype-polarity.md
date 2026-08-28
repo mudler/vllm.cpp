@@ -427,7 +427,8 @@ bytes on the Qwen3-VL vehicle.
 Proposed corrected scope, posted as a comment on #1359 (the title is the
 developer's call):
 
-- Muse Glimmer 30B — 809 tensors, 3.580 GiB -> 7.161 GiB.
+- Muse Glimmer 30B — 809 tensors, 3.580 GiB -> 7.161 GiB. NOT in the landed
+  slice; see `## Now` and #2166.
 - Qwen3-VL-4B — 315 tensors, 0.774 GiB -> 1.547 GiB.
 - Qwen3.5/3.6-27B dense and Qwen3.6-35B MoE — the *same* loader via
   `qwen3_5_weights.cpp:1770`.
@@ -512,14 +513,68 @@ Per AGENTS.md §"Public documents", a lifecycle change also owes `STATUS`,
 
 ## Now
 
-`ENG-MM-INPUT-PIPELINE` remains `READY`. This spec is the committed
-spec-before-code for #1359; no product code changes in it, and #1359 stays open.
+`ENG-MM-INPUT-PIPELINE` remains `READY`. #1359 stays OPEN: its Qwen3-VL half
+landed, its Muse Glimmer half did not.
+
+**Landed.** `Qwen3VLVisionWeights` (and therefore Qwen3-VL-4B, the
+Qwen3.5/3.6-27B dense path and the Qwen3.6-35B MoE path, which share
+`LoadQwen3VLVisionWeights`), `Gemma4VisionWeights`, and both GGUF tower loaders
+now store the checkpoint's own bf16 bits. `LoadVisionF32` became
+`LoadVisionBf16`; `Bf16TensorToF32`'s Qwen3-VL analogue kept an f32 spelling only
+for the pos-embed table. `MakeDevBf16` on both towers is now a straight `Copy`
+of the stored bytes and no longer allocates a per-weight scratch or runs a
+per-weight `F32ToBF16` pass.
+
+**Not landed, and §10's first stop condition is why.** Muse Glimmer's tower is
+storage-only on its PRODUCTION path and is NOT storage-only on its GATE path.
+`MuseGlimmerVisionConfig::compute_dtype`'s `kF32` arm computes on the stored
+weight values, and §4.4's ruling that widening back is bit-identical rests on
+"the values originated bf16" — true for the loader reading an all-BF16
+checkpoint, false for `test_muse_glimmer_vision`, whose weights are a synthetic
+f32 LCG that `scripts/mm/muse_glimmer_vision_ref.py:52-61` builds as
+`torch.float32` and never rounds. Measured on a scratch tree rather than
+predicted: the five f32-arm stages move from rel_l2 1.0-3.0e-07 to 2.164e-03,
+2.193e-03, 2.220e-03, 2.892e-03 and 3.462e-03 against a 1e-6 bound. In the same
+tree the bf16 arm read `rel_l2=5.951e-03 max_abs=3.675e-02`, byte-for-byte what
+it reads today, so the widening IS removable and only the gate stands in the
+way. [#2166](https://github.com/mudler/vllm.cpp/issues/2166) owns it.
+
+**The instrument is per-kind because of that split.**
+`scripts/mm/tower_skip_rss.sh`'s `TOWER_RESIDENT_BYTES` is now
+`TOWER_ONDISK_BYTES` for `qwen3-vl` and `TOWER_ONDISK_BYTES * 2` for
+`muse-glimmer`, mirrored by `WIDEN` in
+`tests/scripts/test_tower_skip_rss_report.py`. That is one defect fixed on one
+of two kinds, not two policies, and keeping the surviving `* 2` visible is what
+stops the Muse Glimmer half from being forgotten.
+
+**Nothing is measured yet.** §6.1, §6.2 and §6.3 are all PENDING: the RSS gate
+needs a leased host and the staged `qwen3-vl-4b-instruct` checkpoint. The
+implementing wave produced the code, the CPU-runnable gates and the harness;
+the operator runs
+
+```sh
+scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl --device cpu
+```
+
+on `thor:gpu0` or `dgx:gpu0` under an `rc` lease, at this commit and at its
+parent, and applies §6.1's two halves to the per-leg `peak RSS default` and
+`peak RSS lang-model-only` keys. MET is a default-arm reduction of at least
+747,625,881 B with the `--language-model-only` arm unchanged within 2%.
 
 ## Owed
 
-- [#1359](https://github.com/mudler/vllm.cpp/issues/1359) — the implementation
-  itself. This spec is the investigation and the declaration; a later wave does
-  the code under it.
+- [#1359](https://github.com/mudler/vllm.cpp/issues/1359) — its Muse Glimmer
+  half, which is where the larger of the two savings is (3.580 GiB -> 7.161 GiB
+  today). Blocked on [#2166](https://github.com/mudler/vllm.cpp/issues/2166),
+  which owns the golden regeneration the `kF32` per-stage gate needs, and
+  separately on the ~56 GB of worker-local disk its RSS leg wants (§10).
+- Both §6.1 halves, §6.2's re-declared skip threshold and §6.3's latency band
+  are PENDING a leased host. Nothing in this row has been measured.
+- Gemma-4's `Gemma4VisionWeights::position_embedding_table` keeps its host f32
+  store for the same reason `pos_embed_w` does — `Gemma4VisionForward` sums its
+  x and y rows on the host (`gemma4_vision.cpp:199-210`) and narrows only the
+  sum, so narrowing the store would move the result. It is the §4.3 exception in
+  a third tower and it rides that entry's reconciliation, not a new one.
 - The scope correction proposed in §7 is a comment on #1359, not an edit to its
   title. If the developer keeps #1359 vision-only, the Whisper/Voxtral audio
   instance (`whisper_audio.h:68-99`, `voxtral.cpp:381-390`) needs its own issue

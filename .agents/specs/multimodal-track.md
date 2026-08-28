@@ -997,10 +997,14 @@ comparing the two arms must set the flag on both sides or state that it did not.
      disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp` widens it to
      host f32. That is
      [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which the operator
-     has confirmed also affects the Qwen3.6-27B path. **Fixing #1359 should
-     roughly HALVE this saving, and that will be correct rather than a
-     regression** — the flag will then be freeing the tower the checkpoint
-     actually ships.
+     has confirmed also affects the Qwen3.6-27B path. **#1359's Qwen3-VL half
+     has since LANDED, so this leg rerun should read about 0.774 GiB rather than
+     1.542, and that HALVING IS CORRECT rather than a regression** — the flag now
+     frees the tower the checkpoint actually ships. The figure recorded above is
+     what the run at `41ab550b9` measured and it stays as that record.
+     `muse-glimmer-30b`'s tower is still held in host f32, so its own
+     90%-of-7.161-GiB threshold is unchanged; that half is blocked on
+     [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
   2. *This is load-time residency, not a served request.* Peak RSS over a load
      that stops at `/health`, for the reason the paragraph below gives:
      `ForwardQwen3VLForConditionalGeneration` refuses text-only input through

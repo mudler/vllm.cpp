@@ -128,8 +128,14 @@ struct DevW {
 
 namespace {
 
-// Convert host f32 -> bf16 and upload once as a device-resident buffer.
-DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<float>& f, std::vector<int64_t> shape) {
+// Upload host bf16 bits once as a device-resident buffer.
+//
+// Since #1359 the host store IS bf16, so this is a straight `Copy` of the bytes
+// the checkpoint shipped. It used to allocate an N-element scratch and run an
+// N-element `F32ToBF16` pass per weight per upload; deleting that pass is why
+// the storage change cannot cost latency by its own mechanism.
+DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<uint16_t>& bf,
+                 std::vector<int64_t> shape) {
   DevW d;
   d.b = &b;
   int64_t numel = 1;
@@ -146,7 +152,8 @@ DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<float>& f, std::vector<
     d.t.stride[i] = stride;
     stride *= shape[static_cast<size_t>(i)];
   }
-  const auto bf = ToBf16(f);
+  VT_CHECK(bf.size() * sizeof(uint16_t) >= bytes,
+           "qwen3-vl vision: weight store is smaller than its declared shape");
   if (bytes != 0) b.Copy(q, d.p, bf.data(), bytes);
   return d;
 }

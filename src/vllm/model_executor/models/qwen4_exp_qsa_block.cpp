@@ -58,6 +58,80 @@ Tensor Reshape(const Tensor& t, const std::vector<int64_t>& shape) {
   return RowsView(t, 0, t.rank == 0 ? 0 : t.shape[0], shape);
 }
 
+
+// ─── THE TWO ROPE LAYOUTS, CROSS-CHECKED ────────────────────────────────────
+// The block is handed ONE set of angles TWICE: `vt::RopeFromCache` reads a
+// PACKED bf16 `[P, rot]` cache (cos in the leading half, sin in the trailing
+// half) and `vt::Qwen4ExpQsaCompress` reads SEPARATE f32 `[P, rot]` tables,
+// because the two ops were ported from two upstreams that spell it differently.
+// Nothing in the type system forces a caller to build both from one table, and
+// a layer loop that does not diverges SILENTLY — the query roped with one set of
+// angles and the pooled indexer keys with another, every value finite, the
+// selection quietly wrong. The header used to say "the gate asserts they agree";
+// nothing did, and the test's own builder derived one FROM the other, which is
+// agreement by construction rather than an assertion.
+//
+// THE PROBE IS A BOUNDED SAMPLE OF ROWS, NOT THE WHOLE TABLE, and that is a cost
+// decision stated rather than hidden. `P` is the context budget and this runs
+// once per QSA layer per step, so a full comparison would be O(P * rot) per call
+// — the same O(kv)-per-step shape the spec already carries under `## Owed`, paid
+// to re-check a constant. Every construction difference that a layer loop can
+// actually make is a property of the WHOLE table and shows at every
+// non-degenerate row: a different theta, a different `rotary_dim`, an
+// INTERLEAVED pack against a half-split one, swapped cos/sin halves, an
+// off-by-one position offset, or a position-scaling factor (linear, YaRN)
+// applied to one table and not the other. What the sample cannot see is a single
+// corrupted row, and that is stated here rather than implied.
+//
+// ROW 0 IS NOT A PROBE WHEN A SECOND ROW EXISTS. cos is 1 and sin is 0 at every
+// frequency there, so row 0 agrees under every difference in that list. The last
+// row is a probe because a position-scaling difference is smallest at low
+// positions and largest at the end of the table.
+constexpr int kRopeProbeRows = 3;
+
+// One bf16 ulp at magnitude 1. `cos_sin` is the block dtype (bf16) and `cos`/`sin`
+// are f32, so two spellings of one angle differ by at most the rounding of a
+// value in [-1, 1] — 2^-9 under round-to-nearest and 2^-8 even under truncation.
+// Every difference the probe exists to catch is O(1), so this bound separates
+// them by two orders of magnitude; it is a LAYOUT check, not an epsilon.
+constexpr float kRopeAgreeTol = 1.0F / 128.0F;
+
+void CheckRopeLayoutsAgree(const Tensor& cos_sin, const Tensor& cos, const Tensor& sin) {
+  // The comparison is a HOST read of both tables, so both must be host-readable.
+  // Refused by name rather than skipped: a check that silently does not run on a
+  // device arm is a mute switch, and this block has no device arm to run on —
+  // the CUDA arm is the QSA ops' own owed item and the wave that adds it owes
+  // this cross-check a device-side home or an argued removal.
+  VT_CHECK(cos_sin.device.type == vt::DeviceType::kCPU &&
+               cos.device.type == vt::DeviceType::kCPU &&
+               sin.device.type == vt::DeviceType::kCPU,
+           "qwen4_exp qsa block: the two rope layouts are cross-checked on the host, so "
+           "both must be CPU-resident; a device-resident pair needs that check moved onto "
+           "the device, which the CUDA arm owes (see the spec's `## Owed`)");
+  VT_CHECK(cos.shape[0] == cos_sin.shape[0] && sin.shape[0] == cos_sin.shape[0],
+           "qwen4_exp qsa block: the PACKED cos_sin cache and the SEPARATE cos/sin tables "
+           "must have the same number of rows — they are two layouts of ONE [P, rotary_dim] "
+           "table and two heights cannot have come from one build");
+  const int64_t P = cos_sin.shape[0], rot = cos_sin.shape[1], half = rot / 2;
+  const int64_t probes[kRopeProbeRows] = {P > 1 ? 1 : 0, P / 2, P - 1};
+  const auto* pk = cos_sin.Ptr<uint16_t>();
+  const auto* cf = cos.Ptr<float>();
+  const auto* sf = sin.Ptr<float>();
+  for (int i = 0; i < kRopeProbeRows; ++i) {
+    const int64_t r = probes[i];
+    for (int64_t j = 0; j < half; ++j) {
+      const float pc = vt::BF16ToF32(pk[r * rot + j]);
+      const float ps = vt::BF16ToF32(pk[r * rot + half + j]);
+      VT_CHECK(std::fabs(pc - cf[r * rot + j]) <= kRopeAgreeTol &&
+                   std::fabs(ps - sf[r * rot + j]) <= kRopeAgreeTol,
+               "qwen4_exp qsa block: the PACKED cos_sin cache and the SEPARATE cos/sin "
+               "tables do not describe the same angles — both must be built from ONE "
+               "table, or the query and the pooled indexer keys are roped differently and "
+               "nothing downstream can tell");
+    }
+  }
+}
+
 }  // namespace
 
 Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float rms_norm_eps,
@@ -252,6 +326,9 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
            "qwen4_exp qsa block: cos/sin must be the f32 [P, rotary_dim] FULL tables "
            "vt::Qwen4ExpQsaCompress reads — a second layout for the same angles, because "
            "the two ops were ported from two upstreams that spell it differently");
+  // The two layouts are cross-checked rather than trusted. See
+  // `CheckRopeLayoutsAgree` for what the bounded row sample can and cannot see.
+  CheckRopeLayoutsAgree(cos_sin, cos, sin);
   VT_CHECK(caches.key.rank == 3 && caches.value.rank == 3 && caches.key.shape[1] == Hkv &&
                caches.key.shape[2] == Dh && caches.value.shape[1] == Hkv &&
                caches.value.shape[2] == Dh,

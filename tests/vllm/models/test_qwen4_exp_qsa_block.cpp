@@ -839,6 +839,45 @@ TEST_CASE("qwen4_exp qsa block: refuses by name rather than computing something 
         vllm::RunQwen4ExpQsaBlock(d, w, p, t_h, t_p, bad, t_cos, t_sin, caches.t, 0),
         doctest::Contains("PACKED cos|sin cache"), std::exception);
   }
+  // ─── THE TWO ROPE LAYOUTS MUST DESCRIBE THE SAME ANGLES ──────────────────
+  // The block takes one set of angles TWICE, in the two layouts its two ops were
+  // ported to read. Nothing in the type system forces a caller to build both
+  // from one table, and a layer loop that does not diverges SILENTLY: the query
+  // would be roped with one set of angles and the pooled indexer keys with
+  // another, and every value stays finite.
+  //
+  // These two subcases are what makes the header's cross-check claim executable.
+  // `BuildRope` above derives `packed` FROM `cos`/`sin`, so the two agree BY
+  // CONSTRUCTION in every other case in this file — agreement by construction is
+  // not an assertion, and before the cross-check landed both of these ran the
+  // whole block to a finite answer and threw nothing.
+  SUBCASE("two rope layouts built from DIFFERENT tables") {
+    // The perturbed row is `c.seq - 1`, which NOTHING ELSE IN THE BLOCK READS:
+    // `vt::RopeFromCache` reads the PACKED cache, not this one, and the
+    // compressor reads only BLOCK-START rows — multiples of `compress_ratio`,
+    // and 10 is not one at seq 11. So this divergence is invisible to every
+    // value gate in this file, which is exactly why it needs its own.
+    REQUIRE((c.seq - 1) % p.qsa.compress_ratio != 0);
+    Caches caches(c.seq, p.num_key_value_heads, p.head_dim, p.qsa.head_dim);
+    std::vector<float> skewed = rope.cos;
+    skewed[static_cast<size_t>((c.seq - 1) * rot)] += 0.5f;
+    Tensor bad = MakeT(skewed.data(), DType::kF32, {c.seq, rot});
+    CHECK_THROWS_WITH_AS(
+        vllm::RunQwen4ExpQsaBlock(d, w, p, t_h, t_p, t_cs, bad, t_sin, caches.t, 0),
+        doctest::Contains("same angles"), std::exception);
+  }
+  SUBCASE("rope tables of DIFFERENT lengths") {
+    // The two layouts are documented as `[P, rotary_dim]` for one `P`, and
+    // nothing checked it. It is a refusal in its own right — a packed cache and
+    // a full table of different heights cannot have come from one build — and it
+    // is also the precondition of the row sample above, which indexes `cos` at
+    // rows it takes from `cos_sin`.
+    Caches caches(c.seq, p.num_key_value_heads, p.head_dim, p.qsa.head_dim);
+    Tensor bad = MakeT(rope.cos.data(), DType::kF32, {c.seq - 1, rot});
+    CHECK_THROWS_WITH_AS(
+        vllm::RunQwen4ExpQsaBlock(d, w, p, t_h, t_p, t_cs, bad, t_sin, caches.t, 0),
+        doctest::Contains("same number of rows"), std::exception);
+  }
   SUBCASE("bf16 cos/sin for the compressor, which requires f32") {
     Caches caches(c.seq, p.num_key_value_heads, p.head_dim, p.qsa.head_dim);
     Tensor bad = MakeT(rope.packed.data(), DType::kBF16, {c.seq, rot});

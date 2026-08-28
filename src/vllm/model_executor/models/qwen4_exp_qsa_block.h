@@ -153,8 +153,13 @@ Qwen4ExpQsaSelection Qwen4ExpQsaIndex(dense_attn::Dev d, const Qwen4ExpQsaParams
 //              reads: columns [0, rot/2) are cos and [rot/2, rot) are sin
 //   cos/sin    [P, rotary_dim] the SEPARATE full tables the compressor reads.
 //              Two layouts for one set of angles, because the two ops were
-//              ported from two upstreams that spell it differently; the caller
-//              builds both from one table and the gate asserts they agree.
+//              ported from two upstreams that spell it differently. The caller
+//              must build both from ONE table, and the block CROSS-CHECKS that
+//              rather than trusting it: equal heights, then a BOUNDED SAMPLE of
+//              rows compared value for value. The sample is what a table-wide
+//              construction difference shows in and is not a per-row guarantee;
+//              `CheckRopeLayoutsAgree` in the .cpp states exactly what it can
+//              and cannot see, and why a full comparison is not paid per call.
 //   past_len   how many tokens the caches already hold; the new tokens land at
 //              rows [past_len, past_len + T)
 //   keys_visited  OPTIONAL, forwarded to `vt::Qwen4ExpQsaGatherAttention`. It is

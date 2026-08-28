@@ -1457,7 +1457,8 @@ from a byte-identical copy and `sha256sum`-verified against the pre-mutation
 digest `ab132cafcd327dda…`. Every row was re-measured on the FINAL head, after
 the repair. Target `src/vllm/model_executor/models/qwen4_exp_qsa_block.cpp`;
 suite `tests/vllm/models/test_qwen4_exp_qsa_block.cpp`, **8 cases / 2828
-assertions green**.
+assertions green** at the time this table was measured; the fresh-review repair
+recorded below took that to **8 / 2831**.
 
 **THE RED CAME FIRST, AND IT WAS MEASURED RATHER THAN ASSERTED.** With the suite
 and the header in place and both function BODIES replaced by a refusal, build
@@ -1498,6 +1499,7 @@ Reading the build rc before the run rc is what caught it.
 | M19 | the value cache ignores `past_len` | 0 | RED, 1 of 8, 1 |
 | M20 | **THE LOAD-BEARING ONE**: the consumer is handed EVERY VISIBLE block — a dense walk wearing a gather's clothes | 0 | **RED, 3 of 8, 130 assertions** — the golden case at over-budget, the NaN-poison case and the released-config sparsity case |
 | M21 | the key is roped into a SCRATCH, so the cache keeps the un-roped key | 0 | RED, 2 of 8, 3 |
+| M22 | **the rope cross-check's production call site deleted** — the fresh-review repair below | 0, after `[[maybe_unused]]` silences the `-Werror=unused-function` this leaves | **RED, 1 of 8, 2** — both new refusal subcases stop throwing |
 
 **THE SURVIVOR, AND ITS REPAIR.** M13 writes the indexer key at cache row 0
 instead of row `past_len`, and in the first battery it SURVIVED: 8 of 8 cases,
@@ -1548,6 +1550,49 @@ What it does NOT add is the fetch-level property — that the bytes were never
 READ — which stays discharged by the `mprotect(PROT_NONE)` probe in
 `test_qwen4_exp_qsa_device.cpp`; M20 is what says this block's only consumer call
 is the op that probe covers.
+
+**THE FRESH-REVIEW REPAIR: A HEADER THAT CLAIMED A GATE NOBODY HAD WRITTEN.**
+The header said of the two rope layouts "the caller builds both from one table
+and the gate asserts they agree". Nothing asserted it. The test's own `BuildRope`
+DERIVES `packed` from `cos`/`sin`, so the two agree BY CONSTRUCTION in every case
+in the file — which is not an assertion, and a layer loop that built them
+inconsistently would diverge silently while the header told the next reader it
+was covered. The block accepted two independently supplied layouts and
+cross-checked neither.
+
+Repaired by writing the check rather than softening the sentence, because a
+silent divergence in a layer loop is the failure this campaign keeps finding.
+`CheckRopeLayoutsAgree` refuses unequal heights, then compares a BOUNDED SAMPLE
+of rows — row 1, the midpoint and the last row — value for value at one bf16 ulp
+(2^-7); it refuses a non-CPU-resident pair BY NAME rather than skipping, because
+a check that silently does not run on a device arm is a mute switch. Row 0 is not
+a probe: cos is 1 and sin is 0 at every frequency there, so it agrees under every
+difference the probe exists to catch. A full comparison is not paid, and that is
+a cost decision rather than an oversight: it would be O(P * rot) per QSA layer per
+step to re-check a constant.
+
+**THE RED CAME FIRST, AND IT MEASURED THE SILENCE.** Two subcases were added
+BEFORE the check existed. One perturbs the FULL `cos` table at row `c.seq - 1`
+— a row nothing else in the block reads, because `vt::RopeFromCache` reads the
+PACKED cache and the compressor reads only block-start rows (multiples of 4, and
+10 is not one at seq 11); the other hands the two layouts different heights. On
+the pre-check head, build rc 0, both reported **did NOT throw at all** and the
+other **2829 of 2831 assertions passed** — so the divergence was invisible to
+every value gate in the file, which is the claim the header had been making in
+reverse. With the check in place: **8 of 8 cases, 2831 of 2831 assertions**. M22
+above deletes the production call site on the repaired head and reds both
+subcases again, which is what says the subcases gate the CHECK and not the
+arithmetic.
+
+**M1 AND M13 WERE RE-ARMED ON THE REPAIRED HEAD**, because a later commit can
+silently disarm an earlier commit's mutation proof. The table above was measured
+against the pre-repair file (digest `ab132cafcd327dda…`); the repaired file is
+`e837cf290a86bd0d…`. M1 (inherit `n_head ** -0.5`) reds 1 of 8 / 2 assertions and
+M13 (the indexer key at row 0) reds 1 of 8 / 2 assertions, both unchanged from
+their recorded rows. The remaining rows are not re-measured, and the reason is
+stated rather than assumed: the added check reads ONLY the two rope operand
+tables and compares them with each other, and no mutation in the table alters
+what a caller passes in those two arguments.
 
 **NO REACHABILITY MUTATION IS AVAILABLE AT THIS LAYER, and that is the honest
 statement rather than an omission.** AGENTS.md `## Nothing lands dead` wants a
@@ -1834,7 +1879,14 @@ is listed under `## Owed`.
     `norm_conv` with `vllm::qwen4_exp::HcNormWeightFromHf` before handing them to
     that op. Miss it and every gated residual applies a near-zero scale, which
     reads as a checkpoint bug rather than a port bug. Nothing gates this today,
-    because the layer loop is the first caller.
+    because the layer loop is the first caller. **Tracked as
+    [#2218](https://github.com/mudler/vllm.cpp/issues/2218)**, which is its own
+    wave and deliberately not repaired here. The contradiction is visible AT THE
+    LOAD SITE and does not need the op to be read to be seen:
+    `qwen4_exp_weights.cpp:258-263` argues FOR the fold in its own comment — "the
+    fold is what makes the file's value the multiplier our own `out * weight`
+    grouped norm wants", corroborated elementwise on three published artifacts —
+    immediately above the line that strips it with `unshift=true`.
   - **The PAGED cache.** This block takes CONTIGUOUS per-sequence K/V and a
     contiguous indexer side cache, which is the shape both `vt::` ops already
     accept — the gather addresses its cache as `(p * HKV + kvh) * DH + d` and
@@ -1850,8 +1902,18 @@ is listed under `## Owed`.
     layout. The block takes the tables as operands in BOTH layouts the two ops
     want — a bf16 PACKED `[P, rot]` cos|sin cache for `vt::RopeFromCache` and two
     f32 FULL `[P, rot]` tables for `vt::Qwen4ExpQsaCompress` — and asserts each by
-    name. The wave that builds them still owes the case with three DISTINCT
-    position streams this spec already records as unowned.
+    name. It also CROSS-CHECKS the two against each other, which it did not when
+    the header first claimed it did: equal heights, then a BOUNDED SAMPLE of rows
+    (row 1, the midpoint and the last row) compared value for value at one bf16
+    ulp. Row 0 is not a probe, because cos is 1 and sin is 0 at every frequency
+    there and it agrees under every construction difference. What the sample
+    cannot see is a single corrupted row; what it does see is every table-wide
+    difference a layer loop can make — a different theta, a different
+    `rotary_dim`, an interleaved pack, swapped halves, an off-by-one position
+    offset, or a position scaling applied to one table and not the other. A FULL
+    comparison is deliberately not paid: it would be O(P * rot) per QSA layer per
+    step to re-check a constant. The wave that builds them still owes the case
+    with three DISTINCT position streams this spec already records as unowned.
   - **The bf16 STORAGE arm is the only arm.** The block refuses an f32 `hidden`
     by name, and the reason is a shared-surface fact rather than a preference:
     every `vt::` output-gate op in this tree — `SigmoidGateBf16`,
@@ -1860,7 +1922,38 @@ is listed under `## Owed`.
     widen a dispatcher across five backends this host cannot gate, and the
     refusal says so.
   - **The CUDA arm**, which is the QSA ops' own owed item and not a new one. The
-    block adds no arithmetic, so it inherits that debt unchanged.
+    block adds no arithmetic, so it inherits that debt unchanged. TWO things ARE
+    new at the BLOCK level, and they are named here rather than folded into that
+    inherited debt, because a device arm has to answer both and neither is
+    visible from the ops:
+    - **The indexer's per-call INDEX BUILD is done on the host.**
+      `Qwen4ExpQsaIndex` materialises `ones` `[T, H]`, `win_start` `[T]` and
+      `win_end` `[T]` into host vectors and hands each to a `DBuf`, and
+      `RunQwen4ExpQsaBlock` does the same for `kv_lens` `[T]` — FOUR small
+      host-to-device copies per QSA layer per step on a device queue. It also
+      `VT_CHECK`s that `kv_lens` is CPU-resident and reads it on the host to build
+      the window, which is a refusal a device-resident batch would hit by name.
+      Upstream rebuilds exactly the same metadata on every call —
+      `local_visible_indices` out of `torch.nonzero` on the mask row,
+      `block_token_indices`, `group_starts` and `selected_token_indices`, inside a
+      `for batch_idx / for query_idx` Python loop
+      (`modeling_qwen4_exp.py:667-702`) — so the PER-CALL REBUILD is a faithful
+      mirror rather than a divergence. What is not inherited is the transfer:
+      upstream has one device and no H2D edge to pay, so the device arm owes the
+      decision of where these four are built, and the nested Python loop is a
+      reminder that the oracle is a reference implementation and not a
+      performance model.
+    - **The pooled BLOCK KEYS are recomputed over the ENTIRE cache every step.**
+      The `block_keys` scratch is allocated per call and dropped, and
+      `vt::Qwen4ExpQsaCompress` runs over cache rows `[0, complete_keys)` — O(kv)
+      per layer per token, for a quantity that only ever GROWS by one block every
+      `compress_ratio` tokens. Upstream does the same, and worse: it recomputes
+      `pooled_keys` and `block_key_states` inside the per-query-token loop
+      (`:679-686`), so its cost is O(kv) per query token per layer. So this is a
+      faithful mirror of a reference implementation, and it is the shape that
+      makes the incremental store worth having. The wave that gives QSA a real
+      KV-cache group turns this scratch into the side cache's paged store and
+      inherits the choice of whether to keep it incremental.
   - **The FETCH-level proof is inherited, not re-built.** The `mprotect(PROT_NONE)`
     unmapped-tail probe lives one layer down in
     `test_qwen4_exp_qsa_device.cpp`, and it is load-bearing for this block because

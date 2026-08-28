@@ -525,6 +525,8 @@ const char* OpNameImpl(OpId op) {
       return "Ltx2";
     case OpId::kLtx2Vae:
       return "Ltx2Vae";
+    case OpId::kQwen4ExpPleConv:
+      return "Qwen4ExpPleConv";
     case OpId::kQwen4ExpGatedResidual:
       return "Qwen4ExpGatedResidual";
     case OpId::kQwen4ExpGatedResidualWriteBack:

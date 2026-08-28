@@ -4612,3 +4612,59 @@ TEST_CASE(
                                     w4b3cmix::BatchMeta(fresh), /*num_reqs=*/2,
                                     b.params.physical_latent_row()));
 }
+
+TEST_CASE(
+    "dots3-note W4b-3c: a step whose metadata is NOT SHAPED the way the sparse "
+    "route reads it REFUSES by name, and says which half of the refusal fired") {
+  // THE OTHER ARM, which nothing measured. The repair made the refusal the
+  // exact complement of `Dots3NoteSparseEligibility::Active`, so it fires on
+  // `prunes && (resumes || !well_formed)`. The `resumes` half is held by the
+  // mixed-batch case above. The `!well_formed` half was held by nothing: the
+  // message's ternary could lose its false arm entirely and every gate in this
+  // tree stayed green — a predicate nothing measures, which is the shape of the
+  // defect the whole brick spent two review rounds repairing.
+  //
+  // `well_formed` is `index_topk > 0 && num_reqs > 0 &&
+  // query_start_loc.size() == num_reqs + 1 && seq_lens.size() >= num_reqs`. A
+  // `query_start_loc` one entry too long is the cheapest violation and the one
+  // that matters: `BuildDots3NoteSparseStep` reads exactly `num_reqs + 1`
+  // entries off it to build `cu`, so a step it cannot read is a step nothing
+  // may serve — and a step that PRUNES and is not eligible has no dense answer
+  // to fall back to.
+  const w4a::DeviceBench b(w4b3c::SparseSpec());
+  REQUIRE(w4a::Dots3NoteDenseEquivalentMaxSeqLen(b.params) == 2);
+  REQUIRE(w4a::Dots3NoteDeviceRefusal(b.params).empty());  // the CONFIG is fine
+
+  // ONE FRESH request past `index_topk`. Nothing resumes, so the `#1925` arm of
+  // the message cannot be what fires and the discriminator is unambiguous.
+  const std::vector<w4b3cmix::Req> rs = {w4b3cmix::Fresh(5, 3)};
+  REQUIRE(rs[0].computed == 0);
+  REQUIRE(static_cast<int64_t>(rs[0].seq_len) > b.params.index_topk);
+
+  // THE CONTROL, and it comes first. The very same request on WELL-FORMED
+  // metadata takes the sparse route and runs, so whatever the refusal below
+  // measures is the SHAPE of the metadata and not this request.
+  const vllm::v1::CommonAttentionMetadata good = w4b3cmix::BatchMeta(rs);
+  REQUIRE(good.query_start_loc.size() == static_cast<size_t>(good.num_reqs) + 1);
+  CHECK_NOTHROW((void)b.RunDeviceOn(w4b3cmix::CatTokens(rs), w4b3cmix::CatPositions(rs),
+                                    good, /*num_reqs=*/1,
+                                    b.params.physical_latent_row()));
+
+  // One entry too long, and NOTHING else changed.
+  vllm::v1::CommonAttentionMetadata bad = good;
+  bad.query_start_loc.push_back(bad.query_start_loc.back());
+  bad.query_start_loc_cpu = bad.query_start_loc;
+  REQUIRE(bad.query_start_loc.size() != static_cast<size_t>(bad.num_reqs) + 1);
+
+  // It refuses; it names `index_topk`, because the step really does prune; and
+  // it names the MALFORMATION rather than the resumed-request arm, which is the
+  // half of the message that had no gate.
+  CHECK_THROWS_WITH_AS(
+      b.RunDeviceOn(w4b3cmix::CatTokens(rs), w4b3cmix::CatPositions(rs), bad,
+                    /*num_reqs=*/1, b.params.physical_latent_row()),
+      doctest::Contains("index_topk"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      b.RunDeviceOn(w4b3cmix::CatTokens(rs), w4b3cmix::CatPositions(rs), bad,
+                    /*num_reqs=*/1, b.params.physical_latent_row()),
+      doctest::Contains("not shaped"), std::runtime_error);
+}

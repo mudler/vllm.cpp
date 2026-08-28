@@ -22,24 +22,30 @@ path.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
 windowed CUDA kernels were compiled and executed on `orin:gpu0` (sm_87) instead,
 through an `rc` lease on 2026-08-26 (§4.8). Read the `fa2` row before booking a
 lease for anything on the FA-2 path, and pick the host by capability.
-**Status:** W4b-2 — **BOTH attention geometries are on the decode path**
-(§7 W4b-2, evidence §4.8), on top of W4b-1's host maths (§4.7), W4a's
-full-attention layer (§4.6), W3's host reference (§4.5), W2's whole weight map
-(§4.4) and W1's config + registry (§4.1). The arch RESOLVES, parses, accounts
-for 38006/38006 of the released checkpoint's tensors, and DECODES a config whose
-layers are any mix of `full_attention` and `sliding_attention` with dense MLPs —
-through `ModelRegistry::Forward`, over an `mla::ForwardMlaAttentionBlock` that
-carries dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its
-headwise gate and now its 513-wide window, reading a PADDED 1088-wide MLA cache
-row narrowed to each layer's own logical width. The RELEASED checkpoint still
-REFUSES BY NAME, now at its first MoE layer (W5), and so do GGUF and both
-towers. Exactly ONE GPU lease has run a BRICK GATE of this row, at kernel level
-and no further: `orin:gpu0` (sm_87) compiled and ran W4b-2's two windowed CUDA
-ops on 2026-08-26 (§4.8). The row's other leases were `thor:gpu0` provisioning
-and `ctest` baseline runs, which gate the HOST and not this model (§7 W0.5).
-No brick has run the MODEL on a GPU, and no tensor byte of the checkpoint
-has been downloaded: the committed fixtures are the released `config.json` and a
-headers-only projection of the complete shard index. The row stays `SPIKE`.
+**Status:** W4b-3c — **the DSA lightning indexer's SELECTION is on the decode
+path** (§7 W4b-3, evidence §4.9), on top of W4b-2's two attention geometries
+(§4.8), W4b-1's host maths (§4.7), W4a's full-attention layer (§4.6), W3's host
+reference (§4.5), W2's whole weight map (§4.4) and W1's config + registry
+(§4.1). The arch RESOLVES, parses, accounts for 38006/38006 of the released
+checkpoint's tensors, and DECODES a config whose layers are any mix of
+`full_attention` and `sliding_attention` with dense MLPs — through
+`ModelRegistry::Forward`, over an `mla::ForwardMlaAttentionBlock` that carries
+dots3-note's two LoRA rescales, its `k_rope_only_layernorm`, its headwise gate
+and its 513-wide window, reading a PADDED 1088-wide MLA cache row narrowed to
+each layer's own logical width, and that now computes the indexer's logits and
+its top-k and attends only the selected slots. A step past `index_topk` whose
+requests are all single-shot prefills is SERVED sparsely; a step in which any
+request resumes is REFUSED BY NAME, because the indexer's own key cache is
+`KV-DSV4-MULTICACHE` ([#1925](https://github.com/mudler/vllm.cpp/issues/1925))
+and not this row. The RELEASED checkpoint still REFUSES BY NAME, now at its
+first MoE layer (W5), and so do GGUF and both towers. Exactly ONE GPU lease has
+run a BRICK GATE of this row, at kernel level and no further: `orin:gpu0`
+(sm_87) compiled and ran W4b-2's two windowed CUDA ops on 2026-08-26 (§4.8).
+The row's other leases were `thor:gpu0` provisioning and `ctest` baseline runs,
+which gate the HOST and not this model (§7 W0.5). No brick has run the MODEL on
+a GPU, and no tensor byte of the checkpoint has been downloaded: the committed
+fixtures are the released `config.json` and a headers-only projection of the
+complete shard index. The row stays `SPIKE`.
 
 ---
 
@@ -2821,7 +2827,7 @@ production call site in a scratch copy and requires the focused gate to go RED.
 |---|---|
 | `test_ops_dsa_indexer` (NEW) | 10 cases / 176 assertions, CPU |
 | `test_ops_mla_attn` | 23 cases / 289,324 assertions (from 15 / 246,290 at base) |
-| `test_dots3_note_attn` | **42 cases / 3,803 assertions** after the review repair (40 / 3,558 before it; 36 / 3,037 at base) |
+| `test_dots3_note_attn` | **43 cases / 3,942 assertions** after the `!well_formed` arm got its own case (42 / 3,803 after the review repair; 40 / 3,558 before it; 36 / 3,037 at base) |
 | `test_mla_attention_block` | 13 cases / 2,247,730 assertions |
 | `test_deepseek_v2_forward` (SACRED sibling) | 11 cases / 1,052 assertions |
 | `test_dots3_note_scaffold` | 26 cases / 110,819 assertions |
@@ -3094,9 +3100,35 @@ captured separately:
 |---|---|
 | new cases against the PRE-repair code | 2 cases, **1 failed**, 2 assertions failed: `CHECK_THROWS_WITH_AS(...) did NOT throw at all!` on both the `index_topk` and the `#1925` arm |
 | the same cases after the repair | 42 cases / 3,803 assertions, 0 failed |
+| after the `!well_formed` arm got its own case (below) | **43 cases / 3,942 assertions**, 0 failed |
 
-The two cases are `TWO fresh prompts past index_topk in ONE step are each served
-SPARSELY` — `num_reqs = 2`, device **0.00916328** relative from the selecting
+**The refusal has TWO arms, and only one of them had a case.** The repaired
+refusal is `prunes && (resumes || !well_formed)`, and the fresh review that
+passed this brick reached the `!well_formed` arm only with a throwaway probe:
+nothing committed entered it, so the message's ternary could lose its false arm
+entirely and every gate in the tree stayed green. That is the same shape as the
+defect this brick spent two review rounds repairing — a predicate nothing
+measures — so a third case now holds it: `a step whose metadata is NOT SHAPED
+the way the sparse route reads it REFUSES by name`. ONE FRESH 5-token request
+past `index_topk` with a `query_start_loc` one entry too long, so `prunes` is
+true and `resumes` is false; the same request on WELL-FORMED metadata is the
+control and runs. RED-before was measured by MUTATION at this head, each anchor
+`grep -c` == 1 before it was applied, the compiler exit captured separately from
+the run exit, and the file restored and `md5sum -c` verified after each:
+
+| mutation | build | run | result |
+|---|---|---|---|
+| the false arm's string emptied (`std::string("")`) — "delete the false arm" | exit 0 | exit 1 | **1 case, 1 assertion failed**, `Contains("not shaped")` against a message reading `... PRUNES (model.py:171) — and .` |
+| the `VT_CHECK` condition widened to `!prunes \|\| !resumes \|\| Active()`, so only the `resumes` arm refuses | exit 0 | exit 1 | **1 case, 2 assertions failed**, both arms `threw a DIFFERENT exception` |
+
+The second mutation also measured something worth recording: with the dots3-note
+refusal gone, this shape does NOT reach a wrong answer — it throws later, at
+`deepseek_v2.cpp:778`'s generic `query_start_loc must have num_reqs + 1
+entries`. So what the `!well_formed` arm buys is the MESSAGE and not the safety
+on this particular violation, and the case gates it as such.
+
+The first two cases are `TWO fresh prompts past index_topk in ONE step are each
+served SPARSELY` — `num_reqs = 2`, device **0.00916328** relative from the selecting
 reference against the 0.05 bound and **0.872793** from the non-selecting one,
 7 of 11 rows pruning and 16 causal keys dropped — and `a MIXED step ... REFUSES
 rather than silently serving dense`, which carries two controls: the same
@@ -3562,7 +3594,21 @@ dispatchable in order, under the constraints that answer imposes.
   CUDA half is NO LONGER on this list: an `rc` lease on `orin:gpu0` compiled and
   executed it on 2026-08-26 (§4.8), and `thor:gpu0` could not have gated its
   prefill half at any point, because sm_110 is outside the `fa2` feature row.
-  All three remaining items are in `## Owed`.
+  **W4b-3c — LANDED, evidence §4.9.** Both of its units went in together,
+  because the second is what makes the first reachable at its own merge commit:
+  the two `vt` primitives (an OPTIONAL selected-slot arm on
+  `vt::MlaDecodeAttention`, and the `vt::DsaIndexerLogits` +
+  `vt::DsaTopkSelect` family) and the seam-and-model half (the indexer group on
+  `MlaBlockDims` / `MlaBlockWeights`, the indexer call inside
+  `mla::ForwardMlaAttentionBlock`, the per-token sparse-MQA routing on
+  `MlaBlockMetadata`, the five indexer tensors in `MaterializeDots3NoteDevice`,
+  and the NARROWED refusal). So `seq_len > index_topk` no longer refuses on its
+  own: a step past it whose requests are all single-shot prefills is SERVED, and
+  the refusal that remains is the exact complement of the route rather than a
+  second predicate beside it. **What W4b-3 still owes** is the windowed prefill
+  with chunked CONTEXT, the per-layer `SlidingWindowMLASpec` emission, and the
+  PER-REQUEST routing of a mixed step that the narrowed refusal stands in for.
+  All three are in `## Owed`.
 - **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
   routing our existing path at new dims.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
@@ -3626,13 +3672,24 @@ Carried openly under option B (§6.4), not waived:
   entitled to, via an identity selection, which the op gate already proves is
   bit-for-bit the unselected call — is expressible, but it needs a per-request
   flag on `MlaBlockMetadata` and an identity fill inside
-  `mla::ForwardMlaAttentionBlock`, and it rescues only the sub-case in which
-  every resumed request is under `index_topk`. A resumed request PAST
-  `index_topk` co-batched with anything still needs the indexer's own key
-  cache, which is the ordinary continuous-batching shape. Owner: this row, a
-  later W4b-3 brick, and it is BLOCKED ON `KV-DSV4-MULTICACHE`
-  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)) for everything
-  beyond that sub-case. Issue
+  `mla::ForwardMlaAttentionBlock`, and it rescues only ONE of the two halves the
+  refusal covers.
+  **BOTH halves are ordinary, and the record has to say so.** At the released
+  geometry `index_topk` is 2048, so a co-scheduled decode whose context is at or
+  UNDER 2048 tokens — the RESCUABLE half — is at least as common as one past it.
+  What the refusal turns away today is therefore a genuinely common serving
+  shape rather than a corner: ANY step that mixes a resumed request with a fresh
+  prompt past `index_topk` is refused, on whichever side of 2048 the resumed
+  request sits. **The conclusion is unchanged.** Serving that step with no
+  selection, on a model whose selection prunes, is a wrong answer in silence,
+  and a refusal that names the missing part is better than that. Where the two
+  halves differ is who unblocks them. The rescuable half — every resumed request
+  at or under `index_topk` — is THIS row's work and needs nothing from anyone
+  else: a per-request flag and an identity fill. A resumed request PAST
+  `index_topk` needs the indexer's own 128-wide key cache and is the half
+  BLOCKED ON `KV-DSV4-MULTICACHE`
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)). Owner: this row, a
+  later W4b-3 brick. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 - **The two `vt` MLA-decode arms disagree on an OUT-OF-RANGE selected
   position.** `src/vt/cpu/cpu_mla_attn.cpp` refuses by name when a selected

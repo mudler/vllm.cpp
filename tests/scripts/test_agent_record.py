@@ -743,11 +743,15 @@ class AgentRecordMutationTests(unittest.TestCase):
         a compensating edit elsewhere in the matrix while every other check stays
         green. Only an assertion that names the row goes red.
 
-        `SPIKE` is pinned deliberately and is the weaker half of the evidence,
-        stated rather than implied: the row is `SPIKE` because W1a has landed
-        UNREACHED -- no production path constructs `Exl3LinearMethod` yet -- and
-        pinning the state here means a later refactor of the claim-ownership or
-        structured-spec rules cannot silently take this pin with it.
+        `ACTIVE` is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied: the row is `ACTIVE` because W1a landed
+        product code, even though that code is UNREACHED -- no production path
+        constructs `Exl3LinearMethod` yet -- and pinning the state here means a
+        later refactor of the claim-ownership or structured-spec rules cannot
+        silently take this pin with it. The state was `SPIKE` in the first draft
+        of this row while the spec's own `## Now` already said `ACTIVE`; a fresh
+        review caught the divergence, and this assertion is what stops it
+        recurring.
         """
         errors: list[str] = []
         rows, _ = agent_record.check_matrices(errors)
@@ -757,7 +761,7 @@ class AgentRecordMutationTests(unittest.TestCase):
         found = [row for row in rows if row.item_id == item_id]
         self.assertEqual(len(found), 1, item_id)
         self.assertEqual(found[0].path.name, "quantization-matrix.md", item_id)
-        self.assertEqual(found[0].field("state").strip().strip("`"), "SPIKE", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
 
         # One row, not two: the rank-sliced layout is the same scheme and must
         # not acquire a sibling SCHEME row. Scoped to `QUANT-` deliberately --

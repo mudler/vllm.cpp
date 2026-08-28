@@ -1874,15 +1874,32 @@ which is precisely how this landed green locally in the first place.
   `.agents/oracles/exllamav3.md` file with its `gateable` verdict AND the
   AGENTS.md table row — and neither was edited here: this dispatch is W2a+W2b,
   and AGENTS.md is the binding policy file, not a helper's to widen.
-- **The CUDA arm compiles nowhere yet.** `src/vt/cuda/cuda_exl3.cu` has never
-  been through `nvcc`: the implementer host has no toolkit and `dgx.casa` is
-  down. First verdict comes from `cuda-fat-build` or from
-  `cmake -S . -B build-cuda -G Ninja -DVLLM_CPP_CUDA=ON
-  -DVLLM_CPP_CUDA_ARCHITECTURES=121a && cmake --build build-cuda --target vllm -j 4`.
-- **Every W2 device measurement.** The byte gate for `had_r_128`, the tier-3
-  bound for `exl3_gemm`, and the shape the device actually takes. All three are
-  one command once the box returns:
-  `rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V`.
+- ~~**The CUDA arm compiles nowhere yet.**~~ **RETIRED 2026-08-28.**
+  `src/vt/cuda/cuda_exl3.cu` compiles and its object carries an `sm_121a` cubin
+  (MEASURED 2026-08-28 on `dgx:gpu0` (GB10 `sm_121a`, driver 580.173.02, nvcc 13.0.88, worker `rc-worker-4b8lj`, tree `525d2b991`, Release), with `cuda_exl3.cu.o` carrying one `cuda_exl3.cu.1.sm_121a.cubin`). CI's `cuda-fat-build` compiles the same
+  translation unit for ten architectures and has been green on `main` since at
+  least 2026-08-27T23:54:55Z (run 33121667815), so this was already stale when
+  it was measured directly.
+- **Every W2 device measurement — PARTLY TAKEN 2026-08-28, and the residue is
+  named rather than rounded up to "done".** MEASURED 2026-08-28 on `dgx:gpu0` (GB10 `sm_121a`, driver 580.173.02, nvcc 13.0.88, worker `rc-worker-4b8lj`, tree `525d2b991`, Release), with `cuda_exl3.cu.o` carrying one `cuda_exl3.cu.1.sm_121a.cubin`:
+  - W2a `had_r_128` CUDA vs CPU: **BYTE-IDENTICAL** (`mismatches == 0`). MET.
+  - W2b `exl3_gemm` vs the f64 reference: **`rel_rms 5.538e-4`** against the
+    stated `1.0e-3`, worst `0.0334` against 8 ulp `0.0625`. MET.
+  - W2c tier 3c on the GEMV arm: **`rel_rms 5.160e-4`** against `6.0e-3`, worst
+    `0.125` against 64 ulp `1.0`. MET — but the case FORCES the arm through
+    `force_gemv`, deliberately, so what is measured is the arm's NUMERICS and
+    not whether the heuristic would choose it. See `narrow_coresident` below,
+    which is still owed.
+  - W2d tier 4 on the fused MoE arm: **STILL OWED, and it cannot be taken on
+    this code.** The case skips on `CudaBackend::DeviceMemoryIsHostAddressable()`,
+    which answers `false` BY DESIGN (`cuda_backend.cu:330-366`, #1635: a
+    `cudaMalloc` pointer is not host-dereferenceable even on GB10), and the
+    fused kernel dereferences its per-expert pointer tables on the device. So
+    the arm whose whole rationale is `3 * topk * T` launches -> 1 per layer has
+    never run on a GPU and cannot until the device-resident tower below lands.
+    The suite still reports 8/8 because the skip asserts its own precondition.
+  - The real-checkpoint spot anchors: **STILL OWED.** That run decoded ZERO real
+    tensors — `test_exl3_dequant` reported `SKIPPED: no readable EXL3 shard`.
   No speed number was attempted and none is quoted.
 - **The CUDA arm instantiates `bits == 3`, `codebook == 1` (mcg) ONLY.** Eight
   template instantiations rather than 64 in a TU the fat build compiles for ten

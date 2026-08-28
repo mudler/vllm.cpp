@@ -16,6 +16,7 @@
 // disagreement is a defect rather than drift.
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 

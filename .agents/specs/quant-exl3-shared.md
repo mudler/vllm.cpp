@@ -125,6 +125,94 @@ and say so at the refusal.
 #1875's blockers are its DSA composition and its residency, neither of which
 this row's seam changes.
 
+## Dependencies
+
+| Depends on | State | Effect if it moves |
+|---|---|---|
+| `vt::Exl3Gemm` / `Exl3HadR128` / `Exl3MoeMlp` (`MODEL-DSV4-EXL3` W2) | LANDED, device-proven | none — this row consumes them and changes nothing in them |
+| `vt::CastF16` | LANDED here (W1a) | its four missing backend arms fall due with W1b |
+| the shared dense container + forward (`Qwen3DenseWeights`, the Qwen3-dense `AttnBlock` that `LlamaForCausalLM` reuses) | owned elsewhere | W1b ADDS an arm to it; if that container is restructured, W1b rebases onto the new shape |
+| `exllamav3` as a gateable oracle (#1901) | `gateable = no`, does not build on aarch64 | blocks the oracle token gate ONLY; every gate this row states is reachable without it |
+| a device-resident trellis tower | OWED (W2, and `MODEL-DSV4-EXL3` `## Owed`) | blocks the `Exl3MoeMlp` device arm and any large EXL3 checkpoint |
+| nothing in `MODEL-DSV4-EXL3`'s DSA work (#1961, #1970, #1976) | open | **no dependency either way** — that row's blockers are attention and residency, not the scheme, which is why this row can finish while that one cannot |
+
+## Work breakdown
+
+Dependency order, and what can run in parallel. The content of each wave is in
+`## Scope, in waves` above; this is the sequencing.
+
+| Wave | Needs | Can run beside | Gateable on |
+|---|---|---|---|
+| W1a — the scheme, the method, `CastF16` | nothing | — | CPU, no checkpoint. **LANDED** |
+| W1b — the native reader, the dense arm, one model e2e | W1a | W3 | CPU + a 1.09 GB checkpoint |
+| W2 — device residency | W1b (for a caller) | W3 | a GPU lease |
+| W3 — width coverage (the 6-bit head) | W1a | W1b, W2 | CPU for the refusal, a GPU for the arm |
+| W4 — DeepSeek-V4 routed onto this seam | W1b, W2 | — | that row's own gates |
+
+W1b is the critical path and the only wave that turns a class into a
+capability. W3 is independent of it and is the one wave a second agent could
+take in parallel without touching W1b's files.
+
+## Upstream chain
+
+The two halves come from different places, which is the whole shape of this row.
+
+| Piece | Source | Anchor |
+|---|---|---|
+| the scheme seam | **vLLM** (primary) | `layers/quantization/base_config.py:87-180` (`QuantizationConfig`, `get_quant_method`); `layers/linear.py:141-181` (`LinearMethodBase`) |
+| the local seam it mirrors | this tree | `include/vllm/model_executor/layers/quantization/base_config.h`; `include/vllm/model_executor/layers/linear.h:43` |
+| the trellis format | **exllamav3** (secondary, pinned `2398c056`) | `modules/quant/exl3.py:16-40` (the owned tensors), `:183-214` (the runtime form), `:227-237` (the reconstruction form) |
+| the codebook | exllamav3 | `exllamav3_ext/quant/codebook.cuh:67-75` (`decode_3inst`, cb == 1) |
+| the codeword window | exllamav3 | `exllamav3_ext/quant/exl3_dq.cuh:15-31` |
+| the storage predicate | exllamav3 | `modules/linear.py:385-389` (`is_exl3_storage`: `trellis` + `suh\|su` + `svh\|sv`) |
+
+vLLM registers no EXL3 at the parity pin, which is what admits the secondary
+oracle for the format. It does NOT admit one for the seam, and the seam is
+mirrored from vLLM.
+
+## Our baseline
+
+The kernels already exist and are gated; this row consumes them and adds
+nothing to them.
+
+| Piece | Where | State |
+|---|---|---|
+| CPU reference dequant | `src/vt/cpu/cpu_exl3_dequant.cpp` | gated (`test_exl3_dequant` 3/3, 66 assertions) |
+| `Exl3Gemm`, `Exl3HadR128` CPU | `src/vt/cpu/cpu_exl3_kernels.cpp` | gated (`test_exl3_gemm` 13/13, 199) |
+| the CUDA arm | `src/vt/cuda/cuda_exl3.cu` | compiles `sm_121a`; `had_r_128` byte-identical, `exl3_gemm` `rel_rms 5.538e-4`, GEMV tier 3c `5.160e-4`, GB10 2026-08-28 |
+| `Exl3MoeMlp` device arm | same | UNRUN — needs a device-resident tower (W2) |
+| the shape policy | `src/vt/exl3_policy.cpp` | gated, host-side |
+| the only consumer | `src/vllm/model_executor/models/deepseek_v4.cpp` | model-private, which is the gap this row closes |
+
+The scheme's own baseline is empty: no `QUANT-EXL3` row existed before #2181 and
+no architecture but DeepSeek-V4 could reach the format.
+
+## Port map
+
+| Upstream | Ours | Wave |
+|---|---|---|
+| `LinearMethodBase.apply` | `layers::Exl3LinearMethod::Apply` (`quantization/exl3.h`) | W1a — LANDED |
+| `get_quant_method` | `layers::MakeLinearMethod(const OwnedTensor&, const Exl3Weight&)` | W1a — LANDED |
+| the fp16 activation the format assumes | `vt::CastF16` (`ops.h`, CPU + CUDA) | W1a — LANDED |
+| `Linear.is_exl3_storage` / `load_exl3` | the native-layout reader, no rank segment | W1b — OWED |
+| the dense container's quantized arm | `Qwen3DenseWeights` + the Qwen3-dense forward that `LlamaForCausalLM` reuses verbatim | W1b — OWED |
+| `LinearEXL3.tp_import_split` | NOT ported: the stock layout is not TP-sliced, and the rank-sliced arm already exists on `MODEL-DSV4-EXL3` | out of scope |
+
+## Tests to port
+
+exllamav3's own suites are the source, adapted only where the harness forces it.
+
+| Upstream test | Ours | State |
+|---|---|---|
+| `tests/test_quant_fn.py:83-116` (the tail-biting window and its reference) | `tests/vt/test_exl3_dequant.cpp` | ALREADY PORTED by `MODEL-DSV4-EXL3` W1a |
+| the reconstruct-vs-runtime identity (`exl3.py:183-214` vs `:227-237`) | `test_exl3_linear_method.cpp`, `Apply` vs the weight-side dequant at 2.0e-3 | W1a — LANDED |
+| no upstream test covers per-tensor `bits` | ours is NEW, and it has to be: upstream reads the width from the tensor everywhere and never had the config-scalar trap to guard | W1a — LANDED |
+| an end-to-end generation | `turboderp/Llama-3.2-1B-Instruct-exl3` through a production entry point | W1b — OWED |
+
+Upstream's kernel tests are CUDA-only and unrunnable here while `exllamav3`
+records `gateable = no` (#1901); that is recorded as debt rather than adapted
+into something weaker wearing the same name.
+
 ## Design
 
 **Why a `LinearMethodBase` rather than a fourth field on the dense container.**
@@ -167,7 +255,7 @@ token gate cannot see a dtype that is too wide.
 
 Red first, in this order:
 
-1. `tests/vllm/layers/test_exl3_linear_method.cpp` — the method's `Apply`
+1. `tests/vllm/model_executor/layers/test_exl3_linear_method.cpp` — the method's `Apply`
    against `vt::Exl3DequantLinear` + a dense GEMM on the same fixture, and
    `bits` resolved from the tensor rather than the config (a fixture whose
    config says 3 and whose tensor says 6 must decode at 6).
@@ -217,6 +305,15 @@ Stated here before code, per risk 1:
   `MakeLinearMethod` call from the dense forward — is W1b, owned by this row and
   tracked by #2181. Until it lands, this row has a class rather than a
   capability, which is the distinction `.agents/reachability.md` exists for.
+- **`vt::CastF16` is registered on TWO backends where its siblings have SIX.**
+  `kCastBf16` and `kCastF32` are each registered for CPU, CUDA, ROCm, Vulkan,
+  Metal and Tenstorrent; `kCastF16` has CPU and CUDA only. The header calls it
+  "the third sibling" and that is true of its semantics, not yet of its reach.
+  Nothing is broken today, because no production path calls it and
+  `RegisterReferenceTier` installs a CPU fallback on host-addressable targets —
+  but the four missing arms fall due with W1b, which is what makes the op
+  reachable. Named here because a gap nobody wrote down is the one discovered by
+  a red gate on somebody else's row.
 - **The CUDA arm of `vt::CastF16` has not been compiled or run.** It is
   registered in `cuda_glue.cu` beside its two siblings and the CPU arm is gated;
   the device verdict comes from `cuda-fat-build` or from

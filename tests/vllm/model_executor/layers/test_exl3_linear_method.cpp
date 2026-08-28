@@ -26,13 +26,23 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
-#include "vt/exl3_fixture.h"  // tests/vt/exl3_fixture.h — the shared EXL3 fixture
+// The shared EXL3 fixture, at tests/vt/exl3_fixture.h. The three other users
+// live in tests/vt/ and write the plain `"exl3_fixture.h"`, which resolves
+// relative to their own directory and CANNOT resolve from here; this suite
+// needs the `vt/` prefix against the `tests/` include root
+// (tests/CMakeLists.txt:23). That root is searched BEFORE `include/`, and no
+// `include/vt/exl3_fixture.h` exists, so the prefix is unambiguous today —
+// adding one would silently switch this file's fixture, which is the shadowing
+// surface tests/CMakeLists.txt:20-22 warns about and the reason this is spelled
+// out rather than left to look like a typo.
+#include "vt/exl3_fixture.h"
 
 namespace {
 
 using exl3_test::Exl3Fixture;
 using exl3_test::MakeFixture;
 using exl3_test::Rng;
+using exl3_test::UlpF16;
 using vllm::OwnedTensor;
 using vt::DType;
 namespace layers = vllm::layers;
@@ -139,8 +149,9 @@ TEST_CASE("exl3 linear method: bits come from the TENSOR, never from a config sc
                         w3.data());
   CHECK(RelRms(w3, w6) > 0.5);
 
-  // A trellis whose last dim is not a multiple of 16 is not a width this format
-  // can express, and is refused rather than rounded.
+  // A trellis whose last dim is not a multiple of 32 BYTES (16 i16 words on
+  // disk) is not a width this format can express, and is refused rather than
+  // rounded.
   layers::Exl3Weight bad = WrapFixture(three);
   bad.trellis.shape[2] = 47;
   CHECK_THROWS(bad.Bits());
@@ -229,7 +240,100 @@ TEST_CASE("exl3 linear method: a mismatched activation width REFUSES BY NAME") {
 
   std::vector<float> x(2 * 64, 0.5f);
   vllm::dense_attn::DBuf xb(d, DType::kF32, {2, 64}, x.data());
-  CHECK_THROWS(method->Apply(d, xb.t(), DType::kF32));
+
+  // BY NAME is the claim, so the message is the assertion. A bare CHECK_THROWS
+  // here passes on `vt::CastF16`'s downstream "same element count" throw just as
+  // happily, which would leave THIS refusal ungated while the case still read
+  // green — and deleting the check in a scratch copy proved exactly that.
+  std::string what;
+  try {
+    method->Apply(d, xb.t(), DType::kF32);
+    FAIL("exl3 linear: a mismatched activation width did NOT throw at all");
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  INFO("refusal message: " << what);
+  CHECK(what.find("exl3 linear") != std::string::npos);
+  CHECK(what.find("the weight needs K=") != std::string::npos);
+  CHECK(what.find("128") != std::string::npos);
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(q);
+}
+
+TEST_CASE("exl3 linear method: the f16 OUT arm is the kernel's own, and is executed") {
+  // The f16 arm is the one `Exl3Gemm` writes natively, and it was the arm no
+  // case asked for: gutting it in a scratch copy left the suite green, so the
+  // header's "the output dtype is the caller's" paragraph was unpinned exactly
+  // where the caller and the kernel agree.
+  vt::Queue q = CpuQueue();
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{b, q};
+
+  const int64_t m = 2, k = 128, n = 128;
+  const Exl3Fixture f = MakeFixture(k, n, 3, 0xF16Au);
+  const layers::Exl3Weight w = WrapFixture(f);
+  OwnedTensor bf16;
+  auto method = layers::MakeLinearMethod(bf16, w);
+
+  Rng rng;
+  rng.s = 0x2468ACEu;
+  std::vector<float> x(static_cast<size_t>(m * k));
+  for (auto& v : x) v = vt::F16ToF32(vt::F32ToF16(rng.next(1.0f)));
+  vllm::dense_attn::DBuf xb(d, DType::kF32, {m, k}, x.data());
+
+  vllm::dense_attn::DBuf f16_out = method->Apply(d, xb.t(), DType::kF16);
+  vllm::dense_attn::DBuf f32_out = method->Apply(d, xb.t(), DType::kF32);
+  CHECK(f16_out.t().dtype == DType::kF16);
+
+  std::vector<uint16_t> got(static_cast<size_t>(m * n));
+  std::vector<float> ref(static_cast<size_t>(m * n));
+  f16_out.Download(d, got.data());
+  f32_out.Download(d, ref.data());
+
+  // The f16 arm is the same answer at the kernel's own width. It is NOT
+  // byte-equal to `F32ToF16(f32 arm)` in general -- the kernel's own f16 output
+  // transform rounds inside `had_r_128` rather than after it -- so this is a
+  // bounded agreement, and the bound is one f16 ulp of the value.
+  double worst = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double d16 = static_cast<double>(vt::F16ToF32(got[i]));
+    worst = std::max(worst, std::abs(d16 - static_cast<double>(ref[i])));
+  }
+  MESSAGE("f16 out arm vs f32 out arm: worst abs = ", worst);
+  double mag = 0.0;
+  for (float v : ref) mag = std::max(mag, static_cast<double>(std::abs(v)));
+  REQUIRE(mag > 0.0);  // not vacuous: a zeroed arm would pass any bound below
+  CHECK(worst <= 4.0 * UlpF16(static_cast<float>(mag)));
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(q);
+}
+
+TEST_CASE("exl3 linear method: an out dtype it cannot write REFUSES") {
+  // Deleting this check in a scratch copy left the suite green, and what it
+  // then does is worse than a wrong number: `Apply(d, x, kI8)` falls through
+  // the f16 and f32 arms and silently returns a kBF16 buffer, so the caller
+  // gets a different dtype than it asked for with no diagnostic anywhere.
+  vt::Queue q = CpuQueue();
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{b, q};
+
+  const Exl3Fixture f = MakeFixture(128, 128, 3, 0x0D7Du);
+  const layers::Exl3Weight w = WrapFixture(f);
+  OwnedTensor bf16;
+  auto method = layers::MakeLinearMethod(bf16, w);
+
+  std::vector<float> x(2 * 128, 0.25f);
+  vllm::dense_attn::DBuf xb(d, DType::kF32, {2, 128}, x.data());
+
+  std::string what;
+  try {
+    method->Apply(d, xb.t(), DType::kI8);
+    FAIL("exl3 linear: an unwritable out dtype did NOT throw at all");
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  INFO("refusal message: " << what);
+  CHECK(what.find("out_dtype") != std::string::npos);
 
   vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(q);
 }

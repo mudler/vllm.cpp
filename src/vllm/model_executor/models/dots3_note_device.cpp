@@ -154,6 +154,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <stdexcept>
 #include <string>
@@ -508,10 +509,24 @@ DBuf DenseMlp(Dev d, const Dots3NoteDenseMlp& w, const Tensor& dh, int64_t T,
 
 // ─── the MoE block (W5, #699) ───────────────────────────────────────────────
 // Per-layer RESIDENT expert device-pointer arrays for the grouped bf16 MoE
-// GEMM. Uploaded ONCE at first touch, keyed on the layer's weight-struct
-// address, and never freed for the process lifetime — the same
-// retire-don't-free contract `deepseek_v2.cpp`'s `MoePtrs` and
-// `qwen3_5.cpp`'s `MoeBf16Resident` already rely on, so nothing can dangle.
+// GEMM. Uploaded ONCE at first touch and never freed for the process lifetime,
+// the same retire-don't-free contract `qwen3_5.cpp`'s `MoeBf16Resident` relies
+// on for the DEVICE allocations, so nothing they point at can dangle.
+//
+// THE STATE ITSELF IS OWNED BY THE WEIGHTS, NOT BY AN ADDRESS-KEYED TABLE.
+// W5 first shipped this as `static std::map<const Dots3NoteMoeWeights*, ...>`,
+// which is the shape issue #237 removed from `qwen3_5.cpp` (`ce2349dee`,
+// 2026-08-10) precisely because it corrupts output across two engines in one
+// process: `ready` is inherited from a destroyed engine whose device pointers
+// now belong to whatever the new engine allocated there, and since the buffers
+// are never freed there is no crash to notice. `deepseek_v2.cpp`'s `MoePtrs`
+// still carries the pre-#237 shape (`04f5c01e7`, 2026-07-22) — that is unswept
+// debt on a SACRED path, tracked separately, and it is not a precedent.
+//
+// `ResidentIn` below is the qwen3_5.cpp accessor, which is file-local `static`
+// there and so cannot be called from here; laguna.cpp:497 spells the same
+// three lines out for the same reason. What matters is the PROPERTY, and it is
+// identical: the state is keyed on the slot the weights own.
 struct Dots3NoteMoePtrs {
   void* gate = nullptr;
   void* up = nullptr;
@@ -519,9 +534,13 @@ struct Dots3NoteMoePtrs {
   std::map<int64_t, void*> tok_map;  // T -> [T*top_k] i32 pair->token row map
   bool ready = false;
 };
-Dots3NoteMoePtrs& Dots3NoteMoePtrsFor(const Dots3NoteMoeWeights* key) {
-  static std::map<const Dots3NoteMoeWeights*, Dots3NoteMoePtrs> table;
-  return table[key];
+Dots3NoteMoePtrs& Dots3NoteMoePtrsFor(const Dots3NoteMoeWeights* w) {
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!w->resident_moe.state) {
+    w->resident_moe.state = std::make_shared<Dots3NoteMoePtrs>();
+  }
+  return *static_cast<Dots3NoteMoePtrs*>(w->resident_moe.state.get());
 }
 
 // Is the grouped bf16 GEMM arm available for this layer's weights?

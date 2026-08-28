@@ -405,6 +405,24 @@ struct Dots3NoteMoeWeights {
   // (`Dots3NoteParams::shared_intermediate_size`), gate/up merged for the
   // shared `layers::MlpGateUpMethodBase` seam exactly as the dense MLP is.
   Dots3NoteDenseMlp shared;
+  // The device-resident per-expert pointer arrays the grouped bf16 MoE GEMM
+  // reads, built ONCE on first device-MoE use and owned BY THIS BLOCK (issue
+  // #237's `ResidentSlot`, qwen3_5_weights.h, which this header already
+  // includes). Opaque here on purpose: the resident type is a CUDA
+  // implementation detail of `dots3_note_device.cpp`, exactly as
+  // `MoeBlockWeights` keeps qwen3_5.cpp's out of its own header.
+  //
+  // KEYED ON THE SLOT, NEVER ON AN ADDRESS. W5 first shipped this state as a
+  // process-lifetime `static std::map<const Dots3NoteMoeWeights*, ...>`. An
+  // address is only a valid identity while the object lives: destroy one engine
+  // and build another in the same process, and the allocator can hand the new
+  // weights the old ones' address. The new block then finds an entry already
+  // marked ready and every routed expert GEMM reads the PREVIOUS engine's
+  // device pointers. Because those buffers are deliberately never freed, there
+  // is no crash and no error — the second model silently answers from the
+  // first's experts. That is issue #237, and `tests/vllm/models/
+  // test_moe_resident_lifetime.cpp` pins the invariant for this block too.
+  ResidentSlot resident_moe;
 };
 
 struct Dots3NoteLayerDeviceWeights {

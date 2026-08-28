@@ -3402,6 +3402,17 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
+// out[i] = F32ToF16(in[i]); out f16, in f32 or bf16, same element count.
+// QUANT-EXL3 W1a (#2181). LoadF32 reads either source width as f32 and StoreF32
+// rounds once to the f16 destination (cpu_ops.cpp:44-51), so the bf16 source
+// path is "widen exactly, then round once" rather than a reinterpretation.
+void CastF16Kernel(Queue&, Tensor& out, const Tensor& in) {
+  const int64_t n = out.Numel();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) StoreF32(out, i, LoadF32(in, i));
+  });
+}
+
 // x[m,n] *= col[n]; x f32 OR bf16 [M,N] (inner-contiguous rows, row stride
 // x.stride[0]), col always f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel,
 // and the portable reference every other backend ports FROM — so it carries the
@@ -3831,6 +3842,8 @@ struct Registrar {
                    static_cast<TopKValuesIndicesFn>(&TopKValuesIndicesKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
+    RegisterOp(OpId::kCastF16, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<CastF16Fn>(&CastF16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32Kernel)));
     RegisterOp(OpId::kMulColVecF32, DeviceType::kCPU,

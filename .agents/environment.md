@@ -1839,6 +1839,42 @@ environment:
   | Device probe | `mx.metal.device_info()` -> `applegpu_g16g`, `max_recommended_working_set_size` 12,713,115,648 (11.84 GiB), `max_buffer_length` 9,534,832,640 |
   | Removal | `rm -rf ~/mlx-venv ~/hf-cache` — neither is on any PATH our builds consult |
 
+- **Local AMD/ROCm profile (gfx1200)**: Radeon RX 9060 XT, `gfx1200` (RDNA 4),
+  ROCm 7.2.3, AMD Ryzen 7 5800XT host. It is not a fleet device, so `rc` does
+  not manage it and GPU work takes the file mutex `${GPU_LOCK:-$HOME/gpu.lock}`
+  directly. Build it from `nix develop .#rocm-shell`, which prints the
+  configure and gate recipe on entry, and read the arch from `rocminfo`'s
+  `Name:` field rather than from `CMakeCache.txt`. This box is the gate
+  environment for the `BACKEND-ROCM` rows.
+
+  **The `ROCm` known-red baseline. A row on this box does NOT own these.**
+  Same key and same columns as the sm_110 table above: the pair is
+  `(name, failure mode)`, the table is keyed on NAME, and the line number is a
+  pointer to re-derive rather than part of the key.
+
+  | Test | Mode | First failing assertion | Cause |
+  |---|---|---|---|
+  | `test_backend_cross_device` | Failed | `:2067` `CHECK(got == ref_b)`, case "MoeSiluMul matches the CPU oracle within NMSE <= 5e-4", bf16 arm, logged `std::string(DeviceName(dt)) := ROCM`. 26 cases / 25 passed, 80253 assertions / 1 failed | [#1954](https://github.com/mudler/vllm.cpp/issues/1954), the gfx1200 counterpart of the CUDA-only [#1802](https://github.com/mudler/vllm.cpp/issues/1802), which carries this same test name and this same assertion on sm_110. [#907](https://github.com/mudler/vllm.cpp/issues/907) is the same DEFECT FAMILY on sm_121a and NOT the same test: it records `test_cuda_ops`'s "CUDA silu_and_mul matches CPU" failing at 439 of 440 assertions, a different test and a different assertion. Elements differ in the last digit |
+
+  #1954 recorded that assertion at `:2063`, which is where it sat before this
+  row's `CAPTURE` repair added four comment lines above it. The move is the
+  reason the key is the name and not the line.
+
+  Measured 2026-08-25 on `row/ROCM-KQUANT-NWARPS-DECODE`, gate
+  `ctest --test-dir build-hip -R 'rocm|cross_device'`, 5 tests / 4 passed / 1
+  failed. The assertion count and the pass and fail split have not moved since
+  `b06928af4`, and that control was run twice: once by a fresh review, once by
+  the implementer of `d0474321c` while writing this note. Two runs, not two
+  reviews. The line number and the `ROCM` rendering in the row above are read
+  from `d0474321c` instead, because that is the commit that moved the assertion
+  and repaired the `CAPTURE` spelling; at `b06928af4` the same failure sits at
+  `:2063` and logs `DeviceName(dt) := 1`. Proven pre-existing rather than
+  assumed: reverting that row's two source files to the parent `5888abf11` and
+  rebuilding reproduces the identical failure, at 24 of 25 cases and 1 of 80195
+  assertions. **Report this gate as one expected red, never as a clean pass**,
+  and re-measure whenever the base SHA moves across `src/`, `include/` or
+  `tests/`.
+
 ## Benchmark models on Ettore's dgx.casa profile
 
 - `~/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4`

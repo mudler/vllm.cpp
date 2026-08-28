@@ -1329,17 +1329,18 @@ struct PagedAttentionArgs {
   // device read (companion to query_start_loc_host). 0 => that launcher falls
   // back to the D2H+sync.
   int32_t max_seq_len = 0;
-  // OPTIONAL fp8 KV-cache read (KV-FP8 W1 CPU, W2 CUDA). kAuto (default) => the cache holds
-  // the model float dtype and is read directly — every existing caller is
-  // byte-identical. When != kAuto the K/V cache pages are 1-byte fp8 (DType::kI8
-  // storage) and each read is DEQUANTIZED as Dequant(fp8) * k_scale|v_scale
-  // before entering the f32 softmax, mirroring the fp8 attention read path
-  // (scaled_vec_conversion<float,uint8_t>, quant_utils.cuh:302-308). k_scale /
-  // v_scale are the per-tensor scales from BaseKVCacheMethod (kv_cache.py:108-191)
-  // — 1.0 is the uncalibrated default. Per-head scales are a later brick.
-  // Implemented on CPU and CUDA. kMETAL/kROCM register kPagedAttention for the
-  // FLOAT path only, and because these fields are ADDITIVE the provider table
-  // cannot tell the two arms apart, so src/vt/ops.cpp refuses them by name.
+  // OPTIONAL fp8 KV-cache read (KV-FP8 W1 CPU, W2 CUDA, W6 ROCm). kAuto
+  // (default) => the cache holds the model float dtype and is read directly —
+  // every existing caller is byte-identical. When != kAuto the K/V cache pages
+  // are 1-byte fp8 (DType::kI8 storage) and each read is DEQUANTIZED as
+  // Dequant(fp8) * k_scale|v_scale before entering the f32 softmax, mirroring
+  // the fp8 attention read path (scaled_vec_conversion<float,uint8_t>,
+  // quant_utils.cuh:302-308). k_scale / v_scale are the per-tensor scales from
+  // BaseKVCacheMethod (kv_cache.py:108-191) — 1.0 is the uncalibrated default.
+  // Per-head scales are a later brick. Implemented on CPU, CUDA, and ROCm.
+  // kMETAL registers kPagedAttention for the FLOAT path only, and because
+  // these fields are ADDITIVE the provider table cannot tell the two arms
+  // apart, so src/vt/ops.cpp refuses Metal by name.
   Fp8KVCacheDataType kv_cache_dtype = Fp8KVCacheDataType::kAuto;
   float k_scale = 1.0f;
   float v_scale = 1.0f;

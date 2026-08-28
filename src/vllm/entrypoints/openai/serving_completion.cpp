@@ -3,6 +3,8 @@
 #include "vllm/entrypoints/openai/serving_completion.h"
 
 #include <ctime>
+#include <deque>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -14,6 +16,7 @@
 #include "vllm/entrypoints/beam_search.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/tokenizer/tokenizer.h"
+#include "vllm/v1/engine/validation_error.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -50,6 +53,16 @@ class CompletionSseStream final : public SseStream {
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
+    // completion/serving.py:330-442 yields ONE frame per CompletionOutput, and
+    // a parallel-sampling frame carries up to n of them (the collector keeps
+    // distinct indices side by side, output_processor.cpp Merge). Drain those
+    // buffered frames before any terminal frame, so the usage chunk and [DONE]
+    // stay last.
+    if (!pending_.empty()) {
+      chunk = std::move(pending_.front());
+      pending_.pop_front();
+      return true;
+    }
     if (usage_pending_) {
       CompletionStreamResponse frame;
       frame.id = response_id_;
@@ -89,32 +102,42 @@ class CompletionSseStream final : public SseStream {
         continue;
       }
 
-      const CompletionOutput& output = response.outputs.front();
-      const std::string delta_text = SanitizeUtf8(output.text);
-      // completion/serving.py:368-374 chunked-prefill hold-back. Preserve a
-      // terminal empty chunk so clients still observe finish_reason.
-      if (delta_text.empty() && output.token_ids.empty() &&
-          previous_num_tokens_ == 0 && !response.finished) {
-        continue;
-      }
-      previous_num_tokens_ += static_cast<int>(output.token_ids.size());
+      // :330-331 `for output in res.outputs:` / `i = output.index + prompt_idx
+      // * num_choices` — every output in the frame gets its own chunk, not just
+      // the first.
+      for (const CompletionOutput& output : response.outputs) {
+        const std::string delta_text = SanitizeUtf8(output.text);
+        // :376-380 chunked-prefill hold-back, read PER CHOICE
+        // (previous_num_tokens[i]). Preserve a terminal empty chunk so clients
+        // still observe finish_reason.
+        int& choice_tokens = tokens_by_index_[output.index];
+        if (delta_text.empty() && output.token_ids.empty() &&
+            choice_tokens == 0 && !response.finished) {
+          continue;
+        }
+        choice_tokens += static_cast<int>(output.token_ids.size());
+        previous_num_tokens_ += static_cast<int>(output.token_ids.size());
 
-      CompletionResponseStreamChoice choice;
-      choice.index = output.index;
-      choice.text = delta_text;
-      choice.finish_reason = output.finish_reason;
+        CompletionResponseStreamChoice choice;
+        choice.index = output.index;
+        choice.text = delta_text;
+        choice.finish_reason = output.finish_reason;
 
-      CompletionStreamResponse frame;
-      frame.id = response_id_;
-      frame.created = created_;
-      frame.model = model_;
-      frame.choices.push_back(std::move(choice));
-      if (usage_.include_continuous_usage) {
-        frame.usage = UsageInfo{prompt_tokens_,
-                                prompt_tokens_ + previous_num_tokens_,
-                                previous_num_tokens_};
+        CompletionStreamResponse frame;
+        frame.id = response_id_;
+        frame.created = created_;
+        frame.model = model_;
+        frame.choices.push_back(std::move(choice));
+        if (usage_.include_continuous_usage) {
+          // :433-440 continuous usage counts THIS choice's completions
+          // (previous_num_tokens[i]); the trailing usage frame sums them.
+          frame.usage = UsageInfo{prompt_tokens_,
+                                  prompt_tokens_ + choice_tokens,
+                                  choice_tokens};
+        }
+        pending_.push_back("data: " + nlohmann::json(frame).dump() + "\n\n");
       }
-      chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
+      if (pending_.empty()) continue;  // every output was held back
 
       if (response.finished) {
         engine_finished_ = true;
@@ -124,6 +147,8 @@ class CompletionSseStream final : public SseStream {
           done_pending_ = true;
         }
       }
+      chunk = std::move(pending_.front());
+      pending_.pop_front();
       return true;
     }
   }
@@ -142,7 +167,16 @@ class CompletionSseStream final : public SseStream {
   std::string model_;
   StreamUsageSelection usage_;
   int prompt_tokens_ = 0;
+  // The SUM over choices, for the trailing usage frame (:445
+  // `sum(previous_num_tokens)`).
   int previous_num_tokens_ = 0;
+  // previous_num_tokens[i] (:296): per-choice counts, which drive the
+  // chunked-prefill hold-back and continuous usage. Degenerate (one entry) for
+  // the n == 1 default, where it equals previous_num_tokens_.
+  std::map<int, int> tokens_by_index_;
+  // Frames built from one multi-output RequestOutput, waiting to be handed out
+  // one next() call at a time.
+  std::deque<std::string> pending_;
   bool usage_pending_ = false;
   bool done_pending_ = false;
   bool engine_finished_ = false;
@@ -236,11 +270,61 @@ CompletionResult OpenAIServingCompletion::create_completion(
     return result;
   }
 
+  // ── best_of != n + stream: DOWNGRADE, never refuse ───────────────────────
+  // Ported from serving_completion.py:253-260 @ `56e96b37e4^`:
+  //
+  //     # Similar to the OpenAI API, when n != best_of, we do not stream the
+  //     # results. Noting that best_of is only supported in V0. In addition,
+  //     # we do not stream the results when use beam search.
+  //     stream = (request.stream
+  //               and (request.best_of is None or request.n == request.best_of)
+  //               and not request.use_beam_search)
+  //
+  // best_of asks the engine for MORE candidates than the response returns and
+  // the endpoint keeps the top `n` by FINAL cumulative logprob (SelectBestOf,
+  // below). A delta stream has no final score until the last token of each
+  // candidate, so a ranked choice set cannot be emitted incrementally. Upstream
+  // does not turn that into an error: it SILENTLY serves the request as
+  // non-streaming and returns the ranked top-n body.
+  //
+  // WHY THE PIN'S TREE CANNOT SHOW THIS ANCHOR. `56e96b37e4` ("[V0 Deprecation]
+  // Remove `best_of`", vllm#29090, 2025-11-21) deleted the `best_of` clause and
+  // kept the beam-search one, so the field — and its stream rule — is gone at
+  // `5559679229`; the anchor is that commit's PARENT. The 400 below
+  // (completion/serving.py:136-139) is NOT precedent for refusing best_of:
+  // `65a4da1504` (vllm#36160, 2026-03-08) introduced it four months AFTER
+  // best_of was removed. At the one revision where the two ranked-selection
+  // modes coexisted, upstream DOWNGRADED both and refused neither. protocol.h
+  // declares this field an implementation of that same classic OpenAI /
+  // vLLM-V0 contract, so the downgrade is the contract's stream behaviour.
+  //
+  // Beam search keeps the pin's 400 (above) rather than that revision's
+  // downgrade, because the pin is what we mirror and the pin refuses it.
+  //
+  // NARROW: only `best_of != n` downgrades. best_of unset or == n has nothing
+  // to rank and streams n children exactly as a plain n>1 request does.
+  const bool stream_results =
+      request.stream &&
+      (!request.best_of.has_value() || request.n == *request.best_of);
+
   // request → SamplingParams. to_sampling_params sets output_kind to kDelta
   // when stream, kFinalOnly otherwise (protocol.cpp) — matching upstream's
   // per-request RequestOutputKind (completion/serving.py:174).
   SamplingParams sampling_params =
       request.to_sampling_params(std::nullopt, &default_sampling_params_);
+  // ADAPTATION, annotated. Upstream derives output_kind from the RAW
+  // `request.stream`: CompletionRequest.to_sampling_params sets it at
+  // protocol.py:1401-1403 @ 56e96b37e4^ (the class opens at :1086, the method
+  // at :1304; the chat twin is :915-917 in ChatCompletionRequest, class :528).
+  // So upstream asks for DELTA outputs on a request it then aggregates
+  // non-streamed. Our non-streaming arm reads the FINAL RequestOutput, so
+  // inheriting that would deliver only the last delta's text — the downgrade's
+  // whole point is that the client gets the SAME body the non-streamed request
+  // returns. Bind the kind to the EFFECTIVE stream instead; this changes no
+  // behaviour upstream's own aggregator relies on.
+  if (request.stream && !stream_results) {
+    sampling_params.output_kind = RequestOutputKind::kFinalOnly;
+  }
 
   // T0: single prompt, single choice (n == 1). The engine sub-request id is
   // f"{request_id}-{i}" upstream (:179); here i == 0.
@@ -248,7 +332,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
   // W2 production path: enqueue and return immediately with a live pull source.
   // The HTTP provider blocks on this request's collector one chunk at a time.
-  if (async_engine_ != nullptr && request.stream) {
+  if (async_engine_ != nullptr && stream_results) {
     v1::AsyncRequest async_request = async_engine_->add_request(
         engine_request_id, request.prompt, std::move(sampling_params),
         request.priority);
@@ -265,7 +349,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
     return result;
   }
 
-  if (request.stream) {
+  if (stream_results) {
     // ── Streaming (completion_stream_generator, :278) ─────────────────────
     // Drive the engine over DELTA RequestOutputs; format one
     // CompletionStreamResponse per non-empty delta, then `data: [DONE]\n\n`.
@@ -388,6 +472,36 @@ CompletionResult OpenAIServingCompletion::create_completion(
   response.usage.total_tokens = num_prompt_tokens + num_generated_tokens;
 
   CompletionResult result;
+
+  // ── the downgraded request still answers on the STREAM transport ─────────
+  // completion/serving.py:269-278 @ `5559679229` — this mechanism survives in
+  // the pin's own tree, even though the pin has no condition left that reaches
+  // it:
+  //
+  //     # When user requests streaming but we don't stream, we still need to
+  //     # return a streaming response with a single event.
+  //     if request.stream:
+  //         response_json = response.model_dump_json()
+  //
+  //         async def fake_stream_generator() -> AsyncGenerator[str, None]:
+  //             yield f"data: {response_json}\n\n"
+  //             yield "data: [DONE]\n\n"
+  //
+  //         return fake_stream_generator()
+  //
+  // A client that sent `stream: true` asked for `text/event-stream`, and a
+  // JSON content-type would break the OpenAI SDKs that unconditionally parse
+  // the stream. The single frame carries the COMPLETE CompletionResponse — the
+  // ranked top-n choices, `object: "text_completion"` and `usage` — not a
+  // CompletionStreamResponse delta, which is exactly upstream's shape.
+  if (request.stream) {
+    result.streaming = true;
+    result.sse_chunks.push_back("data: " + nlohmann::json(response).dump() +
+                                "\n\n");
+    result.sse_chunks.push_back("data: [DONE]\n\n");
+    return result;
+  }
+
   result.streaming = false;
   result.response = std::move(response);
   return result;

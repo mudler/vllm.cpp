@@ -69,9 +69,10 @@ returns a 44.1 kHz stereo WAV. See the
 
 IndexTTS-2.5 loads from `--speech-model` and returns a 22.05 kHz mono WAV. Each
 request must include `reference_audio` as a data URL for a 16-bit PCM mono WAV.
-The current engine does not use the reference clip for conditioning, so the
-clip does not select the output voice. The vLLM-Omni quality comparison is also
-pending. See the
+The clip must have a 16 kHz sample rate. Its CAMPPlus speaker vector conditions
+the talker and S2Mel stages. Different clips change the output, but this does
+not establish voice-cloning parity. The inferred emotion path is not
+implemented, and the vLLM-Omni quality comparison is pending. See the
 [owning model specification](../../.agents/specs/indextts-2-5.md) for the owned
 limitations and verification evidence.
 

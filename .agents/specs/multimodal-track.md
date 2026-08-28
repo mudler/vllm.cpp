@@ -1953,6 +1953,15 @@ L4 (§1.6); the second while landing L3 (§1.5).
   that reads it, so it takes the surprising-fix path rather than an in-flow
   repair. It is orthogonal to L3, which removes the tower rather than narrowing
   it, and it is why the L3 threshold is stated against 7.161 GiB.
+  **That surprising-fix spec is now committed:**
+  [`vision-tower-dtype-polarity.md`](vision-tower-dtype-polarity.md). It
+  answers the feasibility question — the storage is a carrier, every vision
+  tower narrows back to bf16 before its first GEMM, and the change is
+  bit-identical rather than merely within tolerance — and it declares, ahead of
+  any number, both the memory gate for the fix and the tower-skip threshold
+  that REPLACES the two resident figures above once the `x 2` at
+  `scripts/mm/tower_skip_rss.sh:431` goes. §8 there lists every surface on this
+  page that the implementing wave has to move in the same change.
 - **[#758](https://github.com/mudler/vllm.cpp/issues/758)** — a multimodal
   refusal cannot distinguish a configured limit from an unimplemented arm.
   Unchanged by L3, and recorded here so the L2 finding keeps an owner.

@@ -191,6 +191,32 @@ struct Dots3NoteParams {
   // `Dots3NotePaddedMLAAttention`, whose `get_kv_cache_spec` reports it :211).
   int64_t physical_latent_row() const { return swa.latent_row(); }
 
+  // The `quantization_config` block. ABSENT from the released bf16
+  // `dots-studio/dots3-note-prev` (verified against the committed fixture) and
+  // PRESENT on the `-fp8` sibling as `{"quant_method": "fp8", "fmt": "e4m3",
+  // "activation_scheme": "dynamic", "weight_block_size": [128, 128]}`.
+  //
+  // Upstream reads exactly this: `_padded_mlp_size` (model.py:63-73) takes
+  // `getattr(quant_config, "weight_block_size", None)`, and
+  // `Dots3NoteModel._pad_dense_mlp_weight` (model.py:598-618) does the same.
+  // We read it to REFUSE by name rather than to pad: the fp8 arm is W9, and
+  // `dense_loaders::MaterializeBf16Source` handles a per-tensor or
+  // per-output-ROW `<name>_scale` and nothing else, so a blockwise
+  // `weight_scale_inv` would otherwise surface as a bare "tensor not found".
+  std::string quant_method;                // "" when the block is absent
+  std::vector<int64_t> weight_block_size;  // empty when the key is absent
+  bool has_blockwise_quant() const { return !weight_block_size.empty(); }
+
+  // `intermediate_size=config.moe_intermediate_size * num_shared_experts`
+  // (model.py:103-107, through `_padded_mlp_size`, which is the identity at
+  // TP=1 with no `weight_block_size`). NOT `intermediate_size`: the released
+  // checkpoint's `mlp.shared_experts.gate_proj.weight` is [1536, 5120] and the
+  // dense layers' `mlp.gate_proj.weight` is [13824, 5120], so reading the wrong
+  // one is an 9x-too-wide MLP that the shape check refuses BY NAME.
+  int64_t shared_intermediate_size() const {
+    return moe_intermediate_size * n_shared_experts;
+  }
+
   Dots3NoteLayerKind kind_of(int64_t layer) const {
     return layer_types.at(static_cast<size_t>(layer));
   }
@@ -332,6 +358,32 @@ struct Dots3NoteDenseMlp {
   OwnedTensor down_proj;     // [hidden, intermediate] raw-NK
 };
 
+// `Dots3NoteMoE` (model.py:76) — `DeepseekV2MoE`'s router and routed experts
+// with the shared expert LIFTED OUT of the base and added unfused
+// (model.py:87-99 sets `n_shared_experts` to None on the routed config, so
+// `DeepseekV2MoE.__init__` takes its `shared_experts = None` branch at
+// deepseek_v2.py:354-355; model.py:125-127 does the add). Numerically that is
+// the same function the base computes when it owns the shared expert, which is
+// why `vt::MoeCombine`'s optional `shared` term expresses it exactly.
+//
+// The released `dots-studio/dots3-note-prev` ships every one of these BF16
+// except `e_score_correction_bias`, which is F32 — the ONLY dtype exception in
+// the MoE block, and F32 upstream too (deepseek_v2.py:322-324).
+struct Dots3NoteMoeWeights {
+  OwnedTensor router_gate;  // [H, E] Matmul-B (from the [E, H] `mlp.gate.weight`)
+  // `e_score_correction_bias` [E] F32 — built only for `topk_method ==
+  // "noaux_tc"` (deepseek_v2.py:321-326), which `ParseDots3NoteParams` already
+  // requires for this architecture, so it is never empty here.
+  OwnedTensor e_score_correction_bias;
+  std::vector<OwnedTensor> expert_gate;  // E x [H, moe_intermediate_size] Matmul-B
+  std::vector<OwnedTensor> expert_up;    // E x [H, moe_intermediate_size] Matmul-B
+  std::vector<OwnedTensor> expert_down;  // E x [moe_intermediate_size, H] Matmul-B
+  // The ONE shared expert, at `moe_intermediate_size * n_shared_experts`
+  // (`Dots3NoteParams::shared_intermediate_size`), gate/up merged for the
+  // shared `layers::MlpGateUpMethodBase` seam exactly as the dense MLP is.
+  Dots3NoteDenseMlp shared;
+};
+
 struct Dots3NoteLayerDeviceWeights {
   // WHICH of the two attention geometries this layer runs — `config.layer_types
   // [layer_idx] == "sliding_attention"` selects `Dots3NoteSlidingAttention`
@@ -342,7 +394,16 @@ struct Dots3NoteLayerDeviceWeights {
   OwnedTensor input_layernorm;           // [hidden]
   OwnedTensor post_attention_layernorm;  // [hidden]
   Dots3NoteMlaLayerWeights attn;
-  Dots3NoteDenseMlp mlp;
+  // WHICH MLP this layer runs — `is_moe` at model.py:514-519, i.e.
+  // `layer_idx < num_hidden_layers and n_routed_experts is not None and
+  // layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0`,
+  // which is `Dots3NoteParams::is_moe_layer`. Stored beside the weights rather
+  // than re-derived at each use, for the same reason `kind` is (W4b-2): on a
+  // MoE layer `mlp.gate_proj.weight` DOES NOT EXIST on disk, so the choice is
+  // structural and not a preference. (W5, #699.)
+  bool is_moe = false;
+  Dots3NoteDenseMlp mlp;      // populated iff !is_moe
+  Dots3NoteMoeWeights moe;    // populated iff  is_moe
 };
 
 // The materialized language tower, present ONLY for a config the device forward
@@ -397,8 +458,18 @@ struct Dots3NoteWeights {
 //
 // W4a/W4b cover both attention geometries — full and sliding-window — with a
 // DENSE MLP, and since W4b-3c a long SINGLE-SHOT prefill is served with the DSA
-// selection rather than refused. What remains is W5 (MoE), W6/W7 (the vision
-// and audio towers) and W10 (the nextn tail).
+// selection rather than refused. **W5 added the MoE layer and W5c removed the
+// nextn branch, so this function now returns "" for the RELEASED
+// `dots-studio/dots3-note-prev` config.** What it still refuses is a
+// BLOCKWISE-QUANTIZED checkpoint, which is W9: the `-fp8` sibling carries
+// `quantization_config.weight_block_size = [128, 128]` and a `weight_scale_inv`
+// per projection, while `dense_loaders::MaterializeBf16Source` reads a
+// per-tensor or per-output-ROW `<name>_scale` and would otherwise fail with a
+// bare "tensor not found".
+// — and the NEXTN tail, which is W10.
+//
+// The vision and audio towers (W6/W7) are NAMED DEFERRALS in the accounting
+// rather than refusals here, through `Dots3NoteDeferredTowers()`.
 //
 // NOTE what this function does NOT decide. The `seq_len > index_topk` question
 // is a property of the STEP, not of the config, so it lives in the forward

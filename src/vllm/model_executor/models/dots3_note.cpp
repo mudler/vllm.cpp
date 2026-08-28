@@ -249,6 +249,38 @@ Dots3NoteParams ParseDots3NoteParams(const HfConfig& config) {
   p.n_group = OptInt(raw, "n_group", 1);
   p.topk_group = OptInt(raw, "topk_group", 1);
 
+  // --- the `quantization_config` block (W5, #699) ---
+  // ABSENT from the released bf16 checkpoint and PRESENT on the `-fp8` sibling
+  // as `{"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+  // "weight_block_size": [128, 128]}`. Upstream reads `weight_block_size` off
+  // the quant config in two places (`_padded_mlp_size`, model.py:63-73, and
+  // `Dots3NoteModel._pad_dense_mlp_weight`, model.py:598-618). We read it to
+  // REFUSE by name in `Dots3NoteDeviceRefusal`, because the blockwise-fp8 arm
+  // is W9 and the bf16 loaders would otherwise fail with a bare tensor miss.
+  // Parsed here rather than at the refusal so a malformed block refuses at the
+  // same place every other malformed key does.
+  if (const nlohmann::json* qc = Field(raw, "quantization_config")) {
+    if (!qc->is_object()) RefuseType("quantization_config", *qc, "an object");
+    if (const nlohmann::json* qm = Field(*qc, "quant_method")) {
+      if (!qm->is_string()) {
+        RefuseType("quantization_config.quant_method", *qm, "a string");
+      }
+      p.quant_method = qm->get<std::string>();
+    }
+    if (const nlohmann::json* wbs = Field(*qc, "weight_block_size")) {
+      if (!wbs->is_array()) {
+        RefuseType("quantization_config.weight_block_size", *wbs,
+                   "an array of integers");
+      }
+      for (const nlohmann::json& e : *wbs) {
+        if (!e.is_number_integer()) {
+          RefuseType("quantization_config.weight_block_size", e, "an integer");
+        }
+        p.weight_block_size.push_back(e.get<int64_t>());
+      }
+    }
+  }
+
   // --- DSA lightning indexer ---
   // All three are plain reads on the dots3 config, and `index_topk` is the one
   // upstream probes with `hasattr` to decide whether the model is V3.2-sparse

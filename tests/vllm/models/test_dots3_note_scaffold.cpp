@@ -214,10 +214,17 @@ TEST_CASE("dots3-note: the architecture resolves through the model registry") {
   CHECK(reg.factory->load_weights != nullptr);
   CHECK(reg.factory->forward != nullptr);
   CHECK(reg.factory->make_kv_cache != nullptr);
-  // registry.py:381 puts it in _MULTIMODAL_MODELS: image, video AND audio
-  // (multimodal.py:65-72).
   CHECK(reg.info.is_text_generation_model);
-  CHECK(reg.info.supports_multimodal);
+  // `supports_multimodal` is FALSE, and it was TRUE until W5 (#699). Upstream
+  // does put this architecture in `_MULTIMODAL_MODELS` with image, video AND
+  // audio (registry.py:381, multimodal.py:65-72), which is why W1 set it — but
+  // that is a statement about UPSTREAM, and it only became misleading about
+  // THIS port once W5 made the released config's MoE layers loadable. There is
+  // no vision tower (W6), no audio tower (W7) and no multimodal front end (W8):
+  // `EnumerateDots3NoteTensors` claims not one tensor of either tower and
+  // `Dots3NoteDeferredTowers()` records all 2625 as deferrals. W8 flips it
+  // back, and the true -> false -> true trail is the honest record.
+  CHECK_FALSE(reg.info.supports_multimodal);
   // Both attention classes page the same MLA cache; the sliding half is a
   // window on it, not a recurrent state.
   CHECK_FALSE(reg.info.is_hybrid);
@@ -1737,16 +1744,16 @@ TEST_CASE("dots3-note: the forward REFUSES BY NAME through the REAL loaded model
   CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),
                        doctest::Contains("Dots3NoteForCausalLM forward"),
                        std::runtime_error);
-  // ...name the missing piece rather than only failing. The RELEASED config's
-  // first unrepresentable layer is layer 1's MoE (W5): W4b-2 put both attention
-  // geometries — full AND sliding-window — on the decode path, so the sliding
-  // layer at index 2 is no longer what stops this checkpoint. Naming the piece
-  // the released config ACTUALLY trips on is the point of the assertion; a
-  // string that outlives the refusal it describes is the failure this row keeps
-  // recording.
-  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("MoE layer"),
+  // ...name the missing piece rather than only failing. Naming the piece the
+  // released config ACTUALLY trips on is the point of the assertion; a string
+  // that outlives the refusal it describes is the failure this row keeps
+  // recording, and this assertion has been re-aimed twice — W4b-2 moved it off
+  // the sliding layer and onto the MoE one, and W5 moves it off the MoE layer
+  // and onto the NEXTN tail. That branch is stricter than upstream and #2176
+  // removes it next, which will re-aim this assertion a third time.
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("nextn"),
                        std::runtime_error);
-  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("W5"),
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("W10"),
                        std::runtime_error);
   // ...and point at the record that owns the brick.
   CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),

@@ -229,6 +229,69 @@ every ratio from it remain superseded under #1003.
 prompt's token 2 was one. A prompt whose margins are wider might never diverge,
 and a longer generation might diverge more; neither was measured.
 
+## W4 — the wider sweep, PARTIAL: 1 of 1 prompts measured diverged, five unmeasured
+
+W3 recorded that one prompt at 32 tokens shows a divergence EXISTS and cannot show
+how often. W4 sweeps six prompts at 256 tokens to put a rate on it. **It is
+recorded here incomplete**, because the measured part is decision-relevant on its
+own and the unmeasured part is blocked on infrastructure rather than on analysis.
+
+### What was measured
+
+**Prompt 0, "The capital of France is": DIVERGES first at token position 2 of
+256**, on `dgx:gpu0`. This is an independent reproduction of W3 — a different run,
+a different container, and EIGHT TIMES the generation length — landing on the same
+prompt at the same position. It also rules out one hopeful reading: the divergence
+is not a rare late-generation event, at least on this prompt.
+
+Five prompts (a primes list, a Python function, a word problem, a long-form
+paragraph, and a French factual) are **UNMEASURED**. Nothing about them is
+implied by prompt 0.
+
+### Why the sweep is not finished, and it is not analysis
+
+Seven leases were spent on harness and environment faults, every one of them the
+author's rather than the tree's, and they share a single root: **each fix encoded
+an assumption taken from the box last seen.** Recorded because the pattern is the
+finding:
+
+| Fault | What it would have produced |
+|---|---|
+| `xxd` absent in the worker | False refusal of a valid checkpoint |
+| `--token-ids` read as an OUTPUT flag | A gate comparing files never written |
+| `decode_hp` timings inside the token diff | `FAIL` on every run regardless of tokens |
+| `--idle-timeout 40m` against a 37.9 min cadence | `rc` killing a healthy job |
+| `nvcc` install unverified | A 16-minute silently CPU-only build |
+| `lib64` glob missing `targets/sbsa-linux/lib` | "library absent" on a box that had it |
+| `find \| head -1` selecting a **stub** | Linking a no-op library, with cmake returning 0 |
+| The cublasLt guard made FATAL | Rejecting dgx, the box that had always built |
+
+The last is the general lesson: **a guard must not be stricter than the thing it
+guards.** cublasLt is now a hint, and cmake — which is the authority on whether a
+toolkit is usable — decides.
+
+### A real negative result about the fleet
+
+**Thor cannot run this sweep, and the reason is measured.** It loads this
+checkpoint in **2887 s (48.1 min)** against dgx's ~16 min, so thirteen loads is
+**10.4 hours** there against 3.5 on dgx. Thor is also sm_110 and needs its own
+arch and library paths (`targets/sbsa-linux`, not `lib64`), which the sweep script
+now detects rather than assumes. Even with the toolchain fixed, this sweep should
+not run on Thor: it would hold a shared device for ten hours to answer what dgx
+answers in three.
+
+### What this does and does not support
+
+It does NOT establish a rate. One prompt is one prompt, and the sweep exists
+precisely because W3's single result could not generalise. Quoting "100% of
+prompts diverge" from n=1 would repeat the error this row keeps catching.
+
+What it does support is that the divergence reproduces across runs, containers and
+generation lengths, so it is a property of the arm rather than of one execution.
+Combined with W3's `DETERMINISM=PASS`, the fused arm is deterministic and
+deterministically different. **The default stays OFF**, which is where W3 put it
+and where this evidence keeps it.
+
 ## Now
 
 `ACTIVE`, and the row's question is answered. W1 measured the dtype pairing
@@ -238,9 +301,9 @@ warm. **The arm ships default-OFF and the two-call path remains the reference.**
 
 What is owed, and neither is a blocker on the above:
 
-- A wider token sweep. One prompt at 32 tokens established that a divergence
-  EXISTS; it cannot show how often. If several prompts at longer generations came
-  back identical, the near-tie would look rare enough to reconsider the default —
-  that is a decision for the developer, not for this spec to pre-empt.
+- The wider token sweep, **still owed for five of six prompts** (see `## W4`).
+  Prompt 0 reproduced at 256 tokens; the rest are blocked on dgx availability, and
+  Thor is ruled out on measured load time. A rate would only change the decision
+  if it came back near ZERO, which prompt 0 argues against.
 - A ratified speed number, if the arm is ever defaulted on: n=2 on one prompt is
   a direction. That needs repeats on an idle box.

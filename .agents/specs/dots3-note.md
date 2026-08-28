@@ -22,8 +22,16 @@ path.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
 windowed CUDA kernels were compiled and executed on `orin:gpu0` (sm_87) instead,
 through an `rc` lease on 2026-08-26 (§4.8). Read the `fa2` row before booking a
 lease for anything on the FA-2 path, and pick the host by capability.
-**Status:** W4b-3c — **the DSA lightning indexer's SELECTION is on the decode
-path** (§7 W4b-3, evidence §4.9), on top of W4b-2's two attention geometries
+**Status:** W5 — **the RELEASED `config.json` is REPRESENTABLE for the first
+time** (§7 W5, evidence §4.10). `Dots3NoteDeviceRefusal` returns "" for
+`dots-studio/dots3-note-prev`: W5 put the 45 MoE layers on the decode path
+through `Dots3NoteMoeBlock` over the shared `RunMoePlaced` seam, and W5c
+([#2176](https://github.com/mudler/vllm.cpp/issues/2176)) removed the nextn
+branch, which was STRICTER THAN UPSTREAM. **Representable is not runnable**: the
+MoE alone is 545.82 GB of a 576.89 GB checkpoint (94.62%), so nothing this
+project owns can feed it, and the ~290 GB fp8 sibling is refused BY NAME as W9.
+That sits on top of W4b-3c — **the DSA lightning indexer's SELECTION is on the
+decode path** (§7 W4b-3, evidence §4.9), on W4b-2's two attention geometries
 (§4.8), W4b-1's host maths (§4.7), W4a's full-attention layer (§4.6), W3's host
 reference (§4.5), W2's whole weight map (§4.4) and W1's config + registry
 (§4.1). The arch RESOLVES, parses, accounts for 38006/38006 of the released
@@ -38,7 +46,7 @@ requests are all single-shot prefills is SERVED sparsely; a step in which any
 request resumes is REFUSED BY NAME, because the indexer's own key cache is
 `KV-DSV4-MULTICACHE` ([#1925](https://github.com/mudler/vllm.cpp/issues/1925))
 and not this row. The RELEASED checkpoint still REFUSES BY NAME, now at its
-first MoE layer (W5), and so do GGUF and both towers. Exactly ONE GPU lease has
+first MoE layer until W5 LIFTED it, and both towers still do. Exactly ONE GPU lease has
 run a BRICK GATE of this row, at kernel level and no further: `orin:gpu0`
 (sm_87) compiled and ran W4b-2's two windowed CUDA ops on 2026-08-26 (§4.8).
 The row's other leases were `thor:gpu0` provisioning and `ctest` baseline runs,
@@ -3610,6 +3618,263 @@ not. The path needs no FA-2, no fp8 and no NVFP4, so all three fleet devices
 qualify; `orin:gpu0` is preferred because §4.8 proved the recipe on this row.
 `rc run` only, never `ssh`, bounded with `--max-runtime`.
 
+#### The gate, met
+
+Measured at `9a500f3e1e8bc2f034cce1fdac45a3c632446af1` on the devbox
+(`mudler-ubuntu-box`, x86_64, gcc 13, `CMAKE_BUILD_TYPE=Debug`,
+`VLLM_CPP_BUILD_TESTS=ON`, CUDA OFF). **Build exit and run exit are separate
+numbers, because a non-building mutation reads as a passing test when nobody
+looks.**
+
+| binary | build | cases | assertions | run exit |
+|---|---|---|---:|---|
+| `test_dots3_note_attn` | `BUILD_RC=0` | 51 / 0 failed | 6,888 / 0 failed | `RC=0` |
+| `test_dots3_note_scaffold` | `BUILD_RC=0` | 26 / 0 failed | 110,832 / 0 failed | `RC=0` |
+| `test_model_registry` | `BUILD_RC=0` | 24 / 0 failed, 1 skipped | 975 / 0 failed | `RC=0` |
+
+**The continuous half.**
+
+| quantity | value | against |
+|---|---:|---|
+| residue (device bf16 against the double reference) | **0.011902** | 0.198x the bound |
+| the bound `kMoeRel` | **0.06** | 5.04x the residue |
+| nearest mechanism | **0.207964** | 3.47x the bound |
+
+The bound sits just above the geometric mean of the residue and the nearest
+mechanism (0.0497), which is W4b-2's shape and the reason it is not a hugged
+threshold.
+
+**The DISCRETE half, which is the part a bound cannot give.**
+
+| quantity | value | bar |
+|---|---:|---|
+| minimum decision margin | **0.0633073** | — |
+| bf16 score ulp at this fixture's scale (`0.25 * max\|logit\| * 2^-8`, `max\|logit\|` 3.76543) | 0.00367718 | — |
+| margin / ulp | **17.2x** | > 4x |
+| distinct experts activated across the batch | **6 of 8** | >= 4 |
+| the deliberate exact tie, `max\|biased[0] - biased[1]\|` | **0.0** | exactly 0 |
+| selection-SET equality against the reference | **14 of 14** (layer, token) decisions | all |
+| the group stage deleted from the reference | **0.0 absolute** | exactly 0 |
+
+**Every mechanism, printed by the case from the numbers it just measured.**
+
+| mechanism mutated in the REFERENCE | relative | x the bound | x the residue |
+|---|---:|---:|---:|
+| `norm_topk_prob` dropped (`:153-154`) | 0.791637 | 13.19 | 66.51 |
+| `routed_scaling_factor` 1.7 (this config's is 1.0) | 0.580572 | 9.68 | 48.78 |
+| `top_k - 1` | 0.478647 | 7.98 | 40.22 |
+| the bias applied to the routing WEIGHT too | 0.405859 | 6.76 | 34.10 |
+| the shared expert dropped (`model.py:127`) | 0.358613 | 5.98 | 30.13 |
+| the correction bias dropped from the SELECTION | 0.319568 | 5.33 | 26.85 |
+| `top_k + 1` | 0.314643 | 5.24 | 26.44 |
+| **softmax scoring instead of sigmoid (`:110-116`)** | **0.207964** | **3.47** | **17.47** |
+
+**THE BRIEF'S PREDICTION ABOUT WHICH MECHANISM IS NEAREST WAS WRONG, and the
+first fixture would have shipped a hole because of it.** The design section
+above names the bias-in-the-routing-weight defect as the nearest mechanism and
+says to tune against that one. It is not nearest: at this fixture it reads
+0.4059, sixth of eight. The nearest is SOFTMAX-versus-SIGMOID scoring, and on
+the FIRST fixture it read **0.0400 — below the 0.06 bound**, so a port that
+wrote `kSoftmax` into the router args would have passed a green gate. The
+mechanism is small precisely where the fixture was designed to be safe: with
+small router logits, sigmoid is near-linear and the two scoring functions barely
+separate after renormalisation.
+
+**The repair was the fixture, twice, and never the bound.** The two knobs and
+what each measured:
+
+| `contended_gain` (experts 2-5's `down_proj` amplitude) | bias-in-weight |
+|---:|---:|
+| 1 | 0.0703 - 0.2262 across six seeds |
+| 3 | 0.2620 - 0.7127 across the same six |
+
+| `router_amp` | margin / ulp | distinct | residue | softmax arm |
+|---:|---:|---:|---:|---:|
+| 0.09 | 19.4x | 6 | 0.0230 | **0.0400** |
+| 0.18 | 19.3x | 6 | 0.0193 | 0.0770 |
+| 0.30 | 18.7x | 6 | 0.0190 | 0.1126 |
+| 0.45 | 18.1x | 6 | 0.0162 | 0.1515 |
+| **0.60** | **17.2x** | **6** | **0.0119** | **0.2080** |
+
+0.45 is the smallest value that clears the 0.15 fixture-quality floor, and it
+clears it by one percent. A guard met by one percent is the hugged threshold
+this project keeps naming, so the fixture takes 0.60.
+
+The seed was chosen the same way, over six seeds x {gain 1, 3} x {shared
+amplitude 0.5, 0.15}, and the spread is the argument for measuring rather than
+assuming: the minimum decision margin ranged **1.51x to 25.8x the ulp** across
+that grid. One seed in twelve would have shipped a fixture whose selection is a
+coin flip, which is exactly §4.9's DSA-indexer defect one brick later.
+
+#### The mutation table
+
+Driven through the committed `scripts/mutation-harness.py`, which refuses a
+dirty tree, refuses an absent anchor, prints the diffstat, prints the compiler
+error count, and restores the tree byte-for-byte verified by sha256. Every
+anchor was asserted UNIQUE (`grep -cF` == 1) before the run. **The compiler exit
+is printed beside every row**, because a non-building mutation is `NOT A RESULT`
+and reads as a passing test.
+
+Baseline for the `test_dots3_note_attn` rows: `exit=0 cases=51 (0 failed)
+assertions=6888 (0 failed)`. Baseline for the `test_dots3_note_scaffold` rows:
+`exit=0 cases=26 (0 failed) assertions=110832 (0 failed)`.
+
+| # | mutation | file | built | cc errors | run exit | cases / asserts failed | verdict |
+|---|---|---|---|---:|---:|---|---|
+| M1 | the router bias passed as `nullptr` | device | YES | 0 | 1 | 2 / 3 | DETECTED |
+| M2 | `args.renormalize = false` | device | YES | 0 | 1 | 2 / 4 | DETECTED |
+| M3 | `top_k - 1` | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M4 | the shared term passed as `nullptr` to `MoeCombine` | device | YES | 0 | 1 | 2 / 4 | DETECTED |
+| M5 | `args.num_expert_group = 0` (the pre-W3 softmax path) | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M6 | the shared expert built at `intermediate_size` | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M7 | the router loaded raw-NK instead of transposed | device | YES | 0 | 1 | 4 / 1 | DETECTED |
+| M8 | expert `gate_proj` loaded from `up_proj` | device | YES | 0 | 1 | 2 / 2 | DETECTED |
+| M9 | REACH: the layer-loop `RunMoePlaced` call deleted | device | **NO** | **1** | — | — | **BUILD_FAILED — NOT A RESULT** |
+| M9r | the same, with `(void)&Dots3NoteMoeBlock;` to satisfy `-Werror=unused-function` | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M10 | REACH: `lw.is_moe = false` in materialization | device | YES | 0 | 1 | 4 / 1 | DETECTED |
+| M11 | REACH: the MoE refusal branch restored | device | YES | 0 | 1 | 10 / 14 | DETECTED |
+| M12 | the nextn refusal branch restored | device | YES | 0 | 1 | 5 / 9 | DETECTED |
+| M13 | `Dots3NoteIsNextnTensor` never matches `model.mtp.` | model | YES | 0 | 1 | 2 / 2 | DETECTED |
+| M15 | the blockwise-fp8 refusal disabled | device | YES | 0 | 1 | 1 / 4 | DETECTED |
+| M16 | `weight_block_size` parsed but not stored | model | YES | 0 | 1 | 1 / 1 | DETECTED |
+| M14 | the nextn accounting bucket disabled | model | YES | 0 | **0** | 0 / 0 | **SURVIVED on `test_dots3_note_attn`** |
+| G1 | `routed_scaling_factor` replaced by the literal `1.0f` | device | YES | 0 | 0 | 0 / 0 | **PREDICTED GREEN — SURVIVED** |
+| G2 | `topk_group` replaced by the literal `1` | device | YES | 0 | 0 | 0 / 0 | **PREDICTED GREEN — SURVIVED** |
+
+**M9 is recorded as a build failure rather than dropped**, because it is the
+class the harness exists to catch: it failed `-Werror=unused-function` — with
+the only call gone, `Dots3NoteMoeBlock` has no user — and a harness that scored
+the previous binary's run would have called that a survivor. Roughly one
+mutation in five dies this way and this one did; M9r is the same deletion with
+the symbol's address taken so the compile stands.
+
+**M14 SURVIVED on `test_dots3_note_attn` and that is an instrument fact, not a
+coverage hole** — the nextn accounting bucket is asserted in
+`test_dots3_note_scaffold`, which the attention binary does not contain, so the
+first run pointed the instrument at the wrong binary. Re-run against the binary
+that carries the assertion, with `test_dots3_note_scaffold`'s own baseline of
+`exit=0 cases=26 (0 failed) assertions=110832 (0 failed)`:
+
+| # | mutation | file | built | cc errors | run exit | cases / asserts failed | verdict |
+|---|---|---|---|---:|---:|---|---|
+| M13s | `Dots3NoteIsNextnTensor` never matches `model.mtp.` | model | YES | 0 | 1 | 3 / 6 | DETECTED |
+| M14s | the nextn accounting bucket disabled | model | YES | 0 | 1 | 3 / 6 | **DETECTED** |
+| M19s | REACH: `lw.is_moe = false` in materialization | device | YES | 0 | 0 | 0 / 0 | SURVIVED — WRONG BINARY AGAIN |
+
+**M19s is the same shape and is recorded rather than hidden.** It is M10's
+mutation pointed at the scaffold binary, which carries no MoE forward gate, so a
+survival there says nothing. M10 is the same edit against
+`test_dots3_note_attn`, which does carry it, and M10 is RED. The row is kept so
+a reader can see that two of the twenty-one rows measured a binary rather than a
+guarantee, and that both were re-aimed rather than argued away.
+
+**A misleading diffstat in the scaffold rows, and it is THIS SESSION'S error
+rather than the harness's.** Every scaffold row's `diff --stat` column names
+four paths — this spec and the two `docs/` projections beside the mutated source
+— which reads as though the harness mutated four files. It did not.
+`mutation-harness.py::require_clean` runs `git status --porcelain` ONCE at
+start-up and refuses a dirty tree, and the tree was clean when that run started;
+the three record-commit files were edited by this session WHILE the run was in
+flight, and `diffstat()` re-reads the whole tree per mutation. The claim was
+almost written up the other way round — as a harness weakness — and reading
+`require_clean` before recording it is what stopped that. The per-file sha256
+restore is unaffected and was verified afterwards: `git diff -- src tests` is
+empty at the end of the run. The lesson for the next run is the ordinary one:
+do not touch the tree while a mutation pass owns it, even in files the plan
+does not name.
+
+**The two PREDICTED-GREEN rows were named before the run, in the design section
+above, and both came back green for the stated reason.** `routed_scaling_factor`
+is 1.0 on this config and on the released one, so the multiply is the identity.
+`topk_group` is 1, so writing the literal is writing the value. Note what is NOT
+inert and is therefore in the red table: `num_expert_group = 0` selects
+`vt::MoeRouterTopK`'s pre-W3 ungrouped SOFTMAX path verbatim, which ignores both
+`scoring_func` and the correction bias, so M5 is red rather than green.
+`_padded_mlp_size` has no row at all — it is deliberately not ported, so there
+is no line to mutate, and the absence is recorded rather than shown as a green.
+
+#### Reachability
+
+Three deletion mutations, all red, all through
+`ModelRegistry::Resolve` -> `LoadDots3NoteForCausalLM` over a real
+`SafetensorsFile` -> `MaterializeDots3NoteDevice` -> `ModelRegistry::Forward` ->
+the layer loop -> `vllm::RunMoePlaced` -> `Dots3NoteMoeBlock`:
+
+- **M9r** deletes the production CALL in the layer loop. RED.
+- **M10** deletes the MoE arm of materialization (`lw.is_moe = false`). RED.
+- **M11** restores the MoE branch of `Dots3NoteDeviceRefusal`, so the forward
+  turns the config away before the block runs. RED at 10 cases and 14
+  assertions, the widest of the three.
+
+No W5 case constructs `Dots3NoteMoeWeights` or calls `Dots3NoteMoeBlock` by
+hand. The one case that calls a `vt` op directly — the selection-set probe on
+`vt::MoeRouterTopK` — says in its own body that it is a supplementary DISCRETE
+probe and not the reachability-carrying gate.
+
+#### The device run, and the ZERO DELTA it returned
+
+`rc run -d orin:gpu0`, job **`b4b2a08b-35b4-4f54-806a-aa9f3cc3ca37`**, 2026-08-28,
+`--max-runtime 180m --idle-timeout 25m`, about 30 minutes of device time.
+`rc run` only; the box was never reached by `ssh`. The SHA was PROVEN rather
+than asserted: the job cloned in the container and refused to build unless
+`git rev-parse HEAD` equalled `9a500f3e1e8bc2f034cce1fdac45a3c632446af1` with
+`git status --porcelain` empty. `orin`'s `/workspace` is LOCAL disk and is not
+the NAS, so the source came from a `git clone` of this branch rather than from a
+staged tarball.
+
+**The toolchain gate did its job, and it is the reason this section can say
+"executed" about anything at all.** CUDA 13.0 installs on this box and compiles
+for `sm_87`, and it cannot LAUNCH: the smoke program read `SMOKE=NO_DEVICE`
+(`SMOKE13_RC=2`), which is `cudaGetDeviceCount` failing against the 540.4.0
+driver. The job then installed `cuda-toolkit-12-6` and re-ran the SAME smoke
+program, which compiled and launched (`SMOKE126_RC=0`). A job that had gated on
+`command -v nvcc` would have reported a compile as an execution.
+
+**What was proven.** The tree CONFIGURES and BUILDS clean for `sm_87` with
+`VLLM_CPP_CUDA=ON`: `CONFIGURE_RC=0`, `BUILD_RC=0`, **zero** `: error:` lines
+across 547 targets including every `*.cu` object. W5 adds no `-Werror` breakage
+on the CUDA tier, which the CPU-only devbox cannot show.
+
+**What was NOT proven, and this is the result rather than a caveat.** The
+per-case assertion counts, device against a `CUDA_VISIBLE_DEVICES=""` control on
+the SAME binary:
+
+| case | device | control | delta |
+|---|---:|---:|---:|
+| the MoE layer through `ModelRegistry::Forward` | 295 | 295 | **0** |
+| every MoE mechanism past the bound | 283 | 283 | **0** |
+| the SELECTION set-equal to the reference | 114 | 114 | **0** |
+| the mixed dense+MoE forward is DETERMINISTIC | 468 | 468 | **0** |
+
+Whole binary, both ways: 51 cases / 6,888 assertions / `SUCCESS!`, `DEVICE_RC=0`
+and `CONTROL_RC=0`.
+
+**A zero delta means the device did not participate, and the cause is in the
+FIXTURE rather than in the model.** Every dots3-note model case in this file
+builds its queue as `vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}` —
+`grep -c kCUDA tests/vllm/models/test_dots3_note_attn.cpp` is **0** — so
+`ModelRegistry::Forward` runs on a CPU queue whatever the box has, and
+`Dots3NoteGroupedMoeEligible` is false because
+`vt::OpRegistered(kMoeGroupedGemmBf16, kCPU)` is false. The reference arm ran on
+both sides, identically, which is exactly what identical counts say.
+
+**So the grouped arm of `Dots3NoteMoeBlock` has NO execution evidence, and it is
+recorded as owed rather than claimed.** It is not DEAD code — production reaches
+it whenever the engine's queue is CUDA, which is the ordinary configuration on a
+CUDA build — it is UNGATED. Closing it needs a device-queue variant of the
+bench: a `kCUDA` `vt::Queue`, a `PagedKvCache` in device memory rather than
+`w4a::MlaCachePool`'s host vectors, and the resident-weight uploads that follow.
+That is a test-infrastructure change of its own size, and W4b-2 and W4b-3c hit
+the same wall from the other side — §4.8 says their CUDA evidence is
+"KERNEL-level parity on two ops. It is not the end-to-end model gate", and no
+brick on this row has yet run the MODEL on a GPU.
+
+**The instrument is what makes this reportable at all.** Had the job printed
+only `SUCCESS!` and the exit code, the run would have read as a device
+execution: the verdict is identical on both sides. The assertion COUNT is the
+only column that distinguishes them, and it distinguishes them by being the
+same.
+
 #### Risks
 
 - **R-W5-1 — the fixture's selection margin collapses under retuning.** The
@@ -4095,8 +4360,20 @@ dispatchable in order, under the constraints that answer imposes.
   with chunked CONTEXT, the per-layer `SlidingWindowMLASpec` emission, and the
   PER-REQUEST routing of a mixed step that the narrowed refusal stands in for.
   All three are in `## Owed`.
-- **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
-  routing our existing path at new dims.
+- **W5 — MoE. LANDED, evidence §4.10.** Ungrouped `noaux_tc` at 256/8 + the one
+  shared expert at `moe_intermediate_size * n_shared_experts`, through
+  `Dots3NoteMoeBlock` over `vllm::RunMoePlaced`, with NO `vt` op changed. It
+  carried two things beyond the block. **W5a** made materialization pick the
+  MoE arm per layer — it loaded `mlp.{gate_up,down}_proj` unconditionally
+  before, and on a MoE layer those tensors do not exist — and added a named
+  BLOCKWISE-FP8 refusal keyed on `quantization_config.weight_block_size`, which
+  is what the `-fp8` sibling carries. **W5c**
+  ([#2176](https://github.com/mudler/vllm.cpp/issues/2176)) removed the nextn
+  refusal, which was STRICTER THAN UPSTREAM, and replaced it with a named W10
+  deferral and its own accounting bucket. Together they make
+  `Dots3NoteDeviceRefusal(released_params)` EMPTY. What that does NOT mean is
+  recorded in §4.10 and in the row header: the MoE is 94.62% of a 576.89 GB
+  checkpoint and nothing here can hold it.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
   FP32-scale FP8 formula. Reuses `qwen3_vl_vision` structure.
 - **W7 — audio tower.** The `dots` stem deltas over our Whisper encoder.
@@ -4491,6 +4768,44 @@ Carried openly under option B (§6.4), not waived:
   exactly needs an op whose store dtype is the caller's. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 
+- **`vt::QuantFp8Group` has no `use_ue8m0` rounding, and it is owed against
+  W9** (recorded at W5, #699). It does NOT bite at W5: it is the ACTIVATION
+  quantizer and W5 is entirely on the bf16 path, so nothing in that brick calls
+  it. It probably does bite at W9, because upstream's blockwise-FP8 MoE routes
+  through DeepGEMM with e8m0 scales
+  (`vllm/models/dots3_note/nvidia/vision_moe.py`'s own docstring names the
+  sibling trap on the vision side: "the native NOTE encoder keeps dynamic
+  activation scales as FP32 instead of rounding them to E8M0"). A port that
+  quantizes activations with plain scaling there disagrees with the kernel
+  upstream runs, and the disagreement is numerically silent. Recorded here with
+  the reason so W9 does not re-derive it.
+- **The blockwise-FP8 arm itself is owed to W9**, and it is now refused BY NAME
+  rather than by a bare tensor miss (W5a). `dots-studio/dots3-note-prev-fp8` @
+  `7c14222e22423d6df6848eb0d1c5c3a88a00311a` carries
+  `quantization_config.weight_block_size = [128, 128]` and ships a
+  `weight_scale_inv` beside every projection; `dense_loaders::MaterializeBf16Source`
+  reads a per-tensor or per-output-ROW `<name>_scale` and nothing else.
+- **The GROUPED (CUDA) arm of `Dots3NoteMoeBlock` has no execution evidence.**
+  `vt::MoeGroupedGemmBf16` and `vt::MoeGroupedGemmBf16GateUpSilu` are registered
+  for CUDA only, and every dots3-note model case builds a `kCPU` `vt::Queue`, so
+  the CPU gate takes the reference arm and the `orin:gpu0` lease measured a ZERO
+  device-versus-control delta on every W5 case. The arm is UNGATED rather than
+  dead: production reaches it whenever the engine queue is CUDA. Closing it needs
+  a device-queue bench — a `kCUDA` queue, a device-memory `PagedKvCache`, and the
+  resident uploads that follow — which is test infrastructure no brick on this
+  row has built, and which W4b-2 and W4b-3c also did not (§4.8: their CUDA
+  evidence is kernel-level parity on two ops, not the model).
+- **The W1/W2 accounting fixture can no longer be MATERIALIZED**, and that is a
+  consequence of W5 rather than a defect. Those gates drive all 38006 names
+  through the production loader from a synthetic checkpoint of ONE-ELEMENT
+  tensors, which worked only because the released config was refused and
+  materialization was skipped. It is not skipped now, so the loader accounts for
+  every name and then refuses the first WEIGHT SHAPE. The cases assert that
+  discrimination instead, which is the same statement one step later — an
+  unaccounted, missing or duplicated name throws a DIFFERENT message strictly
+  earlier, and all three are separately gated. A shape-true fixture for this
+  config starts at a 1.5 GiB `embed_tokens` and is not buildable in a test.
+
 ## 9. Stop conditions
 
 - Any brick whose only available comparison is a shared helper stops and says so
@@ -4718,3 +5033,30 @@ rather than as a pass, and re-run.
 cache whose physical row is wider than the row a layer reads, a windowed decode
 and prefill through the shared MLA seam, and the three refusals above. All are
 in `## Owed`.
+
+**W5 — LANDED, and the row's headline changed.** The 45 MoE layers are on the
+decode path through `Dots3NoteMoeBlock` over the shared `vllm::RunMoePlaced`
+seam, and `Dots3NoteDeviceRefusal` returns `""` for the RELEASED
+`dots-studio/dots3-note-prev` `config.json` for the first time on this row. Two
+branches went: the MoE layer (W5) and the nextn tail (W5c,
+[#2176](https://github.com/mudler/vllm.cpp/issues/2176)), the second of which
+was a DEFECT rather than a gap — it was stricter than upstream, which drops
+those weights from the main model instead of refusing. Evidence is §4.10.
+
+**Say the other half in the same breath.** Representable is not runnable. The
+MoE alone is 545.82 GB of a 576.89 GB checkpoint (94.62%), measured over the
+committed headers-only index; the routed experts are 543.58 GB of that. No host
+this project reaches holds it, the ~290 GB fp8 sibling does not fit either and
+is refused BY NAME as W9, and no tensor byte of either has ever been
+downloaded. The gate is a consistency gate against an independent
+double-precision reference, not a correctness claim against vLLM (§6.4 option
+B). `supports_multimodal` went TRUE -> FALSE in the same change, because the
+released config becoming loadable made a claim this port cannot honour: the
+2195 vision and 430 audio tensors are named W6/W7 deferrals and the multimodal
+front end (W8) does not exist. W8 flips it back.
+
+**Next dispatchable: W6 — the vision tower**, or W9 for the quantized arms if
+the fp8 sibling is wanted before the towers. `## Owed` is unchanged except that
+`vt::QuantFp8Group`'s missing `use_ue8m0` rounding is now recorded against W9
+with the reason, because upstream's blockwise-fp8 MoE routes through DeepGEMM
+with e8m0 scales.

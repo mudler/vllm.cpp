@@ -3218,6 +3218,16 @@ target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
 target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5b-2 (#2031) — the DEVICE arm of the same stream:
+# vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME
+# lane-pinned goldens the host reference is gated on, so the two arms answer to
+# one oracle rather than to each other, plus a MODEL-WIDTH (hidden_size 2560,
+# hc_count 4, hc_lowrank 320) agreement check the golden shapes cannot make. CPU
+# only: no CUDA arm of this op exists and one written on a CPU host could not be
+# gated. Reaches the model-private `qwen4_exp_hc.h`, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_hc_device vllm/models/test_qwen4_exp_hc_device.cpp)
+target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would

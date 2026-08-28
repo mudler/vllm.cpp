@@ -74,7 +74,7 @@ def emit(name, t):
     out.append("};")
 
 
-def case(tag, hidden, hc, lowrank, eps, tokens, use_combine, seed):
+def case(tag, hidden, hc, lowrank, eps, tokens, use_combine, seed, hyper_scale=1.7):
     g = torch.Generator().manual_seed(seed)
     cfg = Qwen4ExpTextConfig(hidden, hc, lowrank, eps)
     mod = Qwen4ExpTextGatedResidual(cfg, use_combine=use_combine)
@@ -87,7 +87,7 @@ def case(tag, hidden, hc, lowrank, eps, tokens, use_combine, seed):
         mod.input_mix_weight_up.weight.copy_(torch.randn(hc_h, lowrank, generator=g) * 0.3)
         if use_combine:
             mod.block_inject_weight.weight.copy_(torch.randn(hc, hc_h, generator=g) * 0.3)
-        hyper = torch.randn(tokens, hc_h, generator=g) * 1.7
+        hyper = torch.randn(tokens, hc_h, generator=g) * hyper_scale
         block_out = torch.randn(tokens, hidden, generator=g) * 0.9
 
         normed = mod.hc_norm(hyper)
@@ -105,8 +105,9 @@ def case(tag, hidden, hc, lowrank, eps, tokens, use_combine, seed):
             mixed = res
 
     out.append("")
-    out.append("// ---- %s: hidden=%d hc=%d lowrank=%d eps=%g T=%d use_combine=%s seed=%d"
-               % (tag, hidden, hc, lowrank, eps, tokens, use_combine, seed))
+    out.append("// ---- %s: hidden=%d hc=%d lowrank=%d eps=%g T=%d use_combine=%s seed=%d "
+               "hyper_scale=%g"
+               % (tag, hidden, hc, lowrank, eps, tokens, use_combine, seed, hyper_scale))
     emit("k%s_norm_w_hf" % tag, mod.hc_norm.weight)
     emit("k%s_down" % tag, mod.input_mix_weight_down.weight)
     emit("k%s_up" % tag, mod.input_mix_weight_up.weight)
@@ -134,6 +135,22 @@ out.append("// torch %s" % torch.__version__)
 case("A", hidden=6, hc=4, lowrank=5, eps=1e-6, tokens=3, use_combine=True, seed=1234)
 case("B", hidden=5, hc=3, lowrank=7, eps=1e-5, tokens=2, use_combine=True, seed=99)
 case("C", hidden=6, hc=4, lowrank=5, eps=1e-6, tokens=2, use_combine=False, seed=7)
+# D IS THE EPS-PLACEMENT CASE, and it exists because A, B and C cannot see that
+# defect. eps is INSIDE the rsqrt, added to the MEAN SQUARE
+# (`torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)`, :170); the plausible
+# slip is to add it to the norm instead. At A/B/C's `hyper_scale = 1.7` the mean
+# square is O(1) and eps = 1e-6 moves the answer by ~5e-7 relative -- BELOW the
+# suite's own 1e-5 tolerance, so the wrong spelling passes. Measured, not
+# supposed: mutation M7 in the W5b-2 battery
+# (`.agents/specs/qwen4-exp-flash-next.md`) SURVIVED all three cases.
+#
+# At `hyper_scale = 0.01` the mean square is ~1e-4, so eps is 1% of it and the
+# two spellings differ by ~0.5% -- three orders over the tolerance. The regime is
+# ordinary rather than contrived: a small-magnitude activation is exactly where a
+# stabilizing epsilon is supposed to act, which is why putting it in the wrong
+# place matters there and nowhere else.
+case("D", hidden=6, hc=4, lowrank=5, eps=1e-6, tokens=2, use_combine=True, seed=31337,
+     hyper_scale=0.01)
 
 open(sys.argv[1], "w").write("\n".join(out) + "\n")
 print("wrote", sys.argv[1])

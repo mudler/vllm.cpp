@@ -373,6 +373,48 @@ TEST_CASE("qwen4_exp GatedResidual with use_combine=false is the final mixer") {
   }
 }
 
+TEST_CASE("qwen4_exp GatedResidual at a SMALL magnitude, where eps is observable") {
+  // ADDED BY W5b-2 (#2031). It SHARPENS this file; it does not close a hole in
+  // it. The `big_eps = 4.0f` probe in "qwen4_exp grouped RMSNorm mirrors
+  // RMSNormGated(group_size) at the lane pin" above already gates the
+  // placement: on a reconstructed pre-repair tree (this file and the goldens at
+  // `origin/main`, no case D) the eps mutation reds it at
+  // `CHECK( 0.802185 < 1e-05 )`, 2 of 14 cases and 2 assertions. The hole was
+  // the DEVICE arm's, which had no such probe. Case D is driven by BOTH suites
+  // and takes this file from those 2 red assertions to 10 (mutation M16).
+  // `eps` goes INSIDE the rsqrt, added to the MEAN SQUARE
+  // (`torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)`, :170); the
+  // plausible slip adds it to the norm instead. Cases A, B and C all draw the
+  // stream at `hyper_scale = 1.7`, where the mean square is O(1) and eps = 1e-6
+  // moves the answer by about 5e-7 — a third of `kTol`, so the wrong spelling
+  // passes all three, and the `Variant` sweep below has no flag for it either.
+  //
+  // MEASURED on the device arm of the same arithmetic: the W5b-2 mutation
+  // battery moved `+ eps` outside the rsqrt in `cpu_qwen4_exp.cpp` and it
+  // SURVIVED every A/B/C comparison. Golden case D draws the stream at
+  // `hyper_scale = 0.01`, where the mean square is ~1e-4 and eps is 1% of it, so
+  // the two spellings separate by ~0.5% — three orders over `kTol`.
+  const int64_t hc = 4, hidden = 6, rank = 5, flat = hc * hidden;
+  GatedResidualWeights w;
+  w.hc_norm_weight = HcNormWeightFromHf(Load(kD_norm_w_hf, static_cast<size_t>(flat)));
+  w.mix_down = Load(kD_down, static_cast<size_t>(rank * flat));
+  w.mix_up = Load(kD_up, static_cast<size_t>(flat * rank));
+  w.block_inject = Load(kD_inject, static_cast<size_t>(hc * flat));
+
+  for (int64_t t = 0; t < 2; ++t) {
+    const std::vector<float> hyper = Load(kD_hyper + t * flat, static_cast<size_t>(flat));
+    const GatedResidualResult r = GatedResidualForward(hyper, w, hc, hidden, 1e-6f);
+    CHECK(MaxAbsDiff(r.hyper_input_normed, kD_normed + t * flat, static_cast<size_t>(flat)) <
+          kTol);
+    CHECK(MaxAbsDiff(r.mixed_input, kD_mixed + t * hidden, static_cast<size_t>(hidden)) < kTol);
+    CHECK(MaxAbsDiff(r.injection_weights, kD_inj_w + t * hc, static_cast<size_t>(hc)) < kTol);
+    const std::vector<float> block = Load(kD_block_out + t * hidden, static_cast<size_t>(hidden));
+    const std::vector<float> got =
+        GatedResidualWriteBack(hyper, block, r.injection_weights, hc, hidden);
+    CHECK(MaxAbsDiff(got, kD_written + t * flat, static_cast<size_t>(flat)) < kTol);
+  }
+}
+
 TEST_CASE("qwen4_exp GatedResidual refuses a stream that is not hc_count * hidden_size") {
   GatedResidualWeights w;
   w.hc_norm_weight.assign(24, 1.0f);

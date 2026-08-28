@@ -146,7 +146,22 @@ column above is the entry point, not the whole chain.
    near-tie ≤500 milli-nats, strict-exact reported, BACKEND PROOF selections > 0
    and declines == 0 for the GDN op set, both ambient legs, and exit code 0 —
    the #1486 teardown SIGSEGV is fixed (static tensor caches are deliberately
-   never destroyed), so no post-summary crash is tolerated anymore.
+   never destroyed), so no post-summary crash is tolerated anymore. Each
+   decode ARM gates against its OWN captured golden pair (#2115): the ambient
+   leg (`VT_TT_HOST_FREE_DECODE` unset) against
+   `our_ids_tenstorrent.npy` / `neartie_gap_mnats_tenstorrent.npy`, the
+   host-free opt-out leg (`VT_TT_HOST_FREE_DECODE=0`) against
+   `our_ids_tenstorrent_host_free_off.npy` /
+   `neartie_gap_mnats_tenstorrent_host_free_off.npy`. Both anchors are
+   exact-match REQUIREs; the near-tie band stays 500 milli-nats. The opt-out
+   arm is a legitimate alternate greedy path: 61 of 256 cells differ across
+   prompts 2,7,8,10,13,15 (first splits at (2,1),(7,3),(8,4),(10,10),(13,2),
+   (15,9)), every one a near-tie on BOTH teacher-forced paths — ambient
+   ≤375 mnats at all of them, eager max exactly 500 at (15,9), the band edge
+   (stored int 500 passes `mn > kNearTieMnats`). The earlier "1 of 256 cells,
+   re-syncs at tok=2" claim was an artifact of the anchor REQUIRE aborting at
+   the first divergence and is retired; `## Evidence` (#2115) carries the
+   capture, the verification, and the numbers.
 3. **Full TT suite green; CPU gate green; `scripts/agent-preflight.sh` all-green.**
 4. **Mutation evidence** per asserted guarantee, re-run by the fresh reviewer.
 5. **W4 focused:** a doctest pins the bulk staging path — staging a contiguous
@@ -972,3 +987,32 @@ Owed (recorded, not blocking): the test binary SEGFAULTS during teardown
 after printing its verdict (ttnn::Tensor deallocate -> GraphTracker::
 is_enabled, device-destruction order). Verdict unaffected; file the issue
 and fix the teardown ordering separately.
+
+### #2115 — the host-free opt-out arm gates against its own captured pair (2026-08-28)
+
+The W4-era record "the opt-out leg drifts at exactly one cell" was an artifact:
+the anchor REQUIRE aborts at the FIRST divergence, so only prompt[2] tok=1 was
+ever reported. The issue's premise (a landing after the pair capture moved the
+token) is falsified — the drift reproduces byte-identically AT the capture
+commit `c31cad9c1` itself (that run's exit-139 was the pre-#1486 teardown
+crash, unrelated; bisect closed by testing the endpoint directly, no commit
+walk needed).
+
+Full-suffix capture on the opt-out arm (sanctioned procedure, `c31cad9c1`
+precedent): the eager arm differs from the ambient pair at **61 of 256 cells**
+across prompts 2, 7, 8, 10, 13, 15 — first splits at (2,1), (7,3), (8,4),
+(10,10), (13,2), (15,9); prompt 2's suffix re-agrees transiently at (2,8).
+Every differing cell is a near-tie on BOTH teacher-forced paths: ambient gaps
+<= 375 mnats at all 61; eager max exactly **500 mnats at (15,9) — the band
+edge** (stored int 500, `mn > kNearTieMnats` passes; 0 cells over). At (2,1)
+the top-2 logits are TIED (gap 0 on both paths): ambient takes the
+oracle-greedy 1814, eager flips to the tied runner-up 15039. The opt-out arm
+is a legitimate alternate greedy path within the ratified band, not a numeric
+regression. The harness selects the pair by arm (`..._host_free_off.npy` for
+`VT_TT_HOST_FREE_DECODE=0`); both anchors stay exact-match REQUIREs, the band
+stays 500, the ambient pair is byte-untouched.
+
+Gates: opt-out leg 16/16 PASS (9 strict, 7 near-tie, max gap 0.5 nats at
+prompt[15] tok=9) exit 0; ambient leg 16/16 (10 strict, max 0.375) exit 0 —
+unchanged; suite 40/40 / 3757/3757 exit 0. Evidence:
+`docs/bench-evidence/tt-2115-eager-arm-pair-20260828.log`.

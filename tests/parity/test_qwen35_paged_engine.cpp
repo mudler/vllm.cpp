@@ -60,6 +60,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -279,9 +280,35 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   // on that sequence — NOT vLLM, which has no Tenstorrent backend; same
   // secondary-oracle lane and precedent as the Qwen3-0.6B and Mistral-7B TT
   // goldens).
-  const char* ids_name = tenstorrent ? "our_ids_tenstorrent.npy" : "our_ids.npy";
-  const char* gap_name =
-      tenstorrent ? "neartie_gap_mnats_tenstorrent.npy" : "neartie_gap_mnats.npy";
+  //
+  // Each Tenstorrent decode ARM gates against its OWN captured pair (#2115).
+  // VT_TT_HOST_FREE_DECODE=0 (the eager opt-out; same parsing convention as
+  // vt::tenstorrent::HostFreeDecodeEnabled) is a LEGITIMATE ALTERNATE GREEDY
+  // PATH, not a drift: it differs from the ambient pair at 61 of 256 cells
+  // across prompts 2,7,8,10,13,15 (first splits at (2,1),(7,3),(8,4),(10,10),
+  // (13,2),(15,9); prompt 2's suffix re-agrees transiently at (2,8)). Every
+  // differing cell is a near-tie on BOTH teacher-forced paths — ambient gaps
+  // <= 375 mnats at all 61 cells; eager max is exactly 500 mnats at (15,9),
+  // the band edge (stored int 500, so the `mn > kNearTieMnats` check passes).
+  // At (2,1) the top-2 logits are TIED (gap 0 on both paths): the ambient arm
+  // takes the oracle-greedy 1814, the eager arm flips to the tied runner-up
+  // 15039. So the eager leg loads the host_free_off pair captured on that arm,
+  // and the near-tie band (kNearTieMnats) and the exact-match anchor REQUIRE
+  // stay as they are. An earlier "differs at exactly one cell (2,1), re-syncs
+  // at tok=2" note was an artifact of this REQUIRE aborting at the first
+  // divergence — retired by the #2115 full-suffix diff (c31cad9c1 precedent).
+  const char* hf_env = std::getenv("VT_TT_HOST_FREE_DECODE");
+  const bool host_free_off =
+      tenstorrent && hf_env != nullptr && std::string_view(hf_env) == "0";
+  const char* ids_name = tenstorrent ? (host_free_off
+                                           ? "our_ids_tenstorrent_host_free_off.npy"
+                                           : "our_ids_tenstorrent.npy")
+                                     : "our_ids.npy";
+  const char* gap_name = tenstorrent
+                             ? (host_free_off
+                                    ? "neartie_gap_mnats_tenstorrent_host_free_off.npy"
+                                    : "neartie_gap_mnats_tenstorrent.npy")
+                             : "neartie_gap_mnats.npy";
   parity::NpyArray o_dev, gap_dev;  // keep the device arrays alive for the loop
   bool bootstrap_only = false;
   if (device_golden) {
@@ -289,7 +316,11 @@ void RunGate(const std::string& golden_subdir, const char* label) {
     if (!have_dev && dump) {
       // Bootstrap dump path: generate tokens, write raw i32, skip the gate.
       bootstrap_only = true;
-      MESSAGE(label << ": BOOTSTRAP dump (device golden absent) for Tenstorrent...");
+      MESSAGE(label << ": BOOTSTRAP dump (device golden absent) for Tenstorrent"
+                    << (host_free_off ? std::string(" host-free opt-out arm")
+                                      : std::string(" ambient arm"))
+                    << " — dumping ids for " << std::string(ids_name) << " / "
+                    << std::string(gap_name) << "...");
     } else {
       REQUIRE_MESSAGE(have_dev,
                       label << ": device oracle golden absent (" << ids_name << " / "

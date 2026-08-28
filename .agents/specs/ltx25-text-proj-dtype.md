@@ -22,6 +22,13 @@ loads at its true width. The NVFP4 arm keeps every refusal and every byte it has
 today. A load-time case on a synthetic BF16-projection fixture gates the new arm
 without a lease.
 
+**Also in scope, because the evidence needs it.**
+`scripts/probe_ltx2_text_encoder_load.cpp`, a probe in the shape of the two that
+`scripts/` already carries: no CMake target, and its compile line recorded in its
+own header so a reviewer can re-run it. A synthetic fixture cannot prove that the
+real bytes of either shipped encoder resolve, and this row's whole subject is
+that the two files disagree about their format.
+
 **Not in scope.** The Gemma tower itself, which already has both arms
 (`TowerModule` in `ltx2_text_encoder.cpp` takes a `BF16` module directly and a
 `U8`-plus-marker module through the dequantizer). The comparison gate of
@@ -188,14 +195,95 @@ a `torchao_nvfp4` marker, so on the bf16 file its body never runs. No change.
    no scales; a `F32` weight with no scales. Each refuses naming the module.
 5. **`scripts/agent-preflight.sh`** green, including `--staged`.
 
+## 5b. What was measured
+
+Every number below was produced on this branch, on this host (`mudler-ubuntu-box`,
+x86-64, CPU-only Release build, no GPU and therefore no lease: nothing here
+touches a device).
+
+**The checkpoints, hashed before they were read.** Both agree with the records
+that pin them, so neither is the re-quantized-in-place case #1723 records:
+
+| File | sha256 measured here | Agrees with |
+|---|---|---|
+| `gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | `ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1` | `tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json` and `docs/USAGE.md` |
+| `gemma4-12b-with-proj-nvfp4-torchao.safetensors` | `12132b7157925332d2b21de9fc6f507c14f4f0cbc7081484d1968ebf8a19b4bf` | `docs/USAGE.md` |
+
+**Red before, green after, on the synthetic fixture.** The four new cases fail
+at the base source with `unpacks to in_features 1024 but the Gemma geometry
+gives 512` — the same factor of two, at the fixture's reduced dimensions, that
+the shipped file shows as 376320 against 188160. After the change: 4 cases, 42
+assertions, all passing.
+
+**Red before, green after, on the SHIPPED bf16 checkpoint.** Through
+`scripts/probe_ltx2_text_encoder_load.cpp`, which calls the same
+`Ltx2LoadTextEncoderFromSafetensors` the engine calls. At the base source:
+
+```text
+REFUSED: ltx2 loader: 'text_embedding_projection.video_aggregate_embed.weight'
+unpacks to in_features 376320 but the Gemma geometry gives 188160
+```
+
+which is #2140's message, character for character. At this head, the same file:
+
+```text
+gemma_hidden_size       = 3840
+gemma_num_hidden_layers = 48
+geometry hidden*(L+1)   = 188160
+video  out=4096 in=188160 weights=770703360 bias=4096
+audio  out=2048 in=188160 weights=385351680 bias=2048
+quantized_modules       = 0
+tokenizer_json bytes    = 32169626, has_config=1
+video.weight[0..3]      = 0.01440430 -0.00057220 -0.00286865 0.00201416
+widened video out=4096 in=188160 weights=770703360 bias=4096
+VmHWM kB                = 9100848
+OK
+```
+
+**The NVFP4 arm is unchanged, on the shipped torchao checkpoint too.** The same
+probe on `gemma4-12b-with-proj-nvfp4-torchao.safetensors` reports the identical
+geometry and the identical projection widths, with `quantized_modules = 334` and
+`has_config=0`, and its `video.weight[0..3]` reads
+`0.01397705 -0.00000000 -0.00233459 0.00233459` against the bf16 file's
+`0.01440430 -0.00057220 -0.00286865 0.00201416`. Those are two encodings of one
+tensor, and the agreement is a cross-arm sanity signal rather than a gate:
+nothing here asserts a tolerance between the arms, because a 4-bit encoding of
+the second element legitimately reads as zero.
+
+**The NVFP4 arm's own cases, before and after.** `test_ltx2_loader` filtered to
+`*torchao*,*NVFP4*,*nvfp4*,*require_config*` is **11 cases / 19934 assertions,
+0 failed** at the base source and **11 cases / 19934 assertions, 0 failed** at
+this head — the same two numbers, not merely both green. The full binary is 41
+cases / 64246 assertions, 0 failed, and all 13 `ctest -R ltx2` targets pass.
+
+**Four mutations, each restored byte-for-byte afterwards** (verified with
+`sha256sum -c` over the three touched files):
+
+| Mutation | Focused gate |
+|---|---|
+| Delete the production `LoadProjection` call site in `Ltx2LoadTextEncoderFromSafetensors` | **RED**, 4/4 cases, 18 assertions failed |
+| Restore the `* 2` on the plain arm only (the #2140 defect) | **RED**, 2/4 cases |
+| Disarm the exactly-one-of-the-scale-pair refusal | **RED** |
+| Disarm the plain arm's `BF16` dtype refusal | **RED** |
+
+The first is the reachability case: without the call site the gate measures a
+class rather than a capability, and it does not stay green.
+
+**What this does NOT prove.** No render ran, so nothing here says the bf16 arm
+produces the right video — only that its weights arrive at the right width with
+the right bytes. §6 keeps that owed.
+
 ## 6. Owed
 
-- **The end-to-end bf16 render.** The only exercise that proves the whole arm is
-  a GPU render, and it needs a `dgx:gpu0` lease and the four bf16 checkpoints
-  the `ltx2_oracle` manifest pins. Recorded as owed on
-  [#2140](https://github.com/mudler/vllm.cpp/issues/2140) unless this row takes a
-  lease and records the result here. A unit gate proves the width arithmetic; it
-  does not prove that the render is right.
+- **The end-to-end bf16 render.** §5b proves the shipped bf16 text encoder now
+  LOADS, on its own bytes, through the function the engine calls. It does not
+  prove the arm renders: that needs the DiT and both VAEs on a device, which
+  needs a `dgx:gpu0` lease. No lease was taken by this row — `dgx:gpu0` was held
+  by an unrelated job with another hold queued behind it, and displacing either
+  to prove a load that a CPU-only probe already proves would be the wrong trade.
+  The render stays owed here and is what
+  [#1854](https://github.com/mudler/vllm.cpp/issues/1854)'s comparison will
+  exercise.
 - **The comparison reading itself** stays with `LTX25-ORACLE-ABSOLUTE`. This row
   unblocks it and does not take it.
 

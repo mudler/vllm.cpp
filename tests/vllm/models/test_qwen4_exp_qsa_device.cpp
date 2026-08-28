@@ -25,9 +25,10 @@
 // 2.1x the buffer width, genuinely sparse — and the last two cases in this file
 // additionally run the RELEASED indexer config (`token_budget` 2048,
 // `compress_ratio` 4, `index_head_dim` 128, `rotary_dim` 64) at **3002 tokens of
-// context**, which is past 2048 and where 512 of 750 complete blocks are
-// discarded. The sub-budget control beside it runs at 2051 and selects
-// everything, which is the measurement of WHY the requirement exists.
+// context**, which is past 2048 and where 512 of the 750 complete blocks are
+// SELECTED and the other 238 are discarded. The sub-budget control beside it
+// runs at 2051 and selects everything, which is the measurement of WHY the
+// requirement exists.
 //
 // AND ONE GATE THAT IS NOT ABOUT CORRECTNESS. `keys_visited` says the gather
 // READ only the selected rows. A sparse mask over a dense cache is correct and
@@ -48,6 +49,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -56,6 +58,21 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+
+// THE FETCH-LEVEL PROBE'S ONLY PLATFORM DEPENDENCY. `mmap`/`mprotect` are POSIX
+// and MSVC has neither, so the case below is compiled where they exist and is
+// declared SKIPPED where they are not — a probe that cannot run must say so,
+// never fail and never quietly vanish.
+#if !defined(_WIN32) && (defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)))
+#define VT_QSA_MPROTECT_PROBE 1
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <csetjmp>
+#include <csignal>
+#else
+#define VT_QSA_MPROTECT_PROBE 0
+#endif
 
 using vllm::qwen4_exp::QsaBlockScores;
 using vllm::qwen4_exp::QsaCompressNormRope;
@@ -270,6 +287,102 @@ struct Lcg {
     return static_cast<float>(static_cast<int32_t>(s >> 33)) / 2147483648.0f - 0.5f;
   }
 };
+
+#if VT_QSA_MPROTECT_PROBE
+// ── The fetch-level probe's trampoline ──────────────────────────────────
+//
+// A kernel that reads an unmapped page raises SIGSEGV, and an unhandled SIGSEGV
+// kills the whole binary: ctest then reports a signal with no case name, which
+// is indistinguishable from a build that never ran and is the "broken
+// instruments fail toward a code verdict" trap. So the fault is caught and
+// turned into a FAILING ASSERTION that names the row it died on.
+//
+// `siglongjmp` out of the handler formally skips the destructors of every frame
+// it unwinds. Those frames belong to the kernel and hold only `std::vector`s, so
+// a body that faults leaks a few kilobytes on its way to a red. The SHIPPED
+// kernel never takes this path -- it is the mutant's exit, and a mutant does not
+// have to be leak-clean to be convicted.
+sigjmp_buf g_qsa_probe_jmp;
+volatile sig_atomic_t g_qsa_probe_armed = 0;
+
+extern "C" void QsaProbeFaultHandler(int sig) {
+  if (g_qsa_probe_armed != 0) {
+    g_qsa_probe_armed = 0;
+    siglongjmp(g_qsa_probe_jmp, 1);
+  }
+  // Not ours. Put the default action back and return, so the faulting
+  // instruction re-executes and dies exactly as it would have without us --
+  // swallowing an unrelated SIGSEGV would hide a real defect.
+  ::signal(sig, SIG_DFL);
+}
+
+// The `sigsetjmp` lives in its OWN function so that no non-volatile local of the
+// test case is modified between the setjmp and the longjmp; that is both the
+// standard's rule and what keeps `-Wclobbered` quiet under `-Werror`.
+//
+// The handler is installed HERE and doctest's own is put back before returning.
+// doctest installs a fatal-condition handler around every case, and left in
+// place it turns the mutant's fault into `FATAL ERROR: test case CRASHED` and
+// ABANDONS the rest of the binary -- every remaining case reads as skipped, so
+// one convicted mutant costs the verdict on every other property in the file.
+// Catching it here makes the fault a failing CHECK in one case and lets the
+// suite finish.
+bool GatherFaulted(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                   const Tensor& value, const Tensor& block_ids, const Tensor& kv_lens,
+                   const Qwen4ExpQsaAttnArgs& args) {
+  struct sigaction sa;
+  struct sigaction old_segv;
+  struct sigaction old_bus;
+  std::memset(&sa, 0, sizeof(sa));
+  std::memset(&old_segv, 0, sizeof(old_segv));
+  std::memset(&old_bus, 0, sizeof(old_bus));
+  sa.sa_handler = &QsaProbeFaultHandler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  if (::sigaction(SIGSEGV, &sa, &old_segv) != 0) return true;
+  if (::sigaction(SIGBUS, &sa, &old_bus) != 0) {
+    ::sigaction(SIGSEGV, &old_segv, nullptr);
+    return true;
+  }
+  // VOLATILE on purpose: a non-volatile local written between `sigsetjmp` and
+  // `siglongjmp` has an indeterminate value on the longjmp path.
+  volatile bool faulted = true;
+  if (sigsetjmp(g_qsa_probe_jmp, 1) == 0) {
+    g_qsa_probe_armed = 1;
+    vt::Qwen4ExpQsaGatherAttention(q, out, query, key, value, block_ids, kv_lens, args);
+    g_qsa_probe_armed = 0;
+    faulted = false;
+  }
+  g_qsa_probe_armed = 0;
+  ::sigaction(SIGSEGV, &old_segv, nullptr);
+  ::sigaction(SIGBUS, &old_bus, nullptr);
+  return faulted;
+}
+
+// An anonymous page-aligned mapping, restored to readable before it is returned
+// so that a `munmap` on a PROT_NONE range is never the thing under test.
+struct GuardedCache {
+  void* base = nullptr;
+  size_t bytes = 0;
+  GuardedCache() = default;
+  GuardedCache(const GuardedCache&) = delete;
+  GuardedCache& operator=(const GuardedCache&) = delete;
+  ~GuardedCache() {
+    if (base != nullptr) {
+      ::mprotect(base, bytes, PROT_READ | PROT_WRITE);
+      ::munmap(base, bytes);
+    }
+  }
+  bool Map(size_t n) {
+    void* p = ::mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return false;
+    base = p;
+    bytes = n;
+    return true;
+  }
+  float* Data() { return static_cast<float*>(base); }
+};
+#endif  // VT_QSA_MPROTECT_PROBE
 
 }  // namespace
 
@@ -613,9 +726,11 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention: the unselected rows are NaN and the a
   // moment an unselected row is poisoned, a mask's output is NaN and a gather's
   // is unchanged. This is an OBSERVABLE OF THE WALK, not of the kernel's
   // bookkeeping, and it is what makes the property checkable rather than
-  // asserted. It is also the honest limit of what a CPU host can prove: the
-  // structural version is a PAGED cache where the unselected blocks are simply
-  // not mapped, which needs the block-table store owed under #2131.
+  // asserted. Its honest limit is that it proves a row was never MULTIPLIED,
+  // not that it was never FETCHED — a body that loads every row and throws the
+  // unselected ones away passes this case. The case that convicts THAT is the
+  // unmapped-tail probe below, which needs no paged production store because a
+  // test may `mmap` its own cache.
   //
   // ONE query token, deliberately: the poison set is that token's complement,
   // and two tokens with different selections have no common complement to
@@ -695,6 +810,143 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention: the unselected rows are NaN and the a
     CHECK(out[static_cast<size_t>(i)] == want[static_cast<size_t>(i)]);
   }
 }
+
+// ── The same property, one layer deeper: the unselected tail is UNMAPPED ─────
+
+#if VT_QSA_MPROTECT_PROBE
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention: the gather never FETCHES an unmapped unselected row") {
+  // WHAT THIS ADDS OVER THE NaN CASE ABOVE, which is the whole reason it exists.
+  // A NaN poison proves an unselected row was never MULTIPLIED into an
+  // accumulator. It does not prove the row's bytes were never READ: a body that
+  // loads every row and discards the unselected ones before the multiply passes
+  // it untouched, and the key-row TRAFFIC is the cost llama.cpp #27739 measures,
+  // not the multiply. The instrument that convicts a fetch is a cache whose
+  // unselected pages are not readable at all, so a read of one is a SIGSEGV.
+  //
+  // AND IT DOES NOT NEED THE PAGED STORE. The structural version of this in
+  // PRODUCTION is a block-table cache whose unselected blocks are simply not
+  // mapped, and that store is genuinely owed and genuinely blocked. A TEST is
+  // under no such constraint: it builds the cache itself, and `mmap` plus
+  // `mprotect(PROT_NONE)` gives it the page-granular hole for free.
+  //
+  // THE SHAPE IS FORCED BY THE KERNEL. The gather addresses the cache as
+  // `(p * HKV + kvh) * DH + d` and never reads `key.stride[0]`, so a guard page
+  // BETWEEN rows is not available -- the unselected rows have to form ONE
+  // contiguous run. Selecting blocks 0..511 and running at kv_len 3000, a
+  // multiple of `compress_ratio` so the always-attended ragged tail is empty,
+  // puts every unselected row in `[2048, 3000)` with nothing of interest after
+  // it.
+  Queue q = CpuQ();
+  QsaConfig cfg;  // the released Qwen3.8-Flash-Next indexer values
+  REQUIRE(cfg.token_budget == 2048);
+  REQUIRE(cfg.block_topk() == 512);
+  constexpr int64_t T = 1, HQ = 4, HKV = 2, DH = 32;
+  const int64_t topk = cfg.block_topk();
+  const int64_t kv = 3000;
+  REQUIRE(kv % cfg.compress_ratio == 0);  // an empty ragged tail
+  const int64_t complete = kv / cfg.compress_ratio;
+  REQUIRE(topk < complete);  // genuinely sparse: 512 of 750 blocks
+
+  const size_t row_floats = static_cast<size_t>(HKV * DH);
+  const size_t cache_bytes = static_cast<size_t>(kv) * row_floats * sizeof(float);
+  GuardedCache kmap, vmap;
+  REQUIRE(kmap.Map(cache_bytes));
+  REQUIRE(vmap.Map(cache_bytes));
+
+  Lcg rng(0xfe7c40ded1234ULL);
+  for (size_t i = 0; i < cache_bytes / sizeof(float); ++i) kmap.Data()[i] = rng.Next();
+  for (size_t i = 0; i < cache_bytes / sizeof(float); ++i) vmap.Data()[i] = rng.Next();
+  std::vector<float> qa(static_cast<size_t>(T * HQ * DH));
+  for (float& v : qa) v = rng.Next();
+
+  // The selection is handed in directly rather than scored: this case is about
+  // the gather's FETCH, and an indexer run would only add a second thing that
+  // could be wrong. Ascending and inside the complete blocks, as the op demands.
+  std::vector<int32_t> ids(static_cast<size_t>(T * topk), -1);
+  for (int64_t j = 0; j < topk; ++j) ids[static_cast<size_t>(j)] = static_cast<int32_t>(j);
+  std::vector<int32_t> lens(static_cast<size_t>(T), static_cast<int32_t>(kv));
+
+  Tensor t_q = MakeT(qa.data(), DType::kF32, {T, HQ, DH});
+  Tensor t_k = MakeT(kmap.base, DType::kF32, {kv, HKV, DH});
+  Tensor t_v = MakeT(vmap.base, DType::kF32, {kv, HKV, DH});
+  Tensor t_ids = MakeT(ids.data(), DType::kI32, {T, topk});
+  Tensor t_len = MakeT(lens.data(), DType::kI32, {T});
+
+  Qwen4ExpQsaAttnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(DH));
+  args.compress_ratio = cfg.compress_ratio;
+
+  // Pass 1: the cache is fully readable. This is the control the guarded run is
+  // compared against, and it is taken FIRST because reading it afterwards would
+  // mean unprotecting the pages the case exists to keep unreadable.
+  std::vector<float> out_open(static_cast<size_t>(T * HQ * DH), 0.0f);
+  Tensor t_out_open = MakeT(out_open.data(), DType::kF32, {T, HQ, DH});
+  int64_t visited_open = -1;
+  args.keys_visited = &visited_open;
+  vt::Qwen4ExpQsaGatherAttention(q, t_out_open, t_q, t_k, t_v, t_ids, t_len, args);
+
+  // The whole pages that lie STRICTLY INSIDE the unselected tail. The partial
+  // pages at each end stay readable, because a page is the granularity mprotect
+  // has and taking a page that holds a selected row would fault the honest
+  // kernel.
+  const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  REQUIRE(page > 0);
+  const size_t tail_lo =
+      static_cast<size_t>(topk * cfg.compress_ratio) * row_floats * sizeof(float);
+  const size_t guard_lo = ((tail_lo + page - 1) / page) * page;
+  const size_t guard_hi = (cache_bytes / page) * page;
+  // A guard of zero pages would make this case vacuous -- the "a gate that never
+  // fired is not a gate" failure -- so it is REQUIREd, not assumed.
+  REQUIRE(guard_hi > guard_lo);
+  const size_t guard_bytes = guard_hi - guard_lo;
+  INFO("guarding ", guard_bytes, " bytes (", guard_bytes / page, " pages) of the unselected tail [",
+       tail_lo, ", ", cache_bytes, ") in BOTH the key and the value cache");
+  REQUIRE(::mprotect(static_cast<char*>(kmap.base) + guard_lo, guard_bytes, PROT_NONE) == 0);
+  REQUIRE(::mprotect(static_cast<char*>(vmap.base) + guard_lo, guard_bytes, PROT_NONE) == 0);
+
+  // Pass 2: the same call over the same cache with the tail taken away. A
+  // gather walks past it. A dense masked walk -- mutation M11's body, which the
+  // NaN case reds and which every read-count assertion in this file passes --
+  // dereferences the first guarded row and dies.
+  std::vector<float> out_guarded(static_cast<size_t>(T * HQ * DH), 0.0f);
+  Tensor t_out_guarded = MakeT(out_guarded.data(), DType::kF32, {T, HQ, DH});
+  int64_t visited_guarded = -1;
+  args.keys_visited = &visited_guarded;
+  const bool faulted = GatherFaulted(q, t_out_guarded, t_q, t_k, t_v, t_ids, t_len, args);
+
+  INFO("faulted ", faulted, " keys_visited ", visited_guarded);
+  CHECK_FALSE(faulted);
+  if (faulted) return;  // the tensors below hold nothing a fault left behind
+
+  // The counts, so that a body which survived by reading NOTHING is not mistaken
+  // for one that gathered. 512 blocks * 4 rows * 4 query heads * 2 softmax
+  // passes = 16384, against a dense 3000 * 4 * 2 = 24000.
+  // Re-derived here rather than shared with the case above: two softmax passes,
+  // each of which reads every row it visits. A single-pass online-softmax
+  // rewrite halves it, and that is owed work, not a free change.
+  constexpr int64_t kReadsPerRowPerHead = 2;
+  const int64_t want_reads = topk * cfg.compress_ratio * HQ * kReadsPerRowPerHead;
+  const int64_t dense_reads = kv * HQ * kReadsPerRowPerHead;
+  CHECK(visited_guarded == want_reads);
+  CHECK(visited_guarded == visited_open);
+  CHECK(visited_guarded < dense_reads);
+
+  // And bit-identical to the unguarded run, which says the walk was the same one
+  // and not a truncated version of it that stopped at the hole.
+  for (int64_t i = 0; i < T * HQ * DH; ++i) {
+    CAPTURE(i);
+    CHECK(std::isfinite(out_guarded[static_cast<size_t>(i)]));
+    CHECK(out_guarded[static_cast<size_t>(i)] == out_open[static_cast<size_t>(i)]);
+  }
+}
+#else
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention: the gather never FETCHES an unmapped unselected row" *
+          doctest::skip()) {
+  // No POSIX `mmap`/`mprotect` on this platform. The NaN case above still runs
+  // and is portable; this one reports SKIPPED rather than failing, because a
+  // probe that cannot be built here proves nothing either way.
+}
+#endif  // VT_QSA_MPROTECT_PROBE
 
 // ── The RELEASED indexer config, past 2048 tokens of context ─────────────────
 

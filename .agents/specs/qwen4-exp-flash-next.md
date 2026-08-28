@@ -1158,7 +1158,10 @@ each of the three would otherwise have run a STALE binary and reported a pass.
 Every row below is re-measured on the FINAL head, after the repair, not at the
 point in the wave where its fix landed. Target `src/vt/cpu/cpu_qwen4_exp_qsa.cpp`
 unless stated; suite `tests/vllm/models/test_qwen4_exp_qsa_device.cpp`,
-**11 cases / 4427 assertions green**.
+**12 cases / 4697 assertions green** after the fresh review's repair added the
+unmapped-tail probe. The per-mutation figures in the table below were measured on
+the 11-case suite, before that case existed; the three rows the repair added or
+re-measured (the probe row, M11 and M11c) name the 12-case suite explicitly.
 
 | # | mutation | build rc | result | first battery |
 |---|---|---|---|---|
@@ -1172,8 +1175,9 @@ unless stated; suite `tests/vllm/models/test_qwen4_exp_qsa_device.cpp`,
 | M8 | OVERLAPPING pooling window (DeepSeek-V4's shape), stride 1 not CR | 0 | RED, 5 of 11 cases, 1548 assertions | RED |
 | M9 | the RMS norm's `.type_as(x)` bf16 rounding dropped | 0 | RED, 1 of 11 cases, 2 assertions | RED |
 | M10 | the NoPE dims are zeroed instead of carried through untouched | 0 | RED, 5 of 11 cases, 1479 assertions | RED |
-| M11 | THE LOAD-BEARING ONE: a dense masked walk reporting the SPARSE read count | 0 | RED, 1 of 11 cases, 256 assertions | **SURVIVED** |
+| M11 | THE LOAD-BEARING ONE: a dense masked walk reporting the SPARSE read count | 0 | RED, 1 of 11 cases, 256 assertions; **re-measured on the 12-case suite: RED, 2 of 12 cases, 257 assertions** — the NaN case and the unmapped-tail probe | **SURVIVED** |
 | M11b | the same dense masked walk, with the counter left AT the read site | 0 | RED, 3 of 11 cases, 260 assertions | n/a |
+| M11c | THE FETCH, NOT THE MULTIPLY: prefetch every cached row and discard it, then gather honestly | 0 | RED, **1 of 12** cases — the unmapped-tail probe ALONE; the NaN case and every read-count case pass | n/a |
 | M12 | the always-attended ragged tail dropped | 0 | RED, 5 of 11 cases, 899 assertions | RED |
 | M13 | block b expands to tokens [b, b + CR) instead of [CR*b, CR*b + CR) | 0 | RED, 4 of 11 cases, 1538 assertions | RED |
 | M14 | block b expands to CR - 1 tokens (the off-by-one) | 0 | RED, 5 of 11 cases, 1926 assertions | RED |
@@ -1220,15 +1224,51 @@ directly, so the shipped counter is a function of the walk and not a restatement
 of the selection. A single survivor with no companion reads as an instrument
 nobody wired up, which is why both rows are here.
 
-**THE HONEST LIMIT.** The NaN probe proves a row was not multiplied into the
-accumulator. It does not prove the row's bytes were never fetched: a body that
-loads every row and discards the unselected ones before the multiply passes it,
-and the loop counter is not the cost llama.cpp #27739 measures anyway — the
-key-row traffic is. The structural version of this test is a PAGED cache in which
-the unselected blocks are simply not mapped, so touching one faults. That needs
-the block-table store, which is owed and blocked on
-[#2131](https://github.com/mudler/vllm.cpp/issues/2131), and it is recorded under
-`## Owed` rather than left for a later reviewer to discover.
+**THE LIMIT OF THE NaN PROBE, AND THE PROBE THAT CLOSES IT.** The NaN poison
+proves a row was not multiplied into the accumulator. It does not prove the row's
+bytes were never fetched: a body that loads every row and discards the unselected
+ones before the multiply passes it, and the loop counter is not the cost
+llama.cpp #27739 measures anyway — the key-row traffic is.
+
+The wave's first draft recorded that gap as blocked, on the reasoning that the
+structural version is a PAGED cache whose unselected blocks are not mapped, and
+that the block-table store is owed and waits on
+[#2131](https://github.com/mudler/vllm.cpp/issues/2131). **That is true of the
+PRODUCTION cache and false of a test instrument**, and the fresh review proved it
+by building one. `vt::Qwen4ExpQsaGatherAttention: the gather never FETCHES an
+unmapped unselected row` `mmap`s its own page-aligned K and V caches at kv_len
+3000 — a multiple of `compress_ratio`, so the always-attended ragged tail is
+empty — selects blocks `0..511`, and `mprotect(PROT_NONE)`s the 59 whole pages
+(241664 bytes, `[524288, 768000)`) that lie strictly inside the unselected run
+`[2048, 3000)`, in BOTH caches. The shipped kernel walks past the hole:
+`keys_visited` 16384 against a dense 24000, and its output is bit-identical to
+the same call over the unguarded mapping. M11's dense masked walk dereferences
+the first guarded row and takes SIGSEGV.
+
+The construction is forced by the kernel, not chosen: the gather addresses the
+cache as `(p * HKV + kvh) * DH + d` and never reads `key.stride[0]`, so a guard
+page BETWEEN rows is unavailable and the unselected rows have to form one
+contiguous tail.
+
+**M11c is what says the probe is not a restatement of the NaN case.** It
+prefetches every cached row into a discarded accumulator and then gathers
+honestly with the honest counter — the exact body the paragraph above names as
+the NaN probe's blind spot. It reds **one** case out of twelve, the unmapped-tail
+probe, and passes the NaN case, every read-count case and every value case. The
+two probes are therefore ordered, not redundant: NaN convicts the multiply, the
+unmapped tail convicts the fetch.
+
+**A fault has to be a failing assertion, not a dead binary.** doctest installs a
+fatal-condition handler around every case, and left in place it turns the
+mutant's SIGSEGV into `FATAL ERROR: test case CRASHED` and abandons the rest of
+the run — every remaining case reads as skipped, so one convicted mutant costs
+the verdict on every other property in the file. This was measured, not assumed:
+the first build of the probe omitted the handler and exited 139 with eleven cases
+unreported. The probe installs its own `SIGSEGV`/`SIGBUS` handler around the one
+call, `siglongjmp`s back into the case, restores doctest's handlers, and reports
+`CHECK_FALSE(faulted)`. On a platform without POSIX `mmap`/`mprotect` the case is
+declared `doctest::skip()` rather than compiled out, because a probe that cannot
+run must say so.
 
 **THE OTHER SURVIVOR IS A DELIBERATE CONTROL.** M26 inherits DeepSeek-V4's
 `n_head_scale = n_head ** -0.5` into the composed indexer, which QSA has no
@@ -1432,6 +1472,26 @@ is listed under `## Owed`.
   launch; and whether the gather is a genuine address-generated gather on the
   device or degrades to a mask, which is the whole point of the row and is
   exactly what a CPU host cannot measure.
+- **W5b OWES THE INDEXER COMPOSITION IN PRODUCTION CODE, AND FOUR SETTINGS WITH
+  IT.** This wave's headline claim is that QSA's block score and top-k are
+  `vt::DsaIndexerLogits` + `vt::DsaTopkSelect` with the fold collapsed. That
+  composition exists in exactly one place: the `RunIndexer` helper in
+  `tests/vllm/models/test_qwen4_exp_qsa_device.cpp`. Nothing under `src/` composes
+  it, so nothing outside that helper enforces any of the four settings the
+  collapse depends on:
+  1. `weights` is all ones (`[T, index_n_heads]`), which is what collapses the
+     per-head fold to a single constant. M27 is its red control.
+  2. `n_head_scale == 1.0f`, NOT DeepSeek-V4's `n_head ** -0.5`, which QSA has no
+     tensor for.
+  3. `softmax_scale == index_head_dim ** -0.5`, QSA's own scale.
+  4. `win_end == kv_len / compress_ratio` per query token — the COMPLETE visible
+     blocks, not the whole cache. M28 is its red control.
+  W5b must write this recipe again where no test helper is watching, and two of
+  the four have no gate that would catch a wrong value there: M26 records that
+  `n_head_scale` is invisible to selection BY CONSTRUCTION, because top-k is
+  invariant under a positive rescale of every score, and `softmax_scale` is
+  invariant for the same reason. Whatever composes these ops in production owes a
+  VALUE gate on the logits, not a selection gate.
 - **A single-pass online softmax for the gather.** The CPU kernel makes two
   passes over the selected rows per query head, which is why the honest read
   count is `selected * num_q_heads * 2`. A single-pass rewrite legitimately
@@ -1454,7 +1514,13 @@ is listed under `## Owed`.
   costs and `QsaCompressedSlot` says which slot a token writes; this op writes a
   DENSE `[num_blocks, head_dim]` array and not a paged one. The block-table store
   belongs to the wave that gives QSA a real KV-cache group, which is blocked on
-  [#2131](https://github.com/mudler/vllm.cpp/issues/2131).
+  [#2131](https://github.com/mudler/vllm.cpp/issues/2131). **This is a PRODUCTION
+  obligation only.** The wave's first draft also recorded the fetch-level PROOF —
+  a cache whose unselected blocks fault when touched — as waiting on the same
+  store. It never was: the fresh review built it out of `mmap` and
+  `mprotect(PROT_NONE)` inside the test, it is the case `the gather never FETCHES
+  an unmapped unselected row`, and M11c is the paired control showing it convicts
+  a body the NaN poison cannot see. Nothing about the instrument is owed.
 
 - [#1978](https://github.com/mudler/vllm.cpp/issues/1978): this port, the campaign
   row. W0 landed the spec with no product code.

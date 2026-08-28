@@ -160,143 +160,6 @@ scripts/agent-preflight.sh --fail-on-skip
 ```
 
 The three model suites are the regression gate named by the issue. Their case
-and assertion counts are recorded in `## Owed` names both, with the upstream anchor for each.
-
-## Scope
-
-`GPUModelRunner::initialize_kv_cache` refuses any recurrent group whose
-`MambaSpec` does not carry EXACTLY two shapes and two dtypes:
-
-```cpp
-VT_CHECK(mamba_spec->shapes.size() == 2 && mamba_spec->dtypes.size() == 2,
-         "runner: recurrent MambaSpec must contain conv then temporal state");
-conv_state_shape = mamba_spec->shapes[0];
-ssm_state_shape  = mamba_spec->shapes[1];
-```
-
-and `GdnStateCache` carries exactly two named tensors, `conv_state` and
-`ssm_state`. Between them, a recurrent layer in this tree cannot hold a third
-state at all.
-
-In scope: the state COUNT and the per-state dtype, end to end — spec read,
-allocation, byte accounting, and the view carrier the models read.
-
-Out of scope, each named under `## Owed` rather than dropped: per-layer state
-heterogeneity within one recurrent group, a state count of ONE, a SECOND
-recurrent group, and any model that publishes N >= 3.
-
-## The finding: vLLM never had a two-state assumption, and we invented one
-
-The issue's premise is that upstream may not express this either. It does, it
-expresses it fully generally, and it SHIPS three different values of N at the
-pin. Read at `5559679229`:
-
-| Upstream | Anchor | What it says |
-|---|---|---|
-| the carrier | `vllm/model_executor/layers/mamba/abstract.py:26` | `kv_cache: tuple[torch.Tensor, ...]` — an ordered tuple of unbounded length, NOT a named `(conv, ssm)` pair |
-| the unpack | `abstract.py:29-43` `bind_kv_cache` | `for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())`, slicing one page at a running byte offset. N states, each with its OWN shape and its OWN dtype |
-| the contract | `abstract.py:46-52` | "For mamba layers this is **usually** a (conv_state, ssm_state) tuple". Two is a convention the docstring itself hedges |
-| N == 1 | `vllm/model_executor/layers/mamba/short_conv.py:87` | `self.kv_cache = (torch.tensor([]),)` |
-| N == 5 | `vllm/model_executor/layers/mamba/mamba_mixer2.py:517-520` | `_n_state = 5 if self.use_replayssm else 2`, and `:722-724` `x_cache, dt_cache, B_cache = self.kv_cache[2:]` |
-| N == 5 shapes | `vllm/model_executor/layers/mamba/mamba_utils.py:202-221` | the three appended shapes are rank 3, rank **2** and rank 3 — a rank change inside one layer's state set |
-| N == 5 dtypes | `mamba_utils.py:84-93` | `(*base_dtypes, activation_dtype, torch.float32, activation_dtype)` — a `float32` beside two activation dtypes |
-| the runner | `vllm/v1/worker/gpu_model_runner.py:7429-7440` | allocates `num_blocks * page_size_bytes` RAW int8 and hands the layer one untyped page. The runner never learns N, and cannot |
-| the spec | `vllm/v1/kv_cache_interface.py:698-707` | `page_size_bytes` is `sum(prod(shape) * get_dtype_size(dtype))` over the zip — already N-general |
-
-Our `MambaSpec` (`include/vllm/v1/kv_cache_interface.h`) already mirrors the last
-row: it holds `std::vector<std::vector<int64_t>> shapes` and
-`std::vector<vt::DType> dtypes`, and `MambaSpec::page_size_bytes` sums over both.
-`vllm::v1::recurrent_state_bytes` reads nothing but `page_size_bytes()`. **The
-two-shape assumption exists in exactly two places, the runner and the state
-carrier, and both are local inventions.** That is why this is a repair and not a
-feature.
-
-## Design
-
-Mirror `bind_kv_cache`. The recurrent cache becomes an ORDERED LIST of states
-whose length, per-state shape and per-state dtype all come from the group's own
-`MambaSpec`.
-
-1. **`GdnStateCache` grows `std::vector<vt::Tensor> states`** — the mirror of
-   `kv_cache: tuple[torch.Tensor, ...]`. `conv_state` and `ssm_state` stay, and
-   are `states[0]` and `states[1]`. Every existing consumer — `qwen3_5.cpp`,
-   `kimi_linear_device.cpp`, `nemotron_h_device.cpp`, `gemma4_mm.cpp` — reads
-   those two names and is untouched.
-2. **The runner's recurrent geometry becomes vectors over N.** One
-   `CacheBuffer` per (recurrent layer, state), allocated in SPEC ORDER, which is
-   the order `bind_kv_cache` slices in. `kv_cache_allocated_bytes` sums every
-   one of them, so the memory the runner reports stays the memory it took.
-3. **The refusal widens from `== 2` to `>= 2`, and gains
-   `shapes.size() == dtypes.size()`.** The second half was never checked: a spec
-   with two shapes and one dtype read `dtypes[1]` out of bounds.
-4. **The per-state dtype predicate widens from `{F16, BF16, F32}` to any
-   non-block-quantized `vt::DType`.** `bind_kv_cache` imposes no dtype
-   constraint at all; the local floating-only rule was justified by "all-zero
-   bytes are `+0.0f` for every supported floating storage type", which is
-   equally true of an integer zero. The real constraint is that a block-quant
-   dtype has no per-element size, and that is what the widened predicate names.
-   This is what makes an INTEGER state expressible — a `qwen4_exp` PLE layer's
-   n-gram history holds `input_ids.long()`, i.e. token ids and not activations.
-
-Widening an assertion is a semantic checker change, so it lands red-first: the
-new test is RED at the base tree for BOTH halves (the count and the dtype), and
-the widening is justified by the upstream anchor rather than by making a gate
-green.
-
-### What this wave deliberately does NOT do
-
-`gdn_group_id_` stays a scalar and the `recurrent_seen > 1` refusal stays. The
-issue reads the one-group limit as a second half of the same blocker. It is a
-real hole, but it is NOT the one a PLE topology hits, and that correction is
-worth recording: upstream does not split recurrent layers with different state
-sets into different groups. `vllm/v1/core/kv_cache_utils.py:1099-1110` pads the
-smaller `MambaSpec` page up to `max_page_size` through `page_size_padded` and
-keeps ONE group, precisely because "MambaSpec's page size is determined by its
-state shapes and does not scale with block_size". Heterogeneous recurrent layers
-are therefore a PER-LAYER SPEC problem inside one group — the recurrent twin of
-the `per_layer_attn_specs` seam this tree already has for Gemma-4's
-heterogeneous attention head_dim — and not a multi-group problem. That is the
-next wave, and it is named under `## Owed`.
-
-## Risks
-
-- **Silent byte drift on the existing arms.** Four model families flow through
-  these lines. Mitigated by an existing literal byte-neutrality case
-  (`test_runner.cpp`, "the Qwen3.5 allocation is BYTE-IDENTICAL after #810") and
-  by running the recurrent suites before and after and comparing case and
-  assertion counts exactly.
-- **A cosmetic generalization.** A vector that is only ever length 2 proves
-  nothing. Mitigated by a mutation that reverts the loop to `states[0..1]` and
-  must RED the new case, and by shapes chosen so the third state genuinely
-  changes the allocated bytes, the view count and the reported total.
-- **The reverse: the OLD path stops being exercised.** Mitigated by a mutation
-  inside the two-state path that must RED an EXISTING recurrent suite.
-
-## Tests
-
-`tests/vllm/v1/worker/test_runner.cpp`:
-
-- a THREE-state recurrent group, with a third state of a different rank, a
-  different element count and a different dtype from either of the first two:
-  three buffers, three views, `page_size_bytes` identity over all three, and
-  `kv_cache_allocated_bytes` counting the third.
-- an INTEGER third state (`kI64`), which is what a token-id history is.
-- a spec whose `shapes` and `dtypes` disagree in length is REFUSED.
-- a block-quantized state dtype is REFUSED.
-
-## Gates
-
-```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_BUILD_EXAMPLES=OFF
-ninja -C build -j 6 test_runner test_qwen27_paged_forward test_nemotron_h_paged_forward test_kimi_linear_paged
-./build/tests/test_runner
-./build/tests/test_qwen27_paged_forward
-./build/tests/test_nemotron_h_paged_forward
-./build/tests/test_kimi_linear_paged
-scripts/agent-preflight.sh --fail-on-skip
-```
-
-The three model suites are the regression gate named by the issue. Their case
 and assertion counts are recorded in `## Outcome` before and after, because a
 count that moved is the only thing that can see a case that stopped running.
 
@@ -385,6 +248,17 @@ is those other three, and this row used all four.
 - **A SECOND recurrent group.** `recurrent_seen > 1` still refuses, and
   `gdn_group_id_` is still a scalar. Not needed for a PLE topology (see
   `### What this wave deliberately does NOT do`) but still unrepresentable.
+- **`test_qwen27_paged_forward` does not gate the runner's recurrent state
+  assignment**, measured above. Either it should enter through the runner's own
+  `GdnStateCache`, or the issue text and any future dispatch should stop naming
+  it as this seam's gate. Tracked by
+  [#2131](https://github.com/mudler/vllm.cpp/issues/2131) until a row picks it
+  up.
+- **`GdnStateCache::states` is filled by the runner only.** The host-path
+  scaffolds in `qwen3_5.cpp` and several test fixtures build the two named
+  fields and leave the list empty. Inert while nothing outside the runner reads
+  it; a consumer that starts reading `states` owes those builders the
+  assignment.
 - **Nothing publishes N >= 3.** Every recurrent registry in the tree publishes
   two states, so the N >= 3 arm lands EXPRESSIBLE and UNREACHED. The two-state
   arm is reached by every recurrent model through the same generalized loop —

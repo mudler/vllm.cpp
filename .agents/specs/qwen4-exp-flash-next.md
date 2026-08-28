@@ -416,10 +416,46 @@ constructs. Both halves stay owed as generic engine debt —
 divergence from upstream's list order, and the same bytes.** Upstream keeps the
 three CONV states adjacent (`number_of_conv_states = 3`) with the temporal state
 after them. `GdnStateCache` publishes `conv_state = states[0]` and
-`ssm_state = states[1]` as NAMED fields that `qwen3_5.cpp`,
-`kimi_linear_device.cpp`, `nemotron_h_device.cpp` and `gemma4_mm.cpp` all read,
-so moving the temporal state off slot 1 would silently re-point four model
-families. Slice order differs; `page_size_bytes` does not.
+`ssm_state = states[1]` as NAMED fields that THREE model families read —
+`qwen3_5.cpp`, `kimi_linear_device.cpp`, and the `nemotron_h` pair
+`nemotron_h_device.cpp` / `nemotron_h_forward.h` — so moving the temporal state
+off slot 1 would silently re-point three model families. Slice order differs;
+`page_size_bytes` does not.
+
+**Three, not four ([#2203](https://github.com/mudler/vllm.cpp/issues/2203)).**
+This wave first wrote FOUR here and in `qwen4_exp_registry.cpp`, inheriting the
+list from `.agents/specs/recurrent-multistate.md` (landed by `f7710c1b4`,
+[#2131](https://github.com/mudler/vllm.cpp/issues/2131)), whose fourth name is
+`gemma4_mm.cpp`. That file reads NEITHER field — zero occurrences of
+`conv_state` and zero of `ssm_state` — and its only two mentions of the type are
+an include comment and `std::vector<GdnStateCache> no_gdn_state;`
+(`gemma4_mm.cpp:221`), passed EMPTY. It is the file that proves Gemma-4 has no
+recurrent arm, cited as proving the opposite. `muse_glimmer_mm.cpp:340` and
+`qwen3_vl.cpp:621` carry the identical empty-vector shape, so the wrong fourth
+name was one of the three files that demonstrate the negative. Measured on
+`ad6696fa3`, `GdnStateCache` / `conv_state` / `ssm_state` counts per file:
+
+| File | `GdnStateCache` | `conv_state` | `ssm_state` |
+|---|---|---|---|
+| `qwen3_5.cpp` | 37 | 33 | 34 |
+| `nemotron_h_device.cpp` | 6 | 9 | 14 |
+| `kimi_linear_device.cpp` | 2 | 7 | 6 |
+| `gemma4_mm.cpp` | 2 | **0** | **0** |
+| `muse_glimmer_mm.cpp` | 2 | **0** | **0** |
+| `qwen3_vl.cpp` | 2 | **0** | **0** |
+
+A grep on the FIELD name over-counts in the other direction:
+`glm5_next_kda.cpp:343-345` matches `conv_state` 13 times, but that is
+`Glm5NextKdaCache::conv_state`, a `std::vector<float>` KDA sequence state
+(`include/vllm/model_executor/models/glm5_next_kda.h:314`), where this one is a
+`vt::Tensor` (`include/vllm/model_executor/models/qwen3_5.h:111`); that file has
+zero occurrences of `GdnStateCache`. Grep the TYPE. **The conclusion does not
+move:** re-pointing three families is still the reason the temporal state stays
+on slot 1. Only the enumeration was wrong, and no checker can see this class —
+`check-symbol-anchors` resolves symbols, and `GdnStateCache` genuinely appears
+in `gemma4_mm.cpp`, so symbol existence passes on a file whose behaviour is the
+opposite of the one asserted. Same class as
+[#2198](https://github.com/mudler/vllm.cpp/issues/2198), which this wave closes.
 
 **Group 2 must be an `MLAAttentionSpec`, and a `FullAttentionSpec` there fails
 SILENTLY.** The runner's leftover scan treats the first published
@@ -1577,7 +1613,7 @@ Green at the head: **4 cases / 399 assertions / rc 0** (the fourth case, the
 |---|---|---|
 | `test_runner` | 31 / 884 / rc 0 | 32 / 990 / rc 0 |
 | `test_qwen4_exp_kv_cache` | did not exist | 4 / 399 / rc 0 |
-| `test_qwen4_exp_gguf_weights` | 11 / 2975 / rc 0 | 11 / 2975 / rc 0 (one new SUBCASE inside an existing case) |
+| `test_qwen4_exp_gguf_weights` | 11 / 2970 / rc 0 | 11 / 2975 / rc 0 (one new SUBCASE inside an existing case) |
 | `test_qwen4_exp_scaffold` | 12 / 296 / rc 0 | 12 / 296 / rc 0 |
 | `test_qwen4_exp_qsa` | 14 / 7263 / rc 0 | 14 / 7263 / rc 0 |
 | `test_qwen27_paged_forward` | 31 / 770 / rc 0 | 31 / 770 / rc 0 |

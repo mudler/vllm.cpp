@@ -83,8 +83,24 @@ whose length, per-state shape and per-state dtype all come from the group's own
 1. **`GdnStateCache` grows `std::vector<vt::Tensor> states`** — the mirror of
    `kv_cache: tuple[torch.Tensor, ...]`. `conv_state` and `ssm_state` stay, and
    are `states[0]` and `states[1]`. Every existing consumer — `qwen3_5.cpp`,
-   `kimi_linear_device.cpp`, `nemotron_h_device.cpp`, `gemma4_mm.cpp` — reads
-   those two names and is untouched.
+   `kimi_linear_device.cpp` and the `nemotron_h` pair `nemotron_h_device.cpp` /
+   `nemotron_h_forward.h` — reads those two names and is untouched. **That is
+   THREE families, and this line said four
+   ([#2203](https://github.com/mudler/vllm.cpp/issues/2203), fixed in flow under
+   W5c-1 of [#2031](https://github.com/mudler/vllm.cpp/issues/2031)).** The
+   removed fourth name was `gemma4_mm.cpp`, which reads NEITHER field — zero
+   occurrences of `conv_state`, zero of `ssm_state` — and whose only two
+   mentions of the type are an include comment and
+   `std::vector<GdnStateCache> no_gdn_state;` (`gemma4_mm.cpp:221`), passed
+   EMPTY: the file that proves Gemma-4 has no recurrent arm, cited as proving
+   the opposite. `muse_glimmer_mm.cpp:340` and `qwen3_vl.cpp:621` carry the same
+   empty-vector shape. Grepping the FIELD name over-counts the other way —
+   `glm5_next_kda.cpp` matches `conv_state` 13 times on
+   `Glm5NextKdaCache::conv_state`, a `std::vector<float>` KDA sequence state
+   (`glm5_next_kda.h:314`) and not this `vt::Tensor` (`qwen3_5.h:111`), with
+   zero occurrences of `GdnStateCache`. Grep the TYPE. The paragraph's CLAIM is
+   unaffected: three untouched consumers is still why `conv_state` and
+   `ssm_state` stay as names.
 2. **The runner's recurrent geometry becomes vectors over N.** One
    `CacheBuffer` per (recurrent layer, state), allocated in SPEC ORDER, which is
    the order `bind_kv_cache` slices in. `kv_cache_allocated_bytes` sums every

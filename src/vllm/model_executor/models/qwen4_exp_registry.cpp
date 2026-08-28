@@ -219,9 +219,22 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
 // temporal state after them. This tree publishes
 // `[gdn_conv, temporal, ple_conv, ngram]` because `GdnStateCache` exposes
 // `conv_state = states[0]` and `ssm_state = states[1]` as NAMED fields that
-// four model families already read (`qwen3_5.cpp`, `kimi_linear_device.cpp`,
-// `nemotron_h_device.cpp`, `gemma4_mm.cpp`), and moving the temporal state off
-// slot 1 would silently re-point every one of them. Recorded in the row spec.
+// THREE model families already read (`qwen3_5.cpp`, `kimi_linear_device.cpp`
+// and the `nemotron_h` pair `nemotron_h_device.cpp` / `nemotron_h_forward.h`),
+// and moving the temporal state off slot 1 would silently re-point every one
+// of them. Recorded in the row spec.
+//
+// THE COUNT IS THREE, NOT FOUR (#2203). `gemma4_mm.cpp` was named here and in
+// `.agents/specs/recurrent-multistate.md` as a fourth reader, and it reads
+// NEITHER field: its only two mentions of the type are an include comment and
+// `std::vector<GdnStateCache> no_gdn_state;` (`gemma4_mm.cpp:221`), passed
+// EMPTY, which is the file proving Gemma-4 has no recurrent arm.
+// `muse_glimmer_mm.cpp:340` and `qwen3_vl.cpp:621` carry that same empty-vector
+// shape. Grepping the FIELD name over-counts in the other direction:
+// `glm5_next_kda.cpp` matches `conv_state` 13 times on
+// `Glm5NextKdaCache::conv_state`, a `std::vector<float>` KDA sequence state
+// (`glm5_next_kda.h:314`), where this one is a `vt::Tensor` (`qwen3_5.h:111`),
+// and that file has zero occurrences of `GdnStateCache`. Grep the TYPE.
 //
 // REAL PER-LAYER NAMES, NEVER PLACEHOLDERS. `ResolveKVCacheGroupLayerNames`
 // (`src/vllm/v1/kv_cache_interface.cpp`) rewrites a placeholder group set into

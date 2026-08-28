@@ -1747,7 +1747,15 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   }
 
   // DECODE-FIRST REORDER (four-way ordering contract) — before any metadata.
-  reorder_batch_to_split_decodes_and_prefills(input_batch_, scheduler_output);
+  // #2129: the threshold is the mirrored one, not the declaration default.
+  // Upstream passes its resolved `reorder_batch_threshold` here
+  // (gpu_model_runner.py:1126-1130 @ pin 5559679229), and a spec-as-decode
+  // backend raises it to `1 + (parallel_drafting ? 2 : 1) * k`. At k=8 with
+  // parallel drafting that is 17: a 1+k == 9-token verify row is a DECODE, not
+  // a long extend sorted among the chunked-prefill continuations. Exactly 1 —
+  // the pre-#2129 value — on every non-speculative configuration.
+  reorder_batch_to_split_decodes_and_prefills(input_batch_, scheduler_output,
+                                              reorder_batch_threshold());
 
   // SPEC-MTP I5d: splice the scheduler's drafts for THIS verify step into
   // token_ids_cpu after each request's committed prefix (gpu_input_batch.py:

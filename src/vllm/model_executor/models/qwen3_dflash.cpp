@@ -8,6 +8,7 @@
 // reused from the landed Qwen3-dense block ops (dense_attn_block.h / vt::).
 #include "vllm/model_executor/models/qwen3_dflash.h"
 
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -663,6 +664,64 @@ Qwen3DFlashModel::ContextKV Qwen3DFlashModel::PrecomputeContextKV(
 // re-projects the whole context every step) and ForwardBlockLogitsWithPrecomputedKV
 // (which uploads the persistent append-only store) build the ckv and delegate here,
 // so the two paths are byte-identical downstream of how ckv's bits were obtained.
+// #2202: the LEVEL-3 op split inside the batched draft forward.
+//
+// `VT_SPEC_TRACE=2` attributes the draft phase to `pre / fwd / select / walk`
+// and put `fwd` at 76% of it. What `fwd` is MADE OF is unmeasured: after L1
+// (contiguous context copy) and L2 (per-request query tiling) roughly 19-21 ms
+// of it is still unexplained, and every lever guessed at without this split has
+// been wrong. This is the instrument that ends the guessing.
+//
+// Level 3 only, and it SYNCHRONISES at each seam, so it serialises the forward
+// and inflates the absolutes exactly as level 2 does. Read the SHARES, not the
+// milliseconds. Inert at levels 0-2: one getenv, latched.
+struct DflashOpSplit {
+  double norm = 0, conv = 0, qkv = 0, qknorm_rope = 0, ctx_scatter = 0, attn = 0,
+         o_proj = 0, mlp = 0, head = 0;
+  int64_t layers = 0;
+  bool on = false;
+  vt::Backend* b = nullptr;
+  vt::Queue* q = nullptr;
+  std::chrono::steady_clock::time_point mark;
+
+  void Begin(Dev& d) {
+    if (!on) return;
+    b = &d.b;
+    q = &d.q;
+    b->Synchronize(*q);
+    mark = std::chrono::steady_clock::now();
+  }
+  // Close the open segment into `slot` and reopen at the same instant.
+  void Lap(double& slot) {
+    if (!on) return;
+    b->Synchronize(*q);
+    const auto now = std::chrono::steady_clock::now();
+    slot += std::chrono::duration<double, std::milli>(now - mark).count();
+    mark = now;
+  }
+  void Report(int64_t Tq, int num_reqs) const {
+    if (!on) return;
+    const double t = norm + conv + qkv + qknorm_rope + ctx_scatter + attn + o_proj + mlp + head;
+    if (t <= 0.0) return;
+    std::fprintf(stderr,
+                 "[fwd-ops] P=%d Tq=%lld L=%lld total=%.2fms norm=%.1f%% conv=%.1f%% "
+                 "qkv=%.1f%% qknorm_rope=%.1f%% ctx_scatter=%.1f%% attn=%.1f%% "
+                 "o_proj=%.1f%% mlp=%.1f%% head=%.1f%%\n",
+                 num_reqs, static_cast<long long>(Tq), static_cast<long long>(layers), t,
+                 100 * norm / t, 100 * conv / t, 100 * qkv / t, 100 * qknorm_rope / t,
+                 100 * ctx_scatter / t, 100 * attn / t, 100 * o_proj / t, 100 * mlp / t,
+                 100 * head / t);
+  }
+};
+
+static bool DflashOpSplitEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_SPEC_TRACE");
+    return e != nullptr && std::atoi(e) >= 3;
+  }();
+  return on;
+}
+
 static std::vector<float> ForwardWithCtxKVDev(
     Dev d, const ContextKVDev& ckv, const std::vector<int32_t>& ctx_cu,
     const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
@@ -757,6 +816,10 @@ static std::vector<float> ForwardWithCtxKVDev(
   res.Zero(d);
   DBuf dpos(d, DType::kI32, {Tq}, block_positions.data());
 
+  DflashOpSplit ops;
+  ops.on = DflashOpSplitEnabled();
+  ops.layers = config.num_hidden_layers;
+  ops.Begin(d);
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
@@ -765,11 +828,13 @@ static std::vector<float> ForwardWithCtxKVDev(
       vt::FusedChain(d.q, dhn.t(), hidden.t(), w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
     else
       vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
+    ops.Lap(ops.norm);
 
     // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare, before the sublayer.
     DBuf attn_coef(d, DType::kBF16, {0});
     if (weights.IsDflash2())
       attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
+    ops.Lap(ops.conv);
 
     // Block q/k/v: same per-layer path as the context-free forward.
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
@@ -792,6 +857,7 @@ static std::vector<float> ForwardWithCtxKVDev(
       vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
       vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
     }
+    ops.Lap(ops.qkv);
     Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
     Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
     Tensor q3 = Reshape(q.t(), {Tq, Hq, Dh});
@@ -799,6 +865,7 @@ static std::vector<float> ForwardWithCtxKVDev(
     vt::RmsNorm(d.q, q2, q2, ResidentWeight(d, layer.q_norm, {Dh}), vt::RmsNormArgs{eps, false});
     vt::RmsNorm(d.q, k2, k2, ResidentWeight(d, layer.k_norm, {Dh}), vt::RmsNormArgs{eps, false});
     vt::RopeNeox(d.q, q3, k3, dpos.t(), MakeRopeArgs(config));
+    ops.Lap(ops.qknorm_rope);
 
     // Build the combined [context; block] q/k/v ON DEVICE (D7): scatter the layer's
     // device context K/V and this block's q/k/v into the packed combined buffer via
@@ -848,10 +915,13 @@ static std::vector<float> ForwardWithCtxKVDev(
     // #2089: the P>1 lane's counter. Read off the tensors that are about to be
     // passed, so a change to the launch shape moves the number.
     detail::NoteDflashCombinedAttn(q3.shape[0], kcb3.shape[0]);
+    ops.Lap(ops.ctx_scatter);
     vt::DFlashBlockAttention(d.q, a3, q3, kcb3, vcb3, pa);
     Tensor wo = ResidentWeight(d, layer.o_proj);
     DBuf attn(d, DType::kBF16, {Tq, H});
+    ops.Lap(ops.attn);
     vt::MatmulBT(d.q, attn.t(), a.t(), wo);
+    ops.Lap(ops.o_proj);
 
     // SPEC-DFLASH2 W2 (#1314): attention_conv.finish. Its prepare ran above, on
     // the input_layernorm output, before the qkv projection.
@@ -881,6 +951,7 @@ static std::vector<float> ForwardWithCtxKVDev(
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
+    ops.Lap(ops.mlp);
     if (per_layer_out != nullptr) {
       DBuf tmp(d, DType::kF32, {Tq, H});
       vt::CastF32(d.q, tmp.t(), down.t());
@@ -890,6 +961,7 @@ static std::vector<float> ForwardWithCtxKVDev(
     }
     hidden = std::move(down);
   }
+
 
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
   DBuf dnorm(d, DType::kBF16, {Tq, H});
@@ -904,6 +976,8 @@ static std::vector<float> ForwardWithCtxKVDev(
     tmp.Download(d, final_out->data());
   }
   DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
+  ops.Lap(ops.head);   // final norm + the [Tq, vocab] logits GEMM
+  ops.Report(Tq, num_reqs);
   // SPEC-DFLASH2 W8 (#1837): the DEVICE hand-off — the same dnorm and logits
   // this function always computed, released to the caller instead of
   // downloaded. The host return is deliberately empty: downloading the full

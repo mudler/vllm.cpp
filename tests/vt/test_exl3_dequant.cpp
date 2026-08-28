@@ -196,7 +196,7 @@ TEST_CASE("exl3: the trellis window decode reproduces independently packed codew
 
     // …and the codebook value, and the tensor-core -> row-major placement.
     std::vector<float> decoded(256, 0.0f);
-    vt::Exl3DecodeTile(tile.data(), k_bits, decoded.data());
+    vt::Exl3DecodeTile(tile.data(), k_bits, /*codebook=*/1, decoded.data());
     int value_mismatches = 0;
     for (int t = 0; t < 256; ++t) {
       const float want = TestMcgDecode(windows[t]);
@@ -292,14 +292,14 @@ TEST_CASE("exl3: the full dequant matches a dense blockwise-Hadamard reference")
 
   // The inner (pre-Hadamard) reconstruct is byte-exact — no summation happens.
   std::vector<float> got_inner(static_cast<size_t>(k * n), 0.0f);
-  vt::Exl3ReconstructInner(trellis.data(), k, n, kBits, got_inner.data());
+  vt::Exl3ReconstructInner(trellis.data(), k, n, kBits, /*codebook=*/1, got_inner.data());
   int inner_mismatches = 0;
   for (size_t i = 0; i < inner.size(); ++i)
     if (got_inner[i] != inner[i]) ++inner_mismatches;
   CHECK(inner_mismatches == 0);
 
   std::vector<float> got(static_cast<size_t>(k * n), 0.0f);
-  vt::Exl3DequantLinear(trellis.data(), suh.data(), svh.data(), k, n, kBits, got.data());
+  vt::Exl3DequantLinear(trellis.data(), suh.data(), svh.data(), k, n, kBits, /*codebook=*/1, got.data());
   double max_abs = 0.0, max_diff = 0.0;
   for (size_t i = 0; i < got.size(); ++i) {
     max_abs = std::max(max_abs, std::fabs(static_cast<double>(want[i])));
@@ -436,7 +436,7 @@ TEST_CASE("exl3: a REAL rank-sliced DeepSeek-V4 expert linear dequants to its an
   const auto* svh = reinterpret_cast<const uint16_t*>(vb.data());
 
   std::vector<float> inner(static_cast<size_t>(k * n), 0.0f);
-  vt::Exl3ReconstructInner(trellis, k, n, kBits, inner.data());
+  vt::Exl3ReconstructInner(trellis, k, n, kBits, /*codebook=*/1, inner.data());
   for (const Spot& s : kInnerSpots) {
     CAPTURE(s.row);
     CAPTURE(s.col);
@@ -444,7 +444,7 @@ TEST_CASE("exl3: a REAL rank-sliced DeepSeek-V4 expert linear dequants to its an
   }
 
   std::vector<float> w(static_cast<size_t>(k * n), 0.0f);
-  vt::Exl3DequantLinear(trellis, suh, svh, k, n, kBits, w.data());
+  vt::Exl3DequantLinear(trellis, suh, svh, k, n, kBits, /*codebook=*/1, w.data());
   double sum = 0.0, sq = 0.0, absmax = 0.0;
   bool finite = true;
   for (float x : w) {

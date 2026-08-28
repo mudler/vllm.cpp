@@ -29,67 +29,17 @@
 #include <string>
 
 #include "vllm/model_executor/layers/linear.h"
+
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
 namespace vllm {
 namespace layers {
 
-// One EXL3-quantized linear's storage. THREE tensors, not four: the `mcg` int32
-// marker each linear may also carry is a codebook SELECTOR that is never read at
-// inference (`exl3_lib/quantize.py:1414-1424`), the loader resolves it to
-// `codebook` below, and the stock `turboderp/*-exl3` checkpoints ship no `mcg`
-// tensor at all — `Linear.is_exl3_storage` requires only `{key}.trellis` with
-// `suh|su` and `svh|sv` (`modules/linear.py:385-389`).
-//
-// There are NO SCALES. `exl3.py:38` says so in as many words ("scale is no
-// longer used"), and a reader that goes looking for one is reading a different
-// format.
-struct Exl3Weight {
-  // I8 [k/16, n/16, 32*bits] — the SAME BYTES the checkpoint stores as
-  // `I16 [k/16, n/16, 16*bits]`, held at byte width because that is the shape
-  // `vt::Exl3Gemm` reads (`ops.h`: "trellis i8 [k/16, n/16, 32*bits] (bytes)")
-  // and because `vt::DType` has no 16-bit integer. The loader does the widening
-  // once, at load, rather than every call site doing it again.
-  OwnedTensor trellis;
-  OwnedTensor suh;      // F16 [k]   input-side Hadamard sign vector
-  OwnedTensor svh;      // F16 [n]   output-side Hadamard sign vector
-  int codebook = 1;     // cb; 1 == MCG, `LinearEXL3`'s own default
-
-  bool Empty() const { return trellis.bytes.empty(); }
-
-  // k and n, recovered from the trellis geometry rather than from a config: a
-  // 16x16 tile packs 256 weights, so dim 0 counts input tiles and dim 1 output
-  // tiles (`exl3.py:47`).
-  int64_t InFeatures() const { return trellis.shape[0] * 16; }
-  int64_t OutFeatures() const { return trellis.shape[1] * 16; }
-
-  // BITS ARE PER TENSOR, and `quantization_config.bits` is NOT this number.
-  //
-  // Measured on `turboderp/Llama-3.2-1B-Instruct-exl3` @ `3.0bpw`
-  // (`f8f438c290680b15622270eff03bef23a458b1cf`): the body is 3-bit
-  // (`mlp.gate_proj.trellis [128, 512, 48]`, 48 = 16*3) while `lm_head.trellis`
-  // is `[128, 8016, 96]`, 96 = 16*6 — a SIX-bit head under a config that says
-  // `bits: 3.0`. A reader that trusts the config scalar decodes the head at the
-  // wrong width, and no shape check anywhere catches it, because the tensor is
-  // self-consistent at either reading: the bytes are there either way and only
-  // the values come out wrong. So the width is derived HERE, from the tensor,
-  // and the config scalar is only ever a cross-check.
-  int Bits() const {
-    VT_CHECK(trellis.rank == 3,
-             "exl3: trellis must be 3-D [k/16, n/16, 16*bits] (exl3.py:47), got rank " +
-                 std::to_string(trellis.rank));
-    const int64_t last = trellis.shape[2];
-    VT_CHECK(last > 0 && last % 32 == 0,
-             "exl3: trellis last dim must be 32*bits BYTES (16*bits i16 words on disk), got " +
-                 std::to_string(last));
-    const int64_t bits = last / 32;
-    VT_CHECK(bits >= 1 && bits <= 8,
-             "exl3: bits must be in [1, 8]; the trellis last dim " + std::to_string(last) +
-                 " implies " + std::to_string(bits));
-    return static_cast<int>(bits);
-  }
-};
+// `Exl3Weight` itself lives beside `Nvfp4Weight` in
+// `models/qwen3_5_weights.h`, for the same reason that one does: a quantized
+// weight is data a model container holds, and declaring it here would make
+// `qwen3.h` include `linear.h` -> `dense_attn_block.h` -> `qwen3.h`.
 
 // The EXL3 linear method. `Apply` is one `vt::Exl3Gemm`, with the activation
 // staged to fp16 on the way in.
@@ -112,49 +62,12 @@ class Exl3LinearMethod : public LinearMethodBase {
   explicit Exl3LinearMethod(const Exl3Weight* w) : w_(w) {}
 
   DBuf Apply(Dev d, const vt::Tensor& x, vt::DType out_dtype) const override {
-    const int64_t M = x.shape[0];
-    const int64_t K = w_->InFeatures();
-    const int64_t N = w_->OutFeatures();
-    VT_CHECK(x.rank == 2 && x.shape[1] == K,
-             "exl3 linear: activation is [" + std::to_string(x.shape[0]) + "," +
-                 std::to_string(x.rank == 2 ? x.shape[1] : -1) + "] but the weight needs K=" +
-                 std::to_string(K));
-    VT_CHECK(out_dtype == vt::DType::kF32 || out_dtype == vt::DType::kBF16 ||
-                 out_dtype == vt::DType::kF16,
-             "exl3 linear: out_dtype must be f32, bf16 or f16");
-
-    // 1. the activation, in fp16. An already-fp16 caller pays no copy.
-    DBuf a_owned;
-    vt::Tensor a = x;
-    if (x.dtype != vt::DType::kF16) {
-      a_owned = DBuf(d, vt::DType::kF16, {M, K});
-      vt::CastF16(d.q, a_owned.t(), x);
-      a = a_owned.t();
-    }
-    DBuf a_had(d, vt::DType::kF16, {M, K});
-
-    // 2. the three weight tensors, resident on this device.
-    vt::Tensor trellis = ResidentWeight(d, w_->trellis);
-    vt::Tensor suh = ResidentWeight(d, w_->suh);
-    vt::Tensor svh = ResidentWeight(d, w_->svh);
-
-    vt::Exl3GemmArgs args;
-    args.bits = w_->Bits();
-    args.codebook = w_->codebook;
-
-    // 3. the GEMM. f16 out is written straight; anything else goes through f32,
-    // which the kernel writes natively.
-    if (out_dtype == vt::DType::kF16) {
-      DBuf c(d, vt::DType::kF16, {M, N});
-      vt::Exl3Gemm(d.q, c.t(), a, trellis, suh, svh, a_had.t(), args);
-      return c;
-    }
-    DBuf c32(d, vt::DType::kF32, {M, N});
-    vt::Exl3Gemm(d.q, c32.t(), a, trellis, suh, svh, a_had.t(), args);
-    if (out_dtype == vt::DType::kF32) return c32;
-    DBuf cbf(d, vt::DType::kBF16, {M, N});
-    vt::CastBf16(d.q, cbf.t(), c32.t());
-    return cbf;
+    // ONE implementation, `dense_attn::Exl3MatmulD` in `dense_attn_block.h`.
+    // It lives beside `ResidentWeight` because it needs it, and a scheme header
+    // cannot include that one back (`linear.h` already includes it, so the
+    // reverse edge would close a cycle). This method is the seam's thin binding
+    // to that function — never a second copy.
+    return dense_attn::Exl3MatmulD(d, x, *w_, out_dtype);
   }
 
   const char* Name() const override { return "exl3-trellis"; }
@@ -162,6 +75,60 @@ class Exl3LinearMethod : public LinearMethodBase {
  private:
   const Exl3Weight* w_;
 };
+
+// The gate_up half of the MLP, on the shared `MlpGateUpMethodBase` seam.
+//
+// TWO GEMMs, not one, and the reason is the format rather than laziness. The
+// bf16 and NVFP4 arms hold ONE merged `[2I, H]` operand because merging is a
+// row-stack there. A trellis is `[k/16, n/16, 32*bits]`, so joining on the
+// output dim INTERLEAVES per input tile — a real transform, and one that is
+// only valid when no `had_r_128` block straddles two matrices, i.e. when each
+// constituent `n` is a multiple of 128. That holds for this family (Llama-3.2-1B
+// has I = 8192) and the merge is worth doing, but it is a wave with its own
+// gate rather than something to slip into a bring-up: see `## Owed` in
+// `specs/quant-exl3-shared.md`.
+//
+// Routing through the seam is what matters here and is satisfied: the model
+// calls one method and never asks which scheme it bound. The seam is the
+// interface, not the fusion.
+class Exl3MlpGateUpMethod : public MlpGateUpMethodBase {
+ public:
+  Exl3MlpGateUpMethod(const Exl3Weight* gate, const Exl3Weight* up)
+      : gate_(gate), up_(up) {}
+
+  DBuf Apply(Dev d, const vt::Tensor& x) const override {
+    const int64_t M = x.shape[0];
+    const int64_t I = gate_->OutFeatures();
+    VT_CHECK(up_->OutFeatures() == I,
+             "exl3 gate_up: gate is [.., " + std::to_string(I) + "] but up is [.., " +
+                 std::to_string(up_->OutFeatures()) + "]");
+    // `vt::MoeSiluMul` rather than `vt::SiluAndMul`, and it is the op written
+    // for this shape: SiluAndMul consumes ONE [M, 2I] operand with gate rows
+    // first, which is what the MERGED arms hand it, while this one "takes the
+    // two separately-produced projections so no concat/copy is needed"
+    // (`ops.h`). Same function -- silu(gate) * up, computed in f32 and rounded
+    // on store -- so choosing it costs nothing and avoids materializing a
+    // [M, 2I] buffer only to read it back.
+    DBuf g = dense_attn::Exl3MatmulD(d, x, *gate_, vt::DType::kBF16);
+    DBuf u = dense_attn::Exl3MatmulD(d, x, *up_, vt::DType::kBF16);
+    DBuf act(d, vt::DType::kBF16, {M, I});
+    vt::MoeSiluMul(d.q, act.t(), g.t(), u.t());
+    return act;
+  }
+
+  const char* Name() const override { return "exl3-gate-up"; }
+
+ private:
+  const Exl3Weight* gate_;
+  const Exl3Weight* up_;
+};
+
+inline std::unique_ptr<MlpGateUpMethodBase> MakeMlpGateUpMethod(
+    const OwnedTensor& bf16_gate_up, const Exl3Weight& gate, const Exl3Weight& up,
+    int64_t intermediate) {
+  if (!gate.Empty()) return std::make_unique<Exl3MlpGateUpMethod>(&gate, &up);
+  return std::make_unique<UnquantizedMlpGateUpMethod>(&bf16_gate_up, intermediate);
+}
 
 // get_quant_method analogue, same shape as the fp8 and NVFP4 factories and
 // overloaded on the weight type: a non-empty EXL3 weight selects the trellis

@@ -18,22 +18,26 @@ supplies only the trellis format and its kernels.
 
 ## Now
 
-`ACTIVE`. **W1a has landed and is UNREACHED, deliberately and declared.**
-`vt::CastF16` (the narrowing cast the EXL3 linear needs on the way in, third
-sibling of `CastBf16`/`CastF32`) is a general op, registered for CPU and CUDA.
-`layers::Exl3LinearMethod` binds EXL3 to vLLM's own `LinearMethodBase` seam and
-is gated against the W1a weight-side dequant at `rel_rms 5.146e-4` against a
-stated `2.0e-3` bound, with `bits` resolved from the tensor rather than any
-config.
+`ACTIVE`. **W1a and W1b have landed, and EXL3 now RUNS A MODEL.**
 
-**No production path constructs `Exl3LinearMethod` yet.** The loader wiring is
-W1b, owned by this row (`QUANT-EXL3`) and tracked by
-[#2181](https://github.com/mudler/vllm.cpp/issues/2181); it is listed under
-`## Owed` below. `AGENTS.md` §"Nothing lands dead" permits a staged slice to
-land unreached only when it is named this way, and this is that naming.
+`turboderp/Llama-3.2-1B-Instruct-exl3` @ 3.0bpw generates through `vllm-cli`:
+`The capital of France is` -> ` Paris. Paris is known for its famous landmarks
+such as the Eiffel Tower` (greedy, 16 tokens, CPU queue, 2026-08-28). It reaches
+`LlamaForCausalLM` and Qwen3-dense together, because Llama reuses the shared
+`Qwen3DenseWeights` container and the Qwen3-dense forward verbatim.
 
-Next: W1b — the native-layout reader and the dense container's EXL3 arm, which
-is what makes `turboderp/Llama-3.2-1B-Instruct-exl3` generate.
+**The wave's real finding is the codebook.** `LinearEXL3` derives the codebook
+from tensor PRESENCE (`exl3.py:74-77`), so a checkpoint with no `mcg` marker is
+NOT MCG -- it is cb 0, the original QTIP 3INST. Every stock `turboderp/*-exl3`
+artifact is cb 0; the SparkInfer DeepSeek-V4 artifact that `MODEL-DSV4-EXL3` was
+built against is the exception. Reading absence as MCG decodes to the right RMS
+and uncorrelated values, passes every shape check, and produces fluent nonsense:
+measured at cosine -0.0006 for cb 1 against +0.9896 for cb 0, on layer 0
+`q_proj` against the unquantized tensor. `vt::Exl3Gemm`'s "only codebook 1"
+guard made the COMMON case refuse.
+
+Next: W2 (device residency), W3 (the 6-bit head and cb 0 on the device arm),
+W4 (route DeepSeek-V4 onto this seam).
 
 ## The gap, measured
 
@@ -299,12 +303,33 @@ Stated here before code, per risk 1:
 
 ## Owed
 
-- **W1b: nothing constructs `Exl3LinearMethod` yet.** The method and its cast
-  landed with W1a and are reached only by their own suites. The production path
-  — a native-layout reader, the EXL3 arm on the shared dense container, and the
-  `MakeLinearMethod` call from the dense forward — is W1b, owned by this row and
-  tracked by #2181. Until it lands, this row has a class rather than a
-  capability, which is the distinction `.agents/reachability.md` exists for.
+- ~~**W1b: nothing constructs `Exl3LinearMethod` yet.**~~ **RETIRED**: the
+  dense forward constructs it, and a real checkpoint generates through it.
+- **The device arm refuses codebook 0, which is the COMMON case.** `cuda_exl3.cu`
+  instantiates `kInstantiatedCb = 1`, so every stock `turboderp/*-exl3`
+  checkpoint refuses BY NAME on CUDA and runs on a CPU queue. That refusal is
+  correct and it is now the main thing between this row and a useful device
+  path: W3 owns it, together with the 6-bit head.
+- **q/k/v and gate/up run as separate GEMMs.** The bf16 and NVFP4 arms hold ONE
+  merged operand; merging trellis operands joins on the output dim, which
+  INTERLEAVES per input tile rather than row-stacking. It is valid for this
+  family -- `had_r_128` blocks the output in 128s and Llama-3.2-1B's q (2048),
+  k/v (512) and I (8192) are each a multiple of 128, so no block straddles two
+  matrices -- and it is the merged-GEMM seam this row does not yet reach. Owed
+  with its own gate.
+- **`vt::CastF16` is registered on two backends where its siblings have six**
+  (CPU and CUDA against CPU/CUDA/ROCm/Vulkan/Metal/Tenstorrent). Now REACHED, so
+  this is no longer theoretical for a non-CUDA device build.
+- **The two codebook resolutions disagree BY CONSTRUCTION, and W4 owns it.**
+  `LoadExl3` reads tensor PRESENCE, which is what `LinearEXL3` does;
+  `deepseek_v4_weights.cpp` reads the config string
+  `quantization_config.codebook`, which is what the SparkInfer artifact happens
+  to declare. Both are correct for their own artifact and neither generalizes:
+  a stock checkpoint has no such config key, and a rank-sliced one may ship a
+  marker its config does not name. Reconciling them onto presence is part of
+  routing DeepSeek-V4 through this seam.
+- **No speed number.** The e2e run is 0.040 tok/s on a CPU queue at batch 1.
+  That is a functional result and is not offered as a performance one.
 - **`vt::CastF16` is registered on TWO backends where its siblings have SIX.**
   `kCastBf16` and `kCastF32` are each registered for CPU, CUDA, ROCm, Vulkan,
   Metal and Tenstorrent; `kCastF16` has CPU and CUDA only. The header calls it

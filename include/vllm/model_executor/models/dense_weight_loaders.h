@@ -603,6 +603,168 @@ inline OwnedTensor LoadMergedBf16Vector(const TensorResolver& get,
 // per-layer scheme probe: presence of `.weight_packed` means the config group
 // matched this Linear (vLLM resolves the same thing through `find_matched_target`
 // + the `ignore` list, compressed_tensors.py:868-880).
+// F16 -> BF16, for the unquantized remainder of an EXL3 checkpoint.
+//
+// WHY THIS IS SCOPED TO EXL3 RATHER THAN ADDED TO `MaterializeBf16Source`.
+// That helper accepts BF16 and F8_E4M3 and REFUSES anything else by name.
+// Teaching it F16 would silently widen acceptance for every dense model: a
+// checkpoint that refuses today would start loading, through a conversion that
+// DROPS THREE MANTISSA BITS (F16 keeps 10, BF16 keeps 7). That is a change to
+// other rows' models made as a side effect of this one, so it is not made.
+//
+// Inside an EXL3 load the conversion is the right polarity rather than a
+// compromise. exllamav3 runs its linear in fp16 and stores the unquantized
+// remainder to match, but the config's own `torch_dtype` is `bfloat16` -- so
+// bf16 is the MODEL dtype every layer inherits (AGENTS.md "Inherit vLLM
+// defaults"), and materializing the remainder at bf16 is what loading this
+// checkpoint at its declared dtype means.
+inline OwnedTensor LoadF16AsBf16Direct(const TensorResolver& get, const std::string& name,
+                                       const std::vector<int64_t>& want_shape = {}) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.dtype == "F16",
+           "dense loader: expected F16 for " + name + " (the unquantized remainder of an "
+           "EXL3 checkpoint), got " + t.dtype);
+  std::vector<int64_t> shape(t.shape.begin(), t.shape.end());
+  if (!want_shape.empty()) {
+    VT_CHECK(shape == want_shape,
+             "dense loader: " + name + " is " + ShapeString(shape) + ", expected " +
+                 ShapeString(want_shape));
+  }
+  int64_t numel = 1;
+  for (int64_t d : shape) numel *= d;
+  VT_CHECK(static_cast<size_t>(numel) * 2 == t.nbytes,
+           "dense loader: " + name + " byte size does not match its F16 shape");
+  OwnedTensor r = MakeOwned(vt::DType::kBF16, shape);
+  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+  auto* dst = reinterpret_cast<uint16_t*>(r.bytes.data());
+  for (int64_t i = 0; i < numel; ++i) dst[i] = vt::F32ToBF16(vt::F16ToF32(src[i]));
+  MaybeReleaseSourcePages(t.data, t.nbytes);
+  return r;
+}
+
+// ── EXL3 (exllamav3 trellis) — QUANT-EXL3 W1b (#2181) ────────────────────────
+//
+// The predicate is upstream's own: `Linear.is_exl3_storage` requires
+// `{key}.trellis` TOGETHER WITH `{key}.suh|.su` and `{key}.svh|.sv`
+// (`exllamav3/modules/linear.py:385-389`). Requiring all three rather than the
+// trellis alone is what makes a half-written or differently-quantized
+// projection fall through to the dense loader instead of being read as EXL3.
+inline bool IsExl3Projection(const std::function<bool(const std::string&)>& has,
+                             const std::string& proj) {
+  return has(proj + ".trellis") && has(proj + ".suh") && has(proj + ".svh");
+}
+
+// One EXL3 Linear -> `Exl3Weight`, in the NATIVE exllamav3 layout: no `.rank{r}`
+// segment and no coalescing. That segment belongs to SparkInfer's
+// `rank-sliced-deepseek-v4-v1` variant, which `MODEL-DSV4-EXL3` reads; the
+// stock `turboderp/*-exl3` artifacts are a single unsliced tensor per
+// projection, which is why this reader is the simpler of the two.
+inline Exl3Weight LoadExl3(const TensorResolver& get,
+                           const std::function<bool(const std::string&)>& has,
+                           const std::string& proj) {
+  const StTensor& tr = get(proj + ".trellis");
+  VT_CHECK(tr.dtype == "I16",
+           "dense loader: expected I16 trellis for " + proj + " (exl3.py:47), got " + tr.dtype);
+  VT_CHECK(tr.shape.size() == 3,
+           "dense loader: expected 3-D trellis [k/16, n/16, 16*bits] for " + proj +
+               ", got " + ShapeString(std::vector<int64_t>(tr.shape.begin(), tr.shape.end())));
+  const int64_t k = tr.shape[0] * 16;
+  const int64_t n = tr.shape[1] * 16;
+  const int64_t words = tr.shape[2];
+  VT_CHECK(words > 0 && words % 16 == 0,
+           "dense loader: trellis last dim must be 16*bits words for " + proj + ", got " +
+               std::to_string(words));
+  const int64_t bits = words / 16;
+  VT_CHECK(bits >= 1 && bits <= 8,
+           "dense loader: exl3 bits must be in [1, 8] for " + proj + "; the trellis last dim " +
+               std::to_string(words) + " implies " + std::to_string(bits));
+
+  const StTensor& suh = get(proj + ".suh");
+  const StTensor& svh = get(proj + ".svh");
+  VT_CHECK(suh.dtype == "F16" && svh.dtype == "F16",
+           "dense loader: expected F16 suh/svh for " + proj + " (exl3.py:48-49)");
+  // suh is the INPUT side and svh the OUTPUT side. Checking both against the
+  // trellis geometry is what catches a transposed projection, which otherwise
+  // loads, runs, and returns a confidently wrong answer on a square linear.
+  VT_CHECK(suh.shape.size() == 1 && suh.shape[0] == k,
+           "dense loader: " + proj + ".suh must be [k=" + std::to_string(k) + "], got [" +
+               std::to_string(suh.shape.empty() ? -1 : suh.shape[0]) + "]");
+  VT_CHECK(svh.shape.size() == 1 && svh.shape[0] == n,
+           "dense loader: " + proj + ".svh must be [n=" + std::to_string(n) + "], got [" +
+               std::to_string(svh.shape.empty() ? -1 : svh.shape[0]) + "]");
+
+  Exl3Weight r;
+  // THE CODEBOOK IS SELECTED BY TENSOR PRESENCE, and the polarity is the
+  // opposite of the obvious guess. `LinearEXL3` sets
+  // `self.mcg = (self.mcg_tensor is not None)` and likewise for `mul1`
+  // (`exl3.py:74-77`), then passes those BOOLEANS to `ext.reconstruct`
+  // (`:197,223`). So a checkpoint that ships NO marker is NOT MCG: it is cb 0,
+  // the original QTIP 3INST. The SparkInfer DeepSeek-V4 artifact ships an `mcg`
+  // marker and is cb 1; every stock `turboderp/*-exl3` artifact ships neither
+  // and is cb 0.
+  //
+  // Getting this backwards is not a loud failure. The wrong multiplier produces
+  // a codebook with the SAME DISTRIBUTION and no relation to the right one, so
+  // the weight decodes to the correct RMS and uncorrelated values, every shape
+  // check passes, and the model emits fluent nonsense. MEASURED on
+  // `turboderp/Llama-3.2-1B-Instruct-exl3` layer 0 `q_proj` against the
+  // unquantized tensor: cb 1 gives RMS 0.038454 and cosine -0.0006, cb 0 gives
+  // RMS 0.035941 and cosine +0.9896, reference RMS 0.036056.
+  const bool has_mcg = has(proj + ".mcg");
+  const bool has_mul1 = has(proj + ".mul1");
+  VT_CHECK(!(has_mcg && has_mul1),
+           "dense loader: " + proj + " carries BOTH an mcg and a mul1 marker, which "
+           "selects two codebooks at once (QUANT-EXL3, #2181)");
+  VT_CHECK(!has_mul1,
+           "dense loader: " + proj +
+               " selects exllamav3's `mul1` codebook (cb 2), upstream's dp4a "
+               "byte-sum variant, which this tree does not implement "
+               "(QUANT-EXL3, #2181). It is REFUSED rather than decoded as another "
+               "codebook, because the wrong multiplier yields a correctly "
+               "distributed and completely wrong weight.");
+  if (has_mcg) {
+    const StTensor& mcg = get(proj + ".mcg");
+    VT_CHECK(mcg.dtype == "I32",
+             "dense loader: expected I32 mcg marker for " + proj + ", got " + mcg.dtype);
+  }
+  VT_CHECK(!has(proj + ".had"),
+           "dense loader: " + proj +
+               " carries a `had` tensor, which is exllamav3's EXPLICIT Hadamard "
+               "storage rather than the suh/svh sign-vector form this reader "
+               "implements (QUANT-EXL3, #2181)");
+  // `su`/`sv` are the PACKED-BITFIELD form of the sign vectors (`unpack_bf`,
+  // `exl3.py:142-158`), which this reader does not unpack.
+  VT_CHECK(!has(proj + ".su") && !has(proj + ".sv"),
+           "dense loader: " + proj +
+               " carries packed `su`/`sv` sign vectors, which this reader does not "
+               "unpack (QUANT-EXL3, #2181)");
+  r.codebook = has_mcg ? 1 : 0;
+
+  // ENG-LOAD-DIRECT-UPLOAD (#150): all three are taken VERBATIM into a
+  // same-size destination, so all three qualify for the borrow path. The
+  // trellis is BORROWED AS BYTES at 32*bits: identical bytes, and the dtype
+  // differs from disk only because `vt::DType` has no 16-bit integer and
+  // `vt::Exl3Gemm` reads the operand as `kI8` anyway.
+  if (!BorrowStTensorBytes(r.trellis, tr, vt::DType::kI8, {k / 16, n / 16, 32 * bits})) {
+    r.trellis = MakeOwned(vt::DType::kI8, {k / 16, n / 16, 32 * bits});
+    VT_CHECK(tr.nbytes == r.trellis.bytes.size(),
+             "dense loader: trellis byte-size mismatch for " + proj);
+    std::memcpy(r.trellis.bytes.data(), tr.data, tr.nbytes);
+    MaybeReleaseSourcePages(tr.data, tr.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.suh, suh, vt::DType::kF16, {k})) {
+    r.suh = MakeOwned(vt::DType::kF16, {k});
+    std::memcpy(r.suh.bytes.data(), suh.data, suh.nbytes);
+    MaybeReleaseSourcePages(suh.data, suh.nbytes);
+  }
+  if (!BorrowStTensorBytes(r.svh, svh, vt::DType::kF16, {n})) {
+    r.svh = MakeOwned(vt::DType::kF16, {n});
+    std::memcpy(r.svh.bytes.data(), svh.data, svh.nbytes);
+    MaybeReleaseSourcePages(svh.data, svh.nbytes);
+  }
+  return r;
+}
+
 inline bool IsCtNvfp4Projection(
     const std::function<bool(const std::string&)>& has, const std::string& proj) {
   return has(proj + ".weight_packed");

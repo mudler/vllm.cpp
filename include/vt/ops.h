@@ -568,6 +568,55 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpGatedResidual,
   kQwen4ExpGatedResidualWriteBack,
+  // MODEL-MM-QWEN4-EXP W5b-4 (#2167) — Qwen Sparse Attention: the pooled-key
+  // COMPRESSOR that writes the indexer side cache, and the GATHER consumer that
+  // reduces over only the selected raw rows.
+  //
+  // WHAT IS **NOT** HERE, AND THAT IS THE POINT. The MQA block SCORE and the
+  // per-query top-k are NOT new ops, because this tree already has them:
+  // `kDsaIndexerLogits` computes `sum_h fold[t,h] * ReLU(dot(q[t,h,:], k[s,:]))`
+  // over a ONE-key-head MQA cache with a per-query `[win_start, win_end)` window,
+  // which with `weights == 1`, `n_head_scale == 1` and
+  // `softmax_scale == index_head_dim ** -0.5` IS the QSA block score; and
+  // `kDsaTopkSelect` is the same all-select-below-k / ties-to-the-lower-index /
+  // ASCENDING-emission top-k that `Qwen4ExpTextQSAIndexer` needs, over the block
+  // axis instead of the token axis. Writing a QSA-private scoring kernel beside
+  // them would be the parallel path AGENTS.md "Shared seams" forbids, so the
+  // indexer is COMPOSED from those two and only the two things they cannot
+  // express land as ops. `tests/vllm/models/test_qwen4_exp_qsa_device.cpp` gates
+  // that composition against the same lane-pinned transformers goldens the W4
+  // host reference answers to, so the reuse is measured rather than asserted.
+  //
+  // kQwen4ExpQsaCompress — mean-pool `compress_ratio` consecutive RAW index keys
+  // into one, `k_layernorm` the pooled key, and RoPE it at the position of the
+  // block's FIRST token (`compressed_pos = (position // CR) * CR`). Two of the
+  // three stages exist as ops (`vt::RmsNorm` with `gemma=true` is the
+  // `(1.0 + weight)` polarity, `vt::RopeFromCache` rotates a leading slice at
+  // caller-supplied positions) and the POOL does not: this tree has no mean, no
+  // pool, no axis reduction and no transpose, so the window cannot even be faked
+  // as a strided depthwise conv. Fusing all three mirrors upstream, whose own
+  // compressor is ONE kernel
+  // (`_fused_kv_compress_norm_rope_insert_indexer_attn`), and `kFusedNormRope`
+  // is the in-tree precedent for exactly that pair fused into one OpId.
+  //
+  // kQwen4ExpQsaGatherAttention — dense GQA over ONLY the gathered rows. Nothing
+  // upstream supplies it: every DeepSeek-V4 sparse consumer attends the
+  // COMPRESSED MLA KV (one state per four tokens) and MiniMax-M3's consumers
+  // attend raw tokens at KV-PAGE granularity, while QSA attends RAW tokens
+  // selected at ratio-4 granularity. It expands block `b` into tokens
+  // [CR*b, CR*b + CR) as ADDRESSES rather than materialising an index buffer,
+  // appends the always-attended ragged tail, and counts the key rows it actually
+  // READ. That count is the wave's instrument: llama.cpp #27739 records that a
+  // sparse MASK over a dense cache costs what dense attention costs under CUDA
+  // flash attention, so a mask-shaped port passes every value comparison and
+  // forfeits the long-context lever this row exists for.
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_qsa.cpp). The CUDA arm is
+  // OWED, not written: it cannot be gated on a CPU-only host, and an ungated
+  // kernel is worse than an absent one.
+  // Appended before kCount so no existing op's id shifts.
+  kQwen4ExpQsaCompress,
+  kQwen4ExpQsaGatherAttention,
   kCount
 };
 
@@ -868,6 +917,83 @@ struct Qwen4ExpGatedResidualArgs {
   int64_t hidden_size = 0;  // `config.hidden_size`; ALSO the norm's group_size
   int64_t lowrank = 0;      // `config.hc_lowrank`, the mix down/up rank
   float eps = 1e-6f;        // `config.rms_norm_eps`, INSIDE the rsqrt
+};
+
+// Qwen Sparse Attention COMPRESSOR geometry (vt::Qwen4ExpQsaCompress).
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextQSAIndexer` (:677-688),
+// with the scaffolding — boundary predicate, block-start RoPE, paged store —
+// from the TRITON head_dim=128 variant of DeepSeek-V4's
+// `_fused_kv_compress_norm_rope_insert_indexer_attn`
+// (models/deepseek_v4/common/ops/fused_compress_quant_cache.py :677-830 @ vLLM
+// origin/main 6a5e8f5979). Only the scaffolding: DSv4's pool is a LEARNED
+// softmax over an OVERLAPPING window driven by a score channel this checkpoint
+// does not have, and QSA's is an unweighted mean over a NON-overlapping one.
+struct Qwen4ExpQsaCompressArgs {
+  // `config.indexer_compress_ratio`; 4 in the released `Qwen/Qwen3.8-Flash-Next`
+  // config, and the number of consecutive RAW keys that pool into one state.
+  int64_t compress_ratio = 0;
+  // `int(head_dim * partial_rotary_factor)` = 64 at the released config, which
+  // upstream then requires to FIT `indexer_head_dim`
+  // (configuration_qwen4_exp.py:225-231). The LEADING `rotary_dim` dims rotate
+  // NeoX-style and the NoPE dims trail untouched — the halves are swapped end
+  // for end against DeepSeek-V4's indexer, which ropes a TRAILING span.
+  int64_t rotary_dim = 0;
+  float eps = 1e-6f;  // `config.rms_norm_eps`, INSIDE the rsqrt
+  // Mirrors the model dtype's intermediate rounding: upstream's pooled key goes
+  // through `.to(raw_keys.dtype)` before `k_layernorm`, `Qwen4ExpTextRMSNorm`
+  // closes on `.type_as(x)`, and a bf16 elementwise RoPE rounds per operation.
+  // TRUE reproduces that op by op, which is what a bf16 model path does and what
+  // the lane-pinned goldens were dumped under; FALSE is the f32 arm. The host
+  // reference `vllm::qwen4_exp::QsaCompressNormRope` carries the same flag with
+  // the same meaning, so the two arms answer to one oracle rather than to each
+  // other. This is deliberately NOT the house "round once on the store"
+  // contract: here the rounding is load-bearing (mutation M9 measures it), and
+  // an op that could not express it could not be gated against the oracle at
+  // all.
+  bool round_intermediates_to_bf16 = false;
+};
+
+// Qwen Sparse Attention GATHER-CONSUMER arguments
+// (vt::Qwen4ExpQsaGatherAttention).
+struct Qwen4ExpQsaAttnArgs {
+  // Softmax scale, `head_dim ** -0.5` on the MODEL's attention head (256 in the
+  // released config), NOT the indexer's. Must be set explicitly (> 0), the
+  // `AttentionArgs::scale` convention.
+  float scale = 0.0f;
+  // `config.indexer_compress_ratio`. Selected block `b` IS tokens
+  // [CR*b, CR*b + CR); this op expands that as ADDRESSES and never materialises
+  // the token index buffer, which is the difference between a gather and a mask.
+  int64_t compress_ratio = 0;
+  // OPTIONAL host-side instrument: the number of key ROWS the kernel actually
+  // read, ACCUMULATED over every query token of the call and INCREMENTED AT THE
+  // READ. It is never assigned from the selection, and that distinction is the
+  // whole point of it. W4's first fresh review found a counter set to
+  // `sel.size()` and compared against `SelectedCount(sel)` — the same quantity
+  // by the same rule — under which a body that dot-products every one of the
+  // `kv_len` cached rows still reported the sparse figure and passed 12 cases /
+  // 7251 assertions, including the case named "the GATHER touches only the
+  // selected rows". Counted at the read, an honest gather comes out at
+  // `sum_t selected(t) * num_q_heads * 2` (two softmax passes) and a dense walk
+  // at `sum_t kv_len(t) * num_q_heads * 2`, so the ratio between a gather and a
+  // mask is MEASURED rather than asserted.
+  //
+  // WHAT IT CANNOT SEE, stated because it was MEASURED rather than feared. It
+  // counts reads at THIS body's read site, so it says what an honest body cost;
+  // it cannot convict a dishonest one. W5b-4 mutation M11 is a dense masked walk
+  // that also reports `sel.size() * 2` per head, and it passed 10 cases and 4167
+  // assertions — a mask-shaped port changes the loop and the counter together,
+  // which is what a mask-shaped port IS, and no value comparison separates them
+  // either because `exp(-inf - m)` is exactly +0. The gate that DOES separate
+  // them is an observable of the walk: `test_qwen4_exp_qsa_device.cpp` runs this
+  // op over a cache whose UNSELECTED rows are NaN, which a gather never
+  // addresses and a mask multiplies by a zero weight into `0.0f * NaN`. It also
+  // cannot see a body that iterates 0..kv_len and `continue`s past unselected
+  // rows without touching them — correctly, because the loop counter is not the
+  // cost llama.cpp #27739 measures, the key-row traffic is.
+  // A host pointer, on the `GdnArgs::query_start_loc_host` precedent; a CUDA arm
+  // owes a device-side counter and its copy-back.
+  int64_t* keys_visited = nullptr;
 };
 
 // Mamba2 SSD args, shared by the chunked prefill scan and the decode state
@@ -1920,6 +2046,21 @@ using Qwen4ExpGatedResidualFn = void (*)(Queue&, Tensor& /*mixed*/,
 using Qwen4ExpGatedResidualWriteBackFn =
     void (*)(Queue&, Tensor& /*hyper*/, const Tensor& /*block_out*/,
              const Tensor& /*injection*/, const Qwen4ExpGatedResidualArgs&);
+// Qwen4-Exp QSA pooled-key compressor (vt::Qwen4ExpQsaCompress): the side
+// cache's contents, one state per `compress_ratio` complete RAW keys.
+using Qwen4ExpQsaCompressFn = void (*)(Queue&, Tensor& /*block_keys*/,
+                                       const Tensor& /*raw_keys*/,
+                                       const Tensor& /*k_norm_weight*/,
+                                       const Tensor& /*cos*/, const Tensor& /*sin*/,
+                                       const Qwen4ExpQsaCompressArgs&);
+// Qwen4-Exp QSA gather consumer (vt::Qwen4ExpQsaGatherAttention).
+using Qwen4ExpQsaGatherAttentionFn = void (*)(Queue&, Tensor& /*out*/,
+                                              const Tensor& /*query*/,
+                                              const Tensor& /*key*/,
+                                              const Tensor& /*value*/,
+                                              const Tensor& /*block_ids*/,
+                                              const Tensor& /*kv_lens*/,
+                                              const Qwen4ExpQsaAttnArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -3386,6 +3527,113 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
 void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block_out,
                                     const Tensor& injection,
                                     const Qwen4ExpGatedResidualArgs& args);
+
+// --- QWEN SPARSE ATTENTION (row MODEL-MM-QWEN4-EXP W5b-4, #2167) ------------
+//
+// THE INDEXER IS THREE STEPS AND ONLY THE FIRST IS A NEW OP. The other two are
+// `vt::DsaIndexerLogits` and `vt::DsaTopkSelect`, called over the BLOCK axis:
+//
+//   Qwen4ExpQsaCompress(block_keys, raw_keys, k_norm_w, cos, sin, {CR, rot, eps})
+//   DsaIndexerLogits(scores, q_index, block_keys, ones, win_start, win_end,
+//                    {softmax_scale = index_head_dim ** -0.5, n_head_scale = 1})
+//   DsaTopkSelect(block_ids, counts, scores, win_start, win_end)
+//   Qwen4ExpQsaGatherAttention(out, q, k, v, block_ids, kv_lens, {scale, CR})
+//
+// with `win_start[t] = 0` and `win_end[t] = kv_len[t] / compress_ratio` — the
+// COMPLETE blocks visible to query token t — and `block_ids` sized
+// `token_budget / compress_ratio`. `DsaIndexerLogits`'s fold
+// `weights[t,h] * q_scale[t,h] * softmax_scale * n_head_scale` collapses to the
+// single constant `index_head_dim ** -0.5` when `weights` is ones and `q_scale`
+// is null, and that IS QSA's scale: QSA has neither DeepSeek-V4's learned
+// `weights_proj` nor its `n_head ** -0.5`. One reassociation survives and is
+// named rather than hidden — upstream divides AFTER the head sum
+// (`scores.sum(0) / sqrt(D)`, modeling_qwen4_exp.py:690-693) and the fold
+// multiplies BEFORE it, which is `sum_h c*r_h` against `c*sum_h r_h`: equal in
+// exact arithmetic, up to an ulp apart in f32, and top-k is invariant under a
+// positive scalar, so no selection can move except through a tie created at that
+// ulp. `test_qwen4_exp_qsa_device.cpp` measures the composed selection against
+// the lane-pinned oracle's own selected sets rather than trusting that argument.
+//
+// THE POOLED-KEY COMPRESSOR. Per COMPLETE block b of `compress_ratio` raw index
+// keys, `Qwen4ExpTextQSAIndexer` (transformers v5.16.0
+// modeling_qwen4_exp.py:677-688):
+//
+//   pooled[b] = mean(raw_keys[CR*b : CR*b + CR])   rounded back to the cache dtype
+//   block_keys[b] = rope( k_layernorm(pooled[b]), position = CR*b )
+//
+// THE MEAN IS UNWEIGHTED AND THE WINDOW DOES NOT OVERLAP, which is the one place
+// DeepSeek-V4's compressor must NOT be copied: its pool is
+// `score = tl.softmax(score, dim=0); sum(kv * score)` over a window of
+// `(1 + OVERLAP) * COMPRESS_RATIO`, driven by a score channel this checkpoint
+// has no tensor for, and the CuteDSL C4 variant refuses `overlap=False` at
+// compile time. THE ROPE POSITION IS THE BLOCK'S FIRST TOKEN, not its last:
+// upstream reads it as `group_starts = block_token_indices[:, 0]` and the Triton
+// kernel computes the same value as `compressed_pos = (position // CR) * CR`.
+// Taking the last position instead is a silent one-block phase error that no
+// shape check can see.
+//
+// ONLY COMPLETE BLOCKS PRODUCE A STATE. The compressor early-exits unless
+// `(position + 1) % compress_ratio == 0`, so `num_keys` must be a multiple of
+// `compress_ratio` and the ragged tail costs no state at all — it is attended
+// from the RAW KV cache instead, always, whatever the scores said. That floor is
+// why the side cache is 64 B/token/layer at the released shape and a per-token
+// index cache would be 256.
+//
+// SHAPES. raw_keys [num_keys, D] f32/bf16, UN-normed and UN-roped exactly as
+// `Cache.update_indexer` stores them, `num_keys % compress_ratio == 0`;
+// k_norm_weight [D] — the HuggingFace gamma, applied as `(1.0 + weight)`, which
+// is upstream's zero-initialised polarity and NOT vLLM's `out * weight`;
+// cos/sin [>= num_keys, rotary_dim] f32, the FULL-position tables, of which this
+// op reads row `compress_ratio * b`; block_keys [num_keys / compress_ratio, D]
+// f32/bf16 OUT. CPU only; the CUDA arm is owed.
+void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
+                         const Tensor& k_norm_weight, const Tensor& cos,
+                         const Tensor& sin, const Qwen4ExpQsaCompressArgs& args);
+
+// THE GATHER CONSUMER — the point of the wave, and the one piece with no
+// upstream counterpart at all. Dense GQA over ONLY the selected raw rows.
+//
+// For query token t with `kv_len[t]` cached tokens and
+// `complete[t] = kv_len[t] / compress_ratio` complete blocks, the attended set is
+//
+//   { CR*b + i : b in block_ids[t], 0 <= i < CR }  U  [CR*complete[t], kv_len[t])
+//
+// — the selected blocks expanded to their four real tokens, plus the ALWAYS
+// attended ragged tail. `block_ids` is ASCENDING and `-1`-terminated, which is
+// exactly what `vt::DsaTopkSelect` emits, so the expansion is ascending too and
+// the online softmax reduces over the same positions in the same order dense
+// attention would. That is what makes a sub-budget selection BIT-IDENTICAL to
+// dense attention rather than merely close: llama.cpp #27742 measures a max
+// logit delta of 0.0 over all 2051 such rows, and this op reproduces that
+// exactly, which is a free oracle needing no checkpoint.
+//
+// WHY THIS IS NOT A MASK, AND WHY THAT IS GATED RATHER THAN ASSERTED. A sparse
+// mask over a dense cache is CORRECT — it agrees with this op value for value,
+// because `exp(-inf - m)` is exactly +0 and adding an exact zero changes no
+// accumulator — and it is not faster. llama.cpp #27739 names the mechanism:
+// under CUDA flash attention `flash_attn_mask_to_KV_max` scans backwards and
+// stops at the first tile that is not all `-inf`, so a mask that keeps any late
+// key pays the whole dense prefix. A mask-shaped port therefore passes a token
+// gate and forfeits the long-context lever this row exists for. The
+// discriminator is `Qwen4ExpQsaAttnArgs::keys_visited`, counted at the key-row
+// read; see that field for what it can and cannot see.
+//
+// WHY IT TAKES BLOCK IDS RATHER THAN TOKEN IDS. Expanding to a materialised
+// `[T, token_budget + compress_ratio - 1]` token buffer is the mask-shaped
+// intermediate in miniature — at the released config that is 2051 int32 per
+// query token, 8 KiB a token, to say what four multiplications of a block id
+// say. The expansion is address arithmetic and belongs inside the consumer.
+//
+// SHAPES. query [T, num_q_heads, head_dim] f32/bf16; key and value
+// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache;
+// block_ids [T, block_topk] i32, ascending, `-1` = no block;
+// kv_lens [T] i32, the causal visible length per query token;
+// out [T, num_q_heads, head_dim] f32/bf16. GQA: num_q_heads % num_kv_heads == 0.
+// CPU only; the CUDA arm is owed.
+void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query,
+                                const Tensor& key, const Tensor& value,
+                                const Tensor& block_ids, const Tensor& kv_lens,
+                                const Qwen4ExpQsaAttnArgs& args);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and

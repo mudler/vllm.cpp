@@ -874,7 +874,7 @@ it is not `> 0`. The two validators are exact complements over this field, and
 there is no value that satisfies both. W1 mirrors upstream and accepts `0`;
 W3 owns making the MLA block agree.
 
-### W2 — the KDA arm's numerics (CPU, medium)
+### W2 — the KDA arm's numerics (CPU, medium) — [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
 
 Port `Glm5NextTextForgetGate`'s **sigmoid branch**, the strict-fp32
 `RMSNormGated`, and `l2norm`, as portable host references with an independent
@@ -1424,6 +1424,31 @@ Debts this row carries, each visible rather than waived:
   checker change that AGENTS.md requires to carry its own spec, a red-before
   mutation, and a decision about which keys a lane record requires.
   [#2099](https://github.com/mudler/vllm.cpp/issues/2099) owns it.
+- **O14 — `vt::KdaChunkPrefill` cannot serve this model, so both KDA paths run
+  the recurrence.** The chunked prefill op takes the RAW gate projection and
+  FUSES the gate, `-exp(a_log)*softplus(g_raw + dt_bias)`, inside the vendored
+  FLA Triton-AOT cubins (`include/vt/ops.h`) and inside its CPU reference
+  (`src/vt/cpu/cpu_ops.cpp:1779-1786`). That is the SOFTPLUS branch.
+  GLM-5.3-Flash needs the sigmoid branch, and no `(a_log, dt_bias, g_raw)`
+  reproduces it: inverting the fused softplus needs
+  `g_raw = log(exp(-target) - 1)`, which diverges to `-inf` as the gate
+  approaches 0, which is where most channels of 34 layers sit. W2 therefore
+  routes BOTH prefill and decode through `vt::KdaGatedDeltaRule`, which consumes
+  an already-computed per-K-channel log-decay and is branch-agnostic. Closing
+  this needs a chunk op that accepts a precomputed `g`, which is a change to a
+  shared kernel family this row has no gate for. No correctness consequence; a
+  named speed cliff on top of the one §Our baseline "KDA" already records for
+  the 64-head geometry. [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
+  records it.
+- **O15 — the KDA arm is NOT REACHED from a production entry point.** W2 lands
+  `glm5_next_kda.{h,cpp}`, and `Glm5NextForConditionalGeneration::Forward`
+  still refuses by name (O10), so the only call sites at that merge commit are
+  the focused gate's. This is the staged-slice disclosure AGENTS.md "Nothing
+  lands dead" requires and not an exception claimed by silence: the wiring
+  belongs to **W5**, the assembled text forward, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no
+  issue of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+  tracks it. What W2 buys is that when W5 wires the layer it wires a gated one.
 
 ## Now
 
@@ -1452,8 +1477,7 @@ the architecture; the registry pin stays at `5.14.1` and the vLLM parity pin is
 untouched. **O12 is discharged.** O13 records what W0 measured on the way: no
 checker in this tree parses an `oracle-pin-lane` block, so W0's §Gates line
 means the checker stayed green and not that it validated the fields
-([#2099](https://github.com/mudler/vllm.cpp/issues/2099)). The next actions are
-W2 and, whenever the developer grants a large-asset download, W7b.
+([#2099](https://github.com/mudler/vllm.cpp/issues/2099)).
 
 W1's file also broke the Windows build, repaired here as
 [#2101](https://github.com/mudler/vllm.cpp/issues/2101): seven range-`for` loop
@@ -1466,3 +1490,19 @@ facts are worth keeping: sibling scopes do not hide one another, so the shadowed
 declaration was never another loop's variable, and CI reported four of the seven
 sites because MSVC stops at the first `error C2220` — GCC's `-Wshadow` names all
 seven and is the local instrument for this class.
+
+W2 ([#2097](https://github.com/mudler/vllm.cpp/issues/2097),
+`CLAIM-GLM53-FLASH-W2`) then landed the KDA arm's numerics — the forget gate's
+SIGMOID branch, the strict-fp32 `RMSNormGated`, `l2norm`, the checkpoint's three
+depthwise convs concatenated into the reference's one grouped conv, and the
+assembled host layer on the `vt::KdaGatedDeltaRule` seam — gated RED-first
+against `kimi_kda.cpp:60`'s softplus branch. The fresh review found two
+defects and both are repaired on this branch: the conv-order case swapped two
+weight TENSORS and so moved under any fixed concat order — it is now gated
+against references built with the wrong PAIRING, and it reds under a q,v,k and
+under a k,q,v mutation — and `dt_bias` was optional, which upstream has no
+mode for (`:384` declares it unconditionally, `:393` always adds it), so an
+absent or misshaped tensor is now refused by name. That code is **not reached** from
+any production entry point (O15) and `vt::KdaChunkPrefill` cannot serve this
+model (O14). W0 has since landed the lane pin on `main`, so the next actions
+are W3 and W4, and, whenever the developer grants a large-asset download, W7b.

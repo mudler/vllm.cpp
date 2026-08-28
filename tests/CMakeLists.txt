@@ -1188,6 +1188,9 @@ vllm_cpp_add_test(test_kimi_linear_fold_gate vllm/models/test_kimi_linear_fold_g
 # (DGX-blocked); mirrors the DSA lane (.agents/specs/kda-kernel-delta.md).
 vllm_cpp_add_test(test_kimi_kda vllm/models/test_kimi_kda.cpp)
 
+# GLM-5.3-Flash (MODEL-MM-GLM53-FLASH W2) — the KDA arm's numerics.
+vllm_cpp_add_test(test_glm5_next_kda vllm/models/test_glm5_next_kda.cpp)
+
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
 # engine and checks STRICT token-exact agreement with the vLLM 0.25.0 oracle
@@ -3225,6 +3228,17 @@ target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # src/ (the `dots3_note.h` precedent), hence the explicit src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
 target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5b-4 (#2167) — the DEVICE arm of Qwen Sparse Attention:
+# vt::Qwen4ExpQsaCompress and vt::Qwen4ExpQsaGatherAttention, plus the indexer
+# COMPOSED from the vt::DsaIndexerLogits / vt::DsaTopkSelect pair this tree
+# already had, all against the SAME lane-pinned transformers goldens the W4 host
+# reference answers to. Includes a released-config case at 3002 tokens of
+# context, past the 2048 indexer budget below which every candidate is selected.
+# CPU only: no CUDA arm of either op exists. Reaches the model-private
+# qwen4_exp_qsa.h, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_qsa_device vllm/models/test_qwen4_exp_qsa_device.cpp)
+target_include_directories(test_qwen4_exp_qsa_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # MODEL-MM-QWEN4-EXP W5b-2 (#2031) — the DEVICE arm of the same stream:
 # vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME

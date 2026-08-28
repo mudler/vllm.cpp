@@ -4561,10 +4561,37 @@ TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
     CHECK(j.at("choices").at(1).at("index").get<int>() == 1);
   }
 
-  // Ours, not upstream's: the id the client aborts is now the PARENT id, so the
-  // abort has to reach every child. A leaked child keeps the engine busy after
-  // the socket is gone.
-  SUBCASE("aborting the parent id leaves no unfinished child") {
+  // best_of asks the engine for MORE candidates than the response returns, and
+  // the top-n ranking reads every candidate's FINAL cumulative logprob. A delta
+  // stream does not have that number until the last token, so there is nothing
+  // to rank while the frames are being emitted. Refuse the combination rather
+  // than stream best_of choices the non-streaming arm would have trimmed away:
+  // upstream refuses the one ranked-selection mode it still carries the same
+  // way and in the same place (completion/serving.py:136-139, beam search).
+  SUBCASE("best_of > n with stream:true is refused, not over-delivered") {
+    auto res = client.Post(
+        "/v1/completions",
+        R"({"prompt":"hello world","max_tokens":4,"n":2,"best_of":4,)"
+        R"("temperature":1.0,"top_k":1,"seed":7,"stream":true})",
+        "application/json");
+    REQUIRE(res);
+    // Before this row the streaming arm answered ONE choice (no fan-out); the
+    // fan-out turned that into best_of=4 indices, i.e. MORE choices than the
+    // same body returns without `stream`. Neither is a legal answer.
+    REQUIRE(res->status == 400);
+    const json j = json::parse(res->body);
+    CHECK(j.at("error").at("type") == "BadRequestError");
+    CHECK(j.at("error").at("message").get<std::string>().find("best_of") !=
+          std::string::npos);
+    CHECK(res->body.find("data: ") == std::string::npos);
+  }
+
+  // NOT an abort test: it polls a request nobody cancelled, so it measures the
+  // NATURAL drain. What it gates is that all n children retire — a fan-out that
+  // registered a child the OutputProcessor never finishes would hang here. The
+  // abort path is gated by the disconnect case below, which never lets the
+  // children reach max_tokens.
+  SUBCASE("every child of an n>1 request retires when the request finishes") {
     auto res = client.Post(
         "/v1/completions",
         R"({"prompt":"hello world","max_tokens":4,"n":3,"temperature":1.0,)"
@@ -4577,6 +4604,106 @@ TEST_CASE("api_server: an n>1 completion is fanned out over a real socket") {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     CHECK(h.async_engine.get_num_unfinished_requests() == 0);
   }
+
+  server_thread.join();  // stops the server, then joins
+}
+
+// SAMPLE-N-ASYNC (#1816): a client that goes away mid-stream must take EVERY
+// child with it. The id the client's stream holds is now the PARENT id, which
+// is not a key in the OutputProcessor's request table at all — only
+// external_req_ids_ maps it onto the n internal children. Without that
+// resolution the abort matches nothing and all n children run on to
+// max_tokens, burning KV blocks for a socket that is gone.
+//
+// The assertion is taken SYNCHRONOUSLY, with no poll loop: AsyncLLM::abort
+// erases the child states under the same mutex get_num_unfinished_requests()
+// reads, so the count is exact the instant abort() returns. A poll loop would
+// pass on natural drain and measure nothing, which is the trap the previous
+// version of the case above fell into. max_tokens is set far above what the
+// first frame consumes so the children are provably still live at that instant
+// — the pre-abort REQUIRE fails loudly rather than passing vacuously if the
+// engine ever outran it.
+//
+// Dispatch goes through ApiServer::handle_completions, which is the body the
+// registered /v1/completions route calls (api_server.cpp:1172), and the
+// disconnect is SseStream::abort — what the route's content provider calls when
+// the socket write fails and what ~CompletionSseStream calls on teardown.
+TEST_CASE("api_server: a disconnect on an n>1 stream aborts every child") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  constexpr int kN = 3;
+  const std::string body =
+      R"({"prompt":"hello","max_tokens":30,"n":3,"temperature":1.0,)"
+      R"("top_k":1,"seed":7,"stream":true})";
+  ApiServer::DispatchResult result = h.server.handle_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+
+  std::string first;
+  REQUIRE(result.sse_stream->next(first));
+  // n children live, not one: the fan-out ran and none of them has finished.
+  REQUIRE(h.async_engine.get_num_unfinished_requests() == kN);
+
+  result.sse_stream->abort();  // the client disconnected
+  CHECK(h.async_engine.get_num_unfinished_requests() == 0);
+
+  // Idempotent, and destruction adds nothing (~CompletionSseStream aborts too).
+  result.sse_stream->abort();
+  CHECK(h.async_engine.get_num_unfinished_requests() == 0);
+  result.sse_stream.reset();
+  CHECK(h.async_engine.get_num_unfinished_requests() == 0);
+}
+
+// SAMPLE-N-ASYNC (#1816): /v1/chat/completions NON-streaming n>1 became live
+// with the fan-out and had no test on any route. Ported from
+// tests/entrypoints/openai/chat_completion/test_completion.py's n>1 arm shape:
+// n choices, choice.index == idx, a finish reason on each, and usage that sums
+// the children while counting the rendered prompt once.
+//
+// The chat STREAMING arm is NOT gated here because it is broken: ChatSseStream
+// reads outputs.front() only, so an n>1 chat stream shows ONE choice while the
+// engine runs n children. That is #2120, and this row makes it worse rather
+// than leaving it alone — see the spec's `## Owed`.
+TEST_CASE("api_server: an n>1 chat completion returns n choices over a socket") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  ScopedServerThread server_thread(h.server);
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  httplib::Client client("127.0.0.1", port);
+  client.set_connection_timeout(5, 0);
+  client.set_read_timeout(30, 0);
+
+  constexpr int kN = 3;
+  constexpr int kMaxTokens = 3;
+  auto res = client.Post(
+      "/v1/chat/completions",
+      R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":3,)"
+      R"("n":3,"temperature":1.0,"top_k":1,"seed":7})",
+      "application/json");
+  REQUIRE(res);
+  REQUIRE(res->status == 200);
+  const json j = json::parse(res->body);
+  const json& choices = j.at("choices");
+  REQUIRE(choices.is_array());
+  REQUIRE(choices.size() == static_cast<std::size_t>(kN));
+  for (std::size_t i = 0; i < choices.size(); ++i) {
+    CHECK(choices.at(i).at("index").get<int>() == static_cast<int>(i));
+    REQUIRE(choices.at(i).at("finish_reason").is_string());
+    CHECK(choices.at(i).at("message").at("role") == "assistant");
+  }
+  const json& usage = j.at("usage");
+  CHECK(usage.at("completion_tokens").get<int>() == kN * kMaxTokens);
+  const int prompt_tokens = usage.at("prompt_tokens").get<int>();
+  CHECK(prompt_tokens > 0);
+  CHECK(usage.at("total_tokens").get<int>() == prompt_tokens + kN * kMaxTokens);
 
   server_thread.join();  // stops the server, then joins
 }

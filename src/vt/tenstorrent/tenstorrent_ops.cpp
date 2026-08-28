@@ -4225,6 +4225,18 @@ ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
   {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && s->conv_transposed) {
+      // W3 #2201: the fast path keys on the host pointer alone, so a pointer
+      // reused across roles would serve (or volume-reshape) a transposed conv
+      // shadow as an ssm cache. qwen3_5.cpp keeps distinct buffers per role;
+      // refuse loudly and name both geometries instead of guessing.
+      VT_CHECK(false,
+               "tenstorrent: GDN cache role mismatch: host pointer already "
+               "holds a conv_transposed shadow [" + std::to_string(s->dev_rows) +
+                   "x" + std::to_string(s->dev_cols) +
+                   "]; refusing to serve it as the ssm state cache [" +
+                   std::to_string(rows) + "x" + std::to_string(cols) + "]");
+    }
     if (s != nullptr && s->device_current && s->device.has_value() &&
         s->device->dtype() == ttnn::DataType::FLOAT32 &&
         s->device->layout() == layout &&
@@ -4241,6 +4253,15 @@ ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
       s->dev_rows = static_cast<uint32_t>(rows);
       s->dev_cols = static_cast<uint32_t>(cols);
       return reshaped;
+    }
+    // W3 #2201: the refresh below calls EnsureHost, which downloads a
+    // device-current host-stale shadow (wrong dtype/layout for this role —
+    // a foreign commit over the same buffer) before the re-upload. Count
+    // that d2h traffic; the download itself is the shadow's logical volume.
+    if (s != nullptr && !s->host_current) {
+      GdnStateD2hBytes().fetch_add(
+          static_cast<uint64_t>(s->dev_rows) * s->dev_cols * sizeof(float),
+          std::memory_order_relaxed);
     }
   }
   EnsureHost(t);  // host truth (downloads a stale foreign shadow if any)
@@ -4567,6 +4588,10 @@ void CommitConvTransposed(Tensor& state, ttnn::Tensor dev, uint32_t slots,
   if (s == nullptr) {
     // Untracked buffer: materialize the transposition on host directly.
     std::vector<float> v = dev.to_vector<float>();
+    // W3 #2201: the readback is a real device→host download of the whole
+    // [sl+1, R] shadow — count it like every other GDN state download.
+    GdnStateD2hBytes().fetch_add(static_cast<uint64_t>(v.size()) * sizeof(float),
+                                 std::memory_order_relaxed);
     const uint32_t R = slots * Cc;
     for (uint32_t sc = 0; sc < slots * Cc; ++sc)
       for (uint32_t j = 0; j < sl; ++j)

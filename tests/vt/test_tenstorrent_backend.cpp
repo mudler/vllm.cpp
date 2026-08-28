@@ -4144,3 +4144,187 @@ TEST_CASE("kTENSTORRENT W4 EnsureDevice2D bulk bf16 staging: route, bytes, views
   backend.Free(ma); backend.Free(mb); backend.Free(mo); backend.Free(mpb);
   backend.Free(ma32);
 }
+
+// ==== BACKEND-TENSTORRENT-QWEN35 W3 (#2201): the GDN reviewer leftovers ======
+// (a) the state d2h counter must see BOTH remaining download paths — the
+// EnsureGdnCacheDevice slow-path refresh and the CommitConvTransposed
+// untracked fallback; (b) EnsureGdnCacheDevice must refuse a host pointer
+// presented under a different role (a conv_transposed shadow asked for as an
+// ssm cache). qwen3_5.cpp uses distinct buffers per role, so (b) hardens.
+
+namespace {
+
+// Row-major contiguous Tensor over an existing TT-backed allocation
+// (Contiguous takes an initializer_list; these shapes are computed).
+Tensor RowMajorTT(void* mem, vt::DType dt, const std::vector<int64_t>& shape) {
+  Tensor t{};
+  t.data = mem;
+  t.dtype = dt;
+  t.device = Device{DeviceType::kTENSTORRENT, 0};
+  t.rank = static_cast<int32_t>(shape.size());
+  int64_t acc = 1;
+  for (int64_t i = static_cast<int64_t>(shape.size()) - 1; i >= 0; --i) {
+    t.shape[i] = shape[i];
+    t.stride[i] = acc;
+    acc *= shape[i];
+  }
+  return t;
+}
+
+}  // namespace
+
+TEST_CASE("kTENSTORRENT GDN d2h counter sees the EnsureGdnCacheDevice slow-path refresh (#2201)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  const int64_t t = 2, d = 64, rows = 3;  // the shared [t, d] geometry
+  // One allocation plays BOTH roles: kSiluAndMul commits a bf16 [t, d]
+  // device result over it (device-current, host-stale), then the GDN scatter
+  // presents the SAME host pointer as an f32 [t, d] cache. Equal volume,
+  // dtype mismatch: the EnsureGdnCacheDevice fast path misses, so the refresh
+  // downloads the resident bf16 shadow back to host before re-uploading —
+  // a volume change instead would be refused by EnsureHost's size check.
+  void* mc = tt.Alloc(static_cast<size_t>(t * d) * sizeof(float));  // f32-sized
+  void* mx = tt.Alloc(static_cast<size_t>(t * 2 * d) * 2);          // bf16 master
+  void* mw = tt.Alloc(static_cast<size_t>(rows * d) * sizeof(float));
+  void* mi = tt.Alloc(static_cast<size_t>(rows) * sizeof(int32_t));
+  Queue q = tt.CreateQueue();
+  std::vector<uint16_t> xb(static_cast<size_t>(t * 2 * d));
+  for (size_t i = 0; i < xb.size(); ++i)
+    xb[i] = static_cast<uint16_t>(0x3C00 + (i % 7));  // small bf16-exact values
+  tt.Copy(q, mx, xb.data(), xb.size() * 2);
+  const std::vector<int32_t> idx{0, 1, 1};
+  tt.Copy(q, mi, idx.data(), idx.size() * sizeof(int32_t));
+  Tensor ti = RowMajorTT(mi, vt::DType::kI32, {rows});
+
+  Tensor tx = RowMajorTT(mx, vt::DType::kBF16, {t, 2 * d});
+  Tensor tob = RowMajorTT(mc, vt::DType::kBF16, {t, d});
+  vt::SiluAndMul(q, tob, tx);
+  vt::tenstorrent::ResetGdnShadowTraffic();
+  Tensor tc = RowMajorTT(mc, vt::DType::kF32, {t, d});
+  Tensor twk = RowMajorTT(mw, vt::DType::kF32, {rows, d});
+  vt::GdnStateScatter(q, tc, twk, ti);
+  const auto tr = vt::tenstorrent::GetGdnShadowTraffic();
+  const uint64_t want_d2h = static_cast<uint64_t>(t * d) * sizeof(float);
+  MESSAGE("slow-path refresh d2h=", tr.state_d2h_bytes, " (want ", want_d2h,
+          ")");
+  CHECK(tr.state_d2h_bytes == want_d2h);
+  tt.Free(mc);
+  tt.Free(mx);
+  tt.Free(mw);
+  tt.Free(mi);
+}
+
+TEST_CASE("kTENSTORRENT GDN d2h counter sees the CommitConvTransposed untracked fallback (#2201)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  const int64_t B = 2, C = 64, K = 4, sl = K - 1;
+  uint32_t s = 77001u;
+  std::vector<float> w(static_cast<size_t>(C * K)), bias(static_cast<size_t>(C)),
+      x(static_cast<size_t>(B * C)), st(static_cast<size_t>(B * C * sl)),
+      out(static_cast<size_t>(B * C), 0.0f);
+  for (float& v : w) v = 0.4f * GdnLcg(s);
+  for (float& v : bias) v = 0.1f * GdnLcg(s);
+  for (float& v : st) v = GdnLcg(s);
+  for (float& v : x) v = 2.0f * GdnLcg(s);
+  // NONE of these pointers is tt.Alloc'd: the conv state is an UNTRACKED
+  // buffer, so the step's final commit takes the host-materialization
+  // fallback in CommitConvTransposed — a real device→host download of the
+  // whole [sl+1, R] shadow that the counter must see.
+  Queue q = tt.CreateQueue();
+  Tensor to = RowMajorTT(out.data(), vt::DType::kF32, {B, C});
+  Tensor tx = RowMajorTT(x.data(), vt::DType::kF32, {B, C});
+  Tensor tw = RowMajorTT(w.data(), vt::DType::kF32, {C, K});
+  Tensor tb = RowMajorTT(bias.data(), vt::DType::kF32, {C});
+  Tensor ts = RowMajorTT(st.data(), vt::DType::kF32, {B, C, sl});
+  vt::CausalConv1dArgs a;
+  a.silu_activation = true;
+  vt::tenstorrent::ResetGdnShadowTraffic();
+  vt::CausalConv1dUpdate(q, to, tx, tw, &tb, ts, a, nullptr);
+  const auto tr = vt::tenstorrent::GetGdnShadowTraffic();
+  const uint64_t want_d2h =
+      static_cast<uint64_t>(sl + 1) * static_cast<uint64_t>(B * C) *
+      sizeof(float);
+  MESSAGE("untracked conv commit d2h=", tr.state_d2h_bytes, " (want ",
+          want_d2h, ")");
+  CHECK(tr.state_d2h_bytes == want_d2h);
+}
+
+TEST_CASE("kTENSTORRENT EnsureGdnCacheDevice refuses a conv_transposed pointer presented as an ssm cache (#2201)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& tt = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  const int64_t B = 2, C = 64, K = 4, sl = K - 1, R = B * C;
+  uint32_t s = 77002u;
+  std::vector<float> w(static_cast<size_t>(C * K)), bias(static_cast<size_t>(C)),
+      x(static_cast<size_t>(B * C)), st(static_cast<size_t>(B * C * sl)),
+      out(static_cast<size_t>(B * C), 0.0f);
+  for (float& v : w) v = 0.4f * GdnLcg(s);
+  for (float& v : bias) v = 0.1f * GdnLcg(s);
+  for (float& v : st) v = GdnLcg(s);
+  for (float& v : x) v = 2.0f * GdnLcg(s);
+  // One tracked update step leaves the conv-state buffer holding a
+  // TRANSPOSED [sl+1, R] device shadow. The allocation covers the LARGER ssm
+  // view so only the role can be wrong here, never the extent.
+  const size_t ms_floats =
+      st.size() > static_cast<size_t>((sl + 1) * R) ? st.size()
+                                                    : static_cast<size_t>((sl + 1) * R);
+  void* mx = tt.Alloc(x.size() * sizeof(float));
+  void* mw = tt.Alloc(w.size() * sizeof(float));
+  void* mb = tt.Alloc(bias.size() * sizeof(float));
+  void* mo = tt.Alloc(out.size() * sizeof(float));
+  void* ms = tt.Alloc(ms_floats * sizeof(float));
+  void* mg = tt.Alloc(static_cast<size_t>(3 * ((sl + 1) * R / 2)) * sizeof(float));
+  void* mp = tt.Alloc(3 * sizeof(int32_t));
+  Queue q = tt.CreateQueue();
+  tt.Copy(q, mx, x.data(), x.size() * sizeof(float));
+  tt.Copy(q, mw, w.data(), w.size() * sizeof(float));
+  tt.Copy(q, mb, bias.data(), bias.size() * sizeof(float));
+  tt.Copy(q, mo, out.data(), out.size() * sizeof(float));
+  tt.Copy(q, ms, st.data(), st.size() * sizeof(float));
+  Tensor to = RowMajorTT(mo, vt::DType::kF32, {B, C});
+  Tensor tx = RowMajorTT(mx, vt::DType::kF32, {B, C});
+  Tensor tw = RowMajorTT(mw, vt::DType::kF32, {C, K});
+  Tensor tb = RowMajorTT(mb, vt::DType::kF32, {C});
+  Tensor ts = RowMajorTT(ms, vt::DType::kF32, {B, C, sl});
+  vt::CausalConv1dArgs a;
+  a.silu_activation = true;
+  vt::CausalConv1dUpdate(q, to, tx, tw, &tb, ts, a, nullptr);
+
+  // The SAME host pointer, SSM role, equal volume: the fast path would serve
+  // (or volume-reshape) the transposed conv shadow as the ssm cache. The
+  // refusal must name the role and the refused geometry.
+  const int64_t ssm_rows = 2, ssm_cols = (sl + 1) * R / ssm_rows;
+  Tensor twk = RowMajorTT(mg, vt::DType::kF32, {3, ssm_cols});
+  Tensor tc = RowMajorTT(ms, vt::DType::kF32, {ssm_rows, ssm_cols});
+  const std::vector<int32_t> gidx{0, 1, 0};
+  tt.Copy(q, mp, gidx.data(), gidx.size() * sizeof(int32_t));
+  Tensor tp = RowMajorTT(mp, vt::DType::kI32, {3});
+  bool threw = false;
+  std::string what;
+  try {
+    vt::GdnStateGather(q, twk, tc, tp, nullptr);
+  } catch (const std::exception& e) {
+    threw = true;
+    what = e.what();
+  }
+  CHECK_MESSAGE(threw, "cross-role pointer must be refused, got: ", what);
+  CHECK_MESSAGE(what.find("conv_transposed") != std::string::npos,
+                "refusal must name the conv role, got: ", what);
+  CHECK_MESSAGE(what.find("2x256") != std::string::npos,
+                "refusal must name the refused geometry, got: ", what);
+  tt.Free(mx);
+  tt.Free(mw);
+  tt.Free(mb);
+  tt.Free(mo);
+  tt.Free(ms);
+  tt.Free(mg);
+  tt.Free(mp);
+}

@@ -3218,6 +3218,17 @@ target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
 target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5b-4 (#2167) — the DEVICE arm of Qwen Sparse Attention:
+# vt::Qwen4ExpQsaCompress and vt::Qwen4ExpQsaGatherAttention, plus the indexer
+# COMPOSED from the vt::DsaIndexerLogits / vt::DsaTopkSelect pair this tree
+# already had, all against the SAME lane-pinned transformers goldens the W4 host
+# reference answers to. Includes a released-config case at 3002 tokens of
+# context, past the 2048 indexer budget below which every candidate is selected.
+# CPU only: no CUDA arm of either op exists. Reaches the model-private
+# qwen4_exp_qsa.h, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_qsa_device vllm/models/test_qwen4_exp_qsa_device.cpp)
+target_include_directories(test_qwen4_exp_qsa_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # MODEL-MM-QWEN4-EXP W5b-2 (#2031) — the DEVICE arm of the same stream:
 # vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME
 # lane-pinned goldens the host reference is gated on, so the two arms answer to

@@ -122,7 +122,7 @@ the GGUF architecture string.** Measured at the two heads:
 | head | `8a8d0bcc4d5fdf024c457526245bec4bc3a12adc` | `9370c82dbd1774941f9d8a05c9eafdac1ecb2e2c` |
 | architecture string | `LLM_ARCH_GLM5NEXT -> "glm5next"` (`src/llama-arch.cpp:87`) | `LLM_ARCH_GLM5_NEXT -> "glm5-next"` (`src/llama-arch.cpp:152`) |
 | text graph | `src/models/glm5next.cpp`, 55716 bytes | `src/models/glm5-next.cpp`, 35072 bytes |
-| converter | `conversion/glm5next.py`, 4714 bytes | `conversion/glm.py:407-409`, `@ModelBase.register("Glm5NextForConditionalGeneration")` |
+| converter | `conversion/glm5next.py`, 4714 bytes | `conversion/glm.py:407-409` for text, AND `conversion/qwen3vl.py:254-260` for vision, both `@ModelBase.register("Glm5NextForConditionalGeneration")` |
 | vision | none: `git grep -il glm5 <head> -- tools/` is **rc=1** | `PROJECTOR_TYPE_GLM5V -> "glm5v"` (`tools/mtmd/clip-impl.h:551`), `tools/mtmd/models/glm4v.cpp`, `mtmd_image_preprocessor_glm5v` |
 
 That the vision row's rc=1 is absence and not a broken invocation is proved by
@@ -150,7 +150,28 @@ graph at an incompatible spelling, and the registry would then admit two llama.c
 references for one architecture with no rule saying which wins. The debt below is
 a smaller lie than that record would be.
 
-## W6 has no vision denominator, and #27773 would not supply one
+## W6 has no vision denominator against the PUBLISHED mmproj
+
+**Scope this claim carefully, because an earlier draft of this file overstated
+it.** What is true is that #27773 cannot open the *published* `mmproj-BF16.gguf`:
+that file declares `clip.projector_type = glm5next`, read out of the staged
+bytes, and neither head's projector table defines that string. What is NOT true
+is that #27773 could never supply a vision denominator at all. Measured at
+`9370c82dbd1774941f9d8a05c9eafdac1ecb2e2c`:
+
+- `conversion/qwen3vl.py:254-260` carries
+  `@ModelBase.register("Glm5NextForConditionalGeneration")` on a
+  `Glm5NextVisionModel(Glm4VVisionModel)` whose `projector_type` is
+  `gguf.VisionProjectorType.GLM5V`;
+- `gguf-py/gguf/constants.py:5723` defines `GLM5V = "glm5v"`;
+- `tools/mtmd/clip-impl.h:551` accepts `{ PROJECTOR_TYPE_GLM5V, "glm5v" }`.
+
+That is a closed, self-consistent vision path from the `zai-org/GLM-5.3-Flash`
+safetensors to a tower that head can load. So the honest statement is that a
+vision denominator is obtainable from #27773 by CONVERTING the checkpoint
+ourselves, and is not obtainable by pointing that head at the published mmproj.
+Whoever pays this debt should not exclude #27773 on the strength of the earlier
+absolute.
 
 Recorded as owed rather than waived, under **O4** in
 [`../specs/glm5-next-flash.md`](../specs/glm5-next-flash.md).
@@ -203,7 +224,13 @@ revision listing at `d425e572fb9686125831f476129e51cea34bc5b4`, staging state
 | `...-00004-of-00004.gguf` | 9,466,399,584 B (8.816 GiB) | **absent** |
 | `mmproj-BF16.gguf` | 1,164,010,080 B (1.084 GiB) | **complete and verified**, sha256 `513c9bfc55898998186543caefc01626fb28e378b92f391018e1c3dd6655b113` computed locally over the staged bytes |
 
-The four model shards total 108,729,501,347 bytes, **101.262 GiB**. 33.16 GiB of
+The four model shards total 108,720,071,427 bytes, **101.2535 GiB**. An
+earlier revision of this file said 108,729,501,347 bytes / 101.262 GiB. That
+figure was 9,429,920 bytes high because it was summed from a naive substring
+match on `UD-Q2_K_XL`, which returns FIVE entries at this revision: the four
+shards plus `Shard_Rewrite/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf_file`,
+a 9,429,920-byte sibling that is not a shard and is not staged. Match on the
+`UD-Q2_K_XL/` prefix and the `.gguf` suffix, not on the substring. 33.16 GiB of
 them are on the share. **The download is NOT complete, and no run may be claimed
 against a partial file** — loading a truncated shard measures a truncated file,
 not an oracle, which is the same trap

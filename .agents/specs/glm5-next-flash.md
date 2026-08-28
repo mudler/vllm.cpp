@@ -1400,10 +1400,16 @@ Debts this row carries, each visible rather than waived:
   `glm5next`, it is unmerged, and it is pinned by object id. **Still owed:**
   (a) the FLOOR itself — no speed or memory number has been taken against that
   oracle, which is `gateable = no` because nothing has been built or run at the
-  pin; and (b) a VISION denominator, which PR #27773 would not supply even out
-  of draft, because the published `mmproj-BF16.gguf` declares
-  `clip.projector_type = glm5next` and neither head's projector table defines
-  that string.
+  pin; and (b) a VISION denominator against the PUBLISHED `mmproj-BF16.gguf`,
+  which neither head can open: that file declares
+  `clip.projector_type = glm5next` and neither projector table defines that
+  string. Do NOT read (b) as "#27773 has no vision path" — it has its own,
+  measured at its head: `conversion/qwen3vl.py:254-260` registers
+  `Glm5NextForConditionalGeneration` emitting
+  `gguf.VisionProjectorType.GLM5V`, `constants.py:5723` defines
+  `GLM5V = "glm5v"`, and `tools/mtmd/clip-impl.h:551` accepts it. A vision
+  denominator is therefore obtainable by CONVERTING the checkpoint with that
+  head, and unobtainable only by pointing it at the published mmproj.
 - **O5 — no i-quant arm is producible on this fleet** (R4).
 - **O6 — speed.** No number on any axis, and no denominator exists.
 - **O7 — no artifact of this model exists.** W7a authored the converter and

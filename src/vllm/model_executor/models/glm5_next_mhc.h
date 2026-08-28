@@ -9,7 +9,11 @@
 // ORACLE. vLLM registers no `glm5_next` at our parity pin `555967922` nor at
 // its `main`, and neither do vllm-omni, SGLang or llama.cpp. Under AGENTS.md
 // "When vLLM has no implementation" the reference for this surface is
-// `transformers` **v5.16.1** (tag object `93c8b7b485963a10800c91f55304db6be211c2bd`).
+// `transformers` **v5.16.1**, the commit `refs/tags/v5.16.1` resolves to,
+// `93c8b7b485963a10800c91f55304db6be211c2bd`. (The annotated TAG OBJECT is
+// `fb405cdf1bb6fa7b85ac8871b5d8a8b1376f5a3c`; an earlier revision of this
+// comment mislabelled the commit as the tag object. The revision was always
+// right, only the word for it was wrong.)
 // W0 (#2096) owns recording that lane revision in
 // `.agents/oracles/transformers.md`; this file cites it, it does not record it.
 //

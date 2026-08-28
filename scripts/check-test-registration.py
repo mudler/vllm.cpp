@@ -40,7 +40,7 @@ CI = ROOT / ".github/workflows/ci.yml"
 MUTATION_SUITE = ROOT / "tests/scripts/test_check_test_registration.py"
 MUTATION_MANIFEST = ROOT / "tests/scripts/check_test_registration_mutations.txt"
 MUTATION_MANIFEST_SHA256 = (
-    "5936da97d0414dbd1e094029dda32355d611b16d01dfb631201aac32af1782ea"
+    "4589e7a96d839a8309fd0e5799cc7a652b22a9d568d56151e2a1b8feea5d02ee"
 )
 
 REQUIRED_TESTS = {
@@ -56,6 +56,29 @@ REQUIRED_LABEL_SELECTIONS = {
         "test_minimax_music3_depth_arm_real",
         "test_minimax_music3_device_arm_real",
     ),
+}
+
+# Python suites whose registration in BOTH lanes is pinned: the name in the
+# preflight `SUITES` array, and the exact command a CI step runs.  `SUITES` is a
+# bare Bash array that nothing measures, so before this every entry in it was
+# deletable at rc=0 -- measured on `test_sglang_lease_identity` and reproduced on
+# an unrelated control entry (#1833).  "Registered in TWO places, deliberately",
+# which `.github/workflows/ci.yml` documents, bought nothing in either direction.
+#
+# EXPLICIT AND EXACT, in the shape `REQUIRED_TESTS` above uses for C++, and
+# deliberately NOT the symmetric population rule ("every `tests/scripts/test_*.py`
+# in both lanes").  That rule is correct and it reds on 23 suites at once -- 11
+# preflight-only and 12 CI-only at the time of writing -- each of which is a
+# separate classification, some of them lane-correct on purpose.  Forcing 23
+# unreviewed classifications through one change, or lowering it to a floor that
+# admits them, would make a mute switch of a real gate.  Those 23 belong to #408
+# and #1509; this set is the mechanism they can widen rather than replace.
+#
+# `check-test-registration` and `test_check_test_registration` are NOT listed
+# here.  They keep their own hardcoded checks below, whose diagnostics are what
+# the M9-M12 mutation cases match on.
+REQUIRED_SUITE_REGISTRATIONS = {
+    "test_sglang_lease_identity": "tests/scripts/test_sglang_lease_identity.py",
 }
 
 def _without_line_comments(text: str) -> str:
@@ -925,6 +948,11 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
         errors.append(
             "CI guard step must contain the checker and mutation suite as direct active commands"
         )
+    for suite, command in sorted(REQUIRED_SUITE_REGISTRATIONS.items()):
+        if suites is None or suite not in suites:
+            errors.append(f"pinned suite {suite} is missing from preflight SUITES")
+        if ("python3", command) not in active_ci_commands:
+            errors.append(f"pinned suite {suite} is missing from the CI suite lane")
     return errors
 
 
@@ -1158,7 +1186,9 @@ def main() -> int:
         f"the configured tree matches the pinned label selection ({selection}), "
         f"no test target outside `if({SERVER_GUARD_CONDITION})` reaches a "
         "translation unit compiled only inside it, "
-        "and the guard is wired into preflight/CI."
+        "and the guard is wired into preflight/CI "
+        f"together with {len(REQUIRED_SUITE_REGISTRATIONS)} pinned suite(s) "
+        f"[{', '.join(sorted(REQUIRED_SUITE_REGISTRATIONS))}] in BOTH lanes."
     )
     return 0
 

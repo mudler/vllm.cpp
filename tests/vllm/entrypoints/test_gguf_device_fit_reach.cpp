@@ -100,7 +100,16 @@ class StagingPlatform final : public vllm::platforms::Platform {
   std::vector<vt::DType> supported_dtypes() const override {
     return {vt::DType::kBF16};
   }
-  bool needs_weight_staging() const override { return true; }
+  bool needs_weight_staging() const override { return needs_weight_staging_flag; }
+  // BACKEND-ROCM (#1934). Overridden explicitly, NOT left to the default
+  // delegation to `needs_weight_staging()`, and independently settable: the
+  // two are proven-independent inputs to `CheckDeviceWeightFit`'s call site
+  // by a case that sets them to DIFFERENT values, mirroring ROCm's own real
+  // production state (`needs_weight_staging()=false`,
+  // `allocates_bounded_device_memory()=true`).
+  bool allocates_bounded_device_memory() const override {
+    return allocates_bounded_device_memory_flag;
+  }
   // ENG-EXPERT-STREAM-DEVICE W0d (#1124). The second half of the loader's lane
   // condition. A settable field for the same reason `create_queue_throws` is
   // one: the platform registry is process-global, so a second registration would
@@ -115,6 +124,8 @@ class StagingPlatform final : public vllm::platforms::Platform {
   }
 
   bool host_addressable = false;
+  bool needs_weight_staging_flag = true;
+  bool allocates_bounded_device_memory_flag = true;
 
  private:
   HostBackend& backend_;
@@ -881,4 +892,64 @@ TEST_CASE("device fit: the VARIABLE beats the config key, through the loader") {
   CAPTURE(message);
   CHECK(message.find("cannot serve this GGUF") != std::string::npos);
   CHECK(message.find(std::to_string(kStagedLowerBound - 1)) != std::string::npos);
+}
+
+// --- BACKEND-ROCM (#1934): the refusal is gated on --------------------------
+// --- `allocates_bounded_device_memory()`, never on `needs_weight_staging()` -
+//
+// Issue #1934: `RocmPlatform::needs_weight_staging()` is stale-false, so
+// before this row the ONE production call site of `CheckDeviceWeightFit`
+// never ran on ROCm regardless of budget. The fix is `model_loader.cpp`
+// reading `target.allocates_bounded_device_memory()` instead. These two cases
+// pin that the call site reads the NEW predicate and NOT the old one, in both
+// directions, so a regression that reverted the call site to
+// `needs_weight_staging()` — or one that read a `||` instead of the plain
+// predicate — goes red here.
+
+TEST_CASE(
+    "device fit: ROCm's own state (staging=false, bounded-memory=true) "
+    "still refuses") {
+  RegisterFakeStagingPlatform();
+  Platform().needs_weight_staging_flag = false;
+  Platform().allocates_bounded_device_memory_flag = true;
+  TempFile f(BuildSyntheticMoeGguf());
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kStagedLowerBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = true;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound)) != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound - 1)) != std::string::npos);
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+TEST_CASE(
+    "device fit: a platform that stages but reports no bounded memory is "
+    "NEVER refused") {
+  RegisterFakeStagingPlatform();
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = false;
+  TempFile f(BuildSyntheticMoeGguf());
+
+  // One byte under the footprint, exactly the budget the positive-control case
+  // above refuses at. The ONLY thing that moved is
+  // `allocates_bounded_device_memory_flag`.
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kStagedLowerBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().allocates_bounded_device_memory_flag = true;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  // The LATER error, asserted positively: without it, "no refusal" would also
+  // be true of a load that died earlier for an unrelated reason.
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
 }

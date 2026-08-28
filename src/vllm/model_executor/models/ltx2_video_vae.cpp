@@ -90,7 +90,9 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev, dense_attn::DBuf
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/platforms/interface.h"  // platforms::HasPlatform
 #include "vt/backend.h"
 #include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
@@ -123,6 +125,45 @@ namespace {
 // a discrete GPU could see it. Removing the operators makes every such site a
 // compile error instead: a caller that genuinely needs host bytes says `Host()`
 // and gets a check that the volume is where it claims to be.
+
+// ─── THE POOL'S PRECONDITION (#1904) ────────────────────────────────────────
+//
+// `DBuf` reads the device pool's soft cap off `platforms::GetPlatform(type)`
+// (dense_device_glue.h, `ResolveDevicePoolPolicy`), which THROWS for a device
+// type the platform registry does not hold. Routing this file's memory through
+// the shared pool therefore makes a registered platform a precondition of a
+// device decode, where before a registered BACKEND alone was enough (#1904).
+//
+// The production chain always satisfies it, and by construction rather than by
+// luck: `Ltx2VideoEngine::Load` takes the device type from
+// `platforms::CurrentPlatform().device_type()` (src/vllm/multimodal/
+// ltx2_video.cpp:827-828), and `CurrentPlatform()` returns a REGISTERED entry or
+// throws (src/vllm/platforms/platform.cpp:91-98). There is no path from
+// `include/vllm.h` to this decode that names a device type any other way.
+//
+// It is checked anyway, because "the only caller happens to satisfy it" is an
+// audit and not a gate, and because the failure it replaces is a `GetPlatform`
+// throw three headers away that names neither this decode nor the pool.
+//
+// ONE CALL SITE, AT THE DECODE ENTRY, and that is a mutation result rather than
+// a preference. The first draft called this from BOTH `VaeStore::Alloc` and the
+// `VaeWeightCache` constructor, and deleting the `VaeStore` one left the whole
+// seam suite green: the cache is constructed first, so it refused first and
+// neither call site was individually gated. A guard with a spare copy is a guard
+// whose deletion no test can see. `Ltx2ConvVideoDecode` is the one place in this
+// translation unit where a device queue arrives, so the check goes there and
+// nowhere else. A `VaeStore` reached some other way still throws out of
+// `GetPlatform`; what it loses is the message, not the refusal.
+void RequirePooledDevice(const vt::Queue& q) {
+  VT_CHECK(vllm::platforms::HasPlatform(q.device.type),
+           std::string("ltx2 video vae: the decode was handed a queue on device '") +
+               vt::DeviceTypeName(q.device.type) +
+               "', for which no platform is registered. Its buffers are drawn from the shared "
+               "device pool, and the pool's residency cap is platform data, so a device with no "
+               "registered platform has no pool policy to run under. Register the platform for "
+               "this device type, or decode on the CPU queue.");
+}
+
 class VaeStore {
  public:
   VaeStore() = default;
@@ -159,7 +200,25 @@ class VaeStore {
     VT_CHECK(backend_ != nullptr,
              "ltx2 video vae: the decode was handed a queue on a device with no registered "
              "backend, so the volume cannot be made resident on it");
-    dev_ = backend_->Alloc(n_ == 0 ? 1 : n_ * sizeof(float));
+    // THE SHARED SEAM, NOT A SECOND OWNER (#1904). `dense_attn::DBuf` is this
+    // tree's move-only owning device allocation and it draws from the shared
+    // `DevicePool` (device_pool.h), so a volume this decode is finished with is
+    // handed to the next stage that wants that size class instead of being
+    // returned to the driver. Both `cudaMalloc` and `cudaFree` synchronise the
+    // whole device, and a tiled render calls `Ltx2ConvVideoDecode` once per tile
+    // (ltx2_video_vae_tiled.cpp:123), so the raw `Alloc`/`Free` pair this
+    // replaces re-paid every one of a tile's allocations on the next tile.
+    //
+    // The member is a `DBuf` and not a `std::optional<DBuf>`: this store is
+    // default-constructed and allocates later, which is what `DBuf()`'s empty
+    // state is for. It is NOT a second buffer type -- the allocation, the
+    // ownership and the return to the pool are all the seam's.
+    //
+    // `DBuf` itself rounds a zero-byte request up to one byte
+    // (`alloc_bytes_ = bytes_ == 0 ? 1 : bytes_`), which is exactly what the
+    // `n_ == 0 ? 1 : ...` here used to do.
+    dev_ = vllm::dense_attn::DBuf(vllm::dense_attn::Dev{*backend_, *queue_}, vt::DType::kF32,
+                                  std::vector<int64_t>{static_cast<int64_t>(n_)});
   }
 
   // Allocate n floats ON THE SAME QUEUE as `other`. Almost every volume in this
@@ -175,9 +234,9 @@ class VaeStore {
   size_t size() const { return n_; }
   vt::Queue* queue() const { return queue_; }
 
-  float* ptr() { return OnDevice() ? static_cast<float*>(dev_) : host_.data(); }
+  float* ptr() { return OnDevice() ? static_cast<float*>(dev_.ptr()) : host_.data(); }
   const float* ptr() const {
-    return OnDevice() ? static_cast<const float*>(dev_) : host_.data();
+    return OnDevice() ? static_cast<const float*>(dev_.ptr()) : host_.data();
   }
 
   // Host bytes, with a check rather than a comment. Every caller of this is a
@@ -207,7 +266,7 @@ class VaeStore {
       std::copy(host, host + n_, host_.begin());
       return;
     }
-    backend_->Copy(*queue_, dev_, host, n_ * sizeof(float));
+    backend_->Copy(*queue_, dev_.ptr(), host, n_ * sizeof(float));
   }
   void Download(float* host) const {
     if (n_ == 0) return;
@@ -215,14 +274,15 @@ class VaeStore {
       std::copy(host_.begin(), host_.end(), host);
       return;
     }
-    backend_->Copy(*queue_, host, dev_, n_ * sizeof(float));
+    backend_->Copy(*queue_, host, dev_.ptr(), n_ * sizeof(float));
     backend_->Synchronize(*queue_);
   }
 
  private:
   void Release() {
-    if (dev_ != nullptr && backend_ != nullptr) backend_->Free(dev_);
-    dev_ = nullptr;
+    // Assigning the EMPTY buffer returns the block to the pool it came from;
+    // there is no `Free` here any more, which is the point of #1904.
+    dev_ = vllm::dense_attn::DBuf();
     backend_ = nullptr;
     host_.clear();
     n_ = 0;
@@ -238,15 +298,14 @@ class VaeStore {
     // DEVICE TO DEVICE. A copy that went through the host would be exactly the
     // round-trip this row removes, and `Volume hidden = input;` in
     // `ResnetBlock3d` is a copy on the hot path.
-    backend_->Copy(*queue_, dev_, other.dev_, n_ * sizeof(float));
+    backend_->Copy(*queue_, dev_.ptr(), other.dev_.ptr(), n_ * sizeof(float));
   }
   void Steal(VaeStore& other) {
     queue_ = other.queue_;
     backend_ = other.backend_;
-    dev_ = other.dev_;
+    dev_ = std::move(other.dev_);
     host_ = std::move(other.host_);
     n_ = other.n_;
-    other.dev_ = nullptr;
     other.backend_ = nullptr;
     other.n_ = 0;
     other.queue_ = nullptr;
@@ -254,7 +313,7 @@ class VaeStore {
 
   vt::Queue* queue_ = nullptr;
   vt::Backend* backend_ = nullptr;
-  void* dev_ = nullptr;
+  vllm::dense_attn::DBuf dev_;
   std::vector<float> host_;
   size_t n_ = 0;
 };
@@ -292,10 +351,11 @@ class VaeWeightCache {
                "backend, so its weights cannot be staged onto it");
     }
   }
-  ~VaeWeightCache() {
-    if (backend_ == nullptr) return;
-    for (const auto& kv : staged_) backend_->Free(kv.second);
-  }
+  // NO DESTRUCTOR. Each staged weight is a `DBuf` and returns itself to the
+  // shared pool (#1904), where the hand-rolled table had to walk itself calling
+  // `Backend::Free`. This is what makes the per-tile restaging this cache's
+  // lifetime forces (`## Owed`, this row's spec) cost a pool hit rather than a
+  // synchronising driver allocation on every tile after the first.
   VaeWeightCache(const VaeWeightCache&) = delete;
   VaeWeightCache& operator=(const VaeWeightCache&) = delete;
 
@@ -304,18 +364,22 @@ class VaeWeightCache {
   const float* Get(const std::vector<float>& host) {
     if (backend_ == nullptr) return host.data();
     auto it = staged_.find(host.data());
-    if (it != staged_.end()) return static_cast<const float*>(it->second);
-    const size_t bytes = host.size() * sizeof(float);
-    void* dev = backend_->Alloc(bytes == 0 ? 1 : bytes);
-    if (bytes > 0) backend_->Copy(*queue_, dev, host.data(), bytes);
-    staged_.emplace(host.data(), dev);
-    return static_cast<const float*>(dev);
+    if (it != staged_.end()) return static_cast<const float*>(it->second.ptr());
+    // `DBuf`'s host-pointer constructor IS the `Alloc` plus `Copy` this replaced:
+    // it copies only when the tensor has bytes, and it rounds an empty tensor's
+    // allocation up to one byte, both of which the hand-rolled pair did too.
+    auto emplaced = staged_.emplace(
+        host.data(),
+        vllm::dense_attn::DBuf(vllm::dense_attn::Dev{*backend_, *queue_}, vt::DType::kF32,
+                               std::vector<int64_t>{static_cast<int64_t>(host.size())},
+                               host.data()));
+    return static_cast<const float*>(emplaced.first->second.ptr());
   }
 
  private:
   vt::Queue* queue_ = nullptr;
   vt::Backend* backend_ = nullptr;
-  std::map<const float*, void*> staged_;
+  std::map<const float*, vllm::dense_attn::DBuf> staged_;
 };
 
 // A PER-CALL host buffer, on the queue's device. Not everything a kernel reads
@@ -433,11 +497,13 @@ const ltx2::Ltx2DeviceKernels& VaeSiluKernels(const vt::Queue& q) {
 // The volume owns its own storage now (`VaeStore`) and the weights are staged
 // once (`VaeWeightCache`), so nothing in this file allocates per call.
 //
-// Its removal also closes #1904 for this file by deletion rather than by
-// migration: it was a hand-rolled second copy of `vllm::dense_attn::DBuf`
-// (include/vllm/model_executor/models/dense_device_glue.h:109), and the right
-// fix for a duplicated seam is to stop needing it. #1904 stays open for the
-// audit it also asks for.
+// Its removal did NOT close #1904, and the note that used to stand here said it
+// did. `DevBuf` was a hand-rolled second copy of `vllm::dense_attn::DBuf`, and
+// deleting it left the same hand-rolled ownership one level up: `VaeStore` and
+// `VaeWeightCache` each called `Backend::Alloc` and `Free` themselves, so the
+// decode's buffers never reached the shared `DevicePool`. Both hold a `DBuf`
+// now -- see `VaeStore::Alloc` and the pool precondition above it -- and that is
+// what closed the issue.
 
 
 // The one convolution dispatch of the whole video VAE, decoder and encoder.
@@ -1084,6 +1150,12 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
            "ltx2 video vae: latent channel count does not match in_channels");
   VT_CHECK(static_cast<int64_t>(latent.size()) == latent_channels * latent_t * latent_h * latent_w,
            "ltx2 video vae: latent size does not match [C, T, H, W]");
+  // The decode's memory comes from the shared device pool (#1904), and the pool
+  // is platform data. This is the one place a device queue enters this file, so
+  // it is the one place that precondition is stated.
+  if (queue != nullptr && queue->device.type != vt::DeviceType::kCPU) {
+    RequirePooledDevice(*queue);
+  }
   const std::string p = config.prefix;
   // ONE CACHE FOR THE WHOLE DECODE. Constructed here and handed to the spec, so
   // every convolution and every 1x1x1 linear below reaches the SAME staged copy

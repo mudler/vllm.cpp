@@ -70,22 +70,38 @@ void RoundToBf16(std::vector<float>& v) {
   for (float& x : v) x = vt::BF16ToF32(vt::F32ToBF16(x));
 }
 
-// ---- vision weight loader: model.visual.* bf16 -> host f32 (matches M2a dump) ----
+// ---- vision weight loader: model.visual.* bf16 -> host bf16 bits (#1359) ----
 // `t.data` points into the safetensors mmap, whose payload offset carries NO
 // alignment guarantee (issue #772), so the bytes are read through
-// vt::LoadUnaligned rather than handed to Bf16BitsToF32 as a `const uint16_t*`.
-// Bf16BitsToF32 keeps that signature for its OTHER callers, which pass
-// std::vector<uint16_t>::data() and are suitably aligned by construction.
-std::vector<float> LoadVisionF32(const TensorResolver& get,
-                                 const std::string& name) {
+// vt::LoadUnaligned rather than cast to a `const uint16_t*` and indexed. A
+// `reinterpret_cast` plus `out[i] = p[i]` is the regression
+// `tests/vllm/models/test_loader_unaligned_offsets.cpp:247` exists to catch, and
+// a single `std::memcpy` of the whole payload would launder the same defect past
+// the sanitizer. Element-wise LoadUnaligned is the only correct spelling here.
+//
+// The store is bf16 because every consumer narrows straight back to bf16 before
+// its first GEMM, so the f32 this used to return was a carrier that cost 2x the
+// checkpoint's bytes and bought nothing (#1359). Both are the same 16 bits.
+std::vector<uint16_t> LoadVisionBf16(const TensorResolver& get,
+                                     const std::string& name) {
   const StTensor& t = get(name);
   VT_CHECK(t.dtype == "BF16", "qwen3-vl vision: expected BF16 for " + name);
   const auto n = static_cast<size_t>(t.nbytes / sizeof(uint16_t));
   const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
-  std::vector<float> out(n);
-  for (size_t i = 0; i < n; ++i)
-    out[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
+  std::vector<uint16_t> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = vt::LoadUnaligned<uint16_t>(src + i * 2);
   MaybeReleaseSourcePages(t.data, t.nbytes);
+  return out;
+}
+
+// The pos-embed table alone stays host f32 (qwen3_vl_vision.h, `pos_embed_w`):
+// `VisionPosEmbedInterpolate` gathers and sums it on the host before anything
+// narrows, so it is the one weight whose stored values reach arithmetic.
+std::vector<float> LoadVisionPosEmbedF32(const TensorResolver& get,
+                                         const std::string& name) {
+  const std::vector<uint16_t> bits = LoadVisionBf16(get, name);
+  std::vector<float> out(bits.size());
+  for (size_t i = 0; i < bits.size(); ++i) out[i] = vt::BF16ToF32(bits[i]);
   return out;
 }
 
@@ -93,12 +109,12 @@ multimodal::VisionMergerWeights LoadMerger(const TensorResolver& get,
                                            const std::string& prefix, bool postshuffle) {
   multimodal::VisionMergerWeights m;
   m.use_postshuffle_norm = postshuffle;
-  m.norm_w = LoadVisionF32(get, prefix + ".norm.weight");
-  m.norm_b = LoadVisionF32(get, prefix + ".norm.bias");
-  m.fc1_w = LoadVisionF32(get, prefix + ".linear_fc1.weight");
-  m.fc1_b = LoadVisionF32(get, prefix + ".linear_fc1.bias");
-  m.fc2_w = LoadVisionF32(get, prefix + ".linear_fc2.weight");
-  m.fc2_b = LoadVisionF32(get, prefix + ".linear_fc2.bias");
+  m.norm_w = LoadVisionBf16(get, prefix + ".norm.weight");
+  m.norm_b = LoadVisionBf16(get, prefix + ".norm.bias");
+  m.fc1_w = LoadVisionBf16(get, prefix + ".linear_fc1.weight");
+  m.fc1_b = LoadVisionBf16(get, prefix + ".linear_fc1.bias");
+  m.fc2_w = LoadVisionBf16(get, prefix + ".linear_fc2.weight");
+  m.fc2_b = LoadVisionBf16(get, prefix + ".linear_fc2.bias");
   return m;
 }
 
@@ -449,25 +465,25 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionWeights(
 
   multimodal::Qwen3VLVisionWeights vw;
   const std::string V = "model.visual.";
-  vw.patch_proj_w = LoadVisionF32(get, V + "patch_embed.proj.weight");
-  vw.patch_proj_b = LoadVisionF32(get, V + "patch_embed.proj.bias");
-  vw.pos_embed_w = LoadVisionF32(get, V + "pos_embed.weight");
+  vw.patch_proj_w = LoadVisionBf16(get, V + "patch_embed.proj.weight");
+  vw.patch_proj_b = LoadVisionBf16(get, V + "patch_embed.proj.bias");
+  vw.pos_embed_w = LoadVisionPosEmbedF32(get, V + "pos_embed.weight");
   vw.blocks.resize(static_cast<size_t>(vc.depth));
   for (int64_t l = 0; l < vc.depth; ++l) {
     const std::string p = V + "blocks." + std::to_string(l);
     multimodal::VisionBlockWeights& b = vw.blocks[static_cast<size_t>(l)];
-    b.norm1_w = LoadVisionF32(get, p + ".norm1.weight");
-    b.norm1_b = LoadVisionF32(get, p + ".norm1.bias");
-    b.norm2_w = LoadVisionF32(get, p + ".norm2.weight");
-    b.norm2_b = LoadVisionF32(get, p + ".norm2.bias");
-    b.qkv_w = LoadVisionF32(get, p + ".attn.qkv.weight");
-    b.qkv_b = LoadVisionF32(get, p + ".attn.qkv.bias");
-    b.proj_w = LoadVisionF32(get, p + ".attn.proj.weight");
-    b.proj_b = LoadVisionF32(get, p + ".attn.proj.bias");
-    b.fc1_w = LoadVisionF32(get, p + ".mlp.linear_fc1.weight");
-    b.fc1_b = LoadVisionF32(get, p + ".mlp.linear_fc1.bias");
-    b.fc2_w = LoadVisionF32(get, p + ".mlp.linear_fc2.weight");
-    b.fc2_b = LoadVisionF32(get, p + ".mlp.linear_fc2.bias");
+    b.norm1_w = LoadVisionBf16(get, p + ".norm1.weight");
+    b.norm1_b = LoadVisionBf16(get, p + ".norm1.bias");
+    b.norm2_w = LoadVisionBf16(get, p + ".norm2.weight");
+    b.norm2_b = LoadVisionBf16(get, p + ".norm2.bias");
+    b.qkv_w = LoadVisionBf16(get, p + ".attn.qkv.weight");
+    b.qkv_b = LoadVisionBf16(get, p + ".attn.qkv.bias");
+    b.proj_w = LoadVisionBf16(get, p + ".attn.proj.weight");
+    b.proj_b = LoadVisionBf16(get, p + ".attn.proj.bias");
+    b.fc1_w = LoadVisionBf16(get, p + ".mlp.linear_fc1.weight");
+    b.fc1_b = LoadVisionBf16(get, p + ".mlp.linear_fc1.bias");
+    b.fc2_w = LoadVisionBf16(get, p + ".mlp.linear_fc2.weight");
+    b.fc2_b = LoadVisionBf16(get, p + ".mlp.linear_fc2.bias");
   }
   vw.merger = LoadMerger(get, V + "merger", /*postshuffle=*/false);
   // Qwen3.6-27B has EMPTY deepstack_visual_indexes ⇒ this loop runs zero times

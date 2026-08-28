@@ -5254,25 +5254,45 @@ TEST_CASE("minimax_h3: the encoder GGUF visual.* loader dequantizes the vision t
   CHECK(vw.deepstack_mergers[0].use_postshuffle_norm == true);
   CHECK(static_cast<int64_t>(vw.deepstack_mergers[0].norm_w.size()) == merged);  // post-shuffle
 
-  // DEQUANT CORRECTNESS: an f32 tensor round-trips EXACTLY, a Q8_0 tensor within its
-  // block tolerance, in the SAME flat order — this is the load that the reduced-dim
-  // synthetic gate never exercised on real bytes.
+  // DEQUANT CORRECTNESS: an f32 tensor round-trips EXACTLY, a Q8_0 tensor within
+  // its block tolerance, in the SAME flat order — this is the load that the
+  // reduced-dim synthetic gate never exercised on real bytes.
+  //
+  // The tower's host store is raw bf16 BITS since #1359, so both expectations
+  // are stated at the dtype the store holds. That is NOT a loosening: the
+  // narrowing did not appear, it MOVED — `MakeDevBf16` ran the identical
+  // `vt::F32ToBF16` at upload time before, so the device bytes these tensors
+  // reach the first GEMM as have not changed. Putting `want` through the same
+  // function keeps the f32 arm EXACT (`== 0.0`, no tolerance at all) and keeps
+  // the Q8_0 arm on its own unchanged 5e-3 block bound.
+  auto bf16_of = [](const std::vector<float>& f) {
+    std::vector<float> o(f.size());
+    for (size_t i = 0; i < f.size(); ++i) o[i] = vt::BF16ToF32(vt::F32ToBF16(f[i]));
+    return o;
+  };
+  auto stored_f32 = [](const std::vector<uint16_t>& bits) {
+    std::vector<float> o(bits.size());
+    for (size_t i = 0; i < bits.size(); ++i) o[i] = vt::BF16ToF32(bits[i]);
+    return o;
+  };
   {
-    const std::vector<float>& want = orig[V + "patch_embed.proj.bias"];
-    double e = MaxAbsDiff(vw.patch_proj_b, want.data(), want.size());
+    const std::vector<float> want = bf16_of(orig[V + "patch_embed.proj.bias"]);
+    const std::vector<float> got = stored_f32(vw.patch_proj_b);
+    double e = MaxAbsDiff(got, want.data(), want.size());
     INFO("patch bias f32 exact err=" << e);
     CHECK(e == 0.0);
   }
   {
-    const std::vector<float>& want = orig[V + "blocks.0.attn.qkv.weight"];
+    const std::vector<float> want = bf16_of(orig[V + "blocks.0.attn.qkv.weight"]);
     REQUIRE(vw.blocks[0].qkv_w.size() == want.size());
-    double e = MaxAbsDiff(vw.blocks[0].qkv_w, want.data(), want.size());
+    const std::vector<float> got = stored_f32(vw.blocks[0].qkv_w);
+    double e = MaxAbsDiff(got, want.data(), want.size());
     INFO("qkv Q8_0 dequant err=" << e);
     CHECK(e <= 5e-3);  // Q8_0 block tolerance
     // and it is NON-degenerate: real spread, not all-zeros.
     double s2 = 0.0;
-    for (float f : vw.blocks[0].qkv_w) s2 += double(f) * f;
-    CHECK(std::sqrt(s2 / vw.blocks[0].qkv_w.size()) > 1e-3);
+    for (float f : got) s2 += double(f) * f;
+    CHECK(std::sqrt(s2 / got.size()) > 1e-3);
   }
 
   // The production config the driver uses is the measured H3 vision geometry.

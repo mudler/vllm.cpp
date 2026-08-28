@@ -369,13 +369,21 @@ void OutputProcessor::add_request(const EngineCoreRequest& request,
 
   RequestState state = RequestState::FromNewRequest(
       tokenizer_, request, std::move(prompt), request_index, stream_interval_,
-      std::move(parent_req));
+      parent_req);
   state.queue = std::move(queue);
+  // The fan-out replaces only `request_id` on the child copy
+  // (async_llm.py:394 / llm_engine.py:284), so every child KEEPS the parent's
+  // external_req_id and :551 below files all n internal ids under it. That is
+  // what makes an abort of the id the client holds reach every child. For a
+  // single-sequence request there is no parent and the map stays 1:1.
+  if (parent_req != nullptr) {
+    state.external_req_id = parent_req->external_req_id();
+  }
   const std::string external_req_id = state.external_req_id;
   request_states_[request_id] =
       std::make_unique<RequestState>(std::move(state));
 
-  // :541 Track external_req_id -> [internal_req_id, ...].
+  // :550-551 Track external_req_id -> [internal_req_id, ...].
   external_req_ids_[external_req_id].push_back(request_id);
 }
 
@@ -392,7 +400,8 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     const std::string& req_id = eco.request_id;
     auto it = request_states_.find(req_id);
     if (it == request_states_.end()) {
-      // :609 Ignore output for already-aborted / unknown request.
+      // output_processor.py:618-621 — ignore output for an already-aborted /
+      // unknown request.
       continue;
     }
     RequestState& req_state = *it->second;
@@ -577,10 +586,34 @@ OutputProcessorOutput OutputProcessor::process_outputs(
 
 std::vector<std::string> OutputProcessor::abort_requests(
     const std::vector<std::string>& request_ids, bool produce_final_output) {
-  // output_processor.py:450-510 (T0 1:1 id subset): remove each request and,
-  // for AsyncLLM, enqueue its terminal ABORT RequestOutput before cleanup.
-  std::vector<std::string> request_ids_to_abort;
+  // output_processor.py:459-521: remove each request and, for AsyncLLM, enqueue
+  // its terminal ABORT RequestOutput before cleanup.
+  //
+  // :487-489 first: an incoming id may be an EXTERNAL id standing for n internal
+  // parallel-sampling children, in which case ALL of them are aborted. A
+  // single-sequence request files itself under its own id (:551), so the
+  // resolution is the identity there and this path is unchanged for n == 1.
+  //
+  // DEVIATION: upstream splits internal from external with an `internal` flag.
+  // We have no such flag; an id that is not an external key falls through as
+  // itself, which is how the shutdown sweep (abort_all_requests) passes internal
+  // child ids. Upstream's `elif parent := self.parent_requests.get(...)` arm
+  // (:513-519) serves its internal=True callers only and has no caller here.
+  std::vector<std::string> internal_req_ids;
+  internal_req_ids.reserve(request_ids.size());
   for (const std::string& req_id : request_ids) {
+    auto external_it = external_req_ids_.find(req_id);
+    if (external_it != external_req_ids_.end()) {
+      internal_req_ids.insert(internal_req_ids.end(),
+                              external_it->second.begin(),
+                              external_it->second.end());
+    } else {
+      internal_req_ids.push_back(req_id);
+    }
+  }
+
+  std::vector<std::string> request_ids_to_abort;
+  for (const std::string& req_id : internal_req_ids) {
     auto it = request_states_.find(req_id);
     if (it == request_states_.end()) continue;
     RequestState& req_state = *it->second;

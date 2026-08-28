@@ -291,8 +291,14 @@ All CPU, red-first, focused suites named per case:
   steps needs: device-resident rejection sampling, the propose loop's drafts
   staying on device, the draft-aware `combine_sampled_and_draft_tokens`
   (`num_logits = 1 + k`), and the optimistic `prev_num_draft_len` + deferred
-  correction. Owned by `SPEC-DFLASH2` follow-on; issue to be filed if G3 shows
-  the host-sync bound dominating.
+  correction. Owned by `SPEC-DFLASH2` follow-on. The issue this line said
+  would be filed IS filed:
+  [#2116](https://github.com/mudler/vllm.cpp/issues/2116), scoped by
+  [`dflash2-async-spec-sampler.md`](dflash2-async-spec-sampler.md). It was
+  filed on the mirror argument rather than on G3, and the scoping measurement
+  then found the veto load-bearing on a second count this wave's own comment
+  did not name: `sample_tokens_async` has no verify arm at all. The four
+  pieces above are unchanged and are staged there as A2-1 to A2-5.
 - **A3 — structured output × spec × async.** The multi-row grammar bitmask
   under spec decode is deferred upstream-inventory-wide (porting-inventory
   §6), and `update_draft_token_ids_in_output`'s grammar `validate_tokens` arm

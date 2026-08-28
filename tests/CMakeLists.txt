@@ -912,6 +912,14 @@ vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.
 # Muse Glimmer checkpoint with the wiring gate above (muse_glimmer_tiny_fixture.h)
 # so both ask their question of the same bytes.
 vllm_cpp_add_test(test_tower_skip vllm/models/test_tower_skip.cpp)
+# ENG-MM-INPUT-PIPELINE (#1359): the tower's host STORAGE DTYPE, counted in
+# bytes through both production loaders. Shares the same tiny Muse Glimmer
+# checkpoint for the same reason the skip gate does — the question is what the
+# loader did with THOSE bytes. A token gate cannot see a dtype that is too wide,
+# so this is the only shape of gate that can (specs/vision-tower-dtype-polarity.md).
+vllm_cpp_add_test(test_vision_tower_dtype vllm/models/test_vision_tower_dtype.cpp)
+target_include_directories(test_vision_tower_dtype PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_muse_glimmer_wiring PRIVATE
   MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
 # Muse Glimmer REAL-WEIGHT gate. Loads the released 30B bf16 checkpoint (or a
@@ -954,6 +962,26 @@ vllm_cpp_add_test(test_qwen4_exp_gguf_load_plan
   vllm/models/test_qwen4_exp_gguf_load_plan.cpp)
 target_include_directories(test_qwen4_exp_gguf_load_plan PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# MODEL-MM-QWEN4-EXP W5a (#2031): the `qwen4exp` GGUF WEIGHT LOADER, entered
+# through the production `load_weights` hook. Two instruments: the committed
+# 1224-tensor manifest of the shipped artifact gates the name map and the shape
+# rules with no asset in CI, and a synthetic tiny GGUF gates the VALUES -- the
+# `+1` norm fold and its one `ssm_norm` exception, the V-head reorder,
+# `log(-ssm_a)`, and keep-quant residency including the n-gram gather table.
+# No forward and no KV spec: both still refuse by name, and
+# .agents/specs/qwen4-exp-flash-next.md `## Owed` tracks them.
+vllm_cpp_add_test(test_qwen4_exp_gguf_weights
+  vllm/models/test_qwen4_exp_gguf_weights.cpp)
+target_include_directories(test_qwen4_exp_gguf_weights PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# qwen4_exp*.h are MODEL-PRIVATE headers under src/, not include/vllm/.
+target_include_directories(test_qwen4_exp_gguf_weights PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The released Qwen3.8-Flash-Next config.json, committed by W1: the name-map and
+# shape cases resolve their expectations through it so both sides of every
+# comparison come from the model's author.
+target_compile_definitions(test_qwen4_exp_gguf_weights PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
 
 # Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
 # + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
@@ -1171,6 +1199,9 @@ vllm_cpp_add_test(test_kimi_linear_fold_gate vllm/models/test_kimi_linear_fold_g
 # short convs and q/k L2-norm. Full-model gate is the Kimi-Linear-48B proxy
 # (DGX-blocked); mirrors the DSA lane (.agents/specs/kda-kernel-delta.md).
 vllm_cpp_add_test(test_kimi_kda vllm/models/test_kimi_kda.cpp)
+
+# GLM-5.3-Flash (MODEL-MM-GLM53-FLASH W2) — the KDA arm's numerics.
+vllm_cpp_add_test(test_glm5_next_kda vllm/models/test_glm5_next_kda.cpp)
 
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
@@ -2134,6 +2165,7 @@ if(VLLM_CPP_HIP)
 # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
@@ -2651,6 +2683,10 @@ vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
+# dots3-note W4b-3c (#699): the DSA "Lightning Indexer" selection pair, gated
+# against the W3 host reference `vllm::deepseek_v4::DsaIndexerLogits` /
+# `DsaTopkSelect` that this op family lifts onto `vt::Tensor`.
+vllm_cpp_add_test(test_ops_dsa_indexer vt/test_ops_dsa_indexer.cpp)
 # MLA campaign W5: the FLASH_ATTN MLA prefill (QK 192 / V 128) ...
 vllm_cpp_add_test(test_ops_mla_prefill vt/test_ops_mla_prefill.cpp)
 # ... and the workspace-bounded chunked-context loop (gather + LSE merge).
@@ -3205,6 +3241,27 @@ target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
 target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5b-4 (#2167) — the DEVICE arm of Qwen Sparse Attention:
+# vt::Qwen4ExpQsaCompress and vt::Qwen4ExpQsaGatherAttention, plus the indexer
+# COMPOSED from the vt::DsaIndexerLogits / vt::DsaTopkSelect pair this tree
+# already had, all against the SAME lane-pinned transformers goldens the W4 host
+# reference answers to. Includes a released-config case at 3002 tokens of
+# context, past the 2048 indexer budget below which every candidate is selected.
+# CPU only: no CUDA arm of either op exists. Reaches the model-private
+# qwen4_exp_qsa.h, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_qsa_device vllm/models/test_qwen4_exp_qsa_device.cpp)
+target_include_directories(test_qwen4_exp_qsa_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5b-2 (#2031) — the DEVICE arm of the same stream:
+# vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME
+# lane-pinned goldens the host reference is gated on, so the two arms answer to
+# one oracle rather than to each other, plus a MODEL-WIDTH (hidden_size 2560,
+# hc_count 4, hc_lowrank 320) agreement check the golden shapes cannot make. CPU
+# only: no CUDA arm of this op exists and one written on a CPU host could not be
+# gated. Reaches the model-private `qwen4_exp_hc.h`, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_hc_device vllm/models/test_qwen4_exp_hc_device.cpp)
+target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
@@ -3233,3 +3290,13 @@ vllm_cpp_add_test(test_qwen4_exp_ple vllm/models/test_qwen4_exp_ple.cpp)
 # qwen4_exp_ple.h is a MODEL-PRIVATE header under src/, same arrangement as the
 # dots3-note gates above: W2 ships nothing on the public ABI.
 target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5b-3 (#2156) — the DEVICE arm of the same convolution:
+# vt::Qwen4ExpPleConv against the SAME lane-pinned goldens the W2 host reference
+# is gated on, so the two arms answer to one oracle rather than to each other,
+# plus a MODEL-WIDTH (10240 channels) agreement check the golden shapes cannot
+# make. CPU only: no CUDA arm of this op exists and one written on a CPU host
+# could not be gated. Reaches the model-private `qwen4_exp_ple.h`, hence the
+# src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_ple_device vllm/models/test_qwen4_exp_ple_device.cpp)
+target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}/src)

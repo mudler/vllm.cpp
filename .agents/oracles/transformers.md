@@ -142,3 +142,124 @@ fleet device, and the field means what `## Gateability` says it means.
 
 See [`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md)
 `## Oracles`.
+
+## Lane exception: `glm5_next` (`MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, [#2096](https://github.com/mudler/vllm.cpp/issues/2096))
+
+**This is the SECOND application of the exception the developer accepted on
+2026-08-26, not a new one and not a separately accepted one.** The `qwen4_exp`
+section earlier in this file argues the exception and records the acceptance.
+The argument there is the argument here, unchanged, so this section states what
+is different about this lane and does not re-argue the rule. The `oracle-pin`
+block earlier in this file stays at 5.14.1 and remains the pin for every other
+consumer. If a reviewer holds that each lane needs its own accept-or-reject,
+that is a `NEEDS_DECISION` on this section, and nothing else in the row depends
+on the answer.
+
+`zai-org/GLM-5.3-Flash` declares `Glm5NextForConditionalGeneration` /
+`model_type: glm5_next`. vLLM implements it at no revision, re-verified
+2026-08-27 in the local oracle checkout rather than transcribed:
+`git grep -n "Glm5\|glm5_next" -- vllm/` exits 1 with no output at the parity
+pin `555967922` and at vLLM `origin/main` = `d85708f7a4`, which has already
+moved past the `c71f6f8a81` the row's spec read on 2026-08-26. The same grep for
+`Glm4MoeForCausalLM` at the pin returns a hit, so the search itself works and
+the empty result is absence rather than a failed command.
+[vllm#53906](https://github.com/vllm-project/vllm/pull/53906) "[Model] add
+GLM-5.3-Flash support" is OPEN and unmerged, re-read 2026-08-27. An unmerged
+pull request is not a revision and cannot be pinned, so vLLM supplies nothing
+here. `vllm-omni`, SGLang and llama.cpp implement nothing either;
+[`../specs/glm5-next-flash.md`](../specs/glm5-next-flash.md) `## Oracles`
+carries each search and its result.
+
+**The pin earlier in this file cannot serve this row: 5.14.1 does not contain
+`Glm5Next`.**
+
+### The `glm5_next` lane pin, and how it was bounded
+
+`transformers` **5.16.1**. The implementing commit is `eb4d9e2a64a0`
+([transformers#48342](https://github.com/huggingface/transformers/pull/48342),
+"[Glm 5.3 Flash] GLM 5.3 Flash Support"), merged 2026-08-26T14:26:41Z. `v5.16.1`
+was published 2026-08-26T14:50:01Z, 23 minutes later.
+
+Bounded rather than assumed, because "the release is newer than the merge" is an
+argument and not a check. Re-measured 2026-08-27 by fetching
+`src/transformers/models/glm5_next/modeling_glm5_next.py` at each tag:
+
+| Revision | Published | `modeling_glm5_next.py` |
+|---|---|---|
+| `v5.15.1` | 2026-08-19T10:50:47Z | HTTP **404** (absent) |
+| `v5.16.0` | 2026-08-26T12:35:15Z | HTTP **404** (absent) |
+| `v5.16.1` | 2026-08-26T14:50:01Z | HTTP **200** (present) |
+
+5.16.1 is therefore the FIRST release containing this architecture, which is the
+tightest pin available and the one a lane exception must take. It is also the
+LAST release as of 2026-08-27: `v5.16.2` does not exist, and its 404 is the tag
+missing rather than the file missing, which was separated by fetching `setup.py`
+at both tags (`v5.16.1` HTTP 200, `v5.16.2` HTTP 404). `setup.py` at `v5.16.1`
+declares `version="5.16.1"`, and `models/auto/auto_mappings.py` at that tag
+carries 8 occurrences of `glm5_next`, so the registration landed with the model
+rather than trailing it.
+
+**The `qwen4_exp` lane pins 5.16.0 and this lane pins 5.16.1. Do not tidy one
+onto the other.** `Qwen4Exp` merged 2026-08-26T12:03:40Z, before the 5.16.0 cut
+at 12:35:15Z; `Glm5Next` merged 2026-08-26T14:26:41Z, after it. Two lanes, two
+releases, one day apart. Each lane takes the first release that contains its own
+architecture, which is what a lane pin is for.
+
+```oracle-pin-lane
+id = transformers
+lane = glm5_next
+role = secondary
+scope = the algorithm for model_type glm5_next ONLY; every other model, processor, feature extractor and tokenizer stays on the pin above
+pin = 5.16.1
+pin_label = 5.16.1
+pinned_on = 2026-08-27
+accepted_by = precedent, the qwen4_exp lane exception the developer accepted 2026-08-26; NOT a fresh acceptance
+expires = when vLLM registers glm5_next
+gateable = no
+gateable_reason = no oracle has ever run this model, and none can on this fleet; the reference needs 305.78 GiB (FP8) or 598.5 GiB (BF16) resident and the largest reachable device is dgx:gpu0 at ~119.63 GiB. Owed as O1 by https://github.com/mudler/vllm.cpp/issues/1998
+owner_row = MODEL-MM-glm5-next-glm5-next-for-conditional-generation
+issue = https://github.com/mudler/vllm.cpp/issues/2096
+evidence = .agents/specs/glm5-next-flash.md
+```
+
+Its scope and expiry, both binding:
+
+- It covers `model_type: glm5_next` and nothing else. Every other model,
+  processor, feature extractor and tokenizer continues to resolve against
+  5.14.1.
+- It supplies the **algorithm** only. The optimized form of each primitive still
+  mirrors vLLM, which is the polarity AGENTS.md sets and which a missing model
+  registration does not suspend.
+- **It expires the moment vLLM registers `glm5_next`.** At that point the row
+  reconciles onto vLLM and `transformers` demotes to the preprocessing role it
+  holds everywhere else in this file. That is a stop condition in the row's
+  spec, not a reminder.
+
+**`gateable = no`, and unlike the `qwen4_exp` lane this one can never become
+`yes` on this fleet.** The bar AGENTS.md sets is that the oracle demonstrably
+builds and runs THE MODEL. The published artifacts are 305.78 GiB (FP8) and
+598.5 GiB (BF16); the largest device this project can reach is `dgx:gpu0` at
+~119.63 GiB of unified memory. No device here, and no combination of them, can
+execute the reference implementation. The row's `## Gates` builds a tiny-shape
+reference oracle on CPU from this pin, which is a real oracle for the NUMERICS
+of each component and is NOT gateability for the MODEL. Do not promote this pin
+to `gateable = yes` by editing the line.
+
+**The version string is UNMEASURED.** 5.16.1 is the release that provably
+contains the model, established by fetching its source over HTTP. It is not a
+`transformers.__version__` read off a running oracle. Resolving the runtime
+string is owed to the first wave that stands the tiny-shape oracle up, which is
+W2.
+
+**No gate reads the block above, and W0 measured that rather than assuming it.**
+`scripts/check-oracle-pins.py` matches ```` ^```oracle-pin\n ````, so an
+`oracle-pin-lane` fence does not match it and no lane block in this file is
+parsed by any checker in the tree. The checker's `--self-test` corpus and
+`tests/scripts/test_check_oracle_pins.py` name no lane case. A lane pin is
+therefore a documentary record whose fields go unchecked, including `pin`,
+`gateable` and `expires`. The row records this as O13 and
+[#2099](https://github.com/mudler/vllm.cpp/issues/2099) owns it. Read "the
+checker accepts the lane pin" as "the checker stays green", never as "the
+checker validated these fields".
+
+See [`../specs/glm5-next-flash.md`](../specs/glm5-next-flash.md) `## Oracles`.

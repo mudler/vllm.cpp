@@ -37,21 +37,37 @@
 #                 `vision_config` — 3 top-level + 24 blocks x 12 + 6 merger +
 #                 3 x 6 deepstack = 315, with no vision tensor unread and no
 #                 read name absent. Every one of those reads goes through
-#                 `LoadVisionF32` (qwen3_vl.cpp:79-90), which VT_CHECKs
-#                 `dtype == "BF16"` and returns `std::vector<float>`, and every
-#                 field of `Qwen3VLVisionWeights` /`VisionBlockWeights` /
-#                 `VisionMergerWeights` (qwen3_vl_vision.h:60-82) is a
-#                 `std::vector<float>`. So the widening is not partial: the
-#                 resident cost is 2 x 830695424 = 1661390848 B = 1.5473 GiB.
+#                 `LoadVisionBf16` (qwen3_vl.cpp:85-95), which VT_CHECKs
+#                 `dtype == "BF16"` and returns `std::vector<uint16_t>`, and
+#                 every field of `Qwen3VLVisionWeights` /`VisionBlockWeights` /
+#                 `VisionMergerWeights` (qwen3_vl_vision.h:73-104) is a
+#                 `std::vector<uint16_t>` except `pos_embed_w`. So there is no
+#                 widening left to pay for here: the resident cost is
+#                 830695424 B = 0.7736 GiB, the on-disk figure. The one f32
+#                 exception, `pos_embed_w`, adds 4718592 B that
+#                 TOWER_RESIDENT_BYTES deliberately does NOT carry — the
+#                 threshold is a `>=` floor, so omitting 0.57% of the tower can
+#                 only make it harder to pass.
 #                 Workload: load to `/health` ONLY — see the note below.
 #
-# THE WIDENING IS ITSELF A DEFECT (#1359), and it is HALF of what either
-# threshold measures. On both kinds the resident figure is twice the on-disk
-# one because the tower is held as host f32 where the checkpoint ships bf16.
-# A large saving here is therefore partly a large widening, and is NOT a
-# statement that the tower is that big. #1359 is filed and owed; narrowing the
-# storage would change the very quantity these thresholds are stated against,
-# which is why it is not done first.
+# THE WIDENING WAS ITSELF A DEFECT (#1359), and on muse-glimmer it still is —
+# which is HALF of what that kind's threshold measures. The polarity is now
+# PER KIND, which is why TOWER_RESIDENT_BYTES and TOWER_RESIDENT_NOTE are set
+# per kind rather than by one blanket `* 2`:
+#
+#   qwen3-vl      FIXED. The tower is stored in the checkpoint's own bf16, so
+#                 resident == on disk. The saving this harness reports fell
+#                 from the 1655791616 B (1.542 GiB) measured on thor:gpu0 on
+#                 2026-08-24 to about 830695424 B (0.7736 GiB), and that fall
+#                 is CORRECT: the flag now frees the tower the checkpoint ships
+#                 instead of the tower plus our widening. The 2026-08-24
+#                 threshold of 1495251763 B is SUPERSEDED and must not be
+#                 applied to a rerun.
+#   muse-glimmer  STILL WIDENS to host f32, so resident is twice on disk and a
+#                 large saving here is still partly a large widening rather
+#                 than a statement that the tower is that big. Blocked on
+#                 #2166, which owns the golden regeneration its `compute_dtype
+#                 = kF32` per-stage gate needs. #1359 stays OPEN for this half.
 #
 # WHY qwen3-vl RUNS NO COMPLETION. It cannot:
 # `ForwardQwen3VLForConditionalGeneration` (qwen3_vl_registry.cpp:124-130)
@@ -280,6 +296,7 @@ BASELINE_REF="edbc47ce0"   # pre-L3 head, for the second half of the threshold
 # Set by `declare_model`.
 TOWER_ONDISK_BYTES=""
 TOWER_RESIDENT_BYTES=""
+TOWER_RESIDENT_NOTE=""
 SERVED_MODEL_NAME=""
 WORKLOAD=""
 
@@ -426,9 +443,38 @@ declare_model() {
       return 2
       ;;
   esac
-  # The loader widens bf16 -> host f32 on BOTH kinds (#1359). This factor is the
-  # defect, not an estimate: see the header.
-  TOWER_RESIDENT_BYTES=$((TOWER_ONDISK_BYTES * 2))
+  # What the tower actually OCCUPIES once loaded, which is the quantity the skip
+  # frees — not what the checkpoint stores.
+  #
+  # These differ PER KIND now, and the difference is #1359. The Qwen3-VL loader
+  # stores the tower in the checkpoint's own bf16, so resident == on disk. The
+  # Muse Glimmer loader still widens bf16 -> host f32, so resident is twice on
+  # disk. That is not two policies: it is one defect, fixed on one of the two
+  # kinds. The Muse Glimmer half is blocked on its `compute_dtype = kF32`
+  # per-stage gate, which computes on the stored values and whose torch
+  # reference would have to move with it (#2166).
+  #
+  # The Qwen3-VL saving this harness reports therefore FALLS by about half — the
+  # 1,655,791,616 B (1.542 GiB) measured on `thor:gpu0` 2026-08-24 becomes about
+  # 830,695,424 B (0.7736 GiB) — and that is CORRECT, not a regression. The flag
+  # now frees the tower the checkpoint ships instead of the tower plus our
+  # widening. The threshold below moves with it, and the pre-declaration that
+  # authorises the move is `.agents/specs/vision-tower-dtype-polarity.md` §6.2.
+  #
+  # TOWER_RESIDENT_NOTE travels WITH the number, because a fixed parenthetical
+  # that said "2 x ... on disk" printed "830695424 B (2 x 830695424 B on disk)"
+  # on the fixed kind — a self-contradiction, in the evidence log of the very
+  # run it annotates.
+  case "$MODEL_KIND" in
+    qwen3-vl)
+      TOWER_RESIDENT_BYTES=$TOWER_ONDISK_BYTES
+      TOWER_RESIDENT_NOTE="== $TOWER_ONDISK_BYTES B on disk; the tower is stored in the checkpoint's own bf16 since #1359"
+      ;;
+    muse-glimmer)
+      TOWER_RESIDENT_BYTES=$((TOWER_ONDISK_BYTES * 2))
+      TOWER_RESIDENT_NOTE="2 x $TOWER_ONDISK_BYTES B on disk; the x2 is #1359, still open on this kind"
+      ;;
+  esac
   return 0
 }
 
@@ -1048,7 +1094,7 @@ if [ -n "$DRY_RUN" ]; then
   echo "repo            $REPO"
   echo "model kind      $MODEL_KIND"
   echo "workload        $WORKLOAD"
-  echo "resident tower  $TOWER_RESIDENT_BYTES B (2 x $TOWER_ONDISK_BYTES B on disk; the x2 is #1359)"
+  echo "resident tower  $TOWER_RESIDENT_BYTES B ($TOWER_RESIDENT_NOTE)"
   echo
   echo "planned build — one directory per arm, same commit:"
   for arm in a b; do
@@ -1111,7 +1157,7 @@ if [ -n "$REPORT_ONLY" ]; then
   fi
   declare_model "$MODEL_KIND" || exit 2
   echo "model kind      $MODEL_KIND"
-  echo "resident tower  $TOWER_RESIDENT_BYTES B (2 x $TOWER_ONDISK_BYTES B on disk; the x2 is #1359)"
+  echo "resident tower  $TOWER_RESIDENT_BYTES B ($TOWER_RESIDENT_NOTE)"
   report "$REPORT_ONLY"
   exit $?
 fi
@@ -1184,7 +1230,7 @@ echo "checkpoint src  $SOURCE_CHECKPOINT"
 echo "checkpoint fs   $(stat -f -c %T "$CHECKPOINT" 2>/dev/null || echo unknown)"
 echo "model kind      $MODEL_KIND"
 echo "workload        $WORKLOAD"
-echo "resident tower  $TOWER_RESIDENT_BYTES B (2 x $TOWER_ONDISK_BYTES B on disk; the x2 is #1359)"
+echo "resident tower  $TOWER_RESIDENT_BYTES B ($TOWER_RESIDENT_NOTE)"
 echo "checkpoint root USED: the path above. .env's CHECKPOINT_ROOT was NOT consulted."
 echo "host            $(uname -a)"
 echo "load            $(cat /proc/loadavg)"

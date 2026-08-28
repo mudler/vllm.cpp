@@ -78,16 +78,29 @@ std::vector<float> W(const std::string& dir, const std::string& name) {
   return ReadF32(dir + "/" + name + ".bin");
 }
 
+// The same dumped weight, narrowed to the tower's bf16 store (#1359). Not a
+// precision change: `PrepareVisionDeviceWeights` put every one of these through
+// `vt::F32ToBF16` in `MakeDevBf16` before the first GEMM, so the device bytes are
+// the ones this dump always produced. `pos_embed.weight` is the ONE weight that
+// stays host f32 and therefore keeps using `W` — the host bilinear interpolation
+// reads it before anything narrows.
+std::vector<uint16_t> WBits(const std::string& dir, const std::string& name) {
+  const std::vector<float> f = W(dir, name);
+  std::vector<uint16_t> o(f.size());
+  for (size_t i = 0; i < f.size(); ++i) o[i] = vt::F32ToBF16(f[i]);
+  return o;
+}
+
 VisionMergerWeights LoadMerger(const std::string& dir, const std::string& prefix,
                                bool postshuffle) {
   VisionMergerWeights m;
   m.use_postshuffle_norm = postshuffle;
-  m.norm_w = W(dir, prefix + ".norm.weight");
-  m.norm_b = W(dir, prefix + ".norm.bias");
-  m.fc1_w = W(dir, prefix + ".linear_fc1.weight");
-  m.fc1_b = W(dir, prefix + ".linear_fc1.bias");
-  m.fc2_w = W(dir, prefix + ".linear_fc2.weight");
-  m.fc2_b = W(dir, prefix + ".linear_fc2.bias");
+  m.norm_w = WBits(dir, prefix + ".norm.weight");
+  m.norm_b = WBits(dir, prefix + ".norm.bias");
+  m.fc1_w = WBits(dir, prefix + ".linear_fc1.weight");
+  m.fc1_b = WBits(dir, prefix + ".linear_fc1.bias");
+  m.fc2_w = WBits(dir, prefix + ".linear_fc2.weight");
+  m.fc2_b = WBits(dir, prefix + ".linear_fc2.bias");
   return m;
 }
 
@@ -111,25 +124,25 @@ TEST_CASE("qwen3vl_vision_tower_faithful_vs_vllm_0_25_0") {
 
   // --- weights --------------------------------------------------------------
   Qwen3VLVisionWeights w;
-  w.patch_proj_w = W(wdir, "patch_embed.proj.weight");
-  w.patch_proj_b = W(wdir, "patch_embed.proj.bias");
+  w.patch_proj_w = WBits(wdir, "patch_embed.proj.weight");
+  w.patch_proj_b = WBits(wdir, "patch_embed.proj.bias");
   w.pos_embed_w = W(wdir, "pos_embed.weight");
   w.blocks.resize(static_cast<size_t>(cfg.depth));
   for (int64_t l = 0; l < cfg.depth; ++l) {
     const std::string p = "blocks." + std::to_string(l);
     VisionBlockWeights& b = w.blocks[static_cast<size_t>(l)];
-    b.norm1_w = W(wdir, p + ".norm1.weight");
-    b.norm1_b = W(wdir, p + ".norm1.bias");
-    b.norm2_w = W(wdir, p + ".norm2.weight");
-    b.norm2_b = W(wdir, p + ".norm2.bias");
-    b.qkv_w = W(wdir, p + ".attn.qkv.weight");
-    b.qkv_b = W(wdir, p + ".attn.qkv.bias");
-    b.proj_w = W(wdir, p + ".attn.proj.weight");
-    b.proj_b = W(wdir, p + ".attn.proj.bias");
-    b.fc1_w = W(wdir, p + ".mlp.linear_fc1.weight");
-    b.fc1_b = W(wdir, p + ".mlp.linear_fc1.bias");
-    b.fc2_w = W(wdir, p + ".mlp.linear_fc2.weight");
-    b.fc2_b = W(wdir, p + ".mlp.linear_fc2.bias");
+    b.norm1_w = WBits(wdir, p + ".norm1.weight");
+    b.norm1_b = WBits(wdir, p + ".norm1.bias");
+    b.norm2_w = WBits(wdir, p + ".norm2.weight");
+    b.norm2_b = WBits(wdir, p + ".norm2.bias");
+    b.qkv_w = WBits(wdir, p + ".attn.qkv.weight");
+    b.qkv_b = WBits(wdir, p + ".attn.qkv.bias");
+    b.proj_w = WBits(wdir, p + ".attn.proj.weight");
+    b.proj_b = WBits(wdir, p + ".attn.proj.bias");
+    b.fc1_w = WBits(wdir, p + ".mlp.linear_fc1.weight");
+    b.fc1_b = WBits(wdir, p + ".mlp.linear_fc1.bias");
+    b.fc2_w = WBits(wdir, p + ".mlp.linear_fc2.weight");
+    b.fc2_b = WBits(wdir, p + ".mlp.linear_fc2.bias");
   }
   w.merger = LoadMerger(wdir, "merger", /*postshuffle=*/false);
   for (size_t i = 0; i < cfg.deepstack_visual_indexes.size(); ++i)

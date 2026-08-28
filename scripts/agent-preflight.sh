@@ -400,6 +400,24 @@ else
     "numpy is not importable here, and the tool this suite exercises needs it." \
     "CI installs python3-numpy and runs the same suite."
 fi
+# THE ABSOLUTE-REFERENCE SUITE (#1854), registered in the SAME change that adds
+# it, because the paragraph above is the record of what happens otherwise: that
+# suite "ran on NO lane at all until now", while its spec registered it as a
+# gate. This one exercises the half of the same tool that CHECKS rather than
+# reports, so a lane that ran only the older suite would leave the new bound
+# unexecuted while the tool it lives in looked covered.
+#
+# Same numpy condition and the same SKIP-never-ok discipline. One case inside it
+# also needs ffmpeg, to decode the committed reference mp4; that case skips
+# itself with its own reason rather than the whole suite, because the other
+# eighteen need neither.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_absolute_reference" python3 tests/scripts/test_ltx25_absolute_reference.py
+else
+  skip "test_ltx25_absolute_reference" \
+    "numpy is not importable here, and the tool this suite exercises needs it." \
+    "CI installs python3-numpy and runs the same suite."
+fi
 # THE GLM-5.3-Flash GGUF CONVERTER (#2011). Same shape and the same one
 # dependency: `scripts/convert-glm5-next-gguf.py` deliberately does not use
 # gguf-py -- upstream has no `glm5_next` and, decisively, `gguf.quants.Q2_K`

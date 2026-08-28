@@ -34,7 +34,7 @@ set is swept over every tracked file, not listed: the query is in the
 | Flips first | Verdict | Exposure |
 |---|---|---|
 | 1 | Vulkan `BENCH-VK-LLAMA` decode 4.36 vs 4.35, `MET` | 0.23% margin inside a 0.69% 7-leg spread. Its own source calls it "a narrow pass, not a comfortable one", so any move can flip it. The README states it as "matches" |
-| 2 | Muse Glimmer in128 prefill `1.023x` (also `STATUS.md`) | 2.3% margin inside our own arm's 4.5% leg spread, n=4. Its denominator is already stock `7044859`, 84 commits from `b10451`, so the noise floor is what exposes it |
+| 2 | Muse Glimmer in128 prefill `1.023x` (also in [At a glance](at-a-glance.md)) | 2.3% margin inside our own arm's 4.5% leg spread, n=4. Its denominator is already stock `7044859`, 84 commits from `b10451`, so the noise floor is what exposes it |
 | 3 | This table's peak memory `1.01x` PARITY and decode `0.97x` tie | ties by declaration, not wins. A denominator that moves at all in llama.cpp's favour turns both into recorded gaps |
 | 4 | keep-f16's `1.01x` RSS and "prefill `1.18x` AHEAD", quoted in product code for `VT_GGUF_KEEP_F16` default ON | buys 1.05 GiB of peak RSS (3.885 to 2.832) for ~9% prefill (224 to 204 tok/s) and ~1.4% decode, tokens identical. **Decided 2026-08-17: the default stays ON on our own arms, so it needs no re-take.** Both ratios do |
 | 5 | `KERNEL-GEMM-CPU-TILED` NEON vs stock ggml sgemm, "at parity, ahead on 4 of 6 shapes" | off this page, in the kernel matrix. Bands overlap, 216-242 vs 208-215 GFLOP/s, and one shape is already behind |

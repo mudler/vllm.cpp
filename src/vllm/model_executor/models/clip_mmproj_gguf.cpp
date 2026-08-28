@@ -196,12 +196,23 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromClipMmproj(
   std::set<std::string> present;
   for (const GgufTensorInfo& info : gguf.Tensors()) present.insert(info.name);
   auto has = [&](const std::string& name) { return present.count(name) != 0; };
-  auto load = [&](const std::string& name) -> std::vector<float> {
+  auto load_f32 = [&](const std::string& name) -> std::vector<float> {
     VT_CHECK(has(name), "clip mmproj gguf: missing tensor " + name +
                             " (is this a " + kClipProjectorQwen3VL +
                             " projector?)");
     const GgufTensorInfo& info = gguf.Get(name);
     return DequantGgufRowToF32(info.ggml_type, info.data, Numel(info));
+  };
+  // The tower's host store is bf16 bits (#1359). The dequantized f32 therefore
+  // narrows ONCE here rather than once per upload inside `MakeDevBf16`: same
+  // `vt::F32ToBF16`, same input, same output, so the device bytes do not move.
+  // Writing a second, truncating narrow here instead would change this tower's
+  // numbers and no token gate would see it.
+  auto load = [&](const std::string& name) {
+    const std::vector<float> f = load_f32(name);
+    std::vector<uint16_t> out(f.size());
+    for (size_t i = 0; i < f.size(); ++i) out[i] = vt::F32ToBF16(f[i]);
+    return out;
   };
 
   multimodal::Qwen3VLVisionWeights vw;
@@ -256,11 +267,11 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromClipMmproj(
            std::string("clip mmproj gguf: ") + kTnPatchEmbd + " has out=" +
                std::to_string(out) + " but clip.vision.embedding_length is " +
                std::to_string(cfg.hidden_size));
-  const std::vector<float> w0 = load(kTnPatchEmbd);
-  const std::vector<float> w1 = load(kTnPatchEmbd1);
+  const std::vector<uint16_t> w0 = load(kTnPatchEmbd);
+  const std::vector<uint16_t> w1 = load(kTnPatchEmbd1);
   const int64_t plane = cfg.patch_size * cfg.patch_size;
   const int64_t tp = cfg.temporal_patch_size;
-  vw.patch_proj_w.assign(static_cast<size_t>(out * spatial * tp), 0.0F);
+  vw.patch_proj_w.assign(static_cast<size_t>(out * spatial * tp), uint16_t{0});
   for (int64_t o = 0; o < out; ++o) {
     for (int64_t c = 0; c < cfg.in_channels; ++c) {
       const int64_t src = (o * cfg.in_channels + c) * plane;
@@ -274,7 +285,10 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromClipMmproj(
     }
   }
   vw.patch_proj_b = load(kTnPatchBias);
-  vw.pos_embed_w = load(kTnPosEmbd);
+  // The pos-embed table stays host f32: `VisionPosEmbedInterpolate` gathers and
+  // sums it before anything narrows, and on THIS path the dequantized value is a
+  // genuine f32 that narrowing would truncate (qwen3_vl_vision.h, `pos_embed_w`).
+  vw.pos_embed_w = load_f32(kTnPosEmbd);
 
   // ── The blocks ────────────────────────────────────────────────────────────
   // qwen3vl reads a MERGED qkv (clip.cpp reads TN_ATTN_QKV and

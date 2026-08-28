@@ -117,6 +117,13 @@ TEST_CASE("clip mmproj: the two patch-embedding halves INTERLEAVE into one conv3
   // t = 1 INSIDE each channel's p*p block. A concatenation ([all of half 0]
   // then [all of half 1]) has the same size and the same multiset of values, so
   // only a per-position check separates them.
+  //
+  // The store is raw bf16 BITS since #1359, so the expectation is the fixture's
+  // value put through the SAME `vt::F32ToBF16` the loader uses and the check is
+  // EXACT rather than an Approx band. Stronger than the f32 Approx it replaces:
+  // no tolerance is left for a misplaced value to hide in. It is also the arm
+  // that catches a second, truncating narrow being written into this loader,
+  // which would move this tower's numbers with no token gate to see it.
   int64_t checked = 0;
   for (int64_t o = 0; o < d.hidden; ++o) {
     for (int64_t c = 0; c < d.channels; ++c) {
@@ -124,9 +131,9 @@ TEST_CASE("clip mmproj: the two patch-embedding halves INTERLEAVE into one conv3
       const int64_t dst = (o * d.channels + c) * cfg.temporal_patch_size * plane;
       for (int64_t i = 0; i < plane; ++i) {
         CHECK(w.patch_proj_w[static_cast<size_t>(dst + i)] ==
-              doctest::Approx(clip_fixture::PatchHalf0(src + i)).scale(0.0));
+              vt::F32ToBF16(clip_fixture::PatchHalf0(src + i)));
         CHECK(w.patch_proj_w[static_cast<size_t>(dst + plane + i)] ==
-              doctest::Approx(clip_fixture::PatchHalf1(src + i)).scale(0.0));
+              vt::F32ToBF16(clip_fixture::PatchHalf1(src + i)));
         checked += 2;
       }
     }
@@ -151,19 +158,21 @@ TEST_CASE("clip mmproj: every block and merger tensor lands in its own slot") {
     const float base = static_cast<float>(l) * 1000.0F;
     // The fixture gives each tensor its own base constant, so a swapped pair
     // (ln1 vs ln2, ffn_up vs ffn_down, qkv vs out) fails here rather than
-    // merely being the wrong size.
-    CHECK(b.norm1_w[0] == doctest::Approx(base + 1.0F).scale(0.0));
-    CHECK(b.norm1_b[0] == doctest::Approx(base + 2.0F).scale(0.0));
-    CHECK(b.norm2_w[0] == doctest::Approx(base + 3.0F).scale(0.0));
-    CHECK(b.norm2_b[0] == doctest::Approx(base + 4.0F).scale(0.0));
-    CHECK(b.qkv_w[0] == doctest::Approx(base + 5.0F).scale(0.0));
-    CHECK(b.qkv_b[0] == doctest::Approx(base + 6.0F).scale(0.0));
-    CHECK(b.proj_w[0] == doctest::Approx(base + 7.0F).scale(0.0));
-    CHECK(b.proj_b[0] == doctest::Approx(base + 8.0F).scale(0.0));
-    CHECK(b.fc1_w[0] == doctest::Approx(base + 9.0F).scale(0.0));
-    CHECK(b.fc1_b[0] == doctest::Approx(base + 10.0F).scale(0.0));
-    CHECK(b.fc2_w[0] == doctest::Approx(base + 11.0F).scale(0.0));
-    CHECK(b.fc2_b[0] == doctest::Approx(base + 12.0F).scale(0.0));
+    // merely being the wrong size. The store is raw bf16 BITS since #1359, so
+    // the expectation goes through the SAME `vt::F32ToBF16` the loader uses and
+    // the comparison is EXACT — no Approx band for a swapped slot to hide in.
+    CHECK(b.norm1_w[0] == vt::F32ToBF16(base + 1.0F));
+    CHECK(b.norm1_b[0] == vt::F32ToBF16(base + 2.0F));
+    CHECK(b.norm2_w[0] == vt::F32ToBF16(base + 3.0F));
+    CHECK(b.norm2_b[0] == vt::F32ToBF16(base + 4.0F));
+    CHECK(b.qkv_w[0] == vt::F32ToBF16(base + 5.0F));
+    CHECK(b.qkv_b[0] == vt::F32ToBF16(base + 6.0F));
+    CHECK(b.proj_w[0] == vt::F32ToBF16(base + 7.0F));
+    CHECK(b.proj_b[0] == vt::F32ToBF16(base + 8.0F));
+    CHECK(b.fc1_w[0] == vt::F32ToBF16(base + 9.0F));
+    CHECK(b.fc1_b[0] == vt::F32ToBF16(base + 10.0F));
+    CHECK(b.fc2_w[0] == vt::F32ToBF16(base + 11.0F));
+    CHECK(b.fc2_b[0] == vt::F32ToBF16(base + 12.0F));
     // qwen3vl carries a MERGED qkv; the tower reads [3*hidden, hidden].
     CHECK(static_cast<int64_t>(b.qkv_w.size()) == 3 * d.hidden * d.hidden);
     CHECK(static_cast<int64_t>(b.qkv_b.size()) == 3 * d.hidden);
@@ -174,12 +183,12 @@ TEST_CASE("clip mmproj: every block and merger tensor lands in its own slot") {
   }
 
   // `v.post_ln` is the MERGER's norm, applied before the merge reshape.
-  CHECK(w.merger.norm_w[0] == doctest::Approx(21.0F).scale(0.0));
-  CHECK(w.merger.norm_b[0] == doctest::Approx(22.0F).scale(0.0));
+  CHECK(w.merger.norm_w[0] == vt::F32ToBF16(21.0F));
+  CHECK(w.merger.norm_b[0] == vt::F32ToBF16(22.0F));
   CHECK(static_cast<int64_t>(w.merger.norm_w.size()) == d.hidden);
   // `mm.0` -> fc1, `mm.2` -> fc2. There is no `mm.1` in this export.
-  CHECK(w.merger.fc1_w[0] == doctest::Approx(31.0F).scale(0.0));
-  CHECK(w.merger.fc2_w[0] == doctest::Approx(33.0F).scale(0.0));
+  CHECK(w.merger.fc1_w[0] == vt::F32ToBF16(31.0F));
+  CHECK(w.merger.fc2_w[0] == vt::F32ToBF16(33.0F));
   const int64_t merged = d.hidden * d.merge * d.merge;
   CHECK(static_cast<int64_t>(w.merger.fc1_w.size()) == merged * merged);
   CHECK(static_cast<int64_t>(w.merger.fc2_w.size()) == d.out_hidden * merged);

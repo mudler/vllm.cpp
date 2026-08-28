@@ -796,9 +796,15 @@ the author's estimate of reviewable diff, not a budget.
 ### W0 — records and the lane oracle pin (CPU, small)
 
 Write `.agents/oracles/transformers.md`'s lane-scoped `v5.16.1` pin for this row
-with `gateable = no` and the issue that owes the measurement. Verify
-`scripts/check-oracle-pins.py` accepts the shape. **Deliverable:** the pin and
-nothing else. **Exclusion:** no model code. **Gate:** `agent-preflight.sh` green.
+with `gateable = no` and the issue that owes the measurement. **Measure what
+`scripts/check-oracle-pins.py` reads of that block rather than assuming it reads
+anything: W0 measured that it reads nothing.** The checker's `BLOCK` regex is
+```` ^```oracle-pin\n ````, so an `oracle-pin-lane` fence never matches it and
+the lane pin is unchecked prose (**O13**,
+[#2099](https://github.com/mudler/vllm.cpp/issues/2099)). **Deliverable:** the
+pin and nothing else. **Exclusion:** no model code, and no checker. **Gate:**
+`agent-preflight.sh` green, which is the whole of W0's gate: the checker stays
+at exit 0 whether the lane block is correct, corrupt or deleted outright.
 **Stop:** if the checker refuses a second lane pin, return `NEEDS_DECISION`
 rather than editing the checker.
 
@@ -868,7 +874,7 @@ it is not `> 0`. The two validators are exact complements over this field, and
 there is no value that satisfies both. W1 mirrors upstream and accepts `0`;
 W3 owns making the MLA block agree.
 
-### W2 — the KDA arm's numerics (CPU, medium)
+### W2 — the KDA arm's numerics (CPU, medium) — [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
 
 Port `Glm5NextTextForgetGate`'s **sigmoid branch**, the strict-fp32
 `RMSNormGated`, and `l2norm`, as portable host references with an independent
@@ -946,7 +952,7 @@ unmodified `Glm5NextTextHyperConnection.forward` and
 under any other version. DeepSeek-V4's mHC is inert: its two files are
 byte-identical to the base by sha256 and `test_deepseek_v4_mhc`'s 125 assertion
 lines are byte-identical before and after. **Not reached from a production entry
-point — see O13.**
+point — see O16.**
 
 ### W5 — MoE, the decoder layer, and the assembled text forward (GPU, large)
 
@@ -1111,7 +1117,7 @@ reference implementation's own output.
 
 | wave | gate | CPU or GPU |
 |---|---|---|
-| W0 | `check-oracle-pins.py` accepts the lane pin; preflight green | CPU |
+| W0 | preflight green, and that is the whole gate: NO checker parses an `oracle-pin-lane` block, so nothing validates the lane pin's fields (**O13**, [#2099](https://github.com/mudler/vllm.cpp/issues/2099)) | CPU |
 | W1 | registry resolve, config descent, refuse-by-name; architecture count +1; a `glm5next` GGUF reaches its OWN builder through `LoadedEngine::FromModelDir`; preflight | CPU |
 | W2 | tiny-shape forget-gate / gated-norm / l2norm goldens; RED-first against the softplus branch | CPU |
 | W3 | NoPE MLA accept+refuse; k-pool selection at context **> `index_topk` = 2048**; SACRED inertness on DeepSeek-V2/V3, Kimi-Linear, GLM-4.7-Flash goldens byte-identical | GPU |
@@ -1425,15 +1431,53 @@ Debts this row carries, each visible rather than waived:
   the relaxation; `test_glm5_next_scaffold.cpp` pins the refusal as a live fact
   so W3 cannot land the geometry without also moving the pin.
   [#2067](https://github.com/mudler/vllm.cpp/issues/2067) records it.
-- **O12 — W0's transformers lane pin is still unwritten, and no issue owns it.**
-  `.agents/oracles/transformers.md` pins `5.14.1` and carries a lane exception
-  for `qwen4_exp` @ `5.16.0` only. There is no `glm5_next` lane block, so every
-  wave that cites `v5.16.1` — W1 included — cites a revision the oracle registry
-  does not record. §D7 and §W0 both state the deliverable; this entry is what
-  puts it on a record surface a checker reads. W0 owns it and does not advance
-  the registry pin. [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+- **O12 — DISCHARGED by W0 ([#2096](https://github.com/mudler/vllm.cpp/issues/2096)).**
+  `.agents/oracles/transformers.md` now carries a `glm5_next` lane block at
+  `transformers` `5.16.1`, with `gateable = no`, the reason, `owner_row`, and
+  the issue that owes the measurement. The registry pin stays at `5.14.1` and
+  `.agents/upstream-sync.md` is untouched. Every wave that cites `v5.16.1` — W1
+  included — now cites a revision the oracle registry records. **One clause of
+  this entry was wrong and O13 replaces it:** the lane block is NOT "a record
+  surface a checker reads". W0 measured that no checker parses an
+  `oracle-pin-lane` fence.
+- **O13 — a lane pin is unchecked prose, and W0 measured it rather than
+  assuming it.** `scripts/check-oracle-pins.py` matches `^```oracle-pin\n`, so
+  an `oracle-pin-lane` fence never matches and no checker in this tree parses
+  either lane block in `.agents/oracles/transformers.md`. Corrupting this row's
+  lane `pin`, `gateable` or `pinned_on`, and deleting the whole lane block,
+  each leave the checker at exit 0; corrupting the registry `oracle-pin` block
+  reds it. Read W0's gate in §Gates as "the checker stayed green", never as
+  "the checker validated these fields". Not repaired in flow: W0's scope
+  excludes every checker, and teaching one to parse a lane block is a semantic
+  checker change that AGENTS.md requires to carry its own spec, a red-before
+  mutation, and a decision about which keys a lane record requires.
+  [#2099](https://github.com/mudler/vllm.cpp/issues/2099) owns it.
+- **O14 — `vt::KdaChunkPrefill` cannot serve this model, so both KDA paths run
+  the recurrence.** The chunked prefill op takes the RAW gate projection and
+  FUSES the gate, `-exp(a_log)*softplus(g_raw + dt_bias)`, inside the vendored
+  FLA Triton-AOT cubins (`include/vt/ops.h`) and inside its CPU reference
+  (`src/vt/cpu/cpu_ops.cpp:1779-1786`). That is the SOFTPLUS branch.
+  GLM-5.3-Flash needs the sigmoid branch, and no `(a_log, dt_bias, g_raw)`
+  reproduces it: inverting the fused softplus needs
+  `g_raw = log(exp(-target) - 1)`, which diverges to `-inf` as the gate
+  approaches 0, which is where most channels of 34 layers sit. W2 therefore
+  routes BOTH prefill and decode through `vt::KdaGatedDeltaRule`, which consumes
+  an already-computed per-K-channel log-decay and is branch-agnostic. Closing
+  this needs a chunk op that accepts a precomputed `g`, which is a change to a
+  shared kernel family this row has no gate for. No correctness consequence; a
+  named speed cliff on top of the one §Our baseline "KDA" already records for
+  the 64-head geometry. [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
   records it.
-- **O13 — W4's mHC bricks are not reached from a production entry point.**
+- **O15 — the KDA arm is NOT REACHED from a production entry point.** W2 lands
+  `glm5_next_kda.{h,cpp}`, and `Glm5NextForConditionalGeneration::Forward`
+  still refuses by name (O10), so the only call sites at that merge commit are
+  the focused gate's. This is the staged-slice disclosure AGENTS.md "Nothing
+  lands dead" requires and not an exception claimed by silence: the wiring
+  belongs to **W5**, the assembled text forward, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no
+  issue of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+  tracks it. What W2 buys is that when W5 wires the layer it wires a gated one.
+- **O16 — W4's mHC bricks are not reached from a production entry point.**
   `src/vllm/model_executor/models/glm5_next_mhc.cpp` is a host reference and
   nothing in the shipped tree calls it: the loader and `Forward` still refuse by
   name (O10), so no `include/vllm.h` entry point, no registered server path and
@@ -1464,6 +1508,57 @@ all five `validate_architecture` rejections. **O9 is discharged.**
 **No artifact exists** (O7) and **nothing loads or forwards** (O10): the
 loader, the forward and the KV-cache spec each refuse by name, and
 `MlaBlockDims::Validate` still refuses this model's NoPE geometry (O11). No GPU
-gate has moved and no correctness claim about the MODEL has been made. The next
-actions are W0 — the lane oracle pin, still unwritten — then W2, and, whenever
-the developer grants a large-asset download, W7b.
+gate has moved and no correctness claim about the MODEL has been made.
+
+W0 ([#2096](https://github.com/mudler/vllm.cpp/issues/2096)) then wrote the lane
+oracle pin. `.agents/oracles/transformers.md` records `transformers` `5.16.1`
+for `model_type: glm5_next` only, `gateable = no`, expiring when vLLM registers
+the architecture; the registry pin stays at `5.14.1` and the vLLM parity pin is
+untouched. **O12 is discharged.** O13 records what W0 measured on the way: no
+checker in this tree parses an `oracle-pin-lane` block, so W0's §Gates line
+means the checker stayed green and not that it validated the fields
+([#2099](https://github.com/mudler/vllm.cpp/issues/2099)).
+
+W1's file also broke the Windows build, repaired here as
+[#2101](https://github.com/mudler/vllm.cpp/issues/2101): seven range-`for` loop
+variables named `n` in `Glm5NextExpectedGgufTensors` hid the function-scope
+`const size_t n` at `glm5_next_weights.cpp:252`, and under `/W4 /WX` MSVC's
+C4456 became `error C2220`, so `windows-msvc-cpu` and `windows-msvc-vulkan`
+failed the build on `main` and on every branch that merged it. The
+function-scope local is now `layer_count` and the loop variables are `tn`. Two
+facts are worth keeping: sibling scopes do not hide one another, so the shadowed
+declaration was never another loop's variable, and CI reported four of the seven
+sites because MSVC stops at the first `error C2220` — GCC's `-Wshadow` names all
+seven and is the local instrument for this class.
+
+W2 ([#2097](https://github.com/mudler/vllm.cpp/issues/2097),
+`CLAIM-GLM53-FLASH-W2`) then landed the KDA arm's numerics — the forget gate's
+SIGMOID branch, the strict-fp32 `RMSNormGated`, `l2norm`, the checkpoint's three
+depthwise convs concatenated into the reference's one grouped conv, and the
+assembled host layer on the `vt::KdaGatedDeltaRule` seam — gated RED-first
+against `kimi_kda.cpp:60`'s softplus branch. The fresh review found two
+defects and both are repaired on this branch: the conv-order case swapped two
+weight TENSORS and so moved under any fixed concat order — it is now gated
+against references built with the wrong PAIRING, and it reds under a q,v,k and
+under a k,q,v mutation — and `dt_bias` was optional, which upstream has no
+mode for (`:384` declares it unconditionally, `:393` always adds it), so an
+absent or misshaped tensor is now refused by name. That code is **not reached** from
+any production entry point (O15) and `vt::KdaChunkPrefill` cannot serve this
+model (O14). W0 has since landed the lane pin on `main`.
+
+W4 ([#2098](https://github.com/mudler/vllm.cpp/issues/2098),
+`CLAIM-GLM53-FLASH-W4`) then landed the mHC arm. Three of the topology's four
+pieces reuse DeepSeek-V4 unchanged, because `Glm5NextTextHyperConnection` is a
+bare `pass` over `DeepseekV4HyperConnection`; the fourth does not.
+`Glm5NextTextHyperHead.forward` is `hidden_streams.mean(dim=2)`, so
+`glm5_next::HcHeadCollapseMean` is an UNWEIGHTED mean where V4's
+`HcHeadCollapse` is a sigmoid-gated weighted sum, and the checkpoint carries no
+`hc_head.*` tensor a gated collapse could read. `glm5_next::MhcPre` and
+`MhcPost` add no numerics; they bind this model's five constants in one place.
+Every golden is the RUN output of the unmodified reference modules at
+transformers `v5.16.1`, not a transcription, and the gate was RED first against
+the wrong reuse at 59 of 98 assertions failed. That code is **not reached** from
+any production entry point (O16); W5 owns the wiring.
+
+The next actions are W3 and W5, and, whenever the developer grants a
+large-asset download, W7b.

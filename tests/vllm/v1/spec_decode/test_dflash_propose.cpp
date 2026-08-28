@@ -29,6 +29,10 @@
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"
+// SPEC-DFLASH2 W12 (#2087, #2089): the draft-block attention route counters and
+// the combined-attention LAUNCH SHAPE, read from the src-tree header the same
+// way test_dflash2_runner_reach.cpp reads it.
+#include "vllm/model_executor/models/qwen3_dflash_internal.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -429,4 +433,69 @@ TEST_CASE("dflash config: ParseSpeculativeConfigJson accepts method dflash + k, 
   // A still-unsupported method throws (dspark stays out of scope).
   CHECK_THROWS_AS(ParseSpeculativeConfigJson(R"({"method":"dspark"})"),
                   std::invalid_argument);
+}
+
+// SPEC-DFLASH2 W12 D1 (#2087) — the BATCHED propose attends over Tq query rows,
+// not over C + Tq.
+//
+// WHY A SHAPE AND NOT A NUMBER. D1 removes ~99% of the attention work on the
+// P > 1 lane and changes NO token: the rows it stops computing were discarded.
+// A token gate therefore cannot see it, and neither can a call COUNT — the lane
+// is taken either way. What is observable on a CPU gate is the launch shape, so
+// that is what this asserts, at the production entry point the runner calls
+// (`GPUModelRunner::propose_drafts_block` -> `ForwardBlockLogitsWithDeviceKV`
+// with one store per proposing row).
+//
+// It also closes #2089's blind spot in the same read: before W12 both route
+// counters sat inside the `P == 1` branch, so at every serving concurrency above
+// one they read ZERO on both lanes while a third, uncounted lane ran. A zero
+// that means "this lane did not run" and a zero that means "nothing counts this
+// lane" are the same zero, which is why three profiled waves missed the cost.
+//
+// The reachability mutation: restore the pre-D1 call — query over `Ncomb` with
+// no `cu_seqlens_q` and an IndexSelect afterwards — and this case reds on the
+// query-row count while every token assertion in this file stays green.
+TEST_CASE("dflash D1 (#2087): the P>1 batched propose attends over Tq rows, not C+Tq") {
+  Dims dm;
+  HfConfig cfg = MakeConfig(dm);
+  Qwen3DFlashWeights w = MakeWeights(dm);
+  vt::Queue q = Cpu();
+  const int64_t H = dm.H;
+  // Two requests, (1+k)=3 query rows each, contexts of 2 and 1 rows.
+  std::vector<int32_t> ids = {2, 7, 7, 3, 7, 7};
+  std::vector<int32_t> pos = {5, 6, 7, 4, 5, 6};
+  std::vector<int32_t> block_cu = {0, 3, 6};
+  std::vector<int32_t> ctx_cu = {0, 2, 3};
+  std::vector<float> ctx(static_cast<size_t>(3) * H);
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.2f * std::sin(0.13 * static_cast<double>(i) + 0.4);
+
+  auto s0 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
+  auto s1 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q, kUnitCtxSlots);
+  std::vector<float> f0(ctx.begin(), ctx.begin() + 2 * H);
+  std::vector<float> f1(ctx.begin() + 2 * H, ctx.end());
+  Qwen3DFlashModel::AppendContextKVDevice(*s0, f0, {0, 1}, w, cfg, q);
+  Qwen3DFlashModel::AppendContextKVDevice(*s1, f1, {0}, w, cfg, q);
+  std::vector<DflashDeviceKVStore*> stores = {s0.get(), s1.get()};
+
+  vllm::detail::ResetDflashBlockRouteStats();
+  const std::vector<float> logits = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      stores, ctx_cu, ids, pos, block_cu, w, cfg, q);
+  REQUIRE_FALSE(logits.empty());
+  const vllm::detail::DflashBlockRouteStats st = vllm::detail::GetDflashBlockRouteStats();
+
+  const int64_t Tq = 6;           // 2 requests x (1+k) = 3 rows
+  const int64_t Ncomb = 3 + Tq;   // + the 3 gathered context rows
+  INFO("combined_calls=" << st.materialized_combined_calls
+                         << " query_rows=" << st.last_combined_query_rows
+                         << " key_rows=" << st.last_combined_key_rows);
+  // #2089: the P>1 lane is COUNTED now, once per draft layer per forward.
+  CHECK(st.materialized_combined_calls == cfg.num_hidden_layers);
+  CHECK(st.paged_seam_calls == 0);
+  // D1: the query spans the block rows only; the keys still span the combined
+  // sequence. `Ncomb > Tq` is asserted so the two numbers cannot coincide and
+  // make the first check vacuous.
+  REQUIRE(Ncomb > Tq);
+  CHECK(st.last_combined_query_rows == Tq);
+  CHECK(st.last_combined_key_rows == Ncomb);
 }

@@ -16,6 +16,7 @@
 
 #include <doctest/doctest.h>
 
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -723,6 +724,69 @@ TEST_CASE("chat_template: LoadChatTemplateFromGguf errors without the key") {
 TEST_CASE("chat_template: LoadChatTemplateFromGguf errors on an unreadable file") {
   CHECK_THROWS_AS(
       vllm::entrypoints::LoadChatTemplateFromGguf("/nonexistent/x.gguf"),
+      vllm::entrypoints::ChatTemplateError);
+}
+
+// ─── LoadChatTemplateForModel (server selection path, #2077) ────────────────
+// The server's chat-template SELECTION path: try tokenizer_config.json first,
+// then fall back to GGUF metadata. A .gguf model has no tokenizer_config.json,
+// so the config path throws and the GGUF supplies the template. This is the
+// path the server wires (server_main.cpp), and the existing
+// LoadChatTemplateFromGguf unit tests only cover the helper, not this
+// selection. A regression here is the model looping on `\nassistant:\n` with
+// zero useful output (#2077).
+TEST_CASE("chat_template: LoadChatTemplateForModel loads from GGUF when no tokenizer_config.json") {
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "qwen35"));
+  b.AddKv(gguf_test::StrKv("tokenizer.chat_template",
+                           "{{ messages[0].content }}"));
+  gguf_test::TempFile f(b.Build());
+  // The server derives tokenizer_config_path as <model_dir>/tokenizer_config.json.
+  // For a .gguf file that path does not exist (the GGUF is a file, not a dir),
+  // so LoadChatTemplateFromConfig throws and the selection falls back to the GGUF.
+  const std::string config_path = f.path() + "/tokenizer_config.json";
+  std::string source;
+  std::string tmpl = vllm::entrypoints::LoadChatTemplateForModel(
+      config_path, f.path(), source);
+  // The GGUF template is loaded, NOT the role-join fallback.
+  CHECK(tmpl == "{{ messages[0].content }}");
+  CHECK(!tmpl.empty());
+  // The source names the GGUF, not the non-existent tokenizer_config_path.
+  CHECK(source.find("GGUF") != std::string::npos);
+  CHECK(source.find(f.path()) != std::string::npos);
+  CHECK(source.find("tokenizer_config") == std::string::npos);
+}
+
+TEST_CASE("chat_template: LoadChatTemplateForModel prefers tokenizer_config.json over GGUF") {
+  // A safetensors dir has a real tokenizer_config.json. The config path wins
+  // even when the model_dir happens to be a .gguf file, because the config
+  // load is tried first.
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "qwen35"));
+  b.AddKv(gguf_test::StrKv("tokenizer.chat_template", "GGUF_TEMPLATE"));
+  gguf_test::TempFile f(b.Build());
+  // Write a tokenizer_config.json beside the GGUF with a different template.
+  const std::string config_path = f.path() + "_tokenizer_config.json";
+  {
+    std::ofstream out(config_path);
+    out << R"({"chat_template":"CONFIG_TEMPLATE"})";
+  }
+  std::string source;
+  std::string tmpl = vllm::entrypoints::LoadChatTemplateForModel(
+      config_path, f.path(), source);
+  CHECK(tmpl == "CONFIG_TEMPLATE");
+  CHECK(source.find(config_path) != std::string::npos);
+  CHECK(source.find("GGUF") == std::string::npos);
+  std::filesystem::remove(config_path);
+}
+
+TEST_CASE("chat_template: LoadChatTemplateForModel throws for a non-GGUF dir with no config") {
+  // A non-.gguf model dir with no tokenizer_config.json has no fallback, so the
+  // selection throws and the server falls back to the role-join prompt.
+  std::string source;
+  CHECK_THROWS_AS(
+      vllm::entrypoints::LoadChatTemplateForModel(
+          "/nonexistent/tokenizer_config.json", "/nonexistent/model_dir", source),
       vllm::entrypoints::ChatTemplateError);
 }
 

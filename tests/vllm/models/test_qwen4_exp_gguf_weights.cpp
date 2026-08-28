@@ -254,6 +254,23 @@ std::string Q8_0Bytes(int64_t rows, int64_t cols) {
 struct FixtureOpts {
   std::string drop;
   std::string bad_shape;
+  // W5c (#2031): make `attention.compress_ratios` DISAGREE between two sparse
+  // layers. The file states the ratio per LAYER while HF states one value, so
+  // the config builder takes the first non-zero and requires the rest to
+  // match; a mixed schedule that silently first-wins would size the QSA
+  // indexer side cache for one ratio while another layer compressed at a
+  // different one.
+  //
+  // It DOUBLES `block_count`, and that is what makes the defect expressible at
+  // all. The miniature is four layers at `full_attention_interval` 4, so it has
+  // exactly ONE sparse layer and one non-zero ratio, which cannot disagree with
+  // itself; and a stray non-zero on a LINEAR layer is caught one check earlier
+  // by "compress_ratios disagrees with the full_attention_interval schedule".
+  // Eight layers give two sparse ones, 3 and 7, so the array can be
+  // schedule-consistent AND non-uniform. Only `Qwen4ExpHfConfigFromGguf` is
+  // driven with this option — it reads metadata and never walks the per-layer
+  // tensors, which stay at four layers.
+  bool mixed_compress_ratios = false;
 };
 
 void Add(GgufModelBuilder& b, const FixtureOpts& o, const std::string& name,
@@ -274,7 +291,8 @@ std::string BuildFixture(const FixtureOpts& o = {}) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "qwen4exp"));
   b.AddKv(U32Kv("qwen4exp.embedding_length", kH));
-  b.AddKv(U32Kv("qwen4exp.block_count", kLayers));
+  const int64_t layers_kv = o.mixed_compress_ratios ? kLayers * 2 : kLayers;
+  b.AddKv(U32Kv("qwen4exp.block_count", layers_kv));
   b.AddKv(U32Kv("qwen4exp.attention.head_count", kQHeads));
   b.AddKv(U32Kv("qwen4exp.attention.head_count_kv", kKvHeads));
   b.AddKv(U32Kv("qwen4exp.attention.key_length", kHeadDim));
@@ -310,8 +328,14 @@ std::string BuildFixture(const FixtureOpts& o = {}) {
                      {0, static_cast<int32_t>(kNgramHead0Vocab)}));
   b.AddKv(I32ArrayKv("qwen4exp.ple.layers", {static_cast<int32_t>(kPleLayer)}));
   std::vector<int32_t> ratios;
-  for (int64_t i = 0; i < kLayers; ++i)
+  for (int64_t i = 0; i < layers_kv; ++i)
     ratios.push_back(IsLinear(i) ? 0 : static_cast<int32_t>(kCompressRatio));
+  if (o.mixed_compress_ratios) {
+    // The LAST sparse layer compresses at a different ratio from the first, so
+    // the array still agrees with the schedule and no longer agrees with
+    // itself.
+    ratios.back() = static_cast<int32_t>(kCompressRatio) * 2;
+  }
   b.AddKv(I32ArrayKv("qwen4exp.attention.compress_ratios", ratios));
 
   // Tensor dims are in GGUF `ne` order (inner/fastest dim first), which is the
@@ -1181,6 +1205,36 @@ TEST_CASE("qwen4_exp GGUF: a malformed file refuses BY NAME at load_weights") {
     // which end is wrong.
     CHECK(msg.find("got [") != std::string::npos);
     CHECK(msg.find("expected [") != std::string::npos);
+  }
+
+  SUBCASE("a compress_ratios schedule that is not uniform") {
+    // W5c (#2031). The refusal ALREADY existed — the reader takes the first
+    // non-zero ratio and requires the rest to agree — and NOTHING gated it:
+    // deleting its `VT_CHECK` left this whole suite green. It matters to the
+    // KV-cache spec, which publishes ONE `MLAAttentionSpec` for every QSA
+    // layer at ONE `compress_ratio`, mirroring upstream's own
+    // `MLAAttentionSpec.merge` assert that a group carries a single ratio
+    // (`vllm/v1/kv_cache_interface.py:424-435` at the pin `5559679229`). A
+    // first-wins read would size the side cache for one ratio while another
+    // layer compressed at a different one, which is a short cache and wrong
+    // tokens rather than a crash.
+    FixtureOpts o;
+    o.mixed_compress_ratios = true;
+    TempFile f(BuildFixture(o));
+    const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+    std::string msg;
+    try {
+      (void)vllm::Qwen4ExpHfConfigFromGguf(g);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    CHECK(msg.find("compress_ratios") != std::string::npos);
+    CHECK(msg.find("not uniform") != std::string::npos);
+    // The unmodified fixture does NOT throw, so the refusal is scoped to the
+    // defect rather than to the key.
+    TempFile good(BuildFixture());
+    const vllm::GgufFile g2 = vllm::GgufFile::Open(good.path());
+    CHECK_NOTHROW((void)vllm::Qwen4ExpHfConfigFromGguf(g2));
   }
 
   SUBCASE("a GGUF source with no file") {

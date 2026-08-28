@@ -83,8 +83,24 @@ whose length, per-state shape and per-state dtype all come from the group's own
 1. **`GdnStateCache` grows `std::vector<vt::Tensor> states`** — the mirror of
    `kv_cache: tuple[torch.Tensor, ...]`. `conv_state` and `ssm_state` stay, and
    are `states[0]` and `states[1]`. Every existing consumer — `qwen3_5.cpp`,
-   `kimi_linear_device.cpp`, `nemotron_h_device.cpp`, `gemma4_mm.cpp` — reads
-   those two names and is untouched.
+   `kimi_linear_device.cpp` and the `nemotron_h` pair `nemotron_h_device.cpp` /
+   `nemotron_h_forward.h` — reads those two names and is untouched. **That is
+   THREE families, and this line said four
+   ([#2203](https://github.com/mudler/vllm.cpp/issues/2203), fixed in flow under
+   W5c-1 of [#2031](https://github.com/mudler/vllm.cpp/issues/2031)).** The
+   removed fourth name was `gemma4_mm.cpp`, which reads NEITHER field — zero
+   occurrences of `conv_state`, zero of `ssm_state` — and whose only two
+   mentions of the type are an include comment and
+   `std::vector<GdnStateCache> no_gdn_state;` (`gemma4_mm.cpp:221`), passed
+   EMPTY: the file that proves Gemma-4 has no recurrent arm, cited as proving
+   the opposite. `muse_glimmer_mm.cpp:340` and `qwen3_vl.cpp:621` carry the same
+   empty-vector shape. Grepping the FIELD name over-counts the other way —
+   `glm5_next_kda.cpp` matches `conv_state` 13 times on
+   `Glm5NextKdaCache::conv_state`, a `std::vector<float>` KDA sequence state
+   (`glm5_next_kda.h:314`) and not this `vt::Tensor` (`qwen3_5.h:111`), with
+   zero occurrences of `GdnStateCache`. Grep the TYPE. The paragraph's CLAIM is
+   unaffected: three untouched consumers is still why `conv_state` and
+   `ssm_state` stay as names.
 2. **The runner's recurrent geometry becomes vectors over N.** One
    `CacheBuffer` per (recurrent layer, state), allocated in SPEC ORDER, which is
    the order `bind_kv_cache` slices in. `kv_cache_allocated_bytes` sums every
@@ -348,36 +364,82 @@ its own `GdnStateCache` views rather than reading the runner's, so it cannot see
 a defect in the runner's state assignment. The real regression gate for this seam
 is those other three, and this row used all four.
 
+### The correction W5c made to this bullet
+
+Measured at the same pin, `5559679229`, and it does not overturn the numbers in
+`### What this wave deliberately does NOT do`. Those numbers are correct **about
+upstream's grouping FUNCTIONS**, and the premise they were fed is what is wrong:
+they were run on "two identical GDN layers plus one PLE-shaped layer carrying a
+third conv state and an `int64` n-gram history", and **upstream never constructs
+that input**.
+
+| Read at `5559679229` | What it says |
+|---|---|
+| `vllm/model_executor/models/interfaces.py:809-812` | `get_mamba_state_shape_from_config(cls, vllm_config)` is a CLASSMETHOD taking the CONFIG and nothing else. There is no `layer_idx` to vary a shape by |
+| the same name, tree-wide | 19 definitions at the pin: this protocol declaration plus **18 implementations**. Not one of them takes a layer index, and each returns ONE shape tuple for the whole model |
+| `vllm/v1/worker/mamba_utils.py:441` | `assert all(mamba_specs[0] == spec for spec in mamba_specs)` — every `MambaSpec` in the model must be EQUAL, field for field, `shapes` and `dtypes` included |
+| `vllm/v1/core/kv_cache_utils.py:1101-1109` | when a `MambaSpec`'s page is smaller than the max, upstream sets `page_size_padded=max_page_size` and keeps the spec otherwise unchanged. It PADS. It does not split |
+
+So a heterogeneous per-layer recurrent spec set is not a shape upstream is
+reluctant to group — it is a shape upstream cannot produce, and `mamba_utils`
+asserts against it one layer below. `MakeQwen4ExpKVCache` mirrors that: ONE
+`MambaSpec` carrying `[gdn_conv, temporal, ple_conv, ngram]` on every one of the
+36 linear-attention layers, and the 35 that never read the last two pay
+184336 B per sequence each — 49.2 MiB at the default `max_num_seqs` of 8, which
+is 0.09% of the GB10 headroom the `qwen4_exp` row's `## Hardware` accounts.
+Derived from the published shapes; nothing has allocated it on a device.
+
+Both halves therefore stay owed as ENGINE debt and neither blocks W5c.
+
 ## Owed
 
-- **Per-layer recurrent specs, in MORE THAN ONE recurrent group.** A
-  `qwen4_exp` PLE topology needs both halves, and this row closes neither. Only
-  ONE of its linear-attention layers carries the PLE conv and the n-gram history,
-  so its `MambaSpec` differs from its siblings'. Upstream serves per-layer
-  heterogeneity two ways (see `### What this wave deliberately does NOT do`), and
-  a hybrid model such as `qwen4_exp` takes the one that SPLITS: padding
-  (`vllm/v1/core/kv_cache_utils.py:1099-1110`) equalises the page size only, and
-  the grouping key at `:1210` is the frozen `MambaSpec` itself, `shapes` and
-  `dtypes` included. Measured: two distinct spec keys and three groups. Each
-  layer meanwhile keeps its own `get_state_shape()` / `get_state_dtype()`
-  (`abstract.py:29-43`). Seams to mirror: the existing
+- **Per-layer recurrent specs, in MORE THAN ONE recurrent group.** This row
+  closes neither, and it is generic engine debt rather than a `qwen4_exp`
+  blocker. **CORRECTED at W5c of
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031)** — see
+  `### The correction W5c made to this bullet` below, which is where the
+  measurement and the anchors live. The sentence this replaces read "A
+  `qwen4_exp` PLE topology needs both halves", on the premise that only ONE of
+  its linear-attention layers carries the PLE conv and the n-gram history, so
+  its `MambaSpec` differs from its siblings'. That premise describes a
+  per-layer spec set upstream never constructs.
+
+  What the earlier measurement showed remains TRUE OF THE FUNCTIONS and is kept
+  for the row that eventually needs them: fed a heterogeneous per-layer spec
+  set, upstream takes the PADDING path — `vllm/v1/core/kv_cache_utils.py`
+  equalises the page size only, and the grouping key at `:1210` is the frozen
+  `MambaSpec` itself, `shapes` and `dtypes` included, so two distinct spec keys
+  gave three groups. What is false is that any model reaches those functions
+  with that input, because `get_mamba_state_shape_from_config` declares ONE
+  shape model-wide and `mamba_utils.py:441` asserts every spec equal.
+
+  Seams to mirror WHEN a model needs it: the existing
   `KVCacheConfig::per_layer_attn_specs` for the per-layer spec, and a LIST of
   recurrent group ids in place of the scalar `gdn_group_id_` for the second
-  group. Owned by W5c of
-  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) or a successor of this
-  row; tracked by [#2131](https://github.com/mudler/vllm.cpp/issues/2131).
+  group. `ComputeHybridKvBudget` would need the same widening — it keeps the
+  FIRST mamba group and the FIRST attention group
+  (`src/vllm/v1/core/hybrid_kv_budget.cpp:26` and `:33-39`) — although the
+  paged BYTE divisor `KVBytesPerBlock` is already group-general and does count
+  every attention group by its own layer list. Owned by a successor of this row
+  rather than by W5c, which does not need it; tracked by
+  [#2131](https://github.com/mudler/vllm.cpp/issues/2131).
 - **A recurrent group of ONE state.** Upstream's `ShortConv`
   (`short_conv.py:87`) has no temporal state. `GdnStateCache::ssm_state` is a
   named field every consumer reads, so N == 1 needs those consumers to stop
   assuming it, which this wave does not touch. Refused with a message naming the
   missing part.
 - **A SECOND recurrent group.** `recurrent_seen > 1` still refuses, and
-  `gdn_group_id_` is still a scalar. This IS on a PLE topology's path, not beside
-  it: `qwen4_exp` is hybrid, so upstream's grouping gives it more than one
-  recurrent group (measured in
-  `### What this wave deliberately does NOT do`). Folded into the first bullet
-  above, which owns both halves together, and repeated here because the earlier
-  draft of this line said the opposite.
+  `gdn_group_id_` is still a scalar. **CORRECTED at W5c of
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031): this is NOT on
+  `qwen4_exp`'s path.** The sentence it replaces said the opposite — "This IS on
+  a PLE topology's path, not beside it" — and it is kept here rather than
+  deleted because it is what a reader would have planned the next wave against,
+  which is the same reason its own predecessor was kept. `qwen4_exp` publishes
+  ONE uniform recurrent group, and a scalar `gdn_group_id_` carries it. What
+  remains genuinely owed is generic: `ComputeHybridKvBudget` reads only the
+  FIRST mamba group (`src/vllm/v1/core/hybrid_kv_budget.cpp:26`), so a model
+  that did publish two would be budgeted for one. No registry publishes that
+  shape today.
 - **`test_qwen27_paged_forward` does not gate the runner's recurrent state
   assignment**, measured above. Either it should enter through the runner's own
   `GdnStateCache`, or the issue text and any future dispatch should stop naming
@@ -389,21 +451,29 @@ is those other three, and this row used all four.
   fields and leave the list empty. Inert while nothing outside the runner reads
   it; a consumer that starts reading `states` owes those builders the
   assignment.
-- **The multi-cache recurrent allocation site is UNEXERCISED.** The
+- ~~**The multi-cache recurrent allocation site is UNEXERCISED.**~~ **CLOSED by
+  W5c-1 of [#2031](https://github.com/mudler/vllm.cpp/issues/2031).** The
+  measurement above stands: at this row's head, deleting the
   `alloc_recurrent_layer_states` call inside `if (multi_cache_topology)`, in its
-  `membership_by_name && has_mamba_group` recurrent loop, can be deleted with all
-  four suites fully green (measured above). No fixture combines a multi-cache
-  attention topology with a mamba group, so the N-general loop this row routes
-  through that site has never run there. Pre-existing debt from
-  KV-DSV4-MULTICACHE ([#2068](https://github.com/mudler/vllm.cpp/issues/2068));
-  closing it needs a fixture that publishes both, which is a KV-topology fixture
-  and not a recurrent-state one. Tracked by
-  [#2131](https://github.com/mudler/vllm.cpp/issues/2131) until a row picks it
-  up.
-- **Nothing publishes N >= 3.** Every recurrent registry in the tree publishes
-  two states, so the N >= 3 arm lands EXPRESSIBLE and UNREACHED. The two-state
-  arm is reached by every recurrent model through the same generalized loop —
-  the special case is deleted rather than bypassed — so what is unreached is the
-  VALUE of N, not the code. Owned by W5c of
-  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), tracked by
-  [#2131](https://github.com/mudler/vllm.cpp/issues/2131).
+  `membership_by_name && has_mamba_group` recurrent loop, left all four suites
+  fully green. `test_runner.cpp`'s
+  "runner: a multi-cache topology ALLOCATES its N-state recurrent group" is the
+  fixture that was missing — a `qwen4_exp`-shaped topology publishing a paged
+  K+V group, a recurrent group and an `MLAAttentionSpec` indexer side cache —
+  and RE-MEASURED with the same deletion it now reads `test_runner` 32 cases /
+  902 assertions / **rc 1**, failing only the new case at
+  `REQUIRE(runner.gdn_state().size() == 3)`, while the three model suites stay
+  byte-identically green. The existing "keeps its recurrent group" case could
+  not see it because everything it asserts — `layer_kv_class_`,
+  `gdn_group_id_`, the per-layer index lists — is computed BEFORE the
+  allocation.
+- ~~**Nothing publishes N >= 3.**~~ **CLOSED by W5c-1 of
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031)**, which is the wave
+  this bullet named. `MakeQwen4ExpKVCache` publishes **N == 4** —
+  `[gdn_conv, temporal, ple_conv, ngram]`, the last of them `kI64` because it
+  holds token ids — on every one of `qwen4_exp`'s 36 linear-attention layers,
+  reached through the production `make_kv_cache` registry hook and gated by
+  `tests/vllm/models/test_qwen4_exp_kv_cache.cpp`. Both halves of the widening
+  this row landed are therefore now used by a shipped registry: the COUNT
+  (4 > 2) and the DTYPE (an integer state, which the old floating-only
+  predicate made inexpressible).

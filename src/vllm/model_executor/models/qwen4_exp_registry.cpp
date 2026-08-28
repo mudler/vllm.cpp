@@ -36,11 +36,17 @@
 #include "vt/dtype.h"  // VT_CHECK
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // ResolveMambaSsmCacheDType
 #include "vllm/model_executor/models/qwen4_exp.h"
 #include "vllm/model_executor/models/qwen4_exp_weights.h"
+#include "vllm/v1/kv_cache_dtype.h"     // ResolveKvCacheDType
 #include "vllm/v1/kv_cache_interface.h"
 
 namespace vllm {
@@ -174,31 +180,213 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   return ForwardLogits{};  // unreachable; VT_CHECK always throws here
 }
 
+// ─── The KV-cache spec (W5c, #2031) ──────────────────────────────────────────
+//
+// THREE published groups, and the shape of them is the decision this function
+// exists to record:
+//
+//   0. the QSA layers' paged K+V              `FullAttentionSpec`
+//   1. EVERY linear-attention layer's state   `MambaSpec`, N states
+//   2. the QSA layers' indexer side cache     `MLAAttentionSpec`, compress 4
+//
+// ONE UNIFORM RECURRENT GROUP, NOT ONE PER LAYER, AND THE COST IS DELIBERATE.
+// Only ONE linear-attention layer carries the PLE conv and the n-gram token
+// history (`ple_layer_ids` selects 0-based layer 1 on the published
+// checkpoint), so a per-layer spec would give 35 of the 36 recurrent layers a
+// smaller state set. Upstream cannot express that and does not try:
+// `get_mamba_state_shape_from_config` is a CLASSMETHOD taking only the config
+// (`vllm/model_executor/models/interfaces.py:809-812` at the pin
+// `5559679229`), all 18 implementations of it declare ONE shape model-wide and
+// not one of them takes a `layer_idx`, and `get_mamba_groups`
+// (`vllm/v1/worker/mamba_utils.py:441`) asserts
+// `all(mamba_specs[0] == spec for spec in mamba_specs)` — every recurrent spec
+// in the model equal, field for field. Upstream pays the uniform cost by
+// PADDING rather than by splitting (`vllm/v1/core/kv_cache_utils.py:1101-1109`
+// sets `page_size_padded=max_page_size` on the smaller `MambaSpec`).
+//
+// The cost here, derived from the published shapes rather than measured: the
+// PLE conv is `10240 x 9` at bf16 = 184320 B and the n-gram history is 2 int64
+// = 16 B, so 184336 B per sequence on each of the 35 linear layers that do not
+// use them. At the default `max_num_seqs` of 8 that is 49.2 MiB — 0.09% of the
+// GB10 headroom the row's `## Hardware` section accounts. Splitting the group
+// to recover it would need a SECOND recurrent group, which
+// `.agents/specs/recurrent-multistate.md` records as owed generic engine debt
+// and which this topology does not need.
+//
+// STATE ORDER IS A DELIBERATE DIVERGENCE FROM UPSTREAM'S LIST ORDER, and it is
+// the same bytes either way. Upstream keeps the three CONV states adjacent
+// (`number_of_conv_states = 3`: GDN conv, PLE conv, n-gram history) with the
+// temporal state after them. This tree publishes
+// `[gdn_conv, temporal, ple_conv, ngram]` because `GdnStateCache` exposes
+// `conv_state = states[0]` and `ssm_state = states[1]` as NAMED fields that
+// THREE model families already read (`qwen3_5.cpp`, `kimi_linear_device.cpp`
+// and the `nemotron_h` pair `nemotron_h_device.cpp` / `nemotron_h_forward.h`),
+// and moving the temporal state off slot 1 would silently re-point every one
+// of them. Recorded in the row spec.
+//
+// THE COUNT IS THREE, NOT FOUR (#2203). `gemma4_mm.cpp` was named here and in
+// `.agents/specs/recurrent-multistate.md` as a fourth reader, and it reads
+// NEITHER field: its only two mentions of the type are an include comment and
+// `std::vector<GdnStateCache> no_gdn_state;` (`gemma4_mm.cpp:221`), passed
+// EMPTY, which is the file proving Gemma-4 has no recurrent arm.
+// `muse_glimmer_mm.cpp:340` and `qwen3_vl.cpp:621` carry that same empty-vector
+// shape. Grepping the FIELD name over-counts in the other direction:
+// `glm5_next_kda.cpp` matches `conv_state` 13 times on
+// `Glm5NextKdaCache::conv_state`, a `std::vector<float>` KDA sequence state
+// (`glm5_next_kda.h:314`), where this one is a `vt::Tensor` (`qwen3_5.h:111`),
+// and that file has zero occurrences of `GdnStateCache`. Grep the TYPE.
+//
+// REAL PER-LAYER NAMES, NEVER PLACEHOLDERS. `ResolveKVCacheGroupLayerNames`
+// (`src/vllm/v1/kv_cache_interface.cpp`) rewrites a placeholder group set into
+// per-layer names, but its fallback classification can name only a TARGET
+// attention group and one `fa_draft` slot: a third attention group gets
+// `layer_names.clear()` and an unnamed group is then refused by the runner's
+// multi-cache admission check, because its names "do not all resolve to
+// distinct in-range layer indices". Publishing the real names also makes the
+// rewrite a no-op by its own idempotence guard, so what the runner allocates is
+// what this function said.
+//
+// GROUP 2 IS AN `MLAAttentionSpec` AND THAT IS LOAD-BEARING. `MLAAttentionSpec`
+// is not an MLA claim — it is the key-only page budget, one vector per stored
+// state instead of a K+V pair — and `compress_ratio` is what makes a state
+// cover four tokens (`vllm/v1/kv_cache_interface.py:386` and the
+// `storage_block_size = block_size // compress_ratio` property at `:393-395`).
+// A `FullAttentionSpec` here would be absorbed by the runner as the single
+// `fa_draft` draft-KV slot instead (`gpu/runner.cpp`, the `draft_slot_taken`
+// arm of the leftover scan), `multi_cache_topology` would stay false, and the
+// side cache would be published and never allocated — in silence.
 v1::KVCacheConfig MakeQwen4ExpKVCache(const HfConfig& config, int block_size,
                                       int num_blocks) {
-  (void)config;
-  (void)block_size;
-  (void)num_blocks;
-  // REACHABLE since W5a (#2031), and that is a behaviour change this comment
-  // used to deny: it read "unreachable while the loader refuses", which was
-  // true at the parent and is not true at this head. `LoadedEngine` now loads
-  // the whole text tower and then arrives HERE, so pointing the engine at the
-  // shipped 67.56 GiB artifact pays the full load before it is refused, where
-  // before W5a it was refused at once. The spec's `## Owed` records that
-  // regression and the CUDA n-gram expansion behind it
-  // ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)); W5c is what
-  // closes it by making this function return a config instead of throwing.
+  // The row's own resolve-and-validate, not a second reading of the raw config.
+  // It is what rewrites `full_attention` into `qwen_sparse_attention`, so the
+  // classification below is upstream's post-`__post_init__` one.
+  const Qwen4ExpParams p = ParseQwen4ExpParams(config);
+
+  VT_CHECK(block_size > 0,
+           "qwen4_exp KV spec: block_size must be positive, got " +
+               std::to_string(block_size));
+
+  std::vector<std::string> qsa_layers;
+  std::vector<std::string> qsa_indexer_layers;
+  std::vector<std::string> linear_layers;
+  for (size_t l = 0; l < p.layer_types.size(); ++l) {
+    const std::string idx = std::to_string(l);
+    if (p.layer_types[l] == Qwen4ExpLayerKind::kLinearAttention) {
+      // The name `ResolveKVCacheGroupLayerNames` builds for a recurrent layer,
+      // so the runner's by-name membership sees the same string either way.
+      linear_layers.push_back("model.layers." + idx + ".linear_attn");
+    } else {
+      qsa_layers.push_back("model.layers." + idx + ".self_attn.attn");
+      // Upstream addresses a side cache by its own module prefix
+      // (`vllm/models/deepseek_v4/attention.py:761-767` registers the indexer
+      // key cache under `...indexer.k_cache`); the runner parses the
+      // `.layers.<N>.` segment out of it, so the suffix is free to say which
+      // cache it is.
+      qsa_indexer_layers.push_back("model.layers." + idx +
+                                   ".self_attn.indexer.k_cache");
+    }
+  }
+
+  VT_CHECK(!qsa_layers.empty(),
+           "qwen4_exp KV spec: the config declares no qwen_sparse_attention "
+           "layer, so there is no attention KV to publish. See "
+           ".agents/specs/qwen4-exp-flash-next.md and issue #2031.");
+  VT_CHECK(!linear_layers.empty(),
+           "qwen4_exp KV spec: the config declares no linear_attention layer, "
+           "so there is no recurrent state to publish. See "
+           ".agents/specs/qwen4-exp-flash-next.md and issue #2031.");
+
+  // QSA is optional as a WHOLE in the config layer (all five `indexer_*` fields
+  // or none), while the `full_attention` -> `qwen_sparse_attention` rewrite is
+  // unconditional. So a config CAN declare sparse layers and no indexer, and
+  // that combination has no side cache to size. Refuse rather than publish two
+  // groups where the model needs three.
+  VT_CHECK(p.qsa.compress_ratio > 0 && p.qsa.head_dim > 0 &&
+               p.qsa.kv_heads > 0,
+           "qwen4_exp KV spec: the config declares " +
+               std::to_string(qsa_layers.size()) +
+               " qwen_sparse_attention layer(s) but no `indexer_*` group, so "
+               "the QSA indexer side cache cannot be sized. See "
+               ".agents/specs/qwen4-exp-flash-next.md and issue #2031.");
+
+  // `MLAAttentionSpec::storage_block_size()` is `block_size / compress_ratio`,
+  // an INTEGER division that truncates in silence
+  // (`vllm/v1/kv_cache_interface.py:393-395`). At a block size the ratio does
+  // not divide, the page is sized for `floor(block/ratio)` states while the
+  // block still covers `block` tokens, so the last partial state's key has
+  // nowhere to go — a short cache, i.e. wrong tokens rather than a crash.
+  // Upstream never meets this because its DeepSeek-V4 block sizes are powers of
+  // two above the ratio; ours arrives as a caller-supplied parameter.
+  VT_CHECK(block_size % p.qsa.compress_ratio == 0,
+           "qwen4_exp KV spec: block_size " + std::to_string(block_size) +
+               " is not a multiple of `indexer_compress_ratio` " +
+               std::to_string(p.qsa.compress_ratio) +
+               "; the indexer side cache stores one state per " +
+               std::to_string(p.qsa.compress_ratio) +
+               " tokens and storage_block_size() would truncate.");
+
+  // The recurrent state set, in the order stated above.
   //
-  // Refusing BY NAME rather than returning an empty config: this model needs
-  // THREE conv states per linear layer (GDN conv, PLE conv, and an int64
-  // n-gram token history) plus a QSA indexer side cache holding one key vector
-  // per block of four tokens, and a spec that silently omits them would
-  // allocate a wrong-sized cache that nothing downstream checks.
-  throw std::runtime_error(
-      "Qwen4ExpForConditionalGeneration: the KV-cache spec is not ported yet "
-      "(W4 owes the QSA indexer side cache and W2 the third conv state for the "
-      "n-gram token history). See .agents/specs/qwen4-exp-flash-next.md and "
-      "issue #1978.");
+  // The two dtypes come from the SAME resolver every other hybrid in this tree
+  // uses, rather than a second reading of `mamba_ssm_dtype`; its refusal
+  // message is spelled `qwen3_5:` because that is where the one copy lives.
+  const vt::DType conv_dtype = vt::DType::kBF16;
+  const vt::DType ssm_dtype =
+      detail::ResolveMambaSsmCacheDType(config, conv_dtype);
+
+  std::vector<std::vector<int64_t>> state_shapes{
+      // GDN conv: the concatenated q|k|v stream, `conv_kernel - 1` taps.
+      {p.linear_conv_dim(), p.linear_conv_kernel_dim - 1},
+      // GDN temporal.
+      {p.linear_num_value_heads, p.linear_value_head_dim,
+       p.linear_key_head_dim},
+  };
+  std::vector<vt::DType> state_dtypes{conv_dtype, ssm_dtype};
+
+  // `number_of_conv_states` is 3 exactly when the model has a PLE layer, and 1
+  // otherwise (`Qwen4ExpParams::number_of_conv_states`, mirroring upstream).
+  // The two extra conv states are the PLE conv and the n-gram token history,
+  // which upstream keeps in the linear-attention cache beside the GDN conv
+  // because the state manipulations are identical (`modular_qwen4_exp.py`
+  // :178-180).
+  if (p.number_of_conv_states() == 3) {
+    // The PLE conv is DILATED by `ngram_size`, so its state is
+    // `(kernel - 1) * ngram_size` = 9 columns deep, not `kernel - 1`, and it
+    // runs over the FULL hyper-connection stream width.
+    state_shapes.push_back(
+        {p.stream_width(), p.ple.short_conv_state_len()});
+    state_dtypes.push_back(conv_dtype);
+    // TOKEN IDS, and `kI64` is not a widening. The history holds
+    // `input_ids.long()` and feeds a `uint64_t` hash multiply; storing it in a
+    // float dtype rounds a token id, which the row spec records as one of the
+    // three silent divergence sites. `ENG-RECURRENT-MULTISTATE` (#2131) is what
+    // made an integer recurrent state expressible at all.
+    state_shapes.push_back({p.ple.ngram_size - 1});
+    state_dtypes.push_back(vt::DType::kI64);
+  }
+
+  v1::KVCacheConfig kv;
+  kv.num_blocks = num_blocks;
+  kv.kv_cache_groups.emplace_back(
+      std::move(qsa_layers),
+      std::make_shared<v1::FullAttentionSpec>(
+          block_size, static_cast<int>(p.num_key_value_heads),
+          static_cast<int>(p.head_dim), v1::ResolveKvCacheDType()));
+  kv.kv_cache_groups.emplace_back(
+      std::move(linear_layers),
+      std::make_shared<v1::MambaSpec>(block_size, std::move(state_shapes),
+                                      std::move(state_dtypes)));
+  kv.kv_cache_groups.emplace_back(
+      std::move(qsa_indexer_layers),
+      std::make_shared<v1::MLAAttentionSpec>(
+          block_size, static_cast<int>(p.qsa.head_dim),
+          v1::ResolveKvCacheDType(), static_cast<int>(p.qsa.kv_heads),
+          v1::KVQuantMode::kNone, /*page_size_padded=*/std::nullopt,
+          /*indexes_kv_by_block_stride=*/false,
+          /*cache_dtype_str=*/std::nullopt, /*alignment=*/std::nullopt,
+          static_cast<int>(p.qsa.compress_ratio),
+          /*model_version=*/std::nullopt));
+  return kv;
 }
 
 const ModelFactory kQwen4ExpFactory{

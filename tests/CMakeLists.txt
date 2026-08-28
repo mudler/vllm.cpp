@@ -1024,6 +1024,16 @@ target_compile_definitions(test_qwen4_exp_scaffold PRIVATE
 # nothing on the public ABI. Same arrangement test_dots3_note_scaffold uses.
 target_include_directories(test_qwen4_exp_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# Qwen4-Exp W5c (#2031) -- the KV-cache spec, driven through the PRODUCTION
+# `make_kv_cache` registry hook rather than by constructing spec structs. Three
+# groups: the QSA layers' paged K+V, ONE uniform recurrent group carrying four
+# states on every linear-attention layer, and the QSA indexer side cache as an
+# `MLAAttentionSpec` at compress_ratio 4. Fixture is the published
+# `Qwen/Qwen3.8-Flash-Next` config.json verbatim.
+vllm_cpp_add_test(test_qwen4_exp_kv_cache vllm/models/test_qwen4_exp_kv_cache.cpp)
+target_compile_definitions(test_qwen4_exp_kv_cache PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+
 # GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) W1 -- the config layer and
 # the two production entry points that reach it: `ModelRegistry::Resolve` and
 # the `general.architecture` GGUF dispatch. No numerics: W1 has none. The

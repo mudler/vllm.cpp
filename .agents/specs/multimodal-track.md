@@ -888,10 +888,15 @@ comparing the two arms must set the flag on both sides or state that it did not.
 
   **Declared threshold, two halves, both required.**
 
-  1. `peak_rss(default) - peak_rss(--language-model-only) >= 0.90 x 7.161 GiB
-     = 6.445 GiB.` Ninety per cent, not a hundred, leaves room for allocator
-     granularity and for the tower geometry that is still parsed — the construct
-     half of construct-without-initialise.
+  1. `peak_rss(default) - peak_rss(--language-model-only) >= 0.90 x 7687383040 B
+     = 6918644736 B = 6.4435 GiB.` Ninety per cent, not a hundred, leaves room
+     for allocator granularity and for the tower geometry that is still parsed —
+     the construct half of construct-without-initialise. This half was first
+     written as "0.90 x 7.161 GiB = 6.445 GiB"; the byte figure is the same
+     declaration in the units the harness computes it in
+     (`TOWER_RESIDENT_BYTES * MIN_SAVING_FRACTION_PCT / 100`,
+     `scripts/mm/tower_skip_rss.sh:614`), not a renegotiation — nothing has been
+     measured on this kind, so there is no number to renegotiate against.
   2. `peak_rss(default)` within 2% of the same measurement on the pre-L3 binary
      (`edbc47ce0`). This half is what stops "we saved memory" from meaning "we
      broke the default path".
@@ -915,9 +920,10 @@ comparing the two arms must set the flag on both sides or state that it did not.
   carry the `model.visual.` prefix and total 830695424 B = 0.7736 GiB, 9.3593%
   of the weights**; the other 398 are `model.language_model.`.
 
-  *The loader reads exactly those 315, and widens every one.*
-  `LoadQwen3VLVisionWeights` (`src/vllm/model_executor/models/qwen3_vl.cpp:437-480`)
-  walks a fixed enumeration under `w.vision_cfg`, whose defaults
+  *The loader reads exactly those 315, and stores every one at the checkpoint's
+  own width.* `LoadQwen3VLVisionWeights`
+  (`src/vllm/model_executor/models/qwen3_vl.cpp:453`) walks a fixed enumeration
+  under `w.vision_cfg`, whose defaults
   (`include/vllm/model_executor/models/qwen3_vl_vision.h:34-46`: hidden 1024,
   heads 16, **depth 24**, intermediate 4096, out_hidden 2560, patch 16, temporal
   2, merge 2, 2304 position embeddings, **`deepstack_visual_indexes = {5, 11, 17}`**)
@@ -925,31 +931,63 @@ comparing the two arms must set the flag on both sides or state that it did not.
   is 3 top-level + 24 x 12 per block + 6 merger + 3 x 6 deepstack = **315
   names**, and set-differencing it against the header gives **no name the loader
   reads that the file lacks, and no vision tensor the file carries that the
-  loader leaves unread**. Every one of those reads goes through `LoadVisionF32`
-  (`qwen3_vl.cpp:79-90`), which `VT_CHECK`s `dtype == "BF16"` and returns
-  `std::vector<float>`, and every field of `Qwen3VLVisionWeights`,
-  `VisionBlockWeights` and `VisionMergerWeights` (`qwen3_vl_vision.h:60-82`) is a
-  `std::vector<float>`. So the widening is total rather than partial: **resident
-  cost = 2 x 830695424 = 1661390848 B = 1.5473 GiB.**
+  loader leaves unread**. Every one of those reads goes through `LoadVisionBf16`
+  (`qwen3_vl.cpp:85-95`), which `VT_CHECK`s `dtype == "BF16"` and returns
+  `std::vector<uint16_t>`, and every field of `Qwen3VLVisionWeights`,
+  `VisionBlockWeights` and `VisionMergerWeights` (`qwen3_vl_vision.h:73-104`) is
+  a `std::vector<uint16_t>` with one deliberate exception. So there is almost no
+  widening left to pay for: **resident cost = 830695424 B = 0.7736 GiB, the
+  on-disk figure**, plus that one exception.
+
+  *The exception, in bytes.* `pos_embed_w` stays host f32, because
+  `VisionPosEmbedInterpolate` does host arithmetic on its values before anything
+  narrows them (`vision-tower-dtype-polarity.md` §4.3). It is 2304 x 1024
+  elements, so it is resident at 9437184 B against 4718592 B on disk, and the
+  true resident tower is 835414016 B. `TOWER_RESIDENT_BYTES` deliberately does
+  NOT carry that extra 4718592 B: the threshold is a `>=` floor, so leaving 0.57%
+  of the tower outside it can only make the gate harder to pass, and the
+  alternative is a constant that has to be re-derived every time an exception is
+  added or reconciled. `test_vision_tower_dtype` pins the exception in bytes at
+  unit scale instead (`ResidentBytes(w) == on_disk + pos`), which is where a
+  per-weight fact belongs.
+
+  *This paragraph used to say the opposite, and the change is
+  [#1359](https://github.com/mudler/vllm.cpp/issues/1359).* Until it landed,
+  `LoadVisionF32` returned `std::vector<float>` and every field of those three
+  structs was a `std::vector<float>`, so the resident cost was `2 x 830695424 =
+  1661390848 B = 1.5473 GiB` and half of any saving measured here was our own
+  widening rather than the model.
 
   **Declared threshold for `qwen3-vl`, two halves, both required.**
 
-  1. `peak_rss(default) - peak_rss(--language-model-only) >= 0.90 x 1661390848 B
-     = 1495251763 B = 1.3925 GiB`, on BOTH pairs of the swapped assignment. The
+  1. `peak_rss(default) - peak_rss(--language-model-only) >= 0.90 x 830695424 B
+     = 747625881 B = 0.6963 GiB`, on BOTH pairs of the swapped assignment. The
      ninety per cent carries over because its ARGUMENT does — allocator
      granularity and the geometry that is still parsed — and not because the
      model is similar.
   2. `peak_rss(default)` within 2% of the same measurement on the pre-L3 binary
      (`edbc47ce0`), for the same reason as above.
 
-  *Read this number honestly: half of it is a defect.* The x2 is
-  [#1359](https://github.com/mudler/vllm.cpp/issues/1359), the host-f32 storage
-  of a bf16 tower, which the operator has confirmed affects the Qwen3-VL and
-  Qwen3.6-27B paths as well as Muse Glimmer's. A large measured saving here is
-  therefore partly a large WIDENING, and it is not a statement that this tower is
-  1.547 GiB of model. On disk it is 0.774 GiB. #1359 is not fixed first because
-  narrowing the storage would change the very quantity this threshold is stated
-  against.
+  **Half 1's byte figure is DECLARED in the line above and nowhere else.** It is
+  `TOWER_RESIDENT_BYTES * MIN_SAVING_FRACTION_PCT / 100` exactly as
+  `scripts/mm/tower_skip_rss.sh:614` computes it, and
+  `test_spec_carries_the_threshold_the_instrument_applies`
+  (`tests/scripts/test_tower_skip_rss_report.py`) reds when this document and
+  that script disagree about it. Every other `qwen3-vl` threshold figure below is
+  the record of a run measured against a SUPERSEDED value and says so where it
+  appears. Derive from this one; do not re-state it as a literal.
+
+  *Read the fall in this number honestly: it is the defect leaving, not the
+  saving shrinking.* Half of the pre-#1359 threshold was the host-f32 storage of
+  a bf16 tower. The flag now frees the tower the checkpoint ships instead of the
+  tower plus our widening, so a rerun should read about 0.774 GiB where the
+  2026-08-24 run read 1.542, and that halving is CORRECT rather than a
+  regression. The pre-declaration that authorises moving the threshold with it is
+  `.agents/specs/vision-tower-dtype-polarity.md` §6.2: the threshold was not
+  renegotiated after a number arrived, it was re-derived because the fixed loader
+  changed the quantity it is stated against. `muse-glimmer` still widens, its
+  threshold above still carries the x2, and #1359 stays OPEN for that half —
+  blocked on [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
 
   **THE RESULT, 2026-08-24: MET on both pairs, first half only (#1358).** The
   run happened. Harness `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at
@@ -960,10 +998,17 @@ comparing the two arms must set the flag on both sides or state that it did not.
   | 1 (binary A then B) | 10209501184 B | 8553709568 B | **1655791616 B = 1.542 GiB** |
   | 2 (SWAPPED, B then A) | 10209841152 B | 8553848832 B | **1655992320 B = 1.542 GiB** |
 
-  Against the threshold declared above with no number in existence —
-  1495251763 B, 90% of the 1661390848 B resident tower — **both pairs clear it,
-  so half 1 is MET**. The saving is 99.7% of the predicted resident tower, so
-  the header-derived prediction was near-exact rather than approximately right.
+  Against the threshold that stood on 2026-08-24, declared with no number in
+  existence — **1495251763 B, now SUPERSEDED**, 90% of the then-resident
+  1661390848 B tower — **both pairs clear it, so half 1 is MET**. The saving is
+  99.7% of the predicted resident tower, so the header-derived prediction was
+  near-exact rather than approximately right.
+
+  **Do not apply 1495251763 B to a rerun.** It is the record of a run at
+  `41ab550b9`, on a binary that widened the tower to host f32. #1359 removed that
+  widening, so the live threshold is the one declared above and a post-#1359 run
+  cannot produce a saving anywhere near this one. Reading this figure forward
+  would fail a correct change.
 
   *The estimator and the bias it was designed to cancel.* Mean 1655891968 B.
   Spread `|pair 1 − pair 2|` = 200704 B, which is 0.012% of the saving, against
@@ -997,10 +1042,14 @@ comparing the two arms must set the flag on both sides or state that it did not.
      disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp` widens it to
      host f32. That is
      [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which the operator
-     has confirmed also affects the Qwen3.6-27B path. **Fixing #1359 should
-     roughly HALVE this saving, and that will be correct rather than a
-     regression** — the flag will then be freeing the tower the checkpoint
-     actually ships.
+     has confirmed also affects the Qwen3.6-27B path. **#1359's Qwen3-VL half
+     has since LANDED, so this leg rerun should read about 0.774 GiB rather than
+     1.542, and that HALVING IS CORRECT rather than a regression** — the flag now
+     frees the tower the checkpoint actually ships. The figure recorded above is
+     what the run at `41ab550b9` measured and it stays as that record.
+     `muse-glimmer-30b`'s tower is still held in host f32, so its own
+     90%-of-7.161-GiB threshold is unchanged; that half is blocked on
+     [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
   2. *This is load-time residency, not a served request.* Peak RSS over a load
      that stops at `/health`, for the reason the paragraph below gives:
      `ForwardQwen3VLForConditionalGeneration` refuses text-only input through
@@ -1907,9 +1956,10 @@ L4 (§1.6); the second while landing L3 (§1.5).
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
   `qwen3_vl.cpp` site is MEASURED, half 1 only, 2026-08-24.** The run happened
   on `thor:gpu0` under an `rc` lease at `main` `41ab550b9` and **MET** the
-  declared 1495251763 B on BOTH pairs of the swapped assignment: 1655791616 B
-  and 1655992320 B, 1.542 GiB, 99.7% of the 1661390848 B predicted resident
-  tower, spread 200704 B against a leg-to-leg 192512 B. The full result, its
+  threshold that stood then — 1495251763 B, SUPERSEDED by #1359 and not
+  applicable to a rerun — on BOTH pairs of the swapped assignment: 1655791616 B
+  and 1655992320 B, 1.542 GiB, 99.7% of the 1661390848 B resident tower that
+  binary carried, spread 200704 B against a leg-to-leg 192512 B. The full result, its
   conditions and its three caveats are in §1.5 L3 under "THE RESULT", and the
   evidence is
   `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log`.

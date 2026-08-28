@@ -28723,8 +28723,13 @@ killed every measured leg mid-load on the previous attempt.
    0.774 GiB on disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp`
    widens it to host f32 —
    [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which also affects
-   the Qwen3.6-27B path. Fixing #1359 should roughly HALVE this saving, and the
-   smaller figure will be the correct one.
+   the Qwen3.6-27B path. #1359's Qwen3-VL half has since LANDED, so this leg
+   rerun should read about 0.774 GiB rather than 1.542, and that HALVING IS
+   CORRECT rather than a regression — the flag now frees the tower the
+   checkpoint ships instead of the tower plus our widening. The figure recorded
+   here stands as what the run at `41ab550b9` measured; `muse-glimmer-30b` still
+   widens, blocked on
+   [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
 2. **Load-time residency, not a served request.**
    `ForwardQwen3VLForConditionalGeneration` `VT_CHECK`s `input.mm.has_value()`,
    so the `qwen3-vl` arms cannot run a completion and stop at `/health`. That is

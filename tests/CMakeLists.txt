@@ -912,6 +912,14 @@ vllm_cpp_add_test(test_muse_glimmer_wiring vllm/models/test_muse_glimmer_wiring.
 # Muse Glimmer checkpoint with the wiring gate above (muse_glimmer_tiny_fixture.h)
 # so both ask their question of the same bytes.
 vllm_cpp_add_test(test_tower_skip vllm/models/test_tower_skip.cpp)
+# ENG-MM-INPUT-PIPELINE (#1359): the tower's host STORAGE DTYPE, counted in
+# bytes through both production loaders. Shares the same tiny Muse Glimmer
+# checkpoint for the same reason the skip gate does — the question is what the
+# loader did with THOSE bytes. A token gate cannot see a dtype that is too wide,
+# so this is the only shape of gate that can (specs/vision-tower-dtype-polarity.md).
+vllm_cpp_add_test(test_vision_tower_dtype vllm/models/test_vision_tower_dtype.cpp)
+target_include_directories(test_vision_tower_dtype PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_muse_glimmer_wiring PRIVATE
   MUSE_GLIMMER_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/muse_glimmer_30b")
 # Muse Glimmer REAL-WEIGHT gate. Loads the released 30B bf16 checkpoint (or a

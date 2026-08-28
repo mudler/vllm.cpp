@@ -145,10 +145,21 @@ void MlaDecodeAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& qu
         const int64_t j = sel != nullptr ? static_cast<int64_t>(sel[b * sel_s0 + i])
                                          : j_start + i;
         // `-1` is upstream's "no token" sentinel (the topk buffer is pre-filled
-        // with it, sparse_attn_indexer.py:426-430 @ bc2d63e650). A live count can
+        // with it at sparse_attn_indexer.py:431-432 @ bc2d63e650; `:426-430` is
+        // the COMMENT above that statement). A live count can
         // still name one when a caller pads inside the count, so it is SKIPPED
         // rather than trusted to be absent.
         if (j < 0) continue;
+        // A DIVERGENCE FROM THE CUDA ARM, recorded rather than hidden. On an
+        // out-of-range selected position (`j >= seq_len`) this arm REFUSES,
+        // while `cuda_mla_attn.cu` scores the slot `-inf` and treats it as a
+        // dead one — same input, a throw here and a number there, under headers
+        // that claim the two arms are behaviourally identical. It is not
+        // reachable from the current wiring, because `vt::DsaTopkSelect` bounds
+        // every emitted position by `win_end` and so cannot produce one, which
+        // is why this stays a recorded divergence rather than a same-change
+        // repair: aligning them is a semantic decision about an ungated path on
+        // BOTH arms. `## Owed` in `.agents/specs/dots3-note.md` carries it.
         VT_CHECK(j < seq_len,
                  "cpu mla_decode_attention: a selected token position is past the "
                  "request's own seq_len");

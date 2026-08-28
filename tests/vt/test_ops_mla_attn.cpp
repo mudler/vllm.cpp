@@ -976,7 +976,7 @@ TEST_CASE("mla_decode CPU: a FULL selection is BIT-IDENTICAL to no selection") {
 
 TEST_CASE("mla_decode CPU: a -1 slot INSIDE the count contributes nothing") {
   // The `-1` sentinel is what the topk buffer is pre-filled with
-  // (sparse_attn_indexer.py:426-430). A caller that pads INSIDE its own count
+  // (sparse_attn_indexer.py:431-432). A caller that pads INSIDE its own count
   // must not make the kernel read cache row 0 as if it were a key, so the
   // padded call is compared against the same list with the sentinels removed
   // and the count reduced — which must be the identical answer.
@@ -1012,7 +1012,7 @@ TEST_CASE("mla_decode CPU: entries PAST valid_counts are ignored even when they 
   //
   // Upstream passes the count for a concrete reason: its `topk_indices_buffer`
   // is a persistent workspace REUSED across steps
-  // (`sparse_attn_indexer.py:426-430` pre-fills it, and
+  // (`sparse_attn_indexer.py:431-432` pre-fills it, and
   // `attention.py:759` narrows it to this step's tokens @ `bc2d63e650`), so the
   // slots past a row's live count can hold a PREVIOUS step's real positions
   // rather than sentinels. Reading them would be a silently wrong answer over

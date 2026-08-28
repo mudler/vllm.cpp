@@ -277,6 +277,15 @@ __global__ __launch_bounds__(kThreads) void MlaDecodeStage1(
       // -inf, so its softmax weight is exactly 0 and it neither shifts the
       // running max nor adds to the exp-sum. The key tile was still loaded from
       // position 0 above, which keeps the gather in range.
+      //
+      // A DIVERGENCE FROM THE CPU ARM, recorded rather than hidden. For `-1`
+      // the two agree. For an OUT-OF-RANGE position (`>= seq_len`) they do not:
+      // `cpu_mla_attn.cpp` REFUSES by name where this arm returns a number. It
+      // is unreachable from the current wiring — `vt::DsaTopkSelect` bounds
+      // every emitted position by `win_end` — so it is recorded under `## Owed`
+      // in `.agents/specs/dots3-note.md` instead of being aligned inside a
+      // review repair, because which arm is right is a decision about an
+      // ungated path on both of them.
       const int sel_j = sel != nullptr ? sel[b * sel_s0 + n0 + n] : 0;
       if (sel != nullptr && (sel_j < 0 || sel_j >= seq_len)) {
         qk[n] = -CUDART_INF_F;

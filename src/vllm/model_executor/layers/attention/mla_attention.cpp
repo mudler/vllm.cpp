@@ -578,8 +578,10 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   //     model is. It routes through `vt::LayerNorm`, weight and bias both.
   //   * the rope slice is the LEADING `[0, rope_dim)` of the indexer head, not
   //     the trailing one the MAIN MLA rope uses (`:804-806` against
-  //     mla.py:160-167). It routes through `vt::RopeFromCache` over a strided
-  //     leading-slice view.
+  //     mla.py:200-203, which is where the trailing-slice rope actually is at
+  //     this pin — `:160-167` is the `q_lora_rank is not None` assert block, so
+  //     that anchor was WRONG under a true claim). It routes through
+  //     `vt::RopeFromCache` over a strided leading-slice view.
   //   * the rope PAIRING follows `indexer_rope_interleave` (`:1159`) and is
   //     INDEPENDENT of the main rope's, which dots3-note fixes at GPT-J.
   // Both norms and both ropes are existing gated ops. A second copy of either

@@ -168,7 +168,7 @@ __global__ __launch_bounds__(kTopkThreads) void DsaTopkSelectKernel(
   const float* row = logits + static_cast<int64_t>(t) * lg_s0;
 
   // `-1` is the "no token" sentinel the topk buffer is pre-filled with
-  // (sparse_attn_indexer.py:426-430).
+  // (sparse_attn_indexer.py:431-432; `:426-430` is the comment above it).
   for (int i = tid; i < topk; i += kTopkThreads) dst[i] = -1;
   __syncthreads();
 

@@ -141,7 +141,7 @@ void DsaTopkSelectKernel(Queue&, Tensor& indices, Tensor& counts, const Tensor& 
     const int64_t n = std::max<int64_t>(0, s1 - s0);
     int32_t* dst = idx + t * indices.stride[0];
     // `-1` is the "no token" sentinel the topk buffer is pre-filled with
-    // (sparse_attn_indexer.py:426-430).
+    // (sparse_attn_indexer.py:431-432; `:426-430` is the comment above it).
     for (int64_t i = 0; i < topk; ++i) dst[i] = -1;
 
     if (n <= topk) {

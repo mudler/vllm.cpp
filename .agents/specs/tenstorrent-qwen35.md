@@ -14,13 +14,20 @@ arch wired onto TT and the e2e recipe this row mirrors
 `ACTIVE`. W0 (refusal sweep), W1 (op delta), W2a-W2c (bf16 cache arms,
 allow-list, L1 scatter fix, residency + stale-bytes repairs, the debug
 readback seam), W2b (TT golden pair, sacred 16/16, doctest 146/146), the
-first speed records, and the #1715 one-step profile are all landed — see
-`## Evidence`. The profile named the wall: host-side staging around the TT
-GEMM, no device kernel ranked (`#2107`). Owed next: **W4 — cut the host
-staging wall** (this row's active gate), then W3 leftovers, then the
-`docs/USAGE.md` weights entry that W2 landed without (also riding W4).
-Before W4, reconcile the stale parts of this spec: `## Git integration`'s
-base, and this section itself.
+first speed records, the #1715 one-step profile (0.104 tok/s eager wall,
+attributed to host staging), and **W4** — levers 1+2 of the staging
+breakdown: bulk bf16 staging + single-slot resolution, 0.104 → 0.177
+tok/s (+70%), `Numel()` 27.09% → 1.76%, review PASS; lever 3 (batch
+per-layer staging) NOT taken, the residual attributed to per-upload
+tt-metal-internal work (`#2107`) — are all landed; see `## Evidence`.
+The #1486 teardown fix and the #2115 opt-out-arm golden pair (each arm
+gates its own captured pair; both legs doctest 146/146) landed after it.
+The `docs/USAGE.md` weights entry is complete (file, bytes, repo @
+revision, sha256, refused arms). Owed next: **W3 leftovers** (d2h
+counter completeness, `conv_transposed` fast-path check, tests for
+both), then the W4 record's named next lever: a per-slot persistent
+device buffer written through the mesh command queue, which needs the
+tt-metal-internal half of W4's lever 2.
 
 ## Scope
 
@@ -263,9 +270,9 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `8f5d4e4ed` (bumped
-2026-08-27; the row's W2b/W2c and record waves landed since the original
-`175733000`). Branch `row/BACKEND-TENSTORRENT-QWEN35`, worktree
+in `.agents/developer-preferences.md`). Base `origin/main` @ `3fe34e2c6` (bumped
+2026-08-28; W4 #2118 and the #2115 opt-out-arm pair landed since the previous
+`8f5d4e4ed`). Branch `row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 
 ## Evidence

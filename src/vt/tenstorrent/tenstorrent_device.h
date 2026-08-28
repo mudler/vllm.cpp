@@ -252,4 +252,26 @@ inline GdnShadowTraffic GetGdnShadowTraffic() { return {}; }
 inline void ResetGdnShadowTraffic() {}
 #endif
 
+// ---- BACKEND-TENSTORRENT-QWEN35 W4 (#2107): bulk host→device staging -------
+// counters. The W4 gate pins the ROUTE, not only the bytes: EnsureDevice2D
+// must stage a contiguous bf16 master through the bulk path (raw bf16 bytes
+// handed to ttnn from_span — no f32 intermediate, no per-element dtype
+// dispatch), and the counter is the observable that proves the route ran for
+// a given staging. staged_f32_elems counts elements that still go through the
+// per-element f32 reference path (f16/f32 masters, genuine conversions — the
+// f32 logits GEMM output keeps its declared dtype). Implemented in
+// tenstorrent_ops.cpp; ttnn-free on the no-op arm.
+struct StagingStats {
+  uint64_t uploads_bulk_bf16 = 0;   // bulk bf16 uploads from EnsureDevice2D
+  uint64_t staged_bulk_bf16_bytes = 0;
+  uint64_t staged_f32_elems = 0;    // elements staged via the f32 path
+};
+#ifdef VLLM_CPP_TENSTORRENT
+StagingStats GetStagingStats();
+void ResetStagingStats();
+#else
+inline StagingStats GetStagingStats() { return {}; }
+inline void ResetStagingStats() {}
+#endif
+
 }  // namespace vt::tenstorrent

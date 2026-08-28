@@ -460,4 +460,15 @@ bool ManagedAllocActive(int index) noexcept {
   return caps.valid && UseManagedAlloc(caps);
 }
 
+size_t DeviceMemoryTotalBytes(int index) noexcept {
+  // Mirrors `Backend::DeviceMemoryInfo` (above) byte-for-byte, deliberately
+  // NOT calling it: this is a HIP-free, backend-registration-independent
+  // free function meant for the platform registrar (see the declaration),
+  // where `GetBackend(kROCM)` may not have run yet.
+  if (hipSetDevice(index) != hipSuccess) return 0;
+  size_t free_b = 0, tot_b = 0;
+  if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return 0;
+  return tot_b;
+}
+
 }  // namespace vt::rocm

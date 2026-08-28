@@ -2045,7 +2045,11 @@ TEST_CASE("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") {
     }
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kMoeSiluMul, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      // Wrapped for the same reason as the K-quant case below. This case is
+      // the standing red that issue #1954 tracks on gfx1200, and a bare
+      // CAPTURE logged its device as `1`, which is the one fact a reader
+      // needs from that log.
+      CAPTURE(std::string(DeviceName(dt)));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -2309,6 +2313,177 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
     }
   }
 }
+
+#if defined(VLLM_CPP_HIP)
+// Declared here rather than included: the ROCm kernels have no public header,
+// and src/vt/rocm/rocm_ops.hip:65 already reaches MatmulBTQuantKernelRocm by a
+// file-local extern declaration. This row mirrors that convention instead of
+// inventing a header it would be the only user of.
+namespace vt::rocm {
+int KQuantDecodeCoopWarps(vt::DType wdt, int64_t m, int64_t nsb);
+uint64_t KQuantCoopDispatchCount();
+}  // namespace vt::rocm
+
+TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
+  // Issue #1910: KQuantGemmK strides ONE warp's 32 lanes over nsb = K/256
+  // superblocks, so a 4096-wide projection (nsb = 16) leaves lanes 16..31 with
+  // nothing to do while the full 5-round reduction still runs — 195 of the 259
+  // decode dispatches the issue measured. The answer is llama.cpp's: put
+  // several warps on the same output row and split each superblock's eight
+  // sub-blocks between them (mmvq.cu calc_nwarps, the RDNA4 branch, pin
+  // b10451).
+  //
+  // It is gated for Q6_K ONLY, which is a measured restriction and not a
+  // scoping choice — Q4_K and Q5_K lose 1.5x to 1.8x at every width tried,
+  // because splitting a superblock re-reads its header once per warp and
+  // breaks the quant read's contiguity. The sweep is in the spec's
+  // `## Outcome`. Pinning the losing formats to the single-warp arm here is
+  // what stops the width being widened back to them without a measurement.
+  //
+  // Two things need gating and they fail differently. The dispatch POLICY is
+  // pinned below on any host, GPU or not. Whether the launcher actually reaches
+  // the cooperative arm cannot be read off the output, because the arm reduces
+  // the INTEGER dp4a accumulators across warps and so is bit-identical to the
+  // single-warp one by construction — a dispatch counter answers that, and the
+  // bit-identity itself is gated against the single-warp arm on real hardware.
+
+  // --- policy: pinned everywhere, including a HIP build with no board ---
+  // The issue's k=4096 decode shapes, and the boundary the trigger names.
+  const int w16 = vt::rocm::KQuantDecodeCoopWarps(DType::kQ6_K, 1, 16);
+  CHECK(w16 > 1);
+  CHECK(vt::rocm::KQuantDecodeCoopWarps(DType::kQ6_K, 1, 32) > 1);
+  // The launcher instantiates exactly one width; any other value falls through
+  // to the single-warp arm, so a policy that returns one would be a silent
+  // no-op rather than the dispatch this row measured.
+  CHECK(w16 == 8);
+  // The defect restated as the quantity that fixes it: every one of the w16
+  // warps has to receive a whole share of the superblock's eight sub-blocks,
+  // or a warp is dispatched with nothing to do — which is the failure the
+  // single-warp arm already had, moved one level up.
+  CHECK(8 % w16 == 0);
+  // k=12288 (nsb = 48) already packs all 32 lanes: the spec's gate requires
+  // that shape to keep the kernel and launch config it had.
+  CHECK(vt::rocm::KQuantDecodeCoopWarps(DType::kQ6_K, 1, 48) == 1);
+  // Prefill is out of this row's scope; m > 1 keeps the arm it had.
+  CHECK(vt::rocm::KQuantDecodeCoopWarps(DType::kQ6_K, 64, 16) == 1);
+  // Measured losers and a format that is a different kernel entirely.
+  CHECK(vt::rocm::KQuantDecodeCoopWarps(DType::kQ4_K, 1, 16) == 1);
+  CHECK(vt::rocm::KQuantDecodeCoopWarps(DType::kQ5_K, 1, 16) == 1);
+  CHECK(vt::rocm::KQuantDecodeCoopWarps(DType::kQ8_0, 1, 16) == 1);
+
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  // --- numeric: the cooperative arm is BIT-identical to the single-warp one ---
+  // m == 1 takes the cooperative arm and m == 2 does not, so running the same
+  // activation row under both and demanding byte equality is a direct read of
+  // the reassociation this row could have introduced and did not. Anything
+  // less than byte equality here is a token-exactness regression on a change
+  // that only moves work between lanes.
+  struct Fmt { DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  const Fmt fmts[] = {
+    {DType::kQ4_K, 144, 0, 2, "q4_K"},
+    {DType::kQ5_K, 176, 0, 2, "q5_K"},
+    {DType::kQ6_K, 210, 208, -1, "q6_K"},
+  };
+  // nsb = 16 is the issue's decode shape (cooperative); nsb = 48 is the
+  // k=12288 shape that must stay on the arm it had.
+  const int64_t ks[] = {4096, 12288};
+  constexpr int64_t N = 64;
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  for (const Fmt& f : fmts) {
+    for (int64_t K : ks) {
+      // Wrapped because doctest sends a `const char*` through
+      // `filldata<T*>` to `const volatile void*`, which no `operator<<`
+      // accepts and which therefore decays to `bool`. A bare CAPTURE of this
+      // field logs `1` instead of the format name.
+      CAPTURE(std::string(f.name));
+      CAPTURE(K);
+      const int64_t nsb = K / 256;
+      const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
+      const size_t wn = static_cast<size_t>(N) * row_bytes;
+      std::mt19937 rng(1910);
+      std::vector<uint8_t> wt(wn);
+      for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+      for (int64_t r = 0; r < N; ++r)
+        for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+          uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+          const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+          auto put16 = [&](int off, float v) {
+            uint16_t h = vt::F32ToF16(v);
+            std::memcpy(blk + off, &h, 2);
+          };
+          if (f.d_off >= 0) put16(f.d_off, 0.0125f * jitter);
+          if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+        }
+      const std::vector<float> row = RandomVec(static_cast<size_t>(K), 1911, -0.5f, 0.5f);
+      std::vector<float> act2(row);                       // two IDENTICAL rows
+      act2.insert(act2.end(), row.begin(), row.end());
+
+      std::vector<float> ref(static_cast<size_t>(N), 0.0f);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> ca = row;
+        std::vector<uint8_t> cw = wt;
+        Tensor tout = T2(ref.data(), cd, 1, N);
+        Tensor tact = T2(ca.data(), cd, 1, K);
+        Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+        vt::MatmulBTQuant(cq, tout, tact, twt);
+        cpu.DestroyQueue(cq);
+      }
+
+      Queue q = rocm.CreateQueue();
+      const Device d{DeviceType::kROCM, 0};
+      DevBufBytes dwt(rocm, q, wn);
+      dwt.Upload(wt.data());
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+
+      const uint64_t coop_before = vt::rocm::KQuantCoopDispatchCount();
+      std::vector<float> got1;
+      {
+        DevBuf da(rocm, q, static_cast<size_t>(K));
+        DevBuf dout(rocm, q, static_cast<size_t>(N));
+        da.Upload(row);
+        Tensor tact = T2(da.ptr(), d, 1, K);
+        Tensor tout = T2(dout.ptr(), d, 1, N);
+        vt::MatmulBTQuant(q, tout, tact, twt);
+        got1 = dout.Download();
+      }
+      const uint64_t coop_after = vt::rocm::KQuantCoopDispatchCount();
+      // Reachability: deleting the launcher's cooperative call site leaves this
+      // counter flat and reds the case, which no output comparison can do.
+      const bool coop_expected = f.dt == DType::kQ6_K && nsb <= 32;
+      if (coop_expected) CHECK(coop_after > coop_before);
+      else CHECK(coop_after == coop_before);
+
+      std::vector<float> got2;
+      {
+        DevBuf da(rocm, q, static_cast<size_t>(2 * K));
+        DevBuf dout(rocm, q, static_cast<size_t>(2 * N));
+        da.Upload(act2);
+        Tensor tact = T2(da.ptr(), d, 2, K);
+        Tensor tout = T2(dout.ptr(), d, 2, N);
+        vt::MatmulBTQuant(q, tout, tact, twt);
+        got2 = dout.Download();
+      }
+      rocm.DestroyQueue(q);
+
+      REQUIRE(got1.size() == static_cast<size_t>(N));
+      REQUIRE(got2.size() == static_cast<size_t>(2 * N));
+      // Byte equality, not a tolerance: same weights, same activation bytes.
+      CHECK(std::memcmp(got1.data(), got2.data(), static_cast<size_t>(N) * sizeof(float)) == 0);
+      CHECK(Nmse(ref, got1) <= kNmseTol);
+    }
+  }
+}
+#endif  // VLLM_CPP_HIP
 
 TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
   // kMatmulBTQuantGrouped on ROCm vs the CPU keep-quant reference

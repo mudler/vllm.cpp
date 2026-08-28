@@ -16,6 +16,7 @@
 
 #include "vt/ops.h"
 #include "vt/backend.h"
+#include "vt/fp8_kv.h"
 #include "vt/rocm/rocm_arch.h"
 
 #include <array>
@@ -145,6 +146,37 @@ __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
 }
 
+// fp8-e4m3 byte → f32 on device. Same arithmetic as vt::F8E4M3ToF32
+// (include/vt/fp8_kv.h:40-49) and the CUDA Fp8E4M3ToF32Dev
+// (cuda_paged_attn.cu:164), so ROCm==CPU==CUDA on the read is a property of
+// the source. Bit-identical to the F8E4M3ToF32 in rocm_fp8_channel_gemv.hip:22.
+__device__ inline float F8E4M3ToF32Dev(uint8_t byte) {
+  const uint32_t sign = static_cast<uint32_t>(byte >> 7) & 0x1U;
+  const uint32_t exp = static_cast<uint32_t>(byte >> 3) & 0xFU;
+  const uint32_t mant = static_cast<uint32_t>(byte) & 0x7U;
+  const float sm = sign ? -1.0f : 1.0f;
+  if (exp == 0xFU && mant == 0x7U) return 0.f;  // NaN → 0 (no NaN in finite KV)
+  if (exp == 0U) return sm * (static_cast<float>(mant) * (1.0f / 512.0f));
+  const float mantissa = 1.0f + static_cast<float>(mant) * (1.0f / 8.0f);
+  return sm * ldexpf(mantissa, static_cast<int>(exp) - 7);
+}
+
+// One K/V-cache element as f32, with the fp8 dequant folded in. INERT on the
+// float arms (forward to Ld unchanged), so every existing bf16/f32 caller
+// reads the same bytes in the same order. On uint8_t: Dequant(fp8) * scale.
+// Mirrors CUDA LoadKv (cuda_paged_attn.cu:175-185).
+__device__ inline float LoadKv(const float* p, int64_t i, float scale) {
+  (void)scale;
+  return Ld(p, i);
+}
+__device__ inline float LoadKv(const __hip_bfloat16* p, int64_t i, float scale) {
+  (void)scale;
+  return Ld(p, i);
+}
+__device__ inline float LoadKv(const uint8_t* p, int64_t i, float scale) {
+  return F8E4M3ToF32Dev(p[i]) * scale;
+}
+
 __device__ inline float Softcap(float s, float cap) {
   return cap > 0.f ? cap * tanhf(s / cap) : s;
 }
@@ -165,7 +197,8 @@ __global__ void PagedAttnOnline(TO* out, const TQ* query, const TKV* k_cache,
                                 int64_t block_size, int64_t bt_row, int64_t bt_col,
                                 int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
                                 int64_t vc_pg, int64_t vc_hd, float scale, float softcap,
-                                bool causal, int window_left, int window_right) {
+                                bool causal, int window_left, int window_right,
+                                float k_scale, float v_scale) {
   const int64_t t = blockIdx.x;
   const int64_t h = blockIdx.y;
   if (h >= hq) return;
@@ -231,14 +264,14 @@ __global__ void PagedAttnOnline(TO* out, const TQ* query, const TKV* k_cache,
         const int64_t nvec = d >> 2;
         for (int64_t v = threadIdx.x; v < nvec; v += blockDim.x) {
           const int64_t e = v << 2;
-          part += Ld(query, qoff + e) * Ld(k_cache, kbase + e);
-          part += Ld(query, qoff + e + 1) * Ld(k_cache, kbase + e + 1);
-          part += Ld(query, qoff + e + 2) * Ld(k_cache, kbase + e + 2);
-          part += Ld(query, qoff + e + 3) * Ld(k_cache, kbase + e + 3);
+          part += Ld(query, qoff + e) * LoadKv(k_cache, kbase + e, k_scale);
+          part += Ld(query, qoff + e + 1) * LoadKv(k_cache, kbase + e + 1, k_scale);
+          part += Ld(query, qoff + e + 2) * LoadKv(k_cache, kbase + e + 2, k_scale);
+          part += Ld(query, qoff + e + 3) * LoadKv(k_cache, kbase + e + 3, k_scale);
         }
       } else {
         for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
-          part += Ld(query, qoff + e) * Ld(k_cache, kbase + e);
+          part += Ld(query, qoff + e) * LoadKv(k_cache, kbase + e, k_scale);
       }
       red[threadIdx.x] = part;
       __syncthreads();
@@ -258,14 +291,14 @@ __global__ void PagedAttnOnline(TO* out, const TQ* query, const TKV* k_cache,
         const int64_t nvec = d >> 2;
         for (int64_t v = threadIdx.x; v < nvec; v += blockDim.x) {
           const int64_t e = v << 2;
-          acc[e] = acc[e] * corr + pw * Ld(v_cache, vbase + e);
-          acc[e + 1] = acc[e + 1] * corr + pw * Ld(v_cache, vbase + e + 1);
-          acc[e + 2] = acc[e + 2] * corr + pw * Ld(v_cache, vbase + e + 2);
-          acc[e + 3] = acc[e + 3] * corr + pw * Ld(v_cache, vbase + e + 3);
+          acc[e] = acc[e] * corr + pw * LoadKv(v_cache, vbase + e, v_scale);
+          acc[e + 1] = acc[e + 1] * corr + pw * LoadKv(v_cache, vbase + e + 1, v_scale);
+          acc[e + 2] = acc[e + 2] * corr + pw * LoadKv(v_cache, vbase + e + 2, v_scale);
+          acc[e + 3] = acc[e + 3] * corr + pw * LoadKv(v_cache, vbase + e + 3, v_scale);
         }
       } else {
         for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
-          acc[e] = acc[e] * corr + pw * Ld(v_cache, vbase + e);
+          acc[e] = acc[e] * corr + pw * LoadKv(v_cache, vbase + e, v_scale);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -1688,8 +1721,6 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                               const Tensor& v_cache, const Tensor& block_table,
                               const Tensor& seq_lens, const Tensor& query_start_loc,
                               const PagedAttentionArgs& args) {
-  VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kAuto,
-           "rocm paged_attention: fp8 KV not implemented");
   VT_CHECK(args.scale > 0.f, "rocm paged_attention: scale must be > 0");
   if (CpuRefEnabled()) {
     PagedAttnCpuRef(q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc,
@@ -1989,11 +2020,29 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
         num_reqs, hq, num_kv_heads, d, block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd,
         vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap, args.causal, window_left,
-        window_right);
+        window_right, args.k_scale, args.v_scale);
   };
 
-  if (query.dtype == DType::kBF16 && k_cache.dtype == DType::kBF16 &&
-      out.dtype == DType::kBF16) {
+  // fp8 KV-cache read: cache pages are uint8_t (DType::kI8), dequantized
+  // inside LoadKv. Only the correctness-grade PagedAttnOnline kernel serves
+  // fp8 — the decode-opt bf16 path stages __hip_bfloat16 fragments and a
+  // tensor-core fp8 read is a performance brick, not this one (same scope
+  // as the CUDA arm, spec W2).
+  const bool fp8 = args.kv_cache_dtype != Fp8KVCacheDataType::kAuto;
+  if (fp8) {
+    VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
+             "rocm paged_attention fp8: cache must be kI8");
+    if (query.dtype == DType::kBF16 && out.dtype == DType::kBF16) {
+      launch(__hip_bfloat16{}, uint8_t{}, __hip_bfloat16{});
+    } else if (query.dtype == DType::kF32 && out.dtype == DType::kF32) {
+      launch(float{}, uint8_t{}, float{});
+    } else if (query.dtype == DType::kBF16 && out.dtype == DType::kF32) {
+      launch(__hip_bfloat16{}, uint8_t{}, float{});
+    } else {
+      VT_CHECK(false, "rocm paged_attention fp8: unsupported query/output dtype");
+    }
+  } else if (query.dtype == DType::kBF16 && k_cache.dtype == DType::kBF16 &&
+             out.dtype == DType::kBF16) {
     launch(__hip_bfloat16{}, __hip_bfloat16{}, __hip_bfloat16{});
   } else if (query.dtype == DType::kF32 && k_cache.dtype == DType::kF32 &&
              out.dtype == DType::kF32) {

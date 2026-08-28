@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include "vllm/config/speculative.h"
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
@@ -2215,4 +2217,201 @@ TEST_CASE("runner: DeepSeek-V4's real 167-entry topology allocates end to end") 
   // ones, so the indexer key cache exists on 6 and not on 7.
   CHECK(runner.multi_kv_index().Find("model.layers.6.attn.indexer.k_cache") >= 0);
   CHECK(runner.multi_kv_index().Find("model.layers.7.attn.indexer.k_cache") == -1);
+}
+
+// ─── The reorder's DECODE THRESHOLD reaches the reorder (#2129) ──────────────
+//
+// Upstream resolves one `reorder_batch_threshold` and passes it into
+// `reorder_batch_to_split_decodes_and_prefills`
+// (gpu_model_runner.py:1126-1130 @ pin 5559679229); a backend that supports
+// spec-as-decode raises it to `1 + (2 if parallel_drafting else 1) * k`
+// (backend.py:657-687, requested by gdn_attn.py:112 for every speculative
+// configuration). W10 mirrored the arithmetic
+// (`SpecAsDecodeReorderThreshold`, include/vllm/v1/attention/backend.h) and
+// left the runner calling the reorder with no argument, so it took the
+// declaration default of 1.
+//
+// WHY THE ORDER IS THE OBSERVABLE, NOT THE TOKENS. The reorder is a
+// permutation and every consumer is built after it, so a wrong order changes
+// which lane a row is dispatched onto without changing what is emitted — the
+// acceptance-only failure class #1366 already fired. The gate is therefore
+// structural.
+//
+// THE DISCRIMINATING POPULATION. `ResolveMtp` leaves `parallel_drafting` false
+// (only `dflash`/`dspark` set it, speculative.py:963-964), so at k=8 the
+// threshold is exactly `1 + 1*8 == 9`. Four rows, all with context:
+//
+//   row  scheduled  still prefilling   region at 1   at 9 (mirrored)   at 17
+//   D1     1        no                 decode  0     decode  0         decode 0
+//   V9     9        no                 long_e  2     decode  0         decode 0
+//   X10   10        no                 long_e  2     long_e  2         decode 0
+//   C     15        yes                long_e  2     long_e  2         short  1
+//
+// admitted [C, X10, V9, D1]. `V9 before X10` is the one predicate that holds
+// ONLY at the mirrored value: at 1 the verify row is a long extend and sorts
+// behind X10; at 17 X10 is promoted to a decode and the min-swap partition puts
+// it ahead of V9. So neither dropping the argument nor widening the threshold
+// to the other arm of the formula can satisfy this case — both were run as
+// mutations and both red here.
+//
+// A hardcoded permutation would be the brittle way to say that, and the
+// 3-request case above explains why this file avoids one: upstream partitions
+// with minimum swaps, not a stable sort. The invariant asserted instead is the
+// reorder's own contract — the final order is NON-DECREASING in the region the
+// MIRRORED threshold assigns — plus the per-slot fields following whichever
+// request landed where.
+TEST_CASE("runner: the spec-as-decode reorder threshold reaches the reorder") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  // The public LoadedModel constructor is the one that carries a
+  // SpeculativeConfig; the concrete-weight overloads do not, and widening one
+  // would touch a region another row owns. Nothing is constructed by hand
+  // here: the runner is the production type and `execute_model` below is the
+  // production entry point the reorder sits in.
+  std::unique_ptr<vllm::LoadedModel> lm = vllm::BorrowQwen3_5MoeLoadedModel(w);
+  const vllm::SpeculativeConfig spec =
+      vllm::SpeculativeConfig::ResolveMtp(/*mtp_num_hidden_layers=*/1,
+                                          /*num_speculative_tokens=*/8);
+  REQUIRE_FALSE(spec.parallel_drafting);  // mtp is serial: threshold is 1 + k.
+  REQUIRE(spec.ResolvedNumSpeculativeTokens() == 8);
+  GPUModelRunner runner(c, *lm, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64, spec);
+
+  // C: chunked prefill continuation — 20-token prompt, 5 computed, 15 more
+  // this step. Has context, still prefilling, above the threshold.
+  std::vector<int32_t> c_prompt(20);
+  for (int i = 0; i < 20; ++i) c_prompt[static_cast<size_t>(i)] = 1 + i;
+  NewRequestData rc = MakeNewReq("C", c_prompt, {}, /*num_computed=*/5,
+                                 /*fa_blocks=*/{2, 3}, /*gdn_block=*/2,
+                                 Greedy());
+  // X10: done prefilling, 10 scheduled — one token ABOVE the threshold.
+  NewRequestData rx =
+      MakeNewReq("X10", {21, 22, 23, 24}, {25, 26, 27, 28, 29, 30, 31, 32, 33, 34},
+                 /*num_computed=*/4, /*fa_blocks=*/{1}, /*gdn_block=*/1,
+                 Greedy());
+  // V9: a verify row — done prefilling, 1+k == 9 scheduled, ON the threshold.
+  NewRequestData rv =
+      MakeNewReq("V9", {35, 36, 37, 38}, {39, 1, 2, 3, 4, 5, 6, 7, 8},
+                 /*num_computed=*/4, /*fa_blocks=*/{0}, /*gdn_block=*/0,
+                 Greedy());
+  // D1: a plain single-token decode — a decode at every threshold.
+  NewRequestData rd = MakeNewReq("D1", {9, 10, 11}, {12}, /*num_computed=*/3,
+                                 /*fa_blocks=*/{4}, /*gdn_block=*/3, Greedy());
+
+  SchedulerOutput so = NewStep(
+      {rc, rx, rv, rd}, {{"C", 15}, {"X10", 10}, {"V9", 9}, {"D1", 1}});
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());
+
+  const auto& ib = runner.input_batch();
+  REQUIRE(ib.num_reqs() == 4);
+  std::vector<std::string> order;
+  for (int i = 0; i < 4; ++i) {
+    REQUIRE(ib.req_ids[static_cast<size_t>(i)].has_value());
+    order.push_back(*ib.req_ids[static_cast<size_t>(i)]);
+  }
+  INFO("order: ", order[0], " ", order[1], " ", order[2], " ", order[3]);
+  const auto pos = [&order](const std::string& id) {
+    for (size_t i = 0; i < order.size(); ++i)
+      if (order[i] == id) return static_cast<int>(i);
+    return -1;
+  };
+
+  // THE DISCRIMINATOR. Only the mirrored threshold makes the verify row a
+  // decode while leaving X10 a long extend.
+  CHECK(pos("V9") < pos("X10"));
+  // And the plain decode is a decode too, so the decode region holds both.
+  CHECK(pos("D1") < pos("X10"));
+  CHECK(pos("D1") < pos("C"));
+  CHECK(pos("V9") < pos("C"));
+
+  // The reorder's contract: the batch is sorted by region
+  // decode(0) -> short_extend(1) -> long_extend(2) -> prefill(3), with the
+  // regions taken from the MIRRORED threshold of 9.
+  const std::map<std::string, int> want_region = {
+      {"D1", 0}, {"V9", 0}, {"X10", 2}, {"C", 2}};
+  for (int i = 1; i < 4; ++i) {
+    CAPTURE(i);
+    CHECK(want_region.at(order[static_cast<size_t>(i - 1)]) <=
+          want_region.at(order[static_cast<size_t>(i)]));
+  }
+
+  // The ordering-dependent per-slot fields follow the SAME order, so none of
+  // this can be satisfied by permuting req_ids alone.
+  const std::map<std::string, int> want_seq_len = {
+      {"D1", 4}, {"V9", 13}, {"X10", 14}, {"C", 20}};
+  const std::map<std::string, int> want_fa_block = {
+      {"D1", 4}, {"V9", 0}, {"X10", 1}, {"C", 2}};
+  const std::map<std::string, int> want_scheduled = {
+      {"D1", 1}, {"V9", 9}, {"X10", 10}, {"C", 15}};
+  const auto& am = runner.last_attn_meta();
+  const auto& step = runner.last_step();
+  const int cols = am.block_table_num_cols;
+  REQUIRE(am.seq_lens.size() == 4);
+  REQUIRE(step.query_start_loc.size() == 5);
+  CHECK(step.query_start_loc[0] == 0);
+  for (int i = 0; i < 4; ++i) {
+    const std::string& rid = order[static_cast<size_t>(i)];
+    CAPTURE(rid);
+    CHECK(am.seq_lens[static_cast<size_t>(i)] == want_seq_len.at(rid));
+    CHECK(am.block_table_tensor[static_cast<size_t>(i * cols)] ==
+          want_fa_block.at(rid));
+    CHECK(step.query_start_loc[static_cast<size_t>(i + 1)] -
+              step.query_start_loc[static_cast<size_t>(i)] ==
+          want_scheduled.at(rid));
+  }
+}
+
+// The non-speculative arm is byte-identical: `SpecAsDecodeReorderThreshold`
+// returns 1 for k <= 0, and `num_spec()` is 0 without a SpeculativeConfig. The
+// SAME four rows on a runner with no speculator keep the pre-#2129 partition,
+// in which only D1 is a decode and the 9-token row sorts with the long
+// extends. Deleting the threshold argument leaves this case green, which is
+// exactly what makes it the byte-identity pin rather than a second copy of the
+// gate above.
+TEST_CASE("runner: no speculator keeps the reorder threshold at 1") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+
+  std::vector<int32_t> c_prompt(20);
+  for (int i = 0; i < 20; ++i) c_prompt[static_cast<size_t>(i)] = 1 + i;
+  NewRequestData rc = MakeNewReq("C", c_prompt, {}, /*num_computed=*/5,
+                                 /*fa_blocks=*/{2, 3}, /*gdn_block=*/2,
+                                 Greedy());
+  NewRequestData rx =
+      MakeNewReq("X10", {21, 22, 23, 24}, {25, 26, 27, 28, 29, 30, 31, 32, 33, 34},
+                 /*num_computed=*/4, /*fa_blocks=*/{1}, /*gdn_block=*/1,
+                 Greedy());
+  NewRequestData rv =
+      MakeNewReq("V9", {35, 36, 37, 38}, {39, 1, 2, 3, 4, 5, 6, 7, 8},
+                 /*num_computed=*/4, /*fa_blocks=*/{0}, /*gdn_block=*/0,
+                 Greedy());
+  NewRequestData rd = MakeNewReq("D1", {9, 10, 11}, {12}, /*num_computed=*/3,
+                                 /*fa_blocks=*/{4}, /*gdn_block=*/3, Greedy());
+
+  SchedulerOutput so = NewStep(
+      {rc, rx, rv, rd}, {{"C", 15}, {"X10", 10}, {"V9", 9}, {"D1", 1}});
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());
+
+  const auto& ib = runner.input_batch();
+  REQUIRE(ib.num_reqs() == 4);
+  std::vector<std::string> order;
+  for (int i = 0; i < 4; ++i) {
+    REQUIRE(ib.req_ids[static_cast<size_t>(i)].has_value());
+    order.push_back(*ib.req_ids[static_cast<size_t>(i)]);
+  }
+  INFO("order: ", order[0], " ", order[1], " ", order[2], " ", order[3]);
+  // Only D1 is below a threshold of 1, so it is the only decode and it leads.
+  CHECK(order[0] == "D1");
+  // And the verify-shaped row is NOT promoted: it stays with the long extends.
+  const std::map<std::string, int> want_region = {
+      {"D1", 0}, {"V9", 2}, {"X10", 2}, {"C", 2}};
+  for (int i = 1; i < 4; ++i) {
+    CAPTURE(i);
+    CHECK(want_region.at(order[static_cast<size_t>(i - 1)]) <=
+          want_region.at(order[static_cast<size_t>(i)]));
+  }
 }

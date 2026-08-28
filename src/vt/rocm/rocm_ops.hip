@@ -30,6 +30,11 @@ void RopeFromCacheKernelRocm(Queue& q, Tensor& qs, Tensor* ks, const Tensor& pos
                              const Tensor& cache, const RopeArgs& args);
 void ReshapeAndCacheKernelRocm(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                                Tensor& v_cache, const Tensor& slot_mapping);
+void ReshapeAndCacheFp8KernelRocm(Queue& q, const Tensor& k, const Tensor& v,
+                                  Tensor& k_cache, Tensor& v_cache,
+                                  const Tensor& slot_mapping,
+                                  Fp8KVCacheDataType kind, float k_scale,
+                                  float v_scale);
 void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                               const Tensor& v_cache, const Tensor& block_table,
                               const Tensor& seq_lens, const Tensor& query_start_loc,
@@ -156,6 +161,9 @@ struct Registrar {
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernelRocm)));
+    RegisterOp(OpId::kReshapeAndCacheFp8, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<ReshapeAndCacheFp8Fn>(
+                   &ReshapeAndCacheFp8KernelRocm)));
     RegisterOp(OpId::kPagedAttention, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<PagedAttentionFn>(&PagedAttentionKernelRocm)));

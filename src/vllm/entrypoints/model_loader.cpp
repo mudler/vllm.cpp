@@ -2505,9 +2505,18 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // already excludes every load it could apply to.
       const bool policy_forces_full_expand =
           GgufPolicyForcesFullExpand(gguf_load_policy);
+      // BACKEND-ROCM (#1934): `allocates_bounded_device_memory()`, not
+      // `needs_weight_staging()`. The two questions differ (see the interface
+      // doc): this one asks whether `ResidentWeight` draws from a bounded
+      // device pool at all -- true on every non-CPU platform since issue
+      // #125's `is_cpu()` fix -- while `needs_weight_staging()` asks whether
+      // the FULLY-OPTIMIZED device-resident forward (several GDN kernel
+      // defaults) should run. Using the narrower predicate here is what makes
+      // this refusal reachable on ROCm without moving any of the other one's
+      // consumers; the row's spec records why that flag stays untouched.
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
-          target.needs_weight_staging(),
+          target.allocates_bounded_device_memory(),
           DeviceWeightBudgetBytes(
               target.residency_policy().device_memory_total_bytes),
           /*model_dtype_bytes=*/2, lane, policy_forces_full_expand);

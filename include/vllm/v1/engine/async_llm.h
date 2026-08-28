@@ -231,6 +231,22 @@ class AsyncLLM {
 
   std::vector<AsyncRequest> PublishPreparedWave(
       std::vector<PreparedRequest> prepared);
+
+  // The parallel-sampling fan-out (async_llm.py:386-399), shared by all three
+  // add_request overloads. Called ONLY when sampling_params.n > 1, so the n == 1
+  // path above stays byte-identical, exactly as upstream's `if is_pooling or
+  // params.n == 1` short-circuit (:382-384) and as
+  // LLMEngine::FanOutParallelSampling does on the synchronous side.
+  //
+  // Registers n children ("{idx}_{parent}", n == 1 params, seed + idx from
+  // ParentRequest::get_child_info) against ONE collector and the shared parent,
+  // so the OutputProcessor aggregates their CompletionOutputs into a single
+  // RequestOutput. Returns the PARENT id: that is what RequestOutput::request_id
+  // carries and what the caller aborts.
+  AsyncRequest PublishParallelSampling(
+      const EngineCoreRequest& request, std::optional<std::string> prompt,
+      std::shared_ptr<RequestOutputCollector> collector);
+
   void RunOutputHandler();
 
   InputProcessor& input_processor_;

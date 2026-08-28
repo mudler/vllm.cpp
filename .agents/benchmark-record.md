@@ -28912,3 +28912,154 @@ three orders of magnitude of host-side headroom before any device kernel is wort
 
 Next lever inside #1715: cache the resolved context/device/chip handles across calls, remove the
 `Numel()` hot path (hoist shape math out of per-call staging), and batch per-layer staging.
+
+## QWEN3.5-0.8B TT EAGER DECODE W4: bulk bf16 staging + single-slot resolution moved the wall 0.104 -> 0.177 tok/s (+70%); `Numel()` 27% -> 1.8%; the residual lead is tt-metal's own per-upload context/UMD/CQ work, which our file set cannot cache (#2107) (2026-08-27, `bench/tt-qwen35-profile-w4`, P150 `thalia`)
+
+Levers 1+2 of the W4 breakdown, landed on `row/BACKEND-TENSTORRENT-QWEN35`:
+
+- **Lever 1 (bulk the staging loop).** `EnsureDevice2D` stages a contiguous bf16
+  master as ONE `ttnn::Tensor::from_span<bfloat16>` over the master's own bytes
+  (`UploadRowsBf16`): no `std::vector<float>` intermediate, no per-element
+  `LoadElemF32` dispatch, no `Numel()` in the loop condition, no extra copy in
+  `UploadRows`, and no host-side f32->bf16 pass (tt-metal's `to_dtype`
+  short-circuits on a matching dtype). Bit-identical by construction: bf16->f32
+  widening is exact and packing a zero-low-half value back to bf16 returns the
+  same bits. f16/f32 masters keep the f32 reference arm; the f32 logits GEMM
+  output keeps its declared dtype.
+- **Lever 2 (cache resolved handles behind the slot structures).** ONE locked
+  probe in `EnsureDevice2D` now resolves the tracked fast paths (exact-shape
+  hit, same-numel reshape), the interior-view refusal and the host-refresh flag
+  — the pre-W4 shape re-probed the slot map under the mutex up to four times
+  per call. The device handle was already the cached `SharedMeshDevice()`.
+- **Lever 3 (batch per-layer staging): NOT taken.** The wall moved, and the
+  re-profile attributes the residual to per-upload tt-metal-internal work
+  inside `from_span`->`to_device` (fresh device-buffer allocation, cluster
+  queries, CQ completion polling) and to CPU-threadpool spin — neither is
+  per-layer batching. The next traceable hypothesis is a per-slot persistent
+  device buffer written through the mesh command queue (allocation-free
+  upload), which needs the tt-metal-internal half of lever 2.
+
+**Measurement** — same method as the #1715 before record: production entry
+point (`vllm-cli --device auto`), JIT-discard run first, one `$HOME/gpu.lock`
+hold, greedy 3-token leg, `perf record -F 199 -g`. Before: 28.934 s / 3 =
+**0.104 tok/s**. After: 16.961 s / 3 = **0.177 tok/s** (+70%).
+
+**Attribution shift** (before -> after, `--no-children`):
+`vt::Tensor::Numel()` 27.09% -> 1.76%; `EnsureDevice2D` flat 4.14% -> below the
+0.5% limit; the `EnsureDevice2D`->`MatmulBTKernel` 24.1% call-graph chain ->
+gone from the top; `bfloat16::from_float` 2.62% -> 1.09% (download-side
+residual); `transform_buffers<float,bfloat16>` 2.63% -> 0.97%. What is now the
+lead: TT context/UMD discovery + CQ bookkeeping — `MetalContext::instance`
+9.11%, `DeviceManager::get_active_device` 6.49%, `Cluster::get_chip` 5.24%,
+`get_closest_mmio_capable_chip` 2.17%, `read_cq_host_ptr` 4.93% — ~14.5% of the
+bigger before-pie became ~23% of a 41% smaller pie (absolute seconds ~flat),
+plus CPU threadpool spin (`PollForWork`+`ThreadReady`) 11.4% -> 19.2%.
+Evidence: [`../docs/bench-evidence/tt-qwen35-eager-profile-w4-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-profile-w4-20260827.log)
+(top flat section + the complete callgraphs of the top three entries, verbatim).
+
+**Gates.** Focused doctest green (new W4 case, 1353 assertions; the route is
+pinned by new `vt::tenstorrent` staging counters — a deleted bulk branch, an
+unwired counter, a corrupted payload and a view-staging-the-base window each
+went red and were restored byte-for-byte). Full TT suite 40/40 cases, 3757
+assertions. Sacred e2e, ambient leg: **16/16 prompts PASS, 0 forward-divergent,
+max gap 375 milli-nats <= 500**. `VT_TT_HOST_FREE_DECODE=0` leg: **anchor
+drift, and it is PRE-EXISTING, not W4** — prompt[2] tok=1 engine=15039 vs
+committed anchor 1814 reproduces byte-identically on base `0ac84a486` with the
+W4 change stashed and the binary rebuilt from it. Evidence:
+[`../docs/bench-evidence/tt-qwen35-eager-leg2-anchor-drift-20260827.log`](../docs/bench-evidence/tt-qwen35-eager-leg2-anchor-drift-20260827.log).
+Reported per the spec's stop conditions, not tuned, not waived: the eager
+leg-2 gate is honestly failing at this base and needs an owner outside the W4
+file set (engine/model layer, or a tt-metal pin move).
+
+**Open gaps.** The wall moved materially, so the Qwen3.5 TT row's next-gate
+cell in `docs/benchmarks/open-gaps.md` was updated with what moved and the
+per-slot-device-buffer hypothesis.
+## ROCM-KQUANT-NWARPS-DECODE — Q6_K decode gains a cooperative-warp arm, Q4_K/Q5_K measured and rejected (2026-08-26, `row/ROCM-KQUANT-NWARPS-DECODE`, [#1910](https://github.com/mudler/vllm.cpp/issues/1910))
+
+**Why this was measured.** #1910 found `KQuantGemmK` (RX 9060 XT, gfx1200,
+ROCm 7.2.3) idles 16 of 32 lanes on 195 of 259 decode dispatches, because
+`nsb = K/256 < 32`. The issue's own hypothesis (pack multiple outputs per
+warp) turned out to be the wrong port target: llama.cpp disables that path on
+every RDNA table and never benchmarked it there either way (`## Upstream
+anchor` in the row's spec). What llama.cpp does measure on RDNA4, for
+`ncols_dst == 1`, is `nwarps = 8` for `Q4_K`/`Q5_K`/`Q6_K` — that is what this
+row ports and measures against our own `Dot*K` bodies.
+
+**Full sweep, provenance, and every rejected width are in the row's own spec**,
+[`rocm-kquant-nwarps-decode.md`](specs/rocm-kquant-nwarps-decode.md)
+`## Outcome`, one `rocprofv3 --kernel-trace --stats` run per (format, shape),
+100 timed iterations after 20 warm-up, RX 9060 XT / gfx1200 / ROCm 7.2.3.
+That table is the primary record; this entry states only the shipped result
+and does not re-derive the sweep.
+
+**Result: `nwarps=8` ships for Q6_K only.** Q4_K and Q5_K lose 1.5x to 1.8x at
+every width {2, 4, 8} and every `nsb <= 32` shape measured, and the loss does
+not shrink as the split narrows — splitting a superblock re-reads its header
+once per warp and breaks one 128-byte contiguous quant read into eight
+32-byte ones, which costs a bandwidth-bound GEMV more than the extra resident
+warps buy. Q6_K wins because its per-lane dequant is register/scratch-heavy
+enough (272 B/thread scratch, 152 VGPRs single-warp vs 0 scratch, 72 VGPRs
+cooperative) that the occupancy gain outweighs the same traffic cost.
+`DotQ4K`/`DotQ5K`/`DotQ6K` are byte-for-byte the pre-row bodies; only Q6_K
+decode dispatches at `m == 1 && nsb <= 32` take the new
+`KQuantGemmKCoopQ6K<OutT, 8>` kernel.
+
+**End-to-end**, `rocprofv3` differencing `--max-tokens 4` against
+`--max-tokens 36` over 32 tokens, `Ornith-1.5-9B-Q4_K_M.gguf`, prompt "The
+capital of France is", batch 1, three runs per arm, spread under 0.9%:
+
+| | pre-row | this row | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmK<bf16, Q6_K>` family | 12.296 ms/tok | 11.154 | **1.102x** |
+| `KQuantGemm*` total | 22.566 | 21.459 | 1.052x |
+| total decode GPU time | 54.340 | 53.311 | 1.019x |
+
+The `nsb=48` shapes (`n=4096 k=12288`) keep their pre-row kernel and launch
+config unchanged, measured 345.9 -> 349.6 us/call, inside run-to-run spread —
+the no-regression bar `## Gate` set.
+
+**The issue's own 593 us/call figure was an average over three shapes and
+understated the true outlier 11x.** Bucketed by grid size: `nsb=48` at 345.9
+us/call (16 calls/tok), `n=1024` at 41.3 (4 calls/tok), and lm_head
+(`n=248320`, one call/tok) at **6562.7** — 53% of that bucket's time and 12%
+of all decode GPU time in one dispatch. After this row: lm_head 6562.7 ->
+5425.3 us/call (1.21x), `n=1024` 41.3 -> 27.1 (1.52x).
+
+**Correctness is byte-identity, not the family's NMSE tolerance.** The
+cross-warp reduction carries the integer `dp4a` accumulator, so partial sums
+reassemble exactly across warps and the one f32 scale expression per
+superblock is unchanged; `-ffp-contract=off` removes the remaining way two
+spellings could diverge. Verified host-side (80,000 random split
+combinations, 0 mismatches) and on hardware (`m==1` cooperative vs `m==2`
+single-warp on the identical activation row return identical bytes, Q4_K/
+Q5_K/Q6_K at `nsb` 16 and 48). Independently reproduced by a fresh review
+within 1% on every number above.
+
+**Standing gap, unrelated to this row's kernel.** `test_backend_cross_device`
+is red on gfx1200 before and after this row (`MoeSiluMul` bf16 exactness,
+proven pre-existing by reverting to the parent commit and rebuilding). Filed
+as [#1954](https://github.com/mudler/vllm.cpp/issues/1954); this row's gate
+is reported as one expected pre-existing failure, never as a clean pass.
+
+**Not established, and not claimed.** No ceiling. `QuantizeQ8KK`
+(#1876) is now the single largest decode kernel at 12.87 ms/tok, 24.2% of
+decode, unmoved by this row. `GroupedKQ8K` (the MoE path) and `Q8_0GemmK`
+are the same defect class and untouched. Row-packing (`rows_per_cuda_block`)
+for Q4_K/Q5_K is the open next hypothesis, not yet its own row. One model,
+one prompt, batch 1, gfx1200 only.
+
+### Reproduce
+
+```sh
+nix develop .#rocm-shell --command bash -c '
+  cmake -S . -B build-hip -G Ninja -DVLLM_CPP_HIP=ON \
+    -DVLLM_CPP_HIP_ARCHITECTURES=gfx1200 -DROCM_PATH=$ROCM_PATH \
+    -DCMAKE_BUILD_TYPE=Release &&
+  cmake --build build-hip -j4 &&
+  flock $HOME/gpu.lock -c '\''rocprofv3 --kernel-trace --stats \
+    -- build-hip/examples/vllm-cli --model Ornith-1.5-9B-Q4_K_M.gguf \
+    --max-tokens 4 --device auto'\'''
+```
+Differenced against the identical invocation at `--max-tokens 36`; both legs
+under the same `flock`, never interleaved with unrelated GPU work on this
+non-fleet box.

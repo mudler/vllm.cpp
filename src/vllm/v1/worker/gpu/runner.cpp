@@ -936,13 +936,18 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             .kv_cache_spec.get());
     VT_CHECK(mamba_spec != nullptr,
              "runner: recurrent cache group must carry a MambaSpec");
-    // `>= 2` rather than `== 2`, and the LENGTHS MUST AGREE — the second half
-    // was never checked, so a spec with two shapes and one dtype read
-    // `dtypes[1]` out of bounds. The lower bound stays 2 because
-    // `GdnStateCache` still publishes `conv_state` and `ssm_state` as named
-    // fields that every model consumer in this tree reads; a one-state group
-    // (upstream `ShortConv`) is refused rather than truncated, and is recorded
-    // under `## Owed` in `.agents/specs/recurrent-multistate.md`.
+    // `>= 2` rather than `== 2`, and the lengths must agree. The widening is
+    // justified by the upstream anchor above and by expressibility, and by
+    // nothing else: it closes no bug. A two-shape/one-dtype spec was already
+    // refused before this row, by the CONJUNCTIVE `shapes.size() == 2 &&
+    // dtypes.size() == 2` that stood here, and again by the
+    // `shapes.size() != dtypes.size()` throw in `MambaSpec::page_size_bytes`
+    // (`src/vllm/v1/kv_cache_interface.cpp:210-213`) ahead of its own zip.
+    // The lower bound stays 2 because `GdnStateCache` still publishes
+    // `conv_state` and `ssm_state` as named fields that every model consumer in
+    // this tree reads; a one-state group (upstream `ShortConv`) is refused
+    // rather than truncated, and is recorded under `## Owed` in
+    // `.agents/specs/recurrent-multistate.md`.
     VT_CHECK(mamba_spec->shapes.size() >= 2 &&
                  mamba_spec->shapes.size() == mamba_spec->dtypes.size(),
              "runner: recurrent MambaSpec must carry at least a conv and a "

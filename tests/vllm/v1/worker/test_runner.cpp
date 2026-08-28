@@ -886,30 +886,57 @@ TEST_CASE("runner: a recurrent group carries N states, not two") {
         recurrent_bytes);
 }
 
+// Each subcase asserts the refusal MESSAGE, and that is the whole point of the
+// case. MEASURED: with a bare `CHECK_THROWS` this case is GREEN under the M1
+// mutation that restores the old `shapes.size() == 2` refusal — every one of
+// the three inputs still throws there, at the OLD message, for a reason that
+// has nothing to do with what the subcase is named after. A case that cannot
+// tell the widened refusal from the one it replaced gates nothing; the message
+// is the only thing that separates them. See the mutation record in
+// `.agents/specs/recurrent-multistate.md`.
 TEST_CASE("runner: a malformed recurrent MambaSpec is REFUSED by name") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
-  const auto build = [&](KVCacheConfig kv) {
-    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
-                          /*max_num_batched_tokens=*/64);
+  // Returns the refusal text, or the empty string when nothing was thrown, so
+  // a silent acceptance fails the substring check rather than escaping it.
+  const auto refusal = [&](KVCacheConfig kv) {
+    try {
+      GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                            /*max_num_batched_tokens=*/64);
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+    return std::string();
   };
 
   SUBCASE("shapes and dtypes of different length") {
-    // Never checked before this row: `dtypes[1]` was read out of bounds.
-    CHECK_THROWS(build(MakeMultiStateKvConfig(
+    // Refused at the base tree too, by the CONJUNCTIVE `== 2` that stood here
+    // and by `MambaSpec::page_size_bytes` — this row did not close an
+    // out-of-bounds read, and it does not claim to. What it must not do is
+    // stop refusing while it widens the count.
+    const std::string msg = refusal(MakeMultiStateKvConfig(
         c, {{64, 3}, {4, 8, 8}, {kMsHistElems}},
-        {DType::kF32, DType::kF32})));
+        {DType::kF32, DType::kF32}));
+    INFO("refusal: " << msg);
+    CHECK(msg.find("with one dtype per shape") != std::string::npos);
   }
   SUBCASE("a single state (upstream ShortConv) is refused, not truncated") {
-    CHECK_THROWS(
-        build(MakeMultiStateKvConfig(c, {{64, 3}}, {DType::kF32})));
+    const std::string msg =
+        refusal(MakeMultiStateKvConfig(c, {{64, 3}}, {DType::kF32}));
+    INFO("refusal: " << msg);
+    CHECK(msg.find("must carry at least a conv and a temporal state") !=
+          std::string::npos);
   }
   SUBCASE("a block-quantized state dtype is refused") {
     // `vt::SizeOf` has no per-element answer for a block encoding, so a page
-    // sized from one would be arithmetic on a number that does not exist.
-    CHECK_THROWS(build(MakeMultiStateKvConfig(
+    // sized from one would be arithmetic on a number that does not exist. This
+    // is a THREE-state spec, so under the old `== 2` refusal it threw for the
+    // count and never reached the dtype predicate at all.
+    const std::string msg = refusal(MakeMultiStateKvConfig(
         c, {{64, 3}, {4, 8, 8}, {kMsHistElems}},
-        {DType::kF32, DType::kF32, DType::kQ8_0})));
+        {DType::kF32, DType::kF32, DType::kQ8_0}));
+    INFO("refusal: " << msg);
+    CHECK(msg.find("has no per-element size") != std::string::npos);
   }
 }
 

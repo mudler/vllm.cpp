@@ -437,6 +437,33 @@ gets mistakenly called done. W5 and W0 therefore stay `OPEN` in this table, the
 `## Now` section states them, and `docs/FEATURES.md` may not carry a ✅ for
 this capability until one of them lands.
 
+### W3d — the fp4 refusal, restored AT THE SEAM ([#2309](https://github.com/mudler/vllm.cpp/issues/2309))
+
+`RunMoeBlockPlaced` refused to place a layer whose routed experts are
+fp4-resident. W3c moved every architecture onto the shared seam and did not
+carry that refusal across; the old helper became dead code and the live path
+accepted the arm.
+
+Placing an fp4-resident arm uploads every expert at load and then computes on
+the host across the bus, which is slower than not placing. **A token gate cannot
+see it** — the tokens stay correct and only the placement is wrong — so nothing
+in this tree would have reported it.
+
+The refusal now lives on the seam itself as a `placeable` / `unplaceable_reason`
+contract, not in each caller, so a newly wired architecture inherits it instead
+of having to remember it. It fires only when a placement is actually in force
+(`placed_on != engine_device`), so an ordinary unplaced load is untouched — a
+guard that fired there would break every load, which is the opposite failure and
+just as bad.
+
+Proved by mutation, not by reading: with the guard rewritten to never fire and
+still compiling clean (rc=0, zero errors), `test_device_placement` goes red at 1
+case and 2 assertions. The first attempt at this mutation FAILED TO COMPILE
+under `-Werror` on the now-unused parameters, and the stale binary reported
+19/19 SUCCESS — a passing mutant that proved nothing. The compiling mutant is
+the evidence; the build's exit code is part of it.
+
+
 ## Risks and decisions
 
 - **The bandwidth ratio is assumed, not measured.** Every number in that table comes

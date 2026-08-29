@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -66,15 +67,39 @@ namespace vllm {
 // (`ENG-QWEN35-SHARED-GLUE`), so the template parameters bought nothing and are
 // gone. What remains are two SHAPES, and the difference between them is a real
 // one about ownership rather than about types.
+// WHY A `placeable` FLAG RATHER THAN A CHECK INSIDE THE SEAM. The seam is
+// templated over a lambda and never sees the weights, so it cannot inspect them.
+// The architecture can: it knows whether ITS experts are in a form a placement
+// would help or hurt. Passing that in keeps the seam generic and puts the
+// knowledge where it lives.
+//
+// THE CASE THIS EXISTS FOR, and it is a regression this file already shipped
+// once. An fp4-RESIDENT expert arm builds its device residents EAGERLY at load,
+// so placing it uploads every expert and then computes on the host across the
+// bus — strictly worse than not placing. W3b refused that by name; the W3c
+// refactor moved every architecture onto this seam and did NOT carry the refusal
+// across, leaving the old helper dead and the live path unguarded. A TOKEN GATE
+// CANNOT SEE THAT DEFECT: the tokens stay right while the path moves twice the
+// bytes. It REFUSES rather than silently running unplaced, because quietly not
+// doing what the operator asked is the invisible-fallback shape this tree rejects.
 template <class Body>
 dense_attn::DBuf RunMoePlaced(dense_attn::Dev engine, int64_t layer_index,
                               const vt::Tensor& dh, int64_t T, int64_t H,
-                              Body&& body) {
+                              Body&& body, bool placeable = true,
+                              const char* unplaceable_reason = nullptr) {
   const MoePlacementPlan& plan = ActiveMoePlacementPlan();
   const vt::DeviceType engine_device = engine.q.device.type;
   const vt::DeviceType placed_on = plan.PlacesAnything()
                                        ? plan.DeviceForLayer(layer_index)
                                        : engine_device;
+  if (placed_on != engine_device && !placeable) {
+    throw std::invalid_argument(
+        std::string("device placement: this layer's routed experts cannot be "
+                    "placed") +
+        (unplaceable_reason ? std::string(" - ") + unplaceable_reason : "") +
+        ". Refusing rather than placing them anyway, because that would be "
+        "slower than not placing and a token gate would not show it.");
+  }
   if (placed_on == engine_device) {
     // THE UNPLACED PATH, and it is the existing call with nothing around it: no
     // copy, no allocation, and the value the architecture already produced.
@@ -123,12 +148,21 @@ struct MoePlacedOutput {
 template <class Body>
 MoePlacedOutput RunMoePlacedPair(dense_attn::Dev engine, int64_t layer_index,
                                  const vt::Tensor& dh, int64_t T, int64_t H,
-                                 Body&& body) {
+                                 Body&& body, bool placeable = true,
+                                 const char* unplaceable_reason = nullptr) {
   const MoePlacementPlan& plan = ActiveMoePlacementPlan();
   const vt::DeviceType engine_device = engine.q.device.type;
   const vt::DeviceType placed_on = plan.PlacesAnything()
                                        ? plan.DeviceForLayer(layer_index)
                                        : engine_device;
+  if (placed_on != engine_device && !placeable) {
+    throw std::invalid_argument(
+        std::string("device placement: this layer's routed experts cannot be "
+                    "placed") +
+        (unplaceable_reason ? std::string(" - ") + unplaceable_reason : "") +
+        ". Refusing rather than placing them anyway, because that would be "
+        "slower than not placing and a token gate would not show it.");
+  }
   if (placed_on == engine_device) return body(engine, dh);
 
   const size_t bytes = static_cast<size_t>(T) * static_cast<size_t>(H) *

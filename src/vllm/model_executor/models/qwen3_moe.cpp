@@ -106,10 +106,14 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
   // it; `RunMoePlaced` is the one place the transfer lives, and it is inert by
   // construction when the layer is not placed.
   MoePlacedOutput moe = RunMoePlacedPair(
-      d, layer_index, dh2.t(), T, H, [&](Dev p, const Tensor& h) {
+      d, layer_index, dh2.t(), T, H,
+      [&](Dev p, const Tensor& h) {
         MoeBlockOutput o = RunMoeBlock(p.q, layer.moe, cfg, h, T);
         return MoePlacedOutput{o.tensor, std::move(o.storage)};
-      });
+      },
+      /*placeable=*/layer.moe.expert_gate_fp4.empty(),
+      "the routed experts are fp4-resident and their device residents are "
+      "built at load");
   hidden = moe.tensor;
   hidden_hold = std::move(moe.storage);
 }

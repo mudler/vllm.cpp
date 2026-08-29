@@ -678,7 +678,15 @@ KDA_MAP = {
     "self_attn.g_b_proj.weight": "ssm_g_b.weight",
     "self_attn.b_proj.weight":   "ssm_beta.weight",
     "self_attn.A_log":           "ssm_a",
-    "self_attn.dt_bias":         "ssm_dt",
+    # `ssm_dt.bias`, NOT `ssm_dt`. llama.cpp #27752 @ `8a8d0bcc4` renames the
+    # parameter before its generic map sees it -- `conversion/glm5next.py`:
+    # `if name.endswith(".dt_bias"): name = name.rpartition(".dt_bias")[0] +
+    # ".dt_proj.bias"` -- so it resolves through `MODEL_TENSOR.SSM_DT` and
+    # lands as `blk.N.ssm_dt.bias`. Its own comment says why: "the time-step
+    # bias to be named like a bias so it is not loaded as a MUL_MAT weight."
+    # The published `unsloth/GLM-5.3-Flash-GGUF` artifact carries `ssm_dt.bias`
+    # on all 34 KDA blocks and no `ssm_dt` anywhere (#2242).
+    "self_attn.dt_bias":         "ssm_dt.bias",
     "self_attn.o_norm.weight":   "ssm_norm.weight",
 }
 
@@ -688,7 +696,6 @@ DSA_MAP = {
     "self_attn.q_b_proj.weight":            "attn_q_b.weight",
     "self_attn.kv_a_proj_with_mqa.weight":  "attn_kv_a_mqa.weight",
     "self_attn.kv_a_layernorm.weight":      "attn_kv_a_norm.weight",
-    "self_attn.kv_b_proj.weight":           "attn_kv_b.weight",
     "self_attn.o_proj.weight":              "attn_output.weight",
     "self_attn.indexer.wq_b.weight":        "indexer.attn_q_b.weight",
     "self_attn.indexer.wk.weight":          "indexer.attn_k.weight",
@@ -697,6 +704,24 @@ DSA_MAP = {
     "self_attn.indexer.weights_proj.weight": "indexer.proj.weight",
     "self_attn.indexer.index_kpool_compress_ape":  "indexer_compressor_ape.weight",
     "self_attn.indexer.index_kpool_compress_gate": "indexer_compressor_gate.weight",
+}
+
+# ONE HF parameter, TWO GGUF tensors, and the first is TRANSPOSED. Inherited
+# from `DeepseekV2Model.modify_tensors` (llama.cpp #27752 @ `8a8d0bcc4`,
+# `conversion/deepseek.py`, "note: MLA with the absorption optimization, needs
+# these two split and k_b_proj transposed"):
+#
+#     kv_b = W.view(n_head_kv, v_head_dim + qk_nope_head_dim, -1)
+#     k_b, v_b = split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
+#     k_b = k_b.transpose(1, 2)
+#
+# It is NOT in `DSA_MAP` because a dict cannot carry one key twice, and it is
+# keyed by the same `[k]` / `[v]` selector `Glm5NextMlaKvBSplitTensorMap` uses
+# on the C++ side so the two tables stay comparable key for key. The selector is
+# not a tensor name and nothing looks it up.
+MLA_KV_B_SPLIT = {
+    "self_attn.kv_b_proj.weight[k]": "attn_k_b.weight",
+    "self_attn.kv_b_proj.weight[v]": "attn_v_b.weight",
 }
 
 COMMON_MAP = {
@@ -808,12 +833,21 @@ def pick_type(gguf_name, shape, arm):
 class Plan:
     """One output tensor: where its bytes come from and what they become."""
 
-    def __init__(self, gguf_name, sources, shape, ggml_type, kind):
+    def __init__(self, gguf_name, sources, shape, ggml_type, kind,
+                 transform=None):
         self.gguf_name = gguf_name
         self.sources = sources        # list of HF tensor names, stacked in order
         self.shape = shape            # logical shape, numpy/torch order
         self.ggml_type = ggml_type
         self.kind = kind              # "plain" | "stacked"
+        # A pure f32 -> f32 rewrite of the CONCATENATED source values, applied
+        # before the rows are reshaped and encoded. It may change the element
+        # COUNT (the `kv_b_proj` split does) and the ORDER (the `k_b`
+        # transpose does), which is why it runs on the flat array and `shape`
+        # is stated independently. `None` is the identity, and every non-None
+        # transform in this file inverts or mirrors a named llama.cpp #27752
+        # convention.
+        self.transform = transform
         self.nbytes = type_nbytes(shape, ggml_type)
 
     @property
@@ -832,6 +866,50 @@ def _layer_types(text_cfg):
     return lt
 
 
+def _add_kv_b_split(add, st, text_cfg, base, layer):
+    """Emit `attn_k_b` and `attn_v_b` from the one HF `kv_b_proj`.
+
+    Mirrors `DeepseekV2Model.modify_tensors` at llama.cpp #27752 head
+    `8a8d0bcc4d5fdf024c457526245bec4bc3a12adc` (`conversion/deepseek.py`):
+    the absorbed MLA form needs the two halves separate and `k_b` transposed,
+    so ONE parameter becomes TWO tensors with different shapes. A KDA layer has
+    no `kv_b_proj` and this returns without emitting anything.
+    """
+    hf = base + "self_attn.kv_b_proj.weight"
+    if not st.has(hf):
+        return
+    heads = int(text_cfg["num_key_value_heads"])
+    qk_nope = int(text_cfg["qk_nope_head_dim"])
+    v_head = int(text_cfg["v_head_dim"])
+    shape = st.shape(hf)
+    if len(shape) != 2 or shape[0] != heads * (qk_nope + v_head):
+        raise SystemExit(
+            "convert-glm5-next-gguf: layer %d's `kv_b_proj.weight` is %s, but "
+            "num_key_value_heads * (qk_nope_head_dim + v_head_dim) is "
+            "%d * (%d + %d) = %d rows. Upstream asserts this exact identity "
+            "before splitting, so a disagreement means the split would cut the "
+            "tensor in the wrong place."
+            % (layer, shape, heads, qk_nope, v_head,
+               heads * (qk_nope + v_head)))
+    kv_lora = shape[1]
+
+    def k_half(a):
+        w = a.reshape(heads, qk_nope + v_head, kv_lora)
+        # `k_b.transpose(1, 2)`: [heads, qk_nope, kv_lora] -> [heads, kv_lora,
+        # qk_nope]. The transpose is upstream's, not an optimisation here.
+        return np.ascontiguousarray(
+            w[:, :qk_nope, :].transpose(0, 2, 1)).reshape(-1)
+
+    def v_half(a):
+        w = a.reshape(heads, qk_nope + v_head, kv_lora)
+        return np.ascontiguousarray(w[:, qk_nope:, :]).reshape(-1)
+
+    add("blk.%d.%s" % (layer, MLA_KV_B_SPLIT["self_attn.kv_b_proj.weight[k]"]),
+        [hf], [heads, kv_lora, qk_nope], transform=k_half)
+    add("blk.%d.%s" % (layer, MLA_KV_B_SPLIT["self_attn.kv_b_proj.weight[v]"]),
+        [hf], [heads, v_head, kv_lora], transform=v_half)
+
+
 def build_plan(st, cfg, arm, keep_mtp, want_vision):
     text = cfg["text_config"]
     n_layers = int(text["num_hidden_layers"])
@@ -845,9 +923,9 @@ def build_plan(st, cfg, arm, keep_mtp, want_vision):
     plans = []
     skipped = []
 
-    def add(gguf_name, hf_names, shape, kind="plain"):
+    def add(gguf_name, hf_names, shape, kind="plain", transform=None):
         t = pick_type(gguf_name, shape, arm)
-        plans.append(Plan(gguf_name, hf_names, shape, t, kind))
+        plans.append(Plan(gguf_name, hf_names, shape, t, kind, transform))
 
     def logical(name):
         # The FP8 form stores one byte per element, so the safetensors shape IS
@@ -888,7 +966,20 @@ def build_plan(st, cfg, arm, keep_mtp, want_vision):
             hf = base + hf_suffix
             if not st.has(hf):
                 continue
-            add("blk.%d.%s" % (L, gg_suffix), [hf], logical(hf))
+            # `ssm_a` is NOT `A_log`. llama.cpp #27752 @ `8a8d0bcc4` writes the
+            # already-negated exponential -- `conversion/glm5next.py`:
+            # `if name.endswith(".A_log"): data_torch =
+            # -torch.exp(data_torch.float())`, with the comment "the graph
+            # expects ssm_a to already hold -exp(A_log)". Every value it writes
+            # is therefore strictly negative, and the loader recovers `A_log`
+            # as `log(-x)` and REFUSES a non-negative entry by name. Writing
+            # `A_log` raw here produced a file this project could not read
+            # (#2242).
+            tf = None
+            if hf_suffix == "self_attn.A_log":
+                tf = lambda a: -np.exp(a)  # noqa: E731 — one expression
+            add("blk.%d.%s" % (L, gg_suffix), [hf], logical(hf), transform=tf)
+        _add_kv_b_split(add, st, text, base, L)
         sparse = (mlp_types[L] if L < len(mlp_types)
                   else ("sparse" if st.has(base + "mlp.gate.weight") else "dense"))
         if sparse == "dense":
@@ -1162,8 +1253,20 @@ def materialize(st, plan, block):
             vals = _bf16_to_f32(raw)
         else:
             vals = np.asarray(raw, dtype=f32)
-        chunks.append(np.ascontiguousarray(vals, dtype=f32).reshape(-1, ne0))
-    return np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+        chunks.append(np.ascontiguousarray(vals, dtype=f32).reshape(-1))
+    flat = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+    if plan.transform is not None:
+        flat = np.ascontiguousarray(plan.transform(flat), dtype=f32)
+    want = 1
+    for d in plan.shape:
+        want *= d
+    if flat.size != want:
+        raise SystemExit(
+            "convert-glm5-next-gguf: %s materialized %d values but its planned "
+            "shape %s needs %d. The header already reserved bytes for the "
+            "planned shape, so nothing is written past this point."
+            % (plan.gguf_name, flat.size, plan.shape, want))
+    return flat.reshape(-1, ne0)
 
 
 def main(argv=None):

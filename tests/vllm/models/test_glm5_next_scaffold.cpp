@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -38,6 +39,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"            // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"  // GDNAttentionMetadata
+#include "vllm/v1/kv_cache_interface.h"           // KVCacheConfig, the three specs
 #include "vt/device.h"
 
 using vllm::Glm5NextExpectedGgufTensors;
@@ -106,6 +108,32 @@ HfConfig ConfigFrom(const nlohmann::json& doc) {
 }
 
 HfConfig PublishedConfig() { return ConfigFrom(PublishedConfigJson()); }
+
+// The published config with a DIFFERENT per-layer attention schedule, and with
+// the two companion lists rewritten to match. `period` 0 makes every layer KDA,
+// `period` 1 makes every layer DSA, and any `p >= 2` makes every `p`-th layer
+// DSA. Upstream's `layer_types` is the authority and W1's parser refuses a
+// `linear_attn_config.{kda_layers,full_attn_layers}` that contradicts it, so a
+// case that edited only `layer_types` would be refused for disagreeing with
+// itself rather than exercising the cache.
+nlohmann::json ScheduleConfigJson(int period) {
+  nlohmann::json doc = PublishedConfigJson();
+  const int n = doc["text_config"]["num_hidden_layers"].get<int>();
+  std::vector<std::string> types;
+  std::vector<int> kda;
+  std::vector<int> full;
+  for (int i = 0; i < n; ++i) {
+    const bool dsa = period == 0    ? false
+                     : period == 1  ? true
+                                    : (i % period == period - 1);
+    types.push_back(dsa ? "deepseek_sparse_attention" : "linear_attention");
+    (dsa ? full : kda).push_back(i);
+  }
+  doc["text_config"]["layer_types"] = types;
+  doc["text_config"]["linear_attn_config"]["kda_layers"] = kda;
+  doc["text_config"]["linear_attn_config"]["full_attn_layers"] = full;
+  return doc;
+}
 
 }  // namespace
 
@@ -615,14 +643,17 @@ TEST_CASE("glm5_next: the architecture RESOLVES through the production registry"
                        std::runtime_error);
 }
 
-TEST_CASE("glm5_next: the forward and the KV spec REFUSE BY NAME") {
+TEST_CASE("glm5_next: the forward REFUSES BY NAME, and names what is UNASSEMBLED") {
   const std::vector<std::string> archs = {"Glm5NextForConditionalGeneration"};
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(archs);
 
-  // The forward. WHAT THE REFUSAL BUYS is precision about a wrong MODEL, not a
-  // wrong number: two of the primitives it names LOOK implemented in this tree
-  // and are the wrong function for this model, so the message has to say which
-  // and why.
+  // WHAT THE REFUSAL BUYS is precision about a wrong MODEL, not a wrong number.
+  // Four of this model's primitives now exist and are gated (W2's KDA sigmoid
+  // gate, W3's NoPE MLA + k-pool indexer, W4's unweighted mHC collapse, W5's
+  // 288+1 MoE) and NOTHING assembles them, so the message names the assembly
+  // waves rather than the primitives. Two of the four have LOOK-ALIKES in this
+  // tree that are the wrong function for this model, and the message still says
+  // which and why.
   REQUIRE(reg.factory->forward != nullptr);
   ForeignLoadedModel foreign(reg);
   EmptyForwardInput in;
@@ -634,35 +665,214 @@ TEST_CASE("glm5_next: the forward and the KV spec REFUSE BY NAME") {
   } catch (const std::exception& e) {
     forward_msg = e.what();
   }
-  CHECK(forward_msg.find("Glm5NextForConditionalGeneration") !=
-        std::string::npos);
-  // Each missing primitive, named, with the wave that owes it.
-  CHECK(forward_msg.find("W2") != std::string::npos);
-  CHECK(forward_msg.find("W3") != std::string::npos);
-  CHECK(forward_msg.find("W4") != std::string::npos);
-  CHECK(forward_msg.find("W5") != std::string::npos);
+  CHECK(forward_msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
+  // The waves that still owe assembly, each named with what it owes.
+  CHECK(forward_msg.find("W5b") != std::string::npos);
+  CHECK(forward_msg.find("W5c") != std::string::npos);
   CHECK(forward_msg.find("W6") != std::string::npos);
-  CHECK(forward_msg.find("SIGMOID branch") != std::string::npos);
+  CHECK(forward_msg.find("load_weights") != std::string::npos);
+  CHECK(forward_msg.find("assembled Glm5NextTextModel forward") != std::string::npos);
+  // The two look-alikes, still named, because substituting either produces
+  // fluent wrong text no gate on this fleet could detect.
   CHECK(forward_msg.find("kimi_kda.cpp") != std::string::npos);
-  CHECK(forward_msg.find("UNWEIGHTED mHC head collapse") != std::string::npos);
   CHECK(forward_msg.find("HcHeadCollapse") != std::string::npos);
-  CHECK(forward_msg.find("MlaBlockDims::Validate") != std::string::npos);
-  CHECK(forward_msg.find("k-pool indexer") != std::string::npos);
   CHECK(forward_msg.find("glm5-next-flash.md") != std::string::npos);
+  // The primitives that LANDED are named as landed, not as owed. An earlier
+  // revision of this message said "W3 the NoPE MLA block -- MlaBlockDims
+  // ::Validate still refuses qk_rope_head_dim == 0", which W3 (#2213) made
+  // false: the validator accepts the NoPE geometry and the case immediately
+  // below this file's `mla_block_dims` group proves it. A refusal that names a
+  // landed wave as owing sends the next reader to redo finished work (#2230).
+  CHECK(forward_msg.find("MlaBlockDims::Validate still refuses") == std::string::npos);
+}
 
-  // The KV-cache spec refuses rather than returning an empty config, and names
-  // all three cache shapes this model needs.
-  std::string kv_msg;
-  try {
-    reg.factory->make_kv_cache(PublishedConfig(), 16, 8);
-    FAIL("expected a refusal");
-  } catch (const std::exception& e) {
-    kv_msg = e.what();
+// ─── The KV-cache spec, reached through the production `make_kv_cache` hook ───
+//
+// REACHABILITY. `ModelRegistry::Resolve` is a production entry point -- it is
+// what `LoadedEngine::FromModelDir` calls to pick the factory -- and
+// `reg.factory->make_kv_cache` is the hook the engine invokes on the resolved
+// registration. Nothing below constructs `MakeGlm5NextKVCache` by name or
+// includes the model's translation unit. Deleting the
+// `.make_kv_cache = &MakeGlm5NextKVCache` line from `kGlm5NextFactory` leaves
+// the pointer null and REDS every case here at the `REQUIRE` above them.
+TEST_CASE("glm5_next: the KV spec publishes THREE groups on the published topology") {
+  const std::vector<std::string> archs = {"Glm5NextForConditionalGeneration"};
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(archs);
+  REQUIRE(reg.factory->make_kv_cache != nullptr);
+
+  constexpr int kBlockSize = 16;
+  constexpr int kNumBlocks = 8;
+  const vllm::v1::KVCacheConfig kv =
+      reg.factory->make_kv_cache(PublishedConfig(), kBlockSize, kNumBlocks);
+
+  CHECK(kv.num_blocks == kNumBlocks);
+  REQUIRE(kv.kv_cache_groups.size() == 3);
+
+  const vllm::Glm5NextParams p = ParseGlm5NextParams(PublishedConfig());
+  REQUIRE(p.num_hidden_layers == 45);
+  CHECK(p.num_dsa_layers() == 11);
+  CHECK(p.num_kda_layers() == 34);
+
+  // ── group 0: the MLA latent, one row per token on the 11 DSA layers ───────
+  const auto& mla = kv.kv_cache_groups[0];
+  CHECK(mla.layer_names.size() == 11);
+  const auto* mla_spec =
+      dynamic_cast<const vllm::v1::MLAAttentionSpec*>(mla.kv_cache_spec.get());
+  REQUIRE_MESSAGE(mla_spec != nullptr,
+                  "group 0 must be an MLAAttentionSpec: the DSA layers cache the "
+                  "compressed latent and reconstruct K and V from it, so there is "
+                  "no separate V and the page formula drops the factor 2");
+  CHECK(mla_spec->block_size == kBlockSize);
+  CHECK(mla_spec->num_kv_heads == 1);
+  // 512 + 0. NOT the 576 every DeepSeek variant and Kimi-Linear publish: this
+  // model's `qk_rope_head_dim` is ZERO and upstream REQUIRES it to be
+  // ("Expecting NoPE for the DSA attention layers"). Reusing 576 over-allocates
+  // by 12.5% and nothing downstream reads the difference.
+  CHECK(mla_spec->head_size == 512);
+  CHECK(p.mla.kv_lora_rank == 512);
+  CHECK(p.mla.qk_rope_head_dim == 0);
+  CHECK(mla_spec->head_size != 576);
+  CHECK(mla_spec->compress_ratio == 1);
+
+  // ── group 1: ONE uniform recurrent group over the 34 KDA layers ───────────
+  const auto& kda = kv.kv_cache_groups[1];
+  CHECK(kda.layer_names.size() == 34);
+  const auto* mamba =
+      dynamic_cast<const vllm::v1::MambaSpec*>(kda.kv_cache_spec.get());
+  REQUIRE(mamba != nullptr);
+  REQUIRE_MESSAGE(mamba->shapes.size() == 2,
+                  "ONE grouped [q; k; v] conv state plus ONE recurrent state. The "
+                  "checkpoint stores three separate {q,k,v}_conv1d tensors and the "
+                  "reference concatenates them into one grouped depthwise conv, so "
+                  "a spec with three conv states triples this group");
+  REQUIRE(mamba->dtypes.size() == 2);
+  // 3 * 64 * 128 channels, `linear_conv_kernel_dim` columns.
+  CHECK(mamba->shapes[0] == std::vector<int64_t>{3 * 64 * 128, 4});
+  CHECK(mamba->shapes[0][0] == 24576);
+  // `conv_kernel_dim`, NOT `conv_kernel_dim - 1`. `LinearAttentionLayer
+  // .lazy_initialization` allocates `torch.zeros((*shape[:-1],
+  // conv_kernel_size))` and `causal_conv1d_update` reads `state_len =
+  // conv_state.shape[-1]`, so the slack column is part of the contract.
+  // `kimi_linear_registry.cpp:157` publishes `K - 1` for ITS model; copying that
+  // across would hand the runner a cache one column short of what the layer
+  // reads.
+  CHECK(p.kda.conv_kernel_dim == 4);
+  CHECK(mamba->shapes[0][1] == p.kda.conv_kernel_dim);
+  CHECK(mamba->shapes[0][1] != p.kda.conv_kernel_dim - 1);
+  // The delta-rule recurrent state, [heads, head_dim, head_dim].
+  CHECK(mamba->shapes[1] == std::vector<int64_t>{64, 128, 128});
+  // f32 whatever the model dtype is: the state is a running sum over the whole
+  // sequence and upstream casts to float32 explicitly at every write.
+  CHECK(mamba->dtypes[1] == vt::DType::kF32);
+
+  // ── group 2: the DSA indexer side cache, 257 wide, uncompressed ───────────
+  const auto& idx = kv.kv_cache_groups[2];
+  CHECK(idx.layer_names.size() == 11);
+  const auto* idx_spec =
+      dynamic_cast<const vllm::v1::MLAAttentionSpec*>(idx.kv_cache_spec.get());
+  REQUIRE_MESSAGE(idx_spec != nullptr,
+                  "group 2 must be an MLAAttentionSpec. A FullAttentionSpec here "
+                  "is absorbed by the runner's leftover scan as the single "
+                  "`fa_draft` draft-KV slot, `multi_cache_topology` stays false, "
+                  "and the side cache is published and never allocated -- in "
+                  "silence (MODEL-MM-QWEN4-EXP W5c-1, #2206)");
+  // 2 * index_head_dim + 1 = 257: the packed state is
+  // `concat[k(128), gate_scores(128), valid(1)]` per token. Our DeepSeek-V4
+  // parent stores 128 -- the key alone -- and reading that number across would
+  // under-allocate this cache by half.
+  CHECK(p.indexer.head_dim == 128);
+  CHECK(idx_spec->head_size == 257);
+  CHECK(idx_spec->head_size != 128);
+  CHECK(idx_spec->num_kv_heads == 1);
+  // ONE stored row PER TOKEN. The k-pool compresses at READ time inside
+  // `GetPooledStates`, not at store time, which is the opposite of
+  // MODEL-MM-QWEN4-EXP's QSA side cache where `compress_ratio` is 4.
+  CHECK(idx_spec->compress_ratio == 1);
+  CHECK(p.indexer.kpool == 4);
+  CHECK(idx_spec->storage_block_size() == kBlockSize);
+
+  // ── the names are REAL and per-layer, never placeholders ─────────────────
+  // `ResolveKVCacheGroupLayerNames`'s fallback can name only a TARGET attention
+  // group and one `fa_draft` slot; a third attention group gets
+  // `layer_names.clear()` and the runner then refuses the unnamed group.
+  std::vector<std::string> all;
+  for (const auto& grp : kv.kv_cache_groups) {
+    for (const auto& n : grp.layer_names) all.push_back(n);
   }
-  CHECK(kv_msg.find("KV-cache spec is not ported") != std::string::npos);
-  CHECK(kv_msg.find("NoPE MLA latent") != std::string::npos);
-  CHECK(kv_msg.find("k-pool indexer side cache") != std::string::npos);
-  CHECK(kv_msg.find("KDA recurrent") != std::string::npos);
+  CHECK(all.size() == 56);  // 11 + 34 + 11
+  std::sort(all.begin(), all.end());
+  CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
+  // Every DSA layer index appears in BOTH attention groups, and no KDA index
+  // appears in either.
+  for (size_t l = 0; l < p.layer_types.size(); ++l) {
+    const std::string idx_s = std::to_string(l);
+    const bool is_kda = p.layer_types[l] == Glm5NextLayerKind::kLinearAttention;
+    const std::string recurrent = "model.layers." + idx_s + ".linear_attn";
+    const std::string attn = "model.layers." + idx_s + ".self_attn.attn";
+    const std::string side = "model.layers." + idx_s + ".self_attn.indexer.k_cache";
+    const auto has = [&](const std::vector<std::string>& v, const std::string& n) {
+      return std::find(v.begin(), v.end(), n) != v.end();
+    };
+    INFO("layer " << l);
+    CHECK(has(kda.layer_names, recurrent) == is_kda);
+    CHECK(has(mla.layer_names, attn) == !is_kda);
+    CHECK(has(idx.layer_names, side) == !is_kda);
+  }
+}
+
+TEST_CASE("glm5_next: a DIFFERENT layer schedule builds a DIFFERENT KV cache") {
+  // The group membership is read from the config's own `layer_types`, so a
+  // checkpoint whose schedule differs gets a different cache. This is the
+  // schedule half of the wrong-schedule case: a reader that synthesized the
+  // schedule from a position rule instead of reading it would publish the SAME
+  // 11/34 split here and pass. #2177 owns the GGUF reader's synthesis of
+  // `idx % 4 != 3` when `layer_types` is absent, which is right for the
+  // published checkpoint by coincidence rather than by reading; this row does
+  // not rely on that coincidence, because every case here declares the schedule.
+  const std::vector<std::string> archs = {"Glm5NextForConditionalGeneration"};
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(archs);
+  REQUIRE(reg.factory->make_kv_cache != nullptr);
+
+  // `linear_attn_config.{kda_layers,full_attn_layers}` are cross-checked against
+  // `layer_types` at parse (W1, #2067), so a case that rewrites one and not the
+  // other is refused before it reaches the cache. Rewriting all three is what
+  // makes this a different MODEL rather than an inconsistent config.
+  nlohmann::json doc = ScheduleConfigJson(/*period=*/3);
+  const vllm::v1::KVCacheConfig kv =
+      reg.factory->make_kv_cache(ConfigFrom(doc), 16, 8);
+  REQUIRE(kv.kv_cache_groups.size() == 3);
+  CHECK(kv.kv_cache_groups[0].layer_names.size() == 15);
+  CHECK(kv.kv_cache_groups[1].layer_names.size() == 30);
+  CHECK(kv.kv_cache_groups[2].layer_names.size() == 15);
+  // And it is a DIFFERENT cache from the published one, not merely a valid one.
+  const vllm::v1::KVCacheConfig pub =
+      reg.factory->make_kv_cache(PublishedConfig(), 16, 8);
+  CHECK(kv.kv_cache_groups[0].layer_names != pub.kv_cache_groups[0].layer_names);
+  CHECK(kv.kv_cache_groups[1].layer_names != pub.kv_cache_groups[1].layer_names);
+}
+
+TEST_CASE("glm5_next: the KV spec REFUSES a topology it cannot size") {
+  const std::vector<std::string> archs = {"Glm5NextForConditionalGeneration"};
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(archs);
+  REQUIRE(reg.factory->make_kv_cache != nullptr);
+
+  // A non-positive block size would publish a zero-byte page the runner
+  // allocates and the attention block then writes past.
+  CHECK_THROWS_AS(reg.factory->make_kv_cache(PublishedConfig(), 0, 8),
+                  std::exception);
+  CHECK_THROWS_AS(reg.factory->make_kv_cache(PublishedConfig(), -16, 8),
+                  std::exception);
+
+  // An all-KDA schedule has no MLA latent and no indexer side cache to publish;
+  // an all-DSA one has no recurrent state. Refuse rather than emit an empty
+  // group, which `ResolveKVCacheGroupLayerNames` would then clear and the runner
+  // would reject with a message about names rather than about topology.
+  CHECK_THROWS_WITH_AS(
+      reg.factory->make_kv_cache(ConfigFrom(ScheduleConfigJson(/*period=*/0)), 16, 8),
+      doctest::Contains("no deepseek_sparse_attention"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      reg.factory->make_kv_cache(ConfigFrom(ScheduleConfigJson(/*period=*/1)), 16, 8),
+      doctest::Contains("no linear_attention"), std::runtime_error);
 }
 
 TEST_CASE("glm5_next: the tensor inventory is generated from the topology") {
@@ -1142,14 +1352,25 @@ TEST_CASE("glm5_next: the GGUF LOADER refuses by name through FromModelDir") {
   CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
   CHECK(msg.find("the weight loader is not ported") != std::string::npos);
   // The wave that owes the tower, and each primitive it owes.
-  CHECK(msg.find("W5") != std::string::npos);
+  CHECK(msg.find("W5c") != std::string::npos);
   CHECK(msg.find("KDA") != std::string::npos);
   CHECK(msg.find("NoPE MLA") != std::string::npos);
   CHECK(msg.find("mHC") != std::string::npos);
   CHECK(msg.find("stacked-expert") != std::string::npos);
-  // And O7: no `.gguf` of this model exists anywhere, so the reader's next step
-  // is the converter and not a download.
-  CHECK(msg.find("O7") != std::string::npos);
+  // A PUBLISHED artifact now exists, so the reader's next step is that file and
+  // not the converter. An earlier revision of this message said the opposite --
+  // "NO `.gguf` of this model exists anywhere ... (O7)" -- and this gate pinned
+  // that sentence, which is why it survived the artifact being published
+  // (#2230). The negative below is what stops it coming back.
+  CHECK(msg.find("unsloth/GLM-5.3-Flash-GGUF") != std::string::npos);
+  CHECK(msg.find("d425e572f") != std::string::npos);
+  CHECK(msg.find("NO `.gguf` of this model exists") == std::string::npos);
+  // And the measured reason the artifact is still not loadable: its UD arms mix
+  // six quant encodings this tree cannot decode. W5 ran the production loader
+  // against the staged UD-Q2_K_XL arm and it stopped on ggml type id 17.
+  CHECK(msg.find("IQ2_XS") != std::string::npos);
+  CHECK(msg.find("O5") != std::string::npos);
+  CHECK(msg.find("O8") != std::string::npos);
   CHECK(msg.find("scripts/convert-glm5-next-gguf.py") != std::string::npos);
   CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
   CHECK(msg.find("#1998") != std::string::npos);
@@ -1171,7 +1392,11 @@ TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDi
 
   CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
   CHECK(msg.find("the weight loader is not ported yet") != std::string::npos);
-  CHECK(msg.find("W5 owes it") != std::string::npos);
+  CHECK(msg.find("W5c owes it") != std::string::npos);
+  // W5 landed two of this row's pieces, and the refusal says which, so a reader
+  // is not sent to reimplement them (#2230).
+  CHECK(msg.find("W5 landed the MoE block and the KV-cache spec") !=
+        std::string::npos);
   // The published arms and the device they do not fit, so the reader is not
   // sent looking for a checkpoint that would work.
   CHECK(msg.find("305.78 GiB") != std::string::npos);

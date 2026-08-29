@@ -37,6 +37,28 @@ So the ad-hoc `bisect2.sh` was not merely bypassing a harness; it was
 reimplementing the grid, the interleaving, the lease boundary and the artifact
 capture that this script already owns.
 
+### And the serving driver cannot express THIS workload
+
+Naming the right axis is not the same as having an instrument for it.
+`scripts/dgx-online-serving.sh` and `tools/bench/online_gate.py` contain **zero**
+occurrences of `speculative`, `dflash` or `draft`, and the driver's `--model` is
+closed to `27 | 27n | 35 | q3mxfp4` (`:117-118`). The server it launches
+(`:336-346`) passes `--num-blocks`, `--max-num-seqs` and
+`--max-num-batched-tokens` and no draft path or speculative config at all.
+
+So the committed concurrency instrument **cannot drive the DFlash2 workload**,
+and that — not carelessness alone — is why `bisect2.sh` was written.
+
+**The actionable ask is therefore neither of the first two.** It is:
+
+> Extend `dgx-online-serving.sh` / `online_gate.py` with a speculative arm — a
+> draft path, a `--speculative-config`, and a model id for the
+> Qwen3.8-27B-NVFP4 + DFlash2 pairing — so the c=8 ladder can run on the
+> committed instrument instead of beside it. Then retire `bisect2.sh` by making
+> it unnecessary rather than by deleting it.
+
+That is a wave, not a config change, and it is the real content of this row.
+
 **Everything below stands except the harness name.** The refusals
 `dflash2_speed_harness.py` carries — `--repeat 1` is "an anecdote", equal repeat
 counts across arms, the warm-leg discard, oracle identity, clock state — are the

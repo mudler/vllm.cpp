@@ -35,12 +35,16 @@
 //   * The shape table lives in src/vt/exl3_policy.cpp as pure host code, so it
 //     is gated on a machine with no GPU. This file calls it; it does not carry
 //     a second copy.
-//   * Only bits == 3 and codebook == 1 (mcg) are INSTANTIATED. That is the whole
-//     of the DeepSeek-V4-Flash 3.0bpw artifact and it keeps 8 template
-//     instantiations rather than 64 in a translation unit the fat build compiles
-//     for ten architectures. Every other (bits, codebook) refuses BY NAME from
-//     the launcher and is recorded owed in the row's spec; the CPU arm stays
-//     generic over bits, so the reference is not narrowed with the kernel.
+//   * THREE (bits, codebook) arms are INSTANTIATED: (3, 0), (3, 1) and (6, 0).
+//     It was ONE, (3, 1), which was the whole of the DeepSeek-V4-Flash 3.0bpw
+//     artifact and NOTHING ELSE -- `LinearEXL3` derives the codebook from tensor
+//     PRESENCE (`exl3.py:74-77`), so every stock `turboderp/*-exl3` artifact
+//     ships no marker and is cb 0, and the device arm refused all of them
+//     (QUANT-EXL3, #2181). (6, 0) is the stock `lm_head`, which is SIX-bit over
+//     a 3-bit body and is 21% of a 1B model's weights. Every other pair still
+//     refuses BY NAME from the launcher and is recorded owed in the row's spec;
+//     the CPU arm stays generic over bits, so the reference is not narrowed with
+//     the kernel.
 //   * The grid sync is a hand-rolled sense-reversing barrier rather than
 //     `cooperative_groups`. NOT a preference: `grid_group::sync()` lowers to a
 //     `cudadevrt` call and therefore requires `-rdc=true` device linking, which
@@ -57,7 +61,8 @@
 //     `exl3_gemm.cu:220-236` tries it.
 //   * W2c added the m<=8 GEMV (`exl3_gemv.cu` + `exl3_gemv_kernel.cuh`) and W2d
 //     the fused MoE mgemm (`exl3_moe.cu` + `exl3_moe_kernel.cuh`). Both are
-//     narrowed to bits == 3, codebook == 1 the way the regular kernel is, and
+//     narrowed to bits == 3, codebook == 1; the REGULAR kernel is no longer so
+//     narrowed (it carries (3,0), (3,1) and (6,0)), and
 //     the GEMV's fp16 accumulation gives it its OWN bound (tier 3c, spec
 //     `## W2cd design` W2c-3) rather than the regular kernel's tier 3.
 #include <cuda_fp16.h>
@@ -261,11 +266,28 @@ __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1) {
   return __hadd2(d0, d1);
 }
 
+// `decode_3inst<cb>` (`codebook.cuh:56-90`), two codewords at a time.
+//
+// BOTH ARMS, because codebook 0 is the COMMON one and codebook 1 is the
+// exception. `LinearEXL3` derives the codebook from tensor PRESENCE
+// (`exl3.py:74-77`), so every stock `turboderp/*-exl3` artifact -- shipping no
+// `mcg` marker -- is cb 0, the original QTIP 3INST; the SparkInfer DeepSeek-V4
+// artifact ships a marker and is cb 1. Instantiating only cb 1 made the device
+// arm refuse every ordinary EXL3 checkpoint (QUANT-EXL3, #2181).
 template <int cb>
 __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1) {
-  static_assert(cb == 1, "MODEL-DSV4-EXL3 W2 instantiates the mcg codebook only");
-  x0 *= 0xCBAC1FEDu;
-  x1 *= 0xCBAC1FEDu;
+  static_assert(cb == 0 || cb == 1,
+                "exl3: only codebooks 0 (3INST) and 1 (mcg) are instantiated; cb 2 is "
+                "upstream's dp4a byte-sum variant and needs its own port");
+  if constexpr (cb == 0) {
+    x0 *= 89226354u;
+    x0 += 64248484u;
+    x1 *= 89226354u;
+    x1 += 64248484u;
+  } else {
+    x0 *= 0xCBAC1FEDu;
+    x1 *= 0xCBAC1FEDu;
+  }
   return decode_mcg_product_2(x0, x1);
 }
 
@@ -316,14 +338,49 @@ __device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& fr
   frag1[1] = decode_3inst_2<cb>(w6 & 0xffff, w7 & 0xffff);
 }
 
-// exl3_dq.cuh:254-293, narrowed to the instantiated arm. bits == 3 takes
-// dq8<3, cb, 4>; every other width is refused at the launcher, not here, so the
-// refusal names the row and the missing instantiation.
+// exl3_dq.cuh:37-56. FOUR codewords per funnel shift instead of eight, and the
+// reason is arithmetic rather than taste: `dq8` spans `16 + bits*7` bits across
+// the two uint32 words it merges, which is 58 bits at bits == 6 and overflows
+// the 64-bit funnel once the shift is added. Upstream therefore routes bits
+// 5/6/8 through this one (`exl3_dq.cuh:274-293`), and bits 7 through `dq2x2`.
+template <int bits, int cb>
+__device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& frag) {
+  int b0 = (t_offset + 257) * bits - 16;  // start of the first word
+  int b1 = b0 + 3 * bits;                 // start of the last word
+  int b2 = b1 + 16;                       // end of the last word
+  int i0 = b0 / 32;
+  int i2 = (b2 - 1) / 32;
+  int s2 = (i2 + 1) * 32 - b2;
+
+  uint32_t a = ptr[i0 % (bits * 256 / 32)];
+  uint32_t b = ptr[i2 % (bits * 256 / 32)];
+  uint32_t w3 = fshift(b, a, s2) & 0xffff;
+  uint32_t w2 = fshift(b, a, s2 + bits) & 0xffff;
+  uint32_t w1 = fshift(b, a, s2 + bits * 2) & 0xffff;
+  uint32_t w0 = fshift(b, a, s2 + bits * 3) & 0xffff;
+  frag[0] = decode_3inst_2<cb>(w0, w1);
+  frag[1] = decode_3inst_2<cb>(w2, w3);
+}
+
+// exl3_dq.cuh:254-293, over the widths this tree instantiates. bits == 3 takes
+// dq8<3, cb, 4> and bits == 6 takes two dq4s, both of which are upstream's own
+// choice for those widths. Every other width is refused at the launcher, so the
+// refusal names the row and the missing instantiation rather than firing here.
+//
+// bits == 6 is not an exotic case: the stock `turboderp/*-exl3` artifacts
+// quantize the BODY at 3 bits and the `lm_head` at 6, so a device arm without
+// it leaves 21% of the weights of a 1B model on a CPU queue.
 template <int bits, int cb>
 __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0,
                                             FragB& frag1) {
-  static_assert(bits == 3, "MODEL-DSV4-EXL3 W2 instantiates bits == 3 only");
-  dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
+  static_assert(bits == 3 || bits == 6,
+                "exl3: only bits 3 and 6 are instantiated on the device arm");
+  if constexpr (bits == 3) {
+    dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
+  } else {
+    dq4<bits, cb>(ptr, idx, frag0);
+    dq4<bits, cb>(ptr, idx + 4, frag1);
+  }
 }
 
 // ── the Hadamard inners (hadamard_inner.cuh) ─────────────────────────────────
@@ -1075,7 +1132,10 @@ __global__ __launch_bounds__(kBaseThreads* TILESIZE_K / 16) void exl3_gemm_kerne
 // relative RMS) rather than reusing tier 3's 1.0e-3, which a correct kernel
 // here could not meet.
 //
-// NARROWED, exactly as the regular kernel is: bits == 3 and cb == 1 (mcg) only.
+// NARROWED to bits == 3 and cb == 1 (mcg) only, which is NO LONGER the regular
+// kernel's set: that one carries (3,0), (3,1) and (6,0). Upstream's own GEMV
+// list is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`, so cb 0 at 3 bpw is
+// excluded there too and its envelope refuses it before any kernel is chosen.
 // Upstream instantiates 2/3/4 bpw over three codebooks; every other width
 // DECLINES this arm and falls through to the shape table, which is upstream's
 // own failure mode (`exl3_gemv_select_kernel` returns nullptr and
@@ -1124,7 +1184,15 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void exl3_gemv_kernel(
     const half* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C,
     const int size_m, const int size_k, const int size_n, int* __restrict__ locks,
     const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh) {
-  static_assert(bits == 3, "MODEL-DSV4-EXL3 W2c instantiates the 3 bpw arm only");
+  // The GEMV stays 3-bit. Unlike the regular kernel this one is SPECIALIZED to
+  // the width rather than merely asserted on it: `LSTRIDE` below is the uint32
+  // stride per warp load and is hardcoded to 24 for `bits == 3` (== `TWORDS`),
+  // and the prefetch ring, fold cadence and load count are tuned around it.
+  // Widening it is a kernel port, not an instantiation, so `bits == 6` DECLINES
+  // the GEMV and falls through to the regular shape table -- which is upstream's
+  // own arrangement for a declined GEMV (`exl3_gemm.cu:220-236`) and costs the
+  // 6-bit lm_head its m<=8 fast path, not its device arm (QUANT-EXL3, #2181).
+  static_assert(bits == 3, "exl3: the GEMV kernel is specialized to the 3 bpw arm");
   constexpr int WK = CFG == 0 ? 16 : 8;    // k-split (warps per block)
   constexpr int WNT = CFG == 0 ? 2 : 4;    // adjacent n-tiles per warp
   constexpr int PF = CFG == 0 ? 4 : 2;     // prefetch ring depth
@@ -1770,29 +1838,63 @@ void Exl3HadR128KernelCuda(Queue& q, Tensor& out, const Tensor& in, const Exl3Ha
   Check(cudaGetLastError(), "exl3_had_r_128 launch");
 }
 
-// The instantiated (bits, cb) arm. Every other width refuses BY NAME rather
-// than being silently decoded as if it were this one.
-constexpr int kInstantiatedBits = 3;
-constexpr int kInstantiatedCb = 1;
+// THE INSTANTIATED (bits, codebook) ARMS. Every other pair refuses BY NAME
+// rather than being silently decoded as if it were one of these.
+//
+//   (3, 0)  the body of every stock `turboderp/*-exl3` artifact
+//   (3, 1)  the SparkInfer DeepSeek-V4 artifact, which ships an `mcg` marker
+//   (6, 0)  the `lm_head` of those stock artifacts, which is SIX-bit over a
+//           3-bit body
+//
+// Three arms and not one, because the previous single arm (3, 1) was the
+// EXCEPTION rather than the rule: `LinearEXL3` derives the codebook from tensor
+// PRESENCE (`exl3.py:74-77`), so an artifact with no marker is cb 0, and the
+// device arm refused every ordinary EXL3 checkpoint (QUANT-EXL3, #2181).
+//
+// Three and not more, because each pair costs a full set of kernels in a
+// translation unit the fat build compiles for ten architectures. Widening
+// further is upstream's own per-K compilation-unit split
+// (`comp_units/exl3_comp_unit_K_cbX.cu`), and belongs with the first artifact
+// that needs it.
+//
+// THE WIDTH IS LOAD-BEARING ON SHARED MEMORY, and the guard is already there
+// rather than added here: every B stride in `exl3_gemm_kernel` is
+// `256 / 16 * bits` uint16 per tile, so `sh_b_stage_size` DOUBLES from bits 3
+// to bits 6, and the `static_assert(kSmemMax >= ...)` at the top of that kernel
+// is what refuses a shape whose staged tiles no longer fit. A width that
+// overflows it fails to COMPILE with that assert rather than silently
+// mis-staging, which is why widening here is safe to attempt: the failure mode
+// is loud.
+constexpr bool Exl3ArmInstantiated(int bits, int cb) {
+  return (bits == 3 && (cb == 0 || cb == 1)) || (bits == 6 && cb == 0);
+}
 
-template <bool c_fp32>
-const void* GemmKernelForShape(int shape_idx) {
+template <int BITS, int CB, bool c_fp32>
+const void* GemmKernelForArm(int shape_idx) {
   switch (shape_idx) {
     case 1:
       return reinterpret_cast<const void*>(
-          &exl3_gemm_kernel<kInstantiatedBits, c_fp32, kInstantiatedCb, 16, 16, 128, 6, 5>);
+          &exl3_gemm_kernel<BITS, c_fp32, CB, 16, 16, 128, 6, 5>);
     case 2:
       return reinterpret_cast<const void*>(
-          &exl3_gemm_kernel<kInstantiatedBits, c_fp32, kInstantiatedCb, 16, 32, 128, 4, 3>);
+          &exl3_gemm_kernel<BITS, c_fp32, CB, 16, 32, 128, 4, 3>);
     case 3:
       return reinterpret_cast<const void*>(
-          &exl3_gemm_kernel<kInstantiatedBits, c_fp32, kInstantiatedCb, 16, 32, 256, 4, 3>);
+          &exl3_gemm_kernel<BITS, c_fp32, CB, 16, 32, 256, 4, 3>);
     case 4:
       return reinterpret_cast<const void*>(
-          &exl3_gemm_kernel<kInstantiatedBits, c_fp32, kInstantiatedCb, 16, 16, 512, 4, 3>);
+          &exl3_gemm_kernel<BITS, c_fp32, CB, 16, 16, 512, 4, 3>);
     default:
       return nullptr;
   }
+}
+
+template <bool c_fp32>
+const void* GemmKernelForShape(int bits, int cb, int shape_idx) {
+  if (bits == 3 && cb == 0) return GemmKernelForArm<3, 0, c_fp32>(shape_idx);
+  if (bits == 3 && cb == 1) return GemmKernelForArm<3, 1, c_fp32>(shape_idx);
+  if (bits == 6 && cb == 0) return GemmKernelForArm<6, 0, c_fp32>(shape_idx);
+  return nullptr;
 }
 
 // ── the GEMV try-launch (exl3_gemv.cu:92-169) ────────────────────────────────
@@ -1804,11 +1906,12 @@ const void* GemmKernelForShape(int shape_idx) {
 // The occupancy query is cached per (device, kernel) because it is a driver
 // round-trip and it feeds the shape heuristic on every call
 // (`exl3_gemv.cu:125-135`).
-const void* GemvKernel(bool c_fp32, int mmode, int cfg, bool smem) {
+template <int BITS, int CB>
+const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 #define VT_EXL3_GEMV_SEL(fp32_, mm_, cfg_, sm_)                                            \
   if (c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_)                       \
     return reinterpret_cast<const void*>(                                                  \
-        &exl3_gemv_kernel<kInstantiatedBits, fp32_, kInstantiatedCb, mm_, cfg_, sm_>);
+        &exl3_gemv_kernel<BITS, fp32_, CB, mm_, cfg_, sm_>);
 #define VT_EXL3_GEMV_ROW(sm_)                                                              \
   VT_EXL3_GEMV_SEL(false, 0, 0, sm_) VT_EXL3_GEMV_SEL(false, 0, 1, sm_)                    \
   VT_EXL3_GEMV_SEL(false, 1, 0, sm_) VT_EXL3_GEMV_SEL(false, 1, 1, sm_)                    \
@@ -1818,6 +1921,36 @@ const void* GemvKernel(bool c_fp32, int mmode, int cfg, bool smem) {
   VT_EXL3_GEMV_ROW(true)
 #undef VT_EXL3_GEMV_ROW
 #undef VT_EXL3_GEMV_SEL
+  return nullptr;
+}
+
+
+// THE GEMV ARM SET IS `(3, 1)` ONLY, AND CODEBOOK 0 IS EXCLUDED ON PURPOSE
+// rather than as an oversight. Upstream's own envelope refuses it:
+// `exl3_gemv.cu`'s try-launch carries `if (K != 4 && cb == 0) return false;`,
+// which `Exl3GemvHardEligible` transcribes at `exl3_policy.cpp:148`, and
+// upstream's `SEL_GRID` list instantiates `(4,0) (4,1) (4,2) (2,1) (2,2)
+// (3,1) (3,2)` — no `(3, 0)`. `tests/vt/test_exl3_gemv.cpp:130` already
+// asserted that refusal before this row existed.
+//
+// A first cut of W3 added `(3, 0)` here anyway, which is 16 kernels that can
+// never launch in a translation unit the fat build compiles for ten
+// architectures, with three comments claiming they were reachable. The claim
+// even reached a measurement: a `VT_EXL3_GEMV=1` vs `=0` A/B on a stock
+// codebook-0 checkpoint was reported as an 8% GEMV effect when neither arm
+// could take the GEMV at all — it ran the same path twice. A fresh review
+// caught it.
+//
+// SO A STOCK `turboderp/*-exl3` CHECKPOINT HAS NO GEMV FAST PATH, on this tree
+// or upstream's, and takes the regular shape table at `m == 1`. That is
+// upstream's behaviour, not a gap this row opened.
+//
+// A null here is a DECLINE, and `TryGemv` turns it into a fall-through rather
+// than a failure.
+constexpr bool Exl3GemvArmInstantiated(int bits, int cb) { return bits == 3 && cb == 1; }
+
+const void* GemvKernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem) {
+  if (bits == 3 && cb == 1) return GemvKernelForArm<3, 1>(c_fp32, mmode, cfg, smem);
   return nullptr;
 }
 
@@ -1841,7 +1974,7 @@ bool Exl3GemvTryLaunch(Queue& q, int device, Exl3Cc cc, int num_sms, void** kern
                 "the device and host copies of EXL3_GEMV_MAX_M must agree");
   // exl3_gemv.cu:108-116: the free integer tests first, then the env read.
   if (args.force_gemv == 0) return false;
-  if (args.bits != kInstantiatedBits || args.codebook != kInstantiatedCb) return false;
+  if (!Exl3GemvArmInstantiated(args.bits, args.codebook)) return false;
   if (!Exl3GemvHardEligible(size_m, size_k, size_n, args.bits, args.codebook,
                             /*has_su_sv=*/true))
     return false;
@@ -1850,13 +1983,14 @@ bool Exl3GemvTryLaunch(Queue& q, int device, Exl3Cc cc, int num_sms, void** kern
   const int mmode = size_m == 1 ? 0 : 1;
   const bool smem = Exl3GemvSmemMode() == 1;
 
-  const void* narrow = GemvKernel(c_fp32, mmode, 0, smem);
+  const void* narrow = GemvKernel(args.bits, args.codebook, c_fp32, mmode, 0, smem);
   if (narrow == nullptr) return false;
   const int narrow_coresident = GemvOccupancy(device, narrow, 512) * num_sms;
   const int cfg = Exl3GemvSelectConfig(cc, size_m, size_k, size_n, args.bits, args.codebook, mode,
                                        narrow_coresident);
   if (cfg < 0) return false;
-  const void* kernel = cfg == 0 ? narrow : GemvKernel(c_fp32, mmode, cfg, smem);
+  const void* kernel =
+      cfg == 0 ? narrow : GemvKernel(args.bits, args.codebook, c_fp32, mmode, cfg, smem);
   if (kernel == nullptr) return false;
 
   const int block_dim = cfg == 0 ? 512 : 256;
@@ -1876,13 +2010,16 @@ bool Exl3GemvTryLaunch(Queue& q, int device, Exl3Cc cc, int num_sms, void** kern
 void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
                         const Tensor& suh, const Tensor& svh, Tensor& a_had,
                         const Exl3GemmArgs& args) {
-  if (args.bits != kInstantiatedBits || args.codebook != kInstantiatedCb) {
+  if (!Exl3ArmInstantiated(args.bits, args.codebook)) {
     throw std::runtime_error(
-        "vt cuda exl3: exl3_gemm has CUDA instantiations for bits == 3, codebook == 1 (mcg) "
-        "only; got bits " +
+        "vt cuda exl3: exl3_gemm is instantiated for (bits, codebook) in "
+        "{(3, 0), (3, 1), (6, 0)} only; got bits " +
         std::to_string(args.bits) + " codebook " + std::to_string(args.codebook) +
-        ". MODEL-DSV4-EXL3 W2 records the other widths as owed; the CPU arm decodes "
-        "every width and can serve them on a CPU queue.");
+        ". Those three are the body and head of the stock exl3 artifacts (cb 0) and the "
+        "SparkInfer DeepSeek-V4 one (cb 1); widening further is upstream's per-K "
+        "compilation-unit split and belongs with the artifact that needs it "
+        "(QUANT-EXL3, #2181). The CPU arm decodes every width and serves them on a CPU "
+        "queue meanwhile.");
   }
   // NOT const: cudaLaunchCooperativeKernel takes `void**`, so each argument has
   // to be a modifiable lvalue whose address can be taken as `void*`.
@@ -1938,8 +2075,8 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   }
   const Exl3GemmShape shape = Exl3GemmShapeParams(shape_idx);
   const bool c_fp32 = c.dtype == DType::kF32;
-  const void* kernel = c_fp32 ? GemmKernelForShape<true>(shape_idx)
-                              : GemmKernelForShape<false>(shape_idx);
+  const void* kernel = c_fp32 ? GemmKernelForShape<true>(args.bits, args.codebook, shape_idx)
+                              : GemmKernelForShape<false>(args.bits, args.codebook, shape_idx);
   if (kernel == nullptr)
     throw std::runtime_error("vt cuda exl3: exl3_gemm shape " + std::to_string(shape_idx) +
                              " has no instantiation");
@@ -1975,8 +2112,14 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_state,
                           const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
                           const Exl3MoeTemps& temps, const Exl3MoeArgs& args) {
-  if (args.bits_gate != kInstantiatedBits || args.bits_up != kInstantiatedBits ||
-      args.bits_down != kInstantiatedBits || args.codebook != kInstantiatedCb) {
+  // The FUSED MoE arm stays at (3, mcg): it exists for the DeepSeek-V4 artifact
+  // and no stock EXL3 MoE checkpoint has reached this tree yet. It is a
+  // narrower set than the GEMM/GEMV arms above ON PURPOSE, and the refusal says
+  // which pair it wanted (QUANT-EXL3, #2181).
+  constexpr int kMoeBits = 3;
+  constexpr int kMoeCb = 1;
+  if (args.bits_gate != kMoeBits || args.bits_up != kMoeBits ||
+      args.bits_down != kMoeBits || args.codebook != kMoeCb) {
     throw std::runtime_error(
         "vt cuda exl3: exl3_moe has CUDA instantiations for bits == 3, codebook == 1 (mcg) "
         "only; got bits (" +
@@ -2024,9 +2167,9 @@ void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_s
   const bool n256 = (hidden_dim % 256 == 0) && (intermediate_dim % 256 == 0);
   const void* kernel =
       n256 ? reinterpret_cast<const void*>(
-                 &exl3_moe_kernel<kInstantiatedBits, 256, kInstantiatedCb>)
+                 &exl3_moe_kernel<kMoeBits, 256, kMoeCb>)
            : reinterpret_cast<const void*>(
-                 &exl3_moe_kernel<kInstantiatedBits, 128, kInstantiatedCb>);
+                 &exl3_moe_kernel<kMoeBits, 128, kMoeCb>);
   EnsureSmemOptIn(device, kernel);
 
   const half* hid = hidden_state.Ptr<half>();

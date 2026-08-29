@@ -635,9 +635,16 @@ inline OwnedTensor LoadF16AsBf16Direct(const TensorResolver& get, const std::str
   VT_CHECK(static_cast<size_t>(numel) * 2 == t.nbytes,
            "dense loader: " + name + " byte size does not match its F16 shape");
   OwnedTensor r = MakeOwned(vt::DType::kBF16, shape);
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
   auto* dst = reinterpret_cast<uint16_t*>(r.bytes.data());
-  for (int64_t i = 0; i < numel; ++i) dst[i] = vt::F32ToBF16(vt::F16ToF32(src[i]));
+  // `vt::LoadUnaligned`, NOT a `reinterpret_cast<const uint16_t*>`: a
+  // safetensors tensor's offset is the running byte total of everything before
+  // it and carries NO alignment guarantee, so a widened load at an odd offset
+  // is undefined behaviour. The BF16 and F32 arms above already read their
+  // payloads this way for exactly that reason; this one did not, and UBSan
+  // caught it on the first fixture whose payload is deliberately misaligned:
+  // "load of misaligned address ... requires 2 byte alignment".
+  for (int64_t i = 0; i < numel; ++i)
+    dst[i] = vt::F32ToBF16(vt::F16ToF32(vt::LoadUnaligned<uint16_t>(t.data + i * 2)));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return r;
 }

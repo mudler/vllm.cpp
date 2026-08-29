@@ -1679,23 +1679,93 @@ Debts this row carries, each visible rather than waived:
   `dgx:gpu0` lease on this row;
   [#2213](https://github.com/mudler/vllm.cpp/issues/2213) records it.
 
-- **O18 — the loader now stops on a per-layer CONFIG KEY instead of on a tensor
-  type, and the artifact still does not FIT.** With
+- **O18 — the three per-layer CONFIG ARRAYS are DISCHARGED, and the loader now
+  stops one geometry key further on. The artifact still does not FIT.** With
   [#2240](https://github.com/mudler/vllm.cpp/issues/2240)'s IQ2_XS and IQ4_XS
   decoders in, `LoadedEngine::FromModelDir` opens all four shards of the staged
   `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` artifact, sizes all 1412
-  tensors, and runs on into config resolution, where it stops with
+  tensors, and ran on into config resolution, where it stopped with
   `glm5_next gguf: key glm5next.attention.head_count_kv is not an integer`. The
   published artifact stores that key as a per-layer `array[i32]` of length 46,
-  and `Glm5NextHfConfigFromGguf` reads it as a scalar.
+  and `Glm5NextHfConfigFromGguf` read it as a scalar.
   `glm5next.swiglu_clamp_exp` and `glm5next.swiglu_clamp_shexp` are per-layer
-  `array[f32]` of the same length, so the same shape is waiting twice more
-  directly behind it. Measured 2026-08-29 by driving the production loader
-  read-only, with the reader's `case 17:` deleted and restored to prove the
-  before/after on ONE binary: without it the same probe stops at
-  `tensor "blk.3.ffn_gate_exps.weight" has unknown ggml type id 17 in
-  ...-00002-of-00004.gguf`. Owned by the config/loader wave on this row;
-  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) records it.
+  `array[f32]` of the same length, and there is no `glm5next.layer_types` key at
+  all, so the same shape was waiting twice more and a `ReqStrArray` behind that.
+
+  **Discharged by [#2243](https://github.com/mudler/vllm.cpp/issues/2243) and
+  [#2177](https://github.com/mudler/vllm.cpp/issues/2177) together**, which are
+  one defect seen from two sides: the builder now accepts llama.cpp's
+  scalar-or-array spelling of `attention.head_count_kv`
+  (`b10451:src/llama-model.cpp:1177` reads it through
+  `get_key_or_arr(..., n_layer, false)`) and DERIVES the schedule from the values
+  with llama.cpp's own predicate, `is_recr_impl[i] = hparams.n_head_kv(i) == 0`
+  (`b10451:src/models/kimi-linear.cpp:18`, "KDA layers are recurrent"). When both
+  spellings are present they are cross-checked on the layer KIND and a clash
+  refuses by name; a per-layer array whose length is not `block_count` refuses by
+  name with the shape found; a non-uniform clamp array refuses, because upstream
+  has ONE `swiglu_limit`; and a file that states the schedule in neither spelling
+  still refuses, naming both keys. The `idx % 4 != 3` fallback survives ONLY on
+  the `config.json` path, where it is upstream's own default.
+
+  **THE NEW STOPPING POINT, measured 2026-08-29 on one tree and one binary**,
+  with the array fix reverted and restored so the before/after is not a
+  cross-build comparison. Driven through `LoadedEngine::FromModelDir` on
+  `device = kCPU`, headers only, no tensor materialised:
+
+  ```text
+  without the fix : glm5_next gguf: key glm5next.attention.head_count_kv is not an integer
+  with    the fix : vt: glm5_next gguf: attention.key_length_mla - attention.key_length
+                    is -256 but rope.dimension_count is 0; the file states this model's
+                    rotary width twice and the two disagree
+  ```
+
+  The refusal is the rotary-width cross-check in `Glm5NextHfConfigFromGguf`,
+  named here rather than by `file:line` because the anchor moved once inside the
+  pull request that measured it. The append-only index row for
+  [#2268](https://github.com/mudler/vllm.cpp/issues/2268) quotes the line number
+  it had when the row was appended and cannot be edited; this entry is the
+  corrected surface.
+
+  **BLOCKS ARE NOT LAYERS, and the GGUF path used to conflate them.**
+  `c.num_hidden_layers` was set straight from `block_count`, so the SAME model
+  resolved to a 45-layer backbone from its `config.json` and a 46-layer one from
+  its GGUF, and the extra entry was the MTP block. Nothing downstream would have
+  refused it: `ParseGlm5NextParams` sizes all three schedules from
+  `num_hidden_layers`, so W5b and W5c would have built a decoder layer out of
+  the MTP block, and it would have run and produced plausible tokens. The
+  contract is BACKBONE depth — `glm5_next.h:193` already annotates the field as
+  `// 45` — and llama.cpp states the relationship in its own converters:
+  `self.block_count = self.hparams["num_hidden_layers"] +
+  self.hparams.get("num_nextn_predict_layers", 0)`
+  (`b10451:conversion/exaone.py:134`, and the same `+=` at
+  `b10451:conversion/deepseek.py:470` and `:545`). The builder therefore
+  resolves `num_hidden_layers = block_count - nextn_predict_layers`, validates
+  every per-block array against `block_count`, and truncates the three
+  schedules to the backbone. A file claiming more MTP blocks than blocks is
+  refused by name. Our own converter writes `block_count = n_layers` with
+  `nextn_predict_layers = 0` (`scripts/convert-glm5-next-gguf.py:997`, `:1024`),
+  so the formula leaves its output unchanged.
+
+  **What W5b inherits from this.** The MTP block is read, counted and DROPPED:
+  its entry in `attention.head_count_kv` — index 45, value `1`, MLA-shaped — is
+  not carried into `layer_types`, and no field on `HfConfig` or
+  `Glm5NextParams` holds `nextn_predict_layers` yet. So W5b
+  ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) gets a stack sized
+  to 45 and must not build a layer for block 45; if the MTP head needs that
+  block's kind, W5b adds the field, because this change deliberately did not.
+  O2 still owns the head itself.
+
+  That is NOT a malformed file. `attention.key_length` is 512 and
+  `attention.key_length_mla` is 256 in the published artifact because llama.cpp
+  writes `key_length = kv_lora_rank + qk_rope_head_dim` and
+  `key_length_mla = qk_nope_head_dim + qk_rope_head_dim`
+  (`b10451:conversion/deepseek.py:345-348`), while
+  `scripts/convert-glm5-next-gguf.py` writes `key_length = qk_nope_head_dim` — a
+  different quantity under the same name. `glm5next.attention.linear_head_count`,
+  a `ReqInt` here, appears in none of the file's 72 keys, and llama.cpp spells it
+  nowhere. Both are one defect and both change the WRITE side, so they are filed
+  as [#2268](https://github.com/mudler/vllm.cpp/issues/2268) rather than folded
+  into a config-array fix, and this row owns them.
 
   **The array is 34 zeros and 12 ones.** Parsed 2026-08-29 from shard 1's KV
   block. Key index 21, `glm5next.attention.head_count_kv: array[i32] len=46`:

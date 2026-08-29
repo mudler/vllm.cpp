@@ -21,13 +21,23 @@ tok/s (+70%), `Numel()` 27.09% → 1.76%, review PASS; lever 3 (batch
 per-layer staging) NOT taken, the residual attributed to per-upload
 tt-metal-internal work (`#2107`) — are all landed; see `## Evidence`.
 The #1486 teardown fix and the #2115 opt-out-arm golden pair (each arm
-gates its own captured pair; both legs doctest 146/146) landed after it.
-The `docs/USAGE.md` weights entry is complete (file, bytes, repo @
-revision, sha256, refused arms). Owed next: **W3 leftovers** (d2h
-counter completeness, `conv_transposed` fast-path check, tests for
-both), then the W4 record's named next lever: a per-slot persistent
-device buffer written through the mesh command queue, which needs the
-tt-metal-internal half of W4's lever 2.
+gates its own captured pair; both legs doctest 146/146) landed after it,
+as did the **W3 leftovers** (the two missing d2h `fetch_add`s and the
+scoped `conv_transposed` refusal; #2201 via #2217, `a456e6eaf`), with
+the suite at 44 cases / 4340 assertions. The `docs/USAGE.md` weights
+entry is complete (file, bytes, repo @ revision, sha256, refused arms).
+**W5** (the per-slot persistent buffer written through the mesh command
+queue, [#2244](https://github.com/mudler/vllm.cpp/issues/2244)) landed
+2026-08-29: allocation-free uploads proven (residual allocation 0.02% of
+the profile; suite 45 cases / 5062 assertions; sacred pair byte-identical)
+and the wall HONESTLY UNMOVED — the A/B trace split the W4 hypothesis:
+per-upload allocation was never the wall; the wall is the per-CQ-operation
+tt-metal stack (context queries, `Cluster::get_chip`, `read_cq_host_ptr`
+polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
+staging** (one CQ write per step divides the per-op tax by the fan-in;
+inside our file set), with the tt-metal-side residual (cached context
+handles, amortized CQ polling) recorded as the upstream-shaped
+alternative.
 
 ## Scope
 
@@ -239,6 +249,30 @@ column above is the entry point, not the whole chain.
   benchmark-record entry. A wall that does not move is a reported result, not
   a failure — the attribution either shifts or the lever is named unreachable
   with the trace that proves it.
+- **W5 — allocation-free staging: the per-slot persistent buffer written
+  through the mesh command queue (#2244).** W4's re-attribution left ~23%
+  of the staging chain inside tt-metal per-upload internal work (a fresh
+  `MeshBuffer` allocation, cluster/chip discovery, CQ completion handling)
+  and ~19.2% in the CPU threadpool. `UploadRowsBf16`
+  (`tenstorrent_ops.cpp:469`) builds a new `ttnn::Tensor` via `from_span`
+  on every upload, so identical geometry pays the creation path every
+  step. Allocate the device buffer once per staging slot — lifecycle tied
+  to the slot structures, under the #1486 never-destroy rule for static
+  caches — and write the host bytes through
+  `MeshCommandQueue::enqueue_write`/`enqueue_write_shard`. The
+  tt-metal-internal half is a proof obligation: against the pinned
+  tt-metal's mesh write path (`mesh_command_queue.cpp`:
+  enqueue_write_shard → per-device buffer write + completion), read the
+  source and trace the executed path, and dump it before declaring any
+  part of the lever unreachable. `StagingStats` gains route counters for
+  the new path. The capture-unsafe host-write refusals keep their
+  semantics; the f32-conversion arms keep their declared dtypes.
+  Invariant: staging is bit-identical — the sacred golden pair stays 16/16
+  and the full TT suite stays green; this wave changes SPEED, never
+  tokens. Evidence owed: same-method before/after profile on the P150
+  (identical leg, lock discipline) plus a fresh benchmark-record entry; a
+  wall that does not move is a reported result — the attribution shifts
+  or the lever is named unreachable with the trace that proves it.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -282,9 +316,9 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `3fe34e2c6` (bumped
-2026-08-28; W4 #2118 and the #2115 opt-out-arm pair landed since the previous
-`8f5d4e4ed`). Branch `row/BACKEND-TENSTORRENT-QWEN35`, worktree
+in `.agents/developer-preferences.md`). Base `origin/main` @ `a456e6eaf` (bumped
+2026-08-29; W3 #2201 via #2217 landed since the previous `3fe34e2c6`). Branch
+`row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 
 ## Evidence
@@ -295,6 +329,24 @@ mutex, `TT_METAL_HOME=/home/lu_zero/Sources/tt/tt-metal` (pinned tree), build
 summary was the known #1486 teardown; fixed 2026-08-27 by never destroying the
 static tensor caches — expect exit 0. Evidence entries below that predate the
 fix quote 139 as green.
+
+### W5 — allocation-free staging: the wall did not move, and the trace says why
+
+`dc473a94c` (#2244): per-slot persistent device buffer, in-place CQ writes
+via `ttnn::copy_to_device`; red-first implementer, fresh reviewer PASS (8
+mutations incl. reachability; full gate rerun on the immutable head).
+Same-method interleaved A/B on one lock hold (identical 3-token leg,
+JIT-discard per arm, `perf record -F 199 -g` per measured leg):
+19.154 s vs 19.181 s mean — −0.14%, noise. The trace splits the W4
+hypothesis: `allocate_mesh_tensor_on_device_with_topology` is 0.02% of the
+AFTER profile and the write stacks are identical in both arms, so the
+per-upload allocation was never the wall; the wall is the per-CQ-operation
+tt-metal stack (`MetalContext::instance` 11.14%, `Cluster::get_chip` 5.90%,
+`read_cq_host_ptr` 5.27%+ sub-slices) plus `Threadpool::PollForWork`
+14.29%. Reported result, not a failure — the next lever is W6 (batch
+per-layer staging, our file set); the tt-metal-side residual is recorded
+beside it. Full log:
+[tt-qwen35-eager-profile-w5-20260829.log](../../docs/bench-evidence/tt-qwen35-eager-profile-w5-20260829.log).
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 

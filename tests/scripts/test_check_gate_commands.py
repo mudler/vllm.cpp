@@ -265,6 +265,25 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dsa_compose_is_runnable_for_a_REASON_not_just_by_membership(self):
+        # MODEL-DSV4-DSA-COMPOSE (#2286) entered the runnable population when its
+        # spec landed, and `RUNNABLE_BASELINE` was re-pinned in that same change
+        # as the ratchet above requires.
+        #
+        # Membership alone is a weak pin: the assertion above would stay green if
+        # the row were runnable for a DIFFERENT reason, or if someone added it to
+        # the baseline by hand while its spec stopped carrying a runnable command
+        # (which would leave the exact-equality pin red for a confusing reason, or
+        # green against a stale entry). So pin the REASON.
+        #
+        # The row is scoping-only -- no product code yet -- and it is runnable
+        # purely because its `## Gates` section names commands that can fail. That
+        # is worth stating: a reader who finds a spec with no implementation in
+        # the runnable set should not conclude the ratchet is broken.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("MODEL-DSV4-DSA-COMPOSE"), "runnable")
+        self.assertIn("MODEL-DSV4-DSA-COMPOSE", gates.RUNNABLE_BASELINE)
+
     def test_now_derived_left_the_gated_population_cleanly(self):
         # ENG-NOW-DERIVED (#374) shipped W1-W5 and reached DONE. Closure removes
         # it from both sides of the exact pin; it is not assigned a weaker

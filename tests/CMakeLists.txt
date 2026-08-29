@@ -2717,6 +2717,12 @@ vllm_cpp_add_test(test_ops_mamba2_state_update vt/test_ops_mamba2_state_update.c
 target_include_directories(test_ops_mamba2_state_update PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_mamba2_gated_norm vt/test_ops_mamba2_gated_norm.cpp)
 target_include_directories(test_ops_mamba2_gated_norm PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# vt::RmsNormGroup — the UNGATED per-group RMS norm (MODEL-MM-QWEN4-EXP W5d-1,
+# #2249 item 1). Sibling of the two above: same grouped reduction, no gate. Gated
+# against the lane-pinned transformers goldens the qwen4_exp gated-residual arm
+# already answers to, so both arms are held to ONE oracle.
+vllm_cpp_add_test(test_ops_rms_norm_group vt/test_ops_rms_norm_group.cpp)
+target_include_directories(test_ops_rms_norm_group PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)

@@ -557,6 +557,10 @@ enum class OpId : uint8_t {
   // gate), no standalone `silu`/`sigmoid`, no elementwise binary multiply and no
   // axis reduction, so a composition would need five NEW general ops and would
   // still materialise the [T, hc, H] broadcast the write-back exists to avoid.
+  // ONE OF THOSE FIVE NOW EXISTS AND THE RATIONALE IS UNCHANGED BY IT: W5d-1
+  // (#2249 item 1) added `kRmsNormGroup` for the PLE block, so the first clause
+  // above reads as the history it is — it is why that op was written — and the
+  // other four are still absent, which is what makes this a fused family op.
   // `.agents/specs/qwen4-exp-flash-next.md` names this exact seam: "A device arm
   // reads `block_out` once per (j, h) tile and `injection_weights[j]` once per
   // row; it never allocates the broadcast." `kDeepseekV4Mhc` is the in-tree
@@ -618,6 +622,31 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
+  // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.
+  // A SIBLING of kRmsNorm and of kRmsNormGatedGroup, and neither of those two
+  // can stand in for it: `kRmsNorm` reduces over the WHOLE row and has no
+  // group_size, `kRmsNormGated`/`kRmsNormGatedQuantFp8` fold a gate in, and
+  // `kRmsNormGatedGroup` groups correctly but always multiplies by
+  // `silu(gate)` first, so there is no way to ask any of them for a plain
+  // grouped norm. The only grouped reduction this tree had was FUSED inside
+  // `kQwen4ExpGatedResidual` and could not be called on its own, which is the
+  // gap `include/vt/ops.h` states in its own words at the kQwen4ExpGatedResidual
+  // comment above ("There is no ungated per-group RMS norm").
+  //
+  // Adding `group_size` to `RmsNormArgs` instead was REJECTED, and the reason is
+  // the silent-wrong-answer shape this row keeps meeting. `kRmsNorm` is
+  // registered on five backends; a new field on its args struct is ignored by
+  // every kernel that is not taught to read it, so a CUDA or Metal caller would
+  // get a whole-row norm back from a grouped request, with no crash and no
+  // refusal. A separate OpId cannot do that: an unregistered device refuses BY
+  // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
+  // ("SIBLING of RmsNormGatedArgs, not a mode of it").
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_ops.cpp). The CUDA arm is OWED, not
+  // written: it cannot be gated on a CPU-only host, and an ungated kernel is
+  // worse than an absent one — the same call W5b-3 and W5b-4 made.
+  // Appended before kCount so no existing op's id shifts.
+  kRmsNormGroup,
   kCount
 };
 
@@ -665,6 +694,43 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// Ungated GROUP RMS norm args (vt::RmsNormGroup). A SIBLING of RmsNormArgs, not
+// a mode of it: see the kRmsNormGroup comment for why the group extent is not a
+// field on that struct. `eps` and `gemma` keep RmsNormArgs's names and meanings
+// exactly, so a caller migrating a whole-row norm to a grouped one changes the
+// extent and nothing else.
+//
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextRMSNorm` (:158-181),
+// whose `group_size` argument this mirrors by NAME. `RmsNormGatedGroupArgs`
+// spells the same axis as `n_groups` because ITS upstream
+// (`Mixer2RMSNormGated`, mamba_mixer2.py:80) does; the two upstreams disagree
+// on which half of the quotient is the parameter, and each op takes the one its
+// own upstream takes rather than a normalized third form.
+struct RmsNormGroupArgs {
+  float eps = 1e-6f;
+  // `weight` applied as `(1 + w)` rather than `w`. TRUE is the polarity every
+  // `qwen4_exp` gamma needs: `Qwen4ExpTextRMSNorm.forward` is
+  // `output * (1.0 + self.weight.float())` over a ZERO-initialised parameter
+  // (:162, :177), the loader stores every gamma RAW, and every consumer adds
+  // the 1 itself (#2218). It is a flag and not a constant because this op is a
+  // general `vt::` primitive and `RmsNormArgs` already spells the same choice
+  // the same way.
+  bool gemma = false;
+  // Elements per group. The reduction runs over `group_size` CONSECUTIVE
+  // elements of the last dimension, so the norm of one group cannot see another
+  // (`x.reshape(*x.shape[:-1], -1, group_size)` then `mean(-1)`, :168-171).
+  //
+  // ZERO IS REFUSED rather than meaning "the whole row", and that default is
+  // deliberate. Whole-row is what `vt::RmsNorm` already does; letting a
+  // forgotten field silently produce it would make the single most likely
+  // caller mistake indistinguishable from success, and a full-row reduction
+  // over a grouped stream is a plausible tensor rather than a crash. Upstream
+  // refuses the analogous case at :164-165 (`hidden_size must be divisible by
+  // group_size`) and so does the dispatcher.
+  int64_t group_size = 0;
 };
 
 // ─── EXL3 device-kernel argument records — MODEL-DSV4-EXL3 W2 ────────────────
@@ -1942,6 +2008,11 @@ using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExper
                               const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
+// Ungated group RMS norm (vt::RmsNormGroup). Same operand order as RmsNormFn
+// minus the residual, which this op does not carry because its upstream has no
+// residual arm and a knob nobody can set is a divergence with extra steps.
+using RmsNormGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                const Tensor& /*weight*/, const RmsNormGroupArgs&);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using GeluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulScalarFn = void (*)(Queue&, Tensor&, const Tensor&, double);
@@ -2883,6 +2954,57 @@ void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 // upstream bf16 need bf16-eps tolerance on the non-gemma path.
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
+
+// UNGATED PER-GROUP RMS NORM — `Qwen4ExpTextRMSNorm` (transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py:158-181`), the `group_size is not
+// None` arm, executed per row:
+//
+//   g       = i / group_size                       (:168-169, the reshape)
+//   ms[g]   = mean_{i in g}( x[i]^2 )              (:170, `pow(2).mean(-1)`)
+//   out[i]  = x[i] * rsqrt(ms[g] + eps) * (1 + w[i])   when gemma
+//   out[i]  = x[i] * rsqrt(ms[g] + eps) * w[i]         otherwise
+//
+// A SIBLING of vt::RmsNorm, which is the same expression with one group per
+// row, and of vt::RmsNormGatedGroup, which groups the same way but multiplies
+// `silu(gate)` in before the reduction. Neither can express this one; see the
+// kRmsNormGroup comment for why the extent is not a mode of RmsNormArgs.
+//
+// THREE PLACES EPS IS NOT. It is INSIDE the rsqrt, added to the MEAN SQUARE,
+// and added ONCE PER GROUP. The plausible slips are adding it to the norm
+// rather than to the mean square, and computing it against the whole row's mean
+// square. `scripts/gen-qwen4-exp-hc-goldens.py` case D exists for the first
+// (at `hyper_scale = 1.7` an eps of 1e-6 moves the answer ~5e-7 relative, which
+// is BELOW the gate tolerance and therefore invisible; at `hyper_scale = 0.01`
+// it is 1% of the mean square), and the grouped/full-row separation on those
+// same goldens is 4.0e-1 to 1.2e+0 against a 1e-5 tolerance.
+//
+// POLARITY. `gemma = true` applies `(1 + w)`, and that is what every
+// `qwen4_exp` gamma needs: the loader stores each one RAW as HuggingFace ships
+// it, centred on 0, and EVERY consumer adds the 1 itself — `vt::RmsNorm` under
+// `gemma = true`, `vt::Qwen4ExpQsaCompress`, `vt::Qwen4ExpGatedResidual` since
+// #2218, and this op. `ssm_norm` is the single exception in the architecture.
+// The failure this rule prevents is silent: a gamma centred on 0 multiplied
+// without the `+1` scales the stream by ~0 and reads as a corrupt checkpoint
+// rather than as a wiring bug.
+//
+// SHAPES. x [T, H] and out [T, H] rank-2 contiguous; weight [H] rank-1, applied
+// per COLUMN of the flat row (upstream's `self.weight` is `[dim]` over the
+// unflattened width, and :177 multiplies AFTER `out.flatten(-2)`, so the weight
+// index is the flat one and not the in-group one). `args.group_size` must be
+// >= 1 and divide H; upstream raises `ValueError` on the same condition
+// (:164-165) and this op refuses by name.
+//
+// PRECISION, AND IT IS A MIRROR RATHER THAN A CHOICE. The reduction, the
+// reciprocal square root and the weight multiply all run in f32 and the result
+// is rounded ONCE on the store, which is `output = self._norm(x.float())`,
+// `output * (1.0 + self.weight.float())`, `output.type_as(x)` (:174-178) in
+// order. Upstream says so in a comment at :175-176 — "Llama does x.to(float16)
+// * w whilst Qwen4ExpText is (x * w).to(float16)" — so rounding the normalized
+// value BEFORE the weight multiply is a different model, not a tolerance. This
+// is the same order `vt::RmsNorm` already keeps; `vt::RmsNormGatedGroup` keeps
+// the OTHER one, because its own upstream (mamba_mixer2.py:149) does.
+void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                  const RmsNormGroupArgs& args);
 
 // --- Fused declarative recipe (TDR; see include/vt/recipes.h and
 // .agents/specs/portable-fusion-framework.md). A recipe (a backend-agnostic

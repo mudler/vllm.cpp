@@ -2061,6 +2061,206 @@ re-run green. M3's first attempt did NOT build — deleting the call leaves
 `pos3_prefill` unused under `-Werror=unused-parameter` — which is the W5b-1
 mutation-B trap again and the reason the build rc column is in this table.
 
+## Mutation record — W5d-1 (#2249 item 1)
+
+`vt::RmsNormGroup` / `OpId::kRmsNormGroup`, the ungated per-group RMS norm the
+PLE half of the layer loop needs and the one primitive `include/vt/ops.h` named
+as missing in its own words.
+
+**THE TREE EVERY NUMBER BELOW WAS MEASURED ON**, because an evidence table that
+does not name its tree is not evidence. The RED, the green, the six mutations
+and the suite counts were all taken at base `94de63ff5`. The branch was then
+rebased forward twice as `main` moved under it, onto `6e805abcf` (`QUANT-EXL3`
+W3 — `cpu_exl3_kernels.cpp`, `cuda_exl3.cu`, `test_exl3_gemm.cpp`,
+`dense_weight_loaders.h`) and then onto `5f8a70705` (`SPEC-DFLASH2` #2252 —
+`qwen3_dflash*`). Neither touches a file this op compiles against.
+`test_ops_rms_norm_group` was rebuilt and re-run on that head: **build rc 0,
+7 cases / 69 assertions / rc 0**, unchanged. The mutation battery was NOT re-run
+after either rebase, and that is stated rather than implied.
+
+**The review repair then MERGED `origin/main` into the branch** rather than
+rebasing a third time, and has now had to do it THREE TIMES, because `main` kept
+moving while the repair ran. `scripts/agent-preflight.sh` skips both trailer
+gates whenever `origin/main` is not an ancestor of HEAD — "this branch is behind
+it and the trailer gates did NOT run" — which had quietly voided the review's
+own `PREFLIGHT_RC=0`. The commits merged in are `1bc16ca3c`
+(`PERF-LAGUNA-GROUPED-GEMV` spec) and `37fbccea8` (`MODEL-TEXT-GLM-MOE-DSA` spec)
+first, then `fa9903b86` (`LTX25-ORACLE-ABSOLUTE`, #2210), and finally `3ed2378a3`
+(W5d-2, #2249 item 5, via #2264). THE FIRST TWO touch `.agents/`,
+`docs/USAGE.md` and two `scripts/` files and NO compiled input: `git diff
+--name-only` over that delta returns nothing under `src/`, `include/`, `tests/`
+or `third_party/`, and `ninja` answered "no work to do" after it.
+
+**THE THIRD MERGE IS DIFFERENT, WHICH IS WHY THE SENTENCE ABOVE IS SCOPED TO THE
+FIRST TWO RATHER THAN LEFT TO COVER ALL THREE.** The delta `fa9903b86..3ed2378a3`
+is fourteen commits and it DOES move compiled input, including both files this
+wave itself edits: `include/vt/ops.h`, where W5b-6 rewrote the
+`vt::Qwen4ExpGatedResidual` contract comment in place (#2218 via `a6f933b81`),
+and `tests/CMakeLists.txt`, where W5d-2 registered `test_qwen3_5_mrope`. Git
+merged both without a conflict and both merges are purely ADDITIVE against
+`main`: `git diff origin/main` over the two files shows this wave's blocks and
+nothing removed. The one consequence a conflict-free merge could still have hidden
+is an id shift, because `kRmsNormGroup` is appended before `kCount` and so is
+every other new op — nothing on `main` appended an enumerator, and the merged
+header compiles to `kRmsNormGroup == 140`, `kCount == 141`, so the `id 140` the
+refusal prints below is still this op's id. `.agents/specs/qwen4-exp-flash-next.md`
+did conflict and was resolved as a SET against the merge base rather than by
+taking either side, and the one anchor the merge moved is corrected under
+`## Owed`: the `kTENSTORRENT` `RegisterOp(OpId::kRmsNorm, ...)` line is at
+`tenstorrent_ops.cpp:5323` on this head, not the `:5216` recorded before
+`BACKEND-TENSTORRENT-QWEN35` W5/W6 landed.
+
+**A false alarm is recorded here rather than buried, because it nearly landed a
+duplicate.** `origin/main` is a shared ref in a shared checkout, and another
+session fetched it mid-repair. Comparing the merged index against the ref AFTER
+that fetch read as though the first merge had silently dropped its tail row
+(#2220), and a commit was written to "restore" it. The merge had dropped nothing:
+the row arrived with `fa9903b86`, which had not been merged yet. Appending it by
+hand would have produced a SECOND copy of that row on `main` — the duplicate
+`check-agent-record.py` refuses and `check-issue-index-append-only.py` will not
+permit anyone to remove. The commit was dropped before it left the worktree.
+`check-issue-index-append-only.py` returned rc 0 on BOTH the pre- and
+post-"restore" heads, so the gate would not have caught it either way: the
+control that worked was diffing the row-number list against the ref and asking
+WHICH commit authored the row, not the checker.
+
+At the THIRD merged head, from a build directory configured from scratch, build
+rc 0 read before any test result, **the same FIVE of the seven suites below were
+re-run and all five still match byte-for-byte**: `test_ops_rms_norm_group`
+7 / 69, `test_ops_mamba2_gated_norm` 9 / 2107, `test_ops_glue` 13 / 115,
+`test_qwen4_exp_hc` 15 / 246 and `test_qwen4_exp_hc_device` 9 / 87. Because that
+merge brings compiled input with it, `main`'s OWN two new gates were built and
+run here as well, and both reproduce the counts `main`'s own sections record:
+`test_qwen4_exp_forward` 1 / 421 (W5b-6, #2218) and `test_qwen3_5_mrope` 4 / 157
+(W5d-2, #2249 item 5). `test_qwen4_exp_scaffold` was re-run as well, at
+12 / 296 / rc 0, because this merge EDITS the production refusal string that
+suite's `SUBCASE("the forward")` pins — see `## Now` for why the string had to
+change and which five substrings the suite holds. `test_qwen4_exp_ple` and
+`test_qwen4_exp_ple_device` were NOT re-run at any merged head, and their rows
+below still name `94de63ff5`.
+
+**M4 and M5 were re-run at the SECOND merged head**, because the `## Owed`
+sentence that repair corrects is a claim about exactly those two: M4 build **rc 1** with
+`error: 'RmsNormGroupKernel' defined but not used [-Werror=unused-function]` and
+NO suite run; M5 build **rc 0**, suite **rc 1**, **6 of 7 cases**, six throws of
+`vt: no kernel for op RmsNormGroup (id 140) on device cpu (type 0)` raised at
+`src/vt/op_provider.cpp:589`. `src/vt/cpu/cpu_ops.cpp` was restored
+byte-for-byte after each, sha256 `e4a924b4…04b5` both times, rebuilt at rc 0 and
+re-run green at 7 / 69. **They were NOT re-run at the third merged head**, so the
+battery has not been re-measured since `main` began moving compiled input under
+this branch; the throw site `src/vt/op_provider.cpp:589` and the printed
+`id 140` were both re-checked there, the battery itself was not. Every other
+number in this section still names `94de63ff5` and is not restated as if it were
+measured here.
+
+Method as in the sections above:
+one textual change applied to a pristine tree, proved applied by a **sha256 that
+moved**, the file `touch`ed so ninja cannot skip the rebuild, the **BUILD RETURN
+CODE READ BEFORE ANY TEST RESULT**, then restored from a byte-identical copy and
+`sha256sum`-verified against the pre-mutation digest. Suite
+`tests/vt/test_ops_rms_norm_group.cpp`, **7 cases / 69 assertions / rc 0** green
+at the head this table was measured on.
+
+**WHY IT IS A NEW OpId AND NOT A FIELD ON `RmsNormArgs`.** `kRmsNorm` is
+registered on more than one backend. A `group_size` added to its shared args
+struct is IGNORED by every kernel not taught to read it, so a device whose
+kernel was not updated would answer a grouped request with a whole-row norm —
+no crash, no refusal, a plausible tensor. A separate OpId cannot fail that way:
+an unregistered device refuses BY NAME, which M5 below measures. `kRmsNormGatedGroup`
+is the in-tree precedent for exactly this split.
+
+### The RED, before the change
+
+The test file written first, against the tree at `94de63ff5`, compiling the test
+translation unit alone (`ninja tests/CMakeFiles/test_ops_rms_norm_group.dir/vt/test_ops_rms_norm_group.cpp.o`):
+
+```
+BUILD_RC=1
+test_ops_rms_norm_group.cpp:75:11: error: 'RmsNormGroupArgs' has not been declared in 'vt'
+test_ops_rms_norm_group.cpp:120:7: error: 'RmsNormGroup' is not a member of 'vt'; did you mean 'RmsNormGated'?
+```
+
+The compiler's own suggestion is the gap in one line: the nearest thing this tree
+had is the op that cannot express it. That red is a BUILD refusal and is read as
+one — it says the op is absent, not that any arithmetic is wrong. The red for the
+intended REASON is M1, which builds clean and fails on values.
+
+### The gate, and why each half of it discriminates
+
+The correctness assertions run against `tests/vllm/models/qwen4_exp_hc_goldens.inc`,
+whose `k{A,B,C,D}_normed` arrays are `normed = mod.hc_norm(hyper)` — the pinned
+oracle's OWN `Qwen4ExpTextRMSNorm(hc*hidden, group_size=hidden, eps)` output over
+its own RAW gamma, dumped by `scripts/gen-qwen4-exp-hc-goldens.py` from
+transformers **v5.16.0** (`modeling_qwen4_exp.py:158-181`, sha256
+`77fec77d…c459`). Nothing in the correctness path is transcribed. A local
+double-precision reference exists in the file, but ONLY to measure the
+separations below; the op is never asserted against it.
+
+| Defect | Separation from the oracle | kTol |
+|---|---|---|
+| reduce over the ROW, not the group | A 1.232, B 0.984, C 0.404, D 0.913 | 1e-5 |
+| drop the `+ 1` on the gamma | A 2.279, B 2.181, C 2.053, D 1.986 | 1e-5 |
+| drop eps | A 4.1e-6, B 1.67e-5, C 5.1e-7, **D 2.56e-2** | 1e-5 |
+
+**The eps row is the reason case D exists and the reason an eps probe run at
+A's scale is a mute switch.** At `hyper_scale = 1.7` the mean square is O(1) and
+an eps of 1e-6 moves the answer by less than the tolerance; at D's
+`hyper_scale = 0.01` it is 1% of the mean square. The file asserts BOTH
+directions — `sep > 1e2 * kTol` at D and `sep < kTol` at A — so the fixture's
+blind spot is recorded executably rather than left for the next reader to
+rediscover.
+
+### The battery
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| M1 | `RmsNormGroupKernel`: `group_size = h`, i.e. reduce over the whole row | rc 0 | **RED**, `7 cases / 5 failed`, `69 assertions / 26 failed`. Every value case moves: the oracle case at all four goldens, the four-orders-apart case, the fold case, the eps case and the bf16 rounding case. The two survivors are the two that call no op — the fixture-separation case and the refusal case |
+| M2 | drop `if (args.gemma) wj += 1.0f`, the #2218 defect | rc 0 | **RED**, `4 cases failed`, `22 assertions failed`. This is the polarity the whole architecture now shares: every gamma is stored RAW and every consumer adds the 1, `ssm_norm` excepted |
+| M3 | drop `+ args.eps` from inside the rsqrt | rc 0 | **RED**, `4 cases failed`, **`5 assertions failed`** — and the small count is the finding, not a weakness. Only goldens B and D move; A and C are BELOW the tolerance, exactly as the table above predicts. A probe placed only at A would have reported this mutation as survived |
+| M4 | delete `RegisterOp(OpId::kRmsNormGroup, DeviceType::kCPU, ...)` | **rc 1** | **A BUILD REFUSAL, not a test verdict, and read as such:** `error: 'RmsNormGroupKernel' defined but not used [-Werror=unused-function]`. That registration is the kernel's ONLY reference in the tree, so the compiler proves the link a test result would only have suggested. No suite ran under this mutation |
+| M5 | register the same kernel on `DeviceType::kCUDA` instead — the runnable form of M4 | rc 0 | **RED**, `6 of 7 cases` threw `vt: no kernel for op RmsNormGroup (id 140) on device cpu (type 0)`. This is the load-bearing reachability proof at the layer that exists: the suite reaches the kernel THROUGH `GetOp`, not by calling it directly, and the `op_provider.cpp` name entry is live too, because the refusal prints the op by name |
+| M6 | delete the `args.group_size >= 1` refusal in the dispatcher | rc 0 | **RED**, rc 136 — `SIGFPE`, an integer divide by zero at `h / group_size`. The refusal is therefore load-bearing rather than decorative, and the default `group_size = 0` is genuinely unusable rather than quietly meaning "the whole row" |
+
+M1-M5 target `src/vt/cpu/cpu_ops.cpp`, M6 `src/vt/ops.cpp`. M6 was re-measured on
+the FINAL head after its refusal message was corrected; M1-M5 were measured on a
+head that differs from the final one only in that message string, in a file they
+do not touch.
+
+### Counts on this head
+
+| Suite | Result |
+|---|---|
+| `test_ops_rms_norm_group` | **7 / 69 / rc 0** (new; re-run identical on the rebased head) |
+| `test_ops_mamba2_gated_norm` | 9 / 2107 / rc 0 |
+| `test_ops_glue` | 13 / 115 / rc 0 |
+| `test_qwen4_exp_hc` | 15 / 246 / rc 0 |
+| `test_qwen4_exp_hc_device` | 9 / 87 / rc 0 |
+| `test_qwen4_exp_ple` | 9 / 395 / rc 0 |
+| `test_qwen4_exp_ple_device` | 10 / 538 / rc 0 |
+| `test_qwen4_exp_qsa` | 14 / 7263 / rc 0 |
+| `test_qwen4_exp_qsa_device` | 12 / 4697 / rc 0 |
+| `test_qwen4_exp_qsa_block` | 8 / 2831 / rc 0 |
+| `test_qwen4_exp_kv_cache` | 4 / 399 / rc 0 |
+| `test_qwen4_exp_scaffold` | 12 / 296 / rc 0 |
+| `test_qwen4_exp_gguf_weights` | 11 / 2975 / rc 0 |
+| `test_qwen4_exp_gguf_load_plan` | 10 / 7462 / rc 0 |
+
+**The BEFORE column is stated rather than re-measured, and the reason is
+checkable.** `git diff --numstat` over `include/` and `src/` is `118/0`, `52/0`,
+`2/0`, `31/0` — **zero deletions, zero modified lines**: a new enumerator before
+`kCount`, a new args struct, a new function-pointer alias, a new declaration, a
+new kernel with its registration, and a new name case. No existing behaviour is
+reachable from any of it. Four of the rows above are additionally cross-checked
+against numbers this spec already recorded before this wave — `test_qwen4_exp_qsa`
+14 / 7263, `test_qwen4_exp_qsa_block` 8 / 2831, `test_qwen4_exp_kv_cache` 4 / 399
+and `test_qwen4_exp_scaffold` 12 / 296 — and all four match exactly.
+
+**What the battery did NOT reach**, because a battery's silence is not a result:
+no CUDA arm exists to mutate; no production entry point calls the op, so no
+mutation here can measure a reach that does not exist (`## Owed`); and the group
+widths exercised are 4, 5 and 6, not the 2560 the released config uses, so the
+f32 sum-of-squares accumulator is gated at toy width only.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -2217,6 +2417,78 @@ is listed under `## Owed`.
 
 ## Owed
 
+- **A REFUSAL THAT ENUMERATES PROSE GOES STALE SILENTLY, AND NOTHING PREVENTS THE
+  FOURTH INSTANCE.** [#2288](https://github.com/mudler/vllm.cpp/issues/2288) is
+  fixed by [#2265](https://github.com/mudler/vllm.cpp/pull/2265) for the two
+  items that had gone false, but only those two: the DURABLE fix is not made
+  here. `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` pins that five
+  substrings are PRESENT, never that any of them is still TRUE, so a refusal
+  listing finished work satisfies every assertion — it is a spelling gate, not a
+  truth gate. This is the third instance on this row in one day (#2276 for the
+  paged QSA consumer, #2254 for the opposite polarity, an understated refusal).
+  A truth-linked check — each enumerated item naming a symbol whose absence the
+  suite verifies — or a convention that the refusal enumerates ISSUE NUMBERS
+  rather than prose would close it, and both are larger than this flow and belong
+  to whoever owns the reachability convention. Recorded here so the residual has
+  a named home rather than living only in the issue.
+- **W5d-1 (#2249 item 1) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `vt::RmsNormGroup` (`include/vt/ops.h`, dispatcher `src/vt/ops.cpp`, CPU kernel
+  `RmsNormGroupKernel` in `src/vt/cpu/cpu_ops.cpp`, name in
+  `src/vt/op_provider.cpp`) is reached at this merge commit only by
+  `tests/vt/test_ops_rms_norm_group.cpp`. No production entry point calls it:
+  `ModelRegistry::Forward` is the only one this architecture has, and
+  `ForwardQwen4ExpForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp`) still refuses by name
+  before any downcast, so the PLE block that will hold the three
+  `Qwen4ExpTextRMSNorm(group_size=hidden_size)` calls does not exist to call it
+  from. Wiring it is owned by row `MODEL-MM-QWEN4-EXP` under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), tracked by campaign
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978), and gated by
+  [#2249](https://github.com/mudler/vllm.cpp/issues/2249). The W2 host reference
+  `qwen4_exp_ple.cpp` was NOT rerouted through the op: its `GroupedRmsNorm`
+  accumulates in double by deliberate choice ("a reference choice and not a
+  divergence"), it is file-local and itself unreached, so routing it would have
+  changed a golden-gated number and bought no reach. **M5** is the load-bearing
+  proof at the layer that does exist: registering the kernel on
+  `DeviceType::kCUDA` instead of `kCPU` leaves the build at rc 0 and reds the
+  suite BY REFUSAL, `vt: no kernel for op RmsNormGroup (id 140) on device cpu
+  (type 0)`, so the dispatcher path is live rather than vestigial and the
+  `op_provider.cpp` name entry is live with it. **M4 is a different reading and
+  is recorded as one**: deleting the `RegisterOp(OpId::kRmsNormGroup, ...)` line
+  outright is a BUILD refusal, `error: 'RmsNormGroupKernel' defined but not used
+  [-Werror=unused-function]`, because that registration is the only reference to
+  a kernel defined in the anonymous namespace `src/vt/cpu/cpu_ops.cpp` opens at
+  :24. No suite runs at all under M4, so it cannot red one; what it proves is the
+  link, which is why M5 exists beside it. The battery table two sections above
+  states both correctly; this sentence did not, and a mutation misread as a test
+  verdict is exactly the confusion the battery was run to prevent.
+- **The CUDA arm of `vt::RmsNormGroup`.** Not written, for the reason W5b-3 and
+  W5b-4 give for theirs: it could not be gated on this CPU-only host with no
+  lease, and an ungated kernel is worse than an absent one. Nothing registers for
+  any device but `kCPU`, so the dispatcher refuses BY NAME rather than falling
+  back — which is the whole argument for a separate OpId over a `group_size`
+  field on `RmsNormArgs`, since a new field on that shared struct would be
+  silently ignored by the backends that already register `kRmsNorm` and read only
+  `eps` and `gemma` off it. **SIX register it in total** — `kCPU`
+  (`cpu_ops.cpp:3750`), `kCUDA` (`cuda_ops.cu:3917`), `kROCM`
+  (`rocm_ops.hip:118`), `kVULKAN` (`vulkan_ops.cpp:1626`), `kMETAL`
+  (`metal_ops.mm:1108`) and `kTENSTORRENT` (`tenstorrent_ops.cpp:5323`) — which
+  is FIVE besides the `kCPU` this wave teaches, and five others is the number
+  that carries the argument, because they are the ones that would answer a
+  grouped request with a whole-row norm.
+
+  This entry said "four", which is wrong under either reading, and the
+  correction rides here because this is the paragraph the W5d-1 review already
+  sent back. `include/vt/ops.h:634` says "five backends" and is NOT corrected:
+  its next clause is "so a CUDA or Metal caller would get a whole-row norm
+  back", so it is counting the five OTHER backends and is consistent with this
+  enumeration. The two records are reconciled here rather than left to read as
+  a contradiction, and no product file is touched to do it.
+
+  The arm owes one decision this wave did not make for it: whether the per-group
+  sum of squares reduces in f32 (as the CPU arm does, mirroring `x.float()` at
+  `modeling_qwen4_exp.py:174` and `RmsNormKernel` beside it) or in a wider
+  accumulator once the group is 2560 wide rather than 6.
 - **W5d-2 (#2249 item 5): the mRoPE seam is REACHED, but only by a caller that
   is not itself routed from a production entry point.** `BuildMropeCosSinHost`
   now has external linkage behind
@@ -3196,7 +3468,15 @@ is listed under `## Owed`.
   against this tree while W5b-6 was in flight, each independently sufficient to
   stop a token, and each now named in the `ForwardQwen4ExpForConditionalGeneration`
   refusal so the next reader does not re-derive it:
-    1. **There is no standalone grouped RMS norm.** `Qwen4ExpTextPLELayer` holds
+    1. **CLOSED by W5d-1 (#2249 item 1): there is no standalone grouped RMS
+       norm — there is now.** The refusal string that still said otherwise is
+       [#2288](https://github.com/mudler/vllm.cpp/issues/2288), fixed by
+       [#2265](https://github.com/mudler/vllm.cpp/pull/2265). `vt::RmsNormGroup` / `OpId::kRmsNormGroup` is that
+       op, registered on `kCPU`, gated by `tests/vt/test_ops_rms_norm_group.cpp`
+       at 7 cases / 69 assertions, and its own mutation record is the
+       `## Mutation record — W5d-1` section above. The survey text is kept below
+       because it is the argument that produced the op and the layer loop still
+       has to CALL it, which nothing does yet. `Qwen4ExpTextPLELayer` holds
        three `Qwen4ExpTextRMSNorm(hc_hidden_size, group_size=hidden_size)` —
        `norm_key`, `norm_query`, `norm_conv` — reducing over `hc` independent
        `hidden_size` slices of the 10240-wide stream. `include/vt/ops.h:556`
@@ -3228,8 +3508,18 @@ is listed under `## Owed`.
        reinterpretation plus a router-gate orientation and a shared-expert
        mapping rather than a copy — but it is unwritten and unmeasured, and
        nothing yet proves a bf16 tower routes through `ExpertMlpKq`.
-    5. **The mRoPE table builder has internal linkage.**
-       `BuildMropeCosSinHost` is `static` at `qwen3_5.cpp:9472`, and
+    5. **CLOSED by W5d-2 (#2249 item 5, `3ed2378a3`): the mRoPE table builder
+       has internal linkage — it no longer does.** This half of
+       [#2288](https://github.com/mudler/vllm.cpp/issues/2288) is pre-existing
+       debt from [#2264](https://github.com/mudler/vllm.cpp/pull/2264), which
+       corrected this prose and left the refusal string; both are fixed by
+       [#2265](https://github.com/mudler/vllm.cpp/pull/2265). `BuildMropeCosSinHost` is
+       declared at `include/vllm/model_executor/models/qwen3_5_mrope.h:55` and
+       defined without `static` at `qwen3_5.cpp:9475` on this merged head, so
+       the QSA half can build the SAME tables the Qwen3.5/3.6 VL drivers build.
+       The call from the loop is still owed, and it is W5b's. The survey text
+       follows.
+       `BuildMropeCosSinHost` WAS `static` at `qwen3_5.cpp:9472`, and
        `RunQwen4ExpQsaBlock` needs BOTH layouts derived from it: the packed
        bf16 `[P, rot]` `cos|sin` cache `vt::RopeFromCache` reads and the two
        separate f32 `[P, rot]` tables `vt::Qwen4ExpQsaCompress` reads, with
@@ -3315,15 +3605,32 @@ suite and the forward suite share ONE builder.
 
 **AND IT CORRECTS THIS SECTION'S OWN CLAIM.** The paragraph below used to say
 "THE OP AND SEAM WORK IS FINISHED; WHAT IS LEFT IS THE LAYER LOOP." That is not
-true. Five things the loop composes are absent from `main` — a standalone
-grouped RMS norm for PLE's three norms, a PAGED QSA consumer, the group-2 block
-table (W5c-2), a MoE weight adapter, and an externally linked mRoPE builder —
-and `ModelRegistry::Forward` additionally refuses every multi-cache topology by
-name, which is what this model publishes. Each is measured and cited under
-`## Owed`, and the production refusal in `qwen4_exp_registry.cpp` now names them
-instead of naming W2, W3 and W4, which landed. **A wave dispatched to "write the
-layer loop" will not decode a token; it has five prerequisites, at least two of
-which (the grouped norm, the paged QSA arm) are op-sized waves of their own.**
+true. Five things the loop composes were absent from `main` when W5b-6 surveyed
+it — a standalone grouped RMS norm for PLE's three norms, a PAGED QSA consumer,
+the group-2 block table (W5c-2), a MoE weight adapter, and an externally linked
+mRoPE builder — and `ModelRegistry::Forward` additionally refuses every
+multi-cache topology by name, which is what this model publishes. Each is
+measured and cited under `## Owed`, and the production refusal in
+`qwen4_exp_registry.cpp` now names them instead of naming W2, W3 and W4, which
+landed. **A wave dispatched to "write the layer loop" will not decode a token;
+it has these prerequisites, at least two of which (the grouped norm, the paged
+QSA arm) are op-sized waves of their own.**
+
+**TWO OF THE FIVE ARE NOW CLOSED, AND THE COUNT IS STATED HERE RATHER THAN LEFT
+TO A READER TO RECOUNT.** The stale enumeration is
+[#2288](https://github.com/mudler/vllm.cpp/issues/2288), filed for traceability
+and FIXED IN THE SAME FLOW by
+[#2265](https://github.com/mudler/vllm.cpp/pull/2265), which is the wave this
+correction rides with. The grouped RMS norm is `vt::RmsNormGroup`, landed by
+W5d-1 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 1) — the
+wave this section is being merged with, which is why the correction rides here.
+The externally linked mRoPE builder is `BuildMropeCosSinHost`, landed by W5d-2
+(#2249 item 5) as `3ed2378a3`; that wave corrected the paragraph above and did
+NOT correct this list or the production refusal string, so both had been naming
+a finished seam since it merged. **THREE remain** — the paged QSA consumer, the
+group-2 block table and the MoE weight adapter — plus the `multi_kv` refusal,
+which is not this row's. The refusal in `qwen4_exp_registry.cpp` enumerates
+exactly those three at this merge commit.
 
 **What is owed, in order. THIS PARAGRAPH'S OPENING CLAIM WAS WRONG AND IS
 CORRECTED ABOVE: the op and seam work is NOT finished.** What follows is still

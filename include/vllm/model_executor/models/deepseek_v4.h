@@ -33,6 +33,7 @@
 // (single-GB10 oracle run) is therefore MEMORY-INFEASIBLE, not merely disk-blocked.
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -142,6 +143,35 @@ DeepseekV4Params ParseDeepseekV4Params(const HfConfig& config);
 // shape, NOT by the real checkpoint loader — the FP8-block + NVFP4 tower
 // MATERIALIZATION into this layout is the named W2b residual. All tensors row-major
 // fp32 unless noted.
+// MODEL-DSV4-EXL3 W1d (#2186): the FP8-sourced half of the carried tower is held
+// at the MODEL dtype rather than widened to f32. vLLM resolves ONE model dtype and
+// every layer inherits it (AGENTS.md, "Inherit vLLM defaults"); these tensors are
+// stored `F8_E4M3` + `F8_E8M0` block scales on disk, so there is no f32 anywhere in
+// their lineage and materializing them at four bytes was a 4x inflation with no
+// numerical claim behind it. On DeepSeek-V4-Flash this half costs 10.91 GiB at
+// bf16 against 21.82 GiB at f32, which takes the artifact's total residency from
+// 108.59 GiB to ~97.7 GiB against 119.63 GiB physical -- the difference between an
+// artifact that loads and one that refuses (#2186).
+//
+// The elements are BF16 BIT PATTERNS, not integers. Read them through
+// `vt::BF16ToF32` and write them through `vt::F32ToBF16`; a `uint16_t` that reaches
+// arithmetic unconverted is a bug this alias exists to make visible at the use site.
+using HostBf16 = std::vector<uint16_t>;
+
+// Widen ONE carried-tower element. Inline, and in this header, deliberately:
+// `vt::BF16ToF32` is defined out of line in `src/vt/dtype.cpp` and this build
+// enables no LTO, so calling it from the innermost loop of a carried-tower GEMV
+// would be a function call PER ELEMENT -- which costs more than halving the
+// memory traffic saves, and would make the bf16 arm slower than the f32 one it
+// replaces. This is the SAME bit operation (`AsF32(b << 16)`,
+// `src/vt/dtype.cpp:341`): bf16 is the top 16 bits of an f32, so widening is
+// exact for every one of the 65536 patterns, NaN and Inf included.
+// `test_deepseek_v4_exl3_loader.cpp` asserts that agreement exhaustively rather
+// than trusting this comment.
+inline float HostBf16ToF32(uint16_t b) {
+  return std::bit_cast<float>(static_cast<uint32_t>(b) << 16);
+}
+
 struct DeepseekV4LayerHostWeights {
   // MHC mixing (nvidia/model.py:820-865): hc_attn/hc_ffn fn [(2+hc)*hc, hc*H],
   // base [(2+hc)*hc], scale [3]; the attn/ffn RMSNorms folded into the pre-mix.
@@ -151,14 +181,14 @@ struct DeepseekV4LayerHostWeights {
   std::vector<float> hc_ffn_fn, hc_ffn_base, hc_ffn_scale;
   // 512-wide MLA (attention.py): q down/up, kv down, per-branch RMSNorms,
   // per-head attention sink, grouped OUTPUT-LoRA wo_a (bmm) + wo_b.
-  std::vector<float> wq_a;            // [q_lora_rank, H]
+  HostBf16 wq_a;                      // [q_lora_rank, H]            (FP8-sourced)
   std::vector<float> q_norm_weight;   // [q_lora_rank]
-  std::vector<float> wq_b;            // [n_heads*head_dim, q_lora_rank]
-  std::vector<float> wkv;             // [head_dim, H]
+  HostBf16 wq_b;                      // [n_heads*head_dim, q_lora_rank] (FP8-sourced)
+  HostBf16 wkv;                       // [head_dim, H]               (FP8-sourced)
   std::vector<float> kv_norm_weight;  // [head_dim]
   std::vector<float> attn_sink;       // [n_heads]
-  std::vector<float> wo_a;            // [n_groups, o_lora_rank, in_per_group]
-  std::vector<float> wo_b;            // [H, n_groups*o_lora_rank]
+  HostBf16 wo_a;                      // [n_groups, o_lora_rank, in_per_group] (FP8)
+  HostBf16 wo_b;                      // [H, n_groups*o_lora_rank]    (FP8-sourced)
   // DSA compressor + Lightning-Indexer (those layers only; empty otherwise).
   //
   // TWO GEOMETRIES MEET IN THESE SLOTS, and the shapes below are the LOADED ones
@@ -170,7 +200,7 @@ struct DeepseekV4LayerHostWeights {
   // `[index_n_heads*index_head_dim, H]`, `idx_wk` as `[index_head_dim, H]`), so
   // where the two differ it REFUSES BY NAME rather than reading either. They
   // coincide exactly where `coff` is 1 — every `compress_ratio != 4` layer.
-  std::vector<float> idx_wq;     // [index_n_heads*index_head_dim, q_lora_rank]
+  HostBf16 idx_wq;               // [index_n_heads*index_head_dim, q_lora_rank] (FP8)
   std::vector<float> idx_wk;     // [coff*index_head_dim, H]
   std::vector<float> idx_wproj;  // [index_n_heads, H]  (not widened upstream)
   std::vector<float> comp_wgate;        // [coff*head_dim, H]  (the pool score)
@@ -181,8 +211,8 @@ struct DeepseekV4LayerHostWeights {
   std::vector<float> gate_bias;    // [n_routed_experts]  (non-hash layers)
   std::vector<int32_t> tid2eid;    // [vocab, num_experts_per_tok] (hash layers)
   // Shared + routed experts (clamped SwiGLU). Routed stored flat over experts.
-  std::vector<float> shared_w1, shared_w3;  // [moe_inter, H]
-  std::vector<float> shared_w2;             // [H, moe_inter]
+  HostBf16 shared_w1, shared_w3;            // [moe_inter, H]         (FP8-sourced)
+  HostBf16 shared_w2;                       // [H, moe_inter]         (FP8-sourced)
   std::vector<float> exp_w1, exp_w3;        // [n_experts, moe_inter, H]
   std::vector<float> exp_w2;                // [n_experts, H, moe_inter]
 };

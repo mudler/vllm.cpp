@@ -1044,6 +1044,37 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                                                                     residual);
 }
 
+void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                  const RmsNormGroupArgs& args) {
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1,
+           "rmsnorm_group: x/out rank-2, w rank-1");
+  VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
+           "rmsnorm_group: shape mismatch");
+  VT_CHECK(weight.shape[0] == x.shape[1], "rmsnorm_group: weight size mismatch");
+  // group_size == 0 lands here rather than degenerating to a whole-row norm.
+  // Upstream refuses the divisibility case by name (modeling_qwen4_exp.py:164-165
+  // "hidden_size (...) must be divisible by group_size (...)"); the zero case is
+  // ours, because upstream's `None` means "no grouping" and this op's default
+  // must not silently mean that. See RmsNormGroupArgs::group_size.
+  VT_CHECK(args.group_size >= 1,
+           "rmsnorm_group: group_size must be >= 1; 0 is NOT 'the whole row' "
+           "(that is vt::RmsNorm). Defaulting it to the whole row would make the "
+           "most likely caller mistake indistinguishable from success, so the "
+           "unset value is refused rather than interpreted");
+  VT_CHECK(x.shape[1] % args.group_size == 0,
+           "rmsnorm_group: group_size must divide the last dim "
+           "(modeling_qwen4_exp.py:164-165)");
+  VT_CHECK(args.eps > 0.0f, "rmsnorm_group: eps must be > 0");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
+           "rmsnorm_group: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous(),
+           "rmsnorm_group: contiguous required");
+  VT_CHECK(x.device == out.device && weight.device == x.device && x.device == q.device,
+           "rmsnorm_group: device mismatch (x/out/weight/queue)");
+  reinterpret_cast<RmsNormGroupFn>(GetOp(OpId::kRmsNormGroup, q.device.type))(q, out, x, weight,
+                                                                             args);
+}
+
 namespace {
 
 // Fetch the tensor bound to operand slot `idx`, checked non-null.

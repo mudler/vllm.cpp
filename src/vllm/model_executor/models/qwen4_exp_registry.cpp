@@ -183,22 +183,44 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // Until #2031's W5b survey this message still owed the n-gram embedding to
   // W2, the gated residual to W3 and Qwen Sparse Attention to W4 — all three
   // landed waves. A refusal that names finished work sends the next reader to
-  // rebuild it. The five below are measured against this tree, each one
+  // rebuild it. The three below are measured against this tree, each one
   // independently sufficient to stop a token, and each is carried under
   // `## Owed` in the row spec.
+  //
+  // IT WENT STALE AGAIN WITHIN TWO WAVES, WHICH IS WHY IT IS EDITED HERE AND
+  // NOT LEFT FOR THE LOOP WAVE. That staleness is #2288, filed for traceability
+  // and fixed in the same flow by #2265. The survey listed FIVE, and two of the five are
+  // now on `main`. The grouped RMS norm is `vt::RmsNormGroup`, landed by W5d-1
+  // (#2249 item 1) — the very change this file is being merged alongside, so
+  // leaving the clause would have shipped a commit whose product output denies
+  // what the commit adds. The mRoPE builder is `BuildMropeCosSinHost`, which
+  // W5d-2 (#2249 item 5, `3ed2378a3`) gave external linkage behind
+  // `include/vllm/model_executor/models/qwen3_5_mrope.h`; that wave corrected
+  // the row spec's prose and did NOT correct this string, so the refusal has
+  // been naming a finished seam since it merged. Both clauses are removed
+  // rather than reworded, because a refusal enumerates what is missing and a
+  // present item is not missing.
+  //
+  // WHAT PINS THIS STRING, checked rather than assumed. The `SUBCASE("the
+  // forward")` of `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` drives
+  // this hook with a foreign handle and asserts FIVE substrings:
+  // "Qwen4ExpForConditionalGeneration", "forward is not ported", "W2", "W4",
+  // "#1978", and the ABSENCE of "was not produced by". All five survive this
+  // edit and the absence still holds, so the suite is unchanged at 12 cases /
+  // 296 assertions. The two removed clauses are prose no assertion reads —
+  // which is the point: the gate holds the refusal REACHABLE and names the
+  // owing waves, it cannot hold the enumeration TRUE, so keeping this list
+  // honest is a reading and not a checker.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
-           "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..5, "
-           "W5c-1); what the layer loop still lacks is (1) a standalone grouped "
-           "RMSNorm op — the PLE block needs three and the only grouped "
-           "reduction in this tree is fused inside vt::Qwen4ExpGatedResidual; "
-           "(2) a PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock "
-           "takes contiguous [max_kv, ...] caches while make_kv_cache publishes "
-           "paged ones; (3) reach for the indexer side cache, whose group-2 "
+           "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..6, "
+           "W5c-1, W5d-1, W5d-2); what the layer loop still lacks is (1) a "
+           "PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock takes "
+           "contiguous [max_kv, ...] caches while make_kv_cache publishes "
+           "paged ones; (2) reach for the indexer side cache, whose group-2 "
            "block table GPUModelRunner::gather_block_table never gathers "
-           "(W5c-2); (4) an adapter from the stacked [E, I, H] qwen4_exp MoE "
-           "tensors onto MoeBlockWeights; and (5) a mRoPE cos/sin builder with "
-           "external linkage — qwen3_5.cpp's BuildMropeCosSinHost is static. "
+           "(W5c-2); and (3) an adapter from the stacked [E, I, H] qwen4_exp "
+           "MoE tensors onto MoeBlockWeights. "
            "ModelRegistry::Forward additionally refuses any multi-cache "
            "topology by name, and this model publishes one. See "
            ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");

@@ -358,13 +358,50 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
              "range [ctx_len, ctx_len + block rows) the read's extended bound "
              "addresses (SPEC-DFLASH2 W11, #1890)");
   }
+  // #2274 — THE BOUNDS THIS CALL WRITES AND READS, CHECKED ON EVERY BACKEND.
+  //
+  // The two checks above are guarded on `kCPU` because they dereference device
+  // tensors. These are pure HOST arithmetic over shapes, so they run on CUDA
+  // too — which is where the fault is. `ReshapeAndCache` below WRITES `tq` rows
+  // at `slots`, and the attention then READS `[0, seq_ext)` through
+  // `block_table`; if either passes the pool, that is an illegal access inside a
+  // kernel, reported later and elsewhere (a `cudaMemcpyAsync` or a `cudaFree`)
+  // with nothing naming this call. #2274 is exactly that shape: an out-of-bounds
+  // access on the second request of a process, surfacing far from its cause.
+  //
+  // This is a DETECTOR, not a repair. If it fires, the caller's accounting is
+  // wrong and the message says which term; if it never fires, this class is
+  // excluded and the search moves on. Cost is a few host integer comparisons per
+  // draft layer.
+  const int64_t pool_pages = pool_k.shape[0];
+  const int64_t page_rows = pool_k.shape[1];
+  const int64_t pool_capacity = pool_pages * page_rows;
+  VT_CHECK(canon.seq_ext <= pool_capacity,
+           "dflash block paged attention: the extended read bound passes the pool "
+           "(seq_ext > pages*page_rows); the attention would read unmapped pages "
+           "(SPEC-DFLASH2, #2274)");
+  VT_CHECK(host_inputs.slots.empty() ||
+               host_inputs.slots.back() < pool_capacity,
+           "dflash block paged attention: the last write slot passes the pool "
+           "(slots.back() >= pages*page_rows); ReshapeAndCache would write past "
+           "the K/V pages (SPEC-DFLASH2, #2274)");
+  // The block table must ADDRESS every page the extended bound reaches. It is
+  // `[1, max_pages]`, so its own width is the reachable page count -- a table
+  // shorter than `ceil(seq_ext / page_rows)` sends the kernel through an
+  // uninitialised entry, which is an arbitrary page index rather than a refusal.
+  VT_CHECK(page_rows > 0 && block_table.rank == 2 && block_table.shape[1] > 0,
+           "dflash block paged attention: the block table must be [1, max_pages] "
+           "over a positive page size (SPEC-DFLASH2, #2274)");
+  VT_CHECK(block_table.shape[1] * page_rows >= canon.seq_ext,
+           "dflash block paged attention: the block table cannot address the "
+           "extended bound (max_pages*page_rows < seq_ext), so the read walks off "
+           "the end of the table (SPEC-DFLASH2, #2274)");
   vt::ReshapeAndCache(q, block_k, block_v, pool_k, pool_v, slot_map);
   // #2252: `host_meta` outlives the call below, which is all it must do -- the
   // launcher reads the qsl on the host to size its grid before it launches.
   // The POOL's capacity (pages x page rows), not this step's context length --
   // see the note on `DflashBlockPagedHostMetaOf`: a per-step value baked into a
   // replayed graph reads out of bounds.
-  const int64_t pool_capacity = pool_k.shape[0] * pool_k.shape[1];
   const DflashBlockPagedHostMeta host_meta =
       DflashBlockPagedHostMetaOf(pool_capacity, query.shape[0]);
   const vt::PagedAttentionArgs pa =

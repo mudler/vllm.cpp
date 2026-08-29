@@ -672,10 +672,15 @@ TEST_CASE("glm5_next: the tensor inventory is generated from the topology") {
 
   // Counted from the maps and the schedule rather than transcribed: 3
   // model-level (`tie_word_embeddings` is false, so `output.weight` is its own
-  // tensor), then per layer 8 common + (15 KDA | 14 DSA) + (3 dense | 5+3
-  // sparse), then 11 vision + 24 * 14 vision-block.
+  // tensor), then per layer 8 common + (15 KDA | 13 DSA + 2 SPLIT MLA halves) +
+  // (3 dense | 5+3 sparse), then 11 vision + 24 * 14 vision-block.
+  //
+  // The DSA term is 13 + 2 and not 14, and #2242 is why: `kv_b_proj` is ONE HF
+  // parameter and TWO GGUF tensors, because llama.cpp #27752's converter splits
+  // it and transposes the k half. It cannot live in the 1:1 map, so it has its
+  // own table and its own term here.
   const int64_t expected =
-      3 + (34 * (8 + 15)) + (11 * (8 + 14)) + (3 * 3) + (42 * (5 + 3)) +
+      3 + (34 * (8 + 15)) + (11 * (8 + 13 + 2)) + (3 * 3) + (42 * (5 + 3)) +
       11 + (24 * 14);
   CHECK(static_cast<int64_t>(names.size()) == expected);
 
@@ -691,6 +696,16 @@ TEST_CASE("glm5_next: the tensor inventory is generated from the topology") {
   // A DSA layer carries the MLA tower, the indexer, its LayerNorm BIAS (which
   // is what settles LayerNorm over RMSNorm) and the k-pool compressor.
   CHECK(has("blk.3.attn_kv_a_mqa.weight"));
+  // The two SPLIT absorbed halves, and NOT the fused tensor. The published
+  // artifact carries `attn_k_b` and `attn_v_b` on every DSA block and no
+  // `attn_kv_b.weight` anywhere (#2242, #2291).
+  CHECK(has("blk.3.attn_k_b.weight"));
+  CHECK(has("blk.3.attn_v_b.weight"));
+  CHECK_FALSE(has("blk.3.attn_kv_b.weight"));
+  // And `ssm_dt.bias`, not `ssm_dt`: the converter renames `.dt_bias` to
+  // `.dt_proj.bias` before its generic map runs.
+  CHECK(has("blk.0.ssm_dt.bias"));
+  CHECK_FALSE(has("blk.0.ssm_dt"));
   CHECK(has("blk.3.indexer.k_norm.bias"));
   CHECK(has("blk.3.indexer_compressor_ape.weight"));
   CHECK(has("blk.3.indexer_compressor_gate.weight"));
@@ -789,6 +804,14 @@ struct Glm5NextGgufArrays {
   // pre name every existing case here was written against; the PUBLISHED
   // artifact states `glm4`, which is what #2277's case selects.
   std::string tokenizer_pre = "qwen35";
+
+  // Write the `vision.*` metadata block. TRUE by default, because every case
+  // here was written against a file that carries it. The PUBLISHED artifact's
+  // text container carries NONE of it — its tower ships as a separate
+  // `mmproj-BF16.gguf` — and W5c's loader refuses a vision-declaring config up
+  // front, so a case that wants to reach the TENSOR tower turns this off
+  // (#2242).
+  bool with_vision = true;
 };
 
 std::string PublishedShapeGguf(int64_t n_layers,
@@ -897,19 +920,21 @@ std::string PublishedShapeGguf(int64_t n_layers,
   b.AddKv(gguf_test::U32Kv(k + "image_end_token_id", 154831));
   b.AddKv(gguf_test::U32Kv(k + "video_start_token_id", 154832));
   b.AddKv(gguf_test::U32Kv(k + "video_end_token_id", 154833));
-  b.AddKv(gguf_test::U32Kv(k + "vision.block_count", 24));
-  b.AddKv(gguf_test::U32Kv(k + "vision.embedding_length", 1024));
-  b.AddKv(gguf_test::U32Kv(k + "vision.feed_forward_length", 4096));
-  b.AddKv(gguf_test::U32Kv(k + "vision.head_count", 16));
-  b.AddKv(gguf_test::U32Kv(k + "vision.patch_size", 14));
-  b.AddKv(gguf_test::U32Kv(k + "vision.image_size", 448));
-  b.AddKv(gguf_test::U32Kv(k + "vision.spatial_merge_size", 2));
-  b.AddKv(gguf_test::U32Kv(k + "vision.temporal_patch_size", 2));
-  b.AddKv(gguf_test::U32Kv(k + "vision.out_embedding_length", 4096));
-  b.AddKv(gguf_test::U32Kv(k + "vision.projection_intermediate_size", 10240));
-  b.AddKv(gguf_test::F32Kv(k + "vision.attention.layer_norm_rms_epsilon",
-                           1e-5f));
-  b.AddKv(gguf_test::F32Kv(k + "vision.swiglu_clamp", 10.0f));
+  if (arrays.with_vision) {
+    b.AddKv(gguf_test::U32Kv(k + "vision.block_count", 24));
+    b.AddKv(gguf_test::U32Kv(k + "vision.embedding_length", 1024));
+    b.AddKv(gguf_test::U32Kv(k + "vision.feed_forward_length", 4096));
+    b.AddKv(gguf_test::U32Kv(k + "vision.head_count", 16));
+    b.AddKv(gguf_test::U32Kv(k + "vision.patch_size", 14));
+    b.AddKv(gguf_test::U32Kv(k + "vision.image_size", 448));
+    b.AddKv(gguf_test::U32Kv(k + "vision.spatial_merge_size", 2));
+    b.AddKv(gguf_test::U32Kv(k + "vision.temporal_patch_size", 2));
+    b.AddKv(gguf_test::U32Kv(k + "vision.out_embedding_length", 4096));
+    b.AddKv(gguf_test::U32Kv(k + "vision.projection_intermediate_size", 10240));
+    b.AddKv(gguf_test::F32Kv(k + "vision.attention.layer_norm_rms_epsilon",
+                             1e-5f));
+    b.AddKv(gguf_test::F32Kv(k + "vision.swiglu_clamp", 10.0f));
+  }
   if (with_tokenizer) {
     // "gpt2" is llama.cpp's name for byte-level BPE, and "qwen35" is the only
     // pre name this tree mapped without an approximation before #2277 added
@@ -1720,7 +1745,20 @@ class TempSafetensorsDir {
 
 }  // namespace
 
-TEST_CASE("glm5_next: the GGUF LOADER refuses by name through FromModelDir") {
+// W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) MOVED this case
+// rather than deleting it, and the direction it moved in is the point. Before
+// W5c the GGUF arm refused at the DOOR — "the weight loader is not ported",
+// plus a sentence claiming no `.gguf` of this model existed anywhere, which had
+// stopped being true. There is a weight tower now, so `FromModelDir` gets past
+// the door and into it, and what this case gates is that REACH: the refusal it
+// lands on is one the TOWER raises, by name, on a file the tower can read the
+// metadata of.
+TEST_CASE("glm5_next: FromModelDir reaches the WEIGHT TOWER, which refuses by name") {
+  // The builder's default file declares a vision tower, and the `glm5next`
+  // container is text-only: the published artifact ships its tower as a
+  // separate `mmproj-BF16.gguf` and llama.cpp #27752 drops the vision tensors
+  // at convert time. So the tower refuses that up front, before any tensor I/O,
+  // rather than failing on eleven vision tensor names one at a time.
   const gguf_test::TempFile file(PublishedShapeGguf(
       8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true));
   const std::string msg = LoadRefusalFor(file.path());
@@ -1735,23 +1773,31 @@ TEST_CASE("glm5_next: the GGUF LOADER refuses by name through FromModelDir") {
   CHECK(msg.find("missing metadata key") == std::string::npos);
   CHECK(msg.find("tokenizer") == std::string::npos);
 
-  CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  CHECK(msg.find("the weight loader is not ported") != std::string::npos);
-  // The wave that owes the tower, and each primitive it owes.
-  CHECK(msg.find("W5") != std::string::npos);
-  CHECK(msg.find("KDA") != std::string::npos);
-  CHECK(msg.find("NoPE MLA") != std::string::npos);
-  CHECK(msg.find("mHC") != std::string::npos);
-  CHECK(msg.find("stacked-expert") != std::string::npos);
-  // And O7: no `.gguf` of this model exists anywhere, so the reader's next step
-  // is the converter and not a download.
-  CHECK(msg.find("O7") != std::string::npos);
-  CHECK(msg.find("scripts/convert-glm5-next-gguf.py") != std::string::npos);
+  CHECK(msg.find("glm5_next gguf") != std::string::npos);
+  CHECK(msg.find("TEXT-ONLY") != std::string::npos);
+  CHECK(msg.find("W6") != std::string::npos);
   CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
-  CHECK(msg.find("#1998") != std::string::npos);
-  // This arm and NOT the safetensors one: the two are different next steps.
-  CHECK(msg.find("the GGUF config is read and validated") != std::string::npos);
-  CHECK(msg.find("598.53 GiB") == std::string::npos);
+  // The refusal W1 raised is GONE from product output, and so is the claim that
+  // no artifact exists. Both were true when they were written and neither is
+  // now; `unsloth/GLM-5.3-Flash-GGUF` @ `d425e572f` is 1412 tensors in four
+  // shards.
+  CHECK(msg.find("the weight loader is not ported") == std::string::npos);
+  CHECK(msg.find("NO `.gguf` of this model exists") == std::string::npos);
+
+  // And on a TEXT-ONLY file — which is what the published container is — the
+  // load goes further still, into the tensor tower, and refuses by the NAME of
+  // the first tensor it cannot find. This fixture carries metadata and no
+  // weights at all, so that is the token table.
+  Glm5NextGgufArrays text_only;
+  text_only.with_vision = false;
+  const gguf_test::TempFile txt(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true,
+      text_only));
+  const std::string tmsg = LoadRefusalFor(txt.path());
+  REQUIRE_FALSE(tmsg.empty());
+  CAPTURE(tmsg);
+  CHECK(tmsg.find("TEXT-ONLY") == std::string::npos);
+  CHECK(tmsg.find("token_embd.weight") != std::string::npos);
 }
 
 // #2277, and it is the production-entry-point half of that fix. `FromGguf`'s
@@ -1779,10 +1825,13 @@ TEST_CASE("glm5_next: pre \"glm4\" gets PAST the tokenizer, to the loader") {
   CHECK(msg.find("unsupported tokenizer.ggml.pre") == std::string::npos);
   CHECK(msg.find("glm4") == std::string::npos);
   CHECK(msg.find("tokenizer") == std::string::npos);
-  // It is the WEIGHT LOADER's, which is strictly past the tokenizer read.
-  CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  CHECK(msg.find("the weight loader is not ported") != std::string::npos);
-  CHECK(msg.find("W5") != std::string::npos);
+  // It is the WEIGHT TOWER's, which is strictly past the tokenizer read. W5c
+  // moved this assertion with the refusal it names: before the tower existed
+  // this landed on "the weight loader is not ported", and the reach it proves
+  // is the same reach, one step further along.
+  CHECK(msg.find("glm5_next gguf") != std::string::npos);
+  CHECK(msg.find("TEXT-ONLY") != std::string::npos);
+  CHECK(msg.find("W6") != std::string::npos);
 
   // A name the table still does not carry stops in the TOKENIZER, at the same
   // fixture. Without this the case above would pass on a table that accepted
@@ -1797,7 +1846,7 @@ TEST_CASE("glm5_next: pre \"glm4\" gets PAST the tokenizer, to the loader") {
   CAPTURE(bad_msg);
   CHECK(bad_msg.find("unsupported tokenizer.ggml.pre") != std::string::npos);
   CHECK(bad_msg.find("glm5next") != std::string::npos);
-  CHECK(bad_msg.find("the weight loader is not ported") == std::string::npos);
+  CHECK(bad_msg.find("TEXT-ONLY") == std::string::npos);
 }
 
 TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDir") {
@@ -1812,14 +1861,21 @@ TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDi
   CHECK(msg.find("tokenizer") == std::string::npos);
 
   CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  CHECK(msg.find("the weight loader is not ported yet") != std::string::npos);
-  CHECK(msg.find("W5 owes it") != std::string::npos);
+  // W5c moved WHY this arm refuses, and the new reason is the honest one: it is
+  // not that the loader is unwritten -- the GGUF one is written -- but that
+  // every published safetensors artifact exceeds every device this project
+  // owns, so an arm that read them would be code nothing could run.
+  CHECK(msg.find("the safetensors weight loader is not ported") !=
+        std::string::npos);
+  CHECK(msg.find("exceeds every device this project owns") != std::string::npos);
   // The published arms and the device they do not fit, so the reader is not
   // sent looking for a checkpoint that would work.
   CHECK(msg.find("305.78 GiB") != std::string::npos);
   CHECK(msg.find("598.53 GiB") != std::string::npos);
+  CHECK(msg.find("181.32 GiB") != std::string::npos);
+  CHECK(msg.find("119.63 GiB") != std::string::npos);
   CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
   CHECK(msg.find("#1998") != std::string::npos);
   // This arm and NOT the GGUF one.
-  CHECK(msg.find("the GGUF config is read and validated") == std::string::npos);
+  CHECK(msg.find("TEXT-ONLY") == std::string::npos);
 }

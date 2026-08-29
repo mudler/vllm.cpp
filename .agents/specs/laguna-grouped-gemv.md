@@ -175,14 +175,53 @@ context length moves the grid. Nothing here is a speed claim, no default changed
 and no llama.cpp denominator is quoted — W11's "~22% of peak vs llama.cpp ~76%"
 inherits the #1003 supersession and is not a target.
 
-**What would reopen this row:** a mechanism that shortens the unpack dependency
-chain itself, rather than feeding more warps or more bandwidth to the same chain.
-The one structural difference from the Q8_0 case is that this kernel's own spec
-defers tensor-core tiling (`cuda-keepquant-gemm.md`), which is such a mechanism —
-it changes what the inner loop does rather than how much is in flight around it.
-That remains a genuine candidate and is NOT refuted here; it is simply a different
-and much larger piece of work than "tuning", and it should be opened on its own
-terms rather than as a bandwidth pass.
+**Tensor-core tiling was examined as the reopening candidate and does NOT apply
+to decode.** It is the one mechanism that would shorten the unpack dependency
+chain rather than feed more warps to it, and `cuda-keepquant-gemm.md` defers it,
+so it was the obvious next row. Reading the upstream reference closes it for this
+shape.
+
+llama.cpp's MoE dispatch at `b10451` (`ggml-cuda.cu:1916`) is:
+
+```c
+const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+if (ne2 <= mmvq_mmid_max) { /* MMVQ */ }   // else MMQ
+```
+
+For **Q4_K and Q5_K**, which are exactly Laguna's expert dtypes, the Turing+ table
+(`mmvq.cu:141`) falls through to `default: return MMVQ_MAX_BATCH_SIZE`, and that
+is **8** (`mmvq.cuh:3`). Laguna decodes one token, so `ne2 = 1 <= 8` and **llama.cpp
+takes MMVQ — warp-per-output, the structure we already have.** It reaches for
+tensor-core MMQ tiles only above batch 8, which is prefill.
+
+So there is no upstream existence proof that MMQ wins at decode on this dtype; the
+reference deliberately chooses our structure at this batch size. The shape agrees:
+tensor-core tiles want at least 16 rows and Laguna's decode grouped GEMM has
+`P = 10` top-k experts, so roughly six of sixteen rows would be padding even if it
+were built.
+
+Tensor-core tiling therefore remains a real deferral — for **prefill**, not for the
+decode 62% that motivated this lever. A prefill row would need its own attribution
+first, because Laguna's measured gap was decode and prefill was never attributed.
+
+## The W11 lever list is now EXHAUSTED
+
+| Lever | Disposition |
+|---|---|
+| #1 fused gate/up (`QuantizeQ8K` dedup) | MEASURED, [#2061](https://github.com/mudler/vllm.cpp/issues/2061): works, ~+4.28% warm, moves a token on 6 of 6 prompts, ships default-OFF |
+| #2 keep-quant GEMV "BW-tuning" | REFUTED AT THE COUNTER, this row: latency-bound at 101.5% occupancy, memory SOL 28%, so the bandwidth, occupancy and dp4a levers are all refuted before attempt |
+| #3 device-resident decode | DEMOTED by W11 itself: GPU-busy ~= host sync time, worth ~0.02 s/tok |
+| (reopening candidate) tensor-core MMQ | NOT APPLICABLE to decode: upstream uses MMVQ below batch 8 for Q4_K/Q5_K |
+
+Together with the Q8_0 kernel's five refuted structural bricks and its recorded
+MEASURED FLOOR, the ranked plan that came out of the W7/W11 attribution is
+complete. **Laguna's remaining decode cost is a memory-latency dependency chain in
+the keep-quant unpack, and no lever on that list moves it.**
+
+That is a real answer rather than an absence of one, and it is what closes the
+campaign. What it does NOT say is that Laguna is at its floor for all time — it
+says the enumerated levers are spent. A new lever needs a new mechanism and a
+fresh attribution, not another pass at this list.
 
 ## Now
 
@@ -191,5 +230,6 @@ answered: memory latency, at full occupancy, sharing the Q8_0 kernel's floor. Th
 bandwidth, occupancy and dp4a levers are refuted at the counter. No product code
 was written and none should be, on this evidence.
 
-Tensor-core tiling stays open as a distinct and larger row, if the ~62% of decode
-this kernel occupies is judged worth that scale of work.
+The W11 lever list is exhausted (see the table above). Tensor-core tiling stays a
+genuine deferral for PREFILL only, and would need its own attribution first —
+Laguna's measured gap was decode, and prefill has never been attributed.

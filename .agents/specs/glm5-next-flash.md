@@ -1717,8 +1717,43 @@ Debts this row carries, each visible rather than waived:
   with    the fix : vt: glm5_next gguf: attention.key_length_mla - attention.key_length
                     is -256 but rope.dimension_count is 0; the file states this model's
                     rotary width twice and the two disagree
-                    at src/vllm/model_executor/models/glm5_next_weights.cpp:435
   ```
+
+  The refusal is the rotary-width cross-check in `Glm5NextHfConfigFromGguf`,
+  named here rather than by `file:line` because the anchor moved once inside the
+  pull request that measured it. The append-only index row for
+  [#2268](https://github.com/mudler/vllm.cpp/issues/2268) quotes the line number
+  it had when the row was appended and cannot be edited; this entry is the
+  corrected surface.
+
+  **BLOCKS ARE NOT LAYERS, and the GGUF path used to conflate them.**
+  `c.num_hidden_layers` was set straight from `block_count`, so the SAME model
+  resolved to a 45-layer backbone from its `config.json` and a 46-layer one from
+  its GGUF, and the extra entry was the MTP block. Nothing downstream would have
+  refused it: `ParseGlm5NextParams` sizes all three schedules from
+  `num_hidden_layers`, so W5b and W5c would have built a decoder layer out of
+  the MTP block, and it would have run and produced plausible tokens. The
+  contract is BACKBONE depth — `glm5_next.h:193` already annotates the field as
+  `// 45` — and llama.cpp states the relationship in its own converters:
+  `self.block_count = self.hparams["num_hidden_layers"] +
+  self.hparams.get("num_nextn_predict_layers", 0)`
+  (`b10451:conversion/exaone.py:134`, and the same `+=` at
+  `b10451:conversion/deepseek.py:470` and `:545`). The builder therefore
+  resolves `num_hidden_layers = block_count - nextn_predict_layers`, validates
+  every per-block array against `block_count`, and truncates the three
+  schedules to the backbone. A file claiming more MTP blocks than blocks is
+  refused by name. Our own converter writes `block_count = n_layers` with
+  `nextn_predict_layers = 0` (`scripts/convert-glm5-next-gguf.py:997`, `:1024`),
+  so the formula leaves its output unchanged.
+
+  **What W5b inherits from this.** The MTP block is read, counted and DROPPED:
+  its entry in `attention.head_count_kv` — index 45, value `1`, MLA-shaped — is
+  not carried into `layer_types`, and no field on `HfConfig` or
+  `Glm5NextParams` holds `nextn_predict_layers` yet. So W5b
+  ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) gets a stack sized
+  to 45 and must not build a layer for block 45; if the MTP head needs that
+  block's kind, W5b adds the field, because this change deliberately did not.
+  O2 still owns the head itself.
 
   That is NOT a malformed file. `attention.key_length` is 512 and
   `attention.key_length_mla` is 256 in the published artifact because llama.cpp

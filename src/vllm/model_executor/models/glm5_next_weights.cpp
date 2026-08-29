@@ -373,8 +373,49 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   c.model_type = "glm5_next";
   c.architectures = {"Glm5NextForConditionalGeneration"};
 
-  const int64_t n_layers = ReqInt(gguf, p + "block_count");
-  VT_CHECK(n_layers > 0, "glm5_next gguf: block_count must be > 0");
+  // BLOCKS ARE NOT LAYERS, and the difference is one whole decoder layer.
+  //
+  // llama.cpp's `block_count` counts the multi-token-prediction blocks on top
+  // of the backbone, and it states the relationship in its own converters:
+  // `self.block_count = self.hparams["num_hidden_layers"] +
+  // self.hparams.get("num_nextn_predict_layers", 0)`
+  // (`b10451:conversion/exaone.py:134`, and the same `+=` at
+  // `b10451:conversion/deepseek.py:470` and `:545`). The published artifact is
+  // that formula exactly: `block_count = 46`, `nextn_predict_layers = 1`, and
+  // the released `config.json` declares `num_hidden_layers = 45`.
+  //
+  // So `num_hidden_layers` here is the BACKBONE depth, which is what the field
+  // means on the `config.json` path and what `glm5_next.h` annotates it as. It
+  // is resolved by subtraction rather than transcribed, because reading
+  // `block_count` into it makes ONE model resolve to a 45-layer stack from its
+  // config.json and a 46-layer stack from its GGUF, and the extra entry is the
+  // MTP block. Nothing downstream would refuse that: `ParseGlm5NextParams`
+  // sizes every schedule from `num_hidden_layers`, and a decoder stack built
+  // from 46 would carry an extra layer made out of the MTP block, run, and
+  // produce plausible tokens. A token gate cannot see that, which is the whole
+  // reason this is subtracted here and asserted as a relationship rather than
+  // as a number.
+  //
+  // The MTP block itself is READ, COUNTED and then DROPPED. W5b
+  // (https://github.com/mudler/vllm.cpp/issues/2241) owns the head that would
+  // consume it; until then the per-block schedules below are truncated to the
+  // backbone and no layer is built for it, which is what the reference does
+  // too.
+  const int64_t n_blocks = ReqInt(gguf, p + "block_count");
+  VT_CHECK(n_blocks > 0, "glm5_next gguf: block_count must be > 0");
+  const int64_t n_mtp = OptInt(gguf, p + "nextn_predict_layers", 0);
+  VT_CHECK(n_mtp >= 0,
+           "glm5_next gguf: nextn_predict_layers is " + std::to_string(n_mtp) +
+               " and a count of multi-token-prediction blocks cannot be "
+               "negative");
+  const int64_t n_layers = n_blocks - n_mtp;
+  VT_CHECK(n_layers > 0,
+           "glm5_next gguf: block_count is " + std::to_string(n_blocks) +
+               " and nextn_predict_layers is " + std::to_string(n_mtp) +
+               ", so the backbone would be " + std::to_string(n_layers) +
+               " layers deep; llama.cpp writes block_count as "
+               "num_hidden_layers + nextn_predict_layers, so this file states "
+               "more MTP blocks than it has blocks");
 
   c.hidden_size = ReqInt(gguf, p + "embedding_length");
   c.num_hidden_layers = n_layers;
@@ -408,7 +449,7 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
       OptIntArray(gguf, p + "attention.head_count_kv", &head_count_kv_arr);
   if (kv_is_per_layer) {
     CheckPerLayerLength(p + "attention.head_count_kv",
-                        head_count_kv_arr.size(), n_layers);
+                        head_count_kv_arr.size(), n_blocks);
     c.num_key_value_heads = c.num_attention_heads;
   } else {
     c.num_key_value_heads =
@@ -471,10 +512,10 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   const std::vector<std::string> declared =
       OptStrArray(gguf, p + "layer_types");
   if (!declared.empty()) {
-    VT_CHECK(static_cast<int64_t>(declared.size()) == n_layers,
+    VT_CHECK(static_cast<int64_t>(declared.size()) == n_blocks,
              "glm5_next gguf: layer_types has " +
                  std::to_string(declared.size()) +
-                 " entries but block_count is " + std::to_string(n_layers));
+                 " entries but block_count is " + std::to_string(n_blocks));
   }
 
   // CROSS-CHECK, not a preference. A file that states the schedule twice and
@@ -485,7 +526,7 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   // `LayerKindFromString` rewrites to `deepseek_sparse_attention`, and both are
   // attention layers with a non-zero KV head count.
   if (!declared.empty() && kv_is_per_layer) {
-    for (int64_t il = 0; il < n_layers; ++il) {
+    for (int64_t il = 0; il < n_blocks; ++il) {
       const size_t i = static_cast<size_t>(il);
       const bool declared_kda = declared[i] == "linear_attention";
       const bool derived_kda = head_count_kv_arr[i] == 0;
@@ -515,18 +556,28 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
              "defaulted: write either the string array " +
                  p + "layer_types or a per-layer " + p +
                  "attention.head_count_kv array of " +
-                 std::to_string(n_layers) +
+                 std::to_string(n_blocks) +
                  " entries, 0 on each `linear_attention` block");
   }
+  // TRUNCATE the per-block schedules to the backbone. Every array above is
+  // `block_count` long because it describes BLOCKS; `layer_types` and the two
+  // below describe LAYERS, and the trailing `n_mtp` entries are the MTP blocks
+  // this port does not build (O2, and W5b owns the head). Dropping them here,
+  // once, is what keeps `ParseGlm5NextParams` — which sizes all three schedules
+  // from `num_hidden_layers` — from meeting a length it would have to refuse,
+  // and what makes a GGUF and a config.json of the SAME model resolve to the
+  // same stack.
+  layer_types.resize(static_cast<size_t>(n_layers));
   c.layer_types = layer_types;
 
   std::vector<std::string> mlp_layer_types =
       OptStrArray(gguf, p + "mlp_layer_types");
   if (!mlp_layer_types.empty()) {
-    VT_CHECK(static_cast<int64_t>(mlp_layer_types.size()) == n_layers,
+    VT_CHECK(static_cast<int64_t>(mlp_layer_types.size()) == n_blocks,
              "glm5_next gguf: mlp_layer_types has " +
                  std::to_string(mlp_layer_types.size()) +
-                 " entries but block_count is " + std::to_string(n_layers));
+                 " entries but block_count is " + std::to_string(n_blocks));
+    mlp_layer_types.resize(static_cast<size_t>(n_layers));
   }
 
   // THE INVENTORY CONTRADICTION CHECK, and it is a contradiction check rather
@@ -595,9 +646,16 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   text["intermediate_size"] = c.intermediate_size;
   text["layer_types"] = layer_types;
   if (!mlp_layer_types.empty()) text["mlp_layer_types"] = mlp_layer_types;
-  const std::vector<std::string> indexer_types =
+  std::vector<std::string> indexer_types =
       OptStrArray(gguf, p + "attention.indexer.types");
-  if (!indexer_types.empty()) text["indexer_types"] = indexer_types;
+  if (!indexer_types.empty()) {
+    VT_CHECK(static_cast<int64_t>(indexer_types.size()) == n_blocks,
+             "glm5_next gguf: attention.indexer.types has " +
+                 std::to_string(indexer_types.size()) +
+                 " entries but block_count is " + std::to_string(n_blocks));
+    indexer_types.resize(static_cast<size_t>(n_layers));
+    text["indexer_types"] = indexer_types;
+  }
 
   // MLA.
   text["q_lora_rank"] = ReqInt(gguf, p + "attention.q_lora_rank");
@@ -670,9 +728,9 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   double clamp_exp = 0.0;
   double clamp_shexp = 0.0;
   const bool has_exp =
-      OptPerLayerFloat(gguf, p + "swiglu_clamp_exp", n_layers, &clamp_exp);
+      OptPerLayerFloat(gguf, p + "swiglu_clamp_exp", n_blocks, &clamp_exp);
   const bool has_shexp =
-      OptPerLayerFloat(gguf, p + "swiglu_clamp_shexp", n_layers, &clamp_shexp);
+      OptPerLayerFloat(gguf, p + "swiglu_clamp_shexp", n_blocks, &clamp_shexp);
   VT_CHECK(!(has_exp && has_shexp) || clamp_exp == clamp_shexp,
            "glm5_next gguf: " + p + "swiglu_clamp_exp is " +
                std::to_string(clamp_exp) + " and " + p +

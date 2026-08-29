@@ -737,17 +737,24 @@ namespace {
 // The config-layer cases below must not also be asserting a vocabulary, which
 // is why this is a switch rather than an unconditional block.
 //
-// THE THREE PER-LAYER ARRAY KNOBS are what the published
+// THE PUBLISHED-SHAPE KNOBS are what the published
 // `unsloth/GLM-5.3-Flash-GGUF` artifact needs and our own converter's output
 // does not. An EMPTY `layer_types` omits that key entirely, which is the shape
 // of every published file; a non-empty `head_count_kv_arr` replaces the scalar
 // `attention.head_count_kv` with the per-layer `array[i32]` those files carry;
-// and non-empty clamp vectors replace the scalar `swiglu_clamp_exp` with the
-// `array[f32]` pair. Defaults keep every existing case byte-identical.
+// non-empty clamp vectors replace the scalar `swiglu_clamp_exp` with the
+// `array[f32]` pair; and a non-zero `nextn_predict_layers` writes that key, so
+// a case can state how many of the `block_count` blocks are MTP rather than
+// backbone. Defaults keep every existing case byte-identical.
+//
+// The FIRST argument of `PublishedShapeGguf` is the BLOCK count and is written
+// to `block_count`, so every per-block array this builder generates is block
+// length -- which is what llama.cpp writes and what the reader checks against.
 struct Glm5NextGgufArrays {
   std::vector<int32_t> head_count_kv;
   std::vector<float> swiglu_clamp_exp;
   std::vector<float> swiglu_clamp_shexp;
+  int64_t nextn_predict_layers = 0;
 };
 
 std::string PublishedShapeGguf(int64_t n_layers,
@@ -795,6 +802,11 @@ std::string PublishedShapeGguf(int64_t n_layers,
   if (!arrays.swiglu_clamp_shexp.empty()) {
     b.AddKv(gguf_test::F32ArrayKv(k + "swiglu_clamp_shexp",
                                   arrays.swiglu_clamp_shexp));
+  }
+  if (arrays.nextn_predict_layers != 0) {
+    b.AddKv(gguf_test::U32Kv(
+        k + "nextn_predict_layers",
+        static_cast<uint32_t>(arrays.nextn_predict_layers)));
   }
   b.AddKv(gguf_test::U32Kv(k + "rope.dimension_count", 0));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.head_count", 32));
@@ -1043,27 +1055,53 @@ TEST_CASE("glm5_next: the published GGUF states its schedule ONLY in head_count_
   // published artifact carries. Both refusals stood between this project and
   // the only artifact of this model that exists.
   const std::vector<int32_t> kv = PublishedHeadCountKv();
+  REQUIRE(kv.size() == 46u);
   Glm5NextGgufArrays arrays;
   arrays.head_count_kv = kv;
   arrays.swiglu_clamp_exp = std::vector<float>(46, 10.0f);
   arrays.swiglu_clamp_shexp = std::vector<float>(46, 10.0f);
+  arrays.nextn_predict_layers = 1;
 
   const Glm5NextParams p =
       ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(46, arrays)));
 
-  // The DERIVED schedule is the array, entry for entry -- not merely a file
-  // that parsed.
-  CHECK(p.num_hidden_layers == 46);
-  CHECK(p.layer_types == KindsOf(kv));
-  // 34 KDA and 12 MLA-shaped BLOCKS: the 11 DSA layers of the model plus the
-  // MTP block. `test_glm5_next_scaffold`'s config.json case asserts 34 / 11
-  // over 45 MODEL layers and is a different, also correct, count.
+  // BLOCKS ARE NOT LAYERS, and this is asserted as the RELATIONSHIP llama.cpp
+  // writes -- `block_count = num_hidden_layers + nextn_predict_layers`
+  // (`b10451:conversion/exaone.py:134`) -- rather than as the bare 45. A file
+  // with a different `nextn_predict_layers` therefore cannot pass this case
+  // unchanged, which a literal could not tell us.
+  constexpr int64_t kBlocks = 46;
+  constexpr int64_t kMtp = 1;
+  CHECK(p.num_hidden_layers == kBlocks - kMtp);
+  // ...and 45 is exactly what the released `config.json` declares, so the two
+  // sources of this one model agree on its depth.
+  CHECK(p.num_hidden_layers == 45);
+  CHECK(static_cast<int64_t>(p.layer_types.size()) == kBlocks - kMtp);
+  CHECK(static_cast<int64_t>(p.mlp_layer_types.size()) == kBlocks - kMtp);
+  CHECK(static_cast<int64_t>(p.indexer_types.size()) == kBlocks - kMtp);
+
+  // The schedule is the array's BACKBONE entries, and the MTP block's entry is
+  // DROPPED rather than kept as a 46th layer. This is the sharp end of it:
+  // entry 45 is a `1` and entry 44 is a `0`, so a reader that forgot to
+  // truncate ends its stack with a DSA layer built out of the MTP block --
+  // which would run, and would produce plausible tokens.
+  const std::vector<int32_t> backbone(kv.begin(), kv.begin() + 45);
+  CHECK(p.layer_types == KindsOf(backbone));
+  CHECK(kv[44] == 0);
+  CHECK(kv[45] == 1);
+  CHECK(p.layer_types.back() == Glm5NextLayerKind::kLinearAttention);
+
+  // 34 KDA and 11 DSA over the BACKBONE -- the same split the `config.json`
+  // case asserts at the top of this file. The file's TWELFTH MLA-shaped block
+  // is the MTP one and is not a layer of this model.
   CHECK(p.num_kda_layers() == 34);
-  CHECK(p.num_dsa_layers() == 12);
-  // Entry 45 is the one a stride cannot reach.
-  CHECK((45 % 4) != 3);
-  CHECK(p.layer_types[45] == Glm5NextLayerKind::kDeepseekSparseAttention);
-  CHECK(p.layer_types != SynthesizedKinds(46));
+  CHECK(p.num_dsa_layers() == 11);
+
+  // Over the 45 backbone layers the published array AGREES with `idx % 4 == 3`
+  // exactly. That agreement is the coincidence this row keeps warning about, so
+  // it is asserted here rather than left implied -- and it is why the case
+  // below, not this one, is what proves the values are read.
+  CHECK(p.layer_types == SynthesizedKinds(45));
 
   // The array is a SCHEDULE and not a KV-head count. Its non-zero entries are
   // `1`; taking that as `num_key_value_heads` would refuse the published file
@@ -1071,6 +1109,57 @@ TEST_CASE("glm5_next: the published GGUF states its schedule ONLY in head_count_
   CHECK(p.num_attention_heads == 64);
   CHECK(p.num_key_value_heads == 64);
   CHECK(p.swiglu_limit == doctest::Approx(10.0));
+
+  // THE SUBTRACTION IS LIVE. The same 46-entry file that declares no MTP block
+  // is a 46-layer model with twelve MLA-shaped layers, and entry 45 is then a
+  // layer rather than a dropped block. If `nextn_predict_layers` were ignored,
+  // this and the case above could not differ.
+  Glm5NextGgufArrays no_mtp = arrays;
+  no_mtp.nextn_predict_layers = 0;
+  const Glm5NextParams q =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(46, no_mtp)));
+  CHECK(q.num_hidden_layers == kBlocks);
+  CHECK(q.layer_types == KindsOf(kv));
+  CHECK(q.num_kda_layers() == 34);
+  CHECK(q.num_dsa_layers() == 12);
+  CHECK(q.layer_types.back() == Glm5NextLayerKind::kDeepseekSparseAttention);
+  // ...and THAT one is not the stride, because `45 % 4 == 1`.
+  CHECK(q.layer_types != SynthesizedKinds(46));
+}
+
+TEST_CASE("glm5_next: a GGUF and a config.json of the SAME model resolve identically") {
+  // The cross-source assertion. `block_count = 46` with
+  // `nextn_predict_layers = 1` and `num_hidden_layers = 45` are two spellings
+  // of one model's depth, and W1's whole design claim is that both sources meet
+  // one parser. Reading `block_count` into `num_hidden_layers` broke that
+  // silently: the config.json resolved a 45-layer stack and the GGUF a
+  // 46-layer one, and nothing downstream would have refused the extra layer.
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = PublishedHeadCountKv();
+  arrays.nextn_predict_layers = 1;
+  const Glm5NextParams from_gguf =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(46, arrays)));
+  const Glm5NextParams from_json = ParseGlm5NextParams(PublishedConfig());
+
+  CHECK(from_gguf.num_hidden_layers == from_json.num_hidden_layers);
+  CHECK(from_gguf.layer_types == from_json.layer_types);
+  CHECK(from_gguf.num_kda_layers() == from_json.num_kda_layers());
+  CHECK(from_gguf.num_dsa_layers() == from_json.num_dsa_layers());
+  CHECK(from_gguf.num_attention_heads == from_json.num_attention_heads);
+  CHECK(from_gguf.num_key_value_heads == from_json.num_key_value_heads);
+}
+
+TEST_CASE("glm5_next: more MTP blocks than blocks is refused") {
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = std::vector<int32_t>(8, 0);
+  arrays.head_count_kv[3] = 1;
+  arrays.head_count_kv[7] = 1;
+  arrays.nextn_predict_layers = 8;
+  const std::string message = RefusalForGguf(PerLayerGguf(8, arrays));
+  CHECK(message.find("block_count is 8") != std::string::npos);
+  CHECK(message.find("nextn_predict_layers is 8") != std::string::npos);
+  CHECK(message.find("num_hidden_layers + nextn_predict_layers") !=
+        std::string::npos);
 }
 
 TEST_CASE("glm5_next: the schedule is READ, and a non-stride file proves it") {

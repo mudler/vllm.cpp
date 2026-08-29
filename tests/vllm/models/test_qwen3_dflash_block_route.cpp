@@ -368,3 +368,80 @@ TEST_CASE("dflash block route: an EMPTY context is byte-identical") {
   CheckRouteEquivalence(/*ctx_len=*/0, /*tq=*/4, /*hq=*/8, /*hkv=*/2, /*d=*/16,
                         /*block_size=*/16, /*causal=*/true, /*window=*/2, /*seed=*/5151);
 }
+
+// ---------------------------------------------------------------------------
+// #2252 — the HOST metadata that keeps this call off a synchronizing path.
+//
+// WHAT BROKE. `DflashBlockPagedAttention` built its `vt::PagedAttentionArgs`
+// without `query_start_loc_host` or `max_seq_len`. Both are OPTIONAL by type,
+// so omitting them compiles and is merely SLOW wherever nothing is capturing —
+// and `vt/ops.h` spells out the cost of each default in the same words:
+// nullptr "=> the launcher falls back to the D2H+sync" (`:1546`), 0 "=> that
+// launcher falls back to the D2H+sync" (`:1555`). That fallback ends in
+// `cudaStreamSynchronize` (`cuda_paged_attn.cu:2272`), which is ILLEGAL inside
+// a CUDA graph capture. The draft block is the one lane this tree captures
+// (`P == 1`, `qwen3_dflash.cpp:1716`), so the engine died with "operation not
+// permitted when stream is capturing" and the committed speed gate could not
+// produce a number at all.
+//
+// WHY THESE CASES AND NOT A NUMERICS ONE. The equivalence suite above cannot
+// see this: on the CPU backend both fields are ignored, so every byte-identical
+// case stayed green through the whole defect. The gate has to be on the ARGS.
+// Asserting `DflashBlockPagedHostMetaOf` alone would not do it either — that
+// would pass while production forgot to USE it, which is precisely how this
+// shipped — so the assertion is on `DflashBlockPagedArgsOf`, the pure builder
+// the production call now routes through.
+TEST_CASE("dflash block paged args: the HOST metadata is populated (#2252)") {
+  const int64_t ctx_len = 1200;
+  const int64_t tq = 9;
+  const vllm::detail::DflashBlockPagedHostMeta hm =
+      vllm::detail::DflashBlockPagedHostMetaOf(ctx_len, tq);
+
+  // One request, so the query_start_loc is exactly [0, tq).
+  CHECK(hm.qsl[0] == 0);
+  CHECK(hm.qsl[1] == static_cast<int32_t>(tq));
+  // The EXTENDED bound the read addresses, not the committed context length.
+  CHECK(hm.max_seq_len == static_cast<int32_t>(ctx_len + tq));
+
+  const vt::PagedAttentionArgs pa = vllm::detail::DflashBlockPagedArgsOf(
+      /*scale=*/0.125F, /*causal=*/true, /*sliding_window=*/0, tq, hm);
+
+  // The two fields whose ABSENCE selects `cudaStreamSynchronize`.
+  REQUIRE(pa.query_start_loc_host != nullptr);
+  CHECK(pa.query_start_loc_host[0] == 0);
+  CHECK(pa.query_start_loc_host[1] == static_cast<int32_t>(tq));
+  CHECK(pa.max_seq_len == static_cast<int32_t>(ctx_len + tq));
+  // It must point INTO the caller-owned meta, not at a temporary.
+  CHECK(pa.query_start_loc_host == hm.qsl.data());
+}
+
+// The builder took over the mask and scale wiring, so those must still arrive
+// intact — a refactor that fixed the sync and silently dropped the window would
+// be a wrong ANSWER, which is worse than the slow path it replaced.
+TEST_CASE("dflash block paged args: mask, scale and uniform qlen still flow (#2252)") {
+  const vllm::detail::DflashBlockPagedHostMeta hm =
+      vllm::detail::DflashBlockPagedHostMetaOf(/*ctx_len=*/64, /*tq=*/4);
+
+  const vt::PagedAttentionArgs full = vllm::detail::DflashBlockPagedArgsOf(
+      /*scale=*/0.5F, /*causal=*/false, /*sliding_window=*/0, /*tq=*/4, hm);
+  CHECK(full.scale == doctest::Approx(0.5F));
+  CHECK(full.causal == false);
+  CHECK(full.uniform_spec_query_len == 4);
+  CHECK_FALSE(full.window_size.has_value());
+
+  // causal + a window is the combination the file's own note calls out as the
+  // one no earlier case covered.
+  const vt::PagedAttentionArgs swa = vllm::detail::DflashBlockPagedArgsOf(
+      /*scale=*/0.25F, /*causal=*/true, /*sliding_window=*/2, /*tq=*/4, hm);
+  const vllm::detail::DflashBlockPagedMask expect =
+      vllm::detail::DflashBlockPagedMaskOf(/*causal=*/true, /*sliding_window=*/2);
+  CHECK(swa.causal == expect.causal);
+  REQUIRE(swa.window_size.has_value() == expect.has_window);
+  if (expect.has_window) {
+    CHECK(swa.window_size->left == expect.window_left);
+    CHECK(swa.window_size->right == expect.window_right);
+  }
+  // And the host metadata is not disturbed by the mask arm.
+  REQUIRE(swa.query_start_loc_host != nullptr);
+  CHECK(swa.max_seq_len == 68);
+}

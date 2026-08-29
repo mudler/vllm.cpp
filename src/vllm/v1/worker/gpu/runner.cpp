@@ -1687,10 +1687,15 @@ std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,
 // MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3) — the mirror of upstream's per-group
 // metadata loop (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin
 // 5559679229). Every published group gets its own committed table, including the
-// TARGET attention group: upstream gathers group 0 too (`_get_block_table(0)` at
-// `:2337`) and re-reads it for `cm_base`, so re-gathering here costs one copy of
-// a table this step already built rather than introducing a second convention
-// for "which groups are special". The two named-id gathers in `execute_model`
+// TARGET attention group. Upstream gathers group 0 too, but ONCE and BEFORE the
+// loop (`block_table_gid_0 = _get_block_table(0)` at `:2337`), carrying it into
+// every iteration on `cm_base`; the loop body is guarded by `if kv_cache_gid >
+// 0:` (`:2565`), so upstream does NOT re-gather group 0 inside the loop and
+// this function does. That guard is an OPTIMISATION and not a second
+// convention for "which groups are special" — the table it skips rebuilding is
+// the same table. Re-gathering here therefore costs ONE EXTRA COPY of a table
+// this step already built, and buys a vector with no index the reader has to
+// know is special. The two named-id gathers in `execute_model`
 // keep their own copies because the GDN one is REWRITTEN in place by
 // `remap_gdn_state_slots`, and this vector must carry what the block table
 // actually says, not a remapped state-slot view of it.

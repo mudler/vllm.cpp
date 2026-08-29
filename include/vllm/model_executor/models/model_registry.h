@@ -389,7 +389,7 @@ struct MultiKvCacheIndex {
   // parallel to `attn_kv` because a CACHE is what they describe, while a block
   // table belongs to a GROUP and every layer in that group shares it — which is
   // upstream's own fan-out ("make layers in the same group share the same
-  // metadata", `:2549-2550`). Entry `g` is group `g`'s row-major
+  // metadata", `:2551-2552`). Entry `g` is group `g`'s row-major
   // `[num_reqs, group_block_table_cols[g]]` table. Both vectors are sized to the
   // published group count and owned by the runner, valid for the forward's
   // duration. NULL on every uniform topology, exactly like the three above.

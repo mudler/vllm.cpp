@@ -408,48 +408,34 @@ Stop and report, do not work around:
 
 ## Owed
 
-- **Gate 5's READING is still PENDING, and the reason moved from the code to the
-  fleet.** [#2140](https://github.com/mudler/vllm.cpp/issues/2140) is CLOSED
-  (`8bfd3a542`) and its refusal is verified gone on the real bytes, so nothing in
-  this port is now known to block the render. What blocks it is `dgx:gpu0`, the
-  GB10 the reference was rendered on, which has been `unhealthy` and out of the
-  pool with `worker_lost` since a heartbeat 3h20m before this was written.
-  Clearing it needs an admin token and is a human's call, and no other fleet
-  device can carry the run: `thor:gpu0` is `sm_110`, which the FA-2 architecture
-  set excludes, `orin:gpu0` has no NAS mount for 70 GB of checkpoints, and
-  `strix:gpu0` is AMD and has no CUDA at all. Substituting any of them would
-  measure the box or the arm rather than the render. Owner: this row. §Outcome
-  records what was established without the GPU, and what remains.
-- **`--steps` is WIRED AND UNPROVEN END TO END, and that is the one thing this
-  change lands without an executed path through it** ([#2130](https://github.com/mudler/vllm.cpp/issues/2130)
-  closes the absence of the flag, not the absence of its proof). Every link is
-  verified by inspection and none by execution: `main.cpp` assigns `vp.steps`,
-  `vllm_c.cpp:1664` forwards it, `ltx2_video.cpp:4027` reads it. The lease DID
-  pass `--steps 8`, and the render refused at the checkpoint load 76 s in, before
-  the sampler ever resolved a sigma schedule, so no run in this tree has yet
-  observed the value arrive. Nothing gates it: no test builds `ltx2-gen`.
-  Unblocking it needs the render, so it is owed together with gate 5's reading
-  and not separately. Owner: this row.
+- **Gate 5's READING IS TAKEN. It is no longer owed.** `rc` job
+  `4b0666ee-248c-45fc-9de6-372b6d0c1fab` on `dgx:gpu0` rendered the manifest's
+  request and the comparison returned `PASS` / `NO_WORSE_THAN_ORACLE_ON_BLOCKINESS`
+  against both reference forms. The panel is in `## Outcome`. What remains owed
+  from #1854 is prompt adherence only, which is a separate bullet below and was
+  never in this row's scope.
+- **`--steps` IS NOW PROVEN END TO END, by execution rather than by
+  inspection.** This was the row's one wired-but-unexecuted path
+  ([#2130](https://github.com/mudler/vllm.cpp/issues/2130) closed the absence of
+  the flag, not the absence of its proof). The render observed it arrive:
+  `steps_requested=8 steps_observed={8} dit_forwards=32` in `PROVENANCE`, where
+  the observed set is the distinct denominators of `PhaseLog::Tick`'s
+  `step k/M` lines and `M` is `sigmas.size() - 1`, the RESOLVED count. Not the
+  flag echoed back: a number the sampler computed. **32 forwards over 8 steps is
+  4 per step**, which is the guided denoiser's cond / uncond / perturbed /
+  modality quartet, so the count corroborates the schedule rather than merely
+  agreeing with it.
 
-  **ONE FAILURE MODE IS NOW RULED OUT BY INSPECTION OF THE RECIPE, AND IT WAS THE
-  DANGEROUS ONE.** A step override reaches two branches
-  (`ltx2_video.cpp:4025-4073`): the schedule is computed from `steps` only when
-  `phase.sigmas` is EMPTY, and a phase that carries its own sigmas either REFUSES
-  the override or, if `allow_request_sigmas` is true, keeps its own schedule and
-  ignores it. The second is silent, and a silent 30-step render against an
-  8-step reference would carry a 3.75x denoise-budget confound while reporting
-  success. `OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`) sets `name`,
-  `video_guidance`, `audio_guidance` and `noise_scale` and NO sigmas, and
-  `OneStageRecipe` (`:1149-1163`) never assigns `allow_request_sigmas`, so it
-  keeps the header default `true`. The harness's `--pipeline-kind one_stage`
-  therefore takes the empty-sigmas branch, where `steps` is read. What is still
-  owed is the RUNTIME observation, and the harness now extracts it rather than
-  leaving it in a log: `VLLM_RENDER_PROGRESS` is on by default and `PhaseLog::Tick`
-  (`render_phase_log.cpp:546-560`) writes `[render]   dit forward N  phase P step
-  k/M`, whose denominator `M` is `sigmas.size() - 1` — the RESOLVED count.
-  `ltx25-oracle-absolute-render.sh` collects the distinct denominators into
-  `steps-observed.txt` and into `PROVENANCE`, and says so loudly when the set is
-  not exactly `{8}`.
+  The SILENT failure mode was ruled out before the run and is worth keeping,
+  because it is the one a reader would not think to check. A step override
+  reaches two branches (`ltx2_video.cpp:4025-4073`): the schedule is computed
+  from `steps` only when `phase.sigmas` is EMPTY, and a phase carrying its own
+  sigmas either REFUSES the override or, when `allow_request_sigmas` is true,
+  keeps its schedule and IGNORES it. A silent 30-step render against an 8-step
+  reference would have carried a 3.75x denoise-budget confound in the direction
+  that flatters us, and passed. `OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`)
+  sets no sigmas and `OneStageRecipe` (`:1149-1163`) never assigns
+  `allow_request_sigmas`, so `one_stage` takes the branch that reads `steps`.
 - **Five line anchors into `examples/ltx2_gen/main.cpp` are now STALE and cannot
   be repaired, because they live in the append-only issue index.** Adding
   `--steps` moved that file's later lines by +12, and
@@ -469,13 +455,20 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 and W2 are complete. W3 has now failed three times, each at a
-DIFFERENT and further stage, and each failure is located rather than guessed: the
-checkpoint load ([#2140](https://github.com/mudler/vllm.cpp/issues/2140), CLOSED),
-then the fleet (`dgx:gpu0` `unhealthy ... worker_lost` for 3h20m), then the BUILD
+`DONE`. W1, W2 and W3 are complete and gate 5 has its reading:
+`PASS` / `NO_WORSE_THAN_ORACLE_ON_BLOCKINESS`, against both reference forms,
+from `rc` job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` on `dgx:gpu0`.
+
+W3 took four attempts and each failed at a different and further stage, every
+one located rather than guessed: the checkpoint load
+([#2140](https://github.com/mudler/vllm.cpp/issues/2140), CLOSED), then the
+fleet (`dgx:gpu0` `unhealthy ... worker_lost` for 3h20m), then the BUILD
 ([#2220](https://github.com/mudler/vllm.cpp/issues/2220), a defect in this row's
-own harness, fixed in this change). Everything W3 can establish without a GPU is
-established and is in `## Outcome`. The reading itself stays `PENDING`.
+own harness), then the render itself, which succeeded.
+
+#1854 is NOT closed by this row and should not be: its prompt-adherence
+sub-question is untouched and needs a vision-language oracle this tree does not
+have. See `## Owed`.
 
 ## Outcome
 
@@ -684,3 +677,75 @@ That case and the probe are separate readers of the same header, and they agree.
 committed and unchanged in its request; the reference frames are on the NAS (25
 PPM plus `audio.wav`, 26 files); the previous lease's binary cache is at
 `$W/absref-bin` and will rebuild once, because its `SRC_SHA` predates `8bfd3a542`.
+
+### W3, fourth attempt: THE READING, and it is a PASS
+
+`rc` job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` on `dgx:gpu0`, source
+`0002ddfba26b59279732aeb4e3c99e092b436f28`, built in-lease, 53 minutes wall.
+The harness exited on the comparison's own verdict rather than on "the script
+finished".
+
+**Provenance, so the reading is attributable.** Binary
+`7b1f4367...6817c05d`, library `9e3dc6f4...41287329` (the library is the one that
+matters, #1881), harness `5649b4e8...2b01f6f2`, tarball `1cd4dcc1...57c2ad87`.
+Geometry `320x192/25f steps=8 seed=42`, 240 video tokens, prompt sha256
+`a65a14fe...39f4cb93`. All four checkpoint sha256 recomputed INSIDE the lease on
+the locally staged copies and all four match the manifest — a second independent
+reading of the same digests. The toolkit's rebuilt SONAMEs are recorded too
+(`libcudart.so.13 -> libcudart.so.13.3.29`), so a reader can see what the
+artefacts were linked against.
+
+**The render ran, and `--steps 8` arrived.** `render_rc=0`, 503 s, 25 of 25
+frames, 193,964 bytes of audio. `steps_requested=8 steps_observed={8}
+dit_forwards=32`. The observed set is the distinct denominators of the sampler's
+own `step k/M` lines, so it is a number the sampler computed and not the flag
+echoed back. 32 forwards over 8 steps is 4 per step, the guided denoiser's
+quartet, which corroborates the schedule instead of merely agreeing with it.
+
+**The C0 checks, on our render.** 25 distinct frame hashes of 25, zero
+near-uniform frames, minimum per-frame variance 2186.296, zero zero-motion pairs,
+mean adjacent MAD 5.4060. So the clip has content and it moves.
+
+**The panel, ours beside the reference's own 25 frames** (form `frames`, 25
+digests verified against `SHA256SUMS`):
+
+| statistic | ours | reference mean | reference per-frame range | bound | verdict |
+|---|---|---|---|---|---|
+| `blockiness_grid8` | **1.022135** | 1.042812 | [0.947454, 1.143393] | <= 1.143393 | **PASS**, margin +0.121257 |
+| `blockiness_grid32` | **1.025445** | 1.037230 | [0.920299, 1.148672] | <= 1.148672 | **PASS**, margin +0.123227 |
+| `blockiness_grid8_defined` | 0 of 1600 collapsed | — | — | 0 | **PASS** |
+| `blockiness_grid32_defined` | 0 of 1600 collapsed | — | — | 0 | **PASS** |
+| `sharpness_mean` | 10.517609 | 11.274039 | [10.839144, 11.760068] | REPORTED | — |
+| `clipped_fraction` | 0.00075825 | 0.00165039 | [0.00122613, 0.00210503] | REPORTED | — |
+| `audio_rms_mean` | 133.303581 | not committed | — | REPORTED | — |
+
+`READING NO_WORSE_THAN_ORACLE_ON_BLOCKINESS`, `VERDICT PASS (exit 0)`. **Both
+reference forms agree**: the 25 NAS PPM frames and the committed `upstream-render.mp4`
+each returned exit 0, which re-runs section 2's claim that the two agree on the
+gated bound rather than leaving it as a number somebody wrote down.
+
+**The bound was recomputed, not transcribed.** The JSON records
+`reference/bounds/blockiness_grid8/frame_max = 1.1433929206406797` and
+`digests_verified = 25`, i.e. the gate read its ceiling off the reference in hand
+on this run. T9 exists because a transcribed literal left the whole suite green,
+and this is the field that shows it did not happen here.
+
+**WHAT THE GREEN DOES NOT SAY, and this is the honest half of the reading.** Our
+render is LESS blocky than the reference's own mean on both grids, not merely
+under its maximum. But on the two REPORTED statistics we sit OUTSIDE the
+reference's per-frame range in the same direction: sharpness 10.5176 against a
+reference minimum of 10.8391, and clipped fraction 0.000758 against a reference
+minimum of 0.001226. Less blocky, less sharp and less clipped is one coherent
+picture — **our render is somewhat SMOOTHER than upstream's** — and a smoothness
+difference is exactly what a one-sided blockiness ceiling is blind to by
+construction. Neither statistic is gated, and section 5 gives the measured reason
+a bound cannot be derived for either (sharpness has no structural null and is
+content-driven; the clipped fraction does not survive the mp4's `yuv420p` round
+trip). It is recorded here rather than left in a JSON because a reader who takes
+`PASS` as "matches upstream" would be wrong. The gate's claim is its name: no
+worse on blockiness.
+
+**And prompt adherence is still not measured**, here or anywhere in this tree.
+Nothing above says the 25 frames depict a red fox in a snowy pine forest. That is
+#1854's first sub-question, it needs a vision-language model pinned as an oracle,
+and it stays open.

@@ -448,6 +448,20 @@ def audit() -> list[dict]:
 # A/B cannot be satisfied by a tree in which the guard does nothing, which is
 # exactly what "genuinely fails on a broken guard" asks for, and it was proved by
 # three mutations in the same change rather than asserted.
+# 2026-08-29: -MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm leaves the
+# runnable population because the ROW leaves the gated population, not because it
+# lost a command ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)). It moves
+# `BLOCKED` -> `SPIKE` on a committed port plan, and `SPIKE` is not a gate-obliged
+# state, so `check-agent-record.py` stops reading the row's spec for a `## Gates`
+# section and this audit stops seeing the row at all. SHRINKAGE, so the set is
+# re-pinned in the same change, per the note above. Nothing was weakened: the
+# `### Gates` section that earned the credit is untouched in
+# .agents/specs/glm-dsa-latest-deepseek.md, and §3.6 of that spec ADDS four named
+# gates (module parity against the pin on CPU, a headers-only structural loader
+# gate, a streamed-vs-resident identical-logits gate, and an llama.cpp b10451
+# floor) together with the statement that no end-to-end token gate against vLLM is
+# reachable on this fleet. The credit returns when the row reaches a gate-obliged
+# state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
     "ENG-POOL-BEST-FIT",
     "ENG-UPSTREAM-LTX2-PIN",
@@ -492,7 +506,6 @@ RUNNABLE_BASELINE = frozenset({
     "KV-SLIDING-WINDOW-SPEC",
     "LOAD-SAFETENSORS-DIRECT-DENSE",
     "MODEL-FACTORY-registry",
-    "MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm",
     "MODEL-TEXT-gemma4-gemma4-for-causal-lm",
     "MODEL-TEXT-glm4-glm4-for-causal-lm",
     "MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm",

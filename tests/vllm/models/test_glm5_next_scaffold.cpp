@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -29,6 +30,7 @@
 #include "gguf_builder.h"
 #include "nlohmann/json.hpp"
 #include "support/process_id.h"  // vllm_test::ProcessId, for a unique temp dir
+#include "support/test_env.h"  // vllm_test::SetEnv/UnsetEnv, the portable shim
 #include "vllm/entrypoints/model_loader.h"  // LoadedEngine::FromModelDir
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/glm5_next.h"
@@ -758,7 +760,7 @@ TEST_CASE("glm5_next: the KV spec publishes THREE groups on the published topolo
   // .lazy_initialization` allocates `torch.zeros((*shape[:-1],
   // conv_kernel_size))` and `causal_conv1d_update` reads `state_len =
   // conv_state.shape[-1]`, so the slack column is part of the contract.
-  // `kimi_linear_registry.cpp:157` publishes `K - 1` for ITS model; copying that
+  // `kimi_linear_registry.cpp:156` publishes `K - 1` for ITS model; copying that
   // across would hand the runner a cache one column short of what the layer
   // reads.
   CHECK(p.kda.conv_kernel_dim == 4);
@@ -769,6 +771,60 @@ TEST_CASE("glm5_next: the KV spec publishes THREE groups on the published topolo
   // f32 whatever the model dtype is: the state is a running sum over the whole
   // sequence and upstream casts to float32 explicitly at every write.
   CHECK(mamba->dtypes[1] == vt::DType::kF32);
+
+  // ── dtypes[0], the CONV half, gated as the A/B and not as a constant ──────
+  //
+  // `kda_state_dtype` (`mamba_utils.py:130-137`) returns
+  // `(get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype), torch.float32)`,
+  // so the conv half must TRACK the paged-KV storage dtype -- bf16 by default,
+  // f32 under `VT_KV_CACHE_F32` -- exactly as `kimi_linear_registry.cpp:161`
+  // publishes for the other KDA model here.
+  //
+  // ASSERTING ONLY THE DEFAULT WOULD GATE NOTHING. A `conv_dtype` hardcoded to
+  // `kBF16` -- which is what this function shipped before #2238's repair, under
+  // a comment claiming it called a resolver it never called -- passes a bare
+  // `dtypes[0] == kBF16` line and fails the f32 arm below. Both arms are built
+  // EXPLICITLY rather than read off the ambient environment, so neither result
+  // depends on how the suite was invoked.
+  const char* const kv_f32_before = std::getenv("VT_KV_CACHE_F32");
+  const std::string kv_f32_saved =
+      kv_f32_before != nullptr ? std::string(kv_f32_before) : std::string();
+  vllm_test::UnsetEnv("VT_KV_CACHE_F32");
+  const vllm::v1::KVCacheConfig bf16_kv =
+      reg.factory->make_kv_cache(PublishedConfig(), kBlockSize, kNumBlocks);
+  vllm_test::SetEnv("VT_KV_CACHE_F32", "1");
+  const vllm::v1::KVCacheConfig f32_kv =
+      reg.factory->make_kv_cache(PublishedConfig(), kBlockSize, kNumBlocks);
+  // An EMPTY value is a delete on both platforms (`tests/support/test_env.h`),
+  // so this restores an originally-unset variable to unset. Restored BEFORE the
+  // assertions, because a `REQUIRE` below would otherwise leave the knob set for
+  // every case that runs after this one.
+  vllm_test::SetEnv("VT_KV_CACHE_F32", kv_f32_saved);
+
+  REQUIRE(bf16_kv.kv_cache_groups.size() == 3);
+  REQUIRE(f32_kv.kv_cache_groups.size() == 3);
+  const auto* bf16_mamba = dynamic_cast<const vllm::v1::MambaSpec*>(
+      bf16_kv.kv_cache_groups[1].kv_cache_spec.get());
+  const auto* f32_mamba = dynamic_cast<const vllm::v1::MambaSpec*>(
+      f32_kv.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(bf16_mamba != nullptr);
+  REQUIRE(f32_mamba != nullptr);
+  REQUIRE(bf16_mamba->dtypes.size() == 2);
+  REQUIRE(f32_mamba->dtypes.size() == 2);
+  CHECK(bf16_mamba->dtypes[0] == vt::DType::kBF16);
+  CHECK(f32_mamba->dtypes[0] == vt::DType::kF32);
+  // The two halves are INDEPENDENT: the recurrent state stays f32 on both arms
+  // because `kda_state_dtype` returns `torch.float32` unconditionally, and the
+  // A/B knob does not reach it. A port that wired both dtypes to one resolver
+  // would move this line.
+  CHECK(bf16_mamba->dtypes[1] == vt::DType::kF32);
+  CHECK(f32_mamba->dtypes[1] == vt::DType::kF32);
+  // And the attention groups follow the same knob, which is what makes the conv
+  // half's tracking a property of the KV-cache contract rather than of this case.
+  const auto* f32_mla = dynamic_cast<const vllm::v1::MLAAttentionSpec*>(
+      f32_kv.kv_cache_groups[0].kv_cache_spec.get());
+  REQUIRE(f32_mla != nullptr);
+  CHECK(f32_mla->dtype == vt::DType::kF32);
 
   // ── group 2: the DSA indexer side cache, 257 wide, uncompressed ───────────
   const auto& idx = kv.kv_cache_groups[2];

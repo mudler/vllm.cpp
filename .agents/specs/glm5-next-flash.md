@@ -1996,8 +1996,10 @@ Debts this row carries, each visible rather than waived:
   loader wave that owes the work instead of naming the file's architecture as
   unrecognized. That distinction is the whole of O9 and it is not more than
   that.
-- **O10 — HALF DISCHARGED by W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)):
-  the model LOADS, and the forward and the KV-cache spec still refuse by name.**
+- **O10 — NARROWED TWICE, to the FORWARD alone: by W5c
+  ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)), which made the model
+  LOAD, and by W5 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)),
+  which made it PUBLISH a KV-cache spec.**
   W1 made `Glm5NextForConditionalGeneration` RESOLVE and made its config PARSE
   and VALIDATE; W2, W3 and W4 landed the KDA sigmoid forget gate, the NoPE MLA
   with the k-pool indexer, and the unweighted mHC head as host references; W5c
@@ -2005,14 +2007,27 @@ Debts this row carries, each visible rather than waived:
   `Glm5NextLoadedModel` and this architecture has a `LoadedModel` for the first
   time.
 
-  What still refuses, and who owns each: the FORWARD and the KV-CACHE SPEC are
-  W5b's ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)); the VISION
+  **The KV-CACHE SPEC NO LONGER REFUSES, and W5 is where it stopped.**
+  `MakeGlm5NextKVCache` is wired into `kGlm5NextFactory` as `.make_kv_cache` and
+  returns THREE real groups on the published topology — the MLA latent over the
+  11 DSA layers, one uniform recurrent group over the 34 KDA layers, and the
+  257-wide DSA indexer side cache — entered through `ModelRegistry::Resolve` and
+  the production `make_kv_cache` factory hook. An earlier revision of this
+  paragraph assigned the KV-cache spec to W5b alongside the forward. That
+  sentence was falsified by W5's own diff, and it is the failure
+  [#2230](https://github.com/mudler/vllm.cpp/issues/2230) documents: a refusal
+  that names a wave which already landed sends the next reader to redo finished
+  work. It is corrected here rather than carried.
+
+  What still refuses, and who owns each: the FORWARD is W5b's
+  ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)); the VISION
   TOWER, processor and placeholder expansion are W6's; the MTP HEAD is O2's; the
   SAFETENSORS arm is deferred rather than unwritten, because every published
   safetensors artifact exceeds every device this project owns, and its refusal
   now says so. Each refusal names its wave.
-  [#2067](https://github.com/mudler/vllm.cpp/issues/2067) and
-  [#2242](https://github.com/mudler/vllm.cpp/issues/2242) record it.
+  [#2067](https://github.com/mudler/vllm.cpp/issues/2067),
+  [#2242](https://github.com/mudler/vllm.cpp/issues/2242) and
+  [#2223](https://github.com/mudler/vllm.cpp/issues/2223) record it.
 - **O11 — DISCHARGED by W3 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213)).**
   `MlaBlockDims::Validate` accepts `qk_rope_head_dim == 0` as the ABSENT state
   of the decoupled rotary, so `head_size()` is `kv_lora_rank` (512) and the
@@ -2724,10 +2739,13 @@ with 0 missing and 0 unexplained at 41 MB peak RSS. `blk.45` is read, counted
 and NOT built as a decoder layer. **O10 is half discharged and O7 is narrowed:
 the artifact exists, and what W7b still owes is a conversion of OURS.**
 
-**Nothing FORWARDS** (O10's other half): the forward and the KV-cache spec still
-refuse by name, and W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
-owns both. No GPU gate has moved, no materialized load has been measured (O22),
-and no correctness claim about the MODEL has been made. The paragraph this
+**Nothing FORWARDS** (O10's remaining half): the FORWARD still refuses by name
+and W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it. The
+KV-CACHE SPEC is NOT part of that debt any more — W5
+([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) publishes it through
+the production `make_kv_cache` hook, as the paragraph below records. No GPU gate
+has moved, no materialized load has been measured (O22), and no correctness
+claim about the MODEL has been made. The paragraph this
 replaced said "no artifact exists and nothing loads"; both halves of that were
 true when written and neither is now.
 

@@ -227,7 +227,7 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
 //     columns, so the slack column is part of the contract rather than padding.
 //     `glm5_next_kda.h` records the same width for the host reference's
 //     `Glm5NextKdaCache::conv_state`, and publishing `K - 1` here -- which is
-//     what `kimi_linear_registry.cpp:157` publishes for ITS model -- would give
+//     what `kimi_linear_registry.cpp:156` publishes for ITS model -- would give
 //     the runner a cache one column short of what the layer reads.
 //
 // ONE CONV STATE, NOT THREE. The checkpoint stores `self_attn.{q,k,v}_conv1d`
@@ -337,17 +337,35 @@ v1::KVCacheConfig MakeGlm5NextKVCache(const HfConfig& config, int block_size,
                ", so the DSA indexer side cache cannot be sized. See "
                ".agents/specs/glm5-next-flash.md and issue #2223.");
 
-  // The two recurrent dtypes come from the SAME resolver every other hybrid in
-  // this tree uses, rather than a second reading of `mamba_ssm_dtype`; its
-  // refusal message is spelled `qwen3_5:` because that is where the one copy
-  // lives. The RECURRENT half is f32 whatever the model dtype is, and upstream
-  // annotates why twice: `cache_params.update_recurrent_state(
-  // last_recurrent_state.to(torch.float32), ...)` casts explicitly
-  // (`modeling_glm5_next.py:739`) and `:452` says "calculations happen in float
-  // as states are more susceptible to rounding errors". The state is a running
-  // sum over the whole sequence, so a bf16 store accumulates an error with no
-  // way out.
-  const vt::DType conv_dtype = vt::DType::kBF16;
+  // KDA, NOT GATED DELTA NET, and the two recurrent dtypes follow from that.
+  // The mirror is `MambaStateShapeCalculator.kda_state_dtype`
+  // (`mamba_utils.py:130-137`), which is the pair
+  // `(get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype), torch.float32)`
+  // and is exactly what `kimi_linear_registry.cpp:161` publishes for the OTHER
+  // KDA model in this tree. So the CONV half follows the paged-KV storage dtype
+  // -- model-dtype bf16 by default, f32 under `VT_KV_CACHE_F32`, the
+  // fold-identity A/B -- and the RECURRENT half is f32 unconditionally.
+  //
+  // `detail::ResolveMambaSsmCacheDType`, and with it `HfConfig::mamba_ssm_dtype`,
+  // is deliberately NOT called here. That helper mirrors `_mamba_state_dtype`
+  // (`mamba_utils.py:96-108`), the Mamba/GDN calculator, and `kda_state_dtype`
+  // takes no `mamba_ssm_cache_dtype` parameter at all: honouring the key for a
+  // KDA cache would be an invention rather than a port, and a `bfloat16` value
+  // in some future `config.json` would then silently halve a state upstream
+  // keeps in f32. Qwen3.5 (`qwen3_5_common.cpp:54`) and MODEL-MM-QWEN4-EXP
+  // (`qwen4_exp_registry.cpp:382`) call the resolver because their linear layers
+  // ARE gated delta net (`gated_delta_net_state_dtype`, `mamba_utils.py:119-128`),
+  // which does read it. An earlier revision of this comment claimed this
+  // function called that resolver; it never did, and the claim is retired here
+  // rather than made true, because the GDN calculator is the wrong one.
+  //
+  // Why the recurrent f32 is not negotiable: upstream annotates the cast twice.
+  // `cache_params.update_recurrent_state(last_recurrent_state.to(torch.float32),
+  // ...)` casts explicitly (`modeling_glm5_next.py:739`) and `:452` says
+  // "calculations happen in float as states are more susceptible to rounding
+  // errors". The state is a running sum over the whole sequence, so a bf16 store
+  // accumulates an error with no way out -- and a token gate cannot see it.
+  const vt::DType conv_dtype = v1::ResolveKvCacheDType();
   const vt::DType ssm_dtype = vt::DType::kF32;
 
   v1::KVCacheConfig kv;

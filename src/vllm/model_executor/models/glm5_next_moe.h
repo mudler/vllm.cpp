@@ -83,11 +83,17 @@
 // `glm5_next_dsa.cpp` and `glm5_next_mhc.cpp`. The device arm of this block is
 // the assembled text forward's and is refused by name rather than half-built.
 //
-// NOT REACHED YET. `Glm5NextForConditionalGeneration::Forward` still refuses by
-// name because `load_weights` does (O10): W5 assembles the MoE block and the
-// KV-cache spec, and the decoder layer, the assembled text forward and the
-// weight tower that would let `ModelRegistry::Forward` reach any of it are
-// carried forward as owed debt in `.agents/specs/glm5-next-flash.md` `## Owed`.
+// NOT REACHED YET, and the reason is NOT that `load_weights` refuses. It no
+// longer does: W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242))
+// landed the weight tower, so the GGUF arm returns a real `Glm5NextLoadedModel`
+// and a handle to forward now exists. What refuses is
+// `ForwardGlm5NextForConditionalGeneration` ITSELF
+// (`glm5_next_registry.cpp:129`), because the decoder layer and the assembled
+// `Glm5NextTextModel::Forward` that would call this block do not exist yet; they
+// are W5b's ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)). W5 lands
+// the MoE block and the KV-cache spec -- and the KV-cache spec IS reached, from
+// the production `make_kv_cache` factory hook -- while this block is carried as
+// owed debt in `.agents/specs/glm5-next-flash.md` `## Owed` (O23).
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_MOE_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_MOE_H_
 

@@ -220,6 +220,14 @@ TEST_CASE("glm5_next moe: an incoherent routing geometry is REFUSED by name") {
 }
 
 TEST_CASE("glm5_next moe: the router GEMM reproduces the oracle's fp32 logits") {
+  // An oracle whose identity is not asserted is an oracle nobody can reproduce,
+  // and every number below is the return value of THIS revision. `5.16.1` is
+  // this row's lane pin (W0/#2096, `.agents/oracles/transformers.md`); the
+  // registry pin is `5.14.1`, which does not carry `models/glm5_next` at all.
+  // Regenerating the fixture against a different revision must move this line,
+  // not pass in silence. Mirrors `test_glm5_next_mhc.cpp:92`.
+  CHECK(std::string(g::kOracle) == "transformers 5.16.1");
+
   const gn::MoeDims d = BigDims();
   const std::vector<float> hidden = Vec(g::kHidden);
   const std::vector<float> logits =

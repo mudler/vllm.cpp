@@ -7,10 +7,13 @@
 //
 // Model-private, deliberately not under `include/`: nothing outside this model
 // needs these types, and `include/vllm.h` is the ABI seam a SHIPPED capability
-// is exposed through. This wave ships a LOAD, not a capability — the forward
-// and the KV-cache spec still refuse by name, and W5b
+// is exposed through. This wave ships a LOAD, not a capability — the FORWARD
+// still refuses by name, and W5b
 // ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns the forward
-// this tower feeds.
+// this tower feeds. The KV-CACHE SPEC is no longer part of that sentence: W5
+// ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) wired
+// `MakeGlm5NextKVCache` into `kGlm5NextFactory` and it publishes three real
+// groups, so this comment names only what is still owed.
 //
 // ─── WHY THIS FILE IS NOT `glm5_next_weights.h` ──────────────────────────────
 // That name is already taken, by the PUBLIC header the `general.architecture`

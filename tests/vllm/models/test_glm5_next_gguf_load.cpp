@@ -5,9 +5,13 @@
 // `.agents/specs/glm5-next-flash.md` §W5c.
 //
 // NOTHING HERE IS A TOKEN CLAIM and nothing here is a speed claim. No forward
-// runs; the forward and the KV-cache spec still refuse by name and W5b
-// ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns them. What the
-// four groups of cases prove, and why each one exists:
+// runs; the FORWARD still refuses by name and W5b
+// ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it. The
+// KV-CACHE SPEC does NOT refuse any more -- W5
+// ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) publishes three
+// groups through the production `make_kv_cache` hook, gated in
+// `test_glm5_next_scaffold.cpp` -- so this header names only what is still
+// owed. What the four groups of cases prove, and why each one exists:
 //
 //   (1) THE PUBLISHED ARTIFACT'S TABLE IS ACCOUNTED, in both directions, out of
 //       the committed 1412-tensor header manifest — so CI gates the name map

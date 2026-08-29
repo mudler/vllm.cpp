@@ -2088,6 +2088,54 @@ is listed under `## Owed`.
 
 ## Owed
 
+- **W5d-4 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 4) lands
+  UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `src/vllm/model_executor/models/qwen4_exp_moe.{h,cpp}` —
+  `Qwen4ExpMoeBlockWeights`, `Qwen4ExpMoeHfConfig` and `RunQwen4ExpMoeBlock` — is
+  reached at this merge commit ONLY by
+  `tests/vllm/models/test_qwen4_exp_moe.cpp`. No production entry point calls
+  it: `ModelRegistry::Forward` still refuses
+  `Qwen4ExpForConditionalGeneration` by name, because
+  `ForwardQwen4ExpForConditionalGeneration` does not exist. The wiring is owned
+  by row `MODEL-MM-QWEN4-EXP` and tracked by
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) (the layer loop) under
+  campaign issue [#1978](https://github.com/mudler/vllm.cpp/issues/1978). The
+  reachability mutation is therefore vacuous here and is recorded as such rather
+  than reported as a pass: deleting a production call site cannot red a gate when
+  there is no production call site. What the suite DOES prove is that it enters
+  through the adapter — deleting the adapter's keep-quant wiring reds it
+  (mutation M4).
+  Three further things W5d-4 owes:
+  - **`norm_topk_prob` is not representable through this seam.** `MoeBlock`
+    hardcodes `renormalize = true` (`qwen3_5.cpp:7241`) and `HfConfig` carries no
+    such field, so a config that turned it off could not be honoured and the
+    adapter cannot refuse what it cannot see. Upstream's default is `True`
+    (`configuration_qwen4_exp.py:163`) and the released checkpoint does not
+    override it, so nothing is wrong today; `Qwen4ExpParams` still does not carry
+    the field, which this section already owed above.
+  - **The bf16 arm is ineligible for the CUDA fast grouped-bf16 MoE.**
+    `MoeBf16FastLayoutOk` (`qwen3_5.cpp:841-862`) requires per-expert `[H, I]`
+    with `nk == false`, and the adapter's zero-copy views are the tower's own
+    `[I, H]` with `nk == true`. It therefore falls through to the reference
+    per-expert loop on CUDA, exactly as the 35B MTP producer already does. The
+    alternative is a transposing copy, which is 240 GB across the stack at the
+    released geometry, so this is a deliberate trade and not an oversight — but a
+    grouped bf16 path that reads the tower orientation is owed if a bf16 arm ever
+    becomes the shipped one. It is not one today: all seven staged checkpoints are
+    quantized.
+  - **The NVFP4 expert arm is refused by absence, not by name.**
+    `Qwen4ExpMoeWeights` has no `Nvfp4Weight` fields and `LoadStackedExperts` has
+    no fp4 branch, so `MoeBlockWeights::expert_*_fp4` are left empty and the
+    seam's `fp4` predicate is false. Separately, and NOT this wave's to fix:
+    `LoadStackedExperts` (`qwen4_exp_weights.cpp:148-167`) handles only
+    `kKeepQuant` and falls through to `ExpandBf16` for BOTH `kKeepF16` and
+    `kNvfp4Fp4`, which `GgufLoadPolicy::Route` can return for
+    `kStackedExpertWeight` (`gguf_keep_quant.cpp:59-60`). That silently produces a
+    residency the policy did not ask for; at the released geometry it is a 240 GB
+    allocation rather than a wrong answer, so it fails loudly, but it belongs to
+    the W5a loader and is recorded here so the next reader does not read the
+    adapter's two arms as the loader's full range.
+
 - **W5b-4 (#2167) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`
   (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels
@@ -3050,12 +3098,31 @@ is listed under `## Owed`.
        `gate_exps`/`up_exps` `[E, moe_I, H]` and `down_exps` `[E, H, moe_I]`;
        `RunMoeBlock` reads `MoeBlockWeights`, whose arms are per-expert
        `[H, I]` vectors, an `Nvfp4Weight` set, or the stacked keep-quant
-       `expert_gate_kq [E*I, H]` / `expert_down_kq [E*H, I]`. The third arm's
-       shapes are exactly the qwen4_exp ones and `KqExpertSlice` is dtype-generic
-       (`RowSizeBytes(w.dtype, K)`), so the adapter looks like a
-       reinterpretation plus a router-gate orientation and a shared-expert
-       mapping rather than a copy — but it is unwritten and unmeasured, and
-       nothing yet proves a bf16 tower routes through `ExpertMlpKq`.
+       `expert_gate_kq [E*I, H]` / `expert_down_kq [E*H, I]`. **CLOSED by W5d-4
+       ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 4),
+       `src/vllm/model_executor/models/qwen4_exp_moe.{h,cpp}`. The sentence that
+       used to stand here — "the third arm's shapes are exactly the qwen4_exp
+       ones", so the adapter is "a reinterpretation … rather than a copy" — is
+       measured FALSE, and it is false on the arm every shipped checkpoint
+       takes.** `LoadStackedExperts` records the tower as RANK 3 `[E, N, K]`
+       (`qwen4_exp_weights.cpp:160-164`) and `MoeBlockWeights::expert_*_kq` is
+       RANK 2 `[E*N, K]`; the default keep-quant route
+       (`Qwen35GroupedMoeEnabled`, ON) hands that tensor to
+       `vt::MatmulBTQuantGrouped`, whose first check is
+       "matmul_bt_quant_grouped: rank-2 out/act/weight required"
+       (`src/vt/ops.cpp:223`). Three more differences a shape comparison cannot
+       see: the router and shared gate are f32 by `LoadMoe`'s deliberate choice
+       and the CUDA GEMM refuses a (bf16, f32) pair by name
+       (`cuda_matmul.cu:397-403`), so passing them through runs on CPU and dies
+       on every GPU; `MoeBlock` selects the whole expert path from
+       `expert_gate_kq` ALONE, so a per-tensor residency split reads as
+       keep-quant and dereferences an empty tower; and a **bf16** tower cannot
+       use the stacked fields at all (`ops.cpp:231` refuses a non-block dtype),
+       so the bf16 arm fills the PER-EXPERT vectors — with zero-copy borrowed
+       views, because three copies per layer at the released geometry is 240 GB
+       across the stack. Both arms are now gated against a from-scratch
+       reimplementation of the lane-pinned oracle in
+       `tests/vllm/models/test_qwen4_exp_moe.cpp`.
     5. **The mRoPE table builder has internal linkage.**
        `BuildMropeCosSinHost` is `static` at `qwen3_5.cpp:9472`, and
        `RunQwen4ExpQsaBlock` needs BOTH layouts derived from it: the packed

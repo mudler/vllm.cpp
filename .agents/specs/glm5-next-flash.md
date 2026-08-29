@@ -966,7 +966,30 @@ fixture is `seq_len` 21 against `index_topk` 8 — strictly past the threshold �
 with row 1 left-padded by three so the two rows do not share a pool grid, and
 `index_kpool` 4 so two of five pools are chosen. It asserts SET equality of the
 selected indices and PRINTS the margin: 17 discriminating rows, smallest margin
-**2.58e-3**, zero ties. `tests/vllm/model_executor/layers/attention/
+**2.58e-3**, zero ties.
+
+**The captured `index_scores` are ASSERTED, not only the argmax over them.**
+The first review of this wave found that they were not, and that two live scale
+defects therefore passed the whole file: dropping `n_heads**-0.5` from the
+per-head mix (relative error 1.83) and building `softmax_scale` from the wrong
+head dim (relative error 1.0, the trap the header warns about in prose). Both
+are uniform positive rescalings, so they permute nothing and the discrete
+top-k cannot see them; the printed margin could not either, because it is
+computed from OUR OWN scores and so scales WITH the defect. The 210 oracle
+values are now compared with an absolute tolerance of 2e-4, against a measured
+worst difference of 7.63e-6 on a largest |golden| of 45.17 — 26x of headroom
+against reduction-order drift, and still red for any uniform relative scale
+error above 4.4e-6. Both defects were re-applied and each reds.
+
+**An empty pool set is SERVED, not refused.** Below `index_kpool` valid tokens
+no pool is complete, `keep = pool_valid.any(0)` is empty (`:967-970`), `P` is 0
+and `select_k` is 0 — and upstream carries the empty candidate dimension
+through, so `append_visible_tail` returns the raw visible tail on its own. We
+refused it by name instead, which rejected four prompts the oracle answers: the
+run at transformers v5.16.1 serves `seq_len` 1, 2 and 3, and a `seq_len` 3 row
+left-padded by one, with a well-formed tail-only selection. Those four runs are
+generated into the same fixture as `kShort*` and asserted positionwise; the
+refusal is gone. `tests/vllm/model_executor/layers/attention/
 test_mla_attention_block.cpp` adds the NoPE accept and refuse cases and runs the
 NoPE geometry decode / prefill / chunked-context / MIXED against the SAME
 double-precision `RefBlock` every DeepSeek case uses, plus the
@@ -991,9 +1014,23 @@ is not a substitute for running: the decode dispatch sizes its dynamic shared
 memory as `(kBlockH + n_tile) * head_size * 4` with `kBlockH = 16`,
 `kNTile = 8`, so the published `head_size` 512 asks **49,152** bytes against the
 **55,296** that DeepSeek's 576 already gets on this fleet — strictly less than a
-live configuration, through the same `cudaFuncSetAttribute` opt-in path. The
-CUDA case is committed and guarded by `HasCuda()`, so it runs on the first
-lease.
+live configuration.
+
+**It is NOT the same code path as DeepSeek's 576, and the earlier draft of this
+paragraph said it was.** `cuda_mla_attn.cu:554` and `:565` gate the
+`cudaFuncSetAttribute` opt-in on `smem > 48u * 1024u`, and 49,152 is exactly
+`48 * 1024`, so at `head_size` 512 the opt-in is NOT taken; at 576 it is.
+`:639` and `:644` use the same strict `>`, so `DynamicSmemFits` is never
+consulted at 512 either — both expressions short-circuit before it. What the
+argument therefore rests on is different and weaker: 48 KiB is the
+architecture-guaranteed dynamic shared-memory limit a block gets WITHOUT any
+opt-in, the request is exactly that limit and not one byte over, and
+`cuda_mla_attn.cu` declares exactly one `__shared__` array (`:223`, the `extern`
+dynamic one), so no static allocation is competing for the same budget. The
+launch relies on the guaranteed floor rather than on the opt-in DeepSeek's 576
+takes. That is still an argument and not a measurement, and it does not settle
+occupancy, which is what a run would report. The CUDA case is committed and
+guarded by `HasCuda()`, so it runs on the first lease.
 
 ### W4 — mHC wiring and the unweighted head (CPU, small) — [#2098](https://github.com/mudler/vllm.cpp/issues/2098)
 
@@ -1618,8 +1655,13 @@ Debts this row carries, each visible rather than waived:
   it: `dgx:gpu0` was leased by another session's LTX-2.5 oracle render for the
   whole of W3's window, `rc hold` queued at position 1, and the wave released
   the queue rather than blocking. The static argument — 49,152 bytes of dynamic
-  shared memory against the 55,296 DeepSeek's 576-wide row already gets through
-  the same guard — narrows the risk and settles nothing. Owed against the next
+  shared memory, which is EXACTLY the 48 KiB every architecture guarantees a
+  block without an opt-in, with the file's single `__shared__` declaration
+  (`cuda_mla_attn.cu:223`) competing for none of it — narrows the risk and
+  settles nothing. It is expressly NOT the path DeepSeek's 576-wide row takes:
+  `:554`, `:565`, `:639` and `:644` all gate on `smem > 48u * 1024u`, so at 512
+  the `cudaFuncSetAttribute` opt-in is skipped and `DynamicSmemFits` is never
+  consulted, while at 576 both fire. Owed against the next
   `dgx:gpu0` lease on this row;
   [#2213](https://github.com/mudler/vllm.cpp/issues/2213) records it.
 
@@ -1632,7 +1674,8 @@ accepts the NoPE layer, discharging O11, and the DSA indexer's k-pool
 compression and always-kept ragged tail are ported and gated against the pinned
 transformers reference. W5 can now assemble a forward; nothing on this row loads
 yet, because the loader and `Forward` still refuse by name (O10) and the wiring
-is W5's (O17). The CUDA arm of W3 is committed and unmeasured (O18). The row
+is W5's (O17). The CUDA arm of W3 is committed and unmeasured; O17 carries that debt too,
+deliberately, rather than opening an O-number a concurrent wave may be using. The row
 reached `ACTIVE` on 2026-08-27 through W7a
 ([#2011](https://github.com/mudler/vllm.cpp/issues/2011),
 `CLAIM-GLM53-FLASH-W7A`), which landed the first product code: the

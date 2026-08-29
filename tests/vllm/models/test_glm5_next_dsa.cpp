@@ -197,6 +197,53 @@ TEST_CASE("glm5_next DSA: visibility is causal AND padding-aware") {
   }
 }
 
+TEST_CASE("glm5_next DSA: the index SCORES match the reference, so a wrong SCALE cannot hide behind the argmax") {
+  // WHY THIS CASE EXISTS. Everything else in this file gates the score chain
+  // through the DISCRETE top-k, whose error is bimodal, and the margin printed
+  // by the case below is computed from OUR OWN `sel.index_scores` — so it scales
+  // WITH a scale defect rather than against it. Two live defects therefore
+  // survived the whole file:
+  //
+  //   * `glm5_next_dsa.cpp` dropping `n_heads**-0.5` from the per-head mix
+  //     (`:827`) — every score off by sqrt(8), relative error 1.83;
+  //   * `IndexerDims::softmax_scale()` built from the WRONG head dim — relative
+  //     error 1.0, which is exactly the trap `glm5_next_dsa.h` warns about in
+  //     prose ("this is the INDEXER head dim, not the MLA one"). Prose does not
+  //     gate.
+  //
+  // Both are uniform positive rescalings, so they permute NOTHING: the argmax,
+  // the selected set and the positionwise indices are all unchanged. Only the
+  // VALUES move, and only this case reads them.
+  const IndexerDims d = FixtureDims();
+  const IndexerWeights w = FixtureWeights();
+  const IndexerSelection sel =
+      SelectIndexerTopk(d, w, Hidden(), QResid(), Mask(), g::kBatch, g::kSeqLen);
+  REQUIRE(sel.index_scores.size() ==
+          static_cast<size_t>(g::kBatch * g::kSeqLen * g::kNumPools));
+
+  double worst = 0.0;
+  double biggest = 0.0;
+  for (size_t i = 0; i < sel.index_scores.size(); ++i) {
+    // ABSOLUTE difference, not doctest::Approx, for the same reason the
+    // `pool_keys` check above uses one: Approx carries a scale term with a
+    // ~1.19e-5 floor.
+    //
+    // THE TOLERANCE, and why it is both loose and tight. Measured worst
+    // difference on this fixture is 7.63e-6, against a largest |golden| of
+    // 45.17 — one f32 ULP at that magnitude, from the left-padded query rows.
+    // 2e-4 is 26x that headroom, so reduction-order drift cannot make it flaky.
+    // It is still tight against the defect it is here for: a UNIFORM relative
+    // scale error r moves the largest value by r * 45.17, so this reds for any
+    // r above 4.4e-6. Both surviving defects are r = 1.0 and r = 1.83.
+    CHECK(std::abs(sel.index_scores[i] - g::kIndexScores[i]) < 2e-4f);
+    worst = std::max(worst, std::abs(static_cast<double>(sel.index_scores[i]) -
+                                     static_cast<double>(g::kIndexScores[i])));
+    biggest = std::max(biggest, std::abs(static_cast<double>(g::kIndexScores[i])));
+  }
+  MESSAGE("index_scores: worst absolute difference = " << worst << " over " << sel.index_scores.size()
+                                                       << " values, largest |golden| = " << biggest);
+}
+
 TEST_CASE("glm5_next DSA: the selection matches the reference, by SET, with a printed margin") {
   const IndexerDims d = FixtureDims();
   const IndexerWeights w = FixtureWeights();
@@ -290,6 +337,61 @@ TEST_CASE("glm5_next DSA: the ragged tail is appended RAW and UNSCORED") {
       static_cast<size_t>(g::kBatch * g::kSeqLen * g::kSeqLen), 1);
   const std::vector<uint8_t> vk(static_cast<size_t>(g::kBatch * g::kSeqLen), 1);
   CHECK(AppendVisibleTail(one, in, 4, vis, vk, g::kBatch, g::kSeqLen, g::kSeqLen) == in);
+}
+
+TEST_CASE("glm5_next DSA: a sequence with NO complete pool is SERVED, not refused") {
+  // A prompt shorter than `index_kpool` — or a left-padded row with fewer than
+  // `index_kpool` valid tokens — has no complete pool. `pool_valid` is then all
+  // zero, `keep = pool_valid.any(0)` is empty (`modular_glm5_next.py:967-970`),
+  // P is 0, `select_k = min(index_topk // index_kpool, 0)` is 0, and the pooled
+  // selection is EMPTY. Upstream does not refuse this state: `append_visible_
+  // tail` still returns the raw visible tail, so the row is served with a
+  // tail-only selection. We used to `Require(P > 0, ...)` and THROW, which
+  // refused four prompts the oracle answers — the first four tokens of every
+  // short prefill.
+  //
+  // The goldens below are the RUN output of the same unmodified
+  // `Glm5NextTextIndexer` at transformers v5.16.1, so this asserts the SELECTION
+  // and not merely that nothing throws.
+  const IndexerDims d = FixtureDims();
+  const IndexerWeights w = FixtureWeights();
+  const int64_t W = g::kOutputWidth;
+  REQUIRE(g::kShortCases == 4);
+
+  int64_t off = 0;
+  for (int64_t c = 0; c < g::kShortCases; ++c) {
+    const int64_t S = g::kShortSeqLen[c];
+    const int64_t pad = g::kShortPad[c];
+    CAPTURE(c);
+    CAPTURE(S);
+    CAPTURE(pad);
+    // The property that makes the case the one it claims to be.
+    REQUIRE(S - pad < g::kIndexKpool);
+
+    const std::vector<float> hidden(g::kShortHidden + off * g::kHidden,
+                                    g::kShortHidden + (off + S) * g::kHidden);
+    const std::vector<float> qres(g::kShortQResid + off * g::kQLora,
+                                  g::kShortQResid + (off + S) * g::kQLora);
+    const std::vector<uint8_t> mask = Bytes(g::kShortMask + off, static_cast<size_t>(S));
+
+    const IndexerSelection sel = SelectIndexerTopk(d, w, hidden, qres, mask, 1, S);
+    // The empty-pool path is the one actually taken, and the oracle agrees it
+    // is empty. Without this the case could pass on a fixture that still pools.
+    CHECK(sel.pooled.num_pools == 0);
+    CHECK(sel.pooled.num_pools == g::kShortNumPools[c]);
+    // `select_k` is 0 and the whole output width is therefore tail plus padding.
+    CHECK(d.SelectK(sel.pooled.num_pools) == 0);
+
+    REQUIRE(sel.topk_indices.size() == static_cast<size_t>(S * W));
+    for (int64_t i = 0; i < S * W; ++i) {
+      CAPTURE(i);
+      CHECK(sel.topk_indices[static_cast<size_t>(i)] == g::kShortTopk[off * W + i]);
+    }
+    off += S;
+  }
+  // Every value in the block was consumed, so a golden that grew without the
+  // loop growing with it reds here instead of going unread.
+  CHECK(off * W == static_cast<int64_t>(sizeof(g::kShortTopk) / sizeof(g::kShortTopk[0])));
 }
 
 TEST_CASE("glm5_next DSA: `index_kpool` is READ, and the value CHANGES the answer") {

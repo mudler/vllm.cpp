@@ -27,8 +27,9 @@ fixture is therefore chosen so the two DISAGREE:
     pooling is unobservable (spec section "The k-pool indexer is a compression
     stage DeepSeek-V4 does not have").
   * `index_kpool` 4 is the PUBLISHED checkpoint's value, not the config class
-    default 16. `select_k = min(index_topk // index_kpool, P) = min(2, 6) = 2`,
-    so two of six pools are chosen and four are rejected.
+    default 16. `keep = pool_valid.any(0)` drops the pool no row can use, so P is
+    5 and not ceil(21 / 4) = 6, and `select_k = min(index_topk // index_kpool, P)
+    = min(2, 5) = 2`: two of five pools are chosen and three are rejected.
   * Row 1 is LEFT-PADDED by three tokens, so its pool grid starts at token 3 and
     not at slot 0 (`get_pooled_states`, `:938-945`). A port that pools from slot
     0 passes row 0 and fails row 1.
@@ -63,6 +64,18 @@ INDEX_TOPK = 8
 INDEX_KPOOL = 4          # the CHECKPOINT value; the config class defaults to 16
 PAD_ROW1 = 3             # row 1 is left-padded by three tokens
 SEED = 20260828
+
+# ── the SHORT fixture: sequences with NO complete pool ───────────────────────
+# `number_of_pools` is `ceil(kv_len / index_kpool)`, and a pool is valid only
+# when EVERY one of its `index_kpool` members exists. Below `index_kpool` tokens
+# no pool is complete, `keep = pool_valid.any(0)` is empty (`:967-970`), P is 0,
+# `select_k = min(index_topk // index_kpool, 0)` is 0 and the pooled selection is
+# EMPTY. Upstream does not refuse this: `append_visible_tail` still returns the
+# raw visible tail, so the row is served with a tail-only selection. Each entry
+# is (seq_len, left_pad); the last one is a row with FEWER valid tokens than
+# `index_kpool` behind a left pad, which is the same state a real prefill of a
+# short padded prompt reaches.
+SHORT_CASES = [(1, 0), (2, 0), (3, 0), (3, 1)]
 
 
 def config():
@@ -204,6 +217,46 @@ def main():
     emit_i("kPoolValid", pool_valid)
     emit_f("kIndexScores", index_scores)
     emit_i("kTopkIndices", topk)
+
+    # ── the SHORT cases ─────────────────────────────────────────────────────
+    # Drawn AFTER every tensor above, so the main fixture's bytes are unchanged.
+    # Batch is 1 throughout and the arrays are CONCATENATED over the cases; the
+    # C++ side walks them with a running offset built from `kShortSeqLen`.
+    short_hidden, short_qresid, short_mask, short_topk, short_pools = [], [], [], [], []
+    for s_len, pad in SHORT_CASES:
+        sh = torch.empty(1, s_len, HIDDEN).uniform_(-1.0, 1.0)
+        sq = torch.empty(1, s_len, Q_LORA).uniform_(-1.0, 1.0)
+        sm = torch.ones(1, s_len, dtype=torch.bool)
+        sm[0, :pad] = False
+        sh[0, :pad] = 7.5
+        sq[0, :pad] = -7.5
+        with torch.no_grad():
+            sk = idx.k_norm(idx.wk(sh)).view(1, s_len, -1, HEAD_DIM).squeeze(2)
+            sg = torch.nn.functional.linear(sh, idx.index_kpool_compress_gate)
+            spacked = torch.cat([sk, sg, sm.to(sk.dtype)[..., None]], dim=-1)
+            spk, _, _ = idx.get_pooled_states(packed_states=spacked)
+            st = idx(hidden_states=sh, q_resid=sq, attention_mask=sm, past_key_values=None)
+        short_pools.append(int(spk.shape[1]))
+        short_hidden.append(sh.reshape(-1))
+        short_qresid.append(sq.reshape(-1))
+        short_mask.append(sm.reshape(-1))
+        short_topk.append(st.reshape(-1))
+
+    print()
+    print("// The SHORT cases: sequences with NO complete k-pool. Upstream serves")
+    print("// them with a tail-only selection; it does not refuse them.")
+    print(f"inline constexpr int64_t kShortCases = {len(SHORT_CASES)};")
+    print("inline constexpr int64_t kShortSeqLen[] = {"
+          + ", ".join(str(s_len) for s_len, _ in SHORT_CASES) + "};")
+    print("inline constexpr int64_t kShortPad[] = {"
+          + ", ".join(str(pad) for _, pad in SHORT_CASES) + "};")
+    print("inline constexpr int64_t kShortNumPools[] = {"
+          + ", ".join(str(n) for n in short_pools) + "};")
+    emit_f("kShortHidden", torch.cat(short_hidden))
+    emit_f("kShortQResid", torch.cat(short_qresid))
+    emit_i("kShortMask", torch.cat(short_mask))
+    emit_i("kShortTopk", torch.cat(short_topk))
+
     print()
     print("}  // namespace glm5_next_dsa_goldens")
     return 0

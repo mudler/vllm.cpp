@@ -396,8 +396,15 @@ IndexerSelection SelectIndexerTopk(const IndexerDims& d, const IndexerWeights& w
 
   IndexerSelection sel;
   sel.pooled = GetPooledStates(d, w, packed, batch, kv_len);
+  // P can legitimately be ZERO: below `index_kpool` valid tokens no pool is
+  // complete, `keep = pool_valid.any(0)` is empty (`:967-970`) and upstream
+  // carries an empty candidate dimension through the rest of the function
+  // rather than refusing. `select_k` is then `min(index_topk // index_kpool, 0)`
+  // = 0, `flat` is zero-width, both loops below do not run, and
+  // `AppendVisibleTail` returns the raw visible tail on its own — which is the
+  // selection upstream serves. Refusing here instead rejected the first
+  // `index_kpool - 1` tokens of every prefill.
   const int64_t P = sel.pooled.num_pools;
-  Require(P > 0, "no complete k-pool candidate exists for any row in the batch");
 
   // `q = self.wq_b(q_resid).view(B, S, -1, head_dim)` (`:795`).
   std::vector<float> q(static_cast<size_t>(N * D));

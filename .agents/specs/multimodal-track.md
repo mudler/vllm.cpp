@@ -2019,3 +2019,21 @@ L4 (§1.6); the second while landing L3 (§1.5).
   upstream `context.py:461`). Blocked on the per-model
   `get_supported_mm_limits()` hook that L1 recorded as absent, which the M2
   towers own. Unchanged by L3.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300)** — the GPU runner
+  never sets `ModelForwardInput.mm`, so a Qwen3-VL server throws on the first
+  forward step of EVERY request, text or image.
+  `ForwardQwen3VLForConditionalGeneration` requires the field
+  (`qwen3_vl_registry.cpp:127`). `runner.cpp:2234` builds `ModelForwardInput`
+  without it and calls `ModelRegistry::Forward` at `:2340`, and no line of that
+  4443-line file names `mm_features`, `MultiModalForwardInput` or `.mm`.
+  `input_batch.h:90` already records the worker input batch as a subset with
+  `mm_features` DEFERRED, which is the same fact one layer up. This is the
+  IMAGE half of the condition the `qwen3-vl` L3 bullet above records for text
+  only: that bullet reads the refusal as a benchmark-vehicle limit, and the
+  refusal is in fact total. STATICALLY DERIVED, not run. Sibling registered
+  forwards take the other shape and fall back to text
+  (`gemma4_registry.cpp:145`, `muse_glimmer_registry.cpp:113`), so choosing
+  between a text arm here and building `mm` in the runner is a design decision
+  with its own spec and gate, not an in-flow repair. It is the hop
+  [#1358](https://github.com/mudler/vllm.cpp/issues/1358) needs before the
+  tower it loads can be read back.

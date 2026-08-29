@@ -1,6 +1,7 @@
 # Multimodal serving — wiring image/audio/video into the OpenAI server (`ROAD-V1-MM` serving)
 
-Row IDs: `MM-SERVE-PARSE` (W1), `MM-SERVE-ENGINE` (W2), `MM-SERVE-E2E` (W3, this brick).
+Wave IDs: `MM-SERVE-PARSE` (W1), `MM-SERVE-ENGINE` (W2), `MM-SERVE-E2E` (W3, this
+brick). These are this spec's own wave names, NOT roadmap rows. See `## Owed`.
 Owner claim: `CLAIM-MM-SERVING-E2E` (W1 `CLAIM-MM-SERVING-W1`, W2 `CLAIM-MM-SERVING-W2`).
 Pinned vLLM oracle: `${VLLM_SOURCE}` @ `555967922` (0.26.0.dev0).
 
@@ -256,6 +257,11 @@ Closing the GPU gate (the exact residual, DGX GB10 + Qwen3-VL-4B checkpoint):
 
 ## MM-ENGINE-FORWARD — the block is RESOLVED (2026-07-28, `CLAIM-ENGINE-MM-FORWARD`)
 
+> **Corrected 2026-08-29, see `## Owed`.** What this section records is real and
+> stays. What "RESOLVED" does not mean: no production entry point reaches the
+> registered mm forward, because the runner never sets `ModelForwardInput.mm`
+> ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)).
+
 The three-point architectural block above is CLOSED. Multimodal now runs through the
 engine's REGISTERED forward (`ModelRegistry::Forward`), not only the standalone
 `Qwen3VLGenerateGreedy` driver.
@@ -300,3 +306,59 @@ so batched-runner mm + cross-step per-request MRoPE-delta state is the residual)
 forward end-to-end); (c) video / multi-image / audio / Gemma-4-image through the
 registered path. README's "not yet wired into the OpenAI server end-to-end" line is
 now RESOLVABLE for the registered-forward half.
+
+## Owed
+
+Two statements on this page are false as written. This section corrects both and
+removes neither, because each records work that happened.
+
+**1. `MM-SERVE-PARSE`, `MM-SERVE-ENGINE` and `MM-SERVE-E2E` are wave names in
+this spec, not roadmap rows.** `scripts/now.py --offline` lists none of the
+three, and no matrix carries any of them in a row-ID cell. The live owners are
+`ENG-MM-INPUT-PIPELINE` (`READY`) and `ENG-MM-QWEN36-VL-FORWARD` (`ACTIVE`) in
+[`../engine-matrix.md`](../engine-matrix.md). Read every wave name here as a
+wave inside this document.
+
+**2. "Multimodal now runs through the engine's REGISTERED forward" is true of
+one driver and of nothing a user reaches.**
+[#2300](https://github.com/mudler/vllm.cpp/issues/2300) is the residual, and it
+is the runner hop.
+
+What IS reached, and stays reached: the CPU serving seam body
+(`MakeQwen3VLImageChatFn`, `chat_mm.cpp`) is wired in the LIBRARY, at
+`src/vllm/entrypoints/openai/server_main.cpp:1545`, and gated by `test_chat_mm`
+and `test_openai_serving`. `examples/server/main.cpp` is a 23-line ABI shim that
+reaches that wiring through `vllm_server_main`, so the reachability conclusion
+holds, but the file itself carries no multimodal reference. Two earlier lines on
+this page still name the shim as the wiring site: the `MM-SERVE-E2E` row under
+`## Full wiring path` and the wiring bullet under `## Brick 3`. Both record the
+state before `ARCH-ONE-SURFACE` moved the construction into the library, and
+both stay as written. The single-sequence drivers produce token-correct output
+against the committed M2c golden.
+`Qwen3VLForConditionalGeneration` is registered, and its forward does consume
+`ModelForwardInput.mm` and does reuse the shared per-step contract, exactly as
+the section above records.
+
+What is NOT reached: `Qwen3VLGenerateGreedyViaRegistry` has one caller in the
+whole tree, `tests/vllm/multimodal/test_qwen3vl_registry_e2e.cpp:167`. The three
+writers of `.mm` are single-sequence drivers (`qwen3_vl.cpp:638`,
+`gemma4_mm.cpp:240`, `muse_glimmer_mm.cpp:358`), and the runner is not among
+them: `runner.cpp:2234` builds `ModelForwardInput` without `.mm` and calls
+`ModelRegistry::Forward` at `:2340`, and no line of that 4443-line file names
+`mm_features`, `MultiModalForwardInput` or `.mm`. `input_batch.h:90` records the
+worker input batch as a subset with `mm_features` DEFERRED. So the registered
+forward is reached by a test and by nothing else, which is
+[`../reachability.md`](../reachability.md)'s test-only-driver shape.
+
+The consequence is worse than an unreached capability, and it is why #2300 is
+filed as a bug rather than left as this residual. Because
+`ForwardQwen3VLForConditionalGeneration` makes the field mandatory
+(`VT_CHECK(input.mm.has_value(), ...)`, `qwen3_vl_registry.cpp:127`) instead of
+falling back to text as `gemma4_registry.cpp:145` and
+`muse_glimmer_registry.cpp:113` do, a server started on a Qwen3-VL checkpoint
+throws on the first forward step of every request, text or image. The "GPU
+closing gate DEFERRED" line under `## Correctness / gates` therefore understates
+the state: the gate is not only untaken, the path it would gate refuses.
+
+This correction is statically derived. No binary was built and no server was
+started for it.

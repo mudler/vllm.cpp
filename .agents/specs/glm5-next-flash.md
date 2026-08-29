@@ -1971,8 +1971,8 @@ Debts this row carries, each visible rather than waived:
 - **O21 — the `glm4` PRE-TOKENIZER is DISCHARGED, and the loader now stops in the
   WEIGHT LOADER.** [#2277](https://github.com/mudler/vllm.cpp/issues/2277).
 
-  **The number is O21 and not O19.** `origin/main` at `a36add6a8` carries O1 to
-  O18 plus O20; [#2256](https://github.com/mudler/vllm.cpp/issues/2256) adds an
+  **The number is O21 and not O19.** `origin/main` at `785d4304f` carries O1 to
+  O18 plus O20, and so did `a36add6a8`, the base this branch was cut from; [#2256](https://github.com/mudler/vllm.cpp/issues/2256) adds an
   O19 on a branch that has not merged. Two branches that each append an `O19`
   produce a duplicate rather than a conflict, so this entry skips the number for
   the same reason O20 did. The gap is deliberate.

@@ -34,9 +34,10 @@ and the wall HONESTLY UNMOVED — the A/B trace split the W4 hypothesis:
 per-upload allocation was never the wall; the wall is the per-CQ-operation
 tt-metal stack (context queries, `Cluster::get_chip`, `read_cq_host_ptr`
 polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
-staging** (one CQ write per step divides the per-op tax by the fan-in;
-inside our file set), with the tt-metal-side residual (cached context
-handles, amortized CQ polling) recorded as the upstream-shaped
+staging** ([#2273](https://github.com/mudler/vllm.cpp/issues/2273), the
+active wave) — one CQ write per step divides the per-op tax by the
+fan-in; inside our file set. The tt-metal-side residual (cached context
+handles, amortized CQ polling) is recorded as the upstream-shaped
 alternative.
 
 ## Scope
@@ -273,6 +274,31 @@ column above is the entry point, not the whole chain.
   (identical leg, lock discipline) plus a fresh benchmark-record entry; a
   wall that does not move is a reported result — the attribution shifts
   or the lever is named unreachable with the trace that proves it.
+- **W6 — batch per-layer staging: one mesh-CQ write per step (#2273).**
+  W5's trace re-attributed the unmoved wall to the per-CQ-operation
+  tt-metal stack — `Threadpool::PollForWork` 14.29%,
+  `MetalContext::instance` 11.14%, `memcpy` 6.23%, `Cluster::get_chip`
+  5.90%, `read_cq_host_ptr` 5.27%+ sub-slices — charged once per
+  staging write, so a step with fan-in N staged tensors pays it N
+  times regardless of bytes. Pack a step's staged host rows into one
+  contiguous host block and issue ONE mesh-CQ write per step (or per
+  layer group); the per-op tax divides by the fan-in. `StagingStats`
+  gains route counters for the new path (red-first). The capture-unsafe
+  host-write refusals keep their semantics; the f32-conversion arms
+  keep their declared dtypes. A batched/arena layout states its restage
+  semantics explicitly — same-geometry restage aliases the persistent
+  buffer (W5 review awareness), so no fresh-snapshot reasoning carries
+  over. The route must be production-reachable
+  (`ModelRegistry::Forward` → staging), never test-only.
+  Invariant: staging is bit-identical — the sacred golden pair stays
+  16/16 and the full TT suite stays green; this wave changes SPEED,
+  never tokens. Evidence owed: same-method before/after profile on the
+  P150 (identical leg, JIT-discard per arm, one lock hold) plus a fresh
+  benchmark-record entry; a wall that does not move is a reported
+  result — the attribution shifts or the lever is named unreachable
+  with the trace that proves it. The tt-metal-side residual (cached
+  context handles, amortized CQ polling) stays recorded as the
+  upstream-shaped alternative.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -316,8 +342,8 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `a456e6eaf` (bumped
-2026-08-29; W3 #2201 via #2217 landed since the previous `3fe34e2c6`). Branch
+in `.agents/developer-preferences.md`). Base `origin/main` @ `017c3277f` (bumped
+2026-08-29; W5 #2244 via #2258 landed since the previous `a456e6eaf`). Branch
 `row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 

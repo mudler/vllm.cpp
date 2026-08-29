@@ -1,0 +1,140 @@
+#version 450
+// vt_matmul_bt_tq1_0_grouped_dev: grouped keep-quant matmul for TQ1_0 weights
+// with ON-DEVICE Q8_K activation quantize. BACKEND-VULKAN-KEEPQUANT.
+//
+// Same structure as vt_matmul_bt_tq2_grouped_dev but for TQ1_0 ternary weights.
+// TQ1_0 block: { u8 qs[48]; u8 qh[4]; f16 d; } = 54 bytes per 256 elements.
+// This is the down-projection half of the maple MoE with TQ1_0 weights.
+//
+// One workgroup per output column `col`; 128 lanes split K (blocks), loop rows.
+
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+  uint m;       // output rows (P = T * top_k)
+  uint n;       // output columns (H = hidden_size)
+  uint nb;      // K / 256 blocks per row
+  uint e;       // num experts E (weight stride)
+  uint bcast;   // 1 => all rows share activation row 0
+  uint a_off;   // activation tensor start (f32, device) — byte offset
+  uint w_off;   // weight tensor start (TQ1_0) — byte offset
+  uint eid_off; // expert_ids tensor start (i32) — byte offset
+  uint out_off; // output tensor start — byte offset
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer Ab32 { uint v[]; } A32;
+layout(set = 0, binding = 1, std430) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(set = 0, binding = 2, std430) readonly buffer Wb32 { uint v[]; } W32;
+layout(set = 0, binding = 3, std430) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(set = 0, binding = 4, std430) readonly buffer Eb { int v[]; } EID;
+layout(set = 0, binding = 5, std430) writeonly buffer Ob32 { uint v[]; } O32;
+layout(set = 0, binding = 6, std430) writeonly buffer Ob16 { uint16_t v[]; } O16;
+
+layout(constant_id = 0) const uint VT_TQ_OUT_DT = 0u;  // output dtype spec constant
+
+shared float tq_part[128];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint col = gl_WorkGroupID.x;
+  if (col >= p.n) { return; }
+
+  const uint wbytes = 54u;  // BlockTQ1_0
+
+  for (uint row = 0u; row < p.m; ++row) {
+    int e = EID.v[p.eid_off + row];
+    if (e < 0) continue;
+    uint ee = uint(e);
+    uint a_base32 = (p.a_off >> 2) + ((p.bcast != 0u) ? 0u : row) * p.nb * 256u;
+    uint w_row = p.w_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
+
+    float acc = 0.0;
+    for (uint b = tid; b < p.nb; b += 128u) {
+      // --- Pass 1: find signed-extremum max over 256 f32 activation values ---
+      uint a_base = a_base32 + b * 256u;
+      float amax = 0.0;
+      float maxv = 0.0;
+      for (uint i = 0u; i < 256u; ++i) {
+        float v = uintBitsToFloat(A32.v[a_base + i]);
+        float ax = abs(v);
+        if (ax > amax) { amax = ax; maxv = v; }
+      }
+      if (amax == 0.0) { continue; }
+
+      float iscale = -127.0 / maxv;
+      float d_act = 1.0 / iscale;
+
+      // --- Pass 2: re-read, quantize, dot with TQ1_0 weight ---
+      uint woff = w_row + b * wbytes;
+      float wd = vt_from16(uint(W16.v[(woff + 52u) >> 1]), VT_DT_F16);
+      float blockd = d_act * wd;
+      int acci = 0;
+      // qs[0..31]: 5 trits × 32 elements = 160 elements (indices 0..159)
+      for (uint l = 0u; l < 5u; ++l) {
+        for (uint m = 0u; m < 32u; ++m) {
+          uint ae = l * 32u + m;
+          float v = uintBitsToFloat(A32.v[a_base + ae]);
+          int q = int(roundEven(iscale * v));
+          q = q < 127 ? q : 127;
+          uint wb_byte = woff + m;
+          uint w16 = W16.v[wb_byte >> 1];
+          uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
+          uint qq = (wb * p3) & 0xFFu;
+          uint xi = (qq * 3u) >> 8u;
+          int ternary = int(xi) - 1;
+          acci += q * ternary;
+        }
+      }
+      // qs[32..47]: 5 trits × 16 elements = 80 elements (indices 160..239)
+      for (uint l = 0u; l < 5u; ++l) {
+        for (uint m = 0u; m < 16u; ++m) {
+          uint ae = 160u + l * 16u + m;
+          float v = uintBitsToFloat(A32.v[a_base + ae]);
+          int q = int(roundEven(iscale * v));
+          q = q < 127 ? q : 127;
+          uint wb_byte = woff + 32u + m;
+          uint w16 = W16.v[wb_byte >> 1];
+          uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
+          uint qq = (wb * p3) & 0xFFu;
+          uint xi = (qq * 3u) >> 8u;
+          int ternary = int(xi) - 1;
+          acci += q * ternary;
+        }
+      }
+      // qh[0..3]: 4 trits × 4 elements = 16 elements (indices 240..255)
+      for (uint l = 0u; l < 4u; ++l) {
+        for (uint j = 0u; j < 4u; ++j) {
+          uint ae = 240u + l * 4u + j;
+          float v = uintBitsToFloat(A32.v[a_base + ae]);
+          int q = int(roundEven(iscale * v));
+          q = q < 127 ? q : 127;
+          uint wb_byte = woff + 48u + j;
+          uint w16 = W16.v[wb_byte >> 1];
+          uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
+          uint qq = (wb * p3) & 0xFFu;
+          uint xi = (qq * 3u) >> 8u;
+          int ternary = int(xi) - 1;
+          acci += q * ternary;
+        }
+      }
+      acc += float(acci) * blockd;
+    }
+
+    tq_part[tid] = acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (tid < s) tq_part[tid] += tq_part[tid + s];
+      barrier();
+    }
+    if (tid == 0u) {
+      VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, tq_part[0]);
+    }
+    barrier();
+  }
+}

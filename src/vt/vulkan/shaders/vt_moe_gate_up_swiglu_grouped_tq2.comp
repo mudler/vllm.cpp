@@ -1,0 +1,183 @@
+#version 450
+// vt_moe_gate_up_swiglu_grouped_tq2: FUSED routed-MoE gate+up GEMM + clamped
+// SwiGLU epilogue for TQ2_0 weights, with ON-DEVICE Q8_K activation quantize.
+// BACKEND-VULKAN-KEEPQUANT (maple MoE throughput Phase 2).
+//
+// Replaces {MatmulBTQuantGrouped(gate); MatmulBTQuantGrouped(up); host SwiGLU}
+// — three dispatches + two host drains — with ONE dispatch that reads the bf16
+// activation straight from the device buffer, quantizes to Q8_K per 256-element
+// block INSIDE the shader (matching cpu_quant_act.cpp QuantizeRowQ8_K exactly),
+// and folds the clamped SwiGLU into the store. No host read, no FlushBatch, no
+// scratch buffer: the whole MoE expert path pipelines without drains.
+//
+// Arithmetic (per output row `row`, column `col`):
+//   e = expert_ids[row]
+//   gate = sum_b VecDotTQ2_0Q8_K(w_gate[e,col,b], q8k(act[row,b])) * d_act[b] * d_w[b]
+//   up   = sum_b VecDotTQ2_0Q8_K(w_up[e,col,b],   q8k(act[row,b])) * d_act[b] * d_w[b]
+//   gc = min(gate, limit);  uc = clamp(up, -limit, limit)
+//   out[row,col] = gc * sigmoid(gc) * uc    (clamped SwiGLU, f32 output)
+//
+// The Q8_K quantize is the two-pass form (pass 1 finds the signed-extremum max,
+// pass 2 re-reads, quantizes and dots) so no 256-element local array is needed.
+// L1 caches the 512-byte bf16 block between the two passes.
+//
+// One workgroup per output column `col`; 128 lanes split K (blocks), loop rows.
+//   w_row = w_off + e * N * nb * 66 + col * nb * 66
+//   a_base (A16 index) = (a_off + (bcast?0:row) * nb * 256 * 2) / 2 + b * 256
+
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint VT_FUSED_ACT_DT = 2u;  // activation dtype: 0=f32, 2=bf16
+
+layout(push_constant) uniform Params {
+  uint m;       // output rows (P = T * top_k)
+  uint n;       // output columns (I = moe_intermediate_size)
+  uint nb;      // K / 256 blocks per row
+  uint e;       // num experts E (weight stride)
+  uint bcast;   // 1 => all rows share activation row 0
+  uint gather_k; // >0 => activation is [T, H] and row p reads row p/gather_k
+  uint a_off;   // activation tensor start (f32/bf16, device) — byte offset
+  uint gw_off;  // gate weight tensor start (TQ2_0) — byte offset
+  uint uw_off;  // up weight tensor start (TQ2_0) — byte offset
+  uint eid_off; // expert_ids tensor start (i32) — byte offset
+  uint out_off; // output tensor start (f32) — byte offset
+  float limit;  // SwiGLU clamp limit (7.0 for maple)
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer Ab32 { uint v[]; } A32;
+layout(set = 0, binding = 1, std430) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(set = 0, binding = 2, std430) readonly buffer GWb32 { uint v[]; } GW32;
+layout(set = 0, binding = 3, std430) readonly buffer GWb16 { uint16_t v[]; } GW16;
+layout(set = 0, binding = 4, std430) readonly buffer UWb32 { uint v[]; } UW32;
+layout(set = 0, binding = 5, std430) readonly buffer UWb16 { uint16_t v[]; } UW16;
+layout(set = 0, binding = 6, std430) readonly buffer Eb { int v[]; } EID;
+layout(set = 0, binding = 7, std430) writeonly buffer Ob32 { uint v[]; } O32;
+layout(set = 0, binding = 8, std430) writeonly buffer Ob16 { uint16_t v[]; } O16;
+
+shared float tq_part[128];
+
+// Magic-constant round-to-nearest-even, matching cpu_quant_act.cpp NearestInt
+// (ggml-quants.c:563). Kept bit-for-bit rather than replaced with roundEven:
+// roundEven is specified to round to nearest even, but drivers may differ in
+// subnormal/overflow handling. The magic-constant method is identical to the
+// CPU reference's instruction-level behavior.
+// The `precise` qualifier prevents the driver from contracting
+// `fval + 12582912.0` into a fused multiply-add when `fval` is a product
+// (e.g. `iscale * v`) — the CPU rounds the multiply first, then adds, so
+// the GPU must too or bf16 activations quantize to different Q8_K values.
+int vt_nearest_int(precise float fval) {
+  precise float val = fval + 12582912.0;
+  int i = floatBitsToInt(val);
+  return (i & 0x007fffff) - 0x00400000;
+}
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint col = gl_WorkGroupID.x;
+  if (col >= p.n) { return; }
+
+  const uint wbytes = 66u;  // BlockTQ2_0 = { u8 qs[64]; u16 d; }
+
+  for (uint row = 0u; row < p.m; ++row) {
+    int e = EID.v[p.eid_off + row];
+    if (e < 0) continue;
+    uint ee = uint(e);
+    // Activation row index: bcast => row 0; gather_k > 0 => row / gather_k
+    // (prefill: activation is [T, H], each token routes to top_k experts);
+    // else => row (activation is already [P, H]).
+    uint a_row_idx = (p.bcast != 0u) ? 0u
+        : (p.gather_k > 0u) ? (row / p.gather_k) : row;
+    uint a_row = ((VT_FUSED_ACT_DT == VT_DT_F32) ? (p.a_off >> 2) : (p.a_off >> 1))
+        + a_row_idx * p.nb * 256u;
+    uint gw_row = p.gw_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
+    uint uw_row = p.uw_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
+
+    float gate_acc = 0.0;
+    float up_acc = 0.0;
+
+    for (uint b = tid; b < p.nb; b += 128u) {
+      // --- Pass 1: find signed-extremum max over 256 activation values ---
+      uint a_base = a_row + b * 256u;
+      float amax = 0.0;
+      float maxv = 0.0;
+      for (uint i = 0u; i < 256u; ++i) {
+        float v = (VT_FUSED_ACT_DT == VT_DT_F32)
+            ? uintBitsToFloat(A32.v[a_base + i])
+            : vt_bf16_to_f32(uint(A16.v[a_base + i]));
+        float ax = abs(v);
+        if (ax > amax) { amax = ax; maxv = v; }
+      }
+      if (amax == 0.0) { continue; }
+
+      float iscale = -127.0 / maxv;
+      float d_act = 1.0 / iscale;  // = -maxv / 127
+
+      // --- Pass 2: re-read, quantize, dot with BOTH gate and up weights ---
+      uint gwoff = gw_row + b * wbytes;
+      uint uwoff = uw_row + b * wbytes;
+      float gwd = vt_from16(uint(GW16.v[(gwoff + 64u) >> 1]), VT_DT_F16);
+      float uwd = vt_from16(uint(UW16.v[(uwoff + 64u) >> 1]), VT_DT_F16);
+      float gblockd = d_act * gwd;
+      float ublockd = d_act * uwd;
+      int gacci = 0;
+      int uacci = 0;
+      for (uint j = 0u; j < 64u; j += 32u) {
+        for (uint l = 0u; l < 4u; ++l) {
+          for (uint k = 0u; k < 32u; ++k) {
+            uint ae = j * 4u + l * 32u + k;
+            float v = (VT_FUSED_ACT_DT == VT_DT_F32)
+                ? uintBitsToFloat(A32.v[a_base + ae])
+                : vt_bf16_to_f32(uint(A16.v[a_base + ae]));
+            int q = vt_nearest_int(iscale * v);
+            q = q < 127 ? q : 127;
+            // gate weight element
+            uint gwb_byte = gwoff + j + k;
+            uint gw16 = GW16.v[gwb_byte >> 1];
+            uint gwb = ((gwb_byte & 1u) != 0u) ? (gw16 >> 8u) : (gw16 & 0xFFu);
+            int gternary = int((gwb >> (l * 2u)) & 3u) - 1;
+            gacci += q * gternary;
+            // up weight element
+            uint uwb_byte = uwoff + j + k;
+            uint uw16 = UW16.v[uwb_byte >> 1];
+            uint uwb = ((uwb_byte & 1u) != 0u) ? (uw16 >> 8u) : (uw16 & 0xFFu);
+            int uternary = int((uwb >> (l * 2u)) & 3u) - 1;
+            uacci += q * uternary;
+          }
+        }
+      }
+      gate_acc += float(gacci) * gblockd;
+      up_acc += float(uacci) * ublockd;
+    }
+
+    // --- Reduce gate and up partials across 128 lanes ---
+    tq_part[tid] = gate_acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (tid < s) tq_part[tid] += tq_part[tid + s];
+      barrier();
+    }
+    float gate = tq_part[0];
+    barrier();
+
+    tq_part[tid] = up_acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (tid < s) tq_part[tid] += tq_part[tid + s];
+      barrier();
+    }
+    float up = tq_part[0];
+    barrier();
+
+    // --- Clamped SwiGLU (matches ClampedSiluMul in maple.cpp) ---
+    if (tid == 0u) {
+      float gc = min(gate, p.limit);
+      float uc = clamp(up, -p.limit, p.limit);
+      float s = gc / (1.0 + exp(-gc));
+      O32.v[(p.out_off >> 2) + row * p.n + col] = floatBitsToUint(s * uc);
+    }
+    barrier();
+  }
+}

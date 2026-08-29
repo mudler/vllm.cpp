@@ -1,0 +1,139 @@
+#version 450
+// vt::MoeRouterTopK — softmax over E experts, greedy top-k with lowest-index
+// tie-break, optional renormalize. UNGROUPED path only (num_expert_group == 0);
+// the grouped/noaux_tc variant DECLINES on the host and falls back to the
+// reference tier (maple uses the ungrouped softmax router).
+//
+// CPU oracle: MoeRouterTopKKernel (src/vt/cpu/cpu_ops.cpp:2680-2721).
+//
+// GRID: ONE WORKGROUP PER TOKEN ROW. The row's E probabilities live in shared
+// memory; top-k runs as k greedy rounds over shared state with an explicit
+// lower-index-wins tie-break, matching the CPU's strict `>` scan exactly
+// (equal probabilities keep the earliest index). E <= VT_MR_MAX_E is asserted
+// host-side at dispatch.
+//
+// Bias is NOT implemented in this kernel (a bias tensor changes the score
+// pre-softmax); host declines to the fallback when bias != nullptr.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Wb32 { uint v[]; } W32;   // weights [T,K] f32 OUT
+layout(binding = 1) buffer Ib32 { uint v[]; } I32;   // indices [T,K] i32 OUT
+layout(binding = 2) readonly buffer Lb32 { uint v[]; } L32;
+layout(binding = 3) readonly buffer Lb16 { uint16_t v[]; } L16;
+
+#define VT_MR_MAX_E 1024u
+
+layout(constant_id = 0) const uint VT_MR_E = 256u;   // num experts
+layout(constant_id = 1) const uint VT_MR_K = 8u;     // top_k
+layout(constant_id = 2) const uint VT_MR_RENORM = 1u;
+layout(constant_id = 3) const uint VT_MR_LDT = VT_DT_BF16;   // logits dtype code
+
+layout(push_constant) uniform Params {
+  uint tokens;
+  uint e;
+  uint k;
+  uint logits_off, w_off, i_off;
+} p;
+
+shared float probs[VT_MR_MAX_E];
+shared uint claimed[VT_MR_MAX_E];
+// block-argmax scratch for the top-k rounds (declared at global scope:
+// GLSL forbids `shared` inside a nested scope)
+shared float bv_s[128];
+shared uint bi_s[128];
+shared float sum_s[128];   // denominator reduction scratch (NEVER alias probs[])
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+
+  // 1. softmax with max-subtraction, cpu_ops.cpp:2692-2704.
+  float mx = -1.0 / 0.0;
+  for (uint j = lane; j < p.e; j += 128u) {
+    mx = max(mx, VT_LOAD(L32, L16, VT_MR_LDT, p.logits_off, row * p.e + j));
+  }
+  // warp/block max via shared-free pairwise ops is not available here without
+  // more shared state; reuse probs[] scratch before it holds probabilities.
+  // Simplest correct block reduction: each lane writes its local max, stride
+  // reduction over slot 0..127.
+  probs[lane] = mx;
+  barrier();
+  for (uint s = 64u; s >= 1u; s >>= 1u) {
+    if (lane < s) { probs[lane] = max(probs[lane], probs[lane + s]); }
+    barrier();
+  }
+  mx = probs[0];
+  barrier();
+
+  float sum = 0.0;
+  for (uint j = lane; j < p.e; j += 128u) {
+    float ex = exp(VT_LOAD(L32, L16, VT_MR_LDT, p.logits_off, row * p.e + j) - mx);
+    probs[j] = ex;
+    sum += ex;
+  }
+  sum_s[lane] = sum;                     // dedicated scratch: probs[] holds E values exactly,
+  barrier();                             // a tail write here smashed claimed[] (VK4 regression)
+  for (uint s = 64u; s >= 1u; s >>= 1u) {
+    if (lane < s) { sum_s[lane] += sum_s[lane + s]; }
+    barrier();
+  }
+  sum = sum_s[0];
+  barrier();
+
+  for (uint j = lane; j < p.e; j += 128u) {
+    float pj = probs[j];
+    pj = sum > 0.0 ? pj / sum : 0.0;
+    probs[j] = (pj == pj && pj - pj == 0.0) ? pj : 0.0;   // NaN/Inf clamp (.cu:136); no f32 isfinite builtin in this glslang
+    claimed[j] = 0u;
+  }
+  barrier();
+
+  // 2. k greedy rounds; strict > over ascending lanes -> lowest index wins
+  //    (cpu_ops.cpp:2707-2717). Block-wide argmax per round via shared reduce
+  //    carrying (value, index) pairs.
+  float denom = 0.0;
+  for (uint round = 0u; round < p.k; ++round) {
+    // per-lane best over its strided slice
+    float bv = -1.0 / 0.0;
+    uint bi = 0xffffffffu;
+    for (uint j = lane; j < p.e; j += 128u) {
+      if (claimed[j] == 0u && probs[j] > bv) { bv = probs[j]; bi = j; }
+    }
+    // block argmax with lowest-index tie-break: compare (v, i) pairs.
+    bv_s[lane] = bv;
+    bi_s[lane] = bi;
+    barrier();
+    for (uint s = 64u; s >= 1u; s >>= 1u) {
+      if (lane < s) {
+        float ov = bv_s[lane + s];
+        uint oi = bi_s[lane + s];
+        // strictly greater wins; equal values keep the LOWER index already held
+        if (ov > bv_s[lane] || (ov == bv_s[lane] && oi < bi_s[lane])) {
+          bv_s[lane] = ov;
+          bi_s[lane] = oi;
+        }
+      }
+      barrier();
+    }
+    if (lane == 0u) {
+      uint best = bi_s[0];
+      claimed[best] = 1u;
+      W32.v[row * p.k + round] = floatBitsToUint(bv_s[0]);
+      I32.v[row * p.k + round] = best;
+      sum_s[0] = bv_s[0];   // publish the round's prob; denom below is read by ALL lanes,
+    }                        // and a lane-local accumulator would stay 0 off lane 0.
+    barrier();
+    denom += sum_s[0];
+    barrier();
+  }
+
+  // 3. renormalize, cpu_ops.cpp:2718-2721 (denom<=0 -> 1 guard).
+  if (VT_MR_RENORM == 1u && lane < p.k) {
+    float d = denom > 0.0 ? denom : 1.0;
+    uint off = row * p.k + lane;
+    W32.v[off] = floatBitsToUint(uintBitsToFloat(W32.v[off]) / d);
+  }
+}

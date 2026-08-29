@@ -1,0 +1,135 @@
+#version 450
+// vt_matmul_bt_tq1_0: keep-quant matmul for TQ1_0 weights against Q8_K
+// activations (maple ternary experts), M>=1 (decode AND prefill).
+// BACKEND-VULKAN-KEEPQUANT.
+//
+// Same structure as vt_matmul_bt_tq2 but for TQ1_0 ternary weights.
+// TQ1_0 block: { u8 qs[48]; u8 qh[4]; f16 d; } = 54 bytes per 256 elements.
+// Trit extraction: q = byte * pow3[l] (uint8 wrap); xi = (q * 3) >> 8; w = (xi-1)*d
+// Element layout:
+//   [0,160):  qs[m], trit l, m = e%32, l = e/32 (5 trits × 32 elements)
+//   [160,240): qs[32+m], trit l, m = (e-160)%16, l = (e-160)/16 (5 trits × 16 elements)
+//   [240,256): qh[j], trit l, j = (e-240)%4, l = (e-240)/4 (4 trits × 4 elements)
+
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+  uint n;       // output columns (weight rows)
+  uint m;       // output rows (tokens)
+  uint nb;      // K/256 blocks per row
+  uint a_off;   // byte offset of activation tensor start (device)
+  uint w_off;   // byte offset of weight tensor start (device)
+  uint out_off;  // byte offset of output tensor start (device)
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer Ab32 { uint v[]; } A32;
+layout(set = 0, binding = 1, std430) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(set = 0, binding = 2, std430) readonly buffer Wb32 { uint v[]; } W32;
+layout(set = 0, binding = 3, std430) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(set = 0, binding = 4, std430) writeonly buffer Ob32 { uint v[]; } O32;
+layout(set = 0, binding = 5, std430) writeonly buffer Ob16 { uint16_t v[]; } O16;
+
+layout(constant_id = 0) const uint VT_TQ_OUT_DT = 0u;
+
+shared float tq_part[128];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint col = gl_WorkGroupID.x;
+  if (col >= p.n) { return; }
+
+  const uint abytes = 292u;
+  const uint wbytes = 54u;
+
+  const uint w_row = p.w_off + col * p.nb * wbytes;
+
+  for (uint row = 0u; row < p.m; ++row) {
+    const uint a_row = p.a_off + row * p.nb * abytes;
+    float acc = 0.0;
+    for (uint b = tid; b < p.nb; b += 128u) {
+      uint aoff = a_row + b * abytes;
+      uint woff = w_row + b * wbytes;
+
+      float ad = intBitsToFloat(int(A32.v[aoff >> 2]));
+      float wd = vt_from16(W16.v[(woff + 52u) >> 1], VT_DT_F16);
+      float blockd = ad * wd;
+
+      int acci = 0;
+      // qs[0..31]: 5 trits × 32 elements = 160 elements (indices 0..159)
+      for (uint l = 0u; l < 5u; ++l) {
+        for (uint m = 0u; m < 32u; ++m) {
+          uint wb_byte = woff + m;
+          uint w16 = W16.v[wb_byte >> 1];
+          uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
+          uint qq = (wb * p3) & 0xFFu;
+          uint xi = (qq * 3u) >> 8u;
+          int ternary = int(xi) - 1;
+          uint ae = l * 32u + m;
+          uint ab = aoff + 4u + ae;
+          uint a32 = A32.v[(ab >> 2)];
+          uint a_byte = (ab & 3u);
+          uint sh = a_byte * 8u;
+          uint avu = (a32 >> sh) & 0xFFu;
+          int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
+          acci += av * ternary;
+        }
+      }
+      // qs[32..47]: 5 trits × 16 elements = 80 elements (indices 160..239)
+      for (uint l = 0u; l < 5u; ++l) {
+        for (uint m = 0u; m < 16u; ++m) {
+          uint wb_byte = woff + 32u + m;
+          uint w16 = W16.v[wb_byte >> 1];
+          uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
+          uint qq = (wb * p3) & 0xFFu;
+          uint xi = (qq * 3u) >> 8u;
+          int ternary = int(xi) - 1;
+          uint ae = 160u + l * 16u + m;
+          uint ab = aoff + 4u + ae;
+          uint a32 = A32.v[(ab >> 2)];
+          uint a_byte = (ab & 3u);
+          uint sh = a_byte * 8u;
+          uint avu = (a32 >> sh) & 0xFFu;
+          int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
+          acci += av * ternary;
+        }
+      }
+      // qh[0..3]: 4 trits × 4 elements = 16 elements (indices 240..255)
+      for (uint l = 0u; l < 4u; ++l) {
+        for (uint j = 0u; j < 4u; ++j) {
+          uint wb_byte = woff + 48u + j;
+          uint w16 = W16.v[wb_byte >> 1];
+          uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
+          uint qq = (wb * p3) & 0xFFu;
+          uint xi = (qq * 3u) >> 8u;
+          int ternary = int(xi) - 1;
+          uint ae = 240u + l * 4u + j;
+          uint ab = aoff + 4u + ae;
+          uint a32 = A32.v[(ab >> 2)];
+          uint a_byte = (ab & 3u);
+          uint sh = a_byte * 8u;
+          uint avu = (a32 >> sh) & 0xFFu;
+          int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
+          acci += av * ternary;
+        }
+      }
+      acc += float(acci) * blockd;
+    }
+
+    tq_part[tid] = acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (tid < s) tq_part[tid] += tq_part[tid + s];
+      barrier();
+    }
+    if (tid == 0u) {
+      VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, tq_part[0]);
+    }
+    barrier();
+  }
+}

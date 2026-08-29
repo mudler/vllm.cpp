@@ -1932,6 +1932,135 @@ upstream and restoring the recorded measurement are the same edit. AGENTS.md
 "Inherit vLLM defaults" decides it either way: f32 is the default and the wider
 value would have been the annotated exception, unannotated.
 
+## Mutation record — W5d-2 (#2249 item 5)
+
+The interleaved-mRoPE cos|sin table builder, `BuildMropeCosSinHost`. It was
+`static` at `src/vllm/model_executor/models/qwen3_5.cpp:9472`, so the tables
+Qwen4-Exp's QSA half of the layer loop needs could not be built from another
+translation unit and the QSA block would have had to grow a second copy of the
+axis selection and the angle math.
+
+**WHICH SHAPE, AND WHY THE SIMPLER ONE.** `RunGdnBlockPaged` (W5b-1) and
+`RunMoeBlock` both needed a thin PUBLIC WRAPPER over a private definition,
+because their signatures name types qwen3_5.cpp declares privately
+(`StepDevInputs`). This one names nothing private — `std::vector<int32_t>`,
+`int64_t`, `vllm::HfConfig` — so the extraction is the `static` keyword and a
+declaration in `include/vllm/model_executor/models/qwen3_5_mrope.h`. The
+definition does not move and there is exactly ONE implementation: qwen3_5.cpp's
+own two call sites now resolve through the same public declaration qwen4_exp
+will use, which is what `AGENTS.md` `## Shared seams` requires and what a
+copied second table builder would have broken.
+
+**BYTE IDENTITY, TWICE.** First textually: `git show
+94de63ff5:src/vllm/model_executor/models/qwen3_5.cpp | sed -n '9473,9514p'`
+sha256s to `259b1b932cae0611ca6dbde4ad63214e0d1365efe3b708b8ef7d38a7894688f1`,
+and so does the body on this branch — the whole diff to that function is the
+`static` keyword and two comment lines. Second by VALUE, because the keyword
+that changed is exactly the one that decides which definition a caller binds
+to: `tests/vllm/models/test_qwen3_5_mrope.cpp` pins 152 f32 BIT PATTERNS across
+four cases against what the FILE-STATIC produced at base SHA `94de63ff5`,
+captured by compiling its `sed`-extracted text in a standalone harness. The
+comparison is bitwise and not an epsilon — this is a pure host computation over
+`std::cos`/`std::pow` with no reduction-order freedom, so a tolerance would hide
+the one defect an extraction can introduce.
+
+**Counts, before and after, on the same tree.** 26 pre-existing qwen3_5 /
+qwen4_exp suites built and run at base and at head, identical exit status and
+identical case and assertion counts on every one (`diff` of the two count files
+is empty). The new suite adds 4 cases / 157 assertions. The population is every
+`vllm_cpp_add_test` target in `tests/CMakeLists.txt` whose name matches
+`qwen3_5`, `qwen35` or `qwen4_exp`, less the benchmark
+`bench_qwen3_5_vl_tower` and less this wave's own `test_qwen3_5_mrope`.
+
+**WHICH TREE THAT 26 WAS COUNTED ON, because merging `main` moved it.** The
+count is base `94de63ff5` against branch head `c1ccbac19`, both of which
+predate the merge of `main` in this branch. That merge brings in W5b's
+`test_qwen4_exp_forward` ([#2031](https://github.com/mudler/vllm.cpp/issues/2031),
+landed on `main` as `a6f933b81`'s neighbour), which makes the same glob match 27
+targets on the merged tree. It is NOT a 27th row of this neutrality
+measurement and cannot be: it existed at neither end of the before/after pair,
+so it has no before. It is `main`'s own gate for `main`'s own wave. The 26 is
+therefore a statement about the two trees named here and not about the merged
+head, which is the distinction this section previously left for a reader to
+make.
+
+**FOUR of the 26 measure NOTHING on this host, and only one of them says so.**
+An earlier revision of this section said "23 suites, two of which do not
+measure". Both halves were wrong. Re-measured on this CPU-only host at this
+head:
+
+| suite | rc | cases | assertions | why it measures nothing |
+|---|---|---|---|---|
+| `test_qwen35_paged_engine` | 77 | — | — | prints `*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***`; the Qwen3.5-0.8B snapshot at revision `2fc06364` is not cached here. **This is the one that is honest about itself** |
+| `test_qwen35_gguf_spec_decode` | 0 | 3 | **0** | `SKIP: set VLLM_MTP_GGUF_MODEL` |
+| `test_qwen3_5_vl_e2e` | 0 | 1 | **0** | `SKIP: Qwen3.6-27B checkpoint absent (set VLLM_QWEN36_CKPT)` |
+| `test_qwen3_5_vl_video_e2e` | 0 | 1 | **0** | the same skip |
+
+The last three exit 0 and print `[doctest] Status: SUCCESS!`. That is a skip
+wearing a pass, and a count-diff over a population containing them is neutral by
+construction on those three rows, so they carry no neutrality evidence at all.
+They are listed so that a reader does not read 26 green suites as 26
+measurements.
+
+**AND THIS BOUNDS THE M3 REACHABILITY EVIDENCE, WHICH IS THE PART THAT MATTERS.**
+`test_qwen3_5_vl_e2e` and `test_qwen3_5_vl_video_e2e` are the STRICT token-exact
+end-to-end gates on `VLGenerateCoreGdn`, the shared driver core holding the two
+production call sites M3 deletes. On a host that has the Qwen3.6-27B checkpoint
+they would be the strongest witnesses M3 has. Here they measure nothing, so the
+M3 red rests ENTIRELY on `test_qwen3_5_moe_vision` (7 cases / 38 assertions),
+whose `qwen3_5_moe_vl_image_forward_uses_MRoPE_positions_not_plain_1d` is the
+single case that goes red. One case, one assertion, is the whole reachability
+proof on this host. `test_qwen3_5_moe_vision_hw` does not extend it either: it
+measures 3 cases / 23 assertions but its own e2e case skips on
+`VLLM_MOE_VISION_E2E`. This is a HOST condition and not a defect in the
+mutation — it is stated because a reader on a GPU host with the checkpoint gets
+strictly more evidence than this run produced, and a reader without it gets
+exactly one assertion.
+
+**Upstream.** No divergence found. The interleaved axis masks mirror
+`vllm/model_executor/layers/rotary_embedding/mrope.py:60-63` at the parity pin
+`5559679229` (`h_mask = ((cos_offsets % 3) == 1) & (cos_offsets <= 3 *
+mrope_section_h)`, and the `w` twin), `apply_interleaved_rope` (`:190-198`)
+states the same layout as a tensor rewrite, and the chunked branch mirrors the
+same function's `else` arm (`:66-70`). The per-pair frequency is
+`base ** (-2 * pair / rotary_dim)`, which is `RotaryEmbeddingBase`'s inv_freq.
+
+| # | mutation | build rc | target | result |
+|---|---|---|---|---|
+| M1 | swap the cos and sin stores for the `h` axis (`axis == 1`) inside the extracted function | 0 | `test_qwen3_5_mrope` | **RED, 4 of 4 cases, 42 of 157 assertions.** The first failures are index 1 and index 9 of C1 trading values, which is the swap seen directly |
+| M2 | change the position offset by one (`positions3[axis * T + i] + 1`) | 0 | `test_qwen3_5_mrope` | **RED, 4 of 4 cases, 141 of 157 assertions.** The 16 survivors are the pairs whose frequency is small enough that the f32 store absorbs one position |
+| M2b | `pair <= 3 * sec[1]` -> `pair < 3 * sec[1]`, the upstream `<=` | 0 | `test_qwen3_5_mrope` | **GREEN — an EQUIVALENT MUTANT, and provably so.** The two forms differ only at `pair == 3 * sec[1]`, and the guard already requires `pair % 3 == 1` while `3 * sec[1]` is divisible by 3, so no input separates them. Upstream's `<=` and a `<` are the same function here. Recorded rather than replaced by a stronger case, because the next reader will reach for this mutation too |
+| M2c | shift the same boundary instead: `pair <= 3 * sec[1] + 1` | 0 | `test_qwen3_5_mrope` | **RED, 2 of 4 cases, 8 assertions.** This is the section boundary actually under gate: on C1 (`sec = {4,2,2}`, half 8) pair 7 flips from the `t` axis to the `h` axis |
+| M2d | the SAME shift on clause TWO, the `w` axis: `pair % 3 == 2 && pair <= 3 * sec[2]` -> `... + 2`. `+2` and not `+1`, because `3 * sec[2]` is divisible by 3 and the clause already requires `pair % 3 == 2`, so `+1` would be a second equivalent mutant for exactly M2b's reason | 0 | `test_qwen3_5_mrope` | **RED, 1 of 4 cases, 2 of 157 assertions.** Added on review repair, because M2b's green is only honest if the OTHER clause's reachable boundary is shown to red too — otherwise a reader cannot tell an equivalent mutant from an ungated one. Pristine `qwen3_5.cpp` sha256 `0b4517b3246e6e49fd8b0fa3a8ad7adc5c39b2846a4800966733688fb0d8d9fe` before, `c00f7a461b65a3260ea255b30bc03864bd7ad53cfb9379905cc41fe38b10ff8f` under the mutation, and back to `0b4517b3…` on restore; BUILD RC 0 read before the test result on both legs; re-run green 4 of 4 cases / 157 of 157 assertions, and `test_qwen3_5_moe_vision` 7 of 7 / 38 of 38 |
+| M3 | REACHABILITY: delete both production call sites in `qwen3_5.cpp` (`VLGenerateCoreGdn`'s prefill build and its decode-continuation build) and pass `nullptr` for the cache | 0, after a `(void)` for `-Werror=unused-parameter` | `test_qwen3_5_moe_vision`, `test_qwen3_5_mrope` | **`test_qwen3_5_moe_vision` RED on exactly `qwen3_5_moe_vl_image_forward_uses_MRoPE_positions_not_plain_1d` (1 of 7 cases, 1 of 38 assertions)** — the VL greedy driver reaches the extracted function and a test enters through the driver. It is NOT a production entry point; see the paragraph below. **`test_qwen3_5_mrope` stays GREEN, and it must:** it is a unit and seam case that calls the function directly, so it measures the function and never that anything reaches it. Stated here rather than left to be inferred |
+
+**WHAT M3 DOES NOT PROVE, MEASURED RATHER THAN ASSUMED.** The chain M3 reds
+stops one hop short of a production entry point, and this wave did not create
+that and does not close it. `grep -rn 'Qwen3_5MoeVLGenerateGreedy|Qwen3_5VLGenerateGreedy'`
+over `src/ include/ examples/ tools/ benchmarks/` returns the four DEFINITIONS
+in `src/vllm/model_executor/models/qwen3_5.cpp:9892,9915,9960,9974` and their
+six declaration lines in `qwen3_5.h` / `qwen3_5_dense.h` — and NOTHING else.
+Every CALLER is in `tests/`. The registered factories for
+`Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`
+carry no multimodal hook, so `ModelRegistry::Forward` cannot arrive here, and
+`include/vllm/entrypoints/openai/chat_mm.h:266-267` already says so in the tree's
+own words for the sibling Qwen3-VL driver: the greedy VL drivers run "outside
+`ModelRegistry::Forward`". So `BuildMropeCosSinHost` is reached by a public,
+gated, non-test caller, and that caller is not yet routed from
+`include/vllm.h`, the loader, `ModelRegistry::Forward` or a server path. The
+extraction changes nothing about that either way — the function had exactly this
+reach before the `static` came off — and it is recorded under `## Owed` rather
+than left for a reader to discover, because `AGENTS.md` `## Nothing lands dead`
+asks the question at every merge and silence is not an exception.
+
+Every mutation was applied to a pristine `qwen3_5.cpp`, sha256-proven applied,
+rebuilt with the BUILD RC read BEFORE any test result, run, then restored from a
+byte-identical copy and re-proven at
+`0b4517b3246e6e49fd8b0fa3a8ad7adc5c39b2846a4800966733688fb0d8d9fe`, rebuilt and
+re-run green. M3's first attempt did NOT build — deleting the call leaves
+`pos3_prefill` unused under `-Werror=unused-parameter` — which is the W5b-1
+mutation-B trap again and the reason the build rc column is in this table.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -2088,6 +2217,49 @@ is listed under `## Owed`.
 
 ## Owed
 
+- **W5d-2 (#2249 item 5): the mRoPE seam is REACHED, but only by a caller that
+  is not itself routed from a production entry point.** `BuildMropeCosSinHost`
+  now has external linkage behind
+  `include/vllm/model_executor/models/qwen3_5_mrope.h`, and `qwen3_5.cpp`'s two
+  production call sites resolve through that declaration — deleting them reds
+  `test_qwen3_5_moe_vision`'s
+  `qwen3_5_moe_vl_image_forward_uses_MRoPE_positions_not_plain_1d`. The hop above
+  is the gap: `Qwen3_5VLGenerateGreedy`, `Qwen3_5VLGenerateGreedyVideo`,
+  `Qwen3_5MoeVLGenerateGreedy` and `Qwen3_5MoeVLGenerateGreedyVideo` are DEFINED
+  in `src/vllm/model_executor/models/qwen3_5.cpp:9892,9915,9960,9974` and declared
+  in `qwen3_5.h` / `qwen3_5_dense.h`, and a tree-wide grep over
+  `src/ include/ examples/ tools/ benchmarks/` finds no other occurrence — every
+  CALLER is in `tests/`. The registered factories for
+  `Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`
+  carry no multimodal hook, so `ModelRegistry::Forward` cannot arrive; the tree
+  says so for the sibling driver at
+  `include/vllm/entrypoints/openai/chat_mm.h:266-267`. This condition PREDATES
+  the extraction and the extraction does not change it in either direction, but
+  it is named here because `## Nothing lands dead` asks the question at every
+  merge. TWO owners, because there are two ways to close it, and
+  `.agents/reachability.md` asks for a row ID and an issue for each rather than
+  a description:
+
+  1. **The qwen4_exp call.** The qwen4_exp layer loop will call this seam from a
+     path that IS routed through `ModelRegistry::Forward`. Row
+     `MODEL-MM-QWEN4-EXP`, W5b under
+     [#2031](https://github.com/mudler/vllm.cpp/issues/2031); the extraction
+     itself is this row's and is tracked by
+     [#2249](https://github.com/mudler/vllm.cpp/issues/2249).
+  2. **Request routing to the VL drivers.** Getting an image or video request
+     from the registered forward to `Qwen3_5VLGenerateGreedy` and its three
+     siblings is an ENGINE seam and not this model port's. Row
+     **`ENG-MM-QWEN36-VL-FORWARD`** (`.agents/engine-matrix.md`, state
+     `ACTIVE`), which already owns `BuildMropeCosSinHost`, the shared
+     `VLGenerateCoreGdn` and the two Qwen3.6-27B dense drivers; the two MoE
+     drivers additionally sit under row
+     `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` and
+     [#891](https://github.com/mudler/vllm.cpp/issues/891). Tracked by
+     [#2257](https://github.com/mudler/vllm.cpp/issues/2257), filed while
+     landing this wave because nothing tracked it before: the gap is real, it
+     predates the extraction, and it had no issue of its own. An earlier
+     revision of this entry named this owner only as "the mm-forward row",
+     which is a description and not a record.
 - **W5b-4 (#2167) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`
   (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels
@@ -3089,6 +3261,7 @@ and the ninth, W5a, is the only one with a production call site:
 | W5b-4 | Qwen Sparse Attention as two `vt::` ops, plus the unmapped-tail probe | [#2167](https://github.com/mudler/vllm.cpp/issues/2167) |
 | W5b-5 | `Qwen4ExpTextAttention` as ONE block, and the indexer composition in `src/` | [#2211](https://github.com/mudler/vllm.cpp/issues/2211) |
 | W5c-1 | the KV-cache spec: THREE groups, REACHED through `make_kv_cache` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
+| W5d-2 | `BuildMropeCosSinHost` loses `static`: ONE mRoPE table builder, cross-TU | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
@@ -3166,7 +3339,13 @@ though the PLE block's grouped RMS norm still is, which the sentence this
 replaces overstated into a claim about the whole architecture.
 What has no production shape yet is the PLE block, the GDN and MoE weight
 adapters onto `GdnLayerWeights` / `MoeBlockWeights`, the hyper-connection stream
-through the per-layer loop, the mRoPE cos/sin table build, and the loop itself.
+through the per-layer loop, and the loop itself. The mRoPE cos/sin table build
+is no longer on that list as a SEAM — W5d-2
+([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 5) gave
+`BuildMropeCosSinHost` external linkage behind
+`include/vllm/model_executor/models/qwen3_5_mrope.h`, so the QSA half builds the
+SAME tables the Qwen3.5/3.6 VL drivers build rather than a second copy — but the
+loop still has to CALL it, and that call is W5b's.
 The trap this paragraph used to warn about is FIXED, not pending: the loader
 stores every gamma in the RAW HuggingFace parameterization and
 `vt::Qwen4ExpGatedResidual` used to want the opposite, so a layer loop handing it

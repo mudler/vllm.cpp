@@ -26,10 +26,18 @@ as did the **W3 leftovers** (the two missing d2h `fetch_add`s and the
 scoped `conv_transposed` refusal; #2201 via #2217, `a456e6eaf`), with
 the suite at 44 cases / 4340 assertions. The `docs/USAGE.md` weights
 entry is complete (file, bytes, repo @ revision, sha256, refused arms).
-Owed next: **W5** — the W4 record's named next lever: a per-slot
-persistent device buffer written through the mesh command queue
-([#2244](https://github.com/mudler/vllm.cpp/issues/2244); the
-tt-metal-internal half of W4's lever 2).
+**W5** (the per-slot persistent buffer written through the mesh command
+queue, [#2244](https://github.com/mudler/vllm.cpp/issues/2244)) landed
+2026-08-29: allocation-free uploads proven (residual allocation 0.02% of
+the profile; suite 45 cases / 5062 assertions; sacred pair byte-identical)
+and the wall HONESTLY UNMOVED — the A/B trace split the W4 hypothesis:
+per-upload allocation was never the wall; the wall is the per-CQ-operation
+tt-metal stack (context queries, `Cluster::get_chip`, `read_cq_host_ptr`
+polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
+staging** (one CQ write per step divides the per-op tax by the fan-in;
+inside our file set), with the tt-metal-side residual (cached context
+handles, amortized CQ polling) recorded as the upstream-shaped
+alternative.
 
 ## Scope
 
@@ -321,6 +329,24 @@ mutex, `TT_METAL_HOME=/home/lu_zero/Sources/tt/tt-metal` (pinned tree), build
 summary was the known #1486 teardown; fixed 2026-08-27 by never destroying the
 static tensor caches — expect exit 0. Evidence entries below that predate the
 fix quote 139 as green.
+
+### W5 — allocation-free staging: the wall did not move, and the trace says why
+
+`dc473a94c` (#2244): per-slot persistent device buffer, in-place CQ writes
+via `ttnn::copy_to_device`; red-first implementer, fresh reviewer PASS (8
+mutations incl. reachability; full gate rerun on the immutable head).
+Same-method interleaved A/B on one lock hold (identical 3-token leg,
+JIT-discard per arm, `perf record -F 199 -g` per measured leg):
+19.154 s vs 19.181 s mean — −0.14%, noise. The trace splits the W4
+hypothesis: `allocate_mesh_tensor_on_device_with_topology` is 0.02% of the
+AFTER profile and the write stacks are identical in both arms, so the
+per-upload allocation was never the wall; the wall is the per-CQ-operation
+tt-metal stack (`MetalContext::instance` 11.14%, `Cluster::get_chip` 5.90%,
+`read_cq_host_ptr` 5.27%+ sub-slices) plus `Threadpool::PollForWork`
+14.29%. Reported result, not a failure — the next lever is W6 (batch
+per-layer staging, our file set); the tt-metal-side residual is recorded
+beside it. Full log:
+[tt-qwen35-eager-profile-w5-20260829.log](../../docs/bench-evidence/tt-qwen35-eager-profile-w5-20260829.log).
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 

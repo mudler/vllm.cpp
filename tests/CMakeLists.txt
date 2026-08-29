@@ -3322,6 +3322,15 @@ target_include_directories(test_qwen4_exp_qsa_block PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_qwen4_exp_hc_device vllm/models/test_qwen4_exp_hc_device.cpp)
 target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5b (#2031) -- the assembled layer loop, and the
+# loader/op compositions no single-sided suite can see. Needs `src/` for the
+# model-private qwen4_exp headers. It takes NO checkpoint fixture dir: the suite
+# builds its `qwen4exp` file in memory through
+# `tests/support/qwen4_exp_gguf_fixture.h` and parses no released config, so a
+# `QWEN4_EXP_CKPT_FIXTURE_DIR` grant here would compile a path nothing reads.
+vllm_cpp_add_test(test_qwen4_exp_forward vllm/models/test_qwen4_exp_forward.cpp)
+target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
@@ -3360,3 +3369,11 @@ target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_ple_device vllm/models/test_qwen4_exp_ple_device.cpp)
 target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5d-2 (#2249 item 5) — behaviour-neutrality gate for giving
+# `BuildMropeCosSinHost` external linkage. Pins the interleaved and chunked
+# mRoPE cos|sin tables BITWISE against the values the file-static definition
+# produced at base SHA 94de63ff5, and is itself the seam case: a FOREIGN
+# translation unit reaching the definition only through the new public header.
+# No src/ grant — the whole point is that the header is public.
+vllm_cpp_add_test(test_qwen3_5_mrope vllm/models/test_qwen3_5_mrope.cpp)

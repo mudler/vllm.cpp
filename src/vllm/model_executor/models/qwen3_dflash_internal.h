@@ -216,19 +216,39 @@ inline DflashBlockPagedInputs DflashBlockPagedInputsOf(int64_t ctx_len, int64_t 
 // so a non-captured run cannot see it; under capture the engine dies with
 // "operation not permitted when stream is capturing" (#2252).
 //
-// One request, so the query_start_loc is exactly [0, tq). `max_seq_len` is the
-// EXTENDED bound `ctx_len + tq`, the same value `DflashBlockPagedInputsOf`
-// derives and this call already refuses on if it disagrees; an upper bound is
-// explicitly safe because it only sizes grids (`ops.h:1551-1553`).
+// One request, so the query_start_loc is exactly [0, tq); `tq` is `1 + k`, a
+// constant for the life of the graph.
+//
+// `max_seq_len` MUST BE THE POOL CAPACITY, NOT `ctx_len + tq`. This call is
+// captured into a CUDA graph ONCE and replayed on every later draft step, and
+// `MakeDeviceKVStore` states the invariant that makes that legal: the
+// persistent buffers never move, so "a captured graph reads the growing context
+// purely through the in-place `seq_lens` value". A HOST value derived from the
+// current `ctx_len` is baked into the graph at capture and is then STALE on
+// every replay, because the context has grown -- which is an illegal memory
+// access inside `cudaGraphLaunch`, not a wrong number.
+//
+// MEASURED, 2026-08-29, three arms on one boot at the smallest workload
+// (`max_num_seqs=1`, c=1, 64 tokens): with `ctx_len + tq` the engine aborted
+// 134 at `cudaMemcpyAsync`, and under `CUDA_LAUNCH_BLOCKING=1` at
+// `cudaGraphLaunch`, naming the replay; with `VT_DFLASH_PAGED=0`, which
+// bypasses this route entirely, the same binary exited 0.
+//
+// The capacity is replay-stable and is a valid bound: the store refuses a
+// request whose `ctx_len + append + (1+k)` would exceed it
+// (`runner.cpp`, the ctx-capacity fallback), so the read never addresses past
+// it. An upper bound is explicitly safe here because it only sizes grids and
+// rounded dims, while per-request geometry stays on the DEVICE values
+// (`ops.h:1551-1553`).
 struct DflashBlockPagedHostMeta {
   std::array<int32_t, 2> qsl{};  // [0, tq) for the block's single request
   int32_t max_seq_len = 0;       // ctx_len + tq
 };
 
-inline DflashBlockPagedHostMeta DflashBlockPagedHostMetaOf(int64_t ctx_len, int64_t tq) {
+inline DflashBlockPagedHostMeta DflashBlockPagedHostMetaOf(int64_t pool_capacity, int64_t tq) {
   DflashBlockPagedHostMeta m;
   m.qsl = {0, static_cast<int32_t>(tq)};
-  m.max_seq_len = static_cast<int32_t>(ctx_len + tq);
+  m.max_seq_len = static_cast<int32_t>(pool_capacity);
   return m;
 }
 
@@ -341,8 +361,12 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
   vt::ReshapeAndCache(q, block_k, block_v, pool_k, pool_v, slot_map);
   // #2252: `host_meta` outlives the call below, which is all it must do -- the
   // launcher reads the qsl on the host to size its grid before it launches.
+  // The POOL's capacity (pages x page rows), not this step's context length --
+  // see the note on `DflashBlockPagedHostMetaOf`: a per-step value baked into a
+  // replayed graph reads out of bounds.
+  const int64_t pool_capacity = pool_k.shape[0] * pool_k.shape[1];
   const DflashBlockPagedHostMeta host_meta =
-      DflashBlockPagedHostMetaOf(ctx_len, query.shape[0]);
+      DflashBlockPagedHostMetaOf(pool_capacity, query.shape[0]);
   const vt::PagedAttentionArgs pa =
       DflashBlockPagedArgsOf(scale, causal, sliding_window, query.shape[0], host_meta);
   vt::PagedAttention(q, out, query, pool_k, pool_v, block_table, seq_ext, cu, pa);

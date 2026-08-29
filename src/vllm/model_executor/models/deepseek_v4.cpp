@@ -353,9 +353,10 @@ std::vector<float> DispSoftmaxSink(const V4Backend& be, const std::vector<float>
   if (be.device) return deepseek_v4::DsaDevice()->softmax_sink(*be.q, scores, sink);
   return SoftmaxWithSink(scores, sink);
 }
+// W1d (#2186): `wo_a`/`wo_b` are the carried tower's bf16, on both arms.
 std::vector<float> DispGroupedOLora(const V4Backend& be, const std::vector<float>& o,
-                                    const std::vector<float>& wo_a,
-                                    const std::vector<float>& wo_b, int64_t T, int64_t nh,
+                                    const HostBf16& wo_a,
+                                    const HostBf16& wo_b, int64_t T, int64_t nh,
                                     int64_t hd, int64_t ng, int64_t olr, int64_t H) {
   if (be.device) return deepseek_v4::DsaDevice()->grouped_olora(*be.q, o, wo_a, wo_b, T, nh, hd, ng, olr, H);
   return deepseek_v4::GroupedOutputLora(o, wo_a, wo_b, T, nh, hd, ng, olr, H);
@@ -406,10 +407,25 @@ float Dot(const float* a, const float* b, int64_t n) {
   for (int64_t i = 0; i < n; ++i) acc += a[i] * b[i];
   return acc;
 }
+// W1d (#2186): the BF16 arm of the same dot product, for the carried tower's
+// FP8-sourced half now held at the model dtype (`HostBf16`). Each weight element
+// is widened AS IT IS READ. This is not a per-call widening of the tensor --
+// nothing is materialized, and the loop moves HALF the bytes the f32 arm moves --
+// it is what reading a bf16 weight in place means. The accumulator stays f32, so
+// the reduction order and its precision are unchanged from the f32 arm; the ONLY
+// numerical difference is that each weight now carries bf16's 8 mantissa bits,
+// which is the dtype the checkpoint's FP8 storage already sat below.
+float Dot(const uint16_t* a, const float* b, int64_t n) {
+  float acc = 0.0f;
+  for (int64_t i = 0; i < n; ++i) acc += HostBf16ToF32(a[i]) * b[i];
+  return acc;
+}
 
 // y[o] = Σ_i W[o*in + i] * x[i]  (W is [out, in] row-major).
-std::vector<float> MatVec(const std::vector<float>& w, const float* x, int64_t out,
-                          int64_t in) {
+// `W` is `std::vector<float>` or `HostBf16`; `Dot` overloads on the element type,
+// so the bf16 carried tower and the f32 remainder share one body (W1d, #2186).
+template <typename W>
+std::vector<float> MatVec(const W& w, const float* x, int64_t out, int64_t in) {
   VT_CHECK(static_cast<int64_t>(w.size()) == out * in, "MatVec weight size mismatch");
   std::vector<float> y(static_cast<size_t>(out));
   for (int64_t o = 0; o < out; ++o) y[static_cast<size_t>(o)] = Dot(&w[o * in], x, in);
@@ -425,8 +441,19 @@ std::vector<float> MatVec(const std::vector<float>& w, const float* x, int64_t o
 // source) it falls back to the per-row f32 MatVec — BIT-IDENTICAL to the pre-W2C
 // host composition. Grounded in qwen3_5.cpp:786-838 (host MatmulBT off an
 // OwnedTensor.View()) + vt/ops.cpp:134-171 (block-quant dispatch).
+// The keep-quant `Gemm` arm consumes `wq`'s OwnedTensor and never reads the host
+// vector, so several call sites have no host weights at all. They used to pass a
+// braced `{}`; a template cannot deduce its type from that, and naming the empty
+// says at the call site which arm is meant (W1d, #2186).
+const std::vector<float> kNoHostWeights;
+
+// `W` is `std::vector<float>` or `HostBf16` (W1d, #2186). Only the HOST-fallback
+// tail below reads it: the keep-quant arm consumes `wq`'s OwnedTensor and never
+// touches the host vector at all, so the carried tower's dtype does not reach the
+// device GEMM path.
+template <typename W>
 std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
-                        const std::vector<float>& wf32, const std::vector<float>& x,
+                        const W& wf32, const std::vector<float>& x,
                         int64_t T, int64_t N, int64_t K, bool defer_sync = false) {
   if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
     VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
@@ -541,7 +568,7 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
     for (int64_t t = 0; t < T; ++t)
       for (int64_t d = 0; d < olr; ++d)
         z[t * z_dim + g * olr + d] = zg[static_cast<size_t>(g)][t * olr + d];
-  return Gemm(be, &wo_b, /*wf32=*/{}, z, T, H, z_dim);  // [T,H] (final; drains normally)
+  return Gemm(be, &wo_b, /*wf32=*/kNoHostWeights, z, T, H, z_dim);  // [T,H] (final; drains normally)
 }
 
 // Grouped keep-quant expert GEMM (re-scoped Stage 2): out[P,N] where
@@ -1294,7 +1321,11 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   }
 
   // one clamped-SwiGLU expert on the f32 host tower: w1/w3 [mi,H], w2 [H,mi].
-  const auto expert_f32 = [&](const float* w1, const float* w3, const float* w2,
+  // W1d (#2186): generic in the weight dtype, because this ONE lambda serves both
+  // the SHARED experts (carried tower, now bf16) and the ROUTED experts (still
+  // f32). `Dot` overloads on the element type and widens as it reads, so both
+  // instantiations share this body and the reduction order is identical.
+  const auto expert_f32 = [&](const auto* w1, const auto* w3, const auto* w2,
                               const float* xin) -> std::vector<float> {
     std::vector<float> gate_up(static_cast<size_t>(2) * mi);
     for (int64_t r = 0; r < mi; ++r) {
@@ -1368,8 +1399,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 1: gate + up. Shared expert stays a per-expert Gemm; the topk routed
       // experts collapse into ONE grouped kMatmulBTQuantGrouped launch each when
       // grouped_moe (else the Stage-2 per-expert GemmRowSlice batch).
-      g[0] = Gemm(be, &Lq->shared_gate, {}, x1, 1, mi, H, /*defer_sync=*/true);
-      u[0] = Gemm(be, &Lq->shared_up, {}, x1, 1, mi, H, /*defer_sync=*/true);
+      g[0] = Gemm(be, &Lq->shared_gate, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
+      u[0] = Gemm(be, &Lq->shared_up, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> xrep(static_cast<size_t>(topk) * H);  // topk copies of x1
         for (int64_t j = 0; j < topk; ++j)
@@ -1393,7 +1424,7 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 2: host clamped-SwiGLU
       for (int64_t a = 0; a < A; ++a) act[static_cast<size_t>(a)] = swiglu(g[a], u[a]);
       // phase 3: down. Shared per-expert; routed grouped when grouped_moe.
-      eo[0] = Gemm(be, &Lq->shared_down, {}, act[0], 1, H, mi, /*defer_sync=*/true);
+      eo[0] = Gemm(be, &Lq->shared_down, kNoHostWeights, act[0], 1, H, mi, /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> adown(static_cast<size_t>(topk) * mi);
         for (int64_t j = 0; j < topk; ++j)
@@ -2923,7 +2954,7 @@ void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
       if (std::fread(din.data(), sizeof(float), static_cast<size_t>(H), fi) != static_cast<size_t>(H)) { std::fclose(fi); return; }
       std::fclose(fi);
       const int64_t ne = p.n_routed_experts;
-      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, {}, din, 1, ne, H);
+      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, kNoHostWeights, din, 1, ne, H);
       double dr = 0; for (float v : din) dr += (double)v * v;
       std::fprintf(stderr, "[gate-xcheck] on ds4's router input (rms=%.4f): OUR logit[33]=%.4f logit[233]=%.4f\n",
                    std::sqrt(dr / H), myg[33], myg[233]);

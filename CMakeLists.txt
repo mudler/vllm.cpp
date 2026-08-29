@@ -815,6 +815,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_kda.cpp
   src/vllm/model_executor/models/glm5_next_dsa.cpp
   src/vllm/model_executor/models/glm5_next_mhc.cpp
+  src/vllm/model_executor/models/glm5_next_moe.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
@@ -828,6 +829,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
   src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
   src/vllm/model_executor/models/glm5_next_weights.cpp
+  src/vllm/model_executor/models/glm5_next_loader.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp

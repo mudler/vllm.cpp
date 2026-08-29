@@ -979,6 +979,124 @@ escape — and the projection stays per-layer-exact for the trellis while the ho
 tower is measured, not projected, because the model-level tensors (`embed`,
 `lm_head`) are not per-layer.
 
+## W1d design (this wave: the carried tower at the model dtype)
+
+`W1c` gave the forward a carried tower it could consume. It also gave it one at
+**four bytes per element from a checkpoint that stores it at one and two**, and
+[#2186](https://github.com/mudler/vllm.cpp/issues/2186) measured what that costs:
+the real DeepSeek-V4-Flash artifact refuses at **108.59 GiB**, of which **26.64
+GiB is the carried tower**, against 119.63 GiB of unified memory on `dgx:gpu0`.
+
+The split matters more than the total. The carried tower has two halves:
+
+| half | on disk | at f32 | at bf16 |
+|---|---|---|---|
+| FP8-sourced (`F8_E4M3` + `F8_E8M0` block scales) | 5.455 GiB | 21.82 GiB | **10.91 GiB** |
+| BF16-sourced (norms, embeddings, router) | 2.621 GiB | 5.24 GiB | 2.62 GiB |
+| total | 8.08 GiB | 26.64 GiB (measured 108.59 total) | 13.53 GiB |
+
+**This wave takes the FP8-sourced half only**, 21.82 -> 10.91 GiB, which projects
+the artifact to **~97.7 GiB** and is what puts it under the box. The BF16-sourced
+half is worth a further 2.62 GiB, touches norms and embeddings that far more code
+reads, and is left under `## Owed`.
+
+### W1d-1. Why this is a dtype correction and not a precision trade
+
+AGENTS.md's "Inherit vLLM defaults" says vLLM resolves ONE model dtype and every
+layer inherits it, and that an `f32` value is a rare annotated exception. These
+tensors are stored `F8_E4M3` with `F8_E8M0` block scales: **there is no f32
+anywhere in their lineage**, and W1c's four bytes were a widening with no
+numerical claim behind it, of exactly the shape AGENTS.md warns a token gate
+cannot detect -- the tokens match and the goldens pass while the path moves twice
+the bytes.
+
+**And the narrowing is exactly lossless, which is stronger than a tolerance
+argument.** E4M3 carries four significand bits (3 stored + 1 implicit); E8M0 is a
+pure power of two, so it moves the exponent and cannot add significand bits; bf16
+carries eight (7 + 1) and f32's exponent range verbatim. Every value this tower
+can hold is therefore exactly representable at bf16. The gate asserts that as a
+per-element counter (`narrowing_lost_a_bit == 0`) beside the existing value
+equality, so a future recipe that widens the carried source -- a real f32, or a
+higher-mantissa fp8 -- fires here and says so instead of quietly rounding.
+
+### W1d-2. Widening happens at the READ, so nothing is materialized back
+
+The nine fields become `HostBf16` (`std::vector<uint16_t>`, bf16 bit patterns).
+Their consumers widen each element as they read it:
+
+| consumer | change |
+|---|---|
+| `Dot` (`deepseek_v4.cpp`) | a `const uint16_t*` overload; f32 accumulator, same reduction order |
+| `MatVec`, `Gemm` | templated on the weight vector; the keep-quant arm never touches the host vector at all |
+| `expert_f32` | generic in the weight dtype -- ONE body serves the bf16 shared experts and the still-f32 routed ones |
+| `GroupedOutputLora` | templated with BOTH instantiations explicit, so the ported upstream-parity f32 arm is byte-for-byte unchanged |
+| `GroupedOLoraKernel` (CUDA) | reads `const uint16_t*`; `__ushort_as_bfloat16` + `__bfloat162float` is the same bit operation as host `vt::BF16ToF32` (`AsF32(b << 16)`) |
+
+A bf16 read **moves half the bytes** an f32 read moves, so this is not a per-call
+widening of a tensor; it is what reading a weight at the model dtype means.
+
+The device `grouped_olora` vtable entry changed dtype rather than gaining a
+parallel bf16 entry: a function pointer cannot be a template, and the carried
+tower has exactly one dtype. The f32 arm survives as
+`GroupedOutputLora<float>`, which the ported parity tests drive.
+
+### W1d-3. The residency accounting was ungated, and now is not
+
+`DeepseekV4HostResidentBytes` is the number the load refusal prices the artifact
+with. **Every existing residency case in `test_deepseek_v4_exl3_loader.cpp`
+compares it against itself** -- each takes `host_bytes` from that same call and
+brackets the threshold around it -- so all of them stay green for any
+self-consistent formula, right or wrong. An element size hardcoded inside it
+would report the pre-W1d total and refuse a tower that now fits, and nothing
+would have noticed.
+
+A new case rebuilds the total from the LOADED struct, taking each field's width
+from its own `value_type` rather than naming a number, and asserts the
+discriminating population is non-empty first. MUTATION-PROVEN: hardcoding
+`sizeof(float)` back into the accounting takes exactly that one case red
+(1 failed / 12) and leaves the other eleven green.
+
+The case reports the fixture's saving as a `MESSAGE` rather than asserting it.
+The saving is a property of the real checkpoint's dimensions; a number pinned
+there would gate the fixture instead of the change.
+
+### W1d-5. The widening is INLINED, and that is a performance decision
+
+`vt::BF16ToF32` is declared in `include/vt/dtype.h` and defined out of line in
+`src/vt/dtype.cpp:341`, and this build enables no LTO or IPO. Calling it from the
+innermost loop of a carried-tower GEMV would therefore be a real function call
+**per element** -- which costs more than halving the memory traffic saves, and
+would have made the bf16 arm SLOWER than the f32 arm it replaces. That would be a
+particularly bad failure to ship, because every gate in this wave is a
+correctness gate: the tokens would still match and nothing here would notice.
+
+So `vllm::HostBf16ToF32` (`deepseek_v4.h`) is an inline header helper performing
+the same bit operation, and `Dot`'s bf16 overload and `GroupedOutputLora`'s `Wf`
+both use it. The CUDA kernel needs no equivalent -- `__bfloat162float` is a
+device intrinsic and inlines.
+
+**A duplicated bit operation drifts, so it is pinned over its whole domain.**
+bf16 has 65536 patterns and a case asserts agreement with `vt::BF16ToF32` for
+every one of them, compared as BITS rather than as floats -- `NaN != NaN`, so a
+float comparison would silently pass over exactly the region where a widening
+that mangled the payload would show up. Three fixed values (`1.0`, `-1.0`, `0.0`)
+sit beside it so that a helper returning a constant cannot pass by agreeing with
+a `vt::BF16ToF32` that was itself broken.
+
+### W1d-4. What this wave does NOT claim
+
+It does not claim the artifact runs. The DSA composition is still unported and
+the forward still refuses by name on the 21 `compress_ratio == 4` layers
+([#1961](https://github.com/mudler/vllm.cpp/issues/1961),
+[#1970](https://github.com/mudler/vllm.cpp/issues/1970),
+[#1976](https://github.com/mudler/vllm.cpp/issues/1976)). Residency was the FIRST
+wall, not the only one.
+
+It does not claim ~97.7 GiB has been observed. That is a projection from the
+measured 108.59 / 26.64 split plus the arithmetic above. The load has not been
+re-run on the real artifact in this wave, and the figure falls due as a device
+measurement under `## Owed`.
+
 ## Risks
 
 1. The artifact itself is `runtime_pending` per its publisher — a correctness
@@ -1860,6 +1978,20 @@ have made the whole hazard invisible to every lane including the sanitizer,
 which is precisely how this landed green locally in the first place.
 
 ## Owed
+
+- **The ~97.7 GiB projection is UNMEASURED.** W1d's arithmetic says the real
+  DeepSeek-V4-Flash artifact now prices at ~97.7 GiB against 119.63 GiB physical,
+  from the measured 108.59 / 26.64 split. Nobody has re-run the load on the real
+  artifact since, so the figure is a projection and not an observation. It falls
+  due as a `dgx:gpu0` measurement with the staged 100 GB checkpoint
+  ([#2186](https://github.com/mudler/vllm.cpp/issues/2186)). A load that
+  completes is also not a forward that runs -- see W1d-4.
+- **The BF16-sourced half of the carried tower is still widened to f32**, worth a
+  further ~2.62 GiB (5.24 -> 2.62). W1d took the FP8-sourced half only. This half
+  is the norms, embeddings and router, which far more code reads than the nine
+  fields W1d moved, so it is a wave rather than an extension of this one.
+  Owned by `MODEL-DSV4-EXL3`, tracked by
+  [#2186](https://github.com/mudler/vllm.cpp/issues/2186).
 
 - **`exllamav3` is not a REGISTERED secondary oracle.** AGENTS.md says a
   secondary oracle "is valid only when it appears in this table and has a

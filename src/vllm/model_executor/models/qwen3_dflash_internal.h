@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "vt/backend.h"  // #2274 opt-in device readback
 #include "vt/ops.h"
 
 namespace vllm {
@@ -358,13 +359,91 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
              "range [ctx_len, ctx_len + block rows) the read's extended bound "
              "addresses (SPEC-DFLASH2 W11, #1890)");
   }
+  // #2274 — OPT-IN DEVICE READBACK. The two checks above that read `seq_ext` and
+  // `slot_map` are `kCPU`-guarded because they dereference the tensors, so on
+  // CUDA the one variant their own comment names is unchecked: "the host values
+  // were right and the UPLOAD did not land on the tensor this call reads (a
+  // stale graph buffer, a copy that went elsewhere)". Every HOST-side bound this
+  // function derives has been verified correct on the failing configuration
+  // (`ddd527f3f`, detectors silent), so a host/device divergence is what is
+  // left.
+  //
+  // OFF by default: the read is a `Download`, which synchronizes, and this call
+  // sits on the no-sync path the whole route exists to keep. `VT_DFLASH_BOUNDS_DEVICE=1`
+  // turns it on for a diagnostic run.
+  static const bool bounds_device = [] {
+    const char* e = std::getenv("VT_DFLASH_BOUNDS_DEVICE");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (bounds_device && seq_ext.device.type != vt::DeviceType::kCPU &&
+      seq_ext.data != nullptr) {
+    vt::Backend& bb = vt::GetBackend(seq_ext.device.type);
+    int32_t dev_seq = -1;
+    bb.Copy(q, &dev_seq, seq_ext.data, sizeof(int32_t));
+    bb.Synchronize(q);
+    VT_CHECK(dev_seq == canon.seq_ext,
+             "dflash block paged attention: the DEVICE seq_ext does not match the "
+             "host value this call derived — the upload did not land, or the "
+             "buffer is stale; the paged read would use that length "
+             "(SPEC-DFLASH2, #2274)");
+    if (query.shape[0] > 0 && slot_map.data != nullptr) {
+      const int64_t tqn = query.shape[0];
+      std::vector<int64_t> dev_slots(static_cast<size_t>(tqn), -1);
+      bb.Copy(q, dev_slots.data(), slot_map.data,
+              static_cast<size_t>(tqn) * sizeof(int64_t));
+      bb.Synchronize(q);
+      VT_CHECK(dev_slots.front() == canon.slots.front() &&
+                   dev_slots.back() == canon.slots.back(),
+               "dflash block paged attention: the DEVICE slot map does not match "
+               "the host range [ctx_len, ctx_len+tq); ReshapeAndCache would write "
+               "where this call did not intend (SPEC-DFLASH2, #2274)");
+    }
+  }
+
+  // #2274 — THE BOUNDS THIS CALL WRITES AND READS, CHECKED ON EVERY BACKEND.
+  //
+  // The two checks above are guarded on `kCPU` because they dereference device
+  // tensors. These are pure HOST arithmetic over shapes, so they run on CUDA
+  // too — which is where the fault is. `ReshapeAndCache` below WRITES `tq` rows
+  // at `slots`, and the attention then READS `[0, seq_ext)` through
+  // `block_table`; if either passes the pool, that is an illegal access inside a
+  // kernel, reported later and elsewhere (a `cudaMemcpyAsync` or a `cudaFree`)
+  // with nothing naming this call. #2274 is exactly that shape: an out-of-bounds
+  // access on the second request of a process, surfacing far from its cause.
+  //
+  // This is a DETECTOR, not a repair. If it fires, the caller's accounting is
+  // wrong and the message says which term; if it never fires, this class is
+  // excluded and the search moves on. Cost is a few host integer comparisons per
+  // draft layer.
+  const int64_t pool_pages = pool_k.shape[0];
+  const int64_t page_rows = pool_k.shape[1];
+  const int64_t pool_capacity = pool_pages * page_rows;
+  VT_CHECK(canon.seq_ext <= pool_capacity,
+           "dflash block paged attention: the extended read bound passes the pool "
+           "(seq_ext > pages*page_rows); the attention would read unmapped pages "
+           "(SPEC-DFLASH2, #2274)");
+  VT_CHECK(host_inputs.slots.empty() ||
+               host_inputs.slots.back() < pool_capacity,
+           "dflash block paged attention: the last write slot passes the pool "
+           "(slots.back() >= pages*page_rows); ReshapeAndCache would write past "
+           "the K/V pages (SPEC-DFLASH2, #2274)");
+  // The block table must ADDRESS every page the extended bound reaches. It is
+  // `[1, max_pages]`, so its own width is the reachable page count -- a table
+  // shorter than `ceil(seq_ext / page_rows)` sends the kernel through an
+  // uninitialised entry, which is an arbitrary page index rather than a refusal.
+  VT_CHECK(page_rows > 0 && block_table.rank == 2 && block_table.shape[1] > 0,
+           "dflash block paged attention: the block table must be [1, max_pages] "
+           "over a positive page size (SPEC-DFLASH2, #2274)");
+  VT_CHECK(block_table.shape[1] * page_rows >= canon.seq_ext,
+           "dflash block paged attention: the block table cannot address the "
+           "extended bound (max_pages*page_rows < seq_ext), so the read walks off "
+           "the end of the table (SPEC-DFLASH2, #2274)");
   vt::ReshapeAndCache(q, block_k, block_v, pool_k, pool_v, slot_map);
   // #2252: `host_meta` outlives the call below, which is all it must do -- the
   // launcher reads the qsl on the host to size its grid before it launches.
   // The POOL's capacity (pages x page rows), not this step's context length --
   // see the note on `DflashBlockPagedHostMetaOf`: a per-step value baked into a
   // replayed graph reads out of bounds.
-  const int64_t pool_capacity = pool_k.shape[0] * pool_k.shape[1];
   const DflashBlockPagedHostMeta host_meta =
       DflashBlockPagedHostMetaOf(pool_capacity, query.shape[0]);
   const vt::PagedAttentionArgs pa =

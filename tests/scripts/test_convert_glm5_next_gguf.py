@@ -646,10 +646,20 @@ def case_tensors(g):
                       "ssm_f_a", "ssm_f_b", "ssm_g_a", "ssm_g_b",
                       "ssm_beta", "ssm_norm"):
                 want.add("blk.%d.%s.weight" % (L, s))
-            want |= {"blk.%d.ssm_a" % L, "blk.%d.ssm_dt" % L}
+            # `ssm_dt.bias`, not `ssm_dt`: llama.cpp #27752 @ `8a8d0bcc4`
+            # renames `.dt_bias` to `.dt_proj.bias` before its generic map runs,
+            # so the emitted name carries the `.bias` suffix. The published
+            # `unsloth/GLM-5.3-Flash-GGUF` artifact agrees on all 34 of its KDA
+            # blocks and carries no `ssm_dt` anywhere (#2242).
+            want |= {"blk.%d.ssm_a" % L, "blk.%d.ssm_dt.bias" % L}
         else:
+            # `attn_k_b` and `attn_v_b`, not `attn_kv_b`: the one HF
+            # `kv_b_proj` is SPLIT and its k half TRANSPOSED, mirroring
+            # `DeepseekV2Model.modify_tensors` at llama.cpp #27752 @
+            # `8a8d0bcc4`. The published artifact carries both and no
+            # `attn_kv_b.weight` (#2242).
             for s in ("attn_q_a", "attn_q_a_norm", "attn_q_b", "attn_kv_a_mqa",
-                      "attn_kv_a_norm", "attn_kv_b", "attn_output",
+                      "attn_kv_a_norm", "attn_k_b", "attn_v_b", "attn_output",
                       "indexer.attn_q_b", "indexer.attn_k", "indexer.k_norm",
                       "indexer.proj", "indexer_compressor_ape",
                       "indexer_compressor_gate"):
@@ -745,6 +755,22 @@ def case_types(g):
           "3-D shapes are NOT flattened: the depthwise conv stays [k, 1, ch] and "
           "the expert lane stays [m, n, experts], because ggml indexes both")
 
+    print("case: the MLA `kv_b_proj` is SPLIT, and its k half is TRANSPOSED")
+    # The two halves have DIFFERENT trailing extents even when
+    # `qk_nope_head_dim == v_head_dim`, because only `k_b` is transposed. On
+    # this fixture both head dims are 64, so a split that forgot the transpose
+    # would produce two IDENTICALLY SHAPED tensors and nothing but this check
+    # would notice; the shapes are therefore asserted rather than the sizes.
+    check(g.tensors["blk.2.attn_k_b.weight"]["dims"] == [QK_NOPE, KV_LORA, N_HEADS],
+          "attn_k_b is ne [qk_nope=%d, kv_lora=%d, heads=%d] -- the TRANSPOSED "
+          "half" % (QK_NOPE, KV_LORA, N_HEADS))
+    check(g.tensors["blk.2.attn_v_b.weight"]["dims"] == [KV_LORA, V_HEAD, N_HEADS],
+          "attn_v_b is ne [kv_lora=%d, v_head=%d, heads=%d] -- the untransposed "
+          "half" % (KV_LORA, V_HEAD, N_HEADS))
+    check("blk.2.attn_kv_b.weight" not in g.tensors,
+          "the fused `attn_kv_b.weight` is NOT written: no reader of this "
+          "architecture expects one")
+
 
 def case_values(g, expect):
     print("case: FP8 e4m3 block dequant and bf16 widening reach the file intact")
@@ -786,6 +812,58 @@ def case_values(g, expect):
             order_ok = False
     check(order_ok, "every expert slab is nearest its OWN expert: the lane is in "
                     "expert order, not permuted")
+
+    print("case: `ssm_a` holds -exp(A_log), and the split halves hold the right "
+          "slices")
+    # llama.cpp #27752 @ `8a8d0bcc4` (`conversion/glm5next.py`): "the graph
+    # expects ssm_a to already hold -exp(A_log)". Writing `A_log` raw produced a
+    # file `LoadGlm5NextFromGguf` refuses by name, because it recovers `A_log`
+    # as `log(-x)` and `log` of a positive-or-zero value is NaN or -inf (#2242).
+    name = "blk.0.ssm_a"
+    info = g.tensors[name]
+    a_log = expect[p + "layers.0.self_attn.A_log"].reshape(-1)
+    got = dequant(g.blob(name, nbytes_of(info)), info["type"], a_log.size)
+    want = -np.exp(a_log.astype(np.float64)).astype(np.float32)
+    check(np.array_equal(got, want),
+          "`ssm_a` is -exp(A_log) exactly, not A_log")
+    # And the transform is OBSERVABLE on this fixture: if it were the identity
+    # the values would differ, so the assertion above is not vacuously true for
+    # a converter that wrote A_log raw.
+    check(not np.allclose(want, a_log, atol=1e-6),
+          "-exp(A_log) differs from A_log on this fixture, so the check above "
+          "can fail")
+    check(bool(np.all(got < 0.0)),
+          "every `ssm_a` entry is strictly negative, which is what makes "
+          "`log(-x)` defined on the loader side")
+
+    # The split halves, against the source `kv_b_proj` sliced and transposed the
+    # way upstream does it. bf16 source carried at Q8_0 or better, so this is a
+    # tolerance on the ENCODER and not on the slicing: a wrong slice or a
+    # missing transpose is an O(1) relative error, not a 1% one.
+    kv = expect[p + "layers.2.self_attn.kv_b_proj.weight"].reshape(
+        N_HEADS, QK_NOPE + V_HEAD, KV_LORA)
+    for nm, ref in (("blk.2.attn_k_b.weight",
+                     np.ascontiguousarray(
+                         kv[:, :QK_NOPE, :].transpose(0, 2, 1)).reshape(-1)),
+                    ("blk.2.attn_v_b.weight",
+                     np.ascontiguousarray(kv[:, QK_NOPE:, :]).reshape(-1))):
+        info = g.tensors[nm]
+        got = dequant(g.blob(nm, nbytes_of(info)), info["type"], ref.size)
+        rel = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
+        check(rel < 0.02, "%s carries its own half of `kv_b_proj` (max rel "
+                          "%.4f)" % (nm, rel))
+    # NOT the other half. Both halves are the same SIZE here, so a loader (or a
+    # converter) that swapped them would pass every check above.
+    info = g.tensors["blk.2.attn_k_b.weight"]
+    k_got = dequant(g.blob("blk.2.attn_k_b.weight", nbytes_of(info)),
+                    info["type"], N_HEADS * KV_LORA * QK_NOPE)
+    v_ref = np.ascontiguousarray(kv[:, QK_NOPE:, :]).reshape(-1)
+    k_ref = np.ascontiguousarray(
+        kv[:, :QK_NOPE, :].transpose(0, 2, 1)).reshape(-1)
+    check(float(np.abs(k_got - k_ref).mean()) <
+          float(np.abs(k_got - v_ref).mean()),
+          "attn_k_b is nearer the K half than the V half: the two are not "
+          "swapped")
 
 
 def case_refusals(tmp):
@@ -923,6 +1001,7 @@ def case_namemap():
             ("Glm5NextCommonTensorMap", conv.COMMON_MAP),
             ("Glm5NextKdaTensorMap", conv.KDA_MAP),
             ("Glm5NextDsaTensorMap", conv.DSA_MAP),
+            ("Glm5NextMlaKvBSplitTensorMap", conv.MLA_KV_B_SPLIT),
             ("Glm5NextDenseMlpTensorMap", conv.DENSE_MLP_MAP),
             ("Glm5NextSparseMlpTensorMap", conv.SPARSE_MLP_MAP),
             ("Glm5NextVisionTensorMap", conv.VISION_MAP),

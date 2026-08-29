@@ -332,7 +332,16 @@ std::vector<Glm5NextTensorName> Glm5NextKdaTensorMap() {
       {"self_attn.g_b_proj.weight", "ssm_g_b.weight"},
       {"self_attn.b_proj.weight", "ssm_beta.weight"},
       {"self_attn.A_log", "ssm_a"},
-      {"self_attn.dt_bias", "ssm_dt"},
+      // `ssm_dt.bias`, NOT `ssm_dt`. The converter RENAMES the parameter before
+      // the generic map sees it -- `if name.endswith(".dt_bias"): name =
+      // name.rpartition(".dt_bias")[0] + ".dt_proj.bias"`
+      // (llama.cpp #27752 @ 8a8d0bcc4, `conversion/glm5next.py`) -- so it
+      // resolves through `MODEL_TENSOR.SSM_DT`'s `self_attn.dt_proj` row and
+      // lands as `blk.N.ssm_dt.bias`. The converter's own comment says why:
+      // "the time-step bias to be named like a bias so it is not loaded as a
+      // MUL_MAT weight." The published `unsloth/GLM-5.3-Flash-GGUF` artifact
+      // carries `ssm_dt.bias` on all 34 KDA blocks and no `ssm_dt` anywhere.
+      {"self_attn.dt_bias", "ssm_dt.bias"},
       {"self_attn.o_norm.weight", "ssm_norm.weight"},
   };
 }
@@ -344,7 +353,9 @@ std::vector<Glm5NextTensorName> Glm5NextDsaTensorMap() {
       {"self_attn.q_b_proj.weight", "attn_q_b.weight"},
       {"self_attn.kv_a_proj_with_mqa.weight", "attn_kv_a_mqa.weight"},
       {"self_attn.kv_a_layernorm.weight", "attn_kv_a_norm.weight"},
-      {"self_attn.kv_b_proj.weight", "attn_kv_b.weight"},
+      // `kv_b_proj` IS NOT HERE. It is SPLIT into two GGUF tensors, so one HF
+      // name maps to two and it cannot live in a 1:1 table; see
+      // `Glm5NextMlaKvBSplitTensorMap` below.
       {"self_attn.o_proj.weight", "attn_output.weight"},
       {"self_attn.indexer.wq_b.weight", "indexer.attn_q_b.weight"},
       {"self_attn.indexer.wk.weight", "indexer.attn_k.weight"},
@@ -360,6 +371,33 @@ std::vector<Glm5NextTensorName> Glm5NextDsaTensorMap() {
        "indexer_compressor_ape.weight"},
       {"self_attn.indexer.index_kpool_compress_gate",
        "indexer_compressor_gate.weight"},
+  };
+}
+
+std::vector<Glm5NextTensorName> Glm5NextMlaKvBSplitTensorMap() {
+  return {
+      // ONE HF parameter, TWO GGUF tensors, and the second one is transposed.
+      // `DeepseekV2Model.modify_tensors` (llama.cpp #27752 @ `8a8d0bcc4`,
+      // `conversion/deepseek.py`, "note: MLA with the absorption optimization,
+      // needs these two split and k_b_proj transposed"):
+      //
+      //     kv_b = W.view(n_head_kv, v_head_dim + qk_nope_head_dim, -1)
+      //     k_b, v_b = split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
+      //     k_b = k_b.transpose(1, 2)
+      //
+      // So `attn_k_b` is `[heads, kv_lora_rank, qk_nope_head_dim]` and
+      // `attn_v_b` is `[heads, v_head_dim, kv_lora_rank]` — DIFFERENT shapes
+      // even on this model, where `qk_nope_head_dim == v_head_dim == 256`:
+      // ne [256, 512, 64] against ne [512, 256, 64] in the published
+      // `unsloth/GLM-5.3-Flash-GGUF` artifact, which carries no
+      // `attn_kv_b.weight` on any block.
+      //
+      // The HF side is spelled with a `[k]` / `[v]` selector rather than the
+      // bare parameter name so this stays a 1:1 table a reader (and the
+      // converter interop gate) can compare key for key. The selector is not a
+      // tensor name and nothing looks it up.
+      {"self_attn.kv_b_proj.weight[k]", "attn_k_b.weight"},
+      {"self_attn.kv_b_proj.weight[v]", "attn_v_b.weight"},
   };
 }
 
@@ -453,6 +491,7 @@ std::vector<std::string> Glm5NextExpectedGgufTensors(
   const auto common = Glm5NextCommonTensorMap();
   const auto kda = Glm5NextKdaTensorMap();
   const auto dsa = Glm5NextDsaTensorMap();
+  const auto kvb = Glm5NextMlaKvBSplitTensorMap();
   const auto dense = Glm5NextDenseMlpTensorMap();
   const auto sparse = Glm5NextSparseMlpTensorMap();
   const auto experts = Glm5NextStackedExpertTensorMap();
@@ -464,6 +503,9 @@ std::vector<std::string> Glm5NextExpectedGgufTensors(
                         Glm5NextLayerKind::kLinearAttention;
     for (const Glm5NextTensorName& tn : (is_kda ? kda : dsa)) {
       out.push_back(blk + tn.gguf);
+    }
+    if (!is_kda) {
+      for (const Glm5NextTensorName& tn : kvb) out.push_back(blk + tn.gguf);
     }
     const bool is_dense = params.mlp_layer_types[static_cast<size_t>(il)] ==
                           Glm5NextMlpKind::kDense;

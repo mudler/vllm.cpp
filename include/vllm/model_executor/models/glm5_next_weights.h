@@ -84,6 +84,12 @@ std::vector<Glm5NextTensorName> Glm5NextKdaTensorMap();
 // `index_kpool_compress_{ape,gate}` parameters are this model's net-new k-pool
 // compression stage.
 std::vector<Glm5NextTensorName> Glm5NextDsaTensorMap();
+// The MLA `kv_b_proj` half, which is SPLIT into two GGUF tensors and cannot
+// live in the 1:1 table above. `attn_k_b` is additionally TRANSPOSED. Kept
+// separate rather than folded in so both tables stay key-for-key comparable
+// against `scripts/convert-glm5-next-gguf.py`, which is what
+// `tests/scripts/test_convert_glm5_next_gguf.py` gates.
+std::vector<Glm5NextTensorName> Glm5NextMlaKvBSplitTensorMap();
 std::vector<Glm5NextTensorName> Glm5NextDenseMlpTensorMap();
 // The non-expert half of a sparse layer. The 288 routed experts are STACKED
 // into one 3-D tensor per projection (`ffn_{gate,up,down}_exps.weight`), which

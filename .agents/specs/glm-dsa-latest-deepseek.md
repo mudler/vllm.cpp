@@ -1380,54 +1380,91 @@ the UD recipe keeps every non-expert tensor at Q4_K or better regardless of the
 name on the tin — so the residency plan in §3.3 is arm-independent. And
 `UD-Q2_K_XL` contains **two** Q2_K tensors out of 1809, both on the MTP block.
 
-**The verdict against our decoders and `vec_dot` lists.** Three lists decide
-this, and they are not the same list:
+**The verdict against our decoders and `vec_dot` lists. This section was
+rewritten after `origin/main` moved under it, and the correction inverts the
+answer.** At this branch's base `60a6dd97b`, `IQ4_XS` and `IQ2_XS` had neither a
+`vt` block dtype nor a decoder, so both were a hard refusal. On 2026-08-29 at
+`94de63ff5` ([#2245](https://github.com/mudler/vllm.cpp/issues/2245)) main landed
+**the dequantizers for both**, for the sibling `MODEL-MM-GLM53-FLASH` row's own
+staged artifact. `kIQ2_XS` and `kIQ4_XS` now exist in `include/vt/dtype.h::DType`,
+`gguf_reader.cpp` sizes id 17 at `{256, 74}`, and `gguf_dequant.cpp` cases 17 and
+23 decode. **Neither gained a keep-quant `vec_dot`, and that is the half that
+decides this row.**
 
-1. `src/vllm/model_executor/model_loader/gguf_reader.cpp::FindGgmlTraits` — the
-   ggml type ids we can even SIZE. Ids present: 0,1,2,6,8,10,11,12,13,14,16,18,
-   19,20,22,**23**,24,25,26,27,28,30,39,40,41,66. An id outside this set throws
-   `"gguf: unknown ggml type id N"` at file open (`gguf_reader.cpp:359-364`).
-2. `include/vt/dtype.h::DType` + `vt::BlockDTypeFromGgmlTypeId` — the encodings
-   that have a vt block dtype. `kQ4_0, kQ5_0, kQ8_0, kQ2_K, kQ3_K, kQ4_K, kQ5_K,
-   kQ6_K, kQ8_K, kIQ2_XXS, kIQ3_XXS, kIQ2_S, kIQ1_S, kIQ1_XXXS, kIQ4_NL, kMXFP4`.
-   **There is no `kIQ4_XS`, no `kIQ2_XS`, no `kIQ1_M`, no `kIQ3_S`.**
-3. `src/vt/cpu/cpu_quant_dot.cpp::BlockVecDot` — the keep-quant `vec_dot` list,
-   which decides whether a tensor stays COMPRESSED or expands to bf16 at load.
+Three lists decide it, and they are not the same list:
 
-| type | reader traits | decoder (`gguf_dequant.cpp`) | `vec_dot` | consequence |
+1. `gguf_reader.cpp::FindGgmlTraits` — the ggml ids we can SIZE. An id outside it
+   throws `"gguf: unknown ggml type id N"` at file OPEN. **17 and 23 are now in.**
+2. `vt::BlockDTypeFromGgmlTypeId` + `gguf_dequant.cpp` — the ids we can DECODE.
+   **17 and 23 are now in.**
+3. `src/vt/cpu/cpu_quant_dot.cpp::BlockVecDot`, read through
+   `vt::cpu::HasQuantDotKernel` — the ids that stay COMPRESSED.
+   `Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ2_S,
+   IQ1_S, IQ1_XXXS, IQ4_NL, MXFP4`. **17 and 23 are NOT in, and nothing else in
+   the four censused arms is missing.**
+
+`gguf_keep_quant.cpp::KeepQuantDType` is the gate: it resolves the block dtype
+and then `if (!vt::cpu::HasQuantDotKernel(dt)) return false;`. **A type with a
+decoder and no `vec_dot` therefore EXPANDS TO bf16 at load** — exactly the
+failure mode #2214 named, arriving here through the door that had just been
+opened.
+
+| type | traits | decoder | `vec_dot` | what happens |
 |---|---|---|---|---|
-| Q4_K, Q5_K, Q6_K, Q8_0, F32 | yes | yes | yes | resident class loads compressed |
-| IQ1_S, IQ2_XXS, IQ3_XXS, Q2_K, Q3_K, IQ2_S | yes | yes | yes | expert towers load compressed |
-| **IQ4_XS (23)** | **yes (`{256,136}`)** | **NO** | **NO** | **`gguf dequant: unsupported ggml type 23 (IQ4_XS)`** |
-| **IQ2_XS (17)** | **NO** | NO | NO | **`gguf: unknown ggml type id 17` at file OPEN** |
-| **IQ1_M (29)** | **NO** | NO | NO | **`gguf: unknown ggml type id 29` at file OPEN** |
+| Q4_K, Q5_K, Q6_K, Q8_0, F32 | yes | yes | yes | resident class stays compressed |
+| IQ1_S, IQ2_XXS, IQ3_XXS, IQ2_S, Q2_K, Q3_K | yes | yes | yes | expert towers stay compressed |
+| **IQ4_XS (23)** | **yes** | **yes, since `94de63ff5`** | **NO** | **expands to bf16** |
+| **IQ2_XS (17)** | **yes** | **yes, since `94de63ff5`** | **NO** | **expands to bf16** |
+| IQ1_M (29) | NO | NO | NO | `gguf: unknown ggml type id 29` at file OPEN |
 
-**So the answer to "which are missing" is: exactly one, on the arm we want.**
+**And an expanded tower does not merely cost bytes — it leaves the streaming lane
+entirely.** `gguf_device_fit.cpp:85-100` walks every `*_exps.weight` tensor,
+asks `PeekRoute` for its residency, and returns **false for the whole arm** the
+moment one of them is not `kKeepQuant` or `kKeepF16`. The eligibility is
+per-MODEL, not per-tensor. So four IQ4_XS tensors out of 228 disqualify all 228.
 
-- **UD-IQ1_S needs `IQ4_XS` and nothing else.** Four tensors,
-  `blk.{8,75,76,77}.ffn_down_exps.weight`, 6.375 GiB of the 187 GiB expert set.
-  Everything else in the file — resident and streamed — already has both a
-  decoder and a keep-quant `vec_dot`.
-- UD-IQ2_M needs `IQ4_XS` and nothing else either (its IQ2_S is already
-  supported), at 222.19 GiB.
-- UD-IQ1_M additionally needs `IQ1_M` (76 tensors, 49.9 GiB) and is rejected.
-- UD-Q2_K_XL additionally needs `IQ2_XS` (148 tensors, 128.3 GiB) and is
-  rejected.
+The cost, computed exactly. One `*_exps` tower is
+`2048 * 6144 * 256 = 3,221,225,472` elements, **6.000 GiB at bf16**:
 
-**This is the section that decides viability, and the verdict is: the row is
-blocked on ONE named kernel, `IQ4_XS`, and that kernel already has a matrix row.**
-`QUANT-GGUF-IQ4_XS` is at `.agents/quantization-matrix.md:78`, state
-`INVENTORIED`, with an existing explicit-rejection test
-(`tests/vllm/test_gguf_dequant.cpp`). The port is modest and well-precedented:
-IQ4_XS is a 256-element K-quant super-block (136 B) over the SAME 16-entry
-non-linear codebook as `IQ4_NL`, which this tree already implements
-(`kValuesIq4nl`, `cpu_quant_dot.cpp::VecDotIQ4_NLQ8_0`, anchored at llama.cpp
-`b10451` `quants.c:1254`). The reader already knows its geometry. **Without it
-the row is dead**: a type with no decoder is a hard refusal, not a bf16
-expansion — the failure mode #2214 warned about (a decoder without a `vec_dot`
-expanding to bf16) does not arise here, because `IQ4_XS` has neither, so the
-load refuses loudly instead of silently needing 427 GiB. That is the better
-failure, and it is why the census had to be done before any wave was planned.
+| arm | offending type | compressed | expanded to bf16 | delta |
+|---|---|---:|---:|---:|
+| UD-IQ1_S | 4 x IQ4_XS | 6.375 GiB | **24.000 GiB** | +17.6 GiB |
+| UD-IQ2_M | 4 x IQ4_XS | 6.375 GiB | **24.000 GiB** | +17.6 GiB |
+| UD-Q2_K_XL | 148 x IQ2_XS | 128.344 GiB | **888.000 GiB** | +759.7 GiB |
+
+And the slot arithmetic collapses with it: a bf16 expert slice is
+`6144 * 2048 * 2 = 25,165,824 B = 24.00 MiB` against the IQ4_XS slice's 6.375
+MiB, and slots are uniform at the largest, so §3.3's 4096-slot cache would be
+**96.00 GiB** instead of 25.50 GiB — more than three quarters of the device on
+its own.
+
+**So the verdict changes shape but not sign, and it is sharper than it was.**
+
+- **The row is blocked on ONE kernel and it is a `vec_dot`, not a decoder:
+  `VecDotIQ4_XSQ8_K` against the Q8_K activation encoding.** Four tensors,
+  `blk.{8,75,76,77}.ffn_down_exps.weight`. With it, UD-IQ1_S loads entirely
+  compressed at 201.823 GiB and every tower is streamable. Without it, the arm
+  loads at 219.4 GiB, cannot stream at all, and is dead on this fleet.
+- The port is small and well-precedented, and it is smaller today than it was at
+  this branch's base: `94de63ff5` already ported the 136-byte `block_iq4_xs`
+  layout and its decoder from llama.cpp `b10451`, so what remains is the dot
+  product itself over a codebook this tree already carries for `IQ4_NL`
+  (`kValuesIq4nl`, `cpu_quant_dot.cpp::VecDotIQ4_NLQ8_0`, anchored `quants.c:1254`).
+  Upstream's is `ggml_vec_dot_iq4_xs_q8_K`.
+- `UD-IQ2_M` needs the same one and nothing else. `UD-Q2_K_XL` needs
+  `VecDotIQ2_XSQ8_K` as well, and `UD-IQ1_M` is still rejected outright on
+  `IQ1_M`, which has no traits at all.
+- The row already exists: `QUANT-GGUF-IQ4_XS`
+  (`.agents/quantization-matrix.md:78`, `INVENTORIED`).
+
+**The general lesson this section paid for, and the reason it is written out
+rather than quietly corrected: a decoder and a `vec_dot` are two different
+obligations, and landing only the first turns a loud refusal into a silent 3.4x
+memory multiplier.** At `60a6dd97b` this arm refused at load with a message
+naming the type. At `94de63ff5` it loads, and the only symptom is that a
+119.631 GiB device runs out of memory for reasons the log does not name.
+`gguf_device_fit`'s all-or-nothing rule is what converts the same defect from
+"+17.6 GiB" into "no streaming at all", and neither is visible to a token gate.
 
 **The GGUF's own metadata, and one thing it does NOT carry.** Shard 1's KV block
 declares `general.architecture = glm-dsa`, `glm-dsa.block_count = 79`,
@@ -1710,22 +1747,30 @@ each other; everything else is ordered.
 
 #### W1 — the `IQ4_XS` encoding (CPU, medium)
 
-**Scope:** `vt::DType::kIQ4_XS`, its `BlockIQ4_XS` layout, the `BlockToFloat`
-decoder, the keep-quant `VecDotIQ4_XSQ8_K`, the `BlockDTypeFromGgmlTypeId` row
-and the `gguf_dequant.cpp` case. **Owned by `QUANT-GGUF-IQ4_XS`**
+**Scope:** the keep-quant `VecDotIQ4_XSQ8_K` and its `QuantTypeTraits` row, so
+`vt::cpu::HasQuantDotKernel(kIQ4_XS)` becomes true and
+`gguf_keep_quant.cpp::KeepQuantDType` stops expanding the type to bf16. The
+dtype, the 136-byte block layout and the decoder already landed at `94de63ff5`
+([#2245](https://github.com/mudler/vllm.cpp/issues/2245)); this wave is the half
+that was not in it. **Owned by `QUANT-GGUF-IQ4_XS`**
 (`.agents/quantization-matrix.md:78`, `INVENTORIED`), consumed here; this row
 does not steal that row's state.
-**Exclusions:** no model code, no other encoding. `IQ2_XS` and `IQ1_M` stay
-unimplemented and their arms stay refused.
+**Exclusions:** no model code. `VecDotIQ2_XSQ8_K` is the same shape and is NOT
+in scope, because no arm this row targets needs it; `IQ1_M` stays unimplemented
+and `UD-IQ1_M` stays refused.
 **Anchors:** llama.cpp `b10451` `ggml/src/ggml-common.h::block_iq4_xs` (256
 elements, 136 bytes) and `ggml/src/.../quants.c::ggml_vec_dot_iq4_xs_q8_K`; the
 shared 16-entry `kValuesIq4nl` codebook this tree already carries for `IQ4_NL`
 (`cpu_quant_dot.cpp::VecDotIQ4_NLQ8_0`, anchored `quants.c:1254`); the reader
 already sizes it at `gguf_reader.cpp` case 23, `{256, 136}`.
-**Tests:** the existing explicit-rejection case in
-`tests/vllm/test_gguf_dequant.cpp` flips from "refuses" to "decodes", RED first;
-byte-exact decode against a llama.cpp-produced reference block; the `vec_dot`
-against the dequant-composite fallback.
+**Tests:** RED first — `HasQuantDotKernel(kIQ4_XS)` is false today and
+`KeepQuantDType(23, ...)` returns false, so a test asserting a real IQ4_XS tensor
+loads COMPRESSED fails before the change and passes after. Then the `vec_dot`
+against the existing dequant-composite fallback on the same blocks, and the
+LOWER bound a quantized arm needs: the kept-quant result must not merely
+correlate with the expanded one, it must agree to the encoding's own error.
+`tests/vt/iq2xs_iq4xs_golden_vectors.h` already carries `94de63ff5`'s reference
+vectors.
 **Gate:** focused ctest, full preflight. **Reachability:** the type must arrive
 through `GgufFile::OpenOne` on a real header, not through a hand-built block.
 **Stop:** if the 136-byte layout does not reproduce llama.cpp byte for byte,
@@ -1871,10 +1916,11 @@ only one that can be fed on this fleet. The refusal names the missing pieces so 
 reader meets it at load rather than discovering it.
 
 **D2 — `UD-IQ1_S` is the target arm.** Smallest at 201.83 GiB, needs exactly one
-new encoding, and its resident class is the same 14.5 GiB as every larger arm.
-`UD-IQ2_M` (222.19 GiB) is the fallback and needs the same single encoding, so
-W1 unlocks both. `UD-IQ1_M` and `UD-Q2_K_XL` are rejected on encodings, not on
-size.
+keep-quant `vec_dot` (`IQ4_XS`), and its resident class is the same 14.5 GiB as
+every larger arm. `UD-IQ2_M` (222.19 GiB) is the fallback and needs the same
+single kernel, so W1 unlocks both. `UD-Q2_K_XL` additionally needs
+`VecDotIQ2_XSQ8_K`, and `UD-IQ1_M` is rejected outright because `IQ1_M` has no
+reader traits. None of the four is rejected on size.
 
 **D3 — the published GGUF's indexer schedule cannot be read out of the file, and
 the port must not try.** The file declares indexer weights on **all 79 blocks**
@@ -1925,15 +1971,22 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   multi-device execution path this project does not have. Tracked by
   [#2214](https://github.com/mudler/vllm.cpp/issues/2214). Discharged by either
   of those two things and by nothing else.
-- **O2 — `IQ4_XS` is unimplemented and the target arm cannot be opened without
-  it** (§3.4). Discharged by W1 landing `kIQ4_XS` with a decoder and a keep-quant
-  `vec_dot`, byte-exact against llama.cpp `b10451`. Owned by
-  `QUANT-GGUF-IQ4_XS`.
-- **O3 — `IQ2_XS` (id 17) and `IQ1_M` (id 29) have no reader traits at all**, so
-  `UD-Q2_K_XL` and `UD-IQ1_M` refuse at file open. Discharged by implementing
-  them, or by this row permanently recording those two arms as unreachable.
-  Nothing here needs them; they are named so a later reader does not rediscover
-  the refusal as a defect.
+- **O2 — `IQ4_XS` has a decoder and no keep-quant `vec_dot`, so the target arm
+  loads by EXPANDING four expert towers from 6.375 GiB to 24.000 GiB and, worse,
+  drops out of the streaming lane entirely** (`gguf_device_fit.cpp:85-100` is
+  all-or-nothing across a model's `*_exps` tensors). Discharged by W1 landing
+  `VecDotIQ4_XSQ8_K`. Owned by `QUANT-GGUF-IQ4_XS`.
+- **O3 — `IQ2_XS` (id 17) is in the same state and `IQ1_M` (id 29) has no reader
+  traits at all.** `UD-Q2_K_XL` would expand 148 towers from 128.344 GiB to
+  888.000 GiB; `UD-IQ1_M` refuses at file open. Discharged by a
+  `VecDotIQ2_XSQ8_K` and an `IQ1_M` port, or by this row permanently recording
+  those two arms as unreachable. Nothing here needs either; they are named so a
+  later reader does not rediscover them as defects.
+- **O3b — `94de63ff5` left `IQ2_XS` and `IQ4_XS` decodable but not keep-quant,
+  for every row, not only this one.** That is a silent 3.4x memory multiplier on
+  any artifact carrying them, invisible to a token gate, and it is not this row's
+  record to repair. Named here because a reader who checks `gguf_dequant.cpp` and
+  stops will conclude both types are supported.
 - **O4 — the indexer KV side cache does not exist**, so sparse decode refuses any
   resumed request (`dots3_note_device.cpp:1147-1180`). Discharged by W5, whose
   work is `KV-DSV4-MULTICACHE`'s
@@ -1993,13 +2046,20 @@ geometry this model needs already validates and already dispatches to native
 kernel instantiations. What is left is the indexer KV side cache (O4), sparse
 prefill (O6), and the schedule/reuse semantics.
 
-**The blocker that remains is one quantization kernel, and it is named.** The
-census of `UD-IQ1_S` over its own shard headers says the arm is 106 IQ1_S + 71
-IQ3_XXS + 44 IQ2_XXS + 4 IQ4_XS + 3 K-quant expert tensors, and `IQ4_XS` is the
-only one this tree cannot decode. Four tensors,
-`blk.{8,75,76,77}.ffn_down_exps.weight`. It fails loudly rather than expanding to
-bf16, which is the better failure and the reason this is a scoping finding rather
-than a discovery in W7.
+**The blocker that remains is one quantization kernel, it is named, and
+`origin/main` changed which half of it is missing while this spec was being
+written.** The census of `UD-IQ1_S` over its own shard headers says the arm is
+106 IQ1_S + 71 IQ3_XXS + 44 IQ2_XXS + 4 IQ4_XS + 3 K-quant expert tensors. At
+this branch's base `60a6dd97b`, `IQ4_XS` had no decoder and the arm refused
+loudly at load. At `94de63ff5`, landed 2026-08-29 for the sibling Flash row
+([#2245](https://github.com/mudler/vllm.cpp/issues/2245)), it has a decoder and
+still no keep-quant `vec_dot` — so the arm now LOADS, expands those four towers
+from 6.375 GiB to 24.000 GiB, and drops out of the expert-streaming lane
+altogether, because `gguf_device_fit.cpp:85-100` is all-or-nothing across a
+model's `*_exps` tensors. **The missing piece is `VecDotIQ4_XSQ8_K`, and the
+failure it prevents is now silent rather than loud.** That is the sharper form of
+this finding and it is why the census had to be redone against the merged tree
+rather than trusted from an hour earlier.
 
 **The gate is the honest cost.** vLLM at the pin implements this architecture and
 cannot run it on any device this project can reach, so no wave may promise a

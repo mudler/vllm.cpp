@@ -1579,6 +1579,161 @@ trivially true there and a mask passes them all. At kv_len 3002 the gather reads
 2050 of 3002 rows per query token and the same assertions bite. A QSA gate that
 never crosses 2048 is not a weaker gate; it is not a gate.
 
+## Mutation record — W5b-5 (#2211)
+
+`Qwen4ExpTextAttention` as one production block, and the first place under
+`src/` that COMPOSES the QSA indexer. Method as in the sections above: one
+textual change applied to a pristine tree, proved applied by a **sha256 that
+moved** (the file is NEW on this branch and an untracked file has an empty diff
+whatever is written into it), the file `touch`ed so ninja cannot skip the
+rebuild, the **BUILD RETURN CODE READ BEFORE ANY TEST RESULT**, then restored
+from a byte-identical copy and `sha256sum`-verified against the pre-mutation
+digest `ab132cafcd327dda…`. Every row was re-measured on the FINAL head, after
+the repair. Target `src/vllm/model_executor/models/qwen4_exp_qsa_block.cpp`;
+suite `tests/vllm/models/test_qwen4_exp_qsa_block.cpp`, **8 cases / 2828
+assertions green** at the time this table was measured; the fresh-review repair
+recorded below took that to **8 / 2831**.
+
+**THE RED CAME FIRST, AND IT WAS MEASURED RATHER THAN ASSERTED.** With the suite
+and the header in place and both function BODIES replaced by a refusal, build
+rc 0, the run reported **7 of 7 cases failing, 8 of 11 assertions**, every one on
+`qwen4_exp qsa block: not composed yet`. Nothing in this file has ever passed
+against an absent composition.
+
+**Two mutations failed to BUILD on the first pass, which is the fourth time in
+this campaign that a build failure has presented as a pass.** M3 leaves `one`
+unused and M4 leaves `kl` unused; this tree builds with `-Werror`, ninja then
+leaves the STALE binary on disk, and a stale binary prints green. Both are re-run
+with the one `(void)x;` or `[[maybe_unused]]` that silences the warning and
+changes nothing the mutation is about, and only the second reading is recorded.
+Reading the build rc before the run rc is what caught it.
+
+| # | mutation | build rc | result |
+|---|---|---|---|
+| M1 | **setting 2**: inherit DeepSeek-V4's `n_head_scale = n_head ** -0.5`, which QSA has no tensor for | 0 | **RED, 1 of 8 cases, 2 assertions** — the LOGITS VALUE case alone, which is the whole point of it. This is the repair for M26, which survived at the op layer because no selection can move under a positive rescale |
+| M2 | **setting 3**: the softmax scale dropped from the fold | 0 | **RED, 1 of 8, 2** — again the value case alone |
+| M3 | **setting 1**: the indexer `weights` stop being ones, so the per-head fold no longer collapses to one constant | 0 | RED, 3 of 8, 7 |
+| M4 | **setting 4**: the scoring window becomes the WHOLE cache instead of the visible complete blocks | 0 | RED, 5 of 8 — by REFUSAL, not by assertion: a query then selects a block it cannot see and the gather's own in-range check throws. 113 assertions reached |
+| M5 | setting 4 at the other end: `win_start` skips the first block | 0 | RED, 6 of 8, 2 assertions of 113 — the value case reds, then the gather refuses a query that attends nothing |
+| M6 | the pooled key's rope span derived from the INDEXER head width instead of the model's | 0 | RED, 8 of 8, 11 assertions reached — a REFUSAL mutation: it trips the compressor's cos/sin coverage check |
+| M6b | the pooled key is never roped at all (`rotary_dim = 0`), which is IN RANGE | 0 | RED, 8 of 8 — the arithmetic companion to M6, so the territory is not gated by a refusal alone |
+| M7 | the pooled key's bf16 round-trip dropped | 0 | RED, 1 of 8, 1 |
+| M8 | the ragged tail rounded UP into a block that does not exist yet | 0 | RED, 8 of 8, 11 reached — a REFUSAL mutation: this file's own `RowsView` range check |
+| M8b | the LAST complete block dropped, which is IN RANGE | 0 | RED, 5 of 8, 4 assertions — the arithmetic companion to M8 |
+| M9 | the indexer q norm applies `out * w` instead of upstream's `out * (1 + w)` | 0 | RED, 1 of 8, 1 |
+| M10 | the model q norm loses the `+1` fold | 0 | RED, 2 of 8, 3 |
+| M11 | the model k norm loses the `+1` fold | 0 | RED, 2 of 8, 3 |
+| M12 | the side cache stores a NORMED indexer key, which the compressor then norms again | 0 | RED, 4 of 8, 38 |
+| M13 | the indexer key ignores `past_len` and overwrites row 0 | 0 | **RED, 1 of 8, 2 — after the repair. It SURVIVED the first battery**, see below |
+| M14 | the attention softmax scale taken from the INDEXER head dim | 0 | RED, 2 of 8, 3 |
+| M15 | the query and the OUTPUT GATE halves of `q_proj` swapped | 0 | RED, 2 of 8, 3 |
+| M16 | the sigmoid OUTPUT GATE dropped entirely | 0 | RED, 2 of 8, 3 |
+| M17 | the key is never roped, only the query | 0 | RED, 2 of 8, 3 |
+| M18 | GPT-J adjacent-pair rotation (DeepSeek-V4's) instead of NeoX half-split | 0 | RED, 3 of 8, 131 |
+| M19 | the value cache ignores `past_len` | 0 | RED, 1 of 8, 1 |
+| M20 | **THE LOAD-BEARING ONE**: the consumer is handed EVERY VISIBLE block — a dense walk wearing a gather's clothes | 0 | **RED, 3 of 8, 130 assertions** — the golden case at over-budget, the NaN-poison case and the released-config sparsity case |
+| M21 | the key is roped into a SCRATCH, so the cache keeps the un-roped key | 0 | RED, 2 of 8, 3 |
+| M22 | **the rope cross-check's production call site deleted** — the fresh-review repair below | 0, after `[[maybe_unused]]` silences the `-Werror=unused-function` this leaves | **RED, 1 of 8, 2** — both new refusal subcases stop throwing |
+
+**THE SURVIVOR, AND ITS REPAIR.** M13 writes the indexer key at cache row 0
+instead of row `past_len`, and in the first battery it SURVIVED: 8 of 8 cases,
+2805 of 2805 assertions. The reason is structural rather than careless. Every
+golden case is a PREFILL, where `past_len` is 0 and the two spellings are the
+same expression; the one case with `past_len > 0` compared the block OUTPUT at a
+bf16-sized relative bound, and one wrong pooled key moves the selection by one
+block out of five and leaves the answer inside it. The repair is an observable of
+WHERE the write landed rather than of what it was worth: the decode case now
+compares the side cache ROW FOR ROW against `k...IdxKRaw`, the oracle's own raw
+indexer keys, after a split prefill/decode. M13 reds on it.
+
+**WHAT THE VALUE GATE MEASURED, and why its bound is 1e-6 rather than 1e-3.**
+Fed `k...IdxQPost` and `k...IdxKRaw` — the oracle's own roped indexer query and
+raw keys, captured by intercepting `apply_rotary_pos_emb` and slicing
+`index_qk_proj`'s output — the composed logits are BIT-IDENTICAL to the oracle's
+own pre-top-k `scores`: max abs **0** over a scale of 3.365 (12 logits,
+sub-budget) and 6.239 (60 logits, over-budget). The reassociation the spec names
+(upstream divides AFTER the head sum, the op's fold multiplies BEFORE it) does
+not move a value at these shapes. Fed this port's OWN bf16 projection and bf16
+RoPE instead, the same comparison lands at 1.76e-3 and 1.50e-3 — measured, not
+feared, and it is why the fixture captures the oracle's inputs at all. The two
+are separate cases: one gates the CONSTANTS, the other gates the INPUTS
+(measured 0 and 3.8e-3 / 4.2e-3 against a bf16-sized 1e-2), and neither pretends
+to be the other.
+
+**THE OTHER MEASURED MARGINS**, so that a later reader can see which bound is
+load-bearing and which is slack. Block output vs the oracle: 5.05e-3 and 5.58e-3
+against 3e-2 (5.4x). The decode step: 6.13e-3 against 3e-2. The roped indexer
+query: 4.22e-3 against 1e-2, a 2.4x margin and the tightest in the file — one
+bf16 ulp is the floor there, because `vt::RopeFromCache` computes each rotated
+pair in f32 and stores once where upstream multiplies and adds in bf16.
+
+**WHAT THE CONTEXT LENGTH BUYS, measured again at the BLOCK layer.** At kv_len
+3002 with the released indexer values (budget 2048, compress ratio 4) the block
+reads `keys_visited` **16400** against a dense **24016** — 512 blocks x 4 rows
+plus the 2-token ragged tail, x 4 query heads x 2 softmax passes. Below 2048
+every candidate is selected and that assertion is trivially true, which is why
+the case exists at 3002 and not at the fixture's 23.
+
+**THE NaN PROBE AT THE BLOCK LAYER, and what it does and does not add.** The
+block is run twice over identical inputs, the second time over a cache whose 12
+of 23 rows the block's OWN selection does not name are bf16 NaN in both K and V
+(11 attended). The output is finite AND bit-identical to the clean run, and
+`keys_visited` agrees. That convicts a mask at the BLOCK's consumer call, which
+the op-layer probe cannot do because it does not know what the block selects.
+What it does NOT add is the fetch-level property — that the bytes were never
+READ — which stays discharged by the `mprotect(PROT_NONE)` probe in
+`test_qwen4_exp_qsa_device.cpp`; M20 is what says this block's only consumer call
+is the op that probe covers.
+
+**THE FRESH-REVIEW REPAIR: A HEADER THAT CLAIMED A GATE NOBODY HAD WRITTEN.**
+The header said of the two rope layouts "the caller builds both from one table
+and the gate asserts they agree". Nothing asserted it. The test's own `BuildRope`
+DERIVES `packed` from `cos`/`sin`, so the two agree BY CONSTRUCTION in every case
+in the file — which is not an assertion, and a layer loop that built them
+inconsistently would diverge silently while the header told the next reader it
+was covered. The block accepted two independently supplied layouts and
+cross-checked neither.
+
+Repaired by writing the check rather than softening the sentence, because a
+silent divergence in a layer loop is the failure this campaign keeps finding.
+`CheckRopeLayoutsAgree` refuses unequal heights, then compares a BOUNDED SAMPLE
+of rows — row 1, the midpoint and the last row — value for value at one bf16 ulp
+(2^-7); it refuses a non-CPU-resident pair BY NAME rather than skipping, because
+a check that silently does not run on a device arm is a mute switch. Row 0 is not
+a probe: cos is 1 and sin is 0 at every frequency there, so it agrees under every
+difference the probe exists to catch. A full comparison is not paid, and that is
+a cost decision rather than an oversight: it would be O(P * rot) per QSA layer per
+step to re-check a constant.
+
+**THE RED CAME FIRST, AND IT MEASURED THE SILENCE.** Two subcases were added
+BEFORE the check existed. One perturbs the FULL `cos` table at row `c.seq - 1`
+— a row nothing else in the block reads, because `vt::RopeFromCache` reads the
+PACKED cache and the compressor reads only block-start rows (multiples of 4, and
+10 is not one at seq 11); the other hands the two layouts different heights. On
+the pre-check head, build rc 0, both reported **did NOT throw at all** and the
+other **2829 of 2831 assertions passed** — so the divergence was invisible to
+every value gate in the file, which is the claim the header had been making in
+reverse. With the check in place: **8 of 8 cases, 2831 of 2831 assertions**. M22
+above deletes the production call site on the repaired head and reds both
+subcases again, which is what says the subcases gate the CHECK and not the
+arithmetic.
+
+**M1 AND M13 WERE RE-ARMED ON THE REPAIRED HEAD**, because a later commit can
+silently disarm an earlier commit's mutation proof. The table above was measured
+against the pre-repair file (digest `ab132cafcd327dda…`); the repaired file is
+`e837cf290a86bd0d…`. M1 (inherit `n_head ** -0.5`) reds 1 of 8 / 2 assertions and
+M13 (the indexer key at row 0) reds 1 of 8 / 2 assertions, both unchanged from
+their recorded rows. The remaining rows are not re-measured, and the reason is
+stated rather than assumed: the added check reads ONLY the two rope operand
+tables and compares them with each other, and no mutation in the table alters
+what a caller passes in those two arguments.
+
+**NO REACHABILITY MUTATION IS AVAILABLE AT THIS LAYER, and that is the honest
+statement rather than an omission.** AGENTS.md `## Nothing lands dead` wants a
+production call site deleted, and there is none to delete: `## Owed` records this
+block as unreached with the row and the issue that own the wiring. M20 is the
+strongest statement this slice can make — it proves the tests enter the consumer
+through `vt::Qwen4ExpQsaGatherAttention` and not through some other path.
 ## Mutation record — W5c-1 (#2031)
 
 Every mutation was sha256-proven applied, **its BUILD rc was read before any
@@ -1834,13 +1989,22 @@ is listed under `## Owed`.
   launch; and whether the gather is a genuine address-generated gather on the
   device or degrades to a mask, which is the whole point of the row and is
   exactly what a CPU host cannot measure.
-- **W5b OWES THE INDEXER COMPOSITION IN PRODUCTION CODE, AND FOUR SETTINGS WITH
-  IT.** This wave's headline claim is that QSA's block score and top-k are
-  `vt::DsaIndexerLogits` + `vt::DsaTopkSelect` with the fold collapsed. That
-  composition exists in exactly one place: the `RunIndexer` helper in
-  `tests/vllm/models/test_qwen4_exp_qsa_device.cpp`. Nothing under `src/` composes
-  it, so nothing outside that helper enforces any of the four settings the
-  collapse depends on:
+- ~~**W5b OWES THE INDEXER COMPOSITION IN PRODUCTION CODE, AND FOUR SETTINGS WITH
+  IT.**~~ **DISCHARGED by W5b-5 ([#2211](https://github.com/mudler/vllm.cpp/issues/2211)),
+  and the VALUE gate it demanded exists.** `Qwen4ExpQsaIndex`
+  (`src/vllm/model_executor/models/qwen4_exp_qsa_block.cpp`) composes the three
+  ops and states all four settings at one site, each beside the upstream line it
+  mirrors and the mutation that reds it. The gate is
+  `tests/vllm/models/test_qwen4_exp_qsa_block.cpp`, against the oracle's OWN
+  pre-top-k `scores` tensor: fed `k...IdxQPost` and `k...IdxKRaw` — the oracle's
+  own roped query and raw keys — the composed logits are BIT-IDENTICAL to it,
+  max abs **0** over scales of 3.37 and 6.24 across 12 and 60 logits. M1
+  (inherit `n_head ** -0.5`) and M2 (drop the softmax scale) both RED on that
+  case, which is the repair for M26's recorded survival. The paragraph below is
+  kept because it is the reasoning the repair rests on, not because the debt is
+  open. The composition WAS in exactly one place, the `RunIndexer` helper in
+  `tests/vllm/models/test_qwen4_exp_qsa_device.cpp`, and nothing under `src/`
+  enforced any of the four settings the collapse depends on:
   1. `weights` is all ones (`[T, index_n_heads]`), which is what collapses the
      per-head fold to a single constant. M27 is its red control.
   2. `n_head_scale == 1.0f`, NOT DeepSeek-V4's `n_head ** -0.5`, which QSA has no
@@ -1848,12 +2012,11 @@ is listed under `## Owed`.
   3. `softmax_scale == index_head_dim ** -0.5`, QSA's own scale.
   4. `win_end == kv_len / compress_ratio` per query token — the COMPLETE visible
      blocks, not the whole cache. M28 is its red control.
-  W5b must write this recipe again where no test helper is watching, and two of
-  the four have no gate that would catch a wrong value there: M26 records that
-  `n_head_scale` is invisible to selection BY CONSTRUCTION, because top-k is
-  invariant under a positive rescale of every score, and `softmax_scale` is
-  invariant for the same reason. Whatever composes these ops in production owes a
-  VALUE gate on the logits, not a selection gate.
+  Two of the four have no gate that would catch a wrong value in production:
+  M26 records that `n_head_scale` is invisible to selection BY CONSTRUCTION,
+  because top-k is invariant under a positive rescale of every score, and
+  `softmax_scale` is invariant for the same reason. That is why the W5b-5 gate is
+  a VALUE gate on the logits and not a selection gate.
 - **A single-pass online softmax for the gather.** The CPU kernel makes two
   passes over the selected rows per query head, which is why the honest read
   count is `selected * num_q_heads * 2`. A single-pass rewrite legitimately
@@ -1883,6 +2046,127 @@ is listed under `## Owed`.
   `mprotect(PROT_NONE)` inside the test, it is the case `the gather never FETCHES
   an unmapped unselected row`, and M11c is the paired control showing it convicts
   a body the NaN poison cannot see. Nothing about the instrument is owed.
+
+- **W5b-5 ([#2211](https://github.com/mudler/vllm.cpp/issues/2211)) lands
+  UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `src/vllm/model_executor/models/qwen4_exp_qsa_block.{h,cpp}` — `Qwen4ExpQsaIndex`
+  and `RunQwen4ExpQsaBlock` — are reached at this merge commit only by
+  `tests/vllm/models/test_qwen4_exp_qsa_block.cpp`. No production entry point
+  calls either: this architecture's only one is `ModelRegistry::Forward`, it is
+  all-or-nothing, and `ForwardQwen4ExpForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp`) still refuses by name
+  because the LAYER LOOP is not written. The wiring is owned by row
+  `MODEL-MM-QWEN4-EXP` under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), tracked by campaign
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978). Also owed from that
+  wave, each named rather than discovered later:
+  - **THE LAYER LOOP, WHICH IS NOW THE ONLY THING BETWEEN THIS ROW AND A TOKEN.**
+    Every seam and every op the forward needs is on `main` — `RunGdnBlockPaged`
+    (W5b-1), the two gated-residual ops (W5b-2), `vt::Qwen4ExpPleConv` (W5b-3),
+    the two QSA ops (W5b-4) and now the QSA BLOCK (W5b-5). What has no production
+    shape yet is: the PLE block (the n-gram hash and its gather composed with
+    `vt::Qwen4ExpPleConv`), the GDN and MoE weight adapters
+    (`Qwen4ExpGdnWeights` -> `GdnLayerWeights`, `Qwen4ExpMoeWeights` ->
+    `MoeBlockWeights`; the GGUF loader mirrors `qwen3_5_gguf_weights.cpp` name for
+    name and shape for shape, so the adapters are field aliasing rather than
+    arithmetic), the 10240-wide hyper-connection stream through the per-layer
+    loop, the interleaved-mRoPE cos/sin table build, and the terminal mixer plus
+    `lm_head`.
+  - **THE `hc_norm` POLARITY IS A TRAP THE LAYER LOOP WALKS INTO, and it is
+    recorded here because W5b-5 hit the same shape and got it right by accident
+    of scope.** `LoadNormBf16(..., unshift=true)` INVERTS the converter's baked
+    `+1`, so every gamma the loader stores is the RAW HuggingFace value, centred
+    on 0. `vt::Qwen4ExpQsaCompress` wants exactly that and applies `(1 + w)`
+    itself; `vt::RmsNorm` wants it under `RmsNormArgs::gemma = true`, which is
+    what this block passes and what mutations M9/M10/M11 red. But
+    `vt::Qwen4ExpGatedResidual` documents the OPPOSITE convention — "hc_norm_w is
+    vLLM's parameterization, i.e. ALREADY `1 + w_hf` … This op never adds 1" —
+    so the layer loop must fold `hc_norm`, `norm_key`, `norm_query` and
+    `norm_conv` with `vllm::qwen4_exp::HcNormWeightFromHf` before handing them to
+    that op. Miss it and every gated residual applies a near-zero scale, which
+    reads as a checkpoint bug rather than a port bug. Nothing gates this today,
+    because the layer loop is the first caller. **Tracked as
+    [#2218](https://github.com/mudler/vllm.cpp/issues/2218)**, which is its own
+    wave and deliberately not repaired here. The contradiction is visible AT THE
+    LOAD SITE and does not need the op to be read to be seen:
+    `qwen4_exp_weights.cpp:258-263` argues FOR the fold in its own comment — "the
+    fold is what makes the file's value the multiplier our own `out * weight`
+    grouped norm wants", corroborated elementwise on three published artifacts —
+    immediately above the line that strips it with `unshift=true`.
+  - **The PAGED cache.** This block takes CONTIGUOUS per-sequence K/V and a
+    contiguous indexer side cache, which is the shape both `vt::` ops already
+    accept — the gather addresses its cache as `(p * HKV + kvh) * DH + d` and
+    never reads `stride[0]`. The block-table store belongs to the wave that gives
+    QSA a real KV-cache group, which waits on
+    [#2131](https://github.com/mudler/vllm.cpp/issues/2131) and on W5c.
+  - **The RAGGED-BATCH form.** `kv_lens[t] = past_len + t + 1` is built inside the
+    block from a CONTIGUOUS visible prefix. Upstream's general form reads an
+    arbitrary visibility set out of a padded batch's mask, and the ops' own
+    `## Owed` already records that nothing here can detect one; the block
+    inherits that limit rather than adding to it.
+  - **The cos/sin table BUILD**, and with it the interleaved-mRoPE section
+    layout. The block takes the tables as operands in BOTH layouts the two ops
+    want — a bf16 PACKED `[P, rot]` cos|sin cache for `vt::RopeFromCache` and two
+    f32 FULL `[P, rot]` tables for `vt::Qwen4ExpQsaCompress` — and asserts each by
+    name. It also CROSS-CHECKS the two against each other, which it did not when
+    the header first claimed it did: equal heights, then a BOUNDED SAMPLE of rows
+    (row 1, the midpoint and the last row) compared value for value at one bf16
+    ulp. Row 0 is not a probe, because cos is 1 and sin is 0 at every frequency
+    there and it agrees under every construction difference. What the sample
+    cannot see is a single corrupted row; what it does see is every table-wide
+    difference a layer loop can make — a different theta, a different
+    `rotary_dim`, an interleaved pack, swapped halves, an off-by-one position
+    offset, or a position scaling applied to one table and not the other. A FULL
+    comparison is deliberately not paid: it would be O(P * rot) per QSA layer per
+    step to re-check a constant. The wave that builds them still owes the case
+    with three DISTINCT position streams this spec already records as unowned.
+  - **The bf16 STORAGE arm is the only arm.** The block refuses an f32 `hidden`
+    by name, and the reason is a shared-surface fact rather than a preference:
+    every `vt::` output-gate op in this tree — `SigmoidGateBf16`,
+    `SharedExpertGate` — stores bf16 on every backend, because vLLM resolves one
+    model dtype and this tree inherits that polarity. An f32 arm would have to
+    widen a dispatcher across five backends this host cannot gate, and the
+    refusal says so.
+  - **The CUDA arm**, which is the QSA ops' own owed item and not a new one. The
+    block adds no arithmetic, so it inherits that debt unchanged. TWO things ARE
+    new at the BLOCK level, and they are named here rather than folded into that
+    inherited debt, because a device arm has to answer both and neither is
+    visible from the ops:
+    - **The indexer's per-call INDEX BUILD is done on the host.**
+      `Qwen4ExpQsaIndex` materialises `ones` `[T, H]`, `win_start` `[T]` and
+      `win_end` `[T]` into host vectors and hands each to a `DBuf`, and
+      `RunQwen4ExpQsaBlock` does the same for `kv_lens` `[T]` — FOUR small
+      host-to-device copies per QSA layer per step on a device queue. It also
+      `VT_CHECK`s that `kv_lens` is CPU-resident and reads it on the host to build
+      the window, which is a refusal a device-resident batch would hit by name.
+      Upstream rebuilds exactly the same metadata on every call —
+      `local_visible_indices` out of `torch.nonzero` on the mask row,
+      `block_token_indices`, `group_starts` and `selected_token_indices`, inside a
+      `for batch_idx / for query_idx` Python loop
+      (`modeling_qwen4_exp.py:667-702`) — so the PER-CALL REBUILD is a faithful
+      mirror rather than a divergence. What is not inherited is the transfer:
+      upstream has one device and no H2D edge to pay, so the device arm owes the
+      decision of where these four are built, and the nested Python loop is a
+      reminder that the oracle is a reference implementation and not a
+      performance model.
+    - **The pooled BLOCK KEYS are recomputed over the ENTIRE cache every step.**
+      The `block_keys` scratch is allocated per call and dropped, and
+      `vt::Qwen4ExpQsaCompress` runs over cache rows `[0, complete_keys)` — O(kv)
+      per layer per token, for a quantity that only ever GROWS by one block every
+      `compress_ratio` tokens. Upstream does the same, and worse: it recomputes
+      `pooled_keys` and `block_key_states` inside the per-query-token loop
+      (`:679-686`), so its cost is O(kv) per query token per layer. So this is a
+      faithful mirror of a reference implementation, and it is the shape that
+      makes the incremental store worth having. The wave that gives QSA a real
+      KV-cache group turns this scratch into the side cache's paged store and
+      inherits the choice of whether to keep it incremental.
+  - **The FETCH-level proof is inherited, not re-built.** The `mprotect(PROT_NONE)`
+    unmapped-tail probe lives one layer down in
+    `test_qwen4_exp_qsa_device.cpp`, and it is load-bearing for this block because
+    the block's ONLY consumer call is `vt::Qwen4ExpQsaGatherAttention`. Mutation
+    M20 is what says that call is the one under test: handing the consumer every
+    VISIBLE block — a dense walk wearing a gather's clothes — reds 3 of 8 cases
+    and 130 assertions.
 
 - [#1978](https://github.com/mudler/vllm.cpp/issues/1978): this port, the campaign
   row. W0 landed the spec with no product code.
@@ -2564,8 +2848,8 @@ is listed under `## Owed`.
 
 ## Now
 
-`ACTIVE`. Six reviewed waves have landed. Five of them are unreached by design
-and the sixth, W5a, is the first with a production call site:
+`ACTIVE`. Nine reviewed waves have landed. Eight of them are unreached by design
+and the ninth, W5a, is the only one with a production call site:
 
 | Wave | Lands | Issue |
 |---|---|---|
@@ -2577,6 +2861,9 @@ and the sixth, W5a, is the first with a production call site:
 | W5a | the GGUF weight loader, REACHED through the `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 | W5b-1 | `RunGdnBlockPaged`, the GDN block seam the forward needs cross-TU | [#2110](https://github.com/mudler/vllm.cpp/issues/2110) |
 | W5b-2 | the gated-residual hyper-connection stream as two `vt::` ops | [#2123](https://github.com/mudler/vllm.cpp/issues/2123) |
+| W5b-3 | the PLE dilated depthwise causal conv as `vt::Qwen4ExpPleConv` | [#2156](https://github.com/mudler/vllm.cpp/issues/2156) |
+| W5b-4 | Qwen Sparse Attention as two `vt::` ops, plus the unmapped-tail probe | [#2167](https://github.com/mudler/vllm.cpp/issues/2167) |
+| W5b-5 | `Qwen4ExpTextAttention` as ONE block, and the indexer composition in `src/` | [#2211](https://github.com/mudler/vllm.cpp/issues/2211) |
 | W5c-1 | the KV-cache spec: THREE groups, REACHED through `make_kv_cache` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
@@ -2609,12 +2896,22 @@ is still no token number, no speed number, no `examples/server` e2e and no
 arm SERVE, which is W5b, not W5a. W2, W3 and W4
 remain host reference math with no production call site.
 
-**What is owed, in order.** W5b, the forward in `vt::` ops
-([#2031](https://github.com/mudler/vllm.cpp/issues/2031)) — its two seams are now
-in place, `RunGdnBlockPaged` for the 36 linear layers (W5b-1) and the
-gated-residual ops for the 10240-wide stream (W5b-2), and what remains needing
-NEW `vt::` ops is the PLE and the QSA consumer, plus the layer loop that composes
-everything. The mixer/lm_head tail no longer does: the terminal
+**What is owed, in order. THE OP AND SEAM WORK IS FINISHED; WHAT IS LEFT IS THE
+LAYER LOOP.** W5b needed five slices and four of them are ops or seams:
+`RunGdnBlockPaged` for the 36 linear layers (W5b-1), the two gated-residual ops
+for the 10240-wide stream (W5b-2), `vt::Qwen4ExpPleConv` (W5b-3) and the two QSA
+ops (W5b-4). W5b-5 turned the last of those into a decoder-layer BLOCK —
+`RunQwen4ExpQsaBlock`, the first production composition of the QSA indexer — so
+**nothing this architecture needs is missing from the `vt::` surface any more.**
+What has no production shape yet is the PLE block, the GDN and MoE weight
+adapters onto `GdnLayerWeights` / `MoeBlockWeights`, the hyper-connection stream
+through the per-layer loop, the mRoPE cos/sin table build, and the loop itself.
+One trap is recorded under `## Owed` for whoever writes it and is worth repeating
+here because it is silent: the loader stores every gamma in the RAW HuggingFace
+parameterization, `vt::RmsNorm` wants that under `gemma = true`, and
+`vt::Qwen4ExpGatedResidual` wants the OPPOSITE — a layer loop that hands it the
+raw gamma applies a near-zero scale and reads as a checkpoint bug. The
+mixer/lm_head tail is not owed: the terminal
 `use_combine=false` mixer IS `vt::Qwen4ExpGatedResidual` with a null
 `block_inject`, gated as its own case in `test_qwen4_exp_hc_device.cpp`, and
 `Qwen4ExpTextModel` has no final RMSNorm after it (`## Owed`), so the tail is

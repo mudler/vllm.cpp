@@ -306,9 +306,9 @@ column above is the entry point, not the whole chain.
   P150 (identical leg, JIT-discard per arm, one lock hold) plus a fresh
   benchmark-record entry; a wall that does not move is a reported
   result — the attribution shifts or the lever is named unreachable
-  with the trace that proves it. The tt-metal-side residual (cached
-  context handles, amortized CQ polling) stays recorded as the
-  upstream-shaped alternative.
+  with the trace that proves it. The tt-metal-side residual (a
+  multi-destination write that reaches several offset views at once)
+  stays recorded as the upstream-shaped alternative.
   **Outcome (2026-08-29): named unreachable** — see `## Evidence`, W6.
   The successor lever is round-trip elimination, not write amortization.
 

@@ -64,6 +64,19 @@ std::vector<float> Rand(Rng& rng, int64_t n, float scale) {
   for (auto& e : v) e = rng.next(scale);
   return v;
 }
+
+// W1d (#2186): the carried tower's FP8-sourced half is `HostBf16`, so the fixtures
+// that fill those slots generate at bf16. Same `rng` draw as `Rand`, narrowed once
+// -- the tests below assert structure (finiteness, determinism, trace counts, the
+// miswire arms differing), not hand-computed values, so the extra rounding changes
+// no expectation. Generating here rather than converting at each assignment keeps
+// the fixture's dtype visible at the slot it fills.
+vllm::HostBf16 RandBf16(Rng& rng, int64_t n, float scale) {
+  const std::vector<float> f = Rand(rng, n, scale);
+  vllm::HostBf16 out(f.size());
+  for (size_t i = 0; i < f.size(); ++i) out[i] = vt::F32ToBF16(f[i]);
+  return out;
+}
 std::vector<float> NormW(Rng& rng, int64_t n) {
   std::vector<float> v(static_cast<size_t>(n));
   for (auto& e : v) e = 1.0f + rng.next(0.1f);
@@ -129,19 +142,19 @@ DeepseekV4LayerHostWeights DenseGatedLayer(Rng& rng, const DeepseekV4Params& p) 
   L.hc_ffn_fn = Rand(rng, hc3 * hcH, 0.2f);
   L.hc_ffn_base = Rand(rng, hc3, 0.2f);
   L.hc_ffn_scale = Rand(rng, 3, 0.5f);
-  L.wq_a = Rand(rng, qlr * H, 0.3f);
+  L.wq_a = RandBf16(rng, qlr * H, 0.3f);
   L.q_norm_weight = NormW(rng, qlr);
-  L.wq_b = Rand(rng, (nh * hd) * qlr, 0.3f);
-  L.wkv = Rand(rng, hd * H, 0.3f);
+  L.wq_b = RandBf16(rng, (nh * hd) * qlr, 0.3f);
+  L.wkv = RandBf16(rng, hd * H, 0.3f);
   L.kv_norm_weight = NormW(rng, hd);
   L.attn_sink = {0.7f, -0.4f};
-  L.wo_a = Rand(rng, og * olr * in_per_group, 0.3f);
-  L.wo_b = Rand(rng, H * (og * olr), 0.3f);
+  L.wo_a = RandBf16(rng, og * olr * in_per_group, 0.3f);
+  L.wo_b = RandBf16(rng, H * (og * olr), 0.3f);
   L.gate_weight = Rand(rng, ne * H, 0.4f);
   L.gate_bias = Rand(rng, ne, 0.3f);  // learned-gate (noaux_tc bias), NOT tid2eid
-  L.shared_w1 = Rand(rng, mi * H, 0.3f);
-  L.shared_w3 = Rand(rng, mi * H, 0.3f);
-  L.shared_w2 = Rand(rng, H * mi, 0.3f);
+  L.shared_w1 = RandBf16(rng, mi * H, 0.3f);
+  L.shared_w3 = RandBf16(rng, mi * H, 0.3f);
+  L.shared_w2 = RandBf16(rng, H * mi, 0.3f);
   L.exp_w1 = Rand(rng, ne * mi * H, 0.3f);
   L.exp_w3 = Rand(rng, ne * mi * H, 0.3f);
   L.exp_w2 = Rand(rng, ne * H * mi, 0.3f);
@@ -175,7 +188,7 @@ DeepseekV4HostWeights TinyTarget(const DeepseekV4Params& p) {
     // add the compressor / indexer towers where the config asks (so the target
     // forward exercises the real interleave; the MTP block never does).
     if (p.has_indexer(l)) {
-      L.idx_wq = Rand(rng, (p.index_n_heads * p.index_head_dim) * H, 0.3f);
+      L.idx_wq = RandBf16(rng, (p.index_n_heads * p.index_head_dim) * H, 0.3f);
       L.idx_wk = Rand(rng, p.index_head_dim * H, 0.3f);
       L.idx_wproj = Rand(rng, p.index_n_heads * H, 0.3f);
     }

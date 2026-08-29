@@ -20,6 +20,7 @@
 #include "support/test_env.h"
 #include "vllm/gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace {
@@ -161,6 +162,32 @@ std::string BuildGgufWithNvfp4ExpertTower() {
 // dtype. So the accept has two routes because the loader has two, and this file
 // is the one that says so.
 constexpr size_t kF16TowerStaged = 512;  // 256 elems x 2 bytes, on disk and bf16
+
+// QUANT-GGUF-IQ-VECDOT (#2247). The i-quant expert towers of the two staged
+// GLM-5.3 artifacts, in the ONE role both models actually store them in.
+//
+//   blk.0.ffn_gate_exps.weight  IQ2_XS (17), ne [256, 2, 4] -> 2048 elems,
+//                               8 super-blocks x 74 B = 592 B
+//   blk.1.ffn_down_exps.weight  IQ4_XS (23), same ne, 8 x 136 B = 1088 B
+//
+// This is the fixture that makes the lane's all-or-nothing rule bite on a REAL
+// encoding mix rather than on an F32 straw tower. `GgufExpertTowersReachSlotLane`
+// bails on the FIRST tensor that does not reach a keep residency, so before
+// #2247 a handful of IQ4_XS towers dropped a whole arm out of the streaming
+// lane: on the GLM-5.3 UD-IQ1_S arm, 4 IQ4_XS tensors beside 221 that all keep.
+// One tower then goes 6.375 GiB -> 24.000 GiB of bf16 and the uniform slot goes
+// 6.375 MiB -> 24.00 MiB, which turns a 4096-slot cache from 25.5 GiB into
+// 96 GiB. The kernels are what close that, and this case is the assertion that
+// says so.
+std::string BuildGgufWithIQuantExpertTowers() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {256, 2, 4}, /*ggml_type=*/17,
+              std::string(8 * 74, '\x31'));
+  b.AddTensor("blk.1.ffn_down_exps.weight", {256, 2, 4}, /*ggml_type=*/23,
+              std::string(8 * 136, '\x47'));
+  return b.Build();
+}
 
 std::string BuildGgufWithF16ExpertTower() {
   GgufModelBuilder b;
@@ -640,6 +667,45 @@ TEST_CASE(
   // built wrong: the Q8_0 tower on its own does reach it.
   CHECK(vllm::GgufExpertTowersReachSlotLane(
       gguf, "gate_exps.weight", PolicyWith(true, false, false, false)));
+}
+
+TEST_CASE(
+    "gguf_device_fit: IQ2_XS and IQ4_XS expert towers REACH the slot lane") {
+  // QUANT-GGUF-IQ-VECDOT (#2247). The decisive assertion for the second
+  // consumer of these two kernels. Both towers are 256-element super-blocks in
+  // `kStackedExpertWeight`, the role `PeekRoute` asks about and the role both
+  // GLM-5.3 arms store their routed experts in. Between #2245 and #2247 both
+  // encodings decoded and neither had a `vec_dot`, so `KeepQuantDType` refused
+  // them, `PeekRoute` answered `kExpandBf16`, and this predicate returned false
+  // on the FIRST of them.
+  TempFile f(BuildGgufWithIQuantExpertTowers());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+
+  CHECK(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, false)));
+  // Each tower on its own, so a pass cannot come from one encoding carrying the
+  // other: the suffixes select exactly one tensor each.
+  CHECK(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "gate_exps.weight", PolicyWith(true, false, false, false)));
+  CHECK(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "down_exps.weight", PolicyWith(true, false, false, false)));
+
+  // The same two doors that turn the lane off for every other encoding still
+  // turn it off for these: the documented keep-quant opt-out, and `VT_CPU_REF`.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(false, false, false, false)));
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, true)));
+
+  // And the residency itself, stated directly in the same role, so a reader
+  // does not have to infer it from the predicate above.
+  for (const vllm::GgufTensorInfo& t : gguf.Tensors()) {
+    CAPTURE(t.name);
+    CHECK(vllm::RouteGgufTensor(true, false, false, false,
+                                vllm::GgufTensorRole::kStackedExpertWeight,
+                                t.ggml_type,
+                                t.shape) == vllm::GgufResidency::kKeepQuant);
+  }
 }
 
 TEST_CASE(

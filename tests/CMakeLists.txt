@@ -3363,3 +3363,11 @@ target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_ple_device vllm/models/test_qwen4_exp_ple_device.cpp)
 target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5d-2 (#2249 item 5) — behaviour-neutrality gate for giving
+# `BuildMropeCosSinHost` external linkage. Pins the interleaved and chunked
+# mRoPE cos|sin tables BITWISE against the values the file-static definition
+# produced at base SHA 94de63ff5, and is itself the seam case: a FOREIGN
+# translation unit reaching the definition only through the new public header.
+# No src/ grant — the whole point is that the header is public.
+vllm_cpp_add_test(test_qwen3_5_mrope vllm/models/test_qwen3_5_mrope.cpp)

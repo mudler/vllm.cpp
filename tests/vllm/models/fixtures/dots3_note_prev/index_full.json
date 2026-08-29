@@ -9,7 +9,8 @@
  "checkpoint_total_size_bytes": 576886825984,
  "shard_file_count": 133,
  "tower_files": {"vision_encoder.": "model-vision.safetensors", "audio_encoder.": "model-audio.safetensors"},
- "bucket_totals": {"language": 35381, "vision": 2195, "audio": 430},
+ "bucket_totals": {"language": 35362, "nextn": 19, "vision": 2195, "audio": 430},
+ "bucket_totals_note": "RECLASSIFIED at W5c (#2176), not re-measured: the 19 nextn tensors -- model.layers.46.* (18) and model.mtp.embed_tokens.weight -- moved out of `language` into their own `nextn` bucket, so 35362 + 19 = 35381, which is W2's language count unchanged. The move is because vLLM DROPS those weights when it loads the main model (utils.py:542 -> deepseek_v2.py:1618-1620; models/dots3_note/nvidia/model.py:624 @ bc2d63e650) and the language forward never reads them; folding 19 unloaded weights into `language` leaves every 100%-accounted assertion green over a silent drop. They stay ENUMERATED, so an absent one still refuses. The four buckets still sum to 38006.",
  "total_families": 1808,
  "tensors": {
   "audio_encoder.audio_adapter.proj.0.bias": [1, "BF16", [1280], "model-audio.safetensors"],

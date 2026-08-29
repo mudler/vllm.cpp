@@ -22,8 +22,17 @@ path.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
 windowed CUDA kernels were compiled and executed on `orin:gpu0` (sm_87) instead,
 through an `rc` lease on 2026-08-26 (§4.8). Read the `fa2` row before booking a
 lease for anything on the FA-2 path, and pick the host by capability.
-**Status:** W4b-3c — **the DSA lightning indexer's SELECTION is on the decode
-path** (§7 W4b-3, evidence §4.9), on top of W4b-2's two attention geometries
+**Status:** W5 — **the RELEASED `config.json` is REPRESENTABLE for the first
+time** (§7 W5, evidence §4.10). `Dots3NoteDeviceRefusal` returns "" for
+`dots-studio/dots3-note-prev`: W5 put the 45 MoE layers on the decode path
+through `Dots3NoteMoeBlock` over the shared `RunMoePlaced` seam, and W5c
+([#2176](https://github.com/mudler/vllm.cpp/issues/2176)) removed the nextn
+branch, which was STRICTER THAN UPSTREAM. **Representable is not runnable**: the
+MoE alone is 545.82 GB of a 576.89 GB checkpoint (94.62%), so nothing this
+project owns can feed it, and the 298.67 GB fp8 sibling is refused BY NAME as
+W9.
+That sits on top of W4b-3c — **the DSA lightning indexer's SELECTION is on the
+decode path** (§7 W4b-3, evidence §4.9), on W4b-2's two attention geometries
 (§4.8), W4b-1's host maths (§4.7), W4a's full-attention layer (§4.6), W3's host
 reference (§4.5), W2's whole weight map (§4.4) and W1's config + registry
 (§4.1). The arch RESOLVES, parses, accounts for 38006/38006 of the released
@@ -38,7 +47,7 @@ requests are all single-shot prefills is SERVED sparsely; a step in which any
 request resumes is REFUSED BY NAME, because the indexer's own key cache is
 `KV-DSV4-MULTICACHE` ([#1925](https://github.com/mudler/vllm.cpp/issues/1925))
 and not this row. The RELEASED checkpoint still REFUSES BY NAME, now at its
-first MoE layer (W5), and so do GGUF and both towers. Exactly ONE GPU lease has
+first MoE layer until W5 LIFTED it, and both towers still do. Exactly ONE GPU lease has
 run a BRICK GATE of this row, at kernel level and no further: `orin:gpu0`
 (sm_87) compiled and ran W4b-2's two windowed CUDA ops on 2026-08-26 (§4.8).
 The row's other leases were `thor:gpu0` provisioning and `ctest` baseline runs,
@@ -92,7 +101,16 @@ video + audio understanding, 512K positions.
 
 **Checkpoint, from the HF API:** 131 language shards + `model-vision.safetensors`
 (13.7 GB) + `model-audio.safetensors` (1.77 GB) = **~576 GB** repo total in bf16.
-The `-fp8` sibling is ~290 GB. There is no smaller `dots3-note` variant in the
+The `-fp8` sibling is 298,673,280,504 bytes = **298.67 GB**.
+
+**SIZES IN THIS SPEC ARE DECIMAL GB (10^9 bytes)**, which is the unit the HF API
+returns and the unit the 576.89 / 545.82 / 543.58 GB figures below are already
+in; a binary figure is always written `GiB`. W0 through W5 wrote the fp8 sibling
+as "~290 GB", which is neither convention — 298,673,280,504 B is 298.67 GB
+decimal or 278.16 GiB binary. This is the one brick whose whole honesty argument
+rests on exact sizes, so the measured number is quoted rather than rounded.
+
+There is no smaller `dots3-note` variant in the
 `dots-studio` org — the org's other models (`dots.llm1`, `dots.ocr`, `dots.mocr`,
 the `dots.tts*` family) are different architectures, not scaled-down NOTEs.
 
@@ -316,10 +334,10 @@ the vLLM-side wrapper.
 
 ### 2.6 Multimodal front end and MTP
 
-`nvidia/multimodal.py:49` `Dots3NoteForCausalLM(nn.Module, SupportsMultiModal,
-SupportsPP)` — `get_placeholder_str:65`, `_process_image_input:144`,
-`_process_audio_input:156`, `_process_video_input:172`, `embed_multimodal:225`,
-`get_mm_mapping:300`. `common/processor.py` (811) and `common/video.py` (497)
+`nvidia/multimodal.py:65` `Dots3NoteForCausalLM(nn.Module, SupportsMultiModal,
+SupportsPP)` — `get_placeholder_str:81`, `_process_image_input:173`,
+`_process_audio_input:186`, `_process_video_input:202`, `embed_multimodal:255`,
+`get_mm_mapping:325`. `common/processor.py` (811) and `common/video.py` (497)
 carry the prompt-side expansion and frame sampling.
 `nvidia/mtp.py:31,88,141` — `Dots3NoteMultiTokenPredictorLayer`,
 `Dots3NoteMultiTokenPredictor(DeepseekV32MultiTokenPredictor)`,
@@ -3266,6 +3284,689 @@ cannot express the indexer additively (return `NEEDS_DECISION` rather than
 writing a second path); or if the combined change stops being reviewable in one
 pass.
 
+### 4.10 W5 puts the MoE on the decode path, and the released config stops refusing
+
+**Issue [#699](https://github.com/mudler/vllm.cpp/issues/699); the nextn half is
+[#2176](https://github.com/mudler/vllm.cpp/issues/2176).** Branch
+`row/MODEL-MM-dots3-note-W5`, base `8cf0808253ed49f11cf89799595a7846821d9ac6`.
+
+W4b-3c left `Dots3NoteDeviceRefusal` with exactly two branches: the MoE layer,
+which names W5, and the nextn tail, which names W10. This brick removes both and
+nothing else, so the RELEASED `dots-studio/dots3-note-prev` config is
+representable for the first time. Removing them is two different kinds of work
+and the difference is worth stating before either: the MoE branch needs a block
+written, and the nextn branch needs a refusal DELETED, because it is stricter
+than upstream.
+
+#### The released MoE arm IS bf16, which is unusual on this row
+
+Every other arm this row has met is a deferral. This one is not. From the
+committed full index
+(`tests/vllm/models/fixtures/dots3_note_prev/index_full.json`, revision
+`1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`, headers only, no tensor byte read):
+
+| Tensor family | dtype | shape | count |
+|---|---|---|---:|
+| `model.layers.N.mlp.experts.E.{gate,up}_proj.weight` | BF16 | `[1536, 5120]` | 11520 each |
+| `model.layers.N.mlp.experts.E.down_proj.weight` | BF16 | `[5120, 1536]` | 11520 |
+| `model.layers.N.mlp.shared_experts.{gate,up}_proj.weight` | BF16 | `[1536, 5120]` | 45 each |
+| `model.layers.N.mlp.shared_experts.down_proj.weight` | BF16 | `[5120, 1536]` | 45 |
+| `model.layers.N.mlp.gate.weight` | BF16 | `[256, 5120]` | 45 |
+| `model.layers.N.mlp.gate.e_score_correction_bias` | **F32** | `[256]` | 45 |
+
+45 MoE layers x 256 routed experts = 11520. The bias is the ONLY dtype
+exception in the whole MoE block, and it is F32 upstream too
+(`deepseek_v2.py:322-324`, `torch.empty(config.n_routed_experts,
+dtype=torch.float32)`). So W5's bf16 arm is not a placeholder arm chosen because
+the real one is out of reach — it is the arm the release ships, and the loader
+this brick writes reads the released bytes.
+
+**The shared expert's intermediate is `moe_intermediate_size *
+n_shared_experts`, and the index says so.** `[1536, 5120]`, not the dense
+layers' `[13824, 5120]`. A port that read `intermediate_size` there would build
+a 13824-wide MLP and fail at load rather than silently — but only if the load
+checks the shape BY NAME, which is why W5a does.
+
+**What that arm weighs, measured over the same index.** The routed experts alone
+are 543.58 GB of the checkpoint's 576.89 GB (94.23%); with the shared experts
+(2.12 GB) and the routers (0.118 GB) the whole MoE block is 545.82 GB, or
+**94.62%**. Nothing this project owns holds that in bf16, and the 298.67 GB fp8
+sibling does not fit either (§6.2). "Loadable" is therefore not "runnable end to
+end" on this row, and W5 does not change that.
+
+#### The upstream delta over `DeepseekV2MoE` is four items, and at TP=1 three of them are zero
+
+Re-derived at `bc2d63e650`, the revision W4b-2 and W4b-3c read.
+`git diff bc2d63e650 5559679229 -- vllm/models/dots3_note/` is EMPTY for the
+`model.py` this section cites, so these anchors are the pin's and the head's
+alike. Each carries a uniqueness discriminator, because several of the obvious
+strings are NOT unique in their file and a bare `grep -c` would have lied:
+
+| What | Anchor | `grep -c` of the discriminator |
+|---|---|---:|
+| the class | `nvidia/model.py:76` `class Dots3NoteMoE(DeepseekV2MoE)` | `class Dots3NoteMoE` = **1** |
+| the shared expert lifted OUT of the base | `model.py:87-99` (`routed_config` with `n_shared_experts` set to `None`) + `:101-113` | `self.shared_experts = DeepseekV2MLP` = **1** |
+| the block padding | `model.py:63` `def _padded_mlp_size` | `def _padded_mlp_size` = **1** (bare `_padded_mlp_size` = **3**: `:63`, `:103`, `:532`) |
+| the unfused add | `model.py:125-127` `super().forward(...) + self.shared_experts(hidden_states)` | `def forward` = **3** (`:115`, `:310`, `:462`) — the discriminator is the FIRST `def forward` after `class Dots3NoteMoE`, at `:115` |
+| the TP-only all-reduce | `model.py:100`, `:130-131` | `use_sequence_parallel_moe` = **1**, at `:540`, where the DECODER LAYER sets it `False` |
+| the routed scale's destination | `model.py:527` `apply_routed_scale_to_output=False` | `apply_routed_scale_to_output` = **3** (`:85`, `:94`, `:527`); the discriminator is the one inside `if is_moe:` at `:520-528` |
+| the base block | `deepseek_v2.py:287` `class DeepseekV2MoE(nn.Module)` | `class DeepseekV2MoE` = **1**; its `forward` is `:406` (`def forward` = **11** in that file) |
+| the router formula | `fused_moe/router/grouped_topk_router.py:80` `def grouped_topk` | `def grouped_topk` = **1** (bare `grouped_topk` = **16**) |
+
+The four items, and what each costs us:
+
+1. **The shared expert is lifted out of the base and added unfused.**
+   `routed_config = copy.copy(config)` then
+   `object.__setattr__(routed_config, "n_shared_experts", None)` (`:88-90`),
+   so `DeepseekV2MoE.__init__` takes the `config.n_shared_experts is None`
+   branch at `:354-355` and sets `self.shared_experts = None`. The base's
+   `forward` is therefore purely routed, and `Dots3NoteMoE.forward` adds
+   `self.shared_experts(hidden_states)` itself at `:125-127`. **Numerically
+   this is the same function `DeepseekV2MoE` computes when it owns the shared
+   expert** — `moe_runner.py`'s `shared_output + fused_output` — which is why
+   `vt::MoeCombine`'s optional `shared` term expresses it exactly and why
+   `deepseek_v2.cpp`'s `MoeBlock` did not have to change.
+2. **`_padded_mlp_size` is the IDENTITY here, twice over.** `:69-70` returns
+   `intermediate_size` unchanged when `block_size is None`, and the released
+   bf16 checkpoint carries no `quantization_config` at all (verified against
+   the committed `config.json`: the key is absent). Even with the fp8 sibling's
+   `weight_block_size = [128, 128]`, at `tp_size = 1` the formula reads
+   `blocks = (1536 + 127) // 128 = 12`, then `((12 + 1 - 1) // 1) * 128 * 1 =
+   1536` — the input. **Do not port it.** There is no code to mutate and the
+   mutation table says so rather than showing a green row.
+3. **`reduce_results=False` plus `tensor_model_parallel_all_reduce`** (`:100`,
+   `:130-131`) is TP-only. At TP=1 the all-reduce is the identity and the
+   decoder layer passes `reduce_results=False` anyway (`:524`).
+4. **The sequence-parallel path is DEAD.** `Dots3NoteDecoderLayer.__init__` sets
+   `self.use_sequence_parallel_moe = False` unconditionally at `:540` — that is
+   [vllm#52172](https://github.com/vllm-project/vllm/pull/52172), "Disable
+   sequence parallelism for Dots3 NOTE", the change that landed the day before
+   this spec's W0. `gather_output` at `:121` is therefore always false and
+   `:122-123` and `:128-129` never run.
+
+**The router GEMM stays bf16.** `_get_moe_router_dtype` (`deepseek_v2.py:131`)
+returns `torch.float32` only for `model_type == "glm_moe_dsa"` or an explicit
+`moe_router_dtype: "float32"`; `dots3_note` is neither, so it returns `None` and
+`GateLinear` runs at the model dtype. There is no fp32 router on this model, and
+recording that is the `porting.md` memory-format check for this path: a
+too-WIDE router is exactly the dtype defect no token gate can see.
+
+**`deepseek_v2.cpp`'s recorded deviation (a) does NOT apply here.** That
+deviation exists because vLLM's CUDA path selects
+`apply_routed_scale_to_output=True` and applies `routed_scaling_factor` to the
+combined routed OUTPUT, while we apply it to the routing WEIGHTS. dots3-note
+passes `apply_routed_scale_to_output=False` (`model.py:527`), so upstream puts
+the factor inside `grouped_topk` (`grouped_topk_router.py:159-160`) — which is
+`MoeRouterTopKArgs::routed_scaling_factor`, the same place we put it. The two
+sides agree by construction rather than by an argument about linearity. On the
+released config the factor is 1.0 regardless.
+
+#### Writing a model-local MoE block IS the seam, and hoisting DeepSeek's is not
+
+`include/vllm/model_executor/moe_placement_seam.h` states the contract in its
+own prose: every architecture has its own block with the shape
+`(Dev, weights, params, dh, T) -> DBuf`, and the SEAM is `RunMoePlaced`, which
+closes over the architecture's types with a lambda. `Dots3NoteMoeBlock` is
+therefore the seam being used as designed, not a parallel path.
+
+Hoisting `deepseek_v2.cpp`'s private `MoeBlock` was considered and REJECTED,
+and the reason is recorded so the next MoE model does not re-litigate it. That
+function is keyed on `DeepseekV2MoeWeights` and `DeepseekV2Params`; making it
+serve dots3-note means either a shared weights interface (which the seam's own
+header says it deliberately does not need) or templating it, and either way the
+edit lands on the SACRED DeepSeek-V2 path — 8/8 token-exact on DeepSeek-V2-Lite
+— to serve a model with no oracle at all. A two-model change against a SACRED
+path, to save one function, on a row whose §6.4 says nothing here can be
+compared against vLLM, is the wrong trade. The duplication is ~40 lines of `vt`
+calls; the risk is a token-exact gate on a different model.
+
+**No `vt` op changes and none is wanted.** `vt::MoeRouterTopK` already accepts
+`num_expert_group = 1 / topk_group = 1`; `vt::MoeSiluMul` and `vt::MoeCombine`
+are registered on CPU and CUDA both; `MoeCombine`'s optional `shared` term is
+exactly upstream's `+ self.shared_experts(x)`. If W5 had needed a second `vt` op
+the design would have been wrong, and the instruction was to return
+`NEEDS_DECISION` rather than write one.
+
+#### W5a — weights, and a blockwise-fp8 refusal that names the missing part
+
+`Dots3NoteMoeWeights` joins `Dots3NoteDenseMlp` on
+`Dots3NoteLayerDeviceWeights`, and `MaterializeDots3NoteDevice` picks one or the
+other per layer from `p.is_moe_layer(l)` — which it must, because on a MoE layer
+`mlp.gate_proj.weight` does not exist and the current code loads it
+unconditionally. Every shape is checked BY NAME through the existing
+`RequireShape`, and the shared expert's is asserted as `moe_intermediate_size *
+n_shared_experts` so a port that reached for `intermediate_size` refuses loudly.
+
+**The fp8 sibling gets a named refusal, and it is not hypothetical.** Fetched
+from the HF API at this brick: `dots-studio/dots3-note-prev-fp8`'s `config.json`
+carries `quantization_config = {"quant_method": "fp8", "fmt": "e4m3",
+"activation_scheme": "dynamic", "weight_block_size": [128, 128]}`, and its
+`model.safetensors.index.json` (73029 entries) ships a `weight_scale_inv` beside
+every expert projection — `model.layers.1.mlp.experts.0.gate_proj.weight_scale_inv`
+and its 3 x 256 x 45 siblings — while `mlp.gate.weight` has none. At
+`[1536, 5120]` with a `[128, 128]` block that scale is `[12, 40]`.
+`dense_loaders::MaterializeBf16Source`
+(`include/vllm/model_executor/models/dense_weight_loaders.h`) looks up
+`<name>_scale`, not `weight_scale_inv`, and accepts only a per-tensor or
+per-output-ROW scale (`n_scale == 1 || n_scale == rows`). So today an fp8
+dots3-note checkpoint throws `tensor not found: ..._scale` — a bare miss that
+names nothing. AGENTS.md requires an arm to refuse naming the missing part, so
+the refusal is keyed on the CONFIG (`quantization_config.weight_block_size`)
+rather than on a tensor lookup, and it fires before any bf16 loader runs.
+
+**Keying it on the config is also what keeps the per-ROW case safe.** If a
+future dots3-note republish shipped a per-output-row `_scale` instead of a
+blockwise `weight_scale_inv`, `MaterializeBf16Source` would silently dequantize
+it and run a bf16 GEMM on an fp8 checkpoint. That is numerically plausible
+output from an arm nobody ported, and no token gate on this row could see it
+(§6.4 — there is no token gate). The config-keyed refusal turns that into a
+message. The blockwise-fp8 MoE itself is **W9**.
+
+#### W5b — the block, the forward, and one thing recorded against W9
+
+`Dots3NoteMoeBlock(Dev, const Dots3NoteMoeWeights&, const Dots3NoteParams&,
+const Tensor& dh, int64_t T) -> DBuf`, routed through `vllm::RunMoePlaced` from
+the layer loop, with `layers::UnquantizedMlpGateUpMethod` for the shared expert
+so the mergeable-MLP seam carries it exactly as the dense layers' MLP is
+carried. The unconditional `DenseMlp(...)` call in `ForwardDevice` becomes a
+branch on the layer's kind, and the MoE branch of `Dots3NoteDeviceRefusal` goes.
+
+**Owed, recorded rather than built:** `vt::QuantFp8Group` has no `use_ue8m0`
+rounding. It does not bite at W5, because it is the ACTIVATION quantizer and W5
+is entirely on the bf16 path — nothing in this brick calls it. It probably does
+bite at **W9**, because upstream's blockwise-fp8 MoE routes through DeepGEMM
+with e8m0 scales, and a port that quantizes activations with plain
+power-of-two-free scaling there will disagree with the kernel upstream runs.
+Recorded here against W9 with the reason so it is not re-derived from scratch.
+
+**GGUF k-quants stay owed and refused by name** at `dots3_note_registry.cpp`.
+W5 does not weaken that refusal and does not touch it.
+
+#### W5c — the nextn refusal is STRICTER than upstream, and that is the defect
+
+Issue [#2176](https://github.com/mudler/vllm.cpp/issues/2176). This is a
+mirror-fidelity fix, not a feature: vLLM does not refuse a checkpoint that
+ships nextn weights, it DROPS them from the main model. Three anchors, at
+`bc2d63e650`, each with its discriminator:
+
+| Where | Line | `grep -c` |
+|---|---|---:|
+| `vllm/model_executor/models/utils.py` | `:542` `def get_spec_layer_idx_from_weight_name`, matching `model.layers.{base+i}.` or `layers.{base+i}.` at `:559` | `def get_spec_layer_idx_from_weight_name` = **1** |
+| `vllm/model_executor/models/deepseek_v2.py` | `:1618-1620` `spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)` / `if spec_layer is not None:` / `continue  # skip spec decode layers for main model` | `spec_layer = get_spec_layer_idx_from_weight_name` = **1** |
+| `vllm/models/dots3_note/nvidia/model.py` | `:624` `if name.startswith("mtp."):` / `continue`, inside `Dots3NoteModel._adapt_weights` (`:619`), reached from its `load_weights` (`:677-678`) | `startswith("mtp.")` = **1** |
+
+`Dots3NoteLanguageModelForCausalLM` (`model.py:681`) subclasses
+`DeepseekV32ForCausalLM`, so the `deepseek_v2.py` skip is on the path this
+architecture actually loads through. `num_nextn_predict_layers` is absent from
+the released `config.json` and §4 trap 3 correctly defaults it to 1, so every
+released checkpoint trips a refusal upstream does not have.
+
+**The repair is the classifier-deferral shape the towers already use**, with one
+difference that is forced by the data rather than chosen. `Dots3NoteDeferredTowers()`
+keys on a STATIC prefix, and the nextn tail's prefix is config-derived
+(`model.layers.{num_hidden_layers + i}.`, plus `model.mtp.`), so it gets a
+predicate — `Dots3NoteIsNextnTensor(params, name)` — rather than a table row.
+The counter is the point either way: `Dots3NoteAccounting` grows a `nextn`
+bucket, and over the released index the split becomes **35362 language / 19
+nextn / 2195 vision / 430 audio = 38006**, against W2's 35381 / 2195 / 430. The
+19 are `model.layers.46.*` (18) and `model.mtp.embed_tokens.weight`, and the
+committed fixture's `bucket_totals` is updated to the same split with a note
+that 35362 + 19 is W2's 35381.
+
+**The nextn names stay ENUMERATED**, so `Dots3NoteAccounting::missing` still
+refuses a checkpoint that claims a nextn layer and does not ship it. Only the
+BUCKET moves. That is the smaller change and it keeps a check W2 earned.
+
+Then the headline: `Dots3NoteDeviceRefusal(released_params).empty()`. That is a
+`true -> false` flip on an assertion that exists today, and it is what this
+brick is for.
+
+#### The gate design — a discrete assertion, because the hazard here is discrete
+
+No oracle (§6.4 option B). The instrument is an INDEPENDENT double-precision
+reference of the MoE block, transcribed from `grouped_topk_router.py:80`,
+`deepseek_v2.py:406` and `model.py:115`, and **written without reading
+`src/vt/cpu/cpu_ops.cpp`** — a reference that shares a helper with the code it
+gates measures consistency with itself.
+
+**Why a single continuous tolerance says almost nothing about this block.**
+Router logits are stored bf16, whose relative ulp is `2^-8 = 3.906e-3`. Through
+`sigmoid' <= 0.25` that is a score perturbation of order `1e-3` to `5e-3`. With
+`E = 256` and sigmoid scores spread over `[0, 1]`, the typical gap between the
+8th and 9th order statistics is about `1/256 = 3.9e-3` — the SAME order. A
+fixture whose router logits are uniform noise is therefore a coin flip on
+whether the selected set matches, and a relative-error bound would absorb the
+difference between "the same 8 experts, rounded" and "a different expert
+entirely". §4.9 records this exact defect one brick ago on the DSA indexer: a
+7.43e-4 selection margin against a 1.28e-3 ulp, and the repair was the FIXTURE,
+never the threshold.
+
+So the gate carries five things, and the first three are the ones a continuous
+bound cannot give:
+
+1. **Selection-set equality**, asserted as a SET. `torch.topk(..., sorted=False)`
+   leaves the order unspecified (`use_sorted = envs.VLLM_BATCH_INVARIANT`,
+   `grouped_topk_router.py:134`) and `vt::MoeCombine` sums over the slots, so
+   order is not part of the contract and asserting it would pin something
+   upstream does not promise.
+2. **The minimum decision margin**, PRINTED, and required to exceed **4x** the
+   bf16 score ulp at the fixture's own scale — the same bar W4b-3c stated and
+   met at 48.8x. The margin is the biased-score gap across the k-th boundary:
+   `min over tokens of (score+bias)[k-th selected] - (score+bias)[best rejected]`.
+3. **The number of DISTINCT experts activated across the batch**, PRINTED. A
+   fixture in which every token picks the same k experts has not tested routing,
+   and this brick's whole risk is which experts get picked.
+4. **A deliberate exact tie, OFF the boundary.** Two experts are given
+   byte-identical router-gate rows and identical bias, so their biased scores
+   tie EXACTLY in double for every token, and both sit inside the selected set.
+   The set is then unambiguous whatever the tie rule is, and the assertion is
+   that an exact tie changes nothing — which is the claim upstream's
+   `sorted=False` actually supports. A tie ON the k-th boundary is deliberately
+   NOT in the fixture: the selected set would be genuinely ambiguous, upstream
+   does not specify which side wins, and gating it would pin our kernel's
+   accident as a contract.
+5. **A designed, bias-dominated fixture.** The bias values separate an
+   always-selected tier from an always-rejected one by far more than the score
+   spread, while a middle tier at equal bias lets the LOGITS decide the last
+   slot per token — so the selection is genuinely token-dependent and a port
+   that dropped the bias picks a different pool. The always-selected experts
+   carry DIFFERENT biases from the contended one, which is what makes the
+   nearest mechanism visible.
+
+**The continuous bound follows W4b-2's shape**: a residue near 0.02-0.03, a
+bound of **0.06**, and a nearest mechanism at **>= 0.15**, the bound sitting
+near the geometric mean. The nearest mechanism, and the single most likely port
+defect, is **the correction bias applied to the routing WEIGHT as well as to the
+selection** — upstream is explicit that it is not
+(`grouped_topk_router.py:121-123`: "We use biased scores for expert selection
+but original scores for routing weights"). The fixture is tuned against that
+one. **If a mechanism lands under the residue, the FIXTURE is retuned and the
+bound is not.**
+
+**Predicted-GREEN mutations, named in advance rather than discovered:**
+
+- **Every group-stage mutation**, because `n_group = 1 / topk_group = 1` makes
+  the group mask all-ones and the stage definitionally inert. The standing
+  coverage is the UNGROUPED-ONLY REFUSAL in `ParseDots3NoteParams`
+  (`dots3_note.cpp`, the `n_group == 1 && topk_group == 1` check), and W5's gate
+  RE-ASSERTS it rather than inheriting it silently. Note what is NOT inert:
+  setting `MoeRouterTopKArgs::num_expert_group` to 0 selects the pre-W3
+  ungrouped SOFTMAX path verbatim, which ignores both `scoring_func` and the
+  bias, so that mutation is RED and is in the red table.
+- **`routed_scaling_factor`**, which is 1.0 on this config, so replacing
+  `p.routed_scaling_factor` with a literal `1.0f` is inert.
+- **`_padded_mlp_size`**, identity at TP=1 on this checkpoint and deliberately
+  not ported, so there is no line to mutate. Recorded as an absence rather than
+  shown as a green row.
+
+Every mutation is driven through the committed `scripts/mutation-harness.py`,
+anchors are asserted UNIQUE before they are mutated, and the COMPILER EXIT is
+printed beside every row. A mutation that does not build is `NOT A RESULT`, and
+a non-building mutation reads as a passing test if nobody looks.
+
+#### Reachability
+
+The chain is `ModelRegistry::Resolve` -> `LoadDots3NoteForCausalLM` over a real
+`SafetensorsFile` -> `MaterializeDots3NoteDevice` -> `ModelRegistry::Forward` ->
+the layer loop -> `vllm::RunMoePlaced` -> `Dots3NoteMoeBlock`. The smallest
+failing test enters at `ModelRegistry::Resolve`, exactly as W4a, W4b-2 and
+W4b-3c do; no case constructs `Dots3NoteMoeWeights` by hand. Three deletion
+mutations are owed and are in the table: the block call in the layer loop, the
+MoE arm of materialization, and a restored MoE branch of the refusal.
+
+#### Device
+
+The correctness gate is CPU-only and needs no lease. ONE device run is owed and
+taken: `vt::MoeGroupedGemmBf16` and `vt::MoeGroupedGemmBf16GateUpSilu` are
+CUDA-only, so `Dots3NoteGroupedMoeEligible` selects the reference arm on CPU and
+the grouped arm on CUDA, and dots3-note's ROUTING to them plus the resident
+expert-pointer upload is new code that the CPU gate never executes. The proof is
+an on-device assertion COUNT against a `CUDA_VISIBLE_DEVICES=""` control on the
+SAME binary: a doctest case that returns before its first assertion scores
+PASSED with zero assertions, so the delta is the evidence and the verdict is
+not. The path needs no FA-2, no fp8 and no NVFP4, so all three fleet devices
+qualify; `orin:gpu0` is preferred because §4.8 proved the recipe on this row.
+`rc run` only, never `ssh`, bounded with `--max-runtime`.
+
+#### The gate, met
+
+Measured at `9a500f3e1e8bc2f034cce1fdac45a3c632446af1` on the devbox
+(`mudler-ubuntu-box`, x86_64, gcc 13, `CMAKE_BUILD_TYPE=Debug`,
+`VLLM_CPP_BUILD_TESTS=ON`, CUDA OFF). **Build exit and run exit are separate
+numbers, because a non-building mutation reads as a passing test when nobody
+looks.**
+
+| binary | build | cases | assertions | run exit |
+|---|---|---|---:|---|
+| `test_dots3_note_attn` | `BUILD_RC=0` | 51 / 0 failed | 6,888 / 0 failed | `RC=0` |
+| `test_dots3_note_scaffold` | `BUILD_RC=0` | 26 / 0 failed | 110,832 / 0 failed | `RC=0` |
+| `test_model_registry` | `BUILD_RC=0` | 24 / 0 failed, 1 skipped | 975 / 0 failed | `RC=0` |
+
+**The continuous half.**
+
+| quantity | value | against |
+|---|---:|---|
+| residue (device bf16 against the double reference) | **0.011902** | 0.198x the bound |
+| the bound `kMoeRel` | **0.06** | 5.04x the residue |
+| nearest mechanism | **0.207964** | 3.47x the bound |
+
+The bound sits just above the geometric mean of the residue and the nearest
+mechanism (0.0497), which is W4b-2's shape and the reason it is not a hugged
+threshold.
+
+**The DISCRETE half, which is the part a bound cannot give.**
+
+| quantity | value | bar |
+|---|---:|---|
+| minimum decision margin | **0.0633073** | — |
+| bf16 score ulp at this fixture's scale (`0.25 * max\|logit\| * 2^-8`, `max\|logit\|` 3.76543) | 0.00367718 | — |
+| margin / ulp | **17.2x** | > 4x |
+| distinct experts activated across the batch | **6 of 8** | >= 4 |
+| the deliberate exact tie, `max\|biased[0] - biased[1]\|` | **0.0** | exactly 0 |
+| selection-SET equality against the reference | **14 of 14** (layer, token) decisions | all |
+| the group stage deleted from the reference | **0.0 absolute** | exactly 0 |
+
+**Every mechanism, printed by the case from the numbers it just measured.**
+
+| mechanism mutated in the REFERENCE | relative | x the bound | x the residue |
+|---|---:|---:|---:|
+| `norm_topk_prob` dropped (`:156-157`) | 0.791637 | 13.19 | 66.51 |
+| `routed_scaling_factor` 1.7 (this config's is 1.0) | 0.580572 | 9.68 | 48.78 |
+| `top_k - 1` | 0.478647 | 7.98 | 40.22 |
+| the bias applied to the routing WEIGHT too | 0.405859 | 6.76 | 34.10 |
+| the shared expert dropped (`model.py:127`) | 0.358613 | 5.98 | 30.13 |
+| the correction bias dropped from the SELECTION | 0.319568 | 5.33 | 26.85 |
+| `top_k + 1` | 0.314643 | 5.24 | 26.44 |
+| **softmax scoring instead of sigmoid (`:112-117`)** | **0.207964** | **3.47** | **17.47** |
+
+**THE BRIEF'S PREDICTION ABOUT WHICH MECHANISM IS NEAREST WAS WRONG, and the
+first fixture would have shipped a hole because of it.** The design section
+above names the bias-in-the-routing-weight defect as the nearest mechanism and
+says to tune against that one. It is not nearest: at this fixture it reads
+0.4059, sixth of eight. The nearest is SOFTMAX-versus-SIGMOID scoring, and on
+the FIRST fixture it read **0.0400 — below the 0.06 bound**, so a port that
+wrote `kSoftmax` into the router args would have passed a green gate. The
+mechanism is small precisely where the fixture was designed to be safe: with
+small router logits, sigmoid is near-linear and the two scoring functions barely
+separate after renormalisation.
+
+**The repair was the fixture, twice, and never the bound.** The two knobs and
+what each measured:
+
+| `contended_gain` (experts 2-5's `down_proj` amplitude) | bias-in-weight |
+|---:|---:|
+| 1 | 0.0703 - 0.2262 across six seeds |
+| 3 | 0.2620 - 0.7127 across the same six |
+
+| `router_amp` | margin / ulp | distinct | residue | softmax arm |
+|---:|---:|---:|---:|---:|
+| 0.09 | 19.4x | 6 | 0.0230 | **0.0400** |
+| 0.18 | 19.3x | 6 | 0.0193 | 0.0770 |
+| 0.30 | 18.7x | 6 | 0.0190 | 0.1126 |
+| 0.45 | 18.1x | 6 | 0.0162 | 0.1515 |
+| **0.60** | **17.2x** | **6** | **0.0119** | **0.2080** |
+
+0.45 is the smallest value that clears the 0.15 fixture-quality floor, and it
+clears it by one percent. A guard met by one percent is the hugged threshold
+this project keeps naming, so the fixture takes 0.60.
+
+The seed was chosen the same way, over six seeds x {gain 1, 3} x {shared
+amplitude 0.5, 0.15}, and the spread is the argument for measuring rather than
+assuming: the minimum decision margin ranged **1.51x to 25.8x the ulp** across
+that grid. One seed in twelve would have shipped a fixture whose selection is a
+coin flip, which is exactly §4.9's DSA-indexer defect one brick later.
+
+#### The mutation table
+
+Driven through the committed `scripts/mutation-harness.py`, which refuses a
+dirty tree, refuses an absent anchor, prints the diffstat, prints the compiler
+error count, and restores the tree byte-for-byte verified by sha256. Every
+anchor was asserted UNIQUE (`grep -cF` == 1) before the run. **The compiler exit
+is printed beside every row**, because a non-building mutation is `NOT A RESULT`
+and reads as a passing test.
+
+Baseline for the `test_dots3_note_attn` rows: `exit=0 cases=51 (0 failed)
+assertions=6888 (0 failed)`. Baseline for the `test_dots3_note_scaffold` rows:
+`exit=0 cases=26 (0 failed) assertions=110832 (0 failed)`.
+
+| # | mutation | file | built | cc errors | run exit | cases / asserts failed | verdict |
+|---|---|---|---|---:|---:|---|---|
+| M1 | the router bias passed as `nullptr` | device | YES | 0 | 1 | 2 / 3 | DETECTED |
+| M2 | `args.renormalize = false` | device | YES | 0 | 1 | 2 / 4 | DETECTED |
+| M3 | `top_k - 1` | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M4 | the shared term passed as `nullptr` to `MoeCombine` | device | YES | 0 | 1 | 2 / 4 | DETECTED |
+| M5 | `args.num_expert_group = 0` (the pre-W3 softmax path) | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M6 | the shared expert built at `intermediate_size` | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M7 | the router loaded raw-NK instead of transposed | device | YES | 0 | 1 | 4 / 1 | DETECTED |
+| M8 | expert `gate_proj` loaded from `up_proj` | device | YES | 0 | 1 | 2 / 2 | DETECTED |
+| M9 | REACH: the layer-loop `RunMoePlaced` call deleted | device | **NO** | **1** | — | — | **BUILD_FAILED — NOT A RESULT** |
+| M9r | the same, with `(void)&Dots3NoteMoeBlock;` to satisfy `-Werror=unused-function` | device | YES | 0 | 1 | 3 / 0 | DETECTED |
+| M10 | REACH: `lw.is_moe = false` in materialization | device | YES | 0 | 1 | 4 / 1 | DETECTED |
+| M11 | REACH: the MoE refusal branch restored | device | YES | 0 | 1 | 10 / 14 | DETECTED |
+| M12 | the nextn refusal branch restored | device | YES | 0 | 1 | 5 / 9 | DETECTED |
+| M13 | `Dots3NoteIsNextnTensor` never matches `model.mtp.` | model | YES | 0 | 1 | 2 / 2 | DETECTED |
+| M15 | the blockwise-fp8 refusal disabled | device | YES | 0 | 1 | 1 / 4 | DETECTED |
+| M16 | `weight_block_size` parsed but not stored | model | YES | 0 | 1 | 1 / 1 | DETECTED |
+| M14 | the nextn accounting bucket disabled | model | YES | 0 | **0** | 0 / 0 | **SURVIVED on `test_dots3_note_attn`** |
+| G1 | `routed_scaling_factor` replaced by the literal `1.0f` | device | YES | 0 | 0 | 0 / 0 | **PREDICTED GREEN — SURVIVED** |
+| G2 | `topk_group` replaced by the literal `1` | device | YES | 0 | 0 | 0 / 0 | **PREDICTED GREEN — SURVIVED** |
+
+**M9 is recorded as a build failure rather than dropped**, because it is the
+class the harness exists to catch: it failed `-Werror=unused-function` — with
+the only call gone, `Dots3NoteMoeBlock` has no user — and a harness that scored
+the previous binary's run would have called that a survivor. Roughly one
+mutation in five dies this way and this one did; M9r is the same deletion with
+the symbol's address taken so the compile stands.
+
+**M14 SURVIVED on `test_dots3_note_attn` and that is an instrument fact, not a
+coverage hole** — the nextn accounting bucket is asserted in
+`test_dots3_note_scaffold`, which the attention binary does not contain, so the
+first run pointed the instrument at the wrong binary. Re-run against the binary
+that carries the assertion, with `test_dots3_note_scaffold`'s own baseline of
+`exit=0 cases=26 (0 failed) assertions=110832 (0 failed)`:
+
+| # | mutation | file | built | cc errors | run exit | cases / asserts failed | verdict |
+|---|---|---|---|---:|---:|---|---|
+| M13s | `Dots3NoteIsNextnTensor` never matches `model.mtp.` | model | YES | 0 | 1 | 3 / 6 | DETECTED |
+| M14s | the nextn accounting bucket disabled | model | YES | 0 | 1 | 3 / 6 | **DETECTED** |
+| M19s | REACH: `lw.is_moe = false` in materialization | device | YES | 0 | 0 | 0 / 0 | SURVIVED — WRONG BINARY AGAIN |
+
+**M19s is the same shape and is recorded rather than hidden.** It is M10's
+mutation pointed at the scaffold binary, which carries no MoE forward gate, so a
+survival there says nothing. M10 is the same edit against
+`test_dots3_note_attn`, which does carry it, and M10 is RED. The row is kept so
+a reader can see that two of the twenty-one rows measured a binary rather than a
+guarantee, and that both were re-aimed rather than argued away.
+
+**A misleading diffstat in the scaffold rows, and it is THIS SESSION'S error
+rather than the harness's.** Every scaffold row's `diff --stat` column names
+four paths — this spec and the two `docs/` projections beside the mutated source
+— which reads as though the harness mutated four files. It did not.
+`mutation-harness.py::require_clean` runs `git status --porcelain` ONCE at
+start-up and refuses a dirty tree, and the tree was clean when that run started;
+the three record-commit files were edited by this session WHILE the run was in
+flight, and `diffstat()` re-reads the whole tree per mutation. The claim was
+almost written up the other way round — as a harness weakness — and reading
+`require_clean` before recording it is what stopped that. The per-file sha256
+restore is unaffected and was verified afterwards: `git diff -- src tests` is
+empty at the end of the run. The lesson for the next run is the ordinary one:
+do not touch the tree while a mutation pass owns it, even in files the plan
+does not name.
+
+**The two PREDICTED-GREEN rows were named before the run, in the design section
+above, and both came back green for the stated reason.** `routed_scaling_factor`
+is 1.0 on this config and on the released one, so the multiply is the identity.
+`topk_group` is 1, so writing the literal is writing the value. Note what is NOT
+inert and is therefore in the red table: `num_expert_group = 0` selects
+`vt::MoeRouterTopK`'s pre-W3 ungrouped SOFTMAX path verbatim, which ignores both
+`scoring_func` and the correction bias, so M5 is red rather than green.
+`_padded_mlp_size` has no row at all — it is deliberately not ported, so there
+is no line to mutate, and the absence is recorded rather than shown as a green.
+
+#### The residency defect the fresh review found, and what a mutation CAN say about it
+
+W5 shipped `Dots3NoteMoePtrsFor` as a process-lifetime `static std::map<const
+Dots3NoteMoeWeights*, Dots3NoteMoePtrs>`, the pre-#237 shape, and cited #237's
+own repair as its warrant (review F1,
+[#2193](https://github.com/mudler/vllm.cpp/issues/2193)). It now builds into a
+`ResidentSlot` the weights own. Two mutations, run through the same harness on
+the repaired head, and the pair is what makes the claim honest rather than the
+first row alone:
+
+| # | mutation | test | built | cc errors | run exit | cases / asserts failed | verdict |
+|---|---|---|---|---:|---:|---|---|
+| F1-a | the accessor keys on the WEIGHT'S ADDRESS again | `test_moe_resident_lifetime` | YES | 0 | 0 | 0 / 0 | **SURVIVED** |
+| F1-b | the same edit | `test_dots3_note_attn` | YES | 0 | 0 | 0 / 0 | **SURVIVED** |
+| F1-c | CONTROL: `static inline ResidentSlot resident_moe` — one slot shared by every block | `test_moe_resident_lifetime` | YES | 0 | 1 | 2 / 3 | DETECTED |
+| RV-C | DELETE the `resident_moe` member from `Dots3NoteMoeWeights` | `test_moe_resident_lifetime` | **NO** | 13 | — | — | **BUILD_FAILED** |
+
+**F1-a and F1-b survived, and that is a property of the arm rather than a weak
+gate.** `Dots3NoteMoePtrsFor` is file-local to `dots3_note_device.cpp` and is
+called only from inside `Dots3NoteGroupedMoeEligible`, which requires a NATIVE
+`vt::OpId::kMoeGroupedGemmBf16`. That op is registered for CUDA only
+(`src/vt/cuda/cuda_matmul_nvfp4.cu:2722`) and has no CPU reference tier, so no
+CPU gate can call the accessor at all. Reverting its body is unobservable here
+by construction, and it rides the device run the grouped arm already owes under
+`## Owed`.
+
+**F1-c is the positive control, and it is why the two survivals are readable.**
+Without it, `SURVIVED` is indistinguishable from a dead harness or an assertion
+that never ran. The control mutates the ONE property the CPU cases do pin —
+that residency is owned per BLOCK — by making the slot shared, and the suite
+reds at 2 cases / 3 assertions with exit 1. So the instrument is armed, the
+cases discriminate, and what they cannot reach is named rather than implied.
+
+**RV-C is why F1-a's survival is a statement about the ARM and not about the
+member.** F1-a and F1-b revert the accessor's BODY, and nothing on a CPU tier
+can call it, so they say nothing either way about whether the accessor and the
+member are actually coupled — a reader has to take that from four lines of
+source. RV-C removes the member instead, and the compiler answers: **the build
+FAILS with 13 `: error:` lines**, so the coupling is machine-checked rather than
+read. Measured through the same harness at this head
+(`scripts/mutation-harness.py --test test_moe_resident_lifetime`), which refuses
+a dirty tree and reports the build status beside the row, and reproduced
+directly to see the whole build output rather than the harness's 1200-character
+tail.
+
+**The 13 do not fall where the deferral note predicted, and the split is the
+interesting part.** Three are inside `Dots3NoteMoePtrsFor`
+(`dots3_note_device.cpp:540`, `:541`, `:543`), each reading `has no member named
+'resident_moe'`. The other **ten** are in `test_moe_resident_lifetime.cpp`
+(`:150`, `:155`, `:156`, `:157`, `:164`, `:165`, `:171`, `:172`, `:184`, `:185`).
+That the test file supplies the majority is worth stating plainly rather than
+rounding away: the four residency cases bind to the MEMBER by name, so they
+cannot be satisfied by a copy of the state kept somewhere else, which is exactly
+the property F1-a cannot reach. A BUILD_FAILED is `NOT A RESULT` for a run-exit
+question and is a result for this one, because the question RV-C asks is whether
+the reference exists at all.
+
+The tree was restored byte-for-byte afterwards — `sha256` of
+`dots3_note.h` back to `33b5b2f0e4`, `git status --porcelain` empty — and
+`test_moe_resident_lifetime` rebuilt and re-ran at 10 cases / 28 assertions,
+exit 0, which is the control proving the restore rather than an assumption that
+it worked.
+
+#### Reachability
+
+Three deletion mutations, all red, all through
+`ModelRegistry::Resolve` -> `LoadDots3NoteForCausalLM` over a real
+`SafetensorsFile` -> `MaterializeDots3NoteDevice` -> `ModelRegistry::Forward` ->
+the layer loop -> `vllm::RunMoePlaced` -> `Dots3NoteMoeBlock`:
+
+- **M9r** deletes the production CALL in the layer loop. RED.
+- **M10** deletes the MoE arm of materialization (`lw.is_moe = false`). RED.
+- **M11** restores the MoE branch of `Dots3NoteDeviceRefusal`, so the forward
+  turns the config away before the block runs. RED at 10 cases and 14
+  assertions, the widest of the three.
+
+No W5 case constructs `Dots3NoteMoeWeights` or calls `Dots3NoteMoeBlock` by
+hand. The one case that calls a `vt` op directly — the selection-set probe on
+`vt::MoeRouterTopK` — says in its own body that it is a supplementary DISCRETE
+probe and not the reachability-carrying gate.
+
+#### The device run, and the ZERO DELTA it returned
+
+`rc run -d orin:gpu0`, job **`b4b2a08b-35b4-4f54-806a-aa9f3cc3ca37`**, 2026-08-28,
+`--max-runtime 180m --idle-timeout 25m`, about 30 minutes of device time.
+`rc run` only; the box was never reached by `ssh`. The SHA was PROVEN rather
+than asserted: the job cloned in the container and refused to build unless
+`git rev-parse HEAD` equalled `9a500f3e1e8bc2f034cce1fdac45a3c632446af1` with
+`git status --porcelain` empty. `orin`'s `/workspace` is LOCAL disk and is not
+the NAS, so the source came from a `git clone` of this branch rather than from a
+staged tarball.
+
+**The toolchain gate did its job, and it is the reason this section can say
+"executed" about anything at all.** CUDA 13.0 installs on this box and compiles
+for `sm_87`, and it cannot LAUNCH: the smoke program read `SMOKE=NO_DEVICE`
+(`SMOKE13_RC=2`), which is `cudaGetDeviceCount` failing against the 540.4.0
+driver. The job then installed `cuda-toolkit-12-6` and re-ran the SAME smoke
+program, which compiled and launched (`SMOKE126_RC=0`). A job that had gated on
+`command -v nvcc` would have reported a compile as an execution.
+
+**What was proven.** The tree CONFIGURES and BUILDS clean for `sm_87` with
+`VLLM_CPP_CUDA=ON`: `CONFIGURE_RC=0`, `BUILD_RC=0`, **zero** `: error:` lines
+across 547 targets including every `*.cu` object. W5 adds no `-Werror` breakage
+on the CUDA tier, which the CPU-only devbox cannot show.
+
+**What was NOT proven, and this is the result rather than a caveat.** The
+per-case assertion counts, device against a `CUDA_VISIBLE_DEVICES=""` control on
+the SAME binary:
+
+| case | device | control | delta |
+|---|---:|---:|---:|
+| the MoE layer through `ModelRegistry::Forward` | 295 | 295 | **0** |
+| every MoE mechanism past the bound | 283 | 283 | **0** |
+| the SELECTION set-equal to the reference | 114 | 114 | **0** |
+| the mixed dense+MoE forward is DETERMINISTIC | 468 | 468 | **0** |
+
+Whole binary, both ways: 51 cases / 6,888 assertions / `SUCCESS!`, `DEVICE_RC=0`
+and `CONTROL_RC=0`.
+
+**A zero delta means the device did not participate, and the cause is in the
+FIXTURE rather than in the model.** Every dots3-note model case in this file
+builds its queue as `vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}` —
+`grep -c kCUDA tests/vllm/models/test_dots3_note_attn.cpp` is **0** — so
+`ModelRegistry::Forward` runs on a CPU queue whatever the box has, and
+`Dots3NoteGroupedMoeEligible` is false because
+`vt::OpRegistered(kMoeGroupedGemmBf16, kCPU)` is false. The reference arm ran on
+both sides, identically, which is exactly what identical counts say.
+
+**So the grouped arm of `Dots3NoteMoeBlock` has NO execution evidence, and it is
+recorded as owed rather than claimed.** It is not DEAD code — production reaches
+it whenever the engine's queue is CUDA, which is the ordinary configuration on a
+CUDA build — it is UNGATED. Closing it needs a device-queue variant of the
+bench: a `kCUDA` `vt::Queue`, a `PagedKvCache` in device memory rather than
+`w4a::MlaCachePool`'s host vectors, and the resident-weight uploads that follow.
+That is a test-infrastructure change of its own size, and W4b-2 and W4b-3c hit
+the same wall from the other side — §4.8 says their CUDA evidence is
+"KERNEL-level parity on two ops. It is not the end-to-end model gate", and no
+brick on this row has yet run the MODEL on a GPU.
+
+**The instrument is what makes this reportable at all.** Had the job printed
+only `SUCCESS!` and the exit code, the run would have read as a device
+execution: the verdict is identical on both sides. The assertion COUNT is the
+only column that distinguishes them, and it distinguishes them by being the
+same.
+
+#### Risks
+
+- **R-W5-1 — the fixture's selection margin collapses under retuning.** The
+  mitigation is the printed margin and the 4x bar; if it cannot be met by
+  fixture design the brick STOPS and reports rather than widening the bar.
+- **R-W5-2 — the reference agrees because it shares a helper.** The mitigation
+  is the rule above: the reference is written from the upstream Python, and
+  `cpu_ops.cpp` is not read while writing it.
+- **R-W5-3 — the released config becoming representable reads as "runnable".**
+  It is not. The MoE is 94.62% of a 576.89 GB checkpoint. Every claim this
+  brick makes is bounded by that and says so.
+
+#### Stop conditions
+
+Stop and report on ENOSPC. Stop if the continuous bound cannot be met without
+widening it. Stop if the nearest mechanism cannot be pushed above the residue by
+fixture design. Stop if W5c needs more than the classifier-deferral shape. Stop
+and return `NEEDS_DECISION` if the seam needs a new `vt` op.
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -3306,7 +4007,7 @@ now captures a moving implementation.
 | Vehicle | Size | Fits GB10 (~119 GiB)? | Fits Thor (~122 GiB)? |
 |---|---|---|---|
 | `dots3-note-prev` bf16 | ~576 GB | no | no |
-| `dots3-note-prev-fp8` | ~290 GB | no | no |
+| `dots3-note-prev-fp8` | 298.67 GB (298,673,280,504 B) | no | no |
 | hypothetical ~2 bpw GGUF (ours) | ~75–90 GiB + towers | plausible | plausible |
 
 Upstream's own recipe is `--tensor-parallel-size 8` on H100s. Two of our boxes
@@ -3344,12 +4045,12 @@ carry both corrections.
 Three facts follow, and they are recorded rather than worked around.
 
 1. **Thor cannot host the oracle for this model, and the reason is RAM.** The
-   290 GB FP8 checkpoint is more than twice the box's 122 GB of memory, so the
+   298.67 GB FP8 checkpoint is more than twice the box's 122 GB of memory, so the
    model cannot be resident whatever the disk holds. **The disk half of this
    argument is WITHDRAWN.** W0 wrote it as "290 GB exceeds both its 122 GB of
    RAM and its 123 GiB of free disk — the checkpoint will not even land", and
    the very next measurement of the same volume read 362 GB free, which is more
-   than 290. On that number the checkpoint lands and then fails to load. Both
+   than 298.67. On that number the checkpoint lands and then fails to load. Both
    probes were correct when they were taken, which is the point: free space is
    not a stable premise and a memory ceiling is. Designating the host does not
    change §6.2; it fixes *where our arm and our unit gates run*, which is a real
@@ -3377,7 +4078,7 @@ Three facts follow, and they are recorded rather than worked around.
 
 What Thor *is* good for on this row: sm_110 runtime coverage (it is our only
 non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate
-in §7 THAT IS NOT ON THE FA-2 PATH — none of which need the 290 GB checkpoint.
+in §7 THAT IS NOT ON THE FA-2 PATH — none of which need the 298.67 GB checkpoint.
 
 **The FA-2-gated tests are the exception, and this designation never reached
 them.** Thor's sm_110 is outside `VT_CUDA_FEATURE_TABLE`'s `fa2` row, so
@@ -3732,8 +4433,20 @@ dispatchable in order, under the constraints that answer imposes.
   with chunked CONTEXT, the per-layer `SlidingWindowMLASpec` emission, and the
   PER-REQUEST routing of a mixed step that the narrowed refusal stands in for.
   All three are in `## Owed`.
-- **W5 — MoE.** Ungrouped `noaux_tc` at 256/8 + the shared expert. Mostly
-  routing our existing path at new dims.
+- **W5 — MoE. LANDED, evidence §4.10.** Ungrouped `noaux_tc` at 256/8 + the one
+  shared expert at `moe_intermediate_size * n_shared_experts`, through
+  `Dots3NoteMoeBlock` over `vllm::RunMoePlaced`, with NO `vt` op changed. It
+  carried two things beyond the block. **W5a** made materialization pick the
+  MoE arm per layer — it loaded `mlp.{gate_up,down}_proj` unconditionally
+  before, and on a MoE layer those tensors do not exist — and added a named
+  BLOCKWISE-FP8 refusal keyed on `quantization_config.weight_block_size`, which
+  is what the `-fp8` sibling carries. **W5c**
+  ([#2176](https://github.com/mudler/vllm.cpp/issues/2176)) removed the nextn
+  refusal, which was STRICTER THAN UPSTREAM, and replaced it with a named W10
+  deferral and its own accounting bucket. Together they make
+  `Dots3NoteDeviceRefusal(released_params)` EMPTY. What that does NOT mean is
+  recorded in §4.10 and in the row header: the MoE is 94.62% of a 576.89 GB
+  checkpoint and nothing here can hold it.
 - **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
   FP32-scale FP8 formula. Reuses `qwen3_vl_vision` structure.
 - **W7 — audio tower.** The `dots` stem deltas over our Whisper encoder.
@@ -4128,6 +4841,96 @@ Carried openly under option B (§6.4), not waived:
   exactly needs an op whose store dtype is the caller's. Owner: this row. Issue
   [#699](https://github.com/mudler/vllm.cpp/issues/699).
 
+- **`vt::QuantFp8Group` has no `use_ue8m0` rounding, and it is owed against
+  W9** (recorded at W5, #699). It does NOT bite at W5: it is the ACTIVATION
+  quantizer and W5 is entirely on the bf16 path, so nothing in that brick calls
+  it. It probably does bite at W9, because upstream's blockwise-FP8 MoE routes
+  through DeepGEMM with e8m0 scales
+  (`vllm/models/dots3_note/nvidia/vision_moe.py`'s own docstring names the
+  sibling trap on the vision side: "the native NOTE encoder keeps dynamic
+  activation scales as FP32 instead of rounding them to E8M0"). A port that
+  quantizes activations with plain scaling there disagrees with the kernel
+  upstream runs, and the disagreement is numerically silent. Recorded here with
+  the reason so W9 does not re-derive it.
+- **The blockwise-FP8 arm itself is owed to W9**, and it is now refused BY NAME
+  rather than by a bare tensor miss (W5a). `dots-studio/dots3-note-prev-fp8` @
+  `7c14222e22423d6df6848eb0d1c5c3a88a00311a` carries
+  `quantization_config.weight_block_size = [128, 128]` and ships a
+  `weight_scale_inv` beside every projection; `dense_loaders::MaterializeBf16Source`
+  reads a per-tensor or per-output-ROW `<name>_scale` and nothing else.
+- **The GROUPED (CUDA) arm of `Dots3NoteMoeBlock` has no execution evidence.**
+  `vt::MoeGroupedGemmBf16` and `vt::MoeGroupedGemmBf16GateUpSilu` are registered
+  for CUDA only, and every dots3-note model case builds a `kCPU` `vt::Queue`, so
+  the CPU gate takes the reference arm and the `orin:gpu0` lease measured a ZERO
+  device-versus-control delta on every W5 case. The arm is UNGATED rather than
+  dead: production reaches it whenever the engine queue is CUDA. Closing it needs
+  a device-queue bench — a `kCUDA` queue, a device-memory `PagedKvCache`, and the
+  resident uploads that follow — which is test infrastructure no brick on this
+  row has built, and which W4b-2 and W4b-3c also did not (§4.8: their CUDA
+  evidence is kernel-level parity on two ops, not the model).
+  **UNGATED AND NOT DEAD, proven statically rather than asserted** (W5 fresh
+  review, #2187). All three of `Dots3NoteGroupedMoeEligible`'s conditions hold
+  on a CUDA build: `vt::OpRegistered(kMoeGroupedGemmBf16, kCUDA)` is true
+  (`src/vt/cuda/cuda_matmul_nvfp4.cu:2722`), `w.expert_gate` is non-empty on
+  every MoE layer, and `t->nk` is FALSE on all three expert tensors because
+  `LoadBf16Transposed` returns a `MakeOwned` tensor and never sets the flag
+  (`include/vllm/model_executor/models/dense_weight_loaders.h:388-401`). So the
+  arm is reached the moment the engine queue is CUDA, and the missing evidence
+  is a measurement rather than a wiring question.
+- **The FIX for the address-keyed residency defect is itself only structurally
+  gated** ([#2193](https://github.com/mudler/vllm.cpp/issues/2193), W5 fresh
+  review F1). W5 first shipped `Dots3NoteMoePtrsFor` as a process-lifetime
+  `static std::map<const Dots3NoteMoeWeights*, Dots3NoteMoePtrs>`, which is the
+  shape #237 removed from `qwen3_5.cpp` in `ce2349dee`, and cited that repair as
+  its warrant. It is repaired here — `Dots3NoteMoeWeights` owns a
+  `ResidentSlot resident_moe` and the accessor builds into it under a mutex,
+  the `laguna.cpp:497-507` shape — and
+  `tests/vllm/models/test_moe_resident_lifetime.cpp` gained four cases for this
+  block, including the placement-new address-reuse case. **What those cases
+  CANNOT see, said rather than implied.** The accessor is file-local to
+  `dots3_note_device.cpp` and is called only from inside the grouped arm above,
+  which is CUDA-only with no CPU reference tier, so no CPU gate can call it.
+  The cases pin the invariant the fix rests on (residency is a member of the
+  weights, so it is per-object and cannot be inherited through a reused
+  address); a mutation that reverts the accessor BODY while leaving the member
+  in place is not observable from the CPU and rides the same device run this
+  arm already owes. `deepseek_v2.cpp`'s `MoePtrs` (`04f5c01e7`, 2026-07-22)
+  still carries the pre-#237 shape; it is a SACRED path, is deliberately NOT
+  touched here, and is owed under #2193 until a row picks it up.
+- **The quantization refusal keys on `weight_block_size` alone**
+  ([#2190](https://github.com/mudler/vllm.cpp/issues/2190), W5 fresh review F5).
+  `quant_method` is parsed (`dots3_note.cpp:264-268`) and stored
+  (`dots3_note.h:206`) and is read for nothing but the text of the blockwise
+  message, so a config with `quantization_config.quant_method = "fp8"` (or
+  gptq/awq/mxfp4) and NO `weight_block_size` passes
+  `Dots3NoteDeviceRefusal` and `MaterializeBf16Source` silently dequantizes a
+  per-tensor or per-row `_scale` into a bf16 GEMM. That is the case the
+  refusal's own comment names as the worse one, five lines above the branch that
+  does not cover it. No released checkpoint is affected. Owner: this row, W9.
+- **`hidden_act` is not mirrored**
+  ([#2191](https://github.com/mudler/vllm.cpp/issues/2191), W5 fresh review F6).
+  `DeepseekV2MoE.__init__` raises `ValueError("Unsupported activation ... Only
+  silu is supported for now.")` at `deepseek_v2.py:310-314` @ `bc2d63e650`,
+  inside the very `__init__` this brick ports, and `grep -c hidden_act` over
+  `dots3_note.{cpp,h}` is 0 — so a non-silu config runs SwiGLU silently. The
+  same hole is in `deepseek_v2.cpp`, so it is a mirror gap rather than a W5
+  regression, and the released config is silu. Owner: this row.
+- **The W1/W2 accounting fixture can no longer be MATERIALIZED**, and that is a
+  consequence of W5 rather than a defect. Those gates drive all 38006 names
+  through the production loader from a synthetic checkpoint of ONE-ELEMENT
+  tensors, which worked only because the released config was refused and
+  materialization was skipped. It is not skipped now, so the loader accounts for
+  every name and then refuses the first WEIGHT SHAPE. The cases assert that
+  discrimination instead, which is the same statement one step later — an
+  unaccounted, missing or duplicated name throws a DIFFERENT message strictly
+  earlier. TWO of the three are separately gated — UNCLAIMED and MISSING each
+  have a subcase in "the unported arms REFUSE BY NAME"; DUPLICATED has none, and
+  no fixture can give it one, because `acc.duplicated` is filled at
+  `dots3_note.cpp:624` when `EnumerateDots3NoteTensors` emits the same name
+  twice, which is a property of the ENUMERATOR and not of the checkpoint
+  (W5 fresh review F7). A shape-true fixture for this
+  config starts at a 1.5 GiB `embed_tokens` and is not buildable in a test.
+
 ## 9. Stop conditions
 
 - Any brick whose only available comparison is a shared helper stops and says so
@@ -4355,3 +5158,30 @@ rather than as a pass, and re-run.
 cache whose physical row is wider than the row a layer reads, a windowed decode
 and prefill through the shared MLA seam, and the three refusals above. All are
 in `## Owed`.
+
+**W5 — LANDED, and the row's headline changed.** The 45 MoE layers are on the
+decode path through `Dots3NoteMoeBlock` over the shared `vllm::RunMoePlaced`
+seam, and `Dots3NoteDeviceRefusal` returns `""` for the RELEASED
+`dots-studio/dots3-note-prev` `config.json` for the first time on this row. Two
+branches went: the MoE layer (W5) and the nextn tail (W5c,
+[#2176](https://github.com/mudler/vllm.cpp/issues/2176)), the second of which
+was a DEFECT rather than a gap — it was stricter than upstream, which drops
+those weights from the main model instead of refusing. Evidence is §4.10.
+
+**Say the other half in the same breath.** Representable is not runnable. The
+MoE alone is 545.82 GB of a 576.89 GB checkpoint (94.62%), measured over the
+committed headers-only index; the routed experts are 543.58 GB of that. No host
+this project reaches holds it, the 298.67 GB fp8 sibling does not fit either and
+is refused BY NAME as W9, and no tensor byte of either has ever been
+downloaded. The gate is a consistency gate against an independent
+double-precision reference, not a correctness claim against vLLM (§6.4 option
+B). `supports_multimodal` went TRUE -> FALSE in the same change, because the
+released config becoming loadable made a claim this port cannot honour: the
+2195 vision and 430 audio tensors are named W6/W7 deferrals and the multimodal
+front end (W8) does not exist. W8 flips it back.
+
+**Next dispatchable: W6 — the vision tower**, or W9 for the quantized arms if
+the fp8 sibling is wanted before the towers. `## Owed` is unchanged except that
+`vt::QuantFp8Group`'s missing `use_ue8m0` rounding is now recorded against W9
+with the reason, because upstream's blockwise-fp8 MoE routes through DeepGEMM
+with e8m0 scales.

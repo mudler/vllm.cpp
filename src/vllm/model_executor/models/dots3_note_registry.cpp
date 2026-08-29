@@ -40,17 +40,39 @@
 namespace vllm {
 namespace {
 
-// registry.py _ModelInfo for dots3-note: text generation, multimodal (image,
-// video AND audio — `multimodal.py`::Dots3NoteForCausalLM.get_placeholder_str
-// :65-72 handles all three), NOT hybrid in this tree's sense (both attention
-// classes are attention over a paged MLA cache; the sliding half is a window on
-// the same cache, not a recurrent state).
+// registry.py _ModelInfo for dots3-note: text generation, NOT hybrid in this
+// tree's sense (both attention classes are attention over a paged MLA cache;
+// the sliding half is a window on the same cache, not a recurrent state).
+//
+// ─── `supports_multimodal` IS FALSE, AND IT WAS TRUE UNTIL W5 ────────────────
+// W1 set it TRUE because upstream registers this architecture in
+// `_MULTIMODAL_MODELS` and `multimodal.py`::Dots3NoteForCausalLM
+// .get_placeholder_str (:80-88, the three branches at :82-87) handles image,
+// video AND audio. That is a true statement about UPSTREAM and it was harmless
+// while the released config was refused at its first MoE layer: nothing could
+// load, so nothing could read the flag and act on it.
+//
+// W5 and W5c made the released config loadable, and at that moment the flag
+// became a claim about THIS port that this port cannot honour. There is no
+// vision tower (W6), no audio tower (W7) and no multimodal front end at all
+// (W8) — `EnumerateDots3NoteTensors` does not claim one tensor of either tower
+// and `Dots3NoteDeferredTowers()` records all 2625 of them as deferrals. A
+// registry entry is a support claim, not a code-coverage claim, and the same
+// argument `deepseek_v2_registry.cpp` makes about V3.
+//
+// MEASURED before flipping it: `supports_multimodal` has NO production reader
+// anywhere in `src/`, `include/`, `examples/` or `scripts/` — every occurrence
+// outside `include/vllm/model_executor/models/model_registry.h` is either a
+// registration writing it or a test reading it. So the flip changes no
+// behaviour today; what it changes is what the record SAYS while W6/W7/W8 are
+// owed. W8 flips it back, and the true -> false -> true trail is the honest
+// version of that history.
 inline constexpr ModelInfo kDots3NoteInfo{
     .is_text_generation_model = true,
     .is_pooling_model = false,
     .is_hybrid = false,
     .has_inner_state = false,
-    .supports_multimodal = true,
+    .supports_multimodal = false,
     .score_type = "bi-encoder",
 };
 
@@ -71,7 +93,8 @@ std::unique_ptr<LoadedModel> LoadDots3NoteForCausalLM(
   if (source.kind == ModelSource::Kind::kGguf) {
     // The GGUF k-quant arm is OWED, not optional (AGENTS.md, porting-a-model.md
     // §2) — and for this row it is the only arm that could ever fit a host we
-    // own (spec §6.2: ~576 GB bf16 / ~290 GB fp8 against a 122 GiB ceiling).
+    // own (spec §6.2: 576.89 GB bf16 / 298.67 GB fp8, decimal GB, against a
+    // 122 GiB ceiling).
     // llama.cpp has no `dots3_note` architecture, so the converter is ours to
     // write. W9. Refusing by name beats a silent dequantize.
     throw std::runtime_error(

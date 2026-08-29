@@ -3,7 +3,8 @@
 // weight map, evidence and mutation table).
 //
 // WHY THIS FILE IS THE WHOLE GATE FOR THE ROW SO FAR. Spec §6.4 records the decision that
-// this row has NO oracle: the checkpoint is ~576 GB bf16 / ~290 GB fp8 and the
+// this row has NO oracle: the checkpoint is 576.89 GB bf16 / 298.67 GB fp8
+// (decimal GB, spec §1) and the
 // biggest host this project owns is 122 GiB, so vLLM cannot run this model
 // anywhere we can reach. There is therefore no token gate downstream of these
 // assertions. A config field read wrong here does not crash and does not change
@@ -20,7 +21,9 @@
 //       geometries, the MoE dims, and ALL SIX §4 TRAPS;
 //   (3) the on-disk NAME MAP is faithful over the WHOLE released
 //       `model.safetensors.index.json` — all 38006 tensors, bucketed
-//       35381 language / 2195 vision / 430 audio and asserted BY NUMBER, with
+//       35362 language / 19 nextn / 2195 vision / 430 audio and asserted BY
+//       NUMBER (FOUR buckets since W5c, #2176: 35362 + 19 is W2's 35381
+//       unchanged), with
 //       nothing unaccounted and nothing enumerated that the checkpoint does not
 //       ship. W1's 1614-tensor slice is kept beside it as a cross-check;
 //   (3a) W2 only: the two tower files are NAMED W6/W7 DEFERRAL RECORDS — prefix,
@@ -214,10 +217,18 @@ TEST_CASE("dots3-note: the architecture resolves through the model registry") {
   CHECK(reg.factory->load_weights != nullptr);
   CHECK(reg.factory->forward != nullptr);
   CHECK(reg.factory->make_kv_cache != nullptr);
-  // registry.py:381 puts it in _MULTIMODAL_MODELS: image, video AND audio
-  // (multimodal.py:65-72).
   CHECK(reg.info.is_text_generation_model);
-  CHECK(reg.info.supports_multimodal);
+  // `supports_multimodal` is FALSE, and it was TRUE until W5 (#699). Upstream
+  // does put this architecture in `_MULTIMODAL_MODELS` with image, video AND
+  // audio (registry.py:381, multimodal.py:82-87 — the three branches of
+  // `get_placeholder_str` at :80-88), which is why W1 set it — but
+  // that is a statement about UPSTREAM, and it only became misleading about
+  // THIS port once W5 and W5c made the released config loadable. There is no
+  // vision tower (W6), no audio tower (W7) and no multimodal front end (W8):
+  // `EnumerateDots3NoteTensors` claims not one tensor of either tower and
+  // `Dots3NoteDeferredTowers()` records all 2625 as deferrals. W8 flips it
+  // back, and the true -> false -> true trail is the honest record.
+  CHECK_FALSE(reg.info.supports_multimodal);
   // Both attention classes page the same MLA cache; the sliding half is a
   // window on it, not a recurrent state.
   CHECK_FALSE(reg.info.is_hybrid);
@@ -795,7 +806,12 @@ TEST_CASE("dots3-note enumeration: all 1614 tensors of the released slice are cl
   }
   const Dots3NoteAccounting acc =
       AccountDots3NoteTensors(p, names, SliceLayers());
-  CHECK(acc.language == 1614);
+  // The slice includes the nextn tail, and W5c (#2176) moved its 19 tensors
+  // out of `language` into their own W10-deferral bucket. 1595 + 19 is the
+  // 1614 this case read before, which is the point of asserting both.
+  CHECK(acc.language == 1595);
+  CHECK(acc.nextn == 19);
+  CHECK(acc.language + acc.nextn == 1614);
   CHECK(acc.vision == 0);
   CHECK(acc.audio == 0);
   CHECK(acc.unaccounted.empty());
@@ -1019,9 +1035,16 @@ TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are clai
   CHECK(index.at("checkpoint_total_tensors").get<int64_t>() == 38006);
   CHECK(index.at("checkpoint_total_size_bytes").get<int64_t>() == 576886825984LL);
   CHECK(index.at("shard_file_count").get<int64_t>() == 133);
-  CHECK(index.at("bucket_totals").at("language").get<int64_t>() == 35381);
+  // RECLASSIFIED at W5c (#2176): the 19 nextn tensors moved out of `language`
+  // into their own bucket, so 35362 + 19 is W2's 35381 unchanged. The four
+  // buckets still sum to the checkpoint's 38006.
+  CHECK(index.at("bucket_totals").at("language").get<int64_t>() == 35362);
+  CHECK(index.at("bucket_totals").at("nextn").get<int64_t>() == 19);
   CHECK(index.at("bucket_totals").at("vision").get<int64_t>() == 2195);
   CHECK(index.at("bucket_totals").at("audio").get<int64_t>() == 430);
+  CHECK(index.at("bucket_totals").at("language").get<int64_t>() +
+            index.at("bucket_totals").at("nextn").get<int64_t>() ==
+        35381);
 
   const auto released = ExpandFullIndex(index);
   REQUIRE(released.size() == 38006);
@@ -1077,7 +1100,14 @@ TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are clai
   std::vector<int64_t> backbone;
   for (int64_t l = 0; l < p.num_hidden_layers; ++l) backbone.push_back(l);
   const Dots3NoteAccounting acc = AccountDots3NoteTensors(p, names, backbone);
-  CHECK(acc.language == 35381);
+  // FOUR buckets since W5c (#2176). The nextn tail is a NAMED W10 deferral
+  // rather than 19 language weights nobody loads — vLLM drops exactly these
+  // names from the main model (utils.py:542 -> deepseek_v2.py:1618-1620;
+  // model.py:624) — and asserting it BY NUMBER is what stops the reclassifi-
+  // cation being invisible: `total() == 38006` is true of every split.
+  CHECK(acc.language == 35362);
+  CHECK(acc.nextn == 19);
+  CHECK(acc.language + acc.nextn == 35381);  // W2's count, unchanged
   CHECK(acc.vision == 2195);
   CHECK(acc.audio == 430);
   CHECK(acc.total() == 38006);
@@ -1515,11 +1545,32 @@ std::vector<std::string> AllLanguageNames(const Dots3NoteParams& p) {
 
 }  // namespace
 
-TEST_CASE("dots3-note W2: the whole index loads through the PRODUCTION entry point") {
+TEST_CASE(
+    "dots3-note W2/W5: the whole index is ACCOUNTED through the PRODUCTION "
+    "entry point, and then the load refuses the first WEIGHT") {
   // The accounting above is a helper call. This drives the SAME 38006 names
   // through `ModelRegistry::Resolve(...).factory->load_weights`, which is the
   // path a real load takes, so the map is proved reachable and not merely
   // correct in a unit.
+  //
+  // ─── WHAT W5 CHANGED HERE, AND WHY IT IS NOT A WEAKENING ─────────────────
+  // Until W5 this case read `REQUIRE_NOTHROW(load)`, and the reason it could is
+  // that `Dots3NoteDeviceRefusal` was NON-EMPTY for the released config, so
+  // `LoadDots3NoteWeights` accounted for the names and then SKIPPED
+  // materialization. W5 lifted the MoE branch and W5c the nextn branch, so the
+  // refusal is empty and the loader now goes on to read the tower — and this
+  // fixture's tensors are ONE ELEMENT each, because a shape-true fixture for
+  // this config starts at a 1.5 GiB `embed_tokens` (152064 x 5120 bf16) and a
+  // 64 MiB rope cache. That trade is recorded in `LoadDots3NoteWeights` itself
+  // and it has now come due.
+  //
+  // So the assertion becomes the DISCRIMINATION rather than the acceptance, and
+  // it is stronger for it: the load throws on the first WEIGHT SHAPE, which can
+  // only happen AFTER the accounting pass has claimed all 38006 names. An
+  // unaccounted name, a missing one or a duplicate throws a DIFFERENT message
+  // strictly EARLIER — the three subcases in "the unported arms REFUSE BY NAME"
+  // below prove each of those reachable — so reading the shape message here is
+  // exactly the statement that the classifier accepted the whole index.
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
@@ -1537,15 +1588,36 @@ TEST_CASE("dots3-note W2: the whole index loads through the PRODUCTION entry poi
   std::vector<vllm::SafetensorsFile> shards;
   shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
   const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
-  std::unique_ptr<vllm::LoadedModel> model;
-  REQUIRE_NOTHROW(model = reg.factory->load_weights(reg, config, source));
-  REQUIRE(model != nullptr);
+  std::string refusal;
+  try {
+    (void)reg.factory->load_weights(reg, config, source);
+  } catch (const std::runtime_error& e) {
+    refusal = e.what();
+  }
+  REQUIRE_MESSAGE(!refusal.empty(),
+                  "a one-element fixture cannot materialize the released tower");
+  // The MATERIALIZATION refusal, which is the one that comes second...
+  CHECK_MESSAGE(refusal.find("model.embed_tokens.weight") != std::string::npos,
+                refusal);
+  CHECK_MESSAGE(refusal.find("has shape") != std::string::npos, refusal);
+  // ...and NOT any of the three ACCOUNTING refusals, each of which would have
+  // fired first. TWO of the three are separately gated below — UNCLAIMED and
+  // MISSING each have their own SUBCASE in "the unported arms REFUSE BY NAME".
+  // DUPLICATED has NONE, and no fixture can give it one: `acc.duplicated` is
+  // filled at dots3_note.cpp:624 when `EnumerateDots3NoteTensors` emits the
+  // SAME name twice, which is a property of the ENUMERATOR and not of the
+  // checkpoint. The `find("twice")` check below is therefore a guard on which
+  // refusal fired, never a gate on the duplicate path itself.
+  CHECK_MESSAGE(refusal.find("no consumer claims") == std::string::npos, refusal);
+  CHECK_MESSAGE(refusal.find("the checkpoint is missing") == std::string::npos,
+                refusal);
+  CHECK_MESSAGE(refusal.find("twice") == std::string::npos, refusal);
 
   // WHAT THIS CASE CANNOT SEE, said rather than implied. `Dots3NoteLoadedModel`
   // lives in an anonymous namespace in the registry TU, so the bucket counts
   // cannot be read back off the object here — the case proves the production
   // load ACCEPTS all 38006, and the case above proves the classifier splits
-  // them 35381 / 2195 / 430. The REFUSAL side is the "unported arms" case
+  // them 35362 / 19 / 2195 / 430. The REFUSAL side is the "unported arms" case
   // below, which already builds a whole-tower checkpoint and reads the message
   // the deferral table prints; a second 38006-tensor safetensors here would
   // cost ~35 s at -O0 for a path that is already gated.
@@ -1641,8 +1713,12 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
     // Each bucket by count, not by "nothing was left over": the three counts
     // have to add up the ONE way that says the towers are deferred rather than
     // claimed.
-    CHECK(acc.language == static_cast<int64_t>(language.size()));
-    CHECK(acc.language == 35381);
+    // `language` is the whole enumeration, which still CLAIMS the 19 nextn
+    // names (so `missing` can still refuse an absent one); the accounting puts
+    // them in their own bucket (W5c, #2176).
+    CHECK(acc.language + acc.nextn == static_cast<int64_t>(language.size()));
+    CHECK(acc.language == 35362);
+    CHECK(acc.nextn == 19);
     CHECK_MESSAGE(acc.vision == static_cast<int64_t>(vision.size()),
                   "vision tensors are not landing in the vision bucket — "
                   "acc.vision=" << acc.vision << ", acc.language="
@@ -1664,14 +1740,25 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
     for (const std::string& n : vision) CHECK(claimed.count(n) == 0);
     for (const std::string& n : audio) CHECK(claimed.count(n) == 0);
 
-    // The production entry point still accepts the same checkpoint.
+    // The production entry point ACCOUNTS for the same checkpoint and then
+    // refuses its first WEIGHT, because since W5 the released config is
+    // materializable and this fixture's tensors are one element each. The
+    // discrimination is the point: a tower tensor read as UNACCOUNTED would
+    // throw "no consumer claims" strictly earlier.
     TempCheckpoint ckpt(names);
     std::vector<vllm::SafetensorsFile> shards;
     shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
     const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
-    std::unique_ptr<vllm::LoadedModel> model;
-    REQUIRE_NOTHROW(model = reg.factory->load_weights(reg, config, source));
-    REQUIRE(model != nullptr);
+    std::string refusal;
+    try {
+      (void)reg.factory->load_weights(reg, config, source);
+    } catch (const std::runtime_error& e) {
+      refusal = e.what();
+    }
+    REQUIRE_MESSAGE(!refusal.empty(), "a one-element fixture cannot materialize");
+    CHECK_MESSAGE(refusal.find("model.embed_tokens.weight") != std::string::npos,
+                  refusal);
+    CHECK_MESSAGE(refusal.find("no consumer claims") == std::string::npos, refusal);
   }
 
   SUBCASE("GGUF k-quants are OWED (W9), never silently dequantized") {
@@ -1693,7 +1780,28 @@ TEST_CASE("dots3-note: the forward REFUSES BY NAME through the REAL loaded model
   // undefined behaviour the moment the forward opened it, whether the open is a
   // `static_cast` (it is not — see `ForwardDots3NoteForCausalLM`) or a checked
   // `ModelAs`. #730/#784 is exactly that mistake, made once already.
-  TempConfig cfg(FixtureConfigDoc());
+  //
+  // ─── WHICH CONFIG, AND WHY IT MOVED AT W5 ────────────────────────────────
+  // This case needs two things at once: a LIVE object from the factory, and a
+  // config the forward refuses by name. Until W5 the plain released config gave
+  // both, because its MoE layer was unrepresentable. W5 lifted that branch and
+  // W5c the nextn one, so the released config now REFUSES NOTHING — which is
+  // the row's headline and is asserted in `test_dots3_note_attn.cpp`.
+  //
+  // The config here is therefore the released one plus the `-fp8` SIBLING's own
+  // `quantization_config`, verbatim from
+  // `dots-studio/dots3-note-prev-fp8/config.json`. That is a real published
+  // checkpoint rather than a contrivance, its language tensor NAMES are the
+  // same 35381 (it adds a `weight_scale_inv` beside each, which this case does
+  // not need), and it is refused by name because the blockwise-FP8 arm is W9.
+  // It also keeps the factory returning a live object, because a refused config
+  // is exactly the one `LoadDots3NoteWeights` does not materialize.
+  nlohmann::json doc = FixtureConfigDoc();
+  doc["quantization_config"] = {{"quant_method", "fp8"},
+                                {"fmt", "e4m3"},
+                                {"activation_scheme", "dynamic"},
+                                {"weight_block_size", {128, 128}}};
+  TempConfig cfg(doc);
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
   const Dots3NoteParams p = ParseDots3NoteParams(config);
@@ -1705,8 +1813,10 @@ TEST_CASE("dots3-note: the forward REFUSES BY NAME through the REAL loaded model
   std::unique_ptr<vllm::LoadedModel> model =
       reg.factory->load_weights(reg, config, source);
   REQUIRE(model != nullptr);
-  // 100% accounted: 35381 language-tower tensors, zero unaccounted. (The real
-  // checkpoint adds 2625 tower tensors on top, for 38006.)
+  // 100% accounted: 35381 enumerated language-tower names — 35362 the language
+  // forward reads plus the 19 the nextn bucket defers to W10 — zero
+  // unaccounted. (The real checkpoint adds 2625 tower tensors on top, for
+  // 38006.)
   CHECK(EnumerateDots3NoteTensors(p).size() == 35381);
 
   const std::vector<int32_t> token_ids{0};
@@ -1737,16 +1847,18 @@ TEST_CASE("dots3-note: the forward REFUSES BY NAME through the REAL loaded model
   CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),
                        doctest::Contains("Dots3NoteForCausalLM forward"),
                        std::runtime_error);
-  // ...name the missing piece rather than only failing. The RELEASED config's
-  // first unrepresentable layer is layer 1's MoE (W5): W4b-2 put both attention
-  // geometries — full AND sliding-window — on the decode path, so the sliding
-  // layer at index 2 is no longer what stops this checkpoint. Naming the piece
-  // the released config ACTUALLY trips on is the point of the assertion; a
-  // string that outlives the refusal it describes is the failure this row keeps
-  // recording.
-  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("MoE layer"),
-                       std::runtime_error);
-  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("W5"),
+  // ...name the missing piece rather than only failing. Naming the piece the
+  // config ACTUALLY trips on is the point of the assertion; a string that
+  // outlives the refusal it describes is the failure this row keeps recording,
+  // and this assertion has now been re-aimed twice — W4b-2 moved it off the
+  // sliding layer and onto the MoE one, and W5/W5c moved it off the MoE layer
+  // and onto the blockwise-FP8 arm, which is the ONLY branch of
+  // `Dots3NoteDeviceRefusal` left.
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),
+                       doctest::Contains("BLOCKWISE"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),
+                       doctest::Contains("weight_scale_inv"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input), doctest::Contains("W9"),
                        std::runtime_error);
   // ...and point at the record that owns the brick.
   CHECK_THROWS_WITH_AS(reg.factory->forward(*model, input),

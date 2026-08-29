@@ -1,30 +1,15 @@
 #version 450
-// vt_matmul_bt_tq2_dev: non-grouped keep-quant matmul for TQ2_0 weights with
-// ON-DEVICE Q8_K activation quantize. BACKEND-VULKAN-KEEPQUANT (maple MoE
-// throughput Phase 2).
-//
-// Same arithmetic as vt_matmul_bt_tq2 but reads the activation as f32 or bf16
-// directly from the device buffer and quantizes to Q8_K INSIDE the shader — no
-// host read, no FlushBatch, no scratch buffer. This serves the attention
-// Q/K/V/O projections that use TQ2_0 weights, eliminating their per-dispatch
-// drains.
-//
-// One workgroup per output column `col`; 128 lanes split K (blocks), loop rows.
-//   w_row = w_off + col * nb * 66
-//   a_base = (a_off + row * nb * 256 * elem_size) / elem_size + b * 256
+// vt_matmul_bt_tq2_dev: OPTIMIZED — fine-grained K-split, subgroup reduction.
+// Non-grouped keep-quant matmul for TQ2_0 weights with ON-DEVICE Q8_K quantize.
 
 #extension GL_GOOGLE_include_directive : require
+#define VT_SUBGROUP_REDUCE
 #include "vt_common.glsl"
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
-  uint n;       // output columns (weight rows)
-  uint m;       // output rows (tokens)
-  uint nb;      // k / 256
-  uint a_off;   // activation tensor start — byte offset
-  uint w_off;   // weight tensor start (TQ2_0) — byte offset
-  uint out_off; // output tensor start — byte offset
+  uint n; uint m; uint nb; uint a_off; uint w_off; uint out_off;
 } p;
 
 layout(set = 0, binding = 0, std430) readonly buffer Ab32 { uint v[]; } A32;
@@ -34,74 +19,79 @@ layout(set = 0, binding = 3, std430) readonly buffer Wb16 { uint16_t v[]; } W16;
 layout(set = 0, binding = 4, std430) writeonly buffer Ob32 { uint v[]; } O32;
 layout(set = 0, binding = 5, std430) writeonly buffer Ob16 { uint16_t v[]; } O16;
 
-layout(constant_id = 0) const uint VT_TQ_OUT_DT = 0u;  // output dtype
-layout(constant_id = 1) const uint VT_TQ_ACT_DT = 0u;  // activation dtype (f32/bf16)
+layout(constant_id = 0) const uint VT_TQ_OUT_DT = 0u;
+layout(constant_id = 1) const uint VT_TQ_ACT_DT = 0u;
 
-shared float tq_part[128];
+shared float sm_amax[128];
+
+float load_act(uint idx) {
+  return (VT_TQ_ACT_DT == VT_DT_F32)
+      ? uintBitsToFloat(A32.v[idx])
+      : vt_bf16_to_f32(uint(A16.v[idx]));
+}
+
+int tq2_0_trit(uint ae, uint woff) {
+  uint j = (ae >= 128u) ? 32u : 0u;
+  uint rem = ae - j * 4u;
+  uint l = rem / 32u; uint k = rem % 32u;
+  uint wb_byte = woff + j + k;
+  uint w16 = W16.v[wb_byte >> 1];
+  uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+  return int((wb >> (l * 2u)) & 3u) - 1;
+}
 
 void main() {
   uint tid = gl_LocalInvocationID.x;
   uint col = gl_WorkGroupID.x;
-  if (col >= p.n) { return; }
+  if (col >= p.n) return;
 
-  const uint wbytes = 66u;  // BlockTQ2_0
+  const uint wbytes = 66u;
+  uint nb = p.nb;
+  uint lpb = 128u / nb;
+  uint block_id = tid / lpb;
+  uint lane_in_block = tid % lpb;
+  uint elems = 256u / lpb;
+  uint a_shift = (VT_TQ_ACT_DT == VT_DT_F32) ? 2u : 1u;
 
   for (uint row = 0u; row < p.m; ++row) {
-    uint a_base = (VT_TQ_ACT_DT == VT_DT_F32)
-        ? ((p.a_off >> 2) + row * p.nb * 256u)
-        : ((p.a_off >> 1) + row * p.nb * 256u);
-
+    uint a_row_base = (p.a_off >> a_shift) + row * p.nb * 256u;
     float acc = 0.0;
-    for (uint b = tid; b < p.nb; b += 128u) {
-      // --- Pass 1: find signed-extremum max over 256 activation values ---
-      uint a_off = a_base + b * 256u;
+
+    if (block_id < nb) {
+      uint a_base = a_row_base + block_id * 256u;
+      uint woff = p.w_off + col * p.nb * wbytes + block_id * wbytes;
       float amax = 0.0;
-      float maxv = 0.0;
-      for (uint i = 0u; i < 256u; ++i) {
-        float v = (VT_TQ_ACT_DT == VT_DT_F32)
-            ? uintBitsToFloat(A32.v[a_off + i])
-            : vt_bf16_to_f32(uint(A16.v[a_off + i]));
-        float ax = abs(v);
-        if (ax > amax) { amax = ax; maxv = v; }
+      for (uint i = 0u; i < elems; ++i) {
+        float v = load_act(a_base + lane_in_block * elems + i);
+        amax = max(amax, abs(v));
       }
-      if (amax == 0.0) { continue; }
-
-      float iscale = -127.0 / maxv;
-      float d_act = 1.0 / iscale;
-
-      // --- Pass 2: re-read, quantize, dot with TQ2_0 weight ---
-      uint woff = p.w_off + col * p.nb * wbytes + b * wbytes;
-      float wd = vt_from16(uint(W16.v[(woff + 64u) >> 1]), VT_DT_F16);
-      float blockd = d_act * wd;
-      int acci = 0;
-      for (uint j = 0u; j < 64u; j += 32u) {
-        for (uint l = 0u; l < 4u; ++l) {
-          for (uint k = 0u; k < 32u; ++k) {
-            uint ae = j * 4u + l * 32u + k;
-            float v = (VT_TQ_ACT_DT == VT_DT_F32)
-                ? uintBitsToFloat(A32.v[a_off + ae])
-                : vt_bf16_to_f32(uint(A16.v[a_off + ae]));
-            int q = int(roundEven(iscale * v));
-            q = q < 127 ? q : 127;
-            uint wb_byte = woff + j + k;
-            uint w16 = W16.v[wb_byte >> 1];
-            uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
-            int ternary = int((wb >> (l * 2u)) & 3u) - 1;
-            acci += q * ternary;
-          }
-        }
-      }
-      acc += float(acci) * blockd;
-    }
-
-    tq_part[tid] = acc;
-    barrier();
-    for (uint s = 64u; s > 0u; s >>= 1u) {
-      if (tid < s) tq_part[tid] += tq_part[tid + s];
+      sm_amax[tid] = amax;
       barrier();
+      for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
+        if (lane_in_block < s) sm_amax[tid] = max(sm_amax[tid], sm_amax[tid + s]);
+        barrier();
+      }
+      float block_amax = sm_amax[block_id * lpb];
+      if (block_amax > 0.0) {
+        float iscale = -127.0 / block_amax;
+        float d_act = -block_amax / 127.0;
+        float wd = vt_from16(uint(W16.v[(woff + 64u) >> 1]), VT_DT_F16);
+        float blockd = d_act * wd;
+        int acci = 0;
+        for (uint i = 0u; i < elems; ++i) {
+          uint ae = lane_in_block * elems + i;
+          float v = load_act(a_base + ae);
+          int q = int(roundEven(iscale * v));
+          q = q < 127 ? q : 127;
+          acci += q * tq2_0_trit(ae, woff);
+        }
+        acc = float(acci) * blockd;
+      }
     }
+
+    acc = vt_tg_sum(tid, acc);
     if (tid == 0u) {
-      VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, tq_part[0]);
+      VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, acc);
     }
     barrier();
   }

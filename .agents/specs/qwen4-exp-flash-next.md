@@ -2552,8 +2552,8 @@ is listed under `## Owed`.
   it, and the MECHANISM is not the one an earlier draft of this bullet named.
   `ForwardQwen4ExpForConditionalGeneration` EXISTS
   (`src/vllm/model_executor/models/qwen4_exp_registry.cpp:142`) and IS registered
-  as the model's `.forward` hook (`:421`); its entire body is one
-  `VT_CHECK(false, ...)` refusal-by-name (`:189`), placed ahead of any downcast.
+  as the model's `.forward` hook (`:456`); its entire body is one
+  `VT_CHECK(false, ...)` refusal-by-name (`:228`), placed ahead of any downcast.
   So `ModelRegistry::Forward` reaches a real hook and that hook refuses
   `Qwen4ExpForConditionalGeneration` by name before a layer runs. The conclusion
   — nothing production-side reaches this adapter — is unchanged; "the function
@@ -2569,14 +2569,14 @@ is listed under `## Owed`.
   (mutation M4).
   Six further things W5d-4 owes:
   - **`norm_topk_prob` is not representable through this seam.** `MoeBlock`
-    hardcodes `renormalize = true` (`qwen3_5.cpp:7241`) and `HfConfig` carries no
+    hardcodes `renormalize = true` (`qwen3_5.cpp:7242`) and `HfConfig` carries no
     such field, so a config that turned it off could not be honoured and the
     adapter cannot refuse what it cannot see. Upstream's default is `True`
     (`configuration_qwen4_exp.py:163`) and the released checkpoint does not
     override it, so nothing is wrong today; `Qwen4ExpParams` still does not carry
     the field, which this section already owed above.
   - **The bf16 arm is ineligible for the CUDA fast grouped-bf16 MoE.**
-    `MoeBf16FastLayoutOk` (`qwen3_5.cpp:841-862`) requires per-expert `[H, I]`
+    `MoeBf16FastLayoutOk` (`qwen3_5.cpp:842-863`) requires per-expert `[H, I]`
     with `nk == false`, and the adapter's zero-copy views are the tower's own
     `[I, H]` with `nk == true`. It therefore falls through to the reference
     per-expert loop on CUDA, exactly as the 35B MTP producer already does. The
@@ -2604,7 +2604,7 @@ is listed under `## Owed`.
     renormalized top-k weights back to the model dtype
     (`router_top_value.to(router_logits.dtype)`, `modeling_qwen4_exp.py:914`);
     our shared seam keeps them f32, because `vt::MoeRouterTopK` writes an f32
-    `dtw` (`qwen3_5.cpp:7238-7241`) and every Qwen MoE in this tree reads that
+    `dtw` (`qwen3_5.cpp:7239-7242`) and every Qwen MoE in this tree reads that
     field. An earlier draft of the suite header called the seam "the more
     precise of the two". That is exactly the argument AGENTS.md §"Inherit vLLM
     defaults" exists to refuse: a token gate cannot see a dtype that is too
@@ -3634,7 +3634,7 @@ is listed under `## Owed`.
        (`src/vt/ops.cpp:223`). **That refusal is ROUTE-CONDITIONAL and the
        sentence above is scoped to the default route on purpose.** With
        `VT_QWEN35_GROUPED_MOE=0` the seam takes the per-expert `ExpertMlpKq`
-       path, which reaches `KqResidentSlice` (`qwen3_5.cpp:5664-5677`); that
+       path, which reaches `KqResidentSlice` (`qwen3_5.cpp:5665-5678`); that
        helper rebuilds a rank-2 view from its `N`/`K` ARGUMENTS by pointer
        arithmetic, sets `wt.rank = 2` itself and never reads the tower's
        declared rank, so a rank-3 tower does not throw there — and, the tower
@@ -3657,11 +3657,11 @@ is listed under `## Owed`.
        `tests/vllm/models/test_qwen4_exp_moe.cpp`. **And the alternate route is a
        measured RESULT rather than an admitted limit.**
        `Qwen35GroupedMoeEnabled()` caches in a function-local `static const`
-       (`qwen3_5.cpp:6298-6301`), which prevents flipping it MID-PROCESS, not
+       (`qwen3_5.cpp:6299-6302`), which prevents flipping it MID-PROCESS, not
        before launch — so `VT_QWEN35_GROUPED_MOE=0` does exercise `ExpertMlpKq`.
        Run that way, both value cases pass at BIT-IDENTICAL `max|diff|` to the
        default route (bf16 `0.00218359`, keep-quant `0.00865547`), which is the
-       seam's own byte-identity claim at `qwen3_5.cpp:7260` measured rather than
+       seam's own byte-identity claim at `qwen3_5.cpp:7261` measured rather than
        inherited. The suite runs on both routes and says which behaviour it is
        asserting on each.
     5. **CLOSED by W5d-2 (#2249 item 5, `3ed2378a3`): the mRoPE table builder

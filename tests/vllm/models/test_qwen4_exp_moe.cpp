@@ -16,10 +16,10 @@
 // only thing that keeps the next reader from re-deriving "the shapes match".
 //
 // THAT RED IS ROUTE-CONDITIONAL, and the suite says so rather than leaving a
-// reader to discover it. `Qwen35GroupedMoeEnabled()` (`qwen3_5.cpp:6298-6301`)
+// reader to discover it. `Qwen35GroupedMoeEnabled()` (`qwen3_5.cpp:6299-6302`)
 // is ON by default; with `VT_QWEN35_GROUPED_MOE=0` the seam takes the
 // per-expert `ExpertMlpKq` path, which reaches `KqResidentSlice`
-// (`qwen3_5.cpp:5664-5677`), and that helper rebuilds a rank-2 view from its
+// (`qwen3_5.cpp:5665-5678`), and that helper rebuilds a rank-2 view from its
 // `N`/`K` ARGUMENTS by pointer arithmetic and never reads the declared rank. A
 // rank-3 tower does not throw there, and since the tower is contiguous
 // `[E, N, K]` the slice `row_off = e * N` is the right one, so it answers
@@ -70,7 +70,7 @@
 // UPSTREAM PRECISION NOTE, recorded rather than mirrored: upstream casts the
 // renormalized top-k weights back to the model dtype
 // (`router_top_value.to(router_logits.dtype)`, :914) and our shared seam keeps
-// them f32 (`vt::MoeRouterTopK` writes an f32 `dtw`, qwen3_5.cpp:7238-7241). The
+// them f32 (`vt::MoeRouterTopK` writes an f32 `dtw`, qwen3_5.cpp:7239-7242). The
 // seam is therefore WIDER than the oracle by one bf16 rounding of a value in
 // [0,1]. That is a divergence, not a feature, and it is NOT defended here as
 // being "more precise": AGENTS.md §"Inherit vLLM defaults" is explicit that a
@@ -183,7 +183,7 @@ Queue CpuQ() { return Queue{Cpu(), nullptr}; }
 
 // WHICH EXPERT ROUTE THE SEAM WILL TAKE, read from the same environment variable
 // with the same predicate `Qwen35GroupedMoeEnabled()` uses
-// (`qwen3_5.cpp:6298-6301`). It is duplicated rather than called because the
+// (`qwen3_5.cpp:6299-6302`). It is duplicated rather than called because the
 // seam's copy is file-local to qwen3_5.cpp and is not declared in any header.
 // The duplication is one `getenv` and one string compare, and it is the reason
 // this suite can gate BOTH routes instead of silently asserting the default
@@ -526,7 +526,7 @@ TEST_CASE("Qwen4Exp MoE: the stacked towers do NOT drop into the seam's _kq fiel
   } else {
     // THE OTHER HALF OF #2249 ITEM 4, asserted rather than assumed away. On the
     // per-expert route `ExpertMlpKq` reaches `KqResidentSlice`
-    // (`qwen3_5.cpp:5664-5677`), which rebuilds a rank-2 view from its `N`/`K`
+    // (`qwen3_5.cpp:5665-5678`), which rebuilds a rank-2 view from its `N`/`K`
     // ARGUMENTS and never reads the declared rank — so the rank-3 tower is
     // accepted, and because the tower is contiguous `[E, N, K]` the offset
     // `e * N` is the right slice and the ANSWER IS RIGHT. Item 4's "the shapes
@@ -589,7 +589,7 @@ TEST_CASE("Qwen4Exp MoE: the bf16 arm matches the lane-pinned oracle") {
   INFO("|reference| max = " << scale);
   const double worst = vllm_test::MaxAbsDiff(got, ref.y.data(), ref.y.size());
   // The ROUTE is printed beside the number because the two are only known to be
-  // equal by measurement: `qwen3_5.cpp:7260` claims the grouped path is
+  // equal by measurement: `qwen3_5.cpp:7261` claims the grouped path is
   // byte-identical to the per-expert scatter, and running this suite both ways
   // is what turns that claim into a reading.
   MESSAGE("bf16 arm max|diff| = " << worst << " over |reference| max " << scale

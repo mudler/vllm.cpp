@@ -26,7 +26,7 @@
 //      not "match"; it throws. That qualifier is load-bearing and is not a
 //      hedge: with `VT_QWEN35_GROUPED_MOE=0` the seam takes the per-expert
 //      `ExpertMlpKq` path, which reaches `KqResidentSlice`
-//      (`qwen3_5.cpp:5664-5677`) — and that helper rebuilds a rank-2 view from
+//      (`qwen3_5.cpp:5665-5678`) — and that helper rebuilds a rank-2 view from
 //      its `N`/`K` ARGUMENTS by pointer arithmetic, sets `wt.rank = 2` itself
 //      and never reads the tower's declared rank. A rank-3 tower does not throw
 //      there, and because the tower is contiguous `[E, N, K]` it even answers
@@ -46,7 +46,7 @@
 //      logits that `softmax(..., dtype=torch.float)` then upcasts (`:909-910`) —
 //      exactly the seam's bf16-logits / f32-softmax split.
 //   3. ARM SELECTION. `MoeBlock` decides the whole expert path from
-//      `w.expert_gate_kq.Empty()` ALONE (`qwen3_5.cpp:7256`, `:7295`) — it never
+//      `w.expert_gate_kq.Empty()` ALONE (`qwen3_5.cpp:7257`, `:7296`) — it never
 //      looks at up or down. `GgufLoadPolicy::Route` is per tensor, so a policy
 //      that keeps `gate` quantized and expands `down` produces a set the seam
 //      reads as keep-quant and then dereferences an EMPTY down tower. Refused by
@@ -87,7 +87,7 @@
 // this composition is reached only by its own gate at its merge commit; the
 // spec's `## Owed` records that with the row and the issues that own the wiring
 // (`MODEL-MM-QWEN4-EXP`, #2031, #2249). Also not here: `norm_topk_prob`. The
-// seam hardcodes `renormalize = true` (`qwen3_5.cpp:7241`) and `HfConfig` has no
+// seam hardcodes `renormalize = true` (`qwen3_5.cpp:7242`) and `HfConfig` has no
 // field for it, so a config that turned it off could not be represented; the
 // upstream default is `True` (`configuration_qwen4_exp.py:163`) and
 // `Qwen4ExpParams` does not carry the field, which the spec already owes.

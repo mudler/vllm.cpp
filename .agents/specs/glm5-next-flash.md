@@ -1369,6 +1369,129 @@ the experts to Q2_K and leave the 3% at Q5_K, or accept a shorter maximum
 context. Do not reach for IQ2_XXS to buy headroom without first solving the
 imatrix problem.
 
+### The measured residency, and the two `vec_dot` rows that produced it
+
+[#2247](https://github.com/mudler/vllm.cpp/issues/2247), rows
+`QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS`.
+
+**Scope.** Two keep-quant `vec_dot` kernels in `src/vt/cpu/cpu_quant_dot.cpp`
+beside the fifteen already there, their two block structs, and their two
+`QuantTraits` rows. Nothing else: #2245 had already landed the row decoders, the
+reader strides and the vt geometry, so this row is purely the dot-product side.
+
+**Upstream anchors**, read out of the pinned object with `git cat-file` and
+`git archive` from a fresh partial clone of `ggml-org/llama.cpp`, never a working
+tree. `refs/tags/b10451` was confirmed to resolve to
+`10bf611e533d81f739128304991c5e133c6aebd8` in that clone.
+
+| ported | from |
+|---|---|
+| `VecDotIQ2_XSQ8_K` | `ggml/src/ggml-cpu/quants.c:948` `ggml_vec_dot_iq2_xs_q8_K_generic` |
+| `VecDotIQ4_XSQ8_K` | `ggml/src/ggml-cpu/quants.c:1283` `ggml_vec_dot_iq4_xs_q8_K_generic` |
+| `BlockIQ2_XS` (74 B) | `ggml/src/ggml-common.h:388-393` `block_iq2_xs` |
+| `BlockIQ4_XS` (136 B) | `ggml/src/ggml-common.h:454-460` `block_iq4_xs` |
+| IQ2_XS traits row | `ggml/src/ggml-cpu/ggml-cpu.c:342-347` |
+| IQ4_XS traits row | `ggml/src/ggml-cpu/ggml-cpu.c:385-390` |
+
+**The activation pairing was RESOLVED, not assumed.** IQ4_XS reuses IQ4_NL's
+`kvalues_iq4nl` byte for byte, and IQ4_NL pairs with Q8_0, so the shape of the
+question was real. `type_traits_cpu` answers it: `[GGML_TYPE_IQ4_XS]` carries
+`.vec_dot = ggml_vec_dot_iq4_xs_q8_K` and `.vec_dot_type = GGML_TYPE_Q8_K`
+(ggml-cpu.c:385-390), against `[GGML_TYPE_IQ4_NL]`'s `GGML_TYPE_Q8_0`
+(:379-384), and the kernel's own name carries the same answer. The reason is
+geometry rather than codebook: IQ4_NL's block is 32 elements and pairs with the
+32-element activation encoding, IQ4_XS's is a 256-element super-block and pairs
+with the 256-element one. Both IQ2_XS and IQ4_XS therefore dot against Q8_K.
+
+**Design.** Both bodies are kept verbatim, including the accumulation order:
+IQ2_XS folds `sumi` into `bsum` TWICE per 32-element sub-block because the two
+halves take different scale nibbles, and IQ4_XS forms `d1`/`d2` as f32 before the
+integer sums and accumulates into `sumf` eight times per super-block. That order
+is what makes our GEMM bit-reproducible against upstream, and rewriting either
+body "more naturally" would break the gate below rather than merely change a
+rounding.
+
+**Risk this row exists to manage: a `vec_dot` is a REDUCTION.** A wrong grid
+entry, a swapped scale nibble or a mis-shifted `scales_h` bit pair does not
+throw. It moves the sum a little, and every consistency check in the tree
+(vec_dot against `BlockToFloat`, `MatmulBTQuant` against per-row vec_dot) reads
+the same decode twice and agrees with the defect. IQ2_XXS / IQ2_XS / IQ2_S are
+three same-shaped codebooks, so a kernel pointed at a sibling still indexes in
+range and still returns a plausible magnitude.
+
+**Tests.** Gated BIT FOR BIT against the ORACLE'S OWN KERNELS on REAL bytes of
+the staged artifact — the same 4 IQ2_XS super-blocks of
+`blk.3.ffn_gate_exps.weight` and 4 IQ4_XS super-blocks of
+`blk.11.ffn_down_exps.weight` that #2245's decoder goldens use, re-verified
+against the live file by `dd` on 2026-08-29. The activation side is the oracle's
+own `quantize_row_q8_K_generic` over a deterministic integer-valued signal, and
+the goldens carry the resulting Q8_K bytes so the test can also assert that OUR
+`from_float` reproduces them. The comparison is against upstream's own f32
+accumulation and not against a cleaner f64 reference, because a double
+accumulator agrees with a reduction-order defect. Total and per-super-block
+values are both pinned, so a defect that cancels across blocks is still caught.
+Goldens and the full reproduction recipe: `tests/vt/iq2xs_iq4xs_dot_golden.h`.
+
+Both types also join `kWeightCases` in `tests/vt/test_ops_quant_dot.cpp`, which
+runs the whole existing battery over them (random-block decode against an
+independent f64 reference, `MatmulBTQuant` against per-row vec_dot, the NMSE
+ceiling, run-to-run bit-exactness).
+
+**The codebook seal is now COUPLED to the kernel.** #2245 sealed `kIq2xsGrid`
+with an FNV-1a digest and a lane histogram, which proves the TABLE holds the
+pinned bytes and says nothing about which table the kernel reads. Swapping
+`kIq2xsGrid` for `kIq2xxsGrid` inside `VecDotIQ2_XSQ8_K` leaves the seal green
+and reds the oracle golden; that mutation is the proof, and the coupling case
+states the two facts it depends on (the tables differ over their shared first 256
+rows, and the blocks dotted use indices above 255).
+
+**The measured residency.** `RouteGgufTensor` — the production decision — driven
+over all 1412 tensors of the artifact's own headers, roles assigned by the
+loader's convention (`token_embd.weight` a gather, 3-D `*_exps.weight` stacked
+expert weights, other 2-D weights GEMM weights, 1-D vectors), costing a kept
+tensor its file bytes and an expanded one `numel x 2`. Nothing is loaded: the
+reader mmaps and only the tensor table is touched.
+
+| type | n | disk GiB | resident GiB | resident before #2247 |
+|---|---:|---:|---:|---:|
+| F32 | 638 | 0.21 | 0.10 | 0.10 |
+| IQ2_XS | 82 | 53.33 | **53.33** | **369.00** |
+| IQ3_XXS | 41 | 35.31 | 35.31 | 35.31 |
+| IQ4_XS | 3 | 3.59 | **3.59** | **13.50** |
+| Q2_K | 2 | 1.48 | 1.48 | 1.48 |
+| Q3_K | 1 | 0.97 | 0.97 | 0.97 |
+| Q4_K | 1 | 0.33 | 0.33 | 0.33 |
+| Q5_K | 181 | 3.03 | 3.03 | 3.03 |
+| Q6_K | 117 | 2.20 | 2.20 | 2.20 |
+| Q8_0 | 346 | 0.80 | 0.80 | 0.80 |
+| **TOTAL** | **1412** | **101.24** | **101.14** | **426.72** |
+
+774 of the 1412 tensors route to `kKeepQuant`. All-bf16 is 597.46 GiB. The
+saving is **325.58 GiB**, and 101.14 GiB against ~119.63 GiB leaves 18.49 GiB.
+The "before" column is the same loop with the two types forced to expand on the
+GEMM roles, which is exactly the tree at `94de63ff5`.
+
+**IQ4_XS has a SECOND consumer, and the expert-tower lane is all-or-nothing.**
+`GgufExpertTowersReachSlotLane` (`gguf_device_fit.cpp`) loops the matching
+towers and returns false on the FIRST one that does not reach a keep residency,
+so a handful of IQ4_XS towers drops a whole arm out of the streaming lane. On
+the GLM-5.3 (non-Flash) `UD-IQ1_S` arm that is 4 IQ4_XS tensors beside 106
+IQ1_S, 71 IQ3_XXS, 44 IQ2_XXS and 3 K-quant, every one of which already kept:
+one expert tower then goes 6.375 GiB to 24.000 GiB of bf16 and the uniform slot
+goes 6.375 MiB to 24.00 MiB, turning a 4096-slot cache from 25.5 GiB into 96
+GiB. `tests/vllm/model_executor/test_gguf_device_fit.cpp` carries the assertion
+directly, on a fixture whose towers are IQ2_XS and IQ4_XS in the
+`kStackedExpertWeight` role both models store them in — the role `PeekRoute`
+asks about, and the one this row is actually load-bearing for.
+
+**Gates.** `tests/vt/test_ops_quant_dot.cpp`,
+`tests/vt/test_ops_quant_traits.cpp`, `tests/vllm/test_gguf_keep_quant.cpp`,
+`tests/vllm/model_executor/test_gguf_device_fit.cpp`, plus
+`scripts/agent-preflight.sh --fail-on-skip`. The routing table in
+`test_gguf_keep_quant.cpp` is restated rather than refitted: its GEMM term moves
+20 -> 24 and its GATHER term stays 13, the mirror image of #2245's decode-only
+move (gather 11 -> 13, GEMM 20).
+
 ### Three things that make "fits in VRAM" the wrong question
 
 - **GB10 is unified memory.** The 119.63 GiB is the whole pool, not a VRAM
@@ -1734,20 +1857,26 @@ Debts this row carries, each visible rather than waived:
   #2243 quotes the superseded 35 / 11 and cannot be edited; that row names this
   entry, so this entry is the corrected surface.
 
-  **Reaching config resolution is not the same as the model fitting.** Both new
-  types are DECODE-ONLY. Neither has a keep-quant `vec_dot`, so
-  `HasQuantDotKernel` is false and every GEMM weight of those two types expands
-  to bf16 at load. Measured from the staged artifact's own headers, all four
-  shards and all 1412 tensors: the file is **101.24 GiB on disk and 597.46 GiB
-  as bf16**, an expansion of 5.9x. The resident cost TODAY is **426.72 GiB**,
-  and `dgx:gpu0` has about 119.63 GiB, so it does not fit. A keep-quant
-  `vec_dot` for exactly these two types brings the resident cost to **101.14
-  GiB**, which fits with 18.49 GiB of headroom, and saves **325.58 GiB**. Every
-  other encoding in this file already keeps its quantization, IQ3_XXS
-  (`VecDotIQ3_XXSQ8_K`) included, so these two types are the whole gap.
-  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) owns that work, and
-  the `QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS` rows of
-  [`quantization-matrix.md`](../quantization-matrix.md) carry it as `C` = `-`.
+  **Reaching config resolution is not the same as the model fitting, and that
+  half is now PAID.** Both types were DECODE-ONLY when this entry was written:
+  neither had a keep-quant `vec_dot`, so `HasQuantDotKernel` was false and every
+  GEMM weight of those two types expanded to bf16 at load. Measured from the
+  staged artifact's own headers, all four shards and all 1412 tensors: the file
+  is **101.24 GiB on disk and 597.46 GiB as bf16**, an expansion of 5.9x, and
+  the resident cost was **426.72 GiB** against about 119.63 GiB on `dgx:gpu0`.
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) ported the two
+  kernels, and the same measurement now reads **101.14 GiB**, which fits with
+  18.49 GiB of headroom, for a saving of **325.58 GiB**. Both figures come from
+  driving the production `RouteGgufTensor` over the artifact's real tensor list
+  (§"The measured residency" below), not from arithmetic. Every other encoding
+  in this file already kept its quantization, IQ3_XXS (`VecDotIQ3_XXSQ8_K`)
+  included, so these two types were the whole gap. The `QUANT-GGUF-IQ2_XS` and
+  `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) now carry `C` = `Y`.
+  **The remaining blockers on a real load are functional, not memory:**
+  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) /
+  [#2177](https://github.com/mudler/vllm.cpp/issues/2177) (the per-layer
+  `head_count_kv` array), W5b and W5c.
 
   **O7 is stale beside it and is not corrected here.** "No artifact of this
   model exists" was true when it was written; the UD-Q2_K_XL arm is now staged,

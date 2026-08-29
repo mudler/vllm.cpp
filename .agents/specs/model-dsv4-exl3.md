@@ -1984,14 +1984,15 @@ which is precisely how this landed green locally in the first place.
   from the measured 108.59 / 26.64 split. Nobody has re-run the load on the real
   artifact since, so the figure is a projection and not an observation. It falls
   due as a `dgx:gpu0` measurement with the staged 100 GB checkpoint
-  ([#2186](https://github.com/mudler/vllm.cpp/issues/2186)). A load that
+  ([#2283](https://github.com/mudler/vllm.cpp/issues/2283); #2186 closed with W1d and no longer
+  tracks it). A load that
   completes is also not a forward that runs -- see W1d-4.
 - **The BF16-sourced half of the carried tower is still widened to f32**, worth a
   further ~2.62 GiB (5.24 -> 2.62). W1d took the FP8-sourced half only. This half
   is the norms, embeddings and router, which far more code reads than the nine
   fields W1d moved, so it is a wave rather than an extension of this one.
   Owned by `MODEL-DSV4-EXL3`, tracked by
-  [#2186](https://github.com/mudler/vllm.cpp/issues/2186).
+  [#2283](https://github.com/mudler/vllm.cpp/issues/2283).
 
 - **`exllamav3` is not a REGISTERED secondary oracle.** AGENTS.md says a
   secondary oracle "is valid only when it appears in this table and has a

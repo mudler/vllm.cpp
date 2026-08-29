@@ -248,9 +248,8 @@ consuming `Request.mm_features`
 ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)). Video, audio and
 multi-image over HTTP are not started, and the seam refuses a `video_url` or an
 `input_audio` part with HTTP 400. Audio **in** is gated. Audio **out** has a
-surface now
-(`/v1/audio/speech`, `vllm_speech_*` v20), but no family renders from a prompt:
-both refuse, naming what is missing.
+surface now (`/v1/audio/speech`, `vllm_speech_*` v20), but no family renders
+from a prompt: both refuse, naming what is missing.
 
 ## Speculative decoding
 

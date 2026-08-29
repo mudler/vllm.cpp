@@ -189,8 +189,20 @@ row already reads and needs no new one. If it holds, caching one
 `Ltx2VaeWeights` across the two conditioning passes removes half of it without
 touching a kernel. That is a row of its own and it is not this one.
 
-`generate.guiders` and `decode.audio.mel` have no equivalent hypothesis yet, and
-saying so is better than inventing one. Both are under `## Owed`.
+**`generate.guiders` is mostly the same load, a second time.** It is the negative
+prompt through both stages, so it should read as one tower pass plus one
+connector pass. Measured at n = 3: the positive halves are 28.343 + 122.388 =
+150.731 s and `generate.guiders` is 190.016 s, leaving **39.3 s unexplained**.
+The plausible reading is the negative prompt's larger valid-token count in the
+tower — upstream's `DEFAULT_NEGATIVE_PROMPT` is longer than this request's
+prompt — and it is a reading rather than a measurement, because
+`generate.guiders` is ONE leaf and its tower and connector halves are not
+separately scoped. Splitting it is the same one-line instrument change the
+paragraph above asks for, and it should be done in the same row.
+
+**`decode.audio.mel` at 47 s has no hypothesis, and saying so is better than
+inventing one.** It is larger than the whole denoise loop. It is under
+`## Owed`.
 
 ## The record this falsifies
 
@@ -209,7 +221,7 @@ and #2296 carries it.
 |---|---|
 | `.agents/specs/ltx25-render-speed-parity.md` | this file |
 | `scripts/ltx25-render-speed-repeat.sh` | new; the repeat-render timing harness `## Gates` item 1 runs |
-| `.agents/issue-index.md` | one appended row for #2296 |
+| `.agents/issue-index.md` | two appended rows: #2296, and #2305 which this harness's own defect owed |
 
 **No product code.** This row measures an engine it does not change. That is
 deliberate and it is the reason the harness asserts the binary's sha256 against
@@ -316,10 +328,142 @@ Stop and report, do not work around:
 - **The oracle's own 93.8 s is undecomposed.** Upstream emits no phase table and
   this row did not instrument it, so which part of the 5.4x is load and which is
   compute is known on our side only. Owner: this row.
-- **`decode.audio.mel` at 47.13 s — 9.5% of the wall — is unattributed.** It is
-  larger than the entire denoise loop and nothing in this tree explains it.
+- **`decode.audio.mel` is unattributed.** Measured at n = 3 it is inside
+  `decode.audio`'s 50.745 s, which is 9.79% of the wall and **3.35x the whole
+  denoise loop**, for 1.02 s of audio. Nothing in this tree explains it and this
+  row does not guess. Owner: this row.
+- **The 206.0 s that remains after `guiders` and `connector` is a second
+  question and it is open.** Removing both entirely still leaves 2.20x. `load`
+  is 94.5 s of it, `decode.audio` 50.7 s, `decode.video` 16.0 s and `denoise`
+  15.1 s. Naming it here is what stops the connector finding from being read as
+  the whole answer. Owner: this row.
+- **The oracle side is n = 1.** Its 93.8 s has no spread and this row did not
+  re-run it, because doing so needs the pinned `ltx-2` stack in a lease and that
+  is a second measurement rather than a footnote to this one. Every ratio above
+  is therefore stated against a denominator whose own variance is unknown.
   Owner: this row.
 
 ## Now
 
-`ACTIVE`. W1 is this change.
+`ACTIVE`. W1, W2 and W3 are in this change and complete. The reading is taken.
+
+## Outcome
+
+**The lease.** `rc` job `0baa109c-43ff-475e-abf1-7a50152ffd5d` on `dgx:gpu0`,
+2026-08-29 19:58:51Z to 20:26:45Z, **27m54s**, `renders_completed=3`. The device
+was `ready` and unleased at submission and no other job held it; `rc ps` showed
+an empty queue. Evidence at
+`/mnt/nas_share/rc/ltx25-render-speed/run/20260829T195851Z`, which a leased
+worker sees as `/workspace/ltx25-render-speed/run/20260829T195851Z`.
+
+**Every precondition held, and each was checked rather than assumed.** The
+binary is byte-for-byte `4b0666ee`'s — `ltx2-gen` `7b1f4367...`, `libvllm.so.0.0.3`
+`9e3dc6f4...`, source `0002ddfba` — so this is a timing of the tree that took the
+correctness verdict and not of a rebuild of it. All four checkpoint sha256
+recomputed inside the lease and all four match the manifest. The CUDA unit gate
+ran first at **23 cases / 806 assertions / 0 failed**, the same counts
+`fa9903b86` recorded. Every render read `steps_observed={8}` and
+`dit_forwards=32`, and every phase table covered its own wall to better than
+0.12%.
+
+**The like-for-like comparison. Both sides are one process, both include model
+load, both read local disk on the same GB10.**
+
+| | brackets | seconds |
+|---|---|---:|
+| ours, `[G]` wall, n = 3 | the whole `ltx2-gen` invocation | 509 / 531 / 528, mean **522.7** |
+| ours, `phase-log.json` `wall_seconds`, n = 3 | first phase open to last phase close | 504.865 / 526.778 / 523.551, mean **518.398** |
+| oracle, `render_seconds`, n = 1 | the whole `ti2vid_one_stage` subprocess, load included | **93.8** |
+| oracle, `total_seconds`, n = 1 | the above plus 149 s of sha256 and the ffmpeg decode | 243.7 |
+
+**Ratio 5.53x** on the in-process walls (5.38x to 5.62x across our three runs),
+**5.57x** on the `[G]` walls. The oracle side is n = 1 and has no spread of its
+own, and that is a limit of this comparison rather than a footnote: our
+4.23% spread is measured and theirs is unknown.
+
+`total_seconds` has no counterpart on our side and is not compared. Its 149 s of
+hashing is a separate phase of our harness, outside the render.
+
+**The load-excluded figure is a BOUND, not a ratio.** Our `generate` span means
+423.913 s against the oracle's whole 93.8 s = **4.52x**, and that is a LOWER
+bound on the render-only ratio because the oracle's 93.8 s still has its own load
+inside it. There is no better form available: `--offload cpu` streams upstream's
+weights layer by layer, so its load has no boundary to subtract.
+
+**The decomposition, n = 3, spread stated per phase.** Every boundary here is a
+`phase::Scope` in `src/vllm/multimodal/ltx2_video.cpp` writing
+`phase-log.json` on the shipped default path — an instrument, not an interval
+read off a log.
+
+| phase | r1 | r2 | r3 | mean | spread | % of wall |
+|---|---:|---:|---:|---:|---:|---:|
+| `wall_seconds` | 504.865 | 526.778 | 523.551 | 518.398 | 4.23% | 100.00 |
+| `generate` (span) | 421.733 | 424.300 | 425.707 | 423.913 | 0.94% | 81.77 |
+| **`generate.guiders`** | 189.041 | 189.836 | 191.172 | **190.016** | **1.12%** | **36.65** |
+| `generate.conditioning` (span) | 149.985 | 151.456 | 151.127 | 150.856 | 0.97% | 29.10 |
+| **`conditioning.connector`** | 122.173 | 122.717 | 122.275 | **122.388** | **0.44%** | **23.61** |
+| `load` (span) | 83.129 | 102.477 | 97.843 | 94.483 | 20.48% | 18.23 |
+| `load.text_encoder` | 55.082 | 55.687 | 57.699 | 56.156 | 4.66% | 10.83 |
+| `decode.audio` | 50.703 | 50.709 | 50.822 | 50.745 | 0.23% | 9.79 |
+| `load.dit` | 25.792 | 43.208 | 36.128 | 35.043 | 49.70% | 6.76 |
+| `conditioning.tower` | 27.697 | 28.603 | 28.729 | 28.343 | 3.64% | 5.47 |
+| `decode.video` | 15.818 | 15.958 | 16.133 | 15.970 | 1.98% | 3.08 |
+| **`denoise`** | 14.902 | 15.255 | 15.229 | **15.129** | **2.33%** | **2.92** |
+| `unaccounted_seconds` | 0.481 | 0.593 | 0.600 | 0.558 | — | 0.11 |
+
+**The spread is what makes the attribution safe, and it is the right way round.**
+The two phases this row attributes the gap to are the two most stable numbers in
+the table — 1.12% and 0.44% — while the phase that moves, `load.dit` at 49.70%,
+is the one whose cost is page cache and is attributed to nothing. A finding
+resting on the noisy row would be the
+`1997-put-us-on-the-slow-topk-kernel` failure; this one rests on the quiet ones.
+
+**Where the render's time goes.**
+
+- `generate.guiders` + `conditioning.connector` = **312.4 s, 60.3% of our wall**,
+  and **3.33x the oracle's entire process**. Both would still be there if the
+  denoise were free.
+- Text conditioning end to end — tower, connector, and the negative pass through
+  both — is **340.7 s, 65.7%**.
+- **`denoise` is 2.92%.** The 21B transformer, at the oracle's own request, is
+  16.1% of the oracle's whole render on our side. It is not the term.
+- Even with `guiders` and `connector` removed entirely, 206.0 s remains and the
+  ratio would still be **2.20x**. This row names no ceiling and this is not one:
+  it is the statement that the remainder is a second, separate question.
+
+**An independent instrument agrees, and it is not the phase log.** The clock
+sampler recorded `utilization.gpu` beside the SM clock. Folded through the
+helper's own `build_clock_record`, the three windows excluded **663 of 757, 446
+of 512 and 227 of 257** samples as idle: **the GPU is idle for 87 to 88% of the
+render**, median utilization 0%. `nvidia-smi` and `phase-log.json` share no code
+and agree that this render is host-bound.
+
+**The clock, recorded because a number is quotable only with it.** GB10, driver
+`580.173.02`, persistence `Enabled`, `throttle_reasons_active = 0x0`,
+`clocks.max.sm` 3003 MHz, applications graphics 2418 MHz. Busy-sample SM clock
+medians 2418 / 2411 / 2437 MHz at spreads of 4.30% / 4.02% / 3.98%, inside
+`.agents/benchmarking.md`'s 5% ceiling and with the three medians within 1.1% of
+each other. Host contention: `MemAvailable` 115.0 GiB throughout, `loadavg` 1.44
+before the first render and 7.6 to 8.1 across the rest, no other GPU compute app
+for the whole job.
+
+**A defect this row's own harness shipped with, found by execution and fixed in
+the same flow: [#2305](https://github.com/mudler/vllm.cpp/issues/2305).** The
+clock window was opened as `( ... ) &` and stopped with `kill -TERM "$!"`, but
+`$!` is the SUBSHELL's pid, so the sampler was orphaned and the helper never
+wrote its `--summary` — it writes one only when it stops. The observable is
+arithmetic: three renders at `--interval 2` should give about 255 samples each,
+and the files hold **757, 512 and 257**, so render 1's window spans all three
+renders and only render 3's describes the render it names. This is
+`.agents/benchmarking.md`'s #1657 from the other end — a window that outlives its
+arm. Fixed with `exec`, so the subshell is replaced by the sampler and the signal
+reaches it, plus an explicit `WARNING` when a summary is absent, because the
+failure mode was silence. **No number above depends on it**: the raw sample
+streams were written correctly by every sampler and are what the fold above
+reads. The one field the fold cannot supply is `boot_id`, and no cross-boot
+comparison was made.
+
+**What this row does not claim.** One request, one geometry, one seed, bf16,
+n = 3 on our side and n = 1 on the oracle's. No public benchmark ID. No repair.
+The oracle's 93.8 s is undecomposed, so which part of the 5.53x is its load and
+which is its compute is known on our side only.

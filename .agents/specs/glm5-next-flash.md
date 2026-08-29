@@ -1957,12 +1957,125 @@ Debts this row carries, each visible rather than waived:
   the one thing the mapping is not free on: `b10451:src/llama-vocab.cpp:2259`
   sets `special_bos_id = LLAMA_TOKEN_NULL` for this pre-type while the artifact
   states `tokenizer.ggml.bos_token_id = 154822`, so a port that reads the id and
-  prepends it emits a token no reference run emits.
+  prepends it emits a token no reference run emits. **That sentence is wrong on
+  its first half and O21 corrects it:** `:2259` is a DEFAULT the file's own kv
+  overwrites at `:2559-2578`, so llama.cpp keeps 154822 and merely declines to
+  PREPEND it. The conclusion — do not prepend — survives; the mechanism does
+  not, and the mechanism is what a port mirrors.
 
   **Still not loaded.** Reaching the tokenizer is not fitting: O10 (the weight
   loader refuses by name), O18's 426.72 GiB resident cost and
   [#2247](https://github.com/mudler/vllm.cpp/issues/2247)'s keep-quant
   `vec_dot` all stand unchanged. No token was produced and none is claimed.
+
+- **O21 — the `glm4` PRE-TOKENIZER is DISCHARGED, and the loader now stops in the
+  WEIGHT LOADER.** [#2277](https://github.com/mudler/vllm.cpp/issues/2277).
+
+  **The number is O21 and not O19.** `origin/main` at `a36add6a8` carries O1 to
+  O18 plus O20; [#2256](https://github.com/mudler/vllm.cpp/issues/2256) adds an
+  O19 on a branch that has not merged. Two branches that each append an `O19`
+  produce a duplicate rather than a conflict, so this entry skips the number for
+  the same reason O20 did. The gap is deliberate.
+
+  **THE SPLITTING RULE IS EXACT, AND THE COMPARISON IS OVER BYTES.**
+  `tok::Tokenizer::FromGguf` now maps `glm4` and `chatglm-bpe` — exactly the two
+  names llama.cpp maps to `LLAMA_VOCAB_PRE_TYPE_CHATGLM4`
+  (`b10451:src/llama-vocab.cpp:2256-2258`) — onto `SplitPattern::kLlama3`. That
+  is not an approximation. Extracted from the pinned object rather than read off
+  the page, on 2026-08-29, in a fresh bare clone fetched at depth 1:
+
+  ```sh
+  git cat-file -p 10bf611e533d81f739128304991c5e133c6aebd8:src/llama-vocab.cpp
+  # sha256 3fea10f4481b504d5ca894b32fc177bf2eb83ffdf3f38f3f9c9175f62f62cd4b, 4427 lines
+  sed -n '289p' llama-vocab.cpp   # LLAMA_VOCAB_PRE_TYPE_LLAMA3's one regex   (case at :283)
+  sed -n '398p' llama-vocab.cpp   # LLAMA_VOCAB_PRE_TYPE_CHATGLM4's one regex (case at :396)
+  ```
+
+  Both RAW lines, indentation included, are md5
+  `9000538f3f07df64ebcc73e41b916cab`; `diff` and `cmp` of the two are rc=0; the
+  two string literals with leading whitespace stripped are sha256
+  `4ec934e1de5157434e9663b9b7c8421e5396e50d5fc427a2bb9f99fca0f51a05`. Each arm
+  is a ONE-element `regex_exprs` list, so there is no second stage on either
+  side to differ in. `test_bpe.cpp` carries both literals transcribed and checks
+  them equal, which makes the claim executable; the sha above is what makes it
+  *evidence*, because a transcription cannot gate what it transcribes.
+
+  **WHAT DELIBERATELY DID NOT COME WITH THE ALIAS.** llama.cpp's `llama-bpe`
+  arm (`:2157-2159`) sets `ignore_merges = true` and `add_bos = true` beside its
+  pre-type; the `glm4` arm sets NEITHER. Sharing one `SplitPattern` therefore
+  had to carry the split rule and none of those flags, and it does:
+  `ignore_merges_` stays false on every GGUF path, and no GGUF path prepends a
+  BOS.
+
+  **#2277's BOS PREMISE IS FALSE, AND THE TRUE STATEMENT IS NARROWER.** That
+  issue and O20's forward pointer both say llama.cpp DISCARDS the artifact's
+  `tokenizer.ggml.bos_token_id = 154822`. It does not. `:2259` sets
+  `special_bos_id = LLAMA_TOKEN_NULL` on this arm, but that assignment is a
+  DEFAULT and it is overwritten a few hundred lines later in the SAME function
+  (`llama_vocab::impl::load`, `:1923`): the loop at `:2559-2578` walks
+  `special_token_types` (`:2537-2538` binds `LLM_KV_TOKENIZER_BOS_ID` to
+  `special_bos_id` BY REFERENCE) and assigns `id = new_id` whenever the file
+  states the key and the value is in vocab range. It is straight-line code, so
+  llama.cpp finishes this load with `special_bos_id = 154822`.
+
+  What llama.cpp declines to do is PREPEND it. The prepend at `:3382-3384` tests
+  `add_bos`, which defaults `false` (`:1815`), which this arm does not set, and
+  which the staged file does not state — `tokenizer.ggml.add_bos_token` is not
+  among its 72 KV entries (parsed 2026-08-29 from shard 1's own KV block).
+
+  **So the mirror is: read the id, prepend nothing** — which is what this tree
+  already did, and the change makes it a pinned fact rather than an accident.
+  `BosId()` reports 154822 and `template_bos_` stays `-1`, so
+  `EncodeWithSpecialTokens` reduces to `Encode`. On this checkpoint that is
+  load-bearing rather than academic: id 154822 is `[gMASK]` (read out of the
+  `tokenizer.ggml.tokens` array, token_type 3), and the file's own
+  `tokenizer.chat_template` opens with the LITERAL text `[gMASK]<sop>`. A
+  tokenizer that also prepended the id would double it on every request — one
+  extra token per prompt, which a shape check, a load check and a "does it
+  generate" check all pass. `test_bpe.cpp` fails if `template_bos_` is ever set
+  from the GGUF BOS id; that mutation was run and it reds two assertions.
+
+  **THE NEW STOPPING POINT, measured 2026-08-29 on one tree and one build
+  directory**, with the pre-name arm reverted and restored so the before/after
+  is not a cross-build comparison. Driven through `LoadedEngine::FromModelDir`
+  on `device = kCPU` at
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf`,
+  headers only, no tensor materialised:
+
+  ```text
+  without the arm : tokenizer: unsupported tokenizer.ggml.pre "glm4"
+  with    the arm : Glm5NextForConditionalGeneration: the GGUF config is read and
+                    validated, but the weight loader is not ported (W5 owes the KDA,
+                    NoPE MLA, mHC and stacked-expert weight tower). Separately, NO
+                    `.gguf` of this model exists anywhere: scripts/convert-glm5-next-gguf.py
+                    can write one but has never been run against the 305.78 GiB
+                    checkpoint (O7). See .agents/specs/glm5-next-flash.md and issue #1998.
+  ```
+
+  1.77 s wall, 95.9 MB peak RSS — which is the arithmetic proof that no tensor
+  was materialised, on a file whose weights are 100 GiB. **This is O10's refusal,
+  reached at last from the published artifact.** Every step above the weight
+  tower now passes on a real file: four shards opened, 1412 tensors sized, the
+  config resolved and validated, and the vocabulary — 154880 tokens, 321649
+  merges — built. The next milestone is `load_weights` itself, which W5c
+  ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) owns.
+
+  **Still not loaded, and no token is claimed.** Reaching the weight loader is
+  not fitting: O10, O18's 426.72 GiB resident cost and
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247)'s keep-quant `vec_dot`
+  all stand unchanged.
+
+  **STILL OWED, and filed rather than papered over:
+  [#2279](https://github.com/mudler/vllm.cpp/issues/2279).** `FromGguf` never
+  reads `tokenizer.ggml.add_bos_token` at all. llama.cpp does
+  (`:2585-2586`), and that flag is the only thing that decides the prepend, so a
+  GGUF declaring it `true` gets a BOS from llama.cpp and none from us. Nothing is
+  red today because no artifact this row touches states the key, and the `glm4`
+  arm is correct WITHOUT it — but the divergence is general to every GGUF this
+  tree loads, and it is already live on the `llama-bpe` family in the other
+  direction, masked only because that path has never been token-gated against
+  llama.cpp with `add_special = true`. Out of #2277's scope, which is one pre
+  name.
 
 
 ## Now

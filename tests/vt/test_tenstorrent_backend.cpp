@@ -4145,6 +4145,162 @@ TEST_CASE("kTENSTORRENT W4 EnsureDevice2D bulk bf16 staging: route, bytes, views
   backend.Free(ma32);
 }
 
+// ==== BACKEND-TENSTORRENT-QWEN35 W5 (#2244): allocation-free staging =========
+// W4's profile left ~23% of the staging chain inside tt-metal per-upload
+// internal work: UploadRowsBf16 built a NEW ttnn::Tensor via from_span on
+// every staging upload, paying a fresh MeshBuffer allocation, cluster/chip
+// discovery and tensor-attribute creation for identical geometry every step.
+// W5 allocates the device buffer once per staging slot (lifecycle tied to the
+// slot structures, under the #1486 never-destroy rule for static caches) and
+// re-uploads by packing the host bytes (the exact from_span packing) and
+// writing them through the mesh command queue into the resident buffer.
+//
+// This case pins the ROUTE (the persistent counters: cold slot allocates ONCE,
+// a re-staged slot must NOT reallocate), the BYTES (the device copy equals the
+// window's bf16 bits bit-for-bit after an in-place rewrite, so the persistent
+// buffer provably carries the NEW bytes) and the f32 arm (still excluded — a
+// genuine conversion never enters the bf16 persistent route). The W4 counters
+// keep counting every bulk bf16 staging regardless of sub-route.
+TEST_CASE("kTENSTORRENT W5 EnsureDevice2D persistent staging buffer: route, reuse, bytes") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  constexpr int64_t M = 5, K = 64, N = 16;
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f; std::memcpy(&f, &bits, 4); return f;
+  };
+  auto f32bits = [](float f) {
+    uint32_t b; std::memcpy(&b, &f, 4); return b;
+  };
+  // Two distinguishable bf16 bit patterns for the in-place rewrite leg.
+  auto pattern = [](std::vector<uint16_t>& v, uint16_t base) {
+    for (size_t i = 0; i < v.size(); ++i)
+      v[i] = static_cast<uint16_t>(base + (i % 5));
+  };
+
+  // 1) Cold slot: the FIRST bulk upload allocates the per-slot persistent
+  //    buffer and serves the upload through it.
+  std::vector<uint16_t> ha(M * K), hb(N * K);
+  pattern(ha, 0x3C00);
+  pattern(hb, 0x3F80);
+  void* ma = backend.Alloc(M * K * 2);
+  void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, ha.data(), M * K * 2);
+  backend.Copy(q, mb, hb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+
+  ResetStagingStats();
+  mm(q, o, a, b);  // a is cold → allocates; b is cold → allocates
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 2,
+                "both bf16 operands still stage through the bulk route, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 2,
+                "both bulk uploads must be served by the persistent route, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 2,
+                "two cold slots must allocate one persistent buffer each, got "
+                    << s.uploads_persistent_allocs);
+  CHECK_MESSAGE(s.staged_persistent_bf16_bytes ==
+                    static_cast<uint64_t>((M * K + N * K) * 2),
+                "persistent bytes: got " << s.staged_persistent_bf16_bytes);
+  {
+    std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a);
+    REQUIRE(static_cast<int64_t>(dev.size()) == M * K);
+    for (int64_t i = 0; i < M * K; ++i)
+      CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(ha[static_cast<size_t>(i)])),
+                    "cold persistent buffer carries the wrong bits at " << i);
+  }
+
+  // 2) Rewrite the SAME master in place and restage: the persistent buffer
+  //    must be REUSED (zero new allocations) and must carry the NEW bytes —
+  //    a stale in-place write cannot pass the readback.
+  pattern(ha, 0x3800);  // different bit pattern entirely
+  backend.Copy(q, ma, ha.data(), M * K * 2);  // MarkHostWritten drops the shadow
+  ResetStagingStats();
+  mm(q, o, a, b);  // a restages (shadow dropped); b's shadow is still resident
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 1,
+                "only the rewritten master restages, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 0,
+                "a re-staged slot must REUSE its persistent buffer, got "
+                    << s.uploads_persistent_allocs << " new allocations");
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 1,
+                "the restage must be one in-place persistent write, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.staged_persistent_bf16_bytes == static_cast<uint64_t>(M * K * 2),
+                "the in-place write must count the rewritten bytes, got "
+                    << s.staged_persistent_bf16_bytes);
+  {
+    std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a);
+    REQUIRE(static_cast<int64_t>(dev.size()) == M * K);
+    for (int64_t i = 0; i < M * K; ++i)
+      CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(ha[static_cast<size_t>(i)])),
+                    "persistent buffer did not carry the rewritten bytes at " << i);
+  }
+
+  // 3) Geometry change on the same slot: the resident buffer cannot serve a
+  //    different staging shape — reallocate, and COUNT the reallocation.
+  std::vector<uint16_t> ha1(K);
+  pattern(ha1, 0x4000);
+  void* mo1 = backend.Alloc(N * 4);
+  backend.Copy(q, ma, ha1.data(), K * 2);
+  Tensor a1 = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {1, K});
+  Tensor o1 = Tensor::Contiguous(mo1, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {1, N});
+  ResetStagingStats();
+  mm(q, o1, a1, b);  // a1 is the SAME base slot, staged at a new [1, K] shape
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 1, "geometry change still bulk-stages, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 1,
+                "a staging-geometry change must reallocate the persistent "
+                "buffer exactly once, got " << s.uploads_persistent_allocs);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 1,
+                "the new geometry stages through the persistent route, got "
+                    << s.uploads_persistent_bf16);
+  {
+    std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a1);
+    REQUIRE(static_cast<int64_t>(dev.size()) == K);
+    for (int64_t i = 0; i < K; ++i)
+      CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(ha1[static_cast<size_t>(i)])),
+                    "reallocated persistent buffer carries wrong bits at " << i);
+  }
+
+  // 4) The f32 arm keeps out of the persistent bf16 route entirely (the
+  //    f32 logits GEMM output keeps its declared dtype).
+  std::vector<float> a32(M * K);
+  for (size_t i = 0; i < a32.size(); ++i) a32[i] = widen(ha[static_cast<size_t>(i)]);
+  void* ma32 = backend.Alloc(M * K * 4);
+  backend.Copy(q, ma32, a32.data(), M * K * 4);
+  Tensor a32t = Tensor::Contiguous(ma32, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  ResetStagingStats();
+  mm(q, o, a32t, b);  // only a32 stages; b is resident
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "an f32 master must not enter the persistent bf16 route, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 0,
+                "an f32 master must not allocate a persistent bf16 buffer, got "
+                    << s.uploads_persistent_allocs);
+  CHECK_MESSAGE(s.staged_f32_elems == static_cast<uint64_t>(M * K),
+                "f32 master stages through the f32 path, got "
+                    << s.staged_f32_elems);
+  backend.Free(ma); backend.Free(mb); backend.Free(mo); backend.Free(mo1);
+  backend.Free(ma32);
+}
+
 // ==== BACKEND-TENSTORRENT-QWEN35 W3 (#2201): the GDN reviewer leftovers ======
 // (a) the state d2h counter must see BOTH remaining download paths — the
 // EnsureGdnCacheDevice slow-path refresh and the CommitConvTransposed

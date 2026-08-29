@@ -137,9 +137,14 @@ std::vector<float> SoftmaxWithSink(const std::vector<float>& scores, float sink)
 //              in_per_group = n_heads*head_dim/n_groups = heads_per_group*head_dim
 //   wo_b     : [hidden_size, n_groups*o_lora_rank]             row-major
 // Returns out [num_tokens, hidden_size] row-major.
+// `W` is `float` (the ported upstream-parity arm) or `uint16_t` (bf16 bit
+// patterns -- the carried tower's FP8-sourced half at the model dtype, W1d #2186).
+// Defined in `deepseek_v4_dsa.cpp` with both instantiations explicit, so the two
+// arms share ONE body and cannot drift apart.
+template <typename W>
 std::vector<float> GroupedOutputLora(const std::vector<float>& o,
-                                     const std::vector<float>& wo_a,
-                                     const std::vector<float>& wo_b,
+                                     const std::vector<W>& wo_a,
+                                     const std::vector<W>& wo_b,
                                      int64_t num_tokens, int64_t n_heads,
                                      int64_t head_dim, int64_t n_groups,
                                      int64_t o_lora_rank, int64_t hidden_size);

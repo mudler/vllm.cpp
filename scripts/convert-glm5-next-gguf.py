@@ -1015,10 +1015,31 @@ def write_metadata(w, cfg, arm, n_layers, name):
     f("%s.attention.layer_norm_rms_epsilon" % k, text["rms_norm_eps"])
     u32("%s.attention.q_lora_rank" % k, text["q_lora_rank"])
     u32("%s.attention.kv_lora_rank" % k, text["kv_lora_rank"])
+    # MLA, in llama.cpp's OWN vocabulary. `attention.key_length` is NOT
+    # `qk_nope_head_dim`: for an MLA model llama.cpp caches the LATENT, so that
+    # key is the width of one cached K row, and the per-head query geometry is
+    # spelled by the two `_mla` keys. b10451:conversion/deepseek.py,
+    # `DeepseekModel.set_gguf_parameters`:
+    #
+    #   :345  add_key_length(kv_lora_rank + qk_rope_head_dim)
+    #   :346  add_value_length(kv_lora_rank)
+    #   :347  add_key_length_mla(qk_nope_head_dim + qk_rope_head_dim)
+    #   :348  add_value_length_mla(v_head_dim)
+    #
+    # This converter used to write `key_length = qk_nope_head_dim` and
+    # `value_length = v_head_dim`, a different quantity under each of two names
+    # llama.cpp already owns. Nothing else in the ecosystem reads them that way,
+    # and the published `unsloth/GLM-5.3-Flash-GGUF` artifact does not write
+    # them that way, so the reader was moved onto llama.cpp's meaning and this
+    # side moved with it in the same change (#2268). O7 records that this
+    # converter has never been run against the checkpoint, so no artifact is
+    # invalidated by the move; a file in the former spelling is REFUSED by name
+    # rather than misread.
     u32("%s.attention.key_length_mla" % k, text["qk_head_dim"])
     u32("%s.attention.value_length_mla" % k, text["v_head_dim"])
-    u32("%s.attention.key_length" % k, text["qk_nope_head_dim"])
-    u32("%s.attention.value_length" % k, text["v_head_dim"])
+    u32("%s.attention.key_length" % k,
+        int(text["kv_lora_rank"]) + int(text["qk_rope_head_dim"]))
+    u32("%s.attention.value_length" % k, text["kv_lora_rank"])
     f("%s.swiglu_clamp_exp" % k, text["swiglu_limit"])
     f("%s.swiglu_clamp_shexp" % k, text["swiglu_limit"])
     u32("%s.nextn_predict_layers" % k, 0)  # the MTP tail is not carried; O2.
@@ -1056,7 +1077,27 @@ def write_metadata(w, cfg, arm, n_layers, name):
     # of inheriting Kimi's.
     u32("%s.kda.head_dim" % k, lin["head_dim"])
     f("%s.kda.gate_lower_bound" % k, lin["gate_lower_bound"])
+    # THE KDA HEAD COUNT, written in both spellings because the two producers
+    # of this architecture use different ones and each reader knows only its
+    # own. `attention.linear_head_count` is OURS -- llama.cpp spells it at no
+    # revision, `git grep linear_head_count b10451` is rc=1 tree-wide -- and
+    # llama.cpp's `glm5next` branch writes the same number through its
+    # Kimi-Linear parent's `ssm.*` names:
+    #
+    #   :78  add_ssm_inner_size(linear["num_heads"] * linear["head_dim"])
+    #   :79  add_ssm_state_size(linear["head_dim"])
+    #   :80  add_ssm_group_count(linear["num_heads"])
+    #     -- conversion/glm5next.py at ggml-org/llama.cpp
+    #        refs/pull/27752/head 8a8d0bcc4
+    #
+    # All four come from the one `linear_attn_config`, so they cannot disagree;
+    # writing llama.cpp's three is what lets that branch read our output, which
+    # is the denominator `.agents/oracles/llama-cpp-glm5next.md` exists for.
     u32("%s.attention.linear_head_count" % k, lin["num_heads"])
+    u32("%s.ssm.inner_size" % k,
+        int(lin["num_heads"]) * int(lin["head_dim"]))
+    u32("%s.ssm.state_size" % k, lin["head_dim"])
+    u32("%s.ssm.group_count" % k, lin["num_heads"])
     u32("%s.ssm.conv_kernel" % k, lin["short_conv_kernel_size"])
 
     # mHC. Keys: llama.cpp b10451 `HyperConnection` in constants.py.

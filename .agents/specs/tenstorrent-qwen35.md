@@ -37,15 +37,18 @@ polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
 staging** ([#2273](https://github.com/mudler/vllm.cpp/issues/2273)) is
 RESOLVED 2026-08-29: named UNREACHABLE with the trace (see `## Evidence`,
 W6) — the pinned tt-metal write API targets exactly one `MeshBuffer`
-per write and exposes no public offset views, and the production staging
+per write (offset views are publicly constructible through
+`MeshBuffer::create`, but each view still needs its own write, so a
+merged write cannot exist), and the production staging
 fan-in is causally interleaved (each restage is produced by a host
 round-trip between writes), so a merged write would carry bytes that do
 not exist yet. Owed next: the **round-trip-elimination lever** — the
 `MarkHostWritten` → `CommitHost` → restage host↔device cycle produces
 the staging writes themselves; removing the round-trips removes the
 per-op tax multiplicatively, inside our file set, on the `vt::FusedChain`
-seam. The tt-metal-side residual (public offset views, multi-destination
-write) stays recorded as the upstream-shaped alternative.
+seam. The tt-metal-side residual (a multi-destination write that reaches
+several offset views at once) stays recorded as the upstream-shaped
+alternative.
 
 ## Scope
 
@@ -389,18 +392,23 @@ The wave stopped at NEEDS_DECISION from the fresh implementer, and the operator
 verified both findings independently before accepting the verdict; nothing was
 implemented, and the branch carries records only.
 
-1. **The pinned tt-metal write API has no multi-destination write and no public
-   offset views.** Every write primitive targets exactly ONE `MeshBuffer`:
+1. **The pinned tt-metal write API has no multi-destination write.** Every write
+   primitive targets exactly ONE `MeshBuffer`:
    `enqueue_write` (MeshBuffer + DistributedHostBuffer), `enqueue_write_mesh_buffer`,
    `enqueue_write_shards`, `enqueue_write_shard_to_sub_grid` (optional
-   `BufferRegion` sub-ranges ONE buffer's payload; `mesh_command_queue.hpp:89-155`),
-   the three `ttnn::copy_to_device` overloads (`tensor_ops.cpp:144-191`), and the
-   experimental `core_subset_write` (`mesh_command_queue.hpp:18`). A `BufferRegion`
-   merges SOURCES, never destinations. The address-view `MeshBuffer` constructor is
-   PRIVATE, friend-only to `experimental::per_core_allocation::create_on_single_device`
-   (`mesh_buffer.hpp:162-172`), so the W5 per-slot persistent buffers cannot become
-   windows into one arena through public API. An arena of views would still need one
-   write per view, so the merged write cannot exist.
+   `BufferRegion` sub-ranges ONE buffer's payload; `mesh_command_queue.hpp:89-127`),
+   the two `ttnn::copy_to_device` overloads (`tensor_ops.hpp:35,37`; definitions
+   `tensor_ops.cpp:168`, `:182`), and the experimental `core_subset_write`
+   (`experimental/core_subset_write/mesh_command_queue.hpp:18`). A `BufferRegion`
+   merges SOURCES, never destinations. Offset views ARE publicly constructible:
+   public `MeshBuffer::create` (`mesh_buffer.hpp:94-98`) takes
+   `std::optional<DeviceAddr> address`, and its non-per-core branch
+   (`mesh_buffer.cpp:163-167`) builds the private non-owning view
+   (`mesh_buffer.hpp:163-176`, `ExternallyOwnedState`) — so the W5 per-slot
+   persistent buffers CAN become windows into one arena through public API. That
+   does not make the lever expressible: every write primitive still targets exactly
+   one `MeshBuffer`, so an arena of views would still need one write per view (one
+   CQ op each), and the merged write cannot exist.
 2. **The production per-step staging fan-in is causally interleaved, not
    co-temporal.** Env-guarded probe instrumentation (temporary, reverted, suite
    re-run green 45/45 · 5062 after restore) on a real 3-token eager leg
@@ -408,8 +416,8 @@ implemented, and the branch carries records only.
    `[11,6144]`×17 (the activation hidden buffer, one stable slot) + `[176,128]`×13
    (three rotating pool bases) ≈ 7-8 writes/step, each separated by ~30-60 ms of
    other work. Each restage is CAUSED by a fresh host write:
-   `MarkHostWritten` (`tenstorrent_ops.cpp:5659`) → a TT op's d2h round-trip drops
-   the shadow in `CommitHost` (`:1237`) → restage (`:561`). The bytes write N+1 must
+   `MarkHostWritten` (`tenstorrent_ops.cpp:5654`) → a TT op's d2h round-trip drops
+   the shadow in `CommitHost` (`:1232`) → restage (`:561`). The bytes write N+1 must
    carry do not exist until a d2h + host compute between N and N+1 completes, and
    the consuming kernels enqueue between the writes on the single in-order CQ. One
    write per step would carry not-yet-existing bytes or reorder CQ ops against
@@ -421,8 +429,8 @@ the same conclusion before the verdict was accepted. **Verdict: W6 is named
 unreachable — not a ceiling**: the successor lever inside our file set is
 round-trip elimination (remove the `CommitHost`/`Backend::Copy` host↔device
 cycle that produces the restages; `vt::FusedChain` seam), and the
-upstream-shaped alternative is public offset views / a multi-destination write
-in tt-metal.
+upstream-shaped alternative is a multi-destination write that reaches several
+offset views at once in tt-metal.
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 

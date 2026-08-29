@@ -247,7 +247,15 @@ for i in $(seq 1 "$N"); do
   # (.agents/benchmarking.md: a window that does not span the work it describes
   # measures nothing). The helper writes its summary only when the sampler
   # STOPS, so nothing reads it before then.
-  ( cd "$SRC" && python3 -m tools.bench.gpu_clock_state sample \
+  # `exec`, and it is the fix for a defect this harness shipped with (#2305).
+  # Without it `$!` is the SUBSHELL's pid, the TERM below kills the subshell, and
+  # the python sampler is orphaned -- it keeps sampling into the NEXT render and
+  # never writes its summary, because the helper writes that only when the
+  # sampler STOPS. The observable was a widening window (757, 512, 257 samples
+  # for three equal renders) and three absent `clock-N.json` files. With `exec`
+  # the subshell is REPLACED by python, so `$!` is the sampler and the signal
+  # reaches it.
+  ( cd "$SRC" && exec python3 -m tools.bench.gpu_clock_state sample \
       --output "$OUT/clock-$i.jsonl" --summary "$OUT/clock-$i.json" --interval 2 \
       > "$OUT/clock-$i.stdout" 2>&1 ) &
   CLK=$!
@@ -266,6 +274,11 @@ for i in $(seq 1 "$N"); do
   RC=$?
   SEC=$((SECONDS-t))
   kill -TERM "$CLK" 2>/dev/null; wait "$CLK" 2>/dev/null
+  # THE SUMMARY IS THE INSTRUMENT'S OWN PRECONDITION, so its absence is reported
+  # rather than discovered later in a table that has no clock beside it. Not
+  # fatal: this render is 88% host-side (#2296) and a missing clock fold does not
+  # void it. Silence would.
+  [ -s "$OUT/clock-$i.json" ] || say "  WARNING: the clock sampler wrote no summary for render $i (#2305)"
 
   say "  render $i rc=$RC in ${SEC}s"
   echo "render_${i}_rc=$RC render_${i}_seconds=$SEC" >> "$OUT/PROVENANCE"

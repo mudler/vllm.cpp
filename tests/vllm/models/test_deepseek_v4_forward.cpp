@@ -46,6 +46,19 @@ std::vector<float> Rand(Rng& rng, int64_t n, float scale) {
   for (auto& e : v) e = rng.next(scale);
   return v;
 }
+
+// W1d (#2186): the carried tower's FP8-sourced half is `HostBf16`, so the fixtures
+// that fill those slots generate at bf16. Same `rng` draw as `Rand`, narrowed once
+// -- the tests below assert structure (finiteness, determinism, trace counts, the
+// miswire arms differing), not hand-computed values, so the extra rounding changes
+// no expectation. Generating here rather than converting at each assignment keeps
+// the fixture's dtype visible at the slot it fills.
+vllm::HostBf16 RandBf16(Rng& rng, int64_t n, float scale) {
+  const std::vector<float> f = Rand(rng, n, scale);
+  vllm::HostBf16 out(f.size());
+  for (size_t i = 0; i < f.size(); ++i) out[i] = vt::F32ToBF16(f[i]);
+  return out;
+}
 // Norm weights hover around 1.0 (so RMSNorm outputs are O(1)).
 std::vector<float> NormW(Rng& rng, int64_t n) {
   std::vector<float> v(static_cast<size_t>(n));
@@ -123,17 +136,17 @@ DeepseekV4HostWeights TinyWeights(const DeepseekV4Params& p) {
     L.hc_ffn_base = Rand(rng, hc3, 0.2f);
     L.hc_ffn_scale = Rand(rng, 3, 0.5f);
 
-    L.wq_a = Rand(rng, qlr * H, 0.3f);
+    L.wq_a = RandBf16(rng, qlr * H, 0.3f);
     L.q_norm_weight = NormW(rng, qlr);
-    L.wq_b = Rand(rng, (nh * hd) * qlr, 0.3f);
-    L.wkv = Rand(rng, hd * H, 0.3f);
+    L.wq_b = RandBf16(rng, (nh * hd) * qlr, 0.3f);
+    L.wkv = RandBf16(rng, hd * H, 0.3f);
     L.kv_norm_weight = NormW(rng, hd);
     L.attn_sink = {0.7f, -0.4f};  // non-trivial per-head sinks (kNoAttnSink must differ)
-    L.wo_a = Rand(rng, og * olr * in_per_group, 0.3f);
-    L.wo_b = Rand(rng, H * (og * olr), 0.3f);
+    L.wo_a = RandBf16(rng, og * olr * in_per_group, 0.3f);
+    L.wo_b = RandBf16(rng, H * (og * olr), 0.3f);
 
     if (p.has_indexer(l)) {
-      L.idx_wq = Rand(rng, (inh * ihd) * H, 0.3f);
+      L.idx_wq = RandBf16(rng, (inh * ihd) * H, 0.3f);
       L.idx_wk = Rand(rng, ihd * H, 0.3f);
       L.idx_wproj = Rand(rng, inh * H, 0.3f);
     }
@@ -158,9 +171,9 @@ DeepseekV4HostWeights TinyWeights(const DeepseekV4Params& p) {
       L.gate_bias = Rand(rng, ne, 0.3f);
     }
 
-    L.shared_w1 = Rand(rng, mi * H, 0.3f);
-    L.shared_w3 = Rand(rng, mi * H, 0.3f);
-    L.shared_w2 = Rand(rng, H * mi, 0.3f);
+    L.shared_w1 = RandBf16(rng, mi * H, 0.3f);
+    L.shared_w3 = RandBf16(rng, mi * H, 0.3f);
+    L.shared_w2 = RandBf16(rng, H * mi, 0.3f);
     L.exp_w1 = Rand(rng, ne * mi * H, 0.3f);
     L.exp_w3 = Rand(rng, ne * mi * H, 0.3f);
     L.exp_w2 = Rand(rng, ne * H * mi, 0.3f);

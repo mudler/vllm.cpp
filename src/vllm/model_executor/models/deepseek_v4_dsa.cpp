@@ -2,6 +2,11 @@
 // See deepseek_v4_dsa.h for the full port map (file:line on both sides).
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 
+// For `HostBf16ToF32`, the inlined carried-tower widening `Wf` uses below.
+// No cycle: `deepseek_v4_dsa.h` includes only <cstdint> and <vector>, and
+// `deepseek_v4.h` does not include it back.
+#include "vllm/model_executor/models/deepseek_v4.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -133,9 +138,22 @@ std::vector<float> SoftmaxWithSink(const std::vector<float>& scores, float sink)
   return prob;
 }
 
+// `Wf` is the ONE place the weight dtype is widened. On `float` it is the identity,
+// so the f32 arm compiles to exactly what it compiled to before W1d; on `uint16_t`
+// it is `HostBf16ToF32`, the INLINE header helper (`deepseek_v4.h`) that performs
+// `vt::BF16ToF32`'s bit operation without the out-of-line call this build cannot
+// inline away -- see W1d-5, and the exhaustive 65536-pattern agreement case.
+inline float Wf(float w) { return w; }
+inline float Wf(uint16_t w) { return HostBf16ToF32(w); }
+
+// One body, two weight dtypes (W1d, #2186). `Wf` widens a bf16 bit pattern the
+// same way `vt::BF16ToF32` does and is the identity on f32, so the f32 arm is
+// BYTE-FOR-BYTE the pre-W1d function and the bf16 arm differs only in the weight
+// elements themselves. Accumulators and reduction order are shared.
+template <typename W>
 std::vector<float> GroupedOutputLora(const std::vector<float>& o,
-                                     const std::vector<float>& wo_a,
-                                     const std::vector<float>& wo_b,
+                                     const std::vector<W>& wo_a,
+                                     const std::vector<W>& wo_b,
                                      int64_t num_tokens, int64_t n_heads,
                                      int64_t head_dim, int64_t n_groups,
                                      int64_t o_lora_rank, int64_t hidden_size) {
@@ -160,12 +178,12 @@ std::vector<float> GroupedOutputLora(const std::vector<float>& o,
     // z[g, d] = sum_r wo_a[g, d, r] * o_group[g, r]  (per-group einsum "bhr,hdr->bhd")
     for (int64_t g = 0; g < n_groups; ++g) {
       const float* o_g = o_t + g * in_per_group;
-      const float* wa_g = &wo_a[g * o_lora_rank * in_per_group];
+      const W* wa_g = &wo_a[g * o_lora_rank * in_per_group];
       float* z_g = &z[g * o_lora_rank];
       for (int64_t d = 0; d < o_lora_rank; ++d) {
         float acc = 0.0f;
-        const float* wa_gd = wa_g + d * in_per_group;
-        for (int64_t r = 0; r < in_per_group; ++r) acc += wa_gd[r] * o_g[r];
+        const W* wa_gd = wa_g + d * in_per_group;
+        for (int64_t r = 0; r < in_per_group; ++r) acc += Wf(wa_gd[r]) * o_g[r];
         z_g[d] = acc;
       }
     }
@@ -173,12 +191,26 @@ std::vector<float> GroupedOutputLora(const std::vector<float>& o,
     float* out_t = &out[t * hidden_size];
     for (int64_t h = 0; h < hidden_size; ++h) {
       float acc = 0.0f;
-      const float* wb_h = &wo_b[h * z_dim];
-      for (int64_t c = 0; c < z_dim; ++c) acc += wb_h[c] * z[static_cast<size_t>(c)];
+      const W* wb_h = &wo_b[h * z_dim];
+      for (int64_t c = 0; c < z_dim; ++c) acc += Wf(wb_h[c]) * z[static_cast<size_t>(c)];
       out_t[h] = acc;
     }
   }
   return out;
 }
+
+// Both arms are instantiated HERE rather than left implicit, so a caller that
+// needs a third weight dtype fails to link instead of silently instantiating a
+// body whose numerics nobody reviewed.
+template std::vector<float> GroupedOutputLora<float>(const std::vector<float>&,
+                                                     const std::vector<float>&,
+                                                     const std::vector<float>&, int64_t,
+                                                     int64_t, int64_t, int64_t, int64_t,
+                                                     int64_t);
+template std::vector<float> GroupedOutputLora<uint16_t>(const std::vector<float>&,
+                                                        const std::vector<uint16_t>&,
+                                                        const std::vector<uint16_t>&,
+                                                        int64_t, int64_t, int64_t, int64_t,
+                                                        int64_t, int64_t);
 
 }  // namespace vllm::deepseek_v4

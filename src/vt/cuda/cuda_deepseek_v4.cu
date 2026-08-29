@@ -719,7 +719,17 @@ __global__ void SoftmaxSinkKernel(const float* scores, int n, float sink, float*
 }
 
 // Grouped output-LoRA (o_proj.py:58-73). One block per token; global z scratch.
-__global__ void GroupedOLoraKernel(const float* o, const float* wo_a, const float* wo_b,
+// W1d (#2186): the two WEIGHTS arrive as bf16 bit patterns -- the carried tower's
+// FP8-sourced half is held at the model dtype, so this kernel widens each element
+// as it reads it. `__ushort_as_bfloat16` + `__bfloat162float` is the same bit
+// operation as the host `vt::BF16ToF32` (`AsF32(b << 16)`, `src/vt/dtype.cpp:341`),
+// and bf16 -> f32 is lossless, so the two arms stay bit-identical. The activations
+// `o` and the accumulators stay f32, so the reduction order is unchanged.
+__device__ inline float OLoraW(const uint16_t* p, int64_t i) {
+  return __bfloat162float(__ushort_as_bfloat16(p[i]));
+}
+__global__ void GroupedOLoraKernel(const float* o, const uint16_t* wo_a,
+                                   const uint16_t* wo_b,
                                    int T, int nh, int hd, int ng, int olr, int H,
                                    int in_per_group, int z_dim, float* z_all, float* out) {
   const int t = blockIdx.x;
@@ -729,20 +739,20 @@ __global__ void GroupedOLoraKernel(const float* o, const float* wo_a, const floa
   if (threadIdx.x == 0) {
     for (int g = 0; g < ng; ++g) {
       const float* o_g = o_t + g * in_per_group;
-      const float* wa_g = &wo_a[static_cast<int64_t>(g) * olr * in_per_group];
+      const uint16_t* wa_g = &wo_a[static_cast<int64_t>(g) * olr * in_per_group];
       float* z_g = &z[g * olr];
       for (int d = 0; d < olr; ++d) {
         float acc = 0.0f;
-        const float* wa_gd = wa_g + static_cast<int64_t>(d) * in_per_group;
-        for (int r = 0; r < in_per_group; ++r) acc += wa_gd[r] * o_g[r];
+        const uint16_t* wa_gd = wa_g + static_cast<int64_t>(d) * in_per_group;
+        for (int r = 0; r < in_per_group; ++r) acc += OLoraW(wa_gd, r) * o_g[r];
         z_g[d] = acc;
       }
     }
     float* out_t = &out[static_cast<int64_t>(t) * H];
     for (int h = 0; h < H; ++h) {
       float acc = 0.0f;
-      const float* wb_h = &wo_b[static_cast<int64_t>(h) * z_dim];
-      for (int c = 0; c < z_dim; ++c) acc += wb_h[c] * z[c];
+      const uint16_t* wb_h = &wo_b[static_cast<int64_t>(h) * z_dim];
+      for (int c = 0; c < z_dim; ++c) acc += OLoraW(wb_h, c) * z[c];
       out_t[h] = acc;
     }
   }
@@ -1231,8 +1241,8 @@ std::vector<float> SoftmaxSinkLaunch(Queue& q, const std::vector<float>& scores,
 }
 
 std::vector<float> GroupedOLoraLaunch(Queue& q, const std::vector<float>& o,
-                                      const std::vector<float>& wo_a,
-                                      const std::vector<float>& wo_b, int64_t T, int64_t nh,
+                                      const std::vector<uint16_t>& wo_a,
+                                      const std::vector<uint16_t>& wo_b, int64_t T, int64_t nh,
                                       int64_t hd, int64_t ng, int64_t olr, int64_t H) {
   cudaStream_t s = AsStream(q);
   const int in_per_group = static_cast<int>(nh * hd / ng);
@@ -1242,8 +1252,8 @@ std::vector<float> GroupedOLoraLaunch(Queue& q, const std::vector<float>& o,
   Dev dout(out.size() * sizeof(float));
   Dev dz(static_cast<size_t>(T) * z_dim * sizeof(float));
   GroupedOLoraKernel<<<static_cast<unsigned>(T), 1, 0, s>>>(
-      static_cast<const float*>(doo.p), static_cast<const float*>(dwa.p),
-      static_cast<const float*>(dwb.p), static_cast<int>(T), static_cast<int>(nh),
+      static_cast<const float*>(doo.p), static_cast<const uint16_t*>(dwa.p),
+      static_cast<const uint16_t*>(dwb.p), static_cast<int>(T), static_cast<int>(nh),
       static_cast<int>(hd), static_cast<int>(ng), static_cast<int>(olr), static_cast<int>(H),
       in_per_group, z_dim, static_cast<float*>(dz.p), static_cast<float*>(dout.p));
   Download(out, dout.p, s);

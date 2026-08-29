@@ -95,9 +95,14 @@ struct DsaDeviceKernels {
                                const std::vector<int64_t>& win_end, int64_t num_tokens,
                                int64_t num_keys, int64_t topk);
   std::vector<float> (*softmax_sink)(vt::Queue&, const std::vector<float>& scores, float sink);
+  // W1d (#2186): the two weights are BF16 bit patterns (`HostBf16`), not f32 --
+  // the carried tower's FP8-sourced half is held at the model dtype. A function
+  // pointer cannot be a template, so this entry names the ONE dtype the carried
+  // tower actually has; the f32 arm lives on in the CPU `GroupedOutputLora<float>`
+  // that the ported upstream-parity tests drive.
   std::vector<float> (*grouped_olora)(vt::Queue&, const std::vector<float>& o,
-                                      const std::vector<float>& wo_a,
-                                      const std::vector<float>& wo_b, int64_t num_tokens,
+                                      const std::vector<uint16_t>& wo_a,
+                                      const std::vector<uint16_t>& wo_b, int64_t num_tokens,
                                       int64_t n_heads, int64_t head_dim, int64_t n_groups,
                                       int64_t o_lora_rank, int64_t hidden_size);
   // Brick A — device MLA decode/prefill attention over the unified KV-cache latent.

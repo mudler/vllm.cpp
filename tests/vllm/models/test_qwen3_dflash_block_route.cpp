@@ -478,3 +478,97 @@ TEST_CASE("dflash block paged args: mask, scale and uniform qlen still flow (#22
   REQUIRE(swa.query_start_loc_host != nullptr);
   CHECK(swa.max_seq_len == 4096);
 }
+
+// ---------------------------------------------------------------------------
+// #2274 — the bounds this call writes and reads, refused rather than executed.
+//
+// WHY THESE ARE NOT THE EXISTING CHECKS. This function already validates the
+// slot map and the extended bound, but BOTH are guarded on
+// `device.type == kCPU` because they dereference the tensors. On CUDA they do
+// not run — and CUDA is where #2274's fault is: an out-of-bounds access on the
+// second request of a process, surfaced later and elsewhere as a
+// `cudaMemcpyAsync` or `cudaFree` failure with nothing naming this call. The
+// checks added here are pure HOST arithmetic over SHAPES, so they run on every
+// backend, including the one that faults.
+//
+// The mutation is the pool: shrink it below what the call addresses and the
+// refusal must fire by name. Without the check the same construction reaches
+// `ReshapeAndCache`, which writes `tq` rows at `slots` and, on a device, past
+// the allocation.
+namespace {
+// A pool deliberately too small for the (ctx_len + tq) this call addresses.
+void ExpectPoolRefusal(int64_t ctx_len, int64_t tq, int64_t pages, int64_t block_size) {
+  const int64_t hkv = 2, hq = 4, d = 8;
+  vt::Queue q = Q();
+  const vllm::detail::DflashBlockPagedInputs paged_in =
+      vllm::detail::DflashBlockPagedInputsOf(ctx_len, tq);
+  std::vector<uint16_t> query(static_cast<size_t>(tq * hq * d), 0);
+  std::vector<uint16_t> bk(static_cast<size_t>(tq * hkv * d), 0);
+  std::vector<uint16_t> bv(static_cast<size_t>(tq * hkv * d), 0);
+  std::vector<uint16_t> outv(static_cast<size_t>(tq * hq * d), 0);
+  std::vector<uint16_t> pool(static_cast<size_t>(pages * block_size * hkv * d), 0);
+  std::vector<int32_t> btab(static_cast<size_t>(pages));
+  for (int64_t i = 0; i < pages; ++i) btab[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  std::vector<int32_t> slen_ext{paged_in.seq_ext};
+  std::vector<int32_t> cu{0, static_cast<int32_t>(tq)};
+  std::vector<int64_t> slots = paged_in.slots;
+
+  const std::vector<int64_t> pool_shape{pages, block_size, hkv, d};
+  Tensor out = Contig(outv.data(), DType::kBF16, {tq, hq, d});
+  Tensor pk = Contig(pool.data(), DType::kBF16, pool_shape);
+  Tensor pv = Contig(pool.data(), DType::kBF16, pool_shape);
+  const Tensor t_query = Contig(query.data(), DType::kBF16, {tq, hq, d});
+  const Tensor t_bk = Contig(bk.data(), DType::kBF16, {tq, hkv, d});
+  const Tensor t_bv = Contig(bv.data(), DType::kBF16, {tq, hkv, d});
+  const Tensor t_btab = Contig(btab.data(), DType::kI32, {1, pages});
+  const Tensor t_slen_ext = Contig(slen_ext.data(), DType::kI32, {1});
+  const Tensor t_cu = Contig(cu.data(), DType::kI32, {2});
+  const Tensor t_slots = Contig(slots.data(), DType::kI64, {tq});
+
+  CHECK_THROWS(vllm::detail::DflashBlockPagedAttention(
+      q, out, t_query, t_bk, t_bv, pk, pv, t_btab, t_slen_ext, t_cu, t_slots, paged_in,
+      1.0f / std::sqrt(static_cast<float>(d)), /*causal=*/true, /*sliding_window=*/0,
+      ctx_len));
+}
+}  // namespace
+
+TEST_CASE("dflash block paged: a pool too small for the extended bound REFUSES (#2274)") {
+  // ctx 60 + 8 block rows = 68 addressed, against a pool holding 4*16 = 64.
+  ExpectPoolRefusal(/*ctx_len=*/60, /*tq=*/8, /*pages=*/4, /*block_size=*/16);
+}
+
+TEST_CASE("dflash block paged: a write slot past the pool REFUSES (#2274)") {
+  // The last slot is ctx_len + tq - 1 = 79, one page beyond a 5*16 = 80 pool's
+  // last valid row only when the read bound also passes; this case is sized so
+  // the SLOT is the term that fails first.
+  ExpectPoolRefusal(/*ctx_len=*/76, /*tq=*/8, /*pages=*/5, /*block_size=*/16);
+}
+
+// The control: a pool that DOES fit must not refuse, or the checks above would
+// be refusing correct configurations and every equivalence case would red.
+TEST_CASE("dflash block paged: an adequate pool is NOT refused (#2274)") {
+  const int64_t ctx_len = 60, tq = 8, pages = 16, block_size = 16;
+  const int64_t hkv = 2, hq = 4, d = 8;
+  vt::Queue q = Q();
+  const vllm::detail::DflashBlockPagedInputs paged_in =
+      vllm::detail::DflashBlockPagedInputsOf(ctx_len, tq);
+  std::vector<uint16_t> query(static_cast<size_t>(tq * hq * d), 0), bk(static_cast<size_t>(tq * hkv * d), 0),
+      bv(static_cast<size_t>(tq * hkv * d), 0), outv(static_cast<size_t>(tq * hq * d), 0),
+      pool(static_cast<size_t>(pages * block_size * hkv * d), 0);
+  std::vector<int32_t> btab(static_cast<size_t>(pages));
+  for (int64_t i = 0; i < pages; ++i) btab[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  std::vector<int32_t> slen_ext{paged_in.seq_ext}, cu{0, static_cast<int32_t>(tq)};
+  std::vector<int64_t> slots = paged_in.slots;
+  const std::vector<int64_t> pool_shape{pages, block_size, hkv, d};
+  Tensor out = Contig(outv.data(), DType::kBF16, {tq, hq, d});
+  Tensor pk = Contig(pool.data(), DType::kBF16, pool_shape);
+  Tensor pv = Contig(pool.data(), DType::kBF16, pool_shape);
+  CHECK_NOTHROW(vllm::detail::DflashBlockPagedAttention(
+      q, out, Contig(query.data(), DType::kBF16, {tq, hq, d}),
+      Contig(bk.data(), DType::kBF16, {tq, hkv, d}),
+      Contig(bv.data(), DType::kBF16, {tq, hkv, d}), pk, pv,
+      Contig(btab.data(), DType::kI32, {1, pages}),
+      Contig(slen_ext.data(), DType::kI32, {1}), Contig(cu.data(), DType::kI32, {2}),
+      Contig(slots.data(), DType::kI64, {tq}), paged_in,
+      1.0f / std::sqrt(static_cast<float>(d)), /*causal=*/true, /*sliding_window=*/0, ctx_len));
+}

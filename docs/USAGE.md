@@ -613,7 +613,7 @@ repository in this project's history.
 | DeepSeek-V4-Flash EXL3 trellis shard 1 of 172 | `exl3-layer-000-tp4-rank0.safetensors` | 515,850,920 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `2ed7ae798a794019810b027fe2609e2cf4ad78d70b49c47b2970d03a0a7aaadf` | The rank-sliced EXL3 routed-expert tower LOADS (TP4 coalesced to TP1) and its experts EXECUTE through `vt::Exl3Gemm` on a CPU queue | The CUDA arm compiles for `sm_121a` and its numeric gates PASSED on GB10 on 2026-08-28 (`had_r_128` byte-identical, `exl3_gemm` `rel_rms 5.538e-4`, GEMV tier 3c `5.160e-4`); the FUSED MoE device arm still cannot run, because it needs a device-resident tower, so the routed experts execute on a CPU queue. That run decoded ZERO tensors of THIS artifact -- it found no readable shard -- so nothing here is a claim about these weights on a device. A SYNTHETIC rank-sliced checkpoint now loads and emits logits end to end; THIS artifact still does not, because its DSA compressor and indexer tensors are stored at twice the width the host forward indexes (`compressor.wgate` `[2*head_dim, H]`) and the loader refuses them BY NAME, and because its tokenizer is not read ([#1924](https://github.com/mudler/vllm.cpp/issues/1924)) |
 | DeepSeek-V4-Flash EXL3 carried tower shard 1 of 5 | `carried-001.safetensors` | 4,288,630,252 bytes | `0xSero/deepseek-v4-flash-0731-spark` @ `22f28d32b9b29b4352eaa380ff8c2c170b2847ab` | `3b67ae29f1e75c2ecadfcafd3b0eecec640b06fd60b832f77e6bd3c2a8c85ccf` | The un-requantized `deepseek_v4_fp8` attention, router, shared-expert, compressor and embedding tensors, MATERIALIZED at load into the host-float tower the forward composes with — block-wise FP8 (`F8_E4M3` + `F8_E8M0` over 128x128 blocks) decoded to f32, BF16 norms and embeddings widened, I64 `tid2eid` narrowed to int32 | The DSA compressor and indexer tensors of this artifact are `2 * head_dim` / `2 * index_head_dim` wide and the loader refuses them by name (41 of its 43 layers carry a compressor); the 3,985 `mtp.*` NVFP4 draft tensors are skipped and counted, never silently dropped |
 | GLM-5.3-Flash FP8 source | `model-000{01..62}-of-00062.safetensors` | 328,326,771,576 bytes total (305.78 GiB) | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-26 | Owed: no byte of payload has been fetched, so no local hash exists to state, and an unauthenticated tree hash is not a pin here | Declared source of `scripts/convert-glm5-next-gguf.py`. Only the safetensors HEADERS were read, by HTTP RANGE over all 62 shards: 76,108 tensors, `F8_E4M3` block-quantized at `weight_block_size: [128, 128]` with `weight_scale_inv` companions, plus BF16 and F32 scales | **Nothing has been converted.** The download needs explicit developer authority and a box with room for 305.78 GiB of source and ~100.35 GiB of output at once; owed as O7 on [#2011](https://github.com/mudler/vllm.cpp/issues/2011). The revision is a branch name and not a commit, which is NOT a pin: it is what was read, and W7b re-reads and records the commit when it stages the bytes |
-| GLM-5.3-Flash GGUF | none exists | n/a | `unsloth/GLM-5.3-Flash-GGUF`, `AtomicChat/GLM-5.3-Flash-GGUF`, `aj9o9/GLM-5.3-Flash-GGUF`, `vcruz305/GLM-5.3-Flash-GGUF`, all read 2026-08-26 | n/a | none | **All four repositories named `*-GGUF` contain ZERO `.gguf` files** — READMEs, a `.gitattributes` and four PNGs between them. A repository name is not an artifact, and this row exists so the next reader does not go looking again. llama.cpp cannot produce one either: no `glm5_next` at `origin/master` `539f24529` or at our pin `b10451` |
+| GLM-5.3-Flash GGUF | `GLM-5.3-Flash-UD-Q2_K_XL-0000{1..4}-of-00004.gguf` | 108,720,071,427 bytes total (101.2535 GiB) across four shards; 1412 tensors | `unsloth/GLM-5.3-Flash-GGUF` @ `d425e572fb9686125831f476129e51cea34bc5b4`, path `UD-Q2_K_XL`, staged 2026-08-28 | Owed for this row: the shards are staged and were sha256-verified when they were fetched, but **W5c consumed only the four GGUF HEADERS** and states no hash of its own. W7b ([#2225](https://github.com/mudler/vllm.cpp/issues/2225)) records the per-shard sha256 alongside the load it measures | **LOADS.** The GGUF arm of `load_weights` resolves all 1383 backbone tensors of this file (W5c, [#2242](https://github.com/mudler/vllm.cpp/issues/2242)); `blk.45`, the multi-token-prediction block, is read, counted and DROPPED, as the transformers reference does. The FORWARD, the KV-cache spec, the vision tower (a separate `mmproj-BF16.gguf`) and the safetensors arm all still refuse by name | **The earlier row here said `none exists`, and that was true when it was written (2026-08-26) and is not now.** "UD-Q2_K_XL" names a TARGET AVERAGE and not a format: the census over all 1412 tensors is F32 638, Q8_0 346, Q5_K 181, Q6_K 117, IQ2_XS 82, IQ3_XXS 41, IQ4_XS 3, Q2_K 2, Q4_K 1, Q3_K 1 — **two** Q2_K tensors in a file named Q2_K. It fits `dgx:gpu0` only because IQ2_XS and IQ4_XS keep their blocks ([#2247](https://github.com/mudler/vllm.cpp/issues/2247)); on CUDA the expert GEMM for both falls back to the CPU and the fused seam throws ([#2260](https://github.com/mudler/vllm.cpp/issues/2260)), so use `--device cpu`. **No materialized load, peak RSS, token or speed number exists for this artifact** |
 | GLM-5.3-Flash config | `config.json` | 69,416 bytes | `zai-org/GLM-5.3-Flash` @ `main`, read 2026-08-27 | sha256 `bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f` | The ONLY byte of this checkpoint any change on this row has consumed. Checked in verbatim as `tests/vllm/models/fixtures/glm5_next/config.json` and used as W1's gate fixture, so the config layer is gated against what the checkpoint says rather than against what a port's author believed it says | **Arms refused by name:** every arm. `Glm5NextForConditionalGeneration` is REGISTERED and its config RESOLVES; the weight loader, the forward and the KV-cache spec all refuse, naming the wave that owes each ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)). The revision is a branch name and not a commit, which is NOT a pin for the WEIGHTS; for this one file the sha256 above is the pin |
 | Qwen3.5-0.8B (Tenstorrent P150 arm) | `model.safetensors-00001-of-00001.safetensors` | 1,746,942,600 bytes | `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, authorized 2026-08-23 | `04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696` (non-quantized; hashed anyway from the local bytes the gates and the eager profile consumed) | bf16 on the Tenstorrent P150: the sacred greedy pair, both ambient legs, and the #1715/#2107 profile legs all ran from this snapshot | **Arms refused by name:** GGUF k-quant arms on TT — no TT kernels exist for them, refused at load; Qwen3.8-27B on TT — no arm fits the P150 (bf16 53.8 GB), refused at load |
 | dots3-note bf16 language tower | `model-000{01..131}-of-00131.safetensors` | 561,371,869,568 bytes total (522.82 GiB), of which the MoE is 545,823,175,680 | `dots-studio/dots3-note-prev` @ `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b` | Owed: **no tensor byte has been fetched**, so no local hash exists to state, and an unauthenticated tree hash is not a pin here | The bf16 text tower this port loads: 46 backbone layers, both MLA geometries, and since W5 the 45 MoE layers — the ungrouped noaux_tc router at 256/8 plus one shared expert at `moe_intermediate_size * n_shared_experts` = 1536. Everything except `mlp.gate.e_score_correction_bias` is BF16; that one is F32, on both sides | **Nothing has ever loaded these bytes.** The tower alone is 522.82 GiB against a 122 GiB ceiling on the largest host this project reaches (spec §6.2), so the arm is representable and unfeedable, and the e2e gate is an OPEN GAP by construction. GGUF k-quants are refused by name (W9). The 19-tensor nextn tail is a NAMED W10 deferral rather than a refusal since #2176 |
@@ -665,21 +665,37 @@ ported: only Q2_K, Q6_K and Q8_0 are ported from `ggml/src/ggml-quants.c` at the
 pinned llama.cpp `b10451` and gated byte-for-byte against it.
 `--keep-mtp` is refused because nothing here reads an MTP tail.
 
-**The file it writes is now OPENED by this tree, and it still does not load.**
-W1 ([#2067](https://github.com/mudler/vllm.cpp/issues/2067)) gave `glm5next` its
+**A `glm5next` file now LOADS, and it does not yet forward.** W1
+([#2067](https://github.com/mudler/vllm.cpp/issues/2067)) gave `glm5next` its
 `general.architecture` dispatch row and registered
 `Glm5NextForConditionalGeneration`, so passing such a file to a `.gguf` entry
 point reads its metadata, cross-checks its per-layer schedule against its tensor
 inventory, and validates its config — through the same parser a `config.json`
-descends through. It then **refuses by name** at weight materialization, because
-no weight tower, forward or KV-cache spec is ported (W5 owes them). What changed
-is the refusal: it names the wave that owes the work instead of reporting the
-file's architecture as unrecognized.
+descends through. W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242))
+then landed the weight tower, so the load COMPLETES: every tensor group the
+architecture declares is mapped, and a missing tensor, a disagreeing shape or an
+`ssm_a` that is not the negated exponential the container writes is refused BY
+NAME. It then **refuses by name at the FORWARD**, because no forward and no
+KV-cache spec are ported (W5b,
+[#2241](https://github.com/mudler/vllm.cpp/issues/2241), owes both), and at the
+VISION tower, which the `glm5next` container does not carry at all — the
+published artifact ships it as a separate `mmproj-BF16.gguf`.
 
-**And no artifact exists to try it on.** The converter has never been run
-against the real 305.78 GiB checkpoint; that needs explicit developer authority
-for the download and a box with room for source and output at once
-([#2011](https://github.com/mudler/vllm.cpp/issues/2011)).
+**Use `--device cpu`.** The one artifact that fits any device this project owns
+stores 82 of its tensors as IQ2_XS and 3 as IQ4_XS, and neither encoding has a
+CUDA keep-quant kernel: on a CUDA device the expert GEMM falls back to the host
+cores behind a stream sync and the fused MoE seam throws
+([#2260](https://github.com/mudler/vllm.cpp/issues/2260)).
+
+**Our own converter has still never been run** against the real 305.78 GiB
+checkpoint; that needs explicit developer authority for the download and a box
+with room for source and output at once
+([#2011](https://github.com/mudler/vllm.cpp/issues/2011),
+[#2225](https://github.com/mudler/vllm.cpp/issues/2225)). What it writes moved
+in [#2291](https://github.com/mudler/vllm.cpp/issues/2291) onto the container
+convention the published artifact uses — `ssm_dt.bias`, a split
+`attn_k_b`/`attn_v_b` with the k half transposed, and `ssm_a = -exp(A_log)` — so
+one spelling is written and one is read.
 
 ### The distilled NVFP4 DiT was re-quantized under an unchanged name
 

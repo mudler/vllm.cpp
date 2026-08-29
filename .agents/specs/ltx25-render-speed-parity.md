@@ -221,7 +221,7 @@ and #2296 carries it.
 |---|---|
 | `.agents/specs/ltx25-render-speed-parity.md` | this file |
 | `scripts/ltx25-render-speed-repeat.sh` | new; the repeat-render timing harness `## Gates` item 1 runs |
-| `.agents/issue-index.md` | two appended rows: #2296, and #2305 which this harness's own defect owed |
+| `.agents/issue-index.md` | three appended rows: #2296; #2305, which this harness's own defect owed; and #2306, a `main` gate red this row inherited by merging and does not own |
 
 **No product code.** This row measures an engine it does not change. That is
 deliberate and it is the reason the harness asserts the binary's sha256 against
@@ -462,6 +462,29 @@ failure mode was silence. **No number above depends on it**: the raw sample
 streams were written correctly by every sampler and are what the fold above
 reads. The one field the fold cannot supply is `boot_id`, and no cross-boot
 comparison was made.
+
+**One gate is red and it is not this row's.** `scripts/agent-preflight.sh`
+reports `check-env-doc` failing on `VT_DFLASH_BOUNDS_DEVICE`, which
+`git log -S` places in `21ef6f053` (#2274 / #2304) and which this branch's
+`git diff --name-only origin/main...HEAD` shows it does not touch — the branch
+matches no path under `src/`, `include/`, `docs/` or
+`scripts/env-doc-allowlist.txt`. Filed as
+[#2306](https://github.com/mudler/vllm.cpp/issues/2306) and owned by
+`SPEC-DFLASH2`, with the reason it was not fixed in flow written there rather
+than implied. Its own unit test, `test_check_env_doc`, fails on the same
+variable and for the same reason, so the final tally is two gates on one cause.
+
+`test_cpu_x86_llamacpp_floor` failed on an EARLIER run of this branch's preflight
+and PASSED on the final one, and both observations are recorded because either
+alone would mislead. It fails on `test_a_contended_leg_is_discarded_and_never_summarised`
+reading `4 != 2` with `load=37.89 37.38 28.92` in its own output: the harness
+discards contended legs and retries, and at that load it exhausts the retries.
+The control was run rather than assumed — the same test failed identically on
+the shared checkout at a clean `main` carrying none of this branch — and it then
+passed here once this devbox's load fell. It is a load-dependent flake in a
+harness this row does not touch and it is not a verdict about this change.
+
+Every other gate is green.
 
 **What this row does not claim.** One request, one geometry, one seed, bf16,
 n = 3 on our side and n = 1 on the oracle's. No public benchmark ID. No repair.

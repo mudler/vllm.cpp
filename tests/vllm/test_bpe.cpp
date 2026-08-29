@@ -784,6 +784,146 @@ TEST_CASE("FromGguf: DeepSeek pre names resolve to their EXACT families") {
   CHECK(resolve("laguna") == SplitPattern::kLlama3);
 }
 
+namespace {
+
+// TOK-GLM4-PRE (issue #2277). `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL states
+// `tokenizer.ggml.pre = "glm4"` beside `tokenizer.ggml.model = "gpt2"`, read out
+// of shard 1's own kv block, and `FromGguf` refused that name -- which is where
+// `LoadedEngine::FromModelDir` stopped on the staged artifact.
+//
+// A GGUF fixture with a DISCRIMINATING vocabulary, not the shared tiny one. The
+// only thing that separates kLlama3 from the two Qwen patterns on ordinary text
+// is digit grouping (`\p{N}{1,3}` versus `\p{N}`), so the vocabulary carries the
+// merges "1 2" -> "12" and "12 3" -> "123". Those merges can only fire when the
+// three digits arrive in ONE pretoken, so the split rule becomes visible in the
+// IDS rather than only in `Pattern()`: a pre name that is accepted and splits
+// wrongly emits a fluent, wrong tokenization that a "it loaded" check cannot
+// see, which is the #347 and #1924 failure both times.
+//
+// Ids 22 and 23 are `[gMASK]` and `<sop>`, the published checkpoint's own texts
+// at the ids its `tokenizer.ggml.bos_token_id` and chat template point at.
+std::vector<std::string> Glm4GgufKvs(const char* pre) {
+  const std::vector<std::string> tokens = {
+      "h",   "e",     "l",    "o",   "w",   "r",  "d",       "\xc4\xa0",
+      "1",   "2",     "3",    "ll",  "he",  "llo", "hello",  "\xc4\xa0w",
+      "or",  "orld",  "\xc4\xa0world",     "ld",  "12",      "123",
+      "[gMASK]",      "<sop>"};
+  std::vector<int32_t> types(22, 1);   // ids 0..21: normal
+  types.insert(types.end(), {3, 3});   // 22, 23: control -> special added
+  const std::vector<std::string> merges = {
+      "l l", "h e", "ll o", "he llo", "\xc4\xa0 w",
+      "o r", "l d", "or ld", "\xc4\xa0w orld", "1 2", "12 3"};
+  return {
+      gguf_test::StrKv("tokenizer.ggml.model", "gpt2"),
+      gguf_test::StrKv("tokenizer.ggml.pre", pre),
+      gguf_test::StrArrayKv("tokenizer.ggml.tokens", tokens),
+      gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types),
+      gguf_test::StrArrayKv("tokenizer.ggml.merges", merges),
+      // The staged artifact's own two ids, at this fixture's scale: 154820
+      // `<|endoftext|>` and 154822 `[gMASK]`.
+      gguf_test::U32Kv("tokenizer.ggml.eos_token_id", 22),
+      gguf_test::U32Kv("tokenizer.ggml.bos_token_id", 22),
+  };
+}
+
+// The pinned llama.cpp's two regex arms, transcribed from
+// `10bf611e533d81f739128304991c5e133c6aebd8` (b10451) with the C escapes
+// resolved. This CHECK records the comparison as an executable statement rather
+// than as a sentence; the AUTHORITATIVE comparison is over the pinned object's
+// own bytes and its sha256 is in `.agents/specs/glm5-next-flash.md` O21, because
+// a transcription cannot gate what it transcribes.
+constexpr const char* kUpstreamLlama3Regex =
+    R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+constexpr const char* kUpstreamChatGlm4Regex =
+    R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+
+}  // namespace
+
+TEST_CASE("FromGguf: pre \"glm4\"/\"chatglm-bpe\" resolve to the CHATGLM4 arm") {
+  // LLAMA_VOCAB_PRE_TYPE_CHATGLM4's regex list (llama-vocab.cpp:396-399 @
+  // b10451) against LLAMA_VOCAB_PRE_TYPE_LLAMA3's (:283-290). One expression
+  // each, and the same bytes -- which is why kLlama3 is EXACT here and not the
+  // approximation `laguna` above still is.
+  CHECK(std::string(kUpstreamChatGlm4Regex) ==
+        std::string(kUpstreamLlama3Regex));
+
+  const auto resolve = [](const char* pre) {
+    return LoadGguf(Glm4GgufKvs(pre)).Pattern();
+  };
+  // The two pre names llama.cpp maps to CHATGLM4 (llama-vocab.cpp:2256-2258).
+  CHECK(resolve("glm4") == SplitPattern::kLlama3);
+  CHECK(resolve("chatglm-bpe") == SplitPattern::kLlama3);
+  // Same arm as `llama-bpe`, which is the point of the byte comparison above.
+  CHECK(resolve("glm4") == resolve("llama-bpe"));
+}
+
+TEST_CASE("FromGguf: pre \"glm4\" splits digits in THREES, in the IDS") {
+  const std::string text = "hello world 123";
+  // kLlama3 pretokens: "hello" | " world" | " " | "123". The last one is one
+  // pretoken only because `\p{N}{1,3}` groups it, so "1 2" and "12 3" fire.
+  const Ids kGrouped{14, 18, 7, 21};
+  // kQwen2/kQwen2Classic pretokens end "... | " " | "1" | "2" | "3"": three
+  // separate pretokens, so neither digit merge can apply.
+  const Ids kSingles{14, 18, 7, 8, 9, 10};
+
+  const Tokenizer glm4 = LoadGguf(Glm4GgufKvs("glm4"));
+  CHECK(glm4.Encode(text) == kGrouped);
+  CHECK(LoadGguf(Glm4GgufKvs("chatglm-bpe")).Encode(text) == kGrouped);
+  // Byte-identical arm, so byte-identical ids on the same input.
+  CHECK(LoadGguf(Glm4GgufKvs("llama-bpe")).Encode(text) == kGrouped);
+  // And it is NOT the single-digit families. Without this the case would pass
+  // on any pre name that merely loads.
+  CHECK(LoadGguf(Glm4GgufKvs("qwen35")).Encode(text) == kSingles);
+  CHECK(LoadGguf(Glm4GgufKvs("qwen2")).Encode(text) == kSingles);
+  CHECK(kGrouped != kSingles);
+  // Round-trips, so the split is a SPLIT and not a dropped byte.
+  CHECK(glm4.Decode(kGrouped) == text);
+}
+
+// The BOS trap, and it is not the one #2277 stated. llama.cpp's `glm4` arm sets
+// `special_bos_id = LLAMA_TOKEN_NULL` (llama-vocab.cpp:2259), but that is a
+// DEFAULT: the loop at :2559-2578 reads `tokenizer.ggml.bos_token_id` out of the
+// file and assigns it OVER the null whenever the key is present and in range.
+// So llama.cpp does not discard the id -- the staged artifact's 154822 survives
+// that load. What it declines to do is PREPEND it: the prepend at :3382-3384
+// tests `add_bos`, which defaults false (:1815) and which the `glm4` arm does
+// NOT set, unlike the `llama-bpe` arm three cases up (:2159). The staged file
+// carries no `tokenizer.ggml.add_bos_token` key at all -- 72 kvs, measured --
+// so `add_bos` stays false there.
+//
+// On this checkpoint that is load-bearing rather than academic: id 154822 is
+// `[gMASK]`, and the file's own `tokenizer.chat_template` opens with the LITERAL
+// text `[gMASK]<sop>`. A tokenizer that also prepended the id would emit it
+// twice on every request -- one extra token per prompt, which a shape check, a
+// load check and a "does it generate" check all pass.
+TEST_CASE("FromGguf: pre \"glm4\" reads the BOS id and does NOT prepend it") {
+  const Tokenizer tok = LoadGguf(Glm4GgufKvs("glm4"));
+  // The file's own id, honored: llama-vocab.cpp:2577 over :2259.
+  CHECK(tok.BosId() == 22);
+  CHECK(tok.TokenText(22) == "[gMASK]");
+  // And nothing prepends it. `EncodeWithSpecialTokens` is the prompt path's
+  // add_special_tokens=True; `template_bos_` is left -1 by FromGguf, which is
+  // what mirrors `add_bos == false`.
+  const std::string text = "hello world 123";
+  const Ids plain = tok.Encode(text);
+  CHECK(tok.EncodeWithSpecialTokens(text) == plain);
+  CHECK(tok.EncodeWithSpecialTokens(text).front() != tok.BosId());
+  CHECK(tok.EncodeWithSpecialTokens(text).back() != tok.EosId());
+}
+
+// The table did not become permissive. Every name here is one a reader could
+// plausibly expect to work now, and each is still refused BY NAME.
+TEST_CASE("FromGguf: an unknown pre name is still refused, and named") {
+  for (const char* name : {"glm5", "glm4v", "chatglm", "chatglm-bpe4", "glm",
+                           "glm5next", "GLM4", "glm4 "}) {
+    const std::string pre(name);
+    CAPTURE(pre);
+    CheckThrowsContains([&] { LoadGguf(Glm4GgufKvs(name)); },
+                        "unsupported tokenizer.ggml.pre");
+    CheckThrowsContains([&] { LoadGguf(Glm4GgufKvs(name)); }, pre);
+  }
+}
+
 TEST_CASE(
     "FromGguf: token_type unknown(2), unused(5), byte(6) stay normal vocab") {
   auto kvs = TinyGgufKvs();

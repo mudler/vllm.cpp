@@ -94,7 +94,7 @@ KDA_HEAD_DIM = 128
 KDA_INNER = KDA_HEADS * KDA_HEAD_DIM
 CONV_K = 4
 Q_LORA = 128
-KV_LORA = 64
+KV_LORA = 128
 QK_NOPE = 64
 V_HEAD = 64
 N_HEADS = 4
@@ -574,6 +574,34 @@ def case_convert(tmp):
           "sigmoid forget-gate branch over Kimi-Linear's softplus one")
     check(g.kv.get("glm5next.kda.head_dim") == KDA_HEAD_DIM,
           "`glm5next.kda.head_dim` is carried")
+    # #2268. `attention.key_length` is llama.cpp's name for the width of one
+    # CACHED K row of an MLA model -- `kv_lora_rank + qk_rope_head_dim` -- and
+    # `attention.value_length` is the latent rank itself
+    # (b10451:conversion/deepseek.py:345-346). This converter used to write
+    # `qk_nope_head_dim` and `v_head_dim` under those two names, a private
+    # meaning nothing else in the ecosystem reads. The fixture's KV_LORA is
+    # deliberately NOT equal to QK_NOPE, or this pair of checks would pass
+    # under either convention and gate nothing.
+    check(KV_LORA != QK_NOPE and KV_LORA != V_HEAD,
+          "the fixture DISTINGUISHES the two conventions (kv_lora_rank %d vs "
+          "qk_nope_head_dim %d)" % (KV_LORA, QK_NOPE))
+    check(g.kv.get("glm5next.attention.key_length") == KV_LORA + 0,
+          "`attention.key_length` is `kv_lora_rank + qk_rope_head_dim`, "
+          "llama.cpp's meaning of the name (deepseek.py:345)")
+    check(g.kv.get("glm5next.attention.value_length") == KV_LORA,
+          "`attention.value_length` is `kv_lora_rank` (deepseek.py:346)")
+    check(g.kv.get("glm5next.attention.key_length_mla") == QK_NOPE
+          and g.kv.get("glm5next.attention.value_length_mla") == V_HEAD,
+          "the `_mla` pair still carries the PER-HEAD query geometry: "
+          "`qk_nope_head_dim + qk_rope_head_dim` and `v_head_dim` "
+          "(deepseek.py:347-348)")
+    check(g.kv.get("glm5next.attention.linear_head_count") == KDA_HEADS
+          and g.kv.get("glm5next.ssm.group_count") == KDA_HEADS
+          and g.kv.get("glm5next.ssm.inner_size") == KDA_INNER
+          and g.kv.get("glm5next.ssm.state_size") == KDA_HEAD_DIM,
+          "the KDA head count travels in BOTH spellings -- ours and "
+          "llama.cpp's ssm.* (conversion/glm5next.py:78-80 at PR 27752) -- so "
+          "either reader can load this file")
     check(g.kv.get("glm5next.ssm.conv_kernel") == CONV_K,
           "the short-conv kernel size is carried")
     check(g.kv.get("glm5next.attention.indexer.kpool") == IDX_KPOOL,

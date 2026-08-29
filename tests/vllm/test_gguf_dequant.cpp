@@ -5,7 +5,9 @@
 #include <iterator>
 #include <vector>
 
+#include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vt/dtype.h"
 
 using vllm::DequantGgufRowToBf16;
@@ -443,11 +445,27 @@ TEST_CASE("DequantGgufRowToF32 rejects non-block-multiple numel") {
 }
 
 TEST_CASE("DequantGgufRowToF32 rejects unsupported i-quant type") {
-  // IQ2_S (22) and MXFP4 (39) are now decodable (UD-IQ2_M vehicle); their golden
-  // cases are above. IQ4_XS (23) remains tabulated in the reader but has no
-  // decoder yet, so it must still fail loudly rather than silently mis-decode.
-  std::vector<uint8_t> b2(136, 0);
-  CHECK_THROWS_AS(DequantGgufRowToF32(23, b2.data(), 256), std::runtime_error);
+  // IQ2_S (22) and MXFP4 (39) are now decodable (UD-IQ2_M vehicle); IQ2_XS (17)
+  // and IQ4_XS (23) became decodable with LOADER-GGUF-IQ (#2240). Their golden
+  // cases are all above. Q1_0 (41) is the remaining encoding the reader
+  // TABULATES but nothing decodes — the killgate-fork 128-element type — so it
+  // must still fail loudly rather than silently mis-decode. The guard is not
+  // about type 41 in particular: it is the assertion that a type the reader can
+  // size but the switch cannot decode reaches the `default` arm rather than
+  // falling through to some neighbour's block layout.
+  //
+  // The MESSAGE carries that assertion, and the exception type cannot. Every
+  // refusal on this path is a `std::runtime_error`, including the `VT_CHECK`
+  // inside the block-decode arm, so a bare `CHECK_THROWS_AS` stays green when
+  // type 41 is routed INTO that arm and refused there by
+  // `VT_CHECK(vt::BlockDTypeFromGgmlTypeId(...))` instead. A reviewer applied
+  // exactly that mutation and the whole suite kept passing. The two texts do
+  // differ: the `default` arm names the type id and its reader traits name,
+  // while `VT_CHECK` prefixes `vt:` and names no type. Match the former.
+  std::vector<uint8_t> b2(18, 0);
+  CHECK_THROWS_WITH_AS(DequantGgufRowToF32(41, b2.data(), 128),
+                       doctest::Contains("unsupported ggml type 41 (Q1_0)"),
+                       std::runtime_error);
 }
 
 // --- IQ1_S (19) / IQ1_XXXS (66): the two encodings the Qwen3.8-2.4T-A95B
@@ -528,4 +546,85 @@ TEST_CASE("DequantGgufRowToF32 IQ3_XXS row matches the pinned oracle") {
   CheckGgufDequantAgainstOracle(18, vllm_test::kIq3xxsGoldenBlocks,
                                 vllm_test::kIq3xxsGoldenBits,
                                 std::size(vllm_test::kIq3xxsGoldenBits));
+}
+
+
+// --- IQ2_XS (17) / IQ4_XS (23): the two encodings the staged
+// `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL arm still needed. "UD-Q2_K_XL" names
+// a TARGET AVERAGE, not a format: of that artifact's 1412 tensors only two are
+// actually Q2_K, while 82 are IQ2_XS and 3 are IQ4_XS, and
+// `LoadedEngine::FromModelDir` stopped dead on
+// `blk.3.ffn_gate_exps.weight has unknown ggml type id 17` (#2240, found by
+// #2223 W5).
+//
+//   block_iq2_xs = { f16 d; u16 qs[32]; u8 scales[8]; }               (74 bytes)
+//     Codebook decode, 8 sub-blocks of 32, 4 lanes each. A lane's u16 splits
+//     into a 9-BIT grid index (`qs & 511`, addressing the 512-entry
+//     `iq2xs_grid`) and a 7-bit `ksigns_iq2xs` selector (`qs >> 9`) — so the
+//     sign lives in the SAME u16 as the index, unlike IQ2_XXS (separate u32) and
+//     unlike IQ2_S (a direct sign byte). `scales[ib32]` packs two 4-bit `ls`,
+//     low nibble for lanes 0-1, high for lanes 2-3; `db = d*(0.5 + ls)*0.25`.
+//   block_iq4_xs = { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128] } (136 bytes)
+//     NOT a codebook delta from IQ4_NL: it reuses `kvalues_iq4nl` unchanged and
+//     differs only in the SUPER-BLOCK SCALE LAYOUT. The 6-bit sub-block scale is
+//     spliced from a nibble of `scales_l` and a bit pair of `scales_h`, then
+//     BIASED (`dl = d * (ls - 32)`), where IQ4_NL has one f16 delta per 32
+//     elements and no bias at all.
+//
+// Gated against ORACLE-produced goldens over REAL checkpoint bytes, not against
+// "does not throw" and not against a hand-transcribed expectation. The inputs
+// come from the very tensors the loader refused; the expected values come from
+// the pinned upstream's own dequantizers. Provenance in
+// tests/vt/iq2xs_iq4xs_golden_vectors.h.
+#include "../vt/iq2xs_iq4xs_golden_vectors.h"
+
+TEST_CASE("DequantGgufRowToF32 IQ2_XS row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(17, vllm_test::kIq2xsGoldenBlocks,
+                                vllm_test::kIq2xsGoldenBits,
+                                std::size(vllm_test::kIq2xsGoldenBits));
+}
+
+TEST_CASE("DequantGgufRowToF32 IQ4_XS row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(23, vllm_test::kIq4xsGoldenBlocks,
+                                vllm_test::kIq4xsGoldenBits,
+                                std::size(vllm_test::kIq4xsGoldenBits));
+}
+
+// The decisive one: the SAME bytes reached through the production GGUF READER
+// rather than handed to the dequantizer directly. Before #2240 this file could
+// not even be OPENED — `GgufFile::Open` refused with
+// `tensor "blk.3.ffn_gate_exps.weight" has unknown ggml type id 17` from its
+// `FindGgmlTraits` guard, which is exactly where the real 4-shard artifact
+// stopped, and it stopped there BEFORE any dequant code ran. Registering the
+// block stride and porting the decoder are therefore two separate obligations,
+// and a test that only calls `DequantGgufRowToF32` proves the second one only.
+TEST_CASE("GgufFile reads IQ2_XS and IQ4_XS tensors and they dequant") {
+  gguf_test::GgufModelBuilder b;
+  // ne0 is the fastest-varying dim: 1024 elements = 4 whole blocks of 256 for
+  // both encodings, which is exactly the golden slice.
+  b.AddTensor("blk.3.ffn_gate_exps.weight", {1024},
+              17, std::string(reinterpret_cast<const char*>(
+                                  vllm_test::kIq2xsGoldenBlocks),
+                              sizeof(vllm_test::kIq2xsGoldenBlocks)));
+  b.AddTensor("blk.11.ffn_down_exps.weight", {1024},
+              23, std::string(reinterpret_cast<const char*>(
+                                  vllm_test::kIq4xsGoldenBlocks),
+                              sizeof(vllm_test::kIq4xsGoldenBlocks)));
+  const gguf_test::TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  const vllm::GgufTensorInfo& t2 = g.Get("blk.3.ffn_gate_exps.weight");
+  CHECK(t2.ggml_type == 17U);
+  // 1024 elements at 74 bytes per 256-element block.
+  CHECK(t2.nbytes == 4U * 74U);
+  CheckGgufDequantAgainstOracle(t2.ggml_type, t2.data,
+                                vllm_test::kIq2xsGoldenBits,
+                                std::size(vllm_test::kIq2xsGoldenBits));
+
+  const vllm::GgufTensorInfo& t4 = g.Get("blk.11.ffn_down_exps.weight");
+  CHECK(t4.ggml_type == 23U);
+  CHECK(t4.nbytes == 4U * 136U);
+  CheckGgufDequantAgainstOracle(t4.ggml_type, t4.data,
+                                vllm_test::kIq4xsGoldenBits,
+                                std::size(vllm_test::kIq4xsGoldenBits));
 }

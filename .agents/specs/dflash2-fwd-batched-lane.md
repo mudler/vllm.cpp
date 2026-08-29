@@ -14,9 +14,28 @@ times during this work).
 
 ## Now
 
-`ACTIVE`. L1 landed as `fe21faf63`. L2 is committed on
-`row/SPEC-DFLASH2-fwd-per-request-grid` and is **unverified on a GPU**; it must
-not merge until the CUDA build and the CPU/CUDA parity cases run green.
+`ACTIVE`. L1 landed as `fe21faf63`, the seam adoption as `c9b2049bc` (#2207),
+and **L2 as `150b37852`** (#2212). The prior text here said L2 must not merge
+until it ran green on a GPU; it had already merged, and `scripts/now.py` renders
+this section, so the derived surface reported a landed change as an unmergeable
+branch (#2234).
+
+L2 measured **-11% on `fwd`** (35.19 -> 31.3 ms) with a terminal control
+matching to 1.1%. Its CUDA build exists on `dgx:gpu0` as `build-l2`, and the
+kernel signature is the identity: `DFlashAttnMmaKernel` there mangles to
+`...fbll` (13 params, carrying `tiles_per_req`) against `...fbl` in the pre-L2
+`build23`. That is a stronger identity than a commit label, because it proves
+the FEATURE is compiled in rather than that a directory was named after a SHA
+(`vllm_version()` returns `0.0.3+cuda` for every commit, so the binaries carry
+no tree identity of their own).
+
+**Next gate: L3, the batched capture lane.** The row deferred it until L2 had
+priced the attention shape, and L2 has. At `P > 1` the draft forward is not
+capture-targeted, so at c=8 the term that is 76% of the draft phase runs EAGER,
+while vLLM replays a FULL draft graph at every batch size and pads to
+`max_num_reqs` with `PAD_SLOT_ID` (`spec_decode/dflash/speculator.py:456-458`,
+`:589-618` at pin `5559679229`). This is a porting gap under "mirror vLLM",
+not a new design.
 
 ## The measurement
 
@@ -139,22 +158,20 @@ mutation-proven. The batched lane had no coverage before L1: every case in
 
 ## Owed
 
-- **A policy item, independent of speed.** `ForwardWithCtxKVDev` (`:861-864`) and
-  `ForwardPagedBody` (`:1565-1567`) use a raw `MatmulBT` + `SiluAndMul` rather
-  than `layers::MlpGateUpMethodBase`, and both issue three sliced QKV GEMMs
-  (`:780-782`, `:1485-1487`) rather than a merged one. Only the cold
-  `ForwardBlockLogits` took the Tier-A1 and merged-QKV folds.
-  `scripts/check-fusion-consistency.py` is a FILE-level floor, so one adopted
-  site mutes the whole translation unit, and
-  `scripts/merged-gemm-consistency-allowlist.txt` asserts in prose that this
-  file routes through the seam. No exception is recorded in any of the three
-  forms CLAUDE.md permits. Cost today ~zero; the cost is inheritance, since
-  these bodies cannot pick up a quantized gate-up arm.
-- **O3 in `dflash2-batch-propose.md` is stale** and should be closed against the
-  config literal named above.
-- **A stale anchor**: `dflash2-request-scoped-context.md` cites
-  `qwen3_dflash.cpp:1577` for the `P == 1` gate; it is `:1614`. Per
-  `.agents/porting.md`, name the symbol.
+All three items this section carried are DISCHARGED, and are recorded here
+rather than deleted so the next reader can tell "done" from "never written".
+
+- ~~The seam policy item.~~ Landed as `c9b2049bc` (#2207): both hot bodies call
+  `layers::UnquantizedMlpGateUpMethod` and all three sites take
+  `MergedQkvEnabled()` + `vt::QkvSplit`. This is what makes a quantized gate-up
+  arm reachable for the draft at all, which #2224 needs.
+- ~~O3 in `dflash2-batch-propose.md` is stale.~~ Closed there against the config
+  literal.
+- ~~A stale anchor for the `P == 1` gate.~~ `dflash2-request-scoped-context.md`
+  now names the symbol and records that the line moved, per `.agents/porting.md`.
+  The correction this bullet itself proposed (`:1614`) had ALREADY drifted to
+  `:1716` by the time it was read, which is the argument for the symbol rule
+  stated twice over.
 
 ## Stop conditions
 

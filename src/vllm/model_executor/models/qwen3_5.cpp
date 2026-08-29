@@ -1160,7 +1160,17 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // ...and with no host bytes there is nothing to alias, so skip the attempt
     // rather than charging a `kDeclinedEmpty` to the residency instrument for a
     // weight that is already device-resident.
-    if (!w.bytes.empty()) {
+    // PERF: prefer a TRUE DEVICE COPY when the box can hold one. The retag
+    // below is a measured decode tax on GB10 -- +22.5% throughput when staged
+    // instead, interleaved A/B on one boot (see `DeviceStagingFits`) -- and it
+    // exists only because #1299's 2.4T checkpoint cannot afford to pay for its
+    // weights twice. `DeviceStagingFits` asks that question of the BOX, so a
+    // model that fits stages and a model that does not keeps the retag.
+    // Falling through skips the alias attempt and reaches the staging branch.
+    const bool stage_instead =
+        !w.bytes.empty() &&
+        DeviceStagingFits(vt::GetBackend(d.q.device.type), w.bytes.size());
+    if (!w.bytes.empty() && !stage_instead) {
       const bool aliased = MakeHostBytesDeviceAliasable(w);
       ReportHostAliasResidency();
       if (aliased) {

@@ -695,6 +695,47 @@ TEST_CASE("kIq1xxxsGrid is the PINNED FORK table, not a look-alike") {
   CHECK(lanes[2] == 397);   // +1
 }
 
+TEST_CASE("kIq2xsGrid is the pinned 512-entry table, not a sibling grid") {
+  // The IQ2 family carries THREE codebooks with the identical 8-byte-per-entry
+  // shape — iq2xxs_grid (256), iq2xs_grid (512) and iq2s_grid (1024) — and this
+  // tree now holds all three. A decoder that reaches for the wrong one still
+  // runs, still indexes in range for the first 256 entries, and still produces
+  // plausible magnitudes, so nothing but a digest over the bytes we actually
+  // ported separates them.
+  CHECK(std::size(vt::cpu::kIq2xsGrid) == 512);
+
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (uint64_t v : vt::cpu::kIq2xsGrid) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= static_cast<uint8_t>(v >> (8 * b));
+      h *= 0x100000001b3ULL;
+    }
+  }
+  CHECK(h == 0xc9b1ee61e79909bdULL);
+
+  // The grid alphabet is a second, independent handle: every lane byte is one
+  // of three magnitudes, and the counts are a shape a look-alike table of the
+  // same size still fails. (They differ from iq2s_grid's, which is 1024 rows.)
+  int n8 = 0, n25 = 0, n43 = 0;
+  for (uint64_t v : vt::cpu::kIq2xsGrid) {
+    for (int b = 0; b < 8; ++b) {
+      const uint8_t lane = static_cast<uint8_t>(v >> (8 * b));
+      REQUIRE((lane == 8 || lane == 25 || lane == 43));
+      if (lane == 8) ++n8;
+      else if (lane == 25) ++n25;
+      else ++n43;
+    }
+  }
+  CHECK(n8 == 2114);
+  CHECK(n25 == 1142);
+  CHECK(n43 == 840);
+  // The first two entries pin the table's ORIGIN as well as its content:
+  // ggml-common.h:628 begins 0x0808080808080808, 0x080808080808082b.
+  CHECK(vt::cpu::kIq2xsGrid[0] == 0x0808080808080808ULL);
+  CHECK(vt::cpu::kIq2xsGrid[1] == 0x080808080808082bULL);
+  CHECK(vt::cpu::kIq2xsGrid[511] == 0x2b2b2b2b2b2b2b2bULL);
+}
+
 TEST_CASE("kIq1sDelta is upstream IQ1S_DELTA, not a value this tree chose") {
   // `ggml/src/ggml-common.h:1121` at the pinned 237ad9b96 is
   // `#define IQ1S_DELTA 0.125f`. The FORK reuses that same macro for IQ1_XXXS

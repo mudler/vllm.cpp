@@ -1525,7 +1525,17 @@ Debts this row carries, each visible rather than waived:
   `GLM5V = "glm5v"`, and `tools/mtmd/clip-impl.h:551` accepts it. A vision
   denominator is therefore obtainable by CONVERTING the checkpoint with that
   head, and unobtainable only by pointing it at the published mmproj.
-- **O5 — no i-quant arm is producible on this fleet** (R4).
+- **O5 — no i-quant arm is producible on this fleet** (R4). **PRODUCIBLE, not
+  readable — and the wording above misled a reader into concluding the whole
+  i-quant lane was absent.** O5 is about the CONVERTER, the write side: this
+  tree has no i-quant ENCODER and cannot emit one of these arms. The READ side
+  is far better covered and always was: `gguf_dequant.cpp` decodes IQ1_S,
+  IQ1_XXXS, IQ2_XXS, IQ2_S, IQ3_XXS and IQ4_NL, and
+  [#2240](https://github.com/mudler/vllm.cpp/issues/2240) added IQ2_XS (17) and
+  IQ4_XS (23), the last two the staged UD-Q2_K_XL arm needed. Every one of them
+  is gated byte-for-byte against the pinned llama.cpp. The clarification is
+  recorded here rather than in the report that noticed it, because the next
+  reader will land on this line and not on that report.
 - **O6 — speed.** No number on any axis, and no denominator exists.
 - **O7 — no artifact of this model exists.** W7a authored the converter and
   gated it on synthetic fixtures; it has never been run against the real
@@ -1535,8 +1545,12 @@ Debts this row carries, each visible rather than waived:
   every GPU gate on this row — W3, W5, W6 and W7b — has nothing to load, and
   §Evidence's sha256, conversion recipe and peak RSS are unpaid.
   W7b/[#2011](https://github.com/mudler/vllm.cpp/issues/2011) owns it.
-- **O8 — the Q3_K, Q4_K and Q5_K encoders are not ported** and the converter
-  refuses those arms by name. Only Q2_K, Q6_K and Q8_0 are ported from the
+- **O8 — the Q3_K, Q4_K and Q5_K ENCODERS are not ported** and the converter
+  refuses those arms by name. Write side, like O5: the matching DECODERS have
+  been present and gated since the k-quant port, so this entry never said
+  anything about loading a file that carries those encodings — and the staged
+  UD-Q2_K_XL arm carries 181 Q5_K, 117 Q6_K, 1 Q4_K and 1 Q3_K tensors, all of
+  which our reader sizes and our loader decodes today. Only Q2_K, Q6_K and Q8_0 are ported from the
   pinned llama.cpp reference and gated byte-for-byte against it. No arm this row
   needs uses them today; the §Hardware second-choice line that mentions Q5_K for
   the non-expert 3% would need this first.
@@ -1664,6 +1678,32 @@ Debts this row carries, each visible rather than waived:
   consulted, while at 576 both fire. Owed against the next
   `dgx:gpu0` lease on this row;
   [#2213](https://github.com/mudler/vllm.cpp/issues/2213) records it.
+
+- **O18 — the loader now stops on a per-layer CONFIG KEY instead of on a tensor
+  type, and that is the row's next milestone.** With
+  [#2240](https://github.com/mudler/vllm.cpp/issues/2240)'s IQ2_XS and IQ4_XS
+  decoders in, `LoadedEngine::FromModelDir` opens all four shards of the staged
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` artifact, sizes all 1412
+  tensors, and runs on into config resolution, where it stops with
+  `glm5_next gguf: key glm5next.attention.head_count_kv is not an integer`. The
+  published artifact stores that key as a per-layer `array[i32]` of length 46 —
+  `0` on the 35 KDA layers, `1` on the 11 DSA/MLA layers — and
+  `Glm5NextHfConfigFromGguf` reads it as a scalar.
+  `glm5next.swiglu_clamp_exp` and `glm5next.swiglu_clamp_shexp` are per-layer
+  `array[f32]` of the same length, so the same shape is waiting twice more
+  directly behind it. Measured 2026-08-29 by driving the production loader
+  read-only, with the reader's `case 17:` deleted and restored to prove the
+  before/after on ONE binary: without it the same probe stops at
+  `tensor "blk.3.ffn_gate_exps.weight" has unknown ggml type id 17 in
+  ...-00002-of-00004.gguf`. Owned by the config/loader wave on this row;
+  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) records it.
+
+  **O7 is stale beside it and is not corrected here.** "No artifact of this
+  model exists" was true when it was written; the UD-Q2_K_XL arm is now staged,
+  complete, and read end to end by our own reader. What remains true is the part
+  O7 is actually about — our converter has never been run — so the correction
+  belongs to W7b, which owns that sentence, rather than to a dequant change that
+  merely walked past it.
 
 ## Now
 

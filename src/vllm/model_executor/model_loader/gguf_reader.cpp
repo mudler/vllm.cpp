@@ -251,6 +251,17 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 66, "IQ2_XXS"};
       return &t;
     }
+    case 17: {
+      // block_iq2_xs (llama.cpp @ b10451 ggml-common.h:388-392): f16 d
+      // + QK_K/8 u16 qs + QK_K/32 u8 scales = 2 + 64 + 8 = 74, i.e. 2.3125 bpw.
+      // The `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` arm stores 82 of its 1412
+      // tensors in it — the `ffn_gate_exps`/`ffn_up_exps` routed experts — and
+      // its absence stopped `LoadedEngine::FromModelDir` at
+      // `blk.3.ffn_gate_exps.weight` before any dequant code ran (#2240).
+      // Codebook dequant in cpu_quant_dequant.cpp / vt DType kIQ2_XS.
+      static constexpr GgmlTypeTraits t{256, 74, "IQ2_XS"};
+      return &t;
+    }
     case 18: {
       // block_iq3_xxs (ggml-common.h:385-400): f16 d + 3*QK_K/8 u8 qs
       // = 2 + 96 = 98. The Unsloth-Dynamic `UD-IQ2_XXS` down-projection
@@ -298,8 +309,12 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       return &t;
     }
     case 23: {
-      // block_iq4_xs: f16 d + u16 scales_h + QK_K/64 scales_l + QK_K/2 qs
-      // = 2 + 2 + 4 + 128. Used by the APEX "Quality" GGUFs.
+      // block_iq4_xs (llama.cpp @ b10451 ggml-common.h:454-459): f16 d
+      // + u16 scales_h + QK_K/64 scales_l + QK_K/2 qs = 2 + 2 + 4 + 128 = 136.
+      // Used by the APEX "Quality" GGUFs, and by 3 tensors of the
+      // `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` arm. Same `kValuesIq4nl`
+      // codebook as IQ4_NL; the delta is the super-block scale layout
+      // (cpu_quant_dequant.cpp / vt DType kIQ4_XS).
       static constexpr GgmlTypeTraits t{256, 136, "IQ4_XS"};
       return &t;
     }

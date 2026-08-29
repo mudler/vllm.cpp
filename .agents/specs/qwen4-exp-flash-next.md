@@ -3758,11 +3758,13 @@ BOTH waves, and it is two. This paragraph records the arithmetic rather than the
 result alone, because the result is the part a reader can check and the
 arithmetic is the part that went wrong twice.
 
-Five became four by MERGING two items rather than dropping one, and that shape
-is worth keeping: what W5d-3 discharged is the K/V half of the paged axis, and
-what survives of it is the indexer side cache, which was already its own item.
-A reader who counts items without reading them will conclude a prerequisite
-vanished.
+ONE SHAPE FROM W5d-3'S OWN EDIT SURVIVES THE RECOUNT AND IS WORTH KEEPING.
+Its five-to-four step MERGED two items rather than dropping one — a statement
+about that edit's arithmetic, not about the count here, which is two. What W5d-3
+discharged is the K/V half of the paged axis; what survives of it is the indexer
+side cache, which was already its own item. A reader who counts items without
+reading them will conclude a prerequisite vanished when it was only folded into
+the neighbour it shares an axis with.
 
 **What is owed, in order. THIS PARAGRAPH'S OPENING CLAIM WAS WRONG AND IS
 CORRECTED ABOVE: the op and seam work is NOT finished.** What follows is still

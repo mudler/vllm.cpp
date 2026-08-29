@@ -82,6 +82,14 @@ void UnregisterHostBuffer(void* host);
 // written by a host-side path (Backend::Copy, Memset, host op). Invalidates
 // any device shadow so the next EnsureDevice re-uploads.
 void MarkHostWritten(void* host);
+// DevicePool::Get hands a retained block to a NEW tenant: the slot state
+// MarkHostWritten registers, plus the W7 (#2282) reservation — the resident
+// device allocation and the host bytes both belong to the previous tenant, so
+// the new tenant's first device use is served WITHOUT staging; the pending op
+// establishes the content by writing the buffer it is served. Any host write
+// (CommitHost / MarkHostWritten) clears the reservation and restores the
+// upload-on-stale contract.
+void MarkScratchAcquired(void* host);
 // If `host` is inside a registered buffer whose device shadow is the source
 // of truth, download to host. Used by Backend::Copy so D2H-style reads see
 // device-resident results without every op writing host eagerly.
@@ -97,6 +105,18 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src);
 // value declines so Backend::Memset falls back to host memset. Requires the
 // buffer to already carry a current device shadow.
 bool MemsetDeviceIfCapture(void* p, int value);
+// BACKEND-TENSTORRENT-QWEN35 W7 (#2282): the EAGER arms of the same two
+// primitives, for steps that run outside capture and outside host-free decode.
+// MemsetDeviceFill zero-fills a device-resident slot's shadow on-device for a
+// FULL-slot memset(0) and KEEPS the shadow (the caller still memsets the host
+// bytes), so the next device read serves the shadow instead of restaging the
+// zeros. CopyDeviceDeviceIfResident runs the device->device copy whenever the
+// source shadow is current and the destination already owns a persistent
+// buffer — a cold destination is a host reader's buffer (d2h readback, dump)
+// and keeps the host path. Each returns false when a precondition does not
+// hold and the caller falls back to the host write it has always done.
+bool MemsetDeviceFill(void* p, int value, size_t bytes);
+bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes);
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device
 // cos/sin tensors for the step's positions BEFORE BeginCapture (the
@@ -276,6 +296,20 @@ struct StagingStats {
   uint64_t uploads_persistent_bf16 = 0;
   uint64_t uploads_persistent_allocs = 0;
   uint64_t staged_persistent_bf16_bytes = 0;
+  // ---- BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging-write elimination ----
+  // The W6 probe read the per-step staging-write count off
+  // uploads_persistent_bf16 (~7-8/step) and traced every one to the residency
+  // state dropping a shadow a consumer could have served. These count the
+  // staging writes W7 eliminates, per class: reservation (a pool-acquired
+  // scratch block served from its resident allocation instead of restaging
+  // garbage), device_memset (an eager full-slot zero-fill that keeps the shadow
+  // alive), device_copy (a device-resident D2D copy that skips the
+  // download+restage pair). A post-W7 step's write count is
+  // uploads_persistent_bf16; the avoided counters attribute which precise-
+  // residency arm removed each write the pre-W7 baseline paid.
+  uint64_t stages_avoided_reservation = 0;
+  uint64_t stages_avoided_device_memset = 0;
+  uint64_t stages_avoided_device_copy = 0;
 };
 #ifdef VLLM_CPP_TENSTORRENT
 StagingStats GetStagingStats();

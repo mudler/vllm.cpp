@@ -4301,6 +4301,190 @@ TEST_CASE("kTENSTORRENT W5 EnsureDevice2D persistent staging buffer: route, reus
   backend.Free(ma32);
 }
 
+// ==== BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging-write elimination =======
+// The W6 probe read ~7-8 staging writes per decode step off
+// uploads_persistent_bf16 and traced each to the residency state dropping a
+// shadow a consumer could have served. W7 makes the residency precise. Each
+// case below pins ONE eliminated class through its production entry point —
+// DevicePool::Get's OnScratchBlockAcquired, Backend::Memset, Backend::Copy —
+// asserts the avoided counter AND a zero delta on the W6 write-count
+// observable, and checks bit-identity: the bytes a consumer reads are the
+// bytes it read before the arm existed.
+
+// A pool-acquired block holds a PREVIOUS tenant's bytes on both sides; a
+// pending op that fully overwrites the buffer must not restage that garbage.
+namespace {
+// The W7 arms pin EAGER semantics: the capture/host-free lane
+// (VT_TT_HOST_FREE_DECODE) has its own tests, and under it IfCapture would
+// satisfy the copy case without the eager arm. Saved and restored like the
+// static-graph-mode cells above.
+struct ForceEager {
+  const bool had = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  const std::string saved =
+      had ? std::string(std::getenv("VT_TT_HOST_FREE_DECODE")) : std::string();
+  ForceEager() { ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1); }
+  ~ForceEager() {
+    if (had) ::setenv("VT_TT_HOST_FREE_DECODE", saved.c_str(), 1);
+    else ::unsetenv("VT_TT_HOST_FREE_DECODE");
+  }
+};
+}  // namespace
+TEST_CASE("kTENSTORRENT W7 scratch-acquisition reservation: an acquired block restages nothing") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> hb(M * K), wb(N * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage both; a's slot now owns a persistent buffer
+  std::vector<float> o1(M * N);
+  backend.Copy(q, o1.data(), mo, M * N * 4);
+  // DevicePool::Get free-list hit calls exactly this (device_pool.h) before the
+  // block reaches its new tenant.
+  backend.OnScratchBlockAcquired(ma);
+  ResetStagingStats();
+  mm(q, o, a, b);  // the new tenant's first device touch
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_reservation == 1,
+                "the acquired block must be served without staging, got "
+                    << s.stages_avoided_reservation);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the acquired block must not restage, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 0,
+                "serving the resident allocation must not reallocate, got "
+                    << s.uploads_persistent_allocs);
+  std::vector<float> o2(M * N);
+  backend.Copy(q, o2.data(), mo, M * N * 4);
+  for (size_t i = 0; i < o1.size(); ++i)
+    CHECK_MESSAGE(o1[i] == o2[i], "output mismatch at " << i << ": "
+                            << o1[i] << " vs " << o2[i]);
+  backend.Free(ma); backend.Free(mb); backend.Free(mo);
+}
+
+// An eager full-slot zero-fill of a device-resident slot must keep the shadow:
+// the next device read serves zeros from the device instead of restaging them.
+TEST_CASE("kTENSTORRENT W7 eager full-slot zero-fill keeps the shadow") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> hb(M * K), wb(N * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage a; its shadow is live
+  ResetStagingStats();
+  backend.Memset(q, ma, 0, M * K * 2);  // production entry: eager full-slot zero
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_device_memset == 1,
+                "the full-slot zero-fill must fill the device shadow, got "
+                    << s.stages_avoided_device_memset);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the zero-fill must not stage, got " << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.staged_persistent_bf16_bytes == 0,
+                "the zero-fill must not push staging bytes, got "
+                    << s.staged_persistent_bf16_bytes);
+  const auto* ha = static_cast<const uint16_t*>(ma);
+  for (int64_t i = 0; i < M * K; ++i)
+    CHECK_MESSAGE(ha[i] == 0, "host byte " << i << " not zeroed");
+  mm(q, o, a, b);  // the next device read of the zeroed slot
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the zeroed slot must serve from its shadow, got "
+                    << s.uploads_persistent_bf16);
+  std::vector<float> oh(M * N);
+  backend.Copy(q, oh.data(), mo, M * N * 4);
+  for (size_t i = 0; i < oh.size(); ++i)
+    CHECK_MESSAGE(oh[i] == 0.0f, "output " << i << " = " << oh[i] << ", want 0");
+  backend.Free(ma); backend.Free(mb); backend.Free(mo);
+}
+
+// A copy whose SOURCE is device-resident and whose dst already owns a
+// persistent buffer must go device->device: today it downloads, memcpys, drops
+// the shadow, and the next device read re-uploads the same bytes.
+TEST_CASE("kTENSTORRENT W7 eager device-resident D2D copy skips the host round trip") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> hb(M * K), wb(N * K), db(M * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  for (size_t i = 0; i < db.size(); ++i) db[i] = static_cast<uint16_t>(0x3f00 + (i % 11));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* md = backend.Alloc(M * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  backend.Copy(q, md, db.data(), M * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor d = Tensor::Contiguous(md, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage a — its shadow is live
+  std::vector<float> o_a(M * N);
+  backend.Copy(q, o_a.data(), mo, M * N * 4);  // the a×b reference
+  mm(q, o, d, b);  // stage d — dst owns a persistent buffer
+  ResetStagingStats();
+  backend.Copy(q, md, ma, M * K * 2);  // src is device-resident
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_device_copy == 1,
+                "the device-resident copy must go device->device, got "
+                    << s.stages_avoided_device_copy);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the copy must not stage, got " << s.uploads_persistent_bf16);
+  mm(q, o, d, b);  // the next device consumer of d
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "d must serve from its fresh shadow, got "
+                    << s.uploads_persistent_bf16);
+  std::vector<float> o_d(M * N);
+  backend.Copy(q, o_d.data(), mo, M * N * 4);
+  for (size_t i = 0; i < o_a.size(); ++i)
+    CHECK_MESSAGE(o_a[i] == o_d[i], "d does not carry a's bytes at " << i
+                            << ": " << o_a[i] << " vs " << o_d[i]);
+  backend.Free(ma); backend.Free(mb); backend.Free(md); backend.Free(mo);
+}
+
 // ==== BACKEND-TENSTORRENT-QWEN35 W3 (#2201): the GDN reviewer leftovers ======
 // (a) the state d2h counter must see BOTH remaining download paths — the
 // EnsureGdnCacheDevice slow-path refresh and the CommitConvTransposed

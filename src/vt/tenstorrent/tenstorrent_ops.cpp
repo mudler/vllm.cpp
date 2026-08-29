@@ -281,6 +281,18 @@ struct BufferSlot {
   uint32_t dev_cols = 0;
   bool host_current = true;    // host bytes match the latest value
   bool device_current = false; // device tensor matches the latest value
+  // BACKEND-TENSTORRENT-QWEN35 W7 (#2282): the pool handed the block to a new
+  // tenant (MarkScratchAcquired) and no host write has happened since. The
+  // resident allocation and the host bytes both hold the PREVIOUS tenant's
+  // bytes — undefined for the new tenant, whose pending device op overwrites
+  // the buffer it is served. EnsureDevice2D therefore stages NOTHING for a
+  // reserved slot: it serves the resident persistent buffer at the same
+  // geometry, or hands out an empty one at a new geometry. Restage semantics:
+  // the service ALIASES the slot's persistent buffer in place (W5) — no fresh
+  // snapshot is created. CommitHost / MarkHostWritten clear the flag: from the
+  // first host write on, the bytes are real and the upload-on-stale contract
+  // applies again.
+  bool device_reserved = false;
   // BACKEND-TENSTORRENT-GDN W2: the conv-state shadow is stored TIME-MAJOR
   // ([sl+1, slots*C], one scratch row) because ttnn slice/concat are exact on
   // dim 0 only at this pin (sub-tile last-dim slice/concat is broken — see
@@ -492,6 +504,23 @@ std::atomic<uint64_t>& StagingPersistentBytes() {
   static std::atomic<uint64_t> v{0};
   return v;
 }
+// BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging writes the precise-residency
+// arms eliminate, one counter per class — reservation (EnsureDevice2D serving
+// a pool-acquired block from its resident allocation), device_memset
+// (MemsetDeviceFill keeping the shadow across an eager full-slot zero-fill),
+// device_copy (CopyDeviceDeviceIfResident skipping the download+restage pair).
+std::atomic<uint64_t>& StagingAvoidedReservation() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& StagingAvoidedMemset() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& StagingAvoidedDeviceCopy() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
 
 // W4 lever 1 (#2107): bulk upload of a contiguous bf16 master. The host
 // bytes ARE the payload: one from_span over the tensor's own memory — no f32
@@ -602,6 +631,7 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   // projection with the `b` weight rows — BACKEND-TENSTORRENT-QWEN35 W2c).
   bool tracked_base = false;
   bool need_host_refresh = false;
+  bool reserved_base = false;
   {
     // W4 lever 2 (#2107): ONE locked probe resolves everything this call
     // needs — the tracked fast paths (exact-shape hit and same-numel
@@ -612,6 +642,7 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* s = FindSlot(t.data);
     tracked_base = (s != nullptr && t.data == s->host);
+    reserved_base = tracked_base && s->device_reserved;
     if (tracked_base && s->device_current && s->device.has_value()) {
       if (s->dev_rows == rows && s->dev_cols == cols) {
         return *s->device;
@@ -636,6 +667,41 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
              "tenstorrent: EnsureDevice2D interior view of a device-current "
              "base is unsupported (would read stale bytes); stage via the "
              "base tensor");
+  }
+  if (reserved_base) {
+    // W7 (#2282) reservation: see BufferSlot::device_reserved. The previous
+    // tenant's bytes sit on BOTH sides and the new tenant's pending device op
+    // overwrites the buffer it is served — stage NOTHING. Serve the resident
+    // persistent allocation at the same geometry, or hand out an empty one at
+    // a new geometry (no bytes move in either direction). Restage semantics:
+    // the service ALIASES the slot's persistent buffer in place (W5), it does
+    // not create a fresh snapshot. The re-check under the lock covers a host
+    // write that raced the probe: once the bytes are real, the upload
+    // contract applies again.
+    bool served = false;
+    ttnn::Tensor dev;
+    {
+      std::lock_guard<std::mutex> g(SlotMutex());
+      BufferSlot* s = FindSlot(t.data);
+      if (s != nullptr && t.data == s->host && s->device_reserved) {
+        if (s->persistent.has_value() && s->persist_rows == rows &&
+            s->persist_cols == cols) {
+          dev = *s->persistent;
+        } else {
+          dev = ttnn::empty(ttnn::Shape({rows, cols}), ttnn::DataType::BFLOAT16,
+                            ttnn::Layout::TILE, &device, ttnn::MemoryConfig{});
+        }
+        s->device = dev;
+        s->dev_rows = rows;
+        s->dev_cols = cols;
+        s->device_current = true;
+        s->host_current = false;
+        s->device_reserved = false;
+        StagingAvoidedReservation().fetch_add(1, std::memory_order_relaxed);
+        served = true;
+      }
+    }
+    if (served) return dev;
   }
   if (need_host_refresh) EnsureHostBytes(t.data);
   // HOST-FREE-FORWARD defect: this loop consumed HOST bytes without checking
@@ -1237,6 +1303,7 @@ void CommitHost(Tensor& out) {
   s->device_current = false;
   s->device = std::nullopt;
   s->conv_transposed = false;
+  s->device_reserved = false;  // real bytes now — the upload contract applies
 }
 
 // Device compute: keep result on device (CommitDevice2D). Host round-trip only
@@ -5661,9 +5728,32 @@ void MarkHostWritten(void* host) {
       s->device_current = false;
       s->device = std::nullopt;
       s->conv_transposed = false;
+      s->device_reserved = false;  // real bytes now — the upload contract applies
     }
   }
   // Weight tables may be rewritten in place during load — drop embed cache.
+  DropEmbedTableShadow(host);
+}
+
+void MarkScratchAcquired(void* host) {
+  if (host == nullptr) return;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(host);
+    if (s != nullptr) {
+      // The state MarkHostWritten registers, plus the W7 reservation: the
+      // bytes on BOTH sides belong to the previous tenant. host_current stays
+      // true so host reads behave exactly as before (stale bytes served);
+      // only the first device stage is gated.
+      s->host_current = true;
+      s->device_current = false;
+      s->device = std::nullopt;
+      s->conv_transposed = false;
+      s->device_reserved = true;
+    }
+  }
+  // Same drop MarkHostWritten performed for every caller — a pool block must
+  // never serve a stale embed-table staging either.
   DropEmbedTableShadow(host);
 }
 
@@ -5899,6 +5989,80 @@ bool MemsetDeviceIfCapture(void* p, int value) {
     s->device_current = true;
     s->host_current = false;
   }
+  return true;
+}
+
+// BACKEND-TENSTORRENT-QWEN35 W7 (#2282): the EAGER zero-fill. Outside capture
+// (the capture lane is MemsetDeviceIfCapture above), a FULL-slot memset(0) of
+// a device-resident slot fills the shadow on-device and KEEPS it: the caller
+// still memsets the host bytes, so both sides hold zeros and the next device
+// read serves the shadow instead of restaging the zeros. Zero is the only
+// value handled — memset writes byte patterns, and only the all-zero pattern
+// is a valid value in every dtype the shadows use.
+bool MemsetDeviceFill(void* p, int value, size_t bytes) {
+  if (value != 0) return false;
+  if (tt_capture_active()) return false;  // capture-unsafe refusals keep semantics
+  std::optional<ttnn::Tensor> dev;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(p);
+    if (s == nullptr || !s->device_current || !s->device.has_value()) return false;
+    if (s->bytes != bytes) return false;  // a partial memset keeps the host path
+    dev = *s->device;
+  }
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor zero_src = ZeroCacheGet(*dev, device);
+  // In place into the slot's owning shadow — shared TensorAttributes carry the
+  // write, the shadow's device address stays stable.
+  ttnn::Tensor z = ttnn::copy(zero_src, *dev);
+  (void)z;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(p);
+    if (s == nullptr) return false;
+    s->device_current = true;  // shadow KEPT; the caller zeroes the host bytes
+    s->host_current = true;
+  }
+  StagingAvoidedMemset().fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+// BACKEND-TENSTORRENT-QWEN35 W7 (#2282): the EAGER device->device copy.
+// Outside capture (the capture lane is CopyDeviceDeviceIfCapture above), a
+// copy whose SOURCE shadow is current and whose destination already owns a
+// persistent buffer goes device->device: the host path would download the
+// source, memcpy, drop the destination's shadow, and re-upload the same bytes
+// on the next device read. A destination WITHOUT a persistent buffer is a
+// host reader's buffer (d2h readback, dump) and keeps the host path. Base
+// pointers only: FindSlot resolves interior views to the base slot, and a
+// sub-range copy is not served by a whole-shadow copy.
+bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes) {
+  if (tt_capture_active()) return false;
+  ttnn::Tensor src_dev;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(const_cast<void*>(src));
+    BufferSlot* d = FindSlot(dst);
+    if (s == nullptr || !s->device_current || !s->device.has_value()) return false;
+    if (d == nullptr || s->host != src || d->host != dst) return false;
+    if (s->bytes != bytes || d->bytes != bytes) return false;
+    if (!d->persistent.has_value()) return false;
+    src_dev = *s->device;
+  }
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor cloned = ttnn::empty(src_dev.logical_shape(), src_dev.dtype(),
+                                    src_dev.layout(), &device,
+                                    src_dev.memory_config());
+  cloned = ttnn::copy(src_dev, cloned);
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* d = FindSlot(dst);
+    if (d == nullptr) return false;
+    d->device = std::move(cloned);
+    d->device_current = true;
+    d->host_current = false;
+  }
+  StagingAvoidedDeviceCopy().fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -6393,6 +6557,12 @@ StagingStats GetStagingStats() {
       StagingPersistentAllocs().load(std::memory_order_relaxed);
   s.staged_persistent_bf16_bytes =
       StagingPersistentBytes().load(std::memory_order_relaxed);
+  s.stages_avoided_reservation =
+      StagingAvoidedReservation().load(std::memory_order_relaxed);
+  s.stages_avoided_device_memset =
+      StagingAvoidedMemset().load(std::memory_order_relaxed);
+  s.stages_avoided_device_copy =
+      StagingAvoidedDeviceCopy().load(std::memory_order_relaxed);
   return s;
 }
 
@@ -6403,6 +6573,9 @@ void ResetStagingStats() {
   StagingPersistentWrites().store(0, std::memory_order_relaxed);
   StagingPersistentAllocs().store(0, std::memory_order_relaxed);
   StagingPersistentBytes().store(0, std::memory_order_relaxed);
+  StagingAvoidedReservation().store(0, std::memory_order_relaxed);
+  StagingAvoidedMemset().store(0, std::memory_order_relaxed);
+  StagingAvoidedDeviceCopy().store(0, std::memory_order_relaxed);
 }
 
 }  // namespace vt::tenstorrent

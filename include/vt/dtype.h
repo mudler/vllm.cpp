@@ -82,10 +82,15 @@ namespace vt {
 // per-32 scale is spliced from a `scales_l` nibble and a `scales_h` bit pair and
 // then biased by -32, where IQ4_NL carries one unbiased f16 delta per 32.
 //
-// Both are `to_float`-only for now: neither has a keep-quant `vec_dot`, so
-// `HasQuantDotKernel` is FALSE and the GGUF loader EXPANDS them rather than
-// dotting the blocks in place. That is a memory cost this tree has deliberately
-// avoided for every other routed-expert encoding, and it is owed by #2240's row.
+// Both carry a keep-quant `vec_dot` against Q8_K as of QUANT-GGUF-IQ-VECDOT
+// (#2247), so `HasQuantDotKernel` is TRUE and the loader keeps their blocks
+// COMPRESSED. IQ4_XS pairs with Q8_K and NOT with the Q8_0 of its codebook
+// sibling IQ4_NL, because its block is a 256-element super-block
+// (ggml-cpu.c:385-390 against :379-384). Between #2245 and #2247 they were
+// decode-only, which cost 325.58 GiB of residency on the staged artifact — 82
+// IQ2_XS tensors expanding from 53.33 GiB to 369.00 GiB and 3 IQ4_XS tensors
+// from 3.59 GiB to 13.50 GiB — and was the difference between fitting the
+// ~119.63 GiB of `dgx:gpu0` and overflowing it 3.6x.
 enum class DType : uint8_t {
   kF32,
   kF16,

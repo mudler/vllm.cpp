@@ -43,6 +43,8 @@
 #include <iterator>
 
 #include "iq1_golden_vectors.h"  // oracle-produced IQ1_S / IQ1_XXXS goldens
+#include "iq2xs_iq4xs_dot_golden.h"  // oracle-produced IQ2_XS / IQ4_XS dots
+#include "iq2xs_iq4xs_golden_vectors.h"  // the same artifact bytes, decoded
 #include "vt/cpu/cpu_threadpool.h"  // Threadpool::SwapForTesting (via -I src)
 #include "vt/cpu/cpu_quant_iq_tables.h"  // kIq1sGrid provenance check
 #include "vt/device.h"
@@ -182,6 +184,17 @@ const WeightCase kWeightCases[] = {
     //   iq4_nl  :447-452  d@0  qs@2 (u8[16]: 32 codebook nibbles) (18B)
     {vt::DType::kQ5_0, 32, 22, 0, -1, -1, "q5_0"},
     {vt::DType::kIQ4_NL, 32, 18, 0, -1, -1, "iq4_nl"},
+    // QUANT-GGUF-IQ-VECDOT. The staged `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL`
+    // artifact stores 82 tensors as IQ2_XS and 3 as IQ4_XS, and #2245 gave both
+    // a decoder but no `vec_dot` — which left `HasQuantDotKernel` false, so the
+    // loader expanded every one of them to bf16. Both dot against Q8_K
+    // (ggml-cpu.c:342-347, :385-390); IQ4_XS does NOT inherit IQ4_NL's Q8_0
+    // pairing even though it reuses `kValuesIq4nl`, because its block is a
+    // 256-element super-block rather than 32 elements.
+    //   iq2_xs :388-393  d@0 qs@2 (u16[32]) scales@66 (u8[8])     (74B)
+    //   iq4_xs :454-460  d@0 scales_h@2 (u16) scales_l@4 (u8[4]) qs@8 (128B)
+    {vt::DType::kIQ2_XS, 256, 74, 0, -1, -1, "iq2_xs"},
+    {vt::DType::kIQ4_XS, 256, 136, 0, -1, -1, "iq4_xs"},
 };
 
 // Random raw blocks: every quant/scale payload byte is arbitrary (all legal),
@@ -329,7 +342,13 @@ TEST_CASE("G2/G3 populate from_float and vec_dot (ggml-cpu.c:211-406)") {
   for (vt::DType d : {vt::DType::kQ4_0, vt::DType::kQ2_K, vt::DType::kQ3_K,
                       vt::DType::kQ4_K, vt::DType::kQ5_K, vt::DType::kQ6_K,
                       vt::DType::kIQ2_XXS, vt::DType::kIQ3_XXS,
-                      vt::DType::kIQ2_S, vt::DType::kMXFP4}) {
+                      vt::DType::kIQ2_S, vt::DType::kMXFP4,
+                      // Upstream's row for IQ4_XS DOES carry a `from_float`
+                      // (ggml-cpu.c:386, `quantize_row_iq4_xs`); porting it
+                      // would be dead code here for the same reason the k-quant
+                      // encoders are unported — nothing in this project ever
+                      // quantizes an activation into a weight encoding.
+                      vt::DType::kIQ2_XS, vt::DType::kIQ4_XS}) {
     CHECK(vt::cpu::BlockFromFloat(d) == nullptr);
   }
 
@@ -734,6 +753,159 @@ TEST_CASE("kIq2xsGrid is the pinned 512-entry table, not a sibling grid") {
   CHECK(vt::cpu::kIq2xsGrid[0] == 0x0808080808080808ULL);
   CHECK(vt::cpu::kIq2xsGrid[1] == 0x080808080808082bULL);
   CHECK(vt::cpu::kIq2xsGrid[511] == 0x2b2b2b2b2b2b2b2bULL);
+}
+
+// ---------------------------------------------------------------------------
+// QUANT-GGUF-IQ-VECDOT — the two keep-quant `vec_dot` rows the staged
+// GLM-5.3-Flash UD-Q2_K_XL artifact needs, gated against the ORACLE'S OWN
+// KERNELS on that artifact's OWN BYTES.
+//
+// Why these cases exist beside the battery above. Every other check on a
+// `vec_dot` in this file is a consistency check: it compares the kernel against
+// `BlockToFloat` (a second port of the same layout) or against `MatmulBTQuant`
+// (the same kernel, driven differently). Those cannot see a decode parameter
+// that BOTH ports read the same wrong way, and they cannot see a reduction-order
+// difference at all, because the f64 reference deliberately has none. Only the
+// pinned oracle's own f32 accumulation can, so it is compared BIT for BIT.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The activation signal the oracle harness quantized with its own
+// `quantize_row_q8_K_generic`. Every value is an integer in [-1024, 1023]
+// divided by 64, so it is exact in binary32 and the sequence is identical on
+// any compiler — which is what lets the goldens carry the RESULTING Q8_K bytes
+// instead of 1024 floats.
+void MakeDotActivation(int n, uint32_t seed, float* x) {
+  uint32_t s = seed;
+  for (int i = 0; i < n; ++i) {
+    s = s * 1664525U + 1013904223U;
+    const int32_t v = static_cast<int32_t>((s >> 16) & 0x7ffU) - 1024;
+    x[i] = static_cast<float>(v) / 64.0F;
+  }
+}
+
+uint32_t FloatBits(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, sizeof(u));
+  return u;
+}
+
+// One oracle-gated case, shared by both types: the shapes differ only in the
+// block stride and in which golden arrays are read.
+void CheckOracleDot(vt::DType dtype, const uint8_t* weights, size_t wbytes,
+                    const uint8_t* act, uint32_t seed, uint32_t expected_total,
+                    const uint32_t (&expected_per_block)[4]) {
+  constexpr int kN = 1024;   // 4 super-blocks
+  constexpr int kBlocks = 4;
+  constexpr size_t kQ8KBytes = 292;
+
+  // The pairing itself is a claim: both rows dot against Q8_K (ggml-cpu.c:342
+  // and :385), NOT against the Q8_0 that IQ4_NL's 32-element block forces.
+  REQUIRE(vt::cpu::QuantTraits(dtype).vec_dot_type == vt::DType::kQ8_K);
+  REQUIRE(vt::cpu::BlockVecDot(dtype) != nullptr);
+  REQUIRE(vt::cpu::HasQuantDotKernel(dtype));
+
+  // The activation bytes the oracle dotted are reproduced by OUR encoder, so
+  // the golden below is a statement about the dot alone and not about a
+  // divergent activation.
+  std::vector<float> x(kN);
+  MakeDotActivation(kN, seed, x.data());
+  std::vector<uint8_t> ours(kBlocks * kQ8KBytes);
+  vt::cpu::QuantTraits(vt::DType::kQ8_K)
+      .from_float(x.data(), ours.data(), kN);
+  CHECK(std::memcmp(ours.data(), act, ours.size()) == 0);
+
+  const size_t block_bytes = wbytes / kBlocks;
+  float s = 0.0F;
+  vt::cpu::QuantTraits(dtype).vec_dot(kN, &s, 0, weights, 0, act, 0, 1);
+  CAPTURE(s);
+  CHECK(FloatBits(s) == expected_total);
+
+  for (int b = 0; b < kBlocks; ++b) {
+    CAPTURE(b);
+    float sb = 0.0F;
+    vt::cpu::QuantTraits(dtype).vec_dot(256, &sb, 0,
+                                        weights + b * block_bytes, 0,
+                                        act + b * kQ8KBytes, 0, 1);
+    CAPTURE(sb);
+    CHECK(FloatBits(sb) == expected_per_block[b]);
+  }
+
+  // A second, structurally independent statement of the same product: decode
+  // both operands through `BlockToFloat` (the loader-side decoders, gated
+  // byte-for-byte against the oracle by iq2xs_iq4xs_golden_vectors.h) and dot
+  // them in f64. This one cannot see reduction order — that is the golden's
+  // job — but it does catch a kernel that consumes the wrong field entirely.
+  std::vector<float> w(kN);
+  std::vector<float> a(kN);
+  vt::cpu::BlockToFloat(dtype)(weights, w.data(), kN);
+  vt::cpu::BlockToFloat(vt::DType::kQ8_K)(act, a.data(), kN);
+  double ref = 0.0;
+  double l1 = 0.0;
+  for (int i = 0; i < kN; ++i) {
+    ref += static_cast<double>(w[i]) * static_cast<double>(a[i]);
+    l1 += std::fabs(static_cast<double>(w[i]) * static_cast<double>(a[i]));
+  }
+  CAPTURE(ref);
+  CAPTURE(l1);
+  CHECK(std::fabs(static_cast<double>(s) - ref) < 1e-5 * l1);
+}
+
+}  // namespace
+
+TEST_CASE("IQ2_XS vec_dot is the oracle's own kernel, bit for bit") {
+  // Weights: `blk.3.ffn_gate_exps.weight` of the staged GLM-5.3-Flash
+  // UD-Q2_K_XL artifact — the exact tensor `LoadedEngine::FromModelDir` used to
+  // stop on. Expected value: llama.cpp b10451
+  // ggml/src/ggml-cpu/quants.c:948 `ggml_vec_dot_iq2_xs_q8_K_generic`.
+  CheckOracleDot(vt::DType::kIQ2_XS, vllm_test::kIq2xsGoldenBlocks,
+                 std::size(vllm_test::kIq2xsGoldenBlocks),
+                 vllm_test::kIq2xsDotActQ8K, 0x2247U,
+                 vllm_test::kIq2xsDotExpectedBits,
+                 vllm_test::kIq2xsDotPerBlockBits);
+}
+
+TEST_CASE("IQ4_XS vec_dot is the oracle's own kernel, bit for bit") {
+  // Weights: `blk.11.ffn_down_exps.weight` of the same artifact. Expected
+  // value: quants.c:1283 `ggml_vec_dot_iq4_xs_q8_K_generic`.
+  CheckOracleDot(vt::DType::kIQ4_XS, vllm_test::kIq4xsGoldenBlocks,
+                 std::size(vllm_test::kIq4xsGoldenBlocks),
+                 vllm_test::kIq4xsDotActQ8K, 0x4247U,
+                 vllm_test::kIq4xsDotExpectedBits,
+                 vllm_test::kIq4xsDotPerBlockBits);
+}
+
+TEST_CASE("the IQ2_XS dot consumes the SEALED 512-entry grid") {
+  // The seal above proves `kIq2xsGrid` holds the pinned bytes. It says nothing
+  // about which table the KERNEL reads, and iq2xxs_grid / iq2s_grid have the
+  // identical 8-byte-per-entry shape, so a kernel pointed at a sibling still
+  // indexes in range and still returns a plausible magnitude. What ties the two
+  // together is that the oracle golden above moves when the kernel's grid is
+  // swapped: this case states the coupling, and the review mutation that swaps
+  // `kIq2xsGrid` for `kIq2xxsGrid` in `VecDotIQ2_XSQ8_K` is what proves it.
+  //
+  // The three tables are DIFFERENT over their shared first 256 rows, which is
+  // the only region a swapped index could reach; if they agreed there, no dot
+  // over these blocks could tell them apart.
+  int differ = 0;
+  for (int i = 0; i < 256; ++i) {
+    if (vt::cpu::kIq2xxsGrid[i] != vt::cpu::kIq2xsGrid[i]) ++differ;
+    if (vt::cpu::kIq2sGrid[i] != vt::cpu::kIq2xsGrid[i]) ++differ;
+  }
+  CHECK(differ > 400);
+
+  // And the blocks actually dotted use indices ABOVE 255 as well, so a
+  // 256-entry sibling cannot even be addressed without wrapping.
+  int above_255 = 0;
+  for (size_t b = 0; b < std::size(vllm_test::kIq2xsGoldenBlocks); b += 74) {
+    for (int l = 0; l < 32; ++l) {
+      uint16_t q = 0;
+      std::memcpy(&q, vllm_test::kIq2xsGoldenBlocks + b + 2 + 2 * l, 2);
+      if ((q & 511) > 255) ++above_255;
+    }
+  }
+  CHECK(above_255 > 32);
 }
 
 TEST_CASE("kIq1sDelta is upstream IQ1S_DELTA, not a value this tree chose") {

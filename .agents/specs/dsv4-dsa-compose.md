@@ -27,6 +27,23 @@ the cache topology (`KV-DSV4-MULTICACHE`, #1925); residency (#2283); the
 attention sink, which is a loaded per-head weight and not cache state
 (`attention.py:218-222`).
 
+**The boundary with `KV-DSV4-MULTICACHE` W5, which this row overlapped when it
+was created** (#2302). W5's scope lived in a single wave-table cell reading "the
+DSA-sparse attention path reading the published caches" and removing the
+`!is_indexer && !is_comp` refusal -- the ALGORITHM, not the plumbing -- and it has
+never had a design section, so this row was specced over it. The split, recorded
+in both specs:
+
+| row | owns |
+|---|---|
+| `KV-DSV4-MULTICACHE` W5 | the caches REACHING the model and each layer routing to its own: `attn_kv` consumed rather than `(void)`-ed, and `ModelRegistry::Forward` (`model_registry.cpp:430-440`) stopping its refusal |
+| **this row** | what RUNS on those caches: the three layer shapes, the compressor's two stages, the `coff` role selection and boundary emission, the indexer's `qr`-sourced query, and the `!is_indexer && !is_comp` refusal at `deepseek_v4.cpp:786-787` |
+
+W5 lands first and deliberately does NOT remove the DSA refusal; it makes a cache
+reachable for this row. Neither row is gateable end-to-end alone: W5's
+synthetic-config gate proves routing, and the token-exact oracle gate above 512
+tokens belongs here.
+
 ## Upstream chain
 
 Read at `5559679229`. **The path is `vllm/models/deepseek_v4/`, NOT

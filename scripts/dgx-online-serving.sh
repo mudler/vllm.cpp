@@ -43,6 +43,8 @@ port=8001
 num_blocks=4736
 max_num_seqs=32
 max_num_batched_tokens=""
+draft=""
+speculative_config=""
 trace_concurrency=16
 gdn_ba_mode=""
 gdn_packed_mode=""
@@ -72,6 +74,13 @@ while (($#)); do
     --client) client=${2:?}; shift 2 ;;
     --vllm-cpp-sha) vllm_cpp_sha=${2:?}; shift 2 ;;
     --port) port=${2:?}; shift 2 ;;
+    # #2152: the SPECULATIVE ARM. Both are optional and BOTH ARMS get them, for
+    # the reason `scripts/dflash2-speed-gate.sh:201-204` already enforces on its
+    # own row -- "the oracle arm drafts and a ratio against a plain decode
+    # measures the feature, not this row". A draft configured on one side only
+    # would compare speculation against no speculation.
+    --draft) draft=${2:?}; shift 2 ;;
+    --speculative-config) speculative_config=${2:?}; shift 2 ;;
     --num-blocks) num_blocks=${2:?}; shift 2 ;;
     --trace-concurrency) trace_concurrency=${2:?}; shift 2 ;;
     --gdn-ba-mode) gdn_ba_mode=${2:?}; shift 2 ;;
@@ -116,6 +125,18 @@ fi
 
 [[ ${model} == 27 || ${model} == 27n || ${model} == 35 || ${model} == q3mxfp4 ]] || {
   echo "--model must be 27, 27n, 35 or q3mxfp4" >&2; exit 2; }
+# #2152: a draft without a config, or a config without a draft, would launch one
+# arm speculating and the other not. Refuse rather than emit a ratio that
+# measures the feature instead of the implementation.
+if [[ -n ${draft} && -z ${speculative_config} ]]; then
+  echo "--draft needs --speculative-config; a draft path alone configures nothing" >&2; exit 2
+fi
+if [[ -n ${speculative_config} && -z ${draft} ]]; then
+  echo "--speculative-config needs --draft; the config names a model this run has no path for" >&2; exit 2
+fi
+if [[ -n ${draft} && ! -e ${draft} ]]; then
+  echo "--draft ${draft} does not exist" >&2; exit 2
+fi
 # 35B MoE prefills a wider chunk; the 27B NVFP4 dense arms (27 = unsloth,
 # 27n = nvidia/ModelOpt) and the q3mxfp4 MXFP4 dense 8B all use the dense 2048
 # batched-token gate value.
@@ -476,6 +497,11 @@ start_server() {
       --no-enable-prefix-caching
       --served-model-name gate
     )
+    # #2152: the speculative arm, appended so the non-speculative command is
+    # byte-identical to what it was when this flag is unset.
+    if [[ -n ${speculative_config} ]]; then
+      server_cmd+=(--speculative-config "${speculative_config}")
+    fi
   elif [[ ${model} == q3mxfp4 ]]; then
     # MXFP4 dense 8B oracle. On sm_121 GB10 the default FlashInfer cute-dsl mxf4
     # backend aborts engine start (BackendSupportedError mm_fp4 cap 121), so we
@@ -521,6 +547,12 @@ start_server() {
       --mamba-ssm-cache-dtype float32
       --port "${port}"
     )
+  fi
+  # #2152: the ORACLE arm gets the same speculative config. Configuring only our
+  # side would compare speculation against no speculation, which is the feature
+  # rather than this row -- the rule `dflash2-speed-gate.sh:201-204` states.
+  if [[ -n ${speculative_config} && ${engine} != ours ]]; then
+    server_cmd+=(--speculative-config "${speculative_config}")
   fi
   printf '%q ' "${server_cmd[@]}" >"${command_file}"
   printf '\n' >>"${command_file}"

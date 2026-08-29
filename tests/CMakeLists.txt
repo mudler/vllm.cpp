@@ -675,6 +675,9 @@ set_tests_properties(test_device_pool_concurrent PROPERTIES
   ENVIRONMENT "VT_POOL_BYPASS=0"
   SKIP_RETURN_CODE 77)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
+# dots3-note (#699) keeps its weights header beside the model in src/, not in
+# include/, so this suite needs src/ on its include path to see the MoE block.
+target_include_directories(test_moe_resident_lifetime PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1058,6 +1061,23 @@ target_include_directories(test_glm5_next_scaffold PRIVATE ${CMAKE_CURRENT_SOURC
 vllm_cpp_add_test(test_glm5_next_mhc vllm/models/test_glm5_next_mhc.cpp)
 target_include_directories(test_glm5_next_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_mhc PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
+# GLM-5.3-Flash W3 -- the DSA indexer's k-pool compression (#2213). Gates the
+# stage `deepseek_v4_dsa.cpp` does NOT have: the top-k runs over LEARNED pooled
+# candidates, not raw tokens, and the ragged tail is appended raw and unscored.
+# The fixture runs at seq_len 21 against index_topk 8 ON PURPOSE -- at or below
+# index_topk a raw top-k selects everything and the pooling is unobservable --
+# and asserts SET equality of the selected indices, because top-k error is
+# bimodal and a tolerance on the values passes a wrong selection. Goldens are the
+# RUN output of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_dsa_goldens.py`. `glm5_next_dsa.h` is MODEL-PRIVATE
+# under src/, the same arrangement `glm5_next_mhc.h` uses.
+vllm_cpp_add_test(test_glm5_next_dsa vllm/models/test_glm5_next_dsa.cpp)
+target_compile_definitions(test_glm5_next_dsa PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_dsa PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,

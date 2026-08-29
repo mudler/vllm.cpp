@@ -71,17 +71,22 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/models/dense_device_glue.h"  // W5: Dev/DBuf for the router probe
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 
 using vllm::Dots3NoteParams;
 using vllm::HfConfig;
@@ -1270,16 +1275,23 @@ TEST_CASE("dots3-note W3: the layer refuses a weight of the wrong size BY NAME")
 }
 
 TEST_CASE(
-    "dots3-note W3/W4a: the DEVICE forward still refuses the RELEASED config") {
-  // The honest boundary, made executable, and its subject MOVED at W4a. W3 read
-  // "nothing is on the decode path"; W4a put the FULL-attention layer there, so
-  // what this case now pins is the other half — the released
-  // `dots-studio/dots3-note-prev` config is still refused, at layer 1 (MoE, W5)
-  // and layer 2 (sliding, W4b), and refused BY NAME rather than served as
-  // whatever the supported subset happens to compute. Reaching the refusal
-  // through the REAL model the factory returns, never a fabricated LoadedModel
-  // subclass, which is undefined behaviour the moment the handle is opened
-  // (#730/#775).
+    "dots3-note W3/W4a/W5: the RELEASED config is no longer refused, and an "
+    "UNMATERIALIZED handle still is") {
+  // The honest boundary, made executable, and its subject has MOVED TWICE.
+  // W3 read "nothing is on the decode path". W4a put the FULL-attention layer
+  // there and this case pinned the released config still being refused, at
+  // layer 1 (MoE, W5) and layer 2 (sliding, W4b). **W5 lifted the last two
+  // branches** — the MoE layer and the nextn tail (W5c, #2176) — so
+  // `Dots3NoteDeviceRefusal` over the real released `config.json` is EMPTY, and
+  // the assertion below is the `true -> false` flip that says so rather than a
+  // deleted case.
+  //
+  // What the forward still refuses on THIS handle is the other guard, and it is
+  // the reason the case survives: `weights.materialized` is false here, and a
+  // forward over an unmaterialized tower would read uninitialised weights and
+  // emit a plausible token. Reached through the REAL model the factory returns,
+  // never a fabricated LoadedModel subclass, which is undefined behaviour the
+  // moment the handle is opened (#730/#775).
   TempConfig cfg(FixtureConfigDoc());
   const HfConfig config = LoadHfConfig(cfg.path());
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
@@ -1295,10 +1307,12 @@ TEST_CASE(
   vllm::v1::CommonAttentionMetadata meta{};
   const std::vector<vllm::PagedKvCache> kv;
   const std::vector<int32_t> logits_indices{0};
+  // THE W5 FLIP, asserted where a reader following W3/W4a's evidence lands.
+  CHECK(vllm::Dots3NoteDeviceRefusal(weights.params).empty());
   CHECK_THROWS_WITH_AS(
       (void)vllm::Dots3NoteModel::ForwardDevice(ids, pos, meta, kv, weights,
                                                 queue, logits_indices),
-      doctest::Contains("not ported"), std::runtime_error);
+      doctest::Contains("not materialized"), std::runtime_error);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1338,11 +1352,20 @@ std::vector<double> Bf16All(std::vector<double> v) {
   return v;
 }
 
-// One tensor as it will be written to disk: bf16, the shape the loader checks.
+// One tensor as it will be written to disk: the shape the loader checks, and
+// since W5 the DTYPE too.
+//
+// `dtype` defaults to BF16 and every W3/W4 entry keeps that default, so nothing
+// those bricks wrote changes. It exists because `mlp.gate.e_score_correction_bias`
+// is F32 in the released checkpoint and F32 upstream (deepseek_v2.py:322-324) —
+// the ONE dtype exception in this tower — and a fixture that wrote it BF16 would
+// be testing a checkpoint the publisher does not ship, on the exact axis
+// `porting.md`'s memory-format rule is about.
 struct StOut {
   std::string name;
   std::vector<int64_t> shape;
-  std::vector<double> values;  // ALREADY bf16-rounded
+  std::vector<double> values;  // ALREADY rounded to `dtype`
+  std::string dtype = "BF16";
 };
 
 void WriteSafetensorsBf16(const std::vector<StOut>& entries, const std::string& path) {
@@ -1352,10 +1375,13 @@ void WriteSafetensorsBf16(const std::vector<StOut>& entries, const std::string& 
     size_t n = 1;
     for (int64_t s : e.shape) n *= static_cast<size_t>(s);
     REQUIRE(n == e.values.size());
-    header[e.name] = {{"dtype", "BF16"},
+    REQUIRE_MESSAGE((e.dtype == "BF16" || e.dtype == "F32"),
+                    "unsupported fixture dtype " << e.dtype << " for " << e.name);
+    const size_t w = e.dtype == "F32" ? 4u : 2u;
+    header[e.name] = {{"dtype", e.dtype},
                       {"shape", e.shape},
-                      {"data_offsets", {off, off + n * 2}}};
-    off += n * 2;
+                      {"data_offsets", {off, off + n * w}}};
+    off += n * w;
   }
   const std::string hs = header.dump();
   std::ofstream out(path, std::ios::binary);
@@ -1364,8 +1390,13 @@ void WriteSafetensorsBf16(const std::vector<StOut>& entries, const std::string& 
   out.write(hs.data(), static_cast<std::streamsize>(hs.size()));
   for (const StOut& e : entries) {
     for (double v : e.values) {
-      const uint16_t b = vt::F32ToBF16(static_cast<float>(v));
-      out.write(reinterpret_cast<const char*>(&b), 2);
+      if (e.dtype == "F32") {
+        const float f = static_cast<float>(v);
+        out.write(reinterpret_cast<const char*>(&f), 4);
+      } else {
+        const uint16_t b = vt::F32ToBF16(static_cast<float>(v));
+        out.write(reinterpret_cast<const char*>(&b), 2);
+      }
     }
   }
 }
@@ -2060,22 +2091,25 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (b) a MoE layer — W5.
+  // (b) a MoE layer — LIFTED at W5, and kept as an ACCEPTANCE for the same
+  //     reason as (a): a reader following W4a's evidence lands on the answer.
+  //     `Dots3NoteMoeBlock` over `vllm::RunMoePlaced` runs it, and the W5 cases
+  //     at the bottom of this file gate it against an independent reference.
   {
     w4a::DeviceSpec s;
     nlohmann::json doc = w4a::DeviceConfigDoc(s);
     doc["first_k_dense_replace"] = 1;  // layer 1 becomes MoE
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("MoE") != std::string::npos);
-    CHECK(why.find("W5") != std::string::npos);
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (c) the RELEASED config — both, and the loader still does NOT materialize.
+  // (c) the RELEASED config — LIFTED at W5 (the MoE layer) and W5c (the nextn
+  //     tail, #2176). It is EMPTY now, which is the row's headline and is
+  //     asserted here as the `true -> false` flip rather than deleted.
   {
     TempConfig cfg(FixtureConfigDoc());
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    CHECK_FALSE(w4a::Dots3NoteDeviceRefusal(p).empty());
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
   // (d) a sequence past `index_topk` — LIFTED at W4b-3c for a SINGLE-SHOT
   //     prefill, and kept here as an ACCEPTANCE for the same reason as (a) and
@@ -2104,19 +2138,22 @@ TEST_CASE("dots3-note W4a: what the device path still REFUSES, by name") {
     REQUIRE(p.physical_latent_row() > p.full.latent_row());
     CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (f) a nextn tail — W10. `Dots3NoteMTPModel` is deliberately unregistered
-  //     and the backbone forward has nowhere to put an extra block, so a
-  //     checkpoint that ships one is refused rather than silently enumerated,
-  //     loaded and never run.
+  // (f) a nextn tail — LIFTED at W5c (#2176), and this one was a DEFECT rather
+  //     than a gap: the refusal was STRICTER THAN UPSTREAM. vLLM does not turn
+  //     a checkpoint with nextn weights away, it DROPS them from the main model
+  //     (utils.py:542 -> deepseek_v2.py:1618-1620; model.py:624 @ bc2d63e650).
+  //     They are a NAMED W10 deferral in the accounting now, which is what
+  //     `Dots3NoteIsNextnTensor` is for.
   {
     w4a::DeviceSpec s;
     nlohmann::json doc = w4a::DeviceConfigDoc(s);
     doc["num_nextn_predict_layers"] = 1;
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4a::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("nextn") != std::string::npos);
-    CHECK(why.find("W10") != std::string::npos);
+    CHECK(w4a::Dots3NoteDeviceRefusal(p).empty());
+    CHECK(vllm::Dots3NoteIsNextnTensor(
+        p, "model.layers." + std::to_string(p.num_hidden_layers) + ".enorm.weight"));
+    CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.mtp.embed_tokens.weight"));
   }
   // (g) a KV cache whose row disagrees with the config it was built from. The
   //     config-level check above cannot see this — an engine allocates the
@@ -3438,40 +3475,33 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "dots3-note W4b-1: the MoE layer is what the DEVICE path refuses on this "
-    "bench, and W4b-2 lifted the other two") {
+    "dots3-note W4b-1/W4b-2/W5: this bench's config is refused by NOTHING any "
+    "more, and each branch names the brick that lifted it") {
   // W4b-1 wrote HOST code and lifted nothing. This case recorded the boundary
   // it left: the sliding layer and the PADDED physical row were both refused
-  // by `Dots3NoteDeviceRefusal`. **W4b-2 lifted both**, so the assertions
-  // below are the ACCEPTANCES that replaced them — kept in place rather than
-  // deleted, so a reader following W4b-1's evidence lands on the answer.
+  // by `Dots3NoteDeviceRefusal`. **W4b-2 lifted both**, and **W5 lifted the MoE
+  // layer while W5c lifted the nextn tail (#2176)**, so the assertions below
+  // are the ACCEPTANCES that replaced them — kept in place rather than deleted,
+  // so a reader following W4b-1's evidence lands on the answer.
   const w4b::SwaBench b;
   // The bench's own config is the released schedule's shape: MoE from layer 1
-  // and sliding from layer 2. `Dots3NoteDeviceRefusal` walks the layer list in
-  // order, so this one is refused at the MoE layer — and that is worth
-  // asserting rather than working around, because it is what the RELEASED
-  // checkpoint does too (spec §4.6).
+  // and sliding from layer 2, plus the §4-trap-3 nextn default of 1. Every one
+  // of those was a refusal at some brick and none is one now.
   const std::string why = vllm::Dots3NoteDeviceRefusal(b.params);
-  MESSAGE("device refusal, bench config: " << why);
-  CHECK_FALSE(why.empty());
-  CHECK(why.find("MoE") != std::string::npos);
+  MESSAGE("device refusal, bench config: '" << why << "' (empty)");
+  CHECK(why.empty());
+  REQUIRE(b.params.is_moe_layer(1));
+  REQUIRE(b.params.num_nextn_predict_layers == 1);
 
-  // With the MoE layers out of the way NOTHING is refused any more: the
-  // sliding layers run, and so does the PADDED physical row (6 + 4 = 10
-  // against the full arm's 4 + 4 = 8). W4b-2's own cases run this exact
-  // geometry through `ModelRegistry::Forward`.
+  // The same config with every layer DENSE is also empty, which says the MoE
+  // acceptance above is not standing in for something else.
   nlohmann::json d = w4b::SwaConfigDoc(b.spec);
   d["first_k_dense_replace"] = 4;  // every layer dense
   TempConfig cfg_nextn(d);
   const Dots3NoteParams p_nextn = ParseDots3NoteParams(LoadHfConfig(cfg_nextn.path()));
   const std::string why_nextn = vllm::Dots3NoteDeviceRefusal(p_nextn);
-  MESSAGE("with no MoE layer, the refusal is: " << why_nextn);
-  // NOT the sliding layer any more — the NEXTN tail, which this fixture
-  // inherits from the released config's §4 trap 3 default of 1 and which W10
-  // owns. That is worth pinning: it says the sliding refusal is gone rather
-  // than merely reordered behind something else.
-  CHECK(why_nextn.find("nextn") != std::string::npos);
-  CHECK(why_nextn.find("W10") != std::string::npos);
+  MESSAGE("with no MoE layer, the refusal is: '" << why_nextn << "' (empty)");
+  CHECK(why_nextn.empty());
   d["num_nextn_predict_layers"] = 0;
   TempConfig cfg_swa(d);
   const Dots3NoteParams p_swa = ParseDots3NoteParams(LoadHfConfig(cfg_swa.path()));
@@ -4265,25 +4295,27 @@ TEST_CASE(
   CHECK(p.physical_latent_row() - fd.head_size() == 512);
 }
 
-TEST_CASE("dots3-note W4b-2: what the device path STILL refuses, by name") {
-  // (a) a MoE layer — W5. The RELEASED checkpoint trips this at layer 1, so
-  //     nothing a user can run changed at W4b-2.
+TEST_CASE("dots3-note W4b-2/W5: what the device path refuses, by name") {
+  // (a) a MoE layer — LIFTED at W5. Kept as an ACCEPTANCE so a reader
+  //     following W4b-2's evidence lands on the answer rather than a gap.
   {
     nlohmann::json doc = w4b2::ConfigDoc(w4b2::Spec{});
     doc["first_k_dense_replace"] = 1;
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("MoE") != std::string::npos);
-    CHECK(why.find("W5") != std::string::npos);
+    CHECK(w4b2::Dots3NoteDeviceRefusal(p).empty());
   }
-  // (b) the RELEASED config still refuses, at its MoE layer.
+  // (b) the RELEASED config — LIFTED at W5 (the MoE layer) and W5c (the nextn
+  //     tail, #2176). W4b-2 asserted `why.find("MoE") != npos` here; that
+  //     `true -> false` flip is the row's headline and is asserted rather than
+  //     deleted. It is NOT a claim that the model runs: the MoE is 545.82 GB of
+  //     a 576.89 GB checkpoint (94.62%), and nothing this project owns holds it.
   {
     TempConfig cfg(FixtureConfigDoc());
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
     const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
-    MESSAGE("W4b-2 released-config refusal: " << why);
-    CHECK(why.find("MoE") != std::string::npos);
+    MESSAGE("W5 released-config refusal: '" << why << "' (empty)");
+    CHECK(why.empty());
   }
   // (c) a sequence past `index_topk`, on a config that HAS a full layer. The
   //     DSA selection is still not on the device path (W4b-3).
@@ -4309,15 +4341,15 @@ TEST_CASE("dots3-note W4b-2: what the device path STILL refuses, by name") {
     CHECK(w4b2::Dots3NoteDeviceRefusal(b.params).empty());
     CHECK_NOTHROW((void)b.RunPrefillThenDecode());
   }
-  // (e) a nextn tail — W10, unchanged.
+  // (e) a nextn tail — LIFTED at W5c (#2176), because the refusal was STRICTER
+  //     than upstream: vLLM drops those weights from the main model rather than
+  //     turning the checkpoint away.
   {
     nlohmann::json doc = w4b2::ConfigDoc(w4b2::Spec{});
     doc["num_nextn_predict_layers"] = 1;
     TempConfig cfg(doc);
     const Dots3NoteParams p = ParseDots3NoteParams(LoadHfConfig(cfg.path()));
-    const std::string why = w4b2::Dots3NoteDeviceRefusal(p);
-    CHECK(why.find("nextn") != std::string::npos);
-    CHECK(why.find("W10") != std::string::npos);
+    CHECK(w4b2::Dots3NoteDeviceRefusal(p).empty());
   }
   // (f) a KV cache whose row disagrees with the config it was built from. The
   //     config-level checks cannot see this — an engine allocates the cache
@@ -4668,3 +4700,1168 @@ TEST_CASE(
                     /*num_reqs=*/1, b.params.physical_latent_row()),
       doctest::Contains("not shaped"), std::runtime_error);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// W5 — the MoE layer ON THE DECODE PATH, and the RELEASED config stops refusing.
+//
+// ─── WHAT THIS ESTABLISHES, AND WHAT IT CANNOT ───────────────────────────────
+// A config whose layers are `{full+dense, sliding+MoE, full+MoE}` is loaded
+// through the REAL registry over the REAL loader and run through
+// `ModelRegistry::Forward` TWICE against one KV-cache pool — a PREFILL then a
+// DECODE — and its logits are compared against a whole-model double reference
+// whose MoE block was transcribed from `grouped_topk_router.py:80-161`,
+// `deepseek_v2.py:406-429` and `nvidia/model.py:115-132` at `bc2d63e650`, and
+// WITHOUT reading `src/vt/cpu/cpu_ops.cpp`. A reference that shares a helper
+// with the code it gates measures consistency with itself.
+//
+// It CANNOT say the answer matches vLLM. vLLM cannot run this model on any
+// hardware this project owns (spec §6.2), so there is no oracle and no token
+// gate anywhere on this row. Two implementations of one formula agreeing is
+// what is claimed, and nothing more (spec §6.4, option B).
+//
+// ─── WHY THE DISCRETE ASSERTION IS THE POINT ─────────────────────────────────
+// Router logits are stored bf16, whose maximum relative rounding error is
+// 2^-8 = 3.906e-3. Through `sigmoid' <= 0.25` that is a SCORE perturbation of
+// order 1e-3. At the released E=256 the typical gap between the 8th and 9th
+// order statistics of a uniform score spread is about 1/256 = 3.9e-3 — the same
+// order — so a fixture sampled from noise is a coin flip on whether the
+// SELECTED SET matches, and a relative-error bound cannot tell "the same 8
+// experts, rounded" from "a different expert entirely". §4.9 records that exact
+// defect one brick ago on the DSA indexer (7.43e-4 margin against a 1.28e-3
+// ulp), and the repair there was the FIXTURE and never the threshold.
+//
+// So the fixture is DESIGNED rather than sampled, and the case prints its own
+// discriminators: the minimum decision margin against the bf16 score ulp, the
+// number of distinct experts the batch actually activates, and the tie.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+namespace w5 {
+
+using vllm::Dots3NoteDeviceRefusal;
+using vllm::Dots3NoteLayerKind;
+using vllm::PagedKvCache;
+using vllm::dots3_note::Dots3NoteSlidingAttnDimsFrom;
+using w4a::Bf16All;
+using w4a::StOut;
+
+// The stored width of the correction bias, which is the one F32 tensor in this
+// tower. Rounding the designed values through float here is what makes the
+// reference read the same number the checkpoint stores.
+double F32(double x) { return static_cast<double>(static_cast<float>(x)); }
+std::vector<double> F32All(std::vector<double> v) {
+  for (double& x : v) x = F32(x);
+  return v;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE FIXTURE, and every number in it is a decision.
+//
+// The ATTENTION geometry is W4b-2's, unchanged and reused rather than retyped:
+// `{full, sliding, full}` with a 3-wide window against a 6-token prompt, a
+// padded physical row, two rope thetas orders apart and a SHUFFLED block table.
+// W5 changes the MLP and nothing else, so re-deriving the attention fixture
+// would only risk weakening it.
+//
+// The MoE half:
+//   * `first_k_dense_replace = 1`, so layer 0 is DENSE and layers 1-2 are MoE —
+//     the released schedule's own shape (`first_k_dense_replace: 1` in the
+//     committed config.json). A fixture with no dense layer would not test that
+//     `MaterializeDots3NoteDevice` still reads `mlp.gate_proj.weight` where it
+//     exists, and one with no MoE layer would test nothing at all.
+//   * The MoE layers are one of EACH attention kind (layer 1 sliding, layer 2
+//     full), so a MoE block that leaked a per-layer field across kinds is wrong.
+//   * `E = 8`, `top_k = 3`. Small enough to enumerate by hand in a failure
+//     message, large enough that 8-choose-3 is not a formality.
+//   * THE BIAS IS THE SELECTION, and it is designed in three tiers:
+//       - experts 0 and 1 carry bias +1.30 and BYTE-IDENTICAL router rows, so
+//         their biased scores tie EXACTLY in double for every token and BOTH
+//         are always selected. That is the deliberate exact tie, and it sits
+//         OFF the k-th boundary on purpose: with both inside the set the
+//         selection is unambiguous whatever the tie rule is, which is the only
+//         claim upstream's `torch.topk(..., sorted=False)` actually supports
+//         (grouped_topk_router.py:134 defines `use_sorted`; :148 is the
+//         EXPERT topk that reads it). A tie ON the boundary would make
+//         the correct answer genuinely undefined and gating it would pin our
+//         kernel's accident as a contract.
+//       - experts 2-5 carry bias 0.0, so the LOGITS decide the third slot and
+//         the selection is genuinely token-dependent. The case prints how many
+//         distinct experts the batch activates; a fixture where every token
+//         picks the same three has not tested routing at all.
+//       - experts 6 and 7 carry bias -1.50 and are never selected.
+//     The selected experts therefore carry DIFFERENT biases (+1.30, +1.30, 0.0),
+//     which is what makes the nearest mechanism — the bias applied to the
+//     routing WEIGHT as well as to the selection — visible rather than absorbed
+//     by the renormalisation.
+//   * `router_amp` keeps the logits small, so the sigmoid scores sit in a band
+//     narrow enough for the +1.30 / 0.0 / -1.50 tiers to dominate, while still
+//     spreading enough inside the middle tier for the third slot to move. The
+//     case MEASURES the resulting margin rather than trusting this paragraph.
+//   * `moe_inter = 6` against the dense layers' `inter = 10`, and
+//     `n_shared_experts = 1`, so the shared expert's width is
+//     `moe_intermediate_size * n_shared_experts` = 6 and NOT `intermediate_size`
+//     = 10. A port that reached for the wrong one builds a 10-wide MLP and the
+//     load refuses BY NAME — which has its own case.
+// ─────────────────────────────────────────────────────────────────────────────
+struct Spec {
+  w4b2::Spec attn;  // {full, sliding, full}, prompt 6, page 4, shuffled table
+  int64_t n_experts = 8;
+  int64_t top_k = 3;
+  int64_t moe_inter = 6;
+  int64_t n_shared = 1;
+  int64_t first_k_dense = 1;
+  double routed_scaling_factor = 1.0;
+  bool norm_topk_prob = true;
+  // CHOSEN BY MEASUREMENT over {0.09, 0.18, 0.30, 0.45, 0.60}, and the
+  // discriminator was the SOFTMAX arm rather than the one this brick expected.
+  // At 0.09 the sigmoid-versus-softmax defect moved the logits by only 0.0400 —
+  // BELOW the 0.06 bound, so a port that wrote `kSoftmax` into the router args
+  // would have passed. The scoring functions only separate once the logits are
+  // large enough to leave sigmoid's near-linear region, and the arm scales
+  // 0.0400 / 0.0770 / 0.1126 / 0.1515 / 0.2080 across that grid while the
+  // minimum decision margin barely moves (19.4x / 19.3x / 18.7x / 18.1x /
+  // 17.2x the ulp) and the residue FALLS (0.0230 -> 0.0119). 0.45 is the
+  // SMALLEST value that clears the 0.15 fixture-quality floor at all, and it
+  // clears it by one percent — a guard met by one percent is the hugged
+  // threshold this project keeps naming, so the fixture takes 0.60 and the
+  // nearest mechanism lands at 0.208 instead.
+  double router_amp = 0.60;
+  double expert_amp = 0.5;
+  double shared_amp = 0.5;
+  // A per-expert output GAIN of 3 on the CONTENDED tier (experts 2-5), and it
+  // is what makes the nearest mechanism visible rather than a decoration. The
+  // bias-in-the-weight defect moves routing weight AWAY from the contended
+  // expert (0.333 -> 0.122 at this fixture's scores) and TOWARDS the two
+  // always-selected ones, so unless the three differ in OUTPUT magnitude the
+  // reshuffle largely cancels in the sum. MEASURED: at gain 1 the defect moves
+  // the logits by 0.070-0.226 depending on the seed and at gain 3 by
+  // 0.262-0.712. The first draft of this fixture had gain 1 and a different
+  // seed, and the defect landed at 0.0183 — BELOW the 0.06 bound, i.e. a gate
+  // that would have passed the single most likely port defect on this block.
+  // The repair was the fixture, never the bound.
+  double contended_gain = 3.0;
+  // CHOSEN BY MEASUREMENT over six seeds x {gain 1, 3} x {shared amplitude
+  // 0.5, 0.15}, on the two discriminators this gate turns on: the minimum
+  // decision margin against the bf16 score ulp, and the distance to the nearest
+  // mechanism. This one reads margin 19.4x the ulp (bar 4x), 6 distinct experts
+  // activated, residue 0.0230 and nearest mechanism 0.3214. The scan's own
+  // spread is the argument for measuring rather than assuming: the margin
+  // ranged 1.51x to 25.8x across the grid, so one seed in twelve would have
+  // shipped a fixture whose selection is a coin flip.
+  uint64_t moe_seed = 0x1234567890ABCDEFULL;
+  // The three tiers. F32 because that is how the checkpoint stores them.
+  std::vector<double> bias{1.30, 1.30, 0.0, 0.0, 0.0, 0.0, -1.50, -1.50};
+  int64_t layers() const { return attn.layers(); }
+  bool is_moe(int64_t l) const { return l >= first_k_dense; }
+  int64_t shared_inter() const { return moe_inter * n_shared; }
+};
+
+nlohmann::json ConfigDoc(const Spec& s) {
+  nlohmann::json d = w4b2::ConfigDoc(s.attn);
+  d["n_routed_experts"] = s.n_experts;
+  d["num_experts_per_tok"] = s.top_k;
+  d["moe_intermediate_size"] = s.moe_inter;
+  d["n_shared_experts"] = s.n_shared;
+  d["first_k_dense_replace"] = s.first_k_dense;
+  d["moe_layer_freq"] = 1;
+  d["norm_topk_prob"] = s.norm_topk_prob;
+  d["routed_scaling_factor"] = s.routed_scaling_factor;
+  // The released config.json carries NEITHER key (§4 trap 1) and
+  // `ParseDots3NoteParams` defaults both to 1, which is what
+  // `Dots3NoteConfig.__init__` does at configs/dots3_note.py:18-19. Left ABSENT
+  // here for the same reason: writing them would test a config the publisher
+  // does not ship.
+  d.erase("n_group");
+  d.erase("topk_group");
+  return d;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One MoE layer's weights, in the on-disk orientation, in double.
+struct MoeW {
+  std::vector<double> router;                  // [E, H]
+  std::vector<double> bias;                    // [E], F32-rounded
+  std::vector<std::vector<double>> egate;      // E x [I, H]
+  std::vector<std::vector<double>> eup;        // E x [I, H]
+  std::vector<std::vector<double>> edown;      // E x [H, I]
+  std::vector<double> sgate, sup, sdown;       // shared, at [SI,H]/[SI,H]/[H,SI]
+};
+
+// W5 REUSES W4b-2's WEIGHTS WHOLESALE and adds one thing. `w4b2::MakeWeights`
+// builds the embedding, the lm_head, the norms and BOTH attention arms from the
+// same generator at the same seed, so W5's attention fixture is byte-for-byte
+// W4b-2's rather than a re-derivation of it — including the dense gate/up/down
+// on the MoE layers, which are generated and then not written, precisely so the
+// RNG stream does not shift and the attention weights stay identical.
+struct Weights {
+  w4b2::Weights base;
+  std::vector<MoeW> moe;  // one per layer; only the MoE layers' are populated
+};
+
+MoeW MakeMoe(const Spec& s, Rng& r) {
+  const int64_t H = s.attn.hidden, E = s.n_experts, I = s.moe_inter;
+  const int64_t SI = s.shared_inter();
+  MoeW m;
+  m.router = Bf16All(r.fill(E * H, s.router_amp));
+  // THE EXACT TIE. Expert 1's router row is expert 0's, byte for byte, and
+  // their biases are equal — so `sigmoid(logit) + bias` is bit-identical for
+  // the two at every token and the tie is real rather than approximate. Both
+  // sit inside the selected set (tier +1.30 against top_k 3), so the SET does
+  // not depend on which side a tie-break picks, which is the only claim
+  // upstream's `sorted=False` supports.
+  for (int64_t c = 0; c < H; ++c) {
+    m.router[static_cast<size_t>(1 * H + c)] = m.router[static_cast<size_t>(c)];
+  }
+  m.bias = F32All(s.bias);
+  for (int64_t e = 0; e < E; ++e) {
+    const double gain = e >= 2 ? s.contended_gain : 1.0;
+    m.egate.push_back(Bf16All(r.fill(I * H, s.expert_amp)));
+    m.eup.push_back(Bf16All(r.fill(I * H, s.expert_amp)));
+    m.edown.push_back(Bf16All(r.fill(H * I, s.expert_amp * gain)));
+  }
+  m.sgate = Bf16All(r.fill(SI * H, s.shared_amp));
+  m.sup = Bf16All(r.fill(SI * H, s.shared_amp));
+  m.sdown = Bf16All(r.fill(H * SI, s.shared_amp));
+  return m;
+}
+
+Weights MakeWeights(const Spec& s, const FullAttnDims& fd, const SlidingAttnDims& sd,
+                    uint64_t seed) {
+  Weights w;
+  w.base = w4b2::MakeWeights(s.attn, fd, sd, seed);
+  Rng r(s.moe_seed);
+  for (int64_t l = 0; l < s.layers(); ++l) {
+    w.moe.push_back(s.is_moe(l) ? MakeMoe(s, r) : MoeW{});
+  }
+  return w;
+}
+
+// W4b-2's checkpoint with the DENSE MLP entries of each MoE layer replaced by
+// the MoE ones. Filtering rather than re-emitting keeps every attention tensor
+// byte-identical to the fixture W4b-2 gated, and it is what makes the two
+// bricks' benches comparable.
+std::vector<StOut> CheckpointOf(const Spec& s, const FullAttnDims& fd,
+                                const SlidingAttnDims& sd, const Weights& w) {
+  const int64_t H = s.attn.hidden;
+  const std::vector<StOut> dense = w4b2::CheckpointOf(s.attn, fd, sd, w.base);
+  std::vector<StOut> e;
+  for (const StOut& t : dense) {
+    bool drop = false;
+    for (int64_t l = 0; l < s.layers(); ++l) {
+      if (!s.is_moe(l)) continue;
+      const std::string p = "model.layers." + std::to_string(l) + ".mlp.";
+      if (t.name.rfind(p, 0) == 0) drop = true;
+    }
+    if (!drop) e.push_back(t);
+  }
+  for (int64_t l = 0; l < s.layers(); ++l) {
+    if (!s.is_moe(l)) continue;
+    const MoeW& m = w.moe[static_cast<size_t>(l)];
+    const std::string p = "model.layers." + std::to_string(l) + ".";
+    const int64_t E = s.n_experts, I = s.moe_inter, SI = s.shared_inter();
+    e.push_back({p + "mlp.gate.weight", {E, H}, m.router});
+    // F32, which is the ONE dtype exception in this tower and is upstream's own
+    // (`torch.empty(n_routed_experts, dtype=torch.float32)`,
+    // deepseek_v2.py:322-324). A fixture that stored it bf16 would be testing a
+    // checkpoint the publisher does not ship.
+    e.push_back({p + "mlp.gate.e_score_correction_bias", {E}, m.bias, "F32"});
+    for (int64_t x = 0; x < E; ++x) {
+      const std::string ex = p + "mlp.experts." + std::to_string(x) + ".";
+      e.push_back({ex + "gate_proj.weight", {I, H}, m.egate[static_cast<size_t>(x)]});
+      e.push_back({ex + "up_proj.weight", {I, H}, m.eup[static_cast<size_t>(x)]});
+      e.push_back({ex + "down_proj.weight", {H, I}, m.edown[static_cast<size_t>(x)]});
+    }
+    e.push_back({p + "mlp.shared_experts.gate_proj.weight", {SI, H}, m.sgate});
+    e.push_back({p + "mlp.shared_experts.up_proj.weight", {SI, H}, m.sup});
+    e.push_back({p + "mlp.shared_experts.down_proj.weight", {H, SI}, m.sdown});
+  }
+  return e;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE INDEPENDENT DOUBLE REFERENCE for the MoE block.
+//
+// Transcribed from the upstream Python and from nothing else:
+//   grouped_topk_router.py:112-161   scoring, the correction bias, the group
+//                                    stage, the top-k, the routing weights,
+//                                    renormalise, routed_scaling_factor
+//   deepseek_v2.py:406-429           `DeepseekV2MoE.forward` (routed only here,
+//                                    because model.py:88-90 sets
+//                                    `n_shared_experts` to None on the routed
+//                                    config so deepseek_v2.py:354-355 leaves
+//                                    `self.shared_experts = None`)
+//   nvidia/model.py:115-132          `Dots3NoteMoE.forward` — the unfused
+//                                    `+ self.shared_experts(hidden_states)`
+//
+// `src/vt/cpu/cpu_ops.cpp` was NOT read while writing it. Every switch on
+// `Opts` is a MUTATION HANDLE: the case flips one and requires the answer to
+// move, which is what turns "the two agree" into "the two agree BECAUSE the
+// mechanism is there".
+struct Opts {
+  bool bias_in_selection = true;   // grouped_topk_router.py:120-124
+  bool bias_in_weights = false;    // the NEAREST MECHANISM; :148-150 says NO
+  bool renormalize = true;         // :156-157
+  bool shared = true;              // model.py:125-127
+  bool group_stage = true;         // :125-145 — INERT at n_group == 1
+  bool softmax_scoring = false;    // :112-117 — sigmoid for this architecture
+  double routed_scale = 1.0;       // :159-160
+  int top_k_delta = 0;
+};
+
+// What the router decided for ONE token, kept so the case can assert the
+// DISCRETE half rather than only a norm.
+struct Decision {
+  std::vector<int> selected;   // in the order the reference produced them
+  std::vector<double> weight;  // the routing weight per slot
+  double margin = 0.0;         // biased[k-th selected] - biased[best rejected]
+  double tie_gap = 0.0;        // |biased[0] - biased[1]|, the deliberate tie
+  double max_abs_logit = 0.0;
+};
+
+std::vector<double> Silu(const std::vector<double>& g, const std::vector<double>& u) {
+  std::vector<double> a(g.size());
+  for (size_t i = 0; i < g.size(); ++i) a[i] = (g[i] / (1.0 + std::exp(-g[i]))) * u[i];
+  return a;
+}
+
+// One expert MLP over one row: `down(silu(gate(x)) * up(x))`.
+std::vector<double> ExpertMlp(const std::vector<double>& x, const std::vector<double>& wg,
+                              const std::vector<double>& wu,
+                              const std::vector<double>& wd, int64_t H, int64_t I) {
+  const std::vector<double> g = ref::Dense(x, wg, 1, H, I);
+  const std::vector<double> u = ref::Dense(x, wu, 1, H, I);
+  return ref::Dense(Silu(g, u), wd, 1, I, H);
+}
+
+std::vector<double> RefMoe(const Spec& s, const MoeW& w, const std::vector<double>& x,
+                           int64_t T, const Opts& o,
+                           std::vector<Decision>* trace = nullptr) {
+  const int64_t H = s.attn.hidden, E = s.n_experts, I = s.moe_inter;
+  const int64_t K = s.top_k + o.top_k_delta;
+  const int64_t SI = s.shared_inter();
+  REQUIRE(K >= 1);
+  REQUIRE(K <= E);
+  // `router_logits, _ = self.gate(hidden_states)` — a plain linear at the model
+  // dtype, because `_get_moe_router_dtype` returns None for this model type
+  // (deepseek_v2.py:131-141). The reference computes it in long double; the
+  // WEIGHTS it reads are already bf16-rounded, which is what makes the
+  // comparison measure the forward rather than the storage width.
+  const std::vector<double> logits = ref::Dense(x, w.router, T, H, E);
+  std::vector<double> out(static_cast<size_t>(T * H), 0.0);
+  for (int64_t t = 0; t < T; ++t) {
+    Decision dec;
+    std::vector<double> scores(static_cast<size_t>(E));
+    if (o.softmax_scoring) {
+      double m = -1e300;
+      for (int64_t e = 0; e < E; ++e) {
+        m = std::max(m, logits[static_cast<size_t>(t * E + e)]);
+      }
+      double z = 0.0;
+      for (int64_t e = 0; e < E; ++e) {
+        scores[static_cast<size_t>(e)] = std::exp(logits[static_cast<size_t>(t * E + e)] - m);
+        z += scores[static_cast<size_t>(e)];
+      }
+      for (double& v : scores) v /= z;
+    } else {
+      for (int64_t e = 0; e < E; ++e) {
+        scores[static_cast<size_t>(e)] =
+            1.0 / (1.0 + std::exp(-logits[static_cast<size_t>(t * E + e)]));
+      }
+    }
+    for (int64_t e = 0; e < E; ++e) {
+      dec.max_abs_logit =
+          std::max(dec.max_abs_logit, std::fabs(logits[static_cast<size_t>(t * E + e)]));
+    }
+    // `scores = scores + e_score_correction_bias.unsqueeze(0)` (:122). Used for
+    // SELECTION; the routing weights read `original_scores` (:148-150).
+    std::vector<double> biased = scores;
+    if (o.bias_in_selection) {
+      for (int64_t e = 0; e < E; ++e) biased[static_cast<size_t>(e)] += w.bias[static_cast<size_t>(e)];
+    }
+    // The GROUP stage (:125-145). At `n_group == 1` there is one group, the
+    // `topk_group == 1` selection keeps it, and the mask is all-ones — so this
+    // is written out and then is the identity. It is modelled explicitly rather
+    // than skipped so the PREDICTED-GREEN mutation has a real thing to delete
+    // and the inertness is demonstrated instead of asserted in prose.
+    std::vector<bool> mask(static_cast<size_t>(E), true);
+    if (o.group_stage) {
+      const int64_t G = 1, TG = 1, per = E / G;
+      std::vector<double> gs(static_cast<size_t>(G), 0.0);
+      for (int64_t g = 0; g < G; ++g) {
+        // `.topk(2, dim=-1)[0].sum(dim=-1)` over the group (:125-127)
+        double a = -1e300, b = -1e300;
+        for (int64_t j = 0; j < per; ++j) {
+          const double v = biased[static_cast<size_t>(g * per + j)];
+          if (v > a) { b = a; a = v; } else if (v > b) { b = v; }
+        }
+        gs[static_cast<size_t>(g)] = a + b;
+      }
+      std::vector<int64_t> order(static_cast<size_t>(G));
+      for (int64_t g = 0; g < G; ++g) order[static_cast<size_t>(g)] = g;
+      std::stable_sort(order.begin(), order.end(), [&](int64_t p, int64_t q) {
+        return gs[static_cast<size_t>(p)] > gs[static_cast<size_t>(q)];
+      });
+      std::fill(mask.begin(), mask.end(), false);
+      for (int64_t g = 0; g < TG; ++g) {
+        const int64_t gi = order[static_cast<size_t>(g)];
+        for (int64_t j = 0; j < per; ++j) mask[static_cast<size_t>(gi * per + j)] = true;
+      }
+    }
+    // `topk_ids = torch.topk(tmp_scores, k=topk, ...)[1]` (:148). STABLE, so a
+    // tie resolves to the lower index; the fixture keeps its deliberate tie OFF
+    // the k-th boundary so the resulting SET does not depend on that choice.
+    std::vector<int> order(static_cast<size_t>(E));
+    for (int64_t e = 0; e < E; ++e) order[static_cast<size_t>(e)] = static_cast<int>(e);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+      const double va = mask[static_cast<size_t>(a)] ? biased[static_cast<size_t>(a)] : -1e300;
+      const double vb = mask[static_cast<size_t>(b)] ? biased[static_cast<size_t>(b)] : -1e300;
+      return va > vb;
+    });
+    dec.selected.assign(order.begin(), order.begin() + static_cast<long>(K));
+    dec.margin = biased[static_cast<size_t>(order[static_cast<size_t>(K - 1)])] -
+                 biased[static_cast<size_t>(order[static_cast<size_t>(K)])];
+    dec.tie_gap = std::fabs(biased[0] - biased[1]);
+    // `topk_weights = original_scores.gather(1, topk_ids)` (:150) — the
+    // UNBIASED scores. `bias_in_weights` is the port defect this gate is tuned
+    // against.
+    double z = 0.0;
+    for (int64_t j = 0; j < K; ++j) {
+      const int e = dec.selected[static_cast<size_t>(j)];
+      const double v = o.bias_in_weights ? biased[static_cast<size_t>(e)]
+                                         : scores[static_cast<size_t>(e)];
+      dec.weight.push_back(v);
+      z += v;
+    }
+    if (o.renormalize && z != 0.0) {
+      for (double& v : dec.weight) v /= z;
+    }
+    if (o.routed_scale != 1.0) {
+      for (double& v : dec.weight) v *= o.routed_scale;
+    }
+    const std::vector<double> xt(x.begin() + static_cast<long>(t * H),
+                                 x.begin() + static_cast<long>((t + 1) * H));
+    for (int64_t j = 0; j < K; ++j) {
+      const size_t e = static_cast<size_t>(dec.selected[static_cast<size_t>(j)]);
+      const std::vector<double> y =
+          ExpertMlp(xt, w.egate[e], w.eup[e], w.edown[e], H, I);
+      for (int64_t c = 0; c < H; ++c) {
+        out[static_cast<size_t>(t * H + c)] += dec.weight[static_cast<size_t>(j)] * y[static_cast<size_t>(c)];
+      }
+    }
+    // `+ self.shared_experts(hidden_states)` (model.py:127) — a PLAIN MLP whose
+    // output is ADDED, no gate.
+    if (o.shared) {
+      const std::vector<double> sh = ExpertMlp(xt, w.sgate, w.sup, w.sdown, H, SI);
+      for (int64_t c = 0; c < H; ++c) out[static_cast<size_t>(t * H + c)] += sh[static_cast<size_t>(c)];
+    }
+    if (trace != nullptr) trace->push_back(std::move(dec));
+  }
+  return out;
+}
+
+// The whole-model reference: W4b-2's residual stream and attention dispatch,
+// with the MLP dispatching on `is_moe`.
+std::vector<double> RefModel(const Spec& s, const FullAttnDims& fd,
+                             const SlidingAttnDims& sd, const Weights& w,
+                             const std::vector<int32_t>& tokens,
+                             const std::vector<int32_t>& positions, const Opts& mo,
+                             const ref::Opts& fo = ref::Opts{},
+                             const w4b::sref::Opts& so = w4b::sref::Opts{},
+                             std::vector<Decision>* trace = nullptr,
+                             std::vector<std::vector<double>>* moe_inputs = nullptr) {
+  const int64_t T = static_cast<int64_t>(tokens.size()), H = s.attn.hidden;
+  std::vector<double> hidden(static_cast<size_t>(T * H));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t c = 0; c < H; ++c) {
+      hidden[static_cast<size_t>(t * H + c)] =
+          w.base.embed[static_cast<size_t>(tokens[static_cast<size_t>(t)] * H + c)];
+    }
+  }
+  std::vector<double> res(static_cast<size_t>(T * H), 0.0);
+  for (int64_t l = 0; l < s.layers(); ++l) {
+    const w4b2::Weights::Layer& lw = w.base.layers[static_cast<size_t>(l)];
+    for (size_t i = 0; i < res.size(); ++i) res[i] += hidden[i];
+    const std::vector<double> x = ref::Rms(res, lw.input_ln, T, H, s.attn.rms_eps);
+    const std::vector<double> a =
+        lw.kind == Dots3NoteLayerKind::kSlidingAttention
+            ? w4b::sref::Forward(sd, lw.swa, x, positions, T, so).out
+            : ref::Forward(fd, lw.full, x, positions, T, fo).out;
+    for (size_t i = 0; i < res.size(); ++i) res[i] += a[i];
+    const std::vector<double> y = ref::Rms(res, lw.post_ln, T, H, s.attn.rms_eps);
+    if (s.is_moe(l)) {
+      if (moe_inputs != nullptr) moe_inputs->push_back(y);
+      hidden = RefMoe(s, w.moe[static_cast<size_t>(l)], y, T, mo, trace);
+    } else {
+      const std::vector<double> g = ref::Dense(y, lw.gate_proj, T, H, s.attn.inter);
+      const std::vector<double> u = ref::Dense(y, lw.up_proj, T, H, s.attn.inter);
+      hidden = ref::Dense(Silu(g, u), lw.down_proj, T, s.attn.inter, H);
+    }
+  }
+  for (size_t i = 0; i < res.size(); ++i) res[i] += hidden[i];
+  const std::vector<double> z = ref::Rms(res, w.base.final_norm, T, H,
+                                         s.attn.rms_eps);
+  return ref::Dense(z, w.base.lm_head, T, H, s.attn.vocab);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+struct Bench {
+  Spec spec;
+  TempConfig cfg;
+  HfConfig config;
+  Dots3NoteParams params;
+  FullAttnDims fdims;
+  SlidingAttnDims sdims;
+  Weights w;
+  std::vector<StOut> entries;
+  std::vector<int32_t> tokens;
+  std::vector<int32_t> positions;
+  std::vector<int32_t> block_table{1, 0};  // SHUFFLED, as W4b-2's
+
+  explicit Bench(Spec s = Spec{})
+      : spec(s),
+        cfg(ConfigDoc(s)),
+        config(LoadHfConfig(cfg.path())),
+        params(ParseDots3NoteParams(config)),
+        fdims(w4b2::FullDimsOrDefault(params)),
+        sdims(Dots3NoteSlidingAttnDimsFrom(params)),
+        w(MakeWeights(s, fdims, sdims, 0x243F6A8885A308D3ULL)),
+        entries(CheckpointOf(s, fdims, sdims, w)) {
+    for (int64_t t = 0; t <= spec.attn.prompt; ++t) {
+      tokens.push_back(static_cast<int32_t>((t * 5 + 1) % spec.attn.vocab));
+      positions.push_back(static_cast<int32_t>(t));
+    }
+  }
+
+  // PREFILL then DECODE, both through `ModelRegistry::Forward`, against ONE
+  // cache pool — the production entry point, entered at `ModelRegistry::Resolve`
+  // over a real `SafetensorsFile`. Returns the decode step's [1, vocab] logits.
+  std::vector<double> RunPrefillThenDecode() const {
+    const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+    w4a::TempCheckpoint ckpt(entries);
+    std::vector<vllm::SafetensorsFile> shards;
+    shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+    const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+    std::unique_ptr<vllm::LoadedModel> model =
+        reg.factory->load_weights(reg, config, source);
+    REQUIRE(model != nullptr);
+
+    w4a::MlaCachePool pool(spec.layers(), params.physical_latent_row(),
+                           /*num_blocks=*/2, spec.attn.page_size);
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const std::vector<int32_t> no_gather;
+    std::vector<vllm::GdnStateCache> gdn_state;
+    vllm::v1::GDNAttentionMetadata gdn_meta{};
+
+    {
+      vllm::v1::CommonAttentionMetadata m;
+      m.num_reqs = 1;
+      m.num_actual_tokens = static_cast<int>(spec.attn.prompt);
+      m.query_start_loc = {0, static_cast<int32_t>(spec.attn.prompt)};
+      m.query_start_loc_cpu = m.query_start_loc;
+      m.seq_lens = {static_cast<int32_t>(spec.attn.prompt)};
+      m.seq_lens_cpu = m.seq_lens;
+      m.max_query_len = static_cast<int>(spec.attn.prompt);
+      m.max_seq_len = static_cast<int>(spec.attn.prompt);
+      m.block_table_num_cols = static_cast<int>(block_table.size());
+      m.block_table_tensor = block_table;
+      for (int64_t t = 0; t < spec.attn.prompt; ++t) {
+        m.slot_mapping.push_back(w4b2::SlotOf(spec.attn, block_table, t));
+      }
+      m.causal = true;
+      const std::vector<int32_t> ids(tokens.begin(),
+                                     tokens.begin() + spec.attn.prompt);
+      const std::vector<int32_t> pos(positions.begin(),
+                                     positions.begin() + spec.attn.prompt);
+      const vllm::ModelForwardInput in{.token_ids = ids,
+                                       .positions = pos,
+                                       .attn_meta = m,
+                                       .gdn_meta = gdn_meta,
+                                       .attn_kv = pool.attn_kv,
+                                       .gdn_state = gdn_state,
+                                       .config = config,
+                                       .queue = queue,
+                                       .logits_indices = no_gather,
+                                       .num_reqs = 1};
+      const vllm::ForwardLogits fl = ModelRegistry::Forward(*model, in);
+      REQUIRE(fl.on_device());
+      REQUIRE(fl.rows == spec.attn.prompt);
+    }
+
+    std::vector<double> out;
+    {
+      vllm::v1::CommonAttentionMetadata m;
+      m.num_reqs = 1;
+      m.num_actual_tokens = 1;
+      m.query_start_loc = {0, 1};
+      m.query_start_loc_cpu = m.query_start_loc;
+      m.seq_lens = {static_cast<int32_t>(spec.attn.prompt + 1)};
+      m.seq_lens_cpu = m.seq_lens;
+      m.max_query_len = 1;
+      m.max_seq_len = static_cast<int>(spec.attn.prompt + 1);
+      m.block_table_num_cols = static_cast<int>(block_table.size());
+      m.block_table_tensor = block_table;
+      m.slot_mapping = {w4b2::SlotOf(spec.attn, block_table, spec.attn.prompt)};
+      m.causal = true;
+      const std::vector<int32_t> ids{tokens.back()};
+      const std::vector<int32_t> pos{positions.back()};
+      const vllm::ModelForwardInput in{.token_ids = ids,
+                                       .positions = pos,
+                                       .attn_meta = m,
+                                       .gdn_meta = gdn_meta,
+                                       .attn_kv = pool.attn_kv,
+                                       .gdn_state = gdn_state,
+                                       .config = config,
+                                       .queue = queue,
+                                       .logits_indices = no_gather,
+                                       .num_reqs = 1};
+      const vllm::ForwardLogits fl = ModelRegistry::Forward(*model, in);
+      REQUIRE(fl.on_device());
+      REQUIRE(fl.rows == 1);
+      REQUIRE(fl.vocab == spec.attn.vocab);
+      const auto* src = static_cast<const float*>(fl.device_tensor.data);
+      out.assign(static_cast<size_t>(fl.vocab), 0.0);
+      for (size_t i = 0; i < out.size(); ++i) out[i] = static_cast<double>(src[i]);
+    }
+    return out;
+  }
+
+  std::vector<double> RefLastRow(const Opts& mo = Opts{},
+                                 std::vector<Decision>* trace = nullptr) const {
+    const std::vector<double> all =
+        RefModel(spec, fdims, sdims, w, tokens, positions, mo, ref::Opts{},
+                 w4b::sref::Opts{}, trace);
+    const int64_t T = static_cast<int64_t>(tokens.size());
+    return std::vector<double>(all.begin() + static_cast<long>((T - 1) * spec.attn.vocab),
+                               all.end());
+  }
+
+  // The reference's INPUT to the MoE block of layer `layer`: the post-attention
+  // RMSNorm output. Captured by walking the SAME reference the gate runs rather
+  // than by a second derivation, so the router probe is driven by the numbers
+  // this model actually presents to its router.
+  std::vector<double> RefMoeInput(int64_t layer) const {
+    std::vector<std::vector<double>> inputs;
+    (void)RefModel(spec, fdims, sdims, w, tokens, positions, Opts{}, ref::Opts{},
+                   w4b::sref::Opts{}, nullptr, &inputs);
+    int64_t which = 0;
+    for (int64_t l = 0; l < spec.layers(); ++l) {
+      if (!spec.is_moe(l)) continue;
+      if (l == layer) return inputs[static_cast<size_t>(which)];
+      ++which;
+    }
+    REQUIRE_MESSAGE(false, "layer " << layer << " is not a MoE layer");
+    return {};
+  }
+
+  // ONE prefill through `ModelRegistry::Forward` on an already-loaded model, so
+  // a case can drive a config whose FORWARD is expected to refuse by name.
+  void RunPrefillOn(vllm::LoadedModel& model, const HfConfig& cfg_in) const {
+    w4a::MlaCachePool pool(spec.layers(), params.physical_latent_row(),
+                           /*num_blocks=*/2, spec.attn.page_size);
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const std::vector<int32_t> no_gather;
+    std::vector<vllm::GdnStateCache> gdn_state;
+    vllm::v1::GDNAttentionMetadata gdn_meta{};
+    vllm::v1::CommonAttentionMetadata m;
+    m.num_reqs = 1;
+    m.num_actual_tokens = static_cast<int>(spec.attn.prompt);
+    m.query_start_loc = {0, static_cast<int32_t>(spec.attn.prompt)};
+    m.query_start_loc_cpu = m.query_start_loc;
+    m.seq_lens = {static_cast<int32_t>(spec.attn.prompt)};
+    m.seq_lens_cpu = m.seq_lens;
+    m.max_query_len = static_cast<int>(spec.attn.prompt);
+    m.max_seq_len = static_cast<int>(spec.attn.prompt);
+    m.block_table_num_cols = static_cast<int>(block_table.size());
+    m.block_table_tensor = block_table;
+    for (int64_t t = 0; t < spec.attn.prompt; ++t) {
+      m.slot_mapping.push_back(w4b2::SlotOf(spec.attn, block_table, t));
+    }
+    m.causal = true;
+    const std::vector<int32_t> ids(tokens.begin(), tokens.begin() + spec.attn.prompt);
+    const std::vector<int32_t> pos(positions.begin(),
+                                   positions.begin() + spec.attn.prompt);
+    const vllm::ModelForwardInput in{.token_ids = ids,
+                                     .positions = pos,
+                                     .attn_meta = m,
+                                     .gdn_meta = gdn_meta,
+                                     .attn_kv = pool.attn_kv,
+                                     .gdn_state = gdn_state,
+                                     .config = cfg_in,
+                                     .queue = queue,
+                                     .logits_indices = no_gather,
+                                     .num_reqs = 1};
+    (void)ModelRegistry::Forward(model, in);
+  }
+};
+
+// The bf16 agreement bound. Chosen for SEPARATION rather than to hug the
+// residue, and the case PRINTS all three ratios from the numbers it just
+// measured so this constant is the only thing written down in advance.
+constexpr double kMoeRel = 6e-2;
+
+// The maximum RELATIVE rounding error of a bf16 store: 8 explicit mantissa
+// bits, so half an ulp is 2^-8. This is the number the decision margin is
+// measured against, scaled by `sigmoid' <= 0.25` and by the fixture's own
+// largest router logit.
+constexpr double kBf16HalfUlp = 3.90625e-3;
+
+}  // namespace w5
+}  // namespace
+
+TEST_CASE(
+    "dots3-note W5: the MoE layer runs THROUGH ModelRegistry::Forward, against "
+    "an independent double reference") {
+  const w5::Bench b;
+  // The fixture states its own shape rather than trusting the comment above it.
+  REQUIRE(b.params.num_hidden_layers == 3);
+  REQUIRE(b.params.first_k_dense_replace == 1);
+  CHECK_FALSE(b.params.is_moe_layer(0));  // DENSE, as the released layer 0 is
+  CHECK(b.params.is_moe_layer(1));        // MoE + SLIDING attention
+  CHECK(b.params.is_moe_layer(2));        // MoE + FULL attention
+  CHECK(b.params.kind_of(1) == vllm::Dots3NoteLayerKind::kSlidingAttention);
+  CHECK(b.params.kind_of(2) == vllm::Dots3NoteLayerKind::kFullAttention);
+  // §4 trap 1, re-asserted rather than inherited: the two group keys are ABSENT
+  // from this config (as they are from the released one) and resolve to 1, so
+  // the group stage is inert and every group-stage mutation is PREDICTED GREEN.
+  CHECK(b.params.n_group == 1);
+  CHECK(b.params.topk_group == 1);
+  CHECK(b.params.n_routed_experts == 8);
+  CHECK(b.params.num_experts_per_tok == 3);
+  CHECK(b.params.n_shared_experts == 1);
+  CHECK(b.params.shared_intermediate_size() == 6);
+  CHECK(b.params.shared_intermediate_size() != b.params.intermediate_size);
+  // W5 lifted the MoE refusal; the config carries no nextn tail here, so
+  // nothing at all is refused.
+  CHECK(vllm::Dots3NoteDeviceRefusal(b.params).empty());
+
+  std::vector<w5::Decision> trace;
+  const std::vector<double> want = b.RefLastRow(w5::Opts{}, &trace);
+  const std::vector<double> got = b.RunPrefillThenDecode();
+  const Diff d = Compare(got, want);
+
+  // ── the DISCRETE half, printed from the numbers just measured ────────────
+  // `trace` is (MoE layer, token) in layer-major order: 2 MoE layers x 7 tokens.
+  REQUIRE(trace.size() == 14u);
+  double min_margin = 1e300;
+  double max_logit = 0.0;
+  double max_tie_gap = 0.0;
+  std::set<int> distinct;
+  for (const w5::Decision& dec : trace) {
+    min_margin = std::min(min_margin, dec.margin);
+    max_logit = std::max(max_logit, dec.max_abs_logit);
+    max_tie_gap = std::max(max_tie_gap, dec.tie_gap);
+    for (int e : dec.selected) distinct.insert(e);
+    CHECK(dec.selected.size() == 3u);
+  }
+  // The bf16 SCORE ulp at THIS fixture's scale: a logit stored bf16 carries at
+  // most `|L| * 2^-8` of error, and `sigmoid' <= 0.25` carries it into the
+  // score the top-k compares. The bar is 4x that, which is the bar W4b-3c
+  // stated and met at 48.8x for the DSA indexer.
+  const double score_ulp = 0.25 * max_logit * w5::kBf16HalfUlp;
+  MESSAGE("W5 decision margin: min " << min_margin << " against a bf16 score ulp of "
+                                     << score_ulp << " (max|logit| " << max_logit
+                                     << ") = " << (min_margin / score_ulp)
+                                     << "x the ulp, bar is 4x");
+  MESSAGE("W5 distinct experts activated across the batch: "
+          << distinct.size() << " of " << b.params.n_routed_experts);
+  MESSAGE("W5 deliberate tie, experts 0 and 1: |biased[0] - biased[1]| max over "
+          "the batch = " << max_tie_gap << " (EXACT zero expected)");
+  CHECK(min_margin > 4.0 * score_ulp);
+  // A fixture in which every token picks the same three experts has not tested
+  // routing. 2 always-selected + at least 2 of the contended tier.
+  CHECK(distinct.size() >= 4u);
+  // THE EXACT TIE, and it is exact rather than close: experts 0 and 1 share a
+  // router row byte for byte and share a bias, so their biased scores are
+  // bit-identical. Both are inside the selected set at every token, so the SET
+  // is unambiguous whatever the tie rule is — which is the only thing upstream's
+  // `torch.topk(..., sorted=False)` promises (grouped_topk_router.py:134 +
+  // :148 — the EXPERT topk, NOT the group topk at :135-137).
+  CHECK(max_tie_gap == 0.0);
+  for (const w5::Decision& dec : trace) {
+    const bool has0 = std::find(dec.selected.begin(), dec.selected.end(), 0) !=
+                      dec.selected.end();
+    const bool has1 = std::find(dec.selected.begin(), dec.selected.end(), 1) !=
+                      dec.selected.end();
+    CHECK(has0);
+    CHECK(has1);
+  }
+
+  // ── the CONTINUOUS half ──────────────────────────────────────────────────
+  MESSAGE("W5 mixed dense+MoE forward: " << d.max_rel << " relative ("
+                                         << (d.max_rel / w5::kMoeRel)
+                                         << "x the bound " << w5::kMoeRel << ")");
+  CHECK(d.max_rel < w5::kMoeRel);
+}
+
+TEST_CASE(
+    "dots3-note W5: every MoE mechanism moves the answer past the bound, and "
+    "the NEAREST one is the bias applied to the routing weight") {
+  const w5::Bench b;
+  const std::vector<double> base = b.RefLastRow(w5::Opts{});
+  const std::vector<double> got = b.RunPrefillThenDecode();
+  const double residue = Compare(got, base).max_rel;
+
+  struct Arm {
+    const char* what;
+    w5::Opts o;
+  };
+  std::vector<Arm> arms;
+  {
+    // THE NEAREST MECHANISM. Upstream is explicit that the correction bias
+    // feeds the SELECTION and not the routing weight ("We use biased scores for
+    // expert selection but original scores for routing weights",
+    // grouped_topk_router.py:120-123 / :148-150). This fixture's selected
+    // experts carry DIFFERENT biases (+1.30, +1.30, 0.0), which is what stops
+    // the renormalisation absorbing the defect.
+    w5::Opts o;
+    o.bias_in_weights = true;
+    arms.push_back({"the bias applied to the routing WEIGHT too", o});
+  }
+  {
+    w5::Opts o;
+    o.bias_in_selection = false;
+    arms.push_back({"the correction bias dropped from the SELECTION", o});
+  }
+  {
+    w5::Opts o;
+    o.renormalize = false;
+    arms.push_back({"norm_topk_prob dropped (:156-157)", o});
+  }
+  {
+    w5::Opts o;
+    o.shared = false;
+    arms.push_back({"the shared expert dropped (model.py:127)", o});
+  }
+  {
+    w5::Opts o;
+    o.softmax_scoring = true;
+    arms.push_back({"softmax scoring instead of sigmoid (:112-117)", o});
+  }
+  {
+    w5::Opts o;
+    o.top_k_delta = 1;
+    arms.push_back({"top_k + 1", o});
+  }
+  {
+    w5::Opts o;
+    o.top_k_delta = -1;
+    arms.push_back({"top_k - 1", o});
+  }
+  {
+    w5::Opts o;
+    o.routed_scale = 1.7;
+    arms.push_back({"a routed_scaling_factor of 1.7 (this config's is 1.0)", o});
+  }
+
+  double nearest = 1e300;
+  const char* nearest_what = "-";
+  for (const Arm& a : arms) {
+    const Diff dd = Compare(got, b.RefLastRow(a.o));
+    MESSAGE("W5 with " << std::string(a.what) << ": " << dd.max_rel << " relative = "
+                       << (dd.max_rel / w5::kMoeRel) << "x the BOUND, "
+                       << (dd.max_rel / residue) << "x the RESIDUE");
+    CHECK(dd.max_rel > w5::kMoeRel);
+    if (dd.max_rel < nearest) {
+      nearest = dd.max_rel;
+      nearest_what = a.what;
+    }
+  }
+  MESSAGE("W5 residue " << residue << ", bound " << w5::kMoeRel
+                        << ", NEAREST mechanism " << nearest << " (" << std::string(nearest_what)
+                        << ")");
+  // The bound sits near the geometric mean of the residue and the nearest
+  // mechanism, which is W4b-2's shape and the reason it is not a hugged
+  // threshold. A mechanism under the residue would be a FIXTURE failure and is
+  // repaired by retuning the fixture, never by widening the bound.
+  CHECK(nearest >= 0.15);
+  CHECK(residue < w5::kMoeRel);
+}
+
+TEST_CASE(
+    "dots3-note W5: the SELECTION is set-equal to the reference's, measured on "
+    "vt::MoeRouterTopK at the fixture's own scale") {
+  // The DEVICE forward does not expose its top-k, so set equality is asserted
+  // on the op the model routes to, driven by the reference's own activations
+  // rounded to bf16 — which is the width the model's router GEMM writes. This
+  // is the DISCRETE assertion the continuous bound above cannot make: at E=256
+  // and a bf16 score ulp near 1/256 the two questions "the same experts,
+  // rounded" and "a different expert" are not distinguishable by a norm.
+  //
+  // WHAT THIS IS AN ORACLE FOR, stated because it matters: `vt::MoeRouterTopK`
+  // is itself gated by `tests/vt/test_ops_moe_router_grouped.cpp`. What THIS
+  // case adds is that dots3-note's own arguments and its own fixture scale
+  // produce the reference's selection, which is a property of the model wiring
+  // rather than of the kernel.
+  const w5::Bench b;
+  const int64_t E = b.params.n_routed_experts;
+  const int64_t K = b.params.num_experts_per_tok;
+  const int64_t T = static_cast<int64_t>(b.tokens.size());
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vllm::dense_attn::Dev d{vt::GetBackend(queue.device.type), queue};
+
+  int64_t checked = 0;
+  for (int64_t l = 0; l < b.spec.layers(); ++l) {
+    if (!b.spec.is_moe(l)) continue;
+    const w5::MoeW& m = b.w.moe[static_cast<size_t>(l)];
+    // The reference's post-attention normed activations for this layer, which
+    // is what the model feeds its router.
+    const std::vector<double> y = b.RefMoeInput(l);
+    std::vector<uint16_t> logits_bf16(static_cast<size_t>(T * E));
+    const std::vector<double> logits =
+        ref::Dense(y, m.router, T, b.spec.attn.hidden, E);
+    for (size_t i = 0; i < logits.size(); ++i) {
+      logits_bf16[i] = vt::F32ToBF16(static_cast<float>(logits[i]));
+    }
+    std::vector<float> bias_f32(static_cast<size_t>(E));
+    for (int64_t e = 0; e < E; ++e) {
+      bias_f32[static_cast<size_t>(e)] =
+          static_cast<float>(m.bias[static_cast<size_t>(e)]);
+    }
+    vllm::dense_attn::DBuf dlog(d, vt::DType::kBF16, {T, E}, logits_bf16.data());
+    vllm::dense_attn::DBuf dbias(d, vt::DType::kF32, {E}, bias_f32.data());
+    vllm::dense_attn::DBuf dtw(d, vt::DType::kF32, {T, K});
+    vllm::dense_attn::DBuf dtid(d, vt::DType::kI32, {T, K});
+    vt::MoeRouterTopKArgs args{};
+    args.top_k = static_cast<int>(K);
+    args.renormalize = b.params.norm_topk_prob;
+    args.scoring_func = vt::MoeScoringFunc::kSigmoid;
+    args.num_expert_group = static_cast<int>(b.params.n_group);
+    args.topk_group = static_cast<int>(b.params.topk_group);
+    args.routed_scaling_factor = static_cast<float>(b.params.routed_scaling_factor);
+    vt::Tensor tw = dtw.t(), tid = dtid.t(), tl = dlog.t(), tb = dbias.t();
+    vt::MoeRouterTopK(queue, tw, tid, tl, args, &tb);
+    std::vector<int32_t> ids(static_cast<size_t>(T * K));
+    std::vector<float> wts(static_cast<size_t>(T * K));
+    dtid.Download(d, ids.data());
+    dtw.Download(d, wts.data());
+
+    // The reference's decision on the SAME logits.
+    std::vector<w5::Decision> ref_dec;
+    (void)w5::RefMoe(b.spec, m, y, T, w5::Opts{}, &ref_dec);
+    REQUIRE(ref_dec.size() == static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) {
+      const w5::Decision& dec = ref_dec[static_cast<size_t>(t)];
+      // A SET, because `torch.topk(..., sorted=False)` leaves the order
+      // unspecified and `vt::MoeCombine` sums over the slots; asserting the
+      // order would pin something upstream does not promise.
+      std::set<int> want(dec.selected.begin(), dec.selected.end());
+      std::set<int> have;
+      for (int64_t j = 0; j < K; ++j) {
+        have.insert(ids[static_cast<size_t>(t * K + j)]);
+      }
+      CHECK_MESSAGE(have == want,
+                    "layer " << l << " token " << t
+                             << ": the op selected a different expert SET than "
+                                "the reference");
+      // The routing weights, matched per EXPERT rather than per slot for the
+      // same reason.
+      for (int64_t j = 0; j < K; ++j) {
+        const int e = ids[static_cast<size_t>(t * K + j)];
+        const auto it = std::find(dec.selected.begin(), dec.selected.end(), e);
+        REQUIRE(it != dec.selected.end());
+        const size_t rj = static_cast<size_t>(it - dec.selected.begin());
+        CHECK(static_cast<double>(wts[static_cast<size_t>(t * K + j)]) ==
+              doctest::Approx(dec.weight[rj]).epsilon(2e-3));
+      }
+      ++checked;
+    }
+  }
+  MESSAGE("W5 selection-set equality checked on " << checked
+                                                  << " (layer, token) decisions");
+  CHECK(checked == 14);
+}
+
+TEST_CASE(
+    "dots3-note W5: the group stage is INERT at n_group=1, and the "
+    "UNGROUPED-ONLY refusal is what covers it") {
+  // PREDICTED GREEN, named in advance and then demonstrated. With `n_group == 1`
+  // the group stage builds one group, `topk_group == 1` keeps it, and the mask
+  // is all-ones — so deleting the whole stage from the reference changes
+  // NOTHING. Every group-stage mutation is therefore a coverage hole by
+  // construction rather than by omission, and the thing that actually stands
+  // between this port and a regrouped router is the parse-time refusal below.
+  const w5::Bench b;
+  w5::Opts no_group;
+  no_group.group_stage = false;
+  const std::vector<double> with = b.RefLastRow(w5::Opts{});
+  const std::vector<double> without = b.RefLastRow(no_group);
+  const Diff dd = Compare(with, without);
+  MESSAGE("W5 group stage deleted from the reference: " << dd.max_abs
+                                                        << " absolute (EXACT zero expected)");
+  CHECK(dd.max_abs == 0.0);
+
+  // THE STANDING COVERAGE, re-asserted here rather than inherited silently: a
+  // config that really did carry a grouped router is refused BY NAME at parse
+  // time (§4 trap 1, configs/dots3_note.py:18-19). Without this the inertness
+  // above would be an untested claim about a path nothing guards.
+  for (const auto& kv : std::vector<std::pair<const char*, int64_t>>{
+           {"n_group", 2}, {"topk_group", 2}}) {
+    nlohmann::json doc = w5::ConfigDoc(w5::Spec{});
+    doc[kv.first] = kv.second;
+    TempConfig cfg(doc);
+    CHECK_THROWS_WITH_AS((void)ParseDots3NoteParams(LoadHfConfig(cfg.path())),
+                         doctest::Contains("UNGROUPED"), std::runtime_error);
+  }
+
+  // PREDICTED GREEN #2: `routed_scaling_factor` is 1.0 on this config and on
+  // the released one, so the multiply is the identity and a mutation that drops
+  // it cannot be seen here. Stated so it is not discovered as a surprise.
+  CHECK(b.params.routed_scaling_factor == 1.0);
+  w5::Opts unit_scale;
+  unit_scale.routed_scale = 1.0;
+  CHECK(Compare(with, b.RefLastRow(unit_scale)).max_abs == 0.0);
+}
+
+TEST_CASE(
+    "dots3-note W5: the SHARED expert's width is moe_intermediate_size * "
+    "n_shared_experts, and the wrong one refuses BY NAME") {
+  // `intermediate_size=_padded_mlp_size(config.moe_intermediate_size *
+  // num_shared_experts, ...)` (model.py:103-107). On the RELEASED checkpoint
+  // that is 1536 while `intermediate_size` is 13824, and the shipped
+  // `mlp.shared_experts.gate_proj.weight` is [1536, 5120] — so a port that
+  // reached for the wrong field builds a 9x-too-wide MLP. This is the case that
+  // makes reaching for it a loud failure rather than a silent read past the end
+  // of a weight.
+  const w5::Bench b;
+  REQUIRE(b.params.moe_intermediate_size == 6);
+  REQUIRE(b.params.intermediate_size == 10);
+  REQUIRE(b.params.shared_intermediate_size() == 6);
+
+  std::vector<w4a::StOut> bad = b.entries;
+  bool patched = false;
+  for (w4a::StOut& e : bad) {
+    if (e.name != "model.layers.1.mlp.shared_experts.gate_proj.weight") continue;
+    // The DENSE layers' width, which is what a port reading `intermediate_size`
+    // would allocate.
+    e.shape = {b.params.intermediate_size, b.params.hidden_size};
+    e.values.assign(static_cast<size_t>(b.params.intermediate_size *
+                                        b.params.hidden_size),
+                    0.125);
+    patched = true;
+  }
+  REQUIRE(patched);
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(b.config);
+  w4a::TempCheckpoint ckpt(bad);
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+  CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, b.config, source),
+                       doctest::Contains("shared_experts"), std::runtime_error);
+}
+
+TEST_CASE(
+    "dots3-note W5: a BLOCKWISE-quantized checkpoint refuses BY NAME, and the "
+    "brick it names is W9") {
+  // `dots-studio/dots3-note-prev-fp8` carries `quantization_config = {"fmt":
+  // "e4m3", "quant_method": "fp8", "activation_scheme": "dynamic",
+  // "weight_block_size": [128, 128]}` and ships a `weight_scale_inv` beside
+  // every projection — at the routed experts' [1536, 5120] that scale is
+  // [12, 40]. `dense_loaders::MaterializeBf16Source` looks up `<name>_scale`
+  // and accepts only a per-tensor or per-output-ROW scale, so WITHOUT this
+  // refusal the load throws a bare "tensor not found" that names neither fp8
+  // nor the brick that owes it.
+  nlohmann::json doc = w5::ConfigDoc(w5::Spec{});
+  doc["quantization_config"] = {{"quant_method", "fp8"},
+                                {"fmt", "e4m3"},
+                                {"activation_scheme", "dynamic"},
+                                {"weight_block_size", {128, 128}}};
+  TempConfig cfg(doc);
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const Dots3NoteParams p = ParseDots3NoteParams(config);
+  CHECK(p.quant_method == "fp8");
+  REQUIRE(p.weight_block_size.size() == 2u);
+  CHECK(p.weight_block_size[0] == 128);
+  CHECK(p.weight_block_size[1] == 128);
+  CHECK(p.has_blockwise_quant());
+  const std::string why = vllm::Dots3NoteDeviceRefusal(p);
+  MESSAGE("W5 blockwise-fp8 refusal: " << why);
+  CHECK(why.find("BLOCKWISE") != std::string::npos);
+  CHECK(why.find("weight_scale_inv") != std::string::npos);
+  CHECK(why.find("W9") != std::string::npos);
+
+  // ...and it fires BEFORE any bf16 loader runs, through the real registry, so
+  // the message a user gets names fp8 rather than a missing tensor.
+  const w5::Bench b;
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(config);
+  w4a::TempCheckpoint ckpt(b.entries);
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(ckpt.file()));
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+  std::unique_ptr<vllm::LoadedModel> model =
+      reg.factory->load_weights(reg, config, source);
+  REQUIRE(model != nullptr);
+  // The load itself succeeds (the accounting is a real production result) and
+  // the FORWARD refuses by name, which is this port's standing shape.
+  CHECK_THROWS_WITH_AS(b.RunPrefillOn(*model, config), doctest::Contains("BLOCKWISE"),
+                       std::runtime_error);
+
+  // The RELEASED bf16 checkpoint carries no `quantization_config` at all, so
+  // nothing about it changed. Asserted rather than assumed, because a refusal
+  // keyed on an absent key that is actually present would turn the released
+  // config away.
+  TempConfig released(FixtureConfigDoc());
+  const Dots3NoteParams rp = ParseDots3NoteParams(LoadHfConfig(released.path()));
+  CHECK_FALSE(rp.has_blockwise_quant());
+  CHECK(rp.quant_method.empty());
+}
+
+TEST_CASE(
+    "dots3-note W5c: the RELEASED config no longer refuses, and the nextn tail "
+    "is a NAMED W10 deferral instead") {
+  // THE HEADLINE. `Dots3NoteDeviceRefusal` over the real released
+  // `config.json` was non-empty at every brick from W1 to W4b-3c — W4b-2's own
+  // case asserts `why.find("MoE") != npos` — and it is empty now. Two branches
+  // went: the MoE layer (W5) and the nextn tail (W5c, #2176).
+  TempConfig cfg(FixtureConfigDoc());
+  const HfConfig config = LoadHfConfig(cfg.path());
+  const Dots3NoteParams p = ParseDots3NoteParams(config);
+  // The released config really does have both features, so the flip is not the
+  // fixture quietly losing them.
+  REQUIRE(p.num_hidden_layers == 46);
+  REQUIRE(p.n_routed_experts == 256);
+  REQUIRE(p.num_experts_per_tok == 8);
+  REQUIRE(p.first_k_dense_replace == 1);
+  REQUIRE(p.is_moe_layer(1));
+  // §4 trap 3: the key is ABSENT and defaults to 1, which is what made the
+  // nextn branch fire on every released checkpoint.
+  REQUIRE_FALSE(FixtureConfigDoc().contains("num_nextn_predict_layers"));
+  REQUIRE(p.num_nextn_predict_layers == 1);
+
+  const std::string why = vllm::Dots3NoteDeviceRefusal(p);
+  MESSAGE("W5 released-config refusal is now: '" << why << "' (empty)");
+  CHECK(why.empty());
+
+  // The nextn tensors are DEFERRED, not silently dropped: the predicate names
+  // exactly the 19 the release ships, and the accounting counts them.
+  CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.layers.46.input_layernorm.weight"));
+  CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.layers.46.eh_proj.weight"));
+  CHECK(vllm::Dots3NoteIsNextnTensor(p, "model.mtp.embed_tokens.weight"));
+  // ...and it claims NOTHING the backbone reads. 46 is the tail; 45 is the last
+  // backbone layer and must not be swept up with it.
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "model.layers.45.input_layernorm.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "model.layers.4.mlp.gate.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "model.embed_tokens.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(p, "vision_encoder.blocks.0.attn.qkv.weight"));
+  // A config with NO nextn tail claims nothing at all, so the predicate cannot
+  // steal a backbone layer from a checkpoint that ships none.
+  Dots3NoteParams none = p;
+  none.num_nextn_predict_layers = 0;
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(none, "model.layers.46.input_layernorm.weight"));
+  CHECK_FALSE(vllm::Dots3NoteIsNextnTensor(none, "model.mtp.embed_tokens.weight"));
+
+  // What is STILL refused, so the flip above is not read as "the model runs".
+  // The blockwise-fp8 arm has its own case; here it is the honest scale.
+  MESSAGE("W5: the released config is REPRESENTABLE, which is not RUNNABLE — "
+          "the MoE is 545.82 GB of a 576.89 GB checkpoint (94.62%), and the "
+          "298.67 GB fp8 sibling is refused by name (W9)");
+}
+
+TEST_CASE("dots3-note W5: the mixed dense+MoE device forward is DETERMINISTIC") {
+  const w5::Bench b;
+  const std::vector<double> a = b.RunPrefillThenDecode();
+  const std::vector<double> c = b.RunPrefillThenDecode();
+  REQUIRE(a.size() == c.size());
+  for (size_t i = 0; i < a.size(); ++i) CHECK(a[i] == c[i]);
+}
+
+

@@ -249,6 +249,38 @@ Dots3NoteParams ParseDots3NoteParams(const HfConfig& config) {
   p.n_group = OptInt(raw, "n_group", 1);
   p.topk_group = OptInt(raw, "topk_group", 1);
 
+  // --- the `quantization_config` block (W5, #699) ---
+  // ABSENT from the released bf16 checkpoint and PRESENT on the `-fp8` sibling
+  // as `{"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+  // "weight_block_size": [128, 128]}`. Upstream reads `weight_block_size` off
+  // the quant config in two places (`_padded_mlp_size`, model.py:63-73, and
+  // `Dots3NoteModel._pad_dense_mlp_weight`, model.py:598-618). We read it to
+  // REFUSE by name in `Dots3NoteDeviceRefusal`, because the blockwise-fp8 arm
+  // is W9 and the bf16 loaders would otherwise fail with a bare tensor miss.
+  // Parsed here rather than at the refusal so a malformed block refuses at the
+  // same place every other malformed key does.
+  if (const nlohmann::json* qc = Field(raw, "quantization_config")) {
+    if (!qc->is_object()) RefuseType("quantization_config", *qc, "an object");
+    if (const nlohmann::json* qm = Field(*qc, "quant_method")) {
+      if (!qm->is_string()) {
+        RefuseType("quantization_config.quant_method", *qm, "a string");
+      }
+      p.quant_method = qm->get<std::string>();
+    }
+    if (const nlohmann::json* wbs = Field(*qc, "weight_block_size")) {
+      if (!wbs->is_array()) {
+        RefuseType("quantization_config.weight_block_size", *wbs,
+                   "an array of integers");
+      }
+      for (const nlohmann::json& e : *wbs) {
+        if (!e.is_number_integer()) {
+          RefuseType("quantization_config.weight_block_size", e, "an integer");
+        }
+        p.weight_block_size.push_back(e.get<int64_t>());
+      }
+    }
+  }
+
   // --- DSA lightning indexer ---
   // All three are plain reads on the dots3 config, and `index_topk` is the one
   // upstream probes with `hasattr` to decide whether the model is V3.2-sparse
@@ -523,6 +555,24 @@ std::vector<Dots3NoteTensor> EnumerateDots3NoteTensors(
                                    /*include_nextn=*/true);
 }
 
+bool Dots3NoteIsNextnTensor(const Dots3NoteParams& p, const std::string& name) {
+  if (p.num_nextn_predict_layers <= 0) return false;
+  // `if name.startswith("mtp."): continue` (model.py:624), which
+  // `Dots3NoteModel._adapt_weights` sees with the outer `model.` prefix already
+  // stripped by the weights loader; on disk the tensor is
+  // `model.mtp.embed_tokens.weight`.
+  if (name.rfind("model.mtp.", 0) == 0) return true;
+  // `get_spec_layer_idx_from_weight_name` (utils.py:542), whose match is
+  // `model.layers.{base + i}.` for `i` in `[0, num_nextn_predict_layers)` with
+  // `base = num_hidden_layers` (:557-560). The loop is written the same way
+  // upstream's is rather than as a numeric range test, so a reader can diff
+  // them by eye.
+  for (int64_t i = 0; i < p.num_nextn_predict_layers; ++i) {
+    if (name.rfind(LayerPrefix(p.num_hidden_layers + i), 0) == 0) return true;
+  }
+  return false;
+}
+
 const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers() {
   // The prefixes are upstream's own, read from the hf_to_vllm_mapper at
   // `nvidia/multimodal.py:70-78` (the two prefixes at `:75-76`):
@@ -581,6 +631,18 @@ Dots3NoteAccounting AccountDots3NoteTensors(
 
   for (const std::string& name : present) {
     if (claimed_names.count(name) != 0) {
+      // The nextn tail is CLAIMED by the enumeration — which is what keeps
+      // `missing` able to refuse a checkpoint that promises a nextn layer and
+      // does not ship it — and is NOT read by the language forward. It gets its
+      // own bucket for the reason the tower buckets exist: folding 19 unloaded
+      // weights into `language` leaves every "100% accounted" assertion green
+      // over a silent drop. vLLM skips exactly these names when it loads the
+      // main model (utils.py:542 -> deepseek_v2.py:1618-1620; model.py:624),
+      // which is why refusing them was stricter than upstream (W5c, #2176).
+      if (Dots3NoteIsNextnTensor(p, name)) {
+        ++acc.nextn;
+        continue;
+      }
       ++acc.language;
       continue;
     }
@@ -644,6 +706,13 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
   for (const Dots3NoteDeferredTower& t : Dots3NoteDeferredTowers()) {
     if (!towers.empty()) towers += ", ";
     towers += std::string(t.prefix) + "* (" + t.brick + ")";
+  }
+  // The nextn tail is the third deferred group and it is named in the same
+  // breath, so a reader of an unaccounted-tensor refusal sees the whole set of
+  // things this port defers rather than only the two with a static prefix
+  // (W5c, #2176).
+  if (w.params.num_nextn_predict_layers > 0) {
+    towers += ", " + LayerPrefix(w.params.num_hidden_layers) + "* and model.mtp.* (W10)";
   }
   VT_CHECK(w.accounting.unaccounted.empty(),
            "dots3-note: no consumer claims " + w.accounting.unaccounted.front() +

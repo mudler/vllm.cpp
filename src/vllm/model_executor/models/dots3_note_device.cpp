@@ -30,8 +30,37 @@
 // `Dots3NotePaddedSparseImpl._logical_cache` (attention.py:700-702), and no
 // `vt` op changed to make it work.
 //
+// ─── W5 ADDED THE MoE, AND THE RELEASED CONFIG STOPS REFUSING ────────────────
+// The 45 MoE layers now run, through `Dots3NoteMoeBlock` over
+// `vllm::RunMoePlaced` — the ungrouped (n_group=1 / topk_group=1) noaux_tc
+// router at 256/8 plus the ONE shared expert at `moe_intermediate_size *
+// n_shared_experts`. No `vt` op changed: `vt::MoeRouterTopK` already took the
+// grouped args, and `vt::MoeCombine`'s optional `shared` term IS upstream's
+// `+ self.shared_experts(x)` (model.py:125-127).
+//
+// W5c removed the NEXTN branch too, and that one was a defect rather than a
+// gap: it was STRICTER than upstream. vLLM drops `model.layers.{N+i}.*` and
+// `model.mtp.*` from the main model (utils.py:542 -> deepseek_v2.py:1618-1620;
+// model.py:624) instead of refusing. They are now a NAMED W10 deferral with
+// their own accounting bucket (#2176).
+//
+// So `Dots3NoteDeviceRefusal` returns "" for the RELEASED
+// `dots-studio/dots3-note-prev` config. **That is not the same as runnable.**
+// The MoE is 545.82 GB of the checkpoint's 576.89 GB (94.62%; the routed
+// experts alone are 543.58 GB / 94.23%), measured over the committed full
+// index, and nothing this project owns holds it. The 298.67 GB fp8 sibling does
+// not fit either, and its arm is refused BY NAME below.
+//
 // ─── WHAT IS STILL REFUSED, AND BY WHICH BRICK ───────────────────────────────
-//   MoE layers                 W5  — the ungrouped noaux_tc router at 256/8
+//   a blockwise-quantized
+//   checkpoint                 W9  — `quantization_config.weight_block_size`,
+//                                    which the `-fp8` sibling carries as
+//                                    [128, 128] with a `weight_scale_inv` per
+//                                    projection. Refused BY NAME, because
+//                                    `dense_loaders::MaterializeBf16Source`
+//                                    reads `<name>_scale` per-tensor or
+//                                    per-output-ROW and would otherwise throw a
+//                                    bare "tensor not found"
 //   seq_len > index_topk AND
 //   the request RESUMES        #1925 — LIFTED at W4b-3c for a SINGLE-SHOT
 //                                    prefill, which is now served with the DSA
@@ -123,13 +152,17 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "vllm/model_executor/layers/linear.h"  // UnquantizedMlpGateUpMethod seam
+#include "vllm/model_executor/moe_placement_seam.h"  // RunMoePlaced -- the MoE seam
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v2.h"  // MlaStep / BuildMlaStep
 #include "vllm/model_executor/models/dense_attn_block.h"
@@ -221,6 +254,26 @@ void RequireShape(const OwnedTensor& t, const std::string& name,
   exp += "]";
   VT_CHECK(false, "dots3-note: `" + name + "` has shape " + got + ", expected " + exp +
                       " — refusing rather than reading a truncated weight");
+}
+
+// The `e_score_correction_bias`, which is the ONE F32 tensor in dots3-note's
+// language tower. Upstream allocates it F32 explicitly
+// (`torch.empty(config.n_routed_experts, dtype=torch.float32)`,
+// deepseek_v2.py:322-324) and the released checkpoint ships it F32, while every
+// other MoE tensor is BF16. A loader that assumed one dtype for the whole
+// checkpoint would read it wrong, which is the `porting.md` memory-format trap
+// in its cheapest form. `vt::MoeRouterTopK` takes the bias as F32.
+OwnedTensor LoadF32Vector(const TensorResolver& get, const std::string& name) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.dtype == "F32",
+           "dots3-note: expected F32 for " + name + " but the checkpoint ships " +
+               t.dtype + " — the noaux_tc correction bias is the one F32 tensor "
+               "in this tower (deepseek_v2.py:322-324)");
+  VT_CHECK(t.shape.size() == 1, "dots3-note: expected a 1-D tensor for " + name);
+  OwnedTensor o = MakeOwned(DType::kF32, t.shape);
+  VT_CHECK(t.nbytes == o.bytes.size(), "dots3-note: byte-size mismatch for " + name);
+  std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  return o;
 }
 
 // The device-resident views the seam consumes for ONE layer. ResidentWeight
@@ -454,6 +507,241 @@ DBuf DenseMlp(Dev d, const Dots3NoteDenseMlp& w, const Tensor& dh, int64_t T,
   return out;
 }
 
+// ─── the MoE block (W5, #699) ───────────────────────────────────────────────
+// Per-layer RESIDENT expert device-pointer arrays for the grouped bf16 MoE
+// GEMM. Uploaded ONCE at first touch and never freed for the process lifetime,
+// the same retire-don't-free contract `qwen3_5.cpp`'s `MoeBf16Resident` relies
+// on for the DEVICE allocations, so nothing they point at can dangle.
+//
+// THE STATE ITSELF IS OWNED BY THE WEIGHTS, NOT BY AN ADDRESS-KEYED TABLE.
+// W5 first shipped this as `static std::map<const Dots3NoteMoeWeights*, ...>`,
+// which is the shape issue #237 removed from `qwen3_5.cpp` (`ce2349dee`,
+// 2026-08-10) precisely because it corrupts output across two engines in one
+// process: `ready` is inherited from a destroyed engine whose device pointers
+// now belong to whatever the new engine allocated there, and since the buffers
+// are never freed there is no crash to notice. `deepseek_v2.cpp`'s `MoePtrs`
+// still carries the pre-#237 shape (`04f5c01e7`, 2026-07-22) — that is unswept
+// debt on a SACRED path, tracked separately, and it is not a precedent.
+//
+// `ResidentIn` below is the qwen3_5.cpp accessor, which is file-local `static`
+// there and so cannot be called from here; laguna.cpp:497 spells the same
+// three lines out for the same reason. What matters is the PROPERTY, and it is
+// identical: the state is keyed on the slot the weights own.
+struct Dots3NoteMoePtrs {
+  void* gate = nullptr;
+  void* up = nullptr;
+  void* down = nullptr;
+  std::map<int64_t, void*> tok_map;  // T -> [T*top_k] i32 pair->token row map
+  bool ready = false;
+};
+Dots3NoteMoePtrs& Dots3NoteMoePtrsFor(const Dots3NoteMoeWeights* w) {
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!w->resident_moe.state) {
+    w->resident_moe.state = std::make_shared<Dots3NoteMoePtrs>();
+  }
+  return *static_cast<Dots3NoteMoePtrs*>(w->resident_moe.state.get());
+}
+
+// Is the grouped bf16 GEMM arm available for this layer's weights?
+// `vt::MoeGroupedGemmBf16` is registered for CUDA only, so on CPU this is
+// false and the reference arm below runs instead. THIS IS THE ONE THING THE
+// CPU GATE CANNOT SEE, which is why W5 owes a device run (spec §4.10).
+bool Dots3NoteGroupedMoeEligible(Dev d, const Dots3NoteMoeWeights& w) {
+  if (!vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16, d.q.device.type)) return false;
+  if (w.expert_gate.empty()) return false;
+  // vt::MoeGroupedGemmBf16 reads the [K,N] Matmul-B orientation only.
+  for (const OwnedTensor* t : {&w.expert_gate[0], &w.expert_up[0], &w.expert_down[0]})
+    if (t->nk) return false;
+  return true;
+}
+
+// `Dots3NoteMoE.forward` (model.py:115-132) over `DeepseekV2MoE.forward`
+// (deepseek_v2.py:406-429) and `grouped_topk` (grouped_topk_router.py:80-161),
+// all @ `bc2d63e650`.
+//
+// WHY THIS IS NOT `deepseek_v2.cpp`'s `MoeBlock` HOISTED. The MoE placement
+// seam (`include/vllm/model_executor/moe_placement_seam.h`) says in its own
+// prose that every architecture writes its own block with this shape and routes
+// it through `RunMoePlaced`; that IS the seam. Hoisting DeepSeek's would mean
+// templating or a shared weights interface — an edit landing on the SACRED
+// DeepSeek-V2 path (8/8 token-exact on V2-Lite) to serve a model with no oracle
+// at all. Recorded in spec §4.10 so the next MoE model does not re-litigate it.
+//
+// UPSTREAM'S FOUR DELTAS OVER `DeepseekV2MoE`, and why three cost nothing here:
+//   1. the shared expert is lifted OUT of the base (model.py:87-99 sets
+//      `n_shared_experts` to None on the routed config, so
+//      deepseek_v2.py:354-355 leaves `self.shared_experts = None`) and added
+//      UNFUSED at model.py:125-127. Numerically the same function the base
+//      computes when it owns it, which is exactly `vt::MoeCombine`'s optional
+//      `shared` term.
+//   2. `_padded_mlp_size` (model.py:63-73) — the IDENTITY at TP=1 with no
+//      `weight_block_size`, and the blockwise case is refused by name in
+//      `Dots3NoteDeviceRefusal`. Deliberately NOT ported.
+//   3. `reduce_results=False` + `tensor_model_parallel_all_reduce`
+//      (model.py:100, :130-131) — TP-only, the identity at TP=1.
+//   4. the sequence-parallel path — DEAD. `Dots3NoteDecoderLayer.__init__` sets
+//      `self.use_sequence_parallel_moe = False` unconditionally (model.py:540),
+//      which is vllm#52172.
+//
+// AND ONE NON-DELTA WORTH NAMING. `deepseek_v2.cpp` records a deviation (a):
+// it applies `routed_scaling_factor` to the routing WEIGHTS while vLLM's CUDA
+// path applies it to the combined routed OUTPUT. That deviation does NOT exist
+// here. `Dots3NoteDecoderLayer` builds the block with
+// `apply_routed_scale_to_output=False` (model.py:527), so upstream puts the
+// factor inside `grouped_topk` (grouped_topk_router.py:159-160) — which is
+// `MoeRouterTopKArgs::routed_scaling_factor`, the same place we put it.
+DBuf Dots3NoteMoeBlock(Dev d, const Dots3NoteMoeWeights& w,
+                       const Dots3NoteParams& p, const Tensor& dh, int64_t T) {
+  const int64_t H = p.hidden_size;
+  const int64_t E = p.n_routed_experts;
+  const int64_t top_k = p.num_experts_per_tok;
+  const int64_t I = p.moe_intermediate_size;
+  const int64_t P = T * top_k;
+
+  // --- router -------------------------------------------------------------
+  // BF16, and that is upstream's dtype rather than ours:
+  // `_get_moe_router_dtype` (deepseek_v2.py:131-141) returns fp32 only for
+  // `model_type == "glm_moe_dsa"` or an explicit `moe_router_dtype:
+  // "float32"`, so `GateLinear.out_dtype` is None here and the GEMM runs at the
+  // model dtype. Widening it would be silent to every gate this row can build.
+  Tensor drg = ResidentWeight(d, w.router_gate);  // [H,E] Matmul-B
+  DBuf dlog(d, DType::kBF16, {T, E});
+  vt::Matmul(d.q, dlog.t(), dh, drg);
+
+  vt::MoeRouterTopKArgs args{};
+  args.top_k = static_cast<int>(top_k);
+  args.renormalize = p.norm_topk_prob;
+  // `ParseDots3NoteParams` already refuses anything but "sigmoid"
+  // (`scoring_func`) and "noaux_tc" (`topk_method`) for this architecture, so
+  // the mapping is total rather than defaulted.
+  args.scoring_func = vt::MoeScoringFunc::kSigmoid;
+  // ★ §4 TRAP 1. UNGROUPED: `Dots3NoteConfig.__init__` sets both to 1
+  // (configs/dots3_note.py:18-19) and `ParseDots3NoteParams` refuses anything
+  // else BY NAME. With n_group == 1 the group mask is all-ones and the group
+  // stage is definitionally inert — but passing 0 here would NOT be inert: 0
+  // selects `vt::MoeRouterTopK`'s pre-W3 ungrouped SOFTMAX path verbatim, which
+  // ignores both `scoring_func` and the correction bias.
+  args.num_expert_group = static_cast<int>(p.n_group);
+  args.topk_group = static_cast<int>(p.topk_group);
+  // `apply_routed_scale_to_output=False` (model.py:527) puts the factor inside
+  // `grouped_topk` (grouped_topk_router.py:159-160), which is here. 1.0 on the
+  // released config.
+  args.routed_scaling_factor = static_cast<float>(p.routed_scaling_factor);
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  // The noaux_tc correction bias is added to the scores used for SELECTION and
+  // NOT to the ones used for the routing WEIGHTS — upstream says so in a
+  // comment at grouped_topk_router.py:121-123 ("We use biased scores for expert
+  // selection but original scores for routing weights"). Applying it to both is
+  // the single most likely port defect on this block, and W5's gate is tuned
+  // against exactly that mechanism.
+  Tensor bias = ResidentWeight(d, w.e_score_correction_bias, {E});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(), args, &bias);
+
+  // --- routed experts -------------------------------------------------------
+  DBuf expert_out(d, DType::kBF16, {T, top_k, H});
+  if (Dots3NoteGroupedMoeEligible(d, w)) {
+    Dots3NoteMoePtrs& mr = Dots3NoteMoePtrsFor(&w);
+    if (!mr.ready) {
+      std::vector<int64_t> gp(static_cast<size_t>(E)), up(static_cast<size_t>(E)),
+          dp(static_cast<size_t>(E));
+      for (int64_t e = 0; e < E; ++e) {
+        const size_t se = static_cast<size_t>(e);
+        gp[se] = reinterpret_cast<int64_t>(ResidentWeight(d, w.expert_gate[se]).data);
+        up[se] = reinterpret_cast<int64_t>(ResidentWeight(d, w.expert_up[se]).data);
+        dp[se] = reinterpret_cast<int64_t>(ResidentWeight(d, w.expert_down[se]).data);
+      }
+      const size_t eb = static_cast<size_t>(E) * sizeof(int64_t);
+      auto upload = [&](const std::vector<int64_t>& h) {
+        void* q = d.b.Alloc(eb);
+        d.b.Copy(d.q, q, h.data(), eb);
+        return q;
+      };
+      mr.gate = upload(gp);
+      mr.up = upload(up);
+      mr.down = upload(dp);
+      mr.ready = true;
+    }
+    auto tok_it = mr.tok_map.find(T);
+    if (tok_it == mr.tok_map.end()) {
+      std::vector<int32_t> tok_map(static_cast<size_t>(P));
+      for (int64_t i = 0; i < P; ++i)
+        tok_map[static_cast<size_t>(i)] = static_cast<int32_t>(i / top_k);
+      const size_t tb = static_cast<size_t>(P) * sizeof(int32_t);
+      void* q = d.b.Alloc(tb);
+      d.b.Copy(d.q, q, tok_map.data(), tb);
+      tok_it = mr.tok_map.emplace(T, q).first;
+    }
+    Tensor eids = Reshape(dtid.t(), {P});
+    Tensor gate_ptrs = MakeTensor(mr.gate, DType::kI64, d.q.device, {E});
+    Tensor up_ptrs = MakeTensor(mr.up, DType::kI64, d.q.device, {E});
+    Tensor down_ptrs = MakeTensor(mr.down, DType::kI64, d.q.device, {E});
+    Tensor dtok = MakeTensor(tok_it->second, DType::kI32, d.q.device, {P});
+    DBuf dact(d, DType::kBF16, {P, I});
+    vt::MoeGroupedGemmBf16GateUpSilu(d.q, dact.t(), dh, eids, &dtok, gate_ptrs, up_ptrs);
+    Tensor eo = Reshape(expert_out.t(), {P, H});
+    vt::MoeGroupedGemmBf16(d.q, eo, dact.t(), eids, nullptr, down_ptrs);
+  } else {
+    // REFERENCE path (CPU, and any non-Matmul-B expert layout): download the
+    // routing decision, gather each activated expert's token rows, run its
+    // SwiGLU MLP, scatter back. Same numerics per (token, slot) as the grouped
+    // path modulo GEMM accumulation order.
+    std::vector<int32_t> ids(static_cast<size_t>(P));
+    dtid.Download(d, ids.data());
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> lists(static_cast<size_t>(E));
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t j = 0; j < top_k; ++j)
+        lists[static_cast<size_t>(ids[static_cast<size_t>(t * top_k + j)])]
+            .push_back({t, j});
+    expert_out.Zero(d);
+    const size_t row_bytes = static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
+    for (int64_t e = 0; e < E; ++e) {
+      const auto& list = lists[static_cast<size_t>(e)];
+      if (list.empty()) continue;
+      const int64_t n = static_cast<int64_t>(list.size());
+      DBuf xg(d, DType::kBF16, {n, H});
+      for (int64_t r = 0; r < n; ++r) {
+        d.b.Copy(d.q, static_cast<char*>(xg.ptr()) + static_cast<size_t>(r) * row_bytes,
+                 static_cast<const char*>(dh.data) +
+                     static_cast<size_t>(list[static_cast<size_t>(r)].first) * row_bytes,
+                 row_bytes);
+      }
+      DBuf g(d, DType::kBF16, {n, I}), u(d, DType::kBF16, {n, I});
+      vt::Matmul(d.q, g.t(), xg.t(),
+                 ResidentWeight(d, w.expert_gate[static_cast<size_t>(e)]));
+      vt::Matmul(d.q, u.t(), xg.t(),
+                 ResidentWeight(d, w.expert_up[static_cast<size_t>(e)]));
+      DBuf a(d, DType::kBF16, {n, I});
+      vt::MoeSiluMul(d.q, a.t(), g.t(), u.t());
+      DBuf o(d, DType::kBF16, {n, H});
+      vt::Matmul(d.q, o.t(), a.t(),
+                 ResidentWeight(d, w.expert_down[static_cast<size_t>(e)]));
+      for (int64_t r = 0; r < n; ++r) {
+        const auto& tj = list[static_cast<size_t>(r)];
+        d.b.Copy(d.q,
+                 static_cast<char*>(expert_out.ptr()) +
+                     static_cast<size_t>(tj.first * top_k + tj.second) * row_bytes,
+                 static_cast<const char*>(o.ptr()) + static_cast<size_t>(r) * row_bytes,
+                 row_bytes);
+      }
+    }
+  }
+
+  // --- shared expert + weighted combine -------------------------------------
+  // `output = super().forward(...) + self.shared_experts(hidden_states)`
+  // (model.py:125-127). A PLAIN MLP whose output is ADDED — no sigmoid gate,
+  // unlike Qwen3.6's shared expert — which is exactly `vt::MoeCombine`'s
+  // optional `shared` term. `Dots3NoteMoE.forward` asserts the shared expert
+  // exists (`assert self.shared_experts is not None`, model.py:124) and
+  // `MaterializeDots3NoteDevice` refuses a MoE layer without one, so this is
+  // unconditional rather than guarded.
+  DBuf shared = DenseMlp(d, w.shared, dh, T, H, p.shared_intermediate_size());
+  DBuf out(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, out.t(), expert_out.t(), dtw.t(), &shared.t());
+  return out;
+}
+
 void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>& idx,
                 int64_t row_elems) {
   const size_t rb = static_cast<size_t>(row_elems) * vt::SizeOf(src.dtype);
@@ -543,13 +831,43 @@ int64_t Dots3NoteDenseEquivalentMaxSeqLen(const Dots3NoteParams& params) {
 }
 
 std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
-  for (size_t l = 0; l < p.layer_types.size(); ++l) {
-    if (p.is_moe_layer(static_cast<int64_t>(l))) {
-      return "layer " + std::to_string(l) +
-             " is a MoE layer — the ungrouped noaux_tc router at " +
-             std::to_string(p.n_routed_experts) + "/" +
-             std::to_string(p.num_experts_per_tok) + " plus the shared expert is W5";
+  // ─── the BLOCKWISE-FP8 arm, refused BY NAME (W5, #699) ───────────────────
+  // NEW at W5, and it is FIRST because it is a property of the whole tower
+  // rather than of one layer: `dots-studio/dots3-note-prev-fp8` carries
+  // `quantization_config.weight_block_size = [128, 128]` and ships a
+  // `weight_scale_inv` beside every projection — at the routed experts'
+  // [1536, 5120] that scale is [12, 40].
+  //
+  // WITHOUT this branch the failure is a bare miss with no name in it.
+  // `dense_loaders::MaterializeBf16Source` looks up `<name>_scale`, not
+  // `weight_scale_inv`, and accepts only `n_scale == 1 || n_scale == rows`
+  // (dense_weight_loaders.h), so the load would throw
+  // "tensor not found: ...weight_scale" and name neither fp8 nor the brick
+  // that owes it. AGENTS.md requires an unimplemented arm to refuse naming the
+  // missing part.
+  //
+  // Keying it on the CONFIG rather than on a tensor lookup is also what keeps
+  // the per-ROW case safe. A republish that shipped a per-output-row `_scale`
+  // instead of a blockwise `weight_scale_inv` would be SILENTLY dequantized by
+  // that same helper and run as a bf16 GEMM on an fp8 checkpoint — plausible
+  // output from an arm nobody ported, which this row has no token gate to
+  // catch (spec §6.4).
+  if (p.has_blockwise_quant()) {
+    std::string block = "[";
+    for (size_t i = 0; i < p.weight_block_size.size(); ++i) {
+      block += (i ? ", " : "") + std::to_string(p.weight_block_size[i]);
     }
+    block += "]";
+    return "the checkpoint is BLOCKWISE-quantized — `quantization_config` says "
+           "quant_method='" +
+           (p.quant_method.empty() ? std::string("(unset)") : p.quant_method) +
+           "' with weight_block_size " + block +
+           ", so every projection ships a `weight_scale_inv` of one scale per "
+           + block +
+           " block and NOT the per-tensor or per-output-row `_scale` this "
+           "port's bf16 loaders read. The blockwise-FP8 arm, including the "
+           "DeepGEMM e8m0 activation scales upstream's MoE routes through, is "
+           "W9";
   }
   // ─── LIFTED at W4b-2 (#699): the sliding layer and the PADDED row ─────────
   // W4a refused both here. Both now run.
@@ -570,14 +888,32 @@ std::string Dots3NoteDeviceRefusal(const Dots3NoteParams& p) {
   //
   // WHAT STILL REFUSES here is only what has no upstream form to mirror yet.
 
-  // The nextn tail. `Dots3NoteMTPModel` is deliberately not registered and the
-  // backbone forward has no place to put an extra block, so a checkpoint that
-  // ships one is refused rather than silently having it enumerated, loaded and
-  // never run.
-  if (p.num_nextn_predict_layers > 0) {
-    return "the checkpoint ships " + std::to_string(p.num_nextn_predict_layers) +
-           " nextn layer(s) — `Dots3NoteMTPModel` over the speculator seam is W10";
-  }
+  // ─── LIFTED at W5 (#699): the MoE layer ───────────────────────────────────
+  // `Dots3NoteMoeBlock` runs it, through `vllm::RunMoePlaced`, over the same
+  // `vt::MoeRouterTopK` / `vt::MoeSiluMul` / `vt::MoeCombine` ops the DeepSeek
+  // path uses, at n_group=1 / topk_group=1. No `vt` op changed.
+  //
+  // ─── LIFTED at W5c (#2176): the nextn tail ────────────────────────────────
+  // This branch was STRICTER THAN UPSTREAM and that is why it is gone rather
+  // than merely satisfied. vLLM does not refuse a checkpoint that ships nextn
+  // weights; it DROPS them from the main model —
+  // `get_spec_layer_idx_from_weight_name` (utils.py:542, matching
+  // `model.layers.{base+i}.` at :559) consulted at deepseek_v2.py:1618-1620
+  // `if spec_layer is not None: continue  # skip spec decode layers for main
+  // model`, and `if name.startswith("mtp."): continue` at model.py:624 inside
+  // `Dots3NoteModel._adapt_weights`. `Dots3NoteLanguageModelForCausalLM`
+  // (model.py:681) subclasses `DeepseekV32ForCausalLM`, so the second of those
+  // is the load path this architecture runs. All three re-derived at
+  // `bc2d63e650`.
+  //
+  // The tensors are not silently dropped here either: they stay ENUMERATED by
+  // `EnumerateDots3NoteTensors` (so an absent one still refuses) and
+  // `AccountDots3NoteTensors` counts them into their own `nextn` bucket, which
+  // is the deferral shape `vision_encoder.*` and `audio_encoder.*` already use.
+  // `Dots3NoteMTPModel` over the speculator seam is still W10.
+  //
+  // WHAT THAT LEAVES: nothing. This function now returns "" for the RELEASED
+  // `dots-studio/dots3-note-prev` config, which is what W5 is for.
   return "";
 }
 
@@ -700,11 +1036,83 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
     }
     AbsorbInto(lw.attn, d);
 
-    lw.mlp.gate_up_proj = LoadMergedBf16RawNK(
-        get, {pre + "mlp.gate_proj.weight", pre + "mlp.up_proj.weight"});
-    RequireShape(lw.mlp.gate_up_proj, pre + "mlp.{gate_proj,up_proj}.weight", {2 * I, H});
-    lw.mlp.down_proj = LoadMergedBf16RawNK(get, {pre + "mlp.down_proj.weight"});
-    RequireShape(lw.mlp.down_proj, pre + "mlp.down_proj.weight", {H, I});
+    // WHICH MLP, and it is structural rather than a preference: on a MoE layer
+    // `mlp.gate_proj.weight` DOES NOT EXIST on disk. `is_moe` is
+    // `layer_idx < num_hidden_layers and n_routed_experts is not None and
+    // layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0`
+    // (model.py:514-519), which is `Dots3NoteParams::is_moe_layer`. Before W5
+    // this loop loaded the dense tensors unconditionally, which is why the
+    // released checkpoint could not be materialized at all.
+    lw.is_moe = p.is_moe_layer(l);
+    if (!lw.is_moe) {
+      lw.mlp.gate_up_proj = LoadMergedBf16RawNK(
+          get, {pre + "mlp.gate_proj.weight", pre + "mlp.up_proj.weight"});
+      RequireShape(lw.mlp.gate_up_proj, pre + "mlp.{gate_proj,up_proj}.weight",
+                   {2 * I, H});
+      lw.mlp.down_proj = LoadMergedBf16RawNK(get, {pre + "mlp.down_proj.weight"});
+      RequireShape(lw.mlp.down_proj, pre + "mlp.down_proj.weight", {H, I});
+      continue;
+    }
+
+    // ─── the MoE layer (W5, #699) ─────────────────────────────────────────
+    // `Dots3NoteMoE` (model.py:76) over `DeepseekV2MoE`'s gate + FusedMoE
+    // (deepseek_v2.py:316-395). EVERY shape is checked BY NAME: this model has
+    // no oracle on any hardware this project owns (spec §6.4), so a silently
+    // transposed or truncated weight renders plausible text and nothing
+    // downstream can see it.
+    const int64_t E = p.n_routed_experts;
+    const int64_t MI = p.moe_intermediate_size;
+    // `router_logits, _ = self.gate(hidden_states)` — a plain `GateLinear`
+    // at the MODEL dtype, because `_get_moe_router_dtype` (deepseek_v2.py:131)
+    // returns fp32 only for `glm_moe_dsa` or an explicit
+    // `moe_router_dtype: "float32"`, and dots3-note is neither. So the router
+    // GEMM is BF16 here exactly as it is upstream; an f32 router would be the
+    // too-wide dtype `porting.md` says a token gate cannot see.
+    lw.moe.router_gate = LoadBf16Transposed(get, pre + "mlp.gate.weight");
+    RequireShape(lw.moe.router_gate, pre + "mlp.gate.weight (transposed)", {H, E});
+    lw.moe.e_score_correction_bias =
+        LoadF32Vector(get, pre + "mlp.gate.e_score_correction_bias");
+    RequireShape(lw.moe.e_score_correction_bias,
+                 pre + "mlp.gate.e_score_correction_bias", {E});
+    lw.moe.expert_gate.reserve(static_cast<size_t>(E));
+    lw.moe.expert_up.reserve(static_cast<size_t>(E));
+    lw.moe.expert_down.reserve(static_cast<size_t>(E));
+    for (int64_t e = 0; e < E; ++e) {
+      const std::string ex = pre + "mlp.experts." + std::to_string(e) + ".";
+      lw.moe.expert_gate.push_back(LoadBf16Transposed(get, ex + "gate_proj.weight"));
+      RequireShape(lw.moe.expert_gate.back(), ex + "gate_proj.weight (transposed)",
+                   {H, MI});
+      lw.moe.expert_up.push_back(LoadBf16Transposed(get, ex + "up_proj.weight"));
+      RequireShape(lw.moe.expert_up.back(), ex + "up_proj.weight (transposed)",
+                   {H, MI});
+      lw.moe.expert_down.push_back(LoadBf16Transposed(get, ex + "down_proj.weight"));
+      RequireShape(lw.moe.expert_down.back(), ex + "down_proj.weight (transposed)",
+                   {MI, H});
+    }
+    // THE SHARED EXPERT'S WIDTH IS ASSERTED BY NAME, and this is the one shape
+    // on this layer a port is most likely to get wrong.
+    // `intermediate_size=_padded_mlp_size(config.moe_intermediate_size *
+    // num_shared_experts, ...)` (model.py:103-107) — 1536 on the released
+    // checkpoint, against the DENSE layers' `intermediate_size` of 13824. The
+    // released index agrees: `mlp.shared_experts.gate_proj.weight` is
+    // [1536, 5120]. A port that reached for `intermediate_size` here would
+    // build a 9x-too-wide MLP, and this refuses it rather than reading past the
+    // end of a weight. `_padded_mlp_size` itself is the IDENTITY at TP=1 with
+    // no `weight_block_size` (model.py:69-70), and the blockwise case is
+    // refused above, so it is deliberately not ported.
+    const int64_t SI = p.shared_intermediate_size();
+    VT_CHECK(p.n_shared_experts > 0,
+             "dots3-note: a MoE layer with n_shared_experts=" +
+                 std::to_string(p.n_shared_experts) +
+                 " has no shared expert, but `Dots3NoteMoE.forward` asserts one "
+                 "(`assert self.shared_experts is not None`, model.py:124)");
+    const std::string sh = pre + "mlp.shared_experts.";
+    lw.moe.shared.gate_up_proj = LoadMergedBf16RawNK(
+        get, {sh + "gate_proj.weight", sh + "up_proj.weight"});
+    RequireShape(lw.moe.shared.gate_up_proj, sh + "{gate_proj,up_proj}.weight",
+                 {2 * SI, H});
+    lw.moe.shared.down_proj = LoadMergedBf16RawNK(get, {sh + "down_proj.weight"});
+    RequireShape(lw.moe.shared.down_proj, sh + "down_proj.weight", {H, SI});
   }
   w.present = true;
   return w;
@@ -727,9 +1135,9 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
   VT_CHECK(why.empty(),
            "Dots3NoteForCausalLM forward: not ported — " + why +
                ". W4a/W4b-2 cover BOTH attention geometries — full and "
-               "sliding-window — with a dense MLP; the MoE is W5, the "
-               "vision/audio towers are W6/W7, the nextn tail is W10. See "
-               ".agents/specs/dots3-note.md and issue #699.");
+               "sliding-window — and W5 covers the MoE layer; the vision/audio "
+               "towers are W6/W7, the nextn tail is W10 and the blockwise-FP8 "
+               "arm is W9. See .agents/specs/dots3-note.md and issue #699.");
   VT_CHECK(weights.materialized && weights.device.present,
            "Dots3NoteForCausalLM forward: the language tower was not "
            "materialized — the loader only materializes a config the device "
@@ -969,7 +1377,17 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
       vt::RmsNorm(d.q, dh2_t, attn_ro, w_post, vt::RmsNormArgs{eps, false}, &res_t);
     }
 
-    DBuf mlp = DenseMlp(d, lw.mlp, dh2.t(), T, H, p.intermediate_size);
+    // `self.mlp` is `Dots3NoteMoE` on a MoE layer and `DeepseekV2MLP` otherwise
+    // (model.py:514-534). The MoE arm goes through `vllm::RunMoePlaced`, which
+    // is the ONE seam every architecture's routed-expert compute routes through
+    // — inert by construction when no placement plan is configured, which is
+    // every load that configured none.
+    DBuf mlp = lw.is_moe
+                   ? vllm::RunMoePlaced(d, l, dh2.t(), T, H,
+                                        [&](Dev pd, const Tensor& h) {
+                                          return Dots3NoteMoeBlock(pd, lw.moe, p, h, T);
+                                        })
+                   : DenseMlp(d, lw.mlp, dh2.t(), T, H, p.intermediate_size);
     auto* held = new DBuf(std::move(mlp));
     hidden = held->t();
     hidden_hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });

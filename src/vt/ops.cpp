@@ -326,7 +326,13 @@ void ConcatMlaNopeRope(Queue& q, Tensor& out, const Tensor& nope, const Tensor& 
            "(the single shared k_pe head, broadcast — mla_attention.py:2063-2092)");
   VT_CHECK(out.shape[2] == dn + dr,
            "concat_mla_nope_rope: out last dim must be nope_dim + rope_dim");
-  VT_CHECK(dn > 0 && dr > 0, "concat_mla_nope_rope: both parts must be non-empty");
+  // The NoPE case (GLM-5.3-Flash, W3, #2213): `qk_rope_head_dim == 0` means the
+  // decoupled-rope slice does not exist, so the "concat" is the nope part alone.
+  // Both kernels already do exactly that — their rope loop runs zero times — so
+  // this is the wrapper admitting a shape the implementations always handled.
+  // `dn == 0` stays refused: a concat with no nope part has no upstream form.
+  VT_CHECK(dn > 0, "concat_mla_nope_rope: the nope part must be non-empty");
+  VT_CHECK(dr >= 0, "concat_mla_nope_rope: the rope width must be >= 0");
   VT_CHECK(out.dtype == nope.dtype && out.dtype == rope.dtype,
            "concat_mla_nope_rope: all tensors must share one dtype");
   VT_CHECK(IsOutFloat(out.dtype) || out.dtype == DType::kF16,
@@ -3867,8 +3873,14 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
   VT_CHECK(kv_cache.shape[2] == kv_lora_rank + pe_dim,
            "concat_and_cache_mla: kv_cache entry width must equal "
            "kv_lora_rank + qk_rope_head_dim");
-  VT_CHECK(kv_lora_rank > 0 && pe_dim > 0,
-           "concat_and_cache_mla: kv_lora_rank and qk_rope_head_dim must be > 0");
+  // `pe_dim == 0` is the NoPE cache row (GLM-5.3-Flash, W3, #2213): the entry IS
+  // the latent, `kv_cache.shape[2] == kv_lora_rank`, and both kernels' second
+  // copy loop runs zero times. `kv_lora_rank == 0` stays refused — an MLA cache
+  // with no latent is not a geometry.
+  VT_CHECK(kv_lora_rank > 0, "concat_and_cache_mla: kv_lora_rank must be > 0");
+  VT_CHECK(pe_dim >= 0,
+           "concat_and_cache_mla: qk_rope_head_dim must be >= 0 (0 is the NoPE "
+           "cache row, whose entry width is kv_lora_rank exactly)");
   // Upstream uses slot_mapping.size(0) as the token count (`:855-863`): kv_c/k_pe
   // may carry extra trailing rows (CUDA-graph padding) that are ignored.
   VT_CHECK(kv_c.shape[0] >= slot_mapping.shape[0],

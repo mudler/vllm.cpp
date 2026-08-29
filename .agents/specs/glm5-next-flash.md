@@ -1230,18 +1230,85 @@ config read — worth knowing before #2177 is gated against the real artifact.
 **Rebase note (RESOLVED):** the KV grouping overlapped PR #1977, which MERGED
 on 2026-08-27, so this built on current `main`.
 
-### W5b — the decoder layer, the DSA attention block, and the assembled forward (GPU, large)
+### W5b — the decoder layer, the DSA attention block, and the assembled forward — SPLIT, see the two sections below
 
-Split out of W5 above. The per-layer control flow (KDA vs DSA, dense vs sparse,
-mHC stream threading), the `Glm5NextTextAttention` block the DSA arm needs, and
-`Glm5NextTextModel::Forward`. **Anchors:** `modeling_glm5_next.py:1064-1257`
-(`Glm5NextTextAttention`, `expand_kv`, `build_attention_mask_from_topk`),
-`:1259-1331` (`Glm5NextTextDecoderLayer`), `:1409-1494`
-(`Glm5NextTextModel.forward`). The manifold is threaded from the embedding as
+This was W5's PLAN for W5b, kept so the two readings do not look like a
+contradiction. It scoped the per-layer control flow, the attention block and
+`Glm5NextTextModel::Forward` as one wave. **Anchors:**
+`modeling_glm5_next.py:1064-1257` (`Glm5NextTextAttention`, `expand_kv`,
+`build_attention_mask_from_topk`), `:1259-1331`
+(`Glm5NextTextDecoderLayer`), `:1409-1494` (`Glm5NextTextModel.forward`). The
+manifold is threaded from the embedding as
 `inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1)` (`:1477`) and collapsed
 by the UNWEIGHTED `hc_head` before the final norm (`:1493`), so the whole stack
-carries `[T, hc_mult, hidden]` and not `[T, hidden]`. Owns discharging O15, O16,
-O17 and O23 at the moment the layer calls the four primitives.
+carries `[T, hc_mult, hidden]` and not `[T, hidden]`.
+
+**It splits, and the split is not a size decision.** The attention block and the
+`OwnedTensor` bridge answer to `transformers` v5.16.1 and to the llama.cpp
+#27752 container, and both can be gated with no cache and no decoder layer over
+them. The decoder layer, the mHC threading and the forward answer additionally
+to `MakeGlm5NextKVCache` and to the `[T, hc_mult, hidden]` manifold, and they are
+where reachability lands. Landing them together would produce one diff whose
+correctness argument runs through two unrelated oracles at once.
+
+### W5b-1 — the DSA attention block and the `OwnedTensor` bridge (CPU, large). LANDED — [#2324](https://github.com/mudler/vllm.cpp/issues/2324)
+
+Two deliverables.
+
+**(a) `Glm5NextTextAttention`** (`modeling_glm5_next.py:1064-1257`), as
+`src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` — a host f32 reference,
+exactly as `glm5_next_dsa.cpp`, `glm5_next_mhc.cpp` and `glm5_next_moe.cpp` are.
+`QResid` (`:1165`), `CompressKv` (`:1167-1171`), `ExpandKv` (`:1136-1153`) over
+the checkpoint's SPLIT half-transposed `kv_b_proj` halves,
+`BuildAttentionMaskFromTopk` (`:1218-1257`), `IndexerRoleFor` (`:1126-1131`) and
+`Attention` (`:1157-1216`) with `eager_attention_forward` (`:1039-1060`)
+inlined, which upstream says at `:1222-1225` is the only interface a 3-D
+per-(query, key) mask can reach.
+
+Three things it gets right that a fluent wrong port gets wrong, each with its own
+discriminating case:
+
+* **The `kv_b_proj` halves are SPLIT and only the K half is TRANSPOSED.** The
+  file carries `attn_k_b` at `[H, kv_lora, qk_nope]` and `attn_v_b` at
+  `[H, v_head, kv_lora]`, so K contracts over its FIRST inner axis and V over its
+  SECOND. At the published geometry a swap is a shape error; the gate therefore
+  ALSO carries a SQUARE case at `kv_lora == qk_nope == v_head`, where the
+  untransposed reading is shape-valid and merely wrong, and asserts the
+  separation (2.59 over every one of 468 values).
+* **Cross-layer top-k sharing.** `indexer_types[layer_idx] == "shared"` means the
+  layer builds NO indexer and reuses the previous full layer's selection. The
+  gate runs the shared layer against BOTH the correct output and the output a
+  RECOMPUTING port produces from a decoy indexer — both captured from the same
+  oracle run — and asserts ours is the first: 320 of 800 values differ, max
+  separation 1.52, over 20 of 50 query rows.
+* **The all-masked row is `finfo.min`, not `-inf`** (`:1254`). A left-padded
+  query row has every key masked; with `finfo.min` its softmax is uniform and
+  its output finite, and with `-inf` the NaN reaches `o_proj` and then the
+  residual stream. The `-inf` mutation reds 49 of 160 assertions.
+
+**No rope branch, and upstream is what says so.** `validate_architecture`
+(`configuration_glm5_next.py:219-226`) RAISES for any positive
+`qk_rope_head_dim`, measured by constructing one in the golden generator, so
+`expand_kv`'s concat has a zero-width second half and `key_states` IS `k_nope`.
+`MlaDims::Validate` mirrors the refusal in upstream's own words rather than
+half-implementing a branch no released config can select.
+
+**(b) The `OwnedTensor` -> host f32 bridge**, as
+`glm5_next_bridge.{h,cpp}` — O22's open question, answered. See O25 below for
+the decision and its arithmetic.
+
+**NOT REACHED.** Nothing in either file is called from a production entry point
+at this merge commit; the only call sites are the two focused gates'. W5b-2
+owns the wiring. O25 carries the disclosure.
+
+### W5b-2 — the decoder layer, the mHC threading and the assembled forward (GPU, large) — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
+
+What W5b-1 excluded. `Glm5NextTextDecoderLayer` (`:1259-1331`), the mHC stream
+threading, `Glm5NextTextModel::Forward` (`:1409-1494`), and the binding of the
+attention block to `MakeGlm5NextKVCache` — upstream's
+`past_key_values.update` (`:1176-1178`) is a Cache object W5b-1's reference has
+no equivalent of. Owns discharging O15, O16, O17, O23 and O25 at the moment the
+layer calls the five primitives.
 
 ### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
 
@@ -2704,10 +2771,82 @@ Debts this row carries, each visible rather than waived:
   to reach it. The entry is kept rather than deleted because it is the reason
   the numbering skips: it was live when the tests below it were written. What it
   bounded is now bounded by the forward itself, which W5b owes.
+- **O25 — W5b-1's two files are NOT REACHED from a production entry point, and
+  the residency question O22 left open is now ANSWERED.** Two separate things,
+  in one entry because one wave owns both.
+
+  **The reachability disclosure.**
+  `src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` and
+  `glm5_next_bridge.{h,cpp}` are host references, and the only call sites at
+  this merge commit are `tests/vllm/models/test_glm5_next_attn.cpp` and
+  `test_glm5_next_bridge.cpp`. `grep` over `src/`, `include/` and `examples/`
+  for `glm5_next::Attention`, `BridgeDsaLayer`, `DecodeOwnedTensorToF32`,
+  `IndexerRoleFor` and the two headers returns NOTHING outside those four files.
+  This is the staged-slice disclosure AGENTS.md "Nothing lands dead" requires,
+  declared rather than claimed by silence. There is no production call site to
+  delete, so `.agents/reachability.md`'s reachability mutation has already been
+  answered: the change has no entry-point chain, and saying so is the answer.
+  **The wiring belongs to W5b-2**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **The residency decision: DECODE ONE LAYER AT A TIME, ON DEMAND, AND NEVER
+  RETAIN THE TOWER IN FLOAT.** O22 wrote "Whoever writes the forward decides
+  whether to decode per layer or to go device-native; nothing here forecloses
+  either." The arithmetic forces the first, and every number is this row's own
+  measurement rather than an estimate:
+
+  | what | GiB |
+  |---|---:|
+  | the published `UD-Q2_K_XL` artifact, block-resident as loaded | **101.14** |
+  | the same tower with every tensor expanded (`### The measured residency`) | **426.72** |
+  | all-bf16 | 597.46 |
+  | usable on `dgx:gpu0`, the largest device this project reaches | **~119.63** |
+  | ONE bridged DSA layer, f32 | **0.4654** |
+  | all ELEVEN DSA layers held at once | 5.12 |
+
+  A decoded tower is 426.72 GiB against 119.63, which is 3.57x over — and that
+  is the figure #2245 and #2247 spent six pull requests removing. A float tower
+  is not expensive; it does not exist on any hardware this project can reach.
+  One layer is 499,657,728 bytes, 0.39% of the box, and the caller's peak is one
+  layer because the mirror is a value it can drop. There is deliberately no
+  `BridgeTower`, no cache and no map keyed by layer index: each of those turns
+  "one layer" into "every layer visited so far", which is the tower again with a
+  slower ramp.
+
+  **Device-native was NOT chosen, and the reason is not preference.** There is
+  nothing to be device-native against. Every glm5_next primitive on this row is
+  a host f32 reference and W3's CUDA arm is committed and UNMEASURED for want of
+  a `dgx:gpu0` lease. A device bridge would land beside a device forward that
+  does not exist, which is the "unpassed parameter" shape. W5b-2 revisits it.
+
+  **O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) stays live and
+  this bridge cannot make it reachable**, gated rather than argued. Structurally
+  there is no overload taking `Glm5NextMoeWeights`, `Glm5NextMlpWeights` or any
+  expert bank — the whole surface is `Glm5NextMlaWeights` and
+  `Glm5NextIndexerWeights`, which carry no IQ2_XS or IQ4_XS tensor. Numerically
+  `kBridgeTensorF32ByteCeiling` is 1 GiB, which is EXACTLY 4x above the largest
+  legitimate tensor (`o_proj`, 0.25 GiB) and EXACTLY 9x below the smallest
+  expert bank (`up_exps`, 9.0 GiB); both sides are asserted, because a ceiling
+  above everything is a mute switch and one below the real population is a gate
+  that fires on ordinary work. The check runs from the SHAPE, before any
+  allocation, and the test proves it by handing the bridge a published-size bank
+  carrying no bytes at all.
+
+  **One mutation SURVIVED and is recorded as EQUIVALENT rather than chased.**
+  Rewriting `BridgedDsaLayer::host_f32_bytes` to take
+  `BridgedDsaLayerF32Bytes(d, id)` instead of summing the decoded buffers leaves
+  every assertion green — and it must, because `DecodeShaped` refuses any tensor
+  whose shape disagrees with the dims, so no reachable state separates the two
+  computations. The test pins the sum against the buffers THEMSELVES rather than
+  against the predictor, which is what makes the remaining agreement a fact and
+  not a tautology; an earlier version asserted only
+  `host_f32_bytes == BridgedDsaLayerF32Bytes(...)` and that mutation passed it.
 
 ## Now
 
-`ACTIVE`, 2026-08-28. The row's lifecycle state does not move: W3
+`ACTIVE`, 2026-08-29. The row's lifecycle state does not move: W3
 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213),
 `CLAIM-GLM53-FLASH-W3`) landed the critical-path geometry — `MlaBlockDims`
 accepts the NoPE layer, discharging O11, and the DSA indexer's k-pool
@@ -2739,8 +2878,24 @@ with 0 missing and 0 unexplained at 41 MB peak RSS. `blk.45` is read, counted
 and NOT built as a decoder layer. **O10 is half discharged and O7 is narrowed:
 the artifact exists, and what W7b still owes is a conversion of OURS.**
 
+**THE DSA ATTENTION BLOCK EXISTS.** W5b-1
+([#2324](https://github.com/mudler/vllm.cpp/issues/2324)) landed
+`Glm5NextTextAttention` — `q_a_proj`/`q_a_layernorm`/`q_b_proj`,
+`kv_a_proj_with_mqa`/`kv_a_layernorm`, `expand_kv` over the checkpoint's SPLIT
+half-transposed `kv_b_proj` halves, `build_attention_mask_from_topk` over W3's
+selection, and the CROSS-LAYER top-k sharing a `shared` layer needs — gated
+against the RUN output of `transformers` v5.16.1 at 14 cases / 160 assertions.
+It also landed the `OwnedTensor` -> host f32 bridge, which ANSWERS O22's open
+residency question: one DSA layer at a time, 0.4654 GiB, never the tower, whose
+expanded form is 426.72 GiB against a ~119.63 GiB box. **W5b-1 is NOT REACHED
+from any production entry point** and O25 carries that disclosure; the wiring is
+W5b-2's.
+
 **Nothing FORWARDS** (O10's remaining half): the FORWARD still refuses by name
-and W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it. The
+and W5b-2 ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it —
+the decoder layer, the mHC stream threading, `Glm5NextTextModel::Forward` and
+the binding to `MakeGlm5NextKVCache`, which is the Cache object W5b-1's
+reference has no equivalent of. The
 KV-CACHE SPEC is NOT part of that debt any more — W5
 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) publishes it through
 the production `make_kv_cache` hook, as the paragraph below records. No GPU gate

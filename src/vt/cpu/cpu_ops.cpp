@@ -404,6 +404,56 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::RmsNormGroup — `Qwen4ExpTextRMSNorm` (transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py:158-181`), the `group_size is not
+// None` arm. Deliberately shaped as RmsNormKernel above with the reduction
+// extent narrowed from the row to the group, so the two cannot drift on the
+// rounding order they share; the ONE difference is the absent residual stream,
+// which this op's upstream does not have.
+// ─────────────────────────────────────────────────────────────────────────────
+void RmsNormGroupKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                        const RmsNormGroupArgs& args) {
+  const int64_t t = x.shape[0], h = x.shape[1];
+  const int64_t group_size = args.group_size;
+  const int64_t groups = h / group_size;
+  // Row-chunked over tokens exactly as RmsNormKernel is; each row's groups stay
+  // sequential on one thread, so the result is bit-identical across thread
+  // counts.
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      const int64_t rbase = i * h;
+      for (int64_t g = 0; g < groups; ++g) {
+        const int64_t base = g * group_size;
+        // `x.pow(2).mean(-1)` over the GROUP (:170, after the :168-169 reshape).
+        // f32, which is the width upstream reduces in (`x.float()`, :174) and
+        // the width RmsNormKernel uses; a wider host-reference accumulator would
+        // make the two arms answer to different numbers.
+        float sumsq = 0.0f;
+        for (int64_t j = 0; j < group_size; ++j) {
+          const float v = LoadF32(x, rbase + base + j);
+          sumsq += v * v;
+        }
+        // eps is INSIDE the rsqrt and added to the MEAN SQUARE, once per group.
+        const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(group_size) + args.eps);
+        for (int64_t j = 0; j < group_size; ++j) {
+          const int64_t idx = base + j;
+          // The weight index is the FLAT one: upstream multiplies at :177,
+          // after `out.flatten(-2)` at :171, so `weight` spans the whole row and
+          // is not broadcast per group.
+          float wj = LoadF32(w, idx);
+          if (args.gemma) wj += 1.0f;  // `1.0 + self.weight.float()` (:177)
+          // ONE rounding, on the store (`output.type_as(x)`, :178). The normed
+          // value is NOT narrowed before the weight multiply; upstream's own
+          // comment at :175-176 says that is what separates this norm from
+          // Llama's.
+          StoreF32(out, rbase + idx, LoadF32(x, rbase + idx) * inv * wj);
+        }
+      }
+    }
+  });
+}
+
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
   // act(gate) is narrowed to the INPUT dtype before the multiply, which is what
@@ -3699,6 +3749,8 @@ struct Registrar {
         reinterpret_cast<void*>(static_cast<ConcatMlaNopeRopeFn>(&ConcatMlaNopeRopeKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
+    RegisterOp(OpId::kRmsNormGroup, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<RmsNormGroupFn>(&RmsNormGroupKernel)));
     RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
     RegisterOp(OpId::kQuantFp8Static, DeviceType::kCPU,

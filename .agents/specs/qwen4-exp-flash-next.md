@@ -1807,6 +1807,131 @@ result: the four-state group is never allocated on a DEVICE (the CPU host takes
 and no mutation here can see the zero-seeded n-gram history, because no test in
 this tree reads that row's CONTENTS. All three are under `## Owed`.
 
+## Mutation record — W5d-1 (#2249 item 1)
+
+`vt::RmsNormGroup` / `OpId::kRmsNormGroup`, the ungated per-group RMS norm the
+PLE half of the layer loop needs and the one primitive `include/vt/ops.h` named
+as missing in its own words.
+
+**THE TREE EVERY NUMBER BELOW WAS MEASURED ON**, because an evidence table that
+does not name its tree is not evidence. The RED, the green, the six mutations
+and the suite counts were all taken at base `94de63ff5`. The branch was then
+rebased forward twice as `main` moved under it, onto `6e805abcf` (`QUANT-EXL3`
+W3 — `cpu_exl3_kernels.cpp`, `cuda_exl3.cu`, `test_exl3_gemm.cpp`,
+`dense_weight_loaders.h`) and then onto `5f8a70705` (`SPEC-DFLASH2` #2252 —
+`qwen3_dflash*`). Neither touches a file this op compiles against.
+`test_ops_rms_norm_group` was rebuilt and re-run on the final head: **build rc 0,
+7 cases / 69 assertions / rc 0**, unchanged. The mutation battery was NOT re-run
+after either rebase, and that is stated rather than implied.
+
+Method as in the sections above:
+one textual change applied to a pristine tree, proved applied by a **sha256 that
+moved**, the file `touch`ed so ninja cannot skip the rebuild, the **BUILD RETURN
+CODE READ BEFORE ANY TEST RESULT**, then restored from a byte-identical copy and
+`sha256sum`-verified against the pre-mutation digest. Suite
+`tests/vt/test_ops_rms_norm_group.cpp`, **7 cases / 69 assertions / rc 0** green
+at the head this table was measured on.
+
+**WHY IT IS A NEW OpId AND NOT A FIELD ON `RmsNormArgs`.** `kRmsNorm` is
+registered on more than one backend. A `group_size` added to its shared args
+struct is IGNORED by every kernel not taught to read it, so a device whose
+kernel was not updated would answer a grouped request with a whole-row norm —
+no crash, no refusal, a plausible tensor. A separate OpId cannot fail that way:
+an unregistered device refuses BY NAME, which M5 below measures. `kRmsNormGatedGroup`
+is the in-tree precedent for exactly this split.
+
+### The RED, before the change
+
+The test file written first, against the tree at `94de63ff5`, compiling the test
+translation unit alone (`ninja tests/CMakeFiles/test_ops_rms_norm_group.dir/vt/test_ops_rms_norm_group.cpp.o`):
+
+```
+BUILD_RC=1
+test_ops_rms_norm_group.cpp:75:11: error: 'RmsNormGroupArgs' has not been declared in 'vt'
+test_ops_rms_norm_group.cpp:120:7: error: 'RmsNormGroup' is not a member of 'vt'; did you mean 'RmsNormGated'?
+```
+
+The compiler's own suggestion is the gap in one line: the nearest thing this tree
+had is the op that cannot express it. That red is a BUILD refusal and is read as
+one — it says the op is absent, not that any arithmetic is wrong. The red for the
+intended REASON is M1, which builds clean and fails on values.
+
+### The gate, and why each half of it discriminates
+
+The correctness assertions run against `tests/vllm/models/qwen4_exp_hc_goldens.inc`,
+whose `k{A,B,C,D}_normed` arrays are `normed = mod.hc_norm(hyper)` — the pinned
+oracle's OWN `Qwen4ExpTextRMSNorm(hc*hidden, group_size=hidden, eps)` output over
+its own RAW gamma, dumped by `scripts/gen-qwen4-exp-hc-goldens.py` from
+transformers **v5.16.0** (`modeling_qwen4_exp.py:158-181`, sha256
+`77fec77d…c459`). Nothing in the correctness path is transcribed. A local
+double-precision reference exists in the file, but ONLY to measure the
+separations below; the op is never asserted against it.
+
+| Defect | Separation from the oracle | kTol |
+|---|---|---|
+| reduce over the ROW, not the group | A 1.232, B 0.984, C 0.404, D 0.913 | 1e-5 |
+| drop the `+ 1` on the gamma | A 2.279, B 2.181, C 2.053, D 1.986 | 1e-5 |
+| drop eps | A 4.1e-6, B 1.67e-5, C 5.1e-7, **D 2.56e-2** | 1e-5 |
+
+**The eps row is the reason case D exists and the reason an eps probe run at
+A's scale is a mute switch.** At `hyper_scale = 1.7` the mean square is O(1) and
+an eps of 1e-6 moves the answer by less than the tolerance; at D's
+`hyper_scale = 0.01` it is 1% of the mean square. The file asserts BOTH
+directions — `sep > 1e2 * kTol` at D and `sep < kTol` at A — so the fixture's
+blind spot is recorded executably rather than left for the next reader to
+rediscover.
+
+### The battery
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| M1 | `RmsNormGroupKernel`: `group_size = h`, i.e. reduce over the whole row | rc 0 | **RED**, `7 cases / 5 failed`, `69 assertions / 26 failed`. Every value case moves: the oracle case at all four goldens, the four-orders-apart case, the fold case, the eps case and the bf16 rounding case. The two survivors are the two that call no op — the fixture-separation case and the refusal case |
+| M2 | drop `if (args.gemma) wj += 1.0f`, the #2218 defect | rc 0 | **RED**, `4 cases failed`, `22 assertions failed`. This is the polarity the whole architecture now shares: every gamma is stored RAW and every consumer adds the 1, `ssm_norm` excepted |
+| M3 | drop `+ args.eps` from inside the rsqrt | rc 0 | **RED**, `4 cases failed`, **`5 assertions failed`** — and the small count is the finding, not a weakness. Only goldens B and D move; A and C are BELOW the tolerance, exactly as the table above predicts. A probe placed only at A would have reported this mutation as survived |
+| M4 | delete `RegisterOp(OpId::kRmsNormGroup, DeviceType::kCPU, ...)` | **rc 1** | **A BUILD REFUSAL, not a test verdict, and read as such:** `error: 'RmsNormGroupKernel' defined but not used [-Werror=unused-function]`. That registration is the kernel's ONLY reference in the tree, so the compiler proves the link a test result would only have suggested. No suite ran under this mutation |
+| M5 | register the same kernel on `DeviceType::kCUDA` instead — the runnable form of M4 | rc 0 | **RED**, `6 of 7 cases` threw `vt: no kernel for op RmsNormGroup (id 140) on device cpu (type 0)`. This is the load-bearing reachability proof at the layer that exists: the suite reaches the kernel THROUGH `GetOp`, not by calling it directly, and the `op_provider.cpp` name entry is live too, because the refusal prints the op by name |
+| M6 | delete the `args.group_size >= 1` refusal in the dispatcher | rc 0 | **RED**, rc 136 — `SIGFPE`, an integer divide by zero at `h / group_size`. The refusal is therefore load-bearing rather than decorative, and the default `group_size = 0` is genuinely unusable rather than quietly meaning "the whole row" |
+
+M1-M5 target `src/vt/cpu/cpu_ops.cpp`, M6 `src/vt/ops.cpp`. M6 was re-measured on
+the FINAL head after its refusal message was corrected; M1-M5 were measured on a
+head that differs from the final one only in that message string, in a file they
+do not touch.
+
+### Counts on this head
+
+| Suite | Result |
+|---|---|
+| `test_ops_rms_norm_group` | **7 / 69 / rc 0** (new; re-run identical on the rebased head) |
+| `test_ops_mamba2_gated_norm` | 9 / 2107 / rc 0 |
+| `test_ops_glue` | 13 / 115 / rc 0 |
+| `test_qwen4_exp_hc` | 15 / 246 / rc 0 |
+| `test_qwen4_exp_hc_device` | 9 / 87 / rc 0 |
+| `test_qwen4_exp_ple` | 9 / 395 / rc 0 |
+| `test_qwen4_exp_ple_device` | 10 / 538 / rc 0 |
+| `test_qwen4_exp_qsa` | 14 / 7263 / rc 0 |
+| `test_qwen4_exp_qsa_device` | 12 / 4697 / rc 0 |
+| `test_qwen4_exp_qsa_block` | 8 / 2831 / rc 0 |
+| `test_qwen4_exp_kv_cache` | 4 / 399 / rc 0 |
+| `test_qwen4_exp_scaffold` | 12 / 296 / rc 0 |
+| `test_qwen4_exp_gguf_weights` | 11 / 2975 / rc 0 |
+| `test_qwen4_exp_gguf_load_plan` | 10 / 7462 / rc 0 |
+
+**The BEFORE column is stated rather than re-measured, and the reason is
+checkable.** `git diff --numstat` over `include/` and `src/` is `118/0`, `52/0`,
+`2/0`, `31/0` — **zero deletions, zero modified lines**: a new enumerator before
+`kCount`, a new args struct, a new function-pointer alias, a new declaration, a
+new kernel with its registration, and a new name case. No existing behaviour is
+reachable from any of it. Four of the rows above are additionally cross-checked
+against numbers this spec already recorded before this wave — `test_qwen4_exp_qsa`
+14 / 7263, `test_qwen4_exp_qsa_block` 8 / 2831, `test_qwen4_exp_kv_cache` 4 / 399
+and `test_qwen4_exp_scaffold` 12 / 296 — and all four match exactly.
+
+**What the battery did NOT reach**, because a battery's silence is not a result:
+no CUDA arm exists to mutate; no production entry point calls the op, so no
+mutation here can measure a reach that does not exist (`## Owed`); and the group
+widths exercised are 4, 5 and 6, not the 2560 the released config uses, so the
+f32 sum-of-squares accumulator is gated at toy width only.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -1963,6 +2088,48 @@ is listed under `## Owed`.
 
 ## Owed
 
+- **W5d-1 (#2249 item 1) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `vt::RmsNormGroup` (`include/vt/ops.h`, dispatcher `src/vt/ops.cpp`, CPU kernel
+  `RmsNormGroupKernel` in `src/vt/cpu/cpu_ops.cpp`, name in
+  `src/vt/op_provider.cpp`) is reached at this merge commit only by
+  `tests/vt/test_ops_rms_norm_group.cpp`. No production entry point calls it:
+  `ModelRegistry::Forward` is the only one this architecture has, and
+  `ForwardQwen4ExpForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp`) still refuses by name
+  before any downcast, so the PLE block that will hold the three
+  `Qwen4ExpTextRMSNorm(group_size=hidden_size)` calls does not exist to call it
+  from. Wiring it is owned by row `MODEL-MM-QWEN4-EXP` under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), tracked by campaign
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978), and gated by
+  [#2249](https://github.com/mudler/vllm.cpp/issues/2249). The W2 host reference
+  `qwen4_exp_ple.cpp` was NOT rerouted through the op: its `GroupedRmsNorm`
+  accumulates in double by deliberate choice ("a reference choice and not a
+  divergence"), it is file-local and itself unreached, so routing it would have
+  changed a golden-gated number and bought no reach. **M5** is the load-bearing
+  proof at the layer that does exist: registering the kernel on
+  `DeviceType::kCUDA` instead of `kCPU` leaves the build at rc 0 and reds the
+  suite BY REFUSAL, `vt: no kernel for op RmsNormGroup (id 140) on device cpu
+  (type 0)`, so the dispatcher path is live rather than vestigial and the
+  `op_provider.cpp` name entry is live with it. **M4 is a different reading and
+  is recorded as one**: deleting the `RegisterOp(OpId::kRmsNormGroup, ...)` line
+  outright is a BUILD refusal, `error: 'RmsNormGroupKernel' defined but not used
+  [-Werror=unused-function]`, because that registration is the only reference to
+  a kernel defined in the anonymous namespace `src/vt/cpu/cpu_ops.cpp` opens at
+  :24. No suite runs at all under M4, so it cannot red one; what it proves is the
+  link, which is why M5 exists beside it. The battery table two sections above
+  states both correctly; this sentence did not, and a mutation misread as a test
+  verdict is exactly the confusion the battery was run to prevent.
+- **The CUDA arm of `vt::RmsNormGroup`.** Not written, for the reason W5b-3 and
+  W5b-4 give for theirs: it could not be gated on this CPU-only host with no
+  lease, and an ungated kernel is worse than an absent one. Nothing registers for
+  any device but `kCPU`, so the dispatcher refuses BY NAME rather than falling
+  back — which is the whole argument for a separate OpId over a `group_size`
+  field on `RmsNormArgs`, since a new field on that shared struct would be
+  silently ignored by the four backends that already register `kRmsNorm`. The
+  arm owes one decision this wave did not make for it: whether the per-group
+  sum of squares reduces in f32 (as the CPU arm does, mirroring `x.float()` at
+  `modeling_qwen4_exp.py:174` and `RmsNormKernel` beside it) or in a wider
+  accumulator once the group is 2560 wide rather than 6.
 - **W5b-4 (#2167) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`
   (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels

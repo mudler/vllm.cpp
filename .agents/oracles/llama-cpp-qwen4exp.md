@@ -164,12 +164,16 @@ stands as the CPU-only measurement; the 29 August rows are the GB10 arm.
 
 | Half | 27 Aug, CPU, x86_64 dev host | 29 Aug, CUDA, `dgx:gpu0` GB10 |
 |---|---|---|
-| BUILDS | yes, fresh `git archive`, 247 translation units, 228 `qwen4exp` strings in `libllama.so` | **yes**, fresh `--depth 1` fetch by SHA into an empty directory, `git rev-parse HEAD` asserted equal to the pin, `git status --porcelain` **0 bytes**, `nvcc` 13.0.88, 142 `.cu.o` and **142 `sm_121`** cubins with 142 objects scanned, 68 `qwen4exp` strings in `libllama.so` |
+| BUILDS | yes, fresh `git archive`, 247 translation units, 228 `qwen4exp` strings in `libllama.so` | **yes**, fresh `--depth 1` fetch by SHA into an empty directory, `git rev-parse HEAD` asserted equal to the pin, `git status --porcelain` **0 bytes**, `nvcc` 13.0.88, 142 `.cu.o` and **142 `sm_121a`** cubins with 142 objects scanned, 68 `qwen4exp` strings in `libllama.so` |
 | RUNS | not attempted, no artifact | **yes**: `llama-server` loaded `Qwen3.8-Flash-Next-UD-IQ1_S` and answered `/v1/completions` with 64 coherent greedy tokens |
 
-Configure prints `Replacing 121 in CMAKE_CUDA_ARCHITECTURES with 121a`, so a
-recipe that asks for `121` gets the architecture-specific `sm_121a` the GB10
-wants. The CUDA build recipe, the binary hashes and the identity chain are in
+Configure prints `Replacing 121 in CMAKE_CUDA_ARCHITECTURES with 121a`, and the
+cubin histogram independently agrees: every one of the 142 ELF names in
+`cubin.log` reads `sm_121a`, none reads `sm_121`. A recipe that asks for `121`
+therefore gets the architecture-specific `sm_121a` the GB10 wants, and the
+artifact says so as well as the configure log. An earlier draft of this record
+transcribed the histogram as `sm_121`, which made the strongest of the two legs
+say nothing. The CUDA build recipe, the binary hashes and the identity chain are in
 [the ladder-arm evidence file](../../docs/bench-evidence/qwen4exp-llamacpp-ladder-arm-20260829.md).
 
 **The artifact that blocked the run half is no longer the blocker.** On
@@ -218,29 +222,41 @@ configuration difference.
 `tests/scripts/test_qwen4exp_llamacpp_ladder.py` as its proof. It walks the
 published online-serving grid (c = 1, 2, 4, 8, 16, 32 at 1,024 in / 128 out,
 three repetitions) and issues every timed request through the pinned
-`vllm bench serve`, so both arms are measured by one instrument.
+`vllm bench serve` with the flag sequence
+`online_gate.build_client_command` builds — asserted against it, warmups and
+per-leg corpus partitions included — so both arms are measured by one instrument.
+The build and the decode proof are `scripts/qwen4exp-llamacpp-build-cuda.sh` and
+`scripts/qwen4exp-llamacpp-decode-proof.sh`, in the tree rather than beside their
+own output.
 
-`AGENTS.md` admits `gateable = yes` only once an oracle demonstrably BUILDS and
-RUNS the model. Both halves were attempted on 27 August 2026, and the honest
-result is one half:
+**One thing this pin does NOT print, and a harness must not assume.**
+`llama-server` at `035e2273` reports no KV cache size: the decode proof's server
+log is the complete unfiltered output and carries no `KV self size` line, no
+`llama_kv_cache:` sizing line and no allocation summary, and `/props` carries no
+KV bytes. The ladder therefore refuses to run until a `KV_BYTES_PER_TOKEN`
+measured on a leased load is supplied
+([#2261](https://github.com/mudler/vllm.cpp/issues/2261)). A guard that defaults
+that term to zero is not a guard on this oracle.
 
-- **Builds: yes, measured.** A CPU-only build at the pinned object succeeded from
-  a fresh `git archive` of `035e2273`, never from a checkout somebody develops in,
-  per the tree-assertion rule in [`llama-cpp.md`](llama-cpp.md). The recipe, the
-  identity chain, and the binary hash are in
-  [the build evidence file](../../docs/bench-evidence/oracle-llamacpp-qwen4exp-pr27742-build-20260827.md).
-- **Runs: NOT measured, for want of an artifact.** No `qwen4exp` GGUF was complete
-  on this host when the attempt ran. The seven `unsloth/Qwen3.8-Flash-Next-GGUF`
-  quants were mid-download. The first of them, `UD-IQ1_S`, held 3.3 GiB of
-  67.56 GiB, its first shard was a 10 MiB fragment, and no `SHA256SUMS.txt` had
-  appeared. Loading a truncated shard measures a truncated file, not an oracle.
+### What this section said on 27 August, and why it no longer does
 
-So the flag says `no`, and it keeps saying `no` until somebody records a load and a
-generation. A build is not a run. `llama-model.cpp` compiling proves the
-architecture is declared. It says nothing about whether the graph it builds
-produces coherent text on real weights. That distinction is the whole content of
-the gateability rule, and this record does not blur it to look further along than
-it is.
+Recorded as history, in the past tense, because it is superseded. On 27 August
+2026 this record read `gateable = no`. Both halves had been attempted and only
+one had a result: the CPU-only build at `035e2273` succeeded from a fresh
+`git archive`, per the tree-assertion rule in [`llama-cpp.md`](llama-cpp.md),
+with its recipe and binary hash in
+[the 27 August build evidence file](../../docs/bench-evidence/oracle-llamacpp-qwen4exp-pr27742-build-20260827.md);
+the RUN half had no artifact to attempt, because `UD-IQ1_S` held 3.3 GiB of
+67.56 GiB with a 10 MiB first shard and loading a truncated shard measures a
+truncated file rather than an oracle.
+
+That paragraph used to stand here in the present tense — "the flag says `no`,
+and it keeps saying `no` until somebody records a load and a generation" — about
+forty lines below a heading that already read `gateable = yes`. Somebody has
+since recorded that load and that generation, on 29 August, in the rows above.
+The reasoning was right and is kept: a build is not a run, and
+`llama-model.cpp` compiling proves the architecture is declared rather than that
+its graph produces coherent text. Only the verdict changed.
 
 ## The fidelity fact every comparison against this oracle must carry
 

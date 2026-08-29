@@ -358,6 +358,15 @@ jobs:
         # so this needs no model, no GPU and no quiet box.
         run: |
           python3 tests/scripts/test_cpu_x86_llamacpp_floor.py
+      - name: The qwen4exp llama.cpp ladder harness runs on a lane at all (#2060)
+        # Same shape as the floor harness above: the ladder itself needs a leased
+        # GB10 and a 67 GiB artifact, and its PROOF needs neither -- stub server,
+        # stub client, sparse shards. It landed with no CI line and was absent
+        # from preflight's SUITES, so it ran only when somebody remembered, which
+        # is what this repository calls a gate no lane runs. It also carries the
+        # two executable mutations of the eleven the evidence records.
+        run: |
+          python3 tests/scripts/test_qwen4exp_llamacpp_ladder.py
       - name: The IndexTTS-2.5 port still matches the shipped checkpoint (#634)
         # These three read committed copies of the checkpoint's own config and
         # safetensors header, so they need no network, no weights and no GPU.

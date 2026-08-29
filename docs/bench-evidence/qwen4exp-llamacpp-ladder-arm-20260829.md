@@ -138,8 +138,16 @@ reproduce this will otherwise wonder which of the two was built.
   `libcublasLt.so.13`, `libcuda.so.1`, and `libggml-cuda.so.0` at 60,178,552
   bytes.
 - **The cubin histogram is uniform**: 142 `.cu.o` objects, `cuobjdump --list-elf`
-  over all 142, **142 `sm_121`, objects scanned 142**. No object escaped the
+  over all 142, **142 `sm_121a`, objects scanned 142**. No object escaped the
   scan, which is the check an empty histogram would otherwise pass silently.
+  The suffix is load-bearing and an earlier draft of this file dropped it,
+  transcribing the histogram as `sm_121`. Read off `cubin.log` rather than
+  recalled — `grep -o 'sm_[0-9]*a\?' cubin.log | sort | uniq -c` returns
+  `142 sm_121a` and nothing else — the histogram is a SECOND, independent
+  witness that the `121` in the recipe became `121a` in the artifact. The
+  configure log says llama.cpp intended it; the cubins say it happened. The
+  mistaken transcription was in this project's own disfavour: it made the
+  stronger of those two legs say nothing.
 - **`libllama.so` carries 68 `qwen4exp` strings.** The architecture links; it is
   not merely present in source.
 
@@ -277,11 +285,34 @@ grid carries. `test_ladder_matches_the_published_online_serving_grid` reads
 drift apart silently.
 
 **One instrument, not two.** The harness times nothing itself. Every timed
-request is issued by the pinned `vllm bench serve` with the same flags
-`online_gate.build_client_command` already issues against our own server, pointed
-at `llama-server`'s OpenAI-compatible endpoint. `.agents/benchmarking.md` warns
-that two ratio sets that disagree are frequently two harnesses; the cheapest way
-not to have that argument is to have one client.
+request is issued by the pinned `vllm bench serve`, pointed at `llama-server`'s
+OpenAI-compatible endpoint. `.agents/benchmarking.md` warns that two ratio sets
+that disagree are frequently two harnesses; the cheapest way not to have that
+argument is to have one client.
+
+**"With the same flags" is now ASSERTED, and the first version of this file was
+wrong to state it.** The flag SEQUENCE the harness issues is compared against the
+one `online_gate.build_client_command` builds, by
+`test_client_flag_list_matches_build_client_command`, which reads both. It found
+two real divergences, and both are repaired:
+
+| Flag | Our arm (`build_client_command`) | What the harness did | Now |
+|---|---|---|---|
+| `--num-warmups` | `OnlineRun.num_warmups`, which defaults to the **concurrency** | hardcoded `0` | the concurrency |
+| `--dataset-path` | one **disjoint** partition per (concurrency, repetition), which `prepare_corpus_views` refuses to let overlap | ONE file for all 18 legs | `c<C>-r<R>.jsonl`, the same partition set by the same names |
+
+Neither is cosmetic. At c=32 our arm would have taken 32 warmups and llama.cpp
+none, and this repository's own
+[`../benchmarks/vllm-online-serving.md`](../benchmarks/vllm-online-serving.md)
+records warmup as exactly where two engines differ most. And with
+`--disable-shuffle` a shared corpus replays the same prompts every repetition,
+warming `llama-server`'s slot prefix cache in a way our arm never sees, while
+G4's wording is "identical artifact, **prompts**, token counts, sampling and
+concurrency". `test_client_num_warmups_is_the_concurrency_exactly_as_our_arm_takes_it`
+and `test_client_each_leg_consumes_its_own_corpus_partition` read what the client
+was actually handed on all 18 legs rather than trusting the invocation text, and
+`test_ladder_repetitions_match_online_gate_repetitions` pins the third grid axis,
+which previously had no assertion at all.
 
 **It cannot pin a clock.** Inside an `rc` lease `nvidia-smi -lgc` returns
 `LGC_RC=4` even as root (#1354), so the SM clock here is SAMPLED through
@@ -299,15 +330,24 @@ restored byte-for-byte, verified by sha256, after every one.
 | # | Failure mode | Guard | Test | Mutation | Verdict |
 |---|---|---|---|---|---|
 | 1 | an arithmetic expansion breaks under `set -u` | every identifier used bare inside `$(( ))` is assigned in one defaults block | `test_set_u_no_unbound_variable_in_an_empty_environment` (dynamic, `env -i`), `test_set_u_static_every_arithmetic_operand_is_defaulted` (static scan) | `test_set_u_mutation_removing_one_default_goes_red` deletes the `MEM_FRACTION` default | both halves go red |
-| 2 | the KV/context sizing exceeds the box | a STATIC weights+KV check against the box's own memory, then a MEASURED check against `llama-server`'s reported `KV self size`, before any leg | `test_kv_refuses_when_weights_plus_kv_exceed_the_box`, `test_kv_refuses_a_context_that_cannot_hold_the_slots`, `test_kv_sizes_against_the_boxs_actual_memory_not_a_constant`, `test_kv_the_binding_check_is_the_servers_own_reported_size` | M2, M2b, M2c delete each refusal in turn | RED, RED, RED |
+| 2 | the KV/context sizing exceeds the box | a STATIC weights+KV check against the box's own memory, then a post-launch check that takes the engine's own reported size if it prints one, the supplied `KV_BYTES_PER_TOKEN` if it does not, and REFUSES if neither exists | `test_kv_refuses_when_weights_plus_kv_exceed_the_box`, `test_kv_refuses_a_context_that_cannot_hold_the_slots`, `test_kv_sizes_against_the_boxs_actual_memory_not_a_constant`, `test_kv_the_binding_check_is_the_servers_own_reported_size`, `test_kv_refuses_when_the_server_reports_no_kv_size`, `test_kv_a_supplied_per_token_cost_binds_when_the_server_is_silent`, `test_kv_a_supplied_per_token_cost_still_refuses_over_budget` | M2, M2b, M2c delete each refusal in turn; `test_kv_mutation_restoring_the_fail_open_default_goes_red` restores the zero-term fall-through | RED, RED, RED, RED |
 | 3 | a missing artifact silently measures nothing | the shard SET is derived from the `-00001-of-00003` name, and each shard must exist and be non-empty | `test_artifact_a_missing_shard_refuses_by_name`, `test_artifact_a_zero_byte_shard_refuses`, `test_artifact_shard_set_comes_from_the_name_not_from_a_glob` | M1 deletes the shard guard | RED |
 | 4 | a missing wrapper makes the wrapped command not run | `command -v` on every wrapper BEFORE the lock, then the wrapper's OWN output asserted after each leg | `test_wrapper_absent_time_refuses_before_the_lock`, `test_wrapper_absent_from_path_refuses`, `test_wrapper_present_but_silent_fails_the_leg`, `test_wrapper_a_client_that_writes_no_result_fails_the_leg` | M3, M3b, M3c | RED, RED, RED |
 | 5 | the script hangs while holding the GPU | `flock -w`, a bounded readiness poll, dead-server detection, a leg `timeout`, and a teardown trap on every exit path | `test_hang_lock_contention_is_bounded`, `test_hang_server_that_never_answers_health_times_out`, `test_hang_server_that_dies_is_noticed_immediately`, `test_hang_a_stuck_leg_is_killed_by_the_leg_timeout`, `test_hang_the_server_is_reaped_on_every_exit_path`, `test_hang_no_clock_is_ever_pinned` | M4, M5, M6, M7 | RED, RED, RED, RED |
 
-**32 tests pass; 11 mutations, 11 red, none unarmed.** The sweep restores the
-script after each one and asserts the restored sha256 equals the one taken
-before it: `a361ffb5a31b004949344f6877cb56106af0b0f954848b74a5cc9fa7d072b215`
+**11 mutations went red with none unarmed when the sweep ran on 29 August.** The
+sweep restored the script after each one and asserted the restored sha256 equalled
+the one taken before it: `a361ffb5a31b004949344f6877cb56106af0b0f954848b74a5cc9fa7d072b215`
 both times.
+
+**Only TWO of those eleven are committed as tests, and that is a recorded gap
+rather than a silence.** The sweep DRIVER is not in this tree, so nine of the
+eleven mutations are a claim about a run that happened once on one machine and
+cannot be re-executed by a reader. The two that are executable are
+`test_set_u_mutation_removing_one_default_goes_red` and, added by this repair,
+`test_kv_mutation_restoring_the_fail_open_default_goes_red`. Bringing the driver
+in is owed; see [What is still owed](#5-what-is-still-owed). A mutation nobody
+can re-run is evidence with a shelf life.
 
 ### Two of these were found rather than confirmed
 
@@ -339,6 +379,80 @@ never answers and timed out. The driver now restores on every exit path and
 writes the pristine text to a sidecar, and the restored sha256 is compared
 against the one taken before the sweep.
 
+### The KV guard was failing open on the real denominator
+
+The most expensive defect this harness carried, found by a fresh review before
+it ever held a lease, and measured against this change's own production capture
+rather than reasoned about.
+
+`assert_reported_kv_fits` extracted `KV self size = N` from the server log and,
+finding nothing, did `[[ -n ${kv_mib} ]] || kv_mib=0`. **`llama-server` at this
+pin prints no such line.** `decode-proof/llama-server.log` is the COMPLETE server
+output — the decode proof redirects both streams into it with no filter — and it
+is 1,862 bytes carrying no `KV self size`, no `llama_kv_cache:` sizing line and
+no allocation summary of any kind. Sixteen minutes pass between `load_model:` and
+`threadpool init` with nothing printed in between. `/props` carries no KV bytes
+either; its only sizing fields are `n_ctx = 4096` and `total_slots = 1`.
+
+Meanwhile `KV_BYTES_PER_TOKEN` defaulted to `0`, which made the static budget
+check weights-only by design and said so. **So on the real box neither check had
+a KV term**, while the ladder configures `CTX_TOTAL=49152` across 32 slots
+against a 67.5 GiB model on a 119 GiB unified-memory device that reboots rather
+than swaps. That is the "128 GiB on a 119 GB box" family the guard was written
+to prevent, wearing the guard's own name.
+
+The fixture disagreed with the denominator, which is why no test caught it: every
+server stub in `test_qwen4exp_llamacpp_ladder.py` emitted the line, so the suite
+never fed the guard a log without one.
+
+**What was changed.** The post-launch check now prefers the engine's own reported
+size if a pin ever prints one, falls back to a supplied `KV_BYTES_PER_TOKEN` and
+NAMES the fallback in its output, and **refuses (`E_KV_UNREPORTED`, 21) when
+neither exists.** The fixture server is now silent about KV exactly as the real
+one is, so every execute-path test feeds the guard a log with no KV line and
+passes only because the environment supplies a per-token cost;
+`test_kv_refuses_when_the_server_reports_no_kv_size` removes it and asserts the
+refusal with no leg written, and
+`test_kv_mutation_restoring_the_fail_open_default_goes_red` puts the zero-term
+fall-through back and asserts the same scenario stops refusing.
+
+**Nothing else binds, and this is stated rather than papered over.** The real
+server was read for an alternative and has none: the log carries no sizing line,
+`/props` carries no bytes, and `/metrics` publishes a KV *usage ratio* rather
+than a size. A post-launch RSS check was considered and REJECTED, because whether
+GB10's unified `cudaMalloc` allocations appear in `/proc/<pid>/smaps_rollup` is
+exactly the kind of thing that cannot be settled without a lease, and a guard
+resting on an unverified assumption is the defect again. **The ladder therefore
+must not run until a leased load supplies `KV_BYTES_PER_TOKEN`.** No lease was
+taken for this repair.
+
+## 4b. Reproducibility: what came into the tree, and what is owed
+
+Three gaps were named by the fresh review. Each was decided rather than deferred
+silently.
+
+| Gap | Decision | Why |
+|---|---|---|
+| the build and decode-proof scripts lived on the NAS, not in the tree | **brought in**, as `scripts/qwen4exp-llamacpp-build-cuda.sh` and `scripts/qwen4exp-llamacpp-decode-proof.sh` | they are ~7 KB each and they are the recipes for the two jobs that flipped an oracle to `gateable = yes`. A recipe that lives only beside its own output is a recipe nobody can re-run, and `ArmScriptsInTheTreeTest` now pins both to this record |
+| the toolchain was recorded but NOT pinned: `apt-get install -y cuda-toolkit-13-0` is unversioned, so a rerun gets whatever apt serves | **made fail-closed in the same change** | the channel cannot be pinned from here, but the OUTCOME can be asserted. `EXPECT_NVCC=13.0.88` — the version the evidence above records — is compared against what `nvcc --version` reports and the build exits 89 on a mismatch, naming both. Drift is now visible instead of silent, which is the property that was missing |
+| only 1 of 11 mutations was committed as a test, because the sweep driver is not in the tree | **2 of 11 now; the driver is OWED and has an owner** | the second is this repair's own KV mutation. Committing a general sweep driver is its own unit of work with its own review, and doing it inside a repair branch would bundle unrelated work. It is listed under "What is still owed" and owned by `MODEL-MM-QWEN4-EXP` |
+
+Two smaller repairs rode along, both in the direction of asserting rather than
+transcribing:
+
+- **The cubin histogram lost the architecture suffix.** The build script ran
+  `grep -o 'sm_[0-9]*'`, a pattern that CANNOT print the `a`, so 142 `sm_121a`
+  cubins rendered as `142 sm_121` and that reading went into the oracle record.
+  The pattern is now `sm_[0-9]*a\?` and
+  `test_build_script_cubin_scan_can_see_the_architecture_suffix` asserts it
+  against a real cubin line, with the truncated pattern kept inline as the
+  mutation that demonstrates the defect.
+- **The decode proof did not assert which build answered.** It printed the staged
+  binaries' sha256 under a comment saying they "must equal BUILD-RECORD.txt" and
+  compared nothing. It now reads the pin out of `BUILD-RECORD.txt`, asserts it
+  equals the object this proof is about, and hard-exits on any binary whose
+  staged hash differs from the recorded one.
+
 ## 5. What is still owed
 
 - The ladder itself. It needs `dgx:gpu0` for long enough to walk six rungs three
@@ -348,10 +462,19 @@ against the one taken before the sweep.
   flag. `llama-server` is the path the ladder uses and it is proven.
 - A tokenizer snapshot and a frozen 1,024-token corpus partition for the client,
   both of which the harness refuses without.
-- A `KV_BYTES_PER_TOKEN` measured from a real load, so the STATIC budget check
-  covers the KV term instead of the weights alone. The measured post-launch check
-  binds either way.
+- **A `KV_BYTES_PER_TOKEN` measured from a real load. The ladder now REFUSES
+  without one, and this is a hard blocker rather than a nicety.** See
+  [the KV guard was failing open](#the-kv-guard-was-failing-open-on-the-real-denominator)
+  below: `llama-server` at this pin reports no KV size at all, so the sentence
+  that used to stand here -- "the measured post-launch check binds either way" --
+  was false on the only server this harness will ever face. Only a leased load
+  can supply the number, and no lease was taken for this repair.
 - The fidelity statement every comparison against this oracle must carry: #27742
   is mask-only, so a LONG-CONTEXT decode win over it is partly their mask
   approach and not purely our gather. Short-context and high-concurrency cells,
   which is where the developer's target lives, are unaffected.
+- **A committed mutation-sweep driver.** Nine of the eleven mutations recorded
+  above are not re-executable from this tree. Owned by `MODEL-MM-QWEN4-EXP`.
+- **A toolchain that is pinned rather than asserted.** `EXPECT_NVCC` makes drift
+  refuse; it does not make apt serve one version. Owned by
+  `MODEL-MM-QWEN4-EXP`.

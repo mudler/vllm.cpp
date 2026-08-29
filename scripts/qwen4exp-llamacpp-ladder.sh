@@ -13,12 +13,35 @@
 #
 # WHAT MAKES THE TWO ARMS COMMENSURABLE.  This script does not time anything
 # itself.  Timed requests are issued only by the pinned `vllm bench serve`
-# client -- the SAME instrument, the same corpus, the same flags that
-# `tools/bench/online_gate.py:build_client_command` already issues against our
-# own server.  Two ratio sets that disagree are frequently two harnesses
-# (.agents/benchmarking.md), and the cheapest way not to have that argument is
-# to have one client.  This script owns only: server lifecycle, the ladder,
-# the mutex boundary, the clock and memory windows, and artifact capture.
+# client -- the SAME instrument, the same corpus partitions, the same flags in
+# the same order that `tools/bench/online_gate.py:build_client_command` already
+# issues against our own server.  Two ratio sets that disagree are frequently
+# two harnesses (.agents/benchmarking.md), and the cheapest way not to have that
+# argument is to have one client.  This script owns only: server lifecycle, the
+# ladder, the mutex boundary, the clock and memory windows, and artifact
+# capture.
+#
+# "The same flags" is an assertion here, not a claim.
+# `test_client_flag_list_matches_build_client_command` reads the flag sequence
+# out of `build_client_command` and compares it to the invocation below, so the
+# two cannot drift apart silently.  The first version of this file said "the
+# same flags" and diverged on TWO of them, which is why the claim is now tested:
+#
+#   * `--num-warmups`.  `OnlineRun.num_warmups` defaults to the CONCURRENCY, so
+#     our arm takes 32 warmups at c=32.  This file hardcoded 0, which would have
+#     given llama.cpp none -- and `docs/benchmarks/vllm-online-serving.md`
+#     records warmup as exactly where two engines differ most.  It now passes
+#     the concurrency, as the vllm.cpp arm does.
+#   * The CORPUS.  `online_gate.prepare_corpus_views` builds one partition per
+#     (concurrency, repetition) and REFUSES if any prompt appears in two of
+#     them.  This file passed ONE file to all 18 legs, so with
+#     `--disable-shuffle` every repetition replayed the same prompts and warmed
+#     llama-server's slot prefix cache in a way our arm never sees.  It now
+#     consumes the same `c<C>-r<R>.jsonl` partition set, by the same names.
+#
+# The spec's G4 wording is "Identical artifact, PROMPTS, token counts, sampling
+# and concurrency".  A shared corpus is not identical prompts; it is the same
+# prompts three times on one side and three disjoint thirds on the other.
 #
 # THE LADDER IS NOT INVENTED HERE.  POINTS, INPUT_LEN, OUTPUT_LEN and the three
 # repetitions are the published online-serving grid
@@ -51,6 +74,7 @@ readonly E_SERVER_NOT_READY=17
 readonly E_LEG_FAILED=18
 readonly E_KV_OVER_BUDGET=19
 readonly E_CLOCK_UNUSABLE=20
+readonly E_KV_UNREPORTED=21
 
 # ---------------------------------------------------------------- the ladder
 # (concurrency, num_prompts).  A strict copy of online_gate.POINTS.
@@ -72,7 +96,7 @@ MODEL=${MODEL:-}
 SERVER=${SERVER:-}
 CLIENT=${CLIENT:-}
 TOKENIZER=${TOKENIZER:-}
-CORPUS=${CORPUS:-}
+CORPUS_DIR=${CORPUS_DIR:-}
 OUT=${OUT:-evi-q4exp-llamacpp}
 PORT=${PORT:-8077}
 NGL=${NGL:-99}
@@ -80,9 +104,23 @@ NGL=${NGL:-99}
 # the 32 slots gets CTX_TOTAL/32 tokens and must hold INPUT_LEN + OUTPUT_LEN.
 CTX_TOTAL=${CTX_TOTAL:-49152}
 # Measured, never guessed.  A KV formula invented in a harness once asked for
-# 128 GiB on a 119 GB box.  0 means "not supplied": the static budget check then
-# covers the WEIGHTS only and says so, and the check that actually binds is the
-# post-launch one against the server's OWN reported KV size, which always runs.
+# 128 GiB on a 119 GB box.  0 means "not supplied".
+#
+# THIS VALUE IS NOT OPTIONAL, and the earlier version of this file was wrong to
+# imply that it was.  It said the binding check was the post-launch one against
+# llama-server's OWN reported KV size, "which always runs".  Measured against
+# this row's own production capture, `llama-server` at THIS PIN prints no such
+# line: `.../decode-proof/llama-server.log` is the complete, unfiltered server
+# output (the decode proof redirects both streams into it) and it carries no
+# `KV self size`, no `llama_kv_cache:` sizing line, and no allocation summary at
+# all -- 16 minutes of load between `load_model:` and `threadpool init` with
+# nothing in between.  `/props` carries no KV bytes either.  So with
+# KV_BYTES_PER_TOKEN=0 NEITHER check has a KV term, and the ladder would size a
+# 32-slot context against a 67.5 GiB model on a box that reboots rather than
+# swaps.  That is the 128-GiB-on-a-119-GB-box defect wearing a guard.
+#
+# The harness therefore REFUSES rather than defaulting the term to zero.  Supply
+# a value measured on a leased load, or the ladder does not run.
 KV_BYTES_PER_TOKEN=${KV_BYTES_PER_TOKEN:-0}
 # Share of the box's memory the run may occupy.  GB10 is unified, so the device
 # ceiling IS host MemTotal and there is no second pool to fall back on.
@@ -137,7 +175,9 @@ required (env or flag):
   --server PATH       llama-server built at the llama-cpp-qwen4exp pin
   --client PATH       the pinned vLLM client (issues every timed request)
   --tokenizer DIR     tokenizer snapshot handed to the client
-  --corpus PATH       frozen corpus partition (jsonl)
+  --corpus-dir DIR    the frozen corpus VIEW directory: one c<C>-r<R>.jsonl
+                      partition per rung and repetition, named exactly as
+                      online_gate.prepare_corpus_views writes them
 optional:
   --out DIR --port N --ctx-total N --kv-bytes-per-token N --mem-fraction PCT
 EOF
@@ -152,7 +192,7 @@ while (($#)); do
     --server) SERVER=${2:?}; shift 2 ;;
     --client) CLIENT=${2:?}; shift 2 ;;
     --tokenizer) TOKENIZER=${2:?}; shift 2 ;;
-    --corpus) CORPUS=${2:?}; shift 2 ;;
+    --corpus-dir) CORPUS_DIR=${2:?}; shift 2 ;;
     --out) OUT=${2:?}; shift 2 ;;
     --port) PORT=${2:?}; shift 2 ;;
     --ctx-total) CTX_TOTAL=${2:?}; shift 2 ;;
@@ -250,7 +290,7 @@ detect_mem_total_bytes() {
 
 # -------------------------------------------------------------------- guards
 preflight() {
-  local shard missing bin total source_name budget need kvterm
+  local shard missing bin total source_name budget need kvterm point rep part
   [[ -n ${MODEL} ]] || fail "${E_MODEL_MISSING}" "--model is required and names shard 1 of the GGUF"
   missing=0
   while IFS= read -r shard; do
@@ -268,8 +308,22 @@ preflight() {
     "the pinned vLLM client is not executable at '${CLIENT}'; it issues every timed request, so without it there is no measurement"
   [[ -n ${TOKENIZER} && -d ${TOKENIZER} ]] || fail "${E_CORPUS_MISSING}" \
     "tokenizer snapshot missing at '${TOKENIZER}'"
-  [[ -n ${CORPUS} && -s ${CORPUS} ]] || fail "${E_CORPUS_MISSING}" \
-    "frozen corpus partition missing or empty at '${CORPUS}'"
+  [[ -n ${CORPUS_DIR} && -d ${CORPUS_DIR} ]] || fail "${E_CORPUS_MISSING}" \
+    "frozen corpus view directory missing at '${CORPUS_DIR}'"
+  # Every one of the 18 partitions, asserted BEFORE the lock and before a 67 GiB
+  # load.  A partition discovered missing at rep 3 has already spent the box.
+  missing=0
+  for point in ${LADDER}; do
+    for rep in $(seq 1 "${REPETITIONS}"); do
+      part="${CORPUS_DIR}/c${point%%:*}-r${rep}.jsonl"
+      if [[ ! -s ${part} ]]; then
+        printf 'missing or empty corpus partition: %s\n' "${part}" >&2
+        missing=$((missing + 1))
+      fi
+    done
+  done
+  [[ ${missing} -eq 0 ]] || fail "${E_CORPUS_MISSING}" \
+    "${missing} of $((6 * REPETITIONS)) corpus partitions are missing or empty under '${CORPUS_DIR}'; online_gate.prepare_corpus_views writes one per (concurrency, repetition) and our arm consumes exactly that set"
 
   # A wrapper that is not on PATH does not degrade the leg, it deletes it.
   for bin in "${TIMEV_BIN}" "${TIMEOUT_BIN}" "${FLOCK_BIN}" "${PYTHON_BIN}" "${CURL_BIN}"; do
@@ -301,32 +355,59 @@ preflight() {
   say "weights + KV     ${need} bytes (KV term ${kvterm}, from KV_BYTES_PER_TOKEN=${KV_BYTES_PER_TOKEN})"
   if [[ ${KV_BYTES_PER_TOKEN} -eq 0 ]]; then
     say "NOTE: KV_BYTES_PER_TOKEN is 0, so this static check covers the WEIGHTS only."
-    say "      No formula is invented here.  The check that binds is the post-launch"
-    say "      one against llama-server's OWN reported KV size, and it always runs."
+    say "      No formula is invented here.  llama-server at this pin reports no KV"
+    say "      size either, so with 0 supplied NOTHING carries a KV term and the"
+    say "      post-launch check will REFUSE (${E_KV_UNREPORTED}) rather than pass."
+    say "      --self-check still completes: this mode never launches a server."
   fi
   [[ ${need} -le ${budget} ]] || fail "${E_MEM_BUDGET}" \
     "weights+KV ${need} bytes exceeds ${MEM_FRACTION}% of ${total} bytes; lower CTX_TOTAL or pick a smaller arm"
   say "PREFLIGHT OK"
 }
 
-# The check that binds.  llama-server prints its own KV allocation at startup;
-# that number is measured by the engine that has to live in it, so it is the one
-# this harness refuses on.  A ladder that runs past this writes a table of
-# numbers taken from a box that was already swapping.
+# The memory check that runs after the model is resident, and the one place this
+# harness was failing OPEN.
+#
+# It used to grep the server log for `KV self size = N` and, finding nothing,
+# set the term to 0 and pass.  llama-server at this pin PRINTS NO SUCH LINE --
+# measured on this row's own production capture, not assumed -- so on the real
+# denominator the guard had no KV term at all, while the static check next door
+# also had none whenever KV_BYTES_PER_TOKEN was left at its 0 default.  Two
+# checks, neither of them bounding the cache, in front of a 32-slot 49,152-token
+# context on a box that reboots rather than swaps.
+#
+# The order of preference here is: the ENGINE'S OWN number if it ever prints one
+# (measured by the thing that has to live in it), otherwise the operator's
+# measured KV_BYTES_PER_TOKEN, otherwise REFUSE.  A silent server and a zero
+# term is not a pass.
 assert_reported_kv_fits() {
-  local log total source_name budget weights kv_mib kv_bytes need
+  local log total source_name budget weights kv_mib kv_bytes need origin
   log=$1
   read -r total source_name < <(detect_mem_total_bytes)
   budget=$((total / 100 * MEM_FRACTION))
   weights=$(weights_bytes "${MODEL}")
-  kv_mib=$(grep -Eio 'KV self size *= *[0-9]+' "${log}" 2>/dev/null | grep -Eo '[0-9]+' | tail -1)
-  [[ -n ${kv_mib} ]] || kv_mib=0
-  kv_bytes=$((kv_mib * 1024 * 1024))
+  # The spellings llama.cpp has used for this line, so a pin that starts
+  # printing one is picked up without a code change.  NONE of them occurs at the
+  # `llama-cpp-qwen4exp` pin -- measured, see the decode proof's server log.
+  kv_mib=$(grep -Eio '(KV self size|KV cache size|kv size) *= *[0-9]+' "${log}" 2>/dev/null | grep -Eo '[0-9]+' | tail -1)
+  if [[ -n ${kv_mib} ]]; then
+    origin="server-reported"
+    kv_bytes=$((kv_mib * 1024 * 1024))
+  elif [[ ${KV_BYTES_PER_TOKEN} -gt 0 ]]; then
+    origin="KV_BYTES_PER_TOKEN"
+    kv_mib=0
+    kv_bytes=$((CTX_TOTAL * KV_BYTES_PER_TOKEN))
+    say "llama-server reported NO KV size; falling back to the supplied KV_BYTES_PER_TOKEN=${KV_BYTES_PER_TOKEN}"
+  else
+    fail "${E_KV_UNREPORTED}" \
+      "llama-server wrote no KV size to ${log} and KV_BYTES_PER_TOKEN is 0, so NOTHING bounds the KV cache. This is the 128-GiB-on-a-119-GB-box defect: the model is resident, the ladder is about to configure ${CTX_TOTAL} tokens over ${MAX_CONCURRENCY} slots, and no check carries a KV term. Measure the per-token cost on a leased load and pass --kv-bytes-per-token; do not guess one"
+  fi
   need=$((weights + kv_bytes))
-  say "server-reported KV  ${kv_mib} MiB (${kv_bytes} bytes)"
-  say "weights+reportedKV  ${need} bytes against budget ${budget} (source: ${source_name})"
+  say "KV term source      ${origin}"
+  say "KV bytes            ${kv_bytes} (${kv_mib} MiB as reported)"
+  say "weights+KV          ${need} bytes against budget ${budget} (source: ${source_name})"
   [[ ${need} -le ${budget} ]] || fail "${E_KV_OVER_BUDGET}" \
-    "llama-server reports ${kv_mib} MiB of KV; with ${weights} bytes of weights that is ${need} bytes, over the ${MEM_FRACTION}% budget of ${total}"
+    "the ${origin} KV term is ${kv_bytes} bytes; with ${weights} bytes of weights that is ${need} bytes, over the ${MEM_FRACTION}% budget of ${total}"
 }
 
 wait_for_ready() {  # bounded; the lock is held while this runs
@@ -394,14 +475,14 @@ run_leg() {  # run_leg CONCURRENCY PROMPTS REP -> 0 accepted
       --model gate \
       --tokenizer "${TOKENIZER}" \
       --dataset-name custom \
-      --dataset-path "${CORPUS}" \
+      --dataset-path "${CORPUS_DIR}/c${conc}-r${rep}.jsonl" \
       --custom-output-len "${OUTPUT_LEN}" \
       --skip-chat-template \
       --disable-shuffle \
       --num-prompts "${prompts}" \
       --max-concurrency "${conc}" \
       --request-rate inf \
-      --num-warmups 0 \
+      --num-warmups "${conc}" \
       --ready-check-timeout-sec 0 \
       --seed 0 \
       --ignore-eos \
@@ -513,6 +594,18 @@ lines = [
     "ratio. #27742 is mask-only, so a LONG-CONTEXT decode comparison against it is "
     "partly their mask approach and not purely our gather; short-context and "
     "high-concurrency cells are unaffected. State which side ran what.",
+    "",
+    "**The configuration the vllm.cpp cell beside this one MUST have run.** This "
+    "denominator is TEXT-ONLY: `/props` on the server that produced it reports "
+    "`\"modalities\":{\"vision\":false,\"video\":false,\"audio\":false}`, while "
+    "`MODEL-MM-QWEN4-EXP` is a multimodal port. An arm that loads a vision tower "
+    "does strictly more work per request, so a ratio taken against it measures a "
+    "configuration difference and reads as a performance one. Pair this table only "
+    "with a vllm.cpp run on the SAME `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S "
+    "artifact, text-only prompts, no vision or video tower resident, 1,024 in / "
+    "128 out, `--disable-shuffle`, the c<C>-r<R> corpus partition for the cell, and "
+    "warmups equal to the concurrency. Anything else is a different measurement "
+    "wearing this table's row labels.",
     "",
     "| Concurrency | prompts | decode tok/s | total tok/s | median TTFT ms (prefill) | "
     "median TPOT ms (decode) | median ITL ms | peak RSS MiB | SM clock med MHz | spread % |",

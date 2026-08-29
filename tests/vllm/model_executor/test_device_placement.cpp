@@ -22,6 +22,9 @@
 #include <vector>
 
 #include "vllm/model_executor/device_placement.h"
+#include "vllm/model_executor/moe_placement_seam.h"
+#include "vt/backend.h"
+#include "vt/tensor.h"
 
 namespace {
 
@@ -380,4 +383,59 @@ TEST_CASE("placement: a VULKAN engine placing to cpu is a REAL cross-device plan
                                            vt::DeviceType::kCPU),
       4);
   CHECK_FALSE(same_device.PlacesAnything());
+}
+
+TEST_CASE("placement seam: an UNPLACEABLE arm REFUSES a real placement, and stays inert otherwise") {
+  // THE REGRESSION THIS GUARDS. W3b refused the fp4-resident arm by name; the W3c
+  // refactor moved every architecture onto the shared seam and did NOT carry the
+  // refusal across, leaving the old helper dead and the live path open. Placing
+  // an fp4-resident arm uploads every expert at load and then computes on the
+  // host across the bus — worse than not placing — and A TOKEN GATE CANNOT SEE
+  // IT, because the tokens stay correct.
+  vt::Backend& cpu = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue q = cpu.CreateQueue();
+  vllm::dense_attn::Dev engine{cpu, q};
+  std::vector<uint16_t> hid(8, 0);
+  vt::Tensor dh = vllm::dense_attn::MakeTensor(hid.data(), vt::DType::kBF16,
+                                               q.device, {1, 8});
+  auto body = [&](vllm::dense_attn::Dev d, const vt::Tensor&) {
+    return vllm::dense_attn::DBuf(d, vt::DType::kBF16, std::vector<int64_t>{1, 8});
+  };
+
+  // 1. NO placement configured: `placeable=false` must NOT refuse, because
+  //    nothing is being placed. A guard that fired here would break every
+  //    ordinary load, which is the opposite failure and just as bad.
+  vllm::ResetActiveMoePlacementPlanForTesting();
+  CHECK_NOTHROW(vllm::RunMoePlaced(engine, 0, dh, 1, 8, body,
+                                   /*placeable=*/false, "test arm"));
+
+  // 2. A REAL cross-device placement (engine kCPU, layer resolved to kCUDA) with
+  //    an unplaceable arm must THROW, and name the reason.
+  vllm::SetActiveMoePlacementPlan(vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides({Ov(kExps, "cuda")},
+                                           vt::DeviceType::kCPU),
+      4));
+  REQUIRE(vllm::ActiveMoePlacementPlan().PlacesAnything());
+  std::string msg;
+  try {
+    vllm::RunMoePlaced(engine, 0, dh, 1, 8, body, /*placeable=*/false,
+                       "the routed experts are fp4-resident");
+    msg = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("cannot be placed") != std::string::npos);
+  CHECK(msg.find("fp4-resident") != std::string::npos);
+
+  // 3. The SAME placement with a placeable arm must not refuse on this account.
+  //    (It resolves to kCUDA, which has no backend registered in a CPU build, so
+  //    only assert it is not OUR refusal that fires.)
+  try {
+    vllm::RunMoePlaced(engine, 0, dh, 1, 8, body, /*placeable=*/true, nullptr);
+  } catch (const std::exception& e) {
+    CHECK(std::string(e.what()).find("cannot be placed") == std::string::npos);
+  }
+
+  vllm::ResetActiveMoePlacementPlanForTesting();
+  vt::DestroyQueue(q);
 }

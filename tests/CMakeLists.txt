@@ -1094,6 +1094,23 @@ target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_dsa PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
+# GLM-5.3-Flash W5 -- the 288 routed + 1 shared expert MoE, its grouped
+# `noaux_tc` router and the clamped-SwiGLU epilogue (#2223). The router is gated
+# at the PUBLISHED 288/top-8 and the composed block at 8 experts, because the
+# selection is where the expert count matters and the stacked expert tower is
+# not. It asserts SET equality of the selected experts and prints the separation
+# margin: top-k error is BIMODAL, so a tolerance on the weights passes a wrong
+# selection whose values happen to be close. Goldens are the RUN output of
+# transformers v5.16.1, captured by `fixtures/gen_glm5_next_moe_goldens.py`.
+# `glm5_next_moe.h` is MODEL-PRIVATE under src/, the same arrangement
+# `glm5_next_dsa.h` uses.
+vllm_cpp_add_test(test_glm5_next_moe vllm/models/test_glm5_next_moe.cpp)
+target_compile_definitions(test_glm5_next_moe PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_moe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

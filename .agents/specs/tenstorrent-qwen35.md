@@ -42,13 +42,13 @@ per write (offset views are publicly constructible through
 merged write cannot exist), and the production staging
 fan-in is causally interleaved (each restage is produced by a host
 round-trip between writes), so a merged write would carry bytes that do
-not exist yet. Owed next: the **round-trip-elimination lever** — the
-`MarkHostWritten` → `CommitHost` → restage host↔device cycle produces
-the staging writes themselves; removing the round-trips removes the
-per-op tax multiplicatively, inside our file set, on the `vt::FusedChain`
-seam. The tt-metal-side residual (a multi-destination write that reaches
-several offset views at once) stays recorded as the upstream-shaped
-alternative.
+not exist yet. The **round-trip-elimination lever** is now the active
+wave: **W7** ([#2282](https://github.com/mudler/vllm.cpp/issues/2282)) —
+the residency state itself manufactures the staging writes (7-8 per
+step in the W6 probe), so making it precise removes the writes instead
+of amortizing them. The tt-metal-side residual (a multi-destination
+write that reaches several offset views at once) stays recorded as the
+upstream-shaped alternative.
 
 ## Scope
 
@@ -311,6 +311,32 @@ column above is the entry point, not the whole chain.
   stays recorded as the upstream-shaped alternative.
   **Outcome (2026-08-29): named unreachable** — see `## Evidence`, W6.
   The successor lever is round-trip elimination, not write amortization.
+- **W7 — staging-write elimination: a residency state that stops
+  manufacturing restages (#2282).** The W6 probe counted 30 restages ≈
+  7-8 per step, and every one is our own doing: `MarkHostWritten`
+  (`tenstorrent_ops.cpp:5654`; callers `tenstorrent_backend.cpp:56,66,70`)
+  marks a slot device-stale — including scratch-block acquisition, where
+  the device bytes are garbage but the pending op may fully overwrite
+  them anyway — and `CommitHost` (`:1231`) drops the whole shadow on a
+  host in-place write, forcing a full-tensor restage (`:561`) on the
+  next device use. Make the residency state precise: a decode step
+  stages each slot's bytes once, or zero times when the consumer
+  overwrites the full buffer on device. The implementer derives the
+  mechanism (device-will-overwrite reservation, narrowed
+  `CommitHost`, upload-on-write for host-written device-resident
+  slots) and records it with explicit restage semantics. `StagingStats`
+  must observe the per-step write count; a needed new counter lands
+  red-first. Invariant: staging is bit-identical — the sacred golden
+  pair stays 16/16 and the full TT suite stays green; this wave changes
+  SPEED, never tokens; capture-unsafe refusals keep their semantics;
+  the f32 arms keep their declared dtypes; the #1486 never-destroy rule
+  holds; the route must move the production decode path's write count.
+  Evidence owed: same-method before/after on the P150 (identical leg,
+  JIT-discard per arm, one lock hold) reporting BOTH the per-step write
+  count and the wall time, plus a fresh benchmark-record entry; a count
+  that does not drop or a wall that does not move is a reported result
+  — the attribution shifts or the lever is named unreachable with the
+  trace that proves it.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -354,8 +380,8 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `017c3277f` (bumped
-2026-08-29; W5 #2244 via #2258 landed since the previous `a456e6eaf`). Branch
+in `.agents/developer-preferences.md`). Base `origin/main` @ `785d4304f` (bumped
+2026-08-29; W6 #2273 via #2280 landed since the previous `017c3277f`). Branch
 `row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 

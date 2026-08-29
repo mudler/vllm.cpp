@@ -265,6 +265,17 @@ struct StagingStats {
   uint64_t uploads_bulk_bf16 = 0;   // bulk bf16 uploads from EnsureDevice2D
   uint64_t staged_bulk_bf16_bytes = 0;
   uint64_t staged_f32_elems = 0;    // elements staged via the f32 path
+  // ---- BACKEND-TENSTORRENT-QWEN35 W5 (#2244): allocation-free staging ----
+  // Subdivision of uploads_bulk_bf16 (which keeps counting every bulk bf16
+  // staging, W4 route pin unchanged). uploads_persistent_bf16 counts the
+  // uploads written IN PLACE into the per-slot persistent device buffer via
+  // the mesh command queue; uploads_persistent_allocs counts the (re)
+  // allocations of that buffer — cold slot or staging-geometry change. A
+  // steady-state decode step must show allocs == 0 and every bulk upload on
+  // the persistent route; churn in allocs is visible debt for the profile.
+  uint64_t uploads_persistent_bf16 = 0;
+  uint64_t uploads_persistent_allocs = 0;
+  uint64_t staged_persistent_bf16_bytes = 0;
 };
 #ifdef VLLM_CPP_TENSTORRENT
 StagingStats GetStagingStats();

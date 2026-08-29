@@ -188,7 +188,8 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // `## Owed` in the row spec.
   //
   // IT WENT STALE AGAIN WITHIN TWO WAVES, WHICH IS WHY IT IS EDITED HERE AND
-  // NOT LEFT FOR THE LOOP WAVE. The survey listed FIVE, and two of the five are
+  // NOT LEFT FOR THE LOOP WAVE. That staleness is #2288, filed for traceability
+  // and fixed in the same flow by #2265. The survey listed FIVE, and two of the five are
   // now on `main`. The grouped RMS norm is `vt::RmsNormGroup`, landed by W5d-1
   // (#2249 item 1) — the very change this file is being merged alongside, so
   // leaving the clause would have shipped a commit whose product output denies

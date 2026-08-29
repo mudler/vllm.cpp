@@ -2417,6 +2417,20 @@ is listed under `## Owed`.
 
 ## Owed
 
+- **A REFUSAL THAT ENUMERATES PROSE GOES STALE SILENTLY, AND NOTHING PREVENTS THE
+  FOURTH INSTANCE.** [#2288](https://github.com/mudler/vllm.cpp/issues/2288) is
+  fixed by [#2265](https://github.com/mudler/vllm.cpp/pull/2265) for the two
+  items that had gone false, but only those two: the DURABLE fix is not made
+  here. `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` pins that five
+  substrings are PRESENT, never that any of them is still TRUE, so a refusal
+  listing finished work satisfies every assertion — it is a spelling gate, not a
+  truth gate. This is the third instance on this row in one day (#2276 for the
+  paged QSA consumer, #2254 for the opposite polarity, an understated refusal).
+  A truth-linked check — each enumerated item naming a symbol whose absence the
+  suite verifies — or a convention that the refusal enumerates ISSUE NUMBERS
+  rather than prose would close it, and both are larger than this flow and belong
+  to whoever owns the reachability convention. Recorded here so the residual has
+  a named home rather than living only in the issue.
 - **W5d-1 (#2249 item 1) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::RmsNormGroup` (`include/vt/ops.h`, dispatcher `src/vt/ops.cpp`, CPU kernel
   `RmsNormGroupKernel` in `src/vt/cpu/cpu_ops.cpp`, name in
@@ -3455,7 +3469,9 @@ is listed under `## Owed`.
   stop a token, and each now named in the `ForwardQwen4ExpForConditionalGeneration`
   refusal so the next reader does not re-derive it:
     1. **CLOSED by W5d-1 (#2249 item 1): there is no standalone grouped RMS
-       norm — there is now.** `vt::RmsNormGroup` / `OpId::kRmsNormGroup` is that
+       norm — there is now.** The refusal string that still said otherwise is
+       [#2288](https://github.com/mudler/vllm.cpp/issues/2288), fixed by
+       [#2265](https://github.com/mudler/vllm.cpp/pull/2265). `vt::RmsNormGroup` / `OpId::kRmsNormGroup` is that
        op, registered on `kCPU`, gated by `tests/vt/test_ops_rms_norm_group.cpp`
        at 7 cases / 69 assertions, and its own mutation record is the
        `## Mutation record — W5d-1` section above. The survey text is kept below
@@ -3493,7 +3509,11 @@ is listed under `## Owed`.
        mapping rather than a copy — but it is unwritten and unmeasured, and
        nothing yet proves a bf16 tower routes through `ExpertMlpKq`.
     5. **CLOSED by W5d-2 (#2249 item 5, `3ed2378a3`): the mRoPE table builder
-       has internal linkage — it no longer does.** `BuildMropeCosSinHost` is
+       has internal linkage — it no longer does.** This half of
+       [#2288](https://github.com/mudler/vllm.cpp/issues/2288) is pre-existing
+       debt from [#2264](https://github.com/mudler/vllm.cpp/pull/2264), which
+       corrected this prose and left the refusal string; both are fixed by
+       [#2265](https://github.com/mudler/vllm.cpp/pull/2265). `BuildMropeCosSinHost` is
        declared at `include/vllm/model_executor/models/qwen3_5_mrope.h:55` and
        defined without `static` at `qwen3_5.cpp:9475` on this merged head, so
        the QSA half can build the SAME tables the Qwen3.5/3.6 VL drivers build.
@@ -3597,7 +3617,11 @@ it has these prerequisites, at least two of which (the grouped norm, the paged
 QSA arm) are op-sized waves of their own.**
 
 **TWO OF THE FIVE ARE NOW CLOSED, AND THE COUNT IS STATED HERE RATHER THAN LEFT
-TO A READER TO RECOUNT.** The grouped RMS norm is `vt::RmsNormGroup`, landed by
+TO A READER TO RECOUNT.** The stale enumeration is
+[#2288](https://github.com/mudler/vllm.cpp/issues/2288), filed for traceability
+and FIXED IN THE SAME FLOW by
+[#2265](https://github.com/mudler/vllm.cpp/pull/2265), which is the wave this
+correction rides with. The grouped RMS norm is `vt::RmsNormGroup`, landed by
 W5d-1 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 1) — the
 wave this section is being merged with, which is why the correction rides here.
 The externally linked mRoPE builder is `BuildMropeCosSinHost`, landed by W5d-2

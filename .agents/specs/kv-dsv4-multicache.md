@@ -27,9 +27,9 @@ MLA arms ([#1974](https://github.com/mudler/vllm.cpp/issues/1974)) are fixed in
 flow. Nothing consumed the topology, so that refusal was what a DeepSeek-V4
 engine hit.
 
-W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)) is claimed and its
-design is `### W3 design — the runner carries every published group, and a third
-forward channel`. It makes the runner allocate a buffer for every published cache
+W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)) LANDED as
+`ca3dcda21` (2026-08-27). Its design is `### W3 design — the runner carries every
+published group, and a third forward channel`. It makes the runner allocate a buffer for every published cache
 instead of one per hidden layer, generalizes `full_attn_group_id_` /
 `gdn_group_id_` and the three-valued `LayerKvClass`, and adds the third
 `ModelForwardInput` channel. **This is the wave that touches every model**, so
@@ -38,6 +38,12 @@ the SACRED `test_qwen35_paged_engine` regression. **Still nothing reads a
 cache** — a DeepSeek-V4 engine now constructs and allocates all 167 buffers and
 its first forward refuses, naming W5. W4 through W7 remain proposals with no
 owner.
+
+**The opening of this section read "W3 is claimed" until 2026-08-29**, while the
+paragraph above already described W3's landed behaviour. A reader who stopped at
+the first sentence concluded W3 was the wall and wrote it into another row's spec
+([#2302](https://github.com/mudler/vllm.cpp/issues/2302)). The wall is W5, and it
+has no owner.
 
 ## Scope
 

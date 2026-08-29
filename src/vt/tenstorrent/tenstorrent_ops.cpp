@@ -289,14 +289,14 @@ struct BufferSlot {
   // NOTHING for a reserved slot: it serves the resident persistent buffer at
   // the same geometry, or hands out an empty one at a new geometry. Restage
   // semantics: the service ALIASES the slot's persistent buffer in place (W5)
-  // — no fresh snapshot is created. EVERY content-establishing transition
-  // clears the flag (CommitHost, MarkHostWritten, the device commits, the
-  // staging commits, the memset/copy arms): from the first real bytes on, the
-  // slot is a live tensor and the upload-on-stale contract applies again. The
-  // reserved arm additionally refuses whenever device_current is set, so a
-  // leaked flag can cost a restage but never discards a live shadow (the
-  // #2282 drift: a stale [5,1024] persistent served over a live [8,256]
-  // commit poisoned prompt 1's first token).
+  // — no fresh snapshot is created. The shadow-installing transitions clear
+  // the flag (CommitHost, MarkHostWritten, the device commits, the staging
+  // commits, the memset/copy arms); paths that install content without
+  // spending it (the plain staging arm, the embed-table patch) are still safe
+  // because they set device_current, and the reserved arm refuses whenever
+  // device_current is set — a leaked flag can cost a restage but never
+  // discards a live shadow (the #2282 drift: a stale [5,1024] persistent
+  // served over a live [8,256] commit poisoned prompt 1's first token).
   bool device_reserved = false;
   // BACKEND-TENSTORRENT-GDN W2: the conv-state shadow is stored TIME-MAJOR
   // ([sl+1, slots*C], one scratch row) because ttnn slice/concat are exact on

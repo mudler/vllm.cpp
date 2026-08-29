@@ -4611,14 +4611,17 @@ TEST_CASE("kTENSTORRENT W7 D2D copy records the served geometry") {
 
 // W7 drift repair (#2282): the reservation must not survive content
 // establishment, and the reserved arm must never discard a live shadow.
-// Captured on the host-free e2e drift (LEG B, prompt[1] tok=0,
-// VT_TT_ARM_TRACE seq=24277..24341): a pool block handed to a new tenant
+// Captured on the host-free e2e drift (LEG B, prompt[1] tok=0): a pool
+// block handed to a new tenant
 // received a device-committed [8,256] result while device_reserved stayed
 // armed; the next bf16 consumer staged the block at its earlier [5,1024]
 // geometry, took the reserved arm, and was handed the STALE persistent
 // buffer — the previous tenant's bytes — while the live [8,256] shadow was
 // dropped. The stage must fall through to the normal path (refresh + upload)
-// whenever the slot holds a live device shadow.
+// whenever the slot holds a live device shadow. The arming wiring itself
+// (OnScratchBlockAcquired -> MarkScratchAcquired) is pinned by the sibling
+// acquired-block-restages-nothing test below; this test pins the
+// serve-over-live-shadow guard, which passes vacuously if arming is removed.
 TEST_CASE("kTENSTORRENT W7 reservation never serves over a live device shadow") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");

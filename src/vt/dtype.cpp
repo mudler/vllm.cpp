@@ -128,6 +128,25 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{32, 18, 20, "iq4_nl"};
       return &g;
     }
+    case DType::kIQ2_XS: {
+      // block_iq2_xs (llama.cpp @ b10451 ggml/src/ggml-common.h:388-392):
+      // f16 d + u16 qs[QK_K/8] + u8 scales[QK_K/32] = 2 + 64 + 8 = 74, i.e.
+      // 2.3125 bpw. ggml type id 17 (ggml/include/ggml.h:407). Codebook
+      // (iq2xs_grid, 512 entries) decode: each u16 of `qs` carries a 9-bit grid
+      // index in its low bits and a 7-bit ksigns selector in its high bits.
+      static constexpr BlockGeometry g{256, 74, 17, "iq2_xs"};
+      return &g;
+    }
+    case DType::kIQ4_XS: {
+      // block_iq4_xs (llama.cpp @ b10451 ggml/src/ggml-common.h:454-459):
+      // f16 d + u16 scales_h + u8 scales_l[QK_K/64] + u8 qs[QK_K/2]
+      // = 2 + 2 + 4 + 128 = 136. ggml type id 23 (ggml/include/ggml.h:413).
+      // Same 16-entry `kValuesIq4nl` codebook as IQ4_NL, so the DELTA is the
+      // super-block scale layout: a 6-bit `ls` spliced from a `scales_l` nibble
+      // and a `scales_h` bit pair, biased by -32, per 32 elements.
+      static constexpr BlockGeometry g{256, 136, 23, "iq4_xs"};
+      return &g;
+    }
     case DType::kMXFP4: {
       // block_mxfp4 (ggml-common.h:204-209): u8 e (E8M0 shared exponent)
       // + u8 qs[QK_MXFP4/2] = 1 + 16 = 17, QK_MXFP4 = 32. ggml type id 39.
@@ -169,7 +188,8 @@ bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
       DType::kQ4_0, DType::kQ5_0,  DType::kQ8_0,     DType::kQ2_K, DType::kQ3_K,
       DType::kQ4_K, DType::kQ5_K,  DType::kQ6_K,     DType::kQ8_K,
       DType::kIQ2_XXS, DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4,
-      DType::kIQ1_S, DType::kIQ1_XXXS, DType::kIQ4_NL};
+      DType::kIQ1_S, DType::kIQ1_XXXS, DType::kIQ4_NL,
+      DType::kIQ2_XS, DType::kIQ4_XS};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -218,6 +238,8 @@ size_t SizeOf(DType dtype) {
     case DType::kIQ1_XXXS:
     case DType::kIQ4_NL:
     case DType::kMXFP4:
+    case DType::kIQ2_XS:
+    case DType::kIQ4_XS:
       VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
                           Name(dtype) + " has no per-element size");
       return 0;
@@ -250,6 +272,8 @@ const char* Name(DType dtype) {
     case DType::kIQ1_XXXS: return "iq1_xxxs";
     case DType::kIQ4_NL: return "iq4_nl";
     case DType::kMXFP4: return "mxfp4";
+    case DType::kIQ2_XS: return "iq2_xs";
+    case DType::kIQ4_XS: return "iq4_xs";
   }
   return "?";
 }

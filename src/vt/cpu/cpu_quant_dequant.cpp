@@ -15,7 +15,7 @@
 // tests/vllm/test_gguf_dequant.cpp gates that.
 #include <cstring>
 
-#include "cpu_quant_iq_tables.h"  // kIq2xxsGrid/kIq3xxsGrid/kKsignsIq2xs/kKmaskIq2xs
+#include "cpu_quant_iq_tables.h"  // kIq2xxsGrid/kIq2xsGrid/kIq3xxsGrid/kKsignsIq2xs/kKmaskIq2xs
 #include "vt/quant.h"
 #include "vt/dtype.h"
 
@@ -374,6 +374,75 @@ void DequantIQ3_XXS(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+// block_iq2_xs = { f16 d; u16 qs[32]; u8 scales[8]; } (74 bytes)
+// llama.cpp @ b10451 ggml/src/ggml-quants.c:2516 dequantize_row_iq2_xs.
+// Codebook decode over 8 sub-blocks of 32, 4 lanes of 8 each. Lane l reads ONE
+// u16 `qs[4*ib32 + l]` that carries BOTH halves of the lane: the low 9 bits are
+// the index into the 512-entry kIq2xsGrid (`& 511`) and the high 7 bits select
+// the sign byte from kKsignsIq2xs (`>> 9`). That packing is what separates
+// IQ2_XS from its siblings: IQ2_XXS keeps the signs in a second u32 and IQ2_S
+// keeps them in a direct sign byte, so a decoder written from either of those
+// still runs here and still produces plausible magnitudes.
+// scales[ib32] packs two 4-bit ls: low nibble -> db[0] (lanes 0,1), high nibble
+// -> db[1] (lanes 2,3); db = d*(0.5 + ls)*0.25, as in IQ2_S.
+void DequantIQ2_XS(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  float db[2];
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 74;
+    const float d = ReadF16(blk);
+    const uint8_t* qs = blk + 2;       // u16 qs[32], little-endian bytes
+    const uint8_t* scales = blk + 66;  // u8 scales[8]
+    for (int ib32 = 0; ib32 < qk / 32; ++ib32) {
+      db[0] = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+      db[1] = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+      for (int l = 0; l < 4; ++l) {
+        uint16_t q = 0;
+        std::memcpy(&q, qs + 2 * (4 * ib32 + l), sizeof(q));
+        const uint8_t* grid =
+            reinterpret_cast<const uint8_t*>(kIq2xsGrid + (q & 511));
+        const uint8_t signs = kKsignsIq2xs[q >> 9];
+        for (int j = 0; j < 8; ++j)
+          y[j] = db[l / 2] * grid[j] * ((signs & kKmaskIq2xs[j]) ? -1.f : 1.f);
+        y += 8;
+      }
+    }
+  }
+}
+
+// block_iq4_xs = { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128] } (136 bytes)
+// llama.cpp @ b10451 ggml/src/ggml-quants.c:2743 dequantize_row_iq4_xs.
+// The SAME 16-entry non-linear codebook as IQ4_NL (kValuesIq4nl, deliberately
+// shared rather than duplicated), over a 256-element super-block: what differs
+// is the SCALE. Each 32-element sub-block ib has a 6-bit `ls` spliced from a
+// nibble of scales_l and a bit pair of scales_h, and the sub-block delta is
+// BIASED: dl = d * (ls - 32). IQ4_NL has one unbiased f16 delta per 32 elements
+// and no splice at all, so the two are not interchangeable despite the codebook.
+// Within a sub-block the nibbles use the split-half packing (element j in the
+// low nibble of qs[j], j+16 in the high), like Q4_0 and IQ4_NL.
+void DequantIQ4_XS(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 136;
+    const float d = ReadF16(blk);
+    uint16_t scales_h = 0;
+    std::memcpy(&scales_h, blk + 2, sizeof(scales_h));
+    const uint8_t* scales_l = blk + 4;  // u8 scales_l[4]
+    const uint8_t* qs = blk + 8;        // u8 qs[128]
+    for (int ib = 0; ib < qk / 32; ++ib) {
+      const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                     (((scales_h >> (2 * ib)) & 3) << 4);
+      const float dl = d * (ls - 32);
+      for (int j = 0; j < 16; ++j) {
+        y[j + 0] = dl * kValuesIq4nl[qs[j] & 0xf];
+        y[j + 16] = dl * kValuesIq4nl[qs[j] >> 4];
+      }
+      y += 32;
+      qs += 16;
+    }
+  }
+}
+
 // block_iq2_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 scales[8]; } (82 bytes)
 // dequantize_row_iq2_s:2471. Codebook decode: 8 sub-blocks of 32. Each of the 4
 // lanes reads a grid-index low byte (qs[l]) OR'd with 2 high bits from qh[ib32]
@@ -517,6 +586,8 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kIQ1_XXXS: return &ToFloatAdapter<&DequantIQ1_XXXS, 256>;
     case DType::kIQ4_NL: return &ToFloatAdapter<&DequantIQ4_NL, 32>;
     case DType::kMXFP4: return &ToFloatAdapter<&DequantMXFP4, 32>;
+    case DType::kIQ2_XS: return &ToFloatAdapter<&DequantIQ2_XS, 256>;
+    case DType::kIQ4_XS: return &ToFloatAdapter<&DequantIQ4_XS, 256>;
     default: return nullptr;
   }
 }

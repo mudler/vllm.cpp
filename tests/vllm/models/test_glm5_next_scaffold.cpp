@@ -666,11 +666,16 @@ TEST_CASE("glm5_next: the forward REFUSES BY NAME, and names what is UNASSEMBLED
     forward_msg = e.what();
   }
   CHECK(forward_msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  // The waves that still owe assembly, each named with what it owes.
+  // The waves that still owe assembly, each named with what it owes -- and W5c
+  // named as LANDED rather than owing, which is the direction it moved when the
+  // weight tower went in (#2242). `load_weights` stays asserted for that reason:
+  // the message has to say the load is DONE, so a reader who lands here is sent
+  // to the forward and not back to a tower that exists.
   CHECK(forward_msg.find("W5b") != std::string::npos);
   CHECK(forward_msg.find("W5c") != std::string::npos);
   CHECK(forward_msg.find("W6") != std::string::npos);
   CHECK(forward_msg.find("load_weights") != std::string::npos);
+  CHECK(forward_msg.find("returns a real LoadedModel") != std::string::npos);
   CHECK(forward_msg.find("assembled Glm5NextTextModel forward") != std::string::npos);
   // The two look-alikes, still named, because substituting either produces
   // fluent wrong text no gate on this fleet could detect.
@@ -881,10 +886,15 @@ TEST_CASE("glm5_next: the tensor inventory is generated from the topology") {
 
   // Counted from the maps and the schedule rather than transcribed: 3
   // model-level (`tie_word_embeddings` is false, so `output.weight` is its own
-  // tensor), then per layer 8 common + (15 KDA | 14 DSA) + (3 dense | 5+3
-  // sparse), then 11 vision + 24 * 14 vision-block.
+  // tensor), then per layer 8 common + (15 KDA | 13 DSA + 2 SPLIT MLA halves) +
+  // (3 dense | 5+3 sparse), then 11 vision + 24 * 14 vision-block.
+  //
+  // The DSA term is 13 + 2 and not 14, and #2242 is why: `kv_b_proj` is ONE HF
+  // parameter and TWO GGUF tensors, because llama.cpp #27752's converter splits
+  // it and transposes the k half. It cannot live in the 1:1 map, so it has its
+  // own table and its own term here.
   const int64_t expected =
-      3 + (34 * (8 + 15)) + (11 * (8 + 14)) + (3 * 3) + (42 * (5 + 3)) +
+      3 + (34 * (8 + 15)) + (11 * (8 + 13 + 2)) + (3 * 3) + (42 * (5 + 3)) +
       11 + (24 * 14);
   CHECK(static_cast<int64_t>(names.size()) == expected);
 
@@ -900,6 +910,16 @@ TEST_CASE("glm5_next: the tensor inventory is generated from the topology") {
   // A DSA layer carries the MLA tower, the indexer, its LayerNorm BIAS (which
   // is what settles LayerNorm over RMSNorm) and the k-pool compressor.
   CHECK(has("blk.3.attn_kv_a_mqa.weight"));
+  // The two SPLIT absorbed halves, and NOT the fused tensor. The published
+  // artifact carries `attn_k_b` and `attn_v_b` on every DSA block and no
+  // `attn_kv_b.weight` anywhere (#2242, #2291).
+  CHECK(has("blk.3.attn_k_b.weight"));
+  CHECK(has("blk.3.attn_v_b.weight"));
+  CHECK_FALSE(has("blk.3.attn_kv_b.weight"));
+  // And `ssm_dt.bias`, not `ssm_dt`: the converter renames `.dt_bias` to
+  // `.dt_proj.bias` before its generic map runs.
+  CHECK(has("blk.0.ssm_dt.bias"));
+  CHECK_FALSE(has("blk.0.ssm_dt"));
   CHECK(has("blk.3.indexer.k_norm.bias"));
   CHECK(has("blk.3.indexer_compressor_ape.weight"));
   CHECK(has("blk.3.indexer_compressor_gate.weight"));
@@ -945,10 +965,74 @@ namespace {
 // dies at the tokenizer and never reaches the refusal those cases are about.
 // The config-layer cases below must not also be asserting a vocabulary, which
 // is why this is a switch rather than an unconditional block.
+//
+// THE PUBLISHED-SHAPE KNOBS are what the published
+// `unsloth/GLM-5.3-Flash-GGUF` artifact needs and our own converter's output
+// does not. An EMPTY `layer_types` omits that key entirely, which is the shape
+// of every published file; a non-empty `head_count_kv_arr` replaces the scalar
+// `attention.head_count_kv` with the per-layer `array[i32]` those files carry;
+// non-empty clamp vectors replace the scalar `swiglu_clamp_exp` with the
+// `array[f32]` pair; and a non-zero `nextn_predict_layers` writes that key, so
+// a case can state how many of the `block_count` blocks are MTP rather than
+// backbone. Defaults keep every existing case byte-identical.
+//
+// The FIRST argument of `PublishedShapeGguf` is the BLOCK count and is written
+// to `block_count`, so every per-block array this builder generates is block
+// length -- which is what llama.cpp writes and what the reader checks against.
+//
+// THE MLA AND KDA SPELLING KNOBS are #2268's. `key_length` and `value_length`
+// default to llama.cpp's own meaning of those names — `kv_lora_rank +
+// qk_rope_head_dim` and `kv_lora_rank`, `b10451:conversion/deepseek.py:345-346`
+// — which for this model is 512 and 512 and is what the published artifact
+// carries. `kda_heads` selects WHICH key states the linear-attention head
+// count, because the two producers spell it differently and the published file
+// spells it in no key at all; `ssm_a_entries` writes the `blk.<L>.ssm_a` tensor
+// whose length IS that count, which is the only place that file states it.
+struct Glm5NextGgufArrays {
+  std::vector<int32_t> head_count_kv;
+  std::vector<float> swiglu_clamp_exp;
+  std::vector<float> swiglu_clamp_shexp;
+  int64_t nextn_predict_layers = 0;
+
+  // Which key carries the KDA head count. `kOurs` is
+  // `attention.linear_head_count`, the key `scripts/convert-glm5-next-gguf.py`
+  // writes and llama.cpp spells nowhere; `kGroupCount` and `kInnerSize` are
+  // llama.cpp's `ssm.group_count` and `ssm.inner_size`; `kNone` writes none,
+  // which is the published artifact.
+  enum class KdaHeads { kOurs, kGroupCount, kInnerSize, kNone };
+  KdaHeads kda_heads = KdaHeads::kOurs;
+  int64_t kda_head_count = 64;
+  // A 1-D F32 `ssm_a` on the first `linear_attention` block, of this many
+  // entries. Zero writes no tensor.
+  int64_t ssm_a_entries = 0;
+
+  int64_t kv_lora_rank = 512;
+  int64_t key_length = 512;
+  int64_t value_length = 512;
+  int64_t key_length_mla = 256;
+  int64_t value_length_mla = 256;
+  int64_t rope_dimension_count = 0;
+  int64_t kda_head_dim = 128;
+
+  // `tokenizer.ggml.pre`, when `with_tokenizer` is on. The default is the
+  // pre name every existing case here was written against; the PUBLISHED
+  // artifact states `glm4`, which is what #2277's case selects.
+  std::string tokenizer_pre = "qwen35";
+
+  // Write the `vision.*` metadata block. TRUE by default, because every case
+  // here was written against a file that carries it. The PUBLISHED artifact's
+  // text container carries NONE of it — its tower ships as a separate
+  // `mmproj-BF16.gguf` — and W5c's loader refuses a vision-declaring config up
+  // front, so a case that wants to reach the TENSOR tower turns this off
+  // (#2242).
+  bool with_vision = true;
+};
+
 std::string PublishedShapeGguf(int64_t n_layers,
                                const std::vector<std::string>& layer_types,
                                uint32_t head_count_kv = 64,
-                               bool with_tokenizer = false) {
+                               bool with_tokenizer = false,
+                               const Glm5NextGgufArrays& arrays = {}) {
   gguf_test::GgufModelBuilder b;
   const std::string k = "glm5next.";
   b.AddKv(gguf_test::StrKv("general.architecture", "glm5next"));
@@ -968,29 +1052,74 @@ std::string PublishedShapeGguf(int64_t n_layers,
   b.AddKv(gguf_test::F32Kv(k + "expert_weights_scale", 2.5f));
   b.AddKv(gguf_test::BoolKv(k + "expert_weights_norm", true));
   b.AddKv(gguf_test::U32Kv(k + "attention.head_count", 64));
-  b.AddKv(gguf_test::U32Kv(k + "attention.head_count_kv", head_count_kv));
+  if (arrays.head_count_kv.empty()) {
+    b.AddKv(gguf_test::U32Kv(k + "attention.head_count_kv", head_count_kv));
+  } else {
+    b.AddKv(gguf_test::I32ArrayKv(k + "attention.head_count_kv",
+                                  arrays.head_count_kv));
+  }
   b.AddKv(gguf_test::F32Kv(k + "attention.layer_norm_rms_epsilon", 1e-5f));
   b.AddKv(gguf_test::U32Kv(k + "attention.q_lora_rank", 1536));
-  b.AddKv(gguf_test::U32Kv(k + "attention.kv_lora_rank", 512));
-  b.AddKv(gguf_test::U32Kv(k + "attention.key_length_mla", 256));
-  b.AddKv(gguf_test::U32Kv(k + "attention.value_length_mla", 256));
-  b.AddKv(gguf_test::U32Kv(k + "attention.key_length", 256));
-  b.AddKv(gguf_test::F32Kv(k + "swiglu_clamp_exp", 10.0f));
-  b.AddKv(gguf_test::U32Kv(k + "rope.dimension_count", 0));
+  b.AddKv(gguf_test::U32Kv(k + "attention.kv_lora_rank",
+                           static_cast<uint32_t>(arrays.kv_lora_rank)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.key_length_mla",
+                           static_cast<uint32_t>(arrays.key_length_mla)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.value_length_mla",
+                           static_cast<uint32_t>(arrays.value_length_mla)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.key_length",
+                           static_cast<uint32_t>(arrays.key_length)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.value_length",
+                           static_cast<uint32_t>(arrays.value_length)));
+  if (arrays.swiglu_clamp_exp.empty()) {
+    b.AddKv(gguf_test::F32Kv(k + "swiglu_clamp_exp", 10.0f));
+  } else {
+    b.AddKv(gguf_test::F32ArrayKv(k + "swiglu_clamp_exp",
+                                  arrays.swiglu_clamp_exp));
+  }
+  if (!arrays.swiglu_clamp_shexp.empty()) {
+    b.AddKv(gguf_test::F32ArrayKv(k + "swiglu_clamp_shexp",
+                                  arrays.swiglu_clamp_shexp));
+  }
+  if (arrays.nextn_predict_layers != 0) {
+    b.AddKv(gguf_test::U32Kv(
+        k + "nextn_predict_layers",
+        static_cast<uint32_t>(arrays.nextn_predict_layers)));
+  }
+  b.AddKv(gguf_test::U32Kv(
+      k + "rope.dimension_count",
+      static_cast<uint32_t>(arrays.rope_dimension_count)));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.head_count", 32));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.key_length", 128));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.top_k", 2048));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.kpool", 4));
   b.AddKv(gguf_test::BoolKv(k + "attention.indexer.kpool_always_select_tail",
                             true));
-  b.AddKv(gguf_test::U32Kv(k + "kda.head_dim", 128));
+  b.AddKv(gguf_test::U32Kv(k + "kda.head_dim",
+                           static_cast<uint32_t>(arrays.kda_head_dim)));
   b.AddKv(gguf_test::F32Kv(k + "kda.gate_lower_bound", -5.0f));
-  b.AddKv(gguf_test::U32Kv(k + "attention.linear_head_count", 64));
+  const uint32_t kda_heads = static_cast<uint32_t>(arrays.kda_head_count);
+  switch (arrays.kda_heads) {
+    case Glm5NextGgufArrays::KdaHeads::kOurs:
+      b.AddKv(gguf_test::U32Kv(k + "attention.linear_head_count", kda_heads));
+      break;
+    case Glm5NextGgufArrays::KdaHeads::kGroupCount:
+      b.AddKv(gguf_test::U32Kv(k + "ssm.group_count", kda_heads));
+      break;
+    case Glm5NextGgufArrays::KdaHeads::kInnerSize:
+      b.AddKv(gguf_test::U32Kv(
+          k + "ssm.inner_size",
+          static_cast<uint32_t>(arrays.kda_head_count * arrays.kda_head_dim)));
+      break;
+    case Glm5NextGgufArrays::KdaHeads::kNone:
+      break;
+  }
   b.AddKv(gguf_test::U32Kv(k + "ssm.conv_kernel", 4));
   b.AddKv(gguf_test::U32Kv(k + "hyper_connection.count", 4));
   b.AddKv(gguf_test::U32Kv(k + "hyper_connection.sinkhorn_iterations", 20));
   b.AddKv(gguf_test::F32Kv(k + "hyper_connection.epsilon", 1e-6f));
-  b.AddKv(gguf_test::StrArrayKv(k + "layer_types", layer_types));
+  if (!layer_types.empty()) {
+    b.AddKv(gguf_test::StrArrayKv(k + "layer_types", layer_types));
+  }
   std::vector<std::string> mlp;
   std::vector<std::string> indexer;
   for (int64_t i = 0; i < n_layers; ++i) {
@@ -1005,30 +1134,55 @@ std::string PublishedShapeGguf(int64_t n_layers,
   b.AddKv(gguf_test::U32Kv(k + "image_end_token_id", 154831));
   b.AddKv(gguf_test::U32Kv(k + "video_start_token_id", 154832));
   b.AddKv(gguf_test::U32Kv(k + "video_end_token_id", 154833));
-  b.AddKv(gguf_test::U32Kv(k + "vision.block_count", 24));
-  b.AddKv(gguf_test::U32Kv(k + "vision.embedding_length", 1024));
-  b.AddKv(gguf_test::U32Kv(k + "vision.feed_forward_length", 4096));
-  b.AddKv(gguf_test::U32Kv(k + "vision.head_count", 16));
-  b.AddKv(gguf_test::U32Kv(k + "vision.patch_size", 14));
-  b.AddKv(gguf_test::U32Kv(k + "vision.image_size", 448));
-  b.AddKv(gguf_test::U32Kv(k + "vision.spatial_merge_size", 2));
-  b.AddKv(gguf_test::U32Kv(k + "vision.temporal_patch_size", 2));
-  b.AddKv(gguf_test::U32Kv(k + "vision.out_embedding_length", 4096));
-  b.AddKv(gguf_test::U32Kv(k + "vision.projection_intermediate_size", 10240));
-  b.AddKv(gguf_test::F32Kv(k + "vision.attention.layer_norm_rms_epsilon",
-                           1e-5f));
-  b.AddKv(gguf_test::F32Kv(k + "vision.swiglu_clamp", 10.0f));
+  if (arrays.with_vision) {
+    b.AddKv(gguf_test::U32Kv(k + "vision.block_count", 24));
+    b.AddKv(gguf_test::U32Kv(k + "vision.embedding_length", 1024));
+    b.AddKv(gguf_test::U32Kv(k + "vision.feed_forward_length", 4096));
+    b.AddKv(gguf_test::U32Kv(k + "vision.head_count", 16));
+    b.AddKv(gguf_test::U32Kv(k + "vision.patch_size", 14));
+    b.AddKv(gguf_test::U32Kv(k + "vision.image_size", 448));
+    b.AddKv(gguf_test::U32Kv(k + "vision.spatial_merge_size", 2));
+    b.AddKv(gguf_test::U32Kv(k + "vision.temporal_patch_size", 2));
+    b.AddKv(gguf_test::U32Kv(k + "vision.out_embedding_length", 4096));
+    b.AddKv(gguf_test::U32Kv(k + "vision.projection_intermediate_size", 10240));
+    b.AddKv(gguf_test::F32Kv(k + "vision.attention.layer_norm_rms_epsilon",
+                             1e-5f));
+    b.AddKv(gguf_test::F32Kv(k + "vision.swiglu_clamp", 10.0f));
+  }
   if (with_tokenizer) {
     // "gpt2" is llama.cpp's name for byte-level BPE, and "qwen35" is the only
-    // pre name this tree maps without an approximation. A four-token vocabulary
-    // with no merges is enough: nothing below tokenizes anything, and the load
+    // pre name this tree mapped without an approximation before #2277 added
+    // `glm4`, which the published artifact states. A four-token vocabulary with
+    // no merges is enough: nothing below tokenizes anything, and the load
     // refuses two steps later.
     b.AddKv(gguf_test::StrKv("tokenizer.ggml.model", "gpt2"));
-    b.AddKv(gguf_test::StrKv("tokenizer.ggml.pre", "qwen35"));
+    b.AddKv(gguf_test::StrKv("tokenizer.ggml.pre", arrays.tokenizer_pre));
     b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.tokens",
                                   {"a", "b", "c", "d"}));
     b.AddKv(gguf_test::I32ArrayKv("tokenizer.ggml.token_type", {1, 1, 1, 1}));
     b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.merges", {}));
+  }
+  // `ssm_a` on the FIRST `linear_attention` block, which is where the reader
+  // looks when no key states the head count. Placed by the schedule rather
+  // than at block 0 so the inventory contradiction check cannot fire on it.
+  if (arrays.ssm_a_entries > 0) {
+    int64_t il = 0;
+    for (int64_t i = 0; i < n_layers; ++i) {
+      const bool linear =
+          !arrays.head_count_kv.empty()
+              ? arrays.head_count_kv[static_cast<size_t>(i)] == 0
+              : (layer_types.empty() ||
+                 layer_types[static_cast<size_t>(i)] == "linear_attention");
+      if (linear) {
+        il = i;
+        break;
+      }
+    }
+    b.AddTensor("blk." + std::to_string(il) + ".ssm_a",
+                {static_cast<uint64_t>(arrays.ssm_a_entries)},
+                /*GGML_TYPE_F32=*/0,
+                std::string(static_cast<size_t>(arrays.ssm_a_entries) * 4,
+                            '\0'));
   }
   return b.Build();
 }
@@ -1062,8 +1216,9 @@ std::string SchedulePlusTensor(const std::vector<std::string>& types,
   b.AddKv(gguf_test::U32Kv("glm5next.context_length", 1048576));
   b.AddKv(gguf_test::U32Kv("glm5next.attention.head_count", 64));
   b.AddKv(gguf_test::F32Kv("glm5next.attention.layer_norm_rms_epsilon", 1e-5f));
+  b.AddKv(gguf_test::U32Kv("glm5next.attention.kv_lora_rank", 512));
   b.AddKv(gguf_test::U32Kv("glm5next.attention.key_length_mla", 256));
-  b.AddKv(gguf_test::U32Kv("glm5next.attention.key_length", 256));
+  b.AddKv(gguf_test::U32Kv("glm5next.attention.key_length", 512));
   b.AddKv(gguf_test::U32Kv("glm5next.rope.dimension_count", 0));
   b.AddKv(gguf_test::U32Kv("glm5next.vocab_size", 154880));
   b.AddKv(gguf_test::StrArrayKv("glm5next.layer_types", types));
@@ -1162,6 +1317,302 @@ TEST_CASE("glm5_next: an absent gate_lower_bound is NOT promoted to -5.0") {
   CHECK_FALSE(ParseGlm5NextParams(ConfigFrom(doc)).kda.takes_sigmoid_branch());
 }
 
+// ---------------------------------------------------------------------------
+// The PUBLISHED spelling of the schedule: `attention.head_count_kv` as a
+// per-layer `array[i32]`, with no `layer_types` anywhere in the file
+// (#2243, #2177).
+
+namespace {
+
+// The published `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL `head_count_kv`, read
+// out of shard 1's own KV block on 2026-08-29 (key index 21, `array[i32]`,
+// n=46): `0` on the 34 KDA layers and `1` on the 11 DSA layers at 3, 7, ..., 43
+// AND on entry 45, which is the multi-token-prediction block
+// (`nextn_predict_layers = 1`, `block_count = 46`, `num_hidden_layers = 45`).
+// That last entry is why the file has to be READ: it is MLA-shaped and
+// `45 % 4 == 1`, so it breaks the stride a synthesized schedule would apply.
+std::vector<int32_t> PublishedHeadCountKv() {
+  std::vector<int32_t> v(46, 0);
+  for (int i = 3; i <= 43; i += 4) v[static_cast<size_t>(i)] = 1;
+  v[45] = 1;
+  return v;
+}
+
+// llama.cpp's own predicate, `b10451:src/models/kimi-linear.cpp:18`:
+// `is_recr_impl[i] = hparams.n_head_kv(i) == 0`, "KDA layers are recurrent".
+std::vector<Glm5NextLayerKind> KindsOf(const std::vector<int32_t>& kv) {
+  std::vector<Glm5NextLayerKind> out;
+  for (int32_t n : kv) {
+    out.push_back(n == 0 ? Glm5NextLayerKind::kLinearAttention
+                         : Glm5NextLayerKind::kDeepseekSparseAttention);
+  }
+  return out;
+}
+
+// The `idx % 4 != 3` pattern the reader used to fall back to. Present so the
+// non-stride case can assert what a SYNTHESIZED schedule would have been, not
+// merely that the read one is right.
+std::vector<Glm5NextLayerKind> SynthesizedKinds(int64_t n) {
+  std::vector<Glm5NextLayerKind> out;
+  for (int64_t i = 0; i < n; ++i) {
+    out.push_back(i % 4 != 3 ? Glm5NextLayerKind::kLinearAttention
+                             : Glm5NextLayerKind::kDeepseekSparseAttention);
+  }
+  return out;
+}
+
+std::string PerLayerGguf(int64_t n_layers, const Glm5NextGgufArrays& arrays,
+                         const std::vector<std::string>& layer_types = {}) {
+  return PublishedShapeGguf(n_layers, layer_types, /*head_count_kv=*/64,
+                            /*with_tokenizer=*/false, arrays);
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next: the published GGUF states its schedule ONLY in head_count_kv") {
+  // Before this change the builder read `attention.head_count_kv` with
+  // `OptInt`, whose `default:` arm threw `key glm5next.attention.head_count_kv
+  // is not an integer` on the array form, and then REQUIRED a `layer_types` no
+  // published artifact carries. Both refusals stood between this project and
+  // the only artifact of this model that exists.
+  const std::vector<int32_t> kv = PublishedHeadCountKv();
+  REQUIRE(kv.size() == 46u);
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = kv;
+  arrays.swiglu_clamp_exp = std::vector<float>(46, 10.0f);
+  arrays.swiglu_clamp_shexp = std::vector<float>(46, 10.0f);
+  arrays.nextn_predict_layers = 1;
+
+  const Glm5NextParams p =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(46, arrays)));
+
+  // BLOCKS ARE NOT LAYERS, and this is asserted as the RELATIONSHIP llama.cpp
+  // writes -- `block_count = num_hidden_layers + nextn_predict_layers`
+  // (`b10451:conversion/exaone.py:134`) -- rather than as the bare 45. A file
+  // with a different `nextn_predict_layers` therefore cannot pass this case
+  // unchanged, which a literal could not tell us.
+  constexpr int64_t kBlocks = 46;
+  constexpr int64_t kMtp = 1;
+  CHECK(p.num_hidden_layers == kBlocks - kMtp);
+  // ...and 45 is exactly what the released `config.json` declares, so the two
+  // sources of this one model agree on its depth.
+  CHECK(p.num_hidden_layers == 45);
+  CHECK(static_cast<int64_t>(p.layer_types.size()) == kBlocks - kMtp);
+  CHECK(static_cast<int64_t>(p.mlp_layer_types.size()) == kBlocks - kMtp);
+  CHECK(static_cast<int64_t>(p.indexer_types.size()) == kBlocks - kMtp);
+
+  // The schedule is the array's BACKBONE entries, and the MTP block's entry is
+  // DROPPED rather than kept as a 46th layer. This is the sharp end of it:
+  // entry 45 is a `1` and entry 44 is a `0`, so a reader that forgot to
+  // truncate ends its stack with a DSA layer built out of the MTP block --
+  // which would run, and would produce plausible tokens.
+  const std::vector<int32_t> backbone(kv.begin(), kv.begin() + 45);
+  CHECK(p.layer_types == KindsOf(backbone));
+  CHECK(kv[44] == 0);
+  CHECK(kv[45] == 1);
+  CHECK(p.layer_types.back() == Glm5NextLayerKind::kLinearAttention);
+
+  // 34 KDA and 11 DSA over the BACKBONE -- the same split the `config.json`
+  // case asserts at the top of this file. The file's TWELFTH MLA-shaped block
+  // is the MTP one and is not a layer of this model.
+  CHECK(p.num_kda_layers() == 34);
+  CHECK(p.num_dsa_layers() == 11);
+
+  // Over the 45 backbone layers the published array AGREES with `idx % 4 == 3`
+  // exactly. That agreement is the coincidence this row keeps warning about, so
+  // it is asserted here rather than left implied -- and it is why the case
+  // below, not this one, is what proves the values are read.
+  CHECK(p.layer_types == SynthesizedKinds(45));
+
+  // The array is a SCHEDULE and not a KV-head count. Its non-zero entries are
+  // `1`; taking that as `num_key_value_heads` would refuse the published file
+  // with upstream's GQA message about a number this file never states.
+  CHECK(p.num_attention_heads == 64);
+  CHECK(p.num_key_value_heads == 64);
+  CHECK(p.swiglu_limit == doctest::Approx(10.0));
+
+  // THE SUBTRACTION IS LIVE. The same 46-entry file that declares no MTP block
+  // is a 46-layer model with twelve MLA-shaped layers, and entry 45 is then a
+  // layer rather than a dropped block. If `nextn_predict_layers` were ignored,
+  // this and the case above could not differ.
+  Glm5NextGgufArrays no_mtp = arrays;
+  no_mtp.nextn_predict_layers = 0;
+  const Glm5NextParams q =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(46, no_mtp)));
+  CHECK(q.num_hidden_layers == kBlocks);
+  CHECK(q.layer_types == KindsOf(kv));
+  CHECK(q.num_kda_layers() == 34);
+  CHECK(q.num_dsa_layers() == 12);
+  CHECK(q.layer_types.back() == Glm5NextLayerKind::kDeepseekSparseAttention);
+  // ...and THAT one is not the stride, because `45 % 4 == 1`.
+  CHECK(q.layer_types != SynthesizedKinds(46));
+}
+
+TEST_CASE("glm5_next: a GGUF and a config.json of the SAME model resolve identically") {
+  // The cross-source assertion. `block_count = 46` with
+  // `nextn_predict_layers = 1` and `num_hidden_layers = 45` are two spellings
+  // of one model's depth, and W1's whole design claim is that both sources meet
+  // one parser. Reading `block_count` into `num_hidden_layers` broke that
+  // silently: the config.json resolved a 45-layer stack and the GGUF a
+  // 46-layer one, and nothing downstream would have refused the extra layer.
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = PublishedHeadCountKv();
+  arrays.nextn_predict_layers = 1;
+  const Glm5NextParams from_gguf =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(46, arrays)));
+  const Glm5NextParams from_json = ParseGlm5NextParams(PublishedConfig());
+
+  CHECK(from_gguf.num_hidden_layers == from_json.num_hidden_layers);
+  CHECK(from_gguf.layer_types == from_json.layer_types);
+  CHECK(from_gguf.num_kda_layers() == from_json.num_kda_layers());
+  CHECK(from_gguf.num_dsa_layers() == from_json.num_dsa_layers());
+  CHECK(from_gguf.num_attention_heads == from_json.num_attention_heads);
+  CHECK(from_gguf.num_key_value_heads == from_json.num_key_value_heads);
+}
+
+TEST_CASE("glm5_next: more MTP blocks than blocks is refused") {
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = std::vector<int32_t>(8, 0);
+  arrays.head_count_kv[3] = 1;
+  arrays.head_count_kv[7] = 1;
+  arrays.nextn_predict_layers = 8;
+  const std::string message = RefusalForGguf(PerLayerGguf(8, arrays));
+  CHECK(message.find("block_count is 8") != std::string::npos);
+  CHECK(message.find("nextn_predict_layers is 8") != std::string::npos);
+  CHECK(message.find("num_hidden_layers + nextn_predict_layers") !=
+        std::string::npos);
+}
+
+TEST_CASE("glm5_next: the schedule is READ, and a non-stride file proves it") {
+  // THE DECISIVE CASE. The published checkpoint's 45 model layers happen to
+  // follow `idx % 4 == 3` exactly, so on that file a synthesized schedule and a
+  // read one agree and nothing can tell them apart. This file deliberately does
+  // not follow the stride, so only a reader that looks at the values gets it
+  // right. Without this case the fix is untested (#2177).
+  const std::vector<int32_t> kv = {1, 0, 1, 0, 0, 0, 0, 1};
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = kv;
+
+  const Glm5NextParams p =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(8, arrays)));
+
+  CHECK(p.layer_types == KindsOf(kv));
+  CHECK(p.layer_types[0] == Glm5NextLayerKind::kDeepseekSparseAttention);
+  CHECK(p.layer_types[3] == Glm5NextLayerKind::kLinearAttention);
+  CHECK(p.num_kda_layers() == 5);
+  CHECK(p.num_dsa_layers() == 3);
+  // And it is NOT the pattern the old fallback would have produced: those two
+  // blocks alone are the whole difference between reading and guessing.
+  const std::vector<Glm5NextLayerKind> guessed = SynthesizedKinds(8);
+  CHECK(p.layer_types != guessed);
+  CHECK(guessed[0] == Glm5NextLayerKind::kLinearAttention);
+  CHECK(guessed[3] == Glm5NextLayerKind::kDeepseekSparseAttention);
+}
+
+TEST_CASE("glm5_next: layer_types and head_count_kv must agree, and a clash is refused") {
+  // Two statements of one schedule. Preferring either silently loads a model
+  // whose attention kind is wrong on the blocks where they differ, which is the
+  // defect class this row has no token gate to catch.
+  Glm5NextGgufArrays clash;
+  clash.head_count_kv = std::vector<int32_t>(8, 0);
+  clash.head_count_kv[3] = 1;
+  clash.head_count_kv[6] = 1;  // the string array says 7, not 6
+  const std::string message =
+      RefusalForGguf(PerLayerGguf(8, clash, PublishedLayerTypes(8)));
+  CHECK(message.find("states its layer schedule twice") != std::string::npos);
+  CHECK(message.find("block 6") != std::string::npos);
+  CHECK(message.find("layer_types") != std::string::npos);
+  CHECK(message.find("attention.head_count_kv") != std::string::npos);
+
+  // A DISCRIMINATOR, not a blanket refusal of any file carrying both. When the
+  // two agree the file loads, and it resolves to what the array alone gives.
+  Glm5NextGgufArrays agree;
+  agree.head_count_kv = std::vector<int32_t>(8, 0);
+  agree.head_count_kv[3] = 1;
+  agree.head_count_kv[7] = 1;
+  const Glm5NextParams both = ParseGlm5NextParams(
+      ConfigFromGgufBytes(PerLayerGguf(8, agree, PublishedLayerTypes(8))));
+  const Glm5NextParams array_only =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(8, agree)));
+  CHECK(both.layer_types == array_only.layer_types);
+  CHECK(both.layer_types == KindsOf(agree.head_count_kv));
+
+  // `full_attention` is a legal `layer_types` spelling that upstream rewrites
+  // to `deepseek_sparse_attention`, and it carries KV heads, so it must NOT
+  // read as a disagreement with a non-zero entry.
+  std::vector<std::string> rewritten = PublishedLayerTypes(8);
+  rewritten[3] = "full_attention";
+  rewritten[7] = "full_attention";
+  const Glm5NextParams full = ParseGlm5NextParams(
+      ConfigFromGgufBytes(PerLayerGguf(8, agree, rewritten)));
+  CHECK(full.layer_types == array_only.layer_types);
+}
+
+TEST_CASE("glm5_next: a per-layer array whose length is not block_count is refused") {
+  Glm5NextGgufArrays short_kv;
+  short_kv.head_count_kv = std::vector<int32_t>(7, 0);
+  const std::string kv_message = RefusalForGguf(PerLayerGguf(8, short_kv));
+  CHECK(kv_message.find("glm5next.attention.head_count_kv") !=
+        std::string::npos);
+  CHECK(kv_message.find("per-layer array of 7 entries") != std::string::npos);
+  CHECK(kv_message.find("block_count is 8") != std::string::npos);
+
+  Glm5NextGgufArrays short_clamp;
+  short_clamp.head_count_kv = std::vector<int32_t>(8, 0);
+  short_clamp.swiglu_clamp_exp = std::vector<float>(9, 10.0f);
+  const std::string clamp_message = RefusalForGguf(PerLayerGguf(8, short_clamp));
+  CHECK(clamp_message.find("glm5next.swiglu_clamp_exp") != std::string::npos);
+  CHECK(clamp_message.find("per-layer array of 9 entries") != std::string::npos);
+  CHECK(clamp_message.find("block_count is 8") != std::string::npos);
+}
+
+TEST_CASE("glm5_next: a GGUF that states NO schedule is refused, naming both keys") {
+  // The obligation the removed `ReqStrArray` carried has moved, not gone: a
+  // file that states the interleave in neither spelling is still refused rather
+  // than defaulted onto a plausible pattern.
+  const std::string message =
+      RefusalForGguf(PublishedShapeGguf(8, /*layer_types=*/{}));
+  CHECK(message.find("states no per-layer attention schedule") !=
+        std::string::npos);
+  CHECK(message.find("glm5next.layer_types") != std::string::npos);
+  CHECK(message.find("glm5next.attention.head_count_kv") != std::string::npos);
+}
+
+TEST_CASE("glm5_next: swiglu_clamp_exp and _shexp are read in the ARRAY form too") {
+  // Both keys are per-layer `array[f32]` in the published artifact, so reading
+  // only the scalar form refused it one key after `head_count_kv` did.
+  Glm5NextGgufArrays arrays;
+  arrays.head_count_kv = std::vector<int32_t>(8, 0);
+  arrays.head_count_kv[3] = 1;
+  arrays.head_count_kv[7] = 1;
+  // NOT 10.0: that is the reader's own default, so asserting it would pass
+  // whether or not the array was ever read.
+  arrays.swiglu_clamp_exp = std::vector<float>(8, 7.25f);
+  arrays.swiglu_clamp_shexp = std::vector<float>(8, 7.25f);
+  const Glm5NextParams p =
+      ParseGlm5NextParams(ConfigFromGgufBytes(PerLayerGguf(8, arrays)));
+  CHECK(p.swiglu_limit == doctest::Approx(7.25));
+
+  // A NON-UNIFORM array is a clamp this config cannot hold: upstream has one
+  // `swiglu_limit`. Taking element 0 would clamp eight layers with a number the
+  // file states for one of them.
+  Glm5NextGgufArrays ragged = arrays;
+  ragged.swiglu_clamp_exp[5] = 3.5f;
+  const std::string ragged_message = RefusalForGguf(PerLayerGguf(8, ragged));
+  CHECK(ragged_message.find("glm5next.swiglu_clamp_exp") != std::string::npos);
+  CHECK(ragged_message.find("for block 5") != std::string::npos);
+  CHECK(ragged_message.find("ONE `swiglu_limit`") != std::string::npos);
+
+  // `swiglu_clamp_shexp` is READ and not merely tolerated: were it ignored, a
+  // file stating two different clamps would resolve silently to the first.
+  Glm5NextGgufArrays split = arrays;
+  split.swiglu_clamp_shexp = std::vector<float>(8, 4.5f);
+  const std::string split_message = RefusalForGguf(PerLayerGguf(8, split));
+  CHECK(split_message.find("glm5next.swiglu_clamp_exp") != std::string::npos);
+  CHECK(split_message.find("glm5next.swiglu_clamp_shexp") != std::string::npos);
+  CHECK(split_message.find("routed and the shared expert") != std::string::npos);
+}
+
 TEST_CASE("glm5_next: a tensor inventory that CONTRADICTS layer_types is refused") {
   // Absence proves nothing on a sharded or partial file, so this is a
   // CONTRADICTION check and not a completeness check. A `blk.N` that carries
@@ -1200,25 +1651,199 @@ TEST_CASE("glm5_next: a tensor inventory that CONTRADICTS layer_types is refused
 }
 
 TEST_CASE("glm5_next: the file states the rotary width twice and both must agree") {
-  // `attention.key_length_mla - attention.key_length` and
+  // `attention.key_length - attention.kv_lora_rank` and
   // `rope.dimension_count` are two independent statements of the same number,
-  // written by the converter from two different config fields. On a NoPE model
-  // a disagreement between them is exactly the defect a token gate could not
+  // written by llama.cpp from two different config fields
+  // (`b10451:conversion/deepseek.py:345` and `:369`). On a NoPE model a
+  // disagreement between them is exactly the defect a token gate could not
   // see, so it is a hard refusal rather than a first-wins.
-  gguf_test::GgufModelBuilder b;
-  b.AddKv(gguf_test::StrKv("general.architecture", "glm5next"));
-  b.AddKv(gguf_test::U32Kv("glm5next.block_count", 4));
-  b.AddKv(gguf_test::U32Kv("glm5next.embedding_length", 4096));
-  b.AddKv(gguf_test::U32Kv("glm5next.context_length", 1024));
-  b.AddKv(gguf_test::U32Kv("glm5next.attention.head_count", 64));
-  b.AddKv(gguf_test::F32Kv("glm5next.attention.layer_norm_rms_epsilon", 1e-5f));
-  b.AddKv(gguf_test::U32Kv("glm5next.attention.key_length_mla", 320));
-  b.AddKv(gguf_test::U32Kv("glm5next.attention.key_length", 256));
-  b.AddKv(gguf_test::U32Kv("glm5next.rope.dimension_count", 0));
-  b.AddKv(gguf_test::U32Kv("glm5next.vocab_size", 154880));
-  CHECK(RefusalForGguf(b.Build())
+  //
+  // 576 - 512 states a 64-wide rotary slice; `rope.dimension_count` states 0.
+  Glm5NextGgufArrays a;
+  a.key_length = 576;
+  a.rope_dimension_count = 0;
+  CHECK(RefusalForGguf(PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false,
+                                          a))
             .find("states this model's rotary width twice") !=
         std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// #2268: `attention.key_length` means what llama.cpp means by it, and the KDA
+// head count is DERIVED from whichever of four places the file states it.
+
+namespace {
+
+// The published `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL artifact's spelling,
+// read out of shard 1's own KV block on 2026-08-29 and reproduced key for key:
+// `key_length 512`, `value_length 512`, `key_length_mla 256`,
+// `value_length_mla 256`, `kv_lora_rank 512`, `rope.dimension_count 0`,
+// `kda.head_dim 128`, NO `attention.linear_head_count` and no `ssm.*` head
+// count at all — only the `blk.<L>.ssm_a` tensors, 64 entries each.
+Glm5NextGgufArrays PublishedArtifactSpelling(int64_t n_blocks) {
+  Glm5NextGgufArrays a;
+  // The schedule, in the only spelling that file carries: the per-layer
+  // `attention.head_count_kv` array, zero on a KDA block (#2243).
+  for (int64_t i = 0; i < n_blocks; ++i) {
+    a.head_count_kv.push_back(i % 4 == 3 ? 1 : 0);
+  }
+  a.kv_lora_rank = 512;
+  a.key_length = 512;      // kv_lora_rank + qk_rope_head_dim = 512 + 0
+  a.value_length = 512;    // kv_lora_rank
+  a.key_length_mla = 256;  // qk_nope_head_dim + qk_rope_head_dim = 256 + 0
+  a.value_length_mla = 256;
+  a.rope_dimension_count = 0;
+  a.kda_heads = Glm5NextGgufArrays::KdaHeads::kNone;
+  a.ssm_a_entries = 64;
+  return a;
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next: the PUBLISHED artifact's MLA spelling is llama.cpp's") {
+  // The refusal this case retires read
+  //
+  //   attention.key_length_mla - attention.key_length is -256 but
+  //   rope.dimension_count is 0
+  //
+  // on a file whose geometry is perfectly well formed, because the reader
+  // subtracted llama.cpp's `kv_lora_rank + qk_rope_head_dim` from its
+  // `qk_nope_head_dim + qk_rope_head_dim` as though the first were
+  // `qk_nope_head_dim`.
+  const Glm5NextParams p = ParseGlm5NextParams(ConfigFromGgufBytes(
+      PublishedShapeGguf(8, {}, 64, false, PublishedArtifactSpelling(8))));
+
+  CHECK(p.mla.kv_lora_rank == 512);
+  CHECK(p.mla.qk_rope_head_dim == 0);   // NoPE, and upstream requires it
+  CHECK(p.mla.qk_nope_head_dim == 256);
+  CHECK(p.mla.qk_head_dim == 256);
+  CHECK(p.mla.v_head_dim == 256);
+  CHECK(p.mla.head_dim == 0);
+  // And the KDA width, which this file states in NO key: `ssm_a` is one entry
+  // per head, and `kda.head_dim` is 128, so the inner size is 8192 — the
+  // second dimension of `blk.0.attn_q.weight` in the artifact, [4096, 8192].
+  CHECK(p.kda.num_heads == 64);
+  CHECK(p.kda.head_dim == 128);
+  CHECK(p.kda.num_heads * p.kda.head_dim == 8192);
+}
+
+TEST_CASE("glm5_next: the two producers spell it differently and AGREE") {
+  // THE CROSS-PRODUCER ASSERTION. Both files describe one model. The published
+  // artifact names no head count and carries `ssm_a`;
+  // `scripts/convert-glm5-next-gguf.py` writes
+  // `attention.linear_head_count` and, on a metadata-only read, no tensors at
+  // all. They must resolve to the SAME geometry, or one of the two arms of
+  // this port is loading a different model from the other with no token gate
+  // anywhere on this fleet able to notice.
+  Glm5NextGgufArrays ours;  // defaults ARE our converter's spelling
+  ours.kda_heads = Glm5NextGgufArrays::KdaHeads::kOurs;
+  ours.kda_head_count = 64;
+
+  const Glm5NextParams a = ParseGlm5NextParams(ConfigFromGgufBytes(
+      PublishedShapeGguf(8, {}, 64, false, PublishedArtifactSpelling(8))));
+  const Glm5NextParams b = ParseGlm5NextParams(ConfigFromGgufBytes(
+      PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false, ours)));
+
+  CHECK(a.mla.kv_lora_rank == b.mla.kv_lora_rank);
+  CHECK(a.mla.qk_nope_head_dim == b.mla.qk_nope_head_dim);
+  CHECK(a.mla.qk_rope_head_dim == b.mla.qk_rope_head_dim);
+  CHECK(a.mla.qk_head_dim == b.mla.qk_head_dim);
+  CHECK(a.mla.v_head_dim == b.mla.v_head_dim);
+  CHECK(a.mla.head_dim == b.mla.head_dim);
+  CHECK(a.kda.num_heads == b.kda.num_heads);
+  CHECK(a.kda.head_dim == b.kda.head_dim);
+  CHECK(a.kda.conv_kernel_dim == b.kda.conv_kernel_dim);
+  CHECK(a.layer_types == b.layer_types);
+}
+
+TEST_CASE("glm5_next: llama.cpp's own KDA head-count keys are read too") {
+  // `conversion/glm5next.py:78-80` at `refs/pull/27752/head` 8a8d0bcc4 writes
+  // `ssm.inner_size = num_heads * head_dim`, `ssm.state_size = head_dim` and
+  // `ssm.group_count = num_heads`. Neither is in the published artifact, but a
+  // file built from that branch carries them and must load.
+  for (const Glm5NextGgufArrays::KdaHeads spelling :
+       {Glm5NextGgufArrays::KdaHeads::kGroupCount,
+        Glm5NextGgufArrays::KdaHeads::kInnerSize}) {
+    Glm5NextGgufArrays a;
+    a.kda_heads = spelling;
+    a.kda_head_count = 64;
+    a.kda_head_dim = 128;
+    const Glm5NextParams p = ParseGlm5NextParams(ConfigFromGgufBytes(
+        PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false, a)));
+    CHECK(p.kda.num_heads == 64);
+    CHECK(p.kda.head_dim == 128);
+  }
+}
+
+TEST_CASE("glm5_next: a file that states the KDA head count NOWHERE is refused") {
+  // Derived, never defaulted. 64 is what this checkpoint happens to use and a
+  // reader that assumed it would be right here and silently wrong on the next
+  // file — the #2177 failure, one field along.
+  Glm5NextGgufArrays a = PublishedArtifactSpelling(8);
+  a.ssm_a_entries = 0;  // no key, and now no tensor either
+  const std::string msg =
+      RefusalForGguf(PublishedShapeGguf(8, {}, 64, false, a));
+  CAPTURE(msg);
+  CHECK(msg.find("states no linear-attention head count") != std::string::npos);
+  // It names every place that would have answered, so the reader of the
+  // refusal knows what to write rather than only that something is missing.
+  CHECK(msg.find("attention.linear_head_count") != std::string::npos);
+  CHECK(msg.find("ssm.group_count") != std::string::npos);
+  CHECK(msg.find("ssm.inner_size") != std::string::npos);
+  CHECK(msg.find("ssm_a") != std::string::npos);
+}
+
+TEST_CASE("glm5_next: metadata and `ssm_a` that disagree on the KDA width refuse") {
+  Glm5NextGgufArrays a;
+  a.kda_heads = Glm5NextGgufArrays::KdaHeads::kOurs;
+  a.kda_head_count = 64;
+  a.ssm_a_entries = 32;  // the weights say 32 heads, the metadata says 64
+  const std::string msg = RefusalForGguf(
+      PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false, a));
+  CAPTURE(msg);
+  CHECK(msg.find("linear width twice and the two disagree") !=
+        std::string::npos);
+}
+
+TEST_CASE("glm5_next: a key_length below kv_lora_rank is REFUSED, not misread") {
+  // THE CHECK THAT DID NOT GET WIDENED. Our converter used to write
+  // `attention.key_length = qk_nope_head_dim`, which for this model is 256
+  // against a `kv_lora_rank` of 512. Under llama.cpp's meaning of the key that
+  // is impossible — `kv_lora_rank + qk_rope_head_dim` is never below
+  // `kv_lora_rank` — so such a file is refused by name rather than quietly
+  // read under either convention.
+  Glm5NextGgufArrays a;
+  a.key_length = 256;  // the FORMER private spelling
+  const std::string msg = RefusalForGguf(
+      PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false, a));
+  CAPTURE(msg);
+  CHECK(msg.find("some other convention") != std::string::npos);
+  CHECK(msg.find("deepseek.py:345") != std::string::npos);
+}
+
+TEST_CASE("glm5_next: a value_length that is not the latent rank is refused") {
+  Glm5NextGgufArrays a;
+  a.value_length = 256;  // llama.cpp writes kv_lora_rank, which is 512
+  const std::string msg = RefusalForGguf(
+      PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false, a));
+  CAPTURE(msg);
+  CHECK(msg.find("latent width twice and the two disagree") !=
+        std::string::npos);
+}
+
+TEST_CASE("glm5_next: a key_length_mla with no room for a no-rope slice refuses") {
+  // `key_length_mla` is `qk_nope_head_dim + qk_rope_head_dim`, so a file whose
+  // `_mla` width is entirely rotary states a `qk_nope_head_dim` of zero. That
+  // is not a geometry this model has, and it would size every MLA projection
+  // to nothing.
+  Glm5NextGgufArrays a;
+  a.key_length = 576;             // rotary slice of 64
+  a.rope_dimension_count = 64;    // agreeing, so THIS is not the refusal
+  a.key_length_mla = 64;          // leaves qk_nope_head_dim == 0
+  const std::string msg = RefusalForGguf(
+      PublishedShapeGguf(8, PublishedLayerTypes(8), 64, false, a));
+  CAPTURE(msg);
+  CHECK(msg.find("qk_nope_head_dim would be 0") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,7 +1959,20 @@ class TempSafetensorsDir {
 
 }  // namespace
 
-TEST_CASE("glm5_next: the GGUF LOADER refuses by name through FromModelDir") {
+// W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) MOVED this case
+// rather than deleting it, and the direction it moved in is the point. Before
+// W5c the GGUF arm refused at the DOOR — "the weight loader is not ported",
+// plus a sentence claiming no `.gguf` of this model existed anywhere, which had
+// stopped being true. There is a weight tower now, so `FromModelDir` gets past
+// the door and into it, and what this case gates is that REACH: the refusal it
+// lands on is one the TOWER raises, by name, on a file the tower can read the
+// metadata of.
+TEST_CASE("glm5_next: FromModelDir reaches the WEIGHT TOWER, which refuses by name") {
+  // The builder's default file declares a vision tower, and the `glm5next`
+  // container is text-only: the published artifact ships its tower as a
+  // separate `mmproj-BF16.gguf` and llama.cpp #27752 drops the vision tensors
+  // at convert time. So the tower refuses that up front, before any tensor I/O,
+  // rather than failing on eleven vision tensor names one at a time.
   const gguf_test::TempFile file(PublishedShapeGguf(
       8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true));
   const std::string msg = LoadRefusalFor(file.path());
@@ -1349,34 +1987,80 @@ TEST_CASE("glm5_next: the GGUF LOADER refuses by name through FromModelDir") {
   CHECK(msg.find("missing metadata key") == std::string::npos);
   CHECK(msg.find("tokenizer") == std::string::npos);
 
-  CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  CHECK(msg.find("the weight loader is not ported") != std::string::npos);
-  // The wave that owes the tower, and each primitive it owes.
-  CHECK(msg.find("W5c") != std::string::npos);
-  CHECK(msg.find("KDA") != std::string::npos);
-  CHECK(msg.find("NoPE MLA") != std::string::npos);
-  CHECK(msg.find("mHC") != std::string::npos);
-  CHECK(msg.find("stacked-expert") != std::string::npos);
-  // A PUBLISHED artifact now exists, so the reader's next step is that file and
-  // not the converter. An earlier revision of this message said the opposite --
-  // "NO `.gguf` of this model exists anywhere ... (O7)" -- and this gate pinned
-  // that sentence, which is why it survived the artifact being published
-  // (#2230). The negative below is what stops it coming back.
-  CHECK(msg.find("unsloth/GLM-5.3-Flash-GGUF") != std::string::npos);
-  CHECK(msg.find("d425e572f") != std::string::npos);
-  CHECK(msg.find("NO `.gguf` of this model exists") == std::string::npos);
-  // And the measured reason the artifact is still not loadable: its UD arms mix
-  // six quant encodings this tree cannot decode. W5 ran the production loader
-  // against the staged UD-Q2_K_XL arm and it stopped on ggml type id 17.
-  CHECK(msg.find("IQ2_XS") != std::string::npos);
-  CHECK(msg.find("O5") != std::string::npos);
-  CHECK(msg.find("O8") != std::string::npos);
-  CHECK(msg.find("scripts/convert-glm5-next-gguf.py") != std::string::npos);
+  CHECK(msg.find("glm5_next gguf") != std::string::npos);
+  CHECK(msg.find("TEXT-ONLY") != std::string::npos);
+  CHECK(msg.find("W6") != std::string::npos);
   CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
-  CHECK(msg.find("#1998") != std::string::npos);
-  // This arm and NOT the safetensors one: the two are different next steps.
-  CHECK(msg.find("the GGUF config is read and validated") != std::string::npos);
-  CHECK(msg.find("598.53 GiB") == std::string::npos);
+  // The refusal W1 raised is GONE from product output, and so is the claim that
+  // no artifact exists. Both were true when they were written and neither is
+  // now; `unsloth/GLM-5.3-Flash-GGUF` @ `d425e572f` is 1412 tensors in four
+  // shards.
+  CHECK(msg.find("the weight loader is not ported") == std::string::npos);
+  CHECK(msg.find("NO `.gguf` of this model exists") == std::string::npos);
+
+  // And on a TEXT-ONLY file — which is what the published container is — the
+  // load goes further still, into the tensor tower, and refuses by the NAME of
+  // the first tensor it cannot find. This fixture carries metadata and no
+  // weights at all, so that is the token table.
+  Glm5NextGgufArrays text_only;
+  text_only.with_vision = false;
+  const gguf_test::TempFile txt(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true,
+      text_only));
+  const std::string tmsg = LoadRefusalFor(txt.path());
+  REQUIRE_FALSE(tmsg.empty());
+  CAPTURE(tmsg);
+  CHECK(tmsg.find("TEXT-ONLY") == std::string::npos);
+  CHECK(tmsg.find("token_embd.weight") != std::string::npos);
+}
+
+// #2277, and it is the production-entry-point half of that fix. `FromGguf`'s
+// pre-tokenizer table refused `glm4`, so `LoadedEngine::FromModelDir` stopped in
+// the TOKENIZER on the staged `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL artifact
+// and never reached the loader refusal above. The published file's own spelling
+// is `tokenizer.ggml.pre = "glm4"` beside `tokenizer.ggml.model = "gpt2"`, read
+// out of shard 1's kv block.
+//
+// This case is the one that would go RED if the pre name were dropped again: it
+// asserts the load gets STRICTLY PAST the tokenizer, by name, and lands on the
+// weight-loader refusal that W5c owns. The tokenizer's own splitting and BOS
+// behaviour are gated in `test_bpe.cpp`; what is gated here is REACH.
+TEST_CASE("glm5_next: pre \"glm4\" gets PAST the tokenizer, to the loader") {
+  Glm5NextGgufArrays arrays;
+  arrays.tokenizer_pre = "glm4";
+  const gguf_test::TempFile file(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true,
+      arrays));
+  const std::string msg = LoadRefusalFor(file.path());
+  REQUIRE_FALSE(msg.empty());
+  CAPTURE(msg);
+
+  // Not the tokenizer's refusal, and specifically not the one this fixes.
+  CHECK(msg.find("unsupported tokenizer.ggml.pre") == std::string::npos);
+  CHECK(msg.find("glm4") == std::string::npos);
+  CHECK(msg.find("tokenizer") == std::string::npos);
+  // It is the WEIGHT TOWER's, which is strictly past the tokenizer read. W5c
+  // moved this assertion with the refusal it names: before the tower existed
+  // this landed on "the weight loader is not ported", and the reach it proves
+  // is the same reach, one step further along.
+  CHECK(msg.find("glm5_next gguf") != std::string::npos);
+  CHECK(msg.find("TEXT-ONLY") != std::string::npos);
+  CHECK(msg.find("W6") != std::string::npos);
+
+  // A name the table still does not carry stops in the TOKENIZER, at the same
+  // fixture. Without this the case above would pass on a table that accepted
+  // anything, which is the way a pre-tokenizer gate goes quietly wrong.
+  Glm5NextGgufArrays unknown;
+  unknown.tokenizer_pre = "glm5next";
+  const gguf_test::TempFile bad(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true,
+      unknown));
+  const std::string bad_msg = LoadRefusalFor(bad.path());
+  REQUIRE_FALSE(bad_msg.empty());
+  CAPTURE(bad_msg);
+  CHECK(bad_msg.find("unsupported tokenizer.ggml.pre") != std::string::npos);
+  CHECK(bad_msg.find("glm5next") != std::string::npos);
+  CHECK(bad_msg.find("TEXT-ONLY") == std::string::npos);
 }
 
 TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDir") {
@@ -1391,18 +2075,21 @@ TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDi
   CHECK(msg.find("tokenizer") == std::string::npos);
 
   CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  CHECK(msg.find("the weight loader is not ported yet") != std::string::npos);
-  CHECK(msg.find("W5c owes it") != std::string::npos);
-  // W5 landed two of this row's pieces, and the refusal says which, so a reader
-  // is not sent to reimplement them (#2230).
-  CHECK(msg.find("W5 landed the MoE block and the KV-cache spec") !=
+  // W5c moved WHY this arm refuses, and the new reason is the honest one: it is
+  // not that the loader is unwritten -- the GGUF one is written -- but that
+  // every published safetensors artifact exceeds every device this project
+  // owns, so an arm that read them would be code nothing could run.
+  CHECK(msg.find("the safetensors weight loader is not ported") !=
         std::string::npos);
+  CHECK(msg.find("exceeds every device this project owns") != std::string::npos);
   // The published arms and the device they do not fit, so the reader is not
   // sent looking for a checkpoint that would work.
   CHECK(msg.find("305.78 GiB") != std::string::npos);
   CHECK(msg.find("598.53 GiB") != std::string::npos);
+  CHECK(msg.find("181.32 GiB") != std::string::npos);
+  CHECK(msg.find("119.63 GiB") != std::string::npos);
   CHECK(msg.find(".agents/specs/glm5-next-flash.md") != std::string::npos);
   CHECK(msg.find("#1998") != std::string::npos);
   // This arm and NOT the GGUF one.
-  CHECK(msg.find("the GGUF config is read and validated") == std::string::npos);
+  CHECK(msg.find("TEXT-ONLY") == std::string::npos);
 }

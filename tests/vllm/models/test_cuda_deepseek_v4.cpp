@@ -68,6 +68,14 @@ std::vector<float> Rand(Rng& r, int64_t n, float lo = -1.0f, float hi = 1.0f) {
   return v;
 }
 
+// Narrow a fixture to bf16 for the slots the carried tower now holds at the model
+// dtype (W1d, #2186).
+vllm::HostBf16 Bf16Of(const std::vector<float>& f) {
+  vllm::HostBf16 out(f.size());
+  for (size_t i = 0; i < f.size(); ++i) out[i] = vt::F32ToBF16(f[i]);
+  return out;
+}
+
 // Relative L2 over two equal-length buffers.
 double RelL2(const std::vector<float>& a, const std::vector<float>& b) {
   double num = 0.0, den = 0.0;
@@ -351,8 +359,13 @@ TEST_CASE("W7-device attention-sink softmax + grouped output-LoRA: CUDA vs host 
 
   const int64_t T = 2, nh = 2, hd = 6, ng = 2, olr = 4, H = 8;
   const int64_t ipg = nh * hd / ng;
-  const auto o = Rand(r, T * nh * hd), wa = Rand(r, ng * olr * ipg, -0.3f, 0.3f);
-  const auto wb = Rand(r, H * ng * olr, -0.3f, 0.3f);
+  // W1d (#2186): the olora weights are the carried tower's bf16 on BOTH arms. The
+  // CPU reference is fed the SAME bf16 vectors, so this stays a device-vs-host
+  // parity check on identical inputs rather than one that also folds in a dtype
+  // difference -- and it drives the `GroupedOutputLora<uint16_t>` instantiation.
+  const auto o = Rand(r, T * nh * hd);
+  const auto wa = Bf16Of(Rand(r, ng * olr * ipg, -0.3f, 0.3f));
+  const auto wb = Bf16Of(Rand(r, H * ng * olr, -0.3f, 0.3f));
   const auto oref = dv4::GroupedOutputLora(o, wa, wb, T, nh, hd, ng, olr, H);
   const auto ogot = dv4::DsaDevice()->grouped_olora(g.q, o, wa, wb, T, nh, hd, ng, olr, H);
   CHECK(RelL2(ogot, oref) < kTol);
@@ -595,16 +608,16 @@ DeepseekV4HostWeights TinyWeights(const DeepseekV4Params& p) {
     L.hc_ffn_fn = rnd(hc3 * hcH, 0.2f);
     L.hc_ffn_base = rnd(hc3, 0.2f);
     L.hc_ffn_scale = rnd(3, 0.5f);
-    L.wq_a = rnd(qlr * H, 0.3f);
+    L.wq_a = Bf16Of(rnd(qlr * H, 0.3f));
     L.q_norm_weight = normw(qlr);
-    L.wq_b = rnd((nh * hd) * qlr, 0.3f);
-    L.wkv = rnd(hd * H, 0.3f);
+    L.wq_b = Bf16Of(rnd((nh * hd) * qlr, 0.3f));
+    L.wkv = Bf16Of(rnd(hd * H, 0.3f));
     L.kv_norm_weight = normw(hd);
     L.attn_sink = {0.7f, -0.4f};
-    L.wo_a = rnd(og * olr * in_per_group, 0.3f);
-    L.wo_b = rnd(H * (og * olr), 0.3f);
+    L.wo_a = Bf16Of(rnd(og * olr * in_per_group, 0.3f));
+    L.wo_b = Bf16Of(rnd(H * (og * olr), 0.3f));
     if (p.has_indexer(l)) {
-      L.idx_wq = rnd((inh * ihd) * H, 0.3f);
+      L.idx_wq = Bf16Of(rnd((inh * ihd) * H, 0.3f));
       L.idx_wk = rnd(ihd * H, 0.3f);
       L.idx_wproj = rnd(inh * H, 0.3f);
     }
@@ -624,9 +637,9 @@ DeepseekV4HostWeights TinyWeights(const DeepseekV4Params& p) {
     } else {
       L.gate_bias = rnd(ne, 0.3f);
     }
-    L.shared_w1 = rnd(mi * H, 0.3f);
-    L.shared_w3 = rnd(mi * H, 0.3f);
-    L.shared_w2 = rnd(H * mi, 0.3f);
+    L.shared_w1 = Bf16Of(rnd(mi * H, 0.3f));
+    L.shared_w3 = Bf16Of(rnd(mi * H, 0.3f));
+    L.shared_w2 = Bf16Of(rnd(H * mi, 0.3f));
     L.exp_w1 = rnd(ne * mi * H, 0.3f);
     L.exp_w3 = rnd(ne * mi * H, 0.3f);
     L.exp_w2 = rnd(ne * H * mi, 0.3f);

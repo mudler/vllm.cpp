@@ -40,7 +40,7 @@
 #include <cstring>
 
 #include "cpu_quant_blocks.h"
-#include "cpu_quant_iq_tables.h"  // kIq2xxsGrid/kIq3xxsGrid/kKsignsIq2xs/kKmaskIq2xs
+#include "cpu_quant_iq_tables.h"  // kIq2xxsGrid/kIq2xsGrid/kIq3xxsGrid/kKsignsIq2xs/kKmaskIq2xs
 #include "vt/quant.h"
 
 namespace vt::cpu {
@@ -771,6 +771,125 @@ void VecDotIQ1_XXXSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
   *s = sumf;
 }
 
+// llama.cpp @ b10451 quants.c:948 — ggml_vec_dot_iq2_xs_q8_K_generic. Codebook
+// dot over 8 sub-blocks of 32. Each of the four `q2` u16 in a sub-block carries
+// BOTH the 9-bit kIq2xsGrid index (`& 511`) and the 7-bit kKsignsIq2xs selector
+// (`>> 9`) — the third distinct sign convention in the IQ2 family. The two
+// halves of a sub-block take DIFFERENT scales (`ls1` from the low nibble of
+// `sc[ib32]`, `ls2` from the high one), so upstream folds `sumi` into `bsum`
+// twice per sub-block rather than once; that split is the accumulation ORDER
+// and is kept verbatim. The final 0.125 folds the grid's fixed 8x magnitude, as
+// in IQ2_XXS. Grid and sign tables live in cpu_quant_iq_tables.h.
+void VecDotIQ2_XSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                      const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_iq2_xs_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_iq2_xs_q8_K: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockIQ2_XS* x = static_cast<const BlockIQ2_XS*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+
+  float sumf = 0.f;
+  for (int i = 0; i < nb; ++i) {
+    const float d = F16ToF32(x[i].d) * y[i].d;
+    const uint16_t* q2 = x[i].qs;
+    const uint8_t* sc = x[i].scales;
+    const int8_t* q8 = y[i].qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
+      const uint16_t ls1 = 2 * (sc[ib32] & 0xf) + 1;
+      const uint16_t ls2 = 2 * (sc[ib32] >> 4) + 1;
+      int32_t sumi = 0;
+      for (int l = 0; l < 2; ++l) {
+        const uint8_t* grid =
+            reinterpret_cast<const uint8_t*>(kIq2xsGrid + (q2[l] & 511));
+        const uint8_t signs = kKsignsIq2xs[q2[l] >> 9];
+        for (int j = 0; j < 8; ++j)
+          sumi += grid[j] * q8[j] * ((signs & kKmaskIq2xs[j]) ? -1 : 1);
+        q8 += 8;
+      }
+      bsum += sumi * ls1;
+      sumi = 0;
+      for (int l = 2; l < 4; ++l) {
+        const uint8_t* grid =
+            reinterpret_cast<const uint8_t*>(kIq2xsGrid + (q2[l] & 511));
+        const uint8_t signs = kKsignsIq2xs[q2[l] >> 9];
+        for (int j = 0; j < 8; ++j)
+          sumi += grid[j] * q8[j] * ((signs & kKmaskIq2xs[j]) ? -1 : 1);
+        q8 += 8;
+      }
+      bsum += sumi * ls2;
+      q2 += 4;
+    }
+    sumf += d * bsum;
+  }
+  *s = 0.125f * sumf;
+}
+
+// llama.cpp @ b10451 quants.c:1283 — ggml_vec_dot_iq4_xs_q8_K_generic. UNLIKE
+// IQ4_NL, which shares this kernel's codebook but pairs with Q8_0, IQ4_XS dots
+// against Q8_K: its block is a 256-element SUPER-block, so it pairs with the
+// 256-element activation encoding (ggml-cpu.c:385-390 `.vec_dot_type =
+// GGML_TYPE_Q8_K`, against :379-384's GGML_TYPE_Q8_0 for IQ4_NL).
+//
+// The `ib` loop steps by TWO because one `scales_l` byte serves two sub-blocks,
+// and `h` is consumed 4 bits at a time in the same step. `d1`/`d2` are formed as
+// f32 BEFORE the integer sums are folded in and each sub-block contributes its
+// own `sumf +=`, so there are 8 f32 accumulation steps per super-block rather
+// than one; that association is upstream's and fixes the reduction order.
+void VecDotIQ4_XSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                      const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_iq4_xs_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_iq4_xs_q8_K: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockIQ4_XS* x = static_cast<const BlockIQ4_XS*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+
+  float sumf = 0;
+  for (int ibl = 0; ibl < nb; ++ibl) {
+    const float d4d8 = F16ToF32(x[ibl].d) * y[ibl].d;
+    uint16_t h = x[ibl].scales_h;
+    const uint8_t* qs = x[ibl].qs;
+    const int8_t* q8 = y[ibl].qs;
+    for (int ib = 0; ib < kQK_K / 32; ib += 2) {
+      const uint8_t ls1 =
+          static_cast<uint8_t>((x[ibl].scales_l[ib / 2] & 0xf) | ((h << 4) & 0x30));
+      const uint8_t ls2 =
+          static_cast<uint8_t>((x[ibl].scales_l[ib / 2] >> 4) | ((h << 2) & 0x30));
+      h >>= 4;
+      const float d1 = d4d8 * (ls1 - 32);
+      const float d2 = d4d8 * (ls2 - 32);
+      int sumi1 = 0;
+      int sumi2 = 0;
+      for (int j = 0; j < 16; ++j) {
+        sumi1 += q8[j + 0] * kValuesIq4nl[qs[j] & 0xf];
+        sumi2 += q8[j + 16] * kValuesIq4nl[qs[j] >> 4];
+      }
+      sumf += d1 * (sumi1 + sumi2);
+      qs += 16;
+      q8 += 32;
+      sumi1 = sumi2 = 0;
+      for (int j = 0; j < 16; ++j) {
+        sumi1 += q8[j + 0] * kValuesIq4nl[qs[j] & 0xf];
+        sumi2 += q8[j + 16] * kValuesIq4nl[qs[j] >> 4];
+      }
+      sumf += d2 * (sumi1 + sumi2);
+      qs += 16;
+      q8 += 32;
+    }
+  }
+  *s = sumf;
+}
+
 // quants.c:947 — ggml_vec_dot_iq2_s_q8_K_generic. Codebook dot: 8 sub-blocks of
 // 32. Each lane's 10-bit grid index (`qs[l] | qh high 2 bits`) picks a kIq2sGrid
 // entry; the DIRECT sign byte `signs[l]` (= qs + QK_K/8, NO ksigns lookup) flips
@@ -881,6 +1000,8 @@ VecDotFn BlockVecDot(DType dtype) {
     case DType::kIQ2_XXS: return &VecDotIQ2_XXSQ8_K;  // quants.c:855
     case DType::kIQ3_XXS: return &VecDotIQ3_XXSQ8_K;  // quants.c:999
     case DType::kIQ2_S: return &VecDotIQ2_SQ8_K;      // quants.c:947
+    case DType::kIQ2_XS: return &VecDotIQ2_XSQ8_K;    // b10451 quants.c:948
+    case DType::kIQ4_XS: return &VecDotIQ4_XSQ8_K;    // b10451 quants.c:1283
     case DType::kIQ1_S: return &VecDotIQ1_SQ8_K;      // quants.c:1099
     case DType::kIQ1_XXXS: return &VecDotIQ1_XXXSQ8_K;  // fork quants.c:1281
     case DType::kMXFP4: return &VecDotMXFP4Q8_0;      // quants.c:247

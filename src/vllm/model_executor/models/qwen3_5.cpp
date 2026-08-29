@@ -29,6 +29,7 @@
 #include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // RunGdnBlockPaged (W5b seam, #2110)
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
+#include "vllm/model_executor/models/qwen3_5_mrope.h"  // BuildMropeCosSinHost (W5d-2 seam, #2249)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor residency seam
@@ -9469,7 +9470,9 @@ std::vector<float> Qwen3_5DenseModel::Forward(
 // selection (cpu_ops.cpp:731) exactly, so the fused AttnQkNormRopeGate applies
 // true MRoPE by reading this cache row-per-token (the text path bakes 1-D RoPE
 // into the same cache). No Llama3 freq scaling (mrope rope_type ⇒ identity).
-static std::vector<float> BuildMropeCosSinHost(
+// EXTERNAL LINKAGE (W5d-2, #2249): Qwen4-Exp's QSA block builds the SAME
+// tables from another TU. Declared in qwen3_5_mrope.h; body unchanged.
+std::vector<float> BuildMropeCosSinHost(
     const std::vector<int32_t>& positions3, int64_t T, const HfConfig& config) {
   const int rot = static_cast<int>(config.rotary_dim);
   VT_CHECK(rot > 0, "qwen3_5 VL: rotary_dim must be > 0");

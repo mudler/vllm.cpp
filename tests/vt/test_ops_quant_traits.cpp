@@ -181,6 +181,18 @@ TEST_CASE("IQ/MXFP4 keep-quant block dtypes (geometry + vec_dot)") {
       {vt::DType::kMXFP4, 39, 32, 17, vt::DType::kQ8_0, "mxfp4"},
       {vt::DType::kIQ1_S, 19, 256, 50, vt::DType::kQ8_K, "iq1_s"},
       {vt::DType::kIQ1_XXXS, 66, 256, 38, vt::DType::kQ8_K, "iq1_xxxs"},
+      // QUANT-GGUF-IQ-VECDOT (#2247). The two encodings that carry the staged
+      // `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` arm: 82 of its 1412 tensors are
+      // IQ2_XS and 3 are IQ4_XS, against TWO that are Q2_K. Sizes written out
+      // from llama.cpp @ b10451 ggml-common.h:
+      //   iq2_xs :388-393  f16 d + 32 u16 qs + 8 scales          = 2+64+8   = 74
+      //   iq4_xs :454-460  f16 d + u16 scales_h + 4 scales_l
+      //                    + 128 qs                              = 2+2+4+128 = 136
+      // IQ4_XS dots against Q8_K, NOT against the Q8_0 its codebook sibling
+      // IQ4_NL uses (ggml-cpu.c:385-390 against :379-384): the codebook is
+      // shared, the block geometry is not.
+      {vt::DType::kIQ2_XS, 17, 256, 74, vt::DType::kQ8_K, "iq2_xs"},
+      {vt::DType::kIQ4_XS, 23, 256, 136, vt::DType::kQ8_K, "iq4_xs"},
   };
   for (const KeepQuantCase& c : cases) {
     CAPTURE(c.name);
@@ -213,6 +225,79 @@ TEST_CASE("IQ/MXFP4 keep-quant block dtypes (geometry + vec_dot)") {
     CHECK(vt::cpu::BlockFromFloat(c.vec_dot_type) != nullptr);
     // No `from_float`: nothing quantizes an activation INTO these weight types.
     CHECK(vt::cpu::BlockFromFloat(c.dtype) == nullptr);
+  }
+}
+
+// The DECODE-ONLY class — a block dtype with a `to_float` and no keep-quant
+// `vec_dot`, which the GGUF loader can gather from but must EXPAND on a GEMM.
+// It is worth its own case because it is the class that silently costs memory:
+// nothing throws, tokens still match, and a routed-expert slab quietly lands in
+// bf16.
+//
+// IQ2_XS (17) and IQ4_XS (23) were its only file-type members, put there by
+// LOADER-GGUF-IQ (#2245) and taken out by QUANT-GGUF-IQ-VECDOT (#2247). The
+// class is not empty — Q8_K is still in it — but it now holds NO encoding a
+// checkpoint can be stored in, and this case states both halves so a later
+// reader can tell an empty class from an unwritten one.
+TEST_CASE("the decode-only class is Q8_K alone: no FILE type expands any more") {
+  // Q8_K is the K-quants' ACTIVATION encoding. Upstream gives it no `vec_dot`
+  // row at all (ggml-cpu.c:391-393 carries only a `from_float`), so it can
+  // never leave this class the way the two IQ*_XS rows did.
+  CHECK(vt::cpu::BlockToFloat(vt::DType::kQ8_K) != nullptr);
+  CHECK(vt::cpu::BlockVecDot(vt::DType::kQ8_K) == nullptr);
+  CHECK_FALSE(vt::cpu::HasQuantDotKernel(vt::DType::kQ8_K));
+  // It is the one block dtype here that goes the OTHER way: it has a
+  // `from_float`, because something does have to produce the activation.
+  CHECK(vt::cpu::BlockFromFloat(vt::DType::kQ8_K) != nullptr);
+
+  // Every OTHER block dtype this tree knows must now also dot. The population
+  // is SWEPT out of `BlockDTypeFromGgmlTypeId` rather than hand-listed, so the
+  // next decoder that lands without a kernel reds this case instead of slipping
+  // in behind a list nobody updated.
+  int swept = 0;
+  for (uint32_t id = 0; id < 256; ++id) {
+    vt::DType d = vt::DType::kF32;
+    if (!vt::BlockDTypeFromGgmlTypeId(id, &d)) continue;
+    if (d == vt::DType::kQ8_K) continue;
+    CAPTURE(id);
+    CAPTURE(vt::Name(d));
+    ++swept;
+    REQUIRE(vt::cpu::BlockToFloat(d) != nullptr);
+    CHECK(vt::cpu::BlockVecDot(d) != nullptr);
+    CHECK(vt::cpu::HasQuantDotKernel(d));
+    // Nothing quantizes an activation INTO a weight encoding. Q8_0 is the one
+    // exemption and not an exception: it is a file weight type AND the
+    // 32-element activation encoding, so it has to encode.
+    if (d != vt::DType::kQ8_0) CHECK(vt::cpu::BlockFromFloat(d) == nullptr);
+  }
+  // The sweep found something. A `BlockDTypeFromGgmlTypeId` that started
+  // refusing every id would otherwise pass the loop above vacuously.
+  CAPTURE(swept);
+  CHECK(swept == 17);
+
+  // The pair that moved, named explicitly: the geometry and the reader
+  // agreement are unchanged from #2245, only the dot arrived. Sizes written out
+  // from llama.cpp @ b10451 ggml-common.h, NOT copied from either table under
+  // test:
+  //   iq2_xs :388-393  f16 d + 256/8 u16 qs + 256/32 scales   = 2+64+8    = 74
+  //   iq4_xs :454-460  f16 d + u16 scales_h + 256/64 scales_l
+  //                    + 256/2 qs                             = 2+2+4+128 = 136
+  struct MovedCase {
+    vt::DType dtype;
+    uint32_t ggml_type;
+    int64_t block_bytes;
+  };
+  for (const MovedCase& c : {MovedCase{vt::DType::kIQ2_XS, 17, 2 + 64 + 8},
+                             MovedCase{vt::DType::kIQ4_XS, 23,
+                                       2 + 2 + 4 + 128}}) {
+    CAPTURE(c.ggml_type);
+    CHECK(vt::BlockElems(c.dtype) == 256);
+    CHECK(vt::BlockBytes(c.dtype) == c.block_bytes);
+    const vllm::GgmlTypeTraits& g = vllm::GgmlTraits(c.ggml_type);
+    CHECK(g.block_elems == 256);
+    CHECK(g.block_bytes == c.block_bytes);
+    CHECK(vt::cpu::HasQuantDotKernel(c.dtype));
+    CHECK(vt::cpu::QuantTraits(c.dtype).vec_dot_type == vt::DType::kQ8_K);
   }
 }
 

@@ -966,6 +966,42 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     // alone by #1924: llama.cpp has no `laguna` pre name at all, so unlike the
     // DeepSeek names above there is no exact pre-type to resolve it onto.
     tok.pattern_ = SplitPattern::kLlama3;
+  } else if (pre == "glm4" || pre == "chatglm-bpe") {
+    // The GLM-4 / GLM-5 family, which is what every GLM GGUF in the ecosystem
+    // carries -- `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL states
+    // `tokenizer.ggml.pre = "glm4"` beside `tokenizer.ggml.model = "gpt2"`
+    // (#2277). These are exactly the two pre names llama.cpp maps to
+    // LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (src/llama-vocab.cpp:2256-2258 @ b10451),
+    // and that pre-type's regex list at :396-399 is a single expression that is
+    // BYTE-IDENTICAL to LLAMA_VOCAB_PRE_TYPE_LLAMA3's at :283-290 -- proven by
+    // extracting both lines from the pinned object and comparing them, not by
+    // reading them (`.agents/specs/glm5-next-flash.md` O21 records the sha256).
+    // So kLlama3 is the EXACT splitting rule here, NOT the "close
+    // approximation" that `laguna` above still is and that #347 and #1924 each
+    // had to undo.
+    //
+    // WHAT DELIBERATELY DOES NOT COME WITH IT. llama.cpp's `llama-bpe` arm
+    // (:2157-2159) sets `ignore_merges = true` and `add_bos = true` beside its
+    // pre-type; the `glm4` arm sets NEITHER. Aliasing the two pre names onto one
+    // SplitPattern must therefore carry the split rule and none of those flags,
+    // and it does: `ignore_merges_` stays false on every GGUF path (see the note
+    // below), and no GGUF path prepends a BOS -- `template_bos_` is left -1 by
+    // this function, which is what mirrors llama.cpp's `add_bos = false`
+    // default (:1815) surviving for this arm, and `add_bos` is what :3382-3384
+    // actually tests before pushing `special_bos_id`.
+    //
+    // THE BOS ID IS STILL READ, AND THAT IS ALSO THE MIRROR. :2259 sets
+    // `special_bos_id = LLAMA_TOKEN_NULL` on this arm, but that is a DEFAULT:
+    // the loop at :2559-2578 reads `tokenizer.ggml.bos_token_id` out of the file
+    // and assigns it over the null whenever the key is present and in range. On
+    // the staged artifact that key is 154822, so llama.cpp finishes this load
+    // with `special_bos_id = 154822` and `add_bos = false` -- it does NOT
+    // discard the id, it declines to PREPEND it. `BosId()` therefore reports
+    // 154822 here too, and nothing puts it in a prompt. That matters on this
+    // checkpoint: id 154822 is `[gMASK]`, and the file's own chat template
+    // opens with the literal text `[gMASK]<sop>`, so a prepended BOS would
+    // DOUBLE it on every request.
+    tok.pattern_ = SplitPattern::kLlama3;
   } else {
     Fail("unsupported tokenizer.ggml.pre \"" + pre + "\"");
   }

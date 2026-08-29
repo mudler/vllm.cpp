@@ -87,13 +87,23 @@ Tensor MakeT(void* data, DType dt, const std::vector<int64_t>& shape) {
   return t;
 }
 
-// The `1 + w_hf` fold. The goldens store the HuggingFace gamma (zero-init, so
-// `output * (1.0 + weight)`); the op takes vLLM's parameterization, in which the
-// kernel multiplies by `w` and knows nothing about the offset. `HcNormWeightFromHf`
-// is the ONE home of that transform and this test goes through it rather than
-// adding 1.0 by hand, so a change to the fold's polarity reddens here too.
-std::vector<float> VllmNorm(const float* w_hf, int64_t n) {
-  return vllm::qwen4_exp::HcNormWeightFromHf(std::vector<float>(w_hf, w_hf + n));
+// The gamma the OP takes, and since #2218 that is the goldens' own value with
+// nothing done to it. The goldens store the HuggingFace parameter (zero-init,
+// so upstream spells the norm `output * (1.0 + weight)`) and
+// `vt::Qwen4ExpGatedResidual` now adds the 1 itself, the same way
+// `vt::RmsNorm(gemma=true)` and `vt::Qwen4ExpQsaCompress` do for this
+// architecture's other gammas — so a loaded `Qwen4ExpWeights` can be handed
+// straight to it. `vllm::qwen4_exp::HcNormWeightFromHf` remains the
+// `w_hf -> 1 + w_hf` bridge for the HOST reference, whose `GroupedRmsNorm`
+// keeps vLLM's `out * w` form and which `test_qwen4_exp_hc.cpp` drives; this
+// suite compares the op against the transformers goldens directly, so it no
+// longer needs the transform at all.
+//
+// A PASS-THROUGH THAT IS NOT DECORATION: it names, at every call site, WHICH
+// parameterization the op is being handed, which is the entire content of
+// #2218. An edit that reintroduces a fold here has to say so out loud.
+std::vector<float> OpGamma(const float* w_hf, int64_t n) {
+  return std::vector<float>(w_hf, w_hf + n);
 }
 
 struct Case {
@@ -135,7 +145,7 @@ const Case kCaseD{"D", 6, 4, 5, 2, 1e-6f, kD_norm_w_hf, kD_down,      kD_up,
 void RunReadCase(const Case& c) {
   Queue q = CpuQ();
   const int64_t flat = c.hc * c.hidden;
-  std::vector<float> w = VllmNorm(c.norm_w_hf, flat);
+  std::vector<float> w = OpGamma(c.norm_w_hf, flat);
   std::vector<float> hyper(c.hyper, c.hyper + c.T * flat);
   std::vector<float> down(c.down, c.down + c.lowrank * flat);
   std::vector<float> up(c.up, c.up + flat * c.lowrank);
@@ -234,7 +244,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the per-token rows are independent") {
   Queue q = CpuQ();
   const Case& c = kCaseA;
   const int64_t flat = c.hc * c.hidden;
-  std::vector<float> w = VllmNorm(c.norm_w_hf, flat);
+  std::vector<float> w = OpGamma(c.norm_w_hf, flat);
   std::vector<float> down(c.down, c.down + c.lowrank * flat);
   std::vector<float> up(c.up, c.up + flat * c.lowrank);
   std::vector<float> inject_w(c.inject, c.inject + c.hc * flat);
@@ -300,7 +310,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: bf16 storage rounds ONCE, on the store") {
     for (size_t i = 0; i < src.size(); ++i) out[i] = vt::F32ToBF16(src[i]);
     return out;
   };
-  const std::vector<float> w = bf16_exact(VllmNorm(c.norm_w_hf, flat));
+  const std::vector<float> w = bf16_exact(OpGamma(c.norm_w_hf, flat));
   const std::vector<float> hyper = bf16_exact({c.hyper, c.hyper + c.T * flat});
   const std::vector<float> down = bf16_exact({c.down, c.down + c.lowrank * flat});
   const std::vector<float> up = bf16_exact({c.up, c.up + flat * c.lowrank});
@@ -384,8 +394,13 @@ TEST_CASE("vt::Qwen4ExpGatedResidual agrees with the host reference at MODEL WID
   };
   std::vector<float> hyper(static_cast<size_t>(T * kFlat));
   for (float& v : hyper) v = next();
-  std::vector<float> w(static_cast<size_t>(kFlat));
-  for (float& v : w) v = 1.0f + 0.1f * next();
+  // THE OP TAKES `w_hf`, THE HOST REFERENCE TAKES `1 + w_hf` (#2218). The same
+  // numbers reach the same arithmetic either way — the draw below is centred on
+  // zero and the fold puts it back on one — but the two arms are handed
+  // DIFFERENT parameterizations of it, which is what keeps this an agreement
+  // check between two implementations rather than between two spellings.
+  std::vector<float> w_hf(static_cast<size_t>(kFlat));
+  for (float& v : w_hf) v = 0.1f * next();
   std::vector<float> down(static_cast<size_t>(R * kFlat));
   for (float& v : down) v = 0.02f * next();
   std::vector<float> up(static_cast<size_t>(kFlat * R));
@@ -396,7 +411,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual agrees with the host reference at MODEL WID
   std::vector<float> mixed(static_cast<size_t>(T * H), 0.0f);
   std::vector<float> inj(static_cast<size_t>(T * HC), 0.0f);
   Tensor t_hyper = MakeT(hyper.data(), DType::kF32, {T, kFlat});
-  Tensor t_w = MakeT(w.data(), DType::kF32, {kFlat});
+  Tensor t_w = MakeT(w_hf.data(), DType::kF32, {kFlat});
   Tensor t_down = MakeT(down.data(), DType::kF32, {R, kFlat});
   Tensor t_up = MakeT(up.data(), DType::kF32, {kFlat, R});
   Tensor t_inject = MakeT(inject.data(), DType::kF32, {HC, kFlat});
@@ -412,7 +427,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual agrees with the host reference at MODEL WID
                             args);
 
   vllm::qwen4_exp::GatedResidualWeights hw;
-  hw.hc_norm_weight = w;
+  hw.hc_norm_weight = vllm::qwen4_exp::HcNormWeightFromHf(w_hf);
   hw.mix_down = down;
   hw.mix_up = up;
   hw.block_inject = inject;
@@ -509,11 +524,14 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
     state = state * 6364136223846793005ULL + 1442695040888963407ULL;
     return static_cast<float>(static_cast<int32_t>(state >> 33)) / 2147483648.0f;
   };
-  std::vector<float> hyper(static_cast<size_t>(kFlat)), w(static_cast<size_t>(kFlat));
+  // `w_hf` is the RAW gamma the op takes (#2218); the double reference below
+  // spells the `1 +` itself, IN f32, so both arms describe the same multiplier
+  // bit for bit and the only thing this case widens is the reduction it is about.
+  std::vector<float> hyper(static_cast<size_t>(kFlat)), w_hf(static_cast<size_t>(kFlat));
   for (int64_t j = 0; j < HC; ++j) {
     for (int64_t d = 0; d < H; ++d) {
       hyper[static_cast<size_t>(j * H + d)] = (d == 0) ? dominant[j] : 1.0f;
-      w[static_cast<size_t>(j * H + d)] = 1.0f + 0.5f * next();
+      w_hf[static_cast<size_t>(j * H + d)] = 0.5f * next();
     }
   }
   std::vector<float> down(static_cast<size_t>(R * kFlat), 0.0f);
@@ -521,7 +539,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
   std::vector<float> mixed(static_cast<size_t>(T * H), 0.0f);
 
   Tensor t_hyper = MakeT(hyper.data(), DType::kF32, {T, kFlat});
-  Tensor t_w = MakeT(w.data(), DType::kF32, {kFlat});
+  Tensor t_w = MakeT(w_hf.data(), DType::kF32, {kFlat});
   Tensor t_down = MakeT(down.data(), DType::kF32, {R, kFlat});
   Tensor t_up = MakeT(up.data(), DType::kF32, {kFlat, R});
   Tensor t_mixed = MakeT(mixed.data(), DType::kF32, {T, H});
@@ -534,8 +552,18 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
   vt::Qwen4ExpGatedResidual(q, t_mixed, nullptr, t_hyper, t_w, t_down, t_up, nullptr,
                             args);
 
-  // The reference, in full double. `sigmoid(0)` is 0.5 exactly in any precision,
-  // so the only thing this widens is the reduction.
+  // The reference, in full double EXCEPT the gamma fold. `sigmoid(0)` is 0.5
+  // exactly in any precision, so the reduction is the only thing left for the
+  // widening to isolate -- provided the fold does not quietly widen with it.
+  // Upstream folds in f32: `Qwen4ExpTextRMSNorm.forward` is
+  // `output * (1.0 + self.weight.float())` (`modeling_qwen4_exp.py:177`), where
+  // the Python `1.0` is a weak scalar and the promotion stays fp32, and the
+  // kernel mirrors that with `1.0f + LoadF32At(hc_norm_w, ...)`. Folding in
+  // double here instead would leave the two arms up to a float ulp apart on the
+  // multiplier, and this case's band would absorb the difference silently -- a
+  // tolerance covering a dtype gap, which is the shape AGENTS.md "Inherit vLLM
+  // defaults" warns a token gate cannot see. So the `+ 1` is spelled `1.0f` and
+  // widened AFTERWARDS, matching the kernel exactly.
   std::vector<double> want(static_cast<size_t>(H), 0.0);
   for (int64_t j = 0; j < HC; ++j) {
     double ss = 0.0;
@@ -545,8 +573,9 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
     }
     const double r = 1.0 / std::sqrt(ss / static_cast<double>(H) + static_cast<double>(kEps));
     for (int64_t d = 0; d < H; ++d) {
+      const float w_folded = 1.0f + w_hf[static_cast<size_t>(j * H + d)];
       want[static_cast<size_t>(d)] +=
-          0.5 * hyper[static_cast<size_t>(j * H + d)] * r * w[static_cast<size_t>(j * H + d)];
+          0.5 * hyper[static_cast<size_t>(j * H + d)] * r * static_cast<double>(w_folded);
     }
   }
   for (double& v : want) v /= static_cast<double>(HC);

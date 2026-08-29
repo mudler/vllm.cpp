@@ -62,8 +62,8 @@ namespace {
 // ggml type ids (ggml/include/ggml.h:390-432).
 constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8,
                    kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14,
-                   kQ8_K = 15, kIQ4_NL = 20, kIQ2_S = 22, kIQ4_XS = 23,
-                   kBF16 = 30, kMXFP4 = 39;
+                   kQ8_K = 15, kIQ2_XS = 17, kIQ4_NL = 20, kIQ2_S = 22,
+                   kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39, kQ1_0 = 41;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
 struct Encoding {
@@ -300,14 +300,24 @@ TEST_CASE("KeepQuantDType covers the executable encodings") {
   // IQ2_S (22, Q8_K-activation) and MXFP4 (39, Q8_0-activation) are the UD-IQ2_M
   // routed-expert encodings; both gained a keep-quant vec_dot, so the loader must
   // keep them COMPRESSED (never expand-to-bf16 -> OOM).
-  for (uint32_t id : {kIQ2_S, kMXFP4}) {
+  //
+  // IQ2_XS (17) and IQ4_XS (23) join them with QUANT-GGUF-IQ-VECDOT (#2247).
+  // #2245 gave them a DECODER only, which left them keep-capable on the gather
+  // arm and expand-only on the GEMM arm; the two `vec_dot` rows this row adds
+  // close that, and 53.33 GiB of the staged GLM-5.3-Flash UD-Q2_K_XL artifact
+  // stops expanding to 369.00 GiB of bf16 because of it.
+  for (uint32_t id : {kIQ2_S, kMXFP4, kIQ2_XS, kIQ4_XS}) {
     CAPTURE(id);
     CHECK(KeepQuantDType(id, &dt));
     CHECK(vt::cpu::HasQuantDotKernel(dt));
   }
-  // Unquantized file types, the activation-only encoding, and every still-unported
-  // encoding (IQ4_XS) are NOT keep-quant capable.
-  for (uint32_t id : {kF32, kF16, kBF16, kQ8_K, kIQ4_XS}) {
+  // Unquantized file types, the activation-only encoding, and the encodings that
+  // DECODE but have no keep-quant `vec_dot` are NOT keep-quant capable. Q8_K is
+  // now the ONLY member of that middle class: IQ2_XS and IQ4_XS were in it
+  // between #2245 and #2247 and have left it. Q1_0 (41) carries the OLDEST
+  // shape — the reader tabulates it and nothing in this tree decodes it — so it
+  // is here to keep the two failure modes separately observable.
+  for (uint32_t id : {kF32, kF16, kBF16, kQ8_K, kQ1_0}) {
     CAPTURE(id);
     CHECK_FALSE(KeepQuantDType(id, &dt));
   }
@@ -422,10 +432,12 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   };
   // Q5_0 (6) and IQ4_NL (20) join the list with the encodings MODEL-MM-QWEN4-EXP
   // W6a added (#1989 review F8): a case that calls itself TOTAL and omits the
-  // two newest encodings is total over yesterday's surface.
-  const uint32_t all_types[] = {kF32,  kF16,   kBF16,  kQ4_0,   kQ5_0,
-                                kQ8_0, kQ3_K,  kQ4_K,  kQ5_K,   kQ6_K,
-                                kQ8_K, kIQ4_NL, kIQ2_S, kIQ4_XS, kMXFP4};
+  // two newest encodings is total over yesterday's surface. IQ2_XS (17) joins
+  // it for the same reason with LOADER-GGUF-IQ (#2240).
+  const uint32_t all_types[] = {kF32,   kF16,    kBF16,   kQ4_0,   kQ5_0,
+                                kQ8_0,  kQ3_K,   kQ4_K,   kQ5_K,   kQ6_K,
+                                kQ8_K,  kIQ2_XS, kIQ4_NL, kIQ2_S,  kIQ4_XS,
+                                kMXFP4};
 
   int kept = 0;
   int expanded = 0;
@@ -446,10 +458,14 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // The DEVICE axis (review #523): the running device's kernel set can be
         // narrower than the loader's CPU-derived list — ROCm implements exactly
         // {Q8_0, Q4_K, Q5_K, Q6_K}; the rest keep expand_bf16 there.
+        // QUANT-GGUF-IQ-VECDOT (#2247) put IQ2_XS and IQ4_XS in this list.
+        // They were gather-only between #2245 and #2247 — decoder, no vec_dot —
+        // and the `vec_dot` rows are what moved them onto the GEMM arm.
         const bool cpu_capable =
             type == kQ4_0 || type == kQ5_0 || type == kQ8_0 || type == kQ3_K ||
             type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_S ||
-            type == kMXFP4 || type == kIQ4_NL;
+            type == kMXFP4 || type == kIQ4_NL || type == kIQ2_XS ||
+            type == kIQ4_XS;
         const bool rocm =
             vllm::platforms::CurrentPlatform().device_type() ==
             vt::DeviceType::kROCM;
@@ -463,11 +479,15 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
                                 : 256;
         // MODEL-MM-QWEN4-EXP W6a: the GATHER role is now keep-capable too, and
         // it asks a DIFFERENT question. Its admission is the row decoder, so
-        // IQ4_XS — tabulated by the reader, decodable by nobody in this tree —
-        // stays expanded while everything with a `to_float` keeps, INCLUDING
-        // encodings the GEMM arm rejects for want of a `vec_dot`. On CUDA the
-        // whole gather arm is off, because `EmbeddingKernelCuda` cannot decode
-        // blocks; a kept table there would throw at the first forward.
+        // everything with a `to_float` keeps, INCLUDING encodings the GEMM arm
+        // rejects for want of a `vec_dot`. Since #2247 that surplus is Q8_K
+        // ALONE: IQ2_XS and IQ4_XS were the other two members between #2245 and
+        // #2247, and they left the moment they got a dot kernel. The two
+        // predicates still differ — this term is still not `cpu_capable` — but
+        // Q8_K is now the only encoding that can prove it, which is worth saying
+        // out loud rather than discovering when Q8_K changes. On CUDA the whole
+        // gather arm is off, because `EmbeddingKernelCuda` cannot decode blocks;
+        // a kept table there would throw at the first forward.
         const bool gather_cpu_capable = cpu_capable || type == kQ8_K;
         const bool gather_device_capable =
             vllm::platforms::CurrentPlatform().device_type() ==
@@ -507,18 +527,25 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   }
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
-  // device-dependent (review #523): 10 block-capable encodings x 2 keep-capable
+  // device-dependent (review #523): 12 block-capable encodings x 2 keep-capable
   // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm (ROCm's
-  // kernel set is {Q8_0, Q4_K, Q5_K, Q6_K} and neither Q5_0 nor IQ4_NL is in
-  // it). The GATHER role adds 11 more on CPU ONLY (the 10 plus Q8_K, which has
-  // a decoder and no vec_dot) and nothing anywhere else, since only the CPU
-  // Embedding kernel decodes blocks. Written as three named terms rather than
-  // one number so a future change to any one of them says which one moved.
+  // kernel set is {Q8_0, Q4_K, Q5_K, Q6_K}, and neither Q5_0 nor IQ4_NL nor
+  // either IQ*_XS is in it). The GATHER role adds 13 more on CPU ONLY (the 12,
+  // plus Q8_K, which has a decoder and no vec_dot) and nothing anywhere else,
+  // since only the CPU Embedding kernel decodes blocks. Written as named terms
+  // rather than one number so a future change to any one of them says which one
+  // moved. Both moves are now on record and they are mirror images:
+  // LOADER-GGUF-IQ (#2240) moved the GATHER term 11 -> 13 and left GEMM at 20,
+  // the shape of a decode-only port; QUANT-GGUF-IQ-VECDOT (#2247) moves the
+  // GEMM term 20 -> 24 and leaves GATHER at 13, the shape of a dot-only port.
+  // The gather total is UNCHANGED because those two encodings were already
+  // gather-kept — which is the whole reason the two arms are separate
+  // predicates.
   const vt::DeviceType host = vllm::platforms::CurrentPlatform().device_type();
-  const int gemm_kept = host == vt::DeviceType::kROCM ? 8 : 20;
-  const int gather_kept = host == vt::DeviceType::kCPU ? 11 : 0;
+  const int gemm_kept = host == vt::DeviceType::kROCM ? 8 : 24;
+  const int gather_kept = host == vt::DeviceType::kCPU ? 13 : 0;
   CHECK(kept == gemm_kept + gather_kept);
-  CHECK(expanded == 15 * 36 - (gemm_kept + gather_kept));
+  CHECK(expanded == 16 * 36 - (gemm_kept + gather_kept));
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
@@ -581,13 +608,36 @@ TEST_CASE("a quantized GATHER TABLE keeps its blocks, per encoding and per K") {
   CHECK(RouteGgufTensor(true, false, false, false,
                         GgufTensorRole::kEmbeddingTable, 20u,
                         {320001536, 160}) == GgufResidency::kKeepQuant);
-  // IQ4_XS (23) is tabulated by the READER but has no decoder in this tree, so
-  // it is the case that separates "the reader knows this id" from "this build
-  // can gather it". It must expand, or the table would be kept as bytes nothing
-  // can read.
+  // The case that separates "the reader knows this id" from "this build can
+  // gather it" is Q1_0 (41): tabulated by the READER, decodable by nobody here.
+  // It must expand, or the table would be kept as bytes nothing can read.
   CHECK(RouteGgufTensor(true, false, false, false,
-                        GgufTensorRole::kEmbeddingTable, 23u,
-                        {8, 256}) == GgufResidency::kExpandBf16);
+                        GgufTensorRole::kEmbeddingTable, 41u,
+                        {8, 128}) == GgufResidency::kExpandBf16);
+  // IQ2_XS (17) and IQ4_XS (23) keep on BOTH arms as of QUANT-GGUF-IQ-VECDOT
+  // (#2247). They kept on the gather arm from #2245, on a row decoder alone;
+  // the GEMM arm additionally wanted a `vec_dot`, and now has one. This is the
+  // assertion that reds if either kernel is unregistered, and it is the
+  // residency half of the 325.58 GiB the two kernels buy on the staged
+  // GLM-5.3-Flash artifact.
+  for (uint32_t id : {17u, 23u}) {
+    CAPTURE(id);
+    CHECK(RouteGgufTensor(true, false, false, false,
+                          GgufTensorRole::kEmbeddingTable, id,
+                          {8, 256}) == GgufResidency::kKeepQuant);
+    CHECK(RouteGgufTensor(true, false, false, false,
+                          GgufTensorRole::kMatmulWeight, id,
+                          {8, 256}) == GgufResidency::kKeepQuant);
+    // The stacked-expert role is the one that actually carries them in the
+    // artifact: all 82 IQ2_XS tensors are `blk.N.ffn_{gate,up}_exps.weight`.
+    CHECK(RouteGgufTensor(true, false, false, false,
+                          GgufTensorRole::kStackedExpertWeight, id,
+                          {4, 8, 256}) == GgufResidency::kKeepQuant);
+    // A ragged K still expands: 256-element super-blocks admit no partial row.
+    CHECK(RouteGgufTensor(true, false, false, false,
+                          GgufTensorRole::kMatmulWeight, id,
+                          {8, 255}) == GgufResidency::kExpandBf16);
+  }
 }
 
 TEST_CASE("the gather table's admission is the DECODER, not the vec_dot") {
@@ -597,13 +647,30 @@ TEST_CASE("the gather table's admission is the DECODER, not the vec_dot") {
   // `from_float` on the activation encoding — neither of which a gather uses.
   // Every encoding below has a row decoder; that is the whole requirement.
   vt::DType dt = vt::DType::kF32;
-  for (uint32_t type : {kQ4_0, kQ8_0, kQ3_K, kQ4_K, kQ5_K, kQ6_K, 20u}) {
+  for (uint32_t type : {kQ4_0, kQ8_0, kQ3_K, kQ4_K, kQ5_K, kQ6_K, 20u, 17u,
+                        23u}) {
     CAPTURE(type);
     REQUIRE(vllm::KeepQuantGatherDType(type, &dt));
     REQUIRE(vt::cpu::BlockToFloat(dt) != nullptr);
   }
-  // Not a block encoding at all -> never a gather keep.
-  for (uint32_t type : {kF32, kF16, kBF16}) {
+  // Q8_K passes the line above and FAILS the GEMM predicate, which is the whole
+  // point of the two predicates being separate. It is the LAST encoding that
+  // can prove that: IQ2_XS and IQ4_XS stood here between #2245 and #2247 and
+  // left when they got their `vec_dot` rows, and Q8_K cannot follow them
+  // because it is the K-quants' activation encoding and upstream gives it no
+  // `vec_dot` row at all. If Q8_K ever leaves too, this case stops
+  // discriminating and has to be re-grounded rather than deleted.
+  REQUIRE(vllm::KeepQuantGatherDType(kQ8_K, &dt));
+  CHECK_FALSE(vllm::KeepQuantDType(kQ8_K, &dt));
+  // And the pair that MOVED: both predicates now admit them.
+  for (uint32_t type : {kIQ2_XS, kIQ4_XS}) {
+    CAPTURE(type);
+    CHECK(vllm::KeepQuantGatherDType(type, &dt));
+    CHECK(vllm::KeepQuantDType(type, &dt));
+  }
+  // Not a block encoding at all -> never a gather keep. Q1_0 (41) is a block
+  // encoding the READER tabulates and vt does not know, so it fails here too.
+  for (uint32_t type : {kF32, kF16, kBF16, kQ1_0}) {
     CAPTURE(type);
     CHECK_FALSE(vllm::KeepQuantGatherDType(type, &dt));
   }

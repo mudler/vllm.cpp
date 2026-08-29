@@ -564,3 +564,116 @@ TEST_CASE("exl3 device: exl3_gemm matches the f64 reference within the stated bo
   cb.Free(d_c);
   cb.DestroyQueue(dq);
 }
+
+// ─── the widened device arms — QUANT-EXL3 W3 (#2181) ─────────────────────────
+//
+// The device arm was instantiated for ONE (bits, codebook) pair, (3, 1), and
+// that pair is the EXCEPTION rather than the rule: `LinearEXL3` derives the
+// codebook from tensor PRESENCE (`exl3.py:74-77`), so every stock
+// `turboderp/*-exl3` artifact ships no marker and is codebook 0, and the device
+// refused all of them one projection at a time. W3 instantiates (3, 0), (3, 1)
+// and (6, 0) — a stock body, the DeepSeek-V4 artifact, and the stock 6-bit
+// `lm_head`.
+//
+// These cases gate the NEW arms on the device. The CPU arm is generic over
+// widths and codebooks and is gated elsewhere; what is unproven until a GPU runs
+// it is that each instantiation LAUNCHES and agrees with that generic arm.
+TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm") {
+  if (!HasCuda()) {
+    MESSAGE(
+        "SKIPPED, no CUDA device: QUANT-EXL3 W3's widened arms are PENDING. Reproduce with: "
+        "rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb_dev = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue dq = cb_dev.CreateQueue();
+  vt::Queue hq = CpuQueue();
+
+  struct Arm {
+    int bits;
+    int codebook;
+    const char* what;
+  };
+  // (3, 1) is covered by the case above; these are the two W3 added.
+  const Arm arms[] = {{3, 0, "a stock exl3 body"}, {6, 0, "a stock exl3 lm_head"}};
+
+  for (const Arm& arm : arms) {
+    CAPTURE(arm.bits);
+    CAPTURE(arm.codebook);
+    const int64_t m = 4, k = 256, n = 256;
+    const Exl3Fixture f = MakeFixture(k, n, arm.bits, 0x1D0C0DEu + arm.bits);
+    Rng rng;
+    rng.s = 0xC0FFEEu + arm.bits;
+    std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+    for (auto& v : a_h) v = vt::F32ToF16(rng.next(1.0f));
+
+    // The CPU arm is the reference: it decodes every width and every codebook,
+    // and `test_exl3_real_decode` ties it to real exllamav3 data.
+    std::vector<uint16_t> a_had_h(a_h.size(), 0);
+    std::vector<float> c_host(static_cast<size_t>(m * n), 0.0f);
+    vt::Exl3GemmArgs args;
+    args.bits = arm.bits;
+    args.codebook = arm.codebook;
+    {
+      vt::Tensor ta = vt::Tensor::Contiguous(a_h.data(), vt::DType::kF16, hq.device, {m, k});
+      vt::Tensor tah =
+          vt::Tensor::Contiguous(a_had_h.data(), vt::DType::kF16, hq.device, {m, k});
+      vt::Tensor tc = vt::Tensor::Contiguous(c_host.data(), vt::DType::kF32, hq.device, {m, n});
+      vt::Tensor tb = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.trellis.data()),
+                                             vt::DType::kI8, hq.device,
+                                             {k / 16, n / 16, 32 * arm.bits});
+      vt::Tensor tsuh = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.suh.data()),
+                                               vt::DType::kF16, hq.device, {k});
+      vt::Tensor tsvh = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.svh.data()),
+                                               vt::DType::kF16, hq.device, {n});
+      vt::Exl3Gemm(hq, tc, ta, tb, tsuh, tsvh, tah, args);
+    }
+
+    // Raw device allocations, the same shape the (3, 1) case above uses; there
+    // is no DBuf helper in this suite and inventing one here would be a second
+    // way to do what that case already does.
+    const size_t ab = a_h.size() * sizeof(uint16_t);
+    const size_t bb = f.trellis.size() * sizeof(uint16_t);
+    const size_t cbytes = static_cast<size_t>(m * n) * sizeof(float);
+    void* d_a = cb_dev.Alloc(ab);
+    void* d_ah = cb_dev.Alloc(ab);
+    void* d_b = cb_dev.Alloc(bb);
+    void* d_suh = cb_dev.Alloc(f.suh.size() * sizeof(uint16_t));
+    void* d_svh = cb_dev.Alloc(f.svh.size() * sizeof(uint16_t));
+    void* d_c = cb_dev.Alloc(cbytes);
+    cb_dev.Copy(dq, d_a, a_h.data(), ab);
+    cb_dev.Copy(dq, d_b, f.trellis.data(), bb);
+    cb_dev.Copy(dq, d_suh, f.suh.data(), f.suh.size() * sizeof(uint16_t));
+    cb_dev.Copy(dq, d_svh, f.svh.data(), f.svh.size() * sizeof(uint16_t));
+
+    vt::Tensor tda = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
+    vt::Tensor tdah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+    vt::Tensor tdb = vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device,
+                                            {k / 16, n / 16, 32 * arm.bits});
+    vt::Tensor tdsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+    vt::Tensor tdsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+    vt::Tensor tdc = vt::Tensor::Contiguous(d_c, vt::DType::kF32, dq.device, {m, n});
+    vt::Exl3Gemm(dq, tdc, tda, tdb, tdsuh, tdsvh, tdah, args);
+    cb_dev.Synchronize(dq);
+    std::vector<float> c_dev(static_cast<size_t>(m * n), 0.0f);
+    cb_dev.Copy(dq, c_dev.data(), d_c, cbytes);
+    cb_dev.Synchronize(dq);
+    for (void* p : {d_a, d_ah, d_b, d_suh, d_svh, d_c}) cb_dev.Free(p);
+
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < c_dev.size(); ++i) {
+      const double d = static_cast<double>(c_dev[i]) - c_host[i];
+      num += d * d;
+      den += static_cast<double>(c_host[i]) * c_host[i];
+    }
+    const double rel = std::sqrt(num / den);
+    MESSAGE("bits ", arm.bits, " cb ", arm.codebook, " (", arm.what,
+            "): device vs CPU rel_rms = ", rel);
+    REQUIRE(den > 0.0);  // not vacuous
+    // The same bound the (3, 1) device case states: the difference is the
+    // tensor-core reduction order, not the decode, which is exact either side.
+    CHECK(rel <= 1.0e-3);
+  }
+  cb_dev.DestroyQueue(dq);
+}

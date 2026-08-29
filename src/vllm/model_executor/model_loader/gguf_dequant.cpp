@@ -119,6 +119,10 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
     case 20:   // IQ4_NL  (32-elem non-linear codebook; qwen4exp ffn_down_exps
                //           and the per_layer_token_embd n-gram table)
     case 66:   // IQ1_XXXS (1.1875 bpw; UD-Q1_0 experts, fork-anchored)
+    case 17:   // IQ2_XS  (2.3125 bpw, 512-entry codebook; 82 tensors of the
+               //           GLM-5.3-Flash UD-Q2_K_XL arm — its gate/up experts)
+    case 23:   // IQ4_XS  (4.25 bpw; IQ4_NL's codebook over a 256-elem
+               //           super-block with a spliced, -32-biased scale)
     case 16: {  // IQ2_XXS (~2-bit codebook; UD-IQ2_XXS DeepSeek-V4 vehicle)
       // The block decoders moved to vt (src/vt/cpu/cpu_quant_dequant.cpp) so
       // the loader oracle and the compute-in-quant GEMM's generic fallback

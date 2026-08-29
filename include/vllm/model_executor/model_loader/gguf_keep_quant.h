@@ -100,10 +100,13 @@ using GgufRoutingAudit =
     std::function<void(const std::string& name, GgufTensorRole role,
                        GgufResidency residency)>;
 
-// True when `ggml_type` is one of the six encodings that can currently stay
-// resident (Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K), writing its vt block dtype to
-// `*out`. False for the unquantized types, for Q8_K (activation-only, never a
-// file weight type) and for every unported encoding.
+// True when `ggml_type` is an encoding that can stay resident THROUGH A GEMM,
+// writing its vt block dtype to `*out`. The rule is `HasQuantDotKernel`, not a
+// list: the encoding needs a keep-quant `vec_dot` and its activation encoding
+// needs a `from_float`. False for the unquantized types, for Q8_K
+// (activation-only, never a file weight type, and upstream gives it no `vec_dot`
+// row at all) and for every unported encoding. The list used to be spelled out
+// here and went stale six encodings ago, so it deliberately is not any more.
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 
 // True when `ggml_type` is a block encoding this build can DECODE A ROW OF,

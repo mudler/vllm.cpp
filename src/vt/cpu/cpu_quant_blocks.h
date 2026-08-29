@@ -179,6 +179,37 @@ struct BlockIQ2_S {
 };
 static_assert(sizeof(BlockIQ2_S) == 82, "wrong iq2_s block size/padding");
 
+// llama.cpp @ b10451 ggml-common.h:388-393 block_iq2_xs. 2.3125 bpw codebook
+// quant, and the encoding 82 of the staged `unsloth/GLM-5.3-Flash-GGUF
+// UD-Q2_K_XL` tensors are stored in. It is the MIDDLE member of the IQ2 family
+// and shares no table with either sibling: each `qs` u16 carries a 9-bit index
+// into the 512-entry kIq2xsGrid in its low bits (`& 511`) and a 7-bit
+// kKsignsIq2xs selector in its high bits (`>> 9`) — one u16 doing both jobs,
+// where IQ2_XXS keeps the signs in a separate u32 and IQ2_S in a direct sign
+// byte. `scales` packs two 4-bit sub-scales per 32-element sub-block, low nibble
+// for lanes 0-1 and high nibble for lanes 2-3, each read as `2*n + 1`.
+struct BlockIQ2_XS {
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint16_t qs[kQK_K / 8];       // 32 — 9-bit grid index + 7-bit sign selector
+  uint8_t scales[kQK_K / 32];   // 8 — two 4-bit sub-scales per ib32
+};
+static_assert(sizeof(BlockIQ2_XS) == 74, "wrong iq2_xs block size/padding");
+
+// llama.cpp @ b10451 ggml-common.h:454-460 block_iq4_xs. 4.25 bpw. The SAME
+// 16-entry non-linear codebook as IQ4_NL (kValuesIq4nl, shared not duplicated);
+// what differs is the scale layout. A 256-element super-block carries one f16
+// `d` and eight 6-bit sub-scales, each spliced from a `scales_l` nibble (low 4
+// bits) and a `scales_h` bit pair (high 2 bits) and then biased by -32, so a
+// sub-block delta is `d * (ls - 32)` and can be NEGATIVE. IQ4_NL by contrast
+// carries one unbiased f16 delta per 32 elements.
+struct BlockIQ4_XS {
+  uint16_t d;                    // super-block scale (ggml_half)
+  uint16_t scales_h;             // 2 high bits of each of the 8 sub-scales
+  uint8_t scales_l[kQK_K / 64];  // 4 — 4 low bits of each of the 8 sub-scales
+  uint8_t qs[kQK_K / 2];         // 128 — 256 codebook nibbles
+};
+static_assert(sizeof(BlockIQ4_XS) == 136, "wrong iq4_xs block size/padding");
+
 // ggml-common.h:414-419 block_iq1_s. 1.5625 bpw codebook quant, and the
 // encoding that carries 96.92 % of `Qwen3.8-2.4T-A95B UD-IQ1_S` (see the target
 // checkpoint census in .agents/specs/expert-streaming.md).

@@ -23,6 +23,7 @@
 #ifndef VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 #define VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -201,6 +202,78 @@ inline DflashBlockPagedInputs DflashBlockPagedInputsOf(int64_t ctx_len, int64_t 
   return in;
 }
 
+// The HOST attention metadata a draft block must hand `vt::PagedAttention`, so
+// the CUDA prefill launchers size their query-tile grid from host values
+// instead of taking the fallback. BOTH fields are load-bearing and `vt/ops.h`
+// states the cost of each default in the same words: `query_start_loc_host`
+// nullptr "=> the launcher falls back to the D2H+sync" (`:1546`) and
+// `max_seq_len` 0 "=> that launcher falls back to the D2H+sync" (`:1555`).
+//
+// THAT FALLBACK IS `cudaStreamSynchronize` (`cuda_paged_attn.cu:2272`), and it
+// is ILLEGAL INSIDE A CUDA GRAPH CAPTURE -- which is where this call runs, on
+// the one lane this tree captures (`P == 1`, `qwen3_dflash.cpp:1716`). Omitting
+// them is not a compile error and is merely slow wherever nothing is capturing,
+// so a non-captured run cannot see it; under capture the engine dies with
+// "operation not permitted when stream is capturing" (#2252).
+//
+// One request, so the query_start_loc is exactly [0, tq); `tq` is `1 + k`, a
+// constant for the life of the graph.
+//
+// `max_seq_len` MUST BE THE POOL CAPACITY, NOT `ctx_len + tq`. This call is
+// captured into a CUDA graph ONCE and replayed on every later draft step, and
+// `MakeDeviceKVStore` states the invariant that makes that legal: the
+// persistent buffers never move, so "a captured graph reads the growing context
+// purely through the in-place `seq_lens` value". A HOST value derived from the
+// current `ctx_len` is baked into the graph at capture and is then STALE on
+// every replay, because the context has grown -- which is an illegal memory
+// access inside `cudaGraphLaunch`, not a wrong number.
+//
+// MEASURED, 2026-08-29, three arms on one boot at the smallest workload
+// (`max_num_seqs=1`, c=1, 64 tokens): with `ctx_len + tq` the engine aborted
+// 134 at `cudaMemcpyAsync`, and under `CUDA_LAUNCH_BLOCKING=1` at
+// `cudaGraphLaunch`, naming the replay; with `VT_DFLASH_PAGED=0`, which
+// bypasses this route entirely, the same binary exited 0.
+//
+// The capacity is replay-stable and is a valid bound: the store refuses a
+// request whose `ctx_len + append + (1+k)` would exceed it
+// (`runner.cpp`, the ctx-capacity fallback), so the read never addresses past
+// it. An upper bound is explicitly safe here because it only sizes grids and
+// rounded dims, while per-request geometry stays on the DEVICE values
+// (`ops.h:1551-1553`).
+struct DflashBlockPagedHostMeta {
+  std::array<int32_t, 2> qsl{};  // [0, tq) for the block's single request
+  int32_t max_seq_len = 0;       // ctx_len + tq
+};
+
+inline DflashBlockPagedHostMeta DflashBlockPagedHostMetaOf(int64_t pool_capacity, int64_t tq) {
+  DflashBlockPagedHostMeta m;
+  m.qsl = {0, static_cast<int32_t>(tq)};
+  m.max_seq_len = static_cast<int32_t>(pool_capacity);
+  return m;
+}
+
+// The complete argument set for a draft block's paged attention, as a PURE
+// function of the block's shape -- so the wiring is gateable on the CPU. A test
+// that only checked `DflashBlockPagedHostMetaOf` would pass while production
+// forgot to USE it, which is exactly how #2252 shipped.
+//
+// `host_meta` must outlive the returned args: `query_start_loc_host` points
+// into it.
+inline vt::PagedAttentionArgs DflashBlockPagedArgsOf(float scale, bool causal,
+                                                     int64_t sliding_window, int64_t tq,
+                                                     const DflashBlockPagedHostMeta& host_meta) {
+  vt::PagedAttentionArgs pa;
+  pa.scale = scale;
+  const DflashBlockPagedMask mask = DflashBlockPagedMaskOf(causal, sliding_window);
+  pa.causal = mask.causal;
+  if (mask.has_window)
+    pa.window_size = vt::AttentionWindow{mask.window_left, mask.window_right};
+  pa.uniform_spec_query_len = static_cast<int32_t>(tq);
+  pa.query_start_loc_host = host_meta.qsl.data();
+  pa.max_seq_len = host_meta.max_seq_len;
+  return pa;
+}
+
 // THE ROUTED ATTENTION ITSELF — the write and the read, as ONE call.
 //
 // WHY THEY ARE ONE FUNCTION AND NOT TWO LINES IN THE FORWARD. The two ops are a
@@ -285,14 +358,54 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
              "range [ctx_len, ctx_len + block rows) the read's extended bound "
              "addresses (SPEC-DFLASH2 W11, #1890)");
   }
+  // #2274 — THE BOUNDS THIS CALL WRITES AND READS, CHECKED ON EVERY BACKEND.
+  //
+  // The two checks above are guarded on `kCPU` because they dereference device
+  // tensors. These are pure HOST arithmetic over shapes, so they run on CUDA
+  // too — which is where the fault is. `ReshapeAndCache` below WRITES `tq` rows
+  // at `slots`, and the attention then READS `[0, seq_ext)` through
+  // `block_table`; if either passes the pool, that is an illegal access inside a
+  // kernel, reported later and elsewhere (a `cudaMemcpyAsync` or a `cudaFree`)
+  // with nothing naming this call. #2274 is exactly that shape: an out-of-bounds
+  // access on the second request of a process, surfacing far from its cause.
+  //
+  // This is a DETECTOR, not a repair. If it fires, the caller's accounting is
+  // wrong and the message says which term; if it never fires, this class is
+  // excluded and the search moves on. Cost is a few host integer comparisons per
+  // draft layer.
+  const int64_t pool_pages = pool_k.shape[0];
+  const int64_t page_rows = pool_k.shape[1];
+  const int64_t pool_capacity = pool_pages * page_rows;
+  VT_CHECK(canon.seq_ext <= pool_capacity,
+           "dflash block paged attention: the extended read bound passes the pool "
+           "(seq_ext > pages*page_rows); the attention would read unmapped pages "
+           "(SPEC-DFLASH2, #2274)");
+  VT_CHECK(host_inputs.slots.empty() ||
+               host_inputs.slots.back() < pool_capacity,
+           "dflash block paged attention: the last write slot passes the pool "
+           "(slots.back() >= pages*page_rows); ReshapeAndCache would write past "
+           "the K/V pages (SPEC-DFLASH2, #2274)");
+  // The block table must ADDRESS every page the extended bound reaches. It is
+  // `[1, max_pages]`, so its own width is the reachable page count -- a table
+  // shorter than `ceil(seq_ext / page_rows)` sends the kernel through an
+  // uninitialised entry, which is an arbitrary page index rather than a refusal.
+  VT_CHECK(page_rows > 0 && block_table.rank == 2 && block_table.shape[1] > 0,
+           "dflash block paged attention: the block table must be [1, max_pages] "
+           "over a positive page size (SPEC-DFLASH2, #2274)");
+  VT_CHECK(block_table.shape[1] * page_rows >= canon.seq_ext,
+           "dflash block paged attention: the block table cannot address the "
+           "extended bound (max_pages*page_rows < seq_ext), so the read walks off "
+           "the end of the table (SPEC-DFLASH2, #2274)");
   vt::ReshapeAndCache(q, block_k, block_v, pool_k, pool_v, slot_map);
-  vt::PagedAttentionArgs pa;
-  pa.scale = scale;
-  const DflashBlockPagedMask mask = DflashBlockPagedMaskOf(causal, sliding_window);
-  pa.causal = mask.causal;
-  if (mask.has_window)
-    pa.window_size = vt::AttentionWindow{mask.window_left, mask.window_right};
-  pa.uniform_spec_query_len = static_cast<int32_t>(query.shape[0]);
+  // #2252: `host_meta` outlives the call below, which is all it must do -- the
+  // launcher reads the qsl on the host to size its grid before it launches.
+  // The POOL's capacity (pages x page rows), not this step's context length --
+  // see the note on `DflashBlockPagedHostMetaOf`: a per-step value baked into a
+  // replayed graph reads out of bounds.
+  const DflashBlockPagedHostMeta host_meta =
+      DflashBlockPagedHostMetaOf(pool_capacity, query.shape[0]);
+  const vt::PagedAttentionArgs pa =
+      DflashBlockPagedArgsOf(scale, causal, sliding_window, query.shape[0], host_meta);
   vt::PagedAttention(q, out, query, pool_k, pool_v, block_table, seq_ext, cu, pa);
 }
 

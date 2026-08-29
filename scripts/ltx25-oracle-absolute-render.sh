@@ -143,7 +143,30 @@ for t in ffmpeg python3 cmake ninja; do command -v "$t" >/dev/null || { echo "FA
 python3 -c 'import numpy' || { echo "FATAL: no numpy, and the comparison tool needs it"; exit 38; }
 
 say "=== [A] CUDA toolkit ==="
-need_ok() { [ -x "$1/bin/nvcc" ] && [ -f "$1/targets/sbsa-linux/lib/libcublasLt.so" ]; }
+# THE SONAME IS WHAT MUST EXIST, AND IT IS WHAT CIFS DESTROYS (#2220).
+# `libcudart.so.13` is a SYMLINK in a real install; `/workspace` stores no
+# symlink, so a staged copy carries only the versioned regular file
+# `libcudart.so.13.3.29`. `nvcc` compiles happily against headers, and the
+# failure lands 21 minutes later at the CONSUMER link as 38 lines of
+# `undefined reference to ...@libcudart.so.13`.
+#
+# `soname_ok` therefore checks what the LINKER needs rather than what is easy to
+# check. The previous `need_ok` tested `libcublasLt.so`, which is the ONE link
+# the reconstruction below did create correctly, so it passed on a toolkit that
+# could not be linked against. A precondition that cannot fail is not one.
+soname_ok() {  # $1 = lib dir, $2 = stem; true when <stem>.so AND <stem>.so.<MAJOR> resolve
+  local target major
+  target=$(readlink -f "$1/$2.so" 2>/dev/null) || return 1
+  [ -e "$target" ] || return 1
+  major=$(basename "$target"); major=${major#*.so.}; major=${major%%.*}
+  [ -n "$major" ] || return 1
+  [ -e "$1/$2.so.$major" ]
+}
+need_ok() {
+  [ -x "$1/bin/nvcc" ] || return 1
+  soname_ok "$1/targets/sbsa-linux/lib" libcudart &&
+    soname_ok "$1/targets/sbsa-linux/lib" libcublasLt
+}
 TKLIB=""
 for c in /usr/local/cuda /usr/local/cuda-13.0 /root/cudatk; do
   if need_ok "$c"; then TKLIB=$c; break; fi
@@ -152,13 +175,42 @@ if [ -z "$TKLIB" ] && [ -d /workspace/a3/cuda-staged ]; then
   say "  staging the toolkit from /workspace/a3/cuda-staged (CIFS holds no symlink and serves 0664)"
   cp -a /workspace/a3/cuda-staged /root/cudatk || { echo "FATAL: cannot stage the toolkit"; exit 38; }
   chmod -R 0755 /root/cudatk/bin /root/cudatk/nvvm/bin 2>/dev/null
-  ( cd /root/cudatk/targets/sbsa-linux/lib 2>/dev/null && for f in *.so.*.*; do
-      b=${f%%.so.*}; ln -sf "$f" "$b.so"; ln -sf "$f" "$b.so.${f#*.so.}"; done ) 2>/dev/null
+  L=/root/cudatk/targets/sbsa-linux/lib
+  # PRIMARY: `ldconfig -n` reads each object's own `DT_SONAME` and creates exactly
+  # that name, so it cannot disagree with the name the linker will ask for. It
+  # does NOT create the `.so` development link, which is why the loop still runs.
+  ldconfig -n "$L" 2>/dev/null
+  ( cd "$L" 2>/dev/null && for f in *.so.*; do
+      # Only fully-versioned regular files. `libcudart.so.13` must not re-enter.
+      case "$f" in *.so.*.*) ;; *) continue;; esac
+      b=${f%%.so.*}; v=${f#*.so.}
+      # THE MAJOR, NOT THE FULL VERSION. `${f#*.so.}` is `13.3.29`, and the old
+      # line used it verbatim -- so it linked `libcudart.so.13.3.29` to ITSELF and
+      # never created `libcudart.so.13`. That one expansion is #2220.
+      ln -sf "$f" "$b.so"
+      [ -e "$b.so.${v%%.*}" ] || ln -sf "$f" "$b.so.${v%%.*}"
+    done ) 2>/dev/null
   need_ok /root/cudatk && TKLIB=/root/cudatk
 fi
-[ -n "$TKLIB" ] || { echo "FATAL: no complete CUDA toolkit (nvcc + libcublasLt)"; exit 38; }
+[ -n "$TKLIB" ] || {
+  echo "FATAL: no CUDA toolkit whose libcudart/libcublasLt SONAME links resolve (#2220)"
+  for d in /usr/local/cuda /usr/local/cuda-13.0 /root/cudatk; do
+    [ -d "$d" ] || continue
+    echo "  $d/targets/sbsa-linux/lib:"
+    ls -la "$d/targets/sbsa-linux/lib" 2>/dev/null | grep -E "libcudart|libcublasLt" | head -8
+  done
+  exit 38; }
 export PATH="$TKLIB/bin:$PATH" CUDAToolkit_ROOT="$TKLIB"
 say "  toolkit $TKLIB, $(nvcc --version | tail -1)"
+# ASSERTED IN SECONDS, BEFORE A 21-MINUTE BUILD. #2220 cost exactly that build:
+# it ran to completion and died linking the first consumer. Printed AND recorded,
+# so a later reader can see which toolkit the artefacts were linked against.
+for s in libcudart libcublasLt; do
+  t=$(readlink -f "$TKLIB/targets/sbsa-linux/lib/$s.so")
+  m=$(basename "$t"); m=${m#*.so.}; m=${m%%.*}
+  say "  $s.so -> $(basename "$t"), SONAME link $s.so.$m present"
+  echo "toolkit_soname $s.so.$m -> $(basename "$t")" >> "$OUT/PROVENANCE"
+done
 
 say "=== [B] source ==="
 [ -s "$W/src.tar.gz" ] || { echo "FATAL: no $W/src.tar.gz"; exit 31; }
@@ -343,6 +395,33 @@ echo "render_rc=$RENDER_RC render_seconds=$RENDER_S" >> "$OUT/PROVENANCE"
 # COMPLETENESS IS DEFINED, not eyeballed. Exactly the expected frame count and a
 # non-empty wav. A partial render that reached the comparison would produce a
 # blockiness number over whatever frames survived.
+# --steps 8 ARRIVED, OBSERVED RATHER THAN INFERRED FROM THE FLAG BEING PASSED.
+# The row's `## Owed` records that every link in `main.cpp` -> `vllm_c.cpp` ->
+# `ltx2_video.cpp` is verified by INSPECTION and none by execution, because the
+# lease that would have executed it refused at the checkpoint load 76 s in.
+# `VLLM_RENDER_PROGRESS` is ON by default and writes one
+# `[render]   dit forward N  phase P step k/N  t=.. last=..` per DiT forward
+# (docs/ENVIRONMENT.md), so the denominator in `step k/N` IS the resolved step
+# count. Extracted here into its own file so the proof is an artefact of the run
+# rather than something a later reader has to find in a log.
+#
+# WHY THE DENOMINATOR AND NOT THE LINE COUNT. `one_stage` is GUIDED and runs
+# three DiT forwards per step, so counting lines measures the guider. The
+# distinct set of denominators is the schedule, and a set with anything but a
+# single 8 in it is the finding, not a formatting detail.
+grep -oE 'step [0-9]+/[0-9]+' "$LOG" | awk -F/ '{print $2}' | sort -u > "$OUT/steps-observed.txt"
+STEPS_SEEN=$(tr '\n' ',' < "$OUT/steps-observed.txt" | sed 's/,$//')
+FORWARDS=$(grep -cE 'step [0-9]+/[0-9]+' "$LOG")
+say "  --steps: requested $STEPS, denominators observed at runtime {${STEPS_SEEN:-none}}, $FORWARDS DiT forwards"
+echo "steps_requested=$STEPS steps_observed={${STEPS_SEEN:-none}} dit_forwards=$FORWARDS" >> "$OUT/PROVENANCE"
+if [ "$STEPS_SEEN" != "$STEPS" ]; then
+  # NOT FATAL, and deliberately so: the comparison's verdict is the row's
+  # deliverable and a step count that did not arrive is a SECOND finding rather
+  # than a reason to discard the first. It is said loudly and it is recorded.
+  say "  WARNING: the sampler did not run $STEPS steps. #2130's flag is wired and this run"
+  say "  did NOT observe it arrive; the comparison below carries a denoise-budget confound."
+fi
+
 NF=$(ls "$D"/frame_*.ppm 2>/dev/null | wc -l)
 say "  frames=$NF expected=$FRAMES audio=$(stat -c %s "$D/audio.wav" 2>/dev/null || echo 0) bytes"
 if [ "$NF" != "$FRAMES" ] || [ ! -s "$D/audio.wav" ]; then

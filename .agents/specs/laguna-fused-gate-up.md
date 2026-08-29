@@ -229,68 +229,70 @@ every ratio from it remain superseded under #1003.
 prompt's token 2 was one. A prompt whose margins are wider might never diverge,
 and a longer generation might diverge more; neither was measured.
 
-## W4 — the wider sweep, PARTIAL: 1 of 1 prompts measured diverged, five unmeasured
+## W4 — the wider sweep, COMPLETE: 6 of 6 prompts diverge, at widely varying depth
 
-W3 recorded that one prompt at 32 tokens shows a divergence EXISTS and cannot show
-how often. W4 sweeps six prompts at 256 tokens to put a rate on it. **It is
-recorded here incomplete**, because the measured part is decision-relevant on its
-own and the unmeasured part is blocked on infrastructure rather than on analysis.
+Run on `dgx:gpu0` against `unsloth/Laguna-S-2.1-GGUF` `UD-Q4_K_XL` @ `750f92f9`.
+Six prompts, 256 tokens each, both arms, same binary and weights, differing only
+in `VT_LAGUNA_FUSED_GATEUP`. `SWEEP_DIVERGED=6 SWEEP_TOTAL=6 SWEEP_NTOK=256`.
 
-### What was measured
+| # | Prompt | First divergence |
+|---|---|---:|
+| 0 | "The capital of France is" | **2** |
+| 1 | "List three prime numbers greater than one hundred:" | **73** |
+| 2 | "def quicksort(arr):" | **115** |
+| 3 | "If a train leaves at 3pm travelling 60km/h, and another" | **55** |
+| 4 | "Write a short paragraph about the sea in winter." | **13** |
+| 5 | "La capitale de l'Italie est" | **49** |
 
-**Prompt 0, "The capital of France is": DIVERGES first at token position 2 of
-256**, on `dgx:gpu0`. This is an independent reproduction of W3 — a different run,
-a different container, and EIGHT TIMES the generation length — landing on the same
-prompt at the same position. It also rules out one hopeful reading: the divergence
-is not a rare late-generation event, at least on this prompt.
+Positions 2, 13, 49, 55, 73, 115 — median 52, min 2, max 115.
 
-Five prompts (a primes list, a Python function, a word problem, a long-form
-paragraph, and a French factual) are **UNMEASURED**. Nothing about them is
-implied by prompt 0.
+### What this settles
 
-### Why the sweep is not finished, and it is not analysis
+**The divergence is universal across these prompts, not a property of one.** W3's
+result came from prompt 0 alone, and the honest worry was that it might be that
+prompt's peculiarity. It is not: every prompt tried, across factual recall, a
+numbered list, code, arithmetic reasoning, free prose and a non-English factual,
+eventually hits a near-tie where the 2-ULP epilogue flips an argmax.
 
-Seven leases were spent on harness and environment faults, every one of them the
-author's rather than the tree's, and they share a single root: **each fix encoded
-an assumption taken from the box last seen.** Recorded because the pattern is the
-finding:
+**W3's position 2 was the WORST case, not the typical one.** Five of six ran
+between 13 and 115 tokens before splitting, and the code prompt reached 115. A
+reader who saw only W3 would have concluded the arm diverges immediately; it
+usually does not. That distinction is why this sweep reports the POSITION rather
+than a boolean, and it is the one thing the earlier single measurement got
+misleadingly right.
 
-| Fault | What it would have produced |
-|---|---|
-| `xxd` absent in the worker | False refusal of a valid checkpoint |
-| `--token-ids` read as an OUTPUT flag | A gate comparing files never written |
-| `decode_hp` timings inside the token diff | `FAIL` on every run regardless of tokens |
-| `--idle-timeout 40m` against a 37.9 min cadence | `rc` killing a healthy job |
-| `nvcc` install unverified | A 16-minute silently CPU-only build |
-| `lib64` glob missing `targets/sbsa-linux/lib` | "library absent" on a box that had it |
-| `find \| head -1` selecting a **stub** | Linking a no-op library, with cmake returning 0 |
-| The cublasLt guard made FATAL | Rejecting dgx, the box that had always built |
+**It does NOT establish a per-token probability, and the spread forbids
+estimating one from six samples.** A 2-to-115 range over n=6 supports "varies
+widely" and nothing sharper. No claim is made about prompts outside this set, and
+the prompts were chosen by hand rather than sampled.
 
-The last is the general lesson: **a guard must not be stricter than the thing it
-guards.** cublasLt is now a hint, and cmake — which is the authority on whether a
-toolkit is usable — decides.
+### What it means for the default
 
-### A real negative result about the fleet
+The question W3 left open was whether the near-tie might be rare enough to
+reconsider shipping the arm ON. **It is not rare: 6 of 6.** The option is closed
+on the evidence rather than on preference, and `## Gates`'s advance commitment to
+refuse a near-tie stands unchanged. **The arm stays default-OFF.**
 
-**Thor cannot run this sweep, and the reason is measured.** It loads this
-checkpoint in **2887 s (48.1 min)** against dgx's ~16 min, so thirteen loads is
-**10.4 hours** there against 3.5 on dgx. Thor is also sm_110 and needs its own
-arch and library paths (`targets/sbsa-linux`, not `lib64`), which the sweep script
-now detects rather than assumes. Even with the toolchain fixed, this sweep should
-not run on Thor: it would hold a shared device for ten hours to answer what dgx
-answers in three.
+### Cost, recorded because it was disproportionate
 
-### What this does and does not support
+Eight harness and environment faults were fixed to get this run, every one the
+author's: `xxd` absent; `--token-ids` read as an output flag when it is an input;
+`decode_hp` timings inside the token diff, which would have reported FAIL on every
+run; a 40-minute idle timeout against a measured 37.9-minute cadence, which killed
+a healthy job; an unverified `nvcc` install that produced a silently CPU-only
+build; a `lib64` glob that missed `targets/sbsa-linux/lib`; a `find | head -1`
+that selected a link-time STUB which cmake accepted with rc=0; and a cublasLt
+guard promoted to FATAL that then rejected dgx, the box that had always built.
 
-It does NOT establish a rate. One prompt is one prompt, and the sweep exists
-precisely because W3's single result could not generalise. Quoting "100% of
-prompts diverge" from n=1 would repeat the error this row keeps catching.
+They share one root: **each fix encoded an assumption taken from the box last
+seen.** The general rule the last one states is that a guard must not be stricter
+than the thing it guards. The cheapest correction was also the latest: one
+12-minute diagnostic job established that the container had no CUDA and no NVIDIA
+apt repo, which seven earlier leases of inference had failed to determine.
 
-What it does support is that the divergence reproduces across runs, containers and
-generation lengths, so it is a property of the arm rather than of one execution.
-Combined with W3's `DETERMINISM=PASS`, the fused arm is deterministic and
-deterministically different. **The default stays OFF**, which is where W3 put it
-and where this evidence keeps it.
+Also measured, and worth keeping: **Thor cannot run this sweep.** It loads this
+checkpoint in 2887 s against dgx's 14-24 min, so thirteen loads is 10.4 hours
+there against ~3.5 on dgx.
 
 ## Now
 
@@ -301,9 +303,8 @@ warm. **The arm ships default-OFF and the two-call path remains the reference.**
 
 What is owed, and neither is a blocker on the above:
 
-- The wider token sweep, **still owed for five of six prompts** (see `## W4`).
-  Prompt 0 reproduced at 256 tokens; the rest are blocked on dgx availability, and
-  Thor is ruled out on measured load time. A rate would only change the decision
-  if it came back near ZERO, which prompt 0 argues against.
+- ~~The wider token sweep~~ **DONE (`## W4`): 6 of 6 prompts diverge.** The
+  question of whether the near-tie is rare enough to reconsider the default is
+  answered and closed.
 - A ratified speed number, if the arm is ever defaulted on: n=2 on one prompt is
   a direction. That needs repeats on an idle box.

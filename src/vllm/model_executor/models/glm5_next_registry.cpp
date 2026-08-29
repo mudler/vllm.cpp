@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/glm5_next.h"
+#include "vllm/model_executor/models/glm5_next_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/v1/kv_cache_dtype.h"  // v1::ResolveKvCacheDType
 #include "vllm/v1/kv_cache_interface.h"
@@ -68,42 +69,53 @@ inline constexpr ModelInfo kGlm5NextInfo{
 std::unique_ptr<LoadedModel> LoadGlm5NextForConditionalGeneration(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
+  if (source.kind == ModelSource::Kind::kGguf) {
+    // W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) LOADS it.
+    // The GGUF k-quant arm is OWED, not optional (AGENTS.md,
+    // porting-a-model.md), and for this row it is the ONLY arm that fits a
+    // host we own: `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL is 101.2535 GiB on
+    // disk against ~119.63 GiB usable on GB10, where every safetensors artifact
+    // (FP8 305.78 GiB, BF16 598.53 GiB, NVFP4 181.32 GiB) does not.
+    //
+    // THE ARTIFACT EXISTS, and the refusal this replaced said it did not. That
+    // sentence — "NO `.gguf` of this model exists anywhere" — was true when W1
+    // wrote it and stopped being true when `unsloth/GLM-5.3-Flash-GGUF`
+    // revision `d425e572fb9686125831f476129e51cea34bc5b4` was published and
+    // staged: 1412 tensors, four shards, `general.architecture = glm5next`,
+    // read out of the file's own header. A record correction that leaves the
+    // lie in the product is not a correction, so it is removed here and not
+    // only in the spec. O7 is W7b's
+    // ([#2225](https://github.com/mudler/vllm.cpp/issues/2225)) to discharge;
+    // this change does not discharge it and does not contradict it — what W7b
+    // still owes is the sha256, the conversion recipe and the peak RSS of a
+    // real load, none of which this wave measured.
+    //
+    // A null `gguf` reaches here from a caller that set the KIND without the
+    // FILE. Refused by name rather than dereferenced: the alternative is a
+    // segmentation fault inside a loader the reader is entitled to read as
+    // "GGUF is not supported here".
+    if (source.gguf == nullptr) {
+      throw std::runtime_error(
+          "Glm5NextForConditionalGeneration: the model source says GGUF but "
+          "carries no file. See .agents/specs/glm5-next-flash.md and issue "
+          "#2242.");
+    }
+    return std::make_unique<Glm5NextLoadedModel>(
+        registration, LoadGlm5NextFromGguf(*source.gguf, config));
+  }
   (void)registration;
   (void)config;
-  if (source.kind == ModelSource::Kind::kGguf) {
-    // NOT the same refusal as the safetensors arm, because the two are blocked
-    // on different things and a reader who lands here has a DIFFERENT next
-    // step. The GGUF container is now readable — W1 wired `glm5next` into the
-    // architecture dispatch and this config came out of
-    // `Glm5NextHfConfigFromGguf` — so what is missing is the weight tower, not
-    // the door. O7's PREMISE is superseded and this refusal says so: an artifact
-    // exists (`unsloth/GLM-5.3-Flash-GGUF` rev `d425e572f`), and W5 measured
-    // the production loader against the staged UD-Q2_K_XL arm -- it opens the
-    // file, resolves `general.architecture = glm5next`, walks the 4-way split,
-    // and stops on `blk.3.ffn_gate_exps.weight has unknown ggml type id 17`
-    // (IQ2_XS). So the reader's next step is the artifact, and the FIRST thing
-    // in the way is a quant decoder rather than this tower. What O7 still owes
-    // is an arm this tree can DECODE, which is a different debt from the one it
-    // was written for.
-    throw std::runtime_error(
-        "Glm5NextForConditionalGeneration: the GGUF config is read and "
-        "validated, but the weight loader is not ported (W5c owes the KDA, NoPE "
-        "MLA, mHC and stacked-expert weight tower). A published `.gguf` of this "
-        "model DOES now exist -- `unsloth/GLM-5.3-Flash-GGUF` rev d425e572f -- "
-        "so the next step is that artifact and not "
-        "`scripts/convert-glm5-next-gguf.py`; note that its UD arms mix six "
-        "quant encodings this tree cannot decode (Q3_K, Q4_K, Q5_K per O8 and "
-        "IQ2_XS, IQ3_XXS, IQ4_XS per O5), so the tower is necessary and not "
-        "sufficient. See .agents/specs/glm5-next-flash.md and issue #1998.");
-  }
+  // The safetensors arm stays refused, and NOT because it is the harder one.
+  // Every published safetensors artifact of this model is larger than every
+  // device this project owns, so an arm that read them would be code nothing
+  // could ever run. The spec's `## Owed` records it with that reason rather
+  // than as an unqualified to-do.
   throw std::runtime_error(
-      "Glm5NextForConditionalGeneration: the weight loader is not ported yet "
-      "(W5c owes it; the config resolves and validates, and W5 landed the MoE "
-      "block and the KV-cache spec). The published safetensors arms do not fit "
-      "any device this "
-      "project reaches either -- FP8 305.78 GiB and BF16 598.53 GiB against "
-      "~119.63 GiB on GB10. See .agents/specs/glm5-next-flash.md and issue "
-      "#1998.");
+      "Glm5NextForConditionalGeneration: the safetensors weight loader is not "
+      "ported (every published safetensors artifact -- FP8 305.78 GiB, BF16 "
+      "598.53 GiB and NVFP4 181.32 GiB -- exceeds every device this project "
+      "owns at ~119.63 GiB on GB10, so the GGUF arm is the supported one). "
+      "See .agents/specs/glm5-next-flash.md and issue #1998.");
 }
 
 void PrepareGlm5NextForConditionalGeneration(LoadedModel& model,
@@ -121,13 +133,19 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
   // THE REFUSAL COMES FIRST, AND THERE IS NO DOWNCAST ABOVE IT. The house shape
   // opens the type-erased handle with `ModelAs<...>` before anything else,
   // because a bare `static_cast` down the hierarchy is undefined behaviour on
-  // an object that is not really that type (#775, #730). But nothing can
-  // PRODUCE a loaded GLM-5.3-Flash while `load_weights` refuses
-  // unconditionally, so the only handle any caller can present is a foreign
-  // one, and a downcast placed first would turn every reach into a
-  // type-mismatch report -- leaving the refusal below dead code no test could
-  // enter and any later wave could delete without a red. W5 restores `ModelAs`
-  // at the moment there is a real forward with a real model to open.
+  // an object that is not really that type (#775, #730).
+  //
+  // W5c CHANGED THE PREMISE HALF-WAY AND THE ORDER STILL STANDS. The earlier
+  // version of this comment argued that nothing could PRODUCE a loaded
+  // GLM-5.3-Flash while `load_weights` refused unconditionally, so the only
+  // handle a caller could present was a foreign one. That is no longer true:
+  // the GGUF arm above returns a real `Glm5NextLoadedModel`. What has not
+  // changed is that there is no forward to open it FOR, so a downcast placed
+  // first would report a type mismatch on a foreign handle and then fall
+  // through to this same refusal on our own -- two messages for one missing
+  // capability, and the refusal reachable only on the path where it says
+  // least. W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
+  // restores `ModelAs` in the same change that gives it something to read.
   //
   // `VT_CHECK(false, ...)` IN THE HOOK BODY, not a bare throw behind a
   // `Class::ForwardDevice` delegate: `check-runner-routing-consistency.py`
@@ -152,14 +170,15 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
            "(glm5_next_mhc), and W5's 288+1 expert MoE (glm5_next_moe) -- and "
            "NOTHING ASSEMBLES THEM. W5b owes the decoder layer's per-layer "
            "control flow, the DSA attention block over the indexer's selection "
-           "and the assembled Glm5NextTextModel forward; W5c owes the weight "
-           "tower and `load_weights`, without which no LoadedModel of this "
-           "architecture can exist and this hook is unreachable; W6 the vision "
-           "tower, processor and placeholder expansion. Reusing a look-alike "
-           "for any of the four is what this refusal prevents: kimi_kda.cpp is "
-           "the SOFTPLUS forget gate and deepseek_v4_mhc.cpp's `HcHeadCollapse` "
-           "is the WEIGHTED collapse, and either one produces fluent, wrong "
-           "text that no gate on this fleet could detect. "
+           "and the assembled Glm5NextTextModel forward; W6 the vision tower, "
+           "processor and placeholder expansion. The WEIGHT TOWER is ported and "
+           "`load_weights` returns a real LoadedModel -- W5c (#2242) -- so a "
+           "handle reaching here is real and the missing part is the forward, "
+           "not the load. Reusing a "
+           "look-alike for any of the four is what this refusal prevents: "
+           "kimi_kda.cpp is the SOFTPLUS forget gate and deepseek_v4_mhc.cpp's "
+           "`HcHeadCollapse` is the WEIGHTED collapse, and either one produces "
+           "fluent, wrong text that no gate on this fleet could detect. "
            "See .agents/specs/glm5-next-flash.md and issue #1998.");
   return ForwardLogits{};  // unreachable; VT_CHECK always throws here
 }

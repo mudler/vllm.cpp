@@ -1807,6 +1807,260 @@ result: the four-state group is never allocated on a DEVICE (the CPU host takes
 and no mutation here can see the zero-seeded n-gram history, because no test in
 this tree reads that row's CONTENTS. All three are under `## Owed`.
 
+## Mutation record — W5b-6 (#2218)
+
+The gamma-polarity wave. Every mutation was sha256-proven applied, **its BUILD
+rc was read before any test result**, the tree was restored byte-for-byte with
+the hash re-checked, and both were RE-ARMED on the final head after the registry
+comment landed. `cpu_qwen4_exp.cpp` was measured at `4accd54e82be…` and
+`qwen4_exp_weights.cpp` at `81328de99cc1…`; both are the head's.
+
+### The RED, before the change
+
+`test_qwen4_exp_forward`, the new composition case, driven through
+`ModelRegistry::Load` on the synthetic `qwen4exp` file:
+
+```
+tests/vllm/models/test_qwen4_exp_forward.cpp:222: ERROR:
+  CHECK( MaxAbsDiff(mixed, want_mixed) < 1e-5f ) is NOT correct!
+  values: CHECK( 1.50578 <  1e-05 )
+  logged: site layer0.attn_hc
+  ... identically at site layer0.mlp_hc and site model.mixer
+[doctest] test cases:   1 |   0 passed | 1 failed | 0 skipped
+[doctest] assertions: 409 | 406 passed | 3 failed |
+```
+
+1.50578 against a 1e-5 bound is not a tolerance question. `w_hf` is in [0, 1) on
+this fixture and `1 + w_hf` in [1, 2), so the two parameterizations are a whole
+multiplicative unit apart; on the RELEASED checkpoint `w_hf` sits within an ulp
+or two of zero and the wrong one produces a stream scaled by ~0.
+
+### Counts, before and after, on the same tree
+
+The base was measured by checking `HEAD~1`'s copies of the four changed files
+into this worktree, rebuilding (rc 0) and running, then restoring — not by
+quoting the numbers a previous wave recorded.
+
+| Suite | Before | After |
+|---|---|---|
+| `test_qwen4_exp_forward` | did not exist | 1 / 421 / rc 0 |
+| `test_qwen4_exp_hc_device` | 9 / 87 / rc 0 | 9 / 87 / rc 0 |
+| `test_qwen4_exp_hc` | 15 / 246 / rc 0 | 15 / 246 / rc 0 |
+| `test_qwen4_exp_gguf_weights` | 11 / 2975 / rc 0 | 11 / 2975 / rc 0 |
+| `test_qwen4_exp_ple_device` | 10 / 538 / rc 0 | 10 / 538 / rc 0 |
+| `test_qwen4_exp_qsa_device` | 12 / 4697 / rc 0 | 12 / 4697 / rc 0 |
+
+The op's numeric contract changed and **every existing count is identical**,
+which is the check that the change is a re-parameterization and not a new
+answer: the goldens store `w_hf` either way, the fold simply moved from the test
+harness into the kernel. The fixture extraction is likewise count-neutral on the
+loader suite, 11 / 2975 before and after.
+
+### The battery
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| M-P1 | the kernel drops the `1 +`, i.e. the pre-#2218 contract restored | rc 0 | `test_qwen4_exp_forward` RED 1/1, at all three hyper-connection sites; `test_qwen4_exp_hc_device` RED 4/9, 12 of 87 assertions. The op half is gated |
+| M-P2 | `LoadGatedResidual` stops unshifting, `unshift=false` | rc 0 | `test_qwen4_exp_forward` RED 1/1 **at its precondition**, after 6 assertions — the `model_gamma + 1 == file_gamma` `REQUIRE` fires before any arithmetic runs; `test_qwen4_exp_gguf_weights` RED 1/11, 25 assertions. The LOADER half is gated, so a future edit that moves the fold back into `load_weights` cannot land silently |
+
+M-P2 is the half that matters. A case that only reddened on M-P1 would gate the
+op against a number the test chose; reddening on both is what makes it a gate on
+the SEAM.
+
+### What the battery did NOT reach
+
+Stated because a battery's silence is not a result.
+
+- **The injection arm does not discriminate polarity at this fixture and the
+  case says so out loud.** `2 * sigmoid(inject . normed / hc)` runs the
+  fixture's `inject` ramp against a 128-wide normed row and reaches ~10^4 under
+  BOTH gammas, so the sigmoid saturates at 2.0 either way. The case asserts the
+  saturation explicitly, so the day it stops being saturated is loud rather than
+  silent, and `mixed` carries the whole discriminating claim.
+- **Nothing here decodes.** The composition gated is loader -> one op. The layer
+  loop that would put 97 of these calls in sequence does not exist, so no token,
+  no `hyper` stream and no `lm_head` is involved.
+- **No CUDA arm was measured** because none exists; the op is CPU-only and the
+  spec carries that under `## Owed`.
+
+### The fresh review's findings, and what each one cost
+
+The review returned `PASS` on the change: the mutations reproduce and all eight
+pre-existing suites are count-identical. Six of its eight findings were prose,
+records, a dead build define and a merge. The other two changed something
+measured — one a published claim, one a dtype — and both are recorded here,
+because a reader of this section would otherwise take the earlier text at face
+value.
+
+**The "first suite in this tree" claim was FALSE unscoped.** `## Now` said this
+was the first suite here to load a gamma through `ModelRegistry::Load` and run it
+through a device op in one case. `tests/vllm/models/test_nemotron_h_paged_forward.cpp`
+and `tests/vllm/models/test_kimi_linear_paged.cpp` already do both inside a
+`TEST_CASE`. Scoped to `qwen4_exp` the claim holds, and the argument it supports
+— eleven single-sided waves of THIS row could not see the contradiction —
+survives unchanged. Corrected in `## Now`, in `## Owed` and on #2218 itself.
+
+**The four-gamma attribution was wrong about one CONSUMER.** The `## Owed` entry
+said `RunQwen4ExpQsaBlock` normalizes all four QSA gammas through
+`vt::RmsNorm(gemma = true)` and then cited three line pairs. The count exposed
+it: `idx_k_norm` never reaches `vt::RmsNorm`. It goes to `Qwen4ExpQsaIndex`
+(`qwen4_exp_qsa_block.cpp:401-403`) and is consumed by `vt::Qwen4ExpQsaCompress`
+(`:181`), which adds the 1 itself. Same polarity, different op, so "three of the
+four consumers already add the 1" stands with the consumer named correctly.
+
+**THE FOLD'S DTYPE HAD DRIFTED, AND THE BAND WAS ABSORBING IT.** Before this
+wave, the wide-accumulator case handed one identical `float` multiplier to both
+arms. After it, the kernel folded `1.0f + w` in f32 while the double reference
+folded `1.0 + (double)w`, so the two arms no longer described the same multiplier
+and the case's own comment — "the only thing this widens is the reduction" —
+stopped being true. Nothing failed, which is the point. Measured on exactly the
+data in the case, by forcing the bound to `1e-30` and reading the logged `worst`:
+
+| Reference's fold | Worst absolute deviation, `mixed` vs reference |
+|---|---|
+| `1.0f + w_hf`, widened AFTER (f32, as landed here) | 1.17323e-06 |
+| `1.0 + (double)w_hf` (the drifted form) | 9.8457e-07 |
+
+Both sit far inside the band — the bound is `1e-5` and the `float ss` mutant
+reads 6.702e-4 — so no tolerance was ever at risk. What was at risk is the
+meaning of the number: **1.173e-06 is the figure this file and the W5b-2 table
+record as "ours, double accumulator", and the drifted form no longer reproduced
+it.** The f32 fold is also what upstream does —
+`output * (1.0 + self.weight.float())` (`modeling_qwen4_exp.py:177`) folds a weak
+Python `1.0` into an fp32 tensor and the promotion stays fp32 — so mirroring
+upstream and restoring the recorded measurement are the same edit. AGENTS.md
+"Inherit vLLM defaults" decides it either way: f32 is the default and the wider
+value would have been the annotated exception, unannotated.
+
+## Mutation record — W5d-2 (#2249 item 5)
+
+The interleaved-mRoPE cos|sin table builder, `BuildMropeCosSinHost`. It was
+`static` at `src/vllm/model_executor/models/qwen3_5.cpp:9472`, so the tables
+Qwen4-Exp's QSA half of the layer loop needs could not be built from another
+translation unit and the QSA block would have had to grow a second copy of the
+axis selection and the angle math.
+
+**WHICH SHAPE, AND WHY THE SIMPLER ONE.** `RunGdnBlockPaged` (W5b-1) and
+`RunMoeBlock` both needed a thin PUBLIC WRAPPER over a private definition,
+because their signatures name types qwen3_5.cpp declares privately
+(`StepDevInputs`). This one names nothing private — `std::vector<int32_t>`,
+`int64_t`, `vllm::HfConfig` — so the extraction is the `static` keyword and a
+declaration in `include/vllm/model_executor/models/qwen3_5_mrope.h`. The
+definition does not move and there is exactly ONE implementation: qwen3_5.cpp's
+own two call sites now resolve through the same public declaration qwen4_exp
+will use, which is what `AGENTS.md` `## Shared seams` requires and what a
+copied second table builder would have broken.
+
+**BYTE IDENTITY, TWICE.** First textually: `git show
+94de63ff5:src/vllm/model_executor/models/qwen3_5.cpp | sed -n '9473,9514p'`
+sha256s to `259b1b932cae0611ca6dbde4ad63214e0d1365efe3b708b8ef7d38a7894688f1`,
+and so does the body on this branch — the whole diff to that function is the
+`static` keyword and two comment lines. Second by VALUE, because the keyword
+that changed is exactly the one that decides which definition a caller binds
+to: `tests/vllm/models/test_qwen3_5_mrope.cpp` pins 152 f32 BIT PATTERNS across
+four cases against what the FILE-STATIC produced at base SHA `94de63ff5`,
+captured by compiling its `sed`-extracted text in a standalone harness. The
+comparison is bitwise and not an epsilon — this is a pure host computation over
+`std::cos`/`std::pow` with no reduction-order freedom, so a tolerance would hide
+the one defect an extraction can introduce.
+
+**Counts, before and after, on the same tree.** 26 pre-existing qwen3_5 /
+qwen4_exp suites built and run at base and at head, identical exit status and
+identical case and assertion counts on every one (`diff` of the two count files
+is empty). The new suite adds 4 cases / 157 assertions. The population is every
+`vllm_cpp_add_test` target in `tests/CMakeLists.txt` whose name matches
+`qwen3_5`, `qwen35` or `qwen4_exp`, less the benchmark
+`bench_qwen3_5_vl_tower` and less this wave's own `test_qwen3_5_mrope`.
+
+**WHICH TREE THAT 26 WAS COUNTED ON, because merging `main` moved it.** The
+count is base `94de63ff5` against branch head `c1ccbac19`, both of which
+predate the merge of `main` in this branch. That merge brings in W5b's
+`test_qwen4_exp_forward` ([#2031](https://github.com/mudler/vllm.cpp/issues/2031),
+landed on `main` as `a6f933b81`'s neighbour), which makes the same glob match 27
+targets on the merged tree. It is NOT a 27th row of this neutrality
+measurement and cannot be: it existed at neither end of the before/after pair,
+so it has no before. It is `main`'s own gate for `main`'s own wave. The 26 is
+therefore a statement about the two trees named here and not about the merged
+head, which is the distinction this section previously left for a reader to
+make.
+
+**FOUR of the 26 measure NOTHING on this host, and only one of them says so.**
+An earlier revision of this section said "23 suites, two of which do not
+measure". Both halves were wrong. Re-measured on this CPU-only host at this
+head:
+
+| suite | rc | cases | assertions | why it measures nothing |
+|---|---|---|---|---|
+| `test_qwen35_paged_engine` | 77 | — | — | prints `*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***`; the Qwen3.5-0.8B snapshot at revision `2fc06364` is not cached here. **This is the one that is honest about itself** |
+| `test_qwen35_gguf_spec_decode` | 0 | 3 | **0** | `SKIP: set VLLM_MTP_GGUF_MODEL` |
+| `test_qwen3_5_vl_e2e` | 0 | 1 | **0** | `SKIP: Qwen3.6-27B checkpoint absent (set VLLM_QWEN36_CKPT)` |
+| `test_qwen3_5_vl_video_e2e` | 0 | 1 | **0** | the same skip |
+
+The last three exit 0 and print `[doctest] Status: SUCCESS!`. That is a skip
+wearing a pass, and a count-diff over a population containing them is neutral by
+construction on those three rows, so they carry no neutrality evidence at all.
+They are listed so that a reader does not read 26 green suites as 26
+measurements.
+
+**AND THIS BOUNDS THE M3 REACHABILITY EVIDENCE, WHICH IS THE PART THAT MATTERS.**
+`test_qwen3_5_vl_e2e` and `test_qwen3_5_vl_video_e2e` are the STRICT token-exact
+end-to-end gates on `VLGenerateCoreGdn`, the shared driver core holding the two
+production call sites M3 deletes. On a host that has the Qwen3.6-27B checkpoint
+they would be the strongest witnesses M3 has. Here they measure nothing, so the
+M3 red rests ENTIRELY on `test_qwen3_5_moe_vision` (7 cases / 38 assertions),
+whose `qwen3_5_moe_vl_image_forward_uses_MRoPE_positions_not_plain_1d` is the
+single case that goes red. One case, one assertion, is the whole reachability
+proof on this host. `test_qwen3_5_moe_vision_hw` does not extend it either: it
+measures 3 cases / 23 assertions but its own e2e case skips on
+`VLLM_MOE_VISION_E2E`. This is a HOST condition and not a defect in the
+mutation — it is stated because a reader on a GPU host with the checkpoint gets
+strictly more evidence than this run produced, and a reader without it gets
+exactly one assertion.
+
+**Upstream.** No divergence found. The interleaved axis masks mirror
+`vllm/model_executor/layers/rotary_embedding/mrope.py:60-63` at the parity pin
+`5559679229` (`h_mask = ((cos_offsets % 3) == 1) & (cos_offsets <= 3 *
+mrope_section_h)`, and the `w` twin), `apply_interleaved_rope` (`:190-198`)
+states the same layout as a tensor rewrite, and the chunked branch mirrors the
+same function's `else` arm (`:66-70`). The per-pair frequency is
+`base ** (-2 * pair / rotary_dim)`, which is `RotaryEmbeddingBase`'s inv_freq.
+
+| # | mutation | build rc | target | result |
+|---|---|---|---|---|
+| M1 | swap the cos and sin stores for the `h` axis (`axis == 1`) inside the extracted function | 0 | `test_qwen3_5_mrope` | **RED, 4 of 4 cases, 42 of 157 assertions.** The first failures are index 1 and index 9 of C1 trading values, which is the swap seen directly |
+| M2 | change the position offset by one (`positions3[axis * T + i] + 1`) | 0 | `test_qwen3_5_mrope` | **RED, 4 of 4 cases, 141 of 157 assertions.** The 16 survivors are the pairs whose frequency is small enough that the f32 store absorbs one position |
+| M2b | `pair <= 3 * sec[1]` -> `pair < 3 * sec[1]`, the upstream `<=` | 0 | `test_qwen3_5_mrope` | **GREEN — an EQUIVALENT MUTANT, and provably so.** The two forms differ only at `pair == 3 * sec[1]`, and the guard already requires `pair % 3 == 1` while `3 * sec[1]` is divisible by 3, so no input separates them. Upstream's `<=` and a `<` are the same function here. Recorded rather than replaced by a stronger case, because the next reader will reach for this mutation too |
+| M2c | shift the same boundary instead: `pair <= 3 * sec[1] + 1` | 0 | `test_qwen3_5_mrope` | **RED, 2 of 4 cases, 8 assertions.** This is the section boundary actually under gate: on C1 (`sec = {4,2,2}`, half 8) pair 7 flips from the `t` axis to the `h` axis |
+| M2d | the SAME shift on clause TWO, the `w` axis: `pair % 3 == 2 && pair <= 3 * sec[2]` -> `... + 2`. `+2` and not `+1`, because `3 * sec[2]` is divisible by 3 and the clause already requires `pair % 3 == 2`, so `+1` would be a second equivalent mutant for exactly M2b's reason | 0 | `test_qwen3_5_mrope` | **RED, 1 of 4 cases, 2 of 157 assertions.** Added on review repair, because M2b's green is only honest if the OTHER clause's reachable boundary is shown to red too — otherwise a reader cannot tell an equivalent mutant from an ungated one. Pristine `qwen3_5.cpp` sha256 `0b4517b3246e6e49fd8b0fa3a8ad7adc5c39b2846a4800966733688fb0d8d9fe` before, `c00f7a461b65a3260ea255b30bc03864bd7ad53cfb9379905cc41fe38b10ff8f` under the mutation, and back to `0b4517b3…` on restore; BUILD RC 0 read before the test result on both legs; re-run green 4 of 4 cases / 157 of 157 assertions, and `test_qwen3_5_moe_vision` 7 of 7 / 38 of 38 |
+| M3 | REACHABILITY: delete both production call sites in `qwen3_5.cpp` (`VLGenerateCoreGdn`'s prefill build and its decode-continuation build) and pass `nullptr` for the cache | 0, after a `(void)` for `-Werror=unused-parameter` | `test_qwen3_5_moe_vision`, `test_qwen3_5_mrope` | **`test_qwen3_5_moe_vision` RED on exactly `qwen3_5_moe_vl_image_forward_uses_MRoPE_positions_not_plain_1d` (1 of 7 cases, 1 of 38 assertions)** — the VL greedy driver reaches the extracted function and a test enters through the driver. It is NOT a production entry point; see the paragraph below. **`test_qwen3_5_mrope` stays GREEN, and it must:** it is a unit and seam case that calls the function directly, so it measures the function and never that anything reaches it. Stated here rather than left to be inferred |
+
+**WHAT M3 DOES NOT PROVE, MEASURED RATHER THAN ASSUMED.** The chain M3 reds
+stops one hop short of a production entry point, and this wave did not create
+that and does not close it. `grep -rn 'Qwen3_5MoeVLGenerateGreedy|Qwen3_5VLGenerateGreedy'`
+over `src/ include/ examples/ tools/ benchmarks/` returns the four DEFINITIONS
+in `src/vllm/model_executor/models/qwen3_5.cpp:9892,9915,9960,9974` and their
+six declaration lines in `qwen3_5.h` / `qwen3_5_dense.h` — and NOTHING else.
+Every CALLER is in `tests/`. The registered factories for
+`Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`
+carry no multimodal hook, so `ModelRegistry::Forward` cannot arrive here, and
+`include/vllm/entrypoints/openai/chat_mm.h:266-267` already says so in the tree's
+own words for the sibling Qwen3-VL driver: the greedy VL drivers run "outside
+`ModelRegistry::Forward`". So `BuildMropeCosSinHost` is reached by a public,
+gated, non-test caller, and that caller is not yet routed from
+`include/vllm.h`, the loader, `ModelRegistry::Forward` or a server path. The
+extraction changes nothing about that either way — the function had exactly this
+reach before the `static` came off — and it is recorded under `## Owed` rather
+than left for a reader to discover, because `AGENTS.md` `## Nothing lands dead`
+asks the question at every merge and silence is not an exception.
+
+Every mutation was applied to a pristine `qwen3_5.cpp`, sha256-proven applied,
+rebuilt with the BUILD RC read BEFORE any test result, run, then restored from a
+byte-identical copy and re-proven at
+`0b4517b3246e6e49fd8b0fa3a8ad7adc5c39b2846a4800966733688fb0d8d9fe`, rebuilt and
+re-run green. M3's first attempt did NOT build — deleting the call leaves
+`pos3_prefill` unused under `-Werror=unused-parameter` — which is the W5b-1
+mutation-B trap again and the reason the build rc column is in this table.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -1963,6 +2217,49 @@ is listed under `## Owed`.
 
 ## Owed
 
+- **W5d-2 (#2249 item 5): the mRoPE seam is REACHED, but only by a caller that
+  is not itself routed from a production entry point.** `BuildMropeCosSinHost`
+  now has external linkage behind
+  `include/vllm/model_executor/models/qwen3_5_mrope.h`, and `qwen3_5.cpp`'s two
+  production call sites resolve through that declaration — deleting them reds
+  `test_qwen3_5_moe_vision`'s
+  `qwen3_5_moe_vl_image_forward_uses_MRoPE_positions_not_plain_1d`. The hop above
+  is the gap: `Qwen3_5VLGenerateGreedy`, `Qwen3_5VLGenerateGreedyVideo`,
+  `Qwen3_5MoeVLGenerateGreedy` and `Qwen3_5MoeVLGenerateGreedyVideo` are DEFINED
+  in `src/vllm/model_executor/models/qwen3_5.cpp:9892,9915,9960,9974` and declared
+  in `qwen3_5.h` / `qwen3_5_dense.h`, and a tree-wide grep over
+  `src/ include/ examples/ tools/ benchmarks/` finds no other occurrence — every
+  CALLER is in `tests/`. The registered factories for
+  `Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`
+  carry no multimodal hook, so `ModelRegistry::Forward` cannot arrive; the tree
+  says so for the sibling driver at
+  `include/vllm/entrypoints/openai/chat_mm.h:266-267`. This condition PREDATES
+  the extraction and the extraction does not change it in either direction, but
+  it is named here because `## Nothing lands dead` asks the question at every
+  merge. TWO owners, because there are two ways to close it, and
+  `.agents/reachability.md` asks for a row ID and an issue for each rather than
+  a description:
+
+  1. **The qwen4_exp call.** The qwen4_exp layer loop will call this seam from a
+     path that IS routed through `ModelRegistry::Forward`. Row
+     `MODEL-MM-QWEN4-EXP`, W5b under
+     [#2031](https://github.com/mudler/vllm.cpp/issues/2031); the extraction
+     itself is this row's and is tracked by
+     [#2249](https://github.com/mudler/vllm.cpp/issues/2249).
+  2. **Request routing to the VL drivers.** Getting an image or video request
+     from the registered forward to `Qwen3_5VLGenerateGreedy` and its three
+     siblings is an ENGINE seam and not this model port's. Row
+     **`ENG-MM-QWEN36-VL-FORWARD`** (`.agents/engine-matrix.md`, state
+     `ACTIVE`), which already owns `BuildMropeCosSinHost`, the shared
+     `VLGenerateCoreGdn` and the two Qwen3.6-27B dense drivers; the two MoE
+     drivers additionally sit under row
+     `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` and
+     [#891](https://github.com/mudler/vllm.cpp/issues/891). Tracked by
+     [#2257](https://github.com/mudler/vllm.cpp/issues/2257), filed while
+     landing this wave because nothing tracked it before: the gap is real, it
+     predates the extraction, and it had no issue of its own. An earlier
+     revision of this entry named this owner only as "the mm-forward row",
+     which is a description and not a record.
 - **W5b-4 (#2167) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`
   (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels
@@ -2845,6 +3142,105 @@ is listed under `## Owed`.
   reorder when num_v != num_k" reaches R = 2, and that is the self-inverse
   K == R. Both roads end at the same place, but a reader chasing "K == R" through
   the default fixture would not find it.
+- **W5b-6 (#2218) RESOLVES THE GAMMA POLARITY, AND IT RESOLVES IT THE OTHER WAY
+  ROUND FROM WHAT THAT ISSUE PROPOSED.** #2218 asked the layer loop to fold
+  `hc_norm`, `norm_key`, `norm_query` and `norm_conv` through
+  `vllm::qwen4_exp::HcNormWeightFromHf` before use. Folding the last three would
+  have been the same defect moved one tensor to the left: their consumers
+  already add the 1. Measured in this tree rather than argued —
+  `RunQwen4ExpQsaBlock` normalizes THREE of its four QSA gammas —
+  `idx_q_norm`, `q_norm` and `k_norm` — through `vt::RmsNorm(..., gemma = true)`,
+  which is `out * (1 + w)` (`qwen4_exp_qsa_block.cpp:383-384`, `:425-426`,
+  `:441-442`, three line pairs for three gammas). **The fourth, `idx_k_norm`,
+  never reaches `vt::RmsNorm` at all**: it is handed to `Qwen4ExpQsaIndex`
+  (`:401-403`) and consumed inside it by `vt::Qwen4ExpQsaCompress` (`:181`),
+  which documents `k_norm_weight` as "the HuggingFace gamma, applied as
+  `(1.0 + weight)` ... NOT vLLM's `out * weight`". The polarity is the same
+  either way, which is why the conclusion below is unaffected, but the CONSUMER
+  is a different op and this entry said `vt::RmsNorm` for all four until the
+  W5b-6 review counted the citations against the claim. The PLE host reference
+  spells `(1.0 + static_cast<double>(weight[base + i]))` inline at
+  `qwen4_exp_ple.cpp:72`. **Three of the four consumers were already on the
+  loader's convention and only `vt::Qwen4ExpGatedResidual` was not**, so the op
+  moved rather than the loader. The rule is now one line: every gamma in
+  `Qwen4ExpWeights` is the RAW HuggingFace parameter and every consumer adds the
+  1, `linear_attn.norm.weight` excepted because the converter never folds it and
+  `vt::RmsNormGated` wants a plain multiplier. That is also upstream verbatim,
+  `Qwen4ExpTextRMSNorm.forward` = `output * (1.0 + self.weight.float())` over a
+  zero-initialised parameter (`modeling_qwen4_exp.py:173-178`).
+  `HcNormWeightFromHf` survives as the bridge to the W3 HOST reference, whose
+  `GroupedRmsNorm` keeps vLLM's `out * w` form, and it is now called from the
+  two suites that drive that reference and from no production path.
+- **W5b-6 (#2218) LANDS UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `vt::Qwen4ExpGatedResidual` and `vt::Qwen4ExpGatedResidualWriteBack`
+  (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels
+  `src/vt/cpu/cpu_qwen4_exp.cpp`) are the ops whose gamma contract this wave
+  changed, and at its merge commit nothing calls either from a production entry
+  point. Their only call sites are `tests/vllm/models/test_qwen4_exp_hc_device.cpp`
+  and the new `tests/vllm/models/test_qwen4_exp_forward.cpp`. That second suite
+  reaches the PRODUCTION LOADER — `ModelRegistry::Load` over a `qwen4exp` file —
+  and it is what makes the fix gateable at all, but a test driving a production
+  loader is still a test: it is not a production entry point, and reaching the
+  loader does not reach the op. `Qwen4ExpTextModel::Forward` does not exist and
+  `ForwardQwen4ExpForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp`) still refuses by name
+  before any downcast, so the op stays unreached for exactly the reason W5b-2
+  (#2123) recorded when it landed the op in the first place. The wiring is owed by
+  **W5b, the layer loop**, under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), owned by row
+  `MODEL-MM-QWEN4-EXP` and tracked by campaign
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978); the five measured
+  prerequisites that wave must clear first are the entry below this one.
+- **THE LAYER LOOP'S PREMISE — "every component it composes is already on
+  `main`" — IS FALSE, AND HERE ARE THE FIVE THINGS THAT ARE NOT.** Surveyed
+  against this tree while W5b-6 was in flight, each independently sufficient to
+  stop a token, and each now named in the `ForwardQwen4ExpForConditionalGeneration`
+  refusal so the next reader does not re-derive it:
+    1. **There is no standalone grouped RMS norm.** `Qwen4ExpTextPLELayer` holds
+       three `Qwen4ExpTextRMSNorm(hc_hidden_size, group_size=hidden_size)` —
+       `norm_key`, `norm_query`, `norm_conv` — reducing over `hc` independent
+       `hidden_size` slices of the 10240-wide stream. `include/vt/ops.h:556`
+       states the gap in its own words: "`kRmsNormGated` has no group_size;
+       `kRmsNormGatedGroup` requires a SILU gate". `vt::RmsNorm` reduces the
+       whole last dim and takes a `[D]` gamma, and the PLE gamma is `[hc*H]`, so
+       it cannot express this even per-branch. The only grouped reduction in the
+       tree is FUSED inside `vt::Qwen4ExpGatedResidual` and is not exposed.
+       **This is new op work, and it is the same "why a fused family op" argument
+       W5b-2 made, arriving at the opposite answer because PLE needs the norm
+       without the mix.**
+    2. **The QSA consumer is CONTIGUOUS and the published cache is PAGED.**
+       `Qwen4ExpQsaCaches` is `key`/`value` `[max_kv, num_kv_heads, head_dim]`
+       and `index_key` `[max_kv, indexer_head_dim]`
+       (`qwen4_exp_qsa_block.h`), while `MakeQwen4ExpKVCache` publishes a
+       `FullAttentionSpec` and an `MLAAttentionSpec` the runner allocates as
+       paged `CacheBuffer`s. Bridging them is a paged arm of
+       `RunQwen4ExpQsaBlock`, not a cast.
+    3. **Group 2 is allocated and unread**, already carried above as W5c-2:
+       `gather_block_table` has three call sites and reaches exactly
+       `full_attn_group_id_` and `gdn_group_id_`.
+    4. **The MoE weights need an adapter.** `Qwen4ExpMoeWeights` holds stacked
+       `gate_exps`/`up_exps` `[E, moe_I, H]` and `down_exps` `[E, H, moe_I]`;
+       `RunMoeBlock` reads `MoeBlockWeights`, whose arms are per-expert
+       `[H, I]` vectors, an `Nvfp4Weight` set, or the stacked keep-quant
+       `expert_gate_kq [E*I, H]` / `expert_down_kq [E*H, I]`. The third arm's
+       shapes are exactly the qwen4_exp ones and `KqExpertSlice` is dtype-generic
+       (`RowSizeBytes(w.dtype, K)`), so the adapter looks like a
+       reinterpretation plus a router-gate orientation and a shared-expert
+       mapping rather than a copy — but it is unwritten and unmeasured, and
+       nothing yet proves a bf16 tower routes through `ExpertMlpKq`.
+    5. **The mRoPE table builder has internal linkage.**
+       `BuildMropeCosSinHost` is `static` at `qwen3_5.cpp:9472`, and
+       `RunQwen4ExpQsaBlock` needs BOTH layouts derived from it: the packed
+       bf16 `[P, rot]` `cos|sin` cache `vt::RopeFromCache` reads and the two
+       separate f32 `[P, rot]` tables `vt::Qwen4ExpQsaCompress` reads, with
+       `CheckRopeLayoutsAgree` verifying they describe the same angles.
+  **And one more that is not this row's:** `ModelRegistry::Forward` refuses ANY
+  non-null `multi_kv` by name (`model_registry.cpp:428-440`), and this model's
+  three published groups make the runner set it
+  (`runner.cpp:787-804`, `:2283`). A forward reached through
+  `ModelRegistry::Forward` with a hand-built positional cache set is gateable
+  today; a forward reached through `GPUModelRunner` is not, and lifting that
+  refusal is an engine seam change DeepSeek-V4 waits on too.
 
 ## Now
 
@@ -2865,6 +3261,7 @@ and the ninth, W5a, is the only one with a production call site:
 | W5b-4 | Qwen Sparse Attention as two `vt::` ops, plus the unmapped-tail probe | [#2167](https://github.com/mudler/vllm.cpp/issues/2167) |
 | W5b-5 | `Qwen4ExpTextAttention` as ONE block, and the indexer composition in `src/` | [#2211](https://github.com/mudler/vllm.cpp/issues/2211) |
 | W5c-1 | the KV-cache spec: THREE groups, REACHED through `make_kv_cache` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
+| W5d-2 | `BuildMropeCosSinHost` loses `static`: ONE mRoPE table builder, cross-TU | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
@@ -2896,21 +3293,66 @@ is still no token number, no speed number, no `examples/server` e2e and no
 arm SERVE, which is W5b, not W5a. W2, W3 and W4
 remain host reference math with no production call site.
 
-**What is owed, in order. THE OP AND SEAM WORK IS FINISHED; WHAT IS LEFT IS THE
-LAYER LOOP.** W5b needed five slices and four of them are ops or seams:
+**W5b-6 ([#2218](https://github.com/mudler/vllm.cpp/issues/2218)) closes the
+gamma polarity and it does NOT decode.** `vt::Qwen4ExpGatedResidual` now takes
+the RAW HuggingFace gamma and adds the 1 itself, which is the convention the
+other three consumers of this architecture's gammas already had, so the layer
+loop can hand it `Qwen4ExpWeights` directly instead of scaling the
+hyper-connection stream by ~0. The gate is
+`tests/vllm/models/test_qwen4_exp_forward.cpp`, the first **`qwen4_exp`** suite
+that LOADS a gamma through `ModelRegistry::Load` and runs it through a device op
+in one case — which is why eleven single-sided waves of THIS row could not see
+it. **THE UNSCOPED FORM OF THAT SENTENCE WAS FALSE AND IS CORRECTED HERE.** It
+claimed the first such suite in the tree; it is not.
+`tests/vllm/models/test_nemotron_h_paged_forward.cpp` and
+`tests/vllm/models/test_kimi_linear_paged.cpp` each call `ModelRegistry::Load`
+inside a `TEST_CASE` and drive the loaded weights, gammas included, through the
+device ops of a forward. The claim that survives is the narrow one, and it is
+the one the argument needed: no `qwen4_exp` suite had ever composed the loader
+with an op, so the contradiction between them was unreachable here. The synthetic
+`qwen4exp` file moved to `tests/support/qwen4_exp_gguf_fixture.h` so the loader
+suite and the forward suite share ONE builder.
+
+**AND IT CORRECTS THIS SECTION'S OWN CLAIM.** The paragraph below used to say
+"THE OP AND SEAM WORK IS FINISHED; WHAT IS LEFT IS THE LAYER LOOP." That is not
+true. Five things the loop composes are absent from `main` — a standalone
+grouped RMS norm for PLE's three norms, a PAGED QSA consumer, the group-2 block
+table (W5c-2), a MoE weight adapter, and an externally linked mRoPE builder —
+and `ModelRegistry::Forward` additionally refuses every multi-cache topology by
+name, which is what this model publishes. Each is measured and cited under
+`## Owed`, and the production refusal in `qwen4_exp_registry.cpp` now names them
+instead of naming W2, W3 and W4, which landed. **A wave dispatched to "write the
+layer loop" will not decode a token; it has five prerequisites, at least two of
+which (the grouped norm, the paged QSA arm) are op-sized waves of their own.**
+
+**What is owed, in order. THIS PARAGRAPH'S OPENING CLAIM WAS WRONG AND IS
+CORRECTED ABOVE: the op and seam work is NOT finished.** What follows is still
+the right list of what W5b-1..5 landed; what it got wrong is the inference that
+nothing else was missing. W5b needed five slices and four of them are ops or
+seams:
 `RunGdnBlockPaged` for the 36 linear layers (W5b-1), the two gated-residual ops
 for the 10240-wide stream (W5b-2), `vt::Qwen4ExpPleConv` (W5b-3) and the two QSA
 ops (W5b-4). W5b-5 turned the last of those into a decoder-layer BLOCK —
 `RunQwen4ExpQsaBlock`, the first production composition of the QSA indexer — so
-**nothing this architecture needs is missing from the `vt::` surface any more.**
+nothing the QSA indexer needs is missing from the `vt::` surface any more —
+though the PLE block's grouped RMS norm still is, which the sentence this
+replaces overstated into a claim about the whole architecture.
 What has no production shape yet is the PLE block, the GDN and MoE weight
 adapters onto `GdnLayerWeights` / `MoeBlockWeights`, the hyper-connection stream
-through the per-layer loop, the mRoPE cos/sin table build, and the loop itself.
-One trap is recorded under `## Owed` for whoever writes it and is worth repeating
-here because it is silent: the loader stores every gamma in the RAW HuggingFace
-parameterization, `vt::RmsNorm` wants that under `gemma = true`, and
-`vt::Qwen4ExpGatedResidual` wants the OPPOSITE — a layer loop that hands it the
-raw gamma applies a near-zero scale and reads as a checkpoint bug. The
+through the per-layer loop, and the loop itself. The mRoPE cos/sin table build
+is no longer on that list as a SEAM — W5d-2
+([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 5) gave
+`BuildMropeCosSinHost` external linkage behind
+`include/vllm/model_executor/models/qwen3_5_mrope.h`, so the QSA half builds the
+SAME tables the Qwen3.5/3.6 VL drivers build rather than a second copy — but the
+loop still has to CALL it, and that call is W5b's.
+The trap this paragraph used to warn about is FIXED, not pending: the loader
+stores every gamma in the RAW HuggingFace parameterization and
+`vt::Qwen4ExpGatedResidual` used to want the opposite, so a layer loop handing it
+the loaded tensor applied a near-zero scale that reads as a checkpoint bug. W5b-6
+([#2218](https://github.com/mudler/vllm.cpp/issues/2218)) moved the op onto the
+loader's convention and gated the composition; a layer loop may now hand it
+`Qwen4ExpWeights` directly. The
 mixer/lm_head tail is not owed: the terminal
 `use_combine=false` mixer IS `vt::Qwen4ExpGatedResidual` with a null
 `block_inject`, gated as its own case in `test_qwen4_exp_hc_device.cpp`, and

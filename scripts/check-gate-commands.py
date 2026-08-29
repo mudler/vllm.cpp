@@ -463,6 +463,12 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # MODEL-DSV4-DSA-COMPOSE joined the runnable population when its spec
+    # landed (#2286): the row is scoping-only, but its `## Gates` section
+    # names commands that can fail, and this ratchet counts a row by what its
+    # Gates section can RUN rather than by whether code exists yet. Re-pinned
+    # in the same change that added the row, as the checker requires.
+    "MODEL-DSV4-DSA-COMPOSE",
     "ENG-POOL-BEST-FIT",
     "ENG-UPSTREAM-LTX2-PIN",
     "SERVE-REQUEST-LENGTH-GUARD",

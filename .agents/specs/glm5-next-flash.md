@@ -2779,7 +2779,12 @@ bare `pass` over `DeepseekV4HyperConnection`; the fourth does not.
 Every golden is the RUN output of the unmodified reference modules at
 transformers `v5.16.1`, not a transcription, and the gate was RED first against
 the wrong reuse at 59 of 98 assertions failed. That code is **not reached** from
-any production entry point (O16); W5 owns the wiring.
+any production entry point (O16); **W5b** owns the wiring. W4 wrote "W5" here
+and that was right until W5 split: W5 landed the MoE and the KV-cache spec and
+explicitly did not land the decoder layer, because W3 left no assembled
+attention block for its DSA arm to call, so the layer that reaches this code is
+W5b's ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)). O23 records the
+same split for the MoE.
 
 W3 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) then made the NoPE
 MLA geometry representable and ported the DSA k-pool indexer. **O11 is

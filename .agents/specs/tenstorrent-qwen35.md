@@ -34,11 +34,18 @@ and the wall HONESTLY UNMOVED — the A/B trace split the W4 hypothesis:
 per-upload allocation was never the wall; the wall is the per-CQ-operation
 tt-metal stack (context queries, `Cluster::get_chip`, `read_cq_host_ptr`
 polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
-staging** ([#2273](https://github.com/mudler/vllm.cpp/issues/2273), the
-active wave) — one CQ write per step divides the per-op tax by the
-fan-in; inside our file set. The tt-metal-side residual (cached context
-handles, amortized CQ polling) is recorded as the upstream-shaped
-alternative.
+staging** ([#2273](https://github.com/mudler/vllm.cpp/issues/2273)) is
+RESOLVED 2026-08-29: named UNREACHABLE with the trace (see `## Evidence`,
+W6) — the pinned tt-metal write API targets exactly one `MeshBuffer`
+per write and exposes no public offset views, and the production staging
+fan-in is causally interleaved (each restage is produced by a host
+round-trip between writes), so a merged write would carry bytes that do
+not exist yet. Owed next: the **round-trip-elimination lever** — the
+`MarkHostWritten` → `CommitHost` → restage host↔device cycle produces
+the staging writes themselves; removing the round-trips removes the
+per-op tax multiplicatively, inside our file set, on the `vt::FusedChain`
+seam. The tt-metal-side residual (public offset views, multi-destination
+write) stays recorded as the upstream-shaped alternative.
 
 ## Scope
 
@@ -299,6 +306,8 @@ column above is the entry point, not the whole chain.
   with the trace that proves it. The tt-metal-side residual (cached
   context handles, amortized CQ polling) stays recorded as the
   upstream-shaped alternative.
+  **Outcome (2026-08-29): named unreachable** — see `## Evidence`, W6.
+  The successor lever is round-trip elimination, not write amortization.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -373,6 +382,47 @@ tt-metal stack (`MetalContext::instance` 11.14%, `Cluster::get_chip` 5.90%,
 per-layer staging, our file set); the tt-metal-side residual is recorded
 beside it. Full log:
 [tt-qwen35-eager-profile-w5-20260829.log](../../docs/bench-evidence/tt-qwen35-eager-profile-w5-20260829.log).
+
+### W6 — the batching lever is not expressible (probe logs `/tmp/w6-probe{,2,3}.log`)
+
+The wave stopped at NEEDS_DECISION from the fresh implementer, and the operator
+verified both findings independently before accepting the verdict; nothing was
+implemented, and the branch carries records only.
+
+1. **The pinned tt-metal write API has no multi-destination write and no public
+   offset views.** Every write primitive targets exactly ONE `MeshBuffer`:
+   `enqueue_write` (MeshBuffer + DistributedHostBuffer), `enqueue_write_mesh_buffer`,
+   `enqueue_write_shards`, `enqueue_write_shard_to_sub_grid` (optional
+   `BufferRegion` sub-ranges ONE buffer's payload; `mesh_command_queue.hpp:89-155`),
+   the three `ttnn::copy_to_device` overloads (`tensor_ops.cpp:144-191`), and the
+   experimental `core_subset_write` (`mesh_command_queue.hpp:18`). A `BufferRegion`
+   merges SOURCES, never destinations. The address-view `MeshBuffer` constructor is
+   PRIVATE, friend-only to `experimental::per_core_allocation::create_on_single_device`
+   (`mesh_buffer.hpp:162-172`), so the W5 per-slot persistent buffers cannot become
+   windows into one arena through public API. An arena of views would still need one
+   write per view, so the merged write cannot exist.
+2. **The production per-step staging fan-in is causally interleaved, not
+   co-temporal.** Env-guarded probe instrumentation (temporary, reverted, suite
+   re-run green 45/45 · 5062 after restore) on a real 3-token eager leg
+   (`vllm-cli`, Qwen3.5-0.8B, 17.128 s, 0.175 tok/s): 30 persistent-route restages =
+   `[11,6144]`×17 (the activation hidden buffer, one stable slot) + `[176,128]`×13
+   (three rotating pool bases) ≈ 7-8 writes/step, each separated by ~30-60 ms of
+   other work. Each restage is CAUSED by a fresh host write:
+   `MarkHostWritten` (`tenstorrent_ops.cpp:5659`) → a TT op's d2h round-trip drops
+   the shadow in `CommitHost` (`:1237`) → restage (`:561`). The bytes write N+1 must
+   carry do not exist until a d2h + host compute between N and N+1 completes, and
+   the consuming kernels enqueue between the writes on the single in-order CQ. One
+   write per step would carry not-yet-existing bytes or reorder CQ ops against
+   their consumers — a bit-identity violation, not a speed change.
+
+Operator verification of finding 1: independent read of the pinned tt-metal
+headers (`mesh_command_queue.hpp`, `mesh_buffer.hpp`, `tensor_ops.cpp`) reached
+the same conclusion before the verdict was accepted. **Verdict: W6 is named
+unreachable — not a ceiling**: the successor lever inside our file set is
+round-trip elimination (remove the `CommitHost`/`Backend::Copy` host↔device
+cycle that produces the restages; `vt::FusedChain` seam), and the
+upstream-shaped alternative is public offset views / a multi-destination write
+in tt-metal.
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 

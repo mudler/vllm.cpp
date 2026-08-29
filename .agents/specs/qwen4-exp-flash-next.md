@@ -1820,9 +1820,35 @@ rebased forward twice as `main` moved under it, onto `6e805abcf` (`QUANT-EXL3`
 W3 — `cpu_exl3_kernels.cpp`, `cuda_exl3.cu`, `test_exl3_gemm.cpp`,
 `dense_weight_loaders.h`) and then onto `5f8a70705` (`SPEC-DFLASH2` #2252 —
 `qwen3_dflash*`). Neither touches a file this op compiles against.
-`test_ops_rms_norm_group` was rebuilt and re-run on the final head: **build rc 0,
+`test_ops_rms_norm_group` was rebuilt and re-run on that head: **build rc 0,
 7 cases / 69 assertions / rc 0**, unchanged. The mutation battery was NOT re-run
 after either rebase, and that is stated rather than implied.
+
+**The review repair then MERGED `origin/main` into the branch** rather than
+rebasing a third time, because `main` had moved to `37fbccea8` and a branch behind
+its base makes the diff-scoped gates SKIP rather than pass, which had quietly
+voided the review's own `PREFLIGHT_RC=0`. The two commits merged in — `1bc16ca3c`
+(`PERF-LAGUNA-GROUPED-GEMV` spec) and `37fbccea8` (`MODEL-TEXT-GLM-MOE-DSA` spec)
+— touch `.agents/claims/`, `.agents/issue-index.md`, `.agents/model-matrix.md`,
+two new spec files and `scripts/check-gate-commands.py`, and NO product code.
+
+At the merged head, build rc 0 read before any test result, **FIVE of the seven
+suites below were re-run and all five match byte-for-byte**:
+`test_ops_rms_norm_group` 7 / 69, `test_ops_mamba2_gated_norm` 9 / 2107,
+`test_ops_glue` 13 / 115, `test_qwen4_exp_hc` 15 / 246 and
+`test_qwen4_exp_hc_device` 9 / 87. `test_qwen4_exp_ple` and
+`test_qwen4_exp_ple_device` were NOT re-run, and their rows below still name
+`94de63ff5`.
+
+**M4 and M5 were re-run there too**, because the `## Owed` sentence this repair
+corrects is a claim about exactly those two: M4 build **rc 1** with
+`error: 'RmsNormGroupKernel' defined but not used [-Werror=unused-function]` and
+NO suite run; M5 build **rc 0**, suite **rc 1**, **6 of 7 cases**, six throws of
+`vt: no kernel for op RmsNormGroup (id 140) on device cpu (type 0)` raised at
+`src/vt/op_provider.cpp:589`. `src/vt/cpu/cpu_ops.cpp` was restored
+byte-for-byte after each, sha256 `e4a924b4…04b5` both times, rebuilt at rc 0 and
+re-run green at 7 / 69. Every other number in this section still names
+`94de63ff5` and is not restated as if it were measured here.
 
 Method as in the sections above:
 one textual change applied to a pristine tree, proved applied by a **sha256 that
@@ -2125,8 +2151,24 @@ is listed under `## Owed`.
   any device but `kCPU`, so the dispatcher refuses BY NAME rather than falling
   back — which is the whole argument for a separate OpId over a `group_size`
   field on `RmsNormArgs`, since a new field on that shared struct would be
-  silently ignored by the four backends that already register `kRmsNorm`. The
-  arm owes one decision this wave did not make for it: whether the per-group
+  silently ignored by the backends that already register `kRmsNorm` and read only
+  `eps` and `gemma` off it. **SIX register it in total** — `kCPU`
+  (`cpu_ops.cpp:3750`), `kCUDA` (`cuda_ops.cu:3917`), `kROCM`
+  (`rocm_ops.hip:118`), `kVULKAN` (`vulkan_ops.cpp:1626`), `kMETAL`
+  (`metal_ops.mm:1108`) and `kTENSTORRENT` (`tenstorrent_ops.cpp:5216`) — which
+  is FIVE besides the `kCPU` this wave teaches, and five others is the number
+  that carries the argument, because they are the ones that would answer a
+  grouped request with a whole-row norm.
+
+  This entry said "four", which is wrong under either reading, and the
+  correction rides here because this is the paragraph the W5d-1 review already
+  sent back. `include/vt/ops.h:634` says "five backends" and is NOT corrected:
+  its next clause is "so a CUDA or Metal caller would get a whole-row norm
+  back", so it is counting the five OTHER backends and is consistent with this
+  enumeration. The two records are reconciled here rather than left to read as
+  a contradiction, and no product file is touched to do it.
+
+  The arm owes one decision this wave did not make for it: whether the per-group
   sum of squares reduces in f32 (as the CPU arm does, mirroring `x.float()` at
   `modeling_qwen4_exp.py:174` and `RmsNormKernel` beside it) or in a wider
   accumulator once the group is 2560 wide rather than 6.

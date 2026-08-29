@@ -453,8 +453,19 @@ TEST_CASE("DequantGgufRowToF32 rejects unsupported i-quant type") {
   // about type 41 in particular: it is the assertion that a type the reader can
   // size but the switch cannot decode reaches the `default` arm rather than
   // falling through to some neighbour's block layout.
+  //
+  // The MESSAGE carries that assertion, and the exception type cannot. Every
+  // refusal on this path is a `std::runtime_error`, including the `VT_CHECK`
+  // inside the block-decode arm, so a bare `CHECK_THROWS_AS` stays green when
+  // type 41 is routed INTO that arm and refused there by
+  // `VT_CHECK(vt::BlockDTypeFromGgmlTypeId(...))` instead. A reviewer applied
+  // exactly that mutation and the whole suite kept passing. The two texts do
+  // differ: the `default` arm names the type id and its reader traits name,
+  // while `VT_CHECK` prefixes `vt:` and names no type. Match the former.
   std::vector<uint8_t> b2(18, 0);
-  CHECK_THROWS_AS(DequantGgufRowToF32(41, b2.data(), 128), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DequantGgufRowToF32(41, b2.data(), 128),
+                       doctest::Contains("unsupported ggml type 41 (Q1_0)"),
+                       std::runtime_error);
 }
 
 // --- IQ1_S (19) / IQ1_XXXS (66): the two encodings the Qwen3.8-2.4T-A95B

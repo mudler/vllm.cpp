@@ -3316,6 +3316,15 @@ target_include_directories(test_qwen4_exp_qsa_block PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_qwen4_exp_hc_device vllm/models/test_qwen4_exp_hc_device.cpp)
 target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5b (#2031) -- the assembled layer loop, and the
+# loader/op compositions no single-sided suite can see. Needs `src/` for the
+# model-private qwen4_exp headers and the checkpoint fixture dir for the
+# released config the reachability case parses.
+vllm_cpp_add_test(test_qwen4_exp_forward vllm/models/test_qwen4_exp_forward.cpp)
+target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_qwen4_exp_forward PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would

@@ -26,12 +26,19 @@
 // stopped being true one wave later, which is the drift this paragraph keeps
 // being rewritten to remove.
 //
-// WHAT STILL REFUSES IS THE FORWARD, and it is the only thing that does. No
-// token has been decoded by this architecture. That polarity matters more here
-// than usual, because no oracle for this model runs on any hardware this
-// project owns yet (`gateable = no`, blocked on memory rather than software),
-// so there is no downstream token gate that would catch a forward returning
-// plausible garbage. Refusing is the only safe default.
+// THREE THINGS STILL REFUSE, and the one that matters is the FORWARD: no token
+// has been decoded by this architecture. The other two are load-time and are
+// listed here so that the count is checkable rather than rhetorical -- the
+// SAFETENSORS arm refuses unconditionally at the end of
+// `LoadQwen4ExpForConditionalGeneration` (every published artifact is larger
+// than every device this project owns), and the GGUF arm refuses a source that
+// names the kind without carrying a file. Both are stated at their own sites.
+//
+// The forward's polarity matters more here than usual, because no oracle for
+// this model runs on any hardware this project owns yet (`gateable = no`,
+// blocked on memory rather than software), so there is no downstream token gate
+// that would catch a forward returning plausible garbage. Refusing is the only
+// safe default.
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform — the load-time device gate
 

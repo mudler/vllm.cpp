@@ -164,6 +164,13 @@ void Qwen4ExpGatedResidualKernel(Queue&, Tensor& mixed, Tensor* injection,
       // on zero. See #2218 and the composition case in
       // tests/vllm/models/test_qwen4_exp_forward.cpp, which is the only gate
       // that can see the disagreement: both halves are individually correct.
+      //
+      // THE FOLD IS f32, and that is upstream's width and not a convenience:
+      // `output * (1.0 + self.weight.float())` (:177) folds a Python weak `1.0`
+      // into an fp32 tensor, so the promotion stays fp32. Every host reference
+      // that widens its reduction to double folds in `float` first for the same
+      // reason (`test_qwen4_exp_hc_device.cpp`'s wide-accumulator case), so the
+      // widening isolates the reduction rather than also moving the multiplier.
       for (int64_t h = 0; h < H; ++h) {
         normed[static_cast<size_t>(g0 + h)] =
             LoadF32At(hyper, base + g0 + h) * r *

@@ -49,6 +49,17 @@ std::vector<float> HcNormWeightFromHf(const std::vector<float>& w_hf) {
   return w;
 }
 
+// THERE IS A SECOND `GroupedRmsNorm` IN THIS NAMESPACE AND IT HAS THE OPPOSITE
+// POLARITY. `qwen4_exp_ple.cpp:55` declares one at internal linkage that applies
+// `out * (1.0 + weight)`, i.e. it takes the RAW HuggingFace gamma; this one
+// applies `out * weight` and takes the FOLDED value, which callers reach through
+// `HcNormWeightFromHf`. Nothing collides today -- the two signatures differ and
+// `qwen4_exp_ple.cpp` does not include `qwen4_exp_hc.h` -- but a name shared
+// across two conventions is exactly the arrangement that produced #2218, where
+// the loader and `vt::Qwen4ExpGatedResidual` were each right about their own end
+// and no suite composed them. The duplicate disappears when PLE's three norms
+// move onto a standalone grouped-norm `vt::` op, which `## Owed` item 1 of
+// `.agents/specs/qwen4-exp-flash-next.md` already carries.
 std::vector<float> GroupedRmsNorm(const std::vector<float>& x, const std::vector<float>& weight,
                                   int64_t group_size, float eps) {
   if (group_size <= 0) {

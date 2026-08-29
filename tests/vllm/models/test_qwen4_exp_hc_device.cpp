@@ -525,7 +525,8 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
     return static_cast<float>(static_cast<int32_t>(state >> 33)) / 2147483648.0f;
   };
   // `w_hf` is the RAW gamma the op takes (#2218); the double reference below
-  // spells the `1 +` itself, so both arms describe the same multiplier.
+  // spells the `1 +` itself, IN f32, so both arms describe the same multiplier
+  // bit for bit and the only thing this case widens is the reduction it is about.
   std::vector<float> hyper(static_cast<size_t>(kFlat)), w_hf(static_cast<size_t>(kFlat));
   for (int64_t j = 0; j < HC; ++j) {
     for (int64_t d = 0; d < H; ++d) {
@@ -551,8 +552,18 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
   vt::Qwen4ExpGatedResidual(q, t_mixed, nullptr, t_hyper, t_w, t_down, t_up, nullptr,
                             args);
 
-  // The reference, in full double. `sigmoid(0)` is 0.5 exactly in any precision,
-  // so the only thing this widens is the reduction.
+  // The reference, in full double EXCEPT the gamma fold. `sigmoid(0)` is 0.5
+  // exactly in any precision, so the reduction is the only thing left for the
+  // widening to isolate -- provided the fold does not quietly widen with it.
+  // Upstream folds in f32: `Qwen4ExpTextRMSNorm.forward` is
+  // `output * (1.0 + self.weight.float())` (`modeling_qwen4_exp.py:177`), where
+  // the Python `1.0` is a weak scalar and the promotion stays fp32, and the
+  // kernel mirrors that with `1.0f + LoadF32At(hc_norm_w, ...)`. Folding in
+  // double here instead would leave the two arms up to a float ulp apart on the
+  // multiplier, and this case's band would absorb the difference silently -- a
+  // tolerance covering a dtype gap, which is the shape AGENTS.md "Inherit vLLM
+  // defaults" warns a token gate cannot see. So the `+ 1` is spelled `1.0f` and
+  // widened AFTERWARDS, matching the kernel exactly.
   std::vector<double> want(static_cast<size_t>(H), 0.0);
   for (int64_t j = 0; j < HC; ++j) {
     double ss = 0.0;
@@ -562,9 +573,9 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
     }
     const double r = 1.0 / std::sqrt(ss / static_cast<double>(H) + static_cast<double>(kEps));
     for (int64_t d = 0; d < H; ++d) {
+      const float w_folded = 1.0f + w_hf[static_cast<size_t>(j * H + d)];
       want[static_cast<size_t>(d)] +=
-          0.5 * hyper[static_cast<size_t>(j * H + d)] * r *
-          (1.0 + static_cast<double>(w_hf[static_cast<size_t>(j * H + d)]));
+          0.5 * hyper[static_cast<size_t>(j * H + d)] * r * static_cast<double>(w_folded);
     }
   }
   for (double& v : want) v /= static_cast<double>(HC);

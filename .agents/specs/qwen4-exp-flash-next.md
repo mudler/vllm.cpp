@@ -1883,6 +1883,55 @@ Stated because a battery's silence is not a result.
 - **No CUDA arm was measured** because none exists; the op is CPU-only and the
   spec carries that under `## Owed`.
 
+### The fresh review's findings, and what each one cost
+
+The review returned `PASS` on the change: the mutations reproduce and all eight
+pre-existing suites are count-identical. Six of its eight findings were prose,
+records, a dead build define and a merge. The other two changed something
+measured — one a published claim, one a dtype — and both are recorded here,
+because a reader of this section would otherwise take the earlier text at face
+value.
+
+**The "first suite in this tree" claim was FALSE unscoped.** `## Now` said this
+was the first suite here to load a gamma through `ModelRegistry::Load` and run it
+through a device op in one case. `tests/vllm/models/test_nemotron_h_paged_forward.cpp`
+and `tests/vllm/models/test_kimi_linear_paged.cpp` already do both inside a
+`TEST_CASE`. Scoped to `qwen4_exp` the claim holds, and the argument it supports
+— eleven single-sided waves of THIS row could not see the contradiction —
+survives unchanged. Corrected in `## Now`, in `## Owed` and on #2218 itself.
+
+**The four-gamma attribution was wrong about one CONSUMER.** The `## Owed` entry
+said `RunQwen4ExpQsaBlock` normalizes all four QSA gammas through
+`vt::RmsNorm(gemma = true)` and then cited three line pairs. The count exposed
+it: `idx_k_norm` never reaches `vt::RmsNorm`. It goes to `Qwen4ExpQsaIndex`
+(`qwen4_exp_qsa_block.cpp:401-403`) and is consumed by `vt::Qwen4ExpQsaCompress`
+(`:181`), which adds the 1 itself. Same polarity, different op, so "three of the
+four consumers already add the 1" stands with the consumer named correctly.
+
+**THE FOLD'S DTYPE HAD DRIFTED, AND THE BAND WAS ABSORBING IT.** Before this
+wave, the wide-accumulator case handed one identical `float` multiplier to both
+arms. After it, the kernel folded `1.0f + w` in f32 while the double reference
+folded `1.0 + (double)w`, so the two arms no longer described the same multiplier
+and the case's own comment — "the only thing this widens is the reduction" —
+stopped being true. Nothing failed, which is the point. Measured on exactly the
+data in the case, by forcing the bound to `1e-30` and reading the logged `worst`:
+
+| Reference's fold | Worst absolute deviation, `mixed` vs reference |
+|---|---|
+| `1.0f + w_hf`, widened AFTER (f32, as landed here) | 1.17323e-06 |
+| `1.0 + (double)w_hf` (the drifted form) | 9.8457e-07 |
+
+Both sit far inside the band — the bound is `1e-5` and the `float ss` mutant
+reads 6.702e-4 — so no tolerance was ever at risk. What was at risk is the
+meaning of the number: **1.173e-06 is the figure this file and the W5b-2 table
+record as "ours, double accumulator", and the drifted form no longer reproduced
+it.** The f32 fold is also what upstream does —
+`output * (1.0 + self.weight.float())` (`modeling_qwen4_exp.py:177`) folds a weak
+Python `1.0` into an fp32 tensor and the promotion stays fp32 — so mirroring
+upstream and restoring the recorded measurement are the same edit. AGENTS.md
+"Inherit vLLM defaults" decides it either way: f32 is the default and the wider
+value would have been the annotated exception, unannotated.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -2927,12 +2976,18 @@ is listed under `## Owed`.
   `vllm::qwen4_exp::HcNormWeightFromHf` before use. Folding the last three would
   have been the same defect moved one tensor to the left: their consumers
   already add the 1. Measured in this tree rather than argued —
-  `RunQwen4ExpQsaBlock` normalizes all four QSA gammas through
-  `vt::RmsNorm(..., gemma = true)`, which is `out * (1 + w)`
-  (`qwen4_exp_qsa_block.cpp:383-384`, `:425-426`, `:441-442`);
-  `vt::Qwen4ExpQsaCompress` documents `k_norm_weight` as "the HuggingFace gamma,
-  applied as `(1.0 + weight)` ... NOT vLLM's `out * weight`"; and the PLE host
-  reference spells `(1.0 + static_cast<double>(weight[base + i]))` inline at
+  `RunQwen4ExpQsaBlock` normalizes THREE of its four QSA gammas —
+  `idx_q_norm`, `q_norm` and `k_norm` — through `vt::RmsNorm(..., gemma = true)`,
+  which is `out * (1 + w)` (`qwen4_exp_qsa_block.cpp:383-384`, `:425-426`,
+  `:441-442`, three line pairs for three gammas). **The fourth, `idx_k_norm`,
+  never reaches `vt::RmsNorm` at all**: it is handed to `Qwen4ExpQsaIndex`
+  (`:401-403`) and consumed inside it by `vt::Qwen4ExpQsaCompress` (`:181`),
+  which documents `k_norm_weight` as "the HuggingFace gamma, applied as
+  `(1.0 + weight)` ... NOT vLLM's `out * weight`". The polarity is the same
+  either way, which is why the conclusion below is unaffected, but the CONSUMER
+  is a different op and this entry said `vt::RmsNorm` for all four until the
+  W5b-6 review counted the citations against the claim. The PLE host reference
+  spells `(1.0 + static_cast<double>(weight[base + i]))` inline at
   `qwen4_exp_ple.cpp:72`. **Three of the four consumers were already on the
   loader's convention and only `vt::Qwen4ExpGatedResidual` was not**, so the op
   moved rather than the loader. The rule is now one line: every gamma in
@@ -2944,6 +2999,26 @@ is listed under `## Owed`.
   `HcNormWeightFromHf` survives as the bridge to the W3 HOST reference, whose
   `GroupedRmsNorm` keeps vLLM's `out * w` form, and it is now called from the
   two suites that drive that reference and from no production path.
+- **W5b-6 (#2218) LANDS UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `vt::Qwen4ExpGatedResidual` and `vt::Qwen4ExpGatedResidualWriteBack`
+  (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels
+  `src/vt/cpu/cpu_qwen4_exp.cpp`) are the ops whose gamma contract this wave
+  changed, and at its merge commit nothing calls either from a production entry
+  point. Their only call sites are `tests/vllm/models/test_qwen4_exp_hc_device.cpp`
+  and the new `tests/vllm/models/test_qwen4_exp_forward.cpp`. That second suite
+  reaches the PRODUCTION LOADER — `ModelRegistry::Load` over a `qwen4exp` file —
+  and it is what makes the fix gateable at all, but a test driving a production
+  loader is still a test: it is not a production entry point, and reaching the
+  loader does not reach the op. `Qwen4ExpTextModel::Forward` does not exist and
+  `ForwardQwen4ExpForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp`) still refuses by name
+  before any downcast, so the op stays unreached for exactly the reason W5b-2
+  (#2123) recorded when it landed the op in the first place. The wiring is owed by
+  **W5b, the layer loop**, under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), owned by row
+  `MODEL-MM-QWEN4-EXP` and tracked by campaign
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978); the five measured
+  prerequisites that wave must clear first are the entry below this one.
 - **THE LAYER LOOP'S PREMISE — "every component it composes is already on
   `main`" — IS FALSE, AND HERE ARE THE FIVE THINGS THAT ARE NOT.** Surveyed
   against this tree while W5b-6 was in flight, each independently sufficient to
@@ -3051,9 +3126,17 @@ the RAW HuggingFace gamma and adds the 1 itself, which is the convention the
 other three consumers of this architecture's gammas already had, so the layer
 loop can hand it `Qwen4ExpWeights` directly instead of scaling the
 hyper-connection stream by ~0. The gate is
-`tests/vllm/models/test_qwen4_exp_forward.cpp`, the first suite here that LOADS
-a gamma through `ModelRegistry::Load` and runs it through a device op in one
-case — which is why eleven single-sided waves could not see it. The synthetic
+`tests/vllm/models/test_qwen4_exp_forward.cpp`, the first **`qwen4_exp`** suite
+that LOADS a gamma through `ModelRegistry::Load` and runs it through a device op
+in one case — which is why eleven single-sided waves of THIS row could not see
+it. **THE UNSCOPED FORM OF THAT SENTENCE WAS FALSE AND IS CORRECTED HERE.** It
+claimed the first such suite in the tree; it is not.
+`tests/vllm/models/test_nemotron_h_paged_forward.cpp` and
+`tests/vllm/models/test_kimi_linear_paged.cpp` each call `ModelRegistry::Load`
+inside a `TEST_CASE` and drive the loaded weights, gammas included, through the
+device ops of a forward. The claim that survives is the narrow one, and it is
+the one the argument needed: no `qwen4_exp` suite had ever composed the loader
+with an op, so the contradiction between them was unreachable here. The synthetic
 `qwen4exp` file moved to `tests/support/qwen4_exp_gguf_fixture.h` so the loader
 suite and the forward suite share ONE builder.
 

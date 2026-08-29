@@ -191,6 +191,32 @@ struct Dots3NoteParams {
   // `Dots3NotePaddedMLAAttention`, whose `get_kv_cache_spec` reports it :211).
   int64_t physical_latent_row() const { return swa.latent_row(); }
 
+  // The `quantization_config` block. ABSENT from the released bf16
+  // `dots-studio/dots3-note-prev` (verified against the committed fixture) and
+  // PRESENT on the `-fp8` sibling as `{"quant_method": "fp8", "fmt": "e4m3",
+  // "activation_scheme": "dynamic", "weight_block_size": [128, 128]}`.
+  //
+  // Upstream reads exactly this: `_padded_mlp_size` (model.py:63-73) takes
+  // `getattr(quant_config, "weight_block_size", None)`, and
+  // `Dots3NoteModel._pad_dense_mlp_weight` (model.py:598-618) does the same.
+  // We read it to REFUSE by name rather than to pad: the fp8 arm is W9, and
+  // `dense_loaders::MaterializeBf16Source` handles a per-tensor or
+  // per-output-ROW `<name>_scale` and nothing else, so a blockwise
+  // `weight_scale_inv` would otherwise surface as a bare "tensor not found".
+  std::string quant_method;                // "" when the block is absent
+  std::vector<int64_t> weight_block_size;  // empty when the key is absent
+  bool has_blockwise_quant() const { return !weight_block_size.empty(); }
+
+  // `intermediate_size=config.moe_intermediate_size * num_shared_experts`
+  // (model.py:103-107, through `_padded_mlp_size`, which is the identity at
+  // TP=1 with no `weight_block_size`). NOT `intermediate_size`: the released
+  // checkpoint's `mlp.shared_experts.gate_proj.weight` is [1536, 5120] and the
+  // dense layers' `mlp.gate_proj.weight` is [13824, 5120], so reading the wrong
+  // one is an 9x-too-wide MLP that the shape check refuses BY NAME.
+  int64_t shared_intermediate_size() const {
+    return moe_intermediate_size * n_shared_experts;
+  }
+
   Dots3NoteLayerKind kind_of(int64_t layer) const {
     return layer_types.at(static_cast<size_t>(layer));
   }
@@ -267,13 +293,36 @@ const Dots3NoteDeferredTower* Dots3NoteDeferralFor(const std::string& name);
 // over" is also true of a classifier that claims the towers as language.
 struct Dots3NoteAccounting {
   int64_t language = 0;  // claimed by a named language-tower consumer
+  // The nextn (MTP) tail: `model.layers.{num_hidden_layers + i}.*` and
+  // `model.mtp.*`, deferred to W10 (W5c, #2176). It is a SEPARATE bucket rather
+  // than part of `language` for the reason the tower buckets exist: the
+  // language forward never reads these tensors, and folding them into the
+  // language count leaves "100% accounted" green over 19 weights nobody loads.
+  // They stay ENUMERATED, so `missing` still refuses a checkpoint that claims a
+  // nextn layer and does not ship it — only the bucket moved.
+  int64_t nextn = 0;
   int64_t vision = 0;    // `vision_encoder.*`, deferred to W6
   int64_t audio = 0;     // `audio_encoder.*`, deferred to W7
   std::vector<std::string> unaccounted;  // on disk, claimed by nobody
   std::vector<std::string> missing;      // enumerated, not on disk
   std::vector<std::string> duplicated;   // enumerated more than once
-  int64_t total() const { return language + vision + audio; }
+  int64_t total() const { return language + nextn + vision + audio; }
 };
+
+// Is `name` part of the nextn (MTP) tail this port defers to W10? (W5c, #2176.)
+//
+// A PREDICATE rather than a `Dots3NoteDeferredTowers()` row, and the reason is
+// the data rather than a preference: a tower's prefix is a literal, while the
+// nextn tail's is CONFIG-DERIVED — `model.layers.{num_hidden_layers + i}.` for
+// `i` in `[0, num_nextn_predict_layers)`, plus the flat `model.mtp.`. A static
+// table cannot spell the first one.
+//
+// Upstream skips exactly these names when it loads the MAIN model:
+// `get_spec_layer_idx_from_weight_name` (`utils.py:542`, matching
+// `model.layers.{base+i}.` or `layers.{base+i}.` at `:559`), consulted at
+// `deepseek_v2.py:1618-1620`; and `if name.startswith("mtp."): continue` inside
+// `Dots3NoteModel._adapt_weights` (`model.py:624`). Both at `bc2d63e650`.
+bool Dots3NoteIsNextnTensor(const Dots3NoteParams& params, const std::string& name);
 
 // Classify every name in `present` against what `params` says the language
 // tower ships. `expected_layers` is the backbone layer set to enumerate; pass
@@ -332,6 +381,50 @@ struct Dots3NoteDenseMlp {
   OwnedTensor down_proj;     // [hidden, intermediate] raw-NK
 };
 
+// `Dots3NoteMoE` (model.py:76) — `DeepseekV2MoE`'s router and routed experts
+// with the shared expert LIFTED OUT of the base and added unfused
+// (model.py:87-99 sets `n_shared_experts` to None on the routed config, so
+// `DeepseekV2MoE.__init__` takes its `shared_experts = None` branch at
+// deepseek_v2.py:354-355; model.py:125-127 does the add). Numerically that is
+// the same function the base computes when it owns the shared expert, which is
+// why `vt::MoeCombine`'s optional `shared` term expresses it exactly.
+//
+// The released `dots-studio/dots3-note-prev` ships every one of these BF16
+// except `e_score_correction_bias`, which is F32 — the ONLY dtype exception in
+// the MoE block, and F32 upstream too (deepseek_v2.py:322-324).
+struct Dots3NoteMoeWeights {
+  OwnedTensor router_gate;  // [H, E] Matmul-B (from the [E, H] `mlp.gate.weight`)
+  // `e_score_correction_bias` [E] F32 — built only for `topk_method ==
+  // "noaux_tc"` (deepseek_v2.py:321-326), which `ParseDots3NoteParams` already
+  // requires for this architecture, so it is never empty here.
+  OwnedTensor e_score_correction_bias;
+  std::vector<OwnedTensor> expert_gate;  // E x [H, moe_intermediate_size] Matmul-B
+  std::vector<OwnedTensor> expert_up;    // E x [H, moe_intermediate_size] Matmul-B
+  std::vector<OwnedTensor> expert_down;  // E x [moe_intermediate_size, H] Matmul-B
+  // The ONE shared expert, at `moe_intermediate_size * n_shared_experts`
+  // (`Dots3NoteParams::shared_intermediate_size`), gate/up merged for the
+  // shared `layers::MlpGateUpMethodBase` seam exactly as the dense MLP is.
+  Dots3NoteDenseMlp shared;
+  // The device-resident per-expert pointer arrays the grouped bf16 MoE GEMM
+  // reads, built ONCE on first device-MoE use and owned BY THIS BLOCK (issue
+  // #237's `ResidentSlot`, qwen3_5_weights.h, which this header already
+  // includes). Opaque here on purpose: the resident type is a CUDA
+  // implementation detail of `dots3_note_device.cpp`, exactly as
+  // `MoeBlockWeights` keeps qwen3_5.cpp's out of its own header.
+  //
+  // KEYED ON THE SLOT, NEVER ON AN ADDRESS. W5 first shipped this state as a
+  // process-lifetime `static std::map<const Dots3NoteMoeWeights*, ...>`. An
+  // address is only a valid identity while the object lives: destroy one engine
+  // and build another in the same process, and the allocator can hand the new
+  // weights the old ones' address. The new block then finds an entry already
+  // marked ready and every routed expert GEMM reads the PREVIOUS engine's
+  // device pointers. Because those buffers are deliberately never freed, there
+  // is no crash and no error — the second model silently answers from the
+  // first's experts. That is issue #237, and `tests/vllm/models/
+  // test_moe_resident_lifetime.cpp` pins the invariant for this block too.
+  ResidentSlot resident_moe;
+};
+
 struct Dots3NoteLayerDeviceWeights {
   // WHICH of the two attention geometries this layer runs — `config.layer_types
   // [layer_idx] == "sliding_attention"` selects `Dots3NoteSlidingAttention`
@@ -342,7 +435,16 @@ struct Dots3NoteLayerDeviceWeights {
   OwnedTensor input_layernorm;           // [hidden]
   OwnedTensor post_attention_layernorm;  // [hidden]
   Dots3NoteMlaLayerWeights attn;
-  Dots3NoteDenseMlp mlp;
+  // WHICH MLP this layer runs — `is_moe` at model.py:514-519, i.e.
+  // `layer_idx < num_hidden_layers and n_routed_experts is not None and
+  // layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0`,
+  // which is `Dots3NoteParams::is_moe_layer`. Stored beside the weights rather
+  // than re-derived at each use, for the same reason `kind` is (W4b-2): on a
+  // MoE layer `mlp.gate_proj.weight` DOES NOT EXIST on disk, so the choice is
+  // structural and not a preference. (W5, #699.)
+  bool is_moe = false;
+  Dots3NoteDenseMlp mlp;      // populated iff !is_moe
+  Dots3NoteMoeWeights moe;    // populated iff  is_moe
 };
 
 // The materialized language tower, present ONLY for a config the device forward
@@ -397,8 +499,21 @@ struct Dots3NoteWeights {
 //
 // W4a/W4b cover both attention geometries — full and sliding-window — with a
 // DENSE MLP, and since W4b-3c a long SINGLE-SHOT prefill is served with the DSA
-// selection rather than refused. What remains is W5 (MoE), W6/W7 (the vision
-// and audio towers) and W10 (the nextn tail).
+// selection rather than refused. **W5 added the MoE layer and W5c removed the
+// nextn branch, so this function now returns "" for the RELEASED
+// `dots-studio/dots3-note-prev` config.** What it still refuses is a
+// BLOCKWISE-QUANTIZED checkpoint, which is W9: the `-fp8` sibling carries
+// `quantization_config.weight_block_size = [128, 128]` and a `weight_scale_inv`
+// per projection, while `dense_loaders::MaterializeBf16Source` reads a
+// per-tensor or per-output-ROW `<name>_scale` and would otherwise fail with a
+// bare "tensor not found".
+//
+// The vision and audio towers (W6/W7) and the nextn tail (W10) are NAMED
+// DEFERRALS in the accounting rather than refusals here — the towers through
+// `Dots3NoteDeferredTowers()`, the nextn tail through
+// `Dots3NoteIsNextnTensor`. The nextn branch used to refuse, which was
+// STRICTER than upstream: vLLM drops those weights from the main model
+// (utils.py:542 -> deepseek_v2.py:1618-1620; model.py:624). See #2176.
 //
 // NOTE what this function does NOT decide. The `seq_len > index_topk` question
 // is a property of the STEP, not of the config, so it lives in the forward

@@ -675,6 +675,9 @@ set_tests_properties(test_device_pool_concurrent PROPERTIES
   ENVIRONMENT "VT_POOL_BYPASS=0"
   SKIP_RETURN_CODE 77)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
+# dots3-note (#699) keeps its weights header beside the model in src/, not in
+# include/, so this suite needs src/ on its include path to see the MoE block.
+target_include_directories(test_moe_resident_lifetime PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)

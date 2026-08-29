@@ -306,20 +306,24 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
                registration.architecture ==
                    "Gemma4UnifiedForConditionalGeneration" ||
                registration.architecture == "MuseGlimmerForCausalLM" ||
-               registration.architecture == "Dots3NoteForCausalLM" ||
                registration.architecture ==
                    "MuseGlimmerForConditionalGeneration") {
       // Qwen3-VL (MM-ENGINE-FORWARD) + Gemma-4 (CLAIM-GEMMA4-MM-E2E) + Muse
-      // Glimmer (CLAIM-MUSE-GLIMMER-W0) + dots3-note (#699 W1): MULTIMODAL (a
-      // vision tower alongside the text backbone) but the text backbone is dense
-      // attention → NOT hybrid (no GDN state). Muse Glimmer's iRoPE split is
-      // sliding-vs-full ATTENTION, which is not a recurrent lane, so it belongs
-      // here and not with the hybrids; its vision tower is scaffolded, not yet
-      // forwarding. dots3-note is the same shape twice over: upstream registers
-      // it in _MULTIMODAL_MODELS with image, video AND audio towers
-      // (multimodal.py:65-72), and its own attention split is full-vs-sliding
-      // MLA over one paged cache — a window, not a recurrent state. Both of its
-      // towers are W6/W7. The non-hybrid multimodal registrations.
+      // Glimmer (CLAIM-MUSE-GLIMMER-W0): MULTIMODAL (a vision tower alongside
+      // the text backbone) but the text backbone is dense attention → NOT
+      // hybrid (no GDN state). Muse Glimmer's iRoPE split is sliding-vs-full
+      // ATTENTION, which is not a recurrent lane, so it belongs here and not
+      // with the hybrids; its vision tower is scaffolded, not yet forwarding.
+      // The non-hybrid multimodal registrations.
+      //
+      // `Dots3NoteForCausalLM` USED TO BE IN THIS LIST and moved out at W5
+      // (#699). Upstream does register it in `_MULTIMODAL_MODELS` with image,
+      // video AND audio towers (multimodal.py:82-87, inside
+      // `get_placeholder_str` at :80-88), which is why W1 put it
+      // here — but this port has none of the three (W6/W7 for the towers, W8
+      // for the front end), and the flag only became misleading once W5/W5c
+      // made the released config loadable. It now sits in the text-only branch
+      // below, and W8 moves it back.
       CHECK_FALSE(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
     } else {

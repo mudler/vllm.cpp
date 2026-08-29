@@ -1471,6 +1471,19 @@ saving is **325.58 GiB**, and 101.14 GiB against ~119.63 GiB leaves 18.49 GiB.
 The "before" column is the same loop with the two types forced to expand on the
 GEMM roles, which is exactly the tree at `94de63ff5`.
 
+**This is a RESIDENCY result and not a speed one, and on `dgx:gpu0` it is not
+even a GPU one.** `RouteGgufTensor` is the production decision and the table
+above is what it decides, so the artifact genuinely fits. What fits does not
+follow the same path afterwards: the CUDA arm has NO keep-quant kernel for
+either new type, so on that box the expert GEMM these 85 tensors feed takes the
+CPU fallback behind a full `cudaStreamSynchronize`, and the fused
+`vt::MergedGemmGroup` seam throws outright. That gap is
+[#2260](https://github.com/mudler/vllm.cpp/issues/2260), recorded as **O19**
+under `## Owed` with the mechanism, the reachability argument and the three
+options. Nothing on this row reaches the fused seam today, so this row breaks
+nothing; W5b and W5c make it live. Read every number in this section as "the
+model is resident", never as "the model runs at this speed on GB10".
+
 **IQ4_XS has a SECOND consumer, and the expert-tower lane is all-or-nothing.**
 `GgufExpertTowersReachSlotLane` (`gguf_device_fit.cpp`) loops the matching
 towers and returns false on the FIRST one that does not reach a keep residency,
@@ -1955,7 +1968,10 @@ Debts this row carries, each visible rather than waived:
   as DISCHARGED by [#2269](https://github.com/mudler/vllm.cpp/pull/2269). What
   is left is the rotary-width cross-check
   ([#2268](https://github.com/mudler/vllm.cpp/issues/2268)), which is the
-  loader's stopping point today, then W5b and W5c.
+  loader's stopping point today, then W5b and W5c. **And the residency figure is
+  not a compute claim:** the CUDA arm has no keep-quant kernel for either type,
+  so on `dgx:gpu0` the 101.14 GiB fits with its expert GEMM on the CPU fallback
+  — O19 below.
 
   **O7 is stale beside it and is not corrected here.** "No artifact of this
   model exists" was true when it was written; the UD-Q2_K_XL arm is now staged,
@@ -1963,6 +1979,49 @@ Debts this row carries, each visible rather than waived:
   O7 is actually about — our converter has never been run — so the correction
   belongs to W7b, which owns that sentence, rather than to a dequant change that
   merely walked past it.
+
+- **O19 — the 101.14 GiB is a RESIDENCY result. On `dgx:gpu0` the expert GEMM
+  for both new types runs on the CPU, and the fused seam THROWS.**
+  [#2260](https://github.com/mudler/vllm.cpp/issues/2260).
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) landed the two CPU
+  keep-quant `vec_dot` kernels, which is what flips the artifact's 82 IQ2_XS and
+  3 IQ4_XS tensors from `kExpandBf16` to `kKeepQuant` and makes it fit. The CUDA
+  arm has no kernel for either:
+  `src/vt/cuda/cuda_quant_dot.cu::IsCudaKeepQuantSupported` admits ten
+  Q8_K-family encodings — IQ2_XXS, IQ3_XXS, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S,
+  IQ1_S, IQ1_XXXS — and neither IQ2_XS nor IQ4_XS is among them, while
+  `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp::DeviceKeepQuantSupported`
+  returns `true` for CUDA on its `default:` arm regardless, on the recorded
+  ground that "CUDA falls back to the CPU kernel for anything it lacks". So the
+  residency measurement holds on a CUDA device and the SPEED does not:
+
+  - `src/vt/cuda/cuda_quant_dot.cu::MatmulBTQuantGroupedKernelCuda` takes the
+    CPU-fallback arm behind a full `cudaStreamSynchronize` ("keepquant-grouped
+    CPU-fallback drain") on every grouped expert GEMM. Correct, and it
+    round-trips the routed-expert weight bytes to the host cores per step.
+  - `src/vt/cuda/cuda_quant_dot.cu::MoeGateUpSwiGLUGroupedCuda` THROWS
+    `gate/up must be the SAME CUDA keep-quant dtype`, because
+    `IsCudaKeepQuantSupported` fails for both operands and `MergedGemm` selects
+    the fused op on device registration alone, with no dtype predicate.
+
+  **Not reached today, which is why this is a disclosure and not a defect in
+  [#2256](https://github.com/mudler/vllm.cpp/pull/2256).** `glm5_next_moe.cpp`
+  is W5's host reference and does not use the fused seam; `laguna.cpp` is the
+  only model reaching `MoeGateUpSwiGLUGrouped`. It becomes live the moment this
+  row obeys AGENTS.md `## Shared seams`, which routes mergeable MLP projections
+  through `layers::MlpGateUpMethodBase` and `vt::MergedGemmGroup` — that is
+  exactly what W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) and
+  W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) are for, and at
+  that moment a 101 GiB-resident model throws at first forward.
+
+  #2260 carries the analysis and three options — port the two CUDA kernels (the
+  only one that yields a speed number worth quoting), keep EXPANDING these two
+  on CUDA (honest, but then the artifact does not fit at 426.72 GiB), or refuse
+  by name at load rather than throwing with the model resident. This row owns
+  the consequence; #2260 owns the fix. Until one lands, **no speed or e2e number
+  on this artifact may be quoted as a GPU result**, and the `QUANT-GGUF-IQ2_XS`
+  and `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) say so in place.
 
 ## Now
 

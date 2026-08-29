@@ -183,63 +183,82 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // Until #2031's W5b survey this message still owed the n-gram embedding to
   // W2, the gated residual to W3 and Qwen Sparse Attention to W4 — all three
   // landed waves. A refusal that names finished work sends the next reader to
-  // rebuild it. The two below are measured against this tree, each one
-  // independently sufficient to stop a token, and each is carried under
-  // `## Owed` in the row spec.
+  // rebuild it. The one below is measured against this tree, it is by itself
+  // sufficient to stop a token, and it is carried under `## Owed` in the row
+  // spec.
   //
   // IT WENT STALE AGAIN WITHIN TWO WAVES, WHICH IS WHY IT IS EDITED HERE AND
-  // NOT LEFT FOR THE LOOP WAVE. That staleness is #2288, filed for
-  // traceability and fixed in the same flow by #2265. The survey listed FIVE.
-  // The grouped RMS norm is `vt::RmsNormGroup`, landed by W5d-1 (#2249 item 1)
-  // — the very change that file was merged alongside, so leaving the clause
-  // would have shipped a commit whose product output denies what the commit
-  // adds. The mRoPE builder is `BuildMropeCosSinHost`, which W5d-2 (#2249 item
-  // 5, `3ed2378a3`) gave external linkage behind
+  // NOT LEFT FOR THE LOOP WAVE. That staleness is #2288, filed for traceability
+  // and fixed in the same flow by #2265. The survey listed FIVE, and FOUR of
+  // the five are on `main` once this wave lands. The grouped RMS norm is
+  // `vt::RmsNormGroup`, landed by W5d-1 (#2249 item 1) — the change that file
+  // was merged alongside, so leaving the clause would have shipped a commit
+  // whose product output denies what the commit adds. The mRoPE builder is
+  // `BuildMropeCosSinHost`, which W5d-2 (#2249 item 5, `3ed2378a3`) gave
+  // external linkage behind
   // `include/vllm/model_executor/models/qwen3_5_mrope.h`; that wave corrected
   // the row spec's prose and did NOT correct this string, so the refusal had
-  // been naming a finished seam since it merged. Both clauses are removed
-  // rather than reworded, because a refusal enumerates what is missing and a
-  // present item is not missing.
+  // been naming a finished seam since it merged. Each clause is removed rather
+  // than reworded, because a refusal enumerates what is missing and a present
+  // item is not missing.
   //
-  // AND IT HAPPENED AGAIN, WHICH IS WHY THE COUNT MOVED A SECOND TIME. W5d-3
-  // (#2249 item 2) gave the QSA layers' PAGED K/V a consumer, so the item that
-  // used to sit at (2) — "RunQwen4ExpQsaBlock takes contiguous caches while
-  // make_kv_cache publishes paged ones" — became false in the same commit that
-  // wrote this line. What survives of that axis is the INDEXER side cache,
-  // which was already its own item, so the two merged.
+  // AND IT WENT STALE A FOURTH TIME, IN THE SAME WAY, WHILE W5d-4's BRANCH SAT
+  // BEHIND `main`. #2288's own residual — recorded under `## Owed` in the row
+  // spec — predicted that nothing mechanical prevents the fourth instance, and
+  // the fourth was that one. W5d-4 (#2249 item 4) IS the adapter from the
+  // stacked [E, I, H] qwen4_exp MoE tensors onto `MoeBlockWeights`
+  // (`qwen4_exp_moe.{h,cpp}`), which was an enumerated item here until
+  // `3f9177f7f` landed it. The adapter is a SEAM and not a call: it landed
+  // unreached, the row spec says so under `## Owed`, and the refusal below
+  // still refuses because the loop that would call it does not exist.
   //
-  // NEITHER OF THOSE TWO EDITS IS THE ANSWER ON ITS OWN, AND THAT IS THE WHOLE
-  // REASON THIS PARAGRAPH EXISTS. They were authored against DIFFERENT
-  // baselines and git merges them without a conflict in the prose around them.
-  // #2265 removed items (1) and (5) and renumbered five -> THREE, but it still
-  // listed the paged QSA consumer, which W5d-3 closes. W5d-3 folded (2) into
-  // (3) and renumbered five -> FOUR, but it still listed the grouped RMS norm
-  // and the mRoPE builder, which #2265 closes. Taking either side whole leaves
-  // the message naming work that is finished — #2288 again, in its third
-  // instance on this row in one day. THREE of the original five are now on
-  // `main` and TWO remain, so the count is TWO and neither "three" nor "four"
-  // is reachable by keeping one side. The items are the SET DIFFERENCE of the
-  // survey against both waves, not the shorter of the two lists.
+  // AND A FIFTH TIME, WHICH IS THIS WAVE, AND IT IS THE SAME MECHANISM ONE
+  // MORE TIME. W5d-3 (#2249 item 2) gives the QSA layers' PAGED K/V a consumer
+  // (`RunQwen4ExpQsaBlockPaged`), so the clause `main` still carries — that
+  // "RunQwen4ExpQsaBlock takes contiguous [max_kv, ...] caches while
+  // make_kv_cache publishes paged ones" — becomes false in the very commit
+  // that merges it. ONE enumerated item remains.
+  //
+  // NEITHER SIDE OF THIS MERGE IS THE ANSWER ON ITS OWN, AND THAT IS THE WHOLE
+  // REASON THIS PARAGRAPH EXISTS. The two sides were authored against
+  // DIFFERENT baselines, and git merges the prose around them without a
+  // conflict wherever the paragraphs do not overlap. `main` had removed the
+  // MoE adapter clause and still listed the paged QSA consumer, which this
+  // wave closes; this branch had removed the paged QSA consumer clause and
+  // still listed the MoE adapter, which W5d-4 closed. Each side is therefore
+  // exactly one item too long, both sides say TWO, and TAKING EITHER SIDE
+  // WHOLE PUTS A REFUSAL THAT NAMES FINISHED WORK ON `main` — #2288 again, in
+  // its fifth instance on this row. The enumeration is the SET DIFFERENCE of
+  // the five-item survey against every landed wave, not the shorter of two
+  // lists, so the count is ONE and neither side's TWO is reachable by keeping
+  // one side. This branch has now hit that trap TWICE, against two different
+  // baselines: first against #2265, which had removed items (1) and (5) while
+  // still listing the paged QSA consumer this wave closes, and now against
+  // W5d-4. The paragraphs that recorded the first collision are removed rather
+  // than kept, because they closed on "the count is TWO" and that sentence is
+  // what this merge falsifies.
   //
   // WHAT PINS THIS STRING, checked rather than assumed. The `SUBCASE("the
   // forward")` of `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` drives
   // this hook with a foreign handle and asserts FIVE substrings:
   // "Qwen4ExpForConditionalGeneration", "forward is not ported", "W2", "W4",
-  // "#1978", and the ABSENCE of "was not produced by". All five survive this
-  // edit and the absence still holds. That is exactly why it could not have
-  // caught the double-count above: it pins that those substrings are PRESENT,
-  // never that the enumeration is TRUE, so a message naming finished work
-  // passes it unchanged. Keeping this list honest is a reading, not a checker,
-  // and the residual is carried under `## Owed` in the row spec.
+  // "#1978", and the ABSENCE of "was not produced by". All five survive every
+  // one of these edits and the absence still holds, so the suite is unchanged.
+  // The clauses removed across them are prose no assertion reads — which is
+  // the point, and it is now demonstrated five times rather than argued: the
+  // gate holds the refusal REACHABLE and names the owing waves, it cannot hold
+  // the enumeration TRUE, so keeping this list honest is a reading and not a
+  // checker. Verify it by READING THE EMITTED BYTES, not by grepping this
+  // file: a substring assertion passes on a message that is wrong.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
            "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..6, "
-           "W5c-1, W5d-1, W5d-2, W5d-3); what the layer loop still lacks is "
-           "(1) reach for the indexer side cache — W5d-3 gave the QSA layers' "
-           "PAGED K/V a consumer (RunQwen4ExpQsaBlockPaged), but KV group 2 is "
-           "still contiguous and GPUModelRunner::gather_block_table never "
-           "gathers its block table (W5c-2); and (2) an adapter from the "
-           "stacked [E, I, H] qwen4_exp MoE tensors onto MoeBlockWeights. "
+           "W5c-1, W5d-1, W5d-2, W5d-3, W5d-4); what the layer loop still "
+           "lacks is reach for the indexer side cache — W5d-3 gave the QSA "
+           "layers' PAGED K/V a consumer (RunQwen4ExpQsaBlockPaged), but KV "
+           "group 2 is still contiguous and "
+           "GPUModelRunner::gather_block_table never gathers its block table "
+           "(W5c-2). "
            "ModelRegistry::Forward additionally refuses any multi-cache "
            "topology by name, and this model publishes one. See "
            ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");

@@ -7419,7 +7419,13 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
                         [&](Dev p, const Tensor& h) {
                           return MoeBlock(p, layer.moe, cfg, h, T);
-                        });
+                        },
+                        // fp4-resident experts are built on the device at LOAD,
+                        // so placing them would upload every expert and then
+                        // compute across the bus. Refuse instead.
+                        /*placeable=*/layer.moe.expert_gate_fp4.empty(),
+                        "the routed experts are fp4-resident and their device "
+                        "residents are built at load");
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7682,7 +7688,13 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
                         [&](Dev p, const Tensor& h) {
                           return MoeBlock(p, layer.moe, cfg, h, T);
-                        });
+                        },
+                        // fp4-resident experts are built on the device at LOAD,
+                        // so placing them would upload every expert and then
+                        // compute across the bus. Refuse instead.
+                        /*placeable=*/layer.moe.expert_gate_fp4.empty(),
+                        "the routed experts are fp4-resident and their device "
+                        "residents are built at load");
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -8088,62 +8100,6 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
-MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
-                                 vt::DeviceType placement_device,
-                                 const MoeBlockWeights& weights,
-                                 const HfConfig& config, const vt::Tensor& dh,
-                                 int64_t T) {
-  Dev engine{vt::GetBackend(engine_queue.device.type), engine_queue};
-
-  // The fp4-resident arm is REFUSED rather than served slowly. Its device Marlin
-  // residents are built eagerly at load by `PrepareMarlinResident`, so placing it
-  // would upload every expert and then compute on the host across the bus —
-  // strictly worse than not placing, and invisible to a token gate because the
-  // tokens would still be right. Refuse by name, as an unimplemented arm must.
-  if (!weights.expert_gate_fp4.empty()) {
-    throw std::invalid_argument(
-        "device placement: this checkpoint's routed experts are fp4-resident, "
-        "and their device residents are built at load, so placing them would "
-        "upload every expert and then compute across the bus — slower than not "
-        "placing at all. Placement supports the bf16 and keep-quant expert arms "
-        "(what a GGUF load brings); use one of those or drop the placement");
-  }
-
-  const int64_t H = config.hidden_size;
-  const size_t bytes =
-      static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
-
-  // DOWN: the hidden state to the host. `Download` synchronises, which it must:
-  // the placed backend is about to read these bytes and knows nothing about the
-  // engine's stream.
-  std::vector<uint8_t> staging(bytes);
-  {
-    Tensor src = dh;
-    engine.b.Copy(engine.q, staging.data(), src.data, bytes);
-    engine.b.Synchronize(engine.q);
-  }
-
-  // ACROSS: run the block on the placement device. `RunMoeBlock` derives its
-  // backend from the queue it is handed, and `ResidentWeight` aliases the host
-  // weight bytes for a CPU `Dev`, so nothing is uploaded anywhere by this call.
-  vt::Queue& placed_queue = PlacementQueue(placement_device);
-  Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
-  DBuf placed_in(placed, DType::kBF16, {T, H}, staging.data());
-  MoeBlockOutput placed_out =
-      RunMoeBlock(placed_queue, weights, config, placed_in.t(), T);
-
-  // BACK UP: the combined output to the engine's device, into a buffer from the
-  // ENGINE's pool so the composing forward owns it exactly as it owns an
-  // unplaced block's output.
-  placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
-  placed.b.Synchronize(placed.q);
-  DBuf back(engine, DType::kBF16, {T, H}, staging.data());
-
-  MoeBlockOutput r;
-  r.tensor = back.t();
-  r.storage = back.ReleaseShared();
-  return r;
-}
 
 // Exposed wrapper over the anon-ns `GdnBlockPaged` (row MODEL-MM-QWEN4-EXP W5b,
 // issue #2110) so a hybrid architecture in another TU — Qwen4-Exp, whose

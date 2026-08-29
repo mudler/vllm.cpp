@@ -1094,6 +1094,23 @@ target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_dsa PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
+# GLM-5.3-Flash W5 -- the 288 routed + 1 shared expert MoE, its grouped
+# `noaux_tc` router and the clamped-SwiGLU epilogue (#2223). The router is gated
+# at the PUBLISHED 288/top-8 and the composed block at 8 experts, because the
+# selection is where the expert count matters and the stacked expert tower is
+# not. It asserts SET equality of the selected experts and prints the separation
+# margin: top-k error is BIMODAL, so a tolerance on the weights passes a wrong
+# selection whose values happen to be close. Goldens are the RUN output of
+# transformers v5.16.1, captured by `fixtures/gen_glm5_next_moe_goldens.py`.
+# `glm5_next_moe.h` is MODEL-PRIVATE under src/, the same arrangement
+# `glm5_next_dsa.h` uses.
+vllm_cpp_add_test(test_glm5_next_moe vllm/models/test_glm5_next_moe.cpp)
+target_compile_definitions(test_glm5_next_moe PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_moe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the
@@ -3344,6 +3361,19 @@ target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/
 # `QWEN4_EXP_CKPT_FIXTURE_DIR` grant here would compile a path nothing reads.
 vllm_cpp_add_test(test_qwen4_exp_forward vllm/models/test_qwen4_exp_forward.cpp)
 target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5d-4 (#2249 item 4) — the MoE weight adapter, gated against
+# a from-scratch double-precision reimplementation of the lane-pinned oracle's
+# own `Qwen4ExpTextSparseMoeBlock.forward` that reads the SOURCE stacked towers,
+# not the `MoeBlockWeights` the adapter produced. Carries the RED this wave was
+# written against — the rank-3 towers dropped into the seam's rank-2 `_kq` fields
+# — so #2249's "the shapes match" cannot be re-derived. CPU only: a weight
+# adapter has no CUDA arm to compare, and the one GPU-only fact it turns on (the
+# (bf16,f32) combo `MatmulBTKernelCuda` refuses) is asserted on the DTYPE
+# instead. Reaches the model-private qwen4_exp_moe.h / qwen4_exp_weights.h, hence
+# the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_moe vllm/models/test_qwen4_exp_moe.cpp)
+target_include_directories(test_qwen4_exp_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit

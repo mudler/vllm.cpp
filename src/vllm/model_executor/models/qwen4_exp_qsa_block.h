@@ -57,10 +57,26 @@
 // `## Owed` records that with the row and the issue that own the wiring:
 // `Qwen4ExpTextModel::Forward` does not exist yet, so `ModelRegistry::Forward`
 // still refuses `Qwen4ExpForConditionalGeneration` by name. Also not here: the
-// PAGED cache (this block takes contiguous per-sequence K/V, which is the shape
-// the two `vt::` ops already accept and all the KV-cache group can express
-// today), the cos/sin table build (taken as an operand, so the interleaved-mRoPE
-// section layout stays owed by the wave that builds it), and the CUDA arm.
+// cos/sin table build (taken as an operand, so the interleaved-mRoPE section
+// layout stays owed by the wave that builds it), and the CUDA arm.
+//
+// ─── W5d-3 (#2249 item 2): THE PAGED K/V ARM ─────────────────────────────────
+// W5b-5 shipped ONE cache shape, contiguous, and said so. The engine allocates
+// another: `MakeQwen4ExpKVCache` publishes the QSA layers' K/V as a PAGED
+// `FullAttentionSpec` group, so nothing could serve from the cache a runner
+// actually hands a forward. `RunQwen4ExpQsaBlockPaged` below is that consumer.
+//
+// ONE BODY, TWO CACHE ARMS. The two entry points share `QsaBlockCore`; what
+// forks is where the new K/V rows are STORED (contiguous rows in place, or
+// `dense_attn::WriteKvCache` at a slot mapping) and how a key row is ADDRESSED
+// by the consumer (flat, or through a page table). Everything between —
+// projections, the per-head norms, the RoPE, the indexer, the output gate,
+// `o_proj` — is one copy.
+//
+// STILL CONTIGUOUS, AND STILL OWED: the INDEXER side cache. That is KV group 2,
+// an `MLAAttentionSpec` the runner does not gather yet (#2249 item 3, owed as
+// W5c-2), and its paged store is a separate `## Owed` entry. This wave closes
+// item 2 and does not pretend to close item 3.
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_QSA_BLOCK_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_QSA_BLOCK_H_
 
@@ -68,6 +84,7 @@
 #include <memory>
 
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev
+#include "vllm/model_executor/models/qwen3_5.h"             // PagedKvCache
 #include "vllm/model_executor/models/qwen4_exp.h"          // Qwen4ExpParams
 #include "vllm/model_executor/models/qwen4_exp_weights.h"  // Qwen4ExpQsaWeights
 #include "vt/tensor.h"
@@ -91,6 +108,40 @@ struct Qwen4ExpQsaCaches {
   vt::Tensor key;        // [max_kv, num_kv_heads, head_dim]     READ-WRITE
   vt::Tensor value;      // [max_kv, num_kv_heads, head_dim]     READ-WRITE
   vt::Tensor index_key;  // [max_kv, indexer_head_dim]           READ-WRITE
+};
+
+// The per-layer caches one QSA layer reads and writes when the K/V lives where
+// the ENGINE puts it: a paged `FullAttentionSpec` group.
+// (Row MODEL-MM-QWEN4-EXP W5d-3, [#2249](https://github.com/mudler/vllm.cpp/issues/2249)
+// item 2.)
+//
+// `kv` is the runner's own per-layer handle, unchanged and un-narrowed. Taking
+// `PagedKvCache` rather than a QSA-private copy of its five numbers is the point:
+// `dense_attn::KvSlice` builds the two rank-4 unbind views from it, and
+// `dense_attn::WriteKvCache` / `dense_attn::IsFp8KvCache` read the `fp8_kind` and
+// the scales out of the SAME struct, so the store and the read cannot disagree
+// about how wide a KV element is. An fp8 cache is REFUSED BY NAME here rather
+// than read as floats: `vt::Qwen4ExpQsaGatherAttention` has no dequantising read,
+// and a silently-wrong one is wrong tokens instead of a crash.
+//
+// `slot_mapping` is i64 [T], the runner's own per-token destination slot
+// (`block * block_size + offset`), and it is what makes the store paged. The
+// contiguous arm's "project straight into the cache rows" trick has no paged
+// equivalent, because a step's tokens can cross a page boundary.
+//
+// `block_table` is i32 [1, max_pages]: ONE sequence per call, as the contiguous
+// arm takes one. A ragged multi-request batch needs `query_start_loc` plumbing
+// this block does not carry; the spec's `## Owed` records it.
+//
+// `index_key` is the QSA INDEXER side cache and it is STILL CONTIGUOUS
+// `[max_kv, indexer_head_dim]`. That is KV group 2, which the runner does not
+// gather yet (#2249 item 3, owed as W5c-2); its paged store is its own `## Owed`
+// entry and is deliberately not smuggled in here.
+struct Qwen4ExpQsaPagedCaches {
+  PagedKvCache kv;           // the runner's paged K+V for THIS layer  READ-WRITE
+  vt::Tensor block_table;    // i32 [1, max_pages]  logical page -> physical page
+  vt::Tensor slot_mapping;   // i64 [T]             this step's destination slots
+  vt::Tensor index_key;      // [max_kv, indexer_head_dim]  CONTIGUOUS, READ-WRITE
 };
 
 // Owning device-resident output of one QSA block: a [T, hidden_size] view plus
@@ -123,7 +174,11 @@ struct Qwen4ExpQsaSelection {
 //
 //   q_index    [T, index_n_heads, index_head_dim]  the indexer query, ALREADY
 //              q-layernormed and roped by the caller (the block below does it)
-//   caches.index_key rows [0, kv_len)  the raw indexer keys, UN-normed/UN-roped
+//   index_key  rows [0, kv_len) of the [max_kv, indexer_head_dim] side cache:
+//              the raw indexer keys, UN-normed and UN-roped. THE TENSOR, not the
+//              cache struct: this function reads nothing else from it, and W5d-3
+//              gave the K/V two shapes while the side cache kept one, so taking
+//              the struct would mean handing it one with two dead fields
 //   k_norm_w   [index_head_dim]  the RAW HuggingFace gamma; the compressor
 //              applies `(1.0 + w)` itself, mirroring `Qwen4ExpTextRMSNorm`
 //   cos/sin    [>= kv_len, rotary_dim] f32 FULL-position tables; the compressor
@@ -137,7 +192,7 @@ struct Qwen4ExpQsaSelection {
 // a real KV-cache group turns it into the side cache's paged store.
 Qwen4ExpQsaSelection Qwen4ExpQsaIndex(dense_attn::Dev d, const Qwen4ExpQsaParams& qsa,
                                       float rms_norm_eps, const vt::Tensor& q_index,
-                                      const Qwen4ExpQsaCaches& caches, const vt::Tensor& k_norm_w,
+                                      const vt::Tensor& index_key, const vt::Tensor& k_norm_w,
                                       const vt::Tensor& cos, const vt::Tensor& sin,
                                       const vt::Tensor& kv_lens, int64_t kv_len,
                                       bool round_intermediates_to_bf16,
@@ -172,6 +227,27 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(dense_attn::Dev d, const Qwen4ExpQsaW
                                            const vt::Tensor& cos, const vt::Tensor& sin,
                                            const Qwen4ExpQsaCaches& caches, int64_t past_len,
                                            int64_t* keys_visited = nullptr);
+
+// The SAME block over the PAGED K/V the engine allocates (W5d-3, #2249 item 2).
+//
+// Every operand it shares with `RunQwen4ExpQsaBlock` means exactly what it means
+// there, and the two run one body. `past_len` still counts the LOGICAL tokens the
+// sequence already holds — the page table is what turns a logical position into a
+// physical row, so nothing about the causal arithmetic moves when the pages are
+// permuted, which is the property this arm's gate asserts.
+//
+// The caller owns `caches.slot_mapping` and must have sized it to this step's T;
+// the block does not build it, exactly as `dense_attn::AttnBlock` does not
+// (`StepInputs` carries the runner's own).
+Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlockPaged(dense_attn::Dev d, const Qwen4ExpQsaWeights& w,
+                                                const Qwen4ExpParams& params,
+                                                const vt::Tensor& hidden,
+                                                const vt::Tensor& positions,
+                                                const vt::Tensor& cos_sin, const vt::Tensor& cos,
+                                                const vt::Tensor& sin,
+                                                const Qwen4ExpQsaPagedCaches& caches,
+                                                int64_t past_len,
+                                                int64_t* keys_visited = nullptr);
 
 }  // namespace vllm
 

@@ -1932,6 +1932,58 @@ upstream and restoring the recorded measurement are the same edit. AGENTS.md
 "Inherit vLLM defaults" decides it either way: f32 is the default and the wider
 value would have been the annotated exception, unannotated.
 
+## Mutation record — W5d-3 (#2249 item 2)
+
+The wave that gave the QSA consumer a PAGED read path. Measured on an
+`origin/main` base of `fa9903b860`, CPU only, Release, `-j 2`. The build return
+code was read BEFORE any test result on every row, because a failed build reads
+as a passing test.
+
+**The instrument.** The paged cases fill the WHOLE flash cache with bf16 NaN
+before the block runs, so every row a correct read never addresses — an unnamed
+physical page, or the unused tail of the last named one — is not a number. That
+is the same discriminator the W5b-4 gather-vs-mask case uses, doing a second job:
+there `0.0f * NaN` convicts a MASK, here it convicts a wrong ADDRESS. The block
+table is `{5, 3, 7}` against a logical `{0, 1, 2}`, sharing no fixed point, so the
+three pages an identity-reading body touches are exactly three that are never
+written. **An identity block table would make the whole case prove nothing**, and
+that is why the permutation is stated here rather than left to the fixture.
+
+**And one finding about the harness itself, measured rather than feared.**
+`MaxRelDiff` folds with `std::max`, and `std::max(x, NaN)` returns `x`. So the
+first RED capture below came back ALL NaN and the relative bound still printed
+`0` and PASSED. A tolerance cannot see a NaN. The two paged cases therefore assert
+FINITENESS FIRST and the oracle bound second, and the test says why.
+
+| # | Mutation | Site | Build rc | Result |
+|---|---|---|---|---|
+| RED | the pre-W5d-3 body: `RowBase` always returns the CONTIGUOUS address `(p * HKV + kvh) * DH`, i.e. the paged arm reads slots linearly | `cpu_qwen4_exp_qsa.cpp` | 0 | **RED, 2 of 11 cases, 1537 assertions.** `CHECK(std::isfinite(v))` x1472 (every output NaN), `CHECK(differing == 0)` at `paged vs contiguous differing bf16 words 1472 of 1472`, and 64 more on the decode case. This is the capture of the gap #2249 item 2 names |
+| M1 | OFF-BY-ONE in the page-table read: `pages[(p + 1) / page_size]` | `cpu_qwen4_exp_qsa.cpp` | 0 | **RED, 2 of 11 cases, 195 assertions.** `rel 0.309431 < 0.03` against the oracle, `differing 703 of 1472`, decode `rel 0.667465`. Note it is NOT all-NaN: an off-by-one lands on a WRITTEN page most of the time, which is precisely why the value comparison and the bit-exact one both have to be there |
+| M2 | the partial final page read at FULL page length: the ragged tail runs to `ceil(kv_len / page) * page` instead of `kv_len` | `cpu_qwen4_exp_qsa.cpp` | 0 | **RED, 2 of 11 cases, 515 assertions.** 448 NaN outputs (row 7 of the last page is the one row the 23-token sequence never writes), `rel 1.24777`, `differing 1339 of 1472`, and the `keys_visited` equality with the contiguous arm |
+| M4 | the PAGED STORE deleted (`dense_attn::WriteKvCache` never called) | `qwen4_exp_qsa_block.cpp` | 0 | **RED, 2 of 11 cases, 1537 assertions**, all NaN. The store site is gated, not merely present |
+
+Every mutation was sha256-proved applied, and the tree was restored byte-for-byte
+after each (`cpu_qwen4_exp_qsa.cpp` back to
+`d95eea49e1800a25fb0b920a43c92936973c5e51e576651fa74400064a2497cc`,
+`qwen4_exp_qsa_block.cpp` to
+`feb0eccd41d39a1588a9ffd32db9bfec50ac01dc40e44e494ad426d7ca3c43b7`).
+
+**M3, the reachability mutation, HAS NO SITE, and that is the finding rather than
+an omission.** `.agents/reachability.md` asks for the production call site to be
+deleted in a scratch copy. `grep -rn 'RunQwen4ExpQsaBlock\|Qwen4ExpQsaPagedCaches'
+src include examples` returns only the block's own header and translation unit:
+there is no production caller to delete, because
+`ForwardQwen4ExpForConditionalGeneration` still refuses by name and the layer loop
+is unwritten. So what these mutations measure is a CAPABILITY of the block, not
+that anything reaches it. `## Owed` records the wave as UNREACHED with the owning
+row and the issues.
+
+**What the battery did NOT reach.** The device (CUDA) arm of the address mode does
+not exist, so nothing here says a GPU resolves a page the same way. Nothing decodes
+a real checkpoint through the paged arm. And no mutation here can see a wrong
+INDEXER side-cache address, because that cache is still contiguous — #2249 item 3,
+owed as W5c-2.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -2218,12 +2270,24 @@ is listed under `## Owed`.
     fold is what makes the file's value the multiplier our own `out * weight`
     grouped norm wants", corroborated elementwise on three published artifacts —
     immediately above the line that strips it with `unshift=true`.
-  - **The PAGED cache.** This block takes CONTIGUOUS per-sequence K/V and a
+  - ~~**The PAGED cache.** This block takes CONTIGUOUS per-sequence K/V and a
     contiguous indexer side cache, which is the shape both `vt::` ops already
     accept — the gather addresses its cache as `(p * HKV + kvh) * DH + d` and
     never reads `stride[0]`. The block-table store belongs to the wave that gives
     QSA a real KV-cache group, which waits on
-    [#2131](https://github.com/mudler/vllm.cpp/issues/2131) and on W5c.
+    [#2131](https://github.com/mudler/vllm.cpp/issues/2131) and on W5c.~~
+    **HALF DISCHARGED by W5d-3 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249)
+    item 2)**, and the half is named so nobody reads this as done. The QSA
+    layers' K/V — KV group 0, the `FullAttentionSpec` — now has a paged consumer:
+    `Qwen4ExpQsaPagedCaches` + `RunQwen4ExpQsaBlockPaged`, over a
+    `kv_block_table`/`kv_block_size` ADDRESS MODE inside the same
+    `vt::Qwen4ExpQsaGatherAttention` rather than a second op. The INDEXER side
+    cache is still contiguous: that is KV group 2, the `MLAAttentionSpec`, and its
+    paged store is the separate entry above and #2249 item 3 (owed as W5c-2). What
+    W5d-3 did NOT need from #2131 is worth recording, because this bullet asserted
+    the dependency for three waves: the K/V paged read needs only a block table and
+    a slot mapping, both of which the runner already builds for every full-attention
+    model, and none of the multi-state recurrent work #2131 owns.
   - **The RAGGED-BATCH form.** `kv_lens[t] = past_len + t + 1` is built inside the
     block from a CONTIGUOUS visible prefix. Upstream's general form reads an
     arbitrary visibility set out of a padded batch's mask, and the ops' own
@@ -2292,6 +2356,41 @@ is listed under `## Owed`.
     M20 is what says that call is the one under test: handing the consumer every
     VISIBLE block — a dense walk wearing a gather's clothes — reds 3 of 8 cases
     and 130 assertions.
+
+- **W5d-3 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 2) lands
+  UNREACHED, by AGENTS.md "Nothing lands dead".** The paged QSA consumer —
+  `Qwen4ExpQsaPagedCaches` and `RunQwen4ExpQsaBlockPaged`
+  (`src/vllm/model_executor/models/qwen4_exp_qsa_block.{h,cpp}`) together with the
+  `kv_block_table`/`kv_block_size` address mode on
+  `vt::Qwen4ExpQsaGatherAttention` — is reached at this merge commit only by
+  `tests/vllm/models/test_qwen4_exp_qsa_block.cpp`. The reason is unchanged from
+  W5b-5 and is not a property of this wave: this architecture's only production
+  entry point is `ModelRegistry::Forward`, it is all-or-nothing, and
+  `ForwardQwen4ExpForConditionalGeneration`
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp`) still refuses by name
+  because the LAYER LOOP is not written. The wiring is owned by row
+  `MODEL-MM-QWEN4-EXP` under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031), tracked by campaign
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978). The reachability
+  mutation `.agents/reachability.md` prescribes has no site here for the same
+  reason it had none for W5b-5: there is no production call site to delete.
+  Also owed from this wave:
+  - **The INDEXER side cache is still contiguous.** #2249 item 3 — KV group 2 is
+    never gathered — is owed as W5c-2 and is deliberately not smuggled into this
+    wave. `Qwen4ExpQsaPagedCaches::index_key` is `[max_kv, indexer_head_dim]`, so
+    a forward built on this arm still needs a contiguous side cache per sequence.
+  - **ONE REQUEST PER CALL.** `kv_block_table` is `[1, max_pages]` and the block
+    refuses anything else by name. A ragged multi-request batch needs the
+    `query_start_loc` plumbing `vt::PagedAttention` carries and this block does
+    not, on top of the RAGGED-BATCH `kv_lens` item already owed above.
+  - **An fp8 paged KV cache is REFUSED BY NAME.** `vt::Qwen4ExpQsaGatherAttention`
+    has no dequantising read and no `k_scale`/`v_scale`, so an fp8 page would be
+    read as floats — wrong tokens, not a crash, which is the exact failure
+    `kv_cache_route.h` exists to prevent. The refusal is gated.
+  - **The CUDA arm of the paged address mode**, inherited from the QSA ops' own
+    owed CUDA arm and not a new debt: the address resolution is four lines of
+    integer arithmetic in the same kernel body, so whatever answers the ops
+    answers this.
 
 - [#1978](https://github.com/mudler/vllm.cpp/issues/1978): this port, the campaign
   row. W0 landed the spec with no product code.

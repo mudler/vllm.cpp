@@ -97,7 +97,99 @@ the two kernels sharing a floor is more useful than a sixth refuted brick.
   W11's own "~22% of peak vs llama.cpp ~76%" inherits that supersession and is
   therefore ALSO not quotable as a target.
 
+## W1 — MEASURED: latency-bound, the same floor as the Q8_0 sibling. The row STOPS.
+
+Profiled on `dgx:gpu0` (GB10, sm_121a) on 2026-08-29 with Nsight Compute 2025.3.1,
+`--kernel-name regex:QuantDotGemmGrouped --launch-skip 200 --launch-count 8
+--set full`, against the real `UD-Q4_K_XL` @ `750f92f9`. Eight decode launches of
+`QuantDotGemmGroupedKernel<5, float>` (Q5_K). Evidence:
+[`docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv`](../../docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv).
+
+| metric | value | reading |
+|---|---:|---|
+| Achieved Occupancy | **101.5%** (theoretical 93.75) | fully occupied |
+| Compute (SM) Throughput | **26.1%** | not compute-bound |
+| Memory Throughput | **28.0%** | **NOT bandwidth-bound** |
+| L1/TEX Hit Rate | **95.1%** | over-fetch absorbed, never reaches DRAM |
+| L2 Hit Rate | 42.4% | |
+| **Eligible Warps Per Scheduler** | **0.42** | **the finding** |
+| Active Warps Per Scheduler | 10.87 | |
+| Issue Slots Busy | 14.5% | |
+| Warp Cycles Per Issued Instruction | 77.6 | |
+| Registers Per Thread | 43 | |
+| Duration / launch | 166.5 us | grid 4480, block 128 |
+
+### The reading: latency, not bandwidth
+
+**W11's "BW-tuning" label is WRONG for this kernel, as it was for its sibling.**
+Memory throughput is 28% — there is no bandwidth wall to tune against.
+
+The decisive counter is **0.42 eligible warps per scheduler**. Each scheduler
+holds 10.87 ACTIVE warps and yet fewer than one is READY TO ISSUE at any instant,
+so issue slots are busy only 14.5% of the time at 101% occupancy. That is the
+signature of memory-LATENCY exposure, and it is why compute and memory SOL are
+BOTH low at once: the warps are resident and waiting, not competing for a pipe.
+
+### It is the same floor as the Q8_0 kernel
+
+| | grouped Q4_K/Q5_K (this) | Q8_0 (`ds4-q8-ncu`) |
+|---|---:|---:|
+| occupancy | 101.5% | 72-75% |
+| L1 hit | 95.1% | 96.6% |
+| bound by | latency (0.42 eligible warps) | latency (long_scoreboard 54-57) |
+
+Two different kernels, two different occupancies, the same conclusion: the
+dependent load-to-unpack-to-dot chain is the cost, and neither is starved of
+bandwidth or of warps.
+
+### What this REFUTES before it was attempted
+
+The levers W11's label implied are refuted by these counters rather than by
+experiment, which is the point of measuring first:
+
+- **Vectorised loads / wider footprint** — the bandwidth lever. Memory SOL is 28%.
+  There is nothing to widen into.
+- **Occupancy tuning** — achieved occupancy is 101.5% of theoretical. There is no
+  occupancy to recover, and this kernel has MORE than the Q8_0 one, which was
+  itself not occupancy-starved.
+- **A dp4a pass** — compute SOL is 26.1%; the arithmetic is not the wall.
+
+And the axis that IS implicated, latency hiding, is the one the Q8_0 campaign
+already spent five structural bricks on — aligned repack, sub-warp occupancy,
+launch consolidation, the register-spill hypothesis, and multi-row/prefetch ILP —
+all flat or refuted, with a recorded MEASURED FLOOR. Those are this kernel's prior
+too, not a fresh menu.
+
+### The row stops here, as `## Gates` said it would
+
+The spec committed before the measurement: "A null result is a result. If the
+counters say the grouped kernel is bound the same way Q8_0 is, this row records
+that and stops, because the two kernels sharing a floor is more useful than a
+sixth refuted brick." That is the measured case, and it is applied.
+
+### What is NOT claimed
+
+Eight launches of ONE kernel specialisation (Q5_K, `<5, float>`) on one prompt at
+one context length. The Q4_K specialisation was not separately captured, and
+context length moves the grid. Nothing here is a speed claim, no default changed,
+and no llama.cpp denominator is quoted — W11's "~22% of peak vs llama.cpp ~76%"
+inherits the #1003 supersession and is not a target.
+
+**What would reopen this row:** a mechanism that shortens the unpack dependency
+chain itself, rather than feeding more warps or more bandwidth to the same chain.
+The one structural difference from the Q8_0 case is that this kernel's own spec
+defers tensor-core tiling (`cuda-keepquant-gemm.md`), which is such a mechanism —
+it changes what the inner loop does rather than how much is in flight around it.
+That remains a genuine candidate and is NOT refuted here; it is simply a different
+and much larger piece of work than "tuning", and it should be opened on its own
+terms rather than as a bandwidth pass.
+
 ## Now
 
-`READY`. Spec committed, no implementation. Next action is W1, which needs a GPU
-lease and the staged checkpoint, and produces counters rather than code.
+`DONE` for W1. The row's question — what bounds the grouped Q4_K/Q5_K GEMV — is
+answered: memory latency, at full occupancy, sharing the Q8_0 kernel's floor. The
+bandwidth, occupancy and dp4a levers are refuted at the counter. No product code
+was written and none should be, on this evidence.
+
+Tensor-core tiling stays open as a distinct and larger row, if the ~62% of decode
+this kernel occupies is judged worth that scale of work.

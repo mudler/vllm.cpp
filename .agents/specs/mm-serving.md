@@ -325,9 +325,16 @@ one driver and of nothing a user reaches.**
 is the runner hop.
 
 What IS reached, and stays reached: the CPU serving seam body
-(`MakeQwen3VLImageChatFn`, `chat_mm.cpp`) is wired in `examples/server/main.cpp`
-and gated by `test_chat_mm` and `test_openai_serving`. The single-sequence
-drivers produce token-correct output against the committed M2c golden.
+(`MakeQwen3VLImageChatFn`, `chat_mm.cpp`) is wired in the LIBRARY, at
+`src/vllm/entrypoints/openai/server_main.cpp:1545`, and gated by `test_chat_mm`
+and `test_openai_serving`. `examples/server/main.cpp` is a 23-line ABI shim that
+reaches that wiring through `vllm_server_main`, so the reachability conclusion
+holds, but the file itself carries no multimodal reference. Two earlier lines on
+this page still name the shim as the wiring site: the `MM-SERVE-E2E` row under
+`## Full wiring path` and the wiring bullet under `## Brick 3`. Both record the
+state before `ARCH-ONE-SURFACE` moved the construction into the library, and
+both stay as written. The single-sequence drivers produce token-correct output
+against the committed M2c golden.
 `Qwen3VLForConditionalGeneration` is registered, and its forward does consume
 `ModelForwardInput.mm` and does reuse the shared per-step contract, exactly as
 the section above records.

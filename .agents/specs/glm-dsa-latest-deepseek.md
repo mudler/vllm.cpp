@@ -1024,3 +1024,1048 @@ across every other row that uses it.
 - It did not change the row's state. `BLOCKED` is still correct, and §2.3 is the
   arithmetic that keeps it correct.
 - It did not touch `MODEL-MM-GLM53-FLASH` or its spec.
+
+---
+
+## 3. Port plan: `GlmMoeDsaForCausalLM` / `zai-org/GLM-5.3` under expert streaming (2026-08-29)
+
+**Issue:** [#2214](https://github.com/mudler/vllm.cpp/issues/2214).
+**Row:** `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm`, `BLOCKED` -> `SPIKE`.
+**Claim:** `CLAIM-MODEL-GLM-MOE-DSA`.
+**Scope of THIS section:** a committed port plan and nothing else. No product
+code, no pin advance, no GPU lease, no download. Every number below was
+recomputed here from primary sources — the published `config.json`, the
+published GGUF shard headers over HTTP range requests, and the local tree — and
+none of it was copied from #2214 or from §2 above. Where a recomputation
+DISAGREES with a figure already on record, the disagreement is stated.
+
+**What changes versus §2.** §2 concluded `BLOCKED` on resident capacity, and
+that conclusion was correct for the frame it used. This section changes the
+frame: for a model that is 97.4% routed experts, the question is not whether the
+weights fit but whether the **step working set** fits, and that is a different
+and much smaller number. The row therefore moves to `SPIKE` — scoped in a
+committed spec, not implemented — and stays there until W1 lands.
+
+### 3.1 The streaming arithmetic, recomputed
+
+**Method.** Fetch `https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json`
+(29,464 B, HTTP 200, read 2026-08-29). Sum the parameter count of every tensor
+group analytically from the config's own fields, then check the total against
+the checkpoint's own `model.safetensors.index.json`
+(`metadata.total_size = 755,617,140,416` over 118,629 tensors, fetched through
+the `resolve` endpoint because the `raw` endpoint serves the 11,359,251-byte
+LFS pointer) and against the HuggingFace API's `safetensors.total`. A model that
+does not reproduce the published total is a model of some other checkpoint.
+
+The config's own layer schedule is read, not assumed. `mlp_layer_types` is 78
+entries, 3 `dense` then 75 `sparse`, which agrees with
+`first_k_dense_replace = 3`. `indexer_types` is 78 entries, **21 `full` and 57
+`shared`**, in the pattern `full,full,full` then `(shared,shared,shared,full)`
+repeating. `num_nextn_predict_layers = 1` adds a 79th block.
+
+Per-group formulae, all from `config.json`:
+
+| Group | Formula | Params |
+|---|---|---|
+| one routed expert | `3 * hidden * moe_inter` = `3 * 6144 * 2048` | 37,748,736 |
+| routed experts, one MoE layer | `256 *` the above | 9,663,676,416 |
+| **routed experts, 75 MoE layers** | `75 *` the above | **724,775,731,200** |
+| **routed experts, the MTP block** | `1 *` the above | **9,663,676,416** |
+| MLA, one layer | `H*q_lora + q_lora*n_h*qk_head + H*(kv_lora+qk_rope) + kv_lora*n_h*(qk_nope+v_head) + n_h*v_head*H` | 165,019,648 |
+| MLA, 78 layers | | 12,871,532,544 |
+| indexer, one layer | `q_lora*idx_n_h*idx_head + H*idx_head + H*idx_n_h` | 9,371,648 |
+| indexer, 21 `full` layers | | 196,804,608 |
+| shared expert, 75 MoE layers | `75 * 1 *` one expert | 2,831,155,200 |
+| dense MLP, 3 layers | `3 * 3 * 6144 * 12288` | 679,477,248 |
+| router gates, 75 layers | `75 * 6144 * 256` | 117,964,800 |
+| embed + lm_head | `2 * 154880 * 6144` | 1,903,165,440 |
+| MTP block, non-expert | MLA + indexer + shared expert + gate + `eh_proj(2H x H)` | 289,210,368 |
+
+| | params | share |
+|---|---|---|
+| routed experts, **streamable** | **734,439,407,616** | **97.49%** |
+| everything else, **must be resident** | **18,889,310,208** | **2.51%** |
+| model total, this arithmetic | 753,328,717,824 | — |
+| API `safetensors.total`, measured | 753,329,940,480 | — |
+| **residual** | **-1,222,656** | **-0.00016%** |
+
+The residual is 1.2M parameters over 753.3B — the bias terms and the 79
+`k_norm.bias` / layernorm vectors this model does not enumerate. **This is a
+tighter reconciliation than #2214's, and the numbers differ, which is why it was
+redone.** #2214 models 724.8B streamable / 21.0B resident / 745.8B total and
+calls that "within 1%". The 7.5B gap is the MTP block, whose 256 experts are
+themselves streamable; folding it in moves the streamable share from 97.2% to
+**97.49%** and the resident total from 21.0B **down** to 18.89B. Both figures
+favour the argument, so the correction does not change the verdict — but the
+resident dtype table below is materially different and the difference is 4 GiB.
+
+**Resident footprint by dtype.** `dgx:gpu0` reports 128,452,956,160 B =
+**119.631 GiB** from `cudaMemGetInfo` (measured 2026-08-28, §2.3; not
+re-measured here, because this section took no GPU lease).
+
+| resident dtype | bpw | resident | whole model | fits `dgx:gpu0` resident-only |
+|---|---:|---:|---:|---|
+| bf16 | 16.0000 | **35.18 GiB** | 1403.18 GiB | yes |
+| Q8_0 | 8.5000 | 18.69 GiB | 745.44 GiB | yes |
+| Q6_K | 6.5625 | 14.43 GiB | 575.52 GiB | yes |
+| Q5_K | 5.5000 | 12.09 GiB | 482.34 GiB | yes |
+| Q4_K | 4.5000 | 9.90 GiB | 394.65 GiB | yes |
+| Q2_K | 2.6250 | 5.77 GiB | 230.21 GiB | yes |
+
+#2214 gives bf16 resident as 39.19 GiB; recomputed it is **35.18 GiB**, because
+its resident set was 21.0B and the correct one is 18.89B. Neither number changes
+the answer. **The measured resident figure that actually matters is neither of
+these, and it is in §3.4: the published UD arms carry the non-expert tensors at
+mixed Q4_K/Q5_K/Q6_K/Q8_0/F32 and weigh 14.51 GiB.**
+
+**One decode step, batch 1.** `num_experts_per_tok = 8` over 75 MoE layers
+touches `8 * 75 * 37,748,736` = 22,649,241,600 parameters, i.e. 3.0% of the
+routed set:
+
+| dtype | per decode step |
+|---|---:|
+| bf16 | 42.19 GiB |
+| Q8_0 | 22.41 GiB |
+| Q4_K | 11.87 GiB |
+| Q2_K | 6.92 GiB |
+| IQ1_S | 4.12 GiB |
+
+#2214's "~6.86 GiB at 2.6 bpw" reproduces as 6.92 GiB at Q2_K's exact 2.625 bpw.
+**The step figure is per token and it scales with batch**: at concurrency `c` the
+distinct set is bounded by `min(256, 8c)` experts per layer, so the touched bytes
+grow until they saturate at the whole 187 GiB tower set. This is a paging
+problem at `c = 1` and a capacity problem well before `c = 32`, and §3.6 keeps
+that inside the gate.
+
+### 3.2 What `expert_streamer.cpp` provides today, and what this model needs
+
+Read at base `60a6dd97b`. The capability is real and it is **not turnkey for this
+model**; five of the eight gaps below are load-bearing.
+
+**What exists.** `include/vllm/model_executor/expert_streamer.h` (154 lines) and
+`src/vllm/model_executor/expert_streamer.cpp` (224 lines), plus
+`expert_slot_cache.{h,cpp}` (the policy) and
+`host_expert_slot_store.h` / `device_expert_slot_store.{h,cpp}` (the
+destinations).
+
+- `ExpertSlotStore` (`expert_streamer.h:43`) is a pure-virtual destination seam:
+  `slot_bytes()`, `slot_count()`, `WriteSlot`, `SlotForWrite`, `CommitSlot`.
+  There is deliberately no virtual `SlotForRead`; the read is the concrete
+  `HostExpertSlotStore::Slot()`.
+- `ExpertStreamer` (`expert_streamer.h:91`) offers `Ensure`, `EnsureSpan`,
+  `EnsureFile(key, fd, file_offset, bytes)` and `EndStep()`.
+- `ExpertSlotCache` (`expert_slot_cache.h:61`) is a hotness-decayed LFU with LRU
+  tiebreak (`expert_slot_cache.cpp:19-44`, default decay 0.98), a dense slot
+  table with an `unordered_map<ExpertKey,int32_t>` logical->physical remap, and a
+  **per-step protection rule**: every `Acquire` marks the entry protected
+  (`expert_slot_cache.cpp:91`) and only `EndStep()` clears it
+  (`:142-145`). If every slot is protected, `Acquire` returns `-1` and sets
+  `capacity_exhausted_` (`:105-113`).
+- The backing store is the **GGUF file on disk, read by `pread(2)`** against the
+  model fd (`expert_streamer.cpp:85-100`), or a memcpy out of the mmap when no fd
+  is available. The resident store is host RAM: a plain `std::vector<uint8_t>`
+  arena of `slots * slot_bytes` (`host_expert_slot_store.h:40`).
+- Admissible weight formats are **GGUF keep-quant / keep-f16 stacked
+  `[E, out, in]` towers only** (`gguf_device_fit.cpp:95` refuses anything that is
+  not `kKeepQuant` or `kKeepF16`). Slices are **pure byte offsets, never a
+  repack**, which is a layout precondition stated at `gguf_expert_span.h:12-16`:
+  whole rows of the same K, no block ever cut.
+- Config surface, live and reachable from production: `VT_MOE_EXPERT_STREAM`,
+  `_SLOTS` (default **64**, `weight_residency.cpp:1035-1039`), `_SLOT_BYTES`,
+  plus the JSON `{"vllm_cpp":{"expert_stream":{...}}}` schema at
+  `include/vllm.h:502-506`, installed at
+  `model_loader.cpp:2251` inside `LoadedEngine::FromModelDir`, parsed by the
+  OpenAI server (`server_main.cpp:654-655`, `:1088-1089`, `:1326`) and the C ABI
+  (`vllm_c.cpp:666-667`). Default is OFF.
+- Tests: six binaries, `tests/CMakeLists.txt:1562-1633`. The end-to-end suite is
+  `tests/vllm/model_executor/test_expert_stream_wiring.cpp`, which proves decode
+  reaches the streamer, that a streamed slice and the tower view produce
+  identical logits, and that a file-backed tower is served by `pread` at a
+  deliberately unaligned offset.
+
+**What is missing for GLM-5.3.** Each of these is work, not configuration.
+
+1. **The wiring is not a seam. It lives inside `qwen3_5.cpp`.**
+   `Qwen35ExpertStream` (`qwen3_5.cpp:5725`), `KqExpertSlice` (`:6180`),
+   `KqHostSliceView` (`:6169`), `Reserve` (`:6284`) and the step guard are all in
+   that one translation unit, and it is the **only** model TU that constructs
+   `HostExpertSlotStore` / `ExpertSlotCache` / `ExpertStreamer` (`:6038-6040`).
+   `deepseek_v2.cpp` has zero references to any streamer symbol.
+   `qwen3_moe.cpp:195-197` holds only the step guard. A new architecture cannot
+   include a header and get streaming; the mechanism has to be lifted into a
+   shared seam first. **This is W2 and it is the largest single item.**
+2. **The default slot budget fails closed and quietly.** The decode working set
+   is `75 layers * 3 towers * 8 experts = 1800` distinct slices, every one
+   protected until `EndStep`. The default is 64 slots. Below the working set,
+   `Slice` returns `nullptr`, `exhausted_` increments (`qwen3_5.cpp:5824`), and
+   every slice falls back to reading the mmap in place — **counted on stderr, not
+   an error**. On this model that fallback is a 187 GiB random read per token.
+3. **No prefetch, no double buffering, no async I/O**, stated verbatim at
+   `expert_streamer.h:25-29`. A miss is a blocking `pread` inline in front of the
+   GEMM. 1800 serialized syscalls per token in the cold case.
+4. **Eviction is an O(resident) linear scan per miss**
+   (`expert_slot_cache.cpp:26-44`). At the slot counts §3.3 needs (thousands)
+   and ~1800 misses per step, that is a host cost nobody has profiled.
+5. **No device destination is wired.** `DeviceExpertSlotStore` exists, is filled
+   correctly through `EnsureFile`, is gated by
+   `tests/vllm/model_executor/test_device_expert_slot_store.cpp`, and **is
+   selected by nothing** (`expert_streamer.h:13-23`, and `qwen3_5.cpp:6067`
+   holds the concrete host store). The production predicate is
+   `qwen3_5.cpp:6199`: `cpu || host_memory_is_device_addressable()`. A discrete
+   CUDA GPU answers false and falls through. **`dgx:gpu0` is a GB10 with unified
+   memory and answers TRUE**, which is precisely why this row is viable there and
+   would not be on a discrete part.
+6. **Streaming and the grouped keep-quant MoE path are mutually exclusive**
+   (`qwen3_5.cpp:6307-6312`); enabling one disables the other, with one line on
+   stderr.
+7. **`pread` streaming has never run on a real checkpoint.**
+   `.agents/specs/expert-streaming.md` `## Owed`, verbatim: "**The `pread` path
+   has never run on the model.** ... It is still unmeasured on a real
+   checkpoint." No test model has more than 4 experts or 4 layers
+   (`tests/support/expert_stream_model.h:130-131`).
+8. **Windows has no streaming at all**: `EnsureFile` throws
+   `"expert streamer: EnsureFile needs pread"` (`expert_streamer.cpp:31-36`).
+
+**Row states, read rather than assumed.** `ENG-EXPERT-STREAM`
+(`engine-matrix.md:117`) is `READY`, owner `-`, and its "Our code" and "Our
+tests/evidence" columns are both a bare `-` despite ~700 shipped lines and six
+test binaries; its row text describes "fixed contiguous Marlin slots" and **no
+Marlin code is on this path**. `ENG-HYBRID-PLACEMENT` (`:119`) is `ACTIVE` and
+is the *inverse* mechanism — it moves expert COMPUTE to the CPU — not a
+substitute. `ENG-RESIDENCY-CONFIG` (`:120`) is `ACTIVE`, is the only one of the
+three with populated code/evidence columns, and owns the config surface this row
+uses unchanged. `ENG-EXPERT-STREAM-DEVICE` (`:122`, `ACTIVE`, #1124) is the row
+that owns gap 5; its `## Now` says W1 "lands UNREACHED" and W2 owns the wiring.
+**This row does not take any of those four rows' work.** It consumes them, and
+where it needs more than they provide it says so under `## Owed`.
+
+### 3.3 The residency plan
+
+Grounded in what §3.2 measured, not in what the streaming row claims.
+
+**Two tensor classes, and the split is the GGUF tensor name.** The streamer's
+own admission rule is the `_exps.weight` suffix (`model_loader.cpp:2472`,
+`kStreamedExpertSuffix`; `gguf_device_fit.h:98-99`), and GLM-5.3's GGUF
+conveniently draws the same line: `blk.N.ffn_{gate,up,down}_exps.weight` are the
+228 stacked `[256, out, in]` towers and every other tensor is per-layer.
+
+| class | tensors | UD-IQ1_S size | placement |
+|---|---:|---:|---|
+| **resident** | 1581 | **14.511 GiB** | device pool, whole run |
+| **streamed** | 228 | **187.312 GiB** | slot cache, paged from the file |
+
+The resident class is: `token_embd`, `output`, `output_norm`, and per block
+`attn_norm`, `attn_q_a`, `attn_q_a_norm`, `attn_q_b`, `attn_kv_a_mqa`,
+`attn_kv_a_norm`, `attn_k_b`, `attn_v_b`, `attn_output`, `ffn_norm`,
+`ffn_gate_inp`, `exp_probs_b`, the three shared-expert projections, the five
+`indexer.*` tensors, the three dense-MLP projections on blocks 0-2, and the four
+`nextn.*` tensors on block 78. Full census in §3.4.
+
+**The resident expert cache budget.** Slots are uniform and sized to the
+LARGEST slice (`host_expert_slot_store.h:30-33`; a bigger slice is refused by
+name, `expert_streamer.cpp:181-186`), so on UD-IQ1_S `slot_bytes` is set by the
+IQ4_XS `ffn_down_exps` slice:
+
+| slice encoding | bytes | MiB |
+|---|---:|---:|
+| IQ1_S gate/up | 2,457,600 | 2.344 |
+| IQ2_XXS gate/up | 3,244,032 | 3.094 |
+| IQ3_XXS down | 4,816,896 | 4.594 |
+| **IQ4_XS down (the max)** | **6,684,672** | **6.375** |
+
+| slots | arena | note |
+|---:|---:|---|
+| 1800 | 11.21 GiB | the bare decode working set at `c = 1`; **the floor, not a budget** |
+| 4096 | 25.50 GiB | ~2.3 steps of history |
+| 8000 | 49.80 GiB | the shape `benchmarks/expert_stream_device_w0e.cpp` already uses |
+
+**Proposed default for the first run: 4096 slots = 25.50 GiB.** Resident 14.51 +
+slots 25.50 = **40.01 GiB**, against 119.631 GiB on `dgx:gpu0`, leaving ~79 GiB
+for the KV cache, activations, scratch pools and the CUDA context. The KV
+arithmetic, from the config: the MLA latent row is `kv_lora + qk_rope = 576`
+elements per token per layer, so 78 layers at bf16 is 89,856 B/token = 87.75
+KiB/token, and the DSA indexer cache adds 132 B/token/indexer-layer over 22
+layers = 2,904 B/token. At 8192 context that is **0.71 GiB**; at 131,072 context,
+11.32 GiB. Even the long-context case fits inside the headroom, and the
+`max_position_embeddings` of 1,048,576 does not, which is a configuration limit
+to refuse rather than a surprise.
+
+**Uniform slots waste 46% of the arena on this artifact.** 1800 slices at their
+real sizes are 6.03 GiB; at the uniform 6,684,672 B they are 11.21 GiB. That is
+the price of the pure-byte-offset design, it is a known cost rather than a
+defect, and W6 records it as a measured lever rather than fixing it
+speculatively.
+
+**On a cache miss mid-step: the step stalls, synchronously, per slice.** There is
+no other behaviour available (§3.2 gap 3). The chain is
+`ExpertMlpKq -> MatmulBf16Slice -> KqExpertSlice -> Qwen35ExpertStream::Slice ->
+EnsureFile -> ::pread`, blocking, immediately before `vt::MatmulBT` runs on that
+weight. On a throw the acquisition is undone (`expert_streamer.cpp:108-111`,
+`:163-166`, `:214-217`) so nothing half-filled becomes resident.
+
+**On cache EXHAUSTION — every slot protected this step — the model does not
+fail. It silently degrades**, and on this artifact that degradation is fatal to
+any measurement: `Slice` returns `nullptr` and the caller reads the tower in
+place out of a 201.83 GiB mmap. **W1 therefore owes a refusal, not a fallback,**
+when the configured slot count is below the model's computed decode working set.
+A model that quietly reads 187 GiB per token through the page cache is the exact
+shape of measurement this repository has been burned by, and a `capacity <
+75*3*num_experts_per_tok` check at load costs one comparison.
+
+### 3.4 The artifact, and its encodings
+
+**Re-measured 2026-08-29, and the repository has changed completely since
+2026-08-28.** §2.3 recorded `unsloth/GLM-5.3-GGUF` at revision `8cf52b13b130`
+holding ONE arm, `UD-Q3_K_XL` at 319.41 GiB. At revision
+`346b3591c7f28d1a23716f97a065ecf12ec14771` (`lastModified`
+`2026-08-29T02:35:58Z`) it holds **twelve arms, 140 `.gguf` files, 5542.40 GiB**:
+
+| arm | files | size |
+|---|---:|---:|
+| **UD-IQ1_S** | 6 | **201.83 GiB** |
+| UD-IQ1_M | 6 | 212.80 GiB |
+| UD-IQ2_M | 6 | 222.19 GiB |
+| UD-Q2_K_XL | 7 | 236.44 GiB |
+| UD-IQ3_XXS | 7 | 262.34 GiB |
+| UD-Q3_K_XL | 9 | 319.41 GiB |
+| UD-IQ4_XS | 9 | 340.22 GiB |
+| UD-Q4_K_XL | 11 | 435.20 GiB |
+| UD-Q5_K_XL | 13 | 523.84 GiB |
+| UD-Q6_K_XL | 16 | 637.37 GiB |
+| Q8_0 | 17 | 746.32 GiB |
+| BF16 | 33 | 1404.42 GiB |
+
+Re-read this table rather than quoting it. The repository was being populated
+live on both days this row looked at it.
+
+**The census, and why a name is not a format.** Method: HTTP range requests
+against the six `UD-IQ1_S` shards, parsing only the GGUF header — magic,
+version, `tensor_count`, the KV block, then each `tensor_info`'s name, dims,
+`ggml_type` and offset. Header sizes are 9,428,677 B for shard 1 (metadata only,
+0 tensors, carrying the 20 MB tokenizer) and 25-30 kB for shards 2-6. **Nothing
+was downloaded**; the four arms below cost ~9.6 MB of range reads in total.
+`split.tensors.count` is 1809 and the shards sum to 455+419+412+397+126 = 1809,
+so the census is complete rather than sampled.
+
+`UD-IQ1_S`, 1809 tensors:
+
+| ggml type | n | GiB | of which experts | expert GiB | resident | resident GiB |
+|---|---:|---:|---:|---:|---:|---:|
+| IQ3_XXS | 71 | 81.539 | 71 | 81.539 | 0 | 0.000 |
+| IQ1_S | 106 | 62.109 | 106 | 62.109 | 0 | 0.000 |
+| IQ2_XXS | 44 | 34.031 | 44 | 34.031 | 0 | 0.000 |
+| Q5_K | 312 | 7.154 | 0 | 0.000 | 312 | 7.154 |
+| **IQ4_XS** | **4** | **6.375** | **4** | **6.375** | 0 | 0.000 |
+| Q8_0 | 476 | 4.852 | 0 | 0.000 | 476 | 4.852 |
+| Q2_K | 2 | 1.969 | 2 | 1.969 | 0 | 0.000 |
+| Q3_K | 1 | 1.289 | 1 | 1.289 | 0 | 0.000 |
+| Q6_K | 82 | 1.000 | 0 | 0.000 | 82 | 1.000 |
+| Q4_K | 2 | 0.997 | 0 | 0.000 | 2 | 0.997 |
+| F32 | 709 | 0.508 | 0 | 0.000 | 709 | 0.508 |
+| **TOTAL** | **1809** | **201.823** | **228** | **187.312** | **1581** | **14.511** |
+
+**`UD-IQ1_S` contains 106 IQ1_S tensors out of 1809.** The name is a target
+average, exactly as #2214 warned from the Flash row's `UD-Q2_K_XL`. The same
+census over three neighbours:
+
+| arm | expert encodings | resident encodings | resident GiB |
+|---|---|---|---:|
+| UD-IQ1_S | 106 IQ1_S, 71 IQ3_XXS, 44 IQ2_XXS, 4 **IQ4_XS**, 2 Q2_K, 1 Q3_K | Q8_0/Q5_K/Q6_K/Q4_K/F32 | 14.511 |
+| UD-IQ1_M | 76 **IQ1_M**, 74 IQ2_XXS, 71 IQ3_XXS, 4 **IQ4_XS**, 2 Q2_K, 1 Q3_K | same | 14.511 |
+| UD-IQ2_M | 148 IQ2_XXS, 71 IQ3_XXS, 4 **IQ4_XS**, 2 IQ2_S, 2 Q2_K, 1 Q3_K | same | 14.621 |
+| UD-Q2_K_XL | 148 **IQ2_XS**, 73 IQ3_XXS, 4 **IQ4_XS**, 2 Q2_K, 1 Q3_K | same | 14.621 |
+
+Two facts fall straight out. **The resident class is ~14.5 GiB in every arm** —
+the UD recipe keeps every non-expert tensor at Q4_K or better regardless of the
+name on the tin — so the residency plan in §3.3 is arm-independent. And
+`UD-Q2_K_XL` contains **two** Q2_K tensors out of 1809, both on the MTP block.
+
+**The verdict against our decoders and `vec_dot` lists. This section was
+rewritten after `origin/main` moved under it, and the correction inverts the
+answer.** At this branch's base `60a6dd97b`, `IQ4_XS` and `IQ2_XS` had neither a
+`vt` block dtype nor a decoder, so both were a hard refusal. On 2026-08-29 at
+`94de63ff5` ([#2245](https://github.com/mudler/vllm.cpp/issues/2245)) main landed
+**the dequantizers for both**, for the sibling `MODEL-MM-GLM53-FLASH` row's own
+staged artifact. `kIQ2_XS` and `kIQ4_XS` now exist in `include/vt/dtype.h::DType`,
+`gguf_reader.cpp` sizes id 17 at `{256, 74}`, and `gguf_dequant.cpp` cases 17 and
+23 decode. **Neither gained a keep-quant `vec_dot`, and that is the half that
+decides this row.**
+
+Three lists decide it, and they are not the same list:
+
+1. `gguf_reader.cpp::FindGgmlTraits` — the ggml ids we can SIZE. An id outside it
+   throws `"gguf: unknown ggml type id N"` at file OPEN. **17 and 23 are now in.**
+2. `vt::BlockDTypeFromGgmlTypeId` + `gguf_dequant.cpp` — the ids we can DECODE.
+   **17 and 23 are now in.**
+3. `src/vt/cpu/cpu_quant_dot.cpp::BlockVecDot`, read through
+   `vt::cpu::HasQuantDotKernel` — the ids that stay COMPRESSED.
+   `Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ2_S,
+   IQ1_S, IQ1_XXXS, IQ4_NL, MXFP4`. **17 and 23 are NOT in, and nothing else in
+   the four censused arms is missing.**
+
+`gguf_keep_quant.cpp::KeepQuantDType` is the gate: it resolves the block dtype
+and then `if (!vt::cpu::HasQuantDotKernel(dt)) return false;`. **A type with a
+decoder and no `vec_dot` therefore EXPANDS TO bf16 at load** — exactly the
+failure mode #2214 named, arriving here through the door that had just been
+opened.
+
+| type | traits | decoder | `vec_dot` | what happens |
+|---|---|---|---|---|
+| Q4_K, Q5_K, Q6_K, Q8_0, F32 | yes | yes | yes | resident class stays compressed |
+| IQ1_S, IQ2_XXS, IQ3_XXS, IQ2_S, Q2_K, Q3_K | yes | yes | yes | expert towers stay compressed |
+| **IQ4_XS (23)** | **yes** | **yes, since `94de63ff5`** | **NO** | **expands to bf16** |
+| **IQ2_XS (17)** | **yes** | **yes, since `94de63ff5`** | **NO** | **expands to bf16** |
+| IQ1_M (29) | NO | NO | NO | `gguf: unknown ggml type id 29` at file OPEN |
+
+**And an expanded tower does not merely cost bytes — it leaves the streaming lane
+entirely.** `gguf_device_fit.cpp:85-100` walks every `*_exps.weight` tensor,
+asks `PeekRoute` for its residency, and returns **false for the whole arm** the
+moment one of them is not `kKeepQuant` or `kKeepF16`. The eligibility is
+per-MODEL, not per-tensor. So four IQ4_XS tensors out of 228 disqualify all 228.
+
+The cost, computed exactly. One `*_exps` tower is
+`2048 * 6144 * 256 = 3,221,225,472` elements, **6.000 GiB at bf16**:
+
+| arm | offending type | compressed | expanded to bf16 | delta |
+|---|---|---:|---:|---:|
+| UD-IQ1_S | 4 x IQ4_XS | 6.375 GiB | **24.000 GiB** | +17.6 GiB |
+| UD-IQ2_M | 4 x IQ4_XS | 6.375 GiB | **24.000 GiB** | +17.6 GiB |
+| UD-Q2_K_XL | 148 x IQ2_XS | 128.344 GiB | **888.000 GiB** | +759.7 GiB |
+
+And the slot arithmetic collapses with it: a bf16 expert slice is
+`6144 * 2048 * 2 = 25,165,824 B = 24.00 MiB` against the IQ4_XS slice's 6.375
+MiB, and slots are uniform at the largest, so §3.3's 4096-slot cache would be
+**96.00 GiB** instead of 25.50 GiB — more than three quarters of the device on
+its own.
+
+**So the verdict changes shape but not sign, and it is sharper than it was.**
+
+- **The row is blocked on ONE kernel and it is a `vec_dot`, not a decoder:
+  `VecDotIQ4_XSQ8_K` against the Q8_K activation encoding.** Four tensors,
+  `blk.{8,75,76,77}.ffn_down_exps.weight`. With it, UD-IQ1_S loads entirely
+  compressed at 201.823 GiB and every tower is streamable. Without it, the arm
+  loads at 219.4 GiB, cannot stream at all, and is dead on this fleet.
+- The port is small and well-precedented, and it is smaller today than it was at
+  this branch's base: `94de63ff5` already ported the 136-byte `block_iq4_xs`
+  layout and its decoder from llama.cpp `b10451`, so what remains is the dot
+  product itself over a codebook this tree already carries for `IQ4_NL`
+  (`kValuesIq4nl`, `cpu_quant_dot.cpp::VecDotIQ4_NLQ8_0`, anchored `quants.c:1254`).
+  Upstream's is `ggml_vec_dot_iq4_xs_q8_K`.
+- `UD-IQ2_M` needs the same one and nothing else. `UD-Q2_K_XL` needs
+  `VecDotIQ2_XSQ8_K` as well, and `UD-IQ1_M` is still rejected outright on
+  `IQ1_M`, which has no traits at all.
+- The row already exists: `QUANT-GGUF-IQ4_XS`
+  (`.agents/quantization-matrix.md:78`, `INVENTORIED`).
+
+**The general lesson this section paid for, and the reason it is written out
+rather than quietly corrected: a decoder and a `vec_dot` are two different
+obligations, and landing only the first turns a loud refusal into a silent 3.4x
+memory multiplier.** At `60a6dd97b` this arm refused at load with a message
+naming the type. At `94de63ff5` it loads, and the only symptom is that a
+119.631 GiB device runs out of memory for reasons the log does not name.
+`gguf_device_fit`'s all-or-nothing rule is what converts the same defect from
+"+17.6 GiB" into "no streaming at all", and neither is visible to a token gate.
+
+**The GGUF's own metadata, and one thing it does NOT carry.** Shard 1's KV block
+declares `general.architecture = glm-dsa`, `glm-dsa.block_count = 79`,
+`context_length = 1048576`, `embedding_length = 6144`, `expert_count = 256`,
+`expert_used_count = 8`, `expert_feed_forward_length = 2048`,
+`expert_shared_count = 1`, `expert_gating_func = 2` (sigmoid),
+`expert_weights_scale = 2.5`, `expert_weights_norm = true`,
+`leading_dense_block_count = 3`, `attention.q_lora_rank = 2048`,
+`attention.kv_lora_rank = 512`, `attention.key_length = 576`,
+`attention.value_length = 512`, `attention.key_length_mla = 256`,
+`attention.value_length_mla = 256`, `rope.dimension_count = 64`,
+`rope.freq_base = 8e6`, `nextn_predict_layers = 1`,
+`attention.indexer.head_count = 32`, `attention.indexer.key_length = 128`,
+`attention.indexer.top_k = 2048`, `tokenizer.ggml.pre = glm4`,
+`general.file_type = 24`, and an imatrix provenance block
+(`quantize.imatrix.entries_count = 1065`, `chunks_count = 209`).
+
+**It does NOT carry `glm-dsa.attention.indexer.types`, and that is a trap with a
+known workaround** — see §3.5, D3.
+
+**Fleet and staging.** `rc devices` on 2026-08-29 lists `dgx:gpu0` (busy),
+`orin:gpu0`, `strix:gpu0`, `thor:gpu0`; none is larger than `dgx:gpu0`.
+`/mnt/nas_share` has **2.2 TiB free** of 7.3 TiB, so the 201.83 GiB arm stages
+there. **`dgx.casa`'s local disk had 184 GiB free when last measured (§0.1 C3,
+2026-07-21), which is LESS than the arm**, so W7 must either free local disk or
+`pread` across CIFS — and a CIFS-backed `pread` of 1800 slices per token is a
+different measurement from a local-NVMe one. §3.9 O7 owes that number.
+
+### 3.5 The delta against `DeepseekV2ForCausalLM`
+
+#### 3.5.1 Upstream, at the pin — and §2.2's premise needed one correction
+
+`registry.py:117` and `deepseek_v2.py:1930-1931` are as §2.1 records, both unique
+at `555967922`. `_get_moe_router_dtype` (`deepseek_v2.py:123-133`) forces
+`torch.float32` on `model_type == "glm_moe_dsa"` at `:127` before the generic
+`moe_router_dtype == "float32"` branch at `:131`, so the special case is
+redundant on THIS checkpoint and still fires first. That much §2.2 had right.
+
+**What §2.2 left open, and what is now measured: the pinned class CAN load this
+checkpoint, and it does not read `indexer_types` to do it.** At the pin,
+`grep -c indexer_types` over `deepseek_v2.py` is 0, and over every `*.py` in the
+tree it is 0. `mlp_layer_types` is likewise unread by this model (it exists only
+in `cohere2_moe.py` and `mellum.py`). The schedule is DERIVED, at
+`deepseek_v2.py:1092-1103`:
+
+```python
+_index_topk_freq        = getattr(config, "index_topk_freq", 1)
+_index_topk_pattern     = getattr(config, "index_topk_pattern", None)
+_index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+if _index_topk_pattern is None:
+    _skip_topk = max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq != 0
+```
+
+with the indexer built at `:1115` when `self.is_v32 and (not _skip_topk or
+is_mtp_layer)`. Evaluated on GLM-5.3 (`freq = 4`, `offset = 3`, 78 layers) that
+yields full layers `{0,1,2} ∪ {6,10,…,74}` = **21**, plus the MTP layer forced
+full at `:1110-1115`, = **22 indexers**.
+
+**Three independent derivations agree, and they agree bit for bit.**
+
+| source | schedule |
+|---|---|
+| the checkpoint's `config.json` `indexer_types` | `111000100010001000…` (78 entries, 21 ones) |
+| vLLM at the pin, `deepseek_v2.py:1097-1101`, evaluated | identical |
+| llama.cpp `b10451`, `src/models/glm-dsa.cpp:6-27` `GLM_5_2_DEFAULT_INDEXER_TYPES` | identical over all 78 |
+| the checkpoint's own tensor index | `self_attn.indexer.*` present on **22** of 79 blocks |
+
+Those 22 are the 21 trunk full layers plus block 78, the MTP block — exactly what
+the pin builds. The pin also anticipates a checkpoint that ships MORE indexer
+weight than it builds, dropping the surplus at `deepseek_v2.py:1566-1582`
+("With index_topk_freq>1 only some layers build an indexer, yet the checkpoint
+ships indexer weights for all of them"). GLM-5.3 does not need that path, but the
+PUBLISHED GGUF does — see D3.
+
+**`n_shared_experts = 1`** is an ordinary read (`deepseek_v2.py:299`, `:349`,
+`:352`, `:385`) and needs nothing special.
+
+**The `indexers_proj` question from §2 is now answered, and the answer is that it
+names no tensor.** `grep -n indexers_proj` over every `*.py` at the pin returns
+zero. The checkpoint's own `model.safetensors.index.json` (118,629 tensors,
+`metadata.total_size = 755,617,140,416`, fetched 2026-08-29) ships the upstream
+spellings and only those: `self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`, 22
+of each, with `wq_b` and `wk` carrying `weight_scale_inv` sidecars and
+`weights_proj` and `k_norm` carrying none. `modules_to_not_convert`'s 22
+`self_attn.indexers_proj` entries are a quantization-skip shorthand that matches
+no shipped tensor name; the tensor it means (`indexer.weights_proj.weight`) is
+unquantized anyway. **It is a config-level string, not a naming divergence, and
+a loader must not mirror it.** vLLM at the pin fuses `wk` + `weights_proj` into
+one `MergedColumnParallelLinear` named `wk_weights_proj` through the stacked
+mapping at `deepseek_v2.py:1536-1540`, with an fp8 dequant-into-the-fused-param
+helper `_try_load_fp8_indexer_wk` at `:820-860`.
+
+`vllm/models/deepseek_v32/nvidia/attention.py` exists at the pin and implements
+the same skip schedule at `:211-219`, but `registry.py:117` routes this
+architecture to `deepseek_v2`, so that tree is **not** reached at the pin. The
+re-homing §2.2 describes is a `main`-only change and stays out of scope.
+
+#### 3.5.2 Our side — what is free, what is adjacent, what is new
+
+**Free from the existing DeepSeek-V2 + shared MLA stack.** Verified at
+`60a6dd97b`:
+
+- **The MLA geometry is already supported and already exercised.**
+  `mla::MlaBlockDims::Validate` (`mla_attention.cpp:89-192`) requires
+  `v_head_dim <= qk_head_dim()`; GLM-5.3 is `256 <= 192+64 = 256`, which passes,
+  and there is no rule forcing `qk_nope_head_dim == v_head_dim`. The prefill
+  head-dim switch (`src/vt/cuda/cuda_mla_prefill.cu:194-209`) hits the native
+  FA-2 256 instantiation with no padding — the same instantiation GLM-4.7-Flash
+  already uses. Decode runs in latent space at `head_size = 576` /
+  `v_head_dim = 512` and takes the `<= 512` arm, byte-identical to DeepSeek-V3
+  (`cuda_mla_attn.cu:671-682`). **No MLA refusal fires for this model.**
+- Load-time `kv_b_proj` absorption at the asymmetric 192/256 split
+  (`AbsorbKvBProjBf16`, `mla_attention.cpp:205-229`, splitting at `row = p + v`).
+- **Interleaved (GPT-J) RoPE**, which is DeepSeek's default here:
+  `MlaBlockDims::is_neox_style` defaults `false` (`mla_attention.h:136`). Upstream
+  passes `is_neox_style=False` unconditionally (`deepseek_v2.py:1073`) and reads
+  no top-level `rope_interleave`, so our default is parity-correct — **but it is
+  correct by default rather than by a read, and W2 writes that down**.
+- The **noaux_tc grouped router** at `n_group = 1` / `topk_group = 1`, sigmoid
+  scoring, `norm_topk_prob`, `routed_scaling_factor 2.5` and
+  `e_score_correction_bias` (`deepseek_v2_weights.cpp:286-341`,
+  `deepseek_v2.cpp:355-366`). This is exactly the configuration GLM-4.7-Flash
+  already gates end-to-end (§0.1 C2).
+- The MoE expert layout has **no hardcoded expert-count limit**
+  (`vt::MoeGroupedGemmBf16` validation, `ops.cpp:904-928`, requires only
+  `weight_ptrs.Numel() == e`), so 256 x 75 is representable.
+- `first_k_dense_replace`-driven dense/MoE layout
+  (`DeepseekV2Params::is_moe_layer`, `deepseek_v2.h:126-129`) reproduces
+  upstream's rule and is arithmetically identical to the checkpoint's
+  `mlp_layer_types` for this config. The batch split, decode CUDA graph and
+  paged engine come along unchanged.
+
+**Adjacent and already landed, but not wired to DeepSeek-V2.** This is the
+finding that most changes the size of the port:
+
+- **A device-native DSA lightning indexer already lives inside the SHARED MLA
+  block**, `mla_attention.cpp:598-745`, landed for `dots3-note`. It is a port of
+  upstream's non-fused `Indexer.forward` (`deepseek_v2.py:803-842`): `wq_b` GEMM
+  (`:646`), split `wk` / `weights_proj` GEMMs (`:655`, `:658`), `k_norm` as a
+  real **LayerNorm with bias at eps 1e-6** (`:663-664`), leading-slice rope under
+  an independent `dims.indexer_rope_is_neox_style` (`:667-673`, upstream's
+  `not indexer_rope_interleave` at `deepseek_v2.py:1120`), chunked logits under a
+  16 Mi-element budget (`:698-712`), then `vt::DsaIndexerLogits` +
+  `vt::DsaTopkSelect` per request (`:741-742`), handed to decode at `:880-883`.
+  Both ops are implemented and registered on **CPU** (`cpu_dsa_indexer.cpp:184,186`)
+  and **CUDA** (`cuda_dsa_indexer.cu:320,322`). Geometry fields
+  `index_n_heads` / `index_head_dim` / `index_topk` /
+  `indexer_rope_is_neox_style` already exist on `MlaBlockDims`
+  (`mla_attention.h:210-232`), as do the five indexer tensors
+  (`mla_attention.h:426-430`). **This is a much stronger starting point than
+  §0.2's "GB10 cannot run DSA" verdict suggests** — that verdict was about
+  vLLM's flashinfer path, not about ours, and ours has since been built.
+- The freq/offset + pattern + explicit-list indexer schedule parser is already
+  written and gated, in the WRONG model's translation unit:
+  `glm5_next.cpp:287-338`, whose fallback at `:322-330` is line-for-line
+  upstream's `:1097-1101`. The `mlp_layer_types` reader is at
+  `glm5_next.cpp:262-284`. Both are liftable.
+- The block-fp8 config reader exists (`fp8_block_quant.{h,cpp}`, reading
+  `weight_block_size`, `activation_scheme`, `modules_to_not_convert`), with
+  exactly one consumer, the Qwen3.5 **dense** loader.
+
+**Genuinely net-new, in order of size.**
+
+1. **The indexer KV side cache.** Sparse decode today refuses any step in which
+   any request RESUMES (`dots3_note_device.cpp:1147-1180`), because the indexer's
+   `k` comes from the step's own hidden states and a resumed request needs the
+   indexer's own 128-wide cache. Upstream's is `DeepseekV32IndexerCache`
+   (`deepseek_v2.py:696-701`), a 132 B/token row in its OWN kv-cache group.
+   Tracked as `KV-DSV4-MULTICACHE` ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)).
+   **Without it there is no multi-step decode, so there is no gate.** Largest item.
+2. **The expert-streaming seam.** §3.2 gap 1: the mechanism is welded into
+   `qwen3_5.cpp` and has to be lifted before a second model can reach it.
+3. **Sparse prefill.** `MlaPrefillAttentionArgs` has no topk member at all
+   (`ops.h` through `:1737`); `MlaPrefillAttention` (`ops.cpp:4159-4230`) has no
+   selection arm. Upstream forces ALL tokens through `forward_mqa` for a sparse
+   impl (`mla_attention.py:697-702`), so this is not optional at long context.
+4. **Per-layer heterogeneous `MlaBlockDims`** — 22 indexer-bearing blocks out of
+   79 — plus the **`shared` / `skip_topk` selection-reuse** semantics
+   (`vllm/model_executor/layers/mla.py:180`: a skip layer runs no indexer but
+   stays `is_sparse` and attends through the preceding full layer's
+   `topk_indices_buffer`). Nothing in this tree reuses a prior layer's top-k.
+5. **The `IQ4_XS` encoding** (§3.4), owned by `QUANT-GGUF-IQ4_XS`.
+6. **A `"glm-dsa"` GGUF arm.** `kGgufArchArms` (`model_loader.cpp:1029-1037`)
+   knows `deepseek4`, `muse-glimmer`, `qwen35`, `qwen35moe`, `qwen3next`,
+   `qwen4exp`, `glm5next` — and no `deepseek2` and no `glm-dsa`.
+   `deepseek_v2_registry.cpp:68-71` throws
+   `"Model architecture DeepseekV2ForCausalLM does not support GGUF weights"`.
+   The whole GGUF path for this family is net-new.
+7. **The fp32 router GEMM.** `deepseek_v2.cpp:350` hardcodes
+   `DBuf dlog(d, DType::kBF16, {T, E});`. The softmax/top-k stage is already f32;
+   only the gate GEMM is bf16. Small and real.
+8. **Registration and the lifting of the tripwire.** `ParseDeepseekV2Params`
+   refuses any checkpoint carrying `index_topk`
+   (`deepseek_v2_weights.cpp:358-364`) and any `quantization_config`
+   (`:365-369`), and refuses `num_nextn_predict_layers > 0` unless
+   `allow_mtp_tail` (`:353-357`, which only `Glm4MoeLiteForCausalLM` passes).
+   `GlmMoeDsaForCausalLM` appears nowhere under `src/` or `include/`.
+
+**Deliberately NOT in scope.** The safetensors arms. The published bf16/fp8
+checkpoint is 703.74 GiB across 141 shards and the DeepSeek-V2 loader holds
+`OwnedTensor` host bytes with no streaming path — 57,600 host tensors for the
+routed experts alone. There is no MoE-expert block-fp8 rung anywhere in the tree.
+**This row ships a GGUF arm and refuses safetensors by name**, which inverts the
+usual polarity and is the correct inversion here: the quantized arm is the only
+one that can be fed. Recorded as D1. MTP is skipped through `allow_mtp_tail`,
+following `glm4_moe_lite_registry.cpp:161,169`; there is no MTP drafter in the
+tree at all (`src/vllm/v1/spec_decode/` holds three files, none of them an MTP
+proposer). Recorded as O5.
+
+### 3.6 The gate
+
+**The honest headline: no end-to-end token gate against vLLM is reachable on this
+fleet, and this section says so before any wave promises one.**
+
+vLLM at the pin implements this architecture and, per §3.5.1, would load this
+checkpoint. It cannot RUN it here. The published weights are 703.74 GiB at fp8;
+`dgx:gpu0` is 119.631 GiB of unified memory, which is also its host RAM, so
+`--cpu-offload-gb` offloads into the same pool it is offloading out of. No fleet
+device is larger (`rc devices`, 2026-08-29). vLLM has no GGUF path for this
+architecture either. **The denominator does not exist, and that is a measured
+absence rather than a missing effort.** AGENTS.md's rule applies directly: say so
+plainly, gate against what can actually be run, and do not call the result
+token-exact against the runtime.
+
+Four gates ARE reachable, and together they are the row's spine.
+
+**G1 — module parity against the pinned vLLM, on CPU, at small shapes.** vLLM's
+`Indexer`, `_get_moe_router_dtype`, the skip-topk schedule formula and the
+noaux_tc router are all importable and runnable without the checkpoint. Capture
+goldens out of `555967922` on synthetic inputs and compare numerically, not by
+token. This gates the primitives in items 4 and 7 of §3.5.2 and it is the ONLY
+place vLLM is the reference. Precedent: `MODEL-MM-GLM53-FLASH` W3
+([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) gated its indexer this
+way against transformers, asserting **SET equality of the selected indices** with
+the margin printed — the right shape for a discrete selection, where the error is
+bimodal and a tolerance bounds nothing.
+
+**G2 — the structural loader gate, headers only, env-gated.** Every tensor in the
+real `UD-IQ1_S` shards is enumerated and accounted: 1809 == 1809, zero
+unaccounted, and every `ggml_type` in the file is one this tree can decode. This
+is the gate that would have caught `IQ4_XS` before a wave was planned, and it
+costs ~9.6 MB of range reads, so CI can run it against the published repository
+without the asset.
+
+**G3 — the streaming self-consistency gate, and it needs no oracle at all.** The
+row's novelty is the streaming mechanism, and its correctness question is
+internal: **a streamed slice and the resident tower must produce identical
+logits.** `tests/vllm/model_executor/test_expert_stream_wiring.cpp:215` already
+asserts exactly this for Qwen3.5 through `SetForceFallback`, inside one process.
+Extended to a GLM-5.3-shaped synthetic model it gates the seam lift, the capacity
+refusal and the slot arithmetic, on CPU, with no checkpoint. **This is the gate
+that decides whether W3 landed correctly**, and it is available from W3 onward.
+
+**G4 — an end-to-end floor against llama.cpp `b10451`, on the IDENTICAL
+artifact, labeled as a secondary floor and never as the bar.** llama.cpp reaches
+this architecture at our stock pin (§2.4) and, unlike vLLM, can run it: it mmaps
+the GGUF and pages from disk. Run `llama-cli` on the same `UD-IQ1_S` shards, same
+prompts, greedy, and compare. **Expect a near-tie band and not token-exactness**,
+because two independent i-quant implementations agree on the dequantized values
+but not on reduction order, and `bf16` stores absorb the difference unevenly.
+Ratify the band before running, or the run becomes an argument. Two preconditions
+this section does NOT wave away: the artifact must be staged (O7), and the
+llama.cpp side must itself be shown to load and generate before a single number
+from it is quoted — `gateable = yes` is a property of the oracle, and running
+THIS model on it is a separate measurement.
+
+**What no gate here does.** None of the four is token-exact against vLLM, and no
+wave may report one as if it were. No speed axis has a denominator: vLLM cannot
+run the model, so the only comparable is llama.cpp on the same artifact, and that
+is a labeled secondary floor. Per AGENTS.md the speed axis is therefore an **open
+gap by construction**, not a waiver and not silence.
+
+### 3.7 Work breakdown
+
+Eight waves. Each is a separate `row/MODEL-TEXT-GLM-MOE-DSA-W<n>` branch, a
+separate pull request, a fresh implementer and a fresh reviewer. **W1-W4 and W6
+are CPU-gateable and need no GPU. W5, W7 and W8 need a GPU.** Sizes are the
+author's estimate of reviewable diff, not a budget. W1 and W2 are independent of
+each other; everything else is ordered.
+
+#### W1 — the `IQ4_XS` encoding (CPU, medium)
+
+**Scope:** the keep-quant `VecDotIQ4_XSQ8_K` and its `QuantTypeTraits` row, so
+`vt::cpu::HasQuantDotKernel(kIQ4_XS)` becomes true and
+`gguf_keep_quant.cpp::KeepQuantDType` stops expanding the type to bf16. The
+dtype, the 136-byte block layout and the decoder already landed at `94de63ff5`
+([#2245](https://github.com/mudler/vllm.cpp/issues/2245)); this wave is the half
+that was not in it. **Owned by `QUANT-GGUF-IQ4_XS`**
+(`.agents/quantization-matrix.md:78`, `INVENTORIED`), consumed here; this row
+does not steal that row's state.
+**Exclusions:** no model code. `VecDotIQ2_XSQ8_K` is the same shape and is NOT
+in scope, because no arm this row targets needs it; `IQ1_M` stays unimplemented
+and `UD-IQ1_M` stays refused.
+**Anchors:** llama.cpp `b10451` `ggml/src/ggml-common.h::block_iq4_xs` (256
+elements, 136 bytes) and `ggml/src/.../quants.c::ggml_vec_dot_iq4_xs_q8_K`; the
+shared 16-entry `kValuesIq4nl` codebook this tree already carries for `IQ4_NL`
+(`cpu_quant_dot.cpp::VecDotIQ4_NLQ8_0`, anchored `quants.c:1254`); the reader
+already sizes it at `gguf_reader.cpp` case 23, `{256, 136}`.
+**Tests:** RED first — `HasQuantDotKernel(kIQ4_XS)` is false today and
+`KeepQuantDType(23, ...)` returns false, so a test asserting a real IQ4_XS tensor
+loads COMPRESSED fails before the change and passes after. Then the `vec_dot`
+against the existing dequant-composite fallback on the same blocks, and the
+LOWER bound a quantized arm needs: the kept-quant result must not merely
+correlate with the expanded one, it must agree to the encoding's own error.
+`tests/vt/iq2xs_iq4xs_golden_vectors.h` already carries `94de63ff5`'s reference
+vectors.
+**Gate:** focused ctest, full preflight. **Reachability:** the type must arrive
+through `GgufFile::OpenOne` on a real header, not through a hand-built block.
+**Stop:** if the 136-byte layout does not reproduce llama.cpp byte for byte,
+return `NEEDS_DECISION` rather than widening a tolerance.
+
+#### W2 — config, registration, GGUF arch arm, refuse-by-name (CPU, medium)
+
+**Scope:** a `glm_moe_dsa` config parser that resolves the indexer schedule by
+upstream's DERIVED rule (`index_topk_freq` / `index_skip_topk_offset` /
+`index_topk_pattern`, `deepseek_v2.py:1092-1103`) with the explicit
+`indexer_types` list as an override, lifting the parser at
+`glm5_next.cpp:287-338` rather than writing a second one; the `mlp_layer_types`
+reader (`glm5_next.cpp:262-284`) with its `first_k_dense_replace` fallback and a
+refusal when the two disagree; `GlmMoeDsaForCausalLM` registered from its own
+translation unit; a `"glm-dsa"` row in `kGgufArchArms`
+(`model_loader.cpp:1029-1037`); and a `Forward` that refuses by name, naming
+every unimplemented primitive and this section.
+**Exclusions:** no forward math, no loader materialization, no change to
+`DeepseekV2Params` or to the DeepSeek-V2 refusals — GLM-5.3 gets its own params
+struct, because sharing one would make the `index_topk` tripwire
+(`deepseek_v2_weights.cpp:358-364`) a choice rather than a wall for DeepSeek-V2.
+**Anchors:** `deepseek_v2.py:1092-1103`, `:1110-1115`, `:127`;
+`glm5_next.cpp:262-338`; registration pattern
+`glm4_moe_lite_registry.cpp:18-38`; refusal pattern `kimi_k3.cpp:44-51`.
+**Tests:** the derived schedule equals the checkpoint's `indexer_types` for all
+78 entries, as a committed fixture from the real `config.json` (this is the test
+that makes §3.5.1's three-way agreement executable); the `mlp_layer_types`
+disagreement refusal; `is_neox_style == false` asserted rather than defaulted;
+a `glm-dsa` GGUF header reaches the config builder through
+`LoadedEngine::FromModelDir`; the refusal message names each missing primitive.
+**Gate:** CPU build, focused ctest, full preflight. **Evidence:** the registry
+contract test's architecture count moves by exactly one.
+**Reachability:** deleting the `REGISTER_VLLM_MODEL` line, or the `kGgufArchArms`
+row, must red the focused gate.
+
+#### W3 — lift the expert-streaming seam out of `qwen3_5.cpp` (CPU, large)
+
+**Scope:** move `Qwen35ExpertStream`, `KqExpertSlice`, `KqHostSliceView`,
+`Reserve` and the step guard (`qwen3_5.cpp:5725`, `:6180`, `:6169`, `:6284`) into
+a shared header + translation unit that a second model TU can include, with
+Qwen3.5 rewritten as its first client and byte-identical behaviour. **Plus the
+capacity refusal §3.3 argues for**: a configured slot count below
+`n_moe_layers * 3 * num_experts_per_tok` refuses at load, by name, instead of
+degrading to the mmap fallback.
+**Exclusions:** no policy change (the LFU stays), no prefetch, no async I/O, no
+device store — those are `ENG-EXPERT-STREAM` W6 and
+`ENG-EXPERT-STREAM-DEVICE` W2 and this row does not take them.
+**Anchors:** `expert_streamer.{h,cpp}`, `expert_slot_cache.{h,cpp}`,
+`host_expert_slot_store.h`, `gguf_expert_span.h:12-16`,
+`gguf_device_fit.cpp:95`, `model_loader.cpp:2472`.
+**Tests:** **G3** — a streamed slice and the resident tower produce identical
+logits, extended from `test_expert_stream_wiring.cpp:215` to a model with more
+than 4 experts and more than 4 layers; the capacity refusal RED first; Qwen3.5's
+six existing streaming binaries stay green and its goldens byte-identical.
+**Gate:** focused ctest, full preflight, Qwen3.5 SACRED inertness.
+**Reachability:** deleting the seam's call site in `qwen3_5.cpp` must red the
+Qwen3.5 streaming suite.
+**Stop:** if the lift cannot preserve Qwen3.5 byte-identity, return
+`NEEDS_DECISION`; a behaviour change to a gated model is not this wave's to make.
+
+#### W4 — the heterogeneous indexer schedule and selection reuse (CPU, medium)
+
+**Scope:** per-layer `MlaBlockDims` so 22 of 79 blocks carry an indexer and 57 do
+not; the `skip_topk` semantics — a shared layer runs no indexer, stays
+`is_sparse`, and attends through the preceding full layer's selection
+(`vllm/model_executor/layers/mla.py:180`); the fp32 router gate GEMM
+(`deepseek_v2.cpp:350`).
+**Exclusions:** no KV cache work, no prefill work.
+**Anchors:** `deepseek_v2.py:1115`, `:1134-1135`, `:1175`;
+`vllm/model_executor/layers/mla.py:180`; ours
+`mla_attention.cpp:414`, `:598-745`, `:880-883`;
+`_get_moe_router_dtype` `deepseek_v2.py:123-133`.
+**Tests:** **G1** — the selection a shared layer uses is byte-identical to the
+one its owning full layer produced, mutation-proven by re-pointing it at a
+different layer; the router GEMM's output dtype asserted as f32 against a vLLM
+golden; a full layer and a shared layer produce DIFFERENT attention outputs (the
+tautology guard).
+**Gate:** focused ctest, full preflight. **Reachability:** the schedule must
+arrive from the config parsed in W2, not be constructed in the test.
+
+#### W5 — the indexer KV side cache (GPU, large) — [#1925](https://github.com/mudler/vllm.cpp/issues/1925)
+
+**Scope:** the indexer's own 132 B/token cache in its own kv-cache group, so a
+resumed request no longer refuses. This is `KV-DSV4-MULTICACHE`'s work and this
+row consumes it; if that row does not schedule it, this row's W5 is where it
+lands and the ownership is recorded in both places before a line is written.
+**Exclusions:** sparse prefill, which is W6.
+**Anchors:** `DeepseekV32IndexerCache` `deepseek_v2.py:696-701`; the
+`MLAAttentionSpec` merge rule `vllm/v1/kv_cache_interface.py:399-429` that forces
+it into a separate group; our refusal `dots3_note_device.cpp:1147-1180`.
+**Tests:** a two-step decode with a resumed request produces the same tokens as
+the same prompt decoded in one step; the refusal at
+`dots3_note_device.cpp:1147-1180` is deleted and its replacement is gated, not
+merely absent.
+**Gate:** focused ctest on GPU, full preflight, dots3-note inertness.
+**Needs a GPU.**
+
+#### W6 — sparse prefill (GPU, large)
+
+**Scope:** a topk/selection arm on `MlaPrefillAttentionArgs` and
+`MlaPrefillAttention`, mirroring upstream's rule that a sparse impl forces ALL
+tokens through the MQA path with no prefill/decode split
+(`vllm/model_executor/layers/attention/mla_attention.py:697-702`).
+**Exclusions:** no change to the dense prefill path any other model takes.
+**Anchors:** `mla_attention.py:697-702`; ours `ops.h` `MlaPrefillAttentionArgs`,
+`ops.cpp:4159-4230`.
+**Tests:** prefill selection SET-equal to decode selection on the same context;
+DeepSeek-V2 and GLM-4.7-Flash prefill byte-identical.
+**Needs a GPU.**
+
+#### W7 — the loader, the streamed towers, and the first load (GPU + large asset)
+
+**Scope:** the `glm-dsa` GGUF weight loader; `_exps.weight` towers routed to the
+W3 seam; the resident class staged to device; safetensors refused by name (D1);
+`allow_mtp_tail` skipping block 78. Stage `UD-IQ1_S` (201.83 GiB, 6 shards) to
+`/mnt/nas_share` — 2.2 TiB free — and record the sha256 of each shard.
+**Exclusions:** no speed number.
+**Tests:** **G2** structurally over the real shard headers, env-gated; the model
+loads and produces a first token; the resident footprint measured against the
+14.511 GiB this section predicts, and the difference explained if it is not
+within a few percent.
+**Gate:** the load itself, under an `rc` lease on `dgx:gpu0`.
+**Needs a GPU and the asset.** **Stop:** if `dgx.casa`'s local disk cannot hold
+201.83 GiB, do NOT quietly `pread` across CIFS and report the result as a
+streaming measurement — record it as a CIFS number and open O7's measurement.
+
+#### W8 — the gates, once and only once a load exists (GPU + asset)
+
+**Scope:** G4 against llama.cpp `b10451` on the identical artifact, with the band
+ratified in advance and the oracle's own ability to run this model demonstrated
+first. Then, and only then, the speed axis — recorded as an open gap with a
+labeled secondary floor and no vLLM denominator (§3.6).
+**Exclusions:** no correctness claim that names vLLM as the runtime denominator.
+**Needs a GPU and the asset.**
+
+### 3.8 Risks and decisions taken in this section
+
+**D1 — the GGUF arm ships and the safetensors arms are refused by name.** This
+inverts `porting-a-model.md`'s usual polarity, which treats bf16 as the base arm
+and the quantized arms as the obligation. Here the bf16/fp8 checkpoint is 703.74
+GiB with no streaming loader and no MoE block-fp8 rung, and the GGUF arm is the
+only one that can be fed on this fleet. The refusal names the missing pieces so a
+reader meets it at load rather than discovering it.
+
+**D2 — `UD-IQ1_S` is the target arm.** Smallest at 201.83 GiB, needs exactly one
+keep-quant `vec_dot` (`IQ4_XS`), and its resident class is the same 14.5 GiB as
+every larger arm. `UD-IQ2_M` (222.19 GiB) is the fallback and needs the same
+single kernel, so W1 unlocks both. `UD-Q2_K_XL` additionally needs
+`VecDotIQ2_XSQ8_K`, and `UD-IQ1_M` is rejected outright because `IQ1_M` has no
+reader traits. None of the four is rejected on size.
+
+**D3 — the published GGUF's indexer schedule cannot be read out of the file, and
+the port must not try.** The file declares indexer weights on **all 79 blocks**
+while the checkpoint ships them on 22, so the conversion broadcast the shared
+layers' weights — ~770 MB of duplicated Q8_0 — and it does **not** write
+`glm-dsa.attention.indexer.types`, which `b10451`'s converter would have written
+(`conversion/glm.py:337-340`). llama.cpp survives this by falling back to a
+HARDCODED table: `is_pre_5_2 = n_ctx_train < 1048576` is false for this model
+(`max_position_embeddings` is exactly 1048576), so it uses
+`GLM_5_2_DEFAULT_INDEXER_TYPES` (`src/models/glm-dsa.cpp:6-27`), which §3.5.1
+verified is bit-identical to GLM-5.3's list. **We do not copy that table.** W2
+derives the schedule from `index_topk_freq` / `index_skip_topk_offset` the way
+vLLM does, reads `indexer.types` when present, and refuses when a file declares
+neither and the derivation is unavailable. A hardcoded 78-entry constant that
+happens to be right is the shape that silently becomes wrong on GLM-5.4.
+
+**D4 — the row moves to `SPIKE`, not to `READY` or `ACTIVE`.** Scoped in a
+committed spec, not implemented. It leaves `SPIKE` when W2 lands.
+
+**R1 — the slot cache has never run at this scale.** 1800 protected slices per
+step against a policy whose eviction is an O(resident) linear scan
+(`expert_slot_cache.cpp:26-44`) and whose fills are 1800 serialized blocking
+`pread`s. Nothing in the tree has run the `pread` path on a real checkpoint at
+all. W7 is where this becomes a number, and it may be the number that reopens the
+blocked verdict on throughput grounds rather than capacity grounds.
+
+**R2 — batch is the capacity axis, not context.** At concurrency `c` the distinct
+expert set per layer is bounded by `min(256, 8c)`, so the working set grows to the
+whole 187 GiB tower set well before `c = 32`. The row's viability claim is a
+`c = 1` claim and W8 must say so beside every number.
+
+**R3 — `dgx:gpu0`'s viability depends on it being a GB10.** The production
+predicate is `cpu || host_memory_is_device_addressable()`
+(`qwen3_5.cpp:6199`); a discrete CUDA part answers false and falls through to
+`KqResidentSlice`. Unified memory is what makes the host slot arena readable by
+the device without a device store, and `ENG-EXPERT-STREAM-DEVICE` W2 — the
+virtual `SlotForRead` — is what a discrete part would need. This row does not
+take that work; it records that the port is GB10-shaped until that lands.
+
+**R4 — the streamed and grouped MoE paths are mutually exclusive**
+(`qwen3_5.cpp:6307-6312`). Every speed number on this row is a
+grouped-MoE-disabled number, and that has to be said each time rather than once.
+
+### 3.9 Owed
+
+- **O1 — no end-to-end token gate against vLLM exists or can exist on this
+  fleet** (§3.6). Owed against a device that can hold 703.74 GiB, or against a
+  multi-device execution path this project does not have. Tracked by
+  [#2214](https://github.com/mudler/vllm.cpp/issues/2214). Discharged by either
+  of those two things and by nothing else.
+- **O2 — `IQ4_XS` has a decoder and no keep-quant `vec_dot`, so the target arm
+  loads by EXPANDING four expert towers from 6.375 GiB to 24.000 GiB and, worse,
+  drops out of the streaming lane entirely** (`gguf_device_fit.cpp:85-100` is
+  all-or-nothing across a model's `*_exps` tensors). Discharged by W1 landing
+  `VecDotIQ4_XSQ8_K`. Owned by `QUANT-GGUF-IQ4_XS`.
+- **O3 — `IQ2_XS` (id 17) is in the same state and `IQ1_M` (id 29) has no reader
+  traits at all.** `UD-Q2_K_XL` would expand 148 towers from 128.344 GiB to
+  888.000 GiB; `UD-IQ1_M` refuses at file open. Discharged by a
+  `VecDotIQ2_XSQ8_K` and an `IQ1_M` port, or by this row permanently recording
+  those two arms as unreachable. Nothing here needs either; they are named so a
+  later reader does not rediscover them as defects.
+- **O3b — `94de63ff5` left `IQ2_XS` and `IQ4_XS` decodable but not keep-quant,
+  for every row, not only this one.** That is a silent 3.4x memory multiplier on
+  any artifact carrying them, invisible to a token gate, and it is not this row's
+  record to repair. Named here because a reader who checks `gguf_dequant.cpp` and
+  stops will conclude both types are supported.
+- **O4 — the indexer KV side cache does not exist**, so sparse decode refuses any
+  resumed request (`dots3_note_device.cpp:1147-1180`). Discharged by W5, whose
+  work is `KV-DSV4-MULTICACHE`'s
+  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)).
+- **O5 — MTP is skipped, not implemented.** `num_nextn_predict_layers: 1` and
+  `index_share_for_mtp_iteration: true` are dropped through `allow_mtp_tail`.
+  There is no MTP drafter in the tree (`src/vllm/v1/spec_decode/` holds three
+  files, none of them one). Discharged by a drafter row that does not exist yet.
+- **O6 — sparse prefill does not exist** (§3.5.2 item 3). Discharged by W6.
+- **O7 — no artifact is staged and no `pread` streaming number exists on any real
+  checkpoint** (`expert-streaming.md` `## Owed`, verbatim: "The `pread` path has
+  never run on the model"). `dgx.casa`'s local disk was 184 GiB free at its last
+  measurement (§0.1 C3, 2026-07-21) against a 201.83 GiB arm, so W7 may be forced
+  onto CIFS. Discharged by W7 staging the shards, recording their sha256, and
+  reporting which filesystem served the `pread`s.
+- **O8 — the expert-streaming mechanism has no shared seam**, so it is reachable
+  from exactly one model TU (§3.2 gap 1). Discharged by W3.
+- **O9 — the resident 14.511 GiB is arithmetic from the shard headers, not a
+  measurement.** It excludes KV cache, activations, scratch pools and the CUDA
+  context, which is the same omission `expert-streaming.md` `## Owed` already
+  records for its own fit bound. Discharged by W7 reporting the measured resident
+  footprint beside this prediction.
+- **O10 — no speed axis has a denominator** (§3.6). vLLM cannot run the model, so
+  the only comparable is llama.cpp on the same artifact, a labeled secondary
+  floor. Open gap by construction, not a waiver.
+- **O11 — `docs/USAGE.md` carries no weights row for this model**, because
+  nothing is reachable yet. Owed in the same change that makes the capability
+  reachable, i.e. W7: file names, sizes, `unsloth/GLM-5.3-GGUF` at its exact
+  revision, per-shard sha256, and the refused arms named beside them.
+- **O12 — the `ENG-EXPERT-STREAM` row (`engine-matrix.md:117`) carries `-` in
+  both its "Our code" and "Our tests/evidence" columns**, and its row text
+  describes "fixed contiguous Marlin slots" when no Marlin code is on that path.
+  Not this row's record to fix, and named here because a reader who checks that
+  row before this section will conclude the capability does not exist.
+
+### 3.10 Now
+
+`SPIKE`, 2026-08-29. The row moves off `🚫 BLOCKED` because the blocker was
+computed in the wrong frame, and the correct frame is measured here: **97.49% of
+this model's parameters are routed experts, the resident class is 14.511 GiB in
+every published UD arm, and one decode step at `c = 1` touches 1800 expert slices
+= 11.21 GiB of uniform slots.** Resident plus a 4096-slot cache is 40.01 GiB
+against 119.631 GiB on `dgx:gpu0`. Nothing is implemented; `GlmMoeDsaForCausalLM`
+appears nowhere under `src/` or `include/`, and `ParseDeepseekV2Params` refuses
+this checkpoint at the `index_topk` tripwire before anything else runs.
+
+Three findings shape what happens next, and each corrects something this
+repository previously believed.
+
+**The port is smaller than §0.2 implies.** That section's verdict — "GB10 cannot
+run DSA end-to-end" — was a statement about vLLM's flashinfer sm120 path, and it
+is still true of that path. It is no longer a statement about ours: a
+device-native DSA lightning indexer now lives in the shared MLA block
+(`mla_attention.cpp:598-745`) with CPU and CUDA `DsaIndexerLogits` /
+`DsaTopkSelect`, reached in production by `Dots3NoteForCausalLM`. The MLA
+geometry this model needs already validates and already dispatches to native
+kernel instantiations. What is left is the indexer KV side cache (O4), sparse
+prefill (O6), and the schedule/reuse semantics.
+
+**The blocker that remains is one quantization kernel, it is named, and
+`origin/main` changed which half of it is missing while this spec was being
+written.** The census of `UD-IQ1_S` over its own shard headers says the arm is
+106 IQ1_S + 71 IQ3_XXS + 44 IQ2_XXS + 4 IQ4_XS + 3 K-quant expert tensors. At
+this branch's base `60a6dd97b`, `IQ4_XS` had no decoder and the arm refused
+loudly at load. At `94de63ff5`, landed 2026-08-29 for the sibling Flash row
+([#2245](https://github.com/mudler/vllm.cpp/issues/2245)), it has a decoder and
+still no keep-quant `vec_dot` — so the arm now LOADS, expands those four towers
+from 6.375 GiB to 24.000 GiB, and drops out of the expert-streaming lane
+altogether, because `gguf_device_fit.cpp:85-100` is all-or-nothing across a
+model's `*_exps` tensors. **The missing piece is `VecDotIQ4_XSQ8_K`, and the
+failure it prevents is now silent rather than loud.** That is the sharper form of
+this finding and it is why the census had to be redone against the merged tree
+rather than trusted from an hour earlier.
+
+**The gate is the honest cost.** vLLM at the pin implements this architecture and
+cannot run it on any device this project can reach, so no wave may promise a
+token-exact number against it. What W3 onward can prove is that a streamed slice
+and a resident tower produce identical logits, which is the row's actual novelty
+and needs no oracle at all.
+
+**Next action:** W1 and W2, both CPU, both independent. W1 belongs to
+`QUANT-GGUF-IQ4_XS` and unlocks two arms at once.

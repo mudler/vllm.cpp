@@ -103,6 +103,25 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kIQ3_XXS, DType::kQ8_K);
       return &t;
     }
+    // llama.cpp @ b10451 ggml-cpu.c:342-347 — IQ2_XS -> Q8_K activations. 82 of
+    // the staged `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` artifact's 1412
+    // tensors are IQ2_XS, 53.33 GiB on disk against 369.00 GiB as bf16: this
+    // row is what keeps them compressed. No `from_float` (upstream's row has
+    // none either — nothing quantizes an activation INTO a codebook).
+    case DType::kIQ2_XS: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ2_XS, DType::kQ8_K);
+      return &t;
+    }
+    // llama.cpp @ b10451 ggml-cpu.c:385-390 — IQ4_XS -> Q8_K activations. NOT
+    // the Q8_0 of its codebook sibling IQ4_NL (:379-384): IQ4_XS reuses
+    // `kvalues_iq4nl` but its block is a 256-element super-block, so it pairs
+    // with the 256-element activation encoding. Upstream's row does carry a
+    // `from_float` (`quantize_row_iq4_xs`); porting it would be dead code here
+    // for the same reason the k-quant encoders are unported.
+    case DType::kIQ4_XS: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ4_XS, DType::kQ8_K);
+      return &t;
+    }
     // ggml-cpu.c:352-357 — IQ2_S -> Q8_K activations. The UD-IQ2_M ffn_gate/up
     // routed-expert slabs; keep-quant against Q8_K (no from_float into it).
     case DType::kIQ2_S: {

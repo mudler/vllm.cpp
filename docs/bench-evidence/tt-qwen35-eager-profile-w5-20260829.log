@@ -1,0 +1,58 @@
+# Qwen3.5-0.8B on TT P150 AFTER W5 (#2244): eager decode A/B, same method as the W4 log
+# tree: row/BACKEND-TENSTORRENT-QWEN35 dc473a94c (W5 persistent-buffer staging) vs a456e6eaf (W4 state, main).
+#   Both arms built VLLM_CPP_TENSTORRENT=ON, vllm-cli --device auto (default); BEFORE arm from a scratch
+#   worktree at a456e6eaf, AFTER arm from the row build dir — same session, same box, interleaved arms.
+# single $HOME/gpu.lock hold, JIT-discard run per arm (discarded), greedy 3-token leg, prompt 11 tok,
+#   perf record -F 199 -g on every measured leg. 2026-08-29, thalia (local non-fleet P150), box otherwise idle.
+#
+# A/B (3 tokens, greedy; discard runs 18.843s / 18.787s):
+#   AFTER  dc473a94c: 19.232 s, 19.076 s   -> mean 19.154 s = 0.157 tok/s
+#   BEFORE a456e6eaf: 19.193 s, 19.168 s   -> mean 19.181 s = 0.156 tok/s
+#   delta: -0.14% — NOISE. THE WALL DID NOT MOVE.
+#
+# VERDICT: the W4 record's named hypothesis — "per-upload tt-metal-internal work inside
+#   from_span->to_device (buffer alloc + cluster queries + read_cq_host_ptr polling)" — is SPLIT by
+#   this trace. The buffer-alloc half is now PROVEN GONE and PROVEN IMMATERIAL:
+#     allocate_mesh_tensor_on_device_with_topology   0.02% of the AFTER flat profile
+#     MeshBuffer::create                             absent from the AFTER top; also absent from the
+#                                                    BEFORE top (the alloc was never a meaningful share —
+#                                                    the W4 hypothesis overstated it)
+#   and the route is provably ACTIVE in the production leg: both arms show the identical
+#   MeshCommandQueueBase::enqueue_write_shards_nolock / enqueue_write_with_core_filter /
+#   enqueue_write_tensor stack (AFTER reaches it via ttnn::copy_to_device on the persistent
+#   buffer; BEFORE via to_device on a fresh one — tt-metal routes both through the same CQ write
+#   machinery, which is why the win is zero: the machinery is the wall, not the allocation).
+#
+# WHERE THE WALL ACTUALLY IS (AFTER flat profile, --no-children):
+#   vt::cpu::Threadpool::PollForWork         14.29%  (W4 log: 14.32% — unchanged)
+#   tt::tt_metal::MetalContext::instance     11.14%  (W4 log: 9.11%) — context query per CQ op
+#   memcpy                                    6.23%  (W4 log: 6.79%)
+#   tt::umd::Cluster::get_chip                5.90%  (W4 log: 5.24%) — cluster query per CQ op
+#   tt::tt_metal::read_cq_host_ptr<true>      5.27% flat + 4.08/2.33/2.24/1.35 in callgraph sub-slices
+#                                            — CQ completion polling per CQ op
+#   Every one of these is paid PER CQ OPERATION, and the staging path issues one CQ write per
+#   staged tensor per step regardless of whether the destination buffer is fresh or persistent.
+#   Eliminating the allocation removed a cost that sampling could barely see.
+#
+# CORRECTNESS (same head, this session): e2e leg A eager 16/16 STRICT token-exact, leg B ambient
+#   16/16 STRICT token-exact, suite 45/45 cases / 5062 assertions exit 0; sacred pair byte-identical.
+#   Route counters asserted by the suite: uploads_persistent_allocs pins one allocation per
+#   (slot, geometry); uploads_persistent_bf16 + staged_persistent_bf16_bytes pin the in-place arms.
+#
+# NEXT TRACEABLE HYPOTHESIS (replaces the W4 one): the wall is per-CQ-operation, not per-upload-
+#   allocation. Two shapes attack it:
+#   (a) OUR side — lever 3 (batch per-layer staging), explicitly not taken in W4: one CQ write per
+#       step instead of one per staged tensor divides the per-op context/query/poll tax by the
+#       fan-in. This is now the cheapest next lever and it is inside our file set.
+#   (b) tt-metal side — cached context handles and amortized CQ completion polling inside
+#       MeshCommandQueueBase::enqueue_write_shards_nolock; upstream change, not our file set.
+#
+# WAVE RECORD NOTES: fresh reviewer PASS on dc473a94c (8 mutations incl. reachability; full gate
+#   45/45 · 5062 rerun on the immutable head). One LOW finding, comment-only, rides the next
+#   change to tenstorrent_device.h: the uploads_persistent_bf16 comment says "written IN PLACE
+#   via the mesh command queue" but the cold/allocating arm also increments it (code and test
+#   agree; only the comment is narrower). Awareness for W6+: staged device tensors alias the
+#   slot's persistent buffer, so a same-geometry restage mutates bytes under previously returned
+#   handles — unreachable through today's staging path (full overwrite before every return;
+#   weights stage once), but a multi-consumer stager must not assume W4's fresh-snapshot
+#   semantics.

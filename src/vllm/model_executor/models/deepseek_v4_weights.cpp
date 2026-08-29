@@ -538,7 +538,14 @@ class Exl3CarriedReader {
 
   // One block-wise FP8 linear: `<base>.weight` F8_E4M3 [N,K] beside
   // `<base>.scale` F8_E8M0 [ceil(N/bn), ceil(K/bk)]. Both are accounted.
-  std::vector<float> Fp8Block(const std::string& base, int64_t N, int64_t K) {
+  //
+  // W1d (#2186): the result is BF16, not f32. `DequantFp8BlockToF32` still decodes
+  // to f32 into a per-tensor scratch buffer -- that is the arithmetic upstream
+  // does, and narrowing its result is the LAST step rather than a different
+  // decode -- then the block is narrowed once into the destination. The scratch
+  // is one tensor wide and dies with the call, so peak residency is the bf16
+  // tower plus the single largest tensor's f32, not the f32 tower.
+  HostBf16 Fp8Block(const std::string& base, int64_t N, int64_t K) {
     const std::string wname = base + ".weight";
     const std::string sname = base + ".scale";
     const StTensor& w = Take(wname);
@@ -555,7 +562,7 @@ class Exl3CarriedReader {
     VT_CHECK(s.nbytes == static_cast<size_t>(nb) * static_cast<size_t>(kb),
              std::string("deepseek-v4 exl3 loader: ") + sname +
                  " must hold one UE8M0 byte per block");
-    std::vector<float> out(static_cast<size_t>(N) * static_cast<size_t>(K));
+    std::vector<float> f32(static_cast<size_t>(N) * static_cast<size_t>(K));
     // No alignment hazard on this path, and it is worth naming rather than
     // leaving a reader to re-derive it: `DequantFp8BlockToF32` reads BOTH mmap'd
     // buffers one `uint8_t` at a time, and `alignof(uint8_t) == 1`, so an
@@ -563,7 +570,9 @@ class Exl3CarriedReader {
     // block scale as a wider type acquires the hazard the BF16/I64 arms above
     // have and must go through `vt::LoadUnaligned` too.
     DequantFp8BlockToF32(w.data, s.data, N, K, recipe_.block_n, recipe_.block_k,
-                         out.data());
+                         f32.data());
+    HostBf16 out(f32.size());
+    for (size_t i = 0; i < f32.size(); ++i) out[i] = vt::F32ToBF16(f32[i]);
     return out;
   }
 
@@ -1800,12 +1809,16 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
 // ─── W2C memory accounting ───────────────────────────────────────────────────
 namespace {
 int64_t HostBytes(const DeepseekV4HostWeights& hw) {
-  auto vf = [](const std::vector<float>& v) {
-    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(float));
+  // W1d (#2186): `vf` reads its ELEMENT size rather than assuming `float`, because
+  // the carried tower is no longer one dtype -- the FP8-sourced half is `HostBf16`
+  // at two bytes and the rest stays f32 at four. This lambda IS the residency
+  // number the load refusal prices the artifact with, so an element size hardcoded
+  // here would report the pre-W1d total and refuse a tower that now fits.
+  auto vf = [](const auto& v) {
+    using E = typename std::decay_t<decltype(v)>::value_type;
+    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(E));
   };
-  auto vi = [](const std::vector<int32_t>& v) {
-    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(int32_t));
-  };
+  auto vi = vf;
   int64_t b = vf(hw.embed) + vf(hw.lm_head) + vf(hw.final_norm_weight) +
               vf(hw.hc_head_fn) + vf(hw.hc_head_base) + static_cast<int64_t>(sizeof(float));
   for (const DeepseekV4LayerHostWeights& hl : hw.layers) {

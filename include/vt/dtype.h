@@ -67,6 +67,25 @@ namespace vt {
 // `per_layer_token_embd.weight`. Both dot against Q8_0, like every other
 // 32-element block. IQ4_NL is Q4_0's shape with a NON-LINEAR 16-entry codebook
 // (`kValuesIq4nl`) in place of the `nibble - 8` affine step.
+// kIQ2_XS (ggml id 17, 2.3125 bpw) and kIQ4_XS (ggml id 23, 4.25 bpw) are the
+// last two encodings the staged `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` arm
+// needs. "UD-Q2_K_XL" names a target average, not a format: of that artifact's
+// 1412 tensors only TWO are Q2_K, while 82 are IQ2_XS and 3 are IQ4_XS, so the
+// loader stopped on `blk.3.ffn_gate_exps.weight` (#2240).
+//
+// IQ2_XS is the middle member of the IQ2 family and shares neither table nor
+// sign convention with its siblings: its 9-bit index addresses a 512-entry
+// `iq2xs_grid` (against 256 for IQ2_XXS and 1024 for IQ2_S) and the 7-bit
+// `ksigns_iq2xs` selector lives in the SAME u16 as that index. IQ4_XS is NOT a
+// codebook delta from IQ4_NL — it reuses `kvalues_iq4nl` byte for byte — and
+// differs only in the SUPER-BLOCK SCALE LAYOUT: 256-element blocks whose 6-bit
+// per-32 scale is spliced from a `scales_l` nibble and a `scales_h` bit pair and
+// then biased by -32, where IQ4_NL carries one unbiased f16 delta per 32.
+//
+// Both are `to_float`-only for now: neither has a keep-quant `vec_dot`, so
+// `HasQuantDotKernel` is FALSE and the GGUF loader EXPANDS them rather than
+// dotting the blocks in place. That is a memory cost this tree has deliberately
+// avoided for every other routed-expert encoding, and it is owed by #2240's row.
 enum class DType : uint8_t {
   kF32,
   kF16,
@@ -91,6 +110,8 @@ enum class DType : uint8_t {
   kIQ1_XXXS,
   kIQ4_NL,
   kMXFP4,
+  kIQ2_XS,
+  kIQ4_XS,
 };
 
 // Bytes per ELEMENT. Throws for block-quantized dtypes (they have no

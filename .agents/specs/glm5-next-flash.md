@@ -1525,7 +1525,17 @@ Debts this row carries, each visible rather than waived:
   `GLM5V = "glm5v"`, and `tools/mtmd/clip-impl.h:551` accepts it. A vision
   denominator is therefore obtainable by CONVERTING the checkpoint with that
   head, and unobtainable only by pointing it at the published mmproj.
-- **O5 — no i-quant arm is producible on this fleet** (R4).
+- **O5 — no i-quant arm is producible on this fleet** (R4). **PRODUCIBLE, not
+  readable — and the wording above misled a reader into concluding the whole
+  i-quant lane was absent.** O5 is about the CONVERTER, the write side: this
+  tree has no i-quant ENCODER and cannot emit one of these arms. The READ side
+  is far better covered and always was: `gguf_dequant.cpp` decodes IQ1_S,
+  IQ1_XXXS, IQ2_XXS, IQ2_S, IQ3_XXS and IQ4_NL, and
+  [#2240](https://github.com/mudler/vllm.cpp/issues/2240) added IQ2_XS (17) and
+  IQ4_XS (23), the last two the staged UD-Q2_K_XL arm needed. Every one of them
+  is gated byte-for-byte against the pinned llama.cpp. The clarification is
+  recorded here rather than in the report that noticed it, because the next
+  reader will land on this line and not on that report.
 - **O6 — speed.** No number on any axis, and no denominator exists.
 - **O7 — no artifact of this model exists.** W7a authored the converter and
   gated it on synthetic fixtures; it has never been run against the real
@@ -1535,8 +1545,12 @@ Debts this row carries, each visible rather than waived:
   every GPU gate on this row — W3, W5, W6 and W7b — has nothing to load, and
   §Evidence's sha256, conversion recipe and peak RSS are unpaid.
   W7b/[#2011](https://github.com/mudler/vllm.cpp/issues/2011) owns it.
-- **O8 — the Q3_K, Q4_K and Q5_K encoders are not ported** and the converter
-  refuses those arms by name. Only Q2_K, Q6_K and Q8_0 are ported from the
+- **O8 — the Q3_K, Q4_K and Q5_K ENCODERS are not ported** and the converter
+  refuses those arms by name. Write side, like O5: the matching DECODERS have
+  been present and gated since the k-quant port, so this entry never said
+  anything about loading a file that carries those encodings — and the staged
+  UD-Q2_K_XL arm carries 181 Q5_K, 117 Q6_K, 1 Q4_K and 1 Q3_K tensors, all of
+  which our reader sizes and our loader decodes today. Only Q2_K, Q6_K and Q8_0 are ported from the
   pinned llama.cpp reference and gated byte-for-byte against it. No arm this row
   needs uses them today; the §Hardware second-choice line that mentions Q5_K for
   the non-expert 3% would need this first.
@@ -1664,6 +1678,83 @@ Debts this row carries, each visible rather than waived:
   consulted, while at 576 both fire. Owed against the next
   `dgx:gpu0` lease on this row;
   [#2213](https://github.com/mudler/vllm.cpp/issues/2213) records it.
+
+- **O18 — the loader now stops on a per-layer CONFIG KEY instead of on a tensor
+  type, and the artifact still does not FIT.** With
+  [#2240](https://github.com/mudler/vllm.cpp/issues/2240)'s IQ2_XS and IQ4_XS
+  decoders in, `LoadedEngine::FromModelDir` opens all four shards of the staged
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` artifact, sizes all 1412
+  tensors, and runs on into config resolution, where it stops with
+  `glm5_next gguf: key glm5next.attention.head_count_kv is not an integer`. The
+  published artifact stores that key as a per-layer `array[i32]` of length 46,
+  and `Glm5NextHfConfigFromGguf` reads it as a scalar.
+  `glm5next.swiglu_clamp_exp` and `glm5next.swiglu_clamp_shexp` are per-layer
+  `array[f32]` of the same length, so the same shape is waiting twice more
+  directly behind it. Measured 2026-08-29 by driving the production loader
+  read-only, with the reader's `case 17:` deleted and restored to prove the
+  before/after on ONE binary: without it the same probe stops at
+  `tensor "blk.3.ffn_gate_exps.weight" has unknown ggml type id 17 in
+  ...-00002-of-00004.gguf`. Owned by the config/loader wave on this row;
+  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) records it.
+
+  **The array is 34 zeros and 12 ones.** Parsed 2026-08-29 from shard 1's KV
+  block. Key index 21, `glm5next.attention.head_count_kv: array[i32] len=46`:
+
+  ```text
+  [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+   0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1]
+  ```
+
+  The ones sit at indices 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43 **and 45**.
+  An earlier version of this entry said `0` on 35 KDA layers and `1` on 11
+  DSA/MLA layers. That count is wrong on both halves.
+
+  **The length is 46 because `block_count` counts the MTP block.** The same KV
+  block carries `glm5next.block_count = 46` and
+  `glm5next.nextn_predict_layers = 1`, and `config.json` declares
+  `num_hidden_layers = 45`. Entries 0 to 44 are the model's layers, and entry
+  45 is the multi-token-prediction block that §"The MTP block is in the
+  checkpoint" already records as **DSA/MLA, not KDA**. Over entries 0 to 44 the
+  stride holds exactly: `idx % 4 == 3` selects the 11 DSA layers and the other
+  34 are KDA. `test_glm5_next_scaffold.cpp` asserts that 34 / 11 split from
+  `config.json` and is CORRECT. Entry 45 is a `1` for a different reason, and
+  `45 % 4 == 1`.
+
+  **The checkpoint therefore holds 12 MLA-shaped blocks, not 11.** A consumer
+  that runs `idx % 4 == 3` over all 46 entries selects eleven, drops the MTP
+  block, and reports no error. Whoever sizes the MLA set for
+  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) or
+  [#2177](https://github.com/mudler/vllm.cpp/issues/2177) must READ the 46
+  values and treat entry 45 as the MTP block. Do not re-derive them from a
+  stride, and do not read `block_count` as a layer count. §W7a's tensor
+  inventory says the same thing from the other side: `index_kpool_compress_ape`
+  and `index_kpool_compress_gate` are present on 12 layers, the 11 DSA layers
+  plus the MTP block, read by HTTP RANGE from the safetensors index on
+  2026-08-26. Two independent sources, one count. The append-only index row for
+  #2243 quotes the superseded 35 / 11 and cannot be edited; that row names this
+  entry, so this entry is the corrected surface.
+
+  **Reaching config resolution is not the same as the model fitting.** Both new
+  types are DECODE-ONLY. Neither has a keep-quant `vec_dot`, so
+  `HasQuantDotKernel` is false and every GEMM weight of those two types expands
+  to bf16 at load. Measured from the staged artifact's own headers, all four
+  shards and all 1412 tensors: the file is **101.24 GiB on disk and 597.46 GiB
+  as bf16**, an expansion of 5.9x. The resident cost TODAY is **426.72 GiB**,
+  and `dgx:gpu0` has about 119.63 GiB, so it does not fit. A keep-quant
+  `vec_dot` for exactly these two types brings the resident cost to **101.14
+  GiB**, which fits with 18.49 GiB of headroom, and saves **325.58 GiB**. Every
+  other encoding in this file already keeps its quantization, IQ3_XXS
+  (`VecDotIQ3_XXSQ8_K`) included, so these two types are the whole gap.
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) owns that work, and
+  the `QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) carry it as `C` = `-`.
+
+  **O7 is stale beside it and is not corrected here.** "No artifact of this
+  model exists" was true when it was written; the UD-Q2_K_XL arm is now staged,
+  complete, and read end to end by our own reader. What remains true is the part
+  O7 is actually about — our converter has never been run — so the correction
+  belongs to W7b, which owns that sentence, rather than to a dequant change that
+  merely walked past it.
 
 ## Now
 

@@ -216,6 +216,62 @@ TEST_CASE("IQ/MXFP4 keep-quant block dtypes (geometry + vec_dot)") {
   }
 }
 
+// IQ2_XS (17) and IQ4_XS (23), the last two encodings the staged
+// `unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL` arm needed (#2240). They register
+// geometry and a `to_float` decode but NO keep-quant `vec_dot`, so they are a
+// THIRD contract, distinct from both groups above: `HasQuantDotKernel` is FALSE
+// and the loader expands them rather than dotting the blocks in place. Asserting
+// the FALSE is the point — it is what makes the memory cost visible instead of
+// letting a later reader assume every routed-expert encoding is kept compressed.
+TEST_CASE("IQ2_XS / IQ4_XS decode-only block dtypes (geometry, no vec_dot)") {
+  // Sizes written out from llama.cpp @ b10451 ggml-common.h, NOT copied from
+  // either table under test:
+  //   iq2_xs :388-392  f16 d + 256/8 u16 qs + 256/32 scales   = 2+64+8   = 74
+  //   iq4_xs :454-459  f16 d + u16 scales_h + 256/64 scales_l
+  //                    + 256/2 qs                             = 2+2+4+128 = 136
+  struct DecodeOnlyCase {
+    vt::DType dtype;
+    uint32_t ggml_type;
+    int64_t block_elems;
+    int64_t block_bytes;
+    const char* name;
+  };
+  const DecodeOnlyCase cases[] = {
+      {vt::DType::kIQ2_XS, 17, 256, 2 + 64 + 8, "iq2_xs"},
+      {vt::DType::kIQ4_XS, 23, 256, 2 + 2 + 4 + 128, "iq4_xs"},
+  };
+  for (const DecodeOnlyCase& c : cases) {
+    CAPTURE(c.name);
+    CHECK(vt::IsBlockQuant(c.dtype));
+    CHECK(vt::BlockElems(c.dtype) == c.block_elems);
+    CHECK(vt::BlockBytes(c.dtype) == c.block_bytes);
+    CHECK(vt::GgmlTypeId(c.dtype) == c.ggml_type);
+    CHECK(std::string(vt::Name(c.dtype)) == c.name);
+    CHECK_THROWS(vt::SizeOf(c.dtype));
+    CHECK(vt::RowSizeBytes(c.dtype, c.block_elems) ==
+          static_cast<size_t>(c.block_bytes));
+
+    // The GGUF reader must size them identically, or `GgufFile::Open` refuses
+    // the tensor before any decoder is consulted — which is exactly how the
+    // real 4-shard artifact failed on ggml type 17.
+    const vllm::GgmlTypeTraits& g = vllm::GgmlTraits(c.ggml_type);
+    CHECK(g.block_elems == c.block_elems);
+    CHECK(g.block_bytes == c.block_bytes);
+    vt::DType back = vt::DType::kF32;
+    REQUIRE(vt::BlockDTypeFromGgmlTypeId(c.ggml_type, &back));
+    CHECK(back == c.dtype);
+
+    // Decodes...
+    CHECK(vt::cpu::BlockToFloat(c.dtype) != nullptr);
+    // ...but has no keep-quant path yet: no traits row at all, so QuantTraits
+    // throws rather than handing back a half-populated one.
+    CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
+    CHECK_THROWS(vt::cpu::QuantTraits(c.dtype));
+    // Nothing quantizes an activation INTO them either.
+    CHECK(vt::cpu::BlockFromFloat(c.dtype) == nullptr);
+  }
+}
+
 TEST_CASE("elementwise dtypes are not block-quantized and reject block queries") {
   for (vt::DType d : {vt::DType::kF32, vt::DType::kF16, vt::DType::kBF16,
                       vt::DType::kI8, vt::DType::kI32, vt::DType::kI64}) {

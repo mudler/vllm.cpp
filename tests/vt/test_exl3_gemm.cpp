@@ -610,7 +610,7 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
 
     // The CPU arm is the reference: it decodes every width and every codebook,
     // and `test_exl3_real_decode` ties it to real exllamav3 data.
-    std::vector<uint16_t> a_had_h(a_h.size(), 0), a_had_d(a_h.size(), 0);
+    std::vector<uint16_t> a_had_h(a_h.size(), 0);
     std::vector<float> c_host(static_cast<size_t>(m * n), 0.0f);
     vt::Exl3GemmArgs args;
     args.bits = arm.bits;

@@ -61,7 +61,8 @@
 //     `exl3_gemm.cu:220-236` tries it.
 //   * W2c added the m<=8 GEMV (`exl3_gemv.cu` + `exl3_gemv_kernel.cuh`) and W2d
 //     the fused MoE mgemm (`exl3_moe.cu` + `exl3_moe_kernel.cuh`). Both are
-//     narrowed to bits == 3, codebook == 1 the way the regular kernel is, and
+//     narrowed to bits == 3, codebook == 1; the REGULAR kernel is no longer so
+//     narrowed (it carries (3,0), (3,1) and (6,0)), and
 //     the GEMV's fp16 accumulation gives it its OWN bound (tier 3c, spec
 //     `## W2cd design` W2c-3) rather than the regular kernel's tier 3.
 #include <cuda_fp16.h>
@@ -1131,7 +1132,10 @@ __global__ __launch_bounds__(kBaseThreads* TILESIZE_K / 16) void exl3_gemm_kerne
 // relative RMS) rather than reusing tier 3's 1.0e-3, which a correct kernel
 // here could not meet.
 //
-// NARROWED, exactly as the regular kernel is: bits == 3 and cb == 1 (mcg) only.
+// NARROWED to bits == 3 and cb == 1 (mcg) only, which is NO LONGER the regular
+// kernel's set: that one carries (3,0), (3,1) and (6,0). Upstream's own GEMV
+// list is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`, so cb 0 at 3 bpw is
+// excluded there too and its envelope refuses it before any kernel is chosen.
 // Upstream instantiates 2/3/4 bpw over three codebooks; every other width
 // DECLINES this arm and falls through to the shape table, which is upstream's
 // own failure mode (`exl3_gemv_select_kernel` returns nullptr and
@@ -1920,19 +1924,32 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
   return nullptr;
 }
 
-// The GEMV is the arm a BATCH-1 DECODE takes (`m <= 8`), so an artifact whose
-// (bits, cb) pair is missing here does not merely lose the fast path -- it loses
-// the device entirely, one projection at a time.
-// The GEMV arm set is NARROWER than the GEMM's on purpose: bits 3 only, both
-// codebooks. See the static_assert in `exl3_gemv_kernel` for why 6 is a port
-// rather than an instantiation. A null here is a DECLINE, and `TryGemv` turns
-// it into a fall-through rather than a failure.
-constexpr bool Exl3GemvArmInstantiated(int bits, int cb) {
-  return bits == 3 && (cb == 0 || cb == 1);
-}
+
+// THE GEMV ARM SET IS `(3, 1)` ONLY, AND CODEBOOK 0 IS EXCLUDED ON PURPOSE
+// rather than as an oversight. Upstream's own envelope refuses it:
+// `exl3_gemv.cu`'s try-launch carries `if (K != 4 && cb == 0) return false;`,
+// which `Exl3GemvHardEligible` transcribes at `exl3_policy.cpp:148`, and
+// upstream's `SEL_GRID` list instantiates `(4,0) (4,1) (4,2) (2,1) (2,2)
+// (3,1) (3,2)` — no `(3, 0)`. `tests/vt/test_exl3_gemv.cpp:130` already
+// asserted that refusal before this row existed.
+//
+// A first cut of W3 added `(3, 0)` here anyway, which is 16 kernels that can
+// never launch in a translation unit the fat build compiles for ten
+// architectures, with three comments claiming they were reachable. The claim
+// even reached a measurement: a `VT_EXL3_GEMV=1` vs `=0` A/B on a stock
+// codebook-0 checkpoint was reported as an 8% GEMV effect when neither arm
+// could take the GEMV at all — it ran the same path twice. A fresh review
+// caught it.
+//
+// SO A STOCK `turboderp/*-exl3` CHECKPOINT HAS NO GEMV FAST PATH, on this tree
+// or upstream's, and takes the regular shape table at `m == 1`. That is
+// upstream's behaviour, not a gap this row opened.
+//
+// A null here is a DECLINE, and `TryGemv` turns it into a fall-through rather
+// than a failure.
+constexpr bool Exl3GemvArmInstantiated(int bits, int cb) { return bits == 3 && cb == 1; }
 
 const void* GemvKernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem) {
-  if (bits == 3 && cb == 0) return GemvKernelForArm<3, 0>(c_fp32, mmode, cfg, smem);
   if (bits == 3 && cb == 1) return GemvKernelForArm<3, 1>(c_fp32, mmode, cfg, smem);
   return nullptr;
 }

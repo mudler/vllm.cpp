@@ -316,11 +316,27 @@ Stated here before code, per risk 1:
 
 - ~~**W1b: nothing constructs `Exl3LinearMethod` yet.**~~ **RETIRED**: the
   dense forward constructs it, and a real checkpoint generates through it.
-- **The device arm refuses codebook 0, which is the COMMON case.** `cuda_exl3.cu`
-  instantiates `kInstantiatedCb = 1`, so every stock `turboderp/*-exl3`
-  checkpoint refuses BY NAME on CUDA and runs on a CPU queue. That refusal is
-  correct and it is now the main thing between this row and a useful device
-  path: W3 owns it, together with the 6-bit head.
+- ~~**The device arm refuses codebook 0, which is the COMMON case.**~~ **RETIRED
+  by W3**: the arm now instantiates `(3,0)`, `(3,1)` and `(6,0)`, and
+  `kInstantiatedCb` no longer exists. What replaces it is narrower and real:
+  **a stock codebook-0 checkpoint has no GEMV fast path at `m == 1`**, on this
+  tree or upstream's — upstream's envelope refuses `bits != 4 && cb == 0` and
+  its instantiation list omits `(3,0)`. It takes the regular shape table
+  instead, which is upstream's own behaviour rather than a gap.
+- **Bits 6 has NO real-data anchor.** `tests/vt/exl3_real_corner.inc` pins
+  codebook 0 at 3 bits, so `test_exl3_real_decode` ties the 3-bit arm to real
+  exllamav3 output and the 6-bit `lm_head` to nothing but a device-vs-CPU
+  cross-check on RANDOM trellis bytes — where, as that fixture's own header
+  says, any codebook and any tile permutation is self-consistent. The two
+  readers being independent (`Exl3TileCodeword` against `dq4`) makes it a real
+  cross-check and not a tautology, but the only end-to-end evidence for the
+  6-bit head is a coherence read this spec already records as WEAK.
+- **The CPU threading recovers 4.8x of 20 cores, which is ~25% efficiency.**
+  Named as an open gap rather than a result, because AGENTS.md forbids
+  declaring a ceiling. One hypothesis worth testing first: `raw` is a plain
+  `std::vector<float>` and a 16-float stripe is exactly one 64-byte cache line,
+  so adjacent workers' stripes can straddle a line whenever the allocation is
+  not 64-byte aligned.
 - **q/k/v and gate/up run as separate GEMMs.** The bf16 and NVFP4 arms hold ONE
   merged operand; merging trellis operands joins on the output dim, which
   INTERLEAVES per input tile rather than row-stacking. It is valid for this

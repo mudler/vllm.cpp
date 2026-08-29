@@ -273,29 +273,12 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
 
   DBuf a_owned;
   vt::Tensor a = x;
-  bool own_a = false;
   if (x.dtype != vt::DType::kF16) {
     a_owned = DBuf(d, vt::DType::kF16, {M, K});
     vt::CastF16(d.q, a_owned.t(), x);
     a = a_owned.t();
-    own_a = true;
   }
-
-  // `a_had` MAY ALIAS `a` (`ops.h`: "scratch for the input transform; MAY alias
-  // `a`"), and aliasing is taken whenever this call OWNS the staging buffer.
-  // That is one fewer device allocation per linear, and a linear is the unit
-  // that repeats: a 16-layer model runs 113 of these per token.
-  //
-  // It is NOT taken when `x` is already fp16, because then `a` is the CALLER's
-  // activation and the transform writes over it. The same hidden state feeds
-  // all seven projections of a layer, so overwriting it would corrupt the six
-  // that follow -- a wrong answer, not a slow one.
-  DBuf a_had_owned;
-  vt::Tensor a_had = a;
-  if (!own_a) {
-    a_had_owned = DBuf(d, vt::DType::kF16, {M, K});
-    a_had = a_had_owned.t();
-  }
+  DBuf a_had(d, vt::DType::kF16, {M, K});
 
   vt::Tensor trellis = ResidentWeight(d, w.trellis);
   vt::Tensor suh = ResidentWeight(d, w.suh);
@@ -307,11 +290,11 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
 
   if (out_dtype == vt::DType::kF16) {
     DBuf c(d, vt::DType::kF16, {M, N});
-    vt::Exl3Gemm(d.q, c.t(), a, trellis, suh, svh, a_had, args);
+    vt::Exl3Gemm(d.q, c.t(), a, trellis, suh, svh, a_had.t(), args);
     return c;
   }
   DBuf c32(d, vt::DType::kF32, {M, N});
-  vt::Exl3Gemm(d.q, c32.t(), a, trellis, suh, svh, a_had, args);
+  vt::Exl3Gemm(d.q, c32.t(), a, trellis, suh, svh, a_had.t(), args);
   if (out_dtype == vt::DType::kF32) return c32;
   DBuf cbf(d, vt::DType::kBF16, {M, N});
   vt::CastBf16(d.q, cbf.t(), c32.t());

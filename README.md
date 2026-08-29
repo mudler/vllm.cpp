@@ -239,9 +239,11 @@ you get on top, most of it borrowed from whichever engine does it best:
 - **Tool calling and reasoning.** 38 tool-parser families (42 accepted names) and 12 reasoning
   parser names, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
-- **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
-  wired through the OpenAI server (content parts on `/v1/chat/completions`) into the engine's
-  registered forward; video and audio still run on the single-sequence path.
+- **Multimodal.** Image, video, and audio to text, token-correct against committed goldens on the
+  single-sequence drivers. The OpenAI server parses image content parts on `/v1/chat/completions`
+  and carries them into the engine, and that seam is gated. The GPU runner does not yet pass them
+  to the model forward, so no multimodal request is served end to end
+  ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)).
 - **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF
   F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K, and an FP8 W8A8 slice.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
@@ -371,7 +373,9 @@ All flags, including `--speculative-config`: [docs/USAGE.md](docs/USAGE.md).
 ### Multimodal INPUT and video GENERATION
 
 Multimodal INPUT goes through `/v1/chat/completions` content parts (`image_url`,
-`video_url`, `input_audio`). Video GENERATION:
+`video_url`, `input_audio`). The server parses those parts and carries them into the engine, but
+the GPU runner does not yet pass them to the model forward, so a multimodal request is not served
+end to end ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)). Video GENERATION:
 
 ```sh
 build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \

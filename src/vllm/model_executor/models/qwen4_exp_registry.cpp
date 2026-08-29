@@ -183,22 +183,29 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // Until #2031's W5b survey this message still owed the n-gram embedding to
   // W2, the gated residual to W3 and Qwen Sparse Attention to W4 — all three
   // landed waves. A refusal that names finished work sends the next reader to
-  // rebuild it. The five below are measured against this tree, each one
+  // rebuild it. The four below are measured against this tree, each one
   // independently sufficient to stop a token, and each is carried under
   // `## Owed` in the row spec.
+  //
+  // AND IT HAPPENED AGAIN, WHICH IS WHY THE COUNT MOVED. W5d-3 (#2249 item 2)
+  // gave the QSA layers' PAGED K/V a consumer, so the item that used to sit at
+  // (2) — "RunQwen4ExpQsaBlock takes contiguous caches while make_kv_cache
+  // publishes paged ones" — became false in the same commit that wrote this
+  // line. What survives of that axis is the INDEXER side cache, which was
+  // already its own item, so the two merged and five became four.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
            "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..5, "
-           "W5c-1); what the layer loop still lacks is (1) a standalone grouped "
-           "RMSNorm op — the PLE block needs three and the only grouped "
+           "W5c-1, W5d-3); what the layer loop still lacks is (1) a standalone "
+           "grouped RMSNorm op — the PLE block needs three and the only grouped "
            "reduction in this tree is fused inside vt::Qwen4ExpGatedResidual; "
-           "(2) a PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock "
-           "takes contiguous [max_kv, ...] caches while make_kv_cache publishes "
-           "paged ones; (3) reach for the indexer side cache, whose group-2 "
-           "block table GPUModelRunner::gather_block_table never gathers "
-           "(W5c-2); (4) an adapter from the stacked [E, I, H] qwen4_exp MoE "
-           "tensors onto MoeBlockWeights; and (5) a mRoPE cos/sin builder with "
-           "external linkage — qwen3_5.cpp's BuildMropeCosSinHost is static. "
+           "(2) reach for the indexer side cache — W5d-3 gave the QSA layers' "
+           "PAGED K/V a consumer (RunQwen4ExpQsaBlockPaged), but KV group 2 is "
+           "still contiguous and GPUModelRunner::gather_block_table never "
+           "gathers its block table (W5c-2); (3) an adapter from the stacked "
+           "[E, I, H] qwen4_exp MoE tensors onto MoeBlockWeights; and (4) a "
+           "mRoPE cos/sin builder with external linkage — qwen3_5.cpp's "
+           "BuildMropeCosSinHost is static. "
            "ModelRegistry::Forward additionally refuses any multi-cache "
            "topology by name, and this model publishes one. See "
            ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");

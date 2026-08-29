@@ -3251,6 +3251,17 @@ instead of naming W2, W3 and W4, which landed. **A wave dispatched to "write the
 layer loop" will not decode a token; it has five prerequisites, at least two of
 which (the grouped norm, the paged QSA arm) are op-sized waves of their own.**
 
+**AND THE COUNT IS NOW FOUR, BECAUSE W5d-3 IS THE WAVE THAT DISCHARGED ONE OF
+THEM.** The paragraph above is the W5b-era survey and its five-item list was true
+of `main` when it was written; this commit makes its second item false. The QSA
+layers' PAGED K/V has a consumer — `RunQwen4ExpQsaBlockPaged` over a
+`kv_block_table`/`kv_block_size` address mode — so what survives of that axis is
+the INDEXER side cache, which was already the third item. Five became four by
+MERGING two items, not by dropping one, and the production refusal in
+`qwen4_exp_registry.cpp` was corrected in this same change so that it does not
+send the next reader to rebuild `RunQwen4ExpQsaBlockPaged`. That is the identical
+failure the paragraph above records against W2, W3 and W4, one wave later.
+
 **What is owed, in order. THIS PARAGRAPH'S OPENING CLAIM WAS WRONG AND IS
 CORRECTED ABOVE: the op and seam work is NOT finished.** What follows is still
 the right list of what W5b-1..5 landed; what it got wrong is the inference that

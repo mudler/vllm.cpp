@@ -1318,4 +1318,34 @@ multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
 // route to the text-only path deliberately instead of discovering the refusal.
 bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 
+// Does a weight of `bytes` still fit as a TRUE DEVICE COPY, leaving the box
+// enough headroom to serve?
+//
+// WHY THIS EXISTS, MEASURED. The retag above costs real decode throughput on
+// GB10: interleaved A/B on `dgx:gpu0`, one boot, Qwen3.8-27B bf16 + DFlash2
+// k=7 at concurrency 1, alias ON vs alias OFF, four warm repeats each ->
+// 11.677 / 11.693 tok/s aliased against 14.288 / 14.337 staged, **+22.5%**,
+// the two arms agreeing to 0.14% and 0.34%. That is the same mechanism
+// `laguna.cpp:130-132` records and the same 20-30% band that took Laguna and
+// DeepSeek-V4 from behind their references to ahead of them.
+//
+// WHY IT IS NOT A BLANKET DEFAULT FLIP. This file also serves
+// `Qwen3.8-2.4T-A95B`, and #1299 measured that model exhausting a 119.631 GiB
+// box precisely because the CUDA arm paid for its weights TWICE — host bytes
+// plus a device copy. Staging is the right default for a model that fits and
+// is fatal for one that does not, so the question has to be asked of the BOX
+// rather than answered once for the file.
+//
+// The rule is deliberately conservative: stage only while the device still has
+// `VT_QWEN35_STAGE_MIN_FREE_FRAC` of its total memory free (default 0.55).
+// A 50 GiB model on a 119.6 GiB box starts at ~94% free and stages; the 2.4T
+// model is already past the floor when its first dense weight arrives, so it
+// never stages and keeps exactly the behaviour #1299 shipped.
+// The budget arithmetic, as a PURE function so it is gateable without a device.
+// `min_free_frac` of `total_bytes` must remain free AFTER this weight is staged.
+bool DeviceStagingFitsBudget(size_t free_bytes, size_t total_bytes, size_t bytes,
+                             double min_free_frac);
+
+bool DeviceStagingFits(vt::Backend& b, size_t bytes);
+
 }  // namespace vllm

@@ -1825,12 +1825,31 @@ W3 — `cpu_exl3_kernels.cpp`, `cuda_exl3.cu`, `test_exl3_gemm.cpp`,
 after either rebase, and that is stated rather than implied.
 
 **The review repair then MERGED `origin/main` into the branch** rather than
-rebasing a third time, because `main` had moved to `37fbccea8` and a branch behind
-its base makes the diff-scoped gates SKIP rather than pass, which had quietly
-voided the review's own `PREFLIGHT_RC=0`. The two commits merged in — `1bc16ca3c`
+rebasing a third time, and had to do it TWICE, because `main` moved again while
+the repair was running. `scripts/agent-preflight.sh` skips both trailer gates
+whenever `origin/main` is not an ancestor of HEAD — "this branch is behind it and
+the trailer gates did NOT run" — which had quietly voided the review's own
+`PREFLIGHT_RC=0`. The commits merged in are `1bc16ca3c`
 (`PERF-LAGUNA-GROUPED-GEMV` spec) and `37fbccea8` (`MODEL-TEXT-GLM-MOE-DSA` spec)
-— touch `.agents/claims/`, `.agents/issue-index.md`, `.agents/model-matrix.md`,
-two new spec files and `scripts/check-gate-commands.py`, and NO product code.
+first, then `fa9903b86` (`LTX25-ORACLE-ABSOLUTE`, #2210). Between them they touch
+`.agents/`, `docs/USAGE.md` and two `scripts/` files, and NO compiled input:
+`git diff --name-only` over the second delta returns nothing under `src/`,
+`include/`, `tests/` or `third_party/`, and `ninja` answered "no work to do"
+after it.
+
+**A false alarm is recorded here rather than buried, because it nearly landed a
+duplicate.** `origin/main` is a shared ref in a shared checkout, and another
+session fetched it mid-repair. Comparing the merged index against the ref AFTER
+that fetch read as though the first merge had silently dropped its tail row
+(#2220), and a commit was written to "restore" it. The merge had dropped nothing:
+the row arrived with `fa9903b86`, which had not been merged yet. Appending it by
+hand would have produced a SECOND copy of that row on `main` — the duplicate
+`check-agent-record.py` refuses and `check-issue-index-append-only.py` will not
+permit anyone to remove. The commit was dropped before it left the worktree.
+`check-issue-index-append-only.py` returned rc 0 on BOTH the pre- and
+post-"restore" heads, so the gate would not have caught it either way: the
+control that worked was diffing the row-number list against the ref and asking
+WHICH commit authored the row, not the checker.
 
 At the merged head, build rc 0 read before any test result, **FIVE of the seven
 suites below were re-run and all five match byte-for-byte**:

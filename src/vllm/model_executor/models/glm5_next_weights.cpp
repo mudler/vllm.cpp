@@ -155,6 +155,137 @@ bool HasLayerTensor(const GgufFile& g, int64_t layer, const char* suffix) {
   return false;
 }
 
+// The FIRST dimension of a per-layer tensor, when the file carries it. `shape`
+// is the on-disk ggml dims REVERSED into row-major order; every tensor asked
+// about here is 1-D, so the reversal cannot change the answer.
+bool LayerTensorDim0(const GgufFile& g, int64_t layer, const char* suffix,
+                     int64_t* out) {
+  const std::string name = "blk." + std::to_string(layer) + "." + suffix;
+  for (const GgufTensorInfo& t : g.Tensors()) {
+    if (t.name != name) continue;
+    if (t.shape.empty()) return false;
+    *out = t.shape[0];
+    return true;
+  }
+  return false;
+}
+
+// THE NUMBER OF KDA HEADS, which a file can state in four places and the only
+// published artifact of this model states in NONE of the first three.
+//
+// `%s.attention.linear_head_count` is OURS. llama.cpp spells it nowhere at the
+// pinned release — `git grep linear_head_count b10451` is rc=1, tree-wide — so
+// reading it with `ReqInt` refused the published
+// `unsloth/GLM-5.3-Flash-GGUF` artifact on a key no llama.cpp writer emits
+// (#2268). llama.cpp's own `glm5next` branch writes the same number under the
+// `ssm.*` names its Kimi-Linear parent uses:
+//
+//   :78  add_ssm_inner_size(linear["num_heads"] * linear["head_dim"])
+//   :79  add_ssm_state_size(linear["head_dim"])
+//   :80  add_ssm_group_count(linear["num_heads"])
+//     -- conversion/glm5next.py at ggml-org/llama.cpp refs/pull/27752/head
+//        8a8d0bcc4, the revision `.agents/oracles/llama-cpp-glm5next.md` pins
+//
+// and the published file carries none of those three either: its 72 keys hold
+// `kda.head_dim = 128` and `ssm.conv_kernel = 4` and no head count at all.
+//
+// So the last resort is the MODEL, which states the width whether or not the
+// metadata does. `blk.<L>.ssm_a` is the per-head decay and is 1-D of exactly
+// `num_heads` entries — `A_log` has that shape in the checkpoint, the reference
+// converter only negates and exponentiates it (`conversion/glm5next.py:97-98`),
+// and `scripts/convert-glm5-next-gguf.py:680` maps `self_attn.A_log -> ssm_a`
+// unchanged. On the published artifact `blk.0.ssm_a` is `[64]` beside
+// `kda.head_dim = 128`, and `blk.0.attn_q.weight` is `[4096, 8192] = 64 * 128`,
+// so the file is self-consistent about a number it never names.
+//
+// It is DERIVED, never DEFAULTED, and this is where we are deliberately
+// STRICTER than the secondary oracle. llama.cpp does not read a head count for
+// this architecture at all: it sizes the recurrent state with `n_head() *
+// n_embd_head_kda` and says why in the file — "note: n_embd_r()/n_embd_s()
+// size the recurrent state with n_head()*n_embd_head_kda, which works only
+// because linear_attn_config.num_heads == num_attention_heads"
+// (`src/models/glm5next.cpp:121-122` at 8a8d0bcc4). That invariant holds on
+// this checkpoint — `attention.head_count` is 64 and `blk.0.ssm_a` is `[64]` —
+// and it is a coincidence of the checkpoint rather than a property of the
+// architecture, which is the exact shape of the defect #2177 already cost this
+// row: a value that is right here and silently wrong on the next file, with no
+// gate able to see it. So the count is read from what the file STATES, and a
+// file that states it nowhere is refused by name, listing every place that
+// would have answered.
+int64_t KdaHeadCount(const GgufFile& g, const std::string& p,
+                     const std::vector<std::string>& layer_types,
+                     int64_t kda_head_dim) {
+  int64_t from_meta = 0;
+  std::string meta_key;
+  if (const GgufValue* v = g.FindKv(p + "attention.linear_head_count")) {
+    meta_key = p + "attention.linear_head_count";
+    from_meta = KvInt(*v, meta_key);
+  } else if (const GgufValue* v = g.FindKv(p + "ssm.group_count")) {
+    meta_key = p + "ssm.group_count";
+    from_meta = KvInt(*v, meta_key);
+  } else if (const GgufValue* v = g.FindKv(p + "ssm.inner_size")) {
+    const std::string inner_key = p + "ssm.inner_size";
+    const int64_t inner = KvInt(*v, inner_key);
+    VT_CHECK(inner > 0 && inner % kda_head_dim == 0,
+             "glm5_next gguf: " + inner_key + " is " + std::to_string(inner) +
+                 " and " + p + "kda.head_dim is " +
+                 std::to_string(kda_head_dim) +
+                 "; llama.cpp writes the inner size as `num_heads * head_dim` "
+                 "(conversion/glm5next.py:78), so the one must divide the "
+                 "other");
+    meta_key = inner_key + " / " + p + "kda.head_dim";
+    from_meta = inner / kda_head_dim;
+  }
+
+  // The first `linear_attention` block, which is the one whose `ssm_a` states
+  // the count. Every KDA layer of this model carries the same width, so one is
+  // enough and the schedule says which one to look at.
+  int64_t from_tensor = 0;
+  bool have_tensor = false;
+  for (size_t il = 0; il < layer_types.size(); ++il) {
+    if (layer_types[il] != "linear_attention") continue;
+    have_tensor =
+        LayerTensorDim0(g, static_cast<int64_t>(il), "ssm_a", &from_tensor);
+    break;
+  }
+
+  if (!meta_key.empty()) {
+    VT_CHECK(from_meta > 0,
+             "glm5_next gguf: " + meta_key + " is " +
+                 std::to_string(from_meta) +
+                 " and a linear-attention head count must be positive");
+    // A CONTRADICTION check, not a completeness one. Absence proves nothing —
+    // a metadata-only shard carries no `ssm_a` at all — but a file whose
+    // metadata and whose weights state different KDA widths would build a
+    // stack whose per-head reshape is wrong on every linear layer, and a token
+    // gate would only see fluent garbage.
+    VT_CHECK(!have_tensor || from_meta == from_tensor,
+             "glm5_next gguf: " + meta_key + " states " +
+                 std::to_string(from_meta) +
+                 " linear-attention heads but the first `linear_attention` "
+                 "block's `ssm_a` has " +
+                 std::to_string(from_tensor) +
+                 " entries, which is one entry per KDA head; the file states "
+                 "this model's linear width twice and the two disagree");
+    return from_meta;
+  }
+
+  VT_CHECK(have_tensor,
+           "glm5_next gguf: this file states no linear-attention head count. "
+           "It is not defaultable: it sets the per-head reshape of every KDA "
+           "layer. Write one of " +
+               p + "attention.linear_head_count, " + p + "ssm.group_count or " +
+               p +
+               "ssm.inner_size (`num_heads * head_dim`), or carry the "
+               "`blk.<L>.ssm_a` tensor of a `linear_attention` block, whose "
+               "length is the head count");
+  VT_CHECK(from_tensor > 0,
+           "glm5_next gguf: the first `linear_attention` block's `ssm_a` has " +
+               std::to_string(from_tensor) +
+               " entries and a linear-attention head count must be positive");
+  return from_tensor;
+}
+
 }  // namespace
 
 bool IsGlm5NextGguf(const GgufFile& gguf) {
@@ -463,22 +594,84 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   }
   c.torch_dtype = "bfloat16";
 
-  // MLA. `key_length_mla` is `qk_head_dim` and `key_length` is
-  // `qk_nope_head_dim`, so the rope slice is their DIFFERENCE — derived, not
-  // transcribed, and then cross-checked against the `rope.dimension_count` the
-  // converter writes independently. A file where the two disagree is a file
-  // one of whose two descriptions of the same geometry is wrong, and on a NoPE
-  // model that difference is exactly the thing a token gate could not see.
+  // MLA, in llama.cpp's OWN vocabulary and not in a private one.
+  //
+  // `%s.attention.key_length` is NOT this model's `qk_nope_head_dim`. For an
+  // MLA model llama.cpp caches the LATENT, so the key it writes under that
+  // name is the width of one cached K row — the latent plus the rope slice —
+  // and the per-head query geometry is spelled by the two `_mla` keys beside
+  // it. `b10451:conversion/deepseek.py`, `DeepseekModel.set_gguf_parameters`:
+  //
+  //   :345  add_key_length(kv_lora_rank + qk_rope_head_dim)
+  //   :346  add_value_length(kv_lora_rank)
+  //   :347  add_key_length_mla(qk_nope_head_dim + qk_rope_head_dim)
+  //   :348  add_value_length_mla(v_head_dim)
+  //   :369  add_rope_dimension_count(qk_rope_head_dim)
+  //
+  // On GLM-5.3-Flash — `kv_lora_rank 512`, `qk_nope_head_dim 256`,
+  // `qk_rope_head_dim 0`, `v_head_dim 256` — that is `key_length 512`,
+  // `value_length 512`, `key_length_mla 256`, `value_length_mla 256`, which is
+  // the published `unsloth/GLM-5.3-Flash-GGUF` artifact's KV block exactly.
+  //
+  // This reader used to read `key_length` as `qk_nope_head_dim`, which is our
+  // own converter's former spelling and nobody else's, so the published file
+  // derived `256 - 512 = -256` as its rotary width and was refused as
+  // self-contradictory (#2268). `scripts/convert-glm5-next-gguf.py` moved onto
+  // llama.cpp's meaning in the same change, so ONE convention is written and
+  // ONE is read, and a file in the old private spelling is REFUSED by the
+  // `key_length < kv_lora_rank` check below rather than silently misread.
+  const int64_t kv_lora_rank = ReqInt(gguf, p + "attention.kv_lora_rank");
   const int64_t qk_head_dim = ReqInt(gguf, p + "attention.key_length_mla");
-  const int64_t qk_nope_head_dim = ReqInt(gguf, p + "attention.key_length");
-  const int64_t qk_rope_head_dim = qk_head_dim - qk_nope_head_dim;
+  const int64_t key_length = ReqInt(gguf, p + "attention.key_length");
+  const int64_t qk_rope_head_dim = key_length - kv_lora_rank;
+  VT_CHECK(qk_rope_head_dim >= 0,
+           "glm5_next gguf: attention.key_length is " +
+               std::to_string(key_length) + " and attention.kv_lora_rank is " +
+               std::to_string(kv_lora_rank) +
+               ", so the rotary width would be " +
+               std::to_string(qk_rope_head_dim) +
+               "; llama.cpp writes attention.key_length as `kv_lora_rank + "
+               "qk_rope_head_dim` (b10451:conversion/deepseek.py:345), which is "
+               "never below kv_lora_rank, so this file spells key_length by "
+               "some other convention");
+  // The rotary width is stated TWICE by the same producer — once as
+  // `key_length - kv_lora_rank` (deepseek.py:345) and once as
+  // `rope.dimension_count` (deepseek.py:369) — so a disagreement between them
+  // is a file one of whose two descriptions of the same geometry is wrong. On
+  // a NoPE model that difference is exactly the thing a token gate could not
+  // see, so it is a hard refusal rather than a first-wins.
   const int64_t rope_dim = OptInt(gguf, p + "rope.dimension_count", 0);
   VT_CHECK(qk_rope_head_dim == rope_dim,
-           "glm5_next gguf: attention.key_length_mla - attention.key_length is " +
+           "glm5_next gguf: attention.key_length - attention.kv_lora_rank is " +
                std::to_string(qk_rope_head_dim) +
                " but rope.dimension_count is " + std::to_string(rope_dim) +
                "; the file states this model's rotary width twice and the two "
                "disagree");
+  const int64_t qk_nope_head_dim = qk_head_dim - qk_rope_head_dim;
+  VT_CHECK(qk_nope_head_dim > 0,
+           "glm5_next gguf: attention.key_length_mla is " +
+               std::to_string(qk_head_dim) + " and the rotary width is " +
+               std::to_string(qk_rope_head_dim) +
+               ", so qk_nope_head_dim would be " +
+               std::to_string(qk_nope_head_dim) +
+               "; llama.cpp writes attention.key_length_mla as "
+               "`qk_nope_head_dim + qk_rope_head_dim` "
+               "(b10451:conversion/deepseek.py:347), and a non-positive "
+               "no-rope width is not a geometry this model has");
+  // `value_length` is the THIRD statement of the same latent, and llama.cpp
+  // writes it as `kv_lora_rank` (deepseek.py:346). Checked when present rather
+  // than required, because a file may legitimately omit it — but a file that
+  // states it and disagrees with its own `kv_lora_rank` is contradicting
+  // itself about the size of the cache.
+  const int64_t value_length =
+      OptInt(gguf, p + "attention.value_length", kv_lora_rank);
+  VT_CHECK(value_length == kv_lora_rank,
+           "glm5_next gguf: attention.value_length is " +
+               std::to_string(value_length) + " but attention.kv_lora_rank is " +
+               std::to_string(kv_lora_rank) +
+               "; llama.cpp writes attention.value_length as the latent rank "
+               "itself (b10451:conversion/deepseek.py:346), so the file states "
+               "the latent width twice and the two disagree");
   // The one field `head_dim` is NOT: upstream forces `head_dim =
   // qk_rope_head_dim`, so it is 0 on this model. Setting the shared reader's
   // `head_dim` from `hidden_size / num_attention_heads` instead would give 64,
@@ -614,8 +807,22 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   c.intermediate_size = ReqInt(gguf, p + "feed_forward_length");
 
   // KDA, under llama.cpp's `kda.*` / `ssm.*` namespaces.
-  const int64_t kda_head_dim = ReqInt(gguf, p + "kda.head_dim");
-  const int64_t kda_num_heads = ReqInt(gguf, p + "attention.linear_head_count");
+  // `kda.head_dim`, with llama.cpp's OWN fallback. `src/models/glm5next.cpp`
+  // at the pinned PR head 8a8d0bcc4 reads it optionally and falls back to
+  // `ssm.state_size` — ":110  if (!ml.get_key(LLM_KV_KDA_HEAD_DIM,
+  // hparams.n_embd_head_kda, false)) { :112 ml.get_key(LLM_KV_SSM_STATE_SIZE,
+  // hparams.n_embd_head_kda); }", above the comment "older GGUFs store the KDA
+  // head dim as ssm.state_size". That revision's converter writes only
+  // `ssm.state_size` (`conversion/glm5next.py:79`), so the fallback is the
+  // live arm for a file it produced, not a legacy path.
+  int64_t kda_head_dim = OptInt(gguf, p + "kda.head_dim", 0);
+  if (kda_head_dim == 0) kda_head_dim = ReqInt(gguf, p + "ssm.state_size");
+  VT_CHECK(kda_head_dim > 0,
+           "glm5_next gguf: the KDA head width is " +
+               std::to_string(kda_head_dim) +
+               " and a linear-attention head width must be positive");
+  const int64_t kda_num_heads =
+      KdaHeadCount(gguf, p, layer_types, kda_head_dim);
   const int64_t kda_conv = ReqInt(gguf, p + "ssm.conv_kernel");
   c.linear_num_key_heads = kda_num_heads;
   c.linear_num_value_heads = kda_num_heads;
@@ -659,7 +866,7 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
 
   // MLA.
   text["q_lora_rank"] = ReqInt(gguf, p + "attention.q_lora_rank");
-  text["kv_lora_rank"] = ReqInt(gguf, p + "attention.kv_lora_rank");
+  text["kv_lora_rank"] = kv_lora_rank;
   text["qk_nope_head_dim"] = qk_nope_head_dim;
   text["qk_rope_head_dim"] = qk_rope_head_dim;
   text["v_head_dim"] = ReqInt(gguf, p + "attention.value_length_mla");

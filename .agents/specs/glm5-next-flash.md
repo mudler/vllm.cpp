@@ -1765,7 +1765,8 @@ Debts this row carries, each visible rather than waived:
   a `ReqInt` here, appears in none of the file's 72 keys, and llama.cpp spells it
   nowhere. Both are one defect and both change the WRITE side, so they are filed
   as [#2268](https://github.com/mudler/vllm.cpp/issues/2268) rather than folded
-  into a config-array fix, and this row owns them.
+  into a config-array fix, and this row owns them. **O20 DISCHARGES both**, and
+  carries the stopping point that replaced this one.
 
   **The array is 34 zeros and 12 ones.** Parsed 2026-08-29 from shard 1's KV
   block. Key index 21, `glm5next.attention.head_count_kv: array[i32] len=46`:
@@ -1825,6 +1826,144 @@ Debts this row carries, each visible rather than waived:
   O7 is actually about — our converter has never been run — so the correction
   belongs to W7b, which owns that sentence, rather than to a dequant change that
   merely walked past it.
+
+- **O20 — the MLA key CONVENTION and the KDA head count are DISCHARGED, and the
+  loader now stops in the TOKENIZER.** [#2268](https://github.com/mudler/vllm.cpp/issues/2268).
+
+  **The number is O20 and not O19 deliberately.** `origin/main` at
+  `c3522bc7d` carries O1 to O18; [#2256](https://github.com/mudler/vllm.cpp/issues/2256)
+  adds an O19 on a branch that has not merged. Two branches that each append an
+  `O19` produce a duplicate rather than a conflict, so this entry skips the
+  number rather than racing for it. The gap is deliberate and is not a missing
+  entry.
+
+  **The delta, and it is a delta in MEANING and not in spelling.**
+  `%s.attention.key_length` is a name llama.cpp already owns, and for an MLA
+  model it names the width of one CACHED K row — the latent plus the rope slice
+  — because llama.cpp caches the latent. The per-head query geometry is spelled
+  by the two `_mla` keys beside it. `b10451:conversion/deepseek.py`,
+  `DeepseekModel.set_gguf_parameters`:
+
+  ```python
+  :345  self.gguf_writer.add_key_length(kv_lora_rank + hparams["qk_rope_head_dim"])
+  :346  self.gguf_writer.add_value_length(kv_lora_rank)
+  :347  self.gguf_writer.add_key_length_mla(hparams["qk_nope_head_dim"] + hparams["qk_rope_head_dim"])
+  :348  self.gguf_writer.add_value_length_mla(hparams["v_head_dim"])
+  :369  self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+  ```
+
+  | key | llama.cpp's meaning | ours, BEFORE | ours, AFTER |
+  |---|---|---|---|
+  | `attention.key_length` | `kv_lora_rank + qk_rope_head_dim` = 512 | `qk_nope_head_dim` = 256 | llama.cpp's |
+  | `attention.value_length` | `kv_lora_rank` = 512 | `v_head_dim` = 256 | llama.cpp's |
+  | `attention.key_length_mla` | `qk_nope_head_dim + qk_rope_head_dim` = 256 | same | same |
+  | `attention.value_length_mla` | `v_head_dim` = 256 | same | same |
+  | `rope.dimension_count` | `qk_rope_head_dim` = 0 | same | same |
+  | `attention.linear_head_count` | **spelled nowhere** | KDA `num_heads` | kept, and no longer required |
+
+  The two `_mla` keys already agreed, which is why the defect presented as an
+  arithmetic absurdity rather than as a missing key: the reader subtracted a
+  cache width from a query width and got `256 - 512 = -256` for a rotary slice
+  the same file states as `0`.
+
+  **BOTH SIDES MOVED, and the reader could not move alone.** llama.cpp writes
+  `rope.dimension_count` from `qk_rope_head_dim` (`deepseek.py:369`), so the
+  cross-check that survives is `key_length - kv_lora_rank == rope.dimension_count`
+  — and our former output fails it by construction (`256 - 512 != 0`). Putting
+  the reader on llama.cpp's meaning therefore REQUIRED moving
+  `scripts/convert-glm5-next-gguf.py` in the same change, which is exactly why
+  #2268 was filed as a row-and-spec decision rather than folded into #2243.
+  O7 records that this converter has never been run against the checkpoint, so
+  no artifact of ours is invalidated by the move, and a file in the former
+  private spelling is REFUSED by name — `key_length < kv_lora_rank` is
+  impossible under llama.cpp's meaning — rather than read under either
+  convention. **The check was not widened.** Four refusals stand where one did:
+  a `key_length` below `kv_lora_rank`, a rotary width the file states twice and
+  disagrees with itself about, a `key_length_mla` that leaves no room for a
+  no-rope slice, and a `value_length` that is not the latent rank.
+
+  **THE KDA HEAD COUNT IS DERIVED, and this port is deliberately STRICTER than
+  the oracle.** `attention.linear_head_count` is ours: `git grep
+  linear_head_count b10451` is rc=1 tree-wide. llama.cpp's `glm5next` branch
+  writes the same number through its Kimi-Linear parent's `ssm.*` names —
+  `add_ssm_inner_size(num_heads * head_dim)`, `add_ssm_state_size(head_dim)`,
+  `add_ssm_group_count(num_heads)`, `conversion/glm5next.py:78-80` at
+  `refs/pull/27752/head` `8a8d0bcc4` — and the published artifact carries NONE
+  of those either. So the reader reads whichever of four places the file states
+  it in: `attention.linear_head_count`, `ssm.group_count`, `ssm.inner_size /
+  kda.head_dim`, and finally the `blk.<L>.ssm_a` tensor of the first
+  `linear_attention` block, which is one entry per KDA head. On the published
+  artifact that is `[64]`, beside `kda.head_dim = 128` and a
+  `blk.0.attn_q.weight` of `[4096, 8192] = 64 * 128` — the file is
+  self-consistent about a number it never names. Wherever `ssm_a` is present it
+  cross-checks whatever rung answered, and a file that states the count nowhere
+  and carries no `ssm_a` is refused by name, listing every place that would have
+  answered.
+
+  llama.cpp does not do this. It reads no head count for this architecture at
+  all and sizes the recurrent state with `n_head() * n_embd_head_kda`, saying
+  why in the file: *"note: n_embd_r()/n_embd_s() size the recurrent state with
+  n_head()\*n_embd_head_kda, which works only because
+  linear_attn_config.num_heads == num_attention_heads"*
+  (`src/models/glm5next.cpp:121-122` at `8a8d0bcc4`). That invariant HOLDS on
+  this checkpoint — `attention.head_count` is 64 and `ssm_a` is `[64]` — and it
+  is a property of the checkpoint rather than of the architecture. It is the
+  exact shape of the defect [#2177](https://github.com/mudler/vllm.cpp/issues/2177)
+  already cost this row: a value that is right here and silently wrong on the
+  next file, with no gate able to see it. The divergence is recorded here rather
+  than left to be rediscovered.
+
+  `kda.head_dim` gained llama.cpp's own fallback in the same pass:
+  `src/models/glm5next.cpp:110-113` reads it optionally and falls back to
+  `ssm.state_size`, and the pinned revision's converter writes only
+  `ssm.state_size` (`conversion/glm5next.py:79`), so that arm is live for a file
+  that branch produced rather than a legacy path.
+
+  **THE STAGED ARTIFACT WAS NOT PRODUCED BY THE PINNED ORACLE REVISION.**
+  Measured, not inferred: at `8a8d0bcc4` the `glm5next` converter writes
+  `ssm.inner_size`, `ssm.state_size` and `ssm.group_count` and calls
+  `add_kda_head_dim` NOWHERE (`git grep add_kda_head_dim` at that object returns
+  only `conversion/bailingmoe3.py:60`, `conversion/kimi_k3.py:217` and
+  `conversion/kimi_linear.py:103`, none of which is `Glm5NextModel`'s chain).
+  The staged artifact carries the opposite set: `kda.head_dim = 128`,
+  `ssm.conv_kernel = 4`, and none of the `ssm.inner_size` / `ssm.state_size` /
+  `ssm.group_count` trio. So the two describe different revisions of the same
+  pull request, and
+  [`../oracles/llama-cpp-glm5next.md`](../oracles/llama-cpp-glm5next.md)'s pin
+  does not describe the file this row gates against. That is why the reader
+  accepts BOTH sets rather than the pinned one, and it is a caveat on any future
+  llama.cpp denominator taken on this artifact at that pin.
+
+  **THE NEW STOPPING POINT, measured 2026-08-29 on one tree and one build
+  directory**, three legs of one probe object driven through
+  `LoadedEngine::FromModelDir` on `device = kCPU` at
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf`,
+  headers only, no tensor materialised:
+
+  ```text
+  baseline reader      : vt: glm5_next gguf: attention.key_length_mla - attention.key_length
+                         is -256 but rope.dimension_count is 0
+  MLA convention only  : vt: glm5_next gguf: missing metadata key glm5next.attention.linear_head_count
+  both                 : tokenizer: unsupported tokenizer.ggml.pre "glm4"
+  ```
+
+  The middle leg is why both keys had to move together: fixing the convention
+  alone moves the refusal exactly one key along, which is what `head_count_kv`
+  did before `swiglu_clamp_exp`. The third leg is past config resolution
+  entirely — `Glm5NextHfConfigFromGguf` returns, and the refusal comes from
+  `src/vllm/tokenizer/tokenizer.cpp::FromGguf`, which maps seven pre names and
+  not `glm4`. **That is the next milestone and it is
+  [#2277](https://github.com/mudler/vllm.cpp/issues/2277)**, which also records
+  the one thing the mapping is not free on: `b10451:src/llama-vocab.cpp:2259`
+  sets `special_bos_id = LLAMA_TOKEN_NULL` for this pre-type while the artifact
+  states `tokenizer.ggml.bos_token_id = 154822`, so a port that reads the id and
+  prepends it emits a token no reference run emits.
+
+  **Still not loaded.** Reaching the tokenizer is not fitting: O10 (the weight
+  loader refuses by name), O18's 426.72 GiB resident cost and
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247)'s keep-quant
+  `vec_dot` all stand unchanged. No token was produced and none is claimed.
+
 
 ## Now
 

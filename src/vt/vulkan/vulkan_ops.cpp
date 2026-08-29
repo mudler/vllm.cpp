@@ -41,6 +41,7 @@
 #include "vulkan_buffers.h"
 #include "vulkan_context.h"
 #include "vt/ops.h"
+#include "vt/quant.h"
 
 namespace vt::vulkan {
 namespace {
@@ -163,6 +164,38 @@ struct CastParams {
 struct MatmulParams {
   uint32_t m, n, k, a_off, b_off, out_off;
 };
+// VK4 keep-quant: native TQ2_0 keep-quant GEMV/gemm (vt_matmul_bt_tq2.comp).
+struct MatmulBTQuantTQ2Params {
+  uint32_t n;       // output columns (weight rows)
+  uint32_t m;       // output rows (tokens)
+  uint32_t nb;      // k / 256
+  uint32_t a_off, w_off, out_off;
+};
+struct MatmulBTQuantTQ2GroupedParams {
+  uint32_t m;       // output rows (tokens)
+  uint32_t n;       // output columns (weight rows)
+  uint32_t nb;      // k / 256
+  uint32_t e;       // num experts
+  uint32_t bcast;   // 1 = all rows share activation row 0
+  uint32_t a_off, w_off, eid_off, out_off;
+};
+// VK4 keep-quant Phase 2: fused gate+up+SwiGLU grouped MoE (TQ2_0 weights, bf16
+// activation, on-device Q8_K quantize, f32 output). Push-constant block for
+// vt_moe_gate_up_swiglu_grouped_tq2.comp.
+struct MoeGateUpSwiGLUGroupedTQ2Params {
+  uint32_t m;       // P (output rows = T * top_k)
+  uint32_t n;       // I (output cols = moe_intermediate_size)
+  uint32_t nb;      // K / 256
+  uint32_t e;       // num experts
+  uint32_t bcast;   // 1 = all rows share activation row 0
+  uint32_t gather_k; // >0 = activation is [T, H], row p reads row p/gather_k
+  uint32_t a_off;   // activation (f32/bf16) byte offset
+  uint32_t gw_off;  // gate weight (TQ2_0) byte offset
+  uint32_t uw_off;  // up weight (TQ2_0) byte offset
+  uint32_t eid_off; // expert_ids (i32) byte offset
+  uint32_t out_off; // output (f32) byte offset
+  float limit;      // SwiGLU clamp limit
+};
 struct EmbeddingParams {
   uint32_t t, h, table_off, ids_off, out_off;
 };
@@ -176,6 +209,40 @@ struct RopeFromCacheParams {
   uint32_t tokens, half_dim, rotary_dim, hq, hk;
   uint32_t q_s0, q_s1, k_s0, k_s1;
   uint32_t q_off, k_off, c_off, p_off;
+};
+// VK4: the rotary TABLE build (vt_rope_cos_sin_cache.comp). The angle
+// construction travels as f64 scalars — GLSL `double` push members are 8-byte
+// aligned, so the five uints above land on a 40-byte boundary and the doubles
+// pack from offset 40 with no internal padding (std430 scalar alignment).
+struct RopeCosSinCacheParams {
+  uint32_t tokens, half_dim, rotary_dim;
+  uint32_t pos_off, out_off;
+  double base;
+  double l3_sf, l3_lo, l3_hi, l3_omax;
+};
+// VK4: vt_rope_neox.comp — the DIRECT-ANGLE apply (no cos|sin table). Same f64
+// tail as the cache builder: three uints then five uints land the doubles on
+// their 8-byte boundary with no internal padding.
+// VK4: vt_moe_combine.comp — the routed-expert weighted sum. All-f32 accumulate,
+// one invocation per output element, shared term via spec-const gate.
+struct MoeCombineParams {
+  uint32_t tokens, h, k;
+  float routed_scale;
+  uint32_t out_off, e_off, w_off, s_off;
+};
+
+// VK4: vt_moe_router_topk.comp — softmax+topk+renorm, one workgroup per row.
+struct MoeRouterTopKParams {
+  uint32_t tokens, e, k;
+  uint32_t logits_off, w_off, i_off;
+};
+
+
+struct RopeNeoxParams {
+  uint32_t tokens, half_dim, rotary_dim, hq, hk;
+  uint32_t q_off, k_off, p_off;
+  double base;
+  double l3_sf, l3_lo, l3_hi, l3_omax;
 };
 struct ReshapeAndCacheParams {
   uint32_t num_slots, n_elems, block_size;
@@ -858,6 +925,24 @@ bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
 // of independent sequential read streams the memory controller sees, and each
 // surviving workgroup interleaves reads from rows k*2 bytes apart. The activation
 // re-reads it saves were L2 hits, which were never the constraint.
+
+// BISECT HOOK (temporary): VT_VK_DISABLE=kMoeRouterTopK,kMoeCombine,... skips
+// registering the named ops so they fall back to the reference tier.
+bool VkOpDisabled(const char* op_name) {
+  const char* v = std::getenv("VT_VK_DISABLE");
+  if (v == nullptr || *v == '\0') return false;
+  const std::string s(v);
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    size_t comma = s.find(',', pos);
+    std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+    if (tok == op_name) return true;
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return false;
+}
+
 constexpr uint32_t kGemvRowsDefault = 1;
 constexpr uint32_t kGemvPackDefault = 2;
 
@@ -1120,7 +1205,12 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
   // forwards to the next provider down, which is exactly what GetOpFallback is
   // for (op_provider.h:94-100: per-call refusal belongs in the kernel, because
   // GetOp has no shape or dtype to inspect).
-  if (args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) {
+  // BISECT: VT_VK_DISABLE_PAGED_ATTN=1 forces every call down to the portable tier.
+  static const bool kForcePaFallback = [] {
+    const char* e = std::getenv("VT_VK_DISABLE_PAGED_ATTN");
+    return e != nullptr && e[0] != 0 && std::strcmp(e, "0") != 0;
+  }();
+  if (kForcePaFallback || args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) {
     auto next = reinterpret_cast<PagedAttentionFn>(
         GetOpFallback(OpId::kPagedAttention, DeviceType::kVULKAN, kNativeProviderName));
     next(q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
@@ -1282,6 +1372,167 @@ void RopeFromCacheKernel(Queue& queue, Tensor& qs, Tensor* ks, const Tensor& pos
                         c_off,
                         p_off};
   Go("vt_rope_from_cache", bind, p, FlatGroupCount(tokens * half * (hq + hk)), spec, 5);
+}
+
+// ---------------------------------------------------------------------------
+// VK4 (B60 maple row): the rotary TABLE BUILD goes native. The old note —
+// "kRopeCosSinCache is deliberately host-side, GLSL has no f64" — was WRONG on
+// both halves: GLSL has `double` with core Float64 support in SPIR-V 1.3+, and
+// our own CUDA kernel already does the f64 angle construction ON DEVICE
+// (cuda_ops.cu RopeCosSinCacheKernel), so device-side double is the established
+// house pattern for this op. vt_rope_cos_sin_cache.comp transcribes the CPU
+// oracle's f64 pow/cos/sin element-for-element; the only f32 rounding left is
+// the one cast at the store, which is exactly what the CPU does.
+//
+// cpu_ops.cpp:1182-1200 RopeCosSinCacheKernel.
+void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
+                           const RopeArgs& args) {
+  const int64_t t = cos_sin.shape[0];
+  const int64_t half = args.rotary_dim / 2;
+  if (t == 0 || half == 0) return;
+  VT_CHECK(cos_sin.dtype == DType::kF32,
+           "vulkan rope_cos_sin_cache: cos_sin must be f32");
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "vulkan rope_cos_sin_cache: positions must be i32 or i64");
+  Binder bind;
+  const uint32_t out_off = bind.Add(cos_sin, "rope_cos_sin_cache: cos_sin");
+  const uint32_t pos_off =
+      bind.AddU32Only(positions, "rope_cos_sin_cache: positions");
+  const bool l3 = args.llama3_scaling_factor > 0.0f;
+  const uint32_t spec[2] = {positions.dtype == DType::kI64 ? 1u : 0u, l3 ? 1u : 0u};
+  RopeCosSinCacheParams p{static_cast<uint32_t>(t),
+                          static_cast<uint32_t>(half),
+                          static_cast<uint32_t>(args.rotary_dim),
+                          pos_off,
+                          out_off,
+                          static_cast<double>(args.base),
+                          static_cast<double>(args.llama3_scaling_factor),
+                          static_cast<double>(args.llama3_low_freq_factor),
+                          static_cast<double>(args.llama3_high_freq_factor),
+                          static_cast<double>(args.llama3_orig_max_position)};
+  Go("vt_rope_cos_sin_cache", bind, p, FlatGroupCount(t * half), spec, 2);
+}
+
+// VK4 (B60 maple row): the DIRECT-ANGLE rotary apply goes native. The dense
+// AttnBlock path calls vt::RopeNeox every layer for the SWA layers; leaving it
+// on the reference tier made each decode step pay a host round-trip. Same
+// numerics story as RopeCosSinCacheKernel above — f64 angle accumulation,
+// tracked f32 pow/trig exception (see the shader header).
+// cpu_ops.cpp:1025-1038 RopeNeoxKernel.
+void RopeNeoxKernel(Queue& /*queue*/, Tensor& qs, Tensor& ks, const Tensor& positions,
+                    const RopeArgs& args) {
+  const int64_t tokens = qs.shape[0];
+  const int64_t hq = qs.shape[1];
+  const int64_t hk = ks.shape[1];
+  const int64_t half = args.rotary_dim / 2;
+  if (tokens == 0 || half == 0 || (hq + hk) == 0) return;
+  VT_CHECK(qs.dtype == ks.dtype,
+           "vulkan rope_neox: q/k must share a dtype");
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "vulkan rope_neox: positions must be i32 or i64");
+
+  Binder bind;
+  const uint32_t q_off = bind.Add(qs, "rope_neox: q");
+  const uint32_t k_off = bind.Add(ks, "rope_neox: k");
+  const uint32_t p_off = bind.AddU32Only(positions, "rope_neox: positions");
+  const bool l3 = args.llama3_scaling_factor > 0.0f;
+  const uint32_t qhd = static_cast<uint32_t>(qs.shape[2]);
+  const uint32_t khd = static_cast<uint32_t>(ks.shape[2]);
+  const uint32_t spec[6] = {DtypeCode(qs.dtype),
+                            DtypeCode(ks.dtype),
+                            positions.dtype == DType::kI64 ? 1u : 0u,
+                            l3 ? 1u : 0u,
+                            qhd,
+                            khd};
+  RopeNeoxParams p{static_cast<uint32_t>(tokens),
+                   static_cast<uint32_t>(half),
+                   static_cast<uint32_t>(args.rotary_dim),
+                   static_cast<uint32_t>(hq),
+                   static_cast<uint32_t>(hk),
+                   q_off,
+                   k_off,
+                   p_off,
+                   static_cast<double>(args.base),
+                   static_cast<double>(args.llama3_scaling_factor),
+                   static_cast<double>(args.llama3_low_freq_factor),
+                   static_cast<double>(args.llama3_high_freq_factor),
+                   static_cast<double>(args.llama3_orig_max_position)};
+  Go("vt_rope_neox", bind, p,
+     FlatGroupCount(tokens * half * (hq + hk)), spec, 6);
+}
+
+// VK4: MoeCombine native. cpu_ops.cpp:2749-2765 MoeCombineKernel.
+// The optional shared expert is bound unconditionally (aliased to expert_out
+// when absent — dead reads on that path, the rope kernel's arrangement) and
+// gated by a spec const, because a shader's declared descriptors must be valid
+// whether or not this dispatch reads them.
+void MoeCombineKernelVulkan(Queue&, Tensor& out, const Tensor& expert_out,
+                            const Tensor& weights, const Tensor* shared,
+                            float routed_scale) {
+  const int64_t t = out.shape[0];
+  const int64_t h = out.shape[1];
+  const int64_t k = weights.shape[1];
+  if (t == 0 || h == 0) return;
+  Binder bind;
+  const uint32_t out_off = bind.Add(out, "moe_combine: out");
+  const uint32_t e_off = bind.Add(expert_out, "moe_combine: expert_out");
+  // weights is f32-by-contract ([T,K] f32), so it takes the full u32+u16 pair
+  // like every other operand — the shader declares 8 bindings total.
+  const uint32_t w_off = bind.Add(weights, "moe_combine: weights");
+  const uint32_t s_off = shared != nullptr
+                             ? bind.Add(*shared, "moe_combine: shared")
+                             : bind.Add(expert_out, "moe_combine: shared(dead)");
+  const uint32_t spec[3] = {DtypeCode(out.dtype), DtypeCode(expert_out.dtype),
+                            shared != nullptr ? 1u : 0u};
+  MoeCombineParams p{static_cast<uint32_t>(t),
+                     static_cast<uint32_t>(h),
+                     static_cast<uint32_t>(k),
+                     routed_scale,
+                     out_off,
+                     e_off,
+                     w_off,
+                     s_off};
+  Go("vt_moe_combine", bind, p, FlatGroupCount(t * h), spec, 3);
+}
+
+// VK4: MoeRouterTopK native — the UNGROUPED softmax path only. Grouped
+// top-k and a non-null bias DECLINE to the reference tier (same per-call
+// refusal shape as fp8 KV / mrope): throwing would remove capability the
+// portable tier provides. cpu_ops.cpp:2680-2721.
+void MoeRouterTopKKernelVulkan(Queue& queue, Tensor& weights, Tensor& indices,
+                               const Tensor& logits, const MoeRouterTopKArgs& args,
+                               const Tensor* bias) {
+  if (args.num_expert_group > 0 || bias != nullptr) {
+    auto next = reinterpret_cast<MoeRouterTopKFn>(
+        GetOpFallback(OpId::kMoeRouterTopK, DeviceType::kVULKAN, kNativeProviderName));
+    next(queue, weights, indices, logits, args, bias);
+    return;
+  }
+  const int64_t t = logits.shape[0];
+  const int64_t e = logits.shape[1];
+  VT_CHECK(e <= 1024, "vulkan moe_router_topk: E exceeds VT_MR_MAX_E (1024)");
+  if (t == 0) return;
+  Binder bind;
+  // BINDING ORDER = the shader's declared indices: 0=W32(weights), 1=I32(indices),
+  // 2/3 = the logits u32/u16 pair. The original order put the logits PAIR first,
+  // so the shader's W32/I32 writes landed in the LOGITS buffer and its loads read
+  // weights-as-logits — wrong numbers AND cross-buffer corruption.
+  const uint32_t w_off = bind.AddU32Only(weights, "moe_router_topk: weights");
+  const uint32_t i_off = bind.AddU32Only(indices, "moe_router_topk: indices");
+  const uint32_t l_off = bind.Add(logits, "moe_router_topk: logits");
+  // spec constants are per-pipeline; E/K vary only across models, so the
+  // pipeline cache keys on them correctly. renorm rides args.renormalize.
+  const uint32_t spec[4] = {static_cast<uint32_t>(e),
+                            static_cast<uint32_t>(args.top_k),
+                            args.renormalize ? 1u : 0u,
+                            DtypeCode(logits.dtype)};
+  MoeRouterTopKParams p{static_cast<uint32_t>(t),
+                        static_cast<uint32_t>(e),
+                        static_cast<uint32_t>(args.top_k),
+                        l_off,
+                        w_off,
+                        i_off};
+  Go("vt_moe_router_topk", bind, p, t, spec, 4);
 }
 
 // cpu_ops.cpp:2162-2176 QkvSplitKernel. Mirrors vLLM's QKVParallelLinear output
@@ -1762,6 +2013,393 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate
   Go("vt_attn_qk_norm_rope_gate", bind, p, static_cast<uint32_t>(t * (hq + hkv)), spec, 3);
 }
 
+// ---------------------------------------------------------------------------
+// BACKEND-VULKAN-KEEPQUANT — the GGUF keep-quant tier, by CPU FALL-THROUGH.
+//
+// WHY A HOST KERNEL IS THE CORRECT VULKAN REGISTRATION (for now). The B60 is
+// integrated: VulkanContext allocates every tensor from HOST_VISIBLE |
+// HOST_COHERENT memory and VulkanBackend::DeviceMemoryIsHostAddressable()
+// answers true unconditionally, so the host vec_dot kernels dereference the
+// SAME bytes the rest of the graph dispatches shaders over. That is precisely
+// the property the portable reference tier already relies on to run the CPU
+// kMatmulBTQuant lazily at GetOp time (op_provider.cpp
+// MaybeInstallReferenceTier) — this registration makes that arrangement
+// EAGER, so it also flips vt::OpRegistered(kMatmulBTQuant, kVULKAN), which
+// EXCLUDES the reference tier by design (op_provider.cpp OpRegistered:
+// "fallback, not native"). GgufQuantComputeAvailable()
+// (gguf_keep_quant.cpp:75) reads exactly that predicate to decide the GGUF
+// loader's keep-quant DEFAULT; without a native entry the loader expands
+// every TQ1_0/TQ2_0/K-quant block to bf16 at load and maple's ~4 GB of
+// ternary weights become ~32 GB of anonymous bf16 — OOM on the 31 GB box
+// before the first token. With it, blocks stay resident and the win is
+// MEMORY, not speed: the compute itself is the plain CPU kernel, SLOW, which
+// is why the body drains any pending device batch FIRST — the same contract
+// ResolveFallback discharges for reference-tier ops (a deferred-submission
+// backend must not hand a host kernel activations the GPU has not written),
+// discharged here on the NATIVE path too because the native kernel here IS a
+// host kernel.
+//
+// Mirrors cuda_quant_dot.cu:1835 (CUDA falls through to GetOp(...,kCPU) for
+// dtypes its GPU kernel lacks; on unified memory that fall-through is free).
+// Local activations-reader (mirrors cpu_quant_gemm.cpp LoadActF32): the keep-quant
+// native path quantizes the raw activation to Q8_K before dispatch.
+static float LoadActF32Local(const Tensor& t, int64_t i) {
+  switch (t.dtype) {
+    case DType::kF32: return t.Ptr<float>()[i];
+    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[i]);
+    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[i]);
+    default: VT_CHECK(false, "vulkan tq2: unsupported activation dtype");
+  }
+  return 0.0f;
+}
+
+// BACKEND-VULKAN-KEEPQUANT: NATIVE TQ2_0 DECODE GEMV. For the TQ2_0 weight
+// dtype at decode (M==1) we dispatch vt_matmul_bt_tq2 instead of the scalar
+// CPU fall-through, which was pathologically slow (minutes per prompt, no fence to
+// time out — the "hang" behind the earlier box outages). The activation is
+// quantized to Q8_K (TQ2_0's vec_dot_type), then a workgroup-per-output
+// element kernel reads BlockTQ2_0 weights against it. Returns true if handled.
+
+// Persistent host->GPU scratch for TQ2_0 keep-quant activation rows. Growing a
+// buffer from scratch every dispatch (vkCreateBuffer + vkAllocateMemory +
+// vkDestroyBuffer) is the dominant host cost at 600 dispatches/token. Keep one
+// allocation that only (re)allocates when a request outgrows it. Single-threaded
+// engine use; mutex-guarded for safety.
+static void* Tq2Scratch(size_t need, void** out_buffer) {
+  static std::mutex mu;
+  static void* buf = nullptr, *mem = nullptr;
+  static void* map = nullptr;
+  static size_t cap = 0;
+  std::lock_guard<std::mutex> g(mu);
+  auto& ctx = VulkanContext::Get();
+  if (need > cap) {
+    if (buf != nullptr) ctx.FreeBuffer(buf, mem);
+    size_t nc = need; nc += nc / 2;
+    if (nc < 4096) nc = 4096;
+    map = ctx.AllocBuffer(nc, &buf, &mem);
+    cap = nc;
+  }
+  *out_buffer = buf;
+  return map;
+}
+
+static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
+                              const Tensor& b) {
+  (void)q;
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
+  const bool is_tq2 = (b.dtype == DType::kTQ2_0);
+  const bool is_tq1 = (b.dtype == DType::kTQ1_0);
+  if ((!is_tq2 && !is_tq1) || m <= 0 || k <= 0 || k % 256 != 0 ||
+      b.repacked) {
+    return false;
+  }
+  const int64_t nb = k / 256;
+  const char* dev_shader = is_tq2 ? "vt_matmul_bt_tq2_dev"
+                                  : "vt_matmul_bt_tq1_0_dev";
+  const char* host_shader = is_tq2 ? "vt_matmul_bt_tq2" : "vt_matmul_bt_tq1_0";
+  const DType wdt = b.dtype;
+
+  // GPU-side quantize path (Phase 2): when the activation is f32 or bf16 on the
+  // device, dispatch the _dev shader which quantizes Q8_K INSIDE the shader.
+  // No host read, no FlushBatch — eliminates the per-dispatch drain.
+  if (a.dtype == DType::kF32 || a.dtype == DType::kBF16) {
+    auto& ctx = VulkanContext::Get();
+    std::vector<void*> buffers;
+    uint32_t a_off = 0, w_off = 0, out_off = 0;
+    {
+      Resolved r = Resolve(a.data, "matmul-bt-quant-dev: act");
+      buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+      a_off = r.offset;
+    }
+    {
+      Resolved r = Resolve(b.data, "matmul-bt-quant-dev: weight");
+      buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+      w_off = r.offset;
+    }
+    {
+      Resolved r = Resolve(out.data, "matmul-bt-quant-dev: out");
+      buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+      out_off = r.offset;
+    }
+    MatmulBTQuantTQ2Params cp{static_cast<uint32_t>(n), static_cast<uint32_t>(m),
+                              static_cast<uint32_t>(nb), a_off, w_off, out_off};
+    const uint32_t spec[2] = {DtypeCode(out.dtype), DtypeCode(a.dtype)};
+    ctx.Dispatch(dev_shader, buffers.data(),
+                 static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+                 static_cast<uint32_t>(n), spec, 2);
+    return true;
+  }
+
+  // Host-quantize fallback (f16 activation or when the device path is disabled):
+  // reads the activation from mapped memory, quantizes to Q8_K on the host, and
+  // dispatches the original shader. Requires FlushBatch for coherence.
+  auto& ctx = VulkanContext::Get();
+  ctx.FlushBatch("matmul-bt-quant native");
+
+  vt::cpu::FromFloatFn from_float = vt::cpu::BlockFromFloat(DType::kQ8_K);
+  if (from_float == nullptr) return false;
+  // Quantize ALL m activation rows to Q8_K (the [m, k] prompt/token matrix).
+  std::vector<uint8_t> act(
+      vt::cpu::QuantActScratchBytes(wdt, m, k));
+  std::vector<float> row(static_cast<size_t>(k));
+  const size_t qrow =
+      static_cast<size_t>(vt::RowSizeBytes(DType::kQ8_K, k));
+  for (int64_t r = 0; r < m; ++r) {
+    for (int64_t p = 0; p < k; ++p)
+      row[static_cast<size_t>(p)] = LoadActF32Local(a, r * k + p);
+    from_float(row.data(), act.data() + qrow * static_cast<size_t>(r), k);
+  }
+
+  void* vbuf = nullptr;
+  void* mapped = Tq2Scratch(std::max(act.size(), (size_t)4), &vbuf);
+  std::memcpy(mapped, act.data(), act.size());
+
+  std::vector<void*> buffers;
+  uint32_t a_off = 0, w_off = 0, out_off = 0;
+  buffers.push_back(vbuf); buffers.push_back(vbuf);
+  {
+    Resolved r = Resolve(b.data, "matmul-bt-quant: weight");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    w_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(out.data, "matmul-bt-quant: out");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    out_off = r.offset;
+  }
+
+  MatmulBTQuantTQ2Params cp{static_cast<uint32_t>(n), static_cast<uint32_t>(m),
+                            static_cast<uint32_t>(nb), a_off, w_off, out_off};
+  const uint32_t spec[1] = {DtypeCode(out.dtype)};
+  ctx.Dispatch(host_shader, buffers.data(),
+               static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+               static_cast<uint32_t>(n), spec, 1);
+  return true;
+}
+
+void MatmulBTQuantKernelVulkan(Queue& q, Tensor& out, const Tensor& a,
+                               const Tensor& b) {
+  if (TryNativeTQDecode(q, out, a, b)) return;
+  // Drain before the host reads: same rationale as vulkan_backend.cpp
+  // FlushPending ("reference-tier") — see the block comment above.
+  VulkanContext::Get().FlushBatch("matmul-bt-quant cpu-fallthrough");
+  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBTQuant, DeviceType::kCPU))(
+      q, out, a, b);
+}
+
+
+// VK4 keep-quant: native grouped (per-token expert) TQ2_0 matmul. Reuses the
+// M-loop arithmetic but each output row <row> selects expert eids[row] whose weight
+// slice is weight[e][N][K] (TQ2_0), and its activation row (row, or 0 when
+// broadcasting a single shared hidden across experts) quantized to Q8_K on the host.
+static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
+                               const Tensor& weight, const Tensor& expert_ids) {
+  (void)q;
+  const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
+  const bool bcast = (act.shape[0] == 1 && P > 1);
+  const bool is_tq2 = (weight.dtype == DType::kTQ2_0);
+  const bool is_tq1 = (weight.dtype == DType::kTQ1_0);
+  if ((!is_tq2 && !is_tq1) || P <= 0 || K <= 0 || K % 256 != 0 ||
+      weight.repacked) {
+    return false;
+  }
+  const int64_t nb = K / 256;
+  const int64_t E = weight.shape[0] / N;  // rank-2 weight is [E*N, K]
+  const char* dev_shader = is_tq2 ? "vt_matmul_bt_tq2_grouped_dev"
+                                  : "vt_matmul_bt_tq1_0_grouped_dev";
+  const char* host_shader = is_tq2 ? "vt_matmul_bt_tq2_grouped"
+                                   : "vt_matmul_bt_tq1_0_grouped";
+  const DType wdt = weight.dtype;
+
+  // GPU-side quantize path (Phase 2): when the activation is f32 or bf16 on the
+  // device, dispatch the _dev shader which quantizes Q8_K INSIDE the shader.
+  // No host read, no FlushBatch, no scratch buffer — the dispatch batches
+  // naturally with surrounding ops, eliminating the per-dispatch drain that was
+  // the maple MoE bottleneck. Bit-exact vs the host-quantize path because the
+  // shader's Q8_K quantize matches cpu_quant_act.cpp QuantizeRowQ8_K exactly
+  // (same signed-extremum max, same iscale = -127/max, same roundEven).
+  if (act.dtype == DType::kF32 || act.dtype == DType::kBF16) {
+    auto& ctx = VulkanContext::Get();
+    std::vector<void*> buffers;
+    uint32_t a_off = 0, w_off = 0, eid_off = 0, out_off = 0;
+    {
+      Resolved r = Resolve(act.data, "matmul-bt-quant-grouped-dev: act");
+      buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+      a_off = r.offset;
+    }
+    {
+      Resolved r = Resolve(weight.data, "matmul-bt-quant-grouped-dev: weight");
+      buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+      w_off = r.offset;
+    }
+    {
+      Resolved r = Resolve(expert_ids.data, "matmul-bt-quant-grouped-dev: eids");
+      buffers.push_back(r.buffer);
+      eid_off = r.offset;
+    }
+    {
+      Resolved r = Resolve(out.data, "matmul-bt-quant-grouped-dev: out");
+      buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+      out_off = r.offset;
+    }
+    MatmulBTQuantTQ2GroupedParams cp{static_cast<uint32_t>(P), static_cast<uint32_t>(N),
+                              static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
+                              static_cast<uint32_t>(bcast ? 1 : 0),
+                              a_off, w_off, eid_off, out_off};
+    const uint32_t spec[1] = {DtypeCode(out.dtype)};
+    ctx.Dispatch(dev_shader, buffers.data(),
+                 static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+                 static_cast<uint32_t>(N), spec, 1);
+    return true;
+  }
+
+  // Host-quantize fallback (f16 activation or when the device path is disabled):
+  // reads the activation from mapped memory, quantizes to Q8_K on the host, and
+  // dispatches the original grouped shader. Requires FlushBatch for coherence.
+  auto& ctx = VulkanContext::Get();
+  ctx.FlushBatch("matmul-bt-quant-grouped native");
+
+  vt::cpu::FromFloatFn from_float = vt::cpu::BlockFromFloat(DType::kQ8_K);
+  if (from_float == nullptr) return false;
+  const int64_t nrows = bcast ? 1 : P;
+  std::vector<uint8_t> act_q(
+      vt::cpu::QuantActScratchBytes(wdt, nrows, K));
+  std::vector<float> row(static_cast<size_t>(K));
+  const size_t qrow = static_cast<size_t>(vt::RowSizeBytes(DType::kQ8_K, K));
+  for (int64_t r = 0; r < nrows; ++r) {
+    for (int64_t p = 0; p < K; ++p)
+      row[static_cast<size_t>(p)] = LoadActF32Local(act, r * K + p);
+    from_float(row.data(), act_q.data() + qrow * static_cast<size_t>(r), K);
+  }
+
+  void* vbuf = nullptr;
+  void* mapped = Tq2Scratch(std::max(act_q.size(), (size_t)4), &vbuf);
+  std::memcpy(mapped, act_q.data(), act_q.size());
+
+  std::vector<void*> buffers;
+  uint32_t a_off = 0, w_off = 0, eid_off = 0, out_off = 0;
+  buffers.push_back(vbuf); buffers.push_back(vbuf);
+  {
+    Resolved r = Resolve(weight.data, "matmul-bt-quant-grouped: weight");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    w_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(expert_ids.data, "matmul-bt-quant-grouped: eids");
+    buffers.push_back(r.buffer);
+    eid_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(out.data, "matmul-bt-quant-grouped: out");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    out_off = r.offset;
+  }
+
+  MatmulBTQuantTQ2GroupedParams cp{static_cast<uint32_t>(P), static_cast<uint32_t>(N),
+                            static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
+                            static_cast<uint32_t>(bcast ? 1 : 0),
+                            a_off, w_off, eid_off, out_off};
+  const uint32_t spec[1] = {DtypeCode(out.dtype)};
+  ctx.Dispatch(host_shader, buffers.data(),
+               static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+               static_cast<uint32_t>(N), spec, 1);
+  return true;
+}
+
+void MatmulBTQuantGroupedKernelVulkan(Queue& q, Tensor& out,
+                                      const Tensor& act, const Tensor& weight,
+                                      const Tensor& expert_ids) {
+  if (TryNativeTQGrouped(q, out, act, weight, expert_ids)) return;
+  VulkanContext::Get().FlushBatch("matmul-bt-quant-grouped cpu-fallthrough");
+  reinterpret_cast<MatmulBTQuantGroupedFn>(
+      GetOp(OpId::kMatmulBTQuantGrouped, DeviceType::kCPU))(q, out, act, weight,
+                                                            expert_ids);
+}
+
+// VK4 keep-quant Phase 2: Vulkan provider for kMoeGateUpSwiGLUGrouped. Fuses
+// gate+up grouped GEMMs + clamped SwiGLU into ONE dispatch with on-device Q8_K
+// quantize (vt_moe_gate_up_swiglu_grouped_tq2.comp). No FlushBatch — the shader
+// reads the bf16 activation straight from the device buffer, so the dispatch
+// batches with surrounding ops and the whole MoE expert path runs drain-free.
+// Bit-exact vs the CPU golden (cpu_quant_gemm.cpp MoeGateUpSwiGLUGroupedKernel)
+// because the shader's Q8_K quantize matches QuantizeRowQ8_K exactly and the
+// vec-dot / SwiGLU math is the same integer/f32 sequence.
+static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
+    Queue& q, Tensor& out, const Tensor& act, const Tensor& gate_w,
+    const Tensor& up_w, const Tensor& expert_ids, float limit) {
+  (void)q;
+  const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
+  const bool bcast = (act.shape[0] == 1 && P > 1);
+  // Prefill gather: activation is [T, H], output is [P, H] where P = T * top_k.
+  // Each output row p reads activation row p / top_k. Infer top_k from shapes.
+  const uint32_t gather_k =
+      (!bcast && act.shape[0] > 1 && act.shape[0] < P && P % act.shape[0] == 0)
+          ? static_cast<uint32_t>(P / act.shape[0])
+          : 0u;
+  const bool is_tq2 = (gate_w.dtype == DType::kTQ2_0 && up_w.dtype == DType::kTQ2_0);
+  const bool is_tq1 = (gate_w.dtype == DType::kTQ1_0 && up_w.dtype == DType::kTQ1_0);
+  if ((!is_tq2 && !is_tq1) ||
+      P <= 0 || K <= 0 || K % 256 != 0 ||
+      (act.dtype != DType::kBF16 && act.dtype != DType::kF32) ||
+      gate_w.repacked || up_w.repacked) {
+    return false;
+  }
+  const char* shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2"
+                              : "vt_moe_gate_up_swiglu_grouped_tq1_0";
+  const int64_t nb = K / 256;
+  const int64_t E = gate_w.shape[0] / N;
+
+  auto& ctx = VulkanContext::Get();
+  std::vector<void*> buffers;
+  uint32_t a_off = 0, gw_off = 0, uw_off = 0, eid_off = 0, out_off = 0;
+  {
+    Resolved r = Resolve(act.data, "moe-gate-up-swiglu-grouped: act");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    a_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(gate_w.data, "moe-gate-up-swiglu-grouped: gate_w");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    gw_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(up_w.data, "moe-gate-up-swiglu-grouped: up_w");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    uw_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(expert_ids.data, "moe-gate-up-swiglu-grouped: eids");
+    buffers.push_back(r.buffer);
+    eid_off = r.offset;
+  }
+  {
+    Resolved r = Resolve(out.data, "moe-gate-up-swiglu-grouped: out");
+    buffers.push_back(r.buffer); buffers.push_back(r.buffer);
+    out_off = r.offset;
+  }
+  MoeGateUpSwiGLUGroupedTQ2Params cp{
+      static_cast<uint32_t>(P), static_cast<uint32_t>(N),
+      static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
+      static_cast<uint32_t>(bcast ? 1 : 0), gather_k,
+      a_off, gw_off, uw_off, eid_off, out_off, limit};
+  const uint32_t spec[1] = {DtypeCode(act.dtype)};
+  ctx.Dispatch(shader, buffers.data(),
+               static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+               static_cast<uint32_t>(N), spec, 1);
+  return true;
+}
+
+void MoeGateUpSwiGLUGroupedKernelVulkan(
+    Queue& q, Tensor& out, const Tensor& act, const Tensor& gate_w,
+    const Tensor& up_w, const Tensor& expert_ids, float limit) {
+  if (TryNativeMoeGateUpSwiGLUGroupedTQ(q, out, act, gate_w, up_w, expert_ids,
+                                         limit)) return;
+  VulkanContext::Get().FlushBatch("moe-gate-up-swiglu-grouped cpu-fallthrough");
+  reinterpret_cast<MoeGateUpSwiGLUGroupedFn>(
+      GetOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kCPU))(
+          q, out, act, gate_w, up_w, expert_ids, limit);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -1774,9 +2412,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kRopeFromCache, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
-    RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
+    if (!VkOpDisabled("kReshapeAndCache"))     RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
-    RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
+    if (!VkOpDisabled("kPagedAttention"))     RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
@@ -1828,8 +2466,7 @@ struct Registrar {
     RegisterOp(OpId::kFusedChain, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernel)));
     // BACKEND-VULKAN-GDN: the GDN glue family. kCausalConv1dFwd (the prefill
-    // conv) and kRopeCosSinCache (the double-precision rotary table, deliberately
-    // host-side) stay on the portable reference tier; see the block comment above
+    // conv) stays on the portable reference tier; see the block comment above
     // these kernels.
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16Kernel)));
@@ -1854,6 +2491,34 @@ struct Registrar {
     RegisterOp(
         OpId::kAttnQkNormRopeGate, DeviceType::kVULKAN,
         reinterpret_cast<void*>(static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernel)));
+    // VK4 (B60 maple row): the four ops the maple graph was still draining to
+    // the host for. The rotary TABLE BUILD joins its apply half; see
+    // RopeCosSinCacheKernel above for why the old "no f64 in GLSL" note retired.
+    if (!VkOpDisabled("kRopeCosSinCache"))     RegisterOp(
+        OpId::kRopeCosSinCache, DeviceType::kVULKAN,
+        reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
+    // BACKEND-VULKAN-KEEPQUANT: the GGUF compute-in-quant GEMMs, by CPU
+    // fall-through (see MatmulBTQuantKernelVulkan above). This is what makes
+    // GgufQuantComputeAvailable() true on Vulkan, so a TQ1_0/TQ2_0/K-quant GGUF
+    // keeps its blocks resident instead of expanding to bf16 at load (the maple
+    // 32 GB OOM). The grouped twin rides along for MoE models.
+    RegisterOp(OpId::kMatmulBTQuant, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernelVulkan)));
+    if (!VkOpDisabled("kRopeNeox"))     RegisterOp(OpId::kRopeNeox, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
+    if (!VkOpDisabled("kMoeCombine"))     RegisterOp(
+        OpId::kMoeCombine, DeviceType::kVULKAN,
+        reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernelVulkan)));
+    if (!VkOpDisabled("kMoeRouterTopK"))     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(
+                   static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelVulkan)));
+    RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelVulkan)));
+    if (!VkOpDisabled("kMoeGateUpSwiGLUGrouped"))
+      RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kVULKAN,
+                 reinterpret_cast<void*>(static_cast<MoeGateUpSwiGLUGroupedFn>(
+                     &MoeGateUpSwiGLUGroupedKernelVulkan)));
   }
 } registrar;
 

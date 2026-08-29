@@ -1,0 +1,99 @@
+#version 450
+// vt_matmul_bt_tq2_grouped: grouped keep-quant matmul for TQ2_0 weights against
+// Q8_K activations, M>=1, per-row expert select (maple MoE). BACKEND-VULKAN-KEEPQUANT.
+//
+// Same arithmetic as vt_matmul_bt_tq2 (VecDotTQ2_0Q8_K, deepgrove quants.c:533),
+// but each output row `row` selects its expert via expert_ids[row] and its weight
+// slice is weight[e][col] (weight is [E, N, K] TQ2_0). One workgroup per
+// output column `col`; 128 lanes split K; loop rows.
+//   w_row = w_off + e*N*nb*66 + col*nb*66
+//   a_row = a_off + (bcast? 0 : row)*nb*292
+//   out[row][col] at out_off + row*N*4 + col*4
+
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+  uint m;       // output rows (tokens)
+  uint n;       // output columns (per-expert hidden)
+  uint nb;      // K/256 blocks per row
+  uint e;       // num experts E (weight stride)
+  uint bcast;   // 1 => all rows share activation row 0
+  uint a_off;   // activation tensor start (device)
+  uint w_off;   // weight tensor start (device)
+  uint eid_off;  // expert_ids tensor start (device)
+  uint out_off;  // output tensor start (device)
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer Ab32 { uint v[]; } A32;
+layout(set = 0, binding = 1, std430) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(set = 0, binding = 2, std430) readonly buffer Wb32 { uint v[]; } W32;
+layout(set = 0, binding = 3, std430) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(set = 0, binding = 4, std430) readonly buffer Eb32 { int v[]; } EID;
+layout(set = 0, binding = 5, std430) writeonly buffer Ob32 { uint v[]; } O32;
+layout(set = 0, binding = 6, std430) writeonly buffer Ob16 { uint16_t v[]; } O16;
+
+layout(constant_id = 0) const uint VT_TQ_OUT_DT = 0u;  // output dtype spec constant
+
+shared float tq_part[128];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint col = gl_WorkGroupID.x;
+  if (col >= p.n) { return; }
+
+  const uint abytes = 292u;
+  const uint wbytes = 66u;
+
+  for (uint row = 0u; row < p.m; ++row) {
+    int e = EID.v[p.eid_off + row];
+    if (e < 0) continue;
+    uint ee = uint(e);
+    const uint a_row = p.a_off + ((p.bcast != 0u) ? 0u : row) * p.nb * abytes;
+    const uint w_row = p.w_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
+
+    float acc = 0.0;
+    for (uint b = tid; b < p.nb; b += 128u) {
+      uint aoff = a_row + b * abytes;
+      uint woff = w_row + b * wbytes;
+
+      float ad = intBitsToFloat(int(A32.v[aoff >> 2]));          // BlockQ8_K.d at +0
+      float wd = vt_from16(W16.v[(woff + 64u) >> 1], VT_DT_F16); // BlockTQ2_0.d at +64
+      float blockd = ad * wd;
+
+      int acci = 0;
+      for (uint j = 0u; j < 64u; j += 32u) {
+        for (uint l = 0u; l < 4u; ++l) {
+          for (uint k = 0u; k < 32u; ++k) {
+            uint wb_byte = woff + j + k;
+            uint w16 = W16.v[wb_byte >> 1];
+            uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+            int ternary = int((wb >> (l * 2u)) & 3u) - 1;
+            uint ae = j * 4u + l * 32u + k;
+            uint ab = aoff + 4u + ae;
+            uint a32 = A32.v[(ab >> 2)];
+            uint a_byte = (ab & 3u);
+            uint sh = a_byte * 8u;
+            uint avu = (a32 >> sh) & 0xFFu;
+            int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
+            acci += av * ternary;
+          }
+        }
+      }
+      acc += float(acci) * blockd;
+    }
+
+    tq_part[tid] = acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (tid < s) tq_part[tid] += tq_part[tid + s];
+      barrier();
+    }
+    if (tid == 0u) {
+      VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, tq_part[0]);
+    }
+    barrier();
+  }
+}

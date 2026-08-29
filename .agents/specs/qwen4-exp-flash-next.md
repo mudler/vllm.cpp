@@ -2261,6 +2261,117 @@ mutation here can measure a reach that does not exist (`## Owed`); and the group
 widths exercised are 4, 5 and 6, not the 2560 the released config uses, so the
 f32 sum-of-squares accumulator is gated at toy width only.
 
+## Mutation record — W5c-2 (#2249 item 3)
+
+The group-2 block-table gather. `GPUModelRunner::gather_block_table` had three
+call sites and reached exactly two group ids, so a model publishing a THIRD
+group — `qwen4_exp`'s QSA indexer side cache, an `MLAAttentionSpec` at
+`compress_ratio` 4 — had that cache allocated and no map from a logical position
+into its pages.
+
+**WHAT WAS MIRRORED, AND WHY IT IS A LOOP AND NOT A THIRD NAMED ID.** Upstream
+has no "the two special groups" shape at all. Its per-group metadata build runs
+over `enumerate(kv_cache_groups)` and hands each group its own table —
+`cm.block_table_tensor = _get_block_table(kv_cache_gid)`,
+`vllm/v1/worker/gpu_model_runner.py:2551-2567` at the parity pin
+`5559679229` — where `_get_block_table` (`:2318-2334`) is
+`self.input_batch.block_table[kv_cache_gid].get_device_tensor(...)`, which is
+byte-for-byte what this tree's `gather_block_table` does. Group 0 is gathered
+there too (`:2337`), so re-gathering the target group here follows upstream
+rather than inventing a second convention for "which groups are special".
+`GPUModelRunner::gather_group_block_tables` is that loop.
+
+**WHERE THE TABLES GO, AND WHY NOT ON `CommonAttentionMetadata`.** Upstream fans
+its per-group metadata out BY LAYER NAME (`:2549-2550`, "make layers in the same
+group share the same metadata"), and this tree's mirror of that key is
+`MultiKvCacheIndex` (KV-DSV4-MULTICACHE W3, #2068) — the channel that already
+carries which group each published cache came from. The two new vectors are
+indexed by GROUP ID rather than parallel to `attn_kv`, because a block table
+belongs to a group and every layer in it shares one. `CommonAttentionMetadata`
+carries exactly one table, the target group's, and widening it would put a
+multi-cache field on every uniform step.
+
+**WHAT IS STILL NOT REACHED, STATED BEFORE THE BATTERY.** The gather runs on the
+production `execute_model` path and its count is READ by the multi-cache refusal
+in `ModelRegistry::Forward`. Nothing CONSUMES the tables: no forward reads them,
+because `ForwardQwen4ExpForConditionalGeneration` refuses by name and
+`ModelRegistry::Forward` refuses every multi-cache topology. That is carried
+under `## Owed` and named in the commit and pull-request bodies.
+
+### The RED, before the change
+
+The carrier landed first (the two `MultiKvCacheIndex` fields, the two accessors
+and the refusal's new clause) with NO gather wired, so the red is behavioural
+rather than a compile error — the accessor exists and answers `nullptr`:
+
+```
+tests/vllm/v1/worker/test_runner.cpp:2498: ERROR:
+  CHECK( msg.find("block tables gathered for 3 of 3 published group(s)")
+         != std::string::npos ) is NOT correct!
+  values: CHECK( 18446744073709551615 != 18446744073709551615 )
+
+tests/vllm/v1/worker/test_runner.cpp:2508: FATAL ERROR:
+  REQUIRE( bt != nullptr ) is NOT correct!
+  values: REQUIRE( nullptr != nullptr )
+  logged: g := 0
+```
+
+### Why the fixture discriminates
+
+`MakeQwen4ExpShapedKvConfig()` is this row's own miniature: `FullAttentionSpec` +
+one uniform `MambaSpec` + the indexer `MLAAttentionSpec`. The case drives
+`GPUModelRunner::execute_model` — the production entry point — with a 20-token
+prompt over a 16-token block, so the sequence spans TWO blocks with a PARTIAL
+final one, and gives each of the three groups a DISTINCT two-block list with no
+fixed point: `{6, 2}`, `{4, 7}`, `{5, 3}`. An identity table would have proven
+nothing, because a body that ignores the table, returns the logical indices, or
+reads another group's table agrees with `{0, 1}`. The expectation is the literal
+list handed to `add_row`, never a value read back out of the runner.
+
+### The battery
+
+Each mutation is a single edit to `src/vllm/v1/worker/gpu/runner.cpp`, applied to
+a file whose pre-mutation sha256 is
+`b1fcc71a36ee1ac02b87cbc8786958f301177661f3ce07287911d5785c3ae889`, built to a
+recorded rc BEFORE any test was run, and restored to that same sha256.
+
+| ID | Mutation | Build rc | Result |
+|---|---|---|---|
+| M1 | gather every group with the WRONG id — `gather_block_table(gdn_group_id_, …)` instead of `(g, …)` | 0 | **RED**, 6 of 44: groups 0 and 2 both read `{4, 7, 0, …}` where `{6, 2, …}` and `{5, 3, …}` are owed, and both inequality assertions fire |
+| M2 | OFF-BY-ONE in the group index — `g == 0 ? 0 : g - 1` | 0 | **RED**, 4 of 44: group 1 reads group 0's `{6, 2}` and group 2 reads group 1's `{4, 7}` |
+| M3 | REACHABILITY — the production call site `if (multi_cache_topology_) gather_group_block_tables(num_reqs);` in `execute_model` DELETED | 0 | **RED**, 2 of 1001 over the whole suite: the refusal reports no gather and every group answers `nullptr` |
+
+M3 is NOT vacuous: there IS a production call site and deleting it reds the gate.
+What it proves is bounded, and the bound is worth writing down — it proves the
+RUNNER reaches the gather, not that any forward reaches the tables. No forward
+does; see the paragraph above and `## Owed`.
+
+### Counts, before and after, on the same tree
+
+`tests/test_runner`, one binary, the two new cases excluded by name to get the
+"before" figure rather than rebuilding a second tree:
+
+| | test cases | assertions |
+|---|---|---|
+| before (`-tce` both new cases) | 32 | 990 |
+| after | 34 | 1038 |
+
+`tests/test_qwen4_exp_scaffold` is unchanged at 12 cases / 296 assertions, which
+is the count its own `## Owed` paragraph in `qwen4_exp_registry.cpp` records.
+
+### The refusal string was falsified by this change, and repaired in it
+
+`ForwardQwen4ExpForConditionalGeneration`'s message enumerated "(2) reach for the
+indexer side cache, whose group-2 block table `GPUModelRunner::gather_block_table`
+never gathers (W5c-2)". That clause describes this commit's PARENT. It is
+rewritten rather than deleted, because the half W5c-2 does not close is real: the
+map now reaches the forward and no consumer reads it. The emitted bytes were read
+back out of the running hook (a temporary `MESSAGE` in the scaffold subcase,
+removed and the file restored to its HEAD sha256
+`32ee46d64b3045cbf852c387a2cb106bc46d391ed9fd19b4b6cbc013afac9b07`), not grepped
+out of the source — `test_qwen4_exp_scaffold.cpp:767` pins substrings of that
+string and therefore pins its PRESENCE, never its truth.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -3244,15 +3355,28 @@ is listed under `## Owed`.
   stand up (`gateable = no`). Owned by W5b under
   [#2031](https://github.com/mudler/vllm.cpp/issues/2031). Written down rather
   than solved, and it is the single most expensive thing in this section.
-- **NOTHING GATHERS GROUP 2's BLOCK TABLE, so the QSA side cache lands
-  ALLOCATED AND UNREAD.** `GPUModelRunner::gather_block_table` is called for
-  `full_attn_group_id_` and `gdn_group_id_` and for no other group
-  (`src/vllm/v1/worker/gpu/runner.cpp`), so the indexer group's per-request
-  block rows never reach a forward. Named under all four "Nothing lands dead"
-  conditions: what is unreached is the group-2 block table and the reads that
-  would consume it; the row that owns the wiring is `MODEL-MM-QWEN4-EXP` at
-  **W5c-2**; the issue that tracks it is
-  [#2031](https://github.com/mudler/vllm.cpp/issues/2031); and it is listed
+- **CLOSED by W5c-2 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249)
+  item 3): group 2's block table is gathered. What replaces it is NARROWER and
+  it is still `## Owed`: NOTHING READS IT.** The entry this replaces said
+  `GPUModelRunner::gather_block_table` is called for `full_attn_group_id_` and
+  `gdn_group_id_` and for no other group, so the indexer group's per-request
+  block rows never reach a forward. `GPUModelRunner::gather_group_block_tables`
+  now gathers EVERY published group's table on the multi-cache path and
+  publishes them by GROUP ID on `MultiKvCacheIndex`, mirroring upstream's
+  per-group metadata loop (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin
+  `5559679229`, `cm.block_table_tensor = _get_block_table(kv_cache_gid)`), so
+  the map from a logical position to the physical page now reaches the forward.
+  The half that remains is the CONSUMER: `Qwen4ExpQsaIndex` still reads a
+  contiguous `[max_kv, indexer_head_dim]` side cache, so nothing turns that map
+  into a read. Named under all four "Nothing lands dead" conditions: what is
+  unreached is the per-group block-table channel's VALUE — the runner's gather
+  runs on the production `execute_model` path and the refusal in
+  `ModelRegistry::Forward` reads its count, but no forward consumes the tables,
+  because `ForwardQwen4ExpForConditionalGeneration` refuses by name; the row
+  that owns the wiring is `MODEL-MM-QWEN4-EXP` at **W5b** (the layer loop);
+  the issues that track it are
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) and
+  [#2249](https://github.com/mudler/vllm.cpp/issues/2249); and it is listed
   here, which is the `## Owed` entry the rule requires. The buffer itself IS
   allocated and gated — `test_runner.cpp`'s
   "a multi-cache topology ALLOCATES its N-state recurrent group" asserts the
@@ -3495,9 +3619,16 @@ is listed under `## Owed`.
        `FullAttentionSpec` and an `MLAAttentionSpec` the runner allocates as
        paged `CacheBuffer`s. Bridging them is a paged arm of
        `RunQwen4ExpQsaBlock`, not a cast.
-    3. **Group 2 is allocated and unread**, already carried above as W5c-2:
-       `gather_block_table` has three call sites and reaches exactly
-       `full_attn_group_id_` and `gdn_group_id_`.
+    3. **CLOSED by W5c-2 (#2249 item 3): group 2 was allocated and unread —
+       its block table is now gathered.** This item said `gather_block_table`
+       has three call sites and reaches exactly `full_attn_group_id_` and
+       `gdn_group_id_`. It has a FOURTH now,
+       `GPUModelRunner::gather_group_block_tables`, which runs over every
+       published group on the multi-cache path and publishes the tables by
+       group id on `MultiKvCacheIndex`. What the loop still needs from this
+       axis is the CONSUMER — item 2's paged QSA arm has to read the side
+       cache through the table rather than off a contiguous `[max_kv, D]`
+       array — and that stays carried under `## Owed` above.
     4. **The MoE weights need an adapter.** `Qwen4ExpMoeWeights` holds stacked
        `gate_exps`/`up_exps` `[E, moe_I, H]` and `down_exps` `[E, H, moe_I]`;
        `RunMoeBlock` reads `MoeBlockWeights`, whose arms are per-expert
@@ -3574,7 +3705,8 @@ multi-cache path and allocates every published cache. The engine half was
 needed, more than one recurrent group, is NOT on this path, because upstream
 declares one recurrent shape model-wide. Three things it does not do, each under
 `## Owed`: the n-gram history is ZERO-SEEDED where it needs EOS and no gate here
-can see that, nothing gathers the side cache's block table (W5c-2), and every
+can see that, nothing READS the side cache's block table yet (W5c-2 made the
+runner gather it and hand it to the forward; no consumer takes it), and every
 byte figure is derived on a CPU host rather than measured on a device.
 
 **Reached, and still refusing:** the forward. Nothing decodes a token, so there
@@ -3607,7 +3739,8 @@ suite and the forward suite share ONE builder.
 "THE OP AND SEAM WORK IS FINISHED; WHAT IS LEFT IS THE LAYER LOOP." That is not
 true. Five things the loop composes were absent from `main` when W5b-6 surveyed
 it — a standalone grouped RMS norm for PLE's three norms, a PAGED QSA consumer,
-the group-2 block table (W5c-2), a MoE weight adapter, and an externally linked
+the group-2 block table (W5c-2, landed: the runner gathers every published
+group's table), a MoE weight adapter, and an externally linked
 mRoPE builder — and `ModelRegistry::Forward` additionally refuses every
 multi-cache topology by name, which is what this model publishes. Each is
 measured and cited under `## Owed`, and the production refusal in

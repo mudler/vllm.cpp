@@ -2412,6 +2412,137 @@ TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
   CHECK(msg.find("KV-DSV4-MULTICACHE W5") != std::string::npos);
 }
 
+// ─── MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3) — EVERY published group gathered ─
+//
+// THE GAP THIS CLOSES, in the issue's own words: "`gather_block_table` reaches
+// only `full_attn_group_id_` and `gdn_group_id_`, so the QSA indexer side cache
+// is allocated and unread." A cache the runner allocates and whose block table
+// never leaves the runner cannot be addressed by anything: the buffer is real,
+// the pages are real, and the map from a sequence's LOGICAL position to the
+// PHYSICAL page holding it stays inside `input_batch_`.
+//
+// UPSTREAM ANCHOR. `vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin
+// 5559679229 loops over EVERY published group and gives each its own table:
+//
+//     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+//         cm = copy(cm_base)
+//         ...
+//         if kv_cache_gid > 0:
+//             cm.block_table_tensor = _get_block_table(kv_cache_gid)
+//             cm.slot_mapping = slot_mappings[kv_cache_gid]
+//
+// with `_get_block_table` (`:2318-2334`) being exactly this tree's
+// `gather_block_table`: `self.input_batch.block_table[gid].get_device_tensor()`.
+// Upstream has no "the two named groups" shape at all — the count of groups it
+// serves is `len(kv_cache_groups)`.
+//
+// THE TABLE IS DELIBERATELY PERMUTED AND HAS NO FIXED POINT. An identity map
+// proves nothing: a body that ignores the table, returns the logical indices, or
+// gathers the wrong group's table still agrees with `{0, 1}`. Each group gets a
+// DISTINCT two-block list, none of which maps any logical index to itself, so
+// gathering group 2 with `gdn_group_id_` reads `{4, 7}` where `{5, 3}` is owed
+// and the case reds. The 20-token prompt spans two 16-token blocks with a
+// PARTIAL final block (4 tokens), so a body that assumed a whole final page is
+// visible here too.
+//
+// THIS DRIVES THE PRODUCTION ENTRY POINT. `GPUModelRunner::execute_model` is
+// what an engine calls; the gather runs inside it, and the forward it reaches
+// then REFUSES the multi-cache channel (KV-DSV4-MULTICACHE W5 owns the consuming
+// forward). The refusal is caught and READ, because the count it reports is the
+// production reader of the gathered tables — a value nothing reads is a value
+// nothing can be wrong about.
+TEST_CASE("runner: EVERY published KV group's block table is gathered (#2249)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeQwen4ExpShapedKvConfig();
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  // The topology this case believes it is driving, asserted rather than assumed.
+  REQUIRE(runner.full_attn_group_id() == 0);
+  REQUIRE(runner.gdn_group_id() == 1);
+  REQUIRE(runner.attn_group_ids() == std::vector<int>{0, 2});
+  REQUIRE(kv.kv_cache_groups.size() == 3);
+
+  // One distinct, non-identity, fixed-point-free list per PUBLISHED group.
+  const std::vector<std::vector<int>> want = {
+      {6, 2},  // group 0 — the sparse layers' paged K+V
+      {4, 7},  // group 1 — the uniform recurrent group
+      {5, 3},  // group 2 — the QSA INDEXER SIDE CACHE, the unread one
+  };
+
+  SchedulerOutput so;
+  SamplingParams sp;
+  sp.temperature = 0.0F;
+  NewRequestData nr;
+  nr.req_id = "r0";
+  // 20 tokens over a 16-token block: two blocks, the second one PARTIAL.
+  const std::vector<int32_t> prompt(20, 7);
+  nr.prompt_token_ids = prompt;
+  nr.sampling_params = sp;
+  nr.block_ids = want;
+  nr.num_computed_tokens = 0;
+  nr.prefill_token_ids = prompt;
+  so.scheduled_new_reqs.push_back(std::move(nr));
+  so.num_scheduled_tokens["r0"] = 20;
+  so.total_num_scheduled_tokens = 20;
+
+  std::string msg = "<did not throw>";
+  try {
+    (void)runner.execute_model(so);
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
+  }
+  // The forward is still refused, and the refusal now REPORTS the reach.
+  CHECK(msg.find("2 KV cache(s)") != std::string::npos);
+  CHECK(msg.find("block tables gathered for 3 of 3 published group(s)") !=
+        std::string::npos);
+
+  // The VALUES, per group. The expectation is the literal list fed to
+  // `add_row` above, not anything read back out of the runner.
+  const vllm::MultiKvCacheIndex& mk = runner.multi_kv_index();
+  for (int g = 0; g < 3; ++g) {
+    CAPTURE(g);
+    int cols = 0;
+    const std::vector<int32_t>* bt = mk.BlockTableForGroup(g, &cols);
+    REQUIRE(bt != nullptr);
+    // cdiv(32, 16) == 2, rounded up to a multiple of 128/16 == 8.
+    CHECK(cols == 8);
+    REQUIRE(bt->size() == static_cast<size_t>(cols));
+    CHECK((*bt)[0] == want[static_cast<size_t>(g)][0]);
+    CHECK((*bt)[1] == want[static_cast<size_t>(g)][1]);
+    // The columns past the sequence's two blocks were never written.
+    for (int i = 2; i < cols; ++i) CHECK((*bt)[static_cast<size_t>(i)] == 0);
+  }
+
+  // Group 2's table is NOT group 1's and NOT group 0's, stated as an inequality
+  // so that a gather keyed on the wrong id cannot pass by coincidence.
+  int c0 = 0, c1 = 0, c2 = 0;
+  CHECK(*mk.BlockTableForGroup(2, &c2) != *mk.BlockTableForGroup(1, &c1));
+  CHECK(*mk.BlockTableForGroup(2, &c2) != *mk.BlockTableForGroup(0, &c0));
+
+  // Out of range in both directions is a null answer, never a silent read.
+  int cx = 7;
+  CHECK(mk.BlockTableForGroup(3, &cx) == nullptr);
+  CHECK(cx == 0);
+  CHECK(mk.BlockTableForGroup(-1, &cx) == nullptr);
+}
+
+// A UNIFORM topology publishes no per-group tables at all: the channel stays
+// null, exactly as `layer_names` / `group_ids` / `layer_indices` do, so no model
+// shipping today can observe this wave.
+TEST_CASE("runner: the per-group block tables stay EMPTY on a uniform topology") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+  REQUIRE(runner.multi_kv_index().size() == 0);
+  int cols = 5;
+  CHECK(runner.multi_kv_index().BlockTableForGroup(0, &cols) == nullptr);
+  CHECK(cols == 0);
+  CHECK(runner.multi_kv_index().num_group_block_tables() == 0);
+}
+
 // ─── BYTE-NEUTRALITY: the uniform path does not enter the new code ──────────
 //
 // The obligation of this wave, stated as literals rather than as an absence of

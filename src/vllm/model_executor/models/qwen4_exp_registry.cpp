@@ -201,6 +201,17 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // rather than reworded, because a refusal enumerates what is missing and a
   // present item is not missing.
   //
+  // IT WENT STALE A THIRD TIME, ONE WAVE LATER, AND THE FIX RIDES WITH THE
+  // CHANGE THAT FALSIFIED IT. W5c-2 (#2249 item 3) makes
+  // `GPUModelRunner::gather_group_block_tables` gather EVERY published group's
+  // block table and publish it on `MultiKvCacheIndex`, so the clause that said
+  // the group-2 table "never gathers" describes the parent commit and not this
+  // one. The clause is REWRITTEN rather than deleted, because the half W5c-2
+  // does not close is real: the map into the side cache's pages now reaches the
+  // forward, and no consumer reads it. Saying "reach is missing" would name
+  // finished work; saying nothing would drop a live gap. Both are the failure
+  // this paragraph keeps being extended to remove.
+  //
   // WHAT PINS THIS STRING, checked rather than assumed. The `SUBCASE("the
   // forward")` of `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` drives
   // this hook with a foreign handle and asserts FIVE substrings:
@@ -214,13 +225,14 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
            "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..6, "
-           "W5c-1, W5d-1, W5d-2); what the layer loop still lacks is (1) a "
-           "PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock takes "
-           "contiguous [max_kv, ...] caches while make_kv_cache publishes "
-           "paged ones; (2) reach for the indexer side cache, whose group-2 "
-           "block table GPUModelRunner::gather_block_table never gathers "
-           "(W5c-2); and (3) an adapter from the stacked [E, I, H] qwen4_exp "
-           "MoE tensors onto MoeBlockWeights. "
+           "W5c-1, W5c-2, W5d-1, W5d-2); what the layer loop still lacks is "
+           "(1) a PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock "
+           "takes contiguous [max_kv, ...] caches, the indexer side cache "
+           "among them, while make_kv_cache publishes paged ones; the MAP into "
+           "those pages has arrived, because GPUModelRunner now gathers every "
+           "published group's block table and hands it to the forward "
+           "(W5c-2), and nothing reads it yet; and (2) an adapter from the "
+           "stacked [E, I, H] qwen4_exp MoE tensors onto MoeBlockWeights. "
            "ModelRegistry::Forward additionally refuses any multi-cache "
            "topology by name, and this model publishes one. See "
            ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");

@@ -23,6 +23,7 @@
 #ifndef VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 #define VLLM_CPP_SRC_VLLM_MODEL_EXECUTOR_MODELS_QWEN3_DFLASH_INTERNAL_H_
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -201,6 +202,58 @@ inline DflashBlockPagedInputs DflashBlockPagedInputsOf(int64_t ctx_len, int64_t 
   return in;
 }
 
+// The HOST attention metadata a draft block must hand `vt::PagedAttention`, so
+// the CUDA prefill launchers size their query-tile grid from host values
+// instead of taking the fallback. BOTH fields are load-bearing and `vt/ops.h`
+// states the cost of each default in the same words: `query_start_loc_host`
+// nullptr "=> the launcher falls back to the D2H+sync" (`:1546`) and
+// `max_seq_len` 0 "=> that launcher falls back to the D2H+sync" (`:1555`).
+//
+// THAT FALLBACK IS `cudaStreamSynchronize` (`cuda_paged_attn.cu:2272`), and it
+// is ILLEGAL INSIDE A CUDA GRAPH CAPTURE -- which is where this call runs, on
+// the one lane this tree captures (`P == 1`, `qwen3_dflash.cpp:1716`). Omitting
+// them is not a compile error and is merely slow wherever nothing is capturing,
+// so a non-captured run cannot see it; under capture the engine dies with
+// "operation not permitted when stream is capturing" (#2252).
+//
+// One request, so the query_start_loc is exactly [0, tq). `max_seq_len` is the
+// EXTENDED bound `ctx_len + tq`, the same value `DflashBlockPagedInputsOf`
+// derives and this call already refuses on if it disagrees; an upper bound is
+// explicitly safe because it only sizes grids (`ops.h:1551-1553`).
+struct DflashBlockPagedHostMeta {
+  std::array<int32_t, 2> qsl{};  // [0, tq) for the block's single request
+  int32_t max_seq_len = 0;       // ctx_len + tq
+};
+
+inline DflashBlockPagedHostMeta DflashBlockPagedHostMetaOf(int64_t ctx_len, int64_t tq) {
+  DflashBlockPagedHostMeta m;
+  m.qsl = {0, static_cast<int32_t>(tq)};
+  m.max_seq_len = static_cast<int32_t>(ctx_len + tq);
+  return m;
+}
+
+// The complete argument set for a draft block's paged attention, as a PURE
+// function of the block's shape -- so the wiring is gateable on the CPU. A test
+// that only checked `DflashBlockPagedHostMetaOf` would pass while production
+// forgot to USE it, which is exactly how #2252 shipped.
+//
+// `host_meta` must outlive the returned args: `query_start_loc_host` points
+// into it.
+inline vt::PagedAttentionArgs DflashBlockPagedArgsOf(float scale, bool causal,
+                                                     int64_t sliding_window, int64_t tq,
+                                                     const DflashBlockPagedHostMeta& host_meta) {
+  vt::PagedAttentionArgs pa;
+  pa.scale = scale;
+  const DflashBlockPagedMask mask = DflashBlockPagedMaskOf(causal, sliding_window);
+  pa.causal = mask.causal;
+  if (mask.has_window)
+    pa.window_size = vt::AttentionWindow{mask.window_left, mask.window_right};
+  pa.uniform_spec_query_len = static_cast<int32_t>(tq);
+  pa.query_start_loc_host = host_meta.qsl.data();
+  pa.max_seq_len = host_meta.max_seq_len;
+  return pa;
+}
+
 // THE ROUTED ATTENTION ITSELF — the write and the read, as ONE call.
 //
 // WHY THEY ARE ONE FUNCTION AND NOT TWO LINES IN THE FORWARD. The two ops are a
@@ -286,13 +339,12 @@ inline void DflashBlockPagedAttention(vt::Queue& q, vt::Tensor& out, const vt::T
              "addresses (SPEC-DFLASH2 W11, #1890)");
   }
   vt::ReshapeAndCache(q, block_k, block_v, pool_k, pool_v, slot_map);
-  vt::PagedAttentionArgs pa;
-  pa.scale = scale;
-  const DflashBlockPagedMask mask = DflashBlockPagedMaskOf(causal, sliding_window);
-  pa.causal = mask.causal;
-  if (mask.has_window)
-    pa.window_size = vt::AttentionWindow{mask.window_left, mask.window_right};
-  pa.uniform_spec_query_len = static_cast<int32_t>(query.shape[0]);
+  // #2252: `host_meta` outlives the call below, which is all it must do -- the
+  // launcher reads the qsl on the host to size its grid before it launches.
+  const DflashBlockPagedHostMeta host_meta =
+      DflashBlockPagedHostMetaOf(ctx_len, query.shape[0]);
+  const vt::PagedAttentionArgs pa =
+      DflashBlockPagedArgsOf(scale, causal, sliding_window, query.shape[0], host_meta);
   vt::PagedAttention(q, out, query, pool_k, pool_v, block_table, seq_ext, cu, pa);
 }
 

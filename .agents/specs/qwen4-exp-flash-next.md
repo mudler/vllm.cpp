@@ -367,6 +367,140 @@ granularity.
   indexer side cache. Adjacent to [#1963](https://github.com/mudler/vllm.cpp/issues/1963)
   and [#1966](https://github.com/mudler/vllm.cpp/issues/1966).
 
+### The KV-cache spec is THREE groups and ONE uniform recurrent group (W5c, #2031)
+
+`MakeQwen4ExpKVCache` returns instead of refusing. Landed by W5c; the shape and
+the reason are recorded here because the alternative shape is the one a reader
+arrives with.
+
+| # | layer_names | spec |
+|---|---|---|
+| 0 | the 12 QSA layers, `model.layers.<l>.self_attn.attn` | `FullAttentionSpec(block, 2, 256, ResolveKvCacheDType())` |
+| 1 | the 36 linear layers, `model.layers.<l>.linear_attn` | `MambaSpec(block, {{10240,3},{48,128,128},{10240,9},{2}}, {bf16, ssm, bf16, kI64})` |
+| 2 | the 12 QSA layers, `model.layers.<l>.self_attn.indexer.k_cache` | `MLAAttentionSpec(block, 128, ResolveKvCacheDType(), 1, …, compress_ratio=4)` |
+
+**ONE uniform recurrent group, not per-layer specs and not several groups, and
+that is the MIRROR rather than a shortcut.** Only ONE of the 36 linear layers
+carries the PLE conv and the n-gram history, so a per-layer spec set is the
+shape a reader expects. Upstream cannot produce it. Read at the pin
+`5559679229`:
+
+- `vllm/model_executor/models/interfaces.py:809-812` —
+  `get_mamba_state_shape_from_config(cls, vllm_config)` is a CLASSMETHOD over
+  the CONFIG, with no `layer_idx`. 19 definitions of that name tree-wide: this
+  protocol declaration plus **18 implementations**, and not one of them takes a
+  layer index.
+- `vllm/v1/worker/mamba_utils.py:441` — `get_mamba_groups` asserts
+  `all(mamba_specs[0] == spec for spec in mamba_specs)`: every `MambaSpec` in
+  the model EQUAL, `shapes` and `dtypes` included.
+- `vllm/v1/core/kv_cache_utils.py:1101-1109` — a `MambaSpec` whose page is
+  smaller than the model's max is given `page_size_padded=max_page_size` and is
+  otherwise unchanged. Upstream PADS. It does not split.
+
+**The cost, derived and not measured.** The PLE conv is `10240 x 9` at bf16 =
+184320 B and the n-gram history is 2 `int64` = 16 B, so **184336 B per sequence**
+on each of the **35** linear layers that never read them: **49.2 MiB** at the
+default `max_num_seqs` of 8, 0.09% of the GB10 headroom `## Hardware` accounts.
+Gated as a literal in `tests/vllm/models/test_qwen4_exp_kv_cache.cpp` against
+the same config with `ple_layer_ids` erased, so the number moves if the shapes
+do. **No device has allocated it** — see `## Owed`.
+
+This CORRECTS `.agents/specs/recurrent-multistate.md`, whose `## Owed` said a
+second recurrent group "IS on a PLE topology's path". That measurement fed
+upstream's grouping functions a heterogeneous per-layer input upstream never
+constructs. Both halves stay owed as generic engine debt —
+`ComputeHybridKvBudget` reads only the first mamba group
+(`src/vllm/v1/core/hybrid_kv_budget.cpp:26`) — and neither is on this row's path.
+
+**State order is `[gdn_conv, temporal, ple_conv, ngram]`, a deliberate
+divergence from upstream's list order, and the same bytes.** Upstream keeps the
+three CONV states adjacent (`number_of_conv_states = 3`) with the temporal state
+after them. `GdnStateCache` publishes `conv_state = states[0]` and
+`ssm_state = states[1]` as NAMED fields that THREE model families read —
+`qwen3_5.cpp`, `kimi_linear_device.cpp`, and the `nemotron_h` pair
+`nemotron_h_device.cpp` / `nemotron_h_forward.h` — so moving the temporal state
+off slot 1 would silently re-point three model families. Slice order differs;
+`page_size_bytes` does not.
+
+**Three, not four ([#2203](https://github.com/mudler/vllm.cpp/issues/2203)).**
+This wave first wrote FOUR here and in `qwen4_exp_registry.cpp`, inheriting the
+list from `.agents/specs/recurrent-multistate.md` (landed by `f7710c1b4`,
+[#2131](https://github.com/mudler/vllm.cpp/issues/2131)), whose fourth name is
+`gemma4_mm.cpp`. That file reads NEITHER field — zero occurrences of
+`conv_state` and zero of `ssm_state` — and its only two mentions of the type are
+an include comment and `std::vector<GdnStateCache> no_gdn_state;`
+(`gemma4_mm.cpp:221`), passed EMPTY. It is the file that proves Gemma-4 has no
+recurrent arm, cited as proving the opposite. `muse_glimmer_mm.cpp:340` and
+`qwen3_vl.cpp:621` carry the identical empty-vector shape, so the wrong fourth
+name was one of the three files that demonstrate the negative. Measured on
+`ad6696fa3`, `GdnStateCache` / `conv_state` / `ssm_state` counts per file:
+
+| File | `GdnStateCache` | `conv_state` | `ssm_state` |
+|---|---|---|---|
+| `qwen3_5.cpp` | 37 | 33 | 34 |
+| `nemotron_h_device.cpp` | 6 | 9 | 14 |
+| `kimi_linear_device.cpp` | 2 | 7 | 6 |
+| `gemma4_mm.cpp` | 2 | **0** | **0** |
+| `muse_glimmer_mm.cpp` | 2 | **0** | **0** |
+| `qwen3_vl.cpp` | 2 | **0** | **0** |
+
+A grep on the FIELD name over-counts in the other direction:
+`glm5_next_kda.cpp:343-345` matches `conv_state` 13 times, but that is
+`Glm5NextKdaCache::conv_state`, a `std::vector<float>` KDA sequence state
+(`include/vllm/model_executor/models/glm5_next_kda.h:314`), where this one is a
+`vt::Tensor` (`include/vllm/model_executor/models/qwen3_5.h:111`); that file has
+zero occurrences of `GdnStateCache`. Grep the TYPE. **The conclusion does not
+move:** re-pointing three families is still the reason the temporal state stays
+on slot 1. Only the enumeration was wrong, and no checker can see this class —
+`check-symbol-anchors` resolves symbols, and `GdnStateCache` genuinely appears
+in `gemma4_mm.cpp`, so symbol existence passes on a file whose behaviour is the
+opposite of the one asserted. Same class as
+[#2198](https://github.com/mudler/vllm.cpp/issues/2198), which this wave closes.
+
+**Group 2 must be an `MLAAttentionSpec`, and a `FullAttentionSpec` there fails
+SILENTLY.** The runner's leftover scan treats the first published
+`kFullAttention` group that is neither the target nor the recurrent one as the
+single `fa_draft` draft-KV slot and `continue`s
+(`src/vllm/v1/worker/gpu/runner.cpp`, the `draft_slot_taken` arm). The leftover
+count then stays 0, `multi_cache_topology` stays false, the legacy one-buffer-
+per-layer path runs, and the side cache is published and never allocated with
+nothing reported. `kMlaAttention` is not absorbed by that arm, so the topology
+is multi-cache and every published cache gets a buffer.
+
+**Real per-layer names, never placeholders.**
+`ResolveKVCacheGroupLayerNames` rewrites a placeholder group set, but its
+fallback can name only a TARGET attention group and one `fa_draft` slot: a THIRD
+attention group reaches `group.layer_names.clear()`
+(`src/vllm/v1/kv_cache_interface.cpp`), and an unnamed group is then refused by
+the runner's multi-cache admission check for names that "do not all resolve to
+distinct in-range layer indices". Publishing real names also makes that rewrite
+a no-op by its own idempotence guard, gated in the KV suite.
+
+**`block_size % compress_ratio != 0` is refused BY NAME**, because
+`storage_block_size()` is integer division
+(`vllm/v1/kv_cache_interface.py:393-395`) and truncating it sizes the page for
+fewer states than the block covers — a short cache, i.e. wrong tokens rather
+than a crash. Upstream never meets it (its DeepSeek-V4 block sizes are powers of
+two above the ratio); ours arrives as a caller-supplied parameter.
+
+**A non-uniform `compress_ratio` was ALREADY refused and was NOT gated.**
+`Qwen4ExpHfConfigFromGguf` takes the first non-zero entry of the per-layer
+`attention.compress_ratios` and requires the rest to agree — the mirror of
+upstream's `MLAAttentionSpec.merge` assert
+(`vllm/v1/kv_cache_interface.py:424-435`) — and deleting that `VT_CHECK` left
+`test_qwen4_exp_gguf_weights` fully green. W5c gates it rather than adding a
+second copy in the KV builder. The fixture has to DOUBLE `block_count` to reach
+it: at four layers and `full_attention_interval` 4 there is exactly one sparse
+layer, one non-zero ratio cannot disagree with itself, and a stray non-zero on a
+linear layer is caught one check earlier by the schedule agreement.
+
+**Two refusals W5c did NOT add, because W1 already has them**, verified rather
+than assumed: a `ple_layer_ids` entry outside the one-indexed range, and a PLE
+id landing on a layer the rewrite made sparse
+(`src/vllm/model_executor/models/qwen4_exp.cpp`), both gated by named subcases
+in `test_qwen4_exp_scaffold.cpp`. A second copy in the KV builder would be a
+second derivation of one rule.
+
 ### The n-gram embedding is integer-exact or it is silently wrong
 
 Derived from the lane pin and then **verified against the published checkpoint** by
@@ -1445,6 +1579,79 @@ trivially true there and a mask passes them all. At kv_len 3002 the gather reads
 2050 of 3002 rows per query token and the same assertions bite. A QSA gate that
 never crosses 2048 is not a weaker gate; it is not a gate.
 
+## Mutation record — W5c-1 (#2031)
+
+Every mutation was sha256-proven applied, **its BUILD rc was read before any
+test result**, the tree was restored byte-for-byte with the hash re-checked, and
+the final head was re-measured green afterwards. `runner.cpp` was measured at
+`e538172d207f…`, `qwen4_exp_registry.cpp` at `2c30140e7b65…`,
+`qwen4_exp_gguf_weights.cpp` at `b88f6e9ba247…`, and all three hashes are the
+head's. I is the one row whose CASE gained assertions after its first run (the
+`KVBytesPerBlock` pair), so it was re-run on the final head and reads the same
+2 cases / 5 assertions.
+
+### The RED, before the change
+
+`test_qwen4_exp_kv_cache` at the branch base, every case entering through
+`reg.factory->make_kv_cache`:
+
+```
+test_qwen4_exp_kv_cache.cpp:131: ERROR: test case THREW exception:
+  Qwen4ExpForConditionalGeneration: the KV-cache spec is not ported yet
+  (W4 owes the QSA indexer side cache and W2 the third conv state for the
+   n-gram token history). See .agents/specs/qwen4-exp-flash-next.md and #1978.
+[doctest] test cases:  3 |  0 passed | 3 failed | 0 skipped
+[doctest] assertions: 32 | 23 passed | 9 failed |
+```
+
+Green at the head: **4 cases / 399 assertions / rc 0** (the fourth case, the
+`--kv-cache-dtype fp8` consequence, was written after the first red).
+
+### Counts, before and after, on the same tree
+
+| Suite | Before | After |
+|---|---|---|
+| `test_runner` | 31 / 884 / rc 0 | 32 / 990 / rc 0 |
+| `test_qwen4_exp_kv_cache` | did not exist | 4 / 399 / rc 0 |
+| `test_qwen4_exp_gguf_weights` | 11 / 2970 / rc 0 | 11 / 2975 / rc 0 (one new SUBCASE inside an existing case) |
+| `test_qwen4_exp_scaffold` | 12 / 296 / rc 0 | 12 / 296 / rc 0 |
+| `test_qwen4_exp_qsa` | 14 / 7263 / rc 0 | 14 / 7263 / rc 0 |
+| `test_qwen27_paged_forward` | 31 / 770 / rc 0 | 31 / 770 / rc 0 |
+| `test_nemotron_h_paged_forward` | 13 / 3269 / rc 0 | 13 / 3269 / rc 0 |
+| `test_kimi_linear_paged` | 8 / 206 / rc 0 | 8 / 206 / rc 0 |
+
+`test_runner` moves by exactly the one case this wave adds. `test_qwen4_exp_qsa`
+is byte-identical although its header changed, which is the check that the
+#2198 fix touched only comments.
+
+### The battery
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| A | delete `alloc_recurrent_layer_states` **inside `if (multi_cache_topology)`**, in its `membership_by_name && has_mamba_group` recurrent loop | rc 0 | `test_runner` RED — and ONLY the new case, confirmed scoped: `1 case / 0 passed / 1 failed / 31 skipped`, at `REQUIRE(runner.gdn_state().size() == 3)`. The three model suites stay byte-identically green. **This is the `## Owed` item `.agents/specs/recurrent-multistate.md` recorded: at that row's head the same deletion left ALL FOUR suites fully green** |
+| B | **CONTROL** — delete the LEGACY single-topology `is_gdn` call site | rc 0 | `test_runner` rc 139 (10 of 13 reached cases failed), `test_nemotron_h_paged_forward` rc 139 (5 of 5 reached), `test_kimi_linear_paged` rc 1 (2 of 8), `test_qwen27_paged_forward` 31 / 770 / rc 0. The deletion harness is LIVE, so A's scoped red is a finding and not a dead instrument |
+| C | the recurrent alloc AND view read `state_dtypes[i < 2 ? i : 0]` — states 2 and 3 get `dtypes[0]` | rc 0 | `test_runner` RED, 2 cases. Scoped to the new case: 13 of 106 assertions, every one on `states[3].dtype`, `states[3].Bytes()`, or a total that sums it. The three model suites stay green |
+| D | the recurrent view reads `state_shapes[i == 2 ? 1 : i]` — state 2 gets the TEMPORAL shape | rc 0 | `test_runner` RED, 2 cases. Scoped: 16 of 106, on `states[2].rank`, its shape, its bytes and the two byte-identity totals. The three model suites stay green |
+| E | publish group 2 as a `FullAttentionSpec` instead of an `MLAAttentionSpec` | rc 0 | `test_qwen4_exp_kv_cache` RED, 2 of 4 cases: the `kMlaAttention` kind, the `MLAAttentionSpec` downcast, and BOTH `fp8` refusal assertions — because a non-MLA third group is one an fp8 cache would silently accept |
+| F | delete the `block_size % compress_ratio` refusal | rc 0 | `test_qwen4_exp_kv_cache` RED, 4 assertions, all in the refusal case. Nothing else moves |
+| G | delete the non-uniform `attention.compress_ratios` refusal in `Qwen4ExpHfConfigFromGguf` | rc 0 | `test_qwen4_exp_gguf_weights` RED, 2 assertions. **Before this wave the same deletion left that suite fully green** — the refusal existed and gated nothing |
+| H | **REACHABILITY** — unhook `.make_kv_cache` from `kQwen4ExpFactory` | **rc 1** | **A BUILD REFUSAL, not a test verdict, and it is read as such:** `error: 'MakeQwen4ExpKVCache' defined but not used [-Werror=unused-function]`. The production factory table is the function's ONLY reference in the tree, so the compiler proves the reach that a test result would only have suggested. No suite ran under this mutation |
+| I | drop the `number_of_conv_states() == 3` branch, so the group always publishes two states | rc 0 | `test_qwen4_exp_kv_cache` RED, 2 of 4 cases: the four-shape `REQUIRE`, the 184336 B surcharge, the 51614080 B slack and the 3391504 B page. The uniform-cost accounting is load-bearing rather than decorative |
+
+**Why A needed a NEW fixture and the existing one could not do it.**
+`test_runner.cpp`'s "a multi-cache topology keeps its recurrent group" already
+combines a multi-cache attention set with a mamba group, and it survives A
+untouched: everything it asserts — `layer_kv_class_`, `gdn_group_id_`,
+`recurrent_group_ids_`, the per-layer index lists — is computed BEFORE the
+allocation loop runs. Classification and allocation are different failures, and
+only the second one is what a short KV cache is.
+
+**What the battery did NOT reach**, stated because a battery's silence is not a
+result: the four-state group is never allocated on a DEVICE (the CPU host takes
+`CacheBuffer`'s host-vector arm), nothing decodes through the published caches,
+and no mutation here can see the zero-seeded n-gram history, because no test in
+this tree reads that row's CONTENTS. All three are under `## Owed`.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -2146,24 +2353,80 @@ is listed under `## Owed`.
   keyed on `#2123`, reporting it as the duplicate two branches appending the
   same issue would produce.
 
-- **W5c, the KV-cache spec, is OWED and blocked behind W5b.** It needs three
-  conv states on a PLE layer (GDN conv, PLE conv, and an int64 n-gram token
-  history) plus the QSA indexer side cache. **The runner cannot represent the
-  third stream today**, which is an ENGINE blocker and is now filed as
-  [#2131](https://github.com/mudler/vllm.cpp/issues/2131):
-  `src/vllm/v1/worker/gpu/runner.cpp` asserts
-  `mamba_spec->shapes.size() == 2 && mamba_spec->dtypes.size() == 2` and reads
-  `shapes[0]` as conv and `shapes[1]` as temporal, the topology refusal above it
-  admits exactly ONE `MambaSpec` group, and `gdn_group_id_` is a scalar index
-  rather than a list. W5c cannot be written against the runner as it stands.
-  One naming correction found in W5a: this tree's `MLAAttentionSpec` has NO
-  `tokens_per_state` field. The
-  compression knob is spelled **`compress_ratio`**
-  (`include/vllm/v1/kv_cache_interface.h`), and `storage_block_size()` returns
-  `block_size / compress_ratio`, which is the same semantics under a different
-  name. The only `tokens_per_state` identifier in the repository is W4's own
-  `QsaSideCacheSpec`. A W5c implementer reaching for the upstream spelling
-  finds nothing.
+- **W5c-1, the KV-cache spec, has LANDED**, and this bullet is what it
+  replaces rather than a claim it is still owed. It publishes three groups (see
+  `### The KV-cache spec is THREE groups and ONE uniform recurrent group`) and
+  `MakeQwen4ExpKVCache` returns instead of refusing. The engine blocker this
+  bullet named — the runner's `shapes.size() == 2` refusal — was closed by
+  `ENG-RECURRENT-MULTISTATE`
+  ([#2131](https://github.com/mudler/vllm.cpp/issues/2131), `f7710c1b4`), and
+  the SECOND half it named, more than one recurrent group, turned out **not to
+  be on this row's path at all**: upstream declares one recurrent shape
+  model-wide, so `qwen4_exp` publishes ONE uniform recurrent group and a scalar
+  `gdn_group_id_` carries it. The naming correction this bullet recorded is now
+  fixed in the source it was about, in flow, as
+  [#2198](https://github.com/mudler/vllm.cpp/issues/2198): W4's two comments in
+  `src/vllm/model_executor/models/qwen4_exp_qsa.h` cited a `tokens_per_state`
+  field with ZERO hits over the pinned vLLM tree and anchored it at an
+  unrelated function; they now cite `compress_ratio`
+  (`vllm/v1/kv_cache_interface.py:386`, `:393-395`, `:424-435`). The LOCAL
+  `QsaSideCacheSpec::tokens_per_state` keeps its name — its arithmetic is right
+  and pinned — with a comment saying it has no upstream referent.
+- **THE N-GRAM HISTORY IS ZERO-SEEDED, AND 0 IS A VALID TOKEN ID. Nothing in
+  this tree can see it.** `CacheBuffer` zero-fills every recurrent state it
+  allocates (`src/vllm/v1/worker/gpu/runner.cpp`, both the host and the
+  device-`Memset` arm), which is correct for every float state — zero bytes are
+  `+0.0f` — and WRONG for the n-gram token history. Upstream's own
+  `update_conv_state` pads with 0 too, and the model works around it with an
+  explicit EOS left-pad; `PleSequenceState::Reset`
+  (`src/vllm/model_executor/models/qwen4_exp_ple.h`) says so in terms: "Pad with
+  EOS, never with zero." The forward must therefore EOS-seed that row on the
+  same `prefill_has_initial_state == 0` predicate the GDN temporal state already
+  uses (`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1513-1514`,
+  mirrored at `include/vllm/model_executor/models/qwen3_5.h`). W5c-1 publishes
+  the state and CANNOT seed it, because there is no `Qwen4ExpTextModel::Forward`
+  to seed it in — that is W5b. **No gate here can catch a zero seed**: token id
+  0 hashes to a valid table row, so the model produces fluent wrong text, and
+  the only oracle that would catch it is a transformers run this row cannot
+  stand up (`gateable = no`). Owned by W5b under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031). Written down rather
+  than solved, and it is the single most expensive thing in this section.
+- **NOTHING GATHERS GROUP 2's BLOCK TABLE, so the QSA side cache lands
+  ALLOCATED AND UNREAD.** `GPUModelRunner::gather_block_table` is called for
+  `full_attn_group_id_` and `gdn_group_id_` and for no other group
+  (`src/vllm/v1/worker/gpu/runner.cpp`), so the indexer group's per-request
+  block rows never reach a forward. Named under all four "Nothing lands dead"
+  conditions: what is unreached is the group-2 block table and the reads that
+  would consume it; the row that owns the wiring is `MODEL-MM-QWEN4-EXP` at
+  **W5c-2**; the issue that tracks it is
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031); and it is listed
+  here, which is the `## Owed` entry the rule requires. The buffer itself IS
+  allocated and gated — `test_runner.cpp`'s
+  "a multi-cache topology ALLOCATES its N-state recurrent group" asserts the
+  per-group pages — so this is an unread cache and not an unallocated one.
+- **EVERY BYTE FIGURE IN THIS ROW IS DERIVED, NOT MEASURED.** On a CPU host
+  `kv_cache_backend_resident_` is false
+  (`!platforms::GetPlatform(dev.type).is_cpu()`), so the runner takes host
+  vectors and nothing on a device has ever held this model's KV. The 3391504 B
+  page, the 49.2 MiB uniform slack and the 64 B/token/layer side cache are
+  arithmetic over the published shapes, gated as literals, and they are not a
+  measurement. Gateable only on `dgx:gpu0`, and `--device cuda` still refuses
+  ahead of any tensor I/O for the n-gram expansion
+  ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)).
+- **`--kv-cache-dtype fp8` now refuses the WHOLE model**, and that is a
+  consequence of publishing an MLA group rather than a defect of it.
+  `ApplyCacheDType` refuses any `MLAAttentionSpec`
+  (`src/vllm/v1/kv_cache_interface.cpp`, `RetypeAttentionSpec`) because upstream
+  gives an MLA page its own quantized formula (`fp8_ds_mla`,
+  `kv_cache_interface.py:398-410`) and this tree has the formula with no
+  fp8_ds_mla store or read. Gated as an executable consequence in
+  `test_qwen4_exp_kv_cache.cpp` rather than left to be discovered from a command
+  line. The fp8_ds_mla read/write side is NOT this row's; `auto` is unaffected
+  and is the production default.
+- **The >2048-token QSA gate still has no forward to run.** `## Gates` requires
+  a QSA correctness gate past `indexer_budget` tokens of context, because below
+  it every candidate block is selected and a pooled-key defect is invisible.
+  W5c-1 publishes the cache that gate needs and decodes nothing. Owed by W5b.
 - **The VISION path is owed and has no GGUF artifact to load.** The tower is an
   unchanged `Qwen3_5MoeVisionModel`, but the shipped `unsloth` UD-IQ1_S file is
   TEXT-ONLY: its 1224 tensors are 768 hyper-connection/MoE, 324 Gated DeltaNet,
@@ -2314,6 +2577,7 @@ and the sixth, W5a, is the first with a production call site:
 | W5a | the GGUF weight loader, REACHED through the `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 | W5b-1 | `RunGdnBlockPaged`, the GDN block seam the forward needs cross-TU | [#2110](https://github.com/mudler/vllm.cpp/issues/2110) |
 | W5b-2 | the gated-residual hyper-connection stream as two `vt::` ops | [#2123](https://github.com/mudler/vllm.cpp/issues/2123) |
+| W5c-1 | the KV-cache spec: THREE groups, REACHED through `make_kv_cache` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
@@ -2325,10 +2589,24 @@ n-gram table would otherwise expand from 26.822 GiB to 95.368 GiB of host
 memory ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)); the CUDA
 gather arm is owed.
 
-**Reached, and still refusing:** the forward and the KV-cache spec. Nothing
-decodes a token, so there is still no token number, no speed number, no
-`examples/server` e2e and no `docs/USAGE.md` weights row — that row is owed in
-the same change that makes an arm SERVE, which is W5b, not W5a. W2, W3 and W4
+**Reached, and no longer refusing: the KV-cache spec.** W5c-1
+([#2031](https://github.com/mudler/vllm.cpp/issues/2031)) makes
+`make_kv_cache` return three groups — the QSA layers' paged K+V, ONE uniform
+recurrent group carrying `[gdn_conv, temporal, ple_conv, ngram]` on every
+linear layer, and the QSA indexer side cache as an `MLAAttentionSpec` at
+`compress_ratio` 4 — over real per-layer names, so the runner takes its
+multi-cache path and allocates every published cache. The engine half was
+`ENG-RECURRENT-MULTISTATE` (#2131); the second half that row expected to be
+needed, more than one recurrent group, is NOT on this path, because upstream
+declares one recurrent shape model-wide. Three things it does not do, each under
+`## Owed`: the n-gram history is ZERO-SEEDED where it needs EOS and no gate here
+can see that, nothing gathers the side cache's block table (W5c-2), and every
+byte figure is derived on a CPU host rather than measured on a device.
+
+**Reached, and still refusing:** the forward. Nothing decodes a token, so there
+is still no token number, no speed number, no `examples/server` e2e and no
+`docs/USAGE.md` weights row — that row is owed in the same change that makes an
+arm SERVE, which is W5b, not W5a. W2, W3 and W4
 remain host reference math with no production call site.
 
 **What is owed, in order.** W5b, the forward in `vt::` ops

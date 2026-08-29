@@ -38,6 +38,7 @@
 #include "vt/device.h"
 #include "vllm/model_executor/models/qwen4_exp.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/kv_cache_interface.h"
 
 using vllm::HfConfig;
 using vllm::LoadHfConfig;
@@ -795,15 +796,21 @@ TEST_CASE("qwen4_exp: the safetensors load, the forward and the KV spec refuse B
     CHECK(msg.find("was not produced by") == std::string::npos);
   }
 
-  SUBCASE("the KV-cache spec") {
-    std::string msg;
-    try {
-      (void)reg.factory->make_kv_cache(config, 16, 4);
-    } catch (const std::exception& e) {
-      msg = e.what();
-    }
-    CHECK(msg.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
-    CHECK(msg.find("KV-cache spec") != std::string::npos);
+  SUBCASE("the KV-cache spec no longer refuses") {
+    // CHANGED AT W5c (#2031), AND THE OLD ASSERTION IS RECORDED HERE SO THE
+    // CHANGE IS NOT READ AS A WEAKENING. This subcase used to assert that
+    // `make_kv_cache` threw naming "Qwen4ExpForConditionalGeneration" and
+    // "KV-cache spec"; W5c makes it RETURN a three-group config, so the
+    // refusal that assertion pinned no longer exists. What gates the spec's
+    // CONTENT is `test_qwen4_exp_kv_cache.cpp`, which drives this same hook.
+    // What is left to gate HERE is the polarity: the forward above still
+    // refuses while this one does not, and a reader of this case is entitled
+    // to see which of the two moved.
+    CHECK_NOTHROW((void)reg.factory->make_kv_cache(config, 16, 4));
+    const vllm::v1::KVCacheConfig kv =
+        reg.factory->make_kv_cache(config, 16, 4);
+    CHECK(kv.kv_cache_groups.size() == 3);
+    CHECK(kv.num_blocks == 4);
   }
 }
 

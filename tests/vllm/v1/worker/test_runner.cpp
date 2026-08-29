@@ -2181,6 +2181,195 @@ TEST_CASE("runner: a multi-cache topology keeps its recurrent group") {
   CHECK(runner.layer_attn_kv_indices()[2].size() == 5);
 }
 
+// ─── A qwen4_exp-SHAPED topology: THREE groups, and FOUR recurrent states ────
+//
+// This closes two `## Owed` items in `.agents/specs/recurrent-multistate.md`
+// at once, and it is the first fixture in the tree to do either:
+//
+//   * "The multi-cache recurrent allocation site is UNEXERCISED." The
+//     `alloc_recurrent_layer_states` call inside `if (multi_cache_topology)`,
+//     in its `membership_by_name && has_mamba_group` recurrent loop, could be
+//     DELETED with all four recurrent suites green. The case above
+//     ("keeps its recurrent group") asserts CLASSIFICATION — `layer_kv_class_`,
+//     `gdn_group_id_`, the per-layer index lists — and every one of those is
+//     computed before the allocation, so it cannot see the allocation go away.
+//     This case asserts what was ALLOCATED.
+//   * "Nothing publishes N >= 3." Every recurrent registry in the tree
+//     published two states, so the N-general arm landed EXPRESSIBLE and
+//     UNREACHED. `MakeQwen4ExpKVCache` (W5c, #2031) publishes FOUR, and this
+//     is that shape at four layers instead of forty-eight.
+//
+// The miniature is `Qwen4ExpForConditionalGeneration`'s geometry: a 3:1
+// linear:sparse schedule, one paged K+V group over the sparse layers, ONE
+// uniform recurrent group over every linear layer carrying
+// [gdn_conv, temporal, ple_conv, ngram], and the QSA indexer side cache as an
+// `MLAAttentionSpec` at compress_ratio 4 — which is what makes the topology
+// multi-cache at all. A `FullAttentionSpec` there would be absorbed as the
+// single `fa_draft` draft-KV slot instead and get no buffer.
+//
+// The four state sizes are pairwise DISTINCT in element count, and the set
+// covers three ranks and two dtypes, so no implementation that reuses
+// `shapes[0]`, `shapes[1]`, `dtypes[0]` or a factor of 2 can produce them:
+//   gdn_conv  {64, 3}     bf16 ->  384 B/slot   rank 2
+//   temporal  {4, 8, 8}   f32  -> 1024 B/slot   rank 3
+//   ple_conv  {128, 9}    bf16 -> 2304 B/slot   rank 2
+//   ngram     {2}         i64  ->   16 B/slot   rank 1
+namespace {
+
+constexpr int64_t kQ4ConvElems = 64 * 3;
+constexpr int64_t kQ4SsmElems = 4 * 8 * 8;
+constexpr int64_t kQ4PleElems = 128 * 9;
+constexpr int64_t kQ4NGramElems = 2;
+constexpr int64_t kQ4MambaPage =
+    kQ4ConvElems * 2 + kQ4SsmElems * 4 + kQ4PleElems * 2 + kQ4NGramElems * 8;
+
+KVCacheConfig MakeQwen4ExpShapedKvConfig() {
+  KVCacheConfig kv;
+  kv.num_blocks = kNumBlocks;
+  // Group 0 — the sparse layer's paged K+V. Layer 3 is the `full_attention`
+  // entry in MakeConfig()'s [LA, LA, LA, FA] schedule, which upstream's
+  // `__post_init__` rewrites to `qwen_sparse_attention`.
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.3.self_attn.attn"},
+      std::make_shared<FullAttentionSpec>(kBlockSize, /*num_kv_heads=*/2,
+                                          /*head_size=*/8,
+                                          vllm::v1::ResolveKvCacheDType()));
+  // Group 1 — ONE uniform recurrent group over EVERY linear layer, carrying the
+  // PLE states that only one of them uses. That is upstream's polarity, not a
+  // shortcut: `get_mamba_state_shape_from_config` is a classmethod with no
+  // `layer_idx` (`interfaces.py:809-812`) and `get_mamba_groups`
+  // (`mamba_utils.py:441`) asserts every `MambaSpec` in the model equal.
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.0.linear_attn",
+                               "model.layers.1.linear_attn",
+                               "model.layers.2.linear_attn"},
+      std::make_shared<MambaSpec>(
+          kBlockSize,
+          std::vector<std::vector<int64_t>>{{64, 3},
+                                            {4, 8, 8},
+                                            {128, 9},
+                                            {kQ4NGramElems}},
+          std::vector<DType>{DType::kBF16, DType::kF32, DType::kBF16,
+                             DType::kI64}));
+  // Group 2 — the QSA indexer side cache. One key vector per FOUR tokens, no V.
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.3.self_attn.indexer.k_cache"},
+      std::make_shared<vllm::v1::MLAAttentionSpec>(
+          kBlockSize, /*head_size=*/8, vllm::v1::ResolveKvCacheDType(),
+          /*num_kv_heads=*/1, vllm::v1::KVQuantMode::kNone,
+          /*page_size_padded=*/std::nullopt,
+          /*indexes_kv_by_block_stride=*/false,
+          /*cache_dtype_str=*/std::nullopt, /*alignment=*/std::nullopt,
+          /*compress_ratio=*/4, /*model_version=*/std::nullopt));
+  return kv;
+}
+
+}  // namespace
+
+TEST_CASE("runner: a multi-cache topology ALLOCATES its N-state recurrent group") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeQwen4ExpShapedKvConfig();
+  REQUIRE(vllm::v1::ResolveKvCacheDType() == DType::kBF16);
+
+  const auto* mamba =
+      dynamic_cast<const MambaSpec*>(kv.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(mamba != nullptr);
+  REQUIRE(mamba->shapes.size() == 4);
+  REQUIRE(mamba->page_size_bytes() == kQ4MambaPage);
+  REQUIRE(kQ4MambaPage == 3728);
+
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+  const int64_t slots = runner.gdn_state_slots();
+  REQUIRE(slots == 8);
+
+  // 1. THE TOPOLOGY IS THE MULTI-CACHE ONE. Asserted rather than assumed,
+  //    because if it were not, the recurrent buffers below would come from the
+  //    LEGACY `is_gdn` call site and this case would gate the site that already
+  //    had four suites on it.
+  CHECK(runner.attn_group_ids() == std::vector<int>{0, 2});
+  CHECK(runner.recurrent_group_ids() == std::vector<int>{1});
+  CHECK(runner.gdn_group_id() == 1);
+  CHECK(runner.full_attn_group_id() == 0);
+  using LKC = GPUModelRunner::LayerKvClass;
+  CHECK(runner.layer_kv_class()[0] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[1] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[2] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[3] == LKC::kMultiCache);
+  // Layer 3 owns TWO caches: its paged K+V and its indexer side cache.
+  REQUIRE(runner.layer_attn_kv_indices().size() == 4);
+  CHECK(runner.layer_attn_kv_indices()[3] == std::vector<int32_t>{0, 1});
+  CHECK(runner.attn_kv_layer_names() ==
+        std::vector<std::string>{"model.layers.3.self_attn.attn",
+                                 "model.layers.3.self_attn.indexer.k_cache"});
+
+  // 2. THE RECURRENT ALLOCATION HAPPENED, on the multi-cache path. This is the
+  //    assertion the deletion mutation reds: with that call site removed,
+  //    `recurrent_state_buf_` stays empty, so `gdn_state_` is empty too.
+  REQUIRE(runner.gdn_state().size() == 3);
+
+  for (const GdnStateCache& gs : runner.gdn_state()) {
+    REQUIRE(gs.states.size() == 4);
+    // The two legacy NAMES are still slots 0 and 1, which is why the temporal
+    // state sits between the conv states rather than after them.
+    CHECK(gs.states[0].data == gs.conv_state.data);
+    CHECK(gs.states[1].data == gs.ssm_state.data);
+    // Each state carries its OWN rank, shape and dtype, slot dim prepended.
+    CHECK(gs.states[0].rank == 3);
+    CHECK(gs.states[1].rank == 4);
+    CHECK(gs.states[2].rank == 3);
+    CHECK(gs.states[3].rank == 2);
+    CHECK(gs.states[0].dtype == DType::kBF16);
+    CHECK(gs.states[1].dtype == DType::kF32);
+    CHECK(gs.states[2].dtype == DType::kBF16);
+    CHECK(gs.states[3].dtype == DType::kI64);
+    CHECK(std::vector<int64_t>{gs.states[2].shape[0], gs.states[2].shape[1],
+                               gs.states[2].shape[2]} ==
+          std::vector<int64_t>{slots, 128, 9});
+    CHECK(std::vector<int64_t>{gs.states[3].shape[0], gs.states[3].shape[1]} ==
+          std::vector<int64_t>{slots, kQ4NGramElems});
+    // Four DISTINCT allocations, none an alias or a re-view of another.
+    for (size_t i = 0; i < 4; ++i) {
+      CAPTURE(i);
+      CHECK(gs.states[i].data != nullptr);
+      for (size_t j = i + 1; j < 4; ++j) CHECK(gs.states[i].data != gs.states[j].data);
+    }
+    // 3. STATES 2 AND 3 ARE LOAD-BEARING. Their byte counts are their OWN
+    //    element count times their OWN element size, and both differ from
+    //    everything slots 0 and 1 could supply: reusing `shapes[1]` for the PLE
+    //    conv gives 8192 rather than 18432, and reusing `dtypes[0]` for the
+    //    n-gram history gives 32 rather than 128.
+    CHECK(static_cast<int64_t>(gs.states[2].Bytes()) == slots * kQ4PleElems * 2);
+    CHECK(static_cast<int64_t>(gs.states[2].Bytes()) == 18432);
+    CHECK(static_cast<int64_t>(gs.states[3].Bytes()) ==
+          slots * kQ4NGramElems * 8);
+    CHECK(static_cast<int64_t>(gs.states[3].Bytes()) == 128);
+  }
+
+  // 4. BYTE IDENTITY between what the runner took and what it reports, and
+  //    between that and what the ENGINE's own budget charges for this group.
+  //    A state the allocator skipped or the reporter missed shows up here
+  //    rather than as a short cache nothing mentions.
+  int64_t recurrent_bytes = 0;
+  for (const GdnStateCache& gs : runner.gdn_state())
+    for (const vt::Tensor& s : gs.states)
+      recurrent_bytes += static_cast<int64_t>(s.Bytes());
+  CHECK(recurrent_bytes == 3 * slots * kQ4MambaPage);
+  CHECK(recurrent_bytes == 89472);
+  CHECK(runner.kv_cache_allocated_bytes() -
+            runner.kv_cache_allocated_paged_bytes() == recurrent_bytes);
+  CHECK(vllm::v1::recurrent_state_bytes(kv, /*max_num_seqs=*/8) ==
+        recurrent_bytes);
+
+  // 5. And the paged half, from each group's OWN page: 16*2*(8+8)*2 = 1024 for
+  //    the K+V group, and (16/4)*1*8*2 = 64 for the compress-ratio-4 side
+  //    cache, over 8 blocks.
+  CHECK(runner.attn_kv().size() == 2);
+  CHECK(runner.kv_cache_allocated_paged_bytes() == kNumBlocks * (1024 + 64));
+  CHECK(runner.kv_cache_allocated_bytes() == 8704 + 89472);
+}
+
 // ─── The third forward channel ──────────────────────────────────────────────
 //
 // `ModelRegistry::Forward` is the shared decode seam AGENTS.md routes every

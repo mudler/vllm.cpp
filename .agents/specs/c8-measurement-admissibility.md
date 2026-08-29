@@ -15,6 +15,42 @@ because the implementation needs a working GPU and this does not.
 
 `ACTIVE` — spec only. No implementation lands with it.
 
+## CORRECTION: this spec named the WRONG committed harness
+
+As written below, this spec routes the c=8 ladder through
+`tools/bench/dflash2_speed_harness.py`. **That harness measures a different
+axis.** It is a thin client of `examples/cli` (`vllm-cli`) and drives ONE
+PROCESS PER PROMPT — single-stream draft speed, the axis recorded at 0.8017x by
+`bae0392dd`. It has no notion of concurrency at all.
+
+The c=8 comparison against vLLM and SGLang is a CONCURRENT SERVING axis, and the
+committed instrument for it is **`scripts/dgx-online-serving.sh`**:
+
+- `:627` — `concurrency_points="1 2 4 8 16 32"`, which is the ladder itself.
+- `:1209` — `--execute` is "a PURE TIMED production grid: model gate +
+  INTERLEAVED timed" runs.
+- `:5-7` — "Timed requests are issued only by pinned vLLM `bench serve`; this
+  script owns server lifecycle, interleaving, the one-model/one-lock boundary,
+  memory return, and artifact capture."
+
+So the ad-hoc `bisect2.sh` was not merely bypassing a harness; it was
+reimplementing the grid, the interleaving, the lease boundary and the artifact
+capture that this script already owns.
+
+**Everything below stands except the harness name.** The refusals
+`dflash2_speed_harness.py` carries — `--repeat 1` is "an anecdote", equal repeat
+counts across arms, the warm-leg discard, oracle identity, clock state — are the
+right rules and they are why the ad-hoc readings are inadmissible. They are also
+mostly present in the serving driver, which takes its clock windows through the
+same `tools/bench/gpu_clock_state.py`. The correction is WHICH committed tool a
+c=8 reading must go through, not whether it must go through one.
+
+This is the fourth instance in one session of the repository already holding a
+discipline that was reimplemented beside it: `repeat_reasons` refusing n=1, the
+cross-boot refusal in `gpu_clock_state`, the interleaving contract, and now the
+concurrency grid itself. The failure is not missing discipline; it is not
+looking for it first.
+
 ## The defect
 
 **Every c=8 number this repository has quoted was taken outside the committed
@@ -84,7 +120,10 @@ controller mid-run, and returned nothing (#545).
 IN, in this order:
 
 1. **Instance-vs-pass variance**, measured as above. Everything else is
-   conditional on the answer.
+   conditional on the answer. Run it through `scripts/dgx-online-serving.sh`,
+   not beside it — see the correction above — and persist each leg with
+   `tools/bench/resumable_legs.py`, because three attempts at this measurement
+   were killed mid-run by host crashes (#545).
 2. **A repeat count DERIVED from the measured spread** rather than assumed. The
    5.9% figure quoted across this repository came from a four-run study that
    sampled one stable window; it bounds that window, not the rung.

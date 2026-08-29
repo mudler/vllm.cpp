@@ -10,7 +10,16 @@
 
 #include "vt/ops.h"
 #include "vt/fp8_kv.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 #include "vt/rocm/rocm_f16_codec.h"
+#include "vt/cpu/cpu_quant_blocks.h"
+// From rocm_act_quant.h — duplicated here to avoid redefinition conflicts
+// with rocm_f16_codec.h (both headers define DF16ToF32 etc.).
+__device__ inline int DNearestInt(float fval) {
+  float val = fval + 12582912.0f;
+  int i = __float_as_int(val);
+  return (i & 0x007fffff) - 0x00400000;
+}
 
 namespace vt::rocm {
 namespace {
@@ -319,18 +328,137 @@ void GeluMulSeparateRocm(Queue& q, void* out, const void* gate, const void* up, 
   Check(hipGetLastError(), "gelu_mul_sep");
 }
 
+// T32 (GFX1100-TG200): fused silu(gate)*up + Q8_K quant epilogue. The MLP's
+// silu-mul output feeds exactly one consumer -- the K-quant ffn_down GEMV --
+// which re-quantizes the bf16 activation through QuantizeQ8KKWarpCoop (8.9us
+// launch, 64/step). Producing the Q8_K scratch HERE (same lever, same
+// single-slot producer/consumer bridge as the norm fuse) deletes that launch.
+//
+// Thread mapping and quant body are the QuantizeQ8KKWarpCoop pair (8 threads
+// per super-block, 32 elements per thread, ascending amax with
+// lower-chunk-index tie-break, butterfly xor reduce). BYTE-EXACTNESS: the
+// split path stores silu(g)*up through __float2bfloat16 (SiluMulK::St) and
+// the quantizer loads those bits via DBF16ToF32; this kernel performs the
+// identical store and consumes __bfloat162float of the same bf16 -- the same
+// f32 the standalone quantizer reads.
+__global__ void SiluMulQuantQ8KKWarpCoop(
+    __hip_bfloat16* __restrict__ act, vt::cpu::BlockQ8_K* __restrict__ scratch,
+    const __hip_bfloat16* __restrict__ gu, int64_t total_sb, int64_t d,
+    int64_t nsb) {
+  using vt::cpu::kQK_K;
+  constexpr int kChunk = 32;
+  constexpr int kThreadsPerSb = kQK_K / kChunk;      // 8
+  constexpr int kSbPerBlock = 128 / kThreadsPerSb;   // 16
+
+  const int tid = threadIdx.x;
+  const int sb_local = tid / kThreadsPerSb;
+  const int chunk = tid % kThreadsPerSb;
+  const int64_t global_sb =
+      static_cast<int64_t>(blockIdx.x) * kSbPerBlock + sb_local;
+  if (global_sb >= total_sb) return;
+  const int64_t i = global_sb / nsb;
+  const int64_t sb = global_sb % nsb;
+  const int64_t col0 = sb * kQK_K + chunk * kChunk;
+  const __hip_bfloat16* grow = gu + i * 2 * d;
+  const __hip_bfloat16* urow = grow + d;
+
+  // --- silu-mul, bf16 round-trip (matches SiluMulK store), local amax scan ---
+  float amax = 0.0f, mx = 0.0f;
+  float vals[kChunk];
+  #pragma unroll
+  for (int j = 0; j < kChunk; ++j) {
+    const float g = __bfloat162float(grow[col0 + j]);
+    const float u = __bfloat162float(urow[col0 + j]);
+    const __hip_bfloat16 bf = __float2bfloat16((g / (1.0f + expf(-g))) * u);
+    act[i * d + col0 + j] = bf;
+    vals[j] = __bfloat162float(bf);
+    if (const float ax = fabsf(vals[j]); ax > amax) { amax = ax; mx = vals[j]; }
+  }
+
+  // --- butterfly reduce across 8 threads (lower chunk index wins ties) ---
+  #pragma unroll
+  for (int off = 1; off < kThreadsPerSb; off <<= 1) {
+    const float oa = __shfl_xor_sync(0xffffffffULL, amax, off);
+    const float om = __shfl_xor_sync(0xffffffffULL, mx, off);
+    const int oc = chunk ^ off;
+    if (oa > amax || (oa == amax && oc < chunk)) { amax = oa; mx = om; }
+  }
+
+  // --- quantize + write BlockQ8_K (verbatim QuantizeQ8KKWarpCoop body) ---
+  vt::cpu::BlockQ8_K& y = scratch[global_sb];
+  if (amax > 0.0f) {
+    const float iscale = -127.0f / mx;
+    if (chunk == 0) y.d = 1.0f / iscale;
+    #pragma unroll
+    for (int j = 0; j < kChunk; ++j) {
+      const int qv = DNearestInt(iscale * vals[j]);
+      y.qs[chunk * kChunk + j] = static_cast<int8_t>(qv < 127 ? qv : 127);
+    }
+    int bsum0 = 0, bsum1 = 0;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) bsum0 += y.qs[chunk * kChunk + j];
+    #pragma unroll
+    for (int j = 16; j < kChunk; ++j) bsum1 += y.qs[chunk * kChunk + j];
+    y.bsums[chunk * 2] = static_cast<int16_t>(bsum0);
+    y.bsums[chunk * 2 + 1] = static_cast<int16_t>(bsum1);
+  } else {
+    if (chunk == 0) y.d = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < kChunk; ++j) y.qs[chunk * kChunk + j] = 0;
+    y.bsums[chunk * 2] = 0;
+    y.bsums[chunk * 2 + 1] = 0;
+  }
+}
+
+// Producer-side gate for the silu-mul quant epilogue. Same lever as the norm
+// fuse (one shared consumer bridge); VT_SILU_QUANT_FUSED=0 opts the silu site
+// back out for a same-binary A/B. Dense rows and whole Q8_K super-blocks only.
+static vt::cpu::BlockQ8_K* SiluQuantEpilogueFor(int64_t rows, int64_t d,
+                                                hipStream_t s,
+                                                size_t* scratch_bytes) {
+  const char* e = std::getenv("VT_NORM_QUANT_FUSED");
+  if (e == nullptr || e[0] != '1' || e[1] != '\0') return nullptr;
+  const char* sq = std::getenv("VT_SILU_QUANT_FUSED");
+  if (sq != nullptr && sq[0] == '0' && sq[1] == '\0') return nullptr;
+  if (rows <= 0 || d % static_cast<int64_t>(vt::cpu::kQK_K) != 0) return nullptr;
+  *scratch_bytes = static_cast<size_t>(rows) *
+                   static_cast<size_t>(d / vt::cpu::kQK_K) *
+                   sizeof(vt::cpu::BlockQ8_K);
+  return static_cast<vt::cpu::BlockQ8_K*>(
+      NormQuantProducerScratch(*scratch_bytes, s));
+}
+
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   const int64_t d = x.shape[1] / 2, n = x.shape[0] * d;
   if (n == 0) return;
   hipStream_t st = AsStream(q);
-  if (x.dtype == DType::kBF16)
+  if (x.dtype == DType::kBF16) {
+    // T32: fused silu-mul + Q8_K epilogue. The MLP silu-mul output feeds one
+    // K-quant GEMV consumer that re-quantizes this activation anyway; produce
+    // the scratch here and let NormQuantTakeConsumer skip that launch.
+    size_t q8_bytes = 0;
+    vt::cpu::BlockQ8_K* q8_out =
+        SiluQuantEpilogueFor(x.shape[0], d, st, &q8_bytes);
+    if (q8_out != nullptr) {
+      const int64_t rows = x.shape[0];
+      const int64_t nsb = d / static_cast<int64_t>(vt::cpu::kQK_K);
+      const unsigned grid = static_cast<unsigned>((rows * nsb + 15) / 16);
+      SiluMulQuantQ8KKWarpCoop<<<grid, 128, 0, st>>>(
+          out.Ptr<__hip_bfloat16>(), q8_out, x.Ptr<__hip_bfloat16>(),
+          rows * nsb, d, nsb);
+      Check(hipGetLastError(), "silu_mul_quant_q8k");
+      NormQuantRecordProducer(out.data, rows, /*h=*/d, /*row_stride=*/d,
+                              out.dtype, q8_out, st);
+      return;
+    }
     SiluMulK<__hip_bfloat16, __hip_bfloat16><<<GridFor(n), kBlock, 0, st>>>(
         out.Ptr<__hip_bfloat16>(), x.Ptr<__hip_bfloat16>(), n, d);
-  else if (x.dtype == DType::kF32)
+  } else if (x.dtype == DType::kF32) {
     SiluMulK<float, float>
         <<<GridFor(n), kBlock, 0, st>>>(out.Ptr<float>(), x.Ptr<float>(), n, d);
-  else
+  } else {
     VT_CHECK(false, "rocm silu_and_mul dtype");
+  }
   Check(hipGetLastError(), "silu_and_mul");
 }
 

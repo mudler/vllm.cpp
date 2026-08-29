@@ -57,6 +57,11 @@
 // type and the span view it takes.
 #include <tt-metalium/bfloat16.hpp>
 #include <tt_stl/span.hpp>
+// W5 (#2244): the persistent staging route re-uploads through tt-metal's
+// in-place H2D (ttnn::copy_to_device) instead of a fresh from_span creation.
+#include <tt-metalium/mesh_buffer.hpp>
+#include <tt-metalium/mesh_command_queue.hpp>
+#include <ttnn/tensor/tensor_ops.hpp>
 #include <ttnn/tensor/shape/shape.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
@@ -284,6 +289,19 @@ struct BufferSlot {
   // write that replaces the shadow with a different layout.
   bool conv_transposed = false;
   uint32_t conv_slots = 0, conv_c = 0, conv_sl = 0;
+  // BACKEND-TENSTORRENT-QWEN35 W5 (#2244): the slot's PERSISTENT staged-device
+  // buffer. Allocated once per (slot, staging geometry) by the bulk bf16 arm
+  // and rewritten IN PLACE through the mesh command queue on every later
+  // staging, so an identical-geometry upload no longer pays from_span's fresh
+  // MeshBuffer allocation / tensor creation path. `device` above remains the
+  // consumer-visible shadow (dropped by every host write, replaced by commits
+  // and reshapes); `persistent` survives those drops and holds the resident
+  // device allocation. Its content is only ever observed through a shadow
+  // that a full staging write has just refreshed, so a stale resident buffer
+  // is unreachable. The slot lives in the never-destroyed Slots() map
+  // (#1486), so the tensor is never destroyed after tt-metal teardown.
+  std::optional<ttnn::Tensor> persistent;
+  uint32_t persist_rows = 0, persist_cols = 0;
 };
 
 std::mutex& SlotMutex() {
@@ -459,6 +477,21 @@ std::atomic<uint64_t>& StagingF32Elems() {
   static std::atomic<uint64_t> v{0};
   return v;
 }
+// W5 (#2244): the persistent-route counters — in-place mesh CQ writes into
+// the per-slot buffer, the (re)allocations of that buffer, and the bytes
+// pushed through it. Read through GetStagingStats below.
+std::atomic<uint64_t>& StagingPersistentWrites() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& StagingPersistentAllocs() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+std::atomic<uint64_t>& StagingPersistentBytes() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
 
 // W4 lever 1 (#2107): bulk upload of a contiguous bf16 master. The host
 // bytes ARE the payload: one from_span over the tensor's own memory — no f32
@@ -466,6 +499,21 @@ std::atomic<uint64_t>& StagingF32Elems() {
 // bfloat16::from_float round-trip on the ttnn side. Bit-identical to the f32
 // path: bf16→f32 widening is exact, and packing a value whose low 16 mantissa
 // bits are zero back to bf16 returns the same bits under any rounding rule.
+//
+// W5 (#2244): the upload no longer pays tt-metal's per-upload creation path
+// on every step. A tracked base slot stages through its PERSISTENT device
+// buffer: the first staging for a geometry runs the full from_span creation
+// (and the buffer stays resident in the slot); every later staging packs the
+// host bytes with the SAME function from_span calls (tt-metal
+// host_tensor_from_span_with_pad_value, ttnn/core/tensor/tensor.cpp:170) and
+// writes them through tt-metal's in-place H2D — ttnn::copy_to_device into the
+// resident MeshTensor, which reaches MeshCommandQueue::enqueue_write /
+// enqueue_write_shards against the existing buffer. No fresh MeshBuffer, no
+// cluster/chip rediscovery, no new tensor attributes. The bytes on the device
+// are the same packed bytes from_span writes, into a buffer of the same
+// geometry, fully overwritten each time: bit-identical. Untracked pointers
+// and interior views keep the anonymous from_span arm (W2c: a view must
+// never store against the base slot).
 ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
                             MeshDevice& device) {
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
@@ -474,8 +522,67 @@ ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
   // The bytes at t.Ptr are the window's own bf16 bits (bfloat16 is a 2-byte
   // class wrapping the same uint16 pattern).
   const bfloat16* src = reinterpret_cast<const bfloat16*>(t.Ptr<uint16_t>());
-  return ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
-                                 TileSpecOf(rows, cols), &device);
+  // Short locked probe: resolve the persistent buffer once. The CQ write runs
+  // OUTSIDE the lock — the same probe/upload/re-lock discipline EnsureDevice2D
+  // uses — and the copied handle (shared TensorAttributes) keeps the resident
+  // MeshBuffer alive even if the slot is unregistered mid-upload.
+  std::optional<ttnn::Tensor> persistent;
+  bool tracked_base = false;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    tracked_base = (s != nullptr && t.data == s->host);
+    if (tracked_base && s->persistent.has_value() &&
+        s->persist_rows == rows && s->persist_cols == cols) {
+      persistent = s->persistent;
+    }
+  }
+  if (!tracked_base) {
+    // Untracked pointer or interior view (W2c): anonymous staging, no
+    // persistent buffer, no W5 counters — the caller's bulk counters still see it.
+    return ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
+                                   TileSpecOf(rows, cols), &device);
+  }
+  if (persistent.has_value()) {
+    // In-place arm. Host half: exactly the packing from_span performs
+    // (tt-metal ttnn/core/tensor/tensor.cpp:170 — same function, same spec,
+    // same pad), with no device argument so no device work happens. Device
+    // half: tt-metal's own in-place H2D (ttnn/core/tensor/tensor_ops.cpp:161
+    // copy_to_device → enqueue_write_tensor into the EXISTING MeshTensor,
+    // tt_metal/impl/tensor/tensor_apis.cpp:149) — the same write path
+    // from_span's to_device takes, minus the fresh MeshBuffer allocation and
+    // tensor creation. Bytes on the device are the same packed bytes, into a
+    // buffer of the same geometry, fully overwritten: bit-identical.
+    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
+      std::fprintf(stderr, "[TT-UP] UploadRowsBf16 persistent enqueue_write during capture\n");
+    ttnn::Tensor host = ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
+                                                TileSpecOf(rows, cols),
+                                                /*device=*/nullptr);
+    ttnn::copy_to_device(host, *persistent);
+    StagingPersistentWrites().fetch_add(1, std::memory_order_relaxed);
+    StagingPersistentBytes().fetch_add(static_cast<uint64_t>(n) * 2,
+                                       std::memory_order_relaxed);
+    return *persistent;
+  }
+  // Allocating arm (cold slot or staging-geometry change): the full W4
+  // creation path, and the returned tensor becomes the slot's persistent
+  // buffer. The stale resident buffer, if any, is released here.
+  ttnn::Tensor dev = ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
+                                             TileSpecOf(rows, cols), &device);
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && t.data == s->host) {
+      s->persistent = dev;
+      s->persist_rows = rows;
+      s->persist_cols = cols;
+    }
+  }
+  StagingPersistentWrites().fetch_add(1, std::memory_order_relaxed);
+  StagingPersistentAllocs().fetch_add(1, std::memory_order_relaxed);
+  StagingPersistentBytes().fetch_add(static_cast<uint64_t>(n) * 2,
+                                     std::memory_order_relaxed);
+  return dev;
 }
 
 // Return a TILE BFLOAT16 device tensor for rank-2 `t`, uploading only when the
@@ -6280,6 +6387,12 @@ StagingStats GetStagingStats() {
   s.uploads_bulk_bf16 = StagingBulkUploads().load(std::memory_order_relaxed);
   s.staged_bulk_bf16_bytes = StagingBulkBytes().load(std::memory_order_relaxed);
   s.staged_f32_elems = StagingF32Elems().load(std::memory_order_relaxed);
+  s.uploads_persistent_bf16 =
+      StagingPersistentWrites().load(std::memory_order_relaxed);
+  s.uploads_persistent_allocs =
+      StagingPersistentAllocs().load(std::memory_order_relaxed);
+  s.staged_persistent_bf16_bytes =
+      StagingPersistentBytes().load(std::memory_order_relaxed);
   return s;
 }
 
@@ -6287,6 +6400,9 @@ void ResetStagingStats() {
   StagingBulkUploads().store(0, std::memory_order_relaxed);
   StagingBulkBytes().store(0, std::memory_order_relaxed);
   StagingF32Elems().store(0, std::memory_order_relaxed);
+  StagingPersistentWrites().store(0, std::memory_order_relaxed);
+  StagingPersistentAllocs().store(0, std::memory_order_relaxed);
+  StagingPersistentBytes().store(0, std::memory_order_relaxed);
 }
 
 }  // namespace vt::tenstorrent

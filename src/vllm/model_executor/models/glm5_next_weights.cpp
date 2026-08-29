@@ -64,25 +64,13 @@ bool OptBool(const GgufFile& g, const std::string& key, bool dflt) {
   return v != nullptr ? KvInt(*v, key) != 0 : dflt;
 }
 
-// A required STRING array. The per-layer schedules this architecture is built
-// out of travel as string arrays, and reading one wrong splits the model into
-// layers of the wrong kind — so a missing or wrong-typed array fails here
-// rather than defaulting to a plausible pattern.
-std::vector<std::string> ReqStrArray(const GgufFile& g,
-                                     const std::string& key) {
-  const GgufValue* v = g.FindKv(key);
-  VT_CHECK(v != nullptr, "glm5_next gguf: missing metadata key " + key);
-  VT_CHECK(v->TypeId() == kGgufArray,
-           "glm5_next gguf: key " + key + " must be an array");
-  std::vector<std::string> out;
-  for (const GgufValue& e : std::get<GgufArray>(v->v).elems) {
-    VT_CHECK(e.TypeId() == kGgufString,
-             "glm5_next gguf: key " + key + " must contain only strings");
-    out.push_back(std::get<std::string>(e.v));
-  }
-  return out;
-}
-
+// An OPTIONAL string array. `layer_types` used to be read through a `Req`
+// sibling of this, because the per-layer schedule is what the whole model is
+// and a synthesized one splits the stack into layers of the wrong kind. That
+// obligation has not been weakened, it has MOVED: the schedule is now required
+// in either of its two on-disk spellings, and the refusal that stands in for
+// the removed `ReqStrArray` is the one at the bottom of the schedule block
+// below, which names both keys.
 std::vector<std::string> OptStrArray(const GgufFile& g,
                                      const std::string& key) {
   const GgufValue* v = g.FindKv(key);
@@ -93,6 +81,69 @@ std::vector<std::string> OptStrArray(const GgufFile& g,
     out.push_back(std::get<std::string>(e.v));
   }
   return out;
+}
+
+// A GGUF key that llama.cpp writes as EITHER one scalar or one value per
+// block. `llama-model.cpp:1177` at the pinned `llama-cpp` release `b10451`
+// reads `%s.attention.head_count_kv` through `get_key_or_arr(..., n_layer,
+// false)`, so a per-layer array is as legal a spelling of that key as a scalar
+// is, and a reader that accepts only the scalar refuses the published file
+// (#2243). Returns false when the key is absent or is not an array; the caller
+// then reads it as the scalar it is.
+bool OptIntArray(const GgufFile& g, const std::string& key,
+                 std::vector<int64_t>* out) {
+  const GgufValue* v = g.FindKv(key);
+  if (v == nullptr || v->TypeId() != kGgufArray) return false;
+  out->clear();
+  for (const GgufValue& e : std::get<GgufArray>(v->v).elems) {
+    out->push_back(KvInt(e, key));
+  }
+  return true;
+}
+
+// A per-block array has ONE entry per block or the file is describing a stack
+// this reader cannot place. Refuses by name, with the key and the shape found,
+// rather than indexing a schedule of the wrong length.
+void CheckPerLayerLength(const std::string& key, size_t found,
+                         int64_t n_layers) {
+  VT_CHECK(static_cast<int64_t>(found) == n_layers,
+           "glm5_next gguf: key " + key + " is a per-layer array of " +
+               std::to_string(found) + " entries but block_count is " +
+               std::to_string(n_layers) +
+               "; a per-layer array states exactly one value per block");
+}
+
+// A float key in the same scalar-or-array shape. `swiglu_clamp_exp` and
+// `swiglu_clamp_shexp` arrive as `array[f32]` of `block_count` entries in the
+// published artifact and as scalars from our own converter.
+//
+// UPSTREAM HAS ONE `swiglu_limit`, not one per layer. So a NON-UNIFORM array
+// is a file whose clamp this config cannot represent, and taking element 0 of
+// it would build a fluent model that clamps every layer with a number the file
+// states for one. That is refused by name instead. Returns false when the key
+// is absent.
+bool OptPerLayerFloat(const GgufFile& g, const std::string& key,
+                      int64_t n_layers, double* out) {
+  const GgufValue* v = g.FindKv(key);
+  if (v == nullptr) return false;
+  if (v->TypeId() != kGgufArray) {
+    *out = KvFloat(*v, key);
+    return true;
+  }
+  const std::vector<GgufValue>& elems = std::get<GgufArray>(v->v).elems;
+  CheckPerLayerLength(key, elems.size(), n_layers);
+  const double first = KvFloat(elems[0], key);
+  for (size_t i = 1; i < elems.size(); ++i) {
+    const double here = KvFloat(elems[i], key);
+    VT_CHECK(here == first,
+             "glm5_next gguf: key " + key + " states " + std::to_string(first) +
+                 " for block 0 and " + std::to_string(here) + " for block " +
+                 std::to_string(i) +
+                 ", but this architecture has ONE `swiglu_limit` and no "
+                 "per-layer clamp to put the second value in");
+  }
+  *out = first;
+  return true;
 }
 
 // Does this file carry `blk.<layer>.<suffix>`?
@@ -322,14 +373,88 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   c.model_type = "glm5_next";
   c.architectures = {"Glm5NextForConditionalGeneration"};
 
-  const int64_t n_layers = ReqInt(gguf, p + "block_count");
-  VT_CHECK(n_layers > 0, "glm5_next gguf: block_count must be > 0");
+  // BLOCKS ARE NOT LAYERS, and the difference is one whole decoder layer.
+  //
+  // llama.cpp's `block_count` counts the multi-token-prediction blocks on top
+  // of the backbone, and it states the relationship in its own converters:
+  // `self.block_count = self.hparams["num_hidden_layers"] +
+  // self.hparams.get("num_nextn_predict_layers", 0)`
+  // (`b10451:conversion/exaone.py:134`, and the same `+=` at
+  // `b10451:conversion/deepseek.py:470` and `:545`). The published artifact is
+  // that formula exactly: `block_count = 46`, `nextn_predict_layers = 1`, and
+  // the released `config.json` declares `num_hidden_layers = 45`.
+  //
+  // So `num_hidden_layers` here is the BACKBONE depth, which is what the field
+  // means on the `config.json` path and what `glm5_next.h` annotates it as. It
+  // is resolved by subtraction rather than transcribed, because reading
+  // `block_count` into it makes ONE model resolve to a 45-layer stack from its
+  // config.json and a 46-layer stack from its GGUF, and the extra entry is the
+  // MTP block. Nothing downstream would refuse that: `ParseGlm5NextParams`
+  // sizes every schedule from `num_hidden_layers`, and a decoder stack built
+  // from 46 would carry an extra layer made out of the MTP block, run, and
+  // produce plausible tokens. A token gate cannot see that, which is the whole
+  // reason this is subtracted here and asserted as a relationship rather than
+  // as a number.
+  //
+  // The MTP block itself is READ, COUNTED and then DROPPED. W5b
+  // (https://github.com/mudler/vllm.cpp/issues/2241) owns the head that would
+  // consume it; until then the per-block schedules below are truncated to the
+  // backbone and no layer is built for it, which is what the reference does
+  // too.
+  const int64_t n_blocks = ReqInt(gguf, p + "block_count");
+  VT_CHECK(n_blocks > 0, "glm5_next gguf: block_count must be > 0");
+  const int64_t n_mtp = OptInt(gguf, p + "nextn_predict_layers", 0);
+  VT_CHECK(n_mtp >= 0,
+           "glm5_next gguf: nextn_predict_layers is " + std::to_string(n_mtp) +
+               " and a count of multi-token-prediction blocks cannot be "
+               "negative");
+  const int64_t n_layers = n_blocks - n_mtp;
+  VT_CHECK(n_layers > 0,
+           "glm5_next gguf: block_count is " + std::to_string(n_blocks) +
+               " and nextn_predict_layers is " + std::to_string(n_mtp) +
+               ", so the backbone would be " + std::to_string(n_layers) +
+               " layers deep; llama.cpp writes block_count as "
+               "num_hidden_layers + nextn_predict_layers, so this file states "
+               "more MTP blocks than it has blocks");
 
   c.hidden_size = ReqInt(gguf, p + "embedding_length");
   c.num_hidden_layers = n_layers;
   c.num_attention_heads = ReqInt(gguf, p + "attention.head_count");
-  c.num_key_value_heads =
-      OptInt(gguf, p + "attention.head_count_kv", c.num_attention_heads);
+
+  // `attention.head_count_kv`, in llama.cpp's SCALAR-OR-ARRAY form, and the
+  // array form is not a mis-typed scalar: it is THE per-layer schedule, and on
+  // the only published artifact of this model it is the only schedule the file
+  // carries (#2243, #2177).
+  //
+  // llama.cpp reads the key with `get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV,
+  // hparams.n_head_kv_arr, hparams.n_layer(), false)`
+  // (`b10451:src/llama-model.cpp:1177`) and then every hybrid family decides
+  // which layers are linear from the SAME predicate — `is_recr_impl[i] =
+  // hparams.n_head_kv(i) == 0`, spelled for this model's own KDA parent at
+  // `b10451:src/models/kimi-linear.cpp:18` with the comment "KDA layers are
+  // recurrent". So `0` means a KDA layer and any non-zero means an attention
+  // layer, which for this architecture is DSA/MLA.
+  //
+  // THE ARRAY IS NOT A KV-HEAD COUNT AND MUST NOT BE READ AS ONE. Its non-zero
+  // entries are `1`, the single latent KV head MLA has, while upstream's
+  // `Glm5NextTextConfig` requires `num_attention_heads == num_key_value_heads`
+  // and the released `config.json` states 64 for both. Assigning `1` here would
+  // refuse the published file with a message about GQA, which is a true
+  // statement about a number this file never made. The array form therefore
+  // leaves `num_key_value_heads` at upstream's own `None -> num_attention_heads`
+  // default and spends the values on the schedule below, which is the only
+  // thing they mean.
+  std::vector<int64_t> head_count_kv_arr;
+  const bool kv_is_per_layer =
+      OptIntArray(gguf, p + "attention.head_count_kv", &head_count_kv_arr);
+  if (kv_is_per_layer) {
+    CheckPerLayerLength(p + "attention.head_count_kv",
+                        head_count_kv_arr.size(), n_blocks);
+    c.num_key_value_heads = c.num_attention_heads;
+  } else {
+    c.num_key_value_heads =
+        OptInt(gguf, p + "attention.head_count_kv", c.num_attention_heads);
+  }
   c.max_position_embeddings = ReqInt(gguf, p + "context_length");
   c.rms_norm_eps = ReqFloat(gguf, p + "attention.layer_norm_rms_epsilon");
   c.vocab_size = OptInt(gguf, p + "vocab_size", 0);
@@ -363,21 +488,96 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   // The per-layer schedules. Required, not defaulted: the whole model is the
   // interleave, and a file that does not state it is a file we cannot place a
   // single layer of.
-  const std::vector<std::string> layer_types =
-      ReqStrArray(gguf, p + "layer_types");
-  VT_CHECK(static_cast<int64_t>(layer_types.size()) == n_layers,
-           "glm5_next gguf: layer_types has " +
-               std::to_string(layer_types.size()) +
-               " entries but block_count is " + std::to_string(n_layers));
+  // TWO SPELLINGS, and the schedule is READ from whichever the file carries
+  // rather than synthesized from a stride.
+  //
+  // `glm5next.layer_types` is a string array that only
+  // `scripts/convert-glm5-next-gguf.py` writes, so our own output round-trips
+  // through it. No other tool emits it, and the published
+  // `unsloth/GLM-5.3-Flash-GGUF` artifacts carry the schedule ONLY as the
+  // per-layer `attention.head_count_kv` array read above. Requiring
+  // `layer_types` refused every one of those files, and falling back to
+  // upstream's `idx % 4 != 3` pattern instead would be worse than refusing:
+  // over the published checkpoint's 45 model layers that stride happens to be
+  // right, so the wrong reader and the right reader agree on THIS file and
+  // disagree silently on a fine-tune that moves one layer (#2177). The values
+  // are on disk; they get read.
+  //
+  // The published 46-entry array is NOT `idx % 4 == 3` over its whole length.
+  // `block_count` is 46 because it counts the multi-token-prediction block,
+  // `nextn_predict_layers = 1`; entries 0..44 are the model's layers and entry
+  // 45 is the MTP block, which is MLA-shaped and sits at `45 % 4 == 1`. A
+  // consumer that re-derives the stride selects eleven MLA blocks where the
+  // file states twelve, and reports nothing.
+  const std::vector<std::string> declared =
+      OptStrArray(gguf, p + "layer_types");
+  if (!declared.empty()) {
+    VT_CHECK(static_cast<int64_t>(declared.size()) == n_blocks,
+             "glm5_next gguf: layer_types has " +
+                 std::to_string(declared.size()) +
+                 " entries but block_count is " + std::to_string(n_blocks));
+  }
+
+  // CROSS-CHECK, not a preference. A file that states the schedule twice and
+  // disagrees with itself is a file one of whose two descriptions is wrong, and
+  // silently taking either one loads a model whose attention kind is wrong on
+  // the layers where they differ. Compared on the KIND and not on the string,
+  // because `full_attention` is a legal `layer_types` spelling that
+  // `LayerKindFromString` rewrites to `deepseek_sparse_attention`, and both are
+  // attention layers with a non-zero KV head count.
+  if (!declared.empty() && kv_is_per_layer) {
+    for (int64_t il = 0; il < n_blocks; ++il) {
+      const size_t i = static_cast<size_t>(il);
+      const bool declared_kda = declared[i] == "linear_attention";
+      const bool derived_kda = head_count_kv_arr[i] == 0;
+      VT_CHECK(declared_kda == derived_kda,
+               "glm5_next gguf: the file states its layer schedule twice and "
+               "the two disagree at block " +
+                   std::to_string(il) + ": layer_types says `" + declared[i] +
+                   "` while attention.head_count_kv says " +
+                   std::to_string(head_count_kv_arr[i]) +
+                   " KV heads (0 means a `linear_attention` layer, non-zero an "
+                   "attention layer)");
+    }
+  }
+
+  std::vector<std::string> layer_types;
+  if (!declared.empty()) {
+    layer_types = declared;
+  } else if (kv_is_per_layer) {
+    for (int64_t v : head_count_kv_arr) {
+      layer_types.push_back(v == 0 ? "linear_attention"
+                                   : "deepseek_sparse_attention");
+    }
+  } else {
+    VT_CHECK(false,
+             "glm5_next gguf: this file states no per-layer attention "
+             "schedule. The whole model is the interleave, so it cannot be "
+             "defaulted: write either the string array " +
+                 p + "layer_types or a per-layer " + p +
+                 "attention.head_count_kv array of " +
+                 std::to_string(n_blocks) +
+                 " entries, 0 on each `linear_attention` block");
+  }
+  // TRUNCATE the per-block schedules to the backbone. Every array above is
+  // `block_count` long because it describes BLOCKS; `layer_types` and the two
+  // below describe LAYERS, and the trailing `n_mtp` entries are the MTP blocks
+  // this port does not build (O2, and W5b owns the head). Dropping them here,
+  // once, is what keeps `ParseGlm5NextParams` — which sizes all three schedules
+  // from `num_hidden_layers` — from meeting a length it would have to refuse,
+  // and what makes a GGUF and a config.json of the SAME model resolve to the
+  // same stack.
+  layer_types.resize(static_cast<size_t>(n_layers));
   c.layer_types = layer_types;
 
   std::vector<std::string> mlp_layer_types =
       OptStrArray(gguf, p + "mlp_layer_types");
   if (!mlp_layer_types.empty()) {
-    VT_CHECK(static_cast<int64_t>(mlp_layer_types.size()) == n_layers,
+    VT_CHECK(static_cast<int64_t>(mlp_layer_types.size()) == n_blocks,
              "glm5_next gguf: mlp_layer_types has " +
                  std::to_string(mlp_layer_types.size()) +
-                 " entries but block_count is " + std::to_string(n_layers));
+                 " entries but block_count is " + std::to_string(n_blocks));
+    mlp_layer_types.resize(static_cast<size_t>(n_layers));
   }
 
   // THE INVENTORY CONTRADICTION CHECK, and it is a contradiction check rather
@@ -446,9 +646,16 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   text["intermediate_size"] = c.intermediate_size;
   text["layer_types"] = layer_types;
   if (!mlp_layer_types.empty()) text["mlp_layer_types"] = mlp_layer_types;
-  const std::vector<std::string> indexer_types =
+  std::vector<std::string> indexer_types =
       OptStrArray(gguf, p + "attention.indexer.types");
-  if (!indexer_types.empty()) text["indexer_types"] = indexer_types;
+  if (!indexer_types.empty()) {
+    VT_CHECK(static_cast<int64_t>(indexer_types.size()) == n_blocks,
+             "glm5_next gguf: attention.indexer.types has " +
+                 std::to_string(indexer_types.size()) +
+                 " entries but block_count is " + std::to_string(n_blocks));
+    indexer_types.resize(static_cast<size_t>(n_layers));
+    text["indexer_types"] = indexer_types;
+  }
 
   // MLA.
   text["q_lora_rank"] = ReqInt(gguf, p + "attention.q_lora_rank");
@@ -505,7 +712,37 @@ HfConfig Glm5NextHfConfigFromGguf(const GgufFile& gguf) {
   text["topk_group"] = OptInt(gguf, p + "expert_group_used_count", 1);
   text["routed_scaling_factor"] = OptFloat(gguf, p + "expert_weights_scale", 2.5);
   text["norm_topk_prob"] = OptBool(gguf, p + "expert_weights_norm", true);
-  text["swiglu_limit"] = OptFloat(gguf, p + "swiglu_clamp_exp", 10.0);
+  // The clamped-SwiGLU limit, from EITHER of the two keys the writers use and
+  // in either shape. Our converter writes both `swiglu_clamp_exp` and
+  // `swiglu_clamp_shexp` as scalars from the one `text["swiglu_limit"]`
+  // (`scripts/convert-glm5-next-gguf.py:1022-1023`); the published artifact
+  // writes both as per-layer `array[f32]` of `block_count` entries. Reading
+  // only the scalar form refused the published file one key after
+  // `head_count_kv` did (#2243).
+  //
+  // BOTH are read, and a disagreement between them is refused. Upstream has ONE
+  // `swiglu_limit` covering the routed and the shared expert alike, so a file
+  // that states two different clamps is describing a model this config cannot
+  // hold, and first-wins would pick one of them by the order of these lines.
+  double swiglu_limit = 10.0;
+  double clamp_exp = 0.0;
+  double clamp_shexp = 0.0;
+  const bool has_exp =
+      OptPerLayerFloat(gguf, p + "swiglu_clamp_exp", n_blocks, &clamp_exp);
+  const bool has_shexp =
+      OptPerLayerFloat(gguf, p + "swiglu_clamp_shexp", n_blocks, &clamp_shexp);
+  VT_CHECK(!(has_exp && has_shexp) || clamp_exp == clamp_shexp,
+           "glm5_next gguf: " + p + "swiglu_clamp_exp is " +
+               std::to_string(clamp_exp) + " and " + p +
+               "swiglu_clamp_shexp is " + std::to_string(clamp_shexp) +
+               ", but this architecture has ONE `swiglu_limit` for the routed "
+               "and the shared expert alike");
+  if (has_exp) {
+    swiglu_limit = clamp_exp;
+  } else if (has_shexp) {
+    swiglu_limit = clamp_shexp;
+  }
+  text["swiglu_limit"] = swiglu_limit;
   raw["text_config"] = text;
 
   // The six placeholder ids, on the wrapper. Image and video share one id in

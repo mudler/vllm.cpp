@@ -3474,7 +3474,7 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // front. Per token:
 //
 //   normed[j*H+h] = hyper[j*H+h] * rsqrt(mean_h(hyper[j*H+.]^2) + eps)
-//                                * hc_norm_w[j*H+h]          (group_size == H)
+//                                * (1 + hc_norm_w[j*H+h])    (group_size == H)
 //   low[r]        = silu( (mix_down[r] . normed) / hc )       -- DIVIDE INSIDE
 //   gate[p]       = sigmoid( mix_up[p] . low )                -- NO divide here
 //   mixed[h]      = mean_j( gate[j*H+h] * normed[j*H+h] )     -- MEAN, not sum
@@ -3486,10 +3486,26 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // on the up projection, and the collapse is a MEAN over the branches while the
 // product it collapses is against the NORMED stream and not the raw one.
 //
-// `hc_norm_w` is vLLM's parameterization, i.e. ALREADY `1 + w_hf`. Upstream
-// applies `output * (1.0 + weight)` on a zero-init gamma; folding it once at
-// load is `vllm::qwen4_exp::HcNormWeightFromHf`, and a `qwen4exp` GGUF written by
-// ggml-org/llama.cpp#27742 carries the fold already. This op never adds 1.
+// `hc_norm_w` IS THE RAW HUGGINGFACE GAMMA, `w_hf`, and THIS OP ADDS THE 1.
+// That is upstream's parameterization verbatim — `Qwen4ExpTextRMSNorm.forward`
+// is `output * (1.0 + self.weight.float())` over a ZERO-initialised weight
+// (:173-178) — and it is the SAME polarity `vt::RmsNorm(gemma=true)` and
+// `vt::Qwen4ExpQsaCompress` apply to this architecture's other gammas, which is
+// the point: `Qwen4ExpWeights` holds every gamma raw (the `qwen4exp` loader
+// inverts the `+1` ggml-org/llama.cpp#27742 bakes in at convert time, with
+// `linear_attn.norm.weight` the one tensor the converter never folds), so ONE
+// rule covers the whole model and no call site has to remember which of two
+// forms this particular op wanted.
+//
+// IT READ THE OTHER WAY UNTIL #2218, and the correction is recorded here rather
+// than only in the spec because the failure is silent. Under the old contract a
+// forward that handed this op the loaded `hc_norm` multiplied every
+// hyper-connection norm by a gamma centred on ZERO — a plausible tensor, never
+// a crash, and unreachable by any single-sided gate, because the loader was
+// right about its own output and the op was right about its own input.
+// `vllm::qwen4_exp::HcNormWeightFromHf` remains the `w_hf -> 1 + w_hf` bridge
+// the W3 HOST reference needs (`qwen4_exp_hc.h` `GroupedRmsNorm` is vLLM's
+// `out * w` form and keeps it); it is NOT a step any caller of this op takes.
 //
 // SHAPES. hyper [T, hc*H]; hc_norm_w [hc*H]; mix_down [R, hc*H]; mix_up [hc*H, R]
 // (both in PyTorch `nn.Linear(bias=False)` `(out_features, in_features)` order);

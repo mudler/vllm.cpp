@@ -19,17 +19,26 @@
 // entry, so there is no second architecture string to register. That is why
 // this row moves the MODEL row ratchet by ONE and not by two.
 //
-// SCOPE HONESTY, RESTATED AT W5a (#2031). Registering this arch makes it
-// RESOLVE, parse and validate its config, and — since W5a — LOAD a `qwen4exp`
-// GGUF on a CPU device. It does NOT make it forward, and it does not make it
-// serve: `ModelRegistry::Forward` and `make_kv_cache` both still refuse BY
-// NAME, naming the wave that owes the work, so no token has been decoded by
-// this architecture. The paragraph this replaces said the load refused too,
-// which was true at W5a's parent and is not true here. That polarity matters
-// more here than usual, because no oracle for this model runs on any hardware
-// this project owns yet (`gateable = no`, blocked on memory rather than
-// software), so there is no downstream token gate that would catch a forward
-// returning plausible garbage. Refusing is the only safe default.
+// SCOPE HONESTY, RESTATED AT W5c-1 (#2031). Registering this arch makes it
+// RESOLVE, parse and validate its config, LOAD a `qwen4exp` GGUF on a CPU
+// device (W5a) and PUBLISH its three KV-cache groups (W5c-1). `make_kv_cache`
+// no longer refuses; the sentence that said it did was true at W5a's parent and
+// stopped being true one wave later, which is the drift this paragraph keeps
+// being rewritten to remove.
+//
+// THREE THINGS STILL REFUSE, and the one that matters is the FORWARD: no token
+// has been decoded by this architecture. The other two are load-time and are
+// listed here so that the count is checkable rather than rhetorical -- the
+// SAFETENSORS arm refuses unconditionally at the end of
+// `LoadQwen4ExpForConditionalGeneration` (every published artifact is larger
+// than every device this project owns), and the GGUF arm refuses a source that
+// names the kind without carrying a file. Both are stated at their own sites.
+//
+// The forward's polarity matters more here than usual, because no oracle for
+// this model runs on any hardware this project owns yet (`gateable = no`,
+// blocked on memory rather than software), so there is no downstream token gate
+// that would catch a forward returning plausible garbage. Refusing is the only
+// safe default.
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform — the load-time device gate
 
@@ -170,13 +179,29 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // And `[[noreturn]]` on a non-void return type is MSVC C4646, promoted to
   // C2220 under /W4 /WX; `check-windows-portability.py` caught that on the
   // first draft of this function.
+  // THE REFUSAL NAMES WHAT IS ACTUALLY MISSING, AND IT IS NOT WHAT IT SAID.
+  // Until #2031's W5b survey this message still owed the n-gram embedding to
+  // W2, the gated residual to W3 and Qwen Sparse Attention to W4 — all three
+  // landed waves. A refusal that names finished work sends the next reader to
+  // rebuild it. The five below are measured against this tree, each one
+  // independently sufficient to stop a token, and each is carried under
+  // `## Owed` in the row spec.
   VT_CHECK(false,
-           "Qwen4ExpForConditionalGeneration: the forward is not ported yet. W2 "
-           "owes the hashed n-gram embedding and the PLE dilated depthwise conv, "
-           "W3 the gated-residual hyper-connection stream, W4 Qwen Sparse "
-           "Attention and its indexer side cache, and W5 the assembled forward, "
-           "vision path and MTP. See .agents/specs/qwen4-exp-flash-next.md and "
-           "issue #1978.");
+           "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
+           "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..5, "
+           "W5c-1); what the layer loop still lacks is (1) a standalone grouped "
+           "RMSNorm op — the PLE block needs three and the only grouped "
+           "reduction in this tree is fused inside vt::Qwen4ExpGatedResidual; "
+           "(2) a PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock "
+           "takes contiguous [max_kv, ...] caches while make_kv_cache publishes "
+           "paged ones; (3) reach for the indexer side cache, whose group-2 "
+           "block table GPUModelRunner::gather_block_table never gathers "
+           "(W5c-2); (4) an adapter from the stacked [E, I, H] qwen4_exp MoE "
+           "tensors onto MoeBlockWeights; and (5) a mRoPE cos/sin builder with "
+           "external linkage — qwen3_5.cpp's BuildMropeCosSinHost is static. "
+           "ModelRegistry::Forward additionally refuses any multi-cache "
+           "topology by name, and this model publishes one. See "
+           ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");
   return ForwardLogits{};  // unreachable; VT_CHECK always throws here
 }
 

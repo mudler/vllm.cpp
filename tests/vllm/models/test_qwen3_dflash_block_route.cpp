@@ -392,16 +392,16 @@ TEST_CASE("dflash block route: an EMPTY context is byte-identical") {
 // shipped — so the assertion is on `DflashBlockPagedArgsOf`, the pure builder
 // the production call now routes through.
 TEST_CASE("dflash block paged args: the HOST metadata is populated (#2252)") {
-  const int64_t ctx_len = 1200;
+  const int64_t pool_capacity = 26208;  // pages x page rows, the store's bound
   const int64_t tq = 9;
   const vllm::detail::DflashBlockPagedHostMeta hm =
-      vllm::detail::DflashBlockPagedHostMetaOf(ctx_len, tq);
+      vllm::detail::DflashBlockPagedHostMetaOf(pool_capacity, tq);
 
   // One request, so the query_start_loc is exactly [0, tq).
   CHECK(hm.qsl[0] == 0);
   CHECK(hm.qsl[1] == static_cast<int32_t>(tq));
-  // The EXTENDED bound the read addresses, not the committed context length.
-  CHECK(hm.max_seq_len == static_cast<int32_t>(ctx_len + tq));
+  // The POOL bound, which every replay of the captured graph still satisfies.
+  CHECK(hm.max_seq_len == static_cast<int32_t>(pool_capacity));
 
   const vt::PagedAttentionArgs pa = vllm::detail::DflashBlockPagedArgsOf(
       /*scale=*/0.125F, /*causal=*/true, /*sliding_window=*/0, tq, hm);
@@ -410,9 +410,42 @@ TEST_CASE("dflash block paged args: the HOST metadata is populated (#2252)") {
   REQUIRE(pa.query_start_loc_host != nullptr);
   CHECK(pa.query_start_loc_host[0] == 0);
   CHECK(pa.query_start_loc_host[1] == static_cast<int32_t>(tq));
-  CHECK(pa.max_seq_len == static_cast<int32_t>(ctx_len + tq));
+  CHECK(pa.max_seq_len == static_cast<int32_t>(pool_capacity));
   // It must point INTO the caller-owned meta, not at a temporary.
   CHECK(pa.query_start_loc_host == hm.qsl.data());
+}
+
+// THE PROPERTY, not the value. This call is captured into a CUDA graph once and
+// replayed as the context GROWS, so every host value baked into those args must
+// be the same for every replay. The first #2252 fix used `ctx_len + tq` here,
+// which is exact at capture and stale on every replay after it: measured as an
+// illegal memory access inside `cudaGraphLaunch` (exit 134), against a clean
+// exit 0 from the same binary with `VT_DFLASH_PAGED=0`.
+//
+// A value test alone would not have caught that -- `ctx_len + tq` passes any
+// single-point assertion. Only INVARIANCE across context lengths does.
+TEST_CASE("dflash block paged args: host metadata is REPLAY-STABLE (#2252)") {
+  const int64_t pool_capacity = 4096;
+  const int64_t tq = 8;
+
+  const vllm::detail::DflashBlockPagedHostMeta hm =
+      vllm::detail::DflashBlockPagedHostMetaOf(pool_capacity, tq);
+
+  // The bound must cover the LARGEST sequence any replay can present. A graph
+  // captured while the context is short is replayed until the store is full, so
+  // the worst case is the store's own capacity.
+  const int32_t worst_case_replay_seq = static_cast<int32_t>(pool_capacity);
+  CHECK(hm.max_seq_len >= worst_case_replay_seq);
+
+  // And the defect, stated executably rather than in prose: the bound the first
+  // fix shipped is derived from the context AT CAPTURE, and for any capture that
+  // happens before the store fills, that bound is smaller than a later replay's
+  // sequence. This is the comparison the GPU reported as an illegal access.
+  for (const int64_t capture_ctx : {int64_t{0}, int64_t{16}, int64_t{1200}}) {
+    const int32_t stale_bound = static_cast<int32_t>(capture_ctx + tq);
+    CHECK(stale_bound < worst_case_replay_seq);   // every capture-time bound is short
+    CHECK(hm.max_seq_len >= worst_case_replay_seq);  // the shipped one never is
+  }
 }
 
 // The builder took over the mask and scale wiring, so those must still arrive
@@ -420,7 +453,7 @@ TEST_CASE("dflash block paged args: the HOST metadata is populated (#2252)") {
 // be a wrong ANSWER, which is worse than the slow path it replaced.
 TEST_CASE("dflash block paged args: mask, scale and uniform qlen still flow (#2252)") {
   const vllm::detail::DflashBlockPagedHostMeta hm =
-      vllm::detail::DflashBlockPagedHostMetaOf(/*ctx_len=*/64, /*tq=*/4);
+      vllm::detail::DflashBlockPagedHostMetaOf(/*pool_capacity=*/4096, /*tq=*/4);
 
   const vt::PagedAttentionArgs full = vllm::detail::DflashBlockPagedArgsOf(
       /*scale=*/0.5F, /*causal=*/false, /*sliding_window=*/0, /*tq=*/4, hm);
@@ -443,5 +476,5 @@ TEST_CASE("dflash block paged args: mask, scale and uniform qlen still flow (#22
   }
   // And the host metadata is not disturbed by the mask arm.
   REQUIRE(swa.query_start_loc_host != nullptr);
-  CHECK(swa.max_seq_len == 68);
+  CHECK(swa.max_seq_len == 4096);
 }

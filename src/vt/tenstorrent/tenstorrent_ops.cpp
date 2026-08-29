@@ -282,16 +282,21 @@ struct BufferSlot {
   bool host_current = true;    // host bytes match the latest value
   bool device_current = false; // device tensor matches the latest value
   // BACKEND-TENSTORRENT-QWEN35 W7 (#2282): the pool handed the block to a new
-  // tenant (MarkScratchAcquired) and no host write has happened since. The
-  // resident allocation and the host bytes both hold the PREVIOUS tenant's
-  // bytes — undefined for the new tenant, whose pending device op overwrites
-  // the buffer it is served. EnsureDevice2D therefore stages NOTHING for a
-  // reserved slot: it serves the resident persistent buffer at the same
-  // geometry, or hands out an empty one at a new geometry. Restage semantics:
-  // the service ALIASES the slot's persistent buffer in place (W5) — no fresh
-  // snapshot is created. CommitHost / MarkHostWritten clear the flag: from the
-  // first host write on, the bytes are real and the upload-on-stale contract
-  // applies again.
+  // tenant (MarkScratchAcquired) and no producer has established its content
+  // yet. The resident allocation and the host bytes both hold the PREVIOUS
+  // tenant's bytes — undefined for the new tenant, whose pending device op
+  // overwrites the buffer it is served. EnsureDevice2D therefore stages
+  // NOTHING for a reserved slot: it serves the resident persistent buffer at
+  // the same geometry, or hands out an empty one at a new geometry. Restage
+  // semantics: the service ALIASES the slot's persistent buffer in place (W5)
+  // — no fresh snapshot is created. EVERY content-establishing transition
+  // clears the flag (CommitHost, MarkHostWritten, the device commits, the
+  // staging commits, the memset/copy arms): from the first real bytes on, the
+  // slot is a live tensor and the upload-on-stale contract applies again. The
+  // reserved arm additionally refuses whenever device_current is set, so a
+  // leaked flag can cost a restage but never discards a live shadow (the
+  // #2282 drift: a stale [5,1024] persistent served over a live [8,256]
+  // commit poisoned prompt 1's first token).
   bool device_reserved = false;
   // BACKEND-TENSTORRENT-GDN W2: the conv-state shadow is stored TIME-MAJOR
   // ([sl+1, slots*C], one scratch row) because ttnn slice/concat are exact on
@@ -689,7 +694,13 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
     {
       std::lock_guard<std::mutex> g(SlotMutex());
       BufferSlot* s = FindSlot(t.data);
-      if (s != nullptr && t.data == s->host && s->device_reserved) {
+      // The reservation describes a slot whose bytes are still the previous
+      // tenant's on both sides. A live shadow means some producer already
+      // established the content — serving the resident persistent buffer here
+      // would discard it and hand the consumer stale bytes (the W7 drift,
+      // #2282). Refuse: the normal paths below serve or restage the truth.
+      if (s != nullptr && t.data == s->host && s->device_reserved &&
+          !s->device_current) {
         if (s->persistent.has_value() && s->persist_rows == rows &&
             s->persist_cols == cols) {
           dev = *s->persistent;
@@ -1291,6 +1302,7 @@ void CommitDeviceLogical2D(Tensor& out, ttnn::Tensor dev, uint32_t rows, uint32_
   s->device_current = true;
   s->host_current = false;
   s->conv_transposed = false;  // logical [rows, cols] — oracle layout
+  s->device_reserved = false;  // real bytes committed — the reservation is spent
 }
 
 void CommitDevice2D(Tensor& out, ttnn::Tensor dev) {
@@ -1582,6 +1594,7 @@ ttnn::Tensor EnsureAffine1D(const Tensor& t, uint32_t d, MeshDevice& device) {
     s->dev_cols = d;
     s->device_current = true;
     s->host_current = true;
+    s->device_reserved = false;  // real bytes staged — the reservation is spent
   }
   return dev;
 }
@@ -4472,6 +4485,7 @@ ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
     s->dev_cols = static_cast<uint32_t>(cols);
     s->device_current = true;
     s->host_current = true;
+    s->device_reserved = false;  // real bytes staged — the reservation is spent
     // The re-upload replaces the transposed shadow with this role's logical
     // [rows, cols] split layout — the slot is no longer transposed, and a
     // stale flag would make the equal-volume refusal above fire on the next
@@ -4767,6 +4781,7 @@ ttnn::Tensor EnsureConvStateTransposed(const Tensor& t, uint32_t slots,
       s->dev_cols = R;
       s->device_current = true;
       s->host_current = true;
+      s->device_reserved = false;  // real bytes staged — reservation spent
       s->conv_transposed = true;
       s->conv_slots = slots;
       s->conv_c = Cc;
@@ -4804,6 +4819,7 @@ void CommitConvTransposed(Tensor& state, ttnn::Tensor dev, uint32_t slots,
   s->conv_slots = slots;
   s->conv_c = Cc;
   s->conv_sl = sl;
+  s->device_reserved = false;  // real bytes committed — the reservation is spent
 }
 
 // kCausalConv1dUpdate (§3, seqlen==1 read-old-then-roll; cpu_ops.cpp
@@ -5948,6 +5964,7 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src) {
     d->device = std::move(cloned);
     d->device_current = true;
     d->host_current = false;
+    d->device_reserved = false;  // real bytes installed — reservation spent
   }
   return true;
 }
@@ -5994,6 +6011,7 @@ bool MemsetDeviceIfCapture(void* p, int value) {
     if (s == nullptr) return false;
     s->device_current = true;
     s->host_current = false;
+    s->device_reserved = false;  // real zeros installed — reservation spent
   }
   return true;
 }
@@ -6028,6 +6046,7 @@ bool MemsetDeviceFill(void* p, int value, size_t bytes) {
     if (s == nullptr) return false;
     s->device_current = true;  // shadow KEPT; the caller zeroes the host bytes
     s->host_current = true;
+    s->device_reserved = false;  // real zeros installed — reservation spent
   }
   StagingAvoidedMemset().fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -6074,6 +6093,7 @@ bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes) {
     d->dev_cols = static_cast<uint32_t>(ds[1]);
     d->device_current = true;
     d->host_current = false;
+    d->device_reserved = false;  // real bytes installed — reservation spent
   }
   StagingAvoidedDeviceCopy().fetch_add(1, std::memory_order_relaxed);
   return true;

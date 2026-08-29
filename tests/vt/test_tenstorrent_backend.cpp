@@ -4609,6 +4609,100 @@ TEST_CASE("kTENSTORRENT W7 D2D copy records the served geometry") {
   backend.Free(mb4); backend.Free(mb5); backend.Free(mos); backend.Free(mo);
 }
 
+// W7 drift repair (#2282): the reservation must not survive content
+// establishment, and the reserved arm must never discard a live shadow.
+// Captured on the host-free e2e drift (LEG B, prompt[1] tok=0,
+// VT_TT_ARM_TRACE seq=24277..24341): a pool block handed to a new tenant
+// received a device-committed [8,256] result while device_reserved stayed
+// armed; the next bf16 consumer staged the block at its earlier [5,1024]
+// geometry, took the reserved arm, and was handed the STALE persistent
+// buffer — the previous tenant's bytes — while the live [8,256] shadow was
+// dropped. The stage must fall through to the normal path (refresh + upload)
+// whenever the slot holds a live device shadow.
+TEST_CASE("kTENSTORRENT W7 reservation never serves over a live device shadow") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t T = 5, H = 1024, N1 = 16;   // the block's [5,1024] role
+  constexpr int64_t M2 = 8, K2 = 64, N2 = 256;  // the new tenant's [8,256] role
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  auto mm = reinterpret_cast<vt::MatmulFn>(
+      vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  Queue q = backend.CreateQueue();
+  const Device dev{DeviceType::kTENSTORRENT, 0};
+
+  void* w1b = backend.Alloc(N1 * H * 2);
+  std::vector<uint16_t> w1(N1 * H);
+  for (size_t i = 0; i < w1.size(); ++i) w1[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* a2b = backend.Alloc(M2 * K2 * 2);
+  std::vector<uint16_t> a2(M2 * K2);
+  for (size_t i = 0; i < a2.size(); ++i) a2[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  void* b2b = backend.Alloc(N2 * K2 * 2);
+  std::vector<uint16_t> b2(N2 * K2);
+  for (size_t i = 0; i < b2.size(); ++i) b2[i] = static_cast<uint16_t>(0x3f00 + (i % 5));
+  backend.Copy(q, w1b, w1.data(), N1 * H * 2);
+  backend.Copy(q, a2b, a2.data(), M2 * K2 * 2);
+  backend.Copy(q, b2b, b2.data(), N2 * K2 * 2);
+  Tensor W1 = Tensor::Contiguous(w1b, vt::DType::kBF16, dev, {N1, H});
+  Tensor a2t = Tensor::Contiguous(a2b, vt::DType::kBF16, dev, {M2, K2});
+  Tensor b2t = Tensor::Contiguous(b2b, vt::DType::kBF16, dev, {N2, K2});
+
+  // Tenant 1 stages the block as a [5,1024] bf16 input: its W5 persistent
+  // buffer now holds bytes A.
+  void* blk = backend.Alloc(T * H * 2);
+  std::vector<uint16_t> a(T * H);
+  for (size_t i = 0; i < a.size(); ++i) a[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  backend.Copy(q, blk, a.data(), T * H * 2);
+  Tensor in1 = Tensor::Contiguous(blk, vt::DType::kBF16, dev, {T, H});
+  void* o1b = backend.Alloc(T * N1 * 4);
+  Tensor o1 = Tensor::Contiguous(o1b, vt::DType::kF32, dev, {T, N1});
+  mm(q, o1, in1, W1);
+  std::vector<float> r1(T * N1);
+  backend.Copy(q, r1.data(), o1b, T * N1 * 4);  // bytes A's own reference
+
+  // DevicePool::Get hands the block to a new tenant (reservation armed).
+  backend.OnScratchBlockAcquired(blk);
+
+  // The new tenant's producer commits a DIFFERENT-geometry [8,256] result
+  // into the block: the slot's bytes are now REAL (device truth), which must
+  // consume the reservation.
+  void* o2b = backend.Alloc(M2 * N2 * 4);
+  Tensor o2 = Tensor::Contiguous(blk, vt::DType::kF32, dev, {M2, N2});
+  mm(q, o2, a2t, b2t);  // CommitDeviceLogical2D: live [8,256] shadow on blk
+  std::vector<float> r2(M2 * N2);
+  backend.Copy(q, r2.data(), blk, M2 * N2 * 4);  // the live shadow serves
+
+  // The next bf16 consumer stages the block at its earlier [5,1024] geometry.
+  Tensor in3 = Tensor::Contiguous(blk, vt::DType::kBF16, dev, {T, H});
+  void* o3b = backend.Alloc(T * N1 * 4);
+  Tensor o3 = Tensor::Contiguous(o3b, vt::DType::kF32, dev, {T, N1});
+  ResetStagingStats();
+  mm(q, o3, in3, W1);
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_reservation == 0,
+                "the reserved arm must not serve a slot holding a live device "
+                "shadow, got " << s.stages_avoided_reservation);
+  std::vector<float> r3(T * N1);
+  backend.Copy(q, r3.data(), o3b, T * N1 * 4);
+  bool differs = false;
+  for (size_t i = 0; i < r1.size(); ++i) {
+    if (r1[i] != r3[i]) {
+      differs = true;
+      break;
+    }
+  }
+  CHECK_MESSAGE(differs,
+                "the stage consumed the PREVIOUS tenant's staged bytes: the "
+                "stale persistent buffer was served over a live shadow");
+  backend.Free(w1b); backend.Free(a2b); backend.Free(b2b); backend.Free(blk);
+  backend.Free(o1b); backend.Free(o2b); backend.Free(o3b);
+}
+
 // ==== BACKEND-TENSTORRENT-QWEN35 W3 (#2201): the GDN reviewer leftovers ======
 // (a) the state d2h counter must see BOTH remaining download paths — the
 // EnsureGdnCacheDevice slow-path refresh and the CommitConvTransposed

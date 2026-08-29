@@ -15,6 +15,18 @@
 // is the RED this wave was written against and it stays in the suite: it is the
 // only thing that keeps the next reader from re-deriving "the shapes match".
 //
+// THAT RED IS ROUTE-CONDITIONAL, and the suite says so rather than leaving a
+// reader to discover it. `Qwen35GroupedMoeEnabled()` (`qwen3_5.cpp:6298-6301`)
+// is ON by default; with `VT_QWEN35_GROUPED_MOE=0` the seam takes the
+// per-expert `ExpertMlpKq` path, which reaches `KqResidentSlice`
+// (`qwen3_5.cpp:5664-5677`), and that helper rebuilds a rank-2 view from its
+// `N`/`K` ARGUMENTS by pointer arithmetic and never reads the declared rank. A
+// rank-3 tower does not throw there, and since the tower is contiguous
+// `[E, N, K]` the slice `row_off = e * N` is the right one, so it answers
+// CORRECTLY. `GroupedRoute()` below reads the same environment variable the
+// seam reads, and each case asserts the behaviour of the route it is on. Both
+// routes are gated; neither is assumed.
+//
 // The value gate is `MoeReference`, a from-scratch double-precision
 // reimplementation of the oracle at transformers **5.16.0**
 // (`.agents/oracles/transformers.md`, this row's accepted lane pin):
@@ -35,23 +47,52 @@
 //    points upstream stores bf16 too (the router logits at :909 before its f32
 //    softmax at :910, and the per-expert output at :893), which the reference
 //    reproduces, plus the f32 silu.
-//  * The keep-quant arm carries one more term the reference does not model: the
-//    DOWN projection's activation is quantized to q8_0 by `kMatmulBTQuant`
-//    (cpu_quant_gemm.cpp path 1, mirroring ggml), and that activation is
-//    `silu(g)*u`, which this suite does not control. The gate/up activation IS
-//    controlled — amax is exactly 127*2^-8 per row, so `quantize_row_q8_0`
-//    recovers the codes exactly — which is why only one of the three GEMMs
-//    contributes error. Its bound is measured, printed, and asserted far below
-//    every mutation margin rather than assumed.
+//  * The keep-quant arm's bound is MEASURED, not derived, and it is stated that
+//    way because the derivation an earlier draft gave here was WRONG. All three
+//    of its GEMMs quantize their activation to q8_0 through `kMatmulBTQuant`
+//    (cpu_quant_gemm.cpp path 1, mirroring ggml), and none of the three is
+//    exact. `QuantizeRowQ8_0` (`src/vt/cpu/cpu_quant_act.cpp:52-81`, its
+//    per-block `amax` loop at `:58-69`) takes `amax` per 32-ELEMENT BLOCK,
+//    not per row; `HiddenCodes()` forces
+//    `|code| = 127` at element 0 of each ROW only, and `kH = 64` is TWO blocks,
+//    so block 1 gets whatever amax its random codes happen to carry, its `d` is
+//    not `2^-8`, and the gate and up projections carry quantization error too.
+//    The down projection carries a further term the reference does not model at
+//    all, since its activation is `silu(g)*u`, which nothing here controls. So
+//    the number below is what the suite MEASURES: it is printed by a `MESSAGE`
+//    on every run, and it is asserted an order of magnitude below every
+//    mutation margin. Forcing `|code| = 127` in every 32-element block of every
+//    row would make the derivation true; it is deliberately not done, because
+//    it moves the router logits and therefore the routing, and the seven
+//    mutation margins this wave was gated with have been independently
+//    reproduced against THIS fixture. The spec's `## Owed` carries that.
 //
 // UPSTREAM PRECISION NOTE, recorded rather than mirrored: upstream casts the
 // renormalized top-k weights back to the model dtype
 // (`router_top_value.to(router_logits.dtype)`, :914) and our shared seam keeps
 // them f32 (`vt::MoeRouterTopK` writes an f32 `dtw`, qwen3_5.cpp:7238-7241). The
-// seam is the more precise of the two by one bf16 rounding of a value in [0,1],
-// it is what every Qwen MoE in this tree already does, and mirroring the seam is
-// what "route through the shared seam" means. The reference therefore keeps the
-// weights in double at that point.
+// seam is therefore WIDER than the oracle by one bf16 rounding of a value in
+// [0,1]. That is a divergence, not a feature, and it is NOT defended here as
+// being "more precise": AGENTS.md §"Inherit vLLM defaults" is explicit that a
+// token gate cannot see a dtype that is too wide, which is exactly the argument
+// "more precise" would be. The width is INHERITED — it is what `MoeRouterTopK`
+// writes and what every Qwen MoE in this tree reads, and narrowing it is a
+// seam-level change, not an adapter-level one — so it is recorded under the
+// spec's `## Owed` rather than resolved in this wave. The reference keeps the
+// weights in double at that point so the suite measures the adapter and not
+// this rounding.
+//
+// TWO LIMITS OF THE FIXTURE, so nobody reads it as wider than it is. The
+// keep-quant towers here are hand-written Q8_0 blocks, so the keep-quant arm is
+// value-proven at Q8_0 ONLY: the adapter is dtype-generic on that arm by
+// construction (it re-declares rank and copies no bytes, and
+// `MatmulBTQuantGrouped` accepts any `IsBlockQuant` dtype), but no k-quant tower
+// is executed here and every released checkpoint of this model is a k-quant.
+// And `BuildSource`'s bf16 towers are `nk = false` where `LoadStackedExperts`
+// produces `ExpandBf16(..., /*nk=*/true)`; the adapter stamps `nk = true` on the
+// per-expert views it hands the seam either way, so the gated orientation is the
+// production one, but the SOURCE is not the loader's own output. Both are owed
+// in the spec.
 //
 // CPU only: this is a weight adapter and a composition, there is no CUDA arm to
 // compare, and a CUDA arm written on a CPU host could not be gated. The one
@@ -64,6 +105,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <string>
@@ -138,6 +180,32 @@ Qwen4ExpParams Params() {
 
 vt::Device Cpu() { return vt::Device{vt::DeviceType::kCPU, 0}; }
 Queue CpuQ() { return Queue{Cpu(), nullptr}; }
+
+// WHICH EXPERT ROUTE THE SEAM WILL TAKE, read from the same environment variable
+// with the same predicate `Qwen35GroupedMoeEnabled()` uses
+// (`qwen3_5.cpp:6298-6301`). It is duplicated rather than called because the
+// seam's copy is file-local to qwen3_5.cpp and is not declared in any header.
+// The duplication is one `getenv` and one string compare, and it is the reason
+// this suite can gate BOTH routes instead of silently asserting the default
+// one's behaviour on whichever route it happens to run.
+//
+// The seam caches its answer in a function-local `static const`, which stops the
+// value being flipped MID-PROCESS — not before launch. So
+// `VT_QWEN35_GROUPED_MOE=0 ./tests/test_qwen4_exp_moe` really does exercise the
+// per-expert `ExpertMlpKq` path, and that is a supported way to run this suite.
+bool GroupedRoute() {
+  const char* e = std::getenv("VT_QWEN35_GROUPED_MOE");
+  return e == nullptr || std::string(e) != "0";
+}
+
+// `std::string`, NOT `const char*`. doctest stringifies a bare `char*` through
+// its BOOL overload, so a `MESSAGE(... << RouteName())` returning a pointer
+// prints "1" for every route and the line reports nothing at all. Measured on
+// the first run of this helper.
+std::string RouteName() {
+  return GroupedRoute() ? std::string("grouped (default, VT_QWEN35_GROUPED_MOE unset or != 0)")
+                        : std::string("per-expert ExpertMlpKq (VT_QWEN35_GROUPED_MOE=0)");
+}
 
 OwnedTensor Make(DType dt, const std::vector<int64_t>& shape, size_t bytes, bool nk) {
   OwnedTensor o;
@@ -366,8 +434,12 @@ void AssertRoutingIsNonTrivial(const RefOut& r) {
   }
   std::sort(sets.begin(), sets.end());
   sets.erase(std::unique(sets.begin(), sets.end()), sets.end());
+  // GATE THE NUMBER THAT IS STATED, not a weaker one. The fixture's seeds were
+  // searched for FIVE distinct selected sets across the five tokens, and that
+  // is what the wave's prose claims; `>= 2` would let four of the five collapse
+  // without a word. `kT` rather than a literal 5 so the two cannot drift apart.
   INFO("distinct selected sets = " << sets.size());
-  CHECK(sets.size() >= 2);
+  CHECK(sets.size() == static_cast<size_t>(kT));
   CHECK(any_non_prefix);
   const int64_t unused = std::count(seen.begin(), seen.end(), false);
   INFO("experts never selected = " << unused);
@@ -446,9 +518,27 @@ TEST_CASE("Qwen4Exp MoE: the stacked towers do NOT drop into the seam's _kq fiel
   mixed.expert_up_kq = s.w.up_exps;
   mixed.expert_down_kq = s.w.down_exps;
   REQUIRE(mixed.expert_gate_kq.rank == 3);
-  CHECK_THROWS_WITH_AS(RunBlock(mixed, p, xc),
-                       doctest::Contains("matmul_bt_quant_grouped: rank-2"),
-                       std::exception);
+  MESSAGE("expert route = " << RouteName());
+  if (GroupedRoute()) {
+    CHECK_THROWS_WITH_AS(RunBlock(mixed, p, xc),
+                         doctest::Contains("matmul_bt_quant_grouped: rank-2"),
+                         std::exception);
+  } else {
+    // THE OTHER HALF OF #2249 ITEM 4, asserted rather than assumed away. On the
+    // per-expert route `ExpertMlpKq` reaches `KqResidentSlice`
+    // (`qwen3_5.cpp:5664-5677`), which rebuilds a rank-2 view from its `N`/`K`
+    // ARGUMENTS and never reads the declared rank — so the rank-3 tower is
+    // accepted, and because the tower is contiguous `[E, N, K]` the offset
+    // `e * N` is the right slice and the ANSWER IS RIGHT. Item 4's "the shapes
+    // match" is literally true here and false on the default route; a suite
+    // that only ever ran the default one could state neither.
+    const RefOut ref = MoeReference(s, xc);
+    const std::vector<float> got = RunBlock(mixed, p, xc);
+    const double worst = vllm_test::MaxAbsDiff(got, ref.y.data(), ref.y.size());
+    MESSAGE("rank-3 towers on the per-expert route: max|diff| = " << worst);
+    CHECK(std::isfinite(worst));
+    CHECK(worst < 0.05 * Scale(ref.y));
+  }
 
   // And the adapter's own output is what the field wants: rank 2, [E*I, H].
   MoeBlockWeights mw = vllm::Qwen4ExpMoeBlockWeights(s.w, p);
@@ -498,7 +588,12 @@ TEST_CASE("Qwen4Exp MoE: the bf16 arm matches the lane-pinned oracle") {
   const double scale = Scale(ref.y);
   INFO("|reference| max = " << scale);
   const double worst = vllm_test::MaxAbsDiff(got, ref.y.data(), ref.y.size());
-  MESSAGE("bf16 arm max|diff| = " << worst << " over |reference| max " << scale);
+  // The ROUTE is printed beside the number because the two are only known to be
+  // equal by measurement: `qwen3_5.cpp:7260` claims the grouped path is
+  // byte-identical to the per-expert scatter, and running this suite both ways
+  // is what turns that claim into a reading.
+  MESSAGE("bf16 arm max|diff| = " << worst << " over |reference| max " << scale
+                                  << ", expert route = " << RouteName());
   CHECK(std::isfinite(worst));
   CHECK(worst < 0.02 * scale);
 }
@@ -517,7 +612,8 @@ TEST_CASE("Qwen4Exp MoE: the keep-quant arm matches the same oracle") {
   const double worst = vllm_test::MaxAbsDiff(got, ref.y.data(), ref.y.size());
   // MESSAGE, not only INFO: a tolerance whose measured value is invisible is a
   // number nobody re-reads when the fixture drifts.
-  MESSAGE("keep-quant arm max|diff| = " << worst << " over |reference| max " << scale);
+  MESSAGE("keep-quant arm max|diff| = " << worst << " over |reference| max " << scale
+                                        << ", expert route = " << RouteName());
   CHECK(std::isfinite(worst));
   // Wider than the bf16 arm by exactly one term: the down projection's q8_0
   // activation quantization (see the file header). Still an order of magnitude
@@ -547,6 +643,28 @@ TEST_CASE("Qwen4Exp MoE: the adapter refuses by name") {
     q.moe_intermediate_size = kI * 2;
     CHECK_THROWS_WITH_AS(vllm::Qwen4ExpMoeBlockWeights(s.w, q),
                          doctest::Contains("ffn_gate_exps axis 1 must be"), std::exception);
+  }
+  SUBCASE("a stacked dtype that is neither arm") {
+    // THE FOURTH REFUSAL THE HEADER CONTRACTS, which nothing exercised before.
+    // f32 towers of the RIGHT shape: `RequireShape` passes, `IsStackedKeepQuant`
+    // is false because f32 is not block-quant, and the bf16 branch refuses by
+    // name instead of borrowing f32 bytes into a field the seam will read as
+    // bf16 — which would be a silent 2x misread of every expert weight.
+    //
+    // It is also the refusal that catches
+    // [#2275](https://github.com/mudler/vllm.cpp/issues/2275) at this seam:
+    // `LoadStackedExperts` today falls through to `ExpandBf16` for `kKeepF16`
+    // and `kNvfp4Fp4`, so the adapter never sees a third dtype from the loader.
+    // When that fall-through is replaced by the residency refusal the issue
+    // asks for, THIS case is what says the adapter refuses rather than
+    // reinterprets whatever arrives.
+    MoeSource s = BuildSource(/*keep_quant=*/false);
+    s.w.gate_exps = F32Tensor(s.gate, {kE, kI, kH});
+    s.w.up_exps = F32Tensor(s.up, {kE, kI, kH});
+    s.w.down_exps = F32Tensor(s.down, {kE, kH, kI});
+    CHECK_THROWS_WITH_AS(vllm::Qwen4ExpMoeBlockWeights(s.w, p),
+                         doctest::Contains("the seam has no arm for it"),
+                         std::exception);
   }
   SUBCASE("a hidden state that is not bf16") {
     MoeSource s = BuildSource(/*keep_quant=*/false);

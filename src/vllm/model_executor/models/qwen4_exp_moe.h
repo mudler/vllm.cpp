@@ -22,7 +22,17 @@
 //      (`Qwen35GroupedMoeEnabled`, ON) hands that tensor straight to
 //      `vt::MatmulBTQuantGrouped`, whose FIRST check is
 //      "matmul_bt_quant_grouped: rank-2 out/act/weight required"
-//      (`src/vt/ops.cpp:223`). A rank-3 tower does not "match"; it throws.
+//      (`src/vt/ops.cpp:223`). ON THE DEFAULT GROUPED ROUTE a rank-3 tower does
+//      not "match"; it throws. That qualifier is load-bearing and is not a
+//      hedge: with `VT_QWEN35_GROUPED_MOE=0` the seam takes the per-expert
+//      `ExpertMlpKq` path, which reaches `KqResidentSlice`
+//      (`qwen3_5.cpp:5664-5677`) — and that helper rebuilds a rank-2 view from
+//      its `N`/`K` ARGUMENTS by pointer arithmetic, sets `wt.rank = 2` itself
+//      and never reads the tower's declared rank. A rank-3 tower does not throw
+//      there, and because the tower is contiguous `[E, N, K]` it even answers
+//      correctly. #2249 item 4's "the shapes match" is literally true of that
+//      route and false of the default one, which is the one every shipped
+//      checkpoint takes. The suite carries both behaviours.
 //   2. DTYPE. `LoadMoe` keeps the router and the shared gate in **f32**
 //      deliberately (`qwen4_exp_weights.cpp:437-447`). The seam consumes both
 //      through `MatmulBf16` / `MatmulF32D` against a **bf16** activation, and
@@ -44,7 +54,9 @@
 //   4. THE BF16 ARM CANNOT USE THE STACKED FIELDS AT ALL. A bf16 tower in
 //      `expert_*_kq` takes the same grouped route as (1) and hits
 //      "matmul_bt_quant_grouped: weight must be a block-quantized dtype"
-//      (`ops.cpp:231`). The bf16 arm therefore fills the PER-EXPERT vectors, and
+//      (`ops.cpp:231`) — route-conditional in exactly the way (1) is, since
+//      `MatmulF32Slice`'s generic `vt::MatmulBT` would accept the bf16 slice on
+//      the `ExpertMlpKq` path. The bf16 arm therefore fills the PER-EXPERT vectors, and
 //      it fills them with zero-copy BORROWED views of the stacked buffer: the
 //      released geometry is 512 experts x 640 x 2560, so materialising three
 //      per-expert copies per layer is 240 GB across 48 layers. Zero-copy is not

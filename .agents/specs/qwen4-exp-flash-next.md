@@ -2094,9 +2094,16 @@ is listed under `## Owed`.
   `Qwen4ExpMoeBlockWeights`, `Qwen4ExpMoeHfConfig` and `RunQwen4ExpMoeBlock` — is
   reached at this merge commit ONLY by
   `tests/vllm/models/test_qwen4_exp_moe.cpp`. No production entry point calls
-  it: `ModelRegistry::Forward` still refuses
-  `Qwen4ExpForConditionalGeneration` by name, because
-  `ForwardQwen4ExpForConditionalGeneration` does not exist. The wiring is owned
+  it, and the MECHANISM is not the one an earlier draft of this bullet named.
+  `ForwardQwen4ExpForConditionalGeneration` EXISTS
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp:142`) and IS registered
+  as the model's `.forward` hook (`:421`); its entire body is one
+  `VT_CHECK(false, ...)` refusal-by-name (`:189`), placed ahead of any downcast.
+  So `ModelRegistry::Forward` reaches a real hook and that hook refuses
+  `Qwen4ExpForConditionalGeneration` by name before a layer runs. The conclusion
+  — nothing production-side reaches this adapter — is unchanged; "the function
+  does not exist" was wrong and is corrected here rather than left to be
+  reasoned from. The wiring is owned
   by row `MODEL-MM-QWEN4-EXP` and tracked by
   [#2031](https://github.com/mudler/vllm.cpp/issues/2031) (the layer loop) under
   campaign issue [#1978](https://github.com/mudler/vllm.cpp/issues/1978). The
@@ -2105,7 +2112,7 @@ is listed under `## Owed`.
   there is no production call site. What the suite DOES prove is that it enters
   through the adapter — deleting the adapter's keep-quant wiring reds it
   (mutation M4).
-  Three further things W5d-4 owes:
+  Six further things W5d-4 owes:
   - **`norm_topk_prob` is not representable through this seam.** `MoeBlock`
     hardcodes `renormalize = true` (`qwen3_5.cpp:7241`) and `HfConfig` carries no
     such field, so a config that turned it off could not be honoured and the
@@ -2126,7 +2133,9 @@ is listed under `## Owed`.
   - **The NVFP4 expert arm is refused by absence, not by name.**
     `Qwen4ExpMoeWeights` has no `Nvfp4Weight` fields and `LoadStackedExperts` has
     no fp4 branch, so `MoeBlockWeights::expert_*_fp4` are left empty and the
-    seam's `fp4` predicate is false. Separately, and NOT this wave's to fix:
+    seam's `fp4` predicate is false. Separately, and NOT this wave's to fix,
+    filed as [#2275](https://github.com/mudler/vllm.cpp/issues/2275) and owned by
+    this row:
     `LoadStackedExperts` (`qwen4_exp_weights.cpp:148-167`) handles only
     `kKeepQuant` and falls through to `ExpandBf16` for BOTH `kKeepF16` and
     `kNvfp4Fp4`, which `GgufLoadPolicy::Route` can return for
@@ -2135,6 +2144,55 @@ is listed under `## Owed`.
     allocation rather than a wrong answer, so it fails loudly, but it belongs to
     the W5a loader and is recorded here so the next reader does not read the
     adapter's two arms as the loader's full range.
+  - **The routed top-k weights reach the experts f32, which is WIDER than the
+    oracle, and the width is owed rather than defended.** Upstream casts the
+    renormalized top-k weights back to the model dtype
+    (`router_top_value.to(router_logits.dtype)`, `modeling_qwen4_exp.py:914`);
+    our shared seam keeps them f32, because `vt::MoeRouterTopK` writes an f32
+    `dtw` (`qwen3_5.cpp:7238-7241`) and every Qwen MoE in this tree reads that
+    field. An earlier draft of the suite header called the seam "the more
+    precise of the two". That is exactly the argument AGENTS.md §"Inherit vLLM
+    defaults" exists to refuse: a token gate cannot see a dtype that is too
+    wide, so "more precise" is never a reason to be wider than the oracle. The
+    honest statement is that the adapter INHERITS the width from the seam, has
+    no way to narrow it without diverging from every other Qwen MoE here, and
+    that narrowing `dtw` to the model dtype is a seam-level change owed to the
+    shared seam rather than to this adapter. Nothing measures it today: at
+    top_k = 3 it is one bf16 rounding of a value in [0, 1] per pair, below this
+    suite's tolerances, so it needs a gate of its own.
+  - **The keep-quant arm is value-proven at Q8_0 ONLY, and against a fixture
+    whose bf16 towers are `nk = false` where the loader's are `nk = true`.**
+    `tests/vllm/models/test_qwen4_exp_moe.cpp` builds its keep-quant towers as
+    hand-written Q8_0 blocks. The adapter is dtype-generic on that arm by
+    construction — it re-declares the tower rank 2 and copies no bytes, and
+    `vt::MatmulBTQuantGrouped` accepts any `IsBlockQuant` dtype — but NO k-quant
+    tower is executed through it here, and every released Qwen4-Exp checkpoint
+    is a k-quant (Q2_K..Q6_K, IQ1_*). A k-quant value case is owed, and it is
+    owed at the loader rather than at the adapter, because it needs
+    `OwnGgufQuantBlocks` output rather than a hand-built block. Separately, the
+    fixture's SOURCE bf16 towers are built `nk = false` where
+    `LoadStackedExperts` produces `ExpandBf16(..., /*nk=*/true)`: the adapter
+    stamps `nk = true` on the per-expert views it hands the seam either way, so
+    the gated bytes and the gated orientation are the production ones, but the
+    fixture is not the loader's own output and this section says so rather than
+    letting a reader infer that it is.
+  - **The keep-quant tolerance is MEASURED, not derived.** An earlier draft of
+    the suite header justified it by claiming the gate/up activation is exactly
+    q8_0-representable, "amax is exactly 127*2^-8 per row". `QuantizeRowQ8_0`
+    (`src/vt/cpu/cpu_quant_act.cpp:52-81`, its per-block `amax` loop at
+    `:58-69`) computes `amax` per 32-ELEMENT BLOCK,
+    not per row, and the fixture's `HiddenCodes()` forces `|code| = 127` at
+    element 0 of each row only. `kH = 64` is TWO blocks, so block 1 takes an
+    arbitrary `amax`, its `d` is not `2^-8`, and the gate and up projections
+    carry quantization error as well as the down projection. The bound the suite
+    asserts is therefore what it measures, not what it derives; it is printed by
+    a `MESSAGE` on every run, and it is an order of magnitude below every
+    mutation margin. Forcing `|code| = 127` in every block of every row would
+    restore the derivation, and it is deliberately NOT done here: it moves the
+    router logits, hence the routing, hence the seven mutation margins an
+    independent review has already reproduced against this fixture. The
+    derivation is owed to whichever change next has a reason to move the
+    fixture.
 
 - **W5b-4 (#2167) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`
@@ -3110,7 +3168,18 @@ is listed under `## Owed`.
        (`Qwen35GroupedMoeEnabled`, ON) hands that tensor to
        `vt::MatmulBTQuantGrouped`, whose first check is
        "matmul_bt_quant_grouped: rank-2 out/act/weight required"
-       (`src/vt/ops.cpp:223`). Three more differences a shape comparison cannot
+       (`src/vt/ops.cpp:223`). **That refusal is ROUTE-CONDITIONAL and the
+       sentence above is scoped to the default route on purpose.** With
+       `VT_QWEN35_GROUPED_MOE=0` the seam takes the per-expert `ExpertMlpKq`
+       path, which reaches `KqResidentSlice` (`qwen3_5.cpp:5664-5677`); that
+       helper rebuilds a rank-2 view from its `N`/`K` ARGUMENTS by pointer
+       arithmetic, sets `wt.rank = 2` itself and never reads the tower's
+       declared rank, so a rank-3 tower does not throw there — and, the tower
+       being contiguous `[E, N, K]`, `row_off = e * N` lands on exactly the
+       right slice, so it answers correctly. #2249 item 4's original sentence is
+       therefore literally true of the NON-default route. It is false of the one
+       every shipped checkpoint takes, which is why this wave was the size it
+       was. Three more differences a shape comparison cannot
        see: the router and shared gate are f32 by `LoadMoe`'s deliberate choice
        and the CUDA GEMM refuses a (bf16, f32) pair by name
        (`cuda_matmul.cu:397-403`), so passing them through runs on CPU and dies
@@ -3122,7 +3191,16 @@ is listed under `## Owed`.
        views, because three copies per layer at the released geometry is 240 GB
        across the stack. Both arms are now gated against a from-scratch
        reimplementation of the lane-pinned oracle in
-       `tests/vllm/models/test_qwen4_exp_moe.cpp`.
+       `tests/vllm/models/test_qwen4_exp_moe.cpp`. **And the alternate route is a
+       measured RESULT rather than an admitted limit.**
+       `Qwen35GroupedMoeEnabled()` caches in a function-local `static const`
+       (`qwen3_5.cpp:6298-6301`), which prevents flipping it MID-PROCESS, not
+       before launch — so `VT_QWEN35_GROUPED_MOE=0` does exercise `ExpertMlpKq`.
+       Run that way, both value cases pass at BIT-IDENTICAL `max|diff|` to the
+       default route (bf16 `0.00218359`, keep-quant `0.00865547`), which is the
+       seam's own byte-identity claim at `qwen3_5.cpp:7260` measured rather than
+       inherited. The suite runs on both routes and says which behaviour it is
+       asserting on each.
     5. **The mRoPE table builder has internal linkage.**
        `BuildMropeCosSinHost` is `static` at `qwen3_5.cpp:9472`, and
        `RunQwen4ExpQsaBlock` needs BOTH layouts derived from it: the packed

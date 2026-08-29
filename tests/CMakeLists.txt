@@ -3362,6 +3362,19 @@ target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_qwen4_exp_forward vllm/models/test_qwen4_exp_forward.cpp)
 target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5d-4 (#2249 item 4) — the MoE weight adapter, gated against
+# a from-scratch double-precision reimplementation of the lane-pinned oracle's
+# own `Qwen4ExpTextSparseMoeBlock.forward` that reads the SOURCE stacked towers,
+# not the `MoeBlockWeights` the adapter produced. Carries the RED this wave was
+# written against — the rank-3 towers dropped into the seam's rank-2 `_kq` fields
+# — so #2249's "the shapes match" cannot be re-derived. CPU only: a weight
+# adapter has no CUDA arm to compare, and the one GPU-only fact it turns on (the
+# (bf16,f32) combo `MatmulBTKernelCuda` refuses) is asserted on the DTYPE
+# instead. Reaches the model-private qwen4_exp_moe.h / qwen4_exp_weights.h, hence
+# the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_moe vllm/models/test_qwen4_exp_moe.cpp)
+target_include_directories(test_qwen4_exp_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
 # ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would

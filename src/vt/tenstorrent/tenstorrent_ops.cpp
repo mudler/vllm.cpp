@@ -668,7 +668,13 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
              "base is unsupported (would read stale bytes); stage via the "
              "base tensor");
   }
-  if (reserved_base) {
+  // The reservation arm is bf16-only: it serves the slot's W5 persistent
+  // staging buffer (BFLOAT16/TILE) or a fresh BFLOAT16 empty, so a master of
+  // any other dtype taking the arm would receive a bf16 device tensor for its
+  // declared dtype. A non-bf16 master whose first device use lands on an
+  // acquired block falls through to the normal staging path below, whose f32
+  // arm keeps the declared dtype (the W7 invariant).
+  if (reserved_base && t.dtype == DType::kBF16) {
     // W7 (#2282) reservation: see BufferSlot::device_reserved. The previous
     // tenant's bytes sit on BOTH sides and the new tenant's pending device op
     // overwrites the buffer it is served — stage NOTHING. Serve the resident
@@ -6058,7 +6064,14 @@ bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes) {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* d = FindSlot(dst);
     if (d == nullptr) return false;
+    // The shadow just installed is SRC-shaped, and equal byte size does not
+    // mean equal geometry: the record must name the served geometry, or a
+    // later stage at dst's recorded exact geometry would hit the fast path
+    // and be handed a wrongly-shaped tensor.
+    const auto ds = src_dev.logical_shape();
     d->device = std::move(cloned);
+    d->dev_rows = static_cast<uint32_t>(ds[0]);
+    d->dev_cols = static_cast<uint32_t>(ds[1]);
     d->device_current = true;
     d->host_current = false;
   }

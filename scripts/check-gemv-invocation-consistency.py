@@ -76,6 +76,16 @@ ALGO_CONST = "kGemvHeuristicAlgos"
 ALGO_POLICY_NAMES = (
     ALGO_CONST,             # production: 1, the single best heuristic, no algo search
     "kFp8AlgoLogCandidates",  # diagnostic only, VT_GEMM_ALGO_LOG=1 (#1866)
+    # Diagnostic only, VT_GEMM_ALGO_LOG=1, on its OWN heuristic query: the dense
+    # bf16/f32 lanes still EXECUTE whatever the single-best query above selects,
+    # so this widens what may be LOGGED and not what may run. Added because an
+    # nsys profile of the 27B decode on GB10 (sm_121a) puts 87.4% of GPU time in
+    # `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_*_tn_align8` -- an
+    # Ampere-generation WMMA kernel with a 16x16 tile, for a decode whose M is 8
+    # -- and a candidate list of length one cannot distinguish "cuBLASLt ranked a
+    # Blackwell-native algo second" from "cuBLASLt enumerates none for this
+    # descriptor". That is the same question #1866 asked of the fp8 tower.
+    "kDenseAlgoLogCandidates",
 )
 
 # --- Invariant A(1): C/D (output) layout dtype -------------------------------------

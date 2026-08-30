@@ -1292,6 +1292,33 @@ re-derived here.
 
 ## Owed
 
+- **The placement round trip has no byte-for-byte gate, and since 2026-08-30 it
+  has no test that appears to give it one either** (#2331).
+  `test_placed_moe_roundtrip.cpp` drove `RunMoeBlockPlaced` with `kCPU` passed
+  explicitly as the placement device, so the transfer ran as memcpys and the
+  comparison could be exact. `866075b2f` (#2313) moved every architecture onto
+  `RunMoePlaced`, which takes the placement device from
+  `ActiveMoePlacementPlan()` and short-circuits when it equals the engine
+  device -- `if (placed_on == engine_device) return body(engine, dh);`, no copy
+  and no allocation. Same-device placement is INERT by design, which is an
+  improvement, and the consequence is that the transfer path is reachable only
+  CROSS-DEVICE.
+
+  The deleted file's own header already said this: "It does NOT prove the
+  cross-device arm. That needs the engine device and the placement device to
+  differ, which on this box means a Vulkan build against lavapipe, and it is
+  the gate W3b still owes." So the gap predates the deletion; what the deletion
+  removed is a file that looked like coverage while exercising a helper
+  production had stopped calling.
+
+  The gate falls due as a cross-device run (Vulkan/lavapipe, or a CUDA box):
+  the same block computed placed and unplaced must agree BYTE-FOR-BYTE, not
+  within a tolerance, because placement is a scheduling decision that must
+  never change a value. **Not portable to a same-device test**: the only
+  assertion the seam admits there is that the inert path returns what `body`
+  returned, which restates `return body(engine, dh)`.
+
+
 | Owed | Why it is open |
 |---|---|
 | **`kQwen3MoeFactory.streams_routed_experts = true` is a CORRECT declaration that nothing READS today.** The flag's only reader is the loader's lane block, which is on the GGUF path, and `kGgufArchArms` (`model_loader.cpp`) maps no `general.architecture` onto `Qwen3MoeForCausalLM` (Qwen3-Coder), so no GGUF load can resolve to that factory. | It is set anyway because it is TRUE: `qwen3_moe.cpp` composes the same `RunMoeBlock` the Qwen3.5 MoE forward does, which is why it holds an `EndStepGuard` at all, so its experts do reach `KqExpertSlice`. Declaring it false to make every setting reachable would put a false statement in the registry, and the safe-direction default would then hide it. Named here per `## Nothing lands dead` rather than left for the next reader to find: `ENG-EXPERT-STREAM-DEVICE` owns the wiring under [#1124](https://github.com/mudler/vllm.cpp/issues/1124), and the flag becomes read the moment a `qwen3moe` GGUF arch arm exists. The `Qwen3_5Moe*` setting beside it IS read, and its gate is now EVIDENCED rather than asserted: mutation M-A3 (`kQwen3_5MoeFactory.streams_routed_experts = false`, `qwen3_5_moe.cpp`) was listed as NOT RUN in #1377's pull request body, was then run by that pull request's fresh review, and was re-run during the #1378 repair with the result recorded -- compile status 0, `git diff --stat` 1 file / 1 insertion / 1 deletion, `test_gguf_device_fit_reach` 14 cases with 2 failed and 66 assertions with 6 failed, exit status 1, tree restored byte-identical by sha256. **The laguna half of the same claim is VACUOUS and is not evidence for anything.** Mutation M-A3c (`kLagunaFactory.streams_routed_experts = true`) is GREEN, and correctly so: `laguna` has no entry in `kGgufArchArms` (`model_loader.cpp`), so a Laguna GGUF is refused as an unsupported architecture before the fit check runs and no setting on that factory can reach the lane. Nothing is owed to make it gateable -- manufacturing a gate for an unreachable flag would be worse than saying this -- and `DeepseekV4ForCausalLM`, which DOES have an arch arm, is the case that carries the architecture term's weight. |

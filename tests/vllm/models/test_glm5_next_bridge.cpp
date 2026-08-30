@@ -37,13 +37,16 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "support/glm5_next_gguf_fixture.h"
 #include "vllm/model_executor/models/glm5_next_attn.h"
 #include "vllm/model_executor/models/glm5_next_bridge.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
+#include "vllm/model_executor/models/glm5_next_moe.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 #include "vt/quant.h"
 
 namespace {
@@ -523,4 +526,393 @@ TEST_CASE("glm5_next bridge: a NON-FLOAT encoding is refused, not zero-filled") 
   i8.bytes.assign(8U, 0U);
   CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(i8, "idx_wk"),
                        doctest::Contains("widen"), std::runtime_error);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  W5b-2b — THE PER-EXPERT SOURCE, AND THE ROW RANGE IT IS BUILT ON
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The four arms `BridgeDsaLayer` does not cover are three mechanical decodes
+// and one design problem. These cases pin the design problem and the primitive
+// under it. The arithmetic they assert is the whole argument:
+//
+//   * ONE expert bank is 9.0 GiB in f32 and the 1 GiB ceiling refuses it BY
+//     NAME. That is the gate working, not an obstacle to route around.
+//   * ONE ROW of that bank is 32 MiB, 32x UNDER the same ceiling.
+//   * `num_experts_per_tok` is 8 of 288, so a token needs at most 8 rows.
+//
+// So the per-expert source decodes rows and never a bank, and the cases below
+// assert both halves: the SET of experts decoded is the SET the router
+// selected, and the on-demand result is EXACTLY the resident result.
+
+TEST_CASE("glm5_next bridge: an expert ROW is 32 MiB where the BANK is 9.0 GiB") {
+  // Every number here is the published geometry's: 288 routed experts,
+  // `moe_intermediate_size` 2048, `hidden_size` 4096.
+  const int64_t E = 288, I = 2048, H = 4096;
+
+  OwnedTensor bank;  // `ffn_up_exps.weight`, [E, I, H]
+  bank.dtype = vt::DType::kIQ2_XS;
+  bank.rank = 3;
+  bank.shape[0] = E;
+  bank.shape[1] = I;
+  bank.shape[2] = H;
+
+  // The BANK, and the ceiling refuses it.
+  CHECK(HostF32Bytes(bank) == 9663676416);                 // 9.0 GiB
+  CHECK(HostF32Bytes(bank) == kBridgeTensorF32ByteCeiling * 9);
+  // ONE ROW of the same tensor, from the shape alone.
+  CHECK(vllm::glm5_next::HostF32RowBytes(bank) == 33554432);  // 32 MiB
+  CHECK(vllm::glm5_next::HostF32RowBytes(bank) * 32 == kBridgeTensorF32ByteCeiling);
+
+  // One EXPERT is the fused `[2I, H]` plus `[H, I]`, which is three rows.
+  const int64_t one_expert = 3 * vllm::glm5_next::HostF32RowBytes(bank);
+  CHECK(one_expert == 100663296);  // 0.09375 GiB
+  // One sparse LAYER's three banks, and the 42 sparse layers together. The
+  // second number is what makes a resident float bank impossible rather than
+  // expensive: 1,134 GiB against ~119.63 usable on the largest box we reach.
+  CHECK(3 * HostF32Bytes(bank) == 28991029248);            // 27.0 GiB
+  CHECK(42 * 3 * HostF32Bytes(bank) == 1217623228416);     // 1,134 GiB
+  CHECK(GiB(42 * 3 * HostF32Bytes(bank)) > 9.0 * 119.63);  // 9.5x over the box
+
+  MESSAGE("one expert " << GiB(one_expert) << " GiB, one layer's banks "
+          << GiB(3 * HostF32Bytes(bank)) << " GiB, all sparse layers "
+          << GiB(42 * 3 * HostF32Bytes(bank)) << " GiB, box ~119.63 GiB");
+}
+
+TEST_CASE("glm5_next bridge: the ROW API cannot decode a bank through the back door") {
+  // The row range is checked against the SAME ceiling, so asking for every row
+  // is refused by exactly the arithmetic that refuses the whole tensor. A row
+  // API with a per-row ceiling would be a mute switch wearing a gate's name.
+  OwnedTensor bank;
+  bank.dtype = vt::DType::kIQ2_XS;
+  bank.rank = 3;
+  bank.shape[0] = 288;
+  bank.shape[1] = 2048;
+  bank.shape[2] = 4096;
+  CHECK(bank.bytes.empty());
+
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 0, 288),
+      doctest::Contains("ceiling"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 0, 288),
+      doctest::Contains("up_exps"), std::runtime_error);
+  // 32 rows is exactly the ceiling and passes it; 33 does not. The two sides
+  // are asserted because a bound that only ever refuses proves nothing about
+  // where it sits.
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 0, 33),
+      doctest::Contains("ceiling"), std::runtime_error);
+  // 32 rows gets PAST the ceiling and stops on the empty payload instead —
+  // a DIFFERENT refusal, which is what proves the ceiling is not what stopped
+  // the single-row case.
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 0, 32),
+      doctest::Contains("carries no bytes"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 0, 1),
+      doctest::Contains("carries no bytes"), std::runtime_error);
+
+  // A range outside the leading axis is refused by name rather than read.
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 288, 1),
+      doctest::Contains("rows"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", -1, 1),
+      doctest::Contains("rows"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(bank, "moe.up_exps", 0, 0),
+      doctest::Contains("rows"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next bridge: a row slice reads ITS OWN row, not row 0") {
+  // THE OFFSET IS THE WHOLE POINT. A row decoder that ignored `first_row`
+  // returns a correctly sized, finite buffer of the WRONG expert's weights,
+  // which is the silent failure this row's headers keep naming. Every row is
+  // compared elementwise against the same row of the whole-tensor decode, and
+  // the rows are asserted to DIFFER from one another so the comparison is
+  // discriminating rather than four copies of one value.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> holder;
+  const vllm::Glm5NextWeights& w = LoadFixture(holder, g);
+  REQUIRE(w.layers.size() >= 2U);
+  const vllm::Glm5NextLayerWeights& sparse = w.layers[1];
+  REQUIRE_FALSE(sparse.is_dense_mlp);
+
+  for (const auto& pair : std::vector<std::pair<const vllm::OwnedTensor*, const char*>>{
+           {&sparse.moe.gate_exps, "moe.gate_exps"},
+           {&sparse.moe.down_exps, "moe.down_exps"},
+           {&w.embed_tokens, "token_embd.weight"}}) {
+    const vllm::OwnedTensor& t = *pair.first;
+    INFO("tensor ", pair.second);
+    REQUIRE(t.rank >= 2);
+    const std::vector<float> whole = DecodeOwnedTensorToF32(t, pair.second);
+    const int64_t rows = t.shape[0];
+    const int64_t row_elems = static_cast<int64_t>(whole.size()) / rows;
+    REQUIRE(rows >= 2);
+    int distinct_rows = 0;
+    for (int64_t r = 0; r < rows; ++r) {
+      const std::vector<float> got =
+          vllm::glm5_next::DecodeOwnedTensorRowsToF32(t, pair.second, r, 1);
+      REQUIRE(static_cast<int64_t>(got.size()) == row_elems);
+      bool same_as_row0 = true;
+      for (int64_t i = 0; i < row_elems; ++i) {
+        const float want = whole[static_cast<size_t>(r * row_elems + i)];
+        const float have = got[static_cast<size_t>(i)];
+        // isfinite on BOTH sides: an all-NaN decode compares equal to nothing
+        // and `NaN != NaN` would read as a difference, while `!(a > b)` on a
+        // NaN reads as a match. Both directions are stated.
+        REQUIRE(std::isfinite(want));
+        REQUIRE(std::isfinite(have));
+        CHECK(have == want);
+        if (want != whole[static_cast<size_t>(i)]) same_as_row0 = false;
+      }
+      if (!same_as_row0) ++distinct_rows;
+    }
+    // At least one row differs from row 0, so "reads its own row" is a claim
+    // the fixture can actually falsify.
+    CHECK(distinct_rows >= 1);
+
+    // A CONTIGUOUS RANGE is the concatenation of its rows, which is what the
+    // streamed `lm_head` relies on.
+    const std::vector<float> two =
+        vllm::glm5_next::DecodeOwnedTensorRowsToF32(t, pair.second, 1, 2);
+    REQUIRE(static_cast<int64_t>(two.size()) == 2 * row_elems);
+    for (int64_t i = 0; i < 2 * row_elems; ++i) {
+      CHECK(two[static_cast<size_t>(i)] ==
+            whole[static_cast<size_t>(row_elems + i)]);
+    }
+  }
+}
+
+TEST_CASE("glm5_next bridge: a row that is not whole BLOCKS is refused") {
+  // A block row narrower than one block would make every slice after the first
+  // start MID-BLOCK, and a decoder handed a misaligned base does not fail: it
+  // reads the next block's scale and returns plausible values from the wrong
+  // quantization. `DecodeOwnedTensorToF32` cannot see this, because the WHOLE
+  // tensor is a whole number of blocks; only the row API can.
+  OwnedTensor t;
+  t.dtype = vt::DType::kQ8_0;
+  t.rank = 2;
+  t.shape[0] = 2;
+  t.shape[1] = 16;  // 16 elements per row, and Q8_0 blocks are 32
+  REQUIRE(vt::BlockElems(t.dtype) == 32);
+  t.bytes.assign(vt::RowSizeBytes(t.dtype, 32), 0U);
+  // The whole tensor IS a whole number of blocks, so the old entry point is
+  // happy with exactly this tensor — which is what makes the new check load
+  // bearing rather than a restatement.
+  CHECK(DecodeOwnedTensorToF32(t, "moe.gate_exps").size() == 32U);
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(t, "moe.gate_exps", 1, 1),
+      doctest::Contains("mid-block"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::glm5_next::DecodeOwnedTensorRowsToF32(t, "moe.gate_exps", 1, 1),
+      doctest::Contains("gate_exps"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next bridge: ONLY the SELECTED experts are decoded") {
+  // The claim in one line: with `num_experts_per_tok` of `n_routed_experts`
+  // selected, the source is asked for the SET the router chose and for nothing
+  // else, and the result is EXACTLY what the resident banks produce.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> holder;
+  const vllm::Glm5NextWeights& w = LoadFixture(holder, g);
+  const vllm::Glm5NextParams& p = w.params;
+  REQUIRE(w.layers.size() >= 2U);
+  const vllm::Glm5NextLayerWeights& src = w.layers[1];
+  REQUIRE_FALSE(src.is_dense_mlp);
+
+  const vllm::glm5_next::MoeDims d = vllm::glm5_next::MoeDimsFrom(p);
+  REQUIRE(d.n_routed_experts == kExperts);
+  REQUIRE(d.num_experts_per_tok == kExpertsPerTok);
+  // A STRICT subset is only meaningful when one is possible: 2 of 4 per token.
+  REQUIRE(d.num_experts_per_tok < d.n_routed_experts);
+
+  // ── the ON-DEMAND arm ──────────────────────────────────────────────────────
+  vllm::glm5_next::MoeLayerWeights on_demand =
+      vllm::glm5_next::BridgeMoeLayer(src.moe, d, "blk.1.ffn");
+  // The banks are EMPTY by construction. Nothing bridged 27 GiB.
+  CHECK(on_demand.expert_gate_up.empty());
+  CHECK(on_demand.expert_down.empty());
+  vllm::glm5_next::GgufExpertSource source(src.moe, d, "blk.1.ffn");
+  on_demand.expert_source = &source;
+
+  // ── the RESIDENT arm, built by hand from the same tensors ─────────────────
+  // The fixture's banks are 16 KiB, so decoding them whole here is legal; at
+  // the published geometry it is the 9.0 GiB the ceiling refuses, which is why
+  // production never does it. This arm exists as the ORACLE for the other one.
+  vllm::glm5_next::MoeLayerWeights resident = on_demand;
+  resident.expert_source = nullptr;
+  {
+    const std::vector<float> ge = DecodeOwnedTensorToF32(src.moe.gate_exps, "gate_exps");
+    const std::vector<float> ue = DecodeOwnedTensorToF32(src.moe.up_exps, "up_exps");
+    resident.expert_down = DecodeOwnedTensorToF32(src.moe.down_exps, "down_exps");
+    const int64_t I = d.moe_intermediate_size, H = d.hidden_size;
+    resident.expert_gate_up.resize(static_cast<size_t>(d.n_routed_experts * 2 * I * H));
+    for (int64_t e = 0; e < d.n_routed_experts; ++e) {
+      std::copy_n(ge.begin() + e * I * H, I * H,
+                  resident.expert_gate_up.begin() + e * 2 * I * H);
+      std::copy_n(ue.begin() + e * I * H, I * H,
+                  resident.expert_gate_up.begin() + e * 2 * I * H + I * H);
+    }
+  }
+
+  // ONE token, so at most `num_experts_per_tok` distinct experts can be hit.
+  std::vector<float> hidden(static_cast<size_t>(d.hidden_size));
+  for (int64_t i = 0; i < d.hidden_size; ++i) {
+    hidden[static_cast<size_t>(i)] =
+        0.03F * static_cast<float>((i * 7 + 5) % 23) - 0.3F;
+  }
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  const vllm::glm5_next::MoeRouting r =
+      vllm::glm5_next::RouteTopk(d, resident, hidden, /*num_tokens=*/1, q);
+  std::vector<int64_t> want(r.topk_ids.begin(), r.topk_ids.end());
+  std::sort(want.begin(), want.end());
+  want.erase(std::unique(want.begin(), want.end()), want.end());
+  REQUIRE(static_cast<int64_t>(want.size()) <= d.num_experts_per_tok);
+  // The selection is a STRICT subset on this fixture, so "only the selected"
+  // has something to exclude. Printed, because a bound nobody can see is a
+  // bound nobody can check.
+  CHECK(static_cast<int64_t>(want.size()) < d.n_routed_experts);
+  MESSAGE("router selected " << want.size() << " of " << d.n_routed_experts
+          << " experts for 1 token");
+
+  const std::vector<float> from_source =
+      vllm::glm5_next::MoeForward(d, on_demand, hidden, /*num_tokens=*/1, q);
+  const std::vector<float> from_banks =
+      vllm::glm5_next::MoeForward(d, resident, hidden, /*num_tokens=*/1, q);
+
+  // (a) the SET decoded is the SET selected, and each expert exactly ONCE.
+  std::vector<int64_t> got = source.decoded();
+  CHECK(got.size() == want.size());
+  std::vector<int64_t> uniq = got;
+  std::sort(uniq.begin(), uniq.end());
+  CHECK(std::adjacent_find(uniq.begin(), uniq.end()) == uniq.end());
+  CHECK(uniq == want);
+
+  // ── THE SAME CLAIM AT MORE THAN ONE TOKEN, WHICH IS WHERE "ONCE" BITES ────
+  //
+  // At one token every selected expert is hit exactly once whatever the code
+  // does, so the `adjacent_find` above cannot see a missing grouping. Measured:
+  // removing the grouping from `MoeForward` (mutation M13) leaves the
+  // single-token case fully GREEN. With several tokens the same expert is hit
+  // by more than one of them, and then a per-SLOT visit decodes it twice —
+  // which is a second 96 MiB decode at the published geometry and is exactly
+  // what the residency argument rules out.
+  const int64_t T = 6;
+  std::vector<float> many(static_cast<size_t>(T * d.hidden_size));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t i = 0; i < d.hidden_size; ++i) {
+      many[static_cast<size_t>(t * d.hidden_size + i)] =
+          0.05F * static_cast<float>((i * 3 + 11 * t) % 19) - 0.4F;
+    }
+  }
+  vllm::glm5_next::GgufExpertSource multi(src.moe, d, "blk.1.ffn");
+  vllm::glm5_next::MoeLayerWeights on_demand_multi = on_demand;
+  on_demand_multi.expert_source = &multi;
+  const std::vector<float> multi_src =
+      vllm::glm5_next::MoeForward(d, on_demand_multi, many, T, q);
+  const std::vector<float> multi_res =
+      vllm::glm5_next::MoeForward(d, resident, many, T, q);
+
+  const vllm::glm5_next::MoeRouting rm =
+      vllm::glm5_next::RouteTopk(d, resident, many, T, q);
+  std::vector<int64_t> want_multi(rm.topk_ids.begin(), rm.topk_ids.end());
+  const int64_t slots = static_cast<int64_t>(want_multi.size());
+  std::sort(want_multi.begin(), want_multi.end());
+  want_multi.erase(std::unique(want_multi.begin(), want_multi.end()),
+                   want_multi.end());
+  // The routing must actually REPEAT an expert across the tokens, or the
+  // "exactly once" claim has nothing to exclude here either. Printed, so a
+  // fixture that stopped repeating is visible rather than silently vacuous.
+  REQUIRE(static_cast<int64_t>(want_multi.size()) < slots);
+  MESSAGE("over " << T << " tokens the router filled " << slots
+          << " slots from " << want_multi.size() << " distinct experts");
+
+  std::vector<int64_t> got_multi = multi.decoded();
+  CHECK(got_multi.size() == want_multi.size());
+  std::sort(got_multi.begin(), got_multi.end());
+  CHECK(std::adjacent_find(got_multi.begin(), got_multi.end()) == got_multi.end());
+  CHECK(got_multi == want_multi);
+
+  // ...and the values still match the resident banks exactly.
+  REQUIRE(multi_src.size() == multi_res.size());
+  int multi_nonfinite = 0;
+  for (size_t i = 0; i < multi_src.size(); ++i) {
+    if (!std::isfinite(multi_src[i]) || !std::isfinite(multi_res[i])) {
+      ++multi_nonfinite;
+      continue;
+    }
+    CHECK(multi_src[i] == multi_res[i]);
+  }
+  CHECK(multi_nonfinite == 0);
+
+  // (b) the values are EXACTLY the resident ones. Not a tolerance: the two
+  // paths run the same arithmetic on the same floats, so anything but equality
+  // is a defect and a tolerance would hide it.
+  REQUIRE(from_source.size() == from_banks.size());
+  int nonfinite = 0;
+  for (size_t i = 0; i < from_source.size(); ++i) {
+    // isfinite guarded on BOTH sides: an all-NaN forward makes every
+    // inequality false and reads as a perfect match (W5b-2a's 15th mutation).
+    if (!std::isfinite(from_source[i]) || !std::isfinite(from_banks[i])) {
+      ++nonfinite;
+      continue;
+    }
+    CHECK(from_source[i] == from_banks[i]);
+  }
+  CHECK(nonfinite == 0);
+  // And the output is not trivially zero, which would make (b) vacuous.
+  CHECK(std::any_of(from_banks.begin(), from_banks.end(),
+                    [](float v) { return v != 0.0F; }));
+}
+
+TEST_CASE("glm5_next bridge: MoeForward refuses NEITHER and BOTH residencies") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> holder;
+  const vllm::Glm5NextWeights& w = LoadFixture(holder, g);
+  const vllm::glm5_next::MoeDims d = vllm::glm5_next::MoeDimsFrom(w.params);
+  const vllm::Glm5NextLayerWeights& src = w.layers[1];
+
+  vllm::glm5_next::MoeLayerWeights bare =
+      vllm::glm5_next::BridgeMoeLayer(src.moe, d, "blk.1.ffn");
+  std::vector<float> hidden(static_cast<size_t>(d.hidden_size), 0.1F);
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  // NEITHER. Without this refusal the router would select and every expert
+  // would read as a ZERO weight: a finite, fluent, wrong block.
+  CHECK_THROWS_WITH_AS(vllm::glm5_next::MoeForward(d, bare, hidden, 1, q),
+                       doctest::Contains("NEITHER"), std::runtime_error);
+
+  // BOTH. There is no rule for which one wins, so the ambiguity is refused
+  // rather than resolved silently in favour of whichever the code reads first.
+  vllm::glm5_next::GgufExpertSource source(src.moe, d, "blk.1.ffn");
+  vllm::glm5_next::MoeLayerWeights both = bare;
+  both.expert_source = &source;
+  both.expert_gate_up.assign(
+      static_cast<size_t>(d.n_routed_experts * 2 * d.moe_intermediate_size *
+                          d.hidden_size),
+      0.0F);
+  both.expert_down.assign(
+      static_cast<size_t>(d.n_routed_experts * d.hidden_size *
+                          d.moe_intermediate_size),
+      0.0F);
+  CHECK_THROWS_WITH_AS(vllm::glm5_next::MoeForward(d, both, hidden, 1, q),
+                       doctest::Contains("BOTH"), std::runtime_error);
+
+  // A HALF-FILLED resident layer is refused too, by the size check rather than
+  // read as a bank of the wrong length.
+  vllm::glm5_next::MoeLayerWeights half = bare;
+  half.expert_gate_up = both.expert_gate_up;
+  CHECK_THROWS_AS(vllm::glm5_next::MoeForward(d, half, hidden, 1, q),
+                  std::runtime_error);
+
+  // An out-of-range expert is refused BY NAME by the source itself.
+  std::vector<float> gu, dn;
+  CHECK_THROWS_WITH_AS(source.Expert(d.n_routed_experts, gu, dn),
+                       doctest::Contains("outside"), std::runtime_error);
 }

@@ -247,6 +247,49 @@ struct TextModelWeights {
   std::vector<float> norm;  // [hidden] — `Glm5NextTextModel.norm`, `:1421`
 };
 
+// A source of ONE decoder layer's host-f32 weights, consulted per layer.
+//
+// **This exists for the same reason `glm5_next_bridge.h` has no `BridgeTower`.**
+// A `TextModelWeights` holds all 45 layers at once, and at the published
+// geometry that is the whole float tower: 426.72 GiB against a ~119.63 GiB box.
+// A production forward therefore cannot build one. It walks the layers, and it
+// must be able to DROP each one before it reaches the next.
+//
+// So the streaming overload of `TextModelForward` takes this instead of a
+// tower, and the resident overload wraps a `TextModelWeights` in the trivial
+// implementation. Both run the SAME loop, the same manifold and the same
+// collapse; there is deliberately no second copy of that code, because a
+// parallel forward is the shape AGENTS.md `## Shared seams` forbids.
+class LayerWeightSource {
+ public:
+  virtual ~LayerWeightSource() = default;
+
+  // How many decoder layers this source can serve. `TextModelForward` checks it
+  // against `num_hidden_layers` and refuses a disagreement by name, which is
+  // what keeps the `blk.45` exclusion a checked fact on the streaming path too.
+  virtual int64_t size() const = 0;
+
+  // The layer's weights. **The reference is valid only until the NEXT call.**
+  // An implementation that materializes overwrites ONE slot; it must not keep a
+  // map keyed by layer index, which is the tower again with a slower ramp.
+  virtual const DecoderLayerWeights& Layer(int64_t layer_idx) = 0;
+};
+
+// `Glm5NextTextModel.forward` (`:1431-1494`) over a LAYER SOURCE — the shape a
+// production forward takes, because it never holds two layers at once.
+//
+//   p     : the resolved config; `p.num_hidden_layers` must equal `layers.size()`
+//   norm  : [hidden] — `Glm5NextTextModel.norm`, `:1421`
+// Every other parameter is the resident overload's, unchanged.
+std::vector<float> TextModelForward(const Glm5NextParams& p,
+                                    const std::vector<float>& norm,
+                                    LayerWeightSource& layers,
+                                    const std::vector<float>& inputs_embeds,
+                                    const std::vector<uint8_t>& mask,
+                                    int64_t batch, int64_t seq_len,
+                                    std::vector<LayerCache>* caches,
+                                    vt::Queue& queue);
+
 // `Glm5NextTextModel.forward` (`:1431-1494`), from `inputs_embeds`.
 //
 // It takes the EMBEDDINGS and not the token ids, mirroring upstream's own
@@ -270,6 +313,18 @@ std::vector<float> TextModelForward(const TextModelWeights& w,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
                                     vt::Queue& queue);
+
+// `Glm5NextTextKdaDims` from the resolved config. Every field comes from
+// `p.kda` and none is defaulted here: `linear_head_dim`, `linear_num_heads` and
+// `linear_conv_kernel_dim` all arrive through the `linear_attn_config`
+// sub-object under different spellings, and `gate_lower_bound`'s PRESENCE
+// selects the forget-gate formula (`glm5_next.h`) — its absence is the SOFTPLUS
+// branch, which is Kimi-Linear's and not this model's.
+//
+// Public rather than file-local because the weight bridge needs the same dims
+// the forward runs on, and two builders of one geometry is how a port ends up
+// bridging at one shape and computing at another.
+glm5_next_kda::Glm5NextKdaDims KdaDimsFrom(const Glm5NextParams& p);
 
 // The manifold expansion at `:1477`, isolated so the one line a wrong port omits
 // has a name and a gate of its own.

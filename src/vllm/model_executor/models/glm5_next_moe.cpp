@@ -2,6 +2,7 @@
 // Contract, port anchors and the five silent-failure notes: glm5_next_moe.h.
 #include "vllm/model_executor/models/glm5_next_moe.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -261,16 +262,40 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
            "glm5_next moe: MoeForward hidden expects [" +
                std::to_string(num_tokens) + ", " + std::to_string(H) +
                "] floats, got " + std::to_string(hidden.size()));
-  VT_CHECK(static_cast<int64_t>(w.expert_gate_up.size()) == E * 2 * I * H,
-           "glm5_next moe: expert_gate_up expects the STACKED, FUSED [" +
-               std::to_string(E) + ", 2 * " + std::to_string(I) + ", " +
-               std::to_string(H) + "] = " + std::to_string(E * 2 * I * H) +
-               " floats, got " + std::to_string(w.expert_gate_up.size()));
-  VT_CHECK(static_cast<int64_t>(w.expert_down.size()) == E * H * I,
-           "glm5_next moe: expert_down expects the STACKED [" +
-               std::to_string(E) + ", " + std::to_string(H) + ", " +
-               std::to_string(I) + "] = " + std::to_string(E * H * I) +
-               " floats, got " + std::to_string(w.expert_down.size()));
+  // EXACTLY ONE of the two expert residencies, refused by name on the other two
+  // states. `resident` is true when EITHER bank carries values, so a layer that
+  // filled one and forgot the other is a named error and not a half-read bank.
+  const bool resident = !w.expert_gate_up.empty() || !w.expert_down.empty();
+  VT_CHECK(!(resident && w.expert_source != nullptr),
+           "glm5_next moe: this layer carries BOTH resident expert banks and an "
+           "`expert_source`, and there is no rule for which one wins. Populate "
+           "the banks or set the source, never both (glm5_next_moe.h).");
+  // MEASURED, not asserted defensively: removing this check makes the loop
+  // below dereference a NULL `expert_source` and the process dies with SIGSEGV
+  // (mutation M5, rc=139). The message says that rather than the softer "would
+  // read as zeros", because a reader who lands here needs to know which failure
+  // the guard is standing in front of.
+  VT_CHECK(resident || w.expert_source != nullptr,
+           "glm5_next moe: this layer carries NEITHER resident expert banks nor "
+           "an `expert_source`, so the router would select " +
+               std::to_string(K) + " of " + std::to_string(E) +
+               " experts and there would be nothing to evaluate them with -- the "
+               "loop below would dereference a null source. At the published "
+               "geometry the banks are 27.0 GiB per sparse layer in f32 against "
+               "a ~119.63 GiB box, so the on-demand `ExpertSource` is the shape "
+               "that fits; see glm5_next_moe.h.");
+  if (resident) {
+    VT_CHECK(static_cast<int64_t>(w.expert_gate_up.size()) == E * 2 * I * H,
+             "glm5_next moe: expert_gate_up expects the STACKED, FUSED [" +
+                 std::to_string(E) + ", 2 * " + std::to_string(I) + ", " +
+                 std::to_string(H) + "] = " + std::to_string(E * 2 * I * H) +
+                 " floats, got " + std::to_string(w.expert_gate_up.size()));
+    VT_CHECK(static_cast<int64_t>(w.expert_down.size()) == E * H * I,
+             "glm5_next moe: expert_down expects the STACKED [" +
+                 std::to_string(E) + ", " + std::to_string(H) + ", " +
+                 std::to_string(I) + "] = " + std::to_string(E * H * I) +
+                 " floats, got " + std::to_string(w.expert_down.size()));
+  }
 
   const MoeRouting r = RouteTopk(d, w, hidden, num_tokens, queue);
 
@@ -280,14 +305,57 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   // combine below accumulates in f32 exactly as upstream's `final` does.
   std::vector<float> expert_out(static_cast<size_t>(num_tokens * K * H), 0.0f);
   std::vector<float> gate_up(static_cast<size_t>(2 * I));
+
+  // Group the `[T, K]` routing slots by EXPERT, then visit each hit expert
+  // ONCE. Upstream does the same (`:120-135` iterates the hit experts, not the
+  // tokens), and with an `ExpertSource` it is also the residency bound: a
+  // second visit would be a second decode of the same 96 MiB. `hit` is sorted
+  // so the visit order is a property of the SET and not of the router's
+  // emission order.
+  std::vector<std::vector<int64_t>> slots(static_cast<size_t>(E));
+  std::vector<int64_t> hit;
   for (int64_t t = 0; t < num_tokens; ++t) {
-    const float* xt = &hidden[static_cast<size_t>(t * H)];
     for (int64_t j = 0; j < K; ++j) {
       const int32_t e = r.topk_ids[static_cast<size_t>(t * K + j)];
       VT_CHECK(e >= 0 && static_cast<int64_t>(e) < E,
                "glm5_next moe: the router selected expert " + std::to_string(e) +
                    ", which is outside [0, " + std::to_string(E) + ")");
-      const float* gu = &w.expert_gate_up[static_cast<size_t>(e) * static_cast<size_t>(2 * I * H)];
+      if (slots[static_cast<size_t>(e)].empty()) hit.push_back(e);
+      slots[static_cast<size_t>(e)].push_back(t * K + j);
+    }
+  }
+  std::sort(hit.begin(), hit.end());
+
+  // ONE pair of buffers for the whole call, reused across experts: the peak is
+  // one expert's `[2I, H]` plus `[H, I]` and never K of them.
+  std::vector<float> src_gate_up;
+  std::vector<float> src_down;
+  for (int64_t e : hit) {
+    const float* gu = nullptr;
+    const float* dw = nullptr;
+    if (resident) {
+      gu = &w.expert_gate_up[static_cast<size_t>(e) * static_cast<size_t>(2 * I * H)];
+      dw = &w.expert_down[static_cast<size_t>(e) * static_cast<size_t>(H * I)];
+    } else {
+      w.expert_source->Expert(e, src_gate_up, src_down);
+      VT_CHECK(static_cast<int64_t>(src_gate_up.size()) == 2 * I * H,
+               "glm5_next moe: the expert source returned " +
+                   std::to_string(src_gate_up.size()) +
+                   " gate_up floats for expert " + std::to_string(e) +
+                   ", expected the FUSED [2 * " + std::to_string(I) + ", " +
+                   std::to_string(H) + "] = " + std::to_string(2 * I * H));
+      VT_CHECK(static_cast<int64_t>(src_down.size()) == H * I,
+               "glm5_next moe: the expert source returned " +
+                   std::to_string(src_down.size()) +
+                   " down floats for expert " + std::to_string(e) +
+                   ", expected [" + std::to_string(H) + ", " +
+                   std::to_string(I) + "] = " + std::to_string(H * I));
+      gu = src_gate_up.data();
+      dw = src_down.data();
+    }
+    for (int64_t slot : slots[static_cast<size_t>(e)]) {
+      const int64_t t = slot / K;
+      const float* xt = &hidden[static_cast<size_t>(t * H)];
       for (int64_t o = 0; o < 2 * I; ++o) {
         double acc = 0.0;
         const float* wo = gu + static_cast<size_t>(o * H);
@@ -295,8 +363,7 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
         gate_up[static_cast<size_t>(o)] = static_cast<float>(acc);
       }
       const std::vector<float> act = ExpertGate(gate_up, I, d.swiglu_limit);
-      const float* dw = &w.expert_down[static_cast<size_t>(e) * static_cast<size_t>(H * I)];
-      float* out = &expert_out[static_cast<size_t>((t * K + j) * H)];
+      float* out = &expert_out[static_cast<size_t>(slot * H)];
       for (int64_t o = 0; o < H; ++o) {
         double acc = 0.0;
         const float* wo = dw + static_cast<size_t>(o * I);

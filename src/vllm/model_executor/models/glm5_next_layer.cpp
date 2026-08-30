@@ -35,11 +35,10 @@ void RmsNorm(const float* in, const float* gamma, int64_t n, double eps,
   for (int64_t i = 0; i < n; ++i) out[i] = gamma[i] * (in[i] * inv);
 }
 
-// `Glm5NextTextKdaDims` from the resolved config. Every field is read from
-// `p.kda` and none is defaulted here: `linear_head_dim`, `linear_num_heads` and
-// `linear_conv_kernel_dim` all arrive through the `linear_attn_config`
-// sub-object under different spellings, and `gate_lower_bound`'s PRESENCE
-// selects the forget-gate formula (`glm5_next.h`).
+}  // namespace
+
+// See the header: public so the weight bridge and the forward resolve ONE
+// geometry rather than two.
 glm5_next_kda::Glm5NextKdaDims KdaDimsFrom(const Glm5NextParams& p) {
   glm5_next_kda::Glm5NextKdaDims d;
   d.hidden_size = p.hidden_size;
@@ -50,8 +49,6 @@ glm5_next_kda::Glm5NextKdaDims KdaDimsFrom(const Glm5NextParams& p) {
   d.gate_lower_bound = p.kda.lower_bound;
   return d;
 }
-
-}  // namespace
 
 std::vector<float> ExpandToHiddenStreams(const std::vector<float>& inputs_embeds,
                                          int64_t batch, int64_t seq_len,
@@ -265,13 +262,44 @@ DecoderLayerResult DecoderLayerForward(
   return res;
 }
 
+namespace {
+
+// The resident tower as a `LayerWeightSource`. It holds nothing of its own and
+// hands back a reference into the caller's `TextModelWeights`, so the resident
+// overload below is a delegation and not a copy.
+class ResidentLayerSource final : public LayerWeightSource {
+ public:
+  explicit ResidentLayerSource(const TextModelWeights& w) : w_(&w) {}
+  int64_t size() const override { return static_cast<int64_t>(w_->layers.size()); }
+  const DecoderLayerWeights& Layer(int64_t i) override {
+    return w_->layers[static_cast<size_t>(i)];
+  }
+
+ private:
+  const TextModelWeights* w_;
+};
+
+}  // namespace
+
 std::vector<float> TextModelForward(const TextModelWeights& w,
                                     const std::vector<float>& inputs_embeds,
                                     const std::vector<uint8_t>& mask,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
                                     vt::Queue& queue) {
-  const Glm5NextParams& p = w.params;
+  ResidentLayerSource src(w);
+  return TextModelForward(w.params, w.norm, src, inputs_embeds, mask, batch,
+                          seq_len, caches, queue);
+}
+
+std::vector<float> TextModelForward(const Glm5NextParams& p,
+                                    const std::vector<float>& norm,
+                                    LayerWeightSource& layers,
+                                    const std::vector<float>& inputs_embeds,
+                                    const std::vector<uint8_t>& mask,
+                                    int64_t batch, int64_t seq_len,
+                                    std::vector<LayerCache>* caches,
+                                    vt::Queue& queue) {
   const int64_t hc = p.mhc.mult;
   const int64_t H = p.hidden_size;
   const int64_t tokens = batch * seq_len;
@@ -281,14 +309,14 @@ std::vector<float> TextModelForward(const TextModelWeights& w,
     Fail("attention_mask must hold " + std::to_string(tokens) + " entries, got " +
          std::to_string(mask.size()));
   }
-  RequireSize("model.norm", w.norm.size(), H);
+  RequireSize("model.norm", norm.size(), H);
 
   // `self.layers[: self.config.num_hidden_layers]` (`:1480`), checked rather
   // than sliced. `blk.45` of the published artifact is the MTP block and is NOT
   // a decoder layer: building it as a 46th would be a fluent wrong model that no
   // gate on this fleet could detect (`glm5_next_layer.h`, `glm5_next_loader.h`).
-  if (static_cast<int64_t>(w.layers.size()) != p.num_hidden_layers) {
-    Fail("the weight tower holds " + std::to_string(w.layers.size()) +
+  if (layers.size() != p.num_hidden_layers) {
+    Fail("the weight tower holds " + std::to_string(layers.size()) +
          " decoder layers but `num_hidden_layers` is " +
          std::to_string(p.num_hidden_layers) +
          ". On the published checkpoint the 46th block (`blk.45`) is the "
@@ -312,8 +340,11 @@ std::vector<float> TextModelForward(const TextModelWeights& w,
   std::vector<int32_t> topk;
   int64_t topk_width = 0;
   for (int64_t i = 0; i < p.num_hidden_layers; ++i) {
+    // `Layer(i)` is valid only until the next call, so the layer's weights are
+    // consumed HERE and never retained — which is what makes a streaming source
+    // hold one layer rather than every layer visited so far.
     DecoderLayerResult r = DecoderLayerForward(
-        p, i, w.layers[static_cast<size_t>(i)], streams, mask,
+        p, i, layers.Layer(i), streams, mask,
         topk.empty() ? nullptr : &topk, topk_width, batch, seq_len,
         caches != nullptr ? &(*caches)[static_cast<size_t>(i)] : nullptr, queue);
     streams = std::move(r.hidden_streams);
@@ -331,7 +362,7 @@ std::vector<float> TextModelForward(const TextModelWeights& w,
     const std::vector<float> slab(streams.begin() + t * hc * H,
                                   streams.begin() + (t + 1) * hc * H);
     const std::vector<float> collapsed = HcHeadCollapseMean(slab, hc, H);
-    RmsNorm(collapsed.data(), w.norm.data(), H, p.rms_norm_eps,
+    RmsNorm(collapsed.data(), norm.data(), H, p.rms_norm_eps,
             out.data() + t * H);
   }
   return out;

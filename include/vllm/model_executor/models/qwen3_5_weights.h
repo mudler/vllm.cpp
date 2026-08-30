@@ -1341,11 +1341,38 @@ bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 // A 50 GiB model on a 119.6 GiB box starts at ~94% free and stages; the 2.4T
 // model is already past the floor when its first dense weight arrives, so it
 // never stages and keeps exactly the behaviour #1299 shipped.
-// The budget arithmetic, as a PURE function so it is gateable without a device.
-// `min_free_frac` of `total_bytes` must remain free AFTER this weight is staged.
-bool DeviceStagingFitsBudget(size_t free_bytes, size_t total_bytes, size_t bytes,
-                             double min_free_frac);
+// Does a model of `model_weight_bytes` leave room for a SECOND, device-resident
+// copy of itself on a device of `device_total_bytes`, keeping `reserve_bytes`
+// for the KV cache and activations?
+//
+// PURE, so it is gateable without a device.
+//
+// THE FACTOR OF TWO IS THE WHOLE POINT. On a platform that does not release the
+// host mirror after upload -- which is every unified-memory part, and which is
+// what `ResidencyPolicy::release_host_weights_after_upload` records -- a staged
+// weight is ADDITIVE: the host bytes stay and the device copy joins them. That
+// second copy is exactly what made #1299's 2.4T checkpoint exhaust a 119.631 GiB
+// box, and it is exactly what buys +21.1% for a model that fits.
+bool StagingFitsModel(size_t model_weight_bytes, size_t device_total_bytes,
+                      size_t reserve_bytes);
 
-bool DeviceStagingFits(vt::Backend& b, size_t bytes);
+// Latch the decision for this process, ONCE, from two STABLE numbers. Called by
+// the safetensors loader, which is the only place that knows the model's total.
+//
+// WHY ONCE AND NOT PER WEIGHT. The first attempt at this asked
+// `Backend::DeviceMemoryInfo` per weight and compared LIVE FREE against a
+// fraction of total. Free falls as the host mirror loads, so the floor degraded
+// into "stage the first N GiB, then stop": measured 8.1% of an available 21.1%
+// on the committed gate. `platforms/interface.h:66-69` had already written the
+// rule -- the budget is "TOTAL rather than FREE, because `free` at load time
+// carries the page cache and whatever else the box is doing, which would make a
+// load-time verdict a function of contention."
+//
+// A model that never calls this keeps the retag, which is what every GGUF path
+// does today and is how #1299's checkpoint stays untouched.
+void SetSafetensorsWeightBudget(size_t model_weight_bytes, size_t device_total_bytes);
+
+// The latched answer. False until `SetSafetensorsWeightBudget` says otherwise.
+bool StageOwnedWeightsToDevice();
 
 }  // namespace vllm

@@ -196,38 +196,34 @@ bool HostWeightAliasEnabled() {
   return on;
 }
 
-bool DeviceStagingFitsBudget(size_t free_bytes, size_t total_bytes, size_t bytes,
-                             double min_free_frac) {
-  if (total_bytes == 0) return false;          // no budget answer => keep the retag
-  if (free_bytes <= bytes) return false;       // cannot even hold the copy
-  const double free_after = static_cast<double>(free_bytes - bytes);
-  return free_after >= min_free_frac * static_cast<double>(total_bytes);
+bool StagingFitsModel(size_t model_weight_bytes, size_t device_total_bytes,
+                      size_t reserve_bytes) {
+  if (model_weight_bytes == 0 || device_total_bytes == 0) return false;
+  // Overflow-safe: compare in the domain that cannot wrap.
+  if (model_weight_bytes > (device_total_bytes - reserve_bytes) / 2) return false;
+  return 2 * model_weight_bytes + reserve_bytes <= device_total_bytes;
 }
 
-bool DeviceStagingFits(vt::Backend& b, size_t bytes) {
-  // An explicit `=1` pins the retag on (the #1299 escape hatch); `=0` is
-  // handled by `HostWeightAliasEnabled()` returning false, which forces
-  // staging and never reaches here.
-  static const bool alias_pinned = [] {
-    const char* e = std::getenv("VT_QWEN35_ALIAS_HOST_WEIGHTS");
-    return e != nullptr && e[0] == '1';
-  }();
-  if (alias_pinned) return false;
+namespace {
+std::atomic<bool> g_stage_owned{false};
+}  // namespace
 
-  static const double min_free_frac = [] {
-    const char* e = std::getenv("VT_QWEN35_STAGE_MIN_FREE_FRAC");
-    if (e == nullptr || e[0] == '\0') return 0.55;
-    const double v = std::atof(e);
-    return (v > 0.0 && v < 1.0) ? v : 0.55;
+void SetSafetensorsWeightBudget(size_t model_weight_bytes, size_t device_total_bytes) {
+  static const size_t reserve = [] {
+    const char* e = std::getenv("VT_QWEN35_STAGE_RESERVE_BYTES");
+    if (e == nullptr || e[0] == '\0') return static_cast<size_t>(12ull << 30);
+    const long long v = std::atoll(e);
+    return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(12ull << 30);
   }();
-
-  size_t free_bytes = 0;
-  size_t total_bytes = 0;
-  // A backend that cannot answer keeps today's behaviour rather than guessing:
-  // an unknown budget is not a licence to double this model's residency.
-  if (!b.DeviceMemoryInfo(&free_bytes, &total_bytes)) return false;
-  return DeviceStagingFitsBudget(free_bytes, total_bytes, bytes, min_free_frac);
+  // `=1` pins the retag on (the #1299 escape hatch); `=0` forces staging.
+  const char* pin = std::getenv("VT_QWEN35_ALIAS_HOST_WEIGHTS");
+  if (pin != nullptr && pin[0] == '1') { g_stage_owned.store(false); return; }
+  if (pin != nullptr && pin[0] == '0') { g_stage_owned.store(true); return; }
+  g_stage_owned.store(
+      StagingFitsModel(model_weight_bytes, device_total_bytes, reserve));
 }
+
+bool StageOwnedWeightsToDevice() { return g_stage_owned.load(); }
 
 bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
                                   HostAliasOutcome* outcome) {

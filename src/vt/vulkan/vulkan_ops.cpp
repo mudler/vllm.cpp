@@ -2126,7 +2126,7 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
     const uint32_t spec[2] = {DtypeCode(out.dtype), DtypeCode(a.dtype)};
     ctx.Dispatch(dev_shader, buffers.data(),
                  static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-                 static_cast<uint32_t>(n), spec, 2);
+                 static_cast<uint32_t>((n + 3) / 4), spec, 2);
     return true;
   }
 

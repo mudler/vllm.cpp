@@ -29286,3 +29286,69 @@ the entering-directory line and on compile order and both end
 `[515/515] Linking CXX executable examples/vllm-server` — the identical binary
 sha256 is the stronger statement — and `cmake-b.log`, which diffs against
 `cmake-a.log` on three lines only, two timings and the build directory name.
+
+## TT P150 #2003 CONFIRMED AND DECIDED: the inversion reproduces at 1.300x with the FIRMWARE cap verified on every busy slice; polarity = documented stand-pat, the EnsureDevice2D hypothesis is rejected by the per-op delta, #2003 closes (2026-08-30, `bench/tt-clock-state-w2`, P150 `thalia`)
+
+Spec [`tt-clock-state-w2.md`](specs/tt-clock-state-w2.md) close 3. The
+product binary is `a1d04bbc9` (origin/main at measurement time) logic untouched: the W2 commits
+on this branch change only `tools/` and `tests/`, so both arms run base
+code and the harness measures the shipped polarity, not itself. Workload,
+order-alternation (A,B)(B,A)(A,B), `--repeat 5` with run 1 discarded per
+leg, one `$HOME/gpu.lock` hold, `tt-smi -r` inside it first, fresh process
+per leg — the same method as the 2026-08-26 entries. Per leg a
+`tools/bench/tt_clock_state.py sample --leg-pid <pid>` window,
+`--sampler pyluwen --interval 0.25 --duration 75`. Evidence:
+[`../docs/bench-evidence/tt-p150-w2-confirmed-20260830.log`](../docs/bench-evidence/tt-p150-w2-confirmed-20260830.log)
+(run logs, per-leg tok/s, both analyzer outputs, identity/limits JSON,
+window census, refold verdict).
+
+**Run 1 (superseded, subprocess sampler, interval 1 s): ratio 1.303
+median / 1.300 mean** (14.268 vs 10.954), but the opt-out legs are FASTER,
+so 1 s cadence caught only 26 busy samples in three windows — under the
+30-busy-sample floor the judge requires. That failure is the in-process
+sampler's reason to exist: **run 2 (recorded) moved to `--sampler pyluwen`
+at interval 0.25 s.**
+
+**Run 2 (recorded, 12 warm samples per arm): default host-free eager
+median 10.998 tok/s** (mean 10.995, 10.841–11.127) **vs `VT_TT_HOST_FREE_DECODE=0`
+median 14.299** (mean 14.232, 13.480–14.497) — **ratio 1.300 median / 1.294
+mean**, confirming and sharpening the 2026-08-26 1.254 at `21fe11cf1`. Every
+window holds n=289–292 samples with busy=136–177, and the refold busy-slice
+judge returns **rc=0 PASS with zero reasons: all six windows have distinct
+AICLK set exactly {1350}, 100.0% at cap, pegged=True** — the slower default
+is again a real path difference at clock parity.
+
+**The claimed-max pin is no longer UNVERIFIED.** Every window resolves the
+cap from FIRMWARE: `limits.asic_fmax` (the DECIMAL string "1350" on this
+board; the raw smbus word 0x546 is also accepted) with provenance
+"tt-smi smbus telemetry AICLK_LIMIT_MAX (get_bh_chip_limits, tt_smi
+backend.py:830)", surfaced as `claimed_max_firmware_readout` and never
+guessed — the W1 Owed bullet is retired by measurement, not by code.
+
+**The in-process sampler earns its flag.** Idle-board cadence pair at the
+same 0.25 s request: pyluwen 81 samples/20 s vs subprocess 30 (~2.7x),
+same key set, both windows cap-resolved. The subprocess sampler stays the
+DEFAULT; system python3 has no pyluwen import, and the stated-skip path
+(empty window + `sampler_skip_reason` + exit 1) is real and tested.
+
+**Attribution: the EnsureDevice2D hypothesis is REJECTED, and per the W2
+spec's stop condition 3 the contradiction is the finding.** The per-op
+delta over `b86e3705f..21fe11cf1` contains exactly two `tenstorrent_ops.cpp`
+changes — `353511e72` (+46/−17) and `101b415d7` (+12) — and both are
+`EnsureDevice2D` CORRECTNESS fixes that ADD staging work on the interior
+slices the hybrid arm exercises per op. Adding work cannot explain the
+opt-out arm's ~2.5x improvement while the default arm sits unchanged
+inside its 2026-08-21 band. The corrected mechanism is UNKNOWN.
+
+**The polarity decision is a documented stand-pat.** Default stays
+host-free. A flip needs the corrected mechanism, not a faster number on
+the opt-out; no threshold was edited anywhere and the spread rule stays
+an offline refold. #2003 closes with this record; the corrected-mechanism
+residual is owned in the
+[host-free spec](specs/tenstorrent-host-free-forward.md) `## Owed`, and
+the open-gaps row carries the decided state.
+
+Not retested here: the captured opt-in arm (multi-request capture hang,
+[#1625](https://github.com/mudler/vllm.cpp/issues/1625)) and TT async
+readback ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)), both
+unchanged.

@@ -113,3 +113,51 @@ host-free row updated; comments left on #2005 and #2003.
 One PR for spec and implementation (row claim answer 2026-08-30,
 recorded in developer-preferences; spread-scope stays offline refold;
 pyluwen in scope — same answer session).
+
+## Outcome
+
+All three closes landed (2026-08-30):
+
+1. **Firmware claimed-max verified (#2005).** `limits.asic_fmax` on the
+   P150 is the DECIMAL string "1350" (0x546 is the raw smbus word), so
+   `_limit_int` accepts either and guesses nothing; provenance ships per
+   window as "tt-smi smbus telemetry AICLK_LIMIT_MAX
+   (get_bh_chip_limits, tt_smi backend.py:830)". The W1 "UNVERIFIED pin
+   owed" is retired by the confirming A/B, where all six leg windows and
+   both cadence windows resolved the cap.
+2. **pyluwen in-process sampler (#2005).** `--sampler pyluwen`, subprocess
+   stays default. On the real board it holds the requested 0.25 s cadence
+   (81 samples/20 s vs the subprocess sampler's 30, ~2.7x) with an
+   identical sample shape; run 1's windows at 1 s cadence fell under the
+   30-busy-sample floor on the faster arm, which is the concrete case the
+   flag exists for. System python3 has no pyluwen, so the stated-skip
+   path is real and tested.
+3. **#2003 decided: documented stand-pat.** The confirming A/B reproduced
+   the inversion at clock parity — default eager median 10.998 tok/s vs
+   14.299 for `VT_TT_HOST_FREE_DECODE=0`, ratio 1.300 median / 1.294 mean,
+   judge PASS, every busy slice of both arms exactly {1350} MHz
+   (`benchmark-record.md`, 2026-08-30 entry). The EnsureDevice2D
+   hypothesis was REJECTED by the per-op delta (`353511e72`/`101b415d7`
+   only ADD staging work), so stop condition 3 fired: the PR carries
+   records only, the default stays host-free, and the corrected-mechanism
+   residual is owned in the host-free spec `## Owed`.
+
+Rejected and why: a `--spread-scope busy` flag (policy decision above —
+the refold stays offline); flipping the `VT_TT_HOST_FREE_DECODE` default
+on the opt-out's win (a faster number is not a corrected mechanism);
+widening the spread rule inside the tool (NVIDIA parity stays
+rule-for-rule).
+
+Process note, disclosed: the fresh-review step ran as a
+coordinator-executed 7/7 mutation matrix after both the implementer and
+reviewer subagents died of context overflow; each mutation's catching
+test is asserted unique and the head was byte-verified after restore
+(first commit body carries the detail).
+
+## Now
+
+`DONE` at the merge of the W2 pull request (implementation `4fe8a5eaf`,
+records + this Outcome in the second commit). Follow-ups owned elsewhere:
+the corrected mechanism for the opt-out arm lives in the host-free spec
+`## Owed`; #2107 is the next lever candidate and needs its own spec and
+P150 session.

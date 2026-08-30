@@ -4609,6 +4609,87 @@ TEST_CASE("kTENSTORRENT W7 D2D copy records the served geometry") {
   backend.Free(mb4); backend.Free(mb5); backend.Free(mos); backend.Free(mo);
 }
 
+// The capture-lane twin of the eager case above. #2294: CopyDeviceDeviceIfCapture
+// also installs SRC's shadow into dst's slot, and equal byte size does not mean
+// equal geometry there either. A stale record lets a later stage at dst's
+// recorded exact geometry hit the fast path and be handed a wrongly-shaped
+// src-shaped tensor. The case arms the lane through the live env read the same
+// way the inertness-guard case sets it, and pins the lane with the same
+// avoided-copy counter the eager arm bumps.
+struct ForceHostFreeDecode {
+  const bool had = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  const std::string saved =
+      had ? std::string(std::getenv("VT_TT_HOST_FREE_DECODE")) : std::string();
+  ForceHostFreeDecode() { ::setenv("VT_TT_HOST_FREE_DECODE", "1", 1); }
+  ~ForceHostFreeDecode() {
+    if (had) ::setenv("VT_TT_HOST_FREE_DECODE", saved.c_str(), 1);
+    else ::unsetenv("VT_TT_HOST_FREE_DECODE");
+  }
+};
+TEST_CASE("kTENSTORRENT #2294 capture-lane D2D copy records the served geometry") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceHostFreeDecode host_free;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  // 32 elements on both sides ([4,8] src vs [8,4] dst) — equal 64-byte slots
+  // (Alloc registers the 64-rounded size), different geometry.
+  constexpr int64_t R = 8, C = 4, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> sb(C * R), db(R * C), wb4(N * R), wb5(N * C);
+  for (size_t i = 0; i < sb.size(); ++i) sb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < db.size(); ++i) db[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  for (size_t i = 0; i < wb4.size(); ++i) wb4[i] = static_cast<uint16_t>(0x3f00 + (i % 5));
+  for (size_t i = 0; i < wb5.size(); ++i) wb5[i] = static_cast<uint16_t>(0x4000 + (i % 9));
+  void* ma = backend.Alloc(C * R * 2);
+  void* md = backend.Alloc(R * C * 2);
+  void* mr = backend.Alloc(R * C * 2);
+  void* mb4 = backend.Alloc(N * R * 2);
+  void* mb5 = backend.Alloc(N * C * 2);
+  void* mos = backend.Alloc(C * N * 4);
+  void* mo = backend.Alloc(R * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, sb.data(), C * R * 2);
+  backend.Copy(q, md, db.data(), R * C * 2);
+  backend.Copy(q, mr, sb.data(), R * C * 2);  // dst's post-copy flat bytes as [R, C]
+  backend.Copy(q, mb4, wb4.data(), N * R * 2);
+  backend.Copy(q, mb5, wb5.data(), N * C * 2);
+  Tensor s = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {C, R});
+  Tensor d = Tensor::Contiguous(md, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {R, C});
+  Tensor r = Tensor::Contiguous(mr, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {R, C});
+  Tensor b4 = Tensor::Contiguous(mb4, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, R});
+  Tensor b5 = Tensor::Contiguous(mb5, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, C});
+  Tensor os = Tensor::Contiguous(mos, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {C, N});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {R, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, os, s, b4);  // stage the src [C, R] shadow
+  mm(q, o, d, b5);   // stage dst — its slot owns a persistent buffer
+  mm(q, o, r, b5);   // the reference: the same flat bytes declared [R, C]
+  std::vector<float> want(R * N);
+  backend.Copy(q, want.data(), mo, R * N * 4);
+  ResetStagingStats();
+  backend.Copy(q, md, ma, R * C * 2);  // whole-slot D2D copy: dst's shadow is src-shaped
+  vt::tenstorrent::StagingStats st = GetStagingStats();
+  CHECK_MESSAGE(st.stages_avoided_device_copy == 1,
+                "the capture-lane copy must go device->device, got "
+                    << st.stages_avoided_device_copy);
+  mm(q, o, d, b5);  // consume dst at its DECLARED [R, C] geometry
+  st = GetStagingStats();
+  CHECK_MESSAGE(st.uploads_persistent_bf16 == 0,
+                "dst must serve from its copied shadow, got "
+                    << st.uploads_persistent_bf16);
+  std::vector<float> o2(R * N);
+  backend.Copy(q, o2.data(), mo, R * N * 4);
+  for (size_t i = 0; i < want.size(); ++i)
+    CHECK_MESSAGE(want[i] == o2[i], "dst at its declared geometry differs at "
+                            << i << ": " << want[i] << " vs " << o2[i]);
+  backend.Free(ma); backend.Free(md); backend.Free(mr);
+  backend.Free(mb4); backend.Free(mb5); backend.Free(mos); backend.Free(mo);
+}
+
 // W7 drift repair (#2282): the reservation must not survive content
 // establishment, and the reserved arm must never discard a live shadow.
 // Captured on the host-free e2e drift (LEG B, prompt[1] tok=0): a pool

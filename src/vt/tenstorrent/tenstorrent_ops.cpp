@@ -5961,11 +5961,20 @@ bool CopyDeviceDeviceIfCapture(void* dst, const void* src) {
     std::lock_guard<std::mutex> g(SlotMutex());
     BufferSlot* d = FindSlot(dst);
     if (d == nullptr) return false;
+    // The shadow just installed is SRC-shaped, and equal byte size does not
+    // mean equal geometry: the record must name the served geometry, or a
+    // later stage at dst's recorded exact geometry would hit the fast path
+    // and be handed a wrongly-shaped tensor. The capture lane mirrors the
+    // eager device-resident arm (#2294).
+    const auto ds = src_dev.logical_shape();
     d->device = std::move(cloned);
+    d->dev_rows = static_cast<uint32_t>(ds[0]);
+    d->dev_cols = static_cast<uint32_t>(ds[1]);
     d->device_current = true;
     d->host_current = false;
     d->device_reserved = false;  // real bytes installed — reservation spent
   }
+  StagingAvoidedDeviceCopy().fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 

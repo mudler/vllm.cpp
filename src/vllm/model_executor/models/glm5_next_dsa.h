@@ -204,6 +204,40 @@ IndexerSelection SelectIndexerTopk(const IndexerDims& d, const IndexerWeights& w
                                    const std::vector<uint8_t>& mask, int64_t batch,
                                    int64_t seq_len);
 
+// The same selection over an ALREADY-PACKED key history — the arm upstream takes
+// when `past_key_values is not None` (`:807-813`).
+//
+// `SelectIndexerTopk` above is exactly this function called with the packed
+// states of the current window and `kv_len == seq_len`; that is upstream's
+// `kv_len = seq_len; current_length = seq_len` at `:805-806` and it is why the
+// two are one implementation rather than two.
+//
+// **What upstream caches here is the PACKED ROW, not the key.**
+// `past_key_values.update_indexer(packed_states, layer_idx)` (`:810`) stores
+// `concat[k, gate_scores, valid]` — 2 * head_dim + 1 elements — and reads the
+// WHOLE history back, so the gate scores and the validity channel of an earlier
+// step are re-read rather than recomputed. `MakeGlm5NextKVCache`'s third group
+// is 257 wide for exactly that reason (`glm5_next_registry.cpp`), and a port
+// that cached the 128-wide key alone would have to recompute the other 129
+// channels from hidden states it no longer holds.
+//
+// `current_length` is `kv_len` here and not a third quantity: upstream reads it
+// from `cache_layer.get_seq_length()` (`:813`), and the two differ only on a
+// STATIC cache padded to a maximum length, which this host reference does not
+// have. The comment at `:811` says so upstream.
+//
+//   packed : [batch, kv_len, 2 * head_dim + 1] row-major — the FULL history,
+//            oldest first, exactly what `:810` returns
+//   hidden, q_resid, mask : the CURRENT window only, [batch, seq_len, *]
+IndexerSelection SelectIndexerTopkFromPacked(const IndexerDims& d,
+                                             const IndexerWeights& w,
+                                             const std::vector<float>& hidden,
+                                             const std::vector<float>& q_resid,
+                                             const std::vector<uint8_t>& mask,
+                                             const std::vector<float>& packed,
+                                             int64_t batch, int64_t seq_len,
+                                             int64_t kv_len);
+
 }  // namespace vllm::glm5_next
 
 #endif  // VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_DSA_H_

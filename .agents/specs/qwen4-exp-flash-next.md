@@ -803,8 +803,10 @@ problem and `docs/USAGE.md` must say so beside the arm.
 re-quantized-in-place case AGENTS.md "Say which weights, and from where" names; a repo
 id alone is not a pin. `## Owed` now carries revision
 `8bdc666649440e9bdc97e16f3f75782c98478ff5` and the three per-shard sizes and digests.
-Those digests are the Hub API's `lfs.oid` values and are **not** locally computed, so a
-locally computed sha256 remains owed when W6 stages the file. The `split.tensors.count
+Those digests were the Hub API's `lfs.oid` values and were not locally computed. That
+debt is now DISCHARGED: all three were recomputed with `sha256sum` on the staged copy on
+29 August 2026 and agree three for three, recorded in
+[the ladder-arm evidence file](../../docs/bench-evidence/qwen4exp-llamacpp-ladder-arm-20260829.md). The `split.tensors.count
 = 1224` above is on the same footing and is recorded there as UNVERIFIED, because shard
 1 is the metadata shard and reports `n_tensors = 0`.
 
@@ -1021,13 +1023,34 @@ No token gate is claimable until an arm runs. In order:
    places on quantized gates, and with the missing-llama.cpp-oracle limitation stated
    in the result rather than omitted.
 5. **G4, speed against llama.cpp at its pin.** A denominator now exists and the
-   earlier "there is no denominator" clause is superseded: `llama-cpp` is a registered,
-   pinned, `gateable = yes` oracle whose scope is "GGUF k-quant speed and memory floors,
-   **quant-matched against the same weights**", and `unsloth/Qwen3.8-Flash-Next-GGUF`
-   UD-IQ1_S is one published artifact both engines can run. **W6a has since made that
-   file loadable** (#2019), so the encoding precondition is met on the CPU arm; the gate
-   itself still waits on G2, and no throughput, latency or memory number is admissible
-   from this row until G2 passes.
+   earlier "there is no denominator" clause is superseded. **The oracle is
+   [`llama-cpp-qwen4exp`](../oracles/llama-cpp-qwen4exp.md), pinned at
+   `035e22731a7fd70b9854b3a2d64ec68e9b1a45d3` (ggml-org/llama.cpp PR #27742), and NOT
+   the stock [`llama-cpp`](../oracles/llama-cpp.md) pin this clause used to name.** That
+   correction is measured, not stylistic: `llama-cpp` is pinned at released `b10451`,
+   and a tree-wide grep for the string qwen4exp at that revision matches nothing (rc=1)
+   while the same grep for qwen3vl matches three or more files (rc=0) as the control.
+   Both were run against a fresh bare clone and are recorded in
+   [the oracle file](../oracles/llama-cpp-qwen4exp.md) and in
+   [#2060](https://github.com/mudler/vllm.cpp/issues/2060); they are not repeated as a
+   command here, because a grep against a llama.cpp revision is not something this
+   tree's gate runner can execute and a gate item that cannot fail gates nothing. The
+   released oracle cannot name this architecture, so it cannot supply this denominator,
+   and a gate that named it was naming a tool that refuses the model.
+
+   `llama-cpp-qwen4exp` reads `gateable = yes` as of 29 August 2026, and both halves are
+   recorded: it builds on CUDA for GB10 and `llama-server` at the pin loaded
+   `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S and returned 64 coherent greedy tokens.
+   [#2060](https://github.com/mudler/vllm.cpp/issues/2060) owed that run half and is
+   discharged; the evidence is
+   [`docs/bench-evidence/qwen4exp-llamacpp-ladder-arm-20260829.md`](../../docs/bench-evidence/qwen4exp-llamacpp-ladder-arm-20260829.md).
+   **W6a has since made that file loadable on our side** (#2019), so the encoding
+   precondition is met on the CPU arm; the gate itself still waits on G2, and no
+   throughput, latency or memory number is admissible from this row until G2 passes.
+
+   **`gateable = yes` is not a measurement.** That oracle's own record says so: one
+   prompt, one repetition, five prompt tokens, one slot, no clock window and no
+   contention control. Nothing in that evidence file may be quoted as a number.
 
    **The target is binding.** The developer's words, 2026-08-26, quoted rather than
    paraphrased because the wording is the requirement:
@@ -1039,7 +1062,15 @@ No token gate is claimable until an arm runs. In order:
    Therefore:
 
    - **A concurrency LADDER is the headline, not a point.** c = 1, 4, 8, 16, 32 at
-     minimum. A c=1 result neither confirms nor refutes this target.
+     minimum. A c=1 result neither confirms nor refutes this target. The harness walks
+     the published online-serving grid, which is that set plus the c=2 the grid carries:
+     `(1, 6) (2, 6) (4, 12) (8, 24) (16, 96) (32, 192)` as (concurrency, prompts).
+   - **1,024 input tokens and 128 output tokens, three repetitions.** Stated here
+     because this section used to be silent on the lengths while the runs used the
+     published grid's values anyway, and an unstated input length is the axis that
+     splits prefill from decode. These are `online_gate.INPUT_LEN`, `OUTPUT_LEN` and
+     `REPETITIONS`, copied rather than chosen so a cell of the llama.cpp table can be
+     read beside a cell of `docs/benchmarks/vllm-online-serving.md`.
    - **Prefill and decode reported separately**, because input length splits them and an
      aggregate hides which lever moved.
    - Memory is an axis: peak RSS and peak device bytes at each concurrency.
@@ -1047,7 +1078,18 @@ No token gate is claimable until an arm runs. In order:
      result, and this repository already has the `--enforce-eager` precedent for how that
      goes wrong.
    - Identical artifact, prompts, token counts, sampling and concurrency; idle host;
-     reproduced with a same-binary A/B.
+     reproduced with a same-binary A/B. "Identical prompts" means the same
+     per-(concurrency, repetition) corpus partitions
+     `online_gate.prepare_corpus_views` writes and refuses to let overlap — not one
+     shared file replayed three times on one side against three disjoint thirds on the
+     other — and the same `--num-warmups`, which `OnlineRun.num_warmups` sets to the
+     concurrency.
+   - **The denominator is TEXT-ONLY and this row is a multimodal port.** `/props` on the
+     llama.cpp arm reports `"modalities":{"vision":false,"video":false,"audio":false}`.
+     An arm that loads a vision tower does strictly more work per request, so the
+     vllm.cpp cell paired against it must be a text-only configuration on the same
+     UD-IQ1_S artifact. State which side ran what, or the ratio measures a configuration
+     difference and reads as a performance one.
 
 ### Where the speed is expected to come from, and what would forfeit it
 
@@ -3256,9 +3298,10 @@ is listed under `## Owed`.
   10,946,624 + 49,990,818,368 + 22,544,696,352 = **72,546,461,344 bytes = 67.564 GiB**,
   with sha256 `88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd`,
   `3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6` and
-  `0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a`. Those digests are
-  the Hub API's `lfs.oid` values and are NOT locally computed; W6 owes a local sha256
-  when it stages the file. The "1224 tensors" count remains UNVERIFIED: shard 1 is the
+  `0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a`. Those digests were
+  the Hub API's `lfs.oid` values; a LOCAL sha256 was owed and is now recorded. All three
+  were recomputed on the staged copy on 29 August 2026 and agree three for three, in
+  [the ladder-arm evidence file](../../docs/bench-evidence/qwen4exp-llamacpp-ladder-arm-20260829.md). The "1224 tensors" count remains UNVERIFIED: shard 1 is the
   metadata shard and reports `n_tensors = 0`. It FITS GB10
   with ~52 GiB of headroom, and two things in OUR tree stop us loading it: the missing
   IQ4_NL reader arm, and the gather-table expansion. Its metadata independently
@@ -3973,6 +4016,30 @@ is listed under `## Owed`.
   `ModelRegistry::Forward` with a hand-built positional cache set is gateable
   today; a forward reached through `GPUModelRunner` is not, and lifting that
   refusal is an engine seam change DeepSeek-V4 waits on too.
+
+### The llama.cpp G4 denominator, owed after the arm landed
+
+The `llama-cpp-qwen4exp` oracle is `gateable = yes` and its harness is committed,
+and three things are still owed before a single cell of that table exists.
+
+- **[#2261](https://github.com/mudler/vllm.cpp/issues/2261): a
+  `KV_BYTES_PER_TOKEN` measured on a leased load, without which the ladder
+  refuses.** `llama-server` at the pin reports no KV size — measured on the row's
+  own production capture, which is the complete unfiltered server output — so a
+  guard that defaulted the term to zero was weightless on the only server this
+  harness will face. It now refuses (`E_KV_UNREPORTED`, 21) rather than sizing a
+  49,152-token context over 32 slots against a 67.5 GiB model with nothing
+  bounding the cache. A refusal is the correct output until the number exists.
+- **[#2262](https://github.com/mudler/vllm.cpp/issues/2262): the mutation sweep
+  is not re-executable and the CUDA toolchain is asserted rather than pinned.**
+  Nine of eleven recorded mutations have no committed driver, and
+  `cuda-toolkit-13-0` names a channel rather than a version; `EXPECT_NVCC` makes
+  the drift refuse but does not make apt serve one build.
+- **The ladder run itself, and a vllm.cpp arm to put beside it.** There is
+  nothing to compare until `ModelRegistry::Forward` stops refusing `qwen4_exp` by
+  name, and the vllm.cpp cell must be a TEXT-ONLY configuration on the same
+  UD-IQ1_S artifact, because the denominator reports every modality false.
+
 
 ## Now
 

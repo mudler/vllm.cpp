@@ -236,3 +236,36 @@ TEST_CASE("CUDA backend refuses host dereference of device memory (GPU box only)
                                 << cuda.DeviceMemoryIsHostAddressable());
   CHECK_FALSE(cuda.DeviceMemoryIsHostAddressable());
 }
+
+// PERF-QWEN35-STAGE-WEIGHTS (#2327): does CUDA ANSWER the device memory budget?
+//
+// WHY THIS CASE EXISTS, AND WHAT IT COST NOT TO HAVE IT. `Backend::DeviceMemoryInfo`
+// returns false in the base, and until #2327 only the ROCm backend overrode it
+// (`rocm_backend.hip:373`). Every CUDA caller asking "does this fit?" therefore
+// got "I cannot say", and a caller that reads an unanswerable budget as "do not
+// risk it" — the safe reading, and the one the weight-staging policy takes — is
+// SILENTLY INERT on the platform it was written for.
+//
+// That is measured, not hypothetical. #2327's staging policy shipped, the
+// committed speed gate re-ran on it, and the throughput was unchanged
+// (12.3435 against a 12.361 baseline) because the policy declined every weight.
+// The A/B that motivated the change had forced staging with an env var and saw
+// +22.4%, so the mechanism was real and the gate was inert — the two together
+// are what a silent `false` buys.
+//
+// A `false` here is not a failure of the box: it is a capability the platform
+// genuinely may lack. But CUDA is not that platform, and this pins it.
+TEST_CASE("cuda backend: DeviceMemoryInfo ANSWERS, so budget-gated callers are not inert") {
+  if (!HasCuda()) return;  // CPU-only build, or a CUDA build with no device
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  size_t free_b = 0;
+  size_t total_b = 0;
+  REQUIRE(b.DeviceMemoryInfo(&free_b, &total_b));
+  CHECK(total_b > 0);
+  CHECK(free_b > 0);
+  CHECK(free_b <= total_b);
+  // And it must tolerate a caller that wants only one of the two.
+  size_t only_total = 0;
+  CHECK(b.DeviceMemoryInfo(nullptr, &only_total));
+  CHECK(only_total == total_b);
+}

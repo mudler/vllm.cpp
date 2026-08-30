@@ -2246,10 +2246,10 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
                               static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
                               static_cast<uint32_t>(bcast ? 1 : 0),
                               a_off, w_off, eid_off, out_off};
-    const uint32_t spec[1] = {DtypeCode(out.dtype)};
+    const uint32_t spec[2] = {DtypeCode(out.dtype), DtypeCode(act.dtype)};
     ctx.Dispatch(dev_shader, buffers.data(),
                  static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-                 static_cast<uint32_t>(N), spec, 1);
+                 static_cast<uint32_t>((N + 3) / 4), spec, 2);
     return true;
   }
 
@@ -2382,10 +2382,10 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
       static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
       static_cast<uint32_t>(bcast ? 1 : 0), gather_k,
       a_off, gw_off, uw_off, eid_off, out_off, limit};
-  const uint32_t spec[1] = {DtypeCode(act.dtype)};
+  const uint32_t spec[2] = {DtypeCode(act.dtype), DtypeCode(out.dtype)};
   ctx.Dispatch(shader, buffers.data(),
                static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-               static_cast<uint32_t>(N), spec, 1);
+               static_cast<uint32_t>((N + 3) / 4), spec, 2);
   return true;
 }
 

@@ -266,7 +266,7 @@ void MoeGateUpSwiGLUGrouped(Queue& q, Tensor& out, const Tensor& act, const Tens
            "moe_gate_up_swiglu: gate_w/up_w rows must be a whole multiple of N and equal");
   VT_CHECK(IsBlockQuant(gate_w.dtype) && gate_w.dtype == up_w.dtype,
            "moe_gate_up_swiglu: gate_w/up_w must be the SAME block-quantized dtype");
-  VT_CHECK(IsFloat(act.dtype) && out.dtype == DType::kF32,
+  VT_CHECK(IsFloat(act.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
            "moe_gate_up_swiglu: float activation and f32 output required");
   VT_CHECK(gate_w.shape[1] % BlockElems(gate_w.dtype) == 0,
            "moe_gate_up_swiglu: K must be a whole number of weight blocks");

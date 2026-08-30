@@ -407,8 +407,9 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `785d4304f` (bumped
-2026-08-29; W6 #2273 via #2280 landed since the previous `017c3277f`). Branch
+in `.agents/developer-preferences.md`). Base `origin/main` @ `c31b2496e` (rebased
+2026-08-30 for the PR's up-to-date requirement; the previous base `785d4304f`
+carried W6 #2273 via #2280). Branch
 `row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 

@@ -665,3 +665,71 @@ TEST_CASE("an F32 UPCAST does not make an aliased weight's host mirror redundant
   CHECK(vllm::ReleaseResidentQwen3_5DenseHostWeights(staged_weights) == expect_freed);
   CHECK_FALSE(staged_layer.gdn.conv1d_weight.HasHostBytes());
 }
+
+// ---------------------------------------------------------------------------
+// PERF-QWEN35-STAGE-WEIGHTS — when may a dense weight be STAGED to the device
+// instead of retagged in place?
+//
+// THE MEASUREMENT THAT MOTIVATES IT. The retag this file exists to install is a
+// real decode tax on GB10. Interleaved A/B on `dgx:gpu0`, one boot, Qwen3.8-27B
+// bf16 + DFlash2 k=7 at concurrency 1, four warm repeats per leg:
+//
+//     alias ON   11.677, 11.693 tok/s   (arms agree to 0.14%)
+//     staged     14.288, 14.337 tok/s   (arms agree to 0.34%)   -> +22.5%
+//
+// That is the same mechanism `laguna.cpp:130-132` records and the same 20-30%
+// band that took Laguna and DeepSeek-V4 past their references.
+//
+// WHY IT IS A BUDGET QUESTION AND NOT A FLAG. This file's own subject — the
+// 2.4T checkpoint of #1299 — exhausts a 119.631 GiB box precisely BECAUSE the
+// CUDA arm paid for its weights twice. Staging is right for a model that fits
+// and fatal for one that does not, so the policy has to be asked of the BOX.
+// The arithmetic is extracted as a pure function so it can be gated here
+// without a device: a fake backend would need every pure virtual of
+// `vt::Backend` stubbed, and the boilerplate would gate less than this does.
+TEST_CASE("stage-vs-retag: a model that FITS is staged") {
+  // 50 GiB of weights on a 119.6 GiB box with 113 GiB free: 63 GiB left after,
+  // which is 53% of total, above the 0.55 floor only if... it is not. Use the
+  // real early-load shape instead: the first weights arrive with the box nearly
+  // empty, so each individual weight passes comfortably.
+  const size_t total = 119ull << 30;
+  const size_t free_early = 113ull << 30;
+  CHECK(vllm::DeviceStagingFitsBudget(free_early, total, 2ull << 30, 0.55));
+  CHECK(vllm::DeviceStagingFitsBudget(free_early, total, 20ull << 30, 0.55));
+}
+
+TEST_CASE("stage-vs-retag: the 2.4T shape is REFUSED, which is #1299's invariant") {
+  // #1299 measured that checkpoint resident at 61.20 GiB on a 119.631 GiB box.
+  // Its first dense weight therefore arrives with the box already past the
+  // floor, and must keep the retag rather than pay for a second copy.
+  const size_t total = 119ull << 30;
+  const size_t free_after_host_bytes = 58ull << 30;  // ~119 - 61
+  CHECK_FALSE(vllm::DeviceStagingFitsBudget(free_after_host_bytes, total, 2ull << 30, 0.55));
+}
+
+TEST_CASE("stage-vs-retag: the floor is the load-bearing term") {
+  const size_t total = 100ull << 30;
+  const size_t w = 1ull << 30;
+  // Comfortably above the 55% floor after staging, and comfortably below it.
+  // The EXACT boundary is deliberately not asserted: the comparison is against
+  // `min_free_frac * total` in double, and 0.55 is not representable in binary,
+  // so an equality case would be gating the rounding rather than the policy.
+  CHECK(vllm::DeviceStagingFitsBudget((57ull << 30) + w, total, w, 0.55));
+  CHECK_FALSE(vllm::DeviceStagingFitsBudget((53ull << 30) + w, total, w, 0.55));
+  // And the floor is what moves the answer: the same free/bytes flips with it.
+  CHECK(vllm::DeviceStagingFitsBudget((53ull << 30) + w, total, w, 0.50));
+}
+
+TEST_CASE("stage-vs-retag: an unanswerable budget keeps the retag") {
+  // `DeviceMemoryInfo` returning false leaves total_bytes 0. An unknown budget
+  // is not a licence to double a model's residency, so the answer is NO.
+  CHECK_FALSE(vllm::DeviceStagingFitsBudget(0, 0, 1ull << 30, 0.55));
+  CHECK_FALSE(vllm::DeviceStagingFitsBudget(1ull << 30, 0, 1ull << 30, 0.55));
+}
+
+TEST_CASE("stage-vs-retag: a weight larger than free memory is REFUSED") {
+  const size_t total = 119ull << 30;
+  CHECK_FALSE(vllm::DeviceStagingFitsBudget(4ull << 30, total, 8ull << 30, 0.55));
+  // Equal is also refused: staging it would leave nothing at all.
+  CHECK_FALSE(vllm::DeviceStagingFitsBudget(8ull << 30, total, 8ull << 30, 0.55));
+}

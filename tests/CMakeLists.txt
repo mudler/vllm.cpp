@@ -1108,6 +1108,26 @@ vllm_cpp_add_test(test_glm5_next_moe vllm/models/test_glm5_next_moe.cpp)
 target_compile_definitions(test_glm5_next_moe PRIVATE
   GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
 target_include_directories(test_glm5_next_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# GLM-5.3-Flash W5b-2 -- the decoder layer, the mHC stream threading, the
+# assembled `Glm5NextTextModel::Forward` and the KV binding (#2241). Runs a FIVE
+# layer model whose schedule carries all four control-flow combinations
+# `modeling_glm5_next.py:1261-1272` selects between plus a `shared` DSA layer,
+# at the PUBLISHED `hc_mult` of 4, so the `[T, hc_mult, hidden]` manifold is
+# asserted per stream and against an EARLY-COLLAPSE decoy captured from the same
+# oracle run -- a port that threads `[T, hidden]` is finite, right-shaped and
+# fluent, and nothing else in this tree catches it. Goldens are the RUN output
+# of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_layer_goldens.py`. `glm5_next_layer.h` is
+# MODEL-PRIVATE under src/, the same arrangement `glm5_next_attn.h` uses; the
+# published `config.json` is read so the cache widths the layer fills are gated
+# against the ones the production `make_kv_cache` hook publishes.
+vllm_cpp_add_test(test_glm5_next_layer vllm/models/test_glm5_next_layer.cpp)
+target_compile_definitions(test_glm5_next_layer PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_layer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_layer PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 target_include_directories(test_glm5_next_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 

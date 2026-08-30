@@ -1333,14 +1333,164 @@ state IQ2_XS and IQ4_XS were in before #2245.
 at this merge commit; the only call sites are the two focused gates'. W5b-2
 owns the wiring. O25 carries the disclosure.
 
-### W5b-2 — the decoder layer, the mHC threading and the assembled forward (GPU, large) — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
+### W5b-2 — the decoder layer, the mHC threading and the assembled forward — SPLIT AGAIN, see the two sections below
 
-What W5b-1 excluded. `Glm5NextTextDecoderLayer` (`:1259-1329`), the mHC stream
-threading, `Glm5NextTextModel::Forward` (`:1409-1494`), and the binding of the
-attention block to `MakeGlm5NextKVCache` — upstream's
-`past_key_values.update` (`:1177-1179`) is a Cache object W5b-1's reference has
-no equivalent of. Owns discharging O15, O16, O17, O23 and O25 at the moment the
-layer calls the five primitives.
+This was W5b-1's PLAN for W5b-2, kept so the two readings do not look like a
+contradiction. It scoped `Glm5NextTextDecoderLayer` (`:1259-1329`), the mHC
+stream threading, `Glm5NextTextModel::Forward` (`:1409-1494`), the binding of the
+attention block to `MakeGlm5NextKVCache`, AND the discharge of O15, O16, O17,
+O23 and O25 at the moment the layer calls the five primitives.
+
+**The first four landed together and the fifth did not, because the fifth is not
+the same kind of work.** The layer, the threading, the forward and the cache
+binding answer to `transformers` v5.16.1 and to `MakeGlm5NextKVCache`, and they
+are gated by running the reference. Discharging the five reachability debts
+needs something else entirely: a weight bridge for the FOUR arms W5b-1 did not
+bridge, and an engine binding that turns a `ModelForwardInput` into per-request
+sequences and carries per-layer state across steps. §W5b-2b states the
+arithmetic that makes the first of those a design problem rather than four more
+`BridgeDsaLayer`s.
+
+### W5b-2a — the decoder layer, the mHC threading, the forward and the KV binding (CPU, large). LANDED — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
+
+`src/vllm/model_executor/models/glm5_next_layer.{h,cpp}`:
+`DecoderLayerForward` (`:1279-1329`) with all four control-flow arms
+`:1261-1272` selects between, `TextModelForward` (`:1431-1494`), and
+`ExpandToHiddenStreams` (`:1477`). Plus the cache binding, as an additive
+`DsaCache*` on `Attention` (`glm5_next_attn.h`) and a
+`SelectIndexerTopkFromPacked` lifted out of `SelectIndexerTopk`'s body
+(`glm5_next_dsa.h`), both null-default and byte-identical on the uncached path
+W5b-1 gated.
+
+**THE MANIFOLD IS THE WHOLE POINT, and it is gated three ways that do not
+overlap.** `:1477` expands the embedding to `[B, S, hc_mult, H]` and nothing
+collapses it until `hc_head` at `:1493`; a port that threads `[B, S, H]` and
+collapses early RUNS, is finite, and emits fluent text, and every sublayer gate
+on this row stays green because the collapsed stream is exactly what the
+sublayers consume. So: the per-layer `[B, S, 4, H]` streams are asserted
+ELEMENTWISE; `kStreamSeparation` carries the oracle's own minimum pairwise
+distance between the four streams (**6.4703**) so those assertions are shown to
+be discriminating rather than four copies of one value; and `kEarlyCollapseFinal`
+is a DECOY produced by the SAME oracle modules with the manifold collapsed to its
+mean and re-broadcast after every layer, which the gate asserts we differ from by
+the oracle's own measured **2.4032**.
+
+**The KV binding stores the LATENT, not what the reference stores.** Upstream
+caches the EXPANDED `key_states`/`value_states` at `:1175-1179` — 32,768 values
+per token per layer — and `DsaCache` stores the 512-wide `k_pass` and the
+257-wide packed indexer row instead, which is exactly what
+`MakeGlm5NextKVCache`'s groups 0 and 2 publish. §"MLA: cache the latent" decided
+that and said the equivalence was to be PROVED; the proof is that `ExpandKv` is
+token-wise, which NoPE is what makes true, and it is a case asserting
+`ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)` EXACTLY on real values. It is
+NOT the absorption optimization, which is a speed change and W8's.
+
+**A MUTATION FOUND THE INSTRUMENT, NOT THE PORT, AND IT IS RECORDED AS A
+FINDING.** The mutation that truncates the attention's key range to the current
+window under a filled cache — the "a cache nobody reads back" defect — SURVIVED
+the whole suite at 1647 of 1647 assertions on the first pass. Its output is
+all-NaN, `NaN - want` is NaN, and `NaN > x` is FALSE for every x, so the
+running maximum in the test's `MaxGap` helper never moved off its initial zero
+and an all-NaN forward read as a PERFECT match on every gap assertion in the
+file. `MinStreamSeparation` and the cached-tail comparison were blind the same
+way, because `std::max(m, NaN)` returns `m`. All three now treat a non-finite
+value as an infinite gap and report the count separately, so a failure
+distinguishes "wrong number" from "not a number"; the mutation then reds 3
+assertions. This is the broken-instrument-fails-toward-a-code-verdict class, and
+it was found only because the mutation battery was run at all.
+
+**RED FIRST, and the red found a real defect in the oracle configuration
+rather than in the port.** The first run read 4 of 10 cases and 7 of 1647
+assertions failed, layer 0 (KDA) green and every DSA layer red by 2.7 to 8.1.
+The cause was that `Glm5NextPreTrainedModel` sets `_supports_sdpa = True`, so the
+DEFAULT `_attn_implementation` this config resolves is `sdpa`, and
+`build_attention_mask_from_topk` returns a BOOLEAN mask on that arm
+(`:1249-1250`) instead of the additive `finfo.min` one the eager arm builds
+(`:1252-1256`). The two disagree on a LEFT-PADDED query row where every key is
+masked — torch's SDPA emits 0.0 there and eager's uniform softmax emits the mean
+of the values, measured as 0.0 against our 0.509 — so the generator now pins
+`cfg._attn_implementation = "eager"`, which is the arm W5b-1 gated and the one
+`:1227-1228` names as the only interface this model's 3-D per-(query, key) mask
+can reach. Green is 10/10 cases and 1656/1656 assertions after the instrument repair (1647 before it).
+
+**NOT REACHED, and O26 carries the disclosure.** `ForwardGlm5NextForConditionalGeneration`
+still refuses by name. W5b-2b owns the wiring.
+
+### W5b-2b — the weight bridge for the other four arms, and the engine binding (GPU, large). NOT STARTED — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
+
+What makes `ModelRegistry::Forward` stop refusing by name, and therefore what
+discharges O15, O16, O17, O23, O25 and O10's remaining half. Two deliverables,
+and the first is a design problem rather than more of W5b-1's bridge.
+
+**(a) The bridge for the KDA, MoE, dense-MLP and mHC arms.**
+`BridgeDsaLayer` covers `Glm5NextMlaWeights` and its nested indexer, and
+`TextModelWeights` needs four more: `Glm5NextKdaWeights` (15 tensors),
+`Glm5NextMlpWeights` (3), `Glm5NextMhcWeights` (3, twice per layer) and the
+`Glm5NextWeights` head — `embed_tokens`, `norm`, `lm_head`. Three of those four
+are mechanical. **The MoE is not**, and the arithmetic is this row's own:
+
+| what, at the published geometry | f32 GiB |
+|---|---:|
+| one bridged DSA layer (W5b-1, measured) | 0.4654 |
+| the 34 KDA layers' projections, all held | ~18.5 |
+| ONE sparse layer's 288 routed experts (`gate_up` + `down`) | **~27** |
+| the 42 sparse layers' routed experts, all held | **~1,150** |
+| usable on `dgx:gpu0` | ~119.63 |
+
+`kBridgeTensorF32ByteCeiling` is 1 GiB and the smallest expert bank is 9.0 GiB,
+so `DecodeOwnedTensorToF32` REFUSES a bank by name today — which is O25's
+`byte_ceiling` gate working exactly as designed, not an obstacle to route
+around. Only 8 of 288 experts are selected per token, so the shape that fits is
+an on-demand per-expert decode: `MoeForward` grows an optional expert source
+consulted for each SELECTED expert when `expert_gate_up` is empty, which keeps
+`vt::MoeRouterTopK` and `vt::MoeCombine` as the seams and adds no parallel path.
+That is one seam change in W5's file with its own red-first gate, and it is why
+this is a wave and not a paragraph.
+
+**(b) The engine binding, which is the SMALLER half and has a house pattern.**
+This was surveyed rather than guessed, because "where does per-request state
+live across steps" looked like the hard part and is not. TWO registered models
+already carry a host arm inside their `forward` hook that ignores the device
+paged caches entirely: `NemotronHForCausalLM`
+(`nemotron_h_registry.cpp:200-213`, whose comment says the host reference
+"consumes three of `ModelForwardInput`'s fields — `token_ids`,
+`logits_indices`, `queue`") and `KimiLinearForCausalLM`
+(`kimi_linear_forward.cpp:462-476`, which `(void)`s `positions`, `attn_meta`,
+`attn_kv` and `queue`). Both RE-RUN THE WHOLE PREFIX each step
+(`nemotron_h.cpp:1047-1066`, `kimi_linear_forward.cpp:436-460`) rather than
+owning state, and a survey of every `: public LoadedModel` in the tree found NO
+model that keeps per-request KV or recurrent state on its `LoadedModel` — the
+persistent members are weights, a CUDA-graph driver, a derived read-only cache,
+or load-time bookkeeping. Kimi-Linear is the closest architecture there is to
+this one (KDA plus MLA), so its shape is the precedent to follow.
+
+The rest is house pattern too: `HostLogits(std::vector<float>&&, vocab)`
+(`qwen3_5_common.cpp:24-30`) builds the carrier and derives `rows` from
+`host.size() / vocab`, and the gather-then-lm_head — empty `logits_indices`
+means EVERY row, the gather happens BEFORE lm_head so it never runs on the full
+`T`, and the indices are bounds-checked — is `nemotron_h.cpp:997-1022` with an
+identical copy at `kimi_linear_forward.cpp:409-433`. Ragged batching, if W5b-2b
+wants it rather than the single-sequence shape both precedents use, is
+`attn_meta.query_start_loc` sliced as at `kimi_linear_device.cpp:2120-2126`,
+with the empty-`num_computed_tokens_cpu` fallback `dots3_note_device.cpp:336-346`
+warns "falls OPEN".
+
+**A full-prefix recompute makes `LayerCache` unreached on that path, and that is
+a decision W5b-2b has to take rather than inherit.** W5b-2a's cache binding is
+gated and correct; if the production hook follows Nemotron-H and Kimi-Linear it
+will not call it, which would leave the binding in the same unreached state this
+wave is disclosing. The alternative — carrying `std::vector<LayerCache>` on
+`Glm5NextLoadedModel` — has no precedent in this tree, and inventing one on a
+model that cannot be run end to end on this fleet is the wrong place to try.
+
+**O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) is W5b-2b's to
+answer, and W5b-2a cannot make it reachable.** `glm5_next_layer.cpp` calls
+`MoeForward`, whose only `vt` ops remain `vt::MoeRouterTopK` and
+`vt::MoeCombine` — every expert GEMM is still a host `std::vector<float>`
+accumulation — so it reaches neither `vt::MergedGemmGroup` nor
+`MoeGateUpSwiGLUGroupedCuda` and the `gate/up must be the SAME CUDA keep-quant
+dtype` throw cannot fire from this row. The per-expert source in (a) keeps that
+property by construction, because it hands the block host floats.
 
 ### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
 
@@ -2905,6 +3055,61 @@ Debts this row carries, each visible rather than waived:
   not a tautology; an earlier version asserted only
   `host_f32_bytes == BridgedDsaLayerF32Bytes(...)` and that mutation passed it.
 
+- **O26 — `glm5_next_layer.{h,cpp}` is NOT REACHED from a production entry
+  point, and O15, O16, O17, O23 and O25's reachability halves are therefore NOT
+  discharged.** W5b-2a ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
+  landed the decoder layer, the mHC stream threading, `TextModelForward` and the
+  KV binding, and `ForwardGlm5NextForConditionalGeneration` still refuses by
+  name, so the only call site at this merge commit is
+  `tests/vllm/models/test_glm5_next_layer.cpp`'s. This is the staged-slice
+  disclosure AGENTS.md "Nothing lands dead" requires, declared rather than
+  claimed by silence, and it is stated in the STRONG form on purpose: W5b-2a's
+  own scope said it would discharge those five, and it does not.
+  `.agents/reachability.md` is explicit that "an intermediate hop that is itself
+  unreached does not carry", so a KDA arm now called from `glm5_next_layer.cpp`
+  is exactly as unreached as it was when only its own gate called it.
+  **The wiring belongs to W5b-2b**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **What DID change, stated precisely so the next reader does not re-derive
+  it.** Before this merge the five primitives had five separate dead ends and no
+  assembly point; after it they have ONE, gated against the reference at 10 cases
+  and 1647 assertions, and the remaining gap to a production entry point is a
+  single hop — the weight bridge for four arms plus the engine binding, §W5b-2b.
+  That is a smaller and better-defined debt than five, and it is still a debt.
+
+  **There is a production call site to delete after W5b-2b and there is none
+  now**, so `.agents/reachability.md`'s reachability mutation is answered here
+  the way it was for W5b-1: the change has no entry-point chain, and saying so is
+  the answer. The mutation this change CAN run, and does, is the one for the KV
+  binding's own seam — deleting the `DsaCache*` argument at
+  `glm5_next_layer.cpp`'s `Attention` call reds the cached case while every
+  uncached case stays green, which is what proves the cached path is entered
+  through the layer rather than only by the cache test.
+
+  **The `shared` indexer arm stays unreached even after W5b-2b**, unchanged from
+  O25: the published `config.json` selects `shared` on ZERO of its 45 layers, so
+  the cross-layer sharing this wave now threads through the layer loop is
+  correct against `transformers` v5.16.1 on a schedule the released checkpoint
+  does not contain.
+
+  **One divergence inside the oracle itself is recorded here rather than only in
+  the generator**, because it is a fact about `glm5_next` and not about this
+  fixture. `Glm5NextPreTrainedModel` sets `_supports_sdpa = True`, so a default
+  `Glm5NextTextConfig` resolves `_attn_implementation` to `sdpa`, and
+  `build_attention_mask_from_topk` returns a BOOLEAN mask on that arm
+  (`modeling_glm5_next.py:1249-1250`) where the eager arm returns the additive
+  `finfo.min` one (`:1252-1256`). On a LEFT-PADDED query row, where every key is
+  masked, the two backends disagree: torch's SDPA emits 0.0 and eager's uniform
+  softmax emits the mean of the values, measured at 0.0 against 0.509 on this
+  fixture. Our port inlines `eager_attention_forward`, which is what W5b-1 gated
+  and what `:1227-1228` names as the only interface a 3-D per-(query, key) mask
+  can reach, so both generators pin `cfg._attn_implementation = "eager"`. No
+  token gate could see this, because the rows that differ are padding.
+
+
 ## Now
 
 `ACTIVE`, 2026-08-29. The row's lifecycle state does not move: W3
@@ -2952,11 +3157,30 @@ expanded form is 426.72 GiB against a ~119.63 GiB box. **W5b-1 is NOT REACHED
 from any production entry point** and O25 carries that disclosure; the wiring is
 W5b-2's.
 
+**THE STACK ASSEMBLES, AND NOTHING REACHES IT YET.** W5b-2a
+([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) landed
+`glm5_next_layer.{h,cpp}`: the decoder layer with all four control-flow arms,
+the mHC stream threading at both sites, `TextModelForward`, and the binding of
+the DSA block to `MakeGlm5NextKVCache`'s groups 0 and 2 through an additive
+`DsaCache`. Gated at 10 cases / 1647 assertions against the RUN output of
+`transformers` v5.16.1 over a FIVE-layer mixed schedule at the published
+`hc_mult` of 4 — including a cached 8-token prefill plus 4-token continuation
+that agrees with the 12-token one-shot, and an EARLY-COLLAPSE decoy from the same
+oracle run that a port threading `[T, hidden]` would match instead. The KV
+binding stores the 512-wide LATENT rather than the 32,768-wide expanded K/V the
+reference stores, and the `ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)`
+identity that makes the two equal is now a case rather than a sentence.
+**W5b-2a is NOT REACHED from any production entry point**, O26 carries that
+disclosure, and it discharges NONE of O15, O16, O17, O23 or O25 — the five
+primitives now have one assembly point instead of five dead ends, and that
+assembly point is itself unreached.
+
 **Nothing FORWARDS** (O10's remaining half): the FORWARD still refuses by name
-and W5b-2 ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it —
-the decoder layer, the mHC stream threading, `Glm5NextTextModel::Forward` and
-the binding to `MakeGlm5NextKVCache`, which is the Cache object W5b-1's
-reference has no equivalent of. The
+and W5b-2b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it —
+the weight bridge for the KDA, MoE, dense-MLP and mHC arms, whose routed expert
+banks are ~1,150 GiB in f32 across the 42 sparse layers and therefore need an
+on-demand per-expert decode rather than four more `BridgeDsaLayer`s, plus the
+engine binding from `ModelForwardInput` to `TextModelForward`. The
 KV-CACHE SPEC is NOT part of that debt any more — W5
 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) publishes it through
 the production `make_kv_cache` hook, as the paragraph below records. No GPU gate

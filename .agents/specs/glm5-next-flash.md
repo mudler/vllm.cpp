@@ -3049,6 +3049,12 @@ Debts this row carries, each visible rather than waived:
   did NOT do, named so the next wave does not have to infer it.**
 
   - **No materialized load, and therefore no peak RSS, no token and no speed.**
+    **The first clause of this bullet stopped being true on 2026-08-30 and O28 is
+    the corrected surface**; it is kept as the measurement W5c made rather than
+    rewritten, the way O5 and O18 keep theirs. A materialized load of this
+    artifact now exists on `dgx:gpu0`
+    ([#2343](https://github.com/mudler/vllm.cpp/issues/2343)); peak RSS, a token
+    and a speed number still do not.
     The load was driven at the staged artifact HEADERS ONLY: all four shards
     open, the config resolves, and all 1383 backbone tensor names resolve at 41
     MB peak RSS. A materializing load WAS attempted on this box and STOPPED at
@@ -3387,6 +3393,89 @@ Debts this row carries, each visible rather than waived:
   checker change, which AGENTS.md `## Changing the rules or a checker` routes to
   its own row, spec and red-before.
 
+- **O28 — THE ENGINE CANNOT RUN THIS MODEL, and the reason is a guard ABOVE this
+  row's hook rather than anything in it.** Measured on `dgx:gpu0` 2026-08-30 by
+  driving the production C ABI at the staged artifact.
+  [#2343](https://github.com/mudler/vllm.cpp/issues/2343).
+
+  **What ran.** `vllm-cli --model .../GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
+  --device cpu --prompt "The capital of France is" --max-tokens 8`, from a
+  `vllm-cli` built at `349df8e9a` in the leased container (Ubuntu 24.04, 20
+  cores, 119 GiB total, ~85 GiB free at start), the shards read from the CIFS
+  `/workspace` share.
+
+  **THE LOAD SUCCEEDED, and that is the first materialized load of this model
+  that has ever happened.** All four shards opened, the tower materialized, and
+  the engine sized its caches:
+
+  ```text
+  INFO auto-fit max_model_len: reduced from 1048576 to 8192 to fit the KV cache
+       (256 blocks x 32 tokens).
+  INFO recurrent-state budget: reduced max_num_seqs from 32 to 1. The KV pool
+       (256 blocks) holds 1 unified pages of 4288 tokens (one page = one
+       4390912-byte GDN state), and each sequence owns 1 of them.
+  vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)
+  ```
+
+  **THE FIRST STEP THREW, one level above this row's hook:**
+
+  ```text
+  engine-fatal: EngineCore busy loop threw: vt: model forward: 22 KV cache(s)
+  from 2 published group(s) reached this forward, first
+  'model.layers.3.self_attn.attn', with block tables gathered for 3 of 3
+  published group(s), and no registered forward consumes a cache set keyed by
+  layer name. Refusing rather than discarding an allocated KV topology in
+  silence (row KV-DSV4-MULTICACHE W5 owns the consuming forward; #1925, #2068)
+  ```
+
+  `vllm-cli: completion failed (status 3)`. **No token was generated and none is
+  claimed.**
+
+  **This is the `input.multi_kv != nullptr` guard at the TOP of
+  `ModelRegistry::Forward`**, landed by KV-DSV4-MULTICACHE W3
+  ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)). It fires for ANY
+  model that publishes a multi-cache topology, BEFORE dispatch to that model's
+  `forward` hook, and GLM-5.3-Flash publishes three groups (W5,
+  [#2223](https://github.com/mudler/vllm.cpp/issues/2223)). It is not a defect in
+  W5b-2b and W5b-2b cannot close it: the consuming forward is that row's.
+
+  **WHAT THIS DOES AND DOES NOT DO TO O27.** O27's discharge stands in the letter
+  it was made in — `ModelRegistry::Forward` dispatches to
+  `ForwardGlm5NextForConditionalGeneration` when `multi_kv` is null, the focused
+  gate enters through that entry point, and deleting the production call site
+  reds it at 11 of 118 assertions. What is now MEASURED and was not before is
+  that the ENGINE path stops above it, so **O27 must not be read as "a user can
+  generate text with this model"**. It cannot. Two guards stand between the
+  registration and a token, and only one of them is this row's: the `multi_kv`
+  guard here, and this row's own device-arm and ragged-batching refusals.
+
+  **W5b-2b LANDED TWO SENTENCES THIS MAKES FALSE, and they were in PRODUCT
+  OUTPUT.** `docs/FEATURES.md` said "LOADS AND FORWARDS on `--device cpu`, one
+  sequence at a time" and `docs/USAGE.md` said "A `glm5next` file LOADS and
+  FORWARDS, on the CPU device, one sequence at a time". Both were written from
+  the focused gate, which is exactly the reading this measurement corrects, and
+  both are repaired in the same change that records the measurement — a record
+  correction that leaves the lie in product output is not a correction.
+
+  **WHAT O7 KEEPS AND WHAT IT LOSES.** O7 and the `docs/USAGE.md` weights row
+  both said "No materialized load, peak RSS, token or speed number exists for
+  this artifact". The FIRST clause is now false and is corrected in place. The
+  rest stands: **peak RSS was NOT sampled** — the staging script did not measure
+  it, which is a defect in the instrument and not a property of the run — and no
+  token and no speed number exists. Load plus engine init took under 26 minutes
+  wall (`04:10:07` to the refusal at `04:36:32`), which is a duration and not a
+  throughput number and must not be quoted as one.
+
+  **THREE INSTRUMENT DEFECTS were found and fixed on the way, recorded because
+  each one produced a job that looked like a product result.** The first attempt
+  died at `rc=127` because `/usr/bin/time` is not installed in the leased
+  container, so the build never started. The second died in cmake because
+  `/tmp/b` still held a cache keyed to the previous attempt's source path — the
+  reused-build-dir shape — and cmake refused, which is the good outcome only
+  because it refused. Both are fixed in the staging script. The third is open:
+  the script does not sample RSS, so the peak this row owes did not come out of
+  a run that would otherwise have produced it.
+
 ## Now
 
 `ACTIVE`, 2026-08-30. **`ModelRegistry::Forward` reaches this model.** W5b-2b
@@ -3414,6 +3503,16 @@ own order and what bounds the peak at one expert. The second piece is
 and the hook follows the `NemotronHForCausalLM` / `KimiLinearForCausalLM`
 full-prefix pattern with two narrow refusals of its own — a multi-request step
 and a non-CPU queue.
+
+**IT LOADS, AND THE ENGINE STILL CANNOT RUN IT — measured, not assumed.** Driven
+at the staged 101.2535 GiB artifact on `dgx:gpu0` on 2026-08-30
+([#2343](https://github.com/mudler/vllm.cpp/issues/2343)), all four shards load,
+the tower materializes and the engine sizes its caches; the FIRST step then
+throws at the `input.multi_kv` guard at the TOP of `ModelRegistry::Forward`,
+which KV-DSV4-MULTICACHE W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068))
+landed and which fires for ANY multi-cache model before dispatch to its hook.
+**No token was generated.** O28 carries the run, the two product sentences W5b-2b
+landed that it falsifies, and the three staging-script defects found on the way.
 
 **O27 records what that discharges and what it does not.** The reachability
 halves of **O15, O16, O17, O23, O25 and O26 are DISCHARGED**: the chain from

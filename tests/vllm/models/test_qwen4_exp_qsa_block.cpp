@@ -339,7 +339,7 @@ BlockRun RunCase(const Case& c, const Qwen4ExpQsaWeights& w, const Qwen4ExpParam
     r.logits.assign(static_cast<size_t>(c.seq * r.nb), 0.0f);
     Tensor t_lg = MakeT(r.logits.data(), DType::kF32, {c.seq, r.nb});
     vllm::Qwen4ExpQsaSelection sel = vllm::Qwen4ExpQsaIndex(
-        d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t,
+        d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t.index_key,
         vllm::dense_attn::ResidentWeight(d, w.idx_k_norm, {ID}), t_cos, t_sin, t_len, c.seq,
         /*round_intermediates_to_bf16=*/true, &t_lg);
     const int64_t topk = p.qsa.block_topk();
@@ -394,7 +394,7 @@ TEST_CASE("qwen4_exp qsa block: the composed indexer's LOGITS match the oracle B
     const int64_t nb = c->seq / p.qsa.compress_ratio;
     std::vector<float> logits(static_cast<size_t>(c->seq * nb), 0.0f);
     Tensor t_lg = MakeT(logits.data(), DType::kF32, {c->seq, nb});
-    vllm::Qwen4ExpQsaIndex(d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t,
+    vllm::Qwen4ExpQsaIndex(d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t.index_key,
                            vllm::dense_attn::ResidentWeight(d, w.idx_k_norm, {ID}), t_cos, t_sin,
                            t_len, c->seq, /*round_intermediates_to_bf16=*/true, &t_lg);
 
@@ -663,7 +663,7 @@ TEST_CASE("qwen4_exp qsa block: the block's consumer is a GATHER, not a mask") {
     std::vector<int32_t> lens(1, static_cast<int32_t>(kv));
     Tensor t_len = MakeT(lens.data(), DType::kI32, {1});
     vllm::Qwen4ExpQsaSelection s = vllm::Qwen4ExpQsaIndex(
-        d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, clean.t,
+        d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, clean.t.index_key,
         vllm::dense_attn::ResidentWeight(d, w.idx_k_norm, {ID}), t_cos, t_sin, t_len, kv, true);
     sel_ids.assign(s.block_ids.Ptr<int32_t>(), s.block_ids.Ptr<int32_t>() + topk);
   }
@@ -805,6 +805,306 @@ TEST_CASE("qwen4_exp qsa block: the released config past 2048 tokens is genuinel
   for (float v : out) CHECK(std::isfinite(v));
 }
 
+// ── 5b. THE PAGED CONSUMER (W5d-3, #2249 item 2) ────────────────────────────
+
+namespace {
+
+// The paged K/V the ENGINE allocates, laid out as the runner lays it out: the
+// FlashAttention buffer `[num_pages, 2, kv_block_size, num_kv_heads, head_dim]`
+// that `dense_attn::KvSlice` unbinds into the two rank-4 K and V views.
+//
+// EVERY ELEMENT STARTS AS NaN, and that is the instrument rather than hygiene.
+// A correct read addresses exactly the rows this step's slot mapping wrote; any
+// other row — an unnamed physical page, or the unused tail of the last named one
+// — is not a number, so a mis-paged read cannot come back plausible. It is the
+// same discriminator the gather-vs-mask case one section up uses, doing a second
+// job: there `0.0f * NaN` convicts a mask, here it convicts a wrong ADDRESS.
+struct PagedCaches {
+  std::vector<uint16_t> buf;        // the whole flash cache, NaN-filled
+  std::vector<uint16_t> index_key;  // the indexer side cache, STILL CONTIGUOUS
+  std::vector<int32_t> table;       // [1, pages] logical page -> physical page
+  std::vector<int64_t> slots;       // [T] i64 destination slot per new token
+  vllm::Qwen4ExpQsaPagedCaches t;
+
+  PagedCaches(int64_t num_pages, int64_t page, int64_t hkv, int64_t dh, int64_t idx_d,
+              int64_t max_kv, const std::vector<int32_t>& block_table)
+      : buf(static_cast<size_t>(num_pages * 2 * page * hkv * dh), vt::F32ToBF16(std::numeric_limits<float>::quiet_NaN())),
+        index_key(static_cast<size_t>(max_kv * idx_d), 0),
+        table(block_table) {
+    t.kv.data = buf.data();
+    t.kv.dtype = DType::kBF16;
+    t.kv.num_blocks = num_pages;
+    t.kv.block_size = page;
+    t.kv.num_kv_heads = hkv;
+    t.kv.head_size = dh;
+    t.block_table = MakeT(table.data(), DType::kI32,
+                          {1, static_cast<int64_t>(table.size())});
+    t.index_key = MakeT(index_key.data(), DType::kBF16, {max_kv, idx_d});
+  }
+
+  // The runner's own slot arithmetic: `block * block_size + offset`, for the T
+  // tokens that land at logical positions [past_len, past_len + T).
+  void SetSlots(int64_t past_len, int64_t T, const std::vector<int32_t>& read_table) {
+    const int64_t page = t.kv.block_size;
+    slots.resize(static_cast<size_t>(T));
+    for (int64_t i = 0; i < T; ++i) {
+      const int64_t pos = past_len + i;
+      slots[static_cast<size_t>(i)] =
+          static_cast<int64_t>(read_table[static_cast<size_t>(pos / page)]) * page + pos % page;
+    }
+    t.slot_mapping = MakeT(slots.data(), DType::kI64, {T});
+  }
+};
+
+}  // namespace
+
+TEST_CASE("qwen4_exp qsa block: the PAGED consumer serves the cache the engine allocates") {
+  // THE GAP THIS CLOSES, in #2249's own words: "`Qwen4ExpQsaCaches` is contiguous
+  // `[max_kv, ...]`; `MakeQwen4ExpKVCache` publishes PAGED specs. The block landed
+  // by W5b-5 reads the contiguous form, so nothing can serve from the cache the
+  // engine actually allocates."
+  //
+  // THE BLOCK TABLE IS DELIBERATELY NOT THE IDENTITY, AND IT NAMES MORE THAN ONE
+  // PAGE. Under `logical i -> physical i` a paged read and a contiguous read
+  // return the same answer for every input, so an identity table would make this
+  // case prove nothing at all — it would pass over a body that ignored the table.
+  // `{5, 3, 7}` shares no fixed point with `{0, 1, 2}`, so the three pages an
+  // identity-reading body would touch are exactly the three this one never
+  // writes, and they stay NaN.
+  //
+  // THE LAST PAGE IS PARTIAL. 23 tokens over pages of 8 fill the third page's
+  // rows 0..6 and leave row 7 NaN, so a body that reads a full page past the
+  // visible length reads a NaN rather than a stale-but-finite value.
+  constexpr double kOutTol = 3e-2;
+  const Qwen4ExpParams p = GoldenParams();
+  const Qwen4ExpQsaWeights w = GoldenWeights(DType::kBF16);
+  const Case& c = kOverBudget;  // 23 tokens: over budget, so the gather is sparse
+  const int64_t H = p.hidden_size, rot = p.rotary_dim;
+  const int64_t Hkv = p.num_key_value_heads, Dh = p.head_dim, ID = p.qsa.head_dim;
+  const int64_t kPage = 8;       // a multiple of compress_ratio, as the KV spec requires
+  const int64_t kNumPages = 8;   // more physical pages than the sequence needs
+  const std::vector<int32_t> kPermuted{5, 3, 7};
+  const std::vector<int32_t> kIdentity{0, 1, 2};
+  REQUIRE(c.seq == 23);
+  REQUIRE(kPage % p.qsa.compress_ratio == 0);
+
+  Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  RopeTables rope = BuildRope(c);
+  std::vector<uint16_t> hidden = Bf16Of(c.hidden, c.seq * H);
+  std::vector<int32_t> positions(static_cast<size_t>(c.seq));
+  for (int64_t t = 0; t < c.seq; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  Tensor t_h = MakeT(hidden.data(), DType::kBF16, {c.seq, H});
+  Tensor t_p = MakeT(positions.data(), DType::kI32, {c.seq});
+  Tensor t_cs = MakeT(rope.packed.data(), DType::kBF16, {c.seq, rot});
+  Tensor t_cos = MakeT(rope.cos.data(), DType::kF32, {c.seq, rot});
+  Tensor t_sin = MakeT(rope.sin.data(), DType::kF32, {c.seq, rot});
+
+  // The paged run, over a permuted table.
+  PagedCaches paged(kNumPages, kPage, Hkv, Dh, ID, c.seq, kPermuted);
+  paged.SetSlots(/*past_len=*/0, c.seq, kPermuted);
+  int64_t paged_visited = 0;
+  vllm::Qwen4ExpQsaBlockOutput po = vllm::RunQwen4ExpQsaBlockPaged(
+      d, w, p, t_h, t_p, t_cs, t_cos, t_sin, paged.t, /*past_len=*/0, &paged_visited);
+  const std::vector<float> got = F32Of(po.tensor.Ptr<uint16_t>(), c.seq * H);
+
+  // 1. AGAINST THE ORACLE. The expectation is `Qwen4ExpTextAttention.forward`'s
+  //    own output at the lane pin, the same golden the contiguous case answers
+  //    to — an independently computed one, not a value read back from anything
+  //    under test here.
+  // FINITENESS FIRST, AND THE ORDER IS NOT COSMETIC. `MaxRelDiff` folds with
+  // `std::max`, and `std::max(x, NaN)` returns `x` — so a run that comes back
+  // ALL NaN reports a relative difference of exactly 0 and sails through the
+  // bound below. That is a tolerance absorbing the defect in its purest form,
+  // and it was MEASURED here rather than feared: with the paged address
+  // resolution disarmed, every one of the 1472 outputs was NaN and `rel` still
+  // printed 0. The finiteness loop is what convicts, and the bound is what says
+  // the finite answer is the ORACLE's.
+  for (float v : got) CHECK(std::isfinite(v));
+  const double rel = MaxRelDiff(got, c.out, c.seq * H);
+  INFO("paged block max relative difference vs the oracle ", rel);
+  CHECK(rel < kOutTol);
+
+  // 2. AGAINST THE CONTIGUOUS ARM, BIT FOR BIT, WITH NO TOLERANCE. Paging moves
+  //    WHERE a row lives and nothing else: the same logical rows are visited in
+  //    the same ascending order and reduced in the same f32 order, so the bf16
+  //    stores must be EQUAL, not close. A tolerance here would absorb exactly the
+  //    class of defect this case exists to find — a read one row or one page off
+  //    lands inside a bf16-sized bound often enough to pass one.
+  Caches contig(c.seq, Hkv, Dh, ID);
+  int64_t contig_visited = 0;
+  vllm::Qwen4ExpQsaBlockOutput co = vllm::RunQwen4ExpQsaBlock(
+      d, w, p, t_h, t_p, t_cs, t_cos, t_sin, contig.t, /*past_len=*/0, &contig_visited);
+  const uint16_t* pbits = po.tensor.Ptr<uint16_t>();
+  const uint16_t* cbits = co.tensor.Ptr<uint16_t>();
+  int64_t differing = 0;
+  for (int64_t i = 0; i < c.seq * H; ++i) differing += (pbits[i] != cbits[i]) ? 1 : 0;
+  INFO("paged vs contiguous differing bf16 words ", differing, " of ", c.seq * H);
+  CHECK(differing == 0);
+  // The same rows, therefore the same count of key-row reads. `keys_visited` is
+  // counted AT THE READ (see the op's contract), so this says the paged walk did
+  // the same amount of work and not merely that it agreed.
+  CHECK(paged_visited == contig_visited);
+  CHECK(paged_visited > 0);
+
+  // 3. THE CONTROL: THE BLOCK TABLE IS ACTUALLY CONSULTED. Same inputs, same
+  //    writes — the slot mapping still stores at the permuted pages — but the
+  //    table handed to the READ is the identity. If the consumer ignored the
+  //    table, or resolved a physical page any other way, this run would agree
+  //    with the one above. It reads three never-written pages instead, so it
+  //    comes back NaN, and the case fails if it does not.
+  PagedCaches misread(kNumPages, kPage, Hkv, Dh, ID, c.seq, kIdentity);
+  misread.SetSlots(/*past_len=*/0, c.seq, kPermuted);  // write permuted, read identity
+  vllm::Qwen4ExpQsaBlockOutput mo = vllm::RunQwen4ExpQsaBlockPaged(
+      d, w, p, t_h, t_p, t_cs, t_cos, t_sin, misread.t, /*past_len=*/0);
+  const std::vector<float> mis = F32Of(mo.tensor.Ptr<uint16_t>(), c.seq * H);
+  int64_t nan_rows = 0;
+  for (int64_t t = 0; t < c.seq; ++t) {
+    bool row_nan = false;
+    for (int64_t j = 0; j < H; ++j)
+      row_nan = row_nan || std::isnan(mis[static_cast<size_t>(t * H + j)]);
+    nan_rows += row_nan ? 1 : 0;
+  }
+  INFO("identity-table control: NaN rows ", nan_rows, " of ", c.seq);
+  CHECK(nan_rows == c.seq);
+}
+
+TEST_CASE("qwen4_exp qsa block: a PAGED decode step lands in the right page row") {
+  // `past_len > 0` over a paged cache is where two off-by-ones meet: the slot the
+  // new K/V is STORED at and the page the consumer READS the prefix from. The
+  // prefill case above cannot see either — every token is written in one call
+  // from position 0 — and the golden alone would not either, because a decode
+  // that wrote one row off still produces finite, plausible output. The NaN fill
+  // is what turns "plausible" into "not a number": row 7 of the last page is the
+  // only row the 23-token sequence leaves unwritten, and it is exactly the row a
+  // partial-final-page defect reaches for.
+  constexpr double kOutTol = 3e-2;
+  const Qwen4ExpParams p = GoldenParams();
+  const Qwen4ExpQsaWeights w = GoldenWeights(DType::kBF16);
+  const Case& c = kOverBudget;
+  const int64_t H = p.hidden_size, rot = p.rotary_dim;
+  const int64_t Hkv = p.num_key_value_heads, Dh = p.head_dim, ID = p.qsa.head_dim;
+  const int64_t kPage = 8;
+  const std::vector<int32_t> kPermuted{5, 3, 7};
+  Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  RopeTables rope = BuildRope(c);
+  std::vector<uint16_t> hidden = Bf16Of(c.hidden, c.seq * H);
+  std::vector<int32_t> positions(static_cast<size_t>(c.seq));
+  for (int64_t t = 0; t < c.seq; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  Tensor t_cs = MakeT(rope.packed.data(), DType::kBF16, {c.seq, rot});
+  Tensor t_cos = MakeT(rope.cos.data(), DType::kF32, {c.seq, rot});
+  Tensor t_sin = MakeT(rope.sin.data(), DType::kF32, {c.seq, rot});
+
+  PagedCaches paged(8, kPage, Hkv, Dh, ID, c.seq, kPermuted);
+  {  // prefill of the first seq-1 tokens — which STOPS mid-page, at row 6 of the
+     // third page, so the decode token below is the one that fills row 6..
+     // (22 tokens: pages 0 and 1 full, page 2 rows 0..5)
+    paged.SetSlots(/*past_len=*/0, c.seq - 1, kPermuted);
+    Tensor t_hh = MakeT(hidden.data(), DType::kBF16, {c.seq - 1, H});
+    Tensor t_pp = MakeT(positions.data(), DType::kI32, {c.seq - 1});
+    vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_hh, t_pp, t_cs, t_cos, t_sin, paged.t,
+                                   /*past_len=*/0);
+  }
+  int64_t visited = 0;
+  vllm::Qwen4ExpQsaBlockOutput o;
+  {  // one decode token
+    paged.SetSlots(/*past_len=*/c.seq - 1, 1, kPermuted);
+    Tensor t_hh = MakeT(hidden.data() + (c.seq - 1) * H, DType::kBF16, {1, H});
+    Tensor t_pp = MakeT(positions.data() + (c.seq - 1), DType::kI32, {1});
+    o = vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_hh, t_pp, t_cs, t_cos, t_sin, paged.t,
+                                       /*past_len=*/c.seq - 1, &visited);
+  }
+  const std::vector<float> got = F32Of(o.tensor.Ptr<uint16_t>(), H);
+  // Finiteness before the bound, for the reason the prefill case above states:
+  // `MaxRelDiff` cannot see a NaN.
+  for (float v : got) CHECK(std::isfinite(v));
+  const double rel = MaxRelDiff(got, c.out + (c.seq - 1) * H, H);
+  INFO("paged decode-step max relative difference ", rel, ", keys_visited ", visited);
+  CHECK(rel < kOutTol);
+  CHECK(visited > 0);
+}
+
+TEST_CASE("qwen4_exp qsa block: the PAGED arm refuses by name") {
+  const Qwen4ExpParams p = GoldenParams();
+  const Qwen4ExpQsaWeights w = GoldenWeights(DType::kBF16);
+  const Case& c = kSubBudget;
+  const int64_t H = p.hidden_size, rot = p.rotary_dim;
+  const int64_t Hkv = p.num_key_value_heads, Dh = p.head_dim, ID = p.qsa.head_dim;
+  const std::vector<int32_t> table{2, 0, 1};
+  Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  RopeTables rope = BuildRope(c);
+  std::vector<uint16_t> hidden = Bf16Of(c.hidden, c.seq * H);
+  std::vector<int32_t> positions(static_cast<size_t>(c.seq));
+  for (int64_t t = 0; t < c.seq; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  Tensor t_h = MakeT(hidden.data(), DType::kBF16, {c.seq, H});
+  Tensor t_p = MakeT(positions.data(), DType::kI32, {c.seq});
+  Tensor t_cs = MakeT(rope.packed.data(), DType::kBF16, {c.seq, rot});
+  Tensor t_cos = MakeT(rope.cos.data(), DType::kF32, {c.seq, rot});
+  Tensor t_sin = MakeT(rope.sin.data(), DType::kF32, {c.seq, rot});
+
+  SUBCASE("an fp8 paged cache, which the QSA consumer has no dequantising read for") {
+    PagedCaches pc(4, 8, Hkv, Dh, ID, c.seq, table);
+    pc.SetSlots(0, c.seq, table);
+    pc.t.kv.dtype = DType::kI8;
+    pc.t.kv.fp8_kind = vt::Fp8KVCacheDataType::kFp8E4M3;
+    CHECK_THROWS_WITH_AS(vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_h, t_p, t_cs, t_cos, t_sin,
+                                                        pc.t, /*past_len=*/0),
+                         doctest::Contains("fp8"), std::exception);
+  }
+  SUBCASE("a KV page size the compress ratio does not divide") {
+    PagedCaches pc(4, 6, Hkv, Dh, ID, c.seq, table);
+    pc.SetSlots(0, c.seq, table);
+    CHECK_THROWS_WITH_AS(vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_h, t_p, t_cs, t_cos, t_sin,
+                                                        pc.t, /*past_len=*/0),
+                         doctest::Contains("multiple of"), std::exception);
+  }
+  SUBCASE("a multi-request block table, which this block cannot serve yet") {
+    PagedCaches pc(4, 8, Hkv, Dh, ID, c.seq, table);
+    pc.SetSlots(0, c.seq, table);
+    pc.t.block_table = MakeT(pc.table.data(), DType::kI32, {3, 1});
+    CHECK_THROWS_WITH_AS(vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_h, t_p, t_cs, t_cos, t_sin,
+                                                        pc.t, /*past_len=*/0),
+                         doctest::Contains("ONE sequence"), std::exception);
+  }
+  SUBCASE("a block table naming fewer tokens than the sequence holds") {
+    std::vector<int32_t> one{2};
+    PagedCaches pc(4, 8, Hkv, Dh, ID, c.seq, one);
+    pc.SetSlots(0, c.seq, std::vector<int32_t>{2, 2});
+    CHECK_THROWS_WITH_AS(vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_h, t_p, t_cs, t_cos, t_sin,
+                                                        pc.t, /*past_len=*/0),
+                         doctest::Contains("fewer tokens than kv_len"), std::exception);
+  }
+  SUBCASE("a slot mapping of the wrong length") {
+    PagedCaches pc(4, 8, Hkv, Dh, ID, c.seq, table);
+    pc.SetSlots(0, c.seq - 1, table);
+    CHECK_THROWS_WITH_AS(vllm::RunQwen4ExpQsaBlockPaged(d, w, p, t_h, t_p, t_cs, t_cos, t_sin,
+                                                        pc.t, /*past_len=*/0),
+                         doctest::Contains("slot_mapping"), std::exception);
+  }
+  SUBCASE("a kv_block_size with no page table, at the op") {
+    // The two travel together or the paged read silently becomes a contiguous
+    // one over a strided view — wrong rows, no message.
+    std::vector<uint16_t> kv(static_cast<size_t>(c.seq * Hkv * Dh), 0);
+    std::vector<uint16_t> ob(static_cast<size_t>(c.seq * p.num_attention_heads * Dh), 0);
+    std::vector<int32_t> ids(static_cast<size_t>(c.seq * p.qsa.block_topk()), -1);
+    std::vector<int32_t> lens(static_cast<size_t>(c.seq), 1);
+    Tensor t_k = MakeT(kv.data(), DType::kBF16, {c.seq, Hkv, Dh});
+    Tensor t_o = MakeT(ob.data(), DType::kBF16, {c.seq, p.num_attention_heads, Dh});
+    Tensor t_q = MakeT(ob.data(), DType::kBF16, {c.seq, p.num_attention_heads, Dh});
+    Tensor t_i = MakeT(ids.data(), DType::kI32, {c.seq, p.qsa.block_topk()});
+    Tensor t_l = MakeT(lens.data(), DType::kI32, {c.seq});
+    vt::Qwen4ExpQsaAttnArgs a;
+    a.scale = 1.0f;
+    a.compress_ratio = p.qsa.compress_ratio;
+    a.kv_block_size = 8;  // set, with no table
+    CHECK_THROWS_WITH_AS(
+        vt::Qwen4ExpQsaGatherAttention(q, t_o, t_q, t_k, t_k, t_i, t_l, a),
+        doctest::Contains("TOGETHER"), std::exception);
+  }
+}
+
 // ── 6. REFUSALS ─────────────────────────────────────────────────────────────
 
 TEST_CASE("qwen4_exp qsa block: refuses by name rather than computing something else") {
@@ -917,7 +1217,7 @@ TEST_CASE("qwen4_exp qsa block: refuses by name rather than computing something 
     std::vector<float> lg(static_cast<size_t>(c.seq), 0.0f);
     Tensor bad = MakeT(lg.data(), DType::kF32, {c.seq, 1});
     CHECK_THROWS_WITH_AS(
-        vllm::Qwen4ExpQsaIndex(d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t,
+        vllm::Qwen4ExpQsaIndex(d, p.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t.index_key,
                                vllm::dense_attn::ResidentWeight(d, w.idx_k_norm,
                                                                 {p.qsa.head_dim}),
                                t_cos, t_sin, t_len, c.seq, true, &bad),
@@ -933,7 +1233,7 @@ TEST_CASE("qwen4_exp qsa block: refuses by name rather than computing something 
     for (int64_t t = 0; t < c.seq; ++t) lens[static_cast<size_t>(t)] = static_cast<int32_t>(t + 1);
     Tensor t_len = MakeT(lens.data(), DType::kI32, {c.seq});
     CHECK_THROWS_WITH_AS(
-        vllm::Qwen4ExpQsaIndex(d, bad.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t,
+        vllm::Qwen4ExpQsaIndex(d, bad.qsa, static_cast<float>(p.rms_norm_eps), t_q3, caches.t.index_key,
                                vllm::dense_attn::ResidentWeight(d, w.idx_k_norm,
                                                                 {p.qsa.head_dim}),
                                t_cos, t_sin, t_len, c.seq, true),

@@ -364,6 +364,38 @@ struct MultiKvCacheIndex {
   const std::vector<int32_t>* group_ids = nullptr;
   const std::vector<int32_t>* layer_indices = nullptr;
 
+  // MODEL-MM-QWEN4-EXP W5c-2 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249)
+  // item 3): ONE GATHERED BLOCK TABLE PER PUBLISHED GROUP, indexed by GROUP ID
+  // rather than parallel to `attn_kv` above.
+  //
+  // WHY THE CHANNEL NEEDED A FOURTH VECTOR. W3 made a cache addressable by NAME
+  // and a runner allocate every published one. It did not make a cache
+  // READABLE: a page-addressed cache needs the map from a sequence's LOGICAL
+  // position to the PHYSICAL page holding it, and that map is the group's block
+  // table. Before this, `GPUModelRunner::gather_block_table` was called for
+  // exactly two group ids — the target attention group and the recurrent group
+  // — so a third group's table never left the runner and its cache was
+  // allocated and unread. `qwen4_exp` publishes exactly such a third group: the
+  // QSA indexer side cache, an `MLAAttentionSpec` at `compress_ratio` 4.
+  //
+  // UPSTREAM DOES NOT HAVE A "TWO NAMED GROUPS" SHAPE AT ALL. Its per-group
+  // metadata loop runs over `enumerate(kv_cache_groups)` and hands every group
+  // its own table — `cm.block_table_tensor = _get_block_table(kv_cache_gid)`
+  // (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin 5559679229), with
+  // `_get_block_table` (`:2318-2334`) being this tree's `gather_block_table`.
+  // So this field is the mirror of an existing upstream loop, not a new channel.
+  //
+  // INDEXED BY GROUP ID, and that is deliberate: the other three vectors are
+  // parallel to `attn_kv` because a CACHE is what they describe, while a block
+  // table belongs to a GROUP and every layer in that group shares it — which is
+  // upstream's own fan-out ("make layers in the same group share the same
+  // metadata", `:2551-2552`). Entry `g` is group `g`'s row-major
+  // `[num_reqs, group_block_table_cols[g]]` table. Both vectors are sized to the
+  // published group count and owned by the runner, valid for the forward's
+  // duration. NULL on every uniform topology, exactly like the three above.
+  const std::vector<std::vector<int32_t>>* group_block_tables = nullptr;
+  const std::vector<int32_t>* group_block_table_cols = nullptr;
+
   // How many caches arrived. 0 when the channel is empty.
   size_t size() const;
   // How many DISTINCT published groups they came from.
@@ -375,6 +407,25 @@ struct MultiKvCacheIndex {
   // name up once per layer per role, so an index structure would be premature.
   // Recorded as a decision rather than left as an oversight.
   int64_t Find(std::string_view layer_name) const;
+
+  // How many groups the model PUBLISHED, which is not `num_groups()`: that one
+  // counts the distinct groups the caches in `attn_kv` came from, and a
+  // recurrent group contributes no entry there. `qwen4_exp` publishes THREE and
+  // `num_groups()` answers two, so a diagnostic that used it as the denominator
+  // would report a full gather as partial. 0 when the channel is empty.
+  int num_published_groups() const;
+
+  // How many published groups actually carry a gathered block table. 0 when the
+  // channel is empty AND when a step has not run yet, which is why the runner
+  // publishes the pointers once and refills the vectors every step.
+  int num_group_block_tables() const;
+
+  // Group `group_id`'s row-major `[num_reqs, *num_cols]` block table, or
+  // `nullptr` when the group has none (out of range, or no step has run).
+  // `*num_cols` is written in EVERY case — 0 on the null answer — so a caller
+  // that forgets to check the pointer cannot index a stale width.
+  const std::vector<int32_t>* BlockTableForGroup(int group_id,
+                                                 int* num_cols) const;
 };
 
 // One MRV2 forward invocation. References stay valid for the duration of the

@@ -1010,8 +1010,8 @@ class RatchetTests(unittest.TestCase):
     def test_backend_tenstorrent_gdn_left_the_gated_population_cleanly(self):
         # BACKEND-TENSTORRENT-GDN (#1715) entered the runnable population on
         # 2026-08-22 as inherited credit while its spec was committed and its
-        # W1/W2 waves were still owed. The row's code landed (W1 `4d165d130`,
-        # W2 `337f6e07a`), the Qwen3_5 wiring row made the family
+        # W1/W2 waves were still owed. The row's code landed (W1 `34fde3502`,
+        # W2 `c85af0aaf`), the Qwen3_5 wiring row made the family
         # production-reached, and the record-only close moved the row
         # ACTIVE -> DONE. `DONE` is not in GATED_STATES, so it leaves the
         # AUDITED population entirely.

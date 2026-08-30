@@ -521,7 +521,7 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
     # 2026-08-30: -BACKEND-TENSTORRENT-GDN leaves the runnable population: the
-    # row reached DONE (W1 `4d165d130` + W2 `337f6e07a` landed fresh-review
+    # row reached DONE (W1 `34fde3502` + W2 `c85af0aaf` landed fresh-review
     # PASS; the Qwen3_5 family runs production, closing #1715), and a DONE row
     # is outside this lifecycle-scoped population. Re-pinned in the same
     # change that moved the row, as the checker requires. The suites the entry

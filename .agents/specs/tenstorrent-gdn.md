@@ -8,9 +8,9 @@ Qwen3.8 on Tenstorrent, chosen at the 2026-08-22 planning pass.
 ## Now
 
 `DONE` (moved 2026-08-30; claimed 2026-08-22, helper, worktree
-`vllmcpp-tt-gdn`). W1 (`4d165d130`)
+`vllmcpp-tt-gdn`). W1 (`34fde3502`)
 landed the prefill set (kL2Norm, kRmsNormGated, kCausalConv1dFwd, kGdnPrefill —
-chunk_gated_delta_rule adapter, fresh-review PASS) and W2 (`337f6e07a`) landed
+chunk_gated_delta_rule adapter, fresh-review PASS) and W2 (`c85af0aaf`) landed
 the decode set (kCausalConv1dUpdate, kGdnDecode both state_idx forms,
 kGdnStateGather, kGdnStateScatter; device shadows; composed decode chosen over
 chunked by 1.139 vs 3.164 ms/step measurement; steady-state traffic
@@ -465,10 +465,10 @@ commit order proves spec-before-code.
 ## Outcome
 
 `DONE` 2026-08-30. The deliverable — the eight-op GDN chain as native TT
-kernels — landed in two waves, both fresh-review PASS: W1 `4d165d130`
+kernels — landed in two waves, both fresh-review PASS: W1 `34fde3502`
 (prefill: kL2Norm, kRmsNormGated, kCausalConv1dFwd, kGdnPrefill behind the
 varlen+state-permute adapter over tt-metal's
-`ttnn::transformer::chunk_gated_delta_rule`) and W2 `337f6e07a` (decode:
+`ttnn::transformer::chunk_gated_delta_rule`) and W2 `c85af0aaf` (decode:
 kCausalConv1dUpdate, kGdnDecode both `state_idx` forms, kGdnStateGather,
 kGdnStateScatter, device shadows). Oracle: our own CPU f32 arm, ambient
 33/33 cases · 2124/2124 assertions (leg0 32/33 carried only the

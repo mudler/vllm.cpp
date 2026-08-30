@@ -96,7 +96,10 @@
 
 #include "vllm/model_executor/models/glm5_next_attn.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
+#include "vllm/model_executor/models/glm5_next_kda.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
+#include "vllm/model_executor/models/glm5_next_mhc.h"
+#include "vllm/model_executor/models/glm5_next_moe.h"
 
 namespace vllm::glm5_next {
 
@@ -135,6 +138,46 @@ std::vector<float> DecodeOwnedTensorToF32(
     const OwnedTensor& t, const std::string& what,
     int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
 
+// The f32 host mirror of ONE leading-axis row of `t`, in BYTES, from the shape
+// alone. `HostF32Bytes(t) / t.shape[0]`, stated as its own function because it
+// is the number the per-expert and per-token paths budget with and the two
+// populations the 1 GiB ceiling separates are a WHOLE tensor and a ROW of one.
+int64_t HostF32RowBytes(const OwnedTensor& t);
+
+// Decode a contiguous RANGE of `t`'s leading-axis rows into host f32.
+//
+// ─── WHY A ROW RANGE AND NOT THE TENSOR ──────────────────────────────────────
+//
+// Three tensors of this model cannot be decoded whole on any device this
+// project reaches, and all three are consumed a few rows at a time:
+//
+//   | tensor, published geometry | whole, f32 | one row, f32 |
+//   |---|---:|---:|
+//   | `token_embd.weight` [154880, 4096] | 2.36 GiB | 16 KiB |
+//   | `output.weight` [154880, 4096] | 2.36 GiB | 16 KiB |
+//   | `ffn_up_exps.weight` [288, 2048, 4096] | 9.0 GiB | 32 MiB |
+//
+// A prompt gathers `seq_len` embedding rows of 154,880, a step reads the
+// `lm_head` in chunks, and a token selects 8 experts of 288. Whole-tensor
+// decoding is not "expensive" for any of them; `DecodeOwnedTensorToF32` refuses
+// all three by name at the 1 GiB ceiling, which is that ceiling working.
+//
+// **The ceiling is UNCHANGED and this function is checked against the same
+// one.** It is the RANGE that is checked, so the caller cannot ask for the
+// whole bank through the back door: `first_row = 0, num_rows = 288` on
+// `ffn_up_exps` is 9.0 GiB and is refused by exactly the same arithmetic that
+// refuses the whole tensor.
+//
+// REFUSES BY NAME, in addition to every refusal `DecodeOwnedTensorToF32` has:
+//   * a rank-0 tensor, which has no leading axis to slice;
+//   * a row range outside `[0, shape[0])`;
+//   * a BLOCK-quantized tensor whose row is not a whole number of blocks — the
+//     slice would start mid-block, and a decoder handed a misaligned base
+//     returns plausible values from the wrong scales rather than failing.
+std::vector<float> DecodeOwnedTensorRowsToF32(
+    const OwnedTensor& t, const std::string& what, int64_t first_row,
+    int64_t num_rows, int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
 // One DSA layer's attention weights, mirrored into host f32.
 //
 // **The indexer view is a METHOD and not a member, deliberately.**
@@ -171,10 +214,79 @@ struct BridgedDsaLayer {
 // disagreement, so a geometry that drifted between the config and the file is a
 // named error here rather than a wrong number in the attention block.
 //
-// This is the ONLY entry point. There is no tower-wide form; see the header.
+// This is the ONLY entry point for the DSA arm. There is no tower-wide form;
+// see the header.
 BridgedDsaLayer BridgeDsaLayer(
     const Glm5NextMlaWeights& src, const MlaDims& d, const IndexerDims& id,
     int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
+// ─── THE OTHER FOUR ARMS (W5b-2b) ───────────────────────────────────────────
+//
+// `BridgeDsaLayer` covers the 11 DSA layers' attention. A forward needs four
+// more, and three of them are mechanical: their tensors are the same size class
+// as the DSA layer's and each one is a shape-checked decode. The MoE is the one
+// that is not, and `BridgeMoeLayer` below is where that shows.
+
+// One KDA layer's 15 tensors (`Glm5NextKdaWeights` -> the host reference's
+// `Glm5NextKdaLayerWeights`). Field for field, shape-checked against `d`.
+//
+// 18.5 GiB in f32 for all 34 KDA layers at the published geometry, 0.545 GiB
+// for one — the same size class as a DSA layer's 0.4654 and the same rule
+// applies: bridge one, use it, drop it.
+glm5_next_kda::Glm5NextKdaLayerWeights BridgeKdaLayer(
+    const Glm5NextKdaWeights& src, const glm5_next_kda::Glm5NextKdaDims& d,
+    int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
+// A gated MLP: the dense layers' feed-forward and every sparse layer's SHARED
+// expert. `what` prefixes each refusal, because the two are the same struct at
+// different widths and a message that said only `gate_proj` would not say which.
+DenseMlpWeights BridgeMlp(const Glm5NextMlpWeights& src, int64_t hidden,
+                          int64_t intermediate, const std::string& what,
+                          int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
+// One `Glm5NextTextHyperConnection`'s three tensors. Two per decoder layer.
+HcSite BridgeMhcSite(const Glm5NextMhcWeights& src, const Glm5NextMhcParams& mhc,
+                     int64_t hidden, const std::string& what,
+                     int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
+// The per-expert source `MoeForward` consults, backed by the loader's
+// block-resident banks. See `glm5_next_moe.h` for the arithmetic that makes
+// this the only shape that fits; this class is the implementation of it.
+//
+// It decodes THREE rows per expert — one of `gate_exps`, one of `up_exps`, one
+// of `down_exps` — fuses the first two into the `[2I, H]` gate-first row the
+// seam declares, and holds NOTHING between calls. `decoded()` counts the
+// experts it was asked for, in order, so a gate can assert that only the
+// SELECTED ones were decoded rather than trusting the loop.
+class GgufExpertSource final : public ExpertSource {
+ public:
+  GgufExpertSource(const Glm5NextMoeWeights& src, const MoeDims& d,
+                   const std::string& what,
+                   int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
+  void Expert(int64_t e, std::vector<float>& gate_up,
+              std::vector<float>& down) override;
+
+  // The expert ids this source was asked to decode, in call order. An
+  // instrument, and a cheap one: `num_experts_per_tok` is 8 and a step's
+  // distinct hits are bounded by `n_routed_experts`.
+  const std::vector<int64_t>& decoded() const { return decoded_; }
+
+ private:
+  const Glm5NextMoeWeights* src_;
+  MoeDims d_;
+  std::string what_;
+  int64_t byte_ceiling_;
+  std::vector<int64_t> decoded_;
+};
+
+// One sparse layer's ROUTER, correction bias and shared expert, bridged; the
+// three expert BANKS are deliberately left EMPTY and the caller sets
+// `expert_source`. Bridging them here is what `kBridgeTensorF32ByteCeiling`
+// refuses by name, and rightly: 27.0 GiB per layer against a ~119.63 GiB box.
+MoeLayerWeights BridgeMoeLayer(const Glm5NextMoeWeights& src, const MoeDims& d,
+                               const std::string& what,
+                               int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
 
 }  // namespace vllm::glm5_next
 

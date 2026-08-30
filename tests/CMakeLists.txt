@@ -1164,6 +1164,19 @@ target_include_directories(test_glm5_next_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_include_directories(test_glm5_next_bridge PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
+# GLM-5.3-Flash W5b-2b -- THE ENGINE BINDING and the reachability proof this row
+# has owed since W2 (#2241, spec `## Owed` O15/O16/O17/O23/O25/O26). Every case
+# enters through `ModelRegistry::Forward` on the synthetic `glm5next` miniature,
+# so deleting the `Glm5NextHostForward` call in the registry's forward hook reds
+# the suite. The independently assembled RESIDENT tower is the oracle for the
+# streamed path's composition, and the `lm_head` chunk size is a parameter
+# because at any geometry small enough to run in a test the default gives ONE
+# chunk and the loop would never be entered twice.
+vllm_cpp_add_test(test_glm5_next_forward vllm/models/test_glm5_next_forward.cpp)
+target_include_directories(test_glm5_next_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_forward PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

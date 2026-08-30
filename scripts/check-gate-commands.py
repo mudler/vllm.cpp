@@ -520,14 +520,15 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-ASYNC-LLM",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
-    # 2026-08-22: +BACKEND-TENSTORRENT-GDN enters the runnable population when
-    # its spec lands (#1715). The credit is the PRE-EXISTING suites its
-    # `## Gates` binds -- the full TT suite, the CPU gate, and
-    # `scripts/agent-preflight.sh` -- which run today and genuinely fail on a
-    # broken tree. The row's own doctest cases are still OWED (spec-first,
-    # W1/W2 not implemented), so this is an inherited credit in the exact
-    # shape the #1541 note describes, not a certificate.
-    "BACKEND-TENSTORRENT-GDN",
+    # 2026-08-30: -BACKEND-TENSTORRENT-GDN leaves the runnable population: the
+    # row reached DONE (W1 `4d165d130` + W2 `337f6e07a` landed fresh-review
+    # PASS; the Qwen3_5 family runs production, closing #1715), and a DONE row
+    # is outside this lifecycle-scoped population. Re-pinned in the same
+    # change that moved the row, as the checker requires. The suites the entry
+    # credited (full TT suite, CPU gate, agent-preflight.sh) stay pinned on
+    # the still-live rows that bind them, so no command actually left the
+    # gated population with the row.
+    # (Was: 2026-08-22, +GDN inherited-credit growth when its spec landed.)
     # LTX25-VAE-DEVICE-RESIDENCY (2026-08-25, issue #1451): GROWTH, re-pinned in
     # the same change. `KERNEL-LTX2-VAE` is a NEW row rather than an existing one
     # that changed shape, and it enters the runnable population because its

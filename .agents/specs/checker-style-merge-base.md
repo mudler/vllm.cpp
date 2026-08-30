@@ -90,4 +90,6 @@ description; the red-before captures in the implementer report.
 One PR for spec and implementation (repository default, recorded
 policy). Spec committed before implementation on
 `row/CHECKER-STYLE-MERGE-BASE`. The PR body carries `Closes #2366`, and
-`.agents/issue-index.md` gains its append-only row in the same PR.
+No `.agents/issue-index.md` row: the index is retired upstream by
+`7dc2ef1ea` (ENG-RECORD-CONFLICT-SURFACES W6 — GitHub is the issue
+index), and this PR does not resurrect the file.

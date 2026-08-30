@@ -1,34 +1,23 @@
 #version 450
-// vt_moe_gate_up_swiglu_grouped_tq1_0: FUSED routed-MoE gate+up GEMM + clamped
-// SwiGLU epilogue for TQ1_0 weights, with ON-DEVICE Q8_K activation quantize.
-//
-// OPTIMIZED: fine-grained K-split, activation quantize cache for bcast/gather_k,
-// subgroup reduction, trit extraction helper.
-//
-// One workgroup per output column; 128 lanes split across BOTH blocks and
-// elements within blocks for full utilization.
+// vt_moe_gate_up_swiglu_grouped_tq1_0: OPTIMIZED v2 — multi-column workgroups,
+// packed uint32 weight reads, activation cache, subgroup reduce.
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
+#define VT_TG 512u
 #include "vt_common.glsl"
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#define COLS_PER_WG 4u
 
-layout(constant_id = 0) const uint VT_FUSED_ACT_DT = 2u;  // 0=f32, 2=bf16
+layout(local_size_x = 128, local_size_y = COLS_PER_WG, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint VT_FUSED_ACT_DT = 2u;
+layout(constant_id = 1) const uint VT_FUSED_OUT_DT = 0u;
 
 layout(push_constant) uniform Params {
-  uint m;       // output rows (P = T * top_k)
-  uint n;       // output columns (I = moe_intermediate_size)
-  uint nb;      // K / 256 blocks per row
-  uint e;       // num experts E (weight stride)
-  uint bcast;   // 1 => all rows share activation row 0
-  uint gather_k; // >0 => activation is [T, H], row p reads row p/gather_k
-  uint a_off;   // activation tensor start (f32/bf16, device)
-  uint gw_off;  // gate weight tensor start (TQ1_0)
-  uint uw_off;  // up weight tensor start (TQ1_0)
-  uint eid_off; // expert_ids tensor start (i32)
-  uint out_off; // output tensor start (f32)
-  float limit;  // SwiGLU clamp limit
+  uint m; uint n; uint nb; uint e; uint bcast; uint gather_k;
+  uint a_off; uint gw_off; uint uw_off; uint eid_off; uint out_off;
+  float limit;
 } p;
 
 layout(set = 0, binding = 0, std430) readonly buffer Ab32 { uint v[]; } A32;
@@ -41,11 +30,10 @@ layout(set = 0, binding = 6, std430) readonly buffer Eb { int v[]; } EID;
 layout(set = 0, binding = 7, std430) writeonly buffer Ob32 { uint v[]; } O32;
 layout(set = 0, binding = 8, std430) writeonly buffer Ob16 { uint16_t v[]; } O16;
 
-shared float sm_amax[128];
 shared int q8_cache[8][256];
 shared float d_act_cache[8];
+shared float sm_reduce[512];
 
-// Magic-constant round-to-nearest-even, matching cpu_quant_act.cpp NearestInt.
 int vt_nearest_int(precise float fval) {
   precise float val = fval + 12582912.0;
   int i = floatBitsToInt(val);
@@ -62,22 +50,22 @@ int tq1_0_trit_gw(uint ae, uint woff) {
   if (ae < 160u) {
     uint l = ae / 32u; uint m_idx = ae % 32u;
     uint wb_byte = woff + m_idx;
-    uint w16 = GW16.v[wb_byte >> 1];
-    uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+    uint w32 = GW32.v[wb_byte >> 2];
+    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   } else if (ae < 240u) {
     uint l = (ae - 160u) / 16u; uint m_idx = (ae - 160u) % 16u;
     uint wb_byte = woff + 32u + m_idx;
-    uint w16 = GW16.v[wb_byte >> 1];
-    uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+    uint w32 = GW32.v[wb_byte >> 2];
+    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   } else {
     uint l = (ae - 240u) / 4u; uint j = (ae - 240u) % 4u;
     uint wb_byte = woff + 48u + j;
-    uint w16 = GW16.v[wb_byte >> 1];
-    uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+    uint w32 = GW32.v[wb_byte >> 2];
+    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   }
@@ -87,31 +75,48 @@ int tq1_0_trit_uw(uint ae, uint woff) {
   if (ae < 160u) {
     uint l = ae / 32u; uint m_idx = ae % 32u;
     uint wb_byte = woff + m_idx;
-    uint w16 = UW16.v[wb_byte >> 1];
-    uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+    uint w32 = UW32.v[wb_byte >> 2];
+    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   } else if (ae < 240u) {
     uint l = (ae - 160u) / 16u; uint m_idx = (ae - 160u) % 16u;
     uint wb_byte = woff + 32u + m_idx;
-    uint w16 = UW16.v[wb_byte >> 1];
-    uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+    uint w32 = UW32.v[wb_byte >> 2];
+    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   } else {
     uint l = (ae - 240u) / 4u; uint j = (ae - 240u) % 4u;
     uint wb_byte = woff + 48u + j;
-    uint w16 = UW16.v[wb_byte >> 1];
-    uint wb = ((wb_byte & 1u) != 0u) ? (w16 >> 8u) : (w16 & 0xFFu);
+    uint w32 = UW32.v[wb_byte >> 2];
+    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   }
 }
 
+float col_reduce(uint col_id, float val) {
+  float sg = subgroupAdd(val);
+  uint sub_per_col = 128u / gl_SubgroupSize;
+  uint col_sub_id = gl_SubgroupID % sub_per_col;
+  barrier();
+  if (subgroupElect()) {
+    sm_reduce[col_id * sub_per_col + col_sub_id] = sg;
+  }
+  barrier();
+  float total = 0.0;
+  for (uint i = 0u; i < sub_per_col; ++i) {
+    total += sm_reduce[col_id * sub_per_col + i];
+  }
+  return total;
+}
+
 void main() {
   uint tid = gl_LocalInvocationID.x;
-  uint col = gl_WorkGroupID.x;
-  if (col >= p.n) { return; }
+  uint col_id = gl_LocalInvocationID.y;
+  uint col = gl_WorkGroupID.x * COLS_PER_WG + col_id;
+  if (col >= p.n) return;
 
   const uint wbytes = 54u;
   uint nb = p.nb;
@@ -121,27 +126,31 @@ void main() {
   uint elems = 256u / lpb;
   uint a_shift = (VT_FUSED_ACT_DT == VT_DT_F32) ? 2u : 1u;
 
-  // --- Activation quantize cache (bcast=1: all rows share activation row 0) ---
   if (p.bcast != 0u) {
-    if (block_id < nb) {
+    if (col_id == 0u && block_id < nb) {
       uint a_base = (p.a_off >> a_shift) + block_id * 256u;
-      float amax = 0.0;
+      float amax = 0.0; float maxv = 0.0;
       for (uint i = 0u; i < elems; ++i) {
         float v = load_act(a_base + lane_in_block * elems + i);
-        amax = max(amax, abs(v));
+        float ax = abs(v);
+        if (ax > amax) { amax = ax; maxv = v; }
       }
-      sm_amax[tid] = amax;
+      sm_reduce[block_id * lpb + lane_in_block] = maxv;
       barrier();
       for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
         if (lane_in_block < s) {
-          sm_amax[tid] = max(sm_amax[tid], sm_amax[tid + s]);
+          float a = sm_reduce[block_id * lpb + lane_in_block];
+          float b = sm_reduce[block_id * lpb + lane_in_block + s];
+          if (abs(b) > abs(a))
+            sm_reduce[block_id * lpb + lane_in_block] = b;
         }
         barrier();
       }
-      float block_amax = sm_amax[block_id * lpb];
+      float maxv_final = sm_reduce[block_id * lpb];
+      float block_amax = abs(maxv_final);
       if (block_amax > 0.0) {
-        float iscale = -127.0 / block_amax;
-        d_act_cache[block_id] = -block_amax / 127.0;
+        float iscale = -127.0 / maxv_final;
+        d_act_cache[block_id] = 1.0 / iscale;
         for (uint i = 0u; i < elems; ++i) {
           uint idx = lane_in_block * elems + i;
           float v = load_act(a_base + idx);
@@ -162,12 +171,10 @@ void main() {
     uint ee = uint(e);
     uint gw_row = p.gw_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
     uint uw_row = p.uw_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
-
     float gate_acc = 0.0;
     float up_acc = 0.0;
 
     if (p.bcast != 0u) {
-      // --- Cached path ---
       if (block_id < nb && d_act_cache[block_id] != 0.0) {
         uint gwoff = gw_row + block_id * wbytes;
         uint uwoff = uw_row + block_id * wbytes;
@@ -175,8 +182,7 @@ void main() {
         float uwd = vt_from16(uint(UW16.v[(uwoff + 52u) >> 1]), VT_DT_F16);
         float gblockd = d_act_cache[block_id] * gwd;
         float ublockd = d_act_cache[block_id] * uwd;
-        int gacci = 0;
-        int uacci = 0;
+        int gacci = 0; int uacci = 0;
         for (uint i = 0u; i < elems; ++i) {
           uint ae = lane_in_block * elems + i;
           int q = q8_cache[block_id][ae];
@@ -187,35 +193,38 @@ void main() {
         up_acc = float(uacci) * ublockd;
       }
     } else {
-      // --- Non-cached path: quantize inline ---
       uint a_row_idx = (p.gather_k > 0u) ? (row / p.gather_k) : row;
       if (block_id < nb) {
         uint a_base = (p.a_off >> a_shift) + a_row_idx * p.nb * 256u + block_id * 256u;
         uint gwoff = gw_row + block_id * wbytes;
         uint uwoff = uw_row + block_id * wbytes;
-        float amax = 0.0;
+        float amax = 0.0; float maxv = 0.0;
         for (uint i = 0u; i < elems; ++i) {
           float v = load_act(a_base + lane_in_block * elems + i);
-          amax = max(amax, abs(v));
+          float ax = abs(v);
+          if (ax > amax) { amax = ax; maxv = v; }
         }
-        sm_amax[tid] = amax;
+        sm_reduce[col_id * 128u + tid] = maxv;
         barrier();
         for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
           if (lane_in_block < s) {
-            sm_amax[tid] = max(sm_amax[tid], sm_amax[tid + s]);
+            float a = sm_reduce[col_id * 128u + tid];
+            float b = sm_reduce[col_id * 128u + tid + s];
+            if (abs(b) > abs(a))
+              sm_reduce[col_id * 128u + tid] = b;
           }
           barrier();
         }
-        float block_amax = sm_amax[block_id * lpb];
+        float maxv_final = sm_reduce[col_id * 128u + block_id * lpb];
+        float block_amax = abs(maxv_final);
         if (block_amax > 0.0) {
-          float iscale = -127.0 / block_amax;
-          float d_act = -block_amax / 127.0;
+          float iscale = -127.0 / maxv_final;
+          float d_act = 1.0 / iscale;
           float gwd = vt_from16(uint(GW16.v[(gwoff + 52u) >> 1]), VT_DT_F16);
           float uwd = vt_from16(uint(UW16.v[(uwoff + 52u) >> 1]), VT_DT_F16);
           float gblockd = d_act * gwd;
           float ublockd = d_act * uwd;
-          int gacci = 0;
-          int uacci = 0;
+          int gacci = 0; int uacci = 0;
           for (uint i = 0u; i < elems; ++i) {
             uint ae = lane_in_block * elems + i;
             float v = load_act(a_base + ae);
@@ -230,16 +239,13 @@ void main() {
       }
     }
 
-    // Reduce gate and up partials
-    gate_acc = vt_tg_sum(tid, gate_acc);
-    up_acc = vt_tg_sum(tid, up_acc);
-
-    // Clamped SwiGLU
+    gate_acc = col_reduce(col_id, gate_acc);
+    up_acc = col_reduce(col_id, up_acc);
     if (tid == 0u) {
       float gc = min(gate_acc, p.limit);
       float uc = clamp(up_acc, -p.limit, p.limit);
       float s = gc / (1.0 + exp(-gc));
-      O32.v[(p.out_off >> 2) + row * p.n + col] = floatBitsToUint(s * uc);
+      VT_STORE(O32, O16, VT_FUSED_OUT_DT, p.out_off, row * p.n + col, s * uc);
     }
     barrier();
   }

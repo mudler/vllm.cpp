@@ -301,12 +301,12 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
     } else if (std::strcmp(m.name, "vt_moe_gate_up_swiglu_grouped_tq2") == 0) {
       // Fused gate+up+SwiGLU: one axis — the activation dtype (f32 or bf16).
       // Output is always f32 (the op contract pins it).
-      REQUIRE(m.spec_id_count == 1);
-      CHECK(m.spec_ids[0] == 0);
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq2_grouped_dev") == 0) {
       // Same single output-dtype axis as vt_matmul_bt_tq2_grouped (f32/f16/bf16).
-      REQUIRE(m.spec_id_count == 1);
-      CHECK(m.spec_ids[0] == 0);
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq2_dev") == 0) {
       // Two axes: output dtype (f32/f16/bf16) and activation dtype (f32/bf16).
       REQUIRE(m.spec_id_count == 2);
@@ -321,11 +321,11 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq1_0_grouped_dev") == 0) {
-      REQUIRE(m.spec_id_count == 1);
-      CHECK(m.spec_ids[0] == 0);
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_moe_gate_up_swiglu_grouped_tq1_0") == 0) {
-      REQUIRE(m.spec_id_count == 1);
-      CHECK(m.spec_ids[0] == 0);
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_attn_qk_norm_rope_gate") == 0) {
       // The shared qgate/kf dtype, the shared q_out/k_out dtype, and the gate
       // dtype. THREE, and the third one is the assertion: the gate is a separate

@@ -267,6 +267,23 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // residual asks for: a reader can grep for it, and it resolves the day
   // W5e-2 lands.
   //
+  // "A SIXTH TIME" ABOVE AND "#2288 IN ITS SEVENTH TURN" IN #2336 COUNT
+  // DIFFERENT POPULATIONS, AND BOTH ARE RIGHT. This comment counts instances
+  // #2288 has produced IN THIS REFUSAL STRING; #2336 and the spec's `## Now`
+  // count turns of #2288 ON THE ROW, which includes the two live enumerations
+  // in `## Now` that never touched this file. A reader who meets both numbers
+  // in one session will read them as a contradiction, so the difference is
+  // stated here rather than left to be rediscovered. Neither number is
+  // corrected: correcting one to match the other would make it false.
+  //
+  // AND THE COMPLETENESS CLAUSE IS SCOPED, because an unbounded one cannot be
+  // held. It read "every op the loop composes is now on main", which no gate
+  // and no reading can establish — the loop is not written, so the set of ops
+  // it composes is not yet a fact. It now reads "every op #2336 surveyed",
+  // which is a closed set a reader can check against that issue. This is the
+  // same failure this string has had three times in the other polarity, and
+  // the repair is the same one: name a population, never "every".
+  //
   // WHAT PINS THIS STRING, checked rather than assumed. The `SUBCASE("the
   // forward")` of `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` drives
   // this hook with a foreign handle and asserts FIVE substrings:
@@ -282,9 +299,10 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // that is wrong.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
-           "The five prerequisites #2249 surveyed are ZERO, and every op the "
-           "loop composes is now on main (W2/W3/W4/W6a/W5a/W5b-1..6, W5c-1, "
-           "W5c-2, W5d-1..4, W5e-1). The BLOCK SEAMS are not: the PLE block has "
+           "The five prerequisites #2249 surveyed are ZERO, and every op "
+           "#2336 surveyed is now on main (W2/W3/W4/W6a/W5a/W5b-1..6, "
+           "W5c-1, W5c-2, W5d-1..4, W5e-1). The BLOCK SEAMS are not: the "
+           "PLE block has "
            "no production composition — there is no RunQwen4ExpPleBlock beside "
            "RunQwen4ExpQsaBlock and RunQwen4ExpMoeBlock — and it is the LAST "
            "one, owned by W5e-2 under #2336. Beyond it the LAYER LOOP itself, "

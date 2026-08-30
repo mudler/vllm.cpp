@@ -2512,11 +2512,20 @@ so reading the bytes cost the gate nothing.
 
 ## Mutation record — W5e-1 (#2336)
 
-The PLE GATE as `vt::Qwen4ExpPleGate`. Base SHA `bd90b92b0`. Six mutations, four
-recorded as verdicts and two withdrawn as instrument failures; one reachability
-mutation recorded as VACUOUS. Every applied mutation is sha256-proven applied,
-every BUILD rc is read BEFORE any test result, and the tree is restored
-byte-for-byte from a pristine copy with the sha256 printed.
+The PLE GATE as `vt::Qwen4ExpPleGate`. Base SHA `bd90b92b0`. Nine mutations, six
+recorded as verdicts and three withdrawn as instrument failures; one
+reachability mutation recorded as VACUOUS. Every applied mutation is
+sha256-proven applied, every BUILD rc is read BEFORE any test result, and the
+tree is restored byte-for-byte from a pristine copy with the sha256 printed.
+
+**THE WHOLE BATTERY WAS RE-RUN ON THE REVIEW-REPAIR TREE, and the table below
+carries that tree's numbers.** The repair adds one case (`a NaN score
+PROPAGATES`, F2 below) and the suite moves from 8 / 168 to 9 / 176, so every
+denominator moved with it and a table left at the old ones would name a tree it
+was no longer measured on. Where a row's number changed, the pre-repair value
+the fresh review reproduced is kept beside it in parentheses; where it did not,
+there is nothing to keep. Two rows are NEW and both come from the review: M-NaN,
+which the reviewer ran, and M-NANGUARD, which pins the guard F2 adds.
 
 ### The RED, before the change
 
@@ -2566,29 +2575,57 @@ it in BOTH directions, because each half alone passes a wrong port: `sign(0) ==
 moves every clamped score onto the origin.
 
 Every comparison routes through `tests/support/max_abs_diff.h`, so a non-finite
-operand fails rather than reducing to a perfect 0.0 (#449, #2272).
+operand fails rather than reducing to a perfect 0.0 (#449, #2272). **THAT IS NOW
+MEASURED IN THIS SUITE AND NOT INHERITED FROM THE HELPER'S OWN TESTS.** M-NaN in
+the battery below poisons the kernel's weight with the operands kept live, and
+`max_abs_diff.h:100` fires its `NON-FINITE operand at index 0 … see issue #449`
+five times over seven red cases. The previous revision of this paragraph
+asserted the property; the row measures it.
+
+**AND THE OP ITSELF NO LONGER SWALLOWS A NaN.** `torch.sign(NaN) == 0` while
+`NaN * 0.0 == NaN`, so upstream's `:1181` returns NaN for a NaN score —
+confirmed by running the pinned expression under torch on
+`[nan, inf, -inf, -0.0, 0.0]`, which returns `[nan, inf, -inf, 0.0, 0.0]`. Our
+`SignedSqrt` compared NaN against the clamp (false), tried both sign branches
+(false) and fell through to `0.0`, so a NaN score became exactly `0.5 * value`:
+#2272's polarity, a poison value rendered as a plausible number, and one
+`max_abs_diff.h` cannot catch because by then there is no non-finite operand
+left. The fresh review of W5e-1 found it by lifting the function verbatim and
+executing it. AGENTS.md §"Mirror vLLM" decides the repair rather than a judgement
+about whether the contract admits a NaN: the guard is one line, `if
+(std::isnan(g)) return g;`, `a NaN score PROPAGATES` pins it in both directions,
+and M-NANGUARD reds that case and only that case when the line is deleted. The
+two infinities and the two signed zeros already matched and get no guard.
 
 ### The battery
 
 | # | mutation | build rc | result |
 |---|---|---|---|
 | M1 | the `clamp_min` deleted (`floored = magnitude`) | **1** | **WITHDRAWN — NOT A VERDICT.** `error: unused parameter ‘clamp_min’ [-Werror=unused-parameter]`. No suite ran, so nothing was measured; a build failure that reads as a passing test is the trap `.agents/verification.md` and #2272 both name. Re-run as M1b |
-| M1b | the clamp NEVER binds (`magnitude < 0.0 ? clamp_min : magnitude`), which keeps the operand live and removes only the behaviour | 0 | **RED, 5 of 8 cases, 12 of 168 assertions.** Oracle margin `0.00155973 < 1e-05` — the value `kGateClampSeparation` predicted to five figures, measured independently by the generator. The origin case stays correct (`sign(0) == 0` needs no clamp) and its two 1e-12 neighbours collapse onto it, which is exactly the discontinuity the fixture exists to hold |
-| M2 | the `sign` multiply deleted (`return root`) | 0 | **RED, 5 of 8 cases, 12 of 168 assertions.** Oracle margin `0.324619 < 1e-05`; the origin reads `0.50025` where `0.5` is required, and the two "must be distinguishable" checks read `0 > 1e-05` |
+| M1b | the clamp NEVER binds (`magnitude < 0.0 ? clamp_min : magnitude`), which keeps the operand live and removes only the behaviour | 0 | **RED, 5 of 9 cases, 12 of 176 assertions** (5 of 8, 12 of 168 pre-repair). Oracle margin `0.00155973 < 1e-05` — the value `kGateClampSeparation` predicted to FOUR significant figures and not five — `1.5595e-3` from the generator against `0.00155973` here is 0.015% apart, so the agreement is `1559` and the fifth digit differs — measured independently by the generator. The origin case stays correct (`sign(0) == 0` needs no clamp) and its two 1e-12 neighbours collapse onto it, which is exactly the discontinuity the fixture exists to hold |
+| M2 | the `sign` multiply deleted (`return root`) | 0 | **RED, 6 of 9 cases, 15 of 176 assertions** (5 of 8, 12 of 168 pre-repair; the NaN case's ORIGIN half is the sixth, because dropping the sign moves that row to `0.50025` too). Oracle margin `0.324619 < 1e-05`; the origin reads `0.50025` where `0.5` is required, and the two "must be distinguishable" checks read `0 > 1e-05` |
 | M3 | `sigmoid` applied to the PRE-sqrt gate | **1** | **WITHDRAWN — NOT A VERDICT.** `error: unused variable ‘clamp_min’` and `error: ‘SignedSqrt’ defined but not used`. Re-run as M3b |
-| M3b | the same, with `SignedSqrt` still called and its result discarded | 0 | **RED, 5 of 8 cases, 12 of 168 assertions.** Oracle margin `0.0580857 < 1e-05` |
-| M5 | the kernel registered on `DeviceType::kCUDA` instead of `kCPU` | 0 | **RED BY REFUSAL, 6 of 8 cases, 41 assertions reached.** `vt: no kernel for op Qwen4ExpPleGate (id 141) on device cpu (type 0), and the portable CPU reference tier is the SOURCE of that kernel, not a fallback for it`. The dispatcher path and the `op_provider.cpp` name entry are both live rather than vestigial. Same reading W5d-1's M5 carries |
+| M3b | the same, with `SignedSqrt` still called and its result discarded | 0 | **RED, 5 of 9 cases, 12 of 176 assertions** (5 of 8, 12 of 168 pre-repair). Oracle margin `0.0580857 < 1e-05` |
+| M5 | the kernel registered on `DeviceType::kCUDA` instead of `kCPU` | 0 | **RED BY REFUSAL, 7 of 9 cases, 41 assertions reached** (6 of 8 pre-repair; the assertion count does not move, because every case that enters the op now throws before its first `CHECK`). `vt: no kernel for op Qwen4ExpPleGate (id 141) on device cpu (type 0), and the portable CPU reference tier is the SOURCE of that kernel, not a fallback for it`. The dispatcher path and the `op_provider.cpp` name entry are both live rather than vestigial. Same reading W5d-1's M5 carries |
+| M-NaN-a | the weight poisoned outright (`weight = std::nan("")`) | **1** | **WITHDRAWN — NOT A VERDICT.** `error: unused variable ‘g’`, `error: unused variable ‘clamp_min’`, `error: ‘Sigmoid’ defined but not used`. The THIRD time `-Werror` refused a naive deletion in this battery, for the same reason M1 and M3 did: this kernel has no dead operands. Re-run as M-NaN |
+| M-NaN | the weight poisoned with the operands KEPT LIVE (`Sigmoid(SignedSqrt(g, clamp_min)) * std::nan("")`) | 0 | **RED, 7 of 9 cases, 124 of 181 assertions** (the reviewer measured 6 of 8 and 120 of 173 pre-repair). `tests/support/max_abs_diff.h:100: ERROR: max\|diff\|: NON-FINITE operand at index 0 (got = nan, want = 0.28212). A NaN here used to reduce to 0.0 and PASS — see issue #449` fires **FIVE** times (the two `\|` are escaped for this table; the emitted bytes carry bare pipes). THIS IS THE ROW THAT CLOSES THE #2272 GAP: the finiteness guard is measurably ARMED in THIS suite rather than inherited from `max_abs_diff.h`'s own tests, so "a NaN cannot reduce to a passing 0.0 here" is a measurement and no longer a caveat |
+| M-NANGUARD | the `isnan` guard in `SignedSqrt` deleted (F2's repair reverted) | 0 | **RED, 1 of 9 cases, 4 of 176 assertions** — `a NaN score PROPAGATES` alone, and all four of its NaN columns, `CHECK( std::isnan(...) ) is NOT correct! values: CHECK( false )` at `:297`. NOTHING ELSE MOVES, which is the point: the guard is reachable ONLY from a NaN score, so it cannot have shifted a finite answer. Its ORIGIN half stays green, so the guard is not leaking finite scores out of the op either |
 | M4 | **the reachability mutation: VACUOUS, and recorded as vacuous rather than as a pass** | n/a | There is no production call site to delete. A tree-wide grep over `src/ include/ examples/ tools/ benchmarks/` finds only the op's own declaration, dispatcher, kernel, registration and name entry, plus two prose mentions in the refusal that names it unreached. `.agents/reachability.md` step 5 distinguishes this from a green gate and `## Owed` carries it |
 
-M1 and M3 are kept in the table rather than replaced silently, because the two
-build refusals ARE the finding: the naive deletion of either behaviour leaves
-`clamp_min` unreferenced, `-Werror` stops the build, and a driver that read the
-suite's absence as success would have recorded two false SURVIVEs.
+M1, M3 and M-NaN-a are kept in the table rather than replaced silently, because
+the three build refusals ARE the finding: the naive deletion or short-circuit of
+any of these behaviours leaves `clamp_min`, `g` or `Sigmoid` unreferenced,
+`-Werror` stops the build, and a driver that read the suite's absence as success
+would have recorded three false SURVIVEs.
 
 Restore proof: the kernel's sha256 is
-`e5b00b177d859592cc1f7f940ae2ff6c3ecc7627af274ccb32e7985812aec07f` before every
+`78cdbee1cbec809e616fe1bd113ae8511aa7b0708bca528c1e7d6a2d747f2242` before every
 mutation and after every restore, printed by the driver on each iteration, and
-the suite is rebuilt and re-run green at the end of the battery (8/168, rc 0).
+the suite is rebuilt and re-run green at the end of the battery (9/176, rc 0).
+That hash is the REPAIRED kernel, i.e. the one carrying F2's `isnan` guard; the
+pre-repair battery ran against
+`e5b00b177d859592cc1f7f940ae2ff6c3ecc7627af274ccb32e7985812aec07f` and is the
+tree the fresh review reproduced.
 `touch` after each restore, because `cp -a` preserves the mtime and ninja then
 SKIPS the rebuild — that trap cost one false link failure in this flow before it
 was caught.
@@ -2597,7 +2634,7 @@ was caught.
 
 | suite | at `bd90b92b0` | at this head |
 |---|---|---|
-| `test_qwen4_exp_ple_gate` | did not exist | 8 / 168 / rc 0 |
+| `test_qwen4_exp_ple_gate` | did not exist | 9 / 176 / rc 0 |
 | `test_qwen4_exp_ple` | 9 / 395 / rc 0 | 9 / 395 / rc 0 |
 | `test_qwen4_exp_ple_device` | 10 / 538 / rc 0 | 10 / 538 / rc 0 |
 | `test_qwen4_exp_scaffold` | 12 / 296 / rc 0 | 12 / 296 / rc 0 |
@@ -2814,7 +2851,18 @@ is listed under `## Owed`.
   before any downcast, and that refusal was EDITED IN THIS FLOW because its "the
   ops and block seams ARE on main" clause was false — an overstated refusal,
   #2254's polarity — and the emitted bytes were read back out of the running hook
-  to prove the repair. **M5 is the load-bearing proof at the layer that does
+  to prove the repair. **THE REPAIRED CLAUSE WAS ITSELF UNBOUNDED AND IS NOW
+  SCOPED**, on the fresh review's finding: it read "every op the loop composes is
+  now on main", which nothing can hold, because the loop is not written and the
+  set of ops it composes is therefore not yet a fact. It reads "every op #2336
+  surveyed" instead — a closed population a reader can check against that issue.
+  The emitted bytes were read back a SECOND time for that edit, by a temporary
+  `MESSAGE` in `SUBCASE("the forward")` run with `-s`, and
+  `test_qwen4_exp_scaffold.cpp` restored to its pristine sha256
+  `32ee46d64b3045cbf852c387a2cb106bc46d391ed9fd19b4b6cbc013afac9b07` with `git
+  diff` empty on it. The suite is unchanged at 12 / 296, which is the point
+  `## Owed` already makes about it: it pins five substrings PRESENT and can pin
+  none of them TRUE. **M5 is the load-bearing proof at the layer that does
   exist**, exactly as it was for W5d-1: registering the kernel on
   `DeviceType::kCUDA` instead of `kCPU` leaves the build at rc 0 and reds the
   suite BY REFUSAL, `vt: no kernel for op Qwen4ExpPleGate (id 141) on device cpu
@@ -2836,7 +2884,12 @@ is listed under `## Owed`.
   arm evaluates the divide, the clamp, the square root, the sigmoid and the
   product in DOUBLE, matching the W2 host reference term for term; a CUDA arm
   that evaluates in f32 will not inherit that bit-identity and must be gated
-  against the oracle directly.
+  against the oracle directly. It inherits ONE more obligation, added on this
+  wave's review: the NaN guard in `SignedSqrt`. A CUDA arm owes its own case for
+  `a NaN score PROPAGATES`, because the trap is a fall-through and not an
+  arithmetic difference — every comparison in a signed square root is false for
+  NaN, so any re-expression of it will swallow the NaN into `0.5 * value` unless
+  it tests `isnan` first.
 - **The `bf16` VALUE operand is a real value change and it is the caller's.**
   `vt::Qwen4ExpPleGate` accepts f32/f16/bf16 `value` and f32/bf16 `out`, and the
   `score` operand is f32 ONLY, for the reason `vt::SigmoidGateBf16` gives for its
@@ -2845,6 +2898,35 @@ is listed under `## Owed`.
   `value` is the f32 answer recomputed on the rounded operand rather than the f32
   answer rounded. Which width the PLE block hands it is W5e-2's decision, and
   `.agents/porting.md`'s memory-format rule applies to it there.
+
+- **THE DOT'S f32 ACCUMULATOR AT MODEL WIDTH CAN FLIP THE GATE'S SIGN, and that
+  is W5e-2's decision, not this op's.** The composition this wave recommends —
+  `vt::BatchedMatmul` over `[T*hc, 1, H] x [T*hc, H, 1]` views — accumulates in
+  **f32** (`include/vt/ops.h`, the `BatchedMatmul` declaration: "accumulation is
+  f32", and the CPU arm is the naive serial `float acc` over K).
+  `test_qwen4_exp_ple_gate.cpp` runs that composition at **H = 8**;
+  `Qwen4ExpTextPLELayer` runs it at **H = 2560**. The mechanism is THIS op's and
+  not the matmul's: the signed square root AMPLIFIES near the origin, so a
+  difference of ~1e-6 in the dot — ordinary for a 2560-term f32 reduction over
+  near-cancelling operands — crosses the `|g| < 1e-6` clamp band and moves the
+  gate from `+1e-3` to `-1e-3`. The SIGN is what the reduction order decides,
+  and neither accumulator is more right than the other. Measured by the fresh
+  review of this wave over 201 adversarial near-cancelling pairs at H = 2560,
+  naive-serial-f32 against torch's pairwise f32: **68 of 201 sign flips, worst
+  |gate| delta 2.0e-3, worst sigmoid delta 5.0e-4 — 50x this suite's
+  `kTol = 1e-5`.** An independent reproduction in this repair flow, with a
+  different construction of the adversarial pairs, read 98 of 201 flips,
+  2.187e-3 and 5.467e-4 (55x), so the MAGNITUDE is the construction-independent
+  part and the flip RATE is not. This is the twin of the entry W5d-1 carries for
+  `vt::RmsNormGroup`'s per-group sum of squares once the group is 2560 wide
+  rather than 6, and it is recorded in the same shape for the same reason.
+  **W5e-2 ([#2336](https://github.com/mudler/vllm.cpp/issues/2336)) owns it**,
+  because the accumulator belongs to the COMPOSITION and not to
+  `vt::Qwen4ExpPleGate`, which receives a score and cannot see how it was summed.
+  What W5e-2 owes is a decision — a wider accumulator for this dot, or a gate at
+  model width against the oracle that pins the f32 one as sufficient — and NOT a
+  tolerance widened until the flips fit. A sign flip is bimodal: it does not
+  shrink with a bound, it flips or it does not.
 - **W5d-1 (#2249 item 1) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::RmsNormGroup` (`include/vt/ops.h`, dispatcher `src/vt/ops.cpp`, CPU kernel
   `RmsNormGroupKernel` in `src/vt/cpu/cpu_ops.cpp`, name in
@@ -4197,25 +4279,46 @@ and three things are still owed before a single cell of that table exists.
 
 ## Now
 
-`ACTIVE`. Nine reviewed waves have landed. Eight of them are unreached by design
-and the ninth, W5a, is the only one with a production call site:
+`ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
+The previous revision opened "Nine reviewed waves have landed. Eight of them are
+unreached by design and the ninth, W5a, is the only one with a production call
+site" over a table that held FOURTEEN rows, while four landed waves recorded
+under `## Owed` as unreached — W5c-2, W5d-1, W5d-3 and W5d-4 — had no row at all
+and W5b-6 had none either. That is a live self-contradiction of exactly the shape
+[#2288](https://github.com/mudler/vllm.cpp/issues/2288) names, inside the section
+that exists to reconcile #2288, and W5e-1 made it worse by adding a fifteenth
+wave to a sentence that said nine. A prose count beside a table it is not derived
+from is a drift lock (`## Owed` records the same failure mode for the production
+refusal string). The count is therefore DELETED from the prose and the fact moved
+into a per-row column, which a reader can total and a wave cannot leave stale by
+adding a row without touching a sentence. Every reviewed wave that has landed has
+a row here, and every row says whether anything in production reaches it:
 
-| Wave | Lands | Issue |
-|---|---|---|
-| W1 | the config layer: `qwen4_exp` resolves, parses and VALIDATES | [#1981](https://github.com/mudler/vllm.cpp/issues/1981) |
-| W2 | the hashed n-gram index and the PLE dilated depthwise conv | [#1987](https://github.com/mudler/vllm.cpp/issues/1987) |
-| W3 | the 4-branch gated-residual hyper-connection stream | [#1988](https://github.com/mudler/vllm.cpp/issues/1988) |
-| W4 | Qwen Sparse Attention with a GATHER consumer | [#1991](https://github.com/mudler/vllm.cpp/issues/1991) |
-| W6a | IQ4_NL, Q5_0 and a dequantizing gather, so the artifact OPENS | [#1989](https://github.com/mudler/vllm.cpp/issues/1989) |
-| W5a | the GGUF weight loader, REACHED through the `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
-| W5b-1 | `RunGdnBlockPaged`, the GDN block seam the forward needs cross-TU | [#2110](https://github.com/mudler/vllm.cpp/issues/2110) |
-| W5b-2 | the gated-residual hyper-connection stream as two `vt::` ops | [#2123](https://github.com/mudler/vllm.cpp/issues/2123) |
-| W5b-3 | the PLE dilated depthwise causal conv as `vt::Qwen4ExpPleConv` | [#2156](https://github.com/mudler/vllm.cpp/issues/2156) |
-| W5b-4 | Qwen Sparse Attention as two `vt::` ops, plus the unmapped-tail probe | [#2167](https://github.com/mudler/vllm.cpp/issues/2167) |
-| W5b-5 | `Qwen4ExpTextAttention` as ONE block, and the indexer composition in `src/` | [#2211](https://github.com/mudler/vllm.cpp/issues/2211) |
-| W5c-1 | the KV-cache spec: THREE groups, REACHED through `make_kv_cache` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
-| W5d-2 | `BuildMropeCosSinHost` loses `static`: ONE mRoPE table builder, cross-TU | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
-| W5e-1 | the PLE GATE as `vt::Qwen4ExpPleGate` — the op #2249 never surveyed | [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
+| Wave | Lands | Reached? | Issue |
+|---|---|---|---|
+| W1 | the config layer: `qwen4_exp` resolves, parses and VALIDATES | **yes** — `Qwen4ExpHfConfigFromGguf`, through the `kGgufArchArms` dispatch row | [#1981](https://github.com/mudler/vllm.cpp/issues/1981) |
+| W2 | the hashed n-gram index and the PLE dilated depthwise conv | no | [#1987](https://github.com/mudler/vllm.cpp/issues/1987) |
+| W3 | the 4-branch gated-residual hyper-connection stream | no | [#1988](https://github.com/mudler/vllm.cpp/issues/1988) |
+| W4 | Qwen Sparse Attention with a GATHER consumer | no | [#1991](https://github.com/mudler/vllm.cpp/issues/1991) |
+| W6a | IQ4_NL, Q5_0 and a dequantizing gather, so the artifact OPENS | **yes** — the dispatch row and the dequantizing gather the loader takes | [#1989](https://github.com/mudler/vllm.cpp/issues/1989) |
+| W5a | the GGUF weight loader | **yes** — the registry's `load_weights` hook | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
+| W5b-1 | `RunGdnBlockPaged`, the GDN block seam the forward needs cross-TU | no | [#2110](https://github.com/mudler/vllm.cpp/issues/2110) |
+| W5b-2 | the gated-residual hyper-connection stream as two `vt::` ops | no | [#2123](https://github.com/mudler/vllm.cpp/issues/2123) |
+| W5b-3 | the PLE dilated depthwise causal conv as `vt::Qwen4ExpPleConv` | no | [#2156](https://github.com/mudler/vllm.cpp/issues/2156) |
+| W5b-4 | Qwen Sparse Attention as two `vt::` ops, plus the unmapped-tail probe | no | [#2167](https://github.com/mudler/vllm.cpp/issues/2167) |
+| W5b-5 | `Qwen4ExpTextAttention` as ONE block, and the indexer composition in `src/` | no | [#2211](https://github.com/mudler/vllm.cpp/issues/2211) |
+| W5b-6 | the gamma polarity of W5b-2's two ops, onto the RAW HuggingFace gamma | no | [#2218](https://github.com/mudler/vllm.cpp/issues/2218) |
+| W5c-1 | the KV-cache spec: THREE groups | **yes** — `make_kv_cache` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
+| W5c-2 | `GPUModelRunner::gather_group_block_tables`, every group's block table | **path yes, VALUE no** — the gather runs on `execute_model`; no forward reads the tables | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
+| W5d-1 | the grouped RMS norm as `vt::RmsNormGroup` | no | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
+| W5d-2 | `BuildMropeCosSinHost` loses `static`: ONE mRoPE table builder, cross-TU | **yes, one hop short** — `qwen3_5.cpp` calls it; that caller is not itself routed from a production entry point | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
+| W5d-3 | the PAGED QSA consumer, `RunQwen4ExpQsaBlockPaged` | no | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
+| W5d-4 | the MoE weight adapter, `qwen4_exp_moe.{h,cpp}` | no | [#2249](https://github.com/mudler/vllm.cpp/issues/2249) |
+| W5e-1 | the PLE GATE as `vt::Qwen4ExpPleGate` — the op #2249 never surveyed | no | [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
+
+Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
+lands dead", and the two qualified `yes` rows say what they reach rather than
+claiming a decode. Nothing in the table decodes a token.
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry

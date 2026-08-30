@@ -35,6 +35,16 @@
 // the origin must not move to the floor, and its tiny neighbours must not move
 // to the origin.
 //
+// A NaN SCORE IS OUT OF CONTRACT AND STILL HAS AN UPSTREAM ANSWER, WHICH IS
+// NaN. `torch.sign(NaN) == 0` and `NaN * 0.0 == NaN`, so the gate and the
+// output are both NaN at the pin. Every comparison in `SignedSqrt` is false for
+// NaN, so an unguarded kernel falls through the sign branches and returns 0.0,
+// and the output becomes exactly `0.5 * value` — a poison operand rendered as a
+// plausible number, #2272's polarity, and one `max_abs_diff.h`'s finiteness
+// guard cannot see because the non-finite operand is gone by then. `a NaN score
+// PROPAGATES` pins it, and pins the origin row beside it so a guard that leaked
+// finite scores would red as well.
+//
 // WHAT IS NOT THIS OP, AND IS TESTED ANYWAY. The dot at `:1180` is
 // `vt::BatchedMatmul` over strided views of the two `[T, hc*H]` buffers, not new
 // code. `composed with vt::BatchedMatmul` RUNS that composition end to end
@@ -259,6 +269,40 @@ TEST_CASE("the ORIGIN maps to zero, and its neighbours do NOT map to the origin"
                  static_cast<double>(got[static_cast<size_t>(hidden + 1)])) > kTol);
   CHECK(std::abs(static_cast<double>(got[1]) -
                  static_cast<double>(got[static_cast<size_t>(2 * hidden + 1)])) > kTol);
+}
+
+TEST_CASE("a NaN score PROPAGATES; it is not swallowed into 0.5 * value") {
+  // OUT-OF-CONTRACT INPUT, AND THE ANSWER IS STILL UPSTREAM'S. At the pin,
+  // `torch.sign(NaN) == 0` but `NaN * 0.0 == NaN`, so
+  // `gate.abs().clamp_min(1e-6).sqrt() * gate.sign()` is NaN and
+  // `sigmoid(gate) * value` is NaN. That was measured by running the pinned
+  // expression itself under torch on `[nan, inf, -inf, -0.0, 0.0]`, which
+  // returns `[nan, inf, -inf, 0.0, 0.0]` — so only the NaN arm needed a guard
+  // and the two infinities and the two zeros did not.
+  //
+  // WHAT THIS SEPARATES. `SignedSqrt`'s clamp comparison, its two sign branches
+  // and its fall-through are all FALSE for NaN, so an unguarded kernel returns
+  // 0.0 and the gate becomes exactly `0.5 * value` — a poison operand rendered
+  // as a plausible number, which is #2272's polarity. `MaxAbsDiff` cannot catch
+  // it, because by then there is no non-finite operand left to catch.
+  const std::vector<float> value{1.0f, -2.0f, 0.0f, 0.5f};
+  const int64_t hidden = static_cast<int64_t>(value.size());
+  const std::vector<float> score{std::nanf(""), 0.0f};
+  const std::vector<float> got = RunGate(score, value, 1, 2, hidden, 1.0f);
+
+  // j = 0 is the NaN row. Every d must be NaN, INCLUDING d = 2 where `value` is
+  // 0: `NaN * 0` is NaN, and a swallowed NaN would read 0 there too, so that
+  // column is the one an `isfinite`-shaped check would miss.
+  for (int64_t d = 0; d < hidden; ++d) {
+    CHECK(std::isnan(static_cast<double>(got[static_cast<size_t>(d)])));
+  }
+  // j = 1 is the ORIGIN, and it must STILL be `0.5 * value`. This is the other
+  // direction: a guard written one line too early, or widened to `!isfinite`,
+  // would leak a finite score out of the op unchanged and this row would move.
+  for (int64_t d = 0; d < hidden; ++d) {
+    CHECK(static_cast<double>(got[static_cast<size_t>(hidden + d)]) ==
+          doctest::Approx(0.5 * static_cast<double>(value[static_cast<size_t>(d)])));
+  }
 }
 
 TEST_CASE("section E's eleven scalar probes, through the op") {

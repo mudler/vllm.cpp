@@ -698,9 +698,17 @@ enum class OpId : uint8_t {
   // and the function is genuinely discontinuous there. A fully masked row
   // reaches it.
   //
+  // A NaN SCORE PROPAGATES, and that is a guard rather than a fall-through.
+  // Upstream returns NaN here (`sign(NaN) == 0`, but `NaN * 0.0 == NaN`), while
+  // every comparison in a naive signed-sqrt is FALSE for NaN, so the sign
+  // branches miss and the zero arm returns 0 — turning poison into a plausible
+  // `0.5 * value`. The kernel tests `isnan` first. `+/-inf` and `+/-0.0` need
+  // no guard and get none; they already match the pin term for term.
+  //
   // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
   // OWED, not written: it cannot be gated on a CPU-only host, and an ungated
   // kernel is worse than an absent one — the call W5b-3, W5b-4 and W5d-1 made.
+  // A CUDA arm inherits the NaN obligation above and owes its own case for it.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleGate,
   kCount

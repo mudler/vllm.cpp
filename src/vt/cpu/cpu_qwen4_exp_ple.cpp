@@ -182,6 +182,19 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
 // `value` is read once per (t, d) and broadcast across the hc streams; the
 // broadcast is never materialised, which is the whole reason this is one op.
 double SignedSqrt(double g, double clamp_min) {
+  // NaN IS UPSTREAM'S ANSWER HERE, and the zero arm below would swallow it.
+  // `torch.sign(NaN) == 0`, but `NaN * 0.0 == NaN`, so `:1181` propagates a NaN
+  // gate and `:1182` a NaN output -- measured by running the pinned expression
+  // itself under torch, not inferred from the sign rule. Without this line
+  // `NaN < clamp_min` is false, `floored` and `root` are NaN, NEITHER sign
+  // branch is taken, and the fall-through returns 0.0 -- which sigmoids to a
+  // perfectly plausible `0.5 * value`. That is #2272's polarity, a poison value
+  // rendered as a number, inside an op whose comparisons route through
+  // `max_abs_diff.h` precisely so poison cannot be absorbed silently. `+/-inf`
+  // and `+/-0.0` need NO guard: they already match upstream term for term,
+  // which is why this is spelled for NaN alone rather than as a finiteness
+  // test.
+  if (std::isnan(g)) return g;
   const double magnitude = std::abs(g);
   const double floored = magnitude < clamp_min ? clamp_min : magnitude;
   const double root = std::sqrt(floored);

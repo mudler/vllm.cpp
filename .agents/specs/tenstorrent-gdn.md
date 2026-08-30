@@ -7,7 +7,8 @@ Qwen3.8 on Tenstorrent, chosen at the 2026-08-22 planning pass.
 
 ## Now
 
-`ACTIVE` (claimed 2026-08-22, helper, worktree `vllmcpp-tt-gdn`). W1 (`4d165d130`)
+`DONE` (moved 2026-08-30; claimed 2026-08-22, helper, worktree
+`vllmcpp-tt-gdn`). W1 (`4d165d130`)
 landed the prefill set (kL2Norm, kRmsNormGated, kCausalConv1dFwd, kGdnPrefill —
 chunk_gated_delta_rule adapter, fresh-review PASS) and W2 (`337f6e07a`) landed
 the decode set (kCausalConv1dUpdate, kGdnDecode both state_idx forms,
@@ -16,7 +17,9 @@ chunked by 1.139 vs 3.164 ms/step measurement; steady-state traffic
 h2d=0 d2h=0; NaN-hardened comparator), both fresh-review PASS; all eight ops
 registered for kTENSTORRENT and op-gated vs the CPU f32 oracle (ambient
 33/33 cases 2124/2124; leg0 32/33 with only the pre-existing #1696 red at
-test:83); production-unreached pending the wiring row (see ## Owed, #1715 open).
+test:83); production-reached 2026-08-30 through the wiring row
+(`BACKEND-TENSTORRENT-QWEN35`: the `Qwen3_5*` allow-list, the capacity
+decision, the first e2e gate); see `## Outcome`.
 
 ## Scope
 
@@ -444,11 +447,10 @@ then ran RED.
 
 ## Owed
 
-- **The wiring row:** allow-list registration for `Qwen3_5*` + the capacity
-  decision (quant arm or nothing fits the P150) + the first e2e gate. This
-  row's ops land production-unreached until it exists — named here, in the
-  landing commit body, and in the PR body per `## Nothing lands dead`.
-  Tracked by #1715 (stays open until the family runs).
+- **The wiring row — RESOLVED 2026-08-30** by `BACKEND-TENSTORRENT-QWEN35`:
+  the `Qwen3_5*` allow-list registration, the capacity decision (bf16 0.8B
+  fits the P150; quant arms refused by name), and the first e2e gate all
+  landed there; the family runs, so #1715 closed with the row's `DONE`.
 - GDN ops under host-free capture (`VT_TT_DECODE_CAPTURE`): the shadows must
   be capture-compatible (fixed device buffers) — measured when the capture
   hang [#1625](https://github.com/mudler/vllm.cpp/issues/1625) is resolved,
@@ -459,3 +461,38 @@ then ran RED.
 One pull request for spec and implementation (developer answer recorded
 2026-08-22 in `.agents/developer-preferences.md`). Spec commits first; the
 commit order proves spec-before-code.
+
+## Outcome
+
+`DONE` 2026-08-30. The deliverable — the eight-op GDN chain as native TT
+kernels — landed in two waves, both fresh-review PASS: W1 `4d165d130`
+(prefill: kL2Norm, kRmsNormGated, kCausalConv1dFwd, kGdnPrefill behind the
+varlen+state-permute adapter over tt-metal's
+`ttnn::transformer::chunk_gated_delta_rule`) and W2 `337f6e07a` (decode:
+kCausalConv1dUpdate, kGdnDecode both `state_idx` forms, kGdnStateGather,
+kGdnStateScatter, device shadows). Oracle: our own CPU f32 arm, ambient
+33/33 cases · 2124/2124 assertions (leg0 32/33 carried only the
+pre-existing #1696 red at test:83).
+
+What was measured, and why each default holds:
+- **Composed decode over the chunked kernel: 1.139 vs 3.164 ms/step.** The
+  chunked FLA form lost by ~2.8x at decode's T=1 shapes; composition is the
+  default because it is the measured winner, not by preference.
+- **Steady-state traffic h2d=0 d2h=0.** The device shadow keyed by host
+  pointer (the `PagedKvShadow` pattern) keeps state resident; per-token
+  state round-trips were the stop-condition failure the design refused.
+- **Production-reached via the wiring row, not this row.** The `Qwen3_5*`
+  registration, the capacity decision (bf16 0.8B fits the P150; quant arms
+  refused by name), and the first e2e gate landed under
+  `BACKEND-TENSTORRENT-QWEN35`; its W4 staging cut (0.104 → 0.177 tok/s)
+  runs through this chain, and the sacred pair gates it 16/16 STRICT on
+  both ambient legs (still true at #2294's capture-lane fix). The family
+  this row is the prerequisite for runs on TT; #1715 closed with this
+  move. The Qwen3.8 arm stays owed by the quant-kernel item in the qwen35
+  spec, not here.
+
+Residual debt (open, owned elsewhere): GDN ops under host-free capture
+(`VT_TT_DECODE_CAPTURE`) are unmeasured — the shadows must be
+capture-compatible, and capture itself hangs on multi-request runs
+(#1625, owned by `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`). Measure when
+#1625 resolves, not before.

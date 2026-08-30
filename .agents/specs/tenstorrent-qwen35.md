@@ -393,9 +393,6 @@ the row.
   call and the W7 drift proved they DO serve when the guard allows.
   LEG A (host-hybrid opt-out) was not dump-probed. The
   `VT_TT_STAGE_DUMP` counters stay in-tree as the detector.
-- On landing, the GDN row's lifecycle moves (`ACTIVE` → `DONE` + `## Outcome`) in
-  the same change: its ops become production-reached.
-
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded

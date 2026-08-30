@@ -37,16 +37,16 @@
 
 ## News
 
-- **2026-08** **Hybrid CPU/GPU expert placement reaches five architecture families.** Qwen3-MoE,
-  Qwen3.5/3.6, Nemotron-H, DeepSeek-V2, and Kimi-Linear can run routed experts on the CPU while the
-  rest of the model stays on the selected accelerator. The end-to-end token and speed gates are
-  still pending.
+- **2026-08** **Hybrid CPU/GPU expert placement reaches six architecture families.** Qwen3-MoE,
+  Qwen3.5/3.6, Nemotron-H, DeepSeek-V2, Kimi-Linear, and dots3-note can run routed experts on the CPU
+  while the rest of the model stays on the selected accelerator. The end-to-end token and speed
+  gates are still pending.
 - **2026-08** **IndexTTS 2.5 now uses its reference audio.** The clip conditions both the talker
   and S2Mel stages. Repeated runs with one clip are bit-identical, while different clips change
   the output. Voice-cloning parity with vLLM-Omni remains unmeasured.
-- **2026-08** **FP8 KV cache storage reaches the server.** `--kv-cache-dtype fp8` stores K/V in
-  1-byte E4M3 pages. A fixed memory budget holds twice as many blocks, but the throughput trade-off
-  is not measured yet.
+- **2026-08** **FP8 KV cache storage reaches the server and ROCm.** `--kv-cache-dtype fp8` stores K/V
+  in 1-byte E4M3 pages. The ROCm store and read pass their gfx1100 component gate. CUDA device and
+  end-to-end memory and throughput gates are still pending.
 - **2026-08** **The server returns prompt log probabilities.** Both completion endpoints accept
   `prompt_logprobs`, including `-1` for the full vocabulary, and reject unsupported request shapes
   with `400`.

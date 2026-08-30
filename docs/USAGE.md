@@ -248,11 +248,12 @@ anything, rather than writing floats into a half-sized block. Only one of them
 (Nemotron-H) tells you what you asked for: its refusal names the fp8 KV scheme.
 Qwen3-VL reaches the store, which names the op that should have been called and
 says the architecture is not routed for fp8 KV. The other 14 report a dtype rule
-instead — 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies one
+instead: 13 say `"<arch>: KV cache must be bf16 or f32"`, and Gemma-4 dies one
 step earlier inside a cast with `"cast_f32: out must be f32"`, which does not
 even name the architecture. Every one of the 16 refuses before writing, so the
 half-sized block is never fed floats; what differs is how much the message tells
-you. Metal and ROCm refuse it too. See
+you. Metal refuses it too. CPU and ROCm store/read component gates pass. The
+CUDA device gate is still pending. See
 [the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
 
 A refusal arrives AFTER the pool has already been sized at half, which is the

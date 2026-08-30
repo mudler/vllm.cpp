@@ -4282,12 +4282,14 @@ and three things are still owed before a single cell of that table exists.
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
 The previous revision opened "Nine reviewed waves have landed. Eight of them are
 unreached by design and the ninth, W5a, is the only one with a production call
-site" over a table that held FOURTEEN rows, while four landed waves recorded
-under `## Owed` as unreached — W5c-2, W5d-1, W5d-3 and W5d-4 — had no row at all
-and W5b-6 had none either. That is a live self-contradiction of exactly the shape
-[#2288](https://github.com/mudler/vllm.cpp/issues/2288) names, inside the section
-that exists to reconcile #2288, and W5e-1 made it worse by adding a fifteenth
-wave to a sentence that said nine. A prose count beside a table it is not derived
+site" over a table that held THIRTEEN rows before W5e-1 and FOURTEEN after it,
+while FIVE landed waves had no row at all: W5b-6, W5d-1, W5d-3 and W5d-4, each
+carrying a `## Owed` entry that says it "lands UNREACHED", and W5c-2, whose
+`## Owed` entry names it under all four "Nothing lands dead" conditions for the
+block-table VALUE nothing reads. That is a live self-contradiction of exactly the
+shape [#2288](https://github.com/mudler/vllm.cpp/issues/2288) names, inside the
+section that exists to reconcile #2288, and W5e-1 made it worse by adding a
+FOURTEENTH row under a sentence that said nine. A prose count beside a table it is not derived
 from is a drift lock (`## Owed` records the same failure mode for the production
 refusal string). The count is therefore DELETED from the prose and the fact moved
 into a per-row column, which a reader can total and a wave cannot leave stale by

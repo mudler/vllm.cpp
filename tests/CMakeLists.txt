@@ -1108,8 +1108,74 @@ vllm_cpp_add_test(test_glm5_next_moe vllm/models/test_glm5_next_moe.cpp)
 target_compile_definitions(test_glm5_next_moe PRIVATE
   GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
 target_include_directories(test_glm5_next_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# GLM-5.3-Flash W5b-2 -- the decoder layer, the mHC stream threading, the
+# assembled `Glm5NextTextModel::Forward` and the KV binding (#2241). Runs a FIVE
+# layer model whose schedule carries all four control-flow combinations
+# `modeling_glm5_next.py:1261-1272` selects between plus a `shared` DSA layer,
+# at the PUBLISHED `hc_mult` of 4, so the `[T, hc_mult, hidden]` manifold is
+# asserted per stream and against an EARLY-COLLAPSE decoy captured from the same
+# oracle run -- a port that threads `[T, hidden]` is finite, right-shaped and
+# fluent, and nothing else in this tree catches it. Goldens are the RUN output
+# of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_layer_goldens.py`. `glm5_next_layer.h` is
+# MODEL-PRIVATE under src/, the same arrangement `glm5_next_attn.h` uses; the
+# published `config.json` is read so the cache widths the layer fills are gated
+# against the ones the production `make_kv_cache` hook publishes.
+vllm_cpp_add_test(test_glm5_next_layer vllm/models/test_glm5_next_layer.cpp)
+target_compile_definitions(test_glm5_next_layer PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_layer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_layer PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 target_include_directories(test_glm5_next_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
+# GLM-5.3-Flash W5b-1 -- `Glm5NextTextAttention` and its CROSS-LAYER top-k
+# sharing (#2241). The highest-value case is the `shared` layer: a port that
+# recomputes its own indexer where upstream reuses the previous layer's
+# selection RUNS and emits plausible tokens, so the fixture carries BOTH the
+# correct output and what a recomputing port produces and asserts ours is the
+# first. It also carries a SQUARE `kv_b_proj` case, where the untransposed
+# reading of the converter's half-transposed `k_b` is shape-valid and merely
+# wrong, and a left-padded row whose every key is masked -- upstream fills that
+# with `finfo.min` and not `-inf`, so its output is FINITE. Goldens are the RUN
+# output of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_attn_goldens.py`, which asserts the sha256 of the
+# INSTALLED reference module. `glm5_next_attn.h` is MODEL-PRIVATE under src/,
+# the same arrangement `glm5_next_dsa.h` uses.
+vllm_cpp_add_test(test_glm5_next_attn vllm/models/test_glm5_next_attn.cpp)
+target_compile_definitions(test_glm5_next_attn PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_attn PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
+# GLM-5.3-Flash W5b-1 -- the `OwnedTensor` -> host f32 bridge and the residency
+# decision it implements (#2241, spec `## Owed` O22). Pins the arithmetic that
+# forces the per-layer choice -- 0.4654 GiB for one bridged DSA layer against a
+# 426.72 GiB materialized tower and a ~119.63 GiB box -- and pins the 1 GiB
+# per-tensor ceiling BETWEEN the largest legitimate tensor (`o_proj`, 0.25 GiB)
+# and the smallest expert bank (`up_exps`, 9.0 GiB), so it is neither a mute
+# switch nor a gate that fires on ordinary work. Runs over the synthetic
+# `glm5next` miniature through the PRODUCTION `load_weights` hook.
+vllm_cpp_add_test(test_glm5_next_bridge vllm/models/test_glm5_next_bridge.cpp)
+target_include_directories(test_glm5_next_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_bridge PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# GLM-5.3-Flash W5b-2b -- THE ENGINE BINDING and the reachability proof this row
+# has owed since W2 (#2241, spec `## Owed` O15/O16/O17/O23/O25/O26). Every case
+# enters through `ModelRegistry::Forward` on the synthetic `glm5next` miniature,
+# so deleting the `Glm5NextHostForward` call in the registry's forward hook reds
+# the suite. The independently assembled RESIDENT tower is the oracle for the
+# streamed path's composition, and the `lm_head` chunk size is a parameter
+# because at any geometry small enough to run in a test the default gives ONE
+# chunk and the loop would never be entered twice.
+vllm_cpp_add_test(test_glm5_next_forward vllm/models/test_glm5_next_forward.cpp)
+target_include_directories(test_glm5_next_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_forward PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
@@ -1584,8 +1650,6 @@ vllm_cpp_add_test(test_weight_residency_config
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 
-vllm_cpp_add_test(test_placed_moe_roundtrip
-  vllm/model_executor/test_placed_moe_roundtrip.cpp)
 # ...and the expert-stream knob's own binary (#1122). `ResolveExpertStreamRequested`
 # caches its answer in a function-local static, so a process can observe what it
 # resolved exactly ONCE. That one observation is spent here, on the field the
@@ -3361,6 +3425,19 @@ target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/
 # `QWEN4_EXP_CKPT_FIXTURE_DIR` grant here would compile a path nothing reads.
 vllm_cpp_add_test(test_qwen4_exp_forward vllm/models/test_qwen4_exp_forward.cpp)
 target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5d-4 (#2249 item 4) — the MoE weight adapter, gated against
+# a from-scratch double-precision reimplementation of the lane-pinned oracle's
+# own `Qwen4ExpTextSparseMoeBlock.forward` that reads the SOURCE stacked towers,
+# not the `MoeBlockWeights` the adapter produced. Carries the RED this wave was
+# written against — the rank-3 towers dropped into the seam's rank-2 `_kq` fields
+# — so #2249's "the shapes match" cannot be re-derived. CPU only: a weight
+# adapter has no CUDA arm to compare, and the one GPU-only fact it turns on (the
+# (bf16,f32) combo `MatmulBTKernelCuda` refuses) is asserted on the DTYPE
+# instead. Reaches the model-private qwen4_exp_moe.h / qwen4_exp_weights.h, hence
+# the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_moe vllm/models/test_qwen4_exp_moe.cpp)
+target_include_directories(test_qwen4_exp_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit

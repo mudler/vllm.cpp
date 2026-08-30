@@ -1230,18 +1230,443 @@ config read — worth knowing before #2177 is gated against the real artifact.
 **Rebase note (RESOLVED):** the KV grouping overlapped PR #1977, which MERGED
 on 2026-08-27, so this built on current `main`.
 
-### W5b — the decoder layer, the DSA attention block, and the assembled forward (GPU, large)
+### W5b — the decoder layer, the DSA attention block, and the assembled forward — SPLIT, see the two sections below
 
-Split out of W5 above. The per-layer control flow (KDA vs DSA, dense vs sparse,
-mHC stream threading), the `Glm5NextTextAttention` block the DSA arm needs, and
-`Glm5NextTextModel::Forward`. **Anchors:** `modeling_glm5_next.py:1064-1257`
-(`Glm5NextTextAttention`, `expand_kv`, `build_attention_mask_from_topk`),
-`:1259-1331` (`Glm5NextTextDecoderLayer`), `:1409-1494`
-(`Glm5NextTextModel.forward`). The manifold is threaded from the embedding as
+This was W5's PLAN for W5b, kept so the two readings do not look like a
+contradiction. It scoped the per-layer control flow, the attention block and
+`Glm5NextTextModel::Forward` as one wave. **Anchors:**
+`modeling_glm5_next.py:1064-1257` (`Glm5NextTextAttention`, `expand_kv`,
+`build_attention_mask_from_topk`), `:1259-1329`
+(`Glm5NextTextDecoderLayer`), `:1409-1494` (`Glm5NextTextModel.forward`). The
+manifold is threaded from the embedding as
 `inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1)` (`:1477`) and collapsed
 by the UNWEIGHTED `hc_head` before the final norm (`:1493`), so the whole stack
-carries `[T, hc_mult, hidden]` and not `[T, hidden]`. Owns discharging O15, O16,
-O17 and O23 at the moment the layer calls the four primitives.
+carries `[T, hc_mult, hidden]` and not `[T, hidden]`.
+
+**It splits, and the split is not a size decision.** The attention block and the
+`OwnedTensor` bridge answer to `transformers` v5.16.1 and to the llama.cpp
+#27752 container, and both can be gated with no cache and no decoder layer over
+them. The decoder layer, the mHC threading and the forward answer additionally
+to `MakeGlm5NextKVCache` and to the `[T, hc_mult, hidden]` manifold, and they are
+where reachability lands. Landing them together would produce one diff whose
+correctness argument runs through two unrelated oracles at once.
+
+### W5b-1 — the DSA attention block and the `OwnedTensor` bridge (CPU, large). LANDED — [#2324](https://github.com/mudler/vllm.cpp/issues/2324)
+
+Two deliverables.
+
+**(a) `Glm5NextTextAttention`** (`modeling_glm5_next.py:1064-1257`), as
+`src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` — a host f32 reference,
+exactly as `glm5_next_dsa.cpp`, `glm5_next_mhc.cpp` and `glm5_next_moe.cpp` are.
+`QResid` (`:1167`), `CompressKv` (`:1170-1172`), `ExpandKv` (`:1136-1153`) over
+the checkpoint's SPLIT half-transposed `kv_b_proj` halves,
+`BuildAttentionMaskFromTopk` (`:1218-1256`), `IndexerRoleFor` (`:1130-1134`) and
+`Attention` (`:1155-1216`) with `eager_attention_forward` (`:1039-1061`)
+inlined, which upstream says at `:1227-1228` is the only interface a 3-D
+per-(query, key) mask can reach.
+
+Three things it gets right that a fluent wrong port gets wrong, each with its own
+discriminating case:
+
+* **The `kv_b_proj` halves are SPLIT and only the K half is TRANSPOSED.** The
+  file carries `attn_k_b` at `[H, kv_lora, qk_nope]` and `attn_v_b` at
+  `[H, v_head, kv_lora]`, so K contracts over its FIRST inner axis and V over its
+  SECOND. At the published geometry a swap is a shape error; the gate therefore
+  ALSO carries a SQUARE case at `kv_lora == qk_nope == v_head`, where the
+  untransposed reading is shape-valid and merely wrong, and asserts the
+  separation (2.9469 over every one of 900 values, printed by the case).
+* **Cross-layer top-k sharing.** `indexer_types[layer_idx] == "shared"` means the
+  layer builds NO indexer and reuses the previous full layer's selection. The
+  gate runs the shared layer against BOTH the correct output and the output a
+  RECOMPUTING port produces from a decoy indexer — both captured from the same
+  oracle run — and asserts ours is the first: 320 of 800 values differ, max
+  separation 1.52, over 20 of 50 query rows.
+* **The all-masked row is `finfo.min`, not `-inf`** (`:1253`). A left-padded
+  query row has every key masked; with `finfo.min` its softmax is uniform and
+  its output finite, and with `-inf` the NaN reaches `o_proj` and then the
+  residual stream. The `-inf` mutation reds 49 of 160 assertions.
+
+**No rope branch, and upstream is what says so.** `validate_architecture`
+(`configuration_glm5_next.py:225-228`) RAISES for any positive
+`qk_rope_head_dim`, measured by constructing one in the golden generator, so
+`expand_kv`'s concat has a zero-width second half and `key_states` IS `k_nope`.
+`MlaDims::Validate` mirrors the refusal in upstream's own words rather than
+half-implementing a branch no released config can select.
+
+**(b) The `OwnedTensor` -> host f32 bridge**, as
+`glm5_next_bridge.{h,cpp}` — O22's open question, answered. See O25 below for
+the decision and its arithmetic.
+
+**Its FOUR advertised refusals are each a gate, which they were not when the
+wave was first proposed for review.** `glm5_next_bridge.h` lists four cases
+`DecodeOwnedTensorToF32` refuses by name, and the fresh review found that
+deleting any of the block element-count check, either byte-span check or the
+`default:` dtype arm left the suite fully green. Two of those were not cosmetic:
+without the elementwise byte-span check `std::memcpy(out.data(), src, need)`
+reads past a short `t.bytes` and serves the HEAP as weight values, and without
+the `default:` arm an encoding the bridge cannot widen returns the ZERO-filled
+buffer it allocated — the same failure the `host_released` refusal exists to
+stop, reached by another door. Five cases now pin them, each proved by
+disabling the refusal in a scratch copy with the mutant's BUILD rc recorded
+beside its TEST rc:
+
+| refusal | mutation | result |
+|---|---|---|
+| block element count is a whole number of blocks | `if (false)` | BUILD 0 / TEST 1, 1 assertion |
+| block byte span equals `RowSizeBytes` | `if (false)` | BUILD 0 / TEST 1, 3 assertions |
+| a block dtype has a `BlockToFloat` decoder | `if (false)` | BUILD 0 / TEST 0 — SURVIVES |
+| elementwise byte span equals `numel * SizeOf` | `if (false)` | BUILD 0 / TEST 1, 3 assertions |
+| `default:` refuses a non-float encoding | `return out;` | BUILD 0 / TEST 1, 4 assertions |
+
+The survivor is disclosed rather than chased, and it is the "unselected branch"
+shape: `vt::IsBlockQuant` is true for exactly the 18 dtypes `BlockToFloat`
+answers for, so no input can reach that arm in this build. What the suite gates
+instead is the PREMISE — every block dtype has a decoder — and that gate is
+ARMED, measured by a second mutation on the other side. Rewriting
+`BlockToFloat`'s `kQ8_0` case to `return nullptr` (BUILD rc=0) reds the premise
+case AND makes the refusal fire by name in two more:
+`` `moe.gate_exps` is q8_0, which this build has no `BlockToFloat` decoder for``.
+So the branch is live under the only condition that can reach it, which is the
+state IQ2_XS and IQ4_XS were in before #2245.
+
+**NOT REACHED.** Nothing in either file is called from a production entry point
+at this merge commit; the only call sites are the two focused gates'. W5b-2
+owns the wiring. O25 carries the disclosure.
+
+### W5b-2 — the decoder layer, the mHC threading and the assembled forward — SPLIT AGAIN, see the two sections below
+
+This was W5b-1's PLAN for W5b-2, kept so the two readings do not look like a
+contradiction. It scoped `Glm5NextTextDecoderLayer` (`:1259-1329`), the mHC
+stream threading, `Glm5NextTextModel::Forward` (`:1409-1494`), the binding of the
+attention block to `MakeGlm5NextKVCache`, AND the discharge of O15, O16, O17,
+O23 and O25 at the moment the layer calls the five primitives.
+
+**The first four landed together and the fifth did not, because the fifth is not
+the same kind of work.** The layer, the threading, the forward and the cache
+binding answer to `transformers` v5.16.1 and to `MakeGlm5NextKVCache`, and they
+are gated by running the reference. Discharging the five reachability debts
+needs something else entirely: a weight bridge for the FOUR arms W5b-1 did not
+bridge, and an engine binding that turns a `ModelForwardInput` into per-request
+sequences and carries per-layer state across steps. §W5b-2b states the
+arithmetic that makes the first of those a design problem rather than four more
+`BridgeDsaLayer`s.
+
+### W5b-2a — the decoder layer, the mHC threading, the forward and the KV binding (CPU, large). LANDED — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
+
+`src/vllm/model_executor/models/glm5_next_layer.{h,cpp}`:
+`DecoderLayerForward` (`:1279-1329`) with all four control-flow arms
+`:1261-1272` selects between, `TextModelForward` (`:1431-1494`), and
+`ExpandToHiddenStreams` (`:1477`). Plus the cache binding, as an additive
+`DsaCache*` on `Attention` (`glm5_next_attn.h`) and a
+`SelectIndexerTopkFromPacked` lifted out of `SelectIndexerTopk`'s body
+(`glm5_next_dsa.h`), both null-default and byte-identical on the uncached path
+W5b-1 gated.
+
+**THE MANIFOLD IS THE WHOLE POINT, and it is gated three ways that do not
+overlap.** `:1477` expands the embedding to `[B, S, hc_mult, H]` and nothing
+collapses it until `hc_head` at `:1493`; a port that threads `[B, S, H]` and
+collapses early RUNS, is finite, and emits fluent text, and every sublayer gate
+on this row stays green because the collapsed stream is exactly what the
+sublayers consume. So: the per-layer `[B, S, 4, H]` streams are asserted
+ELEMENTWISE; `kStreamSeparation` carries the oracle's own minimum pairwise
+distance between the four streams (**6.4703**) so those assertions are shown to
+be discriminating rather than four copies of one value; and `kEarlyCollapseFinal`
+is a DECOY produced by the SAME oracle modules with the manifold collapsed to its
+mean and re-broadcast after every layer, which the gate asserts we differ from by
+the oracle's own measured **2.4032**.
+
+**The KV binding stores the LATENT, not what the reference stores.** Upstream
+caches the EXPANDED `key_states`/`value_states` at `:1175-1179` — 32,768 values
+per token per layer — and `DsaCache` stores the 512-wide `k_pass` and the
+257-wide packed indexer row instead, which is exactly what
+`MakeGlm5NextKVCache`'s groups 0 and 2 publish. §"MLA: cache the latent" decided
+that and said the equivalence was to be PROVED; the proof is that `ExpandKv` is
+token-wise, which NoPE is what makes true, and it is a case asserting
+`ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)` EXACTLY on real values. It is
+NOT the absorption optimization, which is a speed change and W8's.
+
+**A MUTATION FOUND THE INSTRUMENT, NOT THE PORT, AND IT IS RECORDED AS A
+FINDING.** The mutation that truncates the attention's key range to the current
+window under a filled cache — the "a cache nobody reads back" defect — SURVIVED
+the whole suite at 1647 of 1647 assertions on the first pass. Its output is
+all-NaN, `NaN - want` is NaN, and `NaN > x` is FALSE for every x, so the
+running maximum in the test's `MaxGap` helper never moved off its initial zero
+and an all-NaN forward read as a PERFECT match on every gap assertion in the
+file. `MinStreamSeparation` and the cached-tail comparison were blind the same
+way, because `std::max(m, NaN)` returns `m`. All three now treat a non-finite
+value as an infinite gap and report the count separately, so a failure
+distinguishes "wrong number" from "not a number"; the mutation then reds 3
+assertions. This is the broken-instrument-fails-toward-a-code-verdict class, and
+it was found only because the mutation battery was run at all.
+
+**RED FIRST, and the red found a real defect in the oracle configuration
+rather than in the port.** The first run read 4 of 10 cases and 7 of 1647
+assertions failed, layer 0 (KDA) green and every DSA layer red by 2.7 to 8.1.
+The cause was that `Glm5NextPreTrainedModel` sets `_supports_sdpa = True`, so the
+DEFAULT `_attn_implementation` this config resolves is `sdpa`, and
+`build_attention_mask_from_topk` returns a BOOLEAN mask on that arm
+(`:1249-1250`) instead of the additive `finfo.min` one the eager arm builds
+(`:1252-1256`). The two disagree on a LEFT-PADDED query row where every key is
+masked — torch's SDPA emits 0.0 there and eager's uniform softmax emits the mean
+of the values, measured as 0.0 against our 0.509 — so the generator now pins
+`cfg._attn_implementation = "eager"`, which is the arm W5b-1 gated and the one
+`:1227-1228` names as the only interface this model's 3-D per-(query, key) mask
+can reach. Green is 10/10 cases and 1656/1656 assertions after the instrument repair (1647 before it).
+
+**NOT REACHED, and O26 carries the disclosure.** `ForwardGlm5NextForConditionalGeneration`
+still refuses by name. W5b-2b owns the wiring.
+
+### W5b-2b — the weight bridge for the other four arms, and the engine binding (CPU, large). LANDED — [#2337](https://github.com/mudler/vllm.cpp/issues/2337)
+
+What makes `ModelRegistry::Forward` stop refusing by name, and therefore what
+discharges O15, O16, O17, O23, O25 and O10's remaining half. Two deliverables,
+and the first is a design problem rather than more of W5b-1's bridge.
+
+**(a) The bridge for the KDA, MoE, dense-MLP and mHC arms.**
+`BridgeDsaLayer` covers `Glm5NextMlaWeights` and its nested indexer, and
+`TextModelWeights` needs four more: `Glm5NextKdaWeights` (15 tensors),
+`Glm5NextMlpWeights` (3), `Glm5NextMhcWeights` (3, twice per layer) and the
+`Glm5NextWeights` head — `embed_tokens`, `norm`, `lm_head`. Three of those four
+are mechanical. **The MoE is not**, and the arithmetic is this row's own:
+
+| what, at the published geometry | f32 GiB |
+|---|---:|
+| one bridged DSA layer (W5b-1, measured) | 0.4654 |
+| the 34 KDA layers' projections, all held | ~18.5 |
+| ONE sparse layer's 288 routed experts (`gate_up` + `down`) | **~27** |
+| the 42 sparse layers' routed experts, all held | **~1,150** |
+| usable on `dgx:gpu0` | ~119.63 |
+
+`kBridgeTensorF32ByteCeiling` is 1 GiB and the smallest expert bank is 9.0 GiB,
+so `DecodeOwnedTensorToF32` REFUSES a bank by name today — which is O25's
+`byte_ceiling` gate working exactly as designed, not an obstacle to route
+around. Only 8 of 288 experts are selected per token, so the shape that fits is
+an on-demand per-expert decode: `MoeForward` grows an optional expert source
+consulted for each SELECTED expert when `expert_gate_up` is empty, which keeps
+`vt::MoeRouterTopK` and `vt::MoeCombine` as the seams and adds no parallel path.
+That is one seam change in W5's file with its own red-first gate, and it is why
+this is a wave and not a paragraph.
+
+**(b) The engine binding, which is the SMALLER half and has a house pattern.**
+This was surveyed rather than guessed, because "where does per-request state
+live across steps" looked like the hard part and is not. TWO registered models
+already carry a host arm inside their `forward` hook that ignores the device
+paged caches entirely: `NemotronHForCausalLM`
+(`nemotron_h_registry.cpp:200-213`, whose comment says the host reference
+"consumes three of `ModelForwardInput`'s fields — `token_ids`,
+`logits_indices`, `queue`") and `KimiLinearForCausalLM`
+(`kimi_linear_forward.cpp:462-476`, which `(void)`s `positions`, `attn_meta`,
+`attn_kv` and `queue`). Both RE-RUN THE WHOLE PREFIX each step
+(`nemotron_h.cpp:1047-1066`, `kimi_linear_forward.cpp:436-460`) rather than
+owning state, and a survey of every `: public LoadedModel` in the tree found NO
+model that keeps per-request KV or recurrent state on its `LoadedModel` — the
+persistent members are weights, a CUDA-graph driver, a derived read-only cache,
+or load-time bookkeeping. Kimi-Linear is the closest architecture there is to
+this one (KDA plus MLA), so its shape is the precedent to follow.
+
+The rest is house pattern too: `HostLogits(std::vector<float>&&, vocab)`
+(`qwen3_5_common.cpp:24-30`) builds the carrier and derives `rows` from
+`host.size() / vocab`, and the gather-then-lm_head — empty `logits_indices`
+means EVERY row, the gather happens BEFORE lm_head so it never runs on the full
+`T`, and the indices are bounds-checked — is `nemotron_h.cpp:997-1022` with an
+identical copy at `kimi_linear_forward.cpp:409-433`. Ragged batching, if W5b-2b
+wants it rather than the single-sequence shape both precedents use, is
+`attn_meta.query_start_loc` sliced as at `kimi_linear_device.cpp:2120-2126`,
+with the empty-`num_computed_tokens_cpu` fallback `dots3_note_device.cpp:336-346`
+warns "falls OPEN".
+
+**A full-prefix recompute makes `LayerCache` unreached on that path, and that is
+a decision W5b-2b has to take rather than inherit.** W5b-2a's cache binding is
+gated and correct; if the production hook follows Nemotron-H and Kimi-Linear it
+will not call it, which would leave the binding in the same unreached state this
+wave is disclosing. The alternative — carrying `std::vector<LayerCache>` on
+`Glm5NextLoadedModel` — has no precedent in this tree, and inventing one on a
+model that cannot be run end to end on this fleet is the wrong place to try.
+
+**O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) is W5b-2b's to
+answer, and W5b-2a cannot make it reachable.** `glm5_next_layer.cpp` calls
+`MoeForward`, whose only `vt` ops remain `vt::MoeRouterTopK` and
+`vt::MoeCombine` — every expert GEMM is still a host `std::vector<float>`
+accumulation — so it reaches neither `vt::MergedGemmGroup` nor
+`MoeGateUpSwiGLUGroupedCuda` and the `gate/up must be the SAME CUDA keep-quant
+dtype` throw cannot fire from this row. The per-expert source in (a) keeps that
+property by construction, because it hands the block host floats.
+
+#### What W5b-2b actually landed
+
+**`ModelRegistry::Forward` reaches this model.** Both deliverables landed as
+scoped, and the plan above was followed rather than reinterpreted: the MoE half
+is an on-demand per-expert source and the binding is the surveyed house pattern.
+
+**(a) The bridge.** `BridgeKdaLayer` (15 tensors), `BridgeMlp` (3, used by the
+dense layers and by every sparse layer's shared expert) and `BridgeMhcSite` (3,
+twice per layer) are shape-checked decodes on the pattern `BridgeDsaLayer`
+already set. `BridgeMoeLayer` bridges the ROUTER, the correction bias and the
+shared expert and **leaves the three expert banks EMPTY by construction**.
+
+The primitive underneath is new: `DecodeOwnedTensorRowsToF32` decodes a
+contiguous LEADING-AXIS ROW RANGE out of a block-resident `OwnedTensor`, and
+`HostF32RowBytes` is the shape-only budget for one row.
+`kBridgeTensorF32ByteCeiling` is UNCHANGED at 1 GiB and the RANGE is checked
+against that same ceiling, so asking for all 288 rows of a bank is refused by
+exactly the arithmetic that refuses the whole tensor — the row API is not a way
+around the gate. A block row that is not a whole number of blocks is refused by
+name, because a slice starting mid-block does not fail: the decoder reads the
+next block's scale and returns plausible values from the wrong quantization.
+
+The arithmetic that forces the shape, all of it asserted rather than written:
+
+| what, at the published geometry (288 experts, `moe_I` 2048, `H` 4096) | f32 bytes | GiB |
+|---|---:|---:|
+| one expert's `gate_up`, `[2 * 2048, 4096]` | 67,108,864 | 0.0625 |
+| one expert's `down`, `[4096, 2048]` | 33,554,432 | 0.03125 |
+| **one expert, both** | **100,663,296** | **0.09375** |
+| ONE ROW of `ffn_up_exps` | 33,554,432 | 0.03125 |
+| one bank (`ffn_up_exps`, `[288, 2048, 4096]`) | 9,663,676,416 | **9.0** |
+| one sparse layer's THREE banks | 28,991,029,248 | **27.0** |
+| the 42 sparse layers' banks, all held | 1,217,623,228,416 | **1,134.0** |
+| usable on `dgx:gpu0` | | ~119.63 |
+
+A resident float bank set is **9.5x over the box**. One row is **32x UNDER the
+1 GiB ceiling** while the bank is 9x over, which is where the two populations
+separate and why the ceiling did not move. `num_experts_per_tok` is 8 of 288, so
+what a token needs is at most 8 experts and what a step needs is the DISTINCT
+experts its tokens hit; `MoeForward` now groups the `[T, K]` routing slots by
+expert and visits each hit expert ONCE, which is upstream's own order
+(`Glm5NextTextExperts.forward` loops the hit experts, not the tokens) and which
+is what bounds the peak at one expert. Every `[t, j]` slot is still computed
+independently into its own row of the combine's `[T, K, H]` operand, so the
+resident path is byte-identical to the token-major visit it replaced — asserted
+EXACTLY, not to a tolerance, against a resident bank built from the same
+tensors.
+
+`MoeLayerWeights` grows a BORROWED `ExpertSource*`. Exactly one of the two
+residencies is admissible and the other two states are refused by name: both
+populated is ambiguous, and neither populated is a null dereference — **measured
+at rc=139 (SIGSEGV), not assumed**, which is why the refusal's message names
+that failure and not the softer "reads as zeros".
+
+**(b) The engine binding.** `glm5_next_forward.{h,cpp}`.
+`Glm5NextGgufLayerSource` is a `LayerWeightSource` holding ONE slot: it bridges
+layer `i`, hands back a reference valid until the next call, and drops the
+previous layer BEFORE bridging the next so the peak is never two. There is
+deliberately no map keyed by layer index, for the reason `glm5_next_bridge.h`
+gives for having no `BridgeTower`. `TextModelForward` grows an overload over
+that source, and the resident overload now delegates to it through a trivial
+`ResidentLayerSource`, so the manifold expansion, the `prev_topk` threading and
+the `hc_head` collapse stay in ONE loop rather than being copied into a second
+forward.
+
+`Glm5NextHostForward` is the rest: a per-token embedding gather out of the
+`[154880, 4096]` table (2.36 GiB in f32, which the ceiling refuses; a row is 16
+KiB), the stack, the logits gather BEFORE `lm_head` with empty meaning every row
+and every index bounds-checked, and `lm_head` streamed in `kLmHeadChunkBytes`
+(64 MiB) chunks. The chunk size is a PARAMETER and that is not a convenience: at
+any geometry small enough to run in CI the default gives ONE chunk, so a
+chunk-offset defect would never be reached by a gate that could only take the
+default.
+
+The residency ladder the forward actually runs at:
+
+| what | GiB |
+|---|---:|
+| the tower as loaded, block-resident | 101.14 |
+| the tower expanded to f32 (what a `TextModelWeights` would be) | 426.72 |
+| ONE bridged DSA layer | 0.4654 |
+| ONE bridged KDA layer | 0.5449 |
+| ONE sparse layer's router + shared expert | 0.0996 |
+| ONE routed expert | 0.0938 |
+| one `lm_head` chunk | 0.0625 |
+
+The forward's f32 peak is one layer plus one expert plus one chunk — under 0.75
+GiB, 0.6% of the box — while the tower stays exactly as the loader left it.
+
+**The hook follows the house pattern, with ONE divergence stated rather than
+inherited.** `ForwardGlm5NextForConditionalGeneration` opens the handle with
+`ModelAs<Glm5NextLoadedModel>` (which W5c made possible and this wave gave
+something to open it FOR), `(void)`s `positions`, `attn_meta`, `gdn_meta`,
+`attn_kv` and `gdn_state`, and re-runs the whole prefix each step — the shape
+`NemotronHForCausalLM` and `KimiLinearForCausalLM` both use, on a tree where no
+`LoadedModel` keeps per-request state. **The divergence:** both precedents take
+`token_ids` as one sequence whatever `num_reqs` says, which on a two-request
+step attends across the request boundary. For this model that is fluent wrong
+text no gate on this fleet could detect (§Gates), so a multi-request step is
+REFUSED BY NAME and ragged batching is owed. A non-CPU queue is refused too,
+because every primitive on this row is host f32 and `vt::MoeRouterTopK`
+dispatches on the queue's device.
+
+**RED FIRST, and the red came from an EXISTING gate rather than a new one.**
+`test_glm5_next_scaffold.cpp`'s case pinning "the forward REFUSES BY NAME, and
+names what is UNASSEMBLED" went red at 8 assertions in 1 case the moment the
+hook ran. That pin MOVED with the change rather than being deleted by it — the
+same shape W3 used when `MlaBlockDims::Validate` stopped refusing the NoPE
+geometry — and now asserts the state that replaced the refusal: the blanket
+message is GONE (asserted as an absence, with the exact sentence it carried, so
+a revert reds it) and a foreign handle is refused by the DOWNCAST naming this
+architecture.
+
+**Thirteen negative mutations, and TWO of them survived the first suite.** Both
+survivals are recorded below because each is a fact about the gate, not a
+footnote. Measured on tree `91354df62`, each mutant proved APPLIED by a diff
+hash, BUILT (rc=0 on all thirteen — a build failure reads as a passing test) and
+restored byte-for-byte:
+
+| # | mutation | test | rc | failed |
+|---|---|---|---:|---:|
+| M1 | **REACHABILITY**: delete the `Glm5NextHostForward` call in the registry hook | forward | 1 | 11 of 118 |
+| M2 | the layer source ignores its index (always bridges layer 0) | forward | 1 | 32 of 81 |
+| M3 | `DecodeOwnedTensorRowsToF32` drops the row offset | bridge / forward | 1 / 1 | 11520 of 32228 / 5 of 118 |
+| M4 | `GgufExpertSource` always decodes expert 0 | bridge | 1 | 224 of 32228 |
+| M5 | the NEITHER-residency refusal disabled | bridge | **139** | SIGSEGV |
+| M6 | the mid-block row-alignment refusal disabled | bridge | 1 | 2 of 32228 |
+| M7 | the `lm_head` chunk writes at `o` instead of `first + o` | forward | 1 | 2 of 118 |
+| M8 | the non-CPU-queue refusal disabled | forward | 1 | 2 of 118 |
+| M9 | the multi-request refusal disabled | forward | 1 | 1 of 118 |
+| M10 | the row-range ceiling check disabled | bridge | 1 | 2 of 32228 |
+| M11 | the gate and up halves swapped in the per-expert fusion | bridge / forward | 1 / 1 | 224 of 32228 / 3 of 118 |
+| M12 | the two mHC sites swapped in the layer source | forward | 1 | 24 of 118 |
+| M13 | the per-expert grouping removed from `MoeForward` | bridge | 1 | 3 of 32228 |
+
+**M12 SURVIVED at 86 of 86 before the repair, and the cause is the FIXTURE.**
+Exchanging `attn_hc` and `mlp_hc` inside `Glm5NextGgufLayerSource` left every
+logit BIT-IDENTICAL. The miniature's mHC `fn` payloads are ramps in the hundreds
+and thousands, so `F.linear(normed, fn) + base` saturates every sigmoid gate and
+the Sinkhorn projection converges to the same matrix from either site; the swap
+is arithmetically invisible downstream. A gate that could only see it through
+the logits is a mute switch at that geometry, so the mapping is now asserted
+STRUCTURALLY against the loader's own two tensors, with the two tensors asserted
+to DIFFER so the equality is a fact and not a tautology. M12 then reds 24.
+
+**M13 SURVIVED at 32030 of 32030 before the repair, and the cause is the
+POPULATION.** The "each expert decoded exactly once" case ran ONE token, and at
+one token every selected expert is hit once whatever the code does. The case now
+also runs SIX tokens, where the router fills 12 slots from 2 distinct experts and
+a per-slot visit decodes each of them six times — six 96 MiB decodes at the
+published geometry. M13 then reds 3.
+
+**M5 kills by CRASHING rather than by failing an assertion**, and that is
+recorded as the result it is: without the refusal the loop dereferences a null
+`expert_source`. The message was corrected in the same flow, because it had
+claimed the experts "would read as a ZERO weight".
+
+**Green:** `test_glm5_next_forward` 9 cases / 118 assertions, `test_glm5_next_bridge`
+19 / 32228, `test_glm5_next_scaffold` 38 / 2652, and the six sibling suites
+unchanged and green (layer 10/1656, moe 8/1614, gguf_load 16/8731, attn 14/160,
+kda 28/342, dsa 10/1934, mhc 5/98).
+
+**One record edit this wave owes and does not hide:** `glm5_next` is added to
+`scripts/runner-routing-allowlist.txt`, because the decode returns HOST logits.
+That is the honest state and the entry says why — there is nothing to be
+device-native against yet, W3's CUDA arm being committed and unmeasured, and the
+forward refuses a device queue rather than pretending otherwise. **The
+checker's OTHER invariant misclassifies this model and that is disclosed rather
+than fixed here:** `check-runner-routing-consistency.py` reports it in the "30
+keep bf16-resident DBuf activations" bucket, which is false — every buffer on
+this path is host f32. The reason is the cross-TU resolution hole the
+`nemotron_h` allowlist entry already names (#1410): the invariant reads the
+registry TU's decode file set, and this model's f32 residual declarations live
+in `glm5_next_forward.cpp`. Teaching it to follow the hop is a semantic checker
+change, which AGENTS.md routes to its own row, spec and red-before.
 
 ### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
 
@@ -2704,10 +3129,312 @@ Debts this row carries, each visible rather than waived:
   to reach it. The entry is kept rather than deleted because it is the reason
   the numbering skips: it was live when the tests below it were written. What it
   bounded is now bounded by the forward itself, which W5b owes.
+- **O25 — W5b-1's two files are NOT REACHED from a production entry point, and
+  the residency question O22 left open is now ANSWERED.** Two separate things,
+  in one entry because one wave owns both.
+
+  **The reachability disclosure.**
+  `src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` and
+  `glm5_next_bridge.{h,cpp}` are host references, and the only call sites at
+  this merge commit are `tests/vllm/models/test_glm5_next_attn.cpp` and
+  `test_glm5_next_bridge.cpp`. `grep` over `src/`, `include/` and `examples/`
+  for `glm5_next::Attention`, `BridgeDsaLayer`, `DecodeOwnedTensorToF32`,
+  `IndexerRoleFor` and the two headers returns NOTHING outside those four files.
+  This is the staged-slice disclosure AGENTS.md "Nothing lands dead" requires,
+  declared rather than claimed by silence. There is no production call site to
+  delete, so `.agents/reachability.md`'s reachability mutation has already been
+  answered: the change has no entry-point chain, and saying so is the answer.
+  **The wiring belongs to W5b-2**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **And one arm stays unreached even after the wiring, which is the shape that
+  SURVIVES W5b-2.** `IndexerRoleFor`'s `shared` arm is CONFIG-KEYED, and the
+  published `GLM-5.3-Flash` `config.json` selects it on ZERO of its 45 layers —
+  the gate measures that and prints `published schedule: 0 shared layers of 45`
+  rather than asserting it from prose. So the cross-layer sharing this wave
+  gates is correct against `transformers` v5.16.1 on a schedule the released
+  checkpoint does not contain, and the wave's own headline should be read with
+  that clause attached. It is the same "unselected branch"
+  (`.agents/reachability.md`) shape as the rope half, which this spec already
+  discloses as "a branch no released config selects" — the difference being
+  that the rope branch is REFUSED and this one is IMPLEMENTED and gated. Once
+  O25's reachability half is discharged the two files become reached; the
+  `shared` arm still is not, and closing that needs either a config that selects
+  it or an accepted decision to leave it gated by fixture alone.
+
+  **`byte_ceiling` is a DEFAULT ARGUMENT, so the ceiling arithmetic below binds
+  the bridge and not the function.** `DecodeOwnedTensorToF32`'s third parameter
+  defaults to `kBridgeTensorF32ByteCeiling` and any caller may pass a larger
+  one. The STRUCTURAL claim — that `BridgeDsaLayer`, the only entry point, has
+  no overload taking an expert bank — holds unconditionally. The NUMERIC claim
+  holds for every call that takes the default, which is every call in this tree.
+  A caller that raises the ceiling has opted out, and nothing here stops it.
+
+  **`Numel` iterates `i < t.rank` against a fixed `shape[vt::kMaxRank]`**, so a
+  hand-built `OwnedTensor` with `rank > kMaxRank` would read past the array. No
+  loader-produced tensor can hold one, and the loader is the only producer this
+  bridge is reachable from; recorded rather than guarded so the next reader does
+  not have to re-derive that it is unreachable.
+
+  **The residency decision: DECODE ONE LAYER AT A TIME, ON DEMAND, AND NEVER
+  RETAIN THE TOWER IN FLOAT.** O22 wrote "Whoever writes the forward decides
+  whether to decode per layer or to go device-native; nothing here forecloses
+  either." The arithmetic forces the first, and every number is this row's own
+  measurement rather than an estimate:
+
+  | what | GiB |
+  |---|---:|
+  | the published `UD-Q2_K_XL` artifact, block-resident as loaded | **101.14** |
+  | the same tower with every tensor expanded (`### The measured residency`) | **426.72** |
+  | all-bf16 | 597.46 |
+  | usable on `dgx:gpu0`, the largest device this project reaches | **~119.63** |
+  | ONE bridged DSA layer, f32 | **0.4654** |
+  | all ELEVEN DSA layers held at once | 5.12 |
+
+  A decoded tower is 426.72 GiB against 119.63, which is 3.57x over — and that
+  is the figure #2245 and #2247 spent six pull requests removing. A float tower
+  is not expensive; it does not exist on any hardware this project can reach.
+  One layer is 499,657,728 bytes, 0.39% of the box, and the caller's peak is one
+  layer because the mirror is a value it can drop. There is deliberately no
+  `BridgeTower`, no cache and no map keyed by layer index: each of those turns
+  "one layer" into "every layer visited so far", which is the tower again with a
+  slower ramp.
+
+  **Device-native was NOT chosen, and the reason is not preference.** There is
+  nothing to be device-native against. Every glm5_next primitive on this row is
+  a host f32 reference and W3's CUDA arm is committed and UNMEASURED for want of
+  a `dgx:gpu0` lease. A device bridge would land beside a device forward that
+  does not exist, which is the "unpassed parameter" shape. W5b-2 revisits it.
+
+  **O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) stays live and
+  this bridge cannot make it reachable**, gated rather than argued. Structurally
+  there is no overload taking `Glm5NextMoeWeights`, `Glm5NextMlpWeights` or any
+  expert bank — the whole surface is `Glm5NextMlaWeights` and
+  `Glm5NextIndexerWeights`, which carry no IQ2_XS or IQ4_XS tensor. Numerically
+  `kBridgeTensorF32ByteCeiling` is 1 GiB, which is EXACTLY 4x above the largest
+  legitimate tensor (`o_proj`, 0.25 GiB) and EXACTLY 9x below the smallest
+  expert bank (`up_exps`, 9.0 GiB); both sides are asserted, because a ceiling
+  above everything is a mute switch and one below the real population is a gate
+  that fires on ordinary work. The check runs from the SHAPE, before any
+  allocation, and the test proves it by handing the bridge a published-size bank
+  carrying no bytes at all.
+
+  **One mutation SURVIVED and is recorded as EQUIVALENT rather than chased.**
+  Rewriting `BridgedDsaLayer::host_f32_bytes` to take
+  `BridgedDsaLayerF32Bytes(d, id)` instead of summing the decoded buffers leaves
+  every assertion green — and it must, because `DecodeShaped` refuses any tensor
+  whose shape disagrees with the dims, so no reachable state separates the two
+  computations. The test pins the sum against the buffers THEMSELVES rather than
+  against the predictor, which is what makes the remaining agreement a fact and
+  not a tautology; an earlier version asserted only
+  `host_f32_bytes == BridgedDsaLayerF32Bytes(...)` and that mutation passed it.
+
+- **O26 — `glm5_next_layer.{h,cpp}` is NOT REACHED from a production entry
+  point, and O15, O16, O17, O23 and O25's reachability halves are therefore NOT
+  discharged.** W5b-2a ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
+  landed the decoder layer, the mHC stream threading, `TextModelForward` and the
+  KV binding, and `ForwardGlm5NextForConditionalGeneration` still refuses by
+  name, so the only call site at this merge commit is
+  `tests/vllm/models/test_glm5_next_layer.cpp`'s. This is the staged-slice
+  disclosure AGENTS.md "Nothing lands dead" requires, declared rather than
+  claimed by silence, and it is stated in the STRONG form on purpose: W5b-2a's
+  own scope said it would discharge those five, and it does not.
+  `.agents/reachability.md` is explicit that "an intermediate hop that is itself
+  unreached does not carry", so a KDA arm now called from `glm5_next_layer.cpp`
+  is exactly as unreached as it was when only its own gate called it.
+  **The wiring belongs to W5b-2b**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **What DID change, stated precisely so the next reader does not re-derive
+  it.** Before this merge the five primitives had five separate dead ends and no
+  assembly point; after it they have ONE, gated against the reference at 10 cases
+  and 1647 assertions, and the remaining gap to a production entry point is a
+  single hop — the weight bridge for four arms plus the engine binding, §W5b-2b.
+  That is a smaller and better-defined debt than five, and it is still a debt.
+
+  **There is a production call site to delete after W5b-2b and there is none
+  now**, so `.agents/reachability.md`'s reachability mutation is answered here
+  the way it was for W5b-1: the change has no entry-point chain, and saying so is
+  the answer. The mutation this change CAN run, and does, is the one for the KV
+  binding's own seam — deleting the `DsaCache*` argument at
+  `glm5_next_layer.cpp`'s `Attention` call reds the cached case while every
+  uncached case stays green, which is what proves the cached path is entered
+  through the layer rather than only by the cache test.
+
+  **The `shared` indexer arm stays unreached even after W5b-2b**, unchanged from
+  O25: the published `config.json` selects `shared` on ZERO of its 45 layers, so
+  the cross-layer sharing this wave now threads through the layer loop is
+  correct against `transformers` v5.16.1 on a schedule the released checkpoint
+  does not contain.
+
+  **One divergence inside the oracle itself is recorded here rather than only in
+  the generator**, because it is a fact about `glm5_next` and not about this
+  fixture. `Glm5NextPreTrainedModel` sets `_supports_sdpa = True`, so a default
+  `Glm5NextTextConfig` resolves `_attn_implementation` to `sdpa`, and
+  `build_attention_mask_from_topk` returns a BOOLEAN mask on that arm
+  (`modeling_glm5_next.py:1249-1250`) where the eager arm returns the additive
+  `finfo.min` one (`:1252-1256`). On a LEFT-PADDED query row, where every key is
+  masked, the two backends disagree: torch's SDPA emits 0.0 and eager's uniform
+  softmax emits the mean of the values, measured at 0.0 against 0.509 on this
+  fixture. Our port inlines `eager_attention_forward`, which is what W5b-1 gated
+  and what `:1227-1228` names as the only interface a 3-D per-(query, key) mask
+  can reach, so both generators pin `cfg._attn_implementation = "eager"`. No
+  token gate could see this, because the rows that differ are padding.
+
+
+- **O27 — W5b-2b DISCHARGES the reachability halves of O15, O16, O17, O23, O25
+  and O26, and this entry names exactly what is and is not discharged so the
+  next reader does not have to re-derive it.**
+  [#2337](https://github.com/mudler/vllm.cpp/issues/2337), split out of
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) because #2241's
+  append-only index row is spent on W5b-2a — the same split W5b-1 took to
+  [#2324](https://github.com/mudler/vllm.cpp/issues/2324).
+
+  **DISCHARGED.** `ForwardGlm5NextForConditionalGeneration` no longer refuses by
+  name. `ModelRegistry::Forward` opens a real `Glm5NextLoadedModel`, bridges each
+  decoder layer on demand and runs `TextModelForward`, so the entry-point chain
+  is complete and every hop on it is reached:
+
+  ```text
+  ModelRegistry::Forward
+    -> ForwardGlm5NextForConditionalGeneration   (glm5_next_registry.cpp)
+    -> glm5_next::Glm5NextHostForward            (glm5_next_forward.cpp)
+    -> Glm5NextGgufLayerSource::Layer            -> BridgeKdaLayer / BridgeDsaLayer
+                                                    / BridgeMlp / BridgeMhcSite
+                                                    / BridgeMoeLayer + GgufExpertSource
+    -> glm5_next::TextModelForward               (glm5_next_layer.cpp)
+    -> DecoderLayerForward -> Glm5NextKdaLayerForward (O15)
+                           -> MhcPre / MhcPost / HcHeadCollapseMean (O16)
+                           -> Attention -> SelectIndexerTopkFromPacked (O17)
+                           -> MoeForward (O23)
+                           -> BridgedDsaLayer / DecodeOwnedTensorToF32 (O25)
+  ```
+
+  **The reachability mutation ANSWERS the question rather than restating it.**
+  `.agents/reachability.md` asks for the production call site to be deleted in a
+  scratch copy: deleting the `Glm5NextHostForward(...)` call in the registry hook
+  and returning an empty `ForwardLogits{}` REDS `test_glm5_next_forward` at 11 of
+  118 assertions (M1, tree `91354df62`, mutant proved applied by diff hash, BUILD
+  rc=0, restored byte-for-byte). O26 said "there is a production call site to
+  delete after W5b-2b and there is none now"; there is one now, and deleting it
+  is red.
+
+  **The smallest failing test ENTERS through the entry point.** Every case in
+  `tests/vllm/models/test_glm5_next_forward.cpp` reaches the model through
+  `ModelRegistry::Load` and `ModelRegistry::Forward` on the synthetic `glm5next`
+  miniature. Nothing in that file calls `Glm5NextHostForward` or
+  `TextModelForward` to produce the value under test; the one direct call is the
+  `lm_head` chunk-size case, which needs a parameter the hook does not expose,
+  and its result is cross-checked against the entry-point result.
+
+  **NOT DISCHARGED, and each is a different kind of debt.**
+
+  - **O1 stands, entirely.** No end-to-end token gate for this model exists or
+    can exist on this fleet. What is gated is a synthetic 4-layer miniature at
+    `hidden_size` 32; nothing here is a claim about the 321.32B model, and no
+    token, speed or load number is claimed.
+  - **O2, O3, O4, O5, O6, O7, O8, O13, O14, O19 and O18's second half** are
+    untouched by this wave.
+  - **O25's `shared` indexer arm stays unreached**, unchanged and for the reason
+    O25 and O26 both give: the published `config.json` selects `shared` on ZERO
+    of its 45 layers. The layer loop threads it and the fixture exercises it;
+    no released checkpoint does.
+  - **W5b-2a's `LayerCache` binding is now UNREACHED on the production path**,
+    and §W5b-2b said this decision had to be taken rather than inherited. It was
+    taken the way the two precedents take it: the hook re-runs the whole prefix
+    each step and passes `caches = nullptr`, so `DsaCache` and the KDA
+    recurrence carried across steps are exercised by
+    `test_glm5_next_layer.cpp` alone. Carrying `std::vector<LayerCache>` on
+    `Glm5NextLoadedModel` has no precedent in this tree and a model that cannot
+    be run end to end on this fleet is the wrong place to invent one. This is
+    the staged-slice disclosure AGENTS.md `## Nothing lands dead` requires,
+    declared rather than claimed by silence, and it is a NARROWER debt than the
+    six this wave discharged: the code is reached, the CACHED path through it is
+    not.
+  - **RAGGED BATCHING is owed and is refused rather than approximated.** A step
+    with `num_reqs > 1` is refused by name. The two house precedents concatenate
+    instead, which attends across the request boundary; on this model that is
+    fluent wrong text no gate here could detect, so the divergence is
+    deliberate and in the safe direction. `attn_meta.query_start_loc` sliced as
+    at `kimi_linear_device.cpp` is the shape that closes it.
+  - **THE DEVICE ARM is owed and is refused rather than crashed.** Every
+    primitive on this row is host f32, so a non-CPU queue is refused by name
+    instead of handing `vt::MoeRouterTopK` host pointers on a device queue.
+    `glm5_next` is therefore on `scripts/runner-routing-allowlist.txt`. Two
+    facts bound what a device port would buy today and both are already
+    recorded: O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) —
+    the artifact's IQ2_XS and IQ4_XS expert tensors have no CUDA keep-quant
+    kernel, so a device decode of THIS checkpoint round-trips every expert GEMM
+    to the host cores anyway — and O1, so it would land without a correctness
+    gate.
+  - **SPEED is not measured and is not claimed.** O6 stands. The forward
+    re-runs the whole prefix and re-decodes every layer each step by
+    construction; that is a residency decision and not a speed one, and W8 owns
+    the axis.
+
+  **`check-runner-routing-consistency.py` MISCLASSIFIES this model on its
+  SECOND invariant, disclosed here rather than fixed.** It reports `glm5_next`
+  among the "30 keep bf16-resident DBuf activations", which is false: every
+  buffer on this path is host f32. The cause is the cross-TU resolution hole the
+  `nemotron_h` allowlist entry already names
+  ([#1410](https://github.com/mudler/vllm.cpp/issues/1410)) — the invariant reads
+  the registry TU's decode file set and this model's f32 residual declarations
+  live in `glm5_next_forward.cpp`. Not repaired in flow: it is a semantic
+  checker change, which AGENTS.md `## Changing the rules or a checker` routes to
+  its own row, spec and red-before.
 
 ## Now
 
-`ACTIVE`, 2026-08-28. The row's lifecycle state does not move: W3
+`ACTIVE`, 2026-08-30. **`ModelRegistry::Forward` reaches this model.** W5b-2b
+([#2337](https://github.com/mudler/vllm.cpp/issues/2337), split out of
+[#2241](https://github.com/mudler/vllm.cpp/issues/2241),
+`CLAIM-GLM53-FLASH-W5B2B`) landed the two pieces that stood between a loaded
+`Glm5NextWeights` and a token. The row's lifecycle state does not move, because
+O1 does not: no end-to-end token gate for this model exists or can exist on this
+fleet, and nothing in this wave is a claim about the 321.32B model.
+
+The first piece was a RESIDENCY problem and not plumbing. `BridgeDsaLayer`
+covered the 11 DSA layers; `BridgeKdaLayer`, `BridgeMlp` and `BridgeMhcSite` are
+the mechanical three, and `BridgeMoeLayer` is not, because one sparse layer's
+three expert banks are 27.0 GiB in f32 and the 42 sparse layers together are
+1,134 GiB against ~119.63 GiB usable. `kBridgeTensorF32ByteCeiling` did NOT
+move: it correctly refuses one 9.0 GiB bank. What changed is that
+`num_experts_per_tok` is 8 of 288, so `MoeLayerWeights` grows a borrowed
+`ExpertSource*` and `DecodeOwnedTensorRowsToF32` decodes ONE leading-axis row
+range — 32 MiB, 32x under the same ceiling — with the RANGE checked against that
+ceiling, so asking for all 288 rows is refused by the arithmetic that refuses
+the whole tensor. `MoeForward` visits each HIT expert once, which is upstream's
+own order and what bounds the peak at one expert. The second piece is
+`glm5_next_forward.{h,cpp}`: `Glm5NextGgufLayerSource` holds ONE layer slot,
+`TextModelForward` grows an overload over it so there is one loop and not two,
+and the hook follows the `NemotronHForCausalLM` / `KimiLinearForCausalLM`
+full-prefix pattern with two narrow refusals of its own — a multi-request step
+and a non-CPU queue.
+
+**O27 records what that discharges and what it does not.** The reachability
+halves of **O15, O16, O17, O23, O25 and O26 are DISCHARGED**: the chain from
+`ModelRegistry::Forward` down to the KDA arm, the mHC bricks, the DSA indexer,
+the MoE block and W5b-1's two files is complete, and deleting the production
+call site reds the focused gate at 11 of 118 assertions. Still owed and named in
+place: the `shared` indexer arm (no released config selects it), W5b-2a's
+`LayerCache` binding (the full-prefix recompute does not call it), ragged
+batching, the device arm, and O1, O6 and O19 unchanged. Two of thirteen
+mutations survived the first suite and both were repaired rather than disclosed
+— a fixture whose mHC ramps saturate every sigmoid, and a one-token case that
+could not see a missing per-expert grouping.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact, whenever the developer grants a large-asset
+download), and the two narrow debts O27 names: ragged batching and the device
+arm.
+
+### Before W5b-2b
+
+`ACTIVE`, 2026-08-29. The row's lifecycle state does not move: W3
 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213),
 `CLAIM-GLM53-FLASH-W3`) landed the critical-path geometry — `MlaBlockDims`
 accepts the NoPE layer, discharging O11, and the DSA indexer's k-pool
@@ -2739,8 +3466,43 @@ with 0 missing and 0 unexplained at 41 MB peak RSS. `blk.45` is read, counted
 and NOT built as a decoder layer. **O10 is half discharged and O7 is narrowed:
 the artifact exists, and what W7b still owes is a conversion of OURS.**
 
+**THE DSA ATTENTION BLOCK EXISTS.** W5b-1
+([#2324](https://github.com/mudler/vllm.cpp/issues/2324)) landed
+`Glm5NextTextAttention` — `q_a_proj`/`q_a_layernorm`/`q_b_proj`,
+`kv_a_proj_with_mqa`/`kv_a_layernorm`, `expand_kv` over the checkpoint's SPLIT
+half-transposed `kv_b_proj` halves, `build_attention_mask_from_topk` over W3's
+selection, and the CROSS-LAYER top-k sharing a `shared` layer needs — gated
+against the RUN output of `transformers` v5.16.1 at 14 cases / 160 assertions.
+It also landed the `OwnedTensor` -> host f32 bridge, which ANSWERS O22's open
+residency question: one DSA layer at a time, 0.4654 GiB, never the tower, whose
+expanded form is 426.72 GiB against a ~119.63 GiB box. **W5b-1 is NOT REACHED
+from any production entry point** and O25 carries that disclosure; the wiring is
+W5b-2's.
+
+**THE STACK ASSEMBLES, AND NOTHING REACHES IT YET.** W5b-2a
+([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) landed
+`glm5_next_layer.{h,cpp}`: the decoder layer with all four control-flow arms,
+the mHC stream threading at both sites, `TextModelForward`, and the binding of
+the DSA block to `MakeGlm5NextKVCache`'s groups 0 and 2 through an additive
+`DsaCache`. Gated at 10 cases / 1647 assertions against the RUN output of
+`transformers` v5.16.1 over a FIVE-layer mixed schedule at the published
+`hc_mult` of 4 — including a cached 8-token prefill plus 4-token continuation
+that agrees with the 12-token one-shot, and an EARLY-COLLAPSE decoy from the same
+oracle run that a port threading `[T, hidden]` would match instead. The KV
+binding stores the 512-wide LATENT rather than the 32,768-wide expanded K/V the
+reference stores, and the `ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)`
+identity that makes the two equal is now a case rather than a sentence.
+**W5b-2a is NOT REACHED from any production entry point**, O26 carries that
+disclosure, and it discharges NONE of O15, O16, O17, O23 or O25 — the five
+primitives now have one assembly point instead of five dead ends, and that
+assembly point is itself unreached.
+
 **Nothing FORWARDS** (O10's remaining half): the FORWARD still refuses by name
-and W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it. The
+and W5b-2b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it —
+the weight bridge for the KDA, MoE, dense-MLP and mHC arms, whose routed expert
+banks are ~1,150 GiB in f32 across the 42 sparse layers and therefore need an
+on-demand per-expert decode rather than four more `BridgeDsaLayer`s, plus the
+engine binding from `ModelForwardInput` to `TextModelForward`. The
 KV-CACHE SPEC is NOT part of that debt any more — W5
 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) publishes it through
 the production `make_kv_cache` hook, as the paragraph below records. No GPU gate

@@ -147,6 +147,52 @@ struct DenseMlpWeights {
   std::vector<float> down_proj;  // [hidden, intermediate]
 };
 
+// A source of ONE routed expert's host-f32 weights, consulted on demand.
+//
+// ─── WHY THIS EXISTS, AND IT IS ARITHMETIC AND NOT PREFERENCE ────────────────
+//
+// `MoeLayerWeights::expert_gate_up` and `expert_down` are the whole bank. At
+// the published geometry (288 experts, `moe_intermediate_size` 2048,
+// `hidden_size` 4096) that is:
+//
+//   | what | f32 bytes | GiB |
+//   |---|---:|---:|
+//   | one expert's `gate_up`, [2 * 2048, 4096] | 67,108,864 | 0.0625 |
+//   | one expert's `down`, [4096, 2048] | 33,554,432 | 0.03125 |
+//   | **one expert, both** | **100,663,296** | **0.09375** |
+//   | one sparse layer's 288 experts | 28,991,029,248 | 27.0 |
+//   | the 42 sparse layers' experts, all held | 1,217,623,228,416 | **1,134.0** |
+//   | usable on `dgx:gpu0`, the largest device this project reaches | | ~119.63 |
+//
+// A resident float bank is 1,134 GiB against a 119.63 GiB box — 9.5x over — and
+// `glm5_next_bridge.h`'s `kBridgeTensorF32ByteCeiling` already refuses one bank
+// BY NAME at 9.0 GiB, which is that gate working rather than an obstacle to
+// route around. **`num_experts_per_tok` is 8 of 288**, so what a token actually
+// needs is at most 8 experts, and what a step needs is the DISTINCT experts its
+// tokens hit. Decoding one at a time and dropping it makes the peak ONE expert:
+// 0.09375 GiB, 0.078% of the box, and 12,096x under the whole-layer figure.
+//
+// **What this rules out, said positively.** There is no cache and no map keyed
+// by expert index, for the same reason `glm5_next_bridge.h` has no `BridgeTower`:
+// either one turns "one expert" into "every expert this request has ever
+// selected", which is the bank again with a slower ramp. `MoeForward` reuses two
+// buffers across the experts of one call and holds nothing between calls.
+class ExpertSource {
+ public:
+  virtual ~ExpertSource() = default;
+
+  // Fill `gate_up` with expert `e`'s [2 * moe_intermediate_size, hidden_size]
+  // (GATE first, then up — the fused order `Glm5NextTextExperts` declares) and
+  // `down` with its [hidden_size, moe_intermediate_size].
+  //
+  // The implementation OVERWRITES both buffers. `MoeForward` hands it the same
+  // two vectors for every expert of a call, which is what makes the peak one
+  // expert; an implementation that appended, or that kept its own copy, would
+  // defeat the whole point of the interface.
+  virtual void Expert(int64_t e, std::vector<float>& gate_up,
+                      std::vector<float>& down) = 0;
+};
+
 // One sparse layer's weights, in the checkpoint's own packing: the routed
 // experts arrive STACKED and gate/up arrive FUSED, which is how
 // `Glm5NextTextExperts` declares them (`:116-117`) and how
@@ -163,6 +209,15 @@ struct MoeLayerWeights {
   std::vector<float> expert_gate_up;
   // [n_routed_experts, hidden, moe_intermediate_size].
   std::vector<float> expert_down;
+  // The ON-DEMAND alternative to the two banks above, BORROWED and not owned.
+  //
+  // Exactly one of the two shapes is admissible per layer and `MoeForward`
+  // refuses the other two states BY NAME: both populated is ambiguous, and
+  // neither populated would run the router and then read an empty bank as a
+  // zero weight — a finite, fluent, wrong block, which is the failure this
+  // row's headers keep naming. The pointer must outlive every `MoeForward`
+  // call that reads this struct.
+  ExpertSource* expert_source = nullptr;
   // The shared expert, at `shared_intermediate_size()`.
   DenseMlpWeights shared;
 };
@@ -248,6 +303,15 @@ std::vector<float> DenseMlpForward(const DenseMlpWeights& w,
 // because `routed_scaling_factor` is already folded into the router weights by
 // `MoeRouterTopKArgs::routed_scaling_factor`. Passing it in BOTH places would
 // square it.
+//
+// THE EXPERTS ARE VISITED ONCE EACH, grouped by expert before any of them is
+// evaluated. That is upstream's own order (`:120-135` loops over the HIT
+// experts and `index_add_`s each one's tokens, rather than looping over tokens)
+// and it is what bounds the residency when `w.expert_source` is set: a second
+// visit to an already-seen expert would be a second 96 MiB decode. Each [t, j]
+// slot is still computed independently and written to its own row of the
+// combine's `[T, K, H]` operand, so the grouping moves no arithmetic and the
+// resident path is byte-identical to a token-major visit.
 //
 //   hidden : [num_tokens, hidden_size]  row-major
 // Returns  : [num_tokens, hidden_size]  row-major

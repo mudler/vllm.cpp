@@ -367,6 +367,26 @@ IndexerSelection SelectIndexerTopk(const IndexerDims& d, const IndexerWeights& w
                                    const std::vector<float>& q_resid,
                                    const std::vector<uint8_t>& mask, int64_t batch,
                                    int64_t seq_len) {
+  // `past_key_values is None`: `kv_len = current_length = seq_len` (`:805-806`),
+  // and the packed history IS the current window. W5b-2 (#2241) made the cached
+  // arm reachable by lifting the body into `SelectIndexerTopkFromPacked`; this
+  // overload is that call with the uncached lengths, so the fresh-prefill path
+  // is the SAME code and not a second implementation of it.
+  d.Validate();
+  return SelectIndexerTopkFromPacked(
+      d, w, hidden, q_resid, mask,
+      PackIndexerStates(d, w, hidden, mask, batch, seq_len), batch, seq_len,
+      /*kv_len=*/seq_len);
+}
+
+IndexerSelection SelectIndexerTopkFromPacked(const IndexerDims& d,
+                                             const IndexerWeights& w,
+                                             const std::vector<float>& hidden,
+                                             const std::vector<float>& q_resid,
+                                             const std::vector<uint8_t>& mask,
+                                             const std::vector<float>& packed,
+                                             int64_t batch, int64_t seq_len,
+                                             int64_t kv_len) {
   d.Validate();
   const int64_t H = d.hidden_size, D = d.head_dim, N = d.n_heads, K = d.index_kpool;
   const int64_t QL = d.q_lora_rank;
@@ -374,15 +394,21 @@ IndexerSelection SelectIndexerTopk(const IndexerDims& d, const IndexerWeights& w
           "`wq_b` and `weights_proj` are required");
   Require(q_resid.size() == static_cast<size_t>(batch * seq_len * QL),
           "`q_resid` must be [batch, seq_len, q_lora_rank]");
-
-  // `past_key_values is None`: `kv_len = current_length = seq_len` (`:803-811`).
-  // The cached arm — where `kv_len` is the STATIC cache width and
-  // `current_length` the live one — is W5's, and it is why every function above
-  // takes those two lengths separately instead of assuming they agree.
-  const int64_t kv_len = seq_len, current_length = seq_len;
-
-  const std::vector<float> packed = PackIndexerStates(d, w, hidden, mask, batch, seq_len);
+  Require(kv_len >= seq_len,
+          "`kv_len` must be at least `seq_len`: the current window is always "
+          "part of the key history it is selecting over");
   const int64_t row = 2 * D + 1;
+  Require(packed.size() == static_cast<size_t>(batch * kv_len * row),
+          "`packed` must be [batch, kv_len, 2 * head_dim + 1]");
+  Require(hidden.size() == static_cast<size_t>(batch * seq_len * H),
+          "`hidden_states` must be [batch, seq_len, hidden_size]");
+  Require(mask.size() == static_cast<size_t>(batch * seq_len),
+          "`attention_mask` must be [batch, seq_len]");
+
+  // `current_length = cache_layer.get_seq_length()` (`:813`). It differs from
+  // `kv_len` only on a STATIC cache padded to a maximum length — upstream says
+  // so itself at `:811` — and this host reference has no such cache.
+  const int64_t current_length = kv_len;
 
   std::vector<uint8_t> valid_keys(static_cast<size_t>(batch * kv_len), 0);
   for (int64_t b = 0; b < batch; ++b) {

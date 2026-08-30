@@ -21,14 +21,16 @@
 // no second architecture string to register. That is why this row moves the
 // architecture count by ONE.
 //
-// SCOPE HONESTY. Registering this arch makes it RESOLVE and makes its config
-// parse and VALIDATE. It does NOT make it load and it does NOT make it forward
-// — both refuse BY NAME, naming the wave that owes the work. That polarity
-// matters more here than usual: no oracle for this model runs on any hardware
-// this project owns, and none can (the smallest published artifact is 181.32
-// GiB against ~119.63 GiB on GB10), so there is no downstream token gate that
-// would catch a forward returning plausible garbage. Refusing is the only safe
-// default and O1 says so.
+// SCOPE HONESTY, and W5b-2b moved it. Registering this arch made it RESOLVE
+// (W1); W5c made it LOAD; this TU's `forward` hook now RUNS, on the CPU device,
+// through `glm5_next::Glm5NextHostForward`. What has NOT changed is the reason
+// the earlier refusal existed: no oracle for this model runs on any hardware
+// this project owns (the smallest published artifact is 181.32 GiB against
+// ~119.63 GiB on GB10), so there is no downstream token gate that would catch a
+// forward returning plausible garbage, and O1 still says so. What replaces the
+// blanket refusal is a set of NARROW ones, each naming what is owed rather than
+// the whole capability: a non-CPU queue, a multi-request step, and the
+// safetensors load are each refused by name in place.
 #include "vllm/model_executor/models/model_registry.h"
 
 #include "vt/dtype.h"  // VT_CHECK
@@ -41,8 +43,10 @@
 #include <vector>
 
 #include "vllm/model_executor/models/glm5_next.h"
+#include "vllm/model_executor/models/glm5_next_forward.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
+#include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"  // v1::ResolveKvCacheDType
 #include "vllm/v1/kv_cache_interface.h"
 
@@ -128,59 +132,51 @@ void PrepareGlm5NextForConditionalGeneration(LoadedModel& model,
 
 ForwardLogits ForwardGlm5NextForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  (void)model;
-  (void)input;
-  // THE REFUSAL COMES FIRST, AND THERE IS NO DOWNCAST ABOVE IT. The house shape
-  // opens the type-erased handle with `ModelAs<...>` before anything else,
-  // because a bare `static_cast` down the hierarchy is undefined behaviour on
-  // an object that is not really that type (#775, #730).
-  //
-  // W5c CHANGED THE PREMISE HALF-WAY AND THE ORDER STILL STANDS. The earlier
-  // version of this comment argued that nothing could PRODUCE a loaded
-  // GLM-5.3-Flash while `load_weights` refused unconditionally, so the only
-  // handle a caller could present was a foreign one. That is no longer true:
-  // the GGUF arm above returns a real `Glm5NextLoadedModel`. What has not
-  // changed is that there is no forward to open it FOR, so a downcast placed
-  // first would report a type mismatch on a foreign handle and then fall
-  // through to this same refusal on our own -- two messages for one missing
-  // capability, and the refusal reachable only on the path where it says
-  // least. W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
-  // restores `ModelAs` in the same change that gives it something to read.
-  //
-  // `VT_CHECK(false, ...)` IN THE HOOK BODY, not a bare throw behind a
-  // `Class::ForwardDevice` delegate: `check-runner-routing-consistency.py`
-  // recognises a refuse-by-name stub by exactly this token and classifies the
-  // hook body itself, and a model it cannot classify lands in the silently
-  // exempt NONE bucket. And `[[noreturn]]` on a non-void return type is MSVC
-  // C4646, promoted to C2220 under /W4 /WX.
-  //
-  // WHAT THIS REFUSAL BUYS, exactly: it prevents a plausible-but-wrong forward,
-  // not a wrong number. There is no partial numeric path here to fall back to.
-  // Every primitive named below is unimplemented for THIS model, and two of
-  // them look implemented and are not -- our KDA is Kimi-Linear's softplus
-  // forget gate where this model needs the sigmoid branch, and our
-  // `HcHeadCollapse` is DeepSeek-V4's weighted collapse where this model needs
-  // an unweighted mean. Reusing either would generate fluent, wrong text that
-  // no gate on this fleet could detect.
-  VT_CHECK(false,
-           "Glm5NextForConditionalGeneration: the forward is not ported yet. "
-           "Four of its primitives now exist and are gated -- W2's KDA sigmoid "
-           "forget gate (glm5_next_kda), W3's NoPE MLA geometry and DSA k-pool "
-           "indexer (glm5_next_dsa), W4's UNWEIGHTED mHC head collapse "
-           "(glm5_next_mhc), and W5's 288+1 expert MoE (glm5_next_moe) -- and "
-           "NOTHING ASSEMBLES THEM. W5b owes the decoder layer's per-layer "
-           "control flow, the DSA attention block over the indexer's selection "
-           "and the assembled Glm5NextTextModel forward; W6 the vision tower, "
-           "processor and placeholder expansion. The WEIGHT TOWER is ported and "
-           "`load_weights` returns a real LoadedModel -- W5c (#2242) -- so a "
-           "handle reaching here is real and the missing part is the forward, "
-           "not the load. Reusing a "
-           "look-alike for any of the four is what this refusal prevents: "
-           "kimi_kda.cpp is the SOFTPLUS forget gate and deepseek_v4_mhc.cpp's "
-           "`HcHeadCollapse` is the WEIGHTED collapse, and either one produces "
-           "fluent, wrong text that no gate on this fleet could detect. "
-           "See .agents/specs/glm5-next-flash.md and issue #1998.");
-  return ForwardLogits{};  // unreachable; VT_CHECK always throws here
+  // `ModelAs<...>` FIRST, never a bare `static_cast` down the hierarchy, which
+  // is undefined behaviour on an object that is not really this type
+  // (#775, #730). W5c made this possible by returning a real
+  // `Glm5NextLoadedModel`; W5b-2b is the change that gives it something to
+  // open it FOR, which is the condition the previous refusal named.
+  auto& g = ModelAs<Glm5NextLoadedModel>(model,
+                                         "Glm5NextForConditionalGeneration");
+  const Glm5NextWeights& w = g.weights();
+
+  // THE HOUSE PATTERN, surveyed and not guessed. `NemotronHForCausalLM`
+  // (`nemotron_h_registry.cpp`) and `KimiLinearForCausalLM`
+  // (`kimi_linear_forward.cpp`) each carry a host arm inside their `forward`
+  // hook that consumes three of `ModelForwardInput`'s fields -- `token_ids`,
+  // `logits_indices`, `queue` -- ignores the paged caches, and re-runs the
+  // whole prefix each step. No `LoadedModel` in this tree keeps per-request KV
+  // or recurrent state on itself, and Kimi-Linear is the closest architecture
+  // there is to this one (KDA plus MLA). `glm5_next_forward.h` records what
+  // the recompute costs and which binding it leaves unreached.
+  (void)input.positions;
+  (void)input.attn_meta;
+  (void)input.gdn_meta;
+  (void)input.attn_kv;
+  (void)input.gdn_state;
+
+  // ONE DIVERGENCE FROM THAT PATTERN, in the safe direction. Both precedents
+  // take `token_ids` as a single sequence whatever `num_reqs` says; on a
+  // two-request step that silently attends ACROSS the boundary. For this model
+  // that is a fluent wrong answer no gate on this fleet could detect -- the
+  // spec's §Gates records that no end-to-end token gate for it exists or can
+  // exist here -- so a multi-request step is refused by name instead of
+  // approximated. Ragged batching is `attn_meta.query_start_loc` sliced as at
+  // `kimi_linear_device.cpp`, and it is OWED.
+  VT_CHECK(input.num_reqs <= 1,
+           "Glm5NextForConditionalGeneration: this forward is a SINGLE-SEQUENCE "
+           "host reference and the step carries " +
+               std::to_string(input.num_reqs) +
+               " requests. Concatenating them would attend across the request "
+               "boundary and emit fluent, wrong text that no gate on this fleet "
+               "could detect. Ragged batching (attn_meta.query_start_loc) is "
+               "owed. See .agents/specs/glm5-next-flash.md and issue #2241.");
+
+  return HostLogits(glm5_next::Glm5NextHostForward(w, input.token_ids,
+                                                   input.logits_indices,
+                                                   input.queue),
+                    w.params.vocab_size);
 }
 
 // ─── The heterogeneous KV-cache spec (W5, #2223) ─────────────────────────────
@@ -353,7 +349,7 @@ v1::KVCacheConfig MakeGlm5NextKVCache(const HfConfig& config, int block_size,
   // KDA cache would be an invention rather than a port, and a `bfloat16` value
   // in some future `config.json` would then silently halve a state upstream
   // keeps in f32. Qwen3.5 (`qwen3_5_common.cpp:54`) and MODEL-MM-QWEN4-EXP
-  // (`qwen4_exp_registry.cpp:382`) call the resolver because their linear layers
+  // (`qwen4_exp_registry.cpp:433`) call the resolver because their linear layers
   // ARE gated delta net (`gated_delta_net_state_dtype`, `mamba_utils.py:119-128`),
   // which does read it. An earlier revision of this comment claimed this
   // function called that resolver; it never did, and the claim is retired here

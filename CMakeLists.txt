@@ -809,10 +809,12 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
   src/vllm/model_executor/models/qwen4_exp_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_moe.cpp
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/glm5_next.cpp
   src/vllm/model_executor/models/glm5_next_kda.cpp
   src/vllm/model_executor/models/glm5_next_dsa.cpp
+  src/vllm/model_executor/models/glm5_next_attn.cpp
   src/vllm/model_executor/models/glm5_next_mhc.cpp
   src/vllm/model_executor/models/glm5_next_moe.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
@@ -829,6 +831,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
   src/vllm/model_executor/models/glm5_next_weights.cpp
   src/vllm/model_executor/models/glm5_next_loader.cpp
+  src/vllm/model_executor/models/glm5_next_bridge.cpp
+  src/vllm/model_executor/models/glm5_next_layer.cpp
+  src/vllm/model_executor/models/glm5_next_forward.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp

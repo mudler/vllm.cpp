@@ -75,6 +75,30 @@ class CudaBackend final : public Backend {
   int DeviceCapabilityMajor() const override { return sm_major_; }
   int DeviceCapabilityMinor() const override { return sm_minor_; }
 
+  // PERF-QWEN35-STAGE-WEIGHTS (#2327): the device memory budget, which CUDA did
+  // not answer until now.
+  //
+  // The base returns false, and ONLY the ROCm backend overrode it
+  // (`rocm_backend.hip:373`), so on CUDA every caller asking "does this fit?"
+  // got "I cannot say". A caller that treats an unanswerable budget as "do not
+  // risk it" — which is the safe reading, and the one #2327's staging policy
+  // takes — is then INERT on the platform it was written for. That is not a
+  // hypothetical: #2327 shipped its capacity gate, measured no change on the
+  // gate, and this silent `false` was why.
+  //
+  // Mirrors the ROCm arm byte-for-byte, `cudaMemGetInfo` for `hipMemGetInfo`.
+  // On a unified-memory part (GB10) the pair describes the shared pool, which is
+  // the right budget for exactly the question staging asks: a device copy there
+  // consumes the same bytes a host allocation would.
+  bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes) const override {
+    size_t free_b = 0, tot_b = 0;
+    if (cudaSetDevice(device_) != cudaSuccess) return false;
+    if (cudaMemGetInfo(&free_b, &tot_b) != cudaSuccess) return false;
+    if (free_bytes != nullptr) *free_bytes = free_b;
+    if (total_bytes != nullptr) *total_bytes = tot_b;
+    return true;
+  }
+
   // cudaMalloc returns allocations aligned to at least 256 bytes, which
   // satisfies the >=64B contract on Backend::Alloc (StepArena depends on it).
   void* Alloc(size_t bytes) override {

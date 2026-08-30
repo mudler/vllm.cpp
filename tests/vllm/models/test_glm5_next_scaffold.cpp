@@ -645,52 +645,50 @@ TEST_CASE("glm5_next: the architecture RESOLVES through the production registry"
                        std::runtime_error);
 }
 
-TEST_CASE("glm5_next: the forward REFUSES BY NAME, and names what is UNASSEMBLED") {
+TEST_CASE("glm5_next: the forward NO LONGER refuses, and the pin MOVED with it") {
   const std::vector<std::string> archs = {"Glm5NextForConditionalGeneration"};
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(archs);
-
-  // WHAT THE REFUSAL BUYS is precision about a wrong MODEL, not a wrong number.
-  // Four of this model's primitives now exist and are gated (W2's KDA sigmoid
-  // gate, W3's NoPE MLA + k-pool indexer, W4's unweighted mHC collapse, W5's
-  // 288+1 MoE) and NOTHING assembles them, so the message names the assembly
-  // waves rather than the primitives. Two of the four have LOOK-ALIKES in this
-  // tree that are the wrong function for this model, and the message still says
-  // which and why.
   REQUIRE(reg.factory->forward != nullptr);
+
+  // ─── WHAT THIS CASE USED TO PIN, AND WHY IT CHANGED ───────────────────────
+  //
+  // Until W5b-2b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) this
+  // case asserted a `VT_CHECK(false, ...)` refusal naming W5b, W5c and W6 and
+  // the two look-alikes a wrong port would reuse. That refusal was TRUE and it
+  // is now FALSE: `ForwardGlm5NextForConditionalGeneration` bridges the tower a
+  // layer at a time and runs `TextModelForward`. The pin MOVES with the change
+  // rather than being deleted by it -- the same shape W3 used when
+  // `MlaBlockDims::Validate` stopped refusing the NoPE geometry -- so what it
+  // asserts now is the state that replaced the refusal.
+  //
+  // The forward's own values are gated in `test_glm5_next_forward.cpp`, which
+  // enters through `ModelRegistry::Forward` on a real loaded tower. What is
+  // asserted HERE is the half that lives at the REGISTRATION: a foreign handle
+  // is refused by the downcast rather than `static_cast` blind, and the
+  // architecture names itself in the refusal.
+
+  // (1) The blanket refusal is GONE. Asserted as an absence with the exact
+  // sentence it used to carry, so a revert that reinstated it reds this case
+  // instead of quietly returning the row to "registered but not runnable".
   ForeignLoadedModel foreign(reg);
   EmptyForwardInput in;
   const ModelForwardInput input = in.Get();
   std::string forward_msg;
   try {
     (void)reg.factory->forward(foreign, input);
-    FAIL("expected a refusal");
+    FAIL("expected the DOWNCAST to refuse a foreign handle");
   } catch (const std::exception& e) {
     forward_msg = e.what();
   }
+  CHECK(forward_msg.find("the forward is not ported yet") == std::string::npos);
+  CHECK(forward_msg.find("NOTHING ASSEMBLES THEM") == std::string::npos);
+
+  // (2) `ModelAs<...>` comes FIRST now that there is a forward to open the
+  // handle FOR, which is exactly the condition the old comment named. A bare
+  // `static_cast` down the hierarchy is undefined behaviour on an object that
+  // is not really this type (#775, #730), so a foreign handle is a named type
+  // mismatch and the message says WHICH entry point refused.
   CHECK(forward_msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
-  // The waves that still owe assembly, each named with what it owes -- and W5c
-  // named as LANDED rather than owing, which is the direction it moved when the
-  // weight tower went in (#2242). `load_weights` stays asserted for that reason:
-  // the message has to say the load is DONE, so a reader who lands here is sent
-  // to the forward and not back to a tower that exists.
-  CHECK(forward_msg.find("W5b") != std::string::npos);
-  CHECK(forward_msg.find("W5c") != std::string::npos);
-  CHECK(forward_msg.find("W6") != std::string::npos);
-  CHECK(forward_msg.find("load_weights") != std::string::npos);
-  CHECK(forward_msg.find("returns a real LoadedModel") != std::string::npos);
-  CHECK(forward_msg.find("assembled Glm5NextTextModel forward") != std::string::npos);
-  // The two look-alikes, still named, because substituting either produces
-  // fluent wrong text no gate on this fleet could detect.
-  CHECK(forward_msg.find("kimi_kda.cpp") != std::string::npos);
-  CHECK(forward_msg.find("HcHeadCollapse") != std::string::npos);
-  CHECK(forward_msg.find("glm5-next-flash.md") != std::string::npos);
-  // The primitives that LANDED are named as landed, not as owed. An earlier
-  // revision of this message said "W3 the NoPE MLA block -- MlaBlockDims
-  // ::Validate still refuses qk_rope_head_dim == 0", which W3 (#2213) made
-  // false: the validator accepts the NoPE geometry and the case immediately
-  // below this file's `mla_block_dims` group proves it. A refusal that names a
-  // landed wave as owing sends the next reader to redo finished work (#2230).
-  CHECK(forward_msg.find("MlaBlockDims::Validate still refuses") == std::string::npos);
 }
 
 // ─── The KV-cache spec, reached through the production `make_kv_cache` hook ───

@@ -29,6 +29,7 @@
 // bindings onto the SAME VkBuffer — a uint32_t view and a uint16_t view — and
 // its BYTE OFFSET travels in the push constants. See
 // src/vt/vulkan/shaders/vt_common.glsl § STORAGE MODEL for why.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -360,19 +361,56 @@ static_assert(sizeof(AttnQkNormRopeGateParams) <= 128,
 static_assert(sizeof(Exl3HadParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(Exl3GemmParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 
-// Flush before a dispatch whose estimated GPU time could exceed the driver
-// hangcheck timeout (~2s on Intel Arc). Without this, prefill batches multiple
-// slow scalar GEMM / MoE dispatches into one command buffer whose total GPU
-// time exceeds the hangcheck, causing VK_ERROR_DEVICE_LOST. Each heavy dispatch
-// gets its own command buffer, isolating it from neighbors.
-//
-// The threshold is deliberately low (1 GFLOP) so that every prefill-sized
-// dispatch is isolated. Decode dispatches (M=1) are well under 1 GFLOP and
-// batch normally, so decode throughput is unaffected.
-void FlushIfHeavy(uint64_t flops_estimate) {
-  constexpr uint64_t kFlushThreshold = 1000ULL * 1000 * 1000;  // 1 GFLOP
-  if (flops_estimate >= kFlushThreshold) {
-    VulkanContext::Get().FlushBatch("heavy-dispatch");
+// Maximum M per dispatch chunk for dense GEMM/GEMV. The Intel Arc hangcheck is
+// ~2s. Measured at 2368 tokens: one scalar GEMM takes ~1.1s. So at 4096 rows
+// a single chunk takes ~1.9s — too close to the limit. 2048 rows gives ~0.95s
+// per chunk, leaving comfortable margin under the 2s hangcheck.
+constexpr uint32_t kMaxMPerChunkDense = 2048;
+
+// Maximum P per dispatch chunk for MoE kernels. Each workgroup processes ALL P
+// rows, so per-workgroup time scales with P. Measured: at P=9472 (1184 tokens),
+// the MoE takes ~1.5s per layer. So at P=2048, each chunk takes ~0.32s per
+// layer — safe under the 2s hangcheck with margin for L2 cache effects.
+constexpr uint32_t kMaxPPerChunkMoe = 2048;
+
+// Chunk a matmul dispatch over M to prevent any single command buffer from
+// exceeding the GPU hangcheck timeout. Each chunk adjusts a_off and out_off
+// to point at the correct rows. The shader is unaware of chunking.
+// Flushes between chunks only when the accumulated GPU time would exceed ~1.5s.
+// Also flushes at the start when the total estimated time exceeds 1.5s, to
+// isolate the GEMM from preceding dispatches in the same command buffer.
+template <typename DispatchFn>
+void ChunkedMatmulDispatch(int64_t m, int64_t n, int64_t k, DType a_dt,
+                           DType out_dt, uint32_t a_off, uint32_t out_off,
+                           DispatchFn dispatch) {
+  const size_t a_elem = vt::SizeOf(a_dt);
+  const size_t o_elem = vt::SizeOf(out_dt);
+  const uint32_t m_total = static_cast<uint32_t>(m);
+  // Estimate GPU time per row: 2*N*K flops at ~200 GFLOP/s
+  const double flops_per_row = 2.0 * static_cast<double>(n) * static_cast<double>(k);
+  const double gpu_time_per_row_sec = flops_per_row / 200e9;
+  const double total_est_sec = m_total * gpu_time_per_row_sec;
+  // Flush when accumulated time exceeds 1.0s (conservative margin under 2s
+  // hangcheck, accounting for other ops that may share the command buffer).
+  constexpr double kFlushAtAccumSec = 1.0;
+  // Flush at the start if this GEMM alone would exceed the threshold, to
+  // isolate it from preceding dispatches (e.g. attention or previous GEMM).
+  if (total_est_sec >= kFlushAtAccumSec) {
+    VulkanContext::Get().FlushBatch("chunked-matmul-start");
+  }
+  double accum_sec = 0.0;
+  for (uint32_t i_start = 0; i_start < m_total; i_start += kMaxMPerChunkDense) {
+    const uint32_t m_chunk = std::min(kMaxMPerChunkDense, m_total - i_start);
+    const uint32_t a_chunk = a_off + i_start * static_cast<uint32_t>(k) *
+                                      static_cast<uint32_t>(a_elem);
+    const uint32_t out_chunk = out_off + i_start * static_cast<uint32_t>(n) *
+                                          static_cast<uint32_t>(o_elem);
+    if (accum_sec >= kFlushAtAccumSec) {
+      VulkanContext::Get().FlushBatch("chunk-accum");
+      accum_sec = 0.0;
+    }
+    dispatch(m_chunk, a_chunk, out_chunk);
+    accum_sec += m_chunk * gpu_time_per_row_sec;
   }
 }
 template <typename P>
@@ -1068,22 +1106,45 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     return;
   }
 
+  // Tiled GEMM for prefill (M >= 16): shared memory blocking reuses B tiles
+  // across 16 output rows, reducing B reads by 16x vs the scalar kernel.
+  // Selected for both orientations when A and B are bf16 or f32 (not quantized).
+  // Not bit-exact with the scalar kernel (different accumulation order), but
+  // within f32 round-off tolerance.
+  if (m >= 16 &&
+      (a.dtype == DType::kBF16 || a.dtype == DType::kF32 || a.dtype == DType::kF16) &&
+      (b.dtype == DType::kBF16 || b.dtype == DType::kF32 || b.dtype == DType::kF16) &&
+      (out.dtype == DType::kBF16 || out.dtype == DType::kF32 || out.dtype == DType::kF16)) {
+    const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
+                              DtypeCode(out.dtype), kBT ? 1u : 0u};
+    // BM=16, BN=64: one workgroup per [16, 64] output tile.
+    const uint32_t BM = 16, BN = 64;
+    // Chunk over M to prevent hangcheck timeouts at large prefill sizes.
+    ChunkedMatmulDispatch(
+        m, n, k, a.dtype, out.dtype, a_off, out_off,
+        [&](uint32_t m_chunk, uint32_t a_chunk, uint32_t out_chunk) {
+          MatmulParams p{m_chunk, static_cast<uint32_t>(n),
+                         static_cast<uint32_t>(k), a_chunk, b_off, out_chunk};
+          const uint32_t chunk_tiles = static_cast<uint32_t>(
+              ((m_chunk + BM - 1) / BM) * ((n + BN - 1) / BN));
+          Go("vt_matmul_tiled", bind, p, chunk_tiles, spec, 4);
+        });
+    return;
+  }
+
   if (GemvMatmulUsable(kBT, k, m)) {
     // ONE WORKGROUP PER `rows` OUTPUT ELEMENTS -- not FlatGroupCount, which would
     // divide the element count by the workgroup size and put the whole K
     // reduction back on a single lane. The workgroup cooperates on its elements.
     const uint32_t rows = GemvRows(m, n);
-    const uint32_t groups = static_cast<uint32_t>((m * n + rows - 1) / rows);
     // VT_VULKAN_GEMV_UNROLL=1 forces the un-unrolled body, for the same-binary A/B.
     static const uint32_t kUnroll = [] {
       const char* v = std::getenv("VT_VULKAN_GEMV_UNROLL");
       return (v != nullptr && std::strcmp(v, "1") == 0) ? 1u : 4u;
     }();
+    const uint32_t pack = GemvPack(a, b, k, a_off, b_off);
     const uint32_t spec[6] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
-                              DtypeCode(out.dtype), kUnroll, rows,
-                              GemvPack(a, b, k, a_off, b_off)};
-    MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
-                   static_cast<uint32_t>(k), a_off, b_off, out_off};
+                              DtypeCode(out.dtype), kUnroll, rows, pack};
     // TWO EXTRA BINDINGS, and they are the same two buffers again. This shader
     // declares a 64-bit view of each input operand for the widest packed load;
     // a shader must declare every descriptor the host writes, so both views are
@@ -1093,8 +1154,15 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     Binder wide = bind;
     wide.AddAlias(a, "matmul: a (64-bit view)");
     wide.AddAlias(b, "matmul: b (64-bit view)");
-    FlushIfHeavy(static_cast<uint64_t>(2) * m * n * k);
-    Go("vt_matmul_vec", wide, p, groups, spec, 6);
+    // Chunk over M to prevent hangcheck timeouts at large prefill sizes.
+    ChunkedMatmulDispatch(
+        m, n, k, a.dtype, out.dtype, a_off, out_off,
+        [&](uint32_t m_chunk, uint32_t a_chunk, uint32_t out_chunk) {
+          MatmulParams p{m_chunk, static_cast<uint32_t>(n),
+                         static_cast<uint32_t>(k), a_chunk, b_off, out_chunk};
+          const uint32_t groups = (static_cast<uint64_t>(m_chunk) * n + rows - 1) / rows;
+          Go("vt_matmul_vec", wide, p, groups, spec, 6);
+        });
     return;
   }
 
@@ -1141,18 +1209,20 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   // Ascending constantID order: a dtype, b dtype, out dtype, orientation, ncols.
   const uint32_t spec[5] = {DtypeCode(a.dtype), DtypeCode(b.dtype), DtypeCode(out.dtype),
                             kBT ? 1u : 0u, ncols};
-  MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n), static_cast<uint32_t>(k),
-                 a_off, b_off, out_off};
-  // ONE WORKGROUP PER COLUMN BLOCK when blocked -- not FlatGroupCount, which
-  // divides an ELEMENT count by the workgroup size. Here a workgroup owns
-  // kWorkgroupSize*ncols consecutive columns of ONE output row, and the block
-  // count is rounded UP because N is not required to be a multiple of that span
-  // (248320 is not a multiple of 1024); the shader bounds-checks each column.
+  // Chunk over M to prevent hangcheck timeouts at large prefill sizes.
   const int64_t span = static_cast<int64_t>(kWorkgroupSize) * ncols;
-  const uint32_t groups = ncols == 1u ? FlatGroupCount(m * n)
-                                      : static_cast<uint32_t>(m * ((n + span - 1) / span));
-  FlushIfHeavy(static_cast<uint64_t>(2) * m * n * k);
-  Go("vt_matmul", bind, p, groups, spec, 5);
+  ChunkedMatmulDispatch(
+      m, n, k, a.dtype, out.dtype, a_off, out_off,
+      [&](uint32_t m_chunk, uint32_t a_chunk, uint32_t out_chunk) {
+        MatmulParams p{m_chunk, static_cast<uint32_t>(n),
+                       static_cast<uint32_t>(k), a_chunk, b_off, out_chunk};
+        const uint32_t groups =
+            ncols == 1u ? FlatGroupCount(static_cast<int64_t>(m_chunk) * n)
+                        : static_cast<uint32_t>(
+                              static_cast<int64_t>(m_chunk) *
+                              ((n + span - 1) / span));
+        Go("vt_matmul", bind, p, groups, spec, 5);
+      });
 }
 
 // cpu_ops.cpp:661-672 EmbeddingKernel. One output ELEMENT per invocation.
@@ -1287,6 +1357,10 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
                     args.logits_soft_cap};
   // One workgroup per (token, head) -- NOT FlatGroupCount, which divides by the
   // workgroup size; here the whole workgroup cooperates on one output row.
+  // Flush before attention at large contexts: the preceding dense GEMM chunks
+  // (QKV projection) may have accumulated enough GPU time in the current command
+  // buffer that adding the attention dispatch would exceed the hangcheck.
+  if (total_q > 256) VulkanContext::Get().FlushBatch("paged-attn-pre");
   Go("vt_paged_attn", bind, p, static_cast<uint32_t>(total_q * hq), spec, 4);
 }
 
@@ -2260,15 +2334,42 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
       buffers.push_back(r.buffer); buffers.push_back(r.buffer);
       out_off = r.offset;
     }
-    MatmulBTQuantTQ2GroupedParams cp{static_cast<uint32_t>(P), static_cast<uint32_t>(N),
-                              static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
-                              static_cast<uint32_t>(bcast ? 1 : 0),
-                              a_off, w_off, eid_off, out_off};
     const uint32_t spec[2] = {DtypeCode(out.dtype), DtypeCode(act.dtype)};
-    FlushIfHeavy(static_cast<uint64_t>(2) * P * N * K);
-    ctx.Dispatch(dev_shader, buffers.data(),
-                 static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-                 static_cast<uint32_t>((N + 3) / 4), spec, 2);
+    // Chunk over P to prevent hangcheck timeouts at large prefill sizes.
+    // Each MoE workgroup processes ALL P rows, so per-WG time scales with P.
+    // Host-side chunking: adjust a_off, eid_off, out_off per chunk so the
+    // shader (unchanged) processes only [p_start, p_start+p_count) rows.
+    // For gather_k>0, p_start must be aligned to gather_k so that the
+    // shader's row/gather_k maps to the correct activation row. kMaxPPerChunkMoe
+    // is a multiple of any reasonable top_k, so alignment is automatic.
+    const uint32_t total_P = static_cast<uint32_t>(P);
+    const uint32_t wg = static_cast<uint32_t>((N + 3) / 4);
+    const size_t act_elem = vt::SizeOf(act.dtype);
+    const size_t out_elem = vt::SizeOf(out.dtype);
+    for (uint32_t p_start = 0; p_start < total_P; p_start += kMaxPPerChunkMoe) {
+      const uint32_t p_count = std::min(kMaxPPerChunkMoe, total_P - p_start);
+      // Flush before each MoE chunk: each workgroup processes ALL p_count rows,
+      // and the kernel also does on-device quantization + SwiGLU, so per-chunk
+      // GPU time is higher than a pure GEMM estimate. Flushing isolates each
+      // chunk in its own command buffer, preventing hangcheck timeouts.
+      if (p_start > 0) ctx.FlushBatch("moe-chunk");
+      // Adjust offsets: shader loops row 0..p_count-1, so shift offsets to
+      // point at the correct slice of activation, expert_ids, and output.
+      const uint32_t a_chunk = a_off + p_start * static_cast<uint32_t>(K) *
+                                        static_cast<uint32_t>(act_elem);
+      const uint32_t eid_chunk = eid_off + p_start * sizeof(uint32_t);
+      const uint32_t out_chunk = out_off + p_start * static_cast<uint32_t>(N) *
+                                             static_cast<uint32_t>(out_elem);
+      MatmulBTQuantTQ2GroupedParams cp{p_count,
+                                static_cast<uint32_t>(N),
+                                static_cast<uint32_t>(nb),
+                                static_cast<uint32_t>(E),
+                                static_cast<uint32_t>(bcast ? 1 : 0),
+                                a_chunk, w_off, eid_chunk, out_chunk};
+      ctx.Dispatch(dev_shader, buffers.data(),
+                   static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+                   wg, spec, 2);
+    }
     return true;
   }
 
@@ -2396,16 +2497,43 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
     buffers.push_back(r.buffer); buffers.push_back(r.buffer);
     out_off = r.offset;
   }
-  MoeGateUpSwiGLUGroupedTQ2Params cp{
-      static_cast<uint32_t>(P), static_cast<uint32_t>(N),
-      static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
-      static_cast<uint32_t>(bcast ? 1 : 0), gather_k,
-      a_off, gw_off, uw_off, eid_off, out_off, limit};
-  FlushIfHeavy(static_cast<uint64_t>(2) * P * N * K * 2);  // gate+up = 2 GEMMs
   const uint32_t spec[2] = {DtypeCode(act.dtype), DtypeCode(out.dtype)};
-  ctx.Dispatch(shader, buffers.data(),
-               static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-               static_cast<uint32_t>((N + 3) / 4), spec, 2);
+  const uint32_t wg = static_cast<uint32_t>((N + 3) / 4);
+  // Chunk over P to prevent hangcheck timeouts at large prefill sizes.
+  // Host-side chunking: adjust a_off, eid_off, out_off per chunk so the
+  // shader (unchanged) processes only [p_start, p_start+p_count) rows.
+  // For gather_k>0, p_start must be aligned to gather_k so that the shader's
+  // row/gather_k maps to the correct activation row. kMaxPPerChunkMoe is a
+  // multiple of any reasonable top_k, so alignment is automatic.
+  const uint32_t total_P = static_cast<uint32_t>(P);
+  const size_t act_elem = vt::SizeOf(act.dtype);
+  const size_t out_elem = vt::SizeOf(out.dtype);
+  // Align chunk to gather_k so row/gather_k maps correctly with a_off adjustment.
+  const uint32_t chunk = (gather_k > 0u)
+      ? std::max(gather_k, kMaxPPerChunkMoe / gather_k * gather_k)
+      : kMaxPPerChunkMoe;
+  for (uint32_t p_start = 0; p_start < total_P; p_start += chunk) {
+    const uint32_t p_count = std::min(chunk, total_P - p_start);
+    // Flush before each MoE chunk: gate+up does 2x the work (2 GEMMs + SwiGLU),
+    // so per-chunk GPU time is higher. Flushing isolates each chunk.
+    if (p_start > 0) ctx.FlushBatch("moe-gate-up-chunk");
+    // Adjust offsets for this chunk. For gather_k>0, the activation row is
+    // row/gather_k, so shift a_off by (p_start/gather_k) rows.
+    const uint32_t act_row_off = (gather_k > 0u) ? (p_start / gather_k) : p_start;
+    const uint32_t a_chunk = a_off + act_row_off * static_cast<uint32_t>(K) *
+                                      static_cast<uint32_t>(act_elem);
+    const uint32_t eid_chunk = eid_off + p_start * sizeof(uint32_t);
+    const uint32_t out_chunk = out_off + p_start * static_cast<uint32_t>(N) *
+                                           static_cast<uint32_t>(out_elem);
+    MoeGateUpSwiGLUGroupedTQ2Params cp{
+        p_count, static_cast<uint32_t>(N),
+        static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
+        static_cast<uint32_t>(bcast ? 1 : 0), gather_k,
+        a_chunk, gw_off, uw_off, eid_chunk, out_chunk, limit};
+    ctx.Dispatch(shader, buffers.data(),
+                 static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
+                 wg, spec, 2);
+  }
   return true;
 }
 

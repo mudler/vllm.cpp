@@ -29068,3 +29068,62 @@ nix develop .#rocm-shell --command bash -c '
 Differenced against the identical invocation at `--max-tokens 36`; both legs
 under the same `flock`, never interleaved with unrelated GPU work on this
 non-fleet box.
+
+## QWEN3.5-0.8B TT EAGER DECODE W7: the staging-write elimination is NULL — staging counters byte-identical before/after on both production workloads, wall unchanged; the premise inverts and the gate failure (a reservation arm serving stale bytes over live shadows) is the real find (#2282) (2026-08-30, `row/BACKEND-TENSTORRENT-QWEN35`, P150 `thalia`)
+
+**What was tested.** #2282's lever: make the staging residency precise
+enough that a decode step stages each slot's bytes once — or zero times
+when a device op overwrites the buffer outright. Landed on
+`row/BACKEND-TENSTORRENT-QWEN35` (`bd81430a9`, repair `d2fd05c6e`):
+the reservation state (`MarkScratchAcquired` arms `device_reserved`
+where base called `MarkHostWritten`), the `EnsureDevice2D` reservation
+arm, the eager full-slot memset fill, the device-resident D2D copy arm,
+and the rule that every content-establishing transition spends the
+reservation. Red-first implementer, fresh reviewer PASS, repair, scoped
+re-review PASS, full gate rerun on the immutable head; suite 51/51 ·
+5852, sacred pair 16/16 STRICT both legs.
+
+**The gate failure was a real latent defect, and it is the wave's
+finding.** The first ambient leg drifted at prompt[1] tok=0,
+deterministically, with the base green on the identical leg: the
+reservation arm served the slot's stale persistent buffer whenever
+`device_reserved` was set — including after a producer had committed a
+live shadow (pool block re-handed to a new tenant → a matmul commits
+`[8,256]` → the next bf16 stage at the block's earlier `[5,1024]`
+geometry receives the PREVIOUS tenant's bytes). Wrong tokens on the
+DEFAULT decode path, reachable only through the W7 change. Fix: every
+content-establishing transition spends the reservation and the arm
+refuses when `device_current` is set; the new suite case pins the joint
+invariant (single-layer mutations pass by design, joint removal red).
+
+**Measurement: a null, with the counter identity as the mechanism.**
+Ambient default legs, one `$HOME/gpu.lock` hold per series, interleaved
+legs, symmetric `VT_TT_STAGE_DUMP` atexit probe (temporary, reverted
+before this record; env-guarded, off by default). vllm-cli 3-token: the
+arms never fire (avoided 0/0/0 in every leg), bulk=277 pwrite=169
+palloc=139 identical before/after, wall 18.844 s vs 18.946 s mean
+(−0.54%, noise). E2E ambient 16-prompt, 8640 GDN steps, 2 interleaved
+legs per arm: AFTER bulk=10205 pwrite=989 palloc=173 pbytes=1459288064
+avoided 0/0/0 — BEFORE the same four counters to the byte in all four
+legs; wall 1385.527 s vs 1385.927 s mean (−0.03%); per-step staging
+writes 989/8640 = 0.114 in BOTH arms. Evidence log:
+[`../docs/bench-evidence/tt-qwen35-staging-w7-20260830.log`](../docs/bench-evidence/tt-qwen35-staging-w7-20260830.log).
+
+**Attribution shift — the issue's own contract for a null.** The
+residency state does NOT manufacture the staging writes: in the base
+the pool-acquire marks the slot device-stale, but a content op commits
+a fresh shadow before any restage can fire — the same commit that
+spends the W7 reservation — so both worlds restage identically, and the
+arm's serve (`device_reserved && !device_current`) is reached by no
+production interleaving. The W6-probe restages (7-8/step on vllm-cli)
+are the causally required ones W6 already identified: each is produced
+by a host round-trip between writes. The staging-write-elimination lane
+is closed with evidence; the tt-metal-side residual (multi-destination
+write, amortized per-op CQ tax) stays the upstream-shaped alternative.
+
+**Not established, and not claimed.** No ceiling on the wall — the W5
+residual attribution stands (per-CQ-operation tt-metal stack +
+threadpool spin). The serve arms are production-evaluated but never
+serve on the measured workloads, and the host-hybrid opt-out leg (LEG
+A) was not dump-probed; both are named owed in the row spec. The
+`VT_TT_STAGE_DUMP` counters remain in-tree as the detector.

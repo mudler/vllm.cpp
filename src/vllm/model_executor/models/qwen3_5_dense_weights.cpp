@@ -880,6 +880,33 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
       all_names.push_back(name);
     }
   }
+
+  // PERF-QWEN35-STAGE-WEIGHTS (#2327/#2342): decide ONCE, here, whether this
+  // checkpoint's dense weights may be staged device-resident instead of
+  // ATS-retagged. This is the only place that knows the model's TOTAL, and the
+  // budget must come from a stable number rather than live free memory --
+  // measured, a live-free floor captured 8.1% of an available 21.1% because
+  // `free` falls as the host mirror loads (`platforms/interface.h:66-69` states
+  // the rule; this is what ignoring it costs).
+  //
+  // Only the SAFETENSORS loader calls this. A GGUF checkpoint never does, so it
+  // keeps the retag unconditionally — which is how #1299's `Qwen3.8-2.4T-A95B
+  // UD-Q1_0` stays exactly as it is, and why the file total is a sound proxy
+  // here: a bf16 safetensors weight occupies its file size in host memory,
+  // while a GGUF one expands on load and would not.
+  {
+    size_t model_weight_bytes = 0;
+    for (const SafetensorsFile& shard : shards)
+      for (const std::string& name : shard.Names())
+        model_weight_bytes += shard.Get(name).nbytes;
+    size_t device_total = 0;
+    if (load_queue != nullptr) {
+      device_total = vllm::platforms::GetPlatform(load_queue->device.type)
+                         .residency_policy()
+                         .device_memory_total_bytes;
+    }
+    SetSafetensorsWeightBudget(model_weight_bytes, device_total);
+  }
   // ONE namespace decision for the whole checkpoint (qwen3_5_weights.h): the
   // VL-nested spelling for the wrappers we gate, the flat `model.` spelling for
   // a text-only arm, and a refusal for a mixed index.

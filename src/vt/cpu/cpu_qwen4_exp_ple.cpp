@@ -1,6 +1,8 @@
-// CPU kernel for the Qwen4-Exp (`Qwen3.8-Flash-Next`) PLE dilated depthwise
-// causal convolution — `vt::Qwen4ExpPleConv`. Row MODEL-MM-QWEN4-EXP W5b-3
-// (#2156), campaign #1978, spec `.agents/specs/qwen4-exp-flash-next.md`
+// CPU kernels for the Qwen4-Exp (`Qwen3.8-Flash-Next`) PLE layer: the dilated
+// depthwise causal convolution — `vt::Qwen4ExpPleConv`, row MODEL-MM-QWEN4-EXP
+// W5b-3 (#2156) — and the signed-sqrt GATE that feeds it —
+// `vt::Qwen4ExpPleGate`, W5e-1 (#2336). Campaign #1978, spec
+// `.agents/specs/qwen4-exp-flash-next.md`
 // (`### PLE: a strided-history conv with no vLLM op, confirmed`).
 //
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
@@ -77,7 +79,7 @@ float LoadF32At(const Tensor& t, int64_t i) {
     case DType::kF32: return t.Ptr<float>()[i];
     case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[i]);
     case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[i]);
-    default: VT_CHECK(false, "qwen4_exp_ple_conv: unsupported input dtype"); return 0.0f;
+    default: VT_CHECK(false, "qwen4_exp_ple: unsupported input dtype"); return 0.0f;
   }
 }
 
@@ -86,7 +88,7 @@ void StoreF32At(const Tensor& t, int64_t i, float v) {
     case DType::kF32: t.Ptr<float>()[i] = v; break;
     case DType::kF16: t.Ptr<uint16_t>()[i] = F32ToF16(v); break;
     case DType::kBF16: t.Ptr<uint16_t>()[i] = F32ToBF16(v); break;
-    default: VT_CHECK(false, "qwen4_exp_ple_conv: unsupported output dtype");
+    default: VT_CHECK(false, "qwen4_exp_ple: unsupported output dtype");
   }
 }
 
@@ -165,11 +167,77 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   }
 }
 
+// ─── THE GATE — `vt::Qwen4ExpPleGate` (W5e-1, #2336) ─────────────────────────
+// `Qwen4ExpTextPLELayer.forward` :1181-1182, flattened at :1184:
+//
+//     gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+//     gated_value = torch.sigmoid(gate) * value.unsqueeze(-2)
+//
+// THE CLAMP IS BEFORE THE SQRT and the sign is applied AFTER it, so this is not
+// `sqrt(clamp(g))` with a sign carried through: at g == 0 the sign is 0 and the
+// 1e-3 floor is cancelled, which is why the origin is handled by the SIGN and
+// not by a branch. Written as one expression whose order matches upstream's
+// method chain left to right, so a reader can diff them by eye.
+//
+// `value` is read once per (t, d) and broadcast across the hc streams; the
+// broadcast is never materialised, which is the whole reason this is one op.
+double SignedSqrt(double g, double clamp_min) {
+  // NaN IS UPSTREAM'S ANSWER HERE, and the zero arm below would swallow it.
+  // `torch.sign(NaN) == 0`, but `NaN * 0.0 == NaN`, so `:1181` propagates a NaN
+  // gate and `:1182` a NaN output -- measured by running the pinned expression
+  // itself under torch, not inferred from the sign rule. Without this line
+  // `NaN < clamp_min` is false, `floored` and `root` are NaN, NEITHER sign
+  // branch is taken, and the fall-through returns 0.0 -- which sigmoids to a
+  // perfectly plausible `0.5 * value`. That is #2272's polarity, a poison value
+  // rendered as a number, inside an op whose comparisons route through
+  // `max_abs_diff.h` precisely so poison cannot be absorbed silently. `+/-inf`
+  // and `+/-0.0` need NO guard: they already match upstream term for term,
+  // which is why this is spelled for NaN alone rather than as a finiteness
+  // test.
+  if (std::isnan(g)) return g;
+  const double magnitude = std::abs(g);
+  const double floored = magnitude < clamp_min ? clamp_min : magnitude;
+  const double root = std::sqrt(floored);
+  // `torch.sign`: -1, 0 or +1. The zero arm is upstream's and it is reachable —
+  // a fully masked row scores exactly zero — so it is spelled out rather than
+  // left to a `g > 0 ? +root : -root` that would return -1e-3 for it.
+  if (g > 0.0) return root;
+  if (g < 0.0) return -root;
+  return 0.0;
+}
+
+double Sigmoid(double v) { return 1.0 / (1.0 + std::exp(-v)); }
+
+void Qwen4ExpPleGateKernel(Queue&, Tensor& out, const Tensor& score, const Tensor& value,
+                           const Qwen4ExpPleGateArgs& args) {
+  const int64_t tokens = score.shape[0];
+  const int64_t hc = score.shape[1];
+  const int64_t hidden = value.shape[1];
+  const double divisor = static_cast<double>(args.gate_divisor);
+  const double clamp_min = static_cast<double>(args.clamp_min);
+  const float* scores = score.Ptr<float>();
+
+  for (int64_t t = 0; t < tokens; ++t) {
+    for (int64_t j = 0; j < hc; ++j) {
+      const double g = static_cast<double>(scores[t * hc + j]) / divisor;
+      const double weight = Sigmoid(SignedSqrt(g, clamp_min));
+      for (int64_t d = 0; d < hidden; ++d) {
+        StoreF32At(out, t * (hc * hidden) + j * hidden + d,
+                   static_cast<float>(weight * static_cast<double>(
+                                                   LoadF32At(value, t * hidden + d))));
+      }
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kQwen4ExpPleConv, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<Qwen4ExpPleConvFn>(&Qwen4ExpPleConvKernel)));
+    RegisterOp(OpId::kQwen4ExpPleGate, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<Qwen4ExpPleGateFn>(&Qwen4ExpPleGateKernel)));
   }
 } registrar;
 

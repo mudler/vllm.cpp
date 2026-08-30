@@ -687,49 +687,46 @@ TEST_CASE("an F32 UPCAST does not make an aliased weight's host mirror redundant
 // The arithmetic is extracted as a pure function so it can be gated here
 // without a device: a fake backend would need every pure virtual of
 // `vt::Backend` stubbed, and the boilerplate would gate less than this does.
-TEST_CASE("stage-vs-retag: a model that FITS is staged") {
-  // 50 GiB of weights on a 119.6 GiB box with 113 GiB free: 63 GiB left after,
-  // which is 53% of total, above the 0.55 floor only if... it is not. Use the
-  // real early-load shape instead: the first weights arrive with the box nearly
-  // empty, so each individual weight passes comfortably.
-  const size_t total = 119ull << 30;
-  const size_t free_early = 113ull << 30;
-  CHECK(vllm::DeviceStagingFitsBudget(free_early, total, 2ull << 30, 0.55));
-  CHECK(vllm::DeviceStagingFitsBudget(free_early, total, 20ull << 30, 0.55));
+TEST_CASE("stage-vs-retag: a 50 GiB model on a 119 GiB box IS staged") {
+  const size_t box = 119ull << 30;
+  const size_t reserve = 12ull << 30;
+  // 2 x 50 + 12 = 112 <= 119. The measured case: this is Qwen3.8-27B bf16 on
+  // GB10, and staging it is +21.1% on the committed gate.
+  CHECK(vllm::StagingFitsModel(50ull << 30, box, reserve));
 }
 
-TEST_CASE("stage-vs-retag: the 2.4T shape is REFUSED, which is #1299's invariant") {
-  // #1299 measured that checkpoint resident at 61.20 GiB on a 119.631 GiB box.
-  // Its first dense weight therefore arrives with the box already past the
-  // floor, and must keep the retag rather than pay for a second copy.
-  const size_t total = 119ull << 30;
-  const size_t free_after_host_bytes = 58ull << 30;  // ~119 - 61
-  CHECK_FALSE(vllm::DeviceStagingFitsBudget(free_after_host_bytes, total, 2ull << 30, 0.55));
+TEST_CASE("stage-vs-retag: #1299's shape is REFUSED, because the copy is ADDITIVE") {
+  const size_t box = 119ull << 30;
+  const size_t reserve = 12ull << 30;
+  // #1299 measured `Qwen3.8-2.4T-A95B UD-Q1_0` resident at 61.20 GiB and then
+  // exhausting this box. 2 x 61 + 12 = 134 > 119, so it must never stage.
+  CHECK_FALSE(vllm::StagingFitsModel(61ull << 30, box, reserve));
+  // And the boundary is the DOUBLING, not the model size: a model just over
+  // half the remaining budget is refused while one just under is admitted.
+  CHECK(vllm::StagingFitsModel(53ull << 30, box, reserve));
+  CHECK_FALSE(vllm::StagingFitsModel(54ull << 30, box, reserve));
 }
 
-TEST_CASE("stage-vs-retag: the floor is the load-bearing term") {
-  const size_t total = 100ull << 30;
-  const size_t w = 1ull << 30;
-  // Comfortably above the 55% floor after staging, and comfortably below it.
-  // The EXACT boundary is deliberately not asserted: the comparison is against
-  // `min_free_frac * total` in double, and 0.55 is not representable in binary,
-  // so an equality case would be gating the rounding rather than the policy.
-  CHECK(vllm::DeviceStagingFitsBudget((57ull << 30) + w, total, w, 0.55));
-  CHECK_FALSE(vllm::DeviceStagingFitsBudget((53ull << 30) + w, total, w, 0.55));
-  // And the floor is what moves the answer: the same free/bytes flips with it.
-  CHECK(vllm::DeviceStagingFitsBudget((53ull << 30) + w, total, w, 0.50));
+TEST_CASE("stage-vs-retag: the reserve is load-bearing") {
+  const size_t box = 119ull << 30;
+  const size_t m = 53ull << 30;
+  CHECK(vllm::StagingFitsModel(m, box, 12ull << 30));
+  // Raise the reserve and the same model no longer fits.
+  CHECK_FALSE(vllm::StagingFitsModel(m, box, 20ull << 30));
 }
 
-TEST_CASE("stage-vs-retag: an unanswerable budget keeps the retag") {
-  // `DeviceMemoryInfo` returning false leaves total_bytes 0. An unknown budget
-  // is not a licence to double a model's residency, so the answer is NO.
-  CHECK_FALSE(vllm::DeviceStagingFitsBudget(0, 0, 1ull << 30, 0.55));
-  CHECK_FALSE(vllm::DeviceStagingFitsBudget(1ull << 30, 0, 1ull << 30, 0.55));
+TEST_CASE("stage-vs-retag: an unknown total or an unknown model REFUSES") {
+  // A platform that could not probe its memory reports 0, and a caller that
+  // never learned the model size passes 0. Neither is a licence to double a
+  // model's residency, so both answer NO rather than guessing.
+  CHECK_FALSE(vllm::StagingFitsModel(50ull << 30, 0, 12ull << 30));
+  CHECK_FALSE(vllm::StagingFitsModel(0, 119ull << 30, 12ull << 30));
+  CHECK_FALSE(vllm::StagingFitsModel(0, 0, 12ull << 30));
 }
 
-TEST_CASE("stage-vs-retag: a weight larger than free memory is REFUSED") {
-  const size_t total = 119ull << 30;
-  CHECK_FALSE(vllm::DeviceStagingFitsBudget(4ull << 30, total, 8ull << 30, 0.55));
-  // Equal is also refused: staging it would leave nothing at all.
-  CHECK_FALSE(vllm::DeviceStagingFitsBudget(8ull << 30, total, 8ull << 30, 0.55));
+TEST_CASE("stage-vs-retag: a model larger than the whole box REFUSES without wrapping") {
+  // The arithmetic must not underflow when the reserve exceeds the box, nor
+  // wrap when 2*model overflows the comparison.
+  CHECK_FALSE(vllm::StagingFitsModel(200ull << 30, 119ull << 30, 12ull << 30));
+  CHECK_FALSE(vllm::StagingFitsModel(1ull << 30, 8ull << 30, 12ull << 30));
 }

@@ -1990,6 +1990,53 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
       q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
 }
 
+// vt::Qwen4ExpPleGate — `Qwen4ExpTextPLELayer.forward` :1181-1182 (+ :1184),
+// transformers v5.16.0. The DOT that feeds it is vt::BatchedMatmul and is
+// deliberately not here; see the kQwen4ExpPleGate comment in include/vt/ops.h.
+void Qwen4ExpPleGate(Queue& q, Tensor& out, const Tensor& score, const Tensor& value,
+                     const Qwen4ExpPleGateArgs& args) {
+  constexpr const char* name = "qwen4_exp_ple_gate";
+  VT_CHECK(out.rank == 2 && score.rank == 2 && value.rank == 2,
+           std::string(name) + ": out [T,hc*H], score [T,hc], value [T,H]");
+  const int64_t T = score.shape[0], hc = score.shape[1], h = value.shape[1];
+  VT_CHECK(out.shape[0] == T && value.shape[0] == T,
+           std::string(name) + ": out/score/value must agree on T");
+  VT_CHECK(hc >= 1 && h >= 1, std::string(name) + ": hc and H must be >= 1");
+  // THE ONE CHECK THIS OP EXISTS FOR, after the arithmetic itself. `out` is the
+  // FLATTENED [T, hc*H] the conv and the norm downstream want, and a caller that
+  // flattened (H, hc) instead of (hc, H) produces a buffer of exactly the right
+  // size holding a transposed answer. The product is therefore named against
+  // both factors, so the message says which two numbers were multiplied.
+  VT_CHECK(out.shape[1] == hc * h,
+           std::string(name) + ": out must be [T, hc*H] = [T," + std::to_string(hc) + "*" +
+               std::to_string(h) + "] = [T," + std::to_string(hc * h) + "], got [T," +
+               std::to_string(out.shape[1]) + "]");
+  // f32 score only, the reason SigmoidGateBf16 gives for its own gate operand:
+  // this value is the argument of a sigmoid AND of a square root, and rounding a
+  // transcendental's input is a value change no downstream tolerance owns.
+  VT_CHECK(score.dtype == DType::kF32,
+           std::string(name) + ": score must be f32 (it is the sigmoid/sqrt argument)");
+  VT_CHECK(IsFloat(value.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float value, f32/bf16 out");
+  VT_CHECK(args.gate_divisor > 0.0f,
+           std::string(name) + ": gate_divisor must be > 0 (it is math.sqrt(hidden_size)), got " +
+               std::to_string(args.gate_divisor));
+  // 0 is NOT "no floor". Upstream's literal is 1e-6 and its whole effect is the
+  // 1e-3 floor it puts on |output|; a zero here would silently mean "port the
+  // line without the clamp", which is the defect the op is gated against.
+  VT_CHECK(args.clamp_min > 0.0f,
+           std::string(name) +
+               ": clamp_min must be > 0; 0 is NOT 'no floor'. Upstream's literal is 1e-6 "
+               "(modeling_qwen4_exp.py:1181) and it is applied BEFORE the sqrt, so the "
+               "floor on |out| is its square root");
+  VT_CHECK(out.IsContiguous() && score.IsContiguous() && value.IsContiguous(),
+           std::string(name) + ": out/score/value must be contiguous");
+  VT_CHECK(out.device == q.device && score.device == q.device && value.device == q.device,
+           std::string(name) + ": device mismatch (out/score/value/queue)");
+  reinterpret_cast<Qwen4ExpPleGateFn>(GetOp(OpId::kQwen4ExpPleGate, q.device.type))(
+      q, out, score, value, args);
+}
+
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                             const Tensor* bias, Tensor& conv_state,
                             const Tensor& conv_state_indices,

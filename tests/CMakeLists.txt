@@ -3478,6 +3478,15 @@ target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen4_exp_ple_device vllm/models/test_qwen4_exp_ple_device.cpp)
 target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-QWEN4-EXP W5e-1 (#2336) — vt::Qwen4ExpPleGate, the PLE signed-sqrt
+# gate and its broadcast sigmoid scale, against section J of the SAME lane-pinned
+# goldens: modeling_qwen4_exp.py:1181-1182 + the :1184 flatten, exec'd verbatim.
+# Includes the vt::BatchedMatmul composition of the :1180 dot, so the claim that
+# the dot needs no new op is measured rather than asserted. CPU only: no CUDA arm
+# of this op exists and one written on a CPU host could not be gated. No src/
+# grant — this test reaches nothing but the public vt:: surface.
+vllm_cpp_add_test(test_qwen4_exp_ple_gate vllm/models/test_qwen4_exp_ple_gate.cpp)
+
 # MODEL-MM-QWEN4-EXP W5d-2 (#2249 item 5) — behaviour-neutrality gate for giving
 # `BuildMropeCosSinHost` external linkage. Pins the interleaved and chunked
 # mRoPE cos|sin tables BITWISE against the values the file-static definition

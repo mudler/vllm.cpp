@@ -4613,9 +4613,18 @@ TEST_CASE("kTENSTORRENT W7 D2D copy records the served geometry") {
 // also installs SRC's shadow into dst's slot, and equal byte size does not mean
 // equal geometry there either. A stale record lets a later stage at dst's
 // recorded exact geometry hit the fast path and be handed a wrongly-shaped
-// src-shaped tensor. The case arms the lane through the live env read the same
-// way the inertness-guard case sets it, and pins the lane with the same
-// avoided-copy counter the eager arm bumps.
+// src-shaped tensor. The whole-slot D2D copy runs INSIDE a real trace capture
+// region (BeginCapture/EndCapture, then Replay to execute the captured op):
+// under an active capture the eager arm CopyDeviceDeviceIfResident structurally
+// declines, so the capture lane is the only path that can serve the copy and
+// the avoided-copy counter is lane-exclusive — deleting the capture lane's
+// call site cannot stay green (the host fallback would read back inside the
+// captured region, violating the ttnn trace contract, and the counter would
+// read 0). The consume at dst's declared [R, C] geometry pins the
+// served-geometry record: without it the stage false-hits the exact-shape
+// fast path and hands the matmul the wrongly-shaped [C, R] tensor, which
+// throws. The case arms the lane through the live env read the same way the
+// inertness-guard case sets it.
 struct ForceHostFreeDecode {
   const bool had = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
   const std::string saved =
@@ -4670,11 +4679,24 @@ TEST_CASE("kTENSTORRENT #2294 capture-lane D2D copy records the served geometry"
   mm(q, o, r, b5);   // the reference: the same flat bytes declared [R, C]
   std::vector<float> want(R * N);
   backend.Copy(q, want.data(), mo, R * N * 4);
+  // Program-cache warm contract (ttnn trace fatals on "Cannot load new
+  // binaries during trace capture"): run the SAME D2D copy once eagerly,
+  // outside capture — the host-free lane arms it and the first use enables
+  // the program cache and compiles the captured ttnn::empty + ttnn::copy
+  // pair. Drop its counter contribution before the capture region.
+  backend.Copy(q, md, ma, R * C * 2);
   ResetStagingStats();
-  backend.Copy(q, md, ma, R * C * 2);  // whole-slot D2D copy: dst's shadow is src-shaped
+  // Capture region holds only the whole-slot D2D copy: dst's shadow becomes
+  // src-shaped. Replay executes it (non-blocking; the readback below
+  // synchronizes, mirroring the matmul capture/replay recipe above).
+  backend.BeginCapture(q);
+  backend.Copy(q, md, ma, R * C * 2);
+  backend.EndCapture(q);
+  backend.Replay(q);
   vt::tenstorrent::StagingStats st = GetStagingStats();
   CHECK_MESSAGE(st.stages_avoided_device_copy == 1,
-                "the capture-lane copy must go device->device, got "
+                "under an active capture only the capture lane may serve the "
+                    "copy, got "
                     << st.stages_avoided_device_copy);
   mm(q, o, d, b5);  // consume dst at its DECLARED [R, C] geometry
   st = GetStagingStats();

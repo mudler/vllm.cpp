@@ -531,6 +531,8 @@ const char* OpNameImpl(OpId op) {
       return "Qwen4ExpPleConv";
     case OpId::kRmsNormGroup:
       return "RmsNormGroup";
+    case OpId::kQwen4ExpPleGate:
+      return "Qwen4ExpPleGate";
     case OpId::kQwen4ExpGatedResidual:
       return "Qwen4ExpGatedResidual";
     case OpId::kQwen4ExpGatedResidualWriteBack:

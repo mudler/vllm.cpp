@@ -250,6 +250,23 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // this model's three published groups trigger — an ENGINE seam that #2249
   // records as belonging to an engine row and not to this model port.
   //
+  // AND A SIXTH TIME, IN THE OPPOSITE POLARITY — AN OVERSTATED REFUSAL, WHICH
+  // IS #2254's SHAPE AND NOT #2276's. The clause "the ops and block seams ARE
+  // on main" was FALSE when it was written and stayed false through two more
+  // waves. #2336 measured it: `git grep -n 'clamp_min\|signed_sqrt\|copysign'
+  // src/vt include/vt` returned ZERO lines, so the PLE GATE
+  // (modeling_qwen4_exp.py:1181-1182) had no `vt::` op at all — it was never
+  // one of #2249's five, so closing all five could not and did not supply it.
+  // W5e-1 supplies it as `vt::Qwen4ExpPleGate`, and the clause is SPLIT here
+  // rather than extended, because the two halves now have different answers:
+  // the ops are complete and the block seams are not. `RunQwen4ExpPleBlock`
+  // does not exist, `vt::RmsNormGroup` and `vt::Qwen4ExpPleGate` therefore have
+  // no production caller, and the PLE block is the last seam the loop is
+  // missing (#2336, W5e-2). Naming the missing SYMBOL rather than a wave label
+  // is the closest this string can get to the truth-linked check #2288's
+  // residual asks for: a reader can grep for it, and it resolves the day
+  // W5e-2 lands.
+  //
   // WHAT PINS THIS STRING, checked rather than assumed. The `SUBCASE("the
   // forward")` of `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` drives
   // this hook with a foreign handle and asserts FIVE substrings:
@@ -265,16 +282,18 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // that is wrong.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
-           "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..6, "
-           "W5c-1, W5c-2, W5d-1, W5d-2, W5d-3, W5d-4), and with W5c-2 ZERO of "
-           "the five prerequisites #2249 surveyed remain: GPUModelRunner now "
-           "gathers every published group's block table, so the map into the "
-           "QSA indexer side cache's pages reaches the forward. What is missing "
-           "is the LAYER LOOP itself, Qwen4ExpTextModel::Forward, owned by "
-           "#2031, with that side cache's PAGED STORE still owed beside it. "
+           "The five prerequisites #2249 surveyed are ZERO, and every op the "
+           "loop composes is now on main (W2/W3/W4/W6a/W5a/W5b-1..6, W5c-1, "
+           "W5c-2, W5d-1..4, W5e-1). The BLOCK SEAMS are not: the PLE block has "
+           "no production composition — there is no RunQwen4ExpPleBlock beside "
+           "RunQwen4ExpQsaBlock and RunQwen4ExpMoeBlock — and it is the LAST "
+           "one, owned by W5e-2 under #2336. Beyond it the LAYER LOOP itself, "
+           "Qwen4ExpTextModel::Forward, is missing, owned by #2031, with the "
+           "QSA indexer side cache's PAGED STORE still owed. "
            "ModelRegistry::Forward additionally refuses any multi-cache "
            "topology by name, and this model publishes one. See "
-           ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");
+           ".agents/specs/qwen4-exp-flash-next.md and issues #2031, #2336 and "
+           "#1978.");
   return ForwardLogits{};  // unreachable; VT_CHECK always throws here
 }
 

@@ -26,6 +26,7 @@ import io
 import math
 import pathlib
 import sys
+import textwrap
 import types
 import urllib.request
 
@@ -476,6 +477,142 @@ W("static const int64_t kConvDilations[%d] = {%s};\n"
 dump_tensor("kConvInput", conv_in)
 for _dil in CONV_DILATIONS:
     dump_tensor(f"kConvExpectedD{_dil}", conv_out[_dil])
+W("\n")
+
+# ---------- J. the PLE GATE ALONE, modeling_qwen4_exp.py:1180-1182 (+ :1184) --
+# MODEL-MM-QWEN4-EXP W5e-1 (#2336). `vt::Qwen4ExpPleGate` is those three lines
+# and nothing else, so it needs a golden that is those three lines and nothing
+# else. Section E already pins :1181 on eleven SCALARS; it cannot see the
+# sigmoid, it cannot see the `value.unsqueeze(-2)` broadcast, and a port that
+# multiplied the wrong axis would pass it. Section G is the whole layer, which
+# sees everything and localises nothing.
+#
+# ANCHORS. #2336 cites this block as ":1179-1183"; at the pinned v5.16.0 file
+# (sha256 77fec77d...c459) :1179 is the `query_normed` unflatten and :1183 is
+# the `norm_conv` call, so the gate itself is :1180-1182 and the flatten it
+# feeds is :1184. The one-line shift is corrected here and in the row's spec.
+#
+# HOW THIS IS PRODUCED. The upstream lines are `exec`d VERBATIM by line range
+# on inputs chosen here -- :1180 alone first, so its scaled dot is observable,
+# then :1181-1182, then the :1184 flatten. No line of the gate is retyped.
+#
+# THE CLAMP IS THE VARIABLE, AND THE FIXTURE PROBES BOTH SIDES OF IT. The
+# `clamp_min(1e-6)` sits BEFORE the sqrt, so the floor on |gate| is 1e-3 and not
+# 1e-6, and a fixture on which it never binds would gate nothing at all -- the
+# blind spot #2272 recorded for an eps invisible at two of four goldens. Four of
+# the twelve (t, j) pairs are therefore built to straddle it:
+#
+#   (0,0)  key row ZEROED      -> the dot is exactly 0, sign(0) == 0, and the
+#                                 gate is 0 rather than the 1e-3 floor. THE
+#                                 ORIGIN, where the function is discontinuous.
+#   (0,1)  key row * 1e-7      -> |gate| ~ 1e-8, the clamp BINDS, positive
+#   (1,0)  key row * -1e-7     -> the clamp BINDS with the sign preserved
+#   (1,1)  key row * 1e-5      -> just above the floor; asserted, not assumed
+#
+# and the remaining eight are dense, where it must be INERT. `kGateClampBinds`
+# records which is which, read off upstream's own :1180 output, so the test
+# asserts the population rather than trusting this comment.
+#
+# The value rows of the two probing tokens are scaled up so the clamp's effect
+# on the OUTPUT is large against the gate tolerance: the whole dynamic range of
+# the clamp is sigmoid(1e-3) - sigmoid(0) = 2.5e-4 per unit of value, so an
+# unscaled fixture would separate by 2.5e-4 and a port that dropped the clamp
+# would sit 25x above a 1e-5 bound rather than comfortably above it.
+GATE_T = 6
+_g = torch.Generator().manual_seed(20260830)
+gate_key = torch.empty(1, GATE_T, HC, H).uniform_(-1.0, 1.0, generator=_g)
+gate_query = torch.empty(1, GATE_T, HC, H).uniform_(-1.0, 1.0, generator=_g)
+gate_value = torch.empty(1, GATE_T, H).uniform_(-1.0, 1.0, generator=_g)
+gate_key[0, 0, 0].zero_()
+gate_key[0, 0, 1] *= 1e-7
+gate_key[0, 1, 0] *= -1e-7
+gate_key[0, 1, 1] *= 1e-5
+gate_value[0, 0] *= 8.0
+gate_value[0, 1] *= 8.0
+
+
+def body_of(first, last):
+    """The upstream lines, verbatim, dedented out of their method body."""
+    return textwrap.dedent(rng(SRC, first, last))
+
+
+def run_gate(key, query, value, eps=None):
+    """upstream :1180, then :1181-1182, then the :1184 flatten -- verbatim.
+
+    `eps` replaces the clamp floor and exists only for the separation number
+    below; it is None for every golden this file emits.
+    """
+    ns = {"torch": torch, "math": math,
+          "self": types.SimpleNamespace(hidden_size=H),
+          "key_normed": key, "query_normed": query, "value": value}
+    exec(compile(body_of(1180, 1180), "modeling_qwen4_exp.py@1180", "exec"), ns)
+    pre = ns["gate"].clone()
+    body = body_of(1181, 1182)
+    if eps is not None:
+        assert "clamp_min(1e-6)" in body
+        body = body.replace("clamp_min(1e-6)", f"clamp_min({eps!r})")
+    exec(compile(body, "modeling_qwen4_exp.py@1181", "exec"), ns)
+    post = ns["gate"].clone()
+    exec(compile(body_of(1184, 1184), "modeling_qwen4_exp.py@1184", "exec"), ns)
+    return pre, post, ns["gated_value"]
+
+
+with torch.no_grad():
+    gate_pre, gate_post, gate_out = run_gate(gate_key, gate_query, gate_value)
+    # The same three lines with the floor taken to zero. torch has no way to
+    # DELETE the clamp from a line it is executing, and 0.0 is what deleting it
+    # means: `x.abs().clamp_min(0)` is `x.abs()`. This is the fixture's
+    # discriminating power, not a golden -- nothing is compared against it.
+    _, gate_post_noclamp, gate_out_noclamp = run_gate(
+        gate_key, gate_query, gate_value, eps=0.0)
+
+gate_binds = (gate_pre.abs() < 1e-6).reshape(-1)
+gate_sep = (gate_out - gate_out_noclamp).abs().max().item()
+assert gate_pre[0, 0, 0, 0].item() == 0.0, "the origin probe must be EXACTLY zero"
+assert gate_post[0, 0, 0, 0].item() == 0.0, "sign(0) == 0, so the origin maps to 0"
+assert int(gate_binds.sum()) == 3, \
+    f"expected 3 clamped pairs, got {int(gate_binds.sum())}: {gate_pre.reshape(-1)}"
+assert int((~gate_binds).sum()) == GATE_T * HC - 3
+assert gate_sep > 1e-3, \
+    f"the clamp must move the output or the fixture gates nothing: {gate_sep}"
+# |post| is EXACTLY the floor wherever the clamp bound, and strictly above it
+# everywhere else. Asserted here so the emitted `kGateClampBinds` cannot drift
+# away from the values beside it.
+_floor = math.sqrt(1e-6)
+for _i, (_b, _p) in enumerate(zip(gate_binds.tolist(),
+                                  gate_post.reshape(-1).tolist())):
+    if _i == 0:
+        assert _p == 0.0, (_i, _p)
+    elif _b:
+        assert abs(abs(_p) - _floor) < 1e-9, (_i, _p)
+    else:
+        assert abs(_p) > _floor, (_i, _p)
+
+W("// modeling_qwen4_exp.py:1180-1182 + the :1184 flatten -- the PLE GATE alone,\n")
+W("// executed VERBATIM by line range on the inputs below. hc_count = 2,\n")
+W("// hidden_size = 8, so `gate` is one scalar per (t, j) and `value` broadcasts\n")
+W("// across j: BOTH operands of the :1182 multiply broadcast, which is why no\n")
+W("// elementwise op in this tree can express it.\n")
+W("// The clamp BINDS on 3 of the 12 (t, j) pairs and is INERT on the other 9;\n")
+W("// kGateClampBinds is read off upstream's own :1180 output. (0,0) is the\n")
+W("// ORIGIN: the dot is exactly 0, sign(0) = 0, and the gate is 0 rather than\n")
+W("// the 1e-3 floor. MEASURED max|difference| between this golden and the same\n")
+W("// three lines with the floor taken to zero: %.6g. A fixture on which the\n" % gate_sep)
+W("// clamp did not bind would gate nothing.\n")
+W(f"static const int64_t kGateT = {GATE_T};\n")
+W(f"static const int64_t kGateHc = {HC};\n")
+W(f"static const int64_t kGateH = {H};\n")
+W("// upstream DIVIDES by math.sqrt(self.hidden_size) at :1180.\n")
+W(f"static const float kGateDivisor = {math.sqrt(H)!r}f;\n")
+W(f"static const float kGateClampSeparation = {gate_sep!r}f;\n")
+W("static const unsigned char kGateClampBinds[%d] = {%s};\n"
+  % (GATE_T * HC, ", ".join(str(int(b)) for b in gate_binds.tolist())))
+dump_tensor("kGateKeyNormed", gate_key)
+dump_tensor("kGateQueryNormed", gate_query)
+dump_tensor("kGateValueIn", gate_value)
+dump_tensor("kGateScaledDot", gate_pre)
+dump_tensor("kGatePostSqrt", gate_post)
+dump_tensor("kGateExpectedOut", gate_out)
 W("\n")
 
 OUT_PATH.write_text(OUT.getvalue())

@@ -360,6 +360,21 @@ static_assert(sizeof(AttnQkNormRopeGateParams) <= 128,
 static_assert(sizeof(Exl3HadParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(Exl3GemmParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 
+// Flush before a dispatch whose estimated GPU time could exceed the driver
+// hangcheck timeout (~2s on Intel Arc). Without this, prefill batches multiple
+// slow scalar GEMM / MoE dispatches into one command buffer whose total GPU
+// time exceeds the hangcheck, causing VK_ERROR_DEVICE_LOST. Each heavy dispatch
+// gets its own command buffer, isolating it from neighbors.
+//
+// The threshold is deliberately low (1 GFLOP) so that every prefill-sized
+// dispatch is isolated. Decode dispatches (M=1) are well under 1 GFLOP and
+// batch normally, so decode throughput is unaffected.
+void FlushIfHeavy(uint64_t flops_estimate) {
+  constexpr uint64_t kFlushThreshold = 1000ULL * 1000 * 1000;  // 1 GFLOP
+  if (flops_estimate >= kFlushThreshold) {
+    VulkanContext::Get().FlushBatch("heavy-dispatch");
+  }
+}
 template <typename P>
 void Go(const char* name, const Binder& b, const P& p, uint32_t groups,
         const uint32_t* spec = nullptr, uint32_t spec_count = 0) {
@@ -881,7 +896,7 @@ bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
   if (kCoopMatWhy) {
     const char* why = nullptr;
     if (!bt) why = "not MatmulBT (b is [K,N]; that layout is already coalesced)";
-    else if (m != 1) why = "M is not 1 (not a decode-shaped GEMV)";
+    // M>1 now allowed for prefill — GEMV coalesces B reads
     else if (k < static_cast<int64_t>(kWorkgroupSize)) why = "K is below one workgroup width";
     if (why != nullptr) {
       static std::mutex gseen_mu;
@@ -895,7 +910,7 @@ bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
     }
   }
 
-  if (!bt || m != 1) return false;
+  if (!bt) return false;  // MatmulBT only — M>1 now allowed for prefill
   return k >= static_cast<int64_t>(kWorkgroupSize);
 }
 
@@ -985,10 +1000,11 @@ uint32_t GemvRows(int64_t m, int64_t n) {
     const uint32_t v = EnvVariant("VT_VULKAN_GEMV_ROWS", kGemvRowsDefault, 1, 4);
     return (v == 1u || v == 2u || v == 4u) ? v : 1u;
   }();
+  if (m != 1) return 1u;  // M>1 (prefill): rows=1 only — rows>1 was measured as a loss
   uint32_t rows = kWant;
-  while (rows > 1u && (m != 1 || (n % static_cast<int64_t>(rows)) != 0)) rows >>= 1;
+  while (rows > 1u && (n % static_cast<int64_t>(rows)) != 0) rows >>= 1;
   if (rows < kWant) {
-    VariantWhy("rows", m != 1 ? "M is not 1" : "N is not a multiple of the requested row count");
+    VariantWhy("rows", "N is not a multiple of the requested row count");
   }
   return rows;
 }
@@ -1077,6 +1093,7 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     Binder wide = bind;
     wide.AddAlias(a, "matmul: a (64-bit view)");
     wide.AddAlias(b, "matmul: b (64-bit view)");
+    FlushIfHeavy(static_cast<uint64_t>(2) * m * n * k);
     Go("vt_matmul_vec", wide, p, groups, spec, 6);
     return;
   }
@@ -1134,6 +1151,7 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t span = static_cast<int64_t>(kWorkgroupSize) * ncols;
   const uint32_t groups = ncols == 1u ? FlatGroupCount(m * n)
                                       : static_cast<uint32_t>(m * ((n + span - 1) / span));
+  FlushIfHeavy(static_cast<uint64_t>(2) * m * n * k);
   Go("vt_matmul", bind, p, groups, spec, 5);
 }
 
@@ -2247,6 +2265,7 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
                               static_cast<uint32_t>(bcast ? 1 : 0),
                               a_off, w_off, eid_off, out_off};
     const uint32_t spec[2] = {DtypeCode(out.dtype), DtypeCode(act.dtype)};
+    FlushIfHeavy(static_cast<uint64_t>(2) * P * N * K);
     ctx.Dispatch(dev_shader, buffers.data(),
                  static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
                  static_cast<uint32_t>((N + 3) / 4), spec, 2);
@@ -2382,6 +2401,7 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
       static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
       static_cast<uint32_t>(bcast ? 1 : 0), gather_k,
       a_off, gw_off, uw_off, eid_off, out_off, limit};
+  FlushIfHeavy(static_cast<uint64_t>(2) * P * N * K * 2);  // gate+up = 2 GEMMs
   const uint32_t spec[2] = {DtypeCode(act.dtype), DtypeCode(out.dtype)};
   ctx.Dispatch(shader, buffers.data(),
                static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),

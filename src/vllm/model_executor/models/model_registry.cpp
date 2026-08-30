@@ -396,6 +396,40 @@ std::string_view MultiKvCacheIndex::first_name() const {
   return layer_names->front();
 }
 
+// MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3). A group carries a table only when the
+// runner gathered one for it THIS step; an empty row is a group whose table was
+// never gathered, which is the state this wave exists to remove.
+int MultiKvCacheIndex::num_published_groups() const {
+  return group_block_tables == nullptr
+             ? 0
+             : static_cast<int>(group_block_tables->size());
+}
+
+int MultiKvCacheIndex::num_group_block_tables() const {
+  if (group_block_tables == nullptr) return 0;
+  int n = 0;
+  for (const std::vector<int32_t>& bt : *group_block_tables)
+    if (!bt.empty()) ++n;
+  return n;
+}
+
+const std::vector<int32_t>* MultiKvCacheIndex::BlockTableForGroup(
+    int group_id, int* num_cols) const {
+  if (num_cols != nullptr) *num_cols = 0;
+  if (group_block_tables == nullptr || group_block_table_cols == nullptr)
+    return nullptr;
+  if (group_id < 0 ||
+      static_cast<size_t>(group_id) >= group_block_tables->size() ||
+      static_cast<size_t>(group_id) >= group_block_table_cols->size())
+    return nullptr;
+  const std::vector<int32_t>& bt =
+      (*group_block_tables)[static_cast<size_t>(group_id)];
+  if (bt.empty()) return nullptr;
+  if (num_cols != nullptr)
+    *num_cols = (*group_block_table_cols)[static_cast<size_t>(group_id)];
+  return &bt;
+}
+
 int64_t MultiKvCacheIndex::Find(std::string_view layer_name) const {
   if (layer_names == nullptr) return -1;
   for (size_t i = 0; i < layer_names->size(); ++i) {
@@ -431,8 +465,12 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
              std::string("model forward: ") + std::to_string(mk.size()) +
                  " KV cache(s) from " + std::to_string(mk.num_groups()) +
                  " published group(s) reached this forward, first '" +
-                 std::string(mk.first_name()) +
-                 "', and no registered forward consumes a cache set keyed by "
+                 std::string(mk.first_name()) + "', with block tables gathered "
+                 "for " +
+                 std::to_string(mk.num_group_block_tables()) + " of " +
+                 std::to_string(mk.num_published_groups()) +
+                 " published group(s), and no registered forward consumes a "
+                 "cache set keyed by "
                  "layer name. Refusing rather than discarding an allocated KV "
                  "topology in silence "
                  "(row KV-DSV4-MULTICACHE W5 owns the consuming forward; "

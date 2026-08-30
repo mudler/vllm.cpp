@@ -98,13 +98,43 @@
 // host reference on this row. The device arm is owed, not implied — see the
 // spec's `## Owed`.
 //
-// ─── WHAT THIS FILE DOES NOT DO ──────────────────────────────────────────────
+// ─── THE KV CACHE, AND WHY OURS IS 512 WIDE WHERE UPSTREAM'S IS 32768 ────────
 //
-// No KV cache: upstream's `past_key_values.update` (`:1177-1179`) is a Cache
-// object this reference has no equivalent of, and `MakeGlm5NextKVCache` (W5) is
-// the production spec it will bind to. No decoder layer, no mHC threading, no
-// `Glm5NextTextModel::Forward`, and NOTHING here is reached from a production
-// entry point. W5b-2 owns all four; the spec's `## Owed` names it.
+// W5b-2 (#2241) bound this block to the two MLA-side groups
+// `MakeGlm5NextKVCache` publishes, through `DsaCache` below.
+//
+// **Upstream caches what this port deliberately does not.** `:1175-1179` runs
+// `expand_kv` on the NEW tokens and then hands the EXPANDED `key_states` and
+// `value_states` to `past_key_values.update` — `[B, 64, S, 256]` twice, 32,768
+// values per token per layer. `DsaCache` stores the 512-wide LATENT `k_pass`
+// instead and re-expands the whole history each step, which is 64x smaller and
+// is what `MakeGlm5NextKVCache`'s group-0 `MLAAttentionSpec` at head 512 already
+// publishes. The spec calls this decision out under "MLA: cache the latent, do
+// not cache what the reference caches" and says the equivalence is to be PROVED
+// rather than asserted.
+//
+// **The proof is that `ExpandKv` is TOKEN-WISE, and NoPE is what makes that
+// true.** `expand_kv` (`:1136-1153`) applies `k_b_proj` and `v_b_proj` to each
+// token's latent independently, and with `qk_rope_head_dim == 0` there is no
+// position-dependent slice riding alongside it — which is exactly why upstream's
+// own `validate_architecture` refusal of a positive rope dim is load-bearing
+// here and not a detail. So
+// `ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)` holds exactly, and the
+// re-expansion reproduces upstream's concatenated cache value for value. The
+// focused gate asserts that split identity on real values rather than deriving
+// it again.
+//
+// **What this is NOT is the ABSORPTION optimization.** Folding `kv_b_proj` into
+// `q_b_proj` would let a decode step skip the re-expansion entirely; it is a
+// SPEED change, it is not needed for the residency result, and W8 owns speed on
+// this row. Recorded so the next reader does not read "cache the latent" as a
+// claim that the absorption already landed.
+//
+// ─── WHAT THIS FILE STILL DOES NOT DO ────────────────────────────────────────
+//
+// No decoder layer, no mHC threading and no `Glm5NextTextModel::Forward` — those
+// are `glm5_next_layer.{h,cpp}`, which is what reaches this file from a
+// production entry point.
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_ATTN_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_ATTN_H_
 
@@ -247,6 +277,32 @@ std::vector<uint8_t> BuildAttentionMaskFromTopk(const std::vector<int32_t>& topk
                                                 int64_t batch, int64_t q_length,
                                                 int64_t width, int64_t kv_length);
 
+// One DSA layer's KV state — the host mirror of the two MLA-side groups
+// `MakeGlm5NextKVCache` publishes (`glm5_next_registry.cpp`), and upstream's
+// `past_key_values` for this layer (`:1178-1179`, `:807-813`).
+//
+// Both members hold the WHOLE history, oldest token first, and both grow by
+// `seq_len` rows per `Attention` call. `cached_len` is the number of rows
+// already stored BEFORE the call and is what makes `kv_length != seq_len`
+// reachable; a fresh sequence starts at zero with both vectors empty.
+//
+// The two are separate because the published cache spec makes them separate:
+// group 0 is an `MLAAttentionSpec` at head 512 (`kv_lora_rank`) and group 2 is a
+// second one at head 257 (`2 * index_head_dim + 1`). Packing them into one
+// buffer here would describe a cache the runner does not allocate.
+struct DsaCache {
+  // Group 0, the MLA latent. [batch, cached_len, kv_lora_rank]. NOT the
+  // expanded K/V upstream stores; see this header's KV-cache section.
+  std::vector<float> k_pass;
+  // Group 2, the indexer side cache: `concat[k, gate_scores, valid]` per token,
+  // which is what `past_key_values.update_indexer` (`:810`) stores.
+  // [batch, cached_len, 2 * index_head_dim + 1].
+  std::vector<float> indexer_packed;
+  // Rows already present in BOTH vectors. Read before the call, advanced by
+  // `seq_len` after it.
+  int64_t cached_len = 0;
+};
+
 // What `Glm5NextTextAttention.forward` returns (`:1216`), made explicit.
 struct AttentionResult {
   std::vector<float> attn_output;      // [batch, seq_len, hidden_size]
@@ -281,6 +337,20 @@ struct AttentionResult {
 //   hidden : [batch, seq_len, hidden_size]  row-major
 //   mask   : [batch, seq_len] uint8, 0 for a padding slot — the indexer's
 //            `attention_mask`, NOT an attention bias.
+//
+// `cache` is upstream's `past_key_values` for this layer (`:1178-1179`,
+// `:807-813`). NULL is upstream's `past_key_values is None`: the key history is
+// the current window, `kv_length == seq_len`, and the call is byte-identical to
+// what this function did before the cache existed. NON-NULL appends this
+// window's latent and packed indexer rows to it and attends over the WHOLE
+// history, which is the only way a second step reuses state instead of
+// recomputing it.
+//
+// A `shared` layer still has no indexer, so it writes NO indexer rows — which is
+// upstream's arithmetic, not an omission: `self.indexer is None` (`:1181`) means
+// `update_indexer` is never reached for that layer, and the layer's own side
+// cache stays empty. Its `k_pass` history IS still appended, because `:1178`
+// runs unconditionally.
 AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
                           const IndexerDims& id, const IndexerWeights* indexer,
                           const IndexerRole& role,
@@ -288,7 +358,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
                           const std::vector<uint8_t>& mask,
                           const std::vector<int32_t>* prev_topk_indices,
                           int64_t prev_topk_width, int64_t batch,
-                          int64_t seq_len);
+                          int64_t seq_len, DsaCache* cache = nullptr);
 
 }  // namespace vllm::glm5_next
 

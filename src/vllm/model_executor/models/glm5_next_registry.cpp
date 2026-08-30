@@ -353,7 +353,7 @@ v1::KVCacheConfig MakeGlm5NextKVCache(const HfConfig& config, int block_size,
   // KDA cache would be an invention rather than a port, and a `bfloat16` value
   // in some future `config.json` would then silently halve a state upstream
   // keeps in f32. Qwen3.5 (`qwen3_5_common.cpp:54`) and MODEL-MM-QWEN4-EXP
-  // (`qwen4_exp_registry.cpp:382`) call the resolver because their linear layers
+  // (`qwen4_exp_registry.cpp:433`) call the resolver because their linear layers
   // ARE gated delta net (`gated_delta_net_state_dtype`, `mamba_utils.py:119-128`),
   // which does read it. An earlier revision of this comment claimed this
   // function called that resolver; it never did, and the claim is retired here

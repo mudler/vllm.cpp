@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -139,9 +140,18 @@ class RangeContract(RepositoryTest):
         advances past the branch. The commits under judgement are still the
         branch's own: `merge_base(base, head)..head`. The base tip carries a
         commit head does not contain, which is what makes the range "behind".
+        A violating commit sits below the base tip on the shared history, so
+        both `base..head` and the true `merge_base..head` exclude it. Pinning
+        `_merge_base` to an earlier commit is the only way the range reaches
+        it: a walk that calls the helper but keeps the literal base tip must
+        leave the violation out and fail this test.
         """
 
         repo = self.new_repo()
+        earlier = self.commit(
+            repo, "policy: seed the earlier commit", "Explain the earlier commit."
+        )
+        violation = self.commit(repo, "policy: omit the body on main", None)
         base = self.commit(repo, "policy: establish the base", "Explain the base.")
         git(repo, "switch", "-c", "feature")
         no_body = self.commit(repo, "policy: omit the body", None)
@@ -158,6 +168,19 @@ class RangeContract(RepositoryTest):
         self.assertTrue(any(no_body[:12] in failure for failure in failures))
         self.assertTrue(any(period[:12] in failure for failure in failures))
         self.assertTrue(all(base[:12] not in failure for failure in failures))
+        self.assertTrue(all(violation[:12] not in failure for failure in failures))
+
+        with mock.patch.object(
+            check_commit_style, "_merge_base", return_value=earlier
+        ) as merge_base:
+            resolved = check_commit_style.validate_range(
+                repo, main_tip, period, cutover=None
+            )
+
+        merge_base.assert_called_once()
+        self.assertEqual(len(resolved), 3)
+        self.assertTrue(any(violation[:12] in failure for failure in resolved))
+        self.assertTrue(all(base[:12] not in failure for failure in resolved))
 
     def test_merge_commits_are_excluded(self) -> None:
         repo = self.new_repo()

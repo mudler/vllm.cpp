@@ -793,6 +793,63 @@ TEST_CASE("glm5_next bridge: ONLY the SELECTED experts are decoded") {
   CHECK(std::adjacent_find(uniq.begin(), uniq.end()) == uniq.end());
   CHECK(uniq == want);
 
+  // ── THE SAME CLAIM AT MORE THAN ONE TOKEN, WHICH IS WHERE "ONCE" BITES ────
+  //
+  // At one token every selected expert is hit exactly once whatever the code
+  // does, so the `adjacent_find` above cannot see a missing grouping. Measured:
+  // removing the grouping from `MoeForward` (mutation M13) leaves the
+  // single-token case fully GREEN. With several tokens the same expert is hit
+  // by more than one of them, and then a per-SLOT visit decodes it twice —
+  // which is a second 96 MiB decode at the published geometry and is exactly
+  // what the residency argument rules out.
+  const int64_t T = 6;
+  std::vector<float> many(static_cast<size_t>(T * d.hidden_size));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t i = 0; i < d.hidden_size; ++i) {
+      many[static_cast<size_t>(t * d.hidden_size + i)] =
+          0.05F * static_cast<float>((i * 3 + 11 * t) % 19) - 0.4F;
+    }
+  }
+  vllm::glm5_next::GgufExpertSource multi(src.moe, d, "blk.1.ffn");
+  vllm::glm5_next::MoeLayerWeights on_demand_multi = on_demand;
+  on_demand_multi.expert_source = &multi;
+  const std::vector<float> multi_src =
+      vllm::glm5_next::MoeForward(d, on_demand_multi, many, T, q);
+  const std::vector<float> multi_res =
+      vllm::glm5_next::MoeForward(d, resident, many, T, q);
+
+  const vllm::glm5_next::MoeRouting rm =
+      vllm::glm5_next::RouteTopk(d, resident, many, T, q);
+  std::vector<int64_t> want_multi(rm.topk_ids.begin(), rm.topk_ids.end());
+  const int64_t slots = static_cast<int64_t>(want_multi.size());
+  std::sort(want_multi.begin(), want_multi.end());
+  want_multi.erase(std::unique(want_multi.begin(), want_multi.end()),
+                   want_multi.end());
+  // The routing must actually REPEAT an expert across the tokens, or the
+  // "exactly once" claim has nothing to exclude here either. Printed, so a
+  // fixture that stopped repeating is visible rather than silently vacuous.
+  REQUIRE(static_cast<int64_t>(want_multi.size()) < slots);
+  MESSAGE("over " << T << " tokens the router filled " << slots
+          << " slots from " << want_multi.size() << " distinct experts");
+
+  std::vector<int64_t> got_multi = multi.decoded();
+  CHECK(got_multi.size() == want_multi.size());
+  std::sort(got_multi.begin(), got_multi.end());
+  CHECK(std::adjacent_find(got_multi.begin(), got_multi.end()) == got_multi.end());
+  CHECK(got_multi == want_multi);
+
+  // ...and the values still match the resident banks exactly.
+  REQUIRE(multi_src.size() == multi_res.size());
+  int multi_nonfinite = 0;
+  for (size_t i = 0; i < multi_src.size(); ++i) {
+    if (!std::isfinite(multi_src[i]) || !std::isfinite(multi_res[i])) {
+      ++multi_nonfinite;
+      continue;
+    }
+    CHECK(multi_src[i] == multi_res[i]);
+  }
+  CHECK(multi_nonfinite == 0);
+
   // (b) the values are EXACTLY the resident ones. Not a tolerance: the two
   // paths run the same arithmetic on the same floats, so anything but equality
   // is a defect and a tolerance would hide it.

@@ -270,15 +270,20 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
            "glm5_next moe: this layer carries BOTH resident expert banks and an "
            "`expert_source`, and there is no rule for which one wins. Populate "
            "the banks or set the source, never both (glm5_next_moe.h).");
+  // MEASURED, not asserted defensively: removing this check makes the loop
+  // below dereference a NULL `expert_source` and the process dies with SIGSEGV
+  // (mutation M5, rc=139). The message says that rather than the softer "would
+  // read as zeros", because a reader who lands here needs to know which failure
+  // the guard is standing in front of.
   VT_CHECK(resident || w.expert_source != nullptr,
            "glm5_next moe: this layer carries NEITHER resident expert banks nor "
            "an `expert_source`, so the router would select " +
                std::to_string(K) + " of " + std::to_string(E) +
-               " experts and every one of them would read as a ZERO weight -- a "
-               "finite, fluent, wrong block. At the published geometry the banks "
-               "are 27.0 GiB per sparse layer in f32 against a ~119.63 GiB box, "
-               "so the on-demand `ExpertSource` is the shape that fits; see "
-               "glm5_next_moe.h.");
+               " experts and there would be nothing to evaluate them with -- the "
+               "loop below would dereference a null source. At the published "
+               "geometry the banks are 27.0 GiB per sparse layer in f32 against "
+               "a ~119.63 GiB box, so the on-demand `ExpertSource` is the shape "
+               "that fits; see glm5_next_moe.h.");
   if (resident) {
     VT_CHECK(static_cast<int64_t>(w.expert_gate_up.size()) == E * 2 * I * H,
              "glm5_next moe: expert_gate_up expects the STACKED, FUSED [" +

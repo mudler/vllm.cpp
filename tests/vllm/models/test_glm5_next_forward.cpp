@@ -391,6 +391,34 @@ TEST_CASE("glm5_next forward: the layer source holds ONE layer, not a tower") {
     }
     norms.push_back(d.input_layernorm);
     CHECK(src.slot_f32_bytes() > 0);
+
+    // THE TWO mHC SITES ARE MAPPED DIRECTLY, and this assertion exists because
+    // the end-to-end comparison CANNOT see the mapping. Swapping `attn_hc` and
+    // `mlp_hc` inside the source (mutation M12) leaves every logit in this
+    // suite BIT-IDENTICAL, measured, not assumed. The reason is the fixture,
+    // not the port: its mHC `fn` payloads are ramps in the hundreds and
+    // thousands, so `F.linear(normed, fn) + base` saturates every sigmoid gate
+    // and the Sinkhorn projection converges to the same matrix from either
+    // site, and the swap becomes arithmetically invisible downstream.
+    //
+    // A gate that could only see the swap through the logits would therefore be
+    // a mute switch here. So the mapping is asserted STRUCTURALLY, against the
+    // loader's own two tensors, and the two are asserted to DIFFER so the
+    // equality above is a fact and not a tautology.
+    const gn::HcSite want_attn = gn::BridgeMhcSite(
+        w.layers[static_cast<size_t>(i)].attn_hc, w.params.mhc,
+        w.params.hidden_size, "want.attn");
+    const gn::HcSite want_ffn = gn::BridgeMhcSite(
+        w.layers[static_cast<size_t>(i)].mlp_hc, w.params.mhc,
+        w.params.hidden_size, "want.ffn");
+    CHECK(want_attn.fn != want_ffn.fn);
+    CHECK(want_attn.base != want_ffn.base);
+    CHECK(d.attn_hc.fn == want_attn.fn);
+    CHECK(d.attn_hc.base == want_attn.base);
+    CHECK(d.attn_hc.scale == want_attn.scale);
+    CHECK(d.ffn_hc.fn == want_ffn.fn);
+    CHECK(d.ffn_hc.base == want_ffn.base);
+    CHECK(d.ffn_hc.scale == want_ffn.scale);
   }
   // Every layer's norm differs from every other's, so the loop above compared
   // things that can differ.

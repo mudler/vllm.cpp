@@ -7,8 +7,9 @@ Oracle: vLLM at the parity pin `5559679229`, `vllm/models/deepseek_v4/`.
 ## Now
 
 `READY` — this spec is the deliverable of the scoping wave. No implementation
-has started. W1 cannot begin until `KV-DSV4-MULTICACHE` W3 lands (see
-`## Dependencies`).
+has started. W1 cannot begin until `KV-DSV4-MULTICACHE` **W5** lands, and W5 has
+no owner today (#2302; W3, which an earlier revision of this spec named, landed
+as `ca3dcda21` on 2026-08-27). See `## Dependencies`.
 
 ## Scope
 
@@ -25,6 +26,23 @@ cache.
 the cache topology (`KV-DSV4-MULTICACHE`, #1925); residency (#2283); the
 attention sink, which is a loaded per-head weight and not cache state
 (`attention.py:218-222`).
+
+**The boundary with `KV-DSV4-MULTICACHE` W5, which this row overlapped when it
+was created** (#2302). W5's scope lived in a single wave-table cell reading "the
+DSA-sparse attention path reading the published caches" and removing the
+`!is_indexer && !is_comp` refusal -- the ALGORITHM, not the plumbing -- and it has
+never had a design section, so this row was specced over it. The split, recorded
+in both specs:
+
+| row | owns |
+|---|---|
+| `KV-DSV4-MULTICACHE` W5 | the caches REACHING the model and each layer routing to its own: `attn_kv` consumed rather than `(void)`-ed, and `ModelRegistry::Forward` (`model_registry.cpp:430-440`) stopping its refusal |
+| **this row** | what RUNS on those caches: the three layer shapes, the compressor's two stages, the `coff` role selection and boundary emission, the indexer's `qr`-sourced query, and the `!is_indexer && !is_comp` refusal at `deepseek_v4.cpp:786-787` |
+
+W5 lands first and deliberately does NOT remove the DSA refusal; it makes a cache
+reachable for this row. Neither row is gateable end-to-end alone: W5's
+synthetic-config gate proves routing, and the token-exact oracle gate above 512
+tokens belongs here.
 
 ## Upstream chain
 
@@ -164,20 +182,45 @@ gate is token-exactness against the pinned oracle ABOVE 512 tokens
 |---|---|
 | W1 (#1960, `c1e6f3fb9`) | LANDED — `SlidingWindowMLASpec`, the four `MLAAttentionSpec` fields |
 | W2 (#1973, `6b18829bc`) | LANDED — all seven groups / 167 entries published; runner refuses an unallocated published group |
-| W3 | OWED — the third `ModelForwardInput` channel |
-| W4 | OWED — non-uniform `block_size` |
-| W5 | OWED — consumption |
+| W3 (#2068, `ca3dcda21`) | LANDED 2026-08-27 — the runner allocates a buffer for EVERY published cache instead of one per hidden layer, and `ModelForwardInput` gained the third channel |
+| W4 | proposal, **no owner** — non-uniform `block_size` |
+| W5 | proposal, **no owner** — consumption |
+| W6-W7 | proposals, **no owner** |
 
-**W1 of this row cannot start before that row's W3.** The composition writes a
+**W1 of this row cannot start before that row's W5.** The composition writes a
 separate compressed cache beside a sliding-window raw cache, and it cannot reach
 a cache the forward is not handed. This is a hard ordering, not a preference.
+
+**W5, not W3** (#2302). An earlier revision of this spec named W3, which had
+already landed when it was written. The wall today is the one the code names
+itself, in `ModelRegistry::Forward`
+(`src/vllm/model_executor/models/model_registry.cpp:430-440`):
+
+> `... and no registered forward consumes a cache set keyed by layer name.
+> Refusing rather than discarding an allocated KV topology in silence (row
+> KV-DSV4-MULTICACHE W5 owns the consuming forward; #1925, #2068)`
+
+A DeepSeek-V4 engine therefore constructs, publishes and ALLOCATES all 167
+buffers today, and refuses at the first forward. **This makes the ordering
+harder than the earlier revision claimed, not softer:** W3 had an owner and
+landed, while W4 through W7 are proposals with no owner at all. Nothing in this
+row can begin until W5 acquires one.
+
+The error is recorded rather than quietly corrected because its cause is
+reusable: two stale records agreed with each other and neither was the tree.
+#1925's index row predates W3, and `kv-dsv4-multicache.md` `## Now` opened with
+"W3 (#2068) is claimed" while its own closing paragraph already said the engine
+allocates all 167 buffers and refuses naming W5. AGENTS.md `## History is git`
+is explicit -- "Before you conclude anything about past work, read the spec and
+run `git log -S`" -- and `git log --oneline --grep '2068'` shows `ca3dcda21`
+immediately. It was not run.
 
 ## Work breakdown
 
 | wave | scope | depends on |
 |---|---|---|
 | W0 | this spec | — |
-| W1 | reconcile 43 vs 46; layer-shape dispatch in `AttentionBlock`, SEQUENTIAL, replacing the refusal for the `compress_ratio == 128` (compressor-only) shape first | multicache W3 |
+| W1 | reconcile 43 vs 46; layer-shape dispatch in `AttentionBlock`, SEQUENTIAL, replacing the refusal for the `compress_ratio == 128` (compressor-only) shape first | multicache W5 |
 | W2 | the compressor's two stages: `save_partial_states`, then boundary-gated compress/norm/RoPE/quant/store | W1 |
 | W3 | the overlapped window and role selection; the `compress_ratio == 4` shape; the indexer's `qr`-sourced query | W2, and both kernel `SPIKE` rows promoted |
 | W4 | the stream overlap, as a measured performance wave | W3 |
@@ -220,7 +263,9 @@ failure mode this row is most exposed to.
 
 ## Stop conditions
 
-- Stop if `KV-DSV4-MULTICACHE` W3 does not land: W1 has no cache to write to.
+- Stop if `KV-DSV4-MULTICACHE` W5 does not land: W1 has no cache to READ. W3
+  (the allocation and the forward channel) landed as `ca3dcda21`; W5 is the
+  consuming forward, and it has no owner (#2302).
 - Stop before claiming any speed number. This row makes the model RUN; a
   throughput comparison against SparkInfer's 44-47 tok/s additionally needs
   `nvfp4_ds_mla` and K5 speculative decoding, neither of which exists here.

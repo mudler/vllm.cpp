@@ -2431,6 +2431,17 @@ is listed under `## Owed`.
   rather than prose would close it, and both are larger than this flow and belong
   to whoever owns the reachability convention. Recorded here so the residual has
   a named home rather than living only in the issue.
+
+  **AND THE FOURTH INSTANCE THEN ARRIVED, EXACTLY HERE.** Merging `main` into
+  W5d-4 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 4) made the
+  refusal's third enumerated item — "an adapter from the stacked [E, I, H]
+  qwen4_exp MoE tensors onto MoeBlockWeights" — false, because that adapter is
+  what W5d-4 adds; landing it unedited would have shipped a commit whose own
+  product output denies the commit, which is the #2288 finding word for word.
+  It is repaired in this flow and the count further down is restated with it.
+  The heading above is left standing rather than softened, because it was right:
+  nothing mechanical caught this one either, a reading did, and the durable fix
+  is still owed.
 - **W5d-1 (#2249 item 1) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::RmsNormGroup` (`include/vt/ops.h`, dispatcher `src/vt/ops.cpp`, CPU kernel
   `RmsNormGroupKernel` in `src/vt/cpu/cpu_ops.cpp`, name in
@@ -2532,6 +2543,112 @@ is listed under `## Owed`.
      predates the extraction, and it had no issue of its own. An earlier
      revision of this entry named this owner only as "the mm-forward row",
      which is a description and not a record.
+- **W5d-4 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 4) lands
+  UNREACHED, by AGENTS.md "Nothing lands dead".**
+  `src/vllm/model_executor/models/qwen4_exp_moe.{h,cpp}` —
+  `Qwen4ExpMoeBlockWeights`, `Qwen4ExpMoeHfConfig` and `RunQwen4ExpMoeBlock` — is
+  reached at this merge commit ONLY by
+  `tests/vllm/models/test_qwen4_exp_moe.cpp`. No production entry point calls
+  it, and the MECHANISM is not the one an earlier draft of this bullet named.
+  `ForwardQwen4ExpForConditionalGeneration` EXISTS
+  (`src/vllm/model_executor/models/qwen4_exp_registry.cpp:142`) and IS registered
+  as the model's `.forward` hook (`:456`); its entire body is one
+  `VT_CHECK(false, ...)` refusal-by-name (`:228`), placed ahead of any downcast.
+  So `ModelRegistry::Forward` reaches a real hook and that hook refuses
+  `Qwen4ExpForConditionalGeneration` by name before a layer runs. The conclusion
+  — nothing production-side reaches this adapter — is unchanged; "the function
+  does not exist" was wrong and is corrected here rather than left to be
+  reasoned from. The wiring is owned
+  by row `MODEL-MM-QWEN4-EXP` and tracked by
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) (the layer loop) under
+  campaign issue [#1978](https://github.com/mudler/vllm.cpp/issues/1978). The
+  reachability mutation is therefore vacuous here and is recorded as such rather
+  than reported as a pass: deleting a production call site cannot red a gate when
+  there is no production call site. What the suite DOES prove is that it enters
+  through the adapter — deleting the adapter's keep-quant wiring reds it
+  (mutation M4).
+  Six further things W5d-4 owes:
+  - **`norm_topk_prob` is not representable through this seam.** `MoeBlock`
+    hardcodes `renormalize = true` (`qwen3_5.cpp:7242`) and `HfConfig` carries no
+    such field, so a config that turned it off could not be honoured and the
+    adapter cannot refuse what it cannot see. Upstream's default is `True`
+    (`configuration_qwen4_exp.py:163`) and the released checkpoint does not
+    override it, so nothing is wrong today; `Qwen4ExpParams` still does not carry
+    the field, which this section already owed above.
+  - **The bf16 arm is ineligible for the CUDA fast grouped-bf16 MoE.**
+    `MoeBf16FastLayoutOk` (`qwen3_5.cpp:842-863`) requires per-expert `[H, I]`
+    with `nk == false`, and the adapter's zero-copy views are the tower's own
+    `[I, H]` with `nk == true`. It therefore falls through to the reference
+    per-expert loop on CUDA, exactly as the 35B MTP producer already does. The
+    alternative is a transposing copy, which is 240 GB across the stack at the
+    released geometry, so this is a deliberate trade and not an oversight — but a
+    grouped bf16 path that reads the tower orientation is owed if a bf16 arm ever
+    becomes the shipped one. It is not one today: all seven staged checkpoints are
+    quantized.
+  - **The NVFP4 expert arm is refused by absence, not by name.**
+    `Qwen4ExpMoeWeights` has no `Nvfp4Weight` fields and `LoadStackedExperts` has
+    no fp4 branch, so `MoeBlockWeights::expert_*_fp4` are left empty and the
+    seam's `fp4` predicate is false. Separately, and NOT this wave's to fix,
+    filed as [#2275](https://github.com/mudler/vllm.cpp/issues/2275) and owned by
+    this row:
+    `LoadStackedExperts` (`qwen4_exp_weights.cpp:148-167`) handles only
+    `kKeepQuant` and falls through to `ExpandBf16` for BOTH `kKeepF16` and
+    `kNvfp4Fp4`, which `GgufLoadPolicy::Route` can return for
+    `kStackedExpertWeight` (`gguf_keep_quant.cpp:59-60`). That silently produces a
+    residency the policy did not ask for; at the released geometry it is a 240 GB
+    allocation rather than a wrong answer, so it fails loudly, but it belongs to
+    the W5a loader and is recorded here so the next reader does not read the
+    adapter's two arms as the loader's full range.
+  - **The routed top-k weights reach the experts f32, which is WIDER than the
+    oracle, and the width is owed rather than defended.** Upstream casts the
+    renormalized top-k weights back to the model dtype
+    (`router_top_value.to(router_logits.dtype)`, `modeling_qwen4_exp.py:914`);
+    our shared seam keeps them f32, because `vt::MoeRouterTopK` writes an f32
+    `dtw` (`qwen3_5.cpp:7239-7242`) and every Qwen MoE in this tree reads that
+    field. An earlier draft of the suite header called the seam "the more
+    precise of the two". That is exactly the argument AGENTS.md §"Inherit vLLM
+    defaults" exists to refuse: a token gate cannot see a dtype that is too
+    wide, so "more precise" is never a reason to be wider than the oracle. The
+    honest statement is that the adapter INHERITS the width from the seam, has
+    no way to narrow it without diverging from every other Qwen MoE here, and
+    that narrowing `dtw` to the model dtype is a seam-level change owed to the
+    shared seam rather than to this adapter. Nothing measures it today: at
+    top_k = 3 it is one bf16 rounding of a value in [0, 1] per pair, below this
+    suite's tolerances, so it needs a gate of its own.
+  - **The keep-quant arm is value-proven at Q8_0 ONLY, and against a fixture
+    whose bf16 towers are `nk = false` where the loader's are `nk = true`.**
+    `tests/vllm/models/test_qwen4_exp_moe.cpp` builds its keep-quant towers as
+    hand-written Q8_0 blocks. The adapter is dtype-generic on that arm by
+    construction — it re-declares the tower rank 2 and copies no bytes, and
+    `vt::MatmulBTQuantGrouped` accepts any `IsBlockQuant` dtype — but NO k-quant
+    tower is executed through it here, and every released Qwen4-Exp checkpoint
+    is a k-quant (Q2_K..Q6_K, IQ1_*). A k-quant value case is owed, and it is
+    owed at the loader rather than at the adapter, because it needs
+    `OwnGgufQuantBlocks` output rather than a hand-built block. Separately, the
+    fixture's SOURCE bf16 towers are built `nk = false` where
+    `LoadStackedExperts` produces `ExpandBf16(..., /*nk=*/true)`: the adapter
+    stamps `nk = true` on the per-expert views it hands the seam either way, so
+    the gated bytes and the gated orientation are the production ones, but the
+    fixture is not the loader's own output and this section says so rather than
+    letting a reader infer that it is.
+  - **The keep-quant tolerance is MEASURED, not derived.** An earlier draft of
+    the suite header justified it by claiming the gate/up activation is exactly
+    q8_0-representable, "amax is exactly 127*2^-8 per row". `QuantizeRowQ8_0`
+    (`src/vt/cpu/cpu_quant_act.cpp:52-81`, its per-block `amax` loop at
+    `:58-69`) computes `amax` per 32-ELEMENT BLOCK,
+    not per row, and the fixture's `HiddenCodes()` forces `|code| = 127` at
+    element 0 of each row only. `kH = 64` is TWO blocks, so block 1 takes an
+    arbitrary `amax`, its `d` is not `2^-8`, and the gate and up projections
+    carry quantization error as well as the down projection. The bound the suite
+    asserts is therefore what it measures, not what it derives; it is printed by
+    a `MESSAGE` on every run, and it is an order of magnitude below every
+    mutation margin. Forcing `|code| = 127` in every block of every row would
+    restore the derivation, and it is deliberately NOT done here: it moves the
+    router logits, hence the routing, hence the seven mutation margins an
+    independent review has already reproduced against this fixture. The
+    derivation is owed to whichever change next has a reason to move the
+    fixture.
+
 - **W5b-4 (#2167) lands UNREACHED, by AGENTS.md "Nothing lands dead".**
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`
   (`include/vt/ops.h`, dispatchers `src/vt/ops.cpp`, CPU kernels
@@ -3502,12 +3619,51 @@ is listed under `## Owed`.
        `gate_exps`/`up_exps` `[E, moe_I, H]` and `down_exps` `[E, H, moe_I]`;
        `RunMoeBlock` reads `MoeBlockWeights`, whose arms are per-expert
        `[H, I]` vectors, an `Nvfp4Weight` set, or the stacked keep-quant
-       `expert_gate_kq [E*I, H]` / `expert_down_kq [E*H, I]`. The third arm's
-       shapes are exactly the qwen4_exp ones and `KqExpertSlice` is dtype-generic
-       (`RowSizeBytes(w.dtype, K)`), so the adapter looks like a
-       reinterpretation plus a router-gate orientation and a shared-expert
-       mapping rather than a copy — but it is unwritten and unmeasured, and
-       nothing yet proves a bf16 tower routes through `ExpertMlpKq`.
+       `expert_gate_kq [E*I, H]` / `expert_down_kq [E*H, I]`. **CLOSED by W5d-4
+       ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 4),
+       `src/vllm/model_executor/models/qwen4_exp_moe.{h,cpp}`. The sentence that
+       used to stand here — "the third arm's shapes are exactly the qwen4_exp
+       ones", so the adapter is "a reinterpretation … rather than a copy" — is
+       measured FALSE, and it is false on the arm every shipped checkpoint
+       takes.** `LoadStackedExperts` records the tower as RANK 3 `[E, N, K]`
+       (`qwen4_exp_weights.cpp:160-164`) and `MoeBlockWeights::expert_*_kq` is
+       RANK 2 `[E*N, K]`; the default keep-quant route
+       (`Qwen35GroupedMoeEnabled`, ON) hands that tensor to
+       `vt::MatmulBTQuantGrouped`, whose first check is
+       "matmul_bt_quant_grouped: rank-2 out/act/weight required"
+       (`src/vt/ops.cpp:223`). **That refusal is ROUTE-CONDITIONAL and the
+       sentence above is scoped to the default route on purpose.** With
+       `VT_QWEN35_GROUPED_MOE=0` the seam takes the per-expert `ExpertMlpKq`
+       path, which reaches `KqResidentSlice` (`qwen3_5.cpp:5665-5678`); that
+       helper rebuilds a rank-2 view from its `N`/`K` ARGUMENTS by pointer
+       arithmetic, sets `wt.rank = 2` itself and never reads the tower's
+       declared rank, so a rank-3 tower does not throw there — and, the tower
+       being contiguous `[E, N, K]`, `row_off = e * N` lands on exactly the
+       right slice, so it answers correctly. #2249 item 4's original sentence is
+       therefore literally true of the NON-default route. It is false of the one
+       every shipped checkpoint takes, which is why this wave was the size it
+       was. Three more differences a shape comparison cannot
+       see: the router and shared gate are f32 by `LoadMoe`'s deliberate choice
+       and the CUDA GEMM refuses a (bf16, f32) pair by name
+       (`cuda_matmul.cu:397-403`), so passing them through runs on CPU and dies
+       on every GPU; `MoeBlock` selects the whole expert path from
+       `expert_gate_kq` ALONE, so a per-tensor residency split reads as
+       keep-quant and dereferences an empty tower; and a **bf16** tower cannot
+       use the stacked fields at all (`ops.cpp:231` refuses a non-block dtype),
+       so the bf16 arm fills the PER-EXPERT vectors — with zero-copy borrowed
+       views, because three copies per layer at the released geometry is 240 GB
+       across the stack. Both arms are now gated against a from-scratch
+       reimplementation of the lane-pinned oracle in
+       `tests/vllm/models/test_qwen4_exp_moe.cpp`. **And the alternate route is a
+       measured RESULT rather than an admitted limit.**
+       `Qwen35GroupedMoeEnabled()` caches in a function-local `static const`
+       (`qwen3_5.cpp:6299-6302`), which prevents flipping it MID-PROCESS, not
+       before launch — so `VT_QWEN35_GROUPED_MOE=0` does exercise `ExpertMlpKq`.
+       Run that way, both value cases pass at BIT-IDENTICAL `max|diff|` to the
+       default route (bf16 `0.00218359`, keep-quant `0.00865547`), which is the
+       seam's own byte-identity claim at `qwen3_5.cpp:7261` measured rather than
+       inherited. The suite runs on both routes and says which behaviour it is
+       asserting on each.
     5. **CLOSED by W5d-2 (#2249 item 5, `3ed2378a3`): the mRoPE table builder
        has internal linkage — it no longer does.** This half of
        [#2288](https://github.com/mudler/vllm.cpp/issues/2288) is pre-existing
@@ -3616,21 +3772,24 @@ landed. **A wave dispatched to "write the layer loop" will not decode a token;
 it has these prerequisites, at least two of which (the grouped norm, the paged
 QSA arm) are op-sized waves of their own.**
 
-**TWO OF THE FIVE ARE NOW CLOSED, AND THE COUNT IS STATED HERE RATHER THAN LEFT
-TO A READER TO RECOUNT.** The stale enumeration is
+**THREE OF THE FIVE ARE NOW CLOSED, AND THE COUNT IS STATED HERE RATHER THAN
+LEFT TO A READER TO RECOUNT.** The stale enumeration is
 [#2288](https://github.com/mudler/vllm.cpp/issues/2288), filed for traceability
 and FIXED IN THE SAME FLOW by
-[#2265](https://github.com/mudler/vllm.cpp/pull/2265), which is the wave this
-correction rides with. The grouped RMS norm is `vt::RmsNormGroup`, landed by
-W5d-1 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 1) — the
-wave this section is being merged with, which is why the correction rides here.
-The externally linked mRoPE builder is `BuildMropeCosSinHost`, landed by W5d-2
-(#2249 item 5) as `3ed2378a3`; that wave corrected the paragraph above and did
-NOT correct this list or the production refusal string, so both had been naming
-a finished seam since it merged. **THREE remain** — the paged QSA consumer, the
-group-2 block table and the MoE weight adapter — plus the `multi_kv` refusal,
-which is not this row's. The refusal in `qwen4_exp_registry.cpp` enumerates
-exactly those three at this merge commit.
+[#2265](https://github.com/mudler/vllm.cpp/pull/2265), the wave this correction
+first rode with. The grouped RMS norm is `vt::RmsNormGroup`, landed by W5d-1
+([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 1). The externally
+linked mRoPE builder is `BuildMropeCosSinHost`, landed by W5d-2 (#2249 item 5)
+as `3ed2378a3`; that wave corrected the paragraph above and did NOT correct this
+list or the production refusal string, so both had been naming a finished seam
+since it merged. **The MoE weight adapter is the third, and it closes HERE** —
+`src/vllm/model_executor/models/qwen4_exp_moe.{h,cpp}`, landed by W5d-4 (#2249
+item 4), the wave this section is being merged with, which is why this recount
+rides here. Closed as a SEAM, not as a call: W5d-4 lands unreached and says so
+under `## Owed`, exactly as W5d-1 does. **TWO remain** — the paged QSA consumer
+and the group-2 block table — plus the `multi_kv` refusal, which is not this
+row's. The refusal in `qwen4_exp_registry.cpp` enumerates exactly those two at
+this merge commit.
 
 **What is owed, in order. THIS PARAGRAPH'S OPENING CLAIM WAS WRONG AND IS
 CORRECTED ABOVE: the op and seam work is NOT finished.** What follows is still
@@ -3644,10 +3803,16 @@ ops (W5b-4). W5b-5 turned the last of those into a decoder-layer BLOCK —
 nothing the QSA indexer needs is missing from the `vt::` surface any more —
 though the PLE block's grouped RMS norm still is, which the sentence this
 replaces overstated into a claim about the whole architecture.
-What has no production shape yet is the PLE block, the GDN and MoE weight
-adapters onto `GdnLayerWeights` / `MoeBlockWeights`, the hyper-connection stream
-through the per-layer loop, and the loop itself. The mRoPE cos/sin table build
-is no longer on that list as a SEAM — W5d-2
+What has no production shape yet is the PLE block, the GDN weight adapter onto
+`GdnLayerWeights`, the hyper-connection stream through the per-layer loop, and
+the loop itself. TWO entries have left that list, and for the same reason in
+both cases: the seam is in `src/` and only the CALL is owed. The MoE weight
+adapter onto `MoeBlockWeights` is no longer on it — W5d-4
+([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 4) is
+`src/vllm/model_executor/models/qwen4_exp_moe.{h,cpp}`, which composes
+`Qwen4ExpTextSparseMoeBlock` through the shared sparse-MoE seam rather than a
+second MoE path, and the layer loop still has to CALL it. The mRoPE cos/sin
+table build is not on it either — W5d-2
 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249) item 5) gave
 `BuildMropeCosSinHost` external linkage behind
 `include/vllm/model_executor/models/qwen3_5_mrope.h`, so the QSA half builds the

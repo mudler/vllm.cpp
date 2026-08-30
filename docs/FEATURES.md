@@ -241,12 +241,15 @@ on the committed fixture); reranking/classify models are not yet registered.
 
 Image, video and audio are correct through the CLI and library. Over the HTTP
 API the image **request** path is wired end to end (`ROAD-V1-MM` W1-W3): the
-production server attaches the seam at `server_main.cpp:826`. Two residuals keep
-it from ✅: the model runner has no mm-forward consuming `Request.mm_features`,
-and no image codec is vendored (raw RGB only). Video, audio and multi-image over
-HTTP are not started. Audio **in** is gated. Audio **out** has a surface now
-(`/v1/audio/speech`, `vllm_speech_*` v20), but no family renders from a prompt:
-both refuse, naming what is missing.
+production server attaches the seam at `server_main.cpp:1545`. Two residuals keep
+it from ✅: no image codec is vendored, so the server accepts raw RGB only and
+refuses a PNG or JPEG data URI first, and the model runner has no mm-forward
+consuming `Request.mm_features`
+([#2300](https://github.com/mudler/vllm.cpp/issues/2300)). Video, audio and
+multi-image over HTTP are not started, and the seam refuses a `video_url` or an
+`input_audio` part with HTTP 400. Audio **in** is gated. Audio **out** has a
+surface now (`/v1/audio/speech`, `vllm_speech_*` v20), but no family renders
+from a prompt: both refuse, naming what is missing.
 
 ## Speculative decoding
 

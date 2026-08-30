@@ -1111,6 +1111,39 @@ target_include_directories(test_glm5_next_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
+# GLM-5.3-Flash W5b-1 -- `Glm5NextTextAttention` and its CROSS-LAYER top-k
+# sharing (#2241). The highest-value case is the `shared` layer: a port that
+# recomputes its own indexer where upstream reuses the previous layer's
+# selection RUNS and emits plausible tokens, so the fixture carries BOTH the
+# correct output and what a recomputing port produces and asserts ours is the
+# first. It also carries a SQUARE `kv_b_proj` case, where the untransposed
+# reading of the converter's half-transposed `k_b` is shape-valid and merely
+# wrong, and a left-padded row whose every key is masked -- upstream fills that
+# with `finfo.min` and not `-inf`, so its output is FINITE. Goldens are the RUN
+# output of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_attn_goldens.py`, which asserts the sha256 of the
+# INSTALLED reference module. `glm5_next_attn.h` is MODEL-PRIVATE under src/,
+# the same arrangement `glm5_next_dsa.h` uses.
+vllm_cpp_add_test(test_glm5_next_attn vllm/models/test_glm5_next_attn.cpp)
+target_compile_definitions(test_glm5_next_attn PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_attn PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
+# GLM-5.3-Flash W5b-1 -- the `OwnedTensor` -> host f32 bridge and the residency
+# decision it implements (#2241, spec `## Owed` O22). Pins the arithmetic that
+# forces the per-layer choice -- 0.4654 GiB for one bridged DSA layer against a
+# 426.72 GiB materialized tower and a ~119.63 GiB box -- and pins the 1 GiB
+# per-tensor ceiling BETWEEN the largest legitimate tensor (`o_proj`, 0.25 GiB)
+# and the smallest expert bank (`up_exps`, 9.0 GiB), so it is neither a mute
+# switch nor a gate that fires on ordinary work. Runs over the synthetic
+# `glm5next` miniature through the PRODUCTION `load_weights` hook.
+vllm_cpp_add_test(test_glm5_next_bridge vllm/models/test_glm5_next_bridge.cpp)
+target_include_directories(test_glm5_next_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_bridge PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
 # .agents/specs/dots3-note.md §7 W3). Checks `_forward_note_mla`'s four deltas
 # over plain DeepSeek MLA -- the two lora rescales, `k_rope_only_layernorm`, the

@@ -60,6 +60,17 @@
 // this is a flag and not the silent divergence `cpu_qwen4_exp.cpp` records for
 // the gated residual. FALSE is the f32 arm and is the house contract.
 //
+// ─── W5d-3 (#2249 item 2): THE PAGED ADDRESS MODE ────────────────────────────
+// `Qwen4ExpQsaGatherAttentionKernel` below serves two cache shapes, and the fork
+// is four lines: the resolution of ONE key/value row address. The engine
+// allocates this model's QSA K/V as a PAGED `FullAttentionSpec` group
+// (`MakeQwen4ExpKVCache`), so the contiguous arm alone could serve nothing a
+// runner hands a forward; the paged arm mirrors vLLM's paged read exactly as
+// `vt::PagedAttention` states it (`block = block_table[j / block_size]`,
+// `offset = j % block_size`). Everything else — the expansion, the ascending
+// visit order, the two softmax passes, the f32 accumulation — is one body, so
+// the two arms cannot drift apart the way two kernels would.
+//
 // A CUDA ARM IS OWED, NOT WRITTEN. It cannot be gated on a CPU-only host and an
 // ungated kernel is worse than an absent one; nothing here registers for any
 // device but kCPU, so the dispatcher refuses by name on every other one rather
@@ -197,13 +208,44 @@ inline float MaybeBf16(float x, bool round) {
   const int64_t T = query.shape[0];
   const int64_t HQ = query.shape[1];
   const int64_t DH = query.shape[2];
-  const int64_t HKV = key.shape[1];
-  const int64_t max_kv = key.shape[0];
+  // THE PAGED ADDRESS MODE (W5d-3, #2249 item 2). It is the SAME body: the
+  // expansion, the ascending visit order, the two softmax passes and the f32
+  // accumulation below are shared, and the only thing that forks is the
+  // resolution of one key/value row address. A second kernel would be the
+  // parallel path AGENTS.md "Shared seams" forbids, and it would have to be
+  // kept bit-identical to this one by hand.
+  const bool paged = args.kv_block_table != nullptr;
+  const int64_t HKV = key.shape[paged ? 2 : 1];
+  // How many logical token rows the cache can address. Contiguous: its row
+  // count. Paged: pages named by the table times the page height — NOT the
+  // physical page count, because the table may name a subset in any order.
+  const int64_t page_size = args.kv_block_size;
+  const int32_t* pages = paged ? args.kv_block_table->Ptr<int32_t>() : nullptr;
+  const int64_t num_pages_named = paged ? args.kv_block_table->shape[1] : 0;
+  const int64_t max_kv = paged ? num_pages_named * page_size : key.shape[0];
   const int64_t topk = block_ids.shape[1];
   const int64_t CR = args.compress_ratio;
   const int64_t groups = HQ / HKV;
   const int32_t* ids = block_ids.Ptr<int32_t>();
   const int32_t* lens = kv_lens.Ptr<int32_t>();
+
+  // The one address that differs between the two arms, mirroring vLLM's paged
+  // read (`vt::PagedAttention`'s own semantics line, ported from
+  // `flash_attn.py::FlashAttentionImpl.forward`):
+  //   block = block_table[j / block_size], offset = j % block_size,
+  //   K = k_cache[block, offset, g, :]
+  // The row itself is contiguous in both arms (the dispatcher checks
+  // `stride[3] == 1` for the paged views), so the caller reads `DH` running
+  // elements from the returned base either way.
+  auto RowBase = [&](const Tensor& c, int64_t p, int64_t kvh) -> int64_t {
+    if (!paged) return (p * HKV + kvh) * DH;
+    const int64_t page = pages[p / page_size];
+    VT_CHECK(page >= 0 && page < c.shape[0],
+             "qwen4_exp_qsa_gather_attention: kv_block_table names physical page " +
+                 std::to_string(page) + ", outside the " + std::to_string(c.shape[0]) +
+                 " pages the cache holds");
+    return page * c.stride[0] + (p % page_size) * c.stride[1] + kvh * c.stride[2];
+  };
 
   // THE KEY-ROW READ COUNT, taken AT the read and nowhere else. An earlier
   // revision of the host reference assigned it from the selection, which
@@ -276,7 +318,7 @@ inline float MaybeBf16(float x, bool round) {
       for (int64_t p : sel) {
         ++reads;
         float dot = 0.0f;
-        const int64_t base = (p * HKV + kvh) * DH;
+        const int64_t base = RowBase(key, p, kvh);
         for (int64_t d = 0; d < DH; ++d) {
           dot += qrow[static_cast<size_t>(d)] * LoadF32At(key, base + d);
         }
@@ -288,13 +330,13 @@ inline float MaybeBf16(float x, bool round) {
       for (int64_t p : sel) {
         ++reads;
         float dot = 0.0f;
-        const int64_t kbase = (p * HKV + kvh) * DH;
+        const int64_t kbase = RowBase(key, p, kvh);
         for (int64_t d = 0; d < DH; ++d) {
           dot += qrow[static_cast<size_t>(d)] * LoadF32At(key, kbase + d);
         }
         const float w = std::exp(dot * args.scale - m);
         denom += w;
-        const int64_t vbase = (p * HKV + kvh) * DH;
+        const int64_t vbase = RowBase(value, p, kvh);
         for (int64_t d = 0; d < DH; ++d) {
           acc[static_cast<size_t>(d)] += w * LoadF32At(value, vbase + d);
         }

@@ -1,6 +1,8 @@
-// Qwen4-Exp W5b-5 — `Qwen4ExpTextAttention` as one production block. See
+// Qwen4-Exp W5b-5 — `Qwen4ExpTextAttention` as one production block, and W5d-3
+// (#2249 item 2) — the same block over the PAGED K/V the engine allocates. See
 // `qwen4_exp_qsa_block.h` for why this file exists, which four settings it is
-// the sole enforcer of, and what it deliberately does not cover.
+// the sole enforcer of, what the two cache arms share, and what it deliberately
+// does not cover.
 //
 // ALGORITHM ORACLE: transformers 5.16.0 (this row's accepted lane pin),
 // `models/qwen4_exp/modeling_qwen4_exp.py`. Every line below cites the upstream
@@ -132,10 +134,21 @@ void CheckRopeLayoutsAgree(const Tensor& cos_sin, const Tensor& cos, const Tenso
   }
 }
 
+// ─── THE TWO CACHE ARMS, AS ONE DESCRIPTOR (W5d-3, #2249 item 2) ────────────
+// Exactly one of the two pointers is set. The block body below reads this in
+// precisely two places — where the new K/V rows are STORED and where the
+// consumer ADDRESSES them — and is otherwise one copy of one function. That is
+// the shape `RunGdnBlockPaged` established next door: one implementation, a
+// second entry point, no second body to keep bit-identical by hand.
+struct KvArm {
+  const Qwen4ExpQsaCaches* contig = nullptr;
+  const Qwen4ExpQsaPagedCaches* paged = nullptr;
+};
+
 }  // namespace
 
 Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float rms_norm_eps,
-                                      const Tensor& q_index, const Qwen4ExpQsaCaches& caches,
+                                      const Tensor& q_index, const Tensor& index_key,
                                       const Tensor& k_norm_w, const Tensor& cos, const Tensor& sin,
                                       const Tensor& kv_lens, int64_t kv_len,
                                       bool round_intermediates_to_bf16, Tensor* logits) {
@@ -150,9 +163,9 @@ Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float
   VT_CHECK(qsa.kv_heads == 1,
            "qwen4_exp qsa indexer: upstream requires indexer_kv_heads == 1 "
            "(configuration_qwen4_exp.py), and the side cache is one vector per state");
-  VT_CHECK(caches.index_key.rank == 2 && caches.index_key.shape[1] == D,
+  VT_CHECK(index_key.rank == 2 && index_key.shape[1] == D,
            "qwen4_exp qsa indexer: the indexer side cache must be [max_kv, indexer_head_dim]");
-  VT_CHECK(kv_len > 0 && kv_len <= caches.index_key.shape[0],
+  VT_CHECK(kv_len > 0 && kv_len <= index_key.shape[0],
            "qwen4_exp qsa indexer: kv_len outside the side cache");
 
   // ONLY COMPLETE BLOCKS PRODUCE A STATE (`(position + 1) % compress_ratio == 0`,
@@ -165,7 +178,7 @@ Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float
   // The pooled-key scratch. A DENSE `[nb, D]` array and not a paged one: the
   // side cache's paged store belongs to the wave that gives QSA a real KV-cache
   // group, which is blocked behind #2131, and the spec's `## Owed` says so.
-  DBuf block_keys(d, caches.index_key.dtype, {nb > 0 ? nb : 1, D});
+  DBuf block_keys(d, index_key.dtype, {nb > 0 ? nb : 1, D});
 
   if (nb > 0) {
     vt::Qwen4ExpQsaCompressArgs cargs;
@@ -177,7 +190,7 @@ Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float
     cargs.rotary_dim = cos.shape[1];
     cargs.eps = rms_norm_eps;
     cargs.round_intermediates_to_bf16 = round_intermediates_to_bf16;
-    Tensor raw = RowsView(caches.index_key, 0, complete_keys, {complete_keys, D});
+    Tensor raw = RowsView(index_key, 0, complete_keys, {complete_keys, D});
     vt::Qwen4ExpQsaCompress(d.q, block_keys.t(), raw, k_norm_w, cos, sin, cargs);
   }
 
@@ -282,12 +295,19 @@ Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float
   return sel;
 }
 
-Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
-                                           const Qwen4ExpParams& params, const Tensor& hidden,
-                                           const Tensor& positions, const Tensor& cos_sin,
-                                           const Tensor& cos, const Tensor& sin,
-                                           const Qwen4ExpQsaCaches& caches, int64_t past_len,
-                                           int64_t* keys_visited) {
+namespace {
+
+// ONE BLOCK BODY. `arm` selects the cache shape; see `KvArm` above for why the
+// two entry points below are wrappers over this and not two functions.
+Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
+                                    const Qwen4ExpParams& params, const Tensor& hidden,
+                                    const Tensor& positions, const Tensor& cos_sin,
+                                    const Tensor& cos, const Tensor& sin, const KvArm& arm,
+                                    int64_t past_len, int64_t* keys_visited) {
+  const bool paged = arm.paged != nullptr;
+  VT_CHECK((arm.contig != nullptr) != paged,
+           "qwen4_exp qsa block: exactly one cache arm must be set");
+  const Tensor& index_key = paged ? arm.paged->index_key : arm.contig->index_key;
   const int64_t T = hidden.shape[0];
   const int64_t H = params.hidden_size;
   const int64_t Hq = params.num_attention_heads;
@@ -329,12 +349,51 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
   // The two layouts are cross-checked rather than trusted. See
   // `CheckRopeLayoutsAgree` for what the bounded row sample can and cannot see.
   CheckRopeLayoutsAgree(cos_sin, cos, sin);
-  VT_CHECK(caches.key.rank == 3 && caches.value.rank == 3 && caches.key.shape[1] == Hkv &&
-               caches.key.shape[2] == Dh && caches.value.shape[1] == Hkv &&
-               caches.value.shape[2] == Dh,
-           "qwen4_exp qsa block: key/value caches must be [max_kv, num_kv_heads, head_dim]");
-  VT_CHECK(past_len >= 0 && kv_len <= caches.key.shape[0] && kv_len <= caches.value.shape[0],
-           "qwen4_exp qsa block: the new tokens do not fit the key/value caches");
+  VT_CHECK(past_len >= 0, "qwen4_exp qsa block: past_len must not be negative");
+  if (!paged) {
+    const Qwen4ExpQsaCaches& caches = *arm.contig;
+    VT_CHECK(caches.key.rank == 3 && caches.value.rank == 3 && caches.key.shape[1] == Hkv &&
+                 caches.key.shape[2] == Dh && caches.value.shape[1] == Hkv &&
+                 caches.value.shape[2] == Dh,
+             "qwen4_exp qsa block: key/value caches must be [max_kv, num_kv_heads, head_dim]");
+    VT_CHECK(kv_len <= caches.key.shape[0] && kv_len <= caches.value.shape[0],
+             "qwen4_exp qsa block: the new tokens do not fit the key/value caches");
+  } else {
+    const Qwen4ExpQsaPagedCaches& pc = *arm.paged;
+    // An fp8 KV cache is REFUSED BY NAME. `vt::Qwen4ExpQsaGatherAttention` has
+    // no dequantising read and no `k_scale`/`v_scale`, so reading fp8 bytes
+    // through it is wrong tokens rather than a crash — the exact shape
+    // `kv_cache_route.h` exists to prevent. The store would take the fp8 branch
+    // and the read would not, which is that header's named failure verbatim.
+    VT_CHECK(!dense_attn::IsFp8KvCache(pc.kv),
+             "qwen4_exp qsa block: an fp8 paged KV cache is not supported — "
+             "vt::Qwen4ExpQsaGatherAttention has no dequantising read. See the spec's "
+             "`## Owed`");
+    VT_CHECK(pc.kv.data != nullptr && pc.kv.num_blocks > 0 && pc.kv.block_size > 0,
+             "qwen4_exp qsa block: the paged KV cache is unallocated");
+    VT_CHECK(pc.kv.num_kv_heads == Hkv && pc.kv.head_size == Dh,
+             "qwen4_exp qsa block: the paged KV cache head dims disagree with the config");
+    VT_CHECK(pc.kv.dtype == hidden.dtype,
+             "qwen4_exp qsa block: the paged KV cache dtype must be the block dtype — "
+             "vt::ReshapeAndCache's `auto` path copies raw elements and does not cast");
+    // `MakeQwen4ExpKVCache` already refuses a `block_size` the compress ratio
+    // does not divide, and the reason is upstream's truncating
+    // `storage_block_size`. It matters a SECOND time here: it is what keeps a
+    // compress block of CR tokens inside one page, so the consumer never has to
+    // resolve two pages for one selected block.
+    VT_CHECK(pc.kv.block_size % CR == 0,
+             "qwen4_exp qsa block: the KV page size must be a multiple of "
+             "`indexer_compress_ratio`, which MakeQwen4ExpKVCache already requires");
+    VT_CHECK(pc.block_table.rank == 2 && pc.block_table.shape[0] == 1 &&
+                 pc.block_table.dtype == DType::kI32 && pc.block_table.IsContiguous(),
+             "qwen4_exp qsa block: block_table must be a contiguous i32 [1, max_pages] — "
+             "this block serves ONE sequence per call");
+    VT_CHECK(pc.block_table.shape[1] * pc.kv.block_size >= kv_len,
+             "qwen4_exp qsa block: the block table names fewer tokens than kv_len");
+    VT_CHECK(pc.slot_mapping.rank == 1 && pc.slot_mapping.shape[0] == T &&
+                 pc.slot_mapping.dtype == DType::kI64 && pc.slot_mapping.IsContiguous(),
+             "qwen4_exp qsa block: slot_mapping must be a contiguous i64 [T]");
+  }
 
   vt::RopeArgs rope;
   rope.rotary_dim = static_cast<int>(rot);
@@ -364,7 +423,7 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
   // `vt::Qwen4ExpQsaCompress` expects — it applies the norm and the block-start
   // rope itself. Storing a normed or roped key here would double-apply both.
   {
-    Tensor slot = RowsView(caches.index_key, past_len, T, {T, IdxD});
+    Tensor slot = RowsView(index_key, past_len, T, {T, IdxD});
     vt::MatmulBT(d.q, slot, hidden, dense_attn::ResidentWeight(d, w.idx_k_proj, {IdxD, H}));
   }
 
@@ -399,9 +458,9 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
   DBuf kv_lens(d, DType::kI32, {T}, kv_lens_host.data());
 
   Qwen4ExpQsaSelection sel = Qwen4ExpQsaIndex(
-      d, params.qsa, eps, q_index, caches,
+      d, params.qsa, eps, q_index, index_key,
       dense_attn::ResidentWeight(d, w.idx_k_norm, {IdxD}), cos, sin, kv_lens_cpu, kv_len,
-      /*round_intermediates_to_bf16=*/caches.index_key.dtype == DType::kBF16);
+      /*round_intermediates_to_bf16=*/index_key.dtype == DType::kBF16);
 
   // ─── THE ATTENTION ─────────────────────────────────────────────────────────
   // `q_proj` emits `num_attention_heads * head_dim * 2` and is chunked PER HEAD
@@ -426,13 +485,28 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
                 vt::RmsNormArgs{eps, /*gemma=*/true});
   }
 
-  // k and v are projected DIRECTLY INTO the cache rows this step owns, so
-  // nothing is copied afterwards and there is no second buffer that could drift
-  // from the cache. That is also what upstream stores: `past_key_values.update`
+  // WHERE THE NEW K/V ROWS LAND — the FIRST of the two places the cache arm is
+  // read, and the one that has no shared shape.
+  //
+  // CONTIGUOUS ARM (W5b-5, unchanged): k and v are projected DIRECTLY INTO the
+  // cache rows this step owns, so nothing is copied afterwards and there is no
+  // second buffer that could drift from the cache.
+  //
+  // PAGED ARM (W5d-3): a step's tokens can cross a page boundary, so there are no
+  // "the rows this step owns" to project into. k and v go to a staging buffer and
+  // `dense_attn::WriteKvCache` scatters them at the slot mapping — which is
+  // `dense_attn::AttnBlock`'s own order, and upstream's: `past_key_values.update`
   // is called AFTER the norm and the rope (:826), so the cache holds normed,
-  // roped keys and raw values.
-  Tensor k_slot = RowsView(caches.key, past_len, T, {T, Hkv, Dh});
-  Tensor v_slot = RowsView(caches.value, past_len, T, {T, Hkv, Dh});
+  // roped keys and raw values either way. The arithmetic reaching the cache is
+  // the same in both arms; only the destination differs.
+  DBuf k_stage;
+  DBuf v_stage;
+  if (paged) {
+    k_stage = DBuf(d, hidden.dtype, {T, Hkv, Dh});
+    v_stage = DBuf(d, hidden.dtype, {T, Hkv, Dh});
+  }
+  Tensor k_slot = paged ? k_stage.t() : RowsView(arm.contig->key, past_len, T, {T, Hkv, Dh});
+  Tensor v_slot = paged ? v_stage.t() : RowsView(arm.contig->value, past_len, T, {T, Hkv, Dh});
   {
     DBuf k_raw(d, hidden.dtype, {T, Hkv * Dh});
     vt::MatmulBT(d.q, k_raw.t(), hidden, dense_attn::ResidentWeight(d, w.k_proj, {Hkv * Dh, H}));
@@ -445,9 +519,19 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
     Tensor dst = Reshape(v_slot, {T, Hkv * Dh});
     vt::MatmulBT(d.q, dst, hidden, dense_attn::ResidentWeight(d, w.v_proj, {Hkv * Dh, H}));
   }
-  // ONE rope call over q and k together, as upstream does (:824). The k operand
-  // IS the cache slice, so the cache holds the roped key with no copy.
+  // ONE rope call over q and k together, as upstream does (:824). On the
+  // contiguous arm the k operand IS the cache slice, so the cache holds the roped
+  // key with no copy; on the paged arm it is the staging buffer, roped before the
+  // scatter for the same reason `dense_attn::AttnBlock` ropes before its
+  // `WriteKvCache`.
   vt::RopeFromCache(d.q, q.t(), &k_slot, positions, cos_sin, rope);
+
+  if (paged) {
+    Tensor kc_w = dense_attn::KvSlice(arm.paged->kv, d.q.device, 0);
+    Tensor vc_w = dense_attn::KvSlice(arm.paged->kv, d.q.device, 1);
+    dense_attn::WriteKvCache(d.q, arm.paged->kv, k_slot, v_slot, kc_w, vc_w,
+                             arm.paged->slot_mapping);
+  }
 
   // THE GATHER CONSUMER. Selected block `b` IS tokens [CR*b, CR*b + CR), expanded
   // as ADDRESSES inside the op and never materialised as a token buffer, plus
@@ -463,8 +547,21 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
     aargs.scale = 1.0f / std::sqrt(static_cast<float>(Dh));
     aargs.compress_ratio = CR;
     aargs.keys_visited = keys_visited;
-    Tensor kc = RowsView(caches.key, 0, kv_len, {kv_len, Hkv, Dh});
-    Tensor vc = RowsView(caches.value, 0, kv_len, {kv_len, Hkv, Dh});
+    // THE SECOND — and last — place the cache arm is read. The consumer resolves
+    // a key row flatly or through the page table; nothing else about the call
+    // changes, which is why this is one op with two address modes rather than
+    // two ops (see `Qwen4ExpQsaAttnArgs::kv_block_table`).
+    Tensor kc;
+    Tensor vc;
+    if (paged) {
+      kc = dense_attn::KvSlice(arm.paged->kv, d.q.device, 0);
+      vc = dense_attn::KvSlice(arm.paged->kv, d.q.device, 1);
+      aargs.kv_block_table = &arm.paged->block_table;
+      aargs.kv_block_size = arm.paged->kv.block_size;
+    } else {
+      kc = RowsView(arm.contig->key, 0, kv_len, {kv_len, Hkv, Dh});
+      vc = RowsView(arm.contig->value, 0, kv_len, {kv_len, Hkv, Dh});
+    }
     vt::Qwen4ExpQsaGatherAttention(d.q, attn.t(), q.t(), kc, vc, sel.block_ids, kv_lens.t(), aargs);
   }
 
@@ -483,6 +580,32 @@ Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
   r.tensor = out.t();
   r.storage = out.ReleaseShared();
   return r;
+}
+
+}  // namespace
+
+Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlock(Dev d, const Qwen4ExpQsaWeights& w,
+                                           const Qwen4ExpParams& params, const Tensor& hidden,
+                                           const Tensor& positions, const Tensor& cos_sin,
+                                           const Tensor& cos, const Tensor& sin,
+                                           const Qwen4ExpQsaCaches& caches, int64_t past_len,
+                                           int64_t* keys_visited) {
+  KvArm arm;
+  arm.contig = &caches;
+  return QsaBlockCore(d, w, params, hidden, positions, cos_sin, cos, sin, arm, past_len,
+                      keys_visited);
+}
+
+Qwen4ExpQsaBlockOutput RunQwen4ExpQsaBlockPaged(Dev d, const Qwen4ExpQsaWeights& w,
+                                                const Qwen4ExpParams& params, const Tensor& hidden,
+                                                const Tensor& positions, const Tensor& cos_sin,
+                                                const Tensor& cos, const Tensor& sin,
+                                                const Qwen4ExpQsaPagedCaches& caches,
+                                                int64_t past_len, int64_t* keys_visited) {
+  KvArm arm;
+  arm.paged = &caches;
+  return QsaBlockCore(d, w, params, hidden, positions, cos_sin, cos, sin, arm, past_len,
+                      keys_visited);
 }
 
 }  // namespace vllm

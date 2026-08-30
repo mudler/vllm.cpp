@@ -1061,6 +1061,43 @@ struct Qwen4ExpQsaAttnArgs {
   // A host pointer, on the `GdnArgs::query_start_loc_host` precedent; a CUDA arm
   // owes a device-side counter and its copy-back.
   int64_t* keys_visited = nullptr;
+
+  // ─── THE PAGED ADDRESS MODE (row MODEL-MM-QWEN4-EXP W5d-3, #2249 item 2) ───
+  //
+  // WHY IT IS HERE AND NOT A SECOND OP. The engine allocates this model's QSA
+  // K/V as a PAGED `FullAttentionSpec` group (`MakeQwen4ExpKVCache`), so the
+  // contiguous `[max_kv, Hkv, Dh]` arm above could not serve from the cache the
+  // runner actually hands a forward. What differs between the two is the
+  // resolution of ONE address — the key/value row for logical position `p` —
+  // and nothing else: the expansion, the visit ORDER, the two softmax passes and
+  // the f32 accumulation are the same body, so a second op would be the parallel
+  // path AGENTS.md "Shared seams" forbids.
+  //
+  // `nullptr` keeps the contiguous arm byte-for-byte. When set, `key`/`value`
+  // are the rank-4 `[num_pages, kv_block_size, num_kv_heads, head_dim]` unbind
+  // views of the runner's flash cache (`dense_attn::KvSlice`), STRIDED rather
+  // than contiguous because K and V interleave at dim 1, and logical position
+  // `p` resolves as vLLM's paged read does
+  // (`vllm/v1/attention/backends/flash_attn.py::FlashAttentionImpl.forward`,
+  // mirrored in this tree's `vt::PagedAttention` contract):
+  //
+  //     page = kv_block_table[p / kv_block_size]
+  //     row  = key[page, p % kv_block_size, kv_head, :]
+  //
+  // TWO THINGS ARE CALLED A "BLOCK" IN THIS OP AND THEY ARE NOT THE SAME
+  // OBJECT. `block_ids` names QSA's COMPRESS blocks of `compress_ratio` tokens
+  // (4 at the released config); `kv_block_table`/`kv_block_size` name the KV
+  // CACHE PAGE (the engine's `block_size`, 16 or more). The `kv_` prefix is what
+  // keeps them apart, and `MakeQwen4ExpKVCache` refuses a `block_size` the
+  // compress ratio does not divide, so a compress block never straddles a page.
+  //
+  // ONE REQUEST. `kv_block_table` is `[1, max_pages]` i32: this op is called per
+  // QSA layer for one sequence, exactly as the contiguous arm is, and a ragged
+  // multi-request batch needs the per-request `query_start_loc` plumbing the
+  // block does not carry yet. Recorded under the spec's `## Owed`.
+  const Tensor* kv_block_table = nullptr;
+  // Tokens per KV cache page. Must be > 0 exactly when `kv_block_table` is set.
+  int64_t kv_block_size = 0;
 };
 
 // Mamba2 SSD args, shared by the chunked prefill scan and the decode state
@@ -3765,7 +3802,11 @@ void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
 // say. The expansion is address arithmetic and belongs inside the consumer.
 //
 // SHAPES. query [T, num_q_heads, head_dim] f32/bf16; key and value
-// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache;
+// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache — or, in the PAGED
+// address mode, the rank-4 [num_pages, kv_block_size, num_kv_heads, head_dim]
+// unbind views of the runner's flash cache, which are STRIDED (see
+// `Qwen4ExpQsaAttnArgs::kv_block_table` for the resolution and for why the two
+// arms are one op);
 // block_ids [T, block_topk] i32, ascending, `-1` = no block;
 // kv_lens [T] i32, the causal visible length per query token;
 // out [T, num_q_heads, head_dim] f32/bf16. GQA: num_q_heads % num_kv_heads == 0.

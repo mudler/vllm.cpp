@@ -68,7 +68,7 @@ void MlaDims::Validate() const {
     Fail("`rms_norm_eps` must be > 0, got " + std::to_string(rms_norm_eps));
   }
   // Upstream's own clause, mirrored so the two refusals mean the same thing:
-  // `validate_architecture` (`configuration_glm5_next.py:219-226`) raises
+  // `validate_architecture` (`configuration_glm5_next.py:225-228`) raises
   // "Expecting NoPE for the DSA attention layers, but got {n} as RoPE dim."
   // for any positive value. This port therefore has no rope branch; a
   // positive width is refused rather than half-implemented.
@@ -102,7 +102,7 @@ IndexerRole IndexerRoleFor(const Glm5NextParams& p, int64_t layer_idx) {
   IndexerRole r;
   r.skip_topk = p.indexer_types[static_cast<size_t>(layer_idx)] ==
                 Glm5NextIndexerKind::kShared;
-  // `min(layer_idx + 1, len - 1)` (`:1130`) — the LAST layer looks at itself.
+  // `min(layer_idx + 1, len - 1)` (`:1133`) — the LAST layer looks at itself.
   const int64_t next = std::min(layer_idx + 1, n - 1);
   r.next_skip_topk =
       !r.skip_topk && p.indexer_types[static_cast<size_t>(next)] ==
@@ -136,7 +136,7 @@ std::vector<float> CompressKv(const MlaDims& d, const MlaWeights& w,
   d.Validate();
   const int64_t tokens = batch * seq_len;
   // `kv_lora_rank + qk_rope_head_dim`, and the rope half has no width, so the
-  // split at `:1168` takes the whole projection and `k_rot` is empty.
+  // split at `:1171` takes the whole projection and `k_rot` is empty.
   const int64_t proj = d.kv_lora_rank + d.qk_rope_head_dim;
   RequireSize("hidden_states", hidden.size(), tokens * d.hidden_size);
   RequireSize("kv_a_proj_with_mqa", w.kv_a_proj_with_mqa.size(),
@@ -169,7 +169,7 @@ ExpandedKv ExpandKv(const MlaDims& d, const MlaWeights& w,
 
   ExpandedKv out;
   // `key_states` is `qk_head_dim` wide; the rope half has no width, so it IS
-  // `k_nope` and there is nothing to concatenate (`:1148-1150`).
+  // `k_nope` and there is nothing to concatenate (`:1150-1152`).
   out.key_states.assign(
       static_cast<size_t>(batch * heads * seq_len * d.qk_head_dim()), 0.0F);
   out.value_states.assign(
@@ -220,7 +220,7 @@ std::vector<uint8_t> BuildAttentionMaskFromTopk(const std::vector<int32_t>& topk
   RequireSize("topk_indices", topk.size(), batch * q_length * width);
 
   // `selected_counts` is int32 upstream and only its `ne(0)` is read
-  // (`:1237-1247`), so a saturating byte is the same predicate at 1/4 the
+  // (`:1236-1246`), so a saturating byte is the same predicate at 1/4 the
   // buffer. It is NOT a bool being or-ed: the scatter-add of a ZERO for an
   // invalid index must not turn a visible key off, and `|=` of 0 does not.
   std::vector<uint8_t> mask(
@@ -231,10 +231,10 @@ std::vector<uint8_t> BuildAttentionMaskFromTopk(const std::vector<int32_t>& topk
       uint8_t* dst = mask.data() + (b * q_length + q) * kv_length;
       for (int64_t i = 0; i < width; ++i) {
         const int32_t idx = row[i];
-        // `topk_indices.ge(0) & topk_indices.lt(kv_length)` (`:1235`).
+        // `topk_indices.ge(0) & topk_indices.lt(kv_length)` (`:1232`).
         const bool valid = idx >= 0 && idx < static_cast<int32_t>(kv_length);
         // `.clamp(0, kv_length - 1)` "only so scatter has a legal index"
-        // (`:1238`); the clamped slot receives a 0 when the entry was invalid.
+        // (`:1234-1235`); the clamped slot receives a 0 when the entry was invalid.
         const int64_t safe = std::min<int64_t>(
             std::max<int64_t>(idx, 0), kv_length - 1);
         if (valid) dst[safe] = 1U;
@@ -266,15 +266,15 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
               d.hidden_size * d.num_heads * d.v_head_dim);
 
   // `self.indexer = None if self.skip_topk else Glm5NextTextIndexer(...)`
-  // (`:1127`). Both mismatches are refused: a shared layer handed an indexer
+  // (`:1131`). Both mismatches are refused: a shared layer handed an indexer
   // would let a caller re-enable the recomputation this model must not do, and
   // a full layer without one has nothing to select with.
   if (role.skip_topk && indexer != nullptr) {
-    Fail("a `shared` layer has no indexer of its own (`:1127`); pass nullptr "
+    Fail("a `shared` layer has no indexer of its own (`:1131`); pass nullptr "
          "and supply `prev_topk_indices` instead");
   }
   if (!role.skip_topk && indexer == nullptr) {
-    Fail("a `full` layer needs its own indexer weights (`:1127`)");
+    Fail("a `full` layer needs its own indexer weights (`:1131`)");
   }
 
   AttentionResult res;
@@ -282,7 +282,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
   const int64_t qk = d.qk_head_dim();
   const int64_t vhd = d.v_head_dim;
 
-  // ── the projections (`:1163-1174`) ────────────────────────────────────────
+  // ── the projections (`:1163-1175`) ────────────────────────────────────────
   const std::vector<float> q_resid = QResid(d, w, hidden, batch, seq_len);
   std::vector<float> query(static_cast<size_t>(batch * heads * seq_len * qk));
   {
@@ -291,7 +291,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
       for (int64_t t = 0; t < seq_len; ++t) {
         LinearNoBias(q_resid.data() + (b * seq_len + t) * d.q_lora_rank,
                      w.q_b_proj.data(), d.q_lora_rank, heads * qk, row.data());
-        // `.view(B, S, -1, qk_head_dim).transpose(1, 2)` (`:1162`, `:1166`):
+        // `.view(B, S, -1, qk_head_dim).transpose(1, 2)` (`:1164`, `:1168`):
         // the flat projection is HEAD-MAJOR within a token.
         for (int64_t h = 0; h < heads; ++h) {
           float* dst = query.data() + ((b * heads + h) * seq_len + t) * qk;
@@ -303,10 +303,10 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
   const std::vector<float> k_pass = CompressKv(d, w, hidden, batch, seq_len);
   const ExpandedKv kv = ExpandKv(d, w, k_pass, batch, seq_len);
 
-  // ── the selection (`:1180-1186`) ──────────────────────────────────────────
+  // ── the selection (`:1181-1191`) ──────────────────────────────────────────
   if (role.skip_topk) {
     if (prev_topk_indices == nullptr) {
-      // Upstream's own message (`:1185`), mirrored verbatim so a log line means
+      // Upstream's own message (`:1190`), mirrored verbatim so a log line means
       // the same thing on both sides.
       Fail("Shared DSA layers require top-k indices from a previous full "
            "indexer layer.");
@@ -325,17 +325,17 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
     res.topk_indices = sel.topk_indices;
   }
 
-  // ── the mask (`:1188-1192`) ───────────────────────────────────────────────
+  // ── the mask (`:1193-1197`) ───────────────────────────────────────────────
   // `kv_length` is `key_states.shape[2]`, which is the CACHE length upstream
   // and equals `seq_len` on the fresh prefill this reference serves. W5b-2's
   // cache binding is what makes the two differ.
   const std::vector<uint8_t> visible = BuildAttentionMaskFromTopk(
       res.topk_indices, batch, seq_len, res.topk_width, seq_len);
 
-  // ── `eager_attention_forward` (`:1039-1060`) ──────────────────────────────
+  // ── `eager_attention_forward` (`:1039-1061`) ──────────────────────────────
   // `repeat_kv` is the identity: `num_key_value_groups` is 1 for this model.
   const float scaling = d.scaling();
-  // `torch.finfo(query_states.dtype).min` (`:1254`) and NOT `-inf`: a query row
+  // `torch.finfo(query_states.dtype).min` (`:1253`) and NOT `-inf`: a query row
   // whose every key is masked then has a UNIFORM softmax and a FINITE output.
   const float min_bias = std::numeric_limits<float>::lowest();
 
@@ -366,7 +366,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
           sum += e;
         }
         const float inv = static_cast<float>(1.0 / sum);
-        // `attn_output.transpose(1, 2)` then `.reshape(B, S, -1)` (`:1213`):
+        // `attn_output.transpose(1, 2)` then `.reshape(B, S, -1)` (`:1059`, `:1214`):
         // head-major within a token, which is what `o_proj` expects.
         float* dst = ctx.data() + (b * seq_len + t) * heads * vhd + h * vhd;
         for (int64_t dv = 0; dv < vhd; ++dv) {
@@ -381,7 +381,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
     }
   }
 
-  // ── `o_proj` (`:1214`) ────────────────────────────────────────────────────
+  // ── `o_proj` (`:1215`) ────────────────────────────────────────────────────
   res.attn_output.assign(static_cast<size_t>(tokens * d.hidden_size), 0.0F);
   for (int64_t t = 0; t < tokens; ++t) {
     LinearNoBias(ctx.data() + t * heads * vhd, w.o_proj.data(), heads * vhd,

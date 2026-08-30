@@ -21,18 +21,18 @@
 //
 // ─── PORT ANCHORS (file:line on BOTH sides) ──────────────────────────────────
 //   OURS                                 <-  transformers v5.16.1, models/glm5_next/
-//   glm5_next::MlaDims                   <-  modeling_glm5_next.py:1082-1128
-//                                            (`Glm5NextTextAttention.__init__`)
-//   glm5_next::IndexerRoleFor            <-  :1126-1131 (`skip_topk`,
-//                                            `next_skip_topk`)
-//   glm5_next::QResid                    <-  :1165 (`q_a_layernorm(q_a_proj(x))`)
-//   glm5_next::CompressKv                <-  :1167-1171
+//   glm5_next::MlaDims                   <-  modeling_glm5_next.py:1079-1088
+//                                            plus :1128 (`scaling`), in `__init__`
+//   glm5_next::IndexerRoleFor            <-  :1130 (`skip_topk`) and
+//                                            :1132-1134 (`next_skip_topk`)
+//   glm5_next::QResid                    <-  :1167 (`q_a_layernorm(q_a_proj(x))`)
+//   glm5_next::CompressKv                <-  :1170-1172
 //                                            (`kv_a_proj_with_mqa`, the split,
 //                                             `kv_a_layernorm`)
 //   glm5_next::ExpandKv                  <-  :1136-1153 (`expand_kv`)
-//   glm5_next::BuildAttentionMaskFromTopk<-  :1218-1257
-//   glm5_next::Attention                 <-  :1157-1216 (`forward`) plus
-//                                            :1039-1060 (`eager_attention_forward`)
+//   glm5_next::BuildAttentionMaskFromTopk<-  :1218-1256
+//   glm5_next::Attention                 <-  :1155-1216 (`forward`) plus
+//                                            :1039-1061 (`eager_attention_forward`)
 //
 // ─── THREE THINGS A PORT GETS SILENTLY WRONG HERE ────────────────────────────
 //
@@ -53,13 +53,13 @@
 //
 // 2. **Cross-layer top-k sharing.** `config.indexer_types[layer_idx] ==
 //    "shared"` means the layer builds NO indexer and REUSES the previous full
-//    layer's selection (`:1128-1131`, `:1180-1186`). A layer that builds its own
+//    layer's selection (`:1130-1134`, `:1181-1191`). A layer that builds its own
 //    indexer where upstream shares is a fluent wrong model: it runs, it selects
 //    a plausible key set, and it emits plausible tokens. Nothing about the
 //    output's shape, finiteness or scale says otherwise. `IndexerRoleFor` is
 //    the whole decision, isolated so it can be gated on its own.
 //
-// 3. **The all-masked row is `finfo.min`, NOT `-inf`.** `:1254-1256` fills a
+// 3. **The all-masked row is `finfo.min`, NOT `-inf`.** `:1253-1256` fills a
 //    non-visible position with `torch.finfo(dtype).min`. A left-padded query row
 //    reaches a state where EVERY key is masked; with `finfo.min` its softmax is
 //    UNIFORM and its output is finite, and with `-inf` every term is NaN and the
@@ -68,10 +68,10 @@
 //
 // ─── THE ROPE HALF HAS NO WIDTH, AND UPSTREAM IS WHAT SAYS SO ────────────────
 //
-// `expand_kv` concatenates `k_nope` with `k_rot` (`:1148-1150`) and `forward`
-// splits `k_rot` off `compressed_kv` (`:1168`). Both halves are ZERO-WIDTH for
+// `expand_kv` concatenates `k_nope` with `k_rot` (`:1150-1152`) and `forward`
+// splits `k_rot` off `compressed_kv` (`:1171`). Both halves are ZERO-WIDTH for
 // this architecture: `Glm5NextTextConfig.validate_architecture`
-// (`configuration_glm5_next.py:219-226`) RAISES "Expecting NoPE for the DSA
+// (`configuration_glm5_next.py:225-228`) RAISES "Expecting NoPE for the DSA
 // attention layers, but got {n} as RoPE dim." for any positive
 // `qk_rope_head_dim`, and the golden generator constructs one to MEASURE that
 // rather than describe it. So this port implements no rope branch — a branch no
@@ -92,7 +92,7 @@
 //
 // This file is a host f32 reference, exactly as `glm5_next_dsa.cpp`,
 // `glm5_next_mhc.cpp` and `glm5_next_moe.cpp` are. The reference's own softmax
-// is `dtype=torch.float32` (`:1055`), so f32 there is upstream's arithmetic and
+// is `dtype=torch.float32` (`:1056`), so f32 there is upstream's arithmetic and
 // not a widening; the projections upstream runs in the model dtype are widened
 // here and that IS a deviation, recorded as such and shared with every other
 // host reference on this row. The device arm is owed, not implied — see the
@@ -100,7 +100,7 @@
 //
 // ─── WHAT THIS FILE DOES NOT DO ──────────────────────────────────────────────
 //
-// No KV cache: upstream's `past_key_values.update` (`:1176-1178`) is a Cache
+// No KV cache: upstream's `past_key_values.update` (`:1177-1179`) is a Cache
 // object this reference has no equivalent of, and `MakeGlm5NextKVCache` (W5) is
 // the production spec it will bind to. No decoder layer, no mHC threading, no
 // `Glm5NextTextModel::Forward`, and NOTHING here is reached from a production
@@ -137,7 +137,7 @@ struct MlaDims {
   // (`:1087`). 256 here, because the rope half has no width.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }
 
-  // `self.scaling = self.qk_head_dim ** (-0.5)` (`:1124`). NOTE this is the MLA
+  // `self.scaling = self.qk_head_dim ** (-0.5)` (`:1128`). NOTE this is the MLA
   // head dim, not the indexer's, and not `v_head_dim`.
   float scaling() const;
 
@@ -176,11 +176,11 @@ struct MlaWeights {
 // the whole of trap 2 and because a gate on it can then be a set of equalities
 // over a schedule rather than a forward it has to run.
 struct IndexerRole {
-  // `self.skip_topk = config.indexer_types[layer_idx] == "shared"` (`:1126`).
+  // `self.skip_topk = config.indexer_types[layer_idx] == "shared"` (`:1130`).
   // True means this layer builds NO indexer and REQUIRES `prev_topk_indices`.
   bool skip_topk = false;
   // `self.next_skip_topk = not self.skip_topk and
-  //  config.indexer_types[min(layer_idx + 1, len - 1)] == "shared"` (`:1128-1131`).
+  //  config.indexer_types[min(layer_idx + 1, len - 1)] == "shared"` (`:1132-1134`).
   // True means `Attention` returns its selection for the NEXT layer to reuse.
   // NOTE the `min` CLAMP: the last layer looks at ITSELF, so a final `full`
   // layer never propagates and a final `shared` layer would make its own
@@ -193,9 +193,9 @@ struct IndexerRole {
 // `layer_idx + 1` only.
 IndexerRole IndexerRoleFor(const Glm5NextParams& p, int64_t layer_idx);
 
-// `q_a_layernorm(q_a_proj(hidden_states))` (`:1165`). This value is used TWICE
+// `q_a_layernorm(q_a_proj(hidden_states))` (`:1167`). This value is used TWICE
 // upstream — as the input to `q_b_proj` and as the indexer's `q_resid`
-// (`:1189`) — so it is returned rather than recomputed.
+// (`:1184`) — so it is returned rather than recomputed.
 //
 //   hidden : [batch, seq_len, hidden_size]  row-major
 //   returns: [batch, seq_len, q_lora_rank]  row-major
@@ -203,7 +203,7 @@ std::vector<float> QResid(const MlaDims& d, const MlaWeights& w,
                           const std::vector<float>& hidden, int64_t batch,
                           int64_t seq_len);
 
-// `kv_a_layernorm(split(kv_a_proj_with_mqa(hidden))[0])` (`:1167-1170`).
+// `kv_a_layernorm(split(kv_a_proj_with_mqa(hidden))[0])` (`:1170-1172`).
 //
 // Returns `k_pass` ONLY. Upstream's `k_rot` is the second half of the split and
 // has ZERO WIDTH at this architecture's only admissible geometry, so there is
@@ -228,10 +228,10 @@ ExpandedKv ExpandKv(const MlaDims& d, const MlaWeights& w,
                     const std::vector<float>& k_pass, int64_t batch,
                     int64_t seq_len);
 
-// `build_attention_mask_from_topk` (`:1218-1257`), returning the BOOLEAN
-// visibility upstream's `sdpa` arm returns (`:1250-1251`). 1 == visible.
+// `build_attention_mask_from_topk` (`:1218-1256`), returning the BOOLEAN
+// visibility upstream's `sdpa` arm returns (`:1249-1250`). 1 == visible.
 //
-// The eager arm's `torch.where(mask, 0.0, finfo.min)` (`:1254-1256`) is a pure
+// The eager arm's `torch.where(mask, 0.0, finfo.min)` (`:1253-1256`) is a pure
 // re-encoding of this same boolean and is applied inside `Attention`, which is
 // the only consumer; materializing an additive float mask here would double the
 // buffer for no information.
@@ -262,19 +262,19 @@ struct AttentionResult {
   bool propagates_topk = false;
 };
 
-// The whole block (`:1157-1216`), with `eager_attention_forward` (`:1039-1060`)
+// The whole block (`:1155-1216`), with `eager_attention_forward` (`:1039-1061`)
 // inlined because it is the only interface this model's 3-D top-k mask can
-// reach — upstream says so at `:1222-1225`, and the reason is that the mask
+// reach — upstream says so at `:1227-1228`, and the reason is that the mask
 // selects per (query, key) pair and no FlashAttention kernel takes one.
 //
 // `indexer` is the layer's own indexer weights and MUST be null exactly when
 // `role.skip_topk` is true, which is upstream's `self.indexer = None if
-// self.skip_topk else Glm5NextTextIndexer(...)` (`:1127`). Both mismatches
+// self.skip_topk else Glm5NextTextIndexer(...)` (`:1131`). Both mismatches
 // throw by name rather than silently choosing an arm.
 //
 // `prev_topk_indices` is REQUIRED when `role.skip_topk` is true and IGNORED
 // otherwise. Upstream raises `ValueError("Shared DSA layers require top-k
-// indices from a previous full indexer layer.")` (`:1184-1185`) and so does
+// indices from a previous full indexer layer.")` (`:1189-1190`) and so does
 // this; the message is mirrored so a log line means the same thing on both
 // sides.
 //

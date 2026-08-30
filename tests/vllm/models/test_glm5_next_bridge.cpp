@@ -44,6 +44,7 @@
 #include "vllm/model_executor/models/glm5_next_bridge.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
 #include "vt/dtype.h"
+#include "vt/quant.h"
 
 namespace {
 
@@ -358,4 +359,168 @@ TEST_CASE("glm5_next bridge: an empty or released tensor is refused") {
   released.host_released = true;
   CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(released, "o_proj"),
                        doctest::Contains("released"), std::runtime_error);
+}
+
+// --- (4) the FOUR refusals `glm5_next_bridge.h` advertises BY NAME -----------
+//
+// The header's `REFUSES BY NAME` list has four entries. Before this section two
+// of them were pinned (the ceiling, and `host_released`) and the review found
+// the rest carrying NO coverage at all: every one could be deleted and this
+// suite stayed 8/8 and 56/56. Two of the uncovered ones are not cosmetic —
+// without the byte-span checks `std::memcpy(out.data(), src, need)` reads past
+// a short buffer and SERVES THE HEAP AS WEIGHT VALUES, and without the `default:`
+// arm an encoding the bridge cannot widen returns a buffer of ZEROS, which is
+// the exact failure the `host_released` refusal already exists to prevent.
+//
+// A refusal with no test is a comment. These make each one a gate.
+
+TEST_CASE("glm5_next bridge: a block count that is not whole BLOCKS is refused") {
+  // Q8_0 has 32 elements per block. 33 is one element into a second block, so
+  // there is no byte layout that could serve it and `to_float` would read a
+  // block that was never written.
+  OwnedTensor t;
+  t.dtype = vt::DType::kQ8_0;
+  t.rank = 1;
+  t.shape[0] = 33;
+  REQUIRE(vt::IsBlockQuant(t.dtype));
+  REQUIRE(vt::BlockElems(t.dtype) == 32);
+  // Non-empty, so the earlier "carries no bytes" refusal cannot be what fires.
+  t.bytes.assign(static_cast<size_t>(vt::RowSizeBytes(t.dtype, 64)), 0U);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "k_b_proj"),
+                       doctest::Contains("whole number"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "k_b_proj"),
+                       doctest::Contains("k_b_proj"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next bridge: a SHORT block byte span is refused, not decoded") {
+  // A whole number of blocks, and one byte less than those blocks occupy. The
+  // element count agrees, so only the byte-span check separates this from a
+  // decode that walks off the end of `t.bytes`.
+  OwnedTensor t;
+  t.dtype = vt::DType::kQ8_0;
+  t.rank = 1;
+  t.shape[0] = 32;
+  const size_t need = vt::RowSizeBytes(t.dtype, 32);
+  REQUIRE(need == 34U);  // one f16 scale + 32 int8 quants
+  t.bytes.assign(need - 1U, 0U);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "moe.gate_exps"),
+                       doctest::Contains("need"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "moe.gate_exps"),
+                       doctest::Contains("moe.gate_exps"), std::runtime_error);
+
+  // A LONGER span is refused too. It cannot over-read, but it means the caller
+  // and the bridge disagree about the geometry, and serving the prefix would
+  // hide that disagreement behind plausible numbers.
+  t.bytes.assign(need + 34U, 0U);
+  CHECK_THROWS_AS(DecodeOwnedTensorToF32(t, "moe.gate_exps"),
+                  std::runtime_error);
+
+  // ...and the exact span decodes, so the check is a boundary and not a veto.
+  t.bytes.assign(need, 0U);
+  std::vector<float> ok;
+  REQUIRE_NOTHROW(ok = DecodeOwnedTensorToF32(t, "moe.gate_exps"));
+  CHECK(ok.size() == 32U);
+}
+
+TEST_CASE("glm5_next bridge: EVERY block dtype this build knows has a decoder") {
+  // The `to_float == nullptr` refusal cannot be reached from the enum as it
+  // stands, and this case is why rather than an assertion that it fires:
+  // `vt::IsBlockQuant` is true exactly for the dtypes with block geometry, and
+  // `vt::cpu::BlockToFloat` answers non-null for every one of them. So the
+  // refusal is the "unselected branch" shape (`.agents/reachability.md`) — a
+  // guard for the encoding that lands NEXT without a CPU decoder, which is the
+  // state IQ2_XS and IQ4_XS were in before #2245.
+  //
+  // What is gated here is therefore the PREMISE, not the branch: the moment a
+  // new block encoding is added to `vt::DType` without a `BlockToFloat` arm,
+  // this case reds and the refusal in `DecodeOwnedTensorToF32` becomes live.
+  // Deleting the refusal on its own does NOT red anything, and that is stated
+  // rather than dressed up.
+  //
+  // MEASURED, not argued. Rewriting `BlockToFloat`'s `kQ8_0` arm to return
+  // nullptr (`cpu_quant_dequant.cpp`, BUILD rc=0) reds THIS case at
+  // `CHECK(vt::cpu::BlockToFloat(d) != nullptr)` and, in the same run, makes
+  // the refusal fire by name in two others: "`moe.gate_exps` is q8_0, which
+  // this build has no `BlockToFloat` decoder for". So the branch is live under
+  // the one condition that can reach it, and the guard is what stands between
+  // that condition and a buffer of zeros served as a weight.
+  int block_dtypes = 0;
+  for (int raw = 0; raw <= 255; ++raw) {
+    const auto d = static_cast<vt::DType>(raw);
+    if (raw > static_cast<int>(vt::DType::kIQ4_XS)) break;
+    if (!vt::IsBlockQuant(d)) continue;
+    ++block_dtypes;
+    INFO("dtype ", vt::Name(d));
+    CHECK(vt::cpu::BlockToFloat(d) != nullptr);
+  }
+  // A loop that found nothing would pass vacuously, which is the mute-switch
+  // shape this repository names. The build carries 18 block encodings.
+  CHECK(block_dtypes == 18);
+  MESSAGE("block dtypes with a CPU decoder: " << block_dtypes);
+}
+
+TEST_CASE("glm5_next bridge: a SHORT elementwise byte span is refused") {
+  // THE HEAP OVER-READ. `kF32` decodes with `std::memcpy(out.data(), src,
+  // need)`, where `need` comes from the SHAPE. With a shorter `t.bytes` and no
+  // check, that memcpy reads whatever follows the vector's allocation and the
+  // bridge returns it AS WEIGHT VALUES — finite, plausible, and wrong, which no
+  // token gate can see.
+  OwnedTensor t;
+  t.dtype = vt::DType::kF32;
+  t.rank = 1;
+  t.shape[0] = 4;
+  const size_t need = 4U * vt::SizeOf(t.dtype);
+  REQUIRE(need == 16U);
+  t.bytes.assign(need - 4U, 0U);  // one element short
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "q_a_layernorm"),
+                       doctest::Contains("need"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "q_a_layernorm"),
+                       doctest::Contains("q_a_layernorm"), std::runtime_error);
+
+  // The same check covers the WIDENING arms, whose loop reads `numel`
+  // half-words rather than memcpying, so it over-reads by a different route.
+  OwnedTensor h;
+  h.dtype = vt::DType::kBF16;
+  h.rank = 2;
+  h.shape[0] = 2;
+  h.shape[1] = 3;
+  h.bytes.assign(6U * sizeof(uint16_t) - 2U, 0U);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(h, "kv_a_layernorm"),
+                       doctest::Contains("kv_a_layernorm"), std::runtime_error);
+
+  // ...and the exact span decodes, so neither check is a blanket refusal.
+  t.bytes.assign(need, 0U);
+  CHECK(DecodeOwnedTensorToF32(t, "q_a_layernorm").size() == 4U);
+  h.bytes.assign(6U * sizeof(uint16_t), 0U);
+  CHECK(DecodeOwnedTensorToF32(h, "kv_a_layernorm").size() == 6U);
+}
+
+TEST_CASE("glm5_next bridge: a NON-FLOAT encoding is refused, not zero-filled") {
+  // `kI32` is elementwise, so it passes the byte-span check with a correctly
+  // sized span and reaches the `switch`. Nothing widens it, and WITHOUT the
+  // `default:` arm the function falls off the end returning the zero-filled
+  // `out` it allocated — a whole weight of zeros, served silently. That is the
+  // same failure the `host_released` refusal exists to stop, reached by a
+  // different door.
+  OwnedTensor t;
+  t.dtype = vt::DType::kI32;
+  t.rank = 1;
+  t.shape[0] = 4;
+  REQUIRE_FALSE(vt::IsBlockQuant(t.dtype));
+  t.bytes.assign(4U * vt::SizeOf(t.dtype), 0U);  // the RIGHT span, on purpose
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "o_proj"),
+                       doctest::Contains("widen"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "o_proj"),
+                       doctest::Contains("o_proj"), std::runtime_error);
+  // The dtype is NAMED, so the refusal says which encoding arrived.
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "o_proj"),
+                       doctest::Contains(vt::Name(t.dtype)), std::runtime_error);
+
+  OwnedTensor i8;
+  i8.dtype = vt::DType::kI8;
+  i8.rank = 1;
+  i8.shape[0] = 8;
+  i8.bytes.assign(8U, 0U);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(i8, "idx_wk"),
+                       doctest::Contains("widen"), std::runtime_error);
 }

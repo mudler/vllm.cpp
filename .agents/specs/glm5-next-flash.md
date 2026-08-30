@@ -1236,7 +1236,7 @@ This was W5's PLAN for W5b, kept so the two readings do not look like a
 contradiction. It scoped the per-layer control flow, the attention block and
 `Glm5NextTextModel::Forward` as one wave. **Anchors:**
 `modeling_glm5_next.py:1064-1257` (`Glm5NextTextAttention`, `expand_kv`,
-`build_attention_mask_from_topk`), `:1259-1331`
+`build_attention_mask_from_topk`), `:1259-1329`
 (`Glm5NextTextDecoderLayer`), `:1409-1494` (`Glm5NextTextModel.forward`). The
 manifold is threaded from the embedding as
 `inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1)` (`:1477`) and collapsed
@@ -1258,11 +1258,11 @@ Two deliverables.
 **(a) `Glm5NextTextAttention`** (`modeling_glm5_next.py:1064-1257`), as
 `src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` — a host f32 reference,
 exactly as `glm5_next_dsa.cpp`, `glm5_next_mhc.cpp` and `glm5_next_moe.cpp` are.
-`QResid` (`:1165`), `CompressKv` (`:1167-1171`), `ExpandKv` (`:1136-1153`) over
+`QResid` (`:1167`), `CompressKv` (`:1170-1172`), `ExpandKv` (`:1136-1153`) over
 the checkpoint's SPLIT half-transposed `kv_b_proj` halves,
-`BuildAttentionMaskFromTopk` (`:1218-1257`), `IndexerRoleFor` (`:1126-1131`) and
-`Attention` (`:1157-1216`) with `eager_attention_forward` (`:1039-1060`)
-inlined, which upstream says at `:1222-1225` is the only interface a 3-D
+`BuildAttentionMaskFromTopk` (`:1218-1256`), `IndexerRoleFor` (`:1130-1134`) and
+`Attention` (`:1155-1216`) with `eager_attention_forward` (`:1039-1061`)
+inlined, which upstream says at `:1227-1228` is the only interface a 3-D
 per-(query, key) mask can reach.
 
 Three things it gets right that a fluent wrong port gets wrong, each with its own
@@ -1274,20 +1274,20 @@ discriminating case:
   SECOND. At the published geometry a swap is a shape error; the gate therefore
   ALSO carries a SQUARE case at `kv_lora == qk_nope == v_head`, where the
   untransposed reading is shape-valid and merely wrong, and asserts the
-  separation (2.59 over every one of 468 values).
+  separation (2.9469 over every one of 900 values, printed by the case).
 * **Cross-layer top-k sharing.** `indexer_types[layer_idx] == "shared"` means the
   layer builds NO indexer and reuses the previous full layer's selection. The
   gate runs the shared layer against BOTH the correct output and the output a
   RECOMPUTING port produces from a decoy indexer — both captured from the same
   oracle run — and asserts ours is the first: 320 of 800 values differ, max
   separation 1.52, over 20 of 50 query rows.
-* **The all-masked row is `finfo.min`, not `-inf`** (`:1254`). A left-padded
+* **The all-masked row is `finfo.min`, not `-inf`** (`:1253`). A left-padded
   query row has every key masked; with `finfo.min` its softmax is uniform and
   its output finite, and with `-inf` the NaN reaches `o_proj` and then the
   residual stream. The `-inf` mutation reds 49 of 160 assertions.
 
 **No rope branch, and upstream is what says so.** `validate_architecture`
-(`configuration_glm5_next.py:219-226`) RAISES for any positive
+(`configuration_glm5_next.py:225-228`) RAISES for any positive
 `qk_rope_head_dim`, measured by constructing one in the golden generator, so
 `expand_kv`'s concat has a zero-width second half and `key_states` IS `k_nope`.
 `MlaDims::Validate` mirrors the refusal in upstream's own words rather than
@@ -1297,16 +1297,48 @@ half-implementing a branch no released config can select.
 `glm5_next_bridge.{h,cpp}` — O22's open question, answered. See O25 below for
 the decision and its arithmetic.
 
+**Its FOUR advertised refusals are each a gate, which they were not when the
+wave was first proposed for review.** `glm5_next_bridge.h` lists four cases
+`DecodeOwnedTensorToF32` refuses by name, and the fresh review found that
+deleting any of the block element-count check, either byte-span check or the
+`default:` dtype arm left the suite fully green. Two of those were not cosmetic:
+without the elementwise byte-span check `std::memcpy(out.data(), src, need)`
+reads past a short `t.bytes` and serves the HEAP as weight values, and without
+the `default:` arm an encoding the bridge cannot widen returns the ZERO-filled
+buffer it allocated — the same failure the `host_released` refusal exists to
+stop, reached by another door. Five cases now pin them, each proved by
+disabling the refusal in a scratch copy with the mutant's BUILD rc recorded
+beside its TEST rc:
+
+| refusal | mutation | result |
+|---|---|---|
+| block element count is a whole number of blocks | `if (false)` | BUILD 0 / TEST 1, 1 assertion |
+| block byte span equals `RowSizeBytes` | `if (false)` | BUILD 0 / TEST 1, 3 assertions |
+| a block dtype has a `BlockToFloat` decoder | `if (false)` | BUILD 0 / TEST 0 — SURVIVES |
+| elementwise byte span equals `numel * SizeOf` | `if (false)` | BUILD 0 / TEST 1, 3 assertions |
+| `default:` refuses a non-float encoding | `return out;` | BUILD 0 / TEST 1, 4 assertions |
+
+The survivor is disclosed rather than chased, and it is the "unselected branch"
+shape: `vt::IsBlockQuant` is true for exactly the 18 dtypes `BlockToFloat`
+answers for, so no input can reach that arm in this build. What the suite gates
+instead is the PREMISE — every block dtype has a decoder — and that gate is
+ARMED, measured by a second mutation on the other side. Rewriting
+`BlockToFloat`'s `kQ8_0` case to `return nullptr` (BUILD rc=0) reds the premise
+case AND makes the refusal fire by name in two more:
+`` `moe.gate_exps` is q8_0, which this build has no `BlockToFloat` decoder for``.
+So the branch is live under the only condition that can reach it, which is the
+state IQ2_XS and IQ4_XS were in before #2245.
+
 **NOT REACHED.** Nothing in either file is called from a production entry point
 at this merge commit; the only call sites are the two focused gates'. W5b-2
 owns the wiring. O25 carries the disclosure.
 
 ### W5b-2 — the decoder layer, the mHC threading and the assembled forward (GPU, large) — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
 
-What W5b-1 excluded. `Glm5NextTextDecoderLayer` (`:1259-1331`), the mHC stream
+What W5b-1 excluded. `Glm5NextTextDecoderLayer` (`:1259-1329`), the mHC stream
 threading, `Glm5NextTextModel::Forward` (`:1409-1494`), and the binding of the
 attention block to `MakeGlm5NextKVCache` — upstream's
-`past_key_values.update` (`:1176-1178`) is a Cache object W5b-1's reference has
+`past_key_values.update` (`:1177-1179`) is a Cache object W5b-1's reference has
 no equivalent of. Owns discharging O15, O16, O17, O23 and O25 at the moment the
 layer calls the five primitives.
 
@@ -2790,6 +2822,35 @@ Debts this row carries, each visible rather than waived:
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
   [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
   [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **And one arm stays unreached even after the wiring, which is the shape that
+  SURVIVES W5b-2.** `IndexerRoleFor`'s `shared` arm is CONFIG-KEYED, and the
+  published `GLM-5.3-Flash` `config.json` selects it on ZERO of its 45 layers —
+  the gate measures that and prints `published schedule: 0 shared layers of 45`
+  rather than asserting it from prose. So the cross-layer sharing this wave
+  gates is correct against `transformers` v5.16.1 on a schedule the released
+  checkpoint does not contain, and the wave's own headline should be read with
+  that clause attached. It is the same "unselected branch"
+  (`.agents/reachability.md`) shape as the rope half, which this spec already
+  discloses as "a branch no released config selects" — the difference being
+  that the rope branch is REFUSED and this one is IMPLEMENTED and gated. Once
+  O25's reachability half is discharged the two files become reached; the
+  `shared` arm still is not, and closing that needs either a config that selects
+  it or an accepted decision to leave it gated by fixture alone.
+
+  **`byte_ceiling` is a DEFAULT ARGUMENT, so the ceiling arithmetic below binds
+  the bridge and not the function.** `DecodeOwnedTensorToF32`'s third parameter
+  defaults to `kBridgeTensorF32ByteCeiling` and any caller may pass a larger
+  one. The STRUCTURAL claim — that `BridgeDsaLayer`, the only entry point, has
+  no overload taking an expert bank — holds unconditionally. The NUMERIC claim
+  holds for every call that takes the default, which is every call in this tree.
+  A caller that raises the ceiling has opted out, and nothing here stops it.
+
+  **`Numel` iterates `i < t.rank` against a fixed `shape[vt::kMaxRank]`**, so a
+  hand-built `OwnedTensor` with `rank > kMaxRank` would read past the array. No
+  loader-produced tensor can hold one, and the loader is the only producer this
+  bridge is reachable from; recorded rather than guarded so the next reader does
+  not have to re-derive that it is unreachable.
 
   **The residency decision: DECODE ONE LAYER AT A TIME, ON DEMAND, AND NEVER
   RETAIN THE TOWER IN FLOAT.** O22 wrote "Whoever writes the forward decides

@@ -15,7 +15,7 @@ string is a label on a package and the hash is the file that ran.
 Every golden here is a value produced by an UNMODIFIED `Glm5NextTextAttention`
 (`modeling_glm5_next.py:1064-1257`), reached through its own `forward` and its
 own public sub-methods `expand_kv` (`:1136-1153`) and
-`build_attention_mask_from_topk` (`:1218-1257`). Nothing is transcribed.
+`build_attention_mask_from_topk` (`:1218-1256`). Nothing is transcribed.
 
 WHY THIS SHAPE. Four properties, each present because dropping it makes the
 file a tautology a wrong port passes:
@@ -43,7 +43,7 @@ file a tautology a wrong port passes:
 
 WHY float32. The C++ side is a host f32 reference exactly as
 `glm5_next_dsa.cpp`, `glm5_next_mhc.cpp` and `glm5_next_moe.cpp` are, and the
-reference's own softmax is `dtype=torch.float32` (`:1055`). Capturing at fp32
+reference's own softmax is `dtype=torch.float32` (`:1056`). Capturing at fp32
 makes the module's `.to(dtype)` casts no-ops, which is honest for what this
 file gates. The device arm is owed, not implied.
 
@@ -83,7 +83,7 @@ PAD_ROW1 = 3
 SEED = 20260829
 
 # The cross-layer schedule. Layer 1 is `shared`: it runs NO indexer of its own
-# and reuses layer 0's selection (`:1128-1131`, `:1180-1186`). Layer 0 therefore
+# and reuses layer 0's selection (`:1130-1134`, `:1181-1191`). Layer 0 therefore
 # has `next_skip_topk` TRUE and propagates its selection upward; layers 2 and 3
 # are full with no sharer above them.
 INDEXER_TYPES = ["full", "shared", "full", "full"]
@@ -286,7 +286,7 @@ def main():
         out1, _, prop1 = l1(
             hidden_states=hidden, attention_mask=mask, prev_topk_indices=topk0
         )
-        assert prop1 is None, "a shared layer propagates nothing (`:1186`)"
+        assert prop1 is None, "a shared layer propagates nothing (`:1132-1133`, `:1216`)"
 
         # ...and this is the value a port that RECOMPUTES produces. Layer 1 has
         # no indexer of its own, so the decoy is layer 2's — a full layer whose
@@ -315,10 +315,10 @@ def main():
 
         # ── the ROPE half has NO WIDTH, and upstream is what says so ────────
         # `Glm5NextTextConfig` REFUSES any positive `qk_rope_head_dim`:
-        # `validate_architecture` (`configuration_glm5_next.py:226`) raises
+        # `validate_architecture` (`configuration_glm5_next.py:225-228`) raises
         # "Expecting NoPE for the DSA attention layers, but got {n} as RoPE
         # dim." — MEASURED here rather than described, by constructing one and
-        # catching it. So `expand_kv`'s concat at `:1148-1150` copies a
+        # catching it. So `expand_kv`'s concat at `:1150-1152` copies a
         # zero-width `k_rot` and `key_states` IS `k_nope`, and this port
         # implements no rope branch because upstream can reach none. The C++
         # side mirrors the refusal instead.

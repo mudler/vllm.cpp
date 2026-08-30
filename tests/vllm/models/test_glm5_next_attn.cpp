@@ -26,7 +26,7 @@
 //     otherwise.
 //  4. Row 1 is LEFT-PADDED by three tokens, so its padded query rows reach a
 //     state where EVERY key is masked. Upstream fills that with
-//     `torch.finfo(dtype).min` and NOT `-inf` (`:1254`), so the softmax is
+//     `torch.finfo(dtype).min` and NOT `-inf` (`:1253`), so the softmax is
 //     UNIFORM and the output FINITE; a port that writes `-inf` produces NaN and
 //     poisons the residual stream for the rest of the stack.
 //
@@ -267,7 +267,7 @@ TEST_CASE("glm5_next attn: q_a_proj -> q_a_layernorm -> q_resid") {
 TEST_CASE("glm5_next attn: kv_a_proj_with_mqa -> kv_a_layernorm -> k_pass") {
   const MlaDims d = Dims();
   // `qk_rope_head_dim` is ZERO, so the `[kv_lora_rank, qk_rope_head_dim]` split
-  // at `:1168` takes the whole projection and `k_rot` has no width. The
+  // at `:1171` takes the whole projection and `k_rot` has no width. The
   // projection's own row count is what says so.
   CHECK(g::kQkRope == 0);
   CHECK(sizeof(g::kL0KvAProj) / sizeof(float) ==
@@ -284,7 +284,7 @@ TEST_CASE("glm5_next attn: expand_kv over the SPLIT, half-transposed halves") {
   const ExpandedKv kv =
       ExpandKv(d, L0Weights(), Vec(g::kL0KPass), g::kBatch, g::kSeqLen);
 
-  // The rope half has no width, so `key_states` IS `k_nope` (`:1148-1150`).
+  // The rope half has no width, so `key_states` IS `k_nope` (`:1150-1152`).
   CHECK(d.qk_head_dim() == g::kQkNope);
   CHECK(kv.key_states.size() ==
         static_cast<size_t>(g::kBatch * g::kNumHeads * g::kSeqLen * g::kQkNope));
@@ -394,7 +394,7 @@ TEST_CASE("glm5_next attn: build_attention_mask_from_topk") {
   MESSAGE("mask: " << visible << " visible of " << got.size());
 
   // The `-1` sentinel and an out-of-range index BOTH contribute nothing, and a
-  // duplicate contributes once (`:1235-1247`).
+  // duplicate contributes once (`:1235-1246`).
   const std::vector<int32_t> odd = {-1, 0, 0, 2, 99, -5};
   const std::vector<uint8_t> m =
       BuildAttentionMaskFromTopk(odd, 1, 1, 6, 4);
@@ -438,7 +438,7 @@ TEST_CASE("glm5_next attn: a FULL layer's forward") {
 }
 
 TEST_CASE("glm5_next attn: the all-masked padded row is FINITE, not NaN") {
-  // `torch.finfo(dtype).min` and not `-inf` (`:1254`). Row 1's first
+  // `torch.finfo(dtype).min` and not `-inf` (`:1253`). Row 1's first
   // `kPadRow1` query positions are padding: the indexer marks them invisible,
   // so every key is masked and their softmax is UNIFORM. With `-inf` every
   // term is NaN and the NaN reaches `o_proj` and then the residual stream.
@@ -486,7 +486,7 @@ TEST_CASE("glm5_next attn: IndexerRoleFor mirrors skip_topk / next_skip_topk") {
   CHECK_FALSE(r0.skip_topk);
   CHECK(r0.next_skip_topk);   // layer 1 is shared, so layer 0 propagates
   CHECK(r1.skip_topk);
-  CHECK_FALSE(r1.next_skip_topk);  // a shared layer never propagates (`:1129`)
+  CHECK_FALSE(r1.next_skip_topk);  // a shared layer never propagates (`:1132-1133`)
   CHECK_FALSE(r2.skip_topk);
   CHECK_FALSE(r2.next_skip_topk);
   CHECK_FALSE(r3.skip_topk);
@@ -539,7 +539,7 @@ TEST_CASE("glm5_next attn: a SHARED layer REUSES the previous selection") {
   // It USED the caller's selection, unchanged.
   CHECK(shared.topk_indices == prev);
   CHECK(shared.topk_width == g::kTopkWidth);
-  // ...and it propagates NOTHING (`:1186`, `:1216`).
+  // ...and it propagates NOTHING (`:1132-1133`, `:1216`).
   CHECK_FALSE(shared.propagates_topk);
 
   const Diff ok = Compare(shared.attn_output, g::kL1SharedAttnOut,
@@ -615,7 +615,7 @@ TEST_CASE("glm5_next attn: the shared-layer contract is refused BY NAME") {
   const std::vector<int32_t> prev = IVec(g::kL0Topk);
 
   // A shared layer with no previous selection. Upstream's own message
-  // (`:1185`), so a log line means the same thing on both sides.
+  // (`:1190`), so a log line means the same thing on both sides.
   CHECK_THROWS_WITH_AS(
       Attention(d, L1Weights(), id, nullptr, IndexerRoleFor(p, 1), hidden, mask,
                 nullptr, 0, g::kBatch, g::kSeqLen),
@@ -651,7 +651,7 @@ TEST_CASE("glm5_next attn: a positive RoPE width is refused, in upstream's words
   CHECK_NOTHROW(zero.Validate());
   CHECK(zero.qk_rope_head_dim == 0);
   CHECK(zero.qk_head_dim() == g::kQkNope);
-  // `self.scaling = self.qk_head_dim ** (-0.5)` (`:1124`) — the MLA head dim,
+  // `self.scaling = self.qk_head_dim ** (-0.5)` (`:1128`) — the MLA head dim,
   // not `v_head_dim` and not the indexer's.
   CHECK(zero.scaling() ==
         doctest::Approx(1.0 / std::sqrt(static_cast<double>(g::kQkNope))));

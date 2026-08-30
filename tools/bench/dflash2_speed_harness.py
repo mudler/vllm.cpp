@@ -1017,6 +1017,60 @@ def axis_rows(
     return rows
 
 
+# ── The SGLang comparison, DECLARED rather than silently absent ──────────────
+#
+# The campaign goal names two denominators, vLLM and SGLang, and this gate has
+# only ever carried one. An absent arm and an arm that measured nothing look
+# identical in the emitted result, and the second half of the goal then goes
+# quiet instead of reading as owed.
+#
+# WHY IT IS NOT MEASURED, at the pin, checked in SGLang's own source rather than
+# assumed: `python/sglang/srt/models/dflash.py` at `f63458b5` (v0.5.15, the
+# `sglang` oracle pin) registers `EntryClass = [DFlashDraftModel,
+# DFlashLagunaForCausalLM]` and contains ZERO occurrences of `selector_rank`,
+# `selector_top_k` or `conv_group_size`. The draft this gate runs declares
+# `architectures: ["DFlash2DraftModel"]` with `selector_rank=256`,
+# `selector_top_k=16`, `conv_group_size=16`, so the pinned SGLang cannot load
+# it. `srt/speculative/` does carry `dflash_worker_v2.py`, which is why the
+# absence has to be established on the MODEL class and the config fields rather
+# than on a "v2" filename.
+#
+# AND A PLAIN-DECODE SGLANG ARM WOULD NOT BE A SUBSTITUTE. This module already
+# refuses a ratio "between a drafted decode and a plain one" because it
+# "measures the feature" rather than the engine. Running SGLang without a draft
+# and dividing would break the same rule from the other side.
+#
+# The vLLM arm faces exactly this and resolves it by running a BEYOND-PIN wheel
+# that can load `DFlash2DraftModel`, recorded as such. An SGLang arm needs the
+# same: a wheel whose `dflash` model class carries the selector and the grouped
+# convolution. That is an operational input, not a code change here, so this
+# states the blocker and the shape of its discharge.
+SGLANG_AXIS_STATUS = {
+    "measured": False,
+    "reason": (
+        "the pinned SGLang (f63458b5, v0.5.15) registers DFlashDraftModel and "
+        "carries no selector_rank / selector_top_k / conv_group_size, so it "
+        "cannot load this gate's DFlash2DraftModel draft"
+    ),
+    "evidence": "python/sglang/srt/models/dflash.py:579 (EntryClass) at f63458b5",
+    "discharged_by": (
+        "a beyond-pin SGLang wheel whose dflash model class carries the "
+        "candidate selector and the grouped convolution, staged and pinned the "
+        "way the vLLM arm's beyond-pin wheel already is"
+    ),
+    "why_no_substitute": (
+        "an undrafted SGLang arm would make the ratio measure the FEATURE "
+        "rather than the engine, which this module refuses in the other "
+        "direction already"
+    ),
+}
+
+
+def sglang_axis_status() -> dict[str, Any]:
+    """The SGLang half of the goal, and why it carries no number yet."""
+    return dict(SGLANG_AXIS_STATUS)
+
+
 def build_speed_result(
     *,
     ours: Mapping[str, Any],
@@ -1064,6 +1118,9 @@ def build_speed_result(
     return {
         "subject": "SPEC-DFLASH2",
         "issue": "https://github.com/mudler/vllm.cpp/issues/1562",
+        # The goal names TWO denominators. This one carries no number yet, and
+        # says so in the artifact rather than being absent from it.
+        "sglang": sglang_axis_status(),
         "axes": axis_rows(
             ours.get("metrics") or {}, theirs.get("metrics") or {}, floors or {}
         ),

@@ -706,6 +706,41 @@ class SpeedResultTest(unittest.TestCase):
     def good(self) -> tuple[dict, dict]:
         return arm_record(ours=True), arm_record(ours=False)
 
+    # BENCH-DFLASH2-SGLANG-AXIS: the campaign names TWO denominators, vLLM and
+    # SGLang, and this gate has only ever carried one. An arm that is ABSENT and
+    # an arm that measured NOTHING look identical in the emitted result, so the
+    # second half of the goal reads as silence rather than as owed. These pin
+    # that the result DECLARES the SGLang axis and names what would discharge it.
+    def test_the_result_declares_the_SGLANG_axis_and_why_it_is_unmeasured(self) -> None:
+        ours, theirs = self.good()
+        result = harness.build_speed_result(ours=ours, theirs=theirs)
+        self.assertIn("sglang", result)
+        sg = result["sglang"]
+        # Unmeasured, and never silently reported as a zero or a ratio.
+        self.assertFalse(sg["measured"])
+        self.assertNotIn("ratio", sg)
+        # The blocker is NAMED and is checkable in SGLang's own source, not a
+        # vague "unsupported": the pinned tree's model class and the config
+        # fields it lacks.
+        self.assertIn("DFlash2DraftModel", sg["reason"])
+        self.assertIn("selector_rank", sg["reason"])
+        self.assertIn("dflash.py", sg["evidence"])
+        # And what would discharge it, so the next reader does not have to
+        # re-derive that a beyond-pin wheel is the answer.
+        self.assertIn("beyond-pin", sg["discharged_by"])
+
+    def test_an_undrafted_SGLANG_arm_is_named_as_NOT_a_substitute(self) -> None:
+        # The module already refuses a ratio "between a drafted decode and a
+        # plain one" because it measures the FEATURE rather than the engine.
+        # Running SGLang without a draft and dividing would break that rule from
+        # the other side, so the status says so rather than leaving it as an
+        # obvious-looking shortcut for whoever picks this up.
+        sg = harness.sglang_axis_status()
+        self.assertIn("FEATURE", sg["why_no_substitute"])
+        # A caller must not be able to mutate the module's own record.
+        sg["measured"] = True
+        self.assertFalse(harness.sglang_axis_status()["measured"])
+
     def test_a_result_carries_every_axis_and_every_precondition(self) -> None:
         ours, theirs = self.good()
         result = harness.build_speed_result(ours=ours, theirs=theirs)

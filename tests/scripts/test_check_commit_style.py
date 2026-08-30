@@ -132,6 +132,33 @@ class RangeContract(RepositoryTest):
         self.assertTrue(any("authored body" in failure for failure in failures))
         self.assertTrue(any("end in a period" in failure for failure in failures))
 
+    def test_range_base_behind_head_walks_from_the_merge_base(self) -> None:
+        """A base the head has diverged from is walked from its merge base.
+
+        `pull_request.base.sha` stops being an ancestor of head as soon as main
+        advances past the branch. The commits under judgement are still the
+        branch's own: `merge_base(base, head)..head`. The base tip carries a
+        commit head does not contain, which is what makes the range "behind".
+        """
+
+        repo = self.new_repo()
+        base = self.commit(repo, "policy: establish the base", "Explain the base.")
+        git(repo, "switch", "-c", "feature")
+        no_body = self.commit(repo, "policy: omit the body", None)
+        period = self.commit(repo, "policy: end the subject.", "Explain the period.")
+        git(repo, "switch", "main")
+        self.commit(repo, "policy: advance main", "Explain main.")
+        main_tip = git(repo, "rev-parse", "HEAD")
+
+        failures = check_commit_style.validate_range(
+            repo, main_tip, period, cutover=None
+        )
+
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(any(no_body[:12] in failure for failure in failures))
+        self.assertTrue(any(period[:12] in failure for failure in failures))
+        self.assertTrue(all(base[:12] not in failure for failure in failures))
+
     def test_merge_commits_are_excluded(self) -> None:
         repo = self.new_repo()
         base = self.commit(repo, "policy: establish the base", "Explain the base.")
@@ -167,10 +194,14 @@ class RangeContract(RepositoryTest):
         left = self.commit(repo, "policy: advance left", "Explain left.")
         git(repo, "switch", "-c", "right", root)
         right = self.commit(repo, "policy: advance right", "Explain right.")
+        # A genuinely unrelated history: `left` and `right` share `root` as
+        # their merge base and walk from it, so only an orphan branch fails.
+        git(repo, "switch", "--orphan", "isolated")
+        orphan = self.commit(repo, "policy: start an unrelated line", "Explain it.")
 
         cases = (
             ("missing", right, None, "revision"),
-            (left, right, None, "range base must be an ancestor"),
+            (orphan, right, None, "no merge base"),
             (root, right, left, "cutover must be reachable"),
         )
         for base, head, cutover, error in cases:

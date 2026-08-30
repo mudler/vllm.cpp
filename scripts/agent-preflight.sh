@@ -635,11 +635,11 @@ esac
 #
 # The ancestry arm is the one #998 was filed for. It USED to be spelled as a
 # silent `&&` in the condition, so a base that was not an ancestor deleted both
-# gates from the report and the run still printed "All gates green.". The guard
-# itself stays, because check-commit-style.py refuses a non-ancestor base at
-# validate_range (#999 owes that repair, and until it lands, dropping the guard
-# would turn every branch behind main RED instead of honest). What changes is
-# that the skip now SAYS SO and costs the banner.
+# gates from the report and the run still printed "All gates green.". The SKIP
+# arm that replaced it is gone now (#2366): check-commit-style.py walks from
+# the merge base, and `rev-list ${BASE_SHA}..HEAD` selects the branch's own
+# commits under any ancestry, so a branch behind the base runs both gates
+# instead of being told to merge first.
 if [ -z "$BASE_SHA" ]; then
   echo "Commit trailers vs ${BASE_REF}:"
   skip "commit-trailers" "$BASE_UNRESOLVED"
@@ -648,13 +648,6 @@ elif [ "$ANCESTRY_STATUS" -gt 1 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   skip "commit-trailers" "$ANCESTRY_UNKNOWN"
   skip "commit-style" "$ANCESTRY_UNKNOWN"
-elif [ "$ANCESTRY_STATUS" -ne 0 ]; then
-  echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
-  TRAILER_BEHIND="${BASE_REF} ${BASE_SHA} is not an ancestor of HEAD, so this
-branch is behind it and the trailer gates did NOT run. Merge ${BASE_REF} and
-rerun. Neither gate reported anything about this tree."
-  skip "commit-trailers" "$TRAILER_BEHIND"
-  skip "commit-style" "$TRAILER_BEHIND"
 elif [ "$RANGE_STATUS" -ne 0 ] || [ "$RANGE_NUMERIC" -eq 0 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   skip "commit-trailers" "$RANGE_UNKNOWN"
@@ -704,7 +697,8 @@ fi
 
 # Reachable ONLY when both arrays are empty. A skip used to survive this line,
 # which made the banner a claim the run had not earned (#998). The DEFAULT exit
-# status stays 0 for a skip: a branch behind origin/main is ordinary work, and
+# status stays 0 for a skip: a checkout whose base does not resolve is ordinary
+# work, and
 # exit 1 would merge "a gate did not run" into the signal that means "a gate ran
 # and failed". A caller that cannot read the report asks for --fail-on-skip.
 if [ "${#skipped[@]}" -eq 0 ]; then

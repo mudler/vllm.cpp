@@ -87,21 +87,24 @@ void main() {
         if (ax > amax) { amax = ax; maxv = v; }
       }
       sm_reduce[block_id * lpb + lane_in_block] = maxv;
-      barrier();
-      for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
-        if (lane_in_block < s) {
-          float a = sm_reduce[block_id * lpb + lane_in_block];
-          float b = sm_reduce[block_id * lpb + lane_in_block + s];
-          if (abs(b) > abs(a))
-            sm_reduce[block_id * lpb + lane_in_block] = b;
-        }
-        barrier();
+    }
+    barrier();
+    for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
+      if (col_id == 0u && block_id < nb && lane_in_block < s) {
+        float a = sm_reduce[block_id * lpb + lane_in_block];
+        float b = sm_reduce[block_id * lpb + lane_in_block + s];
+        if (abs(b) > abs(a))
+          sm_reduce[block_id * lpb + lane_in_block] = b;
       }
+      barrier();
+    }
+    if (col_id == 0u && block_id < nb) {
       float maxv_final = sm_reduce[block_id * lpb];
       float block_amax = abs(maxv_final);
       if (block_amax > 0.0) {
         float iscale = -127.0 / maxv_final;
         d_act_cache[block_id] = 1.0 / iscale;
+        uint a_base = (p.a_off >> a_shift) + block_id * 256u;
         for (uint i = 0u; i < elems; ++i) {
           uint idx = lane_in_block * elems + i;
           float v = load_act(a_base + idx);

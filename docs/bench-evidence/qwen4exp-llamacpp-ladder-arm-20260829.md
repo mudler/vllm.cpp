@@ -8,7 +8,8 @@ and the RUN half of gateability that
 
 **No vllm.cpp arm ran and no ratio appears anywhere in this file.**
 `ModelRegistry::Forward` still refuses `Qwen4ExpForConditionalGeneration` by name
-(`src/vllm/model_executor/models/qwen4_exp_registry.cpp:174`), so there is no
+(the `VT_CHECK(false, ...)` in `ForwardQwen4ExpForConditionalGeneration`,
+`src/vllm/model_executor/models/qwen4_exp_registry.cpp:266`), so there is no
 second arm to compare against and nothing here is a result. This file records
 the denominator side being made ready, correct and provable, so that the A/B is
 one lease away rather than one campaign away.

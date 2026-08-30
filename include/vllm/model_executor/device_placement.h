@@ -135,6 +135,16 @@ class MoePlacementPlan {
   bool PlacesAnything() const { return placed_ > 0; }
 
   int64_t placed_layer_count() const { return placed_; }
+
+  // How many layers this plan was RESOLVED against. On an engine whose device is
+  // the placement target — a CPU engine under `cpu_moe`, the ordinary case in a
+  // CPU-only build — an installed plan and a never-installed one agree on every
+  // other accessor: both answer the engine device and both place nothing. This is
+  // the one observable that separates "resolved against THIS model" from "never
+  // installed", which is exactly what the reachability gate has to see (#2314).
+  int64_t resolved_layer_count() const {
+    return static_cast<int64_t>(per_layer_.size());
+  }
   vt::DeviceType engine_device() const { return engine_device_; }
 
   // One line for the install log, empty when nothing is placed.

@@ -193,6 +193,50 @@ void ReportDevicePlacement(vt::DeviceType engine_device) {
   std::cerr << "engine: device placement: " << described << std::endl;
 }
 
+// ENG-HYBRID-PLACEMENT (#2314): INSTALL the resolved plan, which is the step that
+// makes every part above actually move a weight.
+//
+// W2's neighbour comment says it "RESOLVES AND REPORTS; IT MOVES NOTHING ... W3
+// owns the routing that reads it". W3 built that routing — the `RunMoePlaced`
+// seam and five architectures on it — and never added this call, so the seam read
+// a global nothing ever wrote. `ActiveMoePlacementPlan()` returned the default on
+// every load, `PlacesAnything()` was always false, and NO expert was ever placed.
+//
+// THE ANNOUNCEMENT IS WHY THAT SURVIVED. `ReportDevicePlacement` prints the
+// RESOLVED plan, so an operator running `VT_CPU_MOE=1` read
+// "device placement: N layers on cpu" on stderr and had every reason to believe
+// it. A token gate cannot see it either: with nothing placed the placed arm is
+// byte-identical to the unplaced one, so it passes for the wrong reason.
+//
+// UNCONDITIONAL, including when nothing is placed. The plan lives in a
+// process-wide global, so a second load in the same process must overwrite the
+// first model's plan rather than inherit it; an early return on "no overrides"
+// would leave a stale placement installed against the wrong model.
+void InstallMoePlacementPlan(vt::DeviceType engine_device,
+                             int64_t num_hidden_layers) {
+  const vllm::MoePlacementPlan plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(vllm::ResolvePlacementOverrides(),
+                                           engine_device),
+      num_hidden_layers);
+  vllm::SetActiveMoePlacementPlan(plan);
+
+  // Printed FROM THE INSTALLED PLAN, and this is the distinction that matters
+  // rather than a duplicate of `ReportDevicePlacement`. That line prints what
+  // RESOLVED, so it appeared unchanged through the whole period when nothing was
+  // installed and nothing was placed — it is what made #2314 invisible to the one
+  // signal an operator checks. This line cannot appear unless the plan reached
+  // the seam's global, so a gate can distinguish a real placement from a vacuous
+  // one, which a token comparison alone cannot do.
+  //
+  // Only when it actually places, so an ordinary load stays byte-identical on
+  // stderr.
+  if (plan.PlacesAnything()) {
+    std::cerr << "engine: device placement INSTALLED: " << plan.Describe()
+              << " (resolved against " << plan.resolved_layer_count()
+              << " layers)" << std::endl;
+  }
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
@@ -2460,6 +2504,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
     const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // #2314: before ANY weight I/O, so a CPU-placed layer is never staged onto
+    // the device first — `ResidentWeight` aliases host bytes on a CPU `Dev` and
+    // uploads otherwise, so this ordering is what makes the placement free
+    // rather than a round trip.
+    InstallMoePlacementPlan(
+        ResolveModelDeviceType(gguf_arch.architecture, params.device),
+        config.num_hidden_layers);
     // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
     // device, here, before any weight I/O and before the tokenizer.
     //
@@ -2870,6 +2921,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   }
   HfConfig config = vllm::LoadHfConfig(config_path);
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
+  // #2314, and see the GGUF branch above for why this precedes weight I/O.
+  InstallMoePlacementPlan(
+      ResolveModelDeviceType(registration.architecture, params.device),
+      config.num_hidden_layers);
   // ENG-WEIGHT-OFFLOAD totality guard. Refuse a configured offload against a
   // model whose loader does not consult the offloader, BEFORE any weight I/O.
   // Without this the budget would be accepted and free nothing, with no error

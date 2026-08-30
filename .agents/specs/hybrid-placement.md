@@ -464,6 +464,50 @@ under `-Werror` on the now-unused parameters, and the stale binary reported
 the evidence; the build's exit code is part of it.
 
 
+### W3e — the INSTALL, which is what made any of it move a weight ([#2314](https://github.com/mudler/vllm.cpp/issues/2314))
+
+W1 landed the config, W2 the resolution and the report, W3 the seam and the
+architectures. `SetActiveMoePlacementPlan` was called by **nothing in `src/`**.
+The seam read a process-global no production path ever wrote, so
+`ActiveMoePlacementPlan()` returned the default on every load,
+`PlacesAnything()` was always false, and **no expert was ever placed on the
+CPU** on any architecture.
+
+W2's own comment names the seam of it: "W2 RESOLVES AND REPORTS; IT MOVES
+NOTHING ... W3 owns the routing that reads it." W3 built the routing and never
+added the call between them.
+
+**Two things hid it for three work items.** The loader PRINTS
+`engine: device placement: N layers on cpu` from the RESOLVED plan, so the one
+signal an operator would check confirmed a feature that was not running. And a
+token gate cannot see it: with nothing placed, the placed arm is byte-identical
+to the unplaced arm, so the end-to-end comparison this row owed would have
+PASSED for the wrong reason and been recorded as the feature working.
+
+`LoadedEngine::FromModelDir` now installs the plan on both the GGUF and
+safetensors paths, at each branch's config parse — the first point where the
+engine device and `num_hidden_layers` are both known, and still ahead of all
+weight I/O, which is required rather than tidy: `ResidentWeight` aliases host
+bytes on a CPU `Dev` and uploads otherwise, so installing after the upload would
+pay exactly the round trip the placement exists to avoid.
+
+The install is UNCONDITIONAL, including when nothing is placed. The plan is a
+process-global, so a second load in the same process must overwrite the first
+model's plan; an early return on "no overrides" would leave a stale placement
+pointed at the wrong model. `test_placement_reach`'s second case asserts that
+directly, by installing a 64-layer plan and requiring the next load to re-resolve
+against its own depth.
+
+`MoePlacementPlan::resolved_layer_count()` is new and exists for the gate. In a
+CPU-only build the engine device IS the placement target, so an installed plan
+and a never-installed one agree on every other accessor — both inert, correctly.
+The layer count the plan was resolved against is the one observable that
+separates them.
+
+**Proved by the reachability mutation, not by reading.** Deleting both call sites
+— with the definition kept and `[[maybe_unused]]` so the mutant COMPILES, rc=0
+and zero errors — turns `test_placement_reach` red at 2 cases and 3 assertions.
+
 ## Risks and decisions
 
 - **The bandwidth ratio is assumed, not measured.** Every number in that table comes

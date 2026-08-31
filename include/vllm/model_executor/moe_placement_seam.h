@@ -103,7 +103,11 @@ dense_attn::DBuf RunMoePlaced(dense_attn::Dev engine, int64_t layer_index,
   if (placed_on == engine_device) {
     // THE UNPLACED PATH, and it is the existing call with nothing around it: no
     // copy, no allocation, and the value the architecture already produced.
-    return body(engine, dh);
+    dense_attn::DBuf out = body(engine, dh);
+    // Inert unless VT_PLACEMENT_DUMP_MOE is set; this is the gate's reference arm.
+    MaybeDumpMoeBlockOutput(layer_index, engine.b, engine.q, out.t().data, T * H,
+                            /*data_is_host=*/false);
+    return out;
   }
 
   const size_t bytes = static_cast<size_t>(T) * static_cast<size_t>(H) *
@@ -128,6 +132,9 @@ dense_attn::DBuf RunMoePlaced(dense_attn::Dev engine, int64_t layer_index,
   // the result exactly as it owns an unplaced block's output.
   placed.b.Copy(placed.q, staging.data(), placed_out.t().data, bytes);
   placed.b.Synchronize(placed.q);
+  // The measured arm. `staging` is already host memory, so this costs no copy.
+  MaybeDumpMoeBlockOutput(layer_index, engine.b, engine.q, staging.data(), T * H,
+                          /*data_is_host=*/true);
   return dense_attn::DBuf(engine, vt::DType::kBF16, {T, H}, staging.data());
 }
 
@@ -163,7 +170,12 @@ MoePlacedOutput RunMoePlacedPair(dense_attn::Dev engine, int64_t layer_index,
         ". Refusing rather than placing them anyway, because that would be "
         "slower than not placing and a token gate would not show it.");
   }
-  if (placed_on == engine_device) return body(engine, dh);
+  if (placed_on == engine_device) {
+    MoePlacedOutput out = body(engine, dh);
+    MaybeDumpMoeBlockOutput(layer_index, engine.b, engine.q, out.tensor.data,
+                            T * H, /*data_is_host=*/false);
+    return out;
+  }
 
   const size_t bytes = static_cast<size_t>(T) * static_cast<size_t>(H) *
                        vt::SizeOf(vt::DType::kBF16);
@@ -178,6 +190,8 @@ MoePlacedOutput RunMoePlacedPair(dense_attn::Dev engine, int64_t layer_index,
 
   placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
   placed.b.Synchronize(placed.q);
+  MaybeDumpMoeBlockOutput(layer_index, engine.b, engine.q, staging.data(), T * H,
+                          /*data_is_host=*/true);
   dense_attn::DBuf back(engine, vt::DType::kBF16, {T, H}, staging.data());
 
   MoePlacedOutput r;

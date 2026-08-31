@@ -508,6 +508,46 @@ separates them.
 — with the definition kept and `[[maybe_unused]]` so the mutant COMPILES, rc=0
 and zero errors — turns `test_placement_reach` red at 2 cases and 3 assertions.
 
+### W3f — the e2e gate RAN, and its invariant was wrong ([#2314](https://github.com/mudler/vllm.cpp/issues/2314))
+
+**Hybrid offload works end to end.** Qwen3.6-35B-A3B bf16 on GB10, engine
+`cuda`, `--offload-config '{"vllm_cpp":{"placement":{"cpu_moe":true}}}'`,
+announced by the loader as `40 layers run their routed experts on cpu, the rest
+on cuda (resolved against 40 layers)`. Both arms exit 0 and both answer the
+prompt correctly. This is the first execution of the placed branch on a real
+model, and it was only possible after W3e installed the plan.
+
+**The token gate this row owed asserts something unachievable, and the first run
+proved it.** The completions share a prefix and diverge mid-sentence:
+
+- unplaced: `Paris, a city renowned for its rich history, culture, and iconic landmarks`
+- placed: `Paris, a city renowned for its iconic landmarks such as the Eiffel Tower`
+
+Both correct, both fluent. The cause is not a defect. `docs/FEATURES.md` says
+"the round trip is byte-identical to computing in place, mutation-proven", and
+that is true of the DATA MOVEMENT -- which is what the round-trip test proves.
+It says nothing about the ARITHMETIC: a placed layer runs the CPU MoE kernels
+instead of the CUDA ones, and this project's own cross-device bar for reducing
+ops is NMSE <= 5e-4, not bitwise equality
+(`tests/vt/test_backend_cross_device.cpp:11`, "CPU is the oracle"). Greedy
+decode amplifies any perturbation inside that bar into a different token
+eventually. llama.cpp's `-ncmoe` diverges the same way.
+
+I designed the gate on the first sentence and did not check it against the
+second. The gate was red for a defect in the gate.
+
+**The gate now measures the gateable claim.**
+`VT_PLACEMENT_DUMP_MOE=<path>` makes the seam write layer 0's MoE block output
+once, on whichever path ran, and the gate computes NMSE between the two arms
+against the 5e-4 bar. Inert unless set: one latched `getenv`, first matching
+call only, no allocation and no copy on the placed path because `staging`
+already holds host bytes.
+
+The instrument precondition is checked BEFORE the comparison, because an absent
+or empty dump would make the arms agree trivially -- the vacuous pass this gate
+was written to refuse. A missing dump is `GATE_RC=2`, never a pass. The
+completions are recorded but no longer asserted.
+
 ## Risks and decisions
 
 - **The bandwidth ratio is assumed, not measured.** Every number in that table comes

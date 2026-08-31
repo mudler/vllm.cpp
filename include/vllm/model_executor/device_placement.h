@@ -180,6 +180,26 @@ vt::Queue& PlacementQueue(vt::DeviceType device);
 // through several model entry points that do not share a config parameter, and
 // threading one through every architecture's signature to serve a feature most
 // loads do not use would be the wider change.
+// Dump layer `layer_index`'s MoE block output, ONCE, when `VT_PLACEMENT_DUMP_MOE`
+// names a file. Exists so the placement correctness gate can compare a PLACED
+// run against an UNPLACED one NUMERICALLY.
+//
+// WHY A NUMERIC COMPARISON AND NOT A TOKEN ONE. A placed layer computes its
+// experts with the CPU MoE kernels instead of the accelerator's, and this
+// project's cross-device bar for reducing arithmetic is NMSE <= 5e-4 rather than
+// bitwise equality (`tests/vt/test_backend_cross_device.cpp`). Greedy decode
+// amplifies any perturbation inside that tolerance into a different token, so
+// placed-vs-unplaced TOKEN equality asserts something unachievable -- measured
+// on GB10, both arms answer the prompt correctly and diverge mid-sentence. The
+// gateable claim is that the block outputs agree within the bar, and this is
+// what lets a gate read them.
+//
+// INERT unless the variable is set: no allocation, no copy, one `getenv` latched
+// on first use. First matching call only, so it costs nothing per token.
+void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
+                             const void* bf16_data, int64_t elems,
+                             bool data_is_host);
+
 void SetActiveMoePlacementPlan(const MoePlacementPlan& plan);
 const MoePlacementPlan& ActiveMoePlacementPlan();
 void ResetActiveMoePlacementPlanForTesting();

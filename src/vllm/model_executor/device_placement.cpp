@@ -3,7 +3,12 @@
 // transcribes. Row `ENG-HYBRID-PLACEMENT`, issue #2023.
 #include "vllm/model_executor/device_placement.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -201,6 +206,53 @@ vt::Queue& PlacementQueue(vt::DeviceType device) {
   auto [pos, inserted] = g.queues.emplace(device, b.CreateQueue());
   (void)inserted;
   return pos->second;
+}
+
+void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
+                             const void* bf16_data, int64_t elems,
+                             bool data_is_host) {
+  // Latched once. An unset variable must cost a load and a branch, not a getenv
+  // per layer per token.
+  static const char* const path = std::getenv("VT_PLACEMENT_DUMP_MOE");
+  if (path == nullptr || path[0] == '\0') return;
+  if (layer_index != 0 || bf16_data == nullptr || elems <= 0) return;
+  // FIRST matching call only. A decode writes this layer once per step, and the
+  // gate compares one step against one step; appending every step would compare
+  // arms that have already diverged in TOKENS and so no longer share an input.
+  static bool done = false;
+  if (done) return;
+  done = true;
+
+  const size_t n = static_cast<size_t>(elems);
+  std::vector<uint16_t> host(n);
+  if (data_is_host) {
+    std::memcpy(host.data(), bf16_data, n * sizeof(uint16_t));
+  } else {
+    b.Copy(q, host.data(), bf16_data, n * sizeof(uint16_t));
+    b.Synchronize(q);
+  }
+
+  std::FILE* f = std::fopen(path, "w");
+  if (f == nullptr) {
+    std::fprintf(stderr,
+                 "engine: VT_PLACEMENT_DUMP_MOE is set but '%s' cannot be "
+                 "opened; the placement gate would compare nothing and read it "
+                 "as agreement, so this says so instead\n",
+                 path);
+    return;
+  }
+  // bf16 -> f32 is an exact widening: the value is the high 16 bits of the
+  // float. Text, because the consumer is a gate script and a binary format
+  // would need a reader that could disagree with this writer.
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t bits = static_cast<uint32_t>(host[i]) << 16;
+    float v;
+    std::memcpy(&v, &bits, sizeof(v));
+    std::fprintf(f, "%.9g\n", static_cast<double>(v));
+  }
+  std::fclose(f);
+  std::fprintf(stderr, "engine: wrote %zu MoE block values for layer 0 to %s\n",
+               n, path);
 }
 
 void SetActiveMoePlacementPlan(const MoePlacementPlan& plan) {

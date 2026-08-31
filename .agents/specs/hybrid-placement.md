@@ -548,6 +548,43 @@ or empty dump would make the arms agree trivially -- the vacuous pass this gate
 was written to refuse. A missing dump is `GATE_RC=2`, never a pass. The
 completions are recorded but no longer asserted.
 
+### W3h — the NMSE gate PASSES, and hybrid offload is correct ([#2382](https://github.com/mudler/vllm.cpp/issues/2382))
+
+Measured on dgx (GB10, `sm_121`, 31 cubins), Qwen3.6-35B-A3B bf16, engine
+`cuda`, `--offload-config '{"vllm_cpp":{"placement":{"cpu_moe":true}}}'`, with
+the loader announcing `40 layers run their routed experts on cpu, the rest on
+cuda`:
+
+```
+PLACEMENT CONFIRMED
+values=10240  bitwise_identical=9028/10240
+NMSE=1.091e-06   bar=5.000e-04
+GATE_RC=0        PLACEMENT_E2E=PASS
+```
+
+**NMSE is 458x under the bar.** 9028 of 10240 values are bitwise identical and
+the remainder differ inside the cross-device tolerance — the signature of the
+CPU and CUDA MoE kernels agreeing to within their reduction order, not of a
+defect.
+
+Two things this result depends on, both of which had to be fixed first. Without
+W3e's install nothing was placed, so the comparison would have been the unplaced
+arm against itself. And under the ORIGINAL token invariant this same passing run
+reads RED: the completions still diverge mid-sentence. The gate had to measure
+the right quantity before a correct implementation could pass it.
+
+The gated tree is `d8cefafd7`; the merged head `5d3462f4a` differs from it only
+in files the rebase brought from `main`. All five placement sources
+(`moe_placement_seam.h`, `device_placement.{h,cpp}`, `model_loader.cpp`,
+`qwen3_moe.cpp`) are byte-identical between the two, so the verdict covers what
+lands.
+
+**Still owed, unchanged by this pass:** the SPEED axis. GB10 is unified memory,
+so CPU and GPU memory are the same silicon and a placement's throughput benefit
+cannot be measured there at all. That needs a discrete CPU/GPU rig
+([#149](https://github.com/mudler/vllm.cpp/issues/149)). This gate establishes
+CORRECTNESS only.
+
 ### W3g — the seam assumed bf16, and the placed branch is untestable on CPU ([#2383](https://github.com/mudler/vllm.cpp/issues/2383))
 
 The seam hardcoded `vt::DType::kBF16` in six places and never compared it with

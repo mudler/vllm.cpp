@@ -153,7 +153,7 @@ codebooks aliased to the CPU tables — a transcription proof, NOT a device run)
 
 | leg | result |
 |---|---|
-| baseline, 18 codecs | 0 mismatches, max\|diff\| 0, ~14.2 M elements |
+| baseline, 18 codecs | 0 mismatches, max\|diff\| 0, 13,428,192 elements |
 | baseline, gather kernel | 0 mismatches over an IQ4_NL [13, 160] table |
 | M2 — drop the Q4_K sub-block minimum | **RED**, 457,498 of 968,192, max\|diff\| 4.0295e+06 |
 | M4 — stride the block by ELEMENTS not BYTES | **RED**, 896 of 1120 gather elements |

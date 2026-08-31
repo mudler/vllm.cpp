@@ -6238,12 +6238,16 @@ All six mutations were re-run after this refactor.
   default, so a caller cannot disable the guard by saying nothing — and refuses
   BY NAME ahead of any tensor I/O.
 
-  **KGATHER WROTE THAT KERNEL** ([`cuda-quant-gather.md`](cuda-quant-gather.md)).
-  `EmbeddingKernelCuda` decodes a block row on the device across all 18
-  encodings `vt::cpu::BlockToFloat` decodes, `DeviceQuantGatherSupported` admits
-  `kCUDA`, and the sentence above — "true for `kCPU` alone" — is true only of
-  METAL, VULKAN, ROCM and TENSTORRENT now. The guard itself is UNCHANGED and
-  still refuses those four by name. **What KGATHER does NOT do:** it removes the
+  **KGATHER WROTE THAT KERNEL, AND DID NOT FLIP THE GATE**
+  ([`cuda-quant-gather.md`](cuda-quant-gather.md)). `EmbeddingKernelCuda` decodes
+  a block row across all 18 encodings `vt::cpu::BlockToFloat` decodes, so
+  `vt::Embedding` on a CUDA queue no longer throws on a block table. But
+  `DeviceQuantGatherSupported` still returns true for `kCPU` alone: the one-line
+  flip fails `check-device-leakage.py`, which forbids naming a device in the
+  device-agnostic loader, and closing it properly needs an `OpId` for the block
+  gather so the loader can ask the registry instead. The sentence above therefore
+  still stands as written, and this model still refuses on every non-CPU device.
+  The guard itself is UNCHANGED. **What KGATHER does NOT do:** it removes the
   LOAD-side blocker and produces no token on a GPU, because no `qwen4_exp` op
   reaches a CUDA queue (W6-CUDA landed four arms; `vt::RmsNormGroup`, the QSA
   block and the rest are still host-only, and `ModelRegistry::Forward` is
@@ -6252,7 +6256,7 @@ All six mutations were re-run after this refactor.
   **Still owed after KGATHER, and named rather than implied:**
   - The ON-DEVICE run of `tests/vt/test_cuda_embedding_quant.cpp`. The 18
     decoders and the gather kernel are proven bit-exact against the CPU arm by a
-    host transliteration check (~14.2 M elements, 0 mismatches, max|diff| 0),
+    host transliteration check (13,428,192 elements, 0 mismatches, max|diff| 0),
     which is a transcription proof and NOT a device run. In particular the
     `__fmul_rn`/`__fsub_rn` contraction argument is argued and unmeasured until
     nvcc has compiled it.

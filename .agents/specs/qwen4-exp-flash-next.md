@@ -6263,11 +6263,14 @@ All six mutations were re-run after this refactor.
   all-or-nothing). It claims no throughput number.
 
   **Still owed after KGATHER, and named rather than implied:**
-  - **sm_121a.** The device gate ran on sm_110 (thor). A `dgx:gpu0` job is queued
-    to confirm the target architecture and to close the one mutation that did not
-    build there (M2, an `-Werror` artifact on an unreferenced local, now fixed).
-    No sm_121a claim is made.
-  - The gather arms of METAL, VULKAN, ROCM and TENSTORRENT.
+  - **sm_121a, and M2 on a device** —
+    [#2393](https://github.com/mudler/vllm.cpp/issues/2393). The device gate ran
+    on sm_110 (thor). A `dgx:gpu0` job is queued to confirm the target
+    architecture and to close the one mutation that did not build there (M2, an
+    `-Werror` artifact on an unreferenced local, now fixed). No sm_121a claim is
+    made.
+  - The gather arms of METAL, VULKAN, ROCM and TENSTORRENT —
+    [#2394](https://github.com/mudler/vllm.cpp/issues/2394).
   - Any performance claim. The decoders read byte-wise for alignment safety and
     one thread decodes a whole block; no benchmark ID moves.
 

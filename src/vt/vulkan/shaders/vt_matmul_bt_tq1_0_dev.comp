@@ -1,8 +1,8 @@
 #version 450
-// vt_matmul_bt_tq1_0_dev: OPTIMIZED v2 — multi-column workgroups, packed uint32
-// weight reads, activation cache, subgroup reduce.
-// Non-grouped keep-quant matmul for TQ1_0 weights with ON-DEVICE Q8_K quantize.
-// ALL barriers are hit by ALL threads (Vulkan spec compliance).
+// vt_matmul_bt_tq1_0_dev: OPTIMIZED v3 — shared-memory weight cache.
+// Multi-column workgroups, packed uint32 weight reads, activation cache,
+// subgroup reduce. Non-grouped keep-quant matmul for TQ1_0 weights with
+// ON-DEVICE Q8_K quantize. ALL barriers are hit by ALL threads (Vulkan spec).
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
@@ -10,6 +10,7 @@
 #include "vt_common.glsl"
 
 #define COLS_PER_WG 4u
+#define W_CACHE_WORDS 16u
 
 layout(local_size_x = 128, local_size_y = COLS_PER_WG, local_size_z = 1) in;
 
@@ -30,6 +31,7 @@ layout(constant_id = 1) const uint VT_TQ_ACT_DT = 0u;
 shared int q8_cache[8][256];
 shared float d_act_cache[8];
 shared float sm_reduce[512];
+shared uint w_cache[COLS_PER_WG][8][W_CACHE_WORDS];
 
 float load_act(uint idx) {
   return (VT_TQ_ACT_DT == VT_DT_F32)
@@ -37,26 +39,26 @@ float load_act(uint idx) {
       : vt_bf16_to_f32(uint(A16.v[idx]));
 }
 
-int tq1_0_trit(uint ae, uint woff) {
+int tq1_0_trit_cached(uint ae, uint col_id, uint block_id, uint woff_align) {
   if (ae < 160u) {
     uint l = ae / 32u; uint m_idx = ae % 32u;
-    uint wb_byte = woff + m_idx;
-    uint w32 = W32.v[wb_byte >> 2];
-    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
+    uint byte_off = woff_align + m_idx;
+    uint w32 = w_cache[col_id][block_id][byte_off >> 2];
+    uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   } else if (ae < 240u) {
     uint l = (ae - 160u) / 16u; uint m_idx = (ae - 160u) % 16u;
-    uint wb_byte = woff + 32u + m_idx;
-    uint w32 = W32.v[wb_byte >> 2];
-    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
+    uint byte_off = woff_align + 32u + m_idx;
+    uint w32 = w_cache[col_id][block_id][byte_off >> 2];
+    uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   } else {
     uint l = (ae - 240u) / 4u; uint j = (ae - 240u) % 4u;
-    uint wb_byte = woff + 48u + j;
-    uint w32 = W32.v[wb_byte >> 2];
-    uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
+    uint byte_off = woff_align + 48u + j;
+    uint w32 = w_cache[col_id][block_id][byte_off >> 2];
+    uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
     uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   }
@@ -93,7 +95,7 @@ void main() {
   uint a_shift = (VT_TQ_ACT_DT == VT_DT_F32) ? 2u : 1u;
 
   for (uint row = 0u; row < p.m; ++row) {
-    // --- Phase 1: amax (col_id==0 does work, ALL threads barrier) ---
+    // Phase 1: amax (col_id==0 does work, ALL threads barrier)
     if (col_id == 0u && block_id < nb) {
       uint a_base = (p.a_off >> a_shift) + row * p.nb * 256u + block_id * 256u;
       float amax = 0.0; float maxv = 0.0;
@@ -106,7 +108,7 @@ void main() {
     }
     barrier();
 
-    // --- Phase 2: reduction (col_id==0 does work, ALL threads barrier) ---
+    // Phase 2: reduction (col_id==0 does work, ALL threads barrier)
     for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
       if (col_id == 0u && block_id < nb && lane_in_block < s) {
         float a = sm_reduce[block_id * lpb + lane_in_block];
@@ -117,7 +119,7 @@ void main() {
       barrier();
     }
 
-    // --- Phase 3: quantize + cache (col_id==0 does work, ALL threads barrier) ---
+    // Phase 3: quantize + cache (col_id==0 does work, ALL threads barrier)
     if (col_id == 0u && block_id < nb) {
       float maxv_final = sm_reduce[block_id * lpb];
       float block_amax = abs(maxv_final);
@@ -138,18 +140,29 @@ void main() {
     }
     barrier();
 
-    // --- Phase 4: dot product (all columns use cached activation) ---
+    // Phase 4: cooperative weight block load into shared memory
     uint w_row = p.w_off + col * p.nb * wbytes;
-    float acc = 0.0;
+    if (block_id < nb) {
+      uint woff = w_row + block_id * wbytes;
+      uint w_base = woff >> 2u;
+      uint nwords = ((woff + wbytes - 1u) >> 2u) - w_base + 1u;
+      for (uint i = lane_in_block; i < nwords; i += lpb) {
+        w_cache[col_id][block_id][i] = W32.v[w_base + i];
+      }
+    }
+    barrier();
 
+    // Phase 5: dot product (all columns use cached activation + cached weights)
+    float acc = 0.0;
     if (block_id < nb && d_act_cache[block_id] != 0.0) {
       uint woff = w_row + block_id * wbytes;
+      uint woff_align = woff & 3u;
       float wd = vt_from16(uint(W16.v[(woff + 52u) >> 1]), VT_DT_F16);
       float blockd = d_act_cache[block_id] * wd;
       int acci = 0;
       for (uint i = 0u; i < elems; ++i) {
         uint ae = lane_in_block * elems + i;
-        acci += q8_cache[block_id][ae] * tq1_0_trit(ae, woff);
+        acci += q8_cache[block_id][ae] * tq1_0_trit_cached(ae, col_id, block_id, woff_align);
       }
       acc = float(acci) * blockd;
     }

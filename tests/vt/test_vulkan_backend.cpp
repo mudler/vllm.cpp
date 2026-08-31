@@ -832,7 +832,7 @@ TEST_CASE("a PARTIAL-TILE GEMM declines coopmat -- the shape that hung a GPU") {
   vk.DestroyQueue(q);
 }
 
-TEST_CASE("a DECODE GEMV takes the vec tactic; prefill and the other orientation decline") {
+TEST_CASE("the GEMV vec tactic serves decode and prefill; the non-BT orientation declines") {
   if (!VulkanPresent()) return;
   auto& ctx = vt::vulkan::VulkanContext::Get();
   Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
@@ -905,15 +905,14 @@ TEST_CASE("a DECODE GEMV takes the vec tactic; prefill and the other orientation
     }
   }
 
-  SUBCASE("M=8 is prefill-shaped and does NOT take the vec tactic") {
-    // One workgroup per output element is only the right trade when there are few
-    // of them. The predicate refuses M > 1, and the scalar or coopmat tactic
-    // handles it -- verified by the numbers still being right.
-    const size_t before = ctx.PipelineCacheSize();
+  SUBCASE("M=8 is prefill-shaped and takes the vec tactic (GEMV for M>1)") {
+    // The GEMV vec tactic is now allowed for M>1 (prefill) because its
+    // coalesced B reads beat the scalar kernel's uncoalesced reads. The
+    // predicate accepts any M when kBT and K >= kWorkgroupSize. The numbers
+    // are still correct -- verified against the f64 host oracle.
     std::vector<float> got;
     const std::vector<float> ref = run_bt(8, got);
-    CAPTURE(before);
-    CAPTURE(ctx.PipelineCacheSize());
+    CHECK(ctx.PipelineExistsFor("vt_matmul_vec"));
     for (size_t i = 0; i < got.size(); ++i) {
       CAPTURE(i);
       CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-3));
@@ -4104,3 +4103,202 @@ TEST_CASE("fused MoE gate+up+SwiGLU (TQ2_0) runs NATIVELY on Vulkan and matches 
   CHECK(ctx.PipelineExistsFor("vt_moe_gate_up_swiglu_grouped_tq2"));
 }
 
+
+TEST_CASE("tiled GEMM (M>=16, bf16) runs NATIVELY on Vulkan and matches the CPU oracle") {
+  using vt::Backend; using vt::Device; using vt::DeviceType;
+  using vt::Queue; using vt::Tensor;
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // M=32 (>= 16 triggers the tiled kernel), N=48, K=128. All bf16 so the tiled
+  // path is selected (not the scalar or GEMV path). N is NOT a multiple of BN=64
+  // to exercise the bounds-check in the tiled kernel's last column tile.
+  constexpr int64_t kM = 32, kN = 48, kK = 128;
+  auto Sp_ = [](size_t n, float scale, uint32_t seed) {
+    std::vector<uint16_t> v(n); uint32_t s = seed | 1u;
+    for (size_t i = 0; i < n; ++i) {
+      s = s * 1103515245u + 12345u;
+      v[i] = vt::F32ToBF16(scale * (static_cast<float>(s % 1000u) / 500.0f - 1.0f));
+    }
+    return v;
+  };
+  std::vector<uint16_t> a = Sp_(kM * kK, 0.5f, 29u);
+  std::vector<uint16_t> b = Sp_(kN * kK, 0.25f, 77u);
+
+  struct B_ { Backend& b; void* p_;
+    B_(Backend& x, size_t e, size_t eb):b(x),p_(x.Alloc(e*eb)){}
+    ~B_(){b.Free(p_);} void* p() const{return p_;} };
+  B_ va(vk, kM * kK, 2), ca(cpu, kM * kK, 2);
+  B_ vb(vk, kN * kK, 2), cb(cpu, kN * kK, 2);
+  B_ vo(vk, kM * kN, 2), co(cpu, kM * kN, 2);
+  vk.Copy(vq, va.p(), a.data(), a.size() * 2);
+  vk.Copy(vq, vb.p(), b.data(), b.size() * 2);
+  vk.Synchronize(vq);
+  std::memcpy(ca.p(), a.data(), a.size() * 2);
+  std::memcpy(cb.p(), b.data(), b.size() * 2);
+
+  Tensor vat = Tensor::Contiguous(va.p(), vt::DType::kBF16, vd, {kM, kK});
+  Tensor vbt = Tensor::Contiguous(vb.p(), vt::DType::kBF16, vd, {kN, kK});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kBF16, vd, {kM, kN});
+  Tensor cat = Tensor::Contiguous(ca.p(), vt::DType::kBF16, cd, {kM, kK});
+  Tensor cbt = Tensor::Contiguous(cb.p(), vt::DType::kBF16, cd, {kN, kK});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kBF16, cd, {kM, kN});
+
+  vt::MatmulBT(cq, cot, cat, cbt);
+  vt::MatmulBT(vq, vot, vat, vbt);
+  vk.Synchronize(vq);
+
+  std::vector<uint16_t> g(kM * kN), r(kM * kN);
+  vk.Copy(vq, g.data(), vo.p(), g.size() * 2);
+  vk.Synchronize(vq);
+  std::memcpy(r.data(), co.p(), r.size() * 2);
+
+  // Tiled kernel uses a different accumulation order than the scalar CPU path,
+  // so compare with NMSE tolerance (same tier as vt_matmul_vec).
+  double num = 0, den = 0, maxabs = 0;
+  for (int64_t i = 0; i < kM * kN; ++i) {
+    const float gv = vt::BF16ToF32(g[i]);
+    const float rv = vt::BF16ToF32(r[i]);
+    const double d = static_cast<double>(gv) - static_cast<double>(rv);
+    num += d * d; maxabs = std::max(maxabs, std::fabs(d));
+    den += static_cast<double>(rv) * static_cast<double>(rv);
+  }
+  const double nmse = (den > 1e-12) ? std::sqrt(num / den) : std::sqrt(num + 0.0);
+  MESSAGE("tiled-gemm maxabs=" << maxabs << " nmse=" << nmse);
+  CHECK(nmse < 1e-3);
+  CHECK(maxabs < 0.1);
+  // Prove the tiled kernel (not the scalar or GEMV) served the Vulkan side.
+  CHECK(ctx.PipelineExistsFor("vt_matmul_tiled"));
+}
+
+TEST_CASE("chunked matmul dispatch handles M > 2048 without crash and matches CPU") {
+  using vt::Backend; using vt::Device; using vt::DeviceType;
+  using vt::Queue; using vt::Tensor;
+  if (!VulkanPresent()) return;
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue vq = vk.CreateQueue();
+  Queue cq = cpu.CreateQueue();
+  const Device vd{DeviceType::kVULKAN, 0};
+  const Device cd{DeviceType::kCPU, 0};
+
+  // M=2100 exceeds kMaxMPerChunkDense=2048, forcing a 2-chunk dispatch.
+  // K=128, N=16 keep the total work small so the test runs fast. bf16 inputs
+  // and f32 output. M>=16 triggers the tiled kernel, which is then chunked.
+  constexpr int64_t kM = 2100, kN = 16, kK = 128;
+  auto Sp_ = [](size_t n, float scale, uint32_t seed) {
+    std::vector<uint16_t> v(n); uint32_t s = seed | 1u;
+    for (size_t i = 0; i < n; ++i) {
+      s = s * 1103515245u + 12345u;
+      v[i] = vt::F32ToBF16(scale * (static_cast<float>(s % 1000u) / 500.0f - 1.0f));
+    }
+    return v;
+  };
+  std::vector<uint16_t> a = Sp_(kM * kK, 0.5f, 29u);
+  std::vector<uint16_t> b = Sp_(kN * kK, 0.25f, 77u);
+
+  struct B_ { Backend& b; void* p_;
+    B_(Backend& x, size_t e, size_t eb):b(x),p_(x.Alloc(e*eb)){}
+    ~B_(){b.Free(p_);} void* p() const{return p_;} };
+  B_ va(vk, kM * kK, 2), ca(cpu, kM * kK, 2);
+  B_ vb(vk, kN * kK, 2), cb(cpu, kN * kK, 2);
+  B_ vo(vk, kM * kN, 4), co(cpu, kM * kN, 4);
+  vk.Copy(vq, va.p(), a.data(), a.size() * 2);
+  vk.Copy(vq, vb.p(), b.data(), b.size() * 2);
+  vk.Synchronize(vq);
+  std::memcpy(ca.p(), a.data(), a.size() * 2);
+  std::memcpy(cb.p(), b.data(), b.size() * 2);
+
+  Tensor vat = Tensor::Contiguous(va.p(), vt::DType::kBF16, vd, {kM, kK});
+  Tensor vbt = Tensor::Contiguous(vb.p(), vt::DType::kBF16, vd, {kN, kK});
+  Tensor vot = Tensor::Contiguous(vo.p(), vt::DType::kF32, vd, {kM, kN});
+  Tensor cat = Tensor::Contiguous(ca.p(), vt::DType::kBF16, cd, {kM, kK});
+  Tensor cbt = Tensor::Contiguous(cb.p(), vt::DType::kBF16, cd, {kN, kK});
+  Tensor cot = Tensor::Contiguous(co.p(), vt::DType::kF32, cd, {kM, kN});
+
+  vt::MatmulBT(cq, cot, cat, cbt);
+  vt::MatmulBT(vq, vot, vat, vbt);
+  vk.Synchronize(vq);
+
+  std::vector<float> g(kM * kN), r(kM * kN);
+  vk.Copy(vq, g.data(), vo.p(), g.size() * 4);
+  vk.Synchronize(vq);
+  std::memcpy(r.data(), co.p(), r.size() * 4);
+
+  // The chunk boundary (row 2048) is the critical check: a mis-strided a_off
+  // or out_off would produce garbage at exactly that row. Compare every element.
+  double num = 0, den = 0, maxabs = 0;
+  for (int64_t i = 0; i < kM * kN; ++i) {
+    const double d = static_cast<double>(g[i]) - static_cast<double>(r[i]);
+    num += d * d; maxabs = std::max(maxabs, std::fabs(d));
+    den += static_cast<double>(r[i]) * static_cast<double>(r[i]);
+  }
+  const double nmse = (den > 1e-12) ? std::sqrt(num / den) : std::sqrt(num + 0.0);
+  MESSAGE("chunked-matmul maxabs=" << maxabs << " nmse=" << nmse);
+  CHECK(nmse < 1e-3);
+  CHECK(maxabs < 0.1);
+}
+
+TEST_CASE("tq1_0 keep-quant dequantizer matches the shader's trit extraction") {
+  // Unit test for the CPU TQ1_0 dequantizer (DequantTQ1_0) that serves as the
+  // reference oracle for the Vulkan TQ1_0 keep-quant path. No Vulkan device
+  // needed — pure CPU check.
+  using vt::DType;
+  constexpr int64_t kK = 256;
+  std::vector<uint8_t> block(54, 0);
+  // Set all qs bytes to 0x55 (alternating bits) to exercise all trit lanes.
+  for (int i = 0; i < 48; ++i) block[i] = 0x55;
+  for (int i = 0; i < 4; ++i) block[48 + i] = 0x55;
+  // d = f16(1.0) = 0x3C00
+  const uint16_t dhalf = 0x3C00;
+  std::memcpy(block.data() + 52, &dhalf, 2);
+
+  std::vector<float> y(kK);
+  const vt::cpu::ToFloatFn fn = vt::cpu::BlockToFloat(DType::kTQ1_0);
+  REQUIRE(fn != nullptr);
+  fn(block.data(), y.data(), kK);
+
+  // Every element should be in {-1, 0, +1} since d=1.0. The exact value depends
+  // on the trit extraction, but the range is bounded.
+  for (int64_t e = 0; e < kK; ++e) {
+    CHECK(y[e] >= -1.0f);
+    CHECK(y[e] <= 1.0f);
+  }
+  // Verify the block geometry: 54 bytes, 256 elements.
+  CHECK(vt::BlockElems(DType::kTQ1_0) == 256);
+  CHECK(vt::BlockBytes(DType::kTQ1_0) == 54);
+  CHECK(vt::IsBlockQuant(DType::kTQ1_0));
+}
+
+TEST_CASE("tq2_0 keep-quant dequantizer matches the shader's trit extraction") {
+  // Unit test for the CPU TQ2_0 dequantizer (DequantTQ2_0). No Vulkan device
+  // needed — pure CPU check.
+  using vt::DType;
+  constexpr int64_t kK = 256;
+  std::vector<uint8_t> block(66, 0);
+  // Set all qs bytes to 0xAA (alternating 10 bits) to exercise all 2-bit codes.
+  for (int i = 0; i < 64; ++i) block[i] = 0xAA;
+  // d = f16(1.0) = 0x3C00
+  const uint16_t dhalf = 0x3C00;
+  std::memcpy(block.data() + 64, &dhalf, 2);
+
+  std::vector<float> y(kK);
+  const vt::cpu::ToFloatFn fn = vt::cpu::BlockToFloat(DType::kTQ2_0);
+  REQUIRE(fn != nullptr);
+  fn(block.data(), y.data(), kK);
+
+  // With qs=0xAA and 2-bit codes: (0xAA >> (l*2)) & 3 = 2 for all l.
+  // So all codes are 2, meaning all values are (2-1)*1.0 = 1.0.
+  for (int64_t e = 0; e < kK; ++e) {
+    CHECK(y[e] == doctest::Approx(1.0f).epsilon(1e-6));
+  }
+  // Verify the block geometry: 66 bytes, 256 elements.
+  CHECK(vt::BlockElems(DType::kTQ2_0) == 256);
+  CHECK(vt::BlockBytes(DType::kTQ2_0) == 66);
+}

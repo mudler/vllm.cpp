@@ -474,10 +474,16 @@ TEST_CASE("vt::RmsNormGroup CUDA agrees with the CPU arm BITWISE on every admitt
 
 TEST_CASE("vt::RmsNormGroup CUDA: many rows and many groups, still bitwise") {
   if (SkipNoCuda("vt::RmsNormGroup CUDA wide fixture")) return;
-  // The goldens are 24- and 15-element rows over 2 or 3 tokens. This fixture is
-  // 4096 threads' worth of (row, group) pairs at a group extent that crosses a
-  // warp, which is what separates "the grid-stride loop is right" from "the four
-  // golden rows happened to fit one block".
+  // The goldens are 24- and 15-element rows over 2 or 3 tokens. This fixture
+  // widens that to a group extent that crosses a warp, which separates "the
+  // indexing is right at a non-warp-multiple extent" from "the four golden rows
+  // happened to fit one block".
+  //
+  // **THE SENTENCE THAT STOOD HERE WAS FALSE AND IS CORRECTED.** It claimed this
+  // fixture is "4096 threads' worth of (row, group) pairs". It is 37 x 7 = 259
+  // pairs, which is ONE block of 256 threads plus three, and it therefore takes
+  // exactly ONE trip of the kernel's grid-stride loop. The case below is the one
+  // that crosses it; this one covers extent, not scale.
   constexpr int64_t T = 37, group = 33, groups = 7, width = group * groups;
   const std::vector<float> x = RandomF32(static_cast<size_t>(T * width), 21u, -8.0f, 8.0f);
   const std::vector<float> w = RandomF32(static_cast<size_t>(width), 22u);
@@ -486,6 +492,40 @@ TEST_CASE("vt::RmsNormGroup CUDA: many rows and many groups, still bitwise") {
                RunOp(DeviceType::kCPU, x, w, T, width, group, 1e-6f, true, DType::kF32,
                      DType::kF32, DType::kF32),
                "rms_norm_group 37x231 group=33");
+}
+
+TEST_CASE("vt::RmsNormGroup CUDA: the GRID STRIDE takes more than one trip") {
+  if (SkipNoCuda("vt::RmsNormGroup CUDA grid stride")) return;
+  // The launcher caps the grid at 4096 blocks of 256 threads, so the kernel's
+  // `idx += gridDim.x * blockDim.x` loop runs once for any fixture under
+  // 1,048,576 (row, group) pairs. EVERY other case in this file is under it --
+  // the goldens are 12 and 24 pairs, and the "wide" case above is 259 -- so a
+  // collapsed stride would have been invisible to all of them.
+  //
+  // This fixture is 4200 x 256 = 1,075,200 pairs, so the second trip is
+  // mandatory and the last 26,624 pairs are written only by it.
+  constexpr int64_t T = 4200, group = 4, groups = 256, width = group * groups;  // width 1024
+  constexpr int64_t pairs = T * groups;
+  static_assert(pairs > 4096 * 256, "the fixture must cross the grid cap");
+  const std::vector<float> x = RandomF32(static_cast<size_t>(T * width), 51u, -4.0f, 4.0f);
+  const std::vector<float> w = RandomF32(static_cast<size_t>(width), 52u);
+  const std::vector<uint8_t> gpu = RunOp(DeviceType::kCUDA, x, w, T, width, group, 1e-6f,
+                                         true, DType::kF32, DType::kF32, DType::kF32);
+  const std::vector<uint8_t> cpu = RunOp(DeviceType::kCPU, x, w, T, width, group, 1e-6f, true,
+                                         DType::kF32, DType::kF32, DType::kF32);
+  std::printf("[MEASURED] rms_norm_group grid stride: %lld pairs over a %d-pair cap\n",
+              static_cast<long long>(pairs), 4096 * 256);
+  CheckBitwise(gpu, cpu, "rms_norm_group 1075200 pairs / grid stride");
+  // A collapsed stride leaves the tail as allocated, and two zeros agree. Assert
+  // the tail was actually written.
+  const float* g = reinterpret_cast<const float*>(gpu.data());
+  double tail = 0.0;
+  for (int64_t i = 4096 * 256 * group; i < T * width; ++i) {
+    tail = std::max(tail, std::fabs(static_cast<double>(g[i])));
+  }
+  std::printf("[MEASURED] rms_norm_group grid-stride tail max = %.9g (0 means never written)\n",
+              tail);
+  CHECK(tail > 0.0);
 }
 
 TEST_CASE("vt::RmsNormGroup CUDA: refusals name the caller's mistake") {

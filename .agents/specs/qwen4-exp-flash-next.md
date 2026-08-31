@@ -7587,16 +7587,23 @@ assertions, 10/120 and 12/351; M1-M7 RED; M8's three-way verdict unchanged
 one device agreeing to the bit is what makes these numbers a measurement rather
 than a sample.
 
-**A CAVEAT ON WHICH TREE, stated because it is the kind of gap this file
-exists to record.** The second run gated `20cd838fd`, and the branch then took
-one further `origin/main` merge before the push, landing at `642c20acf`. Those
-two trees differ in FOUR files, all DeepSeek-V4 dspark
-(`deepseek_v4_dspark.h`, `deepseek_v4.cpp`, `test_deepseek_v4_dspark_entry.cpp`
-and that row's spec), and every one of the NINE files this gate compiles for
-this change -- the three `.cu` arms, both `CMakeLists.txt`, the three suites and
-`qwen4_exp_ple_block.cpp` (M8's target) -- is byte-identical between them,
-verified by `sha256`. So the result transfers to the pushed tree exactly. It was
-NOT re-run a third time on `642c20acf` itself, and that is the honest boundary.
+**A CAVEAT ON WHICH TREE, AND THE FIRST VERSION OF IT DID NOT CARRY.** The
+second run gated `20cd838fd`. The paragraph that stood here argued that the
+result transferred to the pushed head because "the NINE files this gate compiles
+for this change" were `sha256`-identical between the two trees.
+
+**That argument is invalid and a fresh review caught it.** Nine files is not the
+compile closure. `git diff 20cd838fd 6e7d651a7` is SIXTEEN files, and three of
+them are `include/vt/dtype.h`, `src/vt/dtype.cpp` and `src/vt/cpu/cpu_ops.cpp`.
+All three `.cu` arms `#include "vt/dtype.h"`, and `cpu_ops.cpp` holds the CPU
+`RmsNormGroupKernel` this wave's byte gate compares against, so "the nine files
+are identical, therefore the result transfers" does not follow. The disclosure
+recorded separately -- that `F32ToBF16` is byte-identical, that `BF16ToF32` and
+`F16ToF32` differ only by the `AsF32` -> `detail::BitsToF32` rename, and that
+`RmsNormGroupKernel` hashes `0c8067e054b3eca3` either side -- is what actually
+carries the argument, and it is a SEMANTIC argument, so the risk is low rather
+than zero. **The device gate has never run on the pushed head**, and that is the
+honest boundary; the run recorded below closes it.
 
 ##### A conflict-free merge moved the converters this wave's byte gate rests on
 
@@ -7642,8 +7649,20 @@ checkpoint, which the on-disk device-fit guard (issue #1123) cannot see. The
 CUDA gather arm is owed. Load this model with --device cpu.
 ```
 
-So on a CUDA build this architecture **does not load at all**, and the refusal is
-at LOAD time rather than at the first forward. That is a stronger statement than
+So on a CUDA build this architecture **does not load**, and the refusal is at
+LOAD time rather than at the first forward.
+
+**THE REFUSAL IS CONDITIONAL, AND THE SENTENCE ABOVE SAID "AT ALL" WHERE IT
+SHOULD HAVE NAMED THE CONDITION.** `qwen4_exp_weights.cpp` guards it with
+`if (!p.ple.layer_ids_zero_based.empty() && !DeviceQuantGatherSupported(device))`.
+A `qwen4exp` config naming NO PLE layer has no n-gram table, so nothing gathers
+from blocks and nothing is refused. For such a config the load proceeds and
+`vt::Qwen4ExpGatedResidual` and both QSA arms WOULD be dispatched on a CUDA
+queue; `vt::RmsNormGroup` still would not, because all three of its call sites
+are inside `RunQwen4ExpPleBlock`. No published `qwen4exp` checkpoint has that
+shape -- the released UD-IQ1_S names PLE layers -- so this is a reachable path
+with no artifact behind it rather than a live one. It is recorded because
+"does not load at all" is the kind of absolute a reader will rely on. That is a stronger statement than
 M8's, and the two agree: M8 says nothing in production reaches these kernels;
 this says nothing in production can even construct the model that would. Both are
 measured.

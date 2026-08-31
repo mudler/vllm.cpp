@@ -74,7 +74,19 @@
 // by name), which is a separate wave's file territory. `ModelRegistry::Forward`
 // is all-or-nothing, so until that lands NOTHING IN PRODUCTION REACHES THESE
 // KERNELS and their reachability from a production entry point is VACUOUS rather
-// than proven. The spec's `## Owed` names the remaining blocker and the row that
+// than proven.
+//
+// **AND THE LOADER REFUSAL THAT ENFORCES THAT IS CONDITIONAL, WHICH AN EARLIER
+// REVISION OF THIS PARAGRAPH DID NOT SAY.** `qwen4_exp_weights.cpp` refuses a
+// non-CPU device only `if (!p.ple.layer_ids_zero_based.empty() &&
+// !DeviceQuantGatherSupported(device))` -- a `qwen4exp` config that names NO PLE
+// layer has no n-gram table, so nothing gathers from blocks and there is nothing
+// to refuse. For such a config the load proceeds, and `vt::RmsNormGroup`'s three
+// call sites are all inside `RunQwen4ExpPleBlock` so they are still not reached
+// -- but `vt::Qwen4ExpGatedResidual` and both QSA ops are NOT PLE-gated and
+// would be dispatched on a CUDA queue. No published `qwen4exp` checkpoint has
+// that shape, so this is a reachable code path with no artifact behind it, not a
+// live one. The spec's `## Owed` names the remaining blocker and the row that
 // owns the wiring. No token claim and no speed claim.
 #include <doctest/doctest.h>
 

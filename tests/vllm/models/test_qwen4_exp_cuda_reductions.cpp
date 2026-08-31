@@ -39,10 +39,15 @@
 // and CUDA documents up to 2 ulp for `expf` where glibc's is correctly rounded.
 // Every other operation is IEEE-exact or `_rn`, and all four of the CPU arm's
 // reduction ORDERS are preserved (the kernel's header enumerates them), so the
-// arms are EXPECTED to be byte-identical and are deliberately NOT asserted to
-// be: `kUlpTol` is one f32 ulp relative and the cases MEASURE and PRINT the
-// difference, so a future toolkit that moves `exp` is visible as a number rather
-// than as a red gate nobody can read.
+// arms are close but NOT byte-identical, and the gate does not pretend
+// otherwise: it holds them to a bound DERIVED from each fixture's own inputs
+// (see the derivation beside `kExpRelDiff`) and prints the scale-free
+// actual/bound ratio, so a future toolkit that moves `exp` is visible as a
+// number rather than as a red gate nobody can read.
+//
+// **AN EARLIER REVISION USED A FITTED `kUlpTol = 1.20e-7` HERE AND IT FAILED ON
+// CORRECT KERNELS**, by 112% to 290% of its own budget as the selection grew.
+// The derivation replacing it records why; do not reintroduce a constant.
 //
 // `vt::Qwen4ExpGatedResidual` has TWO, and the second is structural. Its three
 // projections go through the shared seam `vt::MatmulBT` — a device GEMM, which
@@ -77,6 +82,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -104,10 +110,72 @@ namespace {
 
 namespace g = qwen4_exp_qsa_goldens;
 
-// ONE f32 ulp relative (2^-23 ~ 1.19e-7) with an absolute floor for the denormal
-// neighbourhood. Justified in the header; never widen it.
-constexpr double kUlpTol = 1.20e-7;
 constexpr double kAbsFloor = 1e-30;
+
+// ─── THE GATHER'S ARM-VS-ARM BOUND IS DERIVED, NOT FITTED ────────────────────
+//
+// **THE VALUE THAT STOOD HERE WAS A TOLERANCE FITTED TO ONE FIXTURE AND IT WAS
+// WRONG.** It read `constexpr double kUlpTol = 1.20e-7` -- "one f32 ulp
+// relative" -- applied as `kAbsFloor + kUlpTol * max|want|`. A fresh review
+// measured this kernel against a faithful copy of the CPU body on `thor:gpu0`
+// under the project's `-ffp-contract=off` pin and it failed at every shape it
+// tried, by a margin that GREW with the selection:
+//
+//   suite geometry, different data   2.384e-07 vs 2.127e-07   112% of budget
+//   |sel| = 202,  head_dim = 32      8.941e-08 vs 4.803e-08   186%
+//   |sel| = 2050, head_dim = 256     4.470e-08 vs 1.542e-08   290%   <- released config
+//   pairs = 9000                     3.576e-07 vs 2.958e-07   121%
+//
+// It fails with a CORRECT KERNEL, which is the worst kind of bound: the file's
+// own "NEVER WIDEN A BOUND TO MAKE A CASE PASS" would then send the next reader
+// hunting a defect that is not there. Two separate errors produced it.
+//
+// FIRST, ONE ULP WAS THE WRONG NUMBER. The sole divergence source is `expf`,
+// and CUDA documents `expf` at **2 ulp**, not 1. A 1-ulp bound on a 2-ulp
+// function derives the wrong way round. Perturbing `exp` by +/-1 ulp on the
+// committed fixture -- HALF what CUDA permits itself -- already took the old
+// bound to 140% of itself.
+//
+// SECOND, AND WORSE, IT SCALED THE WRONG WAY. `out` is a WEIGHTED AVERAGE of
+// the selected value rows, so as the selection grows `max|out|` shrinks toward
+// the mean of `v` while the error does not: the error is governed by how far
+// the value rows sit FROM that mean. A bound proportional to `max|out|` therefore
+// tightens exactly where the true error is unchanged, which is why the overshoot
+// runs 112% -> 186% -> 290% as `|sel|` goes 11 -> 202 -> 2050.
+//
+// ─── THE DERIVATION ──────────────────────────────────────────────────────────
+//
+//   out[d] = SUM_p w_p v_p[d] / SUM_p w_p ,   w_p = exp(s_p - m)
+//
+// The two arms compute the same `s_p` and the same `m` bit for bit -- the dot is
+// sequential ascending f32 on one thread and the max is exact -- so they differ
+// ONLY in `w_p`. Write w_p^cuda = w_p (1 + e_p). Then, to first order in e,
+//
+//   out'[d] - out[d] = SUM_p (w_p/W) e_p (v_p[d] - out[d])
+//   |out'[d] - out[d]| <= max|e| * SUM_p (w_p/W) |v_p[d] - out[d]|
+//                      <= max|e| * max_p |v_p[d] - out[d]|
+//
+// because the weights are a convex combination. THAT is the term the old bound
+// got backwards: `max_p |v_p - out|` is a spread, and it does not shrink as the
+// selection grows. The second-order term is O(e^2) ~ 6e-14 and is dropped.
+//
+// The two arms also round their `|sel|` accumulations differently, because they
+// are adding operands that already differ. The standard bound for `n` f32
+// additions gives each arm at most `n u SUM|terms|` away from the exact sum of
+// its own operands, with `u = 2^-24`; dividing the accumulator by `W` turns
+// `SUM_p w_p |v_p[d]|` into at most `max_p |v_p[d]|`. Two arms, so twice that.
+//
+// Both terms are computed FROM THE FIXTURE'S OWN INPUTS in `CheckGatherDerived`
+// below, per output element. Nothing here is fitted, and the bound follows the
+// data instead of the other way round.
+//
+// `expf`: CUDA documents 2 ulp (CUDA C Programming Guide, single-precision
+// intrinsics table). glibc's `expf` is correctly rounded, so <= 0.5 ulp. A ulp
+// is at most `2^-23` relative, so the worst relative disagreement is
+// `2*2^-23 + 0.5*2^-23`.
+constexpr double kUlpRel = 1.0 / 8388608.0;          // 2^-23, one f32 ulp, relative
+constexpr double kExpRelDiff = 2.5 * kUlpRel;        // CUDA 2 ulp + glibc 0.5 ulp
+constexpr double kUnitRoundoff = 1.0 / 16777216.0;   // u = 2^-24
 // The band both arms of the mixer already live in against the torch golden.
 constexpr double kMixerTol = 1e-5;
 // The bound the CPU compressor is held to against the golden, unchanged here.
@@ -406,8 +474,13 @@ std::vector<float> RunCompress(DeviceType dev, const QsaCase& c, bool round_bf16
 // indexer's. `weights == 1` and `n_head_scale == 1` collapse
 // `DsaIndexerLogits`'s fold to QSA's single `index_head_dim ** -0.5`.
 struct Selection {
-  std::vector<int32_t> block_ids;  // [T, kTopk], ASCENDING, -1 padded
+  std::vector<int32_t> block_ids;  // [T, topk], ASCENDING, -1 padded
   std::vector<int32_t> kv_lens;    // [T]
+  // The geometry travels WITH the selection rather than being read from the
+  // golden fixture's file-scope constants, so a synthetic shape can differ from
+  // it. Every helper below reads these two.
+  int64_t topk = kTopk;
+  int64_t CR = g::kCompressRatio;
 };
 
 Selection RunIndexerCpu(const QsaCase& c) {
@@ -463,16 +536,17 @@ GatherResult RunGather(DeviceType dev, const std::vector<float>& qa,
   r.out.assign(static_cast<size_t>(T * HQ * DH), 0.0f);
   Qwen4ExpQsaAttnArgs args;
   args.scale = 1.0f / std::sqrt(static_cast<float>(DH));
-  args.compress_ratio = g::kCompressRatio;
+  args.compress_ratio = sel.CR;
   if (want_counter) args.keys_visited = &r.keys_visited;
   std::vector<float> qc = qa, kc = ka, vc = va;
   std::vector<int32_t> ids = sel.block_ids, lens = sel.kv_lens;
+  const int64_t topk = sel.topk;
   if (dev == DeviceType::kCPU) {
     Queue q = CpuQ();
     Tensor t_q = MakeTensor(qc.data(), DType::kF32, Cpu(), {T, HQ, DH});
     Tensor t_k = MakeTensor(kc.data(), DType::kF32, Cpu(), {max_kv, HKV, DH});
     Tensor t_v = MakeTensor(vc.data(), DType::kF32, Cpu(), {max_kv, HKV, DH});
-    Tensor t_i = MakeTensor(ids.data(), DType::kI32, Cpu(), {T, kTopk});
+    Tensor t_i = MakeTensor(ids.data(), DType::kI32, Cpu(), {T, topk});
     Tensor t_l = MakeTensor(lens.data(), DType::kI32, Cpu(), {T});
     Tensor t_o = MakeTensor(r.out.data(), DType::kF32, Cpu(), {T, HQ, DH});
     vt::Qwen4ExpQsaGatherAttention(q, t_o, t_q, t_k, t_v, t_i, t_l, args);
@@ -483,7 +557,7 @@ GatherResult RunGather(DeviceType dev, const std::vector<float>& qa,
   DeviceTensor d_q(b, qg.q, DType::kF32, {T, HQ, DH}, qc.data());
   DeviceTensor d_k(b, qg.q, DType::kF32, {max_kv, HKV, DH}, kc.data());
   DeviceTensor d_v(b, qg.q, DType::kF32, {max_kv, HKV, DH}, vc.data());
-  DeviceTensor d_i(b, qg.q, DType::kI32, {T, kTopk}, ids.data());
+  DeviceTensor d_i(b, qg.q, DType::kI32, {T, topk}, ids.data());
   DeviceTensor d_l(b, qg.q, DType::kI32, {T}, lens.data());
   DeviceTensor d_o(b, qg.q, DType::kF32, {T, HQ, DH});
   vt::Qwen4ExpQsaGatherAttention(qg.q, d_o.tensor(), d_q.tensor(), d_k.tensor(),
@@ -496,16 +570,128 @@ GatherResult RunGather(DeviceType dev, const std::vector<float>& qa,
 // The HOST expansion of a device selection, used ONLY to derive the EXPECTED
 // read count and the expected READ SET. It never touches the kernel's counter.
 std::vector<int64_t> ExpandHost(const Selection& sel, int64_t t, int64_t kv_len) {
-  const int64_t CR = g::kCompressRatio;
+  const int64_t CR = sel.CR;
   const int64_t complete = kv_len / CR;
   std::vector<int64_t> out;
-  for (int64_t j = 0; j < kTopk; ++j) {
-    const int64_t b = sel.block_ids[static_cast<size_t>(t * kTopk + j)];
+  for (int64_t j = 0; j < sel.topk; ++j) {
+    const int64_t b = sel.block_ids[static_cast<size_t>(t * sel.topk + j)];
     if (b < 0) break;
     for (int64_t i = 0; i < CR; ++i) out.push_back(b * CR + i);
   }
   for (int64_t p = complete * CR; p < kv_len; ++p) out.push_back(p);
   return out;
+}
+
+// THE DERIVED ARM-VS-ARM GATE for the gather. The bound is computed per output
+// element FROM THE FIXTURE'S OWN INPUTS, exactly as the derivation above states:
+//
+//   bound[t,h,d] = kExpRelDiff * max_p |v_p[d] - out[d]|      (the exp term)
+//                + 2 * |sel| * u * max_p |v_p[d]|             (the accumulation term)
+//
+// The first term does NOT shrink as the selection grows, which is the property
+// the old fitted tolerance got backwards. The second grows with `|sel|`, which
+// is the honest cost of comparing two long f32 accumulations that started from
+// slightly different addends.
+//
+// The WORST RATIO is printed on every run, pass or fail. That number, not the
+// bound, is what a reader should watch: it is scale-free, so a change in the
+// kernel or in the toolchain's `expf` moves it visibly while the bound follows
+// the fixture.
+void CheckGatherDerived(const std::vector<float>& got, const std::vector<float>& want,
+                        const std::vector<float>& va, const Selection& sel, int64_t T,
+                        int64_t HQ, int64_t HKV, int64_t DH, const char* what) {
+  REQUIRE(got.size() == want.size());
+  const int64_t groups = HQ / HKV;
+  double worst_ratio = 0.0, worst_abs = 0.0, at_bound = 0.0;
+  size_t notbit = 0, n_over = 0;
+  int64_t worst_sel = 0;
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t kv_len = sel.kv_lens[static_cast<size_t>(t)];
+    const std::vector<int64_t> rows = ExpandHost(sel, t, kv_len);
+    const double n = static_cast<double>(rows.size());
+    for (int64_t h = 0; h < HQ; ++h) {
+      const int64_t kvh = h / groups;
+      for (int64_t d = 0; d < DH; ++d) {
+        const size_t o = static_cast<size_t>((t * HQ + h) * DH + d);
+        const double ref = want[o];
+        double spread = 0.0, mag = 0.0;
+        for (int64_t pr : rows) {
+          const double vv = va[static_cast<size_t>((pr * HKV + kvh) * DH + d)];
+          spread = std::max(spread, std::fabs(vv - ref));
+          mag = std::max(mag, std::fabs(vv));
+        }
+        const double bound =
+            kAbsFloor + kExpRelDiff * spread + 2.0 * n * kUnitRoundoff * mag;
+        const double diff = std::fabs(static_cast<double>(got[o]) - ref);
+        if (std::memcmp(&got[o], &want[o], sizeof(float)) != 0) ++notbit;
+        const double ratio = diff / bound;
+        if (ratio > worst_ratio) {
+          worst_ratio = ratio;
+          worst_abs = diff;
+          at_bound = bound;
+          worst_sel = static_cast<int64_t>(rows.size());
+        }
+        if (diff > bound) ++n_over;
+      }
+    }
+  }
+  std::printf("[MEASURED] %-44s worst ratio = %.4f (|diff| %.9g vs derived bound %.9g at "
+              "|sel|=%lld); over = %zu/%zu; not-bitwise-equal = %zu/%zu\n",
+              what, worst_ratio, worst_abs, at_bound, static_cast<long long>(worst_sel),
+              n_over, want.size(), notbit, want.size());
+  INFO(what << ": worst actual/derived-bound ratio " << worst_ratio << " (" << n_over
+            << " elements over bound); the bound is computed from the fixture, not fitted");
+  CHECK(n_over == 0);
+}
+
+// ─── A SYNTHETIC FIXTURE, because every scale loop in the golden ones runs ONCE
+//
+// The committed QSA goldens are seq 11 and 23. That makes `|sel|` at most 11
+// against a `kSelTile` of 32, and `T*HQ` at most 92 against a 4096-block grid,
+// so the gather's TILE loop and its GRID-STRIDE loop each take exactly one
+// iteration in every case above. A fresh review proved that is not a
+// hypothetical gap: deleting the cross-tile denominator carry
+// (`cuda_qwen4_exp_qsa.cu`, the `float denom = s_denom;` / `s_denom = denom;`
+// pair) leaves the output BYTE-FOR-BYTE identical at one tile, and collapsing
+// the grid stride to `blockIdx.x` leaves it byte-identical at one grid trip.
+// Both mutations were invisible to the entire committed suite.
+//
+// These fixtures exist to cross those two boundaries. They carry no oracle and
+// they do not need one: the claim is CUDA-vs-CPU agreement under the derived
+// bound, and the CPU arm is gated against the transformers goldens elsewhere.
+struct Synth {
+  int64_t T, HQ, HKV, DH, max_kv;
+  std::vector<float> q, k, v;
+  Selection sel;
+};
+
+Synth MakeSynth(int64_t T, int64_t HQ, int64_t HKV, int64_t DH, int64_t kv_len, int64_t CR,
+                int64_t topk, uint32_t seed) {
+  Synth y;
+  y.T = T; y.HQ = HQ; y.HKV = HKV; y.DH = DH; y.max_kv = kv_len;
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+  auto fill = [&](std::vector<float>& out, size_t n) {
+    out.resize(n);
+    for (auto& x : out) x = dist(rng);
+  };
+  fill(y.q, static_cast<size_t>(T * HQ * DH));
+  fill(y.k, static_cast<size_t>(kv_len * HKV * DH));
+  fill(y.v, static_cast<size_t>(kv_len * HKV * DH));
+  y.sel.topk = topk;
+  y.sel.CR = CR;
+  y.sel.kv_lens.assign(static_cast<size_t>(T), static_cast<int32_t>(kv_len));
+  y.sel.block_ids.assign(static_cast<size_t>(T * topk), -1);
+  const int64_t complete = kv_len / CR;
+  const int64_t nsel = std::min<int64_t>(complete, topk);
+  for (int64_t t = 0; t < T; ++t) {
+    // ASCENDING and inside the complete-block count, which is what the op
+    // requires; taking the FIRST `nsel` blocks keeps the ragged tail live too.
+    for (int64_t j = 0; j < nsel; ++j) {
+      y.sel.block_ids[static_cast<size_t>(t * topk + j)] = static_cast<int32_t>(j);
+    }
+  }
+  return y;
 }
 
 }  // namespace
@@ -609,6 +795,75 @@ TEST_CASE("vt::Qwen4ExpQsaCompress CUDA matches the oracle AND the CPU arm BITWI
   }
 }
 
+TEST_CASE("vt::Qwen4ExpQsaCompress CUDA: the GRID STRIDE takes more than one trip") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaCompress CUDA grid stride")) return;
+  // The compressor caps its grid at 4096 blocks and walks `b += gridDim.x`. Both
+  // golden fixtures have `nb` of 2 and 5, so that loop ran ONCE and a collapsed
+  // stride would have been invisible. 4100 blocks makes the second trip
+  // mandatory, and the last 4 blocks are only written by it.
+  const int64_t D = g::kIndexHeadDim, CR = g::kCompressRatio, rot = g::kRotaryDim;
+  constexpr int64_t kNb = 4100;
+  const int64_t num_keys = kNb * CR;
+  CHECK(kNb > 4096);  // the fixture must cross the cap
+  std::mt19937 rng(31337u);
+  std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+  auto fill = [&](size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = dist(rng);
+    return v;
+  };
+  const std::vector<float> raw = fill(static_cast<size_t>(num_keys * D));
+  const std::vector<float> knw = fill(static_cast<size_t>(D));
+  const std::vector<float> cos = fill(static_cast<size_t>(num_keys * rot));
+  const std::vector<float> sin = fill(static_cast<size_t>(num_keys * rot));
+
+  Qwen4ExpQsaCompressArgs args;
+  args.compress_ratio = CR;
+  args.rotary_dim = rot;
+  args.eps = g::kRmsNormEps;
+  args.round_intermediates_to_bf16 = true;
+
+  std::vector<float> cpu(static_cast<size_t>(kNb * D), 0.0f);
+  {
+    Queue q = CpuQ();
+    std::vector<float> r = raw, w = knw, c = cos, si = sin;
+    Tensor t_raw = MakeTensor(r.data(), DType::kF32, Cpu(), {num_keys, D});
+    Tensor t_knw = MakeTensor(w.data(), DType::kF32, Cpu(), {D});
+    Tensor t_cos = MakeTensor(c.data(), DType::kF32, Cpu(), {num_keys, rot});
+    Tensor t_sin = MakeTensor(si.data(), DType::kF32, Cpu(), {num_keys, rot});
+    Tensor t_out = MakeTensor(cpu.data(), DType::kF32, Cpu(), {kNb, D});
+    vt::Qwen4ExpQsaCompress(q, t_out, t_raw, t_knw, t_cos, t_sin, args);
+  }
+  std::vector<float> gpu(static_cast<size_t>(kNb * D), 0.0f);
+  {
+    Backend& b = vt::GetBackend(DeviceType::kCUDA);
+    QueueGuard qg(b);
+    DeviceTensor d_raw(b, qg.q, DType::kF32, {num_keys, D}, raw.data());
+    DeviceTensor d_knw(b, qg.q, DType::kF32, {D}, knw.data());
+    DeviceTensor d_cos(b, qg.q, DType::kF32, {num_keys, rot}, cos.data());
+    DeviceTensor d_sin(b, qg.q, DType::kF32, {num_keys, rot}, sin.data());
+    DeviceTensor d_out(b, qg.q, DType::kF32, {kNb, D});
+    vt::Qwen4ExpQsaCompress(qg.q, d_out.tensor(), d_raw.tensor(), d_knw.tensor(),
+                            d_cos.tensor(), d_sin.tensor(), args);
+    b.Synchronize(qg.q);
+    d_out.Download(qg.q, gpu.data());
+  }
+  std::printf("[MEASURED] qsa_compress grid stride: %lld blocks over a 4096-block cap\n",
+              static_cast<long long>(kNb));
+  // The compressor has no transcendental, so the byte contract holds at scale
+  // exactly as it does at the golden widths.
+  CheckBitwise(gpu, cpu, "qsa_compress 4100 blocks / grid stride");
+  // A collapsed stride leaves the tail as allocated; two zeros would agree, so
+  // assert the tail is LIVE rather than trusting the comparison alone.
+  double tail = 0.0;
+  for (size_t i = static_cast<size_t>(4096 * D); i < gpu.size(); ++i) {
+    tail = std::max(tail, std::fabs(static_cast<double>(gpu[i])));
+  }
+  std::printf("[MEASURED] qsa_compress grid-stride tail max = %.9g (0 means never written)\n",
+              tail);
+  CHECK(tail > 0.0);
+}
+
 TEST_CASE("vt::Qwen4ExpQsaCompress CUDA: the rope position is the BLOCK'S FIRST token") {
   if (SkipNoCuda("vt::Qwen4ExpQsaCompress CUDA rope-position probe")) return;
   // Taking the block's LAST position instead is a silent one-block phase error
@@ -676,56 +931,127 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA reproduces the oracle and the CPU
     std::printf("[MEASURED] qsa_gather %-12s vs ORACLE relL2 = %.9g  bound = %g\n",
                 c->name.c_str(), l2, kGatherL2);
     CHECK(l2 < kGatherL2);
-    // The arm-vs-arm bound is ONE ULP, not the oracle's: the only divergence
-    // source is `expf`, and the case prints whether it moved at all.
-    CheckWithin(gpu.out, cpu.out, kUlpTol, ("qsa_gather " + c->name + " CUDA-vs-CPU").c_str());
+    // The arm-vs-arm bound is DERIVED from this fixture's own inputs, not a
+    // fitted constant -- see the derivation beside `kExpRelDiff`. The case
+    // prints the scale-free ratio, which is the number to watch.
+    CheckGatherDerived(gpu.out, cpu.out, va, sel, c->seq, HQ, HKV, DH,
+                       ("qsa_gather " + c->name + " CUDA-vs-CPU").c_str());
   }
 }
 
-TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: a sub-budget gather is BIT-IDENTICAL to dense") {
-  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA gather-vs-dense")) return;
-  // llama.cpp #27742 measures a max logit delta of 0.0 over all sub-budget rows.
-  // This is that claim ON THE DEVICE: with every candidate selected the gather
-  // reduces over exactly the dense sequence, in exactly the dense order. It is
-  // the property the kernel's ascending visit order exists for, and it is why
-  // the pass-2 dot is NOT tree-reduced. `want` comes from a DENSE selection
-  // through the same kernel — a different selection, so a different code path
-  // through the expansion — rather than from a second identical call, which
-  // would only say the kernel is deterministic.
-  const QsaCase& c = kSubBudget;
-  const int64_t HQ = g::kNumAttentionHeads, HKV = g::kNumKeyValueHeads, DH = g::kHeadDim;
-  const int64_t CR = g::kCompressRatio;
-  const Selection sel = RunIndexerCpu(c);
-  const std::vector<float> qa = Slice(c.attn_q, c.seq * HQ * DH);
-  const std::vector<float> ka = Slice(c.attn_k, c.seq * HKV * DH);
-  const std::vector<float> va = Slice(c.attn_v, c.seq * HKV * DH);
-
-  // A DENSE selection: every complete block, ascending, for every query.
-  Selection dense = sel;
-  bool any_sub_budget = false;
-  for (int64_t t = 0; t < c.seq; ++t) {
-    const int64_t complete = (t + 1) / CR;
-    int64_t n = 0;
-    for (int64_t j = 0; j < kTopk; ++j) {
-      const int32_t v = (j < complete) ? static_cast<int32_t>(j) : -1;
-      dense.block_ids[static_cast<size_t>(t * kTopk + j)] = v;
-      if (v >= 0) ++n;
-    }
-    // The fixture must actually EXERCISE the claim: if every query already
-    // selected everything, "sub-budget equals dense" is trivially true.
-    int64_t got = 0;
-    for (int64_t j = 0; j < kTopk; ++j) {
-      if (sel.block_ids[static_cast<size_t>(t * kTopk + j)] >= 0) ++got;
-    }
-    if (got == n && complete <= kTopk) continue;
-    any_sub_budget = true;
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: |sel| CROSSES the tile boundary") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA multi-tile")) return;
+  // THE CASE THE COMMITTED SUITE DID NOT HAVE. Pass 2 carries the running
+  // denominator across `kSelTile`-sized tiles through shared memory; at one tile
+  // that carry is dead code, and a fresh review showed deleting it leaves the
+  // output BYTE-FOR-BYTE identical on every golden fixture. Each shape below
+  // spans many tiles, so the carry is load-bearing in all of them.
+  struct Shape { const char* name; int64_t T, HQ, HKV, DH, kv, CR, topk; };
+  const Shape kShapes[] = {
+      // 300 complete blocks -> |sel| = 1200 -> 37 tiles.
+      {"1200 rows / 37 tiles", 2, 2, 1, 32, 1200, 4, 300},
+      // The RELEASED geometry's selection size, at head_dim 64: 2050 -> 64 tiles.
+      {"2050 rows / 64 tiles", 1, 2, 1, 64, 2050, 4, 512},
+      // A tile boundary landed on exactly, plus a ragged tail.
+      {"exactly 2 tiles + tail", 3, 4, 2, 32, 66, 4, 16},
+  };
+  for (const Shape& sh : kShapes) {
+    CAPTURE(std::string(sh.name));
+    const Synth y = MakeSynth(sh.T, sh.HQ, sh.HKV, sh.DH, sh.kv, sh.CR, sh.topk, 909u);
+    const int64_t tiles = (static_cast<int64_t>(ExpandHost(y.sel, 0, sh.kv).size()) + 31) / 32;
+    // The fixture must actually cross a tile, or the case is the old one again.
+    CHECK(tiles > 1);
+    const GatherResult gpu = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false);
+    const GatherResult cpu = RunGather(DeviceType::kCPU, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false);
+    char nm[96];
+    std::snprintf(nm, sizeof nm, "qsa_gather %s", sh.name);
+    std::printf("[MEASURED] %-44s tiles = %lld\n", nm, static_cast<long long>(tiles));
+    CheckGatherDerived(gpu.out, cpu.out, y.v, y.sel, sh.T, sh.HQ, sh.HKV, sh.DH, nm);
   }
-  const GatherResult a =
-      RunGather(DeviceType::kCUDA, qa, ka, va, sel, c.seq, HQ, HKV, DH, c.seq, false);
-  const GatherResult b =
-      RunGather(DeviceType::kCUDA, qa, ka, va, dense, c.seq, HQ, HKV, DH, c.seq, false);
-  INFO("any query strictly below budget: ", any_sub_budget);
-  CheckBitwise(a.out, b.out, "qsa_gather CUDA sub-budget vs dense");
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GRID STRIDE takes more than one trip") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA grid stride")) return;
+  // The launcher caps the grid at 4096 blocks and the kernel walks
+  // `pair += gridDim.x`. Every golden fixture has `T*HQ` <= 92, so that loop ran
+  // ONCE and collapsing it to `blockIdx.x` was byte-identical. 5200 pairs makes
+  // the second trip mandatory: without it, every pair at index >= 4096 keeps the
+  // zero its output buffer was allocated with.
+  constexpr int64_t T = 1300, HQ = 4, HKV = 2, DH = 32, KV = 8, CR = 4, TOPK = 2;
+  const int64_t pairs = T * HQ;
+  CHECK(pairs > 4096);  // the fixture must cross the cap
+  const Synth y = MakeSynth(T, HQ, HKV, DH, KV, CR, TOPK, 4242u);
+  const GatherResult gpu =
+      RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, T, HQ, HKV, DH, y.max_kv, false);
+  const GatherResult cpu =
+      RunGather(DeviceType::kCPU, y.q, y.k, y.v, y.sel, T, HQ, HKV, DH, y.max_kv, false);
+  std::printf("[MEASURED] qsa_gather grid stride: %lld pairs over a 4096-block cap\n",
+              static_cast<long long>(pairs));
+  CheckGatherDerived(gpu.out, cpu.out, y.v, y.sel, T, HQ, HKV, DH,
+                     "qsa_gather 5200 pairs / grid stride");
+  // A collapsed stride leaves the tail as allocated. Assert the tail is LIVE
+  // rather than trusting the comparison alone, since two zeros also agree.
+  double tail_mag = 0.0;
+  for (size_t i = static_cast<size_t>(4096 * DH); i < gpu.out.size(); ++i) {
+    tail_mag = std::max(tail_mag, std::fabs(static_cast<double>(gpu.out[i])));
+  }
+  std::printf("[MEASURED] qsa_gather grid-stride tail max|out| = %.9g (0 means never written)\n",
+              tail_mag);
+  CHECK(tail_mag > 0.0);
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the ROW SET decides, not how it is described") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA row-set invariance")) return;
+  // **THE CASE THAT STOOD HERE WAS VACUOUS AND IS REPLACED.** It read "a
+  // sub-budget gather is BIT-IDENTICAL to dense" and built a `dense` selection
+  // to compare against the indexer's. On `kSubBudget` -- seq 11, CR 4, topk 2 --
+  // every query has `complete = kv_len/4 <= 2 = topk`, so `DsaTopkSelect` takes
+  // its all-select branch and emits ascending: the `dense` buffer it was
+  // compared against was THE SAME BUFFER. It measured determinism, which this
+  // file's own comment already said is insufficient. Its vacuity guard was an
+  // `INFO`, not a `CHECK`, so nothing caught that.
+  //
+  // Running it on `kOverBudget` does not fix it either, and that is worth
+  // stating: above the budget the selection is a STRICT SUBSET of the complete
+  // blocks, so it is not equal to a dense walk and must not be -- that
+  // inequality IS the sparsity this op exists for.
+  //
+  // The non-vacuous form of the same claim is INVARIANCE: two selections that
+  // name the SAME rows through DIFFERENT descriptions must agree to the bit.
+  // Here the two differ in `topk` width, so the kernel's `-1` terminator is met
+  // at a different `j` and the expansion arithmetic runs over a different buffer
+  // stride, while the row set is identical. That is what llama.cpp #27742's
+  // "max logit delta 0.0" claim actually needs: with every candidate selected,
+  // the gather reduces over exactly the dense sequence, in exactly the dense
+  // order. The fixture also spans 7 tiles, so the carry is live.
+  constexpr int64_t T = 2, HQ = 4, HKV = 2, DH = 32, KV = 200, CR = 4;
+  const Synth narrow = MakeSynth(T, HQ, HKV, DH, KV, CR, /*topk=*/50, 77u);
+  Synth wide = MakeSynth(T, HQ, HKV, DH, KV, CR, /*topk=*/64, 77u);
+
+  // The two descriptions must genuinely DIFFER ...
+  CHECK(narrow.sel.topk != wide.sel.topk);
+  CHECK(narrow.sel.block_ids.size() != wide.sel.block_ids.size());
+  // ... and must name exactly the same rows, or the comparison below is not an
+  // invariance claim at all. This is the guard the old case left as an INFO.
+  for (int64_t t = 0; t < T; ++t) {
+    const std::vector<int64_t> a = ExpandHost(narrow.sel, t, KV);
+    const std::vector<int64_t> b = ExpandHost(wide.sel, t, KV);
+    REQUIRE(a == b);
+    REQUIRE(a.size() == static_cast<size_t>(KV));  // every row, i.e. the dense prefix
+  }
+  const int64_t tiles = (KV + 31) / 32;
+  CHECK(tiles > 1);
+
+  const GatherResult a = RunGather(DeviceType::kCUDA, narrow.q, narrow.k, narrow.v,
+                                   narrow.sel, T, HQ, HKV, DH, narrow.max_kv, false);
+  const GatherResult b = RunGather(DeviceType::kCUDA, wide.q, wide.k, wide.v, wide.sel, T,
+                                   HQ, HKV, DH, wide.max_kv, false);
+  std::printf("[MEASURED] qsa_gather row-set invariance: topk %lld vs %lld over %lld tiles\n",
+              static_cast<long long>(narrow.sel.topk), static_cast<long long>(wide.sel.topk),
+              static_cast<long long>(tiles));
+  CheckBitwise(a.out, b.out, "qsa_gather CUDA row set vs description");
 }
 
 TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GATHER reads only the selected rows") {

@@ -224,6 +224,24 @@ the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
 does not get one yet; it is listed under `## Owed
 
+- **The compressor's OWN KV projection is not materialized, so W1's composition
+  pools the wrong operand on the real artifact.** Upstream's compressor owns a
+  `fused_wkv_wgate` producing both its KV and its gate from the hidden state
+  (`compressor.py:279-287`), and the artifact stores
+  `attn.compressor.wkv.weight` per compressor layer. This tree accounts that
+  tensor and deliberately does not materialize it, because the collapsed
+  geometry reuses the MLA's `kraw` as the compressor's KV
+  (`deepseek_v4_weights.cpp`, the `Account` comment). `CompressorLayerStep`
+  inherits that convention: correct for the synthetic suites, and on the real
+  artifact it would pool the MLA latent where upstream pools a separate
+  projection -- finite, plausible, and wrong. This is a FOURTH piece W3 needs,
+  beyond the three the forward's refusal names.
+
+- **The indexer's qr projection is UNEXERCISED.** Its shape is accepted and that
+  acceptance is gated, but no test runs a forward to completion with the upstream
+  geometry, because the layer still refuses on `compressor.wkv`. A mutation that
+  always projects from the hidden state passes today.
+
 - **The compressor state's relationship to PREFIX CACHING**, before the runner
   carries it. See the section above: `has_inner_state` is architecture-wide and
   gates prefix caching, while the compressor state is one arm's, and a prefix hit
@@ -386,6 +404,54 @@ one token resuming at `kv_base = 7` refuses, a fresh state at 0 is accepted, and
 the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
+
+## W3's core mechanism: the coff == 2 overlapped gather
+
+`CompressorStepCycle` takes `coff` and implements upstream's gather verbatim
+(`fused_compress_quant_cache.py:169-183`):
+
+    start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    head_offset = (tokens >= COMPRESS_RATIO) * HEAD_SIZE
+
+So `coff * compress_ratio` rows are gathered ending at the boundary, the state row
+is `coff * head_dim` wide, and **a row's ROLE is its index WITHIN THE GATHERING
+WINDOW** -- the first `compress_ratio` positions read the low half, the rest the
+high half. That is precisely what the forward's refusal means by a role "never
+recoverable from the tensor alone", and it is why the tensors are doubled while
+`norm` stays `head_dim`-wide (`compressor.py:288`).
+
+Gated with halves made distinguishable by sign, so the three plausible readings
+give three different numbers: the correct role split pools to -2.0, ignoring
+`head_offset` gives +4.5, and inverting the roles gives +2.0. Three mutations run
+red -- `head_offset` ignored, roles inverted, and only `compress_ratio` rows
+gathered instead of `coff * compress_ratio`. A separate case pins that `coff == 1`
+is byte-unchanged, since every landed gate was written against it.
+
+## W3's first tensor: the indexer's query comes from the q-LoRA
+
+One of the three pieces the forward's refusal names is "the indexer's query
+projected from `qr` (q_lora_rank) instead of the hidden state"
+(`attention.py:721-726`, used at `:835`). `wq_b` is
+`ReplicatedLinear(q_lora_rank, head_dim * n_head)`, so its K is `q_lora_rank`, and
+`qa` in `AttentionBlock` is already `qr` -- the q-LoRA output with `q_norm`
+applied in place, the same operand the main query's `wq_b` consumes.
+
+The forward now dispatches on the weight's own K, so BOTH geometries are
+readable: the artifact's `[inh*ihd, q_lora_rank]` and the collapsed
+`[inh*ihd, hidden_size]` the synthetic suites were written against.
+`RequireDsaGeometryOrRefuse` accepts the upstream shape accordingly, and the
+refusal narrowed by exactly that one tensor -- `compressor.ape`,
+`compressor.wgate.weight` and `indexer.compressor.wkv.weight` still refuse.
+
+**WHAT IS GATED AND WHAT IS NOT, because a mutation drew the line.** Rejecting the
+upstream shape reds, and forcing the qr operand onto the collapsed geometry reds.
+But making the forward ALWAYS project from the hidden state does NOT red anything:
+the only case carrying the upstream geometry asserts on the REFUSAL MESSAGE, and
+that layer still refuses on `compressor.wkv`, so no test ever runs a forward to
+completion with this weight. **The shape is accepted and gated; the projection
+itself is unexercised** until the other two tensors are readable, and it is listed
+under `## Owed` rather than counted as proven.
 
 ## W1's arm is REACHED from production
 

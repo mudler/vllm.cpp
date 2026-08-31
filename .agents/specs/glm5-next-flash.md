@@ -2189,6 +2189,208 @@ device-capable ops, and there is no such compose here to thread a flag through.
 Kimi-Linear's dedicated `kimi_linear_device.cpp` (~2,500 lines) is the
 structural analogue, and it is a campaign rather than a wave.
 
+
+#### W9c — RESCOPED, and the premise the section above rests on is FALSIFIED
+
+`CLAIM-GLM53-FLASH-CUDA`, 2026-08-31, row `MODEL-MM-GLM53-FLASH-CUDA`, issue
+[#2410](https://github.com/mudler/vllm.cpp/issues/2410). This wave writes no
+product code. It is a SCOPING, and it exists because the paragraph above sends
+the next implementer to write a second `kimi_linear_device.cpp` when most of
+what that file would contain is already in this tree and already runs on a GPU.
+
+**The falsified sentence, quoted so it is not softened.** §W9c says the six
+forward files "carry ZERO `vt::Tensor`" and concludes "**This is why the
+DeepSeek-V4 shape does not apply**". Counted on `0b4766c96`, and every count
+and anchor in this section RE-MEASURED after merging `origin/main` at `28d521f90`
+-- because a merge that falsifies its own branch's prose is a failure this
+repository has already paid for:
+
+| file | lines | `vt::Tensor` | `vt::` COMPUTE-op call sites |
+|---|---:|---:|---:|
+| `glm5_next_moe.cpp` | 502 | **15** | **4** |
+| `glm5_next_kda.cpp` | 417 | **10** | **1** |
+| `glm5_next_attn.cpp` | 457 | 0 | 0 |
+| `glm5_next_dsa.cpp` | 534 | 0 | 0 |
+| `glm5_next_layer.cpp` | 414 | 0 | 0 |
+| `glm5_next_forward.cpp` | 370 | 0 | 0 |
+| `glm5_next_mhc.cpp` | 89 | 0 | 0 |
+| **total** | **2,783** | **25** | **5** |
+
+So the claim holds for 1,864 lines and is false for 919. The MoE arm builds
+`vt::Tensor` views and calls four device-capable ops
+(`glm5_next_moe.cpp:131,137,264,497`); the KDA arm builds them and calls
+`vt::KdaGatedDeltaRule` (`glm5_next_kda.cpp:404`). Both are then held on the
+host by an explicit CPU-only refusal — `glm5_next_kda.cpp:322-325` and
+`glm5_next_moe.cpp:222-225` — and NOT by an absence of device arithmetic. That
+is a different obstacle with a different cost, and W9a landing the MoE onto
+`vt::MoeGateUpSwiGLUGrouped` is what moved it.
+
+**EVERY primitive family this model needs already has a registered CUDA
+provider.** Registration is `vt::RegisterOp(OpId, DeviceType, fn)`
+(`include/vt/op_provider.h:127`), looked up by `vt::GetOp`
+(`op_provider.h:141`). Read on `0b4766c96`:
+
+| family | op | CUDA provider | CPU provider |
+|---|---|---|---|
+| KDA | `vt::KdaGatedDeltaRule` | `cuda_gdn.cu:6647-6649` | `cpu_ops.cpp:3936-3938` |
+| KDA | `vt::KdaChunkPrefill` | `cuda_gdn.cu:6650-6652` | `cpu_ops.cpp:3939-3940` |
+| MLA | `vt::MlaDecodeAttention` | `cuda_mla_attn.cu:805-806` | `cpu_mla_attn.cpp:221-222` |
+| MLA | `vt::MlaPrefillAttention` | `cuda_mla_prefill.cu:456-457` | `cpu_mla_prefill.cpp:275` |
+| DSA | `vt::DsaIndexerLogits` | `cuda_dsa_indexer.cu:320-321` | `cpu_dsa_indexer.cpp:184-185` |
+| DSA | `vt::DsaTopkSelect` | `cuda_dsa_indexer.cu:322` | `cpu_dsa_indexer.cpp:186` |
+| MoE | `vt::MoeRouterTopK` | `cuda_moe.cu:935-936` | `cpu_ops.cpp:3965-3966` |
+| MoE | `vt::MoeCombine` | `cuda_moe.cu:937-938` | `cpu_ops.cpp:3967` |
+| MoE | `vt::MoeGateUpSwiGLUGrouped` | `cuda_quant_dot.cu:2380` | `cpu_quant_gemm.cpp:308` |
+| MoE | `vt::MatmulBTQuantGrouped` | `cuda_quant_dot.cu:2161` | `cpu_quant_gemm.cpp:306` |
+| base | `vt::RmsNorm` | `cuda_ops.cu:3916-3917` | `cpu_ops.cpp:3858-3859` |
+| base | `vt::Matmul` / `vt::MatmulBT` | `cuda_matmul.cu:1221-1224` | `cpu_ops.cpp:3849-3852` |
+| base | `vt::Embedding` | `cuda_ops.cu:3930` | `cpu_ops.cpp:3898-3899` |
+| base | `vt::RopeNeox` | `cuda_ops.cu:3932-3933` | `cpu_ops.cpp:3900` |
+
+**No kernel in this campaign has to be written FOR CORRECTNESS.** The remaining
+work is to call ops that already exist from a compose that does not. That is the
+correction: the debt is a PORT, not a kernel campaign, and pricing it as the
+latter is what §W9c did.
+
+**Read that as a correctness claim and not a speed one, because two named speed
+debts survive it unchanged.** O14 already records that `vt::KdaChunkPrefill`
+cannot serve this model at all -- it fuses the SOFTPLUS forget-gate branch and
+this model needs the SIGMOID one -- so both prefill and decode run
+`vt::KdaGatedDeltaRule` for 34 of 45 layers, on device exactly as on host. §Our
+baseline "KDA" records a second cliff for the 64-head geometry. Neither is
+closed by having a CUDA provider, and O6 stays exactly as written: this campaign
+still publishes no number on any axis, and there is still no denominator.
+
+**THE BIGGEST REUSE IS THIS MODEL'S OWN SIBLING, AND §W9c DOES NOT MENTION IT.**
+`GlmMoeDsaForCausalLM` — the `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm`
+row §"Why this needs a spec before code" warns not to merge with this one — has
+a WORKING DEVICE FORWARD for the DSA/MLA block. `GlmResidentMla(Dev d, ...)`
+(`glm_moe_dsa_forward.cpp:157`) builds `mla::MlaBlockWeights` and drives
+`mla::ForwardMlaAttentionBlock`, which calls `vt::DsaIndexerLogits` and
+`vt::DsaTopkSelect` on the `Dev`'s queue (`mla_attention.cpp:920-921`) and
+`vt::MlaDecodeAttention` (`:1083`).
+
+**That seam ALREADY ADMITS THIS MODEL'S GEOMETRY, and O11 is why.**
+`MlaBlockDims::Validate` accepts `qk_rope_head_dim == 0` as the absent state of
+the decoupled rotary (`mla_attention.cpp:96,128`) — a relaxation W3
+([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) landed FOR THIS ROW.
+So the shared MLA block was widened to fit `glm5_next` a wave ago, and
+`glm5_next_attn.cpp` still does not use it: `grep -n 'mla::\|MlaBlock'` over
+`glm5_next_attn.{h,cpp}` returns NOTHING. The model hand-rolls, in 457 + 534
+host lines, a block this tree already ships, already gates, and already runs on
+a GPU for the sibling architecture.
+
+That is the "parallel path by hand" AGENTS.md §"Shared seams" forbids, and it is
+recorded here as a defect rather than as a design. O33 owns it.
+
+**What this changes about the waves.** The device arm is still not one wave, and
+the honest count is four rather than "a campaign":
+
+- **W9b — keep-quant residency** (GPU, large), unchanged from the section above:
+  stage the 101.24 GiB with `dense_attn::ResidentWeight`
+  (`dense_attn_block.h:181`), whose predicate is `is_cpu()` and whose staging arm
+  is dtype-agnostic over GGUF blocks. The open question stays unified memory, and
+  `V4ResidentExpertBase` (`deepseek_v4.cpp:1807`, the reclaim itself at `:1793`) already answers it with
+  `Synchronize` + `madvise(MADV_DONTNEED)`. NOT started.
+- **W9c-1 — the DSA/MLA block onto `mla::ForwardMlaAttentionBlock`.** Retire
+  `glm5_next_attn.cpp`'s hand-rolled MLA and `glm5_next_dsa.cpp`'s hand-rolled
+  indexer in favour of the seam the sibling already drives, keeping both host
+  references BELOW the fold as the parity operand exactly as
+  `nemotron_h_registry.cpp:204-213` keeps its own. 11 of 45 layers. NOT started.
+- **W9c-2 — lift the two CPU-only refusals** (`glm5_next_kda.cpp:322-325`,
+  `glm5_next_moe.cpp:222-225`) once W9b makes the operands resident, so the KDA
+  and MoE arms reach the CUDA providers they already call. 34 of 45 layers plus
+  every sparse block. NOT started.
+- **W9c-3 — the compose**: `Dev`/`DBuf` (`dense_device_glue.h:42`, `DBuf` `:109`, pool policy `:87`), a
+  device-carrying `ForwardLogits` (`qwen3_5.h:153`, `on_device()` `:166`), the
+  `input.gather_logits` dispatch predicate with a residency clause
+  (`deepseek_v4_registry.cpp:106`), RMSNorm / the embedding gather / the lm_head
+  chunk onto `vt::RmsNorm`, `vt::Embedding` and `vt::MatmulBT`, and the mHC
+  sites. This is the wave that deletes the refusal at
+  `glm5_next_forward.cpp:231-238`. NOT started.
+
+**mHC is the ONE family with a real gap, and it is small.** `glm5_next_mhc.cpp`
+(89 lines) calls `deepseek_v4_mhc.cpp`'s host functions directly
+(`glm5_next_mhc.h:20-24`) and reaches no op table. `vt::OpId::kDeepseekV4Mhc`
+(`ops.h:294`) is registered on CUDA ONLY (`cuda_deepseek_v4.cu:2102`), has no
+free-function wrapper in `ops.h`, and is reached only through
+`vt::GetOp(kDeepseekV4Mhc, kCUDA)` behind an `OpRegistered` probe
+(`deepseek_v4_device.cpp:15,31`). So the mHC device kernel EXISTS and its CPU
+half does not, which is the mirror image of every other family here. W9c-3 owns
+deciding whether `glm5_next` reaches it through the same probe or the seam grows
+a CPU registration; both are in scope for that wave and neither is settled here.
+
+**In scope for THIS wave.** This section, the O32-O34 entries, the `## Now`
+update, and the device-gate evidence below. No product code. No file under
+`src/`, `include/` or `tests/` changes.
+
+**Out of scope, named so no reader mistakes this for the port.** Every one of
+W9b, W9c-1, W9c-2 and W9c-3. The vision tower (W6). Any speed number: O6 is
+unchanged and there is still no denominator.
+
+**Gates.** `scripts/agent-preflight.sh --fail-on-skip` exits **1**, and the
+single failure is environmental and reproduced three times rather than waved
+past. 136 checks `ok`; `test_cpu_x86_llamacpp_floor` fails
+`test_a_contended_leg_is_discarded_and_never_summarised` in every run, printing
+its own reason: `NO_QUIET_WINDOW after 30s (busy=340% builders=0 load=129.36)`,
+and `load=80.69` / `load=67.72` / `load=141.56` in the three runs. The dev box
+carried 13 concurrent preflights and two foreign builds throughout. **The
+attribution is structural, not a judgement call: this change is 313 added lines
+in ONE markdown file and changes nothing under `src/`, `tests/`, `include/` or
+`scripts/`**, so the harness and every input it reads are byte-identical to
+`origin/main`. A contention guard firing on real contention is the test working.
+
+
+**THE DEVICE GATE §W9a LEFT PENDING IS TAKEN, ON `thor:gpu0`, AND IT PASSES.**
+`vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` driven at this
+model's published MoE geometry — E=288, I=2048, H=4096, top-8, P=16 — on all
+four of the artifact's real encoding triples, the CUDA provider asserted against
+the CPU provider `ops.h` names as its golden.
+
+| | |
+|---|---|
+| job | `386accdc-ccf1-4575-81c1-36406a452b1b`, `rc run -d thor:gpu0` |
+| device | NVIDIA Thor, `GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600`, driver 595.78, `compute_cap` 11.0, built `sm_110a` |
+| worker | `rc-worker-n8smh`, aarch64, 14 cores, 122 GiB, `boot_id 7ac96c66-5444-4e67-87d2-3b9f0e44f39a` |
+| source | `git archive` of `0b4766c96`, `src.tar.gz` sha256 `35662b6ad93c…` |
+| binary | `test_cuda_quant_dot` sha256 `a78f2e908e236ebeb9635150bb2555c4968a8bfa5f0f8f9528b17974cb42f900` |
+| the GLM-5.3-Flash geometry case | **1 case, 25 assertions, 0 failed** |
+| the whole `test_cuda_quant_dot` suite | **17 cases, 177,284 assertions, 0 failed** |
+| run | 2026-08-31T14:21:53Z → 14:22:36Z |
+
+25 assertions and not 0 is the part that makes this a result: a doctest filter
+that matches nothing exits 0 with `assertions: 0`, which is a skip wearing a
+pass, and the job reads that line out loud and refuses it rather than reporting
+the exit code. The `static_assert` in the case pins what it is FOR —
+`288 * 2048 * 4096 = 2,415,919,104` elements is past INT32 while every byte
+offset in the same tower still fits, so a 32-bit element count would truncate
+here and nowhere in the E<=4 codebook cases.
+
+**`dgx:gpu0` is still queued and this gate is NOT closed by the `thor` run.**
+`sm_110` and `sm_121a` are different targets and a number from one does not
+transfer to the other; the GB10 leg stays PENDING until its lease returns.
+
+**One fleet fact bounds the END-TO-END test and is recorded here**, because
+which box can ever take the end-to-end test: on `thor:gpu0` (`compute_cap` 11.0,
+read off the device) a CUDA build with `-DVLLM_CPP_FLASH_ATTN=ON` and CUTLASS
+4.5.0 configures to `CUDA FA2 compiled-arch manifest: []` (the manifest line is
+`CMakeLists.txt:2942`) -- FA2's arch table is
+`8.0,8.6,8.7,8.9,12.0a,12.1a` at `cmake/CudaArchFeatures.cmake:349`, and 11.0
+is not in it. MLA prefill on this
+family IS FlashAttention with no fallback beneath it, so the eventual
+`--device cuda` end-to-end test can only ever run on `dgx:gpu0` (`sm_121a`).
+`thor` can still take the MoE geometry gate, which needs no FA2. No end-to-end token claim: the
+parity operand for this model remains O30's ` Paris.` on `dgx:gpu0` with
+`--device cpu` at 195.5 s/token, and this wave does not move it.
+
+**Stop conditions.** If the device gate fails, that is the RESULT and it lands
+as one — §W9a's own stop condition already says an untaken device gate is never
+reported as a pass, and a taken one that reds is a finding about the CUDA
+providers this campaign is about to depend on. If any reading above cannot be
+reproduced on the recorded SHA, STOP: a scoping built on a misread anchor is
+worse than no scoping, and this spec family has been caught with drifted anchors
+before.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -4143,7 +4345,118 @@ Debts this row carries, each visible rather than waived:
   edits this entry and W9a's heading with the number. Recorded here rather than
   invented, because a fabricated issue reference is worse than a missing one.
 
+- **O32 — the device arm is still owed, and it is now owed as FOUR named waves
+  rather than as one unscoped debt.** W9c's rescoping (§W9c "RESCOPED") measures
+  what is left: W9b (keep-quant residency), W9c-1 (the DSA/MLA block onto
+  `mla::ForwardMlaAttentionBlock`), W9c-2 (lifting the two CPU-only refusals at
+  `glm5_next_kda.cpp:322-325` and `glm5_next_moe.cpp:222-225`), and W9c-3 (the
+  compose that deletes the refusal at `glm5_next_forward.cpp:231-238`). None is
+  started. `--device cuda` on this model still refuses by name, and O30's
+  ` Paris.` on `--device cpu` at 195.5 s/token remains the only generation this
+  row has ever observed. Owned by row `MODEL-MM-GLM53-FLASH-CUDA` and tracked by
+  [#2410](https://github.com/mudler/vllm.cpp/issues/2410), which is a REAL issue
+  filed by this wave rather than an inherited number. **The `#1998` and `#2241`
+  this row cites throughout resolve to neither an issue nor a pull request
+  today** (`gh issue view` and `gh pr view` both 404 while `gh issue view 2409`
+  serves, and a `--state all` listing spanning #41..#2409 does not contain
+  them). That observation is recorded and NOT acted on: this exact 404 pattern
+  once got read as mass deletion and written into AGENTS.md as a falsehood, so
+  the correct response is a re-measurement by someone with the forge in front of
+  them, not a sweep that rewrites every citation on this row.
+- **O33 — `glm5_next_attn.cpp` and `glm5_next_dsa.cpp` are a PARALLEL PATH BY
+  HAND around a shared seam that already fits this model.** 991 host lines
+  reimplement an MLA + DSA-indexer block that `mla::ForwardMlaAttentionBlock`
+  already provides, that `MlaBlockDims::Validate` was WIDENED to admit for this
+  row by W3/[#2213](https://github.com/mudler/vllm.cpp/issues/2213)
+  (`mla_attention.cpp:96,128` accept `qk_rope_head_dim == 0`), and that the
+  sibling `GlmMoeDsaForCausalLM` already drives on a GPU
+  (`glm_moe_dsa_forward.cpp:157` → `mla_attention.cpp:920-921,1083`).
+  `grep -n 'mla::\|MlaBlock' glm5_next_attn.{h,cpp}` returns NOTHING. AGENTS.md
+  §"Shared seams" forbids exactly this, so it is recorded as a defect and not as
+  a design. **It is not repaired in flow**: retiring the hand-rolled block is
+  W9c-1's whole scope, it changes the numerics of 11 of 45 layers, and the host
+  reference has to survive below the fold as the parity operand — which is a
+  wave with its own red-first gate, not a small clear fix. W9c-1 owns it.
+- **O34 — the mHC family has a CUDA kernel and NO CPU op registration, which is
+  the mirror image of every other family on this row.**
+  `vt::OpId::kDeepseekV4Mhc` (`ops.h:294`) is registered on CUDA only
+  (`cuda_deepseek_v4.cu:2102`), declares no free-function wrapper in `ops.h`, and
+  is reached only through `vt::GetOp(kDeepseekV4Mhc, kCUDA)` behind an
+  `OpRegistered` probe (`deepseek_v4_device.cpp:15,31`). `glm5_next_mhc.cpp` (89
+  lines) bypasses the op table entirely and calls `deepseek_v4_mhc.cpp`'s host
+  functions directly (`glm5_next_mhc.h:20-24`). So this row's mHC sites have no
+  device path and the tree's mHC kernel has no CPU golden to be gated against
+  from here. W9c-3 owns the decision between reaching the CUDA op through the
+  same probe and growing the seam a CPU registration; this entry records that
+  neither has been chosen and that the choice is not free.
+- **O35 — TWO ANCHORS IN THIS ROW'S OWN DISPATCH BRIEFING WERE WRONG, and they
+  were caught by re-reading rather than by a checker.** `dense_device_glue.h:146`
+  was cited as `DBuf`; `DBuf` is declared at `:109` and `:146` is a line inside
+  its body. `deepseek_v4.cpp:1708-1715` was cited as `V4ResidentExpertBase`;
+  that function is at `:1807` and the `madvise(MADV_DONTNEED)` reclaim it is
+  cited for is at `:1793`. Both are DRIFT rather than fabrication — each points
+  into the right file at a plausible neighbourhood — which is the harder class to
+  spot, because a reader who opens the file sees relevant code and stops. Every
+  anchor in §W9c "RESCOPED" was re-read on `0b4766c96` before it was written
+  down, and this entry exists so the next reader knows that was done rather than
+  assumed. No checker asserts anchor uniqueness in this spec, which is why the
+  count of wrong anchors in this family keeps growing;
+  [#2099](https://github.com/mudler/vllm.cpp/issues/2099)'s lane-pin finding is
+  the same shape one document over.
+
 ## Now
+
+`ACTIVE`, 2026-08-31. **The device arm is a PORT, not a kernel campaign, and
+§W9c said otherwise on a premise this wave falsified.** W9c's rescoping
+(`CLAIM-GLM53-FLASH-CUDA`, row `MODEL-MM-GLM53-FLASH-CUDA`, issue
+[#2410](https://github.com/mudler/vllm.cpp/issues/2410)) writes no product code.
+**O31's and W9a's "no issue number, `gh` is 403 on both identities" is STALE and
+this wave measured it rather than inheriting it**: `gh api user` returns 200 as
+`localai-org-maint-bot`, `gh issue list` and `gh issue view` both serve, and
+#2410 was filed for this row. Whoever reads O31 next should re-measure before
+repeating its block; a recorded forge outage outlives the outage. The row's
+lifecycle state does not move, because O1 does not, and `--device cuda` still
+refuses by name at `glm5_next_forward.cpp:231-238`.
+
+**THREE MEASUREMENTS CHANGED THE PRICE OF THIS DEBT.** §W9c states the six
+forward files "carry ZERO `vt::Tensor`" and draws from it that the DeepSeek-V4
+shape cannot apply. Counted on `0b4766c96`: **25 across 2,783 lines** — 15 in
+`glm5_next_moe.cpp` and 10 in `glm5_next_kda.cpp`, both of which also make **5
+`vt::` compute-op calls** between them. The claim holds for 1,864 lines and is
+false for 919. Second, **every primitive family this model needs already has a
+registered CUDA provider** — KDA, MLA, DSA, all four MoE ops, RmsNorm, Matmul,
+Embedding, RopeNeox — so no kernel in this campaign has to be written FOR
+CORRECTNESS; §W9c carries the table with both providers' `file:line`, and names
+in the same breath the two speed debts a provider does not close (O14's
+chunked-prefill gap, and the 64-head cliff). Third, and the largest
+single reuse, **this model's own sibling already runs the DSA/MLA block on a
+GPU**: `GlmMoeDsaForCausalLM` drives `mla::ForwardMlaAttentionBlock`
+(`glm_moe_dsa_forward.cpp:157` → `mla_attention.cpp:920-921,1083`), and that
+seam was WIDENED to admit this row's NoPE geometry by W3
+([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) — yet
+`glm5_next_attn.cpp` does not reference `mla::` at all. O33 records that as the
+parallel-path-by-hand defect it is.
+
+**What the arm actually costs, as four named waves rather than one debt:** W9b
+keep-quant residency; W9c-1 the DSA/MLA block onto the shared seam (11 of 45
+layers); W9c-2 lifting the two CPU-only refusals so the KDA and MoE arms reach
+the CUDA providers they already call (34 of 45 layers plus every sparse block);
+W9c-3 the compose that deletes the refusal. **None is started**, and O32 says so
+rather than letting the scoping read as progress. mHC is the one family with a
+real gap and it is small and inverted — a CUDA kernel with no CPU registration
+(O34).
+
+**The device gate §W9a left PENDING is TAKEN on `thor:gpu0` and PASSES** — the
+grouped keep-quant seam at this model's published MoE geometry on all four of
+its real encoding triples, 25 assertions in the case and 17 cases / 177,284
+assertions across the suite, with the box, the binary hash and the job id in
+§W9c. **The `dgx:gpu0` leg is still queued and this does not close the gate**:
+`sm_110` and `sm_121a` are different targets. This is the first device evidence
+this row has ever carried.
+
+The next actions are W9b, then W9c-1, and W6 and W7b are unchanged.
+
+### Before the W9c rescoping
 
 `ACTIVE`, 2026-08-31. **The routed-expert GEMM is on the shared keep-quant seam,
 and the device arm is scoped as three waves rather than one debt.** W9a

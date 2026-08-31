@@ -243,6 +243,15 @@ std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
 //   5. `MergeWindowAndCompressed` folds the compressed history in, with NO sink --
 //      the window pass owns it, and a merged denominator may count it once.
 //
+// **`kv` IS THE MLA LATENT, AND THAT IS THE COLLAPSED GEOMETRY'S CONVENTION, NOT
+// UPSTREAM'S.** Upstream's compressor owns a `fused_wkv_wgate` producing BOTH its
+// KV and its gate from the hidden state (`compressor.py:279-287`), and the real
+// artifact stores `attn.compressor.wkv.weight` for exactly that. This tree does
+// not materialize it -- `deepseek_v4_weights.cpp` accounts it and says so -- since
+// the collapsed compressor reuses the MLA's own `kraw`. So on the REAL artifact
+// this function would pool the wrong operand: finite, plausible, and not what
+// upstream pools. Listed under the row's `## Owed`.
+//
 // `state_kv`, `state_score` and `comp_rows` are CARRIED ACROSS STEPS by the
 // caller. The compressor is a state machine, and its failure mode is a plausible
 // value several tokens after the mistake rather than an immediate one.

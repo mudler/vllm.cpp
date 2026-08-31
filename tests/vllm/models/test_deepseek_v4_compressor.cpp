@@ -343,3 +343,89 @@ TEST_CASE("W1: the compressor CYCLE emits at boundaries only, and pools the clos
     CHECK(vs_first > 1e-4 * mag);
   }
 }
+
+// ── W3 (#2286): the coff == 2 OVERLAPPED gathering window ───────────────────
+//
+// `fused_compress_quant_cache.py:169-183`, verbatim:
+//     start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+//     tokens = arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+//     head_offset = (tokens >= COMPRESS_RATIO) * HEAD_SIZE
+// A row's ROLE is its index within the gathering window, not a property of the
+// row, which is why the tensors are doubled and why the refusal message says the
+// role "is never recoverable from the tensor alone".
+
+TEST_CASE("W3: coff == 2 gathers coff*ratio rows and splits their ROLE by index") {
+  const int64_t cr = 4, hd = 2, coff = 2, W = coff * hd;
+  // Each token's state row is [low_half | high_half]. Make the two halves
+  // DISTINGUISHABLE so a wrong head_offset cannot look right: low = +1, high = -1
+  // scaled by the token index.
+  const int64_t T = 8;
+  std::vector<float> kv(static_cast<size_t>(T * W), 0.0f), score(kv.size(), 0.0f);
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t d = 0; d < hd; ++d) {
+      kv[static_cast<size_t>(t * W + d)] = 1.0f + static_cast<float>(t);        // low
+      kv[static_cast<size_t>(t * W + hd + d)] = -(1.0f + static_cast<float>(t)); // high
+    }
+  }
+  // A flat score makes the pool a plain mean over the gathered rows, so the
+  // expected value is computable by hand.
+  for (auto& v : score) v = 0.0f;
+  const std::vector<float> ape(static_cast<size_t>(cr * W), 0.0f);
+  const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = t;
+
+  std::vector<float> st_kv, st_sc;
+  const std::vector<float> emitted = vllm::deepseek_v4::CompressorStepCycle(
+      &st_kv, &st_sc, kv, score, ape, pos, rms, /*eps=*/0.0f, cr, hd, coff);
+
+  // Boundaries at positions 3 and 7, so TWO rows are emitted.
+  REQUIRE(emitted.size() == static_cast<size_t>(2 * hd));
+  // The state carries the FULL doubled row per token.
+  CHECK(st_kv.size() == static_cast<size_t>(T * W));
+
+  // At position 7 the window is tokens 0..7. Indices 0..3 read the LOW half
+  // (values +1..+4), indices 4..7 read the HIGH half (values -5..-8). With a flat
+  // score the pool is the mean of those eight: (1+2+3+4-5-6-7-8)/8 = -2.0.
+  // A gather that ignored head_offset would average +1..+8 = +4.5 instead, and a
+  // gather that inverted the roles would give +2.0 -- all three are distinct.
+  const double mean_second = (1.0 + 2.0 + 3.0 + 4.0 - 5.0 - 6.0 - 7.0 - 8.0) / 8.0;
+  // RMSNorm with unit gamma divides by the row's own RMS; every channel of this
+  // pooled row is identical, so the norm maps it to its own sign.
+  const float got = emitted[static_cast<size_t>(hd)];
+  CHECK(got == doctest::Approx(mean_second < 0 ? -1.0f : 1.0f).epsilon(1e-5));
+  CHECK(mean_second < 0.0);  // the ROLE split is what makes it negative at all
+}
+
+TEST_CASE("W3: coff == 1 is unchanged by the overlap parameter") {
+  // The default must stay byte-identical, or every landed coff==1 gate is
+  // measuring a different function than it was written against.
+  const int64_t cr = 2, hd = 3, T = 4;
+  std::vector<float> kv(static_cast<size_t>(T * hd)), score(static_cast<size_t>(T * hd));
+  for (size_t i = 0; i < kv.size(); ++i) {
+    kv[i] = 0.1f * static_cast<float>(i + 1);
+    score[i] = 0.05f * static_cast<float>((i * 7) % 11);
+  }
+  const std::vector<float> ape(static_cast<size_t>(cr * hd), 0.01f);
+  const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
+  std::vector<int64_t> pos{0, 1, 2, 3};
+
+  std::vector<float> a_kv, a_sc, b_kv, b_sc;
+  const auto def = vllm::deepseek_v4::CompressorStepCycle(&a_kv, &a_sc, kv, score, ape,
+                                                          pos, rms, 1e-6f, cr, hd);
+  const auto one = vllm::deepseek_v4::CompressorStepCycle(&b_kv, &b_sc, kv, score, ape,
+                                                          pos, rms, 1e-6f, cr, hd, 1);
+  REQUIRE(def.size() == one.size());
+  for (size_t i = 0; i < def.size(); ++i) CHECK(def[i] == doctest::Approx(one[i]));
+  CHECK(a_kv == b_kv);
+}
+
+TEST_CASE("W3: a coff outside {1, 2} REFUSES") {
+  const int64_t cr = 4, hd = 2;
+  const std::vector<float> kv(static_cast<size_t>(hd), 0.0f), score(kv.size(), 0.0f);
+  const std::vector<float> ape(static_cast<size_t>(cr * hd), 0.0f);
+  const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
+  std::vector<float> st_kv, st_sc;
+  CHECK_THROWS(vllm::deepseek_v4::CompressorStepCycle(&st_kv, &st_sc, kv, score, ape,
+                                                      {0}, rms, 0.0f, cr, hd, 3));
+}

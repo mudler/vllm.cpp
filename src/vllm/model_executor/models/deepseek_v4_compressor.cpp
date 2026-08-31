@@ -187,29 +187,36 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        const std::vector<float>& ape,
                                        const std::vector<int64_t>& positions,
                                        const std::vector<float>& rms_weight, float eps,
-                                       int64_t compress_ratio, int64_t head_dim) {
+                                       int64_t compress_ratio, int64_t head_dim,
+                                       int64_t coff) {
   VT_CHECK(state_kv != nullptr && state_score != nullptr,
            "CompressorStepCycle: state buffers are required");
   VT_CHECK(compress_ratio > 0 && head_dim > 0,
            "CompressorStepCycle: compress_ratio and head_dim must be > 0");
+  VT_CHECK(coff == 1 || coff == 2,
+           "CompressorStepCycle: coff is 1 + (compress_ratio == 4) and is 1 or 2 "
+           "(compressor.py:247-248)");
   const int64_t T = static_cast<int64_t>(positions.size());
-  VT_CHECK(static_cast<int64_t>(kv.size()) == T * head_dim &&
-               static_cast<int64_t>(score.size()) == T * head_dim,
-           "CompressorStepCycle: kv/score must be [num_tokens, head_dim]");
+  // At `coff == 2` the projections are DOUBLED: a row carries BOTH roles, and the
+  // gather below picks which half each window position reads.
+  const int64_t width = coff * head_dim;
+  VT_CHECK(static_cast<int64_t>(kv.size()) == T * width &&
+               static_cast<int64_t>(score.size()) == T * width,
+           "CompressorStepCycle: kv/score must be [num_tokens, coff*head_dim]");
   VT_CHECK(state_kv->size() == state_score->size(),
            "CompressorStepCycle: the two state buffers must stay in lockstep");
 
   // SAVE: the score carries the position-wrapped APE, the kv does not. Reusing
   // the gated helper rather than re-deriving `position % compress_ratio` here.
   const std::vector<float> scored =
-      CompressorSaveScoreApe(score, ape, positions, T, head_dim, compress_ratio);
+      CompressorSaveScoreApe(score, ape, positions, T, width, compress_ratio);
 
   std::vector<float> emitted;
   for (int64_t t = 0; t < T; ++t) {
-    state_kv->insert(state_kv->end(), kv.begin() + t * head_dim,
-                     kv.begin() + (t + 1) * head_dim);
-    state_score->insert(state_score->end(), scored.begin() + t * head_dim,
-                        scored.begin() + (t + 1) * head_dim);
+    state_kv->insert(state_kv->end(), kv.begin() + t * width,
+                     kv.begin() + (t + 1) * width);
+    state_score->insert(state_score->end(), scored.begin() + t * width,
+                        scored.begin() + (t + 1) * width);
 
     // BOUNDARY-ONLY EMISSION. `(position + 1) % compress_ratio == 0` is upstream's
     // gate verbatim; a step that crosses none emits nothing, and a step that
@@ -218,21 +225,32 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
     const int64_t pos = positions[static_cast<size_t>(t)];
     if ((pos + 1) % compress_ratio != 0) continue;
 
-    // The window that just CLOSED is the last `compress_ratio` rows of the state.
-    // `coff == 1`, so it is exactly one window with no overlap and no role split.
-    const int64_t have = static_cast<int64_t>(state_kv->size()) / head_dim;
-    const int64_t win = compress_ratio;
+    // THE GATHERING WINDOW, 1:1 with `fused_compress_quant_cache.py:169-183`:
+    //
+    //     start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    //     tokens = arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    //     head_offset = (tokens >= COMPRESS_RATIO) * HEAD_SIZE
+    //
+    // So `coff * compress_ratio` rows are gathered ending at the boundary, and a
+    // row's ROLE is its index WITHIN THIS WINDOW, not a property of the row: the
+    // first `compress_ratio` positions read the state's low half, the rest read
+    // the high half. That is why the tensors are doubled and why the role "is
+    // never recoverable from the tensor alone".
+    const int64_t have = static_cast<int64_t>(state_kv->size()) / width;
+    const int64_t win = coff * compress_ratio;
     std::vector<float> wkv(static_cast<size_t>(win * head_dim), 0.0f);
     std::vector<float> wsc(static_cast<size_t>(win * head_dim), 0.0f);
     std::vector<uint8_t> valid(static_cast<size_t>(win), 0);
     for (int64_t i = 0; i < win; ++i) {
       const int64_t row = have - win + i;  // global row index into the state
-      if (row < 0) continue;               // masked: before the sequence began
+      if (row < 0) continue;               // masked: `pos >= 0`, before the start
       valid[static_cast<size_t>(i)] = 1;
-      std::copy(state_kv->begin() + row * head_dim, state_kv->begin() + (row + 1) * head_dim,
+      const int64_t head_offset = (i >= compress_ratio) ? head_dim : 0;
+      const int64_t base = row * width + head_offset;
+      std::copy(state_kv->begin() + base, state_kv->begin() + base + head_dim,
                 wkv.begin() + i * head_dim);
-      std::copy(state_score->begin() + row * head_dim,
-                state_score->begin() + (row + 1) * head_dim, wsc.begin() + i * head_dim);
+      std::copy(state_score->begin() + base, state_score->begin() + base + head_dim,
+                wsc.begin() + i * head_dim);
     }
     const std::vector<float> pooled =
         CompressorPoolNorm(wkv, wsc, valid, rms_weight, eps, win, head_dim);

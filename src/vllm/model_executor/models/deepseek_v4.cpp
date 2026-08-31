@@ -727,8 +727,14 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
   if (is_indexer) {
     const int64_t inh = p.index_n_heads;
     const int64_t ihd = p.index_head_dim;
-    want("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
-         L.idx_wq.size(), inh * ihd * H);
+    // Either geometry is READABLE now: upstream's `[inh*ihd, q_lora_rank]` (the
+    // real artifact's) or the collapsed `[inh*ihd, hidden_size]` the synthetic
+    // suites use. The forward dispatches on which one it got.
+    if (static_cast<int64_t>(L.idx_wq.size()) != inh * ihd * p.q_lora_rank)
+      want("indexer.wq_b",
+           "[index_n_heads*index_head_dim, q_lora_rank] (upstream) or "
+           "[index_n_heads*index_head_dim, hidden_size] (collapsed)",
+           L.idx_wq.size(), inh * ihd * H);
     want("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
          L.idx_wk.size(), ihd * H);
     want("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
@@ -988,8 +994,24 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const int64_t inh = p.index_n_heads, ihd = p.index_head_dim, itopk = p.index_topk;
     // indexer q/k projections keep-quant (idx_wq_b / indexer_compressor_kv); the
     // weights_proj (idx_wproj) is a small V role and stays f32 (host).
+    // W3 (#2286): upstream's indexer query comes from the q-LoRA, NOT the hidden
+    // state. `wq_b` is `ReplicatedLinear(q_lora_rank, head_dim * n_head)`
+    // (`attention.py:721-726`, used at `:835`), so its K is `q_lora_rank`. `qa`
+    // above is already `qr` -- the q-LoRA output with `q_norm` applied in place --
+    // which is the same operand `wq_b` feeds the main query from.
+    //
+    // Dispatched on the weight's own K so BOTH geometries are readable: the real
+    // artifact stores `[inh*ihd, q_lora_rank]`, while the synthetic suites here
+    // were written against a collapsed `[inh*ihd, hidden_size]`. A shape this arm
+    // cannot read is refused by `RequireDsaGeometryOrRefuse` before reaching here.
+    const bool idx_q_from_qr =
+        static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr;
     const std::vector<float> iq =
-        Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T, inh * ihd, H);
+        idx_q_from_qr
+            ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
+                   inh * ihd, qlr)
+            : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
+                   inh * ihd, H);
     const std::vector<float> ik =
         Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H);
     const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);

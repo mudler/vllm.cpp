@@ -185,6 +185,11 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        const std::vector<float>& ape,
                                        const std::vector<int64_t>& positions,
                                        const std::vector<float>& rms_weight, float eps,
-                                       int64_t compress_ratio, int64_t head_dim);
+                                       int64_t compress_ratio, int64_t head_dim,
+                                       // `coff = 1 + (compress_ratio == 4)`
+                                       // (compressor.py:247-248). At 2 the kv/score
+                                       // rows are `coff*head_dim` wide and a window
+                                       // position's ROLE picks which half it reads.
+                                       int64_t coff = 1);
 
 }  // namespace vllm::deepseek_v4

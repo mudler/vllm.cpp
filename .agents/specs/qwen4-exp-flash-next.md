@@ -7583,6 +7583,103 @@ queue. That op is another wave's file territory and is deliberately untouched
 here. **Seven CUDA kernels are now blocked by exactly one thing where they were
 blocked by five.**
 
+#### The fresh review, and the two blocking findings it returned
+
+A fresh reviewer ran the gather kernel on `thor:gpu0` at five shapes, read the
+byte-identity arithmetic line by line against the CPU arms, reproduced the
+`0c8067e054b3eca3` oracle hash and reconstructed the 70-assertion count
+independently. **It found the four kernels correct and every finding was about
+the GATE.** That split is the useful part of the result: the arms compute the
+right answers, and the suite that said so could not have noticed if they did not.
+
+**F1, BLOCKING — the arm-vs-arm bound was a tolerance fitted to one fixture.**
+`kUlpTol = 1.20e-7` failed on a CORRECT kernel at every shape the reviewer
+measured, and worse as the selection grew: 112% of its own budget at the suite
+geometry, 186% at `|sel| = 202`, **290% at the released `|sel| = 2050`**, 121% at
+9000 pairs. Two errors compounded. One ulp was the wrong constant, because CUDA
+documents `expf` at TWO. And the bound scaled the wrong way: it was proportional
+to `max|out|`, and `out` is a weighted average whose magnitude shrinks toward the
+mean as the selection grows, while the error is governed by `max_p |v_p - out|`,
+a spread that does not shrink. Perturbing `exp` by ±1 ulp -- half what CUDA
+permits itself -- already took the old bound to 140% of itself.
+
+It is replaced by a bound DERIVED per output element from each fixture's own
+inputs, `kExpRelDiff * max_p|v_p[d] - out[d]| + 2|sel| u max_p|v_p[d]|`, with
+`kExpRelDiff = 2.5 * 2^-23` from CUDA's 2 ulp plus glibc's correctly-rounded
+0.5. The derivation is written out beside the constants. The gate now prints the
+scale-free actual/bound RATIO, which is what a reader should watch: it is
+invariant to the fixture, so a change in the kernel or in the toolchain's `expf`
+moves it visibly while the bound follows the data.
+
+**F2, BLOCKING — every loop that exists for scale ran exactly one iteration.**
+`|sel|` was at most 11 against a 32-row tile; `T*HQ` at most 92 against a
+4096-block grid; the compressor's `nb` was 2 and 5; the norm's pair count 12 and
+259. The reviewer proved this was not hypothetical with two device mutations:
+dropping the gather's cross-tile denominator carry and collapsing its grid stride
+are each BYTE-FOR-BYTE identical to the unmutated kernel at those shapes, and the
+first is 18.2 / 352.6 / 568.2 at 7 / 33 / 65 tiles. Five fixtures now cross those
+boundaries -- 37, 64 and exactly-2-plus-tail gather tiles, 5200 gather pairs,
+4100 compressor blocks, 1,075,200 norm pairs -- and each asserts its own TAIL IS
+LIVE, so a collapsed loop cannot pass by two zeros agreeing. M9 to M12 are the
+mutations, added as standing acceptance criteria.
+
+**F3 — the "sub-budget is BIT-IDENTICAL to dense" case was vacuous.** On
+`kSubBudget` every query has `complete <= topk`, so `DsaTopkSelect` takes its
+all-select branch and the `dense` buffer the case built was the SAME buffer; it
+measured determinism, which this file's own comment already called insufficient,
+and its vacuity guard was an `INFO`. Running it on `kOverBudget` does not repair
+it either: above the budget the selection is a strict SUBSET and must not equal a
+dense walk. The non-vacuous form is INVARIANCE -- two selections naming the same
+rows through different `topk` widths must agree to the bit -- with the guard
+promoted to `CHECK` and a `REQUIRE` that the row sets really are equal.
+
+**F4 — the mixer's block-dtype branch was never entered on a device**, though
+the kernel's header argues for `vt::MatmulBT` precisely because the released file
+carries 194 Q8_0 mix weights. A Q8_0 case now enters it, and the device settled a
+question the case had guessed at: **it does not refuse.**
+`IsCudaKeepQuantSupported` returning false for Q8_0 does not stop the branch
+running on CUDA.
+
+#### Two lessons the device run taught, both about the gate rather than the code
+
+**A BOUND DERIVED FOR ONE ROUTE MUST NOT BE APPLIED TO A DIFFERENT ROUTE, and
+this wave made that mistake TWICE.** F1 was the first. The second was inside F4's
+own repair: the new Q8_0 case asserted `Q8_0 vs f32 on CUDA` against the mixer's
+1e-05 oracle band, reasoning that the weights are exact in Q8_0 so both arms
+compute the same function. They do not: `kMatmulBTQuant` also QUANTIZES THE
+ACTIVATION, and `normed` is not exact in Q8_0. The device measured 7.549e-05 --
+a real difference held to a bound derived for something else, exactly the shape
+F1 had just been repaired for. The comparison that tests THIS wave's kernel is
+the same route on both devices, CUDA Q8_0 against CPU Q8_0, and the f32 gap is
+now printed as the activation-quantization measurement it is rather than
+asserted.
+
+**A MUTATION THAT FAILS TO BUILD IS NOT A VERDICT, AND nvcc's `-Werror=all-warnings`
+MAKES THAT EASY TO HIT.** M12's first spelling replaced `idx += step` with
+`idx += total`, which orphaned `step`; nvcc refused it with
+`error #177-D: variable "step" was declared but never referenced` and the harness
+reported `BUILD FAILED -- no binary, so no run. Not counted as a red` rather than
+letting a stale binary answer. M1 had hit the same class earlier. The repair
+edits the stride's DEFINITION instead. **The harness guard is what made both
+visible**, and it is the reason a mutation battery must delete the binary before
+it builds.
+
+**AND A MUTATION KILL IS MEANINGLESS WHEN THE SUITE'S BASELINE IS RED.** The run
+that first carried F4 had `green test_qwen4_exp_cuda_reductions RC=1`, so every
+mutation targeting that suite -- M3, M4, M5, M9, M10, M11 -- reported `RUN RC=1`
+for a reason that had nothing to do with the mutation. Those readings are VOID
+and are not counted anywhere in this record; the battery was re-run once the
+baseline was green. A red baseline turns a mutation battery into a row of
+uninformative ones, which is the mirror image of the stale-binary trap.
+
+**nvcc DOES NOT GET THE PROJECT'S `-ffp-contract=off` PIN**, verified on the
+device's own compile line: `add_compile_options` applies it to
+`COMPILE_LANGUAGE:CXX` (and HIP, and OBJCXX) and never to CUDA. That is exactly
+why these kernels spell every multiply-add `__fmul_rn`/`__fadd_rn` instead of
+relying on a flag, and it is why the reviewer's first device numbers were
+inflated ~2x until it re-ran under the pin. The suites are `.cpp` and DO get the
+pin, so this wave's harness is uncontaminated.
+
 ##### The battery RAN TWICE, and the second run is on the pushed tree
 
 The whole sequence was re-run end to end on `thor:gpu0` after the branch was

@@ -201,6 +201,12 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
   // Q8_K is the K-quants' ACTIVATION encoding; it never appears as a file
   // weight type and has no vec_dot, so it is not keep-quant capable.
+  // TQ1_0/TQ2_0 are Vulkan-native keep-quant: no CPU vec_dot, but the Vulkan
+  // backend has native TQ vec_dot shaders, so they are keep-quant capable.
+  if (dt == vt::DType::kTQ1_0 || dt == vt::DType::kTQ2_0) {
+    if (out != nullptr) *out = dt;
+    return true;
+  }
   if (!vt::cpu::HasQuantDotKernel(dt)) return false;
   if (out != nullptr) *out = dt;
   return true;

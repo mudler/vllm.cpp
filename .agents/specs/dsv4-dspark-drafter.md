@@ -269,6 +269,25 @@ W-5. **Propose/verify**, reusing the shared `RejectionSampler` verbatim. The
 lossless property makes the correctness gate exact: drafter-on greedy output must
 be token-IDENTICAL to drafter-off.
 
+**Checked before scheduling, because the drafter's variable draft length looked
+like it might need a new verify path. It does not.** The shared sampler already
+takes `cu_num_logits`, a `[num_reqs + 1]` cumulative array, and derives each
+request's length as `cu[r + 1] - cu[r]`
+(`src/vllm/v1/spec_decode/rejection_sampler.cpp:85-86`). Per-request lengths are
+therefore supported by construction, which is exactly the shape W-4b's
+confidence cap produces: a draft length anywhere in `[0, block]`, differing
+between requests in the same step.
+
+Two consequences worth stating so the wave is not mis-sized. `num_speculative_steps`
+only sizes the scratch row, so it must be at least `dspark_block_size` (5) and
+nothing more depends on it. And a confidence length of 0, "skip drafting this
+round", is `cu[r + 1] - cu[r] == 1`: one logit row carrying the previous token,
+which yields the bonus token alone and is a valid sampling row rather than an
+empty one.
+
+So W-5 adds NO new verify path. It is the propose side plus the `cu_num_logits`
+bookkeeping.
+
 W-6. **The device arm**, and only then a throughput claim.
 
 ## 4. Gates

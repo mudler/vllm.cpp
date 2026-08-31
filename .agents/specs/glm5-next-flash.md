@@ -4710,6 +4710,39 @@ Debts this row carries, each visible rather than waived:
   `RegisterOp` line and shows the device gate reds — which proves the gate
   measures the registered provider and not a directly-called kernel, and proves
   nothing about a capability. Read it that way.
+- **O37 — `--device cuda` ON THE REAL ARTIFACT DOES NOT REACH THE REFUSAL THIS
+  ROW KEEPS CITING, and the row had never measured it.** W9c-0's lease drove
+  `vllm-cli --model <first shard> --device cuda` on
+  `GLM-5.3-Flash-UD-Q2_K_XL` on `dgx:gpu0` (job
+  `79aa5bb5-7536-43fe-a051-ed73ac1302e1`, 2026-08-31T23:30Z, on `4034c368c`).
+  It loads, auto-fits the KV cache, enters the engine and dies in the KV
+  BINDING: `'model.layers.3.self_attn.indexer.k_cache' resolved to attn_kv index
+  45 but only 22 cache(s) arrived` (`glm5_next_kv.cpp:127`), `CLI_DEVICE_CUDA=1`.
+
+  **The guard at `glm5_next_forward.cpp:231-238` is still in the tree and never
+  fires**, because `ResolveAttnCache` throws before the forward is entered. So
+  the sentence this row repeats — "`--device cuda` still refuses by name at
+  `glm5_next_forward.cpp:231-238`" — describes code that exists but not any
+  behaviour a user can reach, and W9c-3, scoped as "the compose that deletes
+  that refusal", will meet the KV binding first and earlier. The 22 is W5b-2c's
+  own expected count (11 latents + 11 indexer caches, O29), so the name index is
+  producing indices from a larger space than the vector it indexes.
+
+  **The prior probe measured nothing and is not a baseline.** It passed the
+  checkpoint DIRECTORY instead of a shard, died in `hf_config` in five seconds
+  over a GGUF artifact that carries no `config.json`, and its capture came back
+  empty. This is the first run that reached the engine.
+
+  **What is NOT established: whether `--device cpu` reproduces it.** That was not
+  measured, this lease drove the CUDA arm only, and the auto-fit above (256
+  blocks, `max_model_len` 8192, `max_num_seqs` 1) is memory-dependent and may
+  differ per device. O30's ` Paris.` predates several waves and a different
+  resolved config. A general KV-binding defect and a device-only one have
+  different owners, so the polarity is left open rather than guessed, and one
+  `--device cpu` run at the same shard and config settles it. Tracked by
+  [#2445](https://github.com/mudler/vllm.cpp/issues/2445); not repaired in flow
+  because the fix lives in the multi-KV index mapping W5b-2c owns and the
+  measurement above has to come first.
 
 ## Now
 

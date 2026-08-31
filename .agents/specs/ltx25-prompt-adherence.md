@@ -6,9 +6,13 @@ Owner row: `LTX25-PROMPT-ADHERENCE`. Until this spec landed, that sub-question w
 owed by `LTX25-ORACLE-ABSOLUTE` under `## Owed` in
 [`ltx25-oracle-absolute.md`](ltx25-oracle-absolute.md).
 
-**This row lands a spec and a record, and no code.** It ends in a decision the
-developer takes, not in a gate. §9 states the decision. That outcome is the
-row's deliverable rather than its failure.
+**W0 landed a spec and a record and no code, and ended in a decision the
+developer takes.** §9 states that decision and it is now ANSWERED: the scoring
+model is an INSTRUMENT. W1 and W2 followed on that answer and are in this row's
+second change -- the measurement, the gate, and its red-before suite. `## Outcome`
+carries what was measured. #1854's first sub-question is answered for the request
+the reference render was taken at, and `## Owed` states, in the same breath, the
+one it cannot answer.
 
 ## Scope
 
@@ -318,6 +322,8 @@ model. Constructing a config proves nothing."
 
 ## 6. Port map
 
+W0, the spec and the record:
+
 | File | Change |
 |---|---|
 | `.agents/specs/ltx25-prompt-adherence.md` | this file |
@@ -325,120 +331,175 @@ model. Constructing a config proves nothing."
 | `.agents/specs/ltx25-oracle-absolute.md` | its `## Owed` bullet for #1854 sub-question 1 names this row as the owner |
 
 No product code, no script, no test, no oracle record, and no change to
-AGENTS.md. §9 is why the list stops here.
+AGENTS.md. §9 is why that list stopped there.
+
+W1 and W2, the measurement and the gate, after §9 was answered:
+
+| File | Change |
+|---|---|
+| `scripts/ltx25-render-compare.py` | `--adherence-model`, and the S0/S1/S2 block behind it. `--reference` is required with it, and the module docstring states the 77-position bound in both states |
+| `tests/parity/goldens/ltx25_adherence/scorer-pin.json` | new; the checkpoint's revision, its eight measured sha256 digests, its three costs, and `gateable` |
+| `tests/parity/goldens/ltx25_adherence/decoys.json` | new; the six committed decoys, three near and three far, and the derivation of the null |
+| `tests/scripts/test_ltx25_prompt_adherence.py` | new; the red-before suite, 47 cases |
+| `tests/scripts/test_ltx25_absolute_reference.py` | one assertion, because this change made its declaration line false |
+| `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` | the new suite runs on both lanes, registered in the change that adds it |
+| `docs/USAGE.md` | the command and the checkpoint it is gated against |
+
+**No `.agents/oracles/` file and no change to AGENTS.md's oracle table.** §9 is
+still why.
 
 ## 7. Tests to port
 
-**None, and that is the correct answer for this change.** There is no upstream
-test for a decision, and this row implements no behaviour to test. The suites
-that WOULD be owed once §9 is answered are named so the next implementer does
-not have to derive them:
+**W0 owed none**: there is no upstream test for a decision, and it implemented no
+behaviour to test. W2 owes five, and all five are in
+`tests/scripts/test_ltx25_prompt_adherence.py`. Each was RED on `origin/main`
+before the change: 47 cases, 3 failures and 34 errors, run against `main`'s copy
+of the tool with only the new goldens and the new suite added.
 
-| ID | Assertion | Wave |
+| ID | Assertion | State |
 |---|---|---|
-| P1 | The scorer's checkpoint is refused unless its sha256 matches the pinned digest | W2 |
-| P2 | S0: a scorer that ranks a decoy first on the REFERENCE exits `EXIT_UNREADABLE` and publishes no bound | W2 |
-| P3 | The S1 bound in the JSON equals the reference's own recomputed per-frame minimum, not a literal — one render, TWO references, OPPOSITE verdicts | W2 |
-| P4 | S2 on a pure-noise render FAILS, and the case says so beside the blockiness case that PASSES it | W2 |
-| P5 | A prompt longer than CLIP's 77 positions is REFUSED rather than silently truncated | W2 |
+| P1 | The scorer's checkpoint is refused unless its sha256 matches the pinned digest | LANDED, six cases: an UNMEASURED (`null`) digest, a wrong digest, a missing file, an empty pin, the committed pin against a directory that is not the checkpoint, and the matching case |
+| P2 | S0: a scorer that ranks a decoy first on the REFERENCE exits `EXIT_UNREADABLE` and publishes no bound | LANDED, and the sharper case beside it: a CONSTANT scorer, which HAS an argmax (numpy returns the first maximal index, which is the true prompt) and would clear a bare set assertion while measuring nothing. The margin must be strictly positive |
+| P3 | The S1 bound equals the reference's own recomputed per-frame minimum, not a literal | LANDED as exactly that case: ONE render, TWO references, OPPOSITE verdicts, plus the at-the-bound pair |
+| P4 | S2 on a pure-noise render FAILS, beside the blockiness case that PASSES it | LANDED in the suite, and MEASURED end to end on the real checkpoint; see `## Outcome` |
+| P5 | A prompt longer than CLIP's 77 positions is REFUSED rather than silently truncated | LANDED, and the boundary is checked at the limit and one past it |
 
-P3 is the shape `ltx25-oracle-absolute.md` T9 had to be added for: a mutation
-replacing the computed bound with the reference's own literal left that suite
-green, because the report still showed a computed number while the gate enforced
-a transcribed one.
+**The upstream test is ported in the same change**, in
+`PinnedCheckpoint.test_ported_vllm_test_clip_the_two_feature_routes_agree`, from
+`vllm/tests/models/multimodal/pooling/test_clip.py` at `5559679229`. It preserves
+upstream's tolerance (`check_embeddings_close`, `tol = 1e-3`, cosine), upstream's
+dtype (`"float"`, `:75`), upstream's context (`max_model_len=77`, `:41`) and
+upstream's reference entry points (`get_image_features(pixel_values=...)` and
+`get_text_features(input_ids=..., attention_mask=...)`, `:52-57`). **One harness
+adaptation, and it is unavoidable**: upstream's other side is `VllmRunner`, which
+needs an installed vLLM and a GPU lease, and this tree's vLLM is a source
+checkout. So the second side here is the route vLLM-Omni's `CLIPScorer` takes
+(`helpers.py:507-508`, `outputs.image_embeds` and `.text_embeds`), and the case
+requires it to agree with vLLM's reference route at upstream's own tolerance.
+That is not a tautology: they are different code paths in `transformers`, and the
+scorer deliberately takes vLLM's, because vLLM is the primary reference. The
+`VllmRunner` half stays OWED.
 
-P5 exists because of §3's third cost. Truncating is the failure mode that
-produces a plausible number for a question nobody asked.
+`transformers` 5.x returns a `BaseModelOutputWithPooling` from those two calls
+with its `pooler_output` already REPLACED by the projected features, which is
+`clip.py:867`'s `self.visual_projection(pooled_output)`. The scorer ports
+upstream's own unwrap for it (`test_clip.py:59-61`) rather than assuming a
+tensor, so it reads the PROJECTED feature and not the pre-projection pooled one.
 
 ## 8. Gates
 
-1. `scripts/agent-preflight.sh` — the record gates, since the change is records.
-2. `python3 scripts/check-agent-record.py` — the appended index row names an
-   owning row ID, so the unowned count does not move.
-3. `python3 scripts/check-oracle-pins.py` — unchanged and must stay green: this
-   row adds no oracle and touches no pin, and the checker asserts the AGENTS.md
-   table and `.agents/oracles/` name the same set of ids.
+W0 was a records change and its gates were the record gates. W2 adds executable
+ones, and they run on both lanes in the change that adds them:
 
-There is no measurement gate, because this row measures nothing new. §5 says why
-the first measurement is W1 and what it costs.
+1. `python3 tests/scripts/test_ltx25_prompt_adherence.py` — the new suite. 47
+   cases; 42 need numpy only and no checkpoint, and the 5 that need the pinned
+   weights SKIP LOUDLY on `VT_LTX25_ADHERENCE_MODEL` being unset. A skip is never
+   an `ok`. Registered in `scripts/agent-preflight.sh` and in `ci.yml`'s
+   numpy lane beside the two suites that already exercise this tool.
+2. `python3 tests/scripts/test_ltx25_absolute_reference.py` — unchanged in every
+   value it checks. One assertion moved, because this change made the tool's
+   "prompt adherence is not measured anywhere in this tree" line false; the
+   replacement holds the same obligation, that a run with no scorer says it
+   measured no adherence and carries no adherence check into the table.
+3. `python3 tests/scripts/test_ltx25_render_compare.py` — the older suite over
+   the same tool, unchanged and green.
+4. `scripts/agent-preflight.sh` — the record gates.
 
-## 9. `NEEDS_DECISION`
+There is no C++ in this change, so there is nothing to compile. That is stated
+rather than left implicit, because a record gate builds nothing and a green one
+has already let a tree that did not compile onto `main`.
 
-**Is a scoring model an ORACLE or an INSTRUMENT?** The two readings are both
-defensible and they lead to different work.
+## 9. `NEEDS_DECISION` — ANSWERED
+
+**Is a scoring model an ORACLE or an INSTRUMENT?**
+
+**ANSWERED: INSTRUMENT** (developer, 2026-08-31, recorded in
+`.agents/developer-preferences.md`), on this row's own recommendation and
+argument. Reading A below. The consequences, all of them discharged in this
+change:
+
+- `ltx-2` remains the oracle. **AGENTS.md's oracle table is unchanged** and there
+  is no `.agents/oracles/` file for the scorer. A case in the suite asserts the
+  second half of that, so a later edit that promotes the scorer in place is red.
+- The checkpoint is pinned by **revision AND sha256**, like any other artifact
+  this project loads: `tests/parity/goldens/ltx25_adherence/scorer-pin.json`.
+- This is an ordinary row. W1 and W2 ran.
+- **Reversible.** If it turns out to need oracle status, that returns as a
+  decision rather than being promoted in place.
+
+The two readings are kept below, because the argument is what makes the answer
+checkable and a later reader needs the one that was rejected.
 
 **Reading A — instrument.** The scorer is a measuring device, like
 `torchmetrics`' SSIM in #1743's coherence checks or `ffmpeg` in the reference
 decode. The ORACLE remains `ltx-2`, whose render is the other side of every
 comparison, running on `vllm`, which supplies the runner. Nothing is added to
-AGENTS.md's table. The checkpoint is pinned by revision and sha256 in
-`docs/USAGE.md` beside every other weight this project loads. Consequence: this
-is an ordinary row, and W1 can start.
+AGENTS.md's table. The checkpoint is pinned by revision and sha256 beside every
+other weight this project loads.
 
 **Reading B — oracle.** The scorer produces the verdict, so it is the authority
-the gate defers to. It then needs its own `.agents/oracles/<id>.md`, its own
-`gateable` measurement, and a row in AGENTS.md's table with a `Reach for it
-when` line. Consequence: this is a policy change under AGENTS.md §"Changing the
-rules or a checker", it needs its own spec and a red-before test of the checker
-semantics, and no scoring work starts before it lands.
+the gate defers to. It would then need its own `.agents/oracles/<id>.md`, its own
+`gateable` measurement, and a row in AGENTS.md's table with a `Reach for it when`
+line — a policy change under AGENTS.md §"Changing the rules or a checker", with
+its own spec and a red-before test of the checker semantics.
 
-**This row recommends A, and the argument is that the scorer never answers a
-question on its own.** Every number it produces is consumed as a comparison
-against the #1864 render, which is already the pinned oracle's output. S1 holds
-our mean against the reference's own frames; S2 requires the reference to pass
-the same discrimination our render must pass. Delete the reference and neither
-check has a bound. That is the test for what the oracle IS, and the answer is
-`ltx-2`, unchanged. What the CLIP checkpoint contributes is a metric space, and
-a metric space with pinned bytes is an instrument.
+**The argument for A is that the scorer never answers a question on its own.**
+Every number it produces is consumed as a comparison against the #1864 render,
+which is already the pinned oracle's output. S1 holds our mean against the
+reference's own frames; S0 requires the reference to pass the same discrimination
+our render must pass, and refuses to publish anything if it does not. Delete the
+reference and neither check has a bound. That is the test for what the oracle IS,
+and the answer is `ltx-2`, unchanged. What the CLIP checkpoint contributes is a
+metric space, and a metric space with pinned bytes is an instrument.
 
-**Two things make the recommendation less than obvious, and they are why this is
-the developer's call and not the row's.** A neural instrument has weights, so it
-is not a closed form the way SSIM is, and AGENTS.md's gateability rule was
-written for exactly that difference. And S2's verdict does not reference the
-oracle's frames at all in its argmax — only S0's precondition does — so under S2
-the scorer comes closer to speaking on its own than under S1.
+Two things made the recommendation less than obvious, and they are why it was the
+developer's call. A neural instrument has weights, so it is not a closed form the
+way SSIM is, and AGENTS.md's gateability rule was written for exactly that
+difference — which is why `gateable` is a MEASURED field in the pin and not an
+assertion. And S2's verdict does not reference the oracle's frames in its argmax;
+only S0's precondition does, so under S2 the scorer comes closer to speaking on
+its own than under S1.
 
-Three smaller decisions ride along and are named so they are not answered by
-default:
+The three smaller decisions that rode along, and their answers:
 
-- **The unlicensed weights of §3.** `openai/clip-vit-*` declare no licence.
-  Accept them, or take `laion/CLIP-ViT-H-14` at `mit` and 3.67 GiB and lose the
-  match with upstream's choice.
-- **The 598 MB download**, which needs the authority
-  `.agents/developer-preferences.md` requires and does not currently record for
-  this row.
-- **Whether S2 ships at all**, since it is this row's construction rather than
-  upstream's. Its argument is in §4 and it is the only one of the two that
-  answers #1854's question as #1854 phrases it.
+- **The unlicensed weights of §3.** ACCEPTED (developer, 2026-08-31), with the
+  fact recorded beside the pin rather than smoothed over: `openai/clip-vit-*`
+  declares no licence, and the pin's `licence` field is `null` rather than a
+  guess. A case asserts it stays `null`.
+- **The 598 MB download.** AUTHORISED (developer, 2026-08-31), priced first: 598
+  MB, no declared licence, a pickle rather than safetensors. All three are in the
+  pin.
+- **Whether S2 ships at all.** It ships. It is the only one of the two that
+  answers #1854's question as #1854 phrases it, and `## Outcome` records that it
+  is also the only one of the two that catches the noise render.
 
 ## 10. Dependencies
 
 - The #1864 reference render and its `SHA256SUMS`. Landed and committed.
-- `ffmpeg`, already required by `ltx2-gen` and by `--reference`.
-- Download authority for one 598 MB checkpoint. **Not recorded. `PENDING`.**
-- Our render's frames. The render itself is DONE
-  ([#2140](https://github.com/mudler/vllm.cpp/issues/2140) is closed and `rc`
-  job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` produced it), and whether its 25
-  frames survive the lease is UNMEASURED. W1 needs neither.
-- The decision of §9. **`PENDING`, and it gates W2 and W3 but not W1.**
+- `ffmpeg`, already required by `ltx2-gen` and by `--reference`. RESOLVED.
+- Download authority for one 598 MB checkpoint. **GRANTED**, 2026-08-31.
+- `transformers` and `torch` on the host that runs the scorer. Present on the
+  devbox; the four cases that need them skip loudly elsewhere. No GPU and no
+  lease: the whole measurement is seconds of CPU.
+- Our render's frames. **STILL THE ONE OPEN DEPENDENCY.** The render itself is
+  DONE ([#2140](https://github.com/mudler/vllm.cpp/issues/2140) is closed and
+  `rc` job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` produced it), and whether its
+  25 frames survived the lease is UNMEASURED. W1 and W2 needed neither. W3 does.
+- The decision of §9. **ANSWERED.**
 
 ## 11. Work breakdown
 
-- **W0** — this spec and the record. No code. Complete in this change.
-- **W1** — the instrument measurement, and the only wave that may start before
-  §9 is answered because it adds nothing to the tree's verdicts: load
-  `openai/clip-vit-base-patch16`, hash it, decode the committed reference mp4,
-  and record the reference's own per-frame CLIP distribution against the prompt
-  and against the decoys. CPU, no lease. Its output is the gateability
-  measurement §5 owes AND the bound S1 would use. If S0 fails at W1, the
-  candidate is dead and §9 is moot for it, which is worth knowing for the price
-  of an afternoon.
+- **W0** — the spec and the record. No code. COMPLETE.
+- **W1** — the instrument measurement. COMPLETE, and `## Outcome` is its result:
+  the checkpoint downloaded and hashed, the scorer loaded, the committed
+  reference mp4 decoded and scored, and the reference's own per-frame CLIP
+  distribution recorded. CPU, no lease, no GPU.
 - **W2** — the tool change and its red-before suite, S0/S1/S2 and P1..P5.
-  **Blocked on §9.**
-- **W3** — scoring our render at the reference's request, and the verdict.
-  **Blocked on §9.** Its first step is to establish whether the frames of `rc`
-  job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` were retained, because a fetch and
-  a fresh lease are not the same cost.
+  COMPLETE.
+- **W3** — scoring OUR render at the reference's request, and the verdict.
+  **NOT STARTED, and it is what `## Owed` names.** Its first step is to establish
+  whether the frames of `rc` job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` were
+  retained, because a fetch and a fresh lease are not the same cost.
 
 ## 12. Risks and decisions
 
@@ -483,8 +544,14 @@ default:
 - §3's prompt lengths: 13 words / 73 characters for the reference request, 70
   words / 413 characters for `ltx25-dit-attn-flash-pixel-ab.sh:697`, against
   `text_config.max_position_embeddings = 77`.
-- W1 will add: the checkpoint's measured sha256, the reference's per-frame CLIP
-  distribution, and the S0 verdict.
+- W1 ADDED, and `## Outcome` carries them: the checkpoint's eight measured
+  sha256 digests, the reference's own per-frame CLIP distribution, the S0
+  verdict on the reference and the S0 refusal on a noise render, and one
+  end-to-end run in which the gate fires.
+- §3's prompt-length reading is now MEASURED against the scorer's own tokenizer
+  rather than argued: the reference request is 17 CLIP tokens, every committed
+  decoy is 20 or fewer, and #1854's 70-word example needs more than 77. The
+  vocabulary-free lower bound in the suite reads 83 for it and agrees.
 
 ## 14. Stop conditions
 
@@ -498,30 +565,136 @@ Stop and report, do not work around:
   constant. #1854 filed this gap rather than proxy it, and a proxy landed under
   this row would be the same failure with a spec attached.
 
+## Outcome
+
+What was measured, on 2026-08-31, on the devbox: no GPU, no lease, CPU only, and
+the whole run is seconds once the checkpoint is on disk.
+
+### The instrument is GATEABLE, and that is measured rather than asserted
+
+`openai/clip-vit-base-patch16` at revision
+`57c216476eefef5ab752ec549e440a49ae4ae5f3` was fetched and hashed file by file.
+Every measured size equals the size the HuggingFace API advertises, and the eight
+digests are in `scorer-pin.json`. `pytorch_model.bin` is 598,641,023 bytes and
+its sha256 is `ec89c7b09c749a60aae3c9cd910516f24b58214a7df060b48962d14c469cfbf0`.
+`transformers` then loaded the model and the processor from the local directory
+and produced embeddings. So `gateable = true` in the pin, and it says what was
+run rather than that a config was constructed.
+
+**The 77 positions are measured too.** `config.json` at that revision, sha256
+`eaf1c9089a8553c913d27ea66407f8bfc2be9989c80c9f331ddb3d63d4c5e8ad`, has
+`text_config.max_position_embeddings = 77` and `vision_config.image_size = 224`.
+
+### S0 PASSED on the reference, and the same scorer says NO on noise
+
+Scored the 25 frames of the committed `upstream-render.mp4` against the prompt
+the manifest records and the six committed decoys:
+
+| Prompt | mean | per-frame |
+|---|---|---|
+| **true** | **38.1278** | [36.0087, 39.8198] |
+| `near:1` grey wolf, same forest | 36.3039 | [35.0705, 37.6487] |
+| `near:2` fox asleep at night | 31.9409 | [29.8596, 33.6220] |
+| `near:0` fox, summer forest | 31.9369 | [30.2435, 33.6573] |
+| `far:4` bowl of soup | 20.2937 | [19.6407, 21.2946] |
+| `far:5` empty beach | 18.9246 | [18.3531, 19.5103] |
+| `far:3` city street at night | 16.2770 | [15.6993, 16.8785] |
+
+S0 PASSED: the true prompt ranks first, margin **+1.8240** to the best decoy,
+per-frame wins **25 of 25**, against a null of 1/7 = 0.1429. The near decoys are
+genuinely near — the grey wolf sits 1.82 below the true prompt, which is what
+makes the set discriminating rather than decorative.
+
+**The instrument then failed on something it should fail on**, which is the whole
+of S0's claim. The same scorer on 25 frames of uniform pseudo-random noise ranks
+the true prompt **LAST of seven**, margin **−5.6586**, per-frame wins **0 of 25**,
+and `scorer_precondition` refuses at `EXIT_UNREADABLE`. An instrument that has
+never said no is not known to be able to; this one has.
+
+### S1's bound IS derivable, and here is the number
+
+    ours_mean_clip  >=  36.0087
+
+recomputed on every run from the reference's own 25 frames. The reference's mean
+is 38.1278 with a per-frame sd of 0.9518, so the bound sits **2.23 of the
+reference's own per-frame standard deviations** below its mean. §4 left that
+multiplier UNMEASURED and refused to guess it; this is the measurement. It is
+close to the roughly two standard deviations the blockiness bound worked out at,
+and that is a coincidence of two different statistics on one render rather than a
+property of the construction — it is recorded because §4 said it would be, not
+because it means anything.
+
+**No statistic in this row stays REPORTED for want of a derivation.** Both checks
+gate. The four statistics of the absolute panel are untouched: two still gate and
+three still report, for the reasons `ltx25-oracle-absolute.md` §5 measures.
+
+### The gate FIRES end to end, on exactly the blind spot the landed row declares
+
+One run of the tool, a 25-frame noise render against the committed reference and
+the pinned scorer:
+
+    [PASS] content.a.not_uniform / distinct_frames / motion
+    [PASS] absolute.a.blockiness_grid8   1.001814 <= 1.143697
+    [PASS] absolute.a.blockiness_grid32  0.999606 <= 1.147804
+    [FAIL] absolute.a.adherence_clip     15.7422 >= 36.0087 ... margin -20.2665
+    [FAIL] absolute.a.adherence_argmax   argmax is 'far:4' ... per-frame wins 0/25
+    READING WORSE_THAN_ORACLE
+    VERDICT FAIL (exit 1)
+
+`ltx25-oracle-absolute.md` records, with a test, that a pure-noise render passes
+C0 and passes both blockiness ratios. That is not an argument here; it is the
+first five lines of this run's own output. The two adherence checks are what
+catches it.
+
+### What the two checks are worth, separately
+
+S1 and S2 are not redundant and the noise run shows why: S1 fails it by 20 CLIP
+points, S2 fails it by ranking. But S1 alone would pass a render that scored
+highly against *every* prompt, and S2 alone would pass a render that ranked
+correctly at a uniformly terrible score. Each covers the other's failure, and
+both print their margin on every run so a passing gate can be seen degrading.
+
 ## Owed
 
-- **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1
-  remains OPEN.** This row narrows it from "there is no scorer and no shape" to
-  "here is the scorer, here is the shape, and here is the decision it waits on".
-  It does not close it. Owner: this row, through
-  [#2295](https://github.com/mudler/vllm.cpp/issues/2295).
-- **The gateability of vLLM's CLIP path is UNMEASURED**, and the `vllm` oracle
-  record is not changed to say otherwise, because its `gateable = yes` is true
-  of the repository. W1 owes the per-path measurement. Owner: this row.
-- **The `20.0` and `7.0` constants in vLLM-Omni's own gate are undefended**, and
-  this spec declines to import them. If a later reader wants an absolute floor,
-  it needs a derivation this row does not have. Owner: this row.
-- **No candidate with a text context long enough for #1854's own 70-word example
-  has been identified.** §3's table does not contain one that is both upstream's
-  choice and long enough. Owner: this row.
+- **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1 is
+  ANSWERED FOR THE REFERENCE'S REQUEST AND STAYS OPEN.** There is now a scorer,
+  a shape, a bound and a gate that fires, and OUR render has not been through it.
+  What closes #1854 is W3: our engine's 25 frames at the reference's exact
+  request, scored, with the verdict recorded whatever it says. Owner: this row,
+  through [#2295](https://github.com/mudler/vllm.cpp/issues/2295).
+- **Our render's frames are not established to exist.** `rc` job
+  `4b0666ee-248c-45fc-9de6-372b6d0c1fab` produced them on `dgx:gpu0` and they
+  were never committed. Whether W3 needs a fetch or a fresh lease is UNMEASURED
+  and is its first step. Owner: this row.
+- **The `VllmRunner` half of the ported upstream test is NOT run.** The ported
+  case holds vLLM-Omni's `outputs.image_embeds` route against vLLM's
+  `get_image_features` route at upstream's own tolerance, which is the half that
+  can run here; upstream's own other side needs an installed vLLM and a GPU
+  lease, and this tree's vLLM is a source checkout. So **`CLIPEmbeddingModel`
+  itself has still never been loaded in this tree**, and no claim in this row
+  rests on it. Owner: this row.
+- **The `20.0` and `7.0` constants in vLLM-Omni's own gate remain undefended**,
+  and this row still declines to import them. Nothing here uses an absolute
+  floor. If a later reader wants one, it needs a derivation this row does not
+  have. Owner: this row.
+- **NO CANDIDATE CAN ANSWER #1854'S OWN 70-WORD EXAMPLE.** CLIP's context is 77
+  positions and that prompt needs at least 83; the tool refuses it rather than
+  truncating. A scorer with a longer text context is not upstream's choice and
+  has never run here. This is the sharpest limit on what landed and it is stated
+  in the tool's own output, in the pin, and in the suite. Owner: this row.
+- **Adherence is scored per FRAME, so temporal adherence is invisible.**
+  "walks SLOWLY" is not measured by anything here, exactly as it is not by
+  vLLM-Omni's own middle-frame scorer. A video-native scorer would be a different
+  question. Owner: this row.
 
 ## Now
 
-`BLOCKED` on the decision in §9. W0 is complete and in this change. W1 is
-unblocked and unstarted, and needs one 598 MB download authority. W2 and W3
-cannot start.
+`ACTIVE`. W0, W1 and W2 are COMPLETE and in this row's two changes. §9 is
+ANSWERED — instrument, not oracle — so nothing in this row is blocked on a
+decision, and nothing in it is blocked on hardware either: the whole measurement
+is CPU.
 
-Nothing in this row is blocked on hardware. `LTX25-ORACLE-ABSOLUTE` took its
-reading on 2026-08-28 and closed
-[#2140](https://github.com/mudler/vllm.cpp/issues/2140) on the way, so the one
-dependency this spec would otherwise have carried is already discharged.
+W3 is the only wave left and it is the one that closes #1854's first
+sub-question. It needs our engine's 25 frames at the reference's request, and
+its first step is to find out whether the frames `rc` job
+`4b0666ee-248c-45fc-9de6-372b6d0c1fab` wrote were retained.

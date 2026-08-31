@@ -792,7 +792,15 @@ ENGINE_PREFIXES = (
 # counts one of the two new rows and silently drops the other. The counter is
 # the union, so it is 173. Bumped for real new rows, never to make a failing
 # state transition pass.
-ENGINE_ROWS = 173
+# 174 since 2026-08-31: +`ENG-PREFLIGHT-COMPILES` (no gate compiles a translation
+# unit before a push, and `main` was pushed twice on 2026-08-31 in a state that
+# does not build with every record gate green -- `5263ac31f` and `08fa2f5aa`,
+# #2401). A genuinely-new row rather than a state move: `GATE-PREPUSH-FAIL-LOUD`
+# owns whether the hook can find the checkers it names, `ENG-CI-*` owns the CI
+# lanes, and nothing owned whether anything compiles before the push at all.
+# `ACTIVE`, spec `specs/preflight-compiles.md`. Bumped for a real new row, never
+# to make a failing state transition pass.
+ENGINE_ROWS = 174
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

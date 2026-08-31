@@ -719,10 +719,31 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
   };
   if (is_comp) {
     const int64_t cr = p.compress_ratio(layer);
-    want("compressor.ape", "[compress_ratio, head_dim]", L.comp_ape.size(), cr * hd);
-    want("compressor.wgate.weight", "[head_dim, hidden_size]", L.comp_wgate.size(),
-         hd * H);
+    // W3 (#2286): `coff = 1 + (compress_ratio == 4)` (`compressor.py:247-248`)
+    // widens the ape and the fused wkv|wgate; `norm` does NOT, because upstream
+    // is `RMSNorm(self.head_dim, ...)` (`compressor.py:288`).
+    //
+    // Read from the TENSOR rather than derived from `compress_ratio`, the same
+    // way `idx_wq`'s K is. Upstream emits only the derived width, but this tree's
+    // synthetic suites are written at a COLLAPSED `coff == 1` shape on `cr == 4`
+    // layers -- a shape upstream cannot produce and this forward has always
+    // accepted. Deriving the requirement instead would refuse all of them at
+    // once, which is a fixture migration and not this wave.
+    const int64_t cw = (hd > 0 && H > 0 && L.comp_wgate.size() % (hd * H) == 0 &&
+                        L.comp_wgate.size() / (hd * H) == 2)
+                           ? 2 * hd
+                           : hd;
+    const int64_t coff = cw / hd;
+    (void)coff;
+    want("compressor.ape", "[compress_ratio, coff*head_dim]", L.comp_ape.size(), cr * cw);
+    want("compressor.wgate.weight", "[coff*head_dim, hidden_size]", L.comp_wgate.size(),
+         cw * H);
     want("compressor.norm.weight", "[head_dim]", L.comp_norm_weight.size(), hd);
+    // Materialized since W3; empty only on a checkpoint that carries none, where
+    // the collapsed convention still applies.
+    if (!L.comp_wkv.empty())
+      want("compressor.wkv.weight", "[coff*head_dim, hidden_size]", L.comp_wkv.size(),
+           cw * H);
   }
   if (is_indexer) {
     const int64_t inh = p.index_n_heads;
@@ -1065,8 +1086,19 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       VT_CHECK(static_cast<int64_t>(cs.state_kv.size()) > layer,
                "deepseek-v4 compressor: state has no entry for this layer");
       std::vector<int64_t> pos64(positions.begin(), positions.end());
+      // W3 (#2286): pool the compressor's OWN projection of the hidden state when
+      // the checkpoint carries one. Upstream's `fused_wkv_wgate` emits the KV and
+      // the gate together (`compressor.py:279-287`) and never reuses the MLA
+      // latent; `deck` is the collapsed geometry's convention and is kept only
+      // for checkpoints that carry no `compressor.wkv`.
+      const int64_t comp_w =
+          static_cast<int64_t>(L.comp_wgate.size()) / (H > 0 ? H : 1);
+      const std::vector<float> comp_kv =
+          L.comp_wkv.empty()
+              ? deck
+              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H);
       o = deepseek_v4::CompressorLayerStep(
-          *be.q, x, deck, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
+          *be.q, x, comp_kv, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
           (*be.paged_kv)[static_cast<size_t>(layer)],
           (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
           (*be.paged_kv)[static_cast<size_t>(layer)].shape[1],

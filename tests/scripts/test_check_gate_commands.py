@@ -987,6 +987,21 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dropping_preflight_compiles_from_the_pin_breaks_it(self):
+        # ENG-PREFLIGHT-COMPILES (#2401) arrives `ACTIVE` with a `## Gates`
+        # section naming `tests/scripts/test_check_tree_compiles.py` and
+        # `scripts/check-tree-compiles.py --base origin/main`, so it enters the
+        # runnable population and the baseline grows by one. Same shape and same
+        # reason as the two rows above: the exact pin proves the SET agrees,
+        # which holds for any membership and cannot say this row belongs. This
+        # says it -- remove the entry and set equality has to go red.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-PREFLIGHT-COMPILES"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-PREFLIGHT-COMPILES"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
     def test_hf_model_download_earns_its_runnable_baseline_entry(self):
         # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
         # population for the first time and the baseline grows by one. Same

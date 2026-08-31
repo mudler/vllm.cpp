@@ -465,8 +465,14 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   // are named in ONE message on purpose: a refusal that stopped at the first
   // mismatch would make the other three checks unfalsifiable, because deleting
   // any one of them would still red on the first.
-  CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.ape"));
-  CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.wgate.weight"));
+  // W3 (#2286) NARROWED this from four tensors to one. `compressor.ape`,
+  // `compressor.wgate.weight` and `indexer.wq_b` are now READ at the artifact's
+  // own widths: the coff-widened ape and fused gate, and the indexer's q-LoRA
+  // query. What is still unimplemented is the INDEXER's own compressor, which
+  // carries a second `DeepseekCompressor` at `index_head_dim`
+  // (`attention.py:768-776`), so only its KV projection is named here.
+  CHECK_FALSE(dsv4_exl3_fixture::Mentions(msg, "attn.compressor.ape"));
+  CHECK_FALSE(dsv4_exl3_fixture::Mentions(msg, "attn.compressor.wgate.weight"));
   CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
   // `indexer.wq_b` is NO LONGER among them. W3 (#2286) made the indexer's query
   // come from the q-LoRA, which is upstream's own shape (`attention.py:721-726`,
@@ -479,12 +485,6 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   // `MismatchLine`), so a wrong count on one tensor is still found on another's
   // line. `indexer.wq_b` gets its counts here too — it had none before, and its
   // indexed count is one of the colliding 2048s.
-  CHECK(dsv4_exl3_fixture::Mentions(
-      msg, MismatchLine("compressor.ape", "[compress_ratio, head_dim]", cr * hd,
-                        cr * 2 * hd)));
-  CHECK(dsv4_exl3_fixture::Mentions(
-      msg, MismatchLine("compressor.wgate.weight", "[head_dim, hidden_size]", hd * H,
-                        2 * hd * H)));
   CHECK(dsv4_exl3_fixture::Mentions(
       msg, MismatchLine("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
                         ihd * H, 2 * ihd * H)));

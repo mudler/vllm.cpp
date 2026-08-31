@@ -367,18 +367,28 @@ std::vector<float> CompressorLayerStep(
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
     int64_t sliding_window, float eps, float scale) {
-  VT_CHECK(compress_ratio == 128,
-           "deepseek-v4 compressor step: this is the coff == 1 shape only; "
-           "compress_ratio 4 is coff == 2 and belongs to W3 (#2286)");
+  // W3 (#2286): both shapes now. `coff = 1 + (compress_ratio == 4)`
+  // (`compressor.py:247-248`); at 2 the projections are doubled and a window
+  // position's ROLE picks which half it reads.
+  VT_CHECK(compress_ratio == 4 || compress_ratio == 128,
+           "deepseek-v4 compressor step: upstream emits compress_ratio 4 or 128 "
+           "only (sparse_swa.py:44-55)");
+  // Read from the TENSOR, not derived from the ratio: the synthetic suites carry a
+  // collapsed `coff == 1` shape on `cr == 4` layers, which upstream cannot emit
+  // but this tree has always accepted.
+  const int64_t coff =
+      (hidden > 0 && head_dim > 0 &&
+       static_cast<int64_t>(comp_wgate.size()) == 2 * head_dim * hidden)
+          ? 2
+          : 1;
   VT_CHECK(state_kv != nullptr && state_score != nullptr && comp_rows != nullptr,
            "deepseek-v4 compressor step: the state is CARRIED, not owned here");
   VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
            "deepseek-v4 compressor step: x must be [num_tokens, hidden]");
-  VT_CHECK(static_cast<int64_t>(kv.size()) == num_tokens * head_dim,
-           "deepseek-v4 compressor step: kv must be [num_tokens, head_dim]");
-  VT_CHECK(static_cast<int64_t>(comp_wgate.size()) == head_dim * hidden,
-           "deepseek-v4 compressor step: comp_wgate is [coff*head_dim, hidden] and "
-           "coff is 1 here");
+  VT_CHECK(static_cast<int64_t>(kv.size()) == num_tokens * coff * head_dim,
+           "deepseek-v4 compressor step: kv must be [num_tokens, coff*head_dim]");
+  VT_CHECK(static_cast<int64_t>(comp_wgate.size()) == coff * head_dim * hidden,
+           "deepseek-v4 compressor step: comp_wgate is [coff*head_dim, hidden]");
   VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
            "deepseek-v4 compressor step: one position per token");
 
@@ -403,21 +413,22 @@ std::vector<float> CompressorLayerStep(
                "(MODEL-DSV4-DSA-COMPOSE, #2286)");
 
   // 1. The pool score this layer selects with.
-  std::vector<float> score(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
+  const int64_t cw = coff * head_dim;
+  std::vector<float> score(static_cast<size_t>(num_tokens) * cw, 0.0f);
   for (int64_t t = 0; t < num_tokens; ++t) {
-    for (int64_t d = 0; d < head_dim; ++d) {
+    for (int64_t d = 0; d < cw; ++d) {
       double acc = 0.0;
       const float* w = &comp_wgate[static_cast<size_t>(d * hidden)];
       const float* xt = &x[static_cast<size_t>(t * hidden)];
       for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(w[h]) * xt[h];
-      score[static_cast<size_t>(t * head_dim + d)] = static_cast<float>(acc);
+      score[static_cast<size_t>(t * cw + d)] = static_cast<float>(acc);
     }
   }
 
   // 2-3. Drive the state machine and keep whatever closed this step.
   const std::vector<float> emitted =
       CompressorStepCycle(state_kv, state_score, kv, score, comp_ape, positions,
-                          comp_norm_weight, eps, compress_ratio, head_dim);
+                          comp_norm_weight, eps, compress_ratio, head_dim, coff);
   comp_rows->insert(comp_rows->end(), emitted.begin(), emitted.end());
 
   // 4. The window pass carries the sink and keeps its LSE.

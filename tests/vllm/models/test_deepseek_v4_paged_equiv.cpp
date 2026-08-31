@@ -659,7 +659,7 @@ TEST_CASE("W1: the compressor layer step is a STATE MACHINE across steps") {
     CHECK(last_out[i] == doctest::Approx(ref[i]).epsilon(1e-6));
 }
 
-TEST_CASE("W1: the compressor step REFUSES the coff == 2 shape") {
+TEST_CASE("W3: the compressor step now ACCEPTS coff == 2, and refuses other ratios") {
   // `compress_ratio == 4` is overlapped windows plus the Lightning Indexer, which
   // is W3. Accepting it here would run the coff == 1 arithmetic on a shape whose
   // gathering window is twice as wide.
@@ -675,9 +675,18 @@ TEST_CASE("W1: the compressor step REFUSES the coff == 2 shape") {
   const std::vector<float> ape(static_cast<size_t>(4 * hd), 0.01f);
   const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
   const std::vector<float> sink(static_cast<size_t>(nh), 0.0f);
-  CHECK_THROWS(vllm::deepseek_v4::CompressorLayerStep(
+  // `compress_ratio == 4` is coff == 2 and W3 implements it, so it is ACCEPTED
+  // now. The operands here are the collapsed width, which selects coff == 1 --
+  // upstream cannot emit that shape on a cr == 4 layer, but this tree's synthetic
+  // suites carry it and the forward has always read it.
+  CHECK_NOTHROW(vllm::deepseek_v4::CompressorLayerStep(
       q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, 1, 16, &st_kv, &st_score, &rows,
       {0}, 0, 1, nh, H, hd, /*compress_ratio=*/4, 4, 1e-6f, 1.0f));
+  // A ratio upstream does not emit still refuses (`sparse_swa.py:44-55`).
+  std::vector<float> s2_kv, s2_sc, r2;
+  CHECK_THROWS(vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, 1, 16, &s2_kv, &s2_sc, &r2,
+      {0}, 0, 1, nh, H, hd, /*compress_ratio=*/8, 4, 1e-6f, 1.0f));
 }
 
 TEST_CASE("W1: a step that CLOSES a window emits rows and the merge runs") {

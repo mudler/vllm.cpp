@@ -1070,3 +1070,118 @@ TEST_CASE("W1: without compressor state the same layer REFUSES (#2286)") {
   CHECK_THROWS(vllm::DeepseekV4ForwardExl3Paged(w, q, pages, 0, tok, pos, {0},
                                                 /*compressor=*/nullptr));
 }
+
+TEST_CASE("W3: the compressor pools its OWN projection, not the MLA latent (#2286)") {
+  // Upstream's compressor owns a `fused_wkv_wgate` emitting both its KV and its
+  // gate from the hidden state (`compressor.py:279-287`); it never reuses the
+  // MLA's `kraw`. This tree accounted `compressor.wkv.weight` and dropped it
+  // until W3, so the composition pooled the MLA latent -- finite, plausible, and
+  // not what upstream pools.
+  //
+  // The claim here is that the loaded projection is LOAD-BEARING: perturbing
+  // `comp_wkv` alone must move the logits. If it did not, the forward would still
+  // be pooling the latent and the materialization would be decoration.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};
+  opt.real_dsa_geometry = false;
+  auto f = BuildFixture(opt);
+  vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+  // It is actually loaded, at the gate's own width.
+  REQUIRE(!w.host.layers[1].comp_wkv.empty());
+  CHECK(static_cast<int64_t>(w.host.layers[1].comp_wkv.size()) ==
+        static_cast<int64_t>(w.host.layers[1].comp_wgate.size()));
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers, hd = w.params.head_dim;
+  const int64_t bs = 16, nb = 16;  // >= 128 slots, so the closing window fits
+  const auto run = [&](const vllm::DeepseekV4Weights& ww) {
+    std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+    std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+    for (int64_t l = 0; l < nlayers; ++l) {
+      storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+      pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+          storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+          {nb, bs, hd});
+    }
+    vllm::DeepseekV4CompressorState cs;
+    cs.Resize(nlayers);
+    // SEED the state so this step CLOSES a window. At ratio 128 a single token at
+    // position 0 closes none, the pooled row never reaches the logits, and the
+    // projection under test would read as inert -- which is exactly what the
+    // first version of this case measured. 127 prior rows plus this token's makes
+    // `(127 + 1) % 128 == 0`, and `kv_base = 127` keeps the prefix guard happy.
+    const int64_t cr = 128;
+    cs.state_kv[1].assign(static_cast<size_t>((cr - 1) * hd), 0.05f);
+    cs.state_score[1].assign(static_cast<size_t>((cr - 1) * hd), 0.02f);
+    const std::vector<int32_t> tok{1}, pos{static_cast<int32_t>(cr - 1)};
+    return vllm::DeepseekV4ForwardExl3Paged(ww, q, pages, cr - 1, tok, pos, {0}, &cs);
+  };
+
+  const std::vector<float> before = run(w);
+  // Perturb ONLY the compressor's KV projection.
+  vllm::DeepseekV4Weights w2 = w;
+  for (float& v : w2.host.layers[1].comp_wkv) v += 0.25f;
+  const std::vector<float> after = run(w2);
+
+  REQUIRE(before.size() == after.size());
+  double diff = 0.0, mag = 0.0;
+  for (size_t i = 0; i < before.size(); ++i) {
+    REQUIRE(std::isfinite(after[i]));
+    mag = std::max(mag, std::abs(static_cast<double>(before[i])));
+    diff = std::max(diff, std::abs(static_cast<double>(before[i] - after[i])));
+  }
+  REQUIRE(mag > 1e-6);
+  CHECK(diff > 1e-6);  // the projection is READ, not decoration
+}
+
+TEST_CASE("W3: the INDEXER's compressor family is materialized (#2286)") {
+  // The indexer carries its own `DeepseekCompressor` at `head_dim =
+  // index_head_dim` (`attention.py:768-776`). Three of its four tensors were
+  // accounted and dropped; only `idx_wk` had a host slot. They load now.
+  //
+  // Loading them does NOT make the indexer's compressor run, and this case does
+  // not pretend otherwise: the forward still refuses on `idx_wk`'s width. That
+  // order is deliberate -- narrowing a refusal before the capability exists turns
+  // it into a silent wrong answer, which this row has established twice.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 4};      // the indexer exists ONLY at cr == 4
+  opt.real_dsa_geometry = true;      // the artifact's widths, coff == 2
+  opt.index_n_heads = 2;
+  opt.index_head_dim = 8;
+  opt.index_topk = 2;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  const auto& L = w.host.layers[1];
+  const int64_t ihd = w.params.index_head_dim, H = w.params.hidden_size;
+  const int64_t cr = w.params.compress_ratio(1);
+  const int64_t iw = 2 * ihd;  // coff == 2, always, where the indexer exists
+
+  // Present, and at upstream's widths: the ape and the fused gate carry `coff`,
+  // the norm does NOT (`compressor.py:288`).
+  CHECK(static_cast<int64_t>(L.idx_comp_ape.size()) == cr * iw);
+  CHECK(static_cast<int64_t>(L.idx_comp_wgate.size()) == iw * H);
+  CHECK(static_cast<int64_t>(L.idx_comp_norm_weight.size()) == ihd);
+  // Its KV projection was already loaded and keeps the same width as the gate.
+  CHECK(static_cast<int64_t>(L.idx_wk.size()) == iw * H);
+
+  // NON-TRIVIAL: an all-zero slot would satisfy every size check above while
+  // carrying nothing the checkpoint wrote.
+  double mag = 0.0;
+  for (const float v : L.idx_comp_wgate) mag = std::max(mag, std::abs((double)v));
+  CHECK(mag > 1e-6);
+
+  // The refusal is UNCHANGED, because the cycle does not run yet.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::string msg = ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward({1}, {0}, {}, {}, w, q, {0});
+  });
+  CAPTURE(msg);
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
+}

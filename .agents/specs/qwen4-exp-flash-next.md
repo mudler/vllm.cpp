@@ -7275,7 +7275,9 @@ separate wave's file territory and is deliberately untouched here. Separately,
 false for IQ4_NL, Q4_0, Q5_0 and Q8_0, so the MoE seam and this wave's own
 quantized projection route either drain to the host or refuse — also another
 wave's. The reachability of these four arms from a production entry point is
-therefore **VACUOUS, not proven**, and `## Owed` carries the entry. Nothing here
+therefore **VACUOUS, and this wave MEASURED that rather than asserting it**:
+mutation M8 below deletes the production call site and both CUDA suites stay
+green while `test_qwen4_exp_ple_block` reds. `## Owed` carries the entry. Nothing here
 claims a token, a decode or a speed number.
 
 **WHAT DOES CHANGE IS THE SIZE OF THE REMAINING GAP, and it is the reachability
@@ -7439,6 +7441,136 @@ BITWISE equal to the clean run. Membership gives "read set is a subset of
 selected"; the counter gives "|read set| == |selected|"; together they are set
 equality, and the margin between the sparse and the dense count is printed.
 
+#### Evidence, and the exact boundary of what it covers
+
+**THE DEVICE IS `thor:gpu0`**, a Jetson Thor at **`sm_110`**, 2026-08-31, `rc` job
+`5d2cd023`, inside a lease (`rc run -d thor:gpu0`). Toolkit `nvcc` 13.0.88,
+driver 595.78, configure
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`.
+The gated tree is `12071a5dd`, which already carries the merge of `origin/main`
+`c2daafb23`, so this is a gate on the MERGE RESULT and not on the branch as it
+stood. **EVERY rc BELOW WAS PRINTED BY THE JOB AND READ, never derived** — the
+one soft spot W6-CUDA had to label a derivation.
+
+`cuobjdump` confirms the objects are genuinely built for this architecture, which
+no rc can show on its own: `cuda_qwen4_exp_qsa.cu.1.sm_110.cubin` and
+`cuda_rms_norm_group.cu.1.sm_110.cubin`, 2 of 2.
+
+**THE RED IS A REAL ABSENCE, NOT A MUTATION.** The red leg builds a tree that is
+`12071a5dd` with the two new translation units DELETED and `cuda_qwen4_exp.cu`
+plus `CMakeLists.txt` taken from `9fb40279d`, so the four registrations simply do
+not exist while every test does.
+
+```text
+### CONFIGURE RC=0
+### RED BUILD RC=0     ### GREEN BUILD RC=0     ### FINAL BUILD RC=0
+### red   test_ops_rms_norm_group_cuda RC=1     ### green ... RC=0   ### final ... RC=0
+### red   test_qwen4_exp_cuda_reductions RC=1   ### green ... RC=0   ### final ... RC=0
+### red   test_qwen4_exp_cuda RC=1              ### green ... RC=0   ### final ... RC=0
+### RESTORE CHECK RC=0
+```
+
+The red FAILS FOR THE INTENDED REASON and the message says so verbatim:
+
+```text
+CHECK_NOTHROW( vt::GetOp(vt::OpId::kRmsNormGroup, DeviceType::kCUDA) ) THREW:
+"vt: no kernel for op RmsNormGroup (id 140) on device cuda (type 1), and the
+ portable CPU reference tier is NOT eligible: this backend does not report its
+ device memory host-addressable ..."
+```
+
+Red counts: `test_ops_rms_norm_group_cuda` 5 of 7 cases failed;
+`test_qwen4_exp_cuda_reductions` 10 of 10; `test_qwen4_exp_cuda` 1 case and
+exactly 4 assertions, which are the four flipped registration checks. Green
+counts: **7 cases / 70 assertions**, **10 cases / 120 assertions**, and
+**12 cases / 351 assertions**, all `SUCCESS!`. The last number is unchanged from
+W6-CUDA's own `sm_121a` run, so flipping its four assertions moved nothing else.
+
+##### What the arms actually measure
+
+| claim | measured |
+|---|---|
+| `vt::RmsNormGroup` CUDA == CPU, **bitwise**, all 18 dtype triples | **0 bytes differ** in every one of the 18 |
+| `vt::RmsNormGroup` CUDA vs the transformers golden | max\|diff\| 1.19e-07, 5.96e-08, **0**, **0** (cases A-D) against 1e-05 |
+| `vt::Qwen4ExpQsaCompress` CUDA == CPU, **bitwise**, both `round_intermediates_to_bf16` arms | **0/32 and 0/80 differ**, max\|diff\| 0 |
+| `vt::Qwen4ExpQsaCompress` CUDA vs the golden | relL2 **exactly 0** on both cases against 1e-06 |
+| `vt::Qwen4ExpQsaGatherAttention` CUDA vs the golden | relL2 7.90e-08 and 8.95e-08 against 2e-03 |
+| ... CUDA vs CPU, bound ONE f32 ulp relative | max\|diff\| **2.384e-07** against 3.73e-07 and 2.56e-07; 386/1408 and 1037/2944 elements not bitwise equal |
+| ... a sub-budget gather is BIT-IDENTICAL to dense | **0/1408 differ** |
+| ... the PAGED arm equals the contiguous one | **0/2944 differ** |
+| ... `keys_visited` vs a count derived from the HOST expansion | **1440 == 1440**, dense 2208, **margin 768** |
+| ... the read SET: rows this query does not select set to NaN | 12 of query 22's 23 visible rows poisoned, **0/128 differ** |
+| ... a malformed selection poisons its row | **128/128 outputs NaN**, and no other row touched |
+| `vt::Qwen4ExpGatedResidual` CUDA vs the golden | max\|diff\| 4.47e-08 to 1.19e-07 against 1e-05 |
+| ... CUDA vs CPU, bound the oracle's own band | max\|diff\| 5.96e-08 to 1.19e-07; 2-4 elements per case not bitwise equal |
+| ... the hyper stream is READ-ONLY | **0 bytes differ** on all four cases |
+
+**THE GATHER'S ARM-VS-ARM MARGIN IS THIN AND IS REPORTED AS SUCH: 2.384e-07
+against a 2.560e-07 bound, 93% of it.** That is not a bound chosen to pass — one
+f32 ulp relative was written down before the kernel ran, and the divergence has
+exactly one named source, `expf`, which CUDA documents at up to 2 ulp where
+glibc's is correctly rounded. The compressor beside it, same file, same
+intrinsics, no transcendental, comes back at **0**. If this number moves, `exp`
+moved; do not widen the bound.
+
+##### The mutation battery, with applied-proof and restore-proof
+
+Every mutation printed a `sha256 before=... after=...` pair proving it changed
+the file, and a `RESTORED byte-for-byte` line proving the tree came back. **All
+eight applied, all eight built (`BUILD RC=0`), so not one is a compiler proof
+wearing a test verdict**, and `RESTORE CHECK RC=0` at the end verifies all four
+kernel files against the sha256 manifest taken before the battery.
+
+| mutation | what it breaks | run rc | reading |
+|---|---|---|---|
+| M1 | `RmsNormGroup` reduces over the WHOLE ROW | **1** | RED |
+| M2 | the `+ 1` gamma fold dropped (#2218) | **1** | RED |
+| M3 | the compressor ropes at the block's LAST token | **1** | RED |
+| M4 | the pool window OVERLAPS (DeepSeek-V4's, not QSA's) | **1** | RED |
+| M5 | THE MASK-SHAPED PORT: the gather walks all `kv_len` rows | **1** | RED |
+| M6 | the mixer's division moves OUTSIDE the SiLU | **1** | RED |
+| M7 | the kCUDA registration deleted, kernel kept referenced | **1** | RED |
+| M8 | the PRODUCTION call site deleted | see below | the reachability answer |
+
+M1's first draft was a BUILD failure rather than a red, because dividing by `h`
+orphaned `gs_f` and `-Werror` refused it. That is the "a mutation that never ran
+reads as a passing test" shape, caught by the script's own
+`no binary, so no run` branch, and repaired by redefining `gs_f` instead. It is
+recorded because the next person writing a mutation here will hit it.
+
+##### M8: the reachability answer, measured on both sides
+
+M8 deletes `vt::RmsNormGroup`'s first PRODUCTION call site — the one inside
+`RunQwen4ExpPleBlock` that `ModelRegistry::Forward` reaches through the layer
+loop — and runs THREE gates against it:
+
+```text
+### MUT M8 test_qwen4_exp_ple_block        RUN RC=1     <- the call site is LIVE
+### MUT M8 test_ops_rms_norm_group_cuda    RUN RC=0     <- the CUDA arm survives it
+### MUT M8 test_qwen4_exp_cuda_reductions  RUN RC=0     <- so does this one
+```
+
+**Both readings are the finding.** The first says a production path really does
+reach this op today, on CPU, so the call site is not decorative. The second and
+third say **NOTHING IN PRODUCTION REACHES THIS WAVE'S CUDA ARMS**: a gate that
+survives the deletion of the production call site measures a class, not a
+capability. AGENTS.md "Nothing lands dead" requires that be stated rather than
+discovered later, and this is it — stated, and MEASURED rather than asserted,
+which is the difference from W6-CUDA's own "vacuous" claim.
+
+**THE THREE W6-CUDA ARMS ARE STILL NOT LIVE EITHER, AND THAT IS THE DIRECT
+ANSWER TO THE QUESTION THIS WAVE WAS ASKED.** `vt::Qwen4ExpPleConv`,
+`vt::Qwen4ExpPleGate` and `vt::Qwen4ExpGatedResidualWriteBack` sit immediately
+after this wave's ops in the same two functions, so closing four blockers moved
+them from "four ops away from runnable" to "one op away". The remaining op is the
+block-decoding n-gram gather: `EmbeddingKernelCuda` still refuses a table that is
+not f32 or bf16 by name (`cuda_ops.cu`, "cuda embedding: unsupported table dtype
+(f32/bf16 only)"), so `DeviceQuantGatherSupported` still refuses CUDA and
+`ModelRegistry::Forward` — which is all-or-nothing — cannot run a step on a CUDA
+queue. That op is another wave's file territory and is deliberately untouched
+here. **Seven CUDA kernels are now blocked by exactly one thing where they were
+blocked by five.**
+
 ## Mutation record — W8CONFIRM (#2031, issue OWED)
 
 W5s answered "does the released artifact emit real tokens on `origin/main`" and
@@ -7587,7 +7719,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W8CONFIRM PROVED IT IS THE FIX** (W5s asserted it; its `701606e51`-vs-`52f7ccbfc` comparison spans W5p too and cannot apportion) — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
 | W5s | the RELEASED UD-IQ1_S artifact re-driven on `origin/main` `52f7ccbfc` (W5p **and** W5r), four arms, one build, one staged copy | **SERVES yes, and the TOKENS ARE REAL** — `" Paris. Given this fact, what is"` and `" 100°C at sea level"` for two different prompts, eight distinct ids none of them 0, against W5q's eight consecutive id 0 on the same box and artifact. Reusing W7DIAG's read-only probe, the pre-W5r tree and this one agree numerically on `embed` and `after_widen` and diverge at exactly `stream.after_layer_0` (`nan=51200` -> `nan=0`); `LOGITS` was `zero=248320` with no maximum and is now `min -9.89818 max 15.7873`, argmax id 11751 = the `" Paris"` token. `VT_CPU_QUANT_REPACK=0` is byte-identical to the default, which is the correct outcome for a performance transform and the thing that was false before W5r. **NOT a token gate** (no oracle decoded these prompts; llama.cpp aborts in `build_delta_net_chunking`), no speed number, UD-IQ1_S only, one sequence. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5s's own issue OWED |
 | W8CONFIRM | the SAME artifact on the SAME `52f7ccbfc` tarball, TWO binaries differing only in `dense_attn_block.h:235-236`, four arms in one lease | **CAUSE ISOLATED** — `X-ON` (fix reverted, repack ON) returns `"!!!!!!!!!!!!!!!!"` with `LOGITS zero=248320` and `after_layer_0 nan=51200`, while `X-OFF` (same binary, repack OFF) and both `M` arms return `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` bit-identically. Same binary either side of one environment variable, so the defect needs the repack chain ACTIVE and the markers DROPPED; W5p is in all four arms and cannot explain a difference between them. Four prompts across factual, narrative and code, all correct, one ending on the model's own EOS. Binaries `e18a38a6…` vs `cfdf47bd…`, mutation applied-proof `2 -> 0` fix lines. **NOT a token gate**, n=1, UD-IQ1_S only, `--device cpu` only. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W8CONFIRM's own issue OWED |
-| W6-CUDA-B | the FOUR remaining CUDA arms: `vt::Qwen4ExpGatedResidual` (the mixer), `vt::RmsNormGroup`, `vt::Qwen4ExpQsaCompress`, `vt::Qwen4ExpQsaGatherAttention` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and `EmbeddingKernelCuda` still refuses a block-quantized table by name, so no `qwen4_exp` step can reach a CUDA queue. What CHANGES is the size of the gap: the three W6-CUDA arms sit immediately AFTER these four in the same functions (`qwen4_exp_ple_block.cpp:489,499` before `:531,580`; `qwen4_exp_forward.cpp:418,476` before `:457,506`), so seven kernels go from four separate blockers to ONE. The wave was dispatched as THREE ops; `kQwen4ExpGatedResidual` was missed because `kQwen4ExpGatedResidualWriteBack` contains it as a substring, and two independent audits caught it before any code was written. Full result in the W6-CUDA-B section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2380](https://github.com/mudler/vllm.cpp/issues/2380) |
+| W6-CUDA-B | the FOUR remaining CUDA arms: `vt::Qwen4ExpGatedResidual` (the mixer), `vt::RmsNormGroup`, `vt::Qwen4ExpQsaCompress`, `vt::Qwen4ExpQsaGatherAttention` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and `EmbeddingKernelCuda` still refuses a block-quantized table by name, so no `qwen4_exp` step can reach a CUDA queue. What CHANGES is the size of the gap: the three W6-CUDA arms sit immediately AFTER these four in the same functions (`qwen4_exp_ple_block.cpp:489,499` before `:531,580`; `qwen4_exp_forward.cpp:418,476` before `:457,506`), so seven kernels go from four separate blockers to ONE. The wave was dispatched as THREE ops; `kQwen4ExpGatedResidual` was missed because `kQwen4ExpGatedResidualWriteBack` contains it as a substring, and two independent audits caught it before any code was written. **AND THE VACUITY IS MEASURED, NOT ASSERTED**: mutation M8 deletes the production call site and `test_qwen4_exp_ple_block` reds (rc 1, so the site is LIVE) while both CUDA suites stay green (rc 0, so nothing reaches the new arms). Gated on `thor:gpu0` `sm_110`, nvcc 13.0.88, on the MERGE RESULT `12071a5dd`: red 5/7, 10/10 and 4 assertions failing for the intended reason, green 7/70, 10/120 and 12/351 all `SUCCESS!`, eight mutations applied and built and seven RED, `RESTORE CHECK RC=0`, and `cuobjdump` reporting 2 of 2 `sm_110` cubins. The norm and the compressor are BYTE-IDENTICAL to their CPU arms (0 bytes differ across all 18 dtype triples; relL2 exactly 0 vs the golden); the gather's only divergence is `expf` at 2.384e-07 against a 2.560e-07 one-ulp bound. Full result in the W6-CUDA-B section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2380](https://github.com/mudler/vllm.cpp/issues/2380) |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

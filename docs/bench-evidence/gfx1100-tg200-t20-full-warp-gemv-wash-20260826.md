@@ -64,13 +64,24 @@ near-tie doctrine.
 
 ## Why the kernel win didn't reach the engine
 
-The 2.4-3.1x kernel speedup only helps large-grid Q6_K (lm_head, 1 call/tok).
-The dominant Q4_K path (2.46 ms/tok, 25% of wall) has small grids (ffn_gate
-and ffn_up at ~288 super-blocks per row, grid≈576). At small grids the kernel
-is launch-overhead-bound, not reduction-barrier-bound — eliminating barriers
-has no effect. The Q6_K path (1.20 ms/tok) is mostly small-grid ffn_down
-(22 calls/tok), where T20 gives 1.03x. The large-grid lm_head (1 call/tok)
-saves ~1.4 ms but that's 0.04 ms/tok averaged over 256 tokens — invisible.
+The dominant Q4_K path (2.46 ms/token, 25% of wall) has small grids
+(`ffn_gate` and `ffn_up` at about 288 super-blocks per row, grid about 576).
+At small grids the kernel is launch-overhead-bound, not
+reduction-barrier-bound. Removing barriers has no effect. The Q6_K path
+(1.20 ms/token) is mostly small-grid `ffn_down` with 22 calls per token,
+where T20 gives 1.03x.
+
+The large-grid timing row is a standalone microbenchmark, not an engine
+amortization. Its OFF-to-ON difference is
+`2,133.7 - 681.7 = 1,452.0 µs`, or `1.452 ms/token`, because the production
+census records one lm_head dispatch per decode token. A 256-token engine run
+therefore makes 256 calls. It does not divide one call's saving by 256.
+The pre-T20 T7 production trace recorded the same lm_head geometry at about
+615 µs/call. That production result is already below both the standalone OFF
+time and its implied saving. The standalone OFF timing therefore does not
+describe the production dispatch. The five-pair engine A/B directly
+establishes the wash, but these measurements do not attribute the
+microbenchmark-to-engine difference.
 
 ## Conclusion
 

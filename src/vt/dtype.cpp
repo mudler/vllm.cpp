@@ -169,17 +169,18 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
     }
     case DType::kTQ2_0: {
       // block_tq2_0 (llama.cpp PR #25850): u8 qs[64] + f16 d = 64 + 2 = 66,
-      // QK = 256. ggml type id 42 (killgate fork extension after Q1_0 = 41).
+      // QK = 256. ggml type id 35 (mainline GGML_TYPE_TQ2_0).
       // 2-bit ternary codes: element e = j*4 + l*32 + k (j in {0,32},
       // l in 0..3, k in 0..31) reads byte qs[j+k], value ((qs[j+k]>>(l*2))&3)-1.
-      static constexpr BlockGeometry g{256, 66, 42, "tq2_0"};
+      static constexpr BlockGeometry g{256, 66, 35, "tq2_0"};
       return &g;
     }
     case DType::kTQ1_0: {
       // block_tq1_0: u8 qs[48] + u8 qh[4] + f16 d = 48 + 4 + 2 = 54,
-      // QK = 256. ggml type id 43. Packed base-3 trits: q = byte * pow3[l]
+      // QK = 256. ggml type id 34 (mainline GGML_TYPE_TQ1_0).
+      // Packed base-3 trits: q = byte * pow3[l]
       // (uint8 wrap); xi = (q * 3) >> 8; w = (xi - 1) * d, giving {-1, 0, +1}.
-      static constexpr BlockGeometry g{256, 54, 43, "tq1_0"};
+      static constexpr BlockGeometry g{256, 54, 34, "tq1_0"};
       return &g;
     }
     case DType::kF32:

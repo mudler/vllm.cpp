@@ -464,6 +464,161 @@ under `-Werror` on the now-unused parameters, and the stale binary reported
 the evidence; the build's exit code is part of it.
 
 
+### W3e — the INSTALL, which is what made any of it move a weight ([#2314](https://github.com/mudler/vllm.cpp/issues/2314))
+
+W1 landed the config, W2 the resolution and the report, W3 the seam and the
+architectures. `SetActiveMoePlacementPlan` was called by **nothing in `src/`**.
+The seam read a process-global no production path ever wrote, so
+`ActiveMoePlacementPlan()` returned the default on every load,
+`PlacesAnything()` was always false, and **no expert was ever placed on the
+CPU** on any architecture.
+
+W2's own comment names the seam of it: "W2 RESOLVES AND REPORTS; IT MOVES
+NOTHING ... W3 owns the routing that reads it." W3 built the routing and never
+added the call between them.
+
+**Two things hid it for three work items.** The loader PRINTS
+`engine: device placement: N layers on cpu` from the RESOLVED plan, so the one
+signal an operator would check confirmed a feature that was not running. And a
+token gate cannot see it: with nothing placed, the placed arm is byte-identical
+to the unplaced arm, so the end-to-end comparison this row owed would have
+PASSED for the wrong reason and been recorded as the feature working.
+
+`LoadedEngine::FromModelDir` now installs the plan on both the GGUF and
+safetensors paths, at each branch's config parse — the first point where the
+engine device and `num_hidden_layers` are both known, and still ahead of all
+weight I/O, which is required rather than tidy: `ResidentWeight` aliases host
+bytes on a CPU `Dev` and uploads otherwise, so installing after the upload would
+pay exactly the round trip the placement exists to avoid.
+
+The install is UNCONDITIONAL, including when nothing is placed. The plan is a
+process-global, so a second load in the same process must overwrite the first
+model's plan; an early return on "no overrides" would leave a stale placement
+pointed at the wrong model. `test_placement_reach`'s second case asserts that
+directly, by installing a 64-layer plan and requiring the next load to re-resolve
+against its own depth.
+
+`MoePlacementPlan::resolved_layer_count()` is new and exists for the gate. In a
+CPU-only build the engine device IS the placement target, so an installed plan
+and a never-installed one agree on every other accessor — both inert, correctly.
+The layer count the plan was resolved against is the one observable that
+separates them.
+
+**Proved by the reachability mutation, not by reading.** Deleting both call sites
+— with the definition kept and `[[maybe_unused]]` so the mutant COMPILES, rc=0
+and zero errors — turns `test_placement_reach` red at 2 cases and 3 assertions.
+
+### W3f — the e2e gate RAN, and its invariant was wrong ([#2314](https://github.com/mudler/vllm.cpp/issues/2314))
+
+**Hybrid offload works end to end.** Qwen3.6-35B-A3B bf16 on GB10, engine
+`cuda`, `--offload-config '{"vllm_cpp":{"placement":{"cpu_moe":true}}}'`,
+announced by the loader as `40 layers run their routed experts on cpu, the rest
+on cuda (resolved against 40 layers)`. Both arms exit 0 and both answer the
+prompt correctly. This is the first execution of the placed branch on a real
+model, and it was only possible after W3e installed the plan.
+
+**The token gate this row owed asserts something unachievable, and the first run
+proved it.** The completions share a prefix and diverge mid-sentence:
+
+- unplaced: `Paris, a city renowned for its rich history, culture, and iconic landmarks`
+- placed: `Paris, a city renowned for its iconic landmarks such as the Eiffel Tower`
+
+Both correct, both fluent. The cause is not a defect. `docs/FEATURES.md` says
+"the round trip is byte-identical to computing in place, mutation-proven", and
+that is true of the DATA MOVEMENT -- which is what the round-trip test proves.
+It says nothing about the ARITHMETIC: a placed layer runs the CPU MoE kernels
+instead of the CUDA ones, and this project's own cross-device bar for reducing
+ops is NMSE <= 5e-4, not bitwise equality
+(`tests/vt/test_backend_cross_device.cpp:11`, "CPU is the oracle"). Greedy
+decode amplifies any perturbation inside that bar into a different token
+eventually. llama.cpp's `-ncmoe` diverges the same way.
+
+I designed the gate on the first sentence and did not check it against the
+second. The gate was red for a defect in the gate.
+
+**The gate now measures the gateable claim.**
+`VT_PLACEMENT_DUMP_MOE=<path>` makes the seam write layer 0's MoE block output
+once, on whichever path ran, and the gate computes NMSE between the two arms
+against the 5e-4 bar. Inert unless set: one latched `getenv`, first matching
+call only, no allocation and no copy on the placed path because `staging`
+already holds host bytes.
+
+The instrument precondition is checked BEFORE the comparison, because an absent
+or empty dump would make the arms agree trivially -- the vacuous pass this gate
+was written to refuse. A missing dump is `GATE_RC=2`, never a pass. The
+completions are recorded but no longer asserted.
+
+### W3h — the NMSE gate PASSES, and hybrid offload is correct ([#2382](https://github.com/mudler/vllm.cpp/issues/2382))
+
+Measured on dgx (GB10, `sm_121`, 31 cubins), Qwen3.6-35B-A3B bf16, engine
+`cuda`, `--offload-config '{"vllm_cpp":{"placement":{"cpu_moe":true}}}'`, with
+the loader announcing `40 layers run their routed experts on cpu, the rest on
+cuda`:
+
+```
+PLACEMENT CONFIRMED
+values=10240  bitwise_identical=9028/10240
+NMSE=1.091e-06   bar=5.000e-04
+GATE_RC=0        PLACEMENT_E2E=PASS
+```
+
+**NMSE is 458x under the bar.** 9028 of 10240 values are bitwise identical and
+the remainder differ inside the cross-device tolerance — the signature of the
+CPU and CUDA MoE kernels agreeing to within their reduction order, not of a
+defect.
+
+Two things this result depends on, both of which had to be fixed first. Without
+W3e's install nothing was placed, so the comparison would have been the unplaced
+arm against itself. And under the ORIGINAL token invariant this same passing run
+reads RED: the completions still diverge mid-sentence. The gate had to measure
+the right quantity before a correct implementation could pass it.
+
+The gated tree is `d8cefafd7`; the merged head `5d3462f4a` differs from it only
+in files the rebase brought from `main`. All five placement sources
+(`moe_placement_seam.h`, `device_placement.{h,cpp}`, `model_loader.cpp`,
+`qwen3_moe.cpp`) are byte-identical between the two, so the verdict covers what
+lands.
+
+**Still owed, unchanged by this pass:** the SPEED axis. GB10 is unified memory,
+so CPU and GPU memory are the same silicon and a placement's throughput benefit
+cannot be measured there at all. That needs a discrete CPU/GPU rig
+([#149](https://github.com/mudler/vllm.cpp/issues/149)). This gate establishes
+CORRECTNESS only.
+
+### W3g — the seam assumed bf16, and the placed branch is untestable on CPU ([#2383](https://github.com/mudler/vllm.cpp/issues/2383))
+
+The seam hardcoded `vt::DType::kBF16` in six places and never compared it with
+the block it was given. `kimi_linear_device.cpp:930` hands it an **f32** `[T,H]`
+buffer, so the placed branch copied HALF the bytes and reinterpreted f32 as
+bf16 — silently, producing plausible floats rather than a crash.
+
+**It could not fire until W3e.** With no plan installed, `placed_on` always
+equalled the engine device and the whole placed branch was dead. Installing the
+plan opened the door, so the trap behind it is fixed in the same campaign rather
+than left for whoever first placed a Kimi-Linear layer.
+
+The seam now carries `dh.dtype`, sizes the copy-back by the dtype the body
+actually produced — which need not equal the input's — and hardcodes bf16
+nowhere.
+
+**Why nothing caught it, which is the finding worth keeping.**
+`RunMoePlaced` takes its engine device from `engine.q.device.type`, and the CPU
+is the only legal placement target, so on a CPU-only build `placed_on` always
+equals the engine device and **the placed branch is unreachable**. Every unit
+test and all of CI exercise only the inert path; the placed branch's sole
+execution is on a GPU box. An entire branch of a shared seam that six
+architecture families route through has no coverage any merge gate can see.
+
+`tests/vllm/model_executor/test_placement_dump_dtype.cpp` covers the dump's
+half, in its OWN binary because `VT_PLACEMENT_DUMP_MOE` latches on first use and
+`test_device_placement` drives the seam first — sharing a binary would latch it
+to "unset" and the suite would pass while asserting nothing. Mutation-proven at
+1 case / 4 assertions on a mutant that compiles at rc=0.
+
+**Owed:** the placed branch itself, still untested on CPU. Closing it needs a
+loopback placement target or a GPU-gated test. Named rather than assumed
+covered.
+
 ## Risks and decisions
 
 - **The bandwidth ratio is assumed, not measured.** Every number in that table comes

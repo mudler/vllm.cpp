@@ -186,6 +186,19 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        const std::vector<int64_t>& positions,
                                        const std::vector<float>& rms_weight, float eps,
                                        int64_t compress_ratio, int64_t head_dim,
+                                       // THE POOLED ROW IS ROTATED. The kernel that
+                                       // writes the compressed cache applies GPT-J
+                                       // RoPE to the ROPE TAIL only, unconditionally,
+                                       // at `compressed_pos = (position /
+                                       // compress_ratio) * compress_ratio` -- the
+                                       // WINDOW'S BASE position, not the emitting
+                                       // token's
+                                       // (`fused_compress_quant_cache.py:272-297`).
+                                       // `rope_dim == 0` leaves the row unrotated,
+                                       // which is what every gate written before this
+                                       // parameter existed expects.
+                                       int64_t rope_dim = 0,
+                                       double rope_theta = 10000.0,
                                        // `coff = 1 + (compress_ratio == 4)`
                                        // (compressor.py:247-248). At 2 the kv/score
                                        // rows are `coff*head_dim` wide and a window

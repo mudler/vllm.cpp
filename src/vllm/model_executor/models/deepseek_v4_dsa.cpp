@@ -366,7 +366,8 @@ std::vector<float> CompressorLayerStep(
     std::vector<float>* state_score, std::vector<float>* comp_rows,
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
-    int64_t sliding_window, float eps, float scale) {
+    int64_t sliding_window, float eps, float scale, int64_t rope_dim,
+    double rope_theta) {
   // W3 (#2286): both shapes now. `coff = 1 + (compress_ratio == 4)`
   // (`compressor.py:247-248`); at 2 the projections are doubled and a window
   // position's ROLE picks which half it reads.
@@ -428,7 +429,8 @@ std::vector<float> CompressorLayerStep(
   // 2-3. Drive the state machine and keep whatever closed this step.
   const std::vector<float> emitted =
       CompressorStepCycle(state_kv, state_score, kv, score, comp_ape, positions,
-                          comp_norm_weight, eps, compress_ratio, head_dim, coff);
+                          comp_norm_weight, eps, compress_ratio, head_dim, rope_dim,
+                          rope_theta, coff);
   comp_rows->insert(comp_rows->end(), emitted.begin(), emitted.end());
 
   // 4. The window pass carries the sink and keeps its LSE.
@@ -444,6 +446,53 @@ std::vector<float> CompressorLayerStep(
 
   return MergeWindowAndCompressed(queue, win_out, win_lse, q, *comp_rows, n_rows,
                                   num_tokens, num_heads, head_dim, scale);
+}
+
+std::vector<float> IndexerCompressedKeys(
+    const std::vector<float>& x, const std::vector<float>& idx_wk,
+    const std::vector<float>& idx_comp_wgate, const std::vector<float>& idx_comp_ape,
+    const std::vector<float>& idx_comp_norm_weight, std::vector<float>* state_kv,
+    std::vector<float>* state_score, const std::vector<int64_t>& positions,
+    int64_t num_tokens, int64_t hidden, int64_t index_head_dim, int64_t compress_ratio,
+    int64_t rope_dim, double rope_theta, float eps) {
+  VT_CHECK(compress_ratio == 4,
+           "deepseek-v4 indexer keys: the indexer exists ONLY at compress_ratio 4 "
+           "(attention.py:274), where coff is 2");
+  const int64_t coff = 2;
+  const int64_t iw = coff * index_head_dim;
+  VT_CHECK(state_kv != nullptr && state_score != nullptr,
+           "deepseek-v4 indexer keys: the state is CARRIED, not owned here");
+  VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
+           "deepseek-v4 indexer keys: x must be [num_tokens, hidden]");
+  VT_CHECK(static_cast<int64_t>(idx_wk.size()) == iw * hidden,
+           "deepseek-v4 indexer keys: idx_wk is [coff*index_head_dim, hidden]");
+  VT_CHECK(static_cast<int64_t>(idx_comp_wgate.size()) == iw * hidden,
+           "deepseek-v4 indexer keys: its gate has the same width as the KV it is "
+           "fused with (compressor.py:279-287)");
+  VT_CHECK(static_cast<int64_t>(idx_comp_norm_weight.size()) == index_head_dim,
+           "deepseek-v4 indexer keys: norm is [index_head_dim] and is NOT widened "
+           "(compressor.py:288)");
+
+  // Both halves come from the hidden state, as one fused projection upstream.
+  const auto project = [&](const std::vector<float>& w) {
+    std::vector<float> out(static_cast<size_t>(num_tokens) * iw, 0.0f);
+    for (int64_t t = 0; t < num_tokens; ++t)
+      for (int64_t d = 0; d < iw; ++d) {
+        double acc = 0.0;
+        const float* wr = &w[static_cast<size_t>(d * hidden)];
+        const float* xt = &x[static_cast<size_t>(t * hidden)];
+        for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(wr[h]) * xt[h];
+        out[static_cast<size_t>(t * iw + d)] = static_cast<float>(acc);
+      }
+    return out;
+  };
+  const std::vector<float> ikv = project(idx_wk);
+  const std::vector<float> iscore = project(idx_comp_wgate);
+
+  // The SAME cycle, at the indexer's dimensions and with rotation on.
+  return CompressorStepCycle(state_kv, state_score, ikv, iscore, idx_comp_ape,
+                             positions, idx_comp_norm_weight, eps, compress_ratio,
+                             index_head_dim, rope_dim, rope_theta, coff);
 }
 
 }  // namespace vllm::deepseek_v4

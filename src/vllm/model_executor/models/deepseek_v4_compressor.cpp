@@ -2,6 +2,8 @@
 // See deepseek_v4_compressor.h for the full port map (file:line on both sides).
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
 
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -188,6 +190,7 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        const std::vector<int64_t>& positions,
                                        const std::vector<float>& rms_weight, float eps,
                                        int64_t compress_ratio, int64_t head_dim,
+                                       int64_t rope_dim, double rope_theta,
                                        int64_t coff) {
   VT_CHECK(state_kv != nullptr && state_score != nullptr,
            "CompressorStepCycle: state buffers are required");
@@ -252,8 +255,24 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
       std::copy(state_score->begin() + base, state_score->begin() + base + head_dim,
                 wsc.begin() + i * head_dim);
     }
-    const std::vector<float> pooled =
+    std::vector<float> pooled =
         CompressorPoolNorm(wkv, wsc, valid, rms_weight, eps, win, head_dim);
+    // ROTATE THE POOLED ROW. `fused_compress_quant_cache.py:272-297` applies
+    // GPT-J RoPE to the rope tail only, and does so UNCONDITIONALLY -- the
+    // `rotate` constructor flag is dead and both compressors pass it. The
+    // position is `(position / compress_ratio) * compress_ratio`, the window's
+    // BASE rather than the emitting token's, so every row of one window shares a
+    // phase.
+    if (rope_dim > 0) {
+      VT_CHECK(rope_dim % 2 == 0 && rope_dim <= head_dim,
+               "CompressorStepCycle: the rope tail is rotated in PAIRS and lies "
+               "inside the head");
+      const int64_t compressed_pos = (pos / compress_ratio) * compress_ratio;
+      RopeInplaceLayer(pooled.data() + (head_dim - rope_dim), rope_dim,
+                       compressed_pos, rope_theta, /*freq_scale=*/1.0,
+                       /*ext_factor=*/0.0, /*n_ctx_orig=*/0, /*beta_fast=*/0.0,
+                       /*beta_slow=*/0.0);
+    }
     emitted.insert(emitted.end(), pooled.begin(), pooled.end());
   }
   return emitted;

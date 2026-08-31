@@ -796,3 +796,98 @@ TEST_CASE("W1: a step resuming past the compressor's state REFUSES (#2286)") {
       &rows, {1}, /*kv_base=*/1, 1, nh, H, hd, cr, win, 1e-6f, 1.0f));
   CHECK(st_kv.size() == static_cast<size_t>(2 * hd));
 }
+
+TEST_CASE("W3: the indexer's compressed KEYS come from its own second compressor") {
+  // `attention.py:768-776`. The indexer owns a second `DeepseekCompressor` at
+  // `head_dim = index_head_dim`, and its pooled rows are the KEYS the top-k
+  // scores against rather than an attention contributor -- so this produces keys
+  // and nothing else.
+  //
+  // `rope_dim` is the MODEL's `qk_rope_head_dim` and not a function of
+  // `index_head_dim` (`compressor.py:240`), which is the detail a reader would
+  // most likely derive wrongly from the indexer's own width.
+  // T == 8, so TWO windows close: at position 3 (base 0) and 7 (base 4). The
+  // first window's base is 0, where RoPE is the IDENTITY -- a case that stopped
+  // at T == 4 would compare a rotated row against an unrotated one and find them
+  // equal, which is exactly what the first version of this case did.
+  const int64_t H = 8, ihd = 8, cr = 4, rd = 4, T = 8;
+  const int64_t iw = 2 * ihd;  // coff is always 2 where the indexer exists
+
+  const std::vector<float> x = Rand(static_cast<size_t>(T * H), 3311u, 0.3f);
+  const std::vector<float> wk = Rand(static_cast<size_t>(iw * H), 3312u, 0.1f);
+  const std::vector<float> wg = Rand(static_cast<size_t>(iw * H), 3313u, 0.1f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * iw), 3314u, 0.05f);
+  const std::vector<float> nrm(static_cast<size_t>(ihd), 1.0f);
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = t;
+
+  std::vector<float> st_kv, st_sc;
+  const std::vector<float> keys = vllm::deepseek_v4::IndexerCompressedKeys(
+      x, wk, wg, ape, nrm, &st_kv, &st_sc, pos, T, H, ihd, cr, rd, 10000.0, 1e-6f);
+
+  // Boundaries at 3 and 7, so TWO key rows, each at the indexer's own width --
+  // NOT the doubled width the projections carry.
+  REQUIRE(keys.size() == static_cast<size_t>(2 * ihd));
+  double mag = 0.0;
+  for (const float v : keys) {
+    REQUIRE(std::isfinite(v));
+    mag = std::max(mag, std::abs(static_cast<double>(v)));
+  }
+  CHECK(mag > 1e-6);
+
+  // The state accumulated the DOUBLED rows, since a token carries both roles.
+  CHECK(st_kv.size() == static_cast<size_t>(T * iw));
+  CHECK(st_sc.size() == static_cast<size_t>(T * iw));
+
+  // THE KEY IS ROTATED: the same run with rope off must differ, or the indexer's
+  // keys would be position-blind exactly as the attention compressor's were.
+  std::vector<float> u_kv, u_sc;
+  const std::vector<float> unrot = vllm::deepseek_v4::IndexerCompressedKeys(
+      x, wk, wg, ape, nrm, &u_kv, &u_sc, pos, T, H, ihd, cr, /*rope_dim=*/0, 10000.0,
+      1e-6f);
+  REQUIRE(unrot.size() == keys.size());
+  // The FIRST row's base is 0, so rotation is the identity there and the two must
+  // AGREE -- that is the window-base rule showing itself.
+  for (int64_t d = 0; d < ihd; ++d)
+    CHECK(keys[static_cast<size_t>(d)] ==
+          doctest::Approx(unrot[static_cast<size_t>(d)]));
+  // The SECOND row's base is 4, so its rope tail MUST differ.
+  double diff = 0.0;
+  for (int64_t d = ihd - rd; d < ihd; ++d)
+    diff = std::max(diff, std::abs(static_cast<double>(keys[static_cast<size_t>(ihd + d)] -
+                                                       unrot[static_cast<size_t>(ihd + d)])));
+  CHECK(diff > 1e-6);
+  // ...and only the ROPE TAIL moved; the nope half is position-independent.
+  for (int64_t d = 0; d < ihd - rd; ++d)
+    CHECK(keys[static_cast<size_t>(ihd + d)] ==
+          doctest::Approx(unrot[static_cast<size_t>(ihd + d)]));
+
+  // THE KV AND THE GATE ARE DISTINCT OPERANDS. They are fused into one projection
+  // upstream but are not the same half: the KV is pooled, the gate only weights
+  // the pooling. Every assertion above is structural and holds for ANY
+  // non-degenerate KV, so a mutation pooling the GATE as the KV survived them.
+  // Running with the gate in both slots must give different keys.
+  std::vector<float> g_kv, g_sc;
+  const std::vector<float> gate_as_kv = vllm::deepseek_v4::IndexerCompressedKeys(
+      x, /*idx_wk=*/wg, wg, ape, nrm, &g_kv, &g_sc, pos, T, H, ihd, cr, rd, 10000.0,
+      1e-6f);
+  REQUIRE(gate_as_kv.size() == keys.size());
+  double swap = 0.0;
+  for (size_t i = 0; i < keys.size(); ++i)
+    swap = std::max(swap, std::abs(static_cast<double>(keys[i] - gate_as_kv[i])));
+  CHECK(swap > 1e-6);
+}
+
+TEST_CASE("W3: the indexer REFUSES a ratio it cannot exist at") {
+  const int64_t H = 4, ihd = 4, iw = 8;
+  const std::vector<float> x(static_cast<size_t>(H), 0.1f);
+  const std::vector<float> wk(static_cast<size_t>(iw * H), 0.1f);
+  const std::vector<float> wg(static_cast<size_t>(iw * H), 0.1f);
+  const std::vector<float> ape(static_cast<size_t>(128 * iw), 0.0f);
+  const std::vector<float> nrm(static_cast<size_t>(ihd), 1.0f);
+  std::vector<float> st_kv, st_sc;
+  // The indexer exists ONLY at cr == 4 (`attention.py:274`).
+  CHECK_THROWS(vllm::deepseek_v4::IndexerCompressedKeys(
+      x, wk, wg, ape, nrm, &st_kv, &st_sc, {0}, 1, H, ihd, /*cr=*/128, 2, 10000.0,
+      1e-6f));
+}

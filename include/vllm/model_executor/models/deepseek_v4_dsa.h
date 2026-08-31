@@ -264,6 +264,38 @@ std::vector<float> CompressorLayerStep(
     std::vector<float>* state_score, std::vector<float>* comp_rows,
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
-    int64_t sliding_window, float eps, float scale);
+    int64_t sliding_window, float eps, float scale,
+    // The pooled row's rope tail is rotated at the WINDOW'S BASE position
+    // (`fused_compress_quant_cache.py:272-297`). 0 leaves it unrotated.
+    int64_t rope_dim = 0, double rope_theta = 10000.0);
+
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — the INDEXER's compressed keys.
+//
+// The indexer owns a second `DeepseekCompressor` at `head_dim = index_head_dim`
+// (`attention.py:768-776`), and its pooled rows are the KEYS its top-k scores
+// against -- not an attention contributor. So this produces keys and nothing
+// else; the selection consumes them.
+//
+// It is the SAME cycle: both compressors go through `compress_norm_rope_store_*`
+// and the dispatch names the split ("triton (indexer/AMD)",
+// `compressor.py:414-415`). So the rope rule is identical -- the last
+// `rope_head_dim` elements, at `(position / compress_ratio) * compress_ratio`.
+//
+// `rope_dim` is the MODEL's `qk_rope_head_dim`, not a function of
+// `index_head_dim`: `compressor.py:240` sets `self.rope_head_dim =
+// config.qk_rope_head_dim` whatever the compressor's own head is. At the real
+// geometry that is 64 inside a 128-wide indexer head.
+//
+// `coff` is always 2 here, because the indexer exists only at
+// `compress_ratio == 4` (`attention.py:274`).
+//
+//   returns the compressed key rows emitted this step, [k * index_head_dim]
+std::vector<float> IndexerCompressedKeys(
+    const std::vector<float>& x, const std::vector<float>& idx_wk,
+    const std::vector<float>& idx_comp_wgate, const std::vector<float>& idx_comp_ape,
+    const std::vector<float>& idx_comp_norm_weight, std::vector<float>* state_kv,
+    std::vector<float>* state_score, const std::vector<int64_t>& positions,
+    int64_t num_tokens, int64_t hidden, int64_t index_head_dim, int64_t compress_ratio,
+    int64_t rope_dim, double rope_theta, float eps);
 
 }  // namespace vllm::deepseek_v4

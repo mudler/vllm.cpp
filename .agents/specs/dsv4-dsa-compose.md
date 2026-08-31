@@ -404,6 +404,74 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## What the top-k INDEXES, which was the last unknown
+
+`_fill_short_context_topk_indices` (`attention.py:71-87`) settles it, and it is
+the short-context arm writing the answer in the clear:
+
+    num_compressed = (positions + 1) // COMPRESS_RATIO
+    store(offsets < num_compressed ? offsets : -1)
+
+So a selection index addresses a **COMPRESSED ROW**, not a token: index `i` means
+the i-th compressed entry, the count available at a position is
+`(position + 1) / compress_ratio`, and `-1` is the invalid marker padding the row
+out to `TOP_K`.
+
+That is the same arithmetic the `c128a` path uses, where selection is "which
+compressed windows have CLOSED" and needs no learned component. The `cr == 4`
+family differs only in that the indexer LEARNS which of those closed rows to
+take.
+
+**This tree's `sel[t]` holds TOKEN indices into `kv_keys`.** Re-pointing the
+selection is therefore not a change of operand alone: the attention must attend
+compressed rows at the selected indices, and `-1` must be honoured as padding
+rather than read as a row. Both are behaviour changes to the attention path, not
+to the indexer, which is why this is recorded before either is attempted.
+
+## The indexer's compressed KEYS are produced
+
+`IndexerCompressedKeys` runs the indexer's second `DeepseekCompressor` at
+`index_head_dim`: both halves projected from the hidden state, then the SAME cycle
+with `coff == 2` and rotation on. Its output is keys and nothing else, because the
+indexer's pooled rows are what the top-k scores against.
+
+Two details are read from upstream rather than derived. `rope_dim` is the MODEL's
+`qk_rope_head_dim` whatever the compressor's own head is (`compressor.py:240`), so
+at the real geometry it is 64 inside a 128-wide indexer head -- deriving it from
+`index_head_dim` is the likely mistake. And `coff` is always 2, because the
+indexer exists only at `compress_ratio == 4` (`attention.py:274`).
+
+**The gate needed two repairs, both the same shape as earlier ones.** With
+`T == 4` only one window closes, at base position 0, where RoPE is the identity --
+so a rotated row compared equal to an unrotated one and the rotation looked inert.
+And every remaining assertion was STRUCTURAL (size, finiteness, magnitude), which
+holds for any non-degenerate KV, so a mutation pooling the GATE as the KV survived
+untouched. The case now closes two windows and compares the KV and gate slots
+against each other. Three mutations run red: the gate pooled as the KV, `coff`
+collapsed to 1, and the keys left unrotated.
+
+## The pooled row IS rotated, and W1 was not doing it
+
+Chasing whether the INDEXER's cycle rotates answered a question about the
+ATTENTION compressor instead, and the answer is a defect in what W1 landed.
+
+`fused_compress_quant_cache.py:272-297` applies GPT-J RoPE to the pooled row's
+ROPE TAIL, unconditionally -- there is no `rotate` predicate in the kernel, and
+both compressors pass the dead flag. `CompressorPoolNorm` and the cycle applied
+NO rotation at all, so every compressed key this row produced was
+position-blind: attention over the compressed history could not tell one window
+from another, while every value stayed finite.
+
+The position is the non-obvious part and is now gated: `compressed_pos =
+(position / compress_ratio) * compress_ratio`, the WINDOW'S BASE rather than the
+emitting token's, so all rows of one window share a phase. The gate derives the
+second emitted row by hand at base position 2 and separately shows that rotating
+at the token's own position 3 gives a different, equally finite answer.
+
+Three mutations run red: the token's position used instead of the window's base,
+the nope half rotated instead of the tail, and the rotation skipped entirely --
+which is exactly the state this row shipped in until now.
+
 ## The indexer's cycle, as upstream builds it
 
 Read before starting it, because two details change its shape
@@ -412,18 +480,46 @@ Read before starting it, because two details change its shape
 - The indexer owns a `DeepseekV4IndexerCache` keyed by `compress_ratio`, and its
   `DeepseekCompressor` writes INTO that cache (`k_cache_prefix=` is passed to the
   compressor). So the compressed keys are cache rows, not a returned buffer.
-- That compressor is constructed with **`rotate=True`**, where the main
-  compressor is not. The indexer's pooled keys carry RoPE and the attention
-  compressor's do not, so the two cycles are NOT the same call with different
-  dimensions.
+- ~~That compressor is constructed with `rotate=True`, where the main compressor
+  is not.~~ **WRONG, and corrected the commit after it was written.** The MAIN
+  attention compressor passes `rotate=True` too (`attention.py:340`), so it is
+  not a difference between them at all. Worse, `rotate` is assigned to
+  `self.rotate` (`compressor.py:234`) and **never read anywhere in the package**:
+  it is a dead parameter, and it says nothing about either cycle. Nothing about
+  RoPE can be concluded from it in either direction.
 - Selection is `SparseAttnIndexer` over that cache with
   `skip_k_cache_insert=True`, at `topk_tokens = index_topk`. So the top-k scores
   against the COMPRESSED cache rather than against per-token keys, which is what
   `ik` currently feeds `DispLogits`.
 
-So the remaining work is: an indexer-side cache, a second compressor cycle with
-rotation at `index_head_dim`, and a selection re-pointed from per-token keys to
-that cache. All four of its tensors load (previous commit); none of that is a
+So the remaining work is: an indexer-side cache, a second compressor cycle at
+`index_head_dim`, and a selection re-pointed from per-token keys to that cache.
+
+**RESOLVED: the indexer's cycle DOES rotate, by the same rule.** Both compressors
+go through the `compress_norm_rope_store_*` family, and the dispatch names the
+split explicitly: "cutedsl (head=512) accepts the full-cache flags; triton
+(indexer/AMD) does not" (`compressor.py:414-415`). The rope contract is stated
+directly above it (`:396-399`): applied to the LAST `rope_head_dim` elements of
+`head_dim`, at position `(positions // compress_ratio) * compress_ratio`. That is
+the same rule the attention compressor's fix implements.
+
+The cache-layout difference below is about STORAGE, not about whether rotation
+happens: the rotation is applied before the store, and the indexer's store
+quantizes the result. So it does not make the indexer an exception, and the
+earlier note that it left the question open is superseded.
+
+**The cache layouts still differ, and that matters for the store.** The
+attention compressor's cache carries an explicit bf16 area for the rotated rope
+tail (`fused_compress_quant_cache.py:293`). The indexer's does not: its
+`k_cache_head_dim` is a BYTE layout, `head_dim + head_dim / quant_block_size * 4`
+-- 132 bytes for a 128-wide head, being 128 fp8 values plus four fp32 scales
+(`attention.py:751-760`), or an MXFP4 variant at 68. There is no bf16 rope area in
+it at all.
+
+So the two caches are shaped differently and the shared kernel's rope store has
+nowhere to land in the indexer's. Reading the indexer's own write path is the
+precondition for its cycle, and assuming the attention compressor's answer would
+put a rotated tail into a layout with no room for one. All four of its tensors load (previous commit); none of that is a
 width change, and treating it as one would compute a top-k over the wrong
 operand rather than refuse.
 

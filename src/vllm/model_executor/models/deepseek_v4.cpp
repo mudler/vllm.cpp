@@ -1105,7 +1105,10 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           &cs.state_kv[static_cast<size_t>(layer)],
           &cs.state_score[static_cast<size_t>(layer)],
           &cs.comp_rows[static_cast<size_t>(layer)], pos64, kv_base, T, nh, H, hd,
-          p.compress_ratio(layer), p.sliding_window, eps, scale);
+          p.compress_ratio(layer), p.sliding_window, eps, scale,
+          // The compressed row carries RoPE on its tail, at this layer's own
+          // base -- compressed layers use `compress_rope_theta`.
+          rope, rope_base);
     } else
     o = deepseek_v4::PagedCausalMlaAttention(
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],

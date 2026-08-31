@@ -62,15 +62,20 @@
 // kernel is wrong and the bound is not the thing to change.
 //
 // ─── SCOPE, HONESTLY ─────────────────────────────────────────────────────────
-// THREE OF THE SIX `qwen4_exp` OPS HAVE CUDA ARMS. `vt::Qwen4ExpGatedResidual`,
-// `vt::RmsNormGroup`, `vt::Qwen4ExpQsaCompress` and
-// `vt::Qwen4ExpQsaGatherAttention` do not, and neither does the block-decoding
-// n-gram gather `vt::Embedding` needs (`EmbeddingKernelCuda` refuses a
-// block-quantized table by name). So `ModelRegistry::Forward` still cannot run
-// this architecture on a CUDA queue, NOTHING IN PRODUCTION REACHES THESE THREE
-// KERNELS, and their reachability from a production entry point is VACUOUS
-// rather than proven. The spec's `## Owed` names each missing arm and the row
-// that owns the wiring. No token claim and no speed claim.
+// **THE PARAGRAPH THAT STOOD HERE IS STALE AND IS REPLACED RATHER THAN LEFT TO
+// AGE.** It read "THREE OF THE SIX `qwen4_exp` OPS HAVE CUDA ARMS", naming
+// `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup` and the two QSA ops as absent.
+// W6-CUDA-B landed all four, so ALL SIX `qwen4_exp` ops plus `vt::RmsNormGroup`
+// now have CUDA arms and the registration case at the bottom of this file
+// asserts each one RESOLVES.
+//
+// WHAT IS STILL MISSING IS NOT ONE OF THEM: the block-decoding n-gram gather
+// `vt::Embedding` needs (`EmbeddingKernelCuda` refuses a block-quantized table
+// by name), which is a separate wave's file territory. `ModelRegistry::Forward`
+// is all-or-nothing, so until that lands NOTHING IN PRODUCTION REACHES THESE
+// KERNELS and their reachability from a production entry point is VACUOUS rather
+// than proven. The spec's `## Owed` names the remaining blocker and the row that
+// owns the wiring. No token claim and no speed claim.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -843,14 +848,22 @@ TEST_CASE("the qwen4_exp CUDA arms are registered for kCUDA and refuse BY NAME e
   CHECK(vt::GetOp(vt::OpId::kQwen4ExpPleConv, DeviceType::kCUDA) != nullptr);
   CHECK(vt::GetOp(vt::OpId::kQwen4ExpPleGate, DeviceType::kCUDA) != nullptr);
   CHECK(vt::GetOp(vt::OpId::kQwen4ExpGatedResidualWriteBack, DeviceType::kCUDA) != nullptr);
-  // The three ops this wave did NOT give a CUDA arm. They must still refuse, by
-  // name, rather than silently falling back to a CPU kernel that would then
-  // dereference device pointers. If a later wave registers one, this case fails
-  // and the reader is sent to the spec's `## Owed` to strike the entry.
-  CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpGatedResidual, DeviceType::kCUDA));
-  CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpQsaCompress, DeviceType::kCUDA));
-  CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpQsaGatherAttention, DeviceType::kCUDA));
-  CHECK_THROWS(vt::GetOp(vt::OpId::kRmsNormGroup, DeviceType::kCUDA));
+  // **THESE FOUR WERE `CHECK_THROWS` UNTIL W6-CUDA-B, AND THE FLIP IS THIS
+  // WAVE'S RED.** The comment that stood here said "The three ops this wave did
+  // NOT give a CUDA arm ... If a later wave registers one, this case fails and
+  // the reader is sent to the spec's `## Owed` to strike the entry." That is
+  // exactly what happened, and it undercounted by one: `kQwen4ExpGatedResidual`
+  // is a DIFFERENT op from `kQwen4ExpGatedResidualWriteBack` two lines up, and a
+  // substring reading of the registration list makes the mixer look covered when
+  // it is not. W6-CUDA-B landed all four
+  // (`src/vt/cuda/cuda_qwen4_exp.cu`, `cuda_qwen4_exp_qsa.cu`,
+  // `cuda_rms_norm_group.cu`), so they must now RESOLVE rather than refuse — and
+  // a regression that loses a registration reds here, which is the reason to
+  // keep asserting the direction rather than deleting the lines.
+  CHECK(vt::GetOp(vt::OpId::kQwen4ExpGatedResidual, DeviceType::kCUDA) != nullptr);
+  CHECK(vt::GetOp(vt::OpId::kQwen4ExpQsaCompress, DeviceType::kCUDA) != nullptr);
+  CHECK(vt::GetOp(vt::OpId::kQwen4ExpQsaGatherAttention, DeviceType::kCUDA) != nullptr);
+  CHECK(vt::GetOp(vt::OpId::kRmsNormGroup, DeviceType::kCUDA) != nullptr);
 #endif
 }
 

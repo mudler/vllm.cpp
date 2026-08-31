@@ -1,0 +1,912 @@
+// Qwen4-Exp (Qwen3.8-Flash-Next) W6-CUDA-B DEVICE-ARM GATE — the CUDA arms of
+// the three ops that own a REDUCTION: `vt::Qwen4ExpGatedResidual` (the mixer),
+// `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`.
+// Row MODEL-MM-QWEN4-EXP, campaign issue #1978, spec
+// `.agents/specs/qwen4-exp-flash-next.md`.
+//
+// `vt::RmsNormGroup`'s CUDA arm is the fourth and is gated in
+// `tests/vt/test_ops_rms_norm_group_cuda.cpp`, beside its CPU suite, because it
+// is a shared `vt::` seam and not a `qwen4_exp` op.
+//
+// WHAT IS UNDER TEST, AND WHAT IT IS COMPARED AGAINST. Two things, and the
+// distinction is the point of the file — the arrangement
+// `test_qwen4_exp_cuda.cpp` already states for the W6-CUDA arms:
+//
+//   1. THE ORACLE. The mixer against `qwen4_exp_hc_goldens.inc` and the two QSA
+//      ops against `fixtures/qwen4_exp_qsa_goldens.inc`, both dumped by lifting
+//      transformers v5.16.0 VERBATIM by line range and EXECUTING it under torch.
+//      The CPU arms are held to the same files, so the two arms answer to ONE
+//      oracle instead of to each other.
+//   2. THE CPU ARM, on identical inputs. A DEVICE ARM GATED ONLY AGAINST ITSELF
+//      WOULD BE WORTHLESS, and the goldens' widths (16-element index heads,
+//      6-element hidden) cannot see a defect that needs a warp to express.
+//
+// ─── THE THREE BOUNDS, AND WHY THEY ARE NOT THE SAME NUMBER ──────────────────
+//
+// `vt::Qwen4ExpQsaCompress` IS BYTE-IDENTICAL to its CPU arm and is gated by a
+// byte comparison, in BOTH arms of `round_intermediates_to_bf16`. It has no
+// transcendental, every reduction runs in the host's ascending f32 order, and
+// every multiply/add is spelled `__fmul_rn`/`__fadd_rn` against the host's
+// pinned `-ffp-contract=off`. **AND THAT MAKES ITS ORACLE GATE TRANSITIVE,
+// EXACTLY:** the CPU arm is held to the goldens by
+// `test_qwen4_exp_qsa_device.cpp`, the CUDA arm is held to the CPU arm by
+// equality, and equality composes. That argument is available only BECAUSE the
+// relation is equality; it would be invalid for a tolerance, and it is stated
+// rather than assumed.
+//
+// `vt::Qwen4ExpQsaGatherAttention` has ONE divergence source and it is named:
+// `exp`. The CPU arm calls `std::exp` on a float, the device arm calls `expf`,
+// and CUDA documents up to 2 ulp for `expf` where glibc's is correctly rounded.
+// Every other operation is IEEE-exact or `_rn`, and all four of the CPU arm's
+// reduction ORDERS are preserved (the kernel's header enumerates them), so the
+// arms are EXPECTED to be byte-identical and are deliberately NOT asserted to
+// be: `kUlpTol` is one f32 ulp relative and the cases MEASURE and PRINT the
+// difference, so a future toolkit that moves `exp` is visible as a number rather
+// than as a red gate nobody can read.
+//
+// `vt::Qwen4ExpGatedResidual` has TWO, and the second is structural. Its three
+// projections go through the shared seam `vt::MatmulBT` — a device GEMM, which
+// re-associates the K reduction — where the CPU arm uses its private
+// `LinearNoBias`, an ascending f32 walk. That is a deliberate trade the kernel's
+// header argues (a hand-written device GEMV beside `vt::MatmulBT` is the
+// parallel path AGENTS.md forbids, and it would give the released checkpoint's
+// 194 Q8_0 mix weights a second private route), and the COST is this bound.
+// `kMixerTol` is therefore the ORACLE's 1e-5 and not one ulp: both arms are held
+// to the golden at 1e-5, so their mutual difference cannot usefully be asserted
+// tighter than the band they each live in. The number is MEASURED and printed on
+// every run.
+//
+// **NEVER WIDEN A BOUND TO MAKE A CASE PASS.** The defects each bound has to
+// separate are orders of magnitude away and this file measures the separations
+// rather than asserting them: the mixer's eps probe, the compressor's rope
+// position, and the gather's gather-vs-mask observable are all carried below.
+//
+// ─── SCOPE, HONESTLY ─────────────────────────────────────────────────────────
+// ALL SIX `qwen4_exp` OPS PLUS `vt::RmsNormGroup` NOW HAVE CUDA ARMS. What is
+// still missing is the block-decoding n-gram gather `vt::Embedding` needs
+// (`EmbeddingKernelCuda` refuses a block-quantized table by name), which is
+// another wave's file territory. `ModelRegistry::Forward` is all-or-nothing, so
+// until that lands NOTHING IN PRODUCTION REACHES THESE KERNELS and their
+// reachability from a production entry point is VACUOUS rather than proven. The
+// spec's `## Owed` names the remaining blocker and the row that owns the wiring.
+// No token claim and no speed claim.
+#include <doctest/doctest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "support/max_abs_diff.h"
+#include "vt/backend.h"
+#include "vt/dtype.h"
+#include "vt/ops.h"
+
+using vllm_test::MaxAbsDiff;
+using vt::Backend;
+using vt::Device;
+using vt::DeviceType;
+using vt::DType;
+using vt::Qwen4ExpGatedResidualArgs;
+using vt::Qwen4ExpQsaAttnArgs;
+using vt::Qwen4ExpQsaCompressArgs;
+using vt::Queue;
+using vt::Tensor;
+
+namespace {
+
+#include "fixtures/qwen4_exp_qsa_goldens.inc"  // NOLINT — golden literals
+#include "qwen4_exp_hc_goldens.inc"            // NOLINT — golden literals
+
+namespace g = qwen4_exp_qsa_goldens;
+
+// ONE f32 ulp relative (2^-23 ~ 1.19e-7) with an absolute floor for the denormal
+// neighbourhood. Justified in the header; never widen it.
+constexpr double kUlpTol = 1.20e-7;
+constexpr double kAbsFloor = 1e-30;
+// The band both arms of the mixer already live in against the torch golden.
+constexpr double kMixerTol = 1e-5;
+// The bound the CPU compressor is held to against the golden, unchanged here.
+constexpr double kCompressL2 = 1e-6;
+// The bound the CPU gather is held to against the golden, unchanged here: the
+// oracle reduces in torch's order over the PADDED row and we reduce over the
+// gathered subset, so this is a summation-order band and not a slack.
+constexpr double kGatherL2 = 2e-3;
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+// LOUD, because a silent skip on a CPU box is how a device arm goes un-gated for
+// a release.
+bool SkipNoCuda(const char* what) {
+  if (HasCuda()) return false;
+  std::printf("[SKIP] no CUDA backend: %s NOT exercised\n", what);
+  return true;
+}
+
+Device Cpu() { return Device{DeviceType::kCPU, 0}; }
+Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
+Queue CpuQ() { return Queue{Cpu(), nullptr}; }
+
+Tensor MakeTensor(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+struct QueueGuard {
+  Backend& b;
+  Queue q;
+  explicit QueueGuard(Backend& backend) : b(backend), q(backend.CreateQueue()) {}
+  ~QueueGuard() { b.DestroyQueue(q); }
+  QueueGuard(const QueueGuard&) = delete;
+  QueueGuard& operator=(const QueueGuard&) = delete;
+};
+
+class DeviceTensor {
+ public:
+  DeviceTensor(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+               const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeTensor(p_, dt, Gpu(), shape);
+  }
+  ~DeviceTensor() { b_.Free(p_); }
+  DeviceTensor(const DeviceTensor&) = delete;
+  DeviceTensor& operator=(const DeviceTensor&) = delete;
+  Tensor& tensor() { return t_; }
+  void* raw() { return p_; }
+  void Download(Queue& q, void* dst) {
+    b_.Copy(q, dst, p_, bytes_);
+    b_.Synchronize(q);
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+std::vector<float> Slice(const float* p, int64_t n) { return std::vector<float>(p, p + n); }
+
+double RelL2(const std::vector<float>& a, const float* b, int64_t n) {
+  double num = 0.0, den = 0.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+    num += d * d;
+    den += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+  }
+  return std::sqrt(num) / std::max(std::sqrt(den), 1e-30);
+}
+
+// max|a-b| with `std::max`'s NaN blindness removed, plus the count of elements
+// that are not BITWISE equal. Both are reported, because "within one ulp" and
+// "identical" are different findings and this file claims the second wherever it
+// can get it.
+struct Agreement {
+  double worst = 0.0;
+  size_t not_bitwise_equal = 0;
+};
+
+Agreement Compare(const std::vector<float>& got, const std::vector<float>& want) {
+  REQUIRE(got.size() == want.size());
+  Agreement a;
+  // MaxAbsDiff returns +infinity on ANY non-finite operand and raises its own
+  // doctest failure, so an all-NaN device output cannot read as a perfect match
+  // here. That defect is issue #449 and this file must not re-introduce it by
+  // hand-rolling a reduction.
+  a.worst = MaxAbsDiff(got, want);
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) ++a.not_bitwise_equal;
+  }
+  return a;
+}
+
+// BOTH REPORTERS PRINT ON SUCCESS, not only on failure. doctest's INFO/CAPTURE
+// are emitted only when an assertion fails, so a passing run of a numeric gate
+// says nothing about HOW closely it passed. These numbers are the wave's
+// evidence and have to survive a green run.
+void CheckBitwise(const std::vector<float>& got, const std::vector<float>& want,
+                  const char* what) {
+  const Agreement a = Compare(got, want);
+  std::printf("[MEASURED] %-48s BYTE gate: %zu/%zu differ, max|diff| = %.9g\n", what,
+              a.not_bitwise_equal, want.size(), a.worst);
+  INFO(what << ": " << a.not_bitwise_equal << " of " << want.size()
+            << " elements differ; max|diff| = " << a.worst);
+  CHECK(a.not_bitwise_equal == 0);
+}
+
+void CheckWithin(const std::vector<float>& got, const std::vector<float>& want, double rel,
+                 const char* what) {
+  const Agreement a = Compare(got, want);
+  double scale = 0.0;
+  for (float v : want) scale = std::max(scale, static_cast<double>(std::fabs(v)));
+  const double bound = kAbsFloor + rel * scale;
+  std::printf("[MEASURED] %-48s max|diff| = %.9g  bound = %.9g  not-bitwise-equal = %zu/%zu\n",
+              what, a.worst, bound, a.not_bitwise_equal, want.size());
+  INFO(what << ": max|diff| = " << a.worst << " vs bound " << bound << "; "
+            << a.not_bitwise_equal << " of " << want.size()
+            << " elements not bitwise equal (0 means byte-identical)");
+  CHECK(a.worst <= bound);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// vt::Qwen4ExpGatedResidual — the mixer
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct HcCase {
+  std::string name;
+  int64_t hidden, hc, lowrank, T;
+  float eps;
+  const float *norm_w_hf, *down, *up, *inject, *hyper, *mixed, *inj_w;
+};
+
+const HcCase kHcA{"A", 6, 4, 5, 3, 1e-6f, kA_norm_w_hf, kA_down, kA_up,
+                  kA_inject, kA_hyper, kA_mixed, kA_inj_w};
+const HcCase kHcB{"B", 5, 3, 7, 2, 1e-5f, kB_norm_w_hf, kB_down, kB_up,
+                  kB_inject, kB_hyper, kB_mixed, kB_inj_w};
+// C is the `use_combine=False` arm — the model-level terminal mixer. Upstream
+// returns `mixed_input` alone there and registers NO `block_inject_weight`.
+const HcCase kHcC{"C", 6, 4, 5, 2, 1e-6f, kC_norm_w_hf, kC_down, kC_up,
+                  nullptr, kC_hyper, kC_mixed, nullptr};
+// D is the SMALL-MAGNITUDE case and it is here because A, B and C structurally
+// cannot see WHERE eps goes: at their `hyper_scale = 1.7` the mean square is
+// O(1) and the two spellings differ by ~5e-7, UNDER the bound, so an eps probe
+// run there is a mute switch. At `hyper_scale = 0.01` they separate by ~0.5%.
+const HcCase kHcD{"D", 6, 4, 5, 2, 1e-6f, kD_norm_w_hf, kD_down, kD_up,
+                  kD_inject, kD_hyper, kD_mixed, kD_inj_w};
+
+struct MixerResult {
+  std::vector<float> mixed;
+  std::vector<float> injection;
+  std::vector<float> hyper_after;  // the stream must come back UNCHANGED
+};
+
+MixerResult RunMixer(DeviceType dev, const HcCase& c) {
+  const int64_t flat = c.hc * c.hidden;
+  const bool combine = c.inject != nullptr;
+  std::vector<float> hyper = Slice(c.hyper, c.T * flat);
+  std::vector<float> w = Slice(c.norm_w_hf, flat);
+  std::vector<float> down = Slice(c.down, c.lowrank * flat);
+  std::vector<float> up = Slice(c.up, flat * c.lowrank);
+  std::vector<float> inject_w;
+  if (combine) inject_w = Slice(c.inject, c.hc * flat);
+  MixerResult r;
+  r.mixed.assign(static_cast<size_t>(c.T * c.hidden), 0.0f);
+  r.injection.assign(static_cast<size_t>(c.T * c.hc), 0.0f);
+  r.hyper_after = hyper;
+
+  Qwen4ExpGatedResidualArgs args;
+  args.hc_count = c.hc;
+  args.hidden_size = c.hidden;
+  args.lowrank = c.lowrank;
+  args.eps = c.eps;
+
+  if (dev == DeviceType::kCPU) {
+    Queue q = CpuQ();
+    Tensor t_h = MakeTensor(r.hyper_after.data(), DType::kF32, Cpu(), {c.T, flat});
+    Tensor t_w = MakeTensor(w.data(), DType::kF32, Cpu(), {flat});
+    Tensor t_d = MakeTensor(down.data(), DType::kF32, Cpu(), {c.lowrank, flat});
+    Tensor t_u = MakeTensor(up.data(), DType::kF32, Cpu(), {flat, c.lowrank});
+    Tensor t_m = MakeTensor(r.mixed.data(), DType::kF32, Cpu(), {c.T, c.hidden});
+    Tensor t_j = MakeTensor(r.injection.data(), DType::kF32, Cpu(), {c.T, c.hc});
+    Tensor t_i = combine ? MakeTensor(inject_w.data(), DType::kF32, Cpu(), {c.hc, flat})
+                         : Tensor{};
+    vt::Qwen4ExpGatedResidual(q, t_m, combine ? &t_j : nullptr, t_h, t_w, t_d, t_u,
+                              combine ? &t_i : nullptr, args);
+    return r;
+  }
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(b);
+  DeviceTensor d_h(b, qg.q, DType::kF32, {c.T, flat}, hyper.data());
+  DeviceTensor d_w(b, qg.q, DType::kF32, {flat}, w.data());
+  DeviceTensor d_d(b, qg.q, DType::kF32, {c.lowrank, flat}, down.data());
+  DeviceTensor d_u(b, qg.q, DType::kF32, {flat, c.lowrank}, up.data());
+  DeviceTensor d_m(b, qg.q, DType::kF32, {c.T, c.hidden});
+  DeviceTensor d_j(b, qg.q, DType::kF32, {c.T, c.hc});
+  DeviceTensor d_i(b, qg.q, DType::kF32, {combine ? c.hc : 1, flat},
+                   combine ? inject_w.data() : nullptr);
+  vt::Qwen4ExpGatedResidual(qg.q, d_m.tensor(), combine ? &d_j.tensor() : nullptr,
+                            d_h.tensor(), d_w.tensor(), d_d.tensor(), d_u.tensor(),
+                            combine ? &d_i.tensor() : nullptr, args);
+  b.Synchronize(qg.q);
+  d_m.Download(qg.q, r.mixed.data());
+  d_j.Download(qg.q, r.injection.data());
+  d_h.Download(qg.q, r.hyper_after.data());
+  return r;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The QSA fixture: the indexer runs ON THE CPU so the op under test is isolated
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct QsaCase {
+  std::string name;
+  int64_t seq;
+  const float *k_raw, *cos, *sin, *k_norm_w, *q_post, *block_keys;
+  const float *attn_q, *attn_k, *attn_v, *attn_out;
+};
+
+const QsaCase kSubBudget{"sub_budget",         g::kSubBudgetSeq,     g::kSubBudgetKRaw,
+                         g::kSubBudgetCos,     g::kSubBudgetSin,     g::kSubBudgetKNormW,
+                         g::kSubBudgetQPost,   g::kSubBudgetBlockKeys, g::kSubBudgetAttnQ,
+                         g::kSubBudgetAttnK,   g::kSubBudgetAttnV,   g::kSubBudgetAttnOut};
+const QsaCase kOverBudget{"over_budget",        g::kOverBudgetSeq,    g::kOverBudgetKRaw,
+                          g::kOverBudgetCos,    g::kOverBudgetSin,    g::kOverBudgetKNormW,
+                          g::kOverBudgetQPost,  g::kOverBudgetBlockKeys, g::kOverBudgetAttnQ,
+                          g::kOverBudgetAttnK,  g::kOverBudgetAttnV,  g::kOverBudgetAttnOut};
+
+constexpr int64_t kTopk = g::kTokenBudget / g::kCompressRatio;
+
+// The compressor, on either device, over the golden's own raw keys.
+std::vector<float> RunCompress(DeviceType dev, const QsaCase& c, bool round_bf16) {
+  const int64_t D = g::kIndexHeadDim, CR = g::kCompressRatio, rot = g::kRotaryDim;
+  const int64_t complete = (c.seq / CR) * CR;
+  const int64_t nb = complete / CR;
+  std::vector<float> raw = Slice(c.k_raw, complete * D);
+  std::vector<float> knw = Slice(c.k_norm_w, D);
+  std::vector<float> cos = Slice(c.cos, c.seq * rot);
+  std::vector<float> sin = Slice(c.sin, c.seq * rot);
+  std::vector<float> out(static_cast<size_t>(nb * D), 0.0f);
+  Qwen4ExpQsaCompressArgs args;
+  args.compress_ratio = CR;
+  args.rotary_dim = rot;
+  args.eps = g::kRmsNormEps;
+  args.round_intermediates_to_bf16 = round_bf16;
+  if (dev == DeviceType::kCPU) {
+    Queue q = CpuQ();
+    Tensor t_raw = MakeTensor(raw.data(), DType::kF32, Cpu(), {complete, D});
+    Tensor t_knw = MakeTensor(knw.data(), DType::kF32, Cpu(), {D});
+    Tensor t_cos = MakeTensor(cos.data(), DType::kF32, Cpu(), {c.seq, rot});
+    Tensor t_sin = MakeTensor(sin.data(), DType::kF32, Cpu(), {c.seq, rot});
+    Tensor t_out = MakeTensor(out.data(), DType::kF32, Cpu(), {nb, D});
+    vt::Qwen4ExpQsaCompress(q, t_out, t_raw, t_knw, t_cos, t_sin, args);
+    return out;
+  }
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(b);
+  DeviceTensor d_raw(b, qg.q, DType::kF32, {complete, D}, raw.data());
+  DeviceTensor d_knw(b, qg.q, DType::kF32, {D}, knw.data());
+  DeviceTensor d_cos(b, qg.q, DType::kF32, {c.seq, rot}, cos.data());
+  DeviceTensor d_sin(b, qg.q, DType::kF32, {c.seq, rot}, sin.data());
+  DeviceTensor d_out(b, qg.q, DType::kF32, {nb, D});
+  vt::Qwen4ExpQsaCompress(qg.q, d_out.tensor(), d_raw.tensor(), d_knw.tensor(),
+                          d_cos.tensor(), d_sin.tensor(), args);
+  b.Synchronize(qg.q);
+  d_out.Download(qg.q, out.data());
+  return out;
+}
+
+// The SELECTION, computed ON THE CPU by the two shared DSA ops, so that the
+// gather arm under test is isolated: a difference below is this op's, not the
+// indexer's. `weights == 1` and `n_head_scale == 1` collapse
+// `DsaIndexerLogits`'s fold to QSA's single `index_head_dim ** -0.5`.
+struct Selection {
+  std::vector<int32_t> block_ids;  // [T, kTopk], ASCENDING, -1 padded
+  std::vector<int32_t> kv_lens;    // [T]
+};
+
+Selection RunIndexerCpu(const QsaCase& c) {
+  const int64_t D = g::kIndexHeadDim, CR = g::kCompressRatio, rot = g::kRotaryDim;
+  const int64_t H = g::kIndexNHeads, T = c.seq;
+  const int64_t complete = (T / CR) * CR;
+  const int64_t nb = complete / CR;
+  Queue q = CpuQ();
+  Selection sel;
+  sel.kv_lens.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) sel.kv_lens[static_cast<size_t>(t)] = static_cast<int32_t>(t + 1);
+
+  std::vector<float> block_keys = RunCompress(DeviceType::kCPU, c, /*round_bf16=*/true);
+  std::vector<int32_t> ws(static_cast<size_t>(T), 0), we(static_cast<size_t>(T), 0);
+  for (int64_t t = 0; t < T; ++t) {
+    we[static_cast<size_t>(t)] = static_cast<int32_t>((t + 1) / CR);
+  }
+  std::vector<float> ones(static_cast<size_t>(T * H), 1.0f);
+  std::vector<float> logits(static_cast<size_t>(T * nb), 0.0f);
+  std::vector<float> qi = Slice(c.q_post, T * H * D);
+  (void)rot;
+
+  Tensor t_bk = MakeTensor(block_keys.data(), DType::kF32, Cpu(), {nb, D});
+  Tensor t_q = MakeTensor(qi.data(), DType::kF32, Cpu(), {T, H, D});
+  Tensor t_w = MakeTensor(ones.data(), DType::kF32, Cpu(), {T, H});
+  Tensor t_ws = MakeTensor(ws.data(), DType::kI32, Cpu(), {T});
+  Tensor t_we = MakeTensor(we.data(), DType::kI32, Cpu(), {T});
+  Tensor t_lg = MakeTensor(logits.data(), DType::kF32, Cpu(), {T, nb});
+  vt::DsaIndexerLogitsArgs largs;
+  largs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
+  largs.n_head_scale = 1.0f;
+  vt::DsaIndexerLogits(q, t_lg, t_q, t_bk, t_w, t_ws, t_we, largs);
+
+  sel.block_ids.assign(static_cast<size_t>(T * kTopk), -1);
+  std::vector<int32_t> counts(static_cast<size_t>(T), 0);
+  Tensor t_ids = MakeTensor(sel.block_ids.data(), DType::kI32, Cpu(), {T, kTopk});
+  Tensor t_cnt = MakeTensor(counts.data(), DType::kI32, Cpu(), {T});
+  vt::DsaTopkSelect(q, t_ids, t_cnt, t_lg, t_ws, t_we);
+  return sel;
+}
+
+struct GatherResult {
+  std::vector<float> out;
+  int64_t keys_visited = -1;
+};
+
+// The gather, on either device, over a CONTIGUOUS [max_kv, Hkv, Dh] cache.
+GatherResult RunGather(DeviceType dev, const std::vector<float>& qa,
+                       const std::vector<float>& ka, const std::vector<float>& va,
+                       const Selection& sel, int64_t T, int64_t HQ, int64_t HKV, int64_t DH,
+                       int64_t max_kv, bool want_counter) {
+  GatherResult r;
+  r.out.assign(static_cast<size_t>(T * HQ * DH), 0.0f);
+  Qwen4ExpQsaAttnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(DH));
+  args.compress_ratio = g::kCompressRatio;
+  if (want_counter) args.keys_visited = &r.keys_visited;
+  std::vector<float> qc = qa, kc = ka, vc = va;
+  std::vector<int32_t> ids = sel.block_ids, lens = sel.kv_lens;
+  if (dev == DeviceType::kCPU) {
+    Queue q = CpuQ();
+    Tensor t_q = MakeTensor(qc.data(), DType::kF32, Cpu(), {T, HQ, DH});
+    Tensor t_k = MakeTensor(kc.data(), DType::kF32, Cpu(), {max_kv, HKV, DH});
+    Tensor t_v = MakeTensor(vc.data(), DType::kF32, Cpu(), {max_kv, HKV, DH});
+    Tensor t_i = MakeTensor(ids.data(), DType::kI32, Cpu(), {T, kTopk});
+    Tensor t_l = MakeTensor(lens.data(), DType::kI32, Cpu(), {T});
+    Tensor t_o = MakeTensor(r.out.data(), DType::kF32, Cpu(), {T, HQ, DH});
+    vt::Qwen4ExpQsaGatherAttention(q, t_o, t_q, t_k, t_v, t_i, t_l, args);
+    return r;
+  }
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(b);
+  DeviceTensor d_q(b, qg.q, DType::kF32, {T, HQ, DH}, qc.data());
+  DeviceTensor d_k(b, qg.q, DType::kF32, {max_kv, HKV, DH}, kc.data());
+  DeviceTensor d_v(b, qg.q, DType::kF32, {max_kv, HKV, DH}, vc.data());
+  DeviceTensor d_i(b, qg.q, DType::kI32, {T, kTopk}, ids.data());
+  DeviceTensor d_l(b, qg.q, DType::kI32, {T}, lens.data());
+  DeviceTensor d_o(b, qg.q, DType::kF32, {T, HQ, DH});
+  vt::Qwen4ExpQsaGatherAttention(qg.q, d_o.tensor(), d_q.tensor(), d_k.tensor(),
+                                 d_v.tensor(), d_i.tensor(), d_l.tensor(), args);
+  b.Synchronize(qg.q);
+  d_o.Download(qg.q, r.out.data());
+  return r;
+}
+
+// The HOST expansion of a device selection, used ONLY to derive the EXPECTED
+// read count and the expected READ SET. It never touches the kernel's counter.
+std::vector<int64_t> ExpandHost(const Selection& sel, int64_t t, int64_t kv_len) {
+  const int64_t CR = g::kCompressRatio;
+  const int64_t complete = kv_len / CR;
+  std::vector<int64_t> out;
+  for (int64_t j = 0; j < kTopk; ++j) {
+    const int64_t b = sel.block_ids[static_cast<size_t>(t * kTopk + j)];
+    if (b < 0) break;
+    for (int64_t i = 0; i < CR; ++i) out.push_back(b * CR + i);
+  }
+  for (int64_t p = complete * CR; p < kv_len; ++p) out.push_back(p);
+  return out;
+}
+
+}  // namespace
+
+// ═════════════════════════════════════════════════════════════════════════════
+// vt::Qwen4ExpGatedResidual
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA reproduces the pinned oracle") {
+  if (SkipNoCuda("vt::Qwen4ExpGatedResidual CUDA arm vs the transformers oracle")) return;
+  for (const HcCase* c : {&kHcA, &kHcB, &kHcC, &kHcD}) {
+    INFO("case ", c->name);
+    const MixerResult gpu = RunMixer(DeviceType::kCUDA, *c);
+    const std::vector<float> want_mixed = Slice(c->mixed, c->T * c->hidden);
+    const double d = MaxAbsDiff(gpu.mixed, want_mixed);
+    std::printf("[MEASURED] hc mixer case %-4s vs ORACLE mixed max|diff| = %.9g bound %g\n",
+                c->name.c_str(), d, kMixerTol);
+    CHECK(d < kMixerTol);
+    if (c->inj_w != nullptr) {
+      const std::vector<float> want_inj = Slice(c->inj_w, c->T * c->hc);
+      const double dj = MaxAbsDiff(gpu.injection, want_inj);
+      std::printf("[MEASURED] hc mixer case %-4s vs ORACLE inject max|diff| = %.9g\n",
+                  c->name.c_str(), dj);
+      CHECK(dj < kMixerTol);
+    }
+    // THE STREAM IS READ-ONLY. Upstream returns `hyper_input` RAW and it is the
+    // raw stream the write-back adds to, so an arm that normalized in place
+    // would double-normalize every layer and still look plausible.
+    CheckBitwise(gpu.hyper_after, Slice(c->hyper, c->T * c->hc * c->hidden),
+                 ("hc mixer case " + c->name + " stream unchanged").c_str());
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA agrees with the CPU arm inside the oracle band") {
+  if (SkipNoCuda("vt::Qwen4ExpGatedResidual CUDA vs CPU")) return;
+  // NOT a byte gate, and the header says exactly why: the three projections go
+  // through `vt::MatmulBT`, a device GEMM that re-associates the K reduction,
+  // where the CPU arm walks it ascending in f32. The number is MEASURED and
+  // printed; a change in it is a finding whether or not it crosses the bound.
+  for (const HcCase* c : {&kHcA, &kHcB, &kHcC, &kHcD}) {
+    INFO("case ", c->name);
+    const MixerResult gpu = RunMixer(DeviceType::kCUDA, *c);
+    const MixerResult cpu = RunMixer(DeviceType::kCPU, *c);
+    CheckWithin(gpu.mixed, cpu.mixed, kMixerTol,
+                ("hc mixer case " + c->name + " mixed CUDA-vs-CPU").c_str());
+    if (c->inj_w != nullptr) {
+      CheckWithin(gpu.injection, cpu.injection, kMixerTol,
+                  ("hc mixer case " + c->name + " inject CUDA-vs-CPU").c_str());
+    }
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA: eps is INSIDE the rsqrt, probed where visible") {
+  if (SkipNoCuda("vt::Qwen4ExpGatedResidual CUDA eps probe")) return;
+  // Case D is the only one that can see this: at A/B/C's `hyper_scale = 1.7` the
+  // mean square is O(1) and moving eps changes the answer by ~5e-7, UNDER the
+  // bound. Running the probe there is a mute switch, and mutation M7 of the
+  // W5b-2 battery SURVIVED all three and reds this one.
+  HcCase moved = kHcD;
+  moved.eps = 1.0f;  // an eps this large cannot hide anywhere
+  const MixerResult ok = RunMixer(DeviceType::kCUDA, kHcD);
+  const MixerResult bad = RunMixer(DeviceType::kCUDA, moved);
+  double sep = 0.0;
+  for (size_t i = 0; i < ok.mixed.size(); ++i) {
+    sep = std::max(sep, std::fabs(static_cast<double>(ok.mixed[i]) - bad.mixed[i]));
+  }
+  std::printf("[MEASURED] hc mixer CUDA eps separation (case D) = %.9g\n", sep);
+  CHECK(sep > kMixerTol);  // `args.eps` is READ on the device
+  CHECK(MaxAbsDiff(ok.mixed, Slice(kHcD.mixed, kHcD.T * kHcD.hidden)) < kMixerTol);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// vt::Qwen4ExpQsaCompress
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("vt::Qwen4ExpQsaCompress CUDA matches the oracle AND the CPU arm BITWISE") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaCompress CUDA arm")) return;
+  const int64_t D = g::kIndexHeadDim, CR = g::kCompressRatio;
+  for (const QsaCase* c : {&kSubBudget, &kOverBudget}) {
+    INFO("case ", c->name);
+    const int64_t nb = (c->seq / CR);
+    for (bool round : {true, false}) {
+      CAPTURE(round);
+      const std::vector<float> gpu = RunCompress(DeviceType::kCUDA, *c, round);
+      const std::vector<float> cpu = RunCompress(DeviceType::kCPU, *c, round);
+      // BOTH arms of `round_intermediates_to_bf16`. The flag is load-bearing —
+      // the mean pool is the one place a bf16 round trip changes which four raw
+      // keys a state can represent — so an arm gated in one setting only is
+      // gated in the setting the goldens happen to use.
+      CheckBitwise(gpu, cpu,
+                   ("qsa_compress " + c->name + (round ? " bf16-round" : " f32")).c_str());
+      if (round) {
+        // The oracle bound the CPU arm already answers to, unchanged. Byte
+        // identity above makes this transitive.
+        const double l2 = RelL2(gpu, c->block_keys, nb * D);
+        std::printf("[MEASURED] qsa_compress %-12s vs ORACLE relL2 = %.9g  bound = %g\n",
+                    c->name.c_str(), l2, kCompressL2);
+        CHECK(l2 < kCompressL2);
+      }
+    }
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpQsaCompress CUDA: the rope position is the BLOCK'S FIRST token") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaCompress CUDA rope-position probe")) return;
+  // Taking the block's LAST position instead is a silent one-block phase error
+  // that no shape check can see, and it is the defect this case separates ON THE
+  // DEVICE. The probe shifts the cos/sin tables by one block and measures the
+  // distance; a kernel that ignored `pos` entirely would give zero separation.
+  const QsaCase& c = kSubBudget;
+  const int64_t D = g::kIndexHeadDim, CR = g::kCompressRatio, rot = g::kRotaryDim;
+  const int64_t complete = (c.seq / CR) * CR, nb = complete / CR;
+  const std::vector<float> ref = RunCompress(DeviceType::kCUDA, c, true);
+
+  // Rebuild with tables rotated by one block: row p reads what row p+CR read.
+  std::vector<float> cos = Slice(c.cos, c.seq * rot), sin = Slice(c.sin, c.seq * rot);
+  std::vector<float> cos2(cos.size()), sin2(sin.size());
+  for (int64_t p = 0; p < c.seq; ++p) {
+    const int64_t src = std::min<int64_t>(p + CR, c.seq - 1);
+    std::copy(cos.begin() + src * rot, cos.begin() + (src + 1) * rot, cos2.begin() + p * rot);
+    std::copy(sin.begin() + src * rot, sin.begin() + (src + 1) * rot, sin2.begin() + p * rot);
+  }
+  std::vector<float> raw = Slice(c.k_raw, complete * D);
+  std::vector<float> knw = Slice(c.k_norm_w, D);
+  std::vector<float> out(static_cast<size_t>(nb * D), 0.0f);
+  Qwen4ExpQsaCompressArgs args;
+  args.compress_ratio = CR;
+  args.rotary_dim = rot;
+  args.eps = g::kRmsNormEps;
+  args.round_intermediates_to_bf16 = true;
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(b);
+  DeviceTensor d_raw(b, qg.q, DType::kF32, {complete, D}, raw.data());
+  DeviceTensor d_knw(b, qg.q, DType::kF32, {D}, knw.data());
+  DeviceTensor d_cos(b, qg.q, DType::kF32, {c.seq, rot}, cos2.data());
+  DeviceTensor d_sin(b, qg.q, DType::kF32, {c.seq, rot}, sin2.data());
+  DeviceTensor d_out(b, qg.q, DType::kF32, {nb, D});
+  vt::Qwen4ExpQsaCompress(qg.q, d_out.tensor(), d_raw.tensor(), d_knw.tensor(),
+                          d_cos.tensor(), d_sin.tensor(), args);
+  b.Synchronize(qg.q);
+  d_out.Download(qg.q, out.data());
+  double sep = 0.0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    sep = std::max(sep, std::fabs(static_cast<double>(out[i]) - ref[i]));
+  }
+  std::printf("[MEASURED] qsa_compress CUDA rope-position separation = %.9g\n", sep);
+  CHECK(sep > 1e-3);  // the position IS read on the device
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// vt::Qwen4ExpQsaGatherAttention
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA reproduces the oracle and the CPU arm") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA arm")) return;
+  const int64_t HQ = g::kNumAttentionHeads, HKV = g::kNumKeyValueHeads, DH = g::kHeadDim;
+  for (const QsaCase* c : {&kSubBudget, &kOverBudget}) {
+    INFO("case ", c->name);
+    const Selection sel = RunIndexerCpu(*c);
+    const std::vector<float> qa = Slice(c->attn_q, c->seq * HQ * DH);
+    const std::vector<float> ka = Slice(c->attn_k, c->seq * HKV * DH);
+    const std::vector<float> va = Slice(c->attn_v, c->seq * HKV * DH);
+    const GatherResult gpu =
+        RunGather(DeviceType::kCUDA, qa, ka, va, sel, c->seq, HQ, HKV, DH, c->seq, false);
+    const GatherResult cpu =
+        RunGather(DeviceType::kCPU, qa, ka, va, sel, c->seq, HQ, HKV, DH, c->seq, false);
+    const double l2 = RelL2(gpu.out, c->attn_out, c->seq * HQ * DH);
+    std::printf("[MEASURED] qsa_gather %-12s vs ORACLE relL2 = %.9g  bound = %g\n",
+                c->name.c_str(), l2, kGatherL2);
+    CHECK(l2 < kGatherL2);
+    // The arm-vs-arm bound is ONE ULP, not the oracle's: the only divergence
+    // source is `expf`, and the case prints whether it moved at all.
+    CheckWithin(gpu.out, cpu.out, kUlpTol, ("qsa_gather " + c->name + " CUDA-vs-CPU").c_str());
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: a sub-budget gather is BIT-IDENTICAL to dense") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA gather-vs-dense")) return;
+  // llama.cpp #27742 measures a max logit delta of 0.0 over all sub-budget rows.
+  // This is that claim ON THE DEVICE: with every candidate selected the gather
+  // reduces over exactly the dense sequence, in exactly the dense order. It is
+  // the property the kernel's ascending visit order exists for, and it is why
+  // the pass-2 dot is NOT tree-reduced. `want` comes from a DENSE selection
+  // through the same kernel — a different selection, so a different code path
+  // through the expansion — rather than from a second identical call, which
+  // would only say the kernel is deterministic.
+  const QsaCase& c = kSubBudget;
+  const int64_t HQ = g::kNumAttentionHeads, HKV = g::kNumKeyValueHeads, DH = g::kHeadDim;
+  const int64_t CR = g::kCompressRatio;
+  const Selection sel = RunIndexerCpu(c);
+  const std::vector<float> qa = Slice(c.attn_q, c.seq * HQ * DH);
+  const std::vector<float> ka = Slice(c.attn_k, c.seq * HKV * DH);
+  const std::vector<float> va = Slice(c.attn_v, c.seq * HKV * DH);
+
+  // A DENSE selection: every complete block, ascending, for every query.
+  Selection dense = sel;
+  bool any_sub_budget = false;
+  for (int64_t t = 0; t < c.seq; ++t) {
+    const int64_t complete = (t + 1) / CR;
+    int64_t n = 0;
+    for (int64_t j = 0; j < kTopk; ++j) {
+      const int32_t v = (j < complete) ? static_cast<int32_t>(j) : -1;
+      dense.block_ids[static_cast<size_t>(t * kTopk + j)] = v;
+      if (v >= 0) ++n;
+    }
+    // The fixture must actually EXERCISE the claim: if every query already
+    // selected everything, "sub-budget equals dense" is trivially true.
+    int64_t got = 0;
+    for (int64_t j = 0; j < kTopk; ++j) {
+      if (sel.block_ids[static_cast<size_t>(t * kTopk + j)] >= 0) ++got;
+    }
+    if (got == n && complete <= kTopk) continue;
+    any_sub_budget = true;
+  }
+  const GatherResult a =
+      RunGather(DeviceType::kCUDA, qa, ka, va, sel, c.seq, HQ, HKV, DH, c.seq, false);
+  const GatherResult b =
+      RunGather(DeviceType::kCUDA, qa, ka, va, dense, c.seq, HQ, HKV, DH, c.seq, false);
+  INFO("any query strictly below budget: ", any_sub_budget);
+  CheckBitwise(a.out, b.out, "qsa_gather CUDA sub-budget vs dense");
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GATHER reads only the selected rows") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA read set")) return;
+  // TWO INSTRUMENTS, because neither alone is a set equality and the wave's
+  // whole point is that a MASK over a dense cache is correct and passes every
+  // value comparison:
+  //
+  //   COUNT  `keys_visited`, incremented AT THE READ inside the kernel and
+  //          block-reduced, against a count derived independently from the HOST
+  //          expansion of the selection. Two quantities, two derivations.
+  //   MEMBERSHIP  the cache's UNSELECTED rows are NaN. A gather never addresses
+  //          them; a mask multiplies them by a zero weight into `0.0f * NaN`,
+  //          which is NaN. `MaxAbsDiff` returns +infinity on any non-finite
+  //          operand (#449), so a mask cannot pass this.
+  //
+  // Together they are SET EQUALITY: membership gives read-set is a subset of
+  // selected, count gives |read set| == |selected|.
+  const QsaCase& c = kOverBudget;
+  const int64_t HQ = g::kNumAttentionHeads, HKV = g::kNumKeyValueHeads, DH = g::kHeadDim;
+  constexpr int64_t kReadsPerRowPerHead = 2;  // two softmax passes
+  const Selection sel = RunIndexerCpu(c);
+  const std::vector<float> qa = Slice(c.attn_q, c.seq * HQ * DH);
+  std::vector<float> ka = Slice(c.attn_k, c.seq * HKV * DH);
+  std::vector<float> va = Slice(c.attn_v, c.seq * HKV * DH);
+
+  int64_t want = 0, dense = 0, strictly_sparse = 0;
+  std::vector<char> ever_selected(static_cast<size_t>(c.seq), 0);
+  for (int64_t t = 0; t < c.seq; ++t) {
+    const std::vector<int64_t> e = ExpandHost(sel, t, t + 1);
+    for (int64_t p : e) ever_selected[static_cast<size_t>(p)] = 1;
+    const int64_t sel_reads = static_cast<int64_t>(e.size()) * HQ * kReadsPerRowPerHead;
+    const int64_t dense_reads = (t + 1) * HQ * kReadsPerRowPerHead;
+    want += sel_reads;
+    dense += dense_reads;
+    if (sel_reads < dense_reads) ++strictly_sparse;
+  }
+  const GatherResult clean =
+      RunGather(DeviceType::kCUDA, qa, ka, va, sel, c.seq, HQ, HKV, DH, c.seq, true);
+  std::printf("[MEASURED] qsa_gather CUDA keys_visited = %lld  selected-derived = %lld  "
+              "dense = %lld  margin = %lld\n",
+              static_cast<long long>(clean.keys_visited), static_cast<long long>(want),
+              static_cast<long long>(dense), static_cast<long long>(dense - want));
+  INFO("keys_visited ", clean.keys_visited, " want ", want, " dense ", dense);
+  CHECK(clean.keys_visited == want);
+  CHECK(clean.keys_visited < dense);
+  // Above the budget the selection MUST discard blocks; a fixture that never
+  // crossed it would leave the assertion above trivially true.
+  CHECK(strictly_sparse > 0);
+
+  // MEMBERSHIP. Poison every row NO query ever selects, then require the answer
+  // to stay finite and BITWISE equal to the clean run.
+  int64_t poisoned = 0;
+  for (int64_t p = 0; p < c.seq; ++p) {
+    if (ever_selected[static_cast<size_t>(p)] != 0) continue;
+    ++poisoned;
+    for (int64_t h = 0; h < HKV * DH; ++h) {
+      ka[static_cast<size_t>(p * HKV * DH + h)] = std::nanf("");
+      va[static_cast<size_t>(p * HKV * DH + h)] = std::nanf("");
+    }
+  }
+  std::printf("[MEASURED] qsa_gather CUDA poisoned %lld of %lld cache rows\n",
+              static_cast<long long>(poisoned), static_cast<long long>(c.seq));
+  // A fixture with nothing to poison proves nothing.
+  CHECK(poisoned > 0);
+  const GatherResult probed =
+      RunGather(DeviceType::kCUDA, qa, ka, va, sel, c.seq, HQ, HKV, DH, c.seq, false);
+  CheckBitwise(probed.out, clean.out, "qsa_gather CUDA NaN-unselected walk");
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the PAGED address mode agrees with contiguous") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA paged arm")) return;
+  // The engine allocates this model's QSA K/V as a PAGED FullAttentionSpec
+  // group, so the contiguous arm alone could serve nothing a runner hands a
+  // forward. The paged view is STRIDED by construction — K and V interleave at
+  // dim 1 of the flash cache — and the two arms are ONE body whose only fork is
+  // the resolution of one row address, so the answers must be BITWISE equal.
+  const QsaCase& c = kOverBudget;
+  const int64_t HQ = g::kNumAttentionHeads, HKV = g::kNumKeyValueHeads, DH = g::kHeadDim;
+  constexpr int64_t kPage = 4;
+  const Selection sel = RunIndexerCpu(c);
+  const std::vector<float> qa = Slice(c.attn_q, c.seq * HQ * DH);
+  const std::vector<float> ka = Slice(c.attn_k, c.seq * HKV * DH);
+  const std::vector<float> va = Slice(c.attn_v, c.seq * HKV * DH);
+  const int64_t pages = (c.seq + kPage - 1) / kPage;
+  const int64_t row = HKV * DH;
+
+  // The flash cache: [pages, 2, kPage, HKV, DH], K at dim1 == 0, V at dim1 == 1.
+  // The page TABLE names them in REVERSE, which is what says the kernel reads
+  // the table rather than assuming identity.
+  std::vector<float> cache(static_cast<size_t>(pages * 2 * kPage * row), 0.0f);
+  std::vector<int32_t> table(static_cast<size_t>(pages), 0);
+  for (int64_t lp = 0; lp < pages; ++lp) table[static_cast<size_t>(lp)] =
+      static_cast<int32_t>(pages - 1 - lp);
+  for (int64_t p = 0; p < c.seq; ++p) {
+    const int64_t phys = table[static_cast<size_t>(p / kPage)];
+    const int64_t off = p % kPage;
+    for (int64_t i = 0; i < row; ++i) {
+      cache[static_cast<size_t>(((phys * 2 + 0) * kPage + off) * row + i)] =
+          ka[static_cast<size_t>(p * row + i)];
+      cache[static_cast<size_t>(((phys * 2 + 1) * kPage + off) * row + i)] =
+          va[static_cast<size_t>(p * row + i)];
+    }
+  }
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(b);
+  DeviceTensor d_cache(b, qg.q, DType::kF32, {pages, 2, kPage, HKV, DH}, cache.data());
+  DeviceTensor d_tab(b, qg.q, DType::kI32, {1, pages}, table.data());
+  DeviceTensor d_q(b, qg.q, DType::kF32, {c.seq, HQ, DH}, qa.data());
+  std::vector<int32_t> ids = sel.block_ids, lens = sel.kv_lens;
+  DeviceTensor d_i(b, qg.q, DType::kI32, {c.seq, kTopk}, ids.data());
+  DeviceTensor d_l(b, qg.q, DType::kI32, {c.seq}, lens.data());
+  DeviceTensor d_o(b, qg.q, DType::kF32, {c.seq, HQ, DH});
+
+  // The two unbind views, built the way `dense_attn::KvSlice` builds them: the
+  // page stride is `2 * kPage * HKV * DH` and V starts one `kPage * HKV * DH`
+  // block in. EVERY FIELD IS SET EXPLICITLY; a marker or a stride dropped at
+  // this boundary produces plausible numbers and no crash.
+  auto kv_view = [&](int64_t which) {
+    Tensor t;
+    t.data = static_cast<float*>(d_cache.raw()) + which * kPage * row;
+    t.dtype = DType::kF32;
+    t.device = Gpu();
+    t.rank = 4;
+    t.shape[0] = pages;   t.stride[0] = 2 * kPage * row;
+    t.shape[1] = kPage;   t.stride[1] = row;
+    t.shape[2] = HKV;     t.stride[2] = DH;
+    t.shape[3] = DH;      t.stride[3] = 1;
+    return t;
+  };
+  Tensor t_k = kv_view(0), t_v = kv_view(1);
+
+  Qwen4ExpQsaAttnArgs args;
+  args.scale = 1.0f / std::sqrt(static_cast<float>(DH));
+  args.compress_ratio = g::kCompressRatio;
+  args.kv_block_table = &d_tab.tensor();
+  args.kv_block_size = kPage;
+  vt::Qwen4ExpQsaGatherAttention(qg.q, d_o.tensor(), d_q.tensor(), t_k, t_v, d_i.tensor(),
+                                 d_l.tensor(), args);
+  b.Synchronize(qg.q);
+  std::vector<float> paged(static_cast<size_t>(c.seq * HQ * DH), 0.0f);
+  d_o.Download(qg.q, paged.data());
+
+  const GatherResult contig =
+      RunGather(DeviceType::kCUDA, qa, ka, va, sel, c.seq, HQ, HKV, DH, c.seq, false);
+  CheckBitwise(paged, contig.out, "qsa_gather CUDA paged vs contiguous");
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: a malformed selection POISONS the row") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA malformed-selection refusal")) return;
+  // The CPU arm `VT_CHECK`s that block ids are ASCENDING and inside the complete
+  // block count. A device kernel cannot throw, and `block_ids` is device-resident
+  // so the host dispatcher cannot read it either. This arm therefore reads
+  // NOTHING out of range and writes NaN across the row — chosen over a clamp or
+  // a skip, both of which return a plausible tensor. This case asserts the
+  // poison actually appears, so a future edit that turns it into a silent skip
+  // reds here.
+  const QsaCase& c = kSubBudget;
+  const int64_t HQ = g::kNumAttentionHeads, HKV = g::kNumKeyValueHeads, DH = g::kHeadDim;
+  Selection bad = RunIndexerCpu(c);
+  // Make query token seq-1 name a block far past its own complete-block count.
+  const int64_t t = c.seq - 1;
+  bad.block_ids[static_cast<size_t>(t * kTopk + 0)] = static_cast<int32_t>(c.seq);
+  for (int64_t j = 1; j < kTopk; ++j) bad.block_ids[static_cast<size_t>(t * kTopk + j)] = -1;
+  const GatherResult r =
+      RunGather(DeviceType::kCUDA, Slice(c.attn_q, c.seq * HQ * DH),
+                Slice(c.attn_k, c.seq * HKV * DH), Slice(c.attn_v, c.seq * HKV * DH), bad,
+                c.seq, HQ, HKV, DH, c.seq, false);
+  size_t nan_in_row = 0;
+  for (int64_t i = 0; i < HQ * DH; ++i) {
+    if (std::isnan(r.out[static_cast<size_t>(t * HQ * DH + i)])) ++nan_in_row;
+  }
+  std::printf("[MEASURED] qsa_gather CUDA malformed row: %zu/%lld outputs are NaN\n",
+              nan_in_row, static_cast<long long>(HQ * DH));
+  CHECK(nan_in_row == static_cast<size_t>(HQ * DH));
+  // And the OTHER rows are untouched: the poison is per (token, head) and not a
+  // whole-tensor abort.
+  size_t nan_elsewhere = 0;
+  for (int64_t i = 0; i < t * HQ * DH; ++i) {
+    if (std::isnan(r.out[static_cast<size_t>(i)])) ++nan_elsewhere;
+  }
+  CHECK(nan_elsewhere == 0);
+}

@@ -463,14 +463,18 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
-    # 2026-08-31: +ENG-PREFLIGHT-COMPILES. GROWTH, and earned: the row arrives
-    # `ACTIVE` (#2401) and its spec's `## Gates` section names
-    # `python3 tests/scripts/test_check_tree_compiles.py` and
-    # `python3 scripts/check-tree-compiles.py --base origin/main`, both of which
-    # can fail. Re-pinned in the same change that added the row, as the note
-    # above requires, and `test_dropping_preflight_compiles_from_the_pin_breaks_it`
-    # proves the entry was earned rather than added to quiet this gate.
-    "ENG-PREFLIGHT-COMPILES",
+    # 2026-08-31: -ENG-PREFLIGHT-COMPILES. SHRINKAGE, and legitimate: b39f14adb
+    # moved the row `ACTIVE` -> `PARTIAL` when the compile gate landed (#2401),
+    # which takes it out of GATED_STATES and therefore out of this audit's
+    # population. The re-pin belonged in that change and is happening here
+    # instead -- the record edit and the pin repair are two commits, which is
+    # the shape the checker's message exists to make visible, not to prevent:
+    # `check-gate-commands --check` was red on every main checkout in between.
+    # The row's `## Gates` section is untouched; if the row re-enters a gated
+    # state, its two runnable commands re-earn the entry and the baseline
+    # grows back in that change. (The entry arrived earlier the same day,
+    # `274dc7a06`, when the row was still `ACTIVE`; its earned-growth note is
+    # in that commit.)
     # 2026-08-30: +MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm. GROWTH, and
     # not because the row gained a gate: it re-entered the AUDITED population
     # when W2 (#2214) moved it `SPIKE` -> `ACTIVE`, and its spec's `### Gates`

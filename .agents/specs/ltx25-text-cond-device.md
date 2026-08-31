@@ -220,8 +220,18 @@ Stop and report, do not work around:
   same code path with the materialization inlined rather than a second copy of
   it. Owner: this row, through #2354.
 - **The oracle's 93.8 s is still undecomposed.** Inherited from #2296 unchanged.
-- **`decode.audio.mel` at 47 s is still unattributed.** Not this row.
+- **~~`decode.audio.mel` at 47 s is still unattributed.~~ RESOLVED 2026-08-31 by
+  `LTX25-AUDIO-DECODE-COST`** (`79ee71b71`), which measured it as 28 convolutions
+  totalling 31.46 GMAC at 1.30 GMAC/s on one core -- one multiply-accumulate per
+  roughly four cycles, the latency of a dependent scalar `double` chain -- and
+  parallelised `Conv2d` over output lines, byte-identical at seven worker counts.
+  Struck rather than deleted, because the bullet is the record of what this row
+  did not own. Owner: `LTX25-AUDIO-DECODE-COST`.
 - **The 206.0 s that remains after `guiders` and `connector` is still open.**
+  Owner: `LTX25-RENDER-SPEED-PARITY`, whose `## Owed` carries it with the split
+  (`load` 94.5 s, `decode.audio` 50.7 s, `decode.video` 16.0 s, `denoise` 15.1 s).
+  Named here without an owner until now, which is the one gap a sweep of the LTX
+  specs' owed items found.
   Removing both entirely leaves 2.20x. Naming it here is what stops this row's
   result being read as the whole answer.
 

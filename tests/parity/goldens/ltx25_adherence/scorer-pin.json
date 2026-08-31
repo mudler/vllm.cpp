@@ -1,0 +1,66 @@
+{
+  "row": "LTX25-PROMPT-ADHERENCE",
+  "issue": 2295,
+  "owns": 1854,
+  "role": "instrument",
+  "why_instrument_and_not_oracle": "The developer's answer to section 9 of .agents/specs/ltx25-prompt-adherence.md, on that spec's own recommendation: the scorer never answers a question on its own. Every number it produces is consumed as a comparison against the #1864 render, which is the pinned ltx-2 oracle's output. Delete the reference and neither S1 nor S2 has a bound. So the ORACLE stays ltx-2, AGENTS.md's oracle table is unchanged, there is no .agents/oracles/ file for this checkpoint, and it is pinned by revision AND sha256 the way any other artefact this project loads is.",
+  "repo": "openai/clip-vit-base-patch16",
+  "revision": "57c216476eefef5ab752ec549e440a49ae4ae5f3",
+  "why_this_checkpoint": "It is the checkpoint vLLM-Omni's own CLIPScorer defaults to (tests/e2e/accuracy/helpers.py:497 at a4ea67a21b20054dacc6e83952f9bd407e8ee4e7), and vLLM registers the family as a first-class runner (vllm/model_executor/models/registry.py:251 at 5559679229, \"CLIPModel\": (\"clip\", \"CLIPEmbeddingModel\")). openai/clip-vit-base-patch32 is the recorded fallback with a stated reason: it is what vLLM's own tests/models/multimodal/pooling/test_clip.py exercises. A swap between them changes every reading and must be recorded here.",
+  "licence": null,
+  "licence_note": "cardData.license is null on the HuggingFace repository, measured 2026-08-29 and again 2026-08-31. The openai/CLIP GitHub repository is MIT; the WEIGHTS repository asserts nothing, and a repository that asserts nothing has granted nothing. This is a developer question and no agent resolves it. laion/CLIP-ViT-H-14-laion2B-s32B-b79K declares mit at 3.67 GiB and loses the match with upstream's choice.",
+  "weight_format": "pickle",
+  "weight_format_note": "The only weight file at this revision is pytorch_model.bin. There is no safetensors sibling, so loading it unpickles. flax_model.msgpack exists and is not what transformers loads here.",
+  "text_context_positions": 77,
+  "vision_input_pixels": 224,
+  "context_note": "MEASURED, not transcribed: config.json at this revision, sha256 eaf1c9089a8553c913d27ea66407f8bfc2be9989c80c9f331ddb3d63d4c5e8ad, 4104 bytes, has text_config.max_position_embeddings = 77 and vision_config.image_size = 224. About 75 positions are usable after the boundary tokens. A prompt that does not fit is REFUSED and never truncated: truncating produces a plausible number for a question nobody asked. The #1864 reference request is 13 words / 73 characters and fits. #1854's own motivating prompt, the 70-word golden retriever at scripts/ltx25-dit-attn-flash-pixel-ab.sh:697, does NOT: CLIP's own pre-tokenizer splits it into 81 chunks, and each chunk is at least one BPE token, so it is at least 83 positions with the boundary pair. That is a lower bound and needs no vocabulary file. So this instrument can answer the request the reference render was taken at, and cannot answer the one #1854 quotes. A 320x192 frame also reaches a 224x224 tower as a resized centre crop, so off-centre content is discarded.",
+  "gateable": true,
+  "gateable_note": "MEASURED on 2026-08-31, not asserted. AGENTS.md's rule for an oracle applies to an instrument too: gateable only once it demonstrably builds and runs the model, and constructing a config proves nothing. What was run: the eight files below were fetched at the pinned revision and hashed, all eight digests verified, `transformers` loaded CLIPModel and CLIPProcessor from the local directory, and the scorer produced embeddings for the 25 frames of the committed #1864 reference render. S0 PASSED on that render -- the true prompt ranked first over the six committed decoys, per-frame 25 of 25 -- and the same scorer ranked the true prompt LAST on a pure-noise render, which is the instrument demonstrably able to say no. The end-to-end gate then FAILED that noise render on both adherence checks while C0 and both blockiness ratios passed it. The numbers are in .agents/specs/ltx25-prompt-adherence.md under `## Outcome`. This record does NOT carry the reference's per-frame distribution: S1's bound is recomputed from the reference on every run, and a copy of it here would be a transcription the gate could drift from.",
+  "download_authority": "AUTHORISED (developer, 2026-08-31)",
+  "download_authority_note": "Given in session as \"yes, download the checkpoint\" and recorded in .agents/developer-preferences.md, in reply to a request that priced the artefact and named its three costs: 574.5 MiB across the eight files below, NO declared licence, and a pickle rather than safetensors. Fetched on 2026-08-31 at the pinned revision and hashed file by file; every measured size below equals the advertised one.",
+  "required_bytes_total": 602356502,
+  "files": {
+    "config.json": {
+      "advertised_bytes": 4104,
+      "sha256": "eaf1c9089a8553c913d27ea66407f8bfc2be9989c80c9f331ddb3d63d4c5e8ad",
+      "measured": true
+    },
+    "pytorch_model.bin": {
+      "advertised_bytes": 598641023,
+      "sha256": "ec89c7b09c749a60aae3c9cd910516f24b58214a7df060b48962d14c469cfbf0",
+      "measured": true
+    },
+    "preprocessor_config.json": {
+      "advertised_bytes": 316,
+      "sha256": "910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd",
+      "measured": true
+    },
+    "tokenizer_config.json": {
+      "advertised_bytes": 905,
+      "sha256": "3f74b6a4d97fee70b3b96921a687fc5e3f2fb583f5f81e7c178c0c22281beade",
+      "measured": true
+    },
+    "tokenizer.json": {
+      "advertised_bytes": 2224003,
+      "sha256": "a83e0809aa4c3af7208b2df632a7a69668c6d48775b3c3fe4e1b1199d1f8b8f4",
+      "measured": true
+    },
+    "vocab.json": {
+      "advertised_bytes": 961143,
+      "sha256": "3f0c4f7d2086b61b38487075278ea9ed04edb53a03cbb045b86c27190fa8fb69",
+      "measured": true
+    },
+    "merges.txt": {
+      "advertised_bytes": 524619,
+      "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a",
+      "measured": true
+    },
+    "special_tokens_map.json": {
+      "advertised_bytes": 389,
+      "sha256": "f8c0d6c39aee3f8431078ef6646567b0aba7f2246e9c54b8b99d55c22b707cbf",
+      "measured": true
+    }
+  },
+  "sizes_note": "advertised_bytes and the revision are what the HuggingFace API returned to an unauthenticated request on 2026-08-31, and they agree with the reading .agents/specs/ltx25-prompt-adherence.md section 3 took on 2026-08-29. Every sha256 below is MEASURED on the downloaded file, and every file's measured size equals its advertised one. A digest that reads null would mean UNMEASURED, and the tool refuses the checkpoint while any is null rather than scoring with an unidentified file.",
+  "ours_side_owed": "What is NOT measured: our own engine's render at the reference's request has never been scored. The render exists -- #2140, rc job 4b0666ee-248c-45fc-9de6-372b6d0c1fab on dgx:gpu0 -- and its 25 frames are not committed and are not established to have survived the lease. Owner: row LTX25-PROMPT-ADHERENCE W3, issue #2295."
+}

@@ -1070,3 +1070,205 @@ TEST_CASE("W1: without compressor state the same layer REFUSES (#2286)") {
   CHECK_THROWS(vllm::DeepseekV4ForwardExl3Paged(w, q, pages, 0, tok, pos, {0},
                                                 /*compressor=*/nullptr));
 }
+
+TEST_CASE("W3: the compressor pools its OWN projection, not the MLA latent (#2286)") {
+  // Upstream's compressor owns a `fused_wkv_wgate` emitting both its KV and its
+  // gate from the hidden state (`compressor.py:279-287`); it never reuses the
+  // MLA's `kraw`. This tree accounted `compressor.wkv.weight` and dropped it
+  // until W3, so the composition pooled the MLA latent -- finite, plausible, and
+  // not what upstream pools.
+  //
+  // The claim here is that the loaded projection is LOAD-BEARING: perturbing
+  // `comp_wkv` alone must move the logits. If it did not, the forward would still
+  // be pooling the latent and the materialization would be decoration.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};
+  opt.real_dsa_geometry = false;
+  auto f = BuildFixture(opt);
+  vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+  // It is actually loaded, at the gate's own width.
+  REQUIRE(!w.host.layers[1].comp_wkv.empty());
+  CHECK(static_cast<int64_t>(w.host.layers[1].comp_wkv.size()) ==
+        static_cast<int64_t>(w.host.layers[1].comp_wgate.size()));
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers, hd = w.params.head_dim;
+  const int64_t bs = 16, nb = 16;  // >= 128 slots, so the closing window fits
+  const auto run = [&](const vllm::DeepseekV4Weights& ww) {
+    std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+    std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+    for (int64_t l = 0; l < nlayers; ++l) {
+      storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+      pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+          storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+          {nb, bs, hd});
+    }
+    vllm::DeepseekV4CompressorState cs;
+    cs.Resize(nlayers);
+    // SEED the state so this step CLOSES a window. At ratio 128 a single token at
+    // position 0 closes none, the pooled row never reaches the logits, and the
+    // projection under test would read as inert -- which is exactly what the
+    // first version of this case measured. 127 prior rows plus this token's makes
+    // `(127 + 1) % 128 == 0`, and `kv_base = 127` keeps the prefix guard happy.
+    const int64_t cr = 128;
+    cs.state_kv[1].assign(static_cast<size_t>((cr - 1) * hd), 0.05f);
+    cs.state_score[1].assign(static_cast<size_t>((cr - 1) * hd), 0.02f);
+    const std::vector<int32_t> tok{1}, pos{static_cast<int32_t>(cr - 1)};
+    return vllm::DeepseekV4ForwardExl3Paged(ww, q, pages, cr - 1, tok, pos, {0}, &cs);
+  };
+
+  const std::vector<float> before = run(w);
+  // Perturb ONLY the compressor's KV projection.
+  vllm::DeepseekV4Weights w2 = w;
+  for (float& v : w2.host.layers[1].comp_wkv) v += 0.25f;
+  const std::vector<float> after = run(w2);
+
+  REQUIRE(before.size() == after.size());
+  double diff = 0.0, mag = 0.0;
+  for (size_t i = 0; i < before.size(); ++i) {
+    REQUIRE(std::isfinite(after[i]));
+    mag = std::max(mag, std::abs(static_cast<double>(before[i])));
+    diff = std::max(diff, std::abs(static_cast<double>(before[i] - after[i])));
+  }
+  REQUIRE(mag > 1e-6);
+  CHECK(diff > 1e-6);  // the projection is READ, not decoration
+}
+
+TEST_CASE("W3: the INDEXER's compressor family is materialized (#2286)") {
+  // The indexer carries its own `DeepseekCompressor` at `head_dim =
+  // index_head_dim` (`attention.py:768-776`). Three of its four tensors were
+  // accounted and dropped; only `idx_wk` had a host slot. They load now.
+  //
+  // Loading them does NOT make the indexer's compressor run, and this case does
+  // not pretend otherwise: the forward still refuses on `idx_wk`'s width. That
+  // order is deliberate -- narrowing a refusal before the capability exists turns
+  // it into a silent wrong answer, which this row has established twice.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 4};      // the indexer exists ONLY at cr == 4
+  opt.real_dsa_geometry = true;      // the artifact's widths, coff == 2
+  opt.index_n_heads = 2;
+  opt.index_head_dim = 8;
+  opt.index_topk = 2;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  const auto& L = w.host.layers[1];
+  const int64_t ihd = w.params.index_head_dim, H = w.params.hidden_size;
+  const int64_t cr = w.params.compress_ratio(1);
+  const int64_t iw = 2 * ihd;  // coff == 2, always, where the indexer exists
+
+  // Present, and at upstream's widths: the ape and the fused gate carry `coff`,
+  // the norm does NOT (`compressor.py:288`).
+  CHECK(static_cast<int64_t>(L.idx_comp_ape.size()) == cr * iw);
+  CHECK(static_cast<int64_t>(L.idx_comp_wgate.size()) == iw * H);
+  CHECK(static_cast<int64_t>(L.idx_comp_norm_weight.size()) == ihd);
+  // Its KV projection was already loaded and keeps the same width as the gate.
+  CHECK(static_cast<int64_t>(L.idx_wk.size()) == iw * H);
+
+  // NON-TRIVIAL: an all-zero slot would satisfy every size check above while
+  // carrying nothing the checkpoint wrote.
+  double mag = 0.0;
+  for (const float v : L.idx_comp_wgate) mag = std::max(mag, std::abs((double)v));
+  CHECK(mag > 1e-6);
+
+  // The refusal is UNCHANGED, because the cycle does not run yet.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::string msg = ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward({1}, {0}, {}, {}, w, q, {0});
+  });
+  CAPTURE(msg);
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
+}
+
+TEST_CASE("W3: the cr == 4 arm is REACHED, and its INDEXER state accumulates (#2286)") {
+  // The `cr == 128` arm was already reached. This is the `cr == 4` family, which
+  // differs by running a SECOND compressor -- the indexer's -- and using its
+  // selection to narrow which closed rows the attention merges.
+  //
+  // The claim is reachability of that second machine specifically: its state must
+  // grow, separately from the attention compressor's, or the selection is being
+  // built from nothing and every step would silently attend the window alone.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 4};  // layer 1 carries BOTH a compressor and an indexer
+  // The REAL widths: the loader derives `coff` for a cr == 4 layer and refuses a
+  // collapsed one, since upstream cannot emit it at this ratio.
+  opt.real_dsa_geometry = true;
+  opt.index_n_heads = 2;
+  // >= the model's `qk_rope_head_dim` (64 in this fixture). The indexer's pooled
+  // key is rotated on its rope TAIL, and that tail is the MODEL's rope width
+  // whatever the indexer's head is (`compressor.py:240`), so a head narrower than
+  // the rope width is a geometry upstream cannot produce.
+  opt.index_head_dim = 128;
+  opt.index_topk = 2;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  // Report the widths before running, so a mismatch names the tensor instead of
+  // surfacing as an anonymous MatVec error from inside the forward.
+  {
+    const auto& L1 = w.host.layers[1];
+    const int64_t H1 = w.params.hidden_size, hd1 = w.params.head_dim;
+    const int64_t ihd1 = w.params.index_head_dim, inh1 = w.params.index_n_heads;
+    CAPTURE(L1.comp_wgate.size()); CAPTURE(L1.comp_wkv.size());
+    CAPTURE(L1.comp_ape.size());   CAPTURE(L1.idx_wk.size());
+    CAPTURE(L1.idx_comp_wgate.size()); CAPTURE(L1.idx_comp_ape.size());
+    CAPTURE(L1.idx_wq.size());     CAPTURE(L1.idx_wproj.size());
+    CAPTURE(H1); CAPTURE(hd1); CAPTURE(ihd1); CAPTURE(inh1);
+    CAPTURE(w.params.q_lora_rank);
+    CHECK(static_cast<int64_t>(L1.idx_wproj.size()) == inh1 * H1);
+    CHECK(static_cast<int64_t>(L1.idx_wk.size()) == 2 * ihd1 * H1);
+    CHECK(static_cast<int64_t>(L1.comp_wkv.size()) ==
+          static_cast<int64_t>(L1.comp_wgate.size()));
+    // The one the forward DISPATCHES on: if this is neither shape it falls to the
+    // hidden-state branch and MatVec throws anonymously.
+    CHECK(static_cast<int64_t>(L1.idx_wq.size()) ==
+          inh1 * ihd1 * w.params.q_lora_rank);
+  }
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers, hd = w.params.head_dim;
+  const int64_t bs = 16, nb = 8;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+        {nb, bs, hd});
+  }
+
+  vllm::DeepseekV4CompressorState cs;
+  cs.Resize(nlayers);
+
+  // Enough steps to cross a cr == 4 boundary, so rows actually close and the
+  // selection has something to choose from.
+  int64_t kv_base = 0;
+  for (int step = 0; step < 8; ++step) {
+    const std::vector<int32_t> tok{static_cast<int32_t>(1 + (step % 3))};
+    const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
+    const auto lg = vllm::DeepseekV4ForwardExl3Paged(w, q, pages, kv_base, tok, pos,
+                                                     {0}, &cs);
+    REQUIRE(lg.size() == static_cast<size_t>(w.params.vocab_size));
+    for (const float v : lg) REQUIRE(std::isfinite(v));
+    kv_base += 1;
+  }
+
+  // BOTH state machines ran on layer 1, and they are separate.
+  CHECK(!cs.state_kv[1].empty());       // the attention compressor's
+  CHECK(!cs.idx_state_kv[1].empty());   // the INDEXER's -- the reachability claim
+  CHECK(!cs.idx_state_score[1].empty());
+  // Eight tokens at ratio 4 close two windows, so the indexer produced two keys.
+  const int64_t ihd = w.params.index_head_dim;
+  CHECK(static_cast<int64_t>(cs.idx_comp_rows[1].size()) == 2 * ihd);
+  // Layer 0 is dense: neither machine touched it.
+  CHECK(cs.state_kv[0].empty());
+  CHECK(cs.idx_state_kv[0].empty());
+}

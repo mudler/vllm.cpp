@@ -224,18 +224,17 @@ the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
 does not get one yet; it is listed under `## Owed
 
-- **The compressor's OWN KV projection is not materialized, so W1's composition
-  pools the wrong operand on the real artifact.** Upstream's compressor owns a
-  `fused_wkv_wgate` producing both its KV and its gate from the hidden state
-  (`compressor.py:279-287`), and the artifact stores
-  `attn.compressor.wkv.weight` per compressor layer. This tree accounts that
-  tensor and deliberately does not materialize it, because the collapsed
-  geometry reuses the MLA's `kraw` as the compressor's KV
-  (`deepseek_v4_weights.cpp`, the `Account` comment). `CompressorLayerStep`
-  inherits that convention: correct for the synthetic suites, and on the real
-  artifact it would pool the MLA latent where upstream pools a separate
-  projection -- finite, plausible, and wrong. This is a FOURTH piece W3 needs,
-  beyond the three the forward's refusal names.
+- **The INDEXER's compressor CYCLE.** Its four tensors now all load
+  (`idx_comp_ape`, `idx_comp_wgate`, `idx_comp_norm_weight` beside `idx_wk`), at
+  upstream's widths. What remains is running the cycle at `index_head_dim` and
+  re-pointing the selection at the compressed keys it produces, after which the
+  `idx_wk` refusal may narrow -- and NOT before.
+
+- **(closed) The INDEXER's own compressor tensors**, formerly the last refused. Three of its four
+  tensors have no host destination, it needs a second compressor state per layer
+  at `index_head_dim`, and its pooled rows are the KEYS the top-k scores against
+  rather than an attention contributor. See the section above; it is a wave, not
+  a width fix.
 
 - **The indexer's qr projection is UNEXERCISED.** Its shape is accepted and that
   acceptance is gated, but no test runs a forward to completion with the upstream
@@ -404,6 +403,269 @@ one token resuming at `kv_base = 7` refuses, a fresh state at 0 is accepted, and
 the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
+
+## W3 IS WIRED: the cr == 4 arm runs end to end
+
+`AttentionBlock`'s paged arm now composes a `compress_ratio == 4` layer: the
+indexer's own compressor produces its keys, the selection scores over them, and
+the result narrows which closed rows the merge attends. The `idx_wk` refusal
+narrows with it -- **and only now**, scoped by a `paged_dsa_arm` flag so the
+widened geometry is readable on the arm that composes it and refused everywhere
+else.
+
+**Two legacy branches had to stand down, and both announced themselves as
+anonymous `MatVec weight size mismatch` throws** -- the diagnostic the DSA refusal
+exists to replace. The legacy per-token indexer selection projects `idx_wk` at
+`index_head_dim`, and the legacy compressor placeholder pools a 2-wide window and
+projects `comp_wgate` at `head_dim`; at the real geometry both tensors are
+`coff` times wider. Each is now skipped where the paged arm composes the layer.
+
+**The prefix-cache guard fired on a correct sequence and was right to.** It
+computed `seen = state_kv.size() / head_dim`, but at `coff == 2` a token's state
+row is `coff * head_dim` wide, so it counted every token twice. That bug existed
+from the moment the guard landed and only the `cr == 4` path could expose it.
+
+Gated by driving eight steps through `DeepseekV4ForwardExl3Paged` at the REAL
+geometry and requiring BOTH state machines to have run on the compressor layer and
+neither on the dense one, with the indexer's two closed windows accounted. Three
+mutations run red: no selection built, the indexer's rows dropped, and the legacy
+per-token branch left running beside the arm.
+
+## The two families are now ONE code path
+
+`CompressorLayerStep` takes an optional selection. Null means every closed row,
+which is `cr == 128`; a selection means the rows the indexer chose, which is
+`cr == 4`. That is the only difference between the two families at the attention,
+and it is now expressed as one argument rather than two paths.
+
+An all-padding selection attends nothing and the step returns the window pass
+alone -- the normal state before the first boundary, and NOT a fallback to every
+row. The gate pins all three arms: selecting the only closed row equals attending
+all rows, and an all-padding selection differs from both. Two mutations run red:
+the selection ignored, and an empty gather falling back to every row.
+
+## Every W3 MECHANISM is implemented; what remains is wiring
+
+`GatherSelectedCompressed` is the last one. The `cr == 4` family attends its
+window plus the rows the indexer CHOSE, where `cr == 128` attends the window plus
+ALL closed rows -- so the only difference at the attention is which rows reach
+`MergeWindowAndCompressed`, and this narrows them.
+
+`-1` is dropped as padding and never read as row zero, which is the common case
+rather than an edge one: a selection row is padded whenever fewer rows have closed
+than `top_k`. An index PAST the closed rows is refused instead of clamped, because
+that is a selection bug and clamping would attend the newest row whenever
+selection overran. Three mutations run red on exactly those three behaviours.
+
+The mechanism set is now complete: the `qr` query, the `coff == 2` overlapped
+gather with role selection, boundary emission, the compressor's own KV, the
+pooled-row rotation, the indexer's compressed keys, the selection over those rows,
+and this gather. What remains for W3 is WIRING them into `AttentionBlock`'s
+indexer branch and only then narrowing the `idx_wk` refusal -- in that order.
+
+## The selection over compressed rows LANDED
+
+`IndexerSelectCompressed` scores the indexer's query against the COMPRESSED keys
+and returns compressed-row indices, `-1` padded. The availability count is
+upstream's own, `(position + 1) / compress_ratio`, so a row that has not closed is
+not a candidate; below the first boundary the whole row stays padding rather than
+falling back to row zero.
+
+Hand-derived rather than compared against a helper: keys are built so row `r`
+scores monotonically in `r`, and positions 3, 7 and 11 must yield exactly 1, 2 and
+3 candidates with the best first. A separate case flips which head the fold
+favours and requires the winning row to change with it, so the fold is proven
+load-bearing rather than present.
+
+Four mutations run red: padding with row 0, ignoring the availability count,
+dropping the per-head fold, and ordering lowest-score first.
+
+## What the top-k INDEXES, which was the last unknown
+
+`_fill_short_context_topk_indices` (`attention.py:71-87`) settles it, and it is
+the short-context arm writing the answer in the clear:
+
+    num_compressed = (positions + 1) // COMPRESS_RATIO
+    store(offsets < num_compressed ? offsets : -1)
+
+So a selection index addresses a **COMPRESSED ROW**, not a token: index `i` means
+the i-th compressed entry, the count available at a position is
+`(position + 1) / compress_ratio`, and `-1` is the invalid marker padding the row
+out to `TOP_K`.
+
+That is the same arithmetic the `c128a` path uses, where selection is "which
+compressed windows have CLOSED" and needs no learned component. The `cr == 4`
+family differs only in that the indexer LEARNS which of those closed rows to
+take.
+
+**This tree's `sel[t]` holds TOKEN indices into `kv_keys`.** Re-pointing the
+selection is therefore not a change of operand alone: the attention must attend
+compressed rows at the selected indices, and `-1` must be honoured as padding
+rather than read as a row. Both are behaviour changes to the attention path, not
+to the indexer, which is why this is recorded before either is attempted.
+
+## The indexer's compressed KEYS are produced
+
+`IndexerCompressedKeys` runs the indexer's second `DeepseekCompressor` at
+`index_head_dim`: both halves projected from the hidden state, then the SAME cycle
+with `coff == 2` and rotation on. Its output is keys and nothing else, because the
+indexer's pooled rows are what the top-k scores against.
+
+Two details are read from upstream rather than derived. `rope_dim` is the MODEL's
+`qk_rope_head_dim` whatever the compressor's own head is (`compressor.py:240`), so
+at the real geometry it is 64 inside a 128-wide indexer head -- deriving it from
+`index_head_dim` is the likely mistake. And `coff` is always 2, because the
+indexer exists only at `compress_ratio == 4` (`attention.py:274`).
+
+**The gate needed two repairs, both the same shape as earlier ones.** With
+`T == 4` only one window closes, at base position 0, where RoPE is the identity --
+so a rotated row compared equal to an unrotated one and the rotation looked inert.
+And every remaining assertion was STRUCTURAL (size, finiteness, magnitude), which
+holds for any non-degenerate KV, so a mutation pooling the GATE as the KV survived
+untouched. The case now closes two windows and compares the KV and gate slots
+against each other. Three mutations run red: the gate pooled as the KV, `coff`
+collapsed to 1, and the keys left unrotated.
+
+## The pooled row IS rotated, and W1 was not doing it
+
+Chasing whether the INDEXER's cycle rotates answered a question about the
+ATTENTION compressor instead, and the answer is a defect in what W1 landed.
+
+`fused_compress_quant_cache.py:272-297` applies GPT-J RoPE to the pooled row's
+ROPE TAIL, unconditionally -- there is no `rotate` predicate in the kernel, and
+both compressors pass the dead flag. `CompressorPoolNorm` and the cycle applied
+NO rotation at all, so every compressed key this row produced was
+position-blind: attention over the compressed history could not tell one window
+from another, while every value stayed finite.
+
+The position is the non-obvious part and is now gated: `compressed_pos =
+(position / compress_ratio) * compress_ratio`, the WINDOW'S BASE rather than the
+emitting token's, so all rows of one window share a phase. The gate derives the
+second emitted row by hand at base position 2 and separately shows that rotating
+at the token's own position 3 gives a different, equally finite answer.
+
+Three mutations run red: the token's position used instead of the window's base,
+the nope half rotated instead of the tail, and the rotation skipped entirely --
+which is exactly the state this row shipped in until now.
+
+## The indexer's cycle, as upstream builds it
+
+Read before starting it, because two details change its shape
+(`attention.py:761-790`):
+
+- The indexer owns a `DeepseekV4IndexerCache` keyed by `compress_ratio`, and its
+  `DeepseekCompressor` writes INTO that cache (`k_cache_prefix=` is passed to the
+  compressor). So the compressed keys are cache rows, not a returned buffer.
+- ~~That compressor is constructed with `rotate=True`, where the main compressor
+  is not.~~ **WRONG, and corrected the commit after it was written.** The MAIN
+  attention compressor passes `rotate=True` too (`attention.py:340`), so it is
+  not a difference between them at all. Worse, `rotate` is assigned to
+  `self.rotate` (`compressor.py:234`) and **never read anywhere in the package**:
+  it is a dead parameter, and it says nothing about either cycle. Nothing about
+  RoPE can be concluded from it in either direction.
+- Selection is `SparseAttnIndexer` over that cache with
+  `skip_k_cache_insert=True`, at `topk_tokens = index_topk`. So the top-k scores
+  against the COMPRESSED cache rather than against per-token keys, which is what
+  `ik` currently feeds `DispLogits`.
+
+So the remaining work is: an indexer-side cache, a second compressor cycle at
+`index_head_dim`, and a selection re-pointed from per-token keys to that cache.
+
+**RESOLVED: the indexer's cycle DOES rotate, by the same rule.** Both compressors
+go through the `compress_norm_rope_store_*` family, and the dispatch names the
+split explicitly: "cutedsl (head=512) accepts the full-cache flags; triton
+(indexer/AMD) does not" (`compressor.py:414-415`). The rope contract is stated
+directly above it (`:396-399`): applied to the LAST `rope_head_dim` elements of
+`head_dim`, at position `(positions // compress_ratio) * compress_ratio`. That is
+the same rule the attention compressor's fix implements.
+
+The cache-layout difference below is about STORAGE, not about whether rotation
+happens: the rotation is applied before the store, and the indexer's store
+quantizes the result. So it does not make the indexer an exception, and the
+earlier note that it left the question open is superseded.
+
+**The cache layouts still differ, and that matters for the store.** The
+attention compressor's cache carries an explicit bf16 area for the rotated rope
+tail (`fused_compress_quant_cache.py:293`). The indexer's does not: its
+`k_cache_head_dim` is a BYTE layout, `head_dim + head_dim / quant_block_size * 4`
+-- 132 bytes for a 128-wide head, being 128 fp8 values plus four fp32 scales
+(`attention.py:751-760`), or an MXFP4 variant at 68. There is no bf16 rope area in
+it at all.
+
+So the two caches are shaped differently and the shared kernel's rope store has
+nowhere to land in the indexer's. Reading the indexer's own write path is the
+precondition for its cycle, and assuming the attention compressor's answer would
+put a rotated tail into a layout with no room for one. All four of its tensors load (previous commit); none of that is a
+width change, and treating it as one would compute a top-k over the wrong
+operand rather than refuse.
+
+## The LAST refused tensor is a wave, not a width
+
+`attn.indexer.compressor.wkv.weight` is the one tensor the real geometry still
+refuses, and it looks like the width fix that cleared the other three. It is not,
+and the loader already says why.
+
+The indexer exists only at `cr == 4` (`attention.py:274`) and carries its OWN
+`DeepseekCompressor` at `head_dim = index_head_dim` with the same ratio
+(`attention.py:768-776`). `DeepseekV4LayerHostWeights` has `idx_wk`, its KV
+projection, and **no destination for the other three** -- `indexer.compressor.ape`,
+`.wgate.weight` and `.norm.weight` are accounted and dropped, exactly as the main
+compressor's KV was before this wave.
+
+And the consumer differs. The main compressor's pooled row joins the attention
+through `MergeWindowAndCompressed`. The indexer's pooled rows are the KEYS its
+selection scores against: `ik` feeds `DispLogits` then `DispTopk`, so widening
+`idx_wk` alone would hand the scorer a `[T, 2*ihd]` operand where it expects
+`[T, ihd]`, and the top-k would be computed over the wrong thing rather than
+refuse.
+
+So the last piece needs three host slots, a second compressor state per layer at
+`index_head_dim`, the cycle run at that geometry, and the selection re-pointed at
+the compressed keys. That is the same shape of work the main compressor just
+took, and sizing it as a width change is how it would go wrong.
+
+## W3 takes the real geometry from FOUR refused tensors to ONE
+
+The forward's geometry check reads `coff` from the TENSOR rather than deriving it
+from `compress_ratio`, the same way `idx_wq`'s K is read, and
+`CompressorLayerStep` accepts `compress_ratio == 4` with the doubled operands.
+
+**Deriving it was tried first and broke every synthetic suite.** Upstream emits
+only the derived width, but this tree's fixtures carry a COLLAPSED `coff == 1`
+shape on `cr == 4` layers -- a shape upstream cannot produce and this forward has
+always accepted. Requiring the derived width refused all of them at once, which is
+a fixture migration rather than this wave. That is the same mistake as narrowing
+the resolver refusal before the forward composed: changing what a check demands
+without moving what feeds it.
+
+On the REAL geometry the refusal now names ONE tensor where it named four:
+`attn.indexer.compressor.wkv.weight`. `compressor.ape`,
+`compressor.wgate.weight` and `indexer.wq_b` are read at the artifact's own
+widths. What remains is the INDEXER's own compressor, a second
+`DeepseekCompressor` at `index_head_dim` (`attention.py:768-776`).
+
+## W3's fourth piece: the compressor pools its OWN projection
+
+Recorded as owed one commit ago and now closed. Upstream's compressor owns a
+`fused_wkv_wgate` emitting BOTH its KV and its gate from the hidden state
+(`compressor.py:279-287`), and every compressor layer of the artifact stores
+`attn.compressor.wkv.weight`. This tree accounted that tensor and dropped it,
+because the collapsed geometry reuses the MLA's `kraw`, and `CompressorLayerStep`
+inherited the convention -- right for the synthetic suites, wrong on the real
+artifact.
+
+`DeepseekV4LayerHostWeights::comp_wkv` now materializes it at the same
+`coff * head_dim` width as the gate it is fused with, and the forward projects the
+compressor's KV from it, falling back to the latent only for a checkpoint that
+carries none.
+
+**The gate had to be repaired before it proved anything.** Perturbing `comp_wkv`
+and diffing the logits reported a difference of exactly ZERO: at ratio 128 a
+single token at position 0 closes no window, so the pooled row never reaches the
+output and the projection reads as inert. The case now seeds 127 prior rows so
+`(127 + 1) % 128 == 0` closes a window on the step under test, with `kv_base` set
+to match the prefix guard. Two mutations run red: falling back to the MLA latent
+despite `comp_wkv` being present, and projecting from the gate's weight instead.
 
 ## W3's core mechanism: the coff == 2 overlapped gather
 

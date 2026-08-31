@@ -1448,10 +1448,23 @@ TEST_CASE("placement: precedence is env > config > default, FIELD BY FIELD") {
   }
   ::unsetenv("VT_N_CPU_MOE");
 
+  // `fit` is ON by default, mirroring llama.cpp's `fit_params = true`
+  // (`common/common.h:468` @ b10451). It was `false` until the flip; the
+  // assertion moved with the behaviour rather than the behaviour being bent to
+  // keep an assertion.
+  CHECK(vllm::ResolvePlacementFit());
+  CHECK_FALSE(vllm::PlacementFitWasRequested());  // defaulted, not asked for
+
+  // `=0` must be able to turn OFF a default that is now on, which is the only
+  // way an operator opts out.
+  ::setenv("VT_PLACEMENT_FIT", "0", 1);
   CHECK_FALSE(vllm::ResolvePlacementFit());
+  CHECK(vllm::PlacementFitWasRequested());  // explicitly OFF is still explicit
   ::setenv("VT_PLACEMENT_FIT", "1", 1);
   CHECK(vllm::ResolvePlacementFit());
+  CHECK(vllm::PlacementFitWasRequested());
   ::unsetenv("VT_PLACEMENT_FIT");
+  CHECK_FALSE(vllm::PlacementFitWasRequested());
 }
 
 TEST_CASE("placement: VT_PLACEMENT_OVERRIDES takes llama.cpp's own -ot grammar") {
@@ -1629,4 +1642,60 @@ TEST_CASE("placement: n_cpu_moe is BOUNDED, in the config and in the environment
   ::setenv("VT_N_CPU_MOE", "8", 1);
   CHECK(vllm::ResolvePlacementOverrides().size() == 8);
   ::unsetenv("VT_N_CPU_MOE");
+}
+
+TEST_CASE("placement: an EXPLICIT --fit beside a manual placement collides; a DEFAULTED one does not") {
+  // Two holes in the parse-time refusal, closed at resolve time (#2384).
+  //
+  // The parse-time check sees ONE document, so it never fired for a
+  // multi-document merge (which copies `fit` and the override fields field by
+  // field without re-running it) nor for the environment, where
+  // `VT_PLACEMENT_FIT=1` beside `VT_CPU_MOE=1` was refused nowhere at all.
+  vllm::ResetWeightResidencyConfigForTesting();
+  ::unsetenv("VT_PLACEMENT_FIT");
+  ::unsetenv("VT_CPU_MOE");
+  ::unsetenv("VT_N_CPU_MOE");
+  ::unsetenv("VT_PLACEMENT_OVERRIDES");
+
+  // THE CASE THAT MUST NOT REFUSE, and it is now the common one. `fit` defaults
+  // ON, so a defaulted fit stands beside every manual placement anyone
+  // configures. Refusing here would make `cpu_moe` unusable — the default yields
+  // to the explicit instruction instead.
+  ::setenv("VT_CPU_MOE", "1", 1);
+  CHECK(vllm::ResolvePlacementFit());               // defaulted on
+  CHECK_FALSE(vllm::PlacementFitWasRequested());    // but not asked for
+  CHECK(vllm::DescribePlacementFitCollision().empty());
+
+  // HOLE 2: both set through the ENVIRONMENT, which the parse-time refusal never
+  // saw because it inspects a parsed document.
+  ::setenv("VT_PLACEMENT_FIT", "1", 1);
+  const std::string env_msg = vllm::DescribePlacementFitCollision();
+  CHECK_FALSE(env_msg.empty());
+  CHECK(env_msg.find("mutually exclusive") != std::string::npos);
+  CHECK(env_msg.find("VT_PLACEMENT_FIT=0") != std::string::npos);
+
+  // Explicitly OFF collides with nothing, however the placement was stated.
+  ::setenv("VT_PLACEMENT_FIT", "0", 1);
+  CHECK(vllm::DescribePlacementFitCollision().empty());
+  ::unsetenv("VT_PLACEMENT_FIT");
+  ::unsetenv("VT_CPU_MOE");
+
+  // HOLE 1: the MERGE. Document A states a placement, document B asks for fit.
+  // Neither document alone is refusable, and the merged state is what the parse
+  // never re-checks.
+  vllm::ResetWeightResidencyConfigForTesting();
+  // Each document parses CLEANLY on its own — that is the whole point. The
+  // parse-time refusal inspects one document and neither is refusable; the
+  // MERGED state is what nothing re-checks.
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"placement":{"cpu_moe":true}}})")));
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"placement":{"fit":true}}})")));
+  const std::string merged_msg = vllm::DescribePlacementFitCollision();
+  CHECK_FALSE(merged_msg.empty());
+  CHECK(merged_msg.find("mutually exclusive") != std::string::npos);
+
+  vllm::ResetWeightResidencyConfigForTesting();
 }

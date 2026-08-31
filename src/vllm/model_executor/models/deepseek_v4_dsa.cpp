@@ -366,19 +366,33 @@ std::vector<float> CompressorLayerStep(
     std::vector<float>* state_score, std::vector<float>* comp_rows,
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
-    int64_t sliding_window, float eps, float scale) {
-  VT_CHECK(compress_ratio == 128,
-           "deepseek-v4 compressor step: this is the coff == 1 shape only; "
-           "compress_ratio 4 is coff == 2 and belongs to W3 (#2286)");
+    int64_t sliding_window, float eps, float scale, int64_t rope_dim,
+    double rope_theta, const std::vector<int64_t>* selected) {
+  // W3 (#2286): both shapes now. `coff = 1 + (compress_ratio == 4)`
+  // (`compressor.py:247-248`); at 2 the projections are doubled and a window
+  // position's ROLE picks which half it reads.
+  VT_CHECK(compress_ratio == 4 || compress_ratio == 128,
+           "deepseek-v4 compressor step: upstream emits compress_ratio 4 or 128 "
+           "only (sparse_swa.py:44-55)");
+
+  // Read from the TENSOR, not derived from the ratio: the synthetic suites carry a
+  // collapsed `coff == 1` shape on `cr == 4` layers, which upstream cannot emit
+  // but this tree has always accepted.
+  const int64_t coff =
+      (hidden > 0 && head_dim > 0 &&
+       static_cast<int64_t>(comp_wgate.size()) == 2 * head_dim * hidden)
+          ? 2
+          : 1;
+
+
   VT_CHECK(state_kv != nullptr && state_score != nullptr && comp_rows != nullptr,
            "deepseek-v4 compressor step: the state is CARRIED, not owned here");
   VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
            "deepseek-v4 compressor step: x must be [num_tokens, hidden]");
-  VT_CHECK(static_cast<int64_t>(kv.size()) == num_tokens * head_dim,
-           "deepseek-v4 compressor step: kv must be [num_tokens, head_dim]");
-  VT_CHECK(static_cast<int64_t>(comp_wgate.size()) == head_dim * hidden,
-           "deepseek-v4 compressor step: comp_wgate is [coff*head_dim, hidden] and "
-           "coff is 1 here");
+  VT_CHECK(static_cast<int64_t>(kv.size()) == num_tokens * coff * head_dim,
+           "deepseek-v4 compressor step: kv must be [num_tokens, coff*head_dim]");
+  VT_CHECK(static_cast<int64_t>(comp_wgate.size()) == coff * head_dim * hidden,
+           "deepseek-v4 compressor step: comp_wgate is [coff*head_dim, hidden]");
   VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
            "deepseek-v4 compressor step: one position per token");
 
@@ -393,7 +407,13 @@ std::vector<float> CompressorLayerStep(
   // appears on cache hits. Refusing is never wrong here, only limiting, so the
   // mismatch is refused by name rather than resolved by a policy this row does not
   // own (`## Owed`).
-  const int64_t seen = static_cast<int64_t>(state_kv->size()) / head_dim;
+  // Divided by the STATE ROW's width, not by `head_dim`. At `coff == 2` a token's
+  // state row carries both roles and is `coff * head_dim` wide, so dividing by
+  // `head_dim` counts every token twice and the guard fires on a correct
+  // sequence -- which is how this line was found.
+  const int64_t state_w =
+      coff * head_dim > 0 ? coff * head_dim : head_dim;
+  const int64_t seen = static_cast<int64_t>(state_kv->size()) / state_w;
   VT_CHECK(seen == kv_base,
            "deepseek-v4 compressor: the carried state has seen " +
                std::to_string(seen) + " tokens but this step resumes at kv_base " +
@@ -403,21 +423,23 @@ std::vector<float> CompressorLayerStep(
                "(MODEL-DSV4-DSA-COMPOSE, #2286)");
 
   // 1. The pool score this layer selects with.
-  std::vector<float> score(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
+  const int64_t cw = coff * head_dim;
+  std::vector<float> score(static_cast<size_t>(num_tokens) * cw, 0.0f);
   for (int64_t t = 0; t < num_tokens; ++t) {
-    for (int64_t d = 0; d < head_dim; ++d) {
+    for (int64_t d = 0; d < cw; ++d) {
       double acc = 0.0;
       const float* w = &comp_wgate[static_cast<size_t>(d * hidden)];
       const float* xt = &x[static_cast<size_t>(t * hidden)];
       for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(w[h]) * xt[h];
-      score[static_cast<size_t>(t * head_dim + d)] = static_cast<float>(acc);
+      score[static_cast<size_t>(t * cw + d)] = static_cast<float>(acc);
     }
   }
 
   // 2-3. Drive the state machine and keep whatever closed this step.
   const std::vector<float> emitted =
       CompressorStepCycle(state_kv, state_score, kv, score, comp_ape, positions,
-                          comp_norm_weight, eps, compress_ratio, head_dim);
+                          comp_norm_weight, eps, compress_ratio, head_dim, rope_dim,
+                          rope_theta, coff);
   comp_rows->insert(comp_rows->end(), emitted.begin(), emitted.end());
 
   // 4. The window pass carries the sink and keeps its LSE.
@@ -426,13 +448,156 @@ std::vector<float> CompressorLayerStep(
       queue, q, window_cache, num_blocks, block_size, num_tokens, num_heads, head_dim,
       kv_base, attn_sink, scale, /*no_sink=*/false, sliding_window, &win_lse);
 
-  // 5. Nothing closed yet => the window IS the answer. Merging an empty second
-  //    contributor would divide by an empty denominator rather than be a no-op.
-  const int64_t n_rows = static_cast<int64_t>(comp_rows->size()) / head_dim;
+  // 5. Narrow to the SELECTED rows when the indexer chose. Null selection means
+  //    every closed row, which is the `cr == 128` family.
+  const int64_t all_rows = static_cast<int64_t>(comp_rows->size()) / head_dim;
+  const std::vector<float>* attend = comp_rows;
+  std::vector<float> gathered;
+  if (selected != nullptr) {
+    gathered = GatherSelectedCompressed(*comp_rows, *selected, all_rows, head_dim);
+    attend = &gathered;
+  }
+
+  // Nothing closed, or nothing selected => the window IS the answer. Merging an
+  // empty second contributor would divide by an empty denominator rather than be
+  // a no-op, and an all-padding selection is the normal state before the first
+  // boundary.
+  const int64_t n_rows = static_cast<int64_t>(attend->size()) / head_dim;
   if (n_rows == 0) return win_out;
 
-  return MergeWindowAndCompressed(queue, win_out, win_lse, q, *comp_rows, n_rows,
+  return MergeWindowAndCompressed(queue, win_out, win_lse, q, *attend, n_rows,
                                   num_tokens, num_heads, head_dim, scale);
+}
+
+std::vector<float> IndexerCompressedKeys(
+    const std::vector<float>& x, const std::vector<float>& idx_wk,
+    const std::vector<float>& idx_comp_wgate, const std::vector<float>& idx_comp_ape,
+    const std::vector<float>& idx_comp_norm_weight, std::vector<float>* state_kv,
+    std::vector<float>* state_score, const std::vector<int64_t>& positions,
+    int64_t num_tokens, int64_t hidden, int64_t index_head_dim, int64_t compress_ratio,
+    int64_t rope_dim, double rope_theta, float eps) {
+  VT_CHECK(compress_ratio == 4,
+           "deepseek-v4 indexer keys: the indexer exists ONLY at compress_ratio 4 "
+           "(attention.py:274), where coff is 2");
+  const int64_t coff = 2;
+  const int64_t iw = coff * index_head_dim;
+  VT_CHECK(state_kv != nullptr && state_score != nullptr,
+           "deepseek-v4 indexer keys: the state is CARRIED, not owned here");
+  VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
+           "deepseek-v4 indexer keys: x must be [num_tokens, hidden]");
+  VT_CHECK(static_cast<int64_t>(idx_wk.size()) == iw * hidden,
+           "deepseek-v4 indexer keys: idx_wk is [coff*index_head_dim, hidden]");
+  VT_CHECK(static_cast<int64_t>(idx_comp_wgate.size()) == iw * hidden,
+           "deepseek-v4 indexer keys: its gate has the same width as the KV it is "
+           "fused with (compressor.py:279-287)");
+  VT_CHECK(static_cast<int64_t>(idx_comp_norm_weight.size()) == index_head_dim,
+           "deepseek-v4 indexer keys: norm is [index_head_dim] and is NOT widened "
+           "(compressor.py:288)");
+
+  // Both halves come from the hidden state, as one fused projection upstream.
+  const auto project = [&](const std::vector<float>& w) {
+    std::vector<float> out(static_cast<size_t>(num_tokens) * iw, 0.0f);
+    for (int64_t t = 0; t < num_tokens; ++t)
+      for (int64_t d = 0; d < iw; ++d) {
+        double acc = 0.0;
+        const float* wr = &w[static_cast<size_t>(d * hidden)];
+        const float* xt = &x[static_cast<size_t>(t * hidden)];
+        for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(wr[h]) * xt[h];
+        out[static_cast<size_t>(t * iw + d)] = static_cast<float>(acc);
+      }
+    return out;
+  };
+  const std::vector<float> ikv = project(idx_wk);
+  const std::vector<float> iscore = project(idx_comp_wgate);
+
+  // The SAME cycle, at the indexer's dimensions and with rotation on.
+  return CompressorStepCycle(state_kv, state_score, ikv, iscore, idx_comp_ape,
+                             positions, idx_comp_norm_weight, eps, compress_ratio,
+                             index_head_dim, rope_dim, rope_theta, coff);
+}
+
+std::vector<int64_t> IndexerSelectCompressed(const std::vector<float>& iq,
+                                             const std::vector<float>& keys,
+                                             const std::vector<float>& folded,
+                                             const std::vector<int64_t>& positions,
+                                             int64_t num_tokens, int64_t n_rows,
+                                             int64_t index_n_heads,
+                                             int64_t index_head_dim, int64_t top_k,
+                                             int64_t compress_ratio) {
+  VT_CHECK(compress_ratio > 0 && top_k > 0 && index_head_dim > 0,
+           "deepseek-v4 indexer select: degenerate shape");
+  VT_CHECK(static_cast<int64_t>(iq.size()) ==
+               num_tokens * index_n_heads * index_head_dim,
+           "deepseek-v4 indexer select: iq is [num_tokens, n_heads*head_dim]");
+  VT_CHECK(static_cast<int64_t>(keys.size()) == n_rows * index_head_dim,
+           "deepseek-v4 indexer select: keys are COMPRESSED rows "
+           "[n_rows, index_head_dim], not per-token keys");
+  VT_CHECK(static_cast<int64_t>(folded.size()) == num_tokens * index_n_heads,
+           "deepseek-v4 indexer select: folded is [num_tokens, n_heads]");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
+           "deepseek-v4 indexer select: one position per token");
+
+  std::vector<int64_t> out(static_cast<size_t>(num_tokens) * top_k, -1);
+  for (int64_t t = 0; t < num_tokens; ++t) {
+    // HOW MANY ROWS EXIST at this position, upstream's own count. A row that has
+    // not closed yet is not a candidate, and selecting one would score a key the
+    // model has not produced.
+    const int64_t avail =
+        std::min(n_rows, (positions[static_cast<size_t>(t)] + 1) / compress_ratio);
+    if (avail <= 0) continue;  // the whole row stays -1: nothing to select yet
+
+    std::vector<std::pair<double, int64_t>> scored;
+    scored.reserve(static_cast<size_t>(avail));
+    for (int64_t r = 0; r < avail; ++r) {
+      double s = 0.0;
+      for (int64_t h = 0; h < index_n_heads; ++h) {
+        double dot = 0.0;
+        const float* qh =
+            &iq[static_cast<size_t>((t * index_n_heads + h) * index_head_dim)];
+        const float* kr = &keys[static_cast<size_t>(r * index_head_dim)];
+        for (int64_t d = 0; d < index_head_dim; ++d)
+          dot += static_cast<double>(qh[d]) * kr[d];
+        s += dot * static_cast<double>(
+                       folded[static_cast<size_t>(t * index_n_heads + h)]);
+      }
+      scored.emplace_back(s, r);
+    }
+    // Highest score first; ties to the LOWER row index, so the order is total and
+    // does not depend on the sort's stability.
+    std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+      if (a.first != b.first) return a.first > b.first;
+      return a.second < b.second;
+    });
+    const int64_t take = std::min<int64_t>(top_k, avail);
+    for (int64_t j = 0; j < take; ++j)
+      out[static_cast<size_t>(t * top_k + j)] = scored[static_cast<size_t>(j)].second;
+    // The tail stays -1: PADDING, and a caller that reads it as a row would
+    // attend a real key at every unfilled slot.
+  }
+  return out;
+}
+
+std::vector<float> GatherSelectedCompressed(const std::vector<float>& comp_rows,
+                                            const std::vector<int64_t>& sel,
+                                            int64_t n_rows, int64_t head_dim) {
+  VT_CHECK(head_dim > 0, "deepseek-v4 gather: degenerate head_dim");
+  VT_CHECK(static_cast<int64_t>(comp_rows.size()) == n_rows * head_dim,
+           "deepseek-v4 gather: comp_rows is [n_rows, head_dim]");
+  std::vector<float> out;
+  out.reserve(sel.size() * static_cast<size_t>(head_dim));
+  for (const int64_t r : sel) {
+    // PADDING, dropped. Reading `-1` as row zero would attend a real key the
+    // indexer did not choose, at every unfilled slot.
+    if (r < 0) continue;
+    VT_CHECK(r < n_rows,
+             "deepseek-v4 gather: selection names compressed row " +
+                 std::to_string(r) + " but only " + std::to_string(n_rows) +
+                 " have closed; an index past the end is a selection bug, not "
+                 "padding");
+    out.insert(out.end(), comp_rows.begin() + r * head_dim,
+               comp_rows.begin() + (r + 1) * head_dim);
+  }
+  return out;
 }
 
 }  // namespace vllm::deepseek_v4

@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/host_parallel.h"  // the ONE pool (#1664)
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
@@ -100,25 +101,52 @@ std::vector<float> Conv2d(const std::vector<float>& in, const Conv2dSpec& spec,
   VT_CHECK(oh > 0 && ow > 0, "ltx2 conv2d: empty output");
 
   std::vector<float> out(static_cast<size_t>(co * oh * ow));
-  for (int64_t oc = 0; oc < co; ++oc) {
-    for (int64_t y = 0; y < oh; ++y) {
-      for (int64_t x = 0; x < ow; ++x) {
-        double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
-        for (int64_t ic = 0; ic < ci; ++ic) {
-          for (int64_t a = 0; a < spec.kh; ++a) {
-            const int64_t sy = y * spec.stride_h + a * spec.dil_h;
-            for (int64_t b = 0; b < spec.kw; ++b) {
-              const int64_t sx = x * spec.stride_w + b * spec.dil_w;
-              acc += static_cast<double>(padded[static_cast<size_t>((ic * ph + sy) * pw + sx)]) *
-                     static_cast<double>(
-                         weight[static_cast<size_t>(((oc * ci + ic) * spec.kh + a) * spec.kw + b)]);
+  // THE PARTITION IS OVER OUTPUT LINES (oc, y), AND THAT IS WHY IT IS BIT-EXACT
+  // (LTX25-AUDIO-DECODE-COST). The whole `ci * kh * kw` reduction stays inside
+  // one output element's body, so every element is produced by the same
+  // instruction sequence over the same values in the same order whatever the
+  // worker count is — the contract `host_parallel.h` inherits from
+  // `cpu_threadpool.h:39-43`. Splitting the reduction axis `ic` instead would
+  // make the summation order a function of the thread count; it is rejected
+  // here for the same reason `ltx2_video_vae.cpp` rejected it under #1009.
+  //
+  // WHY THIS FUNCTION AND NOT ANOTHER. `decode.audio.mel` was 47.171 s of a
+  // 518.4 s LTX-2.5 render at the pinned oracle's own request — 9.13% of the
+  // wall, 3.1x the whole 21B denoise loop, for 1.02 s of audio. Instrumented at
+  // the shipped checkpoint's geometry the decoder issues 28 convolutions
+  // totalling 31.46 GMAC and spends 99.7% of the leaf inside THIS loop, at
+  // ~1.2 GMAC/s on one core: one scalar `double` FMA per ~4 cycles, which is
+  // the latency of the dependent accumulator chain and nothing else. The
+  // encoder shares this primitive and inherits the change.
+  //
+  // The `double` accumulator is a SEPARATE, larger question and is deliberately
+  // untouched here: upstream's `nn.Conv2d` accumulates in the tensor dtype
+  // (#1008 measured that for the video half and moved it to f32), and moving
+  // this one is a golden-changing correctness row, not a bit-exact one.
+  host_parallel::ForOutputRows(
+      co * oh, ow * ci * spec.kh * spec.kw, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; ++r) {
+          const int64_t oc = r / oh;
+          const int64_t y = r % oh;
+          for (int64_t x = 0; x < ow; ++x) {
+            double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
+            for (int64_t ic = 0; ic < ci; ++ic) {
+              for (int64_t a = 0; a < spec.kh; ++a) {
+                const int64_t sy = y * spec.stride_h + a * spec.dil_h;
+                for (int64_t b = 0; b < spec.kw; ++b) {
+                  const int64_t sx = x * spec.stride_w + b * spec.dil_w;
+                  acc +=
+                      static_cast<double>(padded[static_cast<size_t>((ic * ph + sy) * pw + sx)]) *
+                      static_cast<double>(
+                          weight[static_cast<size_t>(((oc * ci + ic) * spec.kh + a) * spec.kw +
+                                                     b)]);
+                }
+              }
             }
+            out[static_cast<size_t>((oc * oh + y) * ow + x)] = static_cast<float>(acc);
           }
         }
-        out[static_cast<size_t>((oc * oh + y) * ow + x)] = static_cast<float>(acc);
-      }
-    }
-  }
+      });
   *out_h = oh;
   *out_w = ow;
   return out;

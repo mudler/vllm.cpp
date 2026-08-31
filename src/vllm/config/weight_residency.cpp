@@ -1171,9 +1171,40 @@ std::string DescribePlacementResidencyCollision() {
 bool ResolvePlacementFit() {
   const std::optional<PlacementConfig>& cfg =
       ActiveWeightResidencyConfig().placement;
+  // ON by default, mirroring llama.cpp's `fit_params = true` (`common/common.h:468`
+   // @ b10451). Upstream's headline behaviour is that a model too large for the
+  // device just runs, without the operator configuring anything; shipping the
+  // mechanism switched off would give us the machinery and not the experience.
+  //
+  // Three conditions make that safe, and each is tested: an UNKNOWN budget places
+  // NOTHING rather than everything, an arm the resolver cannot answer is INERT
+  // unless explicitly requested, and a placement that happens is announced with
+  // the arithmetic behind it.
   return ResolveResidencyBool("VT_PLACEMENT_FIT",
                               cfg.has_value() ? cfg->fit : std::nullopt,
-                              /*builtin_default=*/false);
+                              /*builtin_default=*/true);
+}
+
+std::string DescribePlacementFitCollision() {
+  if (!PlacementFitWasRequested()) return "";  // a default yields; it collides with nothing
+  if (!ResolvePlacementFit()) return "";       // explicitly OFF collides with nothing
+  const std::vector<PlacementOverride> overrides = ResolvePlacementOverrides();
+  if (overrides.empty()) return "";
+  return "offload config: \"vllm_cpp.placement.fit\" (--fit) was asked for "
+         "explicitly and a manual placement is also in effect (" +
+         std::to_string(overrides.size()) +
+         " override(s) from \"overrides\", \"cpu_moe\", \"n_cpu_moe\" or their "
+         "environment variables). The resolver would have to override what the "
+         "operator asked for, so these are mutually exclusive rather than "
+         "merged. Drop one: unset the manual placement to let --fit decide, or "
+         "set VT_PLACEMENT_FIT=0 to keep the placement you stated";
+}
+
+bool PlacementFitWasRequested() {
+  if (std::getenv("VT_PLACEMENT_FIT") != nullptr) return true;
+  const std::optional<PlacementConfig>& cfg =
+      ActiveWeightResidencyConfig().placement;
+  return cfg.has_value() && cfg->fit.has_value();
 }
 
 size_t ResolveDeviceWeightBudgetBytes(size_t probed_total_bytes) {

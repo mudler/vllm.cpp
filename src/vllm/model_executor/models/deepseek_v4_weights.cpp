@@ -1154,11 +1154,17 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       hl.comp_ape = carried.Float(a + "compressor.ape", {cr, cw});
       hl.comp_norm_weight = carried.Float(a + "compressor.norm.weight", {hd});
       hl.comp_wgate = carried.Float(wg, {cw, H});
-      // Accounted, no destination: the collapsed-geometry compressor reuses the
-      // MLA's own `kraw` latent as its KV, so no host slot reads a separate
-      // projection. Upstream HAS one, and wiring it is part of the owed DSA
-      // composition rather than of this wave.
-      carried.Account(a + "compressor.wkv.weight");
+      // W3 (#2286): MATERIALIZED now, where it was accounted-and-dropped before.
+      // Upstream's compressor pools its own projection of the hidden state, not
+      // the MLA's `kraw`, so a forward that reuses the latent pools the wrong
+      // operand on this artifact -- finite, plausible, and not what upstream
+      // pools. Same `coff * head_dim` width as the gate, since both halves come
+      // out of one `fused_wkv_wgate` (`compressor.py:279-287`).
+      const std::string wkv = a + "compressor.wkv.weight";
+      RequireDsaDim(carried.PeekShape(wkv), 0, cw, wkv,
+                    "`coff * head_dim`, the same width as the gate it is fused "
+                    "with (compressor.py:279-287)");
+      hl.comp_wkv = carried.Float(wkv, {cw, H});
     }
     if (p.has_indexer(l)) {
       // The indexer exists ONLY at `cr == 4` (`attention.py:274`), so upstream's
@@ -1176,8 +1182,24 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
                     "`compress_ratio == 4` (attention.py:274) where `coff` is 2 "
                     "(compressor.py:247-248)");
       hl.idx_wk = carried.Float(ik, {iw, H});
-      for (const char* c : {"ape", "norm.weight", "wgate.weight"})
-        carried.Account(a + "indexer.compressor." + c);
+      // W3 (#2286): MATERIALIZED, where all three were accounted-and-dropped.
+      // The indexer's compressor is the same machine at `index_head_dim`, so the
+      // same widths apply: the ape and the fused gate carry `coff`, and `norm`
+      // does not (`compressor.py:288`).
+      //
+      // Loading them does NOT make the indexer's compressor run. The forward
+      // still refuses on `idx_wk`'s width, deliberately: narrowing a refusal
+      // before the capability exists turns it into a silent wrong answer, which
+      // this row has already established twice.
+      const std::string iape = a + "indexer.compressor.ape";
+      const std::string iwg = a + "indexer.compressor.wgate.weight";
+      RequireDsaDim(carried.PeekShape(iwg), 0, iw, iwg,
+                    "`coff * index_head_dim`, the same width as the KV it is "
+                    "fused with (compressor.py:279-287)");
+      hl.idx_comp_ape = carried.Float(iape, {p.compress_ratio(l), iw});
+      hl.idx_comp_wgate = carried.Float(iwg, {iw, H});
+      hl.idx_comp_norm_weight =
+          carried.Float(a + "indexer.compressor.norm.weight", {ihd});
       hl.idx_wproj = carried.Float(a + "indexer.weights_proj.weight", {inh, H});
       // NOT A WIDTH PROBLEM AT ALL, and worth separating from the rest. Upstream
       // builds this as `ReplicatedLinear(self.q_lora_rank, self.head_dim *

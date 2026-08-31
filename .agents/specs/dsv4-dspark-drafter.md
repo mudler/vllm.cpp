@@ -215,6 +215,19 @@ block's are 20.2 GiB as host f32 -- and the caller is told through
 Shapes are checked at assembly rather than inside a forward, where a mismatch
 surfaces as an anonymous MatVec size error naming no tensor and no layer.
 
+W-3's EXTERNALLY-SUPPLIED-KV MODE LANDED, which is the seam extension the
+paragraph below argued for. `V4Backend::paged_kv_prewritten`, surfaced on
+`DeepseekV4ForwardGgufPaged` as `kv_prewritten` and defaulting FALSE, skips the
+`vt::ConcatAndCacheMla` write and attends the rows the caller already placed. The
+`deck` is still computed -- it is the same tensor the non-paged arms read -- and
+only the write is skipped.
+
+Gated on the exact claim: with the flag on, a cache filled with a recognisable
+pattern comes back BYTE-UNCHANGED, and the same step with the flag off DOES write.
+Without that second half the case would pass against a build that never writes at
+all. Three mutations run red: the flag ignored, the write removed unconditionally,
+and the public entry dropping the flag before it reaches the backend.
+
 W-3's REMAINING SHAPE, measured rather than estimated. The block weights now
 assemble onto `DeepseekV4LayerHostWeights`, so `MoeBlock`, `MhcPre` and `MhcPost`
 compose the drafter block unchanged. **`AttentionBlock` does not**, and the reason

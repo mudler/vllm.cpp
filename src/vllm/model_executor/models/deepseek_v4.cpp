@@ -139,6 +139,20 @@ struct V4Backend {
   // same keys, and a step that wrote one and read the other would produce
   // plausible tokens from a stale context.
   std::vector<vt::Tensor>* paged_kv = nullptr;
+  // DSV4-DSPARK-DRAFTER W-3 (#1314): the KV rows in `paged_kv` were written by
+  // SOMEONE ELSE, so this step must attend them WITHOUT writing its own.
+  //
+  // A trunk layer derives KV from its own hidden state, which is why the write
+  // below is otherwise unconditional. A DSpark drafter block does not: its rows
+  // come from the TARGET's tap state through `update_kv_from_target`, at the
+  // target's own positions, while its query comes from the block's hidden state.
+  // Query and KV having different sources is the one thing this function could
+  // not express, and this flag is the smallest extension that lets it.
+  //
+  // DEFAULT FALSE, so every existing path keeps writing exactly as before. When
+  // true the `deck` is still COMPUTED -- it is the same tensor the non-paged arms
+  // read -- and only the cache write is skipped.
+  bool paged_kv_prewritten = false;
   // Re-scoped Stage 2: collapse the routed-expert per-expert keep-quant matvecs
   // into ONE grouped kMatmulBTQuantGrouped launch per {gate,up,down} (fewer host
   // launches + higher GB10 occupancy). Default ON for the GGUF keep-quant path;
@@ -936,7 +950,11 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     t_pe.stride[0] = hd;
     vt::Tensor t_slot = vt::Tensor::Contiguous(slots.data(), vt::DType::kI64,
                                                be.q->device, {T});
-    vt::ConcatAndCacheMla(*be.q, t_kvc, t_pe, page, t_slot);
+    // Skipped ONLY when the caller says the rows are already there. Silence would
+    // be the wrong shape for this: a step that believed it had written its KV and
+    // had not would attend a stale context and produce plausible tokens.
+    if (!be.paged_kv_prewritten)
+      vt::ConcatAndCacheMla(*be.q, t_kvc, t_pe, page, t_slot);
     paged_attn = true;
   }
   if (be.kv != nullptr) {
@@ -3150,7 +3168,8 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               int64_t kv_base,
                                               const std::vector<int32_t>& token_ids,
                                               const std::vector<int32_t>& positions,
-                                              const std::vector<int32_t>& logits_indices) {
+                                              const std::vector<int32_t>& logits_indices,
+                                              bool kv_prewritten) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3160,6 +3179,7 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
            "DeepseekV4ForwardGgufPaged: one page tensor per layer is required");
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.paged_kv = &paged_kv;
+  be.paged_kv_prewritten = kv_prewritten;
   be.kv_base = kv_base;
   be.grouped_moe = GroupedMoeEnabled();
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,

@@ -664,7 +664,16 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               int64_t kv_base,
                                               const std::vector<int32_t>& token_ids,
                                               const std::vector<int32_t>& positions,
-                                              const std::vector<int32_t>& logits_indices);
+                                              const std::vector<int32_t>& logits_indices,
+                                              // DSV4-DSPARK-DRAFTER W-3 (#1314):
+                                              // the rows in `paged_kv` were written
+                                              // by the caller, so attend them and do
+                                              // NOT overwrite them. A drafter block's
+                                              // KV comes from the target's taps while
+                                              // its query comes from its own hidden
+                                              // state; nothing else in this tree has
+                                              // those two from different sources.
+                                              bool kv_prewritten = false);
 
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,

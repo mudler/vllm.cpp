@@ -1294,3 +1294,83 @@ TEST_CASE("LoadDeepseekV4FromGguf: RED-first — unmapped/leftover tensors throw
     CHECK_THROWS(vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &pol));
   }
 }
+
+
+TEST_CASE("W-3: `kv_prewritten` attends the pages WITHOUT overwriting them (#1314)") {
+  // A DSpark drafter block's KV rows come from the TARGET's tap state, written at
+  // the target's positions, while its query comes from the block's own hidden
+  // state. Every other path in this tree derives both from the same state, which
+  // is why the paged write was unconditional. This is the smallest extension that
+  // lets the two differ, and the claim it has to earn is exact: with the flag on,
+  // the cache the caller filled must come back BYTE-UNCHANGED.
+  Dims d;
+  d.sliding_window = 0;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+
+  const int64_t nlayers = w.params.num_hidden_layers;
+  const int64_t hd = w.params.head_dim;
+  const int64_t block_size = 8, num_blocks = 4;
+  const std::vector<int32_t> step{1, 2, 3};
+  std::vector<int32_t> pos(step.size());
+  for (size_t i = 0; i < step.size(); ++i) pos[i] = static_cast<int32_t>(i);
+
+  const auto make_pages = [&](std::vector<std::vector<float>>* storage,
+                              std::vector<vt::Tensor>* pages) {
+    storage->assign(static_cast<size_t>(nlayers), {});
+    pages->assign(static_cast<size_t>(nlayers), vt::Tensor{});
+    for (int64_t l = 0; l < nlayers; ++l) {
+      // A RECOGNISABLE pattern, so "unchanged" is a real comparison rather than a
+      // check that zeros stayed zero.
+      std::vector<float>& buf = (*storage)[static_cast<size_t>(l)];
+      buf.resize(static_cast<size_t>(num_blocks * block_size * hd));
+      for (size_t i = 0; i < buf.size(); ++i)
+        buf[i] = 0.01f * static_cast<float>((i * 7 + l * 13) % 41) - 0.2f;
+      (*pages)[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+          buf.data(), vt::DType::kF32, q.device, {num_blocks, block_size, hd});
+    }
+  };
+
+  std::vector<std::vector<float>> st_on, st_off;
+  std::vector<vt::Tensor> pg_on, pg_off;
+  make_pages(&st_on, &pg_on);
+  make_pages(&st_off, &pg_off);
+  const std::vector<std::vector<float>> before = st_on;
+
+  (void)vllm::DeepseekV4ForwardGgufPaged(w, q, pg_on, /*kv_base=*/0, step, pos,
+                                         {static_cast<int32_t>(step.size() - 1)},
+                                         /*kv_prewritten=*/true);
+  (void)vllm::DeepseekV4ForwardGgufPaged(w, q, pg_off, /*kv_base=*/0, step, pos,
+                                         {static_cast<int32_t>(step.size() - 1)},
+                                         /*kv_prewritten=*/false);
+
+  // ON: every byte the caller wrote survives.
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const auto& a = before[static_cast<size_t>(l)];
+    const auto& b = st_on[static_cast<size_t>(l)];
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i]) {
+        CAPTURE(l);
+        CAPTURE(i);
+        REQUIRE(a[i] == b[i]);
+      }
+    }
+  }
+
+  // OFF: the step DID write, or the flag is not load-bearing and the case above
+  // would pass against a build that never writes at all.
+  bool wrote = false;
+  for (int64_t l = 0; l < nlayers && !wrote; ++l) {
+    const auto& a = before[static_cast<size_t>(l)];
+    const auto& b = st_off[static_cast<size_t>(l)];
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i] != b[i]) { wrote = true; break; }
+  }
+  CHECK(wrote);
+}

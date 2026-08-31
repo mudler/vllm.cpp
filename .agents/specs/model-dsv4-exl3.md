@@ -47,9 +47,21 @@ materializes the `carried-*` tower the forward composes with, sets the flag on
 the same arm, and rebuilds the forward suite on the PRODUCTION loader entry so
 the reachability claim is now the thing the tests measure. See `## W1c design`.
 A synthetic rank-sliced checkpoint now loads and emits logits end to end through
-`DeepseekV4Model::Forward`; the REAL artifact remains blocked, on its
-real-geometry DSA tensors (`## W1c design` W1c-4) and on the tokenizer
-([#1924](https://github.com/mudler/vllm.cpp/issues/1924)). W2d replaces that wiring's per-expert loop with `vt::Exl3MoeMlp`
+`DeepseekV4Model::Forward`; the REAL artifact remains blocked on its
+real-geometry DSA tensors (`## W1c design` W1c-4).
+
+**The tokenizer half of that blocker is RESOLVED, and this line claimed otherwise
+until 2026-08-31.** `TOK-DEEPSEEK-V3-PRE` (#1924) landed the four-stage
+DeepSeek-V3/V4-Flash pre-tokenizer and its HF `tokenizers` parity gate,
+`tests/vllm/test_tokenizer_parity_deepseek_v3.cpp`, whose goldens are a
+byte-for-byte copy of THIS artifact's own `tokenizer.json`. Re-verified on
+2026-08-31: the golden and
+`/mnt/nas_share/rc/ckpt/dsv4-flash-0731-spark-exl3/tokenizer.json` share
+sha256 `8f9f37ca37fdc4f5...`, the suite is 10/10 with 0 skipped, and the real file
+loaded through `Tokenizer::FromHfJson` round-trips ASCII, code, CJK, emoji,
+leading/trailing whitespace, digits and the empty string EXACTLY, at
+`vocab_size = 129280` matching `config.json`. So one of the two blockers on the
+real-artifact load has not existed for some time. W2d replaces that wiring's per-expert loop with `vt::Exl3MoeMlp`
 — ONE fused call per layer over every routed expert of every token, where the
 loop paid `3 * topk * T` — and keeps the loop as upstream's own tail arm for an
 expert over `TEMP_ROWS_FUSED` tokens and as the `VT_DSV4_EXL3_FUSED_MOE=0`

@@ -945,3 +945,51 @@ TEST_CASE("dsv4 exl3: unrepresentable inputs REFUSE BY NAME") {
     CHECK(Mentions(msg, "svh"));
   }
 }
+
+TEST_CASE("dsv4 exl3 R1: the MTP tail is CLASSIFIED by the production load (#1314)") {
+  // REACHABILITY, not arithmetic. `test_deepseek_v4_mtp_inventory` states the
+  // real artifact's shapes and exercises `ClassifyDeepseekV4MtpTail` directly;
+  // this case proves the production loader actually CALLS it, by going through
+  // `LoadDeepseekV4ForCausalLMWeights` and reading the result off the weights.
+  //
+  // The distinction is the point. Before #1314 the loader met 3985 draft-head
+  // tensors on every load of the real checkpoint and dropped them while counting
+  // only how many there were, and `deepseek-v4-mtp.md` §4 recorded the MTP gate
+  // as weight-BLOCKED for a week as a result.
+  FixtureOptions opt;
+  opt.layers = 1;
+  opt.mtp_heads = 3;  // the measured artifact carries three, not the config's one
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+
+  // Still SKIPPED, exactly as vLLM skips it (nvidia/model.py:1474) -- classifying
+  // is not loading, and this arm must not start consuming the tail by accident.
+  // 6 tensors x 3 heads. The base fixture's two plain `mtp.0.*` stand down when a
+  // real tail is requested, because they use the same names.
+  CHECK(w.exl3.skipped_mtp_tensors == 18);
+
+  CHECK(w.exl3.mtp.refusal.empty());
+  CHECK(w.exl3.mtp.num_heads == 3);
+  CHECK(w.exl3.mtp.plain == 6);      // (attn_norm + attn_sink) x 3
+  CHECK(w.exl3.mtp.fp8_block == 3);  // wkv, per head
+  CHECK(w.exl3.mtp.mxfp4 == 3);      // one routed expert, per head
+}
+
+TEST_CASE("dsv4 exl3 R1: a tail of PLAIN tensors classifies without refusing") {
+  // The base fixture's tail is two unquantized `mtp.0.*` tensors. A tail carrying
+  // no quantized weight at all must still classify cleanly: a refusal here would
+  // break every load that works today, which is why the classifier REPORTS rather
+  // than throws.
+  FixtureOptions opt;
+  opt.layers = 1;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  CHECK(w.exl3.skipped_mtp_tensors == 2);
+  CHECK(w.exl3.mtp.num_heads == 1);
+  CHECK(w.exl3.mtp.plain == 2);
+  CHECK(w.exl3.mtp.fp8_block == 0);
+  CHECK(w.exl3.mtp.mxfp4 == 0);
+  CHECK(w.exl3.mtp.refusal.empty());
+}

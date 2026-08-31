@@ -253,6 +253,17 @@ inline StEntry F32Entry(const std::string& name, const std::vector<int64_t>& sha
     v[static_cast<size_t>(i)] = CarriedValue(name, i, scale, center);
   return {name, "F32", shape, Raw(v)};
 }
+// `CLAIM-DEEPSEEK-V4-MTP` R1 (#1314): the MTP tail's two quantized layouts are
+// byte payloads, so the fixture writes bytes. The VALUES do not matter here --
+// the loader classifies the tail by dtype and shape and does not decode it.
+inline StEntry ByteEntry(const std::string& name, const std::string& dtype,
+                         const std::vector<int64_t>& shape) {
+  const int64_t n = Numel(shape);
+  std::vector<uint8_t> v(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = static_cast<uint8_t>(i & 0x7f);
+  return {name, dtype, shape, v};
+}
+
 inline StEntry I64Entry(const std::string& name, const std::vector<int64_t>& shape,
                         int64_t modulo) {
   const int64_t n = Numel(shape);
@@ -291,6 +302,10 @@ struct FixtureOptions {
   int ranks_written = kTp;         // < tp leaves a rank missing
   std::string drop_tensor;         // one EXL3 tensor to omit entirely
   std::string extra_carried;       // one unroutable carried tensor to add
+  // R1 (#1314): write N MTP (nextn) heads into the tail, at the REAL artifact's
+  // layouts -- fp8-block attention tiled 128x128 and MXFP4 experts at group 32.
+  // The production loader skips them and must CLASSIFY them on the way past.
+  int mtp_heads = 0;
   bool swap_w2_slice_axis = false; // write w2 sliced on OUT instead of IN
   // ── the NEGATIVE direction of the detection predicate ────────────────────
   // `quantization_config.quant_method`. Anything but "exl3" must take the
@@ -565,8 +580,13 @@ inline std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
   // The real artifact carries an MTP tail. vLLM's DeepSeek-V4 loader skips it
   // (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474) and so
   // must this arm, WITHOUT reporting the tensors as unroutable.
-  push(F32Entry("mtp.0.attn_norm.weight", {1}, 0.25f, 0.0f));
-  push(F32Entry("mtp.0.ffn.experts.0.w1.weight", {1}, 0.25f, 0.0f));
+  // Only when the caller did NOT ask for a real tail: `opt.mtp_heads` writes
+  // `mtp.0.*` under these very names, and two entries with one name would make
+  // which of them the index holds a coin toss.
+  if (opt.mtp_heads == 0) {
+    push(F32Entry("mtp.0.attn_norm.weight", {1}, 0.25f, 0.0f));
+    push(F32Entry("mtp.0.ffn.experts.0.w1.weight", {1}, 0.25f, 0.0f));
+  }
   // The NON-EXL3 vehicle's routed experts: dense NVFP4, the four suffixes the
   // pre-existing arm's name-map requires for `expert_dtype == "fp4"` (the
   // `expert_suffixes` vector in `LoadDeepseekV4ForCausalLMWeights`,
@@ -587,6 +607,22 @@ inline std::vector<StEntry> CarriedEntries(const FixtureOptions& opt) {
   }
   if (!opt.extra_carried.empty())
     push(F32Entry(opt.extra_carried, {1}, 0.25f, 0.0f));
+
+  // The MTP tail. Shapes are the measured artifact's, scaled down only where the
+  // fixture's own widths differ; the SCALE-to-WEIGHT ratios that the classifier
+  // actually checks (128x128 fp8 blocks, one E8M0 byte per 32 packed inputs) are
+  // exact.
+  for (int m = 0; m < opt.mtp_heads; ++m) {
+    const std::string b = "mtp." + std::to_string(m) + ".";
+    push(Bf16Entry(b + "attn_norm.weight", {H}, 0.1f, 1.0f));
+    push(F32Entry(b + "attn.attn_sink", {kHeads}, 0.1f, 0.0f));
+    // fp8-block: scale tiles the weight at exactly 128x128.
+    push(ByteEntry(b + "attn.wkv.weight", "F8_E4M3", {256, 512}));
+    push(ByteEntry(b + "attn.wkv.weight.scale", "F8_E8M0", {2, 4}));
+    // MXFP4: packed [N, K/2] with one E8M0 byte per 32 inputs, so [N, K/32].
+    push(ByteEntry(b + "ffn.experts.0.w1.weight", "I8", {64, 128}));
+    push(ByteEntry(b + "ffn.experts.0.w1.weight.scale", "F8_E8M0", {64, 8}));
+  }
   return e;
 }
 

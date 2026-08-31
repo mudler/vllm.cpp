@@ -3946,33 +3946,25 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
-    // KGATHER -- AND THE ONE LINE THAT IS DELIBERATELY NOT HERE YET.
+    // KGATHER. `EmbeddingKernelCuda` branches on `IsBlockQuant(table.dtype)` and
+    // routes a block table to `LaunchEmbeddingQuant` (decoders in
+    // vt/cuda/cuda_quant_dequant.cuh). Registering it under the quant id is what
+    // makes this device's block-gather capability visible to `OpRegistered`,
+    // which is what `DeviceQuantGatherSupported` asks -- so this call IS the
+    // GGUF residency flip, and there is no separate boolean anywhere.
     //
-    // `EmbeddingKernelCuda` branches on `IsBlockQuant(table.dtype)` and routes a
-    // block table to `LaunchEmbeddingQuant` (decoders in
-    // vt/cuda/cuda_quant_dequant.cuh), so the capability EXISTS. Registering it
-    // under `OpId::kEmbeddingQuant` is what would make it visible to
-    // `OpRegistered`, which is what `DeviceQuantGatherSupported` asks -- so that
-    // registration IS the residency flip, now that the gate is a query rather
-    // than a device list. There is no separate line to flip any more.
-    //
-    // It is withheld because nvcc has never compiled these decoders and no
-    // device has ever executed them. The evidence today is a HOST transcription
-    // proof: the decoders compiled as ordinary C++ against the CPU tables agree
-    // bit-for-bit on 13,428,192 elements across all 18 encodings. That proves
-    // the transliteration, not the kernel.
-    //
-    // Registering it early would not fail loudly -- it would route EVERY GGUF
-    // model's block-typed gather table on CUDA into never-executed code, keeping
-    // the blocks resident and decoding them on device, with no throw and no log
-    // if the decode were wrong. That is the exact failure class this row spent a
-    // day isolating (dropped repack markers -> NaN -> all-zero logits -> every
-    // token id 0). So the gather arm on CUDA is UNREACHED and OWED until
-    // tests/vt/test_cuda_embedding_quant.cpp runs green on a CUDA host; the row
-    // is MODEL-MM-QWEN4-EXP and .agents/specs/cuda-quant-gather.md lists it
-    // under `## Owed`. Uncommenting the two lines below is the whole flip.
-    //
-    // RegisterCudaBlockGather();   <-- THE FLIP. One call, defined below.
+    // It was withheld until a GPU had executed the decoders, because registering
+    // it early would route EVERY GGUF model's block-typed gather table on CUDA
+    // into never-executed code, with no throw and no log if a decode were wrong.
+    // MEASURED on thor:gpu0 (Jetson Thor, sm_110, nvcc 13.0.88, aarch64),
+    // 2026-08-31, job e53a20f5: the RED leg without this arm failed BY NAME on
+    // 4 of 5 cases at 32 assertions ("cuda embedding: unsupported table dtype"),
+    // and with it `tests/vt/test_cuda_embedding_quant.cpp` passed 6 of 6 cases
+    // at 231 of 231 assertions -- every one of the 18 block encodings gathered
+    // BIT-EXACTLY against the CPU arm, in f32 and bf16 out, i32 and i64 ids.
+    // Deleting this call reds that gate, which is how the mutation leg proved it
+    // is the reachable call site and not a duplicate.
+    RegisterCudaBlockGather();
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
     RegisterOp(

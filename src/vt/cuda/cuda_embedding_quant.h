@@ -46,18 +46,19 @@ cudaError_t LaunchEmbeddingQuant(cudaStream_t s, Tensor& out, const Tensor& tabl
 //
 // Since the GGUF gate became `OpRegistered(kEmbeddingQuant, dev)`, registering
 // this device's block gather IS the flip. This function performs that
-// registration and NOTHING else, so the flip is one call rather than a
-// copy-pasted registrar line, and so the device gate can enable it in test scope
-// while production still refuses.
+// registration and NOTHING else, so the flip is one auditable call site rather
+// than a copy-pasted registrar line.
 //
-// PRODUCTION DOES NOT CALL THIS YET. `cuda_ops.cu`'s registrar has the call
-// commented out with its reason: nvcc has never compiled the decoders and no
-// device has executed them, and registering early would route every GGUF model's
-// block-typed gather table on CUDA into never-executed code with no throw and no
-// log if the decode were wrong. `tests/vt/test_cuda_embedding_quant.cpp` calls it
-// to measure the kernel through the real dispatch, and asserts that production
-// has NOT called it. When that gate runs green on a CUDA host, the registrar
-// calls this and that assertion becomes its opposite, in one commit.
+// `cuda_ops.cu`'s registrar CALLS IT, as of the thor:gpu0 device gate
+// (sm_110, nvcc 13.0.88, 2026-08-31): 18 of 18 block encodings gathered
+// bit-exactly against the CPU arm at 231 assertions, with the pre-arm RED leg
+// failing by name. Deleting the call reds `tests/vt/test_cuda_embedding_quant.cpp`,
+// which is what proves it is the reachable call site.
+//
+// It stays a named function rather than being inlined back into the registrar
+// because that is what made the withheld period auditable, and because the same
+// property -- one call site, greppable -- is what a reviewer mutates to check
+// reachability.
 void RegisterCudaBlockGather();
 
 }  // namespace vt::cuda

@@ -4498,6 +4498,120 @@ device gate is recorded as PENDING and never as a pass.
 The next actions are W6 (the vision tower, processor and placeholder expansion),
 W7b (the first fitting artifact), and W9b.
 
+### W9c-1 — the MLA route, PRICED and REFUSED, and the rescoping's central claim is falsified
+
+`ACTIVE`, 2026-08-31. **W9c-1 was dispatched to route this row's 11 DSA layers
+onto `mla::ForwardMlaAttentionBlock` and delete the duplication. It lands no
+product code, because the measurement that precedes the port falsifies the
+premise the wave was scoped on.** The rescoping's §Owed entries O32-O35 are
+[#2413](https://github.com/mudler/vllm.cpp/pull/2413)'s and are not renumbered
+here; [#2410](https://github.com/mudler/vllm.cpp/issues/2410)'s body carries
+their text at this branch's base. Measured on `e4aa7c527`.
+
+**"No kernel needs writing for correctness" is FALSE, and this is the finding
+that changes the price of the whole device arm.** This model's indexer is not
+the Lightning Indexer. It is a **k-pool** indexer, and no `vt` op, no CUDA
+kernel and no other model in this tree implements it:
+
+- `include/vt/ops.h:130-131` defines exactly two indexer ops, `kDsaIndexerLogits`
+  and `kDsaTopkSelect`, and its own comment at `:123` names them "the DSA
+  'Lightning Indexer' selection pair". `kDeepseekV4Dsa` (`:295`) is the same
+  family (`:284-285`, "DSA Lightning-Indexer+seams"). There is no pooled
+  selection op of any kind.
+- `git grep -l 'kpool\|index_kpool\|compress_ape\|compress_gate' src/ include/`
+  returns **11 files and every one of them is a `glm5_next_*` file.** Zero in
+  the shared seam, zero under `src/vt/`, zero in any other model.
+- The two weights that ARE the pooling have no counterpart in
+  `mla::MlaBlockWeights`, which carries exactly five indexer tensors
+  (`mla_attention.h:510-514`) and this model has all five PLUS
+  `kpool_ape` `[index_kpool, head_dim]` and `kpool_gate` `[head_dim, hidden_size]`
+  (`glm5_next_dsa.h:137`, `:141`). They are named tensors in the published
+  artifact -- `indexer_compressor_ape.weight` and
+  `indexer_compressor_gate.weight`, loaded at `glm5_next_loader.cpp:378-380`.
+- The selection semantics are structurally different, not a variant. The seam
+  picks the top `index_topk` **tokens** from per-token logits. This model pools
+  `index_kpool = 4` consecutive valid tokens under a learned per-channel 4-way
+  softmax, picks the top `index_topk / index_kpool = 512` **pools**
+  (`glm5_next_dsa.cpp:168-304`), expands them back to member token indices, then
+  appends the ragged visible tail raw and unscored (`:307-362`). Its output is
+  **2051** wide, not 2048 (`OutputWidth()`, `glm5_next_dsa.cpp:56-59`), and it
+  emits `-1` sentinels and duplicates.
+
+**And every one of the 11 layers pays it.** `indexer_types` is all `full` on the
+published checkpoint (this spec's own config table, §"Constants and layouts"),
+so there is no `shared` layer on this artifact and the seam's `skip_topk` reuse
+path -- `MlaSharedSelection`, `mla_attention.cpp:1101-1129` -- is never taken by
+it. Eleven independent k-pool selections per step, none shareable.
+
+**Composing it out of the existing ops is not available either.** The `OpId`
+inventory has no general softmax, no general reduction and no pooled gather; the
+only top-k entries are `kMoeRouterTopK` and the sampler's `kTopKValuesIndices`,
+neither of which selects over pools or expands a pool back to its members. The
+pooled per-channel softmax, the pool-level top-k, and the ragged sentinel-bearing
+tail append are each new work.
+
+So the DSA layers cannot reach a GPU by routing alone. Either a k-pool CUDA
+kernel gets written, or the indexer stays on the host and every DSA layer costs
+a device-to-host round trip on every step -- 11 per step, on the critical path.
+Neither is priced anywhere in this row. [#2415](https://github.com/mudler/vllm.cpp/issues/2415)
+owns it.
+
+**O33 is 457 lines, not 991.** `glm5_next_dsa.cpp`'s 534 lines are that k-pool
+indexer. They are this model's own algorithm, they duplicate nothing, and
+deleting them onto the seam is not possible because the seam does not implement
+them. Only `glm5_next_attn.cpp` (457) overlaps `mla::ForwardMlaAttentionBlock`.
+The parallel-path defect is real and it is that file.
+
+**W9c-1 cannot be done without W9c-3, which its own scope excludes.** The seam's
+interface is the compose:
+
+- `Attention` is never handed a `vt::Queue`. `glm5_next_layer.cpp:206-209` passes
+  dims, host weights, host hidden and a host cache; `queue` is threaded to the
+  KDA arm (`:193`) and the MoE router only. `ForwardMlaAttentionBlock` takes
+  `dense_attn::Dev{Backend&, Queue&}` (`dense_device_glue.h:42-45`).
+- The seam wants the cache **paged** -- `[num_blocks, block_size, head_size]`
+  plus `slot_mapping` and device `block_table` / `seq_lens` in
+  `MlaBlockMetadata` (`mla_attention.h:540-556`). This row DE-PAGES it before
+  the layer sees it: `LoadCaches` copies `cached_len` rows out of the engine
+  buffer into a contiguous host `DsaCache::k_pass` (`glm5_next_kv.cpp:450-456`)
+  and `StoreCaches` writes them back. Keeping it paged is
+  `ForwardGlm5NextForConditionalGeneration`'s job, which is W9c-3's.
+- The weights are host `std::vector<float>`; the seam needs bf16 `vt::Tensor`,
+  and `w_uk_t` `[H, qk_nope, kv_lora]` / `w_uv` `[H, kv_lora, v_head]`
+  (`mla_attention.h:406-407`) are TRANSPOSED against this row's `k_b_proj`
+  `[H, kv_lora, qk_nope]` / `v_b_proj` `[H, v_head, kv_lora]`
+  (`glm5_next_attn.h:197-201`). A port is a transpose, not a memcpy.
+
+A route built inside the host forward would have to fabricate a single-block
+paging of `k_pass`, convert 11 layers of MLA weights f32 to bf16 on every step
+of a 101.24 GiB model, and would be deleted by W9c-3. That is scaffolding, and
+this wave declines to land it.
+
+**One more divergence the port will meet, recorded so the next reader does not
+find it at gate time.** The seam applies the selection on the DECODE arm only:
+`dec.topk_indices` reaches `impl.forward_mqa` (`mla_attention.cpp:1096-1131`),
+while the prefill arm is `ForwardMlaPrefillMha` (`:1031-1035`) and never sees
+it. This row's `BuildAttentionMaskFromTopk` builds a per-(query, key) mask that
+biases the softmax on EVERY query (`glm5_next_attn.cpp:389-443`), and
+`glm5_next_attn.h`'s own header says why the eager path exists: "no
+FlashAttention kernel takes one". Below 2048 context the two agree because the
+selection is not pruning; above it they do not, and the port owes a refusal by
+name rather than a plausible dense answer.
+
+**Anchors corrected.** Three in the dispatch briefing and the rescoping did not
+resolve: the sibling call site is `glm_moe_dsa_forward.cpp:455`, not `:157`
+(`:157` is `GlmResidentMla`'s signature); the CUDA providers are under
+`src/vt/cuda/`, not `src/vllm/vt/cuda/`; and `MlaBlockDims::Validate`'s NoPE
+clauses are `mla_attention.cpp:112-133`, of which `:128-133` is the refusal that
+a NoPE layer must leave BOTH neox flags false -- the trap a port hits first.
+
+**What holds.** The two CPU-only refusals are exactly where the rescoping said
+(`glm5_next_kda.cpp:322-325`, `glm5_next_moe.cpp:222-225`); the forward files
+carry 25 `vt::Tensor` over 2,783 lines, 10 in `glm5_next_kda.cpp` and 15 in
+`glm5_next_moe.cpp`, both exact; `glm5_next_attn.{h,cpp}` and `glm5_next_dsa.cpp`
+reference `mla::` zero times; and W3's NoPE widening does admit this row's
+geometry. The premise that failed is the price, not the direction.
+
 ### Before W9a
 
 `ACTIVE`, 2026-08-30. **The engine's guard above this model's forward no longer

@@ -489,6 +489,38 @@ and SAYS so in its install line. A user who asked for a fit and got 31 of 48
 layers placed must be able to see that the resolver could not have given them
 30.5.
 
+#### ON BY DEFAULT, mirroring upstream, and what that costs
+
+`common/common.h:468` @ `b10451` sets `fit_params = true`. Upstream's `--fit` is
+ON unless turned off, and that is the whole user-visible point of it: a model too
+large for the device just runs. Shipping ours off by default would give the
+machinery without the experience, and would silently diverge from a flag we
+claim to mirror — a ported llama.cpp command line would behave differently here.
+
+So `ResolvePlacementFit()` defaults to `true`. **This changes residency for every
+GGUF load that does not fit**: such a load previously failed at allocation and
+now runs with experts on the CPU, slower. That is llama.cpp's behaviour and it is
+the intended change, but it is a behavioural change across every model and is
+recorded as one rather than slipped in.
+
+**Three conditions bound it, each tested and each mutation-proven:**
+
+1. An UNKNOWN budget places NOTHING. `device_memory_total_bytes` is `0` on any
+   platform that does not probe one, and a naive comparison would place every
+   layer on a box that was never measured — a wrong placement wearing the face
+   of a working resolver.
+2. **An arm the resolver cannot answer is INERT when DEFAULTED and FATAL when
+   ASKED.** Same condition, opposite correct behaviour. Refusing every
+   safetensors load over a feature nobody requested would make this default a
+   breaking change; telling an operator who explicitly asked that nothing
+   happened is the #2382 failure. `PlacementFitWasRequested()` exists precisely
+   to tell the two apart, and the distinction is mutation-proven: making the
+   refusal unconditional reds 2 cases and 3 assertions.
+3. A placement that happens is ANNOUNCED with its arithmetic — budget,
+   footprint, layers, bytes — and states the whole-layer granularity, because an
+   operator who cannot see both sides cannot tell a wrong placement from a wrong
+   budget.
+
 #### Where it resolves, and the asymmetry that shapes the scope
 
 `InstallMoePlacementPlan` (`model_loader.cpp`) is the one place a plan reaches

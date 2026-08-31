@@ -564,6 +564,18 @@ std::vector<PlacementOverride> ResolvePlacementOverrides();
 // to COMPUTE them, and the two are mutually exclusive (`common/fit.cpp:398-399`).
 bool ResolvePlacementFit();
 
+// Whether the operator ASKED for `--fit`, as opposed to inheriting it from the
+// built-in default.
+//
+// The distinction decides what an arm the resolver cannot answer must do. An
+// explicit request that cannot be honoured is an ERROR — the operator asked for
+// something and must not be told silently that it did not happen. A DEFAULT that
+// does not apply is a no-op, because refusing a load over a feature nobody asked
+// for would make `--fit` defaulting on a breaking change for every safetensors
+// checkpoint. Same condition, opposite correct behaviour, so the two cases have
+// to be distinguishable.
+bool PlacementFitWasRequested();
+
 // THE mmap/placement COLLISION, DECIDED: it WARNS, it does not refuse, and it
 // does not silently win. Returns the warning line, or an empty string when the
 // pairing is not present.

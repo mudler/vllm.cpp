@@ -1448,10 +1448,23 @@ TEST_CASE("placement: precedence is env > config > default, FIELD BY FIELD") {
   }
   ::unsetenv("VT_N_CPU_MOE");
 
+  // `fit` is ON by default, mirroring llama.cpp's `fit_params = true`
+  // (`common/common.h:468` @ b10451). It was `false` until the flip; the
+  // assertion moved with the behaviour rather than the behaviour being bent to
+  // keep an assertion.
+  CHECK(vllm::ResolvePlacementFit());
+  CHECK_FALSE(vllm::PlacementFitWasRequested());  // defaulted, not asked for
+
+  // `=0` must be able to turn OFF a default that is now on, which is the only
+  // way an operator opts out.
+  ::setenv("VT_PLACEMENT_FIT", "0", 1);
   CHECK_FALSE(vllm::ResolvePlacementFit());
+  CHECK(vllm::PlacementFitWasRequested());  // explicitly OFF is still explicit
   ::setenv("VT_PLACEMENT_FIT", "1", 1);
   CHECK(vllm::ResolvePlacementFit());
+  CHECK(vllm::PlacementFitWasRequested());
   ::unsetenv("VT_PLACEMENT_FIT");
+  CHECK_FALSE(vllm::PlacementFitWasRequested());
 }
 
 TEST_CASE("placement: VT_PLACEMENT_OVERRIDES takes llama.cpp's own -ot grammar") {

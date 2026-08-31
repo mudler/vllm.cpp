@@ -194,3 +194,32 @@ TEST_CASE("placement reach: a STATED placement records its origin as stated, not
 
   fs::remove_all(dir);
 }
+
+TEST_CASE("placement reach: --fit ON BY DEFAULT is INERT on safetensors, not fatal") {
+  // THE CONDITION THAT MAKES THE DEFAULT SAFE. `--fit` mirrors llama.cpp's
+  // `fit_params = true`, so it is on for every load. If the arm it cannot answer
+  // refused, flipping that default would break EVERY safetensors checkpoint over
+  // a feature nobody asked for.
+  //
+  // The load still throws -- there is no tokenizer in the fixture -- so the
+  // assertion that matters is WHICH failure: it must not be the fit refusal.
+  PlacementFixture fx;
+  const std::string dir = WriteConfigOnlyModelDir("vllm-cpp-fit-default-st");
+
+  vllm::entrypoints::EngineParams bare;  // nothing configured: fit is DEFAULTED
+  CHECK_FALSE(bare.weight_residency.has_value());
+  std::string msg;
+  try {
+    vllm::entrypoints::LoadedEngine::FromModelDir(dir, bare);
+    msg = "LOADED";
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  // It failed on the missing tokenizer, NOT on a fit refusal the operator never
+  // asked for.
+  CHECK(msg.find("is implemented for GGUF checkpoints only") == std::string::npos);
+  CHECK(vllm::ActiveMoePlacementPlan().origin() == vllm::PlacementOrigin::kNone);
+  CHECK_FALSE(vllm::ActiveMoePlacementPlan().PlacesAnything());
+
+  fs::remove_all(dir);
+}

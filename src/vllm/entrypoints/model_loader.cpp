@@ -227,6 +227,25 @@ void InstallMoePlacementPlan(vt::DeviceType engine_device,
   // parse already refuses, so reaching here with both is not expected.
   if (vllm::ResolvePlacementFit() && overrides.empty()) {
     if (gguf == nullptr) {
+      // INERT WHEN DEFAULTED, FATAL WHEN ASKED. `--fit` is on by default
+      // (mirroring llama.cpp), so refusing every safetensors load over a feature
+      // nobody requested would make that default a breaking change. But an
+      // operator who explicitly asked must NOT be told silently that it did not
+      // happen -- that is the #2382 failure, where a placement was announced and
+      // never installed.
+      if (!vllm::PlacementFitWasRequested()) {
+        std::cerr << "engine: device placement: --fit is on by default but "
+                     "cannot apply to a safetensors checkpoint (its weight "
+                     "footprint is not known where the placement must be "
+                     "installed); continuing with no placement"
+                  << std::endl;
+        vllm::MoePlacementPlan bare = vllm::MoePlacementPlan::Resolve(
+            vllm::DevicePlacement::FromOverrides({}, engine_device),
+            num_hidden_layers);
+        bare.set_origin(vllm::PlacementOrigin::kNone);
+        vllm::SetActiveMoePlacementPlan(bare);
+        return;
+      }
       // REFUSE BY NAME rather than resolve to nothing. The model's weight
       // footprint is not available at this point on the safetensors path -- the
       // shards open downstream of where the plan must be installed, because

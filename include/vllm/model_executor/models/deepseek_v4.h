@@ -450,11 +450,22 @@ struct DeepseekV4CompressorState {
   std::vector<std::vector<float>> state_kv;
   std::vector<std::vector<float>> state_score;
   std::vector<std::vector<float>> comp_rows;
+  // W3 (#2286): the INDEXER's compressor is a second, independent state machine
+  // at `index_head_dim` (`attention.py:768-776`). It is kept beside the
+  // attention compressor's rather than inside it, because the two pool different
+  // operands at different widths and only the `cr == 4` family has both.
+  std::vector<std::vector<float>> idx_state_kv;
+  std::vector<std::vector<float>> idx_state_score;
+  std::vector<std::vector<float>> idx_comp_rows;
 
   void Resize(int64_t num_layers) {
-    state_kv.assign(static_cast<size_t>(num_layers), {});
-    state_score.assign(static_cast<size_t>(num_layers), {});
-    comp_rows.assign(static_cast<size_t>(num_layers), {});
+    const size_t n = static_cast<size_t>(num_layers);
+    state_kv.assign(n, {});
+    state_score.assign(n, {});
+    comp_rows.assign(n, {});
+    idx_state_kv.assign(n, {});
+    idx_state_score.assign(n, {});
+    idx_comp_rows.assign(n, {});
   }
 };
 

@@ -486,7 +486,9 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   // line. `indexer.wq_b` gets its counts here too — it had none before, and its
   // indexed count is one of the colliding 2048s.
   CHECK(dsv4_exl3_fixture::Mentions(
-      msg, MismatchLine("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
+      msg, MismatchLine("indexer.compressor.wkv.weight",
+                        "[coff*index_head_dim, hidden_size] (upstream) or "
+                        "[index_head_dim, hidden_size] (collapsed)",
                         ihd * H, 2 * ihd * H)));
   (void)inh;
 

@@ -404,6 +404,33 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## W3 IS WIRED: the cr == 4 arm runs end to end
+
+`AttentionBlock`'s paged arm now composes a `compress_ratio == 4` layer: the
+indexer's own compressor produces its keys, the selection scores over them, and
+the result narrows which closed rows the merge attends. The `idx_wk` refusal
+narrows with it -- **and only now**, scoped by a `paged_dsa_arm` flag so the
+widened geometry is readable on the arm that composes it and refused everywhere
+else.
+
+**Two legacy branches had to stand down, and both announced themselves as
+anonymous `MatVec weight size mismatch` throws** -- the diagnostic the DSA refusal
+exists to replace. The legacy per-token indexer selection projects `idx_wk` at
+`index_head_dim`, and the legacy compressor placeholder pools a 2-wide window and
+projects `comp_wgate` at `head_dim`; at the real geometry both tensors are
+`coff` times wider. Each is now skipped where the paged arm composes the layer.
+
+**The prefix-cache guard fired on a correct sequence and was right to.** It
+computed `seen = state_kv.size() / head_dim`, but at `coff == 2` a token's state
+row is `coff * head_dim` wide, so it counted every token twice. That bug existed
+from the moment the guard landed and only the `cr == 4` path could expose it.
+
+Gated by driving eight steps through `DeepseekV4ForwardExl3Paged` at the REAL
+geometry and requiring BOTH state machines to have run on the compressor layer and
+neither on the dense one, with the indexer's two closed windows accounted. Three
+mutations run red: no selection built, the indexer's rows dropped, and the legacy
+per-token branch left running beside the arm.
+
 ## The two families are now ONE code path
 
 `CompressorLayerStep` takes an optional selection. Null means every closed row,

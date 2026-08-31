@@ -374,6 +374,7 @@ std::vector<float> CompressorLayerStep(
   VT_CHECK(compress_ratio == 4 || compress_ratio == 128,
            "deepseek-v4 compressor step: upstream emits compress_ratio 4 or 128 "
            "only (sparse_swa.py:44-55)");
+
   // Read from the TENSOR, not derived from the ratio: the synthetic suites carry a
   // collapsed `coff == 1` shape on `cr == 4` layers, which upstream cannot emit
   // but this tree has always accepted.
@@ -382,6 +383,8 @@ std::vector<float> CompressorLayerStep(
        static_cast<int64_t>(comp_wgate.size()) == 2 * head_dim * hidden)
           ? 2
           : 1;
+
+
   VT_CHECK(state_kv != nullptr && state_score != nullptr && comp_rows != nullptr,
            "deepseek-v4 compressor step: the state is CARRIED, not owned here");
   VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
@@ -404,7 +407,13 @@ std::vector<float> CompressorLayerStep(
   // appears on cache hits. Refusing is never wrong here, only limiting, so the
   // mismatch is refused by name rather than resolved by a policy this row does not
   // own (`## Owed`).
-  const int64_t seen = static_cast<int64_t>(state_kv->size()) / head_dim;
+  // Divided by the STATE ROW's width, not by `head_dim`. At `coff == 2` a token's
+  // state row carries both roles and is `coff * head_dim` wide, so dividing by
+  // `head_dim` counts every token twice and the guard fires on a correct
+  // sequence -- which is how this line was found.
+  const int64_t state_w =
+      coff * head_dim > 0 ? coff * head_dim : head_dim;
+  const int64_t seen = static_cast<int64_t>(state_kv->size()) / state_w;
   VT_CHECK(seen == kv_base,
            "deepseek-v4 compressor: the carried state has seen " +
                std::to_string(seen) + " tokens but this step resumes at kv_base " +

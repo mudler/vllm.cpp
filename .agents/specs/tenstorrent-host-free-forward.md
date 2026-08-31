@@ -327,14 +327,20 @@ investigation row but MUST be addressed by the item-5 port:
 ## Owed
 
 - **The default-polarity question reopened by
-  [#2003](https://github.com/mudler/vllm.cpp/issues/2003).** At post-W2c
-  `21fe11cf1` the host-hybrid opt-out outperforms the shipped eager default
-  1.24x on the P150 (Qwen3-0.6B b1, order-alternated pairs ×3, clock
-  unattributed — see `.agents/benchmark-record.md`, 2026-08-26 entry); the
-  default arm is unchanged against its #1604 figures and the opt-out improved
-  ~2.5x unattributed. Owed: a per-op delta of the host-hybrid path from
-  `b86e3705f` to current main, then a polarity decision that carries a clock
-  window per arm.
+  [#2003](https://github.com/mudler/vllm.cpp/issues/2003): RESOLVED as a
+  documented stand-pat (2026-08-30, closed by the W2 record PR).** The
+  confirming A/B under the W2 sampler reproduced the inversion at clock
+  parity: default eager median 10.998 tok/s vs 14.299 for
+  `VT_TT_HOST_FREE_DECODE=0`, ratio 1.300 median / 1.294 mean, judge PASS,
+  every busy slice of both arms exactly {1350} MHz with the cap read from
+  firmware (`.agents/benchmark-record.md`, 2026-08-30 entry). The default
+  stays host-free. STILL OWED on this row: name the corrected mechanism for
+  the opt-out arm's ~2.5x improvement. The EnsureDevice2D hypothesis is
+  REJECTED — the per-op delta `b86e3705f..21fe11cf1` shows `353511e72` /
+  `101b415d7` only ADD staging work on the hybrid path, which cannot explain
+  the movement while the default arm is unchanged — so until the corrected
+  mechanism is named, the inversion is a real, unexplained performance
+  property of the shipped polarity, and a flip would be a guess.
 - **No case pins `HostFreeDecodeEnabled()`'s no-caching contract on the RAC
   path ([#1688](https://github.com/mudler/vllm.cpp/issues/1688)).** The R5
   fresh review found `ReshapeAndCacheKernel` still latching the flag in a

@@ -3898,6 +3898,65 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **WHAT #2396 CHANGES FOR THIS ROW, AND WHAT STILL BLOCKS A CUDA FORWARD AFTER
+  IT. TRACED IN THE CODE, NOT PREDICTED FROM THE PULL REQUEST.** #2396 adds
+  `kEmbeddingQuant`, gives `EmbeddingKernelCuda` a block-decoding arm and makes
+  `DeviceQuantGatherSupported` ask `OpRegistered(kEmbeddingQuant, dev)`. Three
+  clauses this wave wrote then become FALSE and are listed here so whichever
+  branch lands second repairs them rather than discovering them: "the CUDA
+  gather arm is owed", "`DeviceQuantGatherSupported` is `kCPU`-only", and "there
+  is no `kEmbeddingQuant` OpId". They appear in the PR body,
+  `tests/vllm/models/test_qwen4_exp_cuda.cpp` (the SCOPE paragraph) and in this
+  spec.
+
+  **THE MODEL STILL WILL NOT RUN A CUDA FORWARD, AND THE REASON MOVES FROM THE
+  LOADER INTO THE QSA BLOCK.** `qwen4_exp_forward.cpp` builds its rope tables as
+  `DBuf rope_packed/rope_cos/rope_sin`, and `DBuf`'s constructor ends
+  `t_ = MakeTensor(p_, dt, d.q.device, shape)` -- so on a CUDA queue those
+  tensors carry the CUDA device. `QsaBlockCore` passes them straight to
+  `CheckRopeLayoutsAgree`, which is `VT_CHECK(cos_sin/cos/sin .device.type ==
+  kCPU)`. **That refuses by name on every CUDA forward**, before any token. Two
+  more host reads sit behind it: `IndexerRows` dereferences the indexer block
+  table on the host, and `Qwen4ExpQsaIndex` dereferences `kv_lens` on the host to
+  build the scoring window. All three are `qwen4_exp_qsa_block.cpp`'s own owed
+  item -- this row's, not #2396's -- and each already says so in its refusal
+  string.
+
+  **SO THE HONEST POST-MERGE STATEMENT IS NEITHER "VACUOUS" NOR "RUNS".** The
+  decoder layer runs PLE first (`qwen4_exp_forward.cpp:392`), then GDN or QSA
+  (`:431`/`:440`), then MoE (`:498`). With #2396 and this wave both landed, a
+  CUDA forward is EXPECTED to dispatch the gather, `vt::RmsNormGroup`,
+  `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpGatedResidual` and
+  `vt::Qwen4ExpGatedResidualWriteBack` -- five of this row's seven CUDA arms plus
+  the new gather -- and then to refuse at the first QSA layer. **THAT IS A
+  PREDICTION FROM READING THE CODE AND IT IS NOT MEASURED.** It is written down
+  so it can be tested rather than assumed: the test is a `--device cuda`
+  `ModelRegistry::Forward` on the synthetic fixture, and the expected result is
+  the `CheckRopeLayoutsAgree` refusal string, not a token. Until that runs, this
+  row claims no reach beyond what M8 measures.
+
+  **AND A SECOND, INDEPENDENT BLOCKER APPLIES TO THE RELEASED ARTIFACT ONLY.**
+  `IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu`) admits twelve
+  dtypes -- IQ2_XXS, IQ3_XXS, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S, IQ1_S,
+  IQ1_XXXS, IQ2_XS, IQ4_XS -- and **not IQ4_NL, Q5_0, Q4_0 or Q8_0**. The shipped
+  `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S uses IQ4_NL and Q5_0, which this
+  tree added for exactly that file, so its GEMM path would drain to the host or
+  refuse on CUDA even with the QSA host reads moved. The synthetic fixture does
+  not hit this; the real checkpoint does. Owed, and not this wave's.
+
+- **THE `docs/FEATURES.md` CONFLICT WITH #2396 IS A TAKE-BOTH HAZARD, AND THE
+  CONTRADICTION IS EXACT.** Both branches edit the `Qwen4ExpForConditionalGeneration`
+  row. #2396's version RETAINS the sentence "no CUDA arm exists for any
+  `qwen4_exp` op, so there is no device arm to run" and ADDS "several `qwen4_exp`
+  ops still have no CUDA arm"; this wave's version replaces the first with "ALL
+  SIX `qwen4_exp` ops PLUS `vt::RmsNormGroup` NOW HAVE CUDA ARMS". An automatic
+  take-both puts both readings in ONE table cell, where the older one is simply
+  wrong. The merged form must carry #2396's load-side fact (the gather arm
+  exists, `DeviceQuantGatherSupported` says yes on CUDA, METAL/VULKAN/ROCM/
+  TENSTORRENT still refused), this wave's op-side fact (all seven arms exist),
+  and the reconciliation NEITHER branch contains: what now blocks a CUDA forward
+  is the QSA block's three host reads, not op registration and not the loader.
+
 - **A CI DEFECT FOUND AND FIXED IN FLOW: `agent-record` failed on EVERY pull
   request.** [#2407](https://github.com/mudler/vllm.cpp/issues/2407).
   `.github/workflows/ci.yml` still ran

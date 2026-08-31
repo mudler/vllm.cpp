@@ -68,9 +68,13 @@ Rewrite the SHARED body only: unswitch ActDT, vectorize loads (elem0 is a
 multiple of 256 → 16 B alignment guaranteed for bf16/f32), keep the amax scan
 in strict element order (first-occurrence lowest-index tie-break preserved
 exactly), quant pass element-independent, bsums integer-exact. Byte-exact vs
-CPU oracle asserted by the existing `tests/vt/test_rocm_quant_dot.cpp`
-(132k assertions incl. tied-amax adversarial). Expected: epilogue + standalone
-quant drop from ~50µs toward ~10µs ⇒ up to ~4.5 ms/tok.
+CPU oracle asserted by the existing `tests/vt/test_rocm_quant_dot.cpp`.
+A fresh configure and build at source commit
+`09da0553c880a9233dc80aba26ae8aab97aaa825` recorded 841 assertions across
+19 cases. The earlier 132,094-assertion claim came from a stale ROCm 7.14-era
+binary whose test lattice no longer matched the source; it is historical
+provenance, not a current gate count. Expected: epilogue + standalone quant
+drop from ~50µs toward ~10µs ⇒ up to ~4.5 ms/tok.
 
 ## Honest notes
 

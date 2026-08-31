@@ -290,11 +290,11 @@ void MoeGateUpSwiGLUGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
   Tensor ut = Tensor::Contiguous(u.data(), DType::kF32, out.device, {P, N});
   MatmulBTQuantGroupedKernel(q, gt, act, gate_w, expert_ids);
   MatmulBTQuantGroupedKernel(q, ut, act, up_w, expert_ids);
-  float* o = static_cast<float*>(out.data);
   for (size_t i = 0; i < g.size(); ++i) {
     const float gate = std::fmin(g[i], limit);
     const float up = std::fmin(std::fmax(u[i], -limit), limit);
-    o[i] = gate * (1.0F / (1.0F + std::exp(-gate))) * up;
+    StoreOutF32(out, static_cast<int64_t>(i),
+                gate * (1.0F / (1.0F + std::exp(-gate))) * up);
   }
 }
 

@@ -12,6 +12,7 @@
 // about 2.64 accepted tokens per step.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4.h"
@@ -130,6 +131,58 @@ std::vector<float> BlockKvRows(const std::vector<float>& main_x,
                                const std::vector<int32_t>& positions, double rope_theta,
                                int64_t num_tokens, int64_t hidden, int64_t head_dim,
                                int64_t rope_dim);
+
+// W-4b, THE CONFIDENCE-CAPPED DRAFT LENGTH.
+// `sample_from_state` (`exllamav3/architecture/deepseek_v4_mtp.py:340-353`):
+//
+//     conf = confidence(cat(pre_norm_hidden, markov_emb))   # Linear -> 1
+//     keep = sigmoid(conf) >= threshold                     # EXL3_DSPARK_CONF, 0.5
+//     len  = cumprod(keep).sum()                            # per row
+//
+// `cumprod` THEN `sum` is the whole point and is easy to get wrong: it is the
+// longest CONTIGUOUS PREFIX of confident positions, not the count of confident
+// ones. A run like [yes, no, yes] yields 1, never 2. Counting instead would let a
+// drafter propose past a position the model said it was unsure about, and because
+// verification is lossless the only symptom is a worse acceptance rate.
+//
+// The projection's input is the PRE-norm hidden state concatenated with that
+// step's markov embedding (`:277`, `:344-347`), so its width is
+// `hidden + markov_rank` -- the artifact's `confidence_head.proj` is
+// `[1, 4352] = [1, 4096 + 256]`.
+//
+//   xpre         [block, hidden]  pre-norm hidden, one row per block position
+//   markov_emb   [block, rank]    the embedding fed to that step's bigram bias
+//   proj_w       [hidden + rank]  the confidence projection
+//   returns      the draft length in [0, block]; 0 means skip drafting this round
+int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
+                              const std::vector<float>& markov_emb,
+                              const std::vector<float>& proj_w, float threshold,
+                              int64_t block, int64_t hidden, int64_t rank);
+
+// W-3, THE BLOCK'S WEIGHTS. A DSpark block IS a V4 decoder layer of the
+// compressor-less kind -- `DSparkAttention` with `compress_rate = None` over a
+// `BlockSparseMLP` with a shared expert and two `HyperConnection`s
+// (`exllamav3/architecture/deepseek_v4_mtp.py:60-128`). So it fills the SAME
+// `DeepseekV4LayerHostWeights` the trunk's layers use, and the existing
+// `AttentionBlock` / `MoeBlock` / `MhcPre` / `MhcPost` compose it unchanged.
+// Extending that seam is the point; a parallel block forward would be the thing
+// `AGENTS.md` forbids.
+//
+// The compressor and indexer fields stay EMPTY, because these blocks carry
+// neither -- the artifact has no `mtp.L.attn.compressor.*` or `.indexer.*`.
+//
+// THE ROUTED EXPERTS ARE NOT FILLED, and that is a decision rather than an
+// omission: one block's are 216 x 3 x [2048, 4096] = 5.44G values, which is
+// 20.2 GiB as host f32. `out_missing_experts` is set so a caller learns it from
+// the return rather than from a later empty-vector crash, and the host arm of
+// `MoeBlock` already refuses by name when `exp_w1` is empty.
+//
+// Returns a refusal naming the first tensor it could not resolve, empty on
+// success.
+std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
+                                 const DeepseekV4Params& p,
+                                 DeepseekV4LayerHostWeights* out,
+                                 bool* out_missing_experts);
 
 }  // namespace vllm::dspark
 

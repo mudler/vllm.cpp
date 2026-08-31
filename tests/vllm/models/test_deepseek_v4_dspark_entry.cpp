@@ -388,3 +388,180 @@ TEST_CASE("W-3: norm comes BEFORE rope, where the two do not commute") {
   CHECK(got[3] == doctest::Approx(static_cast<float>(n2 * s + n3 * c)));
   (void)NOPE;
 }
+
+// ── W-3: the block's weights, assembled onto the trunk's own layer struct ────
+
+namespace {
+
+// A head at a tiny but SHAPE-CONSISTENT geometry: every tensor the assembly
+// requires, at the widths `DeepseekV4Params` declares.
+vllm::DeepseekV4MtpHead TinyHead(const vllm::DeepseekV4Params& p,
+                                 std::vector<std::vector<float>>* storage) {
+  vllm::DeepseekV4MtpHead h;
+  const int64_t H = p.hidden_size, hc = p.hc_mult, D = p.head_dim;
+  const auto add = [&](const std::string& key, int64_t out_dim, int64_t in_dim) {
+    storage->push_back(std::vector<float>(
+        static_cast<size_t>(out_dim * in_dim), 0.125f));
+    vllm::DeepseekV4MtpTensorView v;
+    v.format = vllm::DeepseekV4MtpFormat::kPlain;
+    v.dtype = "F32";
+    v.shape = {out_dim, in_dim};
+    v.data = reinterpret_cast<const uint8_t*>(storage->back().data());
+    v.out_dim = out_dim;
+    v.in_dim = in_dim;
+    h.tensors.emplace(key, v);
+  };
+  add("attn_norm.weight", H, 1);
+  add("ffn_norm.weight", H, 1);
+  add("attn.q_norm.weight", p.q_lora_rank, 1);
+  add("attn.kv_norm.weight", D, 1);
+  add("attn.attn_sink", p.num_attention_heads, 1);
+  add("attn.wq_a.weight", p.q_lora_rank, H);
+  add("attn.wq_b.weight", p.num_attention_heads * D, p.q_lora_rank);
+  add("attn.wkv.weight", D, H);
+  add("attn.wo_a.weight", p.o_groups * p.o_lora_rank, H);
+  add("attn.wo_b.weight", H, p.o_groups * p.o_lora_rank);
+  add("ffn.gate.weight", p.n_routed_experts, H);
+  add("ffn.gate.bias", p.n_routed_experts, 1);
+  add("ffn.shared_experts.w1.weight", p.moe_intermediate_size, H);
+  add("ffn.shared_experts.w2.weight", H, p.moe_intermediate_size);
+  add("ffn.shared_experts.w3.weight", p.moe_intermediate_size, H);
+  add("hc_attn_fn", (2 + hc) * hc, hc * H);
+  add("hc_attn_base", (2 + hc) * hc, 1);
+  add("hc_attn_scale", hc - 1, 1);
+  add("hc_ffn_fn", (2 + hc) * hc, hc * H);
+  add("hc_ffn_base", (2 + hc) * hc, 1);
+  add("hc_ffn_scale", hc - 1, 1);
+  return h;
+}
+
+vllm::DeepseekV4Params TinyBlockParams() {
+  vllm::DeepseekV4Params p;
+  p.hidden_size = 8;
+  p.hc_mult = 4;
+  p.head_dim = 6;
+  p.num_attention_heads = 2;
+  p.q_lora_rank = 4;
+  p.o_lora_rank = 4;
+  p.o_groups = 2;
+  p.n_routed_experts = 4;
+  p.moe_intermediate_size = 6;
+  return p;
+}
+
+}  // namespace
+
+TEST_CASE("W-3: a complete head assembles onto the trunk's layer struct") {
+  const vllm::DeepseekV4Params p = TinyBlockParams();
+  std::vector<std::vector<float>> storage;
+  const vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+  vllm::DeepseekV4LayerHostWeights L;
+  bool missing_experts = false;
+  const std::string r = vllm::dspark::AssembleBlockWeights(h, p, &L, &missing_experts);
+  CHECK(r.empty());
+  CHECK(static_cast<int64_t>(L.attn_norm_weight.size()) == p.hidden_size);
+  CHECK(static_cast<int64_t>(L.kv_norm_weight.size()) == p.head_dim);
+  CHECK(static_cast<int64_t>(L.wkv.size()) == p.head_dim * p.hidden_size);
+  CHECK(static_cast<int64_t>(L.gate_weight.size()) == p.n_routed_experts * p.hidden_size);
+  // The blocks are compressor-less and indexer-less; those fields must stay EMPTY,
+  // or a later forward would take the DSA path on a drafter block.
+  CHECK(L.comp_wgate.empty());
+  CHECK(L.comp_ape.empty());
+  CHECK(L.idx_wk.empty());
+  // The routed experts are deliberately absent -- 20.2 GiB per block as host f32 --
+  // and the caller is TOLD rather than left to meet an empty vector later.
+  CHECK(missing_experts);
+  CHECK(L.exp_w1.empty());
+}
+
+TEST_CASE("W-3: a head missing ONE tensor is refused BY NAME") {
+  const vllm::DeepseekV4Params p = TinyBlockParams();
+  for (const char* drop : {"attn.wkv.weight", "hc_ffn_base", "ffn.gate.bias"}) {
+    std::vector<std::vector<float>> storage;
+    vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+    h.tensors.erase(drop);
+    vllm::DeepseekV4LayerHostWeights L;
+    bool me = false;
+    const std::string r = vllm::dspark::AssembleBlockWeights(h, p, &L, &me);
+    CAPTURE(drop);
+    CHECK(!r.empty());
+    CHECK(r.find(drop) != std::string::npos);
+  }
+}
+
+TEST_CASE("W-3: a tensor at the WRONG width is refused, not silently accepted") {
+  // The failure this guards: a shape mismatch that surfaces deep inside a block
+  // forward as an anonymous MatVec size error naming no tensor and no layer.
+  const vllm::DeepseekV4Params p = TinyBlockParams();
+  std::vector<std::vector<float>> storage;
+  vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+  auto it = h.tensors.find("attn.kv_norm.weight");
+  REQUIRE(it != h.tensors.end());
+  it->second.out_dim = p.head_dim - 2;  // a nope-sized norm, the V2-convention slip
+  vllm::DeepseekV4LayerHostWeights L;
+  bool me = false;
+  const std::string r = vllm::dspark::AssembleBlockWeights(h, p, &L, &me);
+  CHECK(!r.empty());
+  CHECK(r.find("kv_norm") != std::string::npos);
+}
+
+// ── W-4b: the confidence-capped draft length ─────────────────────────────────
+
+TEST_CASE("W-4b: the length is the longest CONTIGUOUS prefix, not a count") {
+  // The distinction `cumprod(keep).sum()` encodes. With confidence high, low,
+  // high the answer is 1 -- counting confident positions would say 2 and let the
+  // drafter propose past a position the model flagged.
+  const int64_t B = 3, H = 1, R = 1;
+  // proj selects xpre only; markov_emb contributes nothing.
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb(static_cast<size_t>(B * R), 0.0f);
+  const std::vector<float> xpre{5.0f, -5.0f, 5.0f};  // sigmoid: ~1, ~0, ~1
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 1);
+}
+
+TEST_CASE("W-4b: an all-confident block drafts its full length") {
+  const int64_t B = 4, H = 1, R = 1;
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb(static_cast<size_t>(B * R), 0.0f);
+  const std::vector<float> xpre{6.0f, 6.0f, 6.0f, 6.0f};
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 4);
+}
+
+TEST_CASE("W-4b: an unconfident FIRST position yields 0, i.e. skip drafting") {
+  const int64_t B = 3, H = 1, R = 1;
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb(static_cast<size_t>(B * R), 0.0f);
+  const std::vector<float> xpre{-6.0f, 6.0f, 6.0f};
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 0);
+}
+
+TEST_CASE("W-4b: the markov embedding half of the input is LOAD-BEARING") {
+  // The projection reads `cat(xpre, markov_emb)`. If only the hidden half were
+  // consumed the head would be blind to which token the chain actually sampled.
+  const int64_t B = 1, H = 1, R = 1;
+  const std::vector<float> xpre{0.0f};
+  const std::vector<float> proj{1.0f, 4.0f};  // all the signal is in the emb half
+  const std::vector<float> hot{2.0f};   // 8.0 -> confident
+  const std::vector<float> cold{-2.0f}; // -8.0 -> not
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, hot, proj, 0.5f, B, H, R) == 1);
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, cold, proj, 0.5f, B, H, R) == 0);
+}
+
+TEST_CASE("W-4b: the threshold is applied to SIGMOID(conf), not to conf") {
+  // conf = 0.4 is below a 0.5 threshold as a raw logit but sigmoid(0.4) = 0.599,
+  // which is above it. Comparing the raw logit would truncate healthy drafts.
+  const int64_t B = 1, H = 1, R = 1;
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb{0.0f};
+  const std::vector<float> xpre{0.4f};
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 1);
+}
+
+TEST_CASE("W-4b: a projection sized for the hidden half alone REFUSES") {
+  const int64_t B = 1, H = 2, R = 2;
+  const std::vector<float> xpre{1.0f, 1.0f};
+  const std::vector<float> emb{1.0f, 1.0f};
+  const std::vector<float> short_proj{1.0f, 1.0f};  // H only, missing the rank half
+  CHECK_THROWS(
+      vllm::dspark::ConfidenceDraftLength(xpre, emb, short_proj, 0.5f, B, H, R));
+}

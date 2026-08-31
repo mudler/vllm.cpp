@@ -129,11 +129,29 @@ ForwardLogits ForwardQwen3VLForConditionalGeneration(
            "multimodal inputs (ModelForwardInput.mm). Text-only Qwen3-VL through "
            "this arch is a named MM-ENGINE-FORWARD residual.");
   const MultiModalForwardInput& mm = *input.mm;
-  VT_CHECK(mm.inputs_embeds_bf16 != nullptr && mm.positions3 != nullptr &&
-               mm.deepstack_bf16 != nullptr,
-           "Qwen3-VL mm forward: null merged-embeds / positions3 / deepstack "
-           "handle on ModelForwardInput.mm");
-  const int64_t num_tokens = static_cast<int64_t>(mm.positions3->size()) / 3;
+  // ENG-MM-INPUT-PIPELINE P1: both handles are DEVICE views now. `deepstack` is
+  // legitimately absent on a decode step and on a DeepStack-less VL checkpoint, so
+  // it is not required unconditionally; the forward core checks the shapes it was
+  // given.
+  VT_CHECK(mm.inputs_embeds.data != nullptr && mm.positions3.data != nullptr,
+           "Qwen3-VL mm forward: null merged-embeds / positions3 device handle on "
+           "ModelForwardInput.mm");
+  // `deepstack` and `deepstack_levels` are ONE channel expressed as two fields, so
+  // they are checked together. Under the device contract ABSENT and NOT-APPLICABLE
+  // are the SAME value (`data == nullptr`), which is exactly what the host contract
+  // this replaced could not express: it required `deepstack_bf16 != nullptr` and the
+  // driver always passed a pointer to a possibly-empty vector, so a forgotten
+  // DeepStack was a loud throw. Left uncoupled, `VLForwardLastLogitsDBuf` computes
+  // `has_ds = false` and silently SKIPS every multiscale-merger add — a prefill that
+  // returns fluent WRONG tokens with no diagnostic. The REVERSE pairing (tensor set,
+  // levels 0) needs nothing here: `has_ds` is then true and that function's
+  // `Numel() == L * T * H` check refuses it against `0 * T * H`.
+  VT_CHECK(mm.deepstack_levels == 0 || mm.deepstack.data != nullptr,
+           "Qwen3-VL mm forward: MultiModalForwardInput.deepstack_levels is non-zero "
+           "but .deepstack carries no device buffer. Set BOTH fields or NEITHER: an "
+           "absent tensor is how the seam spells 'this step has no DeepStack', so "
+           "leaving it unset here would skip every multiscale-merger add instead.");
+  const int64_t num_tokens = mm.positions3.Numel() / 3;
   const Qwen3VLCosSinCache& cos_sin = vl.CosSinCache(input.queue, input.config);
   // DEVICE-resident logits (sampler-on-device) on the gather path — the mm forward
   // produces exactly the single last-token [1, vocab] row, kept ON DEVICE so the
@@ -142,13 +160,13 @@ ForwardLogits ForwardQwen3VLForConditionalGeneration(
   // path (gather_logits=false) reproduces the old download-then-sample A/B.
   if (input.gather_logits) {
     return Qwen3VLForwardStepLastLogitsDevice(
-        input.queue, vl.weights().text, input.config, *mm.inputs_embeds_bf16,
-        *mm.positions3, num_tokens, *mm.deepstack_bf16, mm.deepstack_levels,
+        input.queue, vl.weights().text, input.config, mm.inputs_embeds,
+        mm.positions3, num_tokens, mm.deepstack, mm.deepstack_levels,
         cos_sin.tensor, input.attn_meta, input.attn_kv);
   }
   std::vector<float> logits = Qwen3VLForwardStepLastLogits(
-      input.queue, vl.weights().text, input.config, *mm.inputs_embeds_bf16,
-      *mm.positions3, num_tokens, *mm.deepstack_bf16, mm.deepstack_levels,
+      input.queue, vl.weights().text, input.config, mm.inputs_embeds,
+      mm.positions3, num_tokens, mm.deepstack, mm.deepstack_levels,
       cos_sin.tensor, input.attn_meta, input.attn_kv);
   return HostLogits(std::move(logits), input.config.vocab_size);
 }

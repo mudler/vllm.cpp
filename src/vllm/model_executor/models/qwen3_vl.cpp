@@ -286,15 +286,17 @@ ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
   return fl;
 }
 
-// Full forked forward for ONE step. `inputs_embeds_bf16` [T*H] host bf16 bits are
-// the already-merged embeddings. `deepstack_bf16` (may be empty) is the [L*T*H]
-// host bf16 DeepStack tensor injected after layers 0/1/2. Returns the LAST row's
-// logits as an ON-DEVICE [1, vocab] f32 DBuf (NO host Download) — the device-
-// resident forward core shared by the host + on-device logits wrappers.
+// Full forked forward for ONE step. ENG-MM-INPUT-PIPELINE P1: `inputs_embeds` is
+// a BORROWED [T, H] bf16 DEVICE view of the already-merged embeddings,
+// `positions3_dev` the [3, T] int32 DEVICE MRoPE positions, and `deepstack` the
+// (possibly absent) [L, T, H] bf16 DEVICE tensor injected after layers 0/1/2 —
+// none of them host vectors any more, so this step no longer round-trips the
+// largest per-step buffer through the host. Returns the LAST row's logits as an
+// ON-DEVICE [1, vocab] f32 DBuf (NO host Download) — the device-resident forward
+// core shared by the host + on-device logits wrappers.
 DBuf VLForwardLastLogitsDBuf(
-    Dev d, const std::vector<uint16_t>& inputs_embeds_bf16,
-    const std::vector<int32_t>& positions3_host, int64_t T,
-    const std::vector<uint16_t>& deepstack_bf16, int64_t L,
+    Dev d, const Tensor& inputs_embeds, const Tensor& positions3_dev, int64_t T,
+    const Tensor& deepstack, int64_t L,
     const Tensor& cos_sin_cache, const CommonAttentionMetadata& meta,
     const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
     const HfConfig& config, const vt::RopeArgs& rope) {
@@ -302,33 +304,51 @@ DBuf VLForwardLastLogitsDBuf(
   const int64_t vocab = config.vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
 
-  DBuf hidden(d, DType::kBF16, {T, H}, inputs_embeds_bf16.data());
+  VT_CHECK(inputs_embeds.data != nullptr,
+           "qwen3-vl mm forward: inputs_embeds carries no device buffer");
+  VT_CHECK(inputs_embeds.Numel() == T * H,
+           "qwen3-vl mm forward: inputs_embeds must be [num_tokens, hidden]");
+  VT_CHECK(positions3_dev.data != nullptr && positions3_dev.Numel() == 3 * T,
+           "qwen3-vl mm forward: positions3 must be [3, num_tokens]");
+  // `hidden` is the residual stream, and it is a FRESH buffer seeded by a D2D copy
+  // rather than the caller's view. The handle is BORROWED: after the runner slice
+  // (#2300) it will be a window into a persistent buffer the runner reuses, and
+  // writing through it would corrupt the next step. MEASURED, so the reason is not
+  // overstated: `VLRunLayer` REPLACES `hidden` on its last line today, and the
+  // in-place `vt::Add` for DeepStack below runs after that replacement, so nothing
+  // currently writes the seed. That invariant is stated nowhere and any future
+  // in-place fusion would break it silently, which is why the copy is here rather
+  // than an alias. Upstream is the same shape: the persistent `self.inputs_embeds`
+  // buffer (gpu_model_runner.py:798) is handed to the forward and its decoder
+  // layers allocate instead of clobbering it. The copy is byte-for-byte, so the
+  // stream starts from the identical bits the host handle used to deliver.
+  DBuf hidden(d, DType::kBF16, {T, H});
+  d.b.Copy(d.q, hidden.ptr(), inputs_embeds.data, hidden.bytes());
   DBuf res(d, DType::kBF16, {T, H});
   res.Zero(d);
 
   // Per-step device inputs.
-  DBuf positions3(d, DType::kI32, {3, T}, positions3_host.data());
   DBuf slot_mapping(d, DType::kI64, {T}, meta.slot_mapping.data());
   DBuf block_table(d, DType::kI32, {meta.num_reqs, meta.block_table_num_cols},
                    meta.block_table_tensor.data());
   DBuf seq_lens(d, DType::kI32, {meta.num_reqs}, meta.seq_lens.data());
   DBuf query_start_loc(d, DType::kI32, {meta.num_reqs + 1}, meta.query_start_loc.data());
 
-  // DeepStack device tensor [L,T,H] bf16 (empty on decode steps).
-  const bool has_ds = !deepstack_bf16.empty();
-  DBuf ds(d, DType::kBF16, has_ds ? std::vector<int64_t>{L, T, H}
-                                  : std::vector<int64_t>{1, 1},
-          has_ds ? deepstack_bf16.data() : nullptr);
+  // DeepStack device tensor [L,T,H] bf16 (ABSENT on decode steps and on models
+  // without DeepStack — the caller then leaves the handle default-constructed).
+  const bool has_ds = deepstack.data != nullptr && deepstack.Numel() > 0;
+  VT_CHECK(!has_ds || deepstack.Numel() == L * T * H,
+           "qwen3-vl mm forward: deepstack must be [levels, num_tokens, hidden]");
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     VLRunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
-               positions3.t(), cos_sin_cache, slot_mapping.t(), block_table.t(),
+               positions3_dev, cos_sin_cache, slot_mapping.t(), block_table.t(),
                seq_lens.t(), query_start_loc.t(), meta, attn_kv[static_cast<size_t>(l)],
                rope, T);
     // DeepStack: add the l-th multiscale merger output after layers 0..L-1
     // (qwen3_vl.py:1589-1594). hidden is the post-layer delta stream.
     if (has_ds && l < L) {
-      Tensor ds_l = MakeTensor(static_cast<char*>(ds.ptr()) +
+      Tensor ds_l = MakeTensor(static_cast<char*>(deepstack.data) +
                                    static_cast<size_t>(l * T * H) * vt::SizeOf(DType::kBF16),
                                DType::kBF16, d.q.device, {T, H});
       vt::Add(d.q, hidden.t(), hidden.t(), ds_l);
@@ -357,14 +377,13 @@ DBuf VLForwardLastLogitsDBuf(
 // Host wrapper over the device core (VT_LOGITS_GATHER=0-style opt-out + the
 // exposed host public API): run the forward, then Download the [vocab] f32 row.
 std::vector<float> VLForwardLastLogits(
-    Dev d, const std::vector<uint16_t>& inputs_embeds_bf16,
-    const std::vector<int32_t>& positions3_host, int64_t T,
-    const std::vector<uint16_t>& deepstack_bf16, int64_t L,
+    Dev d, const Tensor& inputs_embeds, const Tensor& positions3_dev, int64_t T,
+    const Tensor& deepstack, int64_t L,
     const Tensor& cos_sin_cache, const CommonAttentionMetadata& meta,
     const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
     const HfConfig& config, const vt::RopeArgs& rope) {
-  DBuf logits = VLForwardLastLogitsDBuf(d, inputs_embeds_bf16, positions3_host, T,
-                                        deepstack_bf16, L, cos_sin_cache, meta,
+  DBuf logits = VLForwardLastLogitsDBuf(d, inputs_embeds, positions3_dev, T,
+                                        deepstack, L, cos_sin_cache, meta,
                                         attn_kv, weights, config, rope);
   std::vector<float> out(static_cast<size_t>(config.vocab_size));
   logits.Download(d, out.data());
@@ -621,7 +640,26 @@ VLStepFn MakeRegistryStep(LoadedModel& model, const HfConfig& config,
     std::vector<GdnStateCache> no_gdn_state;
     v1::GDNAttentionMetadata gdn_meta{};
     const std::vector<int32_t> gather_li = {static_cast<int32_t>(T - 1)};
-    const MultiModalForwardInput mm{&embeds, &pos3, &ds, deepstack_levels};
+    // ENG-MM-INPUT-PIPELINE P1: the seam takes DEVICE handles, so the H2D happens
+    // HERE, in the driver that owns the host buffers, instead of inside the
+    // forward. These DBufs stay alive across the ModelRegistry::Forward call below
+    // and are released when the step returns; the runner slice (#2300) will hand
+    // the seam a PERSISTENT device buffer and skip the upload entirely.
+    Backend& backend = vt::GetBackend(queue.device.type);
+    Dev d{backend, queue};
+    const int64_t H = config.hidden_size;
+    DBuf dembeds(d, DType::kBF16, {T, H}, embeds.data());
+    DBuf dpos3(d, DType::kI32, {3, T}, pos3.data());
+    const bool has_ds = !ds.empty();
+    DBuf dds(d, DType::kBF16,
+             has_ds ? std::vector<int64_t>{deepstack_levels, T, H}
+                    : std::vector<int64_t>{0},
+             has_ds ? ds.data() : nullptr);
+    MultiModalForwardInput mm{};
+    mm.inputs_embeds = dembeds.t();
+    mm.positions3 = dpos3.t();
+    mm.deepstack_levels = deepstack_levels;
+    if (has_ds) mm.deepstack = dds.t();
     ModelForwardInput in{
         .token_ids = no_tokens,
         .positions = no_pos,
@@ -667,31 +705,29 @@ Qwen3VLCosSinCache Qwen3VLMakeCosSinCache(vt::Queue& queue, const HfConfig& conf
 
 std::vector<float> Qwen3VLForwardStepLastLogits(
     vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
-    const std::vector<uint16_t>& inputs_embeds_bf16,
-    const std::vector<int32_t>& positions3, int64_t num_tokens,
-    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& inputs_embeds, const vt::Tensor& positions3,
+    int64_t num_tokens, const vt::Tensor& deepstack, int64_t deepstack_levels,
     const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
     const std::vector<PagedKvCache>& attn_kv) {
   Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
   const vt::RopeArgs rope = MropeArgs(config);
-  return VLForwardLastLogits(d, inputs_embeds_bf16, positions3, num_tokens,
-                             deepstack_bf16, deepstack_levels, cos_sin_cache_bf16,
+  return VLForwardLastLogits(d, inputs_embeds, positions3, num_tokens,
+                             deepstack, deepstack_levels, cos_sin_cache_bf16,
                              meta, attn_kv, weights_text, config, rope);
 }
 
 ForwardLogits Qwen3VLForwardStepLastLogitsDevice(
     vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
-    const std::vector<uint16_t>& inputs_embeds_bf16,
-    const std::vector<int32_t>& positions3, int64_t num_tokens,
-    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& inputs_embeds, const vt::Tensor& positions3,
+    int64_t num_tokens, const vt::Tensor& deepstack, int64_t deepstack_levels,
     const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
     const std::vector<PagedKvCache>& attn_kv) {
   Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
   const vt::RopeArgs rope = MropeArgs(config);
   DBuf logits = VLForwardLastLogitsDBuf(
-      d, inputs_embeds_bf16, positions3, num_tokens, deepstack_bf16,
+      d, inputs_embeds, positions3, num_tokens, deepstack,
       deepstack_levels, cos_sin_cache_bf16, meta, attn_kv, weights_text, config,
       rope);
   return WrapDeviceLogits(std::move(logits), /*rows=*/1, config.vocab_size);

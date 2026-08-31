@@ -144,11 +144,12 @@ ForwardLogits ForwardGemma4ForConditionalGeneration(
   // DeepStack). nullopt on every text step ⇒ the text path below is byte-identical.
   if (input.mm.has_value()) {
     const MultiModalForwardInput& mm = *input.mm;
-    VT_CHECK(mm.inputs_embeds_bf16 != nullptr && mm.ple_token_ids != nullptr,
-             "Gemma-4 mm forward: null merged-embeds / ple_token_ids handle on "
-             "ModelForwardInput.mm");
+    // ENG-MM-INPUT-PIPELINE P1: both handles are DEVICE views (#1358, #2300).
+    VT_CHECK(mm.inputs_embeds.data != nullptr && mm.ple_token_ids.data != nullptr,
+             "Gemma-4 mm forward: null merged-embeds / ple_token_ids device handle "
+             "on ModelForwardInput.mm");
     return HostLogits(
-        Gemma4Model::ForwardMm(*mm.inputs_embeds_bf16, *mm.ple_token_ids,
+        Gemma4Model::ForwardMm(mm.inputs_embeds, mm.ple_token_ids,
                                input.positions, input.attn_meta, input.attn_kv,
                                weights, input.config, input.queue,
                                input.logits_indices),

@@ -526,3 +526,65 @@ TEST_CASE("W1: two LSE-merged passes equal one pass over the union — sink in E
   }
   CHECK(bad > 1e-4 * mag);
 }
+
+TEST_CASE("W1: window + compressed merged equals ONE pass over the union") {
+  // `MODEL-DSV4-DSA-COMPOSE` W1 (#2286). Upstream attends a compressor layer with
+  // ONE fused two-cache call; `MergeWindowAndCompressed` composes it from two
+  // passes. The claim is that the composition is the same function, so this
+  // builds a cache holding BOTH key sets and compares against a single pass over
+  // all of them.
+  //
+  // T == 1, because the LSE layouts `MergeAttnStates` wants coincide with the
+  // decode op's only when T or H is 1 -- the function asserts that rather than
+  // assuming it, and a general step needs a transpose it does not yet do.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 3, T = 1, n_win = 6, n_comp = 5;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const std::vector<float> win_kv = Rand(static_cast<size_t>(n_win * hd), 301u, 0.3f);
+  const std::vector<float> comp = Rand(static_cast<size_t>(n_comp * hd), 302u, 0.28f);
+  const std::vector<float> qv = Rand(static_cast<size_t>(T * nh * hd), 303u, 0.25f);
+  std::vector<float> sink(static_cast<size_t>(nh));
+  for (int64_t h = 0; h < nh; ++h) sink[static_cast<size_t>(h)] = -0.2f + 0.1f * static_cast<float>(h);
+
+  // (A) THE REFERENCE: one cache holding the window keys THEN the compressed
+  //     rows, attended in a single pass with the sink applied once.
+  const int64_t n_all = n_win + n_comp;
+  const int64_t bs = 16, nb = (n_all + bs - 1) / bs;
+  std::vector<float> all(static_cast<size_t>(nb * bs * hd), 0.0f);
+  std::copy(win_kv.begin(), win_kv.end(), all.begin());
+  std::copy(comp.begin(), comp.end(), all.begin() + n_win * hd);
+  vt::Tensor t_all = Contig(all.data(), vt::DType::kF32, q.device, {nb, bs, hd});
+  const auto want = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_all, nb, bs, T, nh, hd, /*kv_base=*/n_all - 1, sink, scale,
+      /*no_sink=*/false, /*sliding_window=*/0);
+
+  // (B) THE COMPOSITION: a window pass over the window keys only (carrying the
+  //     sink and its LSE), then the compressed pass merged in.
+  const int64_t nbw = (n_win + bs - 1) / bs;
+  std::vector<float> wcache(static_cast<size_t>(nbw * bs * hd), 0.0f);
+  std::copy(win_kv.begin(), win_kv.end(), wcache.begin());
+  vt::Tensor t_w = Contig(wcache.data(), vt::DType::kF32, q.device, {nbw, bs, hd});
+  std::vector<float> win_lse;
+  const auto win_out = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_w, nbw, bs, T, nh, hd, /*kv_base=*/n_win - 1, sink, scale,
+      /*no_sink=*/false, /*sliding_window=*/0, &win_lse);
+  REQUIRE(win_lse.size() == static_cast<size_t>(T * nh));
+
+  const auto got = vllm::deepseek_v4::MergeWindowAndCompressed(
+      q, win_out, win_lse, qv, comp, n_comp, T, nh, hd, scale);
+
+  REQUIRE(got.size() == want.size());
+  double worst = 0.0, mag = 0.0, vs_win = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(!std::isnan(got[i]));
+    mag = std::max(mag, std::abs(static_cast<double>(want[i])));
+    worst = std::max(worst, std::abs(static_cast<double>(want[i] - got[i])));
+    vs_win = std::max(vs_win, std::abs(static_cast<double>(got[i] - win_out[i])));
+  }
+  REQUIRE(mag > 1e-3);
+  CHECK(worst <= 1e-5 * mag);
+  // THE COMPRESSED PASS IS LOAD-BEARING: merging must move the answer away from
+  // the window-only result, or the case would pass against a merge that dropped
+  // the second contributor entirely.
+  CHECK(vs_win > 1e-3 * mag);
+}

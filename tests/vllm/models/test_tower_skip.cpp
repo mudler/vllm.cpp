@@ -53,8 +53,11 @@
 #include "vllm/model_executor/models/qwen3_vl.h"  // #607 L3 the SECOND tower loader
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
+#include "vllm/v1/attention/backends/gdn_attn.h"  // ModelForwardInput::gdn_meta
+#include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
+#include "vt/tensor.h"
 
 using muse_glimmer_tiny::BuildSt;
 using muse_glimmer_tiny::TempFile;
@@ -618,5 +621,277 @@ TEST_CASE("tower skip: --language-model-only reaches the loader from LoadedEngin
         vllm::entrypoints::LoadedEngine::FromModelDir(dir.path(), image_only);
     REQUIRE(engine != nullptr);
     CHECK(engine->skipped_towers().empty());
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. ENG-MM-INPUT-PIPELINE P1 (#1358, #2300) — the DeepStack CHANNEL IS TWO
+//    FIELDS, and they have to agree.
+//
+//    P1 turned `MultiModalForwardInput`'s host pointers into borrowed `vt::Tensor`
+//    DEVICE views. The old contract required `mm.deepstack_bf16 != nullptr`, and the
+//    driver always passed a pointer to a possibly-EMPTY vector, so "I set the level
+//    count and forgot the tensor" was a LOUD throw. Under the device contract ABSENT
+//    and NOT-APPLICABLE are the SAME value (`data == nullptr`), which is what makes
+//    that pair both expressible and silent: with `deepstack_levels > 0` and
+//    `deepstack.data == nullptr`, `VLForwardLastLogitsDBuf` (`qwen3_vl.cpp`)
+//    computes `has_ds = false` and SKIPS every multiscale-merger add, so a Qwen3-VL
+//    prefill returns fluent WRONG tokens with no diagnostic at all. The consumer of
+//    this seam is the runner slice (#2300) — the next piece of work — which has to
+//    set both fields, and nothing else couples them.
+//
+//    The REVERSE pairing (tensor set, `levels == 0`) deliberately gets NO second
+//    guard, because it already has one: `has_ds` is then true, and the forward
+//    core's `VT_CHECK(!has_ds || deepstack.Numel() == L * T * H)` compares a
+//    non-zero `Numel()` against `0 * T * H` and refuses. A check with no failing
+//    input is not a gate.
+//
+//    THE VEHICLE, and why it is here. The refusal lives in
+//    `ForwardQwen3VLForConditionalGeneration`, so reaching it needs a real
+//    `Qwen3VLLoadedModel` — which only `ModelRegistry::Load` produces, and only off
+//    a Qwen3-VL checkpoint. This file already synthesises one and already loads it
+//    through that seam (§2b), so the case lives beside its fixture rather than
+//    behind a third copy of it. Every arm below enters through
+//    `reg.factory->forward`, the same function pointer `ModelRegistry::Forward`
+//    calls; none constructs the model by hand.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+namespace qwen3vl_mrope_tiny {
+
+// A SECOND tiny Qwen3-VL checkpoint, and the one difference that forces it to
+// exist: `MropeArgs` (`qwen3_vl.cpp`) hard-codes `mrope_section = {24, 20, 20}`,
+// and `vt::RopeFromCache` requires that section to sum to `rotary_dim / 2`
+// (`src/vt/ops.cpp`, "mrope_section must sum to rotary_dim/2"). `rotary_dim` IS
+// `config.head_dim`, so any fixture whose forward reaches a decoder layer has to
+// carry head_dim == 128. `qwen3vl_tiny` above never forwards, so its head_dim 8 is
+// right there and unusable here. Everything else is deliberately minimal.
+constexpr int64_t kVocab = 32, kHeads = 2, kKvHeads = 1, kHeadDim = 128;
+constexpr int64_t kHidden = kHeads * kHeadDim, kInter = 64, kLayers = 2;
+
+using muse_glimmer_tiny::Bf16;
+using muse_glimmer_tiny::Fx;
+
+inline std::vector<Fx> TextOnlyTensors() {
+  const std::string P = "model.language_model.";
+  uint32_t seed = 1;
+  std::vector<Fx> ts;
+  ts.push_back(Bf16(P + "embed_tokens.weight", {kVocab, kHidden}, seed++));
+  ts.push_back(Bf16(P + "norm.weight", {kHidden}, seed++));
+  for (int64_t l = 0; l < kLayers; ++l) {
+    const std::string b = P + "layers." + std::to_string(l) + ".";
+    ts.push_back(Bf16(b + "input_layernorm.weight", {kHidden}, seed++));
+    ts.push_back(Bf16(b + "post_attention_layernorm.weight", {kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.q_proj.weight", {kHeads * kHeadDim, kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.k_proj.weight", {kKvHeads * kHeadDim, kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.v_proj.weight", {kKvHeads * kHeadDim, kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.o_proj.weight", {kHidden, kHeads * kHeadDim}, seed++));
+    ts.push_back(Bf16(b + "self_attn.q_norm.weight", {kHeadDim}, seed++));
+    ts.push_back(Bf16(b + "self_attn.k_norm.weight", {kHeadDim}, seed++));
+    ts.push_back(Bf16(b + "mlp.gate_proj.weight", {kInter, kHidden}, seed++));
+    ts.push_back(Bf16(b + "mlp.up_proj.weight", {kInter, kHidden}, seed++));
+    ts.push_back(Bf16(b + "mlp.down_proj.weight", {kHidden, kInter}, seed++));
+  }
+  return ts;
+}
+
+inline HfConfig Config() {
+  HfConfig c;
+  c.architectures = {"Qwen3VLForConditionalGeneration"};
+  c.hidden_size = kHidden;
+  c.intermediate_size = kInter;
+  c.num_hidden_layers = kLayers;
+  c.num_attention_heads = kHeads;
+  c.num_key_value_heads = kKvHeads;
+  c.head_dim = kHeadDim;
+  c.vocab_size = kVocab;
+  c.rms_norm_eps = 1e-6;
+  c.rope_theta = 5e6;
+  return c;
+}
+
+}  // namespace qwen3vl_mrope_tiny
+
+// A rank-2 or rank-3 device allocation with a borrowed `vt::Tensor` over it — the
+// shape the P1 seam takes. Owns the bytes for its lifetime; `t()` hands out the
+// view, exactly as the runner slice will.
+class DevBuf {
+ public:
+  DevBuf(vt::Queue& q, vt::DType dt, int64_t d0, int64_t d1, int64_t d2, const void* src)
+      : b_(&vt::GetBackend(q.device.type)), q_(&q), dt_(dt), d0_(d0), d1_(d1), d2_(d2),
+        rank_(d2 > 0 ? 3 : 2) {
+    const int64_t n = rank_ == 3 ? d0_ * d1_ * d2_ : d0_ * d1_;
+    bytes_ = static_cast<size_t>(n) * vt::SizeOf(dt_);
+    p_ = b_->Alloc(bytes_);
+    if (src != nullptr)
+      b_->Copy(*q_, p_, src, bytes_);
+    else
+      b_->Memset(*q_, p_, 0, bytes_);
+  }
+  ~DevBuf() { b_->Free(p_); }
+  DevBuf(const DevBuf&) = delete;
+  DevBuf& operator=(const DevBuf&) = delete;
+  vt::Tensor t() const {
+    return rank_ == 3
+               ? vt::Tensor::Contiguous(p_, dt_, q_->device, {d0_, d1_, d2_})
+               : vt::Tensor::Contiguous(p_, dt_, q_->device, {d0_, d1_});
+  }
+
+ private:
+  vt::Backend* b_ = nullptr;
+  vt::Queue* q_ = nullptr;
+  vt::DType dt_ = vt::DType::kBF16;
+  int64_t d0_ = 0, d1_ = 0, d2_ = 0;
+  int rank_ = 2;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+};
+
+// One paged KV pool per forward: a forward WRITES its keys and values, so reusing
+// one across arms would make the second arm read the first arm's cache.
+struct VlKvPool {
+  std::vector<std::vector<uint16_t>> buf;
+  std::vector<PagedKvCache> attn_kv;
+  VlKvPool(int64_t num_blocks, int64_t block_size) {
+    using namespace qwen3vl_mrope_tiny;
+    for (int64_t l = 0; l < kLayers; ++l)
+      buf.emplace_back(
+          static_cast<size_t>(num_blocks * 2 * block_size * kKvHeads * kHeadDim), 0);
+    for (auto& b : buf) {
+      PagedKvCache kv;
+      kv.data = b.data();
+      kv.dtype = vt::DType::kBF16;
+      kv.num_blocks = num_blocks;
+      kv.block_size = block_size;
+      kv.num_kv_heads = kKvHeads;
+      kv.head_size = kHeadDim;
+      attn_kv.push_back(kv);
+    }
+  }
+};
+
+}  // namespace
+
+TEST_CASE("mm seam: Qwen3-VL refuses deepstack_levels that no deepstack tensor backs") {
+  using namespace qwen3vl_mrope_tiny;
+  const TempFile file(BuildSt(TextOnlyTensors()));
+  std::vector<vllm::SafetensorsFile> shards = OpenShards(file);
+  const HfConfig config = Config();
+  // The tiny checkpoint carries no `model.visual.*`, so the load has to skip the
+  // tower; that is orthogonal to what this case asks and is §2b's subject.
+  const MultiModalConfig lmo = LanguageModelOnly();
+  vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+  source.multimodal = &lmo;
+  std::unique_ptr<vllm::LoadedModel> model = ModelRegistry::Load(config, source);
+  REQUIRE(model != nullptr);
+
+  const vllm::ModelRegistration& reg =
+      vllm::RegistrationFor("Qwen3VLForConditionalGeneration");
+  REQUIRE(reg.factory != nullptr);
+  REQUIRE(reg.factory->forward != nullptr);
+
+  vt::Queue q = Qcpu();
+  const int64_t T = 4;
+  std::vector<uint16_t> embeds(static_cast<size_t>(T * kHidden));
+  for (size_t i = 0; i < embeds.size(); ++i)
+    embeds[i] = vt::F32ToBF16(0.125f * static_cast<float>(1 + (i % 5)));
+  std::vector<int32_t> pos3(static_cast<size_t>(3 * T));
+  for (int64_t s = 0; s < 3; ++s)
+    for (int64_t t = 0; t < T; ++t)
+      pos3[static_cast<size_t>(s * T + t)] = static_cast<int32_t>(t);
+
+  const DevBuf dembeds(q, vt::DType::kBF16, T, kHidden, 0, embeds.data());
+  const DevBuf dpos3(q, vt::DType::kI32, 3, T, 0, pos3.data());
+
+  const std::vector<int32_t> token_ids(static_cast<size_t>(T), 0);
+  const std::vector<int32_t> positions(static_cast<size_t>(T), 0);
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  const CommonAttentionMetadata meta = PrefillMeta(T, 8);
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  std::vector<vllm::GdnStateCache> gdn_state;
+
+  // The two channels the seam always requires; only the DeepStack pair varies.
+  vllm::MultiModalForwardInput mm;
+  mm.inputs_embeds = dembeds.t();
+  mm.positions3 = dpos3.t();
+
+  SUBCASE("levels set, tensor absent: REFUSED by name, before anything runs") {
+    VlKvPool pool(2, 8);
+    vllm::MultiModalForwardInput bad = mm;
+    bad.deepstack_levels = 3;  // and `bad.deepstack` stays default-constructed
+    vllm::ModelForwardInput in{.token_ids = token_ids,
+                               .positions = positions,
+                               .attn_meta = meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = pool.attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = config,
+                               .queue = q,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    in.mm = bad;
+
+    std::string message;
+    try {
+      (void)reg.factory->forward(*model, in);
+      FAIL("deepstack_levels > 0 with an absent deepstack tensor must be refused");
+    } catch (const std::exception& e) {
+      message = e.what();
+    }
+    CAPTURE(message);
+    // BY NAME, and by the caller's OWN field names: "it threw" is satisfied by any
+    // later failure in the forward, and under the mutation that deletes this guard
+    // the forward throws or returns for entirely different reasons. Naming both
+    // fields is what tells the two apart.
+    CHECK(message.find("deepstack_levels") != std::string::npos);
+    CHECK(message.find(".deepstack") != std::string::npos);
+  }
+
+  SUBCASE("neither set: the legitimate no-DeepStack step RUNS") {
+    // The control, and the reason the guard is a coupling rather than a blanket
+    // requirement. A decode step and a DeepStack-less VL checkpoint both arrive
+    // here with both fields empty, and both must be served.
+    VlKvPool pool(2, 8);
+    vllm::ModelForwardInput in{.token_ids = token_ids,
+                               .positions = positions,
+                               .attn_meta = meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = pool.attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = config,
+                               .queue = q,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    in.mm = mm;  // deepstack_levels == 0, deepstack default-constructed
+
+    const vllm::ForwardLogits out = reg.factory->forward(*model, in);
+    CHECK_FALSE(out.on_device());
+    CHECK(out.host.size() == static_cast<size_t>(kVocab));
+  }
+
+  SUBCASE("both set: the coupled input is SERVED, so the guard is satisfiable") {
+    // Without this arm the guard could be `deepstack_levels == 0` and still pass
+    // the two arms above.
+    VlKvPool pool(2, 8);
+    const DevBuf ds(q, vt::DType::kBF16, 3, T, kHidden, nullptr);
+    vllm::MultiModalForwardInput good = mm;
+    good.deepstack = ds.t();
+    good.deepstack_levels = 3;
+    vllm::ModelForwardInput in{.token_ids = token_ids,
+                               .positions = positions,
+                               .attn_meta = meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = pool.attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = config,
+                               .queue = q,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    in.mm = good;
+
+    const vllm::ForwardLogits out = reg.factory->forward(*model, in);
+    CHECK(out.host.size() == static_cast<size_t>(kVocab));
   }
 }

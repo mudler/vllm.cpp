@@ -112,11 +112,12 @@ ForwardLogits ForwardMuseGlimmer(LoadedModel& model,
   // nullopt on every text step ⇒ the text path below is byte-identical.
   if (input.mm.has_value()) {
     const MultiModalForwardInput& mm = *input.mm;
-    VT_CHECK(mm.inputs_embeds_bf16 != nullptr,
-             "MuseGlimmer mm forward: null merged-embeds handle on "
+    // ENG-MM-INPUT-PIPELINE P1: the handle is a DEVICE view (#1358, #2300).
+    VT_CHECK(mm.inputs_embeds.data != nullptr,
+             "MuseGlimmer mm forward: null merged-embeds device handle on "
              "ModelForwardInput.mm");
     return HostLogits(
-        MuseGlimmerModel::ForwardMm(*mm.inputs_embeds_bf16, input.positions,
+        MuseGlimmerModel::ForwardMm(mm.inputs_embeds, input.positions,
                                     input.attn_meta, input.attn_kv, weights,
                                     input.queue, input.logits_indices),
         weights.params.text.vocab_size);

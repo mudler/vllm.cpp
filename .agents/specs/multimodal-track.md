@@ -1997,6 +1997,111 @@ pieces).**
 
 ---
 
+## 5. P1 — the forward seam carries DEVICE handles (#1358, #2300)
+
+**Scope.** `MultiModalForwardInput`'s five fields, the three sites that construct
+it, and what the three registered forwards do to read them. Nothing else. The
+scheduler, the GPU runner, `NewRequestData` and `EncoderCacheManager` are the NEXT
+slice and are untouched here.
+
+**What changed.** The struct carried five HOST pointers
+(`const std::vector<uint16_t>*` / `const std::vector<int32_t>*`). It now carries
+four borrowed `vt::Tensor` DEVICE views plus the `deepstack_levels` scalar. An
+absent channel is the default-constructed tensor, whose `data == nullptr` — the
+same either/or the null pointers expressed.
+
+**Why, against the pinned oracle `555967922`.** Upstream stages the merged
+embeddings in a PERSISTENT DEVICE buffer and hands the forward a view of it:
+
+| Upstream anchor | Uniqueness discriminator | What it says |
+|---|---|---|
+| `vllm/v1/worker/gpu_model_runner.py:798` | `grep -rn 'self.inputs_embeds = self._make_buffer' vllm/` == **1** | the buffer is allocated once, `[max_num_batched_tokens, inputs_embeds_size]`, in the model dtype, `numpy=False` |
+| `vllm/v1/worker/gpu_model_runner.py:3607` | `grep -c 'self.inputs_embeds.gpu\[:num_scheduled_tokens\].copy_('` == **1** in the file; its `# TODO(woosuk): Avoid the copy. Optimize.` on `:3606` is also `grep -c` == **1** | the merged result is copied INTO that device buffer each step |
+| `vllm/model_executor/models/interfaces.py:380` | `def embed_input_ids` is FAR from unique — **322** hits across the tree and **3** in this file, of which `:350` and `:353` are `@overload` stubs. The discriminator is the signature line `:383`, `multimodal_embeddings: MultiModalEmbeddings \| None = None,`, `grep -c` == **1** in the file: that is `SupportsMultiModal.embed_input_ids`, the concrete one | the merge is a MODEL method, and the runner calls it before the forward (`self.model.embed_input_ids(` at `gpu_model_runner.py:3600`, one of 3 in that file — the mm one, in the `else` of the prompt-embeds branch) |
+| `vllm/model_executor/models/interfaces.py:411` | `grep -c 'return _merge_multimodal_embeddings('` == **1** in the file | that method delegates the scatter |
+| `vllm/model_executor/models/utils.py:658` | `grep -rn 'def _merge_multimodal_embeddings' vllm/` == **1**, at `:637`; `:658` is its `inputs_embeds[is_multimodal] = mm_embeds_flat.to(dtype=input_dtype)` | the scatter is a device index-put |
+| `vllm/model_executor/models/qwen3_vl.py:1757` | `self.deepstack_input_embeds = [` appears **twice** in the file (`:1757` ctor, `:1808` `_resize_deepstack_input_embeds`); the ctor one is discriminated by its `# register buffer for deepstack` on `:1755`, `grep -c` == **1**. Filled at `:1818` `_set_deepstack_input_embeds`, read at `:1788` `_get_deepstack_input_embeds`, consumed at `:1623` whose `deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]` is `grep -c` == **1** | DeepStack is a MODEL-OWNED persistent DEVICE buffer upstream, not a host argument |
+
+Every one of those was re-read in `/home/mudler/_git/vllm` at `5559679229`, which
+is the `parity-pin` block's `vllm_commit`.
+
+The host contract cost three things, and only the third is invisible to a gate:
+
+1. a `[T, H]` D2H followed by an H2D on every step, on the largest per-step buffer;
+2. a permanently NON-graph-capturable mm arm, because a host pointer cannot be
+   baked into a captured graph;
+3. a memory-format divergence in the seam that **no token gate can observe**. The
+   tokens matched throughout. `.agents/porting.md` "Mirror the memory format, not
+   just the math" names exactly this class, and this is an instance of it.
+
+**The borrowed-handle rule, and why the forward copies.** NO registered forward
+writes its hidden stream in place at this head, and the reason for the copy is
+stated against that measurement rather than around it: `RunLayer` ends
+`hidden = DBuf(...)` (`muse_glimmer.cpp`), `VLRunLayer` ends
+`hidden = down->Apply(...)` (`qwen3_vl.cpp`), and Gemma-4 copies `tok` into its own
+`hidden`. Aliasing the caller's view would therefore corrupt nothing TODAY, and no
+logits comparison can tell an aliasing implementation from this one. The copy is a
+CONTRACT rather than a caught defect: the invariant that keeps aliasing safe is
+written down nowhere, the runner slice will hand this seam a window into a buffer it
+reuses across steps, and any future in-place fusion would break the alias silently.
+All three forwards therefore seed their own buffer with a D2D copy — a pure byte
+copy, so the stream starts from the identical bits the host handle used to deliver,
+which is what makes the change bit-neutral rather than merely close. Upstream takes
+the same shape: its decoder layers allocate rather than clobber the persistent
+`inputs_embeds` they are handed. The `## Owed` entry below says the same thing, and
+this paragraph used to contradict it.
+
+**The merge-side question, answered rather than assumed.** Upstream's merge lives
+in a MODEL method (`interfaces.py:380`) that the RUNNER calls
+(`gpu_model_runner.py:3600`) BEFORE the forward; what crosses into the forward is
+the finished device `inputs_embeds`. That is exactly what this seam now carries, so
+the device conversion does NOT require moving the merge, and P1 stands alone. What
+remains divergent is WHO calls `embed_input_ids` and through what channel DeepStack
+travels — both properties of the layer above this seam, both owned by the runner
+slice, and both recorded under `## Owed` rather than half-done here.
+
+**Reachability — declared, not dressed up.** This slice makes NOTHING newly
+reachable and reduces nothing. The three drivers'
+(`Qwen3VLGenerateGreedyViaRegistry`, `Gemma4GenerateGreedyViaRegistry`,
+`MuseGlimmerGenerateGreedyViaRegistry`) only callers are tests, which is precisely
+what [#2300](https://github.com/mudler/vllm.cpp/issues/2300) records: the GPU runner
+never sets `.mm`, so no production entry point reaches this seam at all. Per
+[`.agents/reachability.md`](../reachability.md) "a change that has no production
+call site to delete has already answered the question" — there is nothing to
+mutate for reach here, and the wiring is owned by `ENG-MM-INPUT-PIPELINE` under
+#2300.
+
+**Gates.**
+
+- CPU, hermetic, no checkpoint: `tests/vllm/models/test_muse_glimmer_wiring.cpp`
+  drives the WHOLE chain — `MuseGlimmerGenerateGreedyViaRegistry` →
+  `ModelRegistry::Forward` → the registered mm branch → `MuseGlimmerModel::ForwardMm`
+  — on a synthetic checkpoint. It gained two cross-tree INSTRUMENTS (an FNV-1a-64
+  digest of the logits bytes, and the greedy ids themselves), so a before/after
+  comparison reads a number instead of a verdict, and one new case:
+  `MuseGlimmer: ForwardMm reads a SLICE of a larger device buffer and leaves it untouched`,
+  which reads the caller's device buffer back after the forward. Nothing about the
+  logits can see an aliasing implementation; only that read-back can. The name is
+  written out in full and verbatim because it is a `-tc` argument: doctest's filter
+  matches the WHOLE case name, so an approximation of it selects zero cases and
+  exits 0, which reads as a pass.
+- CPU, hermetic, no checkpoint: `tests/vllm/models/test_tower_skip.cpp` gained
+  `mm seam: Qwen3-VL refuses deepstack_levels that no deepstack tensor backs`,
+  which drives `reg.factory->forward` — the function pointer
+  `ModelRegistry::Forward` calls — on a synthetic Qwen3-VL checkpoint. It pins the
+  DeepStack pair the device contract made silently breakable: `deepstack_levels > 0`
+  with an absent `deepstack` tensor is REFUSED by name, while both-absent and
+  both-set are served. The case lives beside the Qwen3-VL fixture that file already
+  carries, because a real `Qwen3VLLoadedModel` is what the entry point needs and
+  only `ModelRegistry::Load` produces one.
+- GPU, checkpoint-gated: `test_qwen3vl_registry_e2e`, `test_qwen3vl_video_e2e` and
+  `test_gemma4_registry_e2e` are the token-exact arms. They SKIP without CUDA and
+  the cached checkpoints, so their disposition is recorded per run rather than
+  assumed.
+
+
+---
+
 ## Owed
 
 Carried by `ENG-MM-INPUT-PIPELINE`. The first block was filed while landing
@@ -2119,3 +2224,79 @@ L4 (§1.6); the second while landing L3 (§1.5).
   with its own spec and gate, not an in-flow repair. It is the hop
   [#1358](https://github.com/mudler/vllm.cpp/issues/1358) needs before the
   tower it loads can be read back.
+
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — P1 lands UNREACHED,
+  and says so.** The device seam changes code that no production entry point
+  arrives at: `ModelForwardInput.mm` is set by three single-sequence drivers whose
+  only callers are tests, and the GPU runner never sets it. The wiring is owned by
+  `ENG-MM-INPUT-PIPELINE` under this issue and is the next slice (§5).
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — the MERGE is still on
+  the wrong side of the seam.** Upstream's runner calls the MODEL's
+  `embed_input_ids` (`interfaces.py:380`) and the model does the scatter
+  (`utils.py:658`); ours hands the forward an embedding that a HOST-side driver
+  merged. P1 deliberately does not move it: the device contract is coherent without
+  it (§5), and moving it changes what the runner must compute (an embedding list
+  plus an `is_multimodal` mask) rather than what the forward reads.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — `deepstack` is a
+  forward ARGUMENT here and a model-owned persistent DEVICE buffer upstream**
+  (`qwen3_vl.py:1757` allocation, `:1818` fill, `:1788` read, `:1618-1623`
+  consumption). P1 makes our channel device-resident, which is the half that
+  mattered for graph capture; it does not move the channel onto the model. That is
+  the same decision as the merge above and belongs with it.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — the CUDA-graph claim
+  is a PREMISE, not a measurement.** P1 removes the host round trip that made the
+  mm arm uncapturable. Nothing here captures a graph over an mm step, and no
+  throughput number is claimed. The capture is the runner slice's to demonstrate.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — Gemma-4's mm branch
+  now takes ONE MORE `[T, H]` D2D copy than it needs.** `ForwardBody` copies the
+  seam's view into `tok` (`gemma4.cpp`, the `inputs_embeds_override` branch) and
+  then copies `tok` into `hidden` a few dozen lines later; `tok` is never written on
+  that branch, so the first copy is elidable by reading the borrowed view directly.
+  It was NOT elided here on purpose: this slice's bar is bit-identity, the arm that
+  would prove the elision (`test_gemma4_registry_e2e`) is gated on a checkpoint that
+  is not cached, and an unverifiable optimisation is the wrong thing to carry in a
+  change whose whole claim is that nothing moved. Against the HOST contract the copy
+  COUNT is unchanged (it was H2D-into-`tok` then D2D-into-`hidden`), so this is a
+  driver-path regression of zero and a runner-path saving deferred.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — no registered mm
+  forward writes its seed buffer in place TODAY, so the borrow is a contract rather
+  than a caught defect.** Measured while mutation-testing this slice: `RunLayer`
+  ends `hidden = DBuf(...)` (`muse_glimmer.cpp`), `VLRunLayer` ends
+  `hidden = down->Apply(...)` (`qwen3_vl.cpp`), and Gemma-4 copies `tok` into its
+  own `hidden`. An ALIASING implementation would therefore still pass a logits
+  comparison, which is why the CPU gate asserts the read-back of the caller's buffer
+  instead — and why the copy stays: the invariant that keeps aliasing safe is stated
+  nowhere and would be silently broken by any future layer that fuses in place.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — CONTIGUITY and DEVICE
+  are unchecked on the new handles.** `vt::Tensor` carries strides, and
+  `Tensor::Bytes()` itself `VT_CHECK`s `IsContiguous()`, so asserting contiguity is
+  this tree's own convention rather than an extra one. Four consumers do raw BYTE
+  arithmetic on a borrowed handle without checking it — `muse_glimmer.cpp:386`,
+  `qwen3_vl.cpp:326` and `gemma4.cpp:459`, all
+  `d.b.Copy(..., <handle>.data, dst.bytes())`, plus `qwen3_vl.cpp:351`,
+  `static_cast<char*>(deepstack.data) + l * T * H * 2` — and two more pass a handle
+  straight into a kernel (`positions3` into `VLRunLayer`, `ple_token_ids` into
+  `vt::Embedding`). The guards at the entry points test only `data != nullptr` and
+  `Numel()`, both of which a STRIDED view satisfies. The three copy sites size the
+  copy with the DESTINATION's `dst.bytes()` rather than the source's `src.Bytes()`,
+  which is precisely what sidesteps the one check that would already have fired. The
+  handle's `device` is likewise never compared against `input.queue.device`. Impact
+  at this head is ZERO — every constructor of these handles is a contiguous `DBuf`
+  on the queue's own device — which is why it is recorded rather than fixed: it
+  cannot bite until the runner slice starts handing the seam views it did not
+  allocate, and that slice is where the check belongs.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — two of the three
+  converted forwards have ZERO EXECUTED coverage.** `tests/vllm/models/test_model_registry.cpp`
+  asserts architecture registration strings and nothing else: it contains no
+  `MultiModalForwardInput` and no `.mm`. So `Gemma4Model::ForwardMm` and
+  `Qwen3VLForwardStepLastLogits{,Device}` are COMPILE-ONLY on CPU, and the arms that
+  would run them (`test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e`,
+  `test_qwen3vl_video_e2e`) SKIP without CUDA and their cached checkpoints. Only the
+  Muse Glimmer forward is executed by a hermetic gate. Gemma-4's is the most invasive
+  edit in the P1 diff — the `DBuf owned_ids` / `Tensor dids` restructure at
+  `gemma4.cpp:484-491`, which changes WHO owns the id buffer on the text arm as well
+  as the mm one. §5's `Gates` block says the GPU arms skip; it did not say that two
+  of the three forwards are therefore unexecuted, and that is the sentence this entry
+  adds. The Qwen3-VL half is now partly covered on CPU by the DeepStack-pair case in
+  `test_tower_skip.cpp` (§5 `Gates`), which reaches the registered entry point and
+  its shape guards; the numerics of both forwards remain checkpoint-gated.

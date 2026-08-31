@@ -48,6 +48,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/tensor.h"
 
 using vllm::EnumerateMuseGlimmerTensors;
 using vllm::HfConfig;
@@ -229,6 +230,64 @@ std::map<std::string, TensorMeta> ReadLiveHeaders(const std::string& dir) {
 using namespace muse_glimmer_tiny;  // NOLINT(build/namespaces) — a test fixture
 
 vt::Queue Qcpu() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
+
+// A stable digest of the RAW BYTES of a logits row, printed beside the run so a
+// before/after tree comparison reads a number rather than a verdict
+// (`.agents/verification.md`: make the instrument say what it compared). FNV-1a
+// 64 over the float bytes — it moves if ANY bit of ANY logit moves, which is the
+// bar ENG-MM-INPUT-PIPELINE P1 holds itself to.
+std::string LogitsDigest(const std::vector<float>& v) {
+  uint64_t h = 1469598103934665603ULL;
+  const auto* b = reinterpret_cast<const unsigned char*>(v.data());
+  for (size_t i = 0; i < v.size() * sizeof(float); ++i) {
+    h ^= b[i];
+    h *= 1099511628211ULL;
+  }
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+  return std::string(buf);
+}
+
+// ENG-MM-INPUT-PIPELINE P1 (#1358, #2300): `ForwardMm` takes a BORROWED DEVICE
+// view of the merged embeddings, so a test that has them on the host uploads them
+// first. Owns `rows * H` bf16 elements for its lifetime; `View(row0, rows)` is a
+// [rows, H] handle at an arbitrary ROW OFFSET into that allocation — the shape the
+// runner will hand the seam once `inputs_embeds` is a persistent buffer sliced per
+// step (`vllm/v1/worker/gpu_model_runner.py:798`, `:3607`).
+class DeviceEmbeds {
+ public:
+  DeviceEmbeds(vt::Queue& q, const std::vector<uint16_t>& bits, int64_t rows, int64_t H)
+      : b_(&vt::GetBackend(q.device.type)), q_(&q), rows_(rows), h_(H) {
+    REQUIRE(bits.size() == static_cast<size_t>(rows * H));
+    bytes_ = bits.size() * vt::SizeOf(vt::DType::kBF16);
+    p_ = b_->Alloc(bytes_);
+    b_->Copy(q, p_, bits.data(), bytes_);
+  }
+  ~DeviceEmbeds() { b_->Free(p_); }
+  DeviceEmbeds(const DeviceEmbeds&) = delete;
+  DeviceEmbeds& operator=(const DeviceEmbeds&) = delete;
+
+  vt::Tensor t() const { return View(0, rows_); }
+  vt::Tensor View(int64_t row0, int64_t rows) const {
+    auto* base = static_cast<unsigned char*>(p_);
+    return vt::Tensor::Contiguous(
+        base + static_cast<size_t>(row0 * h_) * vt::SizeOf(vt::DType::kBF16),
+        vt::DType::kBF16, q_->device, {rows, h_});
+  }
+  // The WHOLE allocation, read back, so a caller can prove nothing wrote to it.
+  std::vector<uint16_t> ReadBack() const {
+    std::vector<uint16_t> out(static_cast<size_t>(rows_ * h_));
+    b_->Copy(*q_, out.data(), p_, bytes_);
+    return out;
+  }
+
+ private:
+  vt::Backend* b_ = nullptr;
+  vt::Queue* q_ = nullptr;
+  int64_t rows_ = 0, h_ = 0;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+};
 
 
 
@@ -527,10 +586,15 @@ TEST_CASE("MuseGlimmer: the mm seam is BIT-IDENTICAL to the text path with no im
       vllm::MuseGlimmerMergeMultimodalEmbeds(ids, {}, w, q);
   CHECK(embeds.size() == static_cast<size_t>(T * kHidden));
   CachePool pool_mm(w.params, 2, 8);
+  const DeviceEmbeds dembeds(q, embeds, T, kHidden);
   const std::vector<float> mm = MuseGlimmerModel::ForwardMm(
-      embeds, positions, PrefillMeta(T, 8), pool_mm.attn_kv, w, q);
+      dembeds.t(), positions, PrefillMeta(T, 8), pool_mm.attn_kv, w, q);
 
   REQUIRE(mm.size() == text.size());
+  // Printed so a cross-TREE comparison of this arm reads a number. Both digests
+  // are over the SAME prompt through the two branches of the same forward.
+  MESSAGE("muse_glimmer text-path logits fnv1a64 = " << LogitsDigest(text));
+  MESSAGE("muse_glimmer mm-seam   logits fnv1a64 = " << LogitsDigest(mm));
   size_t differing = 0;
   for (size_t i = 0; i < text.size(); ++i)
     if (std::memcmp(&text[i], &mm[i], sizeof(float)) != 0) ++differing;
@@ -691,6 +755,13 @@ TEST_CASE("MuseGlimmer: an image prompt runs through the REGISTERED mm forward")
       *model, MmPrompt(), TinyImages(), /*eos_token_id=*/-1, w, config, q,
       /*max_new_tokens=*/3);
   CHECK(out.size() == 3);
+  {
+    // The ids themselves, printed: a shape check cannot tell one tree's answer
+    // from another's, and this driver IS the registered-forward regression arm.
+    std::string ids_s;
+    for (int32_t id : out) ids_s += std::to_string(id) + " ";
+    MESSAGE("muse_glimmer registered mm-forward greedy ids = " << ids_s);
+  }
   for (int32_t id : out) {
     CHECK(id >= 0);
     CHECK(id < kVocab);
@@ -707,6 +778,87 @@ TEST_CASE("MuseGlimmer: an image prompt runs through the REGISTERED mm forward")
   MuseGlimmerWeights text_only = w;
   text_only.vision = vllm::MuseGlimmerVisionTower{};
   CHECK_THROWS(vllm::MuseGlimmerEncodePixelGroups(TinyImages(), text_only, q));
+}
+
+// NOTE the absent comma in the name: doctest's `-tc` filter SPLITS ON COMMAS, so a
+// comma here makes every `-tc="<this name>"` invocation match nothing, run zero
+// cases and exit 0 — a mutation run against it reads as a pass.
+TEST_CASE("MuseGlimmer: ForwardMm reads a SLICE of a larger device buffer and leaves it untouched") {
+  // ENG-MM-INPUT-PIPELINE P1 (#1358, #2300) — the property the device seam BUYS,
+  // and the one the runner slice depends on.
+  //
+  // Upstream does not hand the forward a right-sized allocation. It allocates
+  // `self.inputs_embeds` ONCE at `[max_num_batched_tokens, hidden]`
+  // (`vllm/v1/worker/gpu_model_runner.py:798`) and passes
+  // `self.inputs_embeds.gpu[:num_scheduled_tokens]` (`:3607`) — a VIEW into a
+  // buffer that is mostly other steps' data. Under the old host contract that shape
+  // was inexpressible: the seam took a `const std::vector<uint16_t>*` whose `size()`
+  // had to BE the step. This case pins that it now works, and pins it at a NON-ZERO
+  // row offset so an implementation reading from the allocation base rather than
+  // from `Tensor::data` fails rather than passes by coincidence.
+  //
+  // WHAT IT DOES NOT ESTABLISH, stated because a reviewer will mutate for it: it is
+  // NOT a no-clobber proof for the residual stream. All three registered mm
+  // forwards REPLACE their hidden DBuf per layer today (`muse_glimmer.cpp` RunLayer
+  // ends `hidden = DBuf(...)`, `qwen3_vl.cpp` VLRunLayer ends
+  // `hidden = down->Apply(...)`, and gemma-4 copies `tok` into its own `hidden`),
+  // so an aliasing implementation would still pass a logits comparison. The
+  // read-back below DOES catch a forward that writes back through the handle or
+  // copies the wrong LENGTH out of it, which are the two mistakes a sliced view
+  // makes reachable.
+  const TempFile file(BuildSt(TinyTensors()));
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+  const HfConfig config = TinyConfig();
+  const MuseGlimmerWeights w =
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, config);
+  vt::Queue q = Qcpu();
+
+  const std::vector<int32_t> ids = {5, 9, 2, 7};
+  const int64_t T = static_cast<int64_t>(ids.size());
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) positions[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+
+  const std::vector<uint16_t> embeds =
+      vllm::MuseGlimmerMergeMultimodalEmbeds(ids, {}, w, q);
+  REQUIRE(embeds.size() == static_cast<size_t>(T * kHidden));
+
+  // The reference arm: an exactly-sized buffer, the shape the driver builds today.
+  const DeviceEmbeds exact(q, embeds, T, kHidden);
+  CachePool pool_a(w.params, 2, 8);
+  const std::vector<float> want = MuseGlimmerModel::ForwardMm(
+      exact.t(), positions, PrefillMeta(T, 8), pool_a.attn_kv, w, q);
+  REQUIRE(want.size() == static_cast<size_t>(T * w.params.text.vocab_size));
+
+  // The runner arm: a 3T-row "persistent" buffer whose MIDDLE T rows hold the step.
+  // The two other thirds carry a different, non-zero pattern, so reading the wrong
+  // rows produces different logits rather than a lucky match.
+  const int64_t kRows = 3 * T;
+  std::vector<uint16_t> big(static_cast<size_t>(kRows * kHidden));
+  for (size_t i = 0; i < big.size(); ++i)
+    big[i] = vt::F32ToBF16(0.5f + 0.125f * static_cast<float>(i % 7));
+  for (size_t i = 0; i < embeds.size(); ++i)
+    big[static_cast<size_t>(T * kHidden) + i] = embeds[i];
+  const DeviceEmbeds persistent(q, big, kRows, kHidden);
+
+  CachePool pool_b(w.params, 2, 8);
+  const std::vector<float> got = MuseGlimmerModel::ForwardMm(
+      persistent.View(T, T), positions, PrefillMeta(T, 8), pool_b.attn_kv, w, q);
+  REQUIRE(got.size() == want.size());
+  MESSAGE("muse_glimmer exact-buffer logits fnv1a64  = " << LogitsDigest(want));
+  MESSAGE("muse_glimmer sliced-view  logits fnv1a64  = " << LogitsDigest(got));
+  size_t differing = 0;
+  for (size_t i = 0; i < want.size(); ++i)
+    if (std::memcmp(&want[i], &got[i], sizeof(float)) != 0) ++differing;
+  CHECK(differing == 0);
+
+  // BORROWED means borrowed: every one of the 3T rows must come back unchanged.
+  const std::vector<uint16_t> after = persistent.ReadBack();
+  REQUIRE(after.size() == big.size());
+  size_t written = 0;
+  for (size_t i = 0; i < big.size(); ++i)
+    if (after[i] != big[i]) ++written;
+  CHECK(written == 0);
 }
 
 TEST_CASE("MuseGlimmer: ForwardMm consumes the given embeds WITHOUT re-normalizing") {
@@ -739,10 +891,12 @@ TEST_CASE("MuseGlimmer: ForwardMm consumes the given embeds WITHOUT re-normalizi
     scaled[i] = vt::F32ToBF16(4.0f * vt::BF16ToF32(base[i]));  // exact in bf16
 
   CachePool pa(w.params, 2, 8), pb(w.params, 2, 8);
-  const std::vector<float> la =
-      MuseGlimmerModel::ForwardMm(base, positions, PrefillMeta(T, 8), pa.attn_kv, w, q);
-  const std::vector<float> lb =
-      MuseGlimmerModel::ForwardMm(scaled, positions, PrefillMeta(T, 8), pb.attn_kv, w, q);
+  const DeviceEmbeds dbase(q, base, T, kHidden);
+  const DeviceEmbeds dscaled(q, scaled, T, kHidden);
+  const std::vector<float> la = MuseGlimmerModel::ForwardMm(
+      dbase.t(), positions, PrefillMeta(T, 8), pa.attn_kv, w, q);
+  const std::vector<float> lb = MuseGlimmerModel::ForwardMm(
+      dscaled.t(), positions, PrefillMeta(T, 8), pb.attn_kv, w, q);
   REQUIRE(la.size() == lb.size());
   size_t differing = 0;
   for (size_t i = 0; i < la.size(); ++i)

@@ -21,6 +21,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
+#include "vt/tensor.h"
 
 namespace vllm {
 
@@ -302,36 +303,56 @@ const Model& ModelAs(const LoadedModel& model, std::string_view architecture) {
 // never read it and the shared runner path stays byte-identical (the field is
 // additive and default-nullopt — text inertness is by construction).
 //
-// The handles are BORROWED (owned by the runner/driver for the forward's
-// duration). The tower + `_merge_multimodal_embeddings` + MRoPE index math already
-// ran on the host side (or the encoder runner) to fill these, so the registered
-// forward is a pure per-step function of them:
-//   * inputs_embeds_bf16 — the ALREADY-MERGED [num_tokens*hidden] host bf16 input
+// ENG-MM-INPUT-PIPELINE P1 (#1358, #2300): THE HANDLES ARE DEVICE TENSORS, not
+// host pointers. Every field is a BORROWED, non-owning `vt::Tensor` view of memory
+// that lives on `ModelForwardInput::queue`'s device for the forward's duration; an
+// absent channel is the default-constructed tensor, whose `data == nullptr`.
+//
+// WHY DEVICE, and why this had to move before the runner does. Upstream stages the
+// merged embeddings in a PERSISTENT DEVICE buffer —
+// `vllm/v1/worker/gpu_model_runner.py::GPUModelRunner._init_device_properties`
+// allocates `self.inputs_embeds` (:798, the sole
+// `self.inputs_embeds = self._make_buffer` in the tree) and the mm branch copies
+// the merged result into it (:3607, `self.inputs_embeds.gpu[...].copy_(...)`) —
+// precisely so the step can be CUDA-graph captured. A HOST handle here forced a
+// `[T,H]` D2H+H2D round trip per step, made the mm arm permanently
+// non-graph-capturable, and put a memory-format divergence in the seam that NO
+// token gate can observe (`.agents/porting.md` "Mirror the memory format, not just
+// the math"). The tokens matched; the bytes moved twice.
+//
+// The tower, the merge (`interfaces.py::SupportsMultiModal.embed_input_ids` :380 →
+// `_merge_multimodal_embeddings` :411 → `utils.py::_merge_multimodal_embeddings`
+// :658) and the MRoPE index math still run ABOVE this seam and fill these buffers,
+// so the registered forward stays a pure per-step function of them:
+//   * inputs_embeds — the ALREADY-MERGED [num_tokens, hidden] bf16 DEVICE
 //     embeddings: embed(token_ids) with the projected vision features
 //     masked-scattered into the placeholder rows. When set, the forward consumes
-//     THESE instead of embedding token_ids.
-//   * positions3 — the 3-D MRoPE positions, row-major [3, num_tokens]
-//     (3*num_tokens int32), replacing the 1-D ModelForwardInput::positions for the
-//     vision-language backbone.
-//   * deepstack_bf16 — the [levels*num_tokens*hidden] host bf16 DeepStack
-//     multiscale tensor added after decoder layers 0..levels-1 (EMPTY on decode
+//     THESE instead of embedding token_ids. The forward COPIES it into its own
+//     residual-stream buffer and never writes through this view, mirroring
+//     upstream, whose decoder layers allocate rather than clobber the persistent
+//     `inputs_embeds` buffer they are handed.
+//   * positions3 — the 3-D MRoPE positions, [3, num_tokens] int32 DEVICE,
+//     replacing the 1-D ModelForwardInput::positions for the vision-language
+//     backbone.
+//   * deepstack — the [levels, num_tokens, hidden] bf16 DEVICE DeepStack
+//     multiscale tensor added after decoder layers 0..levels-1 (ABSENT on decode
 //     steps and on models without DeepStack, e.g. the 27B GDN-hybrid VL path).
 //   * deepstack_levels — `levels` (0 ⇒ no DeepStack inject).
 //   * ple_token_ids — CLAIM-GEMMA4-MM-E2E: the Gemma-4 Per-Layer-Embedding (PLE)
-//     token ids [num_tokens], with the multimodal (image/audio) rows masked to 0
-//     and the vocab_size_per_layer_input range mask applied — mirror of
+//     token ids [num_tokens] int32 DEVICE, with the multimodal (image/audio) rows
+//     masked to 0 and the vocab_size_per_layer_input range mask applied — mirror of
 //     gemma4_mm.py embed_input_ids (`is_multimodal → 0`, :1962-1969) +
 //     gemma4.py get_per_layer_inputs (`id < vocab_size_per_layer_input ? id : 0`,
 //     :857-863). The Gemma-4 registered mm forward looks up embed_tokens_per_layer
-//     from THESE ids (NOT the merged embeds). nullptr for non-Gemma mm models
-//     (Qwen3-VL never sets it) — additive + default-null. Gemma-4 also uses the
-//     1-D ModelForwardInput::positions (NOT positions3) and no DeepStack.
+//     from THESE ids (NOT the merged embeds). ABSENT for non-Gemma mm models
+//     (Qwen3-VL never sets it). Gemma-4 also uses the 1-D
+//     ModelForwardInput::positions (NOT positions3) and no DeepStack.
 struct MultiModalForwardInput {
-  const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr;
-  const std::vector<int32_t>* positions3 = nullptr;
-  const std::vector<uint16_t>* deepstack_bf16 = nullptr;
+  vt::Tensor inputs_embeds;
+  vt::Tensor positions3;
+  vt::Tensor deepstack;
   int64_t deepstack_levels = 0;
-  const std::vector<int32_t>* ple_token_ids = nullptr;
+  vt::Tensor ple_token_ids;
 };
 
 // ENG-MULTIKV-BYNAME: WHERE a published cache's payload lives.

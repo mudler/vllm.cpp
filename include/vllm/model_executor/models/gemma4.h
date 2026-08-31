@@ -207,16 +207,18 @@ class Gemma4Model {
       const std::vector<int32_t>& logits_indices = {});
 
   // CLAIM-GEMMA4-MM-E2E: one MULTIMODAL forward. The hidden stream starts from the
-  // already-merged host bf16 inputs_embeds [T*H] (text rows sqrt(H)-scaled, image/
-  // audio soft-token rows the embed_vision/embed_audio projector output), and the
-  // PLE embed_tokens_per_layer lookup uses `ple_token_ids` [T] (mm rows masked to
-  // 0 + the vocab_size_per_layer_input range mask) — gemma4_mm.py:1962-1973 +
-  // gemma4.py get_per_layer_inputs/project_per_layer_inputs (:848-928). Positions
+  // already-merged bf16 DEVICE inputs_embeds [T, H] (text rows sqrt(H)-scaled,
+  // image/audio soft-token rows the embed_vision/embed_audio projector output), and
+  // the PLE embed_tokens_per_layer lookup uses the DEVICE `ple_token_ids` [T] (mm
+  // rows masked to 0 + the vocab_size_per_layer_input range mask) —
+  // gemma4_mm.py:1962-1973 + gemma4.py get_per_layer_inputs/
+  // project_per_layer_inputs (:848-928). Both handles are BORROWED device views
+  // (ENG-MM-INPUT-PIPELINE P1, #1358/#2300); see MultiModalForwardInput. Positions
   // are Gemma-4's standard 1-D positions (NO MRoPE, NO DeepStack). Returns
   // [n_out, vocab] host f32 (n_out = |logits_indices|, 1 for the last row).
   static std::vector<float> ForwardMm(
-      const std::vector<uint16_t>& inputs_embeds_bf16,
-      const std::vector<int32_t>& ple_token_ids,
+      const vt::Tensor& inputs_embeds,
+      const vt::Tensor& ple_token_ids,
       const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,

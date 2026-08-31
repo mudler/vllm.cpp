@@ -330,9 +330,10 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
 }
 
-// `inputs_embeds_bf16`, when non-null, is the W4 MULTIMODAL entry: the caller has
+// `inputs_embeds`, when non-null, is the W4 MULTIMODAL entry: the caller has
 // already run `embed_input_ids` and masked-scattered the vision soft tokens, so the
-// hidden stream starts from those [T, H] bf16 rows and the embedding + weightless
+// hidden stream starts from those [T, H] bf16 DEVICE rows (a BORROWED view —
+// ENG-MM-INPUT-PIPELINE P1, #1358/#2300) and the embedding + weightless
 // `embed_norm` are SKIPPED — exactly the branch upstream's model forward takes on
 // `inputs_embeds is not None` (muse_glimmer.py:1311-1315). Null on every text step,
 // which leaves the text path byte-identical: the pointer only gates which of two
@@ -343,16 +344,16 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<PagedKvCache>& attn_kv,
                  const MuseGlimmerWeights& weights,
                  const std::vector<int32_t>& logits_indices,
-                 const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr) {
+                 const Tensor* inputs_embeds = nullptr) {
   const MuseGlimmerTextParams& t = weights.params.text;
-  const int64_t T = inputs_embeds_bf16 != nullptr
+  const int64_t T = inputs_embeds != nullptr
                         ? static_cast<int64_t>(positions.size())
                         : static_cast<int64_t>(token_ids.size());
   const int64_t H = t.hidden_size;
   const int64_t vocab = t.vocab_size;
   VT_CHECK(weights.text_loaded, kNoWeights);
-  VT_CHECK(inputs_embeds_bf16 == nullptr ||
-               static_cast<int64_t>(inputs_embeds_bf16->size()) == T * H,
+  VT_CHECK(inputs_embeds == nullptr ||
+               (inputs_embeds->data != nullptr && inputs_embeds->Numel() == T * H),
            "muse_glimmer mm forward: inputs_embeds must be [positions, hidden_size]");
   VT_CHECK(static_cast<int64_t>(positions.size()) == T,
            "muse_glimmer: positions length must match token_ids");
@@ -373,12 +374,16 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   // RMSNorm is scale-invariant, the two are not a constant apart — swapping them is
   // a different function, not a different constant.
   DBuf hidden(d, DType::kBF16, {T, H});
-  if (inputs_embeds_bf16 != nullptr) {
+  if (inputs_embeds != nullptr) {
     // The mm branch: the merged embeds ALREADY carry embed_norm on their text rows
     // and the un-normalized soft tokens on the placeholder rows. Re-applying
     // embed_norm here would re-normalize the vision features, which upstream never
-    // does (:1312-1313 assigns inputs_embeds straight through).
-    hidden = DBuf(d, DType::kBF16, {T, H}, inputs_embeds_bf16->data());
+    // does (:1312-1313 assigns inputs_embeds straight through). This is a D2D copy
+    // of the caller's BORROWED view rather than an alias: `RunLayer` replaces
+    // `hidden` on its last line today, so nothing writes the seed, but that
+    // invariant is stated nowhere and the runner will hand this seam a window into
+    // a buffer it reuses across steps (#2300).
+    d.b.Copy(d.q, hidden.ptr(), inputs_embeds->data, hidden.bytes());
   } else {
     Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
     DBuf dids(d, DType::kI32, {T}, token_ids.data());
@@ -490,7 +495,7 @@ ForwardLogits MuseGlimmerModel::ForwardDevice(
 }
 
 std::vector<float> MuseGlimmerModel::ForwardMm(
-    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const vt::Tensor& inputs_embeds,
     const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,
@@ -500,7 +505,7 @@ std::vector<float> MuseGlimmerModel::ForwardMm(
   // vector so the mm seam never dereferences it.
   const std::vector<int32_t> no_tokens;
   DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, attn_kv, weights,
-                             logits_indices, &inputs_embeds_bf16);
+                             logits_indices, &inputs_embeds);
   const int64_t n_out = dlogits.t().shape[0];
   std::vector<float> logits(static_cast<size_t>(n_out) * weights.params.text.vocab_size);
   dlogits.Download(d, logits.data());

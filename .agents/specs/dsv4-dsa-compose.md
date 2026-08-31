@@ -209,6 +209,28 @@ reference over the union of both key sets, with a non-zero sink, at a length
 where both passes are non-empty. A gate where either pass is empty cannot see a
 double-count.
 
+#### The composition primitive now exists, and the rule is executable
+
+`MergeWindowAndCompressed` in `src/vllm/model_executor/models/deepseek_v4_dsa.cpp`
+is that composition: it attends the compressed rows with NO sink, and merges
+against the window pass's output and LSE. The window pass carries the sink, so
+exactly one contributor seeds the denominator. `PagedCausalMlaAttention` grew an
+optional `out_lse` for this, because a merge needs both sides' LSEs.
+
+Two constraints are asserted rather than assumed. Every query sees EVERY
+compressed row -- a closed window is history, so no causal bound applies among
+them -- and `VT_CHECK(num_tokens == 1 || num_heads == 1)` holds the point where
+the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
+decode op emits `[T, H]`. A general prefill step needs a transpose there and
+does not get one yet; it is listed under `## Owed`.
+
+The gate this section demanded is `tests/vllm/models/test_deepseek_v4_paged_equiv.cpp`,
+"W1: two LSE-merged passes equal one pass over the union". Three mutations prove
+it discriminates: seeding the compressed pass with the same sink (the
+double-count itself), returning the window output unmerged, and bounding the
+compressed rows causally. Each was built before it was read -- a mutation that
+fails to compile leaves a stale binary reporting a pass.
+
 ## Our baseline
 
 What this tree has TODAY, so a later reader does not re-derive it:
@@ -343,6 +365,12 @@ failure mode this row is most exposed to.
 - The `43` vs `46` layer-count reconciliation, raised by #2186 and still open.
 - Promotion of `KERNEL-ATTN-DSA-SPARSE-INDEX` and `KERNEL-ATTN-DSA-COMPRESSOR`
   out of `SPIKE`.
+- The `[T, H]` to `[H, T]` LSE transpose `MergeWindowAndCompressed` refuses, so a
+  PREFILL step with more than one token and more than one head can compose. A
+  decode step is unaffected: it carries one token.
+- The `AttentionBlock` compressor arm itself. The primitive above is reached only
+  by its gate until that arm calls it, and the `compress_ratio == 128` refusal
+  stays in place until then.
 
 ## Stop conditions
 

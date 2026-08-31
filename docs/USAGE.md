@@ -777,7 +777,8 @@ row. What changed is the layer below it: the 82 IQ2_XS and 3 IQ4_XS tensors that
 had no CUDA keep-quant kernel now have one
 ([#2260](https://github.com/mudler/vllm.cpp/issues/2260)), so the expert GEMM no
 longer drains the stream to the host cores and the fused MoE seam no longer
-throws. That is a prerequisite for a CUDA arm of this model, not a CUDA arm.
+throws. That drain was measured on GB10 to SEGFAULT rather than merely run
+slowly, whenever the tensors came from the ordinary CUDA device allocator. That is a prerequisite for a CUDA arm of this model, not a CUDA arm.
 
 **Our own converter has still never been run** against the real 305.78 GiB
 checkpoint; that needs explicit developer authority for the download and a box

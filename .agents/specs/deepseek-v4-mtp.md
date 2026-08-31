@@ -175,15 +175,53 @@ measurement is **blocked on a re-conversion** that retains `blk.43.*`/nextn. `De
 returns false → the engine cleanly falls back to MTP-off (no crash, vLLM-parity behavior). The
 NVFP4 safetensors checkpoint DOES carry `mtp.*` but is 156.7 GiB (does not fit one GB10).
 
+**CORRECTION (2026-08-31) — THE SPEC AND THE LOADER DISAGREED, AND THE LOADER WAS RIGHT.**
+The blocker above is true of the two GGUFs and of the 156.7 GiB NVFP4 safetensors. It is
+NOT true of the checkpoint this project already has on the NAS, and
+`deepseek_v4_weights.cpp` has said so in a comment since 2026-08-24 while this section
+still read `BLOCKED`.
+
+`/mnt/nas_share/rc/ckpt/dsv4-flash-0731-spark-exl3` (100 GB, tp4 ranks) carries
+**THREE** MTP layers -- `mtp.{0,1,2}.*`, 3985 keys across
+`carried-00{3,4,5}.safetensors`, covering `mtp.L.attn.*`, `mtp.L.attn_norm.weight` and
+`mtp.L.ffn.experts.*`. Read from the safetensors headers, the three together are
+**8.62 GiB** (~2.87 GiB each): large because each is a full 256-expert MoE layer, but
+extractable without the other 91 GB.
+
+**They are NVFP4, not EXL3.** Measured dtypes over the `mtp.*` keys are 1944 `I8` +
+1969 `F8_E8M0` + 25 `F8_E4M3` + 20 `BF16` + 27 `F32`, e.g.
+`mtp.0.ffn.experts.0.w1.weight` `I8 [2048, 2048]` with `.scale` `F8_E8M0 [2048, 128]`.
+That is the config's `packed_e2m1_fp4_with_ue8m0_scales`: only the MAIN model was
+requantized to EXL3, and the MTP experts were left in NVFP4. A reader who assumed the
+head shares the main model's format would port the wrong dequantizer.
+
+Note also that this checkpoint carries three heads where §0 describes
+`num_nextn_predict_layers = 1`. Three is what makes a K5 draft possible upstream, so the
+count is a property of THIS artifact and not of the architecture as this spec described it.
+
+**Our loader already parses these keys and discards them deliberately**, matching
+`name.rfind("mtp.", 0) == 0` and counting `skipped_mtp_tensors`, which mirrors vLLM's
+`AutoWeightsLoader(skip_substrs=["mtp."])` (nvidia/model.py:1474). Upstream skips them in
+the MAIN loader precisely because a SEPARATE model owns them (`DeepSeekV4MTP`,
+registry.py:617) -- this spec's own R3.
+
+So **R1 is not blocked on a re-conversion.** It is an un-skip of tensors the loader
+already reads, plus an NVFP4 expert dequant path for the head, then R2 and R3. What
+remains genuinely unmeasured is stated as such: the checkpoint is tp4, and whether one
+GB10 holds the arm it belongs to has not been measured. 8.62 GiB is a byte count from the
+headers, not a residency figure.
+
 **ds4-vs-MTP note:** the antirez `ds4` oracle (16.5 tok/s) runs plain autoregressive decode — it
 does NOT use the MTP head. So MTP is a **BEAT-ds4 lever**: extra tokens/step our engine can do
 that the oracle does not, once a weight-carrying GGUF exists.
 
 ## 5. Named residuals (honest stopping point)
 
-- **R1 (weight-blocked):** re-convert a `deepseek4` GGUF retaining `blk.43.*` nextn tensors (or
-  run the NVFP4 safetensors on multi-Spark), then the real MTP-on==MTP-off gate +
-  acceptance/tok-per-step/wall-clock speedup. Cannot be done with the shipped files.
+- **R1 (NO LONGER weight-blocked; see the §4 correction):** the NAS EXL3 checkpoint carries
+  three `mtp.{0,1,2}.*` heads (8.62 GiB together, NVFP4 not EXL3) that our loader already
+  parses and skips, so this is an un-skip plus an NVFP4 expert dequant, not a re-conversion. Then the real MTP-on==MTP-off gate +
+  acceptance/tok-per-step/wall-clock speedup. Re-converting a GGUF retaining `blk.43.*`
+  remains an option for the GGUF arm specifically, not a precondition for the gate.
 - **R2:** the DS4-native propose/verify LOOP wired into the decode driver
   (`ForwardResidentDecodeGguf` / the decode graph): stash the target's pre-hc_head residual per
   step, run `DeepseekV4MtpDraftLogitsHost` for the k=1 draft, verify next step via
@@ -201,7 +239,8 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | Each nextn lever load-bearing | RED-first miswires (eh-lift / hc_head / hnorm change the logits) | PASS |
 | **Lossless self-spec** | DS4 draft + DS4 target verified by the SHARED `RejectionSampler` == pure target greedy (MTP-on == MTP-off), accept + reject cases | PASS |
 | No regression | `test_deepseek_v4_forward` 6/6, `test_deepseek_v4_gguf_load` 12/12 (the `ForwardComposeImpl` residual-capture out-param is inert when null) | PASS |
-| Real-model MTP-on==MTP-off + acceptance/speedup | 80.7 GB `ds4flash.gguf` on GB10 | **BLOCKED** — no nextn tensors in any shipped GGUF (§4) |
+| Real-model MTP-on==MTP-off + acceptance/speedup | 80.7 GB `ds4flash.gguf` on GB10 | **BLOCKED for the GGUF arm** — that file has no nextn tensors (§4) |
+| Real-model MTP-on==MTP-off + acceptance/speedup | NAS `dsv4-flash-0731-spark-exl3`, `mtp.{0,1,2}.*` un-skipped | **OPEN, not blocked** — three NVFP4 heads are present (§4 correction); needs R1 un-skip + NVFP4 expert dequant + R2/R3 |
 
 ## Dependencies
 

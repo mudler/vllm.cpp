@@ -221,7 +221,8 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
                                            int64_t num_heads, int64_t head_dim,
                                            int64_t kv_base, const std::vector<float>& sink,
                                            float scale, bool no_sink,
-                                           int64_t sliding_window) {
+                                           int64_t sliding_window,
+                                           std::vector<float>* out_lse) {
   VT_CHECK(num_tokens > 0 && num_heads > 0 && head_dim > 0,
            "PagedCausalMlaAttention: num_tokens/num_heads/head_dim must be > 0");
   VT_CHECK(static_cast<int64_t>(q.size()) == num_tokens * num_heads * head_dim,
@@ -271,8 +272,88 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
   if (sliding_window > 0)
     args.window_size =
         vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
-  vt::MlaDecodeAttention(queue, t_out, nullptr, t_q, kv_cache, t_bt, t_sl, args);
+  vt::Tensor t_lse;
+  if (out_lse != nullptr) {
+    out_lse->assign(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_heads), 0.0f);
+    t_lse = vt::Tensor::Contiguous(out_lse->data(), vt::DType::kF32, dev,
+                                   {num_tokens, num_heads});
+  }
+  vt::MlaDecodeAttention(queue, t_out, out_lse != nullptr ? &t_lse : nullptr, t_q, kv_cache,
+                         t_bt, t_sl, args);
   return out;
+}
+
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286). See the header for why no sink appears here.
+std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
+                                            const std::vector<float>& window_out,
+                                            const std::vector<float>& window_lse,
+                                            const std::vector<float>& q,
+                                            const std::vector<float>& comp_rows,
+                                            int64_t n_rows, int64_t num_tokens,
+                                            int64_t num_heads, int64_t head_dim,
+                                            float scale) {
+  VT_CHECK(n_rows > 0, "MergeWindowAndCompressed: no compressed rows");
+  VT_CHECK(static_cast<int64_t>(comp_rows.size()) == n_rows * head_dim,
+           "MergeWindowAndCompressed: comp_rows must be [n_rows, head_dim]");
+  const int64_t TH = num_tokens * num_heads;
+  VT_CHECK(static_cast<int64_t>(window_out.size()) == TH * head_dim,
+           "MergeWindowAndCompressed: window_out must be [T, num_heads, head_dim]");
+  VT_CHECK(static_cast<int64_t>(window_lse.size()) == TH,
+           "MergeWindowAndCompressed: window_lse must be [T * num_heads]");
+
+  // The compressed rows are their own paged cache: one block wide enough to hold
+  // them all, every row visible to every query.
+  const int64_t block_size = 16;
+  const int64_t num_blocks = (n_rows + block_size - 1) / block_size;
+  std::vector<float> cache(static_cast<size_t>(num_blocks * block_size * head_dim), 0.0f);
+  std::copy(comp_rows.begin(), comp_rows.end(), cache.begin());
+
+  const vt::Device dev = queue.device;
+  std::vector<int32_t> bt(static_cast<size_t>(num_tokens * num_blocks));
+  for (int64_t b = 0; b < num_tokens; ++b)
+    for (int64_t i = 0; i < num_blocks; ++i)
+      bt[static_cast<size_t>(b * num_blocks + i)] = static_cast<int32_t>(i);
+  // EVERY query sees EVERY compressed row: a closed window is history, so there
+  // is no causal bound to apply among them.
+  std::vector<int32_t> sl(static_cast<size_t>(num_tokens), static_cast<int32_t>(n_rows));
+  std::vector<float> comp_out(static_cast<size_t>(TH) * head_dim, 0.0f);
+  std::vector<float> comp_lse(static_cast<size_t>(TH), 0.0f);
+
+  vt::Tensor t_c = vt::Tensor::Contiguous(cache.data(), vt::DType::kF32, dev,
+                                          {num_blocks, block_size, head_dim});
+  vt::Tensor t_q = vt::Tensor::Contiguous(const_cast<float*>(q.data()), vt::DType::kF32, dev,
+                                          {num_tokens, num_heads, head_dim});
+  vt::Tensor t_bt = vt::Tensor::Contiguous(bt.data(), vt::DType::kI32, dev,
+                                           {num_tokens, num_blocks});
+  vt::Tensor t_sl = vt::Tensor::Contiguous(sl.data(), vt::DType::kI32, dev, {num_tokens});
+  vt::Tensor t_co = vt::Tensor::Contiguous(comp_out.data(), vt::DType::kF32, dev,
+                                           {num_tokens, num_heads, head_dim});
+  vt::Tensor t_cl = vt::Tensor::Contiguous(comp_lse.data(), vt::DType::kF32, dev,
+                                           {num_tokens, num_heads});
+  vt::MlaDecodeAttentionArgs args;
+  args.scale = scale;
+  // NO `attn_sink` — see the header. The window pass owns it.
+  vt::MlaDecodeAttention(queue, t_co, &t_cl, t_q, t_c, t_bt, t_sl, args);
+
+  std::vector<float> merged(static_cast<size_t>(TH) * head_dim, 0.0f);
+  vt::Tensor t_out = vt::Tensor::Contiguous(merged.data(), vt::DType::kF32, dev,
+                                            {num_tokens, num_heads, head_dim});
+  vt::Tensor t_wo = vt::Tensor::Contiguous(const_cast<float*>(window_out.data()),
+                                           vt::DType::kF32, dev,
+                                           {num_tokens, num_heads, head_dim});
+  // `MergeAttnStates` wants the LSEs as `[H, num_tokens]`; both buffers hold
+  // `T * H` contiguous f32, so this is a reshape rather than a transpose only
+  // because a decode step carries one token per row -- asserted, not assumed.
+  VT_CHECK(num_tokens == 1 || num_heads == 1,
+           "MergeWindowAndCompressed: the LSE layouts coincide only when T or H is "
+           "1; a general step needs a transpose here");
+  vt::Tensor t_wl = vt::Tensor::Contiguous(const_cast<float*>(window_lse.data()),
+                                           vt::DType::kF32, dev, {num_heads, num_tokens});
+  vt::Tensor t_cl2 = vt::Tensor::Contiguous(comp_lse.data(), vt::DType::kF32, dev,
+                                            {num_heads, num_tokens});
+  vt::MergeAttnStates(queue, t_out, nullptr, t_wo, t_wl, t_co, t_cl2, -1);
+  return merged;
 }
 
 }  // namespace vllm::deepseek_v4

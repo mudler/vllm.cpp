@@ -10,8 +10,10 @@ the CUDA half of the `QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS` rows of
 
 ## Now
 
-`ACTIVE`. The CPU arm of both encodings landed with #2247; this row is the
-device arm of the same two `vec_dot`s.
+`DONE`. The CPU arm of both encodings landed with #2247; this row is the device
+arm of the same two `vec_dot`s, and it is measured green on `dgx:gpu0` (GB10,
+`sm_121a`): 17 of 17 cases, 177,284 of 177,284 assertions, both reachability
+mutations killed and the restore proven. See `## Outcome`.
 
 ## The gap, as measured on `673464ee1`
 
@@ -26,8 +28,8 @@ exists:
 
 | Seam | Today, for these two dtypes |
 |---|---|
-| `MatmulBTQuantKernelCuda` | `cudaStreamSynchronize`, then the CPU kernel over the same unified tensors. Correct numbers, host speed, and **not capturable** — the sync invalidates a decode graph. |
-| `MatmulBTQuantGroupedKernelCuda` | the same drain-and-fall-back. |
+| `MatmulBTQuantKernelCuda` | `cudaStreamSynchronize`, then the CPU kernel over the same tensors. **MEASURED on GB10: this SEGFAULTS** when the tensors came from `vt::Backend::Alloc`, which is a plain `cudaMalloc` and is not host-addressable. Where the memory *is* host-accessible it is instead correct, host-speed and **not capturable** — the sync invalidates a decode graph. |
+| `MatmulBTQuantGroupedKernelCuda` | the same drain-and-fall-back, with the same two outcomes. |
 | `MoeGateUpSwiGLUGroupedCuda` | **throws** `gate/up must be the SAME CUDA keep-quant dtype`. There is no fallback behind that seam. |
 
 `gguf_keep_quant.cpp::DeviceKeepQuantSupported` returns `true` for every dtype
@@ -198,6 +200,202 @@ standing is not a correction.
 
 ## Evidence
 
+### The device gate, on `dgx:gpu0` (GB10, `sm_121a`) -- FINAL, attempt 3
+
+**Which box.** `rc-worker-4b8lj` under an `rc` lease on `dgx:gpu0`:
+`NVIDIA GB10, GPU-cb5c11ff-4ea1-5472-a9a6-c7a468a4d9f1`, driver `580.173.02`,
+aarch64, 20 cores, `nvcc` release 13.0 V13.0.88, built
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`. 2026-08-31T07:20:29Z to 07:45:54Z.
+**No number here transfers to `thor:gpu0`**, which is `sm_110`.
+
+Arch proof, with its denominator: **37 `.cu.o` objects scanned, 37 `sm_121a`
+cubins and nothing else.**
+
+| Leg | commit | build | test rc | cases | assertions |
+|---|---|---|---|---|---|
+| RED | `52daeecea` | 0 | **139 (SIGSEGV)** | 0 passed, **1 failed**, 14 skipped | 66000 |
+| GREEN | `0d595d2b6` | 0 | **0** | **17 passed, 0 failed** | **177284, 0 failed** |
+| MUT_A fused switch | +mutation | 0 | **1** | 15 passed, **2 failed** | 177047 |
+| MUT_B dense switch | +mutation | 0 | **1** | 13 passed, **4 failed** | **71589** |
+| RESTORED | `0d595d2b6` | 0 | **0** | **17 passed, 0 failed** | **177284, 0 failed** |
+
+**RED -> GREEN is measured, not asserted.** The RED commit carries the tests and
+no kernels; it builds clean and its very first case takes the CPU-fallback path
+and SIGSEGVs, aborting the run at 1 failed and 14 skipped. The same tests at the
+implementation head pass 17 of 17 cases and 177,284 of 177,284 assertions,
+including the bit-for-bit comparison against llama.cpp `b10451`'s own `vec_dot`
+output on real GLM-5.3-Flash bytes, the stream-capture case, and the
+real-GGUF-header chain. The RED reproduced identically across two independent
+leases.
+
+**Both reachability mutations killed, with distinct kill counts.** Deleting the
+two `case` labels from the FUSED MoE switch fails 2 cases; deleting them from
+the DENSE switch fails 4 and collapses the assertion count from 177,284 to
+71,589. Two switches, two separate deletions, two separate kills -- one deletion
+would have proved only the site it deleted. Note what kills them: the surviving
+`default:` arm THROWS by name, so doctest records failed CASES with no failed
+assertions, which is why the case count and not the assertion count is the
+signal. That is a stronger kill than a compile error, which is why the mutation
+removes a `case` and leaves the file compiling.
+
+**The restore is proven, not assumed.** Each mutation was reverted, sha256'd
+against the pre-mutation hash, and REBUILT before being re-run -- a restored
+source with a stale binary has read red on a sibling row. RESTORED reproduces
+GREEN exactly: 17 cases, 177,284 assertions, 0 failed.
+
+**Sibling suites on the same box:** `test_ops_quant_dot` 249323/0 failed,
+`test_gguf_dequant` 7400/0 failed, `test_ops_quant_traits` 6210/0 failed,
+`test_gguf_keep_quant` **9 failed of 6470** -- BASE-CAUSED, see below.
+
+**The three gates `agent-preflight.sh` skips for want of a build all PASS here**
+on real data: `check-cuda-fat-gencode` 0, `check-cpu-isa-build` 0,
+`check-arm-isa-build` 0 -- the last being asked its real question, since this box
+is aarch64.
+
+### Attempt 2 is what found the two defects, and it is kept
+
+The run before the one above was GREEN-but-for-5-assertions (15 of 17 cases) and
+its RED leg segfaulted. Those two results are what produced the FMA finding and
+the fallback-segfault correction recorded below; the table above is the rerun
+after both were fixed. Its log is at `/workspace/cudaiq2260/out-attempt2-fma/`
+and attempt 1's staging failure at `/workspace/cudaiq2260/out-attempt1-clone-bug/`.
+Three leases were spent on this row: one on a staging bug, one that found two
+real defects, one green.
+
+### The device gate, on `dgx:gpu0` (GB10, `sm_121a`) -- attempt 2, superseded
+
+Same box, 2026-08-31T02:59:21Z to 03:24:55Z, same 37/37 `sm_121a` cubins.
+
+| Leg | commit | build | test | cases | assertions |
+|---|---|---|---|---|---|
+| RED | `52daeecea` | 0 | **139 (SIGSEGV)** | 0 passed, 1 failed, 14 skipped | 66000, 0 failed |
+| GREEN | `2c5dec2e4` | 0 | 1 | 15 passed, **2 failed** | 177284, **5 failed** |
+| MUT_A fused switch | +mutation | 0 | **1** | 13 passed, **4 failed** | 177047, 5 failed |
+| MUT_B dense switch | +mutation | 0 | **1** | 13 passed, **4 failed** | **71589**, 0 failed |
+| RESTORED | `2c5dec2e4` | 0 | 1 | 15 passed, 2 failed | 177284, 5 failed |
+
+**Reachability mutations: both killed, kill count 2 cases each.** GREEN fails 2
+cases (the IQ4_XS rounding, below). Deleting the two `case` labels from the
+FUSED MoE switch takes that to 4; deleting them from the DENSE switch also takes
+it to 4, and drops the assertion count from 177284 to **71589**, because the
+`default:` arm throws by name and aborts the cases mid-run rather than letting
+them finish wrong. Two switches, two separate deletions, two separate kills --
+one deletion would have proved only the site it deleted. Each restore was
+verified byte-identical by sha256 AND rebuilt before being believed, and
+RESTORED reproduces GREEN's counts exactly (177284 / 5 / 15), which is what shows
+the restore was real and not a stale binary.
+
+**Sibling suites on the same box:** `test_ops_quant_dot` 249323 assertions, 0
+failed; `test_gguf_dequant` 0 failed; `test_ops_quant_traits` 7400, 0 failed;
+`test_gguf_keep_quant` **9 failed of 6470** -- BASE-CAUSED, see below.
+
+**The three gates `agent-preflight.sh` skips for want of a build all PASS here**
+on real data: `check-cuda-fat-gencode` 0, `check-cpu-isa-build` 0,
+`check-arm-isa-build` 0 -- the last of those being asked its real question,
+since this box is aarch64.
+
+### `test_gguf_keep_quant`'s 9 failures are the CUDA PLATFORM, not this change
+
+All nine are the same assertion shape:
+`RouteGgufTensor(..., GgufTensorRole::kEmbeddingTable, ...) == kKeepQuant`
+returning `kExpandBf16`. The gather arm's device gate is
+`DeviceQuantGatherSupported(dev) { return dev == vt::DeviceType::kCPU; }`, and
+`RouteGgufTensor` reads `CurrentPlatform().device_type()` -- which on a CUDA
+build running on GB10 is `kCUDA`. The suite encodes the CPU platform's answer.
+
+This row changes neither file: `git diff` over
+`gguf_keep_quant.cpp` and `test_gguf_keep_quant.cpp` between the merged `main`
+and this head is EMPTY. It is a pre-existing property of running that suite on a
+CUDA build, and it is reported rather than repaired because the repair is a
+decision about that suite's platform assumptions, not a kernel port's.
+
+### The RED leg SEGFAULTED, and that corrects a claim this spec made
+
+The RED commit crashed with `SIGSEGV` in the FIRST case rather than failing the
+fused-MoE assertion this row predicted. The reason matters more than the
+prediction: `vt::Backend::Alloc` on CUDA is a plain `cudaMalloc`
+(`cuda_backend.cu:104-107`), so its pointers are **not host-addressable**, and
+`MatmulBTQuantKernelCuda`'s fallback -- `cudaStreamSynchronize` then the CPU
+keep-quant kernel over the same tensors -- dereferences device memory on the
+host.
+
+**So "an absent dtype falls back to the CPU and returns correct tokens at host
+speed" is not what happens for device-allocated tensors. It crashes.** This spec
+and this row's earlier commit messages asserted the slow-but-correct story, and
+that story was read off the source comment at
+`cuda_quant_dot.cu` ("over the SAME unified-memory tensors"), never measured. It
+holds only when the caller's memory really is host-accessible; GB10 has unified
+physical memory, which is not the same thing as a `cudaMalloc` pointer being
+host-mapped.
+
+**What is NOT established, and is not claimed:** what the production loader
+allocates for a kept-quant weight. If it is managed memory the production
+fallback works and is merely slow; if it is `cudaMalloc` it crashes. This row
+did not trace it, so it says so instead of guessing, and the correction is
+limited to what was measured. Either way it strengthens rather than weakens the
+case for #2260, and it is the same shape as the extraction lesson below: a
+confident reading of a comment, standing in for a measurement.
+
+### The host pre-check below CANNOT SEE A MISSING DECLARATION, and it did not
+
+**Read this before the evidence that follows it, because it bounds all of it.**
+The host harness described next reproduced the pinned oracle bit-exactly on all
+eight real checkpoint blocks, and the kernels it validated **did not compile for
+a device**. The first `sm_121a` build of them failed with four errors:
+
+```text
+cuda_quant_dot.cu(482): error: identifier "BlockIQ2_XS" is undefined
+cuda_quant_dot.cu(535): error: identifier "BlockIQ4_XS" is undefined
+cuda_quant_dot.cu(870): error: identifier "BlockIQ2_XS" is undefined
+cuda_quant_dot.cu(874): error: identifier "BlockIQ4_XS" is undefined
+```
+
+The anonymous namespace's `using vt::cpu::...` list named seven sibling block
+types and neither of these two. The structs existed the whole time
+(`cpu_quant_blocks.h:191` and `:205`); only the declarations bringing them into
+scope were missing. Fixed on `main` by `8846e3c4b`, merged here.
+
+**Why the harness was structurally incapable of catching it.** It EXTRACTS the
+two `__device__` functions by line range and compiles them in a translation unit
+it writes itself -- one that does `using namespace vt::cpu;` and therefore has
+every block type already in scope. It compiles the ARITHMETIC out of its file
+and can never compile the FILE. So it can see a wrong grid index, a swapped
+scale nibble or a mis-shifted bit pair, and it cannot see a name that the real
+translation unit does not have. **An extraction is not a build**, and the
+distinction is invisible while the extraction is passing.
+
+That is this repository's recurring shape -- an instrument that returns a
+confident, well-formed answer to a question nobody checked it was asking
+([`verification.md`](../verification.md)) -- in the specific form a CUDA port
+written on a box with no `nvcc` will keep producing, because extraction is the
+only host-side check available. **Anyone doing that again should assume their
+harness is blind to scope, includes, qualifiers and linkage, and say so beside
+the result** rather than letting a bit-exact number imply more than it measured.
+
+Nothing about the arithmetic evidence below is retracted: the same functions,
+unchanged, are the ones `8846e3c4b` made compile. What is retracted is any
+reading of it as "these kernels work", which it was never able to support.
+
+**A check that CAN see this class, and its red-before.** The defect is one
+set-difference away from visible -- the `Block*` types a `.cu` names against the
+ones it declares or qualifies:
+
+```sh
+python3 - <<'EOF'
+import re
+s = open("src/vt/cuda/cuda_quant_dot.cu").read()
+have = {m.group(1) for m in re.finditer(r'^using vt::cpu::(Block\w+);', s, re.M)} | \
+       {m.group(1) for m in re.finditer(r'vt::cpu::(Block\w+)', s)}
+print(sorted({m.group(1) for m in re.finditer(r'\b(Block[A-Z]\w*)\b', s)} - have))
+EOF
+```
+
+At `6e06e4640` it prints `['BlockIQ2_XS', 'BlockIQ4_XS']`; at `2c5dec2e4` it
+prints `[]`. That is a red-before and a green-after on the exact defect, taking
+under a second on a box with no CUDA toolkit at all. It is listed under `## Owed`
+rather than landed here, because a new checker needs its own spec, registration
+and gate, and this row is a kernel port.
+
 ### Host pre-check of the ported math, before any lease was spent
 
 `nvcc` is not on the x86 development box, so a bad port would otherwise have
@@ -231,6 +429,34 @@ the rest. It also confirmed the k=1024 design decision: the warp tree's order
 and the oracle's sequential order differ by ONE ULP on both encodings, so
 asserting bit equality against the oracle's total would have been red on the
 device for a reason that is not a defect.
+
+### A one-ref bundle has no HEAD, so `git clone` of it checks out nothing
+
+Attempt 1 reached `dgx:gpu0` at 2026-08-31T00:12:03Z as `rc-worker-4b8lj` and
+died 14 seconds later, after the CUDA toolkit had already installed:
+
+```text
+warning: remote HEAD refers to nonexistent ref, unable to checkout
+FATAL: clone produced no CMakeLists.txt
+```
+
+`git bundle create <file> <one-branch>` writes that branch and no `HEAD`, so
+`git clone <bundle>` succeeds, warns once, and leaves an EMPTY working tree.
+Everything before it had passed -- the mount guard read the bundle's sha256 off
+the share, `nvcc` reported `release 13.0, V13.0.88`, and `nvidia-smi` reported
+`NVIDIA GB10, GPU-cb5c11ff-...`, driver 580.173.02, 20 cores -- so the failure
+was purely staging. The fix is `git clone --branch <branch> <bundle>`, plus a
+`rev-parse --verify` of BOTH pinned SHAs before any build is spent on either.
+
+**The script's own strictness is what made this cheap rather than confusing.**
+The `test -f CMakeLists.txt` guard fired immediately and named the step, instead
+of letting `cmake -S` fail later with a message about a missing project. The
+fix was verified by cloning the same bundle locally, checking out both SHAs, and
+counting `kIQ2_XS|kIQ4_XS` in `cuda_quant_dot.cu`: **0 at the RED commit and 19
+at the GREEN one**, which is the same precondition the job greps on the box.
+
+Attempt 1's log is kept at `/workspace/cudaiq2260/out-attempt1-clone-bug/`
+rather than deleted.
 
 ### The instrument's own precondition, checked before it was trusted
 
@@ -274,7 +500,7 @@ Both sit under the shared band with room, so **neither dtype takes a per-case
 ceiling and none was added**. Had either come out over, the answer would have
 been `NEEDS_DECISION`, not a wider band.
 
-### `land/glm53-flash-and-dsa` and `main` conflict, and this row inherits it
+### `land/glm53-flash-and-dsa` conflicted with `main` -- RETIRED by `8846e3c4b`
 
 This row was briefed to merge the landing branch so that a GLM-5.3 end-to-end
 check would be possible. That merge was clean. Merging `origin/main` on top of
@@ -297,27 +523,32 @@ between `origin/land/glm53-flash-and-dsa` and `origin/main`, with NONE of this
 row's commits present, reports the identical single conflict on the identical
 file. Whoever lands the landing branch reconciles it.
 
-The consequence for this row is bounded and named: this branch stays on
-`1d1321095` plus the landing branch, so `agent-preflight.sh` skips
-`commit-trailers` and `commit-style` with "origin/main is not an ancestor of
-HEAD". Both were therefore run BY HAND against this branch's real merge base
-and both report OK, so the two gates have answers rather than silence.
+**RETIRED, and kept here because it is why this branch looked behind for
+several hours.** `main` at `8846e3c4b` now CONTAINS `land/glm53-flash-and-dsa`,
+so whoever landed it reconciled the two narrowings, and merging `origin/main`
+into this row is clean. While it stood, this branch could not take `main`, so
+`agent-preflight.sh` skipped `commit-trailers` and `commit-style` with
+"origin/main is not an ancestor of HEAD" and both were run BY HAND against the
+real merge base instead of left silent. Against the merged tree all three now
+run normally and report OK.
 
-### `check-pr-size.py` is red on this branch and it is BASE-CAUSED
+### `check-pr-size.py` was red on this branch, base-caused -- also RETIRED
 
 ```text
 ERROR: PR size check could not classify the change:
        unclassified repository path '.agents/scripts/glm53-dsa-first-load.sh'
 ```
 
-Measured both ways. Against this row's own four commits
-(`673464ee1..HEAD`) the checker reports `OK: every explicit path class is
-within its review budget`. Against `origin/main..origin/land/glm53-flash-and-dsa`
-alone, with none of this row's commits present, it reports the identical error.
-The unclassified path is `land/glm53-flash-and-dsa`'s, added by `fe2117c63`, and
-that branch cannot pass this gate today whoever merges it. Reported rather than
-repaired: the fix is a path class in another row's change, and adding one here
-would put a checker edit into a kernel port.
+Measured both ways at the time. Against this row's own commits the checker
+reported `OK: every explicit path class is within its review budget`. Against
+`origin/main..origin/land/glm53-flash-and-dsa` alone, with none of this row's
+commits present, it reported the identical error. The unclassified path was
+`land/glm53-flash-and-dsa`'s, added by `fe2117c63`.
+
+**Also RETIRED by the same merge.** Against `main` at `8846e3c4b` the checker
+reports `OK` for this branch. Both entries are kept rather than deleted because
+each was a real red that had to be attributed before it could be dismissed, and
+"it went away" is a different claim from "it was never ours".
 
 The generated `d_iq2xs_grid` was checked a second way, independently of the
 device seal: its 512 entries serialized little-endian FNV-1a-64 to
@@ -339,6 +570,51 @@ and `test_ops_quant_dot` re-derives.
 device parity not measured in the same tool. `NEEDS_CONTEXT` if the staged
 artifact is absent from the leased worker.
 
+## Outcome
+
+**What was measured.** `IQ2_XS` and `IQ4_XS` run on `dgx:gpu0` (GB10,
+`sm_121a`) through all three CUDA keep-quant dispatch seams, reproducing
+llama.cpp `b10451`'s own `vec_dot` output BIT FOR BIT on real GLM-5.3-Flash
+super-blocks, inside a stream capture, and reached from a real GGUF header
+through the production reader and residency decision. 17 of 17 cases, 177,284 of
+177,284 assertions, both reachability mutations killed, restore proven by hash
+and rebuild. The GB10 job's own summary line reports every expectation met.
+
+**What was rejected, and why.**
+
+- *A tolerance on the IQ4_XS oracle comparison.* The device disagreed by 1 and 4
+  ULP and the obvious move was to bound it. That would have permanently hidden
+  the actual defect, which was nvcc contracting the accumulation into an FMA and
+  thereby computing a different association from upstream's. The cause was
+  identified on the host instead (simulating FMA reproduces the device's bits
+  exactly) and fixed with `__fadd_rn`/`__fmul_rn`. **The gate that would have
+  been widened is the one that found the bug.**
+- *`-fmad=false` on the translation unit.* It would have fixed IQ4_XS and
+  silently moved the numerics of ten other encodings that nobody measured.
+  Scoped intrinsics keep the change to the kernel that needed it.
+- *Hoisting IQ4_XS's eight f32 accumulation steps into one integer core.* A
+  faster kernel computing a different number.
+- *Narrowing `DeviceKeepQuantSupported` to the CUDA kernel list.* It would push
+  Q4_0, IQ4_NL and MXFP4 back to `expand_bf16` on CUDA -- a residency regression
+  on shipped models, and no part of #2260.
+- *Repairing `test_gguf_keep_quant`'s 9 CUDA-platform failures.* Base-caused, and
+  the repair is a decision about that suite's platform assumptions.
+
+**Why each default has its value.** `d_iq2xs_grid` is a `__device__` global
+because warp lanes read different rows and `__constant__` serialises a divergent
+read -- the measured reason its two siblings are; `d_kvalues_iq4nl` stays
+`__constant__` at 16 bytes. `FinalFactor<kIQ2_XS>` is `0.125` because the IQ2
+codebooks store lanes at a fixed 8x magnitude, and `kIQ4_XS` takes the `1.0`
+default because its per-sub-block delta is already folded in as `d * (ls - 32)`.
+Neither dtype takes a per-case NMSE ceiling: both were measured under the shared
+5e-4 band (1.6e-4 and 6.0e-5) rather than assumed to need one.
+
+**Three leases, and what each bought.** One died on a staging bug (a one-ref
+bundle has no HEAD). One found both real defects. One is the green above. The
+two defects are the outcome that matters: a device build is the only instrument
+that could see either, and both were invisible to a host check that had already
+reproduced the oracle bit-exactly on all eight blocks.
+
 ## Owed
 
 - **These two dispatch arms are landed but not yet SELECTED by any running
@@ -354,6 +630,13 @@ artifact is absent from the leased worker.
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and the campaign
   that tracks it is [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
   The reachability mutation below therefore proves the SEAM, not a model step.
+- **A checker for the defect class that reached `main` from this row**: the
+  `Block*` types a CUDA translation unit names, minus the ones it declares or
+  qualifies, must be empty. The red-before and green-after are recorded above
+  (`['BlockIQ2_XS', 'BlockIQ4_XS']` at `6e06e4640`, `[]` at `2c5dec2e4`), it
+  needs no CUDA toolkit, and it closes the one gap every host-side check of a
+  CUDA port has. Owed here rather than landed because a new checker needs its own
+  spec, preflight registration and gate.
 - The ROCm arm of both encodings. `rocm-gg-keep-quant.md` owns it and already
   records `IQ2_*` / `IQ3_*` as owed; this row does not touch
   `src/vt/rocm/rocm_grouped_gemm.hip`.

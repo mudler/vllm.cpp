@@ -189,6 +189,39 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
                                            // with `extra_k_cache=None`), so a
                                            // full-context read of such a layer
                                            // diverges above the window.
-                                           int64_t sliding_window = 0);
+                                           int64_t sliding_window = 0,
+                                           // MODEL-DSV4-DSA-COMPOSE W1 (#2286):
+                                           // the per-(token,head) log-sum-exp,
+                                           // `[num_tokens * num_heads]`. Needed
+                                           // only to MERGE this pass with another
+                                           // over a disjoint key set; null
+                                           // otherwise and then never computed.
+                                           std::vector<float>* out_lse = nullptr);
+
+
+// `MODEL-DSV4-DSA-COMPOSE` W1 (#2286) — merge a window pass with a COMPRESSED-HISTORY
+// pass, the way upstream's single fused two-cache kernel does it in one call.
+//
+// `window_out`/`window_lse` are an already-computed sliding-window pass INCLUDING
+// the per-head sink. This attends `comp_rows` (`[n_rows, head_dim]` compressed
+// latents), then merges the two states by their log-sum-exps.
+//
+// THE SINK IS DELIBERATELY ABSENT FROM THIS PASS. `vt::MergeAttnStates` combines
+// by LSE, each `log sum exp(scores)`, so a sink seeded into BOTH passes lands in
+// the merged denominator TWICE and yields a plausible, slightly-too-small result
+// that no token gate would catch. It belongs to exactly one contributor, and the
+// window pass already carries it.
+//
+// Every compressed row is visible to every query -- a closed window is history,
+// not a windowed neighbour -- so this pass takes no window and no causal bound
+// beyond the rows that exist.
+std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
+                                            const std::vector<float>& window_out,
+                                            const std::vector<float>& window_lse,
+                                            const std::vector<float>& q,
+                                            const std::vector<float>& comp_rows,
+                                            int64_t n_rows, int64_t num_tokens,
+                                            int64_t num_heads, int64_t head_dim,
+                                            float scale);
 
 }  // namespace vllm::deepseek_v4

@@ -167,6 +167,21 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{32, 17, 39, "mxfp4"};
       return &g;
     }
+    case DType::kTQ2_0: {
+      // block_tq2_0 (llama.cpp PR #25850): u8 qs[64] + f16 d = 64 + 2 = 66,
+      // QK = 256. ggml type id 42 (killgate fork extension after Q1_0 = 41).
+      // 2-bit ternary codes: element e = j*4 + l*32 + k (j in {0,32},
+      // l in 0..3, k in 0..31) reads byte qs[j+k], value ((qs[j+k]>>(l*2))&3)-1.
+      static constexpr BlockGeometry g{256, 66, 42, "tq2_0"};
+      return &g;
+    }
+    case DType::kTQ1_0: {
+      // block_tq1_0: u8 qs[48] + u8 qh[4] + f16 d = 48 + 4 + 2 = 54,
+      // QK = 256. ggml type id 43. Packed base-3 trits: q = byte * pow3[l]
+      // (uint8 wrap); xi = (q * 3) >> 8; w = (xi - 1) * d, giving {-1, 0, +1}.
+      static constexpr BlockGeometry g{256, 54, 43, "tq1_0"};
+      return &g;
+    }
     case DType::kF32:
     case DType::kF16:
     case DType::kBF16:
@@ -202,7 +217,8 @@ bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
       DType::kQ4_K, DType::kQ5_K,  DType::kQ6_K,     DType::kQ8_K,
       DType::kIQ2_XXS, DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4,
       DType::kIQ1_S, DType::kIQ1_XXXS, DType::kIQ4_NL,
-      DType::kIQ2_XS, DType::kIQ4_XS, DType::kIQ3_S};
+      DType::kIQ2_XS, DType::kIQ4_XS, DType::kIQ3_S,
+      DType::kTQ2_0, DType::kTQ1_0};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -265,6 +281,8 @@ const char* Name(DType dtype) {
     case DType::kIQ2_XS: return "iq2_xs";
     case DType::kIQ4_XS: return "iq4_xs";
     case DType::kIQ3_S: return "iq3_s";
+    case DType::kTQ2_0: return "tq2_0";
+    case DType::kTQ1_0: return "tq1_0";
   }
   return "?";
 }

@@ -332,6 +332,53 @@ TEST_CASE("the decode-only class is Q8_K and IQ3_S: exactly one FILE type expand
   }
 }
 
+// TQ2_0/TQ1_0 are Vulkan-native ternary keep-quant encodings. They have block
+// geometry + a to_float dequantizer (CPU reference oracle) + a QuantTraits row
+// (vec_dot_type = kQ8_K), but NO CPU vec_dot — the keep-quant dot is
+// Vulkan-only. HasQuantDotKernel is therefore FALSE, and the CPU
+// MatmulBTQuantKernel takes the dequant-composite path. The GGUF reader does
+// not yet carry ids 42/43, so they are NOT in kBlockCases (which cross-checks
+// against GgmlTraits).
+TEST_CASE("TQ2_0/TQ1_0 ternary block dtypes (geometry + dequant, no CPU vec_dot)") {
+  struct TQCase {
+    vt::DType dtype;
+    uint32_t ggml_type;
+    int64_t block_elems;
+    int64_t block_bytes;
+    vt::DType vec_dot_type;
+    const char* name;
+  };
+  const TQCase cases[] = {
+      {vt::DType::kTQ2_0, 42, 256, 66, vt::DType::kQ8_K, "tq2_0"},
+      {vt::DType::kTQ1_0, 43, 256, 54, vt::DType::kQ8_K, "tq1_0"},
+  };
+  for (const TQCase& c : cases) {
+    CAPTURE(c.name);
+    CHECK(vt::IsBlockQuant(c.dtype));
+    CHECK(vt::BlockElems(c.dtype) == c.block_elems);
+    CHECK(vt::BlockBytes(c.dtype) == c.block_bytes);
+    CHECK(vt::GgmlTypeId(c.dtype) == c.ggml_type);
+    CHECK(std::string(vt::Name(c.dtype)) == c.name);
+    CHECK_THROWS(vt::SizeOf(c.dtype));
+    CHECK(vt::RowSizeBytes(c.dtype, c.block_elems) ==
+          static_cast<size_t>(c.block_bytes));
+    // The ggml type id round-trips back to the same vt dtype.
+    vt::DType back = vt::DType::kF32;
+    REQUIRE(vt::BlockDTypeFromGgmlTypeId(c.ggml_type, &back));
+    CHECK(back == c.dtype);
+    // Has a to_float dequantizer (CPU reference oracle for Vulkan tests).
+    CHECK(vt::cpu::BlockToFloat(c.dtype) != nullptr);
+    // Has a QuantTraits row with vec_dot_type = kQ8_K...
+    const vt::cpu::QuantTypeTraits& t = vt::cpu::QuantTraits(c.dtype);
+    CHECK(t.vec_dot_type == c.vec_dot_type);
+    // ...but NO vec_dot (Vulkan-only), so HasQuantDotKernel is FALSE.
+    CHECK(t.vec_dot == nullptr);
+    CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
+    // Nothing quantizes an activation INTO them (weight-only encodings).
+    CHECK(vt::cpu::BlockFromFloat(c.dtype) == nullptr);
+  }
+}
+
 TEST_CASE("elementwise dtypes are not block-quantized and reject block queries") {
   for (vt::DType d : {vt::DType::kF32, vt::DType::kF16, vt::DType::kBF16,
                       vt::DType::kI8, vt::DType::kI32, vt::DType::kI64}) {

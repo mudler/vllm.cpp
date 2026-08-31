@@ -148,6 +148,20 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kMXFP4, DType::kQ8_0);
       return &t;
     }
+    // TQ2_0/TQ1_0 (Vulkan-native ternary keep-quant): 256-element blocks dotted
+    // against Q8_K activations. No CPU vec_dot — the keep-quant dot is
+    // Vulkan-only. The CPU path uses the dequant-composite fallback
+    // (BlockToFloat -> f32 matmul), which is the reference oracle the Vulkan
+    // tests compare against. HasQuantDotKernel returns false because vec_dot
+    // is nullptr, so MatmulBTQuantKernel takes the to_float branch.
+    case DType::kTQ2_0: {
+      static const QuantTypeTraits t = MakeTraits(DType::kTQ2_0, DType::kQ8_K);
+      return &t;
+    }
+    case DType::kTQ1_0: {
+      static const QuantTypeTraits t = MakeTraits(DType::kTQ1_0, DType::kQ8_K);
+      return &t;
+    }
     default:
       return nullptr;
   }

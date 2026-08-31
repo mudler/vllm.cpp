@@ -464,6 +464,35 @@ The other three sibling suites were clean on the same CUDA build:
 `test_cuda_quant_dot` 17 of 17, `test_ops_embedding_quant` 6 of 6,
 `test_ops_quant_dot` 32 of 32.
 
+## Provenance of the GPU evidence, re-checked at the moment of merge
+
+The gated SHA is `aeaf7089a` (thor job `28bfb44b`). At each merge since, the
+question is whether anything the GPU measured has moved. Run WIDE, over all of
+`src/ include/ tests/`, not over a hand-listed path set — the narrow list this
+row was given omits `models/qwen4_exp_weights.cpp`, which this row edits, and
+`models/qwen3_5_gguf_weights.cpp`, which main edits.
+
+As of the merge of `e4aa7c527`, `git diff aeaf7089a HEAD` over that whole tree
+touches 14 source files, and exactly two matter here:
+
+- **`qwen4_exp_weights.cpp` — mine.** The refusal STRING changed (it no longer
+  offers `--device cuda` as a remedy, because that device now loads and then dies
+  at a forward this model has no CUDA arm for). `test_qwen4_exp_gguf_weights`
+  asserts on message CONTENT, and its GPU verdict was measured against the
+  PREVIOUS string. The assertions it makes — that the message names the tensor,
+  the device and the word "gather" — hold on both, and the suite is green locally
+  after the change, but the GPU reading of that one suite predates this wording.
+  Stated rather than glossed.
+- **`qwen3_5_gguf_weights.cpp` — main's.** It gained a `prefault` parameter on
+  `OwnGgufQuantBlocks`/`OwnGgufF16`. That is a signature change and NOT a
+  residency change: the `kEmbeddingTable` route the reviewer identified as this
+  row's second consumer is intact, so shipped `qwen35` GGUFs still take the CUDA
+  gather residency. Its line moved `:786` -> `:793`, which is the ordinary reason
+  to cite a SYMBOL rather than a line.
+
+Nothing else in that delta reaches `src/vt/`, the residency policy, the op table
+or either gated test, so the thor head result still describes this tree.
+
 ## Landing order with #2397, and the one line that is in NEITHER pull request
 
 [#2397](https://github.com/mudler/vllm.cpp/pull/2397)

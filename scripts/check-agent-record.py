@@ -800,7 +800,12 @@ ENGINE_PREFIXES = (
 # lanes, and nothing owned whether anything compiles before the push at all.
 # `ACTIVE`, spec `specs/preflight-compiles.md`. Bumped for a real new row, never
 # to make a failing state transition pass.
-ENGINE_ROWS = 174
+# +4 on 2026-08-31: four dead-capability rows catalogued while gating the MoE
+# placement install -- `ENG-WEIGHT-RESIDENCY`, `ENG-STRUCTURED-OUTPUT`,
+# `ENG-ATTENTION-WINDOW` and `ENG-GATE-ENV-DOC`. Each is a symbol or knob with a
+# user-facing promise and no production caller, verified by `git grep` restricted
+# to `src include`. Real new rows, which is the only reason this number moves.
+ENGINE_ROWS = 178
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

@@ -215,6 +215,15 @@ void ReportDevicePlacement(vt::DeviceType engine_device) {
 void InstallMoePlacementPlan(vt::DeviceType engine_device,
                              int64_t num_hidden_layers,
                              const vllm::GgufFile* gguf) {
+  // An EXPLICIT `--fit` beside a manual placement is refused here rather than at
+  // parse time, which closes two holes the parse-time check cannot see: a
+  // multi-document merge, and the environment. A DEFAULTED fit is not a
+  // collision — it yields, and the manual placement wins.
+  if (const std::string collision = vllm::DescribePlacementFitCollision();
+      !collision.empty()) {
+    throw std::invalid_argument(collision);
+  }
+
   std::vector<vllm::PlacementOverride> overrides =
       vllm::ResolvePlacementOverrides();
   vllm::PlacementOrigin origin = overrides.empty()

@@ -575,16 +575,29 @@ install line prints, so the operator sees the arithmetic rather than a verdict.
    require (1)+(3) red on a mutant that COMPILES. A mutant that fails to build
    reads as a passing test (W3g).
 
-#### Two holes in the existing exclusivity refusal, to close in W4
+#### Two holes in the exclusivity refusal, CLOSED at resolve time
 
-Found while reading, both currently harmless only because nothing reads the bit:
+The parse-time refusal inspects ONE document, so two routes reached a state it
+would have refused: the multi-document merge inside `SetWeightResidencyConfig`
+copies `fit` and the override fields field-by-field and never re-runs the check,
+and the environment was never checked at all — `VT_PLACEMENT_FIT=1` beside
+`VT_CPU_MOE=1` was refused nowhere.
 
-- the refusal lives in the single-document parse, and the multi-document merge
-  (`weight_residency.cpp:888-896`) copies `fit` and the override fields
-  field-by-field **without re-running the check**, so document A setting
-  `cpu_moe` then document B setting `fit` merges into a state the parser would
-  have refused;
-- `VT_PLACEMENT_FIT=1` beside `VT_CPU_MOE=1` is refused nowhere.
+`DescribePlacementFitCollision()` closes both by asking the RESOLVED values
+instead of a parsed document, so it is source-agnostic by construction rather
+than by enumerating routes. One check, both holes, and a third route would be
+covered too.
+
+**Only for an EXPLICIT fit, and the default flip is what makes that essential.**
+`fit` is now on for every load, so a defaulted fit stands beside every manual
+placement anyone configures; refusing that would make `cpu_moe` unusable. A
+default yields to an explicit instruction — that is not a collision, the manual
+placement simply wins. This is the same explicit-vs-defaulted split the
+safetensors arm needs, and the two are deliberately the same rule.
+
+Mutation-proven in BOTH directions on mutants that compile at rc=0: treating a
+defaulted fit as a collision reds the case that would break every `cpu_moe`
+user, and never detecting a collision reds 5 assertions.
 
 #### Stop conditions
 

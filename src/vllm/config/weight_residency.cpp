@@ -1185,6 +1185,21 @@ bool ResolvePlacementFit() {
                               /*builtin_default=*/true);
 }
 
+std::string DescribePlacementFitCollision() {
+  if (!PlacementFitWasRequested()) return "";  // a default yields; it collides with nothing
+  if (!ResolvePlacementFit()) return "";       // explicitly OFF collides with nothing
+  const std::vector<PlacementOverride> overrides = ResolvePlacementOverrides();
+  if (overrides.empty()) return "";
+  return "offload config: \"vllm_cpp.placement.fit\" (--fit) was asked for "
+         "explicitly and a manual placement is also in effect (" +
+         std::to_string(overrides.size()) +
+         " override(s) from \"overrides\", \"cpu_moe\", \"n_cpu_moe\" or their "
+         "environment variables). The resolver would have to override what the "
+         "operator asked for, so these are mutually exclusive rather than "
+         "merged. Drop one: unset the manual placement to let --fit decide, or "
+         "set VT_PLACEMENT_FIT=0 to keep the placement you stated";
+}
+
 bool PlacementFitWasRequested() {
   if (std::getenv("VT_PLACEMENT_FIT") != nullptr) return true;
   const std::optional<PlacementConfig>& cfg =

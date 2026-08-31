@@ -576,6 +576,25 @@ bool ResolvePlacementFit();
 // to be distinguishable.
 bool PlacementFitWasRequested();
 
+// The message for an EXPLICIT `--fit` standing beside a manual placement, or
+// empty when there is no collision.
+//
+// Mirrors `common/fit.cpp:398-399` ("model_params::tensor_buft_overrides already
+// set by user, abort"): auto and manual are mutually exclusive, not merged.
+//
+// RESOLVE-TIME, and that is what makes it complete. The parse-time refusal sees
+// ONE document, so it misses two ways to reach the same state: a multi-document
+// merge, which copies `fit` and the override fields field by field and never
+// re-runs the check, and the environment, where `VT_PLACEMENT_FIT=1` beside
+// `VT_CPU_MOE=1` was refused nowhere at all. Asking the resolved values closes
+// both without a second checker.
+//
+// ONLY for an explicit fit. Since `fit` now defaults ON, a defaulted fit stands
+// beside every manual placement ever configured; refusing that would make
+// `cpu_moe` unusable. A default that yields to an explicit instruction is not a
+// collision -- the manual placement simply wins.
+std::string DescribePlacementFitCollision();
+
 // THE mmap/placement COLLISION, DECIDED: it WARNS, it does not refuse, and it
 // does not silently win. Returns the warning line, or an empty string when the
 // pairing is not present.

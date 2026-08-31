@@ -7571,6 +7571,33 @@ queue. That op is another wave's file territory and is deliberately untouched
 here. **Seven CUDA kernels are now blocked by exactly one thing where they were
 blocked by five.**
 
+##### The battery RAN TWICE, and the second run is on the pushed tree
+
+The whole sequence was re-run end to end on `thor:gpu0` after the branch was
+merged onto `origin/main` again, and it reproduced **every** rc and **every**
+measurement: red 5/7, 10/10 and 4 assertions; green and final 7 cases/70
+assertions, 10/120 and 12/351; M1-M7 RED; M8's three-way verdict unchanged
+(`test_qwen4_exp_ple_block` rc 1, both CUDA suites rc 0); `RESTORE CHECK RC=0`;
+`FINAL BUILD RC=0`; 2 of 2 `sm_110` cubins.
+
+**The mutation hashes are byte-identical across the two runs** -- M1
+`23dcaf40...` -> `64b518b8...`, M3/M4/M5 all from `740eb5cd...`, M7
+`23dcaf40...` -> `38efc584...` -- and so are the floating-point measurements
+(`5.96046448e-08`, `2.38418579e-07`, `1.1920929e-07`). Two independent runs on
+one device agreeing to the bit is what makes these numbers a measurement rather
+than a sample.
+
+**A CAVEAT ON WHICH TREE, stated because it is the kind of gap this file
+exists to record.** The second run gated `20cd838fd`, and the branch then took
+one further `origin/main` merge before the push, landing at `642c20acf`. Those
+two trees differ in FOUR files, all DeepSeek-V4 dspark
+(`deepseek_v4_dspark.h`, `deepseek_v4.cpp`, `test_deepseek_v4_dspark_entry.cpp`
+and that row's spec), and every one of the NINE files this gate compiles for
+this change -- the three `.cu` arms, both `CMakeLists.txt`, the three suites and
+`qwen4_exp_ple_block.cpp` (M8's target) -- is byte-identical between them,
+verified by `sha256`. So the result transfers to the pushed tree exactly. It was
+NOT re-run a third time on `642c20acf` itself, and that is the honest boundary.
+
 ##### The neighbouring suites, and the LOAD-TIME refusal that settles reachability
 
 `ctest -R 'qwen4_exp|rms_norm_group'` on the gated tree: **76% passed, 5 failed

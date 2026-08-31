@@ -178,6 +178,28 @@ each half of the dual-theta split observable.
 W-4. **The markov head and the sampling loop.** Cheap in weights and the whole
 reason the block is affordable, so it is its own wave with its own gate.
 
+W-3's KV derivation LANDED. `dspark::BlockKvRows` is `update_kv_rows`'s host
+half: project the shared tap state through the block's own `wkv`, RMSNorm, rotate
+the tail. It lives in `deepseek_v4.cpp` because the trunk's `RmsNorm` and the
+lifted `RopeInplaceLayer` are both already there, so the drafter reuses them
+rather than growing a copy of either.
+
+**The norm covers the WHOLE head, and this is NOT `vt::kFusedNormRope`'s
+convention.** That op implements DeepSeek-V2/V3 MLA, where the norm covers only
+the nope half and the decoupled rope part stays UNNORMED. Read out of the kernel
+rather than inferred: `exllamav3_ext/rope.cu` requires the norm weight to be
+`head_dim` wide (:379), divides the RMS by `head_dim` (:207), and orders the body
+`load_head(); apply_norm(); apply_rope();` (:248-251). The artifact agrees --
+`mtp.0.attn.kv_norm.weight` is `[512]`, the full head, where the V2 convention
+would make it `[448]`.
+
+Order is gated, and only after a repair. RMSNorm's scale is a scalar and rotation
+preserves the sum of squares, so **norm and rope COMMUTE whenever gamma is equal
+within a rotated pair** -- and at position 0 the rotation is the identity anyway.
+The first cases met neither condition, so a mutation that roped before norming
+passed them. The added case uses a non-zero position AND a gamma that differs
+inside the pair, which is the only shape in which the order is observable at all.
+
 W-4 LANDED. `MarkovDraftLoop` is the sequential chain: per step one embedding
 gather, one rank-256 GEMV and an argmax, with the bias conditioned on the
 PREVIOUSLY SAMPLED id. Ties go to the lowest id, matching `torch.argmax`, because

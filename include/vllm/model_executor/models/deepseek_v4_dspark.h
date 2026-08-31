@@ -97,6 +97,40 @@ std::vector<int32_t> MarkovDraftLoop(const std::vector<float>& logits, int32_t s
                                      const std::vector<float>& markov_w2, int64_t block,
                                      int64_t vocab, int64_t rank);
 
+// W-3, ONE BLOCK'S KV ROWS. `DSparkAttention.update_kv_rows`
+// (`exllamav3/modules/arch_specific/dspark.py:134-155`):
+//
+//     kv = wkv(main_x).view(bsz, s, 1, D)
+//     ext.rope(kv, kv, ..., positions, kv_norm_w, eps, ..., rotate_dims=1,
+//              rotate_offset=D - rd)
+//     kl.write_rows(kv, positions, block_table)
+//
+// The drafter's KV does NOT come from its own forward: every block derives its
+// rows from the SAME projected tap state, at the target's own positions, so the
+// draft cache stays aligned with the target's block tables.
+//
+// ORDER AND WIDTH, both read out of the kernel rather than inferred. In
+// `exllamav3_ext/rope.cu` the body is `load_head(); apply_norm(); apply_rope();`
+// (:248-251), the norm weight is required to be `head_dim` wide (:379) and the RMS
+// divides by `head_dim` (:207). So the norm covers the WHOLE head_dim and the
+// rotation then applies to `[head_dim - rope_dim, head_dim)`.
+//
+// That is the TRUNK's convention and NOT `vt::kFusedNormRope`'s, which implements
+// DeepSeek-V2/V3 MLA where the norm covers only the nope half and the decoupled
+// rope part stays unnormed. The two are easy to confuse and the artifact settles
+// it: `mtp.0.attn.kv_norm.weight` is `[512]`, the full head_dim, where the V2
+// convention would make it `[448]`.
+//
+//   main_x    [num_tokens, hidden]  the shared, already-projected tap state
+//   wkv       [head_dim, hidden]    this block's own KV projection
+//   returns   [num_tokens, head_dim]
+std::vector<float> BlockKvRows(const std::vector<float>& main_x,
+                               const std::vector<float>& wkv,
+                               const std::vector<float>& kv_norm_w, float eps,
+                               const std::vector<int32_t>& positions, double rope_theta,
+                               int64_t num_tokens, int64_t hidden, int64_t head_dim,
+                               int64_t rope_dim);
+
 }  // namespace vllm::dspark
 
 namespace vllm {

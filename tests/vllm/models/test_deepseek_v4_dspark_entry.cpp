@@ -279,3 +279,112 @@ TEST_CASE("W-3 seam: `freq_scale` alone changes the rotation") {
     diff = std::max(diff, std::abs(static_cast<double>(one[i] - scaled[i])));
   CHECK(diff > 1e-3);
 }
+
+// ── W-3: one block's KV rows from the projected taps ─────────────────────────
+
+TEST_CASE("W-3: the norm covers the WHOLE head, then the tail rotates") {
+  // The distinction this case exists for: DeepSeek-V2/V3 MLA norms only the nope
+  // half and leaves the decoupled rope part unnormed (`vt::kFusedNormRope`), while
+  // this path norms all `head_dim` and rotates afterwards
+  // (`exllamav3_ext/rope.cu:207,248-251,379`). The artifact settles which: its
+  // `kv_norm.weight` is `[512]`, the full head, not `[448]`.
+  //
+  // Built so the two are distinguishable: gamma is 1 on the nope half and 3 on the
+  // rope half. Under the V2 convention the rope half would be untouched by gamma.
+  const int64_t T = 1, H = 2, D = 4, RD = 2, NOPE = D - RD;
+  const std::vector<float> main_x{1.0f, 0.0f};
+  // wkv row d selects main_x[0] scaled, so the pre-norm row is {1,2,3,4}.
+  std::vector<float> wkv(static_cast<size_t>(D * H), 0.0f);
+  for (int64_t d = 0; d < D; ++d) wkv[static_cast<size_t>(d * H)] = static_cast<float>(d + 1);
+  std::vector<float> gamma{1.0f, 1.0f, 3.0f, 3.0f};
+  const std::vector<int32_t> pos{0};  // position 0 => the rotation is identity
+
+  const auto got = vllm::dspark::BlockKvRows(main_x, wkv, gamma, /*eps=*/0.0f, pos,
+                                             /*rope_theta=*/10000.0, T, H, D, RD);
+  REQUIRE(got.size() == static_cast<size_t>(D));
+  // RMS over ALL FOUR values: sqrt((1+4+9+16)/4) = sqrt(7.5).
+  const double rms = std::sqrt(30.0 / 4.0);
+  CHECK(got[0] == doctest::Approx(static_cast<float>(1.0 / rms * 1.0)));
+  CHECK(got[1] == doctest::Approx(static_cast<float>(2.0 / rms * 1.0)));
+  // The rope half carries gamma too -- this is what the V2 convention would not do.
+  CHECK(got[2] == doctest::Approx(static_cast<float>(3.0 / rms * 3.0)));
+  CHECK(got[3] == doctest::Approx(static_cast<float>(4.0 / rms * 3.0)));
+  (void)NOPE;
+}
+
+TEST_CASE("W-3: a non-zero position ROTATES only the rope tail") {
+  const int64_t T = 2, H = 1, D = 4, RD = 2;
+  const std::vector<float> main_x{1.0f, 1.0f};
+  std::vector<float> wkv(static_cast<size_t>(D * H), 0.0f);
+  for (int64_t d = 0; d < D; ++d) wkv[static_cast<size_t>(d)] = static_cast<float>(d + 1);
+  const std::vector<float> gamma(static_cast<size_t>(D), 1.0f);
+  // Token 0 at position 0 (identity), token 1 at position 5 (rotates).
+  const std::vector<int32_t> pos{0, 5};
+  const auto got = vllm::dspark::BlockKvRows(main_x, wkv, gamma, 0.0f, pos, 10000.0, T, H,
+                                             D, RD);
+  REQUIRE(got.size() == static_cast<size_t>(T * D));
+  // The NOPE half is position-independent, so both tokens must agree there.
+  CHECK(got[0] == doctest::Approx(got[4]));
+  CHECK(got[1] == doctest::Approx(got[5]));
+  // The rope half must NOT agree, or the position never entered the row.
+  const double dr = std::max(std::abs(static_cast<double>(got[2] - got[6])),
+                             std::abs(static_cast<double>(got[3] - got[7])));
+  CHECK(dr > 1e-4);
+  // ...and the rotation preserves the pair's magnitude.
+  CHECK(std::hypot(got[6], got[7]) ==
+        doctest::Approx(std::hypot(got[2], got[3])).epsilon(1e-5));
+}
+
+TEST_CASE("W-3: a kv_norm sized for the NOPE half REFUSES") {
+  // The V2-convention mistake, caught at the boundary instead of producing a
+  // plausible row.
+  const int64_t T = 1, H = 1, D = 4, RD = 2;
+  const std::vector<float> main_x{1.0f};
+  const std::vector<float> wkv(static_cast<size_t>(D * H), 1.0f);
+  const std::vector<float> nope_gamma(static_cast<size_t>(D - RD), 1.0f);
+  const std::vector<int32_t> pos{0};
+  CHECK_THROWS(vllm::dspark::BlockKvRows(main_x, wkv, nope_gamma, 0.0f, pos, 10000.0, T,
+                                         H, D, RD));
+}
+
+TEST_CASE("W-3: an ODD rope span REFUSES, because the rotation is pairwise") {
+  const int64_t T = 1, H = 1, D = 4, RD = 3;
+  const std::vector<float> main_x{1.0f};
+  const std::vector<float> wkv(static_cast<size_t>(D * H), 1.0f);
+  const std::vector<float> gamma(static_cast<size_t>(D), 1.0f);
+  const std::vector<int32_t> pos{0};
+  CHECK_THROWS(
+      vllm::dspark::BlockKvRows(main_x, wkv, gamma, 0.0f, pos, 10000.0, T, H, D, RD));
+}
+
+TEST_CASE("W-3: norm comes BEFORE rope, where the two do not commute") {
+  // The order is only OBSERVABLE under two conditions at once, and the first
+  // version of this file met neither, so a mutation that roped before norming
+  // passed it untouched:
+  //
+  //   1. a NON-ZERO position, or the rotation is the identity; and
+  //   2. a gamma that DIFFERS WITHIN a rotated pair. RMSNorm's scale is a scalar
+  //      and rotation preserves the sum of squares, so with g[i] == g[i+1] the two
+  //      operations commute exactly and no test can tell them apart.
+  const int64_t T = 1, H = 1, D = 4, RD = 2, NOPE = D - RD;
+  const std::vector<float> main_x{1.0f};
+  std::vector<float> wkv(static_cast<size_t>(D * H), 0.0f);
+  for (int64_t d = 0; d < D; ++d) wkv[static_cast<size_t>(d)] = static_cast<float>(d + 1);
+  const std::vector<float> gamma{1.0f, 1.0f, 2.0f, 5.0f};  // 2 != 5 inside the pair
+  const std::vector<int32_t> pos{1};
+
+  const auto got = vllm::dspark::BlockKvRows(main_x, wkv, gamma, /*eps=*/0.0f, pos,
+                                             /*rope_theta=*/10000.0, T, H, D, RD);
+  REQUIRE(got.size() == static_cast<size_t>(D));
+
+  // Hand-derived NORM-THEN-ROPE. Pre-norm row is {1,2,3,4}; rms = sqrt(30/4).
+  // Normed = {1r, 2r, 6r, 20r}. The rope span is one pair at theta = pos = 1.
+  const double r = 1.0 / std::sqrt(30.0 / 4.0);
+  const double c = std::cos(1.0), s = std::sin(1.0);
+  const double n2 = 6.0 * r, n3 = 20.0 * r;
+  CHECK(got[0] == doctest::Approx(static_cast<float>(1.0 * r)));
+  CHECK(got[1] == doctest::Approx(static_cast<float>(2.0 * r)));
+  CHECK(got[2] == doctest::Approx(static_cast<float>(n2 * c - n3 * s)));
+  CHECK(got[3] == doctest::Approx(static_cast<float>(n2 * s + n3 * c)));
+  (void)NOPE;
+}

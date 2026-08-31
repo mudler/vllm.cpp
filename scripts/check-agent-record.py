@@ -163,7 +163,17 @@ MATRICES = {
     # Upstream cell therefore carries no pinned module/class target and the
     # at-the-pin static invariants (324/373/356/310/261) are UNCHANGED. Bumped
     # because one row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 379),
+    # 380 since 2026-08-31: +1 for
+    # `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, the released
+    # DeepSeek-V4-Flash-Vision-Exp configuration at model-author revision
+    # `86f746b3` (#2411). It deliberately shares the architecture STRING with
+    # the existing text row and is not a duplicate upstream target: the text row
+    # mirrors vLLM's registered text-only module, while this row owns the
+    # model-author processor, ViT, aligner, sentinel merge and visibility path
+    # that vLLM implements at no revision. It lands `READY`, so the INVENTORIED
+    # count stays 324 and READY moves 3 -> 4. Bumped because one row EXISTS,
+    # never to make a lifecycle transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 380),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

@@ -1787,6 +1787,25 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     debt, W4 owns the wiring and the seam extension, and spec `## Owed` names
     both.
 
+19. **Beyond-pin model-author port: DeepSeek-V4-Flash-Vision-Exp has no vLLM
+    implementation to mirror (2026-08-31,
+    `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, issue
+    [#2411](https://github.com/mudler/vllm.cpp/issues/2411)).** The parity pin
+    `555967922` registers `DeepseekV4ForCausalLM` as text generation. Code search
+    at vLLM main `dafbef15a1c879c64ebb99427917e4ca8d5bca1e` finds neither the
+    released model id nor `vision_n_layers`; Transformers main
+    `a3f3da8f87dc65d724d500eeb44777e4716aaa46` implements DeepSeek-V4 text but
+    not the vision path. The only complete source is the model author's Hugging
+    Face Git repository at
+    `86f746b36186f0e567729a5c06a8c918caba82a9`, which is registered as the
+    `deepseek-v4-vision` secondary oracle for prompt encoding, preprocessing,
+    ViT, aligner, sentinel merge and image-span visibility. vLLM remains primary
+    for the shared language behavior. The deviation expires when vLLM registers
+    the model; that sync cycle reconciles this row onto vLLM rather than keeping
+    two authorities. The oracle starts `gateable = no`: source was read, but the
+    156.287 GiB TP4 artifact did not run. No correctness or performance claim
+    follows from this records change.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

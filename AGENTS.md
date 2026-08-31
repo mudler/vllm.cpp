@@ -268,6 +268,7 @@ only when it appears in this table and has a recorded pin:
 | vLLM | `vllm` | always, as the primary wherever it implements the behavior |
 | vLLM-Omni | `vllm-omni` | diffusion, TTS, and omni-only architectures that vLLM does not register |
 | HuggingFace `transformers` | `transformers` | a model, processor, or tokenizer reference implementation that vLLM mirrors |
+| DeepSeek `DeepSeek-V4-Flash-Vision-Exp` | `deepseek-v4-vision` | the model-author prompt encoder, image processor, ViT, aligner and image-span visibility, which vLLM and Transformers do not implement |
 | `diffusers` | `diffusers` | schedulers, VAEs, and diffusion pipelines |
 | Lightricks `LTX-2` | `ltx-2` | the LTX-2.5 architecture and pipeline recipes, from the model author's own runtime, for the generations and defaults vLLM-Omni's `ltx2` registration does not reach |
 | SGLang | `sglang` | a model or serving path that SGLang implements and vLLM does not |

@@ -7735,6 +7735,70 @@ rebuilt clean and all eight neighbouring suites passed
 `test_qwen4_exp_hc_device` 516, `test_qwen4_exp_ple_block` 100,
 `test_qwen4_exp_forward` 429).
 
+##### The gate after the review repairs, on the PUSHED head
+
+`thor:gpu0`, `sm_110`, nvcc 13.0.88, `rc` job `00b30ca6`, on `b4158d643` --
+**the tree that was pushed, not a predecessor**, which closes the provenance gap
+F6 named. Every rc read from the job's own stdout.
+
+```text
+### CONFIGURE RC=0   ### RED BUILD RC=0   ### GREEN BUILD RC=0   ### FINAL BUILD RC=0
+### red   {rms_norm_group_cuda, qwen4_exp_cuda_reductions, qwen4_exp_cuda} RC=1 1 1
+### green {                    same three                          } RC=0 0 0
+### final {                    same three                          } RC=0 0 0
+### RESTORE CHECK RC=0
+```
+
+`test_ops_rms_norm_group_cuda` 8 cases / 73 assertions,
+`test_qwen4_exp_cuda_reductions` 14 / 160, `test_qwen4_exp_cuda` 12 / 351, all
+`SUCCESS!`.
+
+**THE DERIVED BOUND, AT EVERY SHAPE.** `over = 0` everywhere and the worst
+scale-free ratio is **0.2041**:
+
+| shape | \|sel\| | max\|diff\| | derived bound | ratio | over |
+|---|---|---|---|---|---|
+| `sub_budget` | 2 | 2.384e-07 | 1.337e-06 | 0.178 | 0/1408 |
+| `over_budget` | 2 | 1.192e-07 | 5.842e-07 | 0.204 | 0/2944 |
+| 1200 rows / 38 tiles | 1200 | 2.980e-08 | 5.723e-04 | 0.000 | 0/128 |
+| 2050 rows / 65 tiles | 2050 | 3.166e-08 | 9.777e-04 | 0.000 | 0/128 |
+| 2 full tiles + 2-row tail | 66 | 1.192e-07 | 3.176e-05 | 0.004 | 0/384 |
+| 5200 pairs / grid stride | 8 | 2.384e-07 | 2.824e-06 | 0.084 | 0/166400 |
+
+The retired constant failed all of these. The ratio falls as `|sel|` grows,
+which is the derivation working: the bound now tracks the spread and the
+accumulation length instead of `max|out|`.
+
+**THE SCALE FIXTURES DO WHAT THEY WERE ADDED FOR.** `tiles = 38`, `65` and `3`
+as the code computes them; `qsa_compress` 4100 blocks byte-identical at
+`0/65600`; the grid-stride gather covers 166,400 elements; row-set invariance
+holds across `topk` 50 vs 64 over 7 tiles; `keys_visited` 1440 == 1440 against
+2208 dense, margin 768.
+
+**F4 SETTLED A QUESTION THE CASE HAD GUESSED AT.** The Q8_0 mix weight does NOT
+refuse on CUDA -- `block branch ENTERED, no refusal` -- so
+`IsCudaKeepQuantSupported` returning false for Q8_0 does not stop the branch
+running. Same route on both devices agrees at **2.98e-08** against the 1e-05
+band. The `Q8_0`-vs-`f32` gap is **7.549e-05**, reported and not asserted,
+because it measures the ACTIVATION quantization `kMatmulBTQuant` performs and
+not this wave's kernel.
+
+**TWELVE MUTATIONS, ALL APPLIED, ALL BUILT, ALL RED, ALL RESTORED
+BYTE-FOR-BYTE**, with M12 building this time after its first spelling orphaned
+`step` under nvcc's `-Werror=all-warnings`. M9 and M10 are the reviewer's own
+MUT-A and MUT-C, which were byte-for-byte invisible before F2's fixtures existed.
+
+**M8, THE REACHABILITY MUTATION, NOW READS ON A GREEN BASELINE FOR BOTH CUDA
+SUITES** -- which the earlier run could not claim, because the reductions suite
+was red for an unrelated reason and a mutation kill is meaningless against a red
+baseline:
+
+```text
+### MUT M8 test_qwen4_exp_ple_block        RUN RC=1   <- the production call site is LIVE
+### MUT M8 test_ops_rms_norm_group_cuda    RUN RC=0   <- the CUDA arm survives its deletion
+### MUT M8 test_qwen4_exp_cuda_reductions  RUN RC=0   <- so does this one
+```
+
 ##### The neighbouring suites, and the LOAD-TIME refusal that settles reachability
 
 `ctest -R 'qwen4_exp|rms_norm_group'` on the gated tree: **76% passed, 5 failed

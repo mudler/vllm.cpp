@@ -882,11 +882,47 @@ TEST_CASE("vt::Qwen4ExpGatedResidual CUDA: a Q8_0 mix weight ENTERS the block br
   b.Free(p_dq);
   b.Free(p_iq);
 
-  // BOTH OUTCOMES ARE GATED, and which one occurs is PRINTED, because the answer
-  // is a property of this device's keep-quant support rather than of this wave.
-  // `IsCudaKeepQuantSupported` returns false for Q8_0 today, so a refusal is the
-  // expected arm; if a later wave adds the kernel, the value comparison below
-  // becomes live and must hold.
+  // ── the SAME quantized route on the CPU, which is what this case compares ──
+  // **THE FIRST VERSION OF THIS CASE COMPARED THE WRONG PAIR AND FAILED ON A
+  // CORRECT KERNEL, WHICH IS THE F1 MISTAKE IN A SECOND PLACE.** It asserted
+  // `Q8_0 vs f32 on CUDA` against `kMixerTol`, reasoning that the weights are
+  // exact in Q8_0 so the two arms compute the same function. That reasoning is
+  // wrong: `kMatmulBTQuant` also QUANTIZES THE ACTIVATION to the weight's
+  // `vec_dot_type`, and `normed` is not exact in Q8_0. The two routes therefore
+  // compute genuinely different numbers, and on the device the gap measured
+  // 7.549e-05 against a 1e-05 bound -- a real difference held to a bound derived
+  // for something else.
+  //
+  // The comparison that actually tests THIS WAVE'S KERNEL is the same route on
+  // both devices: CUDA Q8_0 against CPU Q8_0. Both quantize the same activation
+  // the same way, so a disagreement is the device arm's and nothing else. The
+  // f32 gap is still computed and PRINTED, because it measures the activation
+  // quantization this architecture accepts on the released checkpoint, but it is
+  // not asserted against the oracle band.
+  std::vector<float> cpu_q8(static_cast<size_t>(T * H), 0.0f);
+  std::string cpu_refusal;
+  {
+    Queue q = CpuQ();
+    std::vector<float> h2 = hyper, g2 = gamma, u2 = up_f;
+    std::vector<uint8_t> dq2 = down_q, iq2 = inj_q;
+    std::vector<float> j2(static_cast<size_t>(T * hc), 0.0f);
+    Tensor t_h = MakeTensor(h2.data(), DType::kF32, Cpu(), {T, flat});
+    Tensor t_w = MakeTensor(g2.data(), DType::kF32, Cpu(), {flat});
+    Tensor t_u = MakeTensor(u2.data(), DType::kF32, Cpu(), {flat, R});
+    Tensor t_m = MakeTensor(cpu_q8.data(), DType::kF32, Cpu(), {T, H});
+    Tensor t_j = MakeTensor(j2.data(), DType::kF32, Cpu(), {T, hc});
+    Tensor t_d = MakeTensor(dq2.data(), DType::kQ8_0, Cpu(), {R, flat});
+    Tensor t_i = MakeTensor(iq2.data(), DType::kQ8_0, Cpu(), {hc, flat});
+    try {
+      vt::Qwen4ExpGatedResidual(q, t_m, &t_j, t_h, t_w, t_d, t_u, &t_i, args);
+    } catch (const std::exception& e) {
+      cpu_refusal = e.what();
+    }
+  }
+
+  // WHICHEVER ARM THE DEVICE TAKES IS GATED, and which one it took is PRINTED,
+  // because that is a property of this build's keep-quant support and not of
+  // this wave.
   if (!refusal.empty()) {
     std::printf("[MEASURED] hc mixer Q8_0 on CUDA: REFUSED BY NAME -- %.140s\n",
                 refusal.c_str());
@@ -900,12 +936,20 @@ TEST_CASE("vt::Qwen4ExpGatedResidual CUDA: a Q8_0 mix weight ENTERS the block br
                                refusal.find("matmul") != std::string::npos;
     CHECK(names_the_gap);
   } else {
-    const double d = MaxAbsDiff(mixed_q8, mixed_f32);
-    std::printf("[MEASURED] hc mixer Q8_0 vs f32 on CUDA max|diff| = %.9g bound %g\n", d,
-                kMixerTol);
-    // The Q8_0 encoding is LOSSLESS for these weights, so the two arms compute
-    // the same function; only the GEMM's association may differ.
-    CHECK(d < kMixerTol);
+    // The device ENTERED the block branch and returned, which is the fact this
+    // case exists to establish.
+    std::printf("[MEASURED] hc mixer Q8_0 on CUDA: block branch ENTERED, no refusal\n");
+    REQUIRE(cpu_refusal.empty());  // else the two arms are not comparable at all
+    const double same_route = MaxAbsDiff(mixed_q8, cpu_q8);
+    const double vs_f32 = MaxAbsDiff(mixed_q8, mixed_f32);
+    std::printf("[MEASURED] hc mixer Q8_0 CUDA-vs-CPU (same route) max|diff| = %.9g "
+                "bound %g\n", same_route, kMixerTol);
+    std::printf("[MEASURED] hc mixer Q8_0-vs-f32 on CUDA max|diff| = %.9g (ACTIVATION "
+                "quantization, not the device arm; reported, not asserted)\n", vs_f32);
+    CHECK(same_route < kMixerTol);
+    // And the quantized route must actually DIFFER from the f32 one, or the
+    // block branch was not really taken and this case proves nothing.
+    CHECK(vs_f32 > 0.0);
   }
 }
 

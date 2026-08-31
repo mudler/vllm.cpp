@@ -1425,6 +1425,11 @@ vllm_cpp_add_test(test_kv_offload_connector vllm/v1/test_kv_offload_connector.cp
 vllm_cpp_add_test(test_lmcache_codec vllm/v1/kv_offload/lmcache/test_lmcache_codec.cpp)
 target_compile_definitions(test_lmcache_codec PRIVATE
   TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+# DeepSeek-V4 Vision W1: pinned prompt encoding and image preprocessing.
+vllm_cpp_add_test(test_deepseek_v4_encoding
+                  vllm/multimodal/test_deepseek_v4_encoding.cpp)
+vllm_cpp_add_test(test_deepseek_v4_image_processor
+                  vllm/multimodal/test_deepseek_v4_image_processor.cpp)
 # Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
 # (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
 # 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).

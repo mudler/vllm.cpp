@@ -447,12 +447,76 @@ a ceiling.
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
 - The combined GGUF artifact, its revision and SHA-256 are owed by issue #2411
   and W3.
+- W1 prompt encoding and image preprocessing remain unreachable from a
+  production entry point. W4 wires them into the registered model forward, and
+  W5 wires the runner, public ABI and OpenAI server for row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`; issue #2411 tracks both
+  waves.
 - DeepSeek-V4 DSpark remains owned by
   `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm`; this row only
   accounts for and names its tensors.
 
 ## Now
 
-`READY` on the spec commit. The next action after developer review is W1: a
-fresh implementer ports the pinned encoding tests and image processor RED-first.
-No product code has landed under this row.
+`ACTIVE`. W1 ports the pinned prompt encoder and image processor into the shared
+`MultiModalInputs`, `ImageKwargs` and `MultiModalFeatureSpec` surface. The model
+forward remains unwired: ViT, aligner, weights, image-span visibility, ABI and
+server work stay in W2-W5.
+
+### W1 evidence
+
+The repair tests ran before each repair. The Pillow matrix returned BF16 words
+`15885` and `48942` instead of `15877` and `48944` for the pinned 3x5 seed-0
+case. Falsey image-source forms, BF16-only output, configuration validation,
+checked grid arithmetic and the sized RGB API each failed their selected test
+or build for the intended reason. Removing final N-layout alignment padding
+made its new 2x2 case fail.
+
+The second repair added token-budget cases for `6` and `8`. Both cases accepted
+the invalid configuration before the repair. An allocation probe measured two
+allocations and 36 bytes for the 12-byte identity image. The repaired path makes
+one 24-byte allocation for its BF16 output. A `max_image_tokens` value of `9`
+processes the minimum 1x1 image.
+
+The resize implementation ports Pillow 12.1.1
+`src/libImaging/Resample.c::{precompute_coeffs,normalize_coeffs_8bpc,
+ImagingResampleHorizontal_8bpc,ImagingResampleVertical_8bpc}` and
+`PIL/ImageOps.py::{contain,pad}`. Seven deterministic oracle fixtures cover
+ordinary upsampling, downsampling, aspect padding and the direct wide-image
+branch. They compare all BF16 words through fixed hashes and pin selected words
+explicitly. The exact wide threshold fixture has a 3x6 image and a ratio of
+`2`. Its complete BF16 output hashes to `0xab9bbef0bbb70c6a`.
+
+The task repair started red: number, boolean, array and object tasks rendered as
+ordinary prompts, and an invalid string before another user transition returned
+without validation. A null task incorrectly suppressed retained assistant
+reasoning. The image-boundary regression accepted one BF16 feature for
+`patch_size = 2`, whose required feature width is `12`.
+
+A fresh Release CPU build used
+`cmake -S . -B build-repair-clean -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
+-DCMAKE_BUILD_TYPE=Release`, then built both W1 targets. The command
+`ctest --test-dir build-repair-clean -R
+'^test_deepseek_v4_(encoding|image_processor)$' --output-on-failure` passed
+2/2 tests.
+
+Sixty-two independent production-source mutations cover every W1 encoding and
+processor guarantee. The ten repair mutations include the earlier token-budget
+floor, exact wide comparison, identity-buffer and historical-thinking
+mutations. The six latest mutations inverted the task type and membership
+guards, replaced all six task tokens, disabled the action assistant transition,
+treated a null task as present and inverted the patch-feature-width guard. Each
+selected focused test went red. Each mutation restored the source
+byte-for-byte.
+
+The default multi-turn thinking case emitted `<think>` before historical
+assistant content instead of the pinned `</think>`. The repaired transition
+keeps `<think>` only when thinking is retained or the message is at or after the
+last user. The final focused gate passed with source SHA-256
+`9f043f826e38803aca19da29e92aa5103cedb70f8792fe4693bf81d695804886`,
+header SHA-256
+`6c4224c11280430a41aeb4c50b31c3ded921af44f8a0d328fd2164216bebb6f1`,
+encoding-test SHA-256
+`35bb6ba50cfc7eda8c87ca6b0aaed04c826ef8b96231c8601b96d55cd252da7d`
+and processor-test SHA-256
+`0d0d44a2a741e5b52d1acc41c9530f0addb8694e27f03448fb879d25c25c7ade`.

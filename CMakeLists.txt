@@ -1078,6 +1078,7 @@ add_library(vllm STATIC
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
+  src/vllm/multimodal/deepseek_v4_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
   # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone

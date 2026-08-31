@@ -3120,6 +3120,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
+
+    // ENG-WEIGHT-OFFLOAD (#2386): the SECOND guard, and the only one that can
+    // see this particular lie. `RefuseUnsupportedWeightOffload` runs BEFORE the
+    // load and can only ask whether the architecture DECLARES support. A loader
+    // that declares it and then never calls `ConsiderWeight` offloads nothing,
+    // and the run frees no memory with no error anywhere — zero consulted
+    // weights is the only evidence that proves it, and that count does not exist
+    // until the load has finished. Hence here, and not beside its sibling.
+    //
+    // It had no production caller until now: declaration, definition and four
+    // test assertions, while `docs/WEIGHT-OFFLOAD.md` described it in the
+    // present tense as shipped behaviour. It is currently VACUOUS rather than
+    // wrong — no registration sets `supports_weight_offload`, so the first guard
+    // refuses every configured offload before this one is reached — but it stops
+    // being vacuous the day anyone wires a loader, which is exactly when its
+    // absence would be silent.
+    vllm::VerifyWeightOffloadWasConsulted(
+        vllm::GetWeightOffloader(), registration.architecture,
+        registration.factory != nullptr &&
+            registration.factory->supports_weight_offload);
+
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
@@ -3140,6 +3161,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
+
+    // ENG-WEIGHT-OFFLOAD (#2386): the SECOND guard, and the only one that can
+    // see this particular lie. `RefuseUnsupportedWeightOffload` runs BEFORE the
+    // load and can only ask whether the architecture DECLARES support. A loader
+    // that declares it and then never calls `ConsiderWeight` offloads nothing,
+    // and the run frees no memory with no error anywhere — zero consulted
+    // weights is the only evidence that proves it, and that count does not exist
+    // until the load has finished. Hence here, and not beside its sibling.
+    //
+    // It had no production caller until now: declaration, definition and four
+    // test assertions, while `docs/WEIGHT-OFFLOAD.md` described it in the
+    // present tense as shipped behaviour. It is currently VACUOUS rather than
+    // wrong — no registration sets `supports_weight_offload`, so the first guard
+    // refuses every configured offload before this one is reached — but it stops
+    // being vacuous the day anyone wires a loader, which is exactly when its
+    // absence would be silent.
+    vllm::VerifyWeightOffloadWasConsulted(
+        vllm::GetWeightOffloader(), registration.architecture,
+        registration.factory != nullptr &&
+            registration.factory->supports_weight_offload);
+
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(

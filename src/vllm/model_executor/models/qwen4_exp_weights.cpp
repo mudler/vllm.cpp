@@ -630,9 +630,11 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
 
   // ── THE DEVICE GATE, AND IT COMES BEFORE ANY TENSOR I/O (#2083) ───────────
   //
-  // `DeviceQuantGatherSupported` is true for `kCPU` alone, because only the CPU
-  // `Embedding` kernel decodes a block row; `EmbeddingKernelCuda` still asserts
-  // f32/bf16. On every other device `RouteGgufTensor` therefore sends
+  // `DeviceQuantGatherSupported` is true for `kCPU` and `kCUDA` — the two
+  // `Embedding` kernels that decode a block row (the CUDA one since KGATHER,
+  // src/vt/cuda/cuda_quant_dequant.cuh). On METAL, VULKAN, ROCM and
+  // TENSTORRENT, whose gather kernels each assert a float table by name,
+  // `RouteGgufTensor` therefore sends
   // `per_layer_token_embd.weight` to `kExpandBf16` — and on the shipped
   // `unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S` that tensor is
   // [320001536, 160] IQ4_NL: 26.822 GiB on disk becomes
@@ -646,8 +648,12 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
   // comment names the outcome: "Loading for 26 minutes and dying mid-stream is
   // the worst of the available behaviours."
   //
-  // So the CUDA arm is REFUSED BY NAME, naming the missing part, which is what
-  // AGENTS.md requires of an unimplemented arm. It is keyed on the DEVICE and
+  // So a device with no gather arm is REFUSED BY NAME, naming the missing part,
+  // which is what AGENTS.md requires of an unimplemented arm. CUDA was the
+  // device this text was written about and it is no longer refused; the guard
+  // is unchanged because the OTHER four devices still need it, and because a
+  // guard deleted the moment its first caller passes is a guard that stops
+  // protecting the next one. It is keyed on the DEVICE and
   // not on the residency this policy happens to resolve: a CPU load with
   // keep-quant off expands the same table, and on any file a CPU can hold that
   // is a correct, supported, small load rather than this one.
@@ -699,9 +705,10 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
   // The n-gram table. `kEmbeddingTable` is the role W6a (#1989) made keep-quant
   // eligible, and this is the tensor that change exists for: 51.2 G parameters
   // that would otherwise expand from 28.8 GB of Q4_K to 102.4 GB of bf16 on a
-  // ~119.6 GiB box. On CUDA the policy still routes it to `kExpandBf16`, because
-  // `EmbeddingKernelCuda` cannot decode blocks — `DeviceQuantGatherSupported`
-  // says so and the CUDA arm is owed.
+  // ~119.6 GiB box. Since KGATHER the same route holds on CUDA: the device
+  // decodes a block row, `DeviceQuantGatherSupported` admits it, and the table
+  // stays block-resident on the card instead of expanding to 95.4 GiB of host
+  // bf16 — which is what makes a GPU arm of this model possible at all.
   if (!p.ple.layer_ids_zero_based.empty()) {
     const int64_t rows = NgramTableRows(p);
     const int64_t cols = p.ple.head_dim_per_ngram();

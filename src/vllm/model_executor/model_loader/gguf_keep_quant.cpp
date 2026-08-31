@@ -158,14 +158,34 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
   return true;
 }
 
-// Device gate for the gather arm. Today ONLY the CPU kernel decodes a block
-// table: `EmbeddingKernelCuda` (src/vt/cuda/cuda_ops.cu) still asserts
-// f32/bf16, so on CUDA a kept table would throw at the first forward with the
-// whole model resident. It refuses here instead, and the CUDA arm is owed —
-// which is a real cost, because the device-resident quantized table is exactly
-// the shape llama.cpp's own n-gram path does NOT have.
+// Device gate for the gather arm. CPU and CUDA decode a block table; nothing
+// else does.
+//
+// CUDA joined the list with KGATHER. `EmbeddingKernelCuda`
+// (src/vt/cuda/cuda_ops.cu) asserted f32/bf16 until then, so a kept table would
+// have thrown at the first forward with the whole model resident and this
+// function refused at LOAD instead. The device row decoders now live in
+// src/vt/cuda/cuda_quant_dequant.cuh and cover exactly the encodings
+// `vt::cpu::BlockToFloat` covers, which is exactly what `KeepQuantGatherDType`
+// admits — so this stays a DEVICE predicate and does not need a dtype. That
+// equality is not an assumption: `tests/vt/test_cuda_embedding_quant.cpp` asserts
+// `EmbeddingQuantSupported(dt) == (BlockToFloat(dt) != nullptr)` over every
+// DType on a CUDA build, and a decoder added to one side without the other
+// reddens it.
+//
+// METAL, VULKAN, ROCM and TENSTORRENT still refuse: each of their `kEmbedding`
+// kernels asserts a float table by name (e.g. tenstorrent_ops.cpp:1500), so for
+// them the pre-existing expand-bf16 residency remains the only correct answer
+// and the arm is owed per device.
+//
+// What this unlocks is not one op. On a device that cannot gather quantized,
+// the Qwen3.8-Flash-Next n-gram table expands from 26.822 GiB of IQ4_NL to
+// 95.368 GiB of bf16, against ~119.6 GiB of usable memory on the one box that
+// fits the model at all — so the device-resident quantized table is what makes
+// a GPU arm possible, and llama.cpp's own n-gram path does NOT have this shape
+// (#27742 pins that table to the CPU by tensor class).
 bool DeviceQuantGatherSupported(vt::DeviceType dev) {
-  return dev == vt::DeviceType::kCPU;
+  return dev == vt::DeviceType::kCPU || dev == vt::DeviceType::kCUDA;
 }
 
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {

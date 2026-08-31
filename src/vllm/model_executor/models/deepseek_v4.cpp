@@ -38,6 +38,8 @@
 // quant_block == nope_head_dim (one block) at tiny width. Each reuses the SAME
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_dspark.h"
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
 
 #include <chrono>
@@ -88,6 +90,8 @@ using deepseek_v4::HcHeadCollapse;
 using deepseek_v4::MakeFp8DsMlaLayout;
 using deepseek_v4::MhcPost;
 using deepseek_v4::MhcPre;
+using deepseek_v4::RopeInplaceLayer;
+using deepseek_v4::YarnCorrDim;
 using deepseek_v4::MhcPreResult;
 using deepseek_v4::MoeRouteResult;
 using deepseek_v4::SoftmaxWithSink;
@@ -643,40 +647,6 @@ std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>
 // `ds4.c:rope_tail_ext_inplace` (+ `rope_yarn_corr_dim`/`rope_yarn_ramp`). Getting
 // this wrong scrambles the rope half of q·k on every compressed layer → the model
 // loses positional/context structure (degenerate repetition).
-double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
-  return static_cast<double>(n_dims) *
-         std::log(static_cast<double>(n_ctx_orig) /
-                  (beta * 2.0 * std::numbers::pi_v<double>)) /
-         (2.0 * std::log(base));
-}
-void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
-                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
-                      double beta_slow, bool inverse = false) {
-  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
-  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
-  double corr_lo = 0.0, corr_hi = 0.0;
-  if (ext_factor != 0.0) {
-    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
-    corr_hi = std::min(static_cast<double>(r - 1),
-                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
-  }
-  double theta_extrap = static_cast<double>(pos);
-  for (int64_t i = 0; i < r; i += 2) {
-    const double theta_interp = freq_scale * theta_extrap;
-    double theta = theta_interp;
-    if (ext_factor != 0.0) {
-      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
-      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
-      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
-    }
-    const float c = static_cast<float>(std::cos(theta));
-    const float s = static_cast<float>(sin_sign * std::sin(theta));
-    const float x0 = v[i], x1 = v[i + 1];
-    v[i] = x0 * c - x1 * s;
-    v[i + 1] = x0 * s + x1 * c;
-    theta_extrap *= theta_scale;
-  }
-}
 
 std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) {
   return std::vector<float>(v.begin() + off, v.begin() + off + len);
@@ -1620,6 +1590,45 @@ void DumpAct(const char* name, const std::vector<float>& v) {
 
 }  // namespace
 
+namespace deepseek_v4 {
+
+double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
+  return static_cast<double>(n_dims) *
+         std::log(static_cast<double>(n_ctx_orig) /
+                  (beta * 2.0 * std::numbers::pi_v<double>)) /
+         (2.0 * std::log(base));
+}
+void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
+                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
+                      double beta_slow, bool inverse) {
+  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
+  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
+  double corr_lo = 0.0, corr_hi = 0.0;
+  if (ext_factor != 0.0) {
+    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = std::min(static_cast<double>(r - 1),
+                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
+  }
+  double theta_extrap = static_cast<double>(pos);
+  for (int64_t i = 0; i < r; i += 2) {
+    const double theta_interp = freq_scale * theta_extrap;
+    double theta = theta_interp;
+    if (ext_factor != 0.0) {
+      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
+      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
+      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+    }
+    const float c = static_cast<float>(std::cos(theta));
+    const float s = static_cast<float>(sin_sign * std::sin(theta));
+    const float x0 = v[i], x1 = v[i + 1];
+    v[i] = x0 * c - x1 * s;
+    v[i + 1] = x0 * s + x1 * c;
+    theta_extrap *= theta_scale;
+  }
+}
+
+}  // namespace deepseek_v4
+
 // ─── Brick C part 2: the DEVICE-RESIDENT T=1 decode forward ───────────────────
 // The host-orchestrated ForwardComposeImpl drains the stream ~560×/step (each GEMM
 // + each Disp* device kernel syncs so the host can read/copy its output). Here the
@@ -2488,7 +2497,8 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
                                              const V4Backend& be,
-                                             std::vector<float>* mtp_residual_out = nullptr) {
+                                             std::vector<float>* mtp_residual_out = nullptr,
+                                             dspark::TapRequest* taps = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -2620,6 +2630,38 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
       DumpAct(nm, Slice(x, 0, H));  // #188 per-sub-op diff: routed+shared MoE output [H]
     }
 
+    // DSV4-DSPARK-DRAFTER W-1: the trunk tap. The drafter's entry reads the
+    // POST-block manifold state at `dspark_target_layer_ids`, which is this
+    // layer's output folded back through `MhcPost` -- the same state upstream
+    // exports after its residual add (`exllamav3/modules/transformer.py:198-203`)
+    // -- collapsed to `[T, H]` by its stream mean.
+    //
+    // Costs nothing when no caller asks: `taps` is null on every path but the
+    // drafter's, and the fold below runs only for a REQUESTED layer.
+    if (taps != nullptr) {
+      const auto it =
+          std::find(taps->layer_ids.begin(), taps->layer_ids.end(), layer);
+      if (it != taps->layer_ids.end()) {
+        std::vector<float> stack(static_cast<size_t>(T) * hc * H);
+        for (int64_t t = 0; t < T; ++t) {
+          const std::vector<float> folded =
+              MhcPost(Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
+                      Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc),
+                      hc, H);
+          std::copy(folded.begin(), folded.end(),
+                    stack.begin() + static_cast<int64_t>(t) * hc * H);
+        }
+        // Stored AT the request's own index, not appended: the concatenation
+        // order in `main_proj` is the REQUEST order, and appending would order
+        // them by layer instead.
+        const size_t slot =
+            static_cast<size_t>(std::distance(taps->layer_ids.begin(), it));
+        if (taps->taps.size() != taps->layer_ids.size())
+          taps->taps.resize(taps->layer_ids.size());
+        taps->taps[slot] = dspark::StreamMeanTap(stack, T, hc, H);
+      }
+    }
+
     // coherence-debug #188: dump the [hc,H] manifold state AFTER this layer (the
     // MoE output folded back through MhcPost, matching ds4's `cur` after
     // layer_forward_self_one). t=0 only (single-token localization run).
@@ -2693,6 +2735,87 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          V4Miswire miswire, V4ForwardTrace* trace) {
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
                             V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+}
+
+// DSV4-DSPARK-DRAFTER W-3: one block's KV rows, derived from the projected taps.
+// Defined here because its two dependencies -- the trunk's weighted `RmsNorm` and
+// `RopeInplaceLayer` -- already live in this translation unit, so the drafter
+// reuses them rather than growing a second copy of either.
+namespace dspark {
+
+std::vector<float> BlockKvRows(const std::vector<float>& main_x,
+                               const std::vector<float>& wkv,
+                               const std::vector<float>& kv_norm_w, float eps,
+                               const std::vector<int32_t>& positions, double rope_theta,
+                               int64_t num_tokens, int64_t hidden, int64_t head_dim,
+                               int64_t rope_dim) {
+  VT_CHECK(head_dim > 0 && hidden > 0 && rope_dim >= 0 && rope_dim <= head_dim,
+           "dspark kv: degenerate geometry");
+  VT_CHECK(rope_dim % 2 == 0, "dspark kv: the rope span is rotated in PAIRS");
+  VT_CHECK(static_cast<int64_t>(main_x.size()) == num_tokens * hidden,
+           "dspark kv: main_x must be [num_tokens, hidden]");
+  VT_CHECK(static_cast<int64_t>(wkv.size()) == head_dim * hidden,
+           "dspark kv: wkv must be [head_dim, hidden]");
+  VT_CHECK(static_cast<int64_t>(kv_norm_w.size()) == head_dim,
+           "dspark kv: kv_norm is [head_dim] -- the norm covers the WHOLE head, not "
+           "the nope half (exllamav3_ext/rope.cu:207,379)");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
+           "dspark kv: one position per token");
+
+  const int64_t nope = head_dim - rope_dim;
+  std::vector<float> out(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
+  for (int64_t t = 0; t < num_tokens; ++t) {
+    std::vector<float> row(static_cast<size_t>(head_dim), 0.0f);
+    for (int64_t d = 0; d < head_dim; ++d) {
+      double acc = 0.0;
+      const float* w = &wkv[static_cast<size_t>(d * hidden)];
+      const float* x = &main_x[static_cast<size_t>(t * hidden)];
+      for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(w[h]) * x[h];
+      row[static_cast<size_t>(d)] = static_cast<float>(acc);
+    }
+    // NORM FIRST, over the whole head, then rotate the tail -- the kernel's own
+    // order (`load_head(); apply_norm(); apply_rope();`).
+    const std::vector<float> normed = RmsNorm(row, kv_norm_w, eps);
+    std::copy(normed.begin(), normed.end(),
+              out.begin() + static_cast<int64_t>(t) * head_dim);
+    if (rope_dim > 0) {
+      // The blocks are the `"sliding"` kind, so they take the DENSE rope arm:
+      // `freq_scale = 1`, `ext_factor = 0`, no YaRN ramp.
+      RopeInplaceLayer(out.data() + t * head_dim + nope, rope_dim,
+                       positions[static_cast<size_t>(t)], rope_theta,
+                       /*freq_scale=*/1.0, /*ext_factor=*/0.0, /*n_ctx_orig=*/0,
+                       /*beta_fast=*/0.0, /*beta_slow=*/0.0);
+    }
+  }
+  return out;
+}
+
+}  // namespace dspark
+
+// DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
+// Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream
+// mean per requested layer, IN REQUEST ORDER -- which is the order `main_proj`
+// concatenates them in.
+std::vector<std::vector<float>> DeepseekV4TrunkTapsHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int64_t>& layer_ids) {
+  for (const int64_t l : layer_ids)
+    VT_CHECK(l >= 0 && l < p.num_hidden_layers,
+             "deepseek-v4 taps: layer " + std::to_string(l) +
+                 " is outside the model's " + std::to_string(p.num_hidden_layers) +
+                 " layers; `dspark_target_layer_ids` names trunk layers");
+  dspark::TapRequest req;
+  req.layer_ids = layer_ids;
+  (void)ForwardComposeImpl(hw, p, token_ids, positions, /*logits_indices=*/{},
+                           V4Miswire::kNone, /*trace=*/nullptr,
+                           V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr},
+                           /*mtp_residual_out=*/nullptr, &req);
+  VT_CHECK(req.taps.size() == layer_ids.size(),
+           "deepseek-v4 taps: the forward filled " + std::to_string(req.taps.size()) +
+               " of " + std::to_string(layer_ids.size()) +
+               " requested taps; a requested layer was never reached");
+  return req.taps;
 }
 
 // ─── DeepSeek-V4 MTP self-speculative draft head (host oracle, W1) ────────────

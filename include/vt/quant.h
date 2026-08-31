@@ -162,9 +162,28 @@ bool QuantRepackEligible(DType weight_dtype, int64_t n, int64_t k);
 //
 // Transposes an ELEMENTWISE (f32/f16/bf16) [N,K] matmul weight into [K,N] so
 // `vt::MatmulBT` reaches the transpose-free `nk`/`nkm` micro-kernels, measured
-// 1.16x to 1.30x on dgx and BYTE-IDENTICAL (both orientations accumulate each
-// output over K in strict increasing order). Pure permutation: same bytes, same
-// count, so no product and no sum can change.
+// 1.16x to 1.30x on dgx AT THE SHAPES THAT ROW MEASURED, and BYTE-IDENTICAL
+// (both orientations accumulate each output over K in strict increasing order).
+// Pure permutation: same bytes, same count, so no product and no sum can change.
+//
+// THE SPEEDUP IS SHAPE- AND ISA-DEPENDENT AND CAN INVERT. IT IS NOT A GENERAL
+// WIN, and that is why it stays opt-in. Row LTX25-CONNECTOR-GEMM measured this
+// lever at the LTX-2.5 text connector's f32 shapes (M=1024, N/K in
+// {2048, 4096, 8192, 16384}) and found it SLOWER everywhere:
+//
+//   dgx / GB10 Cortex-X925  1.22x - 2.70x slower, 1.806x over the whole set
+//   Thor aarch64            1.389x over the whole set
+//   x86-64 AVX-512          1.78x - 2.06x over three load regimes
+//
+// -- byte-identical on every shape, with same-arm controls at 0.90x to 1.04x, so
+// the regression is not noise and not a numerical difference. The plausible
+// mechanism is that the [N,K] path's per-group register transpose costs less
+// than the [K,N] path's K-strided weight walk once N*4 exceeds a page, which is
+// exactly the trade that flips between shapes and between ISAs. So the 1.16x to
+// 1.30x above is a measurement of ITS shapes, not a property of the transform,
+// and a caller enabling VT_CPU_ELEM_KN_REPACK for a new weight set must measure
+// that weight set. Evidence:
+// /mnt/nas_share/rc/ltx25-connector-gemm/run/rc-worker-4b8lj-20260831T023318Z.
 //
 // The caller must set `Tensor.elem_kn_repacked` on the resulting weight. Only
 // the CPU `MatmulBTKernel` honours that flag, so a repacked buffer handed to

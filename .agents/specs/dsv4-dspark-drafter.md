@@ -137,8 +137,74 @@ W-3. **The three blocks**, composed from the existing pieces. The attention is t
 mechanism is `update_kv_from_target` writing paged rows aligned to the target's
 block tables.
 
+**W-3 starts with a SEAM change, and it is named here so the wave is not
+mis-estimated as pure composition.** Read at
+`exllamav3/modules/arch_specific/dspark.py:134-155`, `update_kv_rows` is:
+
+    kv = wkv(main_x).view(bsz, s, 1, D)
+    ext.rope(kv, kv, ..., positions, kv_norm_w, rms_norm_eps, ..., D - rd)
+    kl.write_rows(kv.view(bsz, s, D), positions, block_table)
+
+which is the operation the TRUNK already performs on its own KV -- project,
+weighted RMSNorm, partial RoPE over the last `rd` dims, paged write -- differing
+only in that it is sourced from `main_x` rather than from the hidden state. The
+blocks are `"sliding"`, so they take the dense RoPE arm (`rope_theta`,
+`freq_scale = 1`), not the compressed layers' YaRN.
+
+The obstacle is that `RopeInplaceLayer` lives in `deepseek_v4.cpp`'s ANONYMOUS
+namespace and has no declaration in any header, while `MhcPost` and friends are
+exported through `deepseek_v4_mhc.h`. The drafter must not re-implement RoPE
+beside it: `AGENTS.md` §"Shared seams" says to extend the seam rather than write a
+parallel path, and a second RoPE would be a second place for the dual-theta rule
+to drift. So W-3's first brick is lifting `RopeInplaceLayer` into a shared header
+alongside the existing per-concern V4 headers, with the trunk and the drafter both
+reading it. That is a refactor of trunk internals and deserves its own review
+rather than riding along with the block composition.
+
+**LANDED.** `deepseek_v4_rope.h` exports `RopeInplaceLayer` and `YarnCorrDim` from
+`vllm::deepseek_v4`; the trunk calls them through the seam. The move is
+behaviour-preserving by construction rather than by assertion -- both function
+bodies were extracted and diffed against their originals and are BYTE-IDENTICAL
+apart from the default argument moving to the declaration, which is the only
+change a header can force.
+
+The seam's contract is gated, and one of those gates had to be repaired before it
+meant anything. The first version of "the YaRN arm is not the dense arm" also
+varied `freq_scale`, so the two calls differed for that reason alone and a mutation
+disabling the ext_factor ramp passed it. The cases now hold everything but one
+parameter equal, one for `ext_factor` and one for `freq_scale`, which is what makes
+each half of the dual-theta split observable.
+
 W-4. **The markov head and the sampling loop.** Cheap in weights and the whole
 reason the block is affordable, so it is its own wave with its own gate.
+
+W-3's KV derivation LANDED. `dspark::BlockKvRows` is `update_kv_rows`'s host
+half: project the shared tap state through the block's own `wkv`, RMSNorm, rotate
+the tail. It lives in `deepseek_v4.cpp` because the trunk's `RmsNorm` and the
+lifted `RopeInplaceLayer` are both already there, so the drafter reuses them
+rather than growing a copy of either.
+
+**The norm covers the WHOLE head, and this is NOT `vt::kFusedNormRope`'s
+convention.** That op implements DeepSeek-V2/V3 MLA, where the norm covers only
+the nope half and the decoupled rope part stays UNNORMED. Read out of the kernel
+rather than inferred: `exllamav3_ext/rope.cu` requires the norm weight to be
+`head_dim` wide (:379), divides the RMS by `head_dim` (:207), and orders the body
+`load_head(); apply_norm(); apply_rope();` (:248-251). The artifact agrees --
+`mtp.0.attn.kv_norm.weight` is `[512]`, the full head, where the V2 convention
+would make it `[448]`.
+
+Order is gated, and only after a repair. RMSNorm's scale is a scalar and rotation
+preserves the sum of squares, so **norm and rope COMMUTE whenever gamma is equal
+within a rotated pair** -- and at position 0 the rotation is the identity anyway.
+The first cases met neither condition, so a mutation that roped before norming
+passed them. The added case uses a non-zero position AND a gamma that differs
+inside the pair, which is the only shape in which the order is observable at all.
+
+W-4 LANDED. `MarkovDraftLoop` is the sequential chain: per step one embedding
+gather, one rank-256 GEMV and an argmax, with the bias conditioned on the
+PREVIOUSLY SAMPLED id. Ties go to the lowest id, matching `torch.argmax`, because
+a drafter that breaks them the other way emits valid text and diverges from the
+oracle -- the exact class of difference acceptance cannot explain afterwards.
 
 W-5. **Propose/verify**, reusing the shared `RejectionSampler` verbatim. The
 lossless property makes the correctness gate exact: drafter-on greedy output must
@@ -178,12 +244,28 @@ Throughput is claimed only at W-6, against the target's own recipe: 384k context
 
 ## 6. Owed
 
-- **W-2 IS UNREACHED.** `vllm::dspark::StreamMeanTap` and
-  `vllm::dspark::ProjectTaps` land with their gate and nothing else calls them:
-  no production entry point reaches the drafter, because the drafter does not
-  exist yet. This row owns the wiring, and W-1 (the tap seam on the trunk) is the
-  first caller. Recorded here rather than left for a reader to discover, as
-  `AGENTS.md` §"Nothing lands dead" requires of a staged slice.
+- **The trunk's tap gate cannot see the REDUCTION.** Deleting the trunk's tap fill
+  reds `test_deepseek_v4_mtp`, and ordering the taps by layer instead of by request
+  reds it too, so the seam and its order are gated. But mutating `StreamMeanTap`
+  from a mean to a sum leaves that file green: a uniform factor preserves
+  non-triviality, per-layer difference and ordering alike. The mean is pinned only
+  in `test_deepseek_v4_dspark_entry.cpp`, so a change that replaced the trunk's
+  call with an inline reduction of its own would pass both. Closing this needs the
+  trunk to expose the pre-mean stack, or the tap to be compared against an
+  independently computed one.
+
+- **W-1 AND W-2 ARE NOT REACHED FROM PRODUCTION, and the distinction is worth
+  being exact about.** The tap fill now lives INSIDE `ForwardComposeImpl`, which
+  is production code, and it calls `dspark::StreamMeanTap`. But it is inert unless
+  a caller passes a `TapRequest`, and the only caller that does is
+  `DeepseekV4TrunkTapsHost`, which the drafter's gate drives and nothing else.
+  `ProjectTaps` has no caller at all.
+
+  So by `AGENTS.md` §"Nothing lands dead" this is still a staged slice: no
+  production entry point -- not `include/vllm.h`, the loader,
+  `ModelRegistry::Forward`, nor any registered server or CLI path on its default
+  configuration -- reaches either function, because the drafter they exist for is
+  not built yet. This row owns the wiring; W-3 is the first production caller.
 
 - The row's own GitHub issue, once the account is restored.
 - The real-artifact load, which is blocked on `MODEL-DSV4-EXL3` W1c-4's

@@ -2748,6 +2748,35 @@ target_include_directories(vllm_conv1d_scaling_probe SYSTEM PRIVATE
 target_compile_features(vllm_conv1d_scaling_probe PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_conv1d_scaling_probe)
 
+# ── The LTX-2.5 connector GEMM probe (LTX25-CONNECTOR-GEMM) ─────────────────
+# `tools/bench/ltx2_connector_gemm_probe.cpp` is the instrument behind
+# `.agents/specs/ltx25-connector-gemm.md`: which CPU GEMM tier the LTX-2.5 text
+# connector's `vt::MatmulBT` calls actually enter, what the two weight
+# orientations cost at those shapes, and how much of `Ltx2ConnectorForward` the
+# GEMM accounts for at all.
+#
+# CI COMPILES IT AND RUNS NOTHING, the same trade its two siblings above record:
+# one leg allocates hundreds of megabytes and spends tens of seconds of every
+# core, which no test tier should pay. What the build buys is that the one file
+# a reader has to compile to re-derive "what the connector's 224.9 s is spent
+# on" cannot rot behind a `vt::MatmulBT`, `vt::AttentionCross` or
+# `Ltx2ConnectorForward` signature change -- the #1246 failure, where the sole
+# named harness for a measurement was compiled by nothing.
+#
+# The recorded runs were taken from the DIRECT g++ compile in the file's own
+# header rather than from this target, because the devbox they were taken on has
+# no room for a CMake build tree. The target still compiles the whole file: it
+# defines no `LTX2_PROBE_NO_CONNECTOR`, so the connector and attention modes are
+# in the guard as well as the GEMM one.
+add_executable(vllm_ltx2_connector_gemm_probe tools/bench/ltx2_connector_gemm_probe.cpp)
+target_link_libraries(vllm_ltx2_connector_gemm_probe PRIVATE vllm)
+target_include_directories(vllm_ltx2_connector_gemm_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_ltx2_connector_gemm_probe SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_ltx2_connector_gemm_probe PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_ltx2_connector_gemm_probe)
+
 # ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
 # `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
 # `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier

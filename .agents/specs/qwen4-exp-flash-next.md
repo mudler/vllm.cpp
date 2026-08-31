@@ -3898,6 +3898,18 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **A CI DEFECT FOUND AND FIXED IN FLOW: `agent-record` failed on EVERY pull
+  request.** [#2407](https://github.com/mudler/vllm.cpp/issues/2407).
+  `.github/workflows/ci.yml` still ran
+  `tests/scripts/test_check_issue_index_append_only.py`, which `7dc2ef1ea`
+  deleted when it retired the append-only index. The job therefore printed
+  `agent record OK: ENGINE=173 MODEL=379 ...` and then exited 2 on a missing
+  file -- the gate green, the check red, which is the worst shape a check can
+  take. W6-CUDA-B hit it on its own pull request, and AGENTS.md "Every change
+  starts from an issue" says to file and fix in the same flow rather than defer,
+  so the line is deleted here. Nothing replaces it: the index it tested is
+  retired and "GitHub is the index. There is no index file."
+
 - **W6-CUDA-B LANDS FOUR CUDA ARMS THAT NOTHING REACHES, AND ONE BLOCKER
   REMAINS. ISSUE OWED.** `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup`,
   `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention` now have CUDA

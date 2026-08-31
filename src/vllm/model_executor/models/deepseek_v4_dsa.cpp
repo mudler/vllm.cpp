@@ -495,4 +495,88 @@ std::vector<float> IndexerCompressedKeys(
                              index_head_dim, rope_dim, rope_theta, coff);
 }
 
+std::vector<int64_t> IndexerSelectCompressed(const std::vector<float>& iq,
+                                             const std::vector<float>& keys,
+                                             const std::vector<float>& folded,
+                                             const std::vector<int64_t>& positions,
+                                             int64_t num_tokens, int64_t n_rows,
+                                             int64_t index_n_heads,
+                                             int64_t index_head_dim, int64_t top_k,
+                                             int64_t compress_ratio) {
+  VT_CHECK(compress_ratio > 0 && top_k > 0 && index_head_dim > 0,
+           "deepseek-v4 indexer select: degenerate shape");
+  VT_CHECK(static_cast<int64_t>(iq.size()) ==
+               num_tokens * index_n_heads * index_head_dim,
+           "deepseek-v4 indexer select: iq is [num_tokens, n_heads*head_dim]");
+  VT_CHECK(static_cast<int64_t>(keys.size()) == n_rows * index_head_dim,
+           "deepseek-v4 indexer select: keys are COMPRESSED rows "
+           "[n_rows, index_head_dim], not per-token keys");
+  VT_CHECK(static_cast<int64_t>(folded.size()) == num_tokens * index_n_heads,
+           "deepseek-v4 indexer select: folded is [num_tokens, n_heads]");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
+           "deepseek-v4 indexer select: one position per token");
+
+  std::vector<int64_t> out(static_cast<size_t>(num_tokens) * top_k, -1);
+  for (int64_t t = 0; t < num_tokens; ++t) {
+    // HOW MANY ROWS EXIST at this position, upstream's own count. A row that has
+    // not closed yet is not a candidate, and selecting one would score a key the
+    // model has not produced.
+    const int64_t avail =
+        std::min(n_rows, (positions[static_cast<size_t>(t)] + 1) / compress_ratio);
+    if (avail <= 0) continue;  // the whole row stays -1: nothing to select yet
+
+    std::vector<std::pair<double, int64_t>> scored;
+    scored.reserve(static_cast<size_t>(avail));
+    for (int64_t r = 0; r < avail; ++r) {
+      double s = 0.0;
+      for (int64_t h = 0; h < index_n_heads; ++h) {
+        double dot = 0.0;
+        const float* qh =
+            &iq[static_cast<size_t>((t * index_n_heads + h) * index_head_dim)];
+        const float* kr = &keys[static_cast<size_t>(r * index_head_dim)];
+        for (int64_t d = 0; d < index_head_dim; ++d)
+          dot += static_cast<double>(qh[d]) * kr[d];
+        s += dot * static_cast<double>(
+                       folded[static_cast<size_t>(t * index_n_heads + h)]);
+      }
+      scored.emplace_back(s, r);
+    }
+    // Highest score first; ties to the LOWER row index, so the order is total and
+    // does not depend on the sort's stability.
+    std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+      if (a.first != b.first) return a.first > b.first;
+      return a.second < b.second;
+    });
+    const int64_t take = std::min<int64_t>(top_k, avail);
+    for (int64_t j = 0; j < take; ++j)
+      out[static_cast<size_t>(t * top_k + j)] = scored[static_cast<size_t>(j)].second;
+    // The tail stays -1: PADDING, and a caller that reads it as a row would
+    // attend a real key at every unfilled slot.
+  }
+  return out;
+}
+
+std::vector<float> GatherSelectedCompressed(const std::vector<float>& comp_rows,
+                                            const std::vector<int64_t>& sel,
+                                            int64_t n_rows, int64_t head_dim) {
+  VT_CHECK(head_dim > 0, "deepseek-v4 gather: degenerate head_dim");
+  VT_CHECK(static_cast<int64_t>(comp_rows.size()) == n_rows * head_dim,
+           "deepseek-v4 gather: comp_rows is [n_rows, head_dim]");
+  std::vector<float> out;
+  out.reserve(sel.size() * static_cast<size_t>(head_dim));
+  for (const int64_t r : sel) {
+    // PADDING, dropped. Reading `-1` as row zero would attend a real key the
+    // indexer did not choose, at every unfilled slot.
+    if (r < 0) continue;
+    VT_CHECK(r < n_rows,
+             "deepseek-v4 gather: selection names compressed row " +
+                 std::to_string(r) + " but only " + std::to_string(n_rows) +
+                 " have closed; an index past the end is a selection bug, not "
+                 "padding");
+    out.insert(out.end(), comp_rows.begin() + r * head_dim,
+               comp_rows.begin() + (r + 1) * head_dim);
+  }
+  return out;
+}
+
 }  // namespace vllm::deepseek_v4

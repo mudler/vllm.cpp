@@ -298,4 +298,53 @@ std::vector<float> IndexerCompressedKeys(
     int64_t num_tokens, int64_t hidden, int64_t index_head_dim, int64_t compress_ratio,
     int64_t rope_dim, double rope_theta, float eps);
 
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — the indexer's SELECTION, over compressed
+// rows.
+//
+// `_fill_short_context_topk_indices` (`attention.py:71-87`) fixes what an index
+// means: `num_compressed = (position + 1) / compress_ratio` rows are available at
+// a position, a selection index addresses one of THOSE, and `-1` pads the row out
+// to `top_k`. So this returns compressed-row indices, never token indices, and a
+// caller must honour `-1` as padding rather than read it as row zero.
+//
+// The scores are `q . k` over the indexer's heads, folded by the per-head
+// weights, which is the same shape the per-token path used -- only the candidate
+// set changes, from tokens to closed compressed rows.
+//
+//   iq        [num_tokens, index_n_heads * index_head_dim]
+//   keys      [n_rows, index_head_dim]  the compressed keys, oldest first
+//   folded    [num_tokens, index_n_heads]  the weights_proj fold
+//   returns   [num_tokens * top_k] compressed-row indices, `-1` padded
+std::vector<int64_t> IndexerSelectCompressed(const std::vector<float>& iq,
+                                             const std::vector<float>& keys,
+                                             const std::vector<float>& folded,
+                                             const std::vector<int64_t>& positions,
+                                             int64_t num_tokens, int64_t n_rows,
+                                             int64_t index_n_heads,
+                                             int64_t index_head_dim, int64_t top_k,
+                                             int64_t compress_ratio);
+
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — gather the SELECTED compressed rows.
+//
+// The `cr == 4` family attends its sliding window plus the compressed rows the
+// indexer CHOSE, where the `cr == 128` family attends the window plus ALL closed
+// rows. So the only difference at the attention is which rows reach
+// `MergeWindowAndCompressed`, and this is what narrows them.
+//
+// `-1` IS PADDING and is dropped, never read as row zero. A selection row is
+// padded out to `top_k` whenever fewer rows have closed than `top_k`, so the
+// padded slots are the common case rather than an edge one, and treating one as a
+// row attends a real key the indexer did not choose.
+//
+// Rows come back in SELECTION order, best first, because that is the order the
+// indices arrive in; the merge is order-independent, so this is a property of the
+// buffer rather than a requirement on it.
+//
+//   comp_rows  [n_rows, head_dim]   every closed row, oldest first
+//   sel        [top_k]              one token's indices, `-1` padded
+//   returns    [k, head_dim] with k <= top_k, the selected rows compacted
+std::vector<float> GatherSelectedCompressed(const std::vector<float>& comp_rows,
+                                            const std::vector<int64_t>& sel,
+                                            int64_t n_rows, int64_t head_dim);
+
 }  // namespace vllm::deepseek_v4

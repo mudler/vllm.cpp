@@ -891,3 +891,122 @@ TEST_CASE("W3: the indexer REFUSES a ratio it cannot exist at") {
       x, wk, wg, ape, nrm, &st_kv, &st_sc, {0}, 1, H, ihd, /*cr=*/128, 2, 10000.0,
       1e-6f));
 }
+
+TEST_CASE("W3: selection returns COMPRESSED-ROW indices, -1 padded") {
+  // `attention.py:71-87`: `num_compressed = (position + 1) / compress_ratio`
+  // rows exist at a position, an index addresses one of THOSE, and `-1` pads the
+  // row out to `top_k`. Reading `-1` as row zero would attend a real key at every
+  // unfilled slot, finitely and wrongly.
+  const int64_t inh = 1, ihd = 4, cr = 4, topk = 3, T = 3, n_rows = 4;
+  // Keys chosen so the score ORDER is decidable by hand: row r has magnitude r.
+  std::vector<float> keys(static_cast<size_t>(n_rows * ihd), 0.0f);
+  for (int64_t r = 0; r < n_rows; ++r)
+    for (int64_t d = 0; d < ihd; ++d)
+      keys[static_cast<size_t>(r * ihd + d)] = static_cast<float>(r);
+  // A uniform positive query and a unit fold, so the score is monotone in r.
+  const std::vector<float> iq(static_cast<size_t>(T * inh * ihd), 1.0f);
+  const std::vector<float> folded(static_cast<size_t>(T * inh), 1.0f);
+  // Positions 3, 7, 11 -> 1, 2, 3 closed rows respectively.
+  const std::vector<int64_t> pos{3, 7, 11};
+
+  const auto sel = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, folded, pos, T, n_rows, inh, ihd, topk, cr);
+  REQUIRE(sel.size() == static_cast<size_t>(T * topk));
+
+  // Token 0: ONE row available, so one index and two padding slots.
+  CHECK(sel[0] == 0);
+  CHECK(sel[1] == -1);
+  CHECK(sel[2] == -1);
+  // Token 1: two rows; the higher-scoring (larger r) comes first.
+  CHECK(sel[3] == 1);
+  CHECK(sel[4] == 0);
+  CHECK(sel[5] == -1);
+  // Token 2: three rows, best first.
+  CHECK(sel[6] == 2);
+  CHECK(sel[7] == 1);
+  CHECK(sel[8] == 0);
+}
+
+TEST_CASE("W3: a position with NO closed row selects nothing") {
+  // Below the first boundary there is nothing to select, and the whole row must
+  // stay padding rather than fall back to row zero.
+  const int64_t inh = 1, ihd = 2, cr = 4, topk = 2, T = 1, n_rows = 3;
+  const std::vector<float> keys(static_cast<size_t>(n_rows * ihd), 1.0f);
+  const std::vector<float> iq(static_cast<size_t>(T * inh * ihd), 1.0f);
+  const std::vector<float> folded(static_cast<size_t>(T * inh), 1.0f);
+  const auto sel = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, folded, {2}, T, n_rows, inh, ihd, topk, cr);  // (2+1)/4 == 0
+  REQUIRE(sel.size() == 2u);
+  CHECK(sel[0] == -1);
+  CHECK(sel[1] == -1);
+}
+
+TEST_CASE("W3: the per-head FOLD is load-bearing in the score") {
+  // The weights_proj fold weights each head's dot product. Flipping one head's
+  // sign must change which row wins, or the fold is decoration.
+  const int64_t inh = 2, ihd = 2, cr = 1, topk = 1, T = 1, n_rows = 2;
+  // head 0 prefers row 0, head 1 prefers row 1.
+  const std::vector<float> keys{2.0f, 0.0f, 0.0f, 2.0f};
+  const std::vector<float> iq{1.0f, 0.0f, 0.0f, 1.0f};  // [h0 q, h1 q]
+  const std::vector<int64_t> pos{1};  // (1+1)/1 == 2 rows available
+
+  const auto a = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, /*folded=*/{1.0f, 0.0f}, pos, T, n_rows, inh, ihd, topk, cr);
+  const auto b = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, /*folded=*/{0.0f, 1.0f}, pos, T, n_rows, inh, ihd, topk, cr);
+  CHECK(a[0] == 0);  // head 0 dominates
+  CHECK(b[0] == 1);  // head 1 dominates
+}
+
+TEST_CASE("W3: selection refuses PER-TOKEN keys, which is the operand it replaced") {
+  const int64_t inh = 1, ihd = 4, cr = 4, topk = 2, T = 2;
+  const std::vector<float> iq(static_cast<size_t>(T * inh * ihd), 1.0f);
+  const std::vector<float> folded(static_cast<size_t>(T * inh), 1.0f);
+  const std::vector<float> per_token(static_cast<size_t>(T * ihd), 1.0f);
+  // n_rows says 3 but the buffer holds 2 rows' worth: a mismatch, refused.
+  CHECK_THROWS(vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, per_token, folded, {3, 7}, T, /*n_rows=*/3, inh, ihd, topk, cr));
+}
+
+TEST_CASE("W3: the gather drops -1 padding and keeps selection order") {
+  // The `cr == 4` family attends the window plus the rows the indexer CHOSE,
+  // where `cr == 128` attends the window plus ALL closed rows. This is the only
+  // difference at the attention, so it is the whole of what W3 adds there.
+  const int64_t hd = 3, n_rows = 4;
+  std::vector<float> rows(static_cast<size_t>(n_rows * hd), 0.0f);
+  for (int64_t r = 0; r < n_rows; ++r)
+    for (int64_t d = 0; d < hd; ++d)
+      rows[static_cast<size_t>(r * hd + d)] = static_cast<float>(10 * r + d);
+
+  // Selection order is best-first and NOT sorted by row; padding trails it.
+  const std::vector<int64_t> sel{2, 0, -1, -1};
+  const auto got = vllm::deepseek_v4::GatherSelectedCompressed(rows, sel, n_rows, hd);
+  REQUIRE(got.size() == static_cast<size_t>(2 * hd));
+  // Row 2 first, then row 0 -- selection order preserved.
+  CHECK(got[0] == doctest::Approx(20.0f));
+  CHECK(got[1] == doctest::Approx(21.0f));
+  CHECK(got[2] == doctest::Approx(22.0f));
+  CHECK(got[3] == doctest::Approx(0.0f));
+  CHECK(got[4] == doctest::Approx(1.0f));
+  CHECK(got[5] == doctest::Approx(2.0f));
+}
+
+TEST_CASE("W3: an ALL-padding selection gathers nothing") {
+  // Before the first boundary every slot is `-1`. The result must be EMPTY, which
+  // is what makes the caller fall back to the window pass alone rather than merge
+  // against a fabricated row.
+  const int64_t hd = 2, n_rows = 3;
+  const std::vector<float> rows(static_cast<size_t>(n_rows * hd), 1.0f);
+  const auto got =
+      vllm::deepseek_v4::GatherSelectedCompressed(rows, {-1, -1, -1}, n_rows, hd);
+  CHECK(got.empty());
+}
+
+TEST_CASE("W3: an index PAST the closed rows is refused, not clamped") {
+  // Distinct from padding: `-1` means "no row", while `n_rows` means the selection
+  // is wrong. Clamping would attend the newest row whenever selection overran.
+  const int64_t hd = 2, n_rows = 2;
+  const std::vector<float> rows(static_cast<size_t>(n_rows * hd), 1.0f);
+  CHECK_THROWS(
+      vllm::deepseek_v4::GatherSelectedCompressed(rows, {0, 2}, n_rows, hd));
+}

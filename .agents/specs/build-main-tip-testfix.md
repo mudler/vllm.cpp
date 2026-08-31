@@ -35,8 +35,8 @@ blocking every PR's CI at the merge ref:
    drives that same schedule, so its call gains the same explicit `nullptr`
    slot. The selection stays where W9 put it: the parameter it names.
 2. Loader: rename the shadowing declarations only — branch-local `v` at line
-   223 becomes `v_group` (use at 224), line 226 becomes `v_inner` (use at
-   227). The first branch's `v` and everything else in the function stay
+   223 becomes `v_group` (use at 225), line 226 becomes `v_inner` (use at
+   228). The first branch's `v` and everything else in the function stay
    byte-identical. No logic, ordering, or refusal behavior changes; both
    `KvInt` calls keep their exact arguments.
 

@@ -173,9 +173,26 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
 // DType on a CUDA build, and a decoder added to one side without the other
 // reddens it.
 //
-// METAL, VULKAN, ROCM and TENSTORRENT still refuse: each of their `kEmbedding`
-// kernels asserts a float table by name (e.g. tenstorrent_ops.cpp:1500), so for
-// them the pre-existing expand-bf16 residency remains the only correct answer
+// AND YET THIS STILL RETURNS `kCPU` ALONE. The one-line flip that would add the
+// CUDA device enumerator here FAILS `scripts/check-device-leakage.py`: it would
+// be the first such token this file carries (bucket baseline 0), and naming a
+// device in the device-agnostic loader is exactly the debt that gate exists to
+// stop. (This comment says it in prose on purpose: that checker greps the token
+// in comments too, and rightly so -- a prose mention is how the next one starts.) Its message names the fix and `GgufQuantComputeAvailable()` above
+// already uses it -- ask the op/provider table. Doing that properly needs an
+// `OpId` for the block gather, registered by the backends that decode a row and
+// dispatched from `vt::Embedding`, which is its own scoped change (recorded in
+// `.agents/specs/cuda-quant-gather.md` under "Blocked").
+//
+// So the KERNEL landed and the RESIDENCY did not, deliberately and in that
+// order: a flipped gate over an arm no device has yet executed converts a clean
+// load-time refusal into silent garbage, and that is the failure class this row
+// spent a day isolating. On CUDA a gather table therefore keeps its
+// expand-bf16 residency for now, exactly as before.
+//
+// METAL, VULKAN, ROCM and TENSTORRENT refuse for a DIFFERENT and more permanent
+// reason: each of their `kEmbedding` kernels asserts a float table by name (e.g.
+// tenstorrent_ops.cpp:1500), so for them expand-bf16 is the only correct answer
 // and the arm is owed per device.
 //
 // What this unlocks is not one op. On a device that cannot gather quantized,
@@ -185,7 +202,7 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
 // a GPU arm possible, and llama.cpp's own n-gram path does NOT have this shape
 // (#27742 pins that table to the CPU by tensor class).
 bool DeviceQuantGatherSupported(vt::DeviceType dev) {
-  return dev == vt::DeviceType::kCPU || dev == vt::DeviceType::kCUDA;
+  return dev == vt::DeviceType::kCPU;
 }
 
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {

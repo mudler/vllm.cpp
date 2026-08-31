@@ -772,9 +772,9 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
     CHECK(msg.find("gather") != std::string::npos);
   }
 
-  SUBCASE("every device WITHOUT a block gather still refuses") {
+  SUBCASE("every device the residency gate does not admit still refuses") {
     for (vt::DeviceType d :
-         {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
           vt::DeviceType::kROCM}) {
       CAPTURE(vt::DeviceTypeName(d));
       CHECK_THROWS_AS(
@@ -783,14 +783,17 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
     }
   }
 
-  SUBCASE("cuda LOADS, because KGATHER gave it a block-decoding gather") {
-    // The point of the whole row. Before KGATHER this device threw here, the
-    // n-gram table expanded to 95.368 GiB of host bf16 on every other route,
-    // and the model had no GPU arm. The load runs on a CPU-only build too: the
-    // device is a PARAMETER of the policy decision, not a place tensors go, so
-    // this asserts the admission and not a device transfer.
-    CHECK_NOTHROW((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
-                                                   vt::DeviceType::kCUDA));
+  SUBCASE("cuda still refuses, because KGATHER landed the kernel and not the flip") {
+    // KGATHER gave CUDA a block-decoding gather, so the KERNEL half of this
+    // refusal is discharged. The residency half is not: admitting the device in
+    // `DeviceQuantGatherSupported` means naming it in the device-agnostic
+    // loader, which `check-device-leakage.py` refuses, and doing it properly
+    // needs an `OpId` for the block gather. This case pins the CURRENT
+    // behaviour so the flip cannot arrive silently -- when it lands, this
+    // subcase is what has to change, deliberately, in that change.
+    CHECK_THROWS_AS((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                     vt::DeviceType::kCUDA),
+                    std::exception);
   }
 
   SUBCASE("CPU loads, and so does an explicit kCPU") {

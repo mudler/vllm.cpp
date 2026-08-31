@@ -692,10 +692,16 @@ TEST_CASE("the gather's DEVICE gate admits exactly the kernels that decode a row
   // throw at the first forward with the whole model resident, which is the
   // failure the #523 review named and the reason the gate exists at all.
   CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kCPU));
-  CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kCUDA));
+  // CUDA is NOT here, and the reason is recorded rather than left to be guessed:
+  // the device now HAS a block-decoding gather (`cuda_quant_dequant.cuh`), but
+  // admitting it in this predicate means naming the device in the
+  // device-agnostic loader, which `check-device-leakage.py` refuses. The fix is
+  // an `OpId` for the block gather so this asks the registry instead, and it is
+  // its own scoped change. Until then a gather table on CUDA keeps expand-bf16,
+  // and this case is what would notice a flip that skipped that work.
   for (vt::DeviceType d :
-       {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN, vt::DeviceType::kROCM,
-        vt::DeviceType::kTENSTORRENT}) {
+       {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+        vt::DeviceType::kROCM, vt::DeviceType::kTENSTORRENT}) {
     CAPTURE(vt::DeviceTypeName(d));
     CHECK_FALSE(vllm::DeviceQuantGatherSupported(d));
   }

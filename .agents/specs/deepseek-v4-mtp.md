@@ -302,6 +302,41 @@ projection and this spec does not yet know what it is. `hc_attn_fn` is
 own MHC mixing, per-block rather than the single `hc_head` collapse our struct
 holds.
 
+**RESOLVED (2026-08-31), by reading the producer.** `exllamav3` at the registered
+pin `2398c056` carries the architecture in
+`exllamav3/architecture/deepseek_v4_mtp.py` and
+`exllamav3/modules/arch_specific/dspark.py`, and it is not a DeepSeek MTP head at
+all. It is the **DSPARK BLOCK DRAFTER**:
+
+- `main_proj` is `Linear(in_features = n_taps * hidden_size, out_features =
+  hidden_size)`. `dspark_target_layer_ids = [40, 41, 42]`, so `n_taps = 3` and the
+  `[H, 3H]` shape is the concatenation of the TRUNK'S STREAM-MEAN TAPS at those
+  three layers -- not `concat(embed, hidden)`. `main_norm` normalizes the result.
+- The three `mtp.{0,1,2}` are **three blocks of ONE drafter**, not three
+  independent heads: full transformer blocks with compressor-less DSA attention, a
+  216-expert noaux MoE with a shared expert, and mHC residual streams. Entry is
+  `main_proj`/`main_norm` on block 0; exit is block N-1's own `hc_head` collapse
+  and final norm into the SHARED TRUNK HEAD, which is why no `shared_head` or
+  `lm_head` appears in the tail.
+- It is SEMI-AUTOREGRESSIVE. `dspark_block_size = 5` is the K5 in "DSpark K5":
+  the input layer takes one seed token, appends `block_size - 1` copies of
+  `dspark_noise_token_id` (128799), embeds them through the ATTACHED target's
+  embedding, and expands to the mHC stream stack. It proposes a BLOCK, and the
+  published acceptance profile 0.65/0.44/0.31/0.17/0.07 is one number per block
+  position.
+- The last block additionally carries a factorized-bigram markov head
+  (`dspark_markov_rank = 256`, a per-token logit bias applied during the
+  sequential sampling loop) and a confidence head (a per-position score for
+  dynamic draft length). Neither has any analogue in this tree.
+
+`num_nextn_predict_layers = 1` in the artifact's own `config.json` does NOT
+describe this. The block count is `num_mtp_layers`, and three blocks are what the
+tensors show.
+
+A reference implementation ships in the source repo under
+`hf/inference/model.py` (`DSparkBlock`, `DSparkAttention`, `forward_spec`). It is
+NOT in the staged copy on the NAS, so reading it needs the HF repo.
+
 **Nothing here should be mapped onto our struct by name similarity.** Guessing
 that `main_proj` is `eh_proj` with an extra stream would produce a head that runs,
 emits finite logits, and drafts badly -- and because MTP is lossless by
@@ -309,10 +344,10 @@ construction, the OUTPUT would still be correct, so the only symptom would be an
 acceptance rate nobody can explain. That is the most expensive shape of wrong
 available here.
 
-What settles it is the producer, not inference: the artifact was quantized by
-`exllamav3` (this row's registered secondary oracle) at rev `787d1582`, and
-`main_proj` appears nowhere in this tree. Reading that source is a precondition
-for R1c, and R1c is not startable until it is read.
+What settled it was the producer rather than inference. Note that `787d1582`, the
+rev the checkpoint was quantized at, does NOT contain `main_proj`; the DSpark
+support is at the registered pin `2398c056`, so a reader who checks only the
+quantizing rev finds nothing and may conclude the name is undocumented.
 
 ### R1b — why there is no host float tower for the head
 
@@ -382,7 +417,7 @@ which is what separates "the function works" from "anything reaches it".
 | W1c gate | `test_deepseek_v4_mtp` (finite + RED-first + lossless verify) | DONE |
 | R1a inventory | the loader CLASSIFIES the `mtp.*` tail instead of only counting it (`ClassifyDeepseekV4MtpTail`); fp8-block at 128x128 and MXFP4 at group 32 are recognised, anything else is reported by name | DONE |
 | R1b routing | the tail is routed to BORROWED views (`RouteDeepseekV4MtpTail`) and dequantized one tensor at a time (`DequantizeDeepseekV4MtpTensor`); the residency question is answered by keeping it quantized, NOT by a host float tower | DONE |
-| R1c head assembly | drive the routed views into a draft forward. BLOCKED, not merely residual: the artifact's head carries `main_norm`/`main_proj` `[H, 3H]` and no `enorm`/`hnorm`/`e_proj`/`h_proj`, so the mapping onto `DeepseekV4MtpHostWeights` is unknown and must be read out of `exllamav3` rather than guessed | BLOCKED |
+| R1c drafter model | the tail is a DSPARK BLOCK DRAFTER, not a DeepSeek MTP head: 3 blocks, 3 trunk taps at layers [40,41,42] through `main_proj`, a 5-token noise-seeded block, a markov bias head and a confidence head. `DeepseekV4MtpHostWeights` and `DeepseekV4MtpDraftLogitsHost` model a DIFFERENT architecture and cannot be extended into this one | RESIDUAL, and it is a NEW model rather than a wiring job |
 | R2 decode-loop | DS4-native propose/verify over `ForwardResidentDecodeGguf` (stash residual, draft k=1, verify) | RESIDUAL |
 | R3 engine register | wire `DeepSeekV4MTP` as the engine speculator (C++ analogue of registry.py:617) | RESIDUAL |
 | R4 device draft | device MTP forward for decode-graph speed | RESIDUAL |

@@ -7598,6 +7598,27 @@ this change -- the three `.cu` arms, both `CMakeLists.txt`, the three suites and
 verified by `sha256`. So the result transfers to the pushed tree exactly. It was
 NOT re-run a third time on `642c20acf` itself, and that is the honest boundary.
 
+##### A conflict-free merge moved the converters this wave's byte gate rests on
+
+Recorded because it is the exact shape this row keeps meeting and because the
+merge raised no conflict. `origin/main` `08fa2f5aa` (row VT-CPU-ELEM-DISPATCH)
+rewrote `include/vt/dtype.h`, INLINING `SizeOf`, `F16ToF32` and `BF16ToF32` and
+renaming `AsF32` to `detail::BitsToF32`. Both of this wave's byte-identity
+claims depend on those functions: the CUDA arms assert `__float2bfloat16` is the
+same round-to-nearest-even as `vt::F32ToBF16`, and the suites narrow every
+operand through them so that both arms are handed the same bits.
+
+Checked rather than assumed, three ways. `F32ToBF16` is **byte-identical** and
+still out of line -- it was not part of that change -- so the RNE equivalence is
+untouched. `BF16ToF32` and `F16ToF32` are semantically identical, differing only
+by the `AsF32` -> `detail::BitsToF32` rename. And
+`cpu_ops.cpp::RmsNormGroupKernel`, which is the ORACLE the CUDA norm is compared
+against, hashes the same before and after (`0c8067e054b3eca3`). The tree then
+rebuilt clean and all eight neighbouring suites passed
+(`test_ops_rms_norm_group` 69, `test_qwen4_exp_qsa_device` 4697,
+`test_qwen4_exp_hc_device` 516, `test_qwen4_exp_ple_block` 100,
+`test_qwen4_exp_forward` 429).
+
 ##### The neighbouring suites, and the LOAD-TIME refusal that settles reachability
 
 `ctest -R 'qwen4_exp|rms_norm_group'` on the gated tree: **76% passed, 5 failed

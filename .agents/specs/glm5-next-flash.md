@@ -2585,6 +2585,81 @@ and the CUDA suite on `dgx:gpu0` under `rc run`. A doctest `assertions: 0` line
 is a skip wearing a pass and the device job reads that line out loud rather than
 trusting the exit code.
 
+**THE DEVICE GATE, TAKEN ON `dgx:gpu0`, AND IT PASSES.** Every number below came
+from **GB10** and from nowhere else. `sm_121a` and `thor`'s `sm_110` are
+different targets and neither transfers to the other.
+
+| | |
+|---|---|
+| job | `79aa5bb5-7536-43fe-a051-ed73ac1302e1`, `rc run -d dgx:gpu0` |
+| device | NVIDIA GB10, `GPU-cb5c11ff-4ea1-5472-a9a6-c7a468a4d9f1`, driver 580.173.02, `compute_cap` 12.1, built `sm_121a` |
+| worker | `rc-worker-4b8lj`, aarch64, 20 cores, `boot_id 49b5d969-3870-4a2b-b5b8-71355083d5e6` |
+| source | `git archive` of `4034c368c`, `src.tar.gz` sha256 `b036a0138f5a…`, COMPARED and fatal on mismatch |
+| build | CUTLASS 4.5.0, `CUDA FA2 compiled-arch manifest: [121a]`, 605/605, `BUILD=0` |
+| binary | `test_glm5_next_kpool_device` sha256 `39788d6d51c5fbe5…` |
+| run | 2026-08-31T22:49:44Z → 23:10:05Z |
+
+**`test_glm5_next_kpool_device`: 4 cases, 918 assertions, 0 failed, and
+`KPOOL_SKIPPED_CASES=0`.** The skip count is the load-bearing line, not the exit
+code: the same binary on a CPU-only build passes 4 cases with **4** assertions
+and three cases skipped, so 918-against-4 is what says the device arm ran. The
+host reference suite `test_glm5_next_dsa` is UNMOVED at 10 / 1934.
+
+| quantity | measured |
+|---|---|
+| `pool_keys` max abs, device vs **transformers v5.16.1** | **3.57628e-07** |
+| `pool_keys` max abs, device vs the **host reference** | **1.78814e-07** |
+| `index_scores` max abs, device vs transformers | **6.67572e-06** |
+| device `P` vs golden `kNumPools` | **5 == 5** (from `np = 6`: the `keep` compaction is exercised) |
+| pruning rows / smallest decision margin | **17 / 2.58482e-03** |
+| the margin-tied bound `score_delta * 4 < margin` | 2.67e-05 < 2.58e-03, **97x of room** |
+
+Selection agreement is SET equality of the chosen token indices AND positionwise
+equality, against the transformers run and against the host reference, at
+**0 mismatches of 462**. The fp32 device answer therefore differs from the fp64
+host reference by a hundredth of the gap the top-k decides on, which is the
+statement a bimodal gate can actually make; a tolerance on the values alone
+would have said nothing.
+
+**NINE MUTATIONS, and the two that did not end in an assertion kill are reported
+as what they are.** Each was applied to product code, rebuilt with the BINARY's
+sha256 asserted to have moved before its result counted, and restored
+byte-for-byte with the source sha256 checked — nine restores, all verified. The
+pristine tree was then rebuilt and re-run, reproducing 918 assertions, because a
+post-mutation green means nothing until the restored tree has been built again.
+
+| mutation | outcome |
+|---|---|
+| M2 `keep` compaction removed | KILLED by assertion |
+| M3 learned pool weighting replaced by a mean | KILLED by assertion |
+| M3b learned intra-pool position embedding zeroed | KILLED by assertion |
+| M4 pool from slot 0 instead of the first valid token | KILLED by assertion |
+| M5 ragged visible tail never written | **BUILD_BROKE** — see below |
+| M6 score skipped on padded query rows | KILLED by assertion |
+| M7 the ReLU before the head mix dropped | KILLED by assertion |
+| M8 the compress op's `RegisterOp` deleted | **SURVIVED AS A SKIP** — see below |
+| M9 the availability probe loses one clause | KILLED by assertion |
+
+**M8 is the reachability result and it is not a kill.** With no provider the
+probe is false, `HasCuda()` is false, and the three device cases return early:
+the suite exits **0** with **4 assertions and 3 cases skipped**. That is the
+exact shape of a skip wearing a pass, it is why this job reads
+`KPOOL_SKIPPED_CASES` instead of the exit code, and it is the honest answer to
+`.agents/reachability.md`'s question — there is no production call site to
+delete, so the mutation measures the registration and not a capability.
+
+**M5 was killed by the COMPILER, which is weaker, and it is owed a re-run.**
+Replacing the tail write with a bare `-1` orphaned `valid` and `vis`, and
+`-Werror=all-warnings` refused it with `error #177-D: variable "valid" was
+declared but never referenced`. A compiler kill proves the code changed and says
+nothing about whether the gate can SEE the defect. Rewritten as
+`(valid && vis && idx < 0)` — every operand live, and `idx` is non-negative for
+every reachable `j`, so the tail column is still always written `-1` — and
+re-submitted as job `3db96e7a-cfe9-4148-aac3-d26eb01a15bc`. **Until that returns,
+the ragged tail is the one guarantee in this file with no assertion-grade
+mutation behind it, and it is recorded as such rather than counted among the
+seven.**
+
 **Stop conditions.** If `transformers` v5.16.1 turns out not to implement the
 k-pool indexer, or if the published artifact's tensors do not match what it
 expects, STOP and return the evidence — inventing the semantics of a learned
@@ -4665,11 +4740,24 @@ than left as a correction. What survives it unchanged is the rest of the
 rescoping: every OTHER primitive family this model needs does have a registered
 CUDA provider, and the remaining device work is still a compose.
 
+**GATED ON `dgx:gpu0` (GB10, `sm_121a`): 4 cases, 918 assertions, 0 failed, and
+ZERO skipped cases.** The device arm agrees with the transformers v5.16.1 run to
+3.58e-07 on the pooled keys and 6.68e-06 on the scores, and its selection is SET-
+and position-identical to both the oracle and the host reference at 0 mismatches
+of 462 — against a decision margin of 2.58e-03, so the numerical difference is a
+hundredth of the gap the top-k turns on. Seven of nine mutations were killed by
+assertions. M8 (the registration deleted) SURVIVED AS A SKIP, which is the
+reachability finding rather than a pass, and M5 was killed by the compiler rather
+than an assertion and is owed a re-run; §W9c-0 records both instead of counting
+them.
+
 **The ops are UNREACHED and O36 says so in the specific.** Nothing on the
 production path calls either one; W9c-3 owns the wiring and
 [#2410](https://github.com/mudler/vllm.cpp/issues/2410) tracks it. Do not read
-the device gate below as a capability claim — it measures two registered
-providers at a small real geometry, and that is all it measures.
+the device gate as a capability claim — it measures two registered providers at a
+small real geometry, and that is all it measures. No throughput number and no
+generation from this artifact: O6 is unchanged and there is still no
+denominator.
 
 The next actions are W9c-3 (the compose that reaches these ops), W9b
 (keep-quant residency), W6 (the vision tower) and W7b (the first fitting

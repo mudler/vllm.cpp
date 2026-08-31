@@ -7812,6 +7812,18 @@ F6 named. Every rc read from the job's own stdout.
 `test_qwen4_exp_cuda_reductions` 14 / 160, `test_qwen4_exp_cuda` 12 / 351, all
 `SUCCESS!`.
 
+**`### BUILD ALL RC=0` ON THIS RUN, WHERE EVERY EARLIER ONE READ RC=1**, and the
+difference is not this wave. The full-tree build had been failing on
+`tests/vllm/models/test_glm_moe_dsa_schedule.cpp:304` ("cannot convert
+`vllm::mla::MlaSharedSelection*` to `vt::Tensor*`"), a break `origin/main`
+carried and has since repaired; that same error was also what reddened
+`build-test-cpu` and `sanitize-cpu` on this pull request. The whole 1,343-target
+tree now compiles with these four arms in it, which is a stronger statement than
+the named-target builds every earlier run made.
+
+`### CTEST qwen4_exp RC=8` is the five pre-existing failures below and nothing
+else.
+
 **THE DERIVED BOUND, AT EVERY SHAPE.** `over = 0` everywhere and the worst
 scale-free ratio is **0.2041**:
 

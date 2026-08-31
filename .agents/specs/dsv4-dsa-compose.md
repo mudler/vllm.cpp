@@ -404,6 +404,19 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## The two families are now ONE code path
+
+`CompressorLayerStep` takes an optional selection. Null means every closed row,
+which is `cr == 128`; a selection means the rows the indexer chose, which is
+`cr == 4`. That is the only difference between the two families at the attention,
+and it is now expressed as one argument rather than two paths.
+
+An all-padding selection attends nothing and the step returns the window pass
+alone -- the normal state before the first boundary, and NOT a fallback to every
+row. The gate pins all three arms: selecting the only closed row equals attending
+all rows, and an all-padding selection differs from both. Two mutations run red:
+the selection ignored, and an empty gather falling back to every row.
+
 ## Every W3 MECHANISM is implemented; what remains is wiring
 
 `GatherSelectedCompressed` is the last one. The `cr == 4` family attends its

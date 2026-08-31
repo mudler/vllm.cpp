@@ -267,7 +267,12 @@ std::vector<float> CompressorLayerStep(
     int64_t sliding_window, float eps, float scale,
     // The pooled row's rope tail is rotated at the WINDOW'S BASE position
     // (`fused_compress_quant_cache.py:272-297`). 0 leaves it unrotated.
-    int64_t rope_dim = 0, double rope_theta = 10000.0);
+    int64_t rope_dim = 0, double rope_theta = 10000.0,
+    // W3 (#2286): the compressed rows this step may attend, as compressed-row
+    // indices with `-1` padding. NULL means ALL closed rows, which is the
+    // `cr == 128` family; a selection is the `cr == 4` family, where the indexer
+    // chooses. That is the ONLY difference between the two at the attention.
+    const std::vector<int64_t>* selected = nullptr);
 
 // `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — the INDEXER's compressed keys.
 //

@@ -367,7 +367,7 @@ std::vector<float> CompressorLayerStep(
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
     int64_t sliding_window, float eps, float scale, int64_t rope_dim,
-    double rope_theta) {
+    double rope_theta, const std::vector<int64_t>* selected) {
   // W3 (#2286): both shapes now. `coff = 1 + (compress_ratio == 4)`
   // (`compressor.py:247-248`); at 2 the projections are doubled and a window
   // position's ROLE picks which half it reads.
@@ -439,12 +439,24 @@ std::vector<float> CompressorLayerStep(
       queue, q, window_cache, num_blocks, block_size, num_tokens, num_heads, head_dim,
       kv_base, attn_sink, scale, /*no_sink=*/false, sliding_window, &win_lse);
 
-  // 5. Nothing closed yet => the window IS the answer. Merging an empty second
-  //    contributor would divide by an empty denominator rather than be a no-op.
-  const int64_t n_rows = static_cast<int64_t>(comp_rows->size()) / head_dim;
+  // 5. Narrow to the SELECTED rows when the indexer chose. Null selection means
+  //    every closed row, which is the `cr == 128` family.
+  const int64_t all_rows = static_cast<int64_t>(comp_rows->size()) / head_dim;
+  const std::vector<float>* attend = comp_rows;
+  std::vector<float> gathered;
+  if (selected != nullptr) {
+    gathered = GatherSelectedCompressed(*comp_rows, *selected, all_rows, head_dim);
+    attend = &gathered;
+  }
+
+  // Nothing closed, or nothing selected => the window IS the answer. Merging an
+  // empty second contributor would divide by an empty denominator rather than be
+  // a no-op, and an all-padding selection is the normal state before the first
+  // boundary.
+  const int64_t n_rows = static_cast<int64_t>(attend->size()) / head_dim;
   if (n_rows == 0) return win_out;
 
-  return MergeWindowAndCompressed(queue, win_out, win_lse, q, *comp_rows, n_rows,
+  return MergeWindowAndCompressed(queue, win_out, win_lse, q, *attend, n_rows,
                                   num_tokens, num_heads, head_dim, scale);
 }
 

@@ -1010,3 +1010,55 @@ TEST_CASE("W3: an index PAST the closed rows is refused, not clamped") {
   CHECK_THROWS(
       vllm::deepseek_v4::GatherSelectedCompressed(rows, {0, 2}, n_rows, hd));
 }
+
+TEST_CASE("W3: a SELECTION narrows which compressed rows the step attends") {
+  // The `cr == 4` family differs from `cr == 128` at the attention in exactly one
+  // way: the indexer chooses which closed rows to attend. This proves the
+  // selection reaches the merge, and that a null selection still means all rows.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 1, H = 16, cr = 128, win = 8, T = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const int64_t bs = 16, nb = (T + bs - 1) / bs;
+
+  const std::vector<float> wgate = Rand(static_cast<size_t>(hd * H), 4111u, 0.05f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * hd), 4112u, 0.05f);
+  const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
+  const std::vector<float> sink(static_cast<size_t>(nh), -0.1f);
+  const std::vector<float> x = Rand(static_cast<size_t>(T * H), 4200u, 0.2f);
+  const std::vector<float> kv = Rand(static_cast<size_t>(T * hd), 4250u, 0.2f);
+  const std::vector<float> qq = Rand(static_cast<size_t>(T * nh * hd), 4290u, 0.2f);
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = t;
+
+  const auto run = [&](const std::vector<int64_t>* sel) {
+    std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+    std::copy(kv.begin(), kv.end(), cache.begin());
+    vt::Tensor tc = Contig(cache.data(), vt::DType::kF32, q.device, {nb, bs, hd});
+    std::vector<float> sk, ss, rows;
+    return vllm::deepseek_v4::CompressorLayerStep(
+        q, x, kv, qq, wgate, ape, cnorm, sink, tc, nb, bs, &sk, &ss, &rows, pos,
+        /*kv_base=*/0, T, nh, H, hd, cr, win, 1e-6f, scale, /*rope_dim=*/0,
+        /*rope_theta=*/10000.0, sel);
+  };
+
+  // One window closes at position 127, so exactly one row exists.
+  const std::vector<float> all = run(nullptr);
+  const std::vector<int64_t> pick0{0};
+  const std::vector<float> chosen = run(&pick0);
+  const std::vector<int64_t> none{-1, -1};
+  const std::vector<float> padded = run(&none);
+
+  REQUIRE(all.size() == chosen.size());
+  REQUIRE(all.size() == padded.size());
+
+  // Selecting the only row equals attending all rows.
+  for (size_t i = 0; i < all.size(); ++i)
+    CHECK(all[i] == doctest::Approx(chosen[i]));
+
+  // An ALL-PADDING selection attends none, so the answer is the window pass
+  // alone -- and must therefore DIFFER from attending the row.
+  double diff = 0.0;
+  for (size_t i = 0; i < all.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(all[i] - padded[i])));
+  CHECK(diff > 1e-6);
+}

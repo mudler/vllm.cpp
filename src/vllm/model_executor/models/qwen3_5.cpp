@@ -7165,6 +7165,58 @@ void MoeSelFp(int dev_type, int64_t T, int64_t E, int64_t top_k,
                SumAbsBf16(expert_out), shared != nullptr ? SumAbsBf16(*shared) : 0.0,
                static_cast<long long>(MoeSelFpLines()));
   ++MoeSelFpCall();
+
+// VK4 keep-quant fast MoE path for Vulkan + TQ-quantized experts. Mirrors
+// MoeBlockBf16Cuda but uses the TQ-quantized ops: Matmul for the router,
+// MoeGateUpSwiGLUGrouped for the fused gate+up+SwiGLU, MatmulBTQuantGrouped
+// for the down GEMM, and MoeCombine. ALL ops run on-device with NO host
+// round-trip — the _dev shaders quantize Q8_K inside the kernel, so no
+// FlushBatch is needed.
+DBuf MoeBlockVulkanTQ(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                      const Tensor& dh, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t E = cfg.num_experts;
+  const int64_t top_k = cfg.num_experts_per_tok;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t P = T * top_k;
+
+  // Router: logits = dh @ gate (bf16 out). Handles both weight orientations
+  // (nk=true for GGUF [N,E], nk=false for safetensors [H,E]) via the shared
+  // MoeRouterLogits helper. For TQ-quantized router weights, MatmulBT redirects
+  // to kMatmulBTQuant which dispatches the _dev shader (on-device Q8_K quantize).
+  DBuf dlog(d, DType::kBF16, {T, E});
+  MoeRouterLogits(d, dlog.t(), dh, w.router_gate);
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                    vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+  Tensor eids = Reshape(dtid.t(), {P});
+
+  // Fused gate+up+SwiGLU: ONE dispatch replaces {gate GEMM; up GEMM; SiluAndMul}.
+  // The shader reads bf16 activation from the device buffer, quantizes Q8_K
+  // on-device, and reads TQ-quantized gate/up weights — no host round-trip.
+  // limit=+inf reduces to plain silu(gate)*up, matching the reference path's
+  // ExpertMlpKq (Silu(hg)*hu, no clamp).
+  Tensor gate_w = ResidentWeight(d, w.expert_gate_kq);
+  Tensor up_w = ResidentWeight(d, w.expert_up_kq);
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeGateUpSwiGLUGrouped(d.q, dact.t(), dh, gate_w, up_w, eids, 1e30f);
+
+  // Down GEMM: act [P,I] bf16 @ down_w [E*N,K] TQ -> [P,H] bf16.
+  // MatmulBTQuantGrouped dispatches the _dev shader (on-device Q8_K quantize).
+  Tensor down_w = ResidentWeight(d, w.expert_down_kq);
+  DBuf ddown(d, DType::kBF16, {P, H});
+  vt::MatmulBTQuantGrouped(d.q, ddown.t(), dact.t(), down_w, eids);
+  Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
+
+  // Shared expert: Qwen3-Coder has none (shared_expert_intermediate_size==0).
+  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
+  std::optional<DBuf> shared;
+  if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
+  DBuf dout(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(),
+                 has_shared ? &shared->t() : nullptr);
+  return dout;
 }
 
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
@@ -7198,6 +7250,18 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   if (!fp4 && vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16, d.q.device.type) && MoeBf16FastEnabled() &&
       !w.expert_gate.empty() && MoeBf16FastLayoutOk(w, cfg))
     return MoeBlockBf16Cuda(d, w, cfg, dh, T);
+
+  // VK4 keep-quant fast MoE path: Vulkan + TQ-quantized experts -> fully
+  // on-device (no host round-trip). The router GEMM, MoeRouterTopK, fused
+  // gate+up+SwiGLU, down GEMM, and MoeCombine all run as native Vulkan ops
+  // with NO FlushBatch — the _dev shaders quantize Q8_K on-device and the
+  // fused MoE kernel reads bf16 activations straight from the device buffer.
+  // Eliminates the ~30 FlushBatch calls/layer of the reference path.
+  if (!fp4 && d.q.device.type == vt::DeviceType::kVULKAN &&
+      !w.expert_gate_kq.Empty() &&
+      vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, d.q.device.type) &&
+      vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, d.q.device.type))
+    return MoeBlockVulkanTQ(d, w, cfg, dh, T);
 
   // Reference path: download the hidden once, then gather + per-expert MLP.
   std::vector<uint16_t> h(static_cast<size_t>(T) * H);

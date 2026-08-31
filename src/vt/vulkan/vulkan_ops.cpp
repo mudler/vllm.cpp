@@ -2355,8 +2355,12 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
       if (p_start > 0) ctx.FlushBatch("moe-chunk");
       // Adjust offsets: shader loops row 0..p_count-1, so shift offsets to
       // point at the correct slice of activation, expert_ids, and output.
-      const uint32_t a_chunk = a_off + p_start * static_cast<uint32_t>(K) *
-                                        static_cast<uint32_t>(act_elem);
+      // In bcast mode (act.shape[0]==1), all rows share activation row 0, so
+      // a_off must NOT be shifted — the activation tensor is a single row.
+      const uint32_t a_chunk = bcast
+          ? a_off
+          : a_off + p_start * static_cast<uint32_t>(K) *
+                        static_cast<uint32_t>(act_elem);
       const uint32_t eid_chunk = eid_off + p_start * sizeof(uint32_t);
       const uint32_t out_chunk = out_off + p_start * static_cast<uint32_t>(N) *
                                              static_cast<uint32_t>(out_elem);
@@ -2518,8 +2522,11 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
     // so per-chunk GPU time is higher. Flushing isolates each chunk.
     if (p_start > 0) ctx.FlushBatch("moe-gate-up-chunk");
     // Adjust offsets for this chunk. For gather_k>0, the activation row is
-    // row/gather_k, so shift a_off by (p_start/gather_k) rows.
-    const uint32_t act_row_off = (gather_k > 0u) ? (p_start / gather_k) : p_start;
+    // row/gather_k, so shift a_off by (p_start/gather_k) rows. In bcast mode
+    // (act.shape[0]==1), all rows share activation row 0, so a_off must NOT
+    // be shifted.
+    const uint32_t act_row_off = bcast ? 0u
+        : (gather_k > 0u) ? (p_start / gather_k) : p_start;
     const uint32_t a_chunk = a_off + act_row_off * static_cast<uint32_t>(K) *
                                       static_cast<uint32_t>(act_elem);
     const uint32_t eid_chunk = eid_off + p_start * sizeof(uint32_t);

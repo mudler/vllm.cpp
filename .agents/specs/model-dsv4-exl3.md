@@ -68,14 +68,39 @@ expert over `TEMP_ROWS_FUSED` tokens and as the `VT_DSV4_EXL3_FUSED_MOE=0`
 rollback. W2c adds the m<=8 GEMV arm and its selection policy, ported verbatim
 and reached from the CUDA GEMM launcher.
 
-**The CUDA arm is UNCOMPILED and UNMEASURED, and nothing in this spec pretends
-otherwise.** The implementer host has no `nvcc` and `dgx.casa` is flapping, so
-every device number is `PENDING` with its command recorded in `## W2 design` §5,
-`## W2cd design` W2cd-9 and `## Owed`. The CPU tier is fully gated and is what
-makes the capability reachable today. **No speed figure has been claimed by this
-row, at any wave.**
-Next: the device compile + parity run the moment the box returns, the shared
-dense-MLA policy the real artifact's DSA geometry needs (`## Owed`), and W3.
+**THE CUDA ARM COMPILES AND ITS DEVICE GATES PASS ON GB10 (2026-08-31).** Measured
+under an `rc` lease on `dgx:gpu0` (GB10, driver 580.173.02), source at
+`f5c70789`, `cuda-nvcc-13-0` installed per run:
+`cmake -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121 -DVLLM_CPP_TRITON=OFF`,
+`ninja -j 4`, both `rc=0`. **31 `.cu.o` objects** and `libcudart.so.13` +
+`libcublasLt.so.13` linked into the test binaries.
+
+| suite | result | device skips |
+|---|---|---|
+| `test_exl3_dequant` | 3/3 | 0 |
+| `test_exl3_gemm` (W2a) | 14/14 | 0 |
+| `test_exl3_gemv` (W2c) | 6/6 | 0 |
+| `test_exl3_moe` (W2d) | 8/8 | 0 |
+
+**The skip count is what makes those greens mean anything, and the FIRST run of
+this job lacked it.** These suites skip loudly when no CUDA device is registered,
+and doctest prints `N passed | 0 failed` for a skipped case, so the summary line
+is byte-identical whether the device arm ran or the portable CPU arm did. The
+first run captured only that line and proved nothing about dispatch; the rerun
+counts `"SKIPPED, no CUDA device"` and reports zero across all four suites.
+
+WHAT THIS IS NOT. It is a compile and a device-parity result at the ops' own
+shapes. It is NOT a throughput number, NOT the real artifact, and NOT an
+end-to-end run: the real-artifact load is still blocked on `## W1c design`
+W1c-4's DSA geometry. **No speed figure is claimed by this row at any wave**, and
+that sentence stands unchanged.
+
+**The former text, superseded:** the CUDA arm was UNCOMPILED and UNMEASURED because
+the implementer host had no `nvcc` and `dgx.casa` was flapping. The CPU tier is fully gated and is what makes the capability reachable today.
+**No speed figure has been claimed by this row, at any wave**, and the device run
+above does not change that: it is a compile and an op-shape parity result.
+Next: the shared dense-MLA policy the real artifact's DSA geometry needs
+(`## Owed`), and W3.
 
 ## The format, as measured (spike, cited at exllamav3 `2398c056`)
 
@@ -908,6 +933,45 @@ keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
 `vt: MatVec weight size mismatch` naming no tensor and no layer. Refusing by name
 buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
 and it is not the difference between wrong tokens and a refusal.
+
+**AND THE OPTION IS ALREADY A FILED DEFECT, not a novel trade.** The forward's own
+refusal message says dense MLA "is NOT a substitute for it at any sequence
+length", citing [#1964](https://github.com/mudler/vllm.cpp/issues/1964), and
+`dsv4-dsa-loader-accept-forward-refuse.md` records what that issue tracks: the
+GGUF arm's `dsa_dense` routing every layer to dense MLA. So proposing a dense-MLA
+policy for the EXL3 arm is proposing to reproduce an open defect on a second arm.
+
+The earlier note here that dense MLA is "exact below 512 tokens" is true only of
+the INDEXER half, where a top-k over fewer keys than `index_topk` selects
+everything. It is NOT true of the COMPRESSOR, which is a different function at any
+length: a 128-wide boundary-emitted pool over a separate `compressor.wkv`
+projection is not a dense attention over the raw prefix, and no sequence length
+makes it one. With 41 of 46 layers carrying a compressor, that is the governing
+half.
+
+**MEASURED 2026-08-31, and it settles what the shared policy may and may not do.**
+The artifact's own `config.json` gives `compress_ratios` over 46 layers of which
+**41 carry a compressor** (`ratio > 1`), and its weight map carries **248
+`*.attn.compressor.*` tensors** -- `ape`, `norm.weight`, `wgate.weight` per layer.
+`index_topk` is 512.
+
+So a shared dense-MLA policy applied to THIS arm is not a shortcut around a
+geometry mismatch. It would make 41 of 46 layers ignore weights the checkpoint
+actually contains, which is running a different model rather than approximating
+this one, and it is exact only below 512 tokens even for the indexer half it was
+argued for. That is a product decision about correctness, not a mechanical
+unblock, and it is escalated rather than taken: `## Owed` already files the policy,
+and this paragraph records what the policy would COST if it were pointed at the
+EXL3 arm.
+
+The GGUF arm is not a precedent for it. That arm's converter did not carry the
+compressor tensors at all, so `dsa_dense` there discards nothing that exists;
+here it would discard 248 tensors that do.
+
+The correct fix is `MODEL-DSV4-DSA-COMPOSE` (#2286), which implements the
+window-plus-compressed-history composition those weights are for, and whose W1
+primitive (`MergeWindowAndCompressed`) has landed. The real-artifact load waits on
+that row rather than on a policy flag.
 
 **The obvious fix is wrong and the reason is worth recording.** The GGUF arm
 dodges the same geometry by setting `dsa_dense = (be.gguf != nullptr)` and

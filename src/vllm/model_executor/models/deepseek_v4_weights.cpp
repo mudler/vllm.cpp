@@ -1154,11 +1154,17 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       hl.comp_ape = carried.Float(a + "compressor.ape", {cr, cw});
       hl.comp_norm_weight = carried.Float(a + "compressor.norm.weight", {hd});
       hl.comp_wgate = carried.Float(wg, {cw, H});
-      // Accounted, no destination: the collapsed-geometry compressor reuses the
-      // MLA's own `kraw` latent as its KV, so no host slot reads a separate
-      // projection. Upstream HAS one, and wiring it is part of the owed DSA
-      // composition rather than of this wave.
-      carried.Account(a + "compressor.wkv.weight");
+      // W3 (#2286): MATERIALIZED now, where it was accounted-and-dropped before.
+      // Upstream's compressor pools its own projection of the hidden state, not
+      // the MLA's `kraw`, so a forward that reuses the latent pools the wrong
+      // operand on this artifact -- finite, plausible, and not what upstream
+      // pools. Same `coff * head_dim` width as the gate, since both halves come
+      // out of one `fused_wkv_wgate` (`compressor.py:279-287`).
+      const std::string wkv = a + "compressor.wkv.weight";
+      RequireDsaDim(carried.PeekShape(wkv), 0, cw, wkv,
+                    "`coff * head_dim`, the same width as the gate it is fused "
+                    "with (compressor.py:279-287)");
+      hl.comp_wkv = carried.Float(wkv, {cw, H});
     }
     if (p.has_indexer(l)) {
       // The indexer exists ONLY at `cr == 4` (`attention.py:274`), so upstream's

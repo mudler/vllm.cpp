@@ -224,4 +224,46 @@ std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
                                             int64_t num_heads, int64_t head_dim,
                                             float scale);
 
+// `MODEL-DSV4-DSA-COMPOSE` W1 (#2286) — ONE compressor layer's decode step,
+// composed. This is what the paged forward must call before its refusal can
+// narrow; the refusal stays until it does, because removing the guard without the
+// capability turns a loud refusal into a silent wrong answer.
+//
+// The `compress_ratio == 128` shape only: `coff == 1`, so no overlapped gathering
+// window and no Lightning Indexer. `compress_ratio == 4` is `coff == 2` and is W3.
+//
+// Per step, in order:
+//   1. score = comp_wgate @ x, the pool score this layer selects with
+//      (`compressor.py:279-287`).
+//   2. `CompressorStepCycle` appends `(kv, score + ape)` to the carried state and
+//      pools at each boundary `(pos + 1) % compress_ratio == 0`, returning the rows
+//      it emitted this step.
+//   3. Those rows append to the layer's compressed history.
+//   4. The window pass attends the sliding window WITH the sink, keeping its LSE.
+//   5. `MergeWindowAndCompressed` folds the compressed history in, with NO sink --
+//      the window pass owns it, and a merged denominator may count it once.
+//
+// **`kv` IS THE MLA LATENT, AND THAT IS THE COLLAPSED GEOMETRY'S CONVENTION, NOT
+// UPSTREAM'S.** Upstream's compressor owns a `fused_wkv_wgate` producing BOTH its
+// KV and its gate from the hidden state (`compressor.py:279-287`), and the real
+// artifact stores `attn.compressor.wkv.weight` for exactly that. This tree does
+// not materialize it -- `deepseek_v4_weights.cpp` accounts it and says so -- since
+// the collapsed compressor reuses the MLA's own `kraw`. So on the REAL artifact
+// this function would pool the wrong operand: finite, plausible, and not what
+// upstream pools. Listed under the row's `## Owed`.
+//
+// `state_kv`, `state_score` and `comp_rows` are CARRIED ACROSS STEPS by the
+// caller. The compressor is a state machine, and its failure mode is a plausible
+// value several tokens after the mistake rather than an immediate one.
+std::vector<float> CompressorLayerStep(
+    vt::Queue& queue, const std::vector<float>& x, const std::vector<float>& kv,
+    const std::vector<float>& q, const std::vector<float>& comp_wgate,
+    const std::vector<float>& comp_ape, const std::vector<float>& comp_norm_weight,
+    const std::vector<float>& attn_sink, vt::Tensor& window_cache,
+    int64_t num_blocks, int64_t block_size, std::vector<float>* state_kv,
+    std::vector<float>* state_score, std::vector<float>* comp_rows,
+    const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
+    int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
+    int64_t sliding_window, float eps, float scale);
+
 }  // namespace vllm::deepseek_v4

@@ -84,10 +84,21 @@ namespace vllm {
 // `cuda_align` (Brick 4): if set AND the encoding is Q8_0, repack the blocks into
 // the CUDA coalesced-load layout (copy off the mmap into an owned buffer, drop the
 // source file pages) instead of borrowing/plain-copying — see RepackQ8_0Cuda.
+// `prefault` (MODEL-TEXT-GLM-MOE-DSA, #2214): whether a BORROWED span is faulted
+// in at load. Defaulted ON, which is every existing caller's behaviour byte for
+// byte, because for a weight the forward reads in place a page trap in the timed
+// prefill is the thing L7 removed. Pass `false` for a span the EXPERT-STREAMING
+// slot lane will serve, where it is not a latency trade at all: the lane preads
+// each slice into a slot and never reads the tower through the mapping, so
+// touching one byte per page of a 187.312 GiB expert set at load reads the whole
+// artifact off disk to populate pages nothing will ever look at. Measured: the
+// GLM-5.3 `UD-IQ1_S` load's RSS grew past 48 GiB against a 18.99 GiB resident
+// class, linearly, at the filesystem's read rate, with no plateau.
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset = 0,
                                const GgufFile* mmap_src = nullptr,
-                               bool repack = false, bool cuda_align = false);
+                               bool repack = false, bool cuda_align = false,
+                               bool prefault = true);
 
 // L6 (keep-f16 residency). Take `n` rows of `k` F16 elements of `tensor`'s raw
 // bytes — starting at row `row_offset` (how a stacked [E, out, in] expert tensor
@@ -108,10 +119,12 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
 // (KERNEL-GEMM-CPU-TILED lever 2); it marks `OwnedTensor::elem_kn_repacked` and
 // is ignored for a gather table (`nk == false`). Defaulted OFF so every existing
 // caller, including tests/vllm/test_gguf_keep_quant.cpp, is unchanged.
+// `prefault` carries the same meaning and the same default as
+// OwnGgufQuantBlocks' — see the note there.
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
                        int64_t row_offset = 0,
                        const GgufFile* mmap_src = nullptr, bool nk = true,
-                       bool elem_kn_repack = false);
+                       bool elem_kn_repack = false, bool prefault = true);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape

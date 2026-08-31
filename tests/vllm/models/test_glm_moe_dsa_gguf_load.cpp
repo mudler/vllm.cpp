@@ -42,6 +42,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/config/weight_residency.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/glm_moe_dsa.h"
@@ -80,6 +81,64 @@ TEST_CASE("glm-dsa W7: a complete `glm-dsa` GGUF loads through LoadedEngine::Fro
   REQUIRE_NOTHROW(engine = vllm::entrypoints::LoadedEngine::FromModelDir(
                       f.path(), params));
   REQUIRE(engine != nullptr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A ROUTED-EXPERT TOWER IS BORROWED AND IS NOT FAULTED IN AT LOAD.
+//
+// Spec §3.3 and `## Owed` O30 ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)).
+// This is the assertion that separates a model that STREAMS its experts from one
+// that only says it does, and it was written because the real artifact said the
+// second thing. On `thor:gpu0`, 2026-08-31, the `UD-IQ1_S` load's RSS grew
+// LINEARLY past 48 GiB against an 18.99 GiB resident class, at the filesystem's
+// read rate, with no plateau: `OwnGgufQuantBlocks` prefaulted every borrowed
+// span, and 228 of those spans are the 187.312 GiB expert set the slot lane
+// exists to page one slice at a time.
+//
+// WHY A ZERO IS A REAL ASSERTION HERE, AND NOT A MUTE SWITCH. Every non-tower
+// tensor in this fixture is F32, and F32 has no keep-quant residency, so it is
+// DEQUANTIZED into an owned buffer and never borrowed. The Q8_0 expert towers
+// are therefore the ONLY spans in this whole model that reach the borrow arm at
+// all — which is exactly the arm that prefaults. A nonzero count can only be a
+// tower. The positive control below is what stops the zero from meaning "the
+// borrow arm was never taken": it asserts the towers ARE mmap-backed borrows,
+// which is the precondition for the prefault this case forbids.
+//
+// The regression control for the DEFAULT is `test_gguf_keep_quant`'s own L7
+// prefault A/B, which is untouched: `prefault` defaults to true, so every weight
+// a forward reads in place is still faulted off the timed prefill.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("glm-dsa W10: the streamed towers are borrowed and NOT prefaulted") {
+  gguf_test::TempFile f(BuildCompleteGlmDsa());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::GlmMoeDsaHfConfigFromGguf(g);
+
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
+  const vllm::GlmMoeDsaWeights w =
+      vllm::LoadGlmMoeDsaFromGguf(g, c, /*policy=*/nullptr);
+
+  // ── the positive control: the towers took the BORROW arm ──
+  // `mmap_fd` is set only on the borrow path of `OwnGgufQuantBlocks`, so this
+  // says the load reached the code the assertion below constrains. Without it a
+  // zero could mean `VT_GGUF_MMAP=0` or a copy arm, and the case would pass on a
+  // run that measured nothing.
+  int64_t borrowed_towers = 0;
+  for (int64_t l = 0; l < kBackbone; ++l) {
+    const vllm::GlmMoeDsaLayerWeights& lw = w.layers[static_cast<size_t>(l)];
+    if (!lw.is_moe) continue;
+    CAPTURE(l);
+    CHECK(lw.moe.gate_exps.mmap_fd >= 0);
+    CHECK(lw.moe.up_exps.mmap_fd >= 0);
+    CHECK(lw.moe.down_exps.mmap_fd >= 0);
+    borrowed_towers += 3;
+  }
+  CHECK(borrowed_towers == (kBackbone - kLeadingDense) * 3);
+
+  // ── the assertion ──
+  const uint64_t prefaulted = vllm::GgufPrefaultedSpanCount();
+  CAPTURE(prefaulted);
+  CAPTURE(borrowed_towers);
+  CHECK(prefaulted == 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

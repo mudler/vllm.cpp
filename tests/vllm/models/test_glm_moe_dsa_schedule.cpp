@@ -301,8 +301,13 @@ std::vector<float> RunLayer(Backend& b, Queue& q, Harness& h, const MlaBlockDims
   vllm::v1::TritonMLAImpl impl;
   Dev dev = h.dev();
   Tensor kvc = h.kv_cache();
-  ForwardMlaAttentionBlock(dev, dims, h.weights(), th, tp, kvc, ts, meta, impl, out,
-                           /*attn_pre_o_proj=*/nullptr, shared);
+  // The ELEVENTH argument is `attn_pre_o_proj`, which `KV-DSV4-MULTICACHE` W5
+  // added between `out` and the shared selection this case exists to drive
+  // (#2323). Naming both keeps the two from swapping again silently: passing the
+  // selection positionally is what broke this file's compile on `origin/main`,
+  // and the product-code half of the same slip was repaired by `11f34effb`.
+  ForwardMlaAttentionBlock(dev, dims, h.weights(), th, tp, kvc, ts, meta, impl,
+                           out, /*attn_pre_o_proj=*/nullptr, shared);
   b.Synchronize(q);
   return h.DownF32(out);
 }

@@ -222,7 +222,17 @@ compressed row -- a closed window is history, so no causal bound applies among
 them -- and `VT_CHECK(num_tokens == 1 || num_heads == 1)` holds the point where
 the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
-does not get one yet; it is listed under `## Owed`.
+does not get one yet; it is listed under `## Owed
+
+- **The indexer's qr projection is UNEXERCISED.** Its shape is accepted and that
+  acceptance is gated, but no test runs a forward to completion with the upstream
+  geometry, because the layer still refuses on `compressor.wkv`. A mutation that
+  always projects from the hidden state passes today.
+
+- **The compressor state's relationship to PREFIX CACHING**, before the runner
+  carries it. See the section above: `has_inner_state` is architecture-wide and
+  gates prefix caching, while the compressor state is one arm's, and a prefix hit
+  would leave that state missing the rows the skipped tokens owed it.`.
 
 The gate this section demanded is `tests/vllm/models/test_deepseek_v4_paged_equiv.cpp`,
 "W1: two LSE-merged passes equal one pass over the union". Three mutations prove
@@ -319,6 +329,213 @@ allocates all 167 buffers and refuses naming W5. AGENTS.md `## History is git`
 is explicit -- "Before you conclude anything about past work, read the spec and
 run `git log -S`" -- and `git log --oneline --grep '2068'` shows `ca3dcda21`
 immediately. It was not run.
+
+## W1's layer step LANDED
+
+`CompressorLayerStep` composes one `compress_ratio == 128` layer's decode step:
+the pool-score projection, `CompressorStepCycle` driving the carried state,
+appending whatever closed, the window pass carrying the sink and keeping its LSE,
+and `MergeWindowAndCompressed` folding in the compressed history with NO sink. It
+refuses `compress_ratio == 4` by name, since that is `coff == 2` and W3's.
+
+Nothing calls it yet, so the resolver's refusal stays exactly where it is.
+
+**Three holes were found in its gate by mutation, and two of them looked like
+coverage.** A six-token run at ratio 128 closes NO window, so `emitted` is always
+empty and dropping the appended rows survived untouched; a 128-token step that
+crosses `(127 + 1) % 128 == 0` is the only shape in which that half is
+observable. And checking finiteness plus "differs from window-only" could not see
+the SINK being dropped from the window pass, because the window-only reference
+kept its own sink and the outputs merely differed more. Comparing the
+no-rows-closed case bit for bit against the sinked window pass is what pins it.
+
+The four mutations that now run red: the state reset each step, the emitted rows
+dropped, `coff == 2` accepted, and the window pass losing its sink.
+
+## The runner cannot simply hold the compressor state, and the reason is prefix caching
+
+The remaining step before the resolver's refusal may narrow is the runner carrying
+the compressor state across steps, since the gate supplies it by hand.
+`DeepseekV4LoadedModel` persists and could hold it, so the change looks like three
+lines. It is not, and the constraint was found before writing them.
+
+**`has_inner_state` gates prefix caching.**
+`LoadedEngine::ResolveEnablePrefixCaching` returns
+`!is_hybrid && !has_inner_state` (`model_loader.cpp:1179`), so declaring inner
+state turns prefix caching OFF by default. This row's registration currently
+declares `false`, and flipping it is model-wide: it would disable prefix caching
+for the GGUF arm too, which carries no compressor state and would lose the
+optimisation for nothing. The flag describes an ARCHITECTURE; the compressor
+state belongs to one arm.
+
+**And the interaction is real, not merely a flag.** A prefix-cache hit skips
+recomputing tokens whose KV is already cached. The compressor's pooled history is
+DERIVED from those tokens, so on a hit the carried state would be missing exactly
+the rows the skipped tokens would have contributed, and the layer would attend a
+compressed history with holes in it. That is the silent-plausible-output failure
+this row exists to avoid, and it would appear only on cache hits.
+
+Three resolutions exist -- the state is REBUILDABLE from a cached prefix, a hit
+INVALIDATES it, or the arm declares incompatibility per-arm -- and choosing among
+them is scheduler-facing and not this row's. **But choosing is not required to be
+safe, because the mismatch is DETECTABLE.** The state knows how many tokens it has
+pooled, and a step knows the `kv_base` it resumes at; if they disagree, tokens
+were skipped that the state needed.
+
+`CompressorLayerStep` therefore refuses on `seen != kv_base`, naming both numbers.
+Refusing is never wrong here, only limiting, so the arm is correct under prefix
+caching today and the policy choice above stays open rather than blocking.
+
+Gated both directions, because a guard can fail either way: a state that has seen
+one token resuming at `kv_base = 7` refuses, a fresh state at 0 is accepted, and
+the consistent continuation at 1 is accepted -- so the guard tracks the state
+rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
+guard and one making it over-fire.
+
+## W3's fourth piece: the compressor pools its OWN projection
+
+Recorded as owed one commit ago and now closed. Upstream's compressor owns a
+`fused_wkv_wgate` emitting BOTH its KV and its gate from the hidden state
+(`compressor.py:279-287`), and every compressor layer of the artifact stores
+`attn.compressor.wkv.weight`. This tree accounted that tensor and dropped it,
+because the collapsed geometry reuses the MLA's `kraw`, and `CompressorLayerStep`
+inherited the convention -- right for the synthetic suites, wrong on the real
+artifact.
+
+`DeepseekV4LayerHostWeights::comp_wkv` now materializes it at the same
+`coff * head_dim` width as the gate it is fused with, and the forward projects the
+compressor's KV from it, falling back to the latent only for a checkpoint that
+carries none.
+
+**The gate had to be repaired before it proved anything.** Perturbing `comp_wkv`
+and diffing the logits reported a difference of exactly ZERO: at ratio 128 a
+single token at position 0 closes no window, so the pooled row never reaches the
+output and the projection reads as inert. The case now seeds 127 prior rows so
+`(127 + 1) % 128 == 0` closes a window on the step under test, with `kv_base` set
+to match the prefix guard. Two mutations run red: falling back to the MLA latent
+despite `comp_wkv` being present, and projecting from the gate's weight instead.
+
+## W3's core mechanism: the coff == 2 overlapped gather
+
+`CompressorStepCycle` takes `coff` and implements upstream's gather verbatim
+(`fused_compress_quant_cache.py:169-183`):
+
+    start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    head_offset = (tokens >= COMPRESS_RATIO) * HEAD_SIZE
+
+So `coff * compress_ratio` rows are gathered ending at the boundary, the state row
+is `coff * head_dim` wide, and **a row's ROLE is its index WITHIN THE GATHERING
+WINDOW** -- the first `compress_ratio` positions read the low half, the rest the
+high half. That is precisely what the forward's refusal means by a role "never
+recoverable from the tensor alone", and it is why the tensors are doubled while
+`norm` stays `head_dim`-wide (`compressor.py:288`).
+
+Gated with halves made distinguishable by sign, so the three plausible readings
+give three different numbers: the correct role split pools to -2.0, ignoring
+`head_offset` gives +4.5, and inverting the roles gives +2.0. Three mutations run
+red -- `head_offset` ignored, roles inverted, and only `compress_ratio` rows
+gathered instead of `coff * compress_ratio`. A separate case pins that `coff == 1`
+is byte-unchanged, since every landed gate was written against it.
+
+## W3's first tensor: the indexer's query comes from the q-LoRA
+
+One of the three pieces the forward's refusal names is "the indexer's query
+projected from `qr` (q_lora_rank) instead of the hidden state"
+(`attention.py:721-726`, used at `:835`). `wq_b` is
+`ReplicatedLinear(q_lora_rank, head_dim * n_head)`, so its K is `q_lora_rank`, and
+`qa` in `AttentionBlock` is already `qr` -- the q-LoRA output with `q_norm`
+applied in place, the same operand the main query's `wq_b` consumes.
+
+The forward now dispatches on the weight's own K, so BOTH geometries are
+readable: the artifact's `[inh*ihd, q_lora_rank]` and the collapsed
+`[inh*ihd, hidden_size]` the synthetic suites were written against.
+`RequireDsaGeometryOrRefuse` accepts the upstream shape accordingly, and the
+refusal narrowed by exactly that one tensor -- `compressor.ape`,
+`compressor.wgate.weight` and `indexer.compressor.wkv.weight` still refuse.
+
+**WHAT IS GATED AND WHAT IS NOT, because a mutation drew the line.** Rejecting the
+upstream shape reds, and forcing the qr operand onto the collapsed geometry reds.
+But making the forward ALWAYS project from the hidden state does NOT red anything:
+the only case carrying the upstream geometry asserts on the REFUSAL MESSAGE, and
+that layer still refuses on `compressor.wkv`, so no test ever runs a forward to
+completion with this weight. **The shape is accepted and gated; the projection
+itself is unexercised** until the other two tensors are readable, and it is listed
+under `## Owed` rather than counted as proven.
+
+## W1's arm is REACHED from production
+
+`DeepseekV4ForwardExl3Paged` is the paged non-GGUF entry the arm needed. It binds
+the EXL3 tower and leaves `gguf` null, so `dsa_dense` is false and the compressor
+predicate is live -- the stateless `DeepseekV4ForwardExl3` beside it already had
+that shape and simply carried no pages.
+
+Gated in `test_deepseek_v4_exl3_loader`: a two-layer fixture whose layer 1 is
+`compress_ratio == 128`, driven for two single-token steps, must come back with
+that layer's carried state holding one row per step while layer 0's stays empty.
+Only the composed arm produces that; a dense fallback leaves it empty. Three
+mutations run red -- the call site deleted, the guard disabled so a compressor
+layer proceeds without state, and the entry dropping the state before it reaches
+the backend.
+
+So `CompressorLayerStep` is no longer a function that merely works. What remains
+before the resolver's refusal may narrow is the runner carrying this state across
+steps, since the gate supplies it by hand.
+
+## The compressor arm is wired, and the GGUF forward CANNOT reach it
+
+`V4Backend::compressor` carries the per-layer state and `AttentionBlock`'s paged
+arm routes a `compress_ratio == 128` layer through `CompressorLayerStep` when it
+is supplied. `DeepseekV4ForwardGgufPaged` surfaces it as an optional argument, and
+null keeps the existing refusal.
+
+**That public entry can never reach it, and two tests written against it failed
+before the assumption was caught.** `dsa_dense` is `(be.gguf != nullptr)` and
+`is_comp` is `has_compressor(layer) && !dsa_dense`, so on the GGUF arm EVERY layer
+is dense regardless of `compress_ratios`. A ratio-128 layer driven through that
+forward leaves the carried state empty and the guard silent, because neither is
+consulted. It is what the arm IS: the GGUF converter never carried compressor
+tensors, and `dsa_dense` says so once for the whole arm.
+
+So the arm is reachable only from a NON-GGUF paged forward, and this tree has no
+public one. That is now the concrete blocker for W1's reachability, ahead of the
+refusal narrowing, and it is smaller than it sounds: the EXL3 arm already loads
+and composes, it simply has no paged entry point yet.
+
+## The refusal narrows LAST, not first
+
+Attempted 2026-08-31 and REVERTED, because the attempt is the natural first move
+and it is wrong.
+
+`ResolveDeepseekV4SwaPages` refuses every compressor layer. Narrowing it to refuse
+only `compress_ratio == 4` -- W3's `coff == 2` overlapped windows plus the
+Lightning Indexer -- looks like progress, since W1's `MergeWindowAndCompressed`
+has landed and `compress_ratio == 128` is `coff == 1`. It builds, and
+`test_deepseek_v4_paged_equiv` catches it immediately.
+
+The primitive exists; NOTHING CALLS IT. So a narrowed refusal does not enable the
+composition, it removes the guard in front of the arm that cannot do it: those 20
+layers would attend the RAW PREFIX and emit entirely plausible tokens from the
+wrong key set. A loud refusal becomes a silent wrong answer, which is the exact
+trade this row exists to prevent.
+
+**The order is: wire the forward, gate it, THEN narrow the refusal.** The refusal
+is not the work; it is what makes the missing work visible.
+
+## What the REAL artifact needs, counted
+
+From the artifact's own `config.json`, `compress_ratios` over 46 layers:
+
+| shape | layers | wave |
+|---|---|---|
+| dense (`0`) | 5 | already handled |
+| `compress_ratio == 128` (`coff == 1`) | 20 | W1 |
+| `compress_ratio == 4` (`coff == 2` + indexer) | 21 | W3 |
+
+So finishing W1 covers 20 of the 41 compressor layers and does NOT make the real
+artifact loadable. The other 21 need W3, including the Lightning Indexer's learned
+top-k, which is the hardest mechanism in this row. Any plan that reads
+"DSA-COMPOSE finishes" as one more wave is mis-sized by the harder half.
 
 ## Work breakdown
 

@@ -2581,6 +2581,26 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
             lane_geom.experts_per_tok, ResolveExpertStreamSlots());
         const size_t slice =
             GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
+        // MODEL-TEXT-GLM-MOE-DSA (#2214, spec O33). RESERVE the same number the
+        // bound below is about to charge the device for, so the arena
+        // `CheckDeviceWeightFit` prices and the arena the store allocates cannot
+        // be two different numbers.
+        //
+        // They WERE two different numbers, and it cost a step. `ExpertStreamLane`
+        // is a process-lifetime singleton built on the FIRST slice anyone asks
+        // for, and a model whose forward reserves per LAYER sizes it from
+        // whichever layer runs first. On GLM-5.3's `UD-IQ1_S` that is `blk.3`,
+        // whose `ffn_down_exps` is IQ3_XXS at 4,816,896 B; `blk.8`'s is IQ4_XS at
+        // 6,684,672 B, so the store was built 28% too small and refused by name
+        // mid-step after streaming 527 slices — measured on `dgx:gpu0`,
+        // 2026-08-31. A `UD-*` arm mixes encodings ACROSS layers by design, so no
+        // per-layer maximum is the model's maximum.
+        //
+        // Here rather than in a model, because this is the one place that has the
+        // whole FILE. `Reserve` takes a maximum and is inert unless streaming was
+        // requested, so a model that reserves for itself as well (Qwen3.5 does)
+        // is unaffected except by being given a floor that is at least correct.
+        if (slice > 0) expert_stream::ExpertStreamLane::Reserve(slice);
         if (slice > 0) {
           lane.arena_bytes =
               static_cast<size_t>(ResolveExpertStreamSlots()) *

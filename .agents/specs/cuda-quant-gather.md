@@ -452,7 +452,17 @@ generalisation from ONE hidden issue and it is wrong.
   architectures — and the HEAD-SHA run with M5 is proven on sm_110. Rerunning the
   head on GB10 is a confirmation rather than a gap: the only non-comment
   difference between the two gated SHAs is the one registration line M5 deletes
-  and reds, and both architectures already agree on every other verdict.
+  and reds, and both architectures already agree on every other verdict. Queued
+  as `ae08d765`.
+
+  A note for whoever reads `rc ps` and finds nothing: the FIRST attempt at this
+  run (`61a5c4fb`) was cancelled when the submitting session died. `rc run` is
+  not fire-and-forget — client death cancels a job that is still QUEUED, while a
+  job that has already STARTED survives. That is why the sm_110 head run
+  (`28bfb44b`, submitted the same way but scheduled immediately) completed and
+  this one did not. "No job in the queue" reads identically for a run that
+  finished, one that failed and one that was never scheduled, and only the first
+  two say anything about the tree.
 - **METAL, VULKAN, ROCM and TENSTORRENT gather arms** —
   [#2394](https://github.com/mudler/vllm.cpp/issues/2394). Each gather kernel
   asserts a float table by name and none registers `kEmbeddingQuant`, so each

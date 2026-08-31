@@ -1,7 +1,7 @@
 #version 450
-// vt_matmul_bt_tq2_dev: OPTIMIZED v2 — multi-column workgroups, packed uint32
-// weight reads, activation cache, subgroup reduce.
-// ALL barriers are hit by ALL threads (Vulkan spec compliance).
+// vt_matmul_bt_tq2_dev: OPTIMIZED v3 — shared-memory weight cache.
+// Multi-column workgroups, packed uint32 weight reads, activation cache,
+// subgroup reduce. ALL barriers are hit by ALL threads (Vulkan spec compliance).
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
@@ -9,6 +9,7 @@
 #include "vt_common.glsl"
 
 #define COLS_PER_WG 4u
+#define W_CACHE_WORDS 18u
 
 layout(local_size_x = 128, local_size_y = COLS_PER_WG, local_size_z = 1) in;
 
@@ -29,6 +30,7 @@ layout(constant_id = 1) const uint VT_TQ_ACT_DT = 0u;
 shared int q8_cache[8][256];
 shared float d_act_cache[8];
 shared float sm_reduce[512];
+shared uint w_cache[COLS_PER_WG][8][W_CACHE_WORDS];
 
 float load_act(uint idx) {
   return (VT_TQ_ACT_DT == VT_DT_F32)
@@ -36,13 +38,13 @@ float load_act(uint idx) {
       : vt_bf16_to_f32(uint(A16.v[idx]));
 }
 
-int tq2_0_trit(uint ae, uint woff) {
+int tq2_0_trit_cached(uint ae, uint col_id, uint block_id, uint woff_align) {
   uint j = (ae >= 128u) ? 32u : 0u;
   uint rem = ae - j * 4u;
   uint l = rem / 32u; uint k = rem % 32u;
-  uint wb_byte = woff + j + k;
-  uint w32 = W32.v[wb_byte >> 2];
-  uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
+  uint byte_off = woff_align + j + k;
+  uint w32 = w_cache[col_id][block_id][byte_off >> 2];
+  uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
   return int((wb >> (l * 2u)) & 3u) - 1;
 }
 
@@ -119,17 +121,28 @@ void main() {
     }
     barrier();
 
+    // Cooperative weight block load
     uint w_row = p.w_off + col * p.nb * wbytes;
-    float acc = 0.0;
+    if (block_id < nb) {
+      uint woff = w_row + block_id * wbytes;
+      uint w_base = woff >> 2u;
+      uint nwords = ((woff + wbytes - 1u) >> 2u) - w_base + 1u;
+      for (uint i = lane_in_block; i < nwords; i += lpb) {
+        w_cache[col_id][block_id][i] = W32.v[w_base + i];
+      }
+    }
+    barrier();
 
+    float acc = 0.0;
     if (block_id < nb && d_act_cache[block_id] != 0.0) {
       uint woff = w_row + block_id * wbytes;
+      uint woff_align = woff & 3u;
       float wd = vt_from16(uint(W16.v[(woff + 64u) >> 1]), VT_DT_F16);
       float blockd = d_act_cache[block_id] * wd;
       int acci = 0;
       for (uint i = 0u; i < elems; ++i) {
         uint ae = lane_in_block * elems + i;
-        acci += q8_cache[block_id][ae] * tq2_0_trit(ae, woff);
+        acci += q8_cache[block_id][ae] * tq2_0_trit_cached(ae, col_id, block_id, woff_align);
       }
       acc = float(acci) * blockd;
     }

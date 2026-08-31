@@ -241,16 +241,25 @@ void MatmulBTQuantGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
   const int64_t P = out.shape[0];
   const int64_t N = out.shape[1];
   const int64_t K = act.shape[1];
-  const bool bcast = (act.shape[0] == 1 && P > 1);  // broadcast a shared hidden across experts
+  const int64_t act_rows = act.shape[0];
+  const bool bcast = (act_rows == 1 && P > 1);  // broadcast a shared hidden across experts
+  // Prefill gather: activation is [T, H], output is [P, H] where P = T * top_k.
+  // Each output row p reads activation row p / top_k. Infer top_k from shapes.
+  // Mirrors the Vulkan shader's gather_k parameter (vulkan_ops.cpp:2283-2286).
+  const bool gather = (!bcast && act_rows > 1 && act_rows < P &&
+                        P % act_rows == 0);
+  const int64_t gather_k = gather ? P / act_rows : 1;
   const size_t row_bytes = RowSizeBytes(weight.dtype, K);
   const size_t act_elem = SizeOf(act.dtype);
   const size_t out_elem = SizeOf(out.dtype);
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
   for (int64_t p = 0; p < P; ++p) {
     const int64_t e = eids[p];
+    const int64_t act_row_idx = bcast ? 0 : (p / gather_k);
     Tensor a_row = Tensor::Contiguous(
-        static_cast<uint8_t*>(act.data) + static_cast<size_t>(bcast ? 0 : p) *
-                                              static_cast<size_t>(act.stride[0]) * act_elem,
+        static_cast<uint8_t*>(act.data) +
+            static_cast<size_t>(act_row_idx) *
+                static_cast<size_t>(act.stride[0]) * act_elem,
         act.dtype, act.device, {1, K});
     Tensor o_row = Tensor::Contiguous(
         static_cast<uint8_t*>(out.data) +

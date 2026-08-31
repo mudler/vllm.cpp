@@ -260,8 +260,9 @@ void MoeGateUpSwiGLUGrouped(Queue& q, Tensor& out, const Tensor& act, const Tens
   VT_CHECK(out.rank == 2 && act.rank == 2 && gate_w.rank == 2 && up_w.rank == 2,
            "moe_gate_up_swiglu: rank-2 out/act/gate_w/up_w required");
   const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
-  VT_CHECK(act.shape[0] == P || act.shape[0] == 1,
-           "moe_gate_up_swiglu: act rows must be P (per-expert) or 1 (broadcast)");
+  VT_CHECK(act.shape[0] == P || act.shape[0] == 1 ||
+           (act.shape[0] > 1 && act.shape[0] < P && P % act.shape[0] == 0),
+           "moe_gate_up_swiglu: act rows must be P (per-expert), 1 (broadcast), or T (gather, P=T*top_k)");
   VT_CHECK(gate_w.shape[1] == K && up_w.shape[1] == K,
            "moe_gate_up_swiglu: gate_w/up_w K mismatch (both are [E*N,K])");
   VT_CHECK(gate_w.shape[0] % N == 0 && up_w.shape[0] == gate_w.shape[0],

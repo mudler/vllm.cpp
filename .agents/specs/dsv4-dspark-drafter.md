@@ -215,6 +215,19 @@ block's are 20.2 GiB as host f32 -- and the caller is told through
 Shapes are checked at assembly rather than inside a forward, where a mismatch
 surfaces as an anonymous MatVec size error naming no tensor and no layer.
 
+W-3's EXTERNALLY-SUPPLIED-KV MODE LANDED, which is the seam extension the
+paragraph below argued for. `V4Backend::paged_kv_prewritten`, surfaced on
+`DeepseekV4ForwardGgufPaged` as `kv_prewritten` and defaulting FALSE, skips the
+`vt::ConcatAndCacheMla` write and attends the rows the caller already placed. The
+`deck` is still computed -- it is the same tensor the non-paged arms read -- and
+only the write is skipped.
+
+Gated on the exact claim: with the flag on, a cache filled with a recognisable
+pattern comes back BYTE-UNCHANGED, and the same step with the flag off DOES write.
+Without that second half the case would pass against a build that never writes at
+all. Three mutations run red: the flag ignored, the write removed unconditionally,
+and the public entry dropping the flag before it reaches the backend.
+
 W-3's REMAINING SHAPE, measured rather than estimated. The block weights now
 assemble onto `DeepseekV4LayerHostWeights`, so `MoeBlock`, `MhcPre` and `MhcPost`
 compose the drafter block unchanged. **`AttentionBlock` does not**, and the reason
@@ -255,6 +268,25 @@ oracle -- the exact class of difference acceptance cannot explain afterwards.
 W-5. **Propose/verify**, reusing the shared `RejectionSampler` verbatim. The
 lossless property makes the correctness gate exact: drafter-on greedy output must
 be token-IDENTICAL to drafter-off.
+
+**Checked before scheduling, because the drafter's variable draft length looked
+like it might need a new verify path. It does not.** The shared sampler already
+takes `cu_num_logits`, a `[num_reqs + 1]` cumulative array, and derives each
+request's length as `cu[r + 1] - cu[r]`
+(`src/vllm/v1/spec_decode/rejection_sampler.cpp:85-86`). Per-request lengths are
+therefore supported by construction, which is exactly the shape W-4b's
+confidence cap produces: a draft length anywhere in `[0, block]`, differing
+between requests in the same step.
+
+Two consequences worth stating so the wave is not mis-sized. `num_speculative_steps`
+only sizes the scratch row, so it must be at least `dspark_block_size` (5) and
+nothing more depends on it. And a confidence length of 0, "skip drafting this
+round", is `cu[r + 1] - cu[r] == 1`: one logit row carrying the previous token,
+which yields the bonus token alone and is a valid sampling row rather than an
+empty one.
+
+So W-5 adds NO new verify path. It is the propose side plus the `cu_num_logits`
+bookkeeping.
 
 W-6. **The device arm**, and only then a throughput claim.
 

@@ -925,3 +925,15 @@ Gemma-4 rows are an honesty pass.
 - **D5 — the Gemma-4 backbone is a separate campaign.** PLE/YOCO/Gemma-4-MoE/k_eq_v
   ([`sweep-gemma.md`](sweep-gemma.md) §0.1) is unbuilt and no other row needs it;
   it is not smuggled into an mm bring-up.
+
+### Cross-reference — the vision tower's wire-or-remove verdict
+
+[`gemma4-vision-reachability.md`](gemma4-vision-reachability.md) settles
+[#2173](https://github.com/mudler/vllm.cpp/issues/2173): the SigLIP2 tower is
+unreached from any production entry point, the pinned oracle runs its own tower
+on the default path, so the verdict is WIRE and the wiring is owed. That spec
+owns the bricks, gates and stop conditions; nothing is restated here, because
+this file is the shared campaign record every Gemma-4 wave writes and a section
+with its own gates would make it a conflict lock. Its §3.8 records a
+provenance contradiction against §0.0 above that is not settled — read it before
+citing §0.0's transformers measurement.

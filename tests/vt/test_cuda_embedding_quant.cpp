@@ -61,6 +61,49 @@ namespace {
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
 
+// THE CIRCULARITY, AND HOW THIS FILE BREAKS IT.
+//
+// Since KGATHER made the residency gate a registry query, registering
+// `kEmbeddingQuant` on the CUDA device IS the residency flip, and it is withheld
+// until this file runs green on a CUDA host (see cuda_ops.cu). But the value
+// cases below dispatch through `vt::Embedding`, which routes a block table to
+// exactly that op — so with the registration withheld they would throw "no
+// kernel for op EmbeddingQuant on device cuda" and could never produce the
+// evidence the flip is waiting on.
+//
+// So this file performs the registration ITSELF, once, in test scope. That is
+// deliberate and it is the honest shape: the gate then measures the same kernel
+// through the same dispatch the flip would enable, while production still
+// refuses. It is literally the two lines commented out in cuda_ops.cu, and when
+// the flip lands this helper is deleted in the same commit that uncomments them.
+//
+// It does NOT weaken the registrar case above: that case runs BEFORE any value
+// case touches this helper only because it asserts a property of the production
+// registrars, and doctest runs cases in declaration order within a file. The
+// helper is called from the value cases alone.
+// True once THIS FILE has performed the registration. The registrar case below
+// asserts `OpRegistered(...) == g_test_registered`, which says "the op is
+// registered if and only if the TEST registered it" — i.e. production has not.
+// Written this way rather than as a bare CHECK_FALSE because a bare one would
+// depend on doctest running the registrar case before the value cases, and a
+// gate whose verdict depends on case ORDER is a gate that passes for the wrong
+// reason the first time someone runs it with `-tc` or reorders the file. A
+// static-init snapshot would be worse still: cross-TU static init order is
+// unspecified, so it could read `false` merely because the CUDA registrar had
+// not run yet, and report a false pass.
+[[maybe_unused]] bool g_test_registered_cuda_gather = false;  // unused in a CPU-only build
+
+void RegisterCudaGatherForTest() {
+#ifdef VLLM_CPP_CUDA
+  static const bool once = [] {
+    vt::cuda::RegisterCudaBlockGather();
+    return true;
+  }();
+  (void)once;
+  g_test_registered_cuda_gather = true;
+#endif
+}
+
 bool HasCuda() {
   try {
     vt::GetBackend(DeviceType::kCUDA);
@@ -196,16 +239,22 @@ TEST_CASE("the CUDA block gather is REGISTERED, so the residency policy can find
   // this a check on the registrar rather than on the host.
   CHECK(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kCPU));
 
-  // CUDA is NOT registered YET, and that is the state under test rather than an
-  // oversight. Since the gate became a registry query, this registration IS the
-  // residency flip, and it is withheld until the value cases below have run
-  // GREEN ON A CUDA HOST — they are skips on a host with no device, and a skip
-  // is not a pass.
+  // PRODUCTION has not registered the CUDA block gather, and that is the state
+  // under test rather than an oversight. Since the gate became a registry query,
+  // that registration IS the residency flip, and it is withheld until the value
+  // cases below have run GREEN ON A CUDA HOST — they are skips on a host with no
+  // device, and a skip is not a pass.
   //
-  // WHEN THAT RUN IS GREEN: uncomment the RegisterOp in cuda_ops.cu and change
-  // this one line to CHECK. Both edits belong in the same commit, and this case
-  // is what stops the registration arriving without anyone deciding to add it.
-  CHECK_FALSE(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kCUDA));
+  // The assertion is an IFF against this file's own bookkeeping, so it holds
+  // whether or not a value case has already run: the op is registered exactly
+  // when the TEST registered it.
+  //
+  // WHEN THE DEVICE RUN IS GREEN: uncomment `RegisterCudaBlockGather()` in
+  // cuda_ops.cu's registrar, delete `RegisterCudaGatherForTest` and its call
+  // sites, and change this to a plain CHECK. All of that belongs in one commit,
+  // and this case is what stops the registration arriving without a decision.
+  CHECK(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kCUDA) ==
+        g_test_registered_cuda_gather);
 
   // The four with no decoder must NOT be registered in any build: registering
   // the id without writing the decoder converts a clean load-time refusal into a
@@ -225,6 +274,8 @@ TEST_CASE("CUDA gather == CPU gather, bit-exactly, on every block encoding") {
   }
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   Queue gq = gpu.CreateQueue();
+  RegisterCudaGatherForTest();  // see the note on that helper: production has NOT
+                                // registered this yet, and that is the point.
 
   uint32_t seed = 1234;
   for (const DType dt : kGatherDTypes) {
@@ -301,6 +352,8 @@ TEST_CASE("CUDA gather == CPU gather in bf16 out, bit-exactly") {
   }
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   Queue gq = gpu.CreateQueue();
+  RegisterCudaGatherForTest();  // see the note on that helper: production has NOT
+                                // registered this yet, and that is the point.
 
   uint32_t seed = 99001;
   for (const DType dt : kGatherDTypes) {
@@ -359,6 +412,8 @@ TEST_CASE("CUDA gather takes i64 ids and agrees with the i32 arm") {
   }
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   Queue gq = gpu.CreateQueue();
+  RegisterCudaGatherForTest();  // see the note on that helper: production has NOT
+                                // registered this yet, and that is the point.
 
   const DType dt = DType::kIQ4_NL;  // the shipped n-gram table's encoding
   const int64_t be = vt::BlockElems(dt);
@@ -404,6 +459,8 @@ TEST_CASE("CUDA gather reports an out-of-range id on a block table") {
   }
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   Queue gq = gpu.CreateQueue();
+  RegisterCudaGatherForTest();  // see the note on that helper: production has NOT
+                                // registered this yet, and that is the point.
 
   const DType dt = DType::kQ4_K;
   const int64_t be = vt::BlockElems(dt);

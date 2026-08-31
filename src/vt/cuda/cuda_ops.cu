@@ -3972,8 +3972,7 @@ struct Registrar {
     // is MODEL-MM-QWEN4-EXP and .agents/specs/cuda-quant-gather.md lists it
     // under `## Owed`. Uncommenting the two lines below is the whole flip.
     //
-    // RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCUDA,
-    //            reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+    // RegisterCudaBlockGather();   <-- THE FLIP. One call, defined below.
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
     RegisterOp(
@@ -4018,4 +4017,13 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+// See vt/cuda/cuda_embedding_quant.h. Defined out here, outside the anonymous
+// namespace, because `EmbeddingKernelCuda` has internal linkage and the gate
+// cannot name it -- this function is the only way in, which is also what keeps
+// the flip auditable as a single call site.
+void RegisterCudaBlockGather() {
+  RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCUDA,
+             reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+}
+
 }  // namespace vt::cuda

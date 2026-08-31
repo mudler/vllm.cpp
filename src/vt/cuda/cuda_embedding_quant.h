@@ -42,4 +42,22 @@ bool EmbeddingQuantSupported(DType dt);
 cudaError_t LaunchEmbeddingQuant(cudaStream_t s, Tensor& out, const Tensor& table,
                                  const Tensor& ids, EmbeddingQuantErr* err);
 
+// THE RESIDENCY FLIP, as ONE callable.
+//
+// Since the GGUF gate became `OpRegistered(kEmbeddingQuant, dev)`, registering
+// this device's block gather IS the flip. This function performs that
+// registration and NOTHING else, so the flip is one call rather than a
+// copy-pasted registrar line, and so the device gate can enable it in test scope
+// while production still refuses.
+//
+// PRODUCTION DOES NOT CALL THIS YET. `cuda_ops.cu`'s registrar has the call
+// commented out with its reason: nvcc has never compiled the decoders and no
+// device has executed them, and registering early would route every GGUF model's
+// block-typed gather table on CUDA into never-executed code with no throw and no
+// log if the decode were wrong. `tests/vt/test_cuda_embedding_quant.cpp` calls it
+// to measure the kernel through the real dispatch, and asserts that production
+// has NOT called it. When that gate runs green on a CUDA host, the registrar
+// calls this and that assertion becomes its opposite, in one commit.
+void RegisterCudaBlockGather();
+
 }  // namespace vt::cuda

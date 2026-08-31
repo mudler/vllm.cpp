@@ -249,6 +249,38 @@ drafter's cache, and the o path. The first is preferable under
 should attempt first, and it must be gated by proving the trunk's own paths are
 byte-unchanged when the new mode is off.
 
+W-5's BOOKKEEPING LANDED. `ProposeToVerifyInputs` maps a drafted block onto the
+shared sampler's inputs: `cu[r+1] - cu[r]` is `1 + length`, and row `cu[r]` is the
+previous token, uncompared. `MarkovDraftLoop` already returns `[seed, drafts...]`
+with the seed first, so the seed IS that row and the block maps across unchanged.
+
+A confidence length of 0 contributes exactly one row rather than none. That is a
+request skipping the round, and it still yields the bonus token; giving it zero
+rows would desynchronise every later offset, which is why the gate checks a
+three-request case with a zero in the middle.
+
+Three mutations run red: the seed row dropped, `cu` stopping accumulating, and a
+zero-length request contributing nothing. NO verify path was added, as recorded
+when the sampler's contract was read.
+
+W-3's ATTENTION HALF LANDED. `DsparkBlockAttentionHost` drives the SAME
+`AttentionBlock` the trunk uses, with `kv_prewritten` on so the rows
+`BlockKvRows` wrote from the projected taps are attended rather than overwritten.
+A DSpark block is a compressor-less V4 layer, so nothing else differs and no
+second attention exists to drift; the guard refuses a layer carrying a compressor
+or an indexer, since `mtp_layer_types` is asserted `"sliding"`
+(`deepseek_v4_mtp.py:61-63`).
+
+Gated on the exact claim: the tap-written rows survive BYTE FOR BYTE, and zeroing
+the cache changes the output, so the block provably READ them rather than
+attending nothing finitely.
+
+**The refusal gate had to be strengthened before it meant anything.** Asserting
+only that a compressor-carrying layer throws passed a mutation that removed the
+guard, because the widened tensor throws an anonymous size error downstream
+regardless. The case now requires the message to NAME the reason, which is the
+whole value the guard adds over the crash it replaces.
+
 W-4b LANDED. `ConfidenceDraftLength` is the draft-length cap:
 `sigmoid(proj(cat(pre_norm_hidden, markov_emb))) >= threshold`, and the length is
 `cumprod(keep).sum()` -- the longest CONTIGUOUS prefix of confident positions, not

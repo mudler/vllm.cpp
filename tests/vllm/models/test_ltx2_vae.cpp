@@ -1591,6 +1591,160 @@ TEST_CASE("ltx2 vae: the decode is BIT-IDENTICAL across thread counts") {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The AUDIO decoder's threadpool pair (LTX25-AUDIO-DECODE-COST, #2405).
+//
+// `decode.audio.mel` was 47.171 s of a 518.4 s LTX-2.5 render at the pinned
+// oracle's own request -- 9.13% of the wall for 1.02 s of audio, and 3.1x the
+// whole 21B denoise loop. Instrumented at the shipped checkpoint's geometry the
+// decoder issues 28 convolutions totalling 31.46 GMAC and spends 99.7% of the
+// leaf inside `Conv2d`, at ~1.2 GMAC/s on ONE core. These two cases are the
+// video half's #1009 pair, ported to the primitive the audio half shares with
+// its own encoder.
+//
+// THE FIXTURE IS THE SHIPPED SHAPE, REDUCED -- not the reduced golden's shape.
+// The artifact's own safetensors metadata carries `attn_resolutions: []` and
+// `mid_block_add_attention: false`, so the shipped decoder is convolution only,
+// and `ch_mult` has three entries so BOTH upsamples run and the output needs no
+// zero padding to reach `4 * latent_frames - 3`. A fixture with attention would
+// spend its time somewhere the render does not.
+//
+// EVERY CONVOLUTION HERE CROSSES `host_parallel::kMinParallelWork`, which is
+// what makes the dispatch observable: the smallest is `conv_out` at 2 output
+// channels and 17 output rows, 34 * 2304 = 78,336 against the 65,536 guard.
+struct Ltx2AudioThreadFixture {
+  vllm::Ltx2AudioDecoderConfig cfg;
+  ParamBag bag;
+  std::vector<float> latent;
+  int64_t latent_t = 0, latent_f = 0;
+};
+
+Ltx2AudioThreadFixture MakeLtx2AudioThreadFixture() {
+  Ltx2AudioThreadFixture f;
+  f.cfg.ch = 16;
+  f.cfg.out_ch = 2;
+  f.cfg.ch_mult = {1, 2, 4};
+  f.cfg.num_res_blocks = 1;
+  f.cfg.attn_resolutions = {};
+  f.cfg.mid_block_add_attention = false;
+  f.cfg.resolution = 32;
+  // `PerChannelStatistics` indexes the PATCHIFIED (c, f) axis, so
+  // `z_channels * latent_f` must equal `ch` -- 4 * 4 = 16, which is what
+  // `BuildAudioDecoderParams` sizes those two tensors to.
+  f.cfg.z_channels = 4;
+  f.cfg.norm_type = vllm::Ltx2NormType::kPixel;
+  f.cfg.causality_axis = vllm::Ltx2CausalityAxis::kHeight;
+  f.cfg.mel_bins = 16;
+  f.cfg.prefix = "ltx2.audiodec.threads.";
+
+  f.latent_t = 5;
+  f.latent_f = 4;
+  f.bag = BuildAudioDecoderParams(f.cfg);
+  f.latent = Ltx2Input("ltx2.audiodec.threads.input",
+                       f.cfg.z_channels * f.latent_t * f.latent_f, 1.0);
+  return f;
+}
+
+vllm::Ltx2AudioSpectrogram Ltx2AudioThreadDecode(const Ltx2AudioThreadFixture& f) {
+  // `Ltx2AudioDecoderForward` IS the production call site. The render reaches it
+  // at src/vllm/multimodal/ltx2_video.cpp:5549 inside the `decode.audio.mel`
+  // scope, and the text-to-audio path at ltx2_t2a.cpp:407. There is no streaming
+  // wrapper between them and this function, so entering here is entering the
+  // shipping path rather than constructing the type by hand.
+  return vllm::Ltx2AudioDecoderForward(f.cfg, f.bag.weights, f.latent, f.cfg.z_channels,
+                                       f.latent_t, f.latent_f);
+}
+
+// The output is generic rather than constant, so "every arm agrees" is not a
+// statement about a decode that never ran: a zero-filled or stubbed result is
+// bit-identical to another one, and the memcmp below would be vacuous on it.
+void RequireAudioDecodeIsNotDegenerate(const vllm::Ltx2AudioSpectrogram& out) {
+  REQUIRE(out.channels == 2);
+  REQUIRE(out.frames == 17);   // 4 * latent_t - 3, the causal target
+  REQUIRE(out.mel_bins == 16);
+  REQUIRE(out.data.size() == static_cast<size_t>(out.channels * out.frames * out.mel_bins));
+  const auto minmax = std::minmax_element(out.data.begin(), out.data.end());
+  INFO("audio decode range [" << *minmax.first << ", " << *minmax.second << "]");
+  CHECK(*minmax.first != *minmax.second);
+}
+
+TEST_CASE("ltx2 vae: the AUDIO decode DISPATCHES its convolutions to the CPU threadpool") {
+  // THE CASE THAT IS RED BEFORE #2405. The determinism case below is not enough
+  // on its own and its own comment says why: two runs of a serial decode are
+  // also bit-identical, so a thread-count A/B is green on an implementation that
+  // never threads anything. This case observes the dispatch itself.
+  //
+  // THE INSTRUMENT is `Threadpool::ChunkAdd(0)`, a non-mutating read
+  // (`fetch_add(0)`) of the pool's shared work-stealing cursor, which
+  // `ParallelForRows` seeds and every steal advances. A fresh pool reads 0; a
+  // pool that has run a partitioned dispatch reads more. The REQUIRE before the
+  // decode is its own positive control -- the instrument demonstrably reads zero
+  // when nothing has dispatched, which is exactly the state this row removes.
+  const Ltx2AudioThreadFixture f = MakeLtx2AudioThreadFixture();
+
+  vt::cpu::Threadpool tp(4);
+  REQUIRE(tp.NThreads() == 4);
+  REQUIRE(tp.ChunkAdd(0) == 0);
+
+  vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+  vllm::Ltx2AudioSpectrogram got;
+  try {
+    got = Ltx2AudioThreadDecode(f);
+  } catch (...) {
+    vt::cpu::Threadpool::SwapForTesting(prev);
+    throw;
+  }
+  const int cursor = tp.ChunkAdd(0);
+  vt::cpu::Threadpool::SwapForTesting(prev);
+
+  RequireAudioDecodeIsNotDegenerate(got);
+
+  // The decode ran, and it ran through the pool.
+  INFO("audio decode chunk cursor = " << cursor);
+  CHECK(cursor > 0);
+}
+
+TEST_CASE("ltx2 vae: the AUDIO decode is BIT-IDENTICAL across thread counts") {
+  // THE GUARANTEE HALF, and it is GREEN BEFORE THE CHANGE -- stated rather than
+  // hidden, because a case that cannot be red before is not evidence that the
+  // change works. It is evidence that the change did not break anything, which
+  // is a different and equally necessary claim: the whole argument for
+  // parallelising this loop is that the partition is over output LINES (oc, y)
+  // and the entire `ci * kh * kw` reduction stays inside one output element's
+  // body, so every element is produced by the same instruction sequence over the
+  // same values in the same order whatever the worker count is
+  // (cpu_threadpool.h:39-43). A decode that returns different floats at 1 worker
+  // and at 8 is a defect with every golden green, and no golden here would see
+  // it: the goldens run at one thread count, the global pool's.
+  //
+  // Worker count 1 short-circuits ParallelForRows to `body(0, nr)` on the caller
+  // (cpu_threadpool.cpp:423-426), so the 1-worker arm IS the pre-#2405 serial
+  // code path byte for byte, and every other arm is compared against it.
+  const Ltx2AudioThreadFixture f = MakeLtx2AudioThreadFixture();
+
+  std::vector<float> base;
+  for (int nth : {1, 2, 3, 5, 8}) {
+    vt::cpu::Threadpool tp(nth);
+    vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+    vllm::Ltx2AudioSpectrogram got;
+    try {
+      got = Ltx2AudioThreadDecode(f);
+    } catch (...) {
+      vt::cpu::Threadpool::SwapForTesting(prev);
+      throw;
+    }
+    vt::cpu::Threadpool::SwapForTesting(prev);
+
+    RequireAudioDecodeIsNotDegenerate(got);
+    if (base.empty()) {
+      base = got.data;
+    } else {
+      INFO("worker count " << nth);
+      CHECK(std::memcmp(base.data(), got.data.data(), base.size() * sizeof(float)) == 0);
+    }
+  }
+}
+
 TEST_CASE("ltx2 vae: the video decoder's norm_eps is gated where it BINDS") {
   // THE ARM THAT MAKES `Ltx2ConvVideoDecoderConfig::norm_eps` NUMERICALLY
   // REACHABLE, and the correction of a record that said it was not.

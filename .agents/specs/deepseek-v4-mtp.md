@@ -279,6 +279,17 @@ carried FP8 half is widened at load, which would move the 8.23 GiB row, and the
 real resident total from `ReportDeepseekV4Exl3Residency` on the box. 90.82 GiB is
 a packed byte count taken from headers, not a residency measurement.
 
+**The BOX side of that is now checked, on hardware rather than a spec sheet.**
+Under an `rc` lease on `thor:gpu0` (`NVIDIA-Thor`, 2026-08-31) the worker reports
+**122 GiB total and 117 GiB available**, and sees the staged checkpoint as 190
+files on the same NAS folder `dgx` uses. So the headroom against 90.82 GiB is
+real, and it does not depend on `dgx:gpu0`, which this campaign spent a session
+queueing behind. What that does NOT settle is the load itself, and therefore
+whether the resident total agrees with the header count once the carried half is
+materialized. A fit inferred from a datasheet and a fit reported by the worker
+that would host the load are different claims, and this row has already carried
+one memory verdict that belonged to a different artifact.
+
 ### THE ARTIFACT'S HEAD IS NOT THE SHAPE W1b BUILT FOR
 
 W1b implemented the draft forward against vLLM's `nvidia/mtp.py`, whose checkpoint

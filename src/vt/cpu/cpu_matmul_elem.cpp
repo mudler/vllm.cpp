@@ -579,4 +579,24 @@ void WidenRowToF32(DType dt, const void* src, int64_t n, float* dst) {
   }
 }
 
+void NarrowRowFromF32(DType dt, void* dst, int64_t n, const float* src) {
+  switch (dt) {
+    case DType::kF32:
+      std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
+      break;
+    case DType::kF16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      for (int64_t i = 0; i < n; ++i) d[i] = F32ToF16(src[i]);
+      break;
+    }
+    case DType::kBF16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      for (int64_t i = 0; i < n; ++i) d[i] = F32ToBF16(src[i]);
+      break;
+    }
+    default:
+      VT_CHECK(false, "matmul: unsupported elementwise dtype");
+  }
+}
+
 }  // namespace vt::cpu

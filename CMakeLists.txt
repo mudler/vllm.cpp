@@ -2777,6 +2777,27 @@ target_include_directories(vllm_ltx2_connector_gemm_probe SYSTEM PRIVATE
 target_compile_features(vllm_ltx2_connector_gemm_probe PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_ltx2_connector_gemm_probe)
 
+# ── BIT-ROT GUARD: the vt CPU per-element dispatch survey probe ──────────────
+# `tools/bench/vt_cpu_elem_survey_probe.cpp` is the artifact behind the ranking
+# in `.agents/specs/vt-cpu-elem-survey.md`: one `--op <name>` runs ONE CPU
+# kernel alone, at a shape a shipped model actually uses, so a `perf record`
+# over it reads that kernel's `LoadF32` self percentage with no other vt work in
+# the process. It reaches every kernel through the production `vt::` entry
+# point, so a signature change must break the build rather than the ranking.
+#
+# CI COMPILES IT AND RUNS NOTHING, like its siblings above: one leg allocates
+# gigabytes and spends tens of seconds of a core, and the recorded runs come
+# from the direct g++ compile in the file's own header, because this devbox has
+# no room for a CMake build tree.
+add_executable(vllm_vt_cpu_elem_survey_probe tools/bench/vt_cpu_elem_survey_probe.cpp)
+target_link_libraries(vllm_vt_cpu_elem_survey_probe PRIVATE vllm)
+target_include_directories(vllm_vt_cpu_elem_survey_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_vt_cpu_elem_survey_probe SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_vt_cpu_elem_survey_probe PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_vt_cpu_elem_survey_probe)
+
 # ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
 # `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
 # `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier

@@ -3058,6 +3058,30 @@ std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
 
 }  // namespace dspark
 
+// DSV4-DSPARK-DRAFTER W-3: one block's attention half, host oracle.
+// Drives the SAME `AttentionBlock` the trunk uses, with `kv_prewritten` on so the
+// rows `BlockKvRows` wrote from the trunk taps are attended rather than
+// overwritten. A DSpark block is a compressor-less V4 layer, so nothing else
+// differs and no second attention exists to drift.
+std::vector<float> DsparkBlockAttentionHost(
+    vt::Queue& queue, const DeepseekV4LayerHostWeights& L,
+    const DeepseekV4Params& p, const std::vector<float>& x,
+    const std::vector<int32_t>& positions, std::vector<vt::Tensor>& pages,
+    int64_t layer, int64_t kv_base) {
+  VT_CHECK(static_cast<int64_t>(pages.size()) > layer,
+           "dspark block attention: no page tensor for this block");
+  VT_CHECK(L.comp_wgate.empty() && L.idx_wk.empty(),
+           "dspark block attention: a DSpark block is COMPRESSOR-LESS and carries "
+           "no indexer (`mtp_layer_types` is asserted \"sliding\", "
+           "deepseek_v4_mtp.py:61-63); this layer carries one");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.paged_kv = &pages;
+  be.paged_kv_prewritten = true;
+  be.kv_base = kv_base;
+  return AttentionBlock(L, /*Lq=*/nullptr, p, x, positions, layer, V4Miswire::kNone,
+                        /*trace=*/nullptr, be);
+}
+
 // DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
 // Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream
 // mean per requested layer, IN REQUEST ORDER -- which is the order `main_proj`

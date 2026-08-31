@@ -102,7 +102,7 @@ class VulkanContext {
   // loops) — here one module covers the axis and the count of committed artifacts
   // tracks shader FILES instead of their cross product.
   void Dispatch(const std::string& name, const void* const* buffers, uint32_t buffer_count,
-                const void* push_constants, uint32_t push_size, uint32_t group_count_x,
+                const void* push_constants, uint32_t push_size, uint32_t group_count_x, uint32_t group_count_y = 1,
                 const uint32_t* spec_values = nullptr, uint32_t spec_count = 0);
 
   // Was a pipeline for this SPIR-V module ever created? The cache key is the
@@ -311,7 +311,8 @@ class VulkanContext {
 
   int api_major() const { return api_major_; }
   int api_minor() const { return api_minor_; }
-  bool unified_memory() const { return unified_memory_; }
+  bool unified_memory() const { return false; } // FIXME: staging path bug
+  bool shader_float64() const { return shader_float64_; }
   const std::string& device_name() const { return device_name_; }
   uint32_t max_workgroup_count_x() const { return max_workgroup_count_x_; }
   // The two float-controls properties that decide whether our f32 arithmetic is
@@ -497,11 +498,13 @@ class VulkanContext {
   int api_major_ = 0;
   int api_minor_ = 0;
   bool unified_memory_ = false;
+  bool shader_float64_ = false;
   bool denorm_preserve_f32_ = false;
   bool sz_inf_nan_preserve_f32_ = false;
   bool coopmat_bf16_f32_ = false;
   uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
+  uint32_t max_workgroup_count_y_ = 0;
   uint32_t max_workgroup_invocations_ = 0;
   uint32_t max_workgroup_size_x_ = 0;
   bool subgroup_arithmetic_compute_ = false;

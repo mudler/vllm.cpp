@@ -9,6 +9,7 @@
 
 #define COLS_PER_WG 4u
 
+
 layout(local_size_x = 128, local_size_y = COLS_PER_WG, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint VT_FUSED_ACT_DT = 2u;
@@ -86,7 +87,7 @@ void main() {
   uint tid = gl_LocalInvocationID.x;
   uint col_id = gl_LocalInvocationID.y;
   uint col = gl_WorkGroupID.x * COLS_PER_WG + col_id;
-  if (col >= p.n) return;
+  bool col_active = col < p.n;
 
   const uint wbytes = 66u;
   uint nb = p.nb;
@@ -138,6 +139,7 @@ void main() {
     barrier();
   }
 
+  
   for (uint row = 0u; row < p.m; ++row) {
     int e = EID.v[p.eid_off + row];
     if (e < 0) continue;
@@ -214,7 +216,7 @@ void main() {
 
     gate_acc = col_reduce(col_id, gate_acc);
     up_acc = col_reduce(col_id, up_acc);
-    if (tid == 0u) {
+    if (col_active && tid == 0u) {
       float gc = min(gate_acc, p.limit);
       float uc = clamp(up_acc, -p.limit, p.limit);
       float s = gc / (1.0 + exp(-gc));

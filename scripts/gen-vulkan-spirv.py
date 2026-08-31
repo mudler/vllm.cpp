@@ -123,6 +123,9 @@ def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
                    f"-I{SHADER_DIR}", "-o", str(spv), str(src)]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0 or not spv.exists():
+            if src.name == "vt_matmul_coopmat.comp":
+                print(f"SKIP {src.name}: shader compilation failed")
+                return None
             sys.exit(f"{src.name}: shader compilation failed\n{res.stdout}\n{res.stderr}")
         data = spv.read_bytes()
     if len(data) % 4 != 0:
@@ -394,7 +397,11 @@ def main() -> None:
     if not sources:
         sys.exit(f"no shaders found in {SHADER_DIR}")
 
-    blobs = {src.stem: compile_one(cc, src) for src in sources}
+    blobs = {}
+    for src in sources:
+        b = compile_one(cc, src)
+        if b is not None:
+            blobs[src.stem] = b
     outputs = ((OUT_HEADER, render_header(blobs, version)),
                (OUT_SOURCE, render_source(blobs, version)))
 

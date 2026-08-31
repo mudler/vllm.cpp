@@ -67,7 +67,7 @@ void main() {
   uint tid = gl_LocalInvocationID.x;
   uint col_id = gl_LocalInvocationID.y;
   uint col = gl_WorkGroupID.x * COLS_PER_WG + col_id;
-  if (col >= p.n) return;
+  bool col_active = col < p.n;
 
   const uint wbytes = 66u;
   uint nb = p.nb;
@@ -181,7 +181,7 @@ void main() {
 
     acc = col_reduce(col_id, acc);
     if (tid == 0u) {
-      VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, acc);
+      if (col_active) VT_STORE(O32, O16, VT_TQ_OUT_DT, p.out_off, row * p.n + col, acc);
     }
     barrier();
   }

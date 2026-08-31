@@ -200,6 +200,52 @@ The first cases met neither condition, so a mutation that roped before norming
 passed them. The added case uses a non-zero position AND a gamma that differs
 inside the pair, which is the only shape in which the order is observable at all.
 
+W-3's WEIGHT ASSEMBLY LANDED. A DSpark block IS a compressor-less V4 decoder
+layer, so `AssembleBlockWeights` fills the SAME `DeepseekV4LayerHostWeights` the
+trunk's layers use and the existing `AttentionBlock`, `MoeBlock`, `MhcPre` and
+`MhcPost` compose it unchanged. Extending that seam is the point; a parallel block
+forward is what `AGENTS.md` forbids.
+
+Two absences are deliberate and both are gated. The compressor and indexer fields
+stay EMPTY, because these blocks carry neither, and a populated `comp_wgate` would
+send a drafter block down the DSA path. The routed experts are NOT filled -- one
+block's are 20.2 GiB as host f32 -- and the caller is told through
+`out_missing_experts` rather than meeting an empty vector later.
+
+Shapes are checked at assembly rather than inside a forward, where a mismatch
+surfaces as an anonymous MatVec size error naming no tensor and no layer.
+
+W-3's REMAINING SHAPE, measured rather than estimated. The block weights now
+assemble onto `DeepseekV4LayerHostWeights`, so `MoeBlock`, `MhcPre` and `MhcPost`
+compose the drafter block unchanged. **`AttentionBlock` does not**, and the reason
+is structural rather than incidental.
+
+A trunk layer derives its KV from its OWN hidden state: the paged arm computes
+`deck` and writes it with `vt::ConcatAndCacheMla` before attending, and does so
+unconditionally. A DSpark block does not work that way. Its KV rows come from the
+TARGET's tap state through `update_kv_from_target`, written at the target's own
+positions, and its query comes from the block's hidden state. Query and KV have
+different sources, which is exactly what `AttentionBlock` has no way to express.
+
+So the remaining brick is not "call `AttentionBlock`". It is either an
+externally-supplied-KV mode on that function -- a seam extension, since the write
+is the only part that must be skipped and everything else is shared -- or the
+drafter's own composition of the q path, `PagedCausalMlaAttention` over the
+drafter's cache, and the o path. The first is preferable under
+`AGENTS.md` §"Shared seams" and is the smaller change; it is what the next wave
+should attempt first, and it must be gated by proving the trunk's own paths are
+byte-unchanged when the new mode is off.
+
+W-4b LANDED. `ConfidenceDraftLength` is the draft-length cap:
+`sigmoid(proj(cat(pre_norm_hidden, markov_emb))) >= threshold`, and the length is
+`cumprod(keep).sum()` -- the longest CONTIGUOUS prefix of confident positions, not
+the count of confident ones. `[yes, no, yes]` is 1 and never 2. Counting instead
+would let the drafter propose past a position the model flagged, and since
+verification is lossless the only symptom is a worse acceptance rate. The
+projection reads the PRE-norm hidden state concatenated with that step's bigram
+embedding, which is why the artifact's `confidence_head.proj` is
+`[1, 4352] = [1, 4096 + 256]`.
+
 W-4 LANDED. `MarkovDraftLoop` is the sequential chain: per step one embedding
 gather, one rank-256 GEMV and an argmax, with the bias conditioned on the
 PREVIOUSLY SAMPLED id. Ties go to the lowest id, matching `torch.argmax`, because

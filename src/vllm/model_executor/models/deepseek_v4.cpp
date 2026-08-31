@@ -2792,6 +2792,87 @@ std::vector<float> BlockKvRows(const std::vector<float>& main_x,
 
 }  // namespace dspark
 
+namespace {
+
+// Dequantize one named tensor of a head, or report the name that is missing.
+bool TakeTensor(const DeepseekV4MtpHead& h, const std::string& key,
+                std::vector<float>* out, std::string* refusal) {
+  const auto it = h.tensors.find(key);
+  if (it == h.tensors.end()) {
+    if (refusal->empty())
+      *refusal = "dspark block: the head carries no '" + key + "'";
+    return false;
+  }
+  *out = DequantizeDeepseekV4MtpTensor(it->second);
+  return true;
+}
+
+bool TakeBf16(const DeepseekV4MtpHead& h, const std::string& key, HostBf16* out,
+              std::string* refusal) {
+  std::vector<float> f;
+  if (!TakeTensor(h, key, &f, refusal)) return false;
+  out->resize(f.size());
+  for (size_t i = 0; i < f.size(); ++i) (*out)[i] = vt::F32ToBF16(f[i]);
+  return true;
+}
+
+}  // namespace
+
+namespace dspark {
+
+std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
+                                 const DeepseekV4Params& p,
+                                 DeepseekV4LayerHostWeights* out,
+                                 bool* out_missing_experts) {
+  VT_CHECK(out != nullptr, "dspark block: null out");
+  std::string refusal;
+  *out = DeepseekV4LayerHostWeights{};
+
+  TakeTensor(head, "attn_norm.weight", &out->attn_norm_weight, &refusal);
+  TakeTensor(head, "ffn_norm.weight", &out->ffn_norm_weight, &refusal);
+  TakeTensor(head, "attn.q_norm.weight", &out->q_norm_weight, &refusal);
+  TakeTensor(head, "attn.kv_norm.weight", &out->kv_norm_weight, &refusal);
+  TakeTensor(head, "attn.attn_sink", &out->attn_sink, &refusal);
+  TakeBf16(head, "attn.wq_a.weight", &out->wq_a, &refusal);
+  TakeBf16(head, "attn.wq_b.weight", &out->wq_b, &refusal);
+  TakeBf16(head, "attn.wkv.weight", &out->wkv, &refusal);
+  TakeBf16(head, "attn.wo_a.weight", &out->wo_a, &refusal);
+  TakeBf16(head, "attn.wo_b.weight", &out->wo_b, &refusal);
+  TakeTensor(head, "ffn.gate.weight", &out->gate_weight, &refusal);
+  TakeTensor(head, "ffn.gate.bias", &out->gate_bias, &refusal);
+  TakeBf16(head, "ffn.shared_experts.w1.weight", &out->shared_w1, &refusal);
+  TakeBf16(head, "ffn.shared_experts.w2.weight", &out->shared_w2, &refusal);
+  TakeBf16(head, "ffn.shared_experts.w3.weight", &out->shared_w3, &refusal);
+  // The two hyperconnections. `(2 + hc) * hc` is the `fn` width the trunk uses.
+  TakeTensor(head, "hc_attn_fn", &out->hc_attn_fn, &refusal);
+  TakeTensor(head, "hc_attn_base", &out->hc_attn_base, &refusal);
+  TakeTensor(head, "hc_attn_scale", &out->hc_attn_scale, &refusal);
+  TakeTensor(head, "hc_ffn_fn", &out->hc_ffn_fn, &refusal);
+  TakeTensor(head, "hc_ffn_base", &out->hc_ffn_base, &refusal);
+  TakeTensor(head, "hc_ffn_scale", &out->hc_ffn_scale, &refusal);
+
+  if (!refusal.empty()) return refusal;
+
+  // Shape agreement, checked HERE rather than deep inside a block forward, where
+  // a mismatch surfaces as an anonymous MatVec size error naming no tensor.
+  const int64_t H = p.hidden_size, hc = p.hc_mult;
+  if (static_cast<int64_t>(out->attn_norm_weight.size()) != H)
+    return "dspark block: attn_norm is not [hidden_size]";
+  if (static_cast<int64_t>(out->kv_norm_weight.size()) != p.head_dim)
+    return "dspark block: kv_norm is not [head_dim]";
+  if (static_cast<int64_t>(out->gate_weight.size()) != p.n_routed_experts * H)
+    return "dspark block: ffn.gate is not [n_routed_experts, hidden_size]";
+  if (static_cast<int64_t>(out->hc_attn_fn.size()) != (2 + hc) * hc * hc * H)
+    return "dspark block: hc_attn_fn is not [(2+hc)*hc, hc*hidden_size]";
+
+  // NOT filled: 20.2 GiB of routed experts per block as host f32. Reported so the
+  // caller learns it here rather than from an empty vector later.
+  if (out_missing_experts != nullptr) *out_missing_experts = true;
+  return {};
+}
+
+}  // namespace dspark
+
 // DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
 // Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream
 // mean per requested layer, IN REQUEST ORDER -- which is the order `main_proj`

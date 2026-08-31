@@ -211,41 +211,18 @@ size_t RowSizeBytes(DType dtype, int64_t k) {
          static_cast<size_t>(g->block_bytes);
 }
 
-size_t SizeOf(DType dtype) {
-  switch (dtype) {
-    case DType::kF32: return 4;
-    case DType::kF16: return 2;
-    case DType::kBF16: return 2;
-    case DType::kI8: return 1;
-    case DType::kI32: return 4;
-    case DType::kI64: return 8;
-    // Block-quantized dtypes are storage-only: there is no per-element size,
-    // so every elementwise path that reaches one fails loudly here rather than
-    // silently mis-striding a packed block buffer.
-    case DType::kQ4_0:
-    case DType::kQ5_0:
-    case DType::kQ8_0:
-    case DType::kQ2_K:
-    case DType::kQ3_K:
-    case DType::kQ4_K:
-    case DType::kQ5_K:
-    case DType::kQ6_K:
-    case DType::kQ8_K:
-    case DType::kIQ2_XXS:
-    case DType::kIQ3_XXS:
-    case DType::kIQ2_S:
-    case DType::kIQ1_S:
-    case DType::kIQ1_XXXS:
-    case DType::kIQ4_NL:
-    case DType::kMXFP4:
-    case DType::kIQ2_XS:
-    case DType::kIQ4_XS:
-      VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
-                          Name(dtype) + " has no per-element size");
-      return 0;
-  }
+// The cold half of the now-inline `SizeOf` (include/vt/dtype.h). Both are
+// [[noreturn]] and both keep the exact message the out-of-line SizeOf threw, so
+// nothing that catches or matches on that text changes.
+void ThrowBlockQuantHasNoElementSize(DType dtype) {
+  VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") + Name(dtype) +
+                      " has no per-element size");
+  throw std::runtime_error("unreachable");
+}
+
+void ThrowUnknownDType() {
   VT_CHECK(false, "unknown dtype");
-  return 0;
+  throw std::runtime_error("unreachable");
 }
 
 const char* Name(DType dtype) {
@@ -284,33 +261,7 @@ uint32_t AsU32(float f) {
   std::memcpy(&u, &f, 4);
   return u;
 }
-float AsF32(uint32_t u) {
-  float f;
-  std::memcpy(&f, &u, 4);
-  return f;
-}
 }  // namespace
-
-float F16ToF32(uint16_t h) {
-  uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
-  uint32_t exp = (h >> 10) & 0x1F;
-  uint32_t mant = h & 0x3FF;
-  if (exp == 0x1F) {  // inf/nan
-    return AsF32(sign | 0x7F800000 | (mant << 13));
-  }
-  if (exp == 0) {
-    if (mant == 0) return AsF32(sign);  // signed zero
-    // subnormal: normalize
-    int shift = 0;
-    while ((mant & 0x400) == 0) {
-      mant <<= 1;
-      ++shift;
-    }
-    mant &= 0x3FF;
-    return AsF32(sign | ((113 - shift) << 23) | (mant << 13));
-  }
-  return AsF32(sign | ((exp + 112) << 23) | (mant << 13));
-}
 
 uint16_t F32ToF16(float f) {
   uint32_t u = AsU32(f);
@@ -337,8 +288,6 @@ uint16_t F32ToF16(float f) {
   if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;  // may carry into exp: correct
   return static_cast<uint16_t>(sign | half);
 }
-
-float BF16ToF32(uint16_t b) { return AsF32(static_cast<uint32_t>(b) << 16); }
 
 uint16_t F32ToBF16(float f) {
   uint32_t u = AsU32(f);

@@ -50,6 +50,90 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
   }
 }
 
+// --- The attention kernels' per-element dtype dispatch, hoisted --------------
+// Row VT-CPU-ELEM-DISPATCH, .agents/specs/vt-cpu-elem-dispatch.md.
+//
+// `AttentionKernel` and `AttentionCrossKernel` read every operand element
+// through `LoadF32` above, which switches on `t.dtype` and multiplies by
+// `SizeOf(t.dtype)` once PER ELEMENT, inside loops whose body is one multiply
+// and one add. Both are loop-invariant; neither could be hoisted by the
+// compiler, because `LoadF32` has 231 call sites in this translation unit and
+// GCC keeps it out of line, so the switch executes per element even after
+// `vt::SizeOf` became inline. A `perf` profile of `vt::AttentionCross` measured
+// the consequence: `LoadF32` 62.68% of the kernel's own CPU time against 17.79%
+// for the arithmetic and the softmax.
+//
+// This is the SAME transformation `MatmulOneChunk` above already applies against
+// `MatmulOneChunkRef`: widen the row that is REUSED to f32 once, and resolve the
+// STREAMED operand's dtype once into a typed micro-kernel. It is not a new
+// shape.
+//
+// BIT-EXACT BY CONSTRUCTION, and this is the whole argument:
+//   * `WidenRowToF32` writes exactly the f32 values `LoadF32` returned for the
+//     query row, so the multiplicands are the same bits;
+//   * `AttnDotT` accumulates over `e` in the same increasing order into one f32
+//     accumulator, exactly as the scalar loop did -- it is a serial float
+//     reduction, so the vectorizer may not reassociate it and does not;
+//   * `AttnAccumT` walks the same `(j, e)` order into the same f32 `acc[]`, and
+//     each `acc[e]` remains its own independent chain over `j`, which is what
+//     lets it vectorize ACROSS `e` without reassociating anything;
+//   * `-ffp-contract=off` (CMakeLists.txt:55) forbids fusing the multiply-add on
+//     either side.
+// No accumulator is split and no sum is reordered, so the outputs are
+// memcmp-identical to the previous kernels rather than merely close.
+struct AttnElemF32 {
+  static float Get(const void* p, int64_t i) {
+    return LoadUnaligned<float>(static_cast<const uint8_t*>(p) + i * 4);
+  }
+};
+struct AttnElemF16 {
+  static float Get(const void* p, int64_t i) {
+    return F16ToF32(LoadUnaligned<uint16_t>(static_cast<const uint8_t*>(p) + i * 2));
+  }
+};
+struct AttnElemBF16 {
+  static float Get(const void* p, int64_t i) {
+    return BF16ToF32(LoadUnaligned<uint16_t>(static_cast<const uint8_t*>(p) + i * 2));
+  }
+};
+
+// dot(qrow, key_row): the pass-1 score, `d` elements, sequential over e.
+using AttnDotFn = float (*)(const float*, const void*, int64_t);
+// acc += p * value_row: the pass-3 weighted sum, `d` independent chains.
+using AttnAccumFn = void (*)(float*, float, const void*, int64_t);
+
+template <class E>
+float AttnDotT(const float* qrow, const void* krow, int64_t d) {
+  float s = 0.0f;
+  for (int64_t e = 0; e < d; ++e) s += qrow[e] * E::Get(krow, e);
+  return s;
+}
+
+template <class E>
+void AttnAccumT(float* acc, float p, const void* vrow, int64_t d) {
+  for (int64_t e = 0; e < d; ++e) acc[e] += p * E::Get(vrow, e);
+}
+
+bool AttnElemFns(DType dt, AttnDotFn* dot, AttnAccumFn* accum) {
+  switch (dt) {
+    case DType::kF32: *dot = &AttnDotT<AttnElemF32>; *accum = &AttnAccumT<AttnElemF32>; return true;
+    case DType::kF16: *dot = &AttnDotT<AttnElemF16>; *accum = &AttnAccumT<AttnElemF16>; return true;
+    case DType::kBF16: *dot = &AttnDotT<AttnElemBF16>; *accum = &AttnAccumT<AttnElemBF16>;
+      return true;
+    default: return false;
+  }
+}
+
+// Resolve, or refuse EXACTLY as the per-element path did. The refusal is
+// produced by `LoadF32`/`SizeOf` themselves rather than by a second message
+// that could drift from theirs: a block-quantized tensor still throws
+// "SizeOf: block-quantized dtype ... has no per-element size" and an i8/i32/i64
+// one still throws "LoadF32: unsupported dtype", on the same input, before any
+// element is read. Neither path dereferences `t.data`.
+void AttnResolveOrRefuse(const Tensor& t, AttnDotFn* dot, AttnAccumFn* accum) {
+  if (!AttnElemFns(t.dtype, dot, accum)) (void)LoadF32(t, 0);
+}
+
 // Defined below with the Mamba2 host references. Declared here because the
 // gated activations need it too: it is the general "what this value reads back
 // as at width `dt`" helper, not a Mamba2-private one.
@@ -2859,11 +2943,23 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
   const int64_t hk = key.shape[1];
   const int64_t qpk = hq / hk;  // q-heads per kv-head (GQA ratio)
   const float scale = args.scale;
+  // The operand dtypes, resolved ONCE (see AttnElemFns above). The refusal for
+  // an unsupported dtype is unchanged, and still happens before any element is
+  // read.
+  AttnDotFn kdot = nullptr;
+  AttnAccumFn kdummy = nullptr;
+  AttnDotFn vdummy = nullptr;
+  AttnAccumFn vaccum = nullptr;
+  AttnResolveOrRefuse(key, &kdot, &kdummy);
+  AttnResolveOrRefuse(value, &vdummy, &vaccum);
   // Row-chunked over (head, query) pairs (spec W3) — the flash-attn q-row
   // split (ops.cpp:9072-9073 nr = neq1*neq2*neq3). Same h-outer/i-inner walk.
   ForRows(hq * t, [&](int64_t r0, int64_t r1) {
   std::vector<float> probs(static_cast<size_t>(t));
   std::vector<float> acc(static_cast<size_t>(d));
+  // The query row, widened once per (head, query) pair instead of once per
+  // (key, element). It is read `t` times by pass 1 and the values are identical.
+  std::vector<float> qrow(static_cast<size_t>(d));
   for (int64_t r = r0; r < r1; ++r) {
     const int64_t h = r / t;
     const int64_t g = h / qpk;
@@ -2871,12 +2967,12 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
       const int64_t i = r % t;
       const int64_t jmax = args.causal ? i : t - 1;  // causal: keys 0..i
       const int64_t qoff = (i * hq + h) * d;
+      WidenRowToF32(query.dtype, ElemPtr(query, qoff), d, qrow.data());
       // Pass 1: scores + running max.
       float m = -std::numeric_limits<float>::infinity();
       for (int64_t j = 0; j <= jmax; ++j) {
         const int64_t koff = (j * hk + g) * d;
-        float dot = 0.0f;
-        for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(key, koff + e);
+        float dot = kdot(qrow.data(), ElemPtr(key, koff), d);
         dot *= scale;
         probs[static_cast<size_t>(j)] = dot;
         if (dot > m) m = dot;
@@ -2894,7 +2990,7 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
       for (int64_t j = 0; j <= jmax; ++j) {
         const float p = probs[static_cast<size_t>(j)] * inv;
         const int64_t voff = (j * hk + g) * d;
-        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += p * LoadF32(value, voff + e);
+        vaccum(acc.data(), p, ElemPtr(value, voff), d);
       }
       for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
     }
@@ -2917,14 +3013,27 @@ void AttentionCrossKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const float scale = args.scale;
   const float* bias_data = bias != nullptr ? bias->Ptr<float>() : nullptr;
   const int64_t bias_rows = bias != nullptr ? bias->shape[0] : 0;
+  // The operand dtypes, resolved ONCE (see AttnElemFns above). The refusal for
+  // an unsupported dtype is unchanged, and still happens before any element is
+  // read.
+  AttnDotFn kdot = nullptr;
+  AttnAccumFn kdummy = nullptr;
+  AttnDotFn vdummy = nullptr;
+  AttnAccumFn vaccum = nullptr;
+  AttnResolveOrRefuse(key, &kdot, &kdummy);
+  AttnResolveOrRefuse(value, &vdummy, &vaccum);
   ForRows(hq * tq, [&](int64_t r0, int64_t r1) {
   std::vector<float> probs(static_cast<size_t>(s));
   std::vector<float> acc(static_cast<size_t>(d));
+  // The query row, widened once per (head, query) pair instead of once per
+  // (key, element). It is read `s` times by pass 1 and the values are identical.
+  std::vector<float> qrow(static_cast<size_t>(d));
   for (int64_t r = r0; r < r1; ++r) {
     const int64_t h = r / tq;
     const int64_t g = h / qpk;
     const int64_t i = r % tq;
     const int64_t qoff = (i * hq + h) * d;
+    WidenRowToF32(query.dtype, ElemPtr(query, qoff), d, qrow.data());
     // The bias row this query reads: its own, or the single broadcast row.
     const float* brow = bias_data == nullptr ? nullptr
                                              : bias_data + (bias_rows == 1 ? 0 : i) * s;
@@ -2932,8 +3041,7 @@ void AttentionCrossKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     float m = -std::numeric_limits<float>::infinity();
     for (int64_t j = 0; j < s; ++j) {
       const int64_t koff = (j * hk + g) * d;
-      float dot = 0.0f;
-      for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(key, koff + e);
+      float dot = kdot(qrow.data(), ElemPtr(key, koff), d);
       dot *= scale;
       if (brow != nullptr) dot += brow[j];
       probs[static_cast<size_t>(j)] = dot;
@@ -2952,7 +3060,7 @@ void AttentionCrossKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     for (int64_t j = 0; j < s; ++j) {
       const float p = probs[static_cast<size_t>(j)] * inv;
       const int64_t voff = (j * hk + g) * d;
-      for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += p * LoadF32(value, voff + e);
+      vaccum(acc.data(), p, ElemPtr(value, voff), d);
     }
     for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
   }

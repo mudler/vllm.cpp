@@ -136,4 +136,35 @@ std::vector<int32_t> MarkovDraftLoop(const std::vector<float>& logits, int32_t s
   return out;
 }
 
+int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
+                              const std::vector<float>& markov_emb,
+                              const std::vector<float>& proj_w, float threshold,
+                              int64_t block, int64_t hidden, int64_t rank) {
+  VT_CHECK(block >= 0 && hidden > 0 && rank > 0, "dspark confidence: degenerate shape");
+  VT_CHECK(static_cast<int64_t>(xpre.size()) == block * hidden,
+           "dspark confidence: xpre must be [block, hidden] and PRE-norm");
+  VT_CHECK(static_cast<int64_t>(markov_emb.size()) == block * rank,
+           "dspark confidence: markov_emb must be [block, rank]");
+  VT_CHECK(static_cast<int64_t>(proj_w.size()) == hidden + rank,
+           "dspark confidence: proj is [hidden + markov_rank] -- the head reads the "
+           "pre-norm state CONCATENATED with the step's bigram embedding");
+
+  int64_t len = 0;
+  for (int64_t i = 0; i < block; ++i) {
+    double acc = 0.0;
+    for (int64_t h = 0; h < hidden; ++h)
+      acc += static_cast<double>(proj_w[static_cast<size_t>(h)]) *
+             xpre[static_cast<size_t>(i * hidden + h)];
+    for (int64_t r = 0; r < rank; ++r)
+      acc += static_cast<double>(proj_w[static_cast<size_t>(hidden + r)]) *
+             markov_emb[static_cast<size_t>(i * rank + r)];
+    const double p = 1.0 / (1.0 + std::exp(-acc));
+    // THE PREFIX STOPS HERE. `cumprod` makes every later position zero regardless
+    // of its own confidence, so this is a break and not a `continue`.
+    if (p < static_cast<double>(threshold)) break;
+    ++len;
+  }
+  return len;
+}
+
 }  // namespace vllm::dspark

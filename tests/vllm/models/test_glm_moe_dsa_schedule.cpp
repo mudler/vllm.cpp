@@ -301,7 +301,8 @@ std::vector<float> RunLayer(Backend& b, Queue& q, Harness& h, const MlaBlockDims
   vllm::v1::TritonMLAImpl impl;
   Dev dev = h.dev();
   Tensor kvc = h.kv_cache();
-  ForwardMlaAttentionBlock(dev, dims, h.weights(), th, tp, kvc, ts, meta, impl, out, shared);
+  ForwardMlaAttentionBlock(dev, dims, h.weights(), th, tp, kvc, ts, meta, impl, out,
+                           /*attn_pre_o_proj=*/nullptr, shared);
   b.Synchronize(q);
   return h.DownF32(out);
 }

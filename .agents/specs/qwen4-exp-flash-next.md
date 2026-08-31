@@ -7571,6 +7571,43 @@ queue. That op is another wave's file territory and is deliberately untouched
 here. **Seven CUDA kernels are now blocked by exactly one thing where they were
 blocked by five.**
 
+##### The neighbouring suites, and the LOAD-TIME refusal that settles reachability
+
+`ctest -R 'qwen4_exp|rms_norm_group'` on the gated tree: **76% passed, 5 failed
+of 21**, and the five are `test_qwen4_exp_gguf_load_plan`, `..._gguf_weights`,
+`..._layer_loop`, `..._runner`, `..._forward` — **the IDENTICAL set W6-CUDA
+recorded as its own pre-existing baseline** on a CUDA-enabled build ("an
+IDENTICAL failing set both times"). This wave's three suites and
+`test_ops_rms_norm_group` are ABSENT from it, because they passed. **The change
+regressed nothing.**
+
+**AND THE REASON THOSE FIVE FAIL IS THIS WAVE'S OWN REACHABILITY ANSWER, in the
+tree's words rather than in mine.** `test_qwen4_exp_forward` throws out of
+`LoadThroughRegistry` — the production loader — before a single op is
+dispatched:
+
+```text
+qwen4_exp gguf: `per_layer_token_embd.weight` is the n-gram gather table and it
+must stay block-resident, but device 'cuda' has no block-decoding gather kernel,
+so the table would expand to bf16 - 95.4 GiB of host memory on the released
+checkpoint, which the on-disk device-fit guard (issue #1123) cannot see. The
+CUDA gather arm is owed. Load this model with --device cpu.
+```
+
+So on a CUDA build this architecture **does not load at all**, and the refusal is
+at LOAD time rather than at the first forward. That is a stronger statement than
+M8's, and the two agree: M8 says nothing in production reaches these kernels;
+this says nothing in production can even construct the model that would. Both are
+measured.
+
+`DeviceQuantGatherSupported` returns `dev == vt::DeviceType::kCPU` and nothing
+else (`gguf_keep_quant.cpp`), `EmbeddingKernelCuda` refuses a table that is not
+f32/bf16 by name (`cuda_ops.cu`, "cuda embedding: unsupported table dtype
+(f32/bf16 only)"), and **there is no `kEmbeddingQuant` OpId at all** — `grep -c
+kEmbeddingQuant include/vt/ops.h` is 0. Three independent readings of one gap.
+Closing it is another wave's file territory; this wave does not touch it, and
+does not work around it.
+
 ## Mutation record — W8CONFIRM (#2031, issue OWED)
 
 W5s answered "does the released artifact emit real tokens on `origin/main`" and

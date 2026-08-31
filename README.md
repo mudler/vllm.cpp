@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>Same tokens as vLLM. Same throughput. 140x less to install.</b><br>
-  <sub>Continuous batching, paged KV, 43 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
+  <sub>Continuous batching, paged KV, 44 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
 <p align="center">
@@ -40,9 +40,14 @@
 - **2026-08** **EXL3 checkpoints now generate on CPU and CUDA.** A stock
   Llama-3.2-1B-Instruct EXL3 checkpoint loads through the shared dense model path and emits text.
   The current CUDA path supports its 3-bit body and 6-bit output head. No speed claim is available.
-- **2026-08** **GGUF gains IQ2_XS and IQ4_XS.** Both formats decode and run directly on their
-  compressed blocks on CPU. This lets the 101.25 GiB GLM-5.3-Flash GGUF weight tower load without
-  expanding to 426.72 GiB. Its model forward is still incomplete.
+- **2026-08** **GLM-5.3-Flash now generates on CPU from a 101.25 GiB GGUF.** The shipped
+  `UD-Q2_K_XL` artifact emits coherent text while keeping IQ2_XS and IQ4_XS blocks compressed.
+  Both formats also have CUDA keep-quant kernels, but this model's CUDA forward and every speed
+  gate remain pending.
+- **2026-08** **GLM-5.3 joins the model registry.** Its GGUF loader and first-token forward run
+  through the shared expert-streaming path. The real 201.83 GiB artifact has not completed a load,
+  and resumed sparse decoding still needs the indexer side cache, so no real-checkpoint token or
+  speed claim is available.
 - **2026-08** **Hybrid CPU/GPU expert placement reaches five architecture families.** Qwen3-MoE,
   Qwen3.5/3.6, Nemotron-H, DeepSeek-V2, and Kimi-Linear can run routed experts on the CPU while the
   rest of the model stays on the selected accelerator. The end-to-end token and speed gates are
@@ -107,7 +112,7 @@ Where that stands today:
   ahead at all six concurrencies but only c1 outside our noise band. Also **1.18x llama.cpp's
   prefill** on the same GGUF file (denominator SUPERSEDED, see below), and **ahead of MLX-LM on
   prefill** on Apple Silicon. Most other architectures are speed-pending, and say so.
-- **Everything.** 43 registered architectures, 38 tool-parser families, structured output including
+- **Everything.** 44 registered architectures, 38 tool-parser families, structured output including
   GBNF, three speculative decoders, image, video, and audio input, music generation, external KV
   offload, Prometheus metrics, and the SGLang knobs, all in a library you can `dlopen`. Multimodal
   input runs on the single-sequence drivers. No multimodal request is served over HTTP yet
@@ -283,7 +288,7 @@ InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus Qwen3-VL and Qwen3.6-27B vision
 and Voxtral (audio).
 
 <details>
-<summary><b>The full architecture matrix</b> (43 registered architectures grouped by family)</summary>
+<summary><b>The full architecture matrix</b> (44 registered architectures grouped by family)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -297,6 +302,7 @@ and Voxtral (audio).
 | DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Decode beats ds4 1.144x by default (byte-exact) |
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
 | GLM-4.7-Flash (MLA MoE) | zai-org/GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
+| GLM-5.3 / GLM-5.3-Flash | unsloth GLM-5.3 GGUFs | keep-quant | Flash emits coherent text; GLM-5.3 synthetic first token only | Speed-pending |
 | Laguna-S / Laguna-XS 2.1 (MoE) | poolside/Laguna-S-2.1-NVFP4 | NVFP4 + Q4_K | Near-tie (byte-exact) | vLLM parity+ 1.03x by default |
 | Kimi-Linear-48B-A3B (KDA + MLA + MoE) | Kimi-Linear-48B-A3B | - | Near-tie (106/128) | 1.59 tok/s, default off |
 | Nemotron-H hybrid (Mamba2 + GQA + MoE) | Nemotron-3.5-Lightning-30B-A3B-NVFP4 | NVFP4 | Host gate strict 96/96; GB10 rerun pending | Speed-pending |
@@ -330,7 +336,7 @@ sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning mod
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
 sliding-window attention are gated feature-positive. The authoritative per-architecture list, bound
-to the C++ registry (all 43 registered architectures with their tested checkpoint and gate, plus the
+to the C++ registry (all 44 registered architectures with their tested checkpoint and gate, plus the
 standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
 [docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
 hardware-blocked and why, is linked from [Project status](#project-status).

@@ -315,6 +315,54 @@ identically. `DqMulSub` is defensive, not load-bearing, on two toolchains.
 (GB10, sm_121a) is queued as job `38a9b799` and will confirm the target
 architecture and close M2 ([#2393](https://github.com/mudler/vllm.cpp/issues/2393)).
 
+## sm_121a confirms it, and M2 is now measured on a device
+
+`dgx:gpu0` (**NVIDIA GB10**, sm_121a, driver 580.173.02, nvcc 13.0.88), `rc` job
+`38a9b799-7caa-4703-bfe2-4f393f6ac06c`, 2026-08-31, same script and same staged
+bundle as the thor run. This closes the sm_121a half of
+[#2393](https://github.com/mudler/vllm.cpp/issues/2393) and M2's device
+measurement.
+
+| leg | build rc | test rc | result |
+|---|---|---|---|
+| RED `e0188c50b` | 0 | 1 | RED by name |
+| GREEN | 0 | 0 | **6 of 6 cases, 231 of 231 assertions** |
+| M1 restore the refusal | 0 | 1 | **RED** |
+| M2 drop the Q4_K minimum | 0 | 1 | **RED — 6863 and 1856 mismatches**, the measurement thor could not make |
+| M3 allow FMA contraction | 0 | 0 | **SURVIVED**, predicted, on a second architecture |
+| M4 element stride | 0 | 1 | **RED** |
+| RESTORED | 0 | 0 | 6 of 6 |
+
+M2's fix worked: `m1 * 0.0f` keeps the local referenced under
+`-Werror=all-warnings` and still drops the minimum. So the two architectures now
+agree on every mutation verdict.
+
+**M5 correctly REFUSED to apply at that SHA**, and the refusal is the guard
+working rather than a gap. M5 deletes the production registration call site,
+which at `e08bc069d` was still commented out — zero occurrences — so the script
+reported `MUT_APPLY(m5_delete_callsite)=FAILED` and ran nothing. A mutation that
+cannot find its target must not report a verdict; M5's real run is on the head,
+where the call site exists.
+
+## Two suites were red on CUDA builds, and this row's first evidence could not see it
+
+Both legs of the runs above executed at `e08bc069d`, one commit BEFORE the flip.
+That is a real limitation of that evidence and the reviewer of #2396 found it:
+the 231 assertions were produced through a test-scope registration the flip later
+deleted, so they prove the DECODERS on both architectures and not the WIRING.
+The head rerun (`61a5c4fb`, dgx) closes that, and it carries a fifth mutation
+(M5) so the reachability claim in `cuda_ops.cu`'s comment is measured rather than
+asserted.
+
+Adding `test_qwen4_exp_gguf_weights` to the sibling list — which the same review
+asked for — immediately found **three more cases red on a CUDA build**, 7
+assertions: the production `load_weights` hook refused the file, the n-gram table
+read `bf16` where the case expects `Q8_0`, and two malformed-file cases never
+reached their own assertions because the device guard threw first. All three have
+the same cause as the `test_gguf_keep_quant` case below — the residency gate
+answering false on CUDA — and all three are expected to pass at the head. That
+expectation is written here BEFORE the run.
+
 ## The flip repaired a red the CUDA builds were already carrying
 
 `test_gguf_keep_quant`'s case "a quantized GATHER TABLE keeps its blocks, per
@@ -338,10 +386,11 @@ from this host (`gh api user` authenticates as `localai-org-maint-bot`). An
 earlier reading of this row's history said writes were `403`; that was a
 generalisation from ONE hidden issue and it is wrong.
 
-- **sm_121a, and mutation M2 on a device** —
-  [#2393](https://github.com/mudler/vllm.cpp/issues/2393). The gate ran on
-  sm_110; the target architecture is GB10 and `dgx:gpu0` job `38a9b799` is queued
-  against it. M2's device measurement is owed for the `-Werror` reason above.
+- **The HEAD compiled by nvcc** — the one gap the review left open. Every leg of
+  both runs above executed at `e08bc069d`, one commit before the flip, so the
+  wiring and the post-flip suite behaviour are unproven. `dgx:gpu0` job
+  `61a5c4fb` runs the head with M5 added. **#2393 is otherwise discharged**:
+  sm_121a is confirmed and M2 is measured on both architectures.
 - **METAL, VULKAN, ROCM and TENSTORRENT gather arms** —
   [#2394](https://github.com/mudler/vllm.cpp/issues/2394). Each gather kernel
   asserts a float table by name and none registers `kEmbeddingQuant`, so each

@@ -776,24 +776,60 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GATHER reads only the select
   // crossed it would leave the assertion above trivially true.
   CHECK(strictly_sparse > 0);
 
-  // MEMBERSHIP. Poison every row NO query ever selects, then require the answer
-  // to stay finite and BITWISE equal to the clean run.
+  // MEMBERSHIP, AND IT IS PER-QUERY RATHER THAN PER-SEQUENCE. The first draft of
+  // this case poisoned the rows NO query anywhere in the batch selects, ran, and
+  // asserted the answer was unchanged. On this fixture that set is EMPTY — every
+  // cache row is selected by SOME query — so the probe measured nothing while
+  // reporting `0/2944 differ`, which is a byte gate over a cache it never
+  // poisoned. **THE GUARD IS WHAT CAUGHT IT** (`CHECK(poisoned > 0)` reddened on
+  // the device), and the repair is to ask the question the op actually answers:
+  // for ONE query token, does the kernel read outside THAT token's selection?
+  //
+  // So the probe runs a single-token call and poisons every row below that
+  // token's `kv_len` that its own selection does not name. A gather never
+  // addresses them; a mask multiplies them by a zero weight into `0.0f * NaN`,
+  // which is NaN. `MaxAbsDiff` returns +infinity on any non-finite operand
+  // (#449), so a mask cannot pass this.
+  const int64_t probe_t = c.seq - 1;  // the largest kv_len, so the most to skip
+  const int64_t probe_kv = probe_t + 1;
+  const std::vector<int64_t> probe_sel = ExpandHost(sel, probe_t, probe_kv);
+  std::vector<char> in_sel(static_cast<size_t>(c.seq), 0);
+  for (int64_t p : probe_sel) in_sel[static_cast<size_t>(p)] = 1;
+
+  Selection one;
+  one.block_ids.assign(sel.block_ids.begin() + probe_t * kTopk,
+                       sel.block_ids.begin() + (probe_t + 1) * kTopk);
+  one.kv_lens.assign(1, static_cast<int32_t>(probe_kv));
+  const std::vector<float> q_one(qa.begin() + probe_t * HQ * DH,
+                                 qa.begin() + (probe_t + 1) * HQ * DH);
+  const GatherResult one_clean =
+      RunGather(DeviceType::kCUDA, q_one, ka, va, one, 1, HQ, HKV, DH, c.seq, false);
+
   int64_t poisoned = 0;
-  for (int64_t p = 0; p < c.seq; ++p) {
-    if (ever_selected[static_cast<size_t>(p)] != 0) continue;
+  for (int64_t p = 0; p < probe_kv; ++p) {
+    if (in_sel[static_cast<size_t>(p)] != 0) continue;
     ++poisoned;
-    for (int64_t h = 0; h < HKV * DH; ++h) {
-      ka[static_cast<size_t>(p * HKV * DH + h)] = std::nanf("");
-      va[static_cast<size_t>(p * HKV * DH + h)] = std::nanf("");
+    for (int64_t e = 0; e < HKV * DH; ++e) {
+      ka[static_cast<size_t>(p * HKV * DH + e)] = std::nanf("");
+      va[static_cast<size_t>(p * HKV * DH + e)] = std::nanf("");
     }
   }
-  std::printf("[MEASURED] qsa_gather CUDA poisoned %lld of %lld cache rows\n",
-              static_cast<long long>(poisoned), static_cast<long long>(c.seq));
-  // A fixture with nothing to poison proves nothing.
+  std::printf("[MEASURED] qsa_gather CUDA query %lld: %lld of its %lld visible rows "
+              "poisoned (%lld selected)\n",
+              static_cast<long long>(probe_t), static_cast<long long>(poisoned),
+              static_cast<long long>(probe_kv),
+              static_cast<long long>(probe_sel.size()));
+  // A fixture with nothing to poison proves nothing. This is the assertion that
+  // caught the per-sequence draft.
   CHECK(poisoned > 0);
-  const GatherResult probed =
-      RunGather(DeviceType::kCUDA, qa, ka, va, sel, c.seq, HQ, HKV, DH, c.seq, false);
-  CheckBitwise(probed.out, clean.out, "qsa_gather CUDA NaN-unselected walk");
+  const GatherResult one_probed =
+      RunGather(DeviceType::kCUDA, q_one, ka, va, one, 1, HQ, HKV, DH, c.seq, false);
+  CheckBitwise(one_probed.out, one_clean.out, "qsa_gather CUDA NaN-unselected walk");
+  // And the clean single-token answer must agree with the batched one, so the
+  // probe is measuring the same computation the case above measured.
+  const std::vector<float> batched_row(clean.out.begin() + probe_t * HQ * DH,
+                                       clean.out.begin() + (probe_t + 1) * HQ * DH);
+  CheckBitwise(one_clean.out, batched_row, "qsa_gather CUDA single-token == batched row");
 }
 
 TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the PAGED address mode agrees with contiguous") {

@@ -3898,6 +3898,34 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **W6-CUDA-B LANDS FOUR CUDA ARMS THAT NOTHING REACHES, AND ONE BLOCKER
+  REMAINS. ISSUE OWED.** `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup`,
+  `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention` now have CUDA
+  arms, so ALL SIX `qwen4_exp` ops plus `vt::RmsNormGroup` do. **They land
+  UNREACHED** under AGENTS.md "Nothing lands dead": `ModelRegistry::Forward` is
+  all-or-nothing and `EmbeddingKernelCuda` refuses a block-quantized table by
+  name, so the block-decoding n-gram gather has no CUDA arm and no `qwen4_exp`
+  step can reach a CUDA queue. The wiring is owned by row `MODEL-MM-QWEN4-EXP`
+  under campaign [#1978](https://github.com/mudler/vllm.cpp/issues/1978),
+  tracked by [#2031](https://github.com/mudler/vllm.cpp/issues/2031); this
+  wave's own issue is unfilable because the `gh` token is invalid on this host
+  (`gh api user` is 403) while `git push` over SSH works. Separately,
+  `IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1711-1739`) returns
+  false for IQ4_NL, Q4_0, Q5_0 and Q8_0, so the mixer's quantized projection
+  route through `vt::MatmulBT` refuses or drains to the host on a CUDA queue —
+  also another wave's, also owed. See `### W6-CUDA-B` below.
+
+- **TWO SPEED ITEMS THIS WAVE DECLINED, EACH WITH ITS CONDITION.** (1) The
+  gather's pass-2 dot is SEQUENTIAL on one lane, `|sel| * head_dim` dependent f32
+  operations, ~525k per (token, head) at the released config. A deterministic
+  tree reduction over `d` would preserve the gather-vs-dense bit-identity — the
+  order would depend on `head_dim` alone — while breaking the CPU-vs-CUDA
+  relation the sequential dot keeps. Take it after a red-first measurement that
+  shows this is the bottleneck, not before. (2) The mixer takes ONE `cudaMalloc`
+  per call for its four intermediates. A static cache would not be re-entrant;
+  the fix is a caller-supplied workspace, which changes the op signature and owes
+  its own spec.
+
 - **W8CONFIRM ISOLATED THE CAUSE TO W5r's TWO LINES, WHICH W5s ASSERTED BUT ITS
   EVIDENCE COULD NOT SEPARATE FROM W5p. ISSUE OWED.** W5s compares W7DIAG on
   `701606e51` against itself on `52f7ccbfc`; that span contains W5p **and** W5r,
@@ -7191,6 +7219,207 @@ W5r's two lines: with them deleted the SAME tree returns
 defective binary restores coherent output. See the W5s and W8CONFIRM entries
 under `## Owed`.
 
+### W6-CUDA-B — the four reduction arms W6-CUDA left owed
+
+**WHAT THIS WAVE LANDS.** CUDA arms for the FOUR `qwen4_exp`-path ops that had
+none: `vt::Qwen4ExpGatedResidual` (the mixer), `vt::RmsNormGroup`,
+`vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`. The mixer joins
+its write-back sibling in `src/vt/cuda/cuda_qwen4_exp.cu`; the two QSA arms land
+in a new `src/vt/cuda/cuda_qwen4_exp_qsa.cu` mirroring
+`src/vt/cpu/cpu_qwen4_exp_qsa.cpp` one for one; the norm lands in a new
+`src/vt/cuda/cuda_rms_norm_group.cu` rather than joining `cuda_layernorm.cu`,
+which is a surface several rows write and which AGENTS.md "Records" therefore
+calls a lock. Gates: `tests/vllm/models/test_qwen4_exp_cuda_reductions.cpp` and
+`tests/vt/test_ops_rms_norm_group_cuda.cpp`.
+
+This is the direct continuation of W6-CUDA, whose split table above names each of
+these four under "the decision a device arm must make". This wave MAKES those
+decisions and records them below rather than inheriting them.
+
+**IT WAS DISPATCHED AS THREE OPS, AND THE COUNT WAS WRONG IN A WAY WORTH
+RECORDING.** The dispatch brief said four of the six `qwen4_exp` ops already had
+CUDA arms and three did not. The audit that produced it counted SUBSTRING matches
+over the registration sites, and `kQwen4ExpGatedResidualWriteBack` CONTAINS
+`kQwen4ExpGatedResidual` — so the write-back's registration made the mixer read
+as covered. It was not. `grep -rn 'RegisterOp(OpId::kQwen4Exp' src/vt/cuda/` at
+`9fb40279d` returns exactly three lines, and
+`src/vllm/model_executor/models/qwen4_exp_forward.cpp:418`, `:476` and `:535`
+call the mixer on the production path. Two independent audits reached the same
+conclusion before any code was written. **The general shape is the one this file
+keeps meeting: a check whose predicate is weaker than the property it is asked
+about returns a confident wrong answer.** An op-name audit must anchor the match,
+because op ids in this tree are deliberately built as extensions of one another.
+
+**AND IT STILL DOES NOT UNBLOCK `--device cuda`, WHICH IS THE SECOND THING TO
+SAY.** `ModelRegistry::Forward` is all-or-nothing and `EmbeddingKernelCuda` still
+refuses a block-quantized table by name, so the block-decoding n-gram gather has
+no CUDA arm and no `qwen4_exp` step can reach a CUDA queue. That gather is a
+separate wave's file territory and is deliberately untouched here. Separately,
+`IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1711-1739`) returns
+false for IQ4_NL, Q4_0, Q5_0 and Q8_0, so the MoE seam and this wave's own
+quantized projection route either drain to the host or refuse — also another
+wave's. The reachability of these four arms from a production entry point is
+therefore **VACUOUS, not proven**, and `## Owed` carries the entry. Nothing here
+claims a token, a decode or a speed number.
+
+**WHAT DOES CHANGE IS THE SIZE OF THE REMAINING GAP, and it is the reachability
+story worth telling.** Three CUDA arms already existed and were unreachable
+BEHIND these four — `vt::Qwen4ExpPleConv` and `vt::Qwen4ExpPleGate`
+(`cuda_qwen4_exp_ple.cu:371,374`) and `vt::Qwen4ExpGatedResidualWriteBack`
+(`cuda_qwen4_exp.cu:194`). Each sits IMMEDIATELY AFTER a CPU-only op in the same
+function: `qwen4_exp_ple_block.cpp:489` and `:499` are `vt::RmsNormGroup` calls
+that precede the gate at `:531` and the conv at `:580`; `qwen4_exp_forward.cpp:418`
+and `:476` are mixer calls that precede the write-back at `:457` and `:506`. So
+this wave converts seven kernels from "cannot run" to "blocked by exactly one
+remaining op", where before it was four separate blockers.
+
+**`vt::RmsNormGroup` UNBLOCKS NO OTHER MODEL, and the dispatch brief's claim that
+it did is corrected here.** It is a shared `vt::` seam and any model may call it,
+but the tree has exactly three non-test call sites and all three are `qwen4_exp`:
+`src/vllm/model_executor/models/qwen4_exp_ple_block.cpp:489, :499, :538`
+(`grep -rn 'RmsNormGroup(' src/ --include='*.cpp' --include='*.h' --include='*.cu'`,
+excluding the declaration, the CPU kernel, the fn typedef and the args struct),
+and `qwen4_exp_ple_block.h:11` says so in its own words: "Callers outside its own
+translation unit: zero." It was done first because it is the smallest of the
+four, not because it carries leverage.
+
+#### The four decisions, made
+
+| op | the decision W6-CUDA recorded | this wave's answer | gate |
+|---|---|---|---|
+| `vt::RmsNormGroup` | the reduction WIDTH, and whether it unifies with the mixer's | **f32, ascending, sequential, ONE THREAD PER GROUP.** It does NOT unify: the mixer's `double` is that op's contract and this op's f32 is the width its goldens were dumped in | **byte-identical**, a byte comparison |
+| `vt::Qwen4ExpQsaCompress` | the width, plus the `round_intermediates_to_bf16` arm | **f32 ascending for the pool (per `d`, in parallel) and for the sum of squares (on thread 0, sequential).** The bf16 round trip is implemented op for op with `__float2bfloat16`, which is round-to-nearest-even exactly as the host `F32ToBF16` is | **byte-identical in BOTH flag arms**, a byte comparison |
+| `vt::Qwen4ExpQsaGatherAttention` | the VISIT ORDER, a DEVICE-side `keys_visited`, and gather-vs-mask | **all four of the CPU arm's orders preserved** (below). `keys_visited` is counted AT THE READ in a per-thread counter, warp-reduced and `atomicAdd`ed to a device slot copied back only when the caller passed the instrument. The expansion stays an ADDRESS walk | one f32 ulp; the only divergence source is `expf` |
+| `vt::Qwen4ExpGatedResidual` | the reduction WIDTH: a 571x separation from f32 at group size 2560 | **`double`, inherited from the CPU arm rather than chosen**, narrowing exactly where the host narrows. The three PROJECTIONS go through the shared `vt::MatmulBT` seam | the ORACLE's own 1e-5 band — see below |
+
+#### Why three of the four are byte-identical and the mixer is not
+
+`-ffp-contract=off` is pinned for the host provider (CMakeLists.txt:41-56) and
+nvcc's `-fmad` is ON and unpinned, so every multiply-add that must match the host
+is spelled `__fmul_rn` / `__fadd_rn` — the measure `cuda_conv1d_general.cu:138-141`
+and `cuda_qwen4_exp.cu` already take. The divides are `__fdiv_rn` / `__frcp_rn` /
+`__ddiv_rn` and the roots are `sqrtf`; IEEE-754 requires both correctly rounded,
+nvcc's defaults (`-prec-div=true`, `-prec-sqrt=true`) keep them so, and glibc
+gives the same guarantee, so those agree by the standard rather than by an
+intrinsic. With the reduction ORDER held identical there is then no operation
+left that CAN differ.
+
+**AND THAT MAKES THE TWO BYTE-IDENTICAL ARMS' ORACLE GATES TRANSITIVE, EXACTLY.**
+The CPU arms are held to the transformers goldens by
+`tests/vt/test_ops_rms_norm_group.cpp` and
+`tests/vllm/models/test_qwen4_exp_qsa_device.cpp`; the CUDA arms are held to the
+CPU arms by equality; equality composes. That argument is available only BECAUSE
+the relation is equality, and it is stated rather than assumed.
+
+`vt::Qwen4ExpQsaGatherAttention` cannot reach it, and exactly one function is
+why: `exp`. The CPU arm calls `std::exp` on a float, the device arm calls `expf`,
+CUDA documents up to 2 ulp for `expf` and glibc's is correctly rounded. The gate
+MEASURES that difference and prints it on a green run rather than holding a bound
+chosen to pass.
+
+**THE MIXER GIVES UP MORE, AND THE TRADE IS DELIBERATE.** Its CPU arm's
+`ProjectRow` routes a block-quantized weight to `vt::MatmulBTQuant` and a float
+weight to a PRIVATE `LinearNoBias` that accumulates `sum_i w[o*K+i]*x[i]` in f32
+in index order — `LinearNoBias` exists there precisely so the float arm stays
+bit-identical to the pre-W5p kernel. A device `LinearNoBias` would reproduce that
+order and hand this arm a byte gate. It would also be a hand-written GEMV beside
+`vt::MatmulBT`, which is the parallel path AGENTS.md "Shared seams" forbids, and
+it would give the released checkpoint's 194 Q8_0 mix weights a second private
+route on the one device where the quantized GEMM lives. So both float and block
+weights go to `vt::MatmulBT`, which dispatches a block dtype to
+`kMatmulBTQuant` itself, and the CONSEQUENCE is recorded rather than hidden: a
+device GEMM re-associates the K reduction, so this arm is NOT bit-identical to
+its CPU sibling. Its bound is the ORACLE's 1e-5 and not one ulp, because both
+arms are held to the golden at 1e-5 and their mutual difference cannot usefully
+be asserted tighter than the band they each live in. Two divergence sources, and
+no third: the GEMM's association and `exp`.
+
+#### The four orders the gather arm preserves, and the speed it forfeits
+
+The CPU arm's header calls the ascending visit order "load-bearing, not
+cosmetic: a gather's visit order IS the softmax's reduction order, and ascending
+is what makes a sub-budget gather reduce over exactly the dense sequence and so
+be BIT-identical to dense attention rather than merely close". This arm keeps all
+four:
+
+1. the **dot** `sum_d q[d]*k[d]` is sequential ascending f32 on ONE thread,
+   never tree-reduced;
+2. the **max** over the gathered rows is split across threads and block-reduced,
+   which is exact and order-free — `max` is associative and commutative in IEEE
+   arithmetic and it is the one reduction here that may be parallelised;
+3. the **denominator** `sum_p w` is accumulated ascending by one thread;
+4. the **value accumulation** `acc[d] += w * v[d]` runs ascending over `p` and is
+   parallel across `d` only, which each thread owns alone.
+
+A 32-row tile carries thread 0's weights to the block so the barrier count is
+`|sel|/32` pairs rather than `|sel|`, and it changes no order: thread 0 still
+walks `s` ascending, still accumulates `denom` ascending, and the block still
+applies each tile in ascending `s`.
+
+**THE COST IS STATED RATHER THAN LEFT TO BE FOUND.** Pass 2's dot is sequential
+on thread 0, so a block spends `|sel| * head_dim` dependent f32 operations on one
+lane — ~525k per (token, head) at the released config. The lever that removes it
+is named and NOT taken here: a deterministic tree reduction over `d` would
+PRESERVE the gather-vs-dense property, because the dot's order would then depend
+on `head_dim` alone and be identical in the sub-budget and the dense run, while
+breaking the CPU-vs-CUDA relation the sequential dot keeps. That trade is
+declined on the run that first puts this kernel on a device, because it would
+replace a measured `max|diff|` with an argued one. Recorded under `## Owed` with
+its condition: take it after a red-first measurement that shows the sequential
+dot is the bottleneck.
+
+#### Three refusals these arms impose that their CPU arms do not
+
+- **`head_dim > 1024` is refused BY NAME** by both QSA arms. One thread block
+  serves one (token, head) or one compressed block and each thread owns one
+  element of the head dim, so the block cannot be wider than the device maximum.
+  `head_dim` is 256 and `index_head_dim` 128 in the released config. A refusal
+  that names the limit is correct where a silent wrap would be a truncated row.
+- **A MALFORMED SELECTION POISONS THE ROW WITH NaN** rather than being refused by
+  name. The CPU gather `VT_CHECK`s that each block id is ASCENDING and inside the
+  complete-block count, that `kv_lens[t]` fits the cache, and that a paged entry
+  names a physical page the cache holds. A device kernel cannot throw, and
+  `block_ids` / `kv_lens` / `kv_block_table` are DEVICE-resident on a CUDA queue
+  so the host dispatcher cannot read them either — the position
+  `cuda_qwen4_exp_ple.cu` already takes for `query_start_loc`, whose wrapper
+  checks run `if (q.device.type == kCPU)` only. This arm makes those
+  preconditions the caller's AND refuses to read out of range: a violating
+  (token, head) reads NOTHING out of bounds and writes NaN across its whole
+  output row, leaving every other row untouched. NaN over a clamp or a skip,
+  because both of those return a plausible tensor, and `MaxAbsDiff` returns
+  +infinity on any non-finite operand (#449) so a poisoned row cannot read as a
+  match in any gate in this tree. The gate carries the case.
+- **The mixer takes ONE `cudaMalloc` per call** for its `normed`, `low`,
+  `gate` and `inject_pre` intermediates, freed through a scope guard because
+  every `vt::` call between them can throw. The CPU arm holds the same buffers in
+  `std::vector`s; a device block cannot, because `hc*hidden` is thousands of
+  floats at the released config. A per-call allocation in a decode loop is a cost
+  and it is recorded under `## Owed` as a SPEED item rather than papered over
+  with a static cache that would not be re-entrant.
+
+#### `keys_visited` is a device counter now, and that debt is discharged
+
+`Qwen4ExpQsaAttnArgs::keys_visited` says in its own words: "A host pointer, on
+the `GdnArgs::query_start_loc_host` precedent; a CUDA arm owes a device-side
+counter and its copy-back." This is that. It is INCREMENTED AT THE READ in a
+per-thread counter, warp-reduced and `atomicAdd`ed once per warp, never assigned
+from the selection — the distinction the args comment spends a paragraph on,
+because W4's first fresh review found a counter set from `sel.size()` under which
+a dense walk still reported the sparse figure and passed 12 cases. The device
+slot is allocated, zeroed, read back and freed ONLY when the caller passed the
+instrument, so the production path takes no allocation and no stream
+synchronisation.
+
+**AND THE COUNTER ALONE IS STILL NOT A SET EQUALITY, which is why the gate
+carries two instruments.** W5b-4 mutation M11 proved a dense masked walk can
+report the sparse number, because a mask-shaped port changes the loop and the
+counter together. The gate therefore ALSO runs the CUDA arm over a cache whose
+rows no query ever selects are NaN: a gather never addresses them, a mask
+multiplies them by a zero weight into `0.0f * NaN`, and the answer must come back
+BITWISE equal to the clean run. Membership gives "read set is a subset of
+selected"; the counter gives "|read set| == |selected|"; together they are set
+equality, and the margin between the sparse and the dense count is printed.
+
 ## Mutation record — W8CONFIRM (#2031, issue OWED)
 
 W5s answered "does the released artifact emit real tokens on `origin/main`" and
@@ -7339,6 +7568,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W8CONFIRM PROVED IT IS THE FIX** (W5s asserted it; its `701606e51`-vs-`52f7ccbfc` comparison spans W5p too and cannot apportion) — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
 | W5s | the RELEASED UD-IQ1_S artifact re-driven on `origin/main` `52f7ccbfc` (W5p **and** W5r), four arms, one build, one staged copy | **SERVES yes, and the TOKENS ARE REAL** — `" Paris. Given this fact, what is"` and `" 100°C at sea level"` for two different prompts, eight distinct ids none of them 0, against W5q's eight consecutive id 0 on the same box and artifact. Reusing W7DIAG's read-only probe, the pre-W5r tree and this one agree numerically on `embed` and `after_widen` and diverge at exactly `stream.after_layer_0` (`nan=51200` -> `nan=0`); `LOGITS` was `zero=248320` with no maximum and is now `min -9.89818 max 15.7873`, argmax id 11751 = the `" Paris"` token. `VT_CPU_QUANT_REPACK=0` is byte-identical to the default, which is the correct outcome for a performance transform and the thing that was false before W5r. **NOT a token gate** (no oracle decoded these prompts; llama.cpp aborts in `build_delta_net_chunking`), no speed number, UD-IQ1_S only, one sequence. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5s's own issue OWED |
 | W8CONFIRM | the SAME artifact on the SAME `52f7ccbfc` tarball, TWO binaries differing only in `dense_attn_block.h:235-236`, four arms in one lease | **CAUSE ISOLATED** — `X-ON` (fix reverted, repack ON) returns `"!!!!!!!!!!!!!!!!"` with `LOGITS zero=248320` and `after_layer_0 nan=51200`, while `X-OFF` (same binary, repack OFF) and both `M` arms return `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` bit-identically. Same binary either side of one environment variable, so the defect needs the repack chain ACTIVE and the markers DROPPED; W5p is in all four arms and cannot explain a difference between them. Four prompts across factual, narrative and code, all correct, one ending on the model's own EOS. Binaries `e18a38a6…` vs `cfdf47bd…`, mutation applied-proof `2 -> 0` fix lines. **NOT a token gate**, n=1, UD-IQ1_S only, `--device cpu` only. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W8CONFIRM's own issue OWED |
+| W6-CUDA-B | the FOUR remaining CUDA arms: `vt::Qwen4ExpGatedResidual` (the mixer), `vt::RmsNormGroup`, `vt::Qwen4ExpQsaCompress`, `vt::Qwen4ExpQsaGatherAttention` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and `EmbeddingKernelCuda` still refuses a block-quantized table by name, so no `qwen4_exp` step can reach a CUDA queue. What CHANGES is the size of the gap: the three W6-CUDA arms sit immediately AFTER these four in the same functions (`qwen4_exp_ple_block.cpp:489,499` before `:531,580`; `qwen4_exp_forward.cpp:418,476` before `:457,506`), so seven kernels go from four separate blockers to ONE. The wave was dispatched as THREE ops; `kQwen4ExpGatedResidual` was missed because `kQwen4ExpGatedResidualWriteBack` contains it as a substring, and two independent audits caught it before any code was written. Full result in the W6-CUDA-B section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA-B's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

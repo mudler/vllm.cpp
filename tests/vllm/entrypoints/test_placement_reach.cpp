@@ -140,3 +140,57 @@ TEST_CASE("placement reach: a load with no placement still installs, and stays i
 
   fs::remove_all(dir);
 }
+
+TEST_CASE("placement reach: --fit REFUSES a safetensors checkpoint by name") {
+  // THE ARM THAT MUST NOT PASS SILENTLY. The model's weight footprint is not
+  // knowable at the install point on this path, so `--fit` cannot resolve. The
+  // failure mode being guarded is not a wrong placement but an ABSENT one: an
+  // operator asks for a fit, sees no error, and gets no placement -- which is
+  // exactly how #2382 stayed invisible for three work items.
+  PlacementFixture fx;
+  const std::string dir = WriteConfigOnlyModelDir("vllm-cpp-placement-fit-st");
+
+  vllm::entrypoints::EngineParams params;
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"fit":true}}})");
+
+  std::string msg;
+  try {
+    vllm::entrypoints::LoadedEngine::FromModelDir(dir, params);
+    msg = "LOADED (no refusal)";
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  // Names the flag, the arm, and what to do instead -- a refusal that only said
+  // "unsupported" would leave the operator guessing which half was the problem.
+  CHECK(msg.find("fit") != std::string::npos);
+  CHECK(msg.find("GGUF") != std::string::npos);
+  CHECK(msg.find("safetensors") != std::string::npos);
+
+  // And it refused rather than quietly installing an empty plan.
+  CHECK(vllm::ActiveMoePlacementPlan().origin() == vllm::PlacementOrigin::kNone);
+  CHECK_FALSE(vllm::ActiveMoePlacementPlan().PlacesAnything());
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("placement reach: a STATED placement records its origin as stated, not fit") {
+  // Provenance is the observable the fit gate needs, so it has to be right for
+  // the arm that is NOT fit as well. Without this, `origin() == kFit` could be
+  // satisfied by a plan that simply defaults to it.
+  PlacementFixture fx;
+  const std::string dir = WriteConfigOnlyModelDir("vllm-cpp-placement-origin");
+
+  vllm::entrypoints::EngineParams params;
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"placement":{"cpu_moe":true}}})");
+  CHECK_THROWS(vllm::entrypoints::LoadedEngine::FromModelDir(dir, params));
+
+  // The engine device IS the placement target on a CPU-only build, so nothing is
+  // placed and the origin is kNone: provenance describes what was INSTALLED, not
+  // what was asked for. A plan that places nothing has no origin to report.
+  CHECK(vllm::ActiveMoePlacementPlan().resolved_layer_count() == kLayers);
+  CHECK(vllm::ActiveMoePlacementPlan().origin() == vllm::PlacementOrigin::kNone);
+
+  fs::remove_all(dir);
+}

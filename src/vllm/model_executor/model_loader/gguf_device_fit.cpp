@@ -1,4 +1,6 @@
 // ENG-EXPERT-STREAM, issue #1123. See the header for what this decides and why.
+#include <regex>
+#include <vector>
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 
 #include <string>
@@ -163,6 +165,32 @@ GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
     out.lower_bound_bytes += lane.arena_bytes;
   }
   return out;
+}
+
+std::vector<size_t> GgufRoutedExpertBytesPerLayer(const GgufFile& gguf,
+                                                  int64_t num_hidden_layers) {
+  std::vector<size_t> per_layer;
+  if (num_hidden_layers <= 0) return per_layer;
+  per_layer.assign(static_cast<size_t>(num_hidden_layers), 0);
+  const std::vector<GgufTensorInfo>& tensors = gguf.Tensors();
+  for (int64_t layer = 0; layer < num_hidden_layers; ++layer) {
+    // One regex per layer, built by the SHARED helper so this counts the same
+    // tensors an override moves. A bad pattern cannot throw here in practice --
+    // the helper composes a fixed literal with a decimal index -- but a throw
+    // would abort a load over a diagnostic, so it degrades to "priced nothing"
+    // for that layer instead.
+    std::regex re;
+    try {
+      re.assign(vllm::LlmFfnExpsBlockRegex(layer));
+    } catch (const std::regex_error&) {
+      continue;
+    }
+    size_t bytes = 0;
+    for (const GgufTensorInfo& t : tensors)
+      if (std::regex_search(t.name, re)) bytes += t.nbytes;
+    per_layer[static_cast<size_t>(layer)] = bytes;
+  }
+  return per_layer;
 }
 
 size_t DeviceWeightBudgetBytes(size_t device_memory_total_bytes) {

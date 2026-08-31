@@ -548,6 +548,40 @@ or empty dump would make the arms agree trivially -- the vacuous pass this gate
 was written to refuse. A missing dump is `GATE_RC=2`, never a pass. The
 completions are recorded but no longer asserted.
 
+### W3g — the seam assumed bf16, and the placed branch is untestable on CPU ([#2383](https://github.com/mudler/vllm.cpp/issues/2383))
+
+The seam hardcoded `vt::DType::kBF16` in six places and never compared it with
+the block it was given. `kimi_linear_device.cpp:930` hands it an **f32** `[T,H]`
+buffer, so the placed branch copied HALF the bytes and reinterpreted f32 as
+bf16 — silently, producing plausible floats rather than a crash.
+
+**It could not fire until W3e.** With no plan installed, `placed_on` always
+equalled the engine device and the whole placed branch was dead. Installing the
+plan opened the door, so the trap behind it is fixed in the same campaign rather
+than left for whoever first placed a Kimi-Linear layer.
+
+The seam now carries `dh.dtype`, sizes the copy-back by the dtype the body
+actually produced — which need not equal the input's — and hardcodes bf16
+nowhere.
+
+**Why nothing caught it, which is the finding worth keeping.**
+`RunMoePlaced` takes its engine device from `engine.q.device.type`, and the CPU
+is the only legal placement target, so on a CPU-only build `placed_on` always
+equals the engine device and **the placed branch is unreachable**. Every unit
+test and all of CI exercise only the inert path; the placed branch's sole
+execution is on a GPU box. An entire branch of a shared seam that six
+architecture families route through has no coverage any merge gate can see.
+
+`tests/vllm/model_executor/test_placement_dump_dtype.cpp` covers the dump's
+half, in its OWN binary because `VT_PLACEMENT_DUMP_MOE` latches on first use and
+`test_device_placement` drives the seam first — sharing a binary would latch it
+to "unset" and the suite would pass while asserting nothing. Mutation-proven at
+1 case / 4 assertions on a mutant that compiles at rc=0.
+
+**Owed:** the placed branch itself, still untested on CPU. Closing it needs a
+loopback placement target or a GPU-gated test. Named rather than assumed
+covered.
+
 ## Risks and decisions
 
 - **The bandwidth ratio is assumed, not measured.** Every number in that table comes

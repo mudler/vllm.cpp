@@ -197,8 +197,8 @@ vt::Queue& PlacementQueue(vt::DeviceType device);
 // INERT unless the variable is set: no allocation, no copy, one `getenv` latched
 // on first use. First matching call only, so it costs nothing per token.
 void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
-                             const void* bf16_data, int64_t elems,
-                             bool data_is_host);
+                             const void* data, int64_t elems, bool data_is_host,
+                             vt::DType dtype);
 
 void SetActiveMoePlacementPlan(const MoePlacementPlan& plan);
 const MoePlacementPlan& ActiveMoePlacementPlan();

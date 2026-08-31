@@ -209,13 +209,13 @@ vt::Queue& PlacementQueue(vt::DeviceType device) {
 }
 
 void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
-                             const void* bf16_data, int64_t elems,
-                             bool data_is_host) {
+                             const void* data, int64_t elems, bool data_is_host,
+                             vt::DType dtype) {
   // Latched once. An unset variable must cost a load and a branch, not a getenv
   // per layer per token.
   static const char* const path = std::getenv("VT_PLACEMENT_DUMP_MOE");
   if (path == nullptr || path[0] == '\0') return;
-  if (layer_index != 0 || bf16_data == nullptr || elems <= 0) return;
+  if (layer_index != 0 || data == nullptr || elems <= 0) return;
   // FIRST matching call only. A decode writes this layer once per step, and the
   // gate compares one step against one step; appending every step would compare
   // arms that have already diverged in TOKENS and so no longer share an input.
@@ -223,12 +223,23 @@ void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
   if (done) return;
   done = true;
 
+  // The block's dtype is NOT assumed. The seam used to hardcode bf16 and a
+  // caller hands it f32; a dump that widened f32 bits as bf16 would print
+  // plausible-looking garbage and the gate would compute an NMSE over it.
+  if (dtype != vt::DType::kBF16 && dtype != vt::DType::kF32) {
+    std::fprintf(stderr,
+                 "engine: VT_PLACEMENT_DUMP_MOE cannot render dtype %s; the "
+                 "gate would otherwise compare misread bytes\n",
+                 vt::Name(dtype));
+    return;
+  }
   const size_t n = static_cast<size_t>(elems);
-  std::vector<uint16_t> host(n);
+  const size_t esz = vt::SizeOf(dtype);
+  std::vector<uint8_t> raw(n * esz);
   if (data_is_host) {
-    std::memcpy(host.data(), bf16_data, n * sizeof(uint16_t));
+    std::memcpy(raw.data(), data, n * esz);
   } else {
-    b.Copy(q, host.data(), bf16_data, n * sizeof(uint16_t));
+    b.Copy(q, raw.data(), data, n * esz);
     b.Synchronize(q);
   }
 
@@ -245,9 +256,16 @@ void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
   // float. Text, because the consumer is a gate script and a binary format
   // would need a reader that could disagree with this writer.
   for (size_t i = 0; i < n; ++i) {
-    const uint32_t bits = static_cast<uint32_t>(host[i]) << 16;
     float v;
-    std::memcpy(&v, &bits, sizeof(v));
+    if (dtype == vt::DType::kF32) {
+      std::memcpy(&v, raw.data() + i * esz, sizeof(v));
+    } else {
+      uint16_t h;
+      std::memcpy(&h, raw.data() + i * esz, sizeof(h));
+      // bf16 -> f32 is an exact widening: the value is the high 16 bits.
+      const uint32_t bits = static_cast<uint32_t>(h) << 16;
+      std::memcpy(&v, &bits, sizeof(v));
+    }
     std::fprintf(f, "%.9g\n", static_cast<double>(v));
   }
   std::fclose(f);

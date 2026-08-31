@@ -27,9 +27,9 @@ MLA arms ([#1974](https://github.com/mudler/vllm.cpp/issues/1974)) are fixed in
 flow. Nothing consumed the topology, so that refusal was what a DeepSeek-V4
 engine hit.
 
-W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)) is claimed and its
-design is `### W3 design — the runner carries every published group, and a third
-forward channel`. It makes the runner allocate a buffer for every published cache
+W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)) LANDED as
+`ca3dcda21` (2026-08-27). Its design is `### W3 design — the runner carries every
+published group, and a third forward channel`. It makes the runner allocate a buffer for every published cache
 instead of one per hidden layer, generalizes `full_attn_group_id_` /
 `gdn_group_id_` and the three-valued `LayerKvClass`, and adds the third
 `ModelForwardInput` channel. **This is the wave that touches every model**, so
@@ -38,6 +38,12 @@ the SACRED `test_qwen35_paged_engine` regression. **Still nothing reads a
 cache** — a DeepSeek-V4 engine now constructs and allocates all 167 buffers and
 its first forward refuses, naming W5. W4 through W7 remain proposals with no
 owner.
+
+**The opening of this section read "W3 is claimed" until 2026-08-29**, while the
+paragraph above already described W3's landed behaviour. A reader who stopped at
+the first sentence concluded W3 was the wall and wrote it into another row's spec
+([#2302](https://github.com/mudler/vllm.cpp/issues/2302)). The wall is W5, and it
+has no owner.
 
 ## Scope
 
@@ -444,14 +450,400 @@ and no wave has an owner.
 | **W2** | `MakeDeepseekV4KVCache` publishes the real topology: one group per (spec class × compress ratio), real per-layer names, the 167 entries enumerated under `## The geometry, derived from source`. Nothing consumes it yet; the gate is the published spec set. | **CPU** | M |
 | **W3** | The runner carries more than one attention group and more than one cache per layer: generalize `full_attn_group_id_`/`gdn_group_id_` (`runner.h:571-572`) and the three-valued `LayerKvClass` (`runner.h:366-370`), and add the third forward channel that `## Why our KV interface cannot represent it` item (5) says is absent. **This is the wave that touches every model**, so its obligation is byte-neutrality for the uniform case, on the model of the `per_layer_attn_specs` contract (`kv_cache_interface.h:384-393`). | **CPU** | L |
 | **W4** | Non-uniform `block_size` across groups: `HybridKVCacheCoordinator`'s deferral (`kv_cache_coordinator.cpp:340-346`) and the block-table geometry (`runner.cpp:311-319`). May land inside W3 if W3's design needs it; kept separate because it is where a wrong answer is silent under `NDEBUG`. | **CPU** | M |
-| **W5** | `Forward`/`ForwardDevice` consume `attn_kv`: the DSA-sparse attention path reading the published caches, replacing `(void)attn_kv`. Removes the `VT_CHECK(!is_indexer && !is_comp, ...)` at `deepseek_v4.cpp:786-787`. | CPU at synthetic config; **GPU** for the real geometry | L |
+| **W5** | `Forward`/`ForwardDevice` CONSUME `attn_kv`: the published caches reach the model keyed by layer name and each layer routes to its own, replacing `(void)attn_kv` and the `ModelRegistry::Forward` refusal (its `input.multi_kv` guard, now the free function `MultiKvRefusalApplies` in `model_registry.cpp`; cited as `:430-440` until [#2353](https://github.com/mudler/vllm.cpp/issues/2353), which measured that those lines are `MultiKvCacheIndex::Find` and replaced the range with the symbol). **The cache plumbing only** -- see the scope boundary below, and `### W5 design` for the design ([#2323](https://github.com/mudler/vllm.cpp/issues/2323)). | CPU at synthetic config; **GPU** for the real geometry | L |
 | **W6** | Reachability + ABI: the capability reachable from `ModelRegistry::Forward` and exposed through `include/vllm.h`, so `examples/deepseek_v4_gen` stops including an internal header (`## Our baseline`). | **CPU** | S |
 | **W7** | The oracle gate of `## Gates`. | **GPU**, ≥2 GB10 | M |
+
+**W5's scope was NARROWED on 2026-08-29, and the boundary is written here
+because two rows would otherwise claim the same code.** Its one-line entry above
+originally read "the DSA-sparse attention path reading the published caches" and
+"Removes the `VT_CHECK(!is_indexer && !is_comp, ...)`", which is the DSA
+ALGORITHM rather than the cache plumbing. `MODEL-DSV4-DSA-COMPOSE`
+([#2286](https://github.com/mudler/vllm.cpp/issues/2286)) was then created against
+the forward's own "no owning row" refusal and specced that algorithm in detail --
+overlapping this wave, because W5 has never had a design section and its scope
+lived in one table cell.
+
+The split, so each row owns code the other does not:
+
+| row | owns |
+|---|---|
+| `KV-DSV4-MULTICACHE` W5 | the caches REACHING the model and each layer routing to its own: `attn_kv` consumed rather than `(void)`-ed, and `ModelRegistry::Forward` stopping its refusal |
+| `MODEL-DSV4-DSA-COMPOSE` | what RUNS on those caches: the three layer shapes, the compressor's two stages, the `coff` role selection and boundary emission, the indexer's `qr`-sourced query, and the `!is_indexer && !is_comp` refusal at `deepseek_v4.cpp:786-787` |
+
+W5 therefore lands first and does NOT remove the DSA refusal; it makes a cache
+reachable for the row that will. Neither row can be gated end-to-end alone, and
+that is stated rather than discovered: W5's synthetic-config gate proves routing,
+and the token-exact oracle gate belongs to `MODEL-DSV4-DSA-COMPOSE` above 512
+tokens.
+
+**A SECOND row consumes this W5, and it is recorded here so the count of
+consumers is not rediscovered as a surprise.**
+`MODEL-TEXT-GLM-MOE-DSA` (`.agents/specs/glm-dsa-latest-deepseek.md` §3.7)
+also has a wave numbered W5, "the indexer KV side cache", and its own text
+makes it conditional: *"This is `KV-DSV4-MULTICACHE`'s work and this row
+consumes it; if that row does not schedule it, this row's W5 is where it lands
+and the ownership is recorded in both places before a line is written."*
+
+**That condition resolved FALSE on 2026-08-30, so W5 is STRUCK from the GLM row
+and re-sequenced there as a consumption site — struck, not deferred, because the
+wave does not belong to that row at any date.** This row scheduled W5: it has a `### W5 design` section (W5-1 through
+W5-6) tracked by [#2323](https://github.com/mudler/vllm.cpp/issues/2323), and
+its first implementation commit — W5-2's gated dispatch — is already written.
+GLM-5.3 is therefore a CONSUMER of the same by-name multi-KV channel that
+DeepSeek-V4 consumes, on the shape `MODEL-MM-GLM53-FLASH` already proved
+(`glm5_next_kv.{h,cpp}`, `ModelFactory::consumes_multi_kv_cache`), and it
+acquires no independent cache-plumbing scope.
+
+**The concrete thing that would have gone wrong** is worth keeping, because it
+is the failure this boundary exists to prevent. The GLM row's W5 lists as a
+test *"the refusal at `dots3_note_device.cpp` is deleted"* — and W5-2 above
+says, in this row's own words, that **deleting the refusal is the one thing W5
+must not do**. Two rows working the same wave from two specs would have had one
+of them delete the guard the other built. A third point: that refusal is not
+GLM's to delete under any owner, because it guards `Dots3NoteForCausalLM` and
+belongs to `MODEL-DOTS3-NOTE` ([#699](https://github.com/mudler/vllm.cpp/issues/699)),
+whose own comment already says the cache "is `KV-DSV4-MULTICACHE` (#1925), not
+this row".
 
 W1, W2, W4 and W6 are fully CPU-gateable. W3 is CPU-gateable for its own
 guarantees but its byte-neutrality obligation reaches every model, so its full
 gate includes the SACRED `test_qwen35_paged_engine` regression. W5 and W7 need
 the GPU.
+
+### W5 design - the forward consumes the caches, and the refusal becomes a dispatch ([#2323](https://github.com/mudler/vllm.cpp/issues/2323))
+
+W5 had no design section until now, and that absence had a cost worth recording:
+its whole scope lived in one wave-table cell, so `MODEL-DSV4-DSA-COMPOSE`
+([#2286](https://github.com/mudler/vllm.cpp/issues/2286)) was specced over it and
+had to be split back apart (#2302). The boundary above is binding on this
+section: **W5 is the plumbing, and it deliberately does not remove the DSA
+refusal.**
+
+#### W5-1. What the tree does today
+
+W3 (`ca3dcda21`) made the runner allocate a buffer for EVERY published cache and
+hand them to the forward keyed by the name each was published under. A
+DeepSeek-V4 engine therefore constructs, publishes and ALLOCATES all 167 caches
+today, and then refuses at the first forward
+(`src/vllm/model_executor/models/model_registry.cpp:430-440`):
+
+> `... and no registered forward consumes a cache set keyed by layer name.
+> Refusing rather than discarding an allocated KV topology in silence (row
+> KV-DSV4-MULTICACHE W5 owns the consuming forward; #1925, #2068)`
+
+That refusal fires **unconditionally on `input.multi_kv != nullptr`**, and it is
+doing its job: `DeepseekV4Model::Forward` and `::ForwardDevice` still open with
+`(void)attn_meta; (void)attn_kv;` (`deepseek_v4.cpp:3033-3034`, `:3105-3106`) and
+recompute the whole prefix per token, so letting the step run would report a
+decode rate for a full-recompute path.
+
+#### W5-2. The refusal becomes a DISPATCH, never a deletion
+
+**Deleting the refusal is the one thing W5 must not do.** It would restore
+exactly the silent-discard failure W3 built it to prevent, and restore it for
+every FUTURE model that publishes a topology it cannot consume - a
+wrong-answer-not-a-crash, invisible to a token gate because the tokens stay right
+while the decode recomputes.
+
+So the forward declares the capability, and `ModelFactory` already has the
+pattern with its rationale written down (`model_registry.h`, beside
+`supports_weight_offload`):
+
+> Declaring the capability makes that case LOUD instead: the engine refuses a
+> configured offload against a model that does not claim support, naming the
+> architecture. A new model inherits false and is refused until someone wires it.
+
+W5 adds one more flag in that shape, defaulting **false**:
+
+```cpp
+// KV-DSV4-MULTICACHE W5: whether THIS model's forward consumes a cache set
+// keyed by layer name (`ModelForwardInput::multi_kv`) rather than the
+// positional `attn_kv` convention.
+bool consumes_multi_kv = false;
+```
+
+`ModelRegistry::Forward` then refuses only when a name-keyed set arrived AND the
+registration does not claim it. Every other model keeps its exact behaviour by
+construction, because `multi_kv` is `nullptr` for every topology the positional
+convention expresses.
+
+#### W5-3. How a layer finds its caches
+
+By name, which is what W3's channel exists for and what upstream does - every
+cache upstream is registered under its own prefix and `get_kv_cache_spec()`
+returns a `dict[str, KVCacheSpec]` keyed by it. `MultiKvCacheIndex::Find(name)`
+returns the index into `attn_kv`, or -1.
+
+The forward therefore resolves each layer's caches by the same names
+`MakeDeepseekV4KVCache` published, and **-1 is a refusal, not a fallback**: a
+name that does not resolve means the published topology and the consuming
+forward disagree, and continuing would silently drop a cache. That is the same
+polarity as W2's refusal and W3's, and it is the third time this row has needed
+it.
+
+`Find` is linear over 167 entries and a forward looks a name up once per layer
+per role; W3 recorded that as a deliberate decision rather than an oversight, and
+W5 does not change it. If profiling later shows it, an index is a follow-up with
+a measurement behind it.
+
+#### W5-4. What W5 does NOT reach, and why the gate is synthetic
+
+DeepSeek-V4-Flash has 21 `compress_ratio == 4` layers, and their DSA algorithm
+belongs to `MODEL-DSV4-DSA-COMPOSE`. **W5 leaves
+`VT_CHECK(!is_indexer && !is_comp, ...)` (`deepseek_v4.cpp:786-787`) exactly
+where it is.** So the real artifact still does not run after W5, and saying so
+here prevents the next reader from expecting it.
+
+What W5 makes true is that a DeepSeek-V4 config WITHOUT DSA layers decodes from
+the published caches instead of recomputing the prefix - which is the whole
+point of the topology and is gateable on CPU at a synthetic config, as the wave
+table says.
+
+`DeepseekV4ForwardGgufCached` (`deepseek_v4.cpp:2804`) is the precedent to build
+on: it already caches, with indexer and compressor forced OFF on every layer
+(`:677-679`).
+
+#### W5-5. The bridge: the two cache representations, and the shortcut that must not be taken
+
+The wave's substance is that two representations have to meet, and naming them
+precisely is what stops the wrong one being chosen:
+
+| side | shape |
+|---|---|
+| runner (`PagedKvCache`, `qwen3_5.h:78-92`) | PAGED -- `{data, dtype, num_blocks, block_size, num_kv_heads, head_size, fp8_kind}`, addressed through a block table, `bf16` or `fp8` |
+| model (`DeepseekV4KvCache`, `deepseek_v4.h:513-528`) | CONTIGUOUS -- `deck[layer]` is a flat `[len * head_dim]` of **f32** that GROWS, plus `len` |
+
+Three ways to join them, and only one of them is real.
+
+**(a) Attend over the paged cache directly.** What upstream does, and what the
+primitives here already support: `vt::ReshapeAndCache` (`ops.h:4628`) writes a
+step's K/V into pages, `vt::PagedAttention` (`ops.h:4975`) reads `[0, ctx)` back
+out, and `dense_attn::AttnBlock` already drives exactly that pair
+(`dense_attn_block.h:662`). This is the wave.
+
+**(b) Copy paged -> contiguous each step, then run the existing forward.**
+**This is the trap, and it must be named rather than left to be discovered.** It
+is by far the easiest thing to write, it produces IDENTICAL TOKENS, and it makes
+every token gate green -- while the decode stays O(context) per token, because the
+copy is exactly the work the paged cache exists to avoid. The engine would then
+report a decode rate for a path that is asymptotically no better than the
+full-recompute one it replaced. That is the same shape as
+`## Why our KV interface cannot represent it`: a wrong-answer-not-a-crash, only
+here the wrong answer is a NUMBER rather than a token. It is also why W5-8's
+gate asserts the saving by COUNTING WORK rather than by timing -- a timing gate on
+a small synthetic config would not separate (a) from (b), and a token gate cannot
+separate them at all.
+
+**(c) Alias the paged storage from the deck.** Not available: pages are not
+contiguous, which is the entire point of paging.
+
+**CORRECTION 2026-08-30.** An earlier revision of this section said (a) is "not a
+wiring change... a PORT of DeepSeek-V4's MLA attention onto the paged seam", on
+the evidence that `deepseek_v4.cpp` contains no `ReshapeAndCache` or
+`PagedAttention`. That evidence was real and the conclusion drawn from it was
+wrong: it searched for the DENSE paged primitives, and MLA does not use them.
+
+**A paged MLA seam already exists, is implemented on CPU and CUDA, and has two
+users.**
+
+| piece | where |
+|---|---|
+| `ForwardMlaAttentionBlock(Dev, MlaBlockDims, MlaBlockWeights, hidden, positions, Tensor& kv_cache, const Tensor& slot_mapping, MlaBlockMetadata, TritonMLAImpl&, out)` | `src/vllm/model_executor/layers/attention/mla_attention.cpp:353` |
+| `vt::ConcatAndCacheMla` -- the paged MLA WRITE | `cpu/cpu_cache.cpp`, `cuda/cuda_cache.cu`, called at `mla_attention.cpp:754` |
+| `vt::GatherMlaCache` -- the paged MLA read | `cpu/cpu_mla_prefill.cpp`, `cuda/cuda_mla_prefill.cu` |
+| existing users | Kimi-Linear (`kimi_linear*.cpp`), dots3-note (`dots3_note_attn.h`, `dots3_note_device.cpp`) |
+
+So W5 is **routing DeepSeek-V4 onto an existing shared seam**, not building one.
+That is also what AGENTS.md `## Shared seams` REQUIRES rather than merely
+permits -- "Never write a parallel path by hand" -- and V4's bespoke MLA is
+already such a path.
+
+**WHAT THE SEAM CANNOT REPRESENT TODAY, and it is exactly one thing.**
+`include/vllm/model_executor/models/mla_attention.h` contains **zero**
+occurrences of `sink`, and DeepSeek-V4 carries a per-head attention sink loaded
+from the checkpoint (`attention.py:218-222`; ours at `deepseek_v4.h`,
+`attn_sink[n_heads]`). AGENTS.md's rule for that case is explicit: "Extend a
+shared seam when it cannot represent the upstream behavior. Otherwise, record
+one exact tracked exception."
+
+So the shape of W5 is:
+
+1. extend `MlaBlockWeights` / `ForwardMlaAttentionBlock` with the per-head sink,
+   inert by default so Kimi-Linear and dots3-note stay byte-identical;
+2. route DeepSeek-V4's NON-DSA layers through it;
+3. leave the DSA layers refusing -- the indexer and compressor belong to
+   `MODEL-DSV4-DSA-COMPOSE` (#2286).
+
+**THE EXACT CHAIN THE SINK HAS TO TRAVEL**, traced so the next session does not
+re-derive it:
+
+```
+ForwardMlaAttentionBlock            layers/attention/mla_attention.cpp:353
+  -> TritonMLAImpl::forward_mqa     v1/attention/backend.cpp:290
+    -> vt::MlaDecodeAttention       ops.h (MlaDecodeAttentionArgs, ops.h:1777)
+```
+
+`MlaDecodeAttentionArgs` carries `scale`, `num_kv_splits` and the block-table
+metadata, and **no sink**; `include/vt/ops.h` has zero `sink` occurrences
+anywhere. So the extension is four edits, in this order:
+
+1. a sink field on `MlaDecodeAttentionArgs`, defaulting to an absent/`-inf`
+   sentinel so every existing caller is bit-identical;
+2. the CPU and CUDA `MlaDecodeAttention` kernels honouring it -- the sink is one
+   extra logit **in the denominator only**, exactly as
+   `deepseek_v4_dsa.cpp:121-139 SoftmaxWithSink` already does it on the host, so
+   the reference semantics are already written and gated in this tree;
+3. the same for the prefill half;
+4. a `attn_sink` tensor on `MlaBlockWeights`, threaded through
+   `ForwardMlaAttentionBlock` -- null for Kimi-Linear and dots3-note, which must
+   stay byte-identical.
+
+**The online-softmax detail that makes (2) non-trivial.** `MlaDecodeAttention`
+splits the KV over `num_kv_splits` and reduces; a sink added per split would be
+counted once per split rather than once per row. It belongs in the FINAL
+reduction, and the gate has to cover `num_kv_splits > 1` or it will not see the
+difference -- `num_kv_splits = 1` is the batch-invariant path and would pass
+either way.
+
+
+**The correction does not move the trap.** Option (b) -- copy paged to contiguous
+each step -- remains available, still produces identical tokens, still passes a
+token gate, and still leaves the decode O(context) per token. It is arguably MORE
+tempting now that (a) is smaller, because "just adapt the existing forward" looks
+close. The work-counting gate below is what separates them.
+
+
+#### W5-6. The SECOND thing the seam cannot represent: DeepSeek-V4's output projection
+
+The sink was the first. Tracing the routing further found the second, and it is
+structural rather than a missing field.
+
+`ForwardMlaAttentionBlock` applies the output projection ITSELF, as step 6, and
+requires a dense one: `RequireWeight(w.o_proj, "o_proj")` then
+`vt::MatmulBT(d.q, out, attn_flat, w.o_proj)`, with
+`o_proj [hidden, num_heads*v_head_dim]` (`mla_attention.cpp:958-960`,
+`mla_attention.h:338`).
+
+DeepSeek-V4 does not have one. Its output side is a **grouped LoRA**:
+`wo_a [n_groups, o_lora_rank, in_per_group]` applied as a block-diagonal bmm,
+then `wo_b [H, n_groups*o_lora_rank]` (`deepseek_v4.h:183-191`). That is a
+low-rank, per-group factorization; expanding it into a dense
+`[hidden, num_heads*v_head_dim]` would reproduce the arithmetic while discarding
+the entire saving the factorization exists for.
+
+**UPSTREAM ALREADY SPLITS THESE, and that is the answer rather than a workaround.**
+`DeepseekV4Attention.forward` (`attention.py:345-391`) runs
+`self.attention_impl(...)` to fill `o_padded`, slices it, and only then calls
+`return self._o_proj(o, positions)` -- a SEPARATE, platform-specific method. The
+attention block and the output projection are distinct steps upstream, and it is
+our block that fused them.
+
+So the routing shape is: expose the attention output BEFORE the output
+projection, let each model apply its own. That is additive for the seam's current
+users -- Kimi-Linear and dots3-note keep calling the fused entry point and stay
+byte-identical -- and it is the mirror of upstream rather than a divergence from
+it.
+
+**Order matters here.** This is a bigger change than the sink, it touches the
+seam's public shape, and it must land BEFORE any DeepSeek-V4 routing: a V4 layer
+cannot reach `ForwardMlaAttentionBlock` at all while step 6 requires a weight the
+model does not have.
+
+#### W5-7. The routing target is the OP, not the block -- and that shrinks the wave again
+
+Tracing the routing to the point of writing it found that DeepSeek-V4 should not
+go through `ForwardMlaAttentionBlock` at all.
+
+**V4's attention is already in post-absorption form.** The block exists to do the
+V2-style work: project q and kv, apply RoPE, ABSORB `kv_b_proj` into the query,
+attend, then project out. V4 has no `kv_b_proj`, no `kv_lora_rank` and no
+separate `v_head_dim` -- `deepseek_v4.h:74` records the whole geometry as
+`head_dim = 512 (= 448 v/nope + 64 rope)`, and the forward attends a per-token
+`deck` of `[T, 512]` latents shared across heads (`deepseek_v4.cpp:~900-930`).
+That is MQA over a latent, which is precisely what MLA decode IS once absorbed.
+
+**And `vt::MlaDecodeAttention` is geometry-general.** Its validator
+(`ops.cpp:4039-4053`) takes `query [batch, num_q_heads, head_size]`,
+`out [batch, num_q_heads, v_head_dim]` and
+`kv_cache [num_blocks, block_size, head_size]` -- "MLA has no K/V and no head
+axis" -- with no width hardcoded anywhere. V4's `head_size = 512`,
+`v_head_dim = 448` satisfies it as written.
+
+So the routing is:
+
+1. write V4's per-token latent into a PAGED cache each step, instead of appending
+   to `DeepseekV4KvCache::deck`;
+2. call `vt::MlaDecodeAttention` with the runner's `block_table` and `seq_lens` --
+   the op already supports the attention sink (W5 step one);
+3. keep V4's own grouped-LoRA output projection, unchanged.
+
+That is materially smaller than routing through the block, and it needs no
+further seam extension.
+
+**AN HONEST CONSEQUENCE, recorded rather than buried.** The `o_proj` split landed
+in the previous commit is therefore NOT on this row's critical path: V4 bypasses
+the block, so it never reaches step 6. The split remains a correct improvement --
+it mirrors upstream, where `_o_proj` is a separate platform-specific step, and it
+unblocks any future model whose output projection is not a dense matrix -- but it
+was built for a route this row will not take. It was written before this check
+was made, which is the cost of estimating a step before tracing it to the point
+of writing it.
+
+That is the fourth time this row's cost has moved after reading the tree rather
+than a record (#2302's wrong dependency; "from scratch" versus an existing seam;
+the `o_proj` requirement; and now the block versus the op). Each move made the
+work smaller.
+
+##### W5-7a. Step one in detail: the latent write needs no new op and no copy
+
+`vt::ConcatAndCacheMla(q, kv_c, k_pe, kv_cache, slot_mapping)` already expresses
+V4's cache write exactly, and the mapping is worth writing down because it is not
+obvious from the names:
+
+| the op wants | V4 supplies |
+|---|---|
+| `kv_c [num_tokens, kv_lora_rank]` | the latent's first **448** columns (nope/v) |
+| `k_pe [num_tokens, qk_rope_head_dim]` | the latent's last **64** columns (rope) |
+| `kv_cache [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]` | `head_dim == 512` |
+| `slot_mapping [num_slots] i64` | from the runner's metadata |
+
+**And it needs no copy.** The op's own contract says indexing is driven by the
+tensor STRIDES -- "a strided cache view or a split-projection source view is
+handled without a copy" -- so V4's CONTIGUOUS `[T, 512]` deck is passed as two
+views over the same buffer: offset 0 width 448, and offset 448 width 64, both
+with row stride 512. Nothing is materialized to split nope from rope.
+
+**One constraint to respect rather than discover.** The op takes the "auto" path
+only: the cache dtype must equal `kv_c`'s, and the `fp8_ds_mla` and int4 layouts
+are REFUSED loudly rather than silently mis-written. V4's published compressed
+latent is `fp8_ds_mla` at 584 B/token (`## The geometry`), so step one lands on
+the plain arm first and the fp8 layout is a later wave -- `KV-DSV4-MULTICACHE`
+already lists it, and this is where the two meet.
+
+So step one is a call, two views and a dtype check, not a kernel.
+
+#### W5-8. Gate
+
+Red-first, on CPU at a synthetic config:
+
+1. A config with no DSA layers publishes its caches, the forward consumes them,
+   and a multi-token decode is **token-identical** to the same prompt decoded by
+   the full-recompute path. Caching a value must not change it.
+2. **The saving is real, not nominal**: the cached decode must not recompute the
+   prefix. Asserted by counting work rather than by timing, so it cannot flake.
+3. A registration that does NOT claim `consumes_multi_kv` still refuses by name
+   when a name-keyed set arrives - mutation-proven by clearing the flag and
+   seeing exactly that case go red.
+4. An unresolvable layer name refuses rather than proceeding.
+5. Every model whose topology the positional convention expresses is
+   byte-identical, which the existing suites already assert and which case 3
+   protects by construction.
+
+**NOT gateable at or below 512 tokens** for the DSA arms, per `## Gates` - the
+one arm that caches today is exact only while `seq_len <= index_topk`. W5's own
+gate is a non-DSA config, so the bound does not bind it, and it is named here so
+nobody carries a 512-token result into the DSA row.
 
 ### W1 design — allocation metadata ([#1960](https://github.com/mudler/vllm.cpp/issues/1960))
 
@@ -1340,6 +1732,107 @@ config parse and upstream's disagree about the layer partition (that would be a
 `NEEDS_CONTEXT` if no multi-GB10 lease is available and a wave's gate needs G2.
 
 ## Owed
+
+- **SETTLED, AND THE RECORDED EXACTNESS BOUND IS TOO GENEROUS BY 4x** (#2323).
+  The previous revision of this entry raised it as an open question; the
+  composition has now been traced end to end and the answer is confirmed.
+
+  `forward_mqa` issues ONE kernel call
+  (`nvidia/flashmla.py`, `flash_mla_with_kvcache`):
+
+  ```python
+  out, _ = flash_mla_with_kvcache(
+      k_cache=swa_cache,                                 # PRIMARY: the sliding window
+      indices=swa_indices,
+      extra_k_cache=kv_cache if not swa_only else None,  # compressed latent, SPARSE layers only
+      extra_indices_in_kvcache=topk_indices,
+      out=output.unsqueeze(1))
+  ```
+
+  with `swa_only = self.compress_ratio <= 1`. So upstream attends the SLIDING
+  WINDOW always, and the selected compressed history ONLY on sparse layers. A
+  `compress_ratio <= 1` layer therefore attends **128 tokens and nothing else**
+  (`sliding_window = 128`, `sparse_swa.py:86-101`).
+
+  Our forward attends the FULL context on every layer (`deepseek_v4.cpp`, the
+  dense-causal `sel` arm over `[0, kv_base + t]`), and the paged arm reproduces
+  it. So:
+
+  | layers | ours | upstream | diverges above |
+  |---|---|---|---|
+  | `ratio <= 1` (5 of 46) | full context | 128-token window | **128 tokens** |
+  | `ratio == 4 / 128` | full context | window + top-k compressed | already refused (#2286) |
+
+  **This row's recorded bound -- "exact only while `seq_len <= index_topk`
+  (=512)" -- is therefore wrong for the SWA-only layers, where the binding
+  constraint is 128.** Any DeepSeek-V4 token-exactness claim above 128 tokens is
+  measuring a different computation from upstream on those five layers, and that
+  includes this row's own W5 gate, which runs far below 128 and so cannot see the
+  difference either way.
+
+  What is owed is the sliding window itself on the SWA-only path, and a bound in
+  the records that says 128 rather than 512.
+
+
+- **The last link of W5 -- `Forward` resolving pages from `multi_kv` -- is NOT
+  mechanical, and the reason is the topology rather than the plumbing** (#2323).
+  `DeepseekV4ForwardGgufPaged` and its paged `AttentionBlock` arm have landed and
+  are gated token-for-token against full recompute, but they assume ONE page
+  tensor per layer. A real DeepSeek-V4 config does not have that:
+
+  - `MakeDeepseekV4KVCache` publishes the compressed latent under
+    `model.layers.{l}.attn`, and **skips it entirely for `compress_ratio == 1`**
+    (`deepseek_v4_registry.cpp`: `if (ratio == 1) continue;`, mirroring
+    `attention.py:626-630` returning `None`). Those layers carry only a SWA
+    cache, so `MultiKvCacheIndex::Find` returns -1 for them by design.
+  - The 21 `compress_ratio == 4` layers additionally carry an indexer key cache
+    and compressor states, and their algorithm belongs to
+    `MODEL-DSV4-DSA-COMPOSE` ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)).
+
+  So the wiring has to express THREE layer shapes against the published names,
+  not map a flat list. That is a design step, and doing it by widening the paged
+  forward's per-layer assumption until it stops throwing would produce a forward
+  that reads whichever cache it happened to find -- the silent-wrong-context
+  failure this row has refused twice already.
+
+  **A `0` versus `1` discrepancy was flagged here and is WITHDRAWN**, because the
+  second side had not been read. The registry NORMALIZES before validating --
+  `const int64_t ratio = raw < 1 ? 1 : raw;`, commented as "`max(1,
+  config.compress_ratios[layer_id])` -- upstream's own guard ... Our parser keeps
+  the raw 0 for layers 0 and 1". So raw `0` and raw `1` both mean "no MLA latent
+  cache", the histogram's `{0: 5, ...}` is the raw value and correct, and the
+  registry's "accepts 1, 4 or 128" is the normalized one. Nothing is wrong.
+
+  Left in rather than deleted, because the flag was landed and a reader who saw
+  it deserves to see it withdrawn -- and because it is a fair example of the rule
+  this row keeps relearning: a discrepancy between two records is not a defect
+  until BOTH sides have been read in the tree. Reading one side and inferring the
+  other is how the four earlier wrong estimates on this row were made.
+
+
+- **W5's dispatch mechanism has landed UNREACHED, and this entry is the record
+  AGENTS.md requires for that** (#2323). `ModelFactory::consumes_multi_kv` and
+  `MultiKvRefusalApplies` turn `ModelRegistry::Forward`'s blanket refusal into a
+  gated dispatch, and **no model sets the flag yet**, so the `true` arm is
+  reachable only from `test_multi_kv_refusal`. Nothing regresses -- every model
+  inherits `false` and hits the same refusal it hit before, which
+  `test_runner`'s "a multi-cache forward is REFUSED, naming the channel" still
+  asserts -- but the capability is not yet a capability.
+
+  What makes it one is the rest of W5: `DeepseekV4Model::Forward` and
+  `::ForwardDevice` consuming `attn_kv` by name instead of `(void)`-ing it, and
+  the DeepSeek-V4 registration then declaring `consumes_multi_kv = true`. The
+  bridge that work has to cross is named here so the next reader does not
+  rediscover it: the runner hands over `PagedKvCache` entries keyed by published
+  name, while `DeepseekV4ForwardGgufCached` (`deepseek_v4.cpp:2804`) takes a
+  model-owned `DeepseekV4KvCache&`. Those two representations have to meet, and
+  that is the substance of the wave rather than an incidental detail.
+
+  Owned by `KV-DSV4-MULTICACHE` W5, tracked by
+  [#2323](https://github.com/mudler/vllm.cpp/issues/2323). It blocks
+  `MODEL-DSV4-DSA-COMPOSE` ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)),
+  which cannot start until a cache reaches the forward.
+
 
 - [#1925](https://github.com/mudler/vllm.cpp/issues/1925) — the defect this
   document scopes. Owned by this row. Not fixed in flow: it is a multi-wave

@@ -27,6 +27,7 @@
 // named MODEL-DSV4-EXL3 W2 residual; see the spec's `## Owed`.
 #include <doctest/doctest.h>
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -487,17 +488,33 @@ TEST_CASE("dsv4 exl3 W1c: the materialized VALUES are the checkpoint's, decoded"
   CHECK(CarriedScaleByte(base + ".scale", 0) != CarriedScaleByte(base + ".scale", 1));
   int64_t fp8_mismatch = 0;
   int64_t nonzero = 0;
+  int64_t narrowing_lost_a_bit = 0;
   for (int64_t n = 0; n < N; ++n) {
     for (int64_t k = 0; k < K; ++k) {
       const uint8_t wb = CarriedFp8Byte(base + ".weight", n * K + k);
       const uint8_t sb =
           CarriedScaleByte(base + ".scale", (n / kBlockN) * kb + (k / kBlockK));
       const float want = vllm::F8E4M3ToF32(wb) * vllm::E8M0ToF32(sb);
-      if (w.host.layers[0].wq_a[static_cast<size_t>(n * K + k)] != want) ++fp8_mismatch;
+      // W1d (#2186): the slot holds BF16 now, so the expectation is narrowed to
+      // the same dtype. Read the stored bit pattern back through `vt::BF16ToF32`
+      // rather than comparing raw `uint16_t`s, so a change that stored something
+      // other than a bf16 pattern in these slots still fails here.
+      const float got = vt::BF16ToF32(w.host.layers[0].wq_a[static_cast<size_t>(n * K + k)]);
+      if (got != vt::BF16ToF32(vt::F32ToBF16(want))) ++fp8_mismatch;
+      // AND THE NARROWING IS LOSSLESS, which is the whole argument for W1d rather
+      // than a precision trade. E4M3 carries FOUR significand bits (3 stored + 1
+      // implicit) and E8M0 is a pure power of two, so their product needs four
+      // significand bits; bf16 has EIGHT (7 stored + 1 implicit) and f32's exponent
+      // range verbatim. Every value of this tower is therefore exactly
+      // representable at bf16, and this counter must be zero -- not small. If a
+      // future checkpoint recipe widens the carried source (a real f32 or a
+      // higher-mantissa fp8), this fires and says so instead of quietly rounding.
+      if (want != vt::BF16ToF32(vt::F32ToBF16(want))) ++narrowing_lost_a_bit;
       if (want != 0.0f) ++nonzero;
     }
   }
   CHECK(fp8_mismatch == 0);
+  CHECK(narrowing_lost_a_bit == 0);
   // A tower of zeros would satisfy an equality check against a zero
   // expectation; it cannot satisfy this.
   CHECK(nonzero == N * K);
@@ -505,10 +522,97 @@ TEST_CASE("dsv4 exl3 W1c: the materialized VALUES are the checkpoint's, decoded"
   // block scale differ from what landed.
   int64_t unscaled_agrees = 0;
   for (int64_t i = 0; i < N * K; ++i)
-    if (w.host.layers[0].wq_a[static_cast<size_t>(i)] ==
+    if (vt::BF16ToF32(w.host.layers[0].wq_a[static_cast<size_t>(i)]) ==
         vllm::F8E4M3ToF32(CarriedFp8Byte(base + ".weight", i)))
       ++unscaled_agrees;
   CHECK(unscaled_agrees < N * K);
+}
+
+TEST_CASE("dsv4 exl3 W1d: the inlined bf16 widening equals vt::BF16ToF32") {
+  // `HostBf16ToF32` exists because `vt::BF16ToF32` is out of line in
+  // `src/vt/dtype.cpp` and this build has no LTO: calling it per element in the
+  // innermost loop of a carried-tower GEMV would cost more than halving the
+  // memory traffic saves. A duplicated bit operation is a thing that DRIFTS,
+  // though, and a token gate would not see it -- so pin the two together over
+  // the WHOLE domain rather than over a sample. bf16 has 65536 patterns; there
+  // is no reason to test fewer than all of them.
+  //
+  // Compared as BITS, not as floats: `NaN != NaN`, so a float comparison would
+  // silently pass over every NaN pattern -- the exact region where a widening
+  // that mangled the payload would show up.
+  int64_t disagree = 0;
+  for (int32_t i = 0; i < 65536; ++i) {
+    const uint16_t b = static_cast<uint16_t>(i);
+    const float mine = vllm::HostBf16ToF32(b);
+    const float theirs = vt::BF16ToF32(b);
+    if (std::bit_cast<uint32_t>(mine) != std::bit_cast<uint32_t>(theirs)) ++disagree;
+  }
+  CHECK(disagree == 0);
+  // And the widening is REAL rather than a constant: distinct patterns stay
+  // distinct, so a helper that returned 0.0f for everything cannot pass above by
+  // agreeing with a broken `vt::BF16ToF32`.
+  CHECK(vllm::HostBf16ToF32(0x3F80) == 1.0f);   // bf16 1.0
+  CHECK(vllm::HostBf16ToF32(0xBF80) == -1.0f);  // bf16 -1.0
+  CHECK(vllm::HostBf16ToF32(0x0000) == 0.0f);
+}
+
+TEST_CASE("dsv4 exl3 W1d: the carried tower is PRICED at each field's own width") {
+  // W1d (#2186) made the carried tower two dtypes: the FP8-sourced half is
+  // `HostBf16` at two bytes and the rest stays f32 at four. `DeepseekV4HostResidentBytes`
+  // is the number the load refusal prices the artifact with -- on the real
+  // DeepSeek-V4-Flash it decides between a 108.59 GiB refusal and a ~97.7 GiB load
+  // against 119.63 GiB physical -- so an element size hardcoded inside it would
+  // report the pre-W1d total and refuse a tower that now fits.
+  //
+  // Nothing else can see that. Every OTHER residency case in this file compares
+  // the function against itself: it takes `host_bytes` from this same call and
+  // brackets the threshold around it, which stays green for any self-consistent
+  // formula, right or wrong. So this case rebuilds the total from the LOADED
+  // struct, taking each field's width from its OWN `value_type` rather than
+  // naming a number. Hardcode `sizeof(float)` back into the accounting and the
+  // two totals part company here.
+  auto f = BuildFixture();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  auto B = [](const auto& v) {
+    using E = typename std::decay_t<decltype(v)>::value_type;
+    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(E));
+  };
+  const vllm::DeepseekV4HostWeights& h = w.host;
+  int64_t want = B(h.embed) + B(h.lm_head) + B(h.final_norm_weight) + B(h.hc_head_fn) +
+                 B(h.hc_head_base) + static_cast<int64_t>(sizeof(float));
+  int64_t bf16_elems = 0;
+  for (const vllm::DeepseekV4LayerHostWeights& L : h.layers) {
+    want += B(L.attn_norm_weight) + B(L.ffn_norm_weight) + B(L.hc_attn_fn) +
+            B(L.hc_attn_base) + B(L.hc_attn_scale) + B(L.hc_ffn_fn) + B(L.hc_ffn_base) +
+            B(L.hc_ffn_scale) + B(L.wq_a) + B(L.q_norm_weight) + B(L.wq_b) + B(L.wkv) +
+            B(L.kv_norm_weight) + B(L.attn_sink) + B(L.wo_a) + B(L.wo_b) + B(L.idx_wq) +
+            B(L.idx_wk) + B(L.idx_wproj) + B(L.comp_wgate) + B(L.comp_ape) +
+            B(L.comp_norm_weight) + B(L.gate_weight) + B(L.gate_bias) + B(L.tid2eid) +
+            B(L.shared_w1) + B(L.shared_w3) + B(L.shared_w2) + B(L.exp_w1) + B(L.exp_w3) +
+            B(L.exp_w2);
+    bf16_elems += static_cast<int64_t>(L.wq_a.size() + L.wq_b.size() + L.wkv.size() +
+                                       L.wo_a.size() + L.wo_b.size() + L.idx_wq.size() +
+                                       L.shared_w1.size() + L.shared_w2.size() +
+                                       L.shared_w3.size());
+  }
+  CHECK(vllm::DeepseekV4HostResidentBytes(w) == want);
+
+  // THE PRECONDITION OF THE CASE ABOVE. If the fixture happened to carry no
+  // FP8-sourced elements, the equality would hold for a hardcoded `sizeof(float)`
+  // too and this file would gate nothing. Assert that the discriminating
+  // population is non-empty, and that it is priced at TWO bytes -- the f32
+  // counterfactual is a different number, and it is the one that refuses.
+  REQUIRE(bf16_elems > 0);
+  // What that population is worth, reported rather than asserted: the saving is a
+  // property of the real checkpoint's dimensions, not of this fixture's, so a
+  // number pinned here would gate the fixture instead of the change. The claim
+  // that 26.64 GiB becomes ~15.7 GiB belongs to the device gate on the real
+  // artifact (#2186), which is the only place it can be measured.
+  MESSAGE("W1d: " << bf16_elems << " FP8-sourced elements held at 2 B, saving "
+                  << 2 * bf16_elems << " B against f32 on this fixture");
 }
 
 TEST_CASE("dsv4 exl3 W1c: the carried tower is read from MISALIGNED payloads") {
@@ -840,4 +944,129 @@ TEST_CASE("dsv4 exl3: unrepresentable inputs REFUSE BY NAME") {
     CHECK(Mentions(msg, "IN-split"));
     CHECK(Mentions(msg, "svh"));
   }
+}
+
+TEST_CASE("dsv4 exl3 R1: the MTP tail is CLASSIFIED by the production load (#1314)") {
+  // REACHABILITY, not arithmetic. `test_deepseek_v4_mtp_inventory` states the
+  // real artifact's shapes and exercises `ClassifyDeepseekV4MtpTail` directly;
+  // this case proves the production loader actually CALLS it, by going through
+  // `LoadDeepseekV4ForCausalLMWeights` and reading the result off the weights.
+  //
+  // The distinction is the point. Before #1314 the loader met 3985 draft-head
+  // tensors on every load of the real checkpoint and dropped them while counting
+  // only how many there were, and `deepseek-v4-mtp.md` §4 recorded the MTP gate
+  // as weight-BLOCKED for a week as a result.
+  FixtureOptions opt;
+  opt.layers = 1;
+  opt.mtp_heads = 3;  // the measured artifact carries three, not the config's one
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+
+  // Still SKIPPED, exactly as vLLM skips it (nvidia/model.py:1474) -- classifying
+  // is not loading, and this arm must not start consuming the tail by accident.
+  // 6 tensors x 3 heads. The base fixture's two plain `mtp.0.*` stand down when a
+  // real tail is requested, because they use the same names.
+  CHECK(w.exl3.skipped_mtp_tensors == 18);
+
+  CHECK(w.exl3.mtp.refusal.empty());
+  CHECK(w.exl3.mtp.num_heads == 3);
+  CHECK(w.exl3.mtp.plain == 6);      // (attn_norm + attn_sink) x 3
+  CHECK(w.exl3.mtp.fp8_block == 3);  // wkv, per head
+  CHECK(w.exl3.mtp.mxfp4 == 3);      // one routed expert, per head
+}
+
+TEST_CASE("dsv4 exl3 R1: a tail of PLAIN tensors classifies without refusing") {
+  // The base fixture's tail is two unquantized `mtp.0.*` tensors. A tail carrying
+  // no quantized weight at all must still classify cleanly: a refusal here would
+  // break every load that works today, which is why the classifier REPORTS rather
+  // than throws.
+  FixtureOptions opt;
+  opt.layers = 1;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  CHECK(w.exl3.skipped_mtp_tensors == 2);
+  CHECK(w.exl3.mtp.num_heads == 1);
+  CHECK(w.exl3.mtp.plain == 2);
+  CHECK(w.exl3.mtp.fp8_block == 0);
+  CHECK(w.exl3.mtp.mxfp4 == 0);
+  CHECK(w.exl3.mtp.refusal.empty());
+}
+
+TEST_CASE("W1: the compressor arm is REACHED from a production forward (#2286)") {
+  // The claim this earns: `CompressorLayerStep` is not a function that merely
+  // works. `test_deepseek_v4_gguf_load` records why the GGUF paged arm can never
+  // reach it -- `dsa_dense` makes every layer dense there -- so the proof has to
+  // come through the non-GGUF paged entry, which is what this drives.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};  // layer 1 carries the compressor
+  opt.real_dsa_geometry = false;   // the collapsed width the host forward indexes
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers;
+  const int64_t hd = w.params.head_dim;
+  const int64_t bs = 8, nb = 4;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+        {nb, bs, hd});
+  }
+
+  vllm::DeepseekV4CompressorState cs;
+  cs.Resize(nlayers);
+
+  int64_t kv_base = 0;
+  for (int step = 0; step < 2; ++step) {
+    const std::vector<int32_t> tok{static_cast<int32_t>(1 + step)};
+    const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
+    const auto lg = vllm::DeepseekV4ForwardExl3Paged(w, q, pages, kv_base, tok, pos,
+                                                     {0}, &cs);
+    REQUIRE(lg.size() == static_cast<size_t>(w.params.vocab_size));
+    for (const float v : lg) REQUIRE(std::isfinite(v));
+    kv_base += 1;
+  }
+
+  // THE REACHABILITY CLAIM: the compressor layer's state grew, one row per step,
+  // which only the composed arm produces. A dense fallback leaves it empty.
+  CHECK(cs.state_kv[1].size() == static_cast<size_t>(2 * hd));
+  CHECK(cs.state_score[1].size() == static_cast<size_t>(2 * hd));
+  // Layer 0 has no compressor, so its state must stay untouched.
+  CHECK(cs.state_kv[0].empty());
+  // Two tokens close no window at ratio 128.
+  CHECK(cs.comp_rows[1].empty());
+}
+
+TEST_CASE("W1: without compressor state the same layer REFUSES (#2286)") {
+  // The guard is what stops a compressor layer attending the raw prefix. Adding
+  // the arm must not make its absence silent.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};
+  opt.real_dsa_geometry = false;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers, hd = w.params.head_dim;
+  const int64_t bs = 8, nb = 4;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+        {nb, bs, hd});
+  }
+  const std::vector<int32_t> tok{1}, pos{0};
+  CHECK_THROWS(vllm::DeepseekV4ForwardExl3Paged(w, q, pages, 0, tok, pos, {0},
+                                                /*compressor=*/nullptr));
 }

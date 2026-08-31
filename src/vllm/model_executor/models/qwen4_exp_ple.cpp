@@ -52,6 +52,16 @@ void RefuseBadEos(const PleGeometry& geom) {
 // identity. Upstream promotes to float32 first; we accumulate in double, which
 // is a reference choice and not a divergence — the tolerance in the gate covers
 // the reduction-order difference against torch.
+//
+// THE OTHER `GroupedRmsNorm` IN THIS NAMESPACE HAS THE OPPOSITE POLARITY.
+// `vllm::qwen4_exp::GroupedRmsNorm` (`qwen4_exp_hc.cpp:52`, declared in
+// `qwen4_exp_hc.h`) applies `out * weight` on vLLM's FOLDED gamma, which callers
+// build with `HcNormWeightFromHf`; this one adds the 1 itself and takes the raw
+// HuggingFace parameter. This function keeps internal linkage and this file does
+// not include `qwen4_exp_hc.h`, so the two cannot be confused by the compiler --
+// only by a reader, and a reader confusing two gamma conventions is #2218
+// exactly. Whichever of these survives PLE's move onto a standalone grouped-norm
+// `vt::` op (`## Owed` item 1) should be the only one.
 void GroupedRmsNorm(const float* x, int64_t rows, int64_t width,
                     int64_t group_size, double eps, const float* weight,
                     float* out) {

@@ -31,7 +31,7 @@ engine prefixes and five matrix prefixes, and none of them owns a benchmarking
 instrument. The precedent is exact: `BENCH-ASSERT-CLOCK-STATE`, the row that owns
 this same helper for [#543](https://github.com/mudler/vllm.cpp/issues/543), also
 has no matrix row and appears only in
-[`../issue-index.md`](../issue-index.md), and `ENV-LEASE-CLOCK-PINNING` records
+[`../issue-index.md`](../completed/issue-index.md), and `ENV-LEASE-CLOCK-PINNING` records
 its own row as owed at claim. Adding a `BENCH` prefix is a checker semantic
 change and needs its own spec plus a red-before test, so this row does not make
 one in passing. The gap is listed under `## Owed`.

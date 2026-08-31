@@ -28723,12 +28723,13 @@ killed every measured leg mid-load on the previous attempt.
    0.774 GiB on disk in bf16 and 1.547 GiB resident, because `qwen3_vl.cpp`
    widens it to host f32 —
    [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which also affects
-   the Qwen3.6-27B path. #1359's Qwen3-VL half has since LANDED, so this leg
-   rerun should read about 0.774 GiB rather than 1.542, and that HALVING IS
-   CORRECT rather than a regression — the flag now frees the tower the
-   checkpoint ships instead of the tower plus our widening. The figure recorded
-   here stands as what the run at `41ab550b9` measured; `muse-glimmer-30b` still
-   widens, blocked on
+   the Qwen3.6-27B path. #1359's Qwen3-VL half has since LANDED, and the
+   2026-08-28 rerun recorded later in this file MEASURED the consequence:
+   826916864 B = 0.770 GiB, **0.499x this figure**. The HALVING IS CORRECT
+   rather than a regression — the flag now frees the tower the checkpoint ships
+   instead of the tower plus our widening. The figure recorded here stands
+   unaltered as what the run at `41ab550b9` measured, and is superseded for
+   current behaviour; `muse-glimmer-30b` still widens, blocked on
    [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
 2. **Load-time residency, not a served request.**
    `ForwardQwen3VLForConditionalGeneration` `VT_CHECK`s `input.mm.has_value()`,
@@ -29068,3 +29069,220 @@ nix develop .#rocm-shell --command bash -c '
 Differenced against the identical invocation at `--max-tokens 36`; both legs
 under the same `flock`, never interleaved with unrelated GPU work on this
 non-fleet box.
+
+## QWEN3.5-0.8B TT EAGER DECODE W7: the staging-write elimination is NULL — staging counters byte-identical before/after on both production workloads, wall unchanged; the premise inverts and the gate failure (a reservation arm serving stale bytes over live shadows) is the real find (#2282) (2026-08-30, `row/BACKEND-TENSTORRENT-QWEN35`, P150 `thalia`)
+
+**What was tested.** #2282's lever: make the staging residency precise
+enough that a decode step stages each slot's bytes once — or zero times
+when a device op overwrites the buffer outright. Landed on
+`row/BACKEND-TENSTORRENT-QWEN35` (`bd81430a9`, repair `d2fd05c6e`):
+the reservation state (`MarkScratchAcquired` arms `device_reserved`
+where base called `MarkHostWritten`), the `EnsureDevice2D` reservation
+arm, the eager full-slot memset fill, the device-resident D2D copy arm,
+and the rule that every content-establishing transition spends the
+reservation. Red-first implementer, fresh reviewer PASS, repair, scoped
+re-review PASS, full gate rerun on the immutable head; suite 51/51 ·
+5852, sacred pair 16/16 STRICT both legs.
+
+**The gate failure was a real latent defect, and it is the wave's
+finding.** The first ambient leg drifted at prompt[1] tok=0,
+deterministically, with the base green on the identical leg: the
+reservation arm served the slot's stale persistent buffer whenever
+`device_reserved` was set — including after a producer had committed a
+live shadow (pool block re-handed to a new tenant → a matmul commits
+`[8,256]` → the next bf16 stage at the block's earlier `[5,1024]`
+geometry receives the PREVIOUS tenant's bytes). Wrong tokens on the
+DEFAULT decode path, reachable only through the W7 change. Fix: every
+content-establishing transition spends the reservation and the arm
+refuses when `device_current` is set; the new suite case pins the joint
+invariant (single-layer mutations pass by design, joint removal red).
+
+**Measurement: a null, with the counter identity as the mechanism.**
+Ambient default legs, one `$HOME/gpu.lock` hold per series, interleaved
+legs, symmetric `VT_TT_STAGE_DUMP` atexit probe (temporary, reverted
+before this record; env-guarded, off by default). vllm-cli 3-token: the
+arms never fire (avoided 0/0/0 in every leg), bulk=277 pwrite=169
+palloc=139 identical before/after, wall 18.844 s vs 18.946 s mean
+(−0.54%, noise). E2E ambient 16-prompt, 8640 GDN steps, 2 interleaved
+legs per arm: AFTER bulk=10205 pwrite=989 palloc=173 pbytes=1459288064
+avoided 0/0/0 — BEFORE the same four counters to the byte in all four
+legs; wall 1385.527 s vs 1385.927 s mean (−0.03%); per-step staging
+writes 989/8640 = 0.114 in BOTH arms. Evidence log:
+[`../docs/bench-evidence/tt-qwen35-staging-w7-20260830.log`](../docs/bench-evidence/tt-qwen35-staging-w7-20260830.log).
+
+**Attribution shift — the issue's own contract for a null.** The
+residency state does NOT manufacture the staging writes: in the base
+the pool-acquire marks the slot device-stale, but a content op commits
+a fresh shadow before any restage can fire — the same commit that
+spends the W7 reservation — so both worlds restage identically, and the
+arm's serve (`device_reserved && !device_current`) is reached by no
+production interleaving. The W6-probe restages (7-8/step on vllm-cli)
+are the causally required ones W6 already identified: each is produced
+by a host round-trip between writes. The staging-write-elimination lane
+is closed with evidence; the tt-metal-side residual (multi-destination
+write, amortized per-op CQ tax) stays the upstream-shaped alternative.
+
+**Not established, and not claimed.** No ceiling on the wall — the W5
+residual attribution stands (per-CQ-operation tt-metal stack +
+threadpool spin). The serve arms are production-evaluated but never
+serve on the measured workloads, and the host-hybrid opt-out leg (LEG
+A) was not dump-probed; both are named owed in the row spec. The
+`VT_TT_STAGE_DUMP` counters remain in-tree as the detector.
+
+## ENG-MM-INPUT-PIPELINE L3 — the tower-skip RSS gate RERAN post-#1359 and `qwen3-vl` MET half 1 on both pairs at the halved threshold; the same run VERIFIES #1359's Qwen3-VL half at 99.7% of prediction (2026-08-28, `dgx:gpu0` under an `rc` lease, [#607](https://github.com/mudler/vllm.cpp/issues/607), [#1358](https://github.com/mudler/vllm.cpp/issues/1358), [#1359](https://github.com/mudler/vllm.cpp/issues/1359))
+
+The 2026-08-24 entry above carried a prediction: that fixing #1359 would halve
+the published saving, and that the fall would be correct rather than a
+regression. This run converts that prediction into a measurement. It is the
+same harness, the same procedure and the same checkpoint on a different host,
+four days later, with #1359's Qwen3-VL half landed in between.
+
+**Recipe.** `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at `main`
+`525d2b9911d8762fc002b2d7ea01991b383a9e96`. Worker `rc-worker-4b8lj`,
+`Linux 6.17.0-1029-nvidia aarch64`, 119 GB RAM (100 available), load
+1.49 / 0.98 / 0.42 at start — a markedly quieter box than the 2026-08-24 run's
+5.16 / 4.48 / 4.05, which is one reason the control arm below matters. Both arms
+built `Release`, `-DVLLM_CPP_BUILD_EXAMPLES=ON`, one build directory per arm,
+live ninja target query green on both, `VLLM_CPP_CUDA=OFF`, servers run
+`--device cpu`. Checkpoint staged off the NAS and **copied to worker-local
+`/tmp/tower-skip-ckpt`** before any leg — 29 files, 8887294190 B, verified by
+relative path and byte size on both sides. That manifest is byte-identical to
+the 2026-08-24 run's, which recorded the artifact as `Qwen/Qwen3-VL-4B-Instruct`
+@ `ebb281ec70b05090aa6165b016eac8ec08e71b17`; this run's own log does not
+restate the revision, so the identity rests on file count and byte total
+agreeing rather than on a re-read hash, and it is stated that way rather than
+asserted as a pin.
+
+**Result.**
+
+| pair | default | `--language-model-only` | saving |
+|---|---:|---:|---:|
+| 1 (binary A then B) | 9381281792 B | 8554364928 B | 826916864 B = 0.770 GiB |
+| 2 (SWAPPED, B then A) | 9380958208 B | 8554381312 B | 826576896 B = 0.770 GiB |
+
+Threshold **747625881 B**, 90% of the 830695424 B tower the checkpoint ships in
+bf16, declared in `.agents/specs/multimodal-track.md` §1.5 L3. **MET on both
+pairs.** The saving is 99.5% of that tower.
+
+**The threshold halved with the tower, and that is not a renegotiation.** The
+2026-08-24 run was gated at 1495251763 B because the resident tower was then
+`2 x 830695424` — our own widening. #1359 removed the widening, so
+`TOWER_RESIDENT_BYTES` became `TOWER_ONDISK_BYTES` and the 90% floor derived
+from it fell with it. The authority for moving it is
+`.agents/specs/vision-tower-dtype-polarity.md` §6.2, written before any
+post-fix number existed. **Do not read 1495251763 B forward onto this run**: it
+would fail a correct change.
+
+### What this run establishes about #1359, and the control that makes it sound
+
+`.agents/specs/vision-tower-dtype-polarity.md` §6.1 declared a two-half gate for
+#1359 itself, distinct from L3's two halves. Both of #1359's halves are MET.
+
+| Half | Arm | Pre-fix (2026-08-24) | Post-fix (2026-08-28) | Delta | Threshold | Result |
+|---|---|---:|---:|---:|---:|---|
+| 1 | default | 10209501184 B | 9381281792 B | −828219392 B (0.771 GiB) | `>=` 747625881 B | MET, 1.108x the floor |
+| 2 | `--language-model-only` | 8553709568 B | 8554364928 B | +655360 B (+0.0077%) | within 2% | MET, 260x inside the band |
+
+Half 1's recovery is **99.7% of the 830695424 B predicted from the checkpoint's
+own safetensors headers**. The prediction was near-exact, not approximately
+right.
+
+**Half 2 is the half that makes the axis mean anything, and it is why this entry
+does not just subtract two numbers.** The two runs are on DIFFERENT HOSTS. A raw
+default-arm difference across that gap confounds the fix with the host, and the
+2026-08-28 box was also far less loaded. The `--language-model-only` arm is the
+control: it loads no tower, so #1359 cannot reach it, and it should not move.
+It moved 0.0077%. Both arms crossed the same host change together — the
+tower-bearing arm fell 8.11% while the tower-free arm moved 0.0077% — so a host
+effect large enough to explain the first would have shown in the second. It did
+not.
+
+**The deviation, stated rather than absorbed.** §6.1 declares half 1 "on the
+same host", and the spec's `## Now` asked for it at the fix commit and at its
+parent. Neither held: `41ab550b9` is not `525d2b991`'s parent, and `thor` is not
+`dgx`. The axis is recorded MET rather than VOID because the margins are not
+close — half 1 clears its floor by 80593511 B, half 2 sits 260x inside its band
+— and because the control arm is a same-pair measurement that travelled through
+the identical host change. A same-host pre/post pair would still be strictly
+better evidence, and it is listed under `## Owed` in the polarity spec.
+
+**The halving, now measured.** 1655791616 B → 826916864 B = **0.499x**. Nine
+prose surfaces carried this as an expectation with a "correct rather than a
+regression" caveat attached; they now carry it as a measurement with the same
+framing.
+
+**The estimator.** Mean 826746880 B. Spread `|pair 1 - pair 2|` = 339968 B,
+0.041% of the saving, against a leg-to-leg `|warmup - default|` of 24576 B on
+the same binary and the same arm. Unlike 2026-08-24, the spread here is LARGER
+than the single repeat, so it is an upper bound on any binary-shaped bias `d`
+rather than a demonstration that none is visible. At 0.041% of the saving it
+changes no conclusion above. The two binaries again came out sha256-identical,
+`fbc540431341a1aa452a6d0d9594412a5ef1cab4f79058ebdb995a790fc33da7`.
+
+**Topology, recorded on the first leg.** `timer pid 4865 -> server pid 4867
+comm='vllm-server'`, so the teardown signalled the server and not a wrapper —
+the [#1844](https://github.com/mudler/vllm.cpp/issues/1844) failure did not
+recur.
+
+**The arms did differ, and the server logs are the receipt.** Both
+`--language-model-only` legs print
+`server: multimodal towers NOT loaded (every modality they serve is at limit 0): vision_tower`
+and `multimodal limit image=0`; both default legs print neither and report
+`image=1`. Without that line the two arms could have been the same binary doing
+the same work, and the byte difference would have needed another explanation.
+
+**Caveats, unchanged from 2026-08-24 and not optional when the number is
+quoted.**
+
+1. **Load-time residency, not a served request.**
+   `ForwardQwen3VLForConditionalGeneration` `VT_CHECK`s `input.mm.has_value()`,
+   so the `qwen3-vl` arms cannot run a completion and stop at `/health`. That is
+   after `LoadedEngine::FromModelDir` returns, so the tower's bytes are inside
+   the window; steady-state serving is not.
+2. **Only HALF 1 of the L3 gate is asserted.** Half 2 — the default arm within
+   2% of the pre-L3 `edbc47ce0` binary — is a separate run and was not taken. It
+   stays owed. Note this is L3's half 2 and is a different obligation from
+   #1359's §6.1 half 2, which this run DID satisfy.
+3. **One model's tower, not a general saving.** How much a skip frees is how big
+   that model's tower is.
+
+**What this is NOT.** Not a VRAM figure: the build is CPU-only and every byte
+above is host RAM. Not a throughput or latency figure: no such axis was
+measured, and the `qwen3-vl` vehicle cannot produce one. Not a claim about any
+model other than Qwen3-VL-4B-Instruct. Not a closure of #1359.
+
+**#1359 does NOT close on this run, and the remainder is real.** Two parts are
+outstanding:
+
+- [#2166](https://github.com/mudler/vllm.cpp/issues/2166) — Muse Glimmer, where
+  the larger saving is (3.580 GiB → 7.161 GiB today). Blocked, and the block is
+  structural rather than scheduling: `MuseGlimmerVisionConfig::compute_dtype`'s
+  `kF32` arm computes on stored weight values, and the ruling that widening back
+  is bit-identical rests on the values having originated in bf16 — true of the
+  loader reading an all-BF16 checkpoint, false of `test_muse_glimmer_vision`,
+  whose weights are a synthetic f32 LCG built as `torch.float32` that never
+  rounds through bf16. Regenerating that golden inside the change it gates would
+  be circular, so the fixture has to move first. Separately it needs ~56 GB of
+  worker-local disk for its RSS leg.
+- [#2173](https://github.com/mudler/vllm.cpp/issues/2173) — the Gemma-4 vision
+  tower this row narrowed is UNREACHED and landed that way. There is no
+  production call site, so it is a storage-dtype correction to a class rather
+  than to a capability, and no RSS figure can exist for it until it is wired.
+
+**Still owed on the L3 axis.** `muse-glimmer-30b`, whose own threshold is 90% of
+7.161 GiB and is unchanged by any of this, because that kind still widens. Also
+owed: L3's half 2 above, §6.3's latency band on either kind, and a GPU-device
+arm.
+
+**Raw artifacts.** The run directory `/mnt/nas_share/rc/ckpt/rss-out/` is
+overwritten by the next run, so the report and the legs it reads are copied into
+the repository: `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828.log`
+(the harness report verbatim) and
+`docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828.legs.log` (five
+`/usr/bin/time -v` records, four server logs, the cmake configure). The
+2026-08-24 pair is kept beside them, unaltered, as the record of the pre-fix
+binary. Not copied: the two 51349-byte ninja build logs, which differ only on
+the entering-directory line and on compile order and both end
+`[515/515] Linking CXX executable examples/vllm-server` — the identical binary
+sha256 is the stronger statement — and `cmake-b.log`, which diffs against
+`cmake-a.log` on three lines only, two timings and the build directory name.

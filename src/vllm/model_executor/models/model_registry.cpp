@@ -396,6 +396,40 @@ std::string_view MultiKvCacheIndex::first_name() const {
   return layer_names->front();
 }
 
+// MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3). A group carries a table only when the
+// runner gathered one for it THIS step; an empty row is a group whose table was
+// never gathered, which is the state this wave exists to remove.
+int MultiKvCacheIndex::num_published_groups() const {
+  return group_block_tables == nullptr
+             ? 0
+             : static_cast<int>(group_block_tables->size());
+}
+
+int MultiKvCacheIndex::num_group_block_tables() const {
+  if (group_block_tables == nullptr) return 0;
+  int n = 0;
+  for (const std::vector<int32_t>& bt : *group_block_tables)
+    if (!bt.empty()) ++n;
+  return n;
+}
+
+const std::vector<int32_t>* MultiKvCacheIndex::BlockTableForGroup(
+    int group_id, int* num_cols) const {
+  if (num_cols != nullptr) *num_cols = 0;
+  if (group_block_tables == nullptr || group_block_table_cols == nullptr)
+    return nullptr;
+  if (group_id < 0 ||
+      static_cast<size_t>(group_id) >= group_block_tables->size() ||
+      static_cast<size_t>(group_id) >= group_block_table_cols->size())
+    return nullptr;
+  const std::vector<int32_t>& bt =
+      (*group_block_tables)[static_cast<size_t>(group_id)];
+  if (bt.empty()) return nullptr;
+  if (num_cols != nullptr)
+    *num_cols = (*group_block_table_cols)[static_cast<size_t>(group_id)];
+  return &bt;
+}
+
 int64_t MultiKvCacheIndex::Find(std::string_view layer_name) const {
   if (layer_names == nullptr) return -1;
   for (size_t i = 0; i < layer_names->size(); ++i) {
@@ -404,39 +438,208 @@ int64_t MultiKvCacheIndex::Find(std::string_view layer_name) const {
   return -1;
 }
 
+// ENG-MULTIKV-BYNAME. The counts and the payload locator. Counted rather than
+// stored: a stored count is a second derivation of the vectors it describes, and
+// a second derivation is the thing that can disagree with them.
+int MultiKvCacheIndex::num_paged() const {
+  if (payload_kinds == nullptr) return 0;
+  int n = 0;
+  for (uint8_t k : *payload_kinds)
+    if (static_cast<KvCachePayload>(k) == KvCachePayload::kPaged) ++n;
+  return n;
+}
+
+int MultiKvCacheIndex::num_recurrent() const {
+  if (payload_kinds == nullptr) return 0;
+  int n = 0;
+  for (uint8_t k : *payload_kinds)
+    if (static_cast<KvCachePayload>(k) == KvCachePayload::kRecurrent) ++n;
+  return n;
+}
+
+bool MultiKvCacheIndex::PayloadAt(int64_t index, KvCachePayload* kind,
+                                  int32_t* slot) const {
+  // Written FIRST and in every path, so the false answer cannot leave a caller
+  // holding a slot from a previous call.
+  if (kind != nullptr) *kind = KvCachePayload::kPaged;
+  if (slot != nullptr) *slot = -1;
+  if (payload_kinds == nullptr || payload_slots == nullptr) return false;
+  if (index < 0 || static_cast<size_t>(index) >= payload_kinds->size() ||
+      static_cast<size_t>(index) >= payload_slots->size())
+    return false;
+  if (kind != nullptr)
+    *kind = static_cast<KvCachePayload>(
+        (*payload_kinds)[static_cast<size_t>(index)]);
+  if (slot != nullptr) *slot = (*payload_slots)[static_cast<size_t>(index)];
+  return true;
+}
+
+bool MultiKvCacheIndex::Resolve(std::string_view layer_name,
+                                KvCachePayload* kind, int32_t* slot) const {
+  return PayloadAt(Find(layer_name), kind, slot);
+}
+
+// KV-DSV4-MULTICACHE W5 (#2323). Trivial by construction, and that is the point:
+// the rule it encodes ("a name-keyed set that reaches a model which has not
+// claimed it is refused") is the one a future edit is most likely to invert or
+// widen, and as a free function it is pinned by a test that needs no model.
+bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv) {
+  return mk != nullptr && !consumes_multi_kv;
+}
+
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                                      const ModelForwardInput& input) {
   // KV-DSV4-MULTICACHE W3 (#2068): a MULTI-CACHE topology reached the shared
-  // decode seam, and no registered forward consumes one.
+  // decode seam, and the forward registered for this architecture does not
+  // consume one. ONE now does — see `consumes_multi_kv` below — so the sentence
+  // that read "no registered forward consumes one" is the one thing in this
+  // comment that W5j had to change rather than extend.
   //
   // W3 makes the runner allocate every published cache — DeepSeek-V4-Flash's 167
   // across 43 layers, in seven groups at four different page sizes — and hand
-  // them here keyed by the name each was published under. What no forward yet
-  // knows is what to DO with a cache set keyed that way:
-  // `DeepseekV4Model::Forward` and `::ForwardDevice` still open with
-  // `(void)attn_kv;` and recompute the whole prefix per token
-  // (`src/vllm/model_executor/models/deepseek_v4.cpp:2886-2887`, `:2959-2960`).
+  // them here keyed by the name each was published under. What to DO with a cache
+  // set keyed that way is known by exactly ONE of the three architectures that
+  // reach this guard (#2353, surveyed at `85f65b0e8`; the count was ZERO until
+  // W5j). Each of the three, in its own way:
+  //
+  //   `DeepseekV4Model::Forward` and `::ForwardDevice` open with
+  //   `(void)attn_meta; (void)attn_kv;`
+  //   (`src/vllm/model_executor/models/deepseek_v4.cpp:3033-3034`, `:3105-3106`
+  //   — the anchors this comment carried, `:2886-2887` and `:2959-2960`, were
+  //   the values at the SHA W3 was written on and had moved by 147 lines).
+  //
+  //   `ForwardGlm5NextForConditionalGeneration` opens with
+  //   `(void)input.attn_kv; (void)input.gdn_state;`
+  //   (`glm5_next_registry.cpp:156-157`) and re-runs the whole prefix each step,
+  //   which its own comment says in those words.
+  //
+  //   `ForwardQwen4ExpForConditionalGeneration` IS THE FIRST CONSUMER, and this
+  //   bullet used to be the third refusal in the list. W5j (#2031) makes it
+  //   resolve every cache through `MultiKvCacheIndex::Resolve` — group 0's paged
+  //   K/V, group 2's indexer side cache and group 1's recurrent states, each by
+  //   the name `MakeQwen4ExpKVCache` published it under — and read group 2's own
+  //   gathered block table through `BlockTableForGroup`. It sets
+  //   `consumes_multi_kv` and is therefore the one architecture this guard lets
+  //   past. It still serves a SINGLE-SHOT prefill of one sequence and says so
+  //   itself, BY NAME, at its own boundary.
   //
   // Letting the step run would discard a correctly allocated topology in silence
   // and report a decode rate for a full-recompute path, which is the
   // wrong-answer-not-a-crash shape this row exists to remove. So it refuses, and
   // it refuses by READING the channel rather than testing its nullness: the
-  // count, the distinct group count and the first published name all come out of
-  // the payload, so a channel that arrived empty says something different.
+  // count, the paged/recurrent split, the distinct group count and the first
+  // published name all come out of the payload, so a channel that arrived empty
+  // says something different.
   //
-  // W5 replaces this with the DSA-sparse forward that reads the caches.
-  if (input.multi_kv != nullptr) {
+  // W5 (#2323) turned this from a BLANKET refusal into a DISPATCH. It is gated on
+  // `ModelFactory::consumes_multi_kv`, so a model that has wired its forward to
+  // read a name-keyed set proceeds, and every model that has not still refuses
+  // here by name. Deleting the refusal outright was the one option W5 rejected:
+  // it would restore this exact silent discard for every FUTURE model that
+  // publishes a topology it cannot consume.
+  //
+  // The predicate lives in `MultiKvRefusalApplies` rather than inline here, so
+  // the rule the refusal applies and the rule a test drives are the SAME
+  // expression. An inline copy is a second derivation, and a second derivation
+  // is the thing that can disagree with the one the test pins.
+  //
+  // ENG-MULTIKV-BYNAME added the paged/recurrent split to this message, because
+  // the total stopped meaning "attention caches" the moment the channel started
+  // carrying a recurrent group's layers. #2343 read the pre-split wording as a
+  // contradiction — `22 KV cache(s) from 2 published group(s)` beside
+  // `block tables gathered for 3 of 3` — which is what a total that silently
+  // omitted 34 recurrent states looked like from the outside.
+  //
+  // WHAT REPLACES THIS IS NOT ONE WAVE, which is the correction #2353 carries.
+  // Lifting the guard is a per-architecture capability the MODEL declares — the
+  // polarity `ModelFactory`'s existing `stage_on_load` and offload bits already
+  // use — and each of the three rows above owns its own arm of it. KV-DSV4-
+  // MULTICACHE W5 is scoped as the DeepSeek-V4 path alone and never spoke for
+  // the other two.
+  //
+  // THAT BIT EXISTS NOW, AND IT LANDED WITH ITS FIRST CONSUMER (W5j, #2031).
+  // `ModelFactory::consumes_multi_kv` is the declaration and
+  // `ForwardQwen4ExpForConditionalGeneration` is the arm that sets it, which is
+  // the condition #2353 named for lifting this at all: "a capability nothing can
+  // turn on has no arm a test could drive". The guard did not go away — it
+  // NARROWED, from "any multi-cache topology" to "any multi-cache topology
+  // reaching a forward that does not ask by name", which is still DeepSeek-V4
+  // and GLM-5-Next and still every model ported after them until one of them
+  // wires the channel.
+  //
+  // LETTING A DECLARED CONSUMER PAST IS NOT LETTING ITS INPUT PAST. The channel
+  // can be malformed in ways only the model can see — a layer name nothing was
+  // published under, a name that resolves to the wrong payload kind, a group
+  // whose block table was never gathered — and the consuming forward refuses
+  // each of those by name at its own boundary. This guard cannot: it does not
+  // know which names the model expects.
+  if (MultiKvRefusalApplies(input.multi_kv,
+                            model.registration().factory->consumes_multi_kv)) {
     const MultiKvCacheIndex& mk = *input.multi_kv;
+    // #2353: NAME THE ARRIVING ARCHITECTURE, and compute it rather than
+    // enumerate. When W3 wrote this string DeepSeek-V4 was the only thing that
+    // could publish a multi-cache topology, so "row KV-DSV4-MULTICACHE W5 owns
+    // the consuming forward" was true by construction. THREE architectures
+    // reach it now and the clause is false for two of them:
+    //
+    //   DeepseekV4ForCausalLM            7 groups, all attention. W5 does own it.
+    //   Qwen4ExpForConditionalGeneration 3 groups. Owned by MODEL-MM-QWEN4-EXP.
+    //                                    `Qwen4ExpTextModel::Forward` EXISTS on
+    //                                    this head, but it prefills once from
+    //                                    the two POSITIONAL channels and reads
+    //                                    `multi_kv` nowhere, so it consumes
+    //                                    nothing this guard holds.
+    //   Glm5NextForConditionalGeneration 3 groups. Owned by that model's own row.
+    //
+    // KV-DSV4-MULTICACHE W5 owns ONE of those three, under either of the two
+    // scopings it has carried this week. At `85f65b0e8`, the base this was
+    // written on, `## Work breakdown` gave it the DeepSeek-V4 DSA-sparse path
+    // that removes `deepseek_v4.cpp`'s `(void)attn_kv`. `44d795d96` (#2352)
+    // then NARROWED it to the plumbing — "the caches REACHING the model and
+    // each layer routing to its own", plus lifting this guard — and moved the
+    // DSA algorithm to `MODEL-DSV4-DSA-COMPOSE`. Both scopings are DeepSeek-V4's
+    // model half, so neither reaches `Qwen4ExpTextModel::Forward` or
+    // `ForwardGlm5NextForConditionalGeneration`, which is the whole point of
+    // naming the architecture instead of a row.
+    //
+    // THE THREE ARE NOT ENUMERATED IN THE STRING, DELIBERATELY. A hard-coded
+    // list of rows in a refusal is precisely the construct #2288 has already
+    // driven stale six times over on the sibling row, in both polarities. The
+    // registered architecture is read at run time from the handle this function
+    // already holds, so it cannot rot, and it is the one value that routes the
+    // reader to the row that owes the work.
+    //
+    // WHAT MADE THE OMISSION EXPENSIVE, measured rather than supposed. #2343
+    // drove GLM-5.3-Flash on `dgx:gpu0` on 2026-08-30 and stopped here on the
+    // first step. Its index row, `docs/FEATURES.md`, `docs/USAGE.md` and
+    // `.agents/claims/CLAIM-GLM53-FLASH-W5B2B.md` each then had to say in prose
+    // what this string should have said: that the guard is the ENGINE's, that
+    // it fires before dispatch to the model's own hook, and that the consuming
+    // forward is owed by the model's row.
+    const std::string arch(model.registration().architecture);
     VT_CHECK(false,
-             std::string("model forward: ") + std::to_string(mk.size()) +
-                 " KV cache(s) from " + std::to_string(mk.num_groups()) +
-                 " published group(s) reached this forward, first '" +
+             std::string("model forward: architecture '") + arch +
+                 "' reached this forward with " + std::to_string(mk.size()) +
+                 " KV cache(s) (" + std::to_string(mk.num_paged()) +
+                 " paged, " + std::to_string(mk.num_recurrent()) +
+                 " recurrent) from " + std::to_string(mk.num_groups()) +
+                 " published group(s), first '" +
                  std::string(mk.first_name()) +
-                 "', and no registered forward consumes a cache set keyed by "
-                 "layer name. Refusing rather than discarding an allocated KV "
-                 "topology in silence "
-                 "(row KV-DSV4-MULTICACHE W5 owns the consuming forward; "
-                 "#1925, #2068)");
+                 "', with block tables gathered for " +
+                 std::to_string(mk.num_group_block_tables()) + " of " +
+                 std::to_string(mk.num_published_groups()) +
+                 " published group(s), and the forward registered for '" +
+                 arch +
+                 "' does not consume a cache set keyed by layer name — its "
+                 "ModelFactory leaves `consumes_multi_kv` false. Refusing "
+                 "rather than discarding an allocated KV topology in silence. "
+                 "THIS GUARD IS THE ENGINE'S (KV-DSV4-MULTICACHE W3, #2068) and "
+                 "it fires for ANY architecture that publishes a multi-cache "
+                 "topology, BEFORE dispatch to that architecture's own forward "
+                 "hook, so the consuming forward is owed by the row that ports '" +
+                 arch +
+                 "' and not by the engine row that owns this guard. "
+                 "#1925, #2068, #2353");
   }
   return model.registration().factory->forward(model, input);
 }

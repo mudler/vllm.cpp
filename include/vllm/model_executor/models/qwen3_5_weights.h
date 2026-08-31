@@ -1318,4 +1318,61 @@ multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
 // route to the text-only path deliberately instead of discovering the refusal.
 bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 
+// Does a weight of `bytes` still fit as a TRUE DEVICE COPY, leaving the box
+// enough headroom to serve?
+//
+// WHY THIS EXISTS, MEASURED. The retag above costs real decode throughput on
+// GB10: interleaved A/B on `dgx:gpu0`, one boot, Qwen3.8-27B bf16 + DFlash2
+// k=7 at concurrency 1, alias ON vs alias OFF, four warm repeats each ->
+// 11.677 / 11.693 tok/s aliased against 14.288 / 14.337 staged, **+22.5%**,
+// the two arms agreeing to 0.14% and 0.34%. That is the same mechanism
+// `laguna.cpp:130-132` records and the same 20-30% band that took Laguna and
+// DeepSeek-V4 from behind their references to ahead of them.
+//
+// WHY IT IS NOT A BLANKET DEFAULT FLIP. This file also serves
+// `Qwen3.8-2.4T-A95B`, and #1299 measured that model exhausting a 119.631 GiB
+// box precisely because the CUDA arm paid for its weights TWICE — host bytes
+// plus a device copy. Staging is the right default for a model that fits and
+// is fatal for one that does not, so the question has to be asked of the BOX
+// rather than answered once for the file.
+//
+// The rule is deliberately conservative: stage only while the device still has
+// `VT_QWEN35_STAGE_MIN_FREE_FRAC` of its total memory free (default 0.55).
+// A 50 GiB model on a 119.6 GiB box starts at ~94% free and stages; the 2.4T
+// model is already past the floor when its first dense weight arrives, so it
+// never stages and keeps exactly the behaviour #1299 shipped.
+// Does a model of `model_weight_bytes` leave room for a SECOND, device-resident
+// copy of itself on a device of `device_total_bytes`, keeping `reserve_bytes`
+// for the KV cache and activations?
+//
+// PURE, so it is gateable without a device.
+//
+// THE FACTOR OF TWO IS THE WHOLE POINT. On a platform that does not release the
+// host mirror after upload -- which is every unified-memory part, and which is
+// what `ResidencyPolicy::release_host_weights_after_upload` records -- a staged
+// weight is ADDITIVE: the host bytes stay and the device copy joins them. That
+// second copy is exactly what made #1299's 2.4T checkpoint exhaust a 119.631 GiB
+// box, and it is exactly what buys +21.1% for a model that fits.
+bool StagingFitsModel(size_t model_weight_bytes, size_t device_total_bytes,
+                      size_t reserve_bytes);
+
+// Latch the decision for this process, ONCE, from two STABLE numbers. Called by
+// the safetensors loader, which is the only place that knows the model's total.
+//
+// WHY ONCE AND NOT PER WEIGHT. The first attempt at this asked
+// `Backend::DeviceMemoryInfo` per weight and compared LIVE FREE against a
+// fraction of total. Free falls as the host mirror loads, so the floor degraded
+// into "stage the first N GiB, then stop": measured 8.1% of an available 21.1%
+// on the committed gate. `platforms/interface.h:66-69` had already written the
+// rule -- the budget is "TOTAL rather than FREE, because `free` at load time
+// carries the page cache and whatever else the box is doing, which would make a
+// load-time verdict a function of contention."
+//
+// A model that never calls this keeps the retag, which is what every GGUF path
+// does today and is how #1299's checkpoint stays untouched.
+void SetSafetensorsWeightBudget(size_t model_weight_bytes, size_t device_total_bytes);
+
+// The latched answer. False until `SetSafetensorsWeightBudget` says otherwise.
+bool StageOwnedWeightsToDevice();
+
 }  // namespace vllm

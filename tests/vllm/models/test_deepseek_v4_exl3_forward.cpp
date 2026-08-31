@@ -468,7 +468,12 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.ape"));
   CHECK(dsv4_exl3_fixture::Mentions(msg, "compressor.wgate.weight"));
   CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
-  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.wq_b"));
+  // `indexer.wq_b` is NO LONGER among them. W3 (#2286) made the indexer's query
+  // come from the q-LoRA, which is upstream's own shape (`attention.py:721-726`,
+  // used at `:835`), so `[inh*ihd, q_lora_rank]` is now READ rather than refused.
+  // The other three still refuse, which is what keeps this a gate: the refusal
+  // narrowed by exactly one tensor rather than collapsing.
+  CHECK_FALSE(dsv4_exl3_fixture::Mentions(msg, "indexer.wq_b"));
   // Both counts, BOUND to the tensor that reported them. Asserting the numbers
   // on their own does not gate this: several coincide at these dimensions (see
   // `MismatchLine`), so a wrong count on one tensor is still found on another's
@@ -483,9 +488,7 @@ TEST_CASE("dsv4 exl3 #1970: the REAL DSA geometry LOADS and the FORWARD refuses 
   CHECK(dsv4_exl3_fixture::Mentions(
       msg, MismatchLine("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
                         ihd * H, 2 * ihd * H)));
-  CHECK(dsv4_exl3_fixture::Mentions(
-      msg, MismatchLine("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
-                        inh * ihd * H, inh * ihd * w.params.q_lora_rank)));
+  (void)inh;
 
   // The MISSING CAPABILITY, named — the AGENTS.md rule this case exists for.
   CHECK(dsv4_exl3_fixture::Mentions(msg, "coff"));

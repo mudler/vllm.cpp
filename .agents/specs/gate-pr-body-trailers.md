@@ -47,7 +47,7 @@ In scope:
 - The operator step, in `AGENTS.md` under `## Landing work` and `## Commands`,
   and in [`.agents/workflow.md`](../workflow.md) under `## Landing`.
 - The [#1298](https://github.com/mudler/vllm.cpp/issues/1298) row in
-  [`issue-index.md`](../issue-index.md), for a defect this row measured and does
+  [`issue-index.md`](../completed/issue-index.md), for a defect this row measured and does
   not fix. See `## Owed`.
 
 Out of scope, deliberately:

@@ -448,8 +448,16 @@ Stop and report, do not work around:
   should read `:318-476`. Owner: this row.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1,
   prompt adherence, stays OPEN and is not narrowed by this row.** It needs a
-  vision-language model scoring frames against the prompt, pinned as an oracle
-  with its own gateability measurement. This tree has none. Owner: this row.
+  vision-language model scoring frames against the prompt, with its own
+  gateability measurement. This tree runs none. **Ownership has MOVED** to row
+  `LTX25-PROMPT-ADHERENCE`, spec
+  [`ltx25-prompt-adherence.md`](ltx25-prompt-adherence.md), issue
+  [#2295](https://github.com/mudler/vllm.cpp/issues/2295), which investigated it
+  and found the scorer inside the PRIMARY oracle rather than outside the table:
+  vLLM at `5559679229` registers `CLIPEmbeddingModel` (`registry.py:251`). That
+  row ends in a `NEEDS_DECISION` — whether a scoring model is an oracle or an
+  instrument — and it implements nothing until that is answered. The sentence
+  above stays as this row wrote it, because it was true when this row landed.
 - The three REPORTED statistics of §5 stay reported. Each has a stated
   derivation that failed, not an absence of effort. Owner: this row.
 

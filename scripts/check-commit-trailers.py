@@ -8,7 +8,6 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_PROTOCOL_MARKER = "FOLLOWING_AGENTS_PROTOCOL"
@@ -376,60 +375,15 @@ def _is_ancestor(repo: Path, older: str, newer: str) -> bool:
 
 
 
-class LandedException(NamedTuple):
-    """One landed message, one exact error, and why it is excused."""
-
-    error: str
-    reason: str
-
-
-# EXCEPTIONS FOR MESSAGES THAT HAVE ALREADY LANDED. Visible debt, not success.
-#
-# A malformed message on `main` cannot be repaired: correcting it rewrites
-# `main`, which nobody may do. It also does not clear itself. The main lane
-# walks `LAST_GREEN..head` and `LAST_GREEN` advances only on a GREEN run, so a
-# range containing an unrepairable red is re-walked by every later push, by
-# every session, forever. `ci.yml:74` relies on exactly that property to make a
-# cancelled run lossless -- the same property makes this red permanent.
-#
-# Keyed on the FULL commit oid AND the EXACT rendered error string. A commit oid
-# covers its message, so an entry names one immutable byte string and cannot
-# grow to cover a message somebody writes later. A DIFFERENT error in the same
-# commit is a different string and is still reported; the SAME error in another
-# commit is another oid and is never consulted; and a message that has not
-# landed is validated by `validate_commit_message`, which does not consult this
-# at all -- so the `--message-file` gate on a pull request BODY, which is what
-# lands under `squash_merge_commit_message = PR_BODY`, can never be excused.
-#
-# `--cutover` was the obvious instrument and was measured before it was
-# rejected (#1262). It does not excuse the sha you name, because
-# `git merge-base --is-ancestor X X` succeeds and the cutover commit is checked
-# STRICTLY; excusing `281b4bc76c0e` needs its CHILD named instead, which then
-# drops all 2986 of that child's ancestors to the marker-only check, waiving
-# defects nobody has read. And a cutover is a value that can be MOVED to make
-# the next red disappear, which is the failure mode AGENTS.md
-# section "Changing the rules or a checker" exists to prevent.
-#
-# Every run that applies an entry PRINTS it, on a passing run as well as a
-# failing one. Growing this table is a reviewable edit that names a commit, an
-# error and a reason; `tests/scripts/test_check_commit_trailers.py` pins the
-# count, pins the key shape, and re-derives every entry against the real commit
-# so a dead or guessed entry is red.
-LANDED_MESSAGE_EXCEPTIONS: dict[str, LandedException] = {
-    "281b4bc76c0e635adbc7ed38317035b07c99864d": LandedException(
-        error=(
-            "[attribution] malformed Assisted-by value 'AGENT:claude-opus-5 CLI'"
-        ),
-        reason=(
-            "landed by the squash of #1257 (#1189 M4). All four branch commits "
-            "carried the corrected value; the PULL REQUEST BODY did not, and "
-            "`squash_merge_commit_message = PR_BODY` makes the body the landed "
-            "message. The guard that reads the body (ci.yml:626-635, #848) was "
-            "still `pending` at merge time because the runner pool was "
-            "saturated -- it did not fail, it never ran. #1262"
-        ),
-    ),
-}
+# NO LANDED-MESSAGE EXCEPTION REGISTRY. There was one, holding a single commit
+# (`281b4bc76c0e`, #1262), and it existed only because the PUSH lane re-read
+# LANDED history on `main` -- where the sole repair is rewriting `main`, which
+# AGENTS.md forbids, so a violation could never clear itself. Scoping the walk to
+# the pull-request lane (#2322) removes the need: no landed commit is read, so
+# nothing can require excusing. A dead exception list invites a live one, so it
+# goes with the reason it existed for. Attribution is now enforced ONCE, on the
+# pull request body, which is the exact byte string that lands under
+# `squash_merge_commit_message = PR_BODY` and is checked before it freezes.
 
 
 def validate_range(
@@ -438,13 +392,9 @@ def validate_range(
     head: str,
     *,
     cutover: str | None,
-    excused: list[str] | None = None,
 ) -> list[str]:
     """Validate an exact first-parent-independent ``BASE..HEAD`` commit set.
 
-    ``excused`` is an optional sink. Each applied ``LANDED_MESSAGE_EXCEPTIONS``
-    entry appends one line to it, so a caller can report the debt a green run
-    is carrying. Passing nothing keeps the verdict identical.
     """
 
     base_oid = _resolve_commit(repo, base)
@@ -463,6 +413,17 @@ def validate_range(
     commits_text = _git(repo, "rev-list", "--reverse", f"{base_oid}..{head_oid}")
     failures: list[str] = []
     for commit in (line for line in commits_text.splitlines() if line):
+        # A merge commit is git's message, not authored content, so it is not
+        # held to a contract about what an author must write. `ci.yml` has said
+        # so since it was written -- "Skip merge commits (>1 parent) -- they are
+        # not authored content" -- and then handed the SAME range to this walk,
+        # which did not (#2157). One job, two walks, one rule between them: a
+        # plain `git merge origin/main` on a row branch, the routine way to take
+        # main, reddened commit-protocol-tag on a message no contributor can edit
+        # without force-pushing. Keyed on PARENT COUNT and never on the message,
+        # so a hand-written commit that merely says "Merge" is still authored.
+        if len(_git(repo, "rev-list", "--parents", "-n1", commit).split()) > 2:
+            continue
         if cutover_oid is None:
             strict = True
         elif _is_ancestor(repo, cutover_oid, commit):
@@ -473,16 +434,7 @@ def validate_range(
             raise ValueError(f"commit {commit} is incomparable with cutover")
 
         message = _git(repo, "show", "-s", "--format=%B", commit) + "\n"
-        exception = LANDED_MESSAGE_EXCEPTIONS.get(commit)
         for error in validate_commit_message(message, strict=strict):
-            # Only the ONE error this commit is registered for. Everything else
-            # it carries is reported exactly as it would be without the entry.
-            if exception is not None and error == exception.error:
-                if excused is not None:
-                    excused.append(
-                        f"{commit[:12]}: {error}\n      reason: {exception.reason}"
-                    )
-                continue
             failures.append(f"{commit[:12]}: {error}")
     return failures
 
@@ -570,27 +522,15 @@ def main() -> int:
         print("OK: commit trailer contract")
         return 0
 
-    excused: list[str] = []
     try:
         failures = validate_range(
             ROOT,
             *args.revision_range,
             cutover=args.cutover,
-            excused=excused,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"commit trailer check FAILED: {exc}", file=sys.stderr)
         return 1
-    # Printed whatever the verdict is. An exception is visible DEBT, and a
-    # reader of a green lane has to be able to see what it is carrying.
-    if excused:
-        print(
-            f"{len(excused)} landed-message exception(s) applied. This is "
-            "DEBT, not success: the message is on `main` and cannot be "
-            "repaired, because that would rewrite `main`."
-        )
-        for note in excused:
-            print(f"    ~ {note}")
     if failures:
         print("commit trailer check FAILED:", file=sys.stderr)
         for failure in failures:

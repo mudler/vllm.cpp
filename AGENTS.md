@@ -66,25 +66,45 @@ spec and run `git log -S`. Do not derive the history again.
 
 **Do not start work without an open GitHub issue.** Before you claim a row or
 write code, make sure that an issue tracks the work. Open one if none exists.
-Link the issue in three places that must agree: the index in
-[`.agents/issue-index.md`](.agents/issue-index.md), the row's spec, and the pull
-request body.
+Link the issue in three places that must agree: the issue's own `Row:` line, the
+row's spec, and the pull request body.
 
-The index is append-only and carries `merge=union`, so two branches that each
-append a row merge without a conflict. Append a row at the end. Never edit a row
-and never delete one, because GitHub holds the open and closed state and an
-edited row is duplicated rather than merged.
+**GitHub is the index.** There is no index file. `gh issue list` is the intake
+surface, and the owning row lives in the issue body as its first line:
+
+```text
+Row: `BACKEND-ROCM`
+```
+
+Write a dash when no row owns it yet and a spec lists it under `## Owed`
+instead. `scripts/agent-issue-index.py --refresh` renders the tracker into an
+untracked snapshot so the record gates can run offline; nothing commits it, so
+no pull request writes it. A tracked index was a surface every pull request had
+to write, and 16 of 21 open pull requests conflicted on it (#2290, #883).
 
 A bug that you find during other work still needs an issue. Filing the issue
 does not defer the fix. File it, fix it in the same flow, reference it in the
 commit, and close it. The person who found the bug has the context to fix it.
 Traceability is the goal, not another round trip.
 
-**An issue you do not fix in the same flow has to say who owns it.** Every index
-row names an owning row ID, or names a spec that lists the issue under `##
-Owed`. `scripts/check-agent-record.py` counts the rows that do neither and
-refuses a count above the recorded mark. Filing without fixing is therefore a
-gate failure rather than a habit.
+**An issue you do not fix in the same flow has to say who owns it.** It names an
+owning row in its `Row:` line, or a spec lists it under `## Owed`.
+`scripts/check-agent-record.py` gates that for every issue a change references.
+Filing without fixing is therefore a gate failure rather than a habit. The gate
+is scoped to what a change cites, because a count over every open issue moves
+whenever anyone files one and could only ever fail `main` for reasons no commit
+caused.
+
+**An issue closes when the work lands.** The pull request that lands the fix
+closes it, and its body carries the closing keyword that does so. Do not leave a
+fixed issue open for a later sweep; the person who landed the fix is the last
+one who knows it is fixed.
+
+**An issue the tree falsifies closes with that evidence.** When the file,
+checker or behaviour an issue describes no longer exists, close it and say what
+falsified it. Do not re-spec it, and do not re-verify it a third time. Intake
+without an exit is how 701 open issues accumulated in 24 days, six of them
+already answered by the tree (#2298).
 
 This in-flow rule applies to small and clear fixes. Use the normal row, spec,
 and fresh-review path for a surprising fix. Use that path when a fix needs its
@@ -377,18 +397,31 @@ owning matrix row in the same change.
 
 For a concurrent edit to a keyed record, take the complete target-branch
 version. Apply the scoped edit again. Verify that unrelated keys remain
-byte-for-byte equal. Union-append only a genuinely append-only log. Never accept
-an automatic three-way merge of a keyed record.
+byte-for-byte equal. Never accept an automatic three-way merge of a keyed record.
 
 **Do not create a surface that every pull request must write.** If N concurrent
 pull requests edit file F, that file is a lock. A record surface can have only
 one of these shapes:
 
 - One file per row, read with a glob.
-- A genuinely append-only file that can union-merge.
 - A value that is derived at read time and is not stored.
 
 Rewrite every other record surface into one of these shapes.
+
+**An append-only file with `merge=union` is NOT one of them.** That shape was
+admissible here until 2026-08-29 and it never worked, because GitHub does not run
+`.gitattributes` merge drivers. The driver resolves the collision on your machine
+and the forge conflicts anyway, so the file reads as safe locally and is a lock
+in the only place that decides whether work can land. The retired
+`.agents/issue-index.md` (now in [`.agents/completed/`](.agents/completed/))
+was a correct implementation of that shape and still became the repository's
+dominant conflict source: 115 of 200 commits wrote it, and 16 of 21 open pull
+requests conflicted on it, four of them on that file alone (#883, #2290).
+
+A conflicted pull request is worse than a failing one. GitHub never schedules CI
+for it, so it carries zero check-runs and reads as unverified rather than red
+(#2248). Do not reach for `merge=union` to make a shared file safe. Derive it, or
+give it one file per writer.
 
 Two rules follow. **Limit an entry, not a shared file.** A shared-file budget
 forces each addition to remove another entry. Merging two such edits cleanly is worse than
@@ -509,8 +542,12 @@ merge keeps an in-flow repair to one step. The task branch still makes the
 change visible, reversible, and attributable.
 
 Run the applicable gate before every push. Chain the successful gate directly
-to the exact-SHA push. Never force-push or add a force option to a script. A
-rejected push protects another merge. Fetch, merge again, rerun the gate, and
+to the exact-SHA push. **Never force-push `main`, and never add a force option to
+a script that can target it.** The scope is `main`, exactly as in §"How work gets
+done" -- a row branch you own is yours to rebase and force-push, and the
+`merge=union` retirement makes that the ordinary way to clear a stale index
+conflict. Read this sentence as a blanket ban and ordinary work stalls (#1808).
+A rejected push on `main` protects another merge. Fetch, merge again, rerun the gate, and
 push again. Hooks are bypassable convenience, not evidence. If you cannot query
 the remote, report `REMOTE_UNVERIFIED`. Unknown is not absence or success, and
 it does not authorize cleanup.

@@ -1069,16 +1069,801 @@ byte-identical to the base by sha256 and `test_deepseek_v4_mhc`'s 125 assertion
 lines are byte-identical before and after. **Not reached from a production entry
 point — see O16.**
 
-### W5 — MoE, the decoder layer, and the assembled text forward (GPU, large)
+### W5 — the MoE and the KV-cache spec (CPU, large). LANDED
 
-Wire the 288+1 expert MoE through the existing grouped `noaux_tc` router and
-clamped-SwiGLU epilogue; implement the per-layer control flow (KDA vs DSA,
-dense vs sparse, mHC stream threading); assemble `Glm5NextTextModel::Forward`;
-build the heterogeneous KV cache (11 MLA groups + 34 KDA state groups + the
-indexer side cache) through `MakeKVCache`, following
-`kimi_linear_registry.cpp:135-166`.
-**Anchors:** `modular_glm5_next.py:321-363`, `:1142-1208`, `:1285-1372`.
-**Needs GPU.** **Rebase note:** the KV grouping overlaps PR #1977 directly.
+Issue: [#2223](https://github.com/mudler/vllm.cpp/issues/2223).
+
+**The wave SPLIT, and the split is the decision this section records.** #2223
+named four deliverables — the MoE, the per-layer control flow, the assembled
+`Glm5NextTextModel::Forward`, and the heterogeneous KV cache. Two of them
+landed. The other two are **blocked on a block that does not exist**, and that
+was not visible from the issue: W3 landed the DSA indexer's *selection*
+(`SelectIndexerTopk`) and relaxed `MlaBlockDims::Validate` for the NoPE
+geometry, but it landed no assembled `Glm5NextTextAttention` over them. The
+decoder layer's DSA arm therefore has nothing to call. `q_a_proj` /
+`q_a_layernorm` / `q_b_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`, `expand_kv`
+(`modeling_glm5_next.py:1136-1153`), the attention itself and
+`build_attention_mask_from_topk` (`:1218-1257`) are all unwritten. That is a
+wave, not a paragraph, so it is **W5b** with its own issue rather than a silent
+narrowing of this one.
+
+**Landed here.**
+
+1. **The MoE**, `src/vllm/model_executor/models/glm5_next_moe.{h,cpp}`. It
+   BINDS rather than reimplements: the router is `vt::MoeRouterTopK`'s grouped
+   `noaux_tc` arm and the epilogue is `deepseek_v4::ClampedSwiGLU` at
+   `alpha = 1, beta = 0`. Anchors `modeling_glm5_next.py:158-183`
+   (`Glm5NextTextTopkRouter.forward`), `:137-142` (`_apply_gate`), `:98-104`
+   (`Glm5NextTextMLP.forward`), `:120-135` + `:200-207` (the composed block).
+2. **The heterogeneous KV cache**, `MakeGlm5NextKVCache`, following
+   `kimi_linear_registry.cpp:135-166` for the MLA + KDA pair and
+   `qwen4_exp_registry.cpp` (W5c-1, #2206) for the third-group discipline.
+
+**THREE published groups, and the three numbers that a plausible port gets
+wrong.**
+
+| # | layers | spec | geometry |
+|---|---|---|---|
+| 0 | 11 DSA | `MLAAttentionSpec` | head **512**, `num_kv_heads` 1 |
+| 1 | 34 KDA | `MambaSpec`, 2 states | conv `[24576, 4]` bf16 + recurrent `[64, 128, 128]` **f32** |
+| 2 | 11 DSA | `MLAAttentionSpec` | head **257**, `compress_ratio` **1** |
+
+- **512, not 576.** Every DeepSeek variant and Kimi-Linear publish
+  `kv_lora_rank + qk_rope_head_dim` = 512 + 64. This model's
+  `qk_rope_head_dim` is ZERO and upstream REQUIRES it to be
+  ("Expecting NoPE for the DSA attention layers"), so the latent row is 512.
+  Reusing 576 over-allocates by 12.5% and nothing downstream reads the
+  difference.
+- **`conv_kernel_dim`, not `conv_kernel_dim - 1`.** The reference ALLOCATES the
+  conv state at the full kernel width:
+  `LinearAttentionLayer.lazy_initialization` builds
+  `torch.zeros((*shape[:-1], conv_kernel_size))` (`transformers` v5.16.1
+  `cache_utils.py:1015-1024`) and `Glm5NextTextLinearAttention.forward` passes
+  `conv_kernel_size=self.conv_kernel_size` (`modeling_glm5_next.py:669-671`);
+  `causal_conv1d_update` then reads `state_len = conv_state.shape[-1]` (`:382`)
+  and writes back that many columns, so the slack column is part of the
+  contract. `kimi_linear_registry.cpp:157` publishes `K - 1` for ITS model, and
+  copying that across hands the runner a cache one column short of what the
+  layer reads. `glm5_next_kda.h` recorded the same width for the host
+  reference and this is the spec agreeing with it.
+- **257, not 128, and `compress_ratio` 1, not `index_kpool`.**
+  `PackIndexerStates` stores `concat[k(128), gate_scores(128), valid(1)]` PER
+  TOKEN (`modeling_glm5_next.py:798-801`). Our DeepSeek-V4 parent stores the
+  key alone, 128, and reading that across under-allocates by half. The k-pool
+  compresses at READ time inside `GetPooledStates`, so nothing divides by
+  `index_kpool` — the opposite of `MODEL-MM-QWEN4-EXP`'s QSA side cache, where
+  the compression IS in the store and `compress_ratio` is 4.
+
+**ONE conv state, not three.** The checkpoint stores `self_attn.{q,k,v}_conv1d`
+separately and the reference declares ONE grouped depthwise conv over the
+concatenated channel axis (`:620-628`), so the cache is one
+`3 * num_heads * head_dim` channel state. The refusal this function replaced
+said "three separate conv states", which would have tripled the group; that is
+one of the three stale sentences [#2230](https://github.com/mudler/vllm.cpp/issues/2230)
+repairs.
+
+**Group 2 must be an `MLAAttentionSpec`, and a `FullAttentionSpec` fails in
+silence.** It is not an MLA claim — it is the key-only page budget. A
+`FullAttentionSpec` there is absorbed by the runner's leftover scan as the
+single `fa_draft` draft-KV slot, `multi_cache_topology` stays false, and the
+side cache is published and never allocated with nothing reported. Measured on
+`MODEL-MM-QWEN4-EXP` W5c-1 (#2206) and the same arm is live here.
+
+**REACHED, and this is the first piece of this row that is.** The cases enter
+through `ModelRegistry::Resolve` and the `make_kv_cache` factory hook — the
+same pair `LoadedEngine::FromModelDir` uses — and nothing constructs
+`MakeGlm5NextKVCache` by name. Unwiring `.make_kv_cache` reds the gate at three
+`REQUIRE` sites; DELETING the row does not compile at all, because
+`-Werror=unused-function` fires on `MakeGlm5NextKVCache`. The toolchain
+therefore proves the factory row is the ONLY reference to it, which is a
+stronger statement than the red.
+
+**The MoE is NOT reached** — nothing calls it until W5b assembles the layer —
+and that is O23, declared rather than silent.
+
+### W5 — what the staged artifact actually does, measured
+
+> **SUPERSEDED as a STATE, retained as a MEASUREMENT.** Everything in this
+> section was read on 2026-08-29 and was true that day. The loader no longer
+> stops where this says it stops:
+> [#2245](https://github.com/mudler/vllm.cpp/issues/2245) landed the IQ2_XS and
+> IQ4_XS decoders, [#2247](https://github.com/mudler/vllm.cpp/issues/2247) made
+> both keep their blocks, and W5c
+> ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) resolves all 1383
+> backbone tensors of this artifact. The census below is still the census; only
+> the "decodable here" column has moved, and O5, O7 and O8 above carry the
+> current reading.
+
+`unsloth/GLM-5.3-Flash-GGUF` rev `d425e572fb9686125831f476129e51cea34bc5b4`,
+arm `UD-Q2_K_XL`, staged read-only at
+`/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` (four shards, 101.2535 GiB).
+Run through the PRODUCTION entry point `LoadedEngine::FromModelDir`, 2026-08-29:
+
+```
+REFUSED: gguf: tensor "blk.3.ffn_gate_exps.weight" has unknown ggml type id 17
+         in .../GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf
+```
+
+So it opens the file, resolves `general.architecture = glm5next` against our
+own registration, walks the 4-way split into shard 2, and stops on a TENSOR
+TYPE. Type 17 is `IQ2_XS`. A census of every tensor header across all four
+shards:
+
+| ggml id | type | tensors | decodable here |
+|---:|---|---:|---|
+| 0 | F32 | 638 | yes |
+| 8 | Q8_0 | 346 | yes |
+| 10 | Q2_K | 2 | yes |
+| 11 | Q3_K | 1 | **no** (O8) |
+| 12 | Q4_K | 1 | **no** (O8) |
+| 13 | Q5_K | 181 | **no** (O8) |
+| 14 | Q6_K | 117 | yes |
+| 17 | IQ2_XS | 82 | **no** (O5) |
+| 18 | IQ3_XXS | 41 | **no** (O5) |
+| 23 | IQ4_XS | 3 | **no** (O5) |
+
+**The "Q2_K" in the arm name is a floor, not a format.** Unsloth Dynamic mixes
+eight encodings and only two of the 288-expert tensors are actually Q2_K; the
+experts are IQ2_XS and IQ3_XXS. Six of the eight are undecodable in this tree,
+and three of those six are i-quants that no wave has scoped. **This changes what
+the row must believe about W7b**: the published artifact is not made loadable by
+adding a weight tower, and O7's premise ("no artifact of this model exists") is
+superseded by a harder problem than the one it named.
+
+Three facts from the same read confirm ports made blind:
+`glm5next.expert_shared_feed_forward_length` is **2048**, so the shared expert
+is `moe_intermediate_size` and not `intermediate_size` (12288) — the §W5 trap
+list said so from the reference and the artifact agrees. `ffn_gate_inp` is
+**F32** on all 43 sparse layers, which is the fp32 router GEMM as an on-disk
+fact. And `ssm_conv1d_{q,k,v}` appear as three separate tensors on each of the
+34 KDA layers, which is the layout `glm5_next_kda.h` records and the reason the
+cache is ONE grouped conv state.
+
+`glm5next.layer_types` is **absent** and the schedule is
+`glm5next.attention.head_count_kv`, exactly as
+[#2177](https://github.com/mudler/vllm.cpp/issues/2177) measured. That question
+is not yet REACHABLE on this file, because the type refusal above preempts the
+config read — worth knowing before #2177 is gated against the real artifact.
+
+**Anchors:** `modeling_glm5_next.py:98-104`, `:120-143`, `:158-183`,
+`:196-207`, `:620-628`, `:669-671`, `:798-801`; `cache_utils.py:1015-1024`.
+**Rebase note (RESOLVED):** the KV grouping overlapped PR #1977, which MERGED
+on 2026-08-27, so this built on current `main`.
+
+### W5b — the decoder layer, the DSA attention block, and the assembled forward — SPLIT, see the two sections below
+
+This was W5's PLAN for W5b, kept so the two readings do not look like a
+contradiction. It scoped the per-layer control flow, the attention block and
+`Glm5NextTextModel::Forward` as one wave. **Anchors:**
+`modeling_glm5_next.py:1064-1257` (`Glm5NextTextAttention`, `expand_kv`,
+`build_attention_mask_from_topk`), `:1259-1329`
+(`Glm5NextTextDecoderLayer`), `:1409-1494` (`Glm5NextTextModel.forward`). The
+manifold is threaded from the embedding as
+`inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1)` (`:1477`) and collapsed
+by the UNWEIGHTED `hc_head` before the final norm (`:1493`), so the whole stack
+carries `[T, hc_mult, hidden]` and not `[T, hidden]`.
+
+**It splits, and the split is not a size decision.** The attention block and the
+`OwnedTensor` bridge answer to `transformers` v5.16.1 and to the llama.cpp
+#27752 container, and both can be gated with no cache and no decoder layer over
+them. The decoder layer, the mHC threading and the forward answer additionally
+to `MakeGlm5NextKVCache` and to the `[T, hc_mult, hidden]` manifold, and they are
+where reachability lands. Landing them together would produce one diff whose
+correctness argument runs through two unrelated oracles at once.
+
+### W5b-1 — the DSA attention block and the `OwnedTensor` bridge (CPU, large). LANDED — [#2324](https://github.com/mudler/vllm.cpp/issues/2324)
+
+Two deliverables.
+
+**(a) `Glm5NextTextAttention`** (`modeling_glm5_next.py:1064-1257`), as
+`src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` — a host f32 reference,
+exactly as `glm5_next_dsa.cpp`, `glm5_next_mhc.cpp` and `glm5_next_moe.cpp` are.
+`QResid` (`:1167`), `CompressKv` (`:1170-1172`), `ExpandKv` (`:1136-1153`) over
+the checkpoint's SPLIT half-transposed `kv_b_proj` halves,
+`BuildAttentionMaskFromTopk` (`:1218-1256`), `IndexerRoleFor` (`:1130-1134`) and
+`Attention` (`:1155-1216`) with `eager_attention_forward` (`:1039-1061`)
+inlined, which upstream says at `:1227-1228` is the only interface a 3-D
+per-(query, key) mask can reach.
+
+Three things it gets right that a fluent wrong port gets wrong, each with its own
+discriminating case:
+
+* **The `kv_b_proj` halves are SPLIT and only the K half is TRANSPOSED.** The
+  file carries `attn_k_b` at `[H, kv_lora, qk_nope]` and `attn_v_b` at
+  `[H, v_head, kv_lora]`, so K contracts over its FIRST inner axis and V over its
+  SECOND. At the published geometry a swap is a shape error; the gate therefore
+  ALSO carries a SQUARE case at `kv_lora == qk_nope == v_head`, where the
+  untransposed reading is shape-valid and merely wrong, and asserts the
+  separation (2.9469 over every one of 900 values, printed by the case).
+* **Cross-layer top-k sharing.** `indexer_types[layer_idx] == "shared"` means the
+  layer builds NO indexer and reuses the previous full layer's selection. The
+  gate runs the shared layer against BOTH the correct output and the output a
+  RECOMPUTING port produces from a decoy indexer — both captured from the same
+  oracle run — and asserts ours is the first: 320 of 800 values differ, max
+  separation 1.52, over 20 of 50 query rows.
+* **The all-masked row is `finfo.min`, not `-inf`** (`:1253`). A left-padded
+  query row has every key masked; with `finfo.min` its softmax is uniform and
+  its output finite, and with `-inf` the NaN reaches `o_proj` and then the
+  residual stream. The `-inf` mutation reds 49 of 160 assertions.
+
+**No rope branch, and upstream is what says so.** `validate_architecture`
+(`configuration_glm5_next.py:225-228`) RAISES for any positive
+`qk_rope_head_dim`, measured by constructing one in the golden generator, so
+`expand_kv`'s concat has a zero-width second half and `key_states` IS `k_nope`.
+`MlaDims::Validate` mirrors the refusal in upstream's own words rather than
+half-implementing a branch no released config can select.
+
+**(b) The `OwnedTensor` -> host f32 bridge**, as
+`glm5_next_bridge.{h,cpp}` — O22's open question, answered. See O25 below for
+the decision and its arithmetic.
+
+**Its FOUR advertised refusals are each a gate, which they were not when the
+wave was first proposed for review.** `glm5_next_bridge.h` lists four cases
+`DecodeOwnedTensorToF32` refuses by name, and the fresh review found that
+deleting any of the block element-count check, either byte-span check or the
+`default:` dtype arm left the suite fully green. Two of those were not cosmetic:
+without the elementwise byte-span check `std::memcpy(out.data(), src, need)`
+reads past a short `t.bytes` and serves the HEAP as weight values, and without
+the `default:` arm an encoding the bridge cannot widen returns the ZERO-filled
+buffer it allocated — the same failure the `host_released` refusal exists to
+stop, reached by another door. Five cases now pin them, each proved by
+disabling the refusal in a scratch copy with the mutant's BUILD rc recorded
+beside its TEST rc:
+
+| refusal | mutation | result |
+|---|---|---|
+| block element count is a whole number of blocks | `if (false)` | BUILD 0 / TEST 1, 1 assertion |
+| block byte span equals `RowSizeBytes` | `if (false)` | BUILD 0 / TEST 1, 3 assertions |
+| a block dtype has a `BlockToFloat` decoder | `if (false)` | BUILD 0 / TEST 0 — SURVIVES |
+| elementwise byte span equals `numel * SizeOf` | `if (false)` | BUILD 0 / TEST 1, 3 assertions |
+| `default:` refuses a non-float encoding | `return out;` | BUILD 0 / TEST 1, 4 assertions |
+
+The survivor is disclosed rather than chased, and it is the "unselected branch"
+shape: `vt::IsBlockQuant` is true for exactly the 18 dtypes `BlockToFloat`
+answers for, so no input can reach that arm in this build. What the suite gates
+instead is the PREMISE — every block dtype has a decoder — and that gate is
+ARMED, measured by a second mutation on the other side. Rewriting
+`BlockToFloat`'s `kQ8_0` case to `return nullptr` (BUILD rc=0) reds the premise
+case AND makes the refusal fire by name in two more:
+`` `moe.gate_exps` is q8_0, which this build has no `BlockToFloat` decoder for``.
+So the branch is live under the only condition that can reach it, which is the
+state IQ2_XS and IQ4_XS were in before #2245.
+
+**NOT REACHED.** Nothing in either file is called from a production entry point
+at this merge commit; the only call sites are the two focused gates'. W5b-2
+owns the wiring. O25 carries the disclosure.
+
+### W5b-2 — the decoder layer, the mHC threading and the assembled forward — SPLIT AGAIN, see the two sections below
+
+This was W5b-1's PLAN for W5b-2, kept so the two readings do not look like a
+contradiction. It scoped `Glm5NextTextDecoderLayer` (`:1259-1329`), the mHC
+stream threading, `Glm5NextTextModel::Forward` (`:1409-1494`), the binding of the
+attention block to `MakeGlm5NextKVCache`, AND the discharge of O15, O16, O17,
+O23 and O25 at the moment the layer calls the five primitives.
+
+**The first four landed together and the fifth did not, because the fifth is not
+the same kind of work.** The layer, the threading, the forward and the cache
+binding answer to `transformers` v5.16.1 and to `MakeGlm5NextKVCache`, and they
+are gated by running the reference. Discharging the five reachability debts
+needs something else entirely: a weight bridge for the FOUR arms W5b-1 did not
+bridge, and an engine binding that turns a `ModelForwardInput` into per-request
+sequences and carries per-layer state across steps. §W5b-2b states the
+arithmetic that makes the first of those a design problem rather than four more
+`BridgeDsaLayer`s.
+
+### W5b-2a — the decoder layer, the mHC threading, the forward and the KV binding (CPU, large). LANDED — [#2241](https://github.com/mudler/vllm.cpp/issues/2241)
+
+`src/vllm/model_executor/models/glm5_next_layer.{h,cpp}`:
+`DecoderLayerForward` (`:1279-1329`) with all four control-flow arms
+`:1261-1272` selects between, `TextModelForward` (`:1431-1494`), and
+`ExpandToHiddenStreams` (`:1477`). Plus the cache binding, as an additive
+`DsaCache*` on `Attention` (`glm5_next_attn.h`) and a
+`SelectIndexerTopkFromPacked` lifted out of `SelectIndexerTopk`'s body
+(`glm5_next_dsa.h`), both null-default and byte-identical on the uncached path
+W5b-1 gated.
+
+**THE MANIFOLD IS THE WHOLE POINT, and it is gated three ways that do not
+overlap.** `:1477` expands the embedding to `[B, S, hc_mult, H]` and nothing
+collapses it until `hc_head` at `:1493`; a port that threads `[B, S, H]` and
+collapses early RUNS, is finite, and emits fluent text, and every sublayer gate
+on this row stays green because the collapsed stream is exactly what the
+sublayers consume. So: the per-layer `[B, S, 4, H]` streams are asserted
+ELEMENTWISE; `kStreamSeparation` carries the oracle's own minimum pairwise
+distance between the four streams (**6.4703**) so those assertions are shown to
+be discriminating rather than four copies of one value; and `kEarlyCollapseFinal`
+is a DECOY produced by the SAME oracle modules with the manifold collapsed to its
+mean and re-broadcast after every layer, which the gate asserts we differ from by
+the oracle's own measured **2.4032**.
+
+**The KV binding stores the LATENT, not what the reference stores.** Upstream
+caches the EXPANDED `key_states`/`value_states` at `:1175-1179` — 32,768 values
+per token per layer — and `DsaCache` stores the 512-wide `k_pass` and the
+257-wide packed indexer row instead, which is exactly what
+`MakeGlm5NextKVCache`'s groups 0 and 2 publish. §"MLA: cache the latent" decided
+that and said the equivalence was to be PROVED; the proof is that `ExpandKv` is
+token-wise, which NoPE is what makes true, and it is a case asserting
+`ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)` EXACTLY on real values. It is
+NOT the absorption optimization, which is a speed change and W8's.
+
+**A MUTATION FOUND THE INSTRUMENT, NOT THE PORT, AND IT IS RECORDED AS A
+FINDING.** The mutation that truncates the attention's key range to the current
+window under a filled cache — the "a cache nobody reads back" defect — SURVIVED
+the whole suite at 1647 of 1647 assertions on the first pass. Its output is
+all-NaN, `NaN - want` is NaN, and `NaN > x` is FALSE for every x, so the
+running maximum in the test's `MaxGap` helper never moved off its initial zero
+and an all-NaN forward read as a PERFECT match on every gap assertion in the
+file. `MinStreamSeparation` and the cached-tail comparison were blind the same
+way, because `std::max(m, NaN)` returns `m`. All three now treat a non-finite
+value as an infinite gap and report the count separately, so a failure
+distinguishes "wrong number" from "not a number"; the mutation then reds 3
+assertions. This is the broken-instrument-fails-toward-a-code-verdict class, and
+it was found only because the mutation battery was run at all.
+
+**RED FIRST, and the red found a real defect in the oracle configuration
+rather than in the port.** The first run read 4 of 10 cases and 7 of 1647
+assertions failed, layer 0 (KDA) green and every DSA layer red by 2.7 to 8.1.
+The cause was that `Glm5NextPreTrainedModel` sets `_supports_sdpa = True`, so the
+DEFAULT `_attn_implementation` this config resolves is `sdpa`, and
+`build_attention_mask_from_topk` returns a BOOLEAN mask on that arm
+(`:1249-1250`) instead of the additive `finfo.min` one the eager arm builds
+(`:1252-1256`). The two disagree on a LEFT-PADDED query row where every key is
+masked — torch's SDPA emits 0.0 there and eager's uniform softmax emits the mean
+of the values, measured as 0.0 against our 0.509 — so the generator now pins
+`cfg._attn_implementation = "eager"`, which is the arm W5b-1 gated and the one
+`:1227-1228` names as the only interface this model's 3-D per-(query, key) mask
+can reach. Green is 10/10 cases and 1656/1656 assertions after the instrument repair (1647 before it).
+
+**NOT REACHED, and O26 carries the disclosure.** `ForwardGlm5NextForConditionalGeneration`
+still refuses by name. W5b-2b owns the wiring.
+
+### W5b-2b — the weight bridge for the other four arms, and the engine binding (CPU, large). LANDED — [#2337](https://github.com/mudler/vllm.cpp/issues/2337)
+
+What makes `ModelRegistry::Forward` stop refusing by name, and therefore what
+discharges O15, O16, O17, O23, O25 and O10's remaining half. Two deliverables,
+and the first is a design problem rather than more of W5b-1's bridge.
+
+**(a) The bridge for the KDA, MoE, dense-MLP and mHC arms.**
+`BridgeDsaLayer` covers `Glm5NextMlaWeights` and its nested indexer, and
+`TextModelWeights` needs four more: `Glm5NextKdaWeights` (15 tensors),
+`Glm5NextMlpWeights` (3), `Glm5NextMhcWeights` (3, twice per layer) and the
+`Glm5NextWeights` head — `embed_tokens`, `norm`, `lm_head`. Three of those four
+are mechanical. **The MoE is not**, and the arithmetic is this row's own:
+
+| what, at the published geometry | f32 GiB |
+|---|---:|
+| one bridged DSA layer (W5b-1, measured) | 0.4654 |
+| the 34 KDA layers' projections, all held | ~18.5 |
+| ONE sparse layer's 288 routed experts (`gate_up` + `down`) | **~27** |
+| the 42 sparse layers' routed experts, all held | **~1,150** |
+| usable on `dgx:gpu0` | ~119.63 |
+
+`kBridgeTensorF32ByteCeiling` is 1 GiB and the smallest expert bank is 9.0 GiB,
+so `DecodeOwnedTensorToF32` REFUSES a bank by name today — which is O25's
+`byte_ceiling` gate working exactly as designed, not an obstacle to route
+around. Only 8 of 288 experts are selected per token, so the shape that fits is
+an on-demand per-expert decode: `MoeForward` grows an optional expert source
+consulted for each SELECTED expert when `expert_gate_up` is empty, which keeps
+`vt::MoeRouterTopK` and `vt::MoeCombine` as the seams and adds no parallel path.
+That is one seam change in W5's file with its own red-first gate, and it is why
+this is a wave and not a paragraph.
+
+**(b) The engine binding, which is the SMALLER half and has a house pattern.**
+This was surveyed rather than guessed, because "where does per-request state
+live across steps" looked like the hard part and is not. TWO registered models
+already carry a host arm inside their `forward` hook that ignores the device
+paged caches entirely: `NemotronHForCausalLM`
+(`nemotron_h_registry.cpp:200-213`, whose comment says the host reference
+"consumes three of `ModelForwardInput`'s fields — `token_ids`,
+`logits_indices`, `queue`") and `KimiLinearForCausalLM`
+(`kimi_linear_forward.cpp:462-476`, which `(void)`s `positions`, `attn_meta`,
+`attn_kv` and `queue`). Both RE-RUN THE WHOLE PREFIX each step
+(`nemotron_h.cpp:1047-1066`, `kimi_linear_forward.cpp:436-460`) rather than
+owning state, and a survey of every `: public LoadedModel` in the tree found NO
+model that keeps per-request KV or recurrent state on its `LoadedModel` — the
+persistent members are weights, a CUDA-graph driver, a derived read-only cache,
+or load-time bookkeeping. Kimi-Linear is the closest architecture there is to
+this one (KDA plus MLA), so its shape is the precedent to follow.
+
+The rest is house pattern too: `HostLogits(std::vector<float>&&, vocab)`
+(`qwen3_5_common.cpp:24-30`) builds the carrier and derives `rows` from
+`host.size() / vocab`, and the gather-then-lm_head — empty `logits_indices`
+means EVERY row, the gather happens BEFORE lm_head so it never runs on the full
+`T`, and the indices are bounds-checked — is `nemotron_h.cpp:997-1022` with an
+identical copy at `kimi_linear_forward.cpp:409-433`. Ragged batching, if W5b-2b
+wants it rather than the single-sequence shape both precedents use, is
+`attn_meta.query_start_loc` sliced as at `kimi_linear_device.cpp:2120-2126`,
+with the empty-`num_computed_tokens_cpu` fallback `dots3_note_device.cpp:336-346`
+warns "falls OPEN".
+
+**A full-prefix recompute makes `LayerCache` unreached on that path, and that is
+a decision W5b-2b has to take rather than inherit.** W5b-2a's cache binding is
+gated and correct; if the production hook follows Nemotron-H and Kimi-Linear it
+will not call it, which would leave the binding in the same unreached state this
+wave is disclosing. The alternative — carrying `std::vector<LayerCache>` on
+`Glm5NextLoadedModel` — has no precedent in this tree, and inventing one on a
+model that cannot be run end to end on this fleet is the wrong place to try.
+
+**O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) is W5b-2b's to
+answer, and W5b-2a cannot make it reachable.** `glm5_next_layer.cpp` calls
+`MoeForward`, whose only `vt` ops remain `vt::MoeRouterTopK` and
+`vt::MoeCombine` — every expert GEMM is still a host `std::vector<float>`
+accumulation — so it reaches neither `vt::MergedGemmGroup` nor
+`MoeGateUpSwiGLUGroupedCuda` and the `gate/up must be the SAME CUDA keep-quant
+dtype` throw cannot fire from this row. The per-expert source in (a) keeps that
+property by construction, because it hands the block host floats.
+
+#### What W5b-2b actually landed
+
+**`ModelRegistry::Forward` reaches this model.** Both deliverables landed as
+scoped, and the plan above was followed rather than reinterpreted: the MoE half
+is an on-demand per-expert source and the binding is the surveyed house pattern.
+
+**(a) The bridge.** `BridgeKdaLayer` (15 tensors), `BridgeMlp` (3, used by the
+dense layers and by every sparse layer's shared expert) and `BridgeMhcSite` (3,
+twice per layer) are shape-checked decodes on the pattern `BridgeDsaLayer`
+already set. `BridgeMoeLayer` bridges the ROUTER, the correction bias and the
+shared expert and **leaves the three expert banks EMPTY by construction**.
+
+The primitive underneath is new: `DecodeOwnedTensorRowsToF32` decodes a
+contiguous LEADING-AXIS ROW RANGE out of a block-resident `OwnedTensor`, and
+`HostF32RowBytes` is the shape-only budget for one row.
+`kBridgeTensorF32ByteCeiling` is UNCHANGED at 1 GiB and the RANGE is checked
+against that same ceiling, so asking for all 288 rows of a bank is refused by
+exactly the arithmetic that refuses the whole tensor — the row API is not a way
+around the gate. A block row that is not a whole number of blocks is refused by
+name, because a slice starting mid-block does not fail: the decoder reads the
+next block's scale and returns plausible values from the wrong quantization.
+
+The arithmetic that forces the shape, all of it asserted rather than written:
+
+| what, at the published geometry (288 experts, `moe_I` 2048, `H` 4096) | f32 bytes | GiB |
+|---|---:|---:|
+| one expert's `gate_up`, `[2 * 2048, 4096]` | 67,108,864 | 0.0625 |
+| one expert's `down`, `[4096, 2048]` | 33,554,432 | 0.03125 |
+| **one expert, both** | **100,663,296** | **0.09375** |
+| ONE ROW of `ffn_up_exps` | 33,554,432 | 0.03125 |
+| one bank (`ffn_up_exps`, `[288, 2048, 4096]`) | 9,663,676,416 | **9.0** |
+| one sparse layer's THREE banks | 28,991,029,248 | **27.0** |
+| the 42 sparse layers' banks, all held | 1,217,623,228,416 | **1,134.0** |
+| usable on `dgx:gpu0` | | ~119.63 |
+
+A resident float bank set is **9.5x over the box**. One row is **32x UNDER the
+1 GiB ceiling** while the bank is 9x over, which is where the two populations
+separate and why the ceiling did not move. `num_experts_per_tok` is 8 of 288, so
+what a token needs is at most 8 experts and what a step needs is the DISTINCT
+experts its tokens hit; `MoeForward` now groups the `[T, K]` routing slots by
+expert and visits each hit expert ONCE, which is upstream's own order
+(`Glm5NextTextExperts.forward` loops the hit experts, not the tokens) and which
+is what bounds the peak at one expert. Every `[t, j]` slot is still computed
+independently into its own row of the combine's `[T, K, H]` operand, so the
+resident path is byte-identical to the token-major visit it replaced — asserted
+EXACTLY, not to a tolerance, against a resident bank built from the same
+tensors.
+
+`MoeLayerWeights` grows a BORROWED `ExpertSource*`. Exactly one of the two
+residencies is admissible and the other two states are refused by name: both
+populated is ambiguous, and neither populated is a null dereference — **measured
+at rc=139 (SIGSEGV), not assumed**, which is why the refusal's message names
+that failure and not the softer "reads as zeros".
+
+**(b) The engine binding.** `glm5_next_forward.{h,cpp}`.
+`Glm5NextGgufLayerSource` is a `LayerWeightSource` holding ONE slot: it bridges
+layer `i`, hands back a reference valid until the next call, and drops the
+previous layer BEFORE bridging the next so the peak is never two. There is
+deliberately no map keyed by layer index, for the reason `glm5_next_bridge.h`
+gives for having no `BridgeTower`. `TextModelForward` grows an overload over
+that source, and the resident overload now delegates to it through a trivial
+`ResidentLayerSource`, so the manifold expansion, the `prev_topk` threading and
+the `hc_head` collapse stay in ONE loop rather than being copied into a second
+forward.
+
+`Glm5NextHostForward` is the rest: a per-token embedding gather out of the
+`[154880, 4096]` table (2.36 GiB in f32, which the ceiling refuses; a row is 16
+KiB), the stack, the logits gather BEFORE `lm_head` with empty meaning every row
+and every index bounds-checked, and `lm_head` streamed in `kLmHeadChunkBytes`
+(64 MiB) chunks. The chunk size is a PARAMETER and that is not a convenience: at
+any geometry small enough to run in CI the default gives ONE chunk, so a
+chunk-offset defect would never be reached by a gate that could only take the
+default.
+
+The residency ladder the forward actually runs at:
+
+| what | GiB |
+|---|---:|
+| the tower as loaded, block-resident | 101.14 |
+| the tower expanded to f32 (what a `TextModelWeights` would be) | 426.72 |
+| ONE bridged DSA layer | 0.4654 |
+| ONE bridged KDA layer | 0.5449 |
+| ONE sparse layer's router + shared expert | 0.0996 |
+| ONE routed expert | 0.0938 |
+| one `lm_head` chunk | 0.0625 |
+
+The forward's f32 peak is one layer plus one expert plus one chunk — under 0.75
+GiB, 0.6% of the box — while the tower stays exactly as the loader left it.
+
+**The hook follows the house pattern, with ONE divergence stated rather than
+inherited.** `ForwardGlm5NextForConditionalGeneration` opens the handle with
+`ModelAs<Glm5NextLoadedModel>` (which W5c made possible and this wave gave
+something to open it FOR), `(void)`s `positions`, `attn_meta`, `gdn_meta`,
+`attn_kv` and `gdn_state`, and re-runs the whole prefix each step — the shape
+`NemotronHForCausalLM` and `KimiLinearForCausalLM` both use, on a tree where no
+`LoadedModel` keeps per-request state. **The divergence:** both precedents take
+`token_ids` as one sequence whatever `num_reqs` says, which on a two-request
+step attends across the request boundary. For this model that is fluent wrong
+text no gate on this fleet could detect (§Gates), so a multi-request step is
+REFUSED BY NAME and ragged batching is owed. A non-CPU queue is refused too,
+because every primitive on this row is host f32 and `vt::MoeRouterTopK`
+dispatches on the queue's device.
+
+**RED FIRST, and the red came from an EXISTING gate rather than a new one.**
+`test_glm5_next_scaffold.cpp`'s case pinning "the forward REFUSES BY NAME, and
+names what is UNASSEMBLED" went red at 8 assertions in 1 case the moment the
+hook ran. That pin MOVED with the change rather than being deleted by it — the
+same shape W3 used when `MlaBlockDims::Validate` stopped refusing the NoPE
+geometry — and now asserts the state that replaced the refusal: the blanket
+message is GONE (asserted as an absence, with the exact sentence it carried, so
+a revert reds it) and a foreign handle is refused by the DOWNCAST naming this
+architecture.
+
+**Thirteen negative mutations, and TWO of them survived the first suite.** Both
+survivals are recorded below because each is a fact about the gate, not a
+footnote. Measured on tree `91354df62`, each mutant proved APPLIED by a diff
+hash, BUILT (rc=0 on all thirteen — a build failure reads as a passing test) and
+restored byte-for-byte:
+
+| # | mutation | test | rc | failed |
+|---|---|---|---:|---:|
+| M1 | **REACHABILITY**: delete the `Glm5NextHostForward` call in the registry hook | forward | 1 | 11 of 118 |
+| M2 | the layer source ignores its index (always bridges layer 0) | forward | 1 | 32 of 81 |
+| M3 | `DecodeOwnedTensorRowsToF32` drops the row offset | bridge / forward | 1 / 1 | 11520 of 32228 / 5 of 118 |
+| M4 | `GgufExpertSource` always decodes expert 0 | bridge | 1 | 224 of 32228 |
+| M5 | the NEITHER-residency refusal disabled | bridge | **139** | SIGSEGV |
+| M6 | the mid-block row-alignment refusal disabled | bridge | 1 | 2 of 32228 |
+| M7 | the `lm_head` chunk writes at `o` instead of `first + o` | forward | 1 | 2 of 118 |
+| M8 | the non-CPU-queue refusal disabled | forward | 1 | 2 of 118 |
+| M9 | the multi-request refusal disabled | forward | 1 | 1 of 118 |
+| M10 | the row-range ceiling check disabled | bridge | 1 | 2 of 32228 |
+| M11 | the gate and up halves swapped in the per-expert fusion | bridge / forward | 1 / 1 | 224 of 32228 / 3 of 118 |
+| M12 | the two mHC sites swapped in the layer source | forward | 1 | 24 of 118 |
+| M13 | the per-expert grouping removed from `MoeForward` | bridge | 1 | 3 of 32228 |
+
+**M12 SURVIVED at 86 of 86 before the repair, and the cause is the FIXTURE.**
+Exchanging `attn_hc` and `mlp_hc` inside `Glm5NextGgufLayerSource` left every
+logit BIT-IDENTICAL. The miniature's mHC `fn` payloads are ramps in the hundreds
+and thousands, so `F.linear(normed, fn) + base` saturates every sigmoid gate and
+the Sinkhorn projection converges to the same matrix from either site; the swap
+is arithmetically invisible downstream. A gate that could only see it through
+the logits is a mute switch at that geometry, so the mapping is now asserted
+STRUCTURALLY against the loader's own two tensors, with the two tensors asserted
+to DIFFER so the equality is a fact and not a tautology. M12 then reds 24.
+
+**M13 SURVIVED at 32030 of 32030 before the repair, and the cause is the
+POPULATION.** The "each expert decoded exactly once" case ran ONE token, and at
+one token every selected expert is hit once whatever the code does. The case now
+also runs SIX tokens, where the router fills 12 slots from 2 distinct experts and
+a per-slot visit decodes each of them six times — six 96 MiB decodes at the
+published geometry. M13 then reds 3.
+
+**M5 kills by CRASHING rather than by failing an assertion**, and that is
+recorded as the result it is: without the refusal the loop dereferences a null
+`expert_source`. The message was corrected in the same flow, because it had
+claimed the experts "would read as a ZERO weight".
+
+**Green:** `test_glm5_next_forward` 9 cases / 118 assertions, `test_glm5_next_bridge`
+19 / 32228, `test_glm5_next_scaffold` 38 / 2652, and the six sibling suites
+unchanged and green (layer 10/1656, moe 8/1614, gguf_load 16/8731, attn 14/160,
+kda 28/342, dsa 10/1934, mhc 5/98).
+
+**One record edit this wave owes and does not hide:** `glm5_next` is added to
+`scripts/runner-routing-allowlist.txt`, because the decode returns HOST logits.
+That is the honest state and the entry says why — there is nothing to be
+device-native against yet, W3's CUDA arm being committed and unmeasured, and the
+forward refuses a device queue rather than pretending otherwise. **The
+checker's OTHER invariant misclassifies this model and that is disclosed rather
+than fixed here:** `check-runner-routing-consistency.py` reports it in the "30
+keep bf16-resident DBuf activations" bucket, which is false — every buffer on
+this path is host f32. The reason is the cross-TU resolution hole the
+`nemotron_h` allowlist entry already names (#1410): the invariant reads the
+registry TU's decode file set, and this model's f32 residual declarations live
+in `glm5_next_forward.cpp`. Teaching it to follow the hop is a semantic checker
+change, which AGENTS.md routes to its own row, spec and red-before.
+
+### W5b-2c — the engine's multi-KV index, consumed (CPU, medium). [#2348](https://github.com/mudler/vllm.cpp/issues/2348)
+
+The last thing between this model and a token, and it is not more plumbing on
+W5b-2b: it is the piece W5b-2b deliberately did not write and O27 declared as a
+staged slice.
+
+**What stood in the way, measured.** O28 drove the production C ABI at the
+staged artifact on `dgx:gpu0` and the engine refused above this row's hook:
+`22 KV cache(s) from 2 published group(s) reached this forward ... and no
+registered forward consumes a cache set keyed by layer name`. That is the
+`input.multi_kv` guard KV-DSV4-MULTICACHE W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068))
+landed, and it fires for ANY model publishing a multi-cache topology BEFORE
+dispatch.
+
+**What the engine actually hands over, read off the code and confirmed by that
+refusal's own numbers.** The three counts in it are three different
+denominators and reading them as one is the first way this mapping goes wrong:
+
+| the number | what it counts |
+|---:|---|
+| 3 published groups | `MakeGlm5NextKVCache`'s MLA latent (512), KDA recurrent state, indexer side cache (257) |
+| 22 caches in `attn_kv` | one entry per published NAME of every ATTENTION group: 11 + 11 |
+| 2 groups in `attn_kv` | the recurrent group contributes NOTHING there — its 34 layers land in `gdn_state` |
+| 3 of 3 block tables | gathered per GROUP ID, not parallel to `attn_kv` |
+
+The first published name is `model.layers.3.self_attn.attn` because the 22
+arrive in PUBLICATION order — group 0's eleven, then group 2's eleven — and
+layer 3 is this checkpoint's first DSA layer. **Nothing is resolved by
+position.** Every attention cache is found through `MultiKvCacheIndex::Find` on
+the name `MakeGlm5NextKVCache` published it under, and its group id is READ off
+the channel rather than assumed to be 0 and 2.
+
+**GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR**, and this is the one error on
+the wave that does not crash. `MLAAttentionSpec` stores ONE vector per token —
+no factor 2, no separate V — so the buffer is `[num_blocks, block_size,
+head_size]` and a row is at `(block * block_size + offset) * head_size`. A
+reader that took the ordinary pair layout indexes at twice the stride and hands
+the layer finite, correctly shaped, wrong numbers; the model then generates
+fluent text. `ResolveKvBinding` refuses `num_kv_heads != 1` and a `head_size`
+that is not the published row, and `PagedRowOffset` is the ONE place this row
+turns a logical position into an element offset.
+
+**And the arithmetic is checked against the engine's own.** The runner computes
+`attn_meta.slot_mapping` for the target attention group with its own walk of the
+same table. The binding recomputes those slots and refuses by name on a
+disagreement, so a misread block table is a refusal on the first step rather
+than a wrong token on every step after it.
+
+**The recurrent group is NOT keyed by name and the spec says so rather than
+leaving it to be discovered.** `MultiKvCacheIndex` describes `attn_kv` only; the
+KDA states arrive on `gdn_state` in ascending layer order with no name, so the
+correspondence is positional and the strongest available check is the count
+against `num_kda_layers()`. The state SLOT is the engine's —
+`GDNAttentionMetadata::non_spec_state_indices_tensor`, the compact index the
+runner remapped block-table column 0 to — because the raw block id would index a
+`[gdn_state_slots, ...]` buffer with an attention block number.
+
+**A sentence W5b-2b landed that this wave retires.** `glm5_next_forward.h` said
+the forward "re-runs the whole prefix every step", following Nemotron-H and
+Kimi-Linear. The runner does not offer that: `ModelForwardInput::token_ids` is
+the step's SCHEDULED tokens, so on the second step of a decode it is ONE id, and
+a forward that treats it as a sequence attends to an empty prefix. The house
+pattern carries the same defect and this row does not inherit it.
+
+**The guard is NARROWED, not dropped.** `ModelFactory` grows
+`consumes_multi_kv_cache`, default false, and `ModelRegistry::Forward` refuses
+only when a keyed cache set arrives AND the registered forward does not declare
+that it consumes one — which is the pair of facts the message already asserted.
+Every model refused before this change is refused after it, DeepSeek-V4
+included; #1925 still owns its consuming forward. This is the same capability
+shape `streams_routed_experts` and `supports_weight_offload` already use, and
+for the same reason: the fact is a property of a model's forward and it lives
+beside the forward.
+
+**What this wave does NOT close.** O1 stands: no end-to-end token gate for this
+model exists or can exist on this fleet, and what CI runs is the synthetic
+4-layer miniature. Ragged batching and the device arm stay refused by name. The
+forward still re-decodes every layer's weights from the block-resident tower on
+every step, which is a residency decision and not a speed one; W8 owns speed.
+
+### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
+
+This was W5's PLAN for W5c, and it is kept only so the two readings do not look
+like a contradiction. It said no `LoadedModel` of this architecture could exist,
+so `ModelRegistry::Forward` was unreachable BY CONSTRUCTION, and that the
+published artifact was additionally blocked behind O5/O8. All three stopped
+being true while W5 was in review: [#2245](https://github.com/mudler/vllm.cpp/issues/2245)
+landed the IQ2_XS and IQ4_XS decoders and W5c
+([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) landed the tower. The
+section immediately below is what actually happened.
+
+### W5c — the weight tower and `load_weights` (CPU, large). LANDED — [#2242](https://github.com/mudler/vllm.cpp/issues/2242)
+
+Split out of W5 because a load and a forward have different blockers and
+different oracles: the load answers to the CONTAINER, the forward to the
+ALGORITHM. This wave is the container half, and it is the one that ends the
+"registered but not loadable" state the row has been in since W1.
+
+**What landed.** `src/vllm/model_executor/models/glm5_next_loader.{h,cpp}` — the
+loaded weight set and `LoadGlm5NextFromGguf`, plus `Glm5NextLoadedModel`, which
+is the first `LoadedModel` of this architecture that has ever existed. The GGUF
+arm of the registry's `load_weights` hook returns it; the safetensors arm still
+refuses, and now says why (every published safetensors artifact exceeds every
+device this project owns) rather than saying the loader is unported.
+
+Field names and shapes mirror the host references W2, W3 and W4 landed —
+`Glm5NextKdaLayerWeights`, `glm5_next_dsa::IndexerWeights`, `HcSite` — one for
+one, so W5b's bridge from `OwnedTensor` to those f32 buffers is mechanical
+rather than a second name map. **The tower is `OwnedTensor` and not host f32,
+and that is a decision rather than a convenience:** the artifact fits at all
+only because 736 of its tensors keep their ggml blocks, and a float tower would
+be 4x the file. The bridge is W5b's.
+
+**The two oracles, both read at source rather than relayed.** The ALGORITHM is
+`transformers` v5.16.1, whose `modeling_glm5_next.py` sha256s to
+`2092bbb4efa2a8087b74f4a4da37635c503fe1df9ae73f1e6e8342af8b4b8e8b` — asserted
+against `raw.githubusercontent.com` at the tag, not assumed. The CONTAINER is
+llama.cpp PR [#27752](https://github.com/ggml-org/llama.cpp/pull/27752) at head
+`8a8d0bcc4d5fdf024c457526245bec4bc3a12adc`, the pin
+[`oracles/llama-cpp-glm5next.md`](../oracles/llama-cpp-glm5next.md) records,
+whose `conversion/glm5next.py` is 4714 bytes and sha256
+`bfacba27746096e7bb3ca4a2549c9026d3475e226c7f3edf230c37ffadc7b6b3`.
+
+**Three convert-time facts the row had wrong, and one it had right.** #2242's own
+scope sentence said the tower is mapped from "the GGUF names W7a's converter and
+the published artifact agree on". They did not agree. `.dt_bias` is renamed to
+`.dt_proj.bias` and lands as `ssm_dt.bias`; `kv_b_proj` is SPLIT into
+`attn_k_b` and `attn_v_b` with the k half transposed, so one HF name maps to two
+GGUF tensors at different shapes; and `ssm_a` holds `-exp(A_log)` rather than
+`A_log`. All three are fixed on both sides under
+[#2291](https://github.com/mudler/vllm.cpp/issues/2291). The fourth candidate is
+the one the row had right by not having it: **there is no `+1` norm fold in this
+chain**, unlike the Qwen3-Next converter the sibling `qwen4exp` loader has to
+undo, so a loader that copied that file would subtract 1.0 from every gamma in
+the model.
+
+**The dtype polarity, and its three annotated exceptions.** Everything inherits
+the model dtype. `router` is f32 because UPSTREAM computes the router GEMM at
+f32 (`F.linear(hidden.type(torch.float32), self.weight.type(torch.float32))`)
+and the file already stores it that way, so it is a mirror and not a widening.
+`e_score_correction_bias` is f32 because it selects experts discretely and a
+rounding error there swaps an expert rather than scaling an output. The mHC
+`base` and `scale` are f32 because every Sinkhorn denominator adds
+`hc_eps = 1e-6` and the bf16 quantum near 1.0 is 3.9e-3, 3900x that eps —
+4.86 kB for the whole model. `a_log` and `dt_bias` are f32 for the reason the
+sibling row already records.
+
+**Gates.** `tests/vllm/models/test_glm5_next_gguf_load.cpp` (16 cases, 8731
+assertions) plus `tests/scripts/test_convert_glm5_next_gguf.py`, and the name
+map is gated against the REAL artifact with no asset:
+`tests/vllm/models/glm5_next_gguf_manifest.inc` freezes the 1412-tensor header
+table of `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL at revision
+`d425e572fb9686125831f476129e51cea34bc5b4`, generated by
+`scripts/gen-glm5-next-gguf-manifest.py` from the shard headers alone.
+
+**`blk.45` is NOT a decoder layer, and it is asserted three ways** because each
+one alone is satisfiable by a wrong loader: a depth of 45 is equally true of a
+stack built from blocks 1..45; "no `blk.45.*` name is enumerated" is equally
+true of a file that never had an MTP block; so the loader also COUNTS the 29
+tensors it skipped, and the synthetic fixture carries a real MTP block for it to
+skip. `1383 + 29 = 1412` closes the arithmetic in both directions.
+
+**The fixture's schedule is `[0, 0, 1, 0, 1]` and not `idx % 4 == 3`.** That is
+[#2177](https://github.com/mudler/vllm.cpp/issues/2177) made expressible: the
+published checkpoint's own schedule happens to BE the stride, so a fixture at the
+stride cannot tell a reader that synthesizes it from one that reads it. This one
+puts the single DSA layer where the stride would put a KDA layer.
+
+**How far it got on the real artifact, and what was NOT materialized.** Driven at
+`/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` through the same chain
+`LoadedEngine::FromModelDir` uses for a GGUF — `GgufFile::Open` on shard 1,
+`Glm5NextHfConfigFromGguf`, `ParseGlm5NextParams`,
+`EnumerateGlm5NextGgufTensors` — HEADERS ONLY. All four shards open and merge to
+1412 tensors; the config resolves to 45 layers, hidden 4096, vocab 154880, 288
+experts, 34 KDA + 11 DSA, `hc_mult` 4, `index_kpool` 4, `swiglu_limit` 10.0 and
+a fully NoPE MLA (`q_lora` 1536, `kv_lora` 512, `qk_nope` 256, `qk_rope` 0,
+`v_head` 256); and every one of the 1383 names the tower reads RESOLVES — 0
+missing, 0 unexplained — at **41 MB peak RSS**, with no weight byte read. The
+residency the load would take, from `PeekRoute` over those same names under
+`mmap_residency`: **736 tensors keep their blocks at 98.260 GiB** and **647
+expand to bf16 at 0.446 GiB**, totalling 98.707 GiB against the file's 101.2535
+— the difference is the 2.55 GiB MTP block this load drops.
+
+**A materializing load was ATTEMPTED and STOPPED, deliberately.** It reached
+8.09 GiB RSS in 2m02s in uninterruptible-sleep state, reading the artifact over
+CIFS, and was killed. Nothing about a materialized load, a peak RSS at load, a
+token or a speed is claimed by this wave. That measurement belongs on
+`dgx:gpu0` under an `rc` lease with the artifact on local disk, and it is W7b's
+([#2225](https://github.com/mudler/vllm.cpp/issues/2225)) to take.
+
+**Reachability.** The production entry point is the loader:
+`ModelRegistry::Load` -> the registration's `load_weights` hook -> the GGUF arm.
+Every case in the suite enters there, through `Glm5NextHfConfigFromGguf` and
+`ModelSource::FromGguf`, and none constructs a `Glm5NextWeights` by hand.
+Deleting the `LoadGlm5NextFromGguf` call site — leaving the type and returning a
+default-constructed `Glm5NextWeights{}` — reds 48 assertions.
 
 ### W6 — vision tower, processor, mm placeholder expansion (GPU, large)
 
@@ -1170,6 +1955,442 @@ before the declared correctness gate stands, and §Gates explains why the
 end-to-end one cannot stand here. W8 opens when W7 closes and its scope is set
 then.
 
+### W9 — the device arm — SPLIT, see W9a below and the two waves it does not claim
+
+The row has carried "the device arm" as an unscoped debt since O17, and O27 and
+O29 both name it as one of the two narrow debts left after W5b-2c. This section
+scopes it, and the first thing it does is establish that the debt is NOT one
+wave. That conclusion is arithmetic, and the arithmetic is below.
+
+#### What the model actually weighs, measured tensor by tensor
+
+Every previous statement about this model's device feasibility used the f32 or
+bf16 expansion of the CHECKPOINT — 305.78 GiB at FP8, 598.5 GiB at BF16, 1,134
+GiB for the expert banks alone — against `dgx:gpu0`'s ~119.63 GiB. §Gates draws
+the end-to-end gate's impossibility from those figures and O1 records it.
+
+**Those figures are all expansions. Nobody had measured what the artifact
+weighs in the encoding it is stored in.** Read on 2026-08-30 by walking the
+GGUF tensor-info region of all four shards of
+`/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` — header only, no tensor
+data — and sizing each tensor with ggml's own `type_traits` block geometry:
+
+| class | tensors | on disk | at bf16 | at f32 |
+|---|---:|---:|---:|---:|
+| routed experts (`ffn_{gate,up,down}_exps`) | 129 | **94.6758 GiB** | 580.50 GiB | 1161.00 GiB |
+| everything else | 1283 | **6.5688 GiB** | 16.96 GiB | 33.92 GiB |
+| **whole artifact** | **1412** | **101.2446 GiB** | 597.46 GiB | 1194.92 GiB |
+
+and by encoding:
+
+| ggml id | type | tensors | on disk | in `IsCudaKeepQuantSupported` |
+|---:|---|---:|---:|---|
+| 17 | IQ2_XS | 82 | 53.3320 GiB | **yes** (#2260) |
+| 18 | IQ3_XXS | 41 | 35.3145 GiB | yes |
+| 23 | IQ4_XS | 3 | 3.5859 GiB | **yes** (#2260) |
+| 13 | Q5_K | 181 | 3.0286 GiB | yes |
+| 14 | Q6_K | 117 | 2.1966 GiB | yes |
+| 10 | Q2_K | 2 | 1.4766 GiB | yes |
+| 11 | Q3_K | 1 | 0.9668 GiB | yes |
+| 8 | Q8_0 | 346 | 0.8013 GiB | **no** — CPU fallback |
+| 12 | Q4_K | 1 | 0.3323 GiB | yes |
+| 0 | F32 | 638 | 0.2100 GiB | n/a |
+
+The counts reproduce §W5's census exactly, which is the check that this walk
+read the same file that walk did. The bytes are new.
+
+**Three conclusions follow, and each of them changes a design choice.**
+
+**(1) The artifact FITS, keep-quant, and O1's impossibility is about the
+oracle rather than about us.** 101.2446 GiB against ~119.63 GiB usable is 18.39
+GiB of headroom. O1 stays exactly as written — it is a statement about running
+`transformers` v5.16.1 as an ORACLE, which needs the bf16 or FP8 expansion and
+therefore genuinely cannot happen on this fleet. What is now false is the
+inference a reader would draw from it, that OUR side cannot be device-resident
+either. It can. The two are different questions and this row had only ever
+answered the first.
+
+**(2) The Kimi-Linear shape does not fit this model, and the census is why.**
+`StageKimiResidentBf16` (`kimi_linear_weights.cpp:555-568`) widens each weight
+to bf16 at load and calls `ReleaseHost()`. Applied here it costs 597.46 GiB and
+is refused by arithmetic. Applied only to the NON-expert tower — the natural
+hybrid, and Nemotron-H's shape — it costs 16.96 GiB where those same tensors
+are 6.57 GiB on disk: **+10.39 GiB, which is 56% of the entire 18.39 GiB
+headroom, spent to widen 6.5% of the model.** The expert banks would still have
+to be keep-quant, so the bf16 widening buys no uniformity either. **All-keep-quant
+residency is the only shape with usable headroom**, and that is a measurement
+and not a preference.
+
+**(3) Q8_0 is the one uncovered encoding and it is not a blocker.** All 346 of
+them are small projections — 45 `hc_attn_fn` + 45 `hc_ffn_fn` (the mHC mixers
+the repack defect NaN'd), 170 `ssm_*` KDA gates, 84 DSA and indexer
+projections, `ffn_down_shexp` and `nextn.eh_proj`. Together they are 0.8013 GiB
+on disk and 1.5083 GiB widened to bf16. The Q8_0 keep-quant GEMM is a 32-element
+Q8_0-activation kernel that does not slot into the Q8_K super-block GEMM
+(`cuda_quant_dot.cu:821-823`), so these tensors take the bf16 expansion arm and
+cost 0.71 GiB more than keeping them. That is 3.9% of the headroom for the one
+encoding the device GEMM cannot read, and it needs no new kernel.
+
+#### A claim on the merged dependency branch that this census falsifies
+
+`cuda_quant_dot.cu:1728-1731` (`row/QUANT-CUDA-IQ4XS-IQ2XS`, merged here) says
+of the IQ2_XS and IQ4_XS arms that without them "the fused MoE seam below THREW
+outright, which is why that model shipped as `--device cpu`."
+
+**The consequence is right and the cause is wrong, and it matters because a
+later reader would conclude the device arm is now unblocked.** GLM-5.3-Flash
+ships `--device cpu` because it has NO device code of any kind:
+`grep -rln glm5 src/vt/` is empty against 49 `.cu` files, there is no
+`cuda_glm5*.cu`, and `ForwardGlm5NextForConditionalGeneration` never reaches a
+keep-quant seam at all — `glm5_next_forward.cpp:231-238` refuses a non-CPU queue
+by name before any GEMM runs. The fused seam cannot have thrown for this model
+because nothing in this model has ever called it. The two kernels were still
+necessary; they were not sufficient, and they were not the reason.
+
+#### W9a — the routed-expert GEMM, onto the shared keep-quant seam (CPU+GPU, medium). THIS WAVE
+
+**The scope is one substitution, and the reason it is the first wave is that it
+is the only hand-rolled arithmetic left in this model's MoE.** `glm5_next_moe.h`
+already states the block's polarity — the router BINDS `vt::MoeRouterTopK`'s
+grouped `noaux_tc` arm and the combine BINDS `vt::MoeCombine`, and neither is
+new numerics. The expert GEMM is the exception: `glm5_next_moe.cpp:357-374` is a
+hand-written double-accumulator matvec pair over host f32 weights that an
+`ExpertSource` decodes from GGUF blocks **on every step, for every hit expert**.
+
+That is a parallel path by hand around a shared seam that already exists, and
+AGENTS.md §"Shared seams" forbids exactly this. The seam is
+`vt::MoeGateUpSwiGLUGrouped` (`include/vt/ops.h:2476-2488`), promoted out of
+DeepSeek-V4's private kernel precisely "so any keep-quant MoE arch inherits it",
+with a CUDA provider (`cuda_quant_dot.cu:2278`) and a CPU provider
+(`cpu_quant_gemm.cpp:282`) that the header declares is "the BYTE-EXACT
+composite ... the golden the fused kernel is gated against". The down projection
+is `vt::MatmulBTQuantGrouped` (`cpu_quant_gemm.cpp:239`, CUDA at
+`cuda_quant_dot.cu:2043`).
+
+**The seam's epilogue IS this model's epilogue, not an approximation of it.**
+`ops.h:2477-2479` specifies `gate = min(F·(gate_w·xq), limit)`,
+`up = clamp(F·(up_w·xq), -limit, limit)`, `out = gate·sigmoid(gate)·up` —
+clamped SwiGLU at α=1, β=0. `glm5_next_moe.h` anchors `ExpertGate` to
+`deepseek_v4::ClampedSwiGLU` at α=1, β=0 against
+`modeling_glm5_next.py:137-142`. Same function, and the seam is where DeepSeek-V4
+already runs it.
+
+**The checkpoint's layout IS the seam's expected layout, byte for byte.** Read
+off the same header walk: every `ffn_gate_exps` / `ffn_up_exps` is
+`ne = [4096, 2048, 288]` and every `ffn_down_exps` is `[2048, 4096, 288]`, which
+in C order is `[E][N][K]` — the `[E*N, K]` stacked tower the op requires, with no
+repack. `OwnGgufQuantBlocks` (`qwen3_5_gguf_weights.cpp:71`) already builds an
+`OwnedTensor` in exactly this shape with `nk = true`, and `GgufExpertSpanOf`
+(`gguf_expert_span.cpp:78`) already offsets an expert slice in BYTES via
+`vt::RowSizeBytes` so a slice never cuts a block.
+
+**The one admission risk was checked rather than assumed.** The fused op
+requires `gate_w.dtype == up_w.dtype`. Unsloth Dynamic mixes encodings per
+layer, so this could have refused the checkpoint outright. Measured across all
+43 sparse blocks: **0 mismatches.** The distinct triples are
+`(IQ2_XS, IQ2_XS, IQ3_XXS)` x39, `(IQ2_XS, IQ2_XS, IQ4_XS)` x2,
+`(IQ3_XXS, IQ3_XXS, IQ4_XS)` x1 and `(Q2_K, Q2_K, Q3_K)` x1 — layers 3-44 plus
+blk.45, whose experts this row does not build (O2). Every one of those six
+encodings is in `IsCudaKeepQuantSupported`.
+
+**In scope.**
+- A per-layer keep-quant bank handle carrying the three expert `OwnedTensor`s
+  (`Glm5NextMoeWeights::{gate,up,down}_exps`, `glm5_next_loader.h:263-265`) as
+  `vt::Tensor` views, host or device, without decoding.
+- `MoeForward` gains a keep-quant arm that builds `act[P, H]` by gathering the
+  routed slots' hidden rows, `expert_ids[P]` i32 from `MoeRouting::topk_ids`,
+  then calls `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` and
+  hands the same `[T, K, H]` buffer to the unchanged `vt::MoeCombine`.
+- P is `num_tokens * num_experts_per_tok`; the grouped ops sort by `expert_ids`
+  themselves, so the hand-rolled `hit`/`slots` grouping is retired rather than
+  reimplemented.
+- The existing host-f32 `ExpertSource` arm stays reachable BELOW the new arm, as
+  `nemotron_h_registry.cpp:204-213` keeps its host reference: it is the operand
+  the parity gate compares against, and deleting it deletes the gate.
+
+**Out of scope, and named so no reader mistakes this wave for the device arm.**
+- Device RESIDENCY of the banks (`dense_attn::ResidentWeight`, `stage_on_load`)
+  is **W9b**. This wave makes the seam call correct and gates it; it does not
+  upload anything.
+- The other 6.57 GiB — attention, KDA, mHC, norms, embeddings, lm_head — stays
+  host f32 loops, so `glm5_next_forward.cpp:231` still refuses a CUDA queue and
+  **the CUDA provider of this seam is NOT reached by this wave.** That is a
+  staged slice under AGENTS.md §"Nothing lands dead" and O31 discloses it.
+- The shared expert and the dense MLP keep `DenseMlpForward`: they are one
+  tensor each, not a stacked bank, and `MatmulBTQuantGrouped` is a grouped op.
+- Speed. §W8 owns the axis and O6 is unchanged. This wave does not publish a
+  tok/s number for the model.
+
+**Upstream anchors.** `modeling_glm5_next.py:120-135` (`Experts.forward`) and
+`:137-142` (`_apply_gate`) at transformers v5.16.1, sha256
+`2092bbb4efa2a8087b74f4a4da37635c503fe1df9ae73f1e6e8342af8b4b8e8b`, unchanged
+from W5 — this wave changes which of OUR seams computes them, not what they are.
+
+**Tests, red first.**
+1. `MoeForward`'s keep-quant arm agrees with its host-f32 arm on the SAME
+   weights, at the published geometry, to the tolerance the two arms'
+   accumulator orders admit. Red before the arm exists because the arm does not
+   exist; red under a mutation that swaps gate and up; red under a mutation that
+   drops `swiglu_limit`.
+2. The `expert_ids` mapping: a slot's expert id must be `topk_ids[p]` and its
+   activation row must be `hidden[p / K]`. A mutation that uses `p % K`, or that
+   forgets the gather and broadcasts row 0, must red. This is the one place a
+   wrong answer is fluent rather than a crash.
+3. Admission: a layer whose gate and up dtypes differ is refused BY NAME rather
+   than falling silently to the host arm.
+4. Reachability: deleting the production call site in `MoeForward` reds the
+   focused gate.
+
+**Gates.**
+- Focused C++ suites by hand with assertion counts, plus
+  `scripts/agent-preflight.sh --fail-on-skip`.
+- A DEVICE gate on a leased fleet box: the CUDA provider of
+  `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` driven at THIS
+  model's geometry (E=288, N=2048, K=4096, top-8) on all four encoding triples
+  the artifact actually contains, asserted against the CPU provider that
+  `ops.h:2483-2485` declares is its golden. The box is recorded, because
+  `sm_110` (thor) and `sm_121a` (GB10) are different targets.
+- No end-to-end token claim. The parity operand for the model remains O30's
+  ` Paris.` on `dgx:gpu0` with `--device cpu`, and this wave does not move it.
+
+**Stop conditions.**
+- If the keep-quant arm and the host arm disagree beyond the accumulator
+  tolerance, STOP and report. Do not widen the tolerance to make it pass: the
+  host arm accumulates in `double` and the seam in f32, so a real disagreement
+  and an accumulator difference look alike and only a mutation separates them.
+- If any sparse layer's gate and up dtypes differ, STOP: the fused seam cannot
+  represent that checkpoint and the split-GEMM shape is a different design.
+- If a device gate cannot be taken because the fleet is held, the gate stays
+  `PENDING` with the reason recorded. An untaken device gate is never reported
+  as a pass.
+
+#### W9b — keep-quant device residency (GPU, large). NOT THIS WAVE
+
+Stage the 101.24 GiB of blocks with `dense_attn::ResidentWeight`
+(`dense_attn_block.h:181-234`, dtype-agnostic and already correct for GGUF
+blocks), slice the expert towers with the `KqResidentSlice` shape
+(`qwen3_5.cpp:5675-5688`), widen only the 346 Q8_0 tensors, and add the
+residency flag the dispatch predicate reads. **The open question is unified
+memory**: on GB10 a device copy of an mmap'd weight is a SECOND copy in the same
+pool, so 101.24 GiB resident plus the mmap's clean page cache is the thing to
+measure, not to assume. `V4ResidentExpertBase` (`deepseek_v4.cpp:1708-1715`)
+already answers it with `Synchronize` + `madvise(MADV_DONTNEED)` over the
+borrowed span, which is a move rather than a copy.
+
+#### W9c — the device forward (GPU, large). NOT THIS WAVE
+
+The remaining 6.57 GiB and roughly 2,900 lines of host f32 loops —
+`glm5_next_attn.cpp` (457), `glm5_next_dsa.cpp` (534), `glm5_next_kda.cpp`
+(417), `glm5_next_layer.cpp` (414), `glm5_next_forward.cpp` (370),
+`glm5_next_mhc.cpp` (89) — carry ZERO `vt::Tensor`. **This is why the
+DeepSeek-V4 shape does not apply**: `deepseek_v4.cpp:3100-3122` threads a
+`V4Backend{device=true}` flag through a host compose that already runs on
+device-capable ops, and there is no such compose here to thread a flag through.
+Kimi-Linear's dedicated `kimi_linear_device.cpp` (~2,500 lines) is the
+structural analogue, and it is a campaign rather than a wave.
+
+
+#### W9c — RESCOPED, and the premise the section above rests on is FALSIFIED
+
+`CLAIM-GLM53-FLASH-CUDA`, 2026-08-31, row `MODEL-MM-GLM53-FLASH-CUDA`, issue
+[#2410](https://github.com/mudler/vllm.cpp/issues/2410). This wave writes no
+product code. It is a SCOPING, and it exists because the paragraph above sends
+the next implementer to write a second `kimi_linear_device.cpp` when most of
+what that file would contain is already in this tree and already runs on a GPU.
+
+**The falsified sentence, quoted so it is not softened.** §W9c says the six
+forward files "carry ZERO `vt::Tensor`" and concludes "**This is why the
+DeepSeek-V4 shape does not apply**". Counted on `0b4766c96`, and every count
+and anchor in this section RE-MEASURED after merging `origin/main` at `28d521f90`
+-- because a merge that falsifies its own branch's prose is a failure this
+repository has already paid for:
+
+| file | lines | `vt::Tensor` | `vt::` COMPUTE-op call sites |
+|---|---:|---:|---:|
+| `glm5_next_moe.cpp` | 502 | **15** | **4** |
+| `glm5_next_kda.cpp` | 417 | **10** | **1** |
+| `glm5_next_attn.cpp` | 457 | 0 | 0 |
+| `glm5_next_dsa.cpp` | 534 | 0 | 0 |
+| `glm5_next_layer.cpp` | 414 | 0 | 0 |
+| `glm5_next_forward.cpp` | 370 | 0 | 0 |
+| `glm5_next_mhc.cpp` | 89 | 0 | 0 |
+| **total** | **2,783** | **25** | **5** |
+
+So the claim holds for 1,864 lines and is false for 919. The MoE arm builds
+`vt::Tensor` views and calls four device-capable ops
+(`glm5_next_moe.cpp:131,137,264,497`); the KDA arm builds them and calls
+`vt::KdaGatedDeltaRule` (`glm5_next_kda.cpp:404`). Both are then held on the
+host by an explicit CPU-only refusal — `glm5_next_kda.cpp:322-325` and
+`glm5_next_moe.cpp:222-225` — and NOT by an absence of device arithmetic. That
+is a different obstacle with a different cost, and W9a landing the MoE onto
+`vt::MoeGateUpSwiGLUGrouped` is what moved it.
+
+**EVERY primitive family this model needs already has a registered CUDA
+provider.** Registration is `vt::RegisterOp(OpId, DeviceType, fn)`
+(`include/vt/op_provider.h:127`), looked up by `vt::GetOp`
+(`op_provider.h:141`). Read on `0b4766c96`:
+
+| family | op | CUDA provider | CPU provider |
+|---|---|---|---|
+| KDA | `vt::KdaGatedDeltaRule` | `cuda_gdn.cu:6647-6649` | `cpu_ops.cpp:3936-3938` |
+| KDA | `vt::KdaChunkPrefill` | `cuda_gdn.cu:6650-6652` | `cpu_ops.cpp:3939-3940` |
+| MLA | `vt::MlaDecodeAttention` | `cuda_mla_attn.cu:805-806` | `cpu_mla_attn.cpp:221-222` |
+| MLA | `vt::MlaPrefillAttention` | `cuda_mla_prefill.cu:456-457` | `cpu_mla_prefill.cpp:275` |
+| DSA | `vt::DsaIndexerLogits` | `cuda_dsa_indexer.cu:320-321` | `cpu_dsa_indexer.cpp:184-185` |
+| DSA | `vt::DsaTopkSelect` | `cuda_dsa_indexer.cu:322` | `cpu_dsa_indexer.cpp:186` |
+| MoE | `vt::MoeRouterTopK` | `cuda_moe.cu:935-936` | `cpu_ops.cpp:3965-3966` |
+| MoE | `vt::MoeCombine` | `cuda_moe.cu:937-938` | `cpu_ops.cpp:3967` |
+| MoE | `vt::MoeGateUpSwiGLUGrouped` | `cuda_quant_dot.cu:2380` | `cpu_quant_gemm.cpp:308` |
+| MoE | `vt::MatmulBTQuantGrouped` | `cuda_quant_dot.cu:2161` | `cpu_quant_gemm.cpp:306` |
+| base | `vt::RmsNorm` | `cuda_ops.cu:3916-3917` | `cpu_ops.cpp:3858-3859` |
+| base | `vt::Matmul` / `vt::MatmulBT` | `cuda_matmul.cu:1221-1224` | `cpu_ops.cpp:3849-3852` |
+| base | `vt::Embedding` | `cuda_ops.cu:3930` | `cpu_ops.cpp:3898-3899` |
+| base | `vt::RopeNeox` | `cuda_ops.cu:3932-3933` | `cpu_ops.cpp:3900` |
+
+**No kernel in this campaign has to be written FOR CORRECTNESS.** The remaining
+work is to call ops that already exist from a compose that does not. That is the
+correction: the debt is a PORT, not a kernel campaign, and pricing it as the
+latter is what §W9c did.
+
+**Read that as a correctness claim and not a speed one, because two named speed
+debts survive it unchanged.** O14 already records that `vt::KdaChunkPrefill`
+cannot serve this model at all -- it fuses the SOFTPLUS forget-gate branch and
+this model needs the SIGMOID one -- so both prefill and decode run
+`vt::KdaGatedDeltaRule` for 34 of 45 layers, on device exactly as on host. §Our
+baseline "KDA" records a second cliff for the 64-head geometry. Neither is
+closed by having a CUDA provider, and O6 stays exactly as written: this campaign
+still publishes no number on any axis, and there is still no denominator.
+
+**THE BIGGEST REUSE IS THIS MODEL'S OWN SIBLING, AND §W9c DOES NOT MENTION IT.**
+`GlmMoeDsaForCausalLM` — the `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm`
+row §"Why this needs a spec before code" warns not to merge with this one — has
+a WORKING DEVICE FORWARD for the DSA/MLA block. `GlmResidentMla(Dev d, ...)`
+(`glm_moe_dsa_forward.cpp:157`) builds `mla::MlaBlockWeights` and drives
+`mla::ForwardMlaAttentionBlock`, which calls `vt::DsaIndexerLogits` and
+`vt::DsaTopkSelect` on the `Dev`'s queue (`mla_attention.cpp:920-921`) and
+`vt::MlaDecodeAttention` (`:1083`).
+
+**That seam ALREADY ADMITS THIS MODEL'S GEOMETRY, and O11 is why.**
+`MlaBlockDims::Validate` accepts `qk_rope_head_dim == 0` as the absent state of
+the decoupled rotary (`mla_attention.cpp:96,128`) — a relaxation W3
+([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) landed FOR THIS ROW.
+So the shared MLA block was widened to fit `glm5_next` a wave ago, and
+`glm5_next_attn.cpp` still does not use it: `grep -n 'mla::\|MlaBlock'` over
+`glm5_next_attn.{h,cpp}` returns NOTHING. The model hand-rolls, in 457 + 534
+host lines, a block this tree already ships, already gates, and already runs on
+a GPU for the sibling architecture.
+
+That is the "parallel path by hand" AGENTS.md §"Shared seams" forbids, and it is
+recorded here as a defect rather than as a design. O33 owns it.
+
+**What this changes about the waves.** The device arm is still not one wave, and
+the honest count is four rather than "a campaign":
+
+- **W9b — keep-quant residency** (GPU, large), unchanged from the section above:
+  stage the 101.24 GiB with `dense_attn::ResidentWeight`
+  (`dense_attn_block.h:181`), whose predicate is `is_cpu()` and whose staging arm
+  is dtype-agnostic over GGUF blocks. The open question stays unified memory, and
+  `V4ResidentExpertBase` (`deepseek_v4.cpp:1807`, the reclaim itself at `:1793`) already answers it with
+  `Synchronize` + `madvise(MADV_DONTNEED)`. NOT started.
+- **W9c-1 — the DSA/MLA block onto `mla::ForwardMlaAttentionBlock`.** Retire
+  `glm5_next_attn.cpp`'s hand-rolled MLA and `glm5_next_dsa.cpp`'s hand-rolled
+  indexer in favour of the seam the sibling already drives, keeping both host
+  references BELOW the fold as the parity operand exactly as
+  `nemotron_h_registry.cpp:204-213` keeps its own. 11 of 45 layers. NOT started.
+- **W9c-2 — lift the two CPU-only refusals** (`glm5_next_kda.cpp:322-325`,
+  `glm5_next_moe.cpp:222-225`) once W9b makes the operands resident, so the KDA
+  and MoE arms reach the CUDA providers they already call. 34 of 45 layers plus
+  every sparse block. NOT started.
+- **W9c-3 — the compose**: `Dev`/`DBuf` (`dense_device_glue.h:42`, `DBuf` `:109`, pool policy `:87`), a
+  device-carrying `ForwardLogits` (`qwen3_5.h:153`, `on_device()` `:166`), the
+  `input.gather_logits` dispatch predicate with a residency clause
+  (`deepseek_v4_registry.cpp:106`), RMSNorm / the embedding gather / the lm_head
+  chunk onto `vt::RmsNorm`, `vt::Embedding` and `vt::MatmulBT`, and the mHC
+  sites. This is the wave that deletes the refusal at
+  `glm5_next_forward.cpp:231-238`. NOT started.
+
+**mHC is the ONE family with a real gap, and it is small.** `glm5_next_mhc.cpp`
+(89 lines) calls `deepseek_v4_mhc.cpp`'s host functions directly
+(`glm5_next_mhc.h:20-24`) and reaches no op table. `vt::OpId::kDeepseekV4Mhc`
+(`ops.h:294`) is registered on CUDA ONLY (`cuda_deepseek_v4.cu:2102`), has no
+free-function wrapper in `ops.h`, and is reached only through
+`vt::GetOp(kDeepseekV4Mhc, kCUDA)` behind an `OpRegistered` probe
+(`deepseek_v4_device.cpp:15,31`). So the mHC device kernel EXISTS and its CPU
+half does not, which is the mirror image of every other family here. W9c-3 owns
+deciding whether `glm5_next` reaches it through the same probe or the seam grows
+a CPU registration; both are in scope for that wave and neither is settled here.
+
+**In scope for THIS wave.** This section, the O32-O34 entries, the `## Now`
+update, and the device-gate evidence below. No product code. No file under
+`src/`, `include/` or `tests/` changes.
+
+**Out of scope, named so no reader mistakes this for the port.** Every one of
+W9b, W9c-1, W9c-2 and W9c-3. The vision tower (W6). Any speed number: O6 is
+unchanged and there is still no denominator.
+
+**Gates.** `scripts/agent-preflight.sh --fail-on-skip` exits **1**, and the
+single failure is environmental and reproduced three times rather than waved
+past. 136 checks `ok`; `test_cpu_x86_llamacpp_floor` fails
+`test_a_contended_leg_is_discarded_and_never_summarised` in every run, printing
+its own reason: `NO_QUIET_WINDOW after 30s (busy=340% builders=0 load=129.36)`,
+and `load=80.69` / `load=67.72` / `load=141.56` in the three runs. The dev box
+carried 13 concurrent preflights and two foreign builds throughout. **The
+attribution is structural, not a judgement call: this change is 313 added lines
+in ONE markdown file and changes nothing under `src/`, `tests/`, `include/` or
+`scripts/`**, so the harness and every input it reads are byte-identical to
+`origin/main`. A contention guard firing on real contention is the test working.
+
+
+**THE DEVICE GATE §W9a LEFT PENDING IS TAKEN, ON `thor:gpu0`, AND IT PASSES.**
+`vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` driven at this
+model's published MoE geometry — E=288, I=2048, H=4096, top-8, P=16 — on all
+four of the artifact's real encoding triples, the CUDA provider asserted against
+the CPU provider `ops.h` names as its golden.
+
+| | |
+|---|---|
+| job | `386accdc-ccf1-4575-81c1-36406a452b1b`, `rc run -d thor:gpu0` |
+| device | NVIDIA Thor, `GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600`, driver 595.78, `compute_cap` 11.0, built `sm_110a` |
+| worker | `rc-worker-n8smh`, aarch64, 14 cores, 122 GiB, `boot_id 7ac96c66-5444-4e67-87d2-3b9f0e44f39a` |
+| source | `git archive` of `0b4766c96`, `src.tar.gz` sha256 `35662b6ad93c…` |
+| binary | `test_cuda_quant_dot` sha256 `a78f2e908e236ebeb9635150bb2555c4968a8bfa5f0f8f9528b17974cb42f900` |
+| the GLM-5.3-Flash geometry case | **1 case, 25 assertions, 0 failed** |
+| the whole `test_cuda_quant_dot` suite | **17 cases, 177,284 assertions, 0 failed** |
+| run | 2026-08-31T14:21:53Z → 14:22:36Z |
+
+25 assertions and not 0 is the part that makes this a result: a doctest filter
+that matches nothing exits 0 with `assertions: 0`, which is a skip wearing a
+pass, and the job reads that line out loud and refuses it rather than reporting
+the exit code. The `static_assert` in the case pins what it is FOR —
+`288 * 2048 * 4096 = 2,415,919,104` elements is past INT32 while every byte
+offset in the same tower still fits, so a 32-bit element count would truncate
+here and nowhere in the E<=4 codebook cases.
+
+**`dgx:gpu0` is still queued and this gate is NOT closed by the `thor` run.**
+`sm_110` and `sm_121a` are different targets and a number from one does not
+transfer to the other; the GB10 leg stays PENDING until its lease returns.
+
+**One fleet fact bounds the END-TO-END test and is recorded here**, because
+which box can ever take the end-to-end test: on `thor:gpu0` (`compute_cap` 11.0,
+read off the device) a CUDA build with `-DVLLM_CPP_FLASH_ATTN=ON` and CUTLASS
+4.5.0 configures to `CUDA FA2 compiled-arch manifest: []` (the manifest line is
+`CMakeLists.txt:2942`) -- FA2's arch table is
+`8.0,8.6,8.7,8.9,12.0a,12.1a` at `cmake/CudaArchFeatures.cmake:349`, and 11.0
+is not in it. MLA prefill on this
+family IS FlashAttention with no fallback beneath it, so the eventual
+`--device cuda` end-to-end test can only ever run on `dgx:gpu0` (`sm_121a`).
+`thor` can still take the MoE geometry gate, which needs no FA2. No end-to-end token claim: the
+parity operand for this model remains O30's ` Paris.` on `dgx:gpu0` with
+`--device cpu` at 195.5 s/token, and this wave does not move it.
+
+**Stop conditions.** If the device gate fails, that is the RESULT and it lands
+as one — §W9a's own stop condition already says an untaken device gate is never
+reported as a pass, and a taken one that reds is a finding about the CUDA
+providers this campaign is about to depend on. If any reading above cannot be
+reproduced on the recorded SHA, STOP: a scoping built on a misread anchor is
+worse than no scoping, and this spec family has been caught with drifted anchors
+before.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -1237,7 +2458,9 @@ reference implementation's own output.
 | W2 | tiny-shape forget-gate / gated-norm / l2norm goldens; RED-first against the softplus branch | CPU |
 | W3 | NoPE MLA accept+refuse; k-pool selection at context **> `index_topk` = 2048**; SACRED inertness on DeepSeek-V2/V3, Kimi-Linear, GLM-4.7-Flash goldens byte-identical | GPU |
 | W4 | mHC goldens at `hc_mult 4`; RED-first against `HcHeadCollapse` | CPU |
-| W5 | per-layer control-flow goldens; assembled tiny-model forward vs the tiny reference | GPU |
+| W5 | router goldens at the PUBLISHED 288/top-8 asserting SET equality with the margin printed; the clamped-SwiGLU epilogue on a row that ACTUALLY clamps in both halves; the composed routed+shared block; the three KV groups and their geometry reached through the `make_kv_cache` factory hook, with the hook unwired as the reachability mutation | CPU |
+| W5b | per-layer control-flow goldens; assembled tiny-model forward vs the tiny reference | GPU |
+| W5c | `load_weights` builds a `LoadedModel` from a synthetic tiny GGUF and `ModelRegistry::Forward` reaches it; deleting that call site reds | GPU |
 | W6 | processor parity vs the transformers processor at the lane pin; placeholder-expansion goldens | GPU |
 | W7 | **the arm below RUNS on `dgx:gpu0` and generates coherent text** | GPU |
 
@@ -1368,6 +2591,142 @@ Second-choice, if Q2_K's ~17 GiB proves thin once W5 measures the real KV: drop
 the experts to Q2_K and leave the 3% at Q5_K, or accept a shorter maximum
 context. Do not reach for IQ2_XXS to buy headroom without first solving the
 imatrix problem.
+
+### The measured residency, and the two `vec_dot` rows that produced it
+
+[#2247](https://github.com/mudler/vllm.cpp/issues/2247), rows
+`QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS`.
+
+**Scope.** Two keep-quant `vec_dot` kernels in `src/vt/cpu/cpu_quant_dot.cpp`
+beside the fifteen already there, their two block structs, and their two
+`QuantTraits` rows. Nothing else: #2245 had already landed the row decoders, the
+reader strides and the vt geometry, so this row is purely the dot-product side.
+
+**Upstream anchors**, read out of the pinned object with `git cat-file` and
+`git archive` from a fresh partial clone of `ggml-org/llama.cpp`, never a working
+tree. `refs/tags/b10451` was confirmed to resolve to
+`10bf611e533d81f739128304991c5e133c6aebd8` in that clone.
+
+| ported | from |
+|---|---|
+| `VecDotIQ2_XSQ8_K` | `ggml/src/ggml-cpu/quants.c:948` `ggml_vec_dot_iq2_xs_q8_K_generic` |
+| `VecDotIQ4_XSQ8_K` | `ggml/src/ggml-cpu/quants.c:1283` `ggml_vec_dot_iq4_xs_q8_K_generic` |
+| `BlockIQ2_XS` (74 B) | `ggml/src/ggml-common.h:388-393` `block_iq2_xs` |
+| `BlockIQ4_XS` (136 B) | `ggml/src/ggml-common.h:454-460` `block_iq4_xs` |
+| IQ2_XS traits row | `ggml/src/ggml-cpu/ggml-cpu.c:342-347` |
+| IQ4_XS traits row | `ggml/src/ggml-cpu/ggml-cpu.c:385-390` |
+
+**The activation pairing was RESOLVED, not assumed.** IQ4_XS reuses IQ4_NL's
+`kvalues_iq4nl` byte for byte, and IQ4_NL pairs with Q8_0, so the shape of the
+question was real. `type_traits_cpu` answers it: `[GGML_TYPE_IQ4_XS]` carries
+`.vec_dot = ggml_vec_dot_iq4_xs_q8_K` and `.vec_dot_type = GGML_TYPE_Q8_K`
+(ggml-cpu.c:385-390), against `[GGML_TYPE_IQ4_NL]`'s `GGML_TYPE_Q8_0`
+(:379-384), and the kernel's own name carries the same answer. The reason is
+geometry rather than codebook: IQ4_NL's block is 32 elements and pairs with the
+32-element activation encoding, IQ4_XS's is a 256-element super-block and pairs
+with the 256-element one. Both IQ2_XS and IQ4_XS therefore dot against Q8_K.
+
+**Design.** Both bodies are kept verbatim, including the accumulation order:
+IQ2_XS folds `sumi` into `bsum` TWICE per 32-element sub-block because the two
+halves take different scale nibbles, and IQ4_XS forms `d1`/`d2` as f32 before the
+integer sums and accumulates into `sumf` eight times per super-block. That order
+is what makes our GEMM bit-reproducible against upstream, and rewriting either
+body "more naturally" would break the gate below rather than merely change a
+rounding.
+
+**Risk this row exists to manage: a `vec_dot` is a REDUCTION.** A wrong grid
+entry, a swapped scale nibble or a mis-shifted `scales_h` bit pair does not
+throw. It moves the sum a little, and every consistency check in the tree
+(vec_dot against `BlockToFloat`, `MatmulBTQuant` against per-row vec_dot) reads
+the same decode twice and agrees with the defect. IQ2_XXS / IQ2_XS / IQ2_S are
+three same-shaped codebooks, so a kernel pointed at a sibling still indexes in
+range and still returns a plausible magnitude.
+
+**Tests.** Gated BIT FOR BIT against the ORACLE'S OWN KERNELS on REAL bytes of
+the staged artifact — the same 4 IQ2_XS super-blocks of
+`blk.3.ffn_gate_exps.weight` and 4 IQ4_XS super-blocks of
+`blk.11.ffn_down_exps.weight` that #2245's decoder goldens use, re-verified
+against the live file by `dd` on 2026-08-29. The activation side is the oracle's
+own `quantize_row_q8_K_generic` over a deterministic integer-valued signal, and
+the goldens carry the resulting Q8_K bytes so the test can also assert that OUR
+`from_float` reproduces them. The comparison is against upstream's own f32
+accumulation and not against a cleaner f64 reference, because a double
+accumulator agrees with a reduction-order defect. Total and per-super-block
+values are both pinned, so a defect that cancels across blocks is still caught.
+Goldens and the full reproduction recipe: `tests/vt/iq2xs_iq4xs_dot_golden.h`.
+
+Both types also join `kWeightCases` in `tests/vt/test_ops_quant_dot.cpp`, which
+runs the whole existing battery over them (random-block decode against an
+independent f64 reference, `MatmulBTQuant` against per-row vec_dot, the NMSE
+ceiling, run-to-run bit-exactness).
+
+**The codebook seal is now COUPLED to the kernel.** #2245 sealed `kIq2xsGrid`
+with an FNV-1a digest and a lane histogram, which proves the TABLE holds the
+pinned bytes and says nothing about which table the kernel reads. Swapping
+`kIq2xsGrid` for `kIq2xxsGrid` inside `VecDotIQ2_XSQ8_K` leaves the seal green
+and reds the oracle golden; that mutation is the proof, and the coupling case
+states the two facts it depends on (the tables differ over their shared first 256
+rows, and the blocks dotted use indices above 255).
+
+**The measured residency.** `RouteGgufTensor` — the production decision — driven
+over all 1412 tensors of the artifact's own headers, roles assigned by the
+loader's convention (`token_embd.weight` a gather, 3-D `*_exps.weight` stacked
+expert weights, other 2-D weights GEMM weights, 1-D vectors), costing a kept
+tensor its file bytes and an expanded one `numel x 2`. Nothing is loaded: the
+reader mmaps and only the tensor table is touched.
+
+| type | n | disk GiB | resident GiB | resident before #2247 |
+|---|---:|---:|---:|---:|
+| F32 | 638 | 0.21 | 0.10 | 0.10 |
+| IQ2_XS | 82 | 53.33 | **53.33** | **369.00** |
+| IQ3_XXS | 41 | 35.31 | 35.31 | 35.31 |
+| IQ4_XS | 3 | 3.59 | **3.59** | **13.50** |
+| Q2_K | 2 | 1.48 | 1.48 | 1.48 |
+| Q3_K | 1 | 0.97 | 0.97 | 0.97 |
+| Q4_K | 1 | 0.33 | 0.33 | 0.33 |
+| Q5_K | 181 | 3.03 | 3.03 | 3.03 |
+| Q6_K | 117 | 2.20 | 2.20 | 2.20 |
+| Q8_0 | 346 | 0.80 | 0.80 | 0.80 |
+| **TOTAL** | **1412** | **101.24** | **101.14** | **426.72** |
+
+774 of the 1412 tensors route to `kKeepQuant`. All-bf16 is 597.46 GiB. The
+saving is **325.58 GiB**, and 101.14 GiB against ~119.63 GiB leaves 18.49 GiB.
+The "before" column is the same loop with the two types forced to expand on the
+GEMM roles, which is exactly the tree at `94de63ff5`.
+
+**This is a RESIDENCY result and not a speed one, and on `dgx:gpu0` it is not
+even a GPU one.** `RouteGgufTensor` is the production decision and the table
+above is what it decides, so the artifact genuinely fits. What fits does not
+follow the same path afterwards: the CUDA arm has NO keep-quant kernel for
+either new type, so on that box the expert GEMM these 85 tensors feed takes the
+CPU fallback behind a full `cudaStreamSynchronize`, and the fused
+`vt::MergedGemmGroup` seam throws outright. That gap is
+[#2260](https://github.com/mudler/vllm.cpp/issues/2260), recorded as **O19**
+under `## Owed` with the mechanism, the reachability argument and the three
+options. Nothing on this row reaches the fused seam today, so this row breaks
+nothing; W5b and W5c make it live. Read every number in this section as "the
+model is resident", never as "the model runs at this speed on GB10".
+
+**IQ4_XS has a SECOND consumer, and the expert-tower lane is all-or-nothing.**
+`GgufExpertTowersReachSlotLane` (`gguf_device_fit.cpp`) loops the matching
+towers and returns false on the FIRST one that does not reach a keep residency,
+so a handful of IQ4_XS towers drops a whole arm out of the streaming lane. On
+the GLM-5.3 (non-Flash) `UD-IQ1_S` arm that is 4 IQ4_XS tensors beside 106
+IQ1_S, 71 IQ3_XXS, 44 IQ2_XXS and 3 K-quant, every one of which already kept:
+one expert tower then goes 6.375 GiB to 24.000 GiB of bf16 and the uniform slot
+goes 6.375 MiB to 24.00 MiB, turning a 4096-slot cache from 25.5 GiB into 96
+GiB. `tests/vllm/model_executor/test_gguf_device_fit.cpp` carries the assertion
+directly, on a fixture whose towers are IQ2_XS and IQ4_XS in the
+`kStackedExpertWeight` role both models store them in — the role `PeekRoute`
+asks about, and the one this row is actually load-bearing for.
+
+**Gates.** `tests/vt/test_ops_quant_dot.cpp`,
+`tests/vt/test_ops_quant_traits.cpp`, `tests/vllm/test_gguf_keep_quant.cpp`,
+`tests/vllm/model_executor/test_gguf_device_fit.cpp`, plus
+`scripts/agent-preflight.sh --fail-on-skip`. The routing table in
+`test_gguf_keep_quant.cpp` is restated rather than refitted: its GEMM term moves
+20 -> 24 and its GATHER term stays 13, the mirror image of #2245's decode-only
+move (gather 11 -> 13, GEMM 20).
 
 ### Three things that make "fits in VRAM" the wrong question
 
@@ -1537,14 +2896,26 @@ Debts this row carries, each visible rather than waived:
   recorded here rather than in the report that noticed it, because the next
   reader will land on this line and not on that report.
 - **O6 — speed.** No number on any axis, and no denominator exists.
-- **O7 — no artifact of this model exists.** W7a authored the converter and
-  gated it on synthetic fixtures; it has never been run against the real
-  checkpoint. Producing the Q2_K arm needs the 300–600 GiB checkpoint staged on
-  local disk (not CIFS), explicit developer authority for the download, and a
-  box with room for the source and the ~100.35 GiB output at once. Until then
-  every GPU gate on this row — W3, W5, W6 and W7b — has nothing to load, and
-  §Evidence's sha256, conversion recipe and peak RSS are unpaid.
-  W7b/[#2011](https://github.com/mudler/vllm.cpp/issues/2011) owns it.
+- **O7 — NARROWED by W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)):
+  an artifact EXISTS, and what is still owed is a conversion of OURS.** The
+  original entry said "no artifact of this model exists", and that sentence was
+  true when W7a wrote it and stopped being true when `unsloth/GLM-5.3-Flash-GGUF`
+  published `UD-Q2_K_XL` — revision `d425e572fb9686125831f476129e51cea34bc5b4`,
+  four shards, 1412 tensors, 101.2535 GiB, `general.architecture = glm5next`,
+  now staged at `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` and read
+  header-first by this row three times. **It was also still in PRODUCT OUTPUT**,
+  as the second sentence of the loader's GGUF refusal, and W5c removed it there
+  as well: a record correction that leaves the lie in the product is not a
+  correction.
+
+  W7b/[#2225](https://github.com/mudler/vllm.cpp/issues/2225) still owns what
+  remains, and it is smaller than it was: W7a's converter has still never been
+  run against the real checkpoint, so §Evidence's sha256 of OUR output, its
+  conversion recipe and its peak RSS are unpaid, and producing it still needs
+  the 300–600 GiB source staged on LOCAL disk (not CIFS), explicit developer
+  authority for the download, and a box with room for source and output at once.
+  What is no longer owed is a file to load: W5c resolves all 1383 of the
+  published artifact's backbone tensor names through the production chain.
 - **O8 — the Q3_K, Q4_K and Q5_K ENCODERS are not ported** and the converter
   refuses those arms by name. Write side, like O5: the matching DECODERS have
   been present and gated since the k-quant port, so this entry never said
@@ -1566,14 +2937,38 @@ Debts this row carries, each visible rather than waived:
   loader wave that owes the work instead of naming the file's architecture as
   unrecognized. That distinction is the whole of O9 and it is not more than
   that.
-- **O10 — nothing above the config layer is implemented, and the loader, the
-  forward and the KV-cache spec all refuse by name.** W1 makes
-  `Glm5NextForConditionalGeneration` RESOLVE and makes its config PARSE and
-  VALIDATE. It does not make the model load and it does not make it forward.
-  The KDA sigmoid forget-gate branch is W2's, the NoPE MLA and the k-pool
-  indexer W3's, the unweighted mHC head W4's, the assembled text forward W5's,
-  the vision tower and processor W6's. Each refusal names its wave.
-  [#2067](https://github.com/mudler/vllm.cpp/issues/2067) records it.
+- **O10 — NARROWED TWICE, to the FORWARD alone: by W5c
+  ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)), which made the model
+  LOAD, and by W5 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)),
+  which made it PUBLISH a KV-cache spec.**
+  W1 made `Glm5NextForConditionalGeneration` RESOLVE and made its config PARSE
+  and VALIDATE; W2, W3 and W4 landed the KDA sigmoid forget gate, the NoPE MLA
+  with the k-pool indexer, and the unweighted mHC head as host references; W5c
+  landed the weight tower, so the GGUF arm of `load_weights` now returns a real
+  `Glm5NextLoadedModel` and this architecture has a `LoadedModel` for the first
+  time.
+
+  **The KV-CACHE SPEC NO LONGER REFUSES, and W5 is where it stopped.**
+  `MakeGlm5NextKVCache` is wired into `kGlm5NextFactory` as `.make_kv_cache` and
+  returns THREE real groups on the published topology — the MLA latent over the
+  11 DSA layers, one uniform recurrent group over the 34 KDA layers, and the
+  257-wide DSA indexer side cache — entered through `ModelRegistry::Resolve` and
+  the production `make_kv_cache` factory hook. An earlier revision of this
+  paragraph assigned the KV-cache spec to W5b alongside the forward. That
+  sentence was falsified by W5's own diff, and it is the failure
+  [#2230](https://github.com/mudler/vllm.cpp/issues/2230) documents: a refusal
+  that names a wave which already landed sends the next reader to redo finished
+  work. It is corrected here rather than carried.
+
+  What still refuses, and who owns each: the FORWARD is W5b's
+  ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)); the VISION
+  TOWER, processor and placeholder expansion are W6's; the MTP HEAD is O2's; the
+  SAFETENSORS arm is deferred rather than unwritten, because every published
+  safetensors artifact exceeds every device this project owns, and its refusal
+  now says so. Each refusal names its wave.
+  [#2067](https://github.com/mudler/vllm.cpp/issues/2067),
+  [#2242](https://github.com/mudler/vllm.cpp/issues/2242) and
+  [#2223](https://github.com/mudler/vllm.cpp/issues/2223) record it.
 - **O11 — DISCHARGED by W3 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213)).**
   `MlaBlockDims::Validate` accepts `qk_rope_head_dim == 0` as the ABSENT state
   of the decoupled rotary, so `head_size()` is `kv_lora_rank` (512) and the
@@ -1626,7 +3021,8 @@ Debts this row carries, each visible rather than waived:
   still refuses by name (O10), so the only call sites at that merge commit are
   the focused gate's. This is the staged-slice disclosure AGENTS.md "Nothing
   lands dead" requires and not an exception claimed by silence: the wiring
-  belongs to **W5**, the assembled text forward, on row
+  belongs to **W5b**, the assembled text forward (W5 landed the MoE and the
+  KV-cache spec and does not call the KDA arm), on row
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no
   issue of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
   tracks it. What W2 buys is that when W5 wires the layer it wires a gated one.
@@ -1637,11 +3033,14 @@ Debts this row carries, each visible rather than waived:
   no command-line default can reach `MhcPre`, `MhcPost` or `HcHeadCollapseMean`.
   The gate enters through the test binary, which measures the functions and not
   a capability. This is the staged-slice exception in AGENTS.md §"Nothing lands
-  dead", declared rather than silent. **W5 owns the wiring** — it assembles
+  dead", declared rather than silent. **W5b owns the wiring** — it assembles
   `Glm5NextTextModel::Forward` and the decoder layer's two mHC sites — on the row
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and
   [#2098](https://github.com/mudler/vllm.cpp/issues/2098) records it under the
-  campaign issue [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+  campaign issue [#1998](https://github.com/mudler/vllm.cpp/issues/1998). W5
+  ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) landed the MoE block
+  and the KV-cache spec and calls none of these three; the split and its reason
+  are in `### W5` above.
 - **O17 — W3's DSA indexer and the NoPE geometry are NOT REACHED from a
   production entry point.** `src/vllm/model_executor/models/glm5_next_dsa.cpp`
   is a host reference and nothing in the shipped tree calls it: the loader and
@@ -1654,12 +3053,18 @@ Debts this row carries, each visible rather than waived:
   changed them — what is unreached is the NoPE *configuration* of that seam,
   because no registered model resolves `qk_rope_head_dim == 0` yet. This is the
   staged-slice disclosure AGENTS.md "Nothing lands dead" requires, declared
-  rather than claimed by silence. **W5 owns the wiring** — it assembles
+  rather than claimed by silence. **W5b owns the wiring** — it assembles
   `Glm5NextTextModel::Forward`, builds the `MlaBlockDims` for the 11 DSA layers
   and calls the indexer from the decoder layer — on the row
-  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no issue
-  of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
-  tracks it. What W3 buys is that when W5 wires the layer, the geometry it needs
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998). W5
+  ([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) did NOT do it and
+  says why: there is no assembled `Glm5NextTextAttention` for the DSA arm to
+  call, so the layer would have one live branch and one that throws. **W5 DID
+  publish the KV-cache group this geometry needs** — an `MLAAttentionSpec` at
+  head 512 for the 11 DSA layers and a second one at 257 for the indexer side
+  cache — and that group IS reached, through the production `make_kv_cache`
+  hook, so the NoPE latent width is no longer only a test's opinion. What W3 buys is that when W5 wires the layer, the geometry it needs
   is representable and the candidate set it selects over is the pooled one.
 
   **The same entry carries W3's second debt, because it is the same wave's and
@@ -1679,23 +3084,98 @@ Debts this row carries, each visible rather than waived:
   `dgx:gpu0` lease on this row;
   [#2213](https://github.com/mudler/vllm.cpp/issues/2213) records it.
 
-- **O18 — the loader now stops on a per-layer CONFIG KEY instead of on a tensor
-  type, and the artifact still does not FIT.** With
+- **O18 — the three per-layer CONFIG ARRAYS are DISCHARGED, and the loader now
+  stops one geometry key further on. The artifact now FITS, and the sentence
+  that said otherwise was true only until
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) landed the two
+  keep-quant kernels (see the residency paragraph at the foot of this entry).**
+  With
   [#2240](https://github.com/mudler/vllm.cpp/issues/2240)'s IQ2_XS and IQ4_XS
   decoders in, `LoadedEngine::FromModelDir` opens all four shards of the staged
   `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` artifact, sizes all 1412
-  tensors, and runs on into config resolution, where it stops with
+  tensors, and ran on into config resolution, where it stopped with
   `glm5_next gguf: key glm5next.attention.head_count_kv is not an integer`. The
   published artifact stores that key as a per-layer `array[i32]` of length 46,
-  and `Glm5NextHfConfigFromGguf` reads it as a scalar.
+  and `Glm5NextHfConfigFromGguf` read it as a scalar.
   `glm5next.swiglu_clamp_exp` and `glm5next.swiglu_clamp_shexp` are per-layer
-  `array[f32]` of the same length, so the same shape is waiting twice more
-  directly behind it. Measured 2026-08-29 by driving the production loader
-  read-only, with the reader's `case 17:` deleted and restored to prove the
-  before/after on ONE binary: without it the same probe stops at
-  `tensor "blk.3.ffn_gate_exps.weight" has unknown ggml type id 17 in
-  ...-00002-of-00004.gguf`. Owned by the config/loader wave on this row;
-  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) records it.
+  `array[f32]` of the same length, and there is no `glm5next.layer_types` key at
+  all, so the same shape was waiting twice more and a `ReqStrArray` behind that.
+
+  **Discharged by [#2243](https://github.com/mudler/vllm.cpp/issues/2243) and
+  [#2177](https://github.com/mudler/vllm.cpp/issues/2177) together**, which are
+  one defect seen from two sides: the builder now accepts llama.cpp's
+  scalar-or-array spelling of `attention.head_count_kv`
+  (`b10451:src/llama-model.cpp:1177` reads it through
+  `get_key_or_arr(..., n_layer, false)`) and DERIVES the schedule from the values
+  with llama.cpp's own predicate, `is_recr_impl[i] = hparams.n_head_kv(i) == 0`
+  (`b10451:src/models/kimi-linear.cpp:18`, "KDA layers are recurrent"). When both
+  spellings are present they are cross-checked on the layer KIND and a clash
+  refuses by name; a per-layer array whose length is not `block_count` refuses by
+  name with the shape found; a non-uniform clamp array refuses, because upstream
+  has ONE `swiglu_limit`; and a file that states the schedule in neither spelling
+  still refuses, naming both keys. The `idx % 4 != 3` fallback survives ONLY on
+  the `config.json` path, where it is upstream's own default.
+
+  **THE NEW STOPPING POINT, measured 2026-08-29 on one tree and one binary**,
+  with the array fix reverted and restored so the before/after is not a
+  cross-build comparison. Driven through `LoadedEngine::FromModelDir` on
+  `device = kCPU`, headers only, no tensor materialised:
+
+  ```text
+  without the fix : glm5_next gguf: key glm5next.attention.head_count_kv is not an integer
+  with    the fix : vt: glm5_next gguf: attention.key_length_mla - attention.key_length
+                    is -256 but rope.dimension_count is 0; the file states this model's
+                    rotary width twice and the two disagree
+  ```
+
+  The refusal is the rotary-width cross-check in `Glm5NextHfConfigFromGguf`,
+  named here rather than by `file:line` because the anchor moved once inside the
+  pull request that measured it. The append-only index row for
+  [#2268](https://github.com/mudler/vllm.cpp/issues/2268) quotes the line number
+  it had when the row was appended and cannot be edited; this entry is the
+  corrected surface.
+
+  **BLOCKS ARE NOT LAYERS, and the GGUF path used to conflate them.**
+  `c.num_hidden_layers` was set straight from `block_count`, so the SAME model
+  resolved to a 45-layer backbone from its `config.json` and a 46-layer one from
+  its GGUF, and the extra entry was the MTP block. Nothing downstream would have
+  refused it: `ParseGlm5NextParams` sizes all three schedules from
+  `num_hidden_layers`, so W5b and W5c would have built a decoder layer out of
+  the MTP block, and it would have run and produced plausible tokens. The
+  contract is BACKBONE depth — `glm5_next.h:193` already annotates the field as
+  `// 45` — and llama.cpp states the relationship in its own converters:
+  `self.block_count = self.hparams["num_hidden_layers"] +
+  self.hparams.get("num_nextn_predict_layers", 0)`
+  (`b10451:conversion/exaone.py:134`, and the same `+=` at
+  `b10451:conversion/deepseek.py:470` and `:545`). The builder therefore
+  resolves `num_hidden_layers = block_count - nextn_predict_layers`, validates
+  every per-block array against `block_count`, and truncates the three
+  schedules to the backbone. A file claiming more MTP blocks than blocks is
+  refused by name. Our own converter writes `block_count = n_layers` with
+  `nextn_predict_layers = 0` (`scripts/convert-glm5-next-gguf.py:997`, `:1024`),
+  so the formula leaves its output unchanged.
+
+  **What W5b inherits from this.** The MTP block is read, counted and DROPPED:
+  its entry in `attention.head_count_kv` — index 45, value `1`, MLA-shaped — is
+  not carried into `layer_types`, and no field on `HfConfig` or
+  `Glm5NextParams` holds `nextn_predict_layers` yet. So W5b
+  ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) gets a stack sized
+  to 45 and must not build a layer for block 45; if the MTP head needs that
+  block's kind, W5b adds the field, because this change deliberately did not.
+  O2 still owns the head itself.
+
+  That is NOT a malformed file. `attention.key_length` is 512 and
+  `attention.key_length_mla` is 256 in the published artifact because llama.cpp
+  writes `key_length = kv_lora_rank + qk_rope_head_dim` and
+  `key_length_mla = qk_nope_head_dim + qk_rope_head_dim`
+  (`b10451:conversion/deepseek.py:345-348`), while
+  `scripts/convert-glm5-next-gguf.py` writes `key_length = qk_nope_head_dim` — a
+  different quantity under the same name. `glm5next.attention.linear_head_count`,
+  a `ReqInt` here, appears in none of the file's 72 keys, and llama.cpp spells it
+  nowhere. Both are one defect and both change the WRITE side, so they are filed
+  as [#2268](https://github.com/mudler/vllm.cpp/issues/2268) rather than folded
+  into a config-array fix, and this row owns them. **O20 DISCHARGES both**, and
+  carries the stopping point that replaced this one.
 
   **The array is 34 zeros and 12 ones.** Parsed 2026-08-29 from shard 1's KV
   block. Key index 21, `glm5next.attention.head_count_kv: array[i32] len=46`:
@@ -1734,20 +3214,41 @@ Debts this row carries, each visible rather than waived:
   #2243 quotes the superseded 35 / 11 and cannot be edited; that row names this
   entry, so this entry is the corrected surface.
 
-  **Reaching config resolution is not the same as the model fitting.** Both new
-  types are DECODE-ONLY. Neither has a keep-quant `vec_dot`, so
-  `HasQuantDotKernel` is false and every GEMM weight of those two types expands
-  to bf16 at load. Measured from the staged artifact's own headers, all four
-  shards and all 1412 tensors: the file is **101.24 GiB on disk and 597.46 GiB
-  as bf16**, an expansion of 5.9x. The resident cost TODAY is **426.72 GiB**,
-  and `dgx:gpu0` has about 119.63 GiB, so it does not fit. A keep-quant
-  `vec_dot` for exactly these two types brings the resident cost to **101.14
-  GiB**, which fits with 18.49 GiB of headroom, and saves **325.58 GiB**. Every
-  other encoding in this file already keeps its quantization, IQ3_XXS
-  (`VecDotIQ3_XXSQ8_K`) included, so these two types are the whole gap.
-  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) owns that work, and
-  the `QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS` rows of
-  [`quantization-matrix.md`](../quantization-matrix.md) carry it as `C` = `-`.
+  **Reaching config resolution is not the same as the model fitting, and that
+  half is now PAID.** Both types were DECODE-ONLY when this entry was written:
+  neither had a keep-quant `vec_dot`, so `HasQuantDotKernel` was false and every
+  GEMM weight of those two types expanded to bf16 at load. Measured from the
+  staged artifact's own headers, all four shards and all 1412 tensors: the file
+  is **101.24 GiB on disk and 597.46 GiB as bf16**, an expansion of 5.9x, and
+  the resident cost was **426.72 GiB** against about 119.63 GiB on `dgx:gpu0`.
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) ported the two
+  kernels, and the same measurement now reads **101.14 GiB**, which fits with
+  18.49 GiB of headroom, for a saving of **325.58 GiB**. Both figures come from
+  driving the production `RouteGgufTensor` over the artifact's real tensor list
+  (§"The measured residency" above), not from arithmetic. Every other encoding
+  in this file already kept its quantization, IQ3_XXS (`VecDotIQ3_XXSQ8_K`)
+  included, so these two types were the whole gap. The `QUANT-GGUF-IQ2_XS` and
+  `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) now carry `C` = `Y`.
+  **The remaining blockers on a real load are functional, not memory.** This
+  sentence has now been rewritten twice as `origin/main` moved under this
+  branch, so it names the whole chain rather than one milestone. It first named
+  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) /
+  [#2177](https://github.com/mudler/vllm.cpp/issues/2177) (the per-layer
+  `head_count_kv` array), which the first half of this very entry records as
+  DISCHARGED by [#2269](https://github.com/mudler/vllm.cpp/pull/2269); then the
+  rotary-width cross-check
+  ([#2268](https://github.com/mudler/vllm.cpp/issues/2268)), which **O20**
+  discharges by moving both sides onto llama.cpp's `attention.key_length`
+  meaning; then the `glm4` pre-tokenizer
+  ([#2277](https://github.com/mudler/vllm.cpp/issues/2277)), which **O21**
+  discharges. None of the three was a memory blocker, and none is left. The
+  stopping point today is the WEIGHT LOADER itself:
+  `src/vllm/model_executor/models/glm5_next_registry.cpp:78` refuses by name,
+  which is O10's refusal reached from the published artifact, and W5b and W5c
+  own it. **And the residency figure is not a compute claim:** the CUDA arm has no keep-quant kernel for either type,
+  so on `dgx:gpu0` the 101.14 GiB fits with its expert GEMM on the CPU fallback
+  — O19 below.
 
   **O7 is stale beside it and is not corrected here.** "No artifact of this
   model exists" was true when it was written; the UD-Q2_K_XL arm is now staged,
@@ -1756,9 +3257,1354 @@ Debts this row carries, each visible rather than waived:
   belongs to W7b, which owns that sentence, rather than to a dequant change that
   merely walked past it.
 
+- **O19 — the 101.14 GiB is a RESIDENCY result. On `dgx:gpu0` the expert GEMM
+  for both new types runs on the CPU, and the fused seam THROWS.**
+  [#2260](https://github.com/mudler/vllm.cpp/issues/2260).
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) landed the two CPU
+  keep-quant `vec_dot` kernels, which is what flips the artifact's 82 IQ2_XS and
+  3 IQ4_XS tensors from `kExpandBf16` to `kKeepQuant` and makes it fit. The CUDA
+  arm has no kernel for either:
+  `src/vt/cuda/cuda_quant_dot.cu::IsCudaKeepQuantSupported` admits ten
+  Q8_K-family encodings — IQ2_XXS, IQ3_XXS, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S,
+  IQ1_S, IQ1_XXXS — and neither IQ2_XS nor IQ4_XS is among them, while
+  `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp::DeviceKeepQuantSupported`
+  returns `true` for CUDA on its `default:` arm regardless, on the recorded
+  ground that "CUDA falls back to the CPU kernel for anything it lacks". So the
+  residency measurement holds on a CUDA device and the SPEED does not:
+
+  - `src/vt/cuda/cuda_quant_dot.cu::MatmulBTQuantGroupedKernelCuda` takes the
+    CPU-fallback arm behind a full `cudaStreamSynchronize` ("keepquant-grouped
+    CPU-fallback drain") on every grouped expert GEMM. Correct, and it
+    round-trips the routed-expert weight bytes to the host cores per step.
+  - `src/vt/cuda/cuda_quant_dot.cu::MoeGateUpSwiGLUGroupedCuda` THROWS
+    `gate/up must be the SAME CUDA keep-quant dtype`, because
+    `IsCudaKeepQuantSupported` fails for both operands and `MergedGemm` selects
+    the fused op on device registration alone, with no dtype predicate.
+
+  **Not reached today, which is why this is a disclosure and not a defect in
+  [#2256](https://github.com/mudler/vllm.cpp/pull/2256).** `glm5_next_moe.cpp`
+  is W5's host reference and does not use the fused seam; `laguna.cpp` is the
+  only model reaching `MoeGateUpSwiGLUGrouped`. It becomes live the moment this
+  row obeys AGENTS.md `## Shared seams`, which routes mergeable MLP projections
+  through `layers::MlpGateUpMethodBase` and `vt::MergedGemmGroup` — that is
+  exactly what W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) and
+  W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) are for, and at
+  that moment a 101 GiB-resident model throws at first forward.
+
+  #2260 carries the analysis and three options — port the two CUDA kernels (the
+  only one that yields a speed number worth quoting), keep EXPANDING these two
+  on CUDA (honest, but then the artifact does not fit at 426.72 GiB), or refuse
+  by name at load rather than throwing with the model resident. This row owns
+  the consequence; #2260 owns the fix. Until one lands, **no speed or e2e number
+  on this artifact may be quoted as a GPU result**, and the `QUANT-GGUF-IQ2_XS`
+  and `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) say so in place.
+- **O20 — the MLA key CONVENTION and the KDA head count are DISCHARGED, and the
+  loader now stops in the TOKENIZER.** [#2268](https://github.com/mudler/vllm.cpp/issues/2268).
+
+  **The number is O20 and not O19 deliberately.** `origin/main` at
+  `c3522bc7d` carried O1 to O18; [#2256](https://github.com/mudler/vllm.cpp/issues/2256)
+  was adding an O19 on a branch that had not merged. Two branches that each
+  append an `O19` produce a duplicate rather than a conflict, so this entry
+  skipped the number rather than racing for it. **That reservation worked and
+  the gap is now CLOSED:** #2256 merged `origin/main` into itself and its O19
+  sits directly above this entry, so O18 to O21 run consecutively and no entry
+  is missing.
+
+  **The delta, and it is a delta in MEANING and not in spelling.**
+  `%s.attention.key_length` is a name llama.cpp already owns, and for an MLA
+  model it names the width of one CACHED K row — the latent plus the rope slice
+  — because llama.cpp caches the latent. The per-head query geometry is spelled
+  by the two `_mla` keys beside it. `b10451:conversion/deepseek.py`,
+  `DeepseekModel.set_gguf_parameters`:
+
+  ```python
+  :345  self.gguf_writer.add_key_length(kv_lora_rank + hparams["qk_rope_head_dim"])
+  :346  self.gguf_writer.add_value_length(kv_lora_rank)
+  :347  self.gguf_writer.add_key_length_mla(hparams["qk_nope_head_dim"] + hparams["qk_rope_head_dim"])
+  :348  self.gguf_writer.add_value_length_mla(hparams["v_head_dim"])
+  :369  self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+  ```
+
+  | key | llama.cpp's meaning | ours, BEFORE | ours, AFTER |
+  |---|---|---|---|
+  | `attention.key_length` | `kv_lora_rank + qk_rope_head_dim` = 512 | `qk_nope_head_dim` = 256 | llama.cpp's |
+  | `attention.value_length` | `kv_lora_rank` = 512 | `v_head_dim` = 256 | llama.cpp's |
+  | `attention.key_length_mla` | `qk_nope_head_dim + qk_rope_head_dim` = 256 | same | same |
+  | `attention.value_length_mla` | `v_head_dim` = 256 | same | same |
+  | `rope.dimension_count` | `qk_rope_head_dim` = 0 | same | same |
+  | `attention.linear_head_count` | **spelled nowhere** | KDA `num_heads` | kept, and no longer required |
+
+  The two `_mla` keys already agreed, which is why the defect presented as an
+  arithmetic absurdity rather than as a missing key: the reader subtracted a
+  cache width from a query width and got `256 - 512 = -256` for a rotary slice
+  the same file states as `0`.
+
+  **BOTH SIDES MOVED, and the reader could not move alone.** llama.cpp writes
+  `rope.dimension_count` from `qk_rope_head_dim` (`deepseek.py:369`), so the
+  cross-check that survives is `key_length - kv_lora_rank == rope.dimension_count`
+  — and our former output fails it by construction (`256 - 512 != 0`). Putting
+  the reader on llama.cpp's meaning therefore REQUIRED moving
+  `scripts/convert-glm5-next-gguf.py` in the same change, which is exactly why
+  #2268 was filed as a row-and-spec decision rather than folded into #2243.
+  O7 records that this converter has never been run against the checkpoint, so
+  no artifact of ours is invalidated by the move, and a file in the former
+  private spelling is REFUSED by name — `key_length < kv_lora_rank` is
+  impossible under llama.cpp's meaning — rather than read under either
+  convention. **The check was not widened.** Four refusals stand where one did:
+  a `key_length` below `kv_lora_rank`, a rotary width the file states twice and
+  disagrees with itself about, a `key_length_mla` that leaves no room for a
+  no-rope slice, and a `value_length` that is not the latent rank.
+
+  **THE KDA HEAD COUNT IS DERIVED, and this port is deliberately STRICTER than
+  the oracle.** `attention.linear_head_count` is ours: `git grep
+  linear_head_count b10451` is rc=1 tree-wide. llama.cpp's `glm5next` branch
+  writes the same number through its Kimi-Linear parent's `ssm.*` names —
+  `add_ssm_inner_size(num_heads * head_dim)`, `add_ssm_state_size(head_dim)`,
+  `add_ssm_group_count(num_heads)`, `conversion/glm5next.py:78-80` at
+  `refs/pull/27752/head` `8a8d0bcc4` — and the published artifact carries NONE
+  of those either. So the reader reads whichever of four places the file states
+  it in: `attention.linear_head_count`, `ssm.group_count`, `ssm.inner_size /
+  kda.head_dim`, and finally the `blk.<L>.ssm_a` tensor of the first
+  `linear_attention` block, which is one entry per KDA head. On the published
+  artifact that is `[64]`, beside `kda.head_dim = 128` and a
+  `blk.0.attn_q.weight` of `[4096, 8192] = 64 * 128` — the file is
+  self-consistent about a number it never names. Wherever `ssm_a` is present it
+  cross-checks whatever rung answered, and a file that states the count nowhere
+  and carries no `ssm_a` is refused by name, listing every place that would have
+  answered.
+
+  llama.cpp does not do this. It reads no head count for this architecture at
+  all and sizes the recurrent state with `n_head() * n_embd_head_kda`, saying
+  why in the file: *"note: n_embd_r()/n_embd_s() size the recurrent state with
+  n_head()\*n_embd_head_kda, which works only because
+  linear_attn_config.num_heads == num_attention_heads"*
+  (`src/models/glm5next.cpp:121-122` at `8a8d0bcc4`). That invariant HOLDS on
+  this checkpoint — `attention.head_count` is 64 and `ssm_a` is `[64]` — and it
+  is a property of the checkpoint rather than of the architecture. It is the
+  exact shape of the defect [#2177](https://github.com/mudler/vllm.cpp/issues/2177)
+  already cost this row: a value that is right here and silently wrong on the
+  next file, with no gate able to see it. The divergence is recorded here rather
+  than left to be rediscovered.
+
+  `kda.head_dim` gained llama.cpp's own fallback in the same pass:
+  `src/models/glm5next.cpp:110-113` reads it optionally and falls back to
+  `ssm.state_size`, and the pinned revision's converter writes only
+  `ssm.state_size` (`conversion/glm5next.py:79`), so that arm is live for a file
+  that branch produced rather than a legacy path.
+
+  **THE STAGED ARTIFACT WAS NOT PRODUCED BY THE PINNED ORACLE REVISION.**
+  Measured, not inferred: at `8a8d0bcc4` the `glm5next` converter writes
+  `ssm.inner_size`, `ssm.state_size` and `ssm.group_count` and calls
+  `add_kda_head_dim` NOWHERE (`git grep add_kda_head_dim` at that object returns
+  only `conversion/bailingmoe3.py:60`, `conversion/kimi_k3.py:217` and
+  `conversion/kimi_linear.py:103`, none of which is `Glm5NextModel`'s chain).
+  The staged artifact carries the opposite set: `kda.head_dim = 128`,
+  `ssm.conv_kernel = 4`, and none of the `ssm.inner_size` / `ssm.state_size` /
+  `ssm.group_count` trio. So the two describe different revisions of the same
+  pull request, and
+  [`../oracles/llama-cpp-glm5next.md`](../oracles/llama-cpp-glm5next.md)'s pin
+  does not describe the file this row gates against. That is why the reader
+  accepts BOTH sets rather than the pinned one, and it is a caveat on any future
+  llama.cpp denominator taken on this artifact at that pin.
+
+  **THE NEW STOPPING POINT, measured 2026-08-29 on one tree and one build
+  directory**, three legs of one probe object driven through
+  `LoadedEngine::FromModelDir` on `device = kCPU` at
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf`,
+  headers only, no tensor materialised:
+
+  ```text
+  baseline reader      : vt: glm5_next gguf: attention.key_length_mla - attention.key_length
+                         is -256 but rope.dimension_count is 0
+  MLA convention only  : vt: glm5_next gguf: missing metadata key glm5next.attention.linear_head_count
+  both                 : tokenizer: unsupported tokenizer.ggml.pre "glm4"
+  ```
+
+  The middle leg is why both keys had to move together: fixing the convention
+  alone moves the refusal exactly one key along, which is what `head_count_kv`
+  did before `swiglu_clamp_exp`. The third leg is past config resolution
+  entirely — `Glm5NextHfConfigFromGguf` returns, and the refusal comes from
+  `src/vllm/tokenizer/tokenizer.cpp::FromGguf`, which maps seven pre names and
+  not `glm4`. **That is the next milestone and it is
+  [#2277](https://github.com/mudler/vllm.cpp/issues/2277)**, which also records
+  the one thing the mapping is not free on: `b10451:src/llama-vocab.cpp:2259`
+  sets `special_bos_id = LLAMA_TOKEN_NULL` for this pre-type while the artifact
+  states `tokenizer.ggml.bos_token_id = 154822`, so a port that reads the id and
+  prepends it emits a token no reference run emits. **That sentence is wrong on
+  its first half and O21 corrects it:** `:2259` is a DEFAULT the file's own kv
+  overwrites at `:2559-2578`, so llama.cpp keeps 154822 and merely declines to
+  PREPEND it. The conclusion — do not prepend — survives; the mechanism does
+  not, and the mechanism is what a port mirrors.
+
+  **Still not loaded.** Reaching the tokenizer is not fitting: O10, the weight
+  loader's refusal by name, stands unchanged. **The memory half no longer does,
+  and this paragraph was corrected when
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) merged into the branch
+  carrying it.** It said O18's 426.72 GiB resident cost and #2247's keep-quant
+  `vec_dot` both stood; #2247 has since landed the two CPU kernels, and O18 and
+  O19 now read 101.14 GiB. Reaching the tokenizer was never a fitting claim
+  either way. No token was produced and none is claimed.
+
+- **O21 — the `glm4` PRE-TOKENIZER is DISCHARGED, and the loader now stops in the
+  WEIGHT LOADER.** [#2277](https://github.com/mudler/vllm.cpp/issues/2277).
+
+  **The number is O21 and not O19.** `origin/main` at `785d4304f` carried O1 to
+  O18 plus O20, and so did `a36add6a8`, the base this branch was cut from; [#2256](https://github.com/mudler/vllm.cpp/issues/2256) was adding an
+  O19 on a branch that had not merged. Two branches that each append an `O19`
+  produce a duplicate rather than a conflict, so this entry skipped the number
+  for the same reason O20 did. **The gap is now CLOSED** — #2256 merged
+  `origin/main` into itself, and O18 to O21 run consecutively above.
+
+  **THE SPLITTING RULE IS EXACT, AND THE COMPARISON IS OVER BYTES.**
+  `tok::Tokenizer::FromGguf` now maps `glm4` and `chatglm-bpe` — exactly the two
+  names llama.cpp maps to `LLAMA_VOCAB_PRE_TYPE_CHATGLM4`
+  (`b10451:src/llama-vocab.cpp:2256-2258`) — onto `SplitPattern::kLlama3`. That
+  is not an approximation. Extracted from the pinned object rather than read off
+  the page, on 2026-08-29, in a fresh bare clone fetched at depth 1:
+
+  ```sh
+  git cat-file -p 10bf611e533d81f739128304991c5e133c6aebd8:src/llama-vocab.cpp
+  # sha256 3fea10f4481b504d5ca894b32fc177bf2eb83ffdf3f38f3f9c9175f62f62cd4b, 4427 lines
+  sed -n '289p' llama-vocab.cpp   # LLAMA_VOCAB_PRE_TYPE_LLAMA3's one regex   (case at :283)
+  sed -n '398p' llama-vocab.cpp   # LLAMA_VOCAB_PRE_TYPE_CHATGLM4's one regex (case at :396)
+  ```
+
+  Both RAW lines, indentation included, are md5
+  `9000538f3f07df64ebcc73e41b916cab`; `diff` and `cmp` of the two are rc=0; the
+  two string literals with leading whitespace stripped are sha256
+  `4ec934e1de5157434e9663b9b7c8421e5396e50d5fc427a2bb9f99fca0f51a05`. Each arm
+  is a ONE-element `regex_exprs` list, so there is no second stage on either
+  side to differ in. `test_bpe.cpp` carries both literals transcribed and checks
+  them equal, which makes the claim executable; the sha above is what makes it
+  *evidence*, because a transcription cannot gate what it transcribes.
+
+  **WHAT DELIBERATELY DID NOT COME WITH THE ALIAS.** llama.cpp's `llama-bpe`
+  arm (`:2157-2159`) sets `ignore_merges = true` and `add_bos = true` beside its
+  pre-type; the `glm4` arm sets NEITHER. Sharing one `SplitPattern` therefore
+  had to carry the split rule and none of those flags, and it does:
+  `ignore_merges_` stays false on every GGUF path, and no GGUF path prepends a
+  BOS.
+
+  **#2277's BOS PREMISE IS FALSE, AND THE TRUE STATEMENT IS NARROWER.** That
+  issue and O20's forward pointer both say llama.cpp DISCARDS the artifact's
+  `tokenizer.ggml.bos_token_id = 154822`. It does not. `:2259` sets
+  `special_bos_id = LLAMA_TOKEN_NULL` on this arm, but that assignment is a
+  DEFAULT and it is overwritten a few hundred lines later in the SAME function
+  (`llama_vocab::impl::load`, `:1923`): the loop at `:2559-2578` walks
+  `special_token_types` (`:2537-2538` binds `LLM_KV_TOKENIZER_BOS_ID` to
+  `special_bos_id` BY REFERENCE) and assigns `id = new_id` whenever the file
+  states the key and the value is in vocab range. It is straight-line code, so
+  llama.cpp finishes this load with `special_bos_id = 154822`.
+
+  What llama.cpp declines to do is PREPEND it. The prepend at `:3382-3384` tests
+  `add_bos`, which defaults `false` (`:1815`), which this arm does not set, and
+  which the staged file does not state — `tokenizer.ggml.add_bos_token` is not
+  among its 72 KV entries (parsed 2026-08-29 from shard 1's own KV block).
+
+  **So the mirror is: read the id, prepend nothing** — which is what this tree
+  already did, and the change makes it a pinned fact rather than an accident.
+  `BosId()` reports 154822 and `template_bos_` stays `-1`, so
+  `EncodeWithSpecialTokens` reduces to `Encode`. On this checkpoint that is
+  load-bearing rather than academic: id 154822 is `[gMASK]` (read out of the
+  `tokenizer.ggml.tokens` array, token_type 3), and the file's own
+  `tokenizer.chat_template` opens with the LITERAL text `[gMASK]<sop>`. A
+  tokenizer that also prepended the id would double it on every request — one
+  extra token per prompt, which a shape check, a load check and a "does it
+  generate" check all pass. `test_bpe.cpp` fails if `template_bos_` is ever set
+  from the GGUF BOS id; that mutation was run and it reds two assertions.
+
+  **THE NEW STOPPING POINT, measured 2026-08-29 on one tree and one build
+  directory**, with the pre-name arm reverted and restored so the before/after
+  is not a cross-build comparison. Driven through `LoadedEngine::FromModelDir`
+  on `device = kCPU` at
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf`,
+  headers only, no tensor materialised:
+
+  ```text
+  without the arm : tokenizer: unsupported tokenizer.ggml.pre "glm4"
+  with    the arm : Glm5NextForConditionalGeneration: the GGUF config is read and
+                    validated, but the weight loader is not ported (W5 owes the KDA,
+                    NoPE MLA, mHC and stacked-expert weight tower). Separately, NO
+                    `.gguf` of this model exists anywhere: scripts/convert-glm5-next-gguf.py
+                    can write one but has never been run against the 305.78 GiB
+                    checkpoint (O7). See .agents/specs/glm5-next-flash.md and issue #1998.
+  ```
+
+  1.77 s wall, 95.9 MB peak RSS — which is the arithmetic proof that no tensor
+  was materialised, on a file whose weights are 100 GiB. **This is O10's refusal,
+  reached at last from the published artifact.** Every step above the weight
+  tower now passes on a real file: four shards opened, 1412 tensors sized, the
+  config resolved and validated, and the vocabulary — 154880 tokens, 321649
+  merges — built. The next milestone is `load_weights` itself, which W5c
+  ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) owns.
+
+  **Still not loaded, and no token is claimed.** Reaching the weight loader is
+  not fitting: O10 stands unchanged. **The memory half does not, and this
+  paragraph was corrected when
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) merged into the branch
+  carrying it.** It said O18's 426.72 GiB resident cost and #2247's keep-quant
+  `vec_dot` both stood; #2247 has since landed the two CPU kernels, and O18 and
+  O19 now read 101.14 GiB against ~119.63 GiB. The artifact FITS and still does
+  not LOAD, which are two different sentences: O10 is a weight-tower gap, not a
+  memory one.
+
+  **STILL OWED, and filed rather than papered over:
+  [#2279](https://github.com/mudler/vllm.cpp/issues/2279).** `FromGguf` never
+  reads `tokenizer.ggml.add_bos_token` at all. llama.cpp does
+  (`:2585-2586`), and that flag is the only thing that decides the prepend, so a
+  GGUF declaring it `true` gets a BOS from llama.cpp and none from us. Nothing is
+  red today because no artifact this row touches states the key, and the `glm4`
+  arm is correct WITHOUT it — but the divergence is general to every GGUF this
+  tree loads, and it is already live on the `llama-bpe` family in the other
+  direction, masked only because that path has never been token-gated against
+  llama.cpp with `add_special = true`. Out of #2277's scope, which is one pre
+  name.
+
+- **O22 — what W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242))
+  did NOT do, named so the next wave does not have to infer it.**
+
+  - **No materialized load, and therefore no peak RSS, no token and no speed.**
+    **The first clause of this bullet stopped being true on 2026-08-30 and O28 is
+    the corrected surface**; it is kept as the measurement W5c made rather than
+    rewritten, the way O5 and O18 keep theirs. A materialized load of this
+    artifact now exists on `dgx:gpu0`
+    ([#2343](https://github.com/mudler/vllm.cpp/issues/2343)); peak RSS, a token
+    and a speed number still do not.
+    The load was driven at the staged artifact HEADERS ONLY: all four shards
+    open, the config resolves, and all 1383 backbone tensor names resolve at 41
+    MB peak RSS. A materializing load WAS attempted on this box and STOPPED at
+    8.09 GiB RSS in 2m02s of uninterruptible-sleep I/O over CIFS. The real one
+    belongs on `dgx:gpu0` under an `rc` lease with the artifact on local disk,
+    and it is W7b's ([#2225](https://github.com/mudler/vllm.cpp/issues/2225)).
+  - **The bridge from `OwnedTensor` to the host references is W5b's.** The tower
+    mirrors `Glm5NextKdaLayerWeights`, `glm5_next_dsa::IndexerWeights` and
+    `HcSite` field for field, but W2/W3/W4 consume `std::vector<float>` and this
+    tower is block-resident by necessity — the artifact fits only because 736 of
+    its tensors keep their ggml blocks, and a float tower would be 4x the file.
+    Whoever writes the forward decides whether to decode per layer or to go
+    device-native; nothing here forecloses either.
+  - **The fused MoE seam is still NOT reached, and O19 stays live.** AGENTS.md
+    `## Shared seams` routes mergeable MLP projections through
+    `layers::MlpGateUpMethodBase` and `vt::MergedGemmGroup`, and O19 records that
+    the moment this row does so on CUDA, `MoeGateUpSwiGLUGroupedCuda` throws
+    because neither IQ2_XS nor IQ4_XS is in `IsCudaKeepQuantSupported`. W5c is a
+    LOAD and reaches no GEMM, so it does not make that live — but it is now the
+    only thing standing between the artifact and that throw, and W5b must read
+    O19 before it routes anything.
+  - **The MTP block is read, counted and dropped**, which is what the reference
+    does. `Glm5NextWeights::mtp_block_tensors_dropped` is 29 on the published
+    artifact. Nothing consumes it and O2 still owns the head.
+  - **The vision tower is refused up front rather than one tensor at a time.**
+    The `glm5next` container is text-only — the published artifact ships its
+    tower as a separate `mmproj-BF16.gguf` and llama.cpp #27752 drops the vision
+    tensors at convert time — so a config declaring a `vision_config` alongside
+    a text-only file is refused by name at the top of the load. W6 owns the arm,
+    and O4 owns the fact that no llama.cpp revision can open that mmproj.
+  - **The converter has never been RUN since #2291 moved it.** Its three
+    corrections — `ssm_dt.bias`, the `kv_b_proj` split with the k half
+    transposed, and `ssm_a = -exp(A_log)` — are gated on synthetic fixtures by
+    `tests/scripts/test_convert_glm5_next_gguf.py` and by the C++/Python interop
+    case, and on nothing else. O7 carries the run itself.
+- **O23 — W5's MoE block is NOT REACHED from a production entry point, and the
+  decoder layer that would reach it is a WAVE and not a paragraph.**
+  `src/vllm/model_executor/models/glm5_next_moe.{h,cpp}` is a host reference and
+  the only call sites at this merge commit are the focused gate's. This is the
+  staged-slice disclosure AGENTS.md "Nothing lands dead" requires, declared
+  rather than claimed by silence, and it is narrower than it looks: W5's OTHER
+  deliverable, `MakeGlm5NextKVCache`, IS reached, through the production
+  `make_kv_cache` factory hook, and deleting that row is a compile error. **The
+  wiring belongs to W5b**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+  **Why W5 did not do it, in the specific:** the decoder layer's DSA arm has
+  nothing to call. W3 landed `SelectIndexerTopk` — the indexer's SELECTION — and
+  relaxed `MlaBlockDims::Validate`, and it landed no assembled
+  `Glm5NextTextAttention` over either. `q_a_proj`/`q_a_layernorm`/`q_b_proj`,
+  `kv_a_proj_with_mqa`, `kv_b_proj`, `expand_kv`
+  (`modeling_glm5_next.py:1136-1153`), the attention itself and
+  `build_attention_mask_from_topk` (`:1218-1257`) are all unwritten. Landing a
+  decoder layer whose sparse arm throws would be a control-flow shell with one
+  live branch, which is worse than an honest split.
+
+  **This entry is what makes O19's disclosure checkable, because it lands the
+  file O19 names.** O19 states that "`glm5_next_moe.cpp` is W5's host reference
+  and does not use the fused seam", and until this merge it said that about a
+  file no tree contained. It is true as landed and was verified rather than
+  assumed: the block's only `vt` ops are `vt::MoeRouterTopK` and
+  `vt::MoeCombine`, and every expert GEMM is a host `std::vector<float>`
+  accumulation, so it reaches neither `vt::MergedGemmGroup` nor
+  `MoeGateUpSwiGLUGroupedCuda` and the `gate/up must be the SAME CUDA
+  keep-quant dtype` throw of
+  [#2260](https://github.com/mudler/vllm.cpp/issues/2260) cannot fire from this
+  row today. It becomes reachable the moment W5b routes the experts through the
+  shared seam, which is the wave O19 already names.
+- **O24 — RETIRED 2026-08-29, premise falsified by W5c
+  ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)).** As written by W5
+  this entry said "`load_weights` refuses, so `ModelRegistry::Forward` is
+  unreachable BY CONSTRUCTION and no wave before W5c can claim otherwise", and
+  it bounded what O15, O16, O17 and O23 could be discharged by. W5c landed the
+  weight tower: the GGUF arm returns a real `LoadedModel` and resolves all 1383
+  backbone tensor names of the published artifact, so a handle reaching the
+  `forward` hook is now real and `ForeignLoadedModel` is no longer the only way
+  to reach it. The entry is kept rather than deleted because it is the reason
+  the numbering skips: it was live when the tests below it were written. What it
+  bounded is now bounded by the forward itself, which W5b owes.
+- **O25 — W5b-1's two files are NOT REACHED from a production entry point, and
+  the residency question O22 left open is now ANSWERED.** Two separate things,
+  in one entry because one wave owns both.
+
+  **The reachability disclosure.**
+  `src/vllm/model_executor/models/glm5_next_attn.{h,cpp}` and
+  `glm5_next_bridge.{h,cpp}` are host references, and the only call sites at
+  this merge commit are `tests/vllm/models/test_glm5_next_attn.cpp` and
+  `test_glm5_next_bridge.cpp`. `grep` over `src/`, `include/` and `examples/`
+  for `glm5_next::Attention`, `BridgeDsaLayer`, `DecodeOwnedTensorToF32`,
+  `IndexerRoleFor` and the two headers returns NOTHING outside those four files.
+  This is the staged-slice disclosure AGENTS.md "Nothing lands dead" requires,
+  declared rather than claimed by silence. There is no production call site to
+  delete, so `.agents/reachability.md`'s reachability mutation has already been
+  answered: the change has no entry-point chain, and saying so is the answer.
+  **The wiring belongs to W5b-2**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **And one arm stays unreached even after the wiring, which is the shape that
+  SURVIVES W5b-2.** `IndexerRoleFor`'s `shared` arm is CONFIG-KEYED, and the
+  published `GLM-5.3-Flash` `config.json` selects it on ZERO of its 45 layers —
+  the gate measures that and prints `published schedule: 0 shared layers of 45`
+  rather than asserting it from prose. So the cross-layer sharing this wave
+  gates is correct against `transformers` v5.16.1 on a schedule the released
+  checkpoint does not contain, and the wave's own headline should be read with
+  that clause attached. It is the same "unselected branch"
+  (`.agents/reachability.md`) shape as the rope half, which this spec already
+  discloses as "a branch no released config selects" — the difference being
+  that the rope branch is REFUSED and this one is IMPLEMENTED and gated. Once
+  O25's reachability half is discharged the two files become reached; the
+  `shared` arm still is not, and closing that needs either a config that selects
+  it or an accepted decision to leave it gated by fixture alone.
+
+  **`byte_ceiling` is a DEFAULT ARGUMENT, so the ceiling arithmetic below binds
+  the bridge and not the function.** `DecodeOwnedTensorToF32`'s third parameter
+  defaults to `kBridgeTensorF32ByteCeiling` and any caller may pass a larger
+  one. The STRUCTURAL claim — that `BridgeDsaLayer`, the only entry point, has
+  no overload taking an expert bank — holds unconditionally. The NUMERIC claim
+  holds for every call that takes the default, which is every call in this tree.
+  A caller that raises the ceiling has opted out, and nothing here stops it.
+
+  **`Numel` iterates `i < t.rank` against a fixed `shape[vt::kMaxRank]`**, so a
+  hand-built `OwnedTensor` with `rank > kMaxRank` would read past the array. No
+  loader-produced tensor can hold one, and the loader is the only producer this
+  bridge is reachable from; recorded rather than guarded so the next reader does
+  not have to re-derive that it is unreachable.
+
+  **The residency decision: DECODE ONE LAYER AT A TIME, ON DEMAND, AND NEVER
+  RETAIN THE TOWER IN FLOAT.** O22 wrote "Whoever writes the forward decides
+  whether to decode per layer or to go device-native; nothing here forecloses
+  either." The arithmetic forces the first, and every number is this row's own
+  measurement rather than an estimate:
+
+  | what | GiB |
+  |---|---:|
+  | the published `UD-Q2_K_XL` artifact, block-resident as loaded | **101.14** |
+  | the same tower with every tensor expanded (`### The measured residency`) | **426.72** |
+  | all-bf16 | 597.46 |
+  | usable on `dgx:gpu0`, the largest device this project reaches | **~119.63** |
+  | ONE bridged DSA layer, f32 | **0.4654** |
+  | all ELEVEN DSA layers held at once | 5.12 |
+
+  A decoded tower is 426.72 GiB against 119.63, which is 3.57x over — and that
+  is the figure #2245 and #2247 spent six pull requests removing. A float tower
+  is not expensive; it does not exist on any hardware this project can reach.
+  One layer is 499,657,728 bytes, 0.39% of the box, and the caller's peak is one
+  layer because the mirror is a value it can drop. There is deliberately no
+  `BridgeTower`, no cache and no map keyed by layer index: each of those turns
+  "one layer" into "every layer visited so far", which is the tower again with a
+  slower ramp.
+
+  **Device-native was NOT chosen, and the reason is not preference.** There is
+  nothing to be device-native against. Every glm5_next primitive on this row is
+  a host f32 reference and W3's CUDA arm is committed and UNMEASURED for want of
+  a `dgx:gpu0` lease. A device bridge would land beside a device forward that
+  does not exist, which is the "unpassed parameter" shape. W5b-2 revisits it.
+
+  **O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) stays live and
+  this bridge cannot make it reachable**, gated rather than argued. Structurally
+  there is no overload taking `Glm5NextMoeWeights`, `Glm5NextMlpWeights` or any
+  expert bank — the whole surface is `Glm5NextMlaWeights` and
+  `Glm5NextIndexerWeights`, which carry no IQ2_XS or IQ4_XS tensor. Numerically
+  `kBridgeTensorF32ByteCeiling` is 1 GiB, which is EXACTLY 4x above the largest
+  legitimate tensor (`o_proj`, 0.25 GiB) and EXACTLY 9x below the smallest
+  expert bank (`up_exps`, 9.0 GiB); both sides are asserted, because a ceiling
+  above everything is a mute switch and one below the real population is a gate
+  that fires on ordinary work. The check runs from the SHAPE, before any
+  allocation, and the test proves it by handing the bridge a published-size bank
+  carrying no bytes at all.
+
+  **One mutation SURVIVED and is recorded as EQUIVALENT rather than chased.**
+  Rewriting `BridgedDsaLayer::host_f32_bytes` to take
+  `BridgedDsaLayerF32Bytes(d, id)` instead of summing the decoded buffers leaves
+  every assertion green — and it must, because `DecodeShaped` refuses any tensor
+  whose shape disagrees with the dims, so no reachable state separates the two
+  computations. The test pins the sum against the buffers THEMSELVES rather than
+  against the predictor, which is what makes the remaining agreement a fact and
+  not a tautology; an earlier version asserted only
+  `host_f32_bytes == BridgedDsaLayerF32Bytes(...)` and that mutation passed it.
+
+- **O26 — `glm5_next_layer.{h,cpp}` is NOT REACHED from a production entry
+  point, and O15, O16, O17, O23 and O25's reachability halves are therefore NOT
+  discharged.** W5b-2a ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
+  landed the decoder layer, the mHC stream threading, `TextModelForward` and the
+  KV binding, and `ForwardGlm5NextForConditionalGeneration` still refuses by
+  name, so the only call site at this merge commit is
+  `tests/vllm/models/test_glm5_next_layer.cpp`'s. This is the staged-slice
+  disclosure AGENTS.md "Nothing lands dead" requires, declared rather than
+  claimed by silence, and it is stated in the STRONG form on purpose: W5b-2a's
+  own scope said it would discharge those five, and it does not.
+  `.agents/reachability.md` is explicit that "an intermediate hop that is itself
+  unreached does not carry", so a KDA arm now called from `glm5_next_layer.cpp`
+  is exactly as unreached as it was when only its own gate called it.
+  **The wiring belongs to W5b-2b**, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, tracked by
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) under campaign issue
+  [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
+
+  **What DID change, stated precisely so the next reader does not re-derive
+  it.** Before this merge the five primitives had five separate dead ends and no
+  assembly point; after it they have ONE, gated against the reference at 10 cases
+  and 1647 assertions, and the remaining gap to a production entry point is a
+  single hop — the weight bridge for four arms plus the engine binding, §W5b-2b.
+  That is a smaller and better-defined debt than five, and it is still a debt.
+
+  **There is a production call site to delete after W5b-2b and there is none
+  now**, so `.agents/reachability.md`'s reachability mutation is answered here
+  the way it was for W5b-1: the change has no entry-point chain, and saying so is
+  the answer. The mutation this change CAN run, and does, is the one for the KV
+  binding's own seam — deleting the `DsaCache*` argument at
+  `glm5_next_layer.cpp`'s `Attention` call reds the cached case while every
+  uncached case stays green, which is what proves the cached path is entered
+  through the layer rather than only by the cache test.
+
+  **The `shared` indexer arm stays unreached even after W5b-2b**, unchanged from
+  O25: the published `config.json` selects `shared` on ZERO of its 45 layers, so
+  the cross-layer sharing this wave now threads through the layer loop is
+  correct against `transformers` v5.16.1 on a schedule the released checkpoint
+  does not contain.
+
+  **One divergence inside the oracle itself is recorded here rather than only in
+  the generator**, because it is a fact about `glm5_next` and not about this
+  fixture. `Glm5NextPreTrainedModel` sets `_supports_sdpa = True`, so a default
+  `Glm5NextTextConfig` resolves `_attn_implementation` to `sdpa`, and
+  `build_attention_mask_from_topk` returns a BOOLEAN mask on that arm
+  (`modeling_glm5_next.py:1249-1250`) where the eager arm returns the additive
+  `finfo.min` one (`:1252-1256`). On a LEFT-PADDED query row, where every key is
+  masked, the two backends disagree: torch's SDPA emits 0.0 and eager's uniform
+  softmax emits the mean of the values, measured at 0.0 against 0.509 on this
+  fixture. Our port inlines `eager_attention_forward`, which is what W5b-1 gated
+  and what `:1227-1228` names as the only interface a 3-D per-(query, key) mask
+  can reach, so both generators pin `cfg._attn_implementation = "eager"`. No
+  token gate could see this, because the rows that differ are padding.
+
+
+- **O27 — W5b-2b DISCHARGES the reachability halves of O15, O16, O17, O23, O25
+  and O26, and this entry names exactly what is and is not discharged so the
+  next reader does not have to re-derive it.**
+  [#2337](https://github.com/mudler/vllm.cpp/issues/2337), split out of
+  [#2241](https://github.com/mudler/vllm.cpp/issues/2241) because #2241's
+  append-only index row is spent on W5b-2a — the same split W5b-1 took to
+  [#2324](https://github.com/mudler/vllm.cpp/issues/2324).
+
+  **DISCHARGED.** `ForwardGlm5NextForConditionalGeneration` no longer refuses by
+  name. `ModelRegistry::Forward` opens a real `Glm5NextLoadedModel`, bridges each
+  decoder layer on demand and runs `TextModelForward`, so the entry-point chain
+  is complete and every hop on it is reached:
+
+  ```text
+  ModelRegistry::Forward
+    -> ForwardGlm5NextForConditionalGeneration   (glm5_next_registry.cpp)
+    -> glm5_next::Glm5NextHostForward            (glm5_next_forward.cpp)
+    -> Glm5NextGgufLayerSource::Layer            -> BridgeKdaLayer / BridgeDsaLayer
+                                                    / BridgeMlp / BridgeMhcSite
+                                                    / BridgeMoeLayer + GgufExpertSource
+    -> glm5_next::TextModelForward               (glm5_next_layer.cpp)
+    -> DecoderLayerForward -> Glm5NextKdaLayerForward (O15)
+                           -> MhcPre / MhcPost / HcHeadCollapseMean (O16)
+                           -> Attention -> SelectIndexerTopkFromPacked (O17)
+                           -> MoeForward (O23)
+                           -> BridgedDsaLayer / DecodeOwnedTensorToF32 (O25)
+  ```
+
+  **The reachability mutation ANSWERS the question rather than restating it.**
+  `.agents/reachability.md` asks for the production call site to be deleted in a
+  scratch copy: deleting the `Glm5NextHostForward(...)` call in the registry hook
+  and returning an empty `ForwardLogits{}` REDS `test_glm5_next_forward` at 11 of
+  118 assertions (M1, tree `91354df62`, mutant proved applied by diff hash, BUILD
+  rc=0, restored byte-for-byte). O26 said "there is a production call site to
+  delete after W5b-2b and there is none now"; there is one now, and deleting it
+  is red.
+
+  **The smallest failing test ENTERS through the entry point.** Every case in
+  `tests/vllm/models/test_glm5_next_forward.cpp` reaches the model through
+  `ModelRegistry::Load` and `ModelRegistry::Forward` on the synthetic `glm5next`
+  miniature. Nothing in that file calls `Glm5NextHostForward` or
+  `TextModelForward` to produce the value under test; the one direct call is the
+  `lm_head` chunk-size case, which needs a parameter the hook does not expose,
+  and its result is cross-checked against the entry-point result.
+
+  **NOT DISCHARGED, and each is a different kind of debt.**
+
+  - **O1 stands, entirely.** No end-to-end token gate for this model exists or
+    can exist on this fleet. What is gated is a synthetic 4-layer miniature at
+    `hidden_size` 32; nothing here is a claim about the 321.32B model, and no
+    token, speed or load number is claimed.
+  - **O2, O3, O4, O5, O6, O7, O8, O13, O14, O19 and O18's second half** are
+    untouched by this wave.
+  - **O25's `shared` indexer arm stays unreached**, unchanged and for the reason
+    O25 and O26 both give: the published `config.json` selects `shared` on ZERO
+    of its 45 layers. The layer loop threads it and the fixture exercises it;
+    no released checkpoint does.
+  - **W5b-2a's `LayerCache` binding is now UNREACHED on the production path**,
+    and §W5b-2b said this decision had to be taken rather than inherited. It was
+    taken the way the two precedents take it: the hook re-runs the whole prefix
+    each step and passes `caches = nullptr`, so `DsaCache` and the KDA
+    recurrence carried across steps are exercised by
+    `test_glm5_next_layer.cpp` alone. Carrying `std::vector<LayerCache>` on
+    `Glm5NextLoadedModel` has no precedent in this tree and a model that cannot
+    be run end to end on this fleet is the wrong place to invent one. This is
+    the staged-slice disclosure AGENTS.md `## Nothing lands dead` requires,
+    declared rather than claimed by silence, and it is a NARROWER debt than the
+    six this wave discharged: the code is reached, the CACHED path through it is
+    not.
+  - **RAGGED BATCHING is owed and is refused rather than approximated.** A step
+    with `num_reqs > 1` is refused by name. The two house precedents concatenate
+    instead, which attends across the request boundary; on this model that is
+    fluent wrong text no gate here could detect, so the divergence is
+    deliberate and in the safe direction. `attn_meta.query_start_loc` sliced as
+    at `kimi_linear_device.cpp` is the shape that closes it.
+  - **THE DEVICE ARM is owed and is refused rather than crashed.** Every
+    primitive on this row is host f32, so a non-CPU queue is refused by name
+    instead of handing `vt::MoeRouterTopK` host pointers on a device queue.
+    `glm5_next` is therefore on `scripts/runner-routing-allowlist.txt`. Two
+    facts bound what a device port would buy today and both are already
+    recorded: O19 / [#2260](https://github.com/mudler/vllm.cpp/issues/2260) —
+    the artifact's IQ2_XS and IQ4_XS expert tensors have no CUDA keep-quant
+    kernel, so a device decode of THIS checkpoint round-trips every expert GEMM
+    to the host cores anyway — and O1, so it would land without a correctness
+    gate.
+  - **SPEED is not measured and is not claimed.** O6 stands. The forward
+    re-runs the whole prefix and re-decodes every layer each step by
+    construction; that is a residency decision and not a speed one, and W8 owns
+    the axis.
+
+  **`check-runner-routing-consistency.py` MISCLASSIFIES this model on its
+  SECOND invariant, disclosed here rather than fixed.** It reports `glm5_next`
+  among the "30 keep bf16-resident DBuf activations", which is false: every
+  buffer on this path is host f32. The cause is the cross-TU resolution hole the
+  `nemotron_h` allowlist entry already names
+  ([#1410](https://github.com/mudler/vllm.cpp/issues/1410)) — the invariant reads
+  the registry TU's decode file set and this model's f32 residual declarations
+  live in `glm5_next_forward.cpp`. Not repaired in flow: it is a semantic
+  checker change, which AGENTS.md `## Changing the rules or a checker` routes to
+  its own row, spec and red-before.
+
+- **O28 — THE ENGINE CANNOT RUN THIS MODEL, and the reason is a guard ABOVE this
+  row's hook rather than anything in it.** Measured on `dgx:gpu0` 2026-08-30 by
+  driving the production C ABI at the staged artifact.
+  [#2343](https://github.com/mudler/vllm.cpp/issues/2343).
+
+  **What ran.** `vllm-cli --model .../GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
+  --device cpu --prompt "The capital of France is" --max-tokens 8`, from a
+  `vllm-cli` built at `349df8e9a` in the leased container (Ubuntu 24.04, 20
+  cores, 119 GiB total, ~85 GiB free at start), the shards read from the CIFS
+  `/workspace` share.
+
+  **THE LOAD SUCCEEDED, and that is the first materialized load of this model
+  that has ever happened.** All four shards opened, the tower materialized, and
+  the engine sized its caches:
+
+  ```text
+  INFO auto-fit max_model_len: reduced from 1048576 to 8192 to fit the KV cache
+       (256 blocks x 32 tokens).
+  INFO recurrent-state budget: reduced max_num_seqs from 32 to 1. The KV pool
+       (256 blocks) holds 1 unified pages of 4288 tokens (one page = one
+       4390912-byte GDN state), and each sequence owns 1 of them.
+  vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)
+  ```
+
+  **THE FIRST STEP THREW, one level above this row's hook:**
+
+  ```text
+  engine-fatal: EngineCore busy loop threw: vt: model forward: 22 KV cache(s)
+  from 2 published group(s) reached this forward, first
+  'model.layers.3.self_attn.attn', with block tables gathered for 3 of 3
+  published group(s), and no registered forward consumes a cache set keyed by
+  layer name. Refusing rather than discarding an allocated KV topology in
+  silence (row KV-DSV4-MULTICACHE W5 owns the consuming forward; #1925, #2068)
+  ```
+
+  `vllm-cli: completion failed (status 3)`. **No token was generated and none is
+  claimed.**
+
+  **This is the `input.multi_kv != nullptr` guard at the TOP of
+  `ModelRegistry::Forward`**, landed by KV-DSV4-MULTICACHE W3
+  ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)). It fires for ANY
+  model that publishes a multi-cache topology, BEFORE dispatch to that model's
+  `forward` hook, and GLM-5.3-Flash publishes three groups (W5,
+  [#2223](https://github.com/mudler/vllm.cpp/issues/2223)). It is not a defect in
+  W5b-2b and W5b-2b cannot close it: the consuming forward is that row's.
+
+  **WHAT THIS DOES AND DOES NOT DO TO O27.** O27's discharge stands in the letter
+  it was made in — `ModelRegistry::Forward` dispatches to
+  `ForwardGlm5NextForConditionalGeneration` when `multi_kv` is null, the focused
+  gate enters through that entry point, and deleting the production call site
+  reds it at 11 of 118 assertions. What is now MEASURED and was not before is
+  that the ENGINE path stops above it, so **O27 must not be read as "a user can
+  generate text with this model"**. It cannot. Two guards stand between the
+  registration and a token, and only one of them is this row's: the `multi_kv`
+  guard here, and this row's own device-arm and ragged-batching refusals.
+
+  **W5b-2b LANDED TWO SENTENCES THIS MAKES FALSE, and they were in PRODUCT
+  OUTPUT.** `docs/FEATURES.md` said "LOADS AND FORWARDS on `--device cpu`, one
+  sequence at a time" and `docs/USAGE.md` said "A `glm5next` file LOADS and
+  FORWARDS, on the CPU device, one sequence at a time". Both were written from
+  the focused gate, which is exactly the reading this measurement corrects, and
+  both are repaired in the same change that records the measurement — a record
+  correction that leaves the lie in product output is not a correction.
+
+  **WHAT O7 KEEPS AND WHAT IT LOSES.** O7 and the `docs/USAGE.md` weights row
+  both said "No materialized load, peak RSS, token or speed number exists for
+  this artifact". The FIRST clause is now false and is corrected in place. The
+  rest stands: **peak RSS was NOT sampled** — the staging script did not measure
+  it, which is a defect in the instrument and not a property of the run — and no
+  token and no speed number exists. Load plus engine init took under 26 minutes
+  wall (`04:10:07` to the refusal at `04:36:32`), which is a duration and not a
+  throughput number and must not be quoted as one.
+
+  **THREE INSTRUMENT DEFECTS were found and fixed on the way, recorded because
+  each one produced a job that looked like a product result.** The first attempt
+  died at `rc=127` because `/usr/bin/time` is not installed in the leased
+  container, so the build never started. The second died in cmake because
+  `/tmp/b` still held a cache keyed to the previous attempt's source path — the
+  reused-build-dir shape — and cmake refused, which is the good outcome only
+  because it refused. Both are fixed in the staging script. The third is open:
+  the script does not sample RSS, so the peak this row owes did not come out of
+  a run that would otherwise have produced it.
+
+- **O29 — W5b-2c CONSUMES the engine's keyed cache set, and O28's guard is
+  NARROWED rather than removed.** [#2348](https://github.com/mudler/vllm.cpp/issues/2348).
+  This entry records what the mapping IS, because the next reader should not
+  have to re-derive it from a refusal message.
+
+  **WHAT THE ENGINE HANDS OVER.** Three denominators, three different numbers,
+  all four established from `runner.cpp` and confirmed by O28's own message:
+
+  | the number | what it counts |
+  |---:|---|
+  | 3 published groups | `MakeGlm5NextKVCache`'s MLA latent (512), KDA recurrent state, indexer side cache (257) |
+  | 22 caches in `attn_kv` | one entry per published NAME of every ATTENTION group: 11 + 11 |
+  | 2 groups among those 22 | the 34-layer recurrent group contributes NOTHING there; it lands on `gdn_state` |
+  | 3 of 3 block tables | gathered per GROUP ID, not parallel to `attn_kv` |
+
+  The first published name is `model.layers.3.self_attn.attn` because the 22
+  arrive in PUBLICATION order — group 0's eleven, then group 2's eleven — and
+  layer 3 is this checkpoint's first DSA layer.
+
+  **THE MAPPING.** Every attention cache is resolved through
+  `MultiKvCacheIndex::Find` on the name `MakeGlm5NextKVCache` published it under
+  and its group id is READ off the channel, never assumed to be 0 and 2. The
+  suite makes that observable rather than asserting it: the miniature has ONE
+  DSA layer, so a resolver that indexed `attn_kv[0]` would be right at the
+  fixture and wrong on the checkpoint, and a case that PERMUTES the published
+  channel — names, group ids, layer indices and caches together — is what
+  separates the two. It is bit-identical under the correct code and reds the
+  mutant that resolves by position.
+
+  **GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR, and this is the error on the
+  wave that does not crash.** `MLAAttentionSpec::real_page_size_bytes` is
+  `storage_block_size * 1 * head_size * dtype_size` — no factor 2, no separate V
+  (`kv_cache_interface.h:27-29`) — so the buffer is `[num_blocks, block_size,
+  head_size]`. `ResolveKvBinding` refuses `num_kv_heads != 1` and a `head_size`
+  that is not the published row, and `PagedRowOffset` is the ONE place this row
+  turns a logical position into an element offset. The mutation that gives it a
+  pair stride does not merely fail an assertion: it walks off the page and the
+  binary ABORTS (rc=134), which is the M5-by-SIGSEGV shape W5b-2b recorded.
+
+  **THE ENGINE IS A SECOND OPINION ON THIS ROW'S ARITHMETIC.** The runner builds
+  `attn_meta.slot_mapping` for the target attention group with its own walk of
+  the same block table. The binding recomputes those slots and refuses by name
+  on a disagreement, so a misread table is a refusal on the first step rather
+  than a wrong token on every step after it.
+
+  **THE RECURRENT GROUP IS NOT KEYED BY NAME.** `MultiKvCacheIndex` describes
+  `attn_kv` only; the KDA states arrive on `gdn_state` in ascending layer order
+  with no name, so the correspondence is POSITIONAL and the count against
+  `num_kda_layers()` is the only check that exists. That is a limit of the
+  channel, recorded rather than hidden. The state SLOT is the engine's —
+  `GDNAttentionMetadata::non_spec_state_indices_tensor`, the compact index the
+  runner remapped block-table column 0 to — because the raw block id would index
+  a `[gdn_state_slots, ...]` buffer with an attention block number.
+
+  **A SENTENCE W5b-2b LANDED IS RETIRED HERE.** `glm5_next_forward.h` said the
+  forward "re-runs the whole prefix every step", following Nemotron-H and
+  Kimi-Linear. The runner does not offer that: `ModelForwardInput::token_ids` is
+  the step's SCHEDULED tokens, so on the second step of a decode it is ONE id,
+  and a forward that treats it as a sequence attends to an empty prefix. Both
+  house precedents carry the same defect; this row does not inherit it, and
+  whether it is a defect in THEIR models is not this row's to answer.
+
+  **THE GUARD IS NARROWED, NOT DROPPED.** `ModelFactory` grows
+  `consumes_multi_kv_cache`, default false, and `ModelRegistry::Forward` refuses
+  only when a keyed cache set arrives AND the registered forward does not
+  declare that it consumes one — the pair of facts the message already asserted.
+  Restoring the unconditional form reds 18 of 23 cases, which is the measure of
+  how much this narrowing carries; DeepSeek-V4 keeps the default, is still
+  refused, and #1925 still owns its consuming forward.
+
+  **WHAT IS GATED, EXACTLY.** `prefill(5) + continue(3)` through
+  `ModelRegistry::Forward` agrees with a one-shot forward over the same eight
+  tokens on the continuation's rows **EXACTLY (0.0)** on an f32 cache. That is
+  stronger than W5b-2a's 5e-4 tolerance because W5b-2a compared against the
+  ORACLE, whose own cached and uncached runs differ by 3.01e-06, and this
+  compares our two paths, whose split identity is exact by construction:
+  `ExpandKv` is token-wise under NoPE, the conv and delta recurrence step per
+  token, the indexer's causal window is the same absolute position either way,
+  and the router, the mHC folds and the head are per token.
+
+  **WHAT THE FIXTURE CANNOT SEE, said rather than papered over.** At the
+  miniature's geometry the logits sit near 2.65e5, where an f32 ULP is 0.03125.
+  Changing three of the eight prompt tokens moves the tail logits by exactly
+  that — two ULP — because the fixture's ramp weights dominate its attention
+  output. So a bf16 cache's round-trip cost (one ULP, 0.015625) and a WRONG
+  PROMPT are both at the floor, and a ratio between them would be a coincidence
+  rather than a gate. The bf16 case therefore asserts only what it can support —
+  the gap is at most one ULP of the largest logit, computed from the data — and
+  the f32 case, whose answer is exactly zero, is the one that separates a read
+  cache from an ignored one.
+
+  **NOT DISCHARGED.** O1 stands entirely: no end-to-end token gate for this
+  model exists or can exist on this fleet, and nothing here is a claim about the
+  321.32B model. Ragged batching and the device arm stay refused by name. O6
+  stands: the forward still re-decodes every layer from the block-resident tower
+  each step, which is a residency decision and not a speed one, and W8 owns the
+  axis. The `shared` indexer arm stays unreached for the reason O25 and O26 give
+  — no released config selects it — and the binding hydrates its side cache as
+  EMPTY, which is what `Attention` writes for such a layer.
+
+- **O30 — THE FIRST GENERATION FROM THIS ARTIFACT WAS GARBAGE, and the cause is
+  a WEIGHT LAYOUT this row's bridge cannot see. Repaired here; the coverage gap
+  that let it through is NOT.** The W5b-2c run
+  (`/mnt/nas_share/rc/glm5-w5b2c/out-20260830T080947Z`, `dgx:gpu0`, branch
+  `row/MODEL-MM-GLM53-FLASH-MULTIKV` @ `3f8c4a275`) generated 8 tokens and every
+  one was token id 0. That is not a coincidence of encoding: this file's own
+  `tokenizer.ggml.tokens[0]` is `"!"`, read directly from shard 1's KV block, so
+  `!!!!!!!!` IS eight ids of 0 and the detokenizer is exonerated.
+
+  **The mechanism, and it is silent by construction.**
+  `GgufLoadPolicy::FromEnv` sets
+  `quant_repack = keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`
+  (`gguf_keep_quant.cpp`). `OwnGgufQuantBlocks` then permutes each eligible q8_0
+  weight into the `block_q8_0x4` i8mm interleave and sets
+  `OwnedTensor::repacked` — leaving the DTYPE at `kQ8_0` and the byte count
+  IDENTICAL, because `sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0)`.
+  `DecodeOwnedTensorToF32` and `DecodeOwnedTensorRowsToF32` keyed on `t.dtype`
+  alone, so the whole-blocks check passed, the byte-span check passed, and
+  `BlockToFloat(kQ8_0)` read the interleave as plain blocks and returned finite,
+  plausible, WRONG floats with no error.
+
+  **ALL 346 of the artifact's 346 q8_0 tensors are repack-eligible**, computed
+  over the real file's own tensor table: every one satisfies `N % 4 == 0` and
+  `K % 32 == 0`. That includes `hc_attn_fn.weight` and `hc_ffn_fn.weight` on
+  **45 layers each** — both mHC mixers of every decoder layer — plus the whole
+  KDA gate chain (`ssm_f_a`, `ssm_f_b`, `ssm_g_a`, `ssm_g_b`, `ssm_beta`, 34
+  each) and the DSA and indexer projections (12 each). A residual manifold whose
+  `hc_attn_fn` is a permutation of itself is wrong at layer 0, which is why no
+  amount of reading the arithmetic found anything: the arithmetic was right and
+  its inputs were not.
+
+  **THIS ROW WAS THE ONLY MODEL WITHOUT THE TRIPWIRE.** `deepseek_v4.cpp`,
+  `laguna.cpp` and `qwen3_5.cpp` each carry `VT_CHECK(!w.repacked, ...)` at
+  their host-side consumers, and `qwen3_5.cpp` names the class exactly — issue
+  [#1320](https://github.com/mudler/vllm.cpp/issues/1320), "silent wrong tokens,
+  not a crash". `glm5_next` had neither that check nor the propagation to
+  `vt::Tensor::repacked`, so it inherited the hazard and none of the guard.
+
+  **The repair is two changes of different kinds.** The loader DECLINES the
+  repack (`kGlm5NextQuantRepack`, `kGlm5NextElemKnRepack`), because nothing on
+  this row consumes it: the forward is a host f32 reference, every weight it
+  touches goes through the two decode functions, no `vt::Tensor` is built over
+  these buffers, and `QuantRepackMatmul` is unreachable from here — so the
+  repack was buying this model nothing while costing it a load-time copy that
+  defeats the mmap borrow. The bridge then REFUSES a `repacked`, `q8_0_aligned`
+  or `elem_kn_repacked` buffer BY NAME, so a later wave that gives this row a
+  quantized GEMM gets a named refusal instead of a fluent wrong model.
+
+  **WHY ELEVEN GREEN SUITES AND A FULL PREFLIGHT MISSED IT, stated because it is
+  the reusable part.** `cpu_quant_repack_arm.cpp` guards its body with
+  `#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)` and the
+  `#else` arm returns `false`, so on x86-64 `QuantRepackActive()` is COMPILED
+  OUT and the loader never repacks. Measured, not assumed: the same load-policy
+  line that reads `QuantRepackActive()=1` on the fleet prints
+  `policy.quant_repack=0 QuantRepackActive()=0` on an x86 dev box. Every box
+  this 101.25 GiB model fits on is aarch64 with i8mm, and every box CI runs the
+  glm5 suites on is x86-64, so **the defect was unreachable in CI and
+  unavoidable in production** — the two populations do not intersect at all.
+
+  **MEASURED, on `thor:gpu0`, and the bisect is a partition rather than a
+  gradient.** Run `/mnt/nas_share/rc/glm5-diag/out-20260830T111015Z`, the
+  UNFIXED tree (`0716fce0e`, which is W5b-2c plus the instrument and nothing
+  else), `vllm-cli --device cpu --max-tokens 2` at `VT_GLM5_DIAG=2`. The prompt
+  tokenizes correctly -- `785 6722 315 9621 374` is `The| capital| of| France|
+  is` -- and the step is `T=5 H=4096 V=154880 layers=45 hc=4
+  logits_indices=1`, so the engine handed the forward exactly what it should.
+
+  | buffer | encoding | nan | min / max |
+  |---|---|---:|---|
+  | `embeds` (gather) | Q5_K | 0 | -0.0420 / 0.0415 |
+  | `output_norm.weight` | F32 | 0 | -0.0146 / 1.984 |
+  | `blk.0 attn_norm` | F32 | 0 | 0.0703 / 0.157 |
+  | **`blk.0 hc_attn.fn`** | **Q8_0** | **12032 / 393216** | **-7.82e6 / +8.17e6** |
+  | `blk.0 hc_attn.base`, `.scale` | F32 | 0 | sane |
+  | **`blk.0 hc_ffn.fn`** | **Q8_0** | **13536** | **+-8.31e6** |
+  | `blk.0 kda.q/k/v/o_proj` | Q5_K, Q6_K | 0 | +-0.37 |
+  | `blk.0 mlp.gate/up/down` | Q5_K, Q6_K | 0 | +-0.14 |
+  | `L0 in.streams` | -- | **0** | -0.042 / 0.042 |
+  | **`L0 mhc_pre.collapsed`** | -- | **20480 / 20480** | -- |
+  | every buffer after, layers 0..44 | -- | 100% | -- |
+  | `hc_head collapse`, `hidden (final)` | -- | 100% | -- |
+  | `lm_head chunk[0]` | Q4_K | **0** | -0.175 / 0.199 |
+  | `logits[row 4]` | -- | **154880 / 154880** | -- |
+
+  **The first NaN is the first arithmetic that touches a Q8_0 weight.**
+  `L0 in.streams` -- the embedding, expanded to four identical streams -- is
+  clean, and `MhcPre`, which reads `hc_attn.fn`, is 100% NaN. Everything
+  downstream follows. The census over the first nine layers is a partition:
+  `hc_attn.fn` 9/9 NaN, `hc_ffn.fn` 9/9, `mla.q_b_proj` 2/2,
+  `mla.kv_a_proj_with_mqa` 2/2 -- every one Q8_0, rank-2 and kept-quant -- and
+  every other tensor clean. `mla.k_b_proj` and `mla.v_b_proj` are Q8_0 and CLEAN,
+  which is explained rather than anomalous: `KeepQuantKDim(kMatmulWeight, shape)`
+  returns `shape.size() == 2 ? shape[1] : -1`, so those rank-3 halves are routed
+  to `ExpandBf16` and never reach the repack at all.
+
+  **WHY NaN AND NOT MERELY WRONG, which is the part a static reading got
+  wrong.** `block_q8_0` is `{fp16 d; int8 qs[32]}` at 34 bytes and
+  `block_q8_0x4` is `{fp16 d[4]; int8 qs[128]}` at 136, so reading the interleave
+  as four plain blocks misaligns the `d` field from the second block onward and
+  QUANT BYTES ARE READ AS AN FP16 SCALE. An fp16 whose five exponent bits are all
+  set with a non-zero mantissa IS NaN, which is 3.06% of the blocks here; the
+  finite remainder is bounded by max-fp16 times max-int8,
+  `65504 * 127 = 8,319,008`, against a measured max of `8.31901e+06`. The
+  envelope is the mechanism's own arithmetic and not an inference from it.
+
+  **The sampler, the head and the tokenizer are each exonerated by the same
+  run.** `lm_head chunk[0]` is clean, so the Q4_K head is intact and only its
+  input is not. The logits line reads `nan=154880` of 154880 and the top-5 is
+  `(3, -nan) (4, -nan) (1, -nan) (0, -nan) (2, -nan)` with
+  `margin(top1-top2)=-nan` -- index order, because every `>` against NaN is
+  false. The next step then arrives with `step token_ids n=1: 0`, so the id 0 is
+  observed INSIDE the engine rather than inferred from the eight `!` on the wire.
+  This is case (a) of the four, and a static reading of the hazard had predicted
+  case (c), finite and wrong; the mechanism is the same and the prediction about
+  which bucket the LOGITS land in was wrong.
+
+  **THE REPAIR IS MEASURED ON THE SAME BOX, and the A/B is single-variable.**
+  `/mnt/nas_share/rc/glm5-diag/out-fix-20260830T125313Z`, `thor:gpu0`, the fixed
+  tree `d84db105b`, same checkpoint, same prompt. `blk.0 hc_attn.fn` goes from
+  `nan=12032, +-8.2e6, sd 4.59e5` to `nan=0, -0.379 / +0.398, sd 0.0332`, and
+  `hc_ffn.fn` likewise; `L0 mhc_pre.collapsed` from 20480/20480 NaN to `nan=0`;
+  all 64 per-layer `streams out` lines to `nan=0`; `hidden (final)` to
+  `nan=0, -13.94 / +8.49, sd 1.30`; and `logits[row 4]` from 154880/154880 NaN
+  to `nan=0, -9.14 / +16.43, sd 2.14`. **NO line in the entire repaired run
+  carries a non-zero NaN count.** The top-5 for `The capital of France is` is
+  `(12089, 16.427) (825, 15.148) (7407, 14.672) (3881, 14.582) (264, 14.376)`
+  with `margin(top1-top2)=1.2794`, which against the file's own vocabulary reads
+  **` Paris`, ` one`, ` located`, ` known`, ` a`** -- the right answer first, and
+  every runner-up a plausible English continuation. The engine then arrives at
+  step 2 with `step token_ids n=1: 12089`, so the sampled token is observed
+  INSIDE the engine exactly as the id 0 was in the broken run. The single
+  variable is checked rather than asserted: every non-q8_0 tensor prints
+  byte-identical statistics across the two runs and only the two q8_0 mixers
+  moved.
+
+
+  **THE FOUR-TOKEN TRACE, every step coherent.** `thor:gpu0`, fixed tree,
+  `--max-tokens 4`, `DONE rc=0` at 14:51:34. Emitted ` Paris. Paris is`.
+
+  | step | input | top-1 | logit | margin | the rest of the top-5 |
+  |---|---|---|---:|---:|---|
+  | 1 (prefill, T=5) | `The capital of France is` | ` Paris` | 16.427 | 1.279 | ` one`, ` located`, ` known`, ` a` |
+  | 2 | ` Paris` | `.` | 17.989 | 1.083 | `,`, ` (`, `.\n\n`, ` and` |
+  | 3 | `.` | ` Paris` | 14.619 | 0.404 | ` In`, ` It`, ` The`, ` France` |
+  | 4 | ` Paris` | ` is` | 19.383 | 2.971 | ` has`, `,`, ` was`, `'s` |
+
+  Every candidate at every step is grammatically and semantically appropriate to
+  its position -- a place name or a hedge after "France is", punctuation after a
+  proper noun, a sentence opener after a full stop, a verb after a subject. All
+  180 per-layer `streams out` readings across the four steps are `nan=0`. **Peak
+  RSS 89,315,324 kB = 85.18 GiB** (`VmHWM`, polled). This is the model answering
+  the question, and it is the fact O30 exists to establish.
+
+
+  **CONFIRMED ON `dgx:gpu0` (GB10), WITH THE INSTRUMENT OFF.** Run
+  `/mnt/nas_share/rc/glm5-diag/out-fix2-20260830T143718Z`, the fixed tree
+  `d84db105b`, `vllm-cli --device cpu --max-tokens 2`, `VT_GLM5_DIAG` UNSET --
+  the shipped configuration, so no probe can be said to have changed what it
+  measures. Output **` Paris.`**, `rc=0`,
+  `finish_reason=length prompt_tokens=5 completion_tokens=2`. **Peak RSS
+  104,792,300 kB = 99.94 GiB** (`VmHWM`, polled), against the 99.47 GiB the
+  UNFIXED binary read on this same box -- the fix removes about 0.76 GiB of q8_0
+  copies and the mmap pages take their place, so residency is unchanged in
+  practice.
+
+  This is the same box, the same 101.2535 GiB artifact and the same prompt as
+  the W5b-2c run that emitted `!!!!!!!!`. **Before: `!!!!!!!!`. After:
+  ` Paris.`** The `thor:gpu0` runs above supply the mechanism and the per-layer
+  bisect; this one supplies the product claim on the box the row is gated
+  against.
+
+  **AND IT PRICES THE VOID SPEED NUMBER, on one box.** This run generated 2
+  tokens in 390.929 s, **195.5 s/token**, where the all-NaN W5b-2c run on this
+  same box read 73.1 s/token. The broken forward was 2.7x "faster" than the
+  working one. That is consistent with the degenerate-routing account below and
+  settles the only thing that matters about it: 73 s/token was never a
+  measurement of this model, and 195.5 s/token is the first honest one. It is
+  still not a benchmark -- one leg, one concurrency, a host f32 reference that
+  re-decodes every layer each step -- and O6 owns the axis.
+
+  **The box is `thor:gpu0` and NOT `dgx:gpu0`, and that is a real limit on this
+  entry.** Both are aarch64 with i8mm, so both take the repack path and the
+  defect and its repair are the same on each; `dgx:gpu0` was held by another
+  session for the whole diagnostic window. Nothing else differed -- same
+  checkpoint, same prompt, same `--device cpu`, same defaults, no flag or arm
+  changed. The one number that is NOT comparable across the two boxes is peak
+  RSS, because the weights are mmap-resident and `VmHWM` then tracks page-cache
+  eviction pressure rather than a fixed footprint: the same unfixed binary read
+  99.47 GiB on `dgx:gpu0` and 72.05 GiB on `thor:gpu0`. The GB10 confirmation is no longer
+  owed: it is the `out-fix2-20260830T143718Z` run recorded above.
+
+  **A SPEED NUMBER THIS ROW MIGHT OTHERWISE HAVE INHERITED IS VOID, and it is
+  worth more than the repair.** The unfixed forward ran a 45-layer pass in about
+  2.3 minutes and the repaired one takes about 39. The probe is not the cause --
+  the unfixed run printed MORE, at level 2, and was faster. The likely cause is
+  the MoE: with NaN router logits every `>` is false, so the top-k almost
+  certainly selected the SAME 8 of 288 experts at every layer and every token,
+  decoding one hot set out of page cache, while the repaired run selects real,
+  scattered experts and pays cold reads for them. If that holds, EVERY speed
+  number this model has produced, including the 73 s/token of the W5b-2c run,
+  came from an all-NaN forward with degenerate expert selection and measures
+  nothing about this model. O6 already claims no speed number, so nothing
+  published depends on it. Recorded as a hypothesis with its reasoning rather
+  than as a measurement, and owed to whoever opens O6.
+
+  **NOT REPAIRED, and it is the part with teeth.** CI HAS an aarch64 lane,
+  `build-test-cpu-arm64` on `ubuntu-24.04-arm`, and it builds **no glm5 target**
+  (`grep -c glm5` over the job is 0): its list is `test_cpu_isa_arm`,
+  `test_ops_matmul_elem`, `test_ops_quant_dot`, `test_ops_quant_repack` and nine
+  tokenizer targets. The miniature WOULD have caught this there — its three
+  stacked expert banks are written at Q8_0 and load as `N = kExperts * kMoeI =
+  128`, `K = kH = 32`, both repack-eligible, and
+  `test_glm5_next_bridge`'s "the BLOCK-QUANT residency decodes" case asserts
+  decoded VALUES against `Q8_0ValueAt` rather than a shape. Adding the target is
+  not a one-line change to make blind: that lane builds only small targets at
+  `-j 2` and `test_glm5_next_bridge` links the whole library, so its build
+  budget has to be MEASURED before the target is added, and it cannot be
+  measured while the forge is unreachable. Owed as its own row with a measured
+  CI run behind it.
+
+- **O31 — W9a's CUDA arm is NOT REACHED from a production entry point, and this
+  entry names what owns the wiring.** The substitution W9a lands routes
+  GLM-5.3-Flash's routed-expert GEMM through `vt::MoeGateUpSwiGLUGrouped` and
+  `vt::MatmulBTQuantGrouped`, both of which have a CPU provider and a CUDA
+  provider and dispatch on `q.device.type`. On this model only the CPU provider
+  runs, because `glm5_next_forward.cpp:231-238` still refuses a non-CPU queue by
+  name and nothing constructs a CUDA queue for this forward. **The CUDA arm of
+  the seam is exercised by W9a's device gate at this model's geometry and
+  encodings, and by nothing on this model's production path.**
+
+  Deliberately staged, per AGENTS.md §"Nothing lands dead". What is unreached is
+  specific: the `DeviceType::kCUDA` registration of `OpId::kMoeGateUpSwiGLUGrouped`
+  and `OpId::kMatmulBTQuantGrouped` as reached FROM THIS MODEL. **W9b** owns the
+  residency that puts the banks on a device and **W9c** owns the forward that
+  constructs a CUDA queue; until both land, the seam call is correct and host-only.
+
+  **The reachability half that IS discharged, and it is the point of the wave.**
+  On the CPU arm the substitution is fully reached — `ModelRegistry::Forward` ->
+  `ForwardGlm5NextForConditionalGeneration` -> `TextModelForward` -> the decoder
+  layer -> `MoeForward` -> the two shared ops — and deleting the seam call reds
+  the focused gate. This is not a layer waiting for a wave to call it, which is
+  what O23, O25 and O26 each were; it is a live path whose device PROVIDER is
+  owed.
+
+  **NO ISSUE NUMBER, and the reason is external.** AGENTS.md requires an open
+  GitHub issue before work starts. `gh api user` returns
+  `403 "Sorry. Your account was suspended"` on both identities available here, so
+  no issue can be filed and no existing issue can be read. This is
+  `REMOTE_UNVERIFIED`, which is never a pass: the obligation is not discharged,
+  only unperformable. Whoever regains forge access files it against this row and
+  edits this entry and W9a's heading with the number. Recorded here rather than
+  invented, because a fabricated issue reference is worse than a missing one.
+
+- **O32 — the device arm is still owed, and it is now owed as FOUR named waves
+  rather than as one unscoped debt.** W9c's rescoping (§W9c "RESCOPED") measures
+  what is left: W9b (keep-quant residency), W9c-1 (the DSA/MLA block onto
+  `mla::ForwardMlaAttentionBlock`), W9c-2 (lifting the two CPU-only refusals at
+  `glm5_next_kda.cpp:322-325` and `glm5_next_moe.cpp:222-225`), and W9c-3 (the
+  compose that deletes the refusal at `glm5_next_forward.cpp:231-238`). None is
+  started. `--device cuda` on this model still refuses by name, and O30's
+  ` Paris.` on `--device cpu` at 195.5 s/token remains the only generation this
+  row has ever observed. Owned by row `MODEL-MM-GLM53-FLASH-CUDA` and tracked by
+  [#2410](https://github.com/mudler/vllm.cpp/issues/2410), which is a REAL issue
+  filed by this wave rather than an inherited number. **The `#1998` and `#2241`
+  this row cites throughout resolve to neither an issue nor a pull request
+  today** (`gh issue view` and `gh pr view` both 404 while `gh issue view 2409`
+  serves, and a `--state all` listing spanning #41..#2409 does not contain
+  them). That observation is recorded and NOT acted on: this exact 404 pattern
+  once got read as mass deletion and written into AGENTS.md as a falsehood, so
+  the correct response is a re-measurement by someone with the forge in front of
+  them, not a sweep that rewrites every citation on this row.
+- **O33 — `glm5_next_attn.cpp` and `glm5_next_dsa.cpp` are a PARALLEL PATH BY
+  HAND around a shared seam that already fits this model.** 991 host lines
+  reimplement an MLA + DSA-indexer block that `mla::ForwardMlaAttentionBlock`
+  already provides, that `MlaBlockDims::Validate` was WIDENED to admit for this
+  row by W3/[#2213](https://github.com/mudler/vllm.cpp/issues/2213)
+  (`mla_attention.cpp:96,128` accept `qk_rope_head_dim == 0`), and that the
+  sibling `GlmMoeDsaForCausalLM` already drives on a GPU
+  (`glm_moe_dsa_forward.cpp:157` → `mla_attention.cpp:920-921,1083`).
+  `grep -n 'mla::\|MlaBlock' glm5_next_attn.{h,cpp}` returns NOTHING. AGENTS.md
+  §"Shared seams" forbids exactly this, so it is recorded as a defect and not as
+  a design. **It is not repaired in flow**: retiring the hand-rolled block is
+  W9c-1's whole scope, it changes the numerics of 11 of 45 layers, and the host
+  reference has to survive below the fold as the parity operand — which is a
+  wave with its own red-first gate, not a small clear fix. W9c-1 owns it.
+- **O34 — the mHC family has a CUDA kernel and NO CPU op registration, which is
+  the mirror image of every other family on this row.**
+  `vt::OpId::kDeepseekV4Mhc` (`ops.h:294`) is registered on CUDA only
+  (`cuda_deepseek_v4.cu:2102`), declares no free-function wrapper in `ops.h`, and
+  is reached only through `vt::GetOp(kDeepseekV4Mhc, kCUDA)` behind an
+  `OpRegistered` probe (`deepseek_v4_device.cpp:15,31`). `glm5_next_mhc.cpp` (89
+  lines) bypasses the op table entirely and calls `deepseek_v4_mhc.cpp`'s host
+  functions directly (`glm5_next_mhc.h:20-24`). So this row's mHC sites have no
+  device path and the tree's mHC kernel has no CPU golden to be gated against
+  from here. W9c-3 owns the decision between reaching the CUDA op through the
+  same probe and growing the seam a CPU registration; this entry records that
+  neither has been chosen and that the choice is not free.
+- **O35 — TWO ANCHORS IN THIS ROW'S OWN DISPATCH BRIEFING WERE WRONG, and they
+  were caught by re-reading rather than by a checker.** `dense_device_glue.h:146`
+  was cited as `DBuf`; `DBuf` is declared at `:109` and `:146` is a line inside
+  its body. `deepseek_v4.cpp:1708-1715` was cited as `V4ResidentExpertBase`;
+  that function is at `:1807` and the `madvise(MADV_DONTNEED)` reclaim it is
+  cited for is at `:1793`. Both are DRIFT rather than fabrication — each points
+  into the right file at a plausible neighbourhood — which is the harder class to
+  spot, because a reader who opens the file sees relevant code and stops. Every
+  anchor in §W9c "RESCOPED" was re-read on `0b4766c96` before it was written
+  down, and this entry exists so the next reader knows that was done rather than
+  assumed. No checker asserts anchor uniqueness in this spec, which is why the
+  count of wrong anchors in this family keeps growing;
+  [#2099](https://github.com/mudler/vllm.cpp/issues/2099)'s lane-pin finding is
+  the same shape one document over.
+
 ## Now
 
-`ACTIVE`, 2026-08-28. The row's lifecycle state does not move: W3
+`ACTIVE`, 2026-08-31. **The device arm is a PORT, not a kernel campaign, and
+§W9c said otherwise on a premise this wave falsified.** W9c's rescoping
+(`CLAIM-GLM53-FLASH-CUDA`, row `MODEL-MM-GLM53-FLASH-CUDA`, issue
+[#2410](https://github.com/mudler/vllm.cpp/issues/2410)) writes no product code.
+**O31's and W9a's "no issue number, `gh` is 403 on both identities" is STALE and
+this wave measured it rather than inheriting it**: `gh api user` returns 200 as
+`localai-org-maint-bot`, `gh issue list` and `gh issue view` both serve, and
+#2410 was filed for this row. Whoever reads O31 next should re-measure before
+repeating its block; a recorded forge outage outlives the outage. The row's
+lifecycle state does not move, because O1 does not, and `--device cuda` still
+refuses by name at `glm5_next_forward.cpp:231-238`.
+
+**THREE MEASUREMENTS CHANGED THE PRICE OF THIS DEBT.** §W9c states the six
+forward files "carry ZERO `vt::Tensor`" and draws from it that the DeepSeek-V4
+shape cannot apply. Counted on `0b4766c96`: **25 across 2,783 lines** — 15 in
+`glm5_next_moe.cpp` and 10 in `glm5_next_kda.cpp`, both of which also make **5
+`vt::` compute-op calls** between them. The claim holds for 1,864 lines and is
+false for 919. Second, **every primitive family this model needs already has a
+registered CUDA provider** — KDA, MLA, DSA, all four MoE ops, RmsNorm, Matmul,
+Embedding, RopeNeox — so no kernel in this campaign has to be written FOR
+CORRECTNESS; §W9c carries the table with both providers' `file:line`, and names
+in the same breath the two speed debts a provider does not close (O14's
+chunked-prefill gap, and the 64-head cliff). Third, and the largest
+single reuse, **this model's own sibling already runs the DSA/MLA block on a
+GPU**: `GlmMoeDsaForCausalLM` drives `mla::ForwardMlaAttentionBlock`
+(`glm_moe_dsa_forward.cpp:157` → `mla_attention.cpp:920-921,1083`), and that
+seam was WIDENED to admit this row's NoPE geometry by W3
+([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) — yet
+`glm5_next_attn.cpp` does not reference `mla::` at all. O33 records that as the
+parallel-path-by-hand defect it is.
+
+**What the arm actually costs, as four named waves rather than one debt:** W9b
+keep-quant residency; W9c-1 the DSA/MLA block onto the shared seam (11 of 45
+layers); W9c-2 lifting the two CPU-only refusals so the KDA and MoE arms reach
+the CUDA providers they already call (34 of 45 layers plus every sparse block);
+W9c-3 the compose that deletes the refusal. **None is started**, and O32 says so
+rather than letting the scoping read as progress. mHC is the one family with a
+real gap and it is small and inverted — a CUDA kernel with no CPU registration
+(O34).
+
+**The device gate §W9a left PENDING is TAKEN on `thor:gpu0` and PASSES** — the
+grouped keep-quant seam at this model's published MoE geometry on all four of
+its real encoding triples, 25 assertions in the case and 17 cases / 177,284
+assertions across the suite, with the box, the binary hash and the job id in
+§W9c. **The `dgx:gpu0` leg is still queued and this does not close the gate**:
+`sm_110` and `sm_121a` are different targets. This is the first device evidence
+this row has ever carried.
+
+The next actions are W9b, then W9c-1, and W6 and W7b are unchanged.
+
+### Before the W9c rescoping
+
+`ACTIVE`, 2026-08-31. **The routed-expert GEMM is on the shared keep-quant seam,
+and the device arm is scoped as three waves rather than one debt.** W9a
+(`CLAIM-GLM53-FLASH-W9A`, no issue number — see O31) moved
+`MoeForward`'s expert arm onto `vt::MoeGateUpSwiGLUGrouped` and
+`vt::MatmulBTQuantGrouped`, which was the last hand-rolled arithmetic in this
+model's MoE. The row's lifecycle state does not move, because O1 does not.
+
+**THE SCOPE CAME FROM A MEASUREMENT AND IT CHANGED THE DESIGN.** Every earlier
+statement about this model's device feasibility used an EXPANSION of the
+checkpoint against `dgx:gpu0`'s ~119.63 GiB. The artifact had never been weighed
+in the encoding it is stored in. It is **101.2446 GiB**, of which the 129
+routed-expert tensors are **94.6758 GiB** and everything else is **6.5688 GiB**.
+So it FITS keep-quant with 18.39 GiB of headroom; the Kimi-Linear
+"stage bf16-resident" shape does NOT fit, because widening only the non-expert
+tower costs +10.39 GiB — 56% of the headroom — to widen 6.5% of the model; and
+Q8_0, the one encoding with no device keep-quant GEMM, is 346 small projections
+totalling 0.8013 GiB and therefore not a blocker. §W9a carries the full census.
+
+**Gated on x86_64 at 13 cases / 9619 assertions** in `test_glm5_next_moe`, of
+which W9a's five are 8005, plus `test_glm5_next_bridge` at 20 / 32562 and the
+forward and layer suites unchanged. Five mutations, each applied to product code
+and killed by an assertion rather than by the compiler. Two are worth the next
+reader's attention. The REACHABILITY mutation is invisible to every band —
+delete the call site and both arms become the f32 arm, so the parity NMSE is
+exactly 0 — and only `GgufExpertSource::decoded()` sees it, because the
+keep-quant arm never consults the source. And dropping `swiglu_limit` SURVIVED
+the first suite: the fixture never drove a pre-clamp value past 10, so no case
+could see the clamp being removed. That was repaired rather than disclosed.
+
+**The CUDA arm of the seam is NOT reached from this model** and O31 says so.
+`glm5_next_forward.cpp:231-238` still refuses a non-CPU queue; **W9b** owns
+keep-quant residency and **W9c** owns the device forward, which is a campaign
+rather than a wave because the ~2,900 lines of this model's forward carry zero
+`vt::Tensor`. The device gate at the published MoE geometry is written and
+PENDING on `dgx:gpu0` and `thor:gpu0`, both queued behind other work; an untaken
+device gate is recorded as PENDING and never as a pass.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact), and W9b.
+
+### Before W9a
+
+`ACTIVE`, 2026-08-30. **The engine's guard above this model's forward no longer
+refuses it.** W5b-2c ([#2348](https://github.com/mudler/vllm.cpp/issues/2348),
+`CLAIM-GLM53-FLASH-W5B2C`) writes the consuming forward O28 measured the absence
+of: `ForwardGlm5NextForConditionalGeneration` maps the engine's layer-name-keyed
+`MultiKvCacheIndex` onto the three groups `MakeGlm5NextKVCache` publishes and
+hands `TextModelForward` a real `std::vector<LayerCache>`, hydrated from the
+engine's paged buffers and written back into them. The row's lifecycle state
+does not move, because O1 does not.
+
+**The mapping is the work, and O29 records it rather than leaving the next
+reader to re-derive it.** The three counts in O28's refusal are three different
+denominators: three published GROUPS, twenty-two caches in `attn_kv` (one per
+published NAME of every ATTENTION group, 11 latents plus 11 indexer caches, the
+34-layer recurrent group contributing none because it lands on `gdn_state`), two
+distinct groups among those 22, and block tables gathered per GROUP ID for all
+three. Every attention cache is resolved BY NAME through
+`MultiKvCacheIndex::Find` and its group id is read off the channel; the
+recurrent group carries no names at all, so its correspondence is positional and
+a count against `num_kda_layers()` is the only check there is, which is stated
+rather than hidden.
+
+**GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR**, and that is the one error here
+that produces a fluent wrong model instead of a crash. `num_kv_heads != 1` and a
+`head_size` that is not the published row are refused by name, and the row's
+page arithmetic is cross-checked against the engine's own
+`attn_meta.slot_mapping`, so a misread block table is a refusal on the first step
+rather than a wrong token on every step after it.
+
+**A sentence W5b-2b landed is retired.** The forward did not "re-run the whole
+prefix each step": `ModelForwardInput::token_ids` is the step's SCHEDULED
+tokens, so on the second step of a decode it is ONE id, and a forward that treats
+it as a sequence attends to an empty prefix. Nemotron-H and Kimi-Linear carry the
+same defect and this row does not inherit it.
+
+**Gated:** `prefill(5) + continue(3)` through `ModelRegistry::Forward` agrees
+with the one-shot forward over the same eight tokens EXACTLY on an f32 cache,
+and nine negative mutations all kill their gate — including the reachability one
+`.agents/reachability.md` asks for and a restoration of the unconditional W3
+guard, which reds 18 of 23 cases. What the fixture CANNOT see is recorded in
+O29: at `hidden_size` 32 a wrong prompt moves the tail logits by two ULP, so the
+bf16 case asserts a one-ULP bound and nothing about discrimination.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact, whenever the developer grants a large-asset
+download), and the two narrow debts O27 and O29 both name: ragged batching and
+the device arm.
+
+### Before W5b-2c
+
+`ACTIVE`, 2026-08-30. **`ModelRegistry::Forward` reaches this model.** W5b-2b
+([#2337](https://github.com/mudler/vllm.cpp/issues/2337), split out of
+[#2241](https://github.com/mudler/vllm.cpp/issues/2241),
+`CLAIM-GLM53-FLASH-W5B2B`) landed the two pieces that stood between a loaded
+`Glm5NextWeights` and a token. The row's lifecycle state does not move, because
+O1 does not: no end-to-end token gate for this model exists or can exist on this
+fleet, and nothing in this wave is a claim about the 321.32B model.
+
+The first piece was a RESIDENCY problem and not plumbing. `BridgeDsaLayer`
+covered the 11 DSA layers; `BridgeKdaLayer`, `BridgeMlp` and `BridgeMhcSite` are
+the mechanical three, and `BridgeMoeLayer` is not, because one sparse layer's
+three expert banks are 27.0 GiB in f32 and the 42 sparse layers together are
+1,134 GiB against ~119.63 GiB usable. `kBridgeTensorF32ByteCeiling` did NOT
+move: it correctly refuses one 9.0 GiB bank. What changed is that
+`num_experts_per_tok` is 8 of 288, so `MoeLayerWeights` grows a borrowed
+`ExpertSource*` and `DecodeOwnedTensorRowsToF32` decodes ONE leading-axis row
+range — 32 MiB, 32x under the same ceiling — with the RANGE checked against that
+ceiling, so asking for all 288 rows is refused by the arithmetic that refuses
+the whole tensor. `MoeForward` visits each HIT expert once, which is upstream's
+own order and what bounds the peak at one expert. The second piece is
+`glm5_next_forward.{h,cpp}`: `Glm5NextGgufLayerSource` holds ONE layer slot,
+`TextModelForward` grows an overload over it so there is one loop and not two,
+and the hook follows the `NemotronHForCausalLM` / `KimiLinearForCausalLM`
+full-prefix pattern with two narrow refusals of its own — a multi-request step
+and a non-CPU queue.
+
+**IT LOADS, AND THE ENGINE STILL CANNOT RUN IT — measured, not assumed.** Driven
+at the staged 101.2535 GiB artifact on `dgx:gpu0` on 2026-08-30
+([#2343](https://github.com/mudler/vllm.cpp/issues/2343)), all four shards load,
+the tower materializes and the engine sizes its caches; the FIRST step then
+throws at the `input.multi_kv` guard at the TOP of `ModelRegistry::Forward`,
+which KV-DSV4-MULTICACHE W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068))
+landed and which fires for ANY multi-cache model before dispatch to its hook.
+**No token was generated.** O28 carries the run, the two product sentences W5b-2b
+landed that it falsifies, and the three staging-script defects found on the way.
+
+**O27 records what that discharges and what it does not.** The reachability
+halves of **O15, O16, O17, O23, O25 and O26 are DISCHARGED**: the chain from
+`ModelRegistry::Forward` down to the KDA arm, the mHC bricks, the DSA indexer,
+the MoE block and W5b-1's two files is complete, and deleting the production
+call site reds the focused gate at 11 of 118 assertions. Still owed and named in
+place: the `shared` indexer arm (no released config selects it), W5b-2a's
+`LayerCache` binding (the full-prefix recompute does not call it), ragged
+batching, the device arm, and O1, O6 and O19 unchanged. Two of thirteen
+mutations survived the first suite and both were repaired rather than disclosed
+— a fixture whose mHC ramps saturate every sigmoid, and a one-token case that
+could not see a missing per-expert grouping.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact, whenever the developer grants a large-asset
+download), and the two narrow debts O27 names: ragged batching and the device
+arm.
+
+### Before W5b-2b
+
+`ACTIVE`, 2026-08-29. The row's lifecycle state does not move: W3
 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213),
 `CLAIM-GLM53-FLASH-W3`) landed the critical-path geometry — `MlaBlockDims`
 accepts the NoPE layer, discharging O11, and the DSA indexer's k-pool
@@ -1780,10 +4626,60 @@ and both sources — a `config.json` and a converter-written GGUF — descend
 through one `ParseGlm5NextParams` that mirrors upstream's `__post_init__` and
 all five `validate_architecture` rejections. **O9 is discharged.**
 
-**No artifact exists** (O7) and **nothing loads or forwards** (O10): the
-loader, the forward and the KV-cache spec each refuse by name, and
-`MlaBlockDims::Validate` still refuses this model's NoPE geometry (O11). No GPU
-gate has moved and no correctness claim about the MODEL has been made.
+**THE MODEL LOADS.** W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242))
+landed the weight tower, so the GGUF arm of `load_weights` returns a real
+`Glm5NextLoadedModel` and this architecture has a `LoadedModel` for the first
+time. Driven at the staged `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL through the
+production chain, HEADERS ONLY: four shards open, the config resolves to 45
+layers / 34 KDA / 11 DSA / NoPE MLA, and all 1383 backbone tensor names resolve
+with 0 missing and 0 unexplained at 41 MB peak RSS. `blk.45` is read, counted
+and NOT built as a decoder layer. **O10 is half discharged and O7 is narrowed:
+the artifact exists, and what W7b still owes is a conversion of OURS.**
+
+**THE DSA ATTENTION BLOCK EXISTS.** W5b-1
+([#2324](https://github.com/mudler/vllm.cpp/issues/2324)) landed
+`Glm5NextTextAttention` — `q_a_proj`/`q_a_layernorm`/`q_b_proj`,
+`kv_a_proj_with_mqa`/`kv_a_layernorm`, `expand_kv` over the checkpoint's SPLIT
+half-transposed `kv_b_proj` halves, `build_attention_mask_from_topk` over W3's
+selection, and the CROSS-LAYER top-k sharing a `shared` layer needs — gated
+against the RUN output of `transformers` v5.16.1 at 14 cases / 160 assertions.
+It also landed the `OwnedTensor` -> host f32 bridge, which ANSWERS O22's open
+residency question: one DSA layer at a time, 0.4654 GiB, never the tower, whose
+expanded form is 426.72 GiB against a ~119.63 GiB box. **W5b-1 is NOT REACHED
+from any production entry point** and O25 carries that disclosure; the wiring is
+W5b-2's.
+
+**THE STACK ASSEMBLES, AND NOTHING REACHES IT YET.** W5b-2a
+([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) landed
+`glm5_next_layer.{h,cpp}`: the decoder layer with all four control-flow arms,
+the mHC stream threading at both sites, `TextModelForward`, and the binding of
+the DSA block to `MakeGlm5NextKVCache`'s groups 0 and 2 through an additive
+`DsaCache`. Gated at 10 cases / 1647 assertions against the RUN output of
+`transformers` v5.16.1 over a FIVE-layer mixed schedule at the published
+`hc_mult` of 4 — including a cached 8-token prefill plus 4-token continuation
+that agrees with the 12-token one-shot, and an EARLY-COLLAPSE decoy from the same
+oracle run that a port threading `[T, hidden]` would match instead. The KV
+binding stores the 512-wide LATENT rather than the 32,768-wide expanded K/V the
+reference stores, and the `ExpandKv(a ++ b) == ExpandKv(a) ++ ExpandKv(b)`
+identity that makes the two equal is now a case rather than a sentence.
+**W5b-2a is NOT REACHED from any production entry point**, O26 carries that
+disclosure, and it discharges NONE of O15, O16, O17, O23 or O25 — the five
+primitives now have one assembly point instead of five dead ends, and that
+assembly point is itself unreached.
+
+**Nothing FORWARDS** (O10's remaining half): the FORWARD still refuses by name
+and W5b-2b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) owns it —
+the weight bridge for the KDA, MoE, dense-MLP and mHC arms, whose routed expert
+banks are ~1,150 GiB in f32 across the 42 sparse layers and therefore need an
+on-demand per-expert decode rather than four more `BridgeDsaLayer`s, plus the
+engine binding from `ModelForwardInput` to `TextModelForward`. The
+KV-CACHE SPEC is NOT part of that debt any more — W5
+([#2223](https://github.com/mudler/vllm.cpp/issues/2223)) publishes it through
+the production `make_kv_cache` hook, as the paragraph below records. No GPU gate
+has moved, no materialized load has been measured (O22), and no correctness
+claim about the MODEL has been made. The paragraph this
+replaced said "no artifact exists and nothing loads"; both halves of that were
+true when written and neither is now.
 
 W0 ([#2096](https://github.com/mudler/vllm.cpp/issues/2096)) then wrote the lane
 oracle pin. `.agents/oracles/transformers.md` records `transformers` `5.16.1`
@@ -1833,7 +4729,62 @@ bare `pass` over `DeepseekV4HyperConnection`; the fourth does not.
 Every golden is the RUN output of the unmodified reference modules at
 transformers `v5.16.1`, not a transcription, and the gate was RED first against
 the wrong reuse at 59 of 98 assertions failed. That code is **not reached** from
-any production entry point (O16); W5 owns the wiring.
+any production entry point (O16); **W5b** owns the wiring. W4 wrote "W5" here
+and that was right until W5 split: W5 landed the MoE and the KV-cache spec and
+explicitly did not land the decoder layer, because W3 left no assembled
+attention block for its DSA arm to call, so the layer that reaches this code is
+W5b's ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)). O23 records the
+same split for the MoE.
 
-The next actions are W3 and W5, and, whenever the developer grants a
-large-asset download, W7b.
+W3 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) then made the NoPE
+MLA geometry representable and ported the DSA k-pool indexer. **O11 is
+discharged.**
+
+W5 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223),
+`CLAIM-GLM53-FLASH-W5`) then landed the 288+1 expert MoE and the heterogeneous
+KV-cache spec — **and this row has its first REACHED capability.**
+`MakeGlm5NextKVCache` replaces a refusal with three published groups, entered
+through `ModelRegistry::Resolve` and the production `make_kv_cache` factory hook;
+unwiring that hook reds the gate, and deleting the row does not compile, because
+`-Werror=unused-function` fires on the function the factory is the only
+reference to. The MoE binds rather than reimplements — `vt::MoeRouterTopK`'s
+grouped `noaux_tc` arm and `deepseek_v4::ClampedSwiGLU` at `alpha=1, beta=0` —
+and is gated at the PUBLISHED 288/top-8 on SET equality of the selected experts
+with the separation margin printed, because top-k error is bimodal.
+
+**W5 SPLIT, and the reason is a gap W3 left rather than a scope decision.** The
+decoder layer and the assembled `Glm5NextTextModel::Forward` need an assembled
+`Glm5NextTextAttention` over W3's indexer, and there is none: the selection
+landed, the block did not. They are **W5b**; the weight tower and `load_weights`
+are **W5c**, and W5c has since LANDED
+([#2242](https://github.com/mudler/vllm.cpp/issues/2242)). The MoE is still not
+reached (O23), but the reason is no longer that nothing on this row can be: when
+W5 was written `ModelRegistry::Forward` was unreachable by construction because
+`load_weights` refused, and that is retired as O24. `load_weights` now returns a
+real `LoadedModel`, so what is missing is the decoder layer W5b owes, not a
+handle.
+
+**The published artifact was measured, not assumed — and the reading has since
+been SUPERSEDED, which is why it is kept as a dated measurement rather than a
+state.** `unsloth/GLM-5.3-Flash-GGUF` rev `d425e572f`, arm `UD-Q2_K_XL`, run
+through `LoadedEngine::FromModelDir` on 2026-08-29: it opened the file, resolved
+`glm5next`, walked the 4-way split, and stopped on
+`blk.3.ffn_gate_exps.weight has unknown ggml type id 17` (IQ2_XS). It does not
+stop there now — [#2245](https://github.com/mudler/vllm.cpp/issues/2245) landed
+that decoder and W5c resolves all 1383 backbone tensors. The arm mixes EIGHT ggml encodings and six are undecodable here —
+Q3_K/Q4_K/Q5_K (O8) and IQ2_XS/IQ3_XXS/IQ4_XS (O5). **"Q2_K" is a floor, not a
+format**, and O7's premise is superseded by a harder debt than the one it named:
+a weight tower alone will not load this file. §W5 carries the census.
+
+W5 also repaired three refusal messages that named landed waves as owing and
+denied an artifact that exists
+([#2230](https://github.com/mudler/vllm.cpp/issues/2230)); the gate had been
+pinning all three, which is why they survived W2, W3 and W4 landing.
+
+No GPU gate has moved: `dgx:gpu0` was held by other sessions throughout W5's
+window, `strix:gpu0` cannot hold the artifact or run a CUDA kernel, and W3's
+committed CUDA arm remains unmeasured (O17). GPU gates stay `PENDING` with the
+reason recorded rather than a result invented.
+
+The next actions are W5b and W5c, then W6, and — whenever the developer grants a
+large-asset download or six quant decoders exist — W7b.

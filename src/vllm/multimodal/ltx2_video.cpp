@@ -414,7 +414,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 930 940 941 1027 1123 1139 1228 1232 1335 1397 1505 1547 1589 1591
+// 1079 1089 1090 1176 1272 1288 1377 1381 1484 1546 1654 1696 1738 1740
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -521,17 +521,119 @@ std::string RecipeVersionKey(const std::string& declared) {
 // a value gate cannot catch. It is taken because `Ltx2ConnectorForward` is L5's
 // declared PARITY dtype and this is the arm its goldens cover, and its output is
 // narrowed to the stream dtype on the first upload like every other activation.
-Ltx2ConnectorEmbeddings RunConnector(const SafetensorsFile& dit_file,
+// A phase leaf that a caller can DECLINE, which is what an empty prefix means.
+// `phase::Scope` has no disabled state and is not movable, so the choice is
+// expressed by whether the optional holds one. Named rather than written inline
+// because two call sites in this file need the same "measure this only when the
+// caller asked for it" shape, and a second copy is how two rules start.
+class SubPhase {
+ public:
+  SubPhase(const std::string& prefix, const char* suffix) {
+    if (!prefix.empty()) scope_.emplace(prefix + suffix);
+  }
+
+ private:
+  std::optional<phase::Scope> scope_;
+};
+
+// ── THE CONNECTOR'S WEIGHTS, MATERIALIZED ONCE PER RENDER ───────────────────
+// Row LTX25-TEXT-COND-DEVICE, issue #2354.
+//
+// A GUIDED RENDER RAN THIS TWICE. Classifier-free guidance encodes the
+// positive prompt and the negative one (guiders.py:275-277), each goes through
+// the connector, and each `RunConnector` re-opened the 42 GB DiT file, re-parsed
+// its 4091-tensor plan and re-materialized 2.016 B parameters into f32 --
+// about 8 GB, both times, out of the same file, for the same configuration.
+// Nothing between the two passes can change what those tensors are: they are
+// checkpoint weights, and the checkpoint does not move mid-render.
+//
+// SO THE SECOND MATERIALIZATION IS REMOVED, AND THE OUTPUT IS BIT-IDENTICAL.
+// Identical weights and identical inputs give identical outputs; this changes
+// which allocation the second pass reads, not a single float in it. That is a
+// stronger claim than a tolerance and the row's gate takes it at its word: the
+// pixel comparison against the pre-change render is byte equality, not a
+// threshold.
+//
+// PEAK HOST BYTES DO NOT RISE, which is the objection this has to answer.
+// `RunConnector`'s own header states the opposite policy -- "THE WEIGHTS LIVE
+// AND DIE INSIDE THIS CALL" -- and it is right about what it argues: holding
+// 8 GB for an ENGINE's lifetime on a 119 GB unified-memory box, for a module
+// that runs once per request, is 8 GB spent badly. This is not that. The window
+// here is ONE render, between the positive conditioning and the negative one,
+// and across that window the 8 GB was already resident twice in sequence. It is
+// now resident once, for longer. The maximum is unchanged; the churn is halved.
+//
+// LAZY, NOT EAGER. A render at `cfg_scale = 1.0` does no unconditional forward
+// and encodes no negative prompt, and a checkpoint with no connector never asks
+// at all. Materializing at construction would charge those renders 8 GB for a
+// module they never reach.
+class ConnectorWeightSet {
+ public:
+  ConnectorWeightSet(std::string dit_path, Ltx2ConnectorConfig video_cfg,
+                     Ltx2ConnectorConfig audio_cfg)
+      : dit_path_(std::move(dit_path)),
+        video_cfg_(std::move(video_cfg)),
+        audio_cfg_(std::move(audio_cfg)) {}
+
+  ConnectorWeightSet(const ConnectorWeightSet&) = delete;
+  ConnectorWeightSet& operator=(const ConnectorWeightSet&) = delete;
+
+  // `phase_prefix` names the leaf the FIRST materialization is charged to. The
+  // second call charges nothing because there is no second materialization, and
+  // that absence is exactly what the row's T2 reads out of the phase table.
+  void Ensure(const std::string& phase_prefix) {
+    if (loaded_) return;
+    const SubPhase weights_phase(phase_prefix, ".weights");
+    const SafetensorsFile file = SafetensorsFile::Open(dit_path_);
+    video_ = Ltx2LoadConnectorWeights(file, video_cfg_);
+    audio_ = Ltx2LoadConnectorWeights(file, audio_cfg_);
+    loaded_ = true;
+  }
+
+  const Ltx2VaeWeights& video() const { return video_; }
+  const Ltx2VaeWeights& audio() const { return audio_; }
+
+ private:
+  std::string dit_path_;
+  Ltx2ConnectorConfig video_cfg_;
+  Ltx2ConnectorConfig audio_cfg_;
+  Ltx2VaeWeights video_;
+  Ltx2VaeWeights audio_;
+  bool loaded_ = false;
+};
+
+//
+// `phase_prefix` SPLITS THIS CALL INTO ITS TWO HALVES, and it is the whole
+// reason this signature grew an argument. #2296 measured `conditioning.connector`
+// at 122.388 s -- 23.61% of an LTX-2.5 render, the SECOND largest phase, and
+// more stable (0.44% spread) than anything else in the table -- and then had to
+// say in its own `## Owed` that it could not tell whether that number is the two
+// `Ltx2LoadConnectorWeights` calls above or the `Ltx2ConnectorCreateEmbeddings`
+// call below. Those are DIFFERENT REPAIRS: one is caching, the other is a
+// kernel. A row that picks between them from a single leaf is guessing, so this
+// emits the boundary instead. Empty prefix = no sub-leaves, which is what the
+// load-time callers pass: their cost is inside `load` and is not what #2296 is
+// about.
+//
+// The two scopes are NESTED leaves. `render_phase_log.h` marks a leaf opened
+// inside another leaf `nested` and EXCLUDES it from `sum_leaf_seconds`, so
+// adding them cannot move `unaccounted_seconds` and cannot change what the
+// coverage gate reads. They decompose a leaf; they do not join the table.
+Ltx2ConnectorEmbeddings RunConnector(const Ltx2VaeWeights& video_weights,
+                                     const Ltx2VaeWeights& audio_weights,
                                      const Ltx2ConnectorConfig& video_cfg,
                                      const Ltx2ConnectorConfig& audio_cfg,
                                      const std::vector<float>& video_in,
                                      const std::vector<float>& audio_in,
-                                     const std::vector<float>& additive, int64_t rows) {
-  const Ltx2VaeWeights video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
-  const Ltx2VaeWeights audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
-  Ltx2ConnectorEmbeddings encoded = Ltx2ConnectorCreateEmbeddings(
-      video_cfg, video_weights, video_in.data(), audio_cfg, audio_weights, audio_in.data(),
-      additive.data(), /*batch=*/1, rows);
+                                     const std::vector<float>& additive, int64_t rows,
+                                     const std::string& phase_prefix) {
+  Ltx2ConnectorEmbeddings encoded;
+  {
+    const SubPhase compute_phase(phase_prefix, ".compute");
+    encoded = Ltx2ConnectorCreateEmbeddings(
+        video_cfg, video_weights, video_in.data(), audio_cfg, audio_weights, audio_in.data(),
+        additive.data(), /*batch=*/1, rows);
+  }
   // The processor returns the mask the DiT's cross-attention is supposed to
   // honour (embeddings_processor.py:89). `Ltx2ModalityInput` carries no context
   // mask, so a mask with a masked position would be silently dropped — the DiT
@@ -562,6 +664,53 @@ Ltx2ConnectorEmbeddings RunConnector(const SafetensorsFile& dit_file,
         "the mask, which would condition the DiT on unmasked padding.");
   }
   return encoded;
+}
+
+// THE RENDER FORM, and the reason `Ensure` lives HERE rather than at the two
+// call sites. It was called from them first, and a mutation deleting the
+// negative pass's call did not move a single assertion -- because by then the
+// positive pass had already materialized, so the second call was a no-op on
+// every path a test reaches. That is a call site a later edit can delete with
+// the suite still green, and on ONE path it is load-bearing: a request with no
+// positive prompt but a negative one through the tower (`gen.prompt` empty, no
+// negative embeds, an encoder loaded) reaches the guiders branch FIRST, and
+// there the deleted call was the only materialization there was.
+//
+// Folding it in removes the class rather than testing for it. There is now ONE
+// deletable statement instead of two, it is on the positive path as well, and
+// deleting it makes the connector read an empty bag on every render -- measured:
+// both cases THROW `missing parameter video_embeddings_connector.learnable_registers`.
+Ltx2ConnectorEmbeddings RunConnector(ConnectorWeightSet& weights,
+                                     const Ltx2ConnectorConfig& video_cfg,
+                                     const Ltx2ConnectorConfig& audio_cfg,
+                                     const std::vector<float>& video_in,
+                                     const std::vector<float>& audio_in,
+                                     const std::vector<float>& additive, int64_t rows,
+                                     const std::string& phase_prefix) {
+  weights.Ensure(phase_prefix);
+  return RunConnector(weights.video(), weights.audio(), video_cfg, audio_cfg, video_in, audio_in,
+                      additive, rows, phase_prefix);
+}
+
+// The LOAD-TIME form, for the `prompt_embeds_path` callers that already hold an
+// open file and run the connector once per stream. It delegates so the mask
+// contract above stays stated ONCE.
+Ltx2ConnectorEmbeddings RunConnectorFromFile(const SafetensorsFile& dit_file,
+                                             const Ltx2ConnectorConfig& video_cfg,
+                                             const Ltx2ConnectorConfig& audio_cfg,
+                                             const std::vector<float>& video_in,
+                                             const std::vector<float>& audio_in,
+                                             const std::vector<float>& additive, int64_t rows,
+                                             const std::string& phase_prefix) {
+  Ltx2VaeWeights video_weights;
+  Ltx2VaeWeights audio_weights;
+  {
+    const SubPhase weights_phase(phase_prefix, ".weights");
+    video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
+    audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
+  }
+  return RunConnector(video_weights, audio_weights, video_cfg, audio_cfg, video_in, audio_in,
+                      additive, rows, phase_prefix);
 }
 
 }  // namespace
@@ -1570,9 +1719,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       }
       // ONE statement of the connector call and its mask contract, shared with
       // the per-request prompt path (`RunConnector`).
-      const Ltx2ConnectorEmbeddings encoded =
-          RunConnector(dit_file, im.video_connector_cfg, im.audio_connector_cfg,
-                       im.video_prompt_embeds, im.audio_prompt_embeds, additive, v_rows);
+      const Ltx2ConnectorEmbeddings encoded = RunConnectorFromFile(
+          dit_file, im.video_connector_cfg, im.audio_connector_cfg, im.video_prompt_embeds,
+          im.audio_prompt_embeds, additive, v_rows, /*phase_prefix=*/"");
       im.video_prompt_embeds = encoded.video;
       im.audio_prompt_embeds = encoded.audio;
     }
@@ -1623,9 +1772,10 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
         for (int64_t s = im.prompt_valid_rows; s < v_rows; ++s) {
           additive[static_cast<size_t>(s)] = -std::numeric_limits<float>::max();
         }
-        const Ltx2ConnectorEmbeddings encoded = RunConnector(
+        const Ltx2ConnectorEmbeddings encoded = RunConnectorFromFile(
             dit_file, im.video_connector_cfg, im.audio_connector_cfg,
-            im.negative_video_prompt_embeds, im.negative_audio_prompt_embeds, additive, v_rows);
+            im.negative_video_prompt_embeds, im.negative_audio_prompt_embeds, additive, v_rows,
+            /*phase_prefix=*/"");
         im.negative_video_prompt_embeds = encoded.video;
         im.negative_audio_prompt_embeds = encoded.audio;
       }
@@ -2330,6 +2480,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   //     hidden, and it is the reason `im.queue` is not passed here.
   setup_phase.Close();
 
+  // ONE per render, lazily materialized, shared by the positive conditioning
+  // pass and the negative one. See `ConnectorWeightSet`.
+  ConnectorWeightSet connector_weights(im.params.dit_path, im.video_connector_cfg,
+                                       im.audio_connector_cfg);
+
   std::vector<float> prompt_video, prompt_audio;
   const float* video_context = im.video_prompt_embeds.data();
   const float* audio_context = im.audio_prompt_embeds.data();
@@ -2370,8 +2525,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
       phase::Scope connector_phase("conditioning.connector");
       const Ltx2ConnectorEmbeddings through = RunConnector(
-          SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
-          im.audio_connector_cfg, prompt_video, prompt_audio, mask, context_tokens);
+          connector_weights, im.video_connector_cfg, im.audio_connector_cfg, prompt_video,
+          prompt_audio, mask, context_tokens, /*phase_prefix=*/"conditioning.connector");
       connector_phase.Close();
       prompt_video = through.video;
       prompt_audio = through.audio;
@@ -3072,9 +3227,21 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "request this engine can serve");
       }
       vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-      const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
-          *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
-          negative, text_queue);
+      // THE NEGATIVE HALF OF THE SAME TWO STAGES the positive pass already
+      // names as `conditioning.tower` and `conditioning.connector`. Until this
+      // scope existed `generate.guiders` was ONE leaf covering both, and #2296
+      // could only subtract: it read the positive halves at 150.731 s against a
+      // `generate.guiders` of 190.016 s and had to call the remaining 39.3 s
+      // "a reading rather than a measurement" because the leaf it came out of
+      // was not split. Nested, so it decomposes that leaf without joining the
+      // sum (`render_phase_log.h`).
+      Ltx2PromptConditioning encoded;
+      {
+        const phase::Scope guiders_tower("guiders.tower");
+        encoded = Ltx2EncodePromptToConditioning(
+            *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
+            negative, text_queue);
+      }
       negative_video = encoded.conditioning.video;
       negative_audio = encoded.conditioning.audio;
       if (encoded.seq != context_tokens) {
@@ -3087,11 +3254,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "; upstream encodes both in one call and they cannot differ");
       }
       if (im.has_connector) {
-        const Ltx2ConnectorEmbeddings through =
-            RunConnector(SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
-                         im.audio_connector_cfg, encoded.conditioning.video,
-                         encoded.conditioning.audio, encoded.conditioning.additive_mask,
-                         context_tokens);
+        const Ltx2ConnectorEmbeddings through = RunConnector(
+            connector_weights, im.video_connector_cfg, im.audio_connector_cfg,
+            encoded.conditioning.video, encoded.conditioning.audio,
+            encoded.conditioning.additive_mask, context_tokens,
+            /*phase_prefix=*/"guiders.connector");
         negative_video = through.video;
         negative_audio = through.audio;
       }
@@ -5642,11 +5809,18 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
            "; upstream encodes both in one call and they cannot differ");
     }
     if (im.has_connector) {
-      const Ltx2ConnectorEmbeddings through =
-          RunConnector(SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
-                       im.audio_connector_cfg, encoded.conditioning.video,
-                       encoded.conditioning.audio, encoded.conditioning.additive_mask,
-                       context_tokens);
+      // THE AUDIO-ONLY ARM STILL MATERIALIZES TWICE, and that is named rather
+      // than hidden. `GenerateAudioOnly` is a private static declared in
+      // `ltx2_video.h`, so it cannot take a type defined in this translation
+      // unit's anonymous namespace, and reaching the render's weight set from
+      // here would mean putting an internal class into a shipped header for an
+      // arm this row does not measure. Owed, under `## Owed` in
+      // `.agents/specs/ltx25-text-cond-device.md`.
+      const Ltx2ConnectorEmbeddings through = RunConnectorFromFile(
+          SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
+          im.audio_connector_cfg, encoded.conditioning.video, encoded.conditioning.audio,
+          encoded.conditioning.additive_mask, context_tokens,
+          /*phase_prefix=*/"guiders.connector");
       negative_audio = through.audio;
     }
     negative_context = negative_audio.data();

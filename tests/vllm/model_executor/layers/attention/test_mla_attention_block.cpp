@@ -632,7 +632,15 @@ std::vector<float> RunBlock(Backend& b, Queue& q, const MlaBlockDims& d,
                             // a WRONG-shaped gate can be handed in on purpose.
                             const std::vector<float>* k_rope_ln = nullptr,
                             const std::vector<float>* gate = nullptr,
-                            int64_t gate_rows = 0) {
+                            int64_t gate_rows = 0,
+                            // KV-DSV4-MULTICACHE W5 (#2323): the per-head
+                            // attention sink, `[num_heads]`. nullptr is its
+                            // ABSENT state, which every case above passes.
+                            const std::vector<float>* attn_sink = nullptr,
+                            // W5 (#2323): take the SPLIT o_proj path -- the block
+                            // hands back `[T, N*V]` and this applies `o_proj`
+                            // itself, which must reproduce the fused result.
+                            bool split_o_proj = false) {
   const int64_t L = d.kv_lora_rank, R = d.qk_rope_head_dim, H = d.hidden_size;
   int64_t T = 0;
   for (const Request& r : reqs) T += r.q_len;
@@ -643,6 +651,7 @@ std::vector<float> RunBlock(Backend& b, Queue& q, const MlaBlockDims& d,
     hh.weights().attn_gate_proj =
         hh.Up(*gate, {gate_rows > 0 ? gate_rows : d.num_heads, H});
   }
+  if (attn_sink != nullptr) hh.weights().attn_sink = hh.Up(*attn_sink, {d.num_heads});
 
   // Seed the cache with the context rows (they were written by earlier steps).
   {
@@ -753,8 +762,18 @@ std::vector<float> RunBlock(Backend& b, Queue& q, const MlaBlockDims& d,
   vllm::v1::TritonMLAImpl impl;
   Dev dev = hh.dev();
   Tensor kvc = hh.kv_cache();
-  ForwardMlaAttentionBlock(dev, d, hh.weights(), t_hidden, t_pos, kvc, t_slot, meta, impl,
-                           t_out);
+  if (split_o_proj) {
+    // The block returns the attention output BEFORE the projection; apply the
+    // same dense `o_proj` here so the two paths are comparable.
+    const int64_t NV = d.num_heads * d.v_head_dim;
+    Tensor t_pre = hh.Alloc(dt, {T, NV});
+    ForwardMlaAttentionBlock(dev, d, hh.weights(), t_hidden, t_pos, kvc, t_slot, meta, impl,
+                             t_out, &t_pre);
+    vt::MatmulBT(q, t_out, t_pre, hh.weights().o_proj);
+  } else {
+    ForwardMlaAttentionBlock(dev, d, hh.weights(), t_hidden, t_pos, kvc, t_slot, meta, impl,
+                             t_out);
+  }
   b.Synchronize(q);
   if (raw_out != nullptr) *raw_out = hh.DownRaw(t_out);
   (void)ctx;
@@ -959,6 +978,152 @@ TEST_CASE("CPU MLA block (f32) reproduces the unabsorbed double oracle — decod
         RunBlock(b, q, d, hw, DType::kF32, hidden, pos, c.reqs, ctx, c.decode_reqs, 64);
     CHECK(RelErr(got, want) < 2e-4);
   }
+}
+
+// `KV-DSV4-MULTICACHE` W5 (#2323) — the sink REACHES the kernel through the seam.
+//
+// WHY THIS CASE EXISTS, and it was written because its absence was caught rather
+// than imagined. `vt::MlaDecodeAttentionArgs::attn_sink` and its two kernels are
+// gated directly by `test_ops_mla_attn`. The WIRE from a loaded weight to that
+// arg -- `MlaBlockWeights::attn_sink` -> `TritonMLAImpl::attn_sink` ->
+// `forward_mqa` -> the arg -- is a different claim, and deleting the
+// `forward_mqa` line left every one of those op-level cases GREEN. A mutation
+// proved the threading unreached; this case is what makes it reached.
+//
+// It asserts REACHABILITY, not numerics: the same batch with and without a sink
+// must DIFFER. The value the sink produces is the op tests' business.
+TEST_CASE("W5: a loaded attention sink reaches the MLA decode through the block seam") {
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+  HostWeights hw = MakeWeights(d, rp, 512, 2323u);
+
+  // One new token per request, labelled DECODE, so the batch runs
+  // `vt::MlaDecodeAttention` -- the path `forward_mqa` builds the args for.
+  const std::vector<Request> reqs = {{9, 1}, {16, 1}, {35, 1}, {1, 1}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 5150u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 5151u);
+
+  const auto without =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64);
+
+  // A sink of 0 against scores of this scale removes real mass on every head; a
+  // hugely NEGATIVE sink would be inert and would make this case vacuous.
+  const std::vector<float> sink(static_cast<size_t>(d.num_heads), 0.0f);
+  const auto with =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64,
+               /*raw_out=*/nullptr, /*k_rope_ln=*/nullptr, /*gate=*/nullptr,
+               /*gate_rows=*/0, &sink);
+
+  REQUIRE(with.size() == without.size());
+  REQUIRE(!with.empty());
+  double worst = 0.0;
+  for (size_t i = 0; i < with.size(); ++i) {
+    REQUIRE(!std::isnan(with[i]));
+    worst = std::max(worst, std::abs(static_cast<double>(with[i] - without[i])));
+  }
+  // The wire is connected. Cut the `forward_mqa` line and this collapses to 0.
+  CHECK(worst > 1e-4);
+}
+
+TEST_CASE("W5: a loaded sink on the PREFILL path REFUSES, it does not attend without it") {
+  // The sink is implemented on the decode half only (#2323). A prefill batch
+  // carrying one must throw by name.
+  //
+  // THE POINT IS THE POLARITY. Ignoring the sink would leave every prefill row
+  // normalized over its keys alone -- a wrong answer that still emits plausible
+  // tokens, which no token gate would catch. This case pins the refusal so the
+  // half-built capability stays loud until the prefill half exists.
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+  HostWeights hw = MakeWeights(d, rp, 512, 2323u);
+
+  // MULTI-token requests, and `decode_reqs = 0`, so the batch takes prefill.
+  const std::vector<Request> reqs = {{9, 3}, {16, 2}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 5150u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 5151u);
+  const std::vector<float> sink(static_cast<size_t>(d.num_heads), 0.0f);
+
+  std::string msg;
+  try {
+    RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/0, 64,
+             /*raw_out=*/nullptr, /*k_rope_ln=*/nullptr, /*gate=*/nullptr,
+             /*gate_rows=*/0, &sink);
+    msg = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("attention sink") != std::string::npos);
+  CHECK(msg.find("decode half only") != std::string::npos);
+
+  // AND THE SAME BATCH WITHOUT A SINK STILL RUNS. Without this, a refusal that
+  // fired on every prefill batch would pass the check above while breaking every
+  // existing model -- the opposite failure, and a worse one.
+  const auto ok =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/0, 64);
+  REQUIRE(!ok.empty());
+  for (float v : ok) REQUIRE(!std::isnan(v));
+}
+
+TEST_CASE("W5: the pre-o_proj output, projected by the caller, equals the fused path") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). `ForwardMlaAttentionBlock` fused attention
+  // and the output projection; DeepSeek-V4 cannot use it that way, because its
+  // output side is a grouped LoRA rather than a dense `o_proj`. The block can now
+  // hand back the attention output BEFORE the projection.
+  //
+  // THE GATE IS EQUIVALENCE, which is the only thing worth asserting here: the
+  // split path must reproduce the fused one EXACTLY when the caller applies the
+  // same dense `o_proj` itself. Anything weaker would let the split quietly
+  // return something else -- pre-gate, wrongly shaped, or stale.
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+  HostWeights hw = MakeWeights(d, rp, 512, 2323u);
+
+  const std::vector<Request> reqs = {{9, 1}, {16, 1}, {35, 1}, {1, 1}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 5150u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 5151u);
+
+  // The FUSED path: the block applies `o_proj` itself.
+  const auto fused =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64);
+
+  // The SPLIT path: the block returns `[T, N*V]` and this applies the SAME
+  // `o_proj` by hand.
+  const auto split =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64,
+               /*raw_out=*/nullptr, /*k_rope_ln=*/nullptr, /*gate=*/nullptr,
+               /*gate_rows=*/0, /*attn_sink=*/nullptr, /*split_o_proj=*/true);
+
+  REQUIRE(fused.size() == split.size());
+  REQUIRE(!fused.empty());
+  double worst = 0.0, scale = 0.0;
+  for (size_t i = 0; i < fused.size(); ++i) {
+    REQUIRE(!std::isnan(split[i]));
+    scale = std::max(scale, std::abs(static_cast<double>(fused[i])));
+    worst = std::max(worst, std::abs(static_cast<double>(fused[i] - split[i])));
+  }
+  // The outputs are NON-TRIVIAL: an all-zero pair would satisfy any difference
+  // bound and prove nothing about either path.
+  REQUIRE(scale > 1e-3);
+  // Same arithmetic in the same order, so this is tight rather than tolerant.
+  CHECK(worst <= 1e-6 * std::max(1.0, scale));
 }
 
 // (3) OURS vs OURS THROUGH TWO DIFFERENT CODE PATHS — the strongest form of the

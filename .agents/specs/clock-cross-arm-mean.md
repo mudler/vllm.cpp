@@ -12,7 +12,7 @@ no assertion.
 **Does not amend:** [`lease-clock-pinning.md`](lease-clock-pinning.md). Route B
 replaces the WITHIN-ARM spread statistic and is unimplemented under #1354. This
 row touches no within-arm term.
-**Lifecycle:** the row exists only in [`../issue-index.md`](../issue-index.md)
+**Lifecycle:** the row exists only in [`../issue-index.md`](../completed/issue-index.md)
 and in this file. `BENCH-*` is not a matrix prefix (§The row has no matrix row),
 so no matrix row changes state, no measurement is accepted, and the change owes
 no `docs/STATUS.md` and no `docs/BENCHMARKS.md` edit.

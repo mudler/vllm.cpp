@@ -271,7 +271,7 @@ are the ones tracked elsewhere; this row claims only its own.
 
 - A guard against a borrowed `vt::Tensor` outliving the object that owns its
   storage — filed as [#949](https://github.com/mudler/vllm.cpp/issues/949) and
-  indexed in [`.agents/issue-index.md`](../issue-index.md). Nothing in the tree
+  indexed in [`.agents/issue-index.md`](../completed/issue-index.md). Nothing in the tree
   refuses it, and it took ASan on a lane that has been cancelled on every `main`
   run for weeks to find this one instance. The review of this row sharpened the
   scope with a measurement rather than an argument: with §3 reverted, a plain

@@ -221,9 +221,15 @@ std::vector<int32_t> Gemma4GenerateGreedyViaRegistry(
     std::vector<GdnStateCache> no_gdn_state;
     v1::GDNAttentionMetadata gdn_meta{};
     const std::vector<int32_t> gather_li = {static_cast<int32_t>(T - 1)};
+    // ENG-MM-INPUT-PIPELINE P1: the seam takes DEVICE handles, so this driver —
+    // which builds its embeds and PLE ids on the host — uploads them HERE. The two
+    // DBufs outlive the ModelRegistry::Forward call below. The runner slice (#2300)
+    // will hand the seam a persistent device buffer and skip the upload.
+    DBuf dembeds(d, DType::kBF16, {T, H}, embeds.data());
+    DBuf dple(d, DType::kI32, {T}, ple_ids.data());
     MultiModalForwardInput mm{};
-    mm.inputs_embeds_bf16 = &embeds;
-    mm.ple_token_ids = &ple_ids;
+    mm.inputs_embeds = dembeds.t();
+    mm.ple_token_ids = dple.t();
     ModelForwardInput in{
         .token_ids = no_tokens,
         .positions = pos1d,

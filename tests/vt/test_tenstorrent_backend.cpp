@@ -4145,6 +4145,670 @@ TEST_CASE("kTENSTORRENT W4 EnsureDevice2D bulk bf16 staging: route, bytes, views
   backend.Free(ma32);
 }
 
+// ==== BACKEND-TENSTORRENT-QWEN35 W5 (#2244): allocation-free staging =========
+// W4's profile left ~23% of the staging chain inside tt-metal per-upload
+// internal work: UploadRowsBf16 built a NEW ttnn::Tensor via from_span on
+// every staging upload, paying a fresh MeshBuffer allocation, cluster/chip
+// discovery and tensor-attribute creation for identical geometry every step.
+// W5 allocates the device buffer once per staging slot (lifecycle tied to the
+// slot structures, under the #1486 never-destroy rule for static caches) and
+// re-uploads by packing the host bytes (the exact from_span packing) and
+// writing them through the mesh command queue into the resident buffer.
+//
+// This case pins the ROUTE (the persistent counters: cold slot allocates ONCE,
+// a re-staged slot must NOT reallocate), the BYTES (the device copy equals the
+// window's bf16 bits bit-for-bit after an in-place rewrite, so the persistent
+// buffer provably carries the NEW bytes) and the f32 arm (still excluded — a
+// genuine conversion never enters the bf16 persistent route). The W4 counters
+// keep counting every bulk bf16 staging regardless of sub-route.
+TEST_CASE("kTENSTORRENT W5 EnsureDevice2D persistent staging buffer: route, reuse, bytes") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  constexpr int64_t M = 5, K = 64, N = 16;
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f; std::memcpy(&f, &bits, 4); return f;
+  };
+  auto f32bits = [](float f) {
+    uint32_t b; std::memcpy(&b, &f, 4); return b;
+  };
+  // Two distinguishable bf16 bit patterns for the in-place rewrite leg.
+  auto pattern = [](std::vector<uint16_t>& v, uint16_t base) {
+    for (size_t i = 0; i < v.size(); ++i)
+      v[i] = static_cast<uint16_t>(base + (i % 5));
+  };
+
+  // 1) Cold slot: the FIRST bulk upload allocates the per-slot persistent
+  //    buffer and serves the upload through it.
+  std::vector<uint16_t> ha(M * K), hb(N * K);
+  pattern(ha, 0x3C00);
+  pattern(hb, 0x3F80);
+  void* ma = backend.Alloc(M * K * 2);
+  void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, ha.data(), M * K * 2);
+  backend.Copy(q, mb, hb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+
+  ResetStagingStats();
+  mm(q, o, a, b);  // a is cold → allocates; b is cold → allocates
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 2,
+                "both bf16 operands still stage through the bulk route, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 2,
+                "both bulk uploads must be served by the persistent route, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 2,
+                "two cold slots must allocate one persistent buffer each, got "
+                    << s.uploads_persistent_allocs);
+  CHECK_MESSAGE(s.staged_persistent_bf16_bytes ==
+                    static_cast<uint64_t>((M * K + N * K) * 2),
+                "persistent bytes: got " << s.staged_persistent_bf16_bytes);
+  {
+    std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a);
+    REQUIRE(static_cast<int64_t>(dev.size()) == M * K);
+    for (int64_t i = 0; i < M * K; ++i)
+      CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(ha[static_cast<size_t>(i)])),
+                    "cold persistent buffer carries the wrong bits at " << i);
+  }
+
+  // 2) Rewrite the SAME master in place and restage: the persistent buffer
+  //    must be REUSED (zero new allocations) and must carry the NEW bytes —
+  //    a stale in-place write cannot pass the readback.
+  pattern(ha, 0x3800);  // different bit pattern entirely
+  backend.Copy(q, ma, ha.data(), M * K * 2);  // MarkHostWritten drops the shadow
+  ResetStagingStats();
+  mm(q, o, a, b);  // a restages (shadow dropped); b's shadow is still resident
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 1,
+                "only the rewritten master restages, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 0,
+                "a re-staged slot must REUSE its persistent buffer, got "
+                    << s.uploads_persistent_allocs << " new allocations");
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 1,
+                "the restage must be one in-place persistent write, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.staged_persistent_bf16_bytes == static_cast<uint64_t>(M * K * 2),
+                "the in-place write must count the rewritten bytes, got "
+                    << s.staged_persistent_bf16_bytes);
+  {
+    std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a);
+    REQUIRE(static_cast<int64_t>(dev.size()) == M * K);
+    for (int64_t i = 0; i < M * K; ++i)
+      CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(ha[static_cast<size_t>(i)])),
+                    "persistent buffer did not carry the rewritten bytes at " << i);
+  }
+
+  // 3) Geometry change on the same slot: the resident buffer cannot serve a
+  //    different staging shape — reallocate, and COUNT the reallocation.
+  std::vector<uint16_t> ha1(K);
+  pattern(ha1, 0x4000);
+  void* mo1 = backend.Alloc(N * 4);
+  backend.Copy(q, ma, ha1.data(), K * 2);
+  Tensor a1 = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {1, K});
+  Tensor o1 = Tensor::Contiguous(mo1, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {1, N});
+  ResetStagingStats();
+  mm(q, o1, a1, b);  // a1 is the SAME base slot, staged at a new [1, K] shape
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_bulk_bf16 == 1, "geometry change still bulk-stages, got "
+                    << s.uploads_bulk_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 1,
+                "a staging-geometry change must reallocate the persistent "
+                "buffer exactly once, got " << s.uploads_persistent_allocs);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 1,
+                "the new geometry stages through the persistent route, got "
+                    << s.uploads_persistent_bf16);
+  {
+    std::vector<float> dev = vt::tenstorrent::DebugDeviceReadbackF32(q, a1);
+    REQUIRE(static_cast<int64_t>(dev.size()) == K);
+    for (int64_t i = 0; i < K; ++i)
+      CHECK_MESSAGE(f32bits(dev[static_cast<size_t>(i)]) == f32bits(widen(ha1[static_cast<size_t>(i)])),
+                    "reallocated persistent buffer carries wrong bits at " << i);
+  }
+
+  // 4) The f32 arm keeps out of the persistent bf16 route entirely (the
+  //    f32 logits GEMM output keeps its declared dtype).
+  std::vector<float> a32(M * K);
+  for (size_t i = 0; i < a32.size(); ++i) a32[i] = widen(ha[static_cast<size_t>(i)]);
+  void* ma32 = backend.Alloc(M * K * 4);
+  backend.Copy(q, ma32, a32.data(), M * K * 4);
+  Tensor a32t = Tensor::Contiguous(ma32, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  ResetStagingStats();
+  mm(q, o, a32t, b);  // only a32 stages; b is resident
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "an f32 master must not enter the persistent bf16 route, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 0,
+                "an f32 master must not allocate a persistent bf16 buffer, got "
+                    << s.uploads_persistent_allocs);
+  CHECK_MESSAGE(s.staged_f32_elems == static_cast<uint64_t>(M * K),
+                "f32 master stages through the f32 path, got "
+                    << s.staged_f32_elems);
+  backend.Free(ma); backend.Free(mb); backend.Free(mo); backend.Free(mo1);
+  backend.Free(ma32);
+}
+
+// ==== BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging-write elimination =======
+// The W6 probe read ~7-8 staging writes per decode step off
+// uploads_persistent_bf16 and traced each to the residency state dropping a
+// shadow a consumer could have served. W7 makes the residency precise. Each
+// case below pins ONE eliminated class through its production entry point —
+// DevicePool::Get's OnScratchBlockAcquired, Backend::Memset, Backend::Copy —
+// asserts the avoided counter AND a zero delta on the W6 write-count
+// observable, and checks bit-identity: the bytes a consumer reads are the
+// bytes it read before the arm existed.
+
+// A pool-acquired block holds a PREVIOUS tenant's bytes on both sides; a
+// pending op that fully overwrites the buffer must not restage that garbage.
+namespace {
+// The W7 arms pin EAGER semantics: the capture/host-free lane
+// (VT_TT_HOST_FREE_DECODE) has its own tests, and under it IfCapture would
+// satisfy the copy case without the eager arm. Saved and restored like the
+// static-graph-mode cells above.
+struct ForceEager {
+  const bool had = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  const std::string saved =
+      had ? std::string(std::getenv("VT_TT_HOST_FREE_DECODE")) : std::string();
+  ForceEager() { ::setenv("VT_TT_HOST_FREE_DECODE", "0", 1); }
+  ~ForceEager() {
+    if (had) ::setenv("VT_TT_HOST_FREE_DECODE", saved.c_str(), 1);
+    else ::unsetenv("VT_TT_HOST_FREE_DECODE");
+  }
+};
+}  // namespace
+TEST_CASE("kTENSTORRENT W7 scratch-acquisition reservation: an acquired block restages nothing") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> hb(M * K), wb(N * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage both; a's slot now owns a persistent buffer
+  std::vector<float> o1(M * N);
+  backend.Copy(q, o1.data(), mo, M * N * 4);
+  // DevicePool::Get free-list hit calls exactly this (device_pool.h) before the
+  // block reaches its new tenant.
+  backend.OnScratchBlockAcquired(ma);
+  ResetStagingStats();
+  mm(q, o, a, b);  // the new tenant's first device touch
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_reservation == 1,
+                "the acquired block must be served without staging, got "
+                    << s.stages_avoided_reservation);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the acquired block must not restage, got "
+                    << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.uploads_persistent_allocs == 0,
+                "serving the resident allocation must not reallocate, got "
+                    << s.uploads_persistent_allocs);
+  std::vector<float> o2(M * N);
+  backend.Copy(q, o2.data(), mo, M * N * 4);
+  for (size_t i = 0; i < o1.size(); ++i)
+    CHECK_MESSAGE(o1[i] == o2[i], "output mismatch at " << i << ": "
+                            << o1[i] << " vs " << o2[i]);
+  backend.Free(ma); backend.Free(mb); backend.Free(mo);
+}
+
+// An eager full-slot zero-fill of a device-resident slot must keep the shadow:
+// the next device read serves zeros from the device instead of restaging them.
+TEST_CASE("kTENSTORRENT W7 eager full-slot zero-fill keeps the shadow") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> hb(M * K), wb(N * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage a; its shadow is live
+  ResetStagingStats();
+  backend.Memset(q, ma, 0, M * K * 2);  // production entry: eager full-slot zero
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_device_memset == 1,
+                "the full-slot zero-fill must fill the device shadow, got "
+                    << s.stages_avoided_device_memset);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the zero-fill must not stage, got " << s.uploads_persistent_bf16);
+  CHECK_MESSAGE(s.staged_persistent_bf16_bytes == 0,
+                "the zero-fill must not push staging bytes, got "
+                    << s.staged_persistent_bf16_bytes);
+  const auto* ha = static_cast<const uint16_t*>(ma);
+  for (int64_t i = 0; i < M * K; ++i)
+    CHECK_MESSAGE(ha[i] == 0, "host byte " << i << " not zeroed");
+  mm(q, o, a, b);  // the next device read of the zeroed slot
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the zeroed slot must serve from its shadow, got "
+                    << s.uploads_persistent_bf16);
+  std::vector<float> oh(M * N);
+  backend.Copy(q, oh.data(), mo, M * N * 4);
+  for (size_t i = 0; i < oh.size(); ++i)
+    CHECK_MESSAGE(oh[i] == 0.0f, "output " << i << " = " << oh[i] << ", want 0");
+  backend.Free(ma); backend.Free(mb); backend.Free(mo);
+}
+
+// A copy whose SOURCE is device-resident and whose dst already owns a
+// persistent buffer must go device->device: today it downloads, memcpys, drops
+// the shadow, and the next device read re-uploads the same bytes.
+TEST_CASE("kTENSTORRENT W7 eager device-resident D2D copy skips the host round trip") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> hb(M * K), wb(N * K), db(M * K);
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  for (size_t i = 0; i < db.size(); ++i) db[i] = static_cast<uint16_t>(0x3f00 + (i % 11));
+  void* ma = backend.Alloc(M * K * 2); void* mb = backend.Alloc(N * K * 2);
+  void* md = backend.Alloc(M * K * 2);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, hb.data(), M * K * 2);
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  backend.Copy(q, md, db.data(), M * K * 2);
+  Tensor a = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor d = Tensor::Contiguous(md, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage a — its shadow is live
+  std::vector<float> o_a(M * N);
+  backend.Copy(q, o_a.data(), mo, M * N * 4);  // the a×b reference
+  mm(q, o, d, b);  // stage d — dst owns a persistent buffer
+  ResetStagingStats();
+  backend.Copy(q, md, ma, M * K * 2);  // src is device-resident
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_device_copy == 1,
+                "the device-resident copy must go device->device, got "
+                    << s.stages_avoided_device_copy);
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "the copy must not stage, got " << s.uploads_persistent_bf16);
+  mm(q, o, d, b);  // the next device consumer of d
+  s = GetStagingStats();
+  CHECK_MESSAGE(s.uploads_persistent_bf16 == 0,
+                "d must serve from its fresh shadow, got "
+                    << s.uploads_persistent_bf16);
+  std::vector<float> o_d(M * N);
+  backend.Copy(q, o_d.data(), mo, M * N * 4);
+  for (size_t i = 0; i < o_a.size(); ++i)
+    CHECK_MESSAGE(o_a[i] == o_d[i], "d does not carry a's bytes at " << i
+                            << ": " << o_a[i] << " vs " << o_d[i]);
+  backend.Free(ma); backend.Free(mb); backend.Free(md); backend.Free(mo);
+}
+
+// W7 repair (#2282): the reservation arm serves a resident-or-empty BFLOAT16
+// allocation, so a non-bf16 master whose first device use lands on an acquired
+// block must NOT take it — the arm would hand a bf16 device tensor to an f32
+// master (the W7 invariant: the f32 arms keep their declared dtypes). The arm
+// must be gated on the master's dtype and the staging must fall through to the
+// normal path, whose f32 arm uploads the declared dtype.
+TEST_CASE("kTENSTORRENT W7 reservation arm keeps an f32 master's declared dtype") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 5, K = 64, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> wb(N * K);
+  for (size_t i = 0; i < wb.size(); ++i) wb[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  std::vector<float> a32(M * K);
+  for (size_t i = 0; i < a32.size(); ++i)
+    a32[i] = 0.25f * static_cast<float>(i % 17) - 1.0f;
+  void* mb = backend.Alloc(N * K * 2);
+  void* ma32 = backend.Alloc(M * K * 4);
+  void* mo = backend.Alloc(M * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mb, wb.data(), N * K * 2);
+  backend.Copy(q, ma32, a32.data(), M * K * 4);
+  Tensor b = Tensor::Contiguous(mb, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor a = Tensor::Contiguous(ma32, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, o, a, b);  // stage the f32 master; its shadow is live
+  std::vector<float> o1(M * N);
+  backend.Copy(q, o1.data(), mo, M * N * 4);  // the f32 master's own reference
+  // DevicePool::Get free-list hit calls exactly this (device_pool.h) before the
+  // block reaches its new tenant.
+  backend.OnScratchBlockAcquired(ma32);
+  ResetStagingStats();
+  mm(q, o, a, b);  // the acquired block's first device use is an f32 master
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_reservation == 0,
+                "the reservation arm must not serve a non-bf16 master, got "
+                    << s.stages_avoided_reservation);
+  CHECK_MESSAGE(s.staged_f32_elems == static_cast<uint64_t>(M * K),
+                "the f32 master must fall through to the f32 staging arm, got "
+                    << s.staged_f32_elems);
+  std::vector<float> o2(M * N);
+  backend.Copy(q, o2.data(), mo, M * N * 4);
+  for (size_t i = 0; i < o1.size(); ++i)
+    CHECK_MESSAGE(o1[i] == o2[i], "f32 master served wrong bytes at " << i
+                            << ": " << o1[i] << " vs " << o2[i]);
+  backend.Free(ma32); backend.Free(mb); backend.Free(mo);
+}
+
+// W7 repair (#2282): the eager D2D copy installs src's shadow — src's logical
+// geometry — into dst's slot. Equal byte size does not mean equal geometry, so
+// the slot record must name the SERVED geometry: a stale record would let a
+// later stage at dst's recorded geometry hit the exact-shape fast path and be
+// handed a wrongly-shaped tensor.
+TEST_CASE("kTENSTORRENT W7 D2D copy records the served geometry") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  // 32 elements on both sides ([4,8] src vs [8,4] dst) — equal 64-byte slots
+  // (Alloc registers the 64-rounded size), different geometry.
+  constexpr int64_t R = 8, C = 4, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> sb(C * R), db(R * C), wb4(N * R), wb5(N * C);
+  for (size_t i = 0; i < sb.size(); ++i) sb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < db.size(); ++i) db[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  for (size_t i = 0; i < wb4.size(); ++i) wb4[i] = static_cast<uint16_t>(0x3f00 + (i % 5));
+  for (size_t i = 0; i < wb5.size(); ++i) wb5[i] = static_cast<uint16_t>(0x4000 + (i % 9));
+  void* ma = backend.Alloc(C * R * 2);
+  void* md = backend.Alloc(R * C * 2);
+  void* mr = backend.Alloc(R * C * 2);
+  void* mb4 = backend.Alloc(N * R * 2);
+  void* mb5 = backend.Alloc(N * C * 2);
+  void* mos = backend.Alloc(C * N * 4);
+  void* mo = backend.Alloc(R * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, sb.data(), C * R * 2);
+  backend.Copy(q, md, db.data(), R * C * 2);
+  backend.Copy(q, mr, sb.data(), R * C * 2);  // dst's post-copy flat bytes as [R, C]
+  backend.Copy(q, mb4, wb4.data(), N * R * 2);
+  backend.Copy(q, mb5, wb5.data(), N * C * 2);
+  Tensor s = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {C, R});
+  Tensor d = Tensor::Contiguous(md, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {R, C});
+  Tensor r = Tensor::Contiguous(mr, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {R, C});
+  Tensor b4 = Tensor::Contiguous(mb4, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, R});
+  Tensor b5 = Tensor::Contiguous(mb5, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, C});
+  Tensor os = Tensor::Contiguous(mos, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {C, N});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {R, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, os, s, b4);  // stage the src [C, R] shadow
+  mm(q, o, d, b5);   // stage dst — its slot owns a persistent buffer
+  mm(q, o, r, b5);   // the reference: the same flat bytes declared [R, C]
+  std::vector<float> want(R * N);
+  backend.Copy(q, want.data(), mo, R * N * 4);
+  ResetStagingStats();
+  backend.Copy(q, md, ma, R * C * 2);  // whole-slot D2D copy: dst's shadow is src-shaped
+  vt::tenstorrent::StagingStats st = GetStagingStats();
+  CHECK_MESSAGE(st.stages_avoided_device_copy == 1,
+                "the device-resident copy must go device->device, got "
+                    << st.stages_avoided_device_copy);
+  mm(q, o, d, b5);  // consume dst at its DECLARED [R, C] geometry
+  st = GetStagingStats();
+  CHECK_MESSAGE(st.uploads_persistent_bf16 == 0,
+                "dst must serve from its copied shadow, got "
+                    << st.uploads_persistent_bf16);
+  std::vector<float> o2(R * N);
+  backend.Copy(q, o2.data(), mo, R * N * 4);
+  for (size_t i = 0; i < want.size(); ++i)
+    CHECK_MESSAGE(want[i] == o2[i], "dst at its declared geometry differs at "
+                            << i << ": " << want[i] << " vs " << o2[i]);
+  backend.Free(ma); backend.Free(md); backend.Free(mr);
+  backend.Free(mb4); backend.Free(mb5); backend.Free(mos); backend.Free(mo);
+}
+
+// The capture-lane twin of the eager case above. #2294: CopyDeviceDeviceIfCapture
+// also installs SRC's shadow into dst's slot, and equal byte size does not mean
+// equal geometry there either. A stale record lets a later stage at dst's
+// recorded exact geometry hit the fast path and be handed a wrongly-shaped
+// src-shaped tensor. The whole-slot D2D copy runs INSIDE a real trace capture
+// region (BeginCapture/EndCapture, then Replay to execute the captured op):
+// under an active capture the eager arm CopyDeviceDeviceIfResident structurally
+// declines, so the capture lane is the only path that can serve the copy and
+// the avoided-copy counter is lane-exclusive — deleting the capture lane's
+// call site cannot stay green (the host fallback would read back inside the
+// captured region, violating the ttnn trace contract, and the counter would
+// read 0). The consume at dst's declared [R, C] geometry pins the
+// served-geometry record: without it the stage false-hits the exact-shape
+// fast path and hands the matmul the wrongly-shaped [C, R] tensor, which
+// throws. The case arms the lane through the live env read the same way the
+// inertness-guard case sets it.
+struct ForceHostFreeDecode {
+  const bool had = std::getenv("VT_TT_HOST_FREE_DECODE") != nullptr;
+  const std::string saved =
+      had ? std::string(std::getenv("VT_TT_HOST_FREE_DECODE")) : std::string();
+  ForceHostFreeDecode() { ::setenv("VT_TT_HOST_FREE_DECODE", "1", 1); }
+  ~ForceHostFreeDecode() {
+    if (had) ::setenv("VT_TT_HOST_FREE_DECODE", saved.c_str(), 1);
+    else ::unsetenv("VT_TT_HOST_FREE_DECODE");
+  }
+};
+TEST_CASE("kTENSTORRENT #2294 capture-lane D2D copy records the served geometry") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceHostFreeDecode host_free;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  // 32 elements on both sides ([4,8] src vs [8,4] dst) — equal 64-byte slots
+  // (Alloc registers the 64-rounded size), different geometry.
+  constexpr int64_t R = 8, C = 4, N = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  std::vector<uint16_t> sb(C * R), db(R * C), wb4(N * R), wb5(N * C);
+  for (size_t i = 0; i < sb.size(); ++i) sb[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  for (size_t i = 0; i < db.size(); ++i) db[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  for (size_t i = 0; i < wb4.size(); ++i) wb4[i] = static_cast<uint16_t>(0x3f00 + (i % 5));
+  for (size_t i = 0; i < wb5.size(); ++i) wb5[i] = static_cast<uint16_t>(0x4000 + (i % 9));
+  void* ma = backend.Alloc(C * R * 2);
+  void* md = backend.Alloc(R * C * 2);
+  void* mr = backend.Alloc(R * C * 2);
+  void* mb4 = backend.Alloc(N * R * 2);
+  void* mb5 = backend.Alloc(N * C * 2);
+  void* mos = backend.Alloc(C * N * 4);
+  void* mo = backend.Alloc(R * N * 4);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, sb.data(), C * R * 2);
+  backend.Copy(q, md, db.data(), R * C * 2);
+  backend.Copy(q, mr, sb.data(), R * C * 2);  // dst's post-copy flat bytes as [R, C]
+  backend.Copy(q, mb4, wb4.data(), N * R * 2);
+  backend.Copy(q, mb5, wb5.data(), N * C * 2);
+  Tensor s = Tensor::Contiguous(ma, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {C, R});
+  Tensor d = Tensor::Contiguous(md, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {R, C});
+  Tensor r = Tensor::Contiguous(mr, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {R, C});
+  Tensor b4 = Tensor::Contiguous(mb4, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, R});
+  Tensor b5 = Tensor::Contiguous(mb5, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, C});
+  Tensor os = Tensor::Contiguous(mos, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {C, N});
+  Tensor o = Tensor::Contiguous(mo, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {R, N});
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  mm(q, os, s, b4);  // stage the src [C, R] shadow
+  mm(q, o, d, b5);   // stage dst — its slot owns a persistent buffer
+  mm(q, o, r, b5);   // the reference: the same flat bytes declared [R, C]
+  std::vector<float> want(R * N);
+  backend.Copy(q, want.data(), mo, R * N * 4);
+  // Program-cache warm contract (ttnn trace fatals on "Cannot load new
+  // binaries during trace capture"): run the SAME D2D copy once eagerly,
+  // outside capture — the host-free lane arms it and the first use enables
+  // the program cache and compiles the captured ttnn::empty + ttnn::copy
+  // pair. Drop its counter contribution before the capture region.
+  backend.Copy(q, md, ma, R * C * 2);
+  ResetStagingStats();
+  // Capture region holds only the whole-slot D2D copy: dst's shadow becomes
+  // src-shaped. Replay executes it (non-blocking; the readback below
+  // synchronizes, mirroring the matmul capture/replay recipe above).
+  backend.BeginCapture(q);
+  backend.Copy(q, md, ma, R * C * 2);
+  backend.EndCapture(q);
+  backend.Replay(q);
+  vt::tenstorrent::StagingStats st = GetStagingStats();
+  CHECK_MESSAGE(st.stages_avoided_device_copy == 1,
+                "under an active capture only the capture lane may serve the "
+                    "copy, got "
+                    << st.stages_avoided_device_copy);
+  mm(q, o, d, b5);  // consume dst at its DECLARED [R, C] geometry
+  st = GetStagingStats();
+  CHECK_MESSAGE(st.uploads_persistent_bf16 == 0,
+                "dst must serve from its copied shadow, got "
+                    << st.uploads_persistent_bf16);
+  std::vector<float> o2(R * N);
+  backend.Copy(q, o2.data(), mo, R * N * 4);
+  for (size_t i = 0; i < want.size(); ++i)
+    CHECK_MESSAGE(want[i] == o2[i], "dst at its declared geometry differs at "
+                            << i << ": " << want[i] << " vs " << o2[i]);
+  backend.Free(ma); backend.Free(md); backend.Free(mr);
+  backend.Free(mb4); backend.Free(mb5); backend.Free(mos); backend.Free(mo);
+}
+
+// W7 drift repair (#2282): the reservation must not survive content
+// establishment, and the reserved arm must never discard a live shadow.
+// Captured on the host-free e2e drift (LEG B, prompt[1] tok=0): a pool
+// block handed to a new tenant
+// received a device-committed [8,256] result while device_reserved stayed
+// armed; the next bf16 consumer staged the block at its earlier [5,1024]
+// geometry, took the reserved arm, and was handed the STALE persistent
+// buffer — the previous tenant's bytes — while the live [8,256] shadow was
+// dropped. The stage must fall through to the normal path (refresh + upload)
+// whenever the slot holds a live device shadow. The arming wiring itself
+// (OnScratchBlockAcquired -> MarkScratchAcquired) is pinned by the sibling
+// acquired-block-restages-nothing test below; this test pins the
+// serve-over-live-shadow guard, which passes vacuously if arming is removed.
+TEST_CASE("kTENSTORRENT W7 reservation never serves over a live device shadow") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ForceEager eager;
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  constexpr int64_t T = 5, H = 1024, N1 = 16;   // the block's [5,1024] role
+  constexpr int64_t M2 = 8, K2 = 64, N2 = 256;  // the new tenant's [8,256] role
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  using vt::tenstorrent::GetStagingStats;
+  using vt::tenstorrent::ResetStagingStats;
+  auto mm = reinterpret_cast<vt::MatmulFn>(
+      vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  Queue q = backend.CreateQueue();
+  const Device dev{DeviceType::kTENSTORRENT, 0};
+
+  void* w1b = backend.Alloc(N1 * H * 2);
+  std::vector<uint16_t> w1(N1 * H);
+  for (size_t i = 0; i < w1.size(); ++i) w1[i] = static_cast<uint16_t>(0x3c00 + (i % 7));
+  void* a2b = backend.Alloc(M2 * K2 * 2);
+  std::vector<uint16_t> a2(M2 * K2);
+  for (size_t i = 0; i < a2.size(); ++i) a2[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  void* b2b = backend.Alloc(N2 * K2 * 2);
+  std::vector<uint16_t> b2(N2 * K2);
+  for (size_t i = 0; i < b2.size(); ++i) b2[i] = static_cast<uint16_t>(0x3f00 + (i % 5));
+  backend.Copy(q, w1b, w1.data(), N1 * H * 2);
+  backend.Copy(q, a2b, a2.data(), M2 * K2 * 2);
+  backend.Copy(q, b2b, b2.data(), N2 * K2 * 2);
+  Tensor W1 = Tensor::Contiguous(w1b, vt::DType::kBF16, dev, {N1, H});
+  Tensor a2t = Tensor::Contiguous(a2b, vt::DType::kBF16, dev, {M2, K2});
+  Tensor b2t = Tensor::Contiguous(b2b, vt::DType::kBF16, dev, {N2, K2});
+
+  // Tenant 1 stages the block as a [5,1024] bf16 input: its W5 persistent
+  // buffer now holds bytes A.
+  void* blk = backend.Alloc(T * H * 2);
+  std::vector<uint16_t> a(T * H);
+  for (size_t i = 0; i < a.size(); ++i) a[i] = static_cast<uint16_t>(0x3800 + (i % 13));
+  backend.Copy(q, blk, a.data(), T * H * 2);
+  Tensor in1 = Tensor::Contiguous(blk, vt::DType::kBF16, dev, {T, H});
+  void* o1b = backend.Alloc(T * N1 * 4);
+  Tensor o1 = Tensor::Contiguous(o1b, vt::DType::kF32, dev, {T, N1});
+  mm(q, o1, in1, W1);
+  std::vector<float> r1(T * N1);
+  backend.Copy(q, r1.data(), o1b, T * N1 * 4);  // bytes A's own reference
+
+  // DevicePool::Get hands the block to a new tenant (reservation armed).
+  backend.OnScratchBlockAcquired(blk);
+
+  // The new tenant's producer commits a DIFFERENT-geometry [8,256] result
+  // into the block: the slot's bytes are now REAL (device truth), which must
+  // consume the reservation.
+  void* o2b = backend.Alloc(M2 * N2 * 4);
+  Tensor o2 = Tensor::Contiguous(blk, vt::DType::kF32, dev, {M2, N2});
+  mm(q, o2, a2t, b2t);  // CommitDeviceLogical2D: live [8,256] shadow on blk
+  std::vector<float> r2(M2 * N2);
+  backend.Copy(q, r2.data(), blk, M2 * N2 * 4);  // the live shadow serves
+
+  // The next bf16 consumer stages the block at its earlier [5,1024] geometry.
+  Tensor in3 = Tensor::Contiguous(blk, vt::DType::kBF16, dev, {T, H});
+  void* o3b = backend.Alloc(T * N1 * 4);
+  Tensor o3 = Tensor::Contiguous(o3b, vt::DType::kF32, dev, {T, N1});
+  ResetStagingStats();
+  mm(q, o3, in3, W1);
+  vt::tenstorrent::StagingStats s = GetStagingStats();
+  CHECK_MESSAGE(s.stages_avoided_reservation == 0,
+                "the reserved arm must not serve a slot holding a live device "
+                "shadow, got " << s.stages_avoided_reservation);
+  std::vector<float> r3(T * N1);
+  backend.Copy(q, r3.data(), o3b, T * N1 * 4);
+  bool differs = false;
+  for (size_t i = 0; i < r1.size(); ++i) {
+    if (r1[i] != r3[i]) {
+      differs = true;
+      break;
+    }
+  }
+  CHECK_MESSAGE(differs,
+                "the stage consumed the PREVIOUS tenant's staged bytes: the "
+                "stale persistent buffer was served over a live shadow");
+  backend.Free(w1b); backend.Free(a2b); backend.Free(b2b); backend.Free(blk);
+  backend.Free(o1b); backend.Free(o2b); backend.Free(o3b);
+}
+
 // ==== BACKEND-TENSTORRENT-QWEN35 W3 (#2201): the GDN reviewer leftovers ======
 // (a) the state d2h counter must see BOTH remaining download paths — the
 // EnsureGdnCacheDevice slow-path refresh and the CommitConvTransposed

@@ -1044,6 +1044,37 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                                                                     residual);
 }
 
+void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                  const RmsNormGroupArgs& args) {
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1,
+           "rmsnorm_group: x/out rank-2, w rank-1");
+  VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
+           "rmsnorm_group: shape mismatch");
+  VT_CHECK(weight.shape[0] == x.shape[1], "rmsnorm_group: weight size mismatch");
+  // group_size == 0 lands here rather than degenerating to a whole-row norm.
+  // Upstream refuses the divisibility case by name (modeling_qwen4_exp.py:164-165
+  // "hidden_size (...) must be divisible by group_size (...)"); the zero case is
+  // ours, because upstream's `None` means "no grouping" and this op's default
+  // must not silently mean that. See RmsNormGroupArgs::group_size.
+  VT_CHECK(args.group_size >= 1,
+           "rmsnorm_group: group_size must be >= 1; 0 is NOT 'the whole row' "
+           "(that is vt::RmsNorm). Defaulting it to the whole row would make the "
+           "most likely caller mistake indistinguishable from success, so the "
+           "unset value is refused rather than interpreted");
+  VT_CHECK(x.shape[1] % args.group_size == 0,
+           "rmsnorm_group: group_size must divide the last dim "
+           "(modeling_qwen4_exp.py:164-165)");
+  VT_CHECK(args.eps > 0.0f, "rmsnorm_group: eps must be > 0");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
+           "rmsnorm_group: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous(),
+           "rmsnorm_group: contiguous required");
+  VT_CHECK(x.device == out.device && weight.device == x.device && x.device == q.device,
+           "rmsnorm_group: device mismatch (x/out/weight/queue)");
+  reinterpret_cast<RmsNormGroupFn>(GetOp(OpId::kRmsNormGroup, q.device.type))(q, out, x, weight,
+                                                                             args);
+}
+
 namespace {
 
 // Fetch the tensor bound to operand slot `idx`, checked non-null.
@@ -1917,11 +1948,35 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
                std::to_string(conv_state.shape[2]) + "]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
-  // f32 state ONLY. `CausalConv1dSpecUpdate` admits bf16 on CUDA because a CUDA
-  // kernel there writes it; no CUDA arm of this op exists, so admitting a dtype
-  // nothing can produce would be a promise with no kernel behind it.
-  VT_CHECK(conv_state.dtype == DType::kF32,
-           std::string(name) + ": conv_state must be f32");
+  // THE STATE CARRIES THE MODEL DTYPE, AND THE ORACLE SETTLES IT (W5k, #2031).
+  // This check read `conv_state.dtype == kF32` and argued that "no CUDA arm of
+  // this op exists, so admitting a dtype nothing can produce would be a promise
+  // with no kernel behind it". The premise was about which KERNELS exist; the
+  // question is what UPSTREAM STORES, and those are different questions. The
+  // second one is now answered from the running oracle rather than from the
+  // shape of this tree.
+  //
+  // transformers 5.16.0 (the `qwen4_exp` lane pin, `.agents/oracles/transformers.md`)
+  // types each cache slot from the tensor that FIRST reaches it, per slot and not
+  // per layer: `cache_utils.py:1019-1023` allocates
+  // `torch.zeros(..., dtype=conv_states.dtype, device=conv_states.device)`. The
+  // tensor reaching the PLE conv slot is `hidden_states`
+  // (`modeling_qwen4_exp.py:1157-1159`, `update_conv_state(..., state_idx=1)`), so
+  // the ring carries the MODEL dtype. Observed, not inferred: the same fixture run
+  // at `dtype=torch.bfloat16` reports `conv_states[1] dtype=torch.bfloat16`, and at
+  // `float32` reports `float32`. It NEVER widens to f32.
+  //
+  // Admitting bf16 is therefore mirroring upstream, and refusing it was the
+  // "dtype that is too wide" AGENTS.md names — the defect class a token gate
+  // cannot see, because the tokens match while the path moves twice the bytes.
+  // The CPU kernel reads and writes the ring through the same `LoadF32At` /
+  // `StoreF32At` accessors it already used for `x` and `out`, so this admits no
+  // dtype that has no kernel behind it. f32 stays accepted and every existing
+  // f32 caller is byte-unchanged.
+  VT_CHECK(conv_state.dtype == DType::kF32 || conv_state.dtype == DType::kBF16,
+           std::string(name) +
+               ": conv_state must be f32 or bf16 (upstream types the slot from "
+               "the model dtype, cache_utils.py:1019-1023)");
   VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
                conv_state.IsContiguous(),
            std::string(name) + ": x/out/weight/conv_state must be contiguous");
@@ -1957,6 +2012,53 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
   }
   reinterpret_cast<Qwen4ExpPleConvFn>(GetOp(OpId::kQwen4ExpPleConv, q.device.type))(
       q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
+}
+
+// vt::Qwen4ExpPleGate — `Qwen4ExpTextPLELayer.forward` :1181-1182 (+ :1184),
+// transformers v5.16.0. The DOT that feeds it is vt::BatchedMatmul and is
+// deliberately not here; see the kQwen4ExpPleGate comment in include/vt/ops.h.
+void Qwen4ExpPleGate(Queue& q, Tensor& out, const Tensor& score, const Tensor& value,
+                     const Qwen4ExpPleGateArgs& args) {
+  constexpr const char* name = "qwen4_exp_ple_gate";
+  VT_CHECK(out.rank == 2 && score.rank == 2 && value.rank == 2,
+           std::string(name) + ": out [T,hc*H], score [T,hc], value [T,H]");
+  const int64_t T = score.shape[0], hc = score.shape[1], h = value.shape[1];
+  VT_CHECK(out.shape[0] == T && value.shape[0] == T,
+           std::string(name) + ": out/score/value must agree on T");
+  VT_CHECK(hc >= 1 && h >= 1, std::string(name) + ": hc and H must be >= 1");
+  // THE ONE CHECK THIS OP EXISTS FOR, after the arithmetic itself. `out` is the
+  // FLATTENED [T, hc*H] the conv and the norm downstream want, and a caller that
+  // flattened (H, hc) instead of (hc, H) produces a buffer of exactly the right
+  // size holding a transposed answer. The product is therefore named against
+  // both factors, so the message says which two numbers were multiplied.
+  VT_CHECK(out.shape[1] == hc * h,
+           std::string(name) + ": out must be [T, hc*H] = [T," + std::to_string(hc) + "*" +
+               std::to_string(h) + "] = [T," + std::to_string(hc * h) + "], got [T," +
+               std::to_string(out.shape[1]) + "]");
+  // f32 score only, the reason SigmoidGateBf16 gives for its own gate operand:
+  // this value is the argument of a sigmoid AND of a square root, and rounding a
+  // transcendental's input is a value change no downstream tolerance owns.
+  VT_CHECK(score.dtype == DType::kF32,
+           std::string(name) + ": score must be f32 (it is the sigmoid/sqrt argument)");
+  VT_CHECK(IsFloat(value.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float value, f32/bf16 out");
+  VT_CHECK(args.gate_divisor > 0.0f,
+           std::string(name) + ": gate_divisor must be > 0 (it is math.sqrt(hidden_size)), got " +
+               std::to_string(args.gate_divisor));
+  // 0 is NOT "no floor". Upstream's literal is 1e-6 and its whole effect is the
+  // 1e-3 floor it puts on |output|; a zero here would silently mean "port the
+  // line without the clamp", which is the defect the op is gated against.
+  VT_CHECK(args.clamp_min > 0.0f,
+           std::string(name) +
+               ": clamp_min must be > 0; 0 is NOT 'no floor'. Upstream's literal is 1e-6 "
+               "(modeling_qwen4_exp.py:1181) and it is applied BEFORE the sqrt, so the "
+               "floor on |out| is its square root");
+  VT_CHECK(out.IsContiguous() && score.IsContiguous() && value.IsContiguous(),
+           std::string(name) + ": out/score/value must be contiguous");
+  VT_CHECK(out.device == q.device && score.device == q.device && value.device == q.device,
+           std::string(name) + ": device mismatch (out/score/value/queue)");
+  reinterpret_cast<Qwen4ExpPleGateFn>(GetOp(OpId::kQwen4ExpPleGate, q.device.type))(
+      q, out, score, value, args);
 }
 
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
@@ -2452,13 +2554,49 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
     VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
     VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
   };
+  // A PROJECTION OPERAND MAY KEEP THE FILE'S BLOCK ENCODING (W5p, #2031). The
+  // released `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 hyper-connection
+  // mix weights as Q8_0 — `blk.N.hc_{attn,ffn}_{down,up}.weight` plus
+  // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
+  // float here refused the released checkpoint at its first prefill.
+  //
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
+  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
+  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
+  // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
+  // — down, up AND inject, on both the attention and the feed-forward side) and
+  // consumes them with a plain `build_lora_mm` on the file-typed tensor
+  // (`src/models/qwen4exp.cpp:237-241`); it never dequantizes one. It declares
+  // `hc_*_norm` `GGML_OP_MUL` (`:758`, `:762`), and where a weight of this
+  // architecture meets an ELEMENTWISE multiply it casts to f32 first and says so
+  // (`qwen4exp.cpp:1198-1202`, the PLE conv). Matmul operands keep the file's
+  // type; elementwise operands get a cast. `hc_norm_w` therefore stays on
+  // `check_operand` above, and refusing a block-typed gamma by name is a gated
+  // behaviour, not an oversight.
+  //
+  // The BLOCK layout replaces the elementwise stride contract, exactly as
+  // `MatmulBTQuant`'s own validation puts it: a block-typed tensor has no
+  // per-element stride, so `IsContiguous()` is not the question — being a whole
+  // number of blocks per row is. The shape checks above are unaffected, because
+  // `Tensor.shape` is in ELEMENTS for a block dtype too.
+  const auto check_projection = [&](const Tensor& t, const char* what) {
+    if (!IsBlockQuant(t.dtype)) {
+      check_operand(t, what, false);
+      return;
+    }
+    VT_CHECK(t.shape[1] % BlockElems(t.dtype) == 0,
+             std::string(name) + ": " + what +
+                 " keeps its blocks, so K must be a whole number of them");
+    VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
+  };
   check_operand(hyper, "hyper", false);
   check_operand(hc_norm_w, "hc_norm weight", false);
-  check_operand(mix_down, "input_mix_weight_down", false);
-  check_operand(mix_up, "input_mix_weight_up", false);
+  check_projection(mix_down, "input_mix_weight_down");
+  check_projection(mix_up, "input_mix_weight_up");
   check_operand(mixed, "mixed", true);
   if (block_inject != nullptr) {
-    check_operand(*block_inject, "block_inject_weight", false);
+    check_projection(*block_inject, "block_inject_weight");
     check_operand(*injection, "injection", true);
   }
   reinterpret_cast<Qwen4ExpGatedResidualFn>(
@@ -2502,10 +2640,11 @@ namespace {
 // "contiguous, float, on this queue" means is how a caller silently reads
 // somebody else's device memory.
 void CheckQsaOperand(const Queue& q, const Tensor& t, const char* name, const char* what,
-                     bool is_out) {
+                     bool is_out, bool require_contiguous = true) {
   VT_CHECK(IsFloat(t.dtype) && (!is_out || IsOutFloat(t.dtype)),
            std::string(name) + ": " + what + " must be float (f32/bf16 for outputs)");
-  VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+  VT_CHECK(!require_contiguous || t.IsContiguous(),
+           std::string(name) + ": " + what + " must be contiguous");
   VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
 }
 
@@ -2581,19 +2720,56 @@ void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query, cons
   VT_CHECK(args.compress_ratio > 1,
            std::string(name) + ": compress_ratio must be > 1, got " +
                std::to_string(args.compress_ratio));
-  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
-           std::string(name) + ": query/key/value/out must be [tokens, heads, head_dim]");
+  // The PAGED address mode (W5d-3, #2249 item 2). It changes the RANK and the
+  // CONTIGUITY of key/value and nothing else, so the checks below fork exactly
+  // there; every other operand is validated once for both arms.
+  const bool paged = args.kv_block_table != nullptr;
+  VT_CHECK(paged == (args.kv_block_size > 0),
+           std::string(name) +
+               ": kv_block_table and a positive kv_block_size must be set TOGETHER — a "
+               "page table with no page size cannot address a row, and a page size with "
+               "no table is a paged read that silently falls back to a contiguous one");
+  VT_CHECK(query.rank == 3 && out.rank == 3,
+           std::string(name) + ": query/out must be [tokens, heads, head_dim]");
+  VT_CHECK(key.rank == value.rank && key.rank == (paged ? 4 : 3),
+           std::string(name) + ": key/value must be " +
+               (paged ? "[num_pages, kv_block_size, num_kv_heads, head_dim] in the paged "
+                        "address mode"
+                      : "[max_kv, num_kv_heads, head_dim]"));
   const int64_t T = query.shape[0];
   const int64_t HQ = query.shape[1];
   const int64_t DH = query.shape[2];
-  const int64_t HKV = key.shape[1];
+  const int64_t HKV = key.shape[paged ? 2 : 1];
   VT_CHECK(HQ > 0 && HKV > 0 && DH > 0, std::string(name) + ": bad attention shape");
   VT_CHECK(HQ % HKV == 0,
            std::string(name) + ": GQA needs num_q_heads divisible by num_kv_heads, got " +
                std::to_string(HQ) + " over " + std::to_string(HKV));
-  VT_CHECK(key.shape[0] == value.shape[0] && value.shape[1] == HKV && key.shape[2] == DH &&
-               value.shape[2] == DH,
-           std::string(name) + ": key/value must be [max_kv, num_kv_heads, head_dim]");
+  for (int i = 0; i < key.rank; ++i) {
+    VT_CHECK(key.shape[i] == value.shape[i],
+             std::string(name) + ": key and value must have the SAME shape");
+  }
+  VT_CHECK(key.shape[key.rank - 1] == DH,
+           std::string(name) + ": the key/value head_dim must match the query's");
+  if (paged) {
+    const Tensor& bt = *args.kv_block_table;
+    VT_CHECK(key.shape[1] == args.kv_block_size,
+             std::string(name) + ": the cache view's page height " +
+                 std::to_string(key.shape[1]) + " disagrees with kv_block_size " +
+                 std::to_string(args.kv_block_size));
+    VT_CHECK(bt.rank == 2 && bt.shape[0] == 1 && bt.shape[1] > 0,
+             std::string(name) +
+                 ": kv_block_table must be [1, max_pages] i32 — this op serves ONE "
+                 "sequence per call, as the contiguous arm does");
+    VT_CHECK(bt.dtype == DType::kI32, std::string(name) + ": kv_block_table must be i32");
+    VT_CHECK(bt.IsContiguous(), std::string(name) + ": kv_block_table must be contiguous");
+    VT_CHECK(bt.device == q.device, std::string(name) + ": kv_block_table device mismatch");
+    // The row within a page is contiguous even though the PAGE stride is not
+    // (K and V interleave at dim 1 of the flash cache), so the kernel resolves a
+    // base offset from the strides and then reads `head_dim` elements running.
+    VT_CHECK(key.stride[3] == 1 && value.stride[3] == 1,
+             std::string(name) +
+                 ": a paged key/value view must be contiguous WITHIN a head row");
+  }
   VT_CHECK(out.shape[0] == T && out.shape[1] == HQ && out.shape[2] == DH,
            std::string(name) + ": out must match query's shape");
   VT_CHECK(block_ids.rank == 2 && block_ids.shape[0] == T,
@@ -2604,8 +2780,12 @@ void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query, cons
            std::string(name) + ": kv_lens must be [tokens]");
   VT_CHECK(kv_lens.dtype == DType::kI32, std::string(name) + ": kv_lens must be i32");
   CheckQsaOperand(q, query, name, "query", false);
-  CheckQsaOperand(q, key, name, "key", false);
-  CheckQsaOperand(q, value, name, "value", false);
+  // The paged views are STRIDED by construction — `dense_attn::KvSlice` gives
+  // each of K and V a page stride of `2 * block_size * Hkv * Dh` — so the
+  // contiguity half of the shared check cannot apply to them. Dtype and device
+  // still must.
+  CheckQsaOperand(q, key, name, "key", false, /*require_contiguous=*/!paged);
+  CheckQsaOperand(q, value, name, "value", false, /*require_contiguous=*/!paged);
   CheckQsaOperand(q, out, name, "out", true);
   VT_CHECK(block_ids.IsContiguous() && kv_lens.IsContiguous(),
            std::string(name) + ": block_ids/kv_lens must be contiguous");

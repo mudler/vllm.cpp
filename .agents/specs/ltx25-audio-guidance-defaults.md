@@ -494,7 +494,7 @@ tree. `grep -rn envelope_cv src include tests scripts` returns nothing and exits
 **The scope in that command is load-bearing, and the unscoped form was
 self-invalidating.** `grep -rn 'envelope_cv'` over the whole repository now
 matches this file and the #1905 row in
-[`../issue-index.md`](../issue-index.md), because both describe the instrument.
+[`../issue-index.md`](../completed/issue-index.md), because both describe the instrument.
 The claim worth checking is that no GATE in this tree reaches it, and the four
 directories above are where a gate could live.
 

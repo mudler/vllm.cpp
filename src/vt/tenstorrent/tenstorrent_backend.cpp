@@ -51,12 +51,22 @@ class TenstorrentBackend final : public Backend {
   }
   // DevicePool::Get hands a retained block to a NEW tensor without passing
   // through Alloc, so the slot at that address still describes the previous
-  // tenant (device shadow committed, host stale). Drop the residency — same
-  // state a fresh Alloc registers: host current, no device copy (#1715).
-  void OnScratchBlockAcquired(void* p) override { MarkHostWritten(p); }
+  // tenant (device shadow committed, host stale). W7 (#2282): register the
+  // acquisition as a RESERVATION — the block's bytes are garbage for the new
+  // tenant on BOTH sides, so its first device use is served without staging
+  // the garbage; the pending op establishes the content by writing the buffer
+  // it is served (#1715).
+  void OnScratchBlockAcquired(void* p) override { MarkScratchAcquired(p); }
   void Memset(Queue&, void* p, int value, size_t bytes) override {
     // HOST-FREE-FORWARD R3: on-device zero-fill when capturing.
     if (MemsetDeviceIfCapture(p, value)) return;
+    // W7 (#2282): an eager FULL-slot zero of a device-resident slot fills the
+    // shadow and keeps it — the next device read serves the shadow instead of
+    // restaging the zeros. The host bytes are still memset here.
+    if (MemsetDeviceFill(p, value, bytes)) {
+      std::memset(p, value, bytes);
+      return;
+    }
     std::memset(p, value, bytes);
     MarkHostWritten(p);
   }
@@ -64,6 +74,11 @@ class TenstorrentBackend final : public Backend {
     // HOST-FREE-FORWARD R2: when capturing, prefer a device->device copy so the
     // captured region has no host readback (which ttnn trace prohibits).
     if (CopyDeviceDeviceIfCapture(dst, src)) return;
+    // W7 (#2282): outside capture, a device-resident source copied into a
+    // slot that already owns a persistent buffer goes device->device — the
+    // host path would download, memcpy, drop the shadow, and re-upload the
+    // same bytes on the next device read.
+    if (CopyDeviceDeviceIfResident(dst, src, bytes)) return;
     // Device-resident results leave host stale until read; materialize first.
     EnsureHostBytes(const_cast<void*>(src));
     std::memcpy(dst, src, bytes);

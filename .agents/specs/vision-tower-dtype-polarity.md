@@ -2,7 +2,7 @@
 
 Issue: [#1359](https://github.com/mudler/vllm.cpp/issues/1359).
 Row: `ENG-MM-INPUT-PIPELINE` ([engine-matrix.md](../engine-matrix.md)).
-Index: [`issue-index.md`](../issue-index.md) line 649.
+Index: [`issue-index.md`](../completed/issue-index.md) line 649.
 Sibling spec: [`multimodal-track.md`](multimodal-track.md) §1.5 L3 owns the
 tower-SKIP measurement; this spec owns the tower's storage DTYPE. §8 below
 states exactly what this row makes stale over there.
@@ -359,6 +359,37 @@ above. `--model-kind qwen3-vl` uses the `load-only` workload
 (`tower_skip_rss.sh:409-428`), which is sufficient here: the widening is a
 load-path cost.
 
+**RESULT for `qwen3-vl`, 2026-08-28: BOTH HALVES MET, with one deviation from
+the declared procedure named below.** The post-fix run is
+`scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at `525d2b991` on
+`dgx:gpu0` under an `rc` lease. The pre-fix number it is read against is the
+2026-08-24 run at `41ab550b9` on `thor:gpu0`.
+
+| Half | Arm | Pre-fix | Post-fix | Delta | Threshold | Result |
+|---|---|---:|---:|---:|---:|---|
+| 1 | default | 10,209,501,184 B | 9,381,281,792 B | **−828,219,392 B (0.771 GiB)** | `>=` 747,625,881 B | **MET**, 1.108x the floor |
+| 2 | `--language-model-only` | 8,553,709,568 B | 8,554,364,928 B | **+655,360 B (+0.0077%)** | within 2% | **MET**, 260x inside the band |
+
+Half 1's recovery is **99.7% of the 830,695,424 B this section predicted from
+the checkpoint's own headers**, so the header-derived prediction was near-exact
+rather than approximately right. Half 2 is the half that decides whether the
+axis means anything: that arm loads no tower, this row cannot touch it, and it
+did not move.
+
+**The deviation, stated rather than absorbed.** Half 1 declares the comparison
+"on the same host", and `## Now` asked for it at this commit and at its parent.
+Neither held: the pre-fix figure is a different host (`thor:gpu0`,
+`rc-worker-kk96r`, tegra kernel, load 5.16/4.48/4.05) on a different day, and
+`41ab550b9` is not `525d2b991`'s parent. A raw default-arm difference across
+that gap confounds the fix with the host. What rescues the axis is half 2, which
+is a **same-pair control that travels with the same host change**: both arms
+moved hosts together, the tower-free arm moved 0.0077% while the tower-bearing
+arm moved 8.11%, and a host effect large enough to produce the second would have
+been visible in the first. The margins are wide enough that this is not a close
+call — half 1 clears by 80.6 MB and half 2 sits 260x inside its band — so the
+axis is recorded MET rather than VOID. A same-host pre/post pair would still be
+strictly better evidence and is listed under `## Owed`.
+
 ### 6.2 The re-declared tower-skip threshold — ALSO declared before the run
 
 After this row lands, the widening is gone, so
@@ -379,6 +410,15 @@ removing.
 freeing the tower the checkpoint actually ships instead of the tower plus our
 widening. Every surface in §8 already carries that prediction; the implementing
 wave converts the prediction into the measurement.
+
+**MEASURED for `qwen3-vl`, 2026-08-28: 826,916,864 B = 0.770 GiB, on both pairs
+of the swapped assignment, against the 747,625,881 B threshold in the table
+above.** The prediction in that table was ~830,695,424 B, so the realised saving
+is 99.5% of it. The fall from 1.542 GiB is **0.499x**, which is the halving this
+section declared in advance, and it is CORRECT rather than a regression. The
+`muse-glimmer` row of the table above stays a prediction: that half has not
+landed and has not run. The surfaces in §8 have been converted from prediction
+to measurement for `qwen3-vl` only.
 
 Removing the `* 2` is not renegotiating a threshold after seeing a number. It
 is correcting a derivation whose premise no longer holds, and this paragraph is
@@ -513,12 +553,23 @@ a hard red rather than a silent drift.
 - `docs/reference/server.md:209`
 - `docs/FEATURES.md:240`
 
-**Do NOT hand-edit** `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log`.
-It is frozen evidence of a run that happened; a rerun produces a new file
-beside it.
+**Done 2026-08-28 for the prose surfaces.** Every item in the list above now
+states the halving as a measurement rather than a prediction, keeping the
+"correct rather than a regression" framing. The load-bearing items had already
+moved with the implementing wave.
 
-Per AGENTS.md §"Public documents", a lifecycle change also owes `STATUS`,
-`BENCHMARKS` and the moved row spec's `## Now`.
+**Do NOT hand-edit** `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log`
+or `…-dgx-20260828{,.legs}.log`. Each is frozen evidence of a run that happened;
+a rerun produces a new file beside them, and the 2026-08-24 pair is kept
+unaltered as the record of the pre-fix binary.
+
+Per AGENTS.md §"Public documents", a lifecycle change also owes the moved row
+spec's `## Now`. This paragraph used to name `STATUS` and `BENCHMARKS` as well:
+`docs/STATUS.md` and `check-public-doc-tables.py` were retired in `1db7e59cf`
+(#1714) and no longer exist, and `docs/BENCHMARKS.md` changes only when a public
+benchmark ID is added, removed, or changes disposition — a rerun of an existing
+`memory` axis is none of those, so it owns
+`docs/benchmarks/<benchmark-id>.md` and its index row instead.
 
 ## 9. Evidence produced by this investigation
 
@@ -554,7 +605,9 @@ Per AGENTS.md §"Public documents", a lifecycle change also owes `STATUS`,
 ## Now
 
 `ENG-MM-INPUT-PIPELINE` remains `READY`. #1359 stays OPEN: its Qwen3-VL half
-landed, its Muse Glimmer half did not.
+landed and is now MEASURED (2026-08-28, both §6.1 halves MET), its Muse Glimmer
+half did not land, and its Gemma-4 half landed unreached. An issue closes when
+the work lands; two thirds of this one has not.
 
 **Landed.** `Qwen3VLVisionWeights` (and therefore Qwen3-VL-4B, the
 Qwen3.5/3.6-27B dense path and the Qwen3.6-35B MoE path, which share
@@ -587,19 +640,34 @@ way. [#2166](https://github.com/mudler/vllm.cpp/issues/2166) owns it.
 of two kinds, not two policies, and keeping the surviving `* 2` visible is what
 stops the Muse Glimmer half from being forgotten.
 
-**Nothing is measured yet.** §6.1, §6.2 and §6.3 are all PENDING: the RSS gate
-needs a leased host and the staged `qwen3-vl-4b-instruct` checkpoint. The
-implementing wave produced the code, the CPU-runnable gates and the harness;
-the operator runs
+**MEASURED for `qwen3-vl`, 2026-08-28. §6.1 and §6.2 are MET; §6.3 is still
+PENDING.** The run is `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl
+--device cpu` at `525d2b991` on `dgx:gpu0` under an `rc` lease, read against the
+2026-08-24 `41ab550b9` run on `thor:gpu0`.
 
-```sh
-scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl --device cpu
-```
+- **§6.1 half 1, the default arm: MET.** 10,209,501,184 B → 9,381,281,792 B, a
+  reduction of **828,219,392 B (0.771 GiB)** against a 747,625,881 B floor —
+  **99.7% of what this row's header arithmetic predicted.**
+- **§6.1 half 2, the `--language-model-only` control: MET.** 8,553,709,568 B →
+  8,554,364,928 B, **+655,360 B = +0.0077%** against a 2% band. That arm loads
+  no tower and did not move, which is what makes half 1 attributable to this row
+  rather than to the host.
+- **§6.2, the re-declared skip threshold: MET on both pairs.** 826,916,864 B and
+  826,576,896 B = 0.770 GiB, against 747,625,881 B. The published saving fell to
+  **0.499x** of 1.542 GiB, which is the declared halving and is correct.
+- **§6.3, the latency band: still PENDING.** No tower-encode timing was taken.
 
-on `thor:gpu0` or `dgx:gpu0` under an `rc` lease, at this commit and at its
-parent, and applies §6.1's two halves to the per-leg `peak RSS default` and
-`peak RSS lang-model-only` keys. MET is a default-arm reduction of at least
-747,625,881 B with the `--language-model-only` arm unchanged within 2%.
+**One deviation, argued in §6.1 rather than absorbed:** the pre-fix figure comes
+from a different host and a commit that is not this one's parent, so half 2 is
+carrying the attribution. §6.1 records why the margins make that admissible, and
+`## Owed` keeps a same-host pre/post pair listed as the better evidence.
+
+Evidence: `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828{,.legs}.log`,
+with the superseded run kept beside it at `…-thor-20260824{,.legs}.log`.
+
+**#1359 is NOT closed by this.** Its Qwen3-VL half is done and now verified; its
+Muse Glimmer half has not landed and its Gemma-4 half landed unreached. Both are
+under `## Owed`.
 
 ## Owed
 
@@ -608,8 +676,18 @@ parent, and applies §6.1's two halves to the per-leg `peak RSS default` and
   today). Blocked on [#2166](https://github.com/mudler/vllm.cpp/issues/2166),
   which owns the golden regeneration the `kF32` per-stage gate needs, and
   separately on the ~56 GB of worker-local disk its RSS leg wants (§10).
-- Both §6.1 halves, §6.2's re-declared skip threshold and §6.3's latency band
-  are PENDING a leased host. Nothing in this row has been measured.
+- **§6.3's latency band** is PENDING a leased host: no tower-encode timing has
+  been taken on either kind. §6.1's two halves and §6.2's re-declared skip
+  threshold are MET for `qwen3-vl` as of 2026-08-28 and are no longer owed; all
+  three remain owed for `muse-glimmer`, whose half has not landed.
+- **A same-host pre/post pair for §6.1.** The 2026-08-28 result reads a
+  `dgx:gpu0` post-fix run against a `thor:gpu0` pre-fix run four days earlier,
+  which is not the "same host" §6.1 declares, and `41ab550b9` is not
+  `525d2b991`'s parent. The `--language-model-only` control arm is what carries
+  the attribution instead, and it does so with a 260x margin, so the axis is MET
+  rather than VOID. Rerunning both arms at this commit and at its parent on one
+  host would replace an argued deviation with a clean one and is worth doing if
+  the figure is ever contested.
 - [#2173](https://github.com/mudler/vllm.cpp/issues/2173) — **the whole Gemma-4
   vision tower this row narrowed is UNREACHED, and it lands that way.**
   `Gemma4VisionForward` and `Gemma4VisionWeights` have no caller outside

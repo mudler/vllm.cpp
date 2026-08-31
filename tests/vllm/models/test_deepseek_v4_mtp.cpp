@@ -19,6 +19,7 @@
 // Grounding: vllm/models/deepseek_v4/nvidia/mtp.py:128-258 (the V4 MTP forward +
 // compute_logits) + our shared verify src/vllm/v1/spec_decode/rejection_sampler.cpp.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_dspark.h"
 
 #include <doctest/doctest.h>
 
@@ -63,6 +64,19 @@ std::vector<float> Rand(Rng& rng, int64_t n, float scale) {
   std::vector<float> v(static_cast<size_t>(n));
   for (auto& e : v) e = rng.next(scale);
   return v;
+}
+
+// W1d (#2186): the carried tower's FP8-sourced half is `HostBf16`, so the fixtures
+// that fill those slots generate at bf16. Same `rng` draw as `Rand`, narrowed once
+// -- the tests below assert structure (finiteness, determinism, trace counts, the
+// miswire arms differing), not hand-computed values, so the extra rounding changes
+// no expectation. Generating here rather than converting at each assignment keeps
+// the fixture's dtype visible at the slot it fills.
+vllm::HostBf16 RandBf16(Rng& rng, int64_t n, float scale) {
+  const std::vector<float> f = Rand(rng, n, scale);
+  vllm::HostBf16 out(f.size());
+  for (size_t i = 0; i < f.size(); ++i) out[i] = vt::F32ToBF16(f[i]);
+  return out;
 }
 std::vector<float> NormW(Rng& rng, int64_t n) {
   std::vector<float> v(static_cast<size_t>(n));
@@ -129,19 +143,19 @@ DeepseekV4LayerHostWeights DenseGatedLayer(Rng& rng, const DeepseekV4Params& p) 
   L.hc_ffn_fn = Rand(rng, hc3 * hcH, 0.2f);
   L.hc_ffn_base = Rand(rng, hc3, 0.2f);
   L.hc_ffn_scale = Rand(rng, 3, 0.5f);
-  L.wq_a = Rand(rng, qlr * H, 0.3f);
+  L.wq_a = RandBf16(rng, qlr * H, 0.3f);
   L.q_norm_weight = NormW(rng, qlr);
-  L.wq_b = Rand(rng, (nh * hd) * qlr, 0.3f);
-  L.wkv = Rand(rng, hd * H, 0.3f);
+  L.wq_b = RandBf16(rng, (nh * hd) * qlr, 0.3f);
+  L.wkv = RandBf16(rng, hd * H, 0.3f);
   L.kv_norm_weight = NormW(rng, hd);
   L.attn_sink = {0.7f, -0.4f};
-  L.wo_a = Rand(rng, og * olr * in_per_group, 0.3f);
-  L.wo_b = Rand(rng, H * (og * olr), 0.3f);
+  L.wo_a = RandBf16(rng, og * olr * in_per_group, 0.3f);
+  L.wo_b = RandBf16(rng, H * (og * olr), 0.3f);
   L.gate_weight = Rand(rng, ne * H, 0.4f);
   L.gate_bias = Rand(rng, ne, 0.3f);  // learned-gate (noaux_tc bias), NOT tid2eid
-  L.shared_w1 = Rand(rng, mi * H, 0.3f);
-  L.shared_w3 = Rand(rng, mi * H, 0.3f);
-  L.shared_w2 = Rand(rng, H * mi, 0.3f);
+  L.shared_w1 = RandBf16(rng, mi * H, 0.3f);
+  L.shared_w3 = RandBf16(rng, mi * H, 0.3f);
+  L.shared_w2 = RandBf16(rng, H * mi, 0.3f);
   L.exp_w1 = Rand(rng, ne * mi * H, 0.3f);
   L.exp_w3 = Rand(rng, ne * mi * H, 0.3f);
   L.exp_w2 = Rand(rng, ne * H * mi, 0.3f);
@@ -175,7 +189,7 @@ DeepseekV4HostWeights TinyTarget(const DeepseekV4Params& p) {
     // add the compressor / indexer towers where the config asks (so the target
     // forward exercises the real interleave; the MTP block never does).
     if (p.has_indexer(l)) {
-      L.idx_wq = Rand(rng, (p.index_n_heads * p.index_head_dim) * H, 0.3f);
+      L.idx_wq = RandBf16(rng, (p.index_n_heads * p.index_head_dim) * H, 0.3f);
       L.idx_wk = Rand(rng, p.index_head_dim * H, 0.3f);
       L.idx_wproj = Rand(rng, p.index_n_heads * H, 0.3f);
     }
@@ -379,4 +393,79 @@ TEST_CASE("deepseek-v4 MTP: shipped GGUFs advertise nextn but carry no MTP tenso
   // See .agents/specs/deepseek-v4-mtp.md §4 (both shipped GGUFs: 1328 tensors,
   // blocks 0-42, zero nextn — DeepseekV4GgufHasMtp == false).
   CHECK(true);
+}
+
+// ── DSV4-DSPARK-DRAFTER W-1: the trunk taps the DSpark drafter is entered from ──
+//
+// Spec: `.agents/specs/dsv4-dspark-drafter.md`. This is the SEAM gate and only
+// that: it drives the production host forward and reads the taps back, so it reds
+// when the trunk stops filling them (proven: deleting the fill fails two cases)
+// and when their order stops following the request (proven: ordering them by
+// layer fails one).
+//
+// WHAT IT DOES NOT SEE, stated because the first version of this comment claimed
+// otherwise. It cannot see the REDUCTION. Mutating `StreamMeanTap` from a mean to
+// a sum leaves this file fully green, because a uniform factor preserves every
+// property asserted here -- non-triviality, per-layer difference, and request
+// order. The mean is pinned only in `test_deepseek_v4_dspark_entry.cpp`, against
+// hand-computed values.
+//
+// So a change that replaced the trunk's call with an inline reduction of its own
+// would pass both files. That gap is real and is listed under `## Owed` in the
+// row's spec rather than papered over here.
+
+TEST_CASE("W-1: the trunk fills one stream-mean tap per requested layer") {
+  const DeepseekV4Params p = TinyParams();
+  const DeepseekV4HostWeights target = TinyTarget(p);
+  const std::vector<int32_t> ids{3, 7, 1};
+  const std::vector<int32_t> pos{0, 1, 2};
+
+  const auto taps = vllm::DeepseekV4TrunkTapsHost(target, p, ids, pos, {0, 2});
+  REQUIRE(taps.size() == 2u);
+  for (const auto& t : taps) {
+    REQUIRE(t.size() == static_cast<size_t>(ids.size()) * p.hidden_size);
+    double mag = 0.0;
+    for (const float v : t) {
+      REQUIRE(std::isfinite(v));
+      mag = std::max(mag, std::abs(static_cast<double>(v)));
+    }
+    // A tap of all zeros would satisfy every shape assertion while carrying no
+    // trunk state at all.
+    CHECK(mag > 1e-6);
+  }
+  // Two DIFFERENT layers must not produce the same state, or the concatenation
+  // `main_proj` reads would be three copies of one tap.
+  double diff = 0.0;
+  for (size_t i = 0; i < taps[0].size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(taps[0][i] - taps[1][i])));
+  CHECK(diff > 1e-6);
+}
+
+TEST_CASE("W-1: taps come back in REQUEST order, not layer order") {
+  // Load-bearing: `main_proj`'s input columns are the taps concatenated in the
+  // order `dspark_target_layer_ids` names them. Returning them sorted by layer
+  // would be a silent permutation of that projection's input.
+  const DeepseekV4Params p = TinyParams();
+  const DeepseekV4HostWeights target = TinyTarget(p);
+  const std::vector<int32_t> ids{3, 7, 1};
+  const std::vector<int32_t> pos{0, 1, 2};
+
+  const auto fwd = vllm::DeepseekV4TrunkTapsHost(target, p, ids, pos, {0, 2});
+  const auto rev = vllm::DeepseekV4TrunkTapsHost(target, p, ids, pos, {2, 0});
+  REQUIRE(fwd.size() == 2u);
+  REQUIRE(rev.size() == 2u);
+  for (size_t i = 0; i < fwd[0].size(); ++i) {
+    CHECK(fwd[0][i] == doctest::Approx(rev[1][i]));
+    CHECK(fwd[1][i] == doctest::Approx(rev[0][i]));
+  }
+}
+
+TEST_CASE("W-1: a tap layer outside the trunk REFUSES") {
+  const DeepseekV4Params p = TinyParams();
+  const DeepseekV4HostWeights target = TinyTarget(p);
+  const std::vector<int32_t> ids{3};
+  const std::vector<int32_t> pos{0};
+  CHECK_THROWS(vllm::DeepseekV4TrunkTapsHost(target, p, ids, pos,
+                                             {p.num_hidden_layers}));
+  CHECK_THROWS(vllm::DeepseekV4TrunkTapsHost(target, p, ids, pos, {-1}));
 }

@@ -3546,7 +3546,7 @@ measured comparison against a running SGLang-Omni.
 `const nlohmann::json& extra` binding in `ParseSpeechRequest` selects one of the
 two objects. It is at `speech_api.cpp:159-161` in `f06b9e93d`, the merge base of
 the change that repairs it. An earlier draft of this section and the `#1315` row
-in [`issue-index.md`](../issue-index.md) both cite `:160-163`, which is off by
+in [`issue-index.md`](../completed/issue-index.md) both cite `:160-163`, which is off by
 one line and, at the repaired head, lands on the `voice` and `speed` refusals
 instead. This copy is corrected; the index row is append-only and keeps the
 slip, so the anchor to trust is this one and the symbol name is what survives

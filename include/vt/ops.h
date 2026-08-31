@@ -541,8 +541,13 @@ enum class OpId : uint8_t {
   //     too, saying so: "We cannot use the usual functions/kernels here for the
   //     short conv as the conv1d has dilation".
   //
-  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
-  // OWED, not written: it cannot be gated on a CPU-only host.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
+  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). The device arm inherits this
+  // kernel's DOUBLE four-tap accumulator rather than choosing a width of its
+  // own, reads `query_start_loc` and `conv_state_indices` on the DEVICE, and is
+  // gated against the same lane-pinned transformers goldens at all three
+  // dilations (tests/vllm/models/test_qwen4_exp_cuda.cpp). No other device is
+  // registered, so the dispatcher still refuses those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleConv,
   // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
@@ -557,15 +562,26 @@ enum class OpId : uint8_t {
   // gate), no standalone `silu`/`sigmoid`, no elementwise binary multiply and no
   // axis reduction, so a composition would need five NEW general ops and would
   // still materialise the [T, hc, H] broadcast the write-back exists to avoid.
+  // ONE OF THOSE FIVE NOW EXISTS AND THE RATIONALE IS UNCHANGED BY IT: W5d-1
+  // (#2249 item 1) added `kRmsNormGroup` for the PLE block, so the first clause
+  // above reads as the history it is — it is why that op was written — and the
+  // other four are still absent, which is what makes this a fused family op.
   // `.agents/specs/qwen4-exp-flash-next.md` names this exact seam: "A device arm
   // reads `block_out` once per (j, h) tile and `injection_weights[j]` once per
   // row; it never allocates the broadcast." `kDeepseekV4Mhc` is the in-tree
   // precedent for an architecture's hyper-connection glue as one OpId.
   //
   // Registered on kCPU (cpu_qwen4_exp.cpp) and gated bit-comparably against the
-  // lane-pinned transformers goldens. The CUDA arm is OWED, not written: it
-  // cannot be gated on a CPU host, and the spec records the reduction-width
-  // decision it has to make first.
+  // lane-pinned transformers goldens. THE TWO OPS BELOW NOW DIFFER ON DEVICE
+  // COVERAGE, and the difference is the reduction: `kQwen4ExpGatedResidual`
+  // carries a grouped RMS norm whose sum of squares this kernel accumulates in
+  // DOUBLE, so its CUDA arm is still OWED, not written — the spec records the
+  // reduction-width decision it has to make first, with a measured 571x
+  // separation from an f32 block reduction at group size 2560.
+  // `kQwen4ExpGatedResidualWriteBack` has NO reduction at all, so W6-CUDA gave
+  // it a kCUDA arm (src/vt/cuda/cuda_qwen4_exp.cu) that is BYTE-IDENTICAL to
+  // this one — `__fmul_rn`/`__fadd_rn` against the host's `-ffp-contract=off` —
+  // and therefore meets these goldens by exactly the margin this kernel does.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpGatedResidual,
   kQwen4ExpGatedResidualWriteBack,
@@ -618,6 +634,98 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
+  // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.
+  // A SIBLING of kRmsNorm and of kRmsNormGatedGroup, and neither of those two
+  // can stand in for it: `kRmsNorm` reduces over the WHOLE row and has no
+  // group_size, `kRmsNormGated`/`kRmsNormGatedQuantFp8` fold a gate in, and
+  // `kRmsNormGatedGroup` groups correctly but always multiplies by
+  // `silu(gate)` first, so there is no way to ask any of them for a plain
+  // grouped norm. The only grouped reduction this tree had was FUSED inside
+  // `kQwen4ExpGatedResidual` and could not be called on its own, which is the
+  // gap `include/vt/ops.h` states in its own words at the kQwen4ExpGatedResidual
+  // comment above ("There is no ungated per-group RMS norm").
+  //
+  // Adding `group_size` to `RmsNormArgs` instead was REJECTED, and the reason is
+  // the silent-wrong-answer shape this row keeps meeting. `kRmsNorm` is
+  // registered on five backends; a new field on its args struct is ignored by
+  // every kernel that is not taught to read it, so a CUDA or Metal caller would
+  // get a whole-row norm back from a grouped request, with no crash and no
+  // refusal. A separate OpId cannot do that: an unregistered device refuses BY
+  // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
+  // ("SIBLING of RmsNormGatedArgs, not a mode of it").
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_ops.cpp). The CUDA arm is OWED, not
+  // written: it cannot be gated on a CPU-only host, and an ungated kernel is
+  // worse than an absent one — the same call W5b-3 and W5b-4 made.
+  // Appended before kCount so no existing op's id shifts.
+  kRmsNormGroup,
+  // MODEL-MM-QWEN4-EXP W5e-1 (#2336) — the Qwen4-Exp PLE GATE: the signed
+  // square root of the hyper-connection score, and the sigmoid of it applied to
+  // a per-token `value` row broadcast across the hc streams.
+  // `Qwen4ExpTextPLELayer.forward`, transformers v5.16.0
+  // `models/qwen4_exp/modeling_qwen4_exp.py:1181-1182` (+ the :1184 flatten):
+  //
+  //     gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+  //     gated_value = torch.sigmoid(gate) * value.unsqueeze(-2)
+  //
+  // WHAT IS **NOT** HERE, AND THAT IS THE POINT. The DOT that produces `gate`
+  // (:1180) is NOT this op. `vt::BatchedMatmul` already computes it — `[T*hc, 1,
+  // H] x [T*hc, H, 1]` over VIEWS of the two `[T, hc*H]` buffers, since only the
+  // innermost dim must be unit-stride and `stride[0]`/`stride[1]` are free — so
+  // a private scoring loop beside it would be the parallel path AGENTS.md
+  // "Shared seams" forbids. `test_qwen4_exp_ple_gate.cpp` RUNS that composition
+  // against the same lane-pinned golden this op is gated on, so the reuse is
+  // measured rather than asserted. The `/ math.sqrt(hidden_size)` that :1180
+  // ends with has no op and no home in `BatchedMatmul`, so it rides here as
+  // `Qwen4ExpPleGateArgs::gate_divisor`.
+  //
+  // WHY A FUSED OP RATHER THAN A COMPOSITION for what is left. The shared
+  // surface has no `abs`, no `clamp`, no `sqrt`, no `sign` and no standalone
+  // `sigmoid` — the same absence `kQwen4ExpGatedResidual` above already
+  // enumerates — so the middle line alone would need four new general ops. The
+  // multiply then needs a fifth, and no existing one can serve, because BOTH of
+  // its operands broadcast: `gate` is `[T, hc, 1]` and `value.unsqueeze(-2)` is
+  // `[T, 1, H]`. `vt::SigmoidGateBf16` refuses it by count
+  // ("sigmoid_gate_bf16: out/attn/gate must have the same element count") and
+  // `vt::MulColVecF32` scales per output COLUMN, where this scales per (t, j)
+  // ROW of the flattened `[T, hc*H]`. Composing it anyway means tiling `value`
+  // to `[T*hc, H]` with `vt::IndexSelect` first, which materialises exactly the
+  // broadcast a fused op exists to avoid.
+  //
+  // WHY A NEW OpId RATHER THAN A FIELD on an existing args struct. Same
+  // arithmetic as `kRmsNormGroup` above: the candidate hosts are registered on
+  // MORE THAN ONE backend, so a new field would be silently IGNORED by every
+  // arm that does not learn it and the caller would get a wrong answer with no
+  // crash and no refusal. `kSigmoidGateBf16` has FOUR registered arms — kCPU
+  // (cpu_ops.cpp), kROCM (rocm_ops.hip), kVULKAN (vulkan_ops.cpp) and
+  // kTENSTORRENT (tenstorrent_ops.cpp) — and `kMulColVecF32` has TWO (kCPU,
+  // kCUDA). Three arms and one arm respectively would answer a broadcast
+  // request with an elementwise product. An unregistered device refuses BY NAME
+  // instead.
+  //
+  // THE CLAMP ORDER IS THE TRAP. `clamp_min` is applied BEFORE the square root,
+  // so the floor on |output| is sqrt(1e-6) = 1e-3 and not 1e-6, and tiny scores
+  // are AMPLIFIED. Exactly zero is the one exception and it is not a special
+  // case in the code: `sign(0) == 0` kills the floor, so the origin maps to 0
+  // and the function is genuinely discontinuous there. A fully masked row
+  // reaches it.
+  //
+  // A NaN SCORE PROPAGATES, and that is a guard rather than a fall-through.
+  // Upstream returns NaN here (`sign(NaN) == 0`, but `NaN * 0.0 == NaN`), while
+  // every comparison in a naive signed-sqrt is FALSE for NaN, so the sign
+  // branches miss and the zero arm returns 0 — turning poison into a plausible
+  // `0.5 * value`. The kernel tests `isnan` first. `+/-inf` and `+/-0.0` need
+  // no guard and get none; they already match the pin term for term.
+  //
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
+  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). THE NaN OBLIGATION ABOVE IS
+  // DISCHARGED ON BOTH ARMS: the device kernel tests `isnan` first for the same
+  // reason, and `tests/vllm/models/test_qwen4_exp_cuda.cpp` carries the case
+  // that separates a NaN from the plausible `0.5 * value` a missing guard
+  // returns. No other device is registered, so the dispatcher still refuses
+  // those BY NAME.
+  // Appended before kCount so no existing op's id shifts.
+  kQwen4ExpPleGate,
   kCount
 };
 
@@ -665,6 +773,43 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// Ungated GROUP RMS norm args (vt::RmsNormGroup). A SIBLING of RmsNormArgs, not
+// a mode of it: see the kRmsNormGroup comment for why the group extent is not a
+// field on that struct. `eps` and `gemma` keep RmsNormArgs's names and meanings
+// exactly, so a caller migrating a whole-row norm to a grouped one changes the
+// extent and nothing else.
+//
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextRMSNorm` (:158-181),
+// whose `group_size` argument this mirrors by NAME. `RmsNormGatedGroupArgs`
+// spells the same axis as `n_groups` because ITS upstream
+// (`Mixer2RMSNormGated`, mamba_mixer2.py:80) does; the two upstreams disagree
+// on which half of the quotient is the parameter, and each op takes the one its
+// own upstream takes rather than a normalized third form.
+struct RmsNormGroupArgs {
+  float eps = 1e-6f;
+  // `weight` applied as `(1 + w)` rather than `w`. TRUE is the polarity every
+  // `qwen4_exp` gamma needs: `Qwen4ExpTextRMSNorm.forward` is
+  // `output * (1.0 + self.weight.float())` over a ZERO-initialised parameter
+  // (:162, :177), the loader stores every gamma RAW, and every consumer adds
+  // the 1 itself (#2218). It is a flag and not a constant because this op is a
+  // general `vt::` primitive and `RmsNormArgs` already spells the same choice
+  // the same way.
+  bool gemma = false;
+  // Elements per group. The reduction runs over `group_size` CONSECUTIVE
+  // elements of the last dimension, so the norm of one group cannot see another
+  // (`x.reshape(*x.shape[:-1], -1, group_size)` then `mean(-1)`, :168-171).
+  //
+  // ZERO IS REFUSED rather than meaning "the whole row", and that default is
+  // deliberate. Whole-row is what `vt::RmsNorm` already does; letting a
+  // forgotten field silently produce it would make the single most likely
+  // caller mistake indistinguishable from success, and a full-row reduction
+  // over a grouped stream is a plausible tensor rather than a crash. Upstream
+  // refuses the analogous case at :164-165 (`hidden_size must be divisible by
+  // group_size`) and so does the dispatcher.
+  int64_t group_size = 0;
 };
 
 // ─── EXL3 device-kernel argument records — MODEL-DSV4-EXL3 W2 ────────────────
@@ -876,6 +1021,27 @@ struct Qwen4ExpPleConvArgs {
   int64_t dilation = 1;
 };
 
+// Qwen4-Exp PLE gate args (vt::Qwen4ExpPleGate). Algorithm oracle: transformers
+// v5.16.0 `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextPLELayer.forward`
+// (:1180-1182, flattened at :1184). Both numbers are held here rather than
+// derived from a shape, for the reason Qwen4ExpPleConvArgs::dilation gives: a
+// caller that believes a different geometry must be visible, not interpolated.
+struct Qwen4ExpPleGateArgs {
+  // `math.sqrt(self.hidden_size)`, the DIVISOR upstream ends :1180 with. Held as
+  // the divisor and not as its reciprocal so the op performs the same operation
+  // upstream does; multiplying by a pre-computed 1/sqrt(H) differs in the last
+  // place. 1.0 is the identity, which is what a caller that has already scaled
+  // its scores passes.
+  float gate_divisor = 1.0f;
+  // The `clamp_min(1e-6)` LITERAL at :1181 — not a config key, and upstream has
+  // no knob for it. It is a field so the number appears ONCE for every arm
+  // rather than being re-typed in each kernel, and so a caller that changes it
+  // is visible in the call rather than invisible in a backend. Applied to
+  // |gate| BEFORE the square root, so the floor it puts on the output magnitude
+  // is its own square root; see the kQwen4ExpPleGate comment.
+  float clamp_min = 1e-6f;
+};
+
 struct L2NormArgs {
   float eps = 1e-6f;  // upstream default (gdn-semantics.md §4)
 };
@@ -995,6 +1161,43 @@ struct Qwen4ExpQsaAttnArgs {
   // A host pointer, on the `GdnArgs::query_start_loc_host` precedent; a CUDA arm
   // owes a device-side counter and its copy-back.
   int64_t* keys_visited = nullptr;
+
+  // ─── THE PAGED ADDRESS MODE (row MODEL-MM-QWEN4-EXP W5d-3, #2249 item 2) ───
+  //
+  // WHY IT IS HERE AND NOT A SECOND OP. The engine allocates this model's QSA
+  // K/V as a PAGED `FullAttentionSpec` group (`MakeQwen4ExpKVCache`), so the
+  // contiguous `[max_kv, Hkv, Dh]` arm above could not serve from the cache the
+  // runner actually hands a forward. What differs between the two is the
+  // resolution of ONE address — the key/value row for logical position `p` —
+  // and nothing else: the expansion, the visit ORDER, the two softmax passes and
+  // the f32 accumulation are the same body, so a second op would be the parallel
+  // path AGENTS.md "Shared seams" forbids.
+  //
+  // `nullptr` keeps the contiguous arm byte-for-byte. When set, `key`/`value`
+  // are the rank-4 `[num_pages, kv_block_size, num_kv_heads, head_dim]` unbind
+  // views of the runner's flash cache (`dense_attn::KvSlice`), STRIDED rather
+  // than contiguous because K and V interleave at dim 1, and logical position
+  // `p` resolves as vLLM's paged read does
+  // (`vllm/v1/attention/backends/flash_attn.py::FlashAttentionImpl.forward`,
+  // mirrored in this tree's `vt::PagedAttention` contract):
+  //
+  //     page = kv_block_table[p / kv_block_size]
+  //     row  = key[page, p % kv_block_size, kv_head, :]
+  //
+  // TWO THINGS ARE CALLED A "BLOCK" IN THIS OP AND THEY ARE NOT THE SAME
+  // OBJECT. `block_ids` names QSA's COMPRESS blocks of `compress_ratio` tokens
+  // (4 at the released config); `kv_block_table`/`kv_block_size` name the KV
+  // CACHE PAGE (the engine's `block_size`, 16 or more). The `kv_` prefix is what
+  // keeps them apart, and `MakeQwen4ExpKVCache` refuses a `block_size` the
+  // compress ratio does not divide, so a compress block never straddles a page.
+  //
+  // ONE REQUEST. `kv_block_table` is `[1, max_pages]` i32: this op is called per
+  // QSA layer for one sequence, exactly as the contiguous arm is, and a ragged
+  // multi-request batch needs the per-request `query_start_loc` plumbing the
+  // block does not carry yet. Recorded under the spec's `## Owed`.
+  const Tensor* kv_block_table = nullptr;
+  // Tokens per KV cache page. Must be > 0 exactly when `kv_block_table` is set.
+  int64_t kv_block_size = 0;
 };
 
 // Mamba2 SSD args, shared by the chunked prefill scan and the decode state
@@ -1667,6 +1870,26 @@ struct MlaDecodeAttentionArgs {
   // so a windowed layer carries no indexer at all.
   const Tensor* topk_indices = nullptr;
   const Tensor* valid_counts = nullptr;
+  // PER-HEAD ATTENTION SINK — `[num_heads]` f32, or null.
+  //
+  // A sink is one extra logit that contributes to the softmax DENOMINATOR ONLY:
+  // it removes probability mass from the row without contributing a value, so a
+  // row can attend to "nothing" (`vllm/models/deepseek_v4/attention.py:218-222`;
+  // this tree's host reference is `SoftmaxWithSink`,
+  // `src/vllm/model_executor/models/deepseek_v4_dsa.cpp:121-139`).
+  //
+  // NULL BY DEFAULT, so every existing caller -- Kimi-Linear, dots3-note,
+  // MiniCPM3, DeepSeek-V2 -- is BIT-IDENTICAL: the online softmax seeds `m` at
+  // `-inf` and `l` at 0 exactly as it did before. Present, it seeds `m` at the
+  // head's sink and `l` at 1 (`exp(sink - sink)`), which is the same arithmetic
+  // the host reference does in its two-pass form.
+  //
+  // WHERE A SPLIT KERNEL MUST PUT IT. A CUDA implementation that splits the KV
+  // over `num_kv_splits` must add the sink in the FINAL reduction, not per
+  // split, or it is counted once per split instead of once per row. At
+  // `num_kv_splits == 1` both placements agree, so a gate that only ran the
+  // batch-invariant path would pass a kernel that is wrong everywhere else.
+  const Tensor* attn_sink = nullptr;
 };
 
 // Arguments for vt::DsaIndexerLogits (dots3-note W4b-3c, #699). The two
@@ -1942,6 +2165,11 @@ using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExper
                               const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
+// Ungated group RMS norm (vt::RmsNormGroup). Same operand order as RmsNormFn
+// minus the residual, which this op does not carry because its upstream has no
+// residual arm and a knob nobody can set is a divergence with extra steps.
+using RmsNormGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                const Tensor& /*weight*/, const RmsNormGroupArgs&);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using GeluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulScalarFn = void (*)(Queue&, Tensor&, const Tensor&, double);
@@ -1974,6 +2202,9 @@ using Qwen4ExpPleConvFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*query_start_loc*/,
                                    const Tensor* /*conv_state_indices*/,
                                    const Qwen4ExpPleConvArgs&);
+// Qwen4-Exp PLE signed-sqrt gate + broadcast sigmoid scale (vt::Qwen4ExpPleGate).
+using Qwen4ExpPleGateFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*score*/,
+                                   const Tensor& /*value*/, const Qwen4ExpPleGateArgs&);
 using L2NormFn = void (*)(Queue&, Tensor&, const Tensor&, const L2NormArgs&);
 using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                 const RmsNormGatedArgs&);
@@ -2884,6 +3115,57 @@ void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 
+// UNGATED PER-GROUP RMS NORM — `Qwen4ExpTextRMSNorm` (transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py:158-181`), the `group_size is not
+// None` arm, executed per row:
+//
+//   g       = i / group_size                       (:168-169, the reshape)
+//   ms[g]   = mean_{i in g}( x[i]^2 )              (:170, `pow(2).mean(-1)`)
+//   out[i]  = x[i] * rsqrt(ms[g] + eps) * (1 + w[i])   when gemma
+//   out[i]  = x[i] * rsqrt(ms[g] + eps) * w[i]         otherwise
+//
+// A SIBLING of vt::RmsNorm, which is the same expression with one group per
+// row, and of vt::RmsNormGatedGroup, which groups the same way but multiplies
+// `silu(gate)` in before the reduction. Neither can express this one; see the
+// kRmsNormGroup comment for why the extent is not a mode of RmsNormArgs.
+//
+// THREE PLACES EPS IS NOT. It is INSIDE the rsqrt, added to the MEAN SQUARE,
+// and added ONCE PER GROUP. The plausible slips are adding it to the norm
+// rather than to the mean square, and computing it against the whole row's mean
+// square. `scripts/gen-qwen4-exp-hc-goldens.py` case D exists for the first
+// (at `hyper_scale = 1.7` an eps of 1e-6 moves the answer ~5e-7 relative, which
+// is BELOW the gate tolerance and therefore invisible; at `hyper_scale = 0.01`
+// it is 1% of the mean square), and the grouped/full-row separation on those
+// same goldens is 4.0e-1 to 1.2e+0 against a 1e-5 tolerance.
+//
+// POLARITY. `gemma = true` applies `(1 + w)`, and that is what every
+// `qwen4_exp` gamma needs: the loader stores each one RAW as HuggingFace ships
+// it, centred on 0, and EVERY consumer adds the 1 itself — `vt::RmsNorm` under
+// `gemma = true`, `vt::Qwen4ExpQsaCompress`, `vt::Qwen4ExpGatedResidual` since
+// #2218, and this op. `ssm_norm` is the single exception in the architecture.
+// The failure this rule prevents is silent: a gamma centred on 0 multiplied
+// without the `+1` scales the stream by ~0 and reads as a corrupt checkpoint
+// rather than as a wiring bug.
+//
+// SHAPES. x [T, H] and out [T, H] rank-2 contiguous; weight [H] rank-1, applied
+// per COLUMN of the flat row (upstream's `self.weight` is `[dim]` over the
+// unflattened width, and :177 multiplies AFTER `out.flatten(-2)`, so the weight
+// index is the flat one and not the in-group one). `args.group_size` must be
+// >= 1 and divide H; upstream raises `ValueError` on the same condition
+// (:164-165) and this op refuses by name.
+//
+// PRECISION, AND IT IS A MIRROR RATHER THAN A CHOICE. The reduction, the
+// reciprocal square root and the weight multiply all run in f32 and the result
+// is rounded ONCE on the store, which is `output = self._norm(x.float())`,
+// `output * (1.0 + self.weight.float())`, `output.type_as(x)` (:174-178) in
+// order. Upstream says so in a comment at :175-176 — "Llama does x.to(float16)
+// * w whilst Qwen4ExpText is (x * w).to(float16)" — so rounding the normalized
+// value BEFORE the weight multiply is a different model, not a tolerance. This
+// is the same order `vt::RmsNorm` already keeps; `vt::RmsNormGatedGroup` keeps
+// the OTHER one, because its own upstream (mamba_mixer2.py:149) does.
+void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                  const RmsNormGroupArgs& args);
+
 // --- Fused declarative recipe (TDR; see include/vt/recipes.h and
 // .agents/specs/portable-fusion-framework.md). A recipe (a backend-agnostic
 // constexpr FusedRecipe) is realized in tiers selected by VT_FUSED_TIER:
@@ -3245,6 +3527,40 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
                      Tensor& conv_state, const Tensor& query_start_loc,
                      const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args);
 
+// The Qwen4-Exp PLE GATE — `Qwen4ExpTextPLELayer.forward` :1181-1182, with the
+// :1184 flatten folded into the output layout. Per (t, j, d):
+//
+//   g       = score[t, j] / args.gate_divisor            // the tail of :1180
+//   gate    = sign(g) * sqrt(max(|g|, args.clamp_min))   // :1181
+//   out[t, j*H + d] = sigmoid(gate) * value[t, d]        // :1182, flattened :1184
+//
+// with sign(0) == 0, so g == 0 gives gate == 0 and out == 0.5 * value — NOT the
+// 1e-3 floor. That discontinuity is upstream's and is reachable: a fully masked
+// row scores exactly zero.
+//
+//   out    [T, hc*H]  f32 or bf16, contiguous
+//   score  [T, hc]    f32, contiguous — the raw per-(t, j) dot from
+//                     vt::BatchedMatmul, BEFORE the sqrt(hidden_size) divide
+//   value  [T, H]     float, contiguous
+//
+// `hc` and `H` are read off `score` and `value`; `out`'s second dim must be
+// their product, which is the check that catches a caller that flattened the
+// two the other way round.
+//
+// SCORE IS F32 AND ONLY F32, for the reason vt::SigmoidGateBf16 gives for its
+// own gate operand: it is the argument of a sigmoid and a transcendental's
+// input must not be rounded. `value` and `out` carry the model's storage width.
+//
+// PRECISION. f32 in, DOUBLE interior — the divide, the clamp, the square root,
+// the sigmoid and the product are all evaluated in double, matching the W2 host
+// reference (`qwen4_exp_ple.cpp::PleForward`) term for term — then ONE store.
+// The same house convention vt::Qwen4ExpPleConv states, and for the same
+// reason: it lets the two arms be bit-identical rather than merely close. A
+// CUDA arm that evaluates in f32 will not inherit that and must be gated
+// against the oracle directly; the spec's `## Owed` records it.
+void Qwen4ExpPleGate(Queue& q, Tensor& out, const Tensor& score, const Tensor& value,
+                     const Qwen4ExpPleGateArgs& args);
+
 // SPECULATIVE multi-token conv step (SPEC-MTP I4). Ported from
 // vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24
 // (_causal_conv1d_update_kernel IS_SPEC_DECODING + IS_VARLEN branches
@@ -3474,7 +3790,7 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // front. Per token:
 //
 //   normed[j*H+h] = hyper[j*H+h] * rsqrt(mean_h(hyper[j*H+.]^2) + eps)
-//                                * hc_norm_w[j*H+h]          (group_size == H)
+//                                * (1 + hc_norm_w[j*H+h])    (group_size == H)
 //   low[r]        = silu( (mix_down[r] . normed) / hc )       -- DIVIDE INSIDE
 //   gate[p]       = sigmoid( mix_up[p] . low )                -- NO divide here
 //   mixed[h]      = mean_j( gate[j*H+h] * normed[j*H+h] )     -- MEAN, not sum
@@ -3486,10 +3802,26 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // on the up projection, and the collapse is a MEAN over the branches while the
 // product it collapses is against the NORMED stream and not the raw one.
 //
-// `hc_norm_w` is vLLM's parameterization, i.e. ALREADY `1 + w_hf`. Upstream
-// applies `output * (1.0 + weight)` on a zero-init gamma; folding it once at
-// load is `vllm::qwen4_exp::HcNormWeightFromHf`, and a `qwen4exp` GGUF written by
-// ggml-org/llama.cpp#27742 carries the fold already. This op never adds 1.
+// `hc_norm_w` IS THE RAW HUGGINGFACE GAMMA, `w_hf`, and THIS OP ADDS THE 1.
+// That is upstream's parameterization verbatim — `Qwen4ExpTextRMSNorm.forward`
+// is `output * (1.0 + self.weight.float())` over a ZERO-initialised weight
+// (:173-178) — and it is the SAME polarity `vt::RmsNorm(gemma=true)` and
+// `vt::Qwen4ExpQsaCompress` apply to this architecture's other gammas, which is
+// the point: `Qwen4ExpWeights` holds every gamma raw (the `qwen4exp` loader
+// inverts the `+1` ggml-org/llama.cpp#27742 bakes in at convert time, with
+// `linear_attn.norm.weight` the one tensor the converter never folds), so ONE
+// rule covers the whole model and no call site has to remember which of two
+// forms this particular op wanted.
+//
+// IT READ THE OTHER WAY UNTIL #2218, and the correction is recorded here rather
+// than only in the spec because the failure is silent. Under the old contract a
+// forward that handed this op the loaded `hc_norm` multiplied every
+// hyper-connection norm by a gamma centred on ZERO — a plausible tensor, never
+// a crash, and unreachable by any single-sided gate, because the loader was
+// right about its own output and the op was right about its own input.
+// `vllm::qwen4_exp::HcNormWeightFromHf` remains the `w_hf -> 1 + w_hf` bridge
+// the W3 HOST reference needs (`qwen4_exp_hc.h` `GroupedRmsNorm` is vLLM's
+// `out * w` form and keeps it); it is NOT a step any caller of this op takes.
 //
 // SHAPES. hyper [T, hc*H]; hc_norm_w [hc*H]; mix_down [R, hc*H]; mix_up [hc*H, R]
 // (both in PyTorch `nn.Linear(bias=False)` `(out_features, in_features)` order);
@@ -3506,6 +3838,21 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // this reduction and meet the same bound; the spec records that choice as owed.
 // Tensors may be f32 or bf16 (widen on load, round once on store), mirroring
 // upstream's `_norm(x.float())` ... `.type_as(x)`.
+//
+// EXCEPT THE THREE PROJECTIONS, WHICH MAY KEEP THE FILE'S BLOCKS (W5p, #2031).
+// `mix_down`, `mix_up` and `block_inject` also accept a block-quantized `[N,K]`
+// dtype, and the kernel then routes that projection through `vt::MatmulBT`,
+// which dispatches `kMatmulBTQuant`. The released
+// `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 of these mix weights as Q8_0
+// and cannot prefill otherwise. `hyper`, `hc_norm_w`, `mixed` and `injection`
+// stay float and a block-typed one is refused BY NAME: the gamma is an
+// ELEMENTWISE multiplicand, which is the split llama.cpp makes for this same
+// architecture -- six projections declared `GGML_OP_MUL_MAT`
+// (`src/llama-arch.cpp:759,760,761,763,764,765` at `6c84c7d5d`) against
+// `GGML_OP_MUL` for `hc_*_norm` (`:758`, `:762`), with an explicit f32 cast
+// where a file-typed weight of this architecture meets an elementwise multiply
+// (`src/models/qwen4exp.cpp:1198-1202`). A float weight is bit-identical to
+// before: it keeps the same scalar accumulation in the same index order.
 void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
                            const Tensor& hc_norm_w, const Tensor& mix_down,
                            const Tensor& mix_up, const Tensor* block_inject,
@@ -3627,7 +3974,11 @@ void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
 // say. The expansion is address arithmetic and belongs inside the consumer.
 //
 // SHAPES. query [T, num_q_heads, head_dim] f32/bf16; key and value
-// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache;
+// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache — or, in the PAGED
+// address mode, the rank-4 [num_pages, kv_block_size, num_kv_heads, head_dim]
+// unbind views of the runner's flash cache, which are STRIDED (see
+// `Qwen4ExpQsaAttnArgs::kv_block_table` for the resolution and for why the two
+// arms are one op);
 // block_ids [T, block_topk] i32, ascending, `-1` = no block;
 // kv_lens [T] i32, the causal visible length per query token;
 // out [T, num_q_heads, head_dim] f32/bf16. GQA: num_q_heads % num_kv_heads == 0.

@@ -311,6 +311,8 @@ void TritonMLAImpl::forward_mqa(const AttentionLayer& layer, const vt::Tensor& q
   vt::MlaDecodeAttentionArgs args;
   args.scale = scale;  // `:253` self.scale
   args.num_kv_splits = metadata.num_kv_splits;
+  // W5 (#2323): present only for a layer whose weights carry one.
+  if (attn_sink.data != nullptr) args.attn_sink = &attn_sink;
   args.max_seq_len = metadata.max_seq_len;
   // dots3-note's windowed decode (#699 W4b-2): `_forward_swa_mqa` keeps keys
   // `kv_pos >= query_pos - WINDOW_SIZE + 1` (attention.py:152 @ bc2d63e650),

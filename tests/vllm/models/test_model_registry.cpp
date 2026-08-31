@@ -64,7 +64,7 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // three: the checkpoint's 46th layer is an MTP block the transformers
   // reference discards rather than a second architecture string, and the
   // text-only `Glm5NextForCausalLM` is declared by no published artifact.
-  REQUIRE(registrations.size() == 43);
+  REQUIRE(registrations.size() == 44);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -152,6 +152,11 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // registration (20 KDA linear-attn + 7 NoPE-MLA layers), likewise ONE new
   // forward/loader/registry TU + one REGISTER line, ZERO shared-array edit.
   CHECK(has_arch("KimiLinearForCausalLM"));
+  // GLM-5.3 (`MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` W2, #2214): the
+  // architecture vLLM routes into `deepseek_v2` at `registry.py:117` and that our
+  // OWN DeepSeek-V2 loader refuses at its `index_topk` tripwire, so it registers
+  // from its own TU with its own params struct rather than sharing one.
+  CHECK(has_arch("GlmMoeDsaForCausalLM"));
 
   // Registration arrival order across TUs is unspecified under C++ static init,
   // so the registry imposes a stable canonical sort by architecture name (byte
@@ -160,7 +165,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 43);
+  REQUIRE(supported.size() == 44);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -181,6 +186,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
       "Glm5NextForConditionalGeneration",
+      "GlmMoeDsaForCausalLM",
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
@@ -639,7 +645,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 43> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 44> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
@@ -652,6 +658,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
       "Glm5NextForConditionalGeneration",
+      "GlmMoeDsaForCausalLM",
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
@@ -757,7 +764,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
-      "'Glm5NextForConditionalGeneration', 'GraniteForCausalLM', "
+      "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "
@@ -782,7 +789,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
-      "'Glm5NextForConditionalGeneration', 'GraniteForCausalLM', "
+      "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', "

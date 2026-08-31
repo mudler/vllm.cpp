@@ -577,6 +577,24 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Build the [num_reqs, num_cols] committed block-table slice for a KV group.
   std::vector<int32_t> gather_block_table(int group_id, int num_reqs,
                                           int* num_cols) const;
+  // MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3): gather EVERY published group's
+  // block table into `group_block_tables_`, in group order.
+  //
+  // The two named-id gathers above serve the TARGET attention group and the
+  // recurrent group, and there is no third name to add — `qwen4_exp` publishes
+  // a third group (the QSA indexer side cache, an `MLAAttentionSpec` at
+  // compress_ratio 4) and DeepSeek-V4-Flash publishes seven. Upstream never had
+  // a named-id shape: its per-group metadata loop runs over
+  // `enumerate(kv_cache_groups)` and assigns each group its own table
+  // (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin 5559679229,
+  // `cm.block_table_tensor = _get_block_table(kv_cache_gid)`), where
+  // `_get_block_table` (`:2318-2334`) is exactly `gather_block_table`.
+  //
+  // MULTI-CACHE ONLY. Every uniform topology leaves `group_block_tables_` empty
+  // and `multi_kv_index_`'s two new pointers null, so no model shipping today
+  // pays a copy or can observe the channel — the same empty-means-unchanged
+  // contract the other three W3 vectors keep.
+  void gather_group_block_tables(int num_reqs);
   // Rewrite the GDN group's block-table col 0 into a COMPACT per-sequence state
   // slot in [0, gdn_state_slots_). The GDN mamba state is one recurrent state
   // per SEQUENCE, kept in a compact cache sized by max_num_reqs — NOT the
@@ -650,8 +668,32 @@ class GPUModelRunner final : public ModelRunnerBase {
   bool multi_cache_topology_ = false;
   std::vector<std::vector<int32_t>> layer_attn_kv_indices_;
   std::vector<std::string> attn_kv_layer_names_;
-  std::vector<int32_t> attn_kv_group_ids_;
-  std::vector<int32_t> attn_kv_layer_indices_;
+  // ENG-MULTIKV-BYNAME: the BY-NAME index over EVERY published cache, paged and
+  // recurrent alike, in published GROUP order and then the group's own
+  // `layer_names` order — upstream's own insertion order for the single
+  // `kv_caches` dict (`vllm/v1/worker/gpu_model_runner.py:7365-7372` @ pin
+  // 5559679229). These five are parallel to EACH OTHER and back
+  // `multi_kv_index_`'s five pointers.
+  //
+  // They are NOT parallel to `attn_kv_`, and that is the whole change: W3's
+  // three vectors were, so a `MambaSpec` group — which contributes no `attn_kv_`
+  // entry — could not be represented in them at all, and `Find()` answered -1
+  // for all 34 of `qwen4_exp`'s recurrent states (#2343). `kv_index_payload_*`
+  // carries the locator a position used to imply: entry `i` is
+  // `attn_kv_[slot]` when its kind is `kPaged` and `gdn_state_[slot]` when it is
+  // `kRecurrent`. Empty on every uniform topology.
+  std::vector<std::string> kv_index_layer_names_;
+  std::vector<int32_t> kv_index_group_ids_;
+  std::vector<int32_t> kv_index_layer_indices_;
+  std::vector<uint8_t> kv_index_payload_kinds_;
+  std::vector<int32_t> kv_index_payload_slots_;
+  // W5c-2 (#2249 item 3): one gathered block table per PUBLISHED GROUP, indexed
+  // by group id (NOT parallel to `attn_kv_` — a table belongs to a group, and
+  // every layer in the group shares it, which is upstream's own fan-out). Sized
+  // once at `initialize_kv_cache` on the multi-cache path and refilled by
+  // `gather_group_block_tables` on every step; empty on every uniform topology.
+  std::vector<std::vector<int32_t>> group_block_tables_;
+  std::vector<int32_t> group_block_table_cols_;
   vllm::MultiKvCacheIndex multi_kv_index_;
   int64_t num_blocks_ = 0;
   // Per-block attention-cache bytes as reported by the KV spec (see the

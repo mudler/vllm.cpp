@@ -31,6 +31,8 @@ struct IqTableSnapshot {
   uint64_t iq2xxs_grid[256];
   uint32_t iq3xxs_grid[256];
   uint64_t iq2s_grid[1024];
+  uint64_t iq2xs_grid[512];
+  int8_t kvalues_iq4nl[16];
   int8_t kvalues_mxfp4[16];
 };
 

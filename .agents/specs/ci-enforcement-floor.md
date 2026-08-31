@@ -239,12 +239,21 @@ after this lands the main push lane never walks it. Measured:
 `check-commit-trailers.py --range fafa16f0f..origin/main` prints that banner
 once, and `--range bacb71109..origin/main` prints it zero times. The commit is
 therefore forgiven twice, and its DEBT line — written precisely so a reader of
-a green lane can see what the lane is carrying — stops reaching that reader. The
-entry is not deleted, duplicated or bypassed, and
-`tests/scripts/test_check_commit_trailers.py::LandedMessageExceptions` still
-pins its count, key shape and error string, so only its runtime visibility on
-the push lane is lost. Recording it here is the replacement, and it is a weaker
-one than the banner.
+a green lane can see what the lane is carrying — stops reaching that reader.
+Recording it here was the replacement, and it was a weaker one than the banner.
+
+**SUPERSEDED 2026-08-29 by [derived-issue-index.md](derived-issue-index.md) W9
+(#2322).** Both trailer steps of `commit-protocol-tag` now run on the
+PULL-REQUEST lane only, so the push lane walks no commit that is already on
+`main` and cannot need forgiving. `LANDED_MESSAGE_EXCEPTIONS` and its test class
+are removed with the reason they existed for. The double-forgiveness described
+above is moot: the entry is gone, the banner is gone, and the paragraph is kept
+because deleting it would erase the record that `281b4bc76c0e` violated the
+contract at all. THIS FILE remains the only place that says so.
+
+The floor itself is untouched and still governs `documentation-checkpoint` and
+`agent-record`'s role-discipline step, which do walk the push lane. Its value is
+unchanged and it still forgives the same 42 commits for those two gates.
 
 ### Advancing the floor
 

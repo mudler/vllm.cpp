@@ -83,11 +83,15 @@ fi
 exit 0
 """
 
-# The five gates that take the pinned base as an argument, by the script name
-# each one is invoked with. Every one of them must be handed `BASE_SHA`.
+# The gates that take the pinned base as an argument, by the script name each one
+# is invoked with. Every one of them must be handed `BASE_SHA`.
+#
+# `check-issue-index-append-only.py` was a fifth until #2290 deleted it. It
+# guarded a tracked append-only file against a wrong union merge, and the index
+# is derived now -- nothing appends to a generated file, so there is no ordering
+# to violate. The entry is removed with the gate, not to quiet a red.
 BASE_ARGUMENT_GATES = (
     "scripts/check-now-current.py",
-    "scripts/check-issue-index-append-only.py",
     "scripts/check-commit-trailers.py",
     "scripts/check-commit-style.py",
 )
@@ -413,7 +417,6 @@ class SkipIsReportedTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -515,8 +518,12 @@ class ThePinnedBaseReachesTheCheckersTests(PreflightHarness):
         # PRECONDITION: a log that recorded nothing satisfies every `assertNotIn`
         # below. Count first, and count ALL of them, so a gate that stops being
         # invoked at all cannot pass as a gate invoked correctly.
+        # DERIVED from the tuple, not written as a literal. It was `4` and went
+        # stale the moment a gate was deleted (#2290), which turned a
+        # precondition into the only red in the suite. One invocation per gate is
+        # the property; the number is an implementation detail of the list.
         self.assertEqual(
-            4,
+            len(BASE_ARGUMENT_GATES),
             sum(len(lines) for lines in recorded.values()),
             f"precondition failed: the stub recorded {recorded}, which is not "
             f"one base-carrying invocation per gate.\n{report}",
@@ -579,7 +586,6 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -665,7 +671,6 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
         # three. Asserting it on the other two would pass on the wrong message.
         for label in (
             "now-current range",
-            "issue-index append-only",
         ):
             with self.subTest(gate=label):
                 reason = self.skip_reason(report, label)
@@ -761,7 +766,6 @@ class StderrIsNotTheValueTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -817,7 +821,6 @@ class StderrIsNotTheValueTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):

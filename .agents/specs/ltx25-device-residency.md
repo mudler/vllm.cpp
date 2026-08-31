@@ -2186,7 +2186,7 @@ owed to whoever next has that checkout.
 
 *The index row could not be corrected in place, and this paragraph is the
 correction.* [#1451](https://github.com/mudler/vllm.cpp/issues/1451)'s row in
-[`issue-index.md`](../issue-index.md) carries the same overreach. That file is
+[`issue-index.md`](../completed/issue-index.md) carries the same overreach. That file is
 append-only and carries `merge=union`, so editing the row means a REMOVED line —
 which `check-issue-index-append-only.py` refuses, and which union-merge would
 DUPLICATE rather than merge. Appending a second #1451 row would be worse than the

@@ -54,7 +54,7 @@ In scope:
   on the full commit oid **and** the exact rendered error string.
 - Executable scope proof in `tests/scripts/test_check_commit_trailers.py`.
 - The [#1262](https://github.com/mudler/vllm.cpp/issues/1262) row in
-  [`issue-index.md`](../issue-index.md), which the issue currently lacks.
+  [`issue-index.md`](../completed/issue-index.md), which the issue currently lacks.
 
 Out of scope, deliberately:
 

@@ -195,7 +195,7 @@ TEST_CASE("qwen4_exp: the KV spec publishes THREE groups over REAL layer names")
     CHECK(spec->page_size_bytes() == 3391504);
   }
 
-  SUBCASE("group 2: the QSA indexer side cache, one key per FOUR tokens") {
+  SUBCASE("group 2: the QSA indexer side cache, one raw key per TOKEN") {
     const auto& g = kv.kv_cache_groups[2];
     REQUIRE(g.kv_cache_spec != nullptr);
     // MLA, not full attention. A `FullAttentionSpec` third group is absorbed by
@@ -212,12 +212,19 @@ TEST_CASE("qwen4_exp: the KV spec publishes THREE groups over REAL layer names")
     REQUIRE(spec != nullptr);
     CHECK(spec->num_kv_heads == 1);
     CHECK(spec->head_size == 128);
-    CHECK(spec->compress_ratio == 4);
-    CHECK(spec->storage_block_size() == 4);
-    // storage_block * 1 * 128 * 2. NO factor 2 for a V that does not exist:
-    // 64 B per token per layer, a quarter of a per-token index cache.
-    CHECK(spec->page_size_bytes() == 1024);
-    CHECK(spec->page_size_bytes() / 16 == 64);
+    // W5h: ONE ROW PER TOKEN. `indexer_compress_ratio` is the indexer's
+    // ALGORITHM and not this cache's page geometry — upstream stores the RAW
+    // per-token key and rebuilds the pooled block keys every step
+    // (`modeling_qwen4_exp.py:655`, `cache_utils.py:346`, `:678-681`). The
+    // dedicated case at the end of this file carries the full oracle citation
+    // and the capacity law; these two lines are the shape assertions that stay
+    // beside the rest of the group.
+    CHECK(spec->compress_ratio == 1);
+    CHECK(spec->storage_block_size() == 16);
+    // block_size * 1 * 128 * 2. NO factor 2 for a V that does not exist:
+    // 256 B per token per layer, which is what a per-token index cache costs.
+    CHECK(spec->page_size_bytes() == 4096);
+    CHECK(spec->page_size_bytes() / 16 == 256);
   }
 
   SUBCASE("every published name resolves to a distinct in-range layer index") {
@@ -322,25 +329,26 @@ TEST_CASE("qwen4_exp: the uniform recurrent group is 49.2 MiB of deliberate slac
   // layers at 32768 B plus 12 side caches at 1024 B; the recurrent group
   // contributes nothing here because its state is sized per sequence slot and
   // not per block.
-  CHECK(vllm::v1::KVBytesPerBlock(a) == 12 * 32768LL + 12 * 1024LL);
-  CHECK(vllm::v1::KVBytesPerBlock(a) == 405504);
+  CHECK(vllm::v1::KVBytesPerBlock(a) == 12 * 32768LL + 12 * 4096LL);
+  CHECK(vllm::v1::KVBytesPerBlock(a) == 442368);
 }
 
 // ─── 3. The refusals, each naming what it refuses ────────────────────────────
 
 TEST_CASE("qwen4_exp: the KV spec refuses BY NAME what it cannot size") {
-  SUBCASE("a block size the compress ratio does not divide") {
-    // `storage_block_size()` is INTEGER division
-    // (`kv_cache_interface.py:393-395`). At block 18 / ratio 4 the page is
-    // sized for 4 states while the block still covers 18 tokens, so the last
-    // partial state has nowhere to go: a short cache, not a crash.
-    const std::string msg = ThrowText(FixtureDoc(), 18, 8);
-    CHECK(msg.find("qwen4_exp KV spec") != std::string::npos);
-    CHECK(msg.find("indexer_compress_ratio") != std::string::npos);
-    CHECK(msg.find("storage_block_size") != std::string::npos);
-    CHECK(msg.find("18") != std::string::npos);
-    // 16 and 4 divide, so the same config at the production block size does not
-    // throw — the refusal is scoped to the defect and not to the model.
+  SUBCASE("a block size the compress ratio does not divide is NOT refused") {
+    // W5h RETIRED THIS REFUSAL, and the replacement is in the dedicated case at
+    // the end of this file rather than here. It read `block_size %
+    // indexer_compress_ratio == 0` and argued that `storage_block_size()`
+    // truncates under integer division (`kv_cache_interface.py:393-395`) — true
+    // of a COMPRESSED page, and this page is not one: upstream's indexer cache
+    // holds one RAW key per token (`modeling_qwen4_exp.py:655`,
+    // `cache_utils.py:346`). At `compress_ratio` 1 there is no division.
+    //
+    // ASSERTED AS AN ACCEPTANCE, not deleted, so a reinstated ratio reds here
+    // AND in the capacity case. A deleted SUBCASE would leave the reinstatement
+    // invisible.
+    CHECK(ThrowText(FixtureDoc(), 18, 8).empty());
     CHECK(ThrowText(FixtureDoc(), 16, 8).empty());
     CHECK(ThrowText(FixtureDoc(), 4, 8).empty());
   }
@@ -399,4 +407,109 @@ TEST_CASE("qwen4_exp: publishing an MLA group makes --kv-cache-dtype fp8 REFUSE"
   }
   CHECK(msg.find("MLA KV cache") != std::string::npos);
   CHECK(msg.find("fp8_ds_mla") != std::string::npos);
+}
+
+// ─── 5. THE INDEXER SIDE CACHE HOLDS ONE RAW KEY PER TOKEN (W5h) ─────────────
+//
+// FOUND BY TRYING TO SERVE. The three published groups are what the runner
+// allocates on the multi-cache path, and the QSA indexer side cache is the one
+// the model cannot read: `Qwen4ExpQsaIndex` refuses `kv_len > index_key.shape[0]`
+// (`src/vllm/model_executor/models/qwen4_exp_qsa_block.cpp:168`) over a
+// `[max_kv, indexer_head_dim]` cache whose rows are TOKENS, and W5c-1 published
+// a group sized for one row per FOUR of them.
+//
+// THE ORACLE DECIDES THIS, AND IT IS NOT AMBIGUOUS. transformers 5.16.0
+// (`.agents/oracles/transformers.md`, sha256
+// `77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459`):
+//
+//   * `modeling_qwen4_exp.py:655` — `raw_keys = past_key_values.update_indexer(
+//     raw_keys, self.layer_idx)`, and `raw_keys` is `token_k.reshape(
+//     batch, seq, -1, index_head_dim).squeeze(2)` (`:645-646`): ONE UN-NORMED,
+//     UN-ROPED KEY PER TOKEN.
+//   * `cache_utils.py:340` — "Update the indexer key cache by concatenation,
+//     and return the full indexer keys", `:346` returning
+//     `[batch_size, total_len, index_head_dim]`; the static-cache arm at
+//     `:666-674` says the same in a preallocated buffer,
+//     `[batch_size, max_cache_len, index_head_dim]`.
+//   * `modeling_qwen4_exp.py:678-681` — the POOLED block keys are recomputed
+//     from those raw keys EVERY step
+//     (`raw_keys[batch_idx].index_select(0, block_token_indices.flatten())`
+//     then `.float().mean(dim=1)`). Nothing caches a pooled key, so nothing in
+//     this model stores one row per `compress_ratio` tokens.
+//
+// `compress_ratio` is therefore the INDEXER'S ALGORITHM (`block_topk =
+// token_budget // compress_ratio`, `:622`) and not this cache's page geometry.
+// A spec that puts it in the page geometry sizes the allocation at a quarter of
+// what the model must store.
+//
+// THE SECOND CONSEQUENCE IS A BUFFER OVERRUN AND NOT MERELY A SHORT CACHE. The
+// runner allocates `num_blocks * page_size_bytes()` bytes — and
+// `MLAAttentionSpec::real_page_size_bytes` computes that off `storage_block_size()`
+// (`src/vllm/v1/kv_cache_interface.cpp:151-152`) — while the `PagedKvCache`
+// view it hands the forward carries `kv.block_size = fa_dims[i].block_size`,
+// which is the spec's OWN `block_size` (`src/vllm/v1/worker/gpu/runner.cpp:1532`
+// against `:1333`). At `compress_ratio` 4 the view claims 16 rows per page over
+// an allocation of 4, so any consumer that trusts the view reads 4x past it.
+// The two agree exactly when `storage_block_size() == block_size`.
+TEST_CASE(
+    "qwen4_exp: the indexer side cache holds ONE raw key per token, not one "
+    "per compress_ratio tokens") {
+  const int kBlock = 16;
+  const int kBlocks = 8;
+  const KVCacheConfig kv = MakeThroughRegistry(FixtureDoc(), kBlock, kBlocks);
+  REQUIRE(kv.kv_cache_groups.size() == 3);
+
+  const auto* qsa =
+      dynamic_cast<const FullAttentionSpec*>(kv.kv_cache_groups[0].kv_cache_spec.get());
+  const auto* idx =
+      dynamic_cast<const MLAAttentionSpec*>(kv.kv_cache_groups[2].kv_cache_spec.get());
+  REQUIRE(qsa != nullptr);
+  REQUIRE(idx != nullptr);
+
+  // DERIVED FROM GROUP 0, NEVER FROM THE CONSTANT. The paged K/V group defines
+  // how many TOKEN slots the allocation covers; asserting the indexer against
+  // `16` would be a tautology that lets both move together
+  // (`.agents/verification.md`, and MEMORY's "asserting against the constant").
+  const int64_t token_slots =
+      static_cast<int64_t>(qsa->block_size) * kv.num_blocks;
+  const int64_t indexer_rows =
+      static_cast<int64_t>(idx->storage_block_size()) * kv.num_blocks;
+  CHECK_MESSAGE(indexer_rows == token_slots,
+                "the indexer side cache holds "
+                    << indexer_rows << " rows for " << token_slots
+                    << " token slots; upstream stores one raw key per token "
+                       "(modeling_qwen4_exp.py:655, cache_utils.py:346)");
+
+  // The page-geometry half, stated separately so a reader sees WHICH of the two
+  // moved when this reds: the view the runner hands the forward carries
+  // `block_size`, the allocation is `storage_block_size()`.
+  CHECK(idx->storage_block_size() == idx->block_size);
+  CHECK(idx->compress_ratio == 1);
+
+  // K ONLY, one vector per token: `num_kv_heads * head_size * sizeof(bf16)`.
+  // 256 B per token per layer, FOUR times the 64 B W5c-1 published.
+  CHECK(idx->page_size_bytes() ==
+        static_cast<int64_t>(idx->block_size) * idx->num_kv_heads *
+            idx->head_size * static_cast<int64_t>(vt::SizeOf(idx->dtype)));
+  CHECK(idx->page_size_bytes() / idx->block_size == 256);
+
+  // AND THE CAPACITY IS WHAT THE CONSUMER REFUSES ON. `Qwen4ExpQsaIndex` throws
+  // when `kv_len > index_key.shape[0]`, so a sequence that fills the paged K/V
+  // must fit the side cache. That is the same equality above, expressed as the
+  // condition the model actually tests, so a future spec that satisfies one and
+  // not the other cannot pass both.
+  CHECK(token_slots <= indexer_rows);
+
+  // NON-DIVIDING BLOCK SIZES ARE ORDINARY NOW. 18 was refused by W5c-1 because
+  // `storage_block_size()` truncates under integer division; at ratio 1 there is
+  // nothing to truncate, and the capacity law must still hold.
+  const KVCacheConfig odd = MakeThroughRegistry(FixtureDoc(), 18, 8);
+  const auto* odd_qsa =
+      dynamic_cast<const FullAttentionSpec*>(odd.kv_cache_groups[0].kv_cache_spec.get());
+  const auto* odd_idx =
+      dynamic_cast<const MLAAttentionSpec*>(odd.kv_cache_groups[2].kv_cache_spec.get());
+  REQUIRE(odd_qsa != nullptr);
+  REQUIRE(odd_idx != nullptr);
+  CHECK(static_cast<int64_t>(odd_idx->storage_block_size()) * odd.num_blocks ==
+        static_cast<int64_t>(odd_qsa->block_size) * odd.num_blocks);
 }

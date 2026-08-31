@@ -56,6 +56,11 @@ ROLE_ONLY=0
 # third state, so every consumer that reads only the return code reads a SKIP as
 # success. There was exactly one such consumer (#998).
 FAIL_ON_SKIP=0
+
+# Checkers the range and trailer blocks below invoke WITH arguments. The
+# discovered sweep skips these names so a gate that already ran properly is not
+# re-run bare and reported as a usage skip.
+NAMED_CHECKERS="check-agent-record.py check-commit-style.py check-commit-trailers.py check-now-current.py"
 # ON by default: an undeclared session is a FAILING gate. The mutation suite
 # anchors on THIS line (`^REQUIRE_ROLE=1$`) and refuses any line-anchored
 # assignment of zero, quoted or not, so a silent revert of the default goes red
@@ -117,7 +122,6 @@ SUITES=(
   test_check_prompt_contract
   test_agent_gates
   test_agent_record
-  test_check_issue_index_append_only
   test_check_release_binary_contract
   test_release_manifest
   test_release_archive
@@ -164,6 +168,7 @@ SUITES=(
   test_main_baseline
   test_agent_preflight_skip_report
   test_agent_pr_body
+  test_agent_issue_index
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
   test_check_conflict_markers
@@ -483,6 +488,35 @@ run "commit style suites" python3 -m unittest \
 # no GPU and no wheel.
 run "tools suites" python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
 
+# EVERY checker in scripts/, DISCOVERED the same way and for the same reason.
+#
+# This block used to name five: check-agent-record, check-commit-style,
+# check-commit-trailers, check-issue-index-append-only and check-now-current.
+# There are 42. "All gates green." therefore described 12% of the gates, and the
+# other 37 reached the working tree only where their own test suite happened to
+# call them against the real ROOT -- a property of the test, not of the gate
+# (#467). A named list is also the record-lock shape AGENTS.md §Records forbids:
+# every new checker would have to edit one shared line here.
+#
+# A checker that needs arguments this block cannot supply is a SKIP carrying the
+# reason, never silence. The argparse USAGE TEXT is what distinguishes that case,
+# not the exit code: rc 2 is argparse's usage error AND a legitimate verdict in
+# at least one checker here, so keying on the code alone would read a real red as
+# "needs arguments" and drop it from the report.
+for checker in scripts/check-*.py; do
+  name="$(basename "$checker")"
+  case " $NAMED_CHECKERS " in *" $name "*) continue ;; esac
+  if output=$(python3 "$checker" 2>&1); then
+    printf '  \033[32mok\033[0m   %s\n' "$name"
+  elif printf '%s' "$output" | grep -qE 'the following arguments are required|expected one argument|usage: '; then
+    skip "$name" "needs arguments preflight does not supply: $(printf '%s' "$output" | head -1)"
+  else
+    printf '  \033[31mFAIL\033[0m %s\n' "$name"
+    printf '%s\n' "$output" | sed 's/^/         /' | head -12
+    failed+=("$name")
+  fi
+done
+
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
 # --staged block: `--staged` inspects staged paths and is therefore VACUOUS after
 # `git commit`, which is when preflight normally runs -- so the obligation went
@@ -499,16 +533,12 @@ if [ -z "$BASE_SHA" ]; then
   echo "Committed range vs ${BASE_REF}:"
   skip "now-current range" "$BASE_UNRESOLVED"
   skip "doc-checkpoint range" "$BASE_UNRESOLVED"
-  skip "issue-index append-only" "$BASE_UNRESOLVED"
 elif [ "$RANGE_STATUS" -ne 0 ] || [ "$RANGE_NUMERIC" -eq 0 ]; then
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
   skip "now-current range" "$RANGE_UNKNOWN"
-  skip "issue-index append-only" "$RANGE_UNKNOWN"
 elif [ "$RANGE_COUNT" -gt 0 ]; then
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
   run "now-current range" python3 scripts/check-now-current.py \
-    --base "$BASE_SHA" --head HEAD
-  run "issue-index append-only" python3 scripts/check-issue-index-append-only.py \
     --base "$BASE_SHA" --head HEAD
 else
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}: empty, HEAD adds no commits."

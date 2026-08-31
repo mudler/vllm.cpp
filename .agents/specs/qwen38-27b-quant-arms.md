@@ -976,7 +976,7 @@ which are already head-based — were left alone. Ranges and comma lists were
 remapped endpoint by endpoint.
 
 **One surface is deliberately NOT repaired.**
-[`issue-index.md`](../issue-index.md) carries three of those citations inside
+[`issue-index.md`](../completed/issue-index.md) carries three of those citations inside
 issue #1411's row, and `AGENTS.md` §"Every change starts from an issue" says the
 index is append-only and that a row is never edited. A stale line number inside
 a closed-or-open issue row is the cost of that rule, and paying it by editing
@@ -1942,7 +1942,7 @@ them:
   and diagnosing it is a kernel investigation rather than a gate re-run. **No
   issue is filed for it yet**, because W3 had no authority to open one; the
   operator dispatching the repair owns filing it and linking it in
-  [`issue-index.md`](../issue-index.md). Until then it is owned by
+  [`issue-index.md`](../completed/issue-index.md). Until then it is owned by
   `QUANT-QWEN38-27B-GGUF-ARM` and tracked by
   [#821](https://github.com/mudler/vllm.cpp/issues/821), whose GGUF-arm
   acceptance bullet it is.

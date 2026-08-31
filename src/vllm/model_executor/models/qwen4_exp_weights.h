@@ -271,6 +271,15 @@ class Qwen4ExpLoadedModel final : public LoadedModel {
                       Qwen4ExpWeights weights)
       : LoadedModel(registration), weights_(std::move(weights)) {}
   const Qwen4ExpWeights& weights() const { return weights_; }
+  // NON-CONST, and it is not a convenience. `Qwen4ExpMoeBlockWeights`
+  // (W5d-4) takes its `Qwen4ExpMoeWeights&` by non-const reference because
+  // the per-expert views BORROW the tower's bytes: `OwnedBytes::KeepAlive()`
+  // converts an owned buffer into a shared read-only one IN PLACE. The layer
+  // loop calls that adapter once per MoE layer, so it needs a mutable handle,
+  // and a `const_cast` at the call site would hide a real mutation behind a
+  // cast a reader has to disbelieve. The object is genuinely non-const — this
+  // class owns it by value — so the accessor is the honest spelling.
+  Qwen4ExpWeights& weights() { return weights_; }
 
  private:
   Qwen4ExpWeights weights_;

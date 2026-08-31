@@ -1,8 +1,13 @@
 # THE ENFORCEMENT FLOOR for the diff-scoped gates on `main`.
 #
-# One commit sha. The gates that walk `BASE..HEAD` -- the two trailer steps of
-# `commit-protocol-tag`, `documentation-checkpoint`, and `agent-record`'s role
-# discipline step -- never start behind it. `scripts/ci-walk-base.py` reads this
+# One commit sha. The gates that walk `BASE..HEAD` -- `documentation-checkpoint`
+# and `agent-record`'s role discipline step -- never start behind it.
+#
+# The two trailer steps of `commit-protocol-tag` were governed by this floor
+# until #2322 and are not any more. They now run on the PULL-REQUEST lane only,
+# so they never read a commit that is already on `main`, and a floor exists
+# precisely to forgive commits that are. Nothing about the current value changes:
+# it still forgives the same 42 commits for the gates that DO walk `main`. `scripts/ci-walk-base.py` reads this
 # file and takes the base as the newer of the last GREEN push run and this
 # commit, decided by ancestry.
 #

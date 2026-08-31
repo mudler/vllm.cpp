@@ -143,6 +143,34 @@ inline HfConfig MakeConfig() {
   return c;
 }
 
+// MODEL-TEXT-GLM-MOE-DSA W3 (#2214, spec §3.7 G3). The SAME model, widened past
+// the two dimensions `MakeConfig` cannot discriminate on.
+//
+// WHY 4x4 IS NOT ENOUGH, and this is the fixture's own recorded gap: spec §3.2
+// gap 7 quotes `expert-streaming.md` `## Owed` saying "no test model has more
+// than 4 experts or 4 layers". Both bounds hide a whole class of ordering
+// defect. With `num_experts == num_experts_per_tok * 2` the routed set is half
+// the tower, so an expert index that is off by a constant, folded modulo the
+// expert count, or silently clamped still lands on a real expert and the logits
+// stay finite. With 4 layers and 3 towers the slice offsets `e * I` and `e * H`
+// stay small enough that a row-offset scaled by the wrong one of the two
+// dimensions can still land inside the tower. Widening to 6 layers and 8
+// experts at top-3 makes the routed set a minority of the tower and pushes the
+// largest offset past every smaller stride, so those cases point outside the
+// slice they were meant to name.
+//
+// The layer pattern keeps two full-attention layers rather than one, so the MoE
+// blocks are not all reached through the same attention arm.
+inline HfConfig MakeWideConfig() {
+  HfConfig c = MakeConfig();
+  c.num_hidden_layers = 6;
+  c.layer_types = {"linear_attention", "linear_attention", "full_attention",
+                   "linear_attention", "linear_attention", "full_attention"};
+  c.num_experts = 8;
+  c.num_experts_per_tok = 3;
+  return c;
+}
+
 inline vllm::MoeBlockWeights MakeKqMoe(const HfConfig& c, uint64_t s) {
   vllm::MoeBlockWeights m;
   const int64_t H = c.hidden_size, E = c.num_experts, I = c.moe_intermediate_size,

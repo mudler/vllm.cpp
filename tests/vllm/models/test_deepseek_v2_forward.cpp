@@ -461,6 +461,86 @@ TEST_CASE("deepseek-v2 forward: CPU synthetic runs, finite, deterministic") {
   CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
 }
 
+// W4 (#2214). `_get_moe_router_dtype` (deepseek_v2.py:123-133) makes the MoE
+// gate's OUTPUT dtype f32 for `moe_router_dtype: "float32"` and for
+// `model_type == "glm_moe_dsa"`; `MoeBlock` (deepseek_v2.cpp:363) sizes `dlog`
+// from the resolved flag.
+//
+// ─── WHAT THIS CASE FOUND, and it is the reason it reads as it does ─────────
+// The widened store has NO observable effect on this forward. Measured, not
+// assumed: over the tiny fixture's 500 output logits the f32 arm and the bf16
+// arm are BIT-IDENTICAL — `differing = 0/500`, `maxabs = 0`. The router logits
+// feed a softmax and a top-2 whose weights are already f32, and every
+// activation downstream of the combine is stored at bf16, so the ~4e-3 relative
+// rounding the wider store removes is re-introduced two ops later and never
+// reaches the vocabulary projection.
+//
+// THAT IS THE STANDING HAZARD ITSELF, not a defect in the change: a dtype that
+// is merely too WIDE moves twice the bytes and emits the same tokens, so no
+// token gate and no numerical gate can see it. Forcing `DType::kF32`
+// unconditionally at `deepseek_v2.cpp:363` leaves every other case in this file
+// green, which was also measured.
+//
+// SO WHAT ACTUALLY GATES THE fp32 ROUTER, in three parts, none of which is this
+// case alone:
+//   1. the PARSE agrees with the pinned oracle's own return values on eight
+//      configs — `test_glm_moe_dsa_schedule.cpp`, and neutering the parse reds
+//      two cases there;
+//   2. an f32 GEMM store and a bf16 one genuinely DIFFER, on products chosen to
+//      be exact for any reduction order — same file, 13 of 24 elements;
+//   3. this case: the f32 arm RUNS end to end. `vt::MoeRouterTopK` accepts the
+//      wider logits, nothing throws, the result is finite, and each arm is
+//      deterministic. A `dlog` the router could not consume would red here.
+// The SELECTION of the dtype from the flag at `:363` is proven by reading, and
+// that residue is recorded as `## Owed` O18 in the row's spec rather than left
+// for a later reader to rediscover.
+//
+// The bit-identity below is asserted rather than merely noted, as a TRIPWIRE:
+// if a later change makes the router dtype observable here, this case reds and
+// whoever made it observable re-reads this comment. It is not a claim that the
+// two arms must always agree.
+TEST_CASE("deepseek-v2 forward: the fp32 router arm RUNS, and is invisible to this forward") {
+  const HfConfig cfg = vllm::LoadHfConfig(WriteTinyConfig("tiny", 1, 2));
+  DeepseekV2Params p = vllm::ParseDeepseekV2Params(cfg);
+  // The tiny config declares no `moe_router_dtype`, which is upstream's None.
+  REQUIRE_FALSE(p.router_dtype_is_f32);
+  REQUIRE(p.n_routed_experts > 0);
+  REQUIRE(p.is_moe_layer(1));
+
+  DeepseekV2Weights w = TinyWeights(p);
+  const std::vector<float> bf16 = RunTiny(w);
+  REQUIRE(!bf16.empty());
+  for (float x : bf16) REQUIRE(std::isfinite(x));
+
+  w.params.router_dtype_is_f32 = true;
+  const std::vector<float> f32 = RunTiny(w);
+  REQUIRE(f32.size() == bf16.size());
+  // The f32 router logits flowed through `vt::MoeRouterTopK` and the combine.
+  for (float x : f32) REQUIRE(std::isfinite(x));
+
+  int differing = 0;
+  double maxd = 0.0;
+  for (size_t i = 0; i < bf16.size(); ++i) {
+    if (bf16[i] != f32[i]) ++differing;
+    maxd = std::max(maxd,
+                    std::abs(static_cast<double>(bf16[i]) - static_cast<double>(f32[i])));
+  }
+  INFO("the router dtype became observable in this forward (differing=", differing,
+       " maxabs=", maxd, "); re-read the comment above this case — the fp32 "
+       "router may now be gateable numerically, which it was not when W4 landed");
+  CHECK(differing == 0);
+  CHECK(maxd == 0.0);
+
+  // Each arm is deterministic, so the comparison above is a dtype statement and
+  // not a run-to-run one.
+  w.params.router_dtype_is_f32 = false;
+  const std::vector<float> bf16_again = RunTiny(w);
+  CHECK(std::memcmp(bf16.data(), bf16_again.data(), bf16.size() * sizeof(float)) == 0);
+  w.params.router_dtype_is_f32 = true;
+  const std::vector<float> f32_again = RunTiny(w);
+  CHECK(std::memcmp(f32.data(), f32_again.data(), f32.size() * sizeof(float)) == 0);
+}
+
 TEST_CASE("deepseek-v2 forward: fusion-catalog ADOPT == hand-call fallback") {
   const HfConfig cfg = vllm::LoadHfConfig(WriteTinyConfig("tiny", 1, 2));
   const DeepseekV2Params p = vllm::ParseDeepseekV2Params(cfg);

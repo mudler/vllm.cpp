@@ -33,9 +33,11 @@
 // (single-GB10 oracle run) is therefore MEMORY-INFEASIBLE, not merely disk-blocked.
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -142,6 +144,35 @@ DeepseekV4Params ParseDeepseekV4Params(const HfConfig& config);
 // shape, NOT by the real checkpoint loader — the FP8-block + NVFP4 tower
 // MATERIALIZATION into this layout is the named W2b residual. All tensors row-major
 // fp32 unless noted.
+// MODEL-DSV4-EXL3 W1d (#2186): the FP8-sourced half of the carried tower is held
+// at the MODEL dtype rather than widened to f32. vLLM resolves ONE model dtype and
+// every layer inherits it (AGENTS.md, "Inherit vLLM defaults"); these tensors are
+// stored `F8_E4M3` + `F8_E8M0` block scales on disk, so there is no f32 anywhere in
+// their lineage and materializing them at four bytes was a 4x inflation with no
+// numerical claim behind it. On DeepSeek-V4-Flash this half costs 10.91 GiB at
+// bf16 against 21.82 GiB at f32, which takes the artifact's total residency from
+// 108.59 GiB to ~97.7 GiB against 119.63 GiB physical -- the difference between an
+// artifact that loads and one that refuses (#2186).
+//
+// The elements are BF16 BIT PATTERNS, not integers. Read them through
+// `vt::BF16ToF32` and write them through `vt::F32ToBF16`; a `uint16_t` that reaches
+// arithmetic unconverted is a bug this alias exists to make visible at the use site.
+using HostBf16 = std::vector<uint16_t>;
+
+// Widen ONE carried-tower element. Inline, and in this header, deliberately:
+// `vt::BF16ToF32` is defined out of line in `src/vt/dtype.cpp` and this build
+// enables no LTO, so calling it from the innermost loop of a carried-tower GEMV
+// would be a function call PER ELEMENT -- which costs more than halving the
+// memory traffic saves, and would make the bf16 arm slower than the f32 one it
+// replaces. This is the SAME bit operation (`AsF32(b << 16)`,
+// `src/vt/dtype.cpp:341`): bf16 is the top 16 bits of an f32, so widening is
+// exact for every one of the 65536 patterns, NaN and Inf included.
+// `test_deepseek_v4_exl3_loader.cpp` asserts that agreement exhaustively rather
+// than trusting this comment.
+inline float HostBf16ToF32(uint16_t b) {
+  return std::bit_cast<float>(static_cast<uint32_t>(b) << 16);
+}
+
 struct DeepseekV4LayerHostWeights {
   // MHC mixing (nvidia/model.py:820-865): hc_attn/hc_ffn fn [(2+hc)*hc, hc*H],
   // base [(2+hc)*hc], scale [3]; the attn/ffn RMSNorms folded into the pre-mix.
@@ -151,14 +182,14 @@ struct DeepseekV4LayerHostWeights {
   std::vector<float> hc_ffn_fn, hc_ffn_base, hc_ffn_scale;
   // 512-wide MLA (attention.py): q down/up, kv down, per-branch RMSNorms,
   // per-head attention sink, grouped OUTPUT-LoRA wo_a (bmm) + wo_b.
-  std::vector<float> wq_a;            // [q_lora_rank, H]
+  HostBf16 wq_a;                      // [q_lora_rank, H]            (FP8-sourced)
   std::vector<float> q_norm_weight;   // [q_lora_rank]
-  std::vector<float> wq_b;            // [n_heads*head_dim, q_lora_rank]
-  std::vector<float> wkv;             // [head_dim, H]
+  HostBf16 wq_b;                      // [n_heads*head_dim, q_lora_rank] (FP8-sourced)
+  HostBf16 wkv;                       // [head_dim, H]               (FP8-sourced)
   std::vector<float> kv_norm_weight;  // [head_dim]
   std::vector<float> attn_sink;       // [n_heads]
-  std::vector<float> wo_a;            // [n_groups, o_lora_rank, in_per_group]
-  std::vector<float> wo_b;            // [H, n_groups*o_lora_rank]
+  HostBf16 wo_a;                      // [n_groups, o_lora_rank, in_per_group] (FP8)
+  HostBf16 wo_b;                      // [H, n_groups*o_lora_rank]    (FP8-sourced)
   // DSA compressor + Lightning-Indexer (those layers only; empty otherwise).
   //
   // TWO GEOMETRIES MEET IN THESE SLOTS, and the shapes below are the LOADED ones
@@ -170,7 +201,7 @@ struct DeepseekV4LayerHostWeights {
   // `[index_n_heads*index_head_dim, H]`, `idx_wk` as `[index_head_dim, H]`), so
   // where the two differ it REFUSES BY NAME rather than reading either. They
   // coincide exactly where `coff` is 1 — every `compress_ratio != 4` layer.
-  std::vector<float> idx_wq;     // [index_n_heads*index_head_dim, q_lora_rank]
+  HostBf16 idx_wq;               // [index_n_heads*index_head_dim, q_lora_rank] (FP8)
   std::vector<float> idx_wk;     // [coff*index_head_dim, H]
   std::vector<float> idx_wproj;  // [index_n_heads, H]  (not widened upstream)
   std::vector<float> comp_wgate;        // [coff*head_dim, H]  (the pool score)
@@ -181,8 +212,8 @@ struct DeepseekV4LayerHostWeights {
   std::vector<float> gate_bias;    // [n_routed_experts]  (non-hash layers)
   std::vector<int32_t> tid2eid;    // [vocab, num_experts_per_tok] (hash layers)
   // Shared + routed experts (clamped SwiGLU). Routed stored flat over experts.
-  std::vector<float> shared_w1, shared_w3;  // [moe_inter, H]
-  std::vector<float> shared_w2;             // [H, moe_inter]
+  HostBf16 shared_w1, shared_w3;            // [moe_inter, H]         (FP8-sourced)
+  HostBf16 shared_w2;                       // [H, moe_inter]         (FP8-sourced)
   std::vector<float> exp_w1, exp_w3;        // [n_experts, moe_inter, H]
   std::vector<float> exp_w2;                // [n_experts, H, moe_inter]
 };
@@ -281,6 +312,104 @@ struct DeepseekV4Exl3Expert {
 struct DeepseekV4Exl3LayerWeights {
   std::vector<DeepseekV4Exl3Expert> experts;
 };
+// ── The MTP (nextn) tail, CLASSIFIED ────────────────────────────────────────
+// `CLAIM-DEEPSEEK-V4-MTP` R1 (#1314). The loader skips `mtp.*` wholesale, exactly
+// as vLLM does (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474),
+// because upstream gives the head to a SEPARATE model (`DeepSeekV4MTP`,
+// registry.py:617). Skipping is right; skipping BLIND is what cost this row a
+// week -- `deepseek-v4-mtp.md` §4 recorded the MTP gate as weight-BLOCKED while
+// this very loader was meeting 3985 draft-head tensors on each load and dropping
+// them without saying what they were.
+//
+// MEASURED on `/mnt/nas_share/rc/ckpt/dsv4-flash-0731-spark-exl3` (2026-08-31),
+// read from the safetensors headers. The head is NOT EXL3 even though the
+// checkpoint directory says exl3: only the MAIN model was requantized to trellis.
+// Per head, 32 non-expert tensors (0.175 GiB) plus 216 routed experts:
+//
+//   mtp.L.attn.*, mtp.L.ffn.shared_experts.*   F8_E4M3 weight + F8_E8M0 scale,
+//                                              blocks of EXACTLY 128x128
+//   mtp.L.ffn.experts.E.w{1,2,3}               I8-packed e2m1 [N, K/2] +
+//                                              F8_E8M0 scale [N, K/32] -- group
+//                                              32, i.e. MXFP4, NOT NVFP4's 16
+//   norms, gate, hc_*, attn_sink               BF16 / F32, stored plainly
+//
+// Both quantized layouts already have readers here: `DequantFp8BlockToF32` and
+// `DequantMxfp4ToBf16`. That is what makes R1 an un-skip rather than a port.
+enum class DeepseekV4MtpFormat { kPlain, kFp8Block, kMxfp4 };
+
+// One `(name, dtype, shape)` triple. Deliberately NOT an `StTensor`: classifying
+// must not require a mapped 100 GB file, so the gate can state the real shapes
+// as data.
+struct DeepseekV4MtpTensorDesc {
+  std::string name;
+  std::string dtype;
+  std::vector<int64_t> shape;
+};
+
+struct DeepseekV4MtpInventory {
+  int64_t num_heads = 0;   // distinct `mtp.{L}` indices, NOT a config value: the
+                           // measured artifact carries THREE where the config
+                           // says `num_nextn_predict_layers = 1`, and three is
+                           // what makes a K5 draft possible upstream.
+  int64_t plain = 0;
+  int64_t fp8_block = 0;
+  int64_t mxfp4 = 0;
+  // Non-empty when a tensor carries a layout this arm has no reader for. It is a
+  // REPORT, not a throw: the 156.7 GiB NVFP4 checkpoint's tail uses the
+  // double-scale variant (`weight_scale` + `weight_scale_2` + `input_scale`), and
+  // refusing here would break loads that work today. The MTP lane reads this and
+  // refuses when it actually wants a head.
+  std::string refusal;
+};
+
+// PURE. Classifies the `mtp.*` tensors of a checkpoint. A `.scale` companion is
+// not classified on its own -- the `.weight` is classified and its scale must be
+// present with the right shape, because a weight whose scale is missing or
+// mis-shaped would otherwise read as a supported tensor and dequantize to noise.
+DeepseekV4MtpInventory ClassifyDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail);
+
+// ── R1b: the tail, ROUTED and KEPT QUANTIZED ────────────────────────────────
+// One head's routed experts are 5.44G values. Dequantized to host f32 that is
+// 20.2 GiB per head and 60.8 GiB for the three this artifact carries, so a host
+// float tower for the draft head does not exist as an option -- it would not fit
+// beside the target it is supposed to speed up. The tail is therefore BORROWED:
+// each view points into the shard's mmap and owns nothing, and a caller
+// dequantizes the one tensor it needs, when it needs it.
+struct DeepseekV4MtpTensorView {
+  DeepseekV4MtpFormat format = DeepseekV4MtpFormat::kPlain;
+  std::vector<int64_t> shape;      // the WEIGHT's shape, as stored
+  std::string dtype;               // the weight's dtype, for kPlain dispatch
+  const uint8_t* data = nullptr;   // borrowed: the shard mapping outlives this
+  const uint8_t* scale = nullptr;  // null for kPlain
+  // Logical width. For kMxfp4 the stored shape is [N, K/2] because two e2m1
+  // nibbles share a byte, so `in_dim` is 2 * shape[1] and NOT shape[1]. Getting
+  // this wrong halves the weight and still produces finite numbers.
+  int64_t out_dim = 0;
+  int64_t in_dim = 0;
+};
+
+struct DeepseekV4MtpHead {
+  // Keyed by the name with the `mtp.{L}.` prefix removed, so a consumer asks for
+  // `attn.wkv.weight` without knowing which head it is holding.
+  std::unordered_map<std::string, DeepseekV4MtpTensorView> tensors;
+};
+
+// PURE. Routes an already-classified tail into per-head borrowed views. `descs`
+// and `data`/`scale` pointers must correspond index-for-index.
+struct DeepseekV4MtpRouted {
+  std::vector<DeepseekV4MtpHead> heads;  // dense, indexed by the `mtp.{L}` index
+  std::string refusal;
+};
+DeepseekV4MtpRouted RouteDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail,
+    const std::vector<const uint8_t*>& payloads);
+
+// Dequantizes ONE borrowed view to f32, dispatching on its format. This is the
+// only place the two readers are chosen between, so a consumer cannot pick the
+// wrong one for a layout.
+std::vector<float> DequantizeDeepseekV4MtpTensor(const DeepseekV4MtpTensorView& v);
+
 struct DeepseekV4Exl3Weights {
   int tp = 0;            // the source artifact's tensor-parallel width
   int bits = 0;          // K
@@ -293,6 +422,26 @@ struct DeepseekV4Exl3Weights {
   // draft-head tensors, and a reader must be able to see that the loader met
   // them and chose to skip them.
   int64_t skipped_mtp_tensors = 0;
+  // What those skipped tensors ARE, classified rather than merely counted. See
+  // `ClassifyDeepseekV4MtpTail`. Filled on every safetensors load; consulted by
+  // the MTP lane when it asks whether this checkpoint can supply a draft head.
+  DeepseekV4MtpInventory mtp{};
+};
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the compressor's carried state, one entry per
+// layer. The compressor pools a CLOSED window into one row, so it is stateful
+// across steps and its failure mode is a plausible value several tokens after the
+// mistake. The caller owns this so the state's lifetime is explicit.
+struct DeepseekV4CompressorState {
+  std::vector<std::vector<float>> state_kv;
+  std::vector<std::vector<float>> state_score;
+  std::vector<std::vector<float>> comp_rows;
+
+  void Resize(int64_t num_layers) {
+    state_kv.assign(static_cast<size_t>(num_layers), {});
+    state_score.assign(static_cast<size_t>(num_layers), {});
+    comp_rows.assign(static_cast<size_t>(num_layers), {});
+  }
 };
 
 struct DeepseekV4Weights {
@@ -503,6 +652,63 @@ struct DeepseekV4KvCache {
 // the cache and attends the new query over the full cached KV — token-IDENTICAL to
 // the full-recompute path (a pure equivalence: same tokens, ~ctx x fewer FLOPs).
 // `logits_indices` are LOCAL indices into the tokens passed THIS call.
+// KV-DSV4-MULTICACHE W5 (#2323): resolve the per-layer SWA pages this forward
+// will read, or REFUSE by name.
+//
+// PURE, and deliberately so -- the same reason W1 made the staging budget a pure
+// function "so it is gateable without a device". Every safety-critical decision
+// of the paged path lives here: one request only, SWA-only layers only, and
+// every published name resolving. The registry adapter is then thin glue, and
+// these refusals are gateable without a runner, a checkpoint or a GPU.
+//
+// Returns an empty string on success and fills `out_pages`; otherwise returns
+// the refusal message and leaves `out_pages` untouched.
+std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
+                                      const MultiKvCacheIndex& multi_kv,
+                                      const std::vector<PagedKvCache>& attn_kv,
+                                      int num_reqs, vt::Device device,
+                                      std::vector<vt::Tensor>* out_pages);
+
+// KV-DSV4-MULTICACHE W5 (#2323): incremental decode over the RUNNER'S PAGES --
+// the paged counterpart of `DeepseekV4ForwardGgufCached`. `paged_kv` holds one
+// `[num_blocks, block_size, head_dim]` tensor per layer; `kv_base` is how many
+// keys they already hold. Dense-causal only: the indexer and compressor layers
+// refuse, and belong to `MODEL-DSV4-DSA-COMPOSE` (#2286).
+std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
+                                              vt::Queue& queue,
+                                              std::vector<vt::Tensor>& paged_kv,
+                                              int64_t kv_base,
+                                              const std::vector<int32_t>& token_ids,
+                                              const std::vector<int32_t>& positions,
+                                              const std::vector<int32_t>& logits_indices,
+                                              // DSV4-DSPARK-DRAFTER W-3 (#1314):
+                                              // the rows in `paged_kv` were written
+                                              // by the caller, so attend them and do
+                                              // NOT overwrite them. A drafter block's
+                                              // KV comes from the target's taps while
+                                              // its query comes from its own hidden
+                                              // state; nothing else in this tree has
+                                              // those two from different sources.
+                                              bool kv_prewritten = false,
+                                              // MODEL-DSV4-DSA-COMPOSE W1 (#2286):
+                                              // supply carried compressor state to
+                                              // enable the `compress_ratio == 128`
+                                              // arm. Null keeps the refusal.
+                                              DeepseekV4CompressorState* compressor =
+                                                  nullptr);
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the paged NON-GGUF forward. The GGUF paged
+// arm binds `gguf`, which forces `dsa_dense` and makes `is_comp` false on every
+// layer; this one binds the EXL3 tower instead, so the compressor predicate is
+// live and a `compress_ratio == 128` layer can take the composed arm when
+// `compressor` state is supplied. Null keeps the refusal.
+std::vector<float> DeepseekV4ForwardExl3Paged(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {},
+    DeepseekV4CompressorState* compressor = nullptr);
+
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,

@@ -375,7 +375,7 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
                                 int64_t o_s1, int64_t lse_s0, int64_t mid_s0, int64_t mid_s1,
                                 int64_t mid_s2, int v_head_dim, int num_splits,
                                 int win_left, const int32_t* __restrict__ sel_cnt,
-                                int topk) {
+                                int topk, const float* __restrict__ attn_sink) {
   const int b = static_cast<int>(blockIdx.x);
   const int h = static_cast<int>(blockIdx.y);
   const int seq_len = seq_lens[b];
@@ -393,8 +393,19 @@ __global__ void MlaDecodeStage2(T* __restrict__ out, float* __restrict__ lse,
   for (int d0 = 0; d0 < v_head_dim; d0 += static_cast<int>(blockDim.x)) {
     const int d = d0 + static_cast<int>(threadIdx.x);
     const bool active = d < v_head_dim;
-    float m = -CUDART_INF_F;
-    float l = 0.0f;
+    // THE PER-HEAD ATTENTION SINK belongs HERE, in stage 2, and nowhere else
+    // (KV-DSV4-MULTICACHE W5, #2323). It is one extra logit joining the softmax
+    // DENOMINATOR with no value attached, so it must be counted ONCE PER ROW.
+    // Seeding it in stage 1 instead would count it once PER SPLIT, and at
+    // `num_kv_splits == 1` -- the batch-invariant path -- both placements agree,
+    // so a gate that only ran there would pass a kernel wrong everywhere else.
+    //
+    // Same seeding as the CPU reference (`cpu_mla_attn.cpp`): the running max
+    // starts at the sink and the denominator at `exp(sink - sink) == 1`, with
+    // the accumulator left at zero. Null (every caller before W5) keeps the
+    // `-inf`/0 seeds and the combine is BIT-IDENTICAL.
+    float m = attn_sink != nullptr ? attn_sink[h] : -CUDART_INF_F;
+    float l = attn_sink != nullptr ? 1.0f : 0.0f;
     float acc = 0.0f;
     for (int s = 0; s < num_splits; ++s) {
       const int split_start = per_split * s;
@@ -659,6 +670,10 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   const int32_t* sel = args.topk_indices != nullptr ? args.topk_indices->Ptr<int32_t>() : nullptr;
   const int32_t* sel_cnt =
       args.valid_counts != nullptr ? args.valid_counts->Ptr<int32_t>() : nullptr;
+  // W5 (#2323): consumed by STAGE 2 only -- see the seeding comment there for why
+  // a split kernel must add the sink in the final reduction rather than per split.
+  const float* attn_sink =
+      args.attn_sink != nullptr ? args.attn_sink->Ptr<float>() : nullptr;
   const int64_t sel_s0 = sel != nullptr ? args.topk_indices->stride[0] : 0;
   const int sel_topk = sel != nullptr ? static_cast<int>(args.topk_indices->shape[1]) : 0;
 
@@ -693,7 +708,7 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   MlaDecodeStage2<T><<<grid2, static_cast<unsigned>(threads2), 0, s>>>(
       out.Ptr<T>(), lse != nullptr ? lse->Ptr<float>() : nullptr, mid, slp, out.stride[0],
       out.stride[1], lse != nullptr ? lse->stride[0] : 0, mid_s0, mid_s1, mid_s2, v_head_dim,
-      num_splits, win_left, sel_cnt, sel_topk);
+      num_splits, win_left, sel_cnt, sel_topk, attn_sink);
   Check(cudaGetLastError(), "stage2 launch");
 }
 

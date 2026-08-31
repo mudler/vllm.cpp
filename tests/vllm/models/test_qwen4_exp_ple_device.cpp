@@ -30,7 +30,11 @@
 // which sees everything and localises nothing. The dense conv-only goldens this
 // wave adds sit between them.
 //
-// SCOPE, HONESTLY. CPU only — no CUDA arm of this op exists, and one written on
+// SCOPE, HONESTLY. This file is the CPU arm's gate. A CUDA arm of this op DOES
+// now exist (`src/vt/cuda/cuda_qwen4_exp_ple.cu`, W6-CUDA) and is gated in
+// `test_qwen4_exp_cuda.cpp`, against these same goldens and against this arm;
+// nothing below runs on a device. The text that stood here said no CUDA arm
+// exists, and it read: CPU only — no CUDA arm of this op exists, and one written on
 // this CPU-only host could not be gated on it. Nothing calls this op from a
 // production entry point yet: `ModelRegistry::Forward` has no `qwen4_exp` arm,
 // the wiring is owned by row `MODEL-MM-QWEN4-EXP` and tracked by #2031 under
@@ -225,6 +229,101 @@ TEST_CASE("vt::Qwen4ExpPleConv: chunked prefill and decode equal the single shot
                                   ExpectedFor(dilation) + kConvSeqLen * kChannels);
     CHECK(MaxAbsDiff(chunked, want) < kTol);
   }
+}
+
+TEST_CASE("vt::Qwen4ExpPleConv: a bf16 RING carries state across calls, and rounds ONCE") {
+  // W5k (#2031). The oracle stores this cache slot at the MODEL dtype — each slot
+  // is allocated with the dtype of the tensor that first reaches it
+  // (`cache_utils.py:1019-1023`), and the tensor reaching it is `hidden_states`
+  // (`modeling_qwen4_exp.py:1157-1159`). Run at `dtype=torch.bfloat16` the pinned
+  // oracle reports `conv_states[1] dtype=torch.bfloat16`. Before this wave the op
+  // refused that ring outright, which is why the model's recurrent group (bf16)
+  // and this op (f32) could not be connected and `past_len > 0` was unreachable.
+  //
+  // THREE THINGS ARE ASSERTED, and the third is what makes this a gate rather
+  // than a smoke test:
+  //   1. the ring's stored bytes are EXACTLY the bf16 rounding of the raw inputs
+  //      — bit-exact, so an off-by-one column or a dropped store is visible;
+  //   2. a chunked run over a bf16 ring reproduces the oracle within bf16's own
+  //      resolution, so the carried state is being READ and not merely written;
+  //   3. the bf16 ring's answer DIFFERS from the same chunked run over an f32
+  //      ring. Without (3) the case would pass on an op that silently kept an f32
+  //      ring behind the caller's back, which is precisely the defect a "does it
+  //      run" assertion cannot see.
+  constexpr int64_t kDil = 3;
+  const int64_t state_len = StateLen(kDil);
+  Qwen4ExpPleConvArgs args;
+  args.dilation = kDil;
+
+  // Chunk the sequence so the SECOND call must read what the FIRST call stored.
+  const int64_t kSplit = 7;
+  REQUIRE(kSplit < kConvSeqLen);
+  REQUIRE(kConvSeqLen - kSplit > 0);
+
+  auto run_chunked = [&](DType ring_dt, std::vector<unsigned char>* ring_out) {
+    Queue q = CpuQ();
+    std::vector<float> w(kPleConv1dWeight, kPleConv1dWeight + kChannels * kKernel);
+    Tensor t_w = MakeT(w.data(), DType::kF32, {kChannels, kKernel});
+    std::vector<unsigned char> ring(
+        static_cast<size_t>(kChannels * state_len) * vt::SizeOf(ring_dt), 0);
+    Tensor t_state = MakeT(ring.data(), ring_dt, {1, kChannels, state_len});
+    std::vector<float> all;
+    int64_t lo = 0;
+    for (int64_t n : {kSplit, kConvSeqLen - kSplit}) {
+      std::vector<float> x(kConvInput + lo * kChannels,
+                           kConvInput + (lo + n) * kChannels);
+      std::vector<float> out(static_cast<size_t>(n * kChannels), 0.0f);
+      std::vector<int32_t> qsl{0, static_cast<int32_t>(n)};
+      Tensor t_x = MakeT(x.data(), DType::kF32, {n, kChannels});
+      Tensor t_out = MakeT(out.data(), DType::kF32, {n, kChannels});
+      Tensor t_qsl = MakeT(qsl.data(), DType::kI32, {2});
+      vt::Qwen4ExpPleConv(q, t_out, t_x, t_w, t_state, t_qsl, nullptr, args);
+      all.insert(all.end(), out.begin(), out.end());
+      lo += n;
+    }
+    if (ring_out != nullptr) *ring_out = ring;
+    return all;
+  };
+
+  std::vector<unsigned char> ring_bf16;
+  const std::vector<float> got_bf16 = run_chunked(DType::kBF16, &ring_bf16);
+  std::vector<unsigned char> ring_f32;
+  const std::vector<float> got_f32 = run_chunked(DType::kF32, &ring_f32);
+  REQUIRE(got_bf16.size() == static_cast<size_t>(kConvSeqLen * kChannels));
+
+  // (1) THE STORED BYTES, bit-exact against the bf16 rounding of the raw input.
+  // `update_conv_state` keeps the last `state_len` RAW columns
+  // (`cache_utils.py:1068`), so every stored value has a known preimage.
+  {
+    const auto* half = reinterpret_cast<const uint16_t*>(ring_bf16.data());
+    for (int64_t ch = 0; ch < kChannels; ++ch) {
+      for (int64_t c = 0; c < state_len; ++c) {
+        const int64_t token = kConvSeqLen - state_len + c;
+        INFO("channel ", ch, " state column ", c);
+        CHECK(half[static_cast<size_t>(ch * state_len + c)] ==
+              vt::F32ToBF16(kConvInput[token * kChannels + ch]));
+      }
+    }
+  }
+
+  // (2) THE ORACLE, within bf16's own resolution of it. A ring that was never
+  // read back would lose the second chunk's first `state_len` lags entirely and
+  // miss this by orders of magnitude, not by a rounding.
+  const std::vector<float> want(ExpectedFor(kDil),
+                                ExpectedFor(kDil) + kConvSeqLen * kChannels);
+  for (float v : got_bf16) REQUIRE(std::isfinite(v));
+  const double sep_bf16 = MaxAbsDiff(got_bf16, want);
+  INFO("bf16 ring vs the oracle: ", sep_bf16);
+  CHECK(sep_bf16 < 5e-2);
+
+  // (3) THE RING DTYPE IS LOAD-BEARING. The f32 arm is bit-exact against the
+  // oracle and the bf16 arm cannot be, because the carried columns round on the
+  // store — upstream rounds them too. If these two agreed exactly, the ring dtype
+  // the caller asked for would not be the ring dtype the op used.
+  CHECK(MaxAbsDiff(got_f32, want) < kTol);
+  CHECK(std::memcmp(got_bf16.data(), got_f32.data(),
+                    sizeof(float) * got_bf16.size()) != 0);
+  CHECK(sep_bf16 > MaxAbsDiff(got_f32, want));
 }
 
 TEST_CASE("vt::Qwen4ExpPleConv: the state write-back is the last (K-1)*dilation raw inputs") {
@@ -576,11 +675,27 @@ TEST_CASE("vt::Qwen4ExpPleConv refuses by name") {
         vt::Qwen4ExpPleConv(q, t_out, t_x, t_w, t_state, bad, nullptr, ok),
         doctest::Contains("one row per sequence"), std::exception);
   }
-  SUBCASE("a bf16 conv_state, which no arm of this op can write") {
-    std::vector<uint16_t> half(static_cast<size_t>(kChannels * state_len), 0);
-    Tensor bad = MakeT(half.data(), DType::kBF16, {1, kChannels, state_len});
+  SUBCASE("an i64 conv_state, which is not a state this conv can hold at all") {
+    // WHAT REPLACED THE bf16 REFUSAL, AND WHY (W5k, #2031). This subcase used to
+    // assert `conv_state must be f32` against a bf16 ring, on the argument that
+    // "no arm of this op can write" one. That argument was about which KERNELS
+    // existed here; the pinned oracle answers the different question of what
+    // upstream STORES, and it stores the model dtype — each cache slot is
+    // allocated with the dtype of the tensor that first reaches it
+    // (`cache_utils.py:1019-1023`), which for this slot is `hidden_states`
+    // (`modeling_qwen4_exp.py:1157-1159`). Run at `dtype=torch.bfloat16` the
+    // oracle reports `conv_states[1] dtype=torch.bfloat16`. So the refusal was on
+    // the wrong side and the bf16 case below is now a POSITIVE one.
+    //
+    // The refusal that remains is real and is not the same statement: an INTEGER
+    // ring is not a rounding of the state, it is not a state. It is kept because
+    // deleting the negative case entirely would leave the widened contract with
+    // no lower edge at all.
+    std::vector<int64_t> ints(static_cast<size_t>(kChannels * state_len), 0);
+    Tensor bad = MakeT(ints.data(), DType::kI64, {1, kChannels, state_len});
     CHECK_THROWS_WITH_AS(vt::Qwen4ExpPleConv(q, t_out, t_x, t_w, bad, t_qsl, nullptr, ok),
-                         doctest::Contains("conv_state must be f32"), std::exception);
+                         doctest::Contains("conv_state must be f32 or bf16"),
+                         std::exception);
   }
   SUBCASE("a weight whose channel count is not the stream's") {
     std::vector<float> w2(static_cast<size_t>((kChannels - 1) * kKernel), 0.1f);

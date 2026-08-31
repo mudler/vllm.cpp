@@ -121,6 +121,32 @@ struct DeepseekV2Params {
   // so no bias tensor exists in its checkpoint.
   bool has_e_score_correction_bias = false;
   float routed_scaling_factor = 1.0f;
+  // ─── the ROUTER GATE's output dtype (W4, #2214) ──────────────────────────
+  // `_get_moe_router_dtype` (deepseek_v2.py:123-133) is the whole rule, and it
+  // has two arms in a ORDER THAT MATTERS:
+  //
+  //     router_dtype = getattr(config, "moe_router_dtype", None)
+  //     if getattr(config, "model_type", None) == "glm_moe_dsa":   # :127
+  //         return torch.float32
+  //     if router_dtype == "float32":                              # :131
+  //         return torch.float32
+  //     return None
+  //
+  // The result is the gate's `out_dtype` (`:310-314`,
+  // `GateLinear(..., out_dtype=self.router_dtype)`), so it is the dtype of
+  // `router_logits` at `:417` — the GEMM's OUTPUT, not its accumulator.
+  //
+  // THIS IS AN ANNOTATED f32 ON THE MODEL PATH, which the dtype polarity in
+  // AGENTS.md requires and which is exactly why it is a field rather than a
+  // constant: everything else here inherits the checkpoint's bf16, and this one
+  // buffer is wider because upstream makes it wider. `None` (this flag false) is
+  // upstream's OWN default and leaves the gate at the model dtype.
+  //
+  // A TOKEN GATE CANNOT SEE THIS EITHER WAY. Too narrow loses router precision
+  // on a checkpoint that asked for f32 and still emits plausible tokens; too
+  // wide moves twice the bytes and still emits the same tokens. The dtype is
+  // asserted directly against the pinned oracle's own answers instead.
+  bool router_dtype_is_f32 = false;
 
   bool is_moe_layer(int64_t layer) const {
     return n_routed_experts > 0 && layer >= first_k_dense_replace &&

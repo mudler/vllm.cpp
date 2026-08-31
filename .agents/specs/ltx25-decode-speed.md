@@ -1467,7 +1467,7 @@ projection to **39-100%** of each single-core stretch.
 **[#1008](https://github.com/mudler/vllm.cpp/issues/1008) is NOT owed here. It
 landed.** It was filed by this row as lever 2 and taken by `LTX25-DECODE-DTYPE`,
 which merged as `d1b0ea3a8` (*"Closes #1008"*) — this branch's own base. It is
-therefore listed in [`issue-index.md`](../issue-index.md) with
+therefore listed in [`issue-index.md`](../completed/issue-index.md) with
 `LTX25-DECODE-DTYPE` as its owning row rather than with a dash, which is what
 that column is for, and it is deliberately absent from this table. Listing a
 closed issue as owed by a row that did not close it would misattribute the work

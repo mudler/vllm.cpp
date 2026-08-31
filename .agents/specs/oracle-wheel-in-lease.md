@@ -25,7 +25,7 @@ In scope:
   [`mtp-k-gt-1.md`](mtp-k-gt-1.md), and
   [`gpu-lease-methodology.md`](gpu-lease-methodology.md), which each carry the
   same `nvcc` reasoning.
-- One appended row in [`.agents/issue-index.md`](../issue-index.md) for #1185.
+- One appended row in [`.agents/issue-index.md`](../completed/issue-index.md) for #1185.
 - One comment on #1146 and one on #1129 recording the result.
 
 Out of scope:

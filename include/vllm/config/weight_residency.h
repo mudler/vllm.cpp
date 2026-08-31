@@ -446,6 +446,17 @@ bool ResolveGgufMmap(bool builtin_default);
 uint64_t GgufPrefaultedSpanCount();
 void ResetGgufPrefaultedSpanCountForTesting();
 
+// LOAD-IO: the same instrument in the two units an attribution needs. The bytes
+// say how much of the artifact the load actually paged in; the seconds say how
+// long that took, so `bytes / seconds` is the load's OWN measured read rate and
+// `weights_phase - seconds` is the host work beside it. `NoteGgufPrefaultedBytes`
+// is called from the prefault itself, so both are zero on a load that skipped it
+// and on a copy-arm load that borrows nothing -- which is the true answer in both
+// cases, not a missing measurement.
+uint64_t GgufPrefaultedBytes();
+double GgufPrefaultSeconds();
+void NoteGgufPrefaultedBytes(uint64_t bytes, uint64_t nanos);
+
 // The slot geometry the expert-stream store was actually BUILT with; both zero
 // until something builds one. Same reason as the counter above, and the same
 // measurement behind it: with the slot-count site mutated to a hardcoded 64, so

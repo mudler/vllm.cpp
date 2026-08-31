@@ -980,9 +980,12 @@ comparing the two arms must set the flag on both sides or state that it did not.
   *Read the fall in this number honestly: it is the defect leaving, not the
   saving shrinking.* Half of the pre-#1359 threshold was the host-f32 storage of
   a bf16 tower. The flag now frees the tower the checkpoint ships instead of the
-  tower plus our widening, so a rerun should read about 0.774 GiB where the
-  2026-08-24 run read 1.542, and that halving is CORRECT rather than a
-  regression. The pre-declaration that authorises moving the threshold with it is
+  tower plus our widening, so a rerun reads about 0.774 GiB where the 2026-08-24
+  run read 1.542, and that halving is CORRECT rather than a regression. **That
+  is no longer a prediction: the 2026-08-28 rerun recorded below measured
+  826916864 B = 0.770 GiB, which is 0.499x the 2026-08-24 saving, and MET this
+  threshold on both pairs.** The pre-declaration that authorises moving the
+  threshold with it is
   `.agents/specs/vision-tower-dtype-polarity.md` §6.2: the threshold was not
   renegotiated after a number arrived, it was re-derived because the fixed loader
   changed the quantity it is stated against. `muse-glimmer` still widens, its
@@ -1043,10 +1046,11 @@ comparing the two arms must set the flag on both sides or state that it did not.
      host f32. That is
      [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which the operator
      has confirmed also affects the Qwen3.6-27B path. **#1359's Qwen3-VL half
-     has since LANDED, so this leg rerun should read about 0.774 GiB rather than
-     1.542, and that HALVING IS CORRECT rather than a regression** — the flag now
-     frees the tower the checkpoint actually ships. The figure recorded above is
-     what the run at `41ab550b9` measured and it stays as that record.
+     has since LANDED, and the 2026-08-28 rerun recorded below MEASURED the
+     consequence: 826916864 B = 0.770 GiB, 0.499x this figure. The HALVING IS
+     CORRECT rather than a regression** — the flag now frees the tower the
+     checkpoint actually ships. The figure recorded above is what the run at
+     `41ab550b9` measured and it stays as that record.
      `muse-glimmer-30b`'s tower is still held in host f32, so its own
      90%-of-7.161-GiB threshold is unchanged; that half is blocked on
      [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
@@ -1061,9 +1065,74 @@ comparing the two arms must set the flag on both sides or state that it did not.
      memory" from meaning "we broke the default path" — is a separate run and
      **was not asserted here**. It stays owed.
 
+  **THE RERUN, 2026-08-28: MET on both pairs, first half only, and it is what
+  verifies #1359's Qwen3-VL half.** Harness
+  `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at `main` `525d2b991`, on
+  `dgx:gpu0` under an `rc` lease. Same procedure, same `--device cpu` CPU-only
+  build, same staged-to-local-disk checkpoint, different host.
+
+  | pair | default arm | `--language-model-only` | saving |
+  |---|---:|---:|---:|
+  | 1 (binary A then B) | 9381281792 B | 8554364928 B | **826916864 B = 0.770 GiB** |
+  | 2 (SWAPPED, B then A) | 9380958208 B | 8554381312 B | **826576896 B = 0.770 GiB** |
+
+  Against the LIVE threshold declared above — **747625881 B**, 90% of the
+  830695424 B tower the checkpoint ships — **both pairs clear it, so half 1 is
+  MET**. The saving is 99.5% of that tower.
+
+  *What this run proves that the 2026-08-24 run could not.* Three things, and
+  the third is the one that makes the first two admissible.
+
+  1. **#1359 recovered 828219392 B = 0.771 GiB on the default arm.** The default
+     arm went 10209501184 B → 9381281792 B between the two runs. The fix
+     predicted 830695424 B from the checkpoint's own headers, so the recovery is
+     **99.7% of prediction**. The prediction was near-exact, not approximately
+     right.
+  2. **The tower-skip saving halved exactly as predicted.** 1655791616 B →
+     826916864 B is **0.499x**. Every surface that carried this as an
+     expectation now carries it as a measurement.
+  3. **The control held, which is why 1 and 2 attribute to the fix.** The two
+     runs are on DIFFERENT HOSTS, so a raw before/after on the default arm alone
+     would confound the fix with the host. The `--language-model-only` arm is
+     the control: it loads no tower, so #1359 cannot touch it and it should not
+     move. It moved **+655360 B = +0.0077%**, against a 2% bound — 8553709568 B
+     → 8554364928 B. A host change large enough to explain the 0.771 GiB default-
+     arm drop would have moved this arm too, and it did not. Without this arm the
+     cross-host comparison would not be sound, and it should not be quoted
+     without it.
+
+  *The estimator, on this run.* Mean 826746880 B. Spread `|pair 1 − pair 2|` =
+  339968 B, 0.041% of the saving, against a leg-to-leg `|warmup − default|` of
+  24576 B on the same binary and the same arm. The spread is larger than the
+  single repeat here, unlike 2026-08-24, so it is an upper bound on any
+  binary-shaped bias `d` rather than a demonstration that none exists — and the
+  two binaries were again sha256-identical,
+  `fbc540431341a1aa452a6d0d9594412a5ef1cab4f79058ebdb995a790fc33da7`. At 0.041%
+  of the saving it changes no conclusion above.
+
+  *Conditions.* Worker `rc-worker-4b8lj`, `Linux 6.17.0-1029-nvidia aarch64`,
+  119 GB RAM (100 available), load 1.49/0.98/0.42 at start — a much quieter box
+  than the 2026-08-24 run's 5.16/4.48/4.05, which is one more reason the control
+  arm matters. Both arms built `Release`, `-DVLLM_CPP_BUILD_EXAMPLES=ON`, one
+  build directory per arm, live ninja target query green on both. The checkpoint
+  was staged off the NAS to worker-local `/tmp/tower-skip-ckpt` before any leg
+  ran — 29 files, 8887294190 B, verified by relative path and byte size. That
+  manifest is byte-identical to the 2026-08-24 run's, which recorded the
+  artifact as `Qwen/Qwen3-VL-4B-Instruct` at `ebb281ec70b05090aa6165b016eac8ec08e71b17`;
+  this run's log does not restate the revision, so the identity rests on the
+  file count and byte total agreeing rather than on a re-read hash. Leg topology
+  recorded on the first leg, `timer pid 4865 -> server pid 4867
+  comm='vllm-server'`, so the teardown signalled the server and not a wrapper.
+
+  *The caveats above carry over unchanged.* It is load-time peak host RSS with
+  both arms stopping at `/health`, not a served request and not VRAM; half 2 is
+  still not asserted and still owed; and it is one model's tower.
+
   *Evidence.* `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log` is
-  the harness report verbatim; `…-20260824.legs.log` beside it carries the five
-  `/usr/bin/time -v` records the report reads, the four server logs whose skip
+  the 2026-08-24 harness report verbatim, and
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828.log` is the
+  2026-08-28 one. The `…legs.log` beside each carries the five
+  `/usr/bin/time -v` records that report reads, the four server logs whose skip
   line is the receipt that the arms differed, and the cmake configure. They are
   copied into the repository because the run directory
   `/mnt/nas_share/rc/ckpt/rss-out/` is overwritten by the next run.
@@ -1928,6 +1997,111 @@ pieces).**
 
 ---
 
+## 5. P1 — the forward seam carries DEVICE handles (#1358, #2300)
+
+**Scope.** `MultiModalForwardInput`'s five fields, the three sites that construct
+it, and what the three registered forwards do to read them. Nothing else. The
+scheduler, the GPU runner, `NewRequestData` and `EncoderCacheManager` are the NEXT
+slice and are untouched here.
+
+**What changed.** The struct carried five HOST pointers
+(`const std::vector<uint16_t>*` / `const std::vector<int32_t>*`). It now carries
+four borrowed `vt::Tensor` DEVICE views plus the `deepstack_levels` scalar. An
+absent channel is the default-constructed tensor, whose `data == nullptr` — the
+same either/or the null pointers expressed.
+
+**Why, against the pinned oracle `555967922`.** Upstream stages the merged
+embeddings in a PERSISTENT DEVICE buffer and hands the forward a view of it:
+
+| Upstream anchor | Uniqueness discriminator | What it says |
+|---|---|---|
+| `vllm/v1/worker/gpu_model_runner.py:798` | `grep -rn 'self.inputs_embeds = self._make_buffer' vllm/` == **1** | the buffer is allocated once, `[max_num_batched_tokens, inputs_embeds_size]`, in the model dtype, `numpy=False` |
+| `vllm/v1/worker/gpu_model_runner.py:3607` | `grep -c 'self.inputs_embeds.gpu\[:num_scheduled_tokens\].copy_('` == **1** in the file; its `# TODO(woosuk): Avoid the copy. Optimize.` on `:3606` is also `grep -c` == **1** | the merged result is copied INTO that device buffer each step |
+| `vllm/model_executor/models/interfaces.py:380` | `def embed_input_ids` is FAR from unique — **322** hits across the tree and **3** in this file, of which `:350` and `:353` are `@overload` stubs. The discriminator is the signature line `:383`, `multimodal_embeddings: MultiModalEmbeddings \| None = None,`, `grep -c` == **1** in the file: that is `SupportsMultiModal.embed_input_ids`, the concrete one | the merge is a MODEL method, and the runner calls it before the forward (`self.model.embed_input_ids(` at `gpu_model_runner.py:3600`, one of 3 in that file — the mm one, in the `else` of the prompt-embeds branch) |
+| `vllm/model_executor/models/interfaces.py:411` | `grep -c 'return _merge_multimodal_embeddings('` == **1** in the file | that method delegates the scatter |
+| `vllm/model_executor/models/utils.py:658` | `grep -rn 'def _merge_multimodal_embeddings' vllm/` == **1**, at `:637`; `:658` is its `inputs_embeds[is_multimodal] = mm_embeds_flat.to(dtype=input_dtype)` | the scatter is a device index-put |
+| `vllm/model_executor/models/qwen3_vl.py:1757` | `self.deepstack_input_embeds = [` appears **twice** in the file (`:1757` ctor, `:1808` `_resize_deepstack_input_embeds`); the ctor one is discriminated by its `# register buffer for deepstack` on `:1755`, `grep -c` == **1**. Filled at `:1818` `_set_deepstack_input_embeds`, read at `:1788` `_get_deepstack_input_embeds`, consumed at `:1623` whose `deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]` is `grep -c` == **1** | DeepStack is a MODEL-OWNED persistent DEVICE buffer upstream, not a host argument |
+
+Every one of those was re-read in `/home/mudler/_git/vllm` at `5559679229`, which
+is the `parity-pin` block's `vllm_commit`.
+
+The host contract cost three things, and only the third is invisible to a gate:
+
+1. a `[T, H]` D2H followed by an H2D on every step, on the largest per-step buffer;
+2. a permanently NON-graph-capturable mm arm, because a host pointer cannot be
+   baked into a captured graph;
+3. a memory-format divergence in the seam that **no token gate can observe**. The
+   tokens matched throughout. `.agents/porting.md` "Mirror the memory format, not
+   just the math" names exactly this class, and this is an instance of it.
+
+**The borrowed-handle rule, and why the forward copies.** NO registered forward
+writes its hidden stream in place at this head, and the reason for the copy is
+stated against that measurement rather than around it: `RunLayer` ends
+`hidden = DBuf(...)` (`muse_glimmer.cpp`), `VLRunLayer` ends
+`hidden = down->Apply(...)` (`qwen3_vl.cpp`), and Gemma-4 copies `tok` into its own
+`hidden`. Aliasing the caller's view would therefore corrupt nothing TODAY, and no
+logits comparison can tell an aliasing implementation from this one. The copy is a
+CONTRACT rather than a caught defect: the invariant that keeps aliasing safe is
+written down nowhere, the runner slice will hand this seam a window into a buffer it
+reuses across steps, and any future in-place fusion would break the alias silently.
+All three forwards therefore seed their own buffer with a D2D copy — a pure byte
+copy, so the stream starts from the identical bits the host handle used to deliver,
+which is what makes the change bit-neutral rather than merely close. Upstream takes
+the same shape: its decoder layers allocate rather than clobber the persistent
+`inputs_embeds` they are handed. The `## Owed` entry below says the same thing, and
+this paragraph used to contradict it.
+
+**The merge-side question, answered rather than assumed.** Upstream's merge lives
+in a MODEL method (`interfaces.py:380`) that the RUNNER calls
+(`gpu_model_runner.py:3600`) BEFORE the forward; what crosses into the forward is
+the finished device `inputs_embeds`. That is exactly what this seam now carries, so
+the device conversion does NOT require moving the merge, and P1 stands alone. What
+remains divergent is WHO calls `embed_input_ids` and through what channel DeepStack
+travels — both properties of the layer above this seam, both owned by the runner
+slice, and both recorded under `## Owed` rather than half-done here.
+
+**Reachability — declared, not dressed up.** This slice makes NOTHING newly
+reachable and reduces nothing. The three drivers'
+(`Qwen3VLGenerateGreedyViaRegistry`, `Gemma4GenerateGreedyViaRegistry`,
+`MuseGlimmerGenerateGreedyViaRegistry`) only callers are tests, which is precisely
+what [#2300](https://github.com/mudler/vllm.cpp/issues/2300) records: the GPU runner
+never sets `.mm`, so no production entry point reaches this seam at all. Per
+[`.agents/reachability.md`](../reachability.md) "a change that has no production
+call site to delete has already answered the question" — there is nothing to
+mutate for reach here, and the wiring is owned by `ENG-MM-INPUT-PIPELINE` under
+#2300.
+
+**Gates.**
+
+- CPU, hermetic, no checkpoint: `tests/vllm/models/test_muse_glimmer_wiring.cpp`
+  drives the WHOLE chain — `MuseGlimmerGenerateGreedyViaRegistry` →
+  `ModelRegistry::Forward` → the registered mm branch → `MuseGlimmerModel::ForwardMm`
+  — on a synthetic checkpoint. It gained two cross-tree INSTRUMENTS (an FNV-1a-64
+  digest of the logits bytes, and the greedy ids themselves), so a before/after
+  comparison reads a number instead of a verdict, and one new case:
+  `MuseGlimmer: ForwardMm reads a SLICE of a larger device buffer and leaves it untouched`,
+  which reads the caller's device buffer back after the forward. Nothing about the
+  logits can see an aliasing implementation; only that read-back can. The name is
+  written out in full and verbatim because it is a `-tc` argument: doctest's filter
+  matches the WHOLE case name, so an approximation of it selects zero cases and
+  exits 0, which reads as a pass.
+- CPU, hermetic, no checkpoint: `tests/vllm/models/test_tower_skip.cpp` gained
+  `mm seam: Qwen3-VL refuses deepstack_levels that no deepstack tensor backs`,
+  which drives `reg.factory->forward` — the function pointer
+  `ModelRegistry::Forward` calls — on a synthetic Qwen3-VL checkpoint. It pins the
+  DeepStack pair the device contract made silently breakable: `deepstack_levels > 0`
+  with an absent `deepstack` tensor is REFUSED by name, while both-absent and
+  both-set are served. The case lives beside the Qwen3-VL fixture that file already
+  carries, because a real `Qwen3VLLoadedModel` is what the entry point needs and
+  only `ModelRegistry::Load` produces one.
+- GPU, checkpoint-gated: `test_qwen3vl_registry_e2e`, `test_qwen3vl_video_e2e` and
+  `test_gemma4_registry_e2e` are the token-exact arms. They SKIP without CUDA and
+  the cached checkpoints, so their disposition is recorded per run rather than
+  assumed.
+
+
+---
+
 ## Owed
 
 Carried by `ENG-MM-INPUT-PIPELINE`. The first block was filed while landing
@@ -1954,15 +2128,28 @@ L4 (§1.6); the second while landing L3 (§1.5).
   MODEL.** The `qwen3-vl` figure below does not stand in for it and is 4.2x
   below this threshold.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
-  `qwen3_vl.cpp` site is MEASURED, half 1 only, 2026-08-24.** The run happened
-  on `thor:gpu0` under an `rc` lease at `main` `41ab550b9` and **MET** the
-  threshold that stood then — 1495251763 B, SUPERSEDED by #1359 and not
-  applicable to a rerun — on BOTH pairs of the swapped assignment: 1655791616 B
-  and 1655992320 B, 1.542 GiB, 99.7% of the 1661390848 B resident tower that
-  binary carried, spread 200704 B against a leg-to-leg 192512 B. The full result, its
-  conditions and its three caveats are in §1.5 L3 under "THE RESULT", and the
+  `qwen3_vl.cpp` site is MEASURED, half 1 only, remeasured 2026-08-28.** It has
+  run twice and MET on both pairs both times.
+
+  The CURRENT figure is the 2026-08-28 rerun on `dgx:gpu0` under an `rc` lease
+  at `main` `525d2b991`, after #1359's Qwen3-VL half landed: **826916864 B and
+  826576896 B, 0.770 GiB**, against the live 747625881 B threshold, 99.5% of the
+  830695424 B tower the checkpoint ships, spread 339968 B against a leg-to-leg
+  24576 B. That run is also what VERIFIES #1359's Qwen3-VL half — the default
+  arm recovered 828219392 B = 99.7% of prediction, while the tower-free
+  `--language-model-only` control arm moved only +655360 B = +0.0077% against a
+  2% bound, which is what makes the cross-host attribution sound.
+
+  The 2026-08-24 run on `thor:gpu0` at `41ab550b9` is HISTORY and is kept as
+  such: it MET the threshold that stood then — 1495251763 B, SUPERSEDED by #1359
+  and NOT applicable to a rerun — with 1655791616 B and 1655992320 B, 1.542 GiB,
+  99.7% of the 1661390848 B resident tower that binary carried, spread 200704 B
+  against a leg-to-leg 192512 B. The fall between the two runs is 0.499x and is
+  CORRECT rather than a regression. The full result of each, its conditions and
+  its caveats are in §1.5 L3 under "THE RESULT" and "THE RERUN", and the
   evidence is
-  `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log`.
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log` and
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828{,.legs}.log`.
   **What is STILL owed on this kind:** half 2 of the gate, the default arm
   within 2% of the pre-L3 `edbc47ce0` binary, which is a separate run and was
   not asserted; and a GPU-device arm, since this figure is `--device cpu` host
@@ -2019,3 +2206,97 @@ L4 (§1.6); the second while landing L3 (§1.5).
   upstream `context.py:461`). Blocked on the per-model
   `get_supported_mm_limits()` hook that L1 recorded as absent, which the M2
   towers own. Unchanged by L3.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300)** — the GPU runner
+  never sets `ModelForwardInput.mm`, so a Qwen3-VL server throws on the first
+  forward step of EVERY request, text or image.
+  `ForwardQwen3VLForConditionalGeneration` requires the field
+  (`qwen3_vl_registry.cpp:127`). `runner.cpp:2234` builds `ModelForwardInput`
+  without it and calls `ModelRegistry::Forward` at `:2340`, and no line of that
+  4443-line file names `mm_features`, `MultiModalForwardInput` or `.mm`.
+  `input_batch.h:90` already records the worker input batch as a subset with
+  `mm_features` DEFERRED, which is the same fact one layer up. This is the
+  IMAGE half of the condition the `qwen3-vl` L3 bullet above records for text
+  only: that bullet reads the refusal as a benchmark-vehicle limit, and the
+  refusal is in fact total. STATICALLY DERIVED, not run. Sibling registered
+  forwards take the other shape and fall back to text
+  (`gemma4_registry.cpp:145`, `muse_glimmer_registry.cpp:113`), so choosing
+  between a text arm here and building `mm` in the runner is a design decision
+  with its own spec and gate, not an in-flow repair. It is the hop
+  [#1358](https://github.com/mudler/vllm.cpp/issues/1358) needs before the
+  tower it loads can be read back.
+
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — P1 lands UNREACHED,
+  and says so.** The device seam changes code that no production entry point
+  arrives at: `ModelForwardInput.mm` is set by three single-sequence drivers whose
+  only callers are tests, and the GPU runner never sets it. The wiring is owned by
+  `ENG-MM-INPUT-PIPELINE` under this issue and is the next slice (§5).
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — the MERGE is still on
+  the wrong side of the seam.** Upstream's runner calls the MODEL's
+  `embed_input_ids` (`interfaces.py:380`) and the model does the scatter
+  (`utils.py:658`); ours hands the forward an embedding that a HOST-side driver
+  merged. P1 deliberately does not move it: the device contract is coherent without
+  it (§5), and moving it changes what the runner must compute (an embedding list
+  plus an `is_multimodal` mask) rather than what the forward reads.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — `deepstack` is a
+  forward ARGUMENT here and a model-owned persistent DEVICE buffer upstream**
+  (`qwen3_vl.py:1757` allocation, `:1818` fill, `:1788` read, `:1618-1623`
+  consumption). P1 makes our channel device-resident, which is the half that
+  mattered for graph capture; it does not move the channel onto the model. That is
+  the same decision as the merge above and belongs with it.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — the CUDA-graph claim
+  is a PREMISE, not a measurement.** P1 removes the host round trip that made the
+  mm arm uncapturable. Nothing here captures a graph over an mm step, and no
+  throughput number is claimed. The capture is the runner slice's to demonstrate.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — Gemma-4's mm branch
+  now takes ONE MORE `[T, H]` D2D copy than it needs.** `ForwardBody` copies the
+  seam's view into `tok` (`gemma4.cpp`, the `inputs_embeds_override` branch) and
+  then copies `tok` into `hidden` a few dozen lines later; `tok` is never written on
+  that branch, so the first copy is elidable by reading the borrowed view directly.
+  It was NOT elided here on purpose: this slice's bar is bit-identity, the arm that
+  would prove the elision (`test_gemma4_registry_e2e`) is gated on a checkpoint that
+  is not cached, and an unverifiable optimisation is the wrong thing to carry in a
+  change whose whole claim is that nothing moved. Against the HOST contract the copy
+  COUNT is unchanged (it was H2D-into-`tok` then D2D-into-`hidden`), so this is a
+  driver-path regression of zero and a runner-path saving deferred.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — no registered mm
+  forward writes its seed buffer in place TODAY, so the borrow is a contract rather
+  than a caught defect.** Measured while mutation-testing this slice: `RunLayer`
+  ends `hidden = DBuf(...)` (`muse_glimmer.cpp`), `VLRunLayer` ends
+  `hidden = down->Apply(...)` (`qwen3_vl.cpp`), and Gemma-4 copies `tok` into its
+  own `hidden`. An ALIASING implementation would therefore still pass a logits
+  comparison, which is why the CPU gate asserts the read-back of the caller's buffer
+  instead — and why the copy stays: the invariant that keeps aliasing safe is stated
+  nowhere and would be silently broken by any future layer that fuses in place.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — CONTIGUITY and DEVICE
+  are unchecked on the new handles.** `vt::Tensor` carries strides, and
+  `Tensor::Bytes()` itself `VT_CHECK`s `IsContiguous()`, so asserting contiguity is
+  this tree's own convention rather than an extra one. Four consumers do raw BYTE
+  arithmetic on a borrowed handle without checking it — `muse_glimmer.cpp:386`,
+  `qwen3_vl.cpp:326` and `gemma4.cpp:459`, all
+  `d.b.Copy(..., <handle>.data, dst.bytes())`, plus `qwen3_vl.cpp:351`,
+  `static_cast<char*>(deepstack.data) + l * T * H * 2` — and two more pass a handle
+  straight into a kernel (`positions3` into `VLRunLayer`, `ple_token_ids` into
+  `vt::Embedding`). The guards at the entry points test only `data != nullptr` and
+  `Numel()`, both of which a STRIDED view satisfies. The three copy sites size the
+  copy with the DESTINATION's `dst.bytes()` rather than the source's `src.Bytes()`,
+  which is precisely what sidesteps the one check that would already have fired. The
+  handle's `device` is likewise never compared against `input.queue.device`. Impact
+  at this head is ZERO — every constructor of these handles is a contiguous `DBuf`
+  on the queue's own device — which is why it is recorded rather than fixed: it
+  cannot bite until the runner slice starts handing the seam views it did not
+  allocate, and that slice is where the check belongs.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — two of the three
+  converted forwards have ZERO EXECUTED coverage.** `tests/vllm/models/test_model_registry.cpp`
+  asserts architecture registration strings and nothing else: it contains no
+  `MultiModalForwardInput` and no `.mm`. So `Gemma4Model::ForwardMm` and
+  `Qwen3VLForwardStepLastLogits{,Device}` are COMPILE-ONLY on CPU, and the arms that
+  would run them (`test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e`,
+  `test_qwen3vl_video_e2e`) SKIP without CUDA and their cached checkpoints. Only the
+  Muse Glimmer forward is executed by a hermetic gate. Gemma-4's is the most invasive
+  edit in the P1 diff — the `DBuf owned_ids` / `Tensor dids` restructure at
+  `gemma4.cpp:484-491`, which changes WHO owns the id buffer on the text arm as well
+  as the mm one. §5's `Gates` block says the GPU arms skip; it did not say that two
+  of the three forwards are therefore unexecuted, and that is the sentence this entry
+  adds. The Qwen3-VL half is now partly covered on CPU by the DeepStack-pair case in
+  `test_tower_skip.cpp` (§5 `Gates`), which reaches the registered entry point and
+  its shape guards; the numerics of both forwards remain checkpoint-gated.

@@ -960,18 +960,49 @@ std::atomic<uint64_t>& PrefaultedSpans() {
   static std::atomic<uint64_t> n{0};
   return n;
 }
+// LOAD-IO. The span COUNT answers "did the prefault run". It cannot answer the
+// question a 74-minute load actually poses, which is "how much of that wall time
+// was the file arriving, and how much was our own host work". Bytes and seconds
+// answer it: the prefault is the only place a keep-quant GGUF load touches every
+// weight page, so its elapsed time IS the load's I/O time, and everything else
+// inside the weights phase is compute. Without this split the two are one number
+// and any attribution between them is a guess.
+std::atomic<uint64_t>& PrefaultedBytes() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+std::atomic<uint64_t>& PrefaultNanos() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
 }  // namespace
 
 uint64_t GgufPrefaultedSpanCount() {
   return PrefaultedSpans().load(std::memory_order_relaxed);
 }
 
+uint64_t GgufPrefaultedBytes() {
+  return PrefaultedBytes().load(std::memory_order_relaxed);
+}
+
+double GgufPrefaultSeconds() {
+  return static_cast<double>(PrefaultNanos().load(std::memory_order_relaxed)) /
+         1e9;
+}
+
 void ResetGgufPrefaultedSpanCountForTesting() {
   PrefaultedSpans().store(0, std::memory_order_relaxed);
+  PrefaultedBytes().store(0, std::memory_order_relaxed);
+  PrefaultNanos().store(0, std::memory_order_relaxed);
 }
 
 void NoteGgufPrefaultedSpan() {
   PrefaultedSpans().fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteGgufPrefaultedBytes(uint64_t bytes, uint64_t nanos) {
+  PrefaultedBytes().fetch_add(bytes, std::memory_order_relaxed);
+  PrefaultNanos().fetch_add(nanos, std::memory_order_relaxed);
 }
 
 ExpertStreamGeometry BuiltExpertStreamGeometry() {

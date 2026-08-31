@@ -813,7 +813,6 @@ REQUIRED = [
     ROOT / "README.md",
     ROOT / "docs/BENCHMARKS.md",
     AGENTS / "roadmap_v1.md",
-    AGENTS / "issue-index.md",
     AGENTS / "coordination.md",
     AGENTS / "feature-matrix.md",
     AGENTS / "specs/model-family-inventory.md",
@@ -1965,36 +1964,26 @@ ISSUE_ROW = re.compile(
 )
 
 
-ISSUE_INDEX = AGENTS / "issue-index.md"
+# The index is DERIVED. `scripts/agent-issue-index.py --refresh` renders
+# `gh issue list` into this untracked snapshot, so the record gates can run
+# offline while GitHub stays the record. Nothing commits it, so no pull request
+# writes it and it cannot conflict -- which is the whole of #2290.
+SNAPSHOT = AGENTS / "issue-index.generated.md"
 
-# The index carries `merge=union`, so an edited preamble line is DUPLICATED
-# rather than merged. Holding the expected text here means the preamble cannot
-# drift without a deliberate edit to both sides.
-INDEX_PREAMBLE = """# Issue index
+# The retired tracked index. Named only so its RETURN can be refused: if this
+# file comes back, the lock comes back with it.
+RETIRED_INDEX = AGENTS / "issue-index.md"
 
-**No work without an open issue.** Before claiming a row or writing code,
-confirm an issue tracks the work; open one if it does not. The number is linked
-from here, from the row's spec, and from the PR.
-
-This file is append-only. Add a row at the end. Never edit a row and never
-delete one. GitHub holds the open and closed state, so closing an issue costs no
-edit here. `Row` is the owning roadmap block or area-matrix row, or a dash when
-a spec lists the issue under `## Owed`.
-
-The path carries `merge=union` in `.gitattributes`, so two branches that each
-append a row merge without a conflict. That driver is only safe while the rule
-above holds. An edited row and an edited line of this preamble are duplicated
-rather than merged. `scripts/check-agent-record.py` gates both.
+# Enough of the generated header to build a fixture. Deliberately NOT gated
+# byte-for-byte: the old INDEX_PREAMBLE literal existed because `merge=union`
+# duplicated an edited preamble line rather than merging it, and a generated
+# file has no such failure mode. Holding a second copy of prose nothing can
+# corrupt would be drift for its own sake.
+SNAPSHOT_PREAMBLE = """# Issue index (GENERATED -- do not edit, do not commit)
 
 | Issue | Row | Title | Kind |
 |---:|---|---|---|
 """
-
-# Rows naming no owning row AND not listed under a spec's `## Owed`. A RATCHET:
-# it may only fall, and a fall must lower this number in the same change.
-# Measured 2026-08-14 on 186 rows. Raising it is a checker semantic change and
-# needs a spec plus a red-before test, which is the point.
-UNOWNED_HIGH_WATER = 33
 
 
 def owed_issues() -> set[str]:
@@ -2015,54 +2004,93 @@ def owed_issues() -> set[str]:
     return owed
 
 
-def check_issue_index(
-    errors: list[str],
-    text: str | None = None,
-    owed: set[str] | None = None,
-    high_water: int | None = None,
-) -> None:
-    """Every tracked issue is well-formed, consistent, and owned.
+def referenced_issues(base: str = "origin/main") -> set[str]:
+    """Issue numbers THIS BRANCH cites, from its own commit messages.
 
-    Deliberately NETWORK-FREE. Querying GitHub would make this gate fail on
-    connectivity, which is exactly the class of flake this protocol exists to
-    remove. It checks the FORM, the internal consistency, and whether an owner
-    is named; whether the issue is still open is GitHub's record, not a CI
-    blocker.
-
-    `text`, `owed` and `high_water` are injectable so a test can build a small
-    index. Without an injectable mark every fixture would be red for having the
-    wrong number of unowned rows, which would hide whatever the fixture is
-    actually about.
+    Offline and deterministic: `git log <merge-base>..HEAD`, never a network
+    call. A branch with no merge base against `base` -- a fresh clone, a
+    detached head, an unrelated history -- yields the empty set rather than
+    raising, because a gate that cannot resolve a range must not invent one.
+    Being unable to tell which issues a change cites is a reason to check none,
+    never a reason to fail the change.
     """
 
-    label = ISSUE_INDEX.relative_to(ROOT)
+    try:
+        merge_base = subprocess.run(
+            ["git", "-C", str(ROOT), "merge-base", base, "HEAD"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if merge_base.returncode != 0:
+            return set()
+        log = subprocess.run(
+            ["git", "-C", str(ROOT), "log", "--format=%B",
+             f"{merge_base.stdout.strip()}..HEAD"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if log.returncode != 0:
+            return set()
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return set(re.findall(r"#(\d+)", log.stdout)) | set(
+        re.findall(r"issues/(\d+)", log.stdout)
+    )
+
+
+def check_issue_index(
+    errors: list[str],
+    skips: list[str],
+    *,
+    text: str | None = None,
+    owed: set[str] | None = None,
+    referenced: set[str] | None = None,
+) -> None:
+    """The issues THIS CHANGE references are well-formed, open, and owned.
+
+    Deliberately NETWORK-FREE, as the tracked version was. It reads the snapshot
+    `scripts/agent-issue-index.py --refresh` leaves behind; querying GitHub here
+    would make the gate fail on connectivity, which is the class of flake this
+    protocol exists to remove.
+
+    ABSENCE IS A SKIP, NOT A PASS. An absent or stale snapshot appends to
+    `skips` with the command that fixes it and leaves `errors` alone. A gate
+    that goes quiet when its input vanishes is #467 in a new place, so the
+    caller must report the skip and `--fail-on-skip` must redden on it.
+
+    OWNERSHIP IS DIFF-SCOPED. The retired `UNOWNED_HIGH_WATER` counted every row
+    in the tree. Against a surface GitHub owns that count moves whenever anyone
+    files an issue anywhere, so a ratchet on it could only red `main` for
+    reasons no commit caused -- the same lock in a new place. What a change can
+    answer for is the issues it cites, so that is what is gated.
+
+    `text`, `owed` and `referenced` are injectable so a test can build a small
+    snapshot without a network call or a git history.
+    """
+
+    if RETIRED_INDEX.is_file():
+        errors.append(
+            f"{RETIRED_INDEX.relative_to(ROOT)}: the tracked issue index is back. "
+            "It is a surface every pull request writes, and GitHub does not run "
+            "the merge=union driver that was supposed to make that safe (#883, "
+            "#2290). The index is derived; run scripts/agent-issue-index.py"
+        )
+
+    label = SNAPSHOT.relative_to(ROOT)
     if text is None:
-        if not ISSUE_INDEX.is_file():
-            errors.append(f"{label}: missing the issue index")
+        if not SNAPSHOT.is_file():
+            skips.append(
+                f"{label} is absent; run "
+                "`python3 scripts/agent-issue-index.py --refresh`. "
+                "Not a pass: the issues this change cites went unchecked"
+            )
             return
-        text = ISSUE_INDEX.read_text(encoding="utf-8")
+        text = SNAPSHOT.read_text(encoding="utf-8")
     if owed is None:
         owed = owed_issues()
-    if high_water is None:
-        high_water = UNOWNED_HIGH_WATER
+    if referenced is None:
+        referenced = referenced_issues()
 
-    if not text.startswith(INDEX_PREAMBLE):
-        actual = text.split("| [#", 1)[0]
-        expected_lines = INDEX_PREAMBLE.splitlines()
-        for number, line in enumerate(actual.splitlines(), 1):
-            if number > len(expected_lines) or line != expected_lines[number - 1]:
-                errors.append(
-                    f"{label}:{number}: preamble drifted from the checker's copy; "
-                    f"got {line[:60]!r}. A union merge DUPLICATES an edited "
-                    "preamble line instead of merging it"
-                )
-                break
-        else:
-            errors.append(f"{label}: preamble is shorter than the checker's copy")
-
-    seen: set[str] = set()
     rows = 0
-    unowned: list[str] = []
+    owners: dict[str, str | None] = {}
     for line in text.splitlines():
         # Any table line that is not the header or the separator. Matching only
         # `| [#` would make a row that LOST its link invisible instead of
@@ -2072,7 +2100,8 @@ def check_issue_index(
         match = ISSUE_ROW.match(line)
         if not match:
             errors.append(
-                f"{label}: malformed issue row {line[:60]!r}; "
+                f"{label}: malformed issue row {line[:60]!r}. This file is "
+                "GENERATED, so a malformed row means the generator broke; "
                 "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
             )
             continue
@@ -2080,32 +2109,31 @@ def check_issue_index(
         number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
         if number != url_number:
             errors.append(f"{label}: issue #{number} links to {url}, a different issue")
-        if number in seen:
-            errors.append(
-                f"{label}: issue #{number} listed twice. Under `merge=union` a "
-                "duplicate is what two branches appending the same issue look like"
-            )
-        seen.add(number)
-        if row_id is None and number not in owed:
-            unowned.append(number)
+        owners[number] = row_id
 
     if rows == 0:
-        errors.append(f"{label}: the issue index has no rows")
+        errors.append(
+            f"{label}: the snapshot has no rows, which is what a silently "
+            "truncated refresh looks like"
+        )
+        return
 
-    if len(unowned) > high_water:
-        fresh = unowned[high_water:]
-        errors.append(
-            f"{label}: {len(unowned)} rows name no owner, above the recorded "
-            f"{high_water}: {', '.join('#' + n for n in fresh[:5])}. "
-            "Name an owning row ID, or list the issue under `## Owed` in the "
-            "spec that owes it. Filing an issue does not defer the fix"
-        )
-    elif len(unowned) < high_water:
-        errors.append(
-            f"{label}: {len(unowned)} rows name no owner, below the recorded "
-            f"{high_water}. Lower UNOWNED_HIGH_WATER to {len(unowned)} "
-            "in the same change, so the ratchet cannot slip back"
-        )
+    for number in sorted(referenced, key=int):
+        # A referenced number ABSENT from the snapshot is not gated. Offline, a
+        # pull request number, a closed issue and a typo are indistinguishable --
+        # `#2248` in a commit body is a pull request, and demanding it be an open
+        # issue fired on four such citations in this rule's own change. Only
+        # OPEN issues, which the snapshot can actually speak to, carry the
+        # ownership obligation.
+        if number not in owners:
+            continue
+        if owners[number] is None and number not in owed:
+            errors.append(
+                f"{label}: this change references #{number}, which names no "
+                "owning row. Add a `Row: `ROW-ID`` line to the issue body, or "
+                "list it under `## Owed` in the spec that owes it. Filing an "
+                "issue does not defer the fix"
+            )
 
 
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
@@ -2169,6 +2197,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     errors: list[str] = []
+    skips: list[str] = []
     for path in REQUIRED:
         if not path.is_file():
             errors.append(f"missing canonical record: {path.relative_to(ROOT)}")
@@ -2177,24 +2206,22 @@ def main(argv: list[str] | None = None) -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
-        check_issue_index(errors)
+        check_issue_index(errors, skips)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)
         check_model_invariants(errors)
         spec_paths = [path for row in rows if row.state in READY_STATES for path in local_spec_paths(row)]
-        # ISSUE_INDEX is here for the same reason every other record table is:
-        # nothing else counts its cells. It was the ONE record surface every
-        # change must write and the only markdown table in the set with no shape
-        # gate, so a row that lost its trailing pipe, or carried an unescaped one
-        # inside a code span, mis-rendered on GitHub while every gate stayed
-        # green (#1033). The constant is reused rather than respelled so this
-        # gate and check_issue_index cannot drift onto different files.
+        # The issue index used to be in this list: it was the ONE record
+        # surface every change had to write, and the only markdown table here
+        # with no shape gate, so a row that lost its trailing pipe mis-rendered
+        # on GitHub while every gate stayed green (#1033). It is derived now, and
+        # a generated table cannot lose a pipe to a human edit -- the generator's
+        # own suite gates its output shape instead (#2290).
         check_table_shapes(
             [
                 AGENTS / "roadmap_v1.md",
                 AGENTS / "coordination.md",
-                ISSUE_INDEX,
                 *MATRIX_PATHS,
                 *spec_paths,
             ],

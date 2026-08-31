@@ -34,3 +34,7 @@ a.out
 *.log
 *.mp4
 generated/
+
+# Derived from `gh issue list` by scripts/agent-issue-index.py --refresh.
+# Untracked on purpose: a tracked index is a surface every PR writes (#2290).
+.agents/issue-index.generated.md

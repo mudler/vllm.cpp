@@ -676,6 +676,18 @@ class TritonMLAImpl final : public AttentionImpl {
   // REFUSED in `forward_mqa`, because that is the base class's rejection and
   // dots3-note does not set it either.
   int64_t sliding_window = 0;
+  // KV-DSV4-MULTICACHE W5 (#2323): the PER-HEAD ATTENTION SINK, `[num_heads]`
+  // f32 on the queue's device, or a null tensor.
+  //
+  // Carried on the impl rather than passed through `forward_mqa` because it is a
+  // property of the LAYER's weights, not of a step -- the same reason `scale`
+  // and `sliding_window` live here. `ForwardMlaAttentionBlock` sets it once from
+  // `MlaBlockWeights::attn_sink`.
+  //
+  // Null by default, so every model that does not load a sink -- Kimi-Linear,
+  // dots3-note, MiniCPM3, DeepSeek-V2 -- reaches `vt::MlaDecodeAttention` with
+  // `attn_sink == nullptr` and is bit-identical.
+  vt::Tensor attn_sink;
 
   // The DECODE entry point — the 1:1 counterpart of `forward_mqa`
   // (triton_mla.py:189-260). `q` is the already-concatenated

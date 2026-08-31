@@ -748,6 +748,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_expert_span.cpp
   src/vllm/model_executor/expert_streamer.cpp
   src/vllm/model_executor/device_expert_slot_store.cpp
+  src/vllm/model_executor/expert_stream_seam.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -798,6 +799,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
+  src/vllm/model_executor/models/deepseek_v4_dspark.cpp
   src/vllm/model_executor/models/deepseek_v4_compressor.cpp
   src/vllm/model_executor/models/deepseek_v4_mhc.cpp
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
@@ -809,12 +811,22 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
   src/vllm/model_executor/models/qwen4_exp_weights.cpp
+  src/vllm/model_executor/models/qwen4_exp_moe.cpp
+  src/vllm/model_executor/models/qwen4_exp_ple_block.cpp
+  src/vllm/model_executor/models/qwen4_exp_forward.cpp
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/glm5_next.cpp
   src/vllm/model_executor/models/glm5_next_kda.cpp
   src/vllm/model_executor/models/glm5_next_dsa.cpp
+  src/vllm/model_executor/models/glm5_next_attn.cpp
   src/vllm/model_executor/models/glm5_next_mhc.cpp
+  src/vllm/model_executor/models/glm5_next_moe.cpp
+  src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
+  src/vllm/model_executor/models/glm_moe_dsa.cpp
+  src/vllm/model_executor/models/glm_moe_dsa_forward.cpp
+  src/vllm/model_executor/models/glm_moe_dsa_loader.cpp
+  src/vllm/model_executor/models/glm_moe_dsa_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
   src/vllm/model_executor/models/interfaces.cpp
@@ -827,6 +839,11 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
   src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
   src/vllm/model_executor/models/glm5_next_weights.cpp
+  src/vllm/model_executor/models/glm5_next_loader.cpp
+  src/vllm/model_executor/models/glm5_next_bridge.cpp
+  src/vllm/model_executor/models/glm5_next_layer.cpp
+  src/vllm/model_executor/models/glm5_next_forward.cpp
+  src/vllm/model_executor/models/glm5_next_diag.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp
@@ -1817,7 +1834,14 @@ if(VLLM_CPP_CUDA)
     # General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) — the device arm
     # the LTX-2.5 video VAE decode never had.
     src/vt/cuda/cuda_conv3d.cu
-    src/vt/cuda/cuda_attention_cross.cu)
+    src/vt/cuda/cuda_attention_cross.cu
+    # Qwen4-Exp (Qwen3.8-Flash-Next) device arms, row MODEL-MM-QWEN4-EXP W6-CUDA:
+    # the first CUDA kernels this architecture has ever had. Split to mirror the
+    # cpu_qwen4_exp*.cpp units listed above. Unconditional and at
+    # if(VLLM_CPP_CUDA) depth one, which is what check-cuda-op-arch-gate.py
+    # requires of any TU that registers an op.
+    src/vt/cuda/cuda_qwen4_exp.cu
+    src/vt/cuda/cuda_qwen4_exp_ple.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
@@ -2723,6 +2747,35 @@ target_include_directories(vllm_conv1d_scaling_probe SYSTEM PRIVATE
   ${CMAKE_SOURCE_DIR}/third_party)
 target_compile_features(vllm_conv1d_scaling_probe PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_conv1d_scaling_probe)
+
+# ── The LTX-2.5 connector GEMM probe (LTX25-CONNECTOR-GEMM) ─────────────────
+# `tools/bench/ltx2_connector_gemm_probe.cpp` is the instrument behind
+# `.agents/specs/ltx25-connector-gemm.md`: which CPU GEMM tier the LTX-2.5 text
+# connector's `vt::MatmulBT` calls actually enter, what the two weight
+# orientations cost at those shapes, and how much of `Ltx2ConnectorForward` the
+# GEMM accounts for at all.
+#
+# CI COMPILES IT AND RUNS NOTHING, the same trade its two siblings above record:
+# one leg allocates hundreds of megabytes and spends tens of seconds of every
+# core, which no test tier should pay. What the build buys is that the one file
+# a reader has to compile to re-derive "what the connector's 224.9 s is spent
+# on" cannot rot behind a `vt::MatmulBT`, `vt::AttentionCross` or
+# `Ltx2ConnectorForward` signature change -- the #1246 failure, where the sole
+# named harness for a measurement was compiled by nothing.
+#
+# The recorded runs were taken from the DIRECT g++ compile in the file's own
+# header rather than from this target, because the devbox they were taken on has
+# no room for a CMake build tree. The target still compiles the whole file: it
+# defines no `LTX2_PROBE_NO_CONNECTOR`, so the connector and attention modes are
+# in the guard as well as the GEMM one.
+add_executable(vllm_ltx2_connector_gemm_probe tools/bench/ltx2_connector_gemm_probe.cpp)
+target_link_libraries(vllm_ltx2_connector_gemm_probe PRIVATE vllm)
+target_include_directories(vllm_ltx2_connector_gemm_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_ltx2_connector_gemm_probe SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_ltx2_connector_gemm_probe PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_ltx2_connector_gemm_probe)
 
 # ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
 # `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in

@@ -60,7 +60,7 @@ Out of scope:
 - Any second oracle id. See `## One pin, two delivery artifacts`.
 - Any product code. This row touches records, documents, and the operator
   scripts that drive its own jobs. Nothing under `src/` or `include/`.
-- Editing an existing [`../issue-index.md`](../issue-index.md) row. That file is
+- Editing an existing [`../issue-index.md`](../completed/issue-index.md) row. That file is
   append-only, #1265 already has a row, and a second row for the same issue
   would duplicate a key rather than append a new one.
 

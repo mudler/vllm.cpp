@@ -42,7 +42,7 @@ In scope:
   received before a guard consults it.
 - Red-first cases in `tests/vllm/models/test_qwen27_dense_forward.cpp`.
 - The [#1258](https://github.com/mudler/vllm.cpp/issues/1258) row appended to
-  [`issue-index.md`](../issue-index.md).
+  [`issue-index.md`](../completed/issue-index.md).
 
 Out of scope, each for a stated reason:
 

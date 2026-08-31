@@ -318,6 +318,18 @@ DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config, bool allow_mtp_ta
   }
   // The learned gate bias exists ONLY for topk_method "noaux_tc" (:313-318).
   p.has_e_score_correction_bias = noaux_tc;
+  // `_get_moe_router_dtype` (deepseek_v2.py:123-133), the GENERIC arm at `:131`.
+  // The `model_type == "glm_moe_dsa"` arm at `:127` is NOT mirrored here and must
+  // not be: this parser serves `DeepseekV2ForCausalLM`, and GLM-5.3 resolves
+  // through `ParseGlmMoeDsaParams`, which carries its own `router_dtype_is_f32`
+  // defaulted true for the same reason. Reading `model_type` here would make
+  // this function answer for an architecture it refuses to load.
+  //
+  // Any other value of the key means `None` upstream — `:131` compares to the
+  // literal string, so `"bfloat16"` and `"float16"` both fall through to the
+  // model dtype rather than selecting one. Mirroring that means NOT throwing on
+  // an unrecognized value.
+  p.router_dtype_is_f32 = RawString(doc, "moe_router_dtype", "") == "float32";
 
   if (p.n_routed_experts > 0) {
     if (p.num_experts_per_tok <= 0 || p.num_experts_per_tok > p.n_routed_experts) {

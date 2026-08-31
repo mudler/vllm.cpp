@@ -154,4 +154,42 @@ Fp8DsMlaToken Fp8DsMlaEncodeToken(const std::vector<float>& head,
 std::vector<float> Fp8DsMlaDecodeToken(const Fp8DsMlaToken& token,
                                        const Fp8DsMlaLayout& layout);
 
+
+// `MODEL-DSV4-DSA-COMPOSE` W1 (#2286) — ONE COMPRESSOR STEP, state machine and all.
+//
+// The individual pieces are already gated: `CompressorSaveScoreApe` adds the
+// position-wrapped APE, `CompressorPoolNorm` does the per-column softmax pool and
+// the RMSNorm. What was NOT gated is the CYCLE that drives them, and the cycle is
+// where a compressor goes wrong: it is stateful across steps, so an error shows
+// up several tokens later as a plausible value rather than immediately.
+//
+// Per step it appends each token's `(kv, score + ape)` to the layer's state, and
+// at every COMPRESS BOUNDARY -- `(position + 1) % compress_ratio == 0`,
+// `fused_compress_quant_cache.py:164-166` -- it pools the window that just closed
+// into one compressed row.
+//
+// COMPRESSOR-ONLY (`coff == 1`) SHAPE. `overlap` is `compress_ratio == 4`, so a
+// `compress_ratio == 128` layer gathers exactly `compress_ratio` rows ending at
+// the boundary and needs no `head_offset` role selection. The overlapped shape is
+// W3's.
+//
+//   state_kv/state_score  [n_state * head_dim] — appended in place, caller-owned
+//   kv/score              [num_tokens * head_dim] this step's rows
+//   positions             [num_tokens] GLOBAL positions
+//   returns               the compressed rows emitted this step, [k * head_dim]
+//                         (k = the number of boundaries this step crossed)
+std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
+                                       std::vector<float>* state_score,
+                                       const std::vector<float>& kv,
+                                       const std::vector<float>& score,
+                                       const std::vector<float>& ape,
+                                       const std::vector<int64_t>& positions,
+                                       const std::vector<float>& rms_weight, float eps,
+                                       int64_t compress_ratio, int64_t head_dim,
+                                       // `coff = 1 + (compress_ratio == 4)`
+                                       // (compressor.py:247-248). At 2 the kv/score
+                                       // rows are `coff*head_dim` wide and a window
+                                       // position's ROLE picks which half it reads.
+                                       int64_t coff = 1);
+
 }  // namespace vllm::deepseek_v4

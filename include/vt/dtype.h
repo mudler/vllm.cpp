@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -82,10 +83,15 @@ namespace vt {
 // per-32 scale is spliced from a `scales_l` nibble and a `scales_h` bit pair and
 // then biased by -32, where IQ4_NL carries one unbiased f16 delta per 32.
 //
-// Both are `to_float`-only for now: neither has a keep-quant `vec_dot`, so
-// `HasQuantDotKernel` is FALSE and the GGUF loader EXPANDS them rather than
-// dotting the blocks in place. That is a memory cost this tree has deliberately
-// avoided for every other routed-expert encoding, and it is owed by #2240's row.
+// Both carry a keep-quant `vec_dot` against Q8_K as of QUANT-GGUF-IQ-VECDOT
+// (#2247), so `HasQuantDotKernel` is TRUE and the loader keeps their blocks
+// COMPRESSED. IQ4_XS pairs with Q8_K and NOT with the Q8_0 of its codebook
+// sibling IQ4_NL, because its block is a 256-element super-block
+// (ggml-cpu.c:385-390 against :379-384). Between #2245 and #2247 they were
+// decode-only, which cost 325.58 GiB of residency on the staged artifact — 82
+// IQ2_XS tensors expanding from 53.33 GiB to 369.00 GiB and 3 IQ4_XS tensors
+// from 3.59 GiB to 13.50 GiB — and was the difference between fitting the
+// ~119.63 GiB of `dgx:gpu0` and overflowing it 3.6x.
 enum class DType : uint8_t {
   kF32,
   kF16,
@@ -114,10 +120,64 @@ enum class DType : uint8_t {
   kIQ4_XS,
 };
 
+const char* Name(DType dtype);
+
+// The two refusals `SizeOf` below can produce. They live OUT OF LINE, and cold,
+// so the inline `SizeOf` carries a switch over six integers and nothing else —
+// no `std::string`, no `Name`, no throw machinery in the hot path.
+[[noreturn]] void ThrowBlockQuantHasNoElementSize(DType dtype);
+[[noreturn]] void ThrowUnknownDType();
+
 // Bytes per ELEMENT. Throws for block-quantized dtypes (they have no
 // per-element size) — see IsBlockQuant/BlockBytes/RowSizeBytes.
-size_t SizeOf(DType dtype);
-const char* Name(DType dtype);
+//
+// INLINE, and that is load-bearing rather than cosmetic (row VT-CPU-ELEM-DISPATCH,
+// .agents/specs/vt-cpu-elem-dispatch.md). Every per-element `LoadF32`/`StoreF32`
+// helper in `src/vt/cpu` computes its byte offset with this call, inside loops
+// whose body is one multiply and one add. The build enables no LTO — CMakeLists.txt
+// sets no INTERPROCEDURAL_OPTIMIZATION and passes no -flto — so while this was
+// defined in `src/vt/dtype.cpp` it was a cross-translation-unit call that no
+// optimizer could remove, and a `perf` profile of `vt::AttentionCross` put
+// `LoadF32` at 36.14% and `vt::SizeOf` at 28.41% of the kernel's own CPU time
+// against 15.60% for its arithmetic. Inline, the switch is loop-invariant code
+// the caller's optimizer hoists on its own.
+//
+// It changes no value this function returns, so it is bit-exact by construction.
+// The enumeration below stays EXHAUSTIVE with no `default:` label, so adding a
+// dtype to the enum is still a -Wswitch error here rather than a silent 0.
+inline size_t SizeOf(DType dtype) {
+  switch (dtype) {
+    case DType::kF32: return 4;
+    case DType::kF16: return 2;
+    case DType::kBF16: return 2;
+    case DType::kI8: return 1;
+    case DType::kI32: return 4;
+    case DType::kI64: return 8;
+    // Block-quantized dtypes are storage-only: there is no per-element size,
+    // so every elementwise path that reaches one fails loudly here rather than
+    // silently mis-striding a packed block buffer.
+    case DType::kQ4_0:
+    case DType::kQ5_0:
+    case DType::kQ8_0:
+    case DType::kQ2_K:
+    case DType::kQ3_K:
+    case DType::kQ4_K:
+    case DType::kQ5_K:
+    case DType::kQ6_K:
+    case DType::kQ8_K:
+    case DType::kIQ2_XXS:
+    case DType::kIQ3_XXS:
+    case DType::kIQ2_S:
+    case DType::kIQ1_S:
+    case DType::kIQ1_XXXS:
+    case DType::kIQ4_NL:
+    case DType::kMXFP4:
+    case DType::kIQ2_XS:
+    case DType::kIQ4_XS:
+      ThrowBlockQuantHasNoElementSize(dtype);
+  }
+  ThrowUnknownDType();
+}
 
 // True for the ggml block-quantized encodings above.
 bool IsBlockQuant(DType dtype);
@@ -141,9 +201,49 @@ uint32_t GgmlTypeId(DType dtype);
 // the id is not one of them (F32/F16/BF16 and every unported encoding).
 bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out);
 
-float F16ToF32(uint16_t h);
+// The four reduced-width converters. `F16ToF32` and `BF16ToF32` are INLINE for
+// the same reason `SizeOf` above is (row VT-CPU-ELEM-DISPATCH): they are called
+// once per ELEMENT by every `LoadF32` in `src/vt/cpu`, the build enables no LTO,
+// and out of line they were a cross-translation-unit call per element on the
+// f16 and bf16 arms of every CPU kernel. The bodies are byte-for-byte the ones
+// that were in `src/vt/dtype.cpp`, so every value they return is unchanged.
+//
+// The two f32 -> narrow directions stay OUT of line. They are STORE-side, called
+// once per output element rather than once per operand element, and they carry
+// the round-to-nearest-even logic that is the part of this file most worth
+// keeping in one compiled place.
+namespace detail {
+inline float BitsToF32(uint32_t u) {
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+}  // namespace detail
+
+inline float F16ToF32(uint16_t h) {
+  uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+  uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t mant = h & 0x3FF;
+  if (exp == 0x1F) {  // inf/nan
+    return detail::BitsToF32(sign | 0x7F800000 | (mant << 13));
+  }
+  if (exp == 0) {
+    if (mant == 0) return detail::BitsToF32(sign);  // signed zero
+    // subnormal: normalize
+    int shift = 0;
+    while ((mant & 0x400) == 0) {
+      mant <<= 1;
+      ++shift;
+    }
+    mant &= 0x3FF;
+    return detail::BitsToF32(sign | ((113 - shift) << 23) | (mant << 13));
+  }
+  return detail::BitsToF32(sign | ((exp + 112) << 23) | (mant << 13));
+}
+
+inline float BF16ToF32(uint16_t b) { return detail::BitsToF32(static_cast<uint32_t>(b) << 16); }
+
 uint16_t F32ToF16(float f);
-float BF16ToF32(uint16_t b);
 uint16_t F32ToBF16(float f);
 
 }  // namespace vt

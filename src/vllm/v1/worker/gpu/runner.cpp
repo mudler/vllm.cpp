@@ -1229,10 +1229,15 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   layer_kv_class_.assign(static_cast<size_t>(num_layers), LayerKvClass::kNone);
   layer_attn_kv_indices_.clear();
   attn_kv_layer_names_.clear();
-  attn_kv_group_ids_.clear();
-  attn_kv_layer_indices_.clear();
+  kv_index_layer_names_.clear();
+  kv_index_group_ids_.clear();
+  kv_index_layer_indices_.clear();
+  kv_index_payload_kinds_.clear();
+  kv_index_payload_slots_.clear();
   multi_cache_topology_ = multi_cache_topology;
   multi_kv_index_ = vllm::MultiKvCacheIndex{};
+  group_block_tables_.clear();
+  group_block_table_cols_.clear();
 
   // ── KV-DSV4-MULTICACHE W3 (#2068): ONE BUFFER PER PUBLISHED CACHE ──────────
   //
@@ -1248,6 +1253,17 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   //
   // ENTERED ONLY on a multi-cache topology (see the entry predicate above), so
   // no model shipping today reaches it.
+  //
+  // ENG-MULTIKV-BYNAME extends it to the RECURRENT half. W3 built the by-name
+  // index off `attn_group_ids_`, so a `MambaSpec` group's layers were allocated
+  // (below) and then named nowhere: their states reached the forward through
+  // `gdn_state` positionally and `Find()` answered -1 for every one of them.
+  // Upstream has no such split — the Mamba page goes into the SAME
+  // `kv_caches: dict[str, torch.Tensor]` as every attention cache
+  // (`gpu_model_runner.py:7429-7441`, "Keeping one tensor per layer lets the KV
+  // connector register it without special-casing Mamba"), and `:7318-7326`
+  // asserts that dict's keys are every layer name of every published group.
+  std::vector<int32_t> recurrent_slot_of_layer;
   if (multi_cache_topology) {
     layer_attn_kv_indices_.assign(static_cast<size_t>(num_layers),
                                   std::vector<int32_t>{});
@@ -1256,11 +1272,21 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     // multi-cache attention set; it is carried rather than refused because
     // expressing it costs one loop and refusing it would be a hole.
     if (membership_by_name && has_mamba_group) {
+      recurrent_slot_of_layer.assign(static_cast<size_t>(num_layers), -1);
       for (int64_t l = 0; l < num_layers; ++l) {
         if (!(*gdn_layer_mask)[static_cast<size_t>(l)]) continue;
         VT_CHECK(mamba_spec != nullptr,
                  "runner: linear-attention layer has no MambaSpec");
         layer_kv_class_[static_cast<size_t>(l)] = LayerKvClass::kRecurrent;
+        // ENG-MULTIKV-BYNAME: the slot this layer's state lands in, recorded
+        // BEFORE the push so it is the index of the entry about to be created.
+        // `gdn_state_` is built one-for-one from `recurrent_state_buf_` at the
+        // end of this function, so this IS the index the by-name channel hands
+        // a forward. It is deliberately not `l`: the mask is over the model's
+        // layers and the buffer is over the recurrent ones, and on every hybrid
+        // in the tree the two differ.
+        recurrent_slot_of_layer[static_cast<size_t>(l)] =
+            static_cast<int32_t>(recurrent_state_buf_.size());
         alloc_recurrent_layer_states(dev, state_dtypes, state_row_elems);
       }
     }
@@ -1299,8 +1325,6 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             static_cast<int32_t>(full_attn_buf_.size()));
         layer_kv_class_[static_cast<size_t>(l)] = LayerKvClass::kMultiCache;
         attn_kv_layer_names_.push_back(group.layer_names[k]);
-        attn_kv_group_ids_.push_back(static_cast<int32_t>(g));
-        attn_kv_layer_indices_.push_back(l);
         full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
             dev, queue_,
             static_cast<size_t>(num_blocks_) * static_cast<size_t>(page),
@@ -1310,6 +1334,85 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                                  spec->k_scale, spec->v_scale});
         mla_layer_mask.push_back(static_cast<char>(fused));
       }
+    }
+
+    // ── ENG-MULTIKV-BYNAME: THE BY-NAME INDEX OVER EVERY PUBLISHED CACHE ────
+    //
+    // One pass over the groups in PUBLICATION order, emitting each group's
+    // names in the group's own order. That is upstream's insertion order for
+    // its single `kv_caches` dict
+    // (`vllm/v1/worker/gpu_model_runner.py:7365-7372`, `for group in ...: for
+    // layer_name in group.layer_names`), and it is why a recurrent group
+    // published between two attention groups lands BETWEEN them here rather
+    // than being appended: an entry's index is its place among the published
+    // caches, not its slot in a payload container.
+    //
+    // EVERY group is one of the two arms. The refusal above already rejected a
+    // spec that is neither an `AttentionSpec` nor a `MambaSpec`, a second
+    // recurrent group, an eagle group and a group whose names do not resolve,
+    // so `group_layer_index[g]` is filled for every group that reaches here.
+    // The `VT_CHECK`s restate that rather than assume it, because a future
+    // shape that slips past the refusal must land as a refusal here and not as
+    // a cache nobody can address.
+    {
+      int32_t paged_slot = 0;
+      for (int g = 0;
+           g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
+        const auto& group =
+            kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+        const bool is_recurrent =
+            group.kv_cache_spec->kind() == KVCacheSpecKind::kMamba;
+        VT_CHECK(is_recurrent || dynamic_cast<const AttentionSpec*>(
+                                     group.kv_cache_spec.get()) != nullptr,
+                 "runner: a published group on the multi-cache path is neither "
+                 "an AttentionSpec nor a MambaSpec group");
+        const std::vector<int32_t>& idx =
+            group_layer_index[static_cast<size_t>(g)];
+        VT_CHECK(idx.size() == group.layer_names.size(),
+                 "runner: group layer indices out of sync with its names");
+        for (size_t k = 0; k < group.layer_names.size(); ++k) {
+          kv_index_layer_names_.push_back(group.layer_names[k]);
+          kv_index_group_ids_.push_back(static_cast<int32_t>(g));
+          kv_index_layer_indices_.push_back(idx[k]);
+          if (is_recurrent) {
+            const int32_t slot =
+                recurrent_slot_of_layer.empty()
+                    ? -1
+                    : recurrent_slot_of_layer[static_cast<size_t>(idx[k])];
+            VT_CHECK(slot >= 0,
+                     "runner: a published recurrent cache was given no state "
+                     "slot, so no forward could address it by name");
+            kv_index_payload_kinds_.push_back(
+                static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent));
+            kv_index_payload_slots_.push_back(slot);
+          } else {
+            kv_index_payload_kinds_.push_back(
+                static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+            kv_index_payload_slots_.push_back(paged_slot++);
+          }
+        }
+      }
+      // The paged half of the index, in order, IS `attn_kv_layer_names_` — two
+      // derivations of one order, and a second derivation is the thing that can
+      // disagree. The allocation loop above walks `attn_group_ids_`; this pass
+      // walks every group and filters. They agree because the refusal makes the
+      // two sets equal, and this states that agreement as a refusal rather than
+      // leaving it as a property of two loops nobody compares.
+      size_t j = 0;
+      for (size_t i = 0; i < kv_index_layer_names_.size(); ++i) {
+        if (static_cast<vllm::KvCachePayload>(kv_index_payload_kinds_[i]) !=
+            vllm::KvCachePayload::kPaged)
+          continue;
+        VT_CHECK(j < attn_kv_layer_names_.size() &&
+                     kv_index_layer_names_[i] == attn_kv_layer_names_[j] &&
+                     kv_index_payload_slots_[i] == static_cast<int32_t>(j),
+                 "runner: the by-name index's paged half disagrees with the "
+                 "order attn_kv was allocated in");
+        ++j;
+      }
+      VT_CHECK(j == attn_kv_layer_names_.size(),
+               "runner: the by-name index does not cover every allocated paged "
+               "cache");
     }
   } else {
     // THE LEGACY PATH, byte-for-byte. Every model shipping today lands here.
@@ -1530,18 +1633,44 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   }
 
   // KV-DSV4-MULTICACHE W3 (#2068): PUBLISH the third channel, now that
-  // `attn_kv_` is stable. The three vectors are parallel to it and are owned by
-  // this runner, so the pointers stay valid for every forward it drives. Left at
-  // its default (all-null, `size() == 0`) on every uniform topology, which is
-  // what keeps `ModelForwardInput::multi_kv` null there.
+  // `attn_kv_` is stable. The vectors are owned by this runner, so the pointers
+  // stay valid for every forward it drives. Left at its default (all-null,
+  // `size() == 0`) on every uniform topology, which is what keeps
+  // `ModelForwardInput::multi_kv` null there.
   if (multi_cache_topology_) {
-    VT_CHECK(attn_kv_layer_names_.size() == attn_kv_.size() &&
-                 attn_kv_group_ids_.size() == attn_kv_.size() &&
-                 attn_kv_layer_indices_.size() == attn_kv_.size(),
-             "runner: the multi-cache name index is out of sync with attn_kv");
-    multi_kv_index_.layer_names = &attn_kv_layer_names_;
-    multi_kv_index_.group_ids = &attn_kv_group_ids_;
-    multi_kv_index_.layer_indices = &attn_kv_layer_indices_;
+    VT_CHECK(attn_kv_layer_names_.size() == attn_kv_.size(),
+             "runner: the paged name list is out of sync with attn_kv");
+    // ENG-MULTIKV-BYNAME: the five vectors are parallel to EACH OTHER and cover
+    // every published cache, so the size they are checked against is the index's
+    // own length, NOT `attn_kv_.size()`. That distinction is the row: checking
+    // against `attn_kv_` is exactly what made a recurrent entry inexpressible.
+    const size_t n = kv_index_layer_names_.size();
+    VT_CHECK(kv_index_group_ids_.size() == n &&
+                 kv_index_layer_indices_.size() == n &&
+                 kv_index_payload_kinds_.size() == n &&
+                 kv_index_payload_slots_.size() == n,
+             "runner: the by-name KV index vectors are not parallel");
+    // EVERY allocated cache is addressable, stated as an equality over the two
+    // payload containers. `gdn_state_` is built one-for-one from
+    // `recurrent_state_buf_` further down this function, so the recurrent count
+    // is read from the buffer list that already exists rather than from a
+    // vector that is still empty at this point.
+    VT_CHECK(n == attn_kv_.size() + recurrent_state_buf_.size(),
+             "runner: the by-name KV index does not cover exactly the caches "
+             "this runner allocated");
+    multi_kv_index_.layer_names = &kv_index_layer_names_;
+    multi_kv_index_.group_ids = &kv_index_group_ids_;
+    multi_kv_index_.layer_indices = &kv_index_layer_indices_;
+    multi_kv_index_.payload_kinds = &kv_index_payload_kinds_;
+    multi_kv_index_.payload_slots = &kv_index_payload_slots_;
+    // W5c-2 (#2249 item 3): the FOURTH vector — one block table per PUBLISHED
+    // group. Sized here (by GROUP, not by cache) and filled per step by
+    // `gather_group_block_tables`; the pointers are published once because the
+    // vectors are members whose storage the refill reuses.
+    group_block_tables_.assign(kv_cache_config.kv_cache_groups.size(), {});
+    group_block_table_cols_.assign(kv_cache_config.kv_cache_groups.size(), 0);
+    multi_kv_index_.group_block_tables = &group_block_tables_;
+    multi_kv_index_.group_block_table_cols = &group_block_table_cols_;
   }
 
   // SPEC-MTP I5d: allocate the MTP draft's own paged KV layer (the `fa_draft`
@@ -1672,6 +1801,30 @@ std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,
   const size_t n = static_cast<size_t>(num_reqs) * static_cast<size_t>(cols);
   return std::vector<int32_t>(dev.begin(),
                               dev.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+// MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3) — the mirror of upstream's per-group
+// metadata loop (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin
+// 5559679229). Every published group gets its own committed table, including the
+// TARGET attention group. Upstream gathers group 0 too, but ONCE and BEFORE the
+// loop (`block_table_gid_0 = _get_block_table(0)` at `:2337`), carrying it into
+// every iteration on `cm_base`; the loop body is guarded by `if kv_cache_gid >
+// 0:` (`:2565`), so upstream does NOT re-gather group 0 inside the loop and
+// this function does. That guard is an OPTIMISATION and not a second
+// convention for "which groups are special" — the table it skips rebuilding is
+// the same table. Re-gathering here therefore costs ONE EXTRA COPY of a table
+// this step already built, and buys a vector with no index the reader has to
+// know is special. The two named-id gathers in `execute_model`
+// keep their own copies because the GDN one is REWRITTEN in place by
+// `remap_gdn_state_slots`, and this vector must carry what the block table
+// actually says, not a remapped state-slot view of it.
+void GPUModelRunner::gather_group_block_tables(int num_reqs) {
+  for (size_t g = 0; g < group_block_tables_.size(); ++g) {
+    int cols = 0;
+    group_block_tables_[g] =
+        gather_block_table(static_cast<int>(g), num_reqs, &cols);
+    group_block_table_cols_[g] = cols;
+  }
 }
 
 void GPUModelRunner::remap_gdn_state_slots(
@@ -2031,6 +2184,14 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       gather_block_table(full_attn_group_id_, num_reqs, &fa_cols);
   CommonAttentionMetadata attn_meta = MakeCommonAttentionMetadata(
       step, fa_bt, fa_cols, /*causal=*/true, full_attn_group_id_);
+
+  // W5c-2 (#2249 item 3): THE PRODUCTION CALL SITE for the per-group gather.
+  // Beside the two named-id gathers rather than instead of them, and gated on
+  // the multi-cache topology so every model shipping today enters no new code.
+  // A published group whose table never leaves the runner has a cache that is
+  // allocated and unaddressable, which is what left the `qwen4_exp` QSA indexer
+  // side cache unread.
+  if (multi_cache_topology_) gather_group_block_tables(num_reqs);
 
   // GDN KV group metadata: the same step over the GDN group's block table,
   // segmented decode-first by the GDN builder (M1.6 Task 4). GATED on the model

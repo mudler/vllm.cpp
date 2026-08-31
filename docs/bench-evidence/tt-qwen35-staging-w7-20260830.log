@@ -1,0 +1,42 @@
+# BACKEND-TENSTORRENT-QWEN35 W7 (#2282) — A/B evidence: staging-write elimination
+# Date 2026-08-30, P150 `thalia`, every series inside one $HOME/gpu.lock hold.
+# AFTER  = row head b142a4683 (row/BACKEND-TENSTORRENT-QWEN35, fix d2fd05c6e in)
+# BEFORE = base 785d4304f (origin/main), scratch worktree /tmp/w7-before
+# Probe: VT_TT_STAGE_DUMP atexit staging-stats dump, symmetric in both arms,
+# temporary (reverted before the record commit; env-guarded, off by default).
+# Counters: bulk/pwrite/palloc/pbytes = W4/W5 staging routes; avoided_res/
+# avoided_memset/avoided_copy = the W7 elimination arms (serve-instead-of-restage);
+# gdn_steps = GdnDecodeSteps() for per-step normalization.
+#
+# == Workload 1: vllm-cli 3-token greedy (Qwen3.5-0.8B), JIT-discard per arm,
+#    then 2 interleaved measured legs per arm. Driver: /tmp/w7-ab.sh (verbatim
+#    walls + dumps reproduced below from its stdout, /tmp/w7ab-walls.txt).
+AFTER  discard  wall=19.095s  bulk=277 pwrite=169 palloc=139 pbytes=1430999040 avoided_res=0 avoided_memset=0 avoided_copy=0 gdn_steps=72
+BEFORE discard  wall=18.792s  bulk=277 pwrite=169 palloc=139 pbytes=1430999040 gdn_steps=72
+AFTER  measured m1 wall=18.840s bulk=277 pwrite=169 palloc=139 pbytes=1430999040 avoided_res=0 avoided_memset=0 avoided_copy=0 gdn_steps=72
+BEFORE measured m1 wall=18.999s bulk=277 pwrite=169 palloc=139 pbytes=1430999040 gdn_steps=72
+AFTER  measured m2 wall=18.847s bulk=277 pwrite=169 palloc=139 pbytes=1430999040 avoided_res=0 avoided_memset=0 avoided_copy=0 gdn_steps=72
+BEFORE measured m2 wall=18.893s bulk=277 pwrite=169 palloc=139 pbytes=1430999040 gdn_steps=72
+# AFTER mean 18.844 s vs BEFORE mean 18.946 s = -0.54% (noise). Every staging
+# counter identical before/after; the W7 arms never fire (avoided 0/0/0).
+#
+# == Workload 2: e2e ambient (build/tests/test_qwen35_paged_engine,
+#    VT_TT_HOST_FREE_DECODE unset = the host-free default), 2 interleaved
+#    measured legs per arm, JIT warm from the same-day gate legs. Driver:
+#    /tmp/w7-ab-e2e.sh (stdout verbatim below).
+AFTER  m1 wall=1385.710s bulk=10205 pwrite=989 palloc=173 pbytes=1459288064 avoided_res=0 avoided_memset=0 avoided_copy=0 gdn_steps=8640
+BEFORE m1 wall=1385.421s bulk=10205 pwrite=989 palloc=173 pbytes=1459288064 gdn_steps=8640
+AFTER  m2 wall=1385.343s bulk=10205 pwrite=989 palloc=173 pbytes=1459288064 avoided_res=0 avoided_memset=0 avoided_copy=0 gdn_steps=8640
+BEFORE m2 wall=1386.433s bulk=10205 pwrite=989 palloc=173 pbytes=1459288064 gdn_steps=8640
+# AFTER mean 1385.527 s vs BEFORE mean 1385.927 s = -0.03% (noise). Every
+# staging counter identical to the byte in all four legs; per-step staging
+# writes 989/8640 = 0.114 in BOTH arms; the W7 arms never fire (avoided 0/0/0).
+#
+# == Gates on the final head b142a4683 (probe stripped, rebuilt, re-run)
+# Full TT suite (LEG C): 51/51 cases, 5852 assertions, exit 0 — this log's tail:
+#   [doctest] test cases:   51 |   51 passed | 0 failed | 0 skipped
+#   [doctest] assertions: 5852 | 5852 passed | 0 failed |
+#   [doctest] Status: SUCCESS!
+# Sacred pair (same session, /tmp/w7gate2-legA.log, /tmp/w7gate2-legB.log):
+#   LEG A (VT_TT_HOST_FREE_DECODE=0): 16/16 prompts PASS STRICT token-exact
+#   LEG B (ambient default):          16/16 prompts PASS STRICT token-exact

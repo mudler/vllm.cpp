@@ -38,6 +38,8 @@
 // quant_block == nope_head_dim (one block) at tiny width. Each reuses the SAME
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_dspark.h"
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
 
 #include <chrono>
@@ -88,6 +90,8 @@ using deepseek_v4::HcHeadCollapse;
 using deepseek_v4::MakeFp8DsMlaLayout;
 using deepseek_v4::MhcPost;
 using deepseek_v4::MhcPre;
+using deepseek_v4::RopeInplaceLayer;
+using deepseek_v4::YarnCorrDim;
 using deepseek_v4::MhcPreResult;
 using deepseek_v4::MoeRouteResult;
 using deepseek_v4::SoftmaxWithSink;
@@ -124,6 +128,35 @@ struct V4Backend {
   // query's global position is kv_base + local_t (kv_base = cache.len at the call).
   DeepseekV4KvCache* kv = nullptr;
   int64_t kv_base = 0;
+  // KV-DSV4-MULTICACHE W5 (#2323): the PAGED MLA cache, one tensor per layer
+  // `[num_blocks, block_size, head_dim]`. Present => `AttentionBlock` writes each
+  // step's latents into it through `vt::ConcatAndCacheMla` and attends through
+  // `vt::MlaDecodeAttention`, instead of appending to a contiguous `deck` that
+  // grows without bound. `kv_base` means the same thing on both arms.
+  //
+  // The two are mutually exclusive and the block refuses both at once rather
+  // than silently preferring one: they are different sources of truth for the
+  // same keys, and a step that wrote one and read the other would produce
+  // plausible tokens from a stale context.
+  std::vector<vt::Tensor>* paged_kv = nullptr;
+  // MODEL-DSV4-DSA-COMPOSE W1 (#2286): the compressor is a STATE MACHINE across
+  // steps, so its state is carried by the caller, one entry per layer. Null =>
+  // no compressor arm, which is every existing path.
+  DeepseekV4CompressorState* compressor = nullptr;
+  // DSV4-DSPARK-DRAFTER W-3 (#1314): the KV rows in `paged_kv` were written by
+  // SOMEONE ELSE, so this step must attend them WITHOUT writing its own.
+  //
+  // A trunk layer derives KV from its own hidden state, which is why the write
+  // below is otherwise unconditional. A DSpark drafter block does not: its rows
+  // come from the TARGET's tap state through `update_kv_from_target`, at the
+  // target's own positions, while its query comes from the block's hidden state.
+  // Query and KV having different sources is the one thing this function could
+  // not express, and this flag is the smallest extension that lets it.
+  //
+  // DEFAULT FALSE, so every existing path keeps writing exactly as before. When
+  // true the `deck` is still COMPUTED -- it is the same tensor the non-paged arms
+  // read -- and only the cache write is skipped.
+  bool paged_kv_prewritten = false;
   // Re-scoped Stage 2: collapse the routed-expert per-expert keep-quant matvecs
   // into ONE grouped kMatmulBTQuantGrouped launch per {gate,up,down} (fewer host
   // launches + higher GB10 occupancy). Default ON for the GGUF keep-quant path;
@@ -353,9 +386,10 @@ std::vector<float> DispSoftmaxSink(const V4Backend& be, const std::vector<float>
   if (be.device) return deepseek_v4::DsaDevice()->softmax_sink(*be.q, scores, sink);
   return SoftmaxWithSink(scores, sink);
 }
+// W1d (#2186): `wo_a`/`wo_b` are the carried tower's bf16, on both arms.
 std::vector<float> DispGroupedOLora(const V4Backend& be, const std::vector<float>& o,
-                                    const std::vector<float>& wo_a,
-                                    const std::vector<float>& wo_b, int64_t T, int64_t nh,
+                                    const HostBf16& wo_a,
+                                    const HostBf16& wo_b, int64_t T, int64_t nh,
                                     int64_t hd, int64_t ng, int64_t olr, int64_t H) {
   if (be.device) return deepseek_v4::DsaDevice()->grouped_olora(*be.q, o, wo_a, wo_b, T, nh, hd, ng, olr, H);
   return deepseek_v4::GroupedOutputLora(o, wo_a, wo_b, T, nh, hd, ng, olr, H);
@@ -406,10 +440,25 @@ float Dot(const float* a, const float* b, int64_t n) {
   for (int64_t i = 0; i < n; ++i) acc += a[i] * b[i];
   return acc;
 }
+// W1d (#2186): the BF16 arm of the same dot product, for the carried tower's
+// FP8-sourced half now held at the model dtype (`HostBf16`). Each weight element
+// is widened AS IT IS READ. This is not a per-call widening of the tensor --
+// nothing is materialized, and the loop moves HALF the bytes the f32 arm moves --
+// it is what reading a bf16 weight in place means. The accumulator stays f32, so
+// the reduction order and its precision are unchanged from the f32 arm; the ONLY
+// numerical difference is that each weight now carries bf16's 8 mantissa bits,
+// which is the dtype the checkpoint's FP8 storage already sat below.
+float Dot(const uint16_t* a, const float* b, int64_t n) {
+  float acc = 0.0f;
+  for (int64_t i = 0; i < n; ++i) acc += HostBf16ToF32(a[i]) * b[i];
+  return acc;
+}
 
 // y[o] = Σ_i W[o*in + i] * x[i]  (W is [out, in] row-major).
-std::vector<float> MatVec(const std::vector<float>& w, const float* x, int64_t out,
-                          int64_t in) {
+// `W` is `std::vector<float>` or `HostBf16`; `Dot` overloads on the element type,
+// so the bf16 carried tower and the f32 remainder share one body (W1d, #2186).
+template <typename W>
+std::vector<float> MatVec(const W& w, const float* x, int64_t out, int64_t in) {
   VT_CHECK(static_cast<int64_t>(w.size()) == out * in, "MatVec weight size mismatch");
   std::vector<float> y(static_cast<size_t>(out));
   for (int64_t o = 0; o < out; ++o) y[static_cast<size_t>(o)] = Dot(&w[o * in], x, in);
@@ -425,8 +474,19 @@ std::vector<float> MatVec(const std::vector<float>& w, const float* x, int64_t o
 // source) it falls back to the per-row f32 MatVec — BIT-IDENTICAL to the pre-W2C
 // host composition. Grounded in qwen3_5.cpp:786-838 (host MatmulBT off an
 // OwnedTensor.View()) + vt/ops.cpp:134-171 (block-quant dispatch).
+// The keep-quant `Gemm` arm consumes `wq`'s OwnedTensor and never reads the host
+// vector, so several call sites have no host weights at all. They used to pass a
+// braced `{}`; a template cannot deduce its type from that, and naming the empty
+// says at the call site which arm is meant (W1d, #2186).
+const std::vector<float> kNoHostWeights;
+
+// `W` is `std::vector<float>` or `HostBf16` (W1d, #2186). Only the HOST-fallback
+// tail below reads it: the keep-quant arm consumes `wq`'s OwnedTensor and never
+// touches the host vector at all, so the carried tower's dtype does not reach the
+// device GEMM path.
+template <typename W>
 std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
-                        const std::vector<float>& wf32, const std::vector<float>& x,
+                        const W& wf32, const std::vector<float>& x,
                         int64_t T, int64_t N, int64_t K, bool defer_sync = false) {
   if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
     VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
@@ -541,7 +601,7 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
     for (int64_t t = 0; t < T; ++t)
       for (int64_t d = 0; d < olr; ++d)
         z[t * z_dim + g * olr + d] = zg[static_cast<size_t>(g)][t * olr + d];
-  return Gemm(be, &wo_b, /*wf32=*/{}, z, T, H, z_dim);  // [T,H] (final; drains normally)
+  return Gemm(be, &wo_b, /*wf32=*/kNoHostWeights, z, T, H, z_dim);  // [T,H] (final; drains normally)
 }
 
 // Grouped keep-quant expert GEMM (re-scoped Stage 2): out[P,N] where
@@ -605,40 +665,6 @@ std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>
 // `ds4.c:rope_tail_ext_inplace` (+ `rope_yarn_corr_dim`/`rope_yarn_ramp`). Getting
 // this wrong scrambles the rope half of q·k on every compressed layer → the model
 // loses positional/context structure (degenerate repetition).
-double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
-  return static_cast<double>(n_dims) *
-         std::log(static_cast<double>(n_ctx_orig) /
-                  (beta * 2.0 * std::numbers::pi_v<double>)) /
-         (2.0 * std::log(base));
-}
-void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
-                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
-                      double beta_slow, bool inverse = false) {
-  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
-  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
-  double corr_lo = 0.0, corr_hi = 0.0;
-  if (ext_factor != 0.0) {
-    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
-    corr_hi = std::min(static_cast<double>(r - 1),
-                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
-  }
-  double theta_extrap = static_cast<double>(pos);
-  for (int64_t i = 0; i < r; i += 2) {
-    const double theta_interp = freq_scale * theta_extrap;
-    double theta = theta_interp;
-    if (ext_factor != 0.0) {
-      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
-      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
-      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
-    }
-    const float c = static_cast<float>(std::cos(theta));
-    const float s = static_cast<float>(sin_sign * std::sin(theta));
-    const float x0 = v[i], x1 = v[i + 1];
-    v[i] = x0 * c - x1 * s;
-    v[i + 1] = x0 * s + x1 * c;
-    theta_extrap *= theta_scale;
-  }
-}
 
 std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) {
   return std::vector<float>(v.begin() + off, v.begin() + off + len);
@@ -701,8 +727,14 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
   if (is_indexer) {
     const int64_t inh = p.index_n_heads;
     const int64_t ihd = p.index_head_dim;
-    want("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
-         L.idx_wq.size(), inh * ihd * H);
+    // Either geometry is READABLE now: upstream's `[inh*ihd, q_lora_rank]` (the
+    // real artifact's) or the collapsed `[inh*ihd, hidden_size]` the synthetic
+    // suites use. The forward dispatches on which one it got.
+    if (static_cast<int64_t>(L.idx_wq.size()) != inh * ihd * p.q_lora_rank)
+      want("indexer.wq_b",
+           "[index_n_heads*index_head_dim, q_lora_rank] (upstream) or "
+           "[index_n_heads*index_head_dim, hidden_size] (collapsed)",
+           L.idx_wq.size(), inh * ihd * H);
     want("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
          L.idx_wk.size(), ihd * H);
     want("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
@@ -890,6 +922,57 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const std::vector<float>* kv_keys = &deck;
   int64_t kv_base = 0;
   int64_t n_keys = T;
+  // W5 (#2323): THE PAGED ARM. This step's latents are written into the runner's
+  // pages and the attention reads them back, so nothing grows a contiguous deck.
+  VT_CHECK(be.paged_kv == nullptr || be.kv == nullptr,
+           "deepseek-v4: the paged MLA cache and the contiguous deck cache are two "
+           "sources of truth for the same keys; a step that wrote one and read the "
+           "other would produce plausible tokens from a stale context. Refusing "
+           "both at once (KV-DSV4-MULTICACHE W5, #2323)");
+  bool paged_attn = false;
+  if (be.paged_kv != nullptr) {
+    // W1 (#2286): a `compress_ratio == 128` layer may proceed WHEN the caller
+    // supplies compressor state, because `CompressorLayerStep` composes it. Every
+    // other compressor shape, and the indexer, still refuse: `compress_ratio == 4`
+    // is `coff == 2` plus the Lightning Indexer and is W3's.
+    const bool comp_arm =
+        is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128;
+    VT_CHECK(!is_indexer && (!is_comp || comp_arm),
+             "deepseek-v4: the paged MLA arm is dense-causal only; the indexer and "
+             "compressor layers belong to MODEL-DSV4-DSA-COMPOSE (#2286)");
+    VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
+             "deepseek-v4: paged MLA cache has no tensor for this layer");
+    vt::Tensor& page = (*be.paged_kv)[static_cast<size_t>(layer)];
+    VT_CHECK(page.rank == 3 && page.shape[2] == hd,
+             "deepseek-v4: paged MLA cache must be [num_blocks, block_size, head_dim]");
+    kv_base = be.kv_base;
+    n_keys = kv_base + T;
+
+    // WRITE. `vt::ConcatAndCacheMla` takes the latent as its nope part plus its
+    // rope tail, and it is STRIDE-DRIVEN, so both are views over the SAME
+    // contiguous `deck` -- offset 0 width `nope`, offset `nope` width `rope`,
+    // both at row stride `hd`. Nothing is materialized to split them.
+    const int64_t rope_w = rope, nope_w = hd - rope;
+    std::vector<int64_t> slots(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) slots[static_cast<size_t>(t)] = kv_base + t;
+    // Built contiguous then RE-STRIDED: the row stride is the full `hd`, so each
+    // view walks the same buffer and reads its own columns. `ConcatAndCacheMla`
+    // indexes by stride, which is what makes the no-copy split legal.
+    vt::Tensor t_kvc = vt::Tensor::Contiguous(const_cast<float*>(deck.data()),
+                                              vt::DType::kF32, be.q->device, {T, nope_w});
+    t_kvc.stride[0] = hd;
+    vt::Tensor t_pe = vt::Tensor::Contiguous(const_cast<float*>(deck.data()) + nope_w,
+                                             vt::DType::kF32, be.q->device, {T, rope_w});
+    t_pe.stride[0] = hd;
+    vt::Tensor t_slot = vt::Tensor::Contiguous(slots.data(), vt::DType::kI64,
+                                               be.q->device, {T});
+    // Skipped ONLY when the caller says the rows are already there. Silence would
+    // be the wrong shape for this: a step that believed it had written its KV and
+    // had not would attend a stale context and produce plausible tokens.
+    if (!be.paged_kv_prewritten)
+      vt::ConcatAndCacheMla(*be.q, t_kvc, t_pe, page, t_slot);
+    paged_attn = true;
+  }
   if (be.kv != nullptr) {
     VT_CHECK(!is_indexer && !is_comp,
              "kv-cache incremental decode requires dense MLA (no indexer/compressor)");
@@ -911,8 +994,24 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const int64_t inh = p.index_n_heads, ihd = p.index_head_dim, itopk = p.index_topk;
     // indexer q/k projections keep-quant (idx_wq_b / indexer_compressor_kv); the
     // weights_proj (idx_wproj) is a small V role and stays f32 (host).
+    // W3 (#2286): upstream's indexer query comes from the q-LoRA, NOT the hidden
+    // state. `wq_b` is `ReplicatedLinear(q_lora_rank, head_dim * n_head)`
+    // (`attention.py:721-726`, used at `:835`), so its K is `q_lora_rank`. `qa`
+    // above is already `qr` -- the q-LoRA output with `q_norm` applied in place --
+    // which is the same operand `wq_b` feeds the main query from.
+    //
+    // Dispatched on the weight's own K so BOTH geometries are readable: the real
+    // artifact stores `[inh*ihd, q_lora_rank]`, while the synthetic suites here
+    // were written against a collapsed `[inh*ihd, hidden_size]`. A shape this arm
+    // cannot read is refused by `RequireDsaGeometryOrRefuse` before reaching here.
+    const bool idx_q_from_qr =
+        static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr;
     const std::vector<float> iq =
-        Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T, inh * ihd, H);
+        idx_q_from_qr
+            ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
+                   inh * ihd, qlr)
+            : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
+                   inh * ihd, H);
     const std::vector<float> ik =
         Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H);
     const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
@@ -953,7 +1052,44 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const bool dev_attn = be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU &&
                         !is_indexer && DeviceAttnEnabled() &&
                         deepseek_v4::V4DeviceKernelsAvailable();
-  if (dev_attn) {
+  if (paged_attn) {
+    // W5 (#2323): read the pages back through the shared op. The causal mask is
+    // carried by `seq_lens[t] = kv_base + t + 1` inside the helper -- no mask
+    // tensor, one op call for the whole step. Proven equal to the loop below by
+    // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
+    // several `kv_base` values, with both off-by-one directions mutation-proven.
+    if (is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128) {
+      // The compressor arm. `deck` is this step's latents, `x` the hidden state the
+      // pool score projects from, and the state grows across steps.
+      DeepseekV4CompressorState& cs = *be.compressor;
+      VT_CHECK(static_cast<int64_t>(cs.state_kv.size()) > layer,
+               "deepseek-v4 compressor: state has no entry for this layer");
+      std::vector<int64_t> pos64(positions.begin(), positions.end());
+      o = deepseek_v4::CompressorLayerStep(
+          *be.q, x, deck, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
+          (*be.paged_kv)[static_cast<size_t>(layer)],
+          (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
+          (*be.paged_kv)[static_cast<size_t>(layer)].shape[1],
+          &cs.state_kv[static_cast<size_t>(layer)],
+          &cs.state_score[static_cast<size_t>(layer)],
+          &cs.comp_rows[static_cast<size_t>(layer)], pos64, kv_base, T, nh, H, hd,
+          p.compress_ratio(layer), p.sliding_window, eps, scale);
+    } else
+    o = deepseek_v4::PagedCausalMlaAttention(
+        *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
+        (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
+        (*be.paged_kv)[static_cast<size_t>(layer)].shape[1], T, nh, hd, kv_base,
+        L.attn_sink, scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink,
+        // W5 (#2323): a `compress_ratio <= 1` layer is SWA-ONLY upstream -- it
+        // attends its sliding window and nothing else
+        // (`nvidia/flashmla.py`: `k_cache=swa_cache` with `extra_k_cache=None`
+        // when `swa_only`). Attending the full prefix there diverges above the
+        // window, which is why this row's recorded 512-token exactness bound was
+        // wrong by 4x for these layers. Layers WITH a compressor keep the full
+        // prefix here: their window-plus-compressed-history composition belongs
+        // to MODEL-DSV4-DSA-COMPOSE (#2286) and they refuse above.
+        /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
+  } else if (dev_attn) {
     // kv_keys holds the cached deck [n_keys_total, hd]; sel is dense-causal, so the
     // device kernel derives it from kv_base+t (no per-key index list needed).
     deepseek_v4::DsaDevice()->decode_attn(
@@ -1294,7 +1430,11 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   }
 
   // one clamped-SwiGLU expert on the f32 host tower: w1/w3 [mi,H], w2 [H,mi].
-  const auto expert_f32 = [&](const float* w1, const float* w3, const float* w2,
+  // W1d (#2186): generic in the weight dtype, because this ONE lambda serves both
+  // the SHARED experts (carried tower, now bf16) and the ROUTED experts (still
+  // f32). `Dot` overloads on the element type and widens as it reads, so both
+  // instantiations share this body and the reduction order is identical.
+  const auto expert_f32 = [&](const auto* w1, const auto* w3, const auto* w2,
                               const float* xin) -> std::vector<float> {
     std::vector<float> gate_up(static_cast<size_t>(2) * mi);
     for (int64_t r = 0; r < mi; ++r) {
@@ -1368,8 +1508,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 1: gate + up. Shared expert stays a per-expert Gemm; the topk routed
       // experts collapse into ONE grouped kMatmulBTQuantGrouped launch each when
       // grouped_moe (else the Stage-2 per-expert GemmRowSlice batch).
-      g[0] = Gemm(be, &Lq->shared_gate, {}, x1, 1, mi, H, /*defer_sync=*/true);
-      u[0] = Gemm(be, &Lq->shared_up, {}, x1, 1, mi, H, /*defer_sync=*/true);
+      g[0] = Gemm(be, &Lq->shared_gate, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
+      u[0] = Gemm(be, &Lq->shared_up, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> xrep(static_cast<size_t>(topk) * H);  // topk copies of x1
         for (int64_t j = 0; j < topk; ++j)
@@ -1393,7 +1533,7 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 2: host clamped-SwiGLU
       for (int64_t a = 0; a < A; ++a) act[static_cast<size_t>(a)] = swiglu(g[a], u[a]);
       // phase 3: down. Shared per-expert; routed grouped when grouped_moe.
-      eo[0] = Gemm(be, &Lq->shared_down, {}, act[0], 1, H, mi, /*defer_sync=*/true);
+      eo[0] = Gemm(be, &Lq->shared_down, kNoHostWeights, act[0], 1, H, mi, /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> adown(static_cast<size_t>(topk) * mi);
         for (int64_t j = 0; j < topk; ++j)
@@ -1516,6 +1656,45 @@ void DumpAct(const char* name, const std::vector<float>& v) {
 }
 
 }  // namespace
+
+namespace deepseek_v4 {
+
+double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
+  return static_cast<double>(n_dims) *
+         std::log(static_cast<double>(n_ctx_orig) /
+                  (beta * 2.0 * std::numbers::pi_v<double>)) /
+         (2.0 * std::log(base));
+}
+void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
+                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
+                      double beta_slow, bool inverse) {
+  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
+  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
+  double corr_lo = 0.0, corr_hi = 0.0;
+  if (ext_factor != 0.0) {
+    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = std::min(static_cast<double>(r - 1),
+                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
+  }
+  double theta_extrap = static_cast<double>(pos);
+  for (int64_t i = 0; i < r; i += 2) {
+    const double theta_interp = freq_scale * theta_extrap;
+    double theta = theta_interp;
+    if (ext_factor != 0.0) {
+      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
+      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
+      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+    }
+    const float c = static_cast<float>(std::cos(theta));
+    const float s = static_cast<float>(sin_sign * std::sin(theta));
+    const float x0 = v[i], x1 = v[i + 1];
+    v[i] = x0 * c - x1 * s;
+    v[i + 1] = x0 * s + x1 * c;
+    theta_extrap *= theta_scale;
+  }
+}
+
+}  // namespace deepseek_v4
 
 // ─── Brick C part 2: the DEVICE-RESIDENT T=1 decode forward ───────────────────
 // The host-orchestrated ForwardComposeImpl drains the stream ~560×/step (each GEMM
@@ -2385,7 +2564,8 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
                                              const V4Backend& be,
-                                             std::vector<float>* mtp_residual_out = nullptr) {
+                                             std::vector<float>* mtp_residual_out = nullptr,
+                                             dspark::TapRequest* taps = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -2517,6 +2697,38 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
       DumpAct(nm, Slice(x, 0, H));  // #188 per-sub-op diff: routed+shared MoE output [H]
     }
 
+    // DSV4-DSPARK-DRAFTER W-1: the trunk tap. The drafter's entry reads the
+    // POST-block manifold state at `dspark_target_layer_ids`, which is this
+    // layer's output folded back through `MhcPost` -- the same state upstream
+    // exports after its residual add (`exllamav3/modules/transformer.py:198-203`)
+    // -- collapsed to `[T, H]` by its stream mean.
+    //
+    // Costs nothing when no caller asks: `taps` is null on every path but the
+    // drafter's, and the fold below runs only for a REQUESTED layer.
+    if (taps != nullptr) {
+      const auto it =
+          std::find(taps->layer_ids.begin(), taps->layer_ids.end(), layer);
+      if (it != taps->layer_ids.end()) {
+        std::vector<float> stack(static_cast<size_t>(T) * hc * H);
+        for (int64_t t = 0; t < T; ++t) {
+          const std::vector<float> folded =
+              MhcPost(Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
+                      Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc),
+                      hc, H);
+          std::copy(folded.begin(), folded.end(),
+                    stack.begin() + static_cast<int64_t>(t) * hc * H);
+        }
+        // Stored AT the request's own index, not appended: the concatenation
+        // order in `main_proj` is the REQUEST order, and appending would order
+        // them by layer instead.
+        const size_t slot =
+            static_cast<size_t>(std::distance(taps->layer_ids.begin(), it));
+        if (taps->taps.size() != taps->layer_ids.size())
+          taps->taps.resize(taps->layer_ids.size());
+        taps->taps[slot] = dspark::StreamMeanTap(stack, T, hc, H);
+      }
+    }
+
     // coherence-debug #188: dump the [hc,H] manifold state AFTER this layer (the
     // MoE output folded back through MhcPost, matching ds4's `cur` after
     // layer_forward_self_one). t=0 only (single-token localization run).
@@ -2590,6 +2802,168 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          V4Miswire miswire, V4ForwardTrace* trace) {
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
                             V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+}
+
+// DSV4-DSPARK-DRAFTER W-3: one block's KV rows, derived from the projected taps.
+// Defined here because its two dependencies -- the trunk's weighted `RmsNorm` and
+// `RopeInplaceLayer` -- already live in this translation unit, so the drafter
+// reuses them rather than growing a second copy of either.
+namespace dspark {
+
+std::vector<float> BlockKvRows(const std::vector<float>& main_x,
+                               const std::vector<float>& wkv,
+                               const std::vector<float>& kv_norm_w, float eps,
+                               const std::vector<int32_t>& positions, double rope_theta,
+                               int64_t num_tokens, int64_t hidden, int64_t head_dim,
+                               int64_t rope_dim) {
+  VT_CHECK(head_dim > 0 && hidden > 0 && rope_dim >= 0 && rope_dim <= head_dim,
+           "dspark kv: degenerate geometry");
+  VT_CHECK(rope_dim % 2 == 0, "dspark kv: the rope span is rotated in PAIRS");
+  VT_CHECK(static_cast<int64_t>(main_x.size()) == num_tokens * hidden,
+           "dspark kv: main_x must be [num_tokens, hidden]");
+  VT_CHECK(static_cast<int64_t>(wkv.size()) == head_dim * hidden,
+           "dspark kv: wkv must be [head_dim, hidden]");
+  VT_CHECK(static_cast<int64_t>(kv_norm_w.size()) == head_dim,
+           "dspark kv: kv_norm is [head_dim] -- the norm covers the WHOLE head, not "
+           "the nope half (exllamav3_ext/rope.cu:207,379)");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
+           "dspark kv: one position per token");
+
+  const int64_t nope = head_dim - rope_dim;
+  std::vector<float> out(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
+  for (int64_t t = 0; t < num_tokens; ++t) {
+    std::vector<float> row(static_cast<size_t>(head_dim), 0.0f);
+    for (int64_t d = 0; d < head_dim; ++d) {
+      double acc = 0.0;
+      const float* w = &wkv[static_cast<size_t>(d * hidden)];
+      const float* x = &main_x[static_cast<size_t>(t * hidden)];
+      for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(w[h]) * x[h];
+      row[static_cast<size_t>(d)] = static_cast<float>(acc);
+    }
+    // NORM FIRST, over the whole head, then rotate the tail -- the kernel's own
+    // order (`load_head(); apply_norm(); apply_rope();`).
+    const std::vector<float> normed = RmsNorm(row, kv_norm_w, eps);
+    std::copy(normed.begin(), normed.end(),
+              out.begin() + static_cast<int64_t>(t) * head_dim);
+    if (rope_dim > 0) {
+      // The blocks are the `"sliding"` kind, so they take the DENSE rope arm:
+      // `freq_scale = 1`, `ext_factor = 0`, no YaRN ramp.
+      RopeInplaceLayer(out.data() + t * head_dim + nope, rope_dim,
+                       positions[static_cast<size_t>(t)], rope_theta,
+                       /*freq_scale=*/1.0, /*ext_factor=*/0.0, /*n_ctx_orig=*/0,
+                       /*beta_fast=*/0.0, /*beta_slow=*/0.0);
+    }
+  }
+  return out;
+}
+
+}  // namespace dspark
+
+namespace {
+
+// Dequantize one named tensor of a head, or report the name that is missing.
+bool TakeTensor(const DeepseekV4MtpHead& h, const std::string& key,
+                std::vector<float>* out, std::string* refusal) {
+  const auto it = h.tensors.find(key);
+  if (it == h.tensors.end()) {
+    if (refusal->empty())
+      *refusal = "dspark block: the head carries no '" + key + "'";
+    return false;
+  }
+  *out = DequantizeDeepseekV4MtpTensor(it->second);
+  return true;
+}
+
+bool TakeBf16(const DeepseekV4MtpHead& h, const std::string& key, HostBf16* out,
+              std::string* refusal) {
+  std::vector<float> f;
+  if (!TakeTensor(h, key, &f, refusal)) return false;
+  out->resize(f.size());
+  for (size_t i = 0; i < f.size(); ++i) (*out)[i] = vt::F32ToBF16(f[i]);
+  return true;
+}
+
+}  // namespace
+
+namespace dspark {
+
+std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
+                                 const DeepseekV4Params& p,
+                                 DeepseekV4LayerHostWeights* out,
+                                 bool* out_missing_experts) {
+  VT_CHECK(out != nullptr, "dspark block: null out");
+  std::string refusal;
+  *out = DeepseekV4LayerHostWeights{};
+
+  TakeTensor(head, "attn_norm.weight", &out->attn_norm_weight, &refusal);
+  TakeTensor(head, "ffn_norm.weight", &out->ffn_norm_weight, &refusal);
+  TakeTensor(head, "attn.q_norm.weight", &out->q_norm_weight, &refusal);
+  TakeTensor(head, "attn.kv_norm.weight", &out->kv_norm_weight, &refusal);
+  TakeTensor(head, "attn.attn_sink", &out->attn_sink, &refusal);
+  TakeBf16(head, "attn.wq_a.weight", &out->wq_a, &refusal);
+  TakeBf16(head, "attn.wq_b.weight", &out->wq_b, &refusal);
+  TakeBf16(head, "attn.wkv.weight", &out->wkv, &refusal);
+  TakeBf16(head, "attn.wo_a.weight", &out->wo_a, &refusal);
+  TakeBf16(head, "attn.wo_b.weight", &out->wo_b, &refusal);
+  TakeTensor(head, "ffn.gate.weight", &out->gate_weight, &refusal);
+  TakeTensor(head, "ffn.gate.bias", &out->gate_bias, &refusal);
+  TakeBf16(head, "ffn.shared_experts.w1.weight", &out->shared_w1, &refusal);
+  TakeBf16(head, "ffn.shared_experts.w2.weight", &out->shared_w2, &refusal);
+  TakeBf16(head, "ffn.shared_experts.w3.weight", &out->shared_w3, &refusal);
+  // The two hyperconnections. `(2 + hc) * hc` is the `fn` width the trunk uses.
+  TakeTensor(head, "hc_attn_fn", &out->hc_attn_fn, &refusal);
+  TakeTensor(head, "hc_attn_base", &out->hc_attn_base, &refusal);
+  TakeTensor(head, "hc_attn_scale", &out->hc_attn_scale, &refusal);
+  TakeTensor(head, "hc_ffn_fn", &out->hc_ffn_fn, &refusal);
+  TakeTensor(head, "hc_ffn_base", &out->hc_ffn_base, &refusal);
+  TakeTensor(head, "hc_ffn_scale", &out->hc_ffn_scale, &refusal);
+
+  if (!refusal.empty()) return refusal;
+
+  // Shape agreement, checked HERE rather than deep inside a block forward, where
+  // a mismatch surfaces as an anonymous MatVec size error naming no tensor.
+  const int64_t H = p.hidden_size, hc = p.hc_mult;
+  if (static_cast<int64_t>(out->attn_norm_weight.size()) != H)
+    return "dspark block: attn_norm is not [hidden_size]";
+  if (static_cast<int64_t>(out->kv_norm_weight.size()) != p.head_dim)
+    return "dspark block: kv_norm is not [head_dim]";
+  if (static_cast<int64_t>(out->gate_weight.size()) != p.n_routed_experts * H)
+    return "dspark block: ffn.gate is not [n_routed_experts, hidden_size]";
+  if (static_cast<int64_t>(out->hc_attn_fn.size()) != (2 + hc) * hc * hc * H)
+    return "dspark block: hc_attn_fn is not [(2+hc)*hc, hc*hidden_size]";
+
+  // NOT filled: 20.2 GiB of routed experts per block as host f32. Reported so the
+  // caller learns it here rather than from an empty vector later.
+  if (out_missing_experts != nullptr) *out_missing_experts = true;
+  return {};
+}
+
+}  // namespace dspark
+
+// DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
+// Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream
+// mean per requested layer, IN REQUEST ORDER -- which is the order `main_proj`
+// concatenates them in.
+std::vector<std::vector<float>> DeepseekV4TrunkTapsHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int64_t>& layer_ids) {
+  for (const int64_t l : layer_ids)
+    VT_CHECK(l >= 0 && l < p.num_hidden_layers,
+             "deepseek-v4 taps: layer " + std::to_string(l) +
+                 " is outside the model's " + std::to_string(p.num_hidden_layers) +
+                 " layers; `dspark_target_layer_ids` names trunk layers");
+  dspark::TapRequest req;
+  req.layer_ids = layer_ids;
+  (void)ForwardComposeImpl(hw, p, token_ids, positions, /*logits_indices=*/{},
+                           V4Miswire::kNone, /*trace=*/nullptr,
+                           V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr},
+                           /*mtp_residual_out=*/nullptr, &req);
+  VT_CHECK(req.taps.size() == layer_ids.size(),
+           "deepseek-v4 taps: the forward filled " + std::to_string(req.taps.size()) +
+               " of " + std::to_string(layer_ids.size()) +
+               " requested taps; a requested layer was never reached");
+  return req.taps;
 }
 
 // ─── DeepSeek-V4 MTP self-speculative draft head (host oracle, W1) ────────────
@@ -2828,6 +3202,91 @@ void DeepseekV4ProfReset() {
   prof::g_gemm_s = 0.0;
   prof::g_sync_s = 0.0;
 }
+// KV-DSV4-MULTICACHE W5 (#2323) — incremental decode over the RUNNER'S PAGES.
+//
+// The paged counterpart of `DeepseekV4ForwardGgufCached`. Same contract: call it
+// once per step with the new tokens and `kv_base` set to how many keys the pages
+// already hold. It writes this step's per-layer latents into `paged_kv` and
+// attends over the pages, so nothing grows a contiguous deck.
+//
+// DENSE-CAUSAL ONLY. The indexer and compressor layers refuse inside
+// `AttentionBlock`; they belong to `MODEL-DSV4-DSA-COMPOSE` (#2286).
+std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
+                                              vt::Queue& queue,
+                                              std::vector<vt::Tensor>& paged_kv,
+                                              int64_t kv_base,
+                                              const std::vector<int32_t>& token_ids,
+                                              const std::vector<int32_t>& positions,
+                                              const std::vector<int32_t>& logits_indices,
+                                              bool kv_prewritten,
+                                              DeepseekV4CompressorState* compressor) {
+  VT_CHECK(weights.has_gguf_weights,
+           "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
+  VT_CHECK(weights.has_host_weights,
+           "DeepseekV4ForwardGgufPaged: the small f32 host tower is absent");
+  const int64_t nlayers = weights.params.num_hidden_layers;
+  VT_CHECK(static_cast<int64_t>(paged_kv.size()) == nlayers,
+           "DeepseekV4ForwardGgufPaged: one page tensor per layer is required");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
+  be.paged_kv = &paged_kv;
+  be.paged_kv_prewritten = kv_prewritten;
+  be.compressor = compressor;
+  be.kv_base = kv_base;
+  be.grouped_moe = GroupedMoeEnabled();
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
+                            logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
+// KV-DSV4-MULTICACHE W5 (#2323). See the header for why this is pure.
+std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
+                                      const MultiKvCacheIndex& multi_kv,
+                                      const std::vector<PagedKvCache>& attn_kv,
+                                      int num_reqs, vt::Device device,
+                                      std::vector<vt::Tensor>* out_pages) {
+  // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
+  // step, so a batch at differing context lengths would silently attend the
+  // wrong history for every request but one.
+  if (num_reqs != 1) {
+    return "deepseek-v4 paged forward: one request per step only; a batch at "
+           "differing context lengths needs a per-request kv_base "
+           "(KV-DSV4-MULTICACHE W5, #2323)";
+  }
+  // SWA-ONLY LAYERS. A layer with a compressor composes its window with selected
+  // compressed history; attending the raw prefix instead would produce entirely
+  // plausible tokens from the wrong key set.
+  for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
+    if (params.has_compressor(l)) {
+      return "deepseek-v4 paged forward: layer " + std::to_string(l) +
+             " has a compressor (compress_ratio " +
+             std::to_string(params.compress_ratio(l)) +
+             "), whose window-plus-compressed-history composition is unported. "
+             "Refusing rather than attending over the raw prefix "
+             "(MODEL-DSV4-DSA-COMPOSE, #2286)";
+    }
+  }
+  std::vector<vt::Tensor> pages(static_cast<size_t>(params.num_hidden_layers));
+  for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
+    // BY NAME, the way the runner published it. A name that does not resolve
+    // means the published topology and this forward disagree, and continuing
+    // would drop a cache in silence.
+    const std::string name = "model.layers." + std::to_string(l) + ".attn.swa_cache";
+    const int64_t idx = multi_kv.Find(name);
+    if (idx < 0 || idx >= static_cast<int64_t>(attn_kv.size())) {
+      return "deepseek-v4 paged forward: no published cache named '" + name + "'";
+    }
+    const PagedKvCache& c = attn_kv[static_cast<size_t>(idx)];
+    if (c.head_size != params.head_dim) {
+      return "deepseek-v4 paged forward: the SWA cache for '" + name +
+             "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
+             std::to_string(params.head_dim);
+    }
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
+  }
+  *out_pages = std::move(pages);
+  return {};
+}
+
 double DeepseekV4ProfGemmSeconds() { return prof::g_gemm_s; }
 double DeepseekV4ProfSyncSeconds() { return prof::g_sync_s; }
 
@@ -2923,7 +3382,7 @@ void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
       if (std::fread(din.data(), sizeof(float), static_cast<size_t>(H), fi) != static_cast<size_t>(H)) { std::fclose(fi); return; }
       std::fclose(fi);
       const int64_t ne = p.n_routed_experts;
-      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, {}, din, 1, ne, H);
+      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, kNoHostWeights, din, 1, ne, H);
       double dr = 0; for (float v : din) dr += (double)v * v;
       std::fprintf(stderr, "[gate-xcheck] on ds4's router input (rms=%.4f): OUR logit[33]=%.4f logit[233]=%.4f\n",
                    std::sqrt(dr / H), myg[33], myg[233]);
@@ -2992,6 +3451,36 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
   be.exl3 = &weights.exl3;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                             V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the PAGED non-GGUF forward, which is what
+// makes the compressor arm reachable at all.
+//
+// `DeepseekV4ForwardGgufPaged` cannot host it: that arm binds `gguf`, so
+// `dsa_dense` is true and `is_comp` is false on every layer regardless of
+// `compress_ratios`. This one binds `exl3` and leaves `gguf` null, so the
+// compressor and indexer predicates are live, exactly as in the stateless
+// `DeepseekV4ForwardExl3` beside it.
+//
+// `compressor` is optional and null keeps the refusal, so adding this entry
+// changes no existing behaviour.
+std::vector<float> DeepseekV4ForwardExl3Paged(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices,
+    DeepseekV4CompressorState* compressor) {
+  VT_CHECK(weights.has_exl3_weights,
+           "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
+  VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
+           "DeepseekV4ForwardExl3Paged: one page tensor per layer is required");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.exl3 = &weights.exl3;
+  be.paged_kv = &paged_kv;
+  be.kv_base = kv_base;
+  be.compressor = compressor;
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
+                            logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
 
 std::vector<float> DeepseekV4Model::Forward(

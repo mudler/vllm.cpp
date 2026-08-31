@@ -342,12 +342,25 @@ DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
   const int64_t P = T * top_k;
 
   // --- router: logits = gate(hidden) then grouped top-k ---------------------
-  // `router_logits, _ = self.gate(hidden_states)` (:413). GateLinear is a plain
-  // ReplicatedLinear here (router_dtype is None for V2/V2-Lite —
-  // `_get_moe_router_dtype` at :120-130 returns fp32 only for glm_moe_dsa or an
-  // explicit `moe_router_dtype: "float32"`), so this is the bf16 GEMM.
+  // `router_logits, _ = self.gate(hidden_states)` (:417). The gate is a
+  // ReplicatedLinear whose OUTPUT dtype is `_get_moe_router_dtype(config)`
+  // (`:309-314`, `GateLinear(..., out_dtype=self.router_dtype)`), which is f32
+  // for `model_type == "glm_moe_dsa"` (`:127`) and for any config declaring
+  // `moe_router_dtype: "float32"` (`:131`), and None — i.e. the model dtype —
+  // otherwise. DeepSeek-V2 and V2-Lite declare neither and stay bf16.
+  //
+  // THE ANNOTATED f32, and the one buffer on this path that is deliberately
+  // wider than the checkpoint's dtype. `vt::MoeRouterTopK` already accepts any
+  // float logits dtype and already scores in f32, so widening the STORE is the
+  // whole delta: it is the rounding between the GEMM and the top-k that
+  // upstream removes, not the arithmetic inside either.
+  //
+  // The three anchors in the previous version of this comment were all stale —
+  // `:413` for the gate call (now `:417`) and `:120-130` for
+  // `_get_moe_router_dtype` (now `:123-133`) — and they were correct at the
+  // PRIOR pin. Re-read at `5559679229` on 2026-08-30.
   Tensor drg = ResidentWeight(d, w.router_gate);  // [H,E] Matmul-B
-  DBuf dlog(d, DType::kBF16, {T, E});
+  DBuf dlog(d, p.router_dtype_is_f32 ? DType::kF32 : DType::kBF16, {T, E});
   vt::Matmul(d.q, dlog.t(), dh, drg);
 
   vt::MoeRouterTopKArgs args{};

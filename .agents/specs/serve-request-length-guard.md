@@ -231,9 +231,9 @@ hand. `## Outcome` records the deletion mutation.
 **Code:** none. Host code only, no oracle run, no lease, no checkpoint mount.
 The four goldens the derivation was measured on are already committed.
 
-**Record:** none, and this row appends no [`issue-index.md`](../issue-index.md)
+**Record:** none, and this row appends no [`issue-index.md`](../completed/issue-index.md)
 row of its own. #1541's row already landed at
-[`issue-index.md`](../issue-index.md), appended by the closing commit of
+[`issue-index.md`](../completed/issue-index.md), appended by the closing commit of
 `SPEC-BPE-QUADRATIC-MERGE`, and the index is append-only: a second row for the
 same issue is what `scripts/check-agent-record.py` reports as `issue #1541
 listed twice`. That row names no owning row ID and is owned through `## Owed` in

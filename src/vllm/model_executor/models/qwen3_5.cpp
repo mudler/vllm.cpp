@@ -13,6 +13,7 @@
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
+#include "vllm/model_executor/expert_stream_seam.h"  // MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the lifted lane
 #include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) slot-key + dispatch counters
 #include "vllm/model_executor/models/qwen3_5.h"
 
@@ -29,6 +30,7 @@
 #include "vllm/model_executor/moe_placement_seam.h"
 #include "vllm/model_executor/models/qwen3_5_gdn_block.h"  // RunGdnBlockPaged (W5b seam, #2110)
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
+#include "vllm/model_executor/models/qwen3_5_mrope.h"  // BuildMropeCosSinHost (W5d-2 seam, #2249)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor residency seam
@@ -1159,7 +1161,15 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // ...and with no host bytes there is nothing to alias, so skip the attempt
     // rather than charging a `kDeclinedEmpty` to the residency instrument for a
     // weight that is already device-resident.
-    if (!w.bytes.empty()) {
+    // PERF: prefer a TRUE DEVICE COPY when the box can hold one. The retag
+    // below is a measured decode tax on GB10 -- +22.5% throughput when staged
+    // instead, interleaved A/B on one boot (see `DeviceStagingFits`) -- and it
+    // exists only because #1299's 2.4T checkpoint cannot afford to pay for its
+    // weights twice. `DeviceStagingFits` asks that question of the BOX, so a
+    // model that fits stages and a model that does not keeps the retag.
+    // Falling through skips the alias attempt and reaches the staging branch.
+    const bool stage_instead = !w.bytes.empty() && StageOwnedWeightsToDevice();
+    if (!w.bytes.empty() && !stage_instead) {
       const bool aliased = MakeHostBytesDeviceAliasable(w);
       ReportHostAliasResidency();
       if (aliased) {
@@ -5653,7 +5663,8 @@ std::vector<uint16_t> ExpertMlp(Dev d, const OwnedTensor& gate,
 // produces garbage", FULL STOP, AND THAT IS NO LONGER TRUE OF EVERY STAGING PLATFORM
 // (ENG-EXPERT-STREAM-DEVICE W0c, issue #1124). It is still true of a DISCRETE one, and
 // that is why this function exists and why a discrete device keeps taking it. But
-// `KqHostSliceView` twenty lines below deliberately builds exactly the raw-host-ptr
+// `expert_stream::HostSliceView` (expert_stream_seam.h, lifted out of this file
+// by MODEL-TEXT-GLM-MOE-DSA W3) deliberately builds exactly the raw-host-ptr
 // view the old sentence forbade, on a platform whose probed
 // `host_memory_is_device_addressable()` says its kernels can follow a host pointer —
 // a GB10, where `PageableMemoryAccess` and `Integrated` are both 1 (W0a, measured).
@@ -5676,560 +5687,37 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
   return wt;
 }
 
-// ENG-EXPERT-STREAM W4: serve an expert slice from a BOUNDED slot cache instead
-// of reading it straight out of the mmap'd tower.
+// ENG-EXPERT-STREAM W4 / MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the streamed-expert
+// lane now lives in `expert_stream_seam.{h,cpp}` so a second model's translation
+// unit can reach it (spec .agents/specs/glm-dsa-latest-deepseek.md §3.7). Until
+// that lift this file was the ONLY one that constructed a `HostExpertSlotStore`,
+// which is why a new architecture could include every streaming header and still
+// not stream. Qwen3.5 is the seam's first client, and these four declarations are
+// the whole of what that costs: the lane, the step guard, the request predicate
+// and the slice seam are the SAME objects this file used to define, moved rather
+// than reimplemented.
 //
-// Default OFF (`VT_MOE_EXPERT_STREAM=1` turns it on, `VT_MOE_EXPERT_STREAM_SLOTS`
-// sets the budget), so every existing path keeps its bytes and its numbers.
-//
-// Why this exists, measured rather than assumed. On `Qwen3.8-2.4T-A95B UD-Q1_0`
-// the borrowed tower already makes a 370 GiB model FIT in 119 GiB, because the
-// weights are never copied. What it does not do is make it fast: each token
-// needs ~6.7 GB of expert bytes and the kernel serves them as 4 KiB faults in
-// ROUTER order, measured near 100 MB/s against an NVMe that sustains ~5 GB/s.
-// A slot is filled by ONE contiguous copy of a whole slice, so the read is
-// sequential, and a slice already resident costs nothing at all.
-//
-// The cache is keyed by (tower, expert). A tower's identity is `TowerUid()`, a
-// process-unique counter, NOT the buffer's address: the store outlives any one
-// model, and the allocator hands a freed tower's address to the next one (#1066,
-// and the note on TowerId below).
+// `KqExpertSlice` passes THIS file's `KqResidentSlice` in as the fallback, and
+// that is load-bearing rather than tidy. `KqResidentSlice` calls the
+// `ResidentWeight` defined in this translation unit, which SHADOWS
+// `dense_attn_block.h`'s and carries the `expert_streamed`, `elem_kn_repacked`
+// and `repacked` staging refusals plus the host-alias arm that the header's
+// version does not have. A seam that called `ResidentWeight` itself would bind
+// to the header's definition and quietly drop all of them, which is a behaviour
+// change to a gated model. Injecting the function keeps the streamed lane
+// byte-identical to what it was before the lift, by construction rather than by
+// inspection; the seam header carries the full argument.
+using Qwen35ExpertStream = ::vllm::expert_stream::ExpertStreamLane;
+using Qwen35ExpertStreamStep = ::vllm::expert_stream::ExpertStreamStepGuard;
 
-// Whether the operator ASKED for streaming, independent of whether a store has
-// been built yet. The grouped-MoE gate needs this before any expert is touched.
 inline bool Qwen35ExpertStreamRequested() {
-  // ENG-RESIDENCY-CONFIG (#1110): the answer now comes from
-  // `ResolveExpertStreamRequested()`, which holds `VT_MOE_EXPERT_STREAM` >
-  // `--offload-config`'s `vllm_cpp.expert_stream.enabled` > OFF, and which keeps
-  // this knob's ODD environment rule verbatim: only the FIRST CHARACTER is
-  // examined, so `VT_MOE_EXPERT_STREAM=false` is ON. That is what
-  // docs/ENVIRONMENT.md documents, so it is transcribed rather than normalised
-  // onto the tree's whole-value polarity.
-  //
-  // The answer is still cached on first call, and that is deliberate — it decides
-  // whether an ~18 GiB slot store is built and whether the default-on grouped-MoE
-  // path is disabled, and those two must not be able to disagree later in the same
-  // process. The function-local static lives in `ResolveExpertStreamRequested`, not
-  // here; this is a pure delegation.
-  //
-  // That cached answer is why `SetWeightResidencyConfig` refuses a config that would
-  // CHANGE it — not one that arrives late. A document that omits `expert_stream`, or
-  // asks for exactly what was decided, or that the environment overrides anyway, is
-  // accepted; only one that would make this function's answer differ from the value
-  // already returned is refused, because recording that would publish a
-  // configuration the engine is not running. The loader installs in `FromModelDir`'s
-  // first block, ahead of all weight I/O, so the ordering holds by construction.
-  return ResolveExpertStreamRequested();
+  return ::vllm::expert_stream::StreamRequested();
 }
 
-class Qwen35ExpertStream {
- public:
-  // The store, or nullptr when nothing has built one. NEVER constructs, which
-  // is the whole reason it is separate from Get: the once-per-step hook and the
-  // stats reader must be able to ask "is this lane live?" without allocating an
-  // 18 GiB slot array behind a model that is not streaming at all.
-  static Qwen35ExpertStream* Existing() { return Slot().get(); }
-
-  // The largest slice a caller is about to take, declared BEFORE it takes any.
-  //
-  // gate/up and down are not the same size whenever a dynamic (UD) quant keeps
-  // `down_proj` at a higher precision than the gate/up pair, which is exactly
-  // what the checkpoints this row targets do. Sizing the store from whichever
-  // slice happened to arrive first then makes the FIRST down slice exceed the
-  // slot and trip the check below in the middle of decode. Declaring the
-  // maximum up front sizes the store once, correctly, before anything is
-  // stored, so the only remaining way to trip that check is a genuinely
-  // unforeseen slice.
-  static void Reserve(size_t slot_bytes) {
-    if (!Qwen35ExpertStreamRequested()) return;
-    std::lock_guard<std::mutex> lk(Mutex());
-    if (slot_bytes > Reserved()) Reserved() = slot_bytes;
-  }
-
-  static Qwen35ExpertStream* Get(size_t slot_bytes) {
-    if (!Qwen35ExpertStreamRequested()) return nullptr;
-    Qwen35ExpertStream* inst = nullptr;
-    {
-      // Construction only. The lock does NOT cover Slice: a decode step runs on
-      // one host thread, and holding a process-wide mutex across every expert
-      // slice would serialise the lane it exists to speed up.
-      //
-      // It does have to cover construction. The previous `static T* inst =
-      // nullptr; if (inst == nullptr) inst = new T(...)` is not the magic-static
-      // idiom used a few lines above and carries none of its guarantees: two
-      // concurrent first calls both see null, both construct, and one ~18 GiB
-      // store is leaked while the two halves of the model disagree about which
-      // cache they are using.
-      std::lock_guard<std::mutex> lk(Mutex());
-      std::unique_ptr<Qwen35ExpertStream>& slot = Slot();
-      if (slot == nullptr) {
-        slot.reset(new Qwen35ExpertStream(std::max(slot_bytes, Reserved())));
-      }
-      inst = slot.get();
-    }
-    // A tower larger than the slot cannot be served by THIS store. Refuse by
-    // name rather than silently falling back, which would make a streaming
-    // benchmark quietly measure the mmap path instead. Both sizes are named,
-    // because "too big" without the budget it exceeded is not actionable.
-    VT_CHECK(slot_bytes <= inst->store_->slot_bytes(),
-             "expert stream: a slice of " + std::to_string(slot_bytes) +
-                 " bytes exceeds the slot budget of " +
-                 std::to_string(inst->store_->slot_bytes()) +
-                 "; raise VT_MOE_EXPERT_STREAM_SLOT_BYTES");
-    return inst;
-  }
-
-  // The decode step boundary. Calling it is what clears per-step eviction
-  // protection and advances the hotness clock; see the note on the RAII guard
-  // below for what happens when nobody does.
-  static void EndStepIfActive() {
-    if (Qwen35ExpertStream* s = Existing()) s->EndStep();
-  }
-
-  // Force the cache-exhaustion branch, which makes every Slice return nullptr
-  // and every caller fall back to the resident tower view. This is a REAL
-  // production state (a budget smaller than one step's working set reaches it),
-  // and having a switch for it is what lets a gate prove the streamed and
-  // unstreamed arms produce the same bytes inside one process.
-  static void SetForceFallback(bool on) { ForceFallback() = on; }
-
-  // Returns the slot's bytes for `expert` of the tower based at `base`, or
-  // nullptr when the cache is exhausted for this step (the caller then reads
-  // the tower directly, which is correct but slow, and is counted).
-  // `fd`/`file_offset` describe where the slice lives on DISK. When they are
-  // valid the slot is filled by pread, which is the form the design specified
-  // and the only one that changes the I/O: a memcpy from the mapping still
-  // traps every 4 KiB page of its source, which is why W4 measured no decode
-  // gain. The mapping copy stays as the fallback for a weight with no
-  // descriptor (an expanded or repacked tensor owns its bytes outright).
-  uint8_t* Slice(const uint8_t* base, uint64_t tower_uid, int64_t expert,
-                 size_t offset, size_t bytes, int fd, size_t file_offset) {
-    if (ForceFallback()) {
-      // COUNTED SEPARATELY FROM `exhausted_`, on purpose (#1091 finding 6).
-      // `exhausted` is the operator-facing number and both docs define it as
-      // "the budget is smaller than one step's working set; raise
-      // VT_MOE_EXPERT_STREAM_SLOTS". This switch has no production caller at
-      // all, so charging it to that counter told an operator to raise a budget
-      // that was never the reason. It stays out of the stderr line for the same
-      // reason: in a production process it is always zero.
-      ++forced_;
-      return nullptr;
-    }
-    const int32_t tower = TowerId(tower_uid);
-    const ExpertKey key{tower, static_cast<int32_t>(expert)};
-    if (fd >= 0) {
-      const ExpertStreamer::Result r =
-          streamer_->EnsureFile(key, fd, file_offset + offset, bytes);
-      if (r.slot < 0) {
-        ++exhausted_;
-        return nullptr;
-      }
-      return store_->Slot(r.slot);
-    }
-    // Ask the kernel for the WHOLE slice up front, before the copy touches it.
-    //
-    // This is the difference between one readahead and 608 demand faults. The
-    // W4 measurement showed that filling a slot by memcpy from the mapping
-    // inherits the fault path streaming exists to bypass: the copy is
-    // sequential, but each 4 KiB page still traps. MADV_WILLNEED hands the
-    // range to the kernel's readahead in one call, which is the same lever
-    // `PrefaultBorrowedSpan` already uses at load, applied per slice at decode.
-    //
-    // Advisory and read-only, so it cannot change a byte. Skipped on a hit,
-    // where nothing will be read at all.
-    //
-    // THE ADDRESS MUST BE PAGE-ALIGNED. madvise(2) returns EINVAL when it is
-    // not, and a GGUF tensor is aligned to `general.alignment`, which defaults
-    // to 32 (gguf_reader.cpp:401) — so the slice address is essentially never a
-    // page boundary and the unaligned form was a no-op that reported nothing,
-    // because the return value was discarded too. Round the start DOWN and the
-    // end UP: the extra bytes belong to a neighbouring expert that this step is
-    // very likely to want as well, and MADV_WILLNEED cannot harm them either
-    // way. `advised_` counts the calls that were actually accepted, so a run
-    // can tell a working hint from a silently rejected one.
-    //
-    // ROUNDING THE END UP CAN LEAVE THE ALLOCATION, and that is the one way
-    // this call still fails: madvise(2) returns ENOMEM when any page in the
-    // range is unmapped, so a tower whose last byte sits near the end of its
-    // final mapped page would not be counted. In production the tower is a
-    // borrowed view into a file mapping many pages larger than one slice, so
-    // the trailing page is mapped. On the heap-backed towers the gates build it
-    // holds because the allocator's arena page is mapped, not because the
-    // allocation reaches it — which is why `advised == fills` is asserted
-    // against a measured run rather than assumed from the arithmetic.
-    //
-    // NO SPEEDUP IS CLAIMED HERE. This makes the call well-formed; whether
-    // readahead moves decode is a measurement the spec records as owed.
-#if defined(__unix__)
-    if (!cache_->IsResident(key)) {
-      const long ps_l = ::sysconf(_SC_PAGESIZE);
-      const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
-      const auto begin = reinterpret_cast<uintptr_t>(base + offset);
-      const uintptr_t page_begin = begin & ~(ps - 1);
-      const uintptr_t page_end = (begin + bytes + ps - 1) & ~(ps - 1);
-      if (::madvise(reinterpret_cast<void*>(page_begin),
-                    static_cast<size_t>(page_end - page_begin),
-                    MADV_WILLNEED) == 0) {
-        ++advised_;
-      }
-    }
-#endif
-    const ExpertStreamer::Result r =
-        streamer_->EnsureSpan(key, base + offset, bytes);
-    if (r.slot < 0) {
-      ++exhausted_;
-      return nullptr;
-    }
-    return store_->Slot(r.slot);
-  }
-
-  void EndStep() {
-    streamer_->EndStep();
-    ReportStats(/*final=*/false);
-  }
-  const ExpertStreamer& streamer() const { return *streamer_; }
-  const ExpertSlotCache& cache() const { return *cache_; }
-  int64_t exhausted() const { return exhausted_; }
-  int64_t forced() const { return forced_; }
-  int64_t advised() const { return advised_; }
-
-  // ONE line a benchmark can read to prove the lane stayed live.
-  //
-  // This exists because of how the row's published decode number went wrong.
-  // The run printed `[expert-stream] ON ...` once at startup and then nothing,
-  // so a cache that switched itself off partway through token 3 looked exactly
-  // like one that worked for the whole run, and "streaming ON: no decode gain"
-  // was measured against a dead lane. The two numbers that would have caught it
-  // immediately are `steps` and `exhausted`: steps==0 means the step clock never
-  // advanced, and exhausted>0 means slices were refused and silently served from
-  // the mapping instead. Both are on this line, and either is wrong at a glance.
-  //
-  // `final` IS THE WHOLE POINT AND IT USED TO HAVE NO CALLER (#1091 finding 1).
-  // The periodic report is skipped on `steps == 0` — so the one run that most
-  // needs the line, the one where the step boundary is never reached, printed
-  // nothing at all, and both docs told an operator to read a zero off a line
-  // that could not exist. It is skipped again whenever `stats_every_` does not
-  // divide the step count, and the default is 16, so a healthy five-token run
-  // printed nothing either and a benchmark reading absence as failure reported
-  // VOID on a working lane. The final report crosses both early returns.
-  void ReportStats(bool final) const {
-    const int64_t steps = cache_->steps();
-    if (!final) {
-      if (stats_every_ <= 0) return;
-      if (steps == 0 || steps % stats_every_ != 0) return;
-    }
-    PrintStatsLine(steps, cache_->hits(), cache_->misses(), cache_->evictions(),
-                   streamer_->fills(), streamer_->bytes_filled(), exhausted_,
-                   advised_);
-  }
-
-  // The final line, printed exactly ONCE per process.
-  //
-  // NOTHING IN PRODUCTION CALLS THIS, and read the destructor below before you
-  // conclude otherwise. Teardown produces the LINE but does not route through
-  // here: the store is a function-local static, so `~Qwen35ExpertStream` runs on
-  // the normal exit path and calls `ReportStats` itself, for the reason stated
-  // there. The two share the once-flag, not a call, so exactly one of them
-  // prints. This entry exists so a GATE can observe the same guarantee from
-  // inside a running process, because a static destructor fires after main
-  // returns and nothing in the process can assert on it.
-  //
-  // A once-flag rather than two independent prints, so "one line" is a property
-  // of the process and not of which caller happened to win. The flag is a plain
-  // bool with constant initialisation and no destructor of its own, so it cannot
-  // itself be lost to static-destruction ordering.
-  //
-  // No store means no line, and that is not a gap: a store that exists always
-  // announced itself with `[expert-stream] ON ...` first, so banner-without-line
-  // is a process that died, and no-banner is a lane nothing ever reached.
-  static void FlushFinalStats() {
-    if (FinalReported()) return;
-    Qwen35ExpertStream* s = Existing();
-    if (s == nullptr) return;
-    FinalReported() = true;
-    s->ReportStats(/*final=*/true);
-  }
-
-  ~Qwen35ExpertStream() {
-    // The store holds the numbers, so it prints them before it goes away. Not
-    // routed through FlushFinalStats: that reads `Existing()`, and the unique_ptr
-    // this object lives in does not clear itself before running this destructor.
-    if (!FinalReported()) {
-      FinalReported() = true;
-      ReportStats(/*final=*/true);
-    }
-  }
-
- private:
-  // The single instance, and the lock that makes creating it safe. Both are
-  // function-local statics so their own initialisation is the thread-safe magic
-  // static this class failed to use for the instance itself.
-  static std::unique_ptr<Qwen35ExpertStream>& Slot() {
-    static std::unique_ptr<Qwen35ExpertStream> inst;
-    return inst;
-  }
-  static std::mutex& Mutex() {
-    static std::mutex m;
-    return m;
-  }
-  static size_t& Reserved() {
-    static size_t bytes = 0;
-    return bytes;
-  }
-  static bool& ForceFallback() {
-    static bool on = false;
-    return on;
-  }
-  // Constant-initialised and destructor-free, so the "has the final line been
-  // printed" answer survives every other static's destruction.
-  static bool& FinalReported() {
-    static bool done = false;
-    return done;
-  }
-
-  // The one place the statistics line's format lives, so the final report and
-  // the periodic report cannot drift apart into two shapes a parser has to
-  // know about.
-  static void PrintStatsLine(int64_t steps, int64_t hits, int64_t misses,
-                             int64_t evictions, int64_t fills, int64_t bytes,
-                             int64_t exhausted, int64_t advised) {
-    std::fprintf(stderr,
-                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
-                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
-                 "advised=%lld\n",
-                 static_cast<long long>(steps), static_cast<long long>(hits),
-                 static_cast<long long>(misses),
-                 static_cast<long long>(evictions),
-                 static_cast<long long>(fills), static_cast<long long>(bytes),
-                 static_cast<long long>(exhausted),
-                 static_cast<long long>(advised));
-  }
-
-  explicit Qwen35ExpertStream(size_t slot_bytes) {
-    // ENG-RESIDENCY-CONFIG (#1110): both sizes resolve through the shared
-    // resolvers, which hold env var > `--offload-config`'s
-    // `vllm_cpp.expert_stream.{slots,slot_bytes}` > the default, and which keep
-    // the tolerant integer parsing this constructor already had (atoll, then
-    // ignore anything non-positive) so an environment-only run is unchanged. The
-    // CONFIG side is stricter: a zero or negative value is refused at startup,
-    // where the operator can still read the message, rather than silently becoming
-    // the default.
-    //
-    // `slot_bytes`' default is the caller's computed maximum, not a constant, so it
-    // is passed in rather than duplicated here.
-    slot_bytes = static_cast<size_t>(
-        ResolveExpertStreamSlotBytes(static_cast<int64_t>(slot_bytes)));
-    const int32_t slots = static_cast<int32_t>(ResolveExpertStreamSlots());
-    // STATS_EVERY stays environment-only, and that is a decision rather than an
-    // oversight: it changes only how often the line below is printed, so it is the
-    // instrument and not the configuration. `--offload-config` refuses it as an
-    // unknown key rather than accepting and dropping it.
-    const char* se = std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY");
-    if (se != nullptr && *se != '\0') {
-      const long v = std::atol(se);
-      if (v >= 0) stats_every_ = static_cast<int64_t>(v);
-    }
-    // Record the geometry this store was actually built with. It is the only way
-    // a test can tell that the two resolvers above were consulted: the values are
-    // otherwise visible only on a stderr line, and a site that hardcoded the
-    // default would leave every existing suite green.
-    NoteExpertStreamGeometry(static_cast<int64_t>(slots),
-                             static_cast<int64_t>(slot_bytes));
-    store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
-    cache_ = std::make_unique<ExpertSlotCache>(slots);
-    streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
-    std::fprintf(stderr,
-                 "[expert-stream] ON slots=%d slot_bytes=%zu resident=%.2f GiB\n",
-                 slots, slot_bytes, store_->resident_bytes() / 1073741824.0);
-  }
-
-  // A tower's cache identity, compacted into the int32 the key carries.
-  //
-  // The argument is the tensor's PROCESS-UNIQUE uid, not its base pointer. A
-  // pointer was wrong here in a way no single-model test could see. This store
-  // is a process-lifetime singleton, so it outlives any one model, and the
-  // allocator hands out an address again as soon as the first model is freed.
-  // The second model's tower then hit the FIRST model's entries and was served
-  // another checkpoint's weights, as a HIT, which by contract moves no bytes and
-  // so leaves nothing downstream to notice. Measured on two synthetic models in
-  // one process: 24 towers occupied 21 distinct addresses, and 20 of 222 slices
-  // came back wrong. The comment this replaces asserted the opposite, and its
-  // premise ("stable for the model's life") was true; the CACHE is simply not
-  // scoped to one model's life.
-  int32_t TowerId(uint64_t uid) {
-    auto it = tower_ids_.find(uid);
-    if (it != tower_ids_.end()) return it->second;
-    const int32_t id = next_tower_id_++;
-    tower_ids_.emplace(uid, id);
-    return id;
-  }
-
-  std::unique_ptr<HostExpertSlotStore> store_;
-  std::unique_ptr<ExpertSlotCache> cache_;
-  std::unique_ptr<ExpertStreamer> streamer_;
-  std::unordered_map<uint64_t, int32_t> tower_ids_;
-  int32_t next_tower_id_ = 0;
-  int64_t exhausted_ = 0;
-  // Slices the FORCED-fallback switch refused. Separate from `exhausted_`
-  // because that one is an operator-facing budget diagnosis and this one is a
-  // gate asking for the unstreamed arm; see the note at the ForceFallback
-  // branch in Slice.
-  int64_t forced_ = 0;
-  int64_t advised_ = 0;
-  int64_t stats_every_ = 16;
-};
-
-// The decode step boundary, as a scope guard.
-//
-// WHY THIS EXISTS AT ALL. `ExpertSlotCache::Acquire` marks every entry it
-// serves `protected_this_step`, because evicting a slot the current step is
-// about to read would hand the kernel bytes that are being overwritten. ONLY
-// EndStep clears that mark. Without a caller, the protection is permanent: once
-// the cache fills, `ColdestEvictable` finds every entry protected and returns
-// -1, `Acquire` returns slot -1, `Slice` returns nullptr, and every later slice
-// falls back to the mmap path. The lane switches itself off and says nothing,
-// the step clock never advances, and so the hotness decay, the LFU score, the
-// LRU tiebreak and eviction never run in production at all. On the live
-// configuration (8000 slots, ~2790 slices per token) that happens partway
-// through the third token.
-//
-// A guard rather than a call at the end of the body: ForwardLayers has two
-// returns and can throw, and a step that ended by throwing still ended.
-//
-// ONE FORWARD IS ONE STEP, AND THE GUARD REFUSES TO NEST (#1091 finding 3).
-// Five forwards in this file take expert slices — `ForwardLayers`,
-// `Qwen3_5Model::ForwardDense`, both MTP forwards and `Qwen3_5ReplayLayer` —
-// and each is a complete forward that no other one contains. A nested guard
-// would end the step twice, which advances the hotness clock for a step that
-// never happened and decays every resident entry an extra tick; that is a
-// quieter defect than the missing boundary and it is the one adding guards
-// invites. So the precondition is stated rather than handled, the same way
-// `MatmulF32Slice` states `expert >= 0`: the flag is per-thread because a
-// decode step runs on one host thread, which is the assumption the store's own
-// locking already makes.
-//
-// THE REFUSAL IS NOT GATED ON `Qwen35ExpertStreamRequested()`, deliberately.
-// "One forward is one step" is a property of the CALL GRAPH, not of the
-// streaming lane: a nest is a defect whether or not a store exists, and the
-// streamed run is the rare configuration. Arming it only there would let the
-// default-on path establish a nest that nobody sees until someone turns
-// streaming on, which is the shape this row keeps finding. The cost is that a
-// nest reds every Qwen3.5 forward rather than only the streamed ones, and that
-// is the intended polarity: loud on the default path is what makes it a gate.
-//
-// `Begin`/`End` are named rather than living only in the constructor and
-// destructor bodies so that `detail::ExpertStreamStepScope` can hold THE SAME
-// boundary. A gate that re-implemented the refusal would prove its own copy;
-// this way deleting the `VT_CHECK` below is one edit that both changes
-// production and takes the gate red.
-struct Qwen35ExpertStreamStep {
-  Qwen35ExpertStreamStep() { Begin(); }
-  ~Qwen35ExpertStreamStep() { End(); }
-  Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
-  Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
-
-  // Open the step. Throws when one is already open on this thread; the flag is
-  // then left as it was, so the outer guard's `End` still closes exactly one.
-  static void Begin() {
-    VT_CHECK(!Open(), "qwen3_5: a decode step is already open; the expert-stream "
-                      "step guard marks ONE forward and must not nest");
-    Open() = true;
-  }
-  static void End() {
-    Open() = false;
-    Qwen35ExpertStream::EndStepIfActive();
-  }
-
- private:
-  static bool& Open() {
-    static thread_local bool open = false;
-    return open;
-  }
-};
-
-// A [N,K] weight tensor over HOST-resident slice bytes — a slot, or the tower's
-// own mapping — carrying exactly the markers `ResidentWeight`'s ALIASING branch
-// carries and nothing else.
-//
-// WHY THIS IS NOT `ResidentWeight` WITH THE POINTER OVERWRITTEN, which is what
-// the slot arm used to do (ENG-EXPERT-STREAM-DEVICE W0c, issue #1124). That call
-// existed solely to inherit dtype/device/repack markers, and on CPU it aliases
-// and costs nothing. On a WEIGHT-STAGING platform it takes the other branch and
-// runs `d.b.Alloc(w.bytes.size())` on the whole `[E*N,K]` tower — 1.1875 GiB —
-// and memoizes it on `w.d_dev`. So the very first streamed slice allocated the
-// thing streaming exists to avoid, and lifting the `is_cpu()` guard below
-// without this helper reproduces issue #1123 instead of fixing it.
-//
-// The marker set is inherited by TRANSCRIPTION rather than by call, so it is
-// worth saying what it is and what it deliberately omits. `repacked` and
-// `elem_kn_repacked` are copied, exactly as the aliasing branch copies them.
-// `q8_0_aligned` is NOT, also exactly as that branch does not: `MakeTensor`
-// drops it and `ResidentWeight` never restores it on either branch, so copying
-// it here would change the CPU lane's bytes rather than preserve them.
-Tensor KqHostSliceView(Dev d, const OwnedTensor& w, uint8_t* data, int64_t N,
-                       int64_t K) {
-  Tensor wt = MakeTensor(static_cast<void*>(data), w.dtype, d.q.device, {N, K});
-  wt.repacked = w.repacked;
-  wt.elem_kn_repacked = w.elem_kn_repacked;
-  return wt;
-}
-
-// The expert-slice seam. Identical to KqResidentSlice except that, when
-// streaming is on, the returned tensor points at a SLOT holding a contiguous
-// copy of the slice rather than into the tower itself.
 Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
                      int64_t row_off, int64_t expert) {
-  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
-  const size_t bytes = static_cast<size_t>(N) * row_bytes;
-  const vllm::platforms::Platform& p =
-      vllm::platforms::GetPlatform(d.q.device.type);
-  const bool cpu = p.is_cpu();
-  // ENG-EXPERT-STREAM-DEVICE W0b/W0c (issue #1124). The lane serves slices out
-  // of HOST storage — `HostExpertSlotStore`'s arena is a `std::vector<uint8_t>`
-  // — so the question is not "is this the CPU" but "can this platform's kernels
-  // READ host storage". `is_cpu()` is one answer to that;
-  // `host_memory_is_device_addressable()` is the probed answer for the rest, and
-  // it is what lets a GB10 serve a 369.96 GiB checkpoint out of a 119.631 GiB
-  // pool instead of refusing the load.
-  //
-  // A DISCRETE device answers false, keeps falling through to KqResidentSlice,
-  // and therefore keeps hitting the #1123 load-time refusal. That is correct
-  // for it: a slot store it cannot read is not a lane, and giving it one is
-  // W1/W2's job, not this branch's.
-  if (cpu || p.host_memory_is_device_addressable()) {
-    if (Qwen35ExpertStream* st = Qwen35ExpertStream::Get(bytes)) {
-      // Claim the tower for the lane BEFORE taking a slice, so the refusal in
-      // ResidentWeight covers the whole tower rather than only the slices that
-      // happened to be served. A tower the lane touched at all must never be
-      // staged.
-      w.expert_streamed = true;
-      const uint8_t* base = w.bytes.data();
-      if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
-                                    static_cast<size_t>(row_off) * row_bytes,
-                                    bytes, w.mmap_fd, w.mmap_file_offset)) {
-        return KqHostSliceView(d, w, slot, N, K);
-      }
-      // The cache could not serve this slice. On CPU that falls through to the
-      // unchanged KqResidentSlice below, which aliases the tower and is what
-      // every existing arm-comparison gate measures.
-      //
-      // On a host-addressable DEVICE it must NOT: KqResidentSlice would stage
-      // the whole 1.1875 GiB tower, and this branch is not rare. Prefill takes
-      // it thousands of times by construction — the peak protected set for a
-      // T-token prompt is `93 x 3 x min(512, 10*T)` slices, which saturates at
-      // 331 GiB for any T >= 52, so no slot budget makes prefill fit. Reading
-      // the tower's own host bytes in place is exactly what the CPU arm does,
-      // costs nothing, and is correct precisely because this platform said its
-      // kernels can follow a host pointer.
-      if (!cpu) {
-        return KqHostSliceView(
-            d, w,
-            const_cast<uint8_t*>(base) + static_cast<size_t>(row_off) * row_bytes,
-            N, K);
-      }
-    }
-  }
-  return KqResidentSlice(d, w, N, K, row_off);
+  return ::vllm::expert_stream::ExpertSlice(d, w, N, K, row_off, expert,
+                                            &KqResidentSlice);
 }
 
 std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
@@ -7418,7 +6906,13 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
                         [&](Dev p, const Tensor& h) {
                           return MoeBlock(p, layer.moe, cfg, h, T);
-                        });
+                        },
+                        // fp4-resident experts are built on the device at LOAD,
+                        // so placing them would upload every expert and then
+                        // compute across the bus. Refuse instead.
+                        /*placeable=*/layer.moe.expert_gate_fp4.empty(),
+                        "the routed experts are fp4-resident and their device "
+                        "residents are built at load");
 }
 
 // --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
@@ -7681,7 +7175,13 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   hidden = RunMoePlaced(d, layer_index, dh2.t(), T, H,
                         [&](Dev p, const Tensor& h) {
                           return MoeBlock(p, layer.moe, cfg, h, T);
-                        });
+                        },
+                        // fp4-resident experts are built on the device at LOAD,
+                        // so placing them would upload every expert and then
+                        // compute across the bus. Refuse instead.
+                        /*placeable=*/layer.moe.expert_gate_fp4.empty(),
+                        "the routed experts are fp4-resident and their device "
+                        "residents are built at load");
 }
 
 // Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
@@ -8087,62 +7587,6 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
-MoeBlockOutput RunMoeBlockPlaced(vt::Queue& engine_queue,
-                                 vt::DeviceType placement_device,
-                                 const MoeBlockWeights& weights,
-                                 const HfConfig& config, const vt::Tensor& dh,
-                                 int64_t T) {
-  Dev engine{vt::GetBackend(engine_queue.device.type), engine_queue};
-
-  // The fp4-resident arm is REFUSED rather than served slowly. Its device Marlin
-  // residents are built eagerly at load by `PrepareMarlinResident`, so placing it
-  // would upload every expert and then compute on the host across the bus —
-  // strictly worse than not placing, and invisible to a token gate because the
-  // tokens would still be right. Refuse by name, as an unimplemented arm must.
-  if (!weights.expert_gate_fp4.empty()) {
-    throw std::invalid_argument(
-        "device placement: this checkpoint's routed experts are fp4-resident, "
-        "and their device residents are built at load, so placing them would "
-        "upload every expert and then compute across the bus — slower than not "
-        "placing at all. Placement supports the bf16 and keep-quant expert arms "
-        "(what a GGUF load brings); use one of those or drop the placement");
-  }
-
-  const int64_t H = config.hidden_size;
-  const size_t bytes =
-      static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
-
-  // DOWN: the hidden state to the host. `Download` synchronises, which it must:
-  // the placed backend is about to read these bytes and knows nothing about the
-  // engine's stream.
-  std::vector<uint8_t> staging(bytes);
-  {
-    Tensor src = dh;
-    engine.b.Copy(engine.q, staging.data(), src.data, bytes);
-    engine.b.Synchronize(engine.q);
-  }
-
-  // ACROSS: run the block on the placement device. `RunMoeBlock` derives its
-  // backend from the queue it is handed, and `ResidentWeight` aliases the host
-  // weight bytes for a CPU `Dev`, so nothing is uploaded anywhere by this call.
-  vt::Queue& placed_queue = PlacementQueue(placement_device);
-  Dev placed{vt::GetBackend(placed_queue.device.type), placed_queue};
-  DBuf placed_in(placed, DType::kBF16, {T, H}, staging.data());
-  MoeBlockOutput placed_out =
-      RunMoeBlock(placed_queue, weights, config, placed_in.t(), T);
-
-  // BACK UP: the combined output to the engine's device, into a buffer from the
-  // ENGINE's pool so the composing forward owns it exactly as it owns an
-  // unplaced block's output.
-  placed.b.Copy(placed.q, staging.data(), placed_out.tensor.data, bytes);
-  placed.b.Synchronize(placed.q);
-  DBuf back(engine, DType::kBF16, {T, H}, staging.data());
-
-  MoeBlockOutput r;
-  r.tensor = back.t();
-  r.storage = back.ReleaseShared();
-  return r;
-}
 
 // Exposed wrapper over the anon-ns `GdnBlockPaged` (row MODEL-MM-QWEN4-EXP W5b,
 // issue #2110) so a hybrid architecture in another TU — Qwen4-Exp, whose
@@ -9469,7 +8913,9 @@ std::vector<float> Qwen3_5DenseModel::Forward(
 // selection (cpu_ops.cpp:731) exactly, so the fused AttnQkNormRopeGate applies
 // true MRoPE by reading this cache row-per-token (the text path bakes 1-D RoPE
 // into the same cache). No Llama3 freq scaling (mrope rope_type ⇒ identity).
-static std::vector<float> BuildMropeCosSinHost(
+// EXTERNAL LINKAGE (W5d-2, #2249): Qwen4-Exp's QSA block builds the SAME
+// tables from another TU. Declared in qwen3_5_mrope.h; body unchanged.
+std::vector<float> BuildMropeCosSinHost(
     const std::vector<int32_t>& positions3, int64_t T, const HfConfig& config) {
   const int rot = static_cast<int>(config.rotary_dim);
   VT_CHECK(rot > 0, "qwen3_5 VL: rotary_dim must be > 0");

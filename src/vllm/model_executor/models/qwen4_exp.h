@@ -100,6 +100,33 @@ struct Qwen4ExpPleParams {
   // chain derives them. Empty means "the source did not say".
   std::vector<int64_t> head_vocab_sizes;
 
+  // The RESOLVED exclusive prefix sum over `head_vocab_sizes`, when the SOURCE
+  // states it. `qwen4exp.ple.head_offsets` is written by llama.cpp #27742's
+  // converter as an array INDEPENDENT of `head_vocab_sizes` — it reads both off
+  // the checkpoint's own buffers — so the two are a genuine cross-check on each
+  // other and not two spellings of one number. Empty means "the source did not
+  // say", exactly as for `head_vocab_sizes`.
+  //
+  // Until MODEL-MM-QWEN4-EXP W5g this array was written into the text config by
+  // `Qwen4ExpHfConfigFromGguf` and read by NOTHING, so a converter that emitted
+  // offsets disagreeing with its own sizes loaded silently.
+  std::vector<int64_t> head_offsets;
+
+  // Whether the SOURCE stated `ngram_vocab_size_base`, as opposed to inheriting
+  // upstream's 20,000,000 default.
+  //
+  // THE DISTINCTION IS LOAD-BEARING AND A DEFAULTED VALUE CANNOT CARRY IT. A
+  // `config.json` states the base and states no head sizes; a `qwen4exp` GGUF
+  // states the head sizes and states NO base, because the converter reads the
+  // resolved arrays off the checkpoint instead of re-deriving them. So on the
+  // GGUF arm the base is ALWAYS 20,000,000 whatever the file was built from,
+  // and comparing a stated head-size set against a chain derived from it
+  // compares the file against a default. That comparison happens to hold for
+  // the released checkpoint, whose base really is 20,000,000, and refuses every
+  // other `qwen4exp` file — which is what stopped W5f's reachability case
+  // inside layer 1's PLE block.
+  bool ngram_vocab_size_base_stated = false;
+
   // The n-gram table's row count: `sum(head_vocab_sizes)` rounded UP to
   // `make_ngram_vocab_size_divisible_by`. Zero when the source stated no sizes,
   // which is the caller's signal to derive the chain instead.

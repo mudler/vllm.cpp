@@ -382,8 +382,10 @@ class MuseGlimmerModel {
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
 
   // W4 WIRING: the MULTIMODAL entry. Takes the ALREADY-MERGED input embeddings
-  // (bf16 bits, [T, hidden] row-major) instead of token ids, exactly as upstream's
-  // `MuseGlimmerModel.forward` takes `inputs_embeds` (muse_glimmer.py:1311-1315).
+  // (bf16, [T, hidden] row-major, on DEVICE — a BORROWED view, see
+  // MultiModalForwardInput and ENG-MM-INPUT-PIPELINE P1 #1358/#2300) instead of
+  // token ids, exactly as upstream's `MuseGlimmerModel.forward` takes
+  // `inputs_embeds` (muse_glimmer.py:1311-1315).
   //
   // NOTE the asymmetry that upstream's two branches encode and that the caller
   // therefore owns: `embed_input_ids` (:1301-1302) is `embed_norm(embed_tokens(ids))`,
@@ -394,7 +396,7 @@ class MuseGlimmerModel {
   // embedding is shared with the text path, so a text-only prompt routed through
   // here is BIT-IDENTICAL to `Forward` (gated in test_muse_glimmer_wiring.cpp).
   static std::vector<float> ForwardMm(
-      const std::vector<uint16_t>& inputs_embeds_bf16,
+      const vt::Tensor& inputs_embeds,
       const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const MuseGlimmerWeights& weights,

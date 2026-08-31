@@ -7,6 +7,12 @@ trailer steps of `commit-protocol-tag`, `documentation-checkpoint`, and
 byte-similar copy of the same inline shell, and no test in this tree executed any
 of those four blocks.
 
+THE TWO TRAILER STEPS RUN ON THE PULL-REQUEST LANE ONLY as of #2322, so for them
+the base is always `pull_request.base.sha` and the floor below never applies --
+a floor forgives commits already on `main`, and those steps no longer read one.
+The floor still governs `documentation-checkpoint` and the role-discipline step,
+which do walk the push lane, and its value is unchanged.
+
 WHAT THE BASE IS. On the pull-request lane it is `pull_request.base.sha`. On the
 push lane it is the head of the last SUCCESSFUL push run of this workflow,
 falling back to `github.event.before`. The successful-run base is deliberate: a

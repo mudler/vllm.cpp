@@ -6,7 +6,7 @@ Row: `SPEC-MTP-K-GT-1`, under `ROAD-V1-D3-SPEC-K`
 
 Issue: [#81](https://github.com/mudler/vllm.cpp/issues/81), milestone M1
 ("MTP k>1"). The issue is already listed in
-[issue-index.md](../issue-index.md) against `SPEC-MTP`, so this row adds no
+[issue-index.md](../completed/issue-index.md) against `SPEC-MTP`, so this row adds no
 index line.
 
 Git integration: no `.agents/developer-preferences.md` exists in the shared

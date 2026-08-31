@@ -2,6 +2,7 @@
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 
 #include <string>
+#include <variant>
 
 #include "vllm/config/weight_residency.h"
 
@@ -77,6 +78,35 @@ size_t GgufLargestExpertSliceBytes(const GgufFile& gguf,
     if (slice > largest) largest = slice;
   }
   return largest;
+}
+
+GgufExpertLaneGeometry GgufStreamedExpertLaneGeometry(
+    const GgufFile& gguf, std::string_view tensor_name_suffix) {
+  GgufExpertLaneGeometry g;
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (NameHasSuffix(t.name, tensor_name_suffix)) ++g.streamed_tower_count;
+  }
+  // `<arch>.expert_used_count`, the key llama.cpp writes for `top_k`. The arch
+  // prefix is read from the file rather than passed in, so this stays usable by
+  // any architecture that reaches the lane -- which is the point of W3.
+  const GgufValue* arch_v = gguf.FindKv("general.architecture");
+  if (arch_v == nullptr || arch_v->TypeId() != kGgufString) return g;
+  const GgufValue* used =
+      gguf.FindKv(std::get<std::string>(arch_v->v) + ".expert_used_count");
+  if (used == nullptr) return g;
+  // Only the unsigned/signed integer tags a count can legitimately carry. An
+  // unexpected type leaves the term at 0 -- unknown, not zero -- rather than
+  // throwing inside a function whose whole job is to describe a file.
+  if (const auto* u32 = std::get_if<uint32_t>(&used->v)) {
+    g.experts_per_tok = static_cast<int64_t>(*u32);
+  } else if (const auto* i32 = std::get_if<int32_t>(&used->v)) {
+    g.experts_per_tok = static_cast<int64_t>(*i32);
+  } else if (const auto* u64 = std::get_if<uint64_t>(&used->v)) {
+    g.experts_per_tok = static_cast<int64_t>(*u64);
+  } else if (const auto* i64 = std::get_if<int64_t>(&used->v)) {
+    g.experts_per_tok = *i64;
+  }
+  return g;
 }
 
 bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,

@@ -496,8 +496,17 @@ class LoadedEngine {
   //
   // Exposed, like the two resolvers above, so the policy is gateable without a
   // disk load.
+  //
+  // MODEL-MM-QWEN4-EXP W5L (#2031): `serves_one_sequence_per_step` is the
+  // model's own declaration that its forward refuses `num_reqs > 1`. It clamps
+  // the resolved value to 1 AFTER the budget clamp, because the two bound
+  // different things and the smaller must win: the budget says how many
+  // sequences the KV pool can hold, this says how many the forward can read.
+  // Passing `false` reproduces the pre-W5L result for every caller and every
+  // model, which is what makes the parameter additive rather than a new policy.
   static int ResolveMaxNumSeqs(const EngineParams& params,
-                               const vllm::v1::KVCacheConfig& kv_cfg);
+                               const vllm::v1::KVCacheConfig& kv_cfg,
+                               bool serves_one_sequence_per_step);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
   // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy

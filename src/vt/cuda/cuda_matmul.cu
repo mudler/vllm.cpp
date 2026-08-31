@@ -61,6 +61,22 @@ constexpr size_t kWorkspaceBytes = 32ull << 20;  // 32 MB, per the M0.6 plan
 // scripts/check-gemv-invocation-consistency.py.
 constexpr int kGemvHeuristicAlgos = 1;
 
+// requestedAlgoCount for the DIAGNOSTIC-ONLY bf16/f32 candidate dump, which runs
+// on its own heuristic query and only when VT_GEMM_ALGO_LOG=1. It does NOT
+// change what executes: the single-best query above still selects the kernel.
+//
+// WHY IT EXISTS. An nsys profile of the 27B decode (2026-08-30, GB10 sm_121a)
+// puts 87.4% of GPU time in two variants of ONE kernel --
+// `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8` at
+// 73.2% over 11,679 calls and its `128x2` sibling at 14.2% -- an AMPERE-
+// generation WMMA kernel with a 16x16 tile, on a Blackwell part, for a decode
+// whose M is 8. "cuBLASLt ranked a Blackwell-native algo second" and "cuBLASLt
+// enumerates no sm_120/121 bf16 algo for this descriptor at all" are different
+// findings with different fixes, and a list of length one cannot tell them
+// apart. This is the same question #1866 asked of the fp8 tower, which resolves
+// to `sm89_xmma ... tilesize32x64x64` on the same part (#1857).
+constexpr int kDenseAlgoLogCandidates = 8;
+
 // requestedAlgoCount for the DIAGNOSTIC-ONLY fp8 candidate dump below, which
 // runs on its own heuristic query and only when VT_GEMM_ALGO_LOG=1. It exists
 // because #1866 asks a question the single-best query cannot answer: our fp8
@@ -119,6 +135,14 @@ struct LtContext {
   cublasLtHandle_t handle = nullptr;
   void* workspace = nullptr;
 };
+
+// Defined beside the fp8 candidate dump it mirrors; declared here because the BT
+// lane below calls it and `LtContext` has to be complete first.
+void MaybeLogDenseAlgoCandidates(const LtContext& ctx, int64_t m, int64_t n, int64_t k,
+                                 cudaDataType_t ab_type, cudaDataType_t out_type,
+                                 const char* lane, cublasLtMatmulDesc_t desc,
+                                 cublasLtMatrixLayout_t la, cublasLtMatrixLayout_t lb,
+                                 cublasLtMatrixLayout_t lc, cublasLtMatmulPreference_t pref);
 
 LtContext GetContext(int device) {
   static std::mutex mu;
@@ -473,6 +497,9 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   // The 27B GDN in_proj_ba runs through this TN path; its BF16-vs-F32 output type
   // is the algo-latching variable the forensic record flagged.
   if (fresh) MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "TN-bt");
+  if (fresh)
+    MaybeLogDenseAlgoCandidates(ctx, m, n, k, ab_type, out_type, "TN-bt", desc.v, la.v, lb.v,
+                                lc.v, pref.v);
 
   const float alpha = 1.0f, beta = 0.0f;
   CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, b.data, la.v, a.data, lb.v, &beta,
@@ -712,6 +739,49 @@ void MaybeLogFp8PlanRefusal(const Fp8PlanKey& key, Fp8PlanRefusal refusal, uint3
 // DESCRIPTOR or the driver, and no sweep can help — which is a grounded
 // negative rather than a no-op ship. See
 // .agents/specs/perf-fp8-small-m-dispatch.md `## Owed`.
+void MaybeLogDenseAlgoCandidates(const LtContext& ctx, int64_t m, int64_t n, int64_t k,
+                                 cudaDataType_t ab_type, cudaDataType_t out_type,
+                                 const char* lane, cublasLtMatmulDesc_t desc,
+                                 cublasLtMatrixLayout_t la, cublasLtMatrixLayout_t lb,
+                                 cublasLtMatrixLayout_t lc,
+                                 cublasLtMatmulPreference_t pref) {
+  if (!GemmAlgoLogEnabled()) return;  // cached bool; default OFF pays nothing here
+  static LogOncePerKey once;
+  const std::string log_key = std::string("cublasLt-dense-candidates|") + lane + "|m=" +
+                              std::to_string(m) + " n=" + std::to_string(n) +
+                              " k=" + std::to_string(k) + "|ab=" + std::to_string(ab_type) +
+                              "|out=" + std::to_string(out_type);
+  if (!once.ShouldLog(log_key)) return;
+  cublasLtMatmulHeuristicResult_t results[kDenseAlgoLogCandidates] = {};
+  int returned = 0;
+  const cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+      ctx.handle, desc, la, lb, lc, lc, pref, /*requestedAlgoCount=*/kDenseAlgoLogCandidates,
+      results, &returned);
+  if (st != CUBLAS_STATUS_SUCCESS) {
+    std::cerr << "[VT_GEMM_ALGO] backend=cublasLt DENSE-CANDIDATES lane=" << lane << " m=" << m
+              << " n=" << n << " k=" << k << " query failed: " << StatusName(st) << std::endl;
+    return;
+  }
+  for (int i = 0; i < returned; ++i) {
+    int32_t algo_id = -1, split_k = -1;
+    uint32_t tile = 0, stages = 0;
+    size_t written = 0;
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id,
+                                         sizeof(algo_id), &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile,
+                                         sizeof(tile), &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                                         &stages, sizeof(stages), &written);
+    cublasLtMatmulAlgoConfigGetAttribute(&results[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                                         &split_k, sizeof(split_k), &written);
+    std::cerr << "[VT_GEMM_ALGO] backend=cublasLt DENSE-CANDIDATE lane=" << lane
+              << " rank=" << i << "/" << returned << " m=" << m << " n=" << n << " k=" << k
+              << " algoId=" << algo_id << " tile=" << tile << " stages=" << stages
+              << " splitK=" << split_k << " wsSize=" << results[i].workspaceSize
+              << " waves=" << results[i].wavesCount << std::endl;
+  }
+}
+
 void MaybeLogFp8AlgoCandidates(const LtContext& ctx, const Fp8PlanKey& key,
                                cublasLtMatmulDesc_t desc, cublasLtMatrixLayout_t la,
                                cublasLtMatrixLayout_t lb, cublasLtMatrixLayout_t lc,

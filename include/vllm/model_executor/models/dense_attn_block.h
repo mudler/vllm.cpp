@@ -208,8 +208,44 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
              std::string("resident weight: EMPTY tensor has no host bytes to "
                          "alias (host-alias arm, dtype ") +
                  vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
-    return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device, shape);
+    Tensor t = MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
+                          shape);
+    // CIQ G7 / MODEL-MM-QWEN4-EXP W5r (#2031): carry the load-time LAYOUT
+    // markers from the OwnedTensor to the vt::Tensor the kernel actually sees.
+    // `MakeTensor` drops them by default, and this is the only host->kernel
+    // weight-tensor construction on the CPU forward for the 25 models that
+    // inherit this helper, so without these two lines a repacked buffer is read
+    // as a plain one: the i8mm interleave (`block_q8_0x4`) decoded as flat q8_0,
+    // or a [K,N] transposed elementwise buffer read as [N,K]. Both produce
+    // plausible numbers and no crash.
+    //
+    // `qwen3_5.cpp` KEPT A PRIVATE COPY OF THIS HELPER AND ALREADY CARRIES BOTH
+    // (:1055, :1060). This shared one did not, so every model that routes a
+    // keep-quant weight through it was one aarch64 i8mm host away from silent
+    // garbage — `vt::cpu::QuantRepackActive()` is true exactly there, and
+    // `thor`, the box the released Qwen3.8-Flash-Next checkpoint loads on, is
+    // one. It is reachable rather than theoretical for this row specifically:
+    // `qwen4_exp_forward.cpp` hands `hc_*_down`/`hc_*_up` to
+    // `vt::Qwen4ExpGatedResidual` through THIS function (:421-422, :479-480,
+    // :538-539) while it hands `hc_*_inject` through `OwnedTensor::View()`
+    // (:417, :475), which has carried `repacked` all along
+    // (`qwen3_5_weights.cpp:498`) — so the two halves of one op disagreed about
+    // the same flag, and W5p made those two tensors block-quantized operands of
+    // a real quantized GEMM rather than dead float weights.
+    t.repacked = w.repacked;
+    t.elem_kn_repacked = w.elem_kn_repacked;
+    return t;
   }
+  // AUDIT GUARD, mirroring `qwen3_5.cpp` (:1070-1072). Only the CPU
+  // `MatmulBTKernel` honours `elem_kn_repacked`, and the staging path below
+  // uploads bytes verbatim and returns a tensor WITHOUT the marker, so a
+  // repacked weight reaching a staged device would be read as plain [N,K] and
+  // produce garbage silently. `VT_CPU_ELEM_KN_REPACK` is CPU-only and the
+  // loader policy cannot see the device, so this is where the invariant is
+  // enforced: fail loudly at load rather than corrupt tokens at inference.
+  VT_CHECK(!w.elem_kn_repacked,
+           "resident weight: an elem_kn_repacked ([K,N]) weight reached device "
+           "staging; VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
   if (!w.d_dev) {
     VT_CHECK(!w.bytes.empty(),
              std::string("resident weight: EMPTY tensor has no host bytes to "

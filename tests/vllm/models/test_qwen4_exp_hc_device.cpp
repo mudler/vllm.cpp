@@ -31,7 +31,13 @@
 // that walked the low-rank intermediate with the wrong row stride, fails here
 // and could not fail there.
 //
-// SCOPE, HONESTLY. CPU only — no CUDA arm of this op exists, and one written on
+// SCOPE, HONESTLY. This file is the CPU arms' gate, and the two ops it covers
+// now DIFFER on device coverage: `vt::Qwen4ExpGatedResidualWriteBack` has a
+// CUDA arm (`src/vt/cuda/cuda_qwen4_exp.cu`, W6-CUDA), gated BYTE-IDENTICALLY
+// against this arm in `test_qwen4_exp_cuda.cpp` — which is what makes THIS
+// file's oracle gate transitive to it — while `vt::Qwen4ExpGatedResidual` has
+// none, because its grouped norm owes a reduction-width decision first.
+// Nothing below runs on a device. The text that stood here read: CPU only — no CUDA arm of this op exists, and one written on
 // this host could not be gated on it. No token claim and no speed claim: nothing
 // calls these ops from a production entry point yet (the forward is owed, see
 // the spec's `## Owed`), and no `qwen4_exp` arm decodes.
@@ -87,13 +93,23 @@ Tensor MakeT(void* data, DType dt, const std::vector<int64_t>& shape) {
   return t;
 }
 
-// The `1 + w_hf` fold. The goldens store the HuggingFace gamma (zero-init, so
-// `output * (1.0 + weight)`); the op takes vLLM's parameterization, in which the
-// kernel multiplies by `w` and knows nothing about the offset. `HcNormWeightFromHf`
-// is the ONE home of that transform and this test goes through it rather than
-// adding 1.0 by hand, so a change to the fold's polarity reddens here too.
-std::vector<float> VllmNorm(const float* w_hf, int64_t n) {
-  return vllm::qwen4_exp::HcNormWeightFromHf(std::vector<float>(w_hf, w_hf + n));
+// The gamma the OP takes, and since #2218 that is the goldens' own value with
+// nothing done to it. The goldens store the HuggingFace parameter (zero-init,
+// so upstream spells the norm `output * (1.0 + weight)`) and
+// `vt::Qwen4ExpGatedResidual` now adds the 1 itself, the same way
+// `vt::RmsNorm(gemma=true)` and `vt::Qwen4ExpQsaCompress` do for this
+// architecture's other gammas — so a loaded `Qwen4ExpWeights` can be handed
+// straight to it. `vllm::qwen4_exp::HcNormWeightFromHf` remains the
+// `w_hf -> 1 + w_hf` bridge for the HOST reference, whose `GroupedRmsNorm`
+// keeps vLLM's `out * w` form and which `test_qwen4_exp_hc.cpp` drives; this
+// suite compares the op against the transformers goldens directly, so it no
+// longer needs the transform at all.
+//
+// A PASS-THROUGH THAT IS NOT DECORATION: it names, at every call site, WHICH
+// parameterization the op is being handed, which is the entire content of
+// #2218. An edit that reintroduces a fold here has to say so out loud.
+std::vector<float> OpGamma(const float* w_hf, int64_t n) {
+  return std::vector<float>(w_hf, w_hf + n);
 }
 
 struct Case {
@@ -135,7 +151,7 @@ const Case kCaseD{"D", 6, 4, 5, 2, 1e-6f, kD_norm_w_hf, kD_down,      kD_up,
 void RunReadCase(const Case& c) {
   Queue q = CpuQ();
   const int64_t flat = c.hc * c.hidden;
-  std::vector<float> w = VllmNorm(c.norm_w_hf, flat);
+  std::vector<float> w = OpGamma(c.norm_w_hf, flat);
   std::vector<float> hyper(c.hyper, c.hyper + c.T * flat);
   std::vector<float> down(c.down, c.down + c.lowrank * flat);
   std::vector<float> up(c.up, c.up + flat * c.lowrank);
@@ -234,7 +250,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the per-token rows are independent") {
   Queue q = CpuQ();
   const Case& c = kCaseA;
   const int64_t flat = c.hc * c.hidden;
-  std::vector<float> w = VllmNorm(c.norm_w_hf, flat);
+  std::vector<float> w = OpGamma(c.norm_w_hf, flat);
   std::vector<float> down(c.down, c.down + c.lowrank * flat);
   std::vector<float> up(c.up, c.up + flat * c.lowrank);
   std::vector<float> inject_w(c.inject, c.inject + c.hc * flat);
@@ -300,7 +316,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: bf16 storage rounds ONCE, on the store") {
     for (size_t i = 0; i < src.size(); ++i) out[i] = vt::F32ToBF16(src[i]);
     return out;
   };
-  const std::vector<float> w = bf16_exact(VllmNorm(c.norm_w_hf, flat));
+  const std::vector<float> w = bf16_exact(OpGamma(c.norm_w_hf, flat));
   const std::vector<float> hyper = bf16_exact({c.hyper, c.hyper + c.T * flat});
   const std::vector<float> down = bf16_exact({c.down, c.down + c.lowrank * flat});
   const std::vector<float> up = bf16_exact({c.up, c.up + flat * c.lowrank});
@@ -384,8 +400,13 @@ TEST_CASE("vt::Qwen4ExpGatedResidual agrees with the host reference at MODEL WID
   };
   std::vector<float> hyper(static_cast<size_t>(T * kFlat));
   for (float& v : hyper) v = next();
-  std::vector<float> w(static_cast<size_t>(kFlat));
-  for (float& v : w) v = 1.0f + 0.1f * next();
+  // THE OP TAKES `w_hf`, THE HOST REFERENCE TAKES `1 + w_hf` (#2218). The same
+  // numbers reach the same arithmetic either way — the draw below is centred on
+  // zero and the fold puts it back on one — but the two arms are handed
+  // DIFFERENT parameterizations of it, which is what keeps this an agreement
+  // check between two implementations rather than between two spellings.
+  std::vector<float> w_hf(static_cast<size_t>(kFlat));
+  for (float& v : w_hf) v = 0.1f * next();
   std::vector<float> down(static_cast<size_t>(R * kFlat));
   for (float& v : down) v = 0.02f * next();
   std::vector<float> up(static_cast<size_t>(kFlat * R));
@@ -396,7 +417,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual agrees with the host reference at MODEL WID
   std::vector<float> mixed(static_cast<size_t>(T * H), 0.0f);
   std::vector<float> inj(static_cast<size_t>(T * HC), 0.0f);
   Tensor t_hyper = MakeT(hyper.data(), DType::kF32, {T, kFlat});
-  Tensor t_w = MakeT(w.data(), DType::kF32, {kFlat});
+  Tensor t_w = MakeT(w_hf.data(), DType::kF32, {kFlat});
   Tensor t_down = MakeT(down.data(), DType::kF32, {R, kFlat});
   Tensor t_up = MakeT(up.data(), DType::kF32, {kFlat, R});
   Tensor t_inject = MakeT(inject.data(), DType::kF32, {HC, kFlat});
@@ -412,7 +433,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual agrees with the host reference at MODEL WID
                             args);
 
   vllm::qwen4_exp::GatedResidualWeights hw;
-  hw.hc_norm_weight = w;
+  hw.hc_norm_weight = vllm::qwen4_exp::HcNormWeightFromHf(w_hf);
   hw.mix_down = down;
   hw.mix_up = up;
   hw.block_inject = inject;
@@ -509,11 +530,14 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
     state = state * 6364136223846793005ULL + 1442695040888963407ULL;
     return static_cast<float>(static_cast<int32_t>(state >> 33)) / 2147483648.0f;
   };
-  std::vector<float> hyper(static_cast<size_t>(kFlat)), w(static_cast<size_t>(kFlat));
+  // `w_hf` is the RAW gamma the op takes (#2218); the double reference below
+  // spells the `1 +` itself, IN f32, so both arms describe the same multiplier
+  // bit for bit and the only thing this case widens is the reduction it is about.
+  std::vector<float> hyper(static_cast<size_t>(kFlat)), w_hf(static_cast<size_t>(kFlat));
   for (int64_t j = 0; j < HC; ++j) {
     for (int64_t d = 0; d < H; ++d) {
       hyper[static_cast<size_t>(j * H + d)] = (d == 0) ? dominant[j] : 1.0f;
-      w[static_cast<size_t>(j * H + d)] = 1.0f + 0.5f * next();
+      w_hf[static_cast<size_t>(j * H + d)] = 0.5f * next();
     }
   }
   std::vector<float> down(static_cast<size_t>(R * kFlat), 0.0f);
@@ -521,7 +545,7 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
   std::vector<float> mixed(static_cast<size_t>(T * H), 0.0f);
 
   Tensor t_hyper = MakeT(hyper.data(), DType::kF32, {T, kFlat});
-  Tensor t_w = MakeT(w.data(), DType::kF32, {kFlat});
+  Tensor t_w = MakeT(w_hf.data(), DType::kF32, {kFlat});
   Tensor t_down = MakeT(down.data(), DType::kF32, {R, kFlat});
   Tensor t_up = MakeT(up.data(), DType::kF32, {kFlat, R});
   Tensor t_mixed = MakeT(mixed.data(), DType::kF32, {T, H});
@@ -534,8 +558,18 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
   vt::Qwen4ExpGatedResidual(q, t_mixed, nullptr, t_hyper, t_w, t_down, t_up, nullptr,
                             args);
 
-  // The reference, in full double. `sigmoid(0)` is 0.5 exactly in any precision,
-  // so the only thing this widens is the reduction.
+  // The reference, in full double EXCEPT the gamma fold. `sigmoid(0)` is 0.5
+  // exactly in any precision, so the reduction is the only thing left for the
+  // widening to isolate -- provided the fold does not quietly widen with it.
+  // Upstream folds in f32: `Qwen4ExpTextRMSNorm.forward` is
+  // `output * (1.0 + self.weight.float())` (`modeling_qwen4_exp.py:177`), where
+  // the Python `1.0` is a weak scalar and the promotion stays fp32, and the
+  // kernel mirrors that with `1.0f + LoadF32At(hc_norm_w, ...)`. Folding in
+  // double here instead would leave the two arms up to a float ulp apart on the
+  // multiplier, and this case's band would absorb the difference silently -- a
+  // tolerance covering a dtype gap, which is the shape AGENTS.md "Inherit vLLM
+  // defaults" warns a token gate cannot see. So the `+ 1` is spelled `1.0f` and
+  // widened AFTERWARDS, matching the kernel exactly.
   std::vector<double> want(static_cast<size_t>(H), 0.0);
   for (int64_t j = 0; j < HC; ++j) {
     double ss = 0.0;
@@ -545,8 +579,9 @@ TEST_CASE("vt::Qwen4ExpGatedResidual: the grouped norm needs a WIDER-THAN-f32 ac
     }
     const double r = 1.0 / std::sqrt(ss / static_cast<double>(H) + static_cast<double>(kEps));
     for (int64_t d = 0; d < H; ++d) {
+      const float w_folded = 1.0f + w_hf[static_cast<size_t>(j * H + d)];
       want[static_cast<size_t>(d)] +=
-          0.5 * hyper[static_cast<size_t>(j * H + d)] * r * w[static_cast<size_t>(j * H + d)];
+          0.5 * hyper[static_cast<size_t>(j * H + d)] * r * static_cast<double>(w_folded);
     }
   }
   for (double& v : want) v /= static_cast<double>(HC);
@@ -636,5 +671,325 @@ TEST_CASE("vt::Qwen4ExpGatedResidual refuses by name") {
     CHECK_THROWS_WITH_AS(
         vt::Qwen4ExpGatedResidualWriteBack(q, t_hyper, t_mixed, wrong, ok),
         doctest::Contains("injection must be"), std::exception);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5p (#2031) — QUANTIZED MIX WEIGHTS.
+//
+// WHY THIS CASE EXISTS. The released `unsloth/Qwen3.8-Flash-Next-GGUF` stores
+// all 194 hyper-connection mix weights (`blk.N.hc_{attn,ffn}_{down,up}.weight`
+// plus `output_hc_{down,up}`) as **Q8_0**, and every case above — and every
+// arm of `tests/support/qwen4_exp_gguf_fixture.h` — stores them F32. Twelve
+// waves of this row therefore never met a block-typed mix weight, and the
+// first prefill of the real file died inside this op's own validation.
+//
+// WHAT UPSTREAM DOES, and it is llama.cpp here rather than vLLM: vLLM has never
+// registered `qwen4_exp` and never loads a GGUF, so it has no opinion on a
+// block-typed operand. llama.cpp merged the architecture to master on
+// 2026-08-27 (`6c84c7d5d`, PR #27742; `6fe749801` follows it) and declares each
+// of the SIX projection tensors `GGML_OP_MUL_MAT`
+// (`src/llama-arch.cpp:759,760,761,763,764,765` — down, up AND inject on both
+// the attention and the feed-forward side), consuming them with a plain
+// `build_lora_mm` on the file-typed tensor (`src/models/qwen4exp.cpp:237-241`).
+// It never dequantizes one. The COUNTER-EXAMPLE in the same model file proves
+// the policy is deliberate: `hc_*_norm` is `GGML_OP_MUL` (`:758`, `:762`), and
+// where a weight of this architecture meets an ELEMENTWISE multiply llama.cpp
+// casts it to f32 first, saying so in a comment (`qwen4exp.cpp:1198-1202`,
+// the PLE conv). Matmul operands keep the file's type; elementwise operands get
+// a cast. This case gates both halves of that policy.
+//
+// THE EXACTLY-REPRESENTABLE WEIGHT. Every weight value here is `d * q` for an
+// f16-exact power-of-two scale `d` and an integer code `q` in [-127, 127], so
+// the Q8_0 encoding of the weight is LOSSLESS and dequant(quant(w)) == w to the
+// bit. The residual difference against the double reference is therefore
+// entirely the ACTIVATION encoding — `ggml_compute_forward_mul_mat` quantizes
+// src1 to the weight's `vec_dot_type` once per row before the integer dot
+// (ggml-cpu.c:1313-1349), which our `kMatmulBTQuant` mirrors — and NOT weight
+// error. That separation is what lets the bound below be stated rather than
+// guessed.
+namespace {
+
+// The op's arithmetic in DOUBLE, transcribed from transformers v5.16.0
+// `Qwen4ExpTextGatedResidual.forward` (:941-969) and `Qwen4ExpTextRMSNorm`
+// (:158-181) — an INDEPENDENT expectation, never a value read back from the
+// thing under test. `inject_out` is filled only when `inject != nullptr`.
+void RefGatedResidual(int64_t T, int64_t hc, int64_t H, int64_t R, double eps,
+                      const std::vector<float>& hyper, const std::vector<float>& gamma,
+                      const std::vector<float>& down, const std::vector<float>& up,
+                      const std::vector<float>* inject, std::vector<double>& mixed,
+                      std::vector<double>& inject_out) {
+  const int64_t flat = hc * H;
+  mixed.assign(static_cast<size_t>(T * H), 0.0);
+  if (inject != nullptr) inject_out.assign(static_cast<size_t>(T * hc), 0.0);
+  const auto sigmoid = [](double x) { return 1.0 / (1.0 + std::exp(-x)); };
+  std::vector<double> normed(static_cast<size_t>(flat));
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t base = t * flat;
+    for (int64_t j = 0; j < hc; ++j) {
+      double ss = 0.0;
+      for (int64_t h = 0; h < H; ++h) {
+        const double v = hyper[static_cast<size_t>(base + j * H + h)];
+        ss += v * v;
+      }
+      const double r = 1.0 / std::sqrt(ss / static_cast<double>(H) + eps);
+      for (int64_t h = 0; h < H; ++h) {
+        const size_t p = static_cast<size_t>(j * H + h);
+        normed[p] = static_cast<double>(hyper[static_cast<size_t>(base + j * H + h)]) *
+                    r * (1.0 + static_cast<double>(gamma[p]));
+      }
+    }
+    std::vector<double> low(static_cast<size_t>(R), 0.0);
+    for (int64_t o = 0; o < R; ++o) {
+      double acc = 0.0;
+      for (int64_t i = 0; i < flat; ++i)
+        acc += static_cast<double>(down[static_cast<size_t>(o * flat + i)]) *
+               normed[static_cast<size_t>(i)];
+      const double a = acc / static_cast<double>(hc);
+      low[static_cast<size_t>(o)] = a * sigmoid(a);
+    }
+    for (int64_t h = 0; h < H; ++h) {
+      double acc = 0.0;
+      for (int64_t j = 0; j < hc; ++j) {
+        const size_t p = static_cast<size_t>(j * H + h);
+        double g = 0.0;
+        for (int64_t r = 0; r < R; ++r)
+          g += static_cast<double>(up[static_cast<size_t>(p) * static_cast<size_t>(R) +
+                                      static_cast<size_t>(r)]) *
+               low[static_cast<size_t>(r)];
+        acc += sigmoid(g) * normed[p];
+      }
+      mixed[static_cast<size_t>(t * H + h)] = acc / static_cast<double>(hc);
+    }
+    if (inject == nullptr) continue;
+    for (int64_t j = 0; j < hc; ++j) {
+      double acc = 0.0;
+      for (int64_t i = 0; i < flat; ++i)
+        acc += static_cast<double>((*inject)[static_cast<size_t>(j * flat + i)]) *
+               normed[static_cast<size_t>(i)];
+      inject_out[static_cast<size_t>(t * hc + j)] =
+          2.0 * sigmoid(acc / static_cast<double>(hc));
+    }
+  }
+}
+
+// A deterministic 32-bit LCG, so the case is reproducible byte-for-byte and
+// carries no `<random>` implementation dependence across libstdc++ versions.
+struct Lcg {
+  uint32_t s;
+  uint32_t Next() {
+    s = s * 1664525u + 1013904223u;
+    return s;
+  }
+  // A code in [-127, 127]. 127 and -127 are both reachable, so a block's own
+  // amax is exercised.
+  int Code() { return static_cast<int>(Next() % 255u) - 127; }
+};
+
+// An [n, k] weight that is EXACT in Q8_0, returned as both the logical f32
+// values and the 34-byte-per-block Q8_0 payload. The scales cycle over four
+// f16-exact powers of two so no single scale is shared by every block; a
+// kernel that read block 0's scale for the whole row is separated by this.
+struct ExactQ8_0 {
+  std::vector<float> f32;
+  std::vector<uint8_t> blocks;
+};
+
+ExactQ8_0 MakeExactQ8_0(int64_t n, int64_t k, uint32_t seed) {
+  REQUIRE(k % 32 == 0);
+  static const float kScales[4] = {1.0f / 256.0f, 1.0f / 512.0f, 1.0f / 1024.0f,
+                                   1.0f / 2048.0f};
+  const int64_t nblocks = n * (k / 32);
+  ExactQ8_0 out;
+  out.f32.resize(static_cast<size_t>(n * k));
+  out.blocks.assign(static_cast<size_t>(nblocks) * 34, 0);
+  Lcg rng{seed};
+  for (int64_t b = 0; b < nblocks; ++b) {
+    const float d = kScales[b % 4];
+    const uint16_t half = vt::F32ToF16(d);
+    REQUIRE(vt::F16ToF32(half) == d);  // the scale survives the f16 store EXACTLY
+    std::memcpy(out.blocks.data() + static_cast<size_t>(b) * 34, &half, 2);
+    for (int64_t i = 0; i < 32; ++i) {
+      const int code = rng.Code();
+      out.blocks[static_cast<size_t>(b) * 34 + 2 + static_cast<size_t>(i)] =
+          static_cast<uint8_t>(static_cast<int8_t>(code));
+      out.f32[static_cast<size_t>(b * 32 + i)] = d * static_cast<float>(code);
+    }
+  }
+  return out;
+}
+
+Tensor MakeQ8_0T(void* data, const std::vector<int64_t>& shape) {
+  Tensor t = MakeT(data, DType::kQ8_0, shape);
+  return t;
+}
+
+void RequireFinite(const std::vector<float>& v, const char* what) {
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (!std::isfinite(v[i])) {
+      FAIL(what, " is not finite at index ", i, ": ", v[i]);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("vt::Qwen4ExpGatedResidual runs Q8_0 mix weights, the released file's own type") {
+  Queue q = CpuQ();
+  // flat and lowrank are both whole numbers of Q8_0 blocks, which the released
+  // config already is (stream 10240, low-rank 320). The GGUF miniature cannot
+  // reach this shape: its low-rank is 8, so `hc_*_up` has K = 8 and ggml itself
+  // forbids a quantized tensor whose fastest dim is not a whole block — which
+  // is exactly why the up projection's quantized arm is gated HERE and the
+  // fixture arm gates down and inject.
+  constexpr int64_t H = 32, HC = 2, R = 32, T = 3;
+  constexpr int64_t kFlat = HC * H;  // 64
+  constexpr float kEps = 1e-6f;
+
+  const ExactQ8_0 down = MakeExactQ8_0(R, kFlat, 0x1234u);
+  const ExactQ8_0 up = MakeExactQ8_0(kFlat, R, 0x5678u);
+  const ExactQ8_0 inject = MakeExactQ8_0(HC, kFlat, 0x9abcu);
+
+  std::vector<float> hyper(static_cast<size_t>(T * kFlat));
+  std::vector<float> gamma(static_cast<size_t>(kFlat));
+  {
+    Lcg rng{0xdeadbeefu};
+    for (auto& v : hyper)
+      v = 1.7f * (static_cast<float>(rng.Next() % 2001u) / 1000.0f - 1.0f);
+    for (auto& v : gamma)
+      v = 0.25f * (static_cast<float>(rng.Next() % 2001u) / 1000.0f - 1.0f);
+  }
+
+  std::vector<double> want_mixed;
+  std::vector<double> want_inj;
+  RefGatedResidual(T, HC, H, R, kEps, hyper, gamma, down.f32, up.f32, &inject.f32,
+                   want_mixed, want_inj);
+
+  Qwen4ExpGatedResidualArgs args;
+  args.hc_count = HC;
+  args.hidden_size = H;
+  args.lowrank = R;
+  args.eps = kEps;
+
+  // Two runs of ONE op over ONE set of logical weights: the same numbers as
+  // f32, and the same numbers as Q8_0 blocks.
+  const auto run = [&](bool quantized, std::vector<float>& mixed,
+                       std::vector<float>& inj) {
+    mixed.assign(static_cast<size_t>(T * H), 0.0f);
+    inj.assign(static_cast<size_t>(T * HC), 0.0f);
+    std::vector<float> h(hyper);
+    std::vector<float> g(gamma);
+    std::vector<float> d(down.f32), u(up.f32), b(inject.f32);
+    std::vector<uint8_t> qd(down.blocks), qu(up.blocks), qb(inject.blocks);
+    Tensor t_hyper = MakeT(h.data(), DType::kF32, {T, kFlat});
+    Tensor t_g = MakeT(g.data(), DType::kF32, {kFlat});
+    Tensor t_down = quantized ? MakeQ8_0T(qd.data(), {R, kFlat})
+                              : MakeT(d.data(), DType::kF32, {R, kFlat});
+    Tensor t_up = quantized ? MakeQ8_0T(qu.data(), {kFlat, R})
+                            : MakeT(u.data(), DType::kF32, {kFlat, R});
+    Tensor t_inject = quantized ? MakeQ8_0T(qb.data(), {HC, kFlat})
+                                : MakeT(b.data(), DType::kF32, {HC, kFlat});
+    Tensor t_mixed = MakeT(mixed.data(), DType::kF32, {T, H});
+    Tensor t_inj = MakeT(inj.data(), DType::kF32, {T, HC});
+    vt::Qwen4ExpGatedResidual(q, t_mixed, &t_inj, t_hyper, t_g, t_down, t_up,
+                              &t_inject, args);
+  };
+
+  std::vector<float> q_mixed, q_inj, f_mixed, f_inj;
+  run(/*quantized=*/true, q_mixed, q_inj);
+  run(/*quantized=*/false, f_mixed, f_inj);
+
+  RequireFinite(q_mixed, "mixed (Q8_0 arm)");
+  RequireFinite(q_inj, "injection (Q8_0 arm)");
+  RequireFinite(f_mixed, "mixed (f32 arm)");
+  RequireFinite(f_inj, "injection (f32 arm)");
+
+  // THE f32 ARM IS UNMOVED. It is the same code path every golden case above
+  // runs, so this is the statement that nothing in this wave touched it.
+  {
+    std::vector<double> ref_mixed, ref_inj;
+    RefGatedResidual(T, HC, H, R, kEps, hyper, gamma, down.f32, up.f32, &inject.f32,
+                     ref_mixed, ref_inj);
+    const double m = MaxAbsDiff(f_mixed, ref_mixed);
+    const double i = MaxAbsDiff(f_inj, ref_inj);
+    INFO("f32 arm max|mixed - double ref| ", m, " max|inj - double ref| ", i);
+    CHECK(m < kTol);
+    CHECK(i < kTol);
+  }
+
+  // THE Q8_0 ARM. The weights are lossless, so the whole residual is the Q8_0
+  // ACTIVATION encoding `kMatmulBTQuant` applies to each projection's input —
+  // 127 levels over the row's amax, mirroring ggml. `kQuantBound` is set from
+  // the measured value (printed by the INFO below) with headroom, and it is
+  // NOT a relaxation of any golden: no golden case uses a quantized weight.
+  constexpr double kQuantBound = 5e-3;
+  {
+    const double m = MaxAbsDiff(q_mixed, want_mixed);
+    const double i = MaxAbsDiff(q_inj, want_inj);
+    INFO("Q8_0 arm max|mixed - double ref| ", m, " max|inj - double ref| ", i,
+         " bound ", kQuantBound);
+    CHECK(m < kQuantBound);
+    CHECK(i < kQuantBound);
+  }
+
+  // KEEP-QUANT, PROVED BY A STRICTLY POSITIVE DIFFERENCE. A workaround that
+  // dequantized the weight at load and handed the op an f32 tensor would make
+  // these two arms BIT-IDENTICAL, because the weight encoding is lossless here.
+  // The activation encoding is what separates them, and it only exists on the
+  // quantized route — so `> 0` is the assertion that the block bytes actually
+  // reached a quantized GEMM, and it is the one a dequant-at-load "fix" fails.
+  {
+    const double m = MaxAbsDiff(q_mixed, f_mixed);
+    INFO("Q8_0 arm vs f32 arm max|diff| ", m, " (must be > 0 and < ", kQuantBound,
+         ")");
+    CHECK(m > 0.0);
+    CHECK(m < kQuantBound);
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpGatedResidual keeps its ELEMENTWISE operands float") {
+  // llama.cpp's own split, gated: `hc_*_norm` is `GGML_OP_MUL`
+  // (llama-arch.cpp:758,762) and a block-typed tensor cannot be an elementwise
+  // multiplicand — `qwen4exp.cpp:1198-1202` casts one to f32 rather than
+  // letting it through. The stream itself is an activation and was never a
+  // candidate. Both refusals name the operand.
+  Queue q = CpuQ();
+  constexpr int64_t H = 32, HC = 2, R = 32, T = 2;
+  constexpr int64_t kFlat = HC * H;
+
+  const ExactQ8_0 down = MakeExactQ8_0(R, kFlat, 0x1111u);
+  const ExactQ8_0 up = MakeExactQ8_0(kFlat, R, 0x2222u);
+  const ExactQ8_0 gamma_q = MakeExactQ8_0(1, kFlat, 0x3333u);
+  const ExactQ8_0 hyper_q = MakeExactQ8_0(T, kFlat, 0x4444u);
+  std::vector<float> hyper(static_cast<size_t>(T * kFlat), 0.5f);
+  std::vector<float> gamma(static_cast<size_t>(kFlat), 0.1f);
+  std::vector<float> mixed(static_cast<size_t>(T * H), 0.0f);
+
+  Tensor t_hyper = MakeT(hyper.data(), DType::kF32, {T, kFlat});
+  Tensor t_g = MakeT(gamma.data(), DType::kF32, {kFlat});
+  Tensor t_mixed = MakeT(mixed.data(), DType::kF32, {T, H});
+  std::vector<uint8_t> qd(down.blocks), qu(up.blocks), qg(gamma_q.blocks),
+      qh(hyper_q.blocks);
+  Tensor t_down = MakeQ8_0T(qd.data(), {R, kFlat});
+  Tensor t_up = MakeQ8_0T(qu.data(), {kFlat, R});
+
+  Qwen4ExpGatedResidualArgs args;
+  args.hc_count = HC;
+  args.hidden_size = H;
+  args.lowrank = R;
+  args.eps = 1e-6f;
+
+  SUBCASE("a block-quantized hc_norm gamma is refused by name") {
+    Tensor bad = MakeQ8_0T(qg.data(), {kFlat});
+    CHECK_THROWS_WITH_AS(vt::Qwen4ExpGatedResidual(q, t_mixed, nullptr, t_hyper, bad,
+                                                   t_down, t_up, nullptr, args),
+                         doctest::Contains("hc_norm weight must be float"),
+                         std::exception);
+  }
+  SUBCASE("a block-quantized hyper stream is refused by name") {
+    Tensor bad = MakeQ8_0T(qh.data(), {T, kFlat});
+    CHECK_THROWS_WITH_AS(vt::Qwen4ExpGatedResidual(q, t_mixed, nullptr, bad, t_g,
+                                                   t_down, t_up, nullptr, args),
+                         doctest::Contains("hyper must be float"), std::exception);
   }
 }

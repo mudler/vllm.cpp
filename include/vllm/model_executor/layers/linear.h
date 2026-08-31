@@ -112,6 +112,52 @@ class UnquantizedMlpGateUpMethod : public MlpGateUpMethodBase {
 // Unquantized (bf16) GeGLU gate_up: one MatmulBT over the merged [2I,H] weight then
 // vt::GeluAndMul(tanh) — byte-for-byte the inline bf16 GeGLU MLP path the Gemma
 // family (Gemma-1/2/3/4) hand-rolled. The GeGLU sibling of
+// SPLIT gate/up, for a checkpoint that ships the two projections as two tensors
+// and cannot merge them (MODEL-TEXT-GLM-MOE-DSA W9, #2214).
+//
+// WHY THE MERGED METHOD ABOVE CANNOT SERVE IT. Its operand is one `[2I,H]`
+// weight. A llama.cpp k-quant conversion writes `ffn_gate.weight` and
+// `ffn_up.weight` as two tensors, each with its OWN block encoding chosen by the
+// dynamic-quant recipe, so there is no `[2I,H]` buffer to point at: two
+// different encodings cannot be concatenated at all, and even two of the same
+// encoding would have to be COPIED out of the mmap into a new host buffer, which
+// on GLM-5.3 is ~1.3 GiB of resident bytes bought for nothing.
+//
+// SO THE SPLIT ARM IS A METHOD RATHER THAN A HAND-ROLLED PAIR OF GEMMS IN A
+// MODEL TU. That is the whole point of `MlpGateUpMethodBase`: the fused-kernel
+// scheme choice has ONE home, and a model that cannot merge its operands still
+// arrives through it instead of writing the epilogue itself. `vt::MoeSiluMul` is
+// the shared split-operand form of `vt::SiluAndMul` — the same
+// `silu(gate) * up`, reading two `[M,I]` tensors instead of one `[M,2I]` — so
+// the arithmetic is identical to the merged method's and only the launch count
+// differs, which is the same trade the MLA A-projections already record.
+class UnquantizedMlpGateUpSplitMethod : public MlpGateUpMethodBase {
+ public:
+  UnquantizedMlpGateUpSplitMethod(const OwnedTensor* gate, const OwnedTensor* up,
+                                  int64_t intermediate)
+      : gate_(gate), up_(up), I_(intermediate) {}
+
+  DBuf Apply(Dev d, const vt::Tensor& x) const override {
+    const int64_t M = x.shape[0];
+    vt::Tensor wg = ResidentWeight(d, *gate_);  // [I, H] raw-NK
+    vt::Tensor wu = ResidentWeight(d, *up_);    // [I, H] raw-NK
+    DBuf g(d, vt::DType::kBF16, {M, I_});
+    DBuf u(d, vt::DType::kBF16, {M, I_});
+    vt::MatmulBT(d.q, g.t(), x, wg);
+    vt::MatmulBT(d.q, u.t(), x, wu);
+    DBuf act(d, vt::DType::kBF16, {M, I_});
+    vt::MoeSiluMul(d.q, act.t(), g.t(), u.t());  // silu(gate)*up
+    return act;
+  }
+
+  const char* Name() const override { return "bf16-gate-up-split"; }
+
+ private:
+  const OwnedTensor* gate_;
+  const OwnedTensor* up_;
+  int64_t I_;
+};
+
 // UnquantizedMlpGateUpMethod: same merged [2I,H] operand and same single MatmulBT;
 // the ONLY difference is the activation epilogue (GeluAndMul(approximate="tanh")
 // instead of SiluAndMul), mirroring vLLM's GemmaMLP (gemma.py::GemmaMLP.act_fn =

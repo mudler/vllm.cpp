@@ -27,7 +27,7 @@ In scope:
 - Add direct coverage for those helpers, including a fixture that proves the new
   assertion holds on **both** the pre-edit and the post-edit wording.
 - Append the [#1229](https://github.com/mudler/vllm.cpp/issues/1229) row to
-  [`issue-index.md`](../issue-index.md).
+  [`issue-index.md`](../completed/issue-index.md).
 
 Out of scope:
 

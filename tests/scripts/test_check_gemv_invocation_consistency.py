@@ -140,14 +140,27 @@ class AlgoPolicyInvariantTests(unittest.TestCase):
     def test_shipped_tree_is_green_algo(self) -> None:
         text = mod.MATMUL_CU.read_text(encoding="utf-8")
         args = requested_algo_args(text)
-        # Three heuristic queries — GetOrQueryGemmHeuristic (the single cached
+        # Four heuristic queries — GetOrQueryGemmHeuristic (the single cached
         # query the three bf16/f32 lanes share since FIX-CUBLASLT-CAPTURE-1732),
-        # the fp8 plan build, and the fp8 candidate dump (#1866, diagnostic-only,
-        # its own query so it cannot move the selected algo). A non-vacuous green.
-        self.assertEqual(len(args), 3)
+        # the fp8 plan build, the fp8 candidate dump (#1866), and the DENSE
+        # candidate dump. Both dumps are diagnostic-only and each runs its OWN
+        # query, so neither can move the selected algo. A non-vacuous green.
+        #
+        # The dense dump exists because an nsys profile of the 27B decode on
+        # GB10 (sm_121a) put 87.4% of GPU time in
+        # `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_*_tn_align8` — an
+        # AMPERE WMMA kernel with a 16x16 tile, for a decode whose M is 8 — and a
+        # candidate list of length one cannot tell "cuBLASLt ranked a
+        # Blackwell-native algo second" from "it enumerates none".
+        self.assertEqual(len(args), 4)
         self.assertEqual(
             sorted(arg for _, arg in args),
-            ["kFp8AlgoLogCandidates", "kGemvHeuristicAlgos", "kGemvHeuristicAlgos"],
+            [
+                "kDenseAlgoLogCandidates",
+                "kFp8AlgoLogCandidates",
+                "kGemvHeuristicAlgos",
+                "kGemvHeuristicAlgos",
+            ],
         )
         # BOTH PRODUCTION sites still take the single best heuristic: the
         # diagnostic constant may appear exactly once, and invocation parity with

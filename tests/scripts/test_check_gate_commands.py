@@ -265,6 +265,25 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dsa_compose_is_runnable_for_a_REASON_not_just_by_membership(self):
+        # MODEL-DSV4-DSA-COMPOSE (#2286) entered the runnable population when its
+        # spec landed, and `RUNNABLE_BASELINE` was re-pinned in that same change
+        # as the ratchet above requires.
+        #
+        # Membership alone is a weak pin: the assertion above would stay green if
+        # the row were runnable for a DIFFERENT reason, or if someone added it to
+        # the baseline by hand while its spec stopped carrying a runnable command
+        # (which would leave the exact-equality pin red for a confusing reason, or
+        # green against a stale entry). So pin the REASON.
+        #
+        # The row is scoping-only -- no product code yet -- and it is runnable
+        # purely because its `## Gates` section names commands that can fail. That
+        # is worth stating: a reader who finds a spec with no implementation in
+        # the runnable set should not conclude the ratchet is broken.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("MODEL-DSV4-DSA-COMPOSE"), "runnable")
+        self.assertIn("MODEL-DSV4-DSA-COMPOSE", gates.RUNNABLE_BASELINE)
+
     def test_now_derived_left_the_gated_population_cleanly(self):
         # ENG-NOW-DERIVED (#374) shipped W1-W5 and reached DONE. Closure removes
         # it from both sides of the exact pin; it is not assigned a weaker
@@ -290,6 +309,11 @@ class RatchetTests(unittest.TestCase):
             "ENG-NOW-DERIVED",
             "ENG-TRAILER-MERGE-ARTIFACTS",
             "SPEC-BPE-QUADRATIC-MERGE",
+            # BACKEND-TENSTORRENT-GDN joined this population when its row moved
+            # ACTIVE -> DONE (#1715 close, 2026-08-30): the mutation below must
+            # expose it as runnable-DONE and disagree with the re-pinned
+            # baseline, exactly like the five rows above.
+            "BACKEND-TENSTORRENT-GDN",
         }
         self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
         self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
@@ -982,6 +1006,29 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_backend_tenstorrent_gdn_left_the_gated_population_cleanly(self):
+        # BACKEND-TENSTORRENT-GDN (#1715) entered the runnable population on
+        # 2026-08-22 as inherited credit while its spec was committed and its
+        # W1/W2 waves were still owed. The row's code landed (W1 `34fde3502`,
+        # W2 `c85af0aaf`), the Qwen3_5 wiring row made the family
+        # production-reached, and the record-only close moved the row
+        # ACTIVE -> DONE. `DONE` is not in GATED_STATES, so it leaves the
+        # AUDITED population entirely.
+        #
+        # Assert the departure on BOTH sides -- gone from the audit AND gone
+        # from the baseline -- because a row present in one and not the other
+        # is exactly what the exact pin exists to catch. Same shape and same
+        # reason as SPEC-BPE-QUADRATIC-MERGE below.
+        #
+        # The row is NOT re-verdicted downward and it did not lose its command:
+        # the suites it credited are still pinned on the live rows that bind
+        # them. This case pins the difference, since a row that leaves and a
+        # row that silently drops its gate command are the two things this
+        # classifier must never confuse.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("BACKEND-TENSTORRENT-GDN"))
+        self.assertNotIn("BACKEND-TENSTORRENT-GDN", gates.RUNNABLE_BASELINE)
 
     def test_bpe_quadratic_merge_left_the_gated_population_cleanly(self):
         # SPEC-BPE-QUADRATIC-MERGE (#1365) entered the runnable population on

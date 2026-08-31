@@ -21,6 +21,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
+#include "vt/tensor.h"
 
 namespace vllm {
 
@@ -302,40 +303,79 @@ const Model& ModelAs(const LoadedModel& model, std::string_view architecture) {
 // never read it and the shared runner path stays byte-identical (the field is
 // additive and default-nullopt — text inertness is by construction).
 //
-// The handles are BORROWED (owned by the runner/driver for the forward's
-// duration). The tower + `_merge_multimodal_embeddings` + MRoPE index math already
-// ran on the host side (or the encoder runner) to fill these, so the registered
-// forward is a pure per-step function of them:
-//   * inputs_embeds_bf16 — the ALREADY-MERGED [num_tokens*hidden] host bf16 input
+// ENG-MM-INPUT-PIPELINE P1 (#1358, #2300): THE HANDLES ARE DEVICE TENSORS, not
+// host pointers. Every field is a BORROWED, non-owning `vt::Tensor` view of memory
+// that lives on `ModelForwardInput::queue`'s device for the forward's duration; an
+// absent channel is the default-constructed tensor, whose `data == nullptr`.
+//
+// WHY DEVICE, and why this had to move before the runner does. Upstream stages the
+// merged embeddings in a PERSISTENT DEVICE buffer —
+// `vllm/v1/worker/gpu_model_runner.py::GPUModelRunner._init_device_properties`
+// allocates `self.inputs_embeds` (:798, the sole
+// `self.inputs_embeds = self._make_buffer` in the tree) and the mm branch copies
+// the merged result into it (:3607, `self.inputs_embeds.gpu[...].copy_(...)`) —
+// precisely so the step can be CUDA-graph captured. A HOST handle here forced a
+// `[T,H]` D2H+H2D round trip per step, made the mm arm permanently
+// non-graph-capturable, and put a memory-format divergence in the seam that NO
+// token gate can observe (`.agents/porting.md` "Mirror the memory format, not just
+// the math"). The tokens matched; the bytes moved twice.
+//
+// The tower, the merge (`interfaces.py::SupportsMultiModal.embed_input_ids` :380 →
+// `_merge_multimodal_embeddings` :411 → `utils.py::_merge_multimodal_embeddings`
+// :658) and the MRoPE index math still run ABOVE this seam and fill these buffers,
+// so the registered forward stays a pure per-step function of them:
+//   * inputs_embeds — the ALREADY-MERGED [num_tokens, hidden] bf16 DEVICE
 //     embeddings: embed(token_ids) with the projected vision features
 //     masked-scattered into the placeholder rows. When set, the forward consumes
-//     THESE instead of embedding token_ids.
-//   * positions3 — the 3-D MRoPE positions, row-major [3, num_tokens]
-//     (3*num_tokens int32), replacing the 1-D ModelForwardInput::positions for the
-//     vision-language backbone.
-//   * deepstack_bf16 — the [levels*num_tokens*hidden] host bf16 DeepStack
-//     multiscale tensor added after decoder layers 0..levels-1 (EMPTY on decode
+//     THESE instead of embedding token_ids. The forward COPIES it into its own
+//     residual-stream buffer and never writes through this view, mirroring
+//     upstream, whose decoder layers allocate rather than clobber the persistent
+//     `inputs_embeds` buffer they are handed.
+//   * positions3 — the 3-D MRoPE positions, [3, num_tokens] int32 DEVICE,
+//     replacing the 1-D ModelForwardInput::positions for the vision-language
+//     backbone.
+//   * deepstack — the [levels, num_tokens, hidden] bf16 DEVICE DeepStack
+//     multiscale tensor added after decoder layers 0..levels-1 (ABSENT on decode
 //     steps and on models without DeepStack, e.g. the 27B GDN-hybrid VL path).
 //   * deepstack_levels — `levels` (0 ⇒ no DeepStack inject).
 //   * ple_token_ids — CLAIM-GEMMA4-MM-E2E: the Gemma-4 Per-Layer-Embedding (PLE)
-//     token ids [num_tokens], with the multimodal (image/audio) rows masked to 0
-//     and the vocab_size_per_layer_input range mask applied — mirror of
+//     token ids [num_tokens] int32 DEVICE, with the multimodal (image/audio) rows
+//     masked to 0 and the vocab_size_per_layer_input range mask applied — mirror of
 //     gemma4_mm.py embed_input_ids (`is_multimodal → 0`, :1962-1969) +
 //     gemma4.py get_per_layer_inputs (`id < vocab_size_per_layer_input ? id : 0`,
 //     :857-863). The Gemma-4 registered mm forward looks up embed_tokens_per_layer
-//     from THESE ids (NOT the merged embeds). nullptr for non-Gemma mm models
-//     (Qwen3-VL never sets it) — additive + default-null. Gemma-4 also uses the
-//     1-D ModelForwardInput::positions (NOT positions3) and no DeepStack.
+//     from THESE ids (NOT the merged embeds). ABSENT for non-Gemma mm models
+//     (Qwen3-VL never sets it). Gemma-4 also uses the 1-D
+//     ModelForwardInput::positions (NOT positions3) and no DeepStack.
 struct MultiModalForwardInput {
-  const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr;
-  const std::vector<int32_t>* positions3 = nullptr;
-  const std::vector<uint16_t>* deepstack_bf16 = nullptr;
+  vt::Tensor inputs_embeds;
+  vt::Tensor positions3;
+  vt::Tensor deepstack;
   int64_t deepstack_levels = 0;
-  const std::vector<int32_t>* ple_token_ids = nullptr;
+  vt::Tensor ple_token_ids;
 };
 
-// KV-DSV4-MULTICACHE W3 (#2068): THE THIRD FORWARD CHANNEL — the name each paged
-// cache was published under, carried beside the cache itself.
+// ENG-MULTIKV-BYNAME: WHERE a published cache's payload lives.
+//
+// Upstream needs no such thing. `_reshape_kv_cache_tensors` builds ONE
+// `kv_caches: dict[str, torch.Tensor]` (`vllm/v1/worker/gpu_model_runner.py:7354`
+// @ pin 5559679229) and fills it from both arms of the same loop — the attention
+// arm at `:7418-7427` and the `MambaSpec` arm at `:7429-7441`, whose own comment
+// says "Keeping one tensor per layer lets the KV connector register it without
+// special-casing Mamba" — and `bind_kv_cache`
+// (`vllm/v1/worker/utils.py:450-465`) binds every layer out of that one dict.
+// A Mamba page is a `torch.Tensor` like any other, so one dict is enough.
+//
+// This tree carries the two payloads in two typed containers instead:
+// `ModelForwardInput::attn_kv` holds `PagedKvCache` and `::gdn_state` holds
+// `GdnStateCache`. That is a C++ type distinction, not an addressing one, so
+// this enum records the ONE fact the name cannot: which container the slot
+// indexes. Every published name still lives in ONE list, in ONE order, and
+// resolves through ONE `Find`.
+enum class KvCachePayload : uint8_t { kPaged = 0, kRecurrent = 1 };
+
+// KV-DSV4-MULTICACHE W3 (#2068): THE THIRD FORWARD CHANNEL — the name each
+// published cache was addressed by, carried beside the cache itself.
 //
 // `ModelForwardInput::attn_kv` is POSITIONAL: entry `i` is the i-th
 // full-attention layer. That is the only thing a position CAN be while a layer
@@ -352,30 +392,153 @@ struct MultiModalForwardInput {
 // (`vllm/v1/worker/gpu_model_runner.py:7785-7801`). A cache is addressed BY NAME
 // upstream, so this struct carries the name.
 //
-// `layer_names`, `group_ids` and `layer_indices` are PARALLEL to
-// `ModelForwardInput::attn_kv`: entry `i` describes `attn_kv[i]`. The vectors are
-// owned by the runner and stay valid for the forward's duration.
+// ENG-MULTIKV-BYNAME: the five vectors below are PARALLEL to EACH OTHER and
+// cover EVERY published cache — recurrent as well as attention. They are NOT
+// parallel to `ModelForwardInput::attn_kv`, and W3's original contract that they
+// were is what this row removes.
+//
+// WHY THAT CONTRACT COULD NOT STAND. W3 built these three off
+// `attn_group_ids_`, which collects only the groups whose spec is an
+// `AttentionSpec`, so a `MambaSpec` group's layers were never named at all:
+// their states reached the forward through `gdn_state` POSITIONALLY, and
+// `Find()` answered -1 for every one of them. DeepSeek-V4 hid this, because it
+// publishes only MLA / SlidingWindowMLA specs and all 167 of its caches are
+// attention ones. Both three-group hybrids do not: `qwen4_exp` and `glm5_next`
+// each carry a `MambaSpec`, and #2343 measured the consequence as
+// `22 KV cache(s) from 2 published group(s)` reported beside
+// `block tables gathered for 3 of 3` — 34 recurrent states invisible while
+// their group's block table was not.
+//
+// THE ORDER IS UPSTREAM'S INSERTION ORDER: published GROUP order, then that
+// group's own `layer_names` order, which is exactly how
+// `_reshape_kv_cache_tensors` fills its dict
+// (`vllm/v1/worker/gpu_model_runner.py:7365-7372`,
+// `for group in ...: for layer_name in group.layer_names`). A recurrent group
+// between two attention groups therefore sits BETWEEN them here, and an entry's
+// index is NOT its slot in either payload container. That is what
+// `payload_kinds` / `payload_slots` are for: entry `i`'s cache is
+// `attn_kv[(*payload_slots)[i]]` when its kind is `kPaged` and
+// `gdn_state[(*payload_slots)[i]]` when it is `kRecurrent`.
+//
+// The vectors are owned by the runner and stay valid for the forward's
+// duration.
 //
 // NULL on `ModelForwardInput` for every model whose topology the positional
-// convention can express — which is every model in the tree except DeepSeek-V4 —
+// convention can express — every model in the tree except the multi-cache ones —
 // so every existing forward is byte-identical by construction.
 struct MultiKvCacheIndex {
   const std::vector<std::string>* layer_names = nullptr;
   const std::vector<int32_t>* group_ids = nullptr;
   const std::vector<int32_t>* layer_indices = nullptr;
+  // ENG-MULTIKV-BYNAME: parallel to the three above. `payload_kinds` holds
+  // `KvCachePayload` values widened to `uint8_t` so the header needs no
+  // `std::vector<KvCachePayload>` instantiation on either side of the seam;
+  // read them through `PayloadAt` / `Resolve` rather than by hand.
+  const std::vector<uint8_t>* payload_kinds = nullptr;
+  const std::vector<int32_t>* payload_slots = nullptr;
 
-  // How many caches arrived. 0 when the channel is empty.
+  // MODEL-MM-QWEN4-EXP W5c-2 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249)
+  // item 3): ONE GATHERED BLOCK TABLE PER PUBLISHED GROUP, indexed by GROUP ID
+  // rather than parallel to `attn_kv` above.
+  //
+  // WHY THE CHANNEL NEEDED A FOURTH VECTOR. W3 made a cache addressable by NAME
+  // and a runner allocate every published one. It did not make a cache
+  // READABLE: a page-addressed cache needs the map from a sequence's LOGICAL
+  // position to the PHYSICAL page holding it, and that map is the group's block
+  // table. Before this, `GPUModelRunner::gather_block_table` was called for
+  // exactly two group ids — the target attention group and the recurrent group
+  // — so a third group's table never left the runner and its cache was
+  // allocated and unread. `qwen4_exp` publishes exactly such a third group: the
+  // QSA indexer side cache, an `MLAAttentionSpec` at `compress_ratio` 1 —
+  // ONE ROW PER TOKEN. This line said 4 until W5h measured the group against
+  // upstream's `Cache.update_indexer`, which concatenates one raw key per
+  // token; the ratio is the SELECTION algorithm's, never the page geometry.
+  //
+  // UPSTREAM DOES NOT HAVE A "TWO NAMED GROUPS" SHAPE AT ALL. Its per-group
+  // metadata loop runs over `enumerate(kv_cache_groups)` and hands every group
+  // its own table — `cm.block_table_tensor = _get_block_table(kv_cache_gid)`
+  // (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin 5559679229), with
+  // `_get_block_table` (`:2318-2334`) being this tree's `gather_block_table`.
+  // So this field is the mirror of an existing upstream loop, not a new channel.
+  //
+  // INDEXED BY GROUP ID, and that is deliberate: the other three vectors are
+  // parallel to `attn_kv` because a CACHE is what they describe, while a block
+  // table belongs to a GROUP and every layer in that group shares it — which is
+  // upstream's own fan-out ("make layers in the same group share the same
+  // metadata", `:2551-2552`). Entry `g` is group `g`'s row-major
+  // `[num_reqs, group_block_table_cols[g]]` table. Both vectors are sized to the
+  // published group count and owned by the runner, valid for the forward's
+  // duration. NULL on every uniform topology, exactly like the three above.
+  const std::vector<std::vector<int32_t>>* group_block_tables = nullptr;
+  const std::vector<int32_t>* group_block_table_cols = nullptr;
+
+  // How many caches arrived, paged and recurrent together. 0 when the channel is
+  // empty.
   size_t size() const;
   // How many DISTINCT published groups they came from.
   int num_groups() const;
   // The first published name, for a diagnostic. Empty when the channel is empty.
   std::string_view first_name() const;
-  // The index into `attn_kv` of the cache published under `layer_name`, or -1.
+  // The FLAT index of the cache published under `layer_name`, or -1. Feed it to
+  // `PayloadAt` to reach the cache itself; it is NOT a slot in either payload
+  // container, and on any topology carrying a recurrent group it is not equal to
+  // one either.
   // LINEAR: the list is 167 entries at DeepSeek-V4-Flash and a forward looks a
   // name up once per layer per role, so an index structure would be premature.
   // Recorded as a decision rather than left as an oversight.
   int64_t Find(std::string_view layer_name) const;
+
+  // ENG-MULTIKV-BYNAME. How many of the published caches are paged, and how many
+  // are recurrent. `num_paged() + num_recurrent() == size()`.
+  int num_paged() const;
+  int num_recurrent() const;
+
+  // Where flat entry `index` lives. FALSE when `index` is out of range or the
+  // channel carries no locators. `*kind` and `*slot` are written in EVERY case —
+  // `kPaged` and -1 on the false answer — so a caller that forgets the bool
+  // indexes out of range rather than reading a stale slot, which is the failure
+  // mode `BlockTableForGroup` above already guards the same way.
+  bool PayloadAt(int64_t index, KvCachePayload* kind, int32_t* slot) const;
+
+  // `Find` and `PayloadAt` in one call, which is what a forward wants: it holds
+  // a layer name and needs the cache. FALSE when nothing was published under
+  // that name, with `*kind` / `*slot` written as above.
+  bool Resolve(std::string_view layer_name, KvCachePayload* kind,
+               int32_t* slot) const;
+
+  // How many groups the model PUBLISHED, which is not `num_groups()`: that one
+  // counts the distinct groups the caches in `attn_kv` came from, and a
+  // recurrent group contributes no entry there. `qwen4_exp` publishes THREE and
+  // `num_groups()` answers two, so a diagnostic that used it as the denominator
+  // would report a full gather as partial. 0 when the channel is empty.
+  int num_published_groups() const;
+
+  // How many published groups actually carry a gathered block table. 0 when the
+  // channel is empty AND when a step has not run yet, which is why the runner
+  // publishes the pointers once and refills the vectors every step.
+  int num_group_block_tables() const;
+
+  // Group `group_id`'s row-major `[num_reqs, *num_cols]` block table, or
+  // `nullptr` when the group has none (out of range, or no step has run).
+  // `*num_cols` is written in EVERY case — 0 on the null answer — so a caller
+  // that forgets to check the pointer cannot index a stale width.
+  const std::vector<int32_t>* BlockTableForGroup(int group_id,
+                                                 int* num_cols) const;
 };
+
+// KV-DSV4-MULTICACHE W5 (#2323): does a name-keyed cache set reaching this model
+// have to be REFUSED?
+//
+// A PURE PREDICATE, deliberately, and this row has the precedent: W1 made the
+// staging budget a pure function "so it is gateable without a device". The same
+// applies here -- the decision is gateable without a model, a runner or a
+// registry, so both polarities can be pinned directly instead of only through a
+// full engine construction.
+//
+// True when a set arrived (`mk != nullptr`) and the registration has not claimed
+// it. Note it reads NULLNESS for arrival: an EMPTY set that arrived is still an
+// arrival, and the refusal's message reads the payload so it can say so.
+bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv);
 
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
@@ -457,9 +620,14 @@ struct ModelForwardInput {
   const int32_t* device_token_ids = nullptr;
   // KV-DSV4-MULTICACHE W3 (#2068): the THIRD cache channel. Non-null only when
   // the runner allocated a MULTI-CACHE topology — one whose published groups the
-  // positional `attn_kv` convention cannot address, which today is DeepSeek-V4
-  // and nothing else. NULL on every other step, so every other forward is
-  // byte-identical. Set after aggregate construction, like `device_token_ids`
+  // positional `attn_kv` convention cannot address. THREE architectures publish
+  // one today (`DeepseekV4ForCausalLM`, `Qwen4ExpForConditionalGeneration` and
+  // `Glm5NextForConditionalGeneration`); this line said "DeepSeek-V4 and nothing
+  // else", which was true when W3 wrote it and stopped being true two rows
+  // later. NULL on every other step, so every other forward is byte-identical.
+  //
+  // A forward may only READ it when its `ModelFactory::consumes_multi_kv` is
+  // true; `ModelRegistry::Forward` refuses the step otherwise. Set after aggregate construction, like `device_token_ids`
   // above, so no positional initializer moves.
   const MultiKvCacheIndex* multi_kv = nullptr;
 };
@@ -492,6 +660,71 @@ struct ModelFactory {
   // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
   // Default false: every existing arch's engine load path is byte-identical.
   bool stage_on_load = false;
+  // MODEL-MM-QWEN4-EXP W5j ([#2031](https://github.com/mudler/vllm.cpp/issues/2031),
+  // [#2353](https://github.com/mudler/vllm.cpp/issues/2353)): whether THIS
+  // model's forward RESOLVES its caches through `MultiKvCacheIndex` — by the
+  // name each was published under — instead of reading `attn_kv` / `gdn_state`
+  // positionally.
+  //
+  // THE DEFAULT IS FALSE AND THAT IS THE MECHANISM, the same polarity
+  // `stage_on_load` and `supports_weight_offload` above already use.
+  // `ModelRegistry::Forward` refuses a multi-cache topology for every model that
+  // leaves it false, so a model that publishes three groups and then reads two
+  // positional channels is stopped rather than served a cache set it silently
+  // mis-indexes. On a topology whose groups the positional convention CAN
+  // express the runner sends no channel at all (`multi_kv == nullptr`), so this
+  // bit is inert for every uniform model whatever its value.
+  //
+  // WHY A BIT AND NOT AN ARCHITECTURE LIST IN THE GUARD. The fact is a property
+  // of the forward and it lives beside the forward: the one translation unit
+  // that resolves by name is the one that sets this. A list in
+  // `ModelRegistry::Forward` would have to be edited by every model row, which
+  // is the shared-file lock AGENTS.md `## Records` forbids, and it is the
+  // construct #2288 has already driven stale six times on this row.
+  //
+  // IT IS NOT A LICENCE TO SERVE ANY SHAPE. It says the forward ASKS by name;
+  // the forward still refuses a channel that answers wrongly — a name that
+  // resolves to nothing, to the wrong payload kind, or to a group with no
+  // gathered block table. Setting it true on a forward that reads positionally
+  // would move a silent mis-index from the engine into the model, so it lands
+  // WITH its first consumer and never before one.
+  //
+  // THE BIT ITSELF IS KV-DSV4-MULTICACHE W5's
+  // ([#2323](https://github.com/mudler/vllm.cpp/issues/2323)), which introduced
+  // it to turn `ModelRegistry::Forward`'s blanket refusal into a dispatch and
+  // stated the reason this default cannot be flipped for convenience: the
+  // failure it prevents is INVISIBLE. A model that discards a name-keyed set
+  // decodes by recomputing the whole prefix, which keeps the tokens right
+  // while doing asymptotically more work, so no token gate can see it. A
+  // capability whose absence is invisible must be opt-in.
+  bool consumes_multi_kv = false;
+  // MODEL-MM-QWEN4-EXP W5L ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)):
+  // whether THIS model's forward serves exactly ONE sequence per step, so the
+  // engine must not schedule a batch it will refuse.
+  //
+  // THIS IS NOT A PREFERENCE, IT IS THE ONLY THING BETWEEN A SERVER AND A DEAD
+  // ENGINE. A forward that refuses `num_reqs > 1` throws from inside the
+  // EngineCore busy loop, and that loop treats a throw as FATAL: the process
+  // keeps its socket open, every in-flight request gets a 500 naming the model,
+  // and every later request gets the same. MEASURED on this architecture at
+  // `--max-num-seqs 4` before this bit existed — three concurrent
+  // `/v1/completions` calls returned
+  // "EngineCore encountered an issue ... this forward serves ONE sequence per
+  // call and the step carries 2" and the engine never recovered. The default
+  // `max_num_seqs` is 128, so that was the OUT-OF-THE-BOX behaviour.
+  //
+  // `LoadedEngine::ResolveMaxNumSeqs` therefore clamps the resolved concurrency
+  // to 1 for a model that sets it, and says so on stderr exactly as the
+  // recurrent-state budget clamp beside it does. The refusal in the forward
+  // STAYS: this bit stops the engine producing the batch, and the forward stops
+  // anyone else's.
+  //
+  // THE DEFAULT IS FALSE AND MEANS "no opinion", not "batches fine": a model
+  // that leaves it false is scheduled exactly as it was before this field
+  // existed. It is a statement about the PORT and not about the architecture —
+  // clearing it is what a wave that plumbs a ragged multi-request batch does,
+  // and that wave is owed under `.agents/specs/qwen4-exp-flash-next.md`.
+  bool serves_one_sequence_per_step = false;
   // ENG-WEIGHT-OFFLOAD: whether THIS model's loader asks
   // `WeightOffloader::ConsiderWeight` for each weight and honours the answer.
   //
@@ -536,6 +769,29 @@ struct ModelFactory {
   // architecture gets the whole bound and the #1123 refusal until somebody wires
   // the seam and says so here.
   bool streams_routed_experts = false;
+  // MODEL-MM-GLM53-FLASH W5b-2c (#2348): whether THIS model's forward CONSUMES
+  // `ModelForwardInput::multi_kv` -- the cache set keyed by published layer
+  // name -- rather than ignoring it.
+  //
+  // THE DEFAULT IS FALSE, AND THE REFUSAL IN `ModelRegistry::Forward` IS WHAT
+  // THE DEFAULT BUYS. KV-DSV4-MULTICACHE W3 (#2068) made the runner allocate
+  // every published cache and hand them here by name, and refused the step
+  // unconditionally because no forward knew what to do with them. Letting a
+  // model through without that knowledge discards a correctly allocated KV
+  // topology in silence and reports a decode rate for a full-recompute path --
+  // and, for a paged model, re-attends an empty prefix on every step after the
+  // first, which is fluent wrong text and not a crash.
+  //
+  // WHY THE CAPABILITY AND NOT AN ARCHITECTURE LIST, which is the same argument
+  // `streams_routed_experts` above makes: the fact is a property of the
+  // model's forward and it lives beside the forward. `glm5_next_registry.cpp`
+  // is the translation unit that reads the channel and it is the one that sets
+  // this. A new architecture inherits false and is refused until somebody
+  // writes the consuming forward and says so here.
+  //
+  // DeepSeek-V4 keeps the default: `DeepseekV4Model::Forward` still opens with
+  // `(void)attn_kv;` and row KV-DSV4-MULTICACHE W5 (#1925) owns its consuming
+  // forward.
 };
 
 struct ModelRegistration {

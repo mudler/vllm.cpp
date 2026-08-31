@@ -56,6 +56,8 @@
 // W1 (single-GB10 oracle run) is MEMORY-INFEASIBLE — needs multi-node TP / offload.
 #include "vllm/model_executor/models/deepseek_v4.h"
 
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"  // kMxfp4GroupSize
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -538,7 +540,14 @@ class Exl3CarriedReader {
 
   // One block-wise FP8 linear: `<base>.weight` F8_E4M3 [N,K] beside
   // `<base>.scale` F8_E8M0 [ceil(N/bn), ceil(K/bk)]. Both are accounted.
-  std::vector<float> Fp8Block(const std::string& base, int64_t N, int64_t K) {
+  //
+  // W1d (#2186): the result is BF16, not f32. `DequantFp8BlockToF32` still decodes
+  // to f32 into a per-tensor scratch buffer -- that is the arithmetic upstream
+  // does, and narrowing its result is the LAST step rather than a different
+  // decode -- then the block is narrowed once into the destination. The scratch
+  // is one tensor wide and dies with the call, so peak residency is the bf16
+  // tower plus the single largest tensor's f32, not the f32 tower.
+  HostBf16 Fp8Block(const std::string& base, int64_t N, int64_t K) {
     const std::string wname = base + ".weight";
     const std::string sname = base + ".scale";
     const StTensor& w = Take(wname);
@@ -555,7 +564,7 @@ class Exl3CarriedReader {
     VT_CHECK(s.nbytes == static_cast<size_t>(nb) * static_cast<size_t>(kb),
              std::string("deepseek-v4 exl3 loader: ") + sname +
                  " must hold one UE8M0 byte per block");
-    std::vector<float> out(static_cast<size_t>(N) * static_cast<size_t>(K));
+    std::vector<float> f32(static_cast<size_t>(N) * static_cast<size_t>(K));
     // No alignment hazard on this path, and it is worth naming rather than
     // leaving a reader to re-derive it: `DequantFp8BlockToF32` reads BOTH mmap'd
     // buffers one `uint8_t` at a time, and `alignof(uint8_t) == 1`, so an
@@ -563,7 +572,9 @@ class Exl3CarriedReader {
     // block scale as a wider type acquires the hazard the BF16/I64 arms above
     // have and must go through `vt::LoadUnaligned` too.
     DequantFp8BlockToF32(w.data, s.data, N, K, recipe_.block_n, recipe_.block_k,
-                         out.data());
+                         f32.data());
+    HostBf16 out(f32.size());
+    for (size_t i = 0; i < f32.size(); ++i) out[i] = vt::F32ToBF16(f32[i]);
     return out;
   }
 
@@ -796,6 +807,202 @@ int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
 
 namespace {
 
+// `mtp.{L}.` -> L, or -1 when the name is not an MTP tensor.
+int64_t MtpHeadIndex(const std::string& name) {
+  if (name.rfind("mtp.", 0) != 0) return -1;
+  const size_t dot = name.find('.', 4);
+  if (dot == std::string::npos || dot == 4) return -1;
+  int64_t v = 0;
+  for (size_t i = 4; i < dot; ++i) {
+    if (name[i] < '0' || name[i] > '9') return -1;
+    v = v * 10 + (name[i] - '0');
+  }
+  return v;
+}
+
+}  // namespace
+
+DeepseekV4MtpRouted RouteDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail,
+    const std::vector<const uint8_t*>& payloads) {
+  DeepseekV4MtpRouted out;
+  if (payloads.size() != tail.size()) {
+    out.refusal = "deepseek-v4 mtp: " + std::to_string(tail.size()) +
+                  " descriptors but " + std::to_string(payloads.size()) +
+                  " payloads; a view built from mismatched arrays would borrow the "
+                  "wrong bytes";
+    return out;
+  }
+  const DeepseekV4MtpInventory inv = ClassifyDeepseekV4MtpTail(tail);
+  if (!inv.refusal.empty()) {
+    out.refusal = inv.refusal;
+    return out;
+  }
+
+  std::unordered_map<std::string, size_t> pos;
+  for (size_t i = 0; i < tail.size(); ++i) pos.emplace(tail[i].name, i);
+  out.heads.resize(static_cast<size_t>(inv.num_heads));
+
+  for (size_t i = 0; i < tail.size(); ++i) {
+    const DeepseekV4MtpTensorDesc& d = tail[i];
+    const int64_t head = MtpHeadIndex(d.name);
+    if (head < 0 || head >= static_cast<int64_t>(out.heads.size())) {
+      out.refusal = "deepseek-v4 mtp: '" + d.name + "' names head " +
+                    std::to_string(head) + ", outside the " +
+                    std::to_string(out.heads.size()) + " the tail declares";
+      return out;
+    }
+    const std::string kScale = ".scale";
+    if (d.name.size() > kScale.size() &&
+        d.name.compare(d.name.size() - kScale.size(), kScale.size(), kScale) == 0) {
+      continue;  // reached through its weight
+    }
+    const std::string key = d.name.substr(d.name.find('.', 4) + 1);
+
+    DeepseekV4MtpTensorView v;
+    v.shape = d.shape;
+    v.dtype = d.dtype;
+    v.data = payloads[i];
+    if (d.dtype == "BF16" || d.dtype == "F32") {
+      v.format = DeepseekV4MtpFormat::kPlain;
+      v.out_dim = d.shape.empty() ? 0 : d.shape[0];
+      v.in_dim = d.shape.size() > 1 ? d.shape[1] : 1;
+    } else {
+      const auto sit = pos.find(d.name + kScale);
+      VT_CHECK(sit != pos.end(),
+               "deepseek-v4 mtp: classification passed but '" + d.name +
+                   "' has no scale; the two passes disagree");
+      v.scale = payloads[sit->second];
+      v.out_dim = d.shape[0];
+      if (d.dtype == "I8") {
+        // TWO e2m1 nibbles per stored byte. `in_dim` is the LOGICAL width.
+        v.format = DeepseekV4MtpFormat::kMxfp4;
+        v.in_dim = d.shape[1] * 2;
+      } else {
+        v.format = DeepseekV4MtpFormat::kFp8Block;
+        v.in_dim = d.shape[1];
+      }
+    }
+    out.heads[static_cast<size_t>(head)].tensors.emplace(key, v);
+  }
+  return out;
+}
+
+std::vector<float> DequantizeDeepseekV4MtpTensor(const DeepseekV4MtpTensorView& v) {
+  VT_CHECK(v.data != nullptr, "deepseek-v4 mtp: dequantizing a view with no bytes");
+  const int64_t n = v.out_dim * v.in_dim;
+  std::vector<float> out(static_cast<size_t>(n), 0.0f);
+  switch (v.format) {
+    case DeepseekV4MtpFormat::kPlain: {
+      if (v.dtype == "F32") {
+        std::memcpy(out.data(), v.data, static_cast<size_t>(n) * sizeof(float));
+      } else {
+        const auto* p = reinterpret_cast<const uint16_t*>(v.data);
+        for (int64_t i = 0; i < n; ++i)
+          out[static_cast<size_t>(i)] = vt::BF16ToF32(p[static_cast<size_t>(i)]);
+      }
+      break;
+    }
+    case DeepseekV4MtpFormat::kFp8Block:
+      // 128x128 is not a default here: the classifier REFUSED any tail whose
+      // scale does not tile its weight at exactly that, so by this point it holds.
+      DequantFp8BlockToF32(v.data, v.scale, v.out_dim, v.in_dim, 128, 128, out.data());
+      break;
+    case DeepseekV4MtpFormat::kMxfp4:
+      DequantMxfp4ToF32(v.data, v.scale, v.out_dim, v.in_dim, out.data());
+      break;
+  }
+  return out;
+}
+
+DeepseekV4MtpInventory ClassifyDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail) {
+  DeepseekV4MtpInventory inv;
+  std::unordered_map<std::string, const DeepseekV4MtpTensorDesc*> by_name;
+  std::unordered_set<int64_t> heads;
+  for (const auto& d : tail) by_name.emplace(d.name, &d);
+
+  for (const auto& d : tail) {
+    const int64_t head = MtpHeadIndex(d.name);
+    if (head < 0) {
+      if (inv.refusal.empty())
+        inv.refusal = "deepseek-v4 mtp: '" + d.name + "' is not an mtp.{L}.* tensor";
+      continue;
+    }
+    heads.insert(head);
+
+    // A scale is accounted WITH its weight, never on its own.
+    const std::string kScale = ".scale";
+    if (d.name.size() > kScale.size() &&
+        d.name.compare(d.name.size() - kScale.size(), kScale.size(), kScale) == 0) {
+      continue;
+    }
+
+    if (d.dtype == "BF16" || d.dtype == "F32") {
+      ++inv.plain;
+      continue;
+    }
+
+    const std::string sname = d.name + ".scale";
+    const auto sit = by_name.find(sname);
+    if (sit == by_name.end()) {
+      if (inv.refusal.empty())
+        inv.refusal = "deepseek-v4 mtp: '" + d.name + "' is " + d.dtype +
+                      " but carries no '" + sname +
+                      "'; a quantized weight without its scale would dequantize to noise";
+      continue;
+    }
+    const DeepseekV4MtpTensorDesc& sc = *sit->second;
+    if (d.shape.size() != 2 || sc.shape.size() != 2) {
+      if (inv.refusal.empty())
+        inv.refusal = "deepseek-v4 mtp: '" + d.name + "' and its scale must both be rank 2";
+      continue;
+    }
+
+    // FP8 BLOCK: E4M3 weight, E8M0 scale, blocks of exactly 128x128.
+    if (d.dtype == "F8_E4M3" && sc.dtype == "F8_E8M0") {
+      const int64_t bn = sc.shape[0] == 0 ? 0 : d.shape[0] / sc.shape[0];
+      const int64_t bk = sc.shape[1] == 0 ? 0 : d.shape[1] / sc.shape[1];
+      if (bn != 128 || bk != 128 || sc.shape[0] * bn != d.shape[0] ||
+          sc.shape[1] * bk != d.shape[1]) {
+        if (inv.refusal.empty())
+          inv.refusal = "deepseek-v4 mtp: '" + d.name +
+                        "' is fp8-block but its scale does not tile it at 128x128";
+        continue;
+      }
+      ++inv.fp8_block;
+      continue;
+    }
+
+    // MXFP4: I8 holding two e2m1 nibbles, so K = 2 * shape[1]; one E8M0 scale per
+    // group of 32 inputs. Group 16 would be NVFP4 and needs a different reader.
+    if (d.dtype == "I8" && sc.dtype == "F8_E8M0") {
+      const int64_t k = d.shape[1] * 2;
+      if (sc.shape[0] != d.shape[0] || sc.shape[1] == 0 ||
+          k / sc.shape[1] != kMxfp4GroupSize || sc.shape[1] * kMxfp4GroupSize != k) {
+        if (inv.refusal.empty())
+          inv.refusal = "deepseek-v4 mtp: '" + d.name +
+                        "' is packed 4-bit but its scale is not one E8M0 byte per " +
+                        std::to_string(kMxfp4GroupSize) + " inputs";
+        continue;
+      }
+      ++inv.mxfp4;
+      continue;
+    }
+
+    if (inv.refusal.empty())
+      inv.refusal = "deepseek-v4 mtp: '" + d.name + "' has layout " + d.dtype + "/" +
+                    sc.dtype + ", which this arm has no reader for";
+  }
+
+  inv.num_heads = static_cast<int64_t>(heads.size());
+  return inv;
+}
+
+namespace {
+
+
+
 DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config,
                                      const DeepseekV4Params& p) {
@@ -842,6 +1049,7 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
 
   int64_t accounted = 0;
   int64_t skipped_mtp = 0;
+  std::vector<DeepseekV4MtpTensorDesc> mtp_descs;
 
   // ── the CARRIED half: the same name-map the non-EXL3 arm walks, minus the
   //    routed-expert block EXL3 replaced — MATERIALIZED into the host-float
@@ -1083,6 +1291,10 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       // the upstream repo can run a K5 speculative draft at all, and reaching
       // them is a later row's work.
       ++skipped_mtp;
+      // R1 (#1314): say WHAT was skipped, not just how many. Classification is
+      // pure and cheap; the MTP lane reads the result rather than re-opening the
+      // checkpoint to find out whether a draft head is available.
+      mtp_descs.push_back(DeepseekV4MtpTensorDesc{name, tensor->dtype, tensor->shape});
       continue;
     }
     VT_CHECK(false,
@@ -1094,6 +1306,7 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
   }
 
   w.exl3.skipped_mtp_tensors = skipped_mtp;
+  w.exl3.mtp = ClassifyDeepseekV4MtpTail(mtp_descs);
   w.accounted_tensors = accounted;
   // W1c. The carried tower above is what `ForwardComposeImpl` reads on this
   // arm, so the flag every forward entry point gates on is set HERE, on the one
@@ -1800,12 +2013,16 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
 // ─── W2C memory accounting ───────────────────────────────────────────────────
 namespace {
 int64_t HostBytes(const DeepseekV4HostWeights& hw) {
-  auto vf = [](const std::vector<float>& v) {
-    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(float));
+  // W1d (#2186): `vf` reads its ELEMENT size rather than assuming `float`, because
+  // the carried tower is no longer one dtype -- the FP8-sourced half is `HostBf16`
+  // at two bytes and the rest stays f32 at four. This lambda IS the residency
+  // number the load refusal prices the artifact with, so an element size hardcoded
+  // here would report the pre-W1d total and refuse a tower that now fits.
+  auto vf = [](const auto& v) {
+    using E = typename std::decay_t<decltype(v)>::value_type;
+    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(E));
   };
-  auto vi = [](const std::vector<int32_t>& v) {
-    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(int32_t));
-  };
+  auto vi = vf;
   int64_t b = vf(hw.embed) + vf(hw.lm_head) + vf(hw.final_norm_weight) +
               vf(hw.hc_head_fn) + vf(hw.hc_head_base) + static_cast<int64_t>(sizeof(float));
   for (const DeepseekV4LayerHostWeights& hl : hw.layers) {

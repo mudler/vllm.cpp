@@ -359,6 +359,11 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
   p.ple.ngram_size = OptInt(text, "ngram_size", 3);
   p.ple.heads_per_ngram = OptInt(text, "heads_per_ngram", 8);
   p.ple.ngram_vocab_size_base = OptInt(text, "ngram_vocab_size_base", 20000000);
+  // RECORDED, not inferred from the value. 20,000,000 is both upstream's
+  // default and the released checkpoint's own base, so the value cannot say
+  // which of the two it is, and the whole point of the flag is that a GGUF
+  // never states it. W5g (#2031).
+  p.ple.ngram_vocab_size_base_stated = HasKey(text, "ngram_vocab_size_base");
   p.ple.make_ngram_vocab_size_divisible_by =
       OptInt(text, "make_ngram_vocab_size_divisible_by", 128);
   p.ple.split_ngram_parts = OptInt(text, "split_ngram_parts", 512);
@@ -368,6 +373,10 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
   // that happens to carry them is not treated differently from one that does
   // not. W5 (#2031).
   p.ple.head_vocab_sizes = OptIntArray(text, "ple_head_vocab_sizes");
+  // Read for the same reason and on the same terms. `Qwen4ExpHfConfigFromGguf`
+  // has written this key since W6a and nothing consumed it, so the container's
+  // own offsets were dead data. W5g (#2031).
+  p.ple.head_offsets = OptIntArray(text, "ple_head_offsets");
 
   const std::vector<int64_t> raw_ple = OptIntArray(text, "ple_layer_ids");
   const std::set<int64_t> sorted_unique(raw_ple.begin(), raw_ple.end());
@@ -428,6 +437,40 @@ Qwen4ExpParams ParseQwen4ExpParams(const HfConfig& config) {
       if (p.ple.make_ngram_vocab_size_divisible_by <= 0) {
         Refuse("`make_ngram_vocab_size_divisible_by` must be > 0, got " +
                std::to_string(p.ple.make_ngram_vocab_size_divisible_by) + ".");
+      }
+    }
+    // A STATED offset list is checked against the STATED sizes, which is the
+    // one cross-check a `qwen4exp` GGUF can actually support: the converter
+    // writes the two arrays from separate reads of the checkpoint, so a
+    // disagreement is a real defect in the file and not a rounding artefact.
+    // The consequence of letting one through is silent: `head_offsets` selects
+    // which rows of a table BOTH arrays agree the size of, so a wrong offset
+    // gathers another head's vectors and nothing downstream has a shape to
+    // refuse. W5g (#2031).
+    if (!p.ple.head_offsets.empty()) {
+      if (p.ple.head_vocab_sizes.empty()) {
+        Refuse("`ple_head_offsets` is stated without `ple_head_vocab_sizes`; "
+               "the offsets are an exclusive prefix sum over the sizes and "
+               "cannot be checked, or used, without them.");
+      }
+      if (static_cast<int64_t>(p.ple.head_offsets.size()) != heads) {
+        Refuse("`ple_head_offsets` has " +
+               std::to_string(p.ple.head_offsets.size()) +
+               " entries but the n-gram head count is " +
+               std::to_string(heads) + ".");
+      }
+      int64_t running = 0;
+      for (size_t h = 0; h < p.ple.head_offsets.size(); ++h) {
+        if (p.ple.head_offsets[h] != running) {
+          Refuse("`ple_head_offsets`[" + std::to_string(h) + "] is " +
+                 std::to_string(p.ple.head_offsets[h]) +
+                 " but the exclusive prefix sum over `ple_head_vocab_sizes` "
+                 "puts head " + std::to_string(h) + " at " +
+                 std::to_string(running) +
+                 ". The two arrays are written from separate reads of the "
+                 "checkpoint and they disagree.");
+        }
+        running += p.ple.head_vocab_sizes[h];
       }
     }
     for (int64_t one_based : sorted_unique) {

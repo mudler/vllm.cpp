@@ -86,6 +86,54 @@ class PathClassification(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), "evidence")
 
+    def test_both_sides_of_the_issue_index_retirement_classify(self) -> None:
+        """#2290 moved the index to `.agents/completed/`, and a diff that spans
+        the move names BOTH paths -- the archive as the destination, the old path
+        as the rename source.
+
+        Classification is a HARD ERROR, not a skip, so an unclassified side
+        aborts pr-size entirely: on the retirement change itself, and on every
+        in-flight branch whose range still straddles it.
+
+        A REGRESSION GUARD, not mutation evidence -- it passes at base and at
+        head. It is here because the retirement change first "tidied" the old
+        path out of the classification set, having assumed the archive needed
+        adding; in fact `.agents/completed/` already classifies by prefix, and
+        the entry that had to stay was the one removed. pr-size then aborted on
+        its own change, and only did so visibly because W8 had just put it in
+        preflight. Both sides are pinned so the next reader does not repeat it.
+        """
+        for path in (
+            ".agents/completed/issue-index.md",
+            ".agents/issue-index.md",
+        ):
+            with self.subTest(path=path):
+                # classify_path raising ValueError is the failure being pinned.
+                self.assertIsInstance(checker.classify_path(path), str)
+
+    def test_a_profiler_csv_under_bench_evidence_is_evidence(self) -> None:
+        """#2316: `ncu --csv` writes one, and #2289 landed
+        `docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv` with no class.
+
+        `classify_path` fails closed, so the whole-tree sweep in this suite went
+        RED on `origin/main` itself. It also blocked #2290: that change edits
+        this checker, which makes THIS suite its mutation evidence, and the
+        evidence contract runs the whole module -- so one unrelated red in it
+        fails the pair. RED at base.
+        """
+        self.assertEqual(
+            checker.classify_path(
+                "docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv"
+            ),
+            "evidence",
+        )
+
+    def test_a_csv_outside_bench_evidence_still_fails_closed(self) -> None:
+        """The extension is not a licence. Widening by suffix alone would let a
+        csv anywhere in docs/ take the evidence class without review."""
+        with self.assertRaises(ValueError):
+            checker.classify_path("docs/some-other-place/whatever.csv")
+
     def test_completed_csv_near_misses_fail_closed(self) -> None:
         for path in (
             ".agents/completed/unrelated.csv",
@@ -260,6 +308,53 @@ class PathClassification(unittest.TestCase):
             checker.recognized_evidence("scripts/check-agent-record.py"),
             "tests/scripts/test_agent_record.py",
         )
+
+
+class DeletedCheckers(unittest.TestCase):
+    """A checker that is GONE at head owes no mutation evidence.
+
+    The evidence contract asks a checker change to prove a guarantee moved: the
+    paired test must fail against the BASE checker and pass against the HEAD one.
+    A DELETION has no head checker to run and, when the suite is removed in the
+    same change, no test module to import either -- so the contract collapses
+    into `ModuleNotFoundError` reported as "HEAD checker/test pair failed",
+    which reads as a broken checker rather than an absent one.
+
+    Found by #2290, which deletes `check-issue-index-append-only.py` together
+    with its suite. `pr-size` is a REQUIRED check, so a change that retires a
+    checker could not land at all. You cannot mutate a guarantee that no longer
+    exists; the deletion IS the change, and the review of it is the evidence.
+    """
+
+    def test_a_deleted_checker_does_not_demand_evidence(self) -> None:
+        changes = [checker.ChangedPath("scripts/check-gone.py", 0, 120)]
+        errors = checker.change_errors(changes, deleted={"scripts/check-gone.py"})
+        self.assertEqual(errors, [], f"a deletion was asked to prove itself: {errors}")
+
+    def test_a_surviving_checker_still_demands_evidence(self) -> None:
+        """The half that must NOT move. Without this the fix above is a mute
+        switch: marking every checker change 'deleted' would silence the whole
+        contract."""
+        changes = [checker.ChangedPath("scripts/check-gone.py", 4, 4)]
+        errors = checker.change_errors(changes, deleted=set())
+        self.assertTrue(
+            any("requires semantic mutation evidence" in e for e in errors),
+            f"a live checker change escaped the evidence contract: {errors}",
+        )
+
+    def test_a_deleted_checker_whose_suite_survives_still_demands_nothing(self) -> None:
+        """Deletion is decided by the CHECKER's absence, not the suite's.
+
+        A change may retire a checker and keep its suite for a while. The
+        evidence contract is about the checker, so the checker's absence settles
+        it either way.
+        """
+        changes = [
+            checker.ChangedPath("scripts/check-gone.py", 0, 120),
+            checker.ChangedPath("tests/scripts/test_check_gone.py", 3, 0),
+        ]
+        errors = checker.change_errors(changes, deleted={"scripts/check-gone.py"})
+        self.assertEqual(errors, [], f"{errors}")
 
 
 class RetiredSurfaces(unittest.TestCase):

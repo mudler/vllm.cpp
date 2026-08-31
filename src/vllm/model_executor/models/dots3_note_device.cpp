@@ -333,18 +333,13 @@ Tensor UploadInto(Dev d, std::vector<DBuf>& owned, DType dt,
 // mapping already depend on, so it cannot be absent while the step is
 // well-formed. The recorded value is preferred when it is present, because a
 // caller that sets it is the authority on its own batch.
-int64_t Dots3NoteComputedTokens(const v1::CommonAttentionMetadata& am, int r) {
-  if (r < static_cast<int>(am.num_computed_tokens_cpu.size())) {
-    return am.num_computed_tokens_cpu[static_cast<size_t>(r)];
-  }
-  if (r + 1 < static_cast<int>(am.query_start_loc.size()) &&
-      r < static_cast<int>(am.seq_lens.size())) {
-    const int64_t query_len = am.query_start_loc[static_cast<size_t>(r + 1)] -
-                              am.query_start_loc[static_cast<size_t>(r)];
-    return static_cast<int64_t>(am.seq_lens[static_cast<size_t>(r)]) - query_len;
-  }
-  return 0;
-}
+// MODEL-TEXT-GLM-MOE-DSA W9 (#2214) LIFTED this into the MLA seam as
+// `mla::StepComputedTokens`, so a second sparse architecture could reach it, and
+// the local wrapper is GONE rather than kept: it had exactly one caller, the
+// eligibility function below, which now calls the lifted one directly. Keeping a
+// one-line forwarder here would leave two names for one rule and invite the next
+// reader to edit whichever one they found. The reasoning above is why the
+// FALLBACK exists at all and stays with the code, in `mla_attention.cpp`.
 
 // ─── the SPARSE per-token MQA step (W4b-3c, #699) ───────────────────────────
 // Upstream promotes a whole step to per-token MQA when the selection actually
@@ -396,60 +391,20 @@ struct Dots3NoteSparseStep {
 // One function now answers both questions, so the two cannot drift again: the
 // invariant is that a step which `prunes` either takes the sparse route or is
 // REFUSED BY NAME, and there is no third outcome.
-struct Dots3NoteSparseEligibility {
-  // Some request's context exceeds `index_topk`, so the selection really
-  // prunes and dense attention is NOT upstream's answer for this step.
-  bool prunes = false;
-  // Some request resumes from tokens computed on an earlier step, so its index
-  // keys are not in hand. `wk_weights_proj` builds a token's index key from
-  // that token's hidden state (deepseek_v2.py:808-810), and the indexer's own
-  // 128-wide cache is a SECOND attention group — KV-DSV4-MULTICACHE (#1925).
-  bool resumes = false;
-  // The metadata is shaped the way the builder needs to read it.
-  bool well_formed = false;
-  int prunes_req = -1;
-  int resumes_req = -1;
-  int64_t prunes_len = 0;
-  int64_t resumes_from = 0;
-  // `use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
-  // (sparse_mla_attention.py:296-299 @ `bc2d63e650`), and `mla_attention.py`
-  // `:829-851` promotes the WHOLE step when that is false. Upstream can promote
-  // a resumed request too, because it caches its index keys; we cannot, which
-  // is the one place this mirror is narrower than upstream and the reason
-  // `resumes` appears here at all.
-  bool Active() const { return well_formed && prunes && !resumes; }
-};
+// MODEL-TEXT-GLM-MOE-DSA W9 (#2214): this struct and the function below were
+// written here for #699 W4b-3c and have been LIFTED into the MLA seam as
+// `mla::SparseStepEligibility` / `mla::SparseStepEligibilityOf`, because GLM-5.3
+// asks the identical question of the identical metadata and a second copy of it
+// is the parallel path AGENTS.md forbids. Nothing about WHICH steps route
+// sparsely moved: the lifted body is this one, verbatim, with `p.index_topk`
+// become an argument. The header carries the whole argument, including the
+// batch shape whose silent dense service the one-function form exists to
+// prevent.
+using Dots3NoteSparseEligibility = mla::SparseStepEligibility;
 
 Dots3NoteSparseEligibility Dots3NoteSparseEligibilityOf(
     const Dots3NoteParams& p, const v1::CommonAttentionMetadata& am) {
-  Dots3NoteSparseEligibility e;
-  const int64_t topk = p.index_topk;
-  const int num_reqs = am.num_reqs;
-  e.well_formed = topk > 0 && num_reqs > 0 &&
-                  static_cast<int>(am.query_start_loc.size()) == num_reqs + 1 &&
-                  static_cast<int>(am.seq_lens.size()) >= num_reqs;
-  // `num_reqs` is authoritative for a WELL-FORMED step, which is the same span
-  // the builder walked before this repair, so nothing about which steps route
-  // sparsely moves. When the metadata is NOT well formed there is no
-  // authoritative count, so every published `seq_lens` entry is scanned — the
-  // safe direction, because a step that prunes and is not eligible is refused.
-  const size_t scan =
-      e.well_formed ? static_cast<size_t>(num_reqs) : am.seq_lens.size();
-  for (size_t r = 0; r < scan; ++r) {
-    const int64_t sl = am.seq_lens[r];
-    const int64_t computed = Dots3NoteComputedTokens(am, static_cast<int>(r));
-    if (sl > topk && !e.prunes) {
-      e.prunes = true;
-      e.prunes_req = static_cast<int>(r);
-      e.prunes_len = sl;
-    }
-    if (computed > 0 && !e.resumes) {
-      e.resumes = true;
-      e.resumes_req = static_cast<int>(r);
-      e.resumes_from = computed;
-    }
-  }
-  return e;
+  return mla::SparseStepEligibilityOf(p.index_topk, am);
 }
 
 Dots3NoteSparseStep BuildDots3NoteSparseStep(Dev d, const Dots3NoteParams& p,
@@ -601,7 +556,7 @@ DBuf Dots3NoteMoeBlock(Dev d, const Dots3NoteMoeWeights& w,
 
   // --- router -------------------------------------------------------------
   // BF16, and that is upstream's dtype rather than ours:
-  // `_get_moe_router_dtype` (deepseek_v2.py:131-141) returns fp32 only for
+  // `_get_moe_router_dtype` (deepseek_v2.py:123-133) returns fp32 only for
   // `model_type == "glm_moe_dsa"` or an explicit `moe_router_dtype:
   // "float32"`, so `GateLinear.out_dtype` is None here and the GEMM runs at the
   // model dtype. Widening it would be silent to every gate this row can build.
@@ -789,7 +744,7 @@ mla::MlaBlockDims Dots3NoteFullAttnMlaDims(const Dots3NoteParams& p) {
   d.index_n_heads = p.index_n_heads;
   d.index_head_dim = p.index_head_dim;
   d.index_topk = p.index_topk;
-  // `is_neox_style = not indexer_rope_interleave` (deepseek_v2.py:1159), which
+  // `is_neox_style = not indexer_rope_interleave` (deepseek_v2.py:1120), which
   // is INDEPENDENT of `is_neox_style` above — dots3-note's main MLA rope is
   // GPT-J on both geometries while the indexer follows the config flag.
   d.indexer_rope_is_neox_style = p.indexer_rope_is_neox_style();
@@ -1063,7 +1018,7 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
     const int64_t E = p.n_routed_experts;
     const int64_t MI = p.moe_intermediate_size;
     // `router_logits, _ = self.gate(hidden_states)` — a plain `GateLinear`
-    // at the MODEL dtype, because `_get_moe_router_dtype` (deepseek_v2.py:131)
+    // at the MODEL dtype, because `_get_moe_router_dtype` (deepseek_v2.py:127-131)
     // returns fp32 only for `glm_moe_dsa` or an explicit
     // `moe_router_dtype: "float32"`, and dots3-note is neither. So the router
     // GEMM is BF16 here exactly as it is upstream; an f32 router would be the

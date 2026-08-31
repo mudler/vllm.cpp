@@ -58,12 +58,20 @@
 // in and a wider accumulator there would make the two arms disagree for a reason
 // no oracle authorises.
 //
-// A CUDA ARM INHERITS A DECISION FROM THIS, and does not yet exist: a straight
-// f32-accumulate block reduction will not meet the same bound on the norm, so
-// that kernel must either accumulate wider than f32 or be gated against the
-// oracle directly. Deciding which belongs to the wave that writes it. Nothing
-// here is registered for any device but kCPU, so the dispatcher refuses by name
-// on every other one rather than silently falling back.
+// A CUDA ARM OF `vt::Qwen4ExpGatedResidual` INHERITS A DECISION FROM THIS, and
+// still does not exist: a straight f32-accumulate block reduction will not meet
+// the same bound on the norm, so that kernel must either accumulate wider than
+// f32 or be gated against the oracle directly. Deciding which belongs to the
+// wave that writes it, and the spec's `## Owed` carries it.
+//
+// `vt::Qwen4ExpGatedResidualWriteBack` IS DIFFERENT AND W6-CUDA GAVE IT A
+// DEVICE ARM (`src/vt/cuda/cuda_qwen4_exp.cu`). It has no reduction — every
+// output element is one multiply and one add — so there is no width to choose,
+// and the device kernel spells the host's two roundings with
+// `__fmul_rn`/`__fadd_rn` against this build's `-ffp-contract=off`, making it
+// BYTE-IDENTICAL rather than merely close. Nothing else here is registered for
+// any device but kCPU, so the dispatcher refuses those by name on every other
+// one rather than silently falling back.
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -112,7 +120,59 @@ void LinearNoBias(const Tensor& w, const float* x, int64_t out_dim, int64_t in_d
   }
 }
 
-void Qwen4ExpGatedResidualKernel(Queue&, Tensor& mixed, Tensor* injection,
+// ONE PROJECTION OF ONE TOKEN, and the operand's dtype picks the route (W5p,
+// #2031).
+//
+// THE FUSION IS WHAT FORCED FLOAT, and this is the repair. `LoadF32At` above is
+// a SCALAR ELEMENT walk: it can read f32, f16 and bf16 and nothing else, so
+// fusing the whole mixer — grouped norm, down, SiLU, up, sigmoid, stream mean,
+// inject — into one kernel made every weight in it an elementwise tensor by
+// construction. llama.cpp keeps the three projections as separate graph nodes
+// (`src/models/qwen4exp.cpp:237-241`), which is why a block-typed weight falls
+// through its generic quant-aware `mul_mat` there and died here.
+//
+// SO THE PROJECTIONS ROUTE THROUGH THE SHARED SEAM INSTEAD OF A NEW ONE.
+// `vt::MatmulBT` is `out[M,N] = a[M,K] @ b^T` with `b` in `[N,K]` row-major —
+// the SAME orientation `LinearNoBias` walks, which is also ggml's src0 layout
+// and GGUF's disk order, so keeping the blocks needs no transpose (a block row
+// cannot be transposed without requantizing). It auto-dispatches a block dtype
+// to `kMatmulBTQuant`, whose CPU kernel is the 1:1 port of
+// `ggml_compute_forward_mul_mat`: quantize the activation once to the weight's
+// `vec_dot_type`, then one integer block-dot per output.
+//
+// WHY THAT SEAM AND NOT A NEW OpId — THE ARM COUNT DECIDED IT, and it is a
+// measurement rather than a taste. `vt::MatmulBT`/`vt::MatmulBTQuant` take
+// `(Queue&, Tensor& out, const Tensor& a, const Tensor& b)` and NO args struct:
+// ONE arm, whose behaviour is fully determined by the operands, so there is no
+// field a quantized route could silently ignore. Contrast the two decisions this
+// row already made on the same test: `kRmsNorm` has SIX arms, so a grouped norm
+// riding on it would have had a silently-ignored field returning a wrong answer
+// with no crash, and `vt::RmsNormGroup` took its own OpId; the paged QSA read's
+// op has one arm, so it took an address mode instead. This is the one-arm case.
+//
+// THE FLOAT PATH IS UNTOUCHED, and deliberately so: it stays `LinearNoBias`,
+// term for term in index order, so every golden case above is bit-identical by
+// construction rather than by re-measurement.
+//
+// COST, STATED RATHER THAN LEFT TO BE FOUND. This is a per-TOKEN matvec (M = 1),
+// so a prefill of T tokens makes T `kMatmulBTQuant` calls per projection where
+// llama.cpp makes one GEMM over the whole batch. Correct, and the arm the
+// released file needs to run at all; batching the projections over a token tile
+// is recorded under the spec's `## Owed` rather than done here, because it moves
+// the fused kernel's loop structure and owes its own red-first measurement.
+void ProjectRow(Queue& q, const Tensor& w, const float* x, int64_t out_dim,
+                int64_t in_dim, float* y) {
+  if (IsBlockQuant(w.dtype)) {
+    Tensor a = Tensor::Contiguous(const_cast<float*>(x), DType::kF32, w.device,
+                                  {1, in_dim});
+    Tensor o = Tensor::Contiguous(y, DType::kF32, w.device, {1, out_dim});
+    MatmulBTQuant(q, o, a, w);
+    return;
+  }
+  LinearNoBias(w, x, out_dim, in_dim, y);
+}
+
+void Qwen4ExpGatedResidualKernel(Queue& q, Tensor& mixed, Tensor* injection,
                                  const Tensor& hyper, const Tensor& hc_norm_w,
                                  const Tensor& mix_down, const Tensor& mix_up,
                                  const Tensor* block_inject,
@@ -132,6 +192,9 @@ void Qwen4ExpGatedResidualKernel(Queue&, Tensor& mixed, Tensor* injection,
   std::vector<float> normed(static_cast<size_t>(flat));
   std::vector<float> low(static_cast<size_t>(R));
   std::vector<float> gate(static_cast<size_t>(flat));
+  // Only allocated when the injection arm is live (`use_combine=True`).
+  std::vector<float> inject_pre(
+      block_inject != nullptr ? static_cast<size_t>(hc) : 0);
 
   for (int64_t t = 0; t < T; ++t) {
     const int64_t base = t * flat;
@@ -151,23 +214,44 @@ void Qwen4ExpGatedResidualKernel(Queue&, Tensor& mixed, Tensor* injection,
       // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm.
       const float r =
           1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(H)) + eps);
+      // THE `1 +` IS THE OP'S, AND IT IS NOT AN ALTERNATIVE PARAMETERIZATION.
+      // `Qwen4ExpTextRMSNorm.forward` is `output * (1.0 + self.weight.float())`
+      // over a ZERO-initialised gamma (modeling_qwen4_exp.py:173-178), and
+      // `hc_norm_w` is that gamma — the raw HuggingFace parameter, exactly as
+      // `Qwen4ExpGdnWeights`/`Qwen4ExpQsaWeights`/`Qwen4ExpPleWeights` carry
+      // every other gamma of this architecture and exactly as
+      // `vt::RmsNorm(gemma=true)` and `vt::Qwen4ExpQsaCompress` already read
+      // them. This op used to demand the FOLDED form instead, which made it the
+      // one consumer in the model disagreeing with the loader, and handing it
+      // the loaded weight scaled every hyper-connection norm by a gamma centred
+      // on zero. See #2218 and the composition case in
+      // tests/vllm/models/test_qwen4_exp_forward.cpp, which is the only gate
+      // that can see the disagreement: both halves are individually correct.
+      //
+      // THE FOLD IS f32, and that is upstream's width and not a convenience:
+      // `output * (1.0 + self.weight.float())` (:177) folds a Python weak `1.0`
+      // into an fp32 tensor, so the promotion stays fp32. Every host reference
+      // that widens its reduction to double folds in `float` first for the same
+      // reason (`test_qwen4_exp_hc_device.cpp`'s wide-accumulator case), so the
+      // widening isolates the reduction rather than also moving the multiplier.
       for (int64_t h = 0; h < H; ++h) {
         normed[static_cast<size_t>(g0 + h)] =
-            LoadF32At(hyper, base + g0 + h) * r * LoadF32At(hc_norm_w, g0 + h);
+            LoadF32At(hyper, base + g0 + h) * r *
+            (1.0f + LoadF32At(hc_norm_w, g0 + h));
       }
     }
 
     // ── DIVISION 1: inside the SiLU, on the [R] low-rank intermediate, BEFORE
     // the activation. `F.silu(down(x) / hc_count)`. SiLU is not homogeneous, so
     // `silu(a)/hc` is a different function and the placement is load-bearing.
-    LinearNoBias(mix_down, normed.data(), R, flat, low.data());
+    ProjectRow(q, mix_down, normed.data(), R, flat, low.data());
     for (int64_t r = 0; r < R; ++r) {
       const float a = low[static_cast<size_t>(r)] / hc_f;
       low[static_cast<size_t>(r)] = a * Sigmoid(a);
     }
 
     // ── NO division on the up projection: `torch.sigmoid(up(...))`, full stop.
-    LinearNoBias(mix_up, low.data(), flat, R, gate.data());
+    ProjectRow(q, mix_up, low.data(), flat, R, gate.data());
     for (int64_t p = 0; p < flat; ++p) {
       gate[static_cast<size_t>(p)] = Sigmoid(gate[static_cast<size_t>(p)]);
     }
@@ -191,13 +275,14 @@ void Qwen4ExpGatedResidualKernel(Queue&, Tensor& mixed, Tensor* injection,
     // ── DIVISION 2: inside the injection sigmoid, whole sigmoid scaled by 2.
     // `2 * sigmoid(inject(x) / hc_count)`. Range (0, 2), exactly 1.0 at a zero
     // logit, so an untrained branch is the identity rather than a half-scale.
+    // The projection and its activation are SPLIT so the projection can take the
+    // quantized route. `ProjectRow` on a float weight is `LinearNoBias`, which
+    // accumulates `sum_i w[j*flat + i] * normed[i]` in the same index order the
+    // loop that used to be here did — so the float arm is bit-identical.
+    ProjectRow(q, *block_inject, normed.data(), hc, flat, inject_pre.data());
     for (int64_t j = 0; j < hc; ++j) {
-      const int64_t row = j * flat;
-      float acc = 0.0f;
-      for (int64_t i = 0; i < flat; ++i) {
-        acc += LoadF32At(*block_inject, row + i) * normed[static_cast<size_t>(i)];
-      }
-      StoreF32At(*injection, t * hc + j, 2.0f * Sigmoid(acc / hc_f));
+      StoreF32At(*injection, t * hc + j,
+                 2.0f * Sigmoid(inject_pre[static_cast<size_t>(j)] / hc_f));
     }
   }
 }

@@ -21,7 +21,7 @@ In scope:
   did not have.
 - The measurement itself, its recipe, and its evidence, recorded in
   [`benchmark-record.md`](../benchmark-record.md) and `docs/BENCHMARKS.md`.
-- One appended row in [`issue-index.md`](../issue-index.md) for #1250.
+- One appended row in [`issue-index.md`](../completed/issue-index.md) for #1250.
 
 Out of scope:
 

@@ -46,6 +46,37 @@ def require(errors: list[str], pattern: str) -> None:
         raise AssertionError(f"missing expected error {pattern!r}:\n" + "\n".join(errors))
 
 
+
+def tracked_issues(test: unittest.TestCase) -> str:
+    """The derived issue snapshot, or a SKIP naming why it is not here.
+
+    These assertions used to read `.agents/issue-index.md`, a tracked file every
+    pull request wrote. It is derived now (#2290), and the snapshot is untracked,
+    so a fresh checkout legitimately has none. The guarantee is KEPT where it can
+    be checked and SKIPPED with its reason where it cannot -- never quietly
+    dropped, and never a hard failure on a clean clone.
+    """
+
+    # TWO sources, because the question has two halves. The snapshot is
+    # OPEN-ONLY by design, so it cannot answer for an issue that has since been
+    # closed -- #670 is one, and its only home was the retired index. That index
+    # is now the frozen archive: committed, offline, and never appended to, which
+    # is precisely what AGENTS.md keeps `.agents/completed/` for. History comes
+    # from the archive and live state from the snapshot, so no assertion is lost
+    # to the derivation.
+    archive = ROOT / ".agents/completed/issue-index.md"
+    text = archive.read_text(encoding="utf-8") if archive.is_file() else ""
+    snapshot = ROOT / ".agents/issue-index.generated.md"
+    if not snapshot.is_file():
+        if not text:
+            test.skipTest(
+                "neither the frozen archive nor a snapshot is present; run "
+                "`python3 scripts/agent-issue-index.py --refresh`"
+            )
+        return text
+    return text + snapshot.read_text(encoding="utf-8")
+
+
 class AgentRecordMutationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1080,79 +1111,6 @@ class LinkExtraction(unittest.TestCase):
 
 
 
-class IssueIntakeTable(unittest.TestCase):
-    """The issue index is the intake surface: no work without an issue.
-
-    The validator is deliberately NETWORK-FREE, so these mutations are all about
-    FORM and internal consistency. Whether an issue is still open is the agent's
-    job at intake; making CI ask GitHub would reintroduce exactly the kind of
-    connectivity flake this protocol was slimmed down to remove.
-    """
-
-    GOOD = (
-        agent_record.INDEX_PREAMBLE
-        + "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | x | bug |\n"
-        + "| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | y | bug |\n"
-    )
-
-    # The fixture has ONE unowned row. Passing that as the mark keeps every
-    # case below about the thing it names, rather than about the ratchet.
-    MARK = 1
-
-    def run_check(self, text, owed=None, mark=None):
-        errors = []
-        agent_record.check_issue_index(
-            errors,
-            text=text,
-            owed=owed or set(),
-            high_water=self.MARK if mark is None else mark,
-        )
-        return errors
-
-    def test_a_well_formed_table_passes(self):
-        self.assertEqual(self.run_check(self.GOOD), [])
-
-    def test_a_missing_preamble_is_rejected(self):
-        errors = self.run_check("# Roadmap\n\n## Top-level portfolio\n")
-        self.assertTrue(any("preamble" in e for e in errors), errors)
-
-    def test_an_empty_table_is_rejected(self):
-        errors = self.run_check(agent_record.INDEX_PREAMBLE)
-        self.assertTrue(any("no rows" in e for e in errors), errors)
-
-    def test_a_bare_issue_number_without_a_link_is_rejected(self):
-        section = self.GOOD.replace(
-            "| [#85](https://github.com/mudler/vllm.cpp/issues/85) |", "| #85 |"
-        )
-        errors = self.run_check(section, mark=0)
-        self.assertTrue(any("malformed issue row" in e for e in errors), errors)
-
-    def test_a_link_pointing_at_a_different_issue_is_rejected(self):
-        """The number and its URL must agree, or the index lies."""
-        section = self.GOOD.replace(
-            "[#201](https://github.com/mudler/vllm.cpp/issues/201)",
-            "[#201](https://github.com/mudler/vllm.cpp/issues/999)",
-        )
-        errors = self.run_check(section)
-        self.assertTrue(any("a different issue" in e for e in errors), errors)
-
-    def test_a_duplicated_issue_is_rejected(self):
-        """Under `merge=union` this is what two branches appending one issue
-        produce. The driver combines silently, so this check is the only thing
-        that reports it."""
-        section = self.GOOD + (
-            "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | — | dup | bug |\n"
-        )
-        errors = self.run_check(section, mark=2)
-        self.assertTrue(any("listed twice" in e for e in errors), errors)
-
-    def test_the_tracked_index_is_valid(self):
-        errors = []
-        agent_record.check_issue_index(errors)
-        self.assertEqual(errors, [])
-
-
-
 class PerClaimFileSource(unittest.TestCase):
     """A claim may live in its own file under .agents/claims/ (#364).
 
@@ -1355,7 +1313,7 @@ class TenstorrentMistralRowIsCounted(unittest.TestCase):
         # The intake surface moved out of roadmap_v1.md and into the
         # append-only issue index (POLICY-ISSUE-INTAKE, #840). The pin is the
         # same pin: this row's issue link must still exist somewhere trackable.
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/670", index)
 
     def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
@@ -1408,7 +1366,7 @@ class TenstorrentTraceRunnerRowIsCounted(TenstorrentMistralRowIsCounted):
         text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("tenstorrent-trace-runner.md", row)
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/1105", index)
 
 
@@ -1421,7 +1379,7 @@ class TenstorrentHostFreeForwardRowIsCounted(TenstorrentMistralRowIsCounted):
         text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("tenstorrent-host-free-forward.md", row)
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/1105", index)
 
 
@@ -1447,7 +1405,7 @@ class CudaLlamacppRowIsCounted(TenstorrentMistralRowIsCounted):
         text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("bench-qwen38-27b-four-way.md", row)
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/979", index)
 
     def test_the_row_is_not_confused_with_the_legacy_one(self) -> None:
@@ -1508,7 +1466,7 @@ class MtpDepthRowIsCounted(unittest.TestCase):
         text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("mtp-k-gt-1.md", row)
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/81)", index)
 
     def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
@@ -1547,12 +1505,22 @@ class MtpDepthRowIsCounted(unittest.TestCase):
 
 
 class IssueIndexTests(unittest.TestCase):
-    """Every guarantee of the issue index, mutated rather than read.
+    """Every guarantee of the DERIVED issue index, mutated rather than read.
 
-    The index carries `merge=union`. That driver is silent: it combines two
-    sides and never reports it. These checks are the only thing standing
-    between a silent combination and a wrong record, so a mute one is worse
-    than none.
+    The index is no longer a tracked file. `scripts/agent-issue-index.py`
+    renders `gh issue list` into an untracked snapshot, so the failure modes
+    that dominated the old tests -- a drifted preamble, a duplicated row, an
+    interleaved union merge -- cannot occur: nothing appends to a generated
+    file. What replaces them is the pair this row had to get right instead.
+
+    ABSENCE MUST NOT READ AS SUCCESS. A missing snapshot is a SKIP carrying its
+    reason, never an empty error list, because a gate that passes when its input
+    is absent is the #467 failure in a new place.
+
+    OWNERSHIP IS DIFF-SCOPED. The retired `UNOWNED_HIGH_WATER` counted every row
+    in the tree. Against a remote surface that number moves when anyone files an
+    issue anywhere, so it could only ever red `main` for reasons no commit
+    caused. The obligation is now the issues a change REFERENCES.
     """
 
     OWNER = "`BACKEND-ROCM`"
@@ -1564,57 +1532,103 @@ class IssueIndexTests(unittest.TestCase):
             f" | {owner} | title | bug |"
         )
 
-    def index(self, owned: int = 3, unowned: int | None = None) -> str:
-        if unowned is None:
-            unowned = agent_record.UNOWNED_HIGH_WATER
+    def index(self, owned: int = 3, unowned: int = 40) -> str:
         rows = [self.row(1000 + i) for i in range(owned)]
-        rows += [self.row(2000 + i, "—") for i in range(unowned)]
-        return agent_record.INDEX_PREAMBLE + "\n".join(rows) + "\n"
+        rows += [self.row(2000 + i, "\u2014") for i in range(unowned)]
+        return agent_record.SNAPSHOT_PREAMBLE + "\n".join(rows) + "\n"
 
-    def errors_for(self, text: str, owed: set[str] | None = None) -> list[str]:
+    def errors_for(
+        self,
+        text: str | None,
+        owed: set[str] | None = None,
+        referenced: set[str] | None = None,
+    ) -> tuple[list[str], list[str]]:
         errors: list[str] = []
-        agent_record.check_issue_index(errors, text=text, owed=owed or set())
-        return errors
+        skips: list[str] = []
+        agent_record.check_issue_index(
+            errors, skips, text=text, owed=owed or set(),
+            referenced=referenced if referenced is not None else set(),
+        )
+        return errors, skips
 
     def test_unmutated_index_is_green(self) -> None:
         # Guards every case below: a baseline that is already red would make
         # each mutation pass for the wrong reason.
-        self.assertEqual(self.errors_for(self.index()), [])
+        errors, skips = self.errors_for(self.index())
+        self.assertEqual((errors, skips), ([], []))
 
-    def test_real_index_matches_the_checkers_preamble(self) -> None:
-        # The literal in the checker is the anti-drift device. If the shipped
-        # file and the literal disagree, every preamble case below is vacuous.
-        text = agent_record.ISSUE_INDEX.read_text(encoding="utf-8")
-        self.assertTrue(
-            text.startswith(agent_record.INDEX_PREAMBLE),
-            "the shipped index preamble drifted from INDEX_PREAMBLE",
-        )
+    def test_an_absent_snapshot_skips_with_a_reason_and_does_not_pass(self) -> None:
+        # THE case this rewrite exists for. Absence is neither success nor
+        # failure, and it must never render as an empty error list alone.
+        missing = agent_record.AGENTS / "issue-index.generated.absent.md"
+        self.assertFalse(missing.exists(), "fixture path must not exist")
+        errors: list[str] = []
+        skips: list[str] = []
+        with mock.patch.object(agent_record, "SNAPSHOT", missing):
+            agent_record.check_issue_index(
+                errors, skips, owed=set(), referenced={"2000"}
+            )
+        # Referencing #2000 with no snapshot must not pass: the citation went
+        # unchecked, and that is exactly what a silent green would hide.
+        self.assertEqual(errors, [])
+        require(skips, r"agent-issue-index\.py --refresh")
+        require(skips, r"[Nn]ot a pass")
 
-    def test_edited_preamble_is_caught(self) -> None:
-        mutated = self.index().replace(
-            "This file is append-only.", "This file is editable.", 1
-        )
-        require(self.errors_for(mutated), r"preamble drifted")
+    def test_a_referenced_issue_naming_no_row_is_caught(self) -> None:
+        # Diff-scoped: #2000 is dashed in the snapshot and this change cites it.
+        errors, _ = self.errors_for(self.index(), referenced={"2000"})
+        require(errors, r"references #2000, which names no owning row")
 
-    def test_an_extra_unowned_row_is_caught(self) -> None:
-        mutated = self.index() + self.row(3000, "—") + "\n"
-        require(self.errors_for(mutated), r"rows name no owner, above the recorded")
+    def test_an_unreferenced_dashed_row_is_not_this_changes_problem(self) -> None:
+        # The counterpart, and the reason the ratchet died: 40 dashed rows the
+        # change never mentions cost it nothing.
+        errors, _ = self.errors_for(self.index(), referenced=set())
+        self.assertEqual(errors, [])
 
-    def test_a_spec_owed_section_owns_a_dashed_row(self) -> None:
+    def test_a_spec_owed_section_owns_a_referenced_dashed_row(self) -> None:
         # The escape hatch has to work, or the gate just forces a fake row ID.
-        mutated = self.index() + self.row(3000, "—") + "\n"
-        self.assertEqual(self.errors_for(mutated, owed={"3000"}), [])
+        errors, _ = self.errors_for(
+            self.index(), owed={"2000"}, referenced={"2000"}
+        )
+        self.assertEqual(errors, [])
 
-    def test_the_ratchet_refuses_to_slip_back(self) -> None:
-        # Owning one issue must LOWER the mark in the same change. Without this
-        # case the mark is a ceiling that never falls.
-        mutated = self.index(unowned=agent_record.UNOWNED_HIGH_WATER - 1)
-        require(self.errors_for(mutated), r"below the recorded")
+    def test_a_referenced_number_absent_from_the_snapshot_is_not_gated(self) -> None:
+        # Offline, a pull request number, a closed issue and a typo look
+        # identical. Gating this fired on four PR numbers cited as evidence in
+        # this rule's own change, so only OPEN issues carry the obligation.
+        errors, _ = self.errors_for(self.index(), referenced={"99999"})
+        self.assertEqual(errors, [])
+
+    def test_a_link_pointing_at_a_different_issue_is_caught(self) -> None:
+        # Survives from the retired IssueIntakeTable: the number and its URL
+        # must agree, or the index lies about which issue a row is.
+        mutated = self.index().replace("/issues/1000", "/issues/999", 1)
+        errors, _ = self.errors_for(mutated)
+        require(errors, r"a different issue")
+
+    def test_a_malformed_row_is_still_caught(self) -> None:
+        # The generator writes this file, so a malformed row means the GENERATOR
+        # broke. That is worth more noise, not less.
+        mutated = self.index() + "| [#3000](https://example.com/nope) | x |\n"
+        errors, _ = self.errors_for(mutated)
+        require(errors, r"malformed issue row")
+
+    def test_an_empty_snapshot_is_caught(self) -> None:
+        # A zero-row table is what a silently-truncated refresh looks like.
+        errors, _ = self.errors_for(agent_record.SNAPSHOT_PREAMBLE)
+        require(errors, r"has no rows")
 
     def test_owed_issues_reads_specs_with_a_glob(self) -> None:
         # A per-row surface by construction: one file per spec, so filing an
         # owed issue never makes two branches write the same line.
         self.assertIsInstance(agent_record.owed_issues(), set)
+
+    def test_the_retired_index_is_no_longer_a_tracked_writable_surface(self) -> None:
+        # The whole point of the row. If this file comes back, so does the lock.
+        self.assertFalse(
+            (agent_record.AGENTS / "issue-index.md").exists(),
+            "the tracked issue index is back; it is a surface every PR writes",
+        )
 
 
 class RecordAnchorRatchet(unittest.TestCase):
@@ -1788,96 +1802,6 @@ class RecordAnchorRatchet(unittest.TestCase):
         self.assertEqual(agent_record.RECORD_ANCHOR_BASELINE.read_bytes(), digest)
 
 
-class IssueIndexTableShape(unittest.TestCase):
-    """The index is a TABLE, and until #1033 nothing counted its cells.
-
-    `check_issue_index` reads the index by regex, row by row, and answers about
-    KEYS: is the number well-formed, does it link to itself, is it listed twice,
-    does it name an owner. None of that is the table's SHAPE. A row that lost
-    its trailing pipe still matches `ISSUE_ROW`, and a row carrying an unescaped
-    pipe inside a code span matches it too -- both mis-render on GitHub while
-    every gate in the tree stays green.
-
-    `check_table_shapes` is the function that measures shape, it already carried
-    the right regex, and its call site simply did not name this path.
-    """
-
-    def paths_main_hands_the_shape_gate(self) -> list:
-        """The paths the REAL call site passes, captured from the real call.
-
-        Read from the call rather than from the source text on purpose. A test
-        that greps `check-agent-record.py` for the string `issue-index` passes
-        on a line that is commented out, on a second call site that is never
-        reached, and on a constant that is defined and never used.
-        """
-
-        captured: list = []
-
-        def capture(paths, errors) -> None:
-            captured.extend(paths)
-
-        with mock.patch.object(agent_record, "check_table_shapes", capture):
-            with mock.patch.object(sys, "stdout", io.StringIO()):
-                with mock.patch.object(sys, "stderr", io.StringIO()):
-                    # `main([])` rather than `main()`: #632 gave the checker
-                    # an argparse front end, and `main(None)` therefore parses
-                    # `sys.argv`, which under a test runner holds the runner's
-                    # own arguments and exits 2. The real call site is unchanged.
-                    agent_record.main([])
-        return captured
-
-    def test_check_table_shapes_covers_the_issue_index(self) -> None:
-        paths = self.paths_main_hands_the_shape_gate()
-        # A run that handed the gate NOTHING would satisfy any assertNotIn and
-        # would satisfy an assertIn only by accident, so the count is asserted
-        # first. It is the same "how many things did you examine" question the
-        # index itself went two days without an answer to.
-        self.assertGreater(
-            len(paths), 1, "main() handed check_table_shapes no paths at all"
-        )
-        # assertTrue rather than assertIn: the path list runs to ~180 entries
-        # and assertIn prints all of them, which buries the sentence that says
-        # what is wrong under the evidence that it is.
-        self.assertTrue(
-            agent_record.ISSUE_INDEX in paths,
-            f"{agent_record.ISSUE_INDEX.name} is not among the {len(paths)} "
-            "paths main() hands check_table_shapes, so nothing counts the "
-            "cells of the one record surface every change must write (#1033)",
-        )
-
-    def test_the_shipped_issue_index_is_a_well_formed_table(self) -> None:
-        # The case that would have fired in the offending PR's own preflight.
-        errors: list[str] = []
-        agent_record.check_table_shapes([agent_record.ISSUE_INDEX], errors)
-        self.assertEqual(errors, [])
-
-    def test_a_malformed_index_row_is_caught(self) -> None:
-        """The mutation. Without it the two cases above prove only that a list
-        contains a path and that a file happens to be clean today.
-
-        The copy lives under ROOT because `check_table_shapes` reports through
-        `relative_to(ROOT)`; a path outside the tree would raise instead of
-        reporting, and an exception in the harness is not the gate firing.
-        """
-
-        text = agent_record.ISSUE_INDEX.read_text(encoding="utf-8")
-        rows = text.rstrip("\n").split("\n")
-        self.assertTrue(rows[-1].endswith("|"), "the last index row is not a row")
-        rows[-1] = rows[-1][:-1]
-
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-            mutated = Path(tmp) / "issue-index.md"
-            mutated.write_text("\n".join(rows) + "\n", encoding="utf-8")
-            # The mutation APPLIED: one byte shorter, one pipe fewer.
-            self.assertEqual(
-                len(mutated.read_text(encoding="utf-8")), len(text) - 1
-            )
-            errors: list[str] = []
-            agent_record.check_table_shapes([mutated], errors)
-
-        require(errors, rf"issue-index\.md:{len(rows)}: table has 4 pipes; expected 5")
-
-
 class HfModelDownloadRowIsCounted(unittest.TestCase):
     """The ENGINE ratchet bump 164 -> 165 is backed by a real row (#1280).
 
@@ -1903,7 +1827,7 @@ class HfModelDownloadRowIsCounted(unittest.TestCase):
         text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("hf-model-download.md", row)
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/1280)", index)
 
     def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
@@ -2164,7 +2088,7 @@ class DeepseekV4MultiCacheRowIsCounted(unittest.TestCase):
             (ROOT / ".agents/specs/kv-dsv4-multicache.md").is_file(),
             "the spec the row cites must exist",
         )
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/1925)", index)
 
     def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
@@ -2285,7 +2209,7 @@ class Ltx2VaeKernelRowIsCounted(unittest.TestCase):
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("ltx25-vae-device-residency.md", row)
         self.assertIn("CLAIM-LTX25-VAE-DEVICE-RESIDENCY", row)
-        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        index = tracked_issues(self)
         self.assertIn("issues/1451)", index)
 
     def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:

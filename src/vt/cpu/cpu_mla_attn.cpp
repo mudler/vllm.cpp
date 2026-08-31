@@ -131,8 +131,23 @@ void MlaDecodeAttentionKernel(Queue&, Tensor& out, Tensor* lse, const Tensor& qu
       for (int64_t d = 0; d < head_size; ++d) q_row[static_cast<size_t>(d)] = LoadF(query.data, query.dtype, q_off + d);
 
       // Running online softmax (mla_decode.cpp: `max_val` / `acc_lse` / `acc_out`).
-      float m = -std::numeric_limits<float>::infinity();
-      float l = 0.0f;
+      //
+      // SEEDED BY THE PER-HEAD ATTENTION SINK when one is present. A sink is one
+      // extra logit that joins the DENOMINATOR and contributes NO value, so it
+      // is expressed here by starting the running max at the sink and the
+      // running denominator at `exp(sink - sink) == 1`, with `acc` left at zero.
+      // Every later key then rescales against it through the ordinary online
+      // path, which is what makes this identical to the host two-pass reference
+      // `SoftmaxWithSink` (`deepseek_v4_dsa.cpp:121-139`) rather than merely
+      // close to it.
+      //
+      // ABSENT (`attn_sink == nullptr`, which is every caller before this) the
+      // seeds stay `-inf` and 0, so the loop, the reduction ORDER and the output
+      // are BIT-IDENTICAL to the pre-sink kernel.
+      const float* sink_p =
+          args.attn_sink != nullptr ? args.attn_sink->Ptr<float>() : nullptr;
+      float m = sink_p != nullptr ? sink_p[h] : -std::numeric_limits<float>::infinity();
+      float l = sink_p != nullptr ? 1.0f : 0.0f;
       std::fill(acc.begin(), acc.end(), 0.0f);
 
       // ONE loop, two bounds. `n_keys` is how many keys this row visits and the

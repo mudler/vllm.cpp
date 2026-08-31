@@ -491,7 +491,7 @@ rule before Edit 1 and reports `NEEDS_DECISION` rather than silently widening it
 
 The same audit found those four branches 440 commits behind `main` with no pull
 request and no committed spec on `main`, and found that issues #417 and #426 carry
-no row in [`.agents/issue-index.md`](../issue-index.md). Both are real record gaps
+no row in [`.agents/issue-index.md`](../completed/issue-index.md). Both are real record gaps
 and neither is this row's. This spec records them so a later reader does not
 mistake the silence for absence, and contradicts none of it.
 

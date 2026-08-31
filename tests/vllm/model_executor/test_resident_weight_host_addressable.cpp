@@ -665,3 +665,68 @@ TEST_CASE("an F32 UPCAST does not make an aliased weight's host mirror redundant
   CHECK(vllm::ReleaseResidentQwen3_5DenseHostWeights(staged_weights) == expect_freed);
   CHECK_FALSE(staged_layer.gdn.conv1d_weight.HasHostBytes());
 }
+
+// ---------------------------------------------------------------------------
+// PERF-QWEN35-STAGE-WEIGHTS — when may a dense weight be STAGED to the device
+// instead of retagged in place?
+//
+// THE MEASUREMENT THAT MOTIVATES IT. The retag this file exists to install is a
+// real decode tax on GB10. Interleaved A/B on `dgx:gpu0`, one boot, Qwen3.8-27B
+// bf16 + DFlash2 k=7 at concurrency 1, four warm repeats per leg:
+//
+//     alias ON   11.677, 11.693 tok/s   (arms agree to 0.14%)
+//     staged     14.288, 14.337 tok/s   (arms agree to 0.34%)   -> +22.5%
+//
+// That is the same mechanism `laguna.cpp:130-132` records and the same 20-30%
+// band that took Laguna and DeepSeek-V4 past their references.
+//
+// WHY IT IS A BUDGET QUESTION AND NOT A FLAG. This file's own subject — the
+// 2.4T checkpoint of #1299 — exhausts a 119.631 GiB box precisely BECAUSE the
+// CUDA arm paid for its weights twice. Staging is right for a model that fits
+// and fatal for one that does not, so the policy has to be asked of the BOX.
+// The arithmetic is extracted as a pure function so it can be gated here
+// without a device: a fake backend would need every pure virtual of
+// `vt::Backend` stubbed, and the boilerplate would gate less than this does.
+TEST_CASE("stage-vs-retag: a 50 GiB model on a 119 GiB box IS staged") {
+  const size_t box = 119ull << 30;
+  const size_t reserve = 12ull << 30;
+  // 2 x 50 + 12 = 112 <= 119. The measured case: this is Qwen3.8-27B bf16 on
+  // GB10, and staging it is +21.1% on the committed gate.
+  CHECK(vllm::StagingFitsModel(50ull << 30, box, reserve));
+}
+
+TEST_CASE("stage-vs-retag: #1299's shape is REFUSED, because the copy is ADDITIVE") {
+  const size_t box = 119ull << 30;
+  const size_t reserve = 12ull << 30;
+  // #1299 measured `Qwen3.8-2.4T-A95B UD-Q1_0` resident at 61.20 GiB and then
+  // exhausting this box. 2 x 61 + 12 = 134 > 119, so it must never stage.
+  CHECK_FALSE(vllm::StagingFitsModel(61ull << 30, box, reserve));
+  // And the boundary is the DOUBLING, not the model size: a model just over
+  // half the remaining budget is refused while one just under is admitted.
+  CHECK(vllm::StagingFitsModel(53ull << 30, box, reserve));
+  CHECK_FALSE(vllm::StagingFitsModel(54ull << 30, box, reserve));
+}
+
+TEST_CASE("stage-vs-retag: the reserve is load-bearing") {
+  const size_t box = 119ull << 30;
+  const size_t m = 53ull << 30;
+  CHECK(vllm::StagingFitsModel(m, box, 12ull << 30));
+  // Raise the reserve and the same model no longer fits.
+  CHECK_FALSE(vllm::StagingFitsModel(m, box, 20ull << 30));
+}
+
+TEST_CASE("stage-vs-retag: an unknown total or an unknown model REFUSES") {
+  // A platform that could not probe its memory reports 0, and a caller that
+  // never learned the model size passes 0. Neither is a licence to double a
+  // model's residency, so both answer NO rather than guessing.
+  CHECK_FALSE(vllm::StagingFitsModel(50ull << 30, 0, 12ull << 30));
+  CHECK_FALSE(vllm::StagingFitsModel(0, 119ull << 30, 12ull << 30));
+  CHECK_FALSE(vllm::StagingFitsModel(0, 0, 12ull << 30));
+}
+
+TEST_CASE("stage-vs-retag: a model larger than the whole box REFUSES without wrapping") {
+  // The arithmetic must not underflow when the reserve exceeds the box, nor
+  // wrap when 2*model overflows the comparison.
+  CHECK_FALSE(vllm::StagingFitsModel(200ull << 30, 119ull << 30, 12ull << 30));
+  CHECK_FALSE(vllm::StagingFitsModel(1ull << 30, 8ull << 30, 12ull << 30));
+}

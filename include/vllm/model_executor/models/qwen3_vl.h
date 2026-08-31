@@ -153,19 +153,20 @@ struct Qwen3VLCosSinCache {
 // VLGenerateCore and the registered Qwen3-VL LoadedModel (Prepare).
 Qwen3VLCosSinCache Qwen3VLMakeCosSinCache(vt::Queue& queue, const HfConfig& config);
 
-// One registered forward STEP: given the already-merged host bf16 embeddings
-// [num_tokens*hidden], the 3-D MRoPE positions [3*num_tokens], the (possibly empty)
-// DeepStack [levels*num_tokens*hidden], the persistent cos|sin cache, the step
-// attention metadata, and the persistent paged KV, run one forked VL forward and
-// return the LAST row's logits [vocab] (host f32). This is the EXACT step the M2c
-// Qwen3VLGenerateGreedy driver runs (VLForwardLastLogits), exposed so the ENGINE
-// registered forward (ForwardQwen3VL) and the standalone driver are numerically
-// identical by construction.
+// One registered forward STEP: given the already-merged bf16 DEVICE embeddings
+// [num_tokens, hidden], the 3-D MRoPE positions [3, num_tokens] (device int32), the
+// (possibly absent) DeepStack [levels, num_tokens, hidden] (device bf16), the
+// persistent cos|sin cache, the step attention metadata, and the persistent paged
+// KV, run one forked VL forward and return the LAST row's logits [vocab] (host
+// f32). ENG-MM-INPUT-PIPELINE P1 (#1358, #2300) moved the first three from host
+// vectors to borrowed device views; see MultiModalForwardInput for the contract.
+// This is the EXACT step the M2c Qwen3VLGenerateGreedy driver runs
+// (VLForwardLastLogits), exposed so the ENGINE registered forward (ForwardQwen3VL)
+// and the standalone driver are numerically identical by construction.
 std::vector<float> Qwen3VLForwardStepLastLogits(
     vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
-    const std::vector<uint16_t>& inputs_embeds_bf16,
-    const std::vector<int32_t>& positions3, int64_t num_tokens,
-    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& inputs_embeds, const vt::Tensor& positions3,
+    int64_t num_tokens, const vt::Tensor& deepstack, int64_t deepstack_levels,
     const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
     const std::vector<PagedKvCache>& attn_kv);
 
@@ -177,9 +178,8 @@ std::vector<float> Qwen3VLForwardStepLastLogits(
 // (ForwardQwen3VL) returns this on the gather_logits path.
 ForwardLogits Qwen3VLForwardStepLastLogitsDevice(
     vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
-    const std::vector<uint16_t>& inputs_embeds_bf16,
-    const std::vector<int32_t>& positions3, int64_t num_tokens,
-    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& inputs_embeds, const vt::Tensor& positions3,
+    int64_t num_tokens, const vt::Tensor& deepstack, int64_t deepstack_levels,
     const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
     const std::vector<PagedKvCache>& attn_kv);
 

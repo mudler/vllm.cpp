@@ -56,6 +56,8 @@
 #pragma once
 
 #include <cstdint>
+
+#include "vt/ops.h"
 #include <vector>
 
 namespace vllm::deepseek_v4 {
@@ -137,11 +139,131 @@ std::vector<float> SoftmaxWithSink(const std::vector<float>& scores, float sink)
 //              in_per_group = n_heads*head_dim/n_groups = heads_per_group*head_dim
 //   wo_b     : [hidden_size, n_groups*o_lora_rank]             row-major
 // Returns out [num_tokens, hidden_size] row-major.
+// `W` is `float` (the ported upstream-parity arm) or `uint16_t` (bf16 bit
+// patterns -- the carried tower's FP8-sourced half at the model dtype, W1d #2186).
+// Defined in `deepseek_v4_dsa.cpp` with both instantiations explicit, so the two
+// arms share ONE body and cannot drift apart.
+template <typename W>
 std::vector<float> GroupedOutputLora(const std::vector<float>& o,
-                                     const std::vector<float>& wo_a,
-                                     const std::vector<float>& wo_b,
+                                     const std::vector<W>& wo_a,
+                                     const std::vector<W>& wo_b,
                                      int64_t num_tokens, int64_t n_heads,
                                      int64_t head_dim, int64_t n_groups,
                                      int64_t o_lora_rank, int64_t hidden_size);
+
+
+// `KV-DSV4-MULTICACHE` W5 (#2323) — DENSE-CAUSAL MLA attention over a PAGED cache.
+//
+// The paged counterpart of the forward's step-5 loop, for the arms with no
+// indexer selection. It exists so DeepSeek-V4 can stop attending over a
+// contiguous `DeepseekV4KvCache::deck` that grows without bound and read the
+// runner's paged topology instead.
+//
+// THE MAPPING THAT MAKES ONE DECODE OP SERVE T QUERIES. `vt::MlaDecodeAttention`
+// attends ONE query per batch row over `[0, seq_lens[b])`. A V4 step carries T
+// queries whose global positions are `kv_base + t` and whose causal key set is
+// `[0, kv_base + t]` (`deepseek_v4.cpp`, the dense-causal `sel` arm). Presenting
+// the step as `batch = T` with `seq_lens[t] = kv_base + t + 1` therefore
+// reproduces the causal mask EXACTLY, with no mask tensor and no per-token
+// launch. Every row shares the same blocks, so `block_table` is the same row
+// repeated.
+//
+//   q       [T * num_heads * head_dim] f32, row-major (t, h, d)
+//   sink    [num_heads] f32 — per-head, denominator-only
+//   returns [T * num_heads * head_dim] f32
+//
+// `no_sink` is the `kNoAttnSink` miswire: it feeds `-inf`, which contributes
+// nothing to the denominator and so is exactly "no sink".
+std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<float>& q,
+                                           vt::Tensor& kv_cache, int64_t num_blocks,
+                                           int64_t block_size, int64_t num_tokens,
+                                           int64_t num_heads, int64_t head_dim,
+                                           int64_t kv_base, const std::vector<float>& sink,
+                                           float scale, bool no_sink,
+                                           // KV-DSV4-MULTICACHE W5 (#2323): the
+                                           // SLIDING WINDOW, in tokens. 0 = none
+                                           // (attend the whole causal prefix).
+                                           // Upstream attends a `swa_only` layer
+                                           // over its window and NOTHING else
+                                           // (`flashmla.py`, `k_cache=swa_cache`
+                                           // with `extra_k_cache=None`), so a
+                                           // full-context read of such a layer
+                                           // diverges above the window.
+                                           int64_t sliding_window = 0,
+                                           // MODEL-DSV4-DSA-COMPOSE W1 (#2286):
+                                           // the per-(token,head) log-sum-exp,
+                                           // `[num_tokens * num_heads]`. Needed
+                                           // only to MERGE this pass with another
+                                           // over a disjoint key set; null
+                                           // otherwise and then never computed.
+                                           std::vector<float>* out_lse = nullptr);
+
+
+// `MODEL-DSV4-DSA-COMPOSE` W1 (#2286) — merge a window pass with a COMPRESSED-HISTORY
+// pass, the way upstream's single fused two-cache kernel does it in one call.
+//
+// `window_out`/`window_lse` are an already-computed sliding-window pass INCLUDING
+// the per-head sink. This attends `comp_rows` (`[n_rows, head_dim]` compressed
+// latents), then merges the two states by their log-sum-exps.
+//
+// THE SINK IS DELIBERATELY ABSENT FROM THIS PASS. `vt::MergeAttnStates` combines
+// by LSE, each `log sum exp(scores)`, so a sink seeded into BOTH passes lands in
+// the merged denominator TWICE and yields a plausible, slightly-too-small result
+// that no token gate would catch. It belongs to exactly one contributor, and the
+// window pass already carries it.
+//
+// Every compressed row is visible to every query -- a closed window is history,
+// not a windowed neighbour -- so this pass takes no window and no causal bound
+// beyond the rows that exist.
+std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
+                                            const std::vector<float>& window_out,
+                                            const std::vector<float>& window_lse,
+                                            const std::vector<float>& q,
+                                            const std::vector<float>& comp_rows,
+                                            int64_t n_rows, int64_t num_tokens,
+                                            int64_t num_heads, int64_t head_dim,
+                                            float scale);
+
+// `MODEL-DSV4-DSA-COMPOSE` W1 (#2286) — ONE compressor layer's decode step,
+// composed. This is what the paged forward must call before its refusal can
+// narrow; the refusal stays until it does, because removing the guard without the
+// capability turns a loud refusal into a silent wrong answer.
+//
+// The `compress_ratio == 128` shape only: `coff == 1`, so no overlapped gathering
+// window and no Lightning Indexer. `compress_ratio == 4` is `coff == 2` and is W3.
+//
+// Per step, in order:
+//   1. score = comp_wgate @ x, the pool score this layer selects with
+//      (`compressor.py:279-287`).
+//   2. `CompressorStepCycle` appends `(kv, score + ape)` to the carried state and
+//      pools at each boundary `(pos + 1) % compress_ratio == 0`, returning the rows
+//      it emitted this step.
+//   3. Those rows append to the layer's compressed history.
+//   4. The window pass attends the sliding window WITH the sink, keeping its LSE.
+//   5. `MergeWindowAndCompressed` folds the compressed history in, with NO sink --
+//      the window pass owns it, and a merged denominator may count it once.
+//
+// **`kv` IS THE MLA LATENT, AND THAT IS THE COLLAPSED GEOMETRY'S CONVENTION, NOT
+// UPSTREAM'S.** Upstream's compressor owns a `fused_wkv_wgate` producing BOTH its
+// KV and its gate from the hidden state (`compressor.py:279-287`), and the real
+// artifact stores `attn.compressor.wkv.weight` for exactly that. This tree does
+// not materialize it -- `deepseek_v4_weights.cpp` accounts it and says so -- since
+// the collapsed compressor reuses the MLA's own `kraw`. So on the REAL artifact
+// this function would pool the wrong operand: finite, plausible, and not what
+// upstream pools. Listed under the row's `## Owed`.
+//
+// `state_kv`, `state_score` and `comp_rows` are CARRIED ACROSS STEPS by the
+// caller. The compressor is a state machine, and its failure mode is a plausible
+// value several tokens after the mistake rather than an immediate one.
+std::vector<float> CompressorLayerStep(
+    vt::Queue& queue, const std::vector<float>& x, const std::vector<float>& kv,
+    const std::vector<float>& q, const std::vector<float>& comp_wgate,
+    const std::vector<float>& comp_ape, const std::vector<float>& comp_norm_weight,
+    const std::vector<float>& attn_sink, vt::Tensor& window_cache,
+    int64_t num_blocks, int64_t block_size, std::vector<float>* state_kv,
+    std::vector<float>* state_score, std::vector<float>* comp_rows,
+    const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
+    int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
+    int64_t sliding_window, float eps, float scale);
 
 }  // namespace vllm::deepseek_v4

@@ -2370,14 +2370,242 @@ TEST_CASE("runner: a multi-cache topology ALLOCATES its N-state recurrent group"
   CHECK(runner.kv_cache_allocated_bytes() == 8704 + 89472);
 }
 
+// ─── ENG-MULTIKV-BYNAME — the by-name channel addresses RECURRENT caches too ──
+//
+// THE GAP, in one number. `MakeQwen4ExpShapedKvConfig` publishes THREE groups
+// over four layers: one full-attention group (layer 3), one recurrent group
+// (layers 0, 1, 2) and one MLA indexer side cache (layer 3). Five caches. The
+// channel reported TWO, because `attn_kv_layer_names_` is built from
+// `attn_group_ids_`, which collects only `AttentionSpec` groups
+// (`runner.cpp`, the group-classification loop), and a recurrent state reaches
+// the forward through `gdn_state` POSITIONALLY with no name attached. Issue
+// #2343 measured the same shape at full size: `22 KV cache(s) from 2 published
+// group(s)` beside `block tables gathered for 3 of 3` — 34 recurrent states
+// invisible while their group's block table was not.
+//
+// UPSTREAM HAS NO SUCH SPLIT. `_reshape_kv_cache_tensors` puts the Mamba page
+// into the SAME `kv_caches: dict[str, torch.Tensor]` as every attention cache
+// (`vllm/v1/worker/gpu_model_runner.py:7354` declares it, `:7418-7427` fills
+// the attention arm and `:7429-7441` the `MambaSpec` arm, whose comment says
+// "Keeping one tensor per layer lets the KV connector register it without
+// special-casing Mamba"), `:7318-7326` asserts that dict's keys are EVERY layer
+// name of EVERY published group, and `bind_kv_cache`
+// (`vllm/v1/worker/utils.py:450-465`) binds out of that one dict. Read at pin
+// 5559679229bc961848b121ccdeaa8fa5d79bec98.
+//
+// THE ORDER IS UPSTREAM'S INSERTION ORDER: published GROUP order, then the
+// group's own layer-name order (`:7365-7372`, `for group in ...: for layer_name
+// in group.layer_names`). That is what puts the three recurrent entries BETWEEN
+// the two attention ones here, which is the case's non-identity property — the
+// flat index of the indexer side cache is 4 while its slot in `attn_kv` is 1.
+TEST_CASE("runner: the by-name KV channel addresses RECURRENT caches (#2343)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeQwen4ExpShapedKvConfig();
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  // The topology this case believes it is driving, asserted rather than assumed.
+  REQUIRE(kv.kv_cache_groups.size() == 3);
+  REQUIRE(runner.attn_group_ids() == std::vector<int>{0, 2});
+  REQUIRE(runner.recurrent_group_ids() == std::vector<int>{1});
+  REQUIRE(runner.attn_kv().size() == 2);
+  REQUIRE(runner.gdn_state().size() == 3);
+
+  const vllm::MultiKvCacheIndex& mk = runner.multi_kv_index();
+
+  // 1. EVERY published cache is in the channel: 2 paged + 3 recurrent.
+  CHECK(mk.size() == 5);
+  // 2. And they came from THREE groups, which is the count the block-table
+  //    denominator has always reported. Before this, `num_groups()` answered 2
+  //    beside `num_published_groups()` 3, so a diagnostic reading both reported
+  //    a full gather as partial.
+  CHECK(mk.num_groups() == 3);
+  CHECK(mk.num_published_groups() == 3);
+
+  // 3. A recurrent layer RESOLVES BY NAME. Each of the three, not one: a
+  //    single-name check cannot see an off-by-one in the slot mapping.
+  CHECK(mk.Find("model.layers.0.linear_attn") >= 0);
+  CHECK(mk.Find("model.layers.1.linear_attn") >= 0);
+  CHECK(mk.Find("model.layers.2.linear_attn") >= 0);
+  // 4. NON-IDENTITY, and the reason this fixture was chosen over the
+  //    all-attention ones. In published-group order the recurrent group sits
+  //    BETWEEN the two attention groups, so the indexer side cache's flat index
+  //    is 4 while its slot in `attn_kv` is 1. A channel that merely appended
+  //    the recurrent names would answer 2 here and pass every other line above.
+  CHECK(mk.Find("model.layers.3.self_attn.attn") == 0);
+  CHECK(mk.Find("model.layers.0.linear_attn") == 1);
+  CHECK(mk.Find("model.layers.1.linear_attn") == 2);
+  CHECK(mk.Find("model.layers.2.linear_attn") == 3);
+  CHECK(mk.Find("model.layers.3.self_attn.indexer.k_cache") == 4);
+  // 5. A name nobody published is still not found.
+  CHECK(mk.Find("model.layers.3.linear_attn") == -1);
+
+  // 6. THE LOCATOR. `Find` gives a place in the published list; `PayloadAt`
+  //    gives the cache. Every one of the five, with its container, its slot,
+  //    its group and its model layer — a count cannot see a routing inversion,
+  //    and neither can a single spot check.
+  using KP = vllm::KvCachePayload;
+  struct Want {
+    const char* name;
+    KP kind;
+    int32_t slot;
+    int32_t group;
+    int32_t layer;
+  };
+  const std::vector<Want> want = {
+      {"model.layers.3.self_attn.attn", KP::kPaged, 0, 0, 3},
+      {"model.layers.0.linear_attn", KP::kRecurrent, 0, 1, 0},
+      {"model.layers.1.linear_attn", KP::kRecurrent, 1, 1, 1},
+      {"model.layers.2.linear_attn", KP::kRecurrent, 2, 1, 2},
+      {"model.layers.3.self_attn.indexer.k_cache", KP::kPaged, 1, 2, 3},
+  };
+  REQUIRE(mk.size() == want.size());
+  for (size_t i = 0; i < want.size(); ++i) {
+    CAPTURE(i);
+    KP kind = KP::kPaged;
+    int32_t slot = -7;
+    REQUIRE(mk.Resolve(want[i].name, &kind, &slot));
+    CHECK(kind == want[i].kind);
+    CHECK(slot == want[i].slot);
+    CHECK((*mk.group_ids)[i] == want[i].group);
+    CHECK((*mk.layer_indices)[i] == want[i].layer);
+    // The same answer through the two-step form, on the index `Find` returned.
+    KP kind2 = KP::kPaged;
+    int32_t slot2 = -7;
+    REQUIRE(mk.PayloadAt(mk.Find(want[i].name), &kind2, &slot2));
+    CHECK(kind2 == want[i].kind);
+    CHECK(slot2 == want[i].slot);
+  }
+  CHECK(mk.num_paged() == 2);
+  CHECK(mk.num_recurrent() == 3);
+  CHECK(mk.num_paged() + mk.num_recurrent() == static_cast<int>(mk.size()));
+
+  // 7. THE SLOT REACHES A REAL CACHE, which is the whole point of the row: a
+  //    name that resolves to a slot nothing holds is the same silent hole in a
+  //    different place. Each recurrent slot indexes a DISTINCT `gdn_state`
+  //    entry with allocated states.
+  std::vector<const void*> seen;
+  for (const Want& wt : want) {
+    CAPTURE(std::string(wt.name));
+    KP kind = KP::kPaged;
+    int32_t slot = -1;
+    REQUIRE(mk.Resolve(wt.name, &kind, &slot));
+    if (kind == KP::kRecurrent) {
+      REQUIRE(slot >= 0);
+      REQUIRE(static_cast<size_t>(slot) < runner.gdn_state().size());
+      const GdnStateCache& gs = runner.gdn_state()[static_cast<size_t>(slot)];
+      REQUIRE(gs.states.size() == 4);
+      CHECK(gs.conv_state.data != nullptr);
+      // No two names may resolve onto one state.
+      for (const void* p : seen) CHECK(p != gs.conv_state.data);
+      seen.push_back(gs.conv_state.data);
+    } else {
+      REQUIRE(slot >= 0);
+      REQUIRE(static_cast<size_t>(slot) < runner.attn_kv().size());
+      CHECK(runner.attn_kv()[static_cast<size_t>(slot)].data != nullptr);
+    }
+  }
+  CHECK(seen.size() == 3);
+
+  // 8. A name that was never published resolves to NOTHING, and writes the
+  //    out-of-band values rather than leaving the caller's variables alone.
+  //    An out-of-range index does the same.
+  KP kind = KP::kRecurrent;
+  int32_t slot = 99;
+  CHECK_FALSE(mk.Resolve("model.layers.3.linear_attn", &kind, &slot));
+  CHECK(kind == KP::kPaged);
+  CHECK(slot == -1);
+  kind = KP::kRecurrent;
+  slot = 99;
+  CHECK_FALSE(mk.PayloadAt(5, &kind, &slot));
+  CHECK(slot == -1);
+  CHECK_FALSE(mk.PayloadAt(-1, &kind, &slot));
+  CHECK(slot == -1);
+}
+
+// ─── ENG-MULTIKV-BYNAME reaches the PRODUCTION forward seam ──────────────────
+//
+// `GPUModelRunner::execute_model` is what an engine calls and
+// `ModelRegistry::Forward` is the shared decode seam AGENTS.md routes every
+// forward through. The seam READS the channel to build its refusal, so the
+// recurrent half is observable at a production entry point rather than only
+// through a test accessor. That is what makes this row's reachability mutation
+// non-vacuous: deleting the runner's publication of the recurrent entries
+// changes bytes this case reads out of `ModelRegistry::Forward`.
+//
+// THE ASSERTION IS TWO-SIDED. A bare "it threw" is a mute switch here, because
+// the runner has its OWN refusal for an unallocated group and it would satisfy
+// any test that only checked that something was thrown. So the case asserts the
+// forward refusal's identifying bytes PRESENT and the runner refusal's bytes
+// ABSENT.
+TEST_CASE("runner: the forward seam REPORTS the recurrent caches (#2343)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeQwen4ExpShapedKvConfig();
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  SchedulerOutput so;
+  SamplingParams sp;
+  sp.temperature = 0.0F;
+  NewRequestData nr;
+  nr.req_id = "r0";
+  nr.prompt_token_ids = {1, 2, 3};
+  nr.sampling_params = sp;
+  // One block-table group per PUBLISHED group, non-identity and with no fixed
+  // point, so a gather keyed on the wrong id cannot pass by coincidence.
+  nr.block_ids = {{6, 2}, {4, 7}, {5, 3}};
+  nr.num_computed_tokens = 0;
+  nr.prefill_token_ids = {1, 2, 3};
+  so.scheduled_new_reqs.push_back(std::move(nr));
+  so.num_scheduled_tokens["r0"] = 3;
+  so.total_num_scheduled_tokens = 3;
+
+  std::string msg = "<did not throw>";
+  try {
+    (void)runner.execute_model(so);
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
+  }
+  CAPTURE(msg);
+  // PRESENT: the forward seam's refusal, carrying the recurrent half.
+  CHECK(msg.find("5 KV cache(s) (2 paged, 3 recurrent)") != std::string::npos);
+  CHECK(msg.find("from 3 published group(s)") != std::string::npos);
+  CHECK(msg.find("first 'model.layers.3.self_attn.attn'") != std::string::npos);
+  // COMPOSITION NOTE (row/MODEL-MM-QWEN4-EXP-E2E). This read
+  // `KV-DSV4-MULTICACHE W5 owns the consuming forward`, which is the wording
+  // #2353 (`row/ENG-MULTIKV-FORWARD-1925`) deliberately REMOVED: three
+  // architectures reach this guard and that row's W5 owns one of them. The two
+  // branches merged textually clean and semantically contradictory, because
+  // `test_runner.cpp:2662` asserts that exact substring ABSENT. The intent of
+  // the assertion is preserved, not weakened: the message must still pin the
+  // row that owns THE GUARD, and it must now name the ARRIVING architecture,
+  // read from the same registry a different code path builds it from.
+  CHECK(msg.find("KV-DSV4-MULTICACHE W3") != std::string::npos);
+  CHECK(msg.find("KV-DSV4-MULTICACHE W5") == std::string::npos);
+  const std::string arriving(
+      vllm::RegistrationFor("Qwen3_5MoeForConditionalGeneration").architecture);
+  REQUIRE_FALSE(arriving.empty());
+  CHECK(msg.find(arriving) != std::string::npos);
+  // ABSENT: the OTHER refusal this topology could plausibly have hit — the
+  // runner's own "a published group got no cache". If that one fired instead,
+  // every `find` above would still have been reachable by a test that only
+  // asserted a throw.
+  CHECK(msg.find("get NO cache from this runner") == std::string::npos);
+  CHECK(msg.find("<did not throw>") == std::string::npos);
+}
+
 // ─── The third forward channel ──────────────────────────────────────────────
 //
 // `ModelRegistry::Forward` is the shared decode seam AGENTS.md routes every
 // forward through, and `GPUModelRunner::execute_model` reaches it. It REFUSES a
 // multi-cache index, because no registered forward consumes a cache set keyed by
-// layer name yet (W5 owns that). The refusal reads the channel's PAYLOAD — how
-// many caches, from how many groups, and the first name — so a channel that
-// arrived empty produces a different message.
+// layer name yet. THREE architectures reach it and no ONE row owns all three
+// consuming forwards (#2353), so the refusal names the ARRIVING architecture and
+// leaves ownership to that architecture's row. The refusal reads the channel's
+// PAYLOAD — how many caches, from how many groups, and the first name — so a
+// channel that arrived empty produces a different message.
 TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -2406,10 +2634,186 @@ TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
   } catch (const std::runtime_error& e) {
     msg = e.what();
   }
+  MESSAGE("EMITTED REFUSAL BYTES: [" << msg << "]");
   CHECK(msg.find("10 KV cache(s)") != std::string::npos);
   CHECK(msg.find("7 published group(s)") != std::string::npos);
   CHECK(msg.find("model.layers.2.attn") != std::string::npos);
-  CHECK(msg.find("KV-DSV4-MULTICACHE W5") != std::string::npos);
+
+  // ─── #2353 ────────────────────────────────────────────────────────────────
+  //
+  // THE ARRIVING ARCHITECTURE IS NAMED. Three architectures publish a
+  // multi-cache topology today -- `DeepseekV4ForCausalLM` (7 groups),
+  // `Qwen4ExpForConditionalGeneration` (3) and `Glm5NextForConditionalGeneration`
+  // (3) -- and the message named none of them, so a reader who met it could not
+  // tell which row owed the consuming forward. #2343 is the measured cost: the
+  // guard fired on `dgx:gpu0` and four separate records had to reconstruct in
+  // prose what the string should have said itself.
+  //
+  // THE EXPECTATION IS NOT A BARE LITERAL. `Qwen3_5MoeForConditionalGeneration`
+  // is the architecture `BorrowQwen3_5MoeLoadedModel` registers this runner's
+  // model under (`qwen3_5_moe.cpp:241-245`), and it is asserted through
+  // `RegistrationFor`, which is the same registry the message reads and a
+  // different code path from the one that builds it. The NEGATIVE assertion is
+  // what stops a hard-coded architecture from passing: a message that named
+  // `DeepseekV4ForCausalLM` for every arrival would satisfy the positive check
+  // on a DeepSeek-V4 run and fail here.
+  const std::string arch(
+      vllm::RegistrationFor("Qwen3_5MoeForConditionalGeneration").architecture);
+  REQUIRE_FALSE(arch.empty());
+  CHECK(msg.find(arch) != std::string::npos);
+  CHECK(msg.find("DeepseekV4ForCausalLM") == std::string::npos);
+
+  // THE OWNERSHIP PIN MOVED, IT WAS NOT DELETED. It read
+  // "KV-DSV4-MULTICACHE W5", which asserts that row's W5 owns the consuming
+  // forward for whatever architecture arrives. That row's W5 is scoped in
+  // `.agents/specs/kv-dsv4-multicache.md` as the DeepSeek-V4 DSA-sparse path
+  // that removes `deepseek_v4.cpp`'s `(void)attn_kv`, so it is true for one of
+  // the three arrivals and false for the other two. The string now names the
+  // row that owns THE GUARD -- W3 landed it -- and leaves the consuming forward
+  // to the arriving architecture's own row.
+  CHECK(msg.find("KV-DSV4-MULTICACHE W3") != std::string::npos);
+  CHECK(msg.find("KV-DSV4-MULTICACHE W5") == std::string::npos);
+}
+
+// ─── MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3) — EVERY published group gathered ─
+//
+// THE GAP THIS CLOSES, in the issue's own words: "`gather_block_table` reaches
+// only `full_attn_group_id_` and `gdn_group_id_`, so the QSA indexer side cache
+// is allocated and unread." A cache the runner allocates and whose block table
+// never leaves the runner cannot be addressed by anything: the buffer is real,
+// the pages are real, and the map from a sequence's LOGICAL position to the
+// PHYSICAL page holding it stays inside `input_batch_`.
+//
+// UPSTREAM ANCHOR. `vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin
+// 5559679229 loops over EVERY published group and gives each its own table:
+//
+//     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+//         cm = copy(cm_base)
+//         ...
+//         if kv_cache_gid > 0:
+//             cm.block_table_tensor = _get_block_table(kv_cache_gid)
+//             cm.slot_mapping = slot_mappings[kv_cache_gid]
+//
+// with `_get_block_table` (`:2318-2334`) being exactly this tree's
+// `gather_block_table`: `self.input_batch.block_table[gid].get_device_tensor()`.
+// Upstream has no "the two named groups" shape at all — the count of groups it
+// serves is `len(kv_cache_groups)`.
+//
+// THE TABLE IS DELIBERATELY PERMUTED AND HAS NO FIXED POINT. An identity map
+// proves nothing: a body that ignores the table, returns the logical indices, or
+// gathers the wrong group's table still agrees with `{0, 1}`. Each group gets a
+// DISTINCT two-block list, none of which maps any logical index to itself, so
+// gathering group 2 with `gdn_group_id_` reads `{4, 7}` where `{5, 3}` is owed
+// and the case reds. The 20-token prompt spans two 16-token blocks with a
+// PARTIAL final block (4 tokens), so a body that assumed a whole final page is
+// visible here too.
+//
+// THIS DRIVES THE PRODUCTION ENTRY POINT. `GPUModelRunner::execute_model` is
+// what an engine calls; the gather runs inside it, and the forward it reaches
+// then REFUSES the multi-cache channel. The consuming forward is owed by the row
+// that ports the ARRIVING architecture, which is what the refusal now names and
+// what #2353 corrected: this comment said "KV-DSV4-MULTICACHE W5 owns the
+// consuming forward", and that row's W5 is the DeepSeek-V4 DSA-sparse path
+// alone. The refusal is caught and READ, because the count it reports is the
+// production reader of the gathered tables — a value nothing reads is a value
+// nothing can be wrong about.
+TEST_CASE("runner: EVERY published KV group's block table is gathered (#2249)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeQwen4ExpShapedKvConfig();
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+
+  // The topology this case believes it is driving, asserted rather than assumed.
+  REQUIRE(runner.full_attn_group_id() == 0);
+  REQUIRE(runner.gdn_group_id() == 1);
+  REQUIRE(runner.attn_group_ids() == std::vector<int>{0, 2});
+  REQUIRE(kv.kv_cache_groups.size() == 3);
+
+  // One distinct, non-identity, fixed-point-free list per PUBLISHED group.
+  const std::vector<std::vector<int>> want = {
+      {6, 2},  // group 0 — the sparse layers' paged K+V
+      {4, 7},  // group 1 — the uniform recurrent group
+      {5, 3},  // group 2 — the QSA INDEXER SIDE CACHE, the unread one
+  };
+
+  SchedulerOutput so;
+  SamplingParams sp;
+  sp.temperature = 0.0F;
+  NewRequestData nr;
+  nr.req_id = "r0";
+  // 20 tokens over a 16-token block: two blocks, the second one PARTIAL.
+  const std::vector<int32_t> prompt(20, 7);
+  nr.prompt_token_ids = prompt;
+  nr.sampling_params = sp;
+  nr.block_ids = want;
+  nr.num_computed_tokens = 0;
+  nr.prefill_token_ids = prompt;
+  so.scheduled_new_reqs.push_back(std::move(nr));
+  so.num_scheduled_tokens["r0"] = 20;
+  so.total_num_scheduled_tokens = 20;
+
+  std::string msg = "<did not throw>";
+  try {
+    (void)runner.execute_model(so);
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
+  }
+  // The forward is still refused, and the refusal now REPORTS the reach.
+  //
+  // ENG-MULTIKV-BYNAME repaired this count. It read `2 KV cache(s)` beside
+  // `3 of 3` published groups, which is what #2343 measured as a contradiction:
+  // the by-name channel omitted the recurrent group's three layers while the
+  // block-table denominator counted its group. Five caches, three of them
+  // recurrent, from three groups.
+  CHECK(msg.find("5 KV cache(s) (2 paged, 3 recurrent)") != std::string::npos);
+  CHECK(msg.find("from 3 published group(s)") != std::string::npos);
+  CHECK(msg.find("block tables gathered for 3 of 3 published group(s)") !=
+        std::string::npos);
+
+  // The VALUES, per group. The expectation is the literal list fed to
+  // `add_row` above, not anything read back out of the runner.
+  const vllm::MultiKvCacheIndex& mk = runner.multi_kv_index();
+  for (int g = 0; g < 3; ++g) {
+    CAPTURE(g);
+    int cols = 0;
+    const std::vector<int32_t>* bt = mk.BlockTableForGroup(g, &cols);
+    REQUIRE(bt != nullptr);
+    // cdiv(32, 16) == 2, rounded up to a multiple of 128/16 == 8.
+    CHECK(cols == 8);
+    REQUIRE(bt->size() == static_cast<size_t>(cols));
+    CHECK((*bt)[0] == want[static_cast<size_t>(g)][0]);
+    CHECK((*bt)[1] == want[static_cast<size_t>(g)][1]);
+    // The columns past the sequence's two blocks were never written.
+    for (int i = 2; i < cols; ++i) CHECK((*bt)[static_cast<size_t>(i)] == 0);
+  }
+
+  // Group 2's table is NOT group 1's and NOT group 0's, stated as an inequality
+  // so that a gather keyed on the wrong id cannot pass by coincidence.
+  int c0 = 0, c1 = 0, c2 = 0;
+  CHECK(*mk.BlockTableForGroup(2, &c2) != *mk.BlockTableForGroup(1, &c1));
+  CHECK(*mk.BlockTableForGroup(2, &c2) != *mk.BlockTableForGroup(0, &c0));
+
+  // Out of range in both directions is a null answer, never a silent read.
+  int cx = 7;
+  CHECK(mk.BlockTableForGroup(3, &cx) == nullptr);
+  CHECK(cx == 0);
+  CHECK(mk.BlockTableForGroup(-1, &cx) == nullptr);
+}
+
+// A UNIFORM topology publishes no per-group tables at all: the channel stays
+// null, exactly as `layer_names` / `group_ids` / `layer_indices` do, so no model
+// shipping today can observe this wave.
+TEST_CASE("runner: the per-group block tables stay EMPTY on a uniform topology") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+  REQUIRE(runner.multi_kv_index().size() == 0);
+  int cols = 5;
+  CHECK(runner.multi_kv_index().BlockTableForGroup(0, &cols) == nullptr);
+  CHECK(cols == 0);
+  CHECK(runner.multi_kv_index().num_group_block_tables() == 0);
 }
 
 // ─── BYTE-NEUTRALITY: the uniform path does not enter the new code ──────────
@@ -2435,6 +2839,21 @@ TEST_CASE("runner: W3 is BYTE-NEUTRAL for every topology shipped today") {
     CHECK(r.attn_kv_layer_names().empty());
     CHECK(r.multi_kv_index().size() == 0);
     CHECK(r.multi_kv_index().Find("model.layers.0.attn") == -1);
+    // ENG-MULTIKV-BYNAME: the two NEW pointers stay null on every uniform
+    // topology, exactly like the three W3 added. The recurrent half of the
+    // channel is what this row builds, and the hybrid gate models below carry a
+    // recurrent group — so "the recurrent group is now named" must NOT mean
+    // "the channel switched on for a hybrid".
+    CHECK(r.multi_kv_index().payload_kinds == nullptr);
+    CHECK(r.multi_kv_index().payload_slots == nullptr);
+    CHECK(r.multi_kv_index().num_paged() == 0);
+    CHECK(r.multi_kv_index().num_recurrent() == 0);
+    vllm::KvCachePayload kind = vllm::KvCachePayload::kRecurrent;
+    int32_t slot = 42;
+    CHECK_FALSE(r.multi_kv_index().Resolve("model.layers.0.attn", &kind, &slot));
+    CHECK(kind == vllm::KvCachePayload::kPaged);
+    CHECK(slot == -1);
+    CHECK_FALSE(r.multi_kv_index().PayloadAt(0, &kind, &slot));
   };
 
   SUBCASE("one full-attention group (dense Qwen3)") {
@@ -2580,6 +2999,26 @@ TEST_CASE("runner: DeepSeek-V4's real 167-entry topology allocates end to end") 
   // ones, so the indexer key cache exists on 6 and not on 7.
   CHECK(runner.multi_kv_index().Find("model.layers.6.attn.indexer.k_cache") >= 0);
   CHECK(runner.multi_kv_index().Find("model.layers.7.attn.indexer.k_cache") == -1);
+
+  // ENG-MULTIKV-BYNAME: DeepSeek-V4 publishes NO recurrent group, so the
+  // channel is all-paged and every flat index IS its slot in `attn_kv`. Stated
+  // as an assertion because it is the neutrality obligation for the seven-group
+  // shape: this row moved the index off "parallel to attn_kv", and on a topology
+  // with no recurrent member the two orders must still coincide entry for entry.
+  const vllm::MultiKvCacheIndex& mk = runner.multi_kv_index();
+  CHECK(mk.size() == 167);
+  CHECK(mk.num_paged() == 167);
+  CHECK(mk.num_recurrent() == 0);
+  REQUIRE(runner.attn_kv_layer_names().size() == 167);
+  for (size_t i = 0; i < 167; ++i) {
+    CAPTURE(i);
+    REQUIRE((*mk.layer_names)[i] == runner.attn_kv_layer_names()[i]);
+    vllm::KvCachePayload kind = vllm::KvCachePayload::kRecurrent;
+    int32_t slot = -1;
+    REQUIRE(mk.PayloadAt(static_cast<int64_t>(i), &kind, &slot));
+    CHECK(kind == vllm::KvCachePayload::kPaged);
+    CHECK(slot == static_cast<int32_t>(i));
+  }
 }
 
 // ─── The reorder's DECODE THRESHOLD reaches the reorder (#2129) ──────────────

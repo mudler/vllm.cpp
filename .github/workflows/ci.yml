@@ -358,6 +358,15 @@ jobs:
         # so this needs no model, no GPU and no quiet box.
         run: |
           python3 tests/scripts/test_cpu_x86_llamacpp_floor.py
+      - name: The qwen4exp llama.cpp ladder harness runs on a lane at all (#2060)
+        # Same shape as the floor harness above: the ladder itself needs a leased
+        # GB10 and a 67 GiB artifact, and its PROOF needs neither -- stub server,
+        # stub client, sparse shards. It landed with no CI line and was absent
+        # from preflight's SUITES, so it ran only when somebody remembered, which
+        # is what this repository calls a gate no lane runs. It also carries the
+        # two executable mutations of the eleven the evidence records.
+        run: |
+          python3 tests/scripts/test_qwen4exp_llamacpp_ladder.py
       - name: The IndexTTS-2.5 port still matches the shipped checkpoint (#634)
         # These three read committed copies of the checkpoint's own config and
         # safetensors header, so they need no network, no weights and no GPU.
@@ -466,6 +475,7 @@ jobs:
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
           python3 tests/scripts/test_agent_pr_body.py
+          python3 tests/scripts/test_agent_issue_index.py
           python3 tests/scripts/test_ab_arms_differ.py
       - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
         # Registered in TWO places, like the baseline and preflight suites above:
@@ -833,6 +843,16 @@ jobs:
         with:
           fetch-depth: 0
       - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
+        # PULL-REQUEST LANE ONLY (#2157, #2322). This step used to run on the
+        # `push` lane too, walking LANDED history on `main` where the only repair
+        # is rewriting `main` -- which AGENTS.md forbids. It was also redundant:
+        # `squash_merge_commit_message = PR_BODY` makes the pull request body the
+        # landed message, and the body check below validates those exact bytes
+        # BEFORE they freeze. Its only unique coverage was a direct push to
+        # `main`, which the landing rules already prohibit. What it produced
+        # instead was forgiveness work -- 42 commits behind the enforcement floor
+        # plus one LANDED_MESSAGE_EXCEPTIONS entry, each excused by hand.
+        if: github.event_name == 'pull_request'
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -883,6 +903,16 @@ jobs:
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
       - name: Every new commit satisfies the strict trailer contract
+        # PULL-REQUEST LANE ONLY (#2157, #2322). This step used to run on the
+        # `push` lane too, walking LANDED history on `main` where the only repair
+        # is rewriting `main` -- which AGENTS.md forbids. It was also redundant:
+        # `squash_merge_commit_message = PR_BODY` makes the pull request body the
+        # landed message, and the body check below validates those exact bytes
+        # BEFORE they freeze. Its only unique coverage was a direct push to
+        # `main`, which the landing rules already prohibit. What it produced
+        # instead was forgiveness work -- 42 commits behind the enforcement floor
+        # plus one LANDED_MESSAGE_EXCEPTIONS entry, each excused by hand.
+        if: github.event_name == 'pull_request'
         # DIFF-scoped, and therefore HERE rather than in agent-record. It lived
         # in that job until #863: agent-record carries a cancellable group keyed
         # on `github.ref`, which for a push is the constant `refs/heads/main`, so

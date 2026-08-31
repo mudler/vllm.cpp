@@ -518,7 +518,7 @@ it, although closing this row removes the outlier that
 [`qwen38-27b-bf16-gate.md`](qwen38-27b-bf16-gate.md) records.
 
 **Record:** none, and this row appends no
-[`issue-index.md`](../issue-index.md) row of its own.
+[`issue-index.md`](../completed/issue-index.md) row of its own.
 
 #1365 already has its row. `9e1a5e573`
 ([PR #1369](https://github.com/mudler/vllm.cpp/pull/1369)) appended it at
@@ -1000,7 +1000,7 @@ later, and that is what happened.
 
 **The debt is paid.** The operator filed it as
 [#1541](https://github.com/mudler/vllm.cpp/issues/1541) against `67823aee2`, and
-the closing commit appends its [`issue-index.md`](../issue-index.md) row and
+the closing commit appends its [`issue-index.md`](../completed/issue-index.md) row and
 lists it under `## Owed` below, which is what makes it an owned filing rather
 than a deferred one. Both binding constraints survive into the issue text: it
 must REFUSE with an error naming the limit, never truncate, and it belongs at
@@ -1097,7 +1097,7 @@ issue, and one index row that says something true of the past:
 
 **The landed #1365 index row reads as the SYMPTOM, the issue was re-scoped onto
 the CAUSE, and the row is left standing because the rule forbids touching it.**
-That row -- [`issue-index.md`](../issue-index.md), the `#1365` line -- describes
+That row -- [`issue-index.md`](../completed/issue-index.md), the `#1365` line -- describes
 a reproducible ~4 s TTFT outlier at a fixed request index, found in
 `out/bench-20260819T035148Z/`, and it says the cause is deliberately not chased
 and is owed under `## Owed` in
@@ -1108,7 +1108,7 @@ pretoken long enough to make that loop visible is the mechanism behind the
 outlier. So the index row now under-describes its own issue.
 
 **It is not repaired, and that is the correct outcome rather than a shortfall.**
-AGENTS.md makes [`issue-index.md`](../issue-index.md) append-only: never edit a
+AGENTS.md makes [`issue-index.md`](../completed/issue-index.md) append-only: never edit a
 row, never delete one. Appending a second `#1365` row is not the escape either,
 because `scripts/check-agent-record.py` reports exactly that as `issue #1365
 listed twice` -- under `merge=union` a duplicate is what two branches appending

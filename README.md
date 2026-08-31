@@ -37,6 +37,12 @@
 
 ## News
 
+- **2026-08** **EXL3 checkpoints now generate on CPU and CUDA.** A stock
+  Llama-3.2-1B-Instruct EXL3 checkpoint loads through the shared dense model path and emits text.
+  The current CUDA path supports its 3-bit body and 6-bit output head. No speed claim is available.
+- **2026-08** **GGUF gains IQ2_XS and IQ4_XS.** Both formats decode and run directly on their
+  compressed blocks on CPU. This lets the 101.25 GiB GLM-5.3-Flash GGUF weight tower load without
+  expanding to 426.72 GiB. Its model forward is still incomplete.
 - **2026-08** **Hybrid CPU/GPU expert placement reaches five architecture families.** Qwen3-MoE,
   Qwen3.5/3.6, Nemotron-H, DeepSeek-V2, and Kimi-Linear can run routed experts on the CPU while the
   rest of the model stays on the selected accelerator. The end-to-end token and speed gates are
@@ -103,7 +109,9 @@ Where that stands today:
   prefill** on Apple Silicon. Most other architectures are speed-pending, and say so.
 - **Everything.** 43 registered architectures, 38 tool-parser families, structured output including
   GBNF, three speculative decoders, image, video, and audio input, music generation, external KV
-  offload, Prometheus metrics, and the SGLang knobs, all in a library you can `dlopen`.
+  offload, Prometheus metrics, and the SGLang knobs, all in a library you can `dlopen`. Multimodal
+  input runs on the single-sequence drivers. No multimodal request is served over HTTP yet
+  ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)).
 
 ## Performance
 
@@ -206,8 +214,10 @@ you get on top, most of it borrowed from whichever engine does it best:
   ([`include/vllm.h`](include/vllm.h), ABI v23) for C, C++, Go, or Rust. No Python
   interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
-  **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16
-  expansion. Byte-identical greedy output to llama.cpp.
+  **compute directly on the compressed blocks** (Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XS,
+  and IQ4_XS) with no BF16 expansion. Byte-identical greedy output to llama.cpp on the gated paths.
+- **EXL3 trellis weights.** A stock 3.0 bpw Llama-3.2-1B-Instruct checkpoint generates on CPU and
+  CUDA through the shared dense model path. The DeepSeek-V4 rank-sliced layout remains partial.
 - **SGLang's good ideas, as documented toggles.** RadixAttention / prefix caching, LPM cache-aware
   scheduling, jump-forward decoding, and custom logits processors, opt-in from the library, the C
   ABI, or server flags. Each defaults to today's behavior, so an engine that sets none of them is
@@ -239,11 +249,15 @@ you get on top, most of it borrowed from whichever engine does it best:
 - **Tool calling and reasoning.** 38 tool-parser families (42 accepted names) and 12 reasoning
   parser names, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
-- **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
-  wired through the OpenAI server (content parts on `/v1/chat/completions`) into the engine's
-  registered forward; video and audio still run on the single-sequence path.
-- **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF
-  F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K, and an FP8 W8A8 slice.
+- **Multimodal.** Image, video, and audio to text, token-correct against committed goldens on the
+  single-sequence drivers. The OpenAI server parses image content parts on `/v1/chat/completions`
+  and carries them into the engine, and that seam is gated. Two residuals then stop the request
+  before the model. The server decodes only raw RGB, so a PNG or JPEG data URI is refused first.
+  The GPU runner does not pass image features to the model forward
+  ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)). No multimodal request is served end
+  to end.
+- **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, EXL3 trellis, GGUF F32/F16,
+  Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ4_XS, and an FP8 W8A8 slice.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
   external routers. Opt-in, off by default ([docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md)).
 - **Observability.** Prometheus `/metrics` with vLLM's metric names, `/server_info`, `/tokenize`,
@@ -370,8 +384,13 @@ All flags, including `--speculative-config`: [docs/USAGE.md](docs/USAGE.md).
 
 ### Multimodal INPUT and video GENERATION
 
-Multimodal INPUT goes through `/v1/chat/completions` content parts (`image_url`,
-`video_url`, `input_audio`). Video GENERATION:
+Multimodal INPUT goes through `/v1/chat/completions` content parts. The server parses an
+`image_url` part and carries it into the engine. It refuses a `video_url` or an `input_audio`
+part at that seam with HTTP 400. The served limit is one image and zero of every other modality.
+Two residuals then stop an image request. The server decodes only raw RGB, so a PNG or JPEG data
+URI is refused first. The GPU runner does not pass image features to the model forward
+([#2300](https://github.com/mudler/vllm.cpp/issues/2300)). No multimodal request is served end to
+end. Video GENERATION:
 
 ```sh
 build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \

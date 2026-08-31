@@ -1,0 +1,549 @@
+// Qwen4-Exp W5f — `Qwen4ExpTextModel::Forward`. See qwen4_exp_forward.h for the
+// oracle anchors, the four ordering facts a block gate cannot see, and the scope.
+#include "vllm/model_executor/models/qwen4_exp_forward.h"
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+#include "vllm/model_executor/models/dense_attn_block.h"     // ResidentWeight
+#include "vllm/model_executor/models/qwen3_5_gdn_block.h"    // RunGdnBlockPaged
+#include "vllm/model_executor/models/qwen3_5_mrope.h"        // BuildMropeCosSinHost
+#include "vllm/model_executor/models/qwen4_exp_moe.h"        // RunQwen4ExpMoeBlock
+#include "vt/dtype.h"
+#include "vt/ops.h"
+
+namespace vllm {
+
+using dense_attn::DBuf;
+using dense_attn::Dev;
+using vt::DType;
+using vt::Tensor;
+
+namespace {
+
+// The whole tensor under a different shape, same bytes. Same helper the PLE and
+// QSA blocks carry, and for the same reason: the element count must agree, which
+// is the check that stops a reshape from quietly renaming a stride.
+Tensor Reshape(const Tensor& t, const std::vector<int64_t>& shape) {
+  int64_t have = 1;
+  for (int i = 0; i < t.rank; ++i) have *= t.shape[i];
+  int64_t want = 1;
+  for (int64_t s : shape) want *= s;
+  VT_CHECK(t.IsContiguous(),
+           "qwen4_exp forward: Reshape needs a contiguous tensor");
+  VT_CHECK(have == want,
+           "qwen4_exp forward: Reshape would change the element count");
+  return dense_attn::MakeTensor(t.data, t.dtype, t.device, shape);
+}
+
+void CheckOwned(const OwnedTensor& t, const char* name,
+                const std::vector<int64_t>& shape) {
+  VT_CHECK(t.rank == static_cast<int>(shape.size()),
+           std::string("qwen4_exp forward: ") + name + " has rank " +
+               std::to_string(t.rank) + ", expected " +
+               std::to_string(shape.size()));
+  for (size_t i = 0; i < shape.size(); ++i) {
+    VT_CHECK(t.shape[i] == shape[i],
+             std::string("qwen4_exp forward: ") + name + " dim " +
+                 std::to_string(i) + " is " + std::to_string(t.shape[i]) +
+                 ", expected " + std::to_string(shape[i]));
+  }
+}
+
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+HfConfig Qwen4ExpGdnHfConfig(const Qwen4ExpParams& p, const HfConfig& source) {
+  // The GDN block reads a small, named set of `HfConfig` fields, and every one
+  // of them is copied from `p` EXCEPT the output gate, which `p` cannot answer.
+  // See the header: `ParseQwen4ExpParams` validates `output_gate_type` and
+  // stores no field, so the checkpoint's answer survives only on `HfConfig`.
+  VT_CHECK(source.linear_num_key_heads == p.linear_num_key_heads &&
+               source.linear_num_value_heads == p.linear_num_value_heads &&
+               source.linear_key_head_dim == p.linear_key_head_dim &&
+               source.linear_value_head_dim == p.linear_value_head_dim &&
+               source.linear_conv_kernel_dim == p.linear_conv_kernel_dim &&
+               source.hidden_size == p.hidden_size,
+           "qwen4_exp forward: the HfConfig's Gated DeltaNet geometry disagrees "
+           "with Qwen4ExpParams; the two describe ONE checkpoint, so a "
+           "disagreement means the config was composed from two models");
+  VT_CHECK(source.output_gate_type == "silu" ||
+               source.output_gate_type == "sigmoid",
+           "qwen4_exp forward: output_gate_type is \"" +
+               source.output_gate_type +
+               "\"; upstream accepts only sigmoid or silu "
+               "(configuration_qwen4_exp.py:193-195) and the GDN output gate is "
+               "its only consumer, so a third value is a silent wrong "
+               "activation rather than a shape error");
+  HfConfig c;
+  c.model_type = "qwen4_exp_text";
+  c.hidden_size = p.hidden_size;
+  c.num_hidden_layers = p.num_hidden_layers;
+  c.rms_norm_eps = p.rms_norm_eps;
+  c.linear_num_key_heads = p.linear_num_key_heads;
+  c.linear_num_value_heads = p.linear_num_value_heads;
+  c.linear_key_head_dim = p.linear_key_head_dim;
+  c.linear_value_head_dim = p.linear_value_head_dim;
+  c.linear_conv_kernel_dim = p.linear_conv_kernel_dim;
+  // THE ONE FIELD THAT IS CARRIED AND NOT DERIVED.
+  c.output_gate_type = source.output_gate_type;
+  c.mamba_ssm_dtype = source.mamba_ssm_dtype;
+  // CARRIED, AND `GdnBlockPaged` DOES NOT READ IT — checked rather than assumed,
+  // because an earlier draft of this comment claimed it did. The field used to
+  // drive a dense-vs-MoE width choice through a `bool dense_model` parameter
+  // that GDN-MOE-BF16-OUT (#1168) DELETED, so nothing on this path branches on
+  // model shape any more. It is set because this architecture IS a MoE one and a
+  // projection that described it as dense would be false about the model, not
+  // because any consumer here is known to look.
+  c.num_experts = p.num_experts;
+  return c;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+GdnLayerWeights Qwen4ExpGdnBlockWeights(const Qwen4ExpGdnWeights& g,
+                                        const Qwen4ExpParams& p) {
+  const int64_t H = p.hidden_size;
+  const int64_t num_v = p.linear_num_value_heads;
+  const int64_t key_dim = p.linear_num_key_heads * p.linear_key_head_dim;
+  const int64_t value_dim = num_v * p.linear_value_head_dim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+
+  // The `qwen4exp` loader writes `[N, K]` with `nk = true` (`MakeGdnProj` with
+  // `GgufLoadPolicy::gdn_expand_nk`), which is the orientation the qwen3_5 GGUF
+  // path produces for the same tensors. Both are checked, because a tower that
+  // arrived in the other orientation has the same element count and would be
+  // read transposed — a wrong answer, not a crash.
+  CheckOwned(g.in_proj_qkv, "gdn.in_proj_qkv", {conv_dim, H});
+  CheckOwned(g.in_proj_z, "gdn.in_proj_z", {value_dim, H});
+  CheckOwned(g.in_proj_b, "gdn.in_proj_b", {num_v, H});
+  CheckOwned(g.in_proj_a, "gdn.in_proj_a", {num_v, H});
+  CheckOwned(g.conv1d, "gdn.conv1d", {conv_dim, p.linear_conv_kernel_dim});
+  CheckOwned(g.a_log, "gdn.a_log", {num_v});
+  CheckOwned(g.dt_bias, "gdn.dt_bias", {num_v});
+  CheckOwned(g.norm_weight, "gdn.norm_weight", {p.linear_value_head_dim});
+  CheckOwned(g.out_proj, "gdn.out_proj", {H, value_dim});
+
+  GdnLayerWeights w;
+  w.in_proj_qkv = g.in_proj_qkv;
+  w.in_proj_z = g.in_proj_z;
+  w.in_proj_b = g.in_proj_b;
+  w.in_proj_a = g.in_proj_a;
+  w.conv1d_weight = g.conv1d;
+  w.a_log = g.a_log;
+  w.dt_bias = g.dt_bias;
+  w.norm_weight = g.norm_weight;
+  w.out_proj = g.out_proj;
+  // `in_proj_ba` and `in_proj_qkvz` are left EMPTY — see the header. That is
+  // what keeps the split fields above live and it is exactly what qwen3_5's own
+  // GGUF loader does.
+  return w;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+// The two RoPE layouts one set of angles has to be handed in, over the FULL
+// position range `[0, kv_len)` rather than this step's `T`.
+//
+// TWO LAYOUTS, ONE TABLE, and the reason is in `qwen4_exp_qsa_block.h`:
+// `vt::RopeFromCache` reads a PACKED `[P, rot]` cache whose columns are
+// `[cos(rot/2) | sin(rot/2)]`, while `vt::Qwen4ExpQsaCompress` reads the two
+// FULL `[P, rot]` tables separately and in f32. Upstream's `emb = cat(freqs,
+// freqs)` (:135) makes the second half of each row a copy of the first, so both
+// layouts describe the same angles BY CONSTRUCTION — which is the property the
+// QSA block cross-checks rather than trusts.
+//
+// FULL RANGE, not this step's rows: the compressor reads row `compress_ratio*b`,
+// the FIRST token of each pooled block, so it addresses positions this step did
+// not produce.
+struct RopeTables {
+  std::vector<uint16_t> packed;  // [P, rot] bf16, cos|sin
+  std::vector<float> cos;        // [P, rot] f32, second half duplicates first
+  std::vector<float> sin;        // [P, rot] f32
+};
+
+RopeTables BuildQsaRope(const HfConfig& config, int64_t P) {
+  const int64_t rot = config.rotary_dim;
+  VT_CHECK(rot > 0 && rot % 2 == 0,
+           "qwen4_exp forward: rotary_dim must be positive and even, got " +
+               std::to_string(rot));
+  const int64_t half = rot / 2;
+
+  // THE SHARED BUILDER, NOT A PRIVATE ROPE LOOP. `BuildMropeCosSinHost` is
+  // W5d-2's seam (#2249 item 5) and it is what the Qwen3.5/3.6 VL drivers use,
+  // so this architecture builds the SAME angles rather than a second copy.
+  //
+  // ALL THREE AXES CARRY THE SAME POSITIONS, and that is what makes the call
+  // legitimate here. On the TEXT tower upstream expands one position row to
+  // three (`position_ids.view(1,1,-1).expand(4, B, -1)`, :1370) and
+  // `apply_interleaved_mrope` then overwrites slots of `freqs[0]` with slots of
+  // `freqs[1]` / `freqs[2]` — which is the IDENTITY when the three are equal.
+  // The section split is therefore unobservable on this path, and a config that
+  // carries no `mrope_section` gets the smallest valid one rather than a private
+  // rope loop, which would be the parallel path AGENTS.md "Shared seams" forbids.
+  HfConfig rc = config;
+  if (rc.rope_parameters.mrope_section.size() != 3 ||
+      rc.rope_parameters.mrope_section[0] + rc.rope_parameters.mrope_section[1] +
+              rc.rope_parameters.mrope_section[2] !=
+          half) {
+    rc.rope_parameters.mrope_section = {half, 0, 0};
+  }
+  std::vector<int32_t> pos3(static_cast<size_t>(3 * P));
+  for (int64_t axis = 0; axis < 3; ++axis) {
+    for (int64_t i = 0; i < P; ++i)
+      pos3[static_cast<size_t>(axis * P + i)] = static_cast<int32_t>(i);
+  }
+  const std::vector<float> cs = BuildMropeCosSinHost(pos3, P, rc);
+
+  RopeTables r;
+  r.packed.resize(static_cast<size_t>(P * rot));
+  r.cos.resize(static_cast<size_t>(P * rot));
+  r.sin.resize(static_cast<size_t>(P * rot));
+  for (int64_t pp = 0; pp < P; ++pp) {
+    for (int64_t j = 0; j < half; ++j) {
+      const float c = cs[static_cast<size_t>(pp * rot + j)];
+      const float s = cs[static_cast<size_t>(pp * rot + half + j)];
+      r.packed[static_cast<size_t>(pp * rot + j)] = vt::F32ToBF16(c);
+      r.packed[static_cast<size_t>(pp * rot + half + j)] = vt::F32ToBF16(s);
+      r.cos[static_cast<size_t>(pp * rot + j)] = c;
+      r.cos[static_cast<size_t>(pp * rot + half + j)] = c;
+      r.sin[static_cast<size_t>(pp * rot + j)] = s;
+      r.sin[static_cast<size_t>(pp * rot + half + j)] = s;
+    }
+  }
+  return r;
+}
+
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
+    Dev d, Qwen4ExpWeights& w, const HfConfig& config,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const v1::CommonAttentionMetadata& attn_meta,
+    const v1::GDNAttentionMetadata& gdn_meta,
+    const Qwen4ExpForwardCaches& caches, int64_t past_len) {
+  const Qwen4ExpParams& p = w.params;
+  const auto T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = p.hidden_size;
+  const int64_t hc = p.hc_count;
+  const int64_t W = p.stream_width();
+  const int64_t L = p.num_hidden_layers;
+  const auto eps = static_cast<float>(p.rms_norm_eps);
+
+  VT_CHECK(T > 0, "qwen4_exp forward: token_ids must not be empty");
+  VT_CHECK(positions.size() == token_ids.size(),
+           "qwen4_exp forward: positions and token_ids must have one entry per "
+           "token; got " +
+               std::to_string(positions.size()) + " and " +
+               std::to_string(token_ids.size()));
+  VT_CHECK(past_len >= 0, "qwen4_exp forward: past_len must not be negative");
+  VT_CHECK(static_cast<int64_t>(w.layers.size()) == L,
+           "qwen4_exp forward: the weights carry " +
+               std::to_string(w.layers.size()) + " layers and the config names " +
+               std::to_string(L));
+  VT_CHECK(static_cast<int64_t>(p.layer_types.size()) == L,
+           "qwen4_exp forward: layer_types has " +
+               std::to_string(p.layer_types.size()) + " entries for " +
+               std::to_string(L) + " layers");
+
+  // THE CACHE VECTORS ARE COUNTED AGAINST THE CONFIG BEFORE ANY INDEXING, not
+  // checked per layer as the loop reaches them. A short vector discovered at
+  // layer 40 has already mutated 39 layers' worth of state.
+  int64_t n_gdn = 0, n_qsa = 0;
+  for (int64_t i = 0; i < L; ++i) {
+    if (p.layer_types[static_cast<size_t>(i)] ==
+        Qwen4ExpLayerKind::kLinearAttention) {
+      ++n_gdn;
+    } else {
+      ++n_qsa;
+    }
+  }
+  VT_CHECK(static_cast<int64_t>(caches.gdn.size()) == n_gdn,
+           "qwen4_exp forward: " + std::to_string(caches.gdn.size()) +
+               " Gated DeltaNet state caches for " + std::to_string(n_gdn) +
+               " linear_attention layers");
+  VT_CHECK(static_cast<int64_t>(caches.qsa.size()) == n_qsa,
+           "qwen4_exp forward: " + std::to_string(caches.qsa.size()) +
+               " Qwen Sparse Attention caches for " + std::to_string(n_qsa) +
+               " qwen_sparse_attention layers");
+  VT_CHECK(caches.ple.size() == p.ple.layer_ids_zero_based.size(),
+           "qwen4_exp forward: " + std::to_string(caches.ple.size()) +
+               " PLE caches for " +
+               std::to_string(p.ple.layer_ids_zero_based.size()) +
+               " PLE layers");
+
+  const DType dt = kQwen4ExpStreamDType;
+
+  // ─── :1415  inputs_embeds = self.embed_tokens(input_ids) ──────────────────
+  CheckOwned(w.embed_tokens, "embed_tokens", {p.vocab_size, H});
+  DBuf embed(d, dt, {T, H});
+  {
+    std::vector<int64_t> ids(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t id = token_ids[static_cast<size_t>(t)];
+      VT_CHECK(id >= 0 && id < p.vocab_size,
+               "qwen4_exp forward: token id " + std::to_string(id) +
+                   " at position " + std::to_string(t) +
+                   " is outside [0, vocab_size)");
+      ids[static_cast<size_t>(t)] = id;
+    }
+    DBuf d_ids(d, DType::kI64, {T}, ids.data());
+    Tensor table = dense_attn::ResidentWeight(d, w.embed_tokens, {p.vocab_size, H});
+    Tensor out = embed.t();
+    vt::Embedding(d.q, out, table, d_ids.t());
+  }
+
+  // ─── :1417  hidden_states = hidden_states.repeat(1, 1, hc_count) ──────────
+  // THE WIDEN, and it is `vt::IndexSelect` over a repeat index rather than a new
+  // op (#2336 §4). `repeat` on the last axis of `[T, H]` gives
+  // `out[t, j*H + h] = in[t, h]`; read `out` as `[T*hc, H]` and that is exactly
+  // a row gather with `idx[i] = i / hc`. A TILE — `out[t, j*H+h] = in[t, ...]`
+  // with the branches interleaved the other way — would be `idx[i] = i % T` and
+  // is a different tensor; the two agree only at hc == 1.
+  DBuf stream(d, dt, {T, W});
+  {
+    std::vector<int32_t> idx(static_cast<size_t>(T * hc));
+    for (int64_t i = 0; i < T * hc; ++i)
+      idx[static_cast<size_t>(i)] = static_cast<int32_t>(i / hc);
+    DBuf d_idx(d, DType::kI32, {T * hc}, idx.data());
+    Tensor out = Reshape(stream.t(), {T * hc, H});
+    vt::IndexSelect(d.q, out, embed.t(), d_idx.t());
+  }
+
+  // ─── :1416  position_embeddings, built ONCE for the whole step ────────────
+  // Upstream builds them at the model level and hands the SAME pair to every
+  // decoder layer; only the QSA layers read them. The tables cover
+  // `[0, past_len + T)` because the compressor addresses pooled blocks, not
+  // this step's rows.
+  const int64_t kv_len = past_len + T;
+  RopeTables rope;
+  DBuf rope_packed, rope_cos, rope_sin;
+  const bool need_rope = n_qsa > 0;
+  if (need_rope) {
+    rope = BuildQsaRope(config, kv_len);
+    const int64_t rot = config.rotary_dim;
+    rope_packed = DBuf(d, DType::kBF16, {kv_len, rot}, rope.packed.data());
+    rope_cos = DBuf(d, DType::kF32, {kv_len, rot}, rope.cos.data());
+    rope_sin = DBuf(d, DType::kF32, {kv_len, rot}, rope.sin.data());
+  }
+  DBuf d_positions(d, DType::kI32, {T}, positions.data());
+
+  // ─── the GDN step upload, ONCE per step ───────────────────────────────────
+  // `qwen3_5_gdn_block.h` is explicit that rebuilding this inside each block
+  // call reinstates the per-layer upload it was factored out to remove — 36
+  // times per step on this architecture.
+  const HfConfig gdn_config = Qwen4ExpGdnHfConfig(p, config);
+  GdnStepInputs gdn_step;
+  if (n_gdn > 0) {
+    int64_t slots = 0;
+    for (const GdnStateCache& s : caches.gdn) {
+      VT_CHECK(s.ssm_state.rank >= 1,
+               "qwen4_exp forward: a Gated DeltaNet state cache has no ssm_state");
+      if (slots == 0) slots = s.ssm_state.shape[0];
+      VT_CHECK(s.ssm_state.shape[0] == slots,
+               "qwen4_exp forward: the Gated DeltaNet state caches disagree on "
+               "their slot count, and ONE step upload validates the state "
+               "indices against ONE of them");
+    }
+    gdn_step = BuildGdnStepInputs(d.q, positions, attn_meta, gdn_meta, slots);
+  }
+
+  // ─── :1419  the layer loop ────────────────────────────────────────────────
+  int64_t gdn_i = 0, qsa_i = 0;
+  for (int64_t il = 0; il < L; ++il) {
+    Qwen4ExpLayerWeights& lw = w.layers[static_cast<size_t>(il)];
+    const bool linear = p.layer_types[static_cast<size_t>(il)] ==
+                        Qwen4ExpLayerKind::kLinearAttention;
+    VT_CHECK(lw.is_linear_attention == linear,
+             "qwen4_exp forward: layer " + std::to_string(il) +
+                 " was LOADED as a " +
+                 (lw.is_linear_attention ? "linear_attention" : "sparse-attention") +
+                 " layer and the config calls it the other kind; the two read "
+                 "different tensor names, so this is a checkpoint/config "
+                 "mismatch and not a dispatch choice");
+
+    // ─── :1218  hidden_states = hidden_states + self.ple(...) ───────────────
+    // FIRST IN THE LAYER, on the hc-WIDE stream, and ADDED to it. Not last, not
+    // at the model level, and not on the collapsed hidden state — see the
+    // header's ordering fact 1.
+    if (lw.has_ple) {
+      // Which PLE cache this is, by upstream's own indexing:
+      // `config.ple_layer_ids.index(layer_idx + 1)` (:1202). NOT the decoder
+      // layer index, and the layer multipliers are derived from it, so getting
+      // it wrong gathers somebody else's rows from a 320-million-row table with
+      // no shape error.
+      int64_t ple_i = -1;
+      for (size_t k = 0; k < p.ple.layer_ids_zero_based.size(); ++k) {
+        if (p.ple.layer_ids_zero_based[k] == il) {
+          ple_i = static_cast<int64_t>(k);
+          break;
+        }
+      }
+      VT_CHECK(ple_i >= 0,
+               "qwen4_exp forward: layer " + std::to_string(il) +
+                   " was loaded WITH PLE weights and `ple_layer_ids` does not "
+                   "name it");
+      std::vector<int64_t> ple_ids(static_cast<size_t>(T));
+      for (int64_t t = 0; t < T; ++t)
+        ple_ids[static_cast<size_t>(t)] = token_ids[static_cast<size_t>(t)];
+      const qwen4_exp::NGramTableLayout layout = Qwen4ExpPleLayout(p, ple_i);
+      const Qwen4ExpPleBlockOutput ple = RunQwen4ExpPleBlock(
+          d, lw.ple, w.ngram_table, p, layout, stream.t(), ple_ids.data(),
+          /*conv_mask=*/nullptr, caches.ple[static_cast<size_t>(ple_i)], past_len);
+      Tensor s = stream.t();
+      vt::Add(d.q, s, s, ple.tensor);
+    }
+
+    // ─── :1222  the ATTENTION hyper-connection ──────────────────────────────
+    // `mixed` is the block's [T, H] input; `injection` is the [T, hc] rank-1
+    // weight the write-back uses; `stream` is untouched and stays the RAW
+    // stream, which is what :1237 adds to (ordering fact 3).
+    DBuf mixed(d, dt, {T, H});
+    DBuf injection(d, dt, {T, hc});
+    {
+      vt::Qwen4ExpGatedResidualArgs args;
+      args.hc_count = hc;
+      args.hidden_size = H;
+      args.lowrank = p.hc_lowrank;
+      args.eps = eps;
+      VT_CHECK(lw.attn_hc.has_inject,
+               "qwen4_exp forward: layer " + std::to_string(il) +
+                   "'s attention hyper-connection has no block_inject_weight; "
+                   "`use_combine=False` is the MODEL-level mixer alone");
+      Tensor m = mixed.t();
+      Tensor inj = injection.t();
+      Tensor bi = lw.attn_hc.inject.View();
+      vt::Qwen4ExpGatedResidual(
+          d.q, m, &inj, stream.t(),
+          dense_attn::ResidentWeight(d, lw.attn_hc.hc_norm, {W}),
+          dense_attn::ResidentWeight(d, lw.attn_hc.down, {p.hc_lowrank, W}),
+          dense_attn::ResidentWeight(d, lw.attn_hc.up, {W, p.hc_lowrank}), &bi,
+          args);
+    }
+
+    // ─── :1224 / :1228  the mixer block, one arm per layer kind ─────────────
+    Tensor block_out;
+    std::shared_ptr<void> block_store;
+    if (linear) {
+      const GdnLayerWeights gw = Qwen4ExpGdnBlockWeights(lw.gdn, p);
+      const GdnBlockOutput o = RunGdnBlockPaged(
+          d.q, gw, gdn_config, mixed.t(), gdn_step, gdn_meta,
+          caches.gdn[static_cast<size_t>(gdn_i)], T);
+      block_out = o.tensor;
+      block_store = o.storage;
+      ++gdn_i;
+    } else {
+      VT_CHECK(need_rope, "qwen4_exp forward: a sparse-attention layer needs "
+                          "the rope tables and none were built");
+      const Qwen4ExpQsaBlockOutput o = RunQwen4ExpQsaBlockPaged(
+          d, lw.qsa, p, mixed.t(), d_positions.t(), rope_packed.t(),
+          rope_cos.t(), rope_sin.t(),
+          caches.qsa[static_cast<size_t>(qsa_i)], past_len);
+      block_out = o.tensor;
+      block_store = o.storage;
+      ++qsa_i;
+    }
+
+    // ─── :1236-1237  the rank-1 write-back, IN PLACE on the raw stream ──────
+    {
+      vt::Qwen4ExpGatedResidualArgs args;
+      args.hc_count = hc;
+      args.hidden_size = H;
+      args.lowrank = p.hc_lowrank;
+      args.eps = eps;
+      Tensor s = stream.t();
+      vt::Qwen4ExpGatedResidualWriteBack(d.q, s, block_out, injection.t(), args);
+    }
+    block_store.reset();
+
+    // ─── :1239  the MLP hyper-connection ────────────────────────────────────
+    DBuf mlp_in(d, dt, {T, H});
+    DBuf mlp_injection(d, dt, {T, hc});
+    {
+      vt::Qwen4ExpGatedResidualArgs args;
+      args.hc_count = hc;
+      args.hidden_size = H;
+      args.lowrank = p.hc_lowrank;
+      args.eps = eps;
+      VT_CHECK(lw.mlp_hc.has_inject,
+               "qwen4_exp forward: layer " + std::to_string(il) +
+                   "'s MLP hyper-connection has no block_inject_weight");
+      Tensor m = mlp_in.t();
+      Tensor inj = mlp_injection.t();
+      Tensor bi = lw.mlp_hc.inject.View();
+      vt::Qwen4ExpGatedResidual(
+          d.q, m, &inj, stream.t(),
+          dense_attn::ResidentWeight(d, lw.mlp_hc.hc_norm, {W}),
+          dense_attn::ResidentWeight(d, lw.mlp_hc.down, {p.hc_lowrank, W}),
+          dense_attn::ResidentWeight(d, lw.mlp_hc.up, {W, p.hc_lowrank}), &bi,
+          args);
+    }
+
+    // ─── :1240  hidden_states = self.mlp(hidden_states) ─────────────────────
+    // Through the SHARED sparse-MoE seam, which is what W5d-4's adapter exists
+    // for; this loop composes `Qwen4ExpMoeBlockWeights` per layer rather than a
+    // second MoE path.
+    {
+      // NON-CONST by W5d-4's own contract: the per-expert views BORROW the
+      // tower's bytes and `OwnedBytes::KeepAlive()` converts the owned buffer
+      // into a shared read-only one IN PLACE. Rebuilding the adapter per layer
+      // per STEP is the third risk #2336 §3 names — it loses
+      // `ResidentWeight::d_dev` and re-uploads the tower on a device arm — and
+      // it is a SPEED ceiling this wave inherits rather than a wrong answer;
+      // the spec's `## Owed` carries the hoist.
+      const MoeBlockWeights mw = Qwen4ExpMoeBlockWeights(
+          w.layers[static_cast<size_t>(il)].moe, p);
+      const MoeBlockOutput o = RunQwen4ExpMoeBlock(d.q, mw, p, mlp_in.t(), T);
+
+      vt::Qwen4ExpGatedResidualArgs args;
+      args.hc_count = hc;
+      args.hidden_size = H;
+      args.lowrank = p.hc_lowrank;
+      args.eps = eps;
+      Tensor s = stream.t();
+      vt::Qwen4ExpGatedResidualWriteBack(d.q, s, o.tensor, mlp_injection.t(),
+                                         args);
+    }
+  }
+
+  VT_CHECK(gdn_i == n_gdn && qsa_i == n_qsa,
+           "qwen4_exp forward: the loop consumed " + std::to_string(gdn_i) +
+               " of " + std::to_string(n_gdn) + " Gated DeltaNet caches and " +
+               std::to_string(qsa_i) + " of " + std::to_string(n_qsa) +
+               " sparse-attention caches");
+
+  // ─── :1430  hidden_states = self.hyper_connection_mixer(hidden_states) ────
+  // The terminal `use_combine=False` collapse: a NULL `block_inject` and a NULL
+  // `injection` out-parameter, which is the arm that returns `mixed_input`
+  // alone. There is NO final RMSNorm after it (ordering fact 4) — the mixer's
+  // own `hc_norm` is the last normalization in the model.
+  VT_CHECK(!w.mixer.has_inject,
+           "qwen4_exp forward: the model-level mixer carries a "
+           "block_inject_weight; `use_combine=False` is what makes it the "
+           "terminal collapse and an inject tensor means it was loaded as a "
+           "per-layer site");
+  DBuf out(d, dt, {T, H});
+  {
+    vt::Qwen4ExpGatedResidualArgs args;
+    args.hc_count = hc;
+    args.hidden_size = H;
+    args.lowrank = p.hc_lowrank;
+    args.eps = eps;
+    Tensor o = out.t();
+    vt::Qwen4ExpGatedResidual(
+        d.q, o, /*injection=*/nullptr, stream.t(),
+        dense_attn::ResidentWeight(d, w.mixer.hc_norm, {W}),
+        dense_attn::ResidentWeight(d, w.mixer.down, {p.hc_lowrank, W}),
+        dense_attn::ResidentWeight(d, w.mixer.up, {W, p.hc_lowrank}),
+        /*block_inject=*/nullptr, args);
+  }
+
+  Qwen4ExpTextModelOutput r;
+  r.tensor = out.t();
+  r.storage = out.ReleaseShared();
+  return r;
+}
+
+}  // namespace vllm

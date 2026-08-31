@@ -104,6 +104,19 @@ Every low-conflict surface shares one property — **one writer per file**:
   inventory are not derivable from any other source. The roadmap's 4 conflicts
   are the insert-point defect, repairable by ordering rather than deletion.
 - `.agents/benchmark-record.md`: append-only and already union-mergeable.
+  **Correction, 2026-08-31, `ENG-RECORD-CONFLICT-SURFACES`.** Both halves of that
+  clause are false, and
+  [`benchmark-record-conflict-surface.md`](benchmark-record-conflict-surface.md)
+  measures why. It is not append-only: 53 of the 222 writes to it (23.9%) are
+  mid-file inserts, head prepends or deletions. It was never union-mergeable
+  either — `merge=union` first entered the tree on 2026-08-15 in `51e0cb5b1`,
+  four days *after* this line was written in `87308dea3`, and the attribute named
+  `.agents/issue-index.md`; this file has never appeared in `.gitattributes` at
+  any commit. `7dc2ef1ea` later deleted the attribute outright. The exoneration
+  itself still stands, because it rests on the conflict rate measured below (2 of
+  29 open pull requests) and not on the merge shape. The clause is annotated
+  rather than deleted because #1373 was derived from it, and a reader who finds
+  it again needs to find this correction with it.
 - The public documents are user-facing and stay. The ratchets on them are the
   defect; the pages are not.
 

@@ -687,7 +687,7 @@ cannot be unique by construction.
   ships the interim regular expression, its measured spelling list, its declared
   blind spots and its declared over-match. Filed with all four rounds' evidence,
   because "we kept finding more spellings" is the argument for it. Indexed in
-  [`issue-index.md`](../issue-index.md) with no owning row, which is why it is
+  [`issue-index.md`](../completed/issue-index.md) with no owning row, which is why it is
   listed here.
 
 ## Now

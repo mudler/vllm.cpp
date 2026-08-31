@@ -45,6 +45,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "vllm/entrypoints/model_loader.h"
@@ -356,4 +357,53 @@ TEST_CASE("#1946: a post-rebind read of the draft's OWN tensor refuses BY NAME")
   CHECK_THROWS_WITH_AS(Upload(draft->weights.embed_tokens),
                        doctest::Contains("resident weight: EMPTY tensor"),
                        std::runtime_error);
+}
+
+// ─── MODEL-MM-QWEN4-EXP W5r (#2031): the staging arm's LAYOUT audit guard ────
+
+TEST_CASE(
+    "#2031: an elem_kn_repacked weight is REFUSED at device staging, by name") {
+  // THE GUARD THIS CASE EXISTS FOR, and why it lives in THIS file. W5r taught
+  // the shared `dense_attn::ResidentWeight` to carry `repacked` and
+  // `elem_kn_repacked` across on the host-alias arm, mirroring the private copy
+  // `qwen3_5.cpp` has always had (:1055, :1060). That fix has a hole the
+  // private copy closes and the shared one did not: the STAGING arm below it
+  // uploads bytes verbatim and returns a tensor WITHOUT either marker, so a
+  // `[K,N]`-transposed weight reaching a device would be read as plain `[N,K]`
+  // and produce garbage with no crash and no refusal.
+  //
+  // Only the CPU `MatmulBTKernel` honours `elem_kn_repacked`, and
+  // `VT_CPU_ELEM_KN_REPACK` is a CPU-only load transform whose policy cannot
+  // see the device, so the staging arm is the one place the invariant can be
+  // enforced. `qwen3_5.cpp:1070-1072` states the same rule in the same words.
+  //
+  // AND IT IS ONLY REACHABLE HERE. `ResidentWeight` takes the alias branch on
+  // `is_cpu()`, so on this x86 host no CPU-queue caller can enter the staging
+  // arm at all. This file already registers `FakeDevicePlatform` on `kXPU` with
+  // `needs_weight_staging() == true` precisely so that branch can be driven,
+  // which is why the gate for a shared-helper guard sits in the dflash2 suite
+  // rather than beside the qwen4_exp cases that motivated the fix.
+  OwnedTensor w = MakeTable(/*tag=*/3);
+  w.elem_kn_repacked = true;
+
+  // TWO-SIDED, by capture rather than by a single containment: one
+  // `Contains` passes on a message that names the right transform for the wrong
+  // reason, or fires the unrelated EMPTY-tensor refusal this arm also carries.
+  std::string msg;
+  try {
+    Upload(w);
+    FAIL("an elem_kn_repacked weight was staged to a device");
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  INFO("refusal: ", msg);
+  CHECK(msg.find("elem_kn_repacked") != std::string::npos);
+  CHECK(msg.find("CPU-only load transform") != std::string::npos);
+
+  // THE OTHER POLARITY, so the guard cannot be "always refuse", which would
+  // break device staging for the 25 models that inherit this helper and never
+  // set the marker.
+  OwnedTensor plain = MakeTable(/*tag=*/4);
+  CHECK_FALSE(plain.elem_kn_repacked);
+  CHECK_NOTHROW(Upload(plain));
 }

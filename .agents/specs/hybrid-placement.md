@@ -437,6 +437,33 @@ gets mistakenly called done. W5 and W0 therefore stay `OPEN` in this table, the
 `## Now` section states them, and `docs/FEATURES.md` may not carry a ✅ for
 this capability until one of them lands.
 
+### W3d — the fp4 refusal, restored AT THE SEAM ([#2309](https://github.com/mudler/vllm.cpp/issues/2309))
+
+`RunMoeBlockPlaced` refused to place a layer whose routed experts are
+fp4-resident. W3c moved every architecture onto the shared seam and did not
+carry that refusal across; the old helper became dead code and the live path
+accepted the arm.
+
+Placing an fp4-resident arm uploads every expert at load and then computes on
+the host across the bus, which is slower than not placing. **A token gate cannot
+see it** — the tokens stay correct and only the placement is wrong — so nothing
+in this tree would have reported it.
+
+The refusal now lives on the seam itself as a `placeable` / `unplaceable_reason`
+contract, not in each caller, so a newly wired architecture inherits it instead
+of having to remember it. It fires only when a placement is actually in force
+(`placed_on != engine_device`), so an ordinary unplaced load is untouched — a
+guard that fired there would break every load, which is the opposite failure and
+just as bad.
+
+Proved by mutation, not by reading: with the guard rewritten to never fire and
+still compiling clean (rc=0, zero errors), `test_device_placement` goes red at 1
+case and 2 assertions. The first attempt at this mutation FAILED TO COMPILE
+under `-Werror` on the now-unused parameters, and the stale binary reported
+19/19 SUCCESS — a passing mutant that proved nothing. The compiling mutant is
+the evidence; the build's exit code is part of it.
+
+
 ## Risks and decisions
 
 - **The bandwidth ratio is assumed, not measured.** Every number in that table comes
@@ -519,13 +546,28 @@ when all three have landed, not when this one does.
   different spelling; **DeepSeek-V4** runs its experts on the host from host
   weights, where a placement has nothing to move; and GLM-5-Next, dots3-note,
   Kimi-K3 and qwen4_exp have no reachable MoE forward at all yet.
-- **W3b's forward BRANCH is not test-driven, though the helper it calls is.**
-  `RunMoeBlockPlaced` executes under `test_placed_moe_roundtrip`, byte-identical
-  to the direct call and mutation-proven. The `RunMoeLayer` branch that SELECTS
-  it cannot be entered by any test here, because selecting it needs the engine
-  device and the placement device to differ. That is the Vulkan gate this row
-  owes: a Vulkan engine with the routed experts on the CPU, token-exact against
-  the same model run wholly on the CPU.
+- **W3b's forward branch is not test-driven, and since 2026-08-30 NEITHER IS THE
+  TRANSFER IT CALLS** (#2345). This bullet used to say `RunMoeBlockPlaced`
+  executed under `test_placed_moe_roundtrip`, byte-identical to the direct call
+  and mutation-proven. Both halves are now false: `866075b2f` (#2309) deleted the
+  helper once W3c had made it dead, and `6416aab85` (#2331) deleted the test,
+  which was calling a symbol that no longer existed and had stopped `main`
+  building.
+
+  **So there is no byte-for-byte gate on the placement round trip at all**, and
+  the reason it cannot simply be rewritten is structural rather than
+  circumstantial. `RunMoePlaced` short-circuits when the placement device equals
+  the engine device -- `if (placed_on == engine_device) return body(engine, dh);`,
+  no copy and no allocation -- so the transfer is reachable ONLY cross-device.
+  The deleted test had reached it by passing `kCPU` as the placement device
+  explicitly, which the seam no longer accepts. The gate is recorded under
+  `## Owed` in [expert-stream-device-slots.md](expert-stream-device-slots.md).
+
+  The `RunMoeLayer` branch that SELECTS the placement cannot be entered by any
+  test here either, for the same reason: it needs the engine device and the
+  placement device to differ. That is the Vulkan gate this row owes -- a Vulkan
+  engine with the routed experts on the CPU, token-exact against the same model
+  run wholly on the CPU -- and it now covers the transfer as well as the branch.
 - ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
   the plan in `RunMoeLayer`.
 - **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as

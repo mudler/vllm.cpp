@@ -342,6 +342,30 @@ struct DeviceWeightFit {
 // `policy_forces_full_expand` — see `GgufStagedWeightFootprint`, which this
 // forwards to unchanged. Default `false` keeps this function's own existing
 // callers and tests byte-for-byte unchanged.
+// MODEL-TEXT-GLM-MOE-DSA W3 (#2214, spec §3.3). The streamed-expert lane's
+// DECODE GEOMETRY, read off the same file the lane will serve, so the capacity
+// refusal in `expert_stream_seam.h` and the towers the forward actually streams
+// cannot disagree about a checkpoint.
+//
+// WHY BOTH TERMS COME FROM THE FILE. `streamed_tower_count` uses the SAME suffix
+// predicate as `GgufLargestExpertSliceBytes` and `GgufExpertTowersReachSlotLane`
+// above, so it counts exactly the tensors the lane admits — for a gate/up/down
+// MoE that is `moe_layers * 3`, which is the arithmetic §3.3 states without
+// having to be told the layer count. `experts_per_tok` is `<arch>.expert_used_count`,
+// the key every llama.cpp MoE export writes and every GGUF config parser in this
+// tree already reads.
+//
+// A term this function could not determine is left at 0, and 0 is the caller's
+// signal that the geometry is unknown rather than that it is small. The refusal
+// is inert on a zero for exactly that reason: a checkpoint whose metadata this
+// function did not understand must not be refused BY a number it invented.
+struct GgufExpertLaneGeometry {
+  int64_t streamed_tower_count = 0;
+  int64_t experts_per_tok = 0;
+};
+GgufExpertLaneGeometry GgufStreamedExpertLaneGeometry(
+    const GgufFile& gguf, std::string_view tensor_name_suffix);
+
 DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      std::string_view device_name,
                                      bool needs_weight_staging,

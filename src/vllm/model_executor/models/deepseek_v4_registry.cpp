@@ -108,6 +108,23 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
                                           input.attn_meta, input.attn_kv, weights,
                                           input.queue, input.logits_indices);
   }
+  // KV-DSV4-MULTICACHE W5 (#2323): the runner handed us a name-keyed cache set,
+  // so consume it instead of recomputing the prefix every step.
+  if (input.multi_kv != nullptr) {
+    std::vector<vt::Tensor> pages;
+    const std::string refusal = ResolveDeepseekV4SwaPages(
+        weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
+        input.queue.device, &pages);
+    VT_CHECK(refusal.empty(), refusal);
+    const int64_t kv_base =
+        input.attn_meta.num_computed_tokens_cpu.empty()
+            ? 0
+            : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
+    return HostLogits(
+        DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, input.token_ids,
+                                   input.positions, input.logits_indices),
+        weights.params.vocab_size);
+  }
   return HostLogits(
       DeepseekV4Model::Forward(input.token_ids, input.positions, input.attn_meta,
                                input.attn_kv, weights, input.queue,
@@ -122,6 +139,11 @@ const ModelFactory kDeepseekV4Factory{
     .forward = &ForwardDeepseekV4ForCausalLM,
     .make_kv_cache = &MakeDeepseekV4KVCache,
     .is_dense_model = false,
+    // KV-DSV4-MULTICACHE W5 (#2323): this forward consumes a cache set keyed by
+    // layer name. Declaring it is what stops `ModelRegistry::Forward` refusing
+    // the topology -- and the adapter above refuses by name every shape it
+    // cannot serve, so the guard moves rather than disappearing.
+    .consumes_multi_kv = true,
 };
 
 }  // namespace

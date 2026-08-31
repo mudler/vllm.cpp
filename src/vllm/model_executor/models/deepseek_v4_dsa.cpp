@@ -2,6 +2,12 @@
 // See deepseek_v4_dsa.h for the full port map (file:line on both sides).
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 
+// For `HostBf16ToF32`, the inlined carried-tower widening `Wf` uses below.
+// No cycle: `deepseek_v4_dsa.h` includes only <cstdint> and <vector>, and
+// `deepseek_v4.h` does not include it back.
+#include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -133,9 +139,22 @@ std::vector<float> SoftmaxWithSink(const std::vector<float>& scores, float sink)
   return prob;
 }
 
+// `Wf` is the ONE place the weight dtype is widened. On `float` it is the identity,
+// so the f32 arm compiles to exactly what it compiled to before W1d; on `uint16_t`
+// it is `HostBf16ToF32`, the INLINE header helper (`deepseek_v4.h`) that performs
+// `vt::BF16ToF32`'s bit operation without the out-of-line call this build cannot
+// inline away -- see W1d-5, and the exhaustive 65536-pattern agreement case.
+inline float Wf(float w) { return w; }
+inline float Wf(uint16_t w) { return HostBf16ToF32(w); }
+
+// One body, two weight dtypes (W1d, #2186). `Wf` widens a bf16 bit pattern the
+// same way `vt::BF16ToF32` does and is the identity on f32, so the f32 arm is
+// BYTE-FOR-BYTE the pre-W1d function and the bf16 arm differs only in the weight
+// elements themselves. Accumulators and reduction order are shared.
+template <typename W>
 std::vector<float> GroupedOutputLora(const std::vector<float>& o,
-                                     const std::vector<float>& wo_a,
-                                     const std::vector<float>& wo_b,
+                                     const std::vector<W>& wo_a,
+                                     const std::vector<W>& wo_b,
                                      int64_t num_tokens, int64_t n_heads,
                                      int64_t head_dim, int64_t n_groups,
                                      int64_t o_lora_rank, int64_t hidden_size) {
@@ -160,12 +179,12 @@ std::vector<float> GroupedOutputLora(const std::vector<float>& o,
     // z[g, d] = sum_r wo_a[g, d, r] * o_group[g, r]  (per-group einsum "bhr,hdr->bhd")
     for (int64_t g = 0; g < n_groups; ++g) {
       const float* o_g = o_t + g * in_per_group;
-      const float* wa_g = &wo_a[g * o_lora_rank * in_per_group];
+      const W* wa_g = &wo_a[g * o_lora_rank * in_per_group];
       float* z_g = &z[g * o_lora_rank];
       for (int64_t d = 0; d < o_lora_rank; ++d) {
         float acc = 0.0f;
-        const float* wa_gd = wa_g + d * in_per_group;
-        for (int64_t r = 0; r < in_per_group; ++r) acc += wa_gd[r] * o_g[r];
+        const W* wa_gd = wa_g + d * in_per_group;
+        for (int64_t r = 0; r < in_per_group; ++r) acc += Wf(wa_gd[r]) * o_g[r];
         z_g[d] = acc;
       }
     }
@@ -173,12 +192,247 @@ std::vector<float> GroupedOutputLora(const std::vector<float>& o,
     float* out_t = &out[t * hidden_size];
     for (int64_t h = 0; h < hidden_size; ++h) {
       float acc = 0.0f;
-      const float* wb_h = &wo_b[h * z_dim];
-      for (int64_t c = 0; c < z_dim; ++c) acc += wb_h[c] * z[static_cast<size_t>(c)];
+      const W* wb_h = &wo_b[h * z_dim];
+      for (int64_t c = 0; c < z_dim; ++c) acc += Wf(wb_h[c]) * z[static_cast<size_t>(c)];
       out_t[h] = acc;
     }
   }
   return out;
+}
+
+// Both arms are instantiated HERE rather than left implicit, so a caller that
+// needs a third weight dtype fails to link instead of silently instantiating a
+// body whose numerics nobody reviewed.
+template std::vector<float> GroupedOutputLora<float>(const std::vector<float>&,
+                                                     const std::vector<float>&,
+                                                     const std::vector<float>&, int64_t,
+                                                     int64_t, int64_t, int64_t, int64_t,
+                                                     int64_t);
+template std::vector<float> GroupedOutputLora<uint16_t>(const std::vector<float>&,
+                                                        const std::vector<uint16_t>&,
+                                                        const std::vector<uint16_t>&,
+                                                        int64_t, int64_t, int64_t, int64_t,
+                                                        int64_t, int64_t);
+
+
+// KV-DSV4-MULTICACHE W5 (#2323). See the header for the batch<-T mapping.
+std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<float>& q,
+                                           vt::Tensor& kv_cache, int64_t num_blocks,
+                                           int64_t block_size, int64_t num_tokens,
+                                           int64_t num_heads, int64_t head_dim,
+                                           int64_t kv_base, const std::vector<float>& sink,
+                                           float scale, bool no_sink,
+                                           int64_t sliding_window,
+                                           std::vector<float>* out_lse) {
+  VT_CHECK(num_tokens > 0 && num_heads > 0 && head_dim > 0,
+           "PagedCausalMlaAttention: num_tokens/num_heads/head_dim must be > 0");
+  VT_CHECK(static_cast<int64_t>(q.size()) == num_tokens * num_heads * head_dim,
+           "PagedCausalMlaAttention: q must be [T, num_heads, head_dim]");
+  VT_CHECK(static_cast<int64_t>(sink.size()) == num_heads,
+           "PagedCausalMlaAttention: sink must be [num_heads]");
+
+  // `seq_lens[t] = kv_base + t + 1` IS the causal mask: query t's global position
+  // is `kv_base + t` and it may see `[0, kv_base + t]`, which is that many keys.
+  std::vector<int32_t> seq_lens(static_cast<size_t>(num_tokens));
+  for (int64_t t = 0; t < num_tokens; ++t)
+    seq_lens[static_cast<size_t>(t)] = static_cast<int32_t>(kv_base + t + 1);
+
+  // Every query row reads the SAME pages, so the table is one row repeated. The
+  // op indexes it per batch row, so this cannot be a single shared row.
+  std::vector<int32_t> block_table(static_cast<size_t>(num_tokens * num_blocks));
+  for (int64_t b = 0; b < num_tokens; ++b)
+    for (int64_t i = 0; i < num_blocks; ++i)
+      block_table[static_cast<size_t>(b * num_blocks + i)] = static_cast<int32_t>(i);
+
+  // The `kNoAttnSink` miswire feeds -inf, which adds nothing to the denominator
+  // and is therefore EXACTLY "no sink" rather than an approximation of it.
+  std::vector<float> sink_v = sink;
+  if (no_sink)
+    for (float& sv : sink_v) sv = -std::numeric_limits<float>::infinity();
+
+  std::vector<float> out(static_cast<size_t>(num_tokens) * num_heads * head_dim, 0.0f);
+  const vt::Device dev = queue.device;
+  vt::Tensor t_out =
+      vt::Tensor::Contiguous(out.data(), vt::DType::kF32, dev, {num_tokens, num_heads, head_dim});
+  vt::Tensor t_q = vt::Tensor::Contiguous(const_cast<float*>(q.data()), vt::DType::kF32, dev,
+                                          {num_tokens, num_heads, head_dim});
+  vt::Tensor t_bt = vt::Tensor::Contiguous(block_table.data(), vt::DType::kI32, dev,
+                                           {num_tokens, num_blocks});
+  vt::Tensor t_sl =
+      vt::Tensor::Contiguous(seq_lens.data(), vt::DType::kI32, dev, {num_tokens});
+  vt::Tensor t_sink =
+      vt::Tensor::Contiguous(sink_v.data(), vt::DType::kF32, dev, {num_heads});
+  (void)block_size;
+
+  vt::MlaDecodeAttentionArgs args;
+  args.scale = scale;
+  args.attn_sink = &t_sink;
+  // The op's convention is `left == sliding_window - 1` (an INCLUSIVE distance),
+  // and `right == 0` because a decode query is the last position of its own
+  // sequence. Absent (0) the kernel keeps its full-prefix loop byte-identically.
+  if (sliding_window > 0)
+    args.window_size =
+        vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
+  vt::Tensor t_lse;
+  if (out_lse != nullptr) {
+    out_lse->assign(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_heads), 0.0f);
+    t_lse = vt::Tensor::Contiguous(out_lse->data(), vt::DType::kF32, dev,
+                                   {num_tokens, num_heads});
+  }
+  vt::MlaDecodeAttention(queue, t_out, out_lse != nullptr ? &t_lse : nullptr, t_q, kv_cache,
+                         t_bt, t_sl, args);
+  return out;
+}
+
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286). See the header for why no sink appears here.
+std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
+                                            const std::vector<float>& window_out,
+                                            const std::vector<float>& window_lse,
+                                            const std::vector<float>& q,
+                                            const std::vector<float>& comp_rows,
+                                            int64_t n_rows, int64_t num_tokens,
+                                            int64_t num_heads, int64_t head_dim,
+                                            float scale) {
+  VT_CHECK(n_rows > 0, "MergeWindowAndCompressed: no compressed rows");
+  VT_CHECK(static_cast<int64_t>(comp_rows.size()) == n_rows * head_dim,
+           "MergeWindowAndCompressed: comp_rows must be [n_rows, head_dim]");
+  const int64_t TH = num_tokens * num_heads;
+  VT_CHECK(static_cast<int64_t>(window_out.size()) == TH * head_dim,
+           "MergeWindowAndCompressed: window_out must be [T, num_heads, head_dim]");
+  VT_CHECK(static_cast<int64_t>(window_lse.size()) == TH,
+           "MergeWindowAndCompressed: window_lse must be [T * num_heads]");
+
+  // The compressed rows are their own paged cache: one block wide enough to hold
+  // them all, every row visible to every query.
+  const int64_t block_size = 16;
+  const int64_t num_blocks = (n_rows + block_size - 1) / block_size;
+  std::vector<float> cache(static_cast<size_t>(num_blocks * block_size * head_dim), 0.0f);
+  std::copy(comp_rows.begin(), comp_rows.end(), cache.begin());
+
+  const vt::Device dev = queue.device;
+  std::vector<int32_t> bt(static_cast<size_t>(num_tokens * num_blocks));
+  for (int64_t b = 0; b < num_tokens; ++b)
+    for (int64_t i = 0; i < num_blocks; ++i)
+      bt[static_cast<size_t>(b * num_blocks + i)] = static_cast<int32_t>(i);
+  // EVERY query sees EVERY compressed row: a closed window is history, so there
+  // is no causal bound to apply among them.
+  std::vector<int32_t> sl(static_cast<size_t>(num_tokens), static_cast<int32_t>(n_rows));
+  std::vector<float> comp_out(static_cast<size_t>(TH) * head_dim, 0.0f);
+  std::vector<float> comp_lse(static_cast<size_t>(TH), 0.0f);
+
+  vt::Tensor t_c = vt::Tensor::Contiguous(cache.data(), vt::DType::kF32, dev,
+                                          {num_blocks, block_size, head_dim});
+  vt::Tensor t_q = vt::Tensor::Contiguous(const_cast<float*>(q.data()), vt::DType::kF32, dev,
+                                          {num_tokens, num_heads, head_dim});
+  vt::Tensor t_bt = vt::Tensor::Contiguous(bt.data(), vt::DType::kI32, dev,
+                                           {num_tokens, num_blocks});
+  vt::Tensor t_sl = vt::Tensor::Contiguous(sl.data(), vt::DType::kI32, dev, {num_tokens});
+  vt::Tensor t_co = vt::Tensor::Contiguous(comp_out.data(), vt::DType::kF32, dev,
+                                           {num_tokens, num_heads, head_dim});
+  vt::Tensor t_cl = vt::Tensor::Contiguous(comp_lse.data(), vt::DType::kF32, dev,
+                                           {num_tokens, num_heads});
+  vt::MlaDecodeAttentionArgs args;
+  args.scale = scale;
+  // NO `attn_sink` — see the header. The window pass owns it.
+  vt::MlaDecodeAttention(queue, t_co, &t_cl, t_q, t_c, t_bt, t_sl, args);
+
+  std::vector<float> merged(static_cast<size_t>(TH) * head_dim, 0.0f);
+  vt::Tensor t_out = vt::Tensor::Contiguous(merged.data(), vt::DType::kF32, dev,
+                                            {num_tokens, num_heads, head_dim});
+  vt::Tensor t_wo = vt::Tensor::Contiguous(const_cast<float*>(window_out.data()),
+                                           vt::DType::kF32, dev,
+                                           {num_tokens, num_heads, head_dim});
+  // `MergeAttnStates` wants the LSEs as `[H, num_tokens]`; both buffers hold
+  // `T * H` contiguous f32, so this is a reshape rather than a transpose only
+  // because a decode step carries one token per row -- asserted, not assumed.
+  VT_CHECK(num_tokens == 1 || num_heads == 1,
+           "MergeWindowAndCompressed: the LSE layouts coincide only when T or H is "
+           "1; a general step needs a transpose here");
+  vt::Tensor t_wl = vt::Tensor::Contiguous(const_cast<float*>(window_lse.data()),
+                                           vt::DType::kF32, dev, {num_heads, num_tokens});
+  vt::Tensor t_cl2 = vt::Tensor::Contiguous(comp_lse.data(), vt::DType::kF32, dev,
+                                            {num_heads, num_tokens});
+  vt::MergeAttnStates(queue, t_out, nullptr, t_wo, t_wl, t_co, t_cl2, -1);
+  return merged;
+}
+
+std::vector<float> CompressorLayerStep(
+    vt::Queue& queue, const std::vector<float>& x, const std::vector<float>& kv,
+    const std::vector<float>& q, const std::vector<float>& comp_wgate,
+    const std::vector<float>& comp_ape, const std::vector<float>& comp_norm_weight,
+    const std::vector<float>& attn_sink, vt::Tensor& window_cache,
+    int64_t num_blocks, int64_t block_size, std::vector<float>* state_kv,
+    std::vector<float>* state_score, std::vector<float>* comp_rows,
+    const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
+    int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
+    int64_t sliding_window, float eps, float scale) {
+  VT_CHECK(compress_ratio == 128,
+           "deepseek-v4 compressor step: this is the coff == 1 shape only; "
+           "compress_ratio 4 is coff == 2 and belongs to W3 (#2286)");
+  VT_CHECK(state_kv != nullptr && state_score != nullptr && comp_rows != nullptr,
+           "deepseek-v4 compressor step: the state is CARRIED, not owned here");
+  VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
+           "deepseek-v4 compressor step: x must be [num_tokens, hidden]");
+  VT_CHECK(static_cast<int64_t>(kv.size()) == num_tokens * head_dim,
+           "deepseek-v4 compressor step: kv must be [num_tokens, head_dim]");
+  VT_CHECK(static_cast<int64_t>(comp_wgate.size()) == head_dim * hidden,
+           "deepseek-v4 compressor step: comp_wgate is [coff*head_dim, hidden] and "
+           "coff is 1 here");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
+           "deepseek-v4 compressor step: one position per token");
+
+  // THE PREFIX-CACHE GUARD. The compressor pools tokens it has SEEN, so its state
+  // must have seen exactly the `kv_base` tokens this step resumes after. A
+  // prefix-cache hit skips recomputing cached tokens, and those tokens are the
+  // ones whose rows this state would have accumulated -- so after a hit it holds
+  // FEWER rows than the position implies, and the layer would attend a compressed
+  // history with holes in it.
+  //
+  // That failure is invisible: the output stays finite and plausible, and it only
+  // appears on cache hits. Refusing is never wrong here, only limiting, so the
+  // mismatch is refused by name rather than resolved by a policy this row does not
+  // own (`## Owed`).
+  const int64_t seen = static_cast<int64_t>(state_kv->size()) / head_dim;
+  VT_CHECK(seen == kv_base,
+           "deepseek-v4 compressor: the carried state has seen " +
+               std::to_string(seen) + " tokens but this step resumes at kv_base " +
+               std::to_string(kv_base) +
+               ". A prefix-cache hit skipped tokens this state needed, and the "
+               "compressed history would have holes in it. Refusing "
+               "(MODEL-DSV4-DSA-COMPOSE, #2286)");
+
+  // 1. The pool score this layer selects with.
+  std::vector<float> score(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
+  for (int64_t t = 0; t < num_tokens; ++t) {
+    for (int64_t d = 0; d < head_dim; ++d) {
+      double acc = 0.0;
+      const float* w = &comp_wgate[static_cast<size_t>(d * hidden)];
+      const float* xt = &x[static_cast<size_t>(t * hidden)];
+      for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(w[h]) * xt[h];
+      score[static_cast<size_t>(t * head_dim + d)] = static_cast<float>(acc);
+    }
+  }
+
+  // 2-3. Drive the state machine and keep whatever closed this step.
+  const std::vector<float> emitted =
+      CompressorStepCycle(state_kv, state_score, kv, score, comp_ape, positions,
+                          comp_norm_weight, eps, compress_ratio, head_dim);
+  comp_rows->insert(comp_rows->end(), emitted.begin(), emitted.end());
+
+  // 4. The window pass carries the sink and keeps its LSE.
+  std::vector<float> win_lse;
+  const std::vector<float> win_out = PagedCausalMlaAttention(
+      queue, q, window_cache, num_blocks, block_size, num_tokens, num_heads, head_dim,
+      kv_base, attn_sink, scale, /*no_sink=*/false, sliding_window, &win_lse);
+
+  // 5. Nothing closed yet => the window IS the answer. Merging an empty second
+  //    contributor would divide by an empty denominator rather than be a no-op.
+  const int64_t n_rows = static_cast<int64_t>(comp_rows->size()) / head_dim;
+  if (n_rows == 0) return win_out;
+
+  return MergeWindowAndCompressed(queue, win_out, win_lse, q, *comp_rows, n_rows,
+                                  num_tokens, num_heads, head_dim, scale);
 }
 
 }  // namespace vllm::deepseek_v4

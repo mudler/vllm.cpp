@@ -1,0 +1,58 @@
+staging         8887294190 B needed, 2035304263680 B free under /tmp/tower-skip-ckpt
+stage check: source      29 files, 8887294190 B  (/workspace/ckpt/qwen3-vl-4b-instruct)
+stage check: destination 29 files, 8887294190 B  (/tmp/tower-skip-ckpt/qwen3-vl-4b-instruct)
+stage check: OK — every relative path and byte size matches.
+staged to       /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct
+commit          525d2b9911d8762fc002b2d7ea01991b383a9e96
+checkpoint      /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct
+checkpoint src  /workspace/ckpt/qwen3-vl-4b-instruct
+checkpoint fs   overlayfs
+model kind      qwen3-vl
+workload        load-only
+resident tower  830695424 B (== 830695424 B on disk; the tower is stored in the checkpoint's own bf16 since #1359)
+checkpoint root USED: the path above. .env's CHECKPOINT_ROOT was NOT consulted.
+host            Linux rc-worker-4b8lj 6.17.0-1029-nvidia #29-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul  1 00:13:52 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+load            1.49 0.98 0.42 1/878 516
+free            Mem:             119           4         100           0          15         115
+  target             'vllm-server' lives in examples/, gated by VLLM_CPP_BUILD_EXAMPLES, and
+                     these flags pass -DVLLM_CPP_BUILD_EXAMPLES=ON
+  binary path        <build>/examples/vllm-server, which is what the legs run
+  live query         'vllm-server' IS a target in /tmp/tower-skip-build-a
+  live query         'vllm-server' IS a target in /tmp/tower-skip-build-b
+binary A        fbc540431341a1aa452a6d0d9594412a5ef1cab4f79058ebdb995a790fc33da7  /tmp/tower-skip-build-a/examples/vllm-server
+binary B        fbc540431341a1aa452a6d0d9594412a5ef1cab4f79058ebdb995a790fc33da7  /tmp/tower-skip-build-b/examples/vllm-server
+binaries        IDENTICAL
+== warming the page cache (this run is DISCARDED) ==
+leg topology    timer pid 4865 -> server pid 4867  comm='vllm-server'
+                cmdline: /tmp/tower-skip-build-a/examples/vllm-server --model /tmp/tower-skip-ckpt/qwen3-vl-4b-instruct --port 18607 --device cpu 
+                (recorded on the first leg: the teardown signals the
+                 SERVER, so which process this hop resolves to decides
+                 whether the instrument writes a figure at all)
+== A-B then B-A: each binary runs each arm exactly once ==
+
+== pair 1: default vs language-model-only (binary A then binary B) ==
+peak RSS default (default )      9381281792 B     8.737 GiB
+peak RSS lang-model-only (lmo )     8554364928 B     7.967 GiB
+saving                           826916864 B     0.770 GiB  (99% of the resident tower)
+threshold                        747625881 B  (90% of 830695424 B)
+RESULT: MET (this pair).
+
+== pair 2: the SWAPPED assignment (binary B then binary A) ==
+peak RSS default (default2)      9380958208 B     8.737 GiB
+peak RSS lang-model-only (lmo2)     8554381312 B     7.967 GiB
+saving                           826576896 B     0.770 GiB  (99% of the resident tower)
+threshold                        747625881 B  (90% of 830695424 B)
+RESULT: MET (this pair).
+
+pair 1 saving                    826916864 B     0.770 GiB
+pair 2 saving                    826576896 B     0.770 GiB
+mean (estimator, cancels d)      826746880 B     0.770 GiB
+spread |pair 1 - pair 2|            339968 B     0.000 GiB
+leg-to-leg |warmup-default|          24576 B     0.000 GiB
+  (same binary, same arm, one repeat; the warmup leg is COLD, so this is
+   an UPPER BOUND on run-to-run variation, not a calibrated noise band.)
+RESULT: MET (first half, BOTH pairs). Second half — default arm vs the
+  edbc47ce0 binary, within 2% — is a separate run and is NOT
+  asserted here.
+
+logs and all four .time files are under /tmp/tower-skip-out

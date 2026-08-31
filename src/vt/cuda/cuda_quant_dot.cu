@@ -60,8 +60,10 @@ namespace {
 using vt::cpu::BlockIQ1_S;
 using vt::cpu::BlockIQ1_XXXS;
 using vt::cpu::BlockIQ2_S;
+using vt::cpu::BlockIQ2_XS;
 using vt::cpu::BlockIQ2_XXS;
 using vt::cpu::BlockIQ3_XXS;
+using vt::cpu::BlockIQ4_XS;
 using vt::cpu::BlockMXFP4;
 using vt::cpu::BlockQ2_K;
 using vt::cpu::BlockQ3_K;
@@ -462,6 +464,137 @@ __device__ inline float DotIQ2S(const BlockIQ2_S* xb, const BlockQ8_K* yb) {
   return d * bsum;  // final *0.125 applied after the warp reduction
 }
 
+// cpu_quant_dot.cpp VecDotIQ2_XSQ8_K (llama.cpp @ b10451 quants.c:948,
+// `ggml_vec_dot_iq2_xs_q8_K_generic`) — one super-block, and the THIRD sign
+// convention in the IQ2 family. Each `qs` u16 does two jobs at once: its low 9
+// bits index the 512-entry d_iq2xs_grid (`& 511`) and its high 7 bits select a
+// d_ksigns_iq2xs byte (`>> 9`). IQ2_XXS keeps the signs in a separate u32 and
+// IQ2_S in a direct sign byte, so no part of either sibling's decode transfers.
+//
+// The two halves of a sub-block take DIFFERENT scales — `ls1` from the low
+// nibble of `scales[ib32]`, `ls2` from the high one — so upstream folds `sumi`
+// into `bsum` TWICE per sub-block rather than once. That split is the
+// accumulation ORDER and is kept verbatim. The final 0.125 folds the grid's
+// fixed 8x magnitude and is applied ONCE after the warp reduction, via
+// FinalFactor<kIQ2_XS>, exactly as for IQ2_XXS and IQ2_S.
+//
+// Alignment: `qs` is a u16 array at offset 2 of a 74-byte block, and every
+// block address in the GEMM is a 256-B-aligned base plus a multiple of 74, so
+// each u16 read is 2-byte aligned. No 4-byte __dp4a read is taken here.
+__device__ inline float DotIQ2XS(const BlockIQ2_XS* xb, const BlockQ8_K* yb) {
+  const float d = DF16ToF32(xb->d) * yb->d;
+  const uint16_t* q2 = xb->qs;
+  const uint8_t* sc = xb->scales;
+  const int8_t* q8 = yb->qs;
+  int32_t bsum = 0;
+  for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
+    const int ls1 = 2 * (sc[ib32] & 0xf) + 1;
+    const int ls2 = 2 * (sc[ib32] >> 4) + 1;
+    int32_t sumi = 0;
+    for (int l = 0; l < 2; ++l) {
+      const uint8_t* grid =
+          reinterpret_cast<const uint8_t*>(&d_iq2xs_grid[q2[l] & 511]);
+      const uint8_t signs = d_ksigns_iq2xs[q2[l] >> 9];
+      for (int j = 0; j < 8; ++j)
+        sumi += grid[j] * q8[j] * ((signs & d_kmask_iq2xs[j]) ? -1 : 1);
+      q8 += 8;
+    }
+    bsum += sumi * ls1;
+    sumi = 0;
+    for (int l = 2; l < 4; ++l) {
+      const uint8_t* grid =
+          reinterpret_cast<const uint8_t*>(&d_iq2xs_grid[q2[l] & 511]);
+      const uint8_t signs = d_ksigns_iq2xs[q2[l] >> 9];
+      for (int j = 0; j < 8; ++j)
+        sumi += grid[j] * q8[j] * ((signs & d_kmask_iq2xs[j]) ? -1 : 1);
+      q8 += 8;
+    }
+    bsum += sumi * ls2;
+    q2 += 4;
+  }
+  return d * bsum;  // final *0.125 applied after the warp reduction
+}
+
+// cpu_quant_dot.cpp VecDotIQ4_XSQ8_K (llama.cpp @ b10451 quants.c:1283,
+// `ggml_vec_dot_iq4_xs_q8_K_generic`). IQ4_XS shares IQ4_NL's 16-entry
+// d_kvalues_iq4nl codebook and NOT its activation pairing: its block is a
+// 256-element SUPER-block, so it dots Q8_K where IQ4_NL dots Q8_0
+// (type_traits_cpu at ggml-cpu.c:385-390 against :379-384). That is read off the
+// oracle, not inferred from the shared codebook, and getting it wrong is how
+// this encoding has been mis-ported before.
+//
+// The `ib` loop steps by TWO because one `scales_l` byte serves two sub-blocks
+// and `h` is consumed 4 bits in the same step. UNLIKE every other dot in this
+// file there is no single integer core: `d1`/`d2` are formed as f32 BEFORE the
+// integer sums fold in, and each sub-block contributes its own `sumf +=`, so a
+// super-block is EIGHT f32 accumulation steps. That association is upstream's,
+// it is what the pinned oracle's golden numbers were produced with, and it is
+// kept rather than hoisted into one integer accumulator — which would be a
+// faster kernel computing a different number. FinalFactor<kIQ4_XS> is 1.
+//
+// ─── WHY __fmul_rn/__fadd_rn AND NOT `sumf += d1 * x` ───────────────────────
+// Because nvcc CONTRACTS that expression into an FMA (-fmad=true is the
+// default), and an FMA rounds ONCE where upstream rounds twice. That is not a
+// tolerance question, it is the association above being silently replaced: the
+// paragraph promising upstream's eight accumulation steps was true of the
+// source and false of the SASS.
+//
+// MEASURED, not feared. The first sm_121a run of this kernel disagreed with the
+// pinned oracle on exactly two of eight real checkpoint super-blocks, by 1 and
+// 4 ULP, while IQ2_XS was bit-exact everywhere — the split an FMA predicts,
+// because IQ2_XS's core is integer with a single final multiply and has nothing
+// to contract. Recomputing those same blocks on the host with `std::fma` at
+// this line reproduced the device's bits EXACTLY (0xBFC39E59 and 0x3E173708)
+// and left the other two blocks equal to the oracle, which identifies the cause
+// with no free parameters left over.
+//
+// `__fmul_rn` and `__fadd_rn` are the round-to-nearest primitives nvcc is not
+// permitted to fuse, so they restore upstream's rounding exactly. Scoped to
+// THIS kernel rather than fixed with `-fmad=false` on the translation unit,
+// which would change the numerics of ten other encodings that no one measured.
+// Q4_K and Q5_K end in `d * isum - dmin * sumi`, which is contractable the same
+// way; they are gated against the CPU at NMSE and not bit-exactly, so nothing
+// here has ever been able to see it. Recorded in the row's spec, not fixed
+// here.
+//
+// Alignment: `d` and `scales_h` are u16 at offsets 0 and 2 of a 136-byte block,
+// so both are 2-byte aligned wherever the GEMM addresses a block.
+__device__ inline float DotIQ4XS(const BlockIQ4_XS* xb, const BlockQ8_K* yb) {
+  const float d4d8 = DF16ToF32(xb->d) * yb->d;
+  uint16_t h = xb->scales_h;
+  const uint8_t* qs = xb->qs;
+  const int8_t* q8 = yb->qs;
+  float sumf = 0.0f;
+  for (int ib = 0; ib < kQK_K / 32; ib += 2) {
+    const uint8_t ls1 =
+        static_cast<uint8_t>((xb->scales_l[ib / 2] & 0xf) | ((h << 4) & 0x30));
+    const uint8_t ls2 =
+        static_cast<uint8_t>((xb->scales_l[ib / 2] >> 4) | ((h << 2) & 0x30));
+    h = static_cast<uint16_t>(h >> 4);
+    const float d1 = d4d8 * (ls1 - 32);
+    const float d2 = d4d8 * (ls2 - 32);
+    int sumi1 = 0;
+    int sumi2 = 0;
+    for (int j = 0; j < 16; ++j) {
+      sumi1 += q8[j + 0] * d_kvalues_iq4nl[qs[j] & 0xf];
+      sumi2 += q8[j + 16] * d_kvalues_iq4nl[qs[j] >> 4];
+    }
+    sumf = __fadd_rn(sumf, __fmul_rn(d1, static_cast<float>(sumi1 + sumi2)));
+    qs += 16;
+    q8 += 32;
+    sumi1 = 0;
+    sumi2 = 0;
+    for (int j = 0; j < 16; ++j) {
+      sumi1 += q8[j + 0] * d_kvalues_iq4nl[qs[j] & 0xf];
+      sumi2 += q8[j + 16] * d_kvalues_iq4nl[qs[j] >> 4];
+    }
+    sumf = __fadd_rn(sumf, __fmul_rn(d2, static_cast<float>(sumi1 + sumi2)));
+    qs += 16;
+    q8 += 32;
+  }
+  return sumf;
+}
+
 // cpu_quant_dot.cpp VecDotMXFP4Q8_0 (quants.c:247) — one MXFP4 (32-elem) block
 // dotted against ONE Q8_0 activation block. BOX-DEFERRED / NOT YET WIRED into a
 // GEMM: the templated GEMM below is Q8_K-activation-only (its DotSuperblock takes
@@ -708,6 +841,10 @@ enum class WType : int {
   kIQ2_S = 7,  // UD-IQ2_M ffn_gate/up (Q8_K activation, fits this GEMM)
   kIQ1_S = 8,     // Qwen3.8-2.4T UD-IQ1_S routed experts (96.92 % of it)
   kIQ1_XXXS = 9,  // Qwen3.8-2.4T UD-Q1_0 routed experts (96.92 % of it)
+  kIQ2_XS = 10,   // GLM-5.3-Flash UD-Q2_K_XL ffn_gate/up_exps (82 of 1412 tensors)
+  kIQ4_XS = 11,   // GLM-5.3-Flash ffn_down_exps + the GLM-5.3 UD-IQ1_S arm's last
+                  // uncovered encoding. Shares IQ4_NL's codebook, NOT its Q8_0
+                  // activation: a 256-element super-block dots Q8_K.
   // NOTE: MXFP4 is intentionally ABSENT — it dots against a 32-element Q8_0
   // activation, not Q8_K, so it cannot slot into this Q8_K super-block GEMM
   // (see DotMXFP4). It CPU-fallbacks until a Q8_0-activation GEMM variant lands.
@@ -755,10 +892,21 @@ template <>
 __device__ inline float DotSuperblock<WType::kIQ1_XXXS>(const void* w, const BlockQ8_K* a) {
   return DotIQ1XXXS(static_cast<const BlockIQ1_XXXS*>(w), a);
 }
+template <>
+__device__ inline float DotSuperblock<WType::kIQ2_XS>(const void* w, const BlockQ8_K* a) {
+  return DotIQ2XS(static_cast<const BlockIQ2_XS*>(w), a);
+}
+template <>
+__device__ inline float DotSuperblock<WType::kIQ4_XS>(const void* w, const BlockQ8_K* a) {
+  return DotIQ4XS(static_cast<const BlockIQ4_XS*>(w), a);
+}
 
 template <WType W>
 __device__ constexpr float FinalFactor() {
-  return (W == WType::kIQ2_XXS || W == WType::kIQ2_S)
+  // IQ2_XS joins its two siblings at 0.125: all three codebooks store lanes at
+  // a fixed 8x magnitude. IQ4_XS does NOT — its per-sub-block delta is already
+  // folded in as `d * (ls - 32)` inside the dot — so it takes the 1.0 default.
+  return (W == WType::kIQ2_XXS || W == WType::kIQ2_S || W == WType::kIQ2_XS)
              ? 0.125f
              : (W == WType::kIQ3_XXS ? 0.25f : 1.0f);
 }
@@ -1600,6 +1748,20 @@ bool IsCudaKeepQuantSupported(DType dt, WType* out) {
     // can see. That is why they are here and not left owed.
     case DType::kIQ1_S: *out = WType::kIQ1_S; return true;
     case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
+    // QUANT-CUDA-IQ4XS-IQ2XS (#2260). Without these two the GLM-5.3-Flash
+    // UD-Q2_K_XL artifact's 82 IQ2_XS + 3 IQ4_XS tensors drained the stream and
+    // ran their expert GEMM on the host, and the fused MoE seam below THREW
+    // outright, which is why that model shipped as `--device cpu`.
+    //
+    // The fallback below is worse than "slow but correct", and this is MEASURED
+    // rather than read off its own comment: `Backend::Alloc` on CUDA is a plain
+    // `cudaMalloc`, so its pointers are not host-addressable, and the CPU kernel
+    // dereferencing them SEGFAULTS. A GB10 run of this file's gate at the commit
+    // before these two lines died with SIGSEGV in the first case. Unified
+    // PHYSICAL memory is not the same thing as a host-mapped pointer. IQ4_XS alone also completes the
+    // GLM-5.3 non-flash UD-IQ1_S arm, whose other five encodings are all above.
+    case DType::kIQ2_XS: *out = WType::kIQ2_XS; return true;
+    case DType::kIQ4_XS: *out = WType::kIQ4_XS; return true;
     // MXFP4 (Q8_0-activation, 32-elem blocks) is NOT handled by this Q8_K GEMM;
     // it falls through to CPU like Q4_0 / Q8_0 until a Q8_0-activation GEMM lands.
     // Q5_0 and IQ4_NL join them: both are 32-element Q8_0-activation encodings.
@@ -1873,6 +2035,8 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
     case WType::kIQ2_S: LaunchGemm<WType::kIQ2_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ1_S: LaunchGemm<WType::kIQ1_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ1_XXXS: LaunchGemm<WType::kIQ1_XXXS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ2_XS: LaunchGemm<WType::kIQ2_XS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ4_XS: LaunchGemm<WType::kIQ4_XS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     // See the identical arm in MatmulBTQuantGroupedKernelCuda below: past the
     // IsCudaKeepQuantSupported gate there is no CPU fallback left, so a missing
     // case launches nothing, leaves `out` untouched, and CheckCuda still reports
@@ -1966,6 +2130,8 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
     case WType::kIQ2_S: LaunchGroupedGemm<WType::kIQ2_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kIQ1_S: LaunchGroupedGemm<WType::kIQ1_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kIQ1_XXXS: LaunchGroupedGemm<WType::kIQ1_XXXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ2_XS: LaunchGroupedGemm<WType::kIQ2_XS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ4_XS: LaunchGroupedGemm<WType::kIQ4_XS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     // IsCudaKeepQuantSupported already answered yes, so the CPU fallback above is
     // skipped. A `w` with no case here launches NOTHING, leaves `out` exactly as
     // the caller left it, and the CheckCuda below reports SUCCESS because there
@@ -2014,6 +2180,8 @@ void SnapshotIqTablesFromDevice(IqTableSnapshot* out) {
   static_assert(sizeof(out->iq2xxs_grid) == sizeof(d_iq2xxs_grid), "iq2xxs grid extent");
   static_assert(sizeof(out->iq3xxs_grid) == sizeof(d_iq3xxs_grid), "iq3xxs grid extent");
   static_assert(sizeof(out->iq2s_grid) == sizeof(d_iq2s_grid), "iq2s grid extent");
+  static_assert(sizeof(out->iq2xs_grid) == sizeof(d_iq2xs_grid), "iq2xs grid extent");
+  static_assert(sizeof(out->kvalues_iq4nl) == sizeof(d_kvalues_iq4nl), "iq4nl values extent");
   static_assert(sizeof(out->kvalues_mxfp4) == sizeof(d_kvalues_mxfp4), "mxfp4 values extent");
   CheckCuda(cudaMemcpyFromSymbol(out->kmask_iq2xs, d_kmask_iq2xs, sizeof(d_kmask_iq2xs)),
             "snapshot d_kmask_iq2xs");
@@ -2029,6 +2197,10 @@ void SnapshotIqTablesFromDevice(IqTableSnapshot* out) {
             "snapshot d_iq3xxs_grid");
   CheckCuda(cudaMemcpyFromSymbol(out->iq2s_grid, d_iq2s_grid, sizeof(d_iq2s_grid)),
             "snapshot d_iq2s_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->iq2xs_grid, d_iq2xs_grid, sizeof(d_iq2xs_grid)),
+            "snapshot d_iq2xs_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->kvalues_iq4nl, d_kvalues_iq4nl, sizeof(d_kvalues_iq4nl)),
+            "snapshot d_kvalues_iq4nl");
   CheckCuda(cudaMemcpyFromSymbol(out->kvalues_mxfp4, d_kvalues_mxfp4, sizeof(d_kvalues_mxfp4)),
             "snapshot d_kvalues_mxfp4");
 }
@@ -2181,6 +2353,8 @@ void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const 
     case WType::kIQ2_S: LaunchGroupedFusedSwiGLU<WType::kIQ2_S>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     case WType::kIQ1_S: LaunchGroupedFusedSwiGLU<WType::kIQ1_S>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     case WType::kIQ1_XXXS: LaunchGroupedFusedSwiGLU<WType::kIQ1_XXXS>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kIQ2_XS: LaunchGroupedFusedSwiGLU<WType::kIQ2_XS>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kIQ4_XS: LaunchGroupedFusedSwiGLU<WType::kIQ4_XS>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     // Before #967 the guard above THREW for these two dtypes, because
     // IsCudaKeepQuantSupported returned false and the named "same CUDA
     // keep-quant dtype" error fired. #967 made the predicate say yes without

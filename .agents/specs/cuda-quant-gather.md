@@ -165,6 +165,51 @@ defaulting `blockIdx.x` and `threadIdx.x` to 1 alongside the extents, so the
 single host thread started at index 2. The defect was the instrument's and read
 as the kernel's.
 
+## Blocked: the flip fails `check-device-leakage.py`, and the gate is right
+
+`scripts/check-device-leakage.py` FAILS on this branch, on exactly one line:
+
+    ERROR: DSR REGRESSION in bucket 'kcuda': 1 > baseline 0.
+    src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:188
+    return dev == vt::DeviceType::kCPU || dev == vt::DeviceType::kCUDA;
+
+That is the flip itself, and nothing else in this change trips it (baseline for
+this file is 0 `kCUDA` tokens). The gate is not being pedantic: naming a device
+in the device-agnostic loader is the debt it exists to stop, and its message
+names the fix — "Ask the op/provider table the question instead
+(`vt::OpRegistered` / Platform capability)". `GgufQuantComputeAvailable()` two
+screens above already does precisely that for the GEMM arm.
+
+The neighbours do NOT license this. `DeviceKeepQuantSupported` names `kROCM` in
+the same file, but the checker counts only `kCUDA`, so those sites are
+grandfathered rather than approved — reading them as precedent would be reading
+an unmeasured bucket as a permission. Raising the baseline is forbidden by the
+checker's own message, and the ALLOWLIST route is for sites that ARE the CUDA
+platform leg, which the shared loader is not.
+
+**Three ways to close it, with a recommendation:**
+
+1. **A new `OpId::kEmbeddingQuant`**, registered by the backends that decode a
+   block row, dispatched from `vt::Embedding` when the table is block-typed, and
+   asked by the loader through `vt::OpRegistered`. This is the principled fix: it
+   names no device, it makes the capability a fact of the registry rather than a
+   hand-kept list, and it retires the CPU/CUDA list-equality test by construction.
+   The cost is an enumerator in `include/vt/ops.h`, which most of the tree
+   includes, so it is a near-full rebuild to verify.
+2. **A named provider** on the existing `kEmbedding` op, probed with
+   `OpProviderNameAt`. No hot-header change and a small rebuild, but it uses a
+   provider NAME as a capability channel, which is not what the name is for, and
+   it perturbs selection for an op every model calls.
+3. **Leave the flip out** and land the kernel alone.
+
+**Recommended: (1), as its own scoped change.** (2) is a workaround that a
+reviewer should reject, and (3) is what this branch does today.
+
+**So the flip is NOT landed.** `DeviceQuantGatherSupported` on this branch admits
+`kCUDA` and the branch therefore does not pass its own gate; it must not merge in
+this state. The kernel below it is complete and independently useful, and
+separating the two is what "the flip is last" means in practice.
+
 ## Owed
 
 - **The other four devices.** METAL, VULKAN, ROCM and TENSTORRENT gather

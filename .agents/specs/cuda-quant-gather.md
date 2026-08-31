@@ -128,13 +128,27 @@ to one side alone reddens it.
 
 ## Blast radius, stated because it is larger than one model
 
-Flipping the gate changes EVERY GGUF load on CUDA, not only `qwen4_exp`: a
+The gate change reaches EVERY GGUF load on CUDA, not only `qwen4_exp`: a
 `token_embd.weight` in a block encoding now stays block-resident on the card
-instead of expanding to bf16. That is the intended memory win and it is also
-the risk. For a bf16 output the two routes should agree bit-for-bit (both
-decode with the same scalar expressions and round once to bf16), which is what
-the bf16 arm of the parity gate measures; an f32 output is strictly more
-precise than the pre-existing expand-then-widen.
+instead of expanding to bf16. The review of #2396 confirmed the second consumer
+by name — `qwen3_5_gguf_weights.cpp:786` takes the same residency — so shipped
+`qwen35` GGUFs are affected today, not hypothetically.
+
+That is the intended memory win and it is also the risk, and it is why F1
+mattered: the suite the first version of this row red on a CUDA build
+(`test_gguf_keep_quant`) is the one that governs residency for every GGUF model
+on the device, not for one architecture's n-gram table.
+
+**Value behaviour, stated precisely.** For a **bf16 output** the two routes agree
+bit for bit: both decode with the same scalar expressions and round once, so the
+bf16 store is idempotent over the old expand-then-widen and no token can move.
+For an **f32 output** the new path is **strictly more precise** — it decodes
+straight to f32 instead of reading a value already rounded through bf16. That is
+a value change on already-shipped models, in the direction of accuracy, and it is
+recorded rather than left for someone to find in a diff.
+
+`deepseek4` and `laguna` are NOT reached: both consume `token_embd` as a flat
+host f32 array, so their loaders narrow the policy for that tensor.
 
 ## Gates
 
@@ -344,6 +358,53 @@ reported `MUT_APPLY(m5_delete_callsite)=FAILED` and ran nothing. A mutation that
 cannot find its target must not report a verdict; M5's real run is on the head,
 where the call site exists.
 
+## The HEAD ran, through the PRODUCTION registration
+
+`thor:gpu0` (Jetson Thor, sm_110, nvcc 13.0.88, aarch64), `rc` job
+`28bfb44b-1dad-4986-9e78-8e4d69d02ebf`, 2026-08-31. GREEN leg `aeaf7089a` — the
+head, with `RegisterCudaBlockGather()` live in the registrar and the test-scope
+registration deleted. This is the run the review of #2396 asked for, and it
+closes F2.
+
+| leg | build rc | test rc | result |
+|---|---|---|---|
+| RED `e0188c50b` | 0 | 1 | 4 of 5 cases threw by name, 32 assertions |
+| GREEN `aeaf7089a` | 0 | 0 | **7 of 7 cases, 250 of 250 assertions** |
+| M1 restore the refusal | 0 | 1 | RED |
+| M2 drop the Q4_K minimum | 0 | 1 | RED |
+| M3 allow FMA contraction | 0 | 0 | SURVIVED, predicted |
+| **M5 DELETE the production call site** | 0 | 1 | **RED — 5 of 7 cases fail, applied 1 -> 0** |
+| M4 element stride | 0 | 1 | RED |
+| RESTORED | 0 | 0 | 7 of 7 |
+
+**M5 is the finding that mattered.** `cuda_ops.cu` and `cuda_embedding_quant.h`
+both said "deleting this call reds that gate" while no leg had ever deleted it.
+Now one has: removing the single production registration reds 5 of 7 cases, so
+the registrar IS the reachable call site and not a duplicate. The comments state
+a measurement instead of an expectation.
+
+**Every sibling suite is rc 0 at the head**, including the two that were red on a
+CUDA build one commit earlier: `test_gguf_keep_quant` (F1's 13 assertions) and
+`test_qwen4_exp_gguf_weights` (3 cases, 7 assertions). Both flipped 1 -> 0, which
+is the prediction this spec recorded BEFORE the run. `test_cuda_quant_dot`,
+`test_ops_embedding_quant` and `test_ops_quant_dot` stayed 0.
+
+250 assertions and not 231: the F5 tripwire case adds 19 and runs on every build.
+
+## Two settled by the review, recorded rather than re-proven
+
+**M3's survival is exhaustive.** The reviewer enumerated all 65,536 f16 patterns
+and 199,098,368 products, of which ZERO round. So `d1*q` is exactly representable
+across the entire domain and not merely on the sampled draws this spec measured;
+`DqMulSub` is defensive exactly as written, on both toolchains and for every
+input.
+
+**The reach is broader than `qwen4_exp`.** `qwen3_5_gguf_weights.cpp:786` takes
+the same residency, so shipped `qwen35` GGUFs now keep `token_embd` block-resident
+on CUDA too. That is why F1 mattered as much as it did: the suite it red is the
+one that governs residency for every GGUF model on the device, not for one
+architecture's n-gram table.
+
 ## Two suites were red on CUDA builds, and this row's first evidence could not see it
 
 Both legs of the runs above executed at `e08bc069d`, one commit BEFORE the flip.
@@ -386,11 +447,12 @@ from this host (`gh api user` authenticates as `localai-org-maint-bot`). An
 earlier reading of this row's history said writes were `403`; that was a
 generalisation from ONE hidden issue and it is wrong.
 
-- **The HEAD compiled by nvcc** — the one gap the review left open. Every leg of
-  both runs above executed at `e08bc069d`, one commit before the flip, so the
-  wiring and the post-flip suite behaviour are unproven. `dgx:gpu0` job
-  `61a5c4fb` runs the head with M5 added. **#2393 is otherwise discharged**:
-  sm_121a is confirmed and M2 is measured on both architectures.
+- **The head on sm_121a.** [#2393](https://github.com/mudler/vllm.cpp/issues/2393)
+  is DISCHARGED for the decoders — sm_121a green and M2 measured on both
+  architectures — and the HEAD-SHA run with M5 is proven on sm_110. Rerunning the
+  head on GB10 is a confirmation rather than a gap: the only non-comment
+  difference between the two gated SHAs is the one registration line M5 deletes
+  and reds, and both architectures already agree on every other verdict.
 - **METAL, VULKAN, ROCM and TENSTORRENT gather arms** —
   [#2394](https://github.com/mudler/vllm.cpp/issues/2394). Each gather kernel
   asserts a float table by name and none registers `kEmbeddingQuant`, so each

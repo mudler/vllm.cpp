@@ -88,11 +88,32 @@ a FAULT, not a slow load. Every multi-byte read goes through byte-assembly
 (`DqU16`/`DqU32`). This is the one systematic difference from the CPU code,
 which uses `std::memcpy`.
 
-**Contraction.** CXX is compiled `-ffp-contract=off` (`CMakeLists.txt:55`);
-nvcc defaults to `--fmad=true`. Q2_K, Q4_K and Q5_K compute `d*q - m`, exactly
-the shape a contracting compiler folds into one FMA, which differs in the last
-bit. `DqMulSub` states the two operations with `__fmul_rn`/`__fsub_rn`. Every
-other decoder was checked case by case and pairs no multiply with an add.
+**Contraction, and the claim this spec had to withdraw.** CXX is compiled
+`-ffp-contract=off` (`CMakeLists.txt:55`); nvcc defaults to `--fmad=true`. Q2_K,
+Q4_K and Q5_K compute `d*q - m`, exactly the shape a contracting compiler folds
+into one FMA, so `DqMulSub` states the two operations with
+`__fmul_rn`/`__fsub_rn`. This spec first asserted that the fold "differs in the
+last bit". **That was reasoning, not a measurement, and the measurement
+falsifies it.** Compiling the host transliteration harness with
+`-ffp-contract=fast -mfma` and `DqMulSub` rewritten to `a * b - c` emits 12 FMA
+instructions where the guarded build emits 0 — so the probe demonstrably
+APPLIED — and changes **nothing**: 0 mismatches across 2,884,352 Q2_K/Q4_K/Q5_K
+elements.
+
+The reason is a width argument, and it is measured too. `d` is an f16 widened to
+f32, so 11 mantissa bits; the sub-scale is 6 bits and the quant 4 (5 with Q5_K's
+high bit), so `d1 = d*sc` and then `d1*q` need at most 21 bits and are EXACTLY
+representable. A direct probe finds `d1*q` exact in **3,874,835 of 3,874,835**
+random draws. The only rounding left is the subtraction, which an FMA and a
+separate multiply-then-subtract perform identically.
+
+So `DqMulSub` is DEFENSIVE, not load-bearing, and the spec says so rather than
+keeping a claim that reads as measured. It stays: it costs nothing, and it makes
+the invariant explicit instead of leaving the numerics resting on a mantissa-width
+argument that a future encoding with a wider scale would silently break. The
+consequence for the on-device gate is stated ahead of the run: **mutation M3 is
+expected to SURVIVE**, and a survived mutation with a reason is a result, not a
+gap. Every other decoder was checked case by case and pairs no multiply with an add.
 
 **One thread per BLOCK, not per row.** The CPU arm parallelises over gathered
 rows; a row of the shipped table is five IQ4_NL blocks, so per-row would leave
@@ -125,6 +146,24 @@ precise than the pre-existing expand-then-widen.
   `test_qwen4_exp_gguf_weights` (`cuda LOADS, because KGATHER ...`), both
   red-first against the pre-KGATHER predicate.
 - Full: `scripts/agent-preflight.sh`.
+
+**Measured before the lease, on the host transliteration harness** (the device
+decoders compiled as ordinary C++ with the CUDA vocabulary shimmed and the
+codebooks aliased to the CPU tables — a transcription proof, NOT a device run):
+
+| leg | result |
+|---|---|
+| baseline, 18 codecs | 0 mismatches, max\|diff\| 0, ~14.2 M elements |
+| baseline, gather kernel | 0 mismatches over an IQ4_NL [13, 160] table |
+| M2 — drop the Q4_K sub-block minimum | **RED**, 457,498 of 968,192, max\|diff\| 4.0295e+06 |
+| M4 — stride the block by ELEMENTS not BYTES | **RED**, 896 of 1120 gather elements |
+| M3 — allow FMA contraction | **SURVIVES, and provably must** (see Design) |
+
+One instrument failure is recorded rather than hidden: the harness's first run
+reported 64 gather mismatches, exactly two blocks of 32. The cause was the shim
+defaulting `blockIdx.x` and `threadIdx.x` to 1 alongside the extents, so the
+single host thread started at index 2. The defect was the instrument's and read
+as the kernel's.
 
 ## Owed
 

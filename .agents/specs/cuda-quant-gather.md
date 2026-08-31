@@ -464,6 +464,38 @@ The other three sibling suites were clean on the same CUDA build:
 `test_cuda_quant_dot` 17 of 17, `test_ops_embedding_quant` 6 of 6,
 `test_ops_quant_dot` 32 of 32.
 
+## The HEAD also ran on sm_121a — #2393 is discharged
+
+`dgx:gpu0` (**NVIDIA GB10**, sm_121a, driver 580.173.02, nvcc 13.0.88), job
+`ae08d765`, GREEN leg `aeaf7089a` — the head, production registration live:
+
+| leg | build rc | test rc | result |
+|---|---|---|---|
+| RED `e0188c50b` | 0 | 1 | RED by name |
+| GREEN `aeaf7089a` | 0 | 0 | **7 of 7 cases, 250 of 250 assertions** |
+| M1 / M2 / M4 | 0 | 1 | RED |
+| **M5 delete the production call site** | 0 | 1 | **RED, applied 1 -> 0** |
+| M3 allow FMA contraction | 0 | 0 | SURVIVED, predicted |
+| RESTORED | 0 | 0 | 7 of 7 |
+
+All five sibling suites rc 0, including `test_gguf_keep_quant` and
+`test_qwen4_exp_gguf_weights`.
+
+**So the head is proven on BOTH architectures, with M5, and the last named gap in
+[#2393](https://github.com/mudler/vllm.cpp/issues/2393) is closed.** sm_110 and
+sm_121a agree on every verdict: seven legs, same directions, same counts.
+
+**Provenance re-checked against the merged head** (`c06547281`, after the
+65-commit reconciliation). `git diff aeaf7089a HEAD` over `src/ include/ tests/`
+touches 58 files, and the gather-critical surface is BYTE-IDENTICAL across all of
+them: `cuda_quant_dequant.cuh`, `cuda_embedding_quant.h`, `cuda_ops.cu`,
+`cuda_quant_dot.cu`, `gguf_keep_quant.cpp`, `include/vt/ops.h`, `ops.cpp`,
+`test_cuda_embedding_quant.cpp` and `test_gguf_keep_quant.cpp`. Main's
+`cpu_ops.cpp` delta does not touch the embedding kernel or its registration. The
+one measured file that DID change is `qwen4_exp_weights.cpp`'s refusal string,
+recorded above. So the GPU evidence describes this head for everything it
+measured.
+
 ## Provenance of the GPU evidence, re-checked at the moment of merge
 
 The gated SHA is `aeaf7089a` (thor job `28bfb44b`). At each merge since, the
@@ -535,22 +567,9 @@ from this host (`gh api user` authenticates as `localai-org-maint-bot`). An
 earlier reading of this row's history said writes were `403`; that was a
 generalisation from ONE hidden issue and it is wrong.
 
-- **The head on sm_121a.** [#2393](https://github.com/mudler/vllm.cpp/issues/2393)
-  is DISCHARGED for the decoders — sm_121a green and M2 measured on both
-  architectures — and the HEAD-SHA run with M5 is proven on sm_110. Rerunning the
-  head on GB10 is a confirmation rather than a gap: the only non-comment
-  difference between the two gated SHAs is the one registration line M5 deletes
-  and reds, and both architectures already agree on every other verdict. Queued
-  as `ae08d765`.
-
-  A note for whoever reads `rc ps` and finds nothing: the FIRST attempt at this
-  run (`61a5c4fb`) was cancelled when the submitting session died. `rc run` is
-  not fire-and-forget — client death cancels a job that is still QUEUED, while a
-  job that has already STARTED survives. That is why the sm_110 head run
-  (`28bfb44b`, submitted the same way but scheduled immediately) completed and
-  this one did not. "No job in the queue" reads identically for a run that
-  finished, one that failed and one that was never scheduled, and only the first
-  two say anything about the tree.
+- ~~The head on sm_121a~~ — **DISCHARGED**, and
+  [#2393](https://github.com/mudler/vllm.cpp/issues/2393) is closed. The head ran
+  green on GB10 with M5, and the two architectures agree on every verdict.
 - **METAL, VULKAN, ROCM and TENSTORRENT gather arms** —
   [#2394](https://github.com/mudler/vllm.cpp/issues/2394). Each gather kernel
   asserts a float table by name and none registers `kEmbeddingQuant`, so each

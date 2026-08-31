@@ -437,6 +437,132 @@ gets mistakenly called done. W5 and W0 therefore stay `OPEN` in this table, the
 `## Now` section states them, and `docs/FEATURES.md` may not carry a ✅ for
 this capability until one of them lands.
 
+### W4 design — the `fit` auto-resolver ([#2384](https://github.com/mudler/vllm.cpp/issues/2384))
+
+W1 landed `ResolvePlacementFit()`. It has **no production caller**: declaration,
+definition, two test assertions. `--fit` parses, refuses a manual placement
+beside it, prints `placement_fit=on` and is announced by `DescribeEnvOverrides`,
+and nothing ever asks it for the answer. That is #2382 one layer over, with the
+same reassuring-log-line property.
+
+#### What it computes
+
+One question: **how many of the model's MoE layers must run their routed experts
+on the CPU for the rest to fit the device budget.** The answer is expressed in
+the surface that already exists — a list of `PlacementOverride`, identical in
+kind to what `n_cpu_moe` produces — so `fit` adds a resolver and NOT a second
+placement mechanism. Everything downstream (`DevicePlacement`,
+`MoePlacementPlan::Resolve`, the seam) is unchanged.
+
+#### Two deliberate divergences from upstream, and why each is right HERE
+
+**1. Static total, not live free.** `common/fit.cpp` measures free memory per
+device with `ggml_backend_dev_memory` and re-measures on every trial. This tree
+takes the opposite position, and it is already ratified in
+`include/vt/backend.h:100-103`, directly above `DeviceMemoryInfo`:
+
+> The load-time GGUF fit refusal deliberately does not read this seam: it is a
+> live free/total probe, and **a load-time budget must not be a function of
+> contention.** It carries its own `total` on
+> `vllm::platforms::ResidencyPolicy::device_memory_total_bytes` instead.
+
+So `fit` reads `GetPlatform(dev).residency_policy().device_memory_total_bytes`,
+via the existing `DeviceWeightBudgetBytes()` which already applies the operator
+overrides. **This is not a capability gap.** CUDA and ROCm both override
+`DeviceMemoryInfo` (`src/vt/cuda/cuda_backend.cu:93` calls `cudaMemGetInfo`);
+only the base class returns `false`. An earlier draft of #2384 claimed otherwise
+and was wrong. Reading live free here would contradict a landed seam decision,
+and it would make the same model with the same flags resolve differently
+depending on what else was running.
+
+The cost is real and is the honest half: a box with 20 GiB already in use will
+be told a model fits when it does not, and fail later at allocation. That is the
+same trade `CheckDeviceWeightFit` already makes, so `fit` inherits a known
+behaviour rather than inventing one.
+
+**2. Whole layers, not fractional ones.** `common/fit.h:18-22` spills at
+`NONE/ATTN/UP/GATE/MOE` granularity and places *part* of one boundary layer.
+This spec already sanctions starting coarser — "Our `auto` may legitimately
+start coarser, but the difference has to be stated in its reporting rather than
+left for a user to discover from a memory figure" — so W4 places whole layers
+and SAYS so in its install line. A user who asked for a fit and got 31 of 48
+layers placed must be able to see that the resolver could not have given them
+30.5.
+
+#### Where it resolves, and the asymmetry that shapes the scope
+
+`InstallMoePlacementPlan` (`model_loader.cpp`) is the one place a plan reaches
+the seam, so `fit` resolves there. It needs three inputs, and only two are
+available on both paths:
+
+| Input | GGUF branch | safetensors branch |
+|---|---|---|
+| engine device | yes | yes |
+| `num_hidden_layers` | yes | yes |
+| model weight bytes | **yes** — `GgufStagedWeightFootprint(gguf, ...)`, and the `GgufFile` is already open at the install site | **no** — the shards are not opened until the loader runs, well after the install |
+
+The safetensors size is computable (`qwen3_5_dense_weights.cpp:900` sums
+`shard.Get(name).nbytes`) but only once the shards are open, which is downstream
+of where the plan must be installed — `ResidentWeight` aliases host bytes on a
+CPU `Dev` and uploads otherwise, so installing after the upload pays the round
+trip the placement exists to avoid.
+
+**So W4 ships GGUF-only and REFUSES safetensors by name**, naming the missing
+part, as `AGENTS.md` requires of an unimplemented arm. A silent "fit resolved
+nothing" on safetensors would be exactly the #2382 failure again: a user asks
+for a placement, sees no error, and gets none. Reading the index JSON at the
+install site to lift the restriction is W4b, not scope creep dressed as W4.
+
+#### The observable the gate needs, which does not exist yet
+
+`InstallMoePlacementPlan` is unconditional, so a fit-installed plan, a
+`cpu_moe`-installed plan and a bare one all report the same
+`resolved_layer_count()`. A reachability test copied from
+`test_placement_reach.cpp` would therefore **pass against a `fit` that did
+nothing** — the precise trap W3e was about.
+
+`MoePlacementPlan` gains a provenance field: how the placement was arrived at
+(stated / resolved-by-fit / none), plus the budget and footprint the resolver
+compared. That is what the reachability test asserts, and it is also what the
+install line prints, so the operator sees the arithmetic rather than a verdict.
+
+#### Tests, and what each is worth
+
+1. **Resolver unit, deterministic** — budget and footprint in, layer count out.
+   Table-driven over: fits entirely (places nothing), fits with N placed, cannot
+   fit even with all placed, UNKNOWN budget (`0`), and zero layers. No device, so
+   CI runs it.
+2. **UNKNOWN must not read as "nothing fits."** `device_memory_total_bytes` is
+   `0` when the probe failed, and `0` compared naively places every layer. This
+   gets its own case because the failure is silent and plausible-looking.
+3. **Reachability through `FromModelDir`**, asserting the provenance field —
+   red without the install call, per the W3e mutation.
+4. **The safetensors refusal fires by name**, so the unimplemented arm cannot
+   pass as an inert success.
+5. **Mutation**: delete the fit branch inside `InstallMoePlacementPlan` and
+   require (1)+(3) red on a mutant that COMPILES. A mutant that fails to build
+   reads as a passing test (W3g).
+
+#### Two holes in the existing exclusivity refusal, to close in W4
+
+Found while reading, both currently harmless only because nothing reads the bit:
+
+- the refusal lives in the single-document parse, and the multi-document merge
+  (`weight_residency.cpp:888-896`) copies `fit` and the override fields
+  field-by-field **without re-running the check**, so document A setting
+  `cpu_moe` then document B setting `fit` merges into a state the parser would
+  have refused;
+- `VT_PLACEMENT_FIT=1` beside `VT_CPU_MOE=1` is refused nowhere.
+
+#### Stop conditions
+
+- The resolver cannot be made deterministic from static inputs — stop and report.
+- Closing the exclusivity holes would change the meaning of an existing
+  configuration — stop; that is a config-surface decision, not a W4 call.
+- A GPU is needed to prove correctness beyond the unit level — W4 lands the
+  resolver and its reachability, and the NMSE-style device gate is owed
+  separately, exactly as W3h is for the install.
+
 ### W3d — the fp4 refusal, restored AT THE SEAM ([#2309](https://github.com/mudler/vllm.cpp/issues/2309))
 
 `RunMoeBlockPlaced` refused to place a layer whose routed experts are

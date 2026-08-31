@@ -27,6 +27,12 @@ blocking every PR's CI at the merge ref:
    first. gcc/clang do not warn by default, which is why Linux CI stayed
    green. Breaks both `windows-msvc-*` jobs.
 
+**Split while in review.** Facet 1 landed on main from an independent find:
+`08fa2f5aa` (#2395) applies the same twelve-argument repair to the schedule
+test, found by building main. The rebased branch (base now `0b4766c96`) drops
+its duplicate of that change as already applied and carries only facet 2. It
+still closes #2372, which names both breaks and this is the one left standing.
+
 ## Design
 
 1. Test: mirror the production call. `glm_moe_dsa_forward.cpp:455-460` passes

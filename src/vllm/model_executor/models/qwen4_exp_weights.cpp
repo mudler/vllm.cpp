@@ -672,7 +672,9 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
         "bf16 — 95.4 GiB of host memory on the released checkpoint, which the "
         "on-disk device-fit guard (issue #1123) cannot see. CPU and CUDA both "
         "gather blocks; this device's arm is owed (issue #2394). Load this "
-        "model with --device cpu or --device cuda. See "
+        "model with --device cpu — CUDA gathers blocks and will LOAD, but this "
+        "model's forward has no CUDA arm yet, so it would fail a step later. "
+        "See "
         ".agents/specs/cuda-quant-gather.md and issue #2083.");
   }
 

@@ -3,7 +3,7 @@
 Row: `MODEL-MM-QWEN4-EXP` · sibling spec:
 [`qwen4-exp-flash-next.md`](qwen4-exp-flash-next.md) · the debt this discharges
 was recorded by [#2083](https://github.com/mudler/vllm.cpp/issues/2083) under
-that row's `## Owed`.
+that row's Owed section.
 
 ## What this fixes
 
@@ -272,6 +272,30 @@ reviewer should reject, and (3) is what this branch does today.
 this state. The kernel below it is complete and independently useful, and
 separating the two is what "the flip is last" means in practice.
 
+## A near-miss worth recording: I edited a script a job was executing
+
+While `rc` job `38a9b799` was running `/workspace/kgather/run.sh` on `dgx:gpu0`, I
+edited that same file — adding a fifth mutation to its loop and a fifth suite to
+its sibling list. **bash reads a script by BYTE OFFSET as it executes**, so
+inserting text ahead of the interpreter's position can make it resume mid-token
+and run something nobody wrote. Nothing in that run's output shows corruption and
+it completed with coherent verdicts, but "it happened to be fine" is not a
+property of the edit.
+
+It is recorded here rather than left in session prose because a later reader
+auditing `38a9b799` has no way to know the script changed under it, and would
+reasonably assume the file on disk is what ran.
+
+**Nothing in the F1/F2 discharge rests on that job.** Every claim about the head
+comes from `28bfb44b` on `thor:gpu0`, submitted from a SEPARATE directory
+(`/workspace/kgather-thor/`) with its own bundle, its own `/tmp` path and its own
+mutation scripts, started twelve minutes after the last commit it gates. The
+isolation was the response to this hazard, not a coincidence.
+
+The rule that follows: a staged job directory is IMMUTABLE from the moment it is
+submitted. Change a run by staging a new directory, which is what
+`/workspace/kgather-head/` is.
+
 ## A pre-existing flake this row did NOT cause
 
 `test_cpu_x86_llamacpp_floor` FAILS on this development box under load, and it
@@ -439,6 +463,41 @@ leg of this job is what surfaced it at all.
 The other three sibling suites were clean on the same CUDA build:
 `test_cuda_quant_dot` 17 of 17, `test_ops_embedding_quant` 6 of 6,
 `test_ops_quant_dot` 32 of 32.
+
+## Landing order with #2397, and the one line that is in NEITHER pull request
+
+[#2397](https://github.com/mudler/vllm.cpp/pull/2397)
+(`row/ENG-GGUF-RESIDENCY-RESOLVED-DEVICE`) makes `RouteGgufTensor` take the
+engine's RESOLVED device instead of probing `CurrentPlatform()`, and it rewrites
+the same two test files this row rewrote. `git merge-tree` CONFLICTS in
+`tests/vllm/test_gguf_keep_quant.cpp` and
+`tests/vllm/models/test_qwen4_exp_gguf_weights.cpp`.
+
+The two changes AGREE on the principle and differ on the expression:
+
+- this row asks `vt::OpRegistered(vt::OpId::kEmbeddingQuant, CurrentPlatform().device_type())`
+- #2397 asks `kRouteDev == vt::DeviceType::kCPU`, with `kRouteDev` the resolved device
+
+**The correct merged form is in neither pull request:**
+
+```cpp
+const bool gather_device_capable =
+    vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev);
+...
+const int gather_kept =
+    vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 13 : 0;
+```
+
+BOTH terms, not one. Taking #2397's side restores F1: `kRouteDev == kCPU` is
+exactly the hardcoded device list the flip invalidates, and the suite then reds
+13 assertions on a CUDA build with a GPU. Taking this row's side loses the
+resolved device and goes back to probing the platform. **A "take theirs", a "take
+both", and a clean automatic merge of these hunks are all wrong**, which is why
+the conflict being VISIBLE is the good outcome.
+
+Whoever lands second owes those two lines AND a re-run of the CUDA sibling leg
+(`test_gguf_keep_quant` and `test_qwen4_exp_gguf_weights` on a GPU), because the
+defect they guard against is invisible to every CPU lane.
 
 ## Owed
 

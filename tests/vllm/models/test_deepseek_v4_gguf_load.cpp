@@ -1374,3 +1374,21 @@ TEST_CASE("W-3: `kv_prewritten` attends the pages WITHOUT overwriting them (#131
   }
   CHECK(wrote);
 }
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286) — WHY THIS FILE HAS NO COMPRESSOR CASE.
+//
+// Two cases were written here and both failed for the same reason: the compressor
+// never ran. `dsa_dense` is `(be.gguf != nullptr)` and `is_comp` is
+// `has_compressor(layer) && !dsa_dense`, so on the GGUF arm EVERY layer is dense
+// regardless of what `compress_ratios` says. A `compress_ratio == 128` layer
+// driven through `DeepseekV4ForwardGgufPaged` leaves the carried state empty and
+// the guard silent, because neither is ever consulted.
+//
+// That is what this arm IS, not a defect in it: the GGUF converter did not carry
+// compressor tensors, so running them was never possible here, and `dsa_dense`
+// states that once for the whole arm.
+//
+// The consequence for W1 belongs where a reader will meet it. The compressor arm
+// is reachable only from a NON-GGUF paged forward, and this tree has no public one
+// yet. `CompressorLayerStep` is gated in `test_deepseek_v4_paged_equiv`; reaching
+// it from a production entry point is owed by the row, not by this file.

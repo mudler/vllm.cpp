@@ -309,6 +309,54 @@ OwnedTensor LoadMatmul(const GgufFile& g, const GgufLoadPolicy& pol,
   return ExpandBf16(g, name, {n, k}, /*nk=*/true);
 }
 
+// THE VOCABULARY TABLE, WHICH IS A GATHER AND NOT A GEMM, AND ASKING THE POLICY
+// THE WRONG QUESTION ABOUT IT COSTS A REFUSAL AT THE FIRST FORWARD.
+//
+// `token_embd.weight` was routed through `LoadMatmul` until this line existed,
+// so the policy was asked about `kMatmulWeight` — and the two roles differ on
+// exactly the axis that matters here. A GEMM weight's device gate is
+// `DeviceKeepQuantSupported`, which answers TRUE on CUDA because the CUDA
+// backend falls back to the CPU kernel for anything it lacks. A GATHER's gate is
+// `DeviceQuantGatherSupported`, which answers true ONLY on the CPU, because
+// `EmbeddingKernelCuda` (`cuda_ops.cu`) accepts f32 and bf16 tables and nothing
+// else and there is no fallback tier under it. So on a device queue the table
+// stayed Q4_K and the first forward threw
+// `cuda embedding: unsupported table dtype (f32/bf16 only)` with all 201.83 GiB
+// of the model already resident — measured on `thor:gpu0`, 2026-08-31, spec O31.
+//
+// Asking `kEmbeddingTable` is the whole repair: the shared policy already knows
+// the answer and already expands to bf16 on a device queue while keeping the
+// blocks on a CPU one. The cost on this checkpoint is exact and is stated rather
+// than discovered — `[154880, 6144]` Q4_K becomes 1.772 GiB of bf16 — and it is
+// the price of a gather this tree cannot yet do on the device, which
+// `gguf_keep_quant.cpp`'s own comment records as owed.
+//
+// `also_matmul` is the TIED case, where the same bytes are the lm_head GEMM as
+// well. The gather's encoding rule needs only a row decoder while a GEMM needs a
+// `vec_dot`, so a tied table may only keep its blocks when BOTH roles say so;
+// the intersection is taken here rather than left for `vt::MatmulBT` to discover
+// at the first forward. The published `unsloth/GLM-5.3-GGUF` arm ships
+// `token_embd.weight` and `output.weight` as two separate Q4_K tensors, so it
+// takes `also_matmul = false`.
+OwnedTensor LoadEmbeddingTable(const GgufFile& g, const GgufLoadPolicy& pol,
+                               const std::string& name, int64_t v, int64_t h,
+                               bool also_matmul) {
+  const GgufTensorInfo& t = g.Get(name);
+  RequireShape(t, {v, h});
+  GgufResidency r = pol.Route(t, GgufTensorRole::kEmbeddingTable);
+  if (also_matmul && r != GgufResidency::kExpandBf16 &&
+      pol.Route(t, GgufTensorRole::kMatmulWeight) != r) {
+    r = GgufResidency::kExpandBf16;
+  }
+  if (r == GgufResidency::kKeepQuant)
+    return OwnGgufQuantBlocks(t, v, h, /*row_offset=*/0, MmapSrc(g, pol),
+                              kGlmMoeDsaQuantRepack);
+  if (r == GgufResidency::kKeepF16)
+    return OwnGgufF16(t, v, h, /*row_offset=*/0, MmapSrc(g, pol), /*nk=*/true,
+                      /*elem_kn_repack=*/false);
+  return ExpandBf16(g, name, {v, h}, /*nk=*/true);
+}
+
 // The ROUTER GEMM, held at f32. This is the annotated dtype exception the
 // polarity rule requires: `_get_moe_router_dtype` (`deepseek_v2.py:123-133`)
 // forces `torch.float32` on `model_type == "glm_moe_dsa"` at `:127`, and the
@@ -349,12 +397,24 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
                "all of them — and this model's towers are 187.312 GiB "
                "compressed. Check VT_GGUF_KEEP_QUANT and that this encoding has "
                "a keep-quant vec_dot (vt::cpu::HasQuantDotKernel)");
+  // `prefault = false`, and this is the line that decides whether this model
+  // STREAMS or only says it does (#2214, spec §3.3, O30). Every other borrowed
+  // weight is faulted in at load so a page trap does not land in the timed
+  // prefill; a routed-expert tower is the one class where that trade does not
+  // exist, because `expert_stream::ExpertSlice` preads each slice into a slot
+  // and NEVER reads the tower through the mapping. Prefaulting these 228 towers
+  // therefore reads 187.312 GiB off the filesystem at load to populate pages
+  // nothing looks at — measured on the real artifact before this line existed:
+  // RSS climbed linearly past 48 GiB against a 18.99 GiB resident class, at the
+  // filesystem's read rate, with no plateau. It is also the exact shape §3.3
+  // refuses to publish, a page-cache number under a streaming label.
   if (r == GgufResidency::kKeepQuant) {
     return OwnGgufQuantBlocks(t, e * n, k, /*row_offset=*/0, MmapSrc(g, pol),
-                              kGlmMoeDsaQuantRepack);
+                              kGlmMoeDsaQuantRepack, /*cuda_align=*/false,
+                              /*prefault=*/false);
   }
   return OwnGgufF16(t, e * n, k, /*row_offset=*/0, MmapSrc(g, pol), /*nk=*/true,
-                    /*elem_kn_repack=*/false);
+                    /*elem_kn_repack=*/false, /*prefault=*/false);
 }
 
 // A 3-D [H, N, K] tensor that is NOT an expert bank and is never sliced by
@@ -603,13 +663,16 @@ GlmMoeDsaWeights LoadGlmMoeDsaFromGguf(const GgufFile& gguf,
   // ── model-level ──
   const int64_t h = p.hidden_size;
   const int64_t v = p.vocab_size;
-  w.embed_tokens = LoadMatmul(gguf, pol, "token_embd.weight", v, h);
-  w.final_norm = LoadNormBf16(gguf, "output_norm.weight", h);
   // The tie is read OFF THE FILE. A converter is free to materialize either
   // shape regardless of what the source config's `tie_word_embeddings` says,
   // and the published artifact ships both `token_embd.weight` and
-  // `output.weight` as separate Q4_K tensors.
+  // `output.weight` as separate Q4_K tensors. It is resolved BEFORE the table is
+  // loaded, because a tied table is also a GEMM weight and that changes which
+  // residencies it may take.
   const bool tied = !HasTensor(gguf, "output.weight");
+  w.embed_tokens = LoadEmbeddingTable(gguf, pol, "token_embd.weight", v, h,
+                                      /*also_matmul=*/tied);
+  w.final_norm = LoadNormBf16(gguf, "output_norm.weight", h);
   if (!tied) w.lm_head = LoadMatmul(gguf, pol, "output.weight", v, h);
 
   // ── ONE shared rope [cos|sin] cache for every layer ──

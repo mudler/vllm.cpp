@@ -2486,6 +2486,17 @@ target_include_directories(test_ops_quant_repack PRIVATE ${CMAKE_SOURCE_DIR}/src
 # CUDA device. Reaches src/ for vt/cpu block/quant headers used by the reference.
 vllm_cpp_add_test(test_cuda_quant_dot vt/test_cuda_quant_dot.cpp)
 target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# KGATHER: the CUDA DEQUANTIZING GATHER. `vt::Embedding` over a block-quantized
+# table on the device, gated BIT-EXACTLY against the CPU arm (itself gated
+# against the pinned llama.cpp on real shipped bytes) across every encoding
+# `vt::cpu::BlockToFloat` decodes, in f32 and bf16 out, i32 and i64 ids, plus the
+# out-of-range report. Also pins the CUDA decoder list EQUAL to the CPU one,
+# which is the property `DeviceQuantGatherSupported` (a device predicate with no
+# dtype) rests on. Skips coherently with no CUDA device; the list-equality case
+# is a build property and runs without one. Reaches src/ for the vt/cuda seam
+# header and the vt/cpu quant headers.
+vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
+target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

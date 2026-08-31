@@ -676,6 +676,31 @@ TEST_CASE("the gather table's admission is the DECODER, not the vec_dot") {
   }
 }
 
+TEST_CASE("the gather's DEVICE gate admits exactly the kernels that decode a row") {
+  // KGATHER. `DeviceQuantGatherSupported` is a DEVICE predicate with no dtype,
+  // and that is only sound because the CUDA decoder list is the same list
+  // `vt::cpu::BlockToFloat` answers for -- `tests/vt/test_cuda_embedding_quant.cpp`
+  // asserts that equality on a CUDA build, and this case asserts the device
+  // membership the policy reads.
+  //
+  // CPU and CUDA decode a block row: `cpu_ops.cpp EmbeddingKernel` through
+  // `BlockToFloat`, and `EmbeddingKernelCuda` through
+  // `src/vt/cuda/cuda_quant_dequant.cuh`. Nothing else does, and each of the
+  // others says so by name in its own kernel (e.g. `tenstorrent_ops.cpp`:
+  // "tenstorrent kEmbedding: float table, f32/bf16 out"). A device added to
+  // this predicate without a decoder turns a clean LOAD-TIME refusal into a
+  // throw at the first forward with the whole model resident, which is the
+  // failure the #523 review named and the reason the gate exists at all.
+  CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kCPU));
+  CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kCUDA));
+  for (vt::DeviceType d :
+       {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN, vt::DeviceType::kROCM,
+        vt::DeviceType::kTENSTORRENT}) {
+    CAPTURE(vt::DeviceTypeName(d));
+    CHECK_FALSE(vllm::DeviceQuantGatherSupported(d));
+  }
+}
+
 TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   ::unsetenv("VT_CPU_REF");
   ::unsetenv("VT_GGUF_KEEP_QUANT");

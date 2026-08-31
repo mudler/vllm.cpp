@@ -48,6 +48,7 @@
 #include <unordered_map>
 
 #include "vt/cpu/cpu_quant_blocks.h"        // vt::cpu::Block* struct mirror (single source)
+#include "vt/cuda/cuda_embedding_quant.h"   // EmbeddingQuantErr + the KGATHER seam
 #include "vt/cuda/cuda_iq_table_seal.h"      // IqTableSnapshot (the device-codebook drift seal)
 #include "vt/cuda/cuda_quant_iq_tables.cuh"  // d_iq2xxs_grid / d_iq3xxs_grid / d_ksigns / d_kmask
 #include "vt/cuda/graph_safe_scratch.h"      // RetireGraphScratch (cudagraph-safe grow-only)
@@ -167,6 +168,84 @@ __device__ inline float DLoadAct(const void* base, ActDT dt, int64_t idx) {
     case ActDT::kF16: return DF16ToF32(static_cast<const uint16_t*>(base)[idx]);
     default: return DBF16ToF32(static_cast<const uint16_t*>(base)[idx]);
   }
+}
+
+// The dequantizing gather's device row decoders (KGATHER). Included HERE, inside
+// `vt::cuda::{anonymous}`, because it uses the DF16ToF32/DF32ToBF16/DE8M0ToF32Half
+// helpers above and the device codebooks below, and because those codebooks are
+// DEFINED by cuda_quant_iq_tables.cuh -- a second including TU is a duplicate
+// symbol, not a second copy. It opens no namespace of its own.
+#include "vt/cuda/cuda_quant_dequant.cuh"
+
+// The block geometry the decoders hard-code, tied to the SINGLE source of block
+// layout (cpu_quant_blocks.h, itself static_asserted against ggml-common.h). A
+// stride typed by hand into a decoder above is a compile error here, not a row
+// of plausible garbage at the first forward.
+static_assert(DqQ4_0::kBytes == sizeof(vt::cpu::BlockQ4_0), "q4_0 gather stride");
+static_assert(DqQ5_0::kBytes == sizeof(vt::cpu::BlockQ5_0), "q5_0 gather stride");
+static_assert(DqQ8_0::kBytes == sizeof(vt::cpu::BlockQ8_0), "q8_0 gather stride");
+static_assert(DqIQ4_NL::kBytes == sizeof(vt::cpu::BlockIQ4_NL), "iq4_nl gather stride");
+static_assert(DqMXFP4::kBytes == sizeof(vt::cpu::BlockMXFP4), "mxfp4 gather stride");
+static_assert(DqQ2_K::kBytes == sizeof(vt::cpu::BlockQ2_K), "q2_K gather stride");
+static_assert(DqQ3_K::kBytes == sizeof(vt::cpu::BlockQ3_K), "q3_K gather stride");
+static_assert(DqQ4_K::kBytes == sizeof(vt::cpu::BlockQ4_K), "q4_K gather stride");
+static_assert(DqQ5_K::kBytes == sizeof(vt::cpu::BlockQ5_K), "q5_K gather stride");
+static_assert(DqQ6_K::kBytes == sizeof(vt::cpu::BlockQ6_K), "q6_K gather stride");
+static_assert(DqQ8_K::kBytes == sizeof(vt::cpu::BlockQ8_K), "q8_K gather stride");
+static_assert(DqIQ2_XXS::kBytes == sizeof(vt::cpu::BlockIQ2_XXS), "iq2_xxs gather stride");
+static_assert(DqIQ3_XXS::kBytes == sizeof(vt::cpu::BlockIQ3_XXS), "iq3_xxs gather stride");
+static_assert(DqIQ2_XS::kBytes == sizeof(vt::cpu::BlockIQ2_XS), "iq2_xs gather stride");
+static_assert(DqIQ2_S::kBytes == sizeof(vt::cpu::BlockIQ2_S), "iq2_s gather stride");
+static_assert(DqIQ4_XS::kBytes == sizeof(vt::cpu::BlockIQ4_XS), "iq4_xs gather stride");
+static_assert(DqIQ1_S::kBytes == sizeof(vt::cpu::BlockIQ1_S), "iq1_s gather stride");
+static_assert(DqIQ1_XXXS::kBytes == sizeof(vt::cpu::BlockIQ1_XXXS), "iq1_xxxs gather stride");
+
+// One row of the dispatch: the vt DType, its codec, and nothing else. Every
+// list below is generated from this macro so a dtype cannot be decodable in one
+// place and refused in another -- the asymmetry that made the CPU-only gather a
+// silent load-time expansion instead of a loud refusal.
+#define VT_DQ_GATHER_TYPES(X)     \
+  X(kQ4_0, DqQ4_0)                \
+  X(kQ5_0, DqQ5_0)                \
+  X(kQ8_0, DqQ8_0)                \
+  X(kQ2_K, DqQ2_K)                \
+  X(kQ3_K, DqQ3_K)                \
+  X(kQ4_K, DqQ4_K)                \
+  X(kQ5_K, DqQ5_K)                \
+  X(kQ6_K, DqQ6_K)                \
+  X(kQ8_K, DqQ8_K)                \
+  X(kIQ2_XXS, DqIQ2_XXS)          \
+  X(kIQ3_XXS, DqIQ3_XXS)          \
+  X(kIQ2_S, DqIQ2_S)              \
+  X(kIQ2_XS, DqIQ2_XS)            \
+  X(kIQ1_S, DqIQ1_S)              \
+  X(kIQ1_XXXS, DqIQ1_XXXS)        \
+  X(kIQ4_NL, DqIQ4_NL)            \
+  X(kIQ4_XS, DqIQ4_XS)            \
+  X(kMXFP4, DqMXFP4)
+
+template <typename Tout, typename Tid>
+cudaError_t LaunchEmbeddingQuantTyped(cudaStream_t s, Tout* out, const uint8_t* table,
+                                      const Tid* ids, DType dt, int64_t t, int64_t nb,
+                                      int64_t h, int64_t v, size_t row_bytes,
+                                      EmbeddingQuantErr* err) {
+  constexpr int kGatherBlock = 128;
+  const int64_t total = t * nb;
+  int64_t blocks = (total + kGatherBlock - 1) / kGatherBlock;
+  if (blocks > 65535) blocks = 65535;  // grid-stride loop covers the remainder
+  const unsigned grid = static_cast<unsigned>(blocks < 1 ? 1 : blocks);
+  switch (dt) {
+#define VT_DQ_LAUNCH(DT, CODEC)                                                   \
+  case DType::DT:                                                                 \
+    EmbeddingQuantGatherKernel<Tout, Tid, CODEC>                                   \
+        <<<grid, kGatherBlock, 0, s>>>(out, table, ids, t, nb, h, v, row_bytes, err); \
+    break;
+    VT_DQ_GATHER_TYPES(VT_DQ_LAUNCH)
+#undef VT_DQ_LAUNCH
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
 }
 
 // ---------------------------------------------------------------------------
@@ -2382,5 +2461,55 @@ struct FusedMoeSharedRegistrar {
                    static_cast<MoeGateUpSwiGLUGroupedFn>(&MoeGateUpSwiGLUGroupedCuda)));
   }
 } fused_moe_shared_registrar;
+
+
+// --- the KGATHER seam (see vt/cuda/cuda_embedding_quant.h) -------------------
+
+bool EmbeddingQuantSupported(DType dt) {
+  switch (dt) {
+#define VT_DQ_SUPPORTED(DT, CODEC) \
+  case DType::DT:                  \
+    return true;
+    VT_DQ_GATHER_TYPES(VT_DQ_SUPPORTED)
+#undef VT_DQ_SUPPORTED
+    default:
+      return false;
+  }
+}
+
+cudaError_t LaunchEmbeddingQuant(cudaStream_t s, Tensor& out, const Tensor& table,
+                                 const Tensor& ids, EmbeddingQuantErr* err) {
+  const int64_t t = ids.shape[0];
+  const int64_t h = table.shape[1];
+  const int64_t v = table.shape[0];
+  const int64_t be = BlockElems(table.dtype);
+  // `vt::Embedding` already refused a ragged K; restated because this function
+  // computes a BYTE stride from it and a wrong stride is silent.
+  if (be <= 0 || h % be != 0) return cudaErrorInvalidValue;
+  const int64_t nb = h / be;
+  const size_t row_bytes = RowSizeBytes(table.dtype, h);
+  if (row_bytes != static_cast<size_t>(nb) * static_cast<size_t>(BlockBytes(table.dtype))) {
+    return cudaErrorInvalidValue;
+  }
+  const uint8_t* tbl = static_cast<const uint8_t*>(table.data);
+  if (out.dtype == DType::kF32) {
+    if (ids.dtype == DType::kI32) {
+      return LaunchEmbeddingQuantTyped<float, int32_t>(
+          s, static_cast<float*>(out.data), tbl, static_cast<const int32_t*>(ids.data),
+          table.dtype, t, nb, h, v, row_bytes, err);
+    }
+    return LaunchEmbeddingQuantTyped<float, int64_t>(
+        s, static_cast<float*>(out.data), tbl, static_cast<const int64_t*>(ids.data),
+        table.dtype, t, nb, h, v, row_bytes, err);
+  }
+  if (ids.dtype == DType::kI32) {
+    return LaunchEmbeddingQuantTyped<uint16_t, int32_t>(
+        s, static_cast<uint16_t*>(out.data), tbl, static_cast<const int32_t*>(ids.data),
+        table.dtype, t, nb, h, v, row_bytes, err);
+  }
+  return LaunchEmbeddingQuantTyped<uint16_t, int64_t>(
+      s, static_cast<uint16_t*>(out.data), tbl, static_cast<const int64_t*>(ids.data),
+      table.dtype, t, nb, h, v, row_bytes, err);
+}
 
 }  // namespace vt::cuda

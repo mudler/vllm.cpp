@@ -725,9 +725,10 @@ TEST_CASE("qwen4_exp GGUF: the load accounts every tensor in the file") {
 
 TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load") {
   // #2083. The n-gram table is the ONE gather this model keeps quantized, and
-  // `DeviceQuantGatherSupported` is true for `kCPU` alone
-  // (`gguf_keep_quant.cpp`) because only the CPU `Embedding` kernel decodes
-  // blocks. On any other device `RouteGgufTensor` therefore sends
+  // `DeviceQuantGatherSupported` is true for `kCPU` and `kCUDA`
+  // (`gguf_keep_quant.cpp`) — the two `Embedding` kernels that decode blocks,
+  // CUDA since KGATHER. On METAL, VULKAN, ROCM and TENSTORRENT, whose gather
+  // kernels each assert a float table by name, `RouteGgufTensor` sends
   // `per_layer_token_embd.weight` to `kExpandBf16`, and on the shipped
   // artifact that tensor is [320001536, 160]: 320001536 * 160 * 2 =
   // 102,400,491,520 bytes = 95.368 GiB of ANONYMOUS host memory, against
@@ -749,32 +750,47 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
 
-  SUBCASE("cuda refuses, and the message names the tensor and the missing arm") {
+  SUBCASE("metal refuses, and the message names the tensor and the missing arm") {
+    // METAL stands where CUDA stood: `metal_ops.mm`'s `kEmbedding` takes a
+    // float table only. The subcase moved device rather than being deleted,
+    // because what it gates is the REFUSAL'S CONTENT — that it names the
+    // tensor, the device and the missing part — and that obligation outlives
+    // whichever device happens to lack the arm.
     std::string msg;
     try {
-      (void)vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCUDA);
+      (void)vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kMETAL);
     } catch (const std::exception& e) {
       msg = e.what();
     }
     CAPTURE(msg);
     // CHECK, not REQUIRE: a fatal assertion here aborts the whole test case and
-    // the two subcases below never report at all.
+    // the subcases below never report at all.
     CHECK_FALSE(msg.empty());
     CHECK(msg.find("per_layer_token_embd.weight") != std::string::npos);
-    CHECK(msg.find("cuda") != std::string::npos);
+    CHECK(msg.find("metal") != std::string::npos);
     // The refusal has to say what is MISSING, not only that something is.
     CHECK(msg.find("gather") != std::string::npos);
   }
 
-  SUBCASE("every non-CPU device refuses, because none of them decodes blocks") {
+  SUBCASE("every device WITHOUT a block gather still refuses") {
     for (vt::DeviceType d :
-         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
-          vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
+         {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+          vt::DeviceType::kROCM}) {
       CAPTURE(vt::DeviceTypeName(d));
       CHECK_THROWS_AS(
           (void)vllm::LoadQwen4ExpFromGguf(g, cfg, d),
           std::exception);
     }
+  }
+
+  SUBCASE("cuda LOADS, because KGATHER gave it a block-decoding gather") {
+    // The point of the whole row. Before KGATHER this device threw here, the
+    // n-gram table expanded to 95.368 GiB of host bf16 on every other route,
+    // and the model had no GPU arm. The load runs on a CPU-only build too: the
+    // device is a PARAMETER of the policy decision, not a place tensors go, so
+    // this asserts the admission and not a device transfer.
+    CHECK_NOTHROW((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                   vt::DeviceType::kCUDA));
   }
 
   SUBCASE("CPU loads, and so does an explicit kCPU") {

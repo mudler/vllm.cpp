@@ -265,6 +265,27 @@ change caused. It is not this row's, it is load-dependent rather than
 tree-dependent, and it is the ONLY preflight failure on this branch that KGATHER
 does not own.
 
+## The flip, as a procedure
+
+Staged at `/workspace/kgather/` on the shared NAS and queued on `dgx:gpu0` (job
+`38a9b799-7caa-4703-bfe2-4f393f6ac06c`). RED leg `e0188c50b` (decoders and test,
+no wiring), GREEN leg the branch head, then four mutations, a restore, and four
+sibling suites. The job asserts the DIRECTION of each verdict rather than
+printing an rc for a human to interpret, refuses to run a stale binary when a
+mutation fails to build, and calls `assertions: 0` a SKIP by name.
+
+When the GREEN leg reports `VERDICT(GREEN)=GREEN` with a non-zero assertion
+count, the flip is three edits in ONE commit:
+
+1. `src/vt/cuda/cuda_ops.cu` — uncomment `RegisterCudaBlockGather();` in the
+   registrar.
+2. `tests/vt/test_cuda_embedding_quant.cpp` — delete
+   `RegisterCudaGatherForTest` and its four call sites, and change the registrar
+   case's IFF to a plain `CHECK`.
+3. This spec and `docs/FEATURES.md` — the CUDA arm becomes reached.
+
+If it reports RED, the kernel is wrong on device and nothing flips.
+
 ## Owed
 
 - **The other four devices.** METAL, VULKAN, ROCM and TENSTORRENT gather

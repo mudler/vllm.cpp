@@ -27,11 +27,23 @@
 // device grids far more widely than a hand-built block would. Every index the
 // decoders form is masked into its grid's range, so arbitrary bytes are always
 // a legal block.
+// This suite OWNS its main so it can exit 77. doctest returns 0 after a case
+// returns early, printing "assertions: 0 | 0 passed | 0 failed" and
+// "Status: SUCCESS!", which in a log or a `&&` chain is indistinguishable from a
+// gate that ran on a GPU and matched an oracle (issue #463; tests/CMakeLists.txt
+// documents 77 as this tree's answer). Every value case below returns early
+// without a CUDA device, so on a CPU lane this printed a green that described
+// nothing -- the exact trap this row named on the thor run, one level up. The
+// static `vllm_test_main` is still linked; a translation unit that defines main
+// simply keeps the archive member from being extracted.
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -162,6 +174,46 @@ uint32_t Bits(float f) {
 // the load succeeds into a forward-time throw with the whole model resident --
 // the exact failure `DeviceKeepQuantSupported` already carries a per-device set
 // to avoid.
+// THE TRIPWIRE, and it runs on EVERY build.
+//
+// `DeviceQuantGatherSupported` is dtype-BLIND: it answers for the device and not
+// for the encoding, while `KeepQuantGatherDType` admits anything with a CPU
+// `BlockToFloat`. That is sound only while the two sets are EQUAL. A 19th block
+// dtype that gained a CPU decoder and no CUDA codec would pass the loader gate,
+// be kept quantized, and then throw at the FIRST FORWARD with the whole model
+// resident -- the #523 failure the sibling `DeviceKeepQuantSupported` avoids by
+// carrying a per-device dtype set.
+//
+// The equality itself can only be asserted where the CUDA list is linked, so the
+// case below is `#ifdef`-guarded. This one is not: it pins the CPU side to a
+// NAMED set, so adding a 19th decoder reds on a plain CPU build -- the lane
+// everyone runs -- and the failure message says what else has to move. Without
+// it the whole invariant rested on a CUDA lane, which is how a dtype-blind gate
+// goes wrong quietly.
+TEST_CASE("the CPU row-decoder set is PINNED, because the device gate is dtype-blind") {
+  const DType kDecodable[] = {
+      DType::kQ4_0,   DType::kQ5_0,     DType::kQ8_0,     DType::kQ2_K,
+      DType::kQ3_K,   DType::kQ4_K,     DType::kQ5_K,     DType::kQ6_K,
+      DType::kQ8_K,   DType::kIQ2_XXS,  DType::kIQ3_XXS,  DType::kIQ2_S,
+      DType::kIQ2_XS, DType::kIQ1_S,    DType::kIQ1_XXXS, DType::kIQ4_NL,
+      DType::kIQ4_XS, DType::kMXFP4,
+  };
+  int decodable = 0;
+  for (int i = 0; i <= static_cast<int>(DType::kIQ4_XS); ++i) {
+    const DType dt = static_cast<DType>(i);
+    if (vt::cpu::BlockToFloat(dt) != nullptr) ++decodable;
+  }
+  // If this fires you added (or removed) a CPU row decoder. A NEW one also owes
+  // a codec in src/vt/cuda/cuda_quant_dequant.cuh and a row in
+  // VT_DQ_GATHER_TYPES, or the CUDA gather silently stops covering what the
+  // loader admits -- see issue #2394 and the equality case below.
+  CHECK(decodable == static_cast<int>(std::size(kDecodable)));
+  for (const DType dt : kDecodable) {
+    CAPTURE(std::string(vt::Name(dt)));
+    CHECK(vt::cpu::BlockToFloat(dt) != nullptr);
+  }
+}
+
 TEST_CASE("CUDA gather decodes exactly the encodings the CPU decoder does") {
 #ifndef VLLM_CPP_CUDA
   MESSAGE("CPU-only build: the device decoder list is not linked; skipped");
@@ -442,4 +494,22 @@ TEST_CASE("CUDA gather reports an out-of-range id on a block table") {
   CAPTURE(msg);
   CHECK_FALSE(msg.empty());
   CHECK(msg.find("99") != std::string::npos);
+}
+
+// Exit 77 -> CTest reports SKIPPED. Returns the real rc first: a FAILURE must
+// never be laundered into a skip, so 77 is reached only on a clean run that had
+// no device to run on.
+int main(int argc, char** argv) {
+  doctest::Context context;
+  context.applyCommandLine(argc, argv);
+  const int rc = context.run();
+  if (context.shouldExit() || rc != 0) return rc;
+  if (!HasCuda()) {
+    std::fprintf(stderr,
+                 "test_cuda_embedding_quant: no CUDA backend on this host — the "
+                 "value cases did not run. Exiting 77 (SKIPPED) rather than 0, "
+                 "because \"assertions: 0 ... SUCCESS!\" is not a pass.\n");
+    return 77;
+  }
+  return 0;
 }

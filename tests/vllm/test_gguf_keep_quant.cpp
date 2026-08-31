@@ -486,13 +486,21 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // #2247, and they left the moment they got a dot kernel. The two
         // predicates still differ — this term is still not `cpu_capable` — but
         // Q8_K is now the only encoding that can prove it, which is worth saying
-        // out loud rather than discovering when Q8_K changes. On CUDA the whole
-        // gather arm is off, because `EmbeddingKernelCuda` cannot decode blocks;
-        // a kept table there would throw at the first forward.
+        // out loud rather than discovering when Q8_K changes.
+        //
+        // The DEVICE term is a REGISTRY QUERY since KGATHER, and it is asked of
+        // `OpRegistered` rather than of `DeviceQuantGatherSupported` on purpose.
+        // The predicate under test IS that function, so re-deriving the
+        // expectation from it would be a tautology; asking the registry one
+        // level below it asserts the real obligation, which is that
+        // `RouteGgufTensor`'s gather term follows what the running build
+        // actually registered. It cannot be hand-enumerated like `cpu_capable`
+        // above, because whether the CUDA registrar is linked is a property of
+        // the build and not of the encoding.
         const bool gather_cpu_capable = cpu_capable || type == kQ8_K;
-        const bool gather_device_capable =
-            vllm::platforms::CurrentPlatform().device_type() ==
-            vt::DeviceType::kCPU;
+        const bool gather_device_capable = vt::OpRegistered(
+            vt::OpId::kEmbeddingQuant,
+            vllm::platforms::CurrentPlatform().device_type());
         bool expect_keep = false;
         if (block_capable) {
           if (role == GgufTensorRole::kMatmulWeight && shape.size() == 2) {
@@ -510,10 +518,18 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
                                            ? GgufResidency::kKeepQuant
                                            : GgufResidency::kExpandBf16;
 
-        CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
-                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role,
-                              type, shape) == expected);
-        (expect_keep ? kept : expanded)++;
+        const GgufResidency got =
+            RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                            /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role, type,
+                            shape);
+        CHECK(got == expected);
+        // Counted from the ROUTING RESULT, not from `expect_keep`. Incrementing
+        // from the test's own expectation made the totals below a restatement of
+        // this loop's arithmetic, so `CHECK(kept == gemm_kept + gather_kept)`
+        // could not fail for any behaviour of `RouteGgufTensor` -- it had never
+        // fired. Counting `got` makes the totals an independent second reading
+        // of the same 576 routes.
+        (got == GgufResidency::kKeepQuant ? kept : expanded)++;
 
         // The master switch OFF expands everything, always.
         CHECK(RouteGgufTensor(/*keep_quant=*/false, /*keep_f16=*/false,
@@ -531,9 +547,9 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // device-dependent (review #523): 12 block-capable encodings x 2 keep-capable
   // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm (ROCm's
   // kernel set is {Q8_0, Q4_K, Q5_K, Q6_K}, and neither Q5_0 nor IQ4_NL nor
-  // either IQ*_XS is in it). The GATHER role adds 13 more on CPU ONLY (the 12,
-  // plus Q8_K, which has a decoder and no vec_dot) and nothing anywhere else,
-  // since only the CPU Embedding kernel decodes blocks. Written as named terms
+  // either IQ*_XS is in it). The GATHER role adds 13 more (the 12, plus Q8_K,
+  // which has a decoder and no vec_dot) on any device that REGISTERS the block
+  // gather, and nothing on a device that does not. Written as named terms
   // rather than one number so a future change to any one of them says which one
   // moved. Both moves are now on record and they are mirror images:
   // LOADER-GGUF-IQ (#2240) moved the GATHER term 11 -> 13 and left GEMM at 20,
@@ -542,9 +558,16 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // The gather total is UNCHANGED because those two encodings were already
   // gather-kept — which is the whole reason the two arms are separate
   // predicates.
+  //
+  // KGATHER made the gather term BUILD-DEPENDENT rather than CPU-only: CUDA
+  // registers `kEmbeddingQuant` too, so a CUDA build with a device keeps those
+  // 13. This term said `host == kCPU ? 13 : 0` and would have red 13 assertions
+  // on exactly the configuration the flip enables -- the case is the reason a
+  // CUDA lane must run this suite.
   const vt::DeviceType host = vllm::platforms::CurrentPlatform().device_type();
   const int gemm_kept = host == vt::DeviceType::kROCM ? 8 : 24;
-  const int gather_kept = host == vt::DeviceType::kCPU ? 13 : 0;
+  const int gather_kept =
+      vt::OpRegistered(vt::OpId::kEmbeddingQuant, host) ? 13 : 0;
   CHECK(kept == gemm_kept + gather_kept);
   CHECK(expanded == 16 * 36 - (gemm_kept + gather_kept));
 }

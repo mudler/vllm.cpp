@@ -670,9 +670,10 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
         vt::DeviceTypeName(device) +
         "' has no block-decoding gather kernel, so the table would expand to "
         "bf16 — 95.4 GiB of host memory on the released checkpoint, which the "
-        "on-disk device-fit guard (issue #1123) cannot see. The CUDA gather "
-        "arm is owed. Load this model with --device cpu. See "
-        ".agents/specs/qwen4-exp-flash-next.md and issue #2083.");
+        "on-disk device-fit guard (issue #1123) cannot see. CPU and CUDA both "
+        "gather blocks; this device's arm is owed (issue #2394). Load this "
+        "model with --device cpu or --device cuda. See "
+        ".agents/specs/cuda-quant-gather.md and issue #2083.");
   }
 
   // STRUCTURAL accounting. `enumerated` is what the name map expects for this

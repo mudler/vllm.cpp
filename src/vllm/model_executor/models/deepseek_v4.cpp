@@ -139,6 +139,10 @@ struct V4Backend {
   // same keys, and a step that wrote one and read the other would produce
   // plausible tokens from a stale context.
   std::vector<vt::Tensor>* paged_kv = nullptr;
+  // MODEL-DSV4-DSA-COMPOSE W1 (#2286): the compressor is a STATE MACHINE across
+  // steps, so its state is carried by the caller, one entry per layer. Null =>
+  // no compressor arm, which is every existing path.
+  DeepseekV4CompressorState* compressor = nullptr;
   // DSV4-DSPARK-DRAFTER W-3 (#1314): the KV rows in `paged_kv` were written by
   // SOMEONE ELSE, so this step must attend them WITHOUT writing its own.
   //
@@ -921,7 +925,13 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
            "both at once (KV-DSV4-MULTICACHE W5, #2323)");
   bool paged_attn = false;
   if (be.paged_kv != nullptr) {
-    VT_CHECK(!is_indexer && !is_comp,
+    // W1 (#2286): a `compress_ratio == 128` layer may proceed WHEN the caller
+    // supplies compressor state, because `CompressorLayerStep` composes it. Every
+    // other compressor shape, and the indexer, still refuse: `compress_ratio == 4`
+    // is `coff == 2` plus the Lightning Indexer and is W3's.
+    const bool comp_arm =
+        is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128;
+    VT_CHECK(!is_indexer && (!is_comp || comp_arm),
              "deepseek-v4: the paged MLA arm is dense-causal only; the indexer and "
              "compressor layers belong to MODEL-DSV4-DSA-COMPOSE (#2286)");
     VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
@@ -1026,6 +1036,23 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // tensor, one op call for the whole step. Proven equal to the loop below by
     // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
     // several `kv_base` values, with both off-by-one directions mutation-proven.
+    if (is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128) {
+      // The compressor arm. `deck` is this step's latents, `x` the hidden state the
+      // pool score projects from, and the state grows across steps.
+      DeepseekV4CompressorState& cs = *be.compressor;
+      VT_CHECK(static_cast<int64_t>(cs.state_kv.size()) > layer,
+               "deepseek-v4 compressor: state has no entry for this layer");
+      std::vector<int64_t> pos64(positions.begin(), positions.end());
+      o = deepseek_v4::CompressorLayerStep(
+          *be.q, x, deck, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
+          (*be.paged_kv)[static_cast<size_t>(layer)],
+          (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
+          (*be.paged_kv)[static_cast<size_t>(layer)].shape[1],
+          &cs.state_kv[static_cast<size_t>(layer)],
+          &cs.state_score[static_cast<size_t>(layer)],
+          &cs.comp_rows[static_cast<size_t>(layer)], pos64, kv_base, T, nh, H, hd,
+          p.compress_ratio(layer), p.sliding_window, eps, scale);
+    } else
     o = deepseek_v4::PagedCausalMlaAttention(
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
         (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
@@ -3169,7 +3196,8 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               const std::vector<int32_t>& token_ids,
                                               const std::vector<int32_t>& positions,
                                               const std::vector<int32_t>& logits_indices,
-                                              bool kv_prewritten) {
+                                              bool kv_prewritten,
+                                              DeepseekV4CompressorState* compressor) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3180,6 +3208,7 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.paged_kv = &paged_kv;
   be.paged_kv_prewritten = kv_prewritten;
+  be.compressor = compressor;
   be.kv_base = kv_base;
   be.grouped_moe = GroupedMoeEnabled();
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
@@ -3400,6 +3429,36 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
   be.exl3 = &weights.exl3;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                             V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the PAGED non-GGUF forward, which is what
+// makes the compressor arm reachable at all.
+//
+// `DeepseekV4ForwardGgufPaged` cannot host it: that arm binds `gguf`, so
+// `dsa_dense` is true and `is_comp` is false on every layer regardless of
+// `compress_ratios`. This one binds `exl3` and leaves `gguf` null, so the
+// compressor and indexer predicates are live, exactly as in the stateless
+// `DeepseekV4ForwardExl3` beside it.
+//
+// `compressor` is optional and null keeps the refusal, so adding this entry
+// changes no existing behaviour.
+std::vector<float> DeepseekV4ForwardExl3Paged(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices,
+    DeepseekV4CompressorState* compressor) {
+  VT_CHECK(weights.has_exl3_weights,
+           "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
+  VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
+           "DeepseekV4ForwardExl3Paged: one page tensor per layer is required");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.exl3 = &weights.exl3;
+  be.paged_kv = &paged_kv;
+  be.kv_base = kv_base;
+  be.compressor = compressor;
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
+                            logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
 
 std::vector<float> DeepseekV4Model::Forward(

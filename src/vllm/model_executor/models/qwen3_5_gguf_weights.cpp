@@ -83,7 +83,7 @@ inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset,
                                const GgufFile* mmap_src, bool repack,
-                               bool cuda_align) {
+                               bool cuda_align, bool prefault) {
   vt::DType dt = vt::DType::kF32;
   VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
            "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
@@ -169,12 +169,16 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
     o.mmap_fd = ss.fd;
     o.mmap_file_offset = ss.offset;
   }
-  PrefaultBorrowedSpan(src, bytes);  // fault at load, not in the timed prefill
+  // Not for a span the expert-streaming slot lane will serve: see the `prefault`
+  // note on the declaration. The lane preads each slice into its own slot, so a
+  // prefaulted tower is bytes read off disk into pages nothing reads.
+  if (prefault) PrefaultBorrowedSpan(src, bytes);
   return o;
 }
 
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
-                       int64_t row_offset, const GgufFile* mmap_src, bool nk, bool elem_kn_repack) {
+                       int64_t row_offset, const GgufFile* mmap_src, bool nk,
+                       bool elem_kn_repack, bool prefault) {
   VT_CHECK(KeepF16DType(tensor.ggml_type),
            "qwen3_5 gguf: keep-f16 on a non-f16 encoding for " + tensor.name);
   VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
@@ -233,7 +237,10 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
     o.mmap_fd = ss.fd;
     o.mmap_file_offset = ss.offset;
   }
-  PrefaultBorrowedSpan(src, bytes);  // fault at load, not in the timed prefill
+  // Not for a span the expert-streaming slot lane will serve: see the `prefault`
+  // note on the declaration. The lane preads each slice into its own slot, so a
+  // prefaulted tower is bytes read off disk into pages nothing reads.
+  if (prefault) PrefaultBorrowedSpan(src, bytes);
   return o;
 }
 

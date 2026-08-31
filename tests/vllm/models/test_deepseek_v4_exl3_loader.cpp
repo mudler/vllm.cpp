@@ -993,3 +993,80 @@ TEST_CASE("dsv4 exl3 R1: a tail of PLAIN tensors classifies without refusing") {
   CHECK(w.exl3.mtp.mxfp4 == 0);
   CHECK(w.exl3.mtp.refusal.empty());
 }
+
+TEST_CASE("W1: the compressor arm is REACHED from a production forward (#2286)") {
+  // The claim this earns: `CompressorLayerStep` is not a function that merely
+  // works. `test_deepseek_v4_gguf_load` records why the GGUF paged arm can never
+  // reach it -- `dsa_dense` makes every layer dense there -- so the proof has to
+  // come through the non-GGUF paged entry, which is what this drives.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};  // layer 1 carries the compressor
+  opt.real_dsa_geometry = false;   // the collapsed width the host forward indexes
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers;
+  const int64_t hd = w.params.head_dim;
+  const int64_t bs = 8, nb = 4;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+        {nb, bs, hd});
+  }
+
+  vllm::DeepseekV4CompressorState cs;
+  cs.Resize(nlayers);
+
+  int64_t kv_base = 0;
+  for (int step = 0; step < 2; ++step) {
+    const std::vector<int32_t> tok{static_cast<int32_t>(1 + step)};
+    const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
+    const auto lg = vllm::DeepseekV4ForwardExl3Paged(w, q, pages, kv_base, tok, pos,
+                                                     {0}, &cs);
+    REQUIRE(lg.size() == static_cast<size_t>(w.params.vocab_size));
+    for (const float v : lg) REQUIRE(std::isfinite(v));
+    kv_base += 1;
+  }
+
+  // THE REACHABILITY CLAIM: the compressor layer's state grew, one row per step,
+  // which only the composed arm produces. A dense fallback leaves it empty.
+  CHECK(cs.state_kv[1].size() == static_cast<size_t>(2 * hd));
+  CHECK(cs.state_score[1].size() == static_cast<size_t>(2 * hd));
+  // Layer 0 has no compressor, so its state must stay untouched.
+  CHECK(cs.state_kv[0].empty());
+  // Two tokens close no window at ratio 128.
+  CHECK(cs.comp_rows[1].empty());
+}
+
+TEST_CASE("W1: without compressor state the same layer REFUSES (#2286)") {
+  // The guard is what stops a compressor layer attending the raw prefix. Adding
+  // the arm must not make its absence silent.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};
+  opt.real_dsa_geometry = false;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers, hd = w.params.head_dim;
+  const int64_t bs = 8, nb = 4;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+        {nb, bs, hd});
+  }
+  const std::vector<int32_t> tok{1}, pos{0};
+  CHECK_THROWS(vllm::DeepseekV4ForwardExl3Paged(w, q, pages, 0, tok, pos, {0},
+                                                /*compressor=*/nullptr));
+}

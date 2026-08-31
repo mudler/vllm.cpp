@@ -588,3 +588,159 @@ TEST_CASE("W1: window + compressed merged equals ONE pass over the union") {
   // the second contributor entirely.
   CHECK(vs_win > 1e-3 * mag);
 }
+
+TEST_CASE("W1: the compressor layer step is a STATE MACHINE across steps") {
+  // `MODEL-DSV4-DSA-COMPOSE` W1 (#2286). The pieces are gated individually; what
+  // is NOT is the cycle that drives them, and the cycle is where a compressor goes
+  // wrong -- it is stateful, so an error shows up as a plausible value several
+  // tokens after the mistake rather than at it.
+  //
+  // A ratio of 4 is used as the STATE-MACHINE shape here (the boundary arithmetic
+  // is what is under test); the production guard pins `compress_ratio == 128`,
+  // which the refusal case below covers.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 2, H = 16, cr = 128, win = 4;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const float eps = 1e-6f;
+
+  const int64_t bs = 16, nb = 4;
+  std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+  vt::Tensor t_cache = Contig(cache.data(), vt::DType::kF32, q.device, {nb, bs, hd});
+
+  const std::vector<float> wgate = Rand(static_cast<size_t>(hd * H), 811u, 0.05f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * hd), 812u, 0.05f);
+  const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
+  std::vector<float> sink(static_cast<size_t>(nh), -0.1f);
+
+  std::vector<float> st_kv, st_score, rows, last_out;
+  // Drive several single-token steps and watch the state GROW, which is the only
+  // externally visible sign the machine is running at all.
+  std::vector<size_t> state_after;
+  for (int64_t t = 0; t < 6; ++t) {
+    const std::vector<float> x = Rand(static_cast<size_t>(H), 900u + t, 0.2f);
+    const std::vector<float> kv = Rand(static_cast<size_t>(hd), 950u + t, 0.2f);
+    const std::vector<float> qq = Rand(static_cast<size_t>(nh * hd), 990u + t, 0.2f);
+    for (int64_t d = 0; d < hd; ++d) cache[static_cast<size_t>(t * hd + d)] = kv[static_cast<size_t>(d)];
+
+    const std::vector<float> out = vllm::deepseek_v4::CompressorLayerStep(
+        q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, nb, bs, &st_kv, &st_score,
+        &rows, {t}, /*kv_base=*/t, /*num_tokens=*/1, nh, H, hd, cr, win, eps, scale);
+
+    REQUIRE(out.size() == static_cast<size_t>(nh) * hd);
+    for (const float v : out) REQUIRE(std::isfinite(v));
+    state_after.push_back(st_kv.size());
+    last_out = out;
+  }
+
+  // The state must ACCUMULATE one row per step: a machine that reset each step
+  // would hold `hd` forever and still return finite, plausible outputs.
+  for (size_t i = 1; i < state_after.size(); ++i)
+    CHECK(state_after[i] > state_after[i - 1]);
+  CHECK(state_after.back() == static_cast<size_t>(6 * hd));
+
+  // At ratio 128 no window has CLOSED after 6 tokens, so nothing is compressed yet
+  // and the answer must be the window pass alone.
+  CHECK(rows.empty());
+
+  // EXACTLY the window pass, not merely something finite. The earlier version of
+  // this case checked only finiteness, and a mutation dropping the SINK from the
+  // window pass survived it: the outputs stayed finite and still differed from a
+  // window-only reference, because that reference kept its own sink. Comparing
+  // against the sinked window pass bit for bit is what pins it.
+  std::vector<float> ref_lse;
+  const std::vector<float> x6 = Rand(static_cast<size_t>(H), 900u + 5, 0.2f);
+  (void)x6;
+  const std::vector<float> qq6 = Rand(static_cast<size_t>(nh * hd), 990u + 5, 0.2f);
+  const std::vector<float> ref = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qq6, t_cache, nb, bs, 1, nh, hd, /*kv_base=*/5, sink, scale,
+      /*no_sink=*/false, win, &ref_lse);
+  REQUIRE(ref.size() == last_out.size());
+  for (size_t i = 0; i < ref.size(); ++i)
+    CHECK(last_out[i] == doctest::Approx(ref[i]).epsilon(1e-6));
+}
+
+TEST_CASE("W1: the compressor step REFUSES the coff == 2 shape") {
+  // `compress_ratio == 4` is overlapped windows plus the Lightning Indexer, which
+  // is W3. Accepting it here would run the coff == 1 arithmetic on a shape whose
+  // gathering window is twice as wide.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 1, H = 8;
+  std::vector<float> cache(static_cast<size_t>(1 * 16 * hd), 0.0f);
+  vt::Tensor t_cache = Contig(cache.data(), vt::DType::kF32, q.device, {1, 16, hd});
+  std::vector<float> st_kv, st_score, rows;
+  const std::vector<float> x(static_cast<size_t>(H), 0.1f);
+  const std::vector<float> kv(static_cast<size_t>(hd), 0.1f);
+  const std::vector<float> qq(static_cast<size_t>(nh * hd), 0.1f);
+  const std::vector<float> wgate(static_cast<size_t>(hd * H), 0.01f);
+  const std::vector<float> ape(static_cast<size_t>(4 * hd), 0.01f);
+  const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
+  const std::vector<float> sink(static_cast<size_t>(nh), 0.0f);
+  CHECK_THROWS(vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, 1, 16, &st_kv, &st_score, &rows,
+      {0}, 0, 1, nh, H, hd, /*compress_ratio=*/4, 4, 1e-6f, 1.0f));
+}
+
+TEST_CASE("W1: a step that CLOSES a window emits rows and the merge runs") {
+  // The case above never reaches the emit path: at ratio 128, six tokens close no
+  // window, so `emitted` is always empty and a mutation dropping the appended rows
+  // survived it untouched. This crosses a real boundary -- 128 tokens, so
+  // `(127 + 1) % 128 == 0` closes exactly one window -- which is the only shape in
+  // which the emit-and-merge half is observable.
+  //
+  // num_heads == 1 because `MergeWindowAndCompressed` requires T or H to be 1 for
+  // the two LSE layouts to coincide, and here T is 128.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 1, H = 16, cr = 128, win = 8, T = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const float eps = 1e-6f;
+
+  const int64_t bs = 16, nb = (T + bs - 1) / bs;
+  std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+  vt::Tensor t_cache = Contig(cache.data(), vt::DType::kF32, q.device, {nb, bs, hd});
+
+  const std::vector<float> wgate = Rand(static_cast<size_t>(hd * H), 1811u, 0.05f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * hd), 1812u, 0.05f);
+  const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
+  const std::vector<float> sink(static_cast<size_t>(nh), -0.1f);
+
+  const std::vector<float> x = Rand(static_cast<size_t>(T * H), 1900u, 0.2f);
+  const std::vector<float> kv = Rand(static_cast<size_t>(T * hd), 1950u, 0.2f);
+  const std::vector<float> qq = Rand(static_cast<size_t>(T * nh * hd), 1990u, 0.2f);
+  std::copy(kv.begin(), kv.end(), cache.begin());
+
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = t;
+
+  std::vector<float> st_kv, st_score, rows;
+  const std::vector<float> out = vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, nb, bs, &st_kv, &st_score, &rows,
+      pos, /*kv_base=*/0, T, nh, H, hd, cr, win, eps, scale);
+
+  // EXACTLY ONE window closed, so exactly one compressed row exists.
+  CHECK(rows.size() == static_cast<size_t>(hd));
+  double mag = 0.0;
+  for (const float v : rows) {
+    REQUIRE(std::isfinite(v));
+    mag = std::max(mag, std::abs(static_cast<double>(v)));
+  }
+  CHECK(mag > 1e-6);  // an all-zero row would satisfy the size check alone
+
+  REQUIRE(out.size() == static_cast<size_t>(T * nh) * hd);
+  double omag = 0.0;
+  for (const float v : out) {
+    REQUIRE(std::isfinite(v));
+    omag = std::max(omag, std::abs(static_cast<double>(v)));
+  }
+  CHECK(omag > 1e-6);
+
+  // And the merge is LOAD-BEARING: the same step with the compressed history
+  // withheld must differ, or the emitted row changed nothing.
+  std::vector<float> lse_only;
+  const std::vector<float> window_only = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qq, t_cache, nb, bs, T, nh, hd, /*kv_base=*/0, sink, scale,
+      /*no_sink=*/false, win, &lse_only);
+  double diff = 0.0;
+  for (size_t i = 0; i < out.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(out[i] - window_only[i])));
+  CHECK(diff > 1e-6);
+}

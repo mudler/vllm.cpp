@@ -6,6 +6,7 @@
 // No cycle: `deepseek_v4_dsa.h` includes only <cstdint> and <vector>, and
 // `deepseek_v4.h` does not include it back.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -354,6 +355,64 @@ std::vector<float> MergeWindowAndCompressed(vt::Queue& queue,
                                             {num_heads, num_tokens});
   vt::MergeAttnStates(queue, t_out, nullptr, t_wo, t_wl, t_co, t_cl2, -1);
   return merged;
+}
+
+std::vector<float> CompressorLayerStep(
+    vt::Queue& queue, const std::vector<float>& x, const std::vector<float>& kv,
+    const std::vector<float>& q, const std::vector<float>& comp_wgate,
+    const std::vector<float>& comp_ape, const std::vector<float>& comp_norm_weight,
+    const std::vector<float>& attn_sink, vt::Tensor& window_cache,
+    int64_t num_blocks, int64_t block_size, std::vector<float>* state_kv,
+    std::vector<float>* state_score, std::vector<float>* comp_rows,
+    const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
+    int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
+    int64_t sliding_window, float eps, float scale) {
+  VT_CHECK(compress_ratio == 128,
+           "deepseek-v4 compressor step: this is the coff == 1 shape only; "
+           "compress_ratio 4 is coff == 2 and belongs to W3 (#2286)");
+  VT_CHECK(state_kv != nullptr && state_score != nullptr && comp_rows != nullptr,
+           "deepseek-v4 compressor step: the state is CARRIED, not owned here");
+  VT_CHECK(static_cast<int64_t>(x.size()) == num_tokens * hidden,
+           "deepseek-v4 compressor step: x must be [num_tokens, hidden]");
+  VT_CHECK(static_cast<int64_t>(kv.size()) == num_tokens * head_dim,
+           "deepseek-v4 compressor step: kv must be [num_tokens, head_dim]");
+  VT_CHECK(static_cast<int64_t>(comp_wgate.size()) == head_dim * hidden,
+           "deepseek-v4 compressor step: comp_wgate is [coff*head_dim, hidden] and "
+           "coff is 1 here");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
+           "deepseek-v4 compressor step: one position per token");
+
+  // 1. The pool score this layer selects with.
+  std::vector<float> score(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
+  for (int64_t t = 0; t < num_tokens; ++t) {
+    for (int64_t d = 0; d < head_dim; ++d) {
+      double acc = 0.0;
+      const float* w = &comp_wgate[static_cast<size_t>(d * hidden)];
+      const float* xt = &x[static_cast<size_t>(t * hidden)];
+      for (int64_t h = 0; h < hidden; ++h) acc += static_cast<double>(w[h]) * xt[h];
+      score[static_cast<size_t>(t * head_dim + d)] = static_cast<float>(acc);
+    }
+  }
+
+  // 2-3. Drive the state machine and keep whatever closed this step.
+  const std::vector<float> emitted =
+      CompressorStepCycle(state_kv, state_score, kv, score, comp_ape, positions,
+                          comp_norm_weight, eps, compress_ratio, head_dim);
+  comp_rows->insert(comp_rows->end(), emitted.begin(), emitted.end());
+
+  // 4. The window pass carries the sink and keeps its LSE.
+  std::vector<float> win_lse;
+  const std::vector<float> win_out = PagedCausalMlaAttention(
+      queue, q, window_cache, num_blocks, block_size, num_tokens, num_heads, head_dim,
+      kv_base, attn_sink, scale, /*no_sink=*/false, sliding_window, &win_lse);
+
+  // 5. Nothing closed yet => the window IS the answer. Merging an empty second
+  //    contributor would divide by an empty denominator rather than be a no-op.
+  const int64_t n_rows = static_cast<int64_t>(comp_rows->size()) / head_dim;
+  if (n_rows == 0) return win_out;
+
+  return MergeWindowAndCompressed(queue, win_out, win_lse, q, *comp_rows, n_rows,
+                                  num_tokens, num_heads, head_dim, scale);
 }
 
 }  // namespace vllm::deepseek_v4

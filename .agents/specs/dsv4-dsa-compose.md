@@ -222,7 +222,12 @@ compressed row -- a closed window is history, so no causal bound applies among
 them -- and `VT_CHECK(num_tokens == 1 || num_heads == 1)` holds the point where
 the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
-does not get one yet; it is listed under `## Owed`.
+does not get one yet; it is listed under `## Owed
+
+- **The compressor state's relationship to PREFIX CACHING**, before the runner
+  carries it. See the section above: `has_inner_state` is architecture-wide and
+  gates prefix caching, while the compressor state is one arm's, and a prefix hit
+  would leave that state missing the rows the skipped tokens owed it.`.
 
 The gate this section demanded is `tests/vllm/models/test_deepseek_v4_paged_equiv.cpp`,
 "W1: two LSE-merged passes equal one pass over the union". Three mutations prove
@@ -319,6 +324,131 @@ allocates all 167 buffers and refuses naming W5. AGENTS.md `## History is git`
 is explicit -- "Before you conclude anything about past work, read the spec and
 run `git log -S`" -- and `git log --oneline --grep '2068'` shows `ca3dcda21`
 immediately. It was not run.
+
+## W1's layer step LANDED
+
+`CompressorLayerStep` composes one `compress_ratio == 128` layer's decode step:
+the pool-score projection, `CompressorStepCycle` driving the carried state,
+appending whatever closed, the window pass carrying the sink and keeping its LSE,
+and `MergeWindowAndCompressed` folding in the compressed history with NO sink. It
+refuses `compress_ratio == 4` by name, since that is `coff == 2` and W3's.
+
+Nothing calls it yet, so the resolver's refusal stays exactly where it is.
+
+**Three holes were found in its gate by mutation, and two of them looked like
+coverage.** A six-token run at ratio 128 closes NO window, so `emitted` is always
+empty and dropping the appended rows survived untouched; a 128-token step that
+crosses `(127 + 1) % 128 == 0` is the only shape in which that half is
+observable. And checking finiteness plus "differs from window-only" could not see
+the SINK being dropped from the window pass, because the window-only reference
+kept its own sink and the outputs merely differed more. Comparing the
+no-rows-closed case bit for bit against the sinked window pass is what pins it.
+
+The four mutations that now run red: the state reset each step, the emitted rows
+dropped, `coff == 2` accepted, and the window pass losing its sink.
+
+## The runner cannot simply hold the compressor state, and the reason is prefix caching
+
+The remaining step before the resolver's refusal may narrow is the runner carrying
+the compressor state across steps, since the gate supplies it by hand.
+`DeepseekV4LoadedModel` persists and could hold it, so the change looks like three
+lines. It is not, and the constraint was found before writing them.
+
+**`has_inner_state` gates prefix caching.**
+`LoadedEngine::ResolveEnablePrefixCaching` returns
+`!is_hybrid && !has_inner_state` (`model_loader.cpp:1179`), so declaring inner
+state turns prefix caching OFF by default. This row's registration currently
+declares `false`, and flipping it is model-wide: it would disable prefix caching
+for the GGUF arm too, which carries no compressor state and would lose the
+optimisation for nothing. The flag describes an ARCHITECTURE; the compressor
+state belongs to one arm.
+
+**And the interaction is real, not merely a flag.** A prefix-cache hit skips
+recomputing tokens whose KV is already cached. The compressor's pooled history is
+DERIVED from those tokens, so on a hit the carried state would be missing exactly
+the rows the skipped tokens would have contributed, and the layer would attend a
+compressed history with holes in it. That is the silent-plausible-output failure
+this row exists to avoid, and it would appear only on cache hits.
+
+So the next brick owes a decision rather than an implementation: either the
+compressor state is REBUILDABLE from a cached prefix, or a prefix hit must
+invalidate it, or the arm must declare itself incompatible with prefix caching
+per-arm rather than per-architecture. That is a scheduler-facing choice this row
+does not own, and it is filed here rather than guessed at.
+
+## W1's arm is REACHED from production
+
+`DeepseekV4ForwardExl3Paged` is the paged non-GGUF entry the arm needed. It binds
+the EXL3 tower and leaves `gguf` null, so `dsa_dense` is false and the compressor
+predicate is live -- the stateless `DeepseekV4ForwardExl3` beside it already had
+that shape and simply carried no pages.
+
+Gated in `test_deepseek_v4_exl3_loader`: a two-layer fixture whose layer 1 is
+`compress_ratio == 128`, driven for two single-token steps, must come back with
+that layer's carried state holding one row per step while layer 0's stays empty.
+Only the composed arm produces that; a dense fallback leaves it empty. Three
+mutations run red -- the call site deleted, the guard disabled so a compressor
+layer proceeds without state, and the entry dropping the state before it reaches
+the backend.
+
+So `CompressorLayerStep` is no longer a function that merely works. What remains
+before the resolver's refusal may narrow is the runner carrying this state across
+steps, since the gate supplies it by hand.
+
+## The compressor arm is wired, and the GGUF forward CANNOT reach it
+
+`V4Backend::compressor` carries the per-layer state and `AttentionBlock`'s paged
+arm routes a `compress_ratio == 128` layer through `CompressorLayerStep` when it
+is supplied. `DeepseekV4ForwardGgufPaged` surfaces it as an optional argument, and
+null keeps the existing refusal.
+
+**That public entry can never reach it, and two tests written against it failed
+before the assumption was caught.** `dsa_dense` is `(be.gguf != nullptr)` and
+`is_comp` is `has_compressor(layer) && !dsa_dense`, so on the GGUF arm EVERY layer
+is dense regardless of `compress_ratios`. A ratio-128 layer driven through that
+forward leaves the carried state empty and the guard silent, because neither is
+consulted. It is what the arm IS: the GGUF converter never carried compressor
+tensors, and `dsa_dense` says so once for the whole arm.
+
+So the arm is reachable only from a NON-GGUF paged forward, and this tree has no
+public one. That is now the concrete blocker for W1's reachability, ahead of the
+refusal narrowing, and it is smaller than it sounds: the EXL3 arm already loads
+and composes, it simply has no paged entry point yet.
+
+## The refusal narrows LAST, not first
+
+Attempted 2026-08-31 and REVERTED, because the attempt is the natural first move
+and it is wrong.
+
+`ResolveDeepseekV4SwaPages` refuses every compressor layer. Narrowing it to refuse
+only `compress_ratio == 4` -- W3's `coff == 2` overlapped windows plus the
+Lightning Indexer -- looks like progress, since W1's `MergeWindowAndCompressed`
+has landed and `compress_ratio == 128` is `coff == 1`. It builds, and
+`test_deepseek_v4_paged_equiv` catches it immediately.
+
+The primitive exists; NOTHING CALLS IT. So a narrowed refusal does not enable the
+composition, it removes the guard in front of the arm that cannot do it: those 20
+layers would attend the RAW PREFIX and emit entirely plausible tokens from the
+wrong key set. A loud refusal becomes a silent wrong answer, which is the exact
+trade this row exists to prevent.
+
+**The order is: wire the forward, gate it, THEN narrow the refusal.** The refusal
+is not the work; it is what makes the missing work visible.
+
+## What the REAL artifact needs, counted
+
+From the artifact's own `config.json`, `compress_ratios` over 46 layers:
+
+| shape | layers | wave |
+|---|---|---|
+| dense (`0`) | 5 | already handled |
+| `compress_ratio == 128` (`coff == 1`) | 20 | W1 |
+| `compress_ratio == 4` (`coff == 2` + indexer) | 21 | W3 |
+
+So finishing W1 covers 20 of the 41 compressor layers and does NOT make the real
+artifact loadable. The other 21 need W3, including the Lightning Indexer's learned
+top-k, which is the hardest mechanism in this row. Any plan that reads
+"DSA-COMPOSE finishes" as one more wave is mis-sized by the harder half.
 
 ## Work breakdown
 

@@ -428,6 +428,22 @@ struct DeepseekV4Exl3Weights {
   DeepseekV4MtpInventory mtp{};
 };
 
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the compressor's carried state, one entry per
+// layer. The compressor pools a CLOSED window into one row, so it is stateful
+// across steps and its failure mode is a plausible value several tokens after the
+// mistake. The caller owns this so the state's lifetime is explicit.
+struct DeepseekV4CompressorState {
+  std::vector<std::vector<float>> state_kv;
+  std::vector<std::vector<float>> state_score;
+  std::vector<std::vector<float>> comp_rows;
+
+  void Resize(int64_t num_layers) {
+    state_kv.assign(static_cast<size_t>(num_layers), {});
+    state_score.assign(static_cast<size_t>(num_layers), {});
+    comp_rows.assign(static_cast<size_t>(num_layers), {});
+  }
+};
+
 struct DeepseekV4Weights {
   DeepseekV4Params params{};
   // Accounting from the verified name-map pass (W2 gate): how many checkpoint
@@ -673,7 +689,25 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               // its query comes from its own hidden
                                               // state; nothing else in this tree has
                                               // those two from different sources.
-                                              bool kv_prewritten = false);
+                                              bool kv_prewritten = false,
+                                              // MODEL-DSV4-DSA-COMPOSE W1 (#2286):
+                                              // supply carried compressor state to
+                                              // enable the `compress_ratio == 128`
+                                              // arm. Null keeps the refusal.
+                                              DeepseekV4CompressorState* compressor =
+                                                  nullptr);
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the paged NON-GGUF forward. The GGUF paged
+// arm binds `gguf`, which forces `dsa_dense` and makes `is_comp` false on every
+// layer; this one binds the EXL3 tower instead, so the compressor predicate is
+// live and a `compress_ratio == 128` layer can take the composed arm when
+// `compressor` state is supplied. Null keeps the refusal.
+std::vector<float> DeepseekV4ForwardExl3Paged(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {},
+    DeepseekV4CompressorState* compressor = nullptr);
 
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,

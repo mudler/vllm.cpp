@@ -3920,7 +3920,10 @@ All six mutations were re-run after this refactor.
   this spec cites dangle for a reader even though the API is writable again.
   A 403 on writes and a hidden issue on reads are different failures, they were
   conflated on this row, and only the second one is still live. Separately,
-  `IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1711-1739`) returns
+  `IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu`, the function of that
+  name -- a LINE RANGE was written here first and `origin/main` `c2daafb23`
+  invalidated it inside this very branch, which is the drift this file keeps
+  recording) returns
   false for IQ4_NL, Q4_0, Q5_0 and Q8_0, so the mixer's quantized projection
   route through `vt::MatmulBT` refuses or drains to the host on a CUDA queue —
   also another wave's, also owed. See `### W6-CUDA-B` below.
@@ -7265,7 +7268,10 @@ SAY.** `ModelRegistry::Forward` is all-or-nothing and `EmbeddingKernelCuda` stil
 refuses a block-quantized table by name, so the block-decoding n-gram gather has
 no CUDA arm and no `qwen4_exp` step can reach a CUDA queue. That gather is a
 separate wave's file territory and is deliberately untouched here. Separately,
-`IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1711-1739`) returns
+`IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu`, the function of that
+  name -- a LINE RANGE was written here first and `origin/main` `c2daafb23`
+  invalidated it inside this very branch, which is the drift this file keeps
+  recording) returns
 false for IQ4_NL, Q4_0, Q5_0 and Q8_0, so the MoE seam and this wave's own
 quantized projection route either drain to the host or refuse — also another
 wave's. The reachability of these four arms from a production entry point is
@@ -7276,7 +7282,10 @@ claims a token, a decode or a speed number.
 story worth telling.** Three CUDA arms already existed and were unreachable
 BEHIND these four — `vt::Qwen4ExpPleConv` and `vt::Qwen4ExpPleGate`
 (`cuda_qwen4_exp_ple.cu:371,374`) and `vt::Qwen4ExpGatedResidualWriteBack`
-(`cuda_qwen4_exp.cu:194`). Each sits IMMEDIATELY AFTER a CPU-only op in the same
+(`cuda_qwen4_exp.cu`, the `RegisterOp(OpId::kQwen4ExpGatedResidualWriteBack, ...)`
+line -- it was `:194` before this wave added the mixer to the same Registrar and
+pushed it down, a stale anchor created INSIDE its own change). Each sits
+IMMEDIATELY AFTER a CPU-only op in the same
 function: `qwen4_exp_ple_block.cpp:489` and `:499` are `vt::RmsNormGroup` calls
 that precede the gate at `:531` and the conv at `:580`; `qwen4_exp_forward.cpp:418`
 and `:476` are mixer calls that precede the write-back at `:457` and `:506`. So

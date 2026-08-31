@@ -303,6 +303,10 @@ model support.
   by #2411 and does not become a static-source pass.
 - An eligible leased TP4 topology for the official arm and one device with enough
   memory for the combined GGUF arm.
+- Device execution uses the resource-controller fleet only. Every CUDA, ROCm or
+  Vulkan command runs inside `rc run` after `rc describe`; no direct SSH may
+  substitute for a lease. The 2026-08-31 fleet provides NVIDIA devices
+  `dgx:gpu0`, `thor:gpu0` and `orin:gpu0`, plus AMD `strix:gpu0`.
 - Existing `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm` ownership
   for optional DSpark. This row accounts for that tail but does not absorb it.
 
@@ -332,6 +336,9 @@ model support.
 | W4 | Merge, visibility and cached language forward | Registered forward consumes image embeddings, image-span attention matches the oracle, image prefill is atomic, decode does not rerun vision, text-only DeepSeek remains byte-identical |
 | W5 | Runner, public ABI and OpenAI serving | Multiple data-URI and HTTP(S) PNG/JPEG images reach `ModelRegistry::Forward` in order; Qwen and Gemma multimodal smoke cases remain unchanged |
 | W6 | Real-checkpoint correctness, speed and publication | Greedy gate passes on the pinned reference and quantized arm; TTFT, vision encode, prefill, decode and memory are recorded; user documents name exact weights |
+| W7-CUDA | CUDA device path | A leased NVIDIA device runs the vision, merge and generation gates through the CUDA provider; the full-artifact arm uses a device/topology with enough memory |
+| W7-ROCM | ROCm device path | `strix:gpu0` runs the HIP/ROCm provider gates through `rc run`; unsupported full-artifact residency is recorded as a memory blocker, never replaced by a CPU result |
+| W7-VULKAN | Vulkan device path | `strix:gpu0` runs the Vulkan provider under RADV on the physical `AMD Radeon Graphics (RADV GFX1151)` device; the gate rejects llvmpipe or any CPU Vulkan device |
 
 A fresh implementer owns each implementation wave from the committed spec. A
 fresh reviewer inspects each immutable head, mutates every claimed guarantee and
@@ -357,6 +364,10 @@ does not repair them.
   image prompts, then real-checkpoint generated ids.
 - `test_deepseek_v4_mm_server`: OpenAI multi-image request through the actual
   server surface, including PNG/JPEG data URIs and HTTP(S) media.
+- `test_deepseek_v4_vision_device`: the same reduced-shape tower, aligner and
+  merge cases run through CUDA, ROCm and Vulkan providers, with backend-specific
+  tolerances derived from the CPU/oracle result and an assertion naming the
+  physical device/provider.
 
 Every test enters through the lowest production seam that can observe its
 contract. W4 and later include a reachability mutation: remove the registered
@@ -371,6 +382,26 @@ first behavioral command that can falsify its own scope.
 Each implementation wave records its focused and full commands before it moves
 to `ACTIVE`. W6 uses committed oracle and server harnesses so the exact
 revision, images, prompts and sampling parameters are reviewable.
+
+## Backend gate matrix
+
+The operator schedules each device gate through resource-controller and records
+the job id, selected device, backend build identity and contention state.
+Long jobs set a maximum runtime. A missing toolkit is installed or staged inside
+the leased worker as its usage sheet permits; it never authorizes a direct SSH
+run.
+
+| Path | Leased device | Required proof |
+|---|---|---|
+| CUDA | `dgx:gpu0` for the full model; `thor:gpu0` or `orin:gpu0` may run reduced device cases when their memory and architecture fit | CUDA provider selected, device buffers remain resident, reduced stage numerics pass, then the eligible real-artifact gate passes |
+| ROCm | `strix:gpu0` | HIP build selects the ROCm provider, reduced stage numerics and memory-format checks pass on Radeon-8060S, and no CPU reference-tier fallback is reported |
+| Vulkan | `strix:gpu0` | Vulkan build selects RADV GFX1151, not llvmpipe; reduced stage numerics and buffer residency pass through the Vulkan provider |
+
+The Vulkan capability was measured under resource-controller job
+`9eeefe15-1221-4dbf-938a-a0e1d18518bb`: Vulkan 1.3.275 exposed physical device
+`AMD Radeon Graphics (RADV GFX1151)` with RADV/Mesa 25.2.8. ROCm and Vulkan may
+use the same physical leased device in separate jobs and separate builds; the
+providers are distinct gate results.
 
 ## Oracle evidence
 
@@ -392,6 +423,9 @@ After correctness:
 - steady cached decode tokens/s;
 - peak and resident memory;
 - concurrency 1 and the first supported concurrent batch.
+- the same correctness, residency, TTFT and decode axes for each applicable
+  CUDA, ROCm and Vulkan arm, labelled with the resource-controller device and
+  job id.
 
 The denominator is the pinned model-author runtime until vLLM implements the
 model. When vLLM gains support, the row reconciles onto vLLM and reruns every
@@ -424,6 +458,10 @@ a ceiling.
 9. **The upstream repository is experimental.** Every source and artifact link
    uses the 40-hex pin. A force-push or replacement checkpoint triggers the stop
    condition below.
+10. **Backend parity is explicit.** CUDA success cannot stand in for ROCm or
+    Vulkan. Each provider receives its own leased build and execution result.
+    A backend that cannot hold the complete artifact keeps that axis
+    `PENDING` on measured memory while its reduced device path remains required.
 
 ## Stop conditions
 
@@ -435,6 +473,9 @@ a ceiling.
 - The combined quantized arm cannot preserve the released tensor set or fit an
   available gate device: the row remains incomplete; do not publish a sidecar
   workaround as support.
+- Resource-controller reports no matching healthy device or loses a worker:
+  keep only that backend gate `PENDING`, record the controller/device state, and
+  do not bypass the lease with direct SSH or substitute another backend.
 - Current vLLM lands a complete implementation before W1: stop and rebase the
   design onto that exact vLLM revision rather than maintaining the model-author
   runtime as the mirror source.
@@ -447,6 +488,9 @@ a ceiling.
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
 - The combined GGUF artifact, its revision and SHA-256 are owed by issue #2411
   and W3.
+- CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
+  W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
+  any of the three.
 - W1 prompt encoding and image preprocessing remain unreachable from a
   production entry point. W4 wires them into the registered model forward, and
   W5 wires the runner, public ABI and OpenAI server for row

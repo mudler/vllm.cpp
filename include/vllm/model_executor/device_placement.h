@@ -94,6 +94,48 @@ class DevicePlacement {
   bool trivial_ = true;
 };
 
+// ── W4: the `fit` auto-resolver (#2384) ──────────────────────────────────────
+
+// How the active placement was ARRIVED AT. The install is unconditional, so a
+// fit-resolved plan, a stated one and a bare one all report the same
+// `resolved_layer_count()`; without provenance a reachability test cannot tell a
+// working `--fit` from one that resolved nothing, which is the #2382 trap.
+enum class PlacementOrigin {
+  kNone,   // no placement asked for
+  kStated, // overrides / cpu_moe / n_cpu_moe: the operator said where
+  kFit,    // `--fit`: the resolver decided
+};
+
+const char* PlacementOriginName(PlacementOrigin origin);
+
+// What the fit resolver decided, and the arithmetic it decided it from. The
+// inputs are reported alongside the answer because an operator who cannot see
+// the budget and the footprint cannot tell a wrong placement from a wrong
+// budget.
+struct MoeFitResolution {
+  bool resolved = false;       // false => placed nothing, and `reason` says why
+  int64_t placed_layers = 0;   // trailing layers whose experts go to the CPU
+  size_t budget_bytes = 0;
+  size_t footprint_bytes = 0;
+  size_t placed_bytes = 0;     // what placing those layers removes from the device
+  bool still_exceeds = false;  // every layer placed and it STILL does not fit
+  std::string reason;          // why it resolved to nothing, empty when it did
+};
+
+// THE ARITHMETIC, as a pure function so it is testable with no device, no
+// checkpoint and no loader. `moe_bytes_per_layer` is indexed by layer, and a
+// dense layer contributes 0.
+//
+// Fills from the LAST layer backwards, mirroring `common/fit.cpp`'s back-to-front
+// order, so the layers nearest the output are the first to leave the device.
+//
+// A ZERO budget means UNKNOWN, not "nothing fits" — `device_memory_total_bytes`
+// is 0 on every platform that does not probe one, and treating that as a budget
+// of zero would place every layer on a box that was simply not measured.
+MoeFitResolution ResolveMoeFitFromSizes(
+    size_t footprint_bytes, size_t budget_bytes,
+    const std::vector<size_t>& moe_bytes_per_layer);
+
 // The per-LAYER decision, resolved once from a `DevicePlacement` at model build.
 //
 // WHY A SECOND TYPE. `DevicePlacement` answers by tensor NAME, which is the form
@@ -145,6 +187,12 @@ class MoePlacementPlan {
   int64_t resolved_layer_count() const {
     return static_cast<int64_t>(per_layer_.size());
   }
+
+  // How this plan was arrived at. See `PlacementOrigin`.
+  PlacementOrigin origin() const { return origin_; }
+  void set_origin(PlacementOrigin origin) { origin_ = origin; }
+  const MoeFitResolution& fit() const { return fit_; }
+  void set_fit(const MoeFitResolution& fit) { fit_ = fit; }
   vt::DeviceType engine_device() const { return engine_device_; }
 
   // One line for the install log, empty when nothing is placed.
@@ -154,6 +202,8 @@ class MoePlacementPlan {
   std::vector<vt::DeviceType> per_layer_;
   vt::DeviceType engine_device_ = vt::DeviceType::kCPU;
   int64_t placed_ = 0;
+  PlacementOrigin origin_ = PlacementOrigin::kNone;
+  MoeFitResolution fit_{};
 };
 
 // The three routed-expert tensor names llama.cpp's GGUF export uses for a layer,

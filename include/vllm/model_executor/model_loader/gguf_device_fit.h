@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
@@ -282,6 +283,16 @@ GgufStagedFootprint GgufStagedWeightFootprint(
 // TOTAL rather than FREE on purpose: `free` at load time carries the page cache
 // and whatever else the box is doing, which would make the verdict a function
 // of contention. `total` is a device property.
+// Routed-expert bytes per layer, indexed by layer; a dense layer contributes 0.
+// The `fit` resolver's right-hand side (#2384).
+//
+// Counted with `LlmFfnExpsBlockRegex(idx)` — the SAME pattern a `cpu_moe` or
+// `n_cpu_moe` override is expanded from — so the bytes priced here are exactly
+// the bytes a resulting placement moves. Pricing with a second, similar pattern
+// would let the resolver believe it freed memory the placement never touches.
+std::vector<size_t> GgufRoutedExpertBytesPerLayer(const GgufFile& gguf,
+                                                  int64_t num_hidden_layers);
+
 size_t DeviceWeightBudgetBytes(size_t device_memory_total_bytes);
 
 // The verdict. `refuse == false` with a zero budget means "not decided",

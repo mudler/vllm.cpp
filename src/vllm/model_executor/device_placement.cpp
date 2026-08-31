@@ -273,6 +273,76 @@ void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
                n, path);
 }
 
+const char* PlacementOriginName(PlacementOrigin origin) {
+  switch (origin) {
+    case PlacementOrigin::kStated: return "stated";
+    case PlacementOrigin::kFit: return "fit";
+    case PlacementOrigin::kNone: break;
+  }
+  return "none";
+}
+
+MoeFitResolution ResolveMoeFitFromSizes(
+    size_t footprint_bytes, size_t budget_bytes,
+    const std::vector<size_t>& moe_bytes_per_layer) {
+  MoeFitResolution r;
+  r.budget_bytes = budget_bytes;
+  r.footprint_bytes = footprint_bytes;
+
+  // UNKNOWN is not "nothing fits". `device_memory_total_bytes` is 0 on every
+  // platform that does not probe one, and comparing against 0 would place every
+  // layer on a box that was merely not measured — a wrong placement that looks
+  // exactly like a working resolver.
+  if (budget_bytes == 0) {
+    r.reason =
+        "the device memory budget is UNKNOWN (the platform reports no total), "
+        "so there is nothing to fit against; placing nothing rather than "
+        "placing everything against a budget of zero";
+    return r;
+  }
+  if (footprint_bytes == 0) {
+    r.reason =
+        "the model's weight footprint could not be priced, so the resolver has "
+        "no left-hand side; placing nothing rather than guessing";
+    return r;
+  }
+
+  // A placeable layer is one that actually HAS routed experts. A dense layer
+  // contributes nothing, and counting it as placed would claim a saving of zero
+  // while telling the operator a layer moved.
+  int64_t placeable = 0;
+  for (const size_t bytes : moe_bytes_per_layer)
+    if (bytes > 0) ++placeable;
+  if (placeable == 0) {
+    r.reason =
+        "the model has no routed-expert layers, so a placement has nothing to "
+        "move";
+    return r;
+  }
+
+  r.resolved = true;
+  if (footprint_bytes <= budget_bytes) return r;  // already fits; place nothing
+
+  // Fill from the LAST layer backwards, mirroring `common/fit.cpp`'s
+  // back-to-front order, so the layers nearest the output leave the device
+  // first. Whole layers only: a boundary layer that would need splitting is
+  // taken entirely, which is the coarser granularity this row's spec sanctions.
+  const size_t must_free = footprint_bytes - budget_bytes;
+  for (auto it = moe_bytes_per_layer.rbegin(); it != moe_bytes_per_layer.rend();
+       ++it) {
+    if (*it == 0) continue;  // dense: nothing to move, and not counted as placed
+    r.placed_bytes += *it;
+    ++r.placed_layers;
+    if (r.placed_bytes >= must_free) return r;
+  }
+
+  // Every placeable layer is on the CPU and it still does not fit. Upstream
+  // would also reduce the context here; this resolver does not, so it reports
+  // the shortfall instead of implying success.
+  r.still_exceeds = true;
+  return r;
+}
+
 void SetActiveMoePlacementPlan(const MoePlacementPlan& plan) {
   PlacementGlobals& g = Globals();
   std::lock_guard<std::mutex> lk(g.mu);

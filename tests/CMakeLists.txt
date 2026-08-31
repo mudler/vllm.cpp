@@ -1687,6 +1687,10 @@ target_include_directories(test_placement_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_placement_dump_dtype
   vllm/model_executor/test_placement_dump_dtype.cpp)
 target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_moe_fit_resolver
+  vllm/model_executor/test_moe_fit_resolver.cpp)
+target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already
 # drives `vllm_engine_load` with the same JSON string, so a test that called the

@@ -838,6 +838,7 @@ target_include_directories(test_deepseek_v4_gguf_load PRIVATE ${CMAKE_CURRENT_SO
 # LOSSLESS gate (DS4 draft + DS4 target verified by the shared RejectionSampler ==
 # pure target greedy => MTP-on == MTP-off). See .agents/specs/deepseek-v4-mtp.md.
 vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
+vllm_cpp_add_test(test_deepseek_v4_mtp_inventory vllm/models/test_deepseek_v4_mtp_inventory.cpp)
 # MODEL-DSV4-EXL3 W1b — the rank-sliced EXL3 loader arm: a hermetic four-rank
 # fixture through the PRODUCTION loader entry, coalesced TP4->TP1 and checked
 # byte-for-byte against the rank inputs, plus refuse-by-name for every arm the

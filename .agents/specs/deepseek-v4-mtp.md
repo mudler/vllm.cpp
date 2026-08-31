@@ -229,7 +229,11 @@ that the oracle does not, once a weight-carrying GGUF exists.
 - **R3:** register `DeepSeekV4MTP` as the speculator for `DeepseekV4ForCausalLM` in the engine
   spec-config path (the C++ analogue of registry.py:617) once R2's driver exists.
 - **R4:** device MTP draft forward (reuse the DS4 device kernels) for decode-graph speed; the W1
-  landing is the host oracle, mirroring how the DS4 model itself gated host-first.
+  landing is the host oracle, mirroring how the DS4 model itself gated host-first. This is not
+  optional for the throughput claim: `num_experts_per_tok` is 6 of 216, so one token's routed
+  experts are 6 x 3 x [2048, 4096] = 604 MB of f32 weights, and a host draft forward cannot be
+  the fast path at any batch size. R1b's borrowed views exist so the head can stay quantized
+  until a device path consumes it.
 
 ## Gates
 
@@ -241,6 +245,124 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | No regression | `test_deepseek_v4_forward` 6/6, `test_deepseek_v4_gguf_load` 12/12 (the `ForwardComposeImpl` residual-capture out-param is inert when null) | PASS |
 | Real-model MTP-on==MTP-off + acceptance/speedup | 80.7 GB `ds4flash.gguf` on GB10 | **BLOCKED for the GGUF arm** — that file has no nextn tensors (§4) |
 | Real-model MTP-on==MTP-off + acceptance/speedup | NAS `dsv4-flash-0731-spark-exl3`, `mtp.{0,1,2}.*` un-skipped | **OPEN, not blocked** — three NVFP4 heads are present (§4 correction); needs R1 un-skip + NVFP4 expert dequant + R2/R3 |
+
+### WHICH ARM — the two the goal needs are not the same one
+
+Measured from the safetensors headers of the NAS EXL3 checkpoint (177 files,
+2026-08-31), because this decides where every later brick lands:
+
+| part | GiB |
+|---|---|
+| routed experts | 82.59 |
+| everything else | 8.23 |
+| **resident, tp1, mtp skipped** | **90.82** |
+| MTP heads (all three) | 8.62 |
+
+A GB10's ~119 GiB usable pool leaves **~28 GiB of headroom**, so all three heads
+load with roughly 19.6 GiB left for KV and activations. The loader already
+coalesces TP4 to TP1, so the four rank files are disjoint slices and this is the
+whole tower rather than a quarter of it.
+
+That matters because the two arms split the two properties this row needs. The
+**GGUF** arm runs on one Spark at ~14.96 tok/s and carries NO MTP tensors, the
+converter having dropped them. The **EXL3** arm carries three heads and, by the
+number above, also fits. So the MTP gate belongs on the EXL3 arm, and the GGUF
+nextn re-conversion is one way to reach the other arm rather than a precondition
+for the row.
+
+§0's "MEMORY-INFEASIBLE on one GB10" is NOT a verdict on this checkpoint. It is
+about the 156.7 GiB NVFP4 safetensors. Two artifacts, two verdicts, and this
+spec previously named only one of them.
+
+Still unmeasured, and named so it is not mistaken for settled: whether the
+carried FP8 half is widened at load, which would move the 8.23 GiB row, and the
+real resident total from `ReportDeepseekV4Exl3Residency` on the box. 90.82 GiB is
+a packed byte count taken from headers, not a residency measurement.
+
+### THE ARTIFACT'S HEAD IS NOT THE SHAPE W1b BUILT FOR
+
+W1b implemented the draft forward against vLLM's `nvidia/mtp.py`, whose checkpoint
+carries `enorm`, `hnorm`, `e_proj`, `h_proj`, `shared_head` and `hc_head_*`
+(`_rewrite_spec_layer_name`, :504-508). `DeepseekV4MtpHostWeights` mirrors exactly
+that.
+
+The SparkInfer artifact this row would gate on carries something else. Its 32
+non-expert tensors per head are, in full: `attn.{attn_sink, kv_norm.weight,
+q_norm.weight, wq_a, wq_b, wkv, wo_a, wo_b}`, `attn_norm.weight`,
+`ffn.gate.{weight, bias}`, `ffn.shared_experts.w{1,2,3}`, `ffn_norm.weight`,
+`hc_attn_{fn, base, scale}`, `hc_ffn_{fn, base, scale}`, and --
+**`main_norm.weight` and `main_proj.weight`**. There is no `enorm`, no `hnorm`,
+no `e_proj`, no `h_proj`, no `shared_head`, and no `hc_head_*`.
+
+`main_proj.weight` is `F8_E4M3 [4096, 12288]`, i.e. `[H, 3H]`. That is not
+DeepSeek-V3's fused `eh_proj`, which is `[H, 2H]` over
+`concat(enorm(embed), hnorm(hidden))`. A THIRD hidden-width input goes into this
+projection and this spec does not yet know what it is. `hc_attn_fn` is
+`[24, 16384]`, so `hc_mult = 4` and `(2 + hc) * hc = 24` -- the head carries its
+own MHC mixing, per-block rather than the single `hc_head` collapse our struct
+holds.
+
+**Nothing here should be mapped onto our struct by name similarity.** Guessing
+that `main_proj` is `eh_proj` with an extra stream would produce a head that runs,
+emits finite logits, and drafts badly -- and because MTP is lossless by
+construction, the OUTPUT would still be correct, so the only symptom would be an
+acceptance rate nobody can explain. That is the most expensive shape of wrong
+available here.
+
+What settles it is the producer, not inference: the artifact was quantized by
+`exllamav3` (this row's registered secondary oracle) at rev `787d1582`, and
+`main_proj` appears nowhere in this tree. Reading that source is a precondition
+for R1c, and R1c is not startable until it is read.
+
+### R1b — why there is no host float tower for the head
+
+Arithmetic first, because it removes an option rather than choosing one. One
+head's routed experts are 216 experts x 3 projections x [2048, 4096] = 5.44G
+values. As host f32 that is **20.2 GiB per head and 60.8 GiB for the three this
+artifact carries**, next to a target that already fills the box. So
+`DeepseekV4MtpHostWeights`, which is all `std::vector<float>`, cannot hold this
+head, and R1b does not try.
+
+The tail is BORROWED instead. `RouteDeepseekV4MtpTail` builds per-head views that
+point into the shard mapping and own nothing, and
+`DequantizeDeepseekV4MtpTensor` expands exactly one tensor when a caller wants it,
+choosing the reader from the classified format so a consumer cannot pick the wrong
+one.
+
+One trap is written into the type. For MXFP4 the stored shape is `[N, K/2]`,
+because two e2m1 nibbles share a byte, so the view carries a LOGICAL `in_dim` of
+`2 * shape[1]`. Reading `shape[1]` as the width halves every routed expert and
+still produces finite numbers, which no shape assertion would catch; the gate
+mutates exactly that.
+
+The gate hand-computes its expectations from the formats rather than comparing
+against the same helper the code calls -- otherwise it would prove the two agree
+and still pass if the wrong reader were chosen. It also carries a SECOND fp8
+block row with a different scale, because the first version read only row 0, where
+every block extent picks `scale[0]`, and a mutation changing the extent from 128
+to 64 survived it.
+
+### R1a — what landed, and what it deliberately does NOT do
+
+`ClassifyDeepseekV4MtpTail` turns the blanket skip into an accounted inventory:
+per-format counts, a head count taken from the TENSORS rather than from
+`num_nextn_predict_layers`, and a by-name report for any layout this arm has no
+reader for. The loader fills it on every safetensors load
+(`w.exl3.mtp`), and the skip itself is unchanged -- vLLM skips the tail in the
+main loader too, because a separate model owns it.
+
+It is a REPORT, never a throw. The 156.7 GiB NVFP4 checkpoint's tail uses the
+double-scale variant (`weight_scale` + `weight_scale_2` + `input_scale`), and
+throwing here would break loads that work today. R1b refuses at the point where a
+head is actually wanted.
+
+Gated two ways, because the two claims are different. `test_deepseek_v4_mtp_inventory`
+states the measured artifact's real shapes as data and exercises the classifier
+directly: group-16 NVFP4 is refused rather than read as MXFP4, a quantized weight
+with no scale is refused by name, and a scale that does not tile its weight at
+128x128 is refused. `test_deepseek_v4_exl3_loader` drives the PRODUCTION load and
+reads the inventory off the weights, so deleting the loader's call site reds it --
+which is what separates "the function works" from "anything reaches it".
 
 ## Dependencies
 
@@ -258,6 +380,9 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | W1a loader | `DeepseekV4MtpHostWeights` struct + `DeepseekV4GgufHasMtp` absence guard + un-skip the safetensors `mtp.*` accounting | DONE |
 | W1b draft forward | `DeepseekV4MtpDraftLogitsHost` (nextn layer + compute_logits, 1:1 nvidia/mtp.py) + `DeepseekV4TargetMtpResidualHost` residual stash | DONE |
 | W1c gate | `test_deepseek_v4_mtp` (finite + RED-first + lossless verify) | DONE |
+| R1a inventory | the loader CLASSIFIES the `mtp.*` tail instead of only counting it (`ClassifyDeepseekV4MtpTail`); fp8-block at 128x128 and MXFP4 at group 32 are recognised, anything else is reported by name | DONE |
+| R1b routing | the tail is routed to BORROWED views (`RouteDeepseekV4MtpTail`) and dequantized one tensor at a time (`DequantizeDeepseekV4MtpTensor`); the residency question is answered by keeping it quantized, NOT by a host float tower | DONE |
+| R1c head assembly | drive the routed views into a draft forward. BLOCKED, not merely residual: the artifact's head carries `main_norm`/`main_proj` `[H, 3H]` and no `enorm`/`hnorm`/`e_proj`/`h_proj`, so the mapping onto `DeepseekV4MtpHostWeights` is unknown and must be read out of `exllamav3` rather than guessed | BLOCKED |
 | R2 decode-loop | DS4-native propose/verify over `ForwardResidentDecodeGguf` (stash residual, draft k=1, verify) | RESIDUAL |
 | R3 engine register | wire `DeepSeekV4MTP` as the engine speculator (C++ analogue of registry.py:617) | RESIDUAL |
 | R4 device draft | device MTP forward for decode-graph speed | RESIDUAL |

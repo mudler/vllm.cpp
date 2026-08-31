@@ -56,6 +56,8 @@
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"
 #include "vllm/model_executor/models/qwen4_exp_ple.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/op_provider.h"  // vt::OpRegistered — the gather capability is a registry fact
+#include "vt/ops.h"
 #include "vt/dtype.h"
 #include "vt/quant.h"
 
@@ -772,9 +774,12 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
     CHECK(msg.find("gather") != std::string::npos);
   }
 
-  SUBCASE("every device the residency gate does not admit still refuses") {
+  SUBCASE("every device with no block-decoding gather in ANY build still refuses") {
+    // kCUDA is deliberately NOT in this list any more: it is build-dependent and
+    // the subcase above asks the registry about it. These three have no gather
+    // arm in any build.
     for (vt::DeviceType d :
-         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+         {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
           vt::DeviceType::kROCM}) {
       CAPTURE(vt::DeviceTypeName(d));
       CHECK_THROWS_AS(
@@ -783,17 +788,24 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
     }
   }
 
-  SUBCASE("cuda still refuses, because KGATHER landed the kernel and not the flip") {
-    // KGATHER gave CUDA a block-decoding gather, so the KERNEL half of this
-    // refusal is discharged. The residency half is not: admitting the device in
-    // `DeviceQuantGatherSupported` means naming it in the device-agnostic
-    // loader, which `check-device-leakage.py` refuses, and doing it properly
-    // needs an `OpId` for the block gather. This case pins the CURRENT
-    // behaviour so the flip cannot arrive silently -- when it lands, this
-    // subcase is what has to change, deliberately, in that change.
-    CHECK_THROWS_AS((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
-                                                     vt::DeviceType::kCUDA),
-                    std::exception);
+  SUBCASE("cuda follows the OP TABLE, not a hardcoded verdict") {
+    // KGATHER made the gather a registered capability
+    // (`OpId::kEmbeddingQuant`), so whether this device loads is decided by
+    // whether THIS BUILD linked the CUDA registrar -- not by a constant here.
+    // Asserting a fixed verdict would make this case a second, competing
+    // source of truth about the same fact, and the two would drift the first
+    // time a backend gained or lost the arm.
+    const bool gathers =
+        vt::OpRegistered(vt::OpId::kEmbeddingQuant, vt::DeviceType::kCUDA);
+    CAPTURE(gathers);
+    if (gathers) {
+      CHECK_NOTHROW((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                     vt::DeviceType::kCUDA));
+    } else {
+      CHECK_THROWS_AS((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                       vt::DeviceType::kCUDA),
+                      std::exception);
+    }
   }
 
   SUBCASE("CPU loads, and so does an explicit kCPU") {

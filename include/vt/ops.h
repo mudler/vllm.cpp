@@ -726,6 +726,28 @@ enum class OpId : uint8_t {
   // those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleGate,
+  // The DEQUANTIZING GATHER (KGATHER): `vt::Embedding` over a BLOCK-QUANTIZED
+  // table, decoding one row per gathered id. It is a separate op id from
+  // `kEmbedding` and not a dtype branch inside it, for one reason: a device's
+  // ability to decode a block row is a CAPABILITY the GGUF residency policy has
+  // to ask about BEFORE it decides where a tensor lives, and the only
+  // device-agnostic way to ask is the provider table. `DeviceQuantGatherSupported`
+  // (gguf_keep_quant.cpp) is `OpRegistered(kEmbeddingQuant, dev)` and names no
+  // device, exactly as `GgufQuantComputeAvailable()` beside it asks about
+  // `kMatmulBTQuant`; the alternative was a hand-kept per-device set in the
+  // shared loader, which `scripts/check-device-leakage.py` refuses and which
+  // could drift from the kernels it claims to describe.
+  //
+  // `vt::Embedding` routes here when `IsBlockQuant(table.dtype)`, so a device
+  // that registers only `kEmbedding` refuses a block table BY NAME through the
+  // ordinary GetOp message instead of silently gathering garbage. Registered on
+  // kCPU (src/vt/cpu/cpu_ops.cpp, the same kernel — it already branches on the
+  // table dtype) and on kCUDA (src/vt/cuda/cuda_ops.cu, decoders in
+  // src/vt/cuda/cuda_quant_dequant.cuh). METAL, VULKAN, ROCM and TENSTORRENT
+  // are NOT registered: each of their gather kernels asserts a float table by
+  // name, and their arms are owed.
+  // Appended before kCount so no existing op's id shifts.
+  kEmbeddingQuant,
   kCount
 };
 

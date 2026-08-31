@@ -40,6 +40,7 @@
 #include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
+#include "vt/op_provider.h"  // vt::OpRegistered — the seam the policy queries
 #include "vt/ops.h"
 #include "vt/quant.h"  // vt::cpu::BlockToFloat
 #include "vt/tensor.h"
@@ -175,6 +176,44 @@ TEST_CASE("CUDA gather decodes exactly the encodings the CPU decoder does") {
     CAPTURE(std::string(vt::Name(dt)));
     CHECK(vt::cuda::EmbeddingQuantSupported(dt) ==
           (vt::cpu::BlockToFloat(dt) != nullptr));
+  }
+#endif
+}
+
+// The SEAM is reached, not merely present. `vt::Embedding` routes a block table
+// to `OpId::kEmbeddingQuant` (vt/ops.cpp) and the GGUF residency policy asks
+// `OpRegistered(kEmbeddingQuant, dev)` rather than naming a device, so if the
+// CUDA registrar did not link, the whole chain would silently answer "this
+// device cannot gather quantized" and every table would go back to expanding to
+// bf16 — with no throw, no log, and every value gate in this file still green
+// because it would simply skip. That is the failure this case exists to catch.
+TEST_CASE("the CUDA block gather is REGISTERED, so the residency policy can find it") {
+#ifndef VLLM_CPP_CUDA
+  MESSAGE("CPU-only build: the CUDA registrar is not linked; skipped");
+#else
+  // The CPU arm, which the residency policy compares against. A build property,
+  // not a device property: it holds with no card present, which is what makes
+  // this a check on the registrar rather than on the host.
+  CHECK(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kCPU));
+
+  // CUDA is NOT registered YET, and that is the state under test rather than an
+  // oversight. Since the gate became a registry query, this registration IS the
+  // residency flip, and it is withheld until the value cases below have run
+  // GREEN ON A CUDA HOST — they are skips on a host with no device, and a skip
+  // is not a pass.
+  //
+  // WHEN THAT RUN IS GREEN: uncomment the RegisterOp in cuda_ops.cu and change
+  // this one line to CHECK. Both edits belong in the same commit, and this case
+  // is what stops the registration arriving without anyone deciding to add it.
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kCUDA));
+
+  // The four with no decoder must NOT be registered in any build: registering
+  // the id without writing the decoder converts a clean load-time refusal into a
+  // forward-time throw with the whole model resident.
+  for (DeviceType d : {DeviceType::kMETAL, DeviceType::kVULKAN, DeviceType::kROCM,
+                       DeviceType::kTENSTORRENT}) {
+    CAPTURE(vt::DeviceTypeName(d));
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kEmbeddingQuant, d));
   }
 #endif
 }

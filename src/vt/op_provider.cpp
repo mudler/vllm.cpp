@@ -286,6 +286,8 @@ const char* OpNameImpl(OpId op) {
       return "RopeNeox";
     case OpId::kEmbedding:
       return "Embedding";
+    case OpId::kEmbeddingQuant:
+      return "EmbeddingQuant";
     case OpId::kCausalConv1dFwd:
       return "CausalConv1dFwd";
     case OpId::kCausalConv1dUpdate:

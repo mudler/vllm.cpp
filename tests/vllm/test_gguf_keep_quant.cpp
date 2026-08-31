@@ -43,6 +43,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/op_provider.h"  // vt::OpRegistered — the gather gate is a registry query
 #include "vt/quant.h"
 
 using gguf_test::F32Kv;
@@ -676,32 +677,43 @@ TEST_CASE("the gather table's admission is the DECODER, not the vec_dot") {
   }
 }
 
-TEST_CASE("the gather's DEVICE gate admits exactly the kernels that decode a row") {
-  // KGATHER. `DeviceQuantGatherSupported` is a DEVICE predicate with no dtype,
-  // and that is only sound because the CUDA decoder list is the same list
-  // `vt::cpu::BlockToFloat` answers for -- `tests/vt/test_cuda_embedding_quant.cpp`
-  // asserts that equality on a CUDA build, and this case asserts the device
-  // membership the policy reads.
+TEST_CASE("the gather's DEVICE gate is the OP TABLE, not a hand-kept device list") {
+  // KGATHER. `DeviceQuantGatherSupported` is `OpRegistered(kEmbeddingQuant, dev)`
+  // and names no device. That is not a style preference: the GGUF loader is the
+  // device-agnostic layer, `scripts/check-device-leakage.py` refuses a device
+  // enumerator in it, and a per-device set written here drifts from the kernels
+  // it claims to describe. `GgufQuantComputeAvailable()` asks the same way for
+  // the GEMM arm.
   //
-  // CPU and CUDA decode a block row: `cpu_ops.cpp EmbeddingKernel` through
-  // `BlockToFloat`, and `EmbeddingKernelCuda` through
-  // `src/vt/cuda/cuda_quant_dequant.cuh`. Nothing else does, and each of the
-  // others says so by name in its own kernel (e.g. `tenstorrent_ops.cpp`:
-  // "tenstorrent kEmbedding: float table, f32/bf16 out"). A device added to
-  // this predicate without a decoder turns a clean LOAD-TIME refusal into a
-  // throw at the first forward with the whole model resident, which is the
-  // failure the #523 review named and the reason the gate exists at all.
+  // The predicate therefore answers for the BUILD, which is the point: a CUDA
+  // build links the cuda_ops registrar and a CPU-only build does not, and the
+  // residency decision must follow what is actually linked rather than what the
+  // source could in principle do.
   CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kCPU));
-  // CUDA is NOT here, and the reason is recorded rather than left to be guessed:
-  // the device now HAS a block-decoding gather (`cuda_quant_dequant.cuh`), but
-  // admitting it in this predicate means naming the device in the
-  // device-agnostic loader, which `check-device-leakage.py` refuses. The fix is
-  // an `OpId` for the block gather so this asks the registry instead, and it is
-  // its own scoped change. Until then a gather table on CUDA keeps expand-bf16,
-  // and this case is what would notice a flip that skipped that work.
+  CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kCPU) ==
+        vt::OpRegistered(vt::OpId::kEmbeddingQuant, vt::DeviceType::kCPU));
+
+  // Derived from the registry on BOTH sides rather than hardcoded to a build
+  // flavour — the same shape the keep_quant default case below uses, and the
+  // reason this case reads identically on a CPU-only and a CUDA build.
   for (vt::DeviceType d :
        {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
         vt::DeviceType::kROCM, vt::DeviceType::kTENSTORRENT}) {
+    CAPTURE(vt::DeviceTypeName(d));
+    CHECK(vllm::DeviceQuantGatherSupported(d) ==
+          vt::OpRegistered(vt::OpId::kEmbeddingQuant, d));
+  }
+
+  // The four that have no block-decoding gather in ANY build: each of their
+  // `kEmbedding` kernels asserts a float table by name (e.g. tenstorrent_ops.cpp
+  // "tenstorrent kEmbedding: float table, f32/bf16 out"), none registers
+  // `kEmbeddingQuant`, and their arms are owed. A backend that registered the
+  // quant id without writing the decoder would turn a clean load-time refusal
+  // into a forward-time throw with the whole model resident — the #523 failure —
+  // so this half stays an absolute assertion and not a registry echo.
+  for (vt::DeviceType d :
+       {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN, vt::DeviceType::kROCM,
+        vt::DeviceType::kTENSTORRENT}) {
     CAPTURE(vt::DeviceTypeName(d));
     CHECK_FALSE(vllm::DeviceQuantGatherSupported(d));
   }

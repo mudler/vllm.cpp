@@ -3789,6 +3789,13 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4Kernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    // The same kernel serves both ids: `EmbeddingKernel` already branches on
+    // `IsBlockQuant(table.dtype)` and decodes one row per id through
+    // `BlockToFloat`. Registering it under the quant id is what makes the CPU's
+    // block-gather capability VISIBLE to `OpRegistered`, which is how the GGUF
+    // residency policy asks the question without naming a device.
+    RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
     RegisterOp(

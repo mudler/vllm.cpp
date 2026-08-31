@@ -1547,7 +1547,14 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
            "embedding: contiguous required");
   VT_CHECK(table.device == out.device && ids.device == table.device && table.device == q.device,
            "embedding: device mismatch (table/out/ids/queue)");
-  reinterpret_cast<EmbeddingFn>(GetOp(OpId::kEmbedding, q.device.type))(q, out, table, ids);
+  // A block table is a DIFFERENT capability, so it is a different op id. The
+  // split is what lets the GGUF residency policy ask "can this device decode a
+  // block row" through the provider table instead of naming devices in the
+  // loader, and it is what makes a device that lacks the arm refuse BY NAME
+  // here -- GetOp throws naming the op and the device -- rather than dispatch
+  // into a kernel that would assert on the dtype one frame later.
+  const OpId op = IsBlockQuant(table.dtype) ? OpId::kEmbeddingQuant : OpId::kEmbedding;
+  reinterpret_cast<EmbeddingFn>(GetOp(op, q.device.type))(q, out, table, ids);
 }
 
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,

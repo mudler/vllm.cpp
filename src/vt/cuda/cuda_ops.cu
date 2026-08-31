@@ -3946,6 +3946,34 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+    // KGATHER -- AND THE ONE LINE THAT IS DELIBERATELY NOT HERE YET.
+    //
+    // `EmbeddingKernelCuda` branches on `IsBlockQuant(table.dtype)` and routes a
+    // block table to `LaunchEmbeddingQuant` (decoders in
+    // vt/cuda/cuda_quant_dequant.cuh), so the capability EXISTS. Registering it
+    // under `OpId::kEmbeddingQuant` is what would make it visible to
+    // `OpRegistered`, which is what `DeviceQuantGatherSupported` asks -- so that
+    // registration IS the residency flip, now that the gate is a query rather
+    // than a device list. There is no separate line to flip any more.
+    //
+    // It is withheld because nvcc has never compiled these decoders and no
+    // device has ever executed them. The evidence today is a HOST transcription
+    // proof: the decoders compiled as ordinary C++ against the CPU tables agree
+    // bit-for-bit on 13,428,192 elements across all 18 encodings. That proves
+    // the transliteration, not the kernel.
+    //
+    // Registering it early would not fail loudly -- it would route EVERY GGUF
+    // model's block-typed gather table on CUDA into never-executed code, keeping
+    // the blocks resident and decoding them on device, with no throw and no log
+    // if the decode were wrong. That is the exact failure class this row spent a
+    // day isolating (dropped repack markers -> NaN -> all-zero logits -> every
+    // token id 0). So the gather arm on CUDA is UNREACHED and OWED until
+    // tests/vt/test_cuda_embedding_quant.cpp runs green on a CUDA host; the row
+    // is MODEL-MM-QWEN4-EXP and .agents/specs/cuda-quant-gather.md lists it
+    // under `## Owed`. Uncommenting the two lines below is the whole flip.
+    //
+    // RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCUDA,
+    //            reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
     RegisterOp(

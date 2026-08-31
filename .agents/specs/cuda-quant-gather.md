@@ -165,7 +165,46 @@ defaulting `blockIdx.x` and `threadIdx.x` to 1 alongside the extents, so the
 single host thread started at index 2. The defect was the instrument's and read
 as the kernel's.
 
-## Blocked: the flip fails `check-device-leakage.py`, and the gate is right
+## The gate is a REGISTRY QUERY, and the flip is one registration
+
+The first shape of this row named the device: `dev == kCPU || dev == kCUDA` in
+`gguf_keep_quant.cpp`. That failed `scripts/check-device-leakage.py`, which was
+right — the GGUF loader is the device-agnostic layer, and a hand-kept per-device
+set written into it drifts from the kernels it claims to describe.
+
+The fix is the one the checker's own message names, and it is now in:
+
+- `OpId::kEmbeddingQuant` (`include/vt/ops.h`, appended before `kCount` so no
+  existing id shifts).
+- `vt::Embedding` routes to it when `IsBlockQuant(table.dtype)`, so a device with
+  no block gather refuses BY NAME through the ordinary `GetOp` message instead of
+  dispatching into a kernel that asserts on the dtype one frame later.
+- `DeviceQuantGatherSupported(dev)` is `vt::OpRegistered(kEmbeddingQuant, dev)`.
+  It names no device, exactly as `GgufQuantComputeAvailable()` beside it asks
+  about `kMatmulBTQuant`. `check-device-leakage.py` reports rc 0, DSR 32 ==
+  baseline 32 — verified, not assumed.
+- kCPU registers the same `EmbeddingKernel` under both ids (it already branches
+  on the table dtype). The four devices whose gather kernels assert a float table
+  by name register neither.
+
+**A consequence worth stating, because it changes what "the flip" means.** The
+capability is now the REGISTRATION. There is no separate boolean left to flip:
+registering `kEmbeddingQuant` on the CUDA device IS the residency flip. That
+registration is therefore WITHHELD — the two lines sit commented in
+`cuda_ops.cu` with the reason — until `tests/vt/test_cuda_embedding_quant.cpp`
+runs green on a CUDA host. `test_cuda_embedding_quant` asserts
+`CHECK_FALSE(OpRegistered(kEmbeddingQuant, kCUDA))` so the registration cannot
+arrive without someone deciding to add it, and flipping it is two edits in one
+commit: uncomment the registrar, change that one line to `CHECK`.
+
+**So the CUDA gather arm is landed UNREACHED, and this is the notice AGENTS.md
+requires.** What is unreached: the block arm of `EmbeddingKernelCuda` and every
+decoder in `cuda_quant_dequant.cuh`. The row that owns the wiring:
+`MODEL-MM-QWEN4-EXP`. It is listed under `## Owed` below. The GitHub API is
+suspended, so no issue number is available to cite and this record carries the
+obligation instead.
+
+## Superseded: the earlier blocker, kept for its reasoning
 
 `scripts/check-device-leakage.py` FAILS on this branch, on exactly one line:
 
@@ -209,6 +248,22 @@ reviewer should reject, and (3) is what this branch does today.
 `kCUDA` and the branch therefore does not pass its own gate; it must not merge in
 this state. The kernel below it is complete and independently useful, and
 separating the two is what "the flip is last" means in practice.
+
+## A pre-existing flake this row did NOT cause
+
+`test_cpu_x86_llamacpp_floor` FAILS on this development box under load, and it
+failed **identically on the untouched baseline** — measured before any file in
+this row was edited, on `origin/main` with an empty diff, and again at the end.
+The assertion is `self.assertEqual(got.returncode, 2)` getting 4, from
+`test_a_contended_leg_is_discarded_and_never_summarised`; the harness discards a
+contended leg and retries, and under a 1-minute load average of 35-153 (two
+sibling CUDA waves compiling) the retry path returns a different code than the
+case expects.
+
+Recorded here because a flake discovered later looks like a regression the last
+change caused. It is not this row's, it is load-dependent rather than
+tree-dependent, and it is the ONLY preflight failure on this branch that KGATHER
+does not own.
 
 ## Owed
 

@@ -851,6 +851,32 @@ when all three have landed, not when this one does.
 
 ## Owed
 
+- **`qwen4_exp` is WIRED to the seam but UNREACHED, and this entry is what makes
+  that admissible** ([#2424](https://github.com/mudler/vllm.cpp/issues/2424), row
+  `ENG-HYBRID-PLACEMENT`). `qwen4_exp_forward.cpp` now routes its MoE step through
+  `RunMoePlacedPair` with the `qwen3_moe.cpp` adapter verbatim — the block already
+  had the seam's shape, so the change is a call swap and not a refactor, and it
+  compiles.
+
+  What is NOT proven is that anything reaches it. The forward needs a
+  `qwen4_exp` GGUF, and the only one available is `Qwen3.8-2.4T-A95B UD-Q1_0` at
+  369 GiB, which fits no host this project reaches. So the deletion mutation
+  `reachability.md` asks for cannot be run, and no gate here holds the call site
+  in either direction.
+
+  This is the same position `scripts/runner-routing-allowlist.txt` records for
+  Nemotron-H, and it is recorded the same way rather than being dressed up: a
+  seam checker never proved reachability and was never meant to. The wiring is
+  correct BY CONSTRUCTION (shape match, compile), which is weaker than reached
+  and is not claimed as more.
+
+  It also unblocks something: `--fit` has no device gate because every GGUF on
+  the NAS is either off the seam (`laguna`), has no reachable MoE forward
+  (`glm5next`), or does not fit. A runnable `qwen4_exp` GGUF would be the first
+  checkpoint that is both GGUF and seam-wired, which is what a `--fit` NMSE gate
+  needs.
+
+
 - W5, the speed floor against llama.cpp `-ncmoe` at `b10451`. Blocked on a
   discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the

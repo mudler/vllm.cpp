@@ -10,6 +10,7 @@
 #include "vllm/model_executor/models/qwen3_5_gdn_block.h"    // RunGdnBlockPaged
 #include "vllm/model_executor/models/qwen3_5_mrope.h"        // BuildMropeCosSinHost
 #include "vllm/model_executor/models/qwen4_exp_moe.h"        // RunQwen4ExpMoeBlock
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -493,9 +494,36 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       // `ResidentWeight::d_dev` and re-uploads the tower on a device arm — and
       // it is a SPEED ceiling this wave inherits rather than a wrong answer;
       // the spec's `## Owed` carries the hoist.
-      const MoeBlockWeights mw = Qwen4ExpMoeBlockWeights(
+      // Built OUTSIDE the placed body on purpose: `Qwen4ExpMoeBlockWeights`
+      // takes a non-const reference and mutates it via `OwnedBytes::KeepAlive()`,
+      // so it is not a pure function of the layer and must not be re-evaluated
+      // per placement arm.
+      MoeBlockWeights mw = Qwen4ExpMoeBlockWeights(
           w.layers[static_cast<size_t>(il)].moe, p);
-      const MoeBlockOutput o = RunQwen4ExpMoeBlock(d.q, mw, p, mlp_in.t(), T);
+
+      // ENG-HYBRID-PLACEMENT (#2424): through the SHARED placement seam, inert by
+      // construction when this layer is not placed. The block already has the
+      // seam's shape — a `[T,H]` bf16 block in, an owning `MoeBlockOutput` pair
+      // out — so this is the `qwen3_moe.cpp` adapter verbatim and not a refactor.
+      //
+      // NO `placeable` REFUSAL IS OWED HERE. `Qwen4ExpMoeBlockWeights` fills only
+      // the keep-quant stacked arm or the per-expert bf16 borrowed-view arm and
+      // hard-refuses a third dtype; it never touches `expert_*_fp4`, so this
+      // architecture has no eagerly-device-resident expert arm for the fp4
+      // refusal to protect against. Passing `expert_gate_fp4.empty()` would be
+      // correct but permanently dead, which reads as a guard that is doing
+      // something.
+      //
+      // The lambda's device parameter is `pd`, NOT `p`: `p` is the
+      // `Qwen4ExpParams` this body captures, and shadowing it would silently
+      // compile against the wrong object.
+      const MoePlacedOutput placed = vllm::RunMoePlacedPair(
+          d, il, mlp_in.t(), T, H,
+          [&](dense_attn::Dev pd, const Tensor& h) {
+            MoeBlockOutput b = RunQwen4ExpMoeBlock(pd.q, mw, p, h, T);
+            return MoePlacedOutput{b.tensor, std::move(b.storage)};
+          });
+      const MoeBlockOutput o{placed.tensor, placed.storage};
 
       vt::Qwen4ExpGatedResidualArgs args;
       args.hc_count = hc;

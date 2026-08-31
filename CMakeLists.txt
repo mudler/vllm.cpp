@@ -1840,7 +1840,15 @@ if(VLLM_CPP_CUDA)
     # if(VLLM_CPP_CUDA) depth one, which is what check-cuda-op-arch-gate.py
     # requires of any TU that registers an op.
     src/vt/cuda/cuda_qwen4_exp.cu
-    src/vt/cuda/cuda_qwen4_exp_ple.cu)
+    src/vt/cuda/cuda_qwen4_exp_ple.cu
+    # W6-CUDA-B: the two QSA arms and the ungated grouped RMS norm. The norm is a
+    # SHARED `vt::` seam and not a qwen4_exp op, so it gets its own TU rather
+    # than joining cuda_layernorm.cu -- that file is a surface several rows
+    # write, and AGENTS.md "Records" calls a shared file a lock. Both are
+    # unconditional and at if(VLLM_CPP_CUDA) depth one, which is what
+    # check-cuda-op-arch-gate.py requires of any TU that registers an op.
+    src/vt/cuda/cuda_qwen4_exp_qsa.cu
+    src/vt/cuda/cuda_rms_norm_group.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

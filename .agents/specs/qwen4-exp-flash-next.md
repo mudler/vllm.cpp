@@ -3957,17 +3957,23 @@ All six mutations were re-run after this refactor.
   and the reconciliation NEITHER branch contains: what now blocks a CUDA forward
   is the QSA block's three host reads, not op registration and not the loader.
 
-- **A CI DEFECT FOUND AND FIXED IN FLOW: `agent-record` failed on EVERY pull
-  request.** [#2407](https://github.com/mudler/vllm.cpp/issues/2407).
-  `.github/workflows/ci.yml` still ran
-  `tests/scripts/test_check_issue_index_append_only.py`, which `7dc2ef1ea`
-  deleted when it retired the append-only index. The job therefore printed
+- **A CI DEFECT FOUND IN FLOW, AND MAIN FIXED IT BETTER. #2407 IS A DUPLICATE.**
+  `agent-record` failed on EVERY pull request: `.github/workflows/ci.yml` still
+  ran `tests/scripts/test_check_issue_index_append_only.py`, which `7dc2ef1ea`
+  deleted when it retired the append-only index, so the job printed
   `agent record OK: ENGINE=173 MODEL=379 ...` and then exited 2 on a missing
-  file -- the gate green, the check red, which is the worst shape a check can
-  take. W6-CUDA-B hit it on its own pull request, and AGENTS.md "Every change
-  starts from an issue" says to file and fix in the same flow rather than defer,
-  so the line is deleted here. Nothing replaces it: the index it tested is
-  retired and "GitHub is the index. There is no index file."
+  file -- the gate green, the check red. This wave filed
+  [#2407](https://github.com/mudler/vllm.cpp/issues/2407) and DELETED the line.
+  **`origin/main` `df2ad6d84` ([#2371](https://github.com/mudler/vllm.cpp/issues/2371),
+  #2373) had independently REDIRECTED it instead**, to
+  `tests/scripts/test_agent_issue_index.py`.
+  **Main's is the better fix and this row took it wholesale**, which is the
+  honest call rather than the flattering one: deleting the invocation drops a
+  gate, whereas redirecting it keeps one, and the file main points at tests
+  `scripts/agent-issue-index.py` -- the derived renderer that REPLACED the
+  retired index. So main's fix is BROADER than this wave's, not narrower. The
+  merged `ci.yml` is byte-identical to main's, this branch carries no CI change,
+  and #2407 closes as a duplicate of #2371 rather than as work this row did.
 
 - **W6-CUDA-B LANDS FOUR CUDA ARMS THAT NOTHING REACHES, AND ONE BLOCKER
   REMAINS. ISSUE OWED.** `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup`,

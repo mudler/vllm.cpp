@@ -706,7 +706,15 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 // so a mutation could not tell a live check from a dead one.
 void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
                                 const DeepseekV4Params& p, int64_t layer,
-                                bool is_comp, bool is_indexer) {
+                                bool is_comp, bool is_indexer,
+                                // W3 (#2286): true only where the PAGED arm will
+                                // compose this layer. The widened indexer geometry
+                                // is readable THERE and nowhere else, because the
+                                // legacy per-token branch still projects `idx_wk`
+                                // at `index_head_dim`. Narrowing the refusal for a
+                                // path that cannot handle it is the mistake this
+                                // parameter prevents.
+                                bool paged_dsa_arm) {
   const int64_t H = p.hidden_size;
   const int64_t hd = p.head_dim;
   std::string bad;
@@ -719,18 +727,56 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
   };
   if (is_comp) {
     const int64_t cr = p.compress_ratio(layer);
-    want("compressor.ape", "[compress_ratio, head_dim]", L.comp_ape.size(), cr * hd);
-    want("compressor.wgate.weight", "[head_dim, hidden_size]", L.comp_wgate.size(),
-         hd * H);
+    // W3 (#2286): `coff = 1 + (compress_ratio == 4)` (`compressor.py:247-248`)
+    // widens the ape and the fused wkv|wgate; `norm` does NOT, because upstream
+    // is `RMSNorm(self.head_dim, ...)` (`compressor.py:288`).
+    //
+    // Read from the TENSOR rather than derived from `compress_ratio`, the same
+    // way `idx_wq`'s K is. Upstream emits only the derived width, but this tree's
+    // synthetic suites are written at a COLLAPSED `coff == 1` shape on `cr == 4`
+    // layers -- a shape upstream cannot produce and this forward has always
+    // accepted. Deriving the requirement instead would refuse all of them at
+    // once, which is a fixture migration and not this wave.
+    const int64_t cw = (hd > 0 && H > 0 && L.comp_wgate.size() % (hd * H) == 0 &&
+                        L.comp_wgate.size() / (hd * H) == 2)
+                           ? 2 * hd
+                           : hd;
+    const int64_t coff = cw / hd;
+    (void)coff;
+    want("compressor.ape", "[compress_ratio, coff*head_dim]", L.comp_ape.size(), cr * cw);
+    want("compressor.wgate.weight", "[coff*head_dim, hidden_size]", L.comp_wgate.size(),
+         cw * H);
     want("compressor.norm.weight", "[head_dim]", L.comp_norm_weight.size(), hd);
+    // Materialized since W3; empty only on a checkpoint that carries none, where
+    // the collapsed convention still applies.
+    if (!L.comp_wkv.empty())
+      want("compressor.wkv.weight", "[coff*head_dim, hidden_size]", L.comp_wkv.size(),
+           cw * H);
   }
   if (is_indexer) {
     const int64_t inh = p.index_n_heads;
     const int64_t ihd = p.index_head_dim;
-    want("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
-         L.idx_wq.size(), inh * ihd * H);
-    want("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
-         L.idx_wk.size(), ihd * H);
+    // Either geometry is READABLE now: upstream's `[inh*ihd, q_lora_rank]` (the
+    // real artifact's) or the collapsed `[inh*ihd, hidden_size]` the synthetic
+    // suites use. The forward dispatches on which one it got.
+    if (static_cast<int64_t>(L.idx_wq.size()) != inh * ihd * p.q_lora_rank)
+      want("indexer.wq_b",
+           "[index_n_heads*index_head_dim, q_lora_rank] (upstream) or "
+           "[index_n_heads*index_head_dim, hidden_size] (collapsed)",
+           L.idx_wq.size(), inh * ihd * H);
+    // W3 (#2286): NARROWED, and only now. The indexer's compressor is implemented
+    // -- its keys are produced, the selection scores over them, and the gather
+    // narrows the merge -- so the widened width is READ rather than refused. The
+    // order matters and this row has broken it twice: narrowing a refusal before
+    // the capability exists turns a loud refusal into a silent wrong answer.
+    //
+    // Read from the TENSOR, like the compressor family's, because the synthetic
+    // suites carry a collapsed shape upstream cannot emit.
+    if (!(paged_dsa_arm && static_cast<int64_t>(L.idx_wk.size()) == 2 * ihd * H))
+      want("indexer.compressor.wkv.weight",
+           "[coff*index_head_dim, hidden_size] (upstream) or "
+           "[index_head_dim, hidden_size] (collapsed)",
+           L.idx_wk.size(), ihd * H);
     want("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
          L.idx_wproj.size(), inh * H);
   }
@@ -808,7 +854,10 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   // none of them, and the GGUF arm (`dsa_dense`) enters it on no layer at all —
   // so that arm's behaviour is byte for byte unchanged by #1970, and its own
   // separate defect stays owed under #1964.
-  RequireDsaGeometryOrRefuse(L, p, layer, is_comp, is_indexer);
+  RequireDsaGeometryOrRefuse(L, p, layer, is_comp, is_indexer,
+                             /*paged_dsa_arm=*/be.paged_kv != nullptr &&
+                                 be.compressor != nullptr &&
+                                 p.compress_ratio(layer) == 4);
 
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
@@ -854,7 +903,16 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   //    into the cached latent (deepseek_v4_compressor.h : CompressorSaveScoreApe /
   //    CompressorPoolNorm). Non-compressor layers cache the raw latent directly.
   std::vector<float> latent = kraw;
-  if (is_comp) {
+  // W3 (#2286): the PAGED compressor arm supersedes this placeholder entirely. It
+  // pools a 2-wide window over the MLA's own latent, where upstream pools a
+  // `compress_ratio`-wide window over the compressor's own projection, and it
+  // projects `comp_wgate` at `head_dim` where the real geometry is
+  // `coff * head_dim`. Running both throws an anonymous `MatVec weight size
+  // mismatch` -- the diagnostic the DSA refusal exists to replace.
+  const bool paged_comp_arm =
+      is_comp && be.paged_kv != nullptr && be.compressor != nullptr &&
+      (p.compress_ratio(layer) == 4 || p.compress_ratio(layer) == 128);
+  if (is_comp && !paged_comp_arm) {
     const int64_t cr = p.compress_ratio(layer);
     const int64_t win = 2;  // tiny pooling window (device gather addressing = W7 seam)
     // compressor pool-score projection (keep-quant comp_wgate) : [T,H] -> [T,hd].
@@ -929,9 +987,17 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // supplies compressor state, because `CompressorLayerStep` composes it. Every
     // other compressor shape, and the indexer, still refuse: `compress_ratio == 4`
     // is `coff == 2` plus the Lightning Indexer and is W3's.
-    const bool comp_arm =
-        is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128;
-    VT_CHECK(!is_indexer && (!is_comp || comp_arm),
+    // W3 (#2286): `cr == 4` joins the arm now. It is the same composition with a
+    // SELECTION -- the indexer chooses which closed rows to attend -- and the
+    // indexer's own compressor produces the keys it selects over.
+    const int64_t cr_arm = p.compress_ratio(layer);
+    const bool comp_arm = is_comp && be.compressor != nullptr &&
+                          (cr_arm == 128 || cr_arm == 4);
+    // At `cr == 4` the layer carries an indexer too, and the same arm composes
+    // it: its own compressor produces the keys and its selection narrows the
+    // merge. So the indexer is admitted exactly where the compressor is.
+    const bool idx_arm = is_indexer && comp_arm && cr_arm == 4;
+    VT_CHECK((!is_indexer || idx_arm) && (!is_comp || comp_arm),
              "deepseek-v4: the paged MLA arm is dense-causal only; the indexer and "
              "compressor layers belong to MODEL-DSV4-DSA-COMPOSE (#2286)");
     VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
@@ -984,12 +1050,37 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   // 4. selection: DSA Lightning-Indexer top-k on indexer layers, else dense causal
   //    over GLOBAL positions [0..kv_base+t] (kv_base==0 in the stateless path).
   std::vector<std::vector<int64_t>> sel(static_cast<size_t>(T));
-  if (is_indexer) {
+  // W3 (#2286): the PAGED `cr == 4` arm supersedes this selection -- it runs the
+  // indexer's own compressor and selects over COMPRESSED rows, where this branch
+  // scores PER-TOKEN keys. Both must not run: this one projects `idx_wk` at
+  // `index_head_dim`, and at the real geometry that tensor is
+  // `coff * index_head_dim`, so it throws an anonymous `MatVec weight size
+  // mismatch` -- the diagnostic the DSA refusal exists to replace.
+  const bool paged_indexer_arm = is_indexer && be.paged_kv != nullptr &&
+                                 be.compressor != nullptr &&
+                                 p.compress_ratio(layer) == 4;
+  if (is_indexer && !paged_indexer_arm) {
     const int64_t inh = p.index_n_heads, ihd = p.index_head_dim, itopk = p.index_topk;
     // indexer q/k projections keep-quant (idx_wq_b / indexer_compressor_kv); the
     // weights_proj (idx_wproj) is a small V role and stays f32 (host).
+    // W3 (#2286): upstream's indexer query comes from the q-LoRA, NOT the hidden
+    // state. `wq_b` is `ReplicatedLinear(q_lora_rank, head_dim * n_head)`
+    // (`attention.py:721-726`, used at `:835`), so its K is `q_lora_rank`. `qa`
+    // above is already `qr` -- the q-LoRA output with `q_norm` applied in place --
+    // which is the same operand `wq_b` feeds the main query from.
+    //
+    // Dispatched on the weight's own K so BOTH geometries are readable: the real
+    // artifact stores `[inh*ihd, q_lora_rank]`, while the synthetic suites here
+    // were written against a collapsed `[inh*ihd, hidden_size]`. A shape this arm
+    // cannot read is refused by `RequireDsaGeometryOrRefuse` before reaching here.
+    const bool idx_q_from_qr =
+        static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr;
     const std::vector<float> iq =
-        Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T, inh * ihd, H);
+        idx_q_from_qr
+            ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
+                   inh * ihd, qlr)
+            : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
+                   inh * ihd, H);
     const std::vector<float> ik =
         Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H);
     const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
@@ -1036,22 +1127,71 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // tensor, one op call for the whole step. Proven equal to the loop below by
     // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
     // several `kv_base` values, with both off-by-one directions mutation-proven.
-    if (is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128) {
+    if (is_comp && be.compressor != nullptr &&
+        (p.compress_ratio(layer) == 128 || p.compress_ratio(layer) == 4)) {
       // The compressor arm. `deck` is this step's latents, `x` the hidden state the
       // pool score projects from, and the state grows across steps.
       DeepseekV4CompressorState& cs = *be.compressor;
       VT_CHECK(static_cast<int64_t>(cs.state_kv.size()) > layer,
                "deepseek-v4 compressor: state has no entry for this layer");
       std::vector<int64_t> pos64(positions.begin(), positions.end());
+
+      // W3 (#2286): at `cr == 4` the indexer CHOOSES which closed rows to attend.
+      // Its own compressor produces the keys, the selection scores against them,
+      // and the result narrows the merge. At `cr == 128` there is no indexer and
+      // every closed row is attended, which is a null selection.
+      std::vector<int64_t> sel_rows;
+      const std::vector<int64_t>* sel_ptr = nullptr;
+      if (p.compress_ratio(layer) == 4) {
+        VT_CHECK(!L.idx_comp_wgate.empty() && !L.idx_wk.empty(),
+                 "deepseek-v4 indexer: the compressor family did not load for a "
+                 "cr == 4 layer (MODEL-DSV4-DSA-COMPOSE, #2286)");
+        const int64_t inh = p.index_n_heads, ihd = p.index_head_dim;
+        const std::vector<float> ikeys = deepseek_v4::IndexerCompressedKeys(
+            x, L.idx_wk, L.idx_comp_wgate, L.idx_comp_ape, L.idx_comp_norm_weight,
+            &cs.idx_state_kv[static_cast<size_t>(layer)],
+            &cs.idx_state_score[static_cast<size_t>(layer)], pos64, T, H, ihd,
+            p.compress_ratio(layer), rope, rope_base, eps);
+        std::vector<float>& irows = cs.idx_comp_rows[static_cast<size_t>(layer)];
+        irows.insert(irows.end(), ikeys.begin(), ikeys.end());
+
+        const std::vector<float> iq =
+            static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr
+                ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
+                       inh * ihd, qlr)
+                : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
+                       inh * ihd, H);
+        const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
+        const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
+        sel_rows = deepseek_v4::IndexerSelectCompressed(
+            iq, irows, folded, pos64, T,
+            static_cast<int64_t>(irows.size()) / ihd, inh, ihd, p.index_topk,
+            p.compress_ratio(layer));
+        sel_ptr = &sel_rows;
+      }
+      // W3 (#2286): pool the compressor's OWN projection of the hidden state when
+      // the checkpoint carries one. Upstream's `fused_wkv_wgate` emits the KV and
+      // the gate together (`compressor.py:279-287`) and never reuses the MLA
+      // latent; `deck` is the collapsed geometry's convention and is kept only
+      // for checkpoints that carry no `compressor.wkv`.
+      const int64_t comp_w =
+          static_cast<int64_t>(L.comp_wgate.size()) / (H > 0 ? H : 1);
+      const std::vector<float> comp_kv =
+          L.comp_wkv.empty()
+              ? deck
+              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H);
       o = deepseek_v4::CompressorLayerStep(
-          *be.q, x, deck, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
+          *be.q, x, comp_kv, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
           (*be.paged_kv)[static_cast<size_t>(layer)],
           (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
           (*be.paged_kv)[static_cast<size_t>(layer)].shape[1],
           &cs.state_kv[static_cast<size_t>(layer)],
           &cs.state_score[static_cast<size_t>(layer)],
           &cs.comp_rows[static_cast<size_t>(layer)], pos64, kv_base, T, nh, H, hd,
-          p.compress_ratio(layer), p.sliding_window, eps, scale);
+          p.compress_ratio(layer), p.sliding_window, eps, scale,
+          // The compressed row carries RoPE on its tail, at this layer's own
+          // base -- compressed layers use `compress_rope_theta`.
+          rope, rope_base, sel_ptr);
     } else
     o = deepseek_v4::PagedCausalMlaAttention(
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
@@ -2917,6 +3057,30 @@ std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
 }
 
 }  // namespace dspark
+
+// DSV4-DSPARK-DRAFTER W-3: one block's attention half, host oracle.
+// Drives the SAME `AttentionBlock` the trunk uses, with `kv_prewritten` on so the
+// rows `BlockKvRows` wrote from the trunk taps are attended rather than
+// overwritten. A DSpark block is a compressor-less V4 layer, so nothing else
+// differs and no second attention exists to drift.
+std::vector<float> DsparkBlockAttentionHost(
+    vt::Queue& queue, const DeepseekV4LayerHostWeights& L,
+    const DeepseekV4Params& p, const std::vector<float>& x,
+    const std::vector<int32_t>& positions, std::vector<vt::Tensor>& pages,
+    int64_t layer, int64_t kv_base) {
+  VT_CHECK(static_cast<int64_t>(pages.size()) > layer,
+           "dspark block attention: no page tensor for this block");
+  VT_CHECK(L.comp_wgate.empty() && L.idx_wk.empty(),
+           "dspark block attention: a DSpark block is COMPRESSOR-LESS and carries "
+           "no indexer (`mtp_layer_types` is asserted \"sliding\", "
+           "deepseek_v4_mtp.py:61-63); this layer carries one");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.paged_kv = &pages;
+  be.paged_kv_prewritten = true;
+  be.kv_base = kv_base;
+  return AttentionBlock(L, /*Lq=*/nullptr, p, x, positions, layer, V4Miswire::kNone,
+                        /*trace=*/nullptr, be);
+}
 
 // DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
 // Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream

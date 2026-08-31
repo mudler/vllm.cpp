@@ -559,6 +559,19 @@ generalisation from ONE hidden issue and it is wrong.
 - **Performance.** This wave gates CORRECTNESS only. The decoders read byte-wise
   for alignment safety and one thread decodes a whole block. No throughput number
   is claimed, measured or implied, and no benchmark ID moves.
-- **The end-to-end `qwen4_exp` forward on CUDA.** The LOAD-side blocker is gone;
-  the forward is not. `ModelRegistry::Forward` is all-or-nothing, so this
-  produces no token on a GPU by itself.
+- **The end-to-end `qwen4_exp` forward on CUDA — and the reason CHANGED under
+  this row.** While this branch was open, [#2391](https://github.com/mudler/vllm.cpp/pull/2391)
+  landed the last four CUDA op arms, so all six `qwen4_exp` ops plus
+  `vt::RmsNormGroup` now register for `kCUDA`. With those and this row's gather
+  both landed, **what blocks a CUDA forward is neither op registration nor the
+  loader.** The expected shape is a PREDICTION, written here as one because
+  nothing has run it: partial dispatch through the PLE, then a NAMED REFUSAL at
+  the first QSA layer, because `qwen4_exp_qsa_block.cpp` still reads three
+  operands on the HOST — `CheckRopeLayoutsAgree`, `IndexerRows` on the block
+  table, and `Qwen4ExpQsaIndex` on `kv_lens`. Owned by the QSADEV wave; cited,
+  not touched.
+- **`IsCudaKeepQuantSupported` excludes IQ4_NL and Q5_0**
+  ([#2423](https://github.com/mudler/vllm.cpp/issues/2423)), which the released
+  UD-IQ1_S stores its tensors in — a second wall the synthetic fixture never
+  reaches, so no gate in this row could have shown it. Also cited, not touched.
+  **No token has come out of a GPU for this model and none is claimed.**

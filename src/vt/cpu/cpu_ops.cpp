@@ -184,6 +184,11 @@ inline const void* ElemPtr(const Tensor& t, int64_t off) {
   return static_cast<const uint8_t*>(t.data) + static_cast<size_t>(off) * SizeOf(t.dtype);
 }
 
+// The writable form of ElemPtr, for the row-typed STORE helpers.
+inline void* ElemMutPtr(const Tensor& t, int64_t off) {
+  return static_cast<uint8_t*>(t.data) + static_cast<size_t>(off) * SizeOf(t.dtype);
+}
+
 // Specialized/vectorized elementwise GEMM chunk (row `CPU-ELEM-GEMM`,
 // .agents/specs/cpu-elementwise-gemm.md). Structurally identical to
 // MatmulOneChunkRef — same 16x16 tile from ggml_compute_forward_mul_mat_one_chunk
@@ -459,31 +464,82 @@ void ConcatMlaNopeRopeKernel(Queue&, Tensor& out, const Tensor& nope, const Tens
   });
 }
 
+// The per-element dtype dispatch, hoisted. Row VT-CPU-ELEM-SURVEY,
+// .agents/specs/vt-cpu-elem-survey.md.
+//
+// The loop below used to read every operand element through `LoadF32`, which
+// switches on `t.dtype` and multiplies by `SizeOf(t.dtype)` once PER ELEMENT.
+// It did that TWICE over `x` (the variance pass and the scale pass) and once
+// over `w` PER ROW, although `w` is a single [h] vector every one of the `t`
+// rows reuses. `perf record -e cpu-clock` over `vt::RmsNorm` alone at the
+// Qwen3.6-27B `input_layernorm` shape (x[1024,5120] f32, one thread) measured
+// the consequence: `LoadF32` 49.06%, `StoreF32` 12.05%, the loop body 36.48%.
+//
+// This is the SAME transformation `AttentionKernel` and `MatmulOneChunk`
+// already apply in this file: resolve the dtype once and go through the shared
+// `WidenRowToF32` / `NarrowRowFromF32` row helpers.
+//
+// BIT-EXACT BY CONSTRUCTION, and this is the whole argument:
+//   * `WidenRowToF32` writes exactly the f32 values `LoadF32` returned, through
+//     the same `F16ToF32`/`BF16ToF32`, so every operand is the same bits;
+//   * `sumsq` still accumulates over `j` in the same increasing order into one
+//     f32 accumulator — a serial float reduction, which `-ffp-contract=off`
+//     (CMakeLists.txt:55) and the absence of `-ffast-math` forbid reassociating;
+//   * the scale pass computes `v * inv * wj` in the same order and rounds once
+//     on store through `NarrowRowFromF32`, which is `StoreF32`'s rounding;
+//   * `args.gemma`'s `wj += 1.0f` moves onto the widened `w` copy. It is the
+//     same f32 add on the same value, hoisted out of `t` repetitions of it;
+//   * the residual stream keeps its add / round-on-store / RE-READ order, which
+//     is what makes a bf16 residual faithful. `x` is widened into scratch BEFORE
+//     anything is stored, so a caller that aliases `residual` onto `x` sees the
+//     same values the per-element interleave produced;
+//   * each row is independent, so the threadpool partition is unchanged.
+// No accumulator is split and no sum is reordered; the outputs are
+// memcmp-identical, not close (tests/vt/test_ops_rmsnorm_elem_dispatch.cpp).
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
+  // `w` is loop-invariant across rows. Widen it ONCE per call, and fold the
+  // gemma `+1` in here, where it costs h adds instead of t*h. The refusal for a
+  // dtype with no per-element size is produced by `LoadF32`/`SizeOf` themselves
+  // (the `AttnResolveOrRefuse` shape above), so its message cannot drift from
+  // the per-element one, and it is raised before any element is read.
+  if (w.dtype != DType::kF32 && w.dtype != DType::kF16 && w.dtype != DType::kBF16)
+    (void)LoadF32(w, 0);
+  std::vector<float> wf(static_cast<size_t>(h));
+  WidenRowToF32(w.dtype, w.data, h, wf.data());
+  if (args.gemma)
+    for (float& v : wf) v += 1.0f;
+  // Same refusal for the operands the row helpers below will read.
+  if (x.dtype != DType::kF32 && x.dtype != DType::kF16 && x.dtype != DType::kBF16)
+    (void)LoadF32(x, 0);
+  if (residual != nullptr && residual->dtype != DType::kF32 &&
+      residual->dtype != DType::kF16 && residual->dtype != DType::kBF16)
+    (void)LoadF32(*residual, 0);
+  if (out.dtype != DType::kF32 && out.dtype != DType::kF16 && out.dtype != DType::kBF16)
+    StoreF32(out, 0, 0.0f);
   // Row-chunked over tokens (ops.cpp:9070-9126 pattern); each row's f32
   // variance reduction stays sequential on one thread — bit-identical.
   ForRows(t, [&](int64_t r0, int64_t r1) {
+  // One scratch pair per CHUNK, not per row and not per element.
+  std::vector<float> rowf(static_cast<size_t>(h)), outf(static_cast<size_t>(h));
+  std::vector<float> resf(residual != nullptr ? static_cast<size_t>(h) : 0);
   for (int64_t i = r0; i < r1; ++i) {
     const int64_t rbase = i * h;
+    WidenRowToF32(x.dtype, ElemPtr(x, rbase), h, rowf.data());
+    if (residual != nullptr) {
+      WidenRowToF32(residual->dtype, ElemPtr(*residual, rbase), h, resf.data());
+      for (int64_t j = 0; j < h; ++j) resf[j] += rowf[j];  // add in f32
+      // New residual stream: round to its dtype on store, then RE-READ the
+      // rounded value, exactly as the per-element loop did.
+      NarrowRowFromF32(residual->dtype, ElemMutPtr(*residual, rbase), h, resf.data());
+      WidenRowToF32(residual->dtype, ElemPtr(*residual, rbase), h, rowf.data());
+    }
     float sumsq = 0.0f;
-    for (int64_t j = 0; j < h; ++j) {
-      float v = LoadF32(x, i * h + j);
-      if (residual) {
-        v += LoadF32(*residual, rbase + j);   // add in f32
-        StoreF32(*residual, rbase + j, v);     // new residual stream (rounds to its dtype)
-        v = LoadF32(*residual, rbase + j);     // re-read rounded value (bf16-faithful)
-      }
-      sumsq += v * v;
-    }
-    float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
-    for (int64_t j = 0; j < h; ++j) {
-      float v = residual ? LoadF32(*residual, rbase + j) : LoadF32(x, i * h + j);
-      float wj = LoadF32(w, j);
-      if (args.gemma) wj += 1.0f;
-      StoreF32(out, i * h + j, v * inv * wj);
-    }
+    for (int64_t j = 0; j < h; ++j) sumsq += rowf[j] * rowf[j];
+    const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
+    for (int64_t j = 0; j < h; ++j) outf[j] = rowf[j] * inv * wf[j];
+    NarrowRowFromF32(out.dtype, ElemMutPtr(out, rbase), h, outf.data());
   }
   });
 }

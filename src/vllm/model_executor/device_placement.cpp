@@ -3,7 +3,12 @@
 // transcribes. Row `ENG-HYBRID-PLACEMENT`, issue #2023.
 #include "vllm/model_executor/device_placement.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -201,6 +206,141 @@ vt::Queue& PlacementQueue(vt::DeviceType device) {
   auto [pos, inserted] = g.queues.emplace(device, b.CreateQueue());
   (void)inserted;
   return pos->second;
+}
+
+void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
+                             const void* data, int64_t elems, bool data_is_host,
+                             vt::DType dtype) {
+  // Latched once. An unset variable must cost a load and a branch, not a getenv
+  // per layer per token.
+  static const char* const path = std::getenv("VT_PLACEMENT_DUMP_MOE");
+  if (path == nullptr || path[0] == '\0') return;
+  if (layer_index != 0 || data == nullptr || elems <= 0) return;
+  // FIRST matching call only. A decode writes this layer once per step, and the
+  // gate compares one step against one step; appending every step would compare
+  // arms that have already diverged in TOKENS and so no longer share an input.
+  static bool done = false;
+  if (done) return;
+  done = true;
+
+  // The block's dtype is NOT assumed. The seam used to hardcode bf16 and a
+  // caller hands it f32; a dump that widened f32 bits as bf16 would print
+  // plausible-looking garbage and the gate would compute an NMSE over it.
+  if (dtype != vt::DType::kBF16 && dtype != vt::DType::kF32) {
+    std::fprintf(stderr,
+                 "engine: VT_PLACEMENT_DUMP_MOE cannot render dtype %s; the "
+                 "gate would otherwise compare misread bytes\n",
+                 vt::Name(dtype));
+    return;
+  }
+  const size_t n = static_cast<size_t>(elems);
+  const size_t esz = vt::SizeOf(dtype);
+  std::vector<uint8_t> raw(n * esz);
+  if (data_is_host) {
+    std::memcpy(raw.data(), data, n * esz);
+  } else {
+    b.Copy(q, raw.data(), data, n * esz);
+    b.Synchronize(q);
+  }
+
+  std::FILE* f = std::fopen(path, "w");
+  if (f == nullptr) {
+    std::fprintf(stderr,
+                 "engine: VT_PLACEMENT_DUMP_MOE is set but '%s' cannot be "
+                 "opened; the placement gate would compare nothing and read it "
+                 "as agreement, so this says so instead\n",
+                 path);
+    return;
+  }
+  // bf16 -> f32 is an exact widening: the value is the high 16 bits of the
+  // float. Text, because the consumer is a gate script and a binary format
+  // would need a reader that could disagree with this writer.
+  for (size_t i = 0; i < n; ++i) {
+    float v;
+    if (dtype == vt::DType::kF32) {
+      std::memcpy(&v, raw.data() + i * esz, sizeof(v));
+    } else {
+      uint16_t h;
+      std::memcpy(&h, raw.data() + i * esz, sizeof(h));
+      // bf16 -> f32 is an exact widening: the value is the high 16 bits.
+      const uint32_t bits = static_cast<uint32_t>(h) << 16;
+      std::memcpy(&v, &bits, sizeof(v));
+    }
+    std::fprintf(f, "%.9g\n", static_cast<double>(v));
+  }
+  std::fclose(f);
+  std::fprintf(stderr, "engine: wrote %zu MoE block values for layer 0 to %s\n",
+               n, path);
+}
+
+const char* PlacementOriginName(PlacementOrigin origin) {
+  switch (origin) {
+    case PlacementOrigin::kStated: return "stated";
+    case PlacementOrigin::kFit: return "fit";
+    case PlacementOrigin::kNone: break;
+  }
+  return "none";
+}
+
+MoeFitResolution ResolveMoeFitFromSizes(
+    size_t footprint_bytes, size_t budget_bytes,
+    const std::vector<size_t>& moe_bytes_per_layer) {
+  MoeFitResolution r;
+  r.budget_bytes = budget_bytes;
+  r.footprint_bytes = footprint_bytes;
+
+  // UNKNOWN is not "nothing fits". `device_memory_total_bytes` is 0 on every
+  // platform that does not probe one, and comparing against 0 would place every
+  // layer on a box that was merely not measured — a wrong placement that looks
+  // exactly like a working resolver.
+  if (budget_bytes == 0) {
+    r.reason =
+        "the device memory budget is UNKNOWN (the platform reports no total), "
+        "so there is nothing to fit against; placing nothing rather than "
+        "placing everything against a budget of zero";
+    return r;
+  }
+  if (footprint_bytes == 0) {
+    r.reason =
+        "the model's weight footprint could not be priced, so the resolver has "
+        "no left-hand side; placing nothing rather than guessing";
+    return r;
+  }
+
+  // A placeable layer is one that actually HAS routed experts. A dense layer
+  // contributes nothing, and counting it as placed would claim a saving of zero
+  // while telling the operator a layer moved.
+  int64_t placeable = 0;
+  for (const size_t bytes : moe_bytes_per_layer)
+    if (bytes > 0) ++placeable;
+  if (placeable == 0) {
+    r.reason =
+        "the model has no routed-expert layers, so a placement has nothing to "
+        "move";
+    return r;
+  }
+
+  r.resolved = true;
+  if (footprint_bytes <= budget_bytes) return r;  // already fits; place nothing
+
+  // Fill from the LAST layer backwards, mirroring `common/fit.cpp`'s
+  // back-to-front order, so the layers nearest the output leave the device
+  // first. Whole layers only: a boundary layer that would need splitting is
+  // taken entirely, which is the coarser granularity this row's spec sanctions.
+  const size_t must_free = footprint_bytes - budget_bytes;
+  for (auto it = moe_bytes_per_layer.rbegin(); it != moe_bytes_per_layer.rend();
+       ++it) {
+    if (*it == 0) continue;  // dense: nothing to move, and not counted as placed
+    r.placed_bytes += *it;
+    ++r.placed_layers;
+    if (r.placed_bytes >= must_free) return r;
+  }
+
+  // Every placeable layer is on the CPU and it still does not fit. Upstream
+  // would also reduce the context here; this resolver does not, so it reports
+  // the shortfall instead of implying success.
+  r.still_exceeds = true;
+  return r;
 }
 
 void SetActiveMoePlacementPlan(const MoePlacementPlan& plan) {

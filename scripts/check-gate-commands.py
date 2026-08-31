@@ -463,6 +463,11 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # 2026-08-31: -ENG-PREFLIGHT-COMPILES leaves the runnable population when
+    # b39f14adb moves the row ACTIVE -> PARTIAL (#2401). PARTIAL is outside this
+    # lifecycle-scoped audit, so the baseline excludes the row. Its spec keeps
+    # both commands that can fail; this is a lifecycle shrink, not a weaker
+    # verdict or a lost gate command.
     # 2026-08-30: +MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm. GROWTH, and
     # not because the row gained a gate: it re-entered the AUDITED population
     # when W2 (#2214) moved it `SPIKE` -> `ACTIVE`, and its spec's `### Gates`

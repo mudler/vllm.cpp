@@ -1679,6 +1679,18 @@ vllm_cpp_add_test(test_expert_stream_latch
 vllm_cpp_add_test(test_weight_residency_reach
   vllm/entrypoints/test_weight_residency_reach.cpp)
 target_include_directories(test_weight_residency_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_placement_reach
+  vllm/entrypoints/test_placement_reach.cpp)
+target_include_directories(test_placement_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_placement_dump_dtype
+  vllm/model_executor/test_placement_dump_dtype.cpp)
+target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_moe_fit_resolver
+  vllm/model_executor/test_moe_fit_resolver.cpp)
+target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already
 # drives `vllm_engine_load` with the same JSON string, so a test that called the
@@ -2828,6 +2840,15 @@ target_include_directories(test_ops_mamba2_gated_norm PRIVATE ${CMAKE_SOURCE_DIR
 # already answers to, so both arms are held to ONE oracle.
 vllm_cpp_add_test(test_ops_rms_norm_group vt/test_ops_rms_norm_group.cpp)
 target_include_directories(test_ops_rms_norm_group PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The CUDA arm of the same op (MODEL-MM-QWEN4-EXP W6-CUDA-B). A SEPARATE suite
+# rather than cases in the file above, because that one runs on every host and
+# this one skips LOUDLY without a CUDA backend; mixing the two would make a
+# CPU-only run print a skip for a case that has nothing to do with a device.
+# Held to the SAME goldens AND to the CPU arm BITWISE — the op has no
+# transcendental, so anything but byte equality is a defect. Compiled
+# unconditionally, like every other CUDA suite here.
+vllm_cpp_add_test(test_ops_rms_norm_group_cuda vt/test_ops_rms_norm_group_cuda.cpp)
+target_include_directories(test_ops_rms_norm_group_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
@@ -2844,6 +2865,8 @@ vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.c
 # LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
 vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_attention_elem_dispatch vt/test_ops_attention_elem_dispatch.cpp)
+vllm_cpp_add_test(test_ops_rmsnorm_elem_dispatch vt/test_ops_rmsnorm_elem_dispatch.cpp)
+target_include_directories(test_ops_rmsnorm_elem_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_dflash_attn_grid vt/test_dflash_attn_grid.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
@@ -3541,6 +3564,24 @@ vllm_cpp_add_test(test_qwen4_exp_ple_gate vllm/models/test_qwen4_exp_ple_gate.cp
 # device. Compiled unconditionally, like every other CUDA suite here.
 # No src/ grant — it reaches nothing but the public vt:: surface.
 vllm_cpp_add_test(test_qwen4_exp_cuda vllm/models/test_qwen4_exp_cuda.cpp)
+
+# MODEL-MM-QWEN4-EXP W6-CUDA-B — the DEVICE-ARM gate for the three qwen4_exp ops
+# that own a REDUCTION and that W6-CUDA left owed: `vt::Qwen4ExpGatedResidual`
+# (the mixer), `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`.
+# `vt::RmsNormGroup`'s CUDA arm is the fourth and is gated beside its CPU suite
+# in test_ops_rms_norm_group_cuda above, because it is a shared `vt::` seam and
+# not a qwen4_exp op. Each op is held to the SAME lane-pinned transformers
+# goldens its CPU arm answers to AND to the CPU arm itself: BYTE-identically for
+# the compressor, within one f32 ulp for the gather (whose only divergence source
+# is `expf`), and within the oracle's own band for the mixer, whose three
+# projections go through the shared `vt::MatmulBT` seam and so re-associate a
+# reduction the CPU arm walks. The gather's read SET is gated two ways --
+# `keys_visited` for the count and a NaN-poisoned cache for the membership --
+# because a mask over a dense cache passes every value comparison. Skips LOUDLY
+# on a box with no CUDA backend. No src/ grant: it reaches nothing but the public
+# vt:: surface and its own fixture directory.
+vllm_cpp_add_test(test_qwen4_exp_cuda_reductions
+                  vllm/models/test_qwen4_exp_cuda_reductions.cpp)
 
 # MODEL-MM-QWEN4-EXP W5e-2 (#2336) — `RunQwen4ExpPleBlock`, the PLE layer as ONE
 # production composition and the LAST of the three block seams. Gated end to end

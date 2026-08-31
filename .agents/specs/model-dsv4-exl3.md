@@ -68,6 +68,58 @@ expert over `TEMP_ROWS_FUSED` tokens and as the `VT_DSV4_EXL3_FUSED_MOE=0`
 rollback. W2c adds the m<=8 GEMV arm and its selection policy, ported verbatim
 and reached from the CUDA GEMM launcher.
 
+**THE ARTIFACT'S WEIGHTS LOAD (2026-08-31).** Measured on `thor:gpu0` under an
+`rc` lease, source `a87f2cbe4`, reading the checkpoint off `/workspace`:
+
+```
+[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=87994957824 (81.952 GiB)
+  over 43 layers, tp4->tp1, 3-bit trellis;
+  carried host tower host_bytes=16885558876 (15.726 GiB);
+  host MemAvailable=101.381 GiB
+```
+
+The tower coalesces TP4 to TP1 and the whole weight body materializes:
+**81.952 + 15.726 = 97.68 GiB**, at a measured peak RSS of **111 GiB** inside a
+118 GiB pool. This is the first time this row's checkpoint has been loaded at
+all, and it took ~38 minutes to read over CIFS.
+
+**IT ANSWERS THE RESIDENCY QUESTION, and not in the direction the arithmetic
+suggested.** The carried FP8 half DOES widen at load: 15.726 GiB against the 8.23
+GiB its packed headers hold, so it roughly doubles. The 90.82 GiB header figure
+is therefore a FLOOR, understating the tower by ~7 GiB and peak allocation by
+~20 GiB. Planning that treated 90.82 GiB as residency was planning against the
+wrong number, and this row now has the measurement.
+
+**IT THEN REFUSED, BY NAME, ON THE DEFAULT KV BLOCK SIZE:**
+
+```
+deepseek-v4 kv-cache: block_size 32 cannot express a compress_ratio-128 page
+(storage_block_size = block_size / compress_ratio would be 0).
+Upstream derives this geometry at block_size 256
+```
+
+`EngineParams::block_size` defaults to 32, and a `cr == 128` layer cannot be paged
+at that size. The refusal is correct and its message is exactly the diagnostic
+this project's discipline exists to produce -- but it means the artifact does NOT
+load on the DEFAULT configuration, which is where `AGENTS.md`
+§"Nothing lands dead" measures reachability. Upstream derives 256. `vllm-server`
+accepts `--block-size`; `vllm-cli` does not. Filed under `## Owed
+
+- **The artifact does not load on the DEFAULT configuration.**
+  `EngineParams::block_size` is 32 and a `compress_ratio == 128` layer cannot be
+  paged at that size; upstream derives 256
+  (`sparse_swa.py:76-83`, `compressor.py:174-178`). `vllm-server` takes
+  `--block-size`, `vllm-cli` does not, so the CLI cannot serve this architecture
+  at all. Mirroring upstream means the geometry is DERIVED from the model rather
+  than passed by an operator, which is the fix this owes; a flag on the CLI would
+  only move the problem.
+
+.
+
+Note what this refusal is NOT: it is not an OOM, and it is not the DSA
+composition. W3's path was never reached, because the KV-cache spec is built
+before the forward runs.
+
 **THE CUDA ARM COMPILES AND ITS DEVICE GATES PASS ON GB10 (2026-08-31).** Measured
 under an `rc` lease on `dgx:gpu0` (GB10, driver 580.173.02), source at
 `f5c70789`, `cuda-nvcc-13-0` installed per run:
@@ -933,6 +985,21 @@ keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
 `vt: MatVec weight size mismatch` naming no tensor and no layer. Refusing by name
 buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
 and it is not the difference between wrong tokens and a refusal.
+
+**AND THE OPTION IS ALREADY A FILED DEFECT, not a novel trade.** The forward's own
+refusal message says dense MLA "is NOT a substitute for it at any sequence
+length", citing [#1964](https://github.com/mudler/vllm.cpp/issues/1964), and
+`dsv4-dsa-loader-accept-forward-refuse.md` records what that issue tracks: the
+GGUF arm's `dsa_dense` routing every layer to dense MLA. So proposing a dense-MLA
+policy for the EXL3 arm is proposing to reproduce an open defect on a second arm.
+
+The earlier note here that dense MLA is "exact below 512 tokens" is true only of
+the INDEXER half, where a top-k over fewer keys than `index_topk` selects
+everything. It is NOT true of the COMPRESSOR, which is a different function at any
+length: a 128-wide boundary-emitted pool over a separate `compressor.wkv`
+projection is not a dense attention over the raw prefix, and no sequence length
+makes it one. With 41 of 46 layers carrying a compressor, that is the governing
+half.
 
 **MEASURED 2026-08-31, and it settles what the shared policy may and may not do.**
 The artifact's own `config.json` gives `compress_ratios` over 46 layers of which

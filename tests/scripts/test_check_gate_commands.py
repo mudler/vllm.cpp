@@ -987,6 +987,25 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_preflight_compiles_left_the_gated_population_cleanly(self):
+        # b39f14adb moves ENG-PREFLIGHT-COMPILES (#2401) ACTIVE -> PARTIAL.
+        # PARTIAL is outside GATED_STATES, so the row must leave both sides of
+        # the exact pin without losing the runnable commands preserved in its
+        # spec. These three assertions distinguish lifecycle shrinkage from a
+        # weaker verdict or a silently deleted gate command.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("ENG-PREFLIGHT-COMPILES"))
+        self.assertNotIn("ENG-PREFLIGHT-COMPILES", gates.RUNNABLE_BASELINE)
+        spec = ROOT / ".agents/specs/preflight-compiles.md"
+        text = spec.read_text(encoding="utf-8")
+        section = gates.gates_section(text)
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        self.assertIn("python3 tests/scripts/test_check_tree_compiles.py", commands)
+        self.assertIn(
+            "python3 scripts/check-tree-compiles.py --base origin/main", commands
+        )
+
     def test_hf_model_download_earns_its_runnable_baseline_entry(self):
         # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
         # population for the first time and the baseline grows by one. Same

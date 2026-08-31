@@ -76,6 +76,7 @@ USAGE
     ltx25-render-compare.py --a <dir> --b <dir> [--control <dir>] \
         [--control-of a|b] [--label-a naive] [--label-b flash] [--json out.json]
     ltx25-render-compare.py --a <dir> --reference <mp4|dir> [--json out.json]
+    ltx25-render-compare.py --a <dir> --reference <mp4> --adherence-model <dir>
 
 `--reference` is the ABSOLUTE question, and #1854 is the issue that refused to
 answer it until an oracle existed. It now does: #1864 pinned `ltx-2`, ran it on
@@ -92,11 +93,36 @@ a single render uses. The absolute question is about ONE render; requiring a
 second would make this tool demand a comparison it does not use, and both ways of
 faking one are worse than the extra entry point. `_absolute_only` records them.
 
-WHAT `--reference` STILL DOES NOT ANSWER. Prompt adherence. Nothing in this tree
-scores frames against a prompt, that needs a vision-language model pinned as an
-oracle, and #1854's first sub-question stays open. A run that passes says the
-render is no worse than upstream's on two blockiness ratios at one geometry. It
-does not say the render depicts what was asked for.
+`--adherence-model` is #1854's OTHER half, and it is what makes a passing run say
+the render depicts what was asked for. The scorer is CLIP -- upstream's own
+choice, registered in vLLM as `CLIPEmbeddingModel` and used by vLLM-Omni's
+accuracy suite to score prompt faithfulness for video -- and it is an INSTRUMENT
+rather than an oracle: `ltx-2` still supplies the other side of every comparison,
+and the checkpoint is pinned by revision AND sha256 in
+`tests/parity/goldens/ltx25_adherence/scorer-pin.json`. Three checks, none of
+them a threshold:
+
+  S0  the scorer must rank the render's true prompt first ON THE REFERENCE, by a
+      margin above zero, or the run exits UNREADABLE and publishes nothing. An
+      instrument that has never failed is not known to be able to.
+  S1  `ours_mean >= ref_frame_min`, the mirror of the blockiness bound, with every
+      digit recomputed from the reference's own frames.
+  S2  the argmax over the true prompt plus the committed decoys must be the true
+      prompt. Its null is 1/(N+1) and is printed beside the verdict.
+
+S2 COVERS THE BLIND SPOT THE BLOCKINESS BOUND DECLARES: a pure-noise render passes
+C0 and passes both blockiness ratios, and it ranks the true prompt LAST.
+
+WHAT THIS STILL DOES NOT ANSWER. **CLIP's text context is 77 positions**, so a
+longer prompt is REFUSED and never truncated. The #1864 reference request fits at
+17 tokens. #1854's own 70-word golden-retriever example needs at least 83 and
+does not, so this gate answers the request the reference render was taken at and
+CANNOT answer the one #1854 quotes. The tower is 224x224, so a 320x192 frame
+reaches it as a resized centre crop. Frames are scored one at a time, so temporal
+adherence -- "walks SLOWLY" -- is invisible to it, exactly as it is to
+vLLM-Omni's own middle-frame scorer. Without `--adherence-model` a passing run
+says only that the render is no worse than upstream's on two blockiness ratios at
+one geometry.
 
 `--control` is a THIRD render that repeats ONE of the two arms with nothing
 changed. It measures the noise floor: run-to-run nondeterminism of the same
@@ -1214,6 +1240,631 @@ def reference_checks(label: str, panel: dict, bounds: dict) -> list[tuple]:
     return out
 
 
+# --- prompt adherence (#1854 sub-question 1, owned by #2295) ------------------
+# THE HALF OF #1854 THAT WAS STILL OPEN. The block above asks whether this render
+# has artefacts in it. It cannot ask whether the render depicts WHAT THE PROMPT
+# ASKED FOR, and until this section landed the tool said so in its own output.
+#
+# WHAT SCORES IT, AND WHY THAT IS NOT A NEW ORACLE. The scorer is CLIP, and CLIP
+# is an INSTRUMENT here rather than an oracle. That is the developer's answer to
+# section 9 of `.agents/specs/ltx25-prompt-adherence.md`, on that spec's own
+# recommendation, and the argument is that the scorer never answers a question on
+# its own: every number it produces is consumed as a comparison against the #1864
+# render, which is the pinned `ltx-2` oracle's output. Delete the reference and
+# neither check below has a bound. So AGENTS.md's oracle table is unchanged, there
+# is no `.agents/oracles/` file for the checkpoint, and the checkpoint is pinned by
+# revision AND sha256 like any other artefact this project loads --
+# `tests/parity/goldens/ltx25_adherence/scorer-pin.json`.
+#
+# IT IS UPSTREAM'S OWN CHOICE OF SCORER, NOT OURS. vLLM registers the family as a
+# first-class runner (`vllm/model_executor/models/registry.py:251` at
+# `5559679229`, `"CLIPModel": ("clip", "CLIPEmbeddingModel")`, the only occurrence
+# of that literal in the file), and vLLM-Omni's own accuracy suite scores
+# prompt-faithfulness for VIDEO with it (`tests/e2e/accuracy/helpers.py:496`,
+# `class CLIPScorer`, default `openai/clip-vit-base-patch16`, at
+# `a4ea67a21b20054dacc6e83952f9bd407e8ee4e7`; that repository is UNPINNED, #633,
+# so this is a source reading at a stated revision and not a pinned citation).
+# `score()` at `:504` normalises both projected embeddings and returns their
+# cosine times 100, and `_clip_matrix` below is that same arithmetic in a batch.
+#
+# WHAT WAS NOT INHERITED FROM UPSTREAM, AND WHY. vLLM-Omni asserts
+# `clip >= CLIP_ABSOLUTE_FLOOR` with the floor at `20.0` (`:54`), env-overridable
+# and derived nowhere. That is INADMISSIBLE here. #1854 was filed rather than
+# closed with a proxy precisely to keep a chosen constant out of the centre of the
+# verdict, and it names the one admissible shape: "worse than the oracle on this
+# statistic", **because that is a comparison and not a convention**. So neither
+# check below contains a threshold. S1's bound is recomputed from the reference's
+# own frames on every run; S2's null is 1/(N+1) and is arithmetic.
+#
+# THE THREE CHECKS.
+#
+#   S0, the precondition. Before either number is published the scorer must rank
+#       the TRUE prompt first on the REFERENCE's frames, by a margin strictly
+#       greater than zero. If it cannot do that on upstream's own good render of
+#       this prompt, the instrument is broken, and a broken instrument that keeps
+#       running reports a CODE verdict. It exits EXIT_UNREADABLE and publishes
+#       nothing, exactly as `reference_bounds` refuses a degenerate reference. An
+#       instrument that has never failed is not known to be able to.
+#
+#   S1, a comparison. `ours_mean >= ref_frame_min`, both against the true prompt.
+#       This is the exact mirror of the blockiness bound: there, higher is worse
+#       and the form is `ours_mean <= ref_frame_max`; here higher is better, so
+#       the inequality and the order statistic both flip. Every digit is measured
+#       off the reference. Mean-against-mean was rejected because it has no margin
+#       at all and fires on the difference in CONTENT between two renders of one
+#       prompt by two engines; min-against-min was rejected because two single
+#       order statistics over 25 frames a side make the verdict a coin toss.
+#
+#   S2, a SET assertion. The argmax over {true prompt, committed decoys} must be
+#       the true prompt. This is the question #1854 actually poses, and it is
+#       where CLIP is used for what it was trained to do. Its absolute cosine is
+#       uncalibrated -- that is why `20.0` means nothing -- but contrastive
+#       RANKING is the training objective. A discrete selection has bimodal error,
+#       so a tolerance would bound nothing; the assertion is set equality and the
+#       MARGIN to the best decoy is printed on every run, passing or failing,
+#       because a gate that prints only its verdict cannot be seen degrading.
+#
+# S2 ALSO COVERS A BLIND SPOT THE LANDED GATE DECLARES. `ltx25-oracle-absolute.md`
+# records that a pure-noise render PASSES blockiness and passes C0, with a test
+# that says so. Noise ranks no prompt first, and S2 fails it.
+#
+# THE 77-POSITION BOUND, STATED WHEREVER THE GATE IS STATED. CLIP's text context
+# is 77 positions (`config.json` at the pinned revision,
+# `text_config.max_position_embeddings = 77`, measured rather than transcribed --
+# its sha256 is in the pin). A prompt that does not fit is REFUSED and never
+# truncated. The #1864 reference request fits at 13 words. #1854's own motivating
+# prompt, the 70-word golden retriever at
+# `scripts/ltx25-dit-attn-flash-pixel-ab.sh:697`, does NOT: CLIP's pre-tokenizer
+# splits it into 81 chunks and each chunk is at least one BPE token, so it needs
+# at least 83 positions. **This instrument answers the request the reference
+# render was taken at and cannot answer the one #1854 quotes.** Its tower is also
+# 224x224, so a 320x192 frame reaches it as a resized centre crop.
+ADHERENCE_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 os.pardir, "tests", "parity", "goldens", "ltx25_adherence"))
+DEFAULT_ADHERENCE_PIN = os.path.join(ADHERENCE_DIR, "scorer-pin.json")
+DEFAULT_ADHERENCE_DECOYS = os.path.join(ADHERENCE_DIR, "decoys.json")
+DEFAULT_ORACLE_MANIFEST = os.path.join(GOLDEN_DIR, "ltx2_oracle_manifest.json")
+
+
+def load_json_record(path: str, what: str) -> dict:
+    """A committed record, or `UnreadableInput`. Never a default."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError as exc:
+        raise UnreadableInput(f"{path}: cannot read {what} ({exc})")
+    except ValueError as exc:
+        raise UnreadableInput(f"{path}: {what} is not valid JSON ({exc})")
+
+
+def true_prompt(manifest_path: str = DEFAULT_ORACLE_MANIFEST) -> str:
+    """The prompt the #1864 reference render was ACTUALLY taken at.
+
+    Read from the committed manifest rather than accepted from a flag, and that is
+    the whole point: a `--prompt` a caller could set would let the prompt and the
+    reference disagree, and the resulting number would score our render against a
+    request nobody rendered. There is exactly one true prompt in this tree and it
+    is `request.prompt` in the manifest #1864 committed.
+    """
+    rec = load_json_record(manifest_path, "the #1864 oracle manifest")
+    p = (rec.get("request") or {}).get("prompt")
+    if not isinstance(p, str) or not p.strip():
+        raise UnreadableInput(
+            f"{manifest_path}: no request.prompt, so the prompt the reference was "
+            f"rendered at is unknown and nothing may be scored against it")
+    return p
+
+
+def load_decoys(path: str = DEFAULT_ADHERENCE_DECOYS) -> list[dict]:
+    """The committed decoy set, with both required kinds present.
+
+    NOT overridable from the command line, deliberately. A caller who could supply
+    their own decoys could supply trivially far ones and clear S2 by construction,
+    which is `gate-comparing-shared-helper-proves-consistency-not-correctness` with
+    the caller holding both sides. The set is committed so it cannot be chosen
+    after the scores are seen.
+    """
+    rec = load_json_record(path, "the committed decoy prompts")
+    items = rec.get("decoys")
+    if not isinstance(items, list) or len(items) < 2:
+        raise UnreadableInput(
+            f"{path}: fewer than two decoys, so S2's null 1/(N+1) would be at "
+            f"least one half and the argmax would be close to a coin toss")
+    out = []
+    for i, it in enumerate(items):
+        text, kind = (it or {}).get("text"), (it or {}).get("kind")
+        if not isinstance(text, str) or not text.strip():
+            raise UnreadableInput(f"{path}: decoy {i} has no text")
+        if kind not in ("near", "far"):
+            raise UnreadableInput(
+                f"{path}: decoy {i} has kind {kind!r}, and the set must declare "
+                f"each decoy near or far: a set of only far decoys measures "
+                f"almost nothing")
+        out.append({"text": text, "kind": kind})
+    kinds = {d["kind"] for d in out}
+    if kinds != {"near", "far"}:
+        raise UnreadableInput(
+            f"{path}: the decoy set has kinds {sorted(kinds)} and needs both. A "
+            f"scorer that can only tell a snowy forest from a bowl of soup has "
+            f"been shown very little")
+    # DUPLICATES ARE REFUSED BECAUSE THEY CORRUPT THE NULL, not because they are
+    # untidy. `adherence_null` divides by the COUNT, so a set that lists one
+    # prompt twice reports 1/(N+1) while the argmax really ranges over fewer
+    # distinct alternatives than that. The printed null would then understate
+    # chance, which is the one number S2 has to be read against.
+    texts = [d["text"] for d in out]
+    if len(set(texts)) != len(texts):
+        dupes = sorted({t for t in texts if texts.count(t) > 1})
+        raise UnreadableInput(
+            f"{path}: the decoy set repeats {len(dupes)} prompt(s), so its null "
+            f"1/(N+1) counts an alternative the argmax does not actually have: "
+            f"{dupes[0][:60]!r}")
+    return out
+
+
+def adherence_null(n_decoys: int) -> float:
+    """S2's null: an uninformative scorer's chance of picking the true prompt.
+
+    Arithmetic, not a convention. With `n` decoys the argmax ranges over `n + 1`
+    prompts, so chance is `1 / (n + 1)`. It is printed beside every S2 verdict
+    because a set assertion whose null nobody states is a verdict nobody can size.
+    """
+    if n_decoys < 1:
+        raise UnreadableInput("S2 needs at least one decoy: with none, the argmax "
+                              "over a single prompt is the true prompt by "
+                              "construction and the check cannot fail")
+    return 1.0 / float(n_decoys + 1)
+
+
+def assert_scorer_identity(model_dir: str, pin: dict) -> dict:
+    """The scorer's WEIGHTS are its identity, asserted before it reads a pixel.
+
+    SSIM is a closed form; a neural scorer is a file. A swapped checkpoint moves
+    every reading silently and nothing in the report would change, which is #1723
+    exactly. So each file the scorer loads is hashed and compared against the
+    committed pin, the way `load_reference` hashes the reference render.
+
+    A `null` digest in the pin is UNMEASURED, and unmeasured REFUSES. It does not
+    mean "skip this file": it means nobody has ever downloaded and hashed that
+    file, so admitting it would be scoring with an unidentified model and quoting
+    the number. AGENTS.md's gateability rule -- demonstrably builds and runs the
+    model, and constructing a config proves nothing -- is written for an oracle
+    and applies here for the same reason.
+    """
+    files = pin.get("files")
+    if not isinstance(files, dict) or not files:
+        raise UnreadableInput(
+            f"{DEFAULT_ADHERENCE_PIN}: the scorer pin lists no files, so nothing "
+            f"anchors the scorer's identity")
+    if not os.path.isdir(model_dir):
+        raise UnreadableInput(f"{model_dir}: not a directory of scorer weights")
+    unmeasured = sorted(n for n, f in files.items() if (f or {}).get("sha256") is None)
+    if unmeasured:
+        raise UnreadableInput(
+            f"the scorer checkpoint is UNMEASURED: {len(unmeasured)} of "
+            f"{len(files)} pinned files carry sha256 null "
+            f"({', '.join(unmeasured)}). Nothing in this tree has downloaded "
+            f"{pin.get('repo')} at {pin.get('revision')}, hashed it, or produced "
+            f"one embedding from it, so `gateable` is false in "
+            f"{os.path.basename(DEFAULT_ADHERENCE_PIN)} and this run publishes no "
+            f"adherence number. The download is "
+            f"{pin.get('required_bytes_total')} bytes, the repository declares "
+            f"NO licence, and the weights ship as a pickle rather than "
+            f"safetensors; `.agents/developer-preferences.md` records no "
+            f"authority for it. Owner: row LTX25-PROMPT-ADHERENCE, issue #2295")
+    checked = {}
+    for name in sorted(files):
+        want = files[name]["sha256"]
+        p = os.path.join(model_dir, name)
+        if not os.path.isfile(p):
+            raise UnreadableInput(
+                f"{p}: the pin names this file and it is not there, so the "
+                f"checkpoint in {model_dir} is not {pin.get('repo')} at "
+                f"{pin.get('revision')}")
+        got = sha256_file(p)
+        if got != want:
+            raise UnreadableInput(
+                f"{p}: sha256 {got} is not the pinned {want}. This is not "
+                f"{pin.get('repo')} at {pin.get('revision')}, and a score from an "
+                f"unknown scorer is a number with no instrument behind it")
+        checked[name] = got
+    return {"repo": pin.get("repo"), "revision": pin.get("revision"),
+            "model_dir": os.path.abspath(model_dir), "files_verified": len(checked),
+            "digests": checked}
+
+
+def refuse_overlong_prompts(prompts: list[str], count_tokens, limit: int) -> dict:
+    """REFUSE a prompt that does not fit the scorer's context. Never truncate.
+
+    Truncating is the failure mode that produces a plausible number for a question
+    nobody asked: the tokens fit, the cosine comes back, and the report says the
+    render depicts a prompt whose second half the scorer never saw. So the run
+    stops at EXIT_UNREADABLE and names the prompt and its length.
+
+    `count_tokens` is the SCORER'S OWN tokenizer, passed in rather than
+    reimplemented here, because a second definition of "how long is this prompt"
+    could drift from the one the model actually uses.
+    """
+    if not isinstance(limit, int) or limit < 1:
+        raise UnreadableInput(
+            f"the scorer pin records text_context_positions {limit!r}, which is "
+            f"not a length, so no prompt can be checked against it")
+    counts = {}
+    for text in prompts:
+        n = int(count_tokens(text))
+        counts[text] = n
+        if n > limit:
+            raise UnreadableInput(
+                f"a prompt needs {n} of the scorer's {limit} text positions and "
+                f"is REFUSED rather than truncated: {text[:80]!r}... A truncated "
+                f"prompt scores a question nobody asked. This is the bound #1854's "
+                f"own 70-word example runs into; the #1864 reference request fits")
+    return {"limit": limit, "counts": counts,
+            "max": max(counts.values()) if counts else 0}
+
+
+def prompt_score_stats(scores: np.ndarray) -> list[dict]:
+    """Per-prompt reduction of a `(frames, prompts)` score matrix.
+
+    `frame_min` and `frame_max` are the observed per-frame range, and `mean` and
+    `sd` sit beside them so a reader can see how far a value is from the reference
+    IN THE REFERENCE'S OWN UNITS rather than only whether it cleared a line. This
+    is `reference_bounds`' reduction, on a different statistic.
+    """
+    a = np.asarray(scores, dtype=np.float64)
+    if a.ndim != 2 or a.shape[0] < 1 or a.shape[1] < 2:
+        raise UnreadableInput(
+            f"a score matrix of shape {a.shape} cannot be reduced: it needs at "
+            f"least one frame and at least a true prompt plus one decoy")
+    out = []
+    for j in range(a.shape[1]):
+        v = a[:, j]
+        out.append({"n": int(v.size), "mean": float(v.mean()),
+                    "sd": float(v.std(ddof=1)) if v.size > 1 else 0.0,
+                    "frame_min": float(v.min()), "frame_max": float(v.max())})
+    return out
+
+
+def discrimination(scores: np.ndarray, labels: list[str],
+                   true_index: int = 0) -> dict:
+    """S2's ranking: which prompt this render scores highest, and by how much.
+
+    The ranking statistic is the per-prompt MEAN over frames, because the question
+    is about the render and not about one frame. The per-frame win fraction is
+    carried beside it and reported, so a render that ranks correctly on average
+    while losing most frames is visible rather than hidden behind one number.
+
+    `margin` is the true prompt's mean minus the BEST decoy's mean. It is reported
+    on every run, passing or failing. It is not a threshold and nothing is
+    compared against it: the verdict is the set assertion `argmax == true`.
+    """
+    a = np.asarray(scores, dtype=np.float64)
+    stats = prompt_score_stats(a)
+    means = np.array([s["mean"] for s in stats])
+    order = list(np.argsort(-means))
+    best = int(order[0])
+    decoys = [j for j in range(a.shape[1]) if j != true_index]
+    best_decoy = int(max(decoys, key=lambda j: means[j]))
+    per_frame_true_wins = int((a.argmax(axis=1) == true_index).sum())
+    return {
+        "labels": list(labels),
+        "true_index": int(true_index),
+        "argmax_index": best,
+        "argmax_label": labels[best],
+        "true_first": bool(best == true_index),
+        "means": [float(m) for m in means],
+        "ranking": [labels[j] for j in order],
+        "best_decoy_index": best_decoy,
+        "best_decoy_label": labels[best_decoy],
+        "margin": float(means[true_index] - means[best_decoy]),
+        "per_frame_true_wins": per_frame_true_wins,
+        "frames": int(a.shape[0]),
+        "per_frame_true_win_fraction": per_frame_true_wins / float(a.shape[0]),
+        "null": adherence_null(len(decoys)),
+        "stats": stats,
+    }
+
+
+def scorer_precondition(ref_disc: dict) -> dict:
+    """S0. The instrument must prove it can say no, on the ORACLE's own frames.
+
+    Upstream rendered this prompt and the result is committed. If the scorer
+    cannot rank that prompt first over the decoys, on that render, then it is
+    broken here -- wrong checkpoint, wrong preprocessing, wrong frames -- and
+    anything it then says about OUR render is a code verdict wearing a
+    measurement's clothes. So this raises, and the run exits EXIT_UNREADABLE with
+    no adherence number published at all. A FAIL would say our render is worse
+    than a reference that was never established.
+
+    A ZERO margin fails it too, and that case is the one worth naming: a scorer
+    that returns the same value for every prompt has an argmax, and numpy's is the
+    first index, which is the true prompt. It would pass a bare `argmax == true`
+    while measuring nothing. The margin must be strictly positive.
+    """
+    if not ref_disc["true_first"]:
+        raise UnreadableInput(
+            f"S0 FAILED: on the #1864 REFERENCE render the scorer ranks "
+            f"{ref_disc['argmax_label']!r} above the prompt that render was "
+            f"actually made from, by {-ref_disc['margin']:+.4f}. The instrument "
+            f"cannot tell upstream's own good render of this prompt from a decoy, "
+            f"so it measures nothing here and no adherence number is published. "
+            f"This is a dead candidate and a finding, not a thing to loosen")
+    if not (ref_disc["margin"] > 0.0):
+        raise UnreadableInput(
+            f"S0 FAILED: on the #1864 REFERENCE render the true prompt and the "
+            f"best decoy {ref_disc['best_decoy_label']!r} score identically "
+            f"(margin {ref_disc['margin']:+.6f}). A scorer with no separation has "
+            f"an argmax and no information; it would clear a bare set assertion "
+            f"while measuring nothing")
+    return {"passed": True, "margin": ref_disc["margin"],
+            "reference_ranking": ref_disc["ranking"],
+            "null": ref_disc["null"]}
+
+
+def adherence_checks(label: str, ours: dict, ref: dict) -> list[tuple]:
+    """S1 and S2 for OUR render, as `(name, pass, detail, judges)` tuples.
+
+    The reference's own S2 is not repeated here: it is S0, and S0 raises rather
+    than failing, because a broken instrument is an unreadable input and not a bad
+    render. Two checks in the table, and each of them can fail.
+    """
+    out: list[tuple] = []
+    t = ours["true_index"]
+    o, r = ours["stats"][t], ref["stats"][t]
+    lo = r["frame_min"]
+    v = o["mean"]
+    # HOW LOOSE, MEASURED RATHER THAN ASSUMED. The reference's own per-frame
+    # minimum sits some number of its own per-frame standard deviations below its
+    # mean, and that number is a property of this reference render, not a constant.
+    # It is printed so the bound's looseness is visible instead of argued.
+    slack_sd = ((r["mean"] - lo) / r["sd"]) if r["sd"] > 0 else float("inf")
+    out.append((
+        f"absolute.{label}.adherence_clip", v >= lo,
+        f"{v:.4f} >= {lo:.4f}, the reference's per-frame MINIMUM CLIP score "
+        f"against its own prompt (reference mean {r['mean']:.4f}, per-frame sd "
+        f"{r['sd']:.4f}, n={r['n']}); margin {v - lo:+.4f}; the bound sits "
+        f"{slack_sd:.2f} of the reference's own per-frame sd below its mean; "
+        + ("worse than the oracle on this statistic" if v < lo
+           else "no worse than the oracle on this statistic"),
+        "treatment"))
+    out.append((
+        f"absolute.{label}.adherence_argmax", ours["true_first"],
+        f"argmax over {len(ours['labels'])} prompts is {ours['argmax_label']!r}; "
+        f"margin to the best decoy {ours['best_decoy_label']!r} is "
+        f"{ours['margin']:+.4f}; per-frame wins "
+        f"{ours['per_frame_true_wins']}/{ours['frames']} "
+        f"({ours['per_frame_true_win_fraction']:.3f}); null for an uninformative "
+        f"scorer is 1/{len(ours['labels'])} = {ours['null']:.4f}; ranking "
+        f"{' > '.join(ours['ranking'])}",
+        "treatment"))
+    return out
+
+
+class ClipAdherenceScorer:
+    """CLIP, from a LOCAL directory whose bytes are already pinned.
+
+    EVERY CHOICE HERE IS UPSTREAM'S, AND EACH ONE IS CITED. vLLM is the primary
+    reference and it implements this path, so the feature route is vLLM's:
+
+      the projections     `vllm/model_executor/models/clip.py:808` (text) and
+                          `:820` (vision) at `5559679229` -- `nn.Linear(..., bias=False)`
+                          into `config.projection_dim`.
+      what a feature IS   `clip.py:847`, `text_features = self.text_projection(pooled_output)`,
+                          and `:867`, `image_features = self.visual_projection(pooled_output)`.
+                          The model returns the PROJECTED features and does not
+                          normalise them.
+      the ENTRY POINTS    `tests/models/multimodal/pooling/test_clip.py:52-57`
+                          calls HuggingFace `get_image_features(pixel_values=...)`
+                          and `get_text_features(input_ids=..., attention_mask=...)`
+                          as the reference vLLM's own `.embed()` is checked
+                          against, through `check_embeddings_close` at `:67`.
+                          So those two calls are what this scorer calls.
+      dtype               `test_clip.py:75`, `@pytest.mark.parametrize("dtype", ["float"])`.
+                          Upstream runs this pooling path in f32, so f32 is
+                          inherited rather than chosen, and it is upstream's
+                          polarity and not a widening of ours.
+      the CONTEXT         `test_clip.py:41`, `max_model_len=77`.
+      the SCORE itself    vLLM-Omni `tests/e2e/accuracy/helpers.py:507-511` at
+                          `a4ea67a21b20054dacc6e83952f9bd407e8ee4e7`: L2-normalise
+                          both projected embeddings, take the cosine, multiply by
+                          100. That repository is UNPINNED (#633), so it is a
+                          source reading at a stated revision.
+
+    Computed as a matrix rather than one pair at a time, and the value is the same
+    number because each embedding is L2-normalised independently of the other
+    side, so the batched dot product IS the per-pair cosine. The ported case in
+    `tests/scripts/test_ltx25_prompt_adherence.py` asserts that against
+    upstream's own tolerance rather than leaving it as an argument.
+
+    `local_files_only=True` everywhere. A gate that can reach the network can
+    silently score with whatever the hub is serving today, and the pin would be
+    decoration.
+    """
+
+    def __init__(self, model_dir: str, pin: dict):
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+        except ImportError as exc:
+            raise UnreadableInput(
+                f"the adherence scorer needs `transformers` and torch ({exc}). "
+                f"They are the runtime vLLM's own CLIP pooling test and "
+                f"vLLM-Omni's CLIPScorer use; install them or omit "
+                f"--adherence-model")
+        try:
+            # f32: upstream's own dtype for this path, `test_clip.py:75`.
+            self._model = CLIPModel.from_pretrained(
+                model_dir, local_files_only=True, dtype=torch.float32)
+            self._processor = CLIPProcessor.from_pretrained(model_dir,
+                                                            local_files_only=True)
+        except Exception as exc:  # noqa: BLE001 - any load failure is unreadable
+            raise UnreadableInput(
+                f"{model_dir}: cannot load the pinned CLIP scorer ({exc})")
+        self._model.eval()
+        self.limit = int(pin.get("text_context_positions") or 0)
+
+    def count_tokens(self, text: str) -> int:
+        """The SCORER'S own tokenizer, with no truncation, so the count is real."""
+        tok = getattr(self._processor, "tokenizer", None)
+        if tok is None:
+            raise UnreadableInput(
+                "the pinned scorer exposes no tokenizer, so a prompt's length "
+                "against its 77-position context cannot be established and no "
+                "prompt may be admitted")
+        return len(tok(text, truncation=False)["input_ids"])
+
+    def features(self, frames: list[np.ndarray], prompts: list[str]):
+        """The two projected feature blocks, by upstream's own entry points."""
+        import torch
+        from PIL import Image
+        images = [Image.fromarray(np.asarray(f, dtype=np.uint8), mode="RGB")
+                  for f in frames]
+        img_in = self._processor(images=images, return_tensors="pt")
+        txt_in = self._processor(text=list(prompts), return_tensors="pt",
+                                 padding=True)
+        with torch.no_grad():
+            img = self._model.get_image_features(pixel_values=img_in["pixel_values"])
+            txt = self._model.get_text_features(
+                input_ids=txt_in["input_ids"],
+                attention_mask=txt_in.get("attention_mask"))
+        # UPSTREAM'S OWN UNWRAP, not a local convenience. `test_clip.py:59-61`
+        # reads `if not isinstance(pooled_output, torch.Tensor): pooled_output =
+        # pooled_output.pooler_output`, because `transformers` returns a
+        # `BaseModelOutputWithPooling` from these two calls and has already
+        # REPLACED its `pooler_output` with the projected features -- exactly
+        # `clip.py:867`'s `self.visual_projection(pooled_output)`. Taking `.
+        # pooler_output` here is therefore the projected feature and not the
+        # pre-projection pooled one, and porting the guard rather than assuming a
+        # tensor is what makes that true across `transformers` versions.
+        return self._unwrap(img), self._unwrap(txt)
+
+    @staticmethod
+    def _unwrap(v):
+        import torch
+        return v if isinstance(v, torch.Tensor) else v.pooler_output
+
+    def score(self, frames: list[np.ndarray], prompts: list[str]) -> np.ndarray:
+        """`(len(frames), len(prompts))` of cosine * 100."""
+        try:
+            img, txt = self.features(frames, prompts)
+        except UnreadableInput:
+            raise
+        except ImportError as exc:
+            raise UnreadableInput(
+                f"the adherence scorer needs torch and Pillow ({exc})")
+        img = img / img.norm(p=2, dim=-1, keepdim=True)
+        txt = txt / txt.norm(p=2, dim=-1, keepdim=True)
+        return (img @ txt.T).cpu().numpy().astype(np.float64) * 100.0
+
+
+def adherence_report(render_dir: str, ref_frames: list[np.ndarray],
+                     model_dir: str, pin_path: str = DEFAULT_ADHERENCE_PIN,
+                     decoys_path: str = DEFAULT_ADHERENCE_DECOYS,
+                     manifest_path: str = DEFAULT_ORACLE_MANIFEST) -> dict:
+    """S0 then S1 and S2, in the one order that is safe.
+
+    IDENTITY, THEN LENGTH, THEN S0, THEN NUMBERS. Each step refuses at
+    EXIT_UNREADABLE rather than failing, because each of them is a statement that
+    NOTHING was measured. An unidentified checkpoint, a truncated prompt and a
+    scorer that cannot read the oracle's own render are all inputs that could not
+    be read, and a 1 from any of them would say our render is worse than a
+    reference that was never established.
+
+    NO SCORER CAN BE INJECTED HERE, and the omission is deliberate rather than an
+    oversight. A `scorer=` seam would let a caller hand in an object that never
+    went through `assert_scorer_identity`, which is the same hole `load_decoys`
+    refuses for the decoy set two functions above: a caller holding both sides of
+    the comparison can clear it by construction. The scorer is built from the
+    directory whose bytes were just verified, and from nothing else. The suite
+    tests the arithmetic through the pure functions and the refusals through the
+    command line, so nothing needs the seam.
+    """
+    pin = load_json_record(pin_path, "the pinned scorer record")
+    identity = assert_scorer_identity(model_dir, pin)
+    decoys = load_decoys(decoys_path)
+    prompt = true_prompt(manifest_path)
+    # THE TRUE PROMPT MAY NOT ALSO BE A DECOY. It would score identically against
+    # itself, so the argmax would be a TIE that numpy breaks by index -- in favour
+    # of the true prompt, at index 0. S2 would then pass by construction while
+    # measuring nothing, which is exactly the trap `scorer_precondition` refuses a
+    # zero margin for. Checked here rather than in `load_decoys`, which does not
+    # know the prompt.
+    if prompt in {d["text"] for d in decoys}:
+        raise UnreadableInput(
+            f"{decoys_path}: the true prompt is also listed as a decoy, so S2's "
+            f"argmax is a tie broken in its favour by index and would pass "
+            f"whatever the render depicts")
+    prompts = [prompt] + [d["text"] for d in decoys]
+    labels = ["true"] + [f"{d['kind']}:{i}" for i, d in enumerate(decoys)]
+    scorer = ClipAdherenceScorer(model_dir, pin)
+    lengths = refuse_overlong_prompts(prompts, scorer.count_tokens,
+                                      int(pin.get("text_context_positions") or 0))
+    ref_disc = discrimination(scorer.score(ref_frames, prompts), labels)
+    s0 = scorer_precondition(ref_disc)
+    ours_frames = [read_ppm(p) for p in frame_paths(render_dir)]
+    ours_disc = discrimination(scorer.score(ours_frames, prompts), labels)
+    return {
+        "scorer": identity,
+        "role": "instrument",
+        "prompt": prompt,
+        "prompt_source": os.path.abspath(manifest_path),
+        "decoys": decoys,
+        "decoys_source": os.path.abspath(decoys_path),
+        "labels": labels,
+        "text_context_positions": lengths["limit"],
+        "prompt_token_counts": lengths["counts"],
+        "s0": s0,
+        "reference": ref_disc,
+        "ours": ours_disc,
+        "null": ours_disc["null"],
+    }
+
+
+def print_adherence_panel(ad: dict | None) -> None:
+    """What was measured, or the declaration that nothing was.
+
+    #1854 shipped the "not measured anywhere in this tree" line and the
+    declaration was the point: a reader had to be able to see the gap. The same
+    obligation runs the other way once a scorer is attached, so the heading
+    changes with the fact, and the 77-position bound is stated in BOTH states
+    because it limits what this gate can ever be asked.
+    """
+    if ad is None:
+        print("PROMPT ADHERENCE IS NOT MEASURED IN THIS RUN (#1854). Pass "
+              "--adherence-model to score it")
+        print("against the committed prompt and decoys. The scorer is CLIP, an "
+              "INSTRUMENT and not an oracle:")
+        print("its checkpoint is pinned by revision and sha256 in "
+              "tests/parity/goldens/ltx25_adherence/scorer-pin.json,")
+        print("and its text context is 77 positions, so a prompt longer than that "
+              "is REFUSED and never truncated.")
+        return
+    print("--- prompt adherence: CHECKED against the #1864 reference and the "
+          "committed decoys (#1854) ---")
+    print(f"scorer {ad['scorer']['repo']} at {ad['scorer']['revision']}, "
+          f"{ad['scorer']['files_verified']} file digest(s) verified; role "
+          f"{ad['role']}, not an oracle")
+    print(f"prompt {ad['prompt']!r}")
+    print(f"  read from {os.path.basename(ad['prompt_source'])}, the request the "
+          f"reference render was taken at")
+    print(f"  text context {ad['text_context_positions']} positions; the longest "
+          f"prompt scored needs {max(ad['prompt_token_counts'].values())}. A "
+          f"prompt over the limit is REFUSED, never truncated")
+    print(f"  {len(ad['decoys'])} committed decoys, so S2's null is "
+          f"{ad['null']:.4f} = 1/{len(ad['labels'])}")
+    print(f"S0 PASSED on the reference: true prompt first by "
+          f"{ad['s0']['margin']:+.4f}; ranking "
+          f"{' > '.join(ad['reference']['ranking'])}")
+    r = ad["reference"]["stats"][ad["reference"]["true_index"]]
+    print(f"  reference CLIP against its own prompt: mean {r['mean']:.4f}, "
+          f"per-frame [{r['frame_min']:.4f}, {r['frame_max']:.4f}], sd "
+          f"{r['sd']:.4f}, n {r['n']}")
+    print("  no absolute floor is applied: upstream's own `clip >= 20.0` is "
+          "env-overridable and derived nowhere,")
+    print("  and #1854 exists to keep a chosen constant out of the verdict. Both "
+          "checks below are comparisons.")
+
 def content_checks(content: dict, label: str, judges: str) -> list[tuple]:
     """C0 for ONE render, judged on its own content before anything is subtracted.
 
@@ -1348,7 +1999,29 @@ def main() -> int:
     ap.add_argument("--reference-sums", default=DEFAULT_REFERENCE_SUMS,
                     help="the digest list the reference must appear in "
                          "(default: the committed one, resolved from this script)")
+    # PROMPT ADHERENCE (#1854 sub-question 1, #2295). The scorer is an
+    # INSTRUMENT and not an oracle: `ltx-2` still supplies the other side of
+    # every comparison. Only the model DIRECTORY is a flag. The prompt comes
+    # from the #1864 manifest, the decoys are committed, and the checkpoint's
+    # every byte is hashed against the pin -- none of the three is overridable,
+    # because a caller who could set them could clear S2 by construction.
+    ap.add_argument("--adherence-model", default=None,
+                    help="a LOCAL directory holding "
+                         "openai/clip-vit-base-patch16 at the revision pinned in "
+                         "tests/parity/goldens/ltx25_adherence/scorer-pin.json. "
+                         "Every pinned file's sha256 is checked before a pixel is "
+                         "read. Needs --reference: the bound is the reference "
+                         "render's own per-frame minimum. CLIP's text context is "
+                         "77 positions and a longer prompt is REFUSED, never "
+                         "truncated")
     args = ap.parse_args()
+    if args.adherence_model is not None and args.reference is None:
+        ap.error("--adherence-model needs --reference: S1's bound IS the reference "
+                 "render's own per-frame minimum CLIP score, and S0 refuses to "
+                 "publish a number until the scorer has ranked the true prompt "
+                 "first on the reference's frames. Without the reference there is "
+                 "no bound and no precondition, only an absolute CLIP value, which "
+                 "is uncalibrated and is exactly the convention #1854 refused")
     if args.b is None and args.reference is None:
         ap.error("--b or --reference is required: without either there is nothing "
                  "to compare this render against, and a tool that compared a render "
@@ -1429,11 +2102,25 @@ def _absolute_only(args: argparse.Namespace) -> int:
                                        gated=True)
     }
 
+    # PROMPT ADHERENCE (#1854 sub-question 1). Runs only when a scorer is
+    # supplied, and it refuses rather than fails at every step before the
+    # numbers: an unidentified checkpoint, a prompt that does not fit CLIP's 77
+    # positions, and a scorer that cannot rank the true prompt first on the
+    # ORACLE's own frames are each a statement that NOTHING was measured, and
+    # `UnreadableInput` is how this file says that.
+    adherence = None
+    if args.adherence_model:
+        adherence = adherence_report(args.a, ref_frames, args.adherence_model)
+        report["adherence"] = adherence
+
     checks: list[tuple[str, bool, str, str]] = []
     checks.extend(content_checks(report["content"][args.label_a], args.label_a,
                                  "treatment"))
     checks.extend(reference_checks(args.label_a, report["absolute_quality"][args.label_a],
                                    bounds))
+    if adherence is not None:
+        checks.extend(adherence_checks(args.label_a, adherence["ours"],
+                                       adherence["reference"]))
 
     report["checks"] = [{"name": n, "pass": p, "detail": d, "judges": j}
                         for n, p, d, j in checks]
@@ -1453,11 +2140,19 @@ def _absolute_only(args: argparse.Namespace) -> int:
         reading = "CONTENT_DEGENERATE"
     elif abs_failed:
         reading = "WORSE_THAN_ORACLE"
+    elif adherence is not None:
+        # THE READING NAMES BOTH HALVES ONCE BOTH WERE MEASURED. It still names
+        # what was measured and nothing more: blockiness against the reference's
+        # own band, and CLIP adherence against the reference's own per-frame
+        # minimum plus the committed decoy ranking, on one request at one
+        # geometry, with a scorer whose 77-position context cannot read #1854's
+        # own 70-word example.
+        reading = "NO_WORSE_THAN_ORACLE_ON_BLOCKINESS_AND_ADHERENCE"
     else:
         # NAMED FOR EXACTLY WHAT WAS MEASURED. Not "as good as the oracle" and
         # not "a good render": two of the four panel statistics sit inside the
         # reference's own per-frame band, on one request at one geometry, and
-        # #1854's prompt-adherence half is untouched and still open.
+        # #1854's prompt-adherence half is unmeasured in THIS run.
         reading = "NO_WORSE_THAN_ORACLE_ON_BLOCKINESS"
     report["reading"] = reading
     report["verdict"] = "PASS" if ok else "FAIL"
@@ -1475,14 +2170,10 @@ def _absolute_only(args: argparse.Namespace) -> int:
               f"adj_mad={c['adjacent_frame_mad_mean']:.4f} "
               f"zero_motion_pairs={c['zero_motion_pairs']}")
     print_absolute_panel(report, gated=True)
+    print_adherence_panel(adherence)
     print("--- checks ---")
     for n, p, d, j in treatment:
         print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
-    print("PROMPT ADHERENCE IS NOT MEASURED HERE and is not measured anywhere in "
-          "this tree (#1854).")
-    print("It needs a vision-language model pinned as an oracle. Nothing above "
-          "says the render depicts")
-    print("what the prompt asked for.")
     print(f"READING {report['reading']}")
     print(f"VERDICT {report['verdict']} (exit {status})")
 

@@ -98,8 +98,10 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
   // owning device [T,H] bf16 buffer; it becomes the new residual-stream delta.
   // ENG-HYBRID-PLACEMENT W3b (#2026): a placed layer runs its routed experts on
   // the placement device, with the activation round trip at this boundary.
-  // `ActiveMoePlacementPlan` was resolved once at model build and is read, never
-  // re-decided, here. An unplaced model answers the engine device for every
+  // `ActiveMoePlacementPlan` is resolved once at model build and is read, never
+  // re-decided, here. That was an INTENT rather than a fact until #2314: nothing
+  // in `src/` called `SetActiveMoePlacementPlan`, so this read the default on
+  // every load and the branch below was dead. `FromModelDir` installs it now. An unplaced model answers the engine device for every
   // layer, so the branch below is the existing call and nothing is added to it.
   // ENG-HYBRID-PLACEMENT W3c: through the SHARED seam, not a hand-written round
   // trip. W3b wired this architecture by hand and the next one would have copied

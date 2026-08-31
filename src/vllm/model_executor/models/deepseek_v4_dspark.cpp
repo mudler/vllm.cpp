@@ -167,4 +167,32 @@ int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
   return len;
 }
 
+std::vector<int32_t> ProposeToVerifyInputs(
+    const std::vector<std::vector<int32_t>>& drafted,
+    const std::vector<int64_t>& lengths, std::vector<int32_t>* out_cu) {
+  VT_CHECK(out_cu != nullptr, "dspark propose: null cu_num_logits out");
+  VT_CHECK(drafted.size() == lengths.size(),
+           "dspark propose: one draft block per request");
+  out_cu->assign(drafted.size() + 1, 0);
+  std::vector<int32_t> flat;
+  for (size_t r = 0; r < drafted.size(); ++r) {
+    const int64_t k = lengths[r];
+    VT_CHECK(k >= 0, "dspark propose: a negative draft length");
+    // `MarkovDraftLoop` returns `[seed, d0, ...]`, so `1 + k` rows are needed and
+    // the block must be at least that long. A length past the block would name
+    // drafts the loop never produced.
+    VT_CHECK(static_cast<int64_t>(drafted[r].size()) >= k + 1,
+             "dspark propose: the confidence length exceeds the drafted block; "
+             "`MarkovDraftLoop` returns [seed, drafts...] and cannot supply " +
+                 std::to_string(k) + " drafts from " +
+                 std::to_string(drafted[r].size()) + " ids");
+    // Row `cu[r]` is the PREVIOUS token and is never compared; the seed is that
+    // row, so the prefix maps across as-is. `k == 0` contributes exactly that one
+    // row, which is a request skipping this round rather than an empty one.
+    flat.insert(flat.end(), drafted[r].begin(), drafted[r].begin() + (k + 1));
+    (*out_cu)[r + 1] = (*out_cu)[r] + static_cast<int32_t>(k + 1);
+  }
+  return flat;
+}
+
 }  // namespace vllm::dspark

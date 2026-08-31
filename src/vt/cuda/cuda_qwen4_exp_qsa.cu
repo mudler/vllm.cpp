@@ -136,6 +136,22 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"  // OpId, RegisterOp, DeviceType, the op declarations
 
+// ─── THE GATHER'S ERROR BOUND HAS A COMPILER PREMISE, SO PIN IT ──────────────
+// `tests/vllm/models/test_qwen4_exp_cuda_reductions.cpp` gates this file's
+// gather against its CPU arm with a bound DERIVED from CUDA's documented 2 ulp
+// for `expf`. Under `-use_fast_math`, nvcc maps `expf` to `__expf`, whose error
+// is about 2^-21.4 -- far outside 2 ulp -- and the derivation silently becomes
+// wrong while the gate keeps reporting a ratio it can no longer justify.
+//
+// The premise holds today: the only `-use_fast_math` in the build is a
+// `set_property(SOURCE ...)` that does not name this translation unit. But a
+// GLOBAL one has been considered in-tree, and a numeric contract that depends on
+// a compiler flag nobody is watching is exactly the silent-wrong-answer shape
+// this row keeps meeting. So it is a compile error rather than a comment.
+#if defined(__CUDA_FAST_MATH__)
+#error "cuda_qwen4_exp_qsa.cu: -use_fast_math maps expf to __expf (~2^-21.4), which breaks the 2-ulp premise the gather's derived arm-vs-arm bound rests on. Either exclude this TU from fast math or re-derive the bound in tests/vllm/models/test_qwen4_exp_cuda_reductions.cpp."
+#endif
+
 namespace vt::cuda {
 namespace {
 

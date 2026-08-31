@@ -163,7 +163,27 @@ constexpr double kAbsFloor = 1e-30;
 // are adding operands that already differ. The standard bound for `n` f32
 // additions gives each arm at most `n u SUM|terms|` away from the exact sum of
 // its own operands, with `u = 2^-24`; dividing the accumulator by `W` turns
-// `SUM_p w_p |v_p[d]|` into at most `max_p |v_p[d]|`. Two arms, so twice that.
+// `SUM_p w_p |v_p[d]|` into at most `max_p |v_p[d]|`.
+//
+// **BOTH accumulations round, not one.** `out = fl(acc) / fl(den)`, and the
+// DENOMINATOR is a second `|sel|`-long f32 sum whose error passes through the
+// quotient as a further `<= gamma_n |out|` per arm. So the rigorous factor is
+// FOUR n u, not two: one `n u` for `acc` and one for `den`, in each of two arms.
+// An earlier revision wrote 2, which held empirically with about 25% margin --
+// and that is exactly the residue of fitting this derivation exists to remove.
+// The analysis gives 4; the fixtures would have accepted 2; 4 is what is used.
+// It loosens rather than tightens, and it moves the discrimination window from
+// ">= 10 ulp of exp error" to ">= 20", which is still far inside anything a
+// legal `expf` can do.
+//
+// WHY THE ulp -> RELATIVE CONVERSION IS SAFE HERE, which is not obvious: `k`
+// ulp is `k 2^-23` relative only when the value is normal and its mantissa is
+// near 1, and a subnormal `w_p` would break it. Nothing is subnormal, because
+// **`W >= 1` exactly**. `m` is bit-identically one of the `__fmul_rn(dot,
+// scale)` values -- the max is exact and both arms compute the same dots -- so
+// the argmax row contributes `expf(0.0f)`, which is `1.0f` in both arms and in
+// any conforming library. Every other term is non-negative, so the denominator
+// is at least 1 and the quotient cannot amplify.
 //
 // Both terms are computed FROM THE FIXTURE'S OWN INPUTS in `CheckGatherDerived`
 // below, per output element. Nothing here is fitted, and the bound follows the
@@ -586,7 +606,14 @@ std::vector<int64_t> ExpandHost(const Selection& sel, int64_t t, int64_t kv_len)
 // element FROM THE FIXTURE'S OWN INPUTS, exactly as the derivation above states:
 //
 //   bound[t,h,d] = kExpRelDiff * max_p |v_p[d] - out[d]|      (the exp term)
-//                + 2 * |sel| * u * max_p |v_p[d]|             (the accumulation term)
+//                + 4 * |sel| * u * max_p |v_p[d]|             (the accumulation term)
+//
+// THE ACCUMULATION TERM EARNS ITS PLACE AGAINST A WORSE `expf`, NOT AGAINST
+// THIS ONE. Measured on `thor:gpu0`, the exp term ALONE suffices at every shape
+// (ratios 0.049 to 0.87) because that device's `expf` is far inside its 2 ulp
+// budget. Against a legal-but-worse `expf` the exp term alone is exceeded by up
+// to 22.8x, and the accumulation term is what absorbs it. Dropping it because
+// "it never binds here" would fit the bound to one device.
 //
 // The first term does NOT shrink as the selection grows, which is the property
 // the old fitted tolerance got backwards. The second grows with `|sel|`, which
@@ -621,7 +648,7 @@ void CheckGatherDerived(const std::vector<float>& got, const std::vector<float>&
           mag = std::max(mag, std::fabs(vv));
         }
         const double bound =
-            kAbsFloor + kExpRelDiff * spread + 2.0 * n * kUnitRoundoff * mag;
+            kAbsFloor + kExpRelDiff * spread + 4.0 * n * kUnitRoundoff * mag;
         const double diff = std::fabs(static_cast<double>(got[o]) - ref);
         if (std::memcmp(&got[o], &want[o], sizeof(float)) != 0) ++notbit;
         const double ratio = diff / bound;
@@ -930,11 +957,15 @@ TEST_CASE("vt::Qwen4ExpGatedResidual CUDA: a Q8_0 mix weight ENTERS the block br
     // A refusal must NAME something. An empty or generic message would leave a
     // caller with no idea which operand or which support is missing.
     CHECK(refusal.size() > 20);
-    const bool names_the_gap = refusal.find("q8_0") != std::string::npos ||
-                               refusal.find("Q8_0") != std::string::npos ||
-                               refusal.find("quant") != std::string::npos ||
-                               refusal.find("matmul") != std::string::npos;
-    CHECK(names_the_gap);
+    // **IT MUST NAME THE KEEP-QUANT GAP SPECIFICALLY.** An earlier revision
+    // accepted any message containing `q8_0`, `quant` or `matmul`, which a
+    // SHAPE or DTYPE error thrown BEFORE the block branch also satisfies -- so
+    // the case could have passed having never entered the branch it exists to
+    // test. `matmul_bt_quant` is the entry point the block dtype dispatches to,
+    // and only a refusal from inside it proves the branch was taken.
+    const bool from_the_quant_gemm = refusal.find("matmul_bt_quant") != std::string::npos;
+    INFO("the refusal must come from the quantized GEMM, not from a shape check");
+    CHECK(from_the_quant_gemm);
   } else {
     // The device ENTERED the block branch and returned, which is the fact this
     // case exists to establish.
@@ -1039,8 +1070,9 @@ TEST_CASE("vt::Qwen4ExpQsaCompress CUDA: the GRID STRIDE takes more than one tri
   // The compressor has no transcendental, so the byte contract holds at scale
   // exactly as it does at the golden widths.
   CheckBitwise(gpu, cpu, "qsa_compress 4100 blocks / grid stride");
-  // A collapsed stride leaves the tail as allocated; two zeros would agree, so
-  // assert the tail is LIVE rather than trusting the comparison alone.
+  // A collapsed stride leaves the tail AS ALLOCATED, which `DeviceTensor` does
+  // not zero, so it is undefined rather than zero. Agreement alone could be two
+  // zeros agreeing, so the tail is also asserted to be non-zero.
   double tail = 0.0;
   for (size_t i = static_cast<size_t>(4096 * D); i < gpu.size(); ++i) {
     tail = std::max(tail, std::fabs(static_cast<double>(gpu[i])));
@@ -1134,12 +1166,14 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: |sel| CROSSES the tile boundary"
   // spans many tiles, so the carry is load-bearing in all of them.
   struct Shape { const char* name; int64_t T, HQ, HKV, DH, kv, CR, topk; };
   const Shape kShapes[] = {
-      // 300 complete blocks -> |sel| = 1200 -> 37 tiles.
-      {"1200 rows / 37 tiles", 2, 2, 1, 32, 1200, 4, 300},
-      // The RELEASED geometry's selection size, at head_dim 64: 2050 -> 64 tiles.
-      {"2050 rows / 64 tiles", 1, 2, 1, 64, 2050, 4, 512},
-      // A tile boundary landed on exactly, plus a ragged tail.
-      {"exactly 2 tiles + tail", 3, 4, 2, 32, 66, 4, 16},
+      // 300 complete blocks -> |sel| = 1200 -> ceil(1200/32) = 38 tiles.
+      {"1200 rows / 38 tiles", 2, 2, 1, 32, 1200, 4, 300},
+      // The RELEASED geometry's selection size, at head_dim 64:
+      // ceil(2050/32) = 65 tiles.
+      {"2050 rows / 65 tiles", 1, 2, 1, 64, 2050, 4, 512},
+      // 64 selected rows is EXACTLY two tiles; the 2-row ragged tail makes a
+      // third, partial one. ceil(66/32) = 3.
+      {"2 full tiles + a 2-row tail", 3, 4, 2, 32, 66, 4, 16},
   };
   for (const Shape& sh : kShapes) {
     CAPTURE(std::string(sh.name));
@@ -1177,8 +1211,11 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GRID STRIDE takes more than 
               static_cast<long long>(pairs));
   CheckGatherDerived(gpu.out, cpu.out, y.v, y.sel, T, HQ, HKV, DH,
                      "qsa_gather 5200 pairs / grid stride");
-  // A collapsed stride leaves the tail as allocated. Assert the tail is LIVE
-  // rather than trusting the comparison alone, since two zeros also agree.
+  // A collapsed stride leaves the tail AS ALLOCATED. `DeviceTensor` does not
+  // zero its buffer, so "as allocated" is undefined rather than zero -- the
+  // point stands either way and the wording is corrected: the pair of
+  // assertions is what carries it. Agreement alone could be two zeros agreeing,
+  // so the tail is also asserted to be non-zero.
   double tail_mag = 0.0;
   for (size_t i = static_cast<size_t>(4096 * DH); i < gpu.out.size(); ++i) {
     tail_mag = std::max(tail_mag, std::fabs(static_cast<double>(gpu.out[i])));

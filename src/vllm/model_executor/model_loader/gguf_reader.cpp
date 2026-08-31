@@ -363,6 +363,18 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{1, 2, "BF16"};
       return &t;
     }
+    case 34: {
+      // block_tq1_0 (mainline GGML_TYPE_TQ1_0): u8 qs[48] + u8 qh[4] + f16 d
+      // = 48 + 4 + 2 = 54, QK = 256. Packed base-3 trits (vt DType kTQ1_0).
+      static constexpr GgmlTypeTraits t{256, 54, "TQ1_0"};
+      return &t;
+    }
+    case 35: {
+      // block_tq2_0 (mainline GGML_TYPE_TQ2_0): u8 qs[64] + f16 d
+      // = 64 + 2 = 66, QK = 256. 2-bit ternary codes (vt DType kTQ2_0).
+      static constexpr GgmlTypeTraits t{256, 66, "TQ2_0"};
+      return &t;
+    }
     case 39: {
       // block_mxfp4: u8 E8M0 scale + 16 bytes packed 4-bit e2m1
       // (fork ggml-common.h:205-210; same id/geometry as mainline).

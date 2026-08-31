@@ -349,8 +349,8 @@ TEST_CASE("TQ2_0/TQ1_0 ternary block dtypes (geometry + dequant, no CPU vec_dot)
     const char* name;
   };
   const TQCase cases[] = {
-      {vt::DType::kTQ2_0, 42, 256, 66, vt::DType::kQ8_K, "tq2_0"},
-      {vt::DType::kTQ1_0, 43, 256, 54, vt::DType::kQ8_K, "tq1_0"},
+      {vt::DType::kTQ2_0, 35, 256, 66, vt::DType::kQ8_K, "tq2_0"},
+      {vt::DType::kTQ1_0, 34, 256, 54, vt::DType::kQ8_K, "tq1_0"},
   };
   for (const TQCase& c : cases) {
     CAPTURE(c.name);

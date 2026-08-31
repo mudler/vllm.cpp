@@ -767,6 +767,148 @@ TEST_CASE("vt::Qwen4ExpGatedResidual CUDA: eps is INSIDE the rsqrt, probed where
 // vt::Qwen4ExpQsaCompress
 // ═════════════════════════════════════════════════════════════════════════════
 
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA: a Q8_0 mix weight ENTERS the block branch") {
+  if (SkipNoCuda("vt::Qwen4ExpGatedResidual CUDA block-dtype projection")) return;
+  // **THE BRANCH THIS WAVE ARGUES FOR WAS NEVER ENTERED ON A DEVICE.**
+  // `cuda_qwen4_exp.cu` routes the three projections through `vt::MatmulBT`
+  // rather than a hand-written GEMV, and its stated reason is the released
+  // checkpoint's 194 Q8_0 hyper-connection mix weights (W5p). Every golden case
+  // in this file uses f32 weights, so `MatmulBT`'s `IsBlockQuant(b.dtype)`
+  // dispatch to `kMatmulBTQuant` never fired on CUDA and the argument was
+  // untested. The CPU sibling gates both directions (W5p M2/M3); this is the
+  // device half.
+  //
+  // The weights are EXACT in Q8_0 -- codes in [-127,127] against f16-exact
+  // power-of-two scales, so `dequant(quant(w)) == w` bit for bit -- which is
+  // what makes the two arms comparable at all. The scales cycle over four
+  // values so a kernel reading block 0's scale for a whole row is separated.
+  constexpr int64_t hc = 4, H = 8, R = 5, T = 3;
+  constexpr int64_t flat = hc * H;
+  struct Lcg {
+    uint32_t s;
+    uint32_t Next() { s = s * 1664525u + 1013904223u; return s >> 8; }
+    int Code() { return static_cast<int>(Next() % 255u) - 127; }
+  };
+  auto exact_q8 = [](int64_t n, int64_t k, uint32_t seed,
+                     std::vector<float>* f32, std::vector<uint8_t>* blocks) {
+    REQUIRE(k % 32 == 0);
+    static const float kScales[4] = {1.0f / 256.0f, 1.0f / 512.0f, 1.0f / 1024.0f,
+                                     1.0f / 2048.0f};
+    const int64_t nb = n * (k / 32);
+    f32->resize(static_cast<size_t>(n * k));
+    blocks->assign(static_cast<size_t>(nb) * 34, 0);
+    Lcg rng{seed};
+    for (int64_t b = 0; b < nb; ++b) {
+      const float d = kScales[b % 4];
+      const uint16_t half = vt::F32ToF16(d);
+      REQUIRE(vt::F16ToF32(half) == d);  // the scale survives the f16 store EXACTLY
+      std::memcpy(blocks->data() + static_cast<size_t>(b) * 34, &half, 2);
+      for (int64_t i = 0; i < 32; ++i) {
+        const int code = rng.Code();
+        (*blocks)[static_cast<size_t>(b) * 34 + 2 + static_cast<size_t>(i)] =
+            static_cast<uint8_t>(static_cast<int8_t>(code));
+        (*f32)[static_cast<size_t>(b * 32 + i)] = d * static_cast<float>(code);
+      }
+    }
+  };
+  std::vector<float> down_f, up_f, inj_f;
+  std::vector<uint8_t> down_q, inj_q;
+  exact_q8(R, flat, 11u, &down_f, &down_q);
+  // `mix_up` is [flat, R] and R = 5 is not a multiple of 32, so it CANNOT be
+  // Q8_0 -- a Q8_0 row is a whole number of 32-element blocks. Only the two
+  // operands whose inner dim is block-aligned are quantized, which is exactly
+  // the split the loader produces on the released file.
+  up_f.assign(static_cast<size_t>(flat * R), 0.0f);
+  {
+    Lcg rng{5u};
+    for (auto& x : up_f) x = static_cast<float>(rng.Code()) / 512.0f;
+  }
+  exact_q8(hc, flat, 13u, &inj_f, &inj_q);
+
+  std::vector<float> hyper(static_cast<size_t>(T * flat));
+  std::vector<float> gamma(static_cast<size_t>(flat));
+  {
+    Lcg rng{7u};
+    for (auto& x : hyper) x = static_cast<float>(rng.Code()) / 64.0f;
+    for (auto& x : gamma) x = static_cast<float>(rng.Code()) / 256.0f;
+  }
+
+  Qwen4ExpGatedResidualArgs args;
+  args.hc_count = hc;
+  args.hidden_size = H;
+  args.lowrank = R;
+  args.eps = 1e-6f;
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(b);
+  DeviceTensor d_h(b, qg.q, DType::kF32, {T, flat}, hyper.data());
+  DeviceTensor d_w(b, qg.q, DType::kF32, {flat}, gamma.data());
+  DeviceTensor d_up(b, qg.q, DType::kF32, {flat, R}, up_f.data());
+  DeviceTensor d_m(b, qg.q, DType::kF32, {T, H});
+  DeviceTensor d_j(b, qg.q, DType::kF32, {T, hc});
+
+  // ── the f32 reference arm, on the SAME device ──────────────────────────────
+  DeviceTensor d_df(b, qg.q, DType::kF32, {R, flat}, down_f.data());
+  DeviceTensor d_if(b, qg.q, DType::kF32, {hc, flat}, inj_f.data());
+  vt::Qwen4ExpGatedResidual(qg.q, d_m.tensor(), &d_j.tensor(), d_h.tensor(), d_w.tensor(),
+                            d_df.tensor(), d_up.tensor(), &d_if.tensor(), args);
+  b.Synchronize(qg.q);
+  std::vector<float> mixed_f32(static_cast<size_t>(T * H), 0.0f);
+  std::vector<float> inj_out_f32(static_cast<size_t>(T * hc), 0.0f);
+  d_m.Download(qg.q, mixed_f32.data());
+  d_j.Download(qg.q, inj_out_f32.data());
+
+  // ── the Q8_0 arm. `DeviceTensor` cannot size a block dtype -- `vt::SizeOf`
+  // ── refuses one by name -- so the payload is allocated by BYTE COUNT and the
+  // ── tensor built over it with the shape in ELEMENTS, which is the contract
+  // ── `vt::MatmulBTQuant` states.
+  void* p_dq = b.Alloc(down_q.size());
+  void* p_iq = b.Alloc(inj_q.size());
+  b.Copy(qg.q, p_dq, down_q.data(), down_q.size());
+  b.Copy(qg.q, p_iq, inj_q.data(), inj_q.size());
+  Tensor t_dq = MakeTensor(p_dq, DType::kQ8_0, Gpu(), {R, flat});
+  Tensor t_iq = MakeTensor(p_iq, DType::kQ8_0, Gpu(), {hc, flat});
+
+  std::vector<float> mixed_q8(static_cast<size_t>(T * H), 0.0f);
+  std::string refusal;
+  try {
+    vt::Qwen4ExpGatedResidual(qg.q, d_m.tensor(), &d_j.tensor(), d_h.tensor(), d_w.tensor(),
+                              t_dq, d_up.tensor(), &t_iq, args);
+    b.Synchronize(qg.q);
+    d_m.Download(qg.q, mixed_q8.data());
+  } catch (const std::exception& e) {
+    refusal = e.what();
+  }
+  b.Free(p_dq);
+  b.Free(p_iq);
+
+  // BOTH OUTCOMES ARE GATED, and which one occurs is PRINTED, because the answer
+  // is a property of this device's keep-quant support rather than of this wave.
+  // `IsCudaKeepQuantSupported` returns false for Q8_0 today, so a refusal is the
+  // expected arm; if a later wave adds the kernel, the value comparison below
+  // becomes live and must hold.
+  if (!refusal.empty()) {
+    std::printf("[MEASURED] hc mixer Q8_0 on CUDA: REFUSED BY NAME -- %.140s\n",
+                refusal.c_str());
+    INFO("refusal: " << refusal);
+    // A refusal must NAME something. An empty or generic message would leave a
+    // caller with no idea which operand or which support is missing.
+    CHECK(refusal.size() > 20);
+    const bool names_the_gap = refusal.find("q8_0") != std::string::npos ||
+                               refusal.find("Q8_0") != std::string::npos ||
+                               refusal.find("quant") != std::string::npos ||
+                               refusal.find("matmul") != std::string::npos;
+    CHECK(names_the_gap);
+  } else {
+    const double d = MaxAbsDiff(mixed_q8, mixed_f32);
+    std::printf("[MEASURED] hc mixer Q8_0 vs f32 on CUDA max|diff| = %.9g bound %g\n", d,
+                kMixerTol);
+    // The Q8_0 encoding is LOSSLESS for these weights, so the two arms compute
+    // the same function; only the GEMM's association may differ.
+    CHECK(d < kMixerTol);
+  }
+}
+
 TEST_CASE("vt::Qwen4ExpQsaCompress CUDA matches the oracle AND the CPU arm BITWISE") {
   if (SkipNoCuda("vt::Qwen4ExpQsaCompress CUDA arm")) return;
   const int64_t D = g::kIndexHeadDim, CR = g::kCompressRatio;

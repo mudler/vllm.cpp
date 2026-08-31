@@ -320,6 +320,7 @@ struct Probe {
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   uint32_t queue_family = 0;
   uint32_t api_version = 0;
+  bool shader_float64 = false;
   char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
 };
 
@@ -339,6 +340,15 @@ VkInstance CreateInstance() {
   VkInstance instance = VK_NULL_HANDLE;
   if (vk.vkCreateInstance(&ci, nullptr, &instance) != VK_SUCCESS) return VK_NULL_HANDLE;
   return instance;
+}
+
+
+bool HasShaderFloat64(VkPhysicalDevice pd) {
+  const VulkanApi& vk = Api();
+  VkPhysicalDeviceFeatures2 f2{};
+  f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  vk.vkGetPhysicalDeviceFeatures2(pd, &f2);
+  return f2.features.shaderFloat64 == VK_TRUE;
 }
 
 bool HasStorageBuffer16BitAccess(VkPhysicalDevice pd) {
@@ -458,6 +468,7 @@ Probe ProbeDevice(VkInstance instance) {
     if (rank <= best_rank) continue;
     best_rank = rank;
     best.ok = true;
+    best.shader_float64 = HasShaderFloat64(devices[i]);
     best.physical_device = devices[i];
     best.queue_family = static_cast<uint32_t>(qf);
     best.api_version = props.apiVersion;
@@ -738,6 +749,7 @@ VulkanContext::VulkanContext() {
   api_major_ = static_cast<int>(VK_API_VERSION_MAJOR(probe.api_version));
   api_minor_ = static_cast<int>(VK_API_VERSION_MINOR(probe.api_version));
   device_name_ = probe.name;
+  shader_float64_ = probe.shader_float64;
 
   // Float controls — probed and recorded, not pinned; see § RELAXED PRECISION.
   VkPhysicalDeviceFloatControlsProperties fc{};
@@ -749,6 +761,7 @@ VulkanContext::VulkanContext() {
   denorm_preserve_f32_ = fc.shaderDenormPreserveFloat32 == VK_TRUE;
   sz_inf_nan_preserve_f32_ = fc.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
   max_workgroup_count_x_ = props2.properties.limits.maxComputeWorkGroupCount[0];
+  max_workgroup_count_y_ = props2.properties.limits.maxComputeWorkGroupCount[1];
   max_workgroup_invocations_ = props2.properties.limits.maxComputeWorkGroupInvocations;
   max_workgroup_size_x_ = props2.properties.limits.maxComputeWorkGroupSize[0];
   // GPU TIMESTAMP SUPPORT, probed rather than assumed. `timestampPeriod` is
@@ -1578,11 +1591,13 @@ void VulkanContext::RetireSlotLocked(uint32_t s) {
   if (kFenceTimeoutMs > 0) {
     VkResult wr = vk.vkWaitForFences(device, 1, &fence, VK_TRUE,
                                       static_cast<uint64_t>(kFenceTimeoutMs) * 1000000ull);
-    if (wr == VK_TIMEOUT) {
+    if (wr != VK_SUCCESS) {
+      const char* reason = wr == VK_TIMEOUT
+          ? "retired dispatch did not signal in time - GPU wedged"
+          : "vkWaitForFences returned a non-timeout error - device lost or other fatal error";
       std::fprintf(stderr,
-        "[vt vulkan] FATAL: retired dispatch did not signal in %lld ms - GPU wedged, aborting "
-        "(VT_VK_FENCE_TIMEOUT_MS).\n",
-        static_cast<long long>(kFenceTimeoutMs));
+        "[vt vulkan] FATAL: %s (wr=%d, VT_VK_FENCE_TIMEOUT_MS=%lld), aborting\n",
+        reason, static_cast<int>(wr), static_cast<long long>(kFenceTimeoutMs));
       std::fflush(stderr); std::abort();
     }
   } else {
@@ -1714,9 +1729,13 @@ void VulkanContext::FlushBatchLocked(const char* why) {
 
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
                              uint32_t buffer_count, const void* push_constants,
-                             uint32_t push_size, uint32_t group_count_x,
+                             uint32_t push_size, uint32_t group_count_x, uint32_t group_count_y,
                              const uint32_t* spec_values, uint32_t spec_count) {
-  if (group_count_x == 0) return;  // nothing to do; an empty dispatch is illegal
+  if (group_count_x == 0 || group_count_y == 0) return;
+  VT_CHECK(group_count_y <= max_workgroup_count_y_,
+           "vulkan: dispatch needs " + std::to_string(group_count_y) +
+               " Y workgroups, above the device limit of " +
+               std::to_string(max_workgroup_count_y_));  // nothing to do; an empty dispatch is illegal
   VT_CHECK(group_count_x <= max_workgroup_count_x_,
            "vulkan: dispatch needs " + std::to_string(group_count_x) +
                " workgroups, above the device limit of " +
@@ -1915,7 +1934,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                            Unpack<VkQueryPool>(query_pool_), query_base);
   }
-  vk.vkCmdDispatch(cmd, group_count_x, 1, 1);
+  vk.vkCmdDispatch(cmd, group_count_x, group_count_y, 1);
   if (timed) {
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                            Unpack<VkQueryPool>(query_pool_), query_base + 1);

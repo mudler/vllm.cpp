@@ -84,7 +84,7 @@ void main() {
   uint tid = gl_LocalInvocationID.x;
   uint col_id = gl_LocalInvocationID.y;
   uint col = gl_WorkGroupID.x * COLS_PER_WG + col_id;
-  if (col >= p.n) return;
+  bool col_active = col < p.n;
 
   const uint wbytes = 54u;
   uint nb = p.nb;

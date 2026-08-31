@@ -15,6 +15,7 @@
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
+
 layout(push_constant) uniform Params {
   uint m;       // output rows (tokens)
   uint n;       // output columns (per-expert hidden)
@@ -47,6 +48,7 @@ void main() {
   const uint abytes = 292u;
   const uint wbytes = 66u;
 
+  
   for (uint row = 0u; row < p.m; ++row) {
     int e = EID.v[p.eid_off + row];
     if (e < 0) continue;

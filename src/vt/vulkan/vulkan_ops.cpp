@@ -416,7 +416,7 @@ void ChunkedMatmulDispatch(int64_t m, int64_t n, int64_t k, DType a_dt,
 template <typename P>
 void Go(const char* name, const Binder& b, const P& p, uint32_t groups,
         const uint32_t* spec = nullptr, uint32_t spec_count = 0) {
-  VulkanContext::Get().Dispatch(name, b.data(), b.count(), &p, sizeof(P), groups, spec,
+  VulkanContext::Get().Dispatch(name, b.data(), b.count(), &p, sizeof(P), groups, 1, spec,
                                 spec_count);
 }
 
@@ -1548,8 +1548,7 @@ void RopeNeoxKernel(Queue& /*queue*/, Tensor& qs, Tensor& ks, const Tensor& posi
                    static_cast<double>(args.llama3_scaling_factor),
                    static_cast<double>(args.llama3_low_freq_factor),
                    static_cast<double>(args.llama3_high_freq_factor),
-                   static_cast<double>(args.llama3_orig_max_position)};
-  Go("vt_rope_neox", bind, p,
+                   static_cast<double>(args.llama3_orig_max_position)};  Go("vt_rope_neox", bind, p,
      FlatGroupCount(tokens * half * (hq + hk)), spec, 6);
 }
 
@@ -2186,6 +2185,7 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
     return false;
   }
   const int64_t nb = k / 256;
+  VT_CHECK(k % 256 == 0, "vulkan TQ: K must be a multiple of 256 (block size)");
   const char* dev_shader = is_tq2 ? "vt_matmul_bt_tq2_dev"
                                   : "vt_matmul_bt_tq1_0_dev";
   const char* host_shader = is_tq2 ? "vt_matmul_bt_tq2" : "vt_matmul_bt_tq1_0";
@@ -2218,7 +2218,7 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
     const uint32_t spec[2] = {DtypeCode(out.dtype), DtypeCode(a.dtype)};
     ctx.Dispatch(dev_shader, buffers.data(),
                  static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-                 static_cast<uint32_t>((n + 3) / 4), spec, 2);
+                 static_cast<uint32_t>((n + 3) / 4), 1, spec, 2);
     return true;
   }
 
@@ -2265,7 +2265,7 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
   const uint32_t spec[1] = {DtypeCode(out.dtype)};
   ctx.Dispatch(host_shader, buffers.data(),
                static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-               static_cast<uint32_t>(n), spec, 1);
+               static_cast<uint32_t>(n), 1, spec, 1);
   return true;
 }
 
@@ -2296,6 +2296,7 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
     return false;
   }
   const int64_t nb = K / 256;
+  VT_CHECK(K % 256 == 0, "vulkan TQ grouped: K must be a multiple of 256 (block size)");
   const int64_t E = weight.shape[0] / N;  // rank-2 weight is [E*N, K]
   const char* dev_shader = is_tq2 ? "vt_matmul_bt_tq2_grouped_dev"
                                   : "vt_matmul_bt_tq1_0_grouped_dev";
@@ -2370,9 +2371,10 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
                                 static_cast<uint32_t>(E),
                                 static_cast<uint32_t>(bcast ? 1 : 0),
                                 a_chunk, w_off, eid_chunk, out_chunk};
+      const uint32_t wg_y = 1;
       ctx.Dispatch(dev_shader, buffers.data(),
                    static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-                   wg, spec, 2);
+                   wg, wg_y, spec, 2);
     }
     return true;
   }
@@ -2426,7 +2428,7 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
   const uint32_t spec[1] = {DtypeCode(out.dtype)};
   ctx.Dispatch(host_shader, buffers.data(),
                static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-               static_cast<uint32_t>(N), spec, 1);
+               static_cast<uint32_t>(N), 1, spec, 1);
   return true;
 }
 
@@ -2471,6 +2473,7 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
   const char* shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2"
                               : "vt_moe_gate_up_swiglu_grouped_tq1_0";
   const int64_t nb = K / 256;
+  VT_CHECK(K % 256 == 0, "vulkan TQ MoE: K must be a multiple of 256 (block size)");
   const int64_t E = gate_w.shape[0] / N;
 
   auto& ctx = VulkanContext::Get();
@@ -2537,9 +2540,10 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
         static_cast<uint32_t>(nb), static_cast<uint32_t>(E),
         static_cast<uint32_t>(bcast ? 1 : 0), gather_k,
         a_chunk, gw_off, uw_off, eid_chunk, out_chunk, limit};
+    const uint32_t wg_y = 1;
     ctx.Dispatch(shader, buffers.data(),
                  static_cast<uint32_t>(buffers.size()), &cp, sizeof(cp),
-                 wg, spec, 2);
+                 wg, wg_y, spec, 2);
   }
   return true;
 }
@@ -2649,7 +2653,12 @@ struct Registrar {
     // VK4 (B60 maple row): the four ops the maple graph was still draining to
     // the host for. The rotary TABLE BUILD joins its apply half; see
     // RopeCosSinCacheKernel above for why the old "no f64 in GLSL" note retired.
-    if (!VkOpDisabled("kRopeCosSinCache"))     RegisterOp(
+    // The RoPE kernels use GLSL `double` for f64 angle accumulation (matching
+    // the CPU/CUDA references); gate registration on the device feature so a
+    // device without shaderFloat64 falls back to the CPU kernel instead of
+    // failing at pipeline creation.
+    if (VulkanContext::Get().shader_float64() && !VkOpDisabled("kRopeCosSinCache"))
+        RegisterOp(
         OpId::kRopeCosSinCache, DeviceType::kVULKAN,
         reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
     // BACKEND-VULKAN-KEEPQUANT: the GGUF compute-in-quant GEMMs, by CPU
@@ -2659,7 +2668,8 @@ struct Registrar {
     // 32 GB OOM). The grouped twin rides along for MoE models.
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernelVulkan)));
-    if (!VkOpDisabled("kRopeNeox"))     RegisterOp(OpId::kRopeNeox, DeviceType::kVULKAN,
+    if (VulkanContext::Get().shader_float64() && !VkOpDisabled("kRopeNeox"))
+        RegisterOp(OpId::kRopeNeox, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
     if (!VkOpDisabled("kMoeCombine"))     RegisterOp(
         OpId::kMoeCombine, DeviceType::kVULKAN,

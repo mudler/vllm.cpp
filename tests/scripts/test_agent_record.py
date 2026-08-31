@@ -285,6 +285,42 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].path.name, "engine-matrix.md")
 
+    def test_dead_capability_rows_are_inside_the_engine_ratchet(self) -> None:
+        """The four dead-capability rows and the 173 -> 177 bump are one change.
+
+        Each row records a symbol or knob with a user-facing promise and no
+        production caller, found while gating the MoE placement install: the
+        `VT_QWEN35_STAGE_MIN_FREE_FRAC` knob whose only hit in compiled code is a
+        comment, jump-forward's `DrainForcedTokens`, the unreachable
+        `ResolveAttentionWindow`, and the one-directional env-doc gate that let
+        the first one outlive its reader.
+
+        This is the ratchet's own evidence contract, and it is load-bearing in
+        both directions. Against the BASE checker, pinned at 173 while the matrix
+        carries 177, `check_matrices` reports an engine-row count error and this
+        test FAILS. Against HEAD it passes. That is what separates a bump made
+        for four real rows from a bump made to silence a failure -- the
+        distinction `test_engine_row_ratchet_is_load_bearing` exists to protect
+        and that this case supplies the instance of.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+        for item_id in (
+            "ENG-WEIGHT-RESIDENCY",
+            "ENG-STRUCTURED-OUTPUT",
+            "ENG-ATTENTION-WINDOW",
+            "ENG-GATE-ENV-DOC",
+        ):
+            with self.subTest(item_id=item_id):
+                found = [row for row in rows if row.item_id == item_id]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0].path.name, "engine-matrix.md")
+                # INVENTORIED, not SPIKE: a SPIKE row obliges a `CLAIM-*` owner,
+                # and inventing one would record work nobody is doing.
+                self.assertEqual(found[0].state, "INVENTORIED")
+
     def test_serve_recipe_args_row_is_inside_the_engine_ratchet(self) -> None:
         """The #606 row and its 152 -> 153 ratchet bump are one semantic change.
 

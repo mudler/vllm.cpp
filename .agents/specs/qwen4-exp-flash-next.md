@@ -6236,9 +6236,29 @@ All six mutations were re-run after this refactor.
 
   W5a's repair takes the device as an argument to `LoadQwen4ExpFromGguf` — no
   default, so a caller cannot disable the guard by saying nothing — and refuses
-  BY NAME ahead of any tensor I/O. **Owed: the CUDA block-decoding gather
-  kernel.** Until it exists this is a CPU-only arm, which is now a named refusal
-  instead of a discovery.
+  BY NAME ahead of any tensor I/O.
+
+  **KGATHER WROTE THAT KERNEL** ([`cuda-quant-gather.md`](cuda-quant-gather.md)).
+  `EmbeddingKernelCuda` decodes a block row on the device across all 18
+  encodings `vt::cpu::BlockToFloat` decodes, `DeviceQuantGatherSupported` admits
+  `kCUDA`, and the sentence above — "true for `kCPU` alone" — is true only of
+  METAL, VULKAN, ROCM and TENSTORRENT now. The guard itself is UNCHANGED and
+  still refuses those four by name. **What KGATHER does NOT do:** it removes the
+  LOAD-side blocker and produces no token on a GPU, because no `qwen4_exp` op
+  reaches a CUDA queue (W6-CUDA landed four arms; `vt::RmsNormGroup`, the QSA
+  block and the rest are still host-only, and `ModelRegistry::Forward` is
+  all-or-nothing). It claims no throughput number.
+
+  **Still owed after KGATHER, and named rather than implied:**
+  - The ON-DEVICE run of `tests/vt/test_cuda_embedding_quant.cpp`. The 18
+    decoders and the gather kernel are proven bit-exact against the CPU arm by a
+    host transliteration check (~14.2 M elements, 0 mismatches, max|diff| 0),
+    which is a transcription proof and NOT a device run. In particular the
+    `__fmul_rn`/`__fsub_rn` contraction argument is argued and unmeasured until
+    nvcc has compiled it.
+  - The gather arms of METAL, VULKAN, ROCM and TENSTORRENT.
+  - Any performance claim. The decoders read byte-wise for alignment safety and
+    one thread decodes a whole block; no benchmark ID moves.
 
   **Also owed, and only NARROWED by that guard: the load still runs to
   completion on `--device cpu` and then dies in `MakeQwen4ExpKVCache`.** Before

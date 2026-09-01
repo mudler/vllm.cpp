@@ -104,8 +104,18 @@ template <> __device__ inline float ResRound<__nv_bfloat16>(float v) {
 // rmsnorm: one block per row, shared-memory f32 tree reduction.
 // Upstream csrc counterpart: csrc/layernorm_kernels.cu (rms_norm_kernel / fused_add_rms_norm_kernel) — align signatures post-MVP.
 
-template <typename Tin, typename Tout, typename Tres>
-__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual,
+// `Tw` is the GAMMA's own dtype and is INDEPENDENT of `Tin` (#2477). It used to be
+// `Tin`, which welded the two and forced the dispatcher to refuse an f32 gamma
+// against a bf16 activation -- the pairing every GGUF checkpoint produces, because
+// GGUF stores norm gammas as F32 while the model dtype is bf16. vLLM never couples
+// them (`GemmaRMSNorm` does `self.weight.float()`, vllm/models/qwen4_exp/nvidia/
+// ple_layer.py:80 at vLLM origin/main 25efcfa788), this file's CPU sibling widens
+// `w` and `x` separately (cpu_ops.cpp:554-557, :576), and the CUDA grouped-norm
+// sibling already carries an independent weight tag (cuda_rms_norm_group.cu:194).
+// `Load()` is overloaded for both element types above, so the body is unchanged and
+// the f32 arithmetic below is bit-identical for every pairing that already worked.
+template <typename Tin, typename Tw, typename Tout, typename Tres>
+__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual,
                                  int64_t h, float eps, bool gemma) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
@@ -409,21 +419,21 @@ inline bool TryLaunchRmsNormDecodeFastF32(cudaStream_t s, Tensor& out, const Ten
 // bf16 model dtype (model_config.dtype=bfloat16): the residual stream is bf16, only
 // the variance/normalize accumulation below stays f32. A f32 residual (or none)
 // takes the byte-identical previous path.
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tw, typename Tout>
 void LaunchRmsNormRes(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                       const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h) {
   if (residual != nullptr && residual->dtype == DType::kBF16) {
-    RmsNormRowKernel<Tin, Tout, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__nv_bfloat16>(), h,
+    RmsNormRowKernel<Tin, Tw, Tout, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__nv_bfloat16>(), h,
         args.eps, args.gemma);
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-    RmsNormRowKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma);
+    RmsNormRowKernel<Tin, Tw, Tout, float><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma);
   }
 }
 
-template <typename Tin>
+template <typename Tin, typename Tw>
 void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
@@ -448,23 +458,43 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   }
   switch (out.dtype) {
     case DType::kF32:
-      LaunchRmsNormRes<Tin, float>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h);
       break;
     case DType::kBF16:
-      LaunchRmsNormRes<Tin, __nv_bfloat16>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, __nv_bfloat16>(s, out, x, w, args, residual, rows, h);
       break;
     default: VT_CHECK(false, "cuda rmsnorm: unsupported out dtype");
   }
   Check(cudaGetLastError(), "rmsnorm launch");
 }
 
+// The gamma's dtype is dispatched SEPARATELY from the activation's (#2477). This
+// read `VT_CHECK(w.dtype == x.dtype)`, which was an honest mirror of the kernel's
+// old `const Tin* w` -- accepting the mismatch without retyping the kernel would
+// have read a bf16 `[128]` gamma through a `const float*` and run off its end. The
+// refusal is therefore NARROWED, not deleted: an unsupported gamma dtype is still
+// refused, and now says which one it got.
+template <typename Tin>
+void DispatchRmsNormWeight(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                           const RmsNormArgs& args, Tensor* residual) {
+  switch (w.dtype) {
+    case DType::kF32: LaunchRmsNorm<Tin, float>(s, out, x, w, args, residual); break;
+    case DType::kBF16: LaunchRmsNorm<Tin, __nv_bfloat16>(s, out, x, w, args, residual); break;
+    default:
+      VT_CHECK(false, std::string("cuda rmsnorm: unsupported weight dtype "
+                                  "(f32/bf16 only), got ") +
+                          Name(w.dtype));
+  }
+}
+
 void RmsNormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
-  VT_CHECK(w.dtype == x.dtype, "cuda rmsnorm: weight dtype must match x");
   switch (x.dtype) {
-    case DType::kF32: LaunchRmsNorm<float>(AsStream(q), out, x, w, args, residual); break;
+    case DType::kF32:
+      DispatchRmsNormWeight<float>(AsStream(q), out, x, w, args, residual);
+      break;
     case DType::kBF16:
-      LaunchRmsNorm<__nv_bfloat16>(AsStream(q), out, x, w, args, residual);
+      DispatchRmsNormWeight<__nv_bfloat16>(AsStream(q), out, x, w, args, residual);
       break;
     default: VT_CHECK(false, "cuda rmsnorm: unsupported input dtype (f32/bf16 only)");
   }

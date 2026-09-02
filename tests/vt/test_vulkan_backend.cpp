@@ -60,10 +60,10 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 42);  // +2: BACKEND-VULKAN-EXL3 (#2530); +12: BACKEND-VULKAN-TQ1_0
+  CHECK(n == 43);  // +2: BACKEND-VULKAN-EXL3 (#2530); +12: BACKEND-VULKAN-TQ1_0
                    //   (vt_matmul_bt_tq2, vt_matmul_bt_tq2_grouped, vt_matmul_bt_tq2_dev,
                    //    vt_moe_gate_up_swiglu_grouped_tq2, vt_matmul_bt_tq2_grouped_dev,
-                   //    vt_matmul_bt_tq2_dev; VK4 rope/moe)
+                   //    vt_matmul_bt_tq2_dev; VK4 rope/moe); +1: vt_matmul_tiled
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -251,6 +251,11 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // specialization VALUES and not just at the module name.
       REQUIRE(m.spec_id_count == 5);
       for (uint32_t want = 0; want < 5; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_tiled") == 0) {
+      // a dtype, b dtype, out dtype, and the b-transpose flag: 4 spec constants
+      // serving the tiled GEMM path for M>=16.
+      REQUIRE(m.spec_id_count == 4);
+      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_sigmoid_gate_bf16") == 0) {
       // ONE axis, and the count is the assertion: the gate is f32 and the output
       // bf16 by the op contract (src/vt/ops.cpp:3327-3334), so only the attention

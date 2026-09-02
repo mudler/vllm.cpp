@@ -509,6 +509,20 @@ bool BorrowStTensorBytes(OwnedTensor& o, const StTensor& t, vt::DType dtype,
   if (elem == 0 || numel > SIZE_MAX / elem) return false;
   if (numel * elem != t.nbytes) return false;
 
+  // Refuse to borrow misaligned safetensors bytes. An odd file offset is an
+  // ordinary file, but the borrow lever is the only thing at stake — the caller
+  // falls back to MakeOwned + memcpy, which moves the same bytes correctly.
+  //
+  // Issue #2558: EXL3's HadRowBlock and TileWord32 fault on misaligned uint16_t
+  // loads under UBSan. The four original sites (FIX-UNALIGNED-LOADERS-772) already
+  // route through vt::LoadUnaligned, so this gate is for the borrow path only.
+  //
+  // SPECIAL CASE: kI8 data that will be accessed as uint16_t (EXL3 trellis) also
+  // requires 2-byte alignment, even though SizeOf(kI8) == 1. We enforce this here
+  // because the gate has no other way to know the downstream access pattern.
+  const size_t required_alignment = (dtype == vt::DType::kI8) ? 2 : elem;
+  if (reinterpret_cast<uintptr_t>(t.data) % required_alignment != 0) return false;
+
   o.dtype = dtype;
   o.rank = rank;
   for (int i = 0; i < rank; ++i) o.shape[i] = shape[static_cast<size_t>(i)];

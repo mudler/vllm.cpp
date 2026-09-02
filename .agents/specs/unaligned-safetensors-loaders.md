@@ -192,6 +192,25 @@ Stop with `NEEDS_DECISION` if any loaded value moves anywhere: this change is
 required to be inert on every already-aligned checkpoint, which is all of them
 today.
 
+## Owed
+
+**Issue #2558 is the fifth recurrence of this class.** The first four sites were
+direct `reinterpret_cast<const uint16_t*>` formations in loaders. #2558 reports
+that the EXL3 borrow path — `BorrowStTensorBytes` in `qwen3_5_weights.cpp` —
+has the same defect: it borrows safetensors bytes verbatim with no alignment
+check, so an F16/BF16 tensor whose file offset is odd gets an odd base pointer,
+and EXL3's HadRowBlock (`cpu_exl3_kernels.cpp:130`) and TileWord32
+(`cpu_exl3_dequant.cpp:64`) fault on the misaligned `uint16_t` load under UBSan.
+
+The fix differs from the first four recurrences because the defect is in the
+borrow lever, not in a loader. The borrow gate now refuses misaligned data
+(returning false), and the call sites already fall back to MakeOwned + memcpy.
+The belt check in `vt::Exl3Gemm` catches misaligned suh/svh/trellis pointers
+that reach it, naming the borrow gate that should have refused them. The kI8
+trellis requires special handling: it is stored as bytes but accessed as
+uint16_t, so the gate enforces 2-byte alignment for kI8 borrows even though
+`SizeOf(kI8) == 1`.
+
 ## Outcome
 
 **The two shapes of defect need two different fixes, and conflating them would

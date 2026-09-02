@@ -247,7 +247,7 @@ std::string U64Le(uint64_t v) {
   return s;
 }
 
-std::string BuildSafetensors(const std::vector<FixtureTensor>& tensors) {
+std::string BuildSafetensors(const std::vector<FixtureTensor>& tensors, size_t header_pad = 0) {
   nlohmann::json header = nlohmann::json::object();
   std::string payload;
   for (const FixtureTensor& t : tensors) {
@@ -259,9 +259,48 @@ std::string BuildSafetensors(const std::vector<FixtureTensor>& tensors) {
     entry["data_offsets"] = nlohmann::json::array({begin, payload.size()});
     header[t.name] = std::move(entry);
   }
-  const std::string head = header.dump();
+  std::string head = header.dump();
+  head.append(header_pad, ' ');  // Pad header to control payload parity
   return U64Le(head.size()) + head + payload;
 }
+
+void WriteSafetensorsFile(const std::filesystem::path& path,
+                          const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!out) throw std::runtime_error("failed to write fixture checkpoint");
+}
+
+// Write the checkpoint twice — unpadded, and padded by one space — and keep
+// whichever lands the payload on an ODD byte. This makes the test deterministic
+// rather than dependent on JSON length luck.
+std::string WriteOddOffsetSafetensors(const std::filesystem::path& dir,
+                                      const std::vector<FixtureTensor>& tensors) {
+  const std::filesystem::path path_a = dir / "model_a.safetensors";
+  const std::filesystem::path path_b = dir / "model_b.safetensors";
+
+  const std::string bytes_a = BuildSafetensors(tensors, 0);
+  const std::string bytes_b = BuildSafetensors(tensors, 1);
+
+  WriteSafetensorsFile(path_a, bytes_a);
+  WriteSafetensorsFile(path_b, bytes_b);
+
+  // Payload starts after 8-byte length header
+  uint64_t header_len_a;
+  std::memcpy(&header_len_a, bytes_a.data(), 8);
+  uint64_t header_len_b;
+  std::memcpy(&header_len_b, bytes_b.data(), 8);
+
+  const size_t payload_offset_a = 8 + header_len_a;
+  const size_t payload_offset_b = 8 + header_len_b;
+
+  // Verify the two spellings differ in parity
+  REQUIRE((payload_offset_a % 2) != (payload_offset_b % 2));
+
+  // Return the path with odd payload offset
+  return (payload_offset_a % 2 == 1) ? path_a.string() : path_b.string();
+}
+
 
 class TempCheckpoint {
  public:
@@ -275,11 +314,10 @@ class TempCheckpoint {
            ("vllm_qwen35_exl3_" + std::to_string(nonce) + "_" +
             std::to_string(counter.fetch_add(1)));
     std::filesystem::create_directories(dir_);
-    path_ = dir_ / "model.safetensors";
-    const std::string bytes = BuildSafetensors(tensors);
-    std::ofstream out(path_, std::ios::binary);
-    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    if (!out) throw std::runtime_error("failed to write fixture checkpoint");
+
+    // Use odd-offset safetensors to deterministically trigger the alignment issue
+    const std::string odd_path = WriteOddOffsetSafetensors(dir_, tensors);
+    path_ = odd_path;
   }
   ~TempCheckpoint() {
     std::error_code ignored;

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -5377,6 +5378,15 @@ void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const
            "exl3_gemm: the trellis travels as opaque i8 BYTES; got " +
                std::string(Name(trellis.dtype)));
   VT_CHECK(trellis.rank == 3, "exl3_gemm: trellis must be rank-3 [k/16, n/16, 32*bits]");
+  // Belt check: refuse misaligned trellis data pointer. TileWord32 loads the
+  // trellis as uint16_t and faults under UBSan on odd addresses. The trellis
+  // is borrowed as kI8, so the alignment gate does not catch it (1-byte alignment
+  // is always satisfied). Issue #2558.
+  if (trellis.data != nullptr) {
+    VT_CHECK(reinterpret_cast<uintptr_t>(trellis.data) % 2 == 0,
+            "exl3_gemm: trellis data pointer must be 2-byte aligned (borrow gate "
+            "only checks kI8 alignment; TileWord32 requires uint16_t; see issue #2558)");
+  }
   const int64_t m = a.shape[0];
   const int64_t k = a.shape[1];
   const int64_t n = c.shape[1];
@@ -5399,6 +5409,21 @@ void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const
            "exl3_gemm: suh/svh are fp16 sign+scale vectors (exl3.py:20-91)");
   VT_CHECK(suh.Numel() == k, "exl3_gemm: suh must have k entries");
   VT_CHECK(svh.Numel() == n, "exl3_gemm: svh must have n entries");
+  // Belt check: refuse misaligned suh/svh data pointers. HadRowBlock loads
+  // these as uint16_t and faults under UBSan on odd addresses. The borrow
+  // gate (BorrowStTensorBytes) refuses misaligned borrows, forcing a memcpy,
+  // so reaching this check means the gate was bypassed or the data was
+  // synthesized after the borrow. Issue #2558.
+  if (suh.data != nullptr) {
+    VT_CHECK(reinterpret_cast<uintptr_t>(suh.data) % 2 == 0,
+            "exl3_gemm: suh data pointer must be 2-byte aligned (borrow gate refused "
+            "misaligned safetensors; see issue #2558)");
+  }
+  if (svh.data != nullptr) {
+    VT_CHECK(reinterpret_cast<uintptr_t>(svh.data) % 2 == 0,
+            "exl3_gemm: svh data pointer must be 2-byte aligned (borrow gate refused "
+            "misaligned safetensors; see issue #2558)");
+  }
   VT_CHECK(a.IsContiguous() && c.IsContiguous() && a_had.IsContiguous() &&
                trellis.IsContiguous() && suh.IsContiguous() && svh.IsContiguous(),
            "exl3_gemm: contiguous required (the kernels read A as contiguous rows, "

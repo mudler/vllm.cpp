@@ -43,6 +43,10 @@
 
 #include "vt/dtype.h"  // VT_CHECK
 
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -200,6 +204,94 @@ std::string Qwen4ExpQsaIndexerName(size_t layer) {
 // scratch — and the refusal that makes it sound — at this boundary keeps the
 // limit where it is true instead of baking it into the loop.
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODEDIV (#2496) — THE PER-STEP STATE FINGERPRINT, DEFAULT OFF.
+//
+// #2496 is a whole-output symptom on the RELEASED artifact: `--device cuda`
+// emits `11751 271 271 271 271 271 0 0` where `--device cpu` on the same tree
+// and the same file emits `11751 13 15767 411 2029 11 1092 369`. Token 0 agrees,
+// so prefill is right; every decode token is wrong, and bit-stably so across
+// builds and across `CUDA_LAUNCH_BLOCKING`. What is left is state the second
+// step carries, computed differently on the two arms.
+//
+// The hermetic CPU-vs-CUDA comparison in `test_qwen4_exp_layer_loop.cpp` asks
+// the same question on a fixture, and the fixture may not be able to hold the
+// answer: its layer-3 activations sit near 2^18, where one bf16 ULP is ~1024 and
+// the K/V store saturates (W5j measured 0 of 192 paged K/V words moving across
+// two prompts). This is the arm that runs on the REAL weights, where that
+// objection does not apply.
+//
+// IT PRINTS A SUMMARY, NOT A HASH, AND THAT IS THE POINT. The two arms are two
+// processes and two orders of arithmetic, so a checksum disagrees on a CORRECT
+// pair and says nothing. A count of non-finite words, a maximum magnitude, a sum
+// of magnitudes and the first four values separate a state that is WRONG — zero,
+// saturated, NaN, or a different tensor entirely — from one that differs in its
+// last bits, which is the only distinction this defect needs.
+//
+// `VT_Q4EXP_STATE_FP=1` turns it on. Off it costs one `getenv` per step, read
+// once. On it costs one device-to-host copy per state per step, which is a
+// diagnostic price paid deliberately and never on a default run.
+bool Q4ExpStateFpEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_Q4EXP_STATE_FP");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
+void Q4ExpStateSummary(dense_attn::Dev d, long step, const std::string& what,
+                       const vt::Tensor& t) {
+  const int64_t n = t.Numel();
+  if (t.data == nullptr || n <= 0) {
+    std::cerr << "Q4EXP_FP step=" << step << " " << what << " ABSENT\n";
+    return;
+  }
+  const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(t.dtype);
+  std::vector<unsigned char> host(bytes);
+  // ONE entry point for both residencies. `Backend::Copy` infers its direction
+  // from the pointer values, and `Synchronize` is a no-op on the host backend,
+  // so the host arm pays nothing and the device arm cannot forget the drain.
+  d.b.Copy(d.q, host.data(), t.data, bytes);
+  d.b.Synchronize(d.q);
+  const auto at = [&](int64_t i) -> double {
+    switch (t.dtype) {
+      case vt::DType::kF32:
+        return static_cast<double>(reinterpret_cast<const float*>(host.data())[i]);
+      case vt::DType::kBF16:
+        return static_cast<double>(
+            vt::BF16ToF32(reinterpret_cast<const uint16_t*>(host.data())[i]));
+      case vt::DType::kF16:
+        return static_cast<double>(
+            vt::F16ToF32(reinterpret_cast<const uint16_t*>(host.data())[i]));
+      case vt::DType::kI64:
+        return static_cast<double>(reinterpret_cast<const int64_t*>(host.data())[i]);
+      case vt::DType::kI32:
+        return static_cast<double>(reinterpret_cast<const int32_t*>(host.data())[i]);
+      default:
+        // A block-quantized or otherwise unreadable state: report the byte at
+        // this index rather than pretend to read a value, so the line is still
+        // comparable between the two arms and is not silently empty.
+        return static_cast<double>(host[static_cast<size_t>(i)]);
+    }
+  };
+  int64_t nonfinite = 0, nonzero = 0;
+  double maxabs = 0.0, sumabs = 0.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double v = at(i);
+    if (!std::isfinite(v)) { ++nonfinite; continue; }
+    if (v != 0.0) ++nonzero;
+    const double a = std::fabs(v);
+    if (a > maxabs) maxabs = a;
+    sumabs += a;
+  }
+  std::cerr << "Q4EXP_FP step=" << step << " " << what << " dtype="
+            << vt::Name(t.dtype) << " n=" << n << " nonfinite=" << nonfinite
+            << " nonzero=" << nonzero << " maxabs=" << maxabs
+            << " sumabs=" << sumabs << " v=";
+  for (int64_t i = 0; i < 4 && i < n; ++i) std::cerr << at(i) << (i + 1 < 4 ? "," : "");
+  std::cerr << "\n";
+}
+
 ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
   // THE DOWNCAST COMES FIRST NOW, and the inversion this comment used to argue
@@ -271,6 +363,67 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   const auto T = static_cast<int64_t>(input.token_ids.size());
   VT_CHECK(T > 0,
            "Qwen4ExpForConditionalGeneration: the step carries no tokens");
+
+  // ─── THE IDENTIFIERS THIS STEP ACTUALLY RUNS ON (#2496) ───────────────────
+  //
+  // `ModelForwardInput::device_token_ids` says, in its own words, "the input ids
+  // for this step are ALREADY on the device; the host vector is stale for decode
+  // rows". The asynchronous runner's combine splices each decode row's sampled
+  // token into that DEVICE buffer on the main queue and deliberately never
+  // writes it back to `token_ids`, because materialising it on the host is the
+  // synchronise that path exists to remove
+  // (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm).
+  //
+  // THIS HOOK READ THE STALE VECTOR, AND THAT IS #2496. On `--device cuda` the
+  // mirror is the default, so every decode row embedded — and hashed into the
+  // PLE n-gram context — whatever `token_ids_cpu` happened to hold, which for a
+  // row the host never wrote is ZERO. Measured on `thor:gpu0` over the released
+  // `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact with `VT_Q4EXP_STATE_FP=1`:
+  // the n-gram history rolls `[9338, 369] -> [369, 11751] -> [11751, 13] -> …` on
+  // `--device cpu` and `[9338, 369] -> [369, 0] -> [0, 0] -> …` on `--device cuda`,
+  // so the prefill is right and every decode step feeds the model token id 0.
+  // The reported ids stay plausible because they are the argmax of each step's
+  // logits; what is wrong is the FEEDBACK, which is why a token gate on the
+  // prompt's first token could not see it. TWELVE other translation units already
+  // consume this field — `grep -rl 'input\.device_token_ids\|in\.device_token_ids'
+  // src/vllm/model_executor/models/` names them, `qwen3_moe_registry.cpp`,
+  // `deepseek_v2_registry.cpp`, `nemotron_h_device.cpp` and
+  // `kimi_linear_device.cpp` among them — under issue #1305, which is the same
+  // defect on Qwen3-MoE. This architecture was simply never wired to it. The
+  // count is COUNTED rather than remembered: an earlier draft of this comment
+  // said "nine", which is the shape a number quoted often acquires.
+  //
+  // IT IS MATERIALISED ON THE HOST RATHER THAN SPLICED OVER A DEVICE BUFFER, and
+  // that is forced rather than chosen. `detail::ApplyDeviceTokenIds` patches an
+  // embed's device identifier buffer, which is enough for a model whose only
+  // reader is the embed. This one has a second: `RunQwen4ExpPleBlock` hashes the
+  // raw ids in HOST int64 arithmetic (`qwen4_exp::BuildNGramIds`, the port of
+  // transformers 5.16.0 `_splitmix64`, :979-983), and the n-gram context it
+  // advances is what the next step reads. A device splice would fix the embed and
+  // leave the hash reading zeros.
+  //
+  // THE COPY IS ENQUEUED ON THIS STEP'S QUEUE, so it is ORDERED AFTER the
+  // runner's combine rather than racing it, and the drain is the read's other
+  // half — the same stage-then-synchronise shape `qwen4_exp_qsa_block.cpp`
+  // establishes for its three host reads. One drain per step is the cost, and it
+  // is the synchronise W4 removed; the way to get it back is a device-side n-gram
+  // hash, which is what upstream does (`torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids`,
+  // `vllm/models/qwen4_exp/nvidia/ple_layer.py` @ 191cecd51e, a FORWARD reference
+  // past this row's pin). The spec's `## Owed` carries it.
+  //
+  // NULL ON EVERY OTHER PATH, so `--device cpu` and any synchronous arm read the
+  // host vector exactly as before and are byte-identical.
+  std::vector<int32_t> resolved_token_ids;
+  const std::vector<int32_t>* step_token_ids = &input.token_ids;
+  if (input.device_token_ids != nullptr) {
+    resolved_token_ids.assign(input.token_ids.size(), 0);
+    vt::Backend& tok_backend = vt::GetBackend(input.queue.device.type);
+    tok_backend.Copy(input.queue, resolved_token_ids.data(),
+                     input.device_token_ids,
+                     resolved_token_ids.size() * sizeof(int32_t));
+    tok_backend.Synchronize(input.queue);
+    step_token_ids = &resolved_token_ids;
+  }
   VT_CHECK(input.attn_meta.seq_lens.size() == 1,
            "Qwen4ExpForConditionalGeneration: one sequence per call, so "
            "attn_meta.seq_lens must hold exactly one entry");
@@ -801,8 +954,37 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   }
 
   const Qwen4ExpTextModelOutput hidden = Qwen4ExpTextModelForward(
-      d, w, input.config, input.token_ids, input.positions, input.attn_meta,
+      d, w, input.config, *step_token_ids, input.positions, input.attn_meta,
       input.gdn_meta, caches, past_len);
+
+  // DECODEDIV (#2496): the per-step state fingerprint, default OFF. See
+  // `Q4ExpStateSummary` above for why it prints a summary and not a hash, and
+  // why it is the arm that runs on the REAL weights.
+  if (Q4ExpStateFpEnabled()) {
+    static long q4exp_fp_step = 0;
+    const long step = q4exp_fp_step++;
+    std::cerr << "Q4EXP_FP step=" << step << " BEGIN T=" << T
+              << " past_len=" << past_len << " device="
+              << static_cast<int>(input.queue.device.type) << "\n";
+    for (size_t i = 0; i < caches.gdn.size(); ++i) {
+      const GdnStateCache& g = caches.gdn[i];
+      Q4ExpStateSummary(d, step, "gdn[" + std::to_string(i) + "].conv", g.conv_state);
+      Q4ExpStateSummary(d, step, "gdn[" + std::to_string(i) + "].ssm", g.ssm_state);
+      for (size_t k = 2; k < g.states.size(); ++k)
+        Q4ExpStateSummary(d, step, "gdn[" + std::to_string(i) + "].state" +
+                                       std::to_string(k), g.states[k]);
+    }
+    for (size_t i = 0; i < caches.ple.size(); ++i) {
+      Q4ExpStateSummary(d, step, "ple[" + std::to_string(i) + "].ring",
+                        caches.ple[i].conv_state);
+      Q4ExpStateSummary(d, step, "ple[" + std::to_string(i) + "].ngram",
+                        caches.ple[i].tokens);
+    }
+    for (size_t i = 0; i < caches.qsa.size() && i < 2; ++i)
+      Q4ExpStateSummary(d, step, "qsa[" + std::to_string(i) + "].index_key",
+                        caches.qsa[i].index_key);
+    Q4ExpStateSummary(d, step, "hidden", hidden.tensor);
+  }
 
   // ─── the lm_head, which is `Qwen4ExpForCausalLM` and not the text model ────
   // `Qwen4ExpTextModel` has NO final RMSNorm (the mixer's `hc_norm` is the last

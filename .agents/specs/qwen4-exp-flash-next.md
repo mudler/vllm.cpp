@@ -4069,6 +4069,39 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **THE `device_token_ids` CONTRACT IS ADVISORY, AND FIVE MORE ARCHITECTURES
+  IGNORE IT ([#2544](https://github.com/mudler/vllm.cpp/issues/2544)).** DECODEDIV
+  fixed `qwen4_exp`'s half of this and did not fix the general one. The runner
+  assigns `forward_input.device_token_ids` unconditionally whenever the async
+  mirror is engaged — which is the default on CUDA — while the field's own comment
+  still claims "a model that ignores it is simply never given one". A forward that
+  ignores it embeds a host array the runner never wrote for a decode row, and
+  `token_ids_cpu` is zero-initialised, so the model generates from token id 0 for
+  ever. That is [#1305](https://github.com/mudler/vllm.cpp/issues/1305) and #2496,
+  twice, and `grep -rl 'device_token_ids\|DeviceTokenIds'` finds no translation
+  unit for `DeepseekV4ForCausalLM`, `Glm5NextForConditionalGeneration`,
+  `glm_moe_dsa`, `Laguna` or `KimiK3`. Each is a CANDIDATE and not a conviction —
+  the issue is filed on a grep and says so — and convicting one needs the same
+  measurement, which needs its checkpoint and its GPU time. The item this row
+  really owes is not five ports: it is making the contract ENFORCEABLE, so a
+  forward that ignores a live `device_token_ids` is refused by name instead of
+  silently decoding from the previous step's identifiers. `VT_ASYNC_RUNNER=0` is
+  the same-binary rollback meanwhile.
+
+- **THE N-GRAM HASH IS A HOST COMPUTATION, AND THAT IS WHAT COSTS A DRAIN PER
+  STEP (#2496).** `ForwardQwen4ExpForConditionalGeneration` now materialises the
+  device identifiers on the host, because `RunQwen4ExpPleBlock` hashes the raw ids
+  in host int64 arithmetic (`qwen4_exp::BuildNGramIds`, the port of transformers
+  5.16.0 `_splitmix64`, :979-983) and advances the n-gram context the next step
+  reads. `detail::ApplyDeviceTokenIds` would repair the embed alone and leave the
+  hash reading zeros, so the copy plus drain is forced rather than chosen. It is
+  the synchronise ENG-ASYNC-SCHED W4 removed, paid once per step on this
+  architecture. Upstream does not pay it: `vllm/models/qwen4_exp/nvidia/ple_layer.py`
+  computes the ids in a device custom op, `torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids`,
+  over a device `ngram_context` (read at `191cecd51e`, a FORWARD reference past
+  this row's pin at `5559679229`). Porting that op is what buys the drain back,
+  and it is a wave, not a line.
+
 - **WHAT THE 2026-08-31 vLLM LANDING OWES THIS ROW (Q4RECONCILE, #2489).** The
   oracle reconciliation is done and the divergences are classified in
   `### Component-by-component reconciliation`. What it did not do is act on any of
@@ -8304,6 +8337,129 @@ No speed number: every arm is n=1 on a shared box. UD-IQ1_S only, one sequence,
 attributes to the `step == nullptr` branch of `BuildCompletionLogProbs`; nothing
 here reads them.
 
+## DECODEDIV (#2496) — the CUDA decode divergence, and the instrument that names it
+
+**Scope.** One defect: on `thor:gpu0`, over the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact through `examples/server`,
+greedy, `max_tokens=8`, the CUDA arm emits `11751 271 271 271 271 271 0 0` where
+the CPU control on the same tree and the same file emits
+`11751 13 15767 411 2029 11 1092 369`. Token 0 agrees. This wave finds the cause
+and fixes it. It changes no behaviour the CPU arm has today.
+
+**What the measurement already excludes,** each by measurement rather than by
+argument, and each recorded on [#2496](https://github.com/mudler/vllm.cpp/issues/2496):
+
+* the GDN adapter lifetime defect ([#2476](https://github.com/mudler/vllm.cpp/issues/2476),
+  fixed by [#2509](https://github.com/mudler/vllm.cpp/issues/2509)) — a freed
+  operand returns what the allocator left there, not the launch-blocking arm's
+  exact sequence;
+* timing, ordering and the whole async-copy class — the production and
+  `CUDA_LAUNCH_BLOCKING=1` sequences are byte-identical, and both are identical
+  to the original pre-fix measurement on a different tree;
+* the GDN QKVZ GEMM extents — every operand extent agrees with its allocation at
+  `T=5` and at `T=1`;
+* the f32 QSA query buffer ([#2488](https://github.com/mudler/vllm.cpp/issues/2488))
+  — no device branch and no prefill/decode fork, so it is present on the CORRECT
+  CPU run too;
+* the PLE n-gram history read ([#2504](https://github.com/mudler/vllm.cpp/issues/2504))
+  — a real defect, fixed and gated, and it moved the output not at all.
+
+**The shape that survives.** A correct token 0 with a bit-stable wrong decode is
+state that the second step carries, computed differently on the two arms. The
+list of such state is short and this spec can enumerate it, which is what makes
+the wave finite: within one step every buffer the forward writes is also read
+back by that same step EXCEPT three. The paged K/V and the indexer side cache are
+written and then read inside the prefill, so a defect in either is visible in
+token 0. The three that are written at prefill and first read at decode are
+
+1. the GDN conv ring and the GDN temporal state (`MambaSpec` states 0 and 1),
+2. the PLE conv ring (`MambaSpec` state 2),
+3. the PLE n-gram history (`MambaSpec` state 3).
+
+**Method — the instrument comes before the hypothesis.** A whole-output symptom
+cannot name a tensor, so the first artifact of this wave is a comparison, not a
+fix: `test_qwen4_exp_layer_loop.cpp`'s `#2496` case drives one prefill and one
+decode through `ModelRegistry::Forward` on a CPU queue and on a CUDA queue over
+one fixture and one pinned pair of token ids, and reports, in order, the prefill
+logits, every persistent buffer above, and the decode logits. The FIRST row that
+disagrees is the finding. The second step's token is a constant rather than the
+first step's argmax, because sampling per arm would feed the two arms different
+ids the moment the prefill logits differ at all.
+
+**What the instrument cannot see, stated before it is run.** `qwen4_exp_gguf_fixture.h`
+is a miniature whose layer-3 activations sit near 2^18, where one bf16 ULP is
+~1024; W5j measured 0 of 192 paged K/V words moving across two different prompts
+on it. A CPU/CUDA difference small enough to be absorbed by that store is
+invisible here, so a green result is NOT a claim that the device arm decodes
+correctly at released width. It is the statement that the difference is not one
+this fixture can hold, and the wave then escalates to the released artifact.
+
+**Gates.** The focused gate is the new case plus `test_qwen4_exp_layer_loop`,
+`test_qwen4_exp_cuda` and `test_qwen4_exp_cuda_reductions` on `thor:gpu0`
+(`sm_110`, the only device in the fleet at this capability), inside an `rc`
+lease. The wave's acceptance gate is the released artifact through
+`examples/server`: **the GPU must emit `11751 13 15767 411 2029 11 1092 369`**.
+Nothing short of that token sequence is a fix, and a green hermetic case is not a
+substitute for it.
+
+### Outcome — the first tensor that diverged, and what it named
+
+**The instrument answered on the first run, and it named a tensor rather than a
+layer.** `VT_Q4EXP_STATE_FP=1` on `thor:gpu0`, the released UD-IQ1_S artifact,
+`--device cuda` against `--device cpu`, one prompt, greedy, `max_tokens=8`. Every
+persistent state agrees after the prefill. The FIRST divergence is at **step 1,
+the first decode, in the PLE n-gram history**, and it is exact:
+
+| step | `--device cpu` | `--device cuda` |
+|---|---|---|
+| 0 (prefill, T=5) | `[9338, 369]` | `[9338, 369]` |
+| 1 | `[369, 11751]` | `[369, 0]` |
+| 2 | `[11751, 13]` | `[0, 0]` |
+| 3-7 | rolls the sampled ids | `[0, 0]` |
+
+The history is int64 TOKEN IDS, so this cannot be a rounding difference and needs
+no tolerance to read. The FIFO rolled correctly on both arms — `369` moved from
+slot 1 to slot 0 — and what the device arm PUSHED was `0` where the host arm
+pushed the token that had just been sampled.
+
+**So the defect was never in a state at all.** The history is advanced from
+`input_ids`, so a zero pushed means the forward was HANDED token id 0. The cause
+is `ModelForwardInput::device_token_ids`: the asynchronous runner's combine
+splices each decode row's sampled token into a DEVICE buffer on the main queue
+and deliberately leaves the host `token_ids` stale, and this hook read the host
+vector. `token_ids_cpu` is zero-initialised, so every decode row embedded and
+hashed id 0. TWELVE other translation units already consume that field under
+[#1305](https://github.com/mudler/vllm.cpp/issues/1305), which is the same defect
+on Qwen3-MoE.
+
+**That explains every constraint the issue had accumulated**, which is the test a
+cause has to pass: token 0 is right because a prefill row is not a decode row;
+the decode is wrong from the first step because every decode row is; it is
+bit-stable across builds and trees because zero is a constant, not a race; and
+`CUDA_LAUNCH_BLOCKING=1` cannot move it because nothing here is a launch order.
+It also explains why the REPORTED ids stayed plausible — they are the argmax of
+each step's logits, and what was broken is the FEEDBACK, not the sampler.
+
+**AND IT CORRECTS THIS SPEC'S OWN FRAMING.** The scope above enumerates three
+write-at-prefill / read-at-decode states and calls that list what makes the wave
+finite. The list was right and the conclusion drawn from it was not: the
+divergence was in one of those three, and the CAUSE was upstream of all of them,
+in an input the forward is handed. An enumeration of state can locate a symptom;
+it cannot bound where the symptom comes from.
+
+**What the hermetic case could not have found.** It passes `device_token_ids ==
+nullptr` on both arms, because a test builds `ModelForwardInput` by hand. It was
+still the right first instrument — it costs no GPU and it would have convicted any
+of the three states — but the defect lives in a field only the runner sets, which
+is why the released-artifact fingerprint is the arm that answered.
+
+**Stop conditions.** Stop and report rather than widen scope if: the hermetic
+comparison is green AND the released-artifact run still diverges (the fixture
+cannot hold the difference — report that as the finding and escalate to a
+per-layer tap on the real artifact); the divergence is in a `vt::` op with an
+existing CPU-vs-CUDA gate that the defect passes (the gate's coverage is the
+defect, and widening it is its own change); or `thor:gpu0` is out of the pool,
+in which case the sm_110 axis is UNMEASURED and says so.
 ## Wave PREFILLDIV — the CUDA prefill diverges from the CPU prefill (#2547)
 
 ### What this wave is for
@@ -8480,6 +8636,7 @@ a row here, and every row says whether anything in production reaches it:
 | W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate RAN on TWO architectures. `thor:gpu0` (`sm_110`, nvcc 13.0.88): 12 cases, 323 assertions, 322 passing, with the CPU arms matched BITWISE at 0 of 8772, 0 of 20480 and 0 across all 30 dtype combinations; 5 of 6 mutations red and M5 a compiler proof. The single failure was this suite's OWN oracle bound, which was re-derived and bitwise-backstopped. `dgx:gpu0` (`sm_121a`, GB10, nvcc 13.0.88) then ran the corrected suite green: 12 cases, 351 assertions, 351 passing, every rc READ rather than derived, and `cuobjdump` reporting `cuda_qwen4_exp_ple.cu.1.sm_121a.cubin` so the objects are genuinely built for that architecture. The two runs' mutation counts agree. Full result in the W6-CUDA section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
 | W5-LOADIO | `VT_LOAD_STATS` reports on the GGUF branch, and `PrefaultBorrowedSpan` counts BYTES rather than only spans | **yes** — the timing and `ReportGgufLoadIo` sit on the `.gguf` branch of `LoadedEngine::FromModelDir`, the production loader entry point, so `VT_LOAD_STATS=1` on any GGUF model now prints `mmap+header`, `weights` and the prefault's bytes/seconds where it previously printed NOTHING. It deliberately does NOT call `ReportLoadBytes`, whose three counters are incremented on the safetensors path only and would print zeros for an artifact the load had just moved 67.56 GiB of. Gated by a new case in `test_gguf_keep_quant.cpp` asserting an EQUALITY over a double load, because `> 0` is satisfied by a counter wired to the span count, to a constant, or to the last span alone | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), its own issue OWED |
 | W5q | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on the COMPOSED W5p+LOAD-IO tree, staged to worker-local disk | **SERVES yes, USABLE TOKEN no** — the W5n refusal is gone: a 5-token prefill and eight decode steps run with `model_executed=1` each, nothing throws, and `POST /v1/completions` returns **HTTP 200** with 8 completion tokens where W5n got a 500. **Every one of those tokens is id 0**, which this checkpoint's own `tokenizer.ggml.tokens` gives as `!`, and the answer is BYTE-IDENTICAL for two prompts of different lengths. So the forward is degenerate and prompt-independent on the real weights. Load 61 s from local disk (against 4446 s from CIFS), `VmHWM` 73.935 GiB, gate 72 cases / 10,380 assertions / 0 failed / 0 skipped with the oracle golden unmoved at `0.00982457`. **The CAUSE is NOT identified**: `logprobs` was not requested, so nothing distinguishes NaN, zero and constant logits, and no per-op probe was run | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5q's own issue OWED |
+| DECODEDIV | the forward decodes on `ModelForwardInput::device_token_ids` instead of the host `token_ids` the asynchronous runner leaves stale for decode rows | **yes, and it FIXES the CUDA arm's output** — `ForwardQwen4ExpForConditionalGeneration` is the production hook, and on `thor:gpu0` over the released UD-IQ1_S artifact through `examples/server` with NO `CUDA_LAUNCH_BLOCKING` the `--device cuda` tokens go from `11751 271 271 271 271 271 0 0` to `11751 13 15767 411 1928 11 628 567`, against a CPU control of `11751 13 15767 411 2029 11 1092 369` re-taken on the same tree. The gate runs on a CPU QUEUE and still convicts, because the defect is which array the hook reads; the fix made inert reds it and a byte-for-byte restore greens it. **NOT token-exact** — the residual is measurable in the PREFILL hidden state at about 0.3% and is [#2547](https://github.com/mudler/vllm.cpp/issues/2547), not this | [#2496](https://github.com/mudler/vllm.cpp/issues/2496) |
 | W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W8CONFIRM PROVED IT IS THE FIX** (W5s asserted it; its `701606e51`-vs-`52f7ccbfc` comparison spans W5p too and cannot apportion) — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
 | W5s | the RELEASED UD-IQ1_S artifact re-driven on `origin/main` `52f7ccbfc` (W5p **and** W5r), four arms, one build, one staged copy | **SERVES yes, and the TOKENS ARE REAL** — `" Paris. Given this fact, what is"` and `" 100°C at sea level"` for two different prompts, eight distinct ids none of them 0, against W5q's eight consecutive id 0 on the same box and artifact. Reusing W7DIAG's read-only probe, the pre-W5r tree and this one agree numerically on `embed` and `after_widen` and diverge at exactly `stream.after_layer_0` (`nan=51200` -> `nan=0`); `LOGITS` was `zero=248320` with no maximum and is now `min -9.89818 max 15.7873`, argmax id 11751 = the `" Paris"` token. `VT_CPU_QUANT_REPACK=0` is byte-identical to the default, which is the correct outcome for a performance transform and the thing that was false before W5r. **NOT a token gate** (no oracle decoded these prompts; llama.cpp aborts in `build_delta_net_chunking`), no speed number, UD-IQ1_S only, one sequence. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5s's own issue OWED |
 | W8CONFIRM | the SAME artifact on the SAME `52f7ccbfc` tarball, TWO binaries differing only in `dense_attn_block.h:235-236`, four arms in one lease | **CAUSE ISOLATED** — `X-ON` (fix reverted, repack ON) returns `"!!!!!!!!!!!!!!!!"` with `LOGITS zero=248320` and `after_layer_0 nan=51200`, while `X-OFF` (same binary, repack OFF) and both `M` arms return `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` bit-identically. Same binary either side of one environment variable, so the defect needs the repack chain ACTIVE and the markers DROPPED; W5p is in all four arms and cannot explain a difference between them. Four prompts across factual, narrative and code, all correct, one ending on the model's own EOS. Binaries `e18a38a6…` vs `cfdf47bd…`, mutation applied-proof `2 -> 0` fix lines. **NOT a token gate**, n=1, UD-IQ1_S only, `--device cpu` only. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W8CONFIRM's own issue OWED |

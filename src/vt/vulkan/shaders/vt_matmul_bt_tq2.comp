@@ -1,10 +1,11 @@
 #version 450
-// vt_matmul_bt_tq2: OPTIMIZED v3 — shared-memory weight cache.
+// vt_matmul_bt_tq2: OPTIMIZED v4 — byte-at-a-time trit extraction.
 // Keep-quant matmul for TQ2_0 weights against Q8_K activations, M>=1.
 // BACKEND-VULKAN-KEEPQUANT.
 //
-// The weight block (66 bytes) is loaded into per-lane shared memory once per
-// block, eliminating the per-trit global read amplification.
+// v4: iterate over weight bytes first, then trits within each byte. Reads each
+// weight byte from shared memory once instead of 4 times (4x reduction). Inlined
+// trit extraction eliminates the per-element function call.
 
 #extension GL_GOOGLE_include_directive : require
 #include "vt_common.glsl"
@@ -32,14 +33,13 @@ layout(constant_id = 0) const uint VT_TQ_OUT_DT = 0u;
 shared float tq_part[128];
 shared uint w_cache_lane[128][18];
 
-int tq2_0_trit_lane(uint ae, uint tid, uint woff_align) {
-  uint j = (ae >= 128u) ? 32u : 0u;
-  uint rem = ae - j * 4u;
-  uint l = rem / 32u; uint k = rem % 32u;
-  uint byte_off = woff_align + j + k;
+uint w_byte(uint tid, uint byte_off) {
   uint w32 = w_cache_lane[tid][byte_off >> 2];
-  uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
-  return int((wb >> (l * 2u)) & 3u) - 1;
+  return (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+int s8(uint u) {
+  return (u & 0x80u) != 0u ? int(u) - 256 : int(u);
 }
 
 void main() {
@@ -71,17 +71,18 @@ void main() {
       float blockd = ad * wd;
 
       int acci = 0;
+      // TQ2_0: 64 bytes, 4 trits/byte (2 bits each) = 256 elements.
+      // Bytes 0..31 cover ae 0..127 (j=0), bytes 32..63 cover ae 128..255 (j=32).
+      // For each byte k, trit l is at bit position l*2.
       for (uint j = 0u; j < 64u; j += 32u) {
-        for (uint l = 0u; l < 4u; ++l) {
-          for (uint k = 0u; k < 32u; ++k) {
+        for (uint k = 0u; k < 32u; ++k) {
+          uint wb = w_byte(tid, woff_align + j + k);
+          for (uint l = 0u; l < 4u; ++l) {
             uint ae = j * 4u + l * 32u + k;
             uint ab = aoff + 4u + ae;
-            uint a32 = A32.v[(ab >> 2)];
-            uint a_byte = (ab & 3u);
-            uint sh = a_byte * 8u;
-            uint avu = (a32 >> sh) & 0xFFu;
-            int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
-            acci += av * tq2_0_trit_lane(ae, tid, woff_align);
+            uint a32 = A32.v[ab >> 2];
+            int av = s8((a32 >> ((ab & 3u) * 8u)) & 0xFFu);
+            acci += av * (int((wb >> (l * 2u)) & 3u) - 1);
           }
         }
       }

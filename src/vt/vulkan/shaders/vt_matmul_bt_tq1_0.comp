@@ -1,12 +1,16 @@
 #version 450
-// vt_matmul_bt_tq1_0: OPTIMIZED v3 — shared-memory weight cache.
+// vt_matmul_bt_tq1_0: OPTIMIZED v4 — byte-at-a-time trit extraction.
 // Keep-quant matmul for TQ1_0 weights against Q8_K activations, M>=1.
 // BACKEND-VULKAN-KEEPQUANT.
 //
 // The weight block (54 bytes) is loaded into shared memory once per block per
-// workgroup, eliminating the per-trit global read amplification. Each lane
-// processes whole blocks (128 lanes stride over nb blocks), so the cooperative
-// load uses the 128 lanes to fill the cache for the current block.
+// workgroup. Each lane processes whole blocks (128 lanes stride over nb blocks).
+//
+// v4 optimization: the inner loop iterates over weight BYTES first, then trits
+// within each byte. This reads each weight byte from shared memory once instead
+// of 5 times (5 trits per byte), a 5x reduction in shared memory reads. The
+// trit extraction is inlined to eliminate the function call and branch overhead
+// of the per-element tq1_0_trit_lane function.
 
 #extension GL_GOOGLE_include_directive : require
 #include "vt_common.glsl"
@@ -36,29 +40,15 @@ shared float tq_part[128];
 // Each lane processes a different block, so each caches its own block.
 shared uint w_cache_lane[128][16];
 
-int tq1_0_trit_lane(uint ae, uint tid, uint woff_align) {
-  if (ae < 160u) {
-    uint l = ae / 32u; uint m_idx = ae % 32u;
-    uint byte_off = woff_align + m_idx;
-    uint w32 = w_cache_lane[tid][byte_off >> 2];
-    uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
-    uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
-    return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
-  } else if (ae < 240u) {
-    uint l = (ae - 160u) / 16u; uint m_idx = (ae - 160u) % 16u;
-    uint byte_off = woff_align + 32u + m_idx;
-    uint w32 = w_cache_lane[tid][byte_off >> 2];
-    uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
-    uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
-    return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
-  } else {
-    uint l = (ae - 240u) / 4u; uint j = (ae - 240u) % 4u;
-    uint byte_off = woff_align + 48u + j;
-    uint w32 = w_cache_lane[tid][byte_off >> 2];
-    uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
-    uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
-    return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
-  }
+// Extract one byte from the cached weight block at the given byte offset.
+uint w_byte(uint tid, uint byte_off) {
+  uint w32 = w_cache_lane[tid][byte_off >> 2];
+  return (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+// Sign-extend a uint8 to int.
+int s8(uint u) {
+  return (u & 0x80u) != 0u ? int(u) - 256 : int(u);
 }
 
 void main() {
@@ -92,43 +82,41 @@ void main() {
       float blockd = ad * wd;
 
       int acci = 0;
-      // qs[0..31]: 5 trits x 32 elements = 160 elements (indices 0..159)
-      for (uint l = 0u; l < 5u; ++l) {
-        for (uint m = 0u; m < 32u; ++m) {
+      // Region 1: qs[0..31], 5 trits/byte x 32 bytes = 160 elements (ae 0..159).
+      // Iterate over bytes, caching each in a register for all 5 trits.
+      for (uint m = 0u; m < 32u; ++m) {
+        uint wb = w_byte(tid, woff_align + m);
+        for (uint l = 0u; l < 5u; ++l) {
           uint ae = l * 32u + m;
           uint ab = aoff + 4u + ae;
-          uint a32 = A32.v[(ab >> 2)];
-          uint a_byte = (ab & 3u);
-          uint sh = a_byte * 8u;
-          uint avu = (a32 >> sh) & 0xFFu;
-          int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
-          acci += av * tq1_0_trit_lane(ae, tid, woff_align);
+          uint a32 = A32.v[ab >> 2];
+          int av = s8((a32 >> ((ab & 3u) * 8u)) & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
+          acci += av * (int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1);
         }
       }
-      // qs[32..47]: 5 trits x 16 elements = 80 elements (indices 160..239)
-      for (uint l = 0u; l < 5u; ++l) {
-        for (uint m = 0u; m < 16u; ++m) {
+      // Region 2: qs[32..47], 5 trits/byte x 16 bytes = 80 elements (ae 160..239).
+      for (uint m = 0u; m < 16u; ++m) {
+        uint wb = w_byte(tid, woff_align + 32u + m);
+        for (uint l = 0u; l < 5u; ++l) {
           uint ae = 160u + l * 16u + m;
           uint ab = aoff + 4u + ae;
-          uint a32 = A32.v[(ab >> 2)];
-          uint a_byte = (ab & 3u);
-          uint sh = a_byte * 8u;
-          uint avu = (a32 >> sh) & 0xFFu;
-          int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
-          acci += av * tq1_0_trit_lane(ae, tid, woff_align);
+          uint a32 = A32.v[ab >> 2];
+          int av = s8((a32 >> ((ab & 3u) * 8u)) & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : (l == 3u) ? 27u : 81u;
+          acci += av * (int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1);
         }
       }
-      // qh[0..3]: 4 trits x 4 elements = 16 elements (indices 240..255)
-      for (uint l = 0u; l < 4u; ++l) {
-        for (uint j = 0u; j < 4u; ++j) {
+      // Region 3: qh[0..3], 4 trits/byte x 4 bytes = 16 elements (ae 240..255).
+      for (uint j = 0u; j < 4u; ++j) {
+        uint wb = w_byte(tid, woff_align + 48u + j);
+        for (uint l = 0u; l < 4u; ++l) {
           uint ae = 240u + l * 4u + j;
           uint ab = aoff + 4u + ae;
-          uint a32 = A32.v[(ab >> 2)];
-          uint a_byte = (ab & 3u);
-          uint sh = a_byte * 8u;
-          uint avu = (a32 >> sh) & 0xFFu;
-          int av = (avu & 0x80u) != 0u ? int(avu) - 256 : int(avu);
-          acci += av * tq1_0_trit_lane(ae, tid, woff_align);
+          uint a32 = A32.v[ab >> 2];
+          int av = s8((a32 >> ((ab & 3u) * 8u)) & 0xFFu);
+          uint p3 = (l == 0u) ? 1u : (l == 1u) ? 3u : (l == 2u) ? 9u : 27u;
+          acci += av * (int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1);
         }
       }
       acc += float(acci) * blockd;

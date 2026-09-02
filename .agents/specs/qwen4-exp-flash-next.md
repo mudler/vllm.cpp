@@ -8304,6 +8304,129 @@ No speed number: every arm is n=1 on a shared box. UD-IQ1_S only, one sequence,
 attributes to the `step == nullptr` branch of `BuildCompletionLogProbs`; nothing
 here reads them.
 
+## Wave PREFILLDIV — the CUDA prefill diverges from the CPU prefill (#2547)
+
+### What this wave is for
+
+[#2496](https://github.com/mudler/vllm.cpp/issues/2496) is fixed and the CUDA arm
+is fluent. It is not token-exact:
+
+| arm | token ids |
+|---|---|
+| `--device cpu` | `11751 13 15767 411 2029 11 1092 369` |
+| `--device cuda` | `11751 13 15767 411 1928 11 628 567` |
+
+Five of eight agree and the first disagreement is at token 4.
+[#2547](https://github.com/mudler/vllm.cpp/issues/2547) measured that the
+difference is NOT carried decode state: the PLE n-gram history rolls identically
+on both arms, and the model's own output at **step 0** already differs —
+`sumabs 28054.1` on CPU against `27964.7` on CUDA over `n=12800`, about 0.3%.
+The divergence is therefore in the PREFILL, before any decode state is read.
+
+**"Prefill is right" was never measured.** It rested on token 0 agreeing, and
+` Paris` after `The capital of France is` is not a near-tie, so a single argmax
+survived a divergence that was already there. This wave replaces the argmax with
+a per-tap fingerprint.
+
+### Scope
+
+IN: a per-layer, per-tap CPU-vs-CUDA fingerprint of the `qwen4_exp` forward; the
+one arithmetic divergence it names; the fix for that divergence; the
+red-then-green transcript through `ModelRegistry::Forward`.
+
+OUT: speed of any arm, `num_reqs > 1`, the positional arm's second step, and
+every `## Owed` entry this row already carries. A second divergence the
+instrument finds AFTER the first one is fixed belongs to a following wave and to
+its own issue.
+
+### Design — the instrument, and why the layer axis is the one that was missing
+
+`VT_Q4EXP_STATE_FP` (#2496) prints the layer loop's OUTPUT once per step. It has
+no LAYER axis, so it can say that the two arms disagree and not where. This wave
+adds `VT_Q4EXP_LAYER_FP=<steps>`, which prints one line per tap per layer for the
+first `<steps>` forward calls:
+
+```
+q4fp step=0 L07 tag=blk        dtype=bf16 dev=1 n=12800 nonfinite=0 maxabs=... sumabs=... v=...
+```
+
+The taps are placed so that a difference can be attributed to ONE op:
+`emb`, `wide`, then per layer `in`, `ple`, `ahc.mixed`, `ahc.inj`, `blk`, `s1`,
+`mhc.mixed`, `mhc.inj`, `moe`, `s2`, and finally `out`. `layer_types` puts a GDN
+layer at 0, the PLE layer at 2 and the first QSA layer at 3, so the first tap
+that leaves its own arm-vs-arm band names the op:
+
+| first divergent tag | implicates |
+|---|---|
+| `emb` / `wide` | the embedding gather or the widen |
+| `L00 ahc.mixed` | `vt::Qwen4ExpGatedResidual` — the mixer |
+| `L00 blk` | `RunGdnBlockPaged` |
+| `L02 ple` | `RunQwen4ExpPleBlock` |
+| `L03 blk` | `RunQwen4ExpQsaBlockPaged` |
+| any `moe` | `RunQwen4ExpMoeBlock` |
+
+**IT PRINTS THE DTYPE, and that is not decoration.** A token gate cannot see a
+dtype and a value gate cannot see a lifetime; both failures are on this row's
+record already (#2493, #2476). A tap that reported values alone would pass a
+buffer that is f32 on one arm and bf16 on the other while moving twice the bytes.
+
+**IT COUNTS ITS OWN TAPS.** The last line of a fingerprinted step is
+`q4fp step=<s> taps=<n>`, so a run that measured nothing is distinguishable from
+a run whose taps agreed. A grep that matches nothing is not evidence of absence,
+and this row has already paid for an instrument that never ran: the
+`q4exp-gdngemm` job looked for `$BLD/vllm-server` while ninja links
+`$BLD/examples/vllm-server`, and it measured nothing at rc 0.
+
+**IT SYNCHRONISES, and that is stated rather than hidden.** Each tap copies the
+tensor to the host and drains the queue, so this instrument CANNOT see a race.
+It is admissible here only because #2547 measured the divergence as bit-stable
+across builds, trees and `CUDA_LAUNCH_BLOCKING`, which is a deterministic
+arithmetic difference and not a race. A NEW symptom that appears only without the
+instrument is a race and belongs to a different method.
+
+### Risks
+
+- **The two arms disagree everywhere at some magnitude.** Every kernel on this
+  path is a separate CPU and CUDA implementation, so no tap is bit-identical and
+  "the first tap that differs" is not by itself the answer. The reading is the
+  first tap where the relative difference JUMPS by orders of magnitude over the
+  taps before it.
+- **A tolerance that passes its own suite can still be too loose.**
+  `test_qwen4_exp_cuda` is green at 351/351; that bounds each op against its own
+  band, not the composition against the CPU arm.
+- **The instrument perturbs the schedule.** See above: admissible only because
+  the symptom is bit-stable.
+
+### Gates
+
+```sh
+ctest --test-dir "$BLD" -R 'qwen4_exp' --output-on-failure
+```
+
+plus, on `thor:gpu0` (`sm_110`), the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact through
+`examples/vllm-server` on one binary, both arms, greedy, `max_tokens=8`, prompt
+`The capital of France is`, reporting both token id sequences verbatim.
+
+### Evidence required
+
+1. The fingerprint tables from both arms, and the first tap whose relative
+   difference jumps.
+2. The upstream `file:line` and revision for the arithmetic the fix restores.
+3. Red-then-green on a test that enters through `ModelRegistry::Forward` on a
+   `--device cuda` queue.
+4. A reachability mutation that deletes the production call site and reds.
+5. Both token id sequences, and an explicit statement of which ids agree.
+6. Every build and gate rc read literally, never derived from a pipe.
+
+### Stop conditions
+
+Stop and report if the instrument shows the first jump inside an op whose repair
+moves a shared seam's contract; that needs its own spec and its own issue. Stop
+if the released artifact cannot be staged, and report `PENDING` rather than
+substituting another checkpoint.
+
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**

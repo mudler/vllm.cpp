@@ -1,6 +1,13 @@
 #version 450
 // vt_moe_gate_up_swiglu_grouped_tq2: OPTIMIZED v2 — multi-column, packed uint32
 // reads, activation cache, subgroup reduce. TQ2_0 block: 66 bytes.
+//
+// VT_IDOT variant: uses dotPacked4x8EXT for the inner loop.
+// Requires VK_KHR_shader_integer_dot_product at runtime.
+
+#ifdef VT_IDOT
+#extension GL_EXT_integer_dot_product : require
+#endif
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
@@ -64,8 +71,32 @@ int tq2_0_trit_uw(uint ae, uint woff) {
   uint wb_byte = woff + j + k;
   uint w32 = UW32.v[wb_byte >> 2];
   uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
-  return int((wb >> (l * 2u)) & 3u) - 1;
+  return int((wb >> (l * 2u) & 3u)) - 1;
 }
+
+#ifdef VT_IDOT
+uint tq2_load4bytes_gw(uint byte_off) {
+  uint word_idx = byte_off >> 2;
+  uint byte_idx = byte_off & 3u;
+  if (byte_idx == 0u) return GW32.v[word_idx];
+  uint lo = GW32.v[word_idx];
+  uint hi = GW32.v[word_idx + 1u];
+  return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
+}
+
+uint tq2_load4bytes_uw(uint byte_off) {
+  uint word_idx = byte_off >> 2;
+  uint byte_idx = byte_off & 3u;
+  if (byte_idx == 0u) return UW32.v[word_idx];
+  uint lo = UW32.v[word_idx];
+  uint hi = UW32.v[word_idx + 1u];
+  return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
+}
+
+int pack_q8x4_m(int q0, int q1, int q2, int q3) {
+  return (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+}
+#endif
 
 float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
@@ -158,12 +189,35 @@ void main() {
         float gblockd = d_act_cache[block_id] * gwd;
         float ublockd = d_act_cache[block_id] * uwd;
         int gacci = 0; int uacci = 0;
+#ifdef VT_IDOT
+        for (uint i = 0u; i < elems; i += 4u) {
+          uint ae = lane_in_block * elems + i;
+          uint j = (ae >= 128u) ? 32u : 0u;
+          uint rem = ae - j * 4u;
+          uint l = rem / 32u; uint k = rem % 32u;
+          uint byte_off = gwoff + j + k;
+          uint ubyte_off = uwoff + j + k;
+          uint gpacked = tq2_load4bytes_gw(byte_off);
+          uint upacked = tq2_load4bytes_uw(ubyte_off);
+          uint gtrits = (gpacked >> (l * 2u)) & 0x03030303u;
+          uint utrits = (upacked >> (l * 2u)) & 0x03030303u;
+          int packed_q8 = pack_q8x4_m(q8_cache[block_id][ae],
+                                      q8_cache[block_id][ae + 1u],
+                                      q8_cache[block_id][ae + 2u],
+                                      q8_cache[block_id][ae + 3u]);
+          int q8_sum = q8_cache[block_id][ae] + q8_cache[block_id][ae + 1u]
+                     + q8_cache[block_id][ae + 2u] + q8_cache[block_id][ae + 3u];
+          gacci += dotPacked4x8EXT(int(gtrits), packed_q8) - q8_sum;
+          uacci += dotPacked4x8EXT(int(utrits), packed_q8) - q8_sum;
+        }
+#else
         for (uint i = 0u; i < elems; ++i) {
           uint ae = lane_in_block * elems + i;
           int q = q8_cache[block_id][ae];
           gacci += q * tq2_0_trit_gw(ae, gwoff);
           uacci += q * tq2_0_trit_uw(ae, uwoff);
         }
+#endif
         gate_acc = float(gacci) * gblockd;
         up_acc = float(uacci) * ublockd;
       }
@@ -200,6 +254,30 @@ void main() {
           float gblockd = d_act * gwd;
           float ublockd = d_act * uwd;
           int gacci = 0; int uacci = 0;
+#ifdef VT_IDOT
+          for (uint i = 0u; i < elems; i += 4u) {
+            uint ae = lane_in_block * elems + i;
+            uint j = (ae >= 128u) ? 32u : 0u;
+            uint rem = ae - j * 4u;
+            uint l = rem / 32u; uint k = rem % 32u;
+            uint byte_off = gwoff + j + k;
+            uint ubyte_off = uwoff + j + k;
+            uint gpacked = tq2_load4bytes_gw(byte_off);
+            uint upacked = tq2_load4bytes_uw(ubyte_off);
+            uint gtrits = (gpacked >> (l * 2u)) & 0x03030303u;
+            uint utrits = (upacked >> (l * 2u)) & 0x03030303u;
+            int q0 = vt_nearest_int(iscale * load_act(a_base + ae));
+            int q1 = vt_nearest_int(iscale * load_act(a_base + ae + 1u));
+            int q2 = vt_nearest_int(iscale * load_act(a_base + ae + 2u));
+            int q3 = vt_nearest_int(iscale * load_act(a_base + ae + 3u));
+            q0 = q0 < 127 ? q0 : 127; q1 = q1 < 127 ? q1 : 127;
+            q2 = q2 < 127 ? q2 : 127; q3 = q3 < 127 ? q3 : 127;
+            int packed_q8 = pack_q8x4_m(q0, q1, q2, q3);
+            int q8_sum = q0 + q1 + q2 + q3;
+            gacci += dotPacked4x8EXT(int(gtrits), packed_q8) - q8_sum;
+            uacci += dotPacked4x8EXT(int(utrits), packed_q8) - q8_sum;
+          }
+#else
           for (uint i = 0u; i < elems; ++i) {
             uint ae = lane_in_block * elems + i;
             float v = load_act(a_base + ae);
@@ -208,6 +286,7 @@ void main() {
             gacci += q * tq2_0_trit_gw(ae, gwoff);
             uacci += q * tq2_0_trit_uw(ae, uwoff);
           }
+#endif
           gate_acc = float(gacci) * gblockd;
           up_acc = float(uacci) * ublockd;
         }

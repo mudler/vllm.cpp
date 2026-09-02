@@ -3,6 +3,17 @@
 // Multi-column workgroups, packed uint32 weight reads, activation cache,
 // subgroup reduce. Non-grouped keep-quant matmul for TQ1_0 weights with
 // ON-DEVICE Q8_K quantize. ALL barriers are hit by ALL threads (Vulkan spec).
+//
+// VT_IDOT variant: when compiled with -DVT_IDOT, the Phase 5 dot product uses
+// dotPacked4x8EXT (hardware-accelerated 4-way int8 dot product) and SWAR
+// tq1_unpack4 trit extraction instead of scalar MACs. 4 trits are extracted
+// from 4 consecutive weight bytes in one SWAR operation, and 4 Q8 activations
+// are packed into an int32 for a single dotPacked4x8EXT call. Requires
+// VK_KHR_shader_integer_dot_product at runtime.
+
+#ifdef VT_IDOT
+#extension GL_EXT_integer_dot_product : require
+#endif
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
@@ -63,6 +74,38 @@ int tq1_0_trit_cached(uint ae, uint col_id, uint block_id, uint woff_align) {
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   }
 }
+
+#ifdef VT_IDOT
+const uint POW3_TQ1[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// Load 4 consecutive bytes from the weight cache as a uint32. The aligned case
+// (byte_idx==0) is handled separately because hi << 32 is UNDEFINED in GLSL,
+// and Intel GPUs mask the shift to 5 bits (32&31=0), producing hi instead of 0.
+uint tq1_load4bytes(uint col_id, uint block_id, uint byte_off) {
+  uint word_idx = byte_off >> 2;
+  uint byte_idx = byte_off & 3u;
+  if (byte_idx == 0u) return w_cache[col_id][block_id][word_idx];
+  uint lo = w_cache[col_id][block_id][word_idx];
+  uint hi = w_cache[col_id][block_id][word_idx + 1u];
+  return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
+}
+
+// SWAR extraction of 4 trits from 4 consecutive weight bytes at the same trit
+// level. Returns 4 bytes packed in a uint32, each in {0,1,2}, ready for
+// dotPacked4x8EXT. Ported from llama.cpp's tq1_unpack4 (mul_mat_vecq_funcs.glsl).
+uint tq1_unpack4(uint qs4, uint p3) {
+  uint even = qs4 & 0x00FF00FFu;
+  uint odd  = (qs4 >> 8) & 0x00FF00FFu;
+  uint even_xi = ((((even * p3) & 0x00FF00FFu) * 3u) >> 8) & 0x00FF00FFu;
+  uint odd_xi  = ((((odd  * p3) & 0x00FF00FFu) * 3u) >> 8) & 0x00FF00FFu;
+  return even_xi | (odd_xi << 8);
+}
+
+// Pack 4 Q8 activation values into one int32 for dotPacked4x8EXT.
+int pack_q8x4(int q0, int q1, int q2, int q3) {
+  return (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+}
+#endif
 
 float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
@@ -160,10 +203,49 @@ void main() {
       float wd = vt_from16(uint(W16.v[(woff + 52u) >> 1]), VT_DT_F16);
       float blockd = d_act_cache[block_id] * wd;
       int acci = 0;
+#ifdef VT_IDOT
+      // IDOT path: process 4 elements at a time with dotPacked4x8EXT and SWAR
+      // tq1_unpack4 trit extraction. trit_packed in {0,1,2}, w = trit_packed - 1,
+      // so sum(w * q8) = dotPacked4x8EXT(packed_trits, packed_q8) - sum(q8).
+      // 4 consecutive elements at a multiple of 4 are always at the same trit
+      // level (level boundaries fall on multiples of 32/16/4 for the three
+      // TQ1_0 regions, all divisible by 4).
+      for (uint i = 0u; i < elems; i += 4u) {
+        uint ae = lane_in_block * elems + i;
+        uint byte_off;
+        uint p3;
+        if (ae < 160u) {
+          uint l = ae / 32u;
+          uint m = ae % 32u;
+          byte_off = woff_align + m;
+          p3 = POW3_TQ1[l];
+        } else if (ae < 240u) {
+          uint l = (ae - 160u) / 16u;
+          uint m = (ae - 160u) % 16u;
+          byte_off = woff_align + 32u + m;
+          p3 = POW3_TQ1[l];
+        } else {
+          uint l = (ae - 240u) / 4u;
+          uint j = (ae - 240u) % 4u;
+          byte_off = woff_align + 48u + j;
+          p3 = POW3_TQ1[l];
+        }
+        uint packed_bytes = tq1_load4bytes(col_id, block_id, byte_off);
+        uint packed_trits = tq1_unpack4(packed_bytes, p3);
+        int packed_q8 = pack_q8x4(q8_cache[block_id][ae],
+                                  q8_cache[block_id][ae + 1u],
+                                  q8_cache[block_id][ae + 2u],
+                                  q8_cache[block_id][ae + 3u]);
+        int q_sum = dotPacked4x8EXT(int(packed_trits), packed_q8);
+        int q8_sum = dotPacked4x8EXT(packed_q8, 0x01010101);
+        acci += q_sum - q8_sum;
+      }
+#else
       for (uint i = 0u; i < elems; ++i) {
         uint ae = lane_in_block * elems + i;
         acci += q8_cache[block_id][ae] * tq1_0_trit_cached(ae, col_id, block_id, woff_align);
       }
+#endif
       acc = float(acci) * blockd;
     }
 

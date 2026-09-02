@@ -1,6 +1,13 @@
 #version 450
 // vt_matmul_bt_tq1_0_grouped_dev: OPTIMIZED v2 — multi-column workgroups,
 // packed uint32 weight reads, activation cache, subgroup reduce.
+//
+// VT_IDOT variant: uses dotPacked4x8EXT + SWAR tq1_unpack4 for the inner loop.
+// Requires VK_KHR_shader_integer_dot_product at runtime.
+
+#ifdef VT_IDOT
+#extension GL_EXT_integer_dot_product : require
+#endif
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
@@ -61,6 +68,35 @@ int tq1_0_trit(uint ae, uint woff) {
     return int(((wb * p3) & 0xFFu) * 3u >> 8u) - 1;
   }
 }
+
+#ifdef VT_IDOT
+const uint POW3_TQ1_G[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+// Load 4 consecutive bytes from global weight memory as a uint32.
+// The aligned case (byte_idx==0) is handled separately because hi << 32 is
+// UNDEFINED in GLSL, and Intel GPUs mask the shift to 5 bits (32&31=0).
+uint tq1_load4bytes_g(uint byte_off) {
+  uint word_idx = byte_off >> 2;
+  uint byte_idx = byte_off & 3u;
+  if (byte_idx == 0u) return W32.v[word_idx];
+  uint lo = W32.v[word_idx];
+  uint hi = W32.v[word_idx + 1u];
+  return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
+}
+
+// SWAR trit extraction for 4 consecutive TQ1_0 bytes with the same level.
+uint tq1_unpack4_g(uint qs4, uint p3) {
+  uint even = qs4 & 0x00FF00FFu;
+  uint odd  = (qs4 >> 8) & 0x00FF00FFu;
+  uint even_xi = ((((even * p3) & 0x00FF00FFu) * 3u) >> 8) & 0x00FF00FFu;
+  uint odd_xi  = ((((odd  * p3) & 0x00FF00FFu) * 3u) >> 8) & 0x00FF00FFu;
+  return even_xi | (odd_xi << 8);
+}
+
+int pack_q8x4_g(int q0, int q1, int q2, int q3) {
+  return (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+}
+#endif
 
 float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
@@ -147,10 +183,37 @@ void main() {
         float wd = vt_from16(uint(W16.v[(woff + 52u) >> 1]), VT_DT_F16);
         float blockd = d_act_cache[block_id] * wd;
         int acci = 0;
+#ifdef VT_IDOT
+        for (uint i = 0u; i < elems; i += 4u) {
+          uint ae = lane_in_block * elems + i;
+          uint byte_off; uint p3;
+          if (ae < 160u) {
+            uint l = ae / 32u; uint m = ae % 32u;
+            byte_off = woff + m; p3 = POW3_TQ1_G[l];
+          } else if (ae < 240u) {
+            uint l = (ae - 160u) / 16u; uint m = (ae - 160u) % 16u;
+            byte_off = woff + 32u + m; p3 = POW3_TQ1_G[l];
+          } else {
+            uint l = (ae - 240u) / 4u; uint j = (ae - 240u) % 4u;
+            byte_off = woff + 48u + j; p3 = POW3_TQ1_G[l];
+          }
+          uint packed_bytes = tq1_load4bytes_g(byte_off);
+          uint packed_trits = tq1_unpack4_g(packed_bytes, p3);
+          int packed_q8 = pack_q8x4_g(q8_cache[block_id][ae],
+                                      q8_cache[block_id][ae + 1u],
+                                      q8_cache[block_id][ae + 2u],
+                                      q8_cache[block_id][ae + 3u]);
+          int q_sum = dotPacked4x8EXT(int(packed_trits), packed_q8);
+          int q8_sum = q8_cache[block_id][ae] + q8_cache[block_id][ae + 1u]
+                     + q8_cache[block_id][ae + 2u] + q8_cache[block_id][ae + 3u];
+          acci += q_sum - q8_sum;
+        }
+#else
         for (uint i = 0u; i < elems; ++i) {
           uint ae = lane_in_block * elems + i;
           acci += q8_cache[block_id][ae] * tq1_0_trit(ae, woff);
         }
+#endif
         acc = float(acci) * blockd;
       }
     } else {
@@ -182,6 +245,34 @@ void main() {
           float wd = vt_from16(uint(W16.v[(woff + 52u) >> 1]), VT_DT_F16);
           float blockd = d_act * wd;
           int acci = 0;
+#ifdef VT_IDOT
+          for (uint i = 0u; i < elems; i += 4u) {
+            uint ae = lane_in_block * elems + i;
+            uint byte_off; uint p3;
+            if (ae < 160u) {
+              uint l = ae / 32u; uint m = ae % 32u;
+              byte_off = woff + m; p3 = POW3_TQ1_G[l];
+            } else if (ae < 240u) {
+              uint l = (ae - 160u) / 16u; uint m = (ae - 160u) % 16u;
+              byte_off = woff + 32u + m; p3 = POW3_TQ1_G[l];
+            } else {
+              uint l = (ae - 240u) / 4u; uint j = (ae - 240u) % 4u;
+              byte_off = woff + 48u + j; p3 = POW3_TQ1_G[l];
+            }
+            uint packed_bytes = tq1_load4bytes_g(byte_off);
+            uint packed_trits = tq1_unpack4_g(packed_bytes, p3);
+            int q0 = int(roundEven(iscale * load_act(a_base + ae)));
+            int q1 = int(roundEven(iscale * load_act(a_base + ae + 1u)));
+            int q2 = int(roundEven(iscale * load_act(a_base + ae + 2u)));
+            int q3 = int(roundEven(iscale * load_act(a_base + ae + 3u)));
+            q0 = q0 < 127 ? q0 : 127; q1 = q1 < 127 ? q1 : 127;
+            q2 = q2 < 127 ? q2 : 127; q3 = q3 < 127 ? q3 : 127;
+            int packed_q8 = pack_q8x4_g(q0, q1, q2, q3);
+            int q_sum = dotPacked4x8EXT(int(packed_trits), packed_q8);
+            int q8_sum = q0 + q1 + q2 + q3;
+            acci += q_sum - q8_sum;
+          }
+#else
           for (uint i = 0u; i < elems; ++i) {
             uint ae = lane_in_block * elems + i;
             float v = load_act(a_base + ae);
@@ -189,6 +280,7 @@ void main() {
             q = q < 127 ? q : 127;
             acci += q * tq1_0_trit(ae, woff);
           }
+#endif
           acc = float(acci) * blockd;
         }
       }

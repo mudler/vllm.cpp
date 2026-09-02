@@ -2186,8 +2186,14 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
   }
   const int64_t nb = k / 256;
   VT_CHECK(k % 256 == 0, "vulkan TQ: K must be a multiple of 256 (block size)");
-  const char* dev_shader = is_tq2 ? "vt_matmul_bt_tq2_dev"
-                                  : "vt_matmul_bt_tq1_0_dev";
+  // IDOT variant: when the device supports VK_KHR_shader_integer_dot_product,
+  // dispatch the _idot shader which uses dotPacked4x8EXT for the inner loop.
+  // Falls back to the scalar _dev shader on devices without the extension.
+  auto& ctx_idot = VulkanContext::Get();
+  const bool use_idot = ctx_idot.integer_dot_product_4x8();
+  const char* dev_shader = is_tq2
+      ? (use_idot ? "vt_matmul_bt_tq2_dev_idot" : "vt_matmul_bt_tq2_dev")
+      : (use_idot ? "vt_matmul_bt_tq1_0_dev_idot" : "vt_matmul_bt_tq1_0_dev");
   const char* host_shader = is_tq2 ? "vt_matmul_bt_tq2" : "vt_matmul_bt_tq1_0";
   const DType wdt = b.dtype;
 
@@ -2298,8 +2304,11 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
   const int64_t nb = K / 256;
   VT_CHECK(K % 256 == 0, "vulkan TQ grouped: K must be a multiple of 256 (block size)");
   const int64_t E = weight.shape[0] / N;  // rank-2 weight is [E*N, K]
-  const char* dev_shader = is_tq2 ? "vt_matmul_bt_tq2_grouped_dev"
-                                  : "vt_matmul_bt_tq1_0_grouped_dev";
+  auto& ctx_g = VulkanContext::Get();
+  const bool use_idot_g = ctx_g.integer_dot_product_4x8();
+  const char* dev_shader = is_tq2
+      ? (use_idot_g ? "vt_matmul_bt_tq2_grouped_dev_idot" : "vt_matmul_bt_tq2_grouped_dev")
+      : (use_idot_g ? "vt_matmul_bt_tq1_0_grouped_dev_idot" : "vt_matmul_bt_tq1_0_grouped_dev");
   const char* host_shader = is_tq2 ? "vt_matmul_bt_tq2_grouped"
                                    : "vt_matmul_bt_tq1_0_grouped";
   const DType wdt = weight.dtype;
@@ -2472,6 +2481,12 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
   }
   const char* shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2"
                               : "vt_moe_gate_up_swiglu_grouped_tq1_0";
+  auto& ctx_moe = VulkanContext::Get();
+  const bool use_idot_moe = ctx_moe.integer_dot_product_4x8();
+  if (use_idot_moe) {
+    shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2_idot"
+                    : "vt_moe_gate_up_swiglu_grouped_tq1_0_idot";
+  }
   const int64_t nb = K / 256;
   VT_CHECK(K % 256 == 0, "vulkan TQ MoE: K must be a multiple of 256 (block size)");
   const int64_t E = gate_w.shape[0] / N;

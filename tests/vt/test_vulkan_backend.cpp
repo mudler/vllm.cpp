@@ -60,10 +60,13 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 43);  // +2: BACKEND-VULKAN-EXL3 (#2530); +12: BACKEND-VULKAN-TQ1_0
+  CHECK(n == 49);  // +2: BACKEND-VULKAN-EXL3 (#2530); +12: BACKEND-VULKAN-TQ1_0
                    //   (vt_matmul_bt_tq2, vt_matmul_bt_tq2_grouped, vt_matmul_bt_tq2_dev,
                    //    vt_moe_gate_up_swiglu_grouped_tq2, vt_matmul_bt_tq2_grouped_dev,
-                   //    vt_matmul_bt_tq2_dev; VK4 rope/moe); +1: vt_matmul_tiled
+                   //    vt_matmul_bt_tq2_dev; VK4 rope/moe); +1: vt_matmul_tiled;
+                   //   +6: IDOT variants (vt_matmul_bt_tq1_0_dev_idot, vt_matmul_bt_tq2_dev_idot,
+                   //    vt_matmul_bt_tq1_0_grouped_dev_idot, vt_matmul_bt_tq2_grouped_dev_idot,
+                   //    vt_moe_gate_up_swiglu_grouped_tq1_0_idot, vt_moe_gate_up_swiglu_grouped_tq2_idot)
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -308,12 +311,24 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // Output is always f32 (the op contract pins it).
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_moe_gate_up_swiglu_grouped_tq2_idot") == 0) {
+      // Same two axes as the scalar variant.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq2_grouped_dev") == 0) {
       // Same single output-dtype axis as vt_matmul_bt_tq2_grouped (f32/f16/bf16).
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_bt_tq2_grouped_dev_idot") == 0) {
+      // Same two axes as the scalar _grouped_dev variant.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq2_dev") == 0) {
       // Two axes: output dtype (f32/f16/bf16) and activation dtype (f32/bf16).
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_bt_tq2_dev_idot") == 0) {
+      // Same two axes as the scalar _dev variant.
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq1_0") == 0) {
@@ -325,10 +340,22 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq1_0_dev") == 0) {
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_bt_tq1_0_dev_idot") == 0) {
+      // Same two axes as the scalar _dev variant.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_bt_tq1_0_grouped_dev") == 0) {
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_bt_tq1_0_grouped_dev_idot") == 0) {
+      // Same two axes as the scalar _grouped_dev variant.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_moe_gate_up_swiglu_grouped_tq1_0") == 0) {
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_moe_gate_up_swiglu_grouped_tq1_0_idot") == 0) {
+      // Same two axes as the scalar variant.
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_attn_qk_norm_rope_gate") == 0) {
@@ -3874,7 +3901,9 @@ TEST_CASE("tq2 keep-quant (M>=1 decode+prefill) runs NATIVELY on Vulkan and matc
   // Prove the NATIVE kernel (not the CPU reference tier) served the Vulkan side.
   // Phase 2: f32/bf16 activations now take the on-device Q8_K quantize path
   // (vt_matmul_bt_tq2_dev) instead of the host-quantize path (vt_matmul_bt_tq2).
-  CHECK(ctx.PipelineExistsFor("vt_matmul_bt_tq2_dev"));
+  const bool has_tq2_dev_pipeline = ctx.PipelineExistsFor("vt_matmul_bt_tq2_dev") ||
+        ctx.PipelineExistsFor("vt_matmul_bt_tq2_dev_idot");
+  CHECK(has_tq2_dev_pipeline);
 }
 TEST_CASE("tq2 keep-quant GROUPED (per-token expert) matmul runs NATIVELY on Vulkan and matches the CPU oracle") {
   using vt::Backend; using vt::Device; using vt::DeviceType;
@@ -3978,7 +4007,9 @@ TEST_CASE("tq2 keep-quant GROUPED (per-token expert) matmul runs NATIVELY on Vul
   // Phase 2: f32/bf16 activations now take the on-device Q8_K quantize path
   // (vt_matmul_bt_tq2_grouped_dev) instead of the host-quantize path
   // (vt_matmul_bt_tq2_grouped). Both are bit-exact vs the CPU oracle.
-  CHECK(ctx.PipelineExistsFor("vt_matmul_bt_tq2_grouped_dev"));
+  const bool has_tq2_grouped_dev_pipeline = ctx.PipelineExistsFor("vt_matmul_bt_tq2_grouped_dev") ||
+        ctx.PipelineExistsFor("vt_matmul_bt_tq2_grouped_dev_idot");
+  CHECK(has_tq2_grouped_dev_pipeline);
 }
 
 TEST_CASE("fused MoE gate+up+SwiGLU (TQ2_0) runs NATIVELY on Vulkan and matches the CPU golden") {
@@ -4105,7 +4136,9 @@ TEST_CASE("fused MoE gate+up+SwiGLU (TQ2_0) runs NATIVELY on Vulkan and matches 
 
   CHECK(nmse < 1e-6);
   // Prove the NATIVE fused shader served the Vulkan side, not the CPU fallthrough.
-  CHECK(ctx.PipelineExistsFor("vt_moe_gate_up_swiglu_grouped_tq2"));
+  const bool has_moe_pipeline = ctx.PipelineExistsFor("vt_moe_gate_up_swiglu_grouped_tq2") ||
+        ctx.PipelineExistsFor("vt_moe_gate_up_swiglu_grouped_tq2_idot");
+  CHECK(has_moe_pipeline);
 }
 
 

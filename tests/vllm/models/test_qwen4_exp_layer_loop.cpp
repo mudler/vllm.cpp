@@ -2764,8 +2764,16 @@ DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
 
   std::vector<uint16_t> kv_host(
       static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
+  // RANK 4, NOT 5 (#2435, #2560), for the reason spelled out at the first such
+  // fixture in this file: `vt::Tensor` holds `vt::kMaxRank == 4` dimensions, and
+  // `dense_attn::MakeTensor` refuses a wider shape rather than writing past
+  // `Tensor::shape` and `Tensor::stride`. Folding the leading K/V axis into the
+  // block axis is the same bytes, the same element count and the same `data`
+  // pointer -- which is all this fixture takes, because `PagedKvCache` below
+  // carries `num_blocks`, `block_size`, `num_kv_heads` and `head_size` as its
+  // own scalars.
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, kBlocks0, kPage, kKvHeads, kHeadDim},
+                              {2 * kBlocks0, kPage, kKvHeads, kHeadDim},
                               kv_host.data());
   constexpr uint16_t kPoison = 0x3F80;
   std::vector<uint16_t> idx_host(static_cast<size_t>(kIdxRows * kIdxHeadDim),
@@ -3303,7 +3311,11 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward splits the QSA query at the MODEL d
   }
 
   std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
-  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+  // RANK 4, NOT 5 (#2435, #2560): the same fold as every other paged-KV fixture
+  // in this file. The single block makes the leading K/V axis and the block axis
+  // adjacent, so `{2, T, ...}` is byte-identical to the rank-5 spelling, and the
+  // `PagedKvCache` beside it re-declares all four extents anyway.
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim}, kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;
   attn_kv[0].dtype = DType::kBF16;

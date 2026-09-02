@@ -81,6 +81,20 @@ TARGET_ENV = "vulkan1.1"
 
 CANDIDATE_COMPILERS = ("glslang", "glslangValidator", "glslc")
 
+# Shaders that get a second compilation with extra -D defines, producing an
+# additional SPIR-V module with a suffix. Used for VT_IDOT: the _dev TQ
+# shaders compile once as the scalar fallback and once with -DVT_IDOT for the
+# dotPacked4x8EXT path. The device-side dispatch picks the _idot variant when
+# VK_KHR_shader_integer_dot_product is enabled (vulkan_context.cpp).
+EXTRA_VARIANTS = {
+    "vt_matmul_bt_tq1_0_dev": [("-DVT_IDOT", "_idot")],
+    "vt_matmul_bt_tq2_dev": [("-DVT_IDOT", "_idot")],
+    "vt_matmul_bt_tq1_0_grouped_dev": [("-DVT_IDOT", "_idot")],
+    "vt_matmul_bt_tq2_grouped_dev": [("-DVT_IDOT", "_idot")],
+    "vt_moe_gate_up_swiglu_grouped_tq1_0": [("-DVT_IDOT", "_idot")],
+    "vt_moe_gate_up_swiglu_grouped_tq2": [("-DVT_IDOT", "_idot")],
+}
+
 
 def find_compiler(explicit: str | None) -> pathlib.Path:
     if explicit:
@@ -105,12 +119,13 @@ def compiler_version(cc: pathlib.Path) -> str:
     return text[0].strip() if text else str(cc)
 
 
-def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
+def compile_one(cc: pathlib.Path, src: pathlib.Path, extra_defs: list[str] | None = None) -> bytes:
     with tempfile.TemporaryDirectory() as td:
         spv = pathlib.Path(td) / (src.stem + ".spv")
+        defs = extra_defs or []
         if cc.name == "glslc":
             cmd = [str(cc), f"--target-env={TARGET_ENV}", "-O", "-fshader-stage=compute",
-                   "-I", str(SHADER_DIR), "-o", str(spv), str(src)]
+                   "-I", str(SHADER_DIR), "-o", str(spv), str(src)] + defs
         else:
             # -g0 strips debug names (OpName/OpSource), which is most of the
             # committed size. `-Os` is deliberately NOT passed: measured on these
@@ -120,7 +135,7 @@ def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
             # the driver's own optimizer does that work at pipeline creation
             # anyway.
             cmd = [str(cc), "-V", "--target-env", TARGET_ENV, "-g0",
-                   f"-I{SHADER_DIR}", "-o", str(spv), str(src)]
+                   f"-I{SHADER_DIR}", "-o", str(spv), str(src)] + defs
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0 or not spv.exists():
             if src.name == "vt_matmul_coopmat.comp":
@@ -402,6 +417,11 @@ def main() -> None:
         b = compile_one(cc, src)
         if b is not None:
             blobs[src.stem] = b
+        # Compile extra variants (e.g. -DVT_IDOT) for shaders that declare them.
+        for define, suffix in EXTRA_VARIANTS.get(src.stem, []):
+            b = compile_one(cc, src, extra_defs=[define])
+            if b is not None:
+                blobs[src.stem + suffix] = b
     outputs = ((OUT_HEADER, render_header(blobs, version)),
                (OUT_SOURCE, render_source(blobs, version)))
 

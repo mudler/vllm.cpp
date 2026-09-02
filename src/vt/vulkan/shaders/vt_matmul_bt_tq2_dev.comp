@@ -2,6 +2,16 @@
 // vt_matmul_bt_tq2_dev: OPTIMIZED v3 — shared-memory weight cache.
 // Multi-column workgroups, packed uint32 weight reads, activation cache,
 // subgroup reduce. ALL barriers are hit by ALL threads (Vulkan spec compliance).
+//
+// VT_IDOT variant: when compiled with -DVT_IDOT, the Phase 5 dot product uses
+// dotPacked4x8EXT (hardware-accelerated 4-way int8 dot product) instead of
+// scalar MACs. 4 trits are extracted from 4 consecutive weight bytes in one
+// SWAR shift+mask, and 4 Q8 activations are packed into an int32 for a single
+// dotPacked4x8EXT call. Requires VK_KHR_shader_integer_dot_product at runtime.
+
+#ifdef VT_IDOT
+#extension GL_EXT_integer_dot_product : require
+#endif
 
 #extension GL_GOOGLE_include_directive : require
 #define VT_SUBGROUP_REDUCE
@@ -48,6 +58,28 @@ int tq2_0_trit_cached(uint ae, uint col_id, uint block_id, uint woff_align) {
   return int((wb >> (l * 2u)) & 3u) - 1;
 }
 
+#ifdef VT_IDOT
+// Load 4 consecutive bytes from the weight cache as a uint32. The cache stores
+// uint32 words, so an unaligned 4-byte read spans two words. The aligned case
+// (byte_idx==0) is handled separately because hi << 32 is UNDEFINED in GLSL,
+// and Intel GPUs mask the shift to 5 bits (32&31=0), producing hi instead of 0.
+uint tq2_load4bytes(uint col_id, uint block_id, uint byte_off) {
+  uint word_idx = byte_off >> 2;
+  uint byte_idx = byte_off & 3u;
+  if (byte_idx == 0u) return w_cache[col_id][block_id][word_idx];
+  uint lo = w_cache[col_id][block_id][word_idx];
+  uint hi = w_cache[col_id][block_id][word_idx + 1u];
+  return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
+}
+
+// Pack 4 Q8 activation values (stored as int in shared memory) into one int32
+// for dotPacked4x8EXT. Each value is in [-127, 127], so the low byte preserves
+// the signed int8 encoding.
+int pack_q8x4(int q0, int q1, int q2, int q3) {
+  return (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+}
+#endif
+
 float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
   uint sub_per_col = 128u / gl_SubgroupSize;
@@ -79,6 +111,7 @@ void main() {
   uint a_shift = (VT_TQ_ACT_DT == VT_DT_F32) ? 2u : 1u;
 
   for (uint row = 0u; row < p.m; ++row) {
+    // Phase 1: amax (col_id==0 does work, ALL threads barrier)
     if (col_id == 0u && block_id < nb) {
       uint a_base = (p.a_off >> a_shift) + row * p.nb * 256u + block_id * 256u;
       float amax = 0.0; float maxv = 0.0;
@@ -91,6 +124,7 @@ void main() {
     }
     barrier();
 
+    // Phase 2: reduction (col_id==0 does work, ALL threads barrier)
     for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
       if (col_id == 0u && block_id < nb && lane_in_block < s) {
         float a = sm_reduce[block_id * lpb + lane_in_block];
@@ -101,6 +135,7 @@ void main() {
       barrier();
     }
 
+    // Phase 3: quantize + cache (col_id==0 does work, ALL threads barrier)
     if (col_id == 0u && block_id < nb) {
       float maxv_final = sm_reduce[block_id * lpb];
       float block_amax = abs(maxv_final);
@@ -121,7 +156,7 @@ void main() {
     }
     barrier();
 
-    // Cooperative weight block load
+    // Phase 4: cooperative weight block load into shared memory
     uint w_row = p.w_off + col * p.nb * wbytes;
     if (block_id < nb) {
       uint woff = w_row + block_id * wbytes;
@@ -140,10 +175,37 @@ void main() {
       float wd = vt_from16(uint(W16.v[(woff + 64u) >> 1]), VT_DT_F16);
       float blockd = d_act_cache[block_id] * wd;
       int acci = 0;
+#ifdef VT_IDOT
+      // IDOT path: process 4 elements at a time with dotPacked4x8EXT.
+      // trit_packed in {0,1,2}, w = trit_packed - 1, so
+      // sum(w * q8) = dotPacked4x8EXT(packed_trits, packed_q8) - sum(q8).
+      // 4 consecutive elements starting at a multiple of 4 are always at the
+      // same trit level (level boundaries fall on multiples of 32, and the
+      // j-region boundary at ae=128 is also 4-aligned).
+      for (uint i = 0u; i < elems; i += 4u) {
+        uint ae = lane_in_block * elems + i;
+        uint j = (ae >= 128u) ? 32u : 0u;
+        uint rem = ae - j * 4u;
+        uint l = rem / 32u;
+        uint k = rem % 32u;
+        uint byte_off = woff_align + j + k;
+        uint packed_bytes = tq2_load4bytes(col_id, block_id, byte_off);
+        uint packed_trits = (packed_bytes >> (l * 2u)) & 0x03030303u;
+        int packed_q8 = pack_q8x4(q8_cache[block_id][ae],
+                                  q8_cache[block_id][ae + 1u],
+                                  q8_cache[block_id][ae + 2u],
+                                  q8_cache[block_id][ae + 3u]);
+        int q_sum = dotPacked4x8EXT(int(packed_trits), packed_q8);
+        int q8_sum = q8_cache[block_id][ae] + q8_cache[block_id][ae + 1u]
+                   + q8_cache[block_id][ae + 2u] + q8_cache[block_id][ae + 3u];
+        acci += q_sum - q8_sum;
+      }
+#else
       for (uint i = 0u; i < elems; ++i) {
         uint ae = lane_in_block * elems + i;
         acci += q8_cache[block_id][ae] * tq2_0_trit_cached(ae, col_id, block_id, woff_align);
       }
+#endif
       acc = float(acci) * blockd;
     }
 

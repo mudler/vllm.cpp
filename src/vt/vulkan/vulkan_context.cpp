@@ -321,6 +321,7 @@ struct Probe {
   uint32_t queue_family = 0;
   uint32_t api_version = 0;
   bool shader_float64 = false;
+  bool integer_dot_product_4x8 = false;
   char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
 };
 
@@ -349,6 +350,21 @@ bool HasShaderFloat64(VkPhysicalDevice pd) {
   f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   vk.vkGetPhysicalDeviceFeatures2(pd, &f2);
   return f2.features.shaderFloat64 == VK_TRUE;
+}
+
+// Probe shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product). The 4x8
+// packed signed variant is what the TQ keep-quant shaders use for
+// dotPacked4x8EXT. Use the extension-specific struct rather than the 1.2
+// core struct so this compiles on older Vulkan headers.
+bool HasIntegerDotProduct4x8(VkPhysicalDevice pd) {
+  const VulkanApi& vk = Api();
+  VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idot{};
+  idot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+  VkPhysicalDeviceFeatures2 f2{};
+  f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  f2.pNext = &idot;
+  vk.vkGetPhysicalDeviceFeatures2(pd, &f2);
+  return idot.shaderIntegerDotProduct == VK_TRUE;
 }
 
 bool HasStorageBuffer16BitAccess(VkPhysicalDevice pd) {
@@ -469,6 +485,7 @@ Probe ProbeDevice(VkInstance instance) {
     best_rank = rank;
     best.ok = true;
     best.shader_float64 = HasShaderFloat64(devices[i]);
+    best.integer_dot_product_4x8 = HasIntegerDotProduct4x8(devices[i]);
     best.physical_device = devices[i];
     best.queue_family = static_cast<uint32_t>(qf);
     best.api_version = props.apiVersion;
@@ -750,6 +767,7 @@ VulkanContext::VulkanContext() {
   api_minor_ = static_cast<int>(VK_API_VERSION_MINOR(probe.api_version));
   device_name_ = probe.name;
   shader_float64_ = probe.shader_float64;
+  integer_dot_product_4x8_ = probe.integer_dot_product_4x8;
 
   // Float controls — probed and recorded, not pinned; see § RELAXED PRECISION.
   VkPhysicalDeviceFloatControlsProperties fc{};
@@ -853,6 +871,15 @@ VulkanContext::VulkanContext() {
     // Chain: f16 -> coopmat -> bf16.
     coop_feat.pNext = &bf16_feat;
     f16.pNext = &coop_feat;
+  }
+
+  // --- INTEGER DOT PRODUCT (VK-IDOT). Enable VK_KHR_shader_integer_dot_product
+  // when the device supports it, so the TQ keep-quant shaders can use
+  // dotPacked4x8EXT. The feature is CORE in Vulkan 1.2, but we request 1.1 so
+  // the extension must be named explicitly. On a 1.2+ device the extension is
+  // already in core and naming it is a no-op.
+  if (integer_dot_product_4x8_) {
+    device_exts.push_back("VK_KHR_shader_integer_dot_product");
   }
 
   const float priority = 1.0f;

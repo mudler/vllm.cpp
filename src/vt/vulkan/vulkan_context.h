@@ -335,6 +335,15 @@ class VulkanContext {
   bool coopmat_bf16_f32() const { return coopmat_bf16_f32_; }
   uint32_t subgroup_size() const { return subgroup_size_; }
 
+  // --- INTEGER DOT PRODUCT (VK-IDOT). GL_EXT_integer_dot_product provides
+  // dotPacked4x8EXT — a hardware-accelerated 4-way int8 dot product that the
+  // TQ1_0/TQ2_0 keep-quant shaders use to replace 4 scalar MACs with one
+  // instruction. Probed via VkPhysicalDeviceVulkan12Features::shaderIntegerDotProduct
+  // (CORE in 1.2, but we request 1.1 so the feature bit is probed, not assumed).
+  // The TQ shaders gate on this predicate and fall back to the scalar path
+  // where it is false (llvmpipe, older drivers).
+  bool integer_dot_product_4x8() const { return integer_dot_product_4x8_; }
+
   // --- WIDE REDUCTION SHADERS (VK-RMSNORM). Every shader in this backend is
   // compiled for the Vulkan-GUARANTEED 128 invocations, which is the right floor
   // for a flat kernel but leaves a per-ROW reducing kernel on four warps of one
@@ -502,6 +511,7 @@ class VulkanContext {
   bool denorm_preserve_f32_ = false;
   bool sz_inf_nan_preserve_f32_ = false;
   bool coopmat_bf16_f32_ = false;
+  bool integer_dot_product_4x8_ = false;
   uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
   uint32_t max_workgroup_count_y_ = 0;

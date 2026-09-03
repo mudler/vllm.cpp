@@ -71,7 +71,7 @@ int tq2_0_trit_uw(uint ae, uint woff) {
   uint wb_byte = woff + j + k;
   uint w32 = UW32.v[wb_byte >> 2];
   uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
-  return int((wb >> (l * 2u) & 3u)) - 1;
+  return int((wb >> (l * 2u)) & 3u) - 1;
 }
 
 #ifdef VT_IDOT

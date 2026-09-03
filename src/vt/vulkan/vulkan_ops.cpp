@@ -2189,8 +2189,12 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
   // IDOT variant: when the device supports VK_KHR_shader_integer_dot_product,
   // dispatch the _idot shader which uses dotPacked4x8EXT for the inner loop.
   // Falls back to the scalar _dev shader on devices without the extension.
+  // The IDOT shader processes 4 elements per inner iteration, so it requires
+  // elems = 256 / (128 / nb) = 2 * nb to be a multiple of 4, i.e. nb even.
+  // Odd nb (e.g. nb=1 for K=256, nb=3 for K=768) would read past the lane's
+  // element range and double-count, so the scalar path is used there.
   auto& ctx_idot = VulkanContext::Get();
-  const bool use_idot = ctx_idot.integer_dot_product_4x8();
+  const bool use_idot = ctx_idot.integer_dot_product_4x8() && (nb % 2 == 0);
   const char* dev_shader = is_tq2
       ? (use_idot ? "vt_matmul_bt_tq2_dev_idot" : "vt_matmul_bt_tq2_dev")
       : (use_idot ? "vt_matmul_bt_tq1_0_dev_idot" : "vt_matmul_bt_tq1_0_dev");
@@ -2304,8 +2308,10 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
   const int64_t nb = K / 256;
   VT_CHECK(K % 256 == 0, "vulkan TQ grouped: K must be a multiple of 256 (block size)");
   const int64_t E = weight.shape[0] / N;  // rank-2 weight is [E*N, K]
+  // IDOT requires elems = 2 * nb to be a multiple of 4 (nb even); see
+  // TryNativeTQDecode for the rationale. Odd nb uses the scalar _dev shader.
   auto& ctx_g = VulkanContext::Get();
-  const bool use_idot_g = ctx_g.integer_dot_product_4x8();
+  const bool use_idot_g = ctx_g.integer_dot_product_4x8() && (nb % 2 == 0);
   const char* dev_shader = is_tq2
       ? (use_idot_g ? "vt_matmul_bt_tq2_grouped_dev_idot" : "vt_matmul_bt_tq2_grouped_dev")
       : (use_idot_g ? "vt_matmul_bt_tq1_0_grouped_dev_idot" : "vt_matmul_bt_tq1_0_grouped_dev");
@@ -2481,14 +2487,16 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
   }
   const char* shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2"
                               : "vt_moe_gate_up_swiglu_grouped_tq1_0";
+  const int64_t nb = K / 256;
+  VT_CHECK(K % 256 == 0, "vulkan TQ MoE: K must be a multiple of 256 (block size)");
+  // IDOT requires elems = 2 * nb to be a multiple of 4 (nb even); see
+  // TryNativeTQDecode for the rationale. Odd nb uses the scalar shader.
   auto& ctx_moe = VulkanContext::Get();
-  const bool use_idot_moe = ctx_moe.integer_dot_product_4x8();
+  const bool use_idot_moe = ctx_moe.integer_dot_product_4x8() && (nb % 2 == 0);
   if (use_idot_moe) {
     shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2_idot"
                     : "vt_moe_gate_up_swiglu_grouped_tq1_0_idot";
   }
-  const int64_t nb = K / 256;
-  VT_CHECK(K % 256 == 0, "vulkan TQ MoE: K must be a multiple of 256 (block size)");
   const int64_t E = gate_w.shape[0] / N;
 
   auto& ctx = VulkanContext::Get();

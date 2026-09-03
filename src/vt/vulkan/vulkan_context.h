@@ -377,6 +377,7 @@ class VulkanContext {
   uint32_t max_workgroup_invocations() const { return max_workgroup_invocations_; }
   uint32_t max_workgroup_size_x() const { return max_workgroup_size_x_; }
   bool subgroup_arithmetic_compute() const { return subgroup_arithmetic_compute_; }
+  bool subgroup_shuffle_compute() const { return subgroup_shuffle_compute_; }
 
   // Invocations the wide reducing modules are compiled for. Mirrors VT_TG in
   // src/vt/vulkan/shaders/vt_rms_norm_wide.comp; the host never launches with it
@@ -518,6 +519,7 @@ class VulkanContext {
   uint32_t max_workgroup_invocations_ = 0;
   uint32_t max_workgroup_size_x_ = 0;
   bool subgroup_arithmetic_compute_ = false;
+  bool subgroup_shuffle_compute_ = false;
   bool wide_reduce_ = false;
   int rms_norm_override_ = 0;
   std::string device_name_;

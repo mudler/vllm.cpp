@@ -107,6 +107,49 @@ int pack_q8x4_m(int q0, int q1, int q2, int q3) {
 }
 #endif
 
+// Subgroup-based amax reduction (same as TQ1_0 MoE).
+float block_amax_reduce(uint col_id, uint block_id, uint lpb,
+                        uint lane_in_block, uint tid, float maxv) {
+  if ((lpb & (lpb - 1u)) == 0u) {
+    uint sub_mask = min(lpb, gl_SubgroupSize);
+    for (uint s = sub_mask >> 1u; s > 0u; s >>= 1u) {
+      float other = subgroupShuffleXor(maxv, s);
+      if (abs(other) > abs(maxv)) maxv = other;
+    }
+    if (lpb > gl_SubgroupSize) {
+      uint subs_per_block = lpb / gl_SubgroupSize;
+      if (lane_in_block % gl_SubgroupSize == 0u) {
+        sm_reduce[col_id * 128u + block_id * lpb + lane_in_block / gl_SubgroupSize] = maxv;
+      }
+      barrier();
+      if (lane_in_block < subs_per_block) {
+        float v = sm_reduce[col_id * 128u + block_id * lpb + lane_in_block];
+        for (uint i = 1u; i < subs_per_block; ++i) {
+          float other = sm_reduce[col_id * 128u + block_id * lpb + i];
+          if (abs(other) > abs(v)) v = other;
+        }
+        maxv = v;
+      }
+      sm_reduce[col_id * 128u + block_id * lpb] = maxv;
+      barrier();
+      maxv = sm_reduce[col_id * 128u + block_id * lpb];
+    }
+    return maxv;
+  }
+  sm_reduce[col_id * 128u + tid] = maxv;
+  barrier();
+  for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
+    if (lane_in_block < s) {
+      float a = sm_reduce[col_id * 128u + tid];
+      float b = sm_reduce[col_id * 128u + tid + s];
+      if (abs(b) > abs(a))
+        sm_reduce[col_id * 128u + tid] = b;
+    }
+    barrier();
+  }
+  return sm_reduce[col_id * 128u + block_id * lpb];
+}
+
 float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
   uint sub_per_col = 128u / gl_SubgroupSize;
@@ -263,18 +306,8 @@ void main() {
           float ax = abs(v);
           if (ax > amax) { amax = ax; maxv = v; }
         }
-        sm_reduce[col_id * 128u + tid] = maxv;
-        barrier();
-        for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
-          if (lane_in_block < s) {
-            float a = sm_reduce[col_id * 128u + tid];
-            float b = sm_reduce[col_id * 128u + tid + s];
-            if (abs(b) > abs(a))
-              sm_reduce[col_id * 128u + tid] = b;
-          }
-          barrier();
-        }
-        float maxv_final = sm_reduce[col_id * 128u + block_id * lpb];
+        maxv = block_amax_reduce(col_id, block_id, lpb, lane_in_block, tid, maxv);
+        float maxv_final = maxv;
         float block_amax = abs(maxv_final);
         if (block_amax > 0.0) {
           float iscale = -127.0 / maxv_final;

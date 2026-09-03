@@ -1,15 +1,6 @@
 #version 450
-// vt_matmul_bt_tq2_grouped_dev: OPTIMIZED v5 — shared-memory weight cache +
-// subgroup amax reduction. Multi-column workgroups, packed uint32 weight reads,
-// activation cache, subgroup reduce.
-//
-// The weight block is cooperatively loaded into shared memory ONCE per
-// (row, block). ALL inner-loop paths read from w_cache, never from global
-// memory in the hot loop.
-//
-// The per-block amax reduction uses subgroupShuffleXor butterfly (0 barriers
-// when lpb <= subgroupSize, 1 barrier when lpb > subgroupSize) instead of the
-// log2(lpb)-round shared-memory tree reduction.
+// vt_matmul_bt_tq2_grouped_dev: OPTIMIZED v2 — multi-column, packed uint32
+// reads, activation cache, subgroup reduce. TQ2_0 block: 66 bytes per 256 elems.
 //
 // VT_IDOT variant: uses dotPacked4x8EXT for the inner loop.
 // Requires VK_KHR_shader_integer_dot_product at runtime.
@@ -24,7 +15,6 @@
 #include "vt_common.glsl"
 
 #define COLS_PER_WG 4u
-#define W_CACHE_WORDS 18u  // ceil(66/4) = 17, round to 18
 
 layout(local_size_x = 128, local_size_y = COLS_PER_WG, local_size_z = 1) in;
 
@@ -47,7 +37,6 @@ layout(constant_id = 1) const uint VT_TQ_ACT_DT = 0u;
 shared int q8_cache[8][256];
 shared float d_act_cache[8];
 shared float sm_reduce[512];
-shared uint w_cache[COLS_PER_WG][8][W_CACHE_WORDS];
 
 float load_act(uint idx) {
   return (VT_TQ_ACT_DT == VT_DT_F32)
@@ -55,24 +44,26 @@ float load_act(uint idx) {
       : vt_bf16_to_f32(uint(A16.v[idx]));
 }
 
-// Trit extraction from shared-memory cache.
-int tq2_0_trit_cached(uint ae, uint col_id, uint block_id, uint w_align) {
+int tq2_0_trit(uint ae, uint woff) {
   uint j = (ae >= 128u) ? 32u : 0u;
   uint rem = ae - j * 4u;
   uint l = rem / 32u; uint k = rem % 32u;
-  uint byte_off = w_align + j + k;
-  uint w32 = w_cache[col_id][block_id][byte_off >> 2];
-  uint wb = (w32 >> ((byte_off & 3u) * 8u)) & 0xFFu;
+  uint wb_byte = woff + j + k;
+  uint w32 = W32.v[wb_byte >> 2];
+  uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
   return int((wb >> (l * 2u)) & 3u) - 1;
 }
 
 #ifdef VT_IDOT
-uint tq2_load4bytes_cached(uint col_id, uint block_id, uint byte_off) {
+// Load 4 consecutive bytes from global weight memory as a uint32.
+// The aligned case (byte_idx==0) is handled separately because hi << 32 is
+// UNDEFINED in GLSL, and Intel GPUs mask the shift to 5 bits (32&31=0).
+uint tq2_load4bytes_g(uint byte_off) {
   uint word_idx = byte_off >> 2;
   uint byte_idx = byte_off & 3u;
-  if (byte_idx == 0u) return w_cache[col_id][block_id][word_idx];
-  uint lo = w_cache[col_id][block_id][word_idx];
-  uint hi = w_cache[col_id][block_id][word_idx + 1u];
+  if (byte_idx == 0u) return W32.v[word_idx];
+  uint lo = W32.v[word_idx];
+  uint hi = W32.v[word_idx + 1u];
   return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
 }
 
@@ -81,7 +72,9 @@ int pack_q8x4_g(int q0, int q1, int q2, int q3) {
 }
 #endif
 
-// Subgroup-based amax reduction (same as TQ1_0 grouped dev).
+// Subgroup-based amax reduction: find the value with the largest |v| across
+// lpb lanes in the block. Uses subgroupShuffleXor butterfly (0 barriers when
+// lpb <= subgroupSize). Falls back to shared-memory tree for non-power-of-2 lpb.
 float block_amax_reduce(uint col_id, uint block_id, uint lpb,
                         uint lane_in_block, uint tid, float maxv) {
   if ((lpb & (lpb - 1u)) == 0u) {
@@ -96,15 +89,15 @@ float block_amax_reduce(uint col_id, uint block_id, uint lpb,
         sm_reduce[col_id * 128u + block_id * lpb + lane_in_block / gl_SubgroupSize] = maxv;
       }
       barrier();
+      // Only the first subs_per_block lanes combine the per-subgroup winners.
       if (lane_in_block < subs_per_block) {
         float v = sm_reduce[col_id * 128u + block_id * lpb + lane_in_block];
         for (uint i = 1u; i < subs_per_block; ++i) {
           float other = sm_reduce[col_id * 128u + block_id * lpb + i];
           if (abs(other) > abs(v)) v = other;
         }
-        maxv = v;
+        sm_reduce[col_id * 128u + block_id * lpb] = v;
       }
-      sm_reduce[col_id * 128u + block_id * lpb] = maxv;
       barrier();
       maxv = sm_reduce[col_id * 128u + block_id * lpb];
     }
@@ -203,22 +196,9 @@ void main() {
     uint w_row = p.w_off + ee * p.n * p.nb * wbytes + col * p.nb * wbytes;
     float acc = 0.0;
 
-    // Cooperative load of the weight block into shared memory.
-    // 66 bytes = 17 uint32 words (last word has 2 bytes).
-    if (block_id < nb) {
-      uint woff = w_row + block_id * wbytes;
-      uint w_base = woff >> 2u;
-      uint nwords = ((woff + wbytes - 1u) >> 2u) - w_base + 1u;
-      for (uint i = lane_in_block; i < nwords; i += lpb) {
-        w_cache[col_id][block_id][i] = W32.v[w_base + i];
-      }
-    }
-    barrier();
-
     if (p.bcast != 0u) {
       if (block_id < nb && d_act_cache[block_id] != 0.0) {
         uint woff = w_row + block_id * wbytes;
-        uint w_align = woff & 3u;
         float wd = vt_from16(uint(W16.v[(woff + 64u) >> 1]), VT_DT_F16);
         float blockd = d_act_cache[block_id] * wd;
         int acci = 0;
@@ -228,8 +208,8 @@ void main() {
           uint j = (ae >= 128u) ? 32u : 0u;
           uint rem = ae - j * 4u;
           uint l = rem / 32u; uint k = rem % 32u;
-          uint byte_off = w_align + j + k;
-          uint packed_bytes = tq2_load4bytes_cached(col_id, block_id, byte_off);
+          uint byte_off = woff + j + k;
+          uint packed_bytes = tq2_load4bytes_g(byte_off);
           uint packed_trits = (packed_bytes >> (l * 2u)) & 0x03030303u;
           int packed_q8 = pack_q8x4_g(q8_cache[block_id][ae],
                                       q8_cache[block_id][ae + 1u],
@@ -243,7 +223,7 @@ void main() {
 #else
         for (uint i = 0u; i < elems; ++i) {
           uint ae = lane_in_block * elems + i;
-          acci += q8_cache[block_id][ae] * tq2_0_trit_cached(ae, col_id, block_id, w_align);
+          acci += q8_cache[block_id][ae] * tq2_0_trit(ae, woff);
         }
 #endif
         acc = float(acci) * blockd;
@@ -252,17 +232,27 @@ void main() {
       if (block_id < nb) {
         uint a_base = (p.a_off >> a_shift) + row * p.nb * 256u + block_id * 256u;
         uint woff = w_row + block_id * wbytes;
-        uint w_align = woff & 3u;
         float amax = 0.0; float maxv = 0.0;
         for (uint i = 0u; i < elems; ++i) {
           float v = load_act(a_base + lane_in_block * elems + i);
           float ax = abs(v);
           if (ax > amax) { amax = ax; maxv = v; }
         }
-        maxv = block_amax_reduce(col_id, block_id, lpb, lane_in_block, tid, maxv);
-        float block_amax = abs(maxv);
+        sm_reduce[col_id * 128u + tid] = maxv;
+        barrier();
+        for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
+          if (lane_in_block < s) {
+            float a = sm_reduce[col_id * 128u + tid];
+            float b = sm_reduce[col_id * 128u + tid + s];
+            if (abs(b) > abs(a))
+              sm_reduce[col_id * 128u + tid] = b;
+          }
+          barrier();
+        }
+        float maxv_final = sm_reduce[col_id * 128u + block_id * lpb];
+        float block_amax = abs(maxv_final);
         if (block_amax > 0.0) {
-          float iscale = -127.0 / maxv;
+          float iscale = -127.0 / maxv_final;
           float d_act = 1.0 / iscale;
           float wd = vt_from16(uint(W16.v[(woff + 64u) >> 1]), VT_DT_F16);
           float blockd = d_act * wd;
@@ -273,8 +263,8 @@ void main() {
             uint j = (ae >= 128u) ? 32u : 0u;
             uint rem = ae - j * 4u;
             uint l = rem / 32u; uint k = rem % 32u;
-            uint byte_off = w_align + j + k;
-            uint packed_bytes = tq2_load4bytes_cached(col_id, block_id, byte_off);
+            uint byte_off = woff + j + k;
+            uint packed_bytes = tq2_load4bytes_g(byte_off);
             uint packed_trits = (packed_bytes >> (l * 2u)) & 0x03030303u;
             int q0 = int(roundEven(iscale * load_act(a_base + ae)));
             int q1 = int(roundEven(iscale * load_act(a_base + ae + 1u)));
@@ -293,7 +283,7 @@ void main() {
             float v = load_act(a_base + ae);
             int q = int(roundEven(iscale * v));
             q = q < 127 ? q : 127;
-            acci += q * tq2_0_trit_cached(ae, col_id, block_id, w_align);
+            acci += q * tq2_0_trit(ae, woff);
           }
 #endif
           acc = float(acci) * blockd;

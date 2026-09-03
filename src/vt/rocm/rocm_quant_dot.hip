@@ -37,19 +37,16 @@
 #include "vt/ops.h"
 #include "vt/quant.h"
 
-// Forward declarations: the optimized K-quant GEMM kernels in
-// rocm_grouped_gemm.hip (renamed *Gdn). F1 delegates Q4_K/Q5_K/Q6_K to these
-// to preserve the baseline-optimized path; the new kernels in this file
-// handle IQ types and Q2_K/Q3_K that the old code did not support.
 namespace vt::rocm {
-void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a,
-                                const Tensor& b);
-void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
-                                       const Tensor& weight,
-                                       const Tensor& expert_ids);
-}
+// Forward declaration: the K-quant (Q4_K/Q5_K/Q6_K) path lives in
+// rocm_grouped_gemm.hip (external linkage) with the MMVQ arm and
+// norm-quant bridge. This file delegates to it for those types.
+void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out,
+                                  const Tensor& a, const Tensor& b);
+void MatmulBTQuantGroupedKernelRocmGdn(
+    Queue& q, Tensor& out, const Tensor& act,
+    const Tensor& weight, const Tensor& expert_ids);
 
-namespace vt::rocm {
 namespace {
 
 // dtype.cpp F32ToF16 — round-to-nearest-even, subnormals, inf/nan. Used only
@@ -936,10 +933,8 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
     return;
   }
 
-  // Delegate Q4_K/Q5_K/Q6_K to the optimized kernels in rocm_grouped_gemm.hip
-  // (renamed *Gdn). These have cooperative-warp dispatch and format-specific
-  // templates tuned for gfx1100; the new CUDA-ported kernels in this file are
-  // slower for these types. The new kernels handle IQ types and Q2_K/Q3_K.
+  // Delegate K-quant (Q4_K/Q5_K/Q6_K) to rocm_grouped_gemm.hip which
+  // has the MMVQ arm (VT_GEMV_MMVQ) and norm-quant bridge (lever-C).
   if (b.dtype == DType::kQ4_K || b.dtype == DType::kQ5_K ||
       b.dtype == DType::kQ6_K) {
     MatmulBTQuantKernelRocmGdn(q, out, a, b);

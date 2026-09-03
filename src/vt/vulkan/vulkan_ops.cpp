@@ -2204,7 +2204,10 @@ static bool TryNativeTQDecode(Queue& q, Tensor& out, const Tensor& a,
   // GPU-side quantize path (Phase 2): when the activation is f32 or bf16 on the
   // device, dispatch the _dev shader which quantizes Q8_K INSIDE the shader.
   // No host read, no FlushBatch — eliminates the per-dispatch drain.
-  if (a.dtype == DType::kF32 || a.dtype == DType::kBF16) {
+  // The dev shader uses subgroupShuffleXor for the per-block amax reduction,
+  // which requires VK_SUBGROUP_FEATURE_SHUFFLE_BIT in the compute stage.
+  if ((a.dtype == DType::kF32 || a.dtype == DType::kBF16) &&
+      ctx_idot.subgroup_shuffle_compute()) {
     auto& ctx = VulkanContext::Get();
     std::vector<void*> buffers;
     uint32_t a_off = 0, w_off = 0, out_off = 0;
@@ -2326,7 +2329,10 @@ static bool TryNativeTQGrouped(Queue& q, Tensor& out, const Tensor& act,
   // the maple MoE bottleneck. Bit-exact vs the host-quantize path because the
   // shader's Q8_K quantize matches cpu_quant_act.cpp QuantizeRowQ8_K exactly
   // (same signed-extremum max, same iscale = -127/max, same roundEven).
-  if (act.dtype == DType::kF32 || act.dtype == DType::kBF16) {
+  // The dev shader uses subgroupShuffleXor for the per-block amax reduction,
+  // which requires VK_SUBGROUP_FEATURE_SHUFFLE_BIT in the compute stage.
+  if ((act.dtype == DType::kF32 || act.dtype == DType::kBF16) &&
+      ctx_g.subgroup_shuffle_compute()) {
     auto& ctx = VulkanContext::Get();
     std::vector<void*> buffers;
     uint32_t a_off = 0, w_off = 0, eid_off = 0, out_off = 0;
@@ -2485,6 +2491,10 @@ static bool TryNativeMoeGateUpSwiGLUGroupedTQ(
       gate_w.repacked || up_w.repacked) {
     return false;
   }
+  // The MoE shader uses subgroupShuffleXor for the per-block amax reduction,
+  // which requires VK_SUBGROUP_FEATURE_SHUFFLE_BIT in the compute stage.
+  auto& ctx_gate = VulkanContext::Get();
+  if (!ctx_gate.subgroup_shuffle_compute()) return false;
   const char* shader = is_tq2 ? "vt_moe_gate_up_swiglu_grouped_tq2"
                               : "vt_moe_gate_up_swiglu_grouped_tq1_0";
   const int64_t nb = K / 256;

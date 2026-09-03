@@ -846,6 +846,12 @@ VulkanContext::VulkanContext() {
       (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
       (sub.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0 &&
       (sub.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+  // Shuffle is core Vulkan 1.1 alongside basic and arithmetic, but a device
+  // can expose basic+arithmetic without shuffle. Probe it separately because
+  // the TQ shaders use subgroupShuffleXor for the per-block amax reduction.
+  subgroup_shuffle_compute_ =
+      (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+      (sub.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
   wide_reduce_ = subgroup_arithmetic_compute_ && subgroup_size_ > 0 &&
                  max_workgroup_invocations_ >= kWideWorkgroupSize &&
                  max_workgroup_size_x_ >= kWideWorkgroupSize;

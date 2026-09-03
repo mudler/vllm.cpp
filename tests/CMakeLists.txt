@@ -2665,6 +2665,8 @@ vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp
 # Q8_K-family encodings. Skips coherently with no AMD GPU.
 vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
 target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_rocm_skinny_f32 vt/test_rocm_skinny_f32.cpp)
+target_include_directories(test_rocm_skinny_f32 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu

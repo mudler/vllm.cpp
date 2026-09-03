@@ -55,7 +55,8 @@ std::unique_ptr<LoadedModel> LoadMapleForCausalLM(
     throw std::runtime_error("gguf model source is empty");
   }
   return std::make_unique<MapleLoadedModel>(
-      registration, LoadMapleFromGguf(*source.gguf, config, nullptr));
+      registration, LoadMapleFromGguf(*source.gguf, config, nullptr,
+                                      source.device));
 }
 
 void PrepareMaple(LoadedModel& model, const HfConfig& config, vt::Queue& queue) {

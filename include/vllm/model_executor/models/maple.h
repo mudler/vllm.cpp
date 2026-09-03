@@ -93,6 +93,7 @@ v1::KVCacheConfig MakeMapleKVCache(const HfConfig& config, int block_size,
 bool IsMapleGguf(const GgufFile& gguf);
 HfConfig MapleHfConfigFromGguf(const GgufFile& gguf);
 MapleWeights LoadMapleFromGguf(const GgufFile& gguf, const HfConfig& config,
-                               const GgufLoadPolicy* policy);
+                               const GgufLoadPolicy* policy,
+                               vt::DeviceType device = vt::DeviceType::kCPU);
 
 }  // namespace vllm

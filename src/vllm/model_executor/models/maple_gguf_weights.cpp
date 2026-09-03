@@ -268,8 +268,9 @@ HfConfig MapleHfConfigFromGguf(const GgufFile& gguf) {
 }
 
 MapleWeights LoadMapleFromGguf(const GgufFile& gguf, const HfConfig& config,
-                               const GgufLoadPolicy* policy) {
-  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
+                               const GgufLoadPolicy* policy,
+                               vt::DeviceType device) {
+  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv(device);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
 
   MapleWeights w;

@@ -7165,6 +7165,7 @@ void MoeSelFp(int dev_type, int64_t T, int64_t E, int64_t top_k,
                SumAbsBf16(expert_out), shared != nullptr ? SumAbsBf16(*shared) : 0.0,
                static_cast<long long>(MoeSelFpLines()));
   ++MoeSelFpCall();
+}
 
 // VK4 keep-quant fast MoE path for Vulkan + TQ-quantized experts. Mirrors
 // MoeBlockBf16Cuda but uses the TQ-quantized ops: Matmul for the router,

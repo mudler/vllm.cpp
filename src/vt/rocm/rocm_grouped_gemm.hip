@@ -27,21 +27,19 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_device_bind.h"
-#include "vt/rocm/rocm_f16_codec.h"
-#include "vt/rocm/rocm_runtime.h"
 
+#include "vt/rocm/rocm_runtime.h"
 // Block layouts — the single source of truth (ggml-common.h mirrors).
 #include "vt/cpu/cpu_quant_blocks.h"
 
@@ -62,12 +60,54 @@ inline ActDT ActDtOf(DType dt) {
   return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
 }
 
-// ---- device numeric helpers ----
-// The four half/bfloat16 conversions moved to `vt/rocm/rocm_f16_codec.h`
-// (included above) when BACKEND-ROCM-EXL3 needed the same two of them for
-// the trellis decode. They are unchanged, and they are still the bit-exact
-// transcriptions of `vt::F16ToF32` / `vt::F32ToF16` rather than the hardware
-// conversion intrinsics; a second copy is what moving them avoided.
+// ---- device numeric helpers (bit-exact ports from cuda_quant_dot.cu) ----
+__device__ inline float DF16ToF32(uint16_t h) {
+  uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+  uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t mant = h & 0x3FF;
+  if (exp == 0x1F) return __int_as_float(sign | 0x7F800000 | (mant << 13));
+  if (exp == 0) {
+    if (mant == 0) return __int_as_float(sign);
+    int shift = 0;
+    while ((mant & 0x400) == 0) { mant <<= 1; ++shift; }
+    mant &= 0x3FF;
+    return __int_as_float(sign | ((113 - shift) << 23) | (mant << 13));
+  }
+  return __int_as_float(sign | ((exp + 112) << 23) | (mant << 13));
+}
+__device__ inline float DBF16ToF32(uint16_t b) {
+  return __int_as_float(static_cast<uint32_t>(b) << 16);
+}
+__device__ inline uint16_t DF32ToBF16(float f) {
+  uint32_t u = __float_as_int(f);
+  if ((u & 0x7F800000) == 0x7F800000 && (u & 0x7FFFFF))
+    return static_cast<uint16_t>((u >> 16) | 0x0040);
+  uint32_t rounding = 0x7FFF + ((u >> 16) & 1);
+  return static_cast<uint16_t>((u + rounding) >> 16);
+}
+__device__ inline uint16_t DF32ToF16(float f) {
+  uint32_t u = __float_as_uint(f);
+  uint16_t sign = static_cast<uint16_t>((u >> 16) & 0x8000);
+  int32_t exp = static_cast<int32_t>((u >> 23) & 0xFF) - 127 + 15;
+  uint32_t mant = u & 0x7FFFFF;
+  if (((u >> 23) & 0xFF) == 0xFF)
+    return static_cast<uint16_t>(sign | 0x7C00 | (mant ? 0x200 | (mant >> 13) : 0));
+  if (exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00);
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    mant |= 0x800000;
+    uint32_t shift = static_cast<uint32_t>(14 - exp);
+    uint32_t half = mant >> shift;
+    uint32_t rem = mant & ((1u << shift) - 1);
+    uint32_t mid = 1u << (shift - 1);
+    if (rem > mid || (rem == mid && (half & 1))) ++half;
+    return static_cast<uint16_t>(sign | half);
+  }
+  uint32_t half = static_cast<uint32_t>(exp << 10) | (mant >> 13);
+  uint32_t rem = mant & 0x1FFF;
+  if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
+  return static_cast<uint16_t>(sign | half);
+}
 __device__ inline int DNearestInt(float fval) {
   float val = fval + 12582912.0f;
   int i = __float_as_int(val);
@@ -122,21 +162,17 @@ __global__ void QuantizeQ8_0K(BlockQ8_0* __restrict__ scratch, const void* __res
 }
 
 // Q8_K (thread-per-256-superblock): cuda_quant_dot.cu QuantizeQ8KKernel.
-__global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __restrict__ a,
-                             ActDT adt, int64_t a_rs, int64_t m, int64_t nsb,
-                             Q8KKernelWitnessCount* kernel_witness) {
-  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= m * nsb) return;
-  if (t == 0 && kernel_witness != nullptr) atomicAdd(&kernel_witness[0], 1ULL);
-  const int64_t i = t / nsb;
-  const int64_t sb = t % nsb;
-  const int64_t elem0 = i * a_rs + sb * kQK_K;
+// The per-super-block body is factored into QuantQ8KSBlock so the T4a MMVQ
+// fused-prologue arm produces BYTE-IDENTICAL scratch (same amax
+// first-occurrence tie-break, same scale/iscale arithmetic) — asserted by
+// tests/vt/test_rocm_quant_dot.cpp on random AND tied-amax inputs.
+__device__ inline void QuantQ8KSBlock(BlockQ8_K& y, const void* __restrict__ a,
+                                      ActDT adt, int64_t elem0) {
   float mx = 0.0f, amax = 0.0f;
   for (int j = 0; j < kQK_K; ++j) {
-    const float ax = fabsf(DLoadAct(a, adt, elem0 + j));
-    if (ax > amax) { amax = ax; mx = DLoadAct(a, adt, elem0 + j); }
+    const float x = DLoadAct(a, adt, elem0 + j);
+    if (const float ax = fabsf(x); ax > amax) { amax = ax; mx = x; }
   }
-  BlockQ8_K& y = scratch[t];
   if (amax == 0.0f) {
     y.d = 0.0f;
     for (int j = 0; j < kQK_K; ++j) y.qs[j] = 0;
@@ -156,6 +192,16 @@ __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __rest
   y.d = 1.0f / iscale;
 }
 
+__global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __restrict__ a,
+                             ActDT adt, int64_t a_rs, int64_t m, int64_t nsb,
+                             Q8KKernelWitnessCount* kernel_witness) {
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * nsb) return;
+  if (t == 0 && kernel_witness != nullptr) atomicAdd(&kernel_witness[0], 1ULL);
+  const int64_t i = t / nsb;
+  const int64_t sb = t % nsb;
+  QuantQ8KSBlock(scratch[t], a, adt, i * a_rs + sb * kQK_K);
+}
 // Q8_K (block-per-256-superblock): cuda_quant_dot.cu
 // QuantizeQ8KPreqKernel. One thread loads and writes one activation element.
 // The reduction retains the signed value and the lowest original index, which
@@ -915,20 +961,7 @@ __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ 
   float partial = 0.0f;
   for (int64_t sb = lane; sb < nsb; sb += 32) {
     const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
-    if constexpr (Fmt == 3) {
-      // Fmt 3 IS Fmt 2 (Q6_K) with a different PRIVATE-MEMORY footprint, and
-      // nothing else. `DotQ6K` materialises the whole superblock into an
-      // `int8_t aux8[256]` per thread, which the compiler places in SCRATCH;
-      // `DotQ6KIsumRange` reconstructs 32 weights at a time into `int8_t
-      // aux8[32]`, which fits in registers. The arithmetic is the same integer
-      // accumulator times the same one f32 scale product, which is the
-      // bit-equality this file's `DotQ6KIsumRange` note already argues and
-      // which tests/vt/test_backend_cross_device.cpp already asserts between
-      // the cooperative and single-warp arms.
-      const BlockQ6_K* xb = static_cast<const BlockQ6_K*>(w_sb);
-      const BlockQ8_K* yb = a_row + sb;
-      partial += (DF16ToF32(xb->d) * yb->d) * DotQ6KIsumRange(xb, yb, 0, kSubBlocks);
-    } else if constexpr (Fmt == 2) partial += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
+    if constexpr (Fmt == 2) partial += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
     else if constexpr (Fmt == 1) partial += DotQ5K(static_cast<const BlockQ5_K*>(w_sb), a_row + sb);
     else partial += DotQ4K(static_cast<const BlockQ4_K*>(w_sb), a_row + sb);
   }
@@ -1057,6 +1090,222 @@ __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ we
   }
 }
 
+// --- T4a (GFX1100-TG200): MMVQ-style decode GEMV arm for K-quants ----------
+// Dispatched behind VT_GEMV_MMVQ=1 with m == 1 ONLY; default OFF and the
+// baseline KQuantGemmK path below is byte-unchanged.
+//
+// NUMERICS CONTRACT (T4a REPAIR ROUND) — the arm is BIT-EQUAL TO THE
+// BASELINE KQuantGemmK OUTPUT at every (Fmt, nsb, j), not merely within the
+// oracle NMSE band. History: the first round reproduced the CPU ORACLE's
+// association exactly and was bit-exact vs it, yet the ENGINE degraded into
+// number-loops — the extended ON-vs-OFF sweep showed the arm differs from
+// the BASELINE by float ULPs (different summation association), flipping
+// greedy near-ties at isolated rows (red at N=2304..248320). Repair
+// mechanism, three steps:
+//   1. INTEGER PHASE: an octet of 8 lanes walks one super-block in 32-elem
+//      chunk units (all lanes busy down to nsb=1; dp4a word cores below).
+//      Integer sums are EXACT under any association, so the redistribution
+//      cannot change them; an exact octet shuffle recovers each super-
+//      block's full isum (and the Q4/Q5 mins-bsums sumi).
+//   2. TERM RECONSTRUCTION: the octet leader evaluates the baseline's OWN
+//      float expression for that super-block — d*isum (Q6_K) resp.
+//      d*isum - dmin*sumi (Q4_K/Q5_K) with the same d/dmin products — and
+//      broadcasts it. Identical inputs, identical expression => identical
+//      float bits as the baseline's per-super-block Dot return value.
+//   3. ASSOCIATION REPLAY: every lane adds the broadcast term under the
+//      BASELINE's lane ownership (lane l owns super-blocks l, l+32, ...
+//      sequentially in increasing sb order — here: predicate (sb%32)==lane
+//      over the in-order sb stream) and partials close with the baseline's
+//      __shfl_down(16,8,4,2,1) tree.
+// Identical float values in identical order => identical bits. The focused
+// sweep (tests/vt/test_rocm_quant_dot.cpp, ENGINE shape set incl. lm_head
+// N=248320) asserts ON==OFF byte identity at every model shape.
+template <typename OutT, int Fmt>
+__device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
+                                         const uint8_t* __restrict__ w_row,
+                                         const BlockQ8_K* __restrict__ act_row,
+                                         int64_t j, int lane, int64_t nsb,
+                                         size_t w_block_bytes) {
+  float partial = 0.0f;
+  const int passes = static_cast<int>((nsb + 3) / 4);
+  for (int p = 0; p < passes; ++p) {
+    const int sb = p * 4 + (lane >> 3);
+    const int c = lane & 7;
+    int acc = 0;    // this chunk's weighted integer dot (exact)
+    int sumi_c = 0; // Q4/Q5: mn * (bsums pair), exact
+
+    if (sb < nsb) {
+      const uint8_t* blk =
+          w_row + static_cast<size_t>(sb) * w_block_bytes;
+      const BlockQ8_K& yb = act_row[sb];
+      if constexpr (Fmt == 2) {  // Q6_K: ql@0 qh@128 scales(int8)@192 d@208
+        // Chunk c covers dequant elements [c*32, c*32+32). DotQ6K layout:
+        // quarter q=c>>2 holds elements [q*128,+128); segment seg=c&3 picks
+        // the ql low/high nibble half and the qh 2-bit field. Nibble values
+        // are biased by -32; the bias is removed EXACTLY in the integer
+        // domain with a constant-word dp4a (32*q8 per byte), so `acc`
+        // equals the baseline's exact isum whatever the grouping.
+        // seg 0/1: low nibble of ql bytes l / l+32; seg 2/3: high nibble.
+        // qh contributes a 2-bit field per element (mask 0x03030303).
+        const int q = c >> 2, seg = c & 3;
+        const uint8_t* ql = blk + q * 64 + (seg & 1) * 32;
+        const uint8_t* qh = blk + kQK_K / 2 + q * 32;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+        const int shift = (seg >> 1) * 4;
+        const int hs = seg * 2;
+        const int8_t* q8 = yb.qs + c * 32;
+        int sub0 = 0, pre0 = 0, sub1 = 0, pre1 = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          uint32_t Wq, Wh, W8;
+          memcpy(&Wq, ql + 4 * w, 4);
+          memcpy(&Wh, qh + 4 * w, 4);
+          memcpy(&W8, q8 + 4 * w, 4);
+          const uint32_t v =
+              ((Wq >> shift) & 0x0F0F0F0Fu) |
+              (((Wh >> hs) & 0x03030303u) << 4);
+          // scales change every 16 elems: words 0-3 -> sc[2c], 4-7 -> sc[2c+1]
+          if (w < 4) {
+            sub0 = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub0);
+            pre0 = Dp4a(0x20202020, static_cast<int>(W8), pre0);
+          } else {
+            sub1 = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub1);
+            pre1 = Dp4a(0x20202020, static_cast<int>(W8), pre1);
+          }
+        }
+        acc = static_cast<int>(sc[2 * c]) * (sub0 - pre0) +
+              static_cast<int>(sc[2 * c + 1]) * (sub1 - pre1);
+      } else {  // Q4_K / Q5_K: d@0 dmin@2 scales@4 [qh@16] qs@16|48
+        uint32_t W0, W1, W2;
+        memcpy(&W0, blk + 4, 4);
+        memcpy(&W1, blk + 8, 4);
+        memcpy(&W2, blk + 12, 4);
+        int scale, mn;
+        if (c < 4) {
+          scale = static_cast<int>((W0 >> (8 * c)) & 0x3F);
+          mn = static_cast<int>((W1 >> (8 * c)) & 0x3F);
+        } else {
+          const int i4 = 8 * (c - 4);
+          scale = static_cast<int>(((W2 >> i4) & 0xF) |
+                                   (((W0 >> (i4 + 6)) & 3) << 4));
+          mn = static_cast<int>(((W2 >> (i4 + 4)) & 0xF) |
+                                (((W1 >> (i4 + 6)) & 3) << 4));
+        }
+        const uint8_t* qb = blk + (Fmt == 1 ? 48 : 16) + (c >> 1) * 32;
+        const int shift = (c & 1) ? 4 : 0;
+        const uint8_t* hm = blk + 16;
+        const int8_t* q8 = yb.qs + c * 32;
+        int sub = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          uint32_t Wq, W8;
+          memcpy(&Wq, qb + 4 * w, 4);
+          memcpy(&W8, q8 + 4 * w, 4);
+          uint32_t v = (Wq >> shift) & 0x0F0F0F0Fu;
+          if constexpr (Fmt == 1) {
+            uint32_t Wh;
+            memcpy(&Wh, hm + 4 * w, 4);
+            v |= ((Wh >> c) & 0x01010101u) << 4;
+          }
+          sub = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub);
+        }
+        acc = scale * sub;
+        sumi_c = mn * (yb.bsums[2 * c] + yb.bsums[2 * c + 1]);
+      }
+    }
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+      acc += __shfl_down_sync(0xffffffffULL, acc, off);
+      sumi_c += __shfl_down_sync(0xffffffffULL, sumi_c, off);
+    }
+    // Fold THIS pass's super-blocks: reconstruct the baseline's exact float
+    // term on the octet leader (after the reduce above, lane 8*kk holds the
+    // whole-octet integer totals) and add it under the baseline's lane
+    // ownership (lane l owns sbs l, l+32, ... — the stream here is strictly
+    // sb-increasing, so per-lane accumulation order matches).
+    const int rem = static_cast<int>(nsb - p * 4);
+    const int nact = rem < 4 ? rem : 4;
+    for (int kk = 0; kk < nact; ++kk) {
+      const int sbk = p * 4 + kk;
+      const int isum = __shfl_sync(0xffffffffULL, acc, 8 * kk);
+      const int SUMI = __shfl_sync(0xffffffffULL, sumi_c, 8 * kk);
+      float term = 0.0f;
+      if (lane == 8 * kk) {
+        const uint8_t* blk =
+            w_row + static_cast<size_t>(sbk) * w_block_bytes;
+        uint16_t dh;
+        if constexpr (Fmt == 2) memcpy(&dh, blk + 208, 2); else memcpy(&dh, blk, 2);
+        const float d = DF16ToF32(dh) * act_row[sbk].d;
+        if constexpr (Fmt != 2) {  // baseline: d * isum - dmin * sumi
+          uint16_t dmh;
+          memcpy(&dmh, blk + 2, 2);
+          const float dmin = DF16ToF32(dmh) * act_row[sbk].d;
+          term = d * static_cast<float>(isum) - dmin * static_cast<float>(SUMI);
+        } else {                   // baseline: d * isum
+          term = d * static_cast<float>(isum);
+        }
+      }
+      const float P = __shfl_sync(0xffffffffULL, term, 8 * kk);
+      if ((sbk & 31) == lane) partial += P;
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[j] = partial;
+    else out[j] = DF32ToBF16(partial);
+  }
+}
+
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
+                                const uint8_t* __restrict__ weight,
+                                const BlockQ8_K* __restrict__ act, int64_t n,
+                                int64_t nsb, size_t w_block_bytes) {
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, act, j, static_cast<int>(threadIdx.x),
+                               nsb, w_block_bytes);
+}
+
+// Fused-prologue variant (the operator-steered shape of the arm): the block
+// quantizes the activation row into LDS FIRST — each linear thread takes
+// whole super-blocks in the SAME thread-per-super-block walk as the
+// standalone QuantizeQ8KK grid, via the SHARED QuantQ8KSBlock body, so the
+// bytes are identical by construction — then __syncthreads() and runs the
+// identical GEMV row body against the LDS copy. This deletes the standalone
+// ~59us quant launch (T4a capture: 43.7 launches/tok on grids of <=1
+// block). The redundant per-block requantization is bounded by the
+// kMmvqFoldMaxRows gate at the dispatch site: measured on gfx1100, the fold
+// beats the launch at n<=512 and loses badly beyond (the redundancy scales
+// with the block count) — see the gate comment there.
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqFusedK(OutT* __restrict__ out,
+                                     const uint8_t* __restrict__ weight,
+                                     const void* __restrict__ a, ActDT adt,
+                                     int64_t n, int64_t nsb,
+                                     size_t w_block_bytes) {
+  extern __shared__ unsigned char vt_mmvq_smem[];
+  BlockQ8_K* lds =
+      reinterpret_cast<BlockQ8_K*>(vt_mmvq_smem);  // [nsb] blocks
+  const int tid = static_cast<int>(threadIdx.y) * 32 +
+                  static_cast<int>(threadIdx.x);
+  for (int64_t sb = tid; sb < nsb; sb += 128)
+    QuantQ8KSBlock(lds[sb], a, adt, sb * kQK_K);  // m == 1: elem0 = sb*256
+  __syncthreads();
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;  // only AFTER the barrier: whole block quantizes first
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, lds, j,
+                               static_cast<int>(threadIdx.x), nsb,
+                               w_block_bytes);
+}
+
 inline void Check(hipError_t err, const char* what) {
   if (err != hipSuccess)
     throw std::runtime_error(std::string("vt rocm grouped_gemm: ") + what + ": " +
@@ -1092,7 +1341,6 @@ void* EnsureQuantScratch(size_t need, hipStream_t s) {
     return block;
   });
 }
-
 enum class Q8KQuantArm : uint8_t { kLegacy = 0, kCandidate = 1 };
 enum class Q8KProductionRoute : uint8_t { kDense = 0, kGrouped = 1 };
 using Q8KArchResolver = std::string (*)(int) noexcept;
@@ -1223,6 +1471,11 @@ bool QuantWmmaEnabled() {
   return on;
 }
 
+// T4a dispatch-route counters. Incremented on the decode hot path; read by
+// the focused test's byte-equality gate through the quant scratch hook.
+std::atomic<long long> g_mmvq_route_baseline{0};
+std::atomic<long long> g_mmvq_route_gemv{0};
+std::atomic<long long> g_mmvq_route_fused{0};
 // VT_ROCM_Q6K_SMALL_PRIVATE=1 — the A/B arm for
 // [#2511](https://github.com/mudler/vllm.cpp/issues/2511). Every failing leg on
 // `gfx1151` ended inside `KQuantGemmK<OutT, 2>`, the Q6_K arm, with all three of
@@ -1246,8 +1499,8 @@ bool Q6KSmallPrivateEnabled() {
   return on;
 }
 
-}  // namespace
 
+}  // namespace
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
 // the single-warp `KQuantGemmK` the path has always had.
 //
@@ -1320,6 +1573,47 @@ void* Q8KSetKernelExecutionWitnessForTest(void* device_counts) {
   return previous;
 }
 
+// T4a testing hook: fill dst (device ptr, k/256 BlockQ8_K blocks for row a)
+// with the standalone-quantizer semantics (mode 0: the production
+// QuantizeQ8KK grid) or the fused-prologue semantics (mode 1: ONE block,
+// cooperative LDS phase then copy-out) so tests can assert BYTE equality
+// between the two on arbitrary — including tied-amax — inputs.
+namespace {
+__global__ void MmvqPrologueQuantForTestingK(BlockQ8_K* __restrict__ dst,
+                                             const void* __restrict__ a,
+                                             ActDT adt, int64_t nsb) {
+  extern __shared__ unsigned char vt_mmq_smem[];
+  BlockQ8_K* lds = reinterpret_cast<BlockQ8_K*>(vt_mmq_smem);
+  const int tid = static_cast<int>(threadIdx.y) * 32 +
+                  static_cast<int>(threadIdx.x);
+  for (int64_t sb = tid; sb < nsb; sb += 128)
+    QuantQ8KSBlock(lds[sb], a, adt, sb * kQK_K);
+  __syncthreads();
+  for (int64_t sb = tid; sb < nsb; sb += 128) dst[sb] = lds[sb];
+}
+}  // namespace
+void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
+                                bool fused_semantics) {
+  EnsureQueueDevice(q);
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  const int64_t k = a.shape[1], nsb = k / kQK_K;
+  if (a.shape[0] != 1 || k % kQK_K != 0)
+    throw std::runtime_error("vt rocom mmvq test hook: need one whole row");
+  if (!fused_semantics) {
+    QuantizeQ8KK<<<static_cast<unsigned>((nsb + 127) / 128), 128, 0, s>>>(
+        static_cast<BlockQ8_K*>(dst), a.data, ActDtOf(a.dtype), a.stride[0], 1,
+        nsb, nullptr);
+  } else {
+    MmvqPrologueQuantForTestingK<<<1, dim3(32, 4),
+                                   static_cast<size_t>(nsb) * sizeof(BlockQ8_K),
+                                   s>>>(static_cast<BlockQ8_K*>(dst), a.data,
+                                        ActDtOf(a.dtype), nsb);
+  }
+  Check(hipGetLastError(), "mmvq quant scratch hook");
+}
+
+
+
 void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   EnsureQueueDevice(q);
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
@@ -1336,6 +1630,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     QuantizeQ8_0K<<<static_cast<unsigned>((m * nb + 127) / 128), 128, 0, s>>>(
         qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nb);
     Check(hipGetLastError(), "q8_0 quant");
+    ++g_mmvq_route_baseline;
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     if (out.dtype == DType::kF32)
       Q8_0GemmK<float><<<static_cast<unsigned>(grid), block, 0, s>>>(static_cast<float*>(out.data), w, qact, m, n, nb);
@@ -1351,12 +1646,98 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
                                 : b.dtype == DType::kQ5_K ? sizeof(BlockQ5_K)
                                                           : sizeof(BlockQ4_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
+    const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
+    // T4a MMVQ-style decode GEMV arm (VT_GEMV_MMVQ=1, default OFF; m==1
+    // only). Flag read PER CALL (the CUDA sibling's convention,
+    // cuda_quant_dot.cu:1006) so in-process tests and a captured decode
+    // graph pick the arm up at launch/capture time. The baseline path below
+    // is untouched when the flag is absent.
+    // REPAIR-ROUND GATE FIX: the m==1 restriction must gate the WHOLE arm,
+    // not just the LDS fold. The first round gated only `gemv_fused`, so
+    // multi-row calls (the engine's m=39 PREFILL chunks) fell into the
+    // non-fused GEMV branch, whose kernels write row 0 only — rows 1..m-1
+    // of the output were left UNWRITTEN (stale memory) while every op-level
+    // test (all m==1) stayed green: the exact op-green/engine-garbage
+    // pattern of round 1, red-proven by the MULTI-M byte-identity case in
+    // tests/vt/test_rocm_quant_dot.cpp (canary-filled outputs).
+    const char* mmvq_e = std::getenv("VT_GEMV_MMVQ");
+    const bool gemv_mmvq =
+        mmvq_e != nullptr && mmvq_e[0] == '1' && mmvq_e[1] == '\0' &&
+        m == 1;
+    constexpr size_t kMmvqFoldLdsBytes = 32 * 1024;
+    // The fold trades the standalone quant launch for a PER-BLOCK redundant
+    // requant of the activation row, so its cost grows with the block count
+    // (n/4) while the launch it deletes costs a fixed few us. Measured
+    // crossover on gfx1100 at this model's shapes: fold WINS at n=320
+    // (grid 80: 135us vs 148us) and LOSES by n=2304 (grid 576: 159us vs
+    // 123us); at the lm_head class the fused arm ran 2.2-3.3x SLOWER than
+    // baseline while the non-fused arm runs 0.46-0.61x. Gate the fold to
+    // small rows only; everything else takes standalone quant + GEMV.
+    constexpr int64_t kMmvqFoldMaxRows = 512;
+    const bool gemv_fused =
+        gemv_mmvq && m == 1 && n <= kMmvqFoldMaxRows &&
+        static_cast<size_t>(nsb) * sizeof(BlockQ8_K) <= kMmvqFoldLdsBytes;
+
+    auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
+      using OutT = decltype(ot);
+      auto* o = static_cast<OutT*>(out.data);
+      constexpr int kGemvWarps = 4;
+      const int64_t ggrid = (n + kGemvWarps - 1) / kGemvWarps;
+      dim3 gblock(32, kGemvWarps);
+      if (gemv_fused) {
+        const size_t lds_bytes = static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
+      ++g_mmvq_route_fused;
+        if (fmt == 2)
+          KQuantGemvMmvqFusedK<OutT, 2><<<static_cast<unsigned>(ggrid), gblock,
+                                         lds_bytes, s>>>(
+              o, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqFusedK<OutT, 1><<<static_cast<unsigned>(ggrid), gblock,
+                                         lds_bytes, s>>>(
+              o, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
+        else
+          KQuantGemvMmvqFusedK<OutT, 0><<<static_cast<unsigned>(ggrid), gblock,
+                                         lds_bytes, s>>>(
+              o, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
+      } else {
+        if (fmt == 2)
+          KQuantGemvMmvqK<OutT, 2><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              o, w, qact, n, nsb, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqK<OutT, 1><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              o, w, qact, n, nsb, w_block_bytes);
+        else
+          KQuantGemvMmvqK<OutT, 0><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              o, w, qact, n, nsb, w_block_bytes);
+      }
+    };
+
+    // FUSED arm: no standalone quant launch, no scratch — the GEMV blocks
+    // quantize the row into their own LDS via the SHARED QuantQ8KSBlock body
+    // (byte-identical to QuantizeQ8KK's output; asserted by the focused test).
+    if (gemv_fused) {
+      if (out.dtype == DType::kF32) launch_mvq(float{}, nullptr);
+      else launch_mvq(uint16_t{}, nullptr);
+      Check(hipGetLastError(), "K-quant gemv mmvq fused");
+      return;
+    }
+
     BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
         static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
     LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb, s,
                        Q8KProductionRoute::kDense, q.device.index);
+    Check(hipGetLastError(), "q8_K quant");
+
+    if (gemv_mmvq) {  // non-fused arm (nsb too large for the LDS fold)
+      ++g_mmvq_route_gemv;
+      if (out.dtype == DType::kF32) launch_mvq(float{}, qact);
+      else launch_mvq(uint16_t{}, qact);
+      Check(hipGetLastError(), "K-quant gemv mmvq");
+      return;
+    }
+
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
+    // fmt already declared above (line 1649) for the MMVQ arm — reused by the WMMA/cooperative arms below.
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
     // RDNA4 WMMA tile arm: Q6_K and Q4_K prefill only (m > 1, since
     // KQuantDecodeCoopWarps above already owns m == 1). Q5_K is `## Owed` —
@@ -1446,7 +1827,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     Check(hipGetLastError(), "K-quant gemm");
     return;
   }
-  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ3_S/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
+  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
 }
 
 
@@ -1500,6 +1881,7 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
         static_cast<size_t>(Pa) * nsb * sizeof(BlockQ8_K), s));
     LaunchQ8KQuantizer(qact, act.data, ActDtOf(act.dtype), act.stride[0], Pa, nsb, s,
                        Q8KProductionRoute::kGrouped, q.device.index);
+    Check(hipGetLastError(), "q8_K quant");
     const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = weight.dtype == DType::kQ6_K ? 2 : weight.dtype == DType::kQ5_K ? 1 : 0;
     auto launch = [&](auto ot) {

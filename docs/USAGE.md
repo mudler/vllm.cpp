@@ -362,6 +362,206 @@ which names several speculators in preference order. It is parsed and checked
 today and **refused at startup**, because nothing resolves a chain yet; the same
 page says what the document looks like and what each rule refuses.
 
+## Reuse the NVFP4 tactic draw between runs
+
+An NVFP4 W4A4 model runs its general matrix multiplications through CUTLASS, and
+the engine picks one tactic for each matrix shape. The first run on a device
+times every candidate tactic for a shape and keeps the fastest. The engine
+writes the winners to a JSON document, and a later run on the same device and
+the same build reads that document instead of timing again.
+
+Read this cache as a reproducibility and warmup control, not as a speed feature.
+The measured steady-state component of a frozen plan map on the GB10 lane is
+1.0045x at concurrency 2 and 1.0050x at concurrency 16, and the strict component
+result FAILED at 39 of 40 timing axes and 1 of 8 memory axes. [The row
+spec](../.agents/specs/nvfp4-persistent-plan-cache.md) records that run. What
+the cache gives you is that two runs of the same binary on the same device start
+from the same kernel plan, and that a run which loaded a document does not pay a
+tuning pass. A throughput claim beyond that needs its own measurement.
+
+The cache covers one process on one device. Tensor parallelism above one rank
+is out of scope for it, and [the row
+spec](../.agents/specs/nvfp4-persistent-plan-cache.md) records why.
+
+### The cache is on by default
+
+`VT_FP4_PERSISTENT_CACHE` defaults to on. The engine reads a document if one
+matches, tunes the shapes that are missing, and writes the merged result back at
+the end of the warmup. Set the variable to `0`, `false`, or `off` to keep the
+tuning in memory and write nothing. The engine refuses any other value at
+startup with `invalid boolean value for VT_FP4_PERSISTENT_CACHE`.
+
+Without a path override, the document lands under `$XDG_CACHE_HOME`, or under
+`$HOME/.cache` when `XDG_CACHE_HOME` is unset. The path names every input that
+the document is valid for:
+
+```text
+<root>/vllm.cpp/nvfp4_autotune/vllm.cpp_nvfp4_autotune_v1/sm_<architecture>/
+  device_<ordinal>-gpu_<device name>/
+  cuda_<runtime version>-driver_<driver version>/
+  cutlass_<version>/
+  tactics_<descriptor digest>-set_<tactic set version>/
+  dtype_<output dtype>-id_<dtype id>-fp4_<fp4 layout>-sf_<scale layout>/
+  timing_w<warmups>-r<repeats>-d<delay microseconds>-bucket_<bucket version>/
+  build_<tactic ABI digest>/autotune_configs.json
+```
+
+That is one path. The example wraps it for reading, and the indentation is not
+part of it. Every character outside `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`
+becomes `_` in a path component, so a device name such as `NVIDIA GB10` reads as
+`NVIDIA_GB10`.
+
+If `XDG_CACHE_HOME` and `HOME` are both unset, the engine has no cache root. It
+then turns the cache off for that run and tunes in memory. In read-only mode,
+with no imported document, the same condition is refused with
+`read-only NVFP4 cache requested without a cache path/root`.
+
+These are the variables that control the cache:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VT_FP4_PERSISTENT_CACHE` | on | Off turns the persistent document off for the run. Takes `1`, `true`, `on`, `0`, `false`, or `off` |
+| `VT_FP4_AUTOTUNE_CACHE_PATH` | None | Names the native document file and replaces the derived path |
+| `VT_FP4_FLASHINFER_CACHE_PATH` | None | Imports a FlashInfer `autotune_configs.json` before the native document loads |
+| `VT_FP4_AUTOTUNE_CACHE_READONLY` | off | Loads plans, tunes nothing, and writes nothing. A missing plan is refused |
+| `VT_FP4_AUTOTUNE_DELAY_US` | `5000` | Idle microseconds before the timed repeats of one candidate. Maximum `1000000` |
+| `VT_FP4_AUTOTUNE_VERBOSE` | off | Prints one `[VT_FP4_AUTOTUNE]` line for each tactic the engine times |
+
+The timing recipe is FlashInfer's. For each candidate tactic the engine runs 3
+warmup launches, synchronizes the stream, holds it idle for 5,000 microseconds,
+and then takes the mean of 10 event-timed launches.
+`VT_FP4_AUTOTUNE_DELAY_US` changes that idle time, and it also changes the cache
+path, because the recipe is part of the document identity. The value `0` removes
+the delay and keeps the no-delay diagnostic arm.
+
+### Import an existing FlashInfer cache
+
+If you already ran vLLM with the FlashInfer autotuner on the same box, point the
+engine at the file that run produced:
+
+```sh
+VT_FP4_FLASHINFER_CACHE_PATH=$HOME/.cache/vllm/flashinfer_autotune_cache/0.6.13/121a/<config hash>/autotune_configs.json \
+build/examples/vllm-server --model /path/to/nvfp4-model
+```
+
+The import reads the file and never writes to it. The engine installs the
+imported plans before it reads the native document, so an imported plan wins
+over a native one for the same shape.
+
+The import is strict, and a failed import stops the load rather than falling
+back. The file's `_metadata` object must declare FlashInfer version `0.6.13`,
+cuBLAS version `13.1.0`, cuDNN version `91900`, and cuDNN frontend version
+`1.26.0`. Its `cuda_version` must equal the running CUDA runtime version, and
+its `gpu` must equal the running device name. The literal value `*` in any one of
+those six fields matches anything. The engine reads only the entries whose key
+starts with `('fp4_gemm'` and whose value is the pair
+`["CutlassFp4GemmRunner", <tactic id>]`. It counts and ignores every other
+entry, and it refuses a duplicate `fp4_gemm` key.
+
+### Freeze a draw for a benchmark run
+
+Tuning re-times the candidates in every fresh process, and CUTLASS reduction
+order follows the tactic. Two runs that each tuned for themselves can therefore
+select different tactics and produce different token ids for the same prompt.
+Freeze the draw so that tactic selection is not a variable in your measurement:
+
+```sh
+VT_FP4_AUTOTUNE_CACHE_READONLY=1 \
+build/examples/vllm-server --model /path/to/nvfp4-model
+```
+
+In this mode the engine loads the document, tunes nothing, and writes nothing.
+A shape with no plan in the document is refused before the server is ready, with
+`NVFP4 frozen persistent cache miss before readiness:` and the M bucket, N, K,
+device ordinal, and streaming multiprocessor architecture that missed. Take one
+normal read-write run first, so the document covers the shapes your workload
+uses, then freeze it.
+
+The tree ships no measured draw, so a fresh checkout tunes its first run.
+[Issue #2752](https://github.com/mudler/vllm.cpp/issues/2752) owes a pinned GB10
+draw and its install step.
+
+### Confirm the cache was used
+
+The engine prints two `[VT_FP4_CACHE]` lines on stderr. The first reports what it
+resolved, before it serves:
+
+```text
+[VT_FP4_CACHE] prepared mode=read-write native=<path> flashinfer=<path> loaded=64 (flashinfer=0 native=64) rejected=0 delay_us=5000 metadata=<fingerprint> selected=64
+```
+
+The second reports what it published, after the warmup, and one
+`[VT_FP4_CACHE] selected M=<bucket> N=<n> K=<k> tactic=<id>` line follows it for
+each plan in the map:
+
+```text
+[VT_FP4_CACHE] complete mode=read-write loaded=64 tuned=0 rejected=0 saved=64 selected=64 metadata=<fingerprint>
+```
+
+Read the fields as follows:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `read-write` is the default, `read-only` is the frozen mode, and `disabled` means the cache was off. `read-write-native-rejected` and `read-only-native-rejected` mean the document did not match. `read-write-save-failed` means the write did not happen |
+| `native` | The resolved native document path. Empty when no path resolved |
+| `flashinfer` | The imported FlashInfer file. Empty when you set no import path |
+| `loaded` | Plans installed from a document, split into the FlashInfer and native counts |
+| `rejected` | Documents refused for a metadata mismatch, not plans |
+| `delay_us` | The resolved tuning delay, which is part of the document identity |
+| `metadata` | A 16-digit hexadecimal fingerprint of the resolved identity. Two runs that print the same value agree on every keyed input |
+| `selected` | Plans in the live map at that moment |
+| `tuned` | Shapes this process timed itself |
+| `saved` | Plans written to the native document |
+
+A run that reused a document prints `loaded` equal to `selected` and `tuned=0`.
+A run that tuned prints `loaded=0` and a non-zero `tuned`. A `rejected=1` with a
+non-zero `tuned` means the engine found a document, refused it, and tuned
+instead.
+
+Two other lines report a problem by name. A refused native document prints
+`[VT_FP4_CACHE] rejected native cache path=<path> error=<reason>` and names what
+the engine did next. A shape that misses after the pre-serve warmup prints
+`[VT_FP4_AUTOTUNE] lazy-miss after pre-serve warmup` with the shape, which means
+your workload reached a shape the warmup did not cover.
+
+### What invalidates a document
+
+The path carries the identity, and the document repeats it in a `_metadata`
+object. The engine compares the two and refuses a document that does not
+describe the running configuration, rather than serving plans that were measured
+somewhere else. A change to any of these values gives a different path and
+leaves the old document in place, unread:
+
+- the streaming multiprocessor architecture, the device name, and the device
+  ordinal
+- the CUDA runtime version and the CUDA driver version
+- the CUTLASS version
+- the tactic descriptor digest and the tactic set version
+- the output dtype, the FP4 layout, and the scale layout
+- the timing recipe, which is the warmup count, the repeat count, the delay in
+  microseconds, and the M bucket version
+- the tactic ABI digest, which is a SHA-256 over the CUTLASS version and the
+  tactic source files
+
+A rebuild that changes no tactic source keeps the same tactic ABI digest, so an
+ordinary rebuild does not invalidate your cache. A driver update does, and so
+does moving the same file to a second GPU.
+
+In the default read-write mode, a refused native document is not fatal. The
+engine tunes the run, and it does not overwrite the file it could not read. In
+read-only mode with no imported file, a refused document stops the load.
+
+### Tune every shape before the first request
+
+By default the engine tunes the whole hybrid profile set before it serves, using
+one internal greedy request of `max_num_batched_tokens` tokens. This moves the
+tuning cost out of your first real request. It runs only when the model is NVFP4
+W4A4, the device is a CUDA device of compute capability 10.0 to 12.9, and none
+of `VT_FP4_PRE_SERVE_WARMUP`, `VT_FP4_AUTOTUNE`, and `VT_FP4_PLAN_CACHE` is set
+to a value that starts with `0`. Each of the three defaults to on when it is
+unset. Setting any one of them to `0` turns the pre-serve warmup off and moves
+the tuning back into the first requests that meet each shape.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in

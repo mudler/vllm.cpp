@@ -51,12 +51,19 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
 #include <string>
+
+#include "vt/cpu/cpu_quant_blocks.h"
+#include "vt/rocm/rocm_act_quant.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 
 namespace vt::rocm {
+
+using vt::cpu::kQK_K;
 namespace {
 
 // Block width, from cuda_ops.cu:24. Kept at 256 rather than raised to a multiple
@@ -109,9 +116,17 @@ __device__ inline float ResRound<__hip_bfloat16>(float v) {
 // (cuda_ops.cu `RmsNormRowKernel`). `Load()` is overloaded for every gamma element
 // type below, so the body is unchanged and its f32 arithmetic is bit-identical for
 // every pairing that already worked.
+// Lever C: `q8_out` (nullptr on every pre-existing path) turns the kernel into
+// a PRODUCER of Q8_K activation scratch: after the output row is stored, one
+// thread per 256-wide superblock requantizes the STORED bf16/f32 row through
+// the SAME shared QuantQ8KSBlock body the standalone QuantizeQ8KK uses, so
+// the scratch is byte-identical to the standalone path by construction
+// (asserted in tests/vt/test_rocm_quant_dot.cpp). Requires nsb <= kBlock: one
+// thread per superblock within this single-row block.
 template <typename Tin, typename Tw, typename Tout, typename Tres>
 __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual, int64_t h,
-                                 float eps, bool gemma) {
+                                 float eps, bool gemma, vt::cpu::BlockQ8_K* q8_out, int nsb,
+                                 ActDT q8_adt) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
   Tout* orow = out + row * h;
@@ -140,20 +155,48 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* res
     if (gemma) wj += 1.0f;
     Store(orow, j, v * inv * wj);
   }
+  if (q8_out != nullptr) {
+    // Barrier first: the epilogue reads the WHOLE stored row (written by all
+    // 256 threads) back from global memory, exactly as the standalone
+    // QuantizeQ8KK would -- same bytes, same serial per-superblock walk, so
+    // the amax first-occurrence tie-break and every scale bit match.
+    __syncthreads();
+    const int sb = static_cast<int>(threadIdx.x);
+    if (sb < nsb)
+      QuantQ8KSBlock(q8_out[static_cast<int64_t>(row) * nsb + sb], orow, q8_adt,
+                     static_cast<int64_t>(sb) * kQK_K);
+  }
 }
 
 template <typename Tin, typename Tw, typename Tout>
 void LaunchRmsNormRes(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                      const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h) {
+                      const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h,
+                      vt::cpu::BlockQ8_K* q8_out) {
+  const int nsb = q8_out != nullptr ? static_cast<int>(h / kQK_K) : 0;
   if (residual != nullptr && residual->dtype == DType::kBF16) {
     RmsNormRowKernel<Tin, Tw, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__hip_bfloat16>(), h, args.eps,
-        args.gemma);
+        args.gemma, q8_out, nsb, ActDtOf(out.dtype));
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
     RmsNormRowKernel<Tin, Tw, Tout, float><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma);
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma, q8_out,
+        nsb, ActDtOf(out.dtype));
   }
+}
+
+// Lever C opt-in gate: VT_NORM_QUANT_FUSED=1 (read PER CALL like the sibling
+// arms' flags so in-process tests and graph capture pick it up at dispatch
+// time), dense rows, whole Q8_K superblocks, and at most one thread's worth of
+// superblocks per row. Default OFF leaves every path byte-unchanged.
+vt::cpu::BlockQ8_K* NormQuantEpilogueFor(int64_t rows, int64_t h, hipStream_t s,
+                                         size_t* scratch_bytes) {
+  const char* e = std::getenv("VT_NORM_QUANT_FUSED");
+  if (e == nullptr || e[0] != '1' || e[1] != '\0') return nullptr;
+  if (rows <= 0 || h % kQK_K != 0 || h / kQK_K > kBlock) return nullptr;
+  *scratch_bytes = static_cast<size_t>(rows) * static_cast<size_t>(h / kQK_K) *
+                   sizeof(vt::cpu::BlockQ8_K);
+  return static_cast<vt::cpu::BlockQ8_K*>(NormQuantProducerScratch(*scratch_bytes, s));
 }
 
 template <typename Tin, typename Tw>
@@ -162,15 +205,21 @@ void LaunchRmsNorm(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
+  size_t q8_bytes = 0;
+  vt::cpu::BlockQ8_K* q8_out =
+      NormQuantEpilogueFor(t, h, s, &q8_bytes);  // nullptr unless opt-in flag
   switch (out.dtype) {
     case DType::kF32:
-      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h, q8_out);
       break;
     case DType::kBF16:
-      LaunchRmsNormRes<Tin, Tw, __hip_bfloat16>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, __hip_bfloat16>(s, out, x, w, args, residual, rows, h, q8_out);
       break;
     default:
       VT_CHECK(false, "rocm rmsnorm: unsupported out dtype (f32/bf16 only)");
+  }
+  if (q8_out != nullptr) {
+    NormQuantRecordProducer(out.data, t, h, /*row_stride=*/h, out.dtype, q8_out, s);
   }
 }
 

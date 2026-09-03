@@ -53,6 +53,35 @@ using vt::Tensor;
 namespace vt::rocm {
 void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
                                 bool fused_semantics);
+
+// T4a REPAIR-ROUND-2 routing witness (review findings F1/F2): the HOST-side
+// dispatch counters exposed by rocm_grouped_gemm.hip. ON and OFF arms are
+// BIT-EQUAL on outputs by design, so no output comparison can witness which
+// dispatch branch a call took -- these integer counters can.
+struct MmvqRouteCounts {
+  long long baseline;    // KQuantGemmK warp-reduction dispatches
+  long long gemv_mmvq;   // non-fused MMVQ GEMV dispatches (standalone quant)
+  long long gemv_fused;  // fused-fold sub-branch dispatches
+};
+// Lever C (GFX1100-TG200-NORMQ): producer-fused Q8_K norm-epilogue witnesses.
+// The RmsNormRowKernel producer emits the row's Q8_K blocks alongside its
+// normal output under VT_NORM_QUANT_FUSED=1 and records a producer token;
+// MatmulBTQuant's K-quant branch SKIPS the standalone QuantizeQ8KK when the
+// consuming activation matches that token. These counters make the ROUTE
+// observable (outputs are bit-equal either way by contract).
+struct NormQuantCounts {
+  long long producers;            // epilogue-enabled RmsNorm dispatches
+  long long consumers_fused;      // K-quant matvec dispatches that skipped the standalone quant
+  long long consumers_standalone; // K-quant matvec dispatches that launched QuantizeQ8KK
+};
+NormQuantCounts NormQuantCountsForTesting();
+void NormQuantResetForTesting();
+// Device pointer of the Q8_K scratch written by the LAST producer-fused
+// RmsNorm dispatch (rows * (h/256) BlockQ8_K blocks) -- lets tests assert the
+// epilogue bytes are IDENTICAL to the standalone quantizer's.
+const void* NormQuantLastScratchForTesting();
+MmvqRouteCounts MmvqRouteCountsForTesting();
+void MmvqResetRouteCountsForTesting();
 }  // namespace vt::rocm
 
 namespace {
@@ -837,5 +866,468 @@ TEST_CASE("T4a repair: per-grid OFF-vs-ON timing at the operator's captured grid
     gpu.Free(d_a);
     gpu.Free(d_o);
   }
+  gpu.DestroyQueue(gq);
+}
+
+// ---------------------------------------------------------------------------
+// T4a REPAIR ROUND 2 (reviewer findings F1/F2). The round-1 gate could not
+// witness ROUTING: EnvGuard(false) writes "0" (never a true unset), and since
+// ON==OFF are bit-equal by design, every output comparison is blind to which
+// dispatch branch ran. These two cases pin routing itself via the host-side
+// dispatch counters.
+
+// F1: with VT_GEMV_MMVQ TRULY ABSENT (unsetenv, not "0") the call must take
+// the BASELINE branch; with VT_GEMV_MMVQ=1 it must NOT. Catches an inverted
+// getenv default (mutation M3) that outputs cannot see.
+TEST_CASE("T4a repair-2 F1: ROUTING WITNESS -- env truly unset routes to BASELINE; ON routes to the GEMV arm") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase& c = kKQuantCases[0];  // q4_K
+  const int64_t nsb = 10, k = nsb * c.block_elems, n = 7;
+  std::vector<uint8_t> wq = RandomBlocks(c, n * nsb, 0x5EEDU);
+  std::vector<float> a(static_cast<size_t>(k));
+  GenerateData(1.5F, a.size(), a.data());
+
+  void* d_a = gpu.Alloc(a.size() * sizeof(float));
+  void* d_w = gpu.Alloc(wq.size());
+  void* d_o = gpu.Alloc(sizeof(float) * static_cast<size_t>(n));
+  gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+  gpu.Copy(gq, d_w, wq.data(), wq.size());
+
+  auto run_once = [&] {
+    Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+    Tensor bt = DevTensor(d_w, c.dtype, {n, k});
+    Tensor ot = DevTensor(d_o, DType::kF32, {1, n});
+    vt::MatmulBTQuant(gq, ot, at, bt);
+    gpu.Synchronize(gq);
+  };
+
+  // TRUE unset: the flag string must be absent from the environment -- NOT
+  // EnvGuard(false), which sets "0". Default-OFF inertness means the
+  // BASELINE counter advances and no GEMV counter moves.
+  ::unsetenv("VT_GEMV_MMVQ");
+  vt::rocm::MmvqResetRouteCountsForTesting();
+  run_once();
+  const auto off_counts = vt::rocm::MmvqRouteCountsForTesting();
+  CHECK(off_counts.baseline == 1);
+  CHECK(off_counts.gemv_mmvq == 0);
+  CHECK(off_counts.gemv_fused == 0);
+
+  // Paired ON case: exactly the reverse. n=7 <= kMmvqFoldMaxRows, so the
+  // arm engages via its FUSED sub-branch; either way the baseline counter
+  // must not move.
+  {
+    EnvGuard on(true);
+    vt::rocm::MmvqResetRouteCountsForTesting();
+    run_once();
+    const auto on_counts = vt::rocm::MmvqRouteCountsForTesting();
+    CHECK(on_counts.baseline == 0);
+    CHECK(on_counts.gemv_fused == 1);
+    CHECK(on_counts.gemv_mmvq == 0);
+  }
+  ::unsetenv("VT_GEMV_MMVQ");
+  gpu.Free(d_a);
+  gpu.Free(d_w);
+  gpu.Free(d_o);
+  gpu.DestroyQueue(gq);
+}
+
+// F2: fold-crossover WITNESS. With the arm ON, n=256 (<= kMmvqFoldMaxRows)
+// must dispatch through the FUSED sub-branch and n=2304 (> 512, within the
+// reviewer's mutated range (512,4096]) must dispatch through the NON-FUSED
+// GEMV branch. Catches a kMmvqFoldMaxRows drift (mutation M4: 512 -> 4096)
+// that flips measured per-call ratios while staying output-green.
+TEST_CASE("T4a repair-2 F2: FOLD-CROSSOVER WITNESS -- fused sub-branch only at n <= kMmvqFoldMaxRows") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase& c = kKQuantCases[0];  // q4_K
+  const int64_t nsb = 10, k = nsb * c.block_elems;
+
+  struct FoldShape { const char* name; int64_t n; long long want_fused, want_gemv, want_baseline; };
+  const FoldShape shapes[] = {
+      {"n=256  (fold expected)", 256, 1, 0, 0},
+      {"n=2304 (fold NOT expected)", 2304, 0, 1, 0},
+  };
+  for (const FoldShape& sc : shapes) {
+    CAPTURE(sc.name);
+    std::vector<uint8_t> wq = RandomBlocks(c, sc.n * nsb, 0x5EEDU);
+    std::vector<float> a(static_cast<size_t>(k));
+    GenerateData(2.5F, a.size(), a.data());
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_w = gpu.Alloc(wq.size());
+    void* d_o = gpu.Alloc(sizeof(float) * static_cast<size_t>(sc.n));
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_w, wq.data(), wq.size());
+    {
+      EnvGuard on(true);
+      vt::rocm::MmvqResetRouteCountsForTesting();
+      Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+      Tensor bt = DevTensor(d_w, c.dtype, {sc.n, k});
+      Tensor ot = DevTensor(d_o, DType::kF32, {1, sc.n});
+      vt::MatmulBTQuant(gq, ot, at, bt);
+      gpu.Synchronize(gq);
+      const auto counts = vt::rocm::MmvqRouteCountsForTesting();
+      CHECK(counts.gemv_fused == sc.want_fused);
+      CHECK(counts.gemv_mmvq == sc.want_gemv);
+      CHECK(counts.baseline == sc.want_baseline);
+    }
+    ::unsetenv("VT_GEMV_MMVQ");
+    gpu.Free(d_a);
+    gpu.Free(d_w);
+    gpu.Free(d_o);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// F3 (lever B1, GFX1100-TG200): the fold crossover becomes RUNTIME-TUNABLE
+// via VT_GEMV_MMVQ_FOLD_MAX (integer rows; default = kMmvqFoldMaxRowsDefault
+// = 512; invalid/empty = default). The suite constants above keep pinning
+// DEFAULT behavior; THIS case asserts the env actually moves ROUTING via the
+// same host-side dispatch counters:
+//   - unset  : n=256 folds, n=2304 does NOT   (default pinned)
+//   - "4096" : n=2304 FOLDS                   (knob widens the gate)  [RED pre-knob: env inert]
+//   - "128"  : n=256 does NOT fold            (knob narrows the gate) [RED pre-knob: env inert]
+//   - "256"  : n=256 still folds              (boundary is INCLUSIVE <=)
+//   - garbage: behaves exactly like unset     (invalid falls back to default)
+// RED-first contract: before the knob exists VT_GEMV_MMVQ_FOLD_MAX is
+// inert, so the "4096" and "128" legs fail while routing stays at defaults.
+namespace {
+struct FoldMaxGuard {
+  explicit FoldMaxGuard(const char* v) {
+    if (v != nullptr) ::setenv("VT_GEMV_MMVQ_FOLD_MAX", v, 1);
+    else ::unsetenv("VT_GEMV_MMVQ_FOLD_MAX");
+  }
+  ~FoldMaxGuard() { ::unsetenv("VT_GEMV_MMVQ_FOLD_MAX"); }
+};
+}  // namespace
+
+TEST_CASE("T4a lever-B1 F3: FOLD-MAX KNOB WITNESS -- VT_GEMV_MMVQ_FOLD_MAX moves routing at runtime; invalid values fall back to the default") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase& c = kKQuantCases[0];  // q4_K
+  const int64_t nsb = 10, k = nsb * c.block_elems;
+
+  struct Leg { const char* name; const char* fold_max; int64_t n;
+               long long want_fused, want_gemv, want_baseline; };
+  const Leg legs[] = {
+      {"unset    n=256  (default pins fold)",       nullptr,        256,  1, 0, 0},
+      {"unset    n=2304 (default pins non-fused)",  nullptr,        2304, 0, 1, 0},
+      {"4096     n=2304 (knob WIDENS -> fold)",     "4096",         2304, 1, 0, 0},
+      {"128      n=256  (knob NARROWS -> gemv)",    "128",          256,  0, 1, 0},
+      {"256      n=256  (boundary is inclusive)",   "256",          256,  1, 0, 0},
+      {"garbage  n=256  (invalid -> default fold)", "not-a-number", 256,  1, 0, 0},
+      {"garbage  n=2304 (invalid -> default gemv)", "not-a-number", 2304, 0, 1, 0},
+  };
+  for (const Leg& sc : legs) {
+    CAPTURE(sc.name);
+    std::vector<uint8_t> wq = RandomBlocks(c, sc.n * nsb, 0x5EEDU);
+    std::vector<float> a(static_cast<size_t>(k));
+    GenerateData(2.5F, a.size(), a.data());
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_w = gpu.Alloc(wq.size());
+    void* d_o = gpu.Alloc(sizeof(float) * static_cast<size_t>(sc.n));
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_w, wq.data(), wq.size());
+    {
+      EnvGuard on(true);
+      FoldMaxGuard fm(sc.fold_max);
+      vt::rocm::MmvqResetRouteCountsForTesting();
+      Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+      Tensor bt = DevTensor(d_w, c.dtype, {sc.n, k});
+      Tensor ot = DevTensor(d_o, DType::kF32, {1, sc.n});
+      vt::MatmulBTQuant(gq, ot, at, bt);
+      gpu.Synchronize(gq);
+      const auto counts = vt::rocm::MmvqRouteCountsForTesting();
+      CHECK(counts.gemv_fused == sc.want_fused);
+      CHECK(counts.gemv_mmvq == sc.want_gemv);
+      CHECK(counts.baseline == sc.want_baseline);
+    }
+    ::unsetenv("VT_GEMV_MMVQ_FOLD_MAX");
+    ::unsetenv("VT_GEMV_MMVQ");
+    gpu.Free(d_a);
+    gpu.Free(d_w);
+    gpu.Free(d_o);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// --- Lever C (GFX1100-TG200-NORMQ): producer-fused Q8_K norm epilogue -------
+//
+// RED-FIRST contract: before the epilogue exists VT_NORM_QUANT_FUSED=1 is
+// inert, so the ON-leg witness expectations (producers>=1, standalone skipped)
+// FAIL while the OFF leg trivially holds; the scratch byte-equality case also
+// fails because NormQuantLastScratchForTesting() has no producer to observe.
+namespace {
+
+struct EnvNormQuantGuard {
+  explicit EnvNormQuantGuard(bool on) {
+    ::setenv("VT_NORM_QUANT_FUSED", on ? "1" : "0", 1);
+  }
+  ~EnvNormQuantGuard() { ::unsetenv("VT_NORM_QUANT_FUSED"); }
+};
+
+std::vector<unsigned char> RunNormQuantChain(Backend& gpu, Queue& gq,
+                                             void* d_x, void* d_nw, void* d_w,
+                                             void* d_o, int64_t k, int64_t n) {
+  std::vector<unsigned char> out_raw(sizeof(uint16_t) * static_cast<size_t>(n));
+  Tensor xt = DevTensor(d_x, DType::kBF16, {1, k});
+  Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
+  void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
+  Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
+  vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
+  Tensor bt = DevTensor(d_w, DType::kQ4_K, {n, k});
+  Tensor oo = DevTensor(d_o, DType::kBF16, {1, n});
+  vt::MatmulBTQuant(gq, oo, nout, bt);
+  gpu.Copy(gq, out_raw.data(), d_o, out_raw.size());
+  gpu.Synchronize(gq);
+  gpu.Free(d_norm);
+  return out_raw;
+}
+
+}  // namespace
+
+TEST_CASE("Lever C red: VT_NORM_QUANT_FUSED=1 routes norm-produced activations through the fused epilogue (counter witnesses + byte identity)") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const int64_t k = 10 * 256, n = 64;
+  // weight blocks for a Q4_K [n,k] matvec
+  std::vector<uint8_t> wq = RandomBlocks(kKQuantCases[0], n * 10, 0xC0FFEEU);
+  // bf16 activation row (the engine's dtype on this path)
+  std::vector<float> af(static_cast<size_t>(k));
+  GenerateData(0.75F, af.size(), af.data());
+  std::vector<uint16_t> abf(af.size());
+  for (size_t i = 0; i < af.size(); ++i) abf[i] = vt::F32ToBF16(af[i]);
+  // bf16 norm weight
+  std::vector<uint16_t> nw(static_cast<size_t>(k));
+  std::mt19937 rng(7U);
+  for (uint16_t& v : nw) v = vt::F32ToBF16(0.5F + static_cast<float>(rng() % 100) / 200.0F);
+
+  void* d_a = gpu.Alloc(abf.size() * 2);
+  void* d_nw = gpu.Alloc(nw.size() * 2);
+  void* d_w = gpu.Alloc(wq.size());
+  void* d_o = gpu.Alloc(2 * static_cast<size_t>(n));
+  gpu.Copy(gq, d_a, abf.data(), abf.size() * 2);
+  gpu.Copy(gq, d_nw, nw.data(), nw.size() * 2);
+  gpu.Copy(gq, d_w, wq.data(), wq.size());
+
+  // OFF leg: flag absent -> no producer epilogue, standalone quant runs.
+  std::vector<unsigned char> off_raw;
+  {
+    vt::rocm::NormQuantResetForTesting();
+    off_raw = RunNormQuantChain(gpu, gq, d_a, d_nw, d_w, d_o, k, n);
+    const auto c = vt::rocm::NormQuantCountsForTesting();
+    CHECK(c.producers == 0);
+    CHECK(c.consumers_fused == 0);
+    CHECK(c.consumers_standalone == 1);
+  }
+  // ON leg: epilogue fires, the consumer SKIPS the standalone quant, and a
+  // second consumer of the SAME activation (the attn q/k/v pattern: three
+  // matvecs re-quantizing one normalized row) skips too. Outputs must stay
+  // byte-identical to the OFF arm.
+  {
+    EnvNormQuantGuard on(true);
+    vt::rocm::NormQuantResetForTesting();
+    // run the chain twice manually to keep the same normalized buffer alive
+    // across two consumers
+    Tensor xt = DevTensor(d_a, DType::kBF16, {1, k});
+    Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
+    void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
+    Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
+    vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
+    Tensor bt = DevTensor(d_w, DType::kQ4_K, {n, k});
+    std::vector<unsigned char> on_raw(sizeof(uint16_t) * static_cast<size_t>(n));
+    for (int consumer = 0; consumer < 2; ++consumer) {
+      Tensor oo = DevTensor(d_o, DType::kBF16, {1, n});
+      vt::MatmulBTQuant(gq, oo, nout, bt);
+      gpu.Copy(gq, on_raw.data(), d_o, on_raw.size());
+      gpu.Synchronize(gq);
+    }
+    gpu.Free(d_norm);
+    const auto c = vt::rocm::NormQuantCountsForTesting();
+    CHECK(c.producers == 1);
+    CHECK(c.consumers_fused == 2);
+    CHECK(c.consumers_standalone == 0);
+    CHECK(std::memcmp(on_raw.data(), off_raw.data(), on_raw.size()) == 0);
+  }
+  gpu.Free(d_a); gpu.Free(d_nw); gpu.Free(d_w); gpu.Free(d_o);
+  gpu.DestroyQueue(gq);
+}
+
+TEST_CASE("Lever C: fused norm-epilogue Q8_K scratch is BYTE-IDENTICAL to the standalone QuantizeQ8KK (random, tied-amax, zero rows; m=1 and m=3)") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  constexpr size_t kQ8KBytes = 292;  // sizeof(BlockQ8_K), pinned by static_assert
+  for (int64_t nsb : {int64_t{1}, int64_t{3}, int64_t{10}}) {
+    const int64_t k = nsb * 256;
+    CAPTURE(k);
+    for (int64_t rows : {int64_t{1}, int64_t{3}}) {
+      CAPTURE(rows);
+      // row set: pseudo-random x(rows), an adversarial tied-amax row (fabs
+      // tie decided by FIRST occurrence -> index 0 wins; inverting the
+      // tie-break flips mx's sign and the whole block), an all-zero row.
+      std::mt19937 rng(0xB00B5U + static_cast<unsigned>(rows));
+      std::vector<std::vector<float>> rowset;
+      // rows-1 pseudo-random rows, then the adversarial tied-amax row (fabs
+      // tie decided by FIRST occurrence -> index 0 wins; inverting the
+      // tie-break flips mx's sign and the whole block). For rows>=3 a final
+      // all-zero row rides along.
+      for (int r = 0; r < rows - 1; ++r) {
+        std::vector<float> a(static_cast<size_t>(k));
+        for (float& v : a) v = static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F;
+        rowset.push_back(std::move(a));
+      }
+      {
+        std::vector<float> a(static_cast<size_t>(k), 0.0F);
+        a[0] = 3.5F;
+        a[17] = -3.5F;
+        if (k > 300) a[291] = -3.5F;
+        rowset.push_back(std::move(a));
+      }
+      if (rows >= 3) rowset.push_back(std::vector<float>(static_cast<size_t>(k), 0.0F));
+
+      const size_t abuf_bytes = rowset.size() * static_cast<size_t>(k) * 2;
+      std::vector<uint16_t> abf(rowset.size() * static_cast<size_t>(k));
+      std::vector<uint16_t> nw(static_cast<size_t>(k));
+      for (size_t i = 0; i < nw.size(); ++i) nw[i] = vt::F32ToBF16(0.5F);
+      for (size_t r = 0; r < rowset.size(); ++r)
+        for (int64_t j = 0; j < k; ++j) abf[r * static_cast<size_t>(k) + static_cast<size_t>(j)] = vt::F32ToBF16(rowset[r][static_cast<size_t>(j)]);
+
+      void* d_a = gpu.Alloc(abuf_bytes);
+      void* d_nw = gpu.Alloc(nw.size() * 2);
+      gpu.Copy(gq, d_a, abf.data(), abuf_bytes);
+      gpu.Copy(gq, d_nw, nw.data(), nw.size() * 2);
+
+      // The fused epilogue quantizes the NORM'S OUTPUT rows, so the reference
+      // is the standalone quantizer over those SAME output rows: run the
+      // producer-fused RmsNorm first, then hook the standalone QuantizeQ8KK
+      // on the produced out tensor (device dst, copied back after).
+      void* d_out = gpu.Alloc(abuf_bytes);
+      EnvNormQuantGuard on(true);
+      vt::rocm::NormQuantResetForTesting();
+      Tensor xt = DevTensor(d_a, DType::kBF16, {static_cast<int64_t>(rowset.size()), k});
+      Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
+      Tensor ot = DevTensor(d_out, DType::kBF16, {static_cast<int64_t>(rowset.size()), k});
+      vt::RmsNorm(gq, ot, xt, wt, vt::RmsNormArgs{1e-6f, false});
+      const void* scratch = vt::rocm::NormQuantLastScratchForTesting();
+      REQUIRE(scratch != nullptr);
+
+      void* d_ref = gpu.Alloc(rowset.size() * static_cast<size_t>(nsb) * kQ8KBytes);
+      for (size_t r = 0; r < rowset.size(); ++r) {
+        Tensor rt = DevTensor(static_cast<char*>(d_out) + r * static_cast<size_t>(k) * 2, DType::kBF16, {1, k});
+        vt::rocm::MmvqQuantScratchForTesting(gq, static_cast<char*>(d_ref) + r * static_cast<size_t>(nsb) * kQ8KBytes, rt, false);
+      }
+
+      std::vector<unsigned char> ref(rowset.size() * nsb * kQ8KBytes);
+      gpu.Copy(gq, ref.data(), d_ref, ref.size());
+      std::vector<unsigned char> got(rowset.size() * nsb * kQ8KBytes);
+      gpu.Copy(gq, got.data(), scratch, got.size());
+      gpu.Synchronize(gq);
+      gpu.Free(d_ref);
+      CHECK(std::memcmp(got.data(), ref.data(), got.size()) == 0);
+      // HOST-ORACLE leg: vt::cpu::QuantizeRowQ8_K over the bf16-rounded norm
+      // outputs. The two GPU paths above share one device body, so a drift in
+      // that body moves BOTH identically -- this independent oracle is what
+      // actually pins the tie-break (lowest-index first occurrence) and the
+      // d-scale arithmetic down.
+      const auto from_float = vt::cpu::BlockFromFloat(DType::kQ8_K);
+      REQUIRE(from_float != nullptr);
+      std::vector<uint16_t> out_host(rowset.size() * static_cast<size_t>(k));
+      gpu.Copy(gq, out_host.data(), d_out, out_host.size() * 2);
+      gpu.Synchronize(gq);
+      for (size_t r = 0; r < rowset.size(); ++r) {
+        std::vector<float> xf(static_cast<size_t>(k));
+        for (int64_t j = 0; j < k; ++j)
+          xf[static_cast<size_t>(j)] =
+              vt::BF16ToF32(out_host[r * static_cast<size_t>(k) + static_cast<size_t>(j)]);
+        std::vector<unsigned char> want(nsb * kQ8KBytes);
+        from_float(xf.data(), want.data(), k);
+        CAPTURE(r);
+        CHECK(std::memcmp(got.data() + r * nsb * kQ8KBytes, want.data(),
+                          nsb * kQ8KBytes) == 0);
+      }
+      gpu.Free(d_out);
+      gpu.Free(d_a);
+      gpu.Free(d_nw);
+    }
+  }
+  gpu.DestroyQueue(gq);
+}
+
+TEST_CASE("Lever C: a non-matching K-quant consumer invalidates the producer token (stale-scratch guard)") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const int64_t k = 10 * 256, n = 32, k2 = 3 * 256;
+  std::vector<uint8_t> wq = RandomBlocks(kKQuantCases[0], n * 10, 0xD00DU);
+  std::vector<uint8_t> wq2 = RandomBlocks(kKQuantCases[0], n * 3, 0xD01DU);
+  std::vector<uint16_t> abf(static_cast<size_t>(k)), a2bf(static_cast<size_t>(k2));
+  for (size_t i = 0; i < abf.size(); ++i) abf[i] = vt::F32ToBF16(0.1F * static_cast<float>(i % 31));
+  for (size_t i = 0; i < a2bf.size(); ++i) a2bf[i] = vt::F32ToBF16(0.2F * static_cast<float>(i % 17));
+  std::vector<uint16_t> nw(static_cast<size_t>(k));
+  for (size_t i = 0; i < nw.size(); ++i) nw[i] = vt::F32ToBF16(0.5F);
+  void* d_a = gpu.Alloc(abf.size() * 2);
+  void* d_a2 = gpu.Alloc(a2bf.size() * 2);
+  void* d_nw = gpu.Alloc(nw.size() * 2);
+  void* d_w = gpu.Alloc(wq.size());
+  void* d_w2 = gpu.Alloc(wq2.size());
+  void* d_o = gpu.Alloc(2 * static_cast<size_t>(n));
+  gpu.Copy(gq, d_a, abf.data(), abf.size() * 2);
+  gpu.Copy(gq, d_a2, a2bf.data(), a2bf.size() * 2);
+  gpu.Copy(gq, d_nw, nw.data(), nw.size() * 2);
+  gpu.Copy(gq, d_w, wq.data(), wq.size());
+  gpu.Copy(gq, d_w2, wq2.data(), wq2.size());
+
+  EnvNormQuantGuard on(true);
+  vt::rocm::NormQuantResetForTesting();
+  // produce a token for d_a
+  Tensor xt = DevTensor(d_a, DType::kBF16, {1, k});
+  Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
+  void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
+  Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
+  vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
+  // non-matching consumer (different ptr/shape): must take the standalone
+  // quant AND invalidate the token...
+  Tensor at2 = DevTensor(d_a2, DType::kBF16, {1, k2});
+  Tensor bt2 = DevTensor(d_w2, DType::kQ4_K, {n, k2});
+  Tensor oo = DevTensor(d_o, DType::kBF16, {1, n});
+  vt::MatmulBTQuant(gq, oo, at2, bt2);
+  gpu.Synchronize(gq);
+  auto c = vt::rocm::NormQuantCountsForTesting();
+  CHECK(c.producers == 1);
+  CHECK(c.consumers_fused == 0);
+  CHECK(c.consumers_standalone == 1);
+  // ...so even a shape-matching call on the OLD buffer now goes standalone
+  Tensor bt = DevTensor(d_w, DType::kQ4_K, {n, k});
+  Tensor nout2 = DevTensor(d_norm, DType::kBF16, {1, k});
+  vt::MatmulBTQuant(gq, oo, nout2, bt);
+  gpu.Synchronize(gq);
+  c = vt::rocm::NormQuantCountsForTesting();
+  CHECK(c.consumers_fused == 0);
+  CHECK(c.consumers_standalone == 2);
+  gpu.Free(d_norm);
+  gpu.Free(d_a); gpu.Free(d_a2); gpu.Free(d_nw); gpu.Free(d_w); gpu.Free(d_w2); gpu.Free(d_o);
   gpu.DestroyQueue(gq);
 }

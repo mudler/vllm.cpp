@@ -115,9 +115,9 @@ float block_amax_reduce(uint col_id, uint block_id, uint lpb,
         sm_reduce[col_id * 128u + block_id * lpb + lane_in_block / gl_SubgroupSize] = maxv;
       }
       barrier();
-      // Only the first subs_per_block lanes combine the per-subgroup winners.
-      if (lane_in_block < subs_per_block) {
-        float v = sm_reduce[col_id * 128u + block_id * lpb + lane_in_block];
+      // Lane 0 combines the per-subgroup winners and broadcasts via sm_reduce.
+      if (lane_in_block == 0u) {
+        float v = sm_reduce[col_id * 128u + block_id * lpb];
         for (uint i = 1u; i < subs_per_block; ++i) {
           float other = sm_reduce[col_id * 128u + block_id * lpb + i];
           if (abs(other) > abs(v)) v = other;
@@ -147,7 +147,8 @@ float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
   uint sub_per_col = 128u / gl_SubgroupSize;
   uint col_sub_id = gl_SubgroupID % sub_per_col;
-  barrier();
+  // No barrier needed here: subgroupAdd completes within the subgroup before
+  // subgroupElect runs. The second barrier makes the write visible to readers.
   if (subgroupElect()) {
     sm_reduce[col_id * sub_per_col + col_sub_id] = sg;
   }
@@ -271,18 +272,8 @@ void main() {
           float ax = abs(v);
           if (ax > amax) { amax = ax; maxv = v; }
         }
-        sm_reduce[col_id * 128u + tid] = maxv;
-        barrier();
-        for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
-          if (lane_in_block < s) {
-            float a = sm_reduce[col_id * 128u + tid];
-            float b = sm_reduce[col_id * 128u + tid + s];
-            if (abs(b) > abs(a))
-              sm_reduce[col_id * 128u + tid] = b;
-          }
-          barrier();
-        }
-        float maxv_final = sm_reduce[col_id * 128u + block_id * lpb];
+        maxv = block_amax_reduce(col_id, block_id, lpb, lane_in_block, tid, maxv);
+        float maxv_final = maxv;
         float block_amax = abs(maxv_final);
         if (block_amax > 0.0) {
           float iscale = -127.0 / maxv_final;

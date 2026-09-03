@@ -1,13 +1,6 @@
 #version 450
-// vt_moe_gate_up_swiglu_grouped_tq2: OPTIMIZED v5 — shared-memory weight cache.
-// Multi-column, packed uint32 reads, activation cache, subgroup reduce.
-// TQ2_0 block: 66 bytes.
-//
-// Both gate and up weight blocks are cooperatively loaded into shared memory
-// ONCE per (row, block). ALL inner-loop paths — bcast/non-bcast, IDOT/scalar —
-// read from gw_cache/uw_cache, never from global memory in the hot loop.
-// This eliminates the redundant global weight reads that were the dominant
-// cost in the MoE expert GEMM.
+// vt_moe_gate_up_swiglu_grouped_tq2: OPTIMIZED v2 — multi-column, packed uint32
+// reads, activation cache, subgroup reduce. TQ2_0 block: 66 bytes.
 //
 // VT_IDOT variant: uses dotPacked4x8EXT for the inner loop.
 // Requires VK_KHR_shader_integer_dot_product at runtime.
@@ -22,7 +15,7 @@
 #include "vt_common.glsl"
 
 #define COLS_PER_WG 4u
-#define W_CACHE_WORDS 18u  // ceil(66/4) = 17, round to 18
+
 
 layout(local_size_x = 128, local_size_y = COLS_PER_WG, local_size_z = 1) in;
 
@@ -48,8 +41,6 @@ layout(set = 0, binding = 8, std430) writeonly buffer Ob16 { uint16_t v[]; } O16
 shared int q8_cache[8][256];
 shared float d_act_cache[8];
 shared float sm_reduce[512];
-shared uint gw_cache[COLS_PER_WG][8][W_CACHE_WORDS];
-shared uint uw_cache[COLS_PER_WG][8][W_CACHE_WORDS];
 
 int vt_nearest_int(precise float fval) {
   precise float val = fval + 12582912.0;
@@ -63,42 +54,42 @@ float load_act(uint idx) {
       : vt_bf16_to_f32(uint(A16.v[idx]));
 }
 
-// Merged trit extraction from shared-memory cache: computes region/byte-offset
-// once, reads both gate and up weight bytes from their respective caches.
-void tq2_0_trit_both(uint ae, uint col_id, uint block_id,
-                     uint gw_align, uint uw_align,
-                     out int gw_trit, out int uw_trit) {
+int tq2_0_trit_gw(uint ae, uint woff) {
   uint j = (ae >= 128u) ? 32u : 0u;
   uint rem = ae - j * 4u;
   uint l = rem / 32u; uint k = rem % 32u;
-  uint gw_off = gw_align + j + k;
-  uint gw_w32 = gw_cache[col_id][block_id][gw_off >> 2];
-  uint gwb = (gw_w32 >> ((gw_off & 3u) * 8u)) & 0xFFu;
-  uint uw_off = uw_align + j + k;
-  uint uw_w32 = uw_cache[col_id][block_id][uw_off >> 2];
-  uint uwb = (uw_w32 >> ((uw_off & 3u) * 8u)) & 0xFFu;
-  gw_trit = int((gwb >> (l * 2u)) & 3u) - 1;
-  uw_trit = int((uwb >> (l * 2u)) & 3u) - 1;
+  uint wb_byte = woff + j + k;
+  uint w32 = GW32.v[wb_byte >> 2];
+  uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
+  return int((wb >> (l * 2u)) & 3u) - 1;
+}
+
+int tq2_0_trit_uw(uint ae, uint woff) {
+  uint j = (ae >= 128u) ? 32u : 0u;
+  uint rem = ae - j * 4u;
+  uint l = rem / 32u; uint k = rem % 32u;
+  uint wb_byte = woff + j + k;
+  uint w32 = UW32.v[wb_byte >> 2];
+  uint wb = (w32 >> ((wb_byte & 3u) * 8u)) & 0xFFu;
+  return int((wb >> (l * 2u)) & 3u) - 1;
 }
 
 #ifdef VT_IDOT
-// Load 4 consecutive bytes from the gate weight cache as a uint32.
-uint tq2_load4bytes_gw(uint col_id, uint block_id, uint byte_off) {
+uint tq2_load4bytes_gw(uint byte_off) {
   uint word_idx = byte_off >> 2;
   uint byte_idx = byte_off & 3u;
-  if (byte_idx == 0u) return gw_cache[col_id][block_id][word_idx];
-  uint lo = gw_cache[col_id][block_id][word_idx];
-  uint hi = gw_cache[col_id][block_id][word_idx + 1u];
+  if (byte_idx == 0u) return GW32.v[word_idx];
+  uint lo = GW32.v[word_idx];
+  uint hi = GW32.v[word_idx + 1u];
   return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
 }
 
-// Load 4 consecutive bytes from the up weight cache as a uint32.
-uint tq2_load4bytes_uw(uint col_id, uint block_id, uint byte_off) {
+uint tq2_load4bytes_uw(uint byte_off) {
   uint word_idx = byte_off >> 2;
   uint byte_idx = byte_off & 3u;
-  if (byte_idx == 0u) return uw_cache[col_id][block_id][word_idx];
-  uint lo = uw_cache[col_id][block_id][word_idx];
-  uint hi = uw_cache[col_id][block_id][word_idx + 1u];
+  if (byte_idx == 0u) return UW32.v[word_idx];
+  uint lo = UW32.v[word_idx];
+  uint hi = UW32.v[word_idx + 1u];
   return (lo >> (byte_idx * 8u)) | (hi << ((4u - byte_idx) * 8u));
 }
 
@@ -107,7 +98,9 @@ int pack_q8x4_m(int q0, int q1, int q2, int q3) {
 }
 #endif
 
-// Subgroup-based amax reduction (same as TQ1_0 MoE).
+// Subgroup-based amax reduction: find the value with the largest |v| across
+// lpb lanes in the block. Uses subgroupShuffleXor butterfly (0 barriers when
+// lpb <= subgroupSize). Falls back to shared-memory tree for non-power-of-2 lpb.
 float block_amax_reduce(uint col_id, uint block_id, uint lpb,
                         uint lane_in_block, uint tid, float maxv) {
   if ((lpb & (lpb - 1u)) == 0u) {
@@ -122,15 +115,15 @@ float block_amax_reduce(uint col_id, uint block_id, uint lpb,
         sm_reduce[col_id * 128u + block_id * lpb + lane_in_block / gl_SubgroupSize] = maxv;
       }
       barrier();
+      // Only the first subs_per_block lanes combine the per-subgroup winners.
       if (lane_in_block < subs_per_block) {
         float v = sm_reduce[col_id * 128u + block_id * lpb + lane_in_block];
         for (uint i = 1u; i < subs_per_block; ++i) {
           float other = sm_reduce[col_id * 128u + block_id * lpb + i];
           if (abs(other) > abs(v)) v = other;
         }
-        maxv = v;
+        sm_reduce[col_id * 128u + block_id * lpb] = v;
       }
-      sm_reduce[col_id * 128u + block_id * lpb] = maxv;
       barrier();
       maxv = sm_reduce[col_id * 128u + block_id * lpb];
     }
@@ -222,6 +215,7 @@ void main() {
     barrier();
   }
 
+  
   for (uint row = 0u; row < p.m; ++row) {
     int e = EID.v[p.eid_off + row];
     if (e < 0) continue;
@@ -231,28 +225,10 @@ void main() {
     float gate_acc = 0.0;
     float up_acc = 0.0;
 
-    // Cooperative load of BOTH gate and up weight blocks into shared memory.
-    // Each block is 66 bytes = 17 uint32 words (last word has 2 bytes).
-    // lpb lanes stride over nwords, loading once and reusing in the inner loop.
-    if (block_id < nb) {
-      uint gwoff = gw_row + block_id * wbytes;
-      uint uwoff = uw_row + block_id * wbytes;
-      uint gw_base = gwoff >> 2u;
-      uint uw_base = uwoff >> 2u;
-      uint nwords = ((gwoff + wbytes - 1u) >> 2u) - gw_base + 1u;
-      for (uint i = lane_in_block; i < nwords; i += lpb) {
-        gw_cache[col_id][block_id][i] = GW32.v[gw_base + i];
-        uw_cache[col_id][block_id][i] = UW32.v[uw_base + i];
-      }
-    }
-    barrier();
-
     if (p.bcast != 0u) {
       if (block_id < nb && d_act_cache[block_id] != 0.0) {
         uint gwoff = gw_row + block_id * wbytes;
         uint uwoff = uw_row + block_id * wbytes;
-        uint gw_align = gwoff & 3u;
-        uint uw_align = uwoff & 3u;
         float gwd = vt_from16(uint(GW16.v[(gwoff + 64u) >> 1]), VT_DT_F16);
         float uwd = vt_from16(uint(UW16.v[(uwoff + 64u) >> 1]), VT_DT_F16);
         float gblockd = d_act_cache[block_id] * gwd;
@@ -264,10 +240,10 @@ void main() {
           uint j = (ae >= 128u) ? 32u : 0u;
           uint rem = ae - j * 4u;
           uint l = rem / 32u; uint k = rem % 32u;
-          uint gbyte_off = gw_align + j + k;
-          uint ubyte_off = uw_align + j + k;
-          uint gpacked = tq2_load4bytes_gw(col_id, block_id, gbyte_off);
-          uint upacked = tq2_load4bytes_uw(col_id, block_id, ubyte_off);
+          uint byte_off = gwoff + j + k;
+          uint ubyte_off = uwoff + j + k;
+          uint gpacked = tq2_load4bytes_gw(byte_off);
+          uint upacked = tq2_load4bytes_uw(ubyte_off);
           uint gtrits = (gpacked >> (l * 2u)) & 0x03030303u;
           uint utrits = (upacked >> (l * 2u)) & 0x03030303u;
           int packed_q8 = pack_q8x4_m(q8_cache[block_id][ae],
@@ -283,10 +259,8 @@ void main() {
         for (uint i = 0u; i < elems; ++i) {
           uint ae = lane_in_block * elems + i;
           int q = q8_cache[block_id][ae];
-          int gt, ut;
-          tq2_0_trit_both(ae, col_id, block_id, gw_align, uw_align, gt, ut);
-          gacci += q * gt;
-          uacci += q * ut;
+          gacci += q * tq2_0_trit_gw(ae, gwoff);
+          uacci += q * tq2_0_trit_uw(ae, uwoff);
         }
 #endif
         gate_acc = float(gacci) * gblockd;
@@ -298,16 +272,24 @@ void main() {
         uint a_base = (p.a_off >> a_shift) + a_row_idx * p.nb * 256u + block_id * 256u;
         uint gwoff = gw_row + block_id * wbytes;
         uint uwoff = uw_row + block_id * wbytes;
-        uint gw_align = gwoff & 3u;
-        uint uw_align = uwoff & 3u;
         float amax = 0.0; float maxv = 0.0;
         for (uint i = 0u; i < elems; ++i) {
           float v = load_act(a_base + lane_in_block * elems + i);
           float ax = abs(v);
           if (ax > amax) { amax = ax; maxv = v; }
         }
-        maxv = block_amax_reduce(col_id, block_id, lpb, lane_in_block, tid, maxv);
-        float maxv_final = maxv;
+        sm_reduce[col_id * 128u + tid] = maxv;
+        barrier();
+        for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
+          if (lane_in_block < s) {
+            float a = sm_reduce[col_id * 128u + tid];
+            float b = sm_reduce[col_id * 128u + tid + s];
+            if (abs(b) > abs(a))
+              sm_reduce[col_id * 128u + tid] = b;
+          }
+          barrier();
+        }
+        float maxv_final = sm_reduce[col_id * 128u + block_id * lpb];
         float block_amax = abs(maxv_final);
         if (block_amax > 0.0) {
           float iscale = -127.0 / maxv_final;
@@ -323,10 +305,10 @@ void main() {
             uint j = (ae >= 128u) ? 32u : 0u;
             uint rem = ae - j * 4u;
             uint l = rem / 32u; uint k = rem % 32u;
-            uint gbyte_off = gw_align + j + k;
-            uint ubyte_off = uw_align + j + k;
-            uint gpacked = tq2_load4bytes_gw(col_id, block_id, gbyte_off);
-            uint upacked = tq2_load4bytes_uw(col_id, block_id, ubyte_off);
+            uint byte_off = gwoff + j + k;
+            uint ubyte_off = uwoff + j + k;
+            uint gpacked = tq2_load4bytes_gw(byte_off);
+            uint upacked = tq2_load4bytes_uw(ubyte_off);
             uint gtrits = (gpacked >> (l * 2u)) & 0x03030303u;
             uint utrits = (upacked >> (l * 2u)) & 0x03030303u;
             int q0 = vt_nearest_int(iscale * load_act(a_base + ae));
@@ -346,10 +328,8 @@ void main() {
             float v = load_act(a_base + ae);
             int q = vt_nearest_int(iscale * v);
             q = q < 127 ? q : 127;
-            int gt, ut;
-            tq2_0_trit_both(ae, col_id, block_id, gw_align, uw_align, gt, ut);
-            gacci += q * gt;
-            uacci += q * ut;
+            gacci += q * tq2_0_trit_gw(ae, gwoff);
+            uacci += q * tq2_0_trit_uw(ae, uwoff);
           }
 #endif
           gate_acc = float(gacci) * gblockd;

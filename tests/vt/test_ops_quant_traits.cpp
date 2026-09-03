@@ -271,6 +271,10 @@ TEST_CASE("the decode-only class is Q8_K and IQ3_S: exactly one FILE type expand
     // the sweep and asserted explicitly below, so "it expands" is a written
     // claim rather than a hole in a loop.
     if (d == vt::DType::kIQ3_S) continue;
+    // TQ1_0/TQ2_0 are ternary keep-quant encodings whose vec_dot is
+    // Vulkan-only (no CPU dot kernel). Skipped from the sweep and asserted
+    // explicitly below, matching IQ3_S's decode-only pattern.
+    if (d == vt::DType::kTQ1_0 || d == vt::DType::kTQ2_0) continue;
     CAPTURE(id);
     CAPTURE(vt::Name(d));
     ++swept;

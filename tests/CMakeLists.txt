@@ -2697,6 +2697,10 @@ if(VLLM_CPP_VULKAN)
   add_executable(bench_vulkan_tq vt/bench_vulkan_tq.cpp)
   target_link_libraries(bench_vulkan_tq PRIVATE vllm vllm_test_main)
   target_include_directories(bench_vulkan_tq PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # TQ grouped + MoE fused gate+up+SwiGLU microbenchmark.
+  add_executable(bench_vulkan_tq_grouped vt/bench_vulkan_tq_grouped.cpp)
+  target_link_libraries(bench_vulkan_tq_grouped PRIVATE vllm vllm_test_main)
+  target_include_directories(bench_vulkan_tq_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 if(VLLM_CPP_TENSTORRENT)
   # Plain C++ (no ttnn/tt-metal header): every assertion goes through the

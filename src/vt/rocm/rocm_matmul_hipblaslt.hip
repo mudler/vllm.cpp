@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -529,11 +530,49 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
             "hipblasGemmEx NN");
 }
 
+// Host-side routing witness for the bf16-in/f32-out decode population (the
+// Qwen3.5 GDN BA pair; evidence 15.1): process-global counters bumped on
+// exactly the branch taken per dispatch. Both routes are numerically valid,
+// so outputs alone cannot witness routing. Same shape as the T4a MMVQ
+// counters (rocm_grouped_gemm.hip).
+struct SkinnyF32RouteCounts {
+  long long blas;    // fell through to hipblasGemmEx (default route)
+  long long skinny;  // took the VT_SKINNY_BF16 wvSplitK-class arm
+};
+
+namespace {
+std::atomic<long long> g_skinny_f32_route_blas{0};
+std::atomic<long long> g_skinny_f32_route_skinny{0};
+}  // namespace
+
+void SkinnyF32ResetRouteCountsForTesting() {
+  g_skinny_f32_route_blas.store(0, std::memory_order_relaxed);
+  g_skinny_f32_route_skinny.store(0, std::memory_order_relaxed);
+}
+
+SkinnyF32RouteCounts SkinnyF32RouteCountsForTesting() {
+  return {g_skinny_f32_route_blas.load(std::memory_order_relaxed),
+          g_skinny_f32_route_skinny.load(std::memory_order_relaxed)};
+}
+
+// Lever B2 opt-in arm (evidence 15.1): VT_SKINNY_BF16=1 serves bf16-in/
+// f32-out decode-skinny shapes with the wvSplitK geometry instead of
+// rocBLAS's large-M tile. Read PER CALL (cuda_quant_dot.cu convention) so
+// in-process tests and captured graphs pick the arm up at launch time.
+// Default OFF: the default path is byte-unchanged.
+bool SkinnyBf16F32OutEnabled() {
+  if (const char* e = std::getenv("VT_SKINNY_BF16")) return e[0] == '1';
+  return false;
+}
+
 // out[M,N] = a[M,K] @ b[N,K]^T
 // wvSplitK skinny-GEMM host entry (rocm_skinny_gemm.hip, #487). External
 // vt::rocm linkage to match the definition; declared beside its only caller.
 void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, int N,
                 int K, int device);
+// Lever B2 f32-output variant of the same kernel geometry.
+void WvSplitKBTToF32(hipStream_t s, void* out, const void* a, const void* b,
+                     int M, int N, int K, int device);
 
 // Row-major trick: gemm(OP_T, OP_N, N, M, K, B, K, A, a_rs, C, N)
 //   BLAS: C = op(A)*op(B) with opA=T => A is KxN in col form = row B[N,K]
@@ -582,6 +621,25 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
                static_cast<int>(K), q.device.index);
     return;
   }
+
+  // Lever B2 (evidence 15.1): bf16-in/f32-out decode-skinny — the Qwen3.5
+  // GDN BA projections (N=32, K=2560, m=1) emit f32 and today starve on
+  // rocBLAS's large-M MT128x32x16 tile (~73.7us for a 164 KiB weight).
+  // Same donor guards as the bf16 arm above (the kernel is the same
+  // geometry, so the same tail-safety constraints apply), opt-in via
+  // VT_SKINNY_BF16=1, default OFF and byte-unchanged.
+  const bool skinny_f32_pop =
+      bf16 && out.dtype == DType::kF32 && M >= 1 && M <= 4;
+  if (skinny_f32_pop && SkinnyBf16F32OutEnabled() && (K % 8) == 0 && N > 8 &&
+      (N % 2) == 0 && a.stride[0] == K && K * M <= 32768 &&
+      vt::rocm::SkinnyGemmArchOk(q.device.index, vt::rocm::DeviceArchName)) {
+    WvSplitKBTToF32(s, out.data, a.data, b.data, static_cast<int>(M),
+                    static_cast<int>(N), static_cast<int>(K), q.device.index);
+    g_skinny_f32_route_skinny.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (skinny_f32_pop)
+    g_skinny_f32_route_blas.fetch_add(1, std::memory_order_relaxed);
 
   // Decode: M=1 BF16 GEMV
   if (M == 1 && bf16 && out.dtype == DType::kBF16 && a.stride[0] == K && GemvEnabled()) {

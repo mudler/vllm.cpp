@@ -120,6 +120,13 @@ host with no GPU and no snapshot, and neither is this row's work.
   `docs/FEATURES.md` already carries `the shipped 8/8 is not a measurement`.
 - O2. The engine case (T3) is unrun. It compiles here; nothing on this host can
   execute it. Owed to whoever next holds a GPU and the snapshot.
+- O4. The zero-assertion skip is a REPOSITORY-WIDE shape, not this file's.
+  `MESSAGE(...SKIP...); return;` occurs at 228 sites in 72 files under `tests/`,
+  and `test_deepseek_v2_paged_engine` — the SACRED DeepSeek-V2 gate — reports
+  `1 passed | 0 failed`, `assertions: 0`, `Status: SUCCESS!` on this host at
+  `3f12c617d`. Repairing 228 sites is a campaign, so it is filed as
+  [#2918](https://github.com/mudler/vllm.cpp/issues/2918) and owned here rather
+  than fixed in this flow. This row repairs the one instance it touches.
 - O3. `docs/USAGE.md` carries no checkpoint row for `Glm4MoeLiteForCausalLM` —
   no revision and no sha256 — which `CLAUDE.md` §"Say which weights, and from
   where" requires. Not repaired here because the values must be read off the

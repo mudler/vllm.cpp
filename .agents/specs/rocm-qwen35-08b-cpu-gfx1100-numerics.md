@@ -2,360 +2,205 @@
 
 Row: `BACKEND-ROCM`.
 
-Issue: [#1588](https://github.com/mudler/vllm.cpp/issues/1588).
-
-Base: `4d10c8acc527c34a6a58a309d52ea5f8fbd1d47b`.
+Issue: [#2773](https://github.com/mudler/vllm.cpp/issues/2773), which supersedes
+issue #1588 for implementation traceability.
 
 Branch: `row/BACKEND-ROCM-NUMERICS-1588`.
 
-Primary oracle: vLLM at `5559679229bc961848b121ccdeaa8fa5d79bec98`.
-
-Target: AMD Radeon RX 7900 XTX, `gfx1100`.
+Active primary oracle pin: vLLM
+`e126687a9a828d513c01a07cd69f025f27d63280`.
 
 ## Now
 
-The issue is open and the implementation has not started. This spec is the
-committed prerequisite for the implementation.
+`PENDING`. This repaired spec is the only completed deliverable in this commit.
+Implementation cannot start until a fresh reviewer passes this immutable spec.
+Results cannot be accepted until both correctness prerequisites pass:
 
-Current `main` runs the Qwen3.5-0.8B paged engine on ROCm. The backend matrix
-still names its CPU and ROCm numerical characterization as open.
+1. Issue #2772 and PR #2856 own the default-on ROCm `wvSplitK` sacred-anchor
+   repair. The reviewed old base failed prompt 10/token 10 (`369` instead of
+   `488`), while `VT_ROCM_SKINNY=0` passed. The operator reran PR #2856 at
+   `f06619e4c213e3de28359ee10995e682e8c06932`: CPU mode 2/2, prerequisites
+   77/77/77/86, `wvSplitK` 79796/79796, and sacred 137/137 with 15 strict, one
+   tied, maximum gap zero, and zero divergence. PR #2856 is still open and the
+   contributor lacks merge authority. This prerequisite remains `PENDING`
+   until a maintainer lands it and the unchanged default gate passes on the
+   implementation base. Disabling skinny GEMM is diagnostic only.
+2. The configured source and runnable ROCm wrapper are still at historical
+   vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`. The active source object is
+   available for read-only inspection, but no runnable active-pin ROCm runtime
+   has been supplied or proved. Issue #2794 records repository pin-validation
+   context; #2773 itself owns the cache-matched active-pin Qwen3.5-0.8B captures.
+   Active-pin capture and token revalidation remain `PENDING` until that runtime
+   exists and runs the model under the GPU mutex.
 
-The current gate runs one default cache configuration. It does not characterize
-`auto`, `bfloat16`, and `fp8_e4m3` separately.
-
-The current dump records the residual halves and named layer stages. It does not
-record full-attention cache writes or persistent Gated Delta Net state writes.
-
-ROCm static graph mode remains false in `src/vllm/platforms/rocm.cpp:91-98`.
-This work characterizes the current eager path before issue #332 activates model
-graph replay.
-
-## Live gap
-
-The spec implementer checked the pinned base before writing this spec.
-
-- `HEAD`, `origin/main`, and the merge base all resolve to the pinned base.
-- `git log --all --grep=1588` finds no landed commit for issue #1588.
-- No spec with this scope exists on the pinned base.
-- GitHub reports issue #1588 as open.
-- No open pull request owns issue #1588.
-- The issue comment describes an older Q4_K_M experiment at `e2a9e035d`.
-- That experiment predates the current checkpoint gate and the later W1 fix.
-- That experiment does not compare persistent state or cache modes.
-
-The current production gate is
-`tests/parity/test_qwen35_paged_engine.cpp:159-484`. It loads the model through
-`LoadedEngine::FromModelDir` and exercises the paged engine.
-
-The gate checks 16 prompts against a pinned ROCm vLLM oracle. It reports strict
-token agreement and applies the ratified 500 milli-nat near-tie rule.
-
-The gate constructs `EngineParams{}` at
-`tests/parity/test_qwen35_paged_engine.cpp:231-234`. It therefore covers only
-the resolved default cache dtype.
-
-The gate checks native selection and zero declines for 15 required operators at
-`tests/parity/test_qwen35_paged_engine.cpp:254-275` and `:422-446`. It does not
-run the required three-mode matrix.
-
-The current dump writer lives in
-`include/vllm/model_executor/models/act_dump.h:55-227`. Its manifest key is
-`(step, layer, stage)` and its schema is:
-
-```text
-step  layer  stage  dtype  rows  cols  bytes  file
-```
-
-`DenseForwardLayers` records `hidden` and `res` before layer 0 and after every
-layer at `src/vllm/model_executor/models/qwen3_5.cpp:9352-9403`.
-
-`RunDenseLayerPaged` records `block_out` and `mlp_out` at
-`src/vllm/model_executor/models/qwen3_5.cpp:7700-7772`. On a full-attention
-layer, `block_out` is the complete attention output after its output projection.
-
-These existing rows answer the residual-stream, attention-output, and
-multilayer perceptron output questions. The comparator must reconstruct the
-residual stream as `hidden + res` in FP32.
-
-The full-attention store calls `dense_attn::WriteKvCache` at
-`src/vllm/model_executor/models/qwen3_5.cpp:5894-5905`. No dump reads the
-destinations after that call.
-
-GDN prefill scatters working state at
-`src/vllm/model_executor/models/qwen3_5.cpp:5280-5304` and `:5454-5495`.
-GDN decode can update persistent state in place at `:5319-5334` and
-`:5431-5445`.
-
-No existing row records the state after all four write paths. Dumping an FP32
-working buffer would not answer what the persistent cache stores.
+Do not create characterization goldens from a known-regressed local default or
+from the historical oracle revision.
 
 ## Scope
 
 ### In scope
 
-1. Keep the existing `VT_DUMP_ACT` writer and manifest as the dump surface.
-2. Keep `VT_DUMP_ACT_SUB` as the switch for named sub-stage rows.
-3. Add no state-specific environment variable.
-4. Record active full-attention K and V destinations after the production store.
-5. Record active GDN convolution and SSM rows after the production update.
-6. Compare CPU and ROCm on identical model inputs.
-7. Report `max_abs`, root mean square error, and relative L2 error for each key.
-8. Audit every relevant local dtype against the pinned upstream executing chain.
-9. Report the byte cost of each local dtype and each upstream difference.
-10. Gate the ROCm paged engine in `auto`, `bfloat16`, and `fp8_e4m3` modes.
-11. Prove that each ROCm mode has zero reference-tier hits.
-12. Run the final acceptance on one RX 7900 XTX with architecture `gfx1100`.
+- Add opt-in production-boundary dumps for the residual stream, attention
+  output, MLP output, stored K/V cache, and persistent GDN convolution/SSM
+  state.
+- Compare CPU and gfx1100 on identical weights and identical token prefixes.
+- Report descriptive `max_abs`, RMS, and relative-L2 deltas.
+- Port applicable active-pin upstream operation tests with their parameters,
+  modes, fixtures, failure cases, and exact tolerances.
+- Audit runtime dtype, byte width, requested/resolved cache dtype, selected
+  attention backend, and provider counts for `auto`, `bfloat16`, and
+  `fp8_e4m3`.
+- Run cache-matched active-pin vLLM captures and the established end-to-end
+  oracle-backed token/near-tie gate after the prerequisites pass.
 
 ### Out of scope
 
-- Enabling ROCm static graph mode. Issue #332 owns that change.
-- Changing a model dtype before the characterization identifies a defect.
-- Changing a kernel reduction order to make raw state bytes equal.
-- Adding a new activation-dump environment variable.
-- Dumping unused KV blocks or unused recurrent-state slots.
-- Throughput, latency, and power measurements.
-- A CUDA comparison.
-- A GGUF or quantized-weight model arm.
-- A public benchmark claim.
-- A fix for a newly found numerical defect without its required issue flow.
+- Changing a numerical tolerance after observing results.
+- Treating CPU as the conformance oracle for FP8 physical-cache behavior.
+- Permanently expanding the sacred 16-prompt gate merely because this
+  characterization measures three cache modes. A new permanent case or golden
+  may land only when #2773's active-pin capture proves it is necessary and the
+  final implementation records the evidence. Broader gate policy needs its own
+  issue.
+- Enabling ROCm static graph mode; issue #332 owns that work.
+- Performance claims or tuning.
 
 ## Artifact and oracle pins
 
-Use this exact model snapshot for every local and oracle run:
+Use `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`
+from `${CHECKPOINT_ROOT}/Qwen3.5-0.8B`. Before every model run, require:
 
-```text
-repository: Qwen/Qwen3.5-0.8B
-revision:   2fc06364715b967f1860aea9cf38778875588b17
-path:       /home/vikash/models/Qwen3.5-0.8B
+```sh
+sha256sum \
+  "${CHECKPOINT_ROOT}/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors" \
+  "${CHECKPOINT_ROOT}/Qwen3.5-0.8B/model.safetensors.index.json" \
+  "${CHECKPOINT_ROOT}/Qwen3.5-0.8B/config.json"
 ```
 
-The local checkpoint inspection found these hashes:
+Expected hashes are:
 
 ```text
-model.safetensors  04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696
-config.json        b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204
+04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696  model.safetensors-00001-of-00001.safetensors
+d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e  model.safetensors.index.json
+b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204  config.json
 ```
 
-The model file is 1,746,942,600 bytes. Its safetensors header declares 452 BF16
-tensors and 36 FP32 tensors.
+Resolve the active oracle source with:
 
-`tests/parity/hf_snapshot.h` pins the same revision and exposes
-`parity::Qwen35_08BSnapshot()`. An explicit snapshot override checks existence,
-not revision identity.
+```sh
+git -C "${VLLM_SOURCE}" rev-parse e126687a9a828d513c01a07cd69f025f27d63280^{commit}
+```
 
-The characterization must hash the two files before every run. A hash mismatch
-is `ARTIFACT_MISMATCH`, not a skipped comparison.
-
-Use the vLLM source checkout at `/home/vikash/oracle/vllm-src`. Its detached
-`HEAD` must equal `5559679229bc961848b121ccdeaa8fa5d79bec98`.
-
-Run the pinned vLLM oracle on the identical model, prompt set, cache mode,
-sampling configuration, and token count. Use production configuration without
-`--enforce-eager` for the end-to-end denominator.
-
-The internal CPU and ROCm comparison remains eager on both local arms. The dump
-synchronizes the queue and cannot run inside graph capture.
-
-## Model geometry
-
-The pinned checkpoint declares this text-model geometry:
-
-| Field | Value |
-|---|---:|
-| Model dtype | `bfloat16` |
-| Hidden size | 1,024 |
-| Decoder layers | 24 |
-| Full-attention interval | 4 |
-| Full-attention layers | 6 |
-| GDN layers | 18 |
-| Query heads | 8 |
-| KV heads | 2 |
-| Attention head dimension | 256 |
-| GDN key heads | 16 |
-| GDN value heads | 16 |
-| GDN key dimension | 128 |
-| GDN value dimension | 128 |
-| GDN convolution kernel | 4 |
-| GDN SSM dtype | `float32` |
-
-The full-attention layers are 3, 7, 11, 15, 19, and 23. Every other layer is a
-GDN layer.
+The configured checkout may remain detached at the historical revision. Read
+active-pin files with `git -C "${VLLM_SOURCE}" show <pin>:<path>`; do not move
+that checkout. Source availability does not prove runtime gateability.
 
 ## Upstream executing chain
 
-The implementation must preserve these pinned upstream decisions.
+All cross-file anchors name symbols and refer to active pin `e126687a9` unless
+explicitly labeled historical:
 
-- `vllm/model_executor/models/qwen3_5.py:471-531` routes the text model and
-  publishes its recurrent state dtype.
-- `vllm/model_executor/models/qwen3_next.py:389-400` projects Q, K, and V, then
-  calls attention before the output projection.
-- `vllm/model_executor/models/qwen3_next.py:492-550` keeps the residual pair and
-  routes each layer to full attention or GDN.
-- `vllm/model_executor/models/config.py:744-768` copies checkpoint
-  `mamba_ssm_dtype` into the default SSM cache dtype.
-- `vllm/model_executor/layers/mamba/mamba_utils.py:96-128` resolves the
-  convolution and temporal-state dtypes independently.
-- `vllm/model_executor/layers/mamba/mamba_utils.py:180-199` defines the two GDN
-  state shapes.
-- `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1228-1308`
-  identifies the persistent convolution state and its indexed write paths.
-- `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1372-1478`
-  identifies the persistent SSM updates and the prefill scatter.
-- `vllm/v1/attention/ops/paged_attn.py:31-50` calls the paged KV store with the
-  slot mapping and cache scales.
+- `vllm/model_executor/models/qwen3_5.py::Qwen3_5ForCausalLM` defines the text
+  model and layer composition.
+- `vllm/model_executor/layers/mamba/mamba_utils.py::MambaStateShapeCalculator.gated_delta_net_state_shape`
+  defines the GDN convolution and SSM state shapes. It starts at line 258 at
+  the active pin. `MambaStateShapeCalculator.mamba2_state_shape` is a different
+  architecture and is not the anchor.
+- `tests/kernels/mamba/cpu/test_cpu_gdn_ops.py::test_fused_sigmoid_gating_delta_rule_update_cpu`
+  and `test_chunk_gated_delta_rule_cpu` define CPU operation tolerances.
+- `tests/kernels/mamba/test_gdn_forward_core_split.py::test_forward_core_split_matches_unified`
+  defines split/unified state and output comparisons.
+- `tests/kernels/attention/test_cache.py::test_reshape_and_cache` defines
+  cache-store dtype behavior and FP8 comparison tolerances.
+- `tests/kernels/attention/test_cpu_attn.py::_run_varlen_with_paged_kv`
+  defines cache-mode-aware CPU attention tolerances; its `_FP8_ATOL` and
+  `_FP8_RTOL` constants select the FP8 bounds.
 
-The local mirror resolves the cache layout in
-`src/vllm/model_executor/models/qwen3_5_common.cpp:37-90`. The runner consumes
-that layout at `src/vllm/v1/worker/gpu/runner.cpp:930-999` and `:1747-1793`.
+The earlier spec cited these surfaces from historical `555967922`; those
+citations remain diagnostic history but cannot satisfy the active-pin gate. The
+implementer must refresh line evidence from the active object and run the active
+runtime before acceptance.
 
-The local full-attention store routes through
-`include/vllm/model_executor/models/kv_cache_route.h:48-67`. The float and FP8
-arms reach different store operators through this shared seam.
+The local chain is
+`ModelRegistry::Forward` -> `dense_attn::AttnBlock` ->
+`dense_attn::WriteKvCache` -> `vt::ReshapeAndCache` or
+`vt::ReshapeAndCacheFp8`, plus the Qwen3.5 GDN prefill/decode update arms. Cite
+the executing local and active-pin upstream symbols in the evidence.
 
-The implementation must inspect the complete executed kernel chain for each
-mode. A dispatch wrapper alone does not establish a compute dtype.
+## Dtype and state contract
 
-## Dtype and byte contract
+The checkpoint resolves model dtype BF16 and explicitly sets
+`mamba_ssm_dtype=float32`. The measured surfaces are:
 
-The checkpoint and pinned upstream source establish these storage types before
-any measurement:
+| Surface | Shape per active unit | Physical storage |
+|---|---|---|
+| Hidden/residual | `[T, 1024]` | BF16 |
+| Full-attention K/V | `[T, 2, 256]` per layer | BF16 or FP8 E4M3 |
+| GDN convolution state | `[1, 6144, 3]` per layer | BF16 |
+| GDN SSM state | `[1, 16, 128, 128]` per layer | FP32 |
 
-| Surface | Shape per active unit | Required storage | Bytes per unit |
-|---|---|---|---:|
-| Hidden state | `[T, 1024]` | BF16 | `2048 * T` |
-| Residual half | `[T, 1024]` | BF16 | `2048 * T` |
-| Full-attention K | `[T, 2, 256]` per layer | BF16 or FP8 E4M3 | `1024 * T` or `512 * T` |
-| Full-attention V | `[T, 2, 256]` per layer | BF16 or FP8 E4M3 | `1024 * T` or `512 * T` |
-| GDN convolution state | `[1, 6144, 3]` per layer | BF16 | 36,864 |
-| GDN SSM state | `[1, 16, 128, 128]` per layer | FP32 | 1,048,576 |
+Across six full-attention layers, BF16 K/V use 12,288 bytes per cached token
+and FP8 K/V use 6,144 bytes. Across 18 GDN layers, convolution state uses
+663,552 bytes and SSM state uses 18,874,368 bytes per active slot. Confirm
+allocated bytes from runtime specs; arithmetic alone is not evidence.
 
-`auto` and `bfloat16` both store full-attention K and V in BF16. Across six
-full-attention layers, they use 12,288 bytes per cached token.
-
-`fp8_e4m3` stores full-attention K and V in one byte per element. Across six
-layers, it uses 6,144 bytes per cached token.
-
-FP8 therefore removes 6,144 bytes per cached token from this model's
-full-attention cache. The report must confirm the allocated bytes from the
-resolved `FullAttentionSpec` instead of trusting this arithmetic alone.
-
-Across 18 GDN layers, convolution state uses 663,552 bytes per active state
-slot. SSM state uses 18,874,368 bytes per active state slot.
-
-The required GDN total is 19,537,920 bytes per active state slot. Storing the
-SSM state in BF16 would remove 9,437,184 bytes but would violate this checkpoint.
-
-The dtype audit must include each model-path buffer and each GEMM output that
-feeds a compared boundary. For each item, record:
-
-1. The local symbol and runtime dtype.
-2. The pinned upstream symbol and runtime dtype.
-3. The tensor shape and active element count.
-4. The local bytes and upstream bytes.
-5. The byte difference at the measured token count.
-6. The source annotation for every local FP32 exception.
-
-The audit includes the attention query, K and V before storage, attention
-output, GDN projections, GDN working state, MLP output, residual halves, stored
-KV, and stored GDN state.
-
-A wider local dtype is not accepted because tokens agree. Classify it as
-`DTYPE_WIDTH_MISMATCH` unless a committed source annotation names the upstream
-reason for the FP32 exception.
+For every compared buffer and GEMM output, log the local symbol, active-pin
+upstream symbol, runtime dtype, shape, active elements, bytes on each side, and
+the reason beside every FP32 exception. An unjustified wider local dtype is a
+`DTYPE_WIDTH_MISMATCH` even when tokens agree.
 
 ## State dump design
 
-Enable state rows only when `VT_DUMP_ACT` and `VT_DUMP_ACT_SUB` name the same
-writable directory. Use the existing writer and the existing manifest.
+Enable dumps only when `VT_DUMP_ACT` and `VT_DUMP_ACT_SUB` name the same empty,
+writable directory. Preserve existing keys and add:
 
-The existing `hidden`, `res`, `block_out`, and `mlp_out` keys do not change.
-Add these four stage keys:
-
-| Stage key | Production source | On-disk dtype | Manifest shape |
+| Key | Production source | Dump dtype | Shape |
 |---|---|---|---|
-| `state_fa_k` | K destination after `WriteKvCache` | FP32 | `[active_tokens, 512]` |
-| `state_fa_v` | V destination after `WriteKvCache` | FP32 | `[active_tokens, 512]` |
-| `state_gdn_conv` | Persistent convolution cache after update | FP32 | `[active_requests, 18432]` |
-| `state_gdn_ssm` | Persistent SSM cache after update | FP32 | `[active_requests, 262144]` |
+| `state_fa_k` | stored K after `dense_attn::WriteKvCache` | FP32 | `[active_tokens, 512]` |
+| `state_fa_v` | stored V after `dense_attn::WriteKvCache` | FP32 | `[active_tokens, 512]` |
+| `state_gdn_conv` | persistent convolution cache after update | FP32 | `[active_requests, 18432]` |
+| `state_gdn_ssm` | persistent SSM cache after update | FP32 | `[active_requests, 262144]` |
 
-FP32 is the canonical comparison format on disk. It does not change the cache
-storage type.
+Widen stored BF16 to FP32. Dequantize stored FP8 with the recorded per-layer
+scale. The FP32 file format never conceals separately logged physical dtype and
+allocation.
 
-For BF16 state, read the persistent destination and widen it to FP32. For FP8
-KV, read the stored byte and dequantize it with that layer's recorded scale.
+Gather nonnegative slot mappings in input-token order and active GDN indices in
+scheduler request order. Refuse unexplained duplicate destinations, missing
+rows, partial joins, or capacity-wide dumps. A 24-layer step emits 48 state
+blobs, two per layer. Place each probe after its production write and preserve
+queue ordering.
 
-The run log must state the physical storage dtype, K scale, and V scale. The
-dtype audit records the physical byte width independently of the FP32 dump.
+## Workload and backend identity
 
-Gather full-attention rows from nonnegative `slot_mapping` entries only. Preserve
-the input token order instead of sorting by physical slot.
+Use one binary and checkpoint copy. Run one request at concurrency one with
+`The capital of France is`, greedy sampling, seed 0, MTP disabled, and eight
+output tokens. Keep block size, block count, and scheduler budget equal. Run
+each arm and cache mode in a separate process and empty directory. Take two
+enabled repeats and one dump-disabled identity control.
 
-Gather GDN rows from the active state indices for the current step. Preserve the
-request order used by the scheduler metadata.
+Log and assert requested cache dtype, resolved cache dtype, physical cache
+dtype, selected attention backend, and selected cache-store operator for every
+arm and mode. Do not assume backend identity from device alone. The current CPU
+provider accepts `auto` and `fp8_e4m3` in `CPU_ATTN` but omits explicit
+`bfloat16`; that mode falls through to `FLASH_ATTN`, which accepts it. Assert
+`CPU_ATTN` for `auto` and `fp8_e4m3` and `FLASH_ATTN` for explicit `bfloat16`
+on this implementation base. If main changes the selector before implementation,
+re-read and cite the source, update this spec before code, and freshly review
+the changed contract.
 
-Deduplicate no row silently. Refuse duplicate destination indices unless the
-executing metadata defines their update order.
+CPU is a diagnostic comparison arm for CPU-versus-ROCm deltas, including FP8
+state after dequantization. Active-pin vLLM and its upstream tests are the
+conformance authority. CPU results cannot accept or reject FP8 physical-cache
+semantics.
 
-Do not download an entire KV block pool. Do not download an entire GDN state
-pool. A single-request run must write one GDN row per layer per step.
+Join only steps with identical input token prefixes. Include the first divergent
+output step and exclude all later steps. Record the first divergence and number
+of excluded steps.
 
-Place the full-attention probe immediately after the shared production store.
-The queue ordering must make the probe read the stored destination.
+## Descriptive metrics and acceptance
 
-Place the GDN probe at one shared tail after all prefill and decode update arms.
-The probe must gather from `state.conv_state` and `state.ssm_state`.
-
-Do not dump `dcs`, `dss`, `kw`, or `vw` as substitutes. Those tensors precede a
-downcast, quantization, scatter, or indexed in-place update.
-
-Extend the per-step narrative with separate stream, stage, and state counts. A
-24-layer step must report 48 state blobs, with two blobs from each layer.
-
-An enabled state dump that writes fewer than 48 required blobs must refuse the
-run. The manifest row count and active-row shapes remain the stronger capacity
-checks.
-
-## Comparison workload
-
-Use one binary and one checkpoint copy for both local arms. Set
-`EngineParams::device` to `kCPU` for the CPU arm. Use the detected ROCm platform
-for the device arm.
-
-Use one request at concurrency 1. Use the first standard gate prompt:
-
-```text
-The capital of France is
-```
-
-Use greedy sampling, a fixed seed, MTP disabled, and eight output tokens. Keep
-the block size, block count, and scheduler token budget equal on both arms.
-
-Run each cache mode in a separate process and a separate empty dump directory.
-This avoids static environment parsing and file-name collisions.
-
-Run each local arm twice with dumps enabled. The two repeats establish the
-run-to-run floor.
-
-Run an additional dump-disabled control for each arm and mode. Its token IDs and
-logits must equal the corresponding enabled run.
-
-Compare prefill and decode steps only when both arms consume the same token IDs.
-The CPU denominator and ROCm treatment must share the complete input prefix.
-
-If greedy outputs diverge, include the first divergent output step. Exclude every
-later step because those steps consume different inputs.
-
-Record the excluded step count. Do not compare equal step ordinals after the
-input prefixes diverge.
-
-If no decode step has an identical input prefix, classify the end-to-end failure
-first. Do not use a re-prefilled prefix as evidence for incremental state.
-
-## Metrics and advance policy
-
-Decode every compared blob to FP32. Let `A` be ROCm and let `B` be CPU.
-
-For `N` elements, report these metrics for every joined key:
+Decode joined blobs to FP32. Let `A` be ROCm and `B` be CPU. Report:
 
 ```text
 max_abs = max_i(abs(A_i - B_i))
@@ -363,323 +208,227 @@ rms     = sqrt(sum_i((A_i - B_i)^2) / N)
 rel_l2  = sqrt(sum_i((A_i - B_i)^2)) / sqrt(sum_i(B_i^2))
 ```
 
-If both vectors have zero L2 norm, define `rel_l2` as zero. If only `B` has zero
-L2 norm, define `rel_l2` as infinity.
+Define relative L2 as zero when both norms are zero and infinity when only `B`
+has zero norm. Report the worst index, both manifests, joined/rejected rows, and
+excluded steps. Refuse missing or duplicate keys, dtype/shape/byte mismatches,
+nonfinite values, and partial joins.
 
-The report must name directory A and directory B in words. It must report both
-manifest row counts, joined rows, rejected rows, and excluded post-divergence
-steps.
+These layer metrics are descriptive. They have no propagated numerical
+acceptance envelope, discontinuity multiplier, or post-measurement threshold.
+The rejected `E(k)` construction is removed because operation counts do not
+bound cancellation, conditioning, nonlinear sensitivity, correlated
+reductions, FP8 scaling/saturation, or subnormals.
 
-The comparator must refuse missing keys, duplicate keys, dtype mismatches,
-shape mismatches, byte-count mismatches, nonfinite values, and partial joins.
+Acceptance consists of both:
 
-Raw byte equality is not the cross-device acceptance rule. CPU and ROCm kernels
-can use different valid reduction orders.
+1. Ported active-pin operation tests with their exact upstream per-surface
+   tolerances. Examples include GDN `atol=rtol=1e-2` where
+   `test_cpu_gdn_ops.py` specifies it, exact convolution-state equality in the
+   split-core test, its dtype-specific output/SSM tolerances, and cache/CPU
+   attention FP8 tolerances selected by the upstream fixtures. Do not collapse
+   them into one project-wide tolerance.
+2. The established end-to-end 16-prompt strict-token and ratified 500
+   milli-nat near-tie gate against deterministic, cache-matched, active-pin
+   vLLM captures. A new physical cache mode needs its own capture and
+   teacher-forced gaps before it can be accepted.
 
-Use these unit roundoffs:
+If no upstream analogue exists for a layer boundary, report its metrics only.
+A future stage-level acceptance rule requires an independently justified bound
+or explicit developer ratification before values are inspected.
+
+## Provider and end-to-end contract
+
+For `auto` and `bfloat16`, require the established native operator set,
+including nonzero `kReshapeAndCache`, zero `kReshapeAndCacheFp8`, zero declines,
+and zero reference-tier hits. The two modes resolve to physical BF16 and must
+produce identical local token streams.
+
+For `fp8_e4m3`, replace the store requirement: require nonzero
+`kReshapeAndCacheFp8`, zero `kReshapeAndCache`, nonzero native selections for
+all other applicable operators, zero declines, and zero reference-tier hits.
+Provider sets are mode-specific; never require a BF16 store from a correct FP8
+run.
+
+The existing gate remains the permanent gate until #2773 produces reviewed
+active-pin evidence for an additional case. Characterization must run all three
+modes, but this spec alone does not authorize new permanent goldens.
+
+## Required capture-tool implementation
+
+The current `scripts/qwen3-oracle-capture.py` and
+`scripts/qwen3-neartie-gap.py` hard-code `enforce_eager=True` and expose no
+cache-dtype argument. Before active-pin capture, add reviewed options equivalent
+to:
 
 ```text
-u(FP32)       = 2^-24
-u(BF16)       = 2^-8
-u(FP8 E4M3)   = 2^-4
+--kv-cache-dtype {auto,bfloat16,fp8_e4m3}
+--execution-mode {production,eager}
+--seed INT
+--max-tokens INT
+--repetitions INT
+--model-revision REV
+--vllm-revision REV
+--provenance-out PATH
 ```
 
-Before reading cross-device results, finish the dtype audit. For each comparison
-key `k`, record `n(k,d)`, the executed round-to-nearest terms at dtype `d`.
+`production` must instantiate vLLM without `enforce_eager=True`; eager is a
+diagnostic arm and never the denominator. The output must record source, wheel,
+image and artifact hashes, complete arguments, a hash of the scripts' shared
+16-entry `PROMPTS` list, batching, concurrency, sampling, seed, token count,
+repetitions, cache mode, resolved
+cache dtype, execution mode, and output hash.
 
-Count a destination store as one term. Count each reduction term at its actual
-accumulator dtype. Cite the executing kernel for every count.
-
-Freeze the audit file hash before the comparator reads either cross-device dump.
-Compute this three-root-mean-square envelope:
-
-```text
-E(k) = 3 * sqrt((2 / 3) * sum_d(n(k,d) * u(d)^2))
-```
-
-The `sqrt(2)` term models two independent rounding paths. The `1 / sqrt(3)` term
-is the root mean square error of round-to-nearest.
-
-A key is inside the pre-registered dtype envelope only when both conditions hold:
-
-```text
-rel_l2 <= E(k)
-rms <= E(k) * sqrt(sum_i(B_i^2) / N)
-```
-
-Report `max_abs` and the worst index for diagnosis. Do not invent a fixed
-absolute threshold after the values are visible.
-
-For ordered layer boundaries, compute the nonnegative squared-error increment:
-
-```text
-delta(k) = max(0, rel_l2(k)^2 - rel_l2(input(k))^2)
-```
-
-Classify a discontinuity when `delta(k)` exceeds `E(k)^2` and four times the
-median increment for the same stage and layer family. Freeze this factor before
-the hardware run.
-
-The envelope classifies a result. It does not replace the end-to-end correctness
-gate.
-
-## Mismatch classification
-
-Classify every run as exactly one primary result:
-
-- `ARTIFACT_MISMATCH`: a source revision, model hash, or run configuration differs.
-- `INSTRUMENTATION_FAIL`: an enabled dump is incomplete or changes model output.
-- `NONDETERMINISTIC`: a same-arm repeat has a nonzero metric.
-- `STRUCTURE_MISMATCH`: key sets, active indices, shapes, or physical dtypes differ.
-- `DTYPE_WIDTH_MISMATCH`: local storage is wider than upstream without an accepted annotation.
-- `NONFINITE`: one arm creates a NaN or infinity that the other arm does not create.
-- `WITHIN_DTYPE_ENVELOPE`: every key meets the frozen envelope and has no discontinuity.
-- `ORDERING_DRIFT`: tokens pass, but one numerical key exceeds the frozen envelope without a structural error.
-- `NUMERICAL_DEFECT_CANDIDATE`: a state or layer discontinuity identifies a bounded production region.
-- `CORRECTNESS_FAIL`: the applicable end-to-end token gate fails.
-
-Apply the list in this precedence order:
-
-1. `ARTIFACT_MISMATCH`.
-2. `INSTRUMENTATION_FAIL`.
-3. `NONDETERMINISTIC`.
-4. `STRUCTURE_MISMATCH`.
-5. `DTYPE_WIDTH_MISMATCH`.
-6. `CORRECTNESS_FAIL`.
-7. `NONFINITE`.
-8. `NUMERICAL_DEFECT_CANDIDATE`.
-9. `ORDERING_DRIFT`.
-10. `WITHIN_DTYPE_ENVELOPE`.
-
-`CORRECTNESS_FAIL` therefore outranks every interpretable numerical label.
-`INSTRUMENTATION_FAIL` and `NONDETERMINISTIC` stop the cross-device reading.
-
-`WITHIN_DTYPE_ENVELOPE` does not promise equal state bytes. It means the measured
-difference fits the dtype-derived rounding model and the token gate passes.
-
-`ORDERING_DRIFT` does not authorize a wider tolerance. Record the exact stage,
-kernel chain, and token margin before any change.
-
-## End-to-end correctness gate
-
-Extend the current Qwen3.5 paged-engine gate with named cases for:
-
-1. `auto`.
-2. `bfloat16`.
-3. `fp8_e4m3`.
-
-Each case must set `EngineParams::kv_cache_dtype` explicitly. The test name and
-log must print the requested and resolved cache dtype.
-
-`auto` and `bfloat16` resolve to the same physical BF16 cache. Require their
-local token streams to match each other exactly.
-
-Capture a pinned vLLM oracle pair for each distinct physical cache mode. Do not
-reuse the BF16 teacher-forced gaps for FP8.
-
-For each mode, run the existing 16-prompt battery at its current token count.
-Keep the current strict-token report and ratified 500 milli-nat near-tie rule.
-
-The pinned vLLM oracle must use the same cache mode. Capture at least 10
-per-prompt greedy repeats and require determinism before creating a golden.
-
-Every ROCm case must prove all 15 required operators have nonzero native
-selections and zero declines. It must also assert `reference_tier_hits=0`.
-
-The state-dump characterization does not need to run the 16-prompt battery with
-dumps enabled. The narrow workload supplies internal evidence without dumping
-inactive capacity.
-
-## Tests and red-first evidence
-
-The implementation starts with tests that fail because the four state rows are
-absent. Capture the red output before editing production code.
-
-Add focused tests for these contracts:
-
-1. The state writer emits all four keys with the declared shape and FP32 dtype.
-2. A nonmonotonic slot mapping preserves input token order.
-3. Negative slot mappings produce no KV row.
-4. Inactive KV blocks and GDN slots produce no bytes.
-5. A BF16 state row is widened from the stored destination.
-6. An FP8 row is read after quantization and dequantized with its scale.
-7. GDN prefill and decode both read persistent post-write state.
-8. A missing required state row makes the per-step floor refuse.
-9. The comparator refuses duplicate, missing, partial, short, and nonfinite data.
-10. The comparator implements the zero-denominator rules exactly.
-11. The dtype audit rejects an unannotated wider local dtype.
-12. Each cache-mode gate prints its requested and resolved dtype.
-13. The ROCm gate rejects one injected reference-tier hit.
-
-The checkpoint-backed focused test must enter through
-`LoadedEngine::FromModelDir`. A hand-built `PagedKvCache` test can test the
-gather helper but cannot prove production reachability.
-
-Run the focused CPU tests before hardware work. Run the ROCm cases only inside
-the required GPU lease and file mutex.
-
-`IMP-TEST-FIRST` and `IMP-MUTATE` do not apply to this spec-only commit. This
-commit changes no behavior that a test or mutation can falsify.
-
-They apply to the later implementation. Preserve each red result and each
-mutation result in that implementation's evidence.
-
-## Review mutations
-
-A fresh reviewer reviews one immutable implementation head. The reviewer uses a
-scratch copy and restores every file byte for byte after each mutation.
-
-Run these mutations separately:
-
-1. Delete the production probe after `dense_attn::WriteKvCache`.
-2. Delete the shared GDN post-write probe.
-3. Replace the post-write KV read with `kw` and `vw`.
-4. Replace the post-write GDN read with `dcs` and `dss`.
-5. Remove negative-slot filtering.
-6. Sort active rows by physical slot.
-7. Dump the full allocated cache capacity.
-8. Report the FP8 physical dtype as BF16.
-9. Remove one cache-mode test case.
-10. Force one ROCm operator to the reference tier.
-11. Delete the `LoadedEngine::FromModelDir` production call from the focused test.
-
-Each mutation must make its named test fail for the intended reason. A green
-reachability mutation is a review finding.
-
-Record the immutable head, scratch path, command, exit status, and restored tree
-hash for each mutation.
-
-## Gates
-
-The later implementation must pass these gates in order:
-
-1. Confirm the checkpoint and oracle hashes.
-2. Capture the red focused tests.
-3. Pass the dump-writer and comparator tests on CPU.
-4. Pass the checkpoint-backed CPU trace case.
-5. Run the full controlled preflight.
-6. Get a fresh immutable review with all mutations detected.
-7. Run two CPU and two ROCm trace repeats for each cache mode.
-8. Pass the dump-disabled identity control for every arm and mode.
-9. Pass all three ROCm paged-engine end-to-end cases.
-10. Prove zero ROCm reference-tier hits in every case.
-11. Have the operator rerun the focused, full, and hardware gates.
-
-Use this controlled environment for local repository gates:
+Extend `test_qwen35_paged_engine` with future environment inputs
+`VT_QWEN35_GATE_DIR` and `VT_QWEN35_KV_CACHE_DTYPE`. The first selects an empty
+issue-evidence directory instead of the committed golden directory. The second
+sets `EngineParams::kv_cache_dtype` and prints requested, resolved, and physical
+dtype. These commands describe the intended interface and data flow after
+those changes. They are future commands and will fail today:
 
 ```sh
-PATH=/usr/local/bin:/usr/bin:/bin \
-PYTHONPATH=$PWD \
-GIT_CONFIG_GLOBAL=/dev/null \
-scripts/agent-preflight.sh
+VLLM_PIN=e126687a9a828d513c01a07cd69f025f27d63280
+MODEL_REV=2fc06364715b967f1860aea9cf38778875588b17
+MODEL="${CHECKPOINT_ROOT}/Qwen3.5-0.8B"
+for mode in auto bfloat16 fp8_e4m3; do
+  GOLDEN_DIR="evidence/2773/sacred-${mode}"
+  test ! -e "${GOLDEN_DIR}"
+  mkdir -p "${GOLDEN_DIR}"
+  "${VLLM_ORACLE}" scripts/qwen3-oracle-capture.py \
+    --model "${MODEL}" --model-revision "${MODEL_REV}" \
+    --vllm-revision "${VLLM_PIN}" \
+    --kv-cache-dtype "${mode}" --execution-mode production --seed 0 \
+    --max-tokens 16 --runs 10 --per-prompt --out-dir "${GOLDEN_DIR}" \
+    --provenance-out "evidence/2773/oracle-${mode}.json"
+  VT_QWEN35_GATE_DIR="${GOLDEN_DIR}" \
+  VT_QWEN35_KV_CACHE_DTYPE="${mode}" \
+  VT_DUMP_IDS=1 build-rocm/tests/test_qwen35_paged_engine
+  test -s "${GOLDEN_DIR}/our_ids.i32"
+  "${VLLM_ORACLE}" scripts/qwen3-neartie-gap.py \
+    --model "${MODEL}" --model-revision "${MODEL_REV}" \
+    --vllm-revision "${VLLM_PIN}" \
+    --kv-cache-dtype "${mode}" --execution-mode production --seed 0 \
+    --max-tokens 16 --topk 20 --golden-dir "${GOLDEN_DIR}" \
+    --provenance-out "evidence/2773/neartie-${mode}.json"
+  VT_QWEN35_GATE_DIR="${GOLDEN_DIR}" \
+  VT_QWEN35_KV_CACHE_DTYPE="${mode}" \
+    build-rocm/tests/test_qwen35_paged_engine
+done
 ```
 
-An exit status of zero with skipped checks is not green. List each skip and its
-reason.
+The tools must refuse when their `PROMPTS` lists differ from each other or from
+`tests/parity/test_qwen35_paged_engine.cpp::Prompts`. Record exact as-run
+commands. Do not create a golden unless all 10 repeats are deterministic.
 
-The hardware run must use the repository's lease procedure. Use the file mutex
-inside the lease because the target is a non-fleet local GPU unless `rc devices`
-reports it as a fleet device.
+The internal CPU/ROCm state characterization remains eight output tokens as
+specified under `Workload and backend identity`. The permanent sacred-gate
+candidate uses the existing 16-prompt, 16-output-token regime above. Never use
+the eight-token characterization files as sacred-gate goldens.
+
+## Tests and review mutations
+
+The later implementation starts with focused tests that fail because the four
+state rows and capture options are absent. It must test row shape/dtype,
+nonmonotonic and negative slot mappings, inactive-capacity exclusion, stored
+BF16 widening, post-quantization FP8 dequantization, persistent GDN prefill and
+decode state, incomplete-step refusal, comparator structural refusals and
+zero-denominator rules, dtype-width refusal, backend/dtype logging, and
+mode-appropriate provider sets. The checkpoint-backed case must enter through
+`LoadedEngine::FromModelDir`.
+
+A fresh reviewer mutates each guarantee in a scratch copy: remove each
+production probe, substitute pre-write tensors, remove negative-slot filtering,
+sort by physical slot, dump capacity, misreport FP8 as BF16, swap the mode's
+cache-store operator, inject a reference-tier hit, remove the production entry
+point, and force eager oracle mode. Each focused test must fail for the intended
+reason and the reviewer must restore the tree byte for byte.
+
+This spec repair changes no runtime behavior. `IMP-TEST-FIRST` and
+`IMP-MUTATE` are future implementation/review gates, not evidence claimed by
+this commit.
+
+## Gate order
+
+The later implementation must satisfy, in order:
+
+1. #2772 lands and the unchanged default local gate passes on the chosen base.
+2. A runnable active-pin ROCm vLLM runtime is identified and proves this model.
+3. Artifact, source, wrapper, wheel, image, prompt, and output hashes are saved.
+4. The capture tools fail first for missing options, then pass focused tests.
+5. Ported active-pin operation tests pass with unchanged upstream tolerances.
+6. Dump/comparator CPU tests and checkpoint-backed CPU trace pass.
+7. The controlled full preflight runs; every skip remains `PENDING`.
+8. Fresh immutable review detects every required mutation.
+9. Two CPU and two gfx1100 trace repeats plus disabled controls pass per mode.
+10. Cache-matched active-pin production captures are deterministic and the
+    established end-to-end gate passes per measured mode.
+11. Mode-appropriate native selections are nonzero, with zero declines and
+    zero reference-tier hits.
+12. The operator independently reruns focused, full, oracle, and hardware gates.
+
+No GPU result, oracle result, model execution, runtime mutation, or
+implementation test is claimed by this spec-only repair.
 
 ## Evidence required
 
-Record this evidence for the implementation and hardware run:
+Store evidence under an issue-specific durable path and record commit/tree
+hashes, clean status, exact commands/statuses, every skip, active oracle and
+artifact hashes, compiler/build/ROCm/driver/board identity, GPU mutex evidence,
+requested/resolved/physical cache dtype, selected CPU and ROCm attention
+backends, provider counts, enabled repeats, disabled controls, manifests, raw
+dumps, metric tables, first divergence, excluded steps, upstream tolerance
+anchors, red-first output, mutations, fresh review, and operator reruns.
 
-- The implementation commit and tree hashes.
-- The clean source status before and after each gate.
-- The exact checkpoint hashes and upstream revision.
-- The compiler, build type, ROCm version, kernel driver, board name, and `gfx1100` architecture.
-- The GPU lease identity or the non-fleet mutex evidence.
-- The exact commands and exit statuses.
-- Every preflight skip.
-- The requested and resolved cache dtype for each run.
-- The physical cache dtype and allocated bytes for each state surface.
-- The operator-provider selection, decline, and reference-tier counts.
-- Both enabled repeats and the disabled identity control.
-- Both manifests and all raw dump paths.
-- The frozen dtype-audit file and its hash.
-- The full metric table for every joined key.
-- The first token divergence and excluded step count.
-- The selected mismatch classification.
-- The red-first output and every review mutation result.
-- The fresh reviewer report on the immutable head.
-- The operator's independent gate rerun.
-
-Keep raw evidence under an issue-specific evidence path. Do not publish a result
-from temporary files that the reviewer cannot inspect.
-
-The spec-only preflight ran at the pinned base with the controlled environment.
-It returned zero and skipped 10 checks.
-
-Five LTX-2.5 checks skipped because NumPy was unavailable. Three ISA checks
-required compile commands. The pull-request size check required base and head
-arguments. The Triton AOT check required a vendored source root.
-
-This result is `PENDING`, not green. No source build, checkpoint inference, or
-GPU gate applies to this spec-only commit.
+Classify structural and execution failures before interpreting metrics:
+`ARTIFACT_MISMATCH`, `INSTRUMENTATION_FAIL`, `NONDETERMINISTIC`,
+`STRUCTURE_MISMATCH`, `DTYPE_WIDTH_MISMATCH`, `CORRECTNESS_FAIL`, or
+`NONFINITE`. When none applies, report descriptive metrics and the separate
+operation/end-to-end acceptance results. Do not invent `WITHIN_DTYPE_ENVELOPE`
+or `ORDERING_DRIFT` labels.
 
 ## Risks
 
-- The dump can synchronize the queue and perturb scheduling. The disabled
-  identity controls detect output changes.
-- FP8 K or V near a quantization boundary can change one stored code. Numeric
-  comparison occurs after dequantization and never assumes byte equality.
-- GDN update kernels use different reduction orders on CPU and ROCm. The frozen
-  dtype envelope classifies that difference without widening after measurement.
-- A greedy divergence makes later steps incomparable. The comparator excludes
-  those steps and reports the exclusion.
-- The FP32 canonical dump can hide a physical-width error. The independent byte
-  audit and run narrative cover the storage width.
-- A probe before the write can look plausible. The pre-write substitutions are
-  required review mutations.
-- Static environment parsing can mix output directories. Separate processes and
-  empty directories prevent that collision.
-- The current gate goldens describe the BF16 default. FP8 needs its own pinned
-  oracle capture and teacher-forced gaps.
-- Issue #1588 currently lacks the required first-line `Row:` metadata. An
-  authorized operator must reconcile it before the pull request lands.
-- Graph activation changes execution order and invalidates this characterization.
-  Issue #332 requires a new graph-on measurement.
+- Probes can synchronize queues; disabled controls detect output perturbation.
+- FP8 boundaries can change codes; compare dequantized values and record bytes.
+- Different valid reduction orders can produce descriptive CPU/ROCm deltas.
+- Backend fallback can change the diagnostic denominator; explicit backend
+  logging exposes it.
+- Greedy divergence makes later states incomparable; exclude them.
+- The active source object can be read while the active runtime remains absent;
+  never convert source availability into a gate pass.
 
 ## Stop conditions
 
-- Stop with `NEEDS_CONTEXT` if any required revision, hash, model file, or board
-  identity is unavailable.
-- Stop if the issue, spec, and pull request do not name `BACKEND-ROCM` together.
-- Stop if the dump changes tokens or logits on either arm.
-- Stop if a same-arm repeat is not deterministic.
-- Stop if a manifest omits an active row or includes inactive capacity.
-- Stop if the dtype audit is not frozen before cross-device results are read.
-- Stop if the local chain cannot name an upstream dtype for a compared surface.
-- Stop if any ROCm operator declines or reaches the reference tier.
-- Stop if the running device is not an RX 7900 XTX with architecture `gfx1100`.
-- Stop if ROCm static graph mode becomes true before the measurement.
-- Stop before changing a tolerance after result values are visible.
-- Stop before fixing an unexpected numerical defect without the required issue
-  and fresh implementation flow.
-- Do not report a hardware pass from a skipped test.
+- Stop before implementation until this spec receives a fresh `PASS`.
+- Keep correctness `PENDING` until #2772 lands and the unchanged default gate
+  passes on the implementation base.
+- Stop active-pin capture until a runnable active-pin ROCm runtime is proved.
+- Stop on a revision/hash/configuration mismatch, dump perturbation,
+  nondeterminism, incomplete manifest, unexplained backend, provider decline,
+  reference-tier hit, wrong board, missing GPU mutex, or divergent input prefix.
+- Stop before changing tolerances or permanent sacred-gate scope after seeing
+  results.
+- File and assign a new issue before fixing any unexpected defect outside
+  #2773.
 
 ## Git integration
 
-Use one pull request for the spec and implementation. This is the repository
-policy default for `BACKEND-ROCM` and the selected shape for this row.
-
-Commit this spec before any implementation. A fresh implementer starts from the
-committed spec.
-
-Keep the work on `row/BACKEND-ROCM-NUMERICS-1588`. The spec implementer does not
-push or open the pull request.
-
-The pull request body must link issue #1588 and close it when the complete work
-lands. The issue's `Row:` line, this spec, and the pull request must agree.
+Use one pull request for the committed spec and later implementation, following
+the recorded repository default. Preserve rejected spec commit `7bc2546e9` in
+history. The eventual pull request body must name row `BACKEND-ROCM`, link and
+close #2773, and carry the required trailers. The spec implementer does not
+push, open, or merge that pull request.
 
 ## Owed
 
-- Issue #1588 owes its first-line `Row: BACKEND-ROCM` metadata before landing.
-- A fresh implementer owes the state probes, tests, comparator changes, and
-  three-mode end-to-end gate.
-- A fresh reviewer owes static review and every mutation in this spec.
-- The operator owes the controlled build and the RX 7900 XTX hardware run.
-- The operator owes the pinned vLLM production runs for all cache modes.
-- The final implementation change owes an `## Outcome` in this spec.
-- Issue #332 owns the graph-enabled repetition after ROCm graph activation.
+- A maintainer owes the merge decision for reviewed PR #2856; #2772 remains
+  pending until it lands.
+- #2773 owes the runnable active-pin Qwen3.5-0.8B ROCm captures, even though
+  #2794 supplies repository sync context.
+- A fresh reviewer owes this repaired spec a verdict.
+- A fresh implementer owes the capture options, state probes, tests, comparator,
+  and provider checks after the prerequisites pass.
+- A fresh implementation reviewer owes static review and every mutation.
+- The operator owes the independent controlled and gfx1100 gates.
+- The final implementation adds `## Outcome` with measured results, rejected
+  alternatives, and reasons for defaults.
+- Issue #332 owns the graph-enabled repetition.

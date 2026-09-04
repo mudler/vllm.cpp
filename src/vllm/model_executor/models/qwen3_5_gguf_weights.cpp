@@ -1100,11 +1100,14 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // tensors (out_proj/ssm_out) stay kTransformedWeight and expand to bf16.
   // T21 env gate: VT_GDN_ROWPERM_KEEP_QUANT=0 forces the row-permuted tensors
   // back to kTransformedWeight (bf16 expansion) for A/B isolation.
+  // Opt-in, by VALUE like its VT_GDN_COLPERM_KEEP_QUANT sibling: unset keeps
+  // the load path byte-identical to the trunk (reorder, then expand to bf16).
+  // A default-on flip here silently changed the trunk numerics of every
+  // row-permuted V-head projection and broke the token-exact gate -- caught on
+  // the gfx1100 engine leg, reverted to opt-in.
   const char* rpkq = std::getenv("VT_GDN_ROWPERM_KEEP_QUANT");
   const bool rowperm_keep =
-      rpkq == nullptr ||
-      !(std::strcmp(rpkq, "0") == 0 || std::strcmp(rpkq, "false") == 0 ||
-        std::strcmp(rpkq, "off") == 0);
+      rpkq != nullptr && rpkq[0] == '1' && rpkq[1] == '\0';
   const GgufTensorRole proj_role = reorder
                                        ? GgufTensorRole::kTransformedWeight
                                        : GgufTensorRole::kMatmulWeight;

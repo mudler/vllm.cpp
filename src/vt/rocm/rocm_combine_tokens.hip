@@ -30,12 +30,22 @@ hipStream_t AsStream(const Queue& q) {
 
 // _combine_sampled_and_draft_tokens_kernel (input_batch.py:304-360), input_ids
 // splice only (our logits_indices come from prepare_inputs). One thread per
-// request row.
+// request row. Line-for-line the CUDA CombineKernel (cuda_combine_tokens.cu),
+// full contract: num_logits derives from cu_num_logits (null == arange == ONE
+// per row — not num_new_sampled_tokens; the two part at 0), and the
+// num_logits - num_new_sampled_tokens draft tokens splice from the draft
+// buffer. The trap replaces the host's two VT_CHECKs (stride narrower than the
+// row count; null draft buffer while drafts are due) exactly as the CUDA arm's
+// __trap() does — __builtin_trap() because HIP exposes no __trap() alias in
+// every header set this file compiles under.
 __global__ void CombineKernel(int32_t* input_ids, const int32_t* idx_mapping,
                               const int32_t* last_sampled_tokens,
                               const int32_t* query_start_loc,
                               const int32_t* seq_lens,
-                              const int32_t* prefill_len, int num_reqs,
+                              const int32_t* prefill_len,
+                              const int32_t* draft_tokens,
+                              int draft_tokens_stride,
+                              const int32_t* cu_num_logits, int num_reqs,
                               int num_new_sampled_tokens) {
   const int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (batch_idx >= num_reqs) return;
@@ -43,15 +53,32 @@ __global__ void CombineKernel(int32_t* input_ids, const int32_t* idx_mapping,
   const int req_state_idx =
       idx_mapping != nullptr ? idx_mapping[batch_idx] : batch_idx;
 
-  const int num_logits = num_new_sampled_tokens;
+  const int num_logits =
+      cu_num_logits != nullptr
+          ? cu_num_logits[batch_idx + 1] - cu_num_logits[batch_idx]
+          : 1;
+  const int num_draft_tokens = num_logits - num_new_sampled_tokens;
+
   const int query_end = query_start_loc[batch_idx + 1];
+  const int logits_start = query_end - num_logits;
 
   const int seq_len = seq_lens[batch_idx];
   const int pf = prefill_len[req_state_idx];
   if (seq_len <= pf) return;
 
-  if (num_new_sampled_tokens > 0) {
-    input_ids[query_end - num_logits] = last_sampled_tokens[req_state_idx];
+  const int first_logit_seq_pos = seq_len - num_logits;
+  if (num_new_sampled_tokens > 0 && first_logit_seq_pos >= pf) {
+    input_ids[logits_start] = last_sampled_tokens[req_state_idx];
+  }
+
+  if (num_draft_tokens > 0) {
+    if (draft_tokens == nullptr || draft_tokens_stride < num_draft_tokens) {
+      __builtin_trap();
+    }
+    for (int b = 0; b < num_draft_tokens; ++b) {
+      input_ids[query_end - num_draft_tokens + b] =
+          draft_tokens[req_state_idx * draft_tokens_stride + b];
+    }
   }
 }
 
@@ -92,18 +119,18 @@ __global__ void ApplyLastSampledOpsKernel(int32_t* last_sampled_tokens,
 
 }  // namespace
 
-void LaunchCombineSampledAndDraftTokens(Queue& queue, int32_t* input_ids,
-                                        const int32_t* idx_mapping,
-                                        const int32_t* last_sampled_tokens,
-                                        const int32_t* query_start_loc,
-                                        const int32_t* seq_lens,
-                                        const int32_t* prefill_len, int num_reqs,
-                                        int num_new_sampled_tokens) {
+void LaunchCombineSampledAndDraftTokens(
+    Queue& queue, int32_t* input_ids, const int32_t* idx_mapping,
+    const int32_t* last_sampled_tokens, const int32_t* query_start_loc,
+    const int32_t* seq_lens, const int32_t* prefill_len,
+    const int32_t* draft_tokens, int draft_tokens_stride,
+    const int32_t* cu_num_logits, int num_reqs, int num_new_sampled_tokens) {
   if (num_reqs <= 0) return;
   const int grid = (num_reqs + kBlock - 1) / kBlock;
   hipLaunchKernelGGL(CombineKernel, dim3(grid), dim3(kBlock), 0, AsStream(queue),
                      input_ids, idx_mapping, last_sampled_tokens,
-                     query_start_loc, seq_lens, prefill_len, num_reqs,
+                     query_start_loc, seq_lens, prefill_len, draft_tokens,
+                     draft_tokens_stride, cu_num_logits, num_reqs,
                      num_new_sampled_tokens);
   Check(hipGetLastError(), "CombineKernel launch");
 }

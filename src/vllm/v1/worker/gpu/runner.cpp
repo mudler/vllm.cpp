@@ -46,9 +46,7 @@
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
 #if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
-#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
 #include "vt/cuda/combine_tokens.h"  // W3 device combine/scatter (removes the sync)
-#endif
 #ifdef VLLM_CPP_HIP
 #include "vt/rocm/combine_tokens.h"  // W3 device combine/scatter (ROCm port)
 #endif
@@ -64,16 +62,19 @@ namespace {
 void DispatchCombineSampledAndDraftTokens(
     vt::Queue& q, int32_t* input_ids, const int32_t* idx_mapping,
     const int32_t* last_sampled_tokens, const int32_t* query_start_loc,
-    const int32_t* seq_lens, const int32_t* prefill_len, int num_reqs,
-    int num_new_sampled_tokens) {
+    const int32_t* seq_lens, const int32_t* prefill_len,
+    const int32_t* draft_tokens, int draft_tokens_stride,
+    const int32_t* cu_num_logits, int num_reqs, int num_new_sampled_tokens) {
 #if defined(VLLM_CPP_CUDA)
   vt::cuda::LaunchCombineSampledAndDraftTokens(
       q, input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
-      seq_lens, prefill_len, num_reqs, num_new_sampled_tokens);
+      seq_lens, prefill_len, draft_tokens, draft_tokens_stride, cu_num_logits,
+      num_reqs, num_new_sampled_tokens);
 #elif defined(VLLM_CPP_HIP)
   vt::rocm::LaunchCombineSampledAndDraftTokens(
       q, input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
-      seq_lens, prefill_len, num_reqs, num_new_sampled_tokens);
+      seq_lens, prefill_len, draft_tokens, draft_tokens_stride, cu_num_logits,
+      num_reqs, num_new_sampled_tokens);
 #endif
 }
 

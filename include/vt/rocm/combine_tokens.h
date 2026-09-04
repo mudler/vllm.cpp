@@ -16,25 +16,33 @@
 
 namespace vt::rocm {
 
-// combine_sampled_and_draft_tokens (input_batch.py:304-406, T0 non-spec subset:
-// NUM_NEW_SAMPLED_TOKENS == 1, no draft tokens). For each request row b, if the
-// row is a decode row (seq_lens[b] > prefill_len[req_state]) splice the last
+// combine_sampled_and_draft_tokens (input_batch.py:304-406). Same FULL contract
+// as the CUDA CombineKernel (vt/cuda/combine_tokens.h): num_logits comes from
+// cu_num_logits (null == arange, i.e. ONE per row — NOT num_new_sampled_tokens;
+// the two part at 0), and num_logits - num_new_sampled_tokens draft tokens are
+// spliced from draft_tokens[req_state * draft_tokens_stride + b]. The current
+// runner only ever reaches the subset draft_tokens == nullptr &&
+// cu_num_logits == nullptr && num_new_sampled_tokens == 1 (T0 non-spec), but
+// the signatures must stay IDENTICAL across backends — the shared dispatcher
+// (runner.cpp DispatchCombineSampledAndDraftTokens) forwards the same argument
+// list to both, and the CUDA arm asserts the draft-bearing staging (A2-3) with
+// a device trap rather than a silent skip. For each request row b, if the row
+// is a decode row (seq_lens[b] > prefill_len[req_state]) splice the last
 // sampled token into input_ids at the decode position (query_start_loc[b+1] -
-// num_new_sampled_tokens). Prefill/chunked-prefill rows (seq_len <= prefill_len)
-// keep their prompt token. idx_mapping is the batch-row -> req_state indirection
-// (the abort/finish reorder); pass nullptr for the identity mapping (our
-// persistent batch is condensed dense, so batch row == req_state slot). Our
-// runner builds logits_indices in prepare_inputs, so this kernel writes only the
-// input_ids splice (the upstream kernel's logits_indices store is not needed
-// here). Launched on the MAIN queue BEFORE the forward (outside any decode-graph
+// num_logits). Prefill/chunked-prefill rows (seq_len <= prefill_len) keep their
+// prompt token. idx_mapping is the batch-row -> req_state indirection (the
+// abort/finish reorder); pass nullptr for the identity mapping (our persistent
+// batch is condensed dense, so batch row == req_state slot). Our runner builds
+// logits_indices in prepare_inputs, so this kernel writes only the input_ids
+// splice (the upstream kernel's logits_indices store is not needed here).
+// Launched on the MAIN queue BEFORE the forward (outside any decode-graph
 // capture — input prep always precedes the graph replay).
-void LaunchCombineSampledAndDraftTokens(Queue& queue, int32_t* input_ids,
-                                        const int32_t* idx_mapping,
-                                        const int32_t* last_sampled_tokens,
-                                        const int32_t* query_start_loc,
-                                        const int32_t* seq_lens,
-                                        const int32_t* prefill_len, int num_reqs,
-                                        int num_new_sampled_tokens);
+void LaunchCombineSampledAndDraftTokens(
+    Queue& queue, int32_t* input_ids, const int32_t* idx_mapping,
+    const int32_t* last_sampled_tokens, const int32_t* query_start_loc,
+    const int32_t* seq_lens, const int32_t* prefill_len,
+    const int32_t* draft_tokens, int draft_tokens_stride,
+    const int32_t* cu_num_logits, int num_reqs, int num_new_sampled_tokens);
 
 // post_update last_sampled scatter (input_batch.py:457-543 / states.py): record
 // each row's freshly sampled id into last_sampled_tokens[req_state] on the MAIN

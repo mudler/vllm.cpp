@@ -535,6 +535,10 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, int N,
                 int K, int device);
 
+// Effective YTILE after the T16 sweep knobs (VT_WVSPLIT_YTILE, default 4) —
+// the gate must test the SAME tile the kernel will run.
+int WvSplitKYtile();
+
 // Row-major trick: gemm(OP_T, OP_N, N, M, K, B, K, A, a_rs, C, N)
 //   BLAS: C = op(A)*op(B) with opA=T => A is KxN in col form = row B[N,K]
 //   opB=N, B is KxM col = row A[M,K] with ld=a_rs
@@ -569,14 +573,16 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   //   * N > 8 (upstream `m > 8`, utils.py:181 — the feature-dim lower bound;
   //     at N==1 the kernel's y=1 store writes C[1] past the end of a 1-wide
   //     output);
-  //   * N % YTILE == 0 (skinny_gemms.cu:1217 `M_in % _YTILE == 0`; YTILE=2 —
-  //     the last wave's y=1 store lands at C[N] on odd N);
+  //   * N % YTILE == 0 (skinny_gemms.cu:1217 `M_in % _YTILE == 0` — the last
+  //     wave's stores land past C[N] otherwise; the tile is the T16-effective
+  //     one, NOT the donor's fixed 2: with the YT=4 default an N ≡ 2 mod 4
+  //     shape would write two columns past the row under the old N%2 gate);
   //   * wave32 arch only (the gfx9 ROW_BCAST reduction arm is not ported);
   //   * K % 8 == 0 and the LDS-fit (K*M activation fits the staging buffer);
   //   everything else stays on the BLAS path.
   if (bf16 && out.dtype == DType::kBF16 && M >= 1 && M <= 4 && (K % 8) == 0 &&
-      N > 8 && (N % 2) == 0 && a.stride[0] == K && K * M <= 32768 &&
-      SkinnyGemmEnabled() &&
+      N > 8 && (N % vt::rocm::WvSplitKYtile()) == 0 && a.stride[0] == K &&
+      K * M <= 32768 && SkinnyGemmEnabled() &&
       vt::rocm::SkinnyGemmArchOk(q.device.index, vt::rocm::DeviceArchName)) {
     WvSplitKBT(s, out.data, a.data, b.data, static_cast<int>(M), static_cast<int>(N),
                static_cast<int>(K), q.device.index);

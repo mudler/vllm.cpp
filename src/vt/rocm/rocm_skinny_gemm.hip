@@ -252,6 +252,16 @@ void WvSplitKBTLaunch(hipStream_t s, void* out, const void* a, const void* b,
 
 }  // namespace
 
+// Effective YTILE after the T16 sweep knobs, cached identically to the launch
+// path's static cfg. The dispatch gate (rocm_matmul_hipblaslt.hip) tests
+// N % YTILE == 0 against THIS value: the kernel's unguarded y-tile stores are
+// memory-safe only for N a multiple of the tile actually launched, and the
+// T16 default flip to 4 made the old N%2 gate too weak.
+int WvSplitKYtile() {
+  static const WvCfg cfg = WvCfgFromEnv();
+  return cfg.yt;
+}
+
 // out[M,N] = a[M,K] @ b[N,K]^T, bf16 in/out. Only called for the decode-skinny
 // gate below (M in 1..4, K%8==0); the caller keeps every other shape on the
 // BLAS path.

@@ -32,6 +32,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 
 #include "vt/cpu/cpu_quant_blocks.h"
 #include "vt/rocm/rocm_act_quant.h"
@@ -170,7 +171,12 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
   __shared__ float wave_amax[kBlock / 32];
   extern __shared__ char dyn_smem[];
   Tout* lds_out = reinterpret_cast<Tout*>(dyn_smem);
-  const bool vec = sizeof(Tin) == 2 &&
+  // The vector body decodes the gamma as 8 bf16 halves per uint4, so a
+  // non-bf16 gamma (kF32/kF16 are admitted by DispatchRmsNormWeight,
+  // independent of Tin) MUST take the scalar path, whose Load() overloads
+  // decode per dtype. sizeof(Tw)==2 alone would still misread an f16 gamma.
+  const bool vec =
+                   std::is_same_v<Tw, __hip_bfloat16> && sizeof(Tin) == 2 &&
                    (rrow == nullptr || sizeof(Tres) == 2) &&
                    (reinterpret_cast<uintptr_t>(xrow) & 15u) == 0 &&
                    (reinterpret_cast<uintptr_t>(orow) & 15u) == 0 &&
@@ -319,7 +325,11 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
     for (int sb = 0; sb < nsb; ++sb) {
       vt::cpu::BlockQ8_K& y = q8_out[static_cast<int64_t>(row) * nsb + sb];
       const float x = DLoadAct(quant_src, q8_adt, static_cast<int64_t>(sb) * kQK_K + tid);
-      float mx = x, amax = fabsf(x);
+      // Seed 0 like the standalone QuantizeQ8KK (strict > keeps the first
+      // occurrence and rejects NaN): seeding from x let a NaN element poison
+      // d and diverge from the scalar contract's zero block.
+      float mx = 0.0f, amax = 0.0f;
+      if (x == x) { mx = x; amax = fabsf(x); }
       for (int off = waveSz / 2; off > 0; off >>= 1) {
         const float ox = __shfl_down_sync(0xffffffffULL, mx, off);
         const float oa = __shfl_down_sync(0xffffffffULL, amax, off);

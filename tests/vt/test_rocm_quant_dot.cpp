@@ -78,6 +78,12 @@ const WeightCase kCases[] = {
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
     {DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
     {DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
+    // Q8_0 is NOT a Q8_K-superblock encoding: it dots a Q8_0 activation and is
+    // served by the *Gdn kernels this file delegates to. It sits in the same
+    // table because both arms of the provider must keep serving it -- dropping
+    // it from the grouped delegation list turns a working MoE format into a
+    // throw, and only a case here catches that.
+    {DType::kQ8_0, 32, 34, 0, -1, "q8_0"},
 };
 
 void GenerateData(float offset, size_t n, float* dst) {
@@ -141,7 +147,7 @@ Tensor DevTensor(void* p, DType dt, const std::vector<int64_t>& shape) {
 
 }  // namespace
 
-TEST_CASE("ROCm keep-quant GEMM == CPU reference and f64 dequant (Q8_K family)") {
+TEST_CASE("ROCm keep-quant GEMM == CPU reference and f64 dequant") {
   if (!HasRocm()) {
     MESSAGE("no ROCm backend on this host; ROCm keep-quant gate skipped");
     return;

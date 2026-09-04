@@ -1504,6 +1504,33 @@ bool Q6KSmallPrivateEnabled() {
 
 
 }  // namespace
+
+// T4a dispatch-route counters. Incremented on the decode hot path; read by
+// the focused test's byte-equality gate through the quant scratch hook.
+struct MmvqRouteCounts {
+  long long baseline;    // KQuantGemmK warp-reduction dispatches
+  long long gemv_mmvq;   // non-fused MMVQ GEMV dispatches (standalone quant)
+  long long gemv_fused;  // fused-fold sub-branch dispatches
+};
+
+namespace {
+std::atomic<long long> g_mmvq_route_baseline{0};
+std::atomic<long long> g_mmvq_route_gemv{0};
+std::atomic<long long> g_mmvq_route_fused{0};
+}  // namespace
+
+void MmvqResetRouteCountsForTesting() {
+  g_mmvq_route_baseline.store(0, std::memory_order_relaxed);
+  g_mmvq_route_gemv.store(0, std::memory_order_relaxed);
+  g_mmvq_route_fused.store(0, std::memory_order_relaxed);
+}
+
+MmvqRouteCounts MmvqRouteCountsForTesting() {
+  return {g_mmvq_route_baseline.load(std::memory_order_relaxed),
+          g_mmvq_route_gemv.load(std::memory_order_relaxed),
+          g_mmvq_route_fused.load(std::memory_order_relaxed)};
+}
+
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
 // the single-warp `KQuantGemmK` the path has always had.
 //
@@ -1621,34 +1648,6 @@ void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
 // observable even though the ON and OFF arms are bit-equal on outputs (the
 // round-2 review gaps F1/F2). Graph-replay reasoning: during stream capture
 // a kernel launch is RECORDED as a graph node and NOT executed, so these
-// counters advance exactly once per capture-time dispatch call and NEVER per
-// replay iteration -- replay multiplicity cannot skew a witness. No
-// per-thread GPU work and no capture-path behavior change beyond one integer
-// increment on the host dispatch path.
-struct MmvqRouteCounts {
-  long long baseline;    // KQuantGemmK warp-reduction dispatches
-  long long gemv_mmvq;   // non-fused MMVQ GEMV dispatches (standalone quant)
-  long long gemv_fused;  // fused-fold sub-branch dispatches
-};
-
-namespace {
-std::atomic<long long> g_mmvq_route_baseline{0};
-std::atomic<long long> g_mmvq_route_gemv{0};
-std::atomic<long long> g_mmvq_route_fused{0};
-}  // namespace
-
-void MmvqResetRouteCountsForTesting() {
-  g_mmvq_route_baseline.store(0, std::memory_order_relaxed);
-  g_mmvq_route_gemv.store(0, std::memory_order_relaxed);
-  g_mmvq_route_fused.store(0, std::memory_order_relaxed);
-}
-
-MmvqRouteCounts MmvqRouteCountsForTesting() {
-  return {g_mmvq_route_baseline.load(std::memory_order_relaxed),
-          g_mmvq_route_gemv.load(std::memory_order_relaxed),
-          g_mmvq_route_fused.load(std::memory_order_relaxed)};
-}
-
 // --- Lever C (GFX1100-TG200-NORMQ): producer-fused Q8_K norm epilogue bridge
 // (see rocm_norm_quant_bridge.h for the contract). Single-slot latest-producer
 // token; matching K-quant consumers skip the standalone QuantizeQ8KK, any

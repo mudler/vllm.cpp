@@ -112,20 +112,31 @@ explicitly labeled historical:
   defines split/unified state and output comparisons.
 - `tests/kernels/attention/test_cache.py::test_reshape_and_cache` defines
   cache-store dtype behavior and FP8 comparison tolerances.
-- `tests/kernels/attention/test_cpu_attn.py::_run_varlen_with_paged_kv`
-  defines cache-mode-aware CPU attention tolerances; its `_FP8_ATOL` and
-  `_FP8_RTOL` constants select the FP8 bounds.
+- `tests/kernels/attention/test_cpu_attn.py::varlen_with_paged_kv` starts at
+  line 415. Its `_FP8_ATOL` and `_FP8_RTOL` constants at lines 45 and 46
+  set `atol` to `0.2` for E4M3 and `0.3` for E5M2, with `rtol=0.1`.
+  The comparisons at lines 629 to 653 select these bounds for FP8 and
+  `atol=1.5e-2`, `rtol=1e-2` otherwise. Preserve both split and unsplit checks.
 
 The earlier spec cited these surfaces from historical `555967922`; those
 citations remain diagnostic history but cannot satisfy the active-pin gate. The
 implementer must refresh line evidence from the active object and run the active
 runtime before acceptance.
 
-The local chain is
-`ModelRegistry::Forward` -> `dense_attn::AttnBlock` ->
-`dense_attn::WriteKvCache` -> `vt::ReshapeAndCache` or
-`vt::ReshapeAndCacheFp8`, plus the Qwen3.5 GDN prefill/decode update arms. Cite
-the executing local and active-pin upstream symbols in the evidence.
+The local production entry is `ModelRegistry::Forward`, which dispatches the
+registered `ForwardQwen3_5Dense` factory. Its paged forward reaches
+`DenseForwardBody` -> `DenseForwardLayers` -> `RunDenseLayerPaged` ->
+`FullAttnBlockPaged` -> `dense_attn::WriteKvCache` -> `vt::ReshapeAndCache` or
+`vt::ReshapeAndCacheFp8`. The full-attention caller is
+`src/vllm/model_executor/models/qwen3_5.cpp:7758`. `FullAttnBlockPaged` starts
+at line 5726 and writes through `dense_attn::WriteKvCache` at
+`src/vllm/model_executor/models/qwen3_5.cpp:5909`, before `vt::PagedAttention`
+at line 5931. Place the stored-K/V probes after that write. Place GDN probes
+after the persistent writes in `GdnBlockPaged` for prefill and decode.
+
+This Qwen3.5 path does not call `dense_attn::AttnBlock`. Issue #2923 under
+`Owed` records this existing shared-seam debt. Characterize the actual path
+and cite the executing local and active-pin upstream symbols in the evidence.
 
 ## Dtype and state contract
 
@@ -136,8 +147,22 @@ The checkpoint resolves model dtype BF16 and explicitly sets
 |---|---|---|
 | Hidden/residual | `[T, 1024]` | BF16 |
 | Full-attention K/V | `[T, 2, 256]` per layer | BF16 or FP8 E4M3 |
-| GDN convolution state | `[1, 6144, 3]` per layer | BF16 |
+| GDN convolution state | Per layer and slot: oracle SD `[3, 6144]`, local DS `[6144, 3]` | BF16 |
 | GDN SSM state | `[1, 16, 128, 128]` per layer | FP32 |
+
+The active oracle defaults to SD physical convolution storage, with axes
+`(state_len, dim)`. DS reverses these axes to `(dim, state_len)`.
+`vllm/model_executor/layers/mamba/mamba_utils.py::get_conv_state_layout`, lines
+28 to 44, returns `SD` without an override. `_orient_conv_shape`, lines 162
+to 166, and `gated_delta_net_state_shape`, lines 268 to 272, produce
+`[3, 6144]` per slot for this workload. The kernel consumes a DS view
+`[6144, 3]` after the transpose in
+`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1296` to line 1303.
+Local `MakeQwen3_5KVCacheSpec` stores DS directly in
+`src/vllm/model_executor/models/qwen3_5_common.cpp:85`. Leave
+`VLLM_SSM_CONV_STATE_LAYOUT` unset for the production oracle. Record physical
+layout, kernel-view layout, and actual strides on both sides. A transposed
+view does not change the underlying physical layout or byte count.
 
 Across six full-attention layers, BF16 K/V use 12,288 bytes per cached token
 and FP8 K/V use 6,144 bytes. Across 18 GDN layers, convolution state uses
@@ -165,6 +190,19 @@ Widen stored BF16 to FP32. Dequantize stored FP8 with the recorded per-layer
 scale. The FP32 file format never conceals separately logged physical dtype and
 allocation.
 
+Use canonical DS order for `state_gdn_conv`, with `0 <= d < 6144` and
+`0 <= s < 3`:
+
+```text
+local_dump[r, d * 3 + s] = widen(local[slot_local(r), d, s])
+oracle_dump[r, d * 3 + s] = widen(oracle[slot_oracle(r), s, d])
+```
+
+Here `r` follows scheduler request order, and each arm resolves its own slot.
+Use the recorded strides and storage offsets for each lookup. Record this
+mapping in the manifest. The canonical DS dump order does not prescribe
+physical storage or make the oracle's transposed view contiguous.
+
 Gather nonnegative slot mappings in input-token order and active GDN indices in
 scheduler request order. Refuse unexplained duplicate destinations, missing
 rows, partial joins, or capacity-wide dumps. A 24-layer step emits 48 state
@@ -179,15 +217,34 @@ output tokens. Keep block size, block count, and scheduler budget equal. Run
 each arm and cache mode in a separate process and empty directory. Take two
 enabled repeats and one dump-disabled identity control.
 
-Log and assert requested cache dtype, resolved cache dtype, physical cache
-dtype, selected attention backend, and selected cache-store operator for every
-arm and mode. Do not assume backend identity from device alone. The current CPU
-provider accepts `auto` and `fp8_e4m3` in `CPU_ATTN` but omits explicit
-`bfloat16`; that mode falls through to `FLASH_ATTN`, which accepts it. Assert
-`CPU_ATTN` for `auto` and `fp8_e4m3` and `FLASH_ATTN` for explicit `bfloat16`
-on this implementation base. If main changes the selector before implementation,
-re-read and cite the source, update this spec before code, and freshly review
-the changed contract.
+Log and assert requested cache dtype, resolved storage and FP8 interpretation,
+normalized selector input, physical cache dtype, selected attention backend,
+and actual provider execution for every arm and mode.
+`LoadedEngine::ApplyResolvedCacheDType` in
+`src/vllm/entrypoints/model_loader.cpp:1835` applies `ParseCacheDType` from
+`include/vllm/v1/kv_cache_dtype.h:58` to the cache spec. The runner constructs
+`cfg.kv_cache_dtype` from resolved storage and interpretation at
+`src/vllm/v1/worker/gpu/runner.cpp:1590`. `KvCacheDTypeName` maps `kBF16` to
+`auto` in `src/vllm/v1/attention/backend.cpp:91` to line 96. Therefore the
+production CPU selector receives these values for this BF16 workload:
+
+| Requested cache dtype | Resolved physical storage | Normalized selector input | Selected CPU backend |
+|---|---|---|---|
+| `auto` | BF16 (`kBF16`) | `auto` | `CPU_ATTN` |
+| `bfloat16` | BF16 (`kBF16`) | `auto` | `CPU_ATTN` |
+| `fp8_e4m3` | E4M3 bytes (`kI8` plus `kFp8E4M3`) | `fp8_e4m3` | `CPU_ATTN` |
+
+CPU priority starts with `CPU_ATTN` in `src/vllm/platforms/cpu.cpp:51`.
+Its accepted selector values include `auto` and `fp8_e4m3` in
+`include/vllm/v1/attention/backends/cpu_attn.h:108` to line 110.
+`SelectAttentionBackendName` returns the first valid candidate in
+`src/vllm/v1/attention/registry.cpp:124` to line 128.
+Selection alone does not prove execution. Independently record the executing
+attention and cache-store operator providers, selection counts, declines, and
+reference-tier hits. The runner's selected name validates cache configuration
+but does not dispatch the model's attention call. If main changes this chain
+before implementation, update the cited contract before code and obtain fresh
+review.
 
 CPU is a diagnostic comparison arm for CPU-versus-ROCm deltas, including FP8
 state after dequantization. Active-pin vLLM and its upstream tests are the
@@ -424,6 +481,11 @@ push, open, or merge that pull request.
   pending until it lands.
 - #2773 owes the runnable active-pin Qwen3.5-0.8B ROCm captures, even though
   #2794 supplies repository sync context.
+- [#2923](https://github.com/mudler/vllm.cpp/issues/2923), owned by
+  `BACKEND-ROCM`, owes routing Qwen3.5 paged attention through
+  `dense_attn::AttnBlock`. This tracked exception records existing debt. It
+  does not waive or satisfy the shared-seam requirement. Wiring needs its own
+  reviewed spec and implementation, outside #2773's instrumentation scope.
 - A fresh reviewer owes this repaired spec a verdict.
 - A fresh implementer owes the capture options, state probes, tests, comparator,
   and provider checks after the prerequisites pass.

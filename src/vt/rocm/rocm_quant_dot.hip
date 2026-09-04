@@ -998,9 +998,11 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
   const int64_t k = act.shape[1];
   if (P == 0 || n == 0) return;
 
-  // Delegate Q4_K/Q5_K/Q6_K to the optimized grouped kernels.
-  if (weight.dtype == DType::kQ4_K || weight.dtype == DType::kQ5_K ||
-      weight.dtype == DType::kQ6_K) {
+  // Delegate Q8_0/Q4_K/Q5_K/Q6_K to the optimized grouped kernels. Q8_0 has no
+  // Q8_K-superblock arm in this file (it dots a Q8_0 activation), so leaving it
+  // out of this list turns a format the *Gdn kernel serves today into a throw.
+  if (weight.dtype == DType::kQ8_0 || weight.dtype == DType::kQ4_K ||
+      weight.dtype == DType::kQ5_K || weight.dtype == DType::kQ6_K) {
     MatmulBTQuantGroupedKernelRocmGdn(q, out, act, weight, expert_ids);
     return;
   }
@@ -1055,8 +1057,9 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
 }
 
 // Registers the ROCm keep-quant GEMM during static init (table fill only, no
-// HIP calls — same contract as every other registrar). This makes
-// GgufQuantComputeAvailable).
+// HIP calls — same contract as every other registrar). The registration is what
+// makes GgufQuantComputeAvailable() answer yes for kROCM, so the GGUF loader
+// keeps the file quantized instead of expanding it to bf16 at load.
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kROCM,

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -152,6 +153,15 @@ DeepSeekV4VisionWeights Weights(const json& fixture, const DeepSeekV4VisionConfi
   return weights;
 }
 
+// sup|GELU'| = 1.08386..., attained near x = 1.5216. The GELU stage can
+// therefore amplify its input's error by up to 8.4% and can never be assumed to
+// reduce it, which is what makes a stage bound below its input's bound wrong.
+constexpr float kGeluLipschitz = 1.084f;
+// Floor for a case whose input error is zero: our GeluErf and torch F.gelu may
+// still differ by one rounding step on identical bf16 input. One bf16 ulp at
+// the magnitudes this stage reaches, which is the patch-embedding stage's bound.
+constexpr float kGeluErrorFloor = 0.004f;
+
 float MaxAbsDiff(const std::vector<float>& actual, const json& expected_json) {
   const std::vector<float> expected = Floats(expected_json);
   REQUIRE(actual.size() == expected.size());
@@ -283,9 +293,31 @@ TEST_CASE("DeepSeek-V4 ViT and aligner match pinned BF16 stage goldens") {
       }
       CHECK(MaxAbsDiff(store.Download(captures.final_norm), expected.at("vision")) <= 0.024f);
       CHECK(MaxAbsDiff(store.Download(captures.unfold), expected.at("unfold")) <= 0.024f);
-      CHECK(MaxAbsDiff(store.Download(captures.aligner_hidden),
-                       expected.at("aligner_hidden")) <= 0.016f);
-      CHECK(MaxAbsDiff(store.Download(captures.gelu), expected.at("gelu")) <= 0.01f);
+      const float aligner_hidden_diff = MaxAbsDiff(
+          store.Download(captures.aligner_hidden), expected.at("aligner_hidden"));
+      CHECK(aligner_hidden_diff <= 0.016f);
+      // THE GELU BOUND IS DERIVED FROM ITS INPUT, not declared beside it.
+      //
+      // A declared 0.01f here was LOWER than the 0.016f allowed for the
+      // aligner_hidden buffer that feeds this stage, and that ordering is not
+      // derivable: sup|GELU'| is about 1.0839 (at x about 1.5216), so GELU can
+      // amplify the error it is handed by about 8.4% and can never be relied on
+      // to shrink it. The declared value held only because the first two
+      // fixtures happened to hand it half their allowance, and heads4_depth1
+      // already ran at 0.015625 against 0.016, one bf16 ulp from failing.
+      //
+      // Measured on the fixture set, per case, aligner_hidden -> gelu:
+      //   heads2_depth2 2x5              0.0078125  -> 0.0078125
+      //   heads2_depth2 3x3              0.0078125  -> 0.0078125
+      //   heads4_depth1 3x4              0.015625   -> 0.00878906
+      //   heads1_headdim16 4x5           0.0078125  -> 0.00390625
+      //   heads1_headdim16 7x4           0.0136719  -> 0.0117188
+      // Every case ATTENUATES, and no case reaches the Lipschitz ceiling. The
+      // derived bound is TIGHTER than the old 0.01f for three of the five, and
+      // aligner_hidden keeps its own absolute cap above, so this stage stays
+      // transitively bounded at 0.0173f rather than floating free.
+      CHECK(MaxAbsDiff(store.Download(captures.gelu), expected.at("gelu")) <=
+            std::max(kGeluErrorFloor, kGeluLipschitz * aligner_hidden_diff));
       CHECK(MaxAbsDiff(store.Download(output), expected.at("output")) <= 0.01f);
       CHECK(output.dtype == DType::kBF16);
       CHECK(output.IsContiguous());
@@ -468,5 +500,158 @@ TEST_CASE("DeepSeek-V4 repeated shape reuses scratch and 2-D RoPE allocation") {
   CHECK(pool_after_repeat.hits > pool_after_warmup.hits);
   CHECK(model.cached_geometry_count() == 1);
 
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F2 (#2411). A REDUCED FIXTURE CAN DEGENERATE THE AXIS IT GATES.
+//
+// get_vision_cos_sin builds inv_freq[i] = theta ** -(2i / rope_dim) for
+// i in [0, rope_dim/2), and at rope_dim 2 that set is the single element
+// theta ** -0 = 1.0 FOR EVERY THETA. The first two fixtures are head_dim 4, so
+// both were in exactly that state: pinning rope_theta to a literal 10000.0 and
+// halving the exponent denominator each left every golden byte unchanged.
+// Production is head_dim 64, i.e. 16 frequencies.
+//
+// This case fails if the fixture set ever loses the geometry that makes those
+// two mutations observable, so the coverage cannot be removed silently.
+TEST_CASE("DeepSeek-V4 vision goldens can measure rope_theta and the frequency decay") {
+  const DeepSeekV4VisionConfig defaults;
+  REQUIRE(defaults.rope_theta == 10000.0);
+
+  int measuring_fixtures = 0;
+  for (const json& fixture : Goldens().at("fixtures")) {
+    const DeepSeekV4VisionConfig config = Config(fixture);
+    const int64_t frequencies = config.head_dim() / 4;
+    // One frequency means every exponent is 0, so theta cancels entirely.
+    // Two or more make theta and the denominator both observable; require four
+    // so the decay is a curve rather than a single ratio.
+    if (frequencies >= 4 && config.rope_theta != defaults.rope_theta) {
+      ++measuring_fixtures;
+      CAPTURE(fixture.at("name"));
+      // Prove the frequencies really do differ from each other at this
+      // geometry: an equal set would cancel the decay law again.
+      std::vector<float> cosine;
+      std::vector<float> sine;
+      DeepSeekV4VisionRopeCosSin(1, 2, config, &cosine, &sine);
+      const int64_t rope_width = config.head_dim() / 2;
+      // Token 1 is (row 0, column 1), so its WIDTH half carries position 1 and
+      // its values are cos(inv_freq[i]) across the frequency ladder.
+      const size_t width_half = static_cast<size_t>(rope_width + frequencies);
+      CHECK(cosine[width_half + 0] != cosine[width_half + 1]);
+      CHECK(cosine[width_half + 1] != cosine[width_half + 2]);
+      CHECK(cosine[width_half + 2] != cosine[width_half + 3]);
+    }
+  }
+  CHECK(measuring_fixtures >= 1);
+}
+
+// W2 repair, F3 (#2411). The same degeneracy on the aligner's ROW ORDER.
+//
+// Every original fixture grid ((2,5), (3,3), (3,4)) aligns to ONE merged row at
+// downsample_ratio 3, and with block_rows == 1 a row-major and a column-major
+// walk of the merged grid are the same sequence. Swapping the two loops was
+// therefore invisible, although the order fixes the spatial arrangement of the
+// image tokens W4 hands the language model: a 448x448 image is a 32x32 patch
+// grid, 11x11 merged, and would emit transposed rows with the token count, the
+// dtype and every golden unchanged.
+TEST_CASE("DeepSeek-V4 vision goldens can measure the aligner row order") {
+  int measuring_cases = 0;
+  for (const json& fixture : Goldens().at("fixtures")) {
+    const DeepSeekV4VisionConfig config = Config(fixture);
+    const int64_t ratio = config.downsample_ratio;
+    for (const json& test_case : fixture.at("cases")) {
+      const int64_t height = test_case.at("grid").at(0).get<int64_t>();
+      const int64_t width = test_case.at("grid").at(1).get<int64_t>();
+      const int64_t block_rows = 1 + (height - 1) / ratio;
+      const int64_t block_columns = 1 + (width - 1) / ratio;
+      if (block_rows > 1 && block_columns > 1) ++measuring_cases;
+    }
+  }
+  CHECK(measuring_cases >= 1);
+}
+
+// W2 repair, F3 (#2411). The row order itself, at a merged grid that can show it
+// and WITHOUT rebuilding the expectation from the implementation's own loop
+// nesting.
+//
+// The dedicated unfold case above walks block_row then block_column exactly as
+// the implementation does, so on this axis it is a tautology and cannot rescue
+// the order. This one takes the destination row index from the SECONDARY ORACLE
+// instead. llama.cpp release `b10766` = `9400c8946e4da5e7694f2c26d6d4e50e14b690fa`
+// (oracle `llama-cpp-dsv4vision`) builds the same 3x3 patch merge and then maps
+// merged cell (row r, column c) to aligner output row `r * n_llm_w + c` in
+// `clip.cpp`'s `set_input` for `PROJECTOR_TYPE_DEEPSEEK4V`. Its graph in
+// `tools/mtmd/models/deepseek4v.cpp` (blob `ffe8f59d9997` at that pin) reaches
+// the same order through `ggml_im2col` over a [x, y, n_embd] tensor reshaped
+// `[ne0, ne1*ne2]`, which flattens [OW, OH] with OW fastest.
+//
+// So the merged grid is ROW-MAJOR, our loop nesting is right, and this case
+// exists to hold it rather than to change it.
+TEST_CASE("DeepSeek-V4 aligner emits merged cells in llama.cpp row-major order") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  TensorStore store(backend, queue);
+  DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+
+  // 7x4 merges to 3x2 at ratio 3: both dimensions exceed one and they differ,
+  // so a transposed walk is a genuine permutation and not a relabelling.
+  const int64_t height = 7;
+  const int64_t width = 4;
+  const int64_t ratio = config.downsample_ratio;
+  const int64_t hidden = config.hidden_size;
+  const int64_t merged_rows = 1 + (height - 1) / ratio;
+  const int64_t merged_columns = 1 + (width - 1) / ratio;
+  REQUIRE(merged_rows == 3);
+  REQUIRE(merged_columns == 2);
+
+  const int64_t patch_rows = height * width;
+  const int64_t output_rows = config.aligned_rows(height, width);
+  REQUIRE(output_rows == merged_rows * merged_columns);
+
+  // Every element gets its own value. The largest is 7*4*8 = 224, and every
+  // integer up to 256 is exact in bf16, so nothing here is a rounding artefact.
+  std::vector<float> source(static_cast<size_t>(patch_rows * hidden));
+  for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<float>(i + 1);
+  REQUIRE(source.back() <= 256.0f);
+
+  Tensor vision = store.Make(json(source), config.compute_dtype, {patch_rows, hidden});
+  Tensor output = store.Empty(config.compute_dtype, {output_rows, config.output_size});
+  Tensor unfold = store.Empty(config.compute_dtype,
+                              {output_rows, config.aligner_input_size()});
+  DeepSeekV4VisionCapture capture;
+  capture.aligner_unfold = &unfold;
+  model.AlignerForward(queue, output, vision, height, width, &capture);
+  const std::vector<float> actual = store.Download(unfold);
+  const int64_t unfold_width = config.aligner_input_size();
+
+  for (int64_t merged_row = 0; merged_row < merged_rows; ++merged_row) {
+    for (int64_t merged_column = 0; merged_column < merged_columns;
+         ++merged_column) {
+      // The oracle's index, not ours: r * n_llm_w + c.
+      const int64_t destination = merged_row * merged_columns + merged_column;
+      CAPTURE(merged_row);
+      CAPTURE(merged_column);
+      CAPTURE(destination);
+      for (int64_t channel = 0; channel < hidden; ++channel) {
+        for (int64_t local_row = 0; local_row < ratio; ++local_row) {
+          for (int64_t local_column = 0; local_column < ratio; ++local_column) {
+            const int64_t row = merged_row * ratio + local_row;
+            const int64_t column = merged_column * ratio + local_column;
+            const float expected =
+                row < height && column < width
+                    ? source[static_cast<size_t>((row * width + column) * hidden +
+                                                 channel)]
+                    : 0.0f;
+            const size_t offset = static_cast<size_t>(
+                destination * unfold_width + channel * ratio * ratio +
+                local_row * ratio + local_column);
+            REQUIRE(actual[offset] == expected);
+          }
+        }
+      }
+    }
+  }
   backend.DestroyQueue(queue);
 }

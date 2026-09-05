@@ -933,8 +933,11 @@ nothing`, passed before the change and after it.
 
 Green after. `ctest --test-dir build-w3b -R test_deepseek_v4_mm_loader
 --output-on-failure` passes on a Release CPU build configured with
-`-DVLLM_CPP_CUDA=OFF`, and the test binary reports 6 of 6 cases and 83 of 83
-assertions.
+`-DVLLM_CPP_CUDA=OFF`, and the test binary reported 6 of 6 cases and 83 of 83
+assertions AS THIS WAVE LANDED. The W3B review repairs later took the same suite
+to 9 cases and 105 assertions; `### W3B repair evidence` below carries the
+current figure, and this paragraph is kept as the record of what W3B itself
+measured rather than silently restated.
 
 The inertness claim was mutated rather than read. Removing the optionality from
 the GGUF arm, so `exp_probs_b_vl` is taken unconditionally, made

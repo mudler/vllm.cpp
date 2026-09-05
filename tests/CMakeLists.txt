@@ -2679,6 +2679,14 @@ else()
     vllm::vllm vllm_test_main)
 endif()
 vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
+# GFX1100-TG200-T2b: ROCm decode-graph capture through ModelRegistry::Forward.
+# Self-skips without a ROCm device (vt::rocm::DeviceAvailable()) and on non-
+# gfx1100 arches (per-arch opt-in keeps the path eager). On gfx1100 it enters
+# the production forward and exercises the captured decode-graph path.
+vllm_cpp_add_test(test_rocm_decode_graph_forward
+  vllm/models/test_rocm_decode_graph_forward.cpp)
+target_include_directories(test_rocm_decode_graph_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)

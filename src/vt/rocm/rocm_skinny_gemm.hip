@@ -137,7 +137,8 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     if (threadIdx.x == (kThrds - 1)) {
       for (int n = 0; n < N; n++)
         for (int y = 0; y < kYtile; y++)
-          C[m + y + n * M] = WvStoreCast<OutT>(sum[n][y]);
+          if (m + y < static_cast<uint32_t>(M))
+            C[m + y + n * M] = WvStoreCast<OutT>(sum[n][y]);
     }
     m += CuCount * _WvPrGrp * kYtile;
   }

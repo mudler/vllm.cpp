@@ -298,3 +298,94 @@ TEST_CASE("ROCm f32-out skinny routing witness: TRUE-unset behaves like OFF (def
   gpu.Free(d_b);
   gpu.DestroyQueue(gq);
 }
+
+// Conditional regression test for the skinny-GEMM tail-store OOB
+// (rocm_skinny_gemm.hip: wvSplitKSml store loop).  The kernel iterates the M
+// dimension in kYtile-sized steps; when M is not a multiple of kYtile the last
+// wave's y=1 store writes past the valid M range.  With the production
+// kYtile=2 the caller guard (N > 8 && N % 2 == 0) and the M-in-[1,4] gate
+// keep the OOB writes inside the allocated buffer (the buffer is M*N ≥ 1*10
+// elements, so C[1] is still in-bounds), so the bug is invisible on the
+// production bf16-output path.  It becomes visible with a guard band and is
+// guarded against by the `if (m + y < M)` store check.
+//
+// This test is CONDITIONAL: it runs only under VT_SKINNY_BF16=1 (the
+// experimental f32-output arm) and never fires on the production bf16-output
+// path, per the #2894 reviewer's split demand.
+TEST_CASE("ROCm f32-out skinny tail-store OOB regression (VT_SKINNY_BF16=1): guard band untouched for odd M") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm skinny OOB regression skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+
+  // M=1 is not a multiple of kYtile=2: the kernel's y=1 store would write
+  // C[1] past the valid M=0 row.  N=32 (>8, even) and K=256 (%8==0) satisfy
+  // the dispatch guard so the skinny path is taken under VT_SKINNY_BF16=1.
+  struct OobCase { int64_t m, n, k; const char* name; };
+  const OobCase cases[] = {
+      {1, 32, 256, "m=1 odd vs kYtile=2"},
+      {3, 32, 256, "m=3 odd vs kYtile=2"},
+  };
+  for (const OobCase& oc : cases) {
+    CAPTURE(oc.name);
+    CAPTURE(oc.m);
+    CAPTURE(oc.n);
+    CAPTURE(oc.k);
+    const std::vector<uint16_t> a =
+        RandomBf16(static_cast<size_t>(oc.m * oc.k), 0xBEEFu);
+    const std::vector<uint16_t> b =
+        RandomBf16(static_cast<size_t>(oc.n * oc.k), 0xF00Du);
+
+    void* d_a = gpu.Alloc(a.size() * 2);
+    void* d_b = gpu.Alloc(b.size() * 2);
+    gpu.Copy(gq, d_a, a.data(), a.size() * 2);
+    gpu.Copy(gq, d_b, b.data(), b.size() * 2);
+
+    const size_t out_elems = static_cast<size_t>(oc.m * oc.n);
+    const size_t guard_elems = 64;
+    // f32 output: 4 bytes per element.
+    void* d_o = gpu.Alloc(4 * (out_elems + guard_elems));
+
+    // Fill the entire allocation (output + guard) with a sentinel pattern.
+    std::vector<uint32_t> fill(out_elems + guard_elems, 0xDEADBEEFu);
+    gpu.Copy(gq, d_o, fill.data(), fill.size() * 4);
+    gpu.Synchronize(gq);
+
+    {
+      EnvGuard guard(true);  // VT_SKINNY_BF16=1 — experimental arm only
+      Tensor at = DevTensor(d_a, DType::kBF16, {oc.m, oc.k});
+      Tensor bt = DevTensor(d_b, DType::kBF16, {oc.n, oc.k});
+      Tensor ot = DevTensor(d_o, DType::kF32, {oc.m, oc.n});
+      vt::MatmulBT(gq, ot, at, bt);
+      gpu.Synchronize(gq);
+    }
+
+    std::vector<uint32_t> got(out_elems + guard_elems);
+    gpu.Copy(gq, got.data(), d_o, got.size() * 4);
+    gpu.Synchronize(gq);
+
+    // The guard band beyond the output must be untouched.
+    for (size_t i = out_elems; i < out_elems + guard_elems; ++i)
+      CHECK(got[i] == 0xDEADBEEFu);
+
+    // The output itself must match the CPU oracle (the guard fix does not
+    // change correct outputs, only suppresses the OOB store).
+    const std::vector<float> ref = CpuOracleBt(a, b, oc.m, oc.n, oc.k);
+    std::vector<float> out_f(out_elems);
+    for (size_t i = 0; i < out_elems; ++i) {
+      float f;
+      std::memcpy(&f, &got[i], 4);
+      out_f[i] = f;
+    }
+    const double nmse = Nmse(out_f, ref);
+    CAPTURE(nmse);
+    CHECK(nmse <= kMaxNmseVsCpu);
+
+    gpu.Free(d_a);
+    gpu.Free(d_b);
+    gpu.Free(d_o);
+  }
+  gpu.DestroyQueue(gq);
+}

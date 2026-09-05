@@ -6,6 +6,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
@@ -408,6 +409,369 @@ void RefuseUnaccountedClipMmproj(const GgufFile& gguf,
                std::to_string(cfg.depth) + " and " +
                std::to_string(cfg.deepstack_visual_indexes.size()) +
                " deepstack tap(s): " + names +
+               ". Loading it would drop them SILENTLY and build a tower that "
+               "runs and is wrong");
+}
+
+// ─── DeepSeek-V4 Flash Vision (`deepseek4v`) ────────────────────────────────
+// Contract, upstream anchors and the reason each refusal exists:
+// `include/vllm/model_executor/models/clip_mmproj_gguf.h`.
+namespace {
+
+// The two `clip.*` keys the `qwen3vl_merger` arm above does not read.
+constexpr const char* kKvScaleFactor = "clip.vision.projector.scale_factor";
+constexpr const char* kKvUseSilu = "clip.use_silu";
+
+// The `v.*` / `mm.*` names a `deepseek4v` export carries and the arm above does
+// not (clip-impl.h TN_LN_POST, TN_LLAVA_PROJ, TN_TOK_IMG_START/_END/_PAD,
+// TN_IMAGE_NEWLINE). `mm.1` and `mm.2` are the aligner's two projections: there
+// is no `mm.0` in a deepseek4v export, which is the mirror image of
+// `qwen3vl_merger` having no `mm.1`.
+constexpr const char* kTnPostLn = "v.post_ln.weight";
+constexpr const char* kTnMm1Weight = "mm.1.weight";
+constexpr const char* kTnMm1Bias = "mm.1.bias";
+constexpr const char* kTnMm2Weight = "mm.2.weight";
+constexpr const char* kTnMm2Bias = "mm.2.bias";
+constexpr const char* kTnImgStart = "v.token_embd.img_start";
+constexpr const char* kTnImgEnd = "v.token_embd.img_end";
+constexpr const char* kTnImgPad = "v.token_embd.img_pad";
+constexpr const char* kTnImageNewline = "v.image_newline";
+
+// The thirteen tensors ONE `deepseek4v` block carries. Attention arrives as
+// three SEPARATE projections rather than the fused `attn_qkv` a
+// `qwen3vl_merger` file has, and the MLP arrives as three separate matrices,
+// so this list is what makes the block count 13 rather than 12.
+constexpr const char* kDeepSeekV4BlockTensors[] = {
+    "attn_q.weight",   "attn_q.bias",   "attn_k.weight",  "attn_k.bias",
+    "attn_v.weight",   "attn_v.bias",   "attn_out.weight", "attn_out.bias",
+    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "ln1.weight",
+    "ln2.weight",
+};
+
+std::string DeepSeekV4BlockPrefix(int64_t layer) {
+  return "v.blk." + std::to_string(layer) + ".";
+}
+
+// A contiguous HOST view over `data`. W4 owns the upload, so this wave keeps
+// every weight on the default device rather than inventing a device policy.
+vt::Tensor HostView(void* data, vt::DType dtype,
+                    const std::vector<int64_t>& shape) {
+  vt::Tensor view;
+  view.data = data;
+  view.dtype = dtype;
+  view.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = view.rank - 1; i >= 0; --i) {
+    view.shape[i] = shape[static_cast<size_t>(i)];
+    view.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return view;
+}
+
+// Reads one `deepseek4v` projector, keeping the host storage inside the result
+// so every `vt::Tensor` the caller receives points at a buffer the result owns.
+class DeepSeekV4MmprojReader {
+ public:
+  DeepSeekV4MmprojReader(const GgufFile& gguf,
+                         const multimodal::DeepSeekV4VisionConfig& config,
+                         DeepSeekV4ClipMmproj* out)
+      : gguf_(gguf), config_(config), out_(out) {
+    for (const GgufTensorInfo& info : gguf.Tensors()) present_.insert(info.name);
+  }
+
+  // A missing tensor names itself and a wrong-shaped one names both shapes.
+  // `GgufTensorInfo::shape` is the on-disk ggml dims REVERSED into torch
+  // row-major order, so every `want` below is written in torch order.
+  const GgufTensorInfo& Require(const std::string& name,
+                                const std::vector<int64_t>& want) {
+    VT_CHECK(present_.count(name) != 0,
+             "clip mmproj gguf: missing tensor " + name + " (is this a " +
+                 kClipProjectorDeepSeekV4 + " projector?)");
+    const GgufTensorInfo& info = gguf_.Get(name);
+    VT_CHECK(info.shape == want,
+             "clip mmproj gguf: " + name + " is " + ShapeText(info.shape) +
+                 ", expected " + ShapeText(want));
+    return info;
+  }
+
+  std::vector<float> F32(const std::string& name,
+                         const std::vector<int64_t>& want) {
+    const GgufTensorInfo& info = Require(name, want);
+    return DequantGgufRowToF32(info.ggml_type, info.data, Numel(info));
+  }
+
+  std::vector<uint16_t> Bf16(const std::string& name,
+                             const std::vector<int64_t>& want) {
+    const GgufTensorInfo& info = Require(name, want);
+    return DequantGgufRowToBf16(info.ggml_type, info.data, Numel(info));
+  }
+
+  // A linear weight or bias. W2's contract says both take the model dtype, and
+  // this file stores every bias and the patch embedding as f32 because that is
+  // llama.cpp's convention for a small tensor, not because the checkpoint holds
+  // f32 there. Passing the file's dtype through instead would move twice the
+  // bytes on the model path and leave every token identical, which is the one
+  // defect a token gate cannot see.
+  vt::Tensor Model(std::vector<uint16_t> words,
+                   const std::vector<int64_t>& shape) {
+    out_->bf16_storage.push_back(std::move(words));
+    return HostView(out_->bf16_storage.back().data(), config_.compute_dtype,
+                    shape);
+  }
+
+  // An RMSNorm weight. It stays f32: the pinned module declares it f32 and
+  // widens x before the variance and the affine (deepseek_v4_vision.h), so
+  // narrowing it here would change the tower's numbers.
+  vt::Tensor Norm(const std::string& name) {
+    const std::vector<int64_t> shape = {config_.hidden_size};
+    out_->f32_storage.push_back(F32(name, shape));
+    return HostView(out_->f32_storage.back().data(), vt::DType::kF32, shape);
+  }
+
+ private:
+  const GgufFile& gguf_;
+  const multimodal::DeepSeekV4VisionConfig& config_;
+  DeepSeekV4ClipMmproj* out_;
+  std::set<std::string> present_;
+};
+
+}  // namespace
+
+void RefuseUnsupportedDeepSeekV4ClipMmproj(const GgufFile& gguf,
+                                           const std::string& path) {
+  const std::string arch = KvString(gguf, kKvArch);
+  VT_CHECK(arch == kClipGgufArch,
+           "--mmproj: '" + path + "' is not a multimodal projector: its "
+           "general.architecture is '" +
+               (arch.empty() ? std::string("<absent>") : arch) +
+               "', and a projector file carries '" + kClipGgufArch +
+               "'. Pass the language GGUF as the model and the mmproj-*.gguf "
+               "here, not the other way round");
+  const std::string type = KvString(gguf, kKvType);
+  VT_CHECK(type.empty() || type == kClipGgufTypeMmproj,
+           "--mmproj: '" + path + "' declares general.type '" + type +
+               "', not '" + kClipGgufTypeMmproj + "'");
+  const std::string proj = ClipProjectorType(gguf);
+  VT_CHECK(proj == kClipProjectorDeepSeekV4,
+           "--mmproj: '" + path + "' has clip.projector_type '" +
+               (proj.empty() ? std::string("<absent>") : proj) +
+               "'; the DeepSeek-V4 vision arm loads '" +
+               kClipProjectorDeepSeekV4 + "' projectors only");
+  const GgufValue* silu = gguf.FindKv(kKvUseSilu);
+  VT_CHECK(silu != nullptr && silu->TypeId() == kGgufBool &&
+               std::get<bool>(silu->v),
+           "--mmproj: '" + path +
+               "' does not declare clip.use_silu = true. The DeepSeek-V4 "
+               "vision MLP is SwiGLU by construction, the pinned converter "
+               "writes that key for exactly that reason, and a projector with "
+               "another activation loaded through this reader would run and be "
+               "wrong");
+}
+
+multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
+    const GgufFile& gguf) {
+  multimodal::DeepSeekV4VisionConfig config;
+  config.hidden_size = ReqInt(gguf, kKvEmbd);
+  config.num_heads = ReqInt(gguf, kKvHeads);
+  config.depth = ReqInt(gguf, kKvBlocks);
+  config.intermediate_size = ReqInt(gguf, kKvFf);
+  // `projection_dim` is the aligner's output width and `projector.scale_factor`
+  // is the 3x3 downsample ratio: clip.cpp's PROJECTOR_TYPE_DEEPSEEK4V case
+  // reads KEY_PROJ_SCALE_FACTOR into `hparams.n_merge`, and deepseek4v.cpp
+  // unfolds the patch grid with it.
+  config.output_size = ReqInt(gguf, kKvProjDim);
+  config.downsample_ratio = ReqInt(gguf, kKvScaleFactor);
+  config.patch_size = ReqInt(gguf, kKvPatch);
+  // READ, never assumed: this projector's eps is the vision RMSNorm's torch
+  // default rather than the language model's, and a reader that kept the W2
+  // default would agree with this artifact by luck.
+  config.norm_epsilon = static_cast<float>(ReqFloat(gguf, kKvEps));
+  // `rope_theta` and `compute_dtype` keep their W2 defaults. No `clip.*` key
+  // carries the theta: llama.cpp hardcodes 10000.0 for this projector in the
+  // same `clip_model_loader` case that reads the keys above, and the pinned
+  // converter's `get_vision_config` defaults `vision_rope_theta` to the same
+  // value without writing it.
+  return config;
+}
+
+DeepSeekV4ClipMmproj LoadDeepSeekV4VisionFromClipMmproj(
+    const GgufFile& gguf, const multimodal::DeepSeekV4VisionConfig& config) {
+  VT_CHECK(config.compute_dtype == vt::DType::kBF16,
+           "clip mmproj gguf: the deepseek4v reader stores bf16 words, and the "
+           "DeepSeek-V4 vision tower refuses any other compute dtype");
+  DeepSeekV4ClipMmproj out;
+  DeepSeekV4MmprojReader read(gguf, config, &out);
+
+  const int64_t hidden = config.hidden_size;
+  const int64_t intermediate = config.intermediate_size;
+  const int64_t output = config.output_size;
+  const int64_t patch = config.patch_size;
+  const int64_t patch_dim = config.patch_dim();
+  const int64_t aligner_in = config.aligner_input_size();
+  // `patch_dim()` is `3 * patch^2`, so the channel count is W2's own contract
+  // rather than a number read here; the shape check below refuses a file that
+  // disagrees instead of reshaping around it.
+  constexpr int64_t kChannels = 3;
+
+  // ── The patch embedding: a conv2d weight flattened back to torch Linear ──
+  //
+  // The pinned `vision.patch_embed.proj` is an `nn.Linear` over patches
+  // flattened by `F.unfold`, whose element order is [channel, dy, dx], so its
+  // weight is torch [hidden, C * p * p] in exactly that column order. The
+  // pinned converter turns it into a conv2d weight with a pure VIEW --
+  // `data_torch.reshape(data_torch.shape[0], 3, p, p)`, which moves no byte --
+  // and llama.cpp stores that in ggml dim order {p, p, C, out}.
+  // `GgufTensorInfo::shape` reverses it back to torch [out, C, p, p], whose
+  // row-major flattening is [channel, dy, dx] again. The map is therefore the
+  // IDENTITY, and it is written as an explicit index walk rather than a bulk
+  // copy because the [channel, dy, dx] claim is the load-bearing part: the
+  // [dy, dx, channel] order a naive conv2d reading produces is a fluent, wrong
+  // tower rather than an error.
+  const std::vector<uint16_t> patch_source =
+      read.Bf16(kTnPatchEmbd, {hidden, kChannels, patch, patch});
+  std::vector<uint16_t> patch_weight(static_cast<size_t>(hidden * patch_dim));
+  for (int64_t o = 0; o < hidden; ++o) {
+    for (int64_t c = 0; c < kChannels; ++c) {
+      for (int64_t dy = 0; dy < patch; ++dy) {
+        for (int64_t dx = 0; dx < patch; ++dx) {
+          const int64_t source = ((o * kChannels + c) * patch + dy) * patch + dx;
+          const int64_t target = o * patch_dim + (c * patch + dy) * patch + dx;
+          patch_weight[static_cast<size_t>(target)] =
+              patch_source[static_cast<size_t>(source)];
+        }
+      }
+    }
+  }
+  out.weights.patch_weight =
+      read.Model(std::move(patch_weight), {hidden, patch_dim});
+  out.weights.patch_bias =
+      read.Model(read.Bf16(kTnPatchBias, {hidden}), {hidden});
+
+  // ── The blocks ────────────────────────────────────────────────────────────
+  out.weights.blocks.resize(static_cast<size_t>(config.depth));
+  for (int64_t layer = 0; layer < config.depth; ++layer) {
+    const std::string p = DeepSeekV4BlockPrefix(layer);
+    multimodal::DeepSeekV4VisionBlockWeights& block =
+        out.weights.blocks[static_cast<size_t>(layer)];
+    block.norm1_weight = read.Norm(p + "ln1.weight");
+    block.norm2_weight = read.Norm(p + "ln2.weight");
+
+    // q, k, v FUSE in that row order, and the order is the consumer's rather
+    // than a convention chosen here: `deepseek_v4_vision.cpp` takes Q back out
+    // with `RowSlice(layer.qkv_weight, 0, hidden)`, K at `hidden`, V at
+    // `2 * hidden`, and the matching `VectorSlice`s for the bias. Permuting the
+    // three swaps which projection each head attends with and stays fluent.
+    std::vector<uint16_t> qkv_weight;
+    qkv_weight.reserve(static_cast<size_t>(3 * hidden * hidden));
+    std::vector<uint16_t> qkv_bias;
+    qkv_bias.reserve(static_cast<size_t>(3 * hidden));
+    for (const char* part : {"attn_q", "attn_k", "attn_v"}) {
+      const std::vector<uint16_t> weight =
+          read.Bf16(p + part + ".weight", {hidden, hidden});
+      qkv_weight.insert(qkv_weight.end(), weight.begin(), weight.end());
+      const std::vector<uint16_t> bias =
+          read.Bf16(p + part + ".bias", {hidden});
+      qkv_bias.insert(qkv_bias.end(), bias.begin(), bias.end());
+    }
+    block.qkv_weight = read.Model(std::move(qkv_weight), {3 * hidden, hidden});
+    block.qkv_bias = read.Model(std::move(qkv_bias), {3 * hidden});
+    block.out_weight = read.Model(
+        read.Bf16(p + "attn_out.weight", {hidden, hidden}), {hidden, hidden});
+    block.out_bias =
+        read.Model(read.Bf16(p + "attn_out.bias", {hidden}), {hidden});
+
+    // GATE FIRST, UP SECOND. W2 hands `mlp_w1_weight` to
+    // `layers::UnquantizedMlpGateUpMethod`, which runs one `MatmulBT` over the
+    // merged [2I, H] weight and then `vt::SiluAndMul`; that kernel reads the
+    // gate at column `j` and the up at column `d + j`, so the FIRST
+    // `intermediate` rows are the gate. It is also where the pinned converter
+    // took them from -- it split the checkpoint's fused `mlp.w1` with
+    // `gate, up = data_torch.chunk(2, dim=0)` -- so this puts each half back
+    // where it came from. Swapping them applies SiLU to the wrong projection
+    // and stays fluent.
+    std::vector<uint16_t> gate_up =
+        read.Bf16(p + "ffn_gate.weight", {intermediate, hidden});
+    const std::vector<uint16_t> up =
+        read.Bf16(p + "ffn_up.weight", {intermediate, hidden});
+    gate_up.insert(gate_up.end(), up.begin(), up.end());
+    block.mlp_w1_weight =
+        read.Model(std::move(gate_up), {2 * intermediate, hidden});
+    block.mlp_w2_weight = read.Model(
+        read.Bf16(p + "ffn_down.weight", {hidden, intermediate}),
+        {hidden, intermediate});
+  }
+
+  // ── The final norm and the aligner ────────────────────────────────────────
+  // `v.post_ln` is the tower's final RMSNorm, applied before the 3x3 unfold
+  // (deepseek4v.cpp runs `build_vit` and only then reshapes and unfolds), and
+  // `mm.1` is that unfold's consumer: its input width is hidden * ratio^2.
+  out.weights.final_norm_weight = read.Norm(kTnPostLn);
+  out.weights.aligner_w1_weight = read.Model(
+      read.Bf16(kTnMm1Weight, {output, aligner_in}), {output, aligner_in});
+  out.weights.aligner_w1_bias =
+      read.Model(read.Bf16(kTnMm1Bias, {output}), {output});
+  out.weights.aligner_w2_weight = read.Model(
+      read.Bf16(kTnMm2Weight, {output, output}), {output, output});
+  out.weights.aligner_w2_bias =
+      read.Model(read.Bf16(kTnMm2Bias, {output}), {output});
+
+  // The four learned sentinel vectors. They stay f32 for the reason the header
+  // states: W2 declares no dtype for them because it has no field for them.
+  out.image_start = read.F32(kTnImgStart, {output});
+  out.image_end = read.F32(kTnImgEnd, {output});
+  out.image_pad = read.F32(kTnImgPad, {output});
+  out.image_newline = read.F32(kTnImageNewline, {output});
+  return out;
+}
+
+std::vector<std::string> DeepSeekV4ClipMmprojExpectedTensors(
+    const multimodal::DeepSeekV4VisionConfig& config) {
+  std::vector<std::string> out;
+  out.emplace_back(kTnPatchEmbd);
+  out.emplace_back(kTnPatchBias);
+  for (int64_t layer = 0; layer < config.depth; ++layer) {
+    const std::string p = DeepSeekV4BlockPrefix(layer);
+    for (const char* stem : kDeepSeekV4BlockTensors) out.push_back(p + stem);
+  }
+  out.emplace_back(kTnPostLn);
+  for (const char* name :
+       {kTnMm1Weight, kTnMm1Bias, kTnMm2Weight, kTnMm2Bias}) {
+    out.emplace_back(name);
+  }
+  for (const char* name :
+       {kTnImgStart, kTnImgEnd, kTnImgPad, kTnImageNewline}) {
+    out.emplace_back(name);
+  }
+  return out;
+}
+
+void RefuseUnaccountedDeepSeekV4ClipMmproj(
+    const GgufFile& gguf, const multimodal::DeepSeekV4VisionConfig& config,
+    const std::string& path) {
+  const std::vector<std::string> want =
+      DeepSeekV4ClipMmprojExpectedTensors(config);
+  const std::set<std::string> wanted(want.begin(), want.end());
+  std::vector<std::string> extra;
+  for (const GgufTensorInfo& info : gguf.Tensors()) {
+    if (wanted.count(info.name) == 0) extra.push_back(info.name);
+  }
+  if (extra.empty()) return;
+  constexpr size_t kMaxNamed = 12;
+  std::string names;
+  for (size_t i = 0; i < extra.size() && i < kMaxNamed; ++i) {
+    names += (i == 0 ? "" : ", ") + extra[i];
+  }
+  if (extra.size() > kMaxNamed) {
+    names += ", ... (" + std::to_string(extra.size() - kMaxNamed) + " more)";
+  }
+  VT_CHECK(false,
+           "--mmproj: '" + path + "' carries " + std::to_string(extra.size()) +
+               " tensor(s) that this build's " + kClipProjectorDeepSeekV4 +
+               " reader NEVER reads, out of " +
+               std::to_string(gguf.Tensors().size()) + " present against " +
+               std::to_string(wanted.size()) + " enumerated for depth " +
+               std::to_string(config.depth) + ": " + names +
                ". Loading it would drop them SILENTLY and build a tower that "
                "runs and is wrong");
 }

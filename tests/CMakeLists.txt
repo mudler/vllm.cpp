@@ -857,6 +857,15 @@ vllm_cpp_add_test(test_deepseek_v4_dspark_entry vllm/models/test_deepseek_v4_dsp
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-deepseek-v4 W3B (#2411) — `exp_probs_b_vl`, the per-layer MoE routing
+# bias DeepSeek-V4-Flash-Vision adds for image tokens. Drives BOTH weight arms
+# (the `deepseek4` GGUF and the safetensors loader) over hermetic fixtures that
+# carry the tensor on every layer, and pins the text checkpoint's inertness when
+# it is absent. See .agents/specs/deepseek-v4-flash-vision.md.
+vllm_cpp_add_test(test_deepseek_v4_mm_loader vllm/models/test_deepseek_v4_mm_loader.cpp)
+target_include_directories(test_deepseek_v4_mm_loader PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_deepseek_v4_exl3_device_residency
                   vllm/models/test_deepseek_v4_exl3_device_residency.cpp)
 target_include_directories(test_deepseek_v4_exl3_device_residency

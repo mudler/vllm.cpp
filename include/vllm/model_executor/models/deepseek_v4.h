@@ -224,6 +224,14 @@ struct DeepseekV4LayerHostWeights {
   // MoE router: learned gate + (non-hash) noaux_tc bias OR (hash) tid2eid table.
   std::vector<float> gate_weight;  // [n_routed_experts, H]
   std::vector<float> gate_bias;    // [n_routed_experts]  (non-hash layers)
+  // The VISION routing bias, `layers.N.ffn.gate.bias_vl` on the safetensors
+  // checkpoint and `blk.N.exp_probs_b_vl.bias` in the GGUF. The router adds it
+  // in place of `gate_bias` when the token being routed is an IMAGE token, and
+  // it is present on EVERY layer of a DeepSeek-V4-Flash-Vision artifact -- the
+  // hash layers included, where there is no `gate_bias` at all because a text
+  // token routes through `tid2eid` and takes no bias. Empty on a text
+  // checkpoint, which carries none of these tensors.
+  std::vector<float> gate_bias_vl;  // [n_routed_experts]  (vision artifact only)
   std::vector<int32_t> tid2eid;    // [vocab, num_experts_per_tok] (hash layers)
   // Shared + routed experts (clamped SwiGLU). Routed stored flat over experts.
   HostBf16 shared_w1, shared_w3;            // [moe_inter, H]         (FP8-sourced)
@@ -267,6 +275,10 @@ struct DeepseekV4GgufLayerWeights {
   OwnedTensor moe_gate, moe_gate_exps, moe_up_exps, moe_down_exps;
   OwnedTensor shared_gate, shared_up, shared_down;
   OwnedTensor tid2eid, e_score_bias;
+  // The image-token routing bias (`blk.N.exp_probs_b_vl.bias`, V), on every
+  // layer of a vision artifact and on no layer of a text one. See
+  // `DeepseekV4LayerHostWeights::gate_bias_vl`.
+  OwnedTensor e_score_bias_vl;
   // DSA compressor (compressor layers only) + Lightning-Indexer (indexer layers).
   OwnedTensor comp_ape, comp_wgate, comp_wkv, comp_norm;
   OwnedTensor idx_wq_b, idx_proj;

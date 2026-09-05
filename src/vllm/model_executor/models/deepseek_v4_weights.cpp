@@ -586,6 +586,15 @@ class Exl3CarriedReader {
   // hunt for the missing slot.
   void Account(const std::string& name) { (void)Take(name); }
 
+  // Is this tensor on the checkpoint at all? Needed for `ffn.gate.bias_vl`,
+  // which the VISION artifact carries on every layer and a TEXT one carries
+  // nowhere -- llama.cpp creates the same tensor `TENSOR_NOT_REQUIRED`
+  // (`src/models/deepseek4.cpp`, PR #28154 at `llama-cpp-dsv4vision`). Every
+  // other carried tensor stays REQUIRED: `Take` throws by name for the ones an
+  // artifact must have, and optionality is opt-in per tensor rather than a
+  // widening of that refusal.
+  bool Has(const std::string& name) const { return index_.count(name) != 0; }
+
   // The stored shape, WITHOUT accounting the tensor. The DSA family's width has
   // to be read before the family can be required to agree with itself, and the
   // tensor is then taken normally by `Float`/`Fp8Block` below.
@@ -1231,6 +1240,18 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       hl.tid2eid = carried.HashTable(f + "gate.tid2eid", {V, topk});
     else
       hl.gate_bias = carried.Float(f + "gate.bias", {ne});
+    // MODEL-MM-deepseek-v4 W3B (#2411): the IMAGE-token routing bias, on EVERY
+    // layer of a DeepSeek-V4-Flash-Vision checkpoint and on no layer of a text
+    // one. It is read OUTSIDE the hash branch on purpose: a text token on a hash
+    // layer routes through `tid2eid` and takes no bias, so the converter emits no
+    // `gate.bias` there, while an image token has no token id to hash and routes
+    // on this bias instead. Reading it inside the `else` would silently drop the
+    // three layers where it is the ONLY routing input an image row has.
+    //
+    // Loading it does NOT make it selected. W4 owns the per-token choice between
+    // the two biases and the hash-layer replacement; see the spec's `## Owed`.
+    if (carried.Has(f + "gate.bias_vl"))
+      hl.gate_bias_vl = carried.Float(f + "gate.bias_vl", {ne});
 
     hl.shared_w1 = carried.Fp8Block(f + "shared_experts.w1", mi, H);
     hl.shared_w2 = carried.Fp8Block(f + "shared_experts.w2", H, mi);
@@ -1417,6 +1438,13 @@ DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
       require(f + "gate.tid2eid");
     else
       require(f + "gate.bias");
+    // MODEL-MM-deepseek-v4 W3B (#2411): the vision artifact's image-token
+    // routing bias, on every layer including the hash ones. Conditional because
+    // a TEXT checkpoint carries none, and `require` is a REFUSAL: asking for it
+    // unconditionally would reject every DeepSeek-V4 text checkpoint this arm
+    // already loads. This arm accounts without materializing (see the W2b TODO
+    // below), so the count is the whole obligation it can discharge here.
+    if (have.count(f + "gate.bias_vl") != 0) require(f + "gate.bias_vl");
 
     // Shared expert (FP8-block).
     for (const char* w : {"w1", "w2", "w3"}) {
@@ -1946,6 +1974,18 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     } else {
       lw.e_score_bias = ctx.Vec(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector);
     }
+    // MODEL-MM-deepseek-v4 W3B (#2411): `blk.N.exp_probs_b_vl.bias`, f32 [E], the
+    // bias an IMAGE token routes on. The pinned
+    // `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF UD-IQ1_S` carries one for every
+    // one of its 43 language layers and nothing else in its first shard; a text
+    // `deepseek4` file carries none, which is why this is OPTIONAL and why the
+    // accounting gate below still passes on both. Outside the hash branch for the
+    // reason the safetensors arm states: on a hash layer this is the only routing
+    // bias an image row has.
+    if (HasGgufTensor(g, Blk(l, "exp_probs_b_vl.bias"))) {
+      lw.e_score_bias_vl =
+          ctx.Vec(Blk(l, "exp_probs_b_vl.bias"), GgufTensorRole::kVector);
+    }
 
     // DSA compressor (compress_ratio != 0) + Lightning-Indexer (== 4).
     if (lw.has_compressor) {
@@ -1989,6 +2029,11 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     } else {
       hl.gate_bias = HostVec(g, Blk(l, "exp_probs_b.bias"));
     }
+    // The host bridge for the same tensor. It is an [E] vector, so it costs the
+    // same as the text bias beside it and none of the keep-quant memory bound
+    // below applies to it.
+    if (!lw.e_score_bias_vl.Empty())
+      hl.gate_bias_vl = HostVec(g, Blk(l, "exp_probs_b_vl.bias"));
     if (lw.has_compressor) {
       // comp_wgate is keep-quant (in `lw`); only ape/norm are f32 (small V).
       hl.comp_ape = HostVec(g, Blk(l, "attn_compressor_ape.weight"));
@@ -2057,7 +2102,8 @@ int64_t HostBytes(const DeepseekV4HostWeights& hw) {
          vf(hl.wq_b) + vf(hl.wkv) + vf(hl.kv_norm_weight) + vf(hl.attn_sink) +
          vf(hl.wo_a) + vf(hl.wo_b) + vf(hl.idx_wq) + vf(hl.idx_wk) + vf(hl.idx_wproj) +
          vf(hl.comp_wgate) + vf(hl.comp_ape) + vf(hl.comp_norm_weight) +
-         vf(hl.gate_weight) + vf(hl.gate_bias) + vi(hl.tid2eid) + vf(hl.shared_w1) +
+         vf(hl.gate_weight) + vf(hl.gate_bias) + vf(hl.gate_bias_vl) +
+         vi(hl.tid2eid) + vf(hl.shared_w1) +
          vf(hl.shared_w3) + vf(hl.shared_w2) + vf(hl.exp_w1) + vf(hl.exp_w3) +
          vf(hl.exp_w2);
   }
@@ -2076,7 +2122,8 @@ int64_t GgufBytes(const DeepseekV4GgufWeights& gw) {
           &l.kv_a_norm, &l.attn_sink, &l.ffn_norm, &l.hc_attn_base, &l.hc_attn_fn,
           &l.hc_attn_scale, &l.hc_ffn_base, &l.hc_ffn_fn, &l.hc_ffn_scale, &l.moe_gate,
           &l.moe_gate_exps, &l.moe_up_exps, &l.moe_down_exps, &l.shared_gate,
-          &l.shared_up, &l.shared_down, &l.tid2eid, &l.e_score_bias, &l.comp_ape,
+          &l.shared_up, &l.shared_down, &l.tid2eid, &l.e_score_bias,
+          &l.e_score_bias_vl, &l.comp_ape,
           &l.comp_wgate, &l.comp_wkv, &l.comp_norm, &l.idx_wq_b, &l.idx_proj,
           &l.idx_comp_ape, &l.idx_comp_wgate, &l.idx_comp_wkv, &l.idx_comp_norm}) {
       b += OwnedBytesOf(*t);

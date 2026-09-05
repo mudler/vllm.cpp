@@ -437,10 +437,14 @@ constexpr const char* kTnImgEnd = "v.token_embd.img_end";
 constexpr const char* kTnImgPad = "v.token_embd.img_pad";
 constexpr const char* kTnImageNewline = "v.image_newline";
 
-// The thirteen tensors ONE `deepseek4v` block carries. Attention arrives as
-// three SEPARATE projections rather than the fused `attn_qkv` a
-// `qwen3vl_merger` file has, and the MLP arrives as three separate matrices,
-// so this list is what makes the block count 13 rather than 12.
+// The thirteen tensors ONE `deepseek4v` block carries IN THE SHIPPED VEHICLE.
+// Attention arrives as three SEPARATE projections and the MLP as three separate
+// matrices, so this list is what makes the block count 13 rather than 12.
+//
+// The split is a property of the FILE, not of the family: the pinned converter
+// emits the FUSED `attn_qkv` (see the header). `kTnFusedQkvProbe` below is how
+// a fused file is recognised and refused by name instead of being blamed for
+// carrying tensors this build never reads.
 constexpr const char* kDeepSeekV4BlockTensors[] = {
     "attn_q.weight",   "attn_q.bias",   "attn_k.weight",  "attn_k.bias",
     "attn_v.weight",   "attn_v.bias",   "attn_out.weight", "attn_out.bias",
@@ -448,8 +452,46 @@ constexpr const char* kDeepSeekV4BlockTensors[] = {
     "ln2.weight",
 };
 
+// Layer 0 always exists in a projector this reader would otherwise accept, so
+// its fused attention weight is a sufficient probe for the whole file.
+constexpr const char* kTnFusedQkvProbe = "v.blk.0.attn_qkv.weight";
+
+// The largest `clip.vision.block_count` this reader will honour. It is not a
+// capability limit; it is the boundary between a geometry a projector can
+// plausibly declare and one that only reaches `std::vector::resize`. The
+// shipped artifact is depth 32 and no published vision tower is near this, so
+// a file above it is corrupt or hostile rather than new.
+constexpr int64_t kMaxDeepSeekV4Depth = 1024;
+
+// The same boundary for every WIDTH. These do not reach a `resize` on their
+// own, but they multiply into one (`aligner_input_size()` is
+// hidden * ratio^2), so an unbounded pair is the same defect one step removed.
+constexpr int64_t kMaxGeometry = 1 << 20;
+
 std::string DeepSeekV4BlockPrefix(int64_t layer) {
   return "v.blk." + std::to_string(layer) + ".";
+}
+
+bool HasTensor(const GgufFile& gguf, const std::string& name) {
+  for (const GgufTensorInfo& info : gguf.Tensors()) {
+    if (info.name == name) return true;
+  }
+  return false;
+}
+
+// One geometry field, refused BY NAME rather than by the allocation that would
+// follow. `KvInt` widens every integer spelling, so a signed `block_count` of
+// -1 and an unsigned one of four billion both arrive here, and both become a
+// `size_t` at the `resize` below. A `length_error` or a `bad_alloc` names
+// neither the file nor the key, and this path runs on a user-supplied
+// `--mmproj`.
+void RequireGeometry(int64_t value, const char* key, int64_t max,
+                     const std::string& what) {
+  VT_CHECK(value >= 1 && value <= max,
+           "clip mmproj gguf: " + std::string(key) + " is " +
+               std::to_string(value) + ", and this reader accepts 1 to " +
+               std::to_string(max) + " (" + what +
+               "). A projector declaring that is corrupt, not new");
 }
 
 // A contiguous HOST view over `data`. W4 owns the upload, so this wave keeps
@@ -558,6 +600,26 @@ void RefuseUnsupportedDeepSeekV4ClipMmproj(const GgufFile& gguf,
                (proj.empty() ? std::string("<absent>") : proj) +
                "'; the DeepSeek-V4 vision arm loads '" +
                kClipProjectorDeepSeekV4 + "' projectors only");
+  // The FUSED attention arm, refused BY NAME. `gguf-py/gguf/constants.py` at
+  // the pin spells V_ENC_ATTN_QKV `v.blk.{bid}.attn_qkv`, and nothing splits it
+  // for this family, so `convert_hf_to_gguf.py` emits the fused form while the
+  // shipped `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` mmproj carries the
+  // split one. This refusal has to come BEFORE
+  // `RefuseUnaccountedDeepSeekV4ClipMmproj`, which would otherwise report that
+  // the FILE carries tensors this reader never reads and send the user to
+  // re-convert an artifact that is already correct.
+  VT_CHECK(!HasTensor(gguf, kTnFusedQkvProbe),
+           "--mmproj: '" + path + "' stores its vision attention FUSED as '" +
+               kTnFusedQkvProbe +
+               "', and this build's deepseek4v reader reads the SPLIT "
+               "'attn_q' / 'attn_k' / 'attn_v' form only. The fused arm is NOT "
+               "IMPLEMENTED here: row "
+               "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm owns it and "
+               "issue #2411 tracks it. Your file is not at fault -- "
+               "llama.cpp's own convert_hf_to_gguf.py writes this layout. The "
+               "shipped 'unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF' "
+               "mmproj-BF16.gguf carries the split form and this build loads "
+               "it");
   const GgufValue* silu = gguf.FindKv(kKvUseSilu);
   VT_CHECK(silu != nullptr && silu->TypeId() == kGgufBool &&
                std::get<bool>(silu->v),
@@ -576,6 +638,20 @@ multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
   config.num_heads = ReqInt(gguf, kKvHeads);
   config.depth = ReqInt(gguf, kKvBlocks);
   config.intermediate_size = ReqInt(gguf, kKvFf);
+  // Every one of these is a `Require` shape, a loop bound or a `resize`
+  // argument further down, so each is bounded HERE, where the key that carried
+  // it can still be named. `depth` carries the tight bound because it is the
+  // only one that reaches `std::vector::resize` directly; the rest are refused
+  // for being absent-in-effect, which would otherwise build a tower of empty
+  // matrices that runs and is wrong.
+  RequireGeometry(config.depth, kKvBlocks, kMaxDeepSeekV4Depth,
+                  "it becomes the block vector's size");
+  RequireGeometry(config.hidden_size, kKvEmbd, kMaxGeometry,
+                  "it is every block tensor's shape");
+  RequireGeometry(config.num_heads, kKvHeads, kMaxGeometry,
+                  "it divides the hidden size into heads");
+  RequireGeometry(config.intermediate_size, kKvFf, kMaxGeometry,
+                  "it is the MLP's inner width");
   // `projection_dim` is the aligner's output width and `projector.scale_factor`
   // is the 3x3 downsample ratio: clip.cpp's PROJECTOR_TYPE_DEEPSEEK4V case
   // reads KEY_PROJ_SCALE_FACTOR into `hparams.n_merge`, and deepseek4v.cpp
@@ -583,6 +659,12 @@ multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
   config.output_size = ReqInt(gguf, kKvProjDim);
   config.downsample_ratio = ReqInt(gguf, kKvScaleFactor);
   config.patch_size = ReqInt(gguf, kKvPatch);
+  RequireGeometry(config.output_size, kKvProjDim, kMaxGeometry,
+                  "it is the aligner's output width");
+  RequireGeometry(config.downsample_ratio, kKvScaleFactor, kMaxGeometry,
+                  "it squares into the aligner's input width");
+  RequireGeometry(config.patch_size, kKvPatch, kMaxGeometry,
+                  "it squares into the patch embedding's input width");
   // READ, never assumed: this projector's eps is the vision RMSNorm's torch
   // default rather than the language model's, and a reader that kept the W2
   // default would agree with this artifact by luck.

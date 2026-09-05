@@ -9,7 +9,10 @@
 // own value-exact case here:
 //
 //   (a) the file stores `attn_q` / `attn_k` / `attn_v` SEPARATELY and W2 wants
-//       one fused `qkv_weight [3*hidden, hidden]`;
+//       one fused `qkv_weight [3*hidden, hidden]`. THE SPLIT IS THIS FILE'S,
+//       not the family's: the pinned `convert_hf_to_gguf.py` emits the FUSED
+//       `v.blk.{bid}.attn_qkv` instead, which this build does not implement and
+//       refuses by name;
 //   (b) the file stores `ffn_gate` and `ffn_up` SEPARATELY and W2 wants one
 //       `mlp_w1_weight [2*intermediate, hidden]`;
 //   (c) `v.patch_embd.weight` is a 4-D conv2d weight and W2 wants a 2-D torch
@@ -18,6 +21,9 @@
 //   (d) the file stores every 1-D tensor and the patch embedding as F32 while
 //       W2's contract says RMSNorm weights stay f32 and every linear weight and
 //       bias is the model dtype.
+//
+// It also gates the refusals: the unimplemented fused arm, an out-of-range
+// geometry, a wrong shape, and a projector that declares no activation.
 //
 // It does NOT prove that anything reaches this reader. W4 owns the production
 // call site for row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, and the
@@ -49,6 +55,7 @@
 //   tools/mtmd/models/deepseek4v.cpp::clip_graph_deepseek4v::build — the roles
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -184,7 +191,28 @@ struct Options {
   bool emit_use_silu = true;
   std::string omit_tensor;
   std::string stray_tensor;
+  // Emit the FUSED `v.blk.{bid}.attn_qkv.{weight,bias}` instead of the six
+  // separate q/k/v tensors. This is what the pinned oracle's own
+  // `convert_hf_to_gguf.py` produces, and it is the arm this build does not
+  // implement.
+  bool fused_qkv = false;
+  // Write one named tensor with its ggml dims REVERSED, which is a torch
+  // transpose of the same element count. Nothing about the numel changes, so
+  // only the reader's shape guard can catch it.
+  std::string transpose_tensor;
+  // Replace the `clip.vision.block_count` kv with these raw bytes, so a case
+  // can hand the reader a geometry no `U32Kv` can spell.
+  std::string block_count_kv;
+  // The same, for `clip.vision.embedding_length`.
+  std::string embedding_length_kv;
 };
+
+// The builder has no signed-integer kv encoder and it is shared with every
+// other GGUF test, so this one stays local: GGUF type 5 is i32.
+std::string I32Kv(const std::string& key, int32_t val) {
+  return gguf_test::GStr(key) + gguf_test::U32Le(5) +
+         gguf_test::U32Le(static_cast<uint32_t>(val));
+}
 
 uint64_t U(int64_t v) { return static_cast<uint64_t>(v); }
 
@@ -195,9 +223,17 @@ std::string Build(const Dims& d, const Options& o = Options{}) {
     b.AddKv(gguf_test::StrKv("general.type", o.general_type));
   if (!o.projector_type.empty())
     b.AddKv(gguf_test::StrKv("clip.projector_type", o.projector_type));
-  b.AddKv(gguf_test::U32Kv("clip.vision.embedding_length", static_cast<uint32_t>(d.hidden)));
+  if (o.embedding_length_kv.empty()) {
+    b.AddKv(gguf_test::U32Kv("clip.vision.embedding_length", static_cast<uint32_t>(d.hidden)));
+  } else {
+    b.AddKv(o.embedding_length_kv);
+  }
   b.AddKv(gguf_test::U32Kv("clip.vision.feed_forward_length", static_cast<uint32_t>(d.inter)));
-  b.AddKv(gguf_test::U32Kv("clip.vision.block_count", static_cast<uint32_t>(d.depth)));
+  if (o.block_count_kv.empty()) {
+    b.AddKv(gguf_test::U32Kv("clip.vision.block_count", static_cast<uint32_t>(d.depth)));
+  } else {
+    b.AddKv(o.block_count_kv);
+  }
   b.AddKv(gguf_test::U32Kv("clip.vision.projection_dim", static_cast<uint32_t>(d.output)));
   b.AddKv(gguf_test::U32Kv("clip.vision.attention.head_count", static_cast<uint32_t>(d.heads)));
   b.AddKv(gguf_test::U32Kv("clip.vision.patch_size", static_cast<uint32_t>(d.patch)));
@@ -206,63 +242,84 @@ std::string Build(const Dims& d, const Options& o = Options{}) {
   if (o.emit_use_silu) b.AddKv(gguf_test::BoolKv("clip.use_silu", o.use_silu));
 
   const auto skip = [&o](const char* name) { return o.omit_tensor == name; };
+  // Every tensor goes through these so ONE named tensor can be written with its
+  // ggml dims reversed; the shape guard is the only thing that can see it.
+  const auto f32 = [&](const std::string& name, std::vector<uint64_t> dims,
+                       int family) {
+    if (o.transpose_tensor == name) std::reverse(dims.begin(), dims.end());
+    AddF32(b, name, dims, family);
+  };
+  const auto bf16 = [&](const std::string& name, std::vector<uint64_t> dims,
+                        int family) {
+    if (o.transpose_tensor == name) std::reverse(dims.begin(), dims.end());
+    AddBf16(b, name, dims, family);
+  };
 
   // The aligner projection. `mm.1` is the 3x3 unfold's consumer and `mm.2`
   // closes it; there is no `mm.0` in a deepseek4v export.
-  if (!skip("mm.1.weight")) AddBf16(b, "mm.1.weight", {U(d.aligner_in()), U(d.output)}, kFamMm1W);
-  if (!skip("mm.1.bias")) AddF32(b, "mm.1.bias", {U(d.output)}, kFamMm1B);
-  if (!skip("mm.2.weight")) AddBf16(b, "mm.2.weight", {U(d.output), U(d.output)}, kFamMm2W);
-  if (!skip("mm.2.bias")) AddF32(b, "mm.2.bias", {U(d.output)}, kFamMm2B);
+  if (!skip("mm.1.weight")) bf16("mm.1.weight", {U(d.aligner_in()), U(d.output)}, kFamMm1W);
+  if (!skip("mm.1.bias")) f32("mm.1.bias", {U(d.output)}, kFamMm1B);
+  if (!skip("mm.2.weight")) bf16("mm.2.weight", {U(d.output), U(d.output)}, kFamMm2W);
+  if (!skip("mm.2.bias")) f32("mm.2.bias", {U(d.output)}, kFamMm2B);
 
   // The four learned sentinel vectors, f32 [projection_dim] in the artifact.
   if (!skip("v.token_embd.img_start"))
-    AddF32(b, "v.token_embd.img_start", {U(d.output)}, kFamImgStart);
+    f32("v.token_embd.img_start", {U(d.output)}, kFamImgStart);
   if (!skip("v.token_embd.img_end"))
-    AddF32(b, "v.token_embd.img_end", {U(d.output)}, kFamImgEnd);
+    f32("v.token_embd.img_end", {U(d.output)}, kFamImgEnd);
   if (!skip("v.token_embd.img_pad"))
-    AddF32(b, "v.token_embd.img_pad", {U(d.output)}, kFamImgPad);
-  if (!skip("v.image_newline")) AddF32(b, "v.image_newline", {U(d.output)}, kFamNewline);
+    f32("v.token_embd.img_pad", {U(d.output)}, kFamImgPad);
+  if (!skip("v.image_newline")) f32("v.image_newline", {U(d.output)}, kFamNewline);
 
   for (int64_t l = 0; l < d.depth; ++l) {
     const std::string p = "v.blk." + std::to_string(l) + ".";
     if (!skip((p + "ln1.weight").c_str()))
-      AddF32(b, p + "ln1.weight", {U(d.hidden)}, Fam(kFamLn1, l));
+      f32(p + "ln1.weight", {U(d.hidden)}, Fam(kFamLn1, l));
     if (!skip((p + "ln2.weight").c_str()))
-      AddF32(b, p + "ln2.weight", {U(d.hidden)}, Fam(kFamLn2, l));
-    if (!skip((p + "attn_q.weight").c_str()))
-      AddBf16(b, p + "attn_q.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamQ, l));
-    if (!skip((p + "attn_k.weight").c_str()))
-      AddBf16(b, p + "attn_k.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamK, l));
-    if (!skip((p + "attn_v.weight").c_str()))
-      AddBf16(b, p + "attn_v.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamV, l));
-    if (!skip((p + "attn_q.bias").c_str()))
-      AddF32(b, p + "attn_q.bias", {U(d.hidden)}, Fam(kFamQBias, l));
-    if (!skip((p + "attn_k.bias").c_str()))
-      AddF32(b, p + "attn_k.bias", {U(d.hidden)}, Fam(kFamKBias, l));
-    if (!skip((p + "attn_v.bias").c_str()))
-      AddF32(b, p + "attn_v.bias", {U(d.hidden)}, Fam(kFamVBias, l));
+      f32(p + "ln2.weight", {U(d.hidden)}, Fam(kFamLn2, l));
+    if (o.fused_qkv) {
+      // What `convert_hf_to_gguf.py` writes at the pin: `tensor_mapping.py`
+      // maps `vision.blocks.{bid}.attn.wqkv` to V_ENC_ATTN_QKV and
+      // `constants.py` spells that `v.blk.{bid}.attn_qkv`, and nothing splits
+      // it for this family.
+      bf16(p + "attn_qkv.weight", {U(d.hidden), U(3 * d.hidden)}, Fam(kFamQ, l));
+      f32(p + "attn_qkv.bias", {U(3 * d.hidden)}, Fam(kFamQBias, l));
+    } else {
+      if (!skip((p + "attn_q.weight").c_str()))
+        bf16(p + "attn_q.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamQ, l));
+      if (!skip((p + "attn_k.weight").c_str()))
+        bf16(p + "attn_k.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamK, l));
+      if (!skip((p + "attn_v.weight").c_str()))
+        bf16(p + "attn_v.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamV, l));
+      if (!skip((p + "attn_q.bias").c_str()))
+        f32(p + "attn_q.bias", {U(d.hidden)}, Fam(kFamQBias, l));
+      if (!skip((p + "attn_k.bias").c_str()))
+        f32(p + "attn_k.bias", {U(d.hidden)}, Fam(kFamKBias, l));
+      if (!skip((p + "attn_v.bias").c_str()))
+        f32(p + "attn_v.bias", {U(d.hidden)}, Fam(kFamVBias, l));
+    }
     if (!skip((p + "attn_out.weight").c_str()))
-      AddBf16(b, p + "attn_out.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamOutW, l));
+      bf16(p + "attn_out.weight", {U(d.hidden), U(d.hidden)}, Fam(kFamOutW, l));
     if (!skip((p + "attn_out.bias").c_str()))
-      AddF32(b, p + "attn_out.bias", {U(d.hidden)}, Fam(kFamOutB, l));
+      f32(p + "attn_out.bias", {U(d.hidden)}, Fam(kFamOutB, l));
     if (!skip((p + "ffn_gate.weight").c_str()))
-      AddBf16(b, p + "ffn_gate.weight", {U(d.hidden), U(d.inter)}, Fam(kFamGate, l));
+      bf16(p + "ffn_gate.weight", {U(d.hidden), U(d.inter)}, Fam(kFamGate, l));
     if (!skip((p + "ffn_up.weight").c_str()))
-      AddBf16(b, p + "ffn_up.weight", {U(d.hidden), U(d.inter)}, Fam(kFamUp, l));
+      bf16(p + "ffn_up.weight", {U(d.hidden), U(d.inter)}, Fam(kFamUp, l));
     if (!skip((p + "ffn_down.weight").c_str()))
-      AddBf16(b, p + "ffn_down.weight", {U(d.inter), U(d.hidden)}, Fam(kFamDown, l));
+      bf16(p + "ffn_down.weight", {U(d.inter), U(d.hidden)}, Fam(kFamDown, l));
   }
 
-  if (!skip("v.post_ln.weight")) AddF32(b, "v.post_ln.weight", {U(d.hidden)}, kFamPostLn);
+  if (!skip("v.post_ln.weight")) f32("v.post_ln.weight", {U(d.hidden)}, kFamPostLn);
   // ggml order {p, p, C, out} == torch [out, C, p, p], exactly as the artifact
   // stores it and exactly what `data_torch.reshape(shape[0], 3, p, p)` in the
   // pinned converter produced.
   if (!skip("v.patch_embd.weight"))
-    AddF32(b, "v.patch_embd.weight", {U(d.patch), U(d.patch), U(d.channels), U(d.hidden)},
-           kFamPatchW);
-  if (!skip("v.patch_embd.bias")) AddF32(b, "v.patch_embd.bias", {U(d.hidden)}, kFamPatchB);
+    f32("v.patch_embd.weight", {U(d.patch), U(d.patch), U(d.channels), U(d.hidden)},
+        kFamPatchW);
+  if (!skip("v.patch_embd.bias")) f32("v.patch_embd.bias", {U(d.hidden)}, kFamPatchB);
 
-  if (!o.stray_tensor.empty()) AddF32(b, o.stray_tensor, {U(d.hidden)}, 50);
+  if (!o.stray_tensor.empty()) f32(o.stray_tensor, {U(d.hidden)}, 50);
   return b.Build();
 }
 
@@ -514,10 +571,38 @@ TEST_CASE("deepseek4v mmproj: the aligner and the four sentinel vectors land in 
   REQUIRE(loaded.weights.aligner_w1_weight.shape[1] == d.aligner_in());
   REQUIRE(loaded.weights.aligner_w2_weight.shape[0] == d.output);
   REQUIRE(loaded.weights.aligner_w2_weight.shape[1] == d.output);
-  CHECK(Word(loaded.weights.aligner_w1_weight, 0) == vt::F32ToBF16(Series(kFamMm1W, 0)));
-  CHECK(Word(loaded.weights.aligner_w1_bias, 0) == vt::F32ToBF16(Series(kFamMm1B, 0)));
-  CHECK(Word(loaded.weights.aligner_w2_weight, 0) == vt::F32ToBF16(Series(kFamMm2W, 0)));
-  CHECK(Word(loaded.weights.aligner_w2_bias, 0) == vt::F32ToBF16(Series(kFamMm2B, 0)));
+  // EVERY element, not element 0. `mm.2.weight` is the one SQUARE linear in
+  // this projector -- [4096, 4096] on the real artifact -- so a torch/ggml
+  // row-versus-column confusion there survives both shape REQUIREs above and
+  // leaves element 0 unchanged, because index 0 is the one element a transpose
+  // fixes. Only an OFF-DIAGONAL element can see it, and the series gives every
+  // flat index its own bf16 word.
+  int64_t checked = 0;
+  for (int64_t i = 0; i < d.output * d.aligner_in(); ++i) {
+    CHECK(Word(loaded.weights.aligner_w1_weight, i) ==
+          vt::F32ToBF16(Series(kFamMm1W, i)));
+    ++checked;
+  }
+  for (int64_t i = 0; i < d.output * d.output; ++i) {
+    CHECK(Word(loaded.weights.aligner_w2_weight, i) ==
+          vt::F32ToBF16(Series(kFamMm2W, i)));
+    ++checked;
+  }
+  for (int64_t i = 0; i < d.output; ++i) {
+    CHECK(Word(loaded.weights.aligner_w1_bias, i) ==
+          vt::F32ToBF16(Series(kFamMm1B, i)));
+    CHECK(Word(loaded.weights.aligner_w2_bias, i) ==
+          vt::F32ToBF16(Series(kFamMm2B, i)));
+    checked += 2;
+  }
+  // A bound that collapsed to zero leaves every CHECK above unexecuted and the
+  // case still prints SUCCESS.
+  CHECK(checked == d.output * d.aligner_in() + d.output * d.output + 2 * d.output);
+  // Named explicitly, because the loop above would also pass on a matrix that
+  // happened to be symmetric: these two are a transposed PAIR, so one CHECK
+  // that they differ states in the test what the loop is protecting.
+  CHECK(Word(loaded.weights.aligner_w2_weight, 1) !=
+        Word(loaded.weights.aligner_w2_weight, d.output));
 
   // The sentinels stay f32, which is the dtype the file holds and the dtype
   // llama.cpp concatenates them at. W2 declares no dtype for them because it
@@ -557,13 +642,144 @@ TEST_CASE("deepseek4v mmproj: the tensor map closes in BOTH directions") {
 TEST_CASE("deepseek4v mmproj: a tensor the reader never reads is refused, not dropped") {
   const Dims d;
   Options o;
-  o.stray_tensor = "v.blk.0.attn_qkv.weight";
+  // A LEARNED position embedding. A qwen3vl-style export carries one and this
+  // tower is RoPE, so a file that had both would otherwise load fine and place
+  // every patch at the wrong position: a tower that runs and is wrong.
+  o.stray_tensor = "v.position_embd.weight";
   const std::string message = ThrownBy(Build(d, o), /*load_weights=*/false);
-  // Silently dropping it is what produces a tower that runs and is wrong: this
-  // exact name is the FUSED qkv a qwen3vl export carries, so a file that had
-  // both would otherwise load the separate three and ignore the fused one.
-  CHECK(Contains(message, "v.blk.0.attn_qkv.weight"));
+  CHECK(Contains(message, "v.position_embd.weight"));
   CHECK(Contains(message, "NEVER reads"));
+}
+
+TEST_CASE("deepseek4v mmproj: the FUSED attn_qkv arm is refused BY NAME, not blamed on the file") {
+  // THE FILE A USER GETS FROM THE ORACLE'S OWN CONVERTER. At the pin,
+  // `gguf-py/gguf/tensor_mapping.py` maps `vision.blocks.{bid}.attn.wqkv` to
+  // V_ENC_ATTN_QKV and `gguf-py/gguf/constants.py` spells that
+  // `v.blk.{bid}.attn_qkv`. Nothing splits it for this family:
+  // `conversion/base.py` contains no occurrence of `qkv` at all, the only
+  // converter that splits a fused vision qkv is the model-specific
+  // `conversion/qwenvl.py`, and
+  // `conversion/deepseek.py::DeepseekV4FlashVisionModel.modify_tensors` splits
+  // `mlp.w1` only. So `convert_hf_to_gguf.py` emits the FUSED form, 299
+  // tensors at depth 32, and this build reads the SPLIT form only.
+  //
+  // Without the named refusal this file falls through to the unaccounted-tensor
+  // refusal, which reports that the FILE carries tensors the reader never
+  // reads. That blames the artifact for a gap in this build, and it sends the
+  // reader to re-convert a file that is already correct.
+  const Dims d;
+  Options o;
+  o.fused_qkv = true;
+  const std::string message = ThrownBy(Build(d, o), /*load_weights=*/false);
+  CHECK(Contains(message, "attn_qkv"));
+  CHECK(Contains(message, "NOT IMPLEMENTED"));
+  CHECK(Contains(message, "2411"));
+  // The refusal has to arrive BEFORE the unaccounted-tensor one, or the user
+  // reads the wrong diagnosis.
+  CHECK(!Contains(message, "NEVER reads"));
+}
+
+TEST_CASE("deepseek4v mmproj: a projector that declares NO clip.use_silu is refused") {
+  // Absent is not "SwiGLU by omission". `tools/mtmd/clip.cpp` at the pin
+  // defaults to FFN_GELU_QUICK when neither `use_gelu` nor `use_silu` is set,
+  // and W2's MLP is SwiGLU by construction, so a file that states nothing is a
+  // file this reader cannot honour. The pinned converter always writes the key,
+  // so a projector missing it was not produced by it.
+  const Dims d;
+  Options o;
+  o.emit_use_silu = false;
+  const std::string message = ThrownBy(Build(d, o), /*load_weights=*/false);
+  CHECK(Contains(message, "clip.use_silu"));
+}
+
+TEST_CASE("deepseek4v mmproj: a wrong-shaped tensor names BOTH shapes") {
+  // The shape guard is what makes the identity patch permutation safe against a
+  // mis-read ggml/torch dim convention, and it is a memory-safety boundary
+  // besides: a `want` larger than the tensor's numel would publish a
+  // `HostView` over a short buffer. A transposed `ffn_gate` keeps the numel
+  // identical, so nothing except this guard can see it.
+  const Dims d;
+  Options o;
+  o.transpose_tensor = "v.blk.0.ffn_gate.weight";
+  const std::string message = ThrownBy(Build(d, o), /*load_weights=*/true);
+  CHECK(Contains(message, "v.blk.0.ffn_gate.weight"));
+  CHECK(Contains(message, "is [8, 6]"));
+  CHECK(Contains(message, "expected [6, 8]"));
+}
+
+TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
+  // `clip.vision.block_count` is read from a user-supplied `--mmproj` and then
+  // becomes a `resize` argument and a loop bound. `KvInt` widens every integer
+  // spelling, so a signed one can be negative and an unsigned one can be four
+  // billion; both reach `std::vector::resize` as a `size_t`.
+  //
+  // THE VALUES HERE ARE DELIBERATELY SMALL, and that is the point rather than
+  // a convenience. A red-first case for an unbounded allocation performs the
+  // allocation by construction: `block_count = 4000000000` asks for about 80 GB
+  // of blocks, and on this box it tripped the GLOBAL Linux OOM killer twice
+  // ("Out of memory: Killed process (test_deepseek_v) anon-rss:80197996kB")
+  // rather than reporting anything. A test whose only failure mode is
+  // `bad_alloc` is a crash, not a gate. So the guard is asserted on the PARSED
+  // VALUE: `4096` is absurd for a vision tower the artifact ships at depth 32,
+  // it is refused by name, and WITHOUT the guard it allocates a few megabytes
+  // and then fails these CHECKs on the message instead of taking the machine
+  // down.
+  const Dims d;
+  Options negative;
+  negative.block_count_kv = I32Kv("clip.vision.block_count", -1);
+  const std::string neg = ThrownBy(Build(d, negative), /*load_weights=*/false);
+  CHECK(Contains(neg, "clip.vision.block_count"));
+  CHECK(Contains(neg, "-1"));
+
+  Options huge;
+  huge.block_count_kv = gguf_test::U32Kv("clip.vision.block_count", 4096U);
+  const std::string big = ThrownBy(Build(d, huge), /*load_weights=*/false);
+  CHECK(Contains(big, "clip.vision.block_count"));
+  CHECK(Contains(big, "4096"));
+
+  // The other geometry keys are the same class of input and the same class of
+  // consequence: a zero `embedding_length` makes every `Require` shape `[0, 0]`
+  // and a tower of empty matrices runs and is wrong.
+  Options zero_embd;
+  zero_embd.embedding_length_kv =
+      gguf_test::U32Kv("clip.vision.embedding_length", 0U);
+  const std::string zero = ThrownBy(Build(d, zero_embd), /*load_weights=*/false);
+  CHECK(Contains(zero, "clip.vision.embedding_length"));
+}
+
+TEST_CASE("deepseek4v mmproj: the attention OUTPUT projection lands value-exact in its own slot") {
+  // `attn_out` is 32 x 1M parameters on the real artifact and it is the only
+  // block tensor with no join to undo, which is exactly why it is easy to leave
+  // unmeasured. Sourcing it from `attn_q` instead produces a tower that runs
+  // and is fluent, so it gets its own exponent families and its own walk.
+  const Dims d;
+  TempFile file(Build(d));
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(file.path());
+  const DeepSeekV4VisionConfig cfg = vllm::DeepSeekV4ClipMmprojVisionConfig(gguf);
+  const vllm::DeepSeekV4ClipMmproj loaded =
+      vllm::LoadDeepSeekV4VisionFromClipMmproj(gguf, cfg);
+
+  REQUIRE(loaded.weights.blocks.size() == static_cast<size_t>(d.depth));
+  int64_t checked = 0;
+  for (int64_t l = 0; l < d.depth; ++l) {
+    const auto& block = loaded.weights.blocks[static_cast<size_t>(l)];
+    REQUIRE(block.out_weight.rank == 2);
+    REQUIRE(block.out_weight.shape[0] == d.hidden);
+    REQUIRE(block.out_weight.shape[1] == d.hidden);
+    REQUIRE(block.out_bias.rank == 1);
+    REQUIRE(block.out_bias.shape[0] == d.hidden);
+    for (int64_t i = 0; i < d.hidden * d.hidden; ++i) {
+      CHECK(Word(block.out_weight, i) ==
+            vt::F32ToBF16(Series(Fam(kFamOutW, l), i)));
+      ++checked;
+    }
+    for (int64_t i = 0; i < d.hidden; ++i) {
+      CHECK(Word(block.out_bias, i) ==
+            vt::F32ToBF16(Series(Fam(kFamOutB, l), i)));
+      ++checked;
+    }
+  }
+  CHECK(checked == d.depth * (d.hidden * d.hidden + d.hidden));
 }
 
 TEST_CASE("deepseek4v mmproj: a missing tensor names itself") {

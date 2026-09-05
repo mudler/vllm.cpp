@@ -1657,6 +1657,24 @@ struct V4GgufCtx {
   OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
     return VecWith(pol, name, role);
   }
+  // A value tensor whose WIDTH is part of the contract. `Vec` validates the
+  // residency the policy elected and the role it was routed under; it validates
+  // NO geometry, so a `[E-1]` vector published under an unchanged name loads in
+  // silence and is then indexed by expert id — a read past the end of a short
+  // host `std::vector<float>`, not a refusal. That is a live shape here rather
+  // than a hypothetical: a re-quantized artifact keeps its file name, which is
+  // why the porting rule asks for a sha256 beside the repo id. The safetensors
+  // arm already gets this from `carried.Float(..., {ne})`, and the GLM loaders
+  // beside this one already pass their expected width to `LoadVecF32`; this is
+  // the same guarantee for the GGUF arm's two router biases.
+  OwnedTensor Vec1D(const std::string& name, GgufTensorRole role, int64_t n) {
+    OwnedTensor t = Vec(name, role);
+    VT_CHECK(t.rank == 1 && t.shape[0] == n,
+             "deepseek-v4 gguf: " + name + " must be a 1-D [" + std::to_string(n) +
+                 "] vector (n_routed_experts), got rank " + std::to_string(t.rank) +
+                 " first dim " + std::to_string(t.rank >= 1 ? t.shape[0] : 0));
+    return t;
+  }
   // `token_embd.weight`, in BOTH of the roles this model gives it: the GATHER
   // table (`hw.embed`, indexed as a flat host f32 array at deepseek_v4.cpp:1844)
   // and, when the file is tied, the final projection's f32 GEMM operand. Neither
@@ -1972,7 +1990,8 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     if (lw.is_hash) {
       lw.tid2eid = ctx.Vec(Blk(l, "ffn_gate_tid2eid.weight"), GgufTensorRole::kVector);
     } else {
-      lw.e_score_bias = ctx.Vec(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector);
+      lw.e_score_bias =
+          ctx.Vec1D(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector, ne);
     }
     // MODEL-MM-deepseek-v4 W3B (#2411): `blk.N.exp_probs_b_vl.bias`, f32 [E], the
     // bias an IMAGE token routes on. The pinned
@@ -1984,7 +2003,7 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     // bias an image row has.
     if (HasGgufTensor(g, Blk(l, "exp_probs_b_vl.bias"))) {
       lw.e_score_bias_vl =
-          ctx.Vec(Blk(l, "exp_probs_b_vl.bias"), GgufTensorRole::kVector);
+          ctx.Vec1D(Blk(l, "exp_probs_b_vl.bias"), GgufTensorRole::kVector, ne);
     }
 
     // DSA compressor (compress_ratio != 0) + Lightning-Indexer (== 4).

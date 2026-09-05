@@ -1584,6 +1584,13 @@ vllm_cpp_add_test(test_deepseek_v4_vision
                   vllm/models/test_deepseek_v4_vision.cpp)
 target_compile_definitions(test_deepseek_v4_vision PRIVATE
   DEEPSEEK_V4_VISION_GOLDEN="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/goldens.json")
+# DeepSeek-V4 Vision W3A: the `deepseek4v` arm of the `clip` mmproj reader. It
+# gates the four layout mismatches between what `mmproj-BF16.gguf` stores and
+# what the W2 tower consumes, and every one of them is a silent wrong answer
+# rather than a crash. It proves nothing about reachability: W4 owns the
+# production call site.
+vllm_cpp_add_test(test_deepseek_v4_mmproj
+                  vllm/models/test_deepseek_v4_mmproj.cpp)
 # Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
 # (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
 # 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).

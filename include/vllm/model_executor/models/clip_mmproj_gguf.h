@@ -56,10 +56,12 @@
 // reachable from production.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/deepseek_v4_vision.h"
 #include "vllm/model_executor/models/qwen3_vl_vision.h"
 
 namespace vllm {
@@ -141,5 +143,148 @@ std::vector<std::string> Qwen3VLClipMmprojExpectedTensors(
 void RefuseUnaccountedClipMmproj(const GgufFile& gguf,
                                  const multimodal::Qwen3VLVisionConfig& cfg,
                                  const std::string& path);
+
+// ─── DeepSeek-V4 Flash Vision (`deepseek4v`) ────────────────────────────────
+//
+// The SECOND projector this file reads, and the second one only. Row
+// `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` W3A, issue
+// [#2411](https://github.com/mudler/vllm.cpp/issues/2411).
+//
+// UPSTREAM. vLLM still has no GGUF loader at the pin, so the CONTAINER is read
+// at the secondary oracle `llama-cpp-dsv4vision`
+// ([`.agents/oracles/llama-cpp-dsv4vision.md`](../../../../.agents/oracles/llama-cpp-dsv4vision.md)),
+// which pins `ggml-org/llama.cpp` release `b10766` =
+// `9400c8946e4da5e7694f2c26d6d4e50e14b690fa`, the first release that converts,
+// loads and runs this variant. The lines below were read from the diff that
+// introduces `tools/mtmd/models/deepseek4v.cpp` as blob `ffe8f59d9997`, which
+// is the blob that path holds AT that pin, so the anchors are the pin's own
+// bytes rather than a pull-request head that may have moved. The BEHAVIOUR is
+// the model author's own runtime, pinned at
+// `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp@86f746b36186f0e567729a5c06a8c918caba82a9`
+// and already mirrored by W2 in `multimodal::DeepSeekV4Vision`. Anchors:
+//
+//   conversion/deepseek.py::DeepseekV4FlashVisionModel.set_gguf_parameters —
+//       the `clip.*` keys this projector writes, including
+//       `clip.vision.projector.scale_factor` (the downsample ratio),
+//       `clip.use_silu = true` and the 1e-6 eps that is the vision RMSNorm's
+//       torch default rather than the language model's 1e-20
+//   conversion/deepseek.py::DeepseekV4FlashVisionModel.modify_tensors — the
+//       two SPLITS this reader has to undo: `mlp.w1` is chunked into
+//       `ffn_gate` + `ffn_up` with `chunk(2, dim=0)`, and
+//       `vision.patch_embed.proj.weight` is VIEWED as a conv2d weight with
+//       `data_torch.reshape(shape[0], 3, p, p)`
+//   gguf-py/gguf/tensor_mapping.py — `vision.blocks.{bid}.attn.wqkv` maps to
+//       V_ENC_ATTN_QKV, which the shared mmproj base then writes as three
+//       SEPARATE `attn_q` / `attn_k` / `attn_v` tensors
+//   tools/mtmd/clip-impl.h — `TN_TOK_IMG_START/_END/_PAD` and the `TN_*`
+//       spellings of every `v.*` / `mm.*` name
+//   tools/mtmd/clip.cpp::clip_model_loader, PROJECTOR_TYPE_DEEPSEEK4V — the
+//       hyper-parameter reads, and `hparams.rope_theta = 10000.0f`, which this
+//       projector hardcodes because no `clip.*` key carries it
+//   tools/mtmd/models/deepseek4v.cpp::clip_graph_deepseek4v::build — which
+//       tensor plays which role: `v.post_ln` is the tower's final norm, `mm.1`
+//       and `mm.2` are the aligner's two GELU-separated projections, and the
+//       four learned vectors are concatenated as extra rows of the token block
+//
+// SCOPE. This arm reads the projector into the W2 types and stops there. It is
+// NOT reached from a production entry point: W4 wires
+// `ModelRegistry::Forward`, and the row's spec lists the gap under `## Owed`.
+inline constexpr const char* kClipProjectorDeepSeekV4 = "deepseek4v";
+
+// Refuse, BY NAME, a file that is not a `deepseek4v` projector this build can
+// load. Separate from `RefuseUnsupportedClipMmproj` ON PURPOSE, and the
+// separation is load-bearing rather than stylistic: that function is the
+// Qwen3-VL production path's discriminator, and `model_loader.cpp` goes
+// straight from it into `LoadQwen3VLVisionFromClipMmproj`. Widening it to admit
+// `deepseek4v` would route this file into the Qwen3-VL reader and build a tower
+// that runs and is wrong, so it keeps refusing and this one exists beside it.
+//
+// It also refuses a projector declaring `clip.use_silu = false`. W2's MLP is
+// SwiGLU by construction (it routes through `layers::MlpGateUpMethodBase`), the
+// pinned converter writes the key as `true` for exactly that reason, and a
+// GELU-MLP variant loaded as SwiGLU is fluent and wrong rather than broken.
+void RefuseUnsupportedDeepSeekV4ClipMmproj(const GgufFile& gguf,
+                                           const std::string& path);
+
+// The tower geometry, read from the projector's OWN `clip.*` metadata.
+//
+// `rope_theta` is the one field no key carries. llama.cpp hardcodes 10000.0 for
+// this projector in the same `clip_model_loader` case that reads the keys
+// above, and the pinned converter's `get_vision_config` defaults
+// `vision_rope_theta` to the same value without writing it, so the W2 default
+// stands and is not invented here.
+multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
+    const GgufFile& gguf);
+
+// One `deepseek4v` projector, read into the W2 types plus the four learned
+// sentinel vectors W2 has no field for.
+//
+// `weights` holds NON-OWNING `vt::Tensor` views into `bf16_storage` and
+// `f32_storage` below, so the struct owns its own weights and moving it keeps
+// every view valid (moving a `vector<vector<T>>` transfers the outer buffer and
+// leaves each inner heap block where it is). Copying would silently duplicate
+// the storage and leave the views pointing at the original, so it is deleted.
+//
+// The tensors are HOST tensors on the default device. W4 owns the upload: this
+// wave has no production call site and inventing a device policy here would be
+// a decision made by the wrong wave.
+struct DeepSeekV4ClipMmproj {
+  multimodal::DeepSeekV4VisionWeights weights;
+
+  // `v.token_embd.img_start` / `_end` / `_pad` and `v.image_newline`, each
+  // `[output_size]`. They stay f32, which is the dtype the file holds and the
+  // dtype llama.cpp concatenates them at: W2 declares no dtype for them because
+  // it has no field for them, and W4 owns where they are placed, so narrowing
+  // them here would be a dtype decision made by the wrong wave.
+  std::vector<float> image_start;
+  std::vector<float> image_end;
+  std::vector<float> image_pad;
+  std::vector<float> image_newline;
+
+  // Host storage behind `weights`. Never read directly.
+  std::vector<std::vector<uint16_t>> bf16_storage;
+  std::vector<std::vector<float>> f32_storage;
+
+  DeepSeekV4ClipMmproj() = default;
+  DeepSeekV4ClipMmproj(DeepSeekV4ClipMmproj&&) = default;
+  DeepSeekV4ClipMmproj& operator=(DeepSeekV4ClipMmproj&&) = default;
+  DeepSeekV4ClipMmproj(const DeepSeekV4ClipMmproj&) = delete;
+  DeepSeekV4ClipMmproj& operator=(const DeepSeekV4ClipMmproj&) = delete;
+};
+
+// Load the DeepSeek-V4 vision tower and aligner out of a `deepseek4v` mmproj
+// into the W2 `multimodal::DeepSeekV4VisionWeights`.
+//
+// REFUSES BY NAME, and undoes FOUR layout differences between what the file
+// stores and what W2 consumes. Every one of them is a silent wrong answer when
+// it is wrong, not a crash:
+//
+//   * a missing tensor names itself, and a wrong-shaped one names both shapes;
+//   * `attn_q` / `attn_k` / `attn_v` are stored SEPARATELY and fuse into
+//     `qkv_weight [3*hidden, hidden]` in q, k, v ROW order, which is the order
+//     `deepseek_v4_vision.cpp` slices them back out at;
+//   * `ffn_gate` and `ffn_up` are stored SEPARATELY and concatenate into
+//     `mlp_w1_weight [2*intermediate, hidden]` GATE FIRST, which is the half
+//     `vt::SiluAndMul` applies SiLU to;
+//   * `v.patch_embd.weight` is a 4-D conv2d weight and flattens back into the
+//     2-D torch Linear weight W2 reads, in [channel, dy, dx] column order.
+DeepSeekV4ClipMmproj LoadDeepSeekV4VisionFromClipMmproj(
+    const GgufFile& gguf, const multimodal::DeepSeekV4VisionConfig& cfg);
+
+// The EXACT set of tensor names `LoadDeepSeekV4VisionFromClipMmproj` reads for
+// `cfg`: the patch embedding and its bias, `cfg.depth` blocks of thirteen, the
+// final norm, the aligner's two weight/bias pairs, and the four sentinels. On
+// the pinned artifact (depth 32) that is 427, which is its tensor count.
+std::vector<std::string> DeepSeekV4ClipMmprojExpectedTensors(
+    const multimodal::DeepSeekV4VisionConfig& cfg);
+
+// Refuse a `deepseek4v` projector that carries tensors the reader NEVER reads,
+// naming them and the file. Same direction, and the same reason, as
+// `RefuseUnaccountedClipMmproj`: the MISSING direction names itself tensor by
+// tensor inside the reader, and this is the direction that would otherwise drop
+// a name silently and produce a tower that runs and is wrong.
+void RefuseUnaccountedDeepSeekV4ClipMmproj(
+    const GgufFile& gguf, const multimodal::DeepSeekV4VisionConfig& cfg,
+    const std::string& path);
 
 }  // namespace vllm

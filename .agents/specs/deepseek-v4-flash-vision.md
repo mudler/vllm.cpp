@@ -703,9 +703,94 @@ above as its red-before input.
   W5 wires the runner, public ABI and OpenAI server for row
   `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`; issue #2411 tracks both
   waves.
+- The W3A `deepseek4v` mmproj reader is unreachable for the same reason.
+  `RefuseUnsupportedDeepSeekV4ClipMmproj`,
+  `DeepSeekV4ClipMmprojVisionConfig`, `LoadDeepSeekV4VisionFromClipMmproj`,
+  `DeepSeekV4ClipMmprojExpectedTensors` and
+  `RefuseUnaccountedDeepSeekV4ClipMmproj` have no production call site: the one
+  `clip` mmproj call site, `src/vllm/entrypoints/model_loader.cpp`, still calls
+  the Qwen3-VL arm only, and that arm's refusal deliberately keeps rejecting
+  `deepseek4v` so a DeepSeek projector cannot reach a Qwen3-VL reader. Row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring in W4 and
+  issue #2411 tracks it. The four sentinel vectors this reader returns
+  (`image_start`, `image_end`, `image_pad`, `image_newline`) also have no
+  consumer until W4 assembles the token block.
+- The pinned `mmproj-BF16.gguf` has never been read by this code. W3A gates the
+  name map, the metadata map and the four layout joins against a synthetic
+  fixture built to the artifact's measured header; the real 934,462,656-byte
+  file is owed by W3 together with the arm's first load and generation.
 - DeepSeek-V4 DSpark remains owned by
   `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm`; this row only
   accounts for and names its tensors.
+
+### W3A evidence
+
+W3A adds the `deepseek4v` arm to `src/vllm/model_executor/models/clip_mmproj_gguf.cpp`,
+the reader that already carries `qwen3vl_merger`. The container is anchored at
+the secondary oracle `llama-cpp-dsv4vision`, release `b10766` =
+`9400c8946e4da5e7694f2c26d6d4e50e14b690fa`. The anchors were read from the diff
+that introduces `tools/mtmd/models/deepseek4v.cpp` as blob `ffe8f59d9997`, which
+is the blob that path holds at that pin, so the citations are the pin's own
+bytes rather than a moving pull-request head.
+
+The artifact's header was re-read on 2026-09-05 over an HTTP range request for
+its first mebibyte, without downloading the 934,462,656-byte file. It reports
+GGUF v3, 427 tensors and 27 keys: `clip.projector_type = deepseek4v`,
+`projection_dim = 4096`, `patch_size = 14`, `embedding_length = 1024`,
+`feed_forward_length = 2816`, `block_count = 32`, `attention.head_count = 16`,
+`attention.layer_norm_epsilon = 9.999999974752427e-07`, `use_silu = true`,
+`projector.scale_factor = 3` and `image_min_pixels = 147456`. Its 2-D linear
+weights are BF16; every bias, every norm weight, `v.patch_embd.weight` and the
+four sentinel vectors are F32. The reader's own enumeration returns 427 names at
+`depth = 32`, which the focused gate asserts.
+
+Four layout mismatches separate what the file stores from what W2 consumes, and
+each is a silent wrong answer rather than a crash. `attn_q` / `attn_k` /
+`attn_v` are stored separately and fuse in that row order, which is the order
+`deepseek_v4_vision.cpp` slices back out with `RowSlice`. `ffn_gate` and
+`ffn_up` are stored separately and concatenate gate-first, which is the half
+`vt::SiluAndMul` applies SiLU to and the half the pinned converter's
+`gate, up = data_torch.chunk(2, dim=0)` took. `v.patch_embd.weight` is a conv2d
+view of an `nn.Linear` over an `F.unfold`, so its flattening back to
+`[hidden, 3*patch^2]` is the identity in `[channel, dy, dx]` order rather than a
+permutation. The file's f32 storage of every bias and of the patch embedding is
+llama.cpp's small-tensor convention, so those narrow to the model dtype while
+the RMSNorm weights stay f32, exactly as W2's contract states.
+
+The gate started RED. `cmake --build build-w3a --target test_deepseek_v4_mmproj -j 3`
+failed with 99 compiler errors, every one naming a symbol the reader did not yet
+have: `RefuseUnsupportedDeepSeekV4ClipMmproj is not a member of vllm; did you
+mean RefuseUnsupportedClipMmproj?`, and the same for
+`LoadDeepSeekV4VisionFromClipMmproj`, `DeepSeekV4ClipMmprojExpectedTensors`,
+`RefuseUnaccountedDeepSeekV4ClipMmproj`, `DeepSeekV4ClipMmproj` and
+`multimodal::DeepSeekV4VisionConfig`.
+
+After the change the focused gate passes 13 cases and 999 assertions, and
+`ctest --test-dir build-w3a -R deepseek_v4_mmproj --output-on-failure` reports
+1/1 on a Release CPU build with `-DVLLM_CPP_CUDA=OFF`.
+
+Five production-source mutations prove the gate detects each claimed guarantee.
+Permuting the fused order to q, v, k reddens case (a) with 288 failed
+assertions. Swapping `ffn_gate` and `ffn_up` reddens case (b) with 192.
+Reordering the patch flattening to `[dy, dx, channel]` reddens case (c) with 80.
+Routing the RMSNorm weights through the model-dtype narrowing reddens case (d)
+with 45. Replacing the `clip.vision.attention.layer_norm_epsilon` read with the
+W2 default of 1e-6 reddens the config case with 1, which is why the fixture's
+epsilon is 1.5e-5. Each mutation restored
+`src/vllm/model_executor/models/clip_mmproj_gguf.cpp` byte-for-byte, verified by
+`sha256sum -c` against
+`465c762530030ff31b018080aa0020c7bbfd950d7b86f7489a3adee42bc1d0e5`.
+
+The Qwen3-VL arm is deliberately unchanged. `RefuseUnsupportedClipMmproj` still
+refuses `deepseek4v`, because `src/vllm/entrypoints/model_loader.cpp` goes
+straight from that refusal into `LoadQwen3VLVisionFromClipMmproj`, and widening
+it would route a DeepSeek projector into the Qwen3-VL reader. A case in the new
+gate asserts that refusal still fires and still names both projector types.
+`test_clip_mmproj_gguf`, `test_gguf_mmproj_reach`, `test_gguf_accounting_reach`
+and `test_qwen38_27b_gguf_manifest` pass 4/4 on the same build.
+
+The reader is not reached from production. `## Owed` names what is unreached,
+the row that owns the wiring and issue #2411.
 
 ## Now
 

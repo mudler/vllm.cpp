@@ -1115,6 +1115,135 @@ inline std::string Refusal(const MixedPrecisionConfig& c,
   return out;
 }
 
+// The NOTICE a loader owes a ModelOpt `MIXED_PRECISION` checkpoint that DECLARES
+// `NVFP4` -- 4-bit weights AND 4-bit ACTIVATIONS -- on a module this build then
+// executes W4A16, weight-only. "" means no module diverges and nothing is
+// printed.
+//
+// WHY A NOTICE AND NOT A REFUSAL. `RadixArk/Qwen3.8-27B-NVFP4` @ `554ebba9`
+// declares `{"quant_algo": "NVFP4", "group_size": 16}` on all 193 of its NVFP4
+// modules, declares `config_groups.group_1.input_activations` 4-bit static, and
+// ships `<proj>.input_scale` on every one of them. `Refusal` above accepts it:
+// `kNvfp4` and `kW4A16Nvfp4` share ONE `case` there, because both spellings ship
+// the same weight operands and the cross-check is about the SPELLING. So the
+// checkpoint loads, on the weight-only dispatcher, and produces plausible text.
+// Refusing it would refuse a published artifact for a divergence this tree
+// chose; printing nothing is how that divergence stayed invisible.
+//
+// AND A TOKEN GATE CANNOT SEE IT. The weight bytes swept per decode step are
+// IDENTICAL either way -- same E2M1 nibbles, same fp8-e4m3 group-16 scales -- so
+// no throughput axis moves and no roofline changes. What differs is the
+// activation path and the numerics, and W4A16 of a W4A4 checkpoint is
+// numerically plausible, so the tokens still match. That is the defect class
+// `AGENTS.md` §"Inherit vLLM defaults" names: the gate passes and the path is
+// wrong.
+//
+// THE PREDICATE IS PER MODULE AND IT NAMES THE ARM THIS BUILD ACTUALLY TAKES,
+// not the knob's value, because those are different questions:
+//
+//   - `kW4A16Nvfp4` is NOT in it. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` and
+//     `nvidia/Qwen3.6-27B-NVFP4` declare weight-only and get weight-only, so
+//     both stay silent and every checkpoint that loaded before this function
+//     loads byte-identically and prints nothing new.
+//   - A module shipping the compressed-tensors spelling with its
+//     `input_global_scale` is NOT divergent: `LoadCtNvfp4Raw`
+//     (`qwen3_5_dense_weights.cpp`) reads that divisor UNCONDITIONALLY and sets
+//     `alpha`, so such a module really does take the fp4-activation GEMM.
+//   - A module shipping the ModelOpt spelling is divergent unless
+//     `VT_MODELOPT_W4A4` is set AND `<proj>.input_scale` is shipped, which is
+//     exactly the pair `LoadNvfp4AnyNaming` requires before it sets `alpha`. A
+//     checkpoint that declares W4A4 and ships no divisor is STILL divergent with
+//     the knob on, because the arm is still weight-only -- reporting on the knob
+//     alone would call that one silenced.
+inline std::string ActivationArmNotice(const MixedPrecisionConfig& c,
+                                       const std::vector<std::string>& tensor_names,
+                                       bool w4a4_opt_in) {
+  std::map<std::string, ModuleOperands> shipped;
+  for (const std::string& name : tensor_names) {
+    std::string module;
+    std::string suffix;
+    if (!SplitOperand(name, &module, &suffix)) continue;
+    shipped[module].Add(suffix);
+  }
+
+  std::set<std::string> divergent;
+  std::size_t with_divisor = 0;
+  for (const auto& entry : shipped) {
+    const ModuleOperands& ops = entry.second;
+    if (!ops.WeightBearing()) continue;
+    if (c.Resolve(entry.first).algo != QuantAlgo::kNvfp4) continue;
+    if (ops.CtNvfp4() && ops.input_global_scale) continue;
+    if (w4a4_opt_in && ops.input_scale) continue;
+    if (ops.input_scale) ++with_divisor;
+    divergent.insert(entry.first);
+  }
+  if (divergent.empty()) return std::string();
+
+  std::string out =
+      "modelopt MIXED_PRECISION quantization_config declares quant_algo "
+      "\"NVFP4\" -- 4-bit weights AND 4-bit ACTIVATIONS -- on " +
+      std::to_string(divergent.size()) +
+      " module(s), and this build executes them W4A16: 4-bit weights, bf16 "
+      "activations. The weight bytes swept per step are the same either way, so "
+      "no throughput axis moves. The ACTIVATION path and the numerics differ, "
+      "and a token gate cannot see that, because W4A16 of a W4A4 checkpoint is "
+      "numerically plausible.";
+  out += "\n  " + std::to_string(with_divisor) +
+         " of them ship the activation divisor <module>.input_scale that the "
+         "W4A4 arm would read";
+  // Only TWO endings exist, because `with_divisor` is zero whenever
+  // `w4a4_opt_in` is set: a module that ships the divisor under the knob is not
+  // divergent at all and never reaches that counter. A third branch for
+  // "opted in AND counted" would be unreachable text.
+  out += with_divisor == 0
+             ? ", so this build could not take that arm even with VT_MODELOPT_W4A4=1."
+             : ", and VT_MODELOPT_W4A4 is unset, so it is dropped "
+               "(docs/ENVIRONMENT.md records consuming it producing "
+               "incoherent text on nvidia/Qwen3.6-27B-NVFP4).";
+  // AN OUTPUT HEAD IS NOT AN EXCEPTION, and an earlier draft of this line said
+  // it was. `LoadDenseLmHead` forces this build's NVFP4 head weight-only unless
+  // VT_MODELOPT_W4A4=1, citing `ModelOptNvFp4W4A16LinearMethod`, and that method
+  // is what upstream gives a head declared `W4A16_NVFP4` -- NOT one declared
+  // `NVFP4`. At the parity pin `e126687a9a828d513c01a07cd69f025f27d63280`,
+  // `ModelOptMixedPrecisionConfig.get_quant_method` dispatches a
+  // `ParallelLMHead` on `quant_algo` exactly like any other `LinearBase`
+  // (modelopt.py:2426-2438), with no head branch anywhere in it. So the head of
+  // THIS checkpoint diverges for the same reason its 192 siblings do, and
+  // hiding it would make the count irreconcilable against the file.
+  out +=
+      "\n  An OUTPUT HEAD is not an exception: at the parity pin e126687a9a, "
+      "ModelOptMixedPrecisionConfig dispatches a ParallelLMHead on quant_algo "
+      "like any other Linear (modelopt.py:2426-2438), so a head declared NVFP4 "
+      "resolves upstream to ModelOptNvFp4LinearMethod, the fp4-ACTIVATION "
+      "method -- there is no output-head carve-out. "
+      "ModelOptNvFp4W4A16LinearMethod, which deletes input_scale "
+      "(modelopt.py:1375, registered at :1365), is what a head declared "
+      "W4A16_NVFP4 gets, and it is the arm LoadDenseLmHead pins this build's "
+      "head to whatever the declaration says. lm_head, when present, is "
+      "therefore listed rather than hidden.";
+  out += "\n  declared NVFP4, executed W4A16: " +
+         detail::JoinModules(divergent, 8);
+  out +=
+      "\n  This is a NOTICE and not a refusal: the checkpoint loads. Owed by row "
+      "QUANT-QWEN38-27B-NVFP4-ARM "
+      "(.agents/specs/qwen38-27b-quant-arms.md `## Owed`), issue #2760 "
+      "(https://github.com/mudler/vllm.cpp/issues/2760).";
+  return out;
+}
+
+// The whole-config convenience for `ActivationArmNotice`, with the same
+// `quant_method` precondition as `RefusalForQuantizationConfig` and for the same
+// reason. A config that is not a ModelOpt `MIXED_PRECISION` one answers "" and
+// reads nothing.
+template <class Json>
+inline std::string ActivationArmNoticeForQuantizationConfig(
+    const Json& quant, const std::vector<std::string>& tensor_names,
+    bool w4a4_opt_in) {
+  if (!MixedPrecisionConfig::IsMixedPrecision(quant)) return std::string();
+  return ActivationArmNotice(MixedPrecisionConfig::Parse(quant), tensor_names,
+                             w4a4_opt_in);
+}
+
 // The whole-config convenience a loader calls with the document's
 // `quantization_config` and its shipped tensor names. A config that is not a
 // ModelOpt `MIXED_PRECISION` one answers "" and reads nothing, so a caller that

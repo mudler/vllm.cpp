@@ -1,0 +1,55 @@
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 3c312683-efdd-4ca7-860b-8d326a49a3fa
+RESULT LEASE_ID=d32255f7-2004-432a-b656-dcaef50037a9
+RESULT SCRATCH_FREE_GiB 1371
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0 (cmake ninja build-essential ccache git curl patch python3-venv python3-dev)
+RESULT NVCC=13.0
+RESULT DATASET 52a89439a507f5dfa53b5bbd... 164 problems
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT SHA MATCH: the bytes measured are the pinned artifact
+RESULT SRC untar rc=0 (pin 5649e07d2120df4c5d33fd1d245336490c790e2b)
+RESULT SRCDIR /tmp/exl3h2h/src
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3h2h/src -B /tmp/exl3h2h/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3h2h/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3h2h/bin/vllm-server md5=3b8058f078a02b6bb28a483a503cda3b
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd0...
+RESULT THEIRS harness patch (serve_openai usage+acceptance) rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3h2h/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS torch cuda_available=/tmp/exl3h2h/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT THEIRS-A server pid=60066 (theirs)
+RESULT THEIRS-A ready after 32s
+RESULT THEIRS-A client rc=0
+RESULT OURS-A server pid=60755 (ours)
+RESULT OURS-A ready after 3s
+RESULT OURS-A client rc=0
+RESULT THEIRS-B server pid=60795 (theirs)
+RESULT THEIRS-B ready after 9s
+RESULT THEIRS-B client rc=0
+RESULT OURS-B server pid=61359 (ours)
+RESULT OURS-B ready after 3s
+RESULT OURS-B client rc=0
+leg           ok/n  decode-only  whole-run   ttft ms  out tok   wall s
+----------------------------------------------------------------------
+OURS-A     164/164          53.68      37.33    1062.8    20992    562.3
+OURS-B     164/164          53.57      37.36    1055.1    20992    561.8
+THEIRS-A   164/164          44.63      32.54    1021.7    19680    604.9
+THEIRS-B   164/164          45.01      33.99     886.6    19680    579.1
+
+VERDICT decode-only : ours 53.63 vs theirs 44.82 = 1.197x
+VERDICT whole-run   : ours 37.35 vs theirs 33.26 = 1.123x
+RESULT THEIRS-A ACCEPTANCE accepted=15238 per_output_token=0.774
+RESULT THEIRS-B ACCEPTANCE accepted=15253 per_output_token=0.775
+RESULT OURS-A ACCEPTANCE NOT EXPOSED BY THIS ENGINE ON THE SERVER PATH
+RESULT OURS-B ACCEPTANCE NOT EXPOSED BY THIS ENGINE ON THE SERVER PATH

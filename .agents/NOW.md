@@ -23,8 +23,16 @@ no per-row change needs to touch this file at all.
 Token-exact (or ratified distributional) vs pinned vLLM; ≥ throughput and ≤
 latency/memory on every axis, both gate models, reproduced 2–3x idle. See
 [verification](verification.md). Pin: vLLM `e126687a9a` (0.28.1rc1.dev132) since
-2026-09-03 (#2817). **NO gate has run at it**: goldens predate it (#2794) and the
-benchmark baselines were measured at `555967922` and owe step 6 (#2818).
+2026-09-03 (#2817). **A gate HAS now run at it and it PASSED** (2026-09-04, job
+`7386f034-246a-4af5-9a04-f98aafffce54`, `dgx:gpu0`, 2h15m): the OPT candidate
+captured at the target is byte-identical to the committed bar --
+`IDS mismatched_positions 0 of 96`, `IDS_BYTE_EQUAL True`,
+`SELECTOR K=5 multi_valued_cells 0`, `TOKENGATE_VERDICT PASS`. The default
+FLASH_ATTN backend produced the tokens, so the FA-on-GB10 risk did not fire. Our
+arm's 96/96 carries over unchanged because the candidate's bytes are identical to
+the bar it already passed. The BENCHMARK baselines are still measured at
+`555967922` and still owe step 6 (#2818), and the other strict goldens are still
+owed at the target (#2794).
 
 
 ## Next actions

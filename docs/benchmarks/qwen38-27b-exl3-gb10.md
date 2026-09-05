@@ -6,20 +6,27 @@ are not matched here.
 
 ## Disposition
 
-Measured. On the task and temperature the [Mia-AiLab card][card] quotes, real
-HumanEval at T = 0.6, the pair decodes at 59.5 tok/s where they report 47.5. Our
-acceptance is 4.06 tokens per step against their 4.43, so the speed is not
-coming from an easier drafting task.
+Measured, and now measured against their engine rather than against their
+README. On 4 September 2026 one client drove both engines on one GB10 board,
+over four interleaved legs of the full 164-problem HumanEval set at T = 0.6.
+Counted decode only, ours reads 53.63 tok/s against their 44.82, a ratio of
+**1.197x**. Counted over whole-run wall time, ours reads 37.35 against their
+33.26, a ratio of **1.123x**. Both conventions put us ahead, and neither reads
+anything off their card.
 
-Three things about that comparison are still open and are listed under
-[Limitations](#limitations). Their recipe uses a longer context and an NVFP4 KV
-cache, we run with the paged draft route disabled, and their card does not say
-whether its figure counts the prefill. Counted with the prefill in, the same run
-of ours reads 45.1 tok/s.
+Their engine reaches the first token sooner: 954.2 ms against our 1059.0 ms,
+averaged over both legs of each. That axis goes to them.
 
-There are two measurements below. The first uses a short greedy prompt and is
-kept because the correctness evidence lives there. The HumanEval numbers are the
-ones to compare against anything.
+Two things this run does not establish. No correctness gate covers these four
+legs, because both engines sampled at T = 0.6 and nothing scored what either of
+them wrote. And our acceptance rate is absent: our OpenAI server exports no acceptance
+metric at all ([#2770](https://github.com/mudler/vllm.cpp/issues/2770)), where
+theirs reports 0.774 and 0.775 accepted draft tokens per output token.
+
+The earlier `vllm-bench` measurements stay on this page below. They ran a raw
+completion prompt with `ignore_eos`, which is a different workload, so their
+absolute numbers do not belong beside the head-to-head legs. Our only measured
+acceptance rate, 4.06 tokens per step, lives there.
 
 [card]: https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw
 
@@ -31,14 +38,186 @@ ones to compare against anything.
 | draft | `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` @ `4f0436269bca761b071f05319e8e04a87cc633f9` |
 | device | NVIDIA GB10, compute capability 12.1, driver 580.173.02, nvcc 13.0, `sm_121a` |
 | tree | `origin/main` `5649e07d2120df4c5d33fd1d245336490c790e2b`, pinned inside the job by tarball sha256 |
-| binary | one `vllm-cli`, md5 `3bc87f47b5325468ce575d30114d7928`, serving **both** arms |
+| binary, earlier runs | one `vllm-cli`, md5 `3bc87f47b5325468ce575d30114d7928`, serving **both** arms |
+| binary, head-to-head | one `vllm-server`, md5 `3b8058f078a02b6bb28a483a503cda3b`, built from the same tree |
+| comparator engine | `MiaAI-Lab/exllamav3` @ `63b32f001d7b2cfed3b3e3aaf25f534ba53cc7ed`, staged as a tarball with sha256 `18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4` |
+| head-to-head run | `dgx:gpu0`, lease `d32255f7-2004-432a-b656-dcaef50037a9`, 4 September 2026 |
 
 Both shard sha256 values were **recomputed on the device** and matched the
 download-host pins, so the bytes measured are provably the pinned artifact:
 `7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6` and
 `411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2`.
 
-## Method
+## The head-to-head: their engine and ours behind one client
+
+This is the comparison to quote. Everything below it is older, ran on a
+different harness, and answers a narrower question.
+
+### What ran
+
+Their engine and ours served the same two checkpoints on `dgx:gpu0` inside one
+lease, one boot and one client process. The client speaks OpenAI
+`/v1/chat/completions` with `stream: true` and does not know which engine
+answers. Legs ran `THEIRS-A`, `OURS-A`, `THEIRS-B`, `OURS-B`, because a
+sequential A/B measures the hour along with the arm.
+
+Matched across both sides: the box, the client, the 164 HumanEval problems,
+`max_tokens: 128`, `temperature: 0.6`, `top_p: 0.95`, `top_k: 20`, `seed: 0`,
+concurrency 1, the chat endpoint, each model's own chat template, thinking
+enabled, and no `ignore_eos`. Both servers report 31,488 prompt tokens per leg
+and 174 for the first problem, so the two templates rendered the same token
+counts.
+
+Each engine ran its own recipe. Theirs is `-cq nvfp4 -cs 262144`, verbatim from
+their card. Ours ran `--max-num-seqs 1` with a `dflash` speculative config at
+`num_speculative_tokens: 7`, which is the draft budget their default also
+resolves to. See [what is not matched](#what-is-not-matched) before you quote
+any of this.
+
+The client computes both conventions from the same timings:
+
+```text
+decode-only rate = 1000 / mean(tpot),  tpot = (latency - ttft) / (n_out - 1)
+whole-run rate   = sum(completion_tokens) / wall clock of the whole leg
+```
+
+### The four legs
+
+| leg | order | decode-only tok/s | whole-run tok/s | mean TTFT ms | output tokens | wall s |
+|---|---|---|---|---|---|---|
+| `THEIRS-A` | 1 | 44.63 | 32.54 | 1021.7 | 19,680 | 604.9 |
+| `OURS-A` | 2 | **53.68** | **37.33** | 1062.8 | 20,992 | 562.3 |
+| `THEIRS-B` | 3 | 45.01 | 33.99 | 886.6 | 19,680 | 579.1 |
+| `OURS-B` | 4 | **53.57** | **37.36** | 1055.1 | 20,992 | 561.8 |
+
+Every leg completed 164 of 164 requests with no failures. The job's own verdict
+lines, each the mean of that engine's two legs:
+
+```text
+VERDICT decode-only : ours 53.63 vs theirs 44.82 = 1.197x
+VERDICT whole-run   : ours 37.35 vs theirs 33.26 = 1.123x
+```
+
+Pair the two arms at their least favourable ends instead, our slower leg against
+their faster one, and the ratios are 53.57 / 45.01 = 1.190x decode only and
+37.33 / 33.99 = 1.098x whole run. Our legs agree to 0.21% decode only and 0.08%
+whole run. Theirs agree to 0.85% and 4.46%.
+
+Their engine also produced fewer tokens in more wall time: 19,680 in 591.97 s
+averaged, against our 20,992 in 562.07 s.
+
+### Their engine returns 120 tokens where ours returns 128
+
+All 164 requests in both of their legs came back with exactly 120 completion
+tokens. All 164 in both of ours came back with exactly 128. The client sent
+`max_tokens: 128` to both.
+
+Their generator subtracts twice. At the pinned revision,
+`exllamav3/generator/job.py:202` sets `self.max_new_tokens = max_new_tokens - 1
+or 1`, and line 742 ends the job at `self.new_tokens >= self.max_new_tokens -
+self.generator.num_draft_tokens`. Their DFlash2 draft budget is 7, so
+128 - 1 - 7 = 120.
+
+This is a property of their engine at this pin, not a client error, and each
+side is divided by the tokens it actually produced. It does mean their decode
+ran over sequences 8 tokens shorter than ours, which is slightly less attention
+work per token on their side. The difference does not run in our favour.
+
+### Acceptance is readable on their side only
+
+Their `Job` counter, forwarded by the one patch this harness applies to their
+server wrapper, reports 15,238 accepted draft tokens over 19,680 output tokens
+in leg A, and 15,253 over 19,680 in leg B. That is 0.774 and 0.775 accepted
+draft tokens per output token.
+
+Ours reports nothing. `spec_drafts_proposed()` and `spec_drafts_accepted()` are
+`GpuRunner` accessors that no HTTP route reads, so an acceptance rate is
+obtainable from the bench binary and from nowhere else. That is
+[#2770](https://github.com/mudler/vllm.cpp/issues/2770). The client records ours
+as absent rather than as zero, because zero would read as a draft that never
+fired. Until that lands, the mechanism half of this comparison has one side
+only, and no acceptance ratio can be stated.
+
+Their counter does carry one cross-check on their side. If a pass emits one
+target token plus its accepted drafts, output tokens divided by passes is
+19,680 / (19,680 - 15,238) = 4.430 in leg A and 19,680 / (19,680 - 15,253) =
+4.445 in leg B. Their card claims 4.43 tokens per step. Their engine is running
+at the acceptance they publish, so these legs are not a comparison against a
+misconfigured competitor. The conversion assumes that accounting; the counters
+are what the file holds.
+
+### Time to first token goes to them
+
+| arm | mean TTFT ms, leg A / leg B | median TTFT ms, leg A / leg B |
+|---|---|---|
+| theirs | 1021.7 / 886.6 | 765.8 / 759.5 |
+| ours | 1062.8 / 1055.1 | 863.2 / 863.4 |
+
+Both of their legs beat both of ours on both statistics, so the direction holds.
+The size does not: their mean TTFT moves 15.2% between their own two legs,
+against 0.73% between ours. Read 1.11x as a direction, not as a factor.
+
+### What no gate covers here
+
+No correctness gate covers these four legs. Both engines sampled at T = 0.6 with
+`top_p` 0.95 and `top_k` 20, so the two token streams are not expected to match
+and a token-exact comparison cannot run on them. Nothing scored the code either
+engine wrote, on either side.
+
+What the evidence does show is that both engines stayed on the task. The first
+completion of each leg opens on the same reasoning about the same HumanEval
+problem, and both are fluent English about `has_close_elements`. Their streamed
+text drops some spaces at chunk boundaries, which is their server wrapper's
+`HOLD_BACK` buffering and not a token count, so no text-quality comparison is
+available from these files either.
+
+The correctness result on this page is the greedy token-identical check
+[further down](#correctness-which-is-the-result-that-gates-the-other-one). It
+compares our two arms against each other, on a different prompt and a different
+harness. It does not cover this pair.
+
+### What is not matched
+
+Each engine ran at its own published configuration. That is the shape this
+comparison was built for, and it is not one configuration.
+
+- **Context and KV cache.** Theirs is `-cs 262144` with an NVFP4 KV cache. Ours
+  auto-fit `max_model_len` from 262144 down to 8192 to fit its KV cache, and ran
+  its default KV dtype. This engine refuses an NVFP4 KV cache by name
+  ([#2620](https://github.com/mudler/vllm.cpp/issues/2620)), so their cache
+  configuration is not one our arm can take.
+- **The paged draft route.** `VT_DFLASH_PAGED=0` on our side, so our arm is not
+  the shipped default configuration. The tree this job built, `5649e07d`,
+  predates the fix for that fault: `42b309508` landed it later and closed
+  [#2274](https://github.com/mudler/vllm.cpp/issues/2274). A rerun on a tree that
+  contains the fix is owed and would remove this difference.
+- **Their engine revision is our choice.** Their card pins none. This harness
+  pins `63b32f001d7b2cfed3b3e3aaf25f534ba53cc7ed`, and their published 47.5 was
+  not necessarily measured there.
+
+Concurrency is 1 on both sides and is not an unmatched axis: the client sends
+one request at a time, and their server serializes generation behind one lock by
+construction.
+
+### Evidence
+
+The harness, the job as submitted, the patch, the four leg summaries and the
+job's `results.txt` are in
+[`docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/`](../bench-evidence/qwen38-27b-exl3-headtohead-20260903/README.md).
+The per-request JSON records and the server logs stay on the share at
+`/mnt/nas_share/rc/exl3-headtohead/out/`, because they are 1.6 MB of per-token
+timings and server output.
+
+## The earlier `vllm-bench` measurements
+
+The five sections that follow predate the head-to-head. They ran our engine
+against itself through `vllm-bench`, on a raw completion prompt with
+`ignore_eos`, and they compare against numbers other people published rather
+than against a running engine. They are kept because three results live only
+here: our acceptance rate, the draft-budget sweep, and the byte-normalized
+reading of the target-only figure.
+
+### Method
 
 Both arms ran interleaved in one process, on one boot, from one binary: target,
 draft, target, draft. A sequential A/B would measure drift along with the arm,
@@ -53,7 +232,7 @@ VT_DFLASH_PAGED=0 vllm-cli --model <target> --device cuda \
   [--speculative-config '{"method":"dflash","model":"<draft>","num_speculative_tokens":7}']
 ```
 
-## First measurement: a short greedy prompt
+### First measurement: a short greedy prompt
 
 | arm | warm tok/s, runs 2-5 of two interleaved legs | spread |
 |---|---|---|
@@ -64,7 +243,7 @@ The draft arm runs 2.91 times the target-only rate. The two target legs sit
 either side of a draft leg and agree to 0.75%, so drift does not explain the
 gap.
 
-## The MATCHED workload: real HumanEval at T = 0.6
+### The matched workload: real HumanEval at T = 0.6
 
 The section above is a favourable prompt and says so. This section removes two of the
 three differences from the upstream README's 47.5 tok/s: the real 164-problem
@@ -89,14 +268,20 @@ below theirs and the throughput is higher anyway.
 Every request produced exactly 128 tokens (`duration_s` 1355.86 x `output_throughput`
 15.48 = 20,992 = 164 x 128), so no leg was skewed by early EOS.
 
-**The counting convention is the open question, and it is theirs, not ours.** Their
-README says "decode tok/s" and defines it nowhere. The same run of ours reads **59.5**
-counted decode-only and **45.1** counted over whole-run wall time. Against the first
-convention we are 1.25x; against the second, 0.95x. Their page pins no engine revision
-either, so this cannot be settled from published material. Both numbers are given here
-for that reason.
+**The counting convention used to be the open question here, and the head-to-head
+answered it by measurement.** This paragraph read: their README says "decode tok/s" and
+defines it nowhere, the same run of ours reads 59.5 counted decode-only and 45.1 counted
+over whole-run wall time, so against one convention we are 1.25x and against the other
+0.95x. That pair of ratios is superseded. It was never settleable from published
+material, because their card pins no engine revision either. One client counting both
+engines the same way settles it instead, and both conventions then put us ahead: 1.197x
+decode only and 1.123x whole run
+([the head-to-head](#the-head-to-head-their-engine-and-ours-behind-one-client)).
 
-## 16.7 is a QUANTIZATION result, not an engine result
+The two numbers in this section, 59.5 and 45.1, remain what this harness measured on
+this workload. Do not put either of them beside a number from their engine.
+
+### 16.7 is a quantization result, not an engine result
 
 This page's 16.74 tok/s invites one comparison in particular, and that comparison
 does not hold. `pangoleen/qwen3.8-27b-dgx-spark-dflash2` publishes a **12.71
@@ -128,7 +313,7 @@ target forward is close to the bus on both engines, so it is not where either
 engine has room left. What is contested is the speculation multiplier, and the
 section below is where this page measures ours.
 
-## The draft budget is a real lever, and our knee is not theirs
+### The draft budget is a real lever, and our knee is not theirs
 
 `pangoleen/qwen3.8-27b-dgx-spark-dflash2` serves the SAME DFlash2 drafter architecture
 -- its `dflash_config` is byte-identical to ours, `block_size` 8, taps
@@ -178,15 +363,18 @@ is`. A wrong codebook on this format yields a correctly distributed and entirely
 wrong weight, so coherent, factually correct continuation is meaningful evidence
 and not merely a smoke test.
 
-## Reproduce this run
+## Reproduce these runs
 
 Everything here runs on one GB10 board with CUDA 13.0 and about 20 GB of disk
 free. Set aside ninety minutes or so; the CUDA build eats most of it, and each
 measurement leg is another twenty.
 
+Steps 1 to 6 reproduce the earlier `vllm-bench` measurements. Step 7 reproduces
+the head-to-head against their engine, which needs their engine built on the
+same box as well as ours.
+
 If you are going to quote a number from this, read the
-[limitations](#limitations) as well. Three axes of the upstream comparison are
-not matched here, and one of them is a bug we have open.
+[limitations](#limitations) as well.
 
 ### 1. Get the weights
 
@@ -345,10 +533,87 @@ The [draft budget section](#the-draft-budget-is-a-real-lever-and-our-knee-is-not
 above has what each value produced on this box, including where it stops
 helping.
 
+### 7. Reproduce the head-to-head
+
+Steps 1 to 6 measure our engine against itself. This step measures it against
+theirs, which needs their engine on the same box and one client in front of
+both.
+
+The job that produced the four legs is committed as
+[`job-as-run.sh`](../bench-evidence/qwen38-27b-exl3-headtohead-20260903/job-as-run.sh),
+exactly as it was submitted, beside the
+[client](../bench-evidence/qwen38-27b-exl3-headtohead-20260903/client.py) and
+the [one patch](../bench-evidence/qwen38-27b-exl3-headtohead-20260903/serve_openai-usage.patch)
+it applies to their server wrapper. Run it and it stages the weights, builds
+both engines, and runs the four legs in order. The four legs themselves took
+2,308 s of wall time in total, about 39 minutes. Everything before them is
+staging and building, and the evidence does not time those phases. Budget for
+them: the container has no CUDA toolkit, so the job installs one, and it then
+builds our engine and their 129 translation units.
+
+The job is resumable. Each phase drops a marker under `$STATE` and each leg
+writes its JSON as it finishes, so a resubmission after a reboot picks up rather
+than starting again. The job's own header says why: this box has crashed roughly
+hourly under load during this campaign.
+
+Their side, their recipe verbatim from the card, with the paths and the port
+changed:
+
+```sh
+python tools/serve_openai.py --port 8802 --host 127.0.0.1 \
+    -m ./target-3.5bpw -dm ./draft-dflash2-5.0bpw -cq nvfp4 -cs 262144
+```
+
+Ours, on the other port:
+
+```sh
+VT_DFLASH_PAGED=0 build/examples/vllm-server --model ./target-3.5bpw \
+    --device cuda --port 8801 --host 127.0.0.1 \
+    --max-num-seqs 1 --served-model-name ours --enable-thinking \
+    --speculative-config '{"method": "dflash",
+                           "model": "./draft-dflash2-5.0bpw",
+                           "num_speculative_tokens": 7}'
+```
+
+The client drives whichever port you give it and does not know which engine is
+behind it:
+
+```sh
+python3 client.py --url http://127.0.0.1:8801 --model ours \
+    --dataset humaneval-sharegpt.json --num-prompts 164 --max-tokens 128 \
+    --temperature 0.6 --top-p 0.95 --top-k 20 --seed 0 \
+    --label OURS-A --out OURS-A.json
+```
+
+Run the legs in the order `THEIRS-A`, `OURS-A`, `THEIRS-B`, `OURS-B`, and start
+and stop each server around its own leg. Two legs per arm, interleaved, is what
+separates the arm from the hour.
+
+Before you build their engine, apply
+`serve_openai-usage.patch`. Without it their streaming path computes the token
+counts and the acceptance counter and then drops them, so a streaming client has
+nothing to divide by. The patch touches `tools/serve_openai.py` and no file
+under `exllamav3/`.
+
+Two client details decide whether the numbers mean anything, and both were bugs
+before they were features. Count `content` and `reasoning_content` alike, because
+their server routes the model's `<think>` block into the second field and a
+client that reads only the first measures their time to first token to the end of
+the reasoning block. And take token counts from each engine's `usage`, never from
+the count of streamed chunks: their wrapper buffers 16 characters, so one chunk
+is not one token.
+
+Expect their side to return 120 completion tokens for a request of 128. That is
+[their engine's own stop rule](#their-engine-returns-120-tokens-where-ours-returns-128)
+and not a fault in your run.
+
 ## Limitations
 
-Two of these apply to every number on this page. The first applies only to the
-greedy measurement, and the matched HumanEval run above exists to remove it.
+The head-to-head's unmatched axes are in
+[what is not matched](#what-is-not-matched), beside the legs they apply to. The
+three below are about the earlier `vllm-bench` measurements. Two of them apply
+to every number those runs produced. The first applies only to the greedy
+measurement, and the matched HumanEval run exists to remove it.
 
 1. **Workload — closed for the matched run, open for the first one.** The
    published figure is HumanEval-style at **T = 0.6 with acceptance 4.43**. The
@@ -364,11 +629,13 @@ greedy measurement, and the matched HumanEval run above exists to remove it.
 3. **The paged draft route was disabled.** `VT_DFLASH_PAGED=0` was required:
    with the paged route on, run 1 of 5 completes and the engine dies on run 2
    with `cudaMemcpyAsync: an illegal memory access`, resurfacing at `cudaFree`.
-   That is [#2274](https://github.com/mudler/vllm.cpp/issues/2274), a
+   That is [#2274](https://github.com/mudler/vllm.cpp/issues/2274), then a
    pre-existing fault, here reproduced on a checkpoint it had never been seen on
    — which shows it is not specific to the bf16 drafter it was found with. Both
    arms above ran with it off, so the comparison is internally consistent, but
-   neither is the shipped default configuration.
+   neither is the shipped default configuration. **The fault has since been
+   fixed**, in `42b309508` on 2 September 2026, which closed #2274. No tree that
+   any number on this page was measured on contains that fix.
 
 **One prompt, one length, one device, one boot.** 64 tokens, five runs per leg,
 two legs per arm. No multi-request batching, no long context, no second box.
@@ -376,19 +643,40 @@ two legs per arm. No multi-request batching, no long context, no second box.
 ## Owed
 
 - ~~A HumanEval-style prompt set at T = 0.6 with the acceptance rate reported~~ —
-  **done**, see the matched-workload section above: 59.5 tok/s at acceptance 4.06
+  **done**, see the earlier matched-workload section: 59.5 tok/s at acceptance 4.06
   per step against their 47.5 at 4.43.
+- ~~Which counting convention their 47.5 tok/s uses~~ — **retired rather than
+  answered**. The head-to-head computes both conventions from one client's
+  timings on both engines, so no number on this page now depends on reading their
+  card.
+- **Our acceptance rate on the server path**
+  ([#2770](https://github.com/mudler/vllm.cpp/issues/2770)). Their side of the
+  head-to-head reports 0.774 accepted draft tokens per output token and ours
+  reports nothing, so the mechanism half of that comparison has one side only.
+- **A matched-configuration head-to-head leg.** Each engine ran its own published
+  recipe. A leg at one context length and one KV dtype needs
+  [#2620](https://github.com/mudler/vllm.cpp/issues/2620).
+- **A second boot for the head-to-head.** Its four legs are one lease and one
+  boot. Interleaving controls drift inside that window and says nothing about
+  boot-to-boot movement. Their two legs already differ by 4.46% whole run inside
+  that one boot.
 - A repeated `k = 7` vs `k = 12` comparison on the **full 164-problem set**. The
   budget sweep above ran on a 32-prompt subset that drafts hotter than the full
   set, so its 76.28 is not transferable and must not be scaled onto the 59.5.
-- The remaining unmatched axes against the upstream recipe: context (8192 here
-  against their `-cs 262144`) and KV dtype (bf16 here against their `-cq nvfp4`,
-  which this engine refuses by name — [#2620](https://github.com/mudler/vllm.cpp/issues/2620),
-  whose named owner row did not exist). `vllm-bench` also cannot select a KV
-  dtype at all ([#2619](https://github.com/mudler/vllm.cpp/issues/2619)), so no
-  number on this page states the KV dtype it was measured on.
-- [#2274](https://github.com/mudler/vllm.cpp/issues/2274), so the shipped paged
-  route can be measured rather than routed around.
+- For the earlier `vllm-bench` runs, the unmatched axes against the upstream
+  recipe: context (8192 here against their `-cs 262144`) and KV dtype (bf16 here
+  against their `-cq nvfp4`, which this engine refuses by name —
+  [#2620](https://github.com/mudler/vllm.cpp/issues/2620), whose named owner row
+  did not exist). `vllm-bench` had no way to select a KV dtype when those runs
+  were taken, so no number on this page states the KV dtype it was measured on.
+  It has taken `--kv-cache-dtype` since `89bfd79b0`, which closed
+  [#2619](https://github.com/mudler/vllm.cpp/issues/2619), so a rerun can now
+  state it.
+- A measurement of the shipped paged draft route, on both harnesses. Its fault
+  was fixed in `42b309508`, which closed
+  [#2274](https://github.com/mudler/vllm.cpp/issues/2274), and no number on this
+  page was measured on a tree that contains the fix. Every arm here ran
+  `VT_DFLASH_PAGED=0` instead.
 - [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
   GEMV. When this page was first written it instantiated `(3,1)` only, and this
   checkpoint has no `(3,1)` tensor at all, so the arm was dead on it. `(3,2)`

@@ -1,8 +1,14 @@
 # SPEC-PROMPT-TOKEN-DIVERGENCE — the served prompt-token count, and what it is not
 
-Issue: [#1355](https://github.com/mudler/vllm.cpp/issues/1355)
+Issue: [#2948](https://github.com/mudler/vllm.cpp/issues/2948)
 Row: `SPEC-PROMPT-TOKEN-DIVERGENCE`
 State: `READY` (diagnosis committed; the defect is not yet located)
+
+**The original issue no longer resolves.** This row was filed as
+[#1355](https://github.com/mudler/vllm.cpp/issues/1355), which now returns
+`Could not resolve to an issue`. #2948 refiles it with the description recovered
+from `.agents/completed/issue-index.md:448` and carries the grounding below.
+`.agents/benchmark-record.md:25533,25560` still cite the dead number.
 
 **The ID collides with a prefix.** `SPEC-` is this tree's SPECULATIVE-DECODING
 row prefix (`SPEC-MTP-K-GT-1`, `SPEC-DSPARK-BLOCK-SIZE-GUARD`, `SPEC-DFLASH2`),
@@ -79,7 +85,7 @@ STAGED copy the server read).
    48/48 at 1024. **This was a standalone harness and NOT the production request
    path.** It never ran `from_json(const nlohmann::json&, CompletionRequest&)`,
    which is where the `prompt` string is actually extracted
-   (`protocol.cpp:280-281`), and it never ran `serving_completion.cpp`. That
+   (`protocol.cpp:330`), and it never ran `serving_completion.cpp`. That
    segment is x86-testable and is UNTESTED, and it sits inside the gap this
    elimination would otherwise be read as closing.
 4. **Not a build-flag or memory defect.** `-O0`, `-O3`, `-O3 -funsigned-char`
@@ -108,7 +114,7 @@ STAGED copy the server read).
    tokenizer under every wrong pattern it likewise always predicts 1024, never
    915.
 7. **Not Unicode normalisation.** The checkpoint declares `normalizer: NFC` and
-   `tokenizer.cpp:388-391` records the deviation that we accept it and do not
+   `tokenizer.cpp:510-513` records the deviation that we accept it and do not
    apply it. Every one of the 48 prompts is ALREADY NFC, so the deviation is
    inert here. (It is still owed: a client that sends non-NFC text gets a
    different tokenization from HF. The tokenizer parity goldens feed it no
@@ -182,7 +188,7 @@ not read as narrower than it is:
 - **A UTF-8 decode truncation inside `Encode`**, which loses text rather than
   re-ranking merges.
 - **The `/v1/completions` request-parse segment**, which item 3 did not
-  exercise: `CompletionRequest`'s `from_json` (`protocol.cpp:280-281`) and
+  exercise: `CompletionRequest`'s `from_json` (`protocol.cpp:330`) and
   `serving_completion.cpp`.
 
 ## The one probe left
@@ -232,17 +238,71 @@ question needs the box, and needs no GPU beyond a server that is already up:
    test, and it enters through the HTTP entry point rather than by constructing a
    tokenizer by hand.
 
+## The aarch64 hypothesis does not reproduce (2026-09-05, `c796fea41`)
+
+`## The one probe left` says the discriminating test is `examples/tokenize` built
+natively on aarch64. **It does not need the box.** CI already installs
+`qemu-user` and runs `qemu-aarch64 -cpu cortex-a53` (`ci.yml:1563-1577`), so the
+same comparison cross-builds and runs on any x86-64 host.
+
+`src/vllm/tokenizer/{tokenizer,bpe,pretokenizer,unicode_data}.cpp` were built for
+x86-64 (`g++ 13.3`) and for aarch64 (`aarch64-linux-gnu-g++ 13.3, -static`)
+against the committed `tests/parity/goldens/tokenizer_qwen36/tokenizer.json`
+(sha256 `87a7830d…72de4`, equal to the value `encodings.json` records for its
+oracle) and run over two corpora. Instrument precondition: the x86-64 build
+reproduces the committed goldens **53/53**, ids for ids.
+
+| corpus | x86-64 vs aarch64 | ours vs HF `tokenizers` 0.22.2 |
+|---|---|---|
+| committed golden corpus, 1,417 tokens | identical | 53/53 |
+| combining-mark-dense, 74-150 marks/line, 2,245 marks, 4,240 tokens | identical | 15/20 mismatch |
+| the same corpus NFC-normalised, 1,999 marks retained | identical | **20/20** |
+
+Identical also under `-cpu cortex-a53`, and under **both** `-fsigned-char` and
+`-funsigned-char` — the `char`-signedness hypothesis the arm CI job's own comment
+names.
+
+**The 15/20 mismatch is the recorded NFC deviation, and the first corpus injected
+it.** The mismatching line set equals the non-NFC line set exactly (15 == 15, set
+equality), and the direction is wrong for this bug: ours came out **longer** than
+HF, where the anomaly is shorter. Item 7 already establishes that the campaign's
+48 prompts were themselves NFC, so this is not the campaign's mechanism.
+
+**Mechanisms 1 and 2 therefore do not reproduce on today's sources.** None of the
+following is closed by that, and the row stays open on each:
+
+- qemu-user is not aarch64 silicon, and the cross-compiler is not the box's.
+- The golden Qwen3.6 `tokenizer.json` is not the campaign's Qwen3.8-27B one.
+- The four tokenizer sources moved **864 lines** since the campaign build
+  `1dac4f9a7`, so a defect present then may have been repaired by unrelated work.
+
+**Mechanism 3 is untested and is now the leading candidate.** The
+`/v1/completions` request-parse segment — `from_json(const nlohmann::json&,
+CompletionRequest&)` (`protocol.cpp:330`) and `serving_completion.cpp` —
+which item 3 did not exercise, and which the arm lane cannot reach because it
+sets `VLLM_CPP_SERVER=OFF`.
+
 ## Owed
 
-- **The aarch64 lane runs no tokenizer gate.** `.github/workflows/ci.yml:1086`
-  builds exactly four targets on `ubuntu-24.04-arm` — `test_cpu_isa_arm`,
-  `test_ops_matmul_elem`, `test_ops_quant_dot`, `test_ops_quant_repack`. The
-  tokenizer parity goldens never execute on ARM, so an ARM-only tokenizer defect
-  is unguarded by construction. The golden corpus itself is not the gap: it
-  carries 28 combining marks and passes on x86.
-- The NFC deviation at `src/vllm/tokenizer/tokenizer.cpp:388-391` is accepted
+- ~~**The aarch64 lane runs no tokenizer gate.**~~ **Landed 2026-08-23**
+  (`af320abb2`, GATE-CI-AARCH64-COVERAGE W1b, [#1385](https://github.com/mudler/vllm.cpp/issues/1385)).
+  `.github/workflows/ci.yml:1533-1538` now builds nine tokenizer targets on
+  `ubuntu-24.04-arm`, `test_tokenizer_parity` among them, and that test compares
+  IDS rather than counts. **It was necessary and not sufficient, and the gap is
+  now measured rather than estimated.** Before this change the committed corpus
+  carried **28** combining marks across its 64 entries, at most **13** in any
+  single entry and no entry longer than 109 characters, against the **74-150 per
+  prompt** that produced the anomaly. Six entries in that regime were added to
+  `tests/parity/goldens/tokenizer_qwen36/corpus.txt`
+  ([#2948](https://github.com/mudler/vllm.cpp/issues/2948)); the corpus now
+  carries **687** marks, and the aarch64 lane executes them.
+- The NFC deviation at `src/vllm/tokenizer/tokenizer.cpp:510-513` is accepted
   rather than applied. Neither the golden corpus nor any other gate feeds it
-  non-NFC text, so the deviation is unexercised rather than passing.
+  non-NFC text, so the deviation is unexercised rather than passing. **This is
+  deliberate in the added entries too**: every one is NFC-stable, so they probe
+  the `\p{M}`-aware split and the merge ranking rather than re-measuring a
+  deviation that is already recorded. Feeding non-NFC text is a separate change,
+  because it would gate a behaviour this tree has chosen not to implement.
 
 ## Consequence for the campaign's numbers
 

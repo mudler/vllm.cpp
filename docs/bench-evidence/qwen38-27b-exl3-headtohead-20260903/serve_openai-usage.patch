@@ -1,0 +1,72 @@
+diff --git a/tools/serve_openai.py b/tools/serve_openai.py
+index 23d22e4..3be093d 100644
+--- a/tools/serve_openai.py
++++ b/tools/serve_openai.py
+@@ -350,7 +350,9 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
+                   "stop_condition": "stop", "banned": "content_filter"}.get(
+                       reason, "stop")
+     reasoning, content = split_reasoning(content)
+-    return text, calls, finish, prompt_toks, out_toks, reasoning, content
++    accepted = int(getattr(job, "accepted_draft_tokens", 0) or 0)
++    return (text, calls, finish, prompt_toks, out_toks, reasoning, content,
++            accepted)
+ 
+ 
+ async def models(request):
+@@ -427,7 +429,8 @@ async def chat_completions(request):
+     import asyncio
+     if not req["stream"]:
+         try:
+-            text, calls, finish, ptoks, otoks, reasoning, content = await asyncio.to_thread(
++            (text, calls, finish, ptoks, otoks, reasoning, content,
++             accepted) = await asyncio.to_thread(
+                 generate_full, generator, tokenizer, req["messages"],
+                 req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
+                 req["seed"], req["tools"], req["tool_choice"], req["stop"])
+@@ -469,13 +472,16 @@ async def chat_completions(request):
+ 
+         def worker():
+             try:
+-                text, calls, finish, ptoks, otoks, reasoning, content = generate_full(
++                (text, calls, finish, ptoks, otoks, reasoning, content,
++                 accepted) = generate_full(
+                     generator, tokenizer, req["messages"], req["max_tokens"],
+                     req["temperature"], req["top_p"], req["top_k"],
+                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
+                     on_text = None if forced_choice else on_text)
+-                loop.call_soon_threadsafe(queue.put_nowait,
+-                                          ("done", (calls, finish, reasoning, content)))
++                loop.call_soon_threadsafe(
++                    queue.put_nowait,
++                    ("done", (calls, finish, reasoning, content,
++                              ptoks, otoks, accepted)))
+             except Exception as e:
+                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+         loop.run_in_executor(None, worker)
+@@ -553,7 +559,8 @@ async def chat_completions(request):
+                 pending += payload
+                 await flush_pending()
+             elif kind == "done":
+-                calls, finish, reasoning, content = payload
++                (calls, finish, reasoning, content,
++                 ptoks, otoks, accepted) = payload
+                 await flush_pending(final = True)
+                 if forced_choice:
+                     # Buffered path (no deltas were streamed): emit the
+@@ -566,6 +573,16 @@ async def chat_completions(request):
+                     for c in calls:
+                         await send_call(c)
+                 await send({}, finish = finish)
++                usage_obj = {
++                    "id": cid, "object": "chat.completion.chunk",
++                    "created": int(time.time()), "model": model_id,
++                    "choices": [],
++                    "usage": {"prompt_tokens": ptoks,
++                              "completion_tokens": otoks,
++                              "total_tokens": ptoks + otoks,
++                              "accepted_draft_tokens": accepted}}
++                await resp.write(
++                    f"data: {json.dumps(usage_obj)}\n\n".encode())
+                 await resp.write(b"data: [DONE]\n\n")
+                 break
+         await resp.write_eof()

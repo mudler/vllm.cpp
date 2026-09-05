@@ -80,11 +80,36 @@ class ParityPinRecordTests(unittest.TestCase):
         self.assertNotEqual(FLASHINFER_VERSION, ROLLBACK_FLASHINFER_VERSION)
         self.assertNotEqual(VLLM_COMMIT, ROLLBACK_COMMIT)
 
-    def test_metadata_and_runtime_strings_differ_on_the_pin(self) -> None:
-        """The reason `metadata == runtime == CONST` had to be replaced, pinned as a fact."""
+    def test_metadata_and_runtime_are_compared_as_two_independent_fields(self) -> None:
+        """The reason `metadata == runtime == CONST` had to be replaced.
 
-        self.assertNotEqual(VLLM_DISTRIBUTION_VERSION, VLLM_ORACLE_VERSION)
-        self.assertTrue(VLLM_DISTRIBUTION_VERSION.startswith(VLLM_ORACLE_VERSION))
+        This case USED to assert the two strings DIFFER, because on the pin as
+        first recorded the distribution string carried a `.precompiled` suffix
+        the runtime string did not. That is no longer true and the change was
+        deliberate: on aarch64 the `.precompiled` build leaves an install with no
+        compiled extensions, so the only build mode whose string matched could
+        not execute a kernel while the only mode that runs was refused (#2896).
+        The record now names the SOURCE build, and the two strings are equal.
+
+        The invariant that actually matters was never the inequality -- it is
+        that the harness compares the two fields SEPARATELY against their own
+        recorded values, so a build whose metadata and runtime disagree is
+        refused whether or not they happen to coincide on today's pin. That is
+        what is pinned here, and it holds in both regimes.
+        """
+
+        # They MAY be equal (source build) or differ by a build-mode suffix
+        # (precompiled). Either is admissible; a distribution string that is not
+        # an extension of the runtime string is not.
+        self.assertTrue(
+            VLLM_DISTRIBUTION_VERSION.startswith(VLLM_ORACLE_VERSION),
+            "the distribution string must extend the runtime string, so a "
+            "commit assertion made against one holds for the other",
+        )
+        # Both are compared, and neither is allowed to go empty -- an empty
+        # string would satisfy `startswith` vacuously.
+        self.assertTrue(VLLM_ORACLE_VERSION)
+        self.assertTrue(VLLM_DISTRIBUTION_VERSION)
 
 
 class ParityPinLoaderTests(unittest.TestCase):

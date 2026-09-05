@@ -1,0 +1,9 @@
+  [OURS-B] 20/164 t=86s
+  [OURS-B] 40/164 t=149s
+  [OURS-B] 60/164 t=213s
+  [OURS-B] 80/164 t=281s
+  [OURS-B] 100/164 t=348s
+  [OURS-B] 120/164 t=419s
+  [OURS-B] 140/164 t=482s
+  [OURS-B] 160/164 t=549s
+CLIENT_RESULT {"leg": "OURS-B", "requests": 164, "ok": 164, "wall_s": 561.8389568830025, "completion_tokens_counted_by": "usage", "prompt_tokens_total": 31488, "completion_tokens_total": 20992, "mean_completion_tokens": 128.0, "mean_ttft_ms": 1055.0846891462531, "median_ttft_ms": 863.4001019963762, "mean_tpot_ms": 18.666411699059996, "median_tpot_ms": 18.806852468507827, "decode_only_tok_s": 53.572160312437454, "decode_only_tok_s_pooled": 53.99398834639366, "whole_run_tok_s": 37.36301967464207, "accepted_draft_tokens_total": null, "median_itl_ms": 82.24672899814323, "failures": []}

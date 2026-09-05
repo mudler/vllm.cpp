@@ -77,9 +77,58 @@ and deliberately deferred: they sit under paths this row cannot exercise on CPU,
 and moving them without a device gate would be the same unverified change this
 campaign has been closing, not opening.
 
-**W3 — the kill-switch asymmetry.** A decision, not a refactor: either every
-model gets one under a single spelling, or the two that have one lose it. Owed,
-not chosen here, because it changes a user-visible debugging surface.
+**W3 — the kill-switch asymmetry.** This said it was "a decision, not a
+refactor ... because it changes a user-visible debugging surface", and left the
+choice open between giving every model a switch and taking it from the two that
+have one.
+
+**That was wrong, and the rule it missed is the one at the top of `AGENTS.md`.**
+vLLM defines this behaviour, so it is mirrored rather than decided, and asking
+how a mirrored feature must behave is the thing this project does not do. At the
+pin `5559679229`, `vllm/config/model.py:248`:
+
+```python
+disable_sliding_window: bool = False
+"""Whether to disable sliding window. If True, we will disable the sliding
+window functionality of the model, capping to sliding window size. If the
+model does not support sliding window, this argument is ignored."""
+```
+
+One model-agnostic field on `ModelConfig`. Not a per-model switch, and not an
+environment variable. Its docstring also answers the asymmetry directly: a model
+with no window ignores the flag, so covering all five costs nothing at the sites
+that have nothing to disable.
+
+**Our two env vars are not a different spelling of it, they are a narrower
+behaviour**, and that is the part worth stating precisely because it is what a
+"just rename it" reading would ship:
+
+1. `model.py:766-769` — the flag nulls `hf_text_config.sliding_window`, which
+   disables the window for every layer of every model at once.
+2. `model.py:2216-2233` — `_get_and_verify_max_len` additionally caps
+   `max_model_len` to the sliding-window size when the flag is set.
+   `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING` do not do this.
+3. `model.py:693-695` — the flag is set AUTOMATICALLY when a checkpoint declares
+   `sliding_window == 0`, because vLLM spells "disabled" as `None` and some
+   checkpoints spell it `0`. We have no analogue.
+
+So W3 is: one `disable_sliding_window` config field carrying the upstream name
+and all three semantics, consumed through `ResolveAttentionWindow`'s existing
+`disable_model_sliding_window` parameter — which has never had a caller passing
+anything but the default — and the two env vars deleted, with
+`docs/ENVIRONMENT.md` losing them in the same change.
+
+**The coverage gap is separate and survives the correction.** Nothing tests the
+switch in either spelling; W1's mutation proved that by rewiring gemma2's site to
+ignore `SlidingWindowEnabled()` and watching `test_gemma2_forward` stay green at
+1003 assertions under `VT_GEMMA2_SLIDING=0`. Replacing the mechanism does not by
+itself add a test, so W3's red-first test is: set the flag, assert
+`ResolveAttentionWindow` returns no window for a model whose config declares one,
+and mutate the flag read to confirm the test detects it.
+
+**One part IS still a call, and it is small:** whether to keep the two env vars
+as deprecated aliases for one release. Upstream has no env var to mirror, so
+nothing decides it either way.
 
 ## Gates
 
@@ -132,3 +181,8 @@ build failure reads as a passing test, and both would have.
 
 W1 done. W2 (the two shared-path sites) and W3 (the kill-switch asymmetry, now
 also a coverage gap) owed.
+
+W3 is no longer blocked on a decision. `## Work breakdown` above records why: the
+flag is `disable_sliding_window` on vLLM's `ModelConfig`, so the shape is
+mirrored rather than chosen, and what was filed as a naming question turned out
+to be three missing behaviours. It needs no GPU and no checkpoint.

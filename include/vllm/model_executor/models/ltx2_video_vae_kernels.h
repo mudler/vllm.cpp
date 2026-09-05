@@ -46,8 +46,13 @@
 // (src/vt/cpu/cpu_ltx2_vae.cpp) serves f32 AND bf16 behind it (A24 wave 3, row
 // LTX25-A24-VIDEO-VAE-BF16, issue #2786). Upstream resolves ONE pipeline dtype
 // and it is bfloat16 (distilled.py:109, handed to `VideoDecoder` at :148), so
-// bf16 is the arm the render loads and f32 is the parity reference every
-// committed golden is measured against. #1008's finding still stands and is what
+// bf16 is the arm a CPU render loads. f32 is BOTH the parity reference every
+// committed golden is measured against AND the arm a DEVICE render loads
+// (#2853): the refusal below is reachable from the render, so
+// `Ltx2VideoEngine::Load` resolves the bag's width from the arm rather than
+// asking for bf16 unconditionally. Upstream decodes this VAE at f32 too, on its
+// HDR arm (`vae_dtype_for_hdr`, ltx-pipelines .../media_io/color_config.py:64-66).
+// #1008's finding still stands and is what
 // the f32 arm keeps: the decode used to accumulate in f64 where torch computes
 // in f32, and narrowing that is why these kernels have the accumulator widths
 // they do.

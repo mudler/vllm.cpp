@@ -21,16 +21,27 @@ grep -c 'RequireF32(' src/vt/cpu/cpu_ltx2_vae.cpp                              #
 grep -c 'RequireF32(' src/vt/cuda/cuda_ltx2_vae.cu                             # 11
 grep -c 'VaeKernels(' src/vllm/model_executor/models/ltx2_video_vae.cpp        # 14
 grep -c 'DType::kF32'  src/vllm/model_executor/models/ltx2_video_vae.cpp       # 22
+# THE LAST ONE COUNTS CALL SITES AND SAYS NOTHING ABOUT THEIR ARGUMENTS. It was
+# read as "the render passes no queue" and it does not mean that (#2853, 5.6.1).
 grep -c 'Ltx2VideoDecodeStreaming(' src/vllm/multimodal/ltx2_video.cpp         # 1
 ```
 
 **(a) The device kernels ARE the decoder's arithmetic on the shipping path.**
 Every stage between the convolutions dispatches through `vt::OpId::kLtx2Vae`, and
 both arms refuse anything but f32 by name on eleven entry points each.
-`ltx2_video_vae.cpp:459` states the rule that makes the CPU arm the shipping one:
-"`queue == nullptr` means the CPU queue, NOT 'the old host path'. There is one
-code path and the device is a property of the queue." The single production call
-passes no queue, so the CPU arm's eleven refusals sit on the production path.
+`ltx2_video_vae.cpp:459` states the rule that decides which arm runs: "`queue ==
+nullptr` means the CPU queue, NOT 'the old host path'. There is one code path and
+the device is a property of the queue."
+
+**THIS PARAGRAPH ALSO CONCLUDED THAT THE SINGLE PRODUCTION CALL PASSES NO QUEUE,
+SO ONLY THE CPU ARM'S ELEVEN REFUSALS SIT ON THE PRODUCTION PATH. THAT WAS FALSE
+([#2853](https://github.com/mudler/vllm.cpp/issues/2853)), and the last line of
+the block above is how.** `grep -c 'Ltx2VideoDecodeStreaming('` returns 1, which
+is the number of call sites; the argument list it could not see ends with
+`im.on_device ? &*im.queue : nullptr`. BOTH arms' refusals are on the production
+path, and §5.6.1 is what repairs the load that walked into the CUDA one. A count
+of call sites is not a reachability measurement, and this row paid for the same
+error twice: here and in §3.
 
 **This is cheap, which is why it is absorbed rather than deferred.** Every entry
 in `Ltx2VaeDeviceKernels` already takes a `vt::DType dtype` and already refuses
@@ -130,6 +141,22 @@ ones are the two **tiling-mask** lines and one **loader-time** gate fold in
 `video_vae.py`'s ENCODER tiling. So the audio VAE's argued f32
 (`vocoder.py:575-580`) does not extend here.
 
+**THAT GREP WAS ALSO SCOPED ONE PACKAGE TOO NARROW, AND IT CUT IN THIS ROW'S
+FAVOUR ([#2853](https://github.com/mudler/vllm.cpp/issues/2853)).** It searched
+`packages/ltx-core/src/ltx_core/model/video_vae/`, and upstream's f32 decode pin
+is not in that package. `vae_dtype_for_hdr` lives in
+`packages/ltx-pipelines/src/ltx_pipelines/utils/media_io/color_config.py:64-66`
+and returns `torch.float32` whenever an HDR colour space is resolved, taking
+`torch.bfloat16` as the default otherwise; thirteen files under `ltx-pipelines`
+import it, eleven of them pipelines, and `ti2vid_one_stage.py:243` -- the recipe
+this row gates against -- hands the result to the decoder as `dtype=vae_dtype`
+(resolved at `:264`). Upstream therefore DOES decode this VAE at f32 on a
+shipped path. It is the HDR arm, not the SDR default, which is a real and
+narrower statement than "there is no f32 pin on the conv decoder's forward
+path". That conclusion was reached by a grep that could not see the pin -- the
+same class of error as §3's and §0's call-site count, one package over instead
+of one argument over. §5.6.1 takes the corrected reading.
+
 ---
 
 ## 3. The local side, at `77704c8d0`
@@ -141,13 +168,22 @@ generator's `fill_from_stream` casts every upstream parameter to f32, so the
 oracle itself runs f32 and a dtype comparison against it is vacuous by
 construction.
 
-**Exactly ONE production route reaches the decoder, it goes through the tiled
-path, and it passes NO queue.** `Ltx2VideoEngine`'s render calls
-`Ltx2VideoDecodeStreaming` once, inside the `decode.video.chunk` phase scope, with
-no `queue` argument. So the conv video VAE decode runs on the CPU queue on every
-build of this project, and the CPU kernel arm is the only arm production reaches.
-`Ltx2VideoDecode` and `Ltx2ConvVideoDecode` have no caller outside the header,
-this file's own definitions and `ltx2_video_vae_tiled.cpp:123`.
+**Exactly ONE production route reaches the decoder and it goes through the tiled
+path.** `Ltx2VideoEngine`'s render calls `Ltx2VideoDecodeStreaming` once, inside
+the `decode.video.chunk` phase scope. `Ltx2VideoDecode` and `Ltx2ConvVideoDecode`
+have no caller outside the header, this file's own definitions and
+`ltx2_video_vae_tiled.cpp:123`.
+
+**THIS PARAGRAPH ALSO SAID THAT CALL PASSES NO QUEUE, AND THAT WAS FALSE
+([#2853](https://github.com/mudler/vllm.cpp/issues/2853)).** Its last argument is
+`im.on_device ? &*im.queue : nullptr`, so a device render hands the decode an
+accelerator queue and only a CPU render passes null. The error was a counting
+one: `grep -c 'Ltx2VideoDecodeStreaming('` returns 1, which is the number of call
+sites and says nothing about their arguments. §5.6's refusal then rested on this
+sentence, this row's load asked for bf16 on both arms, and every device render
+threw at `decode.video` until §5.6.1 repaired it. Read this as the measurement
+that has to be redone whenever a route claim is used to argue that a refusal is
+unreachable: count the call sites, then read each one's arguments.
 
 **The storage is float-typed throughout.** `VaeStore::Alloc` allocates `n` floats,
 `ptr()` returns `float*`, `VaeWeightCache::Get` returns `const float*`, and
@@ -553,8 +589,103 @@ The `kLtx2Vae` CUDA arm keeps its refusal, with the message updated to name
 the route predicate are the same predicate**, which is the trap this project has
 already paid for: the arm is chosen by asking the same question the kernel
 refuses on, so a device that cannot serve bf16 is never handed a bf16 volume.
-Production is unaffected — §3 measured that the render decodes on the CPU queue on
-every build — and a bf16 CUDA decode is recorded owed with the lease it needs.
+A bf16 CUDA decode is recorded owed with the lease it needs.
+
+This section also said production was unaffected, on §3's measurement. §3 was
+wrong and §5.6.1 records what that cost.
+
+### 5.6.1 The LOAD now asks for bf16 only where a convolution serves it (#2853)
+
+The refusal above is correct and it stays. What was wrong is that the load walked
+into it: §5 asked `Ltx2LoadVaeWeights` for `kBF16` on both arms, and the render
+hands the decode `im.on_device ? &*im.queue : nullptr` (§3, repaired). So every
+device render threw at `decode.video`, and the pre-existing #1426 fake-accelerator
+case `test_ltx2_video_device_forward` — which asserts as preconditions that the
+platform is `kXPU` and that a backend is registered — died on the throw with
+`assertions: 10 | 10 passed | 0 failed`, every assertion it reached still passing.
+
+`Ltx2VideoEngine::Load` now resolves the decoder bag's width from the arm:
+`im.on_device ? kF32 : kBF16`. That is the refusal's own second route, "load the
+VAE weights at f32", taken on the one arm where the first route is not available.
+The CPU arm keeps upstream's bfloat16 and every width gate in §8 sits there
+unchanged. The encoder is untouched and stays unconditional bf16, because
+`Ltx2ConvVideoEncode` takes no queue at either call site and runs on the host.
+
+Three mutations hold the pair, each applied to a scratch copy and restored:
+
+| mutation | expected | measured |
+|---|---|---|
+| drop `p` from the DEVICE arm of the DiT ternary (#1426's D10) | RED | RED, `test_ltx2_video_device_forward` 30/32, on the perturbed and modality assertions, uncond control green |
+| `kBF16` on both arms (the pre-repair shape) | RED | RED, the refusal throws, 10 assertions run and all 10 pass |
+| `kF32` on both arms | RED | RED, `test_ltx2_video` 114/115, on "the VAE DECODE runs at upstream's dtype" |
+
+**The device arm's f32 is UPSTREAM'S OWN HDR DECODE WIDTH, not merely a refused
+one.** The first draft of this section said "a REFUSED width, not a chosen one",
+which under-argues the route. Read at `fd4ded7f` with §2's three identity
+assertions rerun:
+
+| what | anchor | value |
+|---|---|---|
+| `VideoDecoder.__call__` takes a PER-CALL dtype override | `ltx-pipelines/.../utils/blocks.py:1124-1139` | `dtype: torch.dtype \| None = None`, documented "float32 for HDR raw-in/raw-out"; `build_dtype = self._dtype if dtype is None else dtype` drives BOTH `latent.to(dtype=build_dtype)` and `self._decoder_builder.build(device=..., dtype=build_dtype)` |
+| f32 is what HDR resolves to | `ltx-pipelines/.../media_io/color_config.py:64-66` | `def vae_dtype_for_hdr(hdr, default): return torch.float32 if hdr is not None else default` |
+| the recipe under test passes it | `ti2vid_one_stage.py:243`, resolved at `:264` | `self.video_decoder(..., dtype=vae_dtype)`; `vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)` |
+| the SDR constructor default stays bf16 | `distilled.py:109`, `:146-153` | `self.dtype = torch.bfloat16`, handed to `VideoDecoder` at `:148` |
+
+Eleven pipelines under `ltx-pipelines` resolve their VAE dtype through
+`vae_dtype_for_hdr`, so an f32 conv video decode is a shipped upstream arm and not
+a width this tree invented to get past its own refusal. What this tree DOES
+diverge from is the **SDR default**: upstream picks f32 for a colour space and
+this tree picks it for a queue. That divergence is real, it is what #1007 closes,
+and §2 records that the grep which concluded "no f32 pin" never looked in the
+package this pin lives in.
+
+**THE DEVICE ARM CARRIES 2x THE DECODER BYTES, AND NO FIGURE FOR IT APPEARED
+ANYWHERE IN A ROW WHOSE SUBJECT IS MEMORY FORMAT.** Measured by applying
+`Ltx2VideoVaeDecoderKeyRules()`'s four prefixes to the safetensors header of the
+pinned `vae/ltx-2.5-video-vae-conv-bf16.safetensors` (1,452,269,922 bytes,
+`Lightricks/LTX-2.5` @ `8a4ff96f5`, `docs/USAGE.md`): 86 of its 170 tensors enter
+the decoder bag, 407,169,328 parameters, and every one of them is stored `BF16`.
+`Ltx2VaeWeights::bf16` is a real `std::vector<uint16_t>` arm, so the CPU arm holds
+**814,338,656 bytes** -- the checkpoint's own bytes, word for word -- and the
+device arm holds **1,628,677,312 bytes**, exactly 2x, or **+776.6 MiB** resident
+on the host and again in whatever is staged to the device. That is the widening
+#2786 removed, put back on the one arm that cannot decline it, and it is the cost
+this repair buys the render for.
+
+**THE TWO ARMS ALSO DIVERGE NUMERICALLY IN NORMALIZATION, NOT ONLY IN THE
+DECODE'S WIDTH.** `un_normalize` is the decoder's very first arithmetic and its
+statistics narrow to the activation dtype upstream (`ops.py:76-79`, §4.7). This
+tree implements that through the arm's `Round`
+(`ltx2_video_vae.cpp:1574-1587`, the lambda at `:1507-1509`), which is
+`BF16ToF32(F32ToBF16(v))` on `kBF16` and the IDENTITY on `kF32`. §4.7 measured the
+f32-statistics hypothesis at **109 of 288 words wrong at C=16 and 1294 of 4096 at
+C=128** against upstream's own bf16 module, and no token gate can see any of it.
+The device arm now takes that path. It is the right answer for upstream's HDR arm
+and the wrong one for its SDR default, which is a second reason #1007 is owed
+rather than optional.
+
+`VaeStatsAsF32` (`ltx2_video.cpp:534-540`) widens the bag's per-channel statistics
+for the still-f32 latent upsampler, and it follows the bag the same way. On THIS
+checkpoint it returns identical values on both arms, because all 86 decoder
+tensors are `BF16` and both arms widen the same words exactly; the divergence
+there is latent rather than live, and it becomes live on an F32-storage video VAE
+checkpoint, where the CPU arm narrows through `F32ToBF16` and the device arm does
+not. Recorded so the next reader does not rederive which of the two normalization
+divergences is which.
+
+**WHAT THE PAIR OF CASES PROVES, AND WHAT NEITHER HALF PROVES ALONE.** The device
+case passes under `kF32` on BOTH arms of the conditional: `vae_decode_not_bf16 >
+0` is true whenever the decode ran at f32, however that width was asked for. Only
+`test_ltx2_video`'s `vae_decode_not_bf16 == 0` on the CPU arm makes the resolution
+ARM-CONDITIONAL, and the "kF32 on both arms" mutation above is what reds it. The
+guarantee is the pair; either case alone lets the other arm move unnoticed.
+`tests/vllm/multimodal/test_ltx2_video_device_forward.cpp:382-415` says this in
+the code, and it is written here so the spec says it too.
+
+When #1007 lands `cuda_conv3d`'s bf16 storage, the conditional is the one line the
+device bf16 arm deletes, the +776.6 MiB goes with it, and the device case's
+`vae_decode_not_bf16 > 0` is the assertion that reds and asks to be flipped to
+`== 0`.
 
 ---
 
@@ -685,9 +816,14 @@ encoder's own owed row instead.
   actually runs it is not gated. That distance is reported per arm rather than
   hidden.
 * **bf16 is lossy and this row makes the decode less precise than it is today.**
-  That is the point: upstream's answer is the bf16 one, and
-  `ltx2_video_vae.cpp:75-78` already says the f32 file is a correctness reference
-  and not the shipping path.
+  That is the point: upstream's answer on its SDR arm is the bf16 one. **This
+  bullet used to close "and `ltx2_video_vae.cpp:75-78` already says the f32 file
+  is a correctness reference and not the shipping path", and BOTH halves of that
+  were wrong (#2853).** f32 is a shipping width, on the device arm §5.6.1 adds,
+  and it is upstream's own HDR width; the anchor had drifted onto the
+  golden-generator paragraph as well. The file now says so at
+  `ltx2_video_vae.cpp:25-42` and `:56-64`, and the precision this bullet gives up
+  is given up on the CPU arm only.
 * **The CUDA arm is not measured, and now not written either (§5.6).** The refusal
   and the route predicate are the same predicate, so nothing on any path reaches
   a bf16 CUDA VAE kernel. A bf16 CUDA decode needs `cuda_conv3d`'s bf16 storage
@@ -712,8 +848,12 @@ git -C ~/_git/LTX-2 remote get-url origin      # https://github.com/Lightricks/L
 git -C ~/_git/LTX-2 rev-parse HEAD             # fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
 git -C ~/_git/LTX-2 status --porcelain         # empty
 
-# G1 — the ONE production route, counted by string. Must stay 1; a second call
-#      site means §3's reachability argument no longer holds.
+# G1 — the ONE production route. THE COUNT IS NOT THE GATE. A count of call sites
+#      says nothing about their arguments, and that is exactly how §0 and §3 came
+#      to claim the render passes no queue (#2853). Read the call's LAST ARGUMENT
+#      too: if it is not `im.on_device ? &*im.queue : nullptr`, §5.6.1's arm
+#      resolution no longer describes this tree. A second call site breaks the
+#      route argument as well.
 grep -c 'Ltx2VideoDecodeStreaming(' src/vllm/multimodal/ltx2_video.cpp                              # was 1
 grep -c 'Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules()' src/vllm/multimodal/ltx2_video.cpp    # was 1
 
@@ -785,19 +925,14 @@ are both about records a number agreed with and a tree did not.
 
 ## Owed
 
-* **[#2853](https://github.com/mudler/vllm.cpp/issues/2853) — `test_ltx2_video_device_forward`
-  is RED**, and this row's refusal is what it walks into. §5.6's device-bf16
-  refusal (`ltx2_video_vae.cpp`, "a bf16 decode was requested on device ... only
-  the CPU arm serves it") throws inside the pre-existing #1426 fake-accelerator
-  case, which asserts as PRECONDITIONS that the platform is `kXPU` and that a
-  backend is registered for it — so it drives exactly the path the refusal now
-  closes. Found and filed by wave GDNCPUPORT
-  ([#2845](https://github.com/mudler/vllm.cpp/issues/2845)), which touches no
-  LTX2 file and reproduces it identically under `VT_GDN_CHUNKED=0` and `=1`;
-  the refusal string is absent at that branch's pre-merge commit and present at
-  `origin/main`. It is listed HERE rather than fixed there because the choice —
-  load that case's VAE weights at f32, or land the device bf16 arm this section
-  already owes — is this row's, not a GDN kernel row's.
+* ~~**[#2853](https://github.com/mudler/vllm.cpp/issues/2853) —
+  `test_ltx2_video_device_forward` is RED**~~ — **RESOLVED**, see §5.6.1. The row
+  took the first of the two routes this bullet named: the load asks for bf16 on
+  the CPU arm and f32 on the device arm, because `vt::Conv3d` has no bf16 storage
+  arm on an accelerator. The refusal is unchanged. The device bf16 arm stays owed
+  below, and it is what the second route needed. The bullet is kept struck rather
+  than deleted because §3's false route claim is what let the defect land, and a
+  reader of this section needs to see which of the two routes was taken and why.
 * **The scope reconciliation.** §A.7's eight-row table splits the decoder, the
   device kernels and the tiled buffer into three rows this tree cannot separate
   (§0). `.agents/specs/ltx25-completion-scope.md` is operator-owned; this row
@@ -808,10 +943,21 @@ are both about records a number agreed with and a tree did not.
 * **The video VAE ENCODER** (`ltx2_video_vae_encoder.h:52-57`, `ImageConditioner`
   at `distilled.py:120-122`), reached at `ltx2_video.cpp:3108` and `:3756`.
   §6.6 repairs its header's claim that it lands with this row.
-* **The latent upsampler** (`ltx2_upsampler.h:66-70`, `distilled.py:138-141`) and
-  the **duration head** (`ltx2_duration_head.h:55-58`, `distilled.py:163-165`).
+* **The duration head** (`ltx2_duration_head.h:55-58`, `distilled.py:163-165`),
+  which is still f32 on every arm. **The latent upsampler is NO LONGER owed here**:
+  A24 wave 5 ([#2857](https://github.com/mudler/vllm.cpp/issues/2857), row
+  `LTX25-A24-UPSAMPLER-BF16`) landed it on `main` while this row was in review, and
+  `Ltx2VideoEngine::Load` now asks both upsampler checkpoints for `kBF16`
+  (`ltx2_video.cpp:1797`, `:1849`). This bullet said the opposite until the rebase,
+  which is the merge-falsifies-your-own-prose failure and not a stale note: nothing
+  in this row's diff changed, and the sentence became false anyway.
 * **The CUDA arm of `kLtx2Vae` at bf16** (§5.6). It needs `cuda_conv3d`'s bf16
-  storage (#1007) to be reachable at all, and a lease to be measured.
+  storage (#1007) to be reachable at all, and a lease to be measured. It is no
+  longer a paper debt: since §5.6.1 the DEVICE render loads the decoder bag at
+  f32, so this arm costs **+776.6 MiB** resident and staged (1,628,677,312 bytes
+  against the CPU arm's 814,338,656 over 407,169,328 BF16 parameters) and it
+  decodes off upstream's SDR bf16 grid, `un_normalize` included. Both figures go
+  away with the one conditional #1007 deletes.
 * **The attention arm upstream ACTUALLY runs at the shipped widths.** The bf16
   goldens are taken under `SDPBackend.MATH`; on the gated fixture that is
   byte-identical to the module as constructed (0.0), but at the shipped widths
@@ -994,9 +1140,9 @@ recorded as ungateable:
 
 | mutation | result |
 |---|---|
-| delete the bf16-on-a-non-CPU-queue refusal (`ltx2_video_vae.cpp:1473-1481`) | the mutation COMPILES (`BUILD_rc=0`, `libvllm.a` relinked) and reds the new subcase: `test_ltx2_vae -tc='*dtype refusals*'` goes 1/1 cases and 3/3 assertions GREEN to **1 of 1 case failed, 1 of 3 assertions red**, `CHECK_THROWS_WITH_AS ... threw a DIFFERENT exception!` -- the decode runs on past the deleted guard and dies downstream on a missing bf16 parameter. Restored byte-for-byte |
-| the SAME subcase with the fake-accelerator registration removed (control) | throws `":177"` "for which no platform is registered", not `":1473"` "only the CPU arm serves it" -- which is the whole content of the retired "cannot be gated on this build" claim, and it holds only in that control |
-| delete the ENTRY-POINT `RequireVaeDType` call alone (`ltx2_video_vae.cpp:1465`) | COMPILES and stays **GREEN**, 1 of 1 case and 3 of 3 assertions. `VaeStore::Alloc` (`:250`) refuses the same bag with the same message a few lines later, so the f16 subcase cannot see that call site's deletion. Recorded rather than repaired: forking the text would give one refusal three messages, which is what the single function exists to prevent, and the case now states that it gates the PREDICATE |
+| delete the bf16-on-a-non-CPU-queue refusal (`ltx2_video_vae.cpp:1495-1504`) | the mutation COMPILES (`BUILD_rc=0`, `libvllm.a` relinked) and reds the new subcase: `test_ltx2_vae -tc='*dtype refusals*'` goes 1/1 cases and 3/3 assertions GREEN to **1 of 1 case failed, 1 of 3 assertions red**, `CHECK_THROWS_WITH_AS ... threw a DIFFERENT exception!` -- the decode runs on past the deleted guard and dies downstream on a missing bf16 parameter. Restored byte-for-byte |
+| the SAME subcase with the fake-accelerator registration removed (control) | throws `":198"` "for which no platform is registered", not `":1496"` "only the CPU arm serves it" -- which is the whole content of the retired "cannot be gated on this build" claim, and it holds only in that control |
+| delete the ENTRY-POINT `RequireVaeDType` call alone (`ltx2_video_vae.cpp:1487`) | COMPILES and stays **GREEN**, 1 of 1 case and 3 of 3 assertions. `VaeStore::Alloc` (`:271`) refuses the same bag with the same message a few lines later, so the f16 subcase cannot see that call site's deletion. Recorded rather than repaired: forking the text would give one refusal three messages, which is what the single function exists to prevent, and the case now states that it gates the PREDICATE |
 
 ### One instrument lost its window and is repaired rather than deleted
 
@@ -1022,7 +1168,7 @@ than "reaches the pixels".
   bf16 owed".
 * **This spec's own `## Owed` said the bf16-on-a-non-CPU-queue refusal "cannot be
   gated on this build", and that was FALSE.** The shadowing by
-  `RequirePooledDevice` (`ltx2_video_vae.cpp:1441`, throwing at `:177`) is real
+  `RequirePooledDevice` (`ltx2_video_vae.cpp:1463`, throwing at `:198`) is real
   ONLY in the control condition, when no platform is registered for the device
   type. `vllm::platforms::RegisterPlatform` and `vt::RegisterBackend` are public
   APIs, and `grep -rln 'platforms::RegisterPlatform' tests/` names THIRTEEN other
@@ -1031,10 +1177,73 @@ than "reaches the pixels".
   the new subcase is shaped after). Doing so here reaches the refusal with no GPU
   and no lease.
   Both arms measured on the same binary: with the fake `kXPU` backend and platform
-  registered the decode throws "only the CPU arm serves it" (`:1473`); with the
+  registered the decode throws "only the CPU arm serves it" (`:1496`); with the
   registration removed and nothing else changed it throws "for which no platform
-  is registered" (`:177`). All three of this row's dtype refusals are now gated in
+  is registered" (`:198`). All three of this row's dtype refusals are now gated in
   "ltx2 vae: the dtype refusals this arm adds are REACHED, not merely written".
+* **TEN RECORDS CARRIED ONE CLAIM IN SEVERAL SENTENCES -- THAT THE RENDER NEVER
+  HANDS THIS DECODE A DEVICE QUEUE, SO f32 IS A REFERENCE WIDTH AND NOT A SHIPPING
+  ONE -- AND EACH OF THE THREE SWEEPS REPORTED ITS OWN COUNT AS THE TOTAL
+  ([#2853](https://github.com/mudler/vllm.cpp/issues/2853)).** That is the
+  original defect again -- a count that stood in for a search -- so the repair is
+  recorded with the searches that found the rest, not with its total. The bearers,
+  in the order they were found: §3 and `cuda_ltx2_vae.cu:41-50` (repaired first,
+  from memory); then §0(a) and its `grep -c 'Ltx2VideoDecodeStreaming('` line,
+  `ltx2_video_vae.h:56-67` -- the same sentence, nine lines under the refusal it
+  argued for, in the header of the file that owns that refusal --
+  `ltx2_video_vae_kernels.h:48-50` ("bf16 is the arm the render loads") and
+  `docs/FEATURES.md:225` ("bf16 is CPU-ONLY ... which costs nothing because the
+  render decodes on the CPU queue"); then
+  `src/vllm/model_executor/models/ltx2_video_vae.cpp:25-33`, the banner and
+  paragraph of the file that IMPLEMENTS the refusal ("bf16 IS THE ONE THAT SHIPS",
+  "the render loads that bag at `kBF16`, so f32 is the parity REFERENCE and not the
+  shipping path"); and finally, on a third sweep, three more. **(8)**
+  `ltx2_video_vae.cpp:56-58`, the file's SECOND dtype banner -- "DTYPE: THE f32
+  REFERENCE ARM, AND WHY IT IS NOT WHAT SHIPS", with "it is the choice a reference
+  arm makes" in the sentence under it. **(9)** `ltx2_video_vae.cpp:69-70` in the
+  next paragraph of the same section, "So f32 here is the reference arm's
+  convention and nothing more". **(10)** §7's own risk bullet in this document,
+  "`ltx2_video_vae.cpp:75-78` already says the f32 file is a correctness reference
+  and not the shipping path" -- whose anchor had drifted onto the golden-generator
+  paragraph as well. The three repairs are at `ltx2_video_vae.cpp:56-64` and
+  `:71-75` and in §7 above. `FEATURES.md:228`,
+  the DEVICE-arm row, named no width at all and now names f32.
+
+  **THE LAST THREE ARE THE ONES THE LESSON IS FOR, AND NONE OF THEM NEEDED A NEW
+  SPELLING.** The second sweep widened the phrase set to "the one that ships",
+  "not the shipping path" and "render loads" in order to reach the first banner.
+  On `origin/main`, unchanged, two of those same terms return TWO of the three it
+  missed: `git grep -i "what ships"` returns `ltx2_video_vae.cpp:44`, the second
+  banner at its base line number, and `git grep -i "not the shipping path"`
+  returns exactly three hits -- `:30` and `:96`, which the wave repaired, and this
+  document's line 690, which is the §7 bullet and which it did not. The THIRD, the
+  "reference arm's convention" sentence, sits four lines further down inside the
+  second banner's own section and came from an independent phrase family
+  (`reference arm`). The second banner sat 24 lines below the first,
+  in the file that wave had just repaired at `:25-42` and `:111-118`, stating the
+  opposite of both; the risk bullet was in this document. So the miss was not a
+  spelling gap. It was reading a term's output only as far as the hit that was
+  expected. A sweep is complete against neither its spellings nor the claim until
+  every hit every term returns has been read to a verdict, which is why the terms
+  and their hits are listed in the pull request body rather than summarised.
+
+  Four traps were live on this host: `grep` wraps `ugrep`
+  and its `--include` silently admitted a `cmake/` file; zsh ate an unquoted
+  `--include=*.py` and returned "no matches found" at a non-zero rc that reads
+  exactly like a clean sweep; `-E` treats `\|` as a literal pipe; and
+  `ltx25-a24-leaves-bf16.md:180` wraps "runs on the CPU / queue on every build"
+  across a newline, so a phrase search finds it only after the lines are joined.
+  The sweep was therefore run three ways: `git grep` over tracked files,
+  `/usr/bin/grep -rn` bypassing the wrapper, and a Python pass that strips comment
+  markers, refuses a stream carrying a NUL byte by name instead of reading it as no
+  match, and joins the lines before matching. The third sweep added the control the
+  first two lacked: three phrases KNOWN to be present and one known to be absent,
+  run in the same command shape as the real terms, so a bare zero is separable from
+  a broken command. Three sites the sweep surfaced are
+  NOT bearers and are recorded as cleared rather than dropped:
+  `ltx25-a24-leaves-bf16.md:180` and `ltx25-device-residency.md:714` are about the
+  ENCODER, which really does take no queue, and `FEATURES.md:226` says the same of
+  it.
 * **#2816's disagreement set was a spot check presented as a measurement.** It
   named n = 4, 7 and 13. Swept over n = 2..32 against the port's own `Linspace`
   (`ltx2_tiling.cpp:26-40`), `torch.linspace` disagrees at n = 4, 7, 8, 12, 13,

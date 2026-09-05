@@ -427,7 +427,7 @@ mutation going red.
 | The ABSENT-file branch refuses too | its `exit 3` → `exit 0` | **suite rc 1**, `test_a_missing_requirements_file_refuses_instead_of_building` |
 | The checker reads the CLONE | `$WORK/vllm/pyproject.toml` → `$WORK/snapshot-pyproject.toml` | **suite rc 1**, `test_the_checker_is_handed_the_cloned_tree_not_a_snapshot` |
 | Red before the repair | the 16-case suite against the parent's script | **13 red**; the 3 green in both directions are the must-not-move guards |
-| The capture at the target on GB10 | `efc30c74-005e-4e80-bc28-bd34f5b76b77` | **PENDING**, queued |
+| The capture at the target on GB10 | `7386f034-246a-4af5-9a04-f98aafffce54` | **PASS**, 2026-09-04, 2h15m18s. `IDS mismatched_positions 0 of 96`, `IDS_BYTE_EQUAL True`, `SELECTOR K=5 multi_valued_cells 0`, `TOKENGATE_VERDICT PASS`, `DIFF_RC=0`. Preconditions asserted before measuring: `COMPUTE_CAP=12.1` on GB10, `HEAD_SHA=e126687a9a…` with `PORCELAIN_LINES=0`, ten staged inputs sha-verified. `efc30c74` is the FAILED predecessor (exit 4, 3s, missing PEP-518 requires); it is kept in the row above rather than overwritten |
 
 Every rc above was read directly, never after a pipe.
 

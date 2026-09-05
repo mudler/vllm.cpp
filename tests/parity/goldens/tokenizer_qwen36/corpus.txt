@@ -96,3 +96,23 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 # decomposed form of "Café" ("Cafe" + U+0301 COMBINING ACUTE); uncomment it
 # once NFC composition lands.
 #Café decomposed: Café would need NFC composition first
+# --- combining-mark DENSITY (issue #2948, refiling #1355) ---
+# Our server reported 5,942 prompt tokens where the pinned vLLM oracle reported
+# 6,144 for one client-generated corpus, and the short prompts were exactly the
+# ones carrying 74-150 combining marks each. Every entry above reaches at most
+# 13 marks, and the 64 entries above carry 28 in total, so nothing here exercised
+# that regime. These six do: Devanagari matras, Thai marks and Arabic harakat,
+# 78-149 marks per entry. All are NFC-STABLE, so they probe the \p{M}-aware
+# split regex and the merge ranking, NOT the recorded NFC deviation below.
+# They matter on aarch64 in particular: GATE-CI-AARCH64-COVERAGE builds this
+# test on ubuntu-24.04-arm (.github/workflows/ci.yml:1533-1538), and the
+# divergence was only ever observed on an aarch64 server binary.
+# Measured discrimination: capping marks at 6 per letter-run in MatchLetterRun
+# (src/vllm/tokenizer/pretokenizer.cpp) leaves all 64 entries above passing
+# (1175/1175 assertions) and fails five of the six below.
+भुघूयीगंदीङोैषै थिेतृिञैछितृशूेभीोसंःञै फृपेम्ञौ जँघँषोबैँ थेपः गोवू मो ञाङृौबृटा ख्खीणोखृञौणाजाौञँठःमौफृ चःफंधीोमँलःब्ञोकूमंलिशःपा ताीझैफः्ञिहंघः लि यूके फृ
+ฌูซีท้ฟ์ ศ็ีล์ฬัอุ๋ฒิํฮิ์ อํ๋ต๋ ภูฒีต็ล้ฌ์ฏ่ ฎ้ข์ด็บ๋ซึืดํฆ็อิัดืฌึ ฟ้ณึู ชีฏี๊ฑั ดิ อ๊กัขูศิ๊นัฝิภ์ฬ๋นื้ ซูค็สํยึฆ็ํฟีวึ็ป๋่ซ๋ห์ูคึ ฆึผ์มีฟูฮืวั๋ว๊ดี็จิึซื ดึฏ็ผิรึบี ส้ ป่ข๋ข์ ร้ณ๋จุซัฐึ่
+اٌبَِظٍِ لْظَكُعٌذّلْوًحٌوًُثٍغًَ كُّ وًرْصًٍ خَ طَظٍُ دّْ ظٍقٌضًعُظٌِبِلٌفٌقٌذًتَعٍْصْضَلّكّيِزَزٌشُلً ذٌمٌ لٰكْٰحٌلّشٰ ظْٰغٰطُّحٍُ صُشٰمِْظُجٰاّسًذْقٌِ ظٍفٍزٌزَيٍُ لٰنٍ خٍجٰفَٰرْضً دًظًٌخّاِقٰخُخِ طُّصًٍدِنٌعًٍنُرٌظً
+ङेटोशौिषेतंृसोञंँहौदेौजेनोे तँ्रूा झै लँबःीसा षैधोबेृचृखैढीम्रँछीःधः बीगौःकूकैञिधि झू फेहुपृताका दिे चृ घःठुूटीथैञोीशैयूिलीकी डुसूिटो भैभो गीुलैथौेपूलेङे ञिङं धंयँ्मं्योे भंडूञेफृविैधःवूसृखीझूु यूैहुछिञौःषंीरौबू पेमीठ्ञी सो बं कोंछोछ् ज् फेङेू थःंटोीसीङीचि ङंोषु
+ณู๋ขัิผุฐีภ์ึฎ์ส๋ ฏ่ฝับ๊้ทัชู ฬิพีกํูฏ็ วี บ์ ฬ์ฆํ่ฅํ๊ฉุ้ปํ ม๊พื๋ณ่ฉ้ชึภั๊กังีัคีุ ป๋๊ ฟ่ฎ์ห๊ ฮัติจํณั๋ขัฅ์่ฐํูณุซัอัธ็พิฝี่ ดูสี๊ ฟั่ ป้ฟ้ฒํณีฆ็ืฑ๊ ฟูจั๋ฮิีท์ฅํูทึฌู ฟืูฑํ์คุ๊สํฅีล้ลื๋ธ๋ฉํิญั สิ๊วึ่ร์ป็๊ ธํขีขึ๊ฒื้ ก็ึขูหุ้อ๋ซํป์ุป้ฐืฆ็ีต๊่ฐ์ุยัู บื ฅ์ธ๋นิว็ ส็๋จํุฎํอืีศั็
+عِثٌ صُاَطٍُغِّهٍحّْ سَّ رَُحْهْجًٍخٰفٌتْٰاٌنِٰبّْاٍُظَقًبٌتٍخَثٌِ حًٰدٌِنْلٌّضْظًذٌَنًذٍِطٰحًّلُٰسًِقِوٌسٌ طُّهِقٍضُّشْ يِعِضٌّدِ غٰهٌسًعًعًجُِوًَزُّشٍْحٍخًِ

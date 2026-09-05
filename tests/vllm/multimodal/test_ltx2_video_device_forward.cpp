@@ -379,6 +379,41 @@ TEST_CASE("ltx2 one_stage on an accelerator: the x0 model reaches the DEVICE for
   const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
   REQUIRE(t.completed);
 
+  // ── the VAE DECODE ran on this device render, at a width the device serves ──
+  //
+  // #2853. A24 wave 3 made `Ltx2VideoEngine::Load` ask for a bf16 video VAE bag
+  // on BOTH arms, and `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue
+  // by name, because `vt::Conv3d` has no bf16 storage arm on an accelerator
+  // (#1007). The decode is handed `im.on_device ? &*im.queue : nullptr`, so every
+  // device render threw at `decode.video` — this case included, which is how the
+  // regression surfaced. It died on the throw with `assertions: 10 | 10 passed`,
+  // so every assertion that ran still passed and the case count is what said the
+  // render never finished.
+  //
+  // The two lines below are what stops that shape recurring silently. They are
+  // NOT a restatement of `t.completed`: a load that asks for a width the device
+  // convolution cannot serve throws before the decode emits a chunk, so
+  // `vae_decode_values` is the counter that reads zero when the decode is
+  // unreachable and non-zero when it ran. `vae_decode_not_bf16` then says WHICH
+  // arm ran, and it is the deliberate mirror of `test_ltx2_video.cpp`'s
+  // `vae_decode_not_bf16 == 0` on the CPU arm: bf16 where upstream's width is
+  // reachable, f32 where it is not. The two cases together are the whole
+  // resolution, and either one alone would let the other arm move unnoticed.
+  //
+  // When the device bf16 arm lands (`## Owed` in
+  // `.agents/specs/ltx25-a24-video-vae-bf16.md`), this second line is the one
+  // that reds and asks to be flipped to `== 0` — which is the correct polarity
+  // for a guarantee that is owed rather than declined.
+  INFO("device VAE decode: values=" << t.vae_decode_values
+                                    << " wider-than-bf16=" << t.vae_decode_not_bf16);
+  REQUIRE_MESSAGE(t.vae_decode_values > 0,
+                  "the video VAE decode emitted no values on the DEVICE arm, so this render "
+                  "never reached the decoder (#2853)");
+  CHECK_MESSAGE(t.vae_decode_not_bf16 > 0,
+                "the DEVICE arm's video VAE decode produced only bf16-representable values, so "
+                "the load asked for a bf16 bag on a queue whose `vt::Conv3d` has no bf16 "
+                "storage arm (#1007, #2853)");
+
   vt::EnableOpProviderCallStats(false);
 
   // ── the DEVICE branch of the ternary is the one that ran ──────────────────

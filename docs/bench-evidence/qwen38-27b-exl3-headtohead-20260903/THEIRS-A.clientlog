@@ -1,0 +1,9 @@
+  [THEIRS-A] 20/164 t=81s
+  [THEIRS-A] 40/164 t=152s
+  [THEIRS-A] 60/164 t=223s
+  [THEIRS-A] 80/164 t=294s
+  [THEIRS-A] 100/164 t=369s
+  [THEIRS-A] 120/164 t=444s
+  [THEIRS-A] 140/164 t=520s
+  [THEIRS-A] 160/164 t=591s
+CLIENT_RESULT {"leg": "THEIRS-A", "requests": 164, "ok": 164, "wall_s": 604.8858408079977, "completion_tokens_counted_by": "usage", "prompt_tokens_total": 31488, "completion_tokens_total": 19680, "mean_completion_tokens": 120.0, "mean_ttft_ms": 1021.7365941465597, "median_ttft_ms": 765.8071529986046, "mean_tpot_ms": 22.40703963173897, "median_tpot_ms": 21.927435365551986, "decode_only_tok_s": 44.62883167232528, "decode_only_tok_s_pooled": 45.003863871252385, "whole_run_tok_s": 32.53506475488291, "accepted_draft_tokens_total": 15238, "accepted_draft_tokens_per_output_token": 0.7742886178861789, "median_itl_ms": 0.032080999517347664, "failures": []}

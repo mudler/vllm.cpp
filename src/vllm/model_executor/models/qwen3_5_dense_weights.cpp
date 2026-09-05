@@ -4,6 +4,7 @@
 // by name (notes §3.6) and swaps the MoE block for the dense SwiGLU MLP.
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -1116,6 +1117,39 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
     const std::string modelopt_refusal =
         layers::modelopt::RefusalForQuantizationConfig(*quant, all_names);
     VT_CHECK(modelopt_refusal.empty(), "qwen3_5 dense: " + modelopt_refusal);
+
+    // QUANT-QWEN38-27B-NVFP4-ARM W7 (#2760). The FOURTH whole-checkpoint read,
+    // and the only one that is not a refusal.
+    //
+    // A THIRD ModelOpt artifact of this model declares an algorithm this build
+    // does not execute, and the refusal above cannot see it.
+    // `RadixArk/Qwen3.8-27B-NVFP4` @ `554ebba9` -- the target
+    // `pangoleen/qwen3.8-27b-dgx-spark-dflash2` serves, and the artifact
+    // `r0b0tlab/...-MTP-sm121` was derived from -- declares
+    // `{"quant_algo": "NVFP4", "group_size": 16}` on all 193 of its NVFP4
+    // modules, declares `config_groups.group_1.input_activations` 4-bit static,
+    // and ships `<proj>.input_scale` on every one. `Refusal` accepts that,
+    // correctly: its question is whether the shipped SPELLING matches the
+    // declaration, and it does. The arm the loader then takes is the one
+    // `VT_MODELOPT_W4A4` decides, and it defaults to the weight-only W4A16
+    // dispatcher.
+    //
+    // SO WE RUN W4A16 ON A W4A4 CHECKPOINT, AND UNTIL THIS LINE WE PRINTED
+    // NOTHING. The weight bytes per step are identical either way, so no
+    // throughput axis moves and no roofline changes; the activation path and the
+    // numerics differ, and a token gate cannot see that because W4A16 of a W4A4
+    // checkpoint is numerically plausible. This does not refuse and does not
+    // move any arm -- the checkpoint loads exactly as it did -- it makes the
+    // divergence VISIBLE DEBT instead of a silent one. Whether the W4A4 path
+    // should run at all is a lease-side question with a same-binary A/B and a
+    // token gate attached; it is `## Owed` in
+    // `.agents/specs/qwen38-27b-quant-arms.md`, tracked by #2760.
+    const std::string activation_notice =
+        layers::modelopt::ActivationArmNoticeForQuantizationConfig(
+            *quant, all_names, ModelOptW4A4OptIn());
+    if (!activation_notice.empty()) {
+      std::fprintf(stderr, "qwen3_5 dense: %s\n", activation_notice.c_str());
+    }
   }
 
   Qwen3_5DenseWeights w;

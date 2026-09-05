@@ -38,11 +38,16 @@
 // place, asking the same question this table refuses on, so the refusal and the
 // route predicate are the same predicate rather than two that can drift.
 //
-// Production is unaffected: the render passes no queue
-// (`grep -c 'Ltx2VideoDecodeStreaming(' src/vllm/multimodal/ltx2_video.cpp` = 1,
-// queue-less), so the conv video VAE decode runs on the CPU queue on every build
-// of this project. The device bf16 arm is owed with `cuda_conv3d`'s and needs a
-// lease to be measured.
+// THIS BLOCK USED TO SAY THE RENDER PASSES NO QUEUE, AND THAT WAS FALSE (#2853).
+// There is one `Ltx2VideoDecodeStreaming(` call site in
+// `src/vllm/multimodal/ltx2_video.cpp`, which is what the count said; its LAST
+// argument is `im.on_device ? &*im.queue : nullptr`, which the count could not
+// see. So a device render does hand this decode an accelerator queue, and while
+// the load asked for bf16 on both arms every such render threw at the refusal
+// above -- production was affected, and the #1426 fake-accelerator case is what
+// found it. The load now asks for bf16 on the CPU arm and f32 on the device arm,
+// so the refusal guards a hand-built bag rather than the render. The device bf16
+// arm is owed with `cuda_conv3d`'s and needs a lease to be measured.
 //
 // COMPILED BY CI, NEVER EXECUTED ANYWHERE IN THIS PROJECT'S REACH. This block
 // used to say "NEVER COMPILED" as well, and the tree has falsified that: the

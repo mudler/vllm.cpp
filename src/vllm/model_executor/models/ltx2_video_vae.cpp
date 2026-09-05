@@ -22,15 +22,27 @@
 //    the debt it pays, so leaving the two disagreeing was the record contradicting
 //    the tree.
 //
-// ─── DTYPE: BOTH ARMS ARE LIVE, AND bf16 IS THE ONE THAT SHIPS ──────────────
+// ─── DTYPE: BOTH ARMS ARE LIVE, AND THE RENDER SHIPS EITHER ONE ─────────────
 //
 // A24 wave 3 (row LTX25-A24-VIDEO-VAE-BF16, issue #2786) landed the bf16 arm the
 // paragraphs below were written owing. The decode now runs at
-// `Ltx2VaeWeights::dtype` and the render loads that bag at `kBF16`, so f32 is the
-// parity REFERENCE and not the shipping path. Read what follows as the reason the
-// reference exists and as the record of what an f32-only oracle cannot see; the
-// six rounding rules the bf16 arm applies are stated at their own sites and
-// measured in the row's spec section 4.
+// `Ltx2VaeWeights::dtype`.
+//
+// THIS BLOCK USED TO SAY THE RENDER LOADS THAT BAG AT `kBF16`, SO f32 WAS THE
+// PARITY REFERENCE AND NOT THE SHIPPING PATH. THAT WAS FALSE (#2853), and it is
+// the same sentence `cuda_ltx2_vae.cu`, `ltx2_video_vae.h` and `docs/FEATURES.md`
+// each carried in their own words. `Ltx2VideoEngine::Load` resolves the bag's
+// width from the arm -- `im.on_device ? kF32 : kBF16` -- because the one
+// `Ltx2VideoDecodeStreaming(` call site passes `im.on_device ? &*im.queue :
+// nullptr` and the refusal at `:1495-1504` below is therefore reachable from the
+// render. So f32 is BOTH the parity REFERENCE every committed golden is measured
+// against AND what a DEVICE render decodes at; bf16 is what a CPU render decodes
+// at, and it is upstream's SDR default. Upstream decodes this VAE at f32 too, on
+// its HDR arm (`vae_dtype_for_hdr`, ltx-pipelines .../media_io/color_config.py:64-66).
+//
+// Read what follows as the reason the f32 arm exists and as the record of what an
+// f32-only oracle cannot see; the six rounding rules the bf16 arm applies are
+// stated at their own sites and measured in the row's spec section 4.
 //
 // WHAT THE bf16 ARM IS NOT BIT-EXACT AGAINST, said here rather than discovered:
 // torch BLOCKS its convolution reduction and this port does not, so at the gated
@@ -41,21 +53,26 @@
 // asserts that relation rather than asserting a number. The arithmetic is gated
 // bit-exactly one rule per kernel instead.
 //
-// ─── DTYPE: THE f32 REFERENCE ARM, AND WHY IT IS NOT WHAT SHIPS ─────────────
-// Every buffer below is f32, and unlike the audio VAE next door that is NOT an
-// upstream-grounded choice — it is the choice a reference arm makes, and it is
-// annotated here because AGENTS.md requires an f32 on a model path to carry a
-// reason, and because a too-WIDE dtype is the one defect a correctness gate
-// structurally cannot report: it stays numerically right, the goldens stay green,
-// and the only symptom is twice the bytes moved.
+// ─── DTYPE: WHY THE f32 ARM EXISTS, AND WHAT IT COSTS A DEVICE RENDER ──────
+// Every buffer below is f32 on this arm. Unlike the audio VAE next door there is
+// no spectral-metric argument for it: it is the width a parity reference needs,
+// and since #2853 it is also the width a DEVICE render decodes at, for the reason
+// the banner above gives. It is annotated here because AGENTS.md requires an f32
+// on a model path to carry a reason, and because a too-WIDE dtype is the one
+// defect a correctness gate structurally cannot report: it stays numerically
+// right, the goldens stay green, and the only symptom is twice the bytes moved --
+// here, +776.6 MiB of decoder weights resident on every device render.
 //
 // Upstream does the OPPOSITE of what the audio VAE does. `ConvVideoDecoder.forward`
 // runs in the CHECKPOINT's dtype: it casts in with `sample.to(weights_dtype)` on
 // entry and back with `sample.to(output_dtype)` on exit
 // (conv_video_decoder.py:283-286, 355-356). There is no autocast, no float32
 // pin, and no spectral-metric argument of the kind that justifies the audio
-// tower's f32 (ltx2_audio_vae.cpp:7-12 -> vocoder.py:585-595). So f32 here is
-// the reference arm's convention and nothing more.
+// tower's f32 (ltx2_audio_vae.cpp:7-12 -> vocoder.py:585-595). So the CHECKPOINT
+// never asks for f32 here, and on the CPU arm this file follows it to bf16. What
+// selects f32 on the device is this tree's own queue predicate, and upstream's
+// own reason for the same width is a COLOUR SPACE, not a queue (`vae_dtype_for_hdr`
+// again). Both are recorded in section 5.6.1 of the row's spec.
 //
 // The golden CANNOT catch this either, and that is worth stating plainly rather
 // than leaving for someone to discover: the generator's `fill_from_stream` casts
@@ -91,10 +108,14 @@
 // the CPU threadpool" and "the decode is BIT-IDENTICAL across thread counts" in
 // tests/vllm/models/test_ltx2_vae.cpp are the two instruments.
 //
-// PHASE L6 OWES THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
-// checkpoint dtype the way upstream does. Until it lands, this file is a
-// correctness reference, not the shipping path, and no memory or throughput
-// number should be taken from it.
+// PHASE L6 OWED THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
+// checkpoint dtype the way upstream does — and A24 wave 3 (#2786) landed the
+// bf16 half of it. This paragraph used to continue "until it lands, this file is
+// a correctness reference, not the shipping path", which the banner at the top of
+// this file supersedes twice over: the bf16 arm landed, and #2853 then made the
+// f32 arm a SHIPPED width too, on the device. Both arms are the shipping path
+// now, so a memory or throughput number taken from this file must name which arm
+// it was taken on. The NVFP4 half is still owed.
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_kernels.h"
 #include "vllm/model_executor/models/ltx2_video_vae_kernels.h"

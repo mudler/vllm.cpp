@@ -999,3 +999,87 @@ asserts that layer 0 carries `tid2eid` and `e_score_bias_vl` and an EMPTY
 Nothing selects the loaded bias. The commit body names it unreached, names the
 owning row and issue #2411, and `## Owed` above lists the three behaviours W4
 owns.
+
+### W3A repair evidence
+
+A fresh review of W3A returned six findings. The four layout derivations it
+checked -- the q,k,v fuse order, gate-then-up, the identity patch permutation
+and the dtype polarity -- were confirmed correct and are unchanged. What follows
+repairs one false citation and five gate gaps.
+
+**The false citation.** The header claimed that `gguf-py/gguf/tensor_mapping.py`
+maps `vision.blocks.{bid}.attn.wqkv` to V_ENC_ATTN_QKV, "which the shared mmproj
+base then writes as three SEPARATE `attn_q` / `attn_k` / `attn_v` tensors". That
+mechanism does not exist at release `b10766`. `gguf-py/gguf/constants.py` spells
+V_ENC_ATTN_QKV `v.blk.{bid}.attn_qkv`, `conversion/base.py` contains no
+occurrence of `qkv` at all, the only converter that splits a fused vision qkv is
+the model-specific `conversion/qwenvl.py`, and
+`conversion/deepseek.py::DeepseekV4FlashVisionModel.modify_tensors` splits
+`mlp.w1` only. Each of the four was re-read from the pin's own bytes over the
+GitHub raw endpoint before the repair, rather than relayed from the review.
+
+So a projector converted by the pinned oracle's own `convert_hf_to_gguf.py`
+carries `v.blk.N.attn_qkv.{weight,bias}` -- 299 tensors at depth 32 against the
+shipped file's 427 -- and this reader cannot load it. The fused arm is NOT
+implemented. `RefuseUnsupportedDeepSeekV4ClipMmproj` refuses it by name, points
+at issue #2411, and states that the file is not at fault, before
+`RefuseUnaccountedDeepSeekV4ClipMmproj` can report that the artifact carries
+tensors this build never reads. `## Owed` records the arm, the owning row and
+the issue.
+
+**The gate gaps.** `attn_out.weight` and `attn_out.bias` had no value case at
+all: the fixture wrote them with their own exponent families and never read
+either back, so 32 x 1M parameters were unmeasured. The aligner was checked at
+flat index 0 only, and index 0 is the one element a transpose leaves alone, so a
+row/column confusion in the square `mm.2` -- [4096, 4096] on the real artifact,
+the one linear where a shape check cannot help -- was invisible. The shape guard
+itself had no case. The absent-`clip.use_silu` branch had none either, although
+`Options::emit_use_silu` already existed for it. And nothing bounded the
+geometry read from `clip.*` before it became a `resize` argument.
+
+**Mutation evidence.** Each mutation was applied to the production source alone,
+`clip_mmproj_gguf.cpp.o` was confirmed to rebuild, the suite was run, and the
+file was restored and verified with `sha256sum -c` against
+`ee7b510e6a9eea39a57d8dcab95a7cadfac10eba4e069ae55f07b26acc0feed6`.
+
+| Mutation | Case reddened | Failed assertions |
+|---|---|---|
+| source `out_weight` from `attn_q.weight` | the attention output projection | 128 |
+| source `out_bias` from `attn_q.bias` | the attention output projection | 16 |
+| transpose the square `mm.2` | the aligner and the sentinels | 132 |
+| delete the `Require` shape check | a wrong-shaped tensor names both shapes | 3 |
+| accept an absent `clip.use_silu` | a projector that declares no `clip.use_silu` | 1 |
+
+The transpose figure is the measurement, not a round number: 132 is 144 elements
+less the 12 on the diagonal, which is exactly the set a transpose can move. The
+old index-0 check would have reddened on none of them.
+
+The fused-layout and out-of-range-`block_count` cases needed no mutation,
+because the code they gate did not exist. They started red together: 18 cases,
+16 passed, 2 failed, 2198 assertions with 7 failed. The fused case failed on
+"NOT IMPLEMENTED", on "2411" and on the absence of "NEVER reads"; the geometry
+case failed on all four of its message assertions.
+
+**A red-first case for an unbounded allocation performs the allocation.** The
+first draft of the geometry case used `block_count = 4000000000`, which is what
+the defect admits. With no guard in place that value reached
+`blocks.resize(static_cast<size_t>(config.depth))` and asked for about 80 GB. It
+tripped the GLOBAL Linux OOM killer twice on this box -- "Out of memory: Killed
+process (test_deepseek_v) anon-rss:80197996kB" -- and took unrelated processes
+with it. The case now asserts on the PARSED VALUE: `4096` is absurd
+for a tower the artifact ships at depth 32, it is refused by name, and without
+the guard it allocates a few megabytes and fails on the message. A test whose
+only failure mode is `bad_alloc` is a crash, not a gate. Every test run in this
+repair was made under `ulimit -v 6000000`.
+
+**After.** `test_deepseek_v4_mmproj` reports 18 cases and 2198 assertions, up
+from 13 and 999. `test_clip_mmproj_gguf` reports 9 cases and 272 assertions,
+unchanged, because the Qwen3-VL arm is deliberately untouched. `ctest
+--test-dir build-repair3a -R 'deepseek_v4_mmproj|clip_mmproj_gguf'` passes 2/2
+on a Release CPU build with `-DVLLM_CPP_CUDA=OFF`.
+
+The reader is still not reached from production, and `## Owed` still names W4 as
+the owner of the wiring. Three further gaps are recorded there and not fixed:
+the unkeyed vision `rope_theta`, the four `clip.vision.image_*` preprocessor
+keys, and the `general.alignment` fallback the shared fixture cannot yet
+exercise.

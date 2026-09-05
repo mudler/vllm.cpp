@@ -675,7 +675,28 @@ TEST_CASE("The router gate GEMM at f32 reproduces the exact products a bf16 stor
   Queue q = b.CreateQueue();
 
   const int64_t T = kGemmT, H = kGemmH, E = kGemmE;
+  // THE FOUR ALLOCATIONS THIS CASE MAKES ARE OWNED, and until now they were not
+  // (#2435). The vector below already collected every pointer -- it was written
+  // to free them -- and nothing ever did, so this case ran `[doctest] Status:
+  // SUCCESS!` over 533 assertions and then exited nonzero on
+  // `LeakSanitizer: 384 byte(s) leaked in 4 allocation(s)`: 128 + 128 for the
+  // two bf16 operands, 64 + 64 for the two outputs. That is the exact figure
+  // #2435 reports, and this is where it comes from.
+  //
+  // A TRAILING `for (void* p : owned) b.Free(p);` WOULD NOT DO. `RequireFinite`
+  // and the `REQUIRE`s below throw on failure, and doctest unwinds; a loop at
+  // the end of the body is skipped on exactly the runs where a leak report is
+  // least welcome. The `Harness` at the top of this file already owns its
+  // allocations from a destructor for the same reason -- this case duplicated
+  // its `owned_` vector and dropped its `~Harness`.
   std::vector<void*> owned;
+  struct FreeOnScopeExit {
+    Backend& b;
+    std::vector<void*>& owned;
+    ~FreeOnScopeExit() {
+      for (void* p : owned) b.Free(p);
+    }
+  } free_guard{b, owned};
   auto alloc = [&](DType dt, int64_t n) {
     void* p = b.Alloc(static_cast<size_t>(n) * vt::SizeOf(dt));
     owned.push_back(p);

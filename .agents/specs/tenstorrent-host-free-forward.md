@@ -326,15 +326,84 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **The capture arm's cold step emits a deterministic wrong first decode
+  token ([#2461](https://github.com/mudler/vllm.cpp/issues/2461)) — REPAIR
+  LANDED in this change (2026-09-01, root cause and evidence in `## Now`);
+  the issue closes on merge. RESIDUAL, a separate defect, now filed and
+  repaired: the capture-armed battery's one remaining failure at prompt[1]
+  tok=1 is cross-request persistent shadow state, not the slab swap
+  ([#2469](https://github.com/mudler/vllm.cpp/issues/2469), REPAIR LANDED
+  in this change — see its own `## Owed` entry below).** Found by
+  the wave's fresh mutation review (2026-09-01): the reviewer's rerun of the
+  capture-armed focused gate printed deterministic gibberish where the
+  operator's evidence record claimed "coherent" — the gate's `words>20`
+  criterion was tt-metal log lines on stdout, and the A/B/C capture-leg logs
+  hold the same bytes. Per-step adjudication (`VT_TT_DUMP_KV`): prefill
+  exact, COLD step wrong (48755 vs plain-eager 3364 " story" on the same
+  binary and inputs, top-2 gap 1.69 — not a near-tie), capture step and
+  replays then consistent on the corrupted history. The capture-armed golden
+  battery's single 1/32 failure (prompt[0] tok=1) is the same defect — it
+  was mis-filed as a near-tie earlier in this record. Replays are
+  token-exact (battery prompts 1-15), so the defect is the driver's eager
+  cold pre-warm step (`qwen3.cpp:1086-1111`) under the Warm*-staged
+  cached-device-tensor paths leg A never exercises; driver-side attn
+  metadata on that step is verified correct; the root cause is the
+  stride-fabricated shadow descriptor (`## Now`). Pre-exists both R4
+  fixes (fix 1 is warm-branch-only, fix 2's fresh-slot arm is
+  capture-only). R5-era latent: no token gate ever ran on the captured
+  CLI path. The repair carries red→green evidence and a token-clean
+  A/B/C re-measurement (`## Now`); the machinery-only caveat on the
+  earlier captured-arm ratios is superseded by it.
+- **The recycled same-size slot replays the previous request's final decode
+  position ([#2469](https://github.com/mudler/vllm.cpp/issues/2469)) —
+  REPAIR LANDED in this change (2026-09-01, root cause and evidence in
+  `## Now`); the issue closes on merge.** A same-size request boundary
+  under capture kept the previous request's final `cur_pos` on the shared
+  device tensor, so PA attended the dead request's decode KV rows and RAC
+  wrote at the stale virtual position, decoding the previous prompt's
+  tokens. The repair adds the per-slot continuation predicate and
+  `expected_cur_pos` bookkeeping, routes a same-size boundary through the
+  #1476 re-capture lane (seed-only measured insufficient: 13/11/264 with
+  device state verified correct), and makes `WarmPaMeta`'s `cp_host` read
+  the `DecodePos` host mirror so the device-PA guard reads what the device
+  actually holds. Green: capture-armed battery 125/125 assertions, 16/16
+  prompts PASS, max gap 0.375 nats @ prompt[1] tok=1 (inside the ≤0.5
+  near-tie band), 1344 device-PA selections / 0 declines; default arm
+  unchanged (125/125); captured CLI deterministic and coherent across a
+  card reset. Residual near-tie at that cell stays within the row's
+  adjudication band.
+- **Continuous-batching blind spot: the continuation predicate reads only
+  `seq_lens[0]` — a mid-batch request replacement on row r>0 at constant
+  num_reqs (continuous batching) leaves `cur_pos[r]` stale and the predicate
+  blind.** Unexercisable by the single-slot battery; same defect class as
+  #2469. The continuation predicate `seq_lens[0]-1 == expected_cur_pos`
+  covers row 0 / the single-request slot the capture path serves today;
+  multi-row decode request swap is unexercised and unsolved.
+- **The PA decline counter does not count guard-thrown declines (the `PA meta
+  not warmed for this step` fallback path).** Wiring it in measured 6720
+  declines on the default arm's battery vs the asserted 0, so it owes its
+  own change with the test's expectation re-baselined, owned by this row
+  (2026-09-01).
 - **The default-polarity question reopened by
-  [#2003](https://github.com/mudler/vllm.cpp/issues/2003).** At post-W2c
-  `21fe11cf1` the host-hybrid opt-out outperforms the shipped eager default
-  1.24x on the P150 (Qwen3-0.6B b1, order-alternated pairs ×3, clock
-  unattributed — see `.agents/benchmark-record.md`, 2026-08-26 entry); the
-  default arm is unchanged against its #1604 figures and the opt-out improved
-  ~2.5x unattributed. Owed: a per-op delta of the host-hybrid path from
-  `b86e3705f` to current main, then a polarity decision that carries a clock
-  window per arm.
+  [#2003](https://github.com/mudler/vllm.cpp/issues/2003): RESOLVED as a
+  documented stand-pat (2026-08-30, closed by the W2 record PR).** The
+  confirming A/B under the W2 sampler reproduced the inversion at clock
+  parity: default eager median 10.998 tok/s vs 14.299 for
+  `VT_TT_HOST_FREE_DECODE=0`, ratio 1.300 median / 1.294 mean, judge PASS,
+  every busy slice of both arms exactly {1350} MHz with the cap read from
+  firmware (`.agents/benchmark-record.md`, 2026-08-30 entry). The default
+  stays host-free. STILL OWED on this row: name the corrected mechanism for
+  the opt-out arm's ~2.5x improvement. The EnsureDevice2D hypothesis is
+  REJECTED — the per-op delta `b86e3705f..21fe11cf1` shows `353511e72` /
+  `101b415d7` only ADD staging work on the hybrid path, which cannot explain
+  the movement while the default arm is unchanged — so until the corrected
+  mechanism is named, the inversion is a real, unexplained performance
+  property of the shipped polarity, and a flip would be a guess.
+  (2026-08-31: a second candidate — per-step overhead from the default arm's
+  failed device-PA attempts — is REJECTED by measurement: the opt-out probe
+  shows the identical regime, 896 PA attempts / 868 failures / 0 device RAC /
+  0 warm hooks, under `VT_TT_HOST_FREE_DECODE=0`; see `## Now`. The
+  mechanism stays unnamed.)
 - **No case pins `HostFreeDecodeEnabled()`'s no-caching contract on the RAC
   path ([#1688](https://github.com/mudler/vllm.cpp/issues/1688)).** The R5
   fresh review found `ReshapeAndCacheKernel` still latching the flag in a
@@ -356,6 +425,17 @@ investigation row but MUST be addressed by the item-5 port:
   `support_static_graph_mode()` declined by default (opt-in
   `VT_TT_DECODE_CAPTURE`); the captured 27.1 tok/s arm stays one hang fix
   away, and that fix owns flipping this default back.
+  (2026-09-01, this branch: boundary SHARPENED — same-prompt sequential
+  generates are clean under capture (`--repeat 2`, 45 replays, rc 0; the
+  A/B/C capture legs ran `--repeat 5` in-process, 474 replays each), while
+  the 16-prompt battery spins in pure userspace after one capture. The
+  trigger is a cross-prompt KV-geometry re-warm under a live trace, and
+  tt-metal spins (state R, stime=0) instead of the R5-era futex sleep.
+  (2026-09-01, later: the capture-armed golden battery itself COMPLETES at
+  tip — 31/32 exact, the single failure is #2461's cold-step token, not a
+  hang; what still spins is the `VT_DUMP_IDS` battery dump. Blocked on this
+  fix: the capture-arm near-tie pair for `qwen3_greedy_0_6b`. The
+  capture-default flip is blocked on BOTH this fix and #2461.)
 - **TT never advertises async sampled-token readback
   ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)).** The
   async-serving battery FATALs on TT at its anti-vacuous-pass guard
@@ -454,6 +534,20 @@ not a process-global `GraphCapturesCounter`. Tracked on
   `test_qwen3_paged_engine.cpp`. Found during the #1488 re-adjudication after
   the garbled value had been misread as golden-buffer corruption. Fixed by
   [#1508](https://github.com/mudler/vllm.cpp/issues/1508).
+- **Device-PA decode consumes the KV shadow on `device_current` alone
+  ([#2670](https://github.com/mudler/vllm.cpp/issues/2670)).** Latent after
+  #2669's repair removes the one known trigger: the reader-side contract
+  has no proof besides the flag, so any future publisher over a partially
+  correct device block corrupts decode with no error path. Repair
+  direction: a per-block coverage stamp the push records and the reader
+  checks before it skips the upload; mirror upload stays the fallback.
+- **`VT_DUMP_IDS=1` turns the anchor REQUIRE off and the verdict line does
+  not say so ([#2671](https://github.com/mudler/vllm.cpp/issues/2671)).** A
+  dump-mode run prints `16/16 prompts PASS` from the committed goldens
+  alone, which is how a build that reds 14 of 16 prompts outside dump mode
+  looked green on 2026-09-02. Repair direction: mark the verdict
+  `RE-CAPTURE MODE` and report skipped anchors; keep the
+  `qwen3-neartie-gap.py` refresh path working.
 
 The operator must still rerun the 80-token no-hang gate and
 `test_qwen3_paged_engine` on a Blackhole P150. An implementer run is an
@@ -463,6 +557,108 @@ input, not a gate result.
 
 `ACTIVE`. R1-R3b and the R2 on-device `cur_pos` / `update_idxs` advance are
 implemented on this branch, env-gated by `VT_TT_HOST_FREE_DECODE`.
+
+### Repair (2026-09-03): short-chunk device KV push clobber (#2669)
+
+The captured multi-request battery reds at the first cross-request KV block
+boundary. The boundary decode step emits deterministic punctuation garbage
+(the 11/13/264 family) while eager host-free stays green; #1625 carries the
+symptom. Root cause, probed on the P150 with scratch instrumentation that
+never landed:
+
+- `TryDevicePagedPushPair` routes a prefill chunk shorter than
+  `kPagedFillMinTokens` (16) to `TryDevicePagedUpdateBatch`. The batched op
+  treats each chunk token as a separate batch user over a synthetic
+  one-entry page-table stick. All users of one chunk resolve to the same
+  physical block, tt-metal `paged_update_cache` is a page-granular
+  concurrent read-modify-write, so the users clobber each other and the
+  last writer wins. The device block keeps the previous request's rows
+  0..3, patches only the final row, and leaves the rest stale, while the
+  push site publishes `device_current = true`.
+- The boundary decode step reads `sk.device_current` and consumes the
+  device shadow without a re-upload, so device-PA attends the dead
+  request's KV rows. Request 0 is always clean: its prefill push declines
+  (`can_update` is false with no shadow yet), so the mirror re-uploads.
+
+Evidence: the device-vs-mirror diff at the boundary shows K maxdiff 54-342
+with rows 0..3 byte-identical to the dead request's values and rows 5-6
+stale nonzero against a zeroed mirror; the virgin-step control diff is
+0.000000. The flag history shows five mirror patches then `prefillpush OK
+B=5` per layer on the second request's prefill. The fix probe (fill at any
+T, threshold 16 to 1) moves the failure from prompt[1] tok=1 hard garbage
+to tok=14 deterministic near-tie.
+
+Re-measured at tip `4d10c8acc` (2026-09-03, uninstrumented): the DEFAULT
+eager arm stays anchor-exact — the SACRED battery is 16/16 PASS with the
+committed goldens, so the pair stays valid and no default-arm refresh rides
+this repair. The CAPTURED arm reds the anchor REQUIRE at prompt[1] tok=1
+(engine 30, committed 572); which wrong token appears moves run to run
+(374 in the probe session, 30 here), which is the race, not a different
+defect. The trigger is capture-only: the eager arm never consumes the
+stale shadow.
+
+Plan, in order, one pull request: (1) commit this spec; (2) a red-first
+focused gate over prompts 0 and 1 that keeps the anchor-exact REQUIRE and
+runs under `VT_TT_DECODE_CAPTURE=1` — it reds at prompt[1] tok=1 before the
+repair; (3) the repair: route a sequential fill-eligible chunk to
+`TryDevicePagedFill` at any T, or refuse the batched-update path when two
+chunk users share one physical block; (4) the full gate on the P150: the
+focused gate, the SACRED default-arm battery, and the captured battery;
+(5) pin the captured arm with its own committed golden pair
+(`our_ids_tenstorrent_capture.npy` / `neartie_gap_mnats_tenstorrent_capture.npy`),
+dumped from the repaired tree and teacher-forced with the #1488 method
+(`qwen3-neartie-gap-transformers.py`, transformers 4.57.1 CPU) — the same
+method that refreshed the default pair at #1630. Post-repair the captured
+sequence resolves one near-tie differently from the eager anchor (probe:
+tok=14), so the captured arm cannot share the eager pair. (6) the records:
+#2669 closes on merge, #2670 and #2671 ride as Owed. #1625's
+capture-default flip stays blocked on this repair.
+
+LANDED 2026-09-03 (commit `7ee345ef5`, repair = threshold 16 to 1 in
+`TryDevicePagedPushPair`/`TryDevicePagedPush`; #2669 closes on merge).
+Post-repair the captured arm's first divergences from the eager anchor sit
+at p1 t14, p2 t1, p6 t12, p7 t2, p9 t2, p10 t11, p12 t13 and p13 t7, each
+followed by that prompt's own continuation; the boundary cells themselves
+(p1 t0..t4) match eager exactly, so the clobber is gone, and the residual
+is the captured-vs-eager near-tie class #1476 recorded. The captured pair
+was dumped from the repaired tree byte-identical across two runs with a
+card reset between, then teacher-forced: 18 of 256 cells carry any gap, max
+500 mnats, zero cells outside top-K, 238 of 256 cells the teacher's exact
+argmax on our prefix. Teacher environment drifted from the #1488 record:
+transformers 5.16.1, torch 2.13.0+cu130 on CPU (the 4.57.1 environment no
+longer exists on this host); the oracle registry's sub-ULP caveat cannot
+reach this pair because the instrument's quantization error sits two orders
+below every certified gap. Green on the P150, one card reset per run: eager
+battery 16/16 anchor-exact unchanged (max 0.375 nats, rc 0), captured
+battery 16/16 against the new pair (max 0.5 nats, rc 0), focused capture
+gate 2/2 (rc 0), `VT_TT_RECAPTURE_EVERY=8` captured battery 16/16 (rc 0,
+the re-capture lane tolerates the fill path), `test_tenstorrent_backend`
+52/52 cases 5983/5983 assertions. A fresh reviewer returned PASS on the
+review range `77224426e..7ee345ef5`: reverting the threshold to 16 reds the
+focused capture gate at prompt[1] tok=1 (engine 11 against the committed
+572; the wrong token differs from the spec's 30/374, consistent with the
+race), corrupting a captured-pair cell reds it again naming the corrupt
+value, the eager SACRED battery stays 16/16 green (max 0.375 nats), and the
+reachability mutation, `can_update=false` in `NotePagedKvRacWrites` so both
+device push call sites die, greens as expected, which pins the M1 red to
+the production push site. Statically both push functions have exactly one
+caller each, both in `NotePagedKvRacWrites`
+(tenstorrent_ops.cpp:1175,1187), whose only caller is the production
+kReshapeAndCache path (tenstorrent_ops.cpp:3105); no test-only path exists.
+Mutation logs live in `/tmp/review-2669-logs/` on the gate host.
+
+The #2566 rate figure survives the repair, re-taken on this head
+(2026-09-03, P150, the #2566 recipe: order-alternated triples,
+`--repeat 5` with leg 1 discarded, warm medians over 12 legs, one flock
+per batch, card reset first, harness `~/hf-r2672-gate3.sh`, raw logs
+`~/hf-r2672-t{1,2,3}{A,B,C}.{out,err}`): captured 28.61 tok/s against the
+27.47 pre-repair record, default 12.21 against 12.90, opt-out 15.61
+against 17.80 - that arm's band is the unclosed inversion residual the
+#2566 entry already records, and the R5-era 5.34 figure bounced to 17.80
+before it. Capture over default 2.34x, over opt-out 1.83x. Zero fatals,
+zero hangs, 470 replays on every capture leg. The repair costs the
+captured arm nothing, and the payoff figure the capture-default flip
+stands on is measured on the repaired tree.
 
 The operator gate (2026-08-20, P150, `206afb63`) found
 [#1476](https://github.com/mudler/vllm.cpp/issues/1476): captured replay went
@@ -545,3 +741,279 @@ teardown class after the doctest SUCCESS); re-adjudication max gaps 375
 opt-out; default leg 10.94/10.95/11.06 tok/s vs the 5.34 opt-out (2.1x,
 same-binary A/B). The async-serving battery outcome is pre-existing and
 filed (#1627, under `## Owed`). Pending: fresh review, PR, operator merge.
+
+**R4-at-tip wave opened (2026-08-31, worktree
+`row/BACKEND-TENSTORRENT-HOST-FREE-FORWARD` @ main `6a544bdb8`).** Operator
+gate rerun on the merged tip, all under one `flock $HOME/gpu.lock`:
+
+- Golden gate, default arm, this P150: PASS — 16/16 prompts, 125/125
+  assertions, max gap 0.375 nats, 0 forward-divergent; device-op proof
+  0 declines (`kPagedAttention selections=7168`).
+- Same-binary A/B (3 order-alternated pairs, `--repeat 5`, discard run 1,
+  warm medians): default 12.92 vs `VT_TT_HOST_FREE_DECODE=0` 17.78 tok/s —
+  the inversion widened to 1.376x after W2c/#1476 (1.300 on 2026-08-30).
+- Capture never armed in any default-arm leg. Root-cause chain, measured
+  with `VT_TT_TRACE_DEBUG=1`: `VT_TT_DECODE_CAPTURE` unset keeps
+  `support_static_graph_mode()` false (`platforms/tenstorrent.cpp:85-88`),
+  so `Qwen3DenseDecodeGraph::Step` never runs (`qwen3.cpp:1120`), so the
+  warm hooks (`qwen3.cpp:813-864`) never prime the paged-KV shadows, so
+  every decode's `TryPagedAttentionDeviceDecode` shadow-misses and the
+  `EnsurePagedKvTtnn` VT_CHECK throws on the strided `KvSlice` view
+  (`tenstorrent_ops.cpp:1179`) — 868 of 896 decode calls — and the host
+  oracle runs. The default TT arm in the CLI has never exercised the device
+  host-free path; both A/B arms are host-PA arms.
+- The opt-out arm is measurably NOT faster because of PA: under
+  `VT_TT_HOST_FREE_DECODE=0` the identical probe shows the identical regime
+  (896 attempts / 868 failures / 0 device RAC / 0 warm hooks). The
+  failed-attempt-overhead candidate is REJECTED (see `## Owed`).
+- Capture-armed (`VT_TT_DECODE_CAPTURE=1`): warm hooks run, PA device
+  failures drop to 0, capture arms (1 captured size) — and the FIRST
+  capture dies: `TT_FATAL mesh_workload.cpp:153 !is_capturing_trace`.
+  `EmbedDeviceIdsInto`'s `ttnn::copy(dev_out, *s->device)`
+  (`tenstorrent_ops.cpp:5705`) is capture-only — the eager step's
+  `EmbedInto` never runs it — so its program is cold mid-capture. The copy
+  is unchanged since `79ff8f310`; the R5-era 27.1 tok/s single-request arm
+  predates the QWEN35-wave edits to `tenstorrent_ops.cpp` (#1486
+  cache-lifetime conversions, GDN staging), one of which dropped whatever
+  accidentally warmed that program. The archaeology is not owed; the fix
+  makes the invariant explicit.
+- **The inversion is model-specific, not backend-wide (Mistral-7B A/B,
+  same night, same recipe: 3 order-alternated pairs, `--repeat 5`,
+  discard run 1, warm medians).** Mistral-7B-v0.3 on this P150: default
+  host-free eager 11.51 tok/s vs opt-out 5.91 — the DEFAULT wins ~1.95x,
+  the opposite of Qwen3-0.6B's 1.38x the other way. Against the R5-era
+  record the default barely moved (12.2-13.8 then) while the opt-out more
+  than doubled (2.35 then). The owed mechanism question therefore narrows:
+  whatever makes the hybrid arm faster applies to Qwen3-0.6B and not to
+  Mistral-7B; a single backend-wide explanation is ruled out by
+  measurement.
+- **The attempt-overhead mechanism is REJECTED on both models; the
+  mechanism lives in the arms' successful paths (regime probe, 32 tokens,
+  `VT_TT_TRACE_DEBUG=1`).** Per decode step the two arms' FAILED device
+  work is identical on both models — Qwen3-0.6B: 896/896 PA attempts fail
+  on both arms, 896 device-RAC attempts on the default arm with 0
+  successes; Mistral-7B: 1024/1024 PA failures on both arms, 1024
+  default-arm RAC attempts with 0 successes, 0 warm hooks anywhere. The
+  default arm therefore does strictly MORE device work than the opt-out
+  on both models, yet loses on 0.6B and wins ~2x on 7B. What differs is
+  the work that SUCCEEDS: the host-free arm's device-resident R1 ops
+  (RmsNorm/RoPE) succeed on both models and scale with hidden size
+  (Mistral 4096 vs Qwen3 1024), while both arms run the same host PA
+  oracle and host RAC fallback. Remaining attribution — how much of each
+  arm's wall clock is the device R1 ops vs the host fallbacks — needs
+  per-op timing and is future work, not this wave.
+
+**Wave executed and green (2026-09-01, this branch, P150, all under one
+`flock $HOME/gpu.lock`).** Both capture fatals are fixed and the
+capture-armed arm is the fastest measured arm at tip.
+
+- Fix 1 (embed, `qwen3.cpp` warm branch): the capture step now runs the
+  exact captured embed segment once OUTSIDE the scope before opening it —
+  the `_dummy_run` mirror. `EmbedDeviceIdsInto`'s hold semantics make the
+  second run safe (the hold replaces; nothing reads the dummy output).
+  This clears the first fatal (cold program mid-capture,
+  `mesh_workload.cpp:153`).
+- Fix 2 (fresh-slot zero, `tenstorrent_ops.cpp`
+  `MemsetDeviceIfCapture`): `res.Zero` at the top of the captured layer
+  region left the fresh slot host-only — the no-shadow arm refused,
+  `MemsetDeviceFill` refuses under capture — so layer-0
+  `EnsureDevice2D(*residual)` restaged from the recycled slot's stale
+  persistent `[1,1024]` buffer: an enqueue_write, fatal at
+  `fd_mesh_command_queue.cpp:760`. The no-shadow arm now serves the zero
+  ON-DEVICE, capture-only: in-place into the slot's persistent buffer
+  when the `[1, bytes/2]` geometry matches (stable device address, so the
+  captured zero-copy replays against the same buffer), else a fresh
+  `ttnn::empty` installed as persistent (W5). The zero tensor and the
+  copy program are already warm: the cold step's `EnsureDevice2D` restage
+  primes the zero at the exact spec (`ZeroCachePrime`) and the eager copy
+  lane warms the program. bf16-only, the W7 reservation arm's polarity.
+  CAPTURE-ONLY is load-bearing: the first attempt served eager fresh-slot
+  zeros too, guessed bf16 from a byte size, and the f32 KV masters share
+  those pool blocks — `EnsureHost` then aborted on a `[1,16777216]` bf16
+  shadow against a `[256,32,8,128]` f32 request. An eager fresh-slot
+  zero keeps the host fallback; bytes do not name a dtype.
+- Focused gate (capture-armed 80-token CLI): mechanics GREEN — rc 0, 0
+  fatals, 78 replays — but the answer was deterministic gibberish, not
+  coherent. The "coherent" claim first recorded here was a measurement
+  error (the gate's word-count criterion counted tt-metal log lines);
+  corrected 2026-09-01 after the fresh reviewer's rerun flagged it, and
+  root-caused as [#2461](https://github.com/mudler/vllm.cpp/issues/2461)
+  (cold-step defect, pre-existing, replay-exact — only step 1 diverges).
+  What survives of the original audit: `CaptureDecodePosAdvance` records
+  inside the trace with no fatal, and replays are token-exact given their
+  history (golden battery prompts 1-15 exact); no warm needed.
+- Same-binary A/B/C (Qwen3-0.6B, 3 order-alternated triples,
+  `--repeat 5`, discard run 1, warm medians): default 12.95 / opt-out
+  17.68 / CAPTURED 27.57 tok/s. Captured replay is 2.13x the default and
+  1.56x the opt-out; the R5-era 27.1 reproduces at tip. Every capture
+  leg: replays=474, 0 fatals, rc 0, repeat-5 same-prompt multi-generate
+  safe. CORRECTNESS CAVEAT (2026-09-01, #2461): the capture legs' output
+  text was the deterministic cold-step corruption, so these ratios stand
+  as measurements of the replay MACHINERY's speed only — not a capability
+  verdict. Re-measuring a token-clean captured arm is part of #2461's
+  repair gate.
+- The verdict replicates at Qwen3-4B (same recipe, 2 triples): default
+  9.25 / opt-out 8.86 / CAPTURED 13.90 tok/s — 1.50x / 1.57x, replays=474
+  and 0 fatals on every leg. Captured replay dominates at both sizes.
+  The default-vs-opt-out inversion narrows with hidden size exactly as
+  the successful-path attribution predicts (0.6B opt-out wins 1.37x;
+  4B default wins 1.04x; Mistral-7B default wins 1.95x) — but with the
+  captured arm measured, the inversion no longer decides the flip: the
+  captured arm beats BOTH eager arms at every measured size.
+- Default arm untouched by the fixes: golden re-run 16/16, 125/125 PASS
+  (the embed dummy also runs in the default arm's inert-scope warm step;
+  no regression, same 0.375-nat pair).
+- [#1625](https://github.com/mudler/vllm.cpp/issues/1625) boundary
+  sharpened: same-prompt `--repeat 2` capture is clean (45 replays, one
+  capture); the 16-prompt battery with capture armed spins in pure
+  userspace after ONE capture (thread state R, stime=0, ~41 CPU-min;
+  ptrace is unavailable on this host) — a cross-prompt KV-geometry
+  re-warm under a live trace, tt-metal spin rather than the R5-era futex
+  sleep. See `## Owed`.
+- BLOCKED: the capture-armed golden battery RUNS (31/32 exact; the one
+  failure is #2461's cold-step token) and the capture-arm near-tie pair
+  stays blocked on #1625 (the `VT_DUMP_IDS` dump is 16 different prompts
+  and spins). The wave's gate line "capture completes (no TT_FATAL)" is
+  MET; "answer coherent vs the default arm under the near-tie rules" is
+  NOT met — #2461 owns it, and with it the capture-default flip decision
+  (blocked on #2461 + #1625).
+
+**Wave scope (spec-first, one PR per the recorded row preference).** The R4
+gate line "capture completes (no TT_FATAL)" is still unmet at tip; meet it.
+On the capture step (`s.warm`), warm every capture-only segment before
+`GraphCaptureScope` — the `_dummy_run` mirror: run `EmbedDeviceIdsInto`
+once OUTSIDE the scope before the captured call, and audit the remaining
+capture-only calls (`CaptureDecodePosAdvance`, captured RAC copies) the
+same way, iterating until the capture-armed CLI completes 80 tokens with
+replays > 0. Focused gate: capture-armed 80-token CLI run — no TT_FATAL,
+`[Qwen3DenseDecodeGraph]` replay count > 0, answer coherent vs the default
+arm under the near-tie rules. Then the real measurement: same-binary A/B,
+captured replay vs hybrid opt-out. R5-era measured the captured arm at
+27.1 tok/s against a 5.34 opt-out; the opt-out is now 17.8-18.6, so the
+bar is "beat ~18.5". Only then do #1625 (captured multi-request hang) and
+the capture-default flip decision come back within reach.
+- **#2461 REPAIRED in this change (2026-09-01): the cold-step defect was a
+  stride-fabricated KV shadow descriptor, not driver attn metadata.**
+  `WarmPagedKvShadow` (`src/vt/tenstorrent/tenstorrent_ops.cpp:6278`)
+  described the driver's flash-KV unbind(1) slice — a rank-4 view of the
+  combined `[nb,2,bs,nkv,d]` store whose true block stride is
+  `2*bs*nkv*d` (`dense_attn_block.h` `KvSlice`; observed shape
+  `[256,32,8,128]`, stride `[65536,1024,128,1]`, `IsContiguous()==false`)
+  — as `Tensor::Contiguous`, so `NhdToTtnnLayoutPrefix`
+  (`tenstorrent_ops.cpp:834`) indexed the shadow prefix upload with dense
+  strides: block `b` read `b*bs*nkv*d` elements from the view base, one
+  slab early inside the combined buffer. For every physical block >= 1
+  the K shadow received the previous block's V slab (zeros at prefill
+  positions) and the V shadow the next block's K slab, so the cold step
+  attended over zeros. Block 0 was accidentally safe because offset 0 is
+  each view's own base; leg A never stages a shadow; and replays replayed
+  the same corrupted shadow self-consistently — hence leg A coherence,
+  token-exact replays (battery prompts 1-15), and the "consistent after
+  step 1" shape. The fix stages the descriptor with the view's real
+  strides and threads an `accept_unbind_view` flag (default false) through
+  `EnsurePagedKvTtnn` → `NhdToTtnnLayoutPrefix`, admitting the view only on
+  the warm/capture staging path; every existing caller keeps strict
+  contiguity and the eager path is untouched.
+  Red→green at this HEAD (Qwen3-0.6B, logs `$HOME/hf-repair-*`): RED —
+  capture arm cold argmax 48755 (top-2 gap 1.69, word salad), default arm
+  3364 and coherent, capture-armed golden battery 1 failed of 32
+  assertions at prompt[0] tok=1. GREEN — capture arm cold argmax 3364
+  (top-2 gap 1.125; default 3364, gap 1.375), text coherent;
+  capture-armed battery 1 failed of 37 assertions, prompt[0] now exact and
+  the single failure moved to prompt[1] tok=1 (engine 374 vs committed
+  anchor 572 — the documented residual); default golden battery 125/125;
+  `test_tenstorrent_backend` rc 0. Per-step adjudication
+  (`VT_TT_DUMP_KV`, 12-token CLI pair, same binary): prefill and the cold
+  step argmax-exact; the first divergence is step 2, capture top-2 gap
+  0.375 nats — inside the near-tie band (`qwen3-neartie-gap.py`, ≤0.5) —
+  after which both arms greedy-decode their own coherent prefixes.
+  Token-clean A/B/C re-measurement (`hf-gate3.sh`, same binary, 3
+  order-alternated triples, `--repeat 5`, cold repeat discarded, warm
+  medians): default 12.90 / opt-out 17.80 / CAPTURED 27.47 tok/s — 2.13x
+  the default, 1.54x the opt-out; replays=474 and 0 fatals on every leg,
+  and every capture leg's output verified coherent this time. The captured
+  replay ratios are now a capability verdict, not only a machinery
+  measurement; the CORRECTNESS CAVEAT on the earlier 27.57 figure is
+  superseded by this re-measurement.
+  RESIDUAL, owned separately: the capture-armed 16-prompt battery still
+  fails exactly one assertion, now at prompt[1] tok=1 — cross-request
+  persistent shadow state, a different defect from the slab swap (prompt[1]
+  passes in isolation). The battery's fatal REQUIRE stops the case at the
+  first drift, so this run proves prompt[0] exact and the move of the
+  failure cell; the scratch clone's verification covered prompts 1-15.
+  Filed as [#2469](https://github.com/mudler/vllm.cpp/issues/2469); REPAIR
+  LANDED in this change (2026-09-01) — the `## Owed` #2469 entry and the
+  dated `## Now` repair block below carry the evidence.
+
+**#2469 repair landed (2026-09-01, this branch, P150, all runs under
+`flock $HOME/gpu.lock`).** The filed cross-request residual — a recycled
+same-size slot replaying the previous request's final decode position — is
+fixed at its three consumed surfaces.
+
+- Root cause: `DecodePosCache()[num_reqs].cur_pos` is a persistent device
+  tensor aliased into `RacIdxEntry.update_idxs` and `PaMetaEntry.cur_pos`
+  and only `WarmDecodePos`'s seed branch re-seeds it; under capture the
+  replay regime early-returns on `captured()` and `WarmPaMeta`'s
+  `r2_steady` is process-global, so a recycled size slot kept the dead
+  request's final position: PA attended the dead request's decode KV rows,
+  RAC wrote at the stale virtual position. The investigation session's
+  tokenizer decode showed the previous prompt's tokens (" Paris"/" France"/"
+  is") from prompt[1] tok=1; the kept red artifacts document the failure as
+  anchor drift with ids 374 (cap.out), 11 and 13 (diag/boundary).
+- The repair: `Qwen3DenseDecodeGraph` size slots carry `expected_cur_pos`
+  (seeded `seq_lens-1` on seeding steps, +1 per completed replay/capture
+  launch) and `Step` gates `WarmDecodePos`'s replay regime on the
+  continuation predicate `seq_lens[0]-1 == expected_cur_pos`; a same-size
+  request boundary (captured && !continuation) routes through the proven
+  #1476 re-capture lane — Reset the trace, run this step eagerly against
+  the freshly seeded position, re-capture next step. On the device side,
+  `DecodePosEntry.host_val` mirrors what `cur_pos` holds and `WarmPaMeta`
+  echoes it into `cp_host`, repairing a vacuous guard: the unconditional
+  `e.cp_host = cpos` made `TryPagedAttentionDeviceDecode`'s
+  `cp_host[0] == seq_lens[0]-1` check compare the host against itself, so
+  it could never fire on a stale device tensor. `plus_one_scratch` is
+  allocated once per entry and reused, so the boundary seed performs no
+  fresh device allocation under a live trace (the allocator's
+  corruption-under-trace warning).
+- Seed-only was tried and REJECTED: with the boundary seed verified
+  correct on device, the first post-boundary replay still drifted to a
+  near-tie wrong token (battery ids 11 and 13 across builds vs 374
+  unfixed; id 264 appears in no kept artifact), so the boundary re-capture
+  lane is required, not optional.
+- Green on the stripped build (this session's diagnostic probes — KV row
+  checksums, cur_pos/page-table/id readbacks — were investigation
+  instruments and do not ride in the fix, per session precedent):
+  capture-armed golden battery 125/125 assertions, 16/16 prompts PASS,
+  max gap 0.375 nats @ prompt[1] tok=1 — inside the ≤0.5 near-tie band
+  this row already adjudicates — 0 forward-divergent, `kPagedAttention
+  selections=1344` with 0 declines; default arm unchanged (125/125,
+  16/16, same max gap); captured CLI coherent and byte-identical across
+  three runs including one after a `tt-smi -r 0` reset, and the
+  default-arm CLI is coherent with a first-token near-tie flip — no
+  stale-prompt tokens anywhere.
+- The near-tie residual at prompt[1] tok=1 stays inside the row's ≤0.5
+  band adjudication (max gap 0.375 nats), not a strict-token failure; the
+  cross-request replay of the previous prompt's tokens — the actual #2469
+  defect — is gone.
+- **Token-clean at Qwen3-4B ([#2566](https://github.com/mudler/vllm.cpp/issues/2566);
+  `hf-abc4b.sh`, 2026-09-01, 2 order-alternated triples at the repaired
+  head `081efabc7`, same recipe: `--repeat 5`, discard run 1, warm
+  medians): default 9.25 / opt-out 8.89 / CAPTURED 13.84 tok/s — 1.50x the
+  default, 1.56x the opt-out; replays=474 and 0 fatals on every leg, and
+  the capture legs are coherent and deterministic (the pre-repair 4B
+  capture legs were the #2461 cold-step gibberish). The CORRECTNESS CAVEAT
+  on the earlier 13.90 machinery-only figure is superseded by this
+  re-measurement; captured replay dominates both eager arms at 0.6B and 4B
+  on token-clean evidence.
+- **Token-clean at Mistral-7B-v0.3 ([#2566](https://github.com/mudler/vllm.cpp/issues/2566);
+  `hf-mist-abc.sh`, 2026-09-01, 2 order-alternated triples at
+  `081efabc7`, `--max-tokens 64 --repeat 5`, `tt-smi -r 0` first, warm
+  medians): default 11.51 / opt-out 5.93 / CAPTURED 14.23 tok/s — 1.24x
+  the default, 2.40x the opt-out; 314 replays, 0 fatals, rc 0 on both
+  triples, and the capture arm's output is TOKEN-IDENTICAL to the default
+  arm's in both triples (the A-vs-B text divergence is the known
+  eager-kernel near-tie situation). This is the model with the sharpest
+  default-vs-opt-out inversion (the default wins ~1.95x), and the captured
+  arm beats both — captured replay's superiority over eager now holds at
+  all three measured sizes on token-clean legs. The per-model record entry
+  is in `.agents/benchmark-record.md`.

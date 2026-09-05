@@ -2336,6 +2336,118 @@ TEST_CASE("op parity vs upstream goldens (CPU)") {
   CHECK(non_op >= 1);
 }
 
+// KERNEL-GDN-CHUNKED-MIRROR G1 (.agents/specs/gdn-chunked-mirror.md, #2612).
+//
+// gdn_prefill_bf16_realdims is a dump of vLLM's REAL Triton
+// chunk_gated_delta_rule, and it is the only artifact in this tree that can say
+// whether a chunked port is correct -- a chunked arm cannot check itself
+// against another chunked arm. The pass above replays it at the manifest's
+// atol=rtol=5e-3, a tolerance loosened in M0.7 precisely to admit the
+// SEQUENTIAL recurrence across the 2.29e-04 chunk-vs-sequential gap the
+// manifest itself records. That tolerance therefore cannot distinguish the two
+// algorithms, and it stays where it is: this case is the tight bar beside it.
+//
+// THE BAR IS DERIVED, NOT CHOSEN. A numpy replica carrying upstream's bf16
+// intermediate placement and nothing else lands 6.103516e-05 on `out` and
+// 5.059987e-04 on `state` against this dump
+// (docs/bench-evidence/gdn-chunked-decomposition-20260902/, run_golden.py arm
+// `chunk_up`). 1.5e-04 / 1.5e-03 is that residual with 2.46x / 2.96x headroom.
+// Three arms fail it, and each failure is a defect this row exists to prevent:
+//
+//   arm                                      out           state
+//   chunked, upstream bf16 placement    6.103516e-05  5.059987e-04   <- passes
+//   chunked, f32 intermediates          2.441406e-04  2.248646e-03   <- R1
+//   chunked, f32 output store           1.911595e-04  5.059987e-04   <- wide store
+//   sequential (origin/main's CPU arm)  2.286426e-04  2.248661e-03   <- red-before
+//
+// SINGLE-CHUNK-DERIVED. The golden is two sequences of 20 and 12 tokens at
+// BT=64, so it is one chunk per sequence and NO cross-chunk state carry is
+// gated against a real kernel dump anywhere in this tree. A multi-chunk oracle
+// dump is owed (spec `## Owed`); until it exists a T>64 failure on a port that
+// passes the dtype gate is the 6.1e-05 hypothesis, not automatically a defect,
+// and the trigger is to dump the golden rather than to loosen this bar.
+TEST_CASE("gdn chunked CPU prefill meets the tight bar on the real Triton golden") {
+  const fs::path dir = fs::path(PARITY_GOLDENS_DIR) / "gdn_prefill_bf16_realdims";
+  REQUIRE(fs::exists(dir / "manifest.json"));
+  json m = json::parse(std::ifstream(dir / "manifest.json"));
+  // The bar below only means anything against a BF16 dump of the chunked
+  // oracle. Assert the artifact is the one described, rather than trusting the
+  // directory name (an identity assert, not a shape assert).
+  REQUIRE(m["tensors"]["q"]["dtype"].get<std::string>() == "bf16");
+  REQUIRE(m["args"]["q_k_prenormalized"].get<bool>());
+
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q = b.CreateQueue();
+  auto run = [&](const char* flag, double* d_out, double* d_state) {
+    std::optional<ScopedEnv> pin;
+    if (flag != nullptr) pin.emplace("VT_GDN_CHUNKED", flag);
+    auto qi = LoadTensor(dir, m["tensors"]["q"]);
+    auto k = LoadTensor(dir, m["tensors"]["k"]);
+    auto v = LoadTensor(dir, m["tensors"]["v"]);
+    auto g = LoadTensor(dir, m["tensors"]["g"]);
+    auto beta = LoadTensor(dir, m["tensors"]["beta"]);
+    auto st = LoadTensor(dir, m["tensors"]["state_in"]);
+    auto qsl = LoadTensor(dir, m["tensors"]["query_start_loc"]);
+    auto want_out = LoadTensor(dir, m["tensors"]["out"]);
+    auto want_st = LoadTensor(dir, m["tensors"]["state_out"]);
+    DeviceBuf dq(b, q, qi.dtype, ShapeOf(qi.tensor), qi.raw.data.data());
+    DeviceBuf dk(b, q, k.dtype, ShapeOf(k.tensor), k.raw.data.data());
+    DeviceBuf dv(b, q, v.dtype, ShapeOf(v.tensor), v.raw.data.data());
+    DeviceBuf dg(b, q, g.dtype, ShapeOf(g.tensor), g.raw.data.data());
+    DeviceBuf dbeta(b, q, beta.dtype, ShapeOf(beta.tensor), beta.raw.data.data());
+    DeviceBuf dst(b, q, st.dtype, ShapeOf(st.tensor), st.raw.data.data());
+    DeviceBuf dqsl(b, q, qsl.dtype, ShapeOf(qsl.tensor), qsl.raw.data.data());
+    // BF16 OUT, matching the oracle. Upstream allocates `o` with the input's
+    // options (fla.cpp:2158; chunk_o.py:138 stores into a bf16 tensor), and
+    // out.npy is that bf16 result widened to f32 for storage. Handing the
+    // kernel an f32 destination asks it for a value upstream never produces and
+    // costs 1.911595e-04 against this bar purely in the un-taken rounding — so
+    // the buffer dtype is part of what is being replayed, not a detail.
+    DeviceBuf dout(b, q, qi.dtype, ShapeOf(v.tensor));
+    vt::GdnArgs args{m["args"]["scale"].get<float>()};
+    vt::GdnPrefill(q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), dg.tensor(),
+                   dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
+    std::vector<uint8_t> oh, sh;
+    const Tensor got_o = dout.Download(q, oh);
+    const Tensor got_s = dst.Download(q, sh);
+    double mo = 0.0, ms = 0.0;
+    for (int64_t i = 0; i < got_o.Numel(); ++i)
+      mo = std::max(mo, std::abs(static_cast<double>(AsF32(got_o, i)) - AsF32(want_out.tensor, i)));
+    for (int64_t i = 0; i < got_s.Numel(); ++i)
+      ms = std::max(ms, std::abs(static_cast<double>(AsF32(got_s, i)) - AsF32(want_st.tensor, i)));
+    *d_out = mo;
+    *d_state = ms;
+  };
+
+  constexpr double kOutBar = 1.5e-4;
+  constexpr double kStateBar = 1.5e-3;
+
+  // PINNED ON, not left to the ambient environment. This case is named for the
+  // chunked arm and must measure it even when the suite is run with
+  // VT_GDN_CHUNKED=0 exported; that the UNSET default also selects it is
+  // asserted separately, by the predicate case in tests/vt/test_ops_gdn.cpp.
+  double chunked_out = 0.0, chunked_state = 0.0;
+  run("1", &chunked_out, &chunked_state);
+  MESSAGE("chunked CPU arm vs the Triton golden: max|d| out=" << chunked_out
+          << " state=" << chunked_state << " (bar " << kOutBar << " / " << kStateBar << ")");
+  CHECK(chunked_out <= kOutBar);
+  CHECK(chunked_state <= kStateBar);
+
+  // The RED-BEFORE, kept executable rather than described: the sequential arm
+  // -- which is what origin/main runs here, and what VT_GDN_CHUNKED=0 still
+  // selects -- misses this bar. If this half ever passes, the flag stopped
+  // routing and the case above is measuring one arm twice.
+  double seq_out = 0.0, seq_state = 0.0;
+  run("0", &seq_out, &seq_state);
+  MESSAGE("sequential CPU arm vs the same golden: max|d| out=" << seq_out
+          << " state=" << seq_state);
+  CHECK(seq_out > kOutBar);
+  CHECK(seq_state > kStateBar);
+  // ... and it is NEARER the exact recurrence, which is why it is retained.
+  // Do not read the two lines above as "the chunked arm is more accurate".
+  CHECK(chunked_out < seq_out);
+}
+
 TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {
   bool has_cuda = true;
   try {

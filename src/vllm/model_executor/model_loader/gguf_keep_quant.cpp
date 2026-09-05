@@ -7,7 +7,7 @@
 #include <cstring>
 
 #include "vllm/config/weight_residency.h"
-#include "vllm/platforms/interface.h"
+#include "vllm/model_executor/device_placement.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 
@@ -80,14 +80,22 @@ bool EnvOnOr(const char* name, bool fallback) {
 
 }  // namespace
 
-bool GgufQuantComputeAvailable() {
-  return vt::OpRegistered(vt::OpId::kMatmulBTQuant,
-                   vllm::platforms::CurrentPlatform().device_type());
+bool GgufQuantComputeAvailable(vt::DeviceType dev) {
+  return vt::OpRegistered(vt::OpId::kMatmulBTQuant, dev);
 }
 
-bool GgufNvfp4ComputeAvailable() {
-  return vt::OpRegistered(vt::OpId::kMatmulNvfp4,
-                   vllm::platforms::CurrentPlatform().device_type());
+bool GgufNvfp4ComputeAvailable(vt::DeviceType dev) {
+  return vt::OpRegistered(vt::OpId::kMatmulNvfp4, dev);
+}
+
+// #2406. See the header for why `host_repack_active` is a parameter and not a
+// call. The device term is the whole fix: everything else here is the
+// pre-existing expression, so on `dev == kCPU` this is character-for-character
+// the decision the loader made before, and a CPU load is unchanged.
+bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
+                          bool host_repack_active, vt::DeviceType dev) {
+  return keep_quant && !cpu_ref && host_repack_active &&
+         dev == vt::DeviceType::kCPU;
 }
 
 const char* Name(GgufTensorRole role) {
@@ -158,14 +166,34 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
   return true;
 }
 
-// Device gate for the gather arm. Today ONLY the CPU kernel decodes a block
-// table: `EmbeddingKernelCuda` (src/vt/cuda/cuda_ops.cu) still asserts
-// f32/bf16, so on CUDA a kept table would throw at the first forward with the
-// whole model resident. It refuses here instead, and the CUDA arm is owed —
-// which is a real cost, because the device-resident quantized table is exactly
-// the shape llama.cpp's own n-gram path does NOT have.
+// Device gate for the gather arm, asked of the OP/PROVIDER TABLE and not of a
+// hand-kept device list.
+//
+// `vt::Embedding` routes a block-quantized table to `OpId::kEmbeddingQuant`
+// (vt/ops.cpp), so "can this device decode a block row" is exactly "is that op
+// registered here". That is the same shape `GgufQuantComputeAvailable()` above
+// uses for the GEMM arm, and it is the shape this function was owed: naming a
+// device here is what `scripts/check-device-leakage.py` refuses, because the
+// GGUF loader is the device-agnostic layer and a per-device set written into it
+// drifts from the kernels it claims to describe.
+//
+// Registered today by kCPU (cpu_ops.cpp, through `BlockToFloat`) and by the
+// CUDA backend (cuda_ops.cu, through cuda_quant_dequant.cuh) -- named in prose
+// rather than as the enumerator on purpose, because the leakage checker greps
+// the token in comments too, and rightly so: a prose mention is how the next
+// hand-kept device list starts. METAL, VULKAN, ROCM and
+// TENSTORRENT register only `kEmbedding`, whose kernels each assert a float
+// table by name, so they answer false here and keep their pre-existing
+// expand-bf16 residency -- and their gather arms are owed.
+//
+// What this unlocks is not one op. On a device that cannot gather quantized,
+// the Qwen3.8-Flash-Next n-gram table expands from 26.822 GiB of IQ4_NL to
+// 95.368 GiB of bf16, against ~119.6 GiB of usable memory on the one box that
+// fits the model at all -- so the device-resident quantized table is what makes
+// a GPU arm possible, and llama.cpp's own n-gram path does NOT have this shape
+// (#27742 pins that table to the CPU by tensor class).
 bool DeviceQuantGatherSupported(vt::DeviceType dev) {
-  return dev == vt::DeviceType::kCPU;
+  return vt::OpRegistered(vt::OpId::kEmbeddingQuant, dev);
 }
 
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
@@ -181,7 +209,8 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
 GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               bool cpu_ref, GgufTensorRole role,
                               uint32_t ggml_type,
-                              const std::vector<int64_t>& shape) {
+                              const std::vector<int64_t>& shape,
+                              vt::DeviceType dev) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
 
@@ -212,7 +241,6 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
     const int64_t k = KeepQuantKDim(role, shape);
     const bool gather = role == GgufTensorRole::kEmbeddingTable;
     vt::DType dt = vt::DType::kF32;
-    const vt::DeviceType dev = vllm::platforms::CurrentPlatform().device_type();
     // ggml_row_size's precondition: a row is a whole number of blocks. A weight
     // whose K is ragged cannot be dotted OR decoded block-wise, so it expands.
     // The device gate (review #523): a format the RUNNING device cannot execute
@@ -239,13 +267,16 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   return GgufResidency::kExpandBf16;
 }
 
-GgufLoadPolicy GgufLoadPolicy::FromEnv() {
+GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   GgufLoadPolicy p;
+  // FIRST, because every device-dependent flag below reads it. It is the
+  // ENGINE's resolved device, not `CurrentPlatform()`: see the field comment.
+  p.device = dev;
   p.cpu_ref = EnvOn("VT_CPU_REF");
   // CIQ G4 flipped this default: keep-quant is ON wherever the running device
   // can execute the quantized GEMM. VT_GGUF_KEEP_QUANT is the two-way
   // override that survives the flip (=0 is the opt-out the spec promised).
-  p.keep_quant = EnvOnOr("VT_GGUF_KEEP_QUANT", GgufQuantComputeAvailable());
+  p.keep_quant = EnvOnOr("VT_GGUF_KEEP_QUANT", GgufQuantComputeAvailable(dev));
   // The orientation win rides the same availability condition, and the oracle
   // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
   // historical load byte for byte.
@@ -311,14 +342,13 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
   p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk &&
-               DeviceKeepF16Supported(
-                   vllm::platforms::CurrentPlatform().device_type());
+               DeviceKeepF16Supported(dev);
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
   // build keeps expanding, which is correct but unquantized), with
   // VT_GGUF_NVFP4_FP4=0 the same-binary opt-out and the oracle switch forcing it
   // off so VT_CPU_REF=1 still reproduces the historical bf16 load byte for byte.
-  p.nvfp4_fp4 = EnvOnOr("VT_GGUF_NVFP4_FP4", GgufNvfp4ComputeAvailable()) &&
+  p.nvfp4_fp4 = EnvOnOr("VT_GGUF_NVFP4_FP4", GgufNvfp4ComputeAvailable(dev)) &&
                 !p.cpu_ref;
   // Both of vLLM's NVFP4 modes are mirrored; W4A4 is the default because it is
   // what the sibling compressed-tensors container of the same model runs, and
@@ -344,7 +374,15 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // VT_CPU_REF=1 reproduces the historical load. No separate default env read:
   // QuantRepackActive() is the single source of the on/off decision, so the
   // loader and the kernel can never disagree about whether repack is live.
-  p.quant_repack = p.keep_quant && !p.cpu_ref && vt::cpu::QuantRepackActive();
+  //
+  // AND ON THE RESOLVED DEVICE (#2406), which it did not read until now. This
+  // was the ONE device-dependent flag in this function still deciding from a
+  // pure host probe, while its sibling `elem_kn_repack` eight lines below has
+  // always carried the same term for the same reason. `QuantRepackForDevice`
+  // holds the rule; see its header comment for why the ISA probe is passed in
+  // rather than called there.
+  p.quant_repack = QuantRepackForDevice(p.keep_quant, p.cpu_ref,
+                                        vt::cpu::QuantRepackActive(), dev);
   // KERNEL-GEMM-CPU-TILED lever 2, elementwise [N,K] -> [K,N] repack-at-load.
   // OPT-IN ONLY (default false) because the repacked bytes are transposed and
   // only the CPU MatmulBTKernel honours Tensor.elem_kn_repacked today; see the
@@ -352,21 +390,61 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // transform, so VT_CPU_REF=1 still reproduces the historical load.
   // Gated on the CPU platform, not just the env var. Only the CPU
   // MatmulBTKernel honours Tensor::elem_kn_repacked, and a staged device would
-  // upload the transposed bytes and read them as [N,K]. CurrentPlatform() is
-  // the same seam GgufQuantComputeAvailable() above already uses to decide a
-  // load transform, so the policy CAN see this and should not be left to a
-  // runtime backstop alone (ResidentWeight also VT_CHECKs, belt and braces).
+  // upload the transposed bytes and read them as [N,K]. `dev` is the same
+  // seam GgufQuantComputeAvailable(dev) above already uses to decide a load
+  // transform, so the policy CAN see this and should not be left to a runtime
+  // backstop alone (ResidentWeight also VT_CHECKs, belt and braces).
   p.elem_kn_repack = !p.cpu_ref && EnvOnOr("VT_CPU_ELEM_KN_REPACK", false) &&
-                     vllm::platforms::CurrentPlatform().device_type() ==
-                         vt::DeviceType::kCPU;
+                     dev == vt::DeviceType::kCPU;
   return p;
+}
+
+// THE DEVICE A RESIDENCY DECISION IS ACTUALLY ABOUT (#2516).
+//
+// `GgufLoadPolicy::device` is the ENGINE's resolved device, and its own field
+// comment says every device-dependent decision in the struct reads it. Hybrid
+// placement (#2023, #2314) introduced a SECOND, narrower answer for exactly one
+// class of tensor: `ActiveMoePlacementPlan().DeviceForLayer(l)` is the device a
+// layer's routed experts are COMPUTED on, and `RunMoePlaced` hands that device
+// to `MoeBlock`. A keep-quant decision asks "does the device that will execute
+// this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
+// tower it is a question about the placement device, not about the engine.
+//
+// Measured, on GLM-5.3 `UD-IQ1_S` on `strix:gpu0`: `DeviceKeepQuantSupported`
+// serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, so all 228 IQ1_S/IQ3_XXS/IQ2_XXS/
+// IQ4_XS/Q2_K/Q3_K towers routed `kExpandBf16` and `LoadStackedExperts` refused
+// the load by name -- for towers whose bytes never reach the GPU at all (that
+// model reads a tower only through `GlmExpertSlice`, never through
+// `ResidentWeight`) and which the installed plan had already sent to the CPU,
+// whose `vec_dot` table covers every one of those six encodings.
+//
+// THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
+// residency decision resolved against a device other than the one that would
+// read the bytes. The repair is the same shape too -- ask the device that will
+// run it.
+//
+// INERT BY CONSTRUCTION, in four terms, and the last one is the load-bearing
+// one. The plan is a process-global that a load with no placement never writes,
+// and a DEFAULT-CONSTRUCTED plan's `engine_device()` is `kCPU`. Returning its
+// answer unconditionally would therefore route a CUDA load's experts as though
+// they were on the host. So the placed answer is ADOPTED only when the plan
+// actively moves THIS tensor somewhere other than the device the plan itself was
+// resolved for; every other path returns the policy's own device unchanged.
+vt::DeviceType GgufLoadPolicy::ComputeDeviceFor(const std::string& name,
+                                                GgufTensorRole role) const {
+  if (role != GgufTensorRole::kStackedExpertWeight) return device;
+  const MoePlacementPlan& plan = ActiveMoePlacementPlan();
+  if (!plan.PlacesAnything()) return device;
+  const vt::DeviceType placed = plan.DeviceForRoutedExpertTensor(name);
+  if (placed == plan.engine_device()) return device;
+  return placed;
 }
 
 GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
-  const GgufResidency r =
-      RouteGgufTensor(keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role,
-                      tensor.ggml_type, tensor.shape);
+  const GgufResidency r = RouteGgufTensor(
+      keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role, tensor.ggml_type,
+      tensor.shape, ComputeDeviceFor(tensor.name, role));
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -379,8 +457,15 @@ GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy) {
 
 GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
                         GgufTensorRole role) {
+  // THROUGH THE SAME RESOLVER `Route` USES, not a copy of the expression. This
+  // function exists so a caller can ask what the loader WILL do without
+  // notifying the audit, and `GgufExpertTowersReachSlotLane` is one such caller
+  // -- it peeks the very tensors the loader then routes. Two spellings of the
+  // device term is exactly how the bound and the forward come to disagree about
+  // one file, which is the defect #1378 records.
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
-                         policy.cpu_ref, role, tensor.ggml_type, tensor.shape);
+                         policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
+                         policy.ComputeDeviceFor(tensor.name, role));
 }
 
 }  // namespace vllm

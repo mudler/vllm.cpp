@@ -249,6 +249,38 @@ drafter's cache, and the o path. The first is preferable under
 should attempt first, and it must be gated by proving the trunk's own paths are
 byte-unchanged when the new mode is off.
 
+W-5's BOOKKEEPING LANDED. `ProposeToVerifyInputs` maps a drafted block onto the
+shared sampler's inputs: `cu[r+1] - cu[r]` is `1 + length`, and row `cu[r]` is the
+previous token, uncompared. `MarkovDraftLoop` already returns `[seed, drafts...]`
+with the seed first, so the seed IS that row and the block maps across unchanged.
+
+A confidence length of 0 contributes exactly one row rather than none. That is a
+request skipping the round, and it still yields the bonus token; giving it zero
+rows would desynchronise every later offset, which is why the gate checks a
+three-request case with a zero in the middle.
+
+Three mutations run red: the seed row dropped, `cu` stopping accumulating, and a
+zero-length request contributing nothing. NO verify path was added, as recorded
+when the sampler's contract was read.
+
+W-3's ATTENTION HALF LANDED. `DsparkBlockAttentionHost` drives the SAME
+`AttentionBlock` the trunk uses, with `kv_prewritten` on so the rows
+`BlockKvRows` wrote from the projected taps are attended rather than overwritten.
+A DSpark block is a compressor-less V4 layer, so nothing else differs and no
+second attention exists to drift; the guard refuses a layer carrying a compressor
+or an indexer, since `mtp_layer_types` is asserted `"sliding"`
+(`deepseek_v4_mtp.py:61-63`).
+
+Gated on the exact claim: the tap-written rows survive BYTE FOR BYTE, and zeroing
+the cache changes the output, so the block provably READ them rather than
+attending nothing finitely.
+
+**The refusal gate had to be strengthened before it meant anything.** Asserting
+only that a compressor-carrying layer throws passed a mutation that removed the
+guard, because the widened tensor throws an anonymous size error downstream
+regardless. The case now requires the message to NAME the reason, which is the
+whole value the guard adds over the crash it replaces.
+
 W-4b LANDED. `ConfidenceDraftLength` is the draft-length cap:
 `sigmoid(proj(cat(pre_norm_hidden, markov_emb))) >= threshold`, and the length is
 `cumprod(keep).sum()` -- the longest CONTIGUOUS prefix of confident positions, not
@@ -290,6 +322,33 @@ bookkeeping.
 
 W-6. **The device arm**, and only then a throughput claim.
 
+**W-6 IS NOT THE FIRST BLOCKER, and this row was sequenced as if it were**
+([#2442](https://github.com/mudler/vllm.cpp/issues/2442)). Read
+from the source rather than measured, and decisive either way: on the EXL3 arm
+the routed experts CANNOT run on a CUDA queue at all today. `Exl3Linear`
+(`src/vllm/model_executor/models/deepseek_v4.cpp:1295-1302`) refuses a non-CPU
+queue unless `Backend::DeviceMemoryIsHostAddressable()`, because W1b copies each
+TP1-coalesced linear into HOST owner buffers and the kernel would have to
+dereference them. `CudaBackend` answers **false** to that predicate, and does so
+deliberately even on GB10: `cuda_backend.cu:354-391` pins it with a
+`static_assert` and states the reason -- a `cudaMalloc` pointer is not
+host-dereferenceable even where `UnifiedMemory()` is true, and reading the wider
+predicate is what SIGSEGV'd the reference tier (#844, #1435).
+
+So on this arm every one of the 216 routed experts executes on a CPU queue. No
+drafter recovers that: speculation multiplies the step rate by accepted tokens
+per step, and 2.64x a CPU-bound MoE step is still a CPU-bound MoE step. The
+44-47 tok/s target is unreachable until **"Real-checkpoint residency for the
+coalesced tower" (`model-dsv4-exl3.md` W2)** lands and the tower is
+device-resident.
+
+That reorders this row's dependencies without changing its content: W-1 through
+W-5 are the drafter and stay as written, and W-6's device arm is downstream of a
+device-resident tower it does not own. State this before measuring anything,
+because a throughput number taken on a CPU-expert arm would be a measurement of
+the wrong thing, and reading it as "the drafter did not help" is exactly the
+silent-failure mode §4 is built against.
+
 ## 4. Gates
 
 The correctness gate is exact and cheap to state: **drafter-on == drafter-off,
@@ -310,9 +369,15 @@ Throughput is claimed only at W-6, against the target's own recipe: 384k context
 ## 5. Risks
 
 - **The lossless trap above.** Highest risk on the row, because it fails silently.
-- **Residency.** The tower is 90.82 GiB at tp1 and the tail is 8.62 GiB, leaving
-  roughly 19.6 GiB on a 119 GiB GB10 for KV and activations. Not obviously
-  enough at 384k context, and unmeasured.
+- **Residency. MEASURED 2026-08-31, and the planning number was wrong.** The
+  90.82 GiB header figure was a FLOOR, not the residency: the artifact's weights
+  actually materialize to **97.68 GiB** (81.952 GiB coalesced TP1 tower + 15.726
+  GiB carried host tower) at a **peak RSS of 111 GiB**, because the carried FP8
+  half widens at load -- 15.726 GiB against the 8.23 GiB its packed headers hold,
+  roughly double. See `.agents/specs/model-dsv4-exl3.md`. So the headroom on a
+  119 GiB GB10 is about 8 GiB before the 8.62 GiB MTP tail is resident at all,
+  not the ~19.6 GiB this risk was written against. 384k context is not obviously
+  reachable, and W-6 must size against 97.68/111, never against 90.82.
 - **`hf/inference/model.py`**, the reference implementation exllamav3 names, is
   NOT in the EXL3 repo's file list and not in the NAS staging copy. The port
   currently rests on exllamav3's own implementation, which is a re-implementation

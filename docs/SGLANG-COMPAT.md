@@ -17,7 +17,7 @@ grounding live in [`.agents/specs/sglang-enablement.md`](../.agents/specs/sglang
 |---|---|---|---|
 | RadixAttention / prefix caching | `enable_prefix_caching` (tri-state, ABI v7) | model default | none (cache reuse) |
 | LPM cache-aware scheduling | `scheduling_policy = "lpm"` (string, ABI v9) | `fcfs` | none (admission order) |
-| Jump-forward decoding | `enable_jump_forward` (tri-state, ABI v10) | off | none (token-unique subset) |
+| Jump-forward decoding | `enable_jump_forward` (tri-state, ABI v10) | off, **and inert when set** ([§3](#3-jump-forward-decoding)) | none |
 | Custom logits processors | per-request sampling callback (ABI v8) | none | user-defined |
 
 ---
@@ -119,16 +119,31 @@ is a scoped opt-in behavior flag, not a blind mirror (vLLM has no `lpm` policy).
 
 ## 3. Jump-forward decoding
 
-**What it does.** When a structured-output grammar has a **deterministic forced
+**Status: the knob is wired, the decoding is not.** This behavior has **no
+production caller**. The flag, the ABI field, the environment override, the
+grammar forced-token hook and the driver that drains forced tokens all exist and
+have unit tests. No served request reaches the driver, so **setting this today
+changes nothing**. The missing piece is the scheduler splice, which has to
+recompute KV for the tokens the model never ran. The work is
+`ENG-STRUCTURED-OUTPUT`, tracked by
+[issue #2387](https://github.com/mudler/vllm.cpp/issues/2387). Read the rest of
+this section as the shape the knob already has, not as a speed switch you can
+turn on.
+
+**What it will do.** When a structured-output grammar has a **deterministic forced
 continuation**, jump-forward emits it *without* running the model per token, the
-speed win on constrained decoding. vllm.cpp lands the **provably byte-identical
-token-unique subset**: it jumps only while the grammar admits exactly one valid
+speed win on constrained decoding. The scope here is the **provably
+byte-identical token-unique subset**, and the driver that exists implements
+exactly that: it jumps only while the grammar admits exactly one valid
 token at a non-accepting state, so the emitted token is the argmax under any
 sampling params (the constrained sampler masks every other token to `-inf`). The
 general byte-forced-but-multi-tokenizable span (which needs SGLang's re-tokenize +
 boundary rollback) is deliberately not jumped.
 
-**Enable it.**
+**Set it.** The three spellings in this section are accepted and validated
+today, and all three are inert. They stay documented because the knob is a
+published surface, ABI v10 included, and because a caller that sets one now does
+not have to change when the splice lands.
 
 (a) C++ library API, `EngineParams::enable_jump_forward` (tri-state
 `std::optional<bool>`):
@@ -155,17 +170,24 @@ vllm_engine_load(&mp, &engine);
 server --model /models/Qwen3.6-27B --enable-jump-forward   # or --disable-jump-forward
 ```
 
+The server accepts this line and rejects the flag if you pass it twice. It then
+prints no warning and decodes exactly as it would without the flag. See
+[What `--enable-jump-forward` does not do yet](reference/server.md#what---enable-jump-forward-does-not-do-yet).
+
 **Precedence with the env var.** The legacy `VT_ENABLE_JUMP_FORWARD` env var stays
 as an override: **when it is set, it wins** over the C-ABI / C++ / server field
 (`1`/`true`/`on` => on, anything else => off), mirroring the `VT_ASYNC_SCHED`
 convention. When it is unset, the field decides (default off).
 
-**Caveat.** This is the **token-unique subset only**, the general jump-forward
-span is a named residual. The behavior stays **off by default** until the
-production scheduler splice (which must recompute KV for the jumped tokens) lands;
-SGLang itself removed its own jump-forward scheduler wiring upstream. Enabling it
-is output-neutral: the jumped tokens are byte-identical to per-token constrained
-decode.
+**Caveat.** Two limits apply, and the first is the one that matters today. The
+production scheduler splice has not landed, so the knob selects nothing and no
+setting buys the speed win. [`ENVIRONMENT.md`](ENVIRONMENT.md) says the same of
+`VT_ENABLE_JUMP_FORWARD`, which drives only the standalone driver. Second, after
+the splice lands the scope is still the **token-unique subset only**, and the
+general byte-forced-but-multi-tokenizable span stays a named residual. Both
+limits are safe rather than lossy. A jumped token is byte-identical to per-token
+constrained decode, so nothing here can change an output. SGLang removed its own
+jump-forward scheduler wiring upstream.
 
 ---
 
@@ -221,9 +243,13 @@ cache-neutral). Honest per-knob guidance:
   requests share prefixes: it admits cache-hitting requests first, raising the hit
   rate under load. It has no effect without APC (falls back to `fcfs`), and it
   changes admission order, so leave it off for latency-sensitive single-stream use.
-- **Jump-forward decoding**, a niche constrained-decoding speed lever, off by
-  default and conservative (token-unique subset only). Enable only for structured
-  output that matches that pattern; it is not a general throughput knob.
+- **Jump-forward decoding**, a niche constrained-decoding speed lever that is
+  **not connected yet**
+  ([#2387](https://github.com/mudler/vllm.cpp/issues/2387)). No workload gains
+  from setting it, because setting it neither speeds a workload up nor slows one
+  down. After the scheduler splice lands the lever stays conservative
+  (token-unique subset only), worth setting only for structured output that
+  matches that pattern, and never a general throughput knob.
 - **Custom logits processors**, a programmatic per-request hook, not a performance
   knob; use it when you need per-request logit control (a bias, a mask, a forced
   token, a thinking budget).
@@ -237,6 +263,8 @@ shared-prefix benchmark.
 
 Setting **none** of these knobs (all C-ABI fields `0`/`NULL`, no server flags, no
 `VT_ENABLE_JUMP_FORWARD`) yields an engine byte-identical to one built before
-these knobs existed. This is enforced by the CPU exact-gate suites
+these knobs existed. Jump-forward is inert whether it is set or not
+([#2387](https://github.com/mudler/vllm.cpp/issues/2387)), so for that one knob
+this holds in both directions. This is enforced by the CPU exact-gate suites
 (`tests/capi/test_capi.cpp`, `tests/vllm/v1/test_scheduler_lpm.cpp`,
 `tests/vllm/v1/structured_output/test_jump_forward.cpp`).

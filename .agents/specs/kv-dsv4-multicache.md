@@ -453,6 +453,7 @@ and no wave has an owner.
 | **W5** | `Forward`/`ForwardDevice` CONSUME `attn_kv`: the published caches reach the model keyed by layer name and each layer routes to its own, replacing `(void)attn_kv` and the `ModelRegistry::Forward` refusal (its `input.multi_kv` guard, now the free function `MultiKvRefusalApplies` in `model_registry.cpp`; cited as `:430-440` until [#2353](https://github.com/mudler/vllm.cpp/issues/2353), which measured that those lines are `MultiKvCacheIndex::Find` and replaced the range with the symbol). **The cache plumbing only** -- see the scope boundary below, and `### W5 design` for the design ([#2323](https://github.com/mudler/vllm.cpp/issues/2323)). | CPU at synthetic config; **GPU** for the real geometry | L |
 | **W6** | Reachability + ABI: the capability reachable from `ModelRegistry::Forward` and exposed through `include/vllm.h`, so `examples/deepseek_v4_gen` stops including an internal header (`## Our baseline`). | **CPU** | S |
 | **W7** | The oracle gate of `## Gates`. | **GPU**, ≥2 GB10 | M |
+| **W8** | The **fp8_ds_mla STORE and READ**. W1 landed the 584-byte page FORMULA and nothing that writes or reads those bytes, so the model publishes a layout the engine cannot serve and `ApplyCacheDType` refuses the topology on the default path ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)). Slices in `### W8 design`. | **CPU** for the packer, store and read; **GPU** for the kernels and the artifact load | L |
 
 **W5's scope was NARROWED on 2026-08-29, and the boundary is written here
 because two rows would otherwise claim the same code.** Its one-line entry above
@@ -844,6 +845,123 @@ Red-first, on CPU at a synthetic config:
 one arm that caches today is exact only while `seq_len <= index_topk`. W5's own
 gate is a non-DSA config, so the bound does not bind it, and it is named here so
 nobody carries a 512-token result into the DSA row.
+
+### W8 design — the fp8_ds_mla store and read ([#2455](https://github.com/mudler/vllm.cpp/issues/2455))
+
+**The defect, stated as the disagreement it is.** `MakeDeepseekV4KVCache`
+publishes fp8_ds_mla specs at `vt::DType::kI8`, mirroring upstream where
+`use_fp8_ds_mla_layout` is `ClassVar[bool] = True` (`attention.py:140`). W1
+landed the page formula for that layout and **nothing that writes or reads those
+bytes**. The paged store writes f32: `deepseek_v4.cpp` builds `t_kvc`/`t_pe` as
+`kF32` views over `deck` and calls `vt::ConcatAndCacheMla`, which at `head_dim`
+512 is 2048 bytes/token against the 584 the spec declares -- **3.5x**. So
+`ApplyCacheDType` refuses every `MLAAttentionSpec` on the default path, and the
+real artifact loads its weights and dies there.
+
+The `Fp8DsMlaLayout` / `DispEncode` round-trip in the same function is NUMERIC
+and not storage: it encodes and decodes back to floats.
+
+**Two repairs are known-harmful and are named here so they are not rediscovered.**
+Widening `RetypeAttentionSpec`'s guard lets the runner allocate 584-byte pages the
+forward overruns by 3.5x -- masked today only because no production path binds a
+paged cache ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)), i.e. a trap
+set for whoever fixes that. Republishing the topology at f32 reds the three
+assertions that correctly mirror upstream
+(`test_deepseek_v4_scaffold.cpp:253`, `:269`, `:319`) and triples the KV footprint
+at the 384k context the throughput target is measured at.
+
+#### The layout is REGION-SPLIT, which rules out extending the existing op
+
+Upstream's V4 block, at pin `5559679229` (`cache_utils.py:59-66`):
+
+```
+K Cache block layout (block_size=64 tokens):
+- [0, 64*576):              Token data, each token has 448 fp8 + 128 bf16
+- [64*576, 64*576 + 64*8):  Scales, each token has 8 uint8 scales
+- [64*576 + 64*8, block_stride): Padding
+```
+
+A token's scales live in a **different region of the block** from its data, so
+the page cannot be expressed as a rank-3 `(num_blocks, block_size, width)` tensor
+at all. `vt::ConcatAndCacheMla` requires exactly that (`src/vt/ops.cpp`, `rank ==
+3` and `shape[2] == kv_lora_rank + pe_dim`), so **this is a new op over a rank-2
+`[num_blocks, block_bytes]` byte page, not an argument on the existing one.**
+That op's "auto path only, fp8_ds_mla refused" contract stays as it is -- it is
+what stops the f32 write landing in a byte page.
+
+This also reconciles two numbers already in the tree: `page_size_bytes()` is
+37440 (padded to a 576 multiple) while `real_page_size_bytes()` is 37376
+(64 x 584). Both are correct.
+
+#### Slices
+
+1. **Host page packer.** `Fp8DsMlaPageLayout` + `Fp8DsMlaStoreToken` /
+   `Fp8DsMlaLoadToken` beside the existing encode/decode in
+   `deepseek_v4_compressor.{h,cpp}`. Additive; publishes nothing, consumes
+   nothing. This is the piece both the CPU and the CUDA kernels are ports of, so
+   it is written once.
+2. **The store op**, `kConcatAndCacheDsMla`, over a rank-2 byte page. Blast
+   radius is enumerable: the `OpId` enum, the fn typedef, the wrapper, the name
+   table in `op_provider.cpp`, the CPU kernel and registrar in `cpu_cache.cpp`,
+   and the two places enumerating the MLA ops a backend lacks
+   (`platforms/vulkan.cpp` and its assertion in `tests/vt/test_vulkan_backend.cpp`).
+3. **The read.** Port upstream's `_dequantize_and_gather_k_kernel`
+   (`cache_utils.py:228-341`) into a gather filling a float scratch that the
+   existing `vt::MlaDecodeAttention` consumes unchanged. Upstream splits the same
+   way: prefill dequant-gathers (`nvidia/flashmla.py:296`), decode hands the
+   packed page to a vendor kernel (`:219-226`) we do not have. Cost is one
+   scratch of `seq_len * 512 * 4` per layer per step, which is why the native fp8
+   decode is a later wave and not this one.
+   NOTE the asymmetry: the write stores 8 scale bytes, the read consumes 7
+   (`n_quant_blocks=7`, `cache_utils.py:389`). The 8th is written and never read.
+4. **The model bridge.** The paged store picks the packed op when the bound page
+   is `kI8`/fp8_ds_mla and keeps the f32 store otherwise;
+   `ResolveDeepseekV4SwaPages` learns to build a rank-2 byte page for that case.
+5. **CUDA kernels** for 2 and 3, byte-compared against the CPU kernels.
+6. **Only then**, the load path: whether `auto` should resolve to the dtype the
+   model's own factory published. That is a change to RESOLUTION, not a widening
+   of `RetypeAttentionSpec`, and it needs its own issue.
+
+#### Gate
+
+Byte-exactness against a **poison-filled block**, not a tolerance, because this
+is integer packing. Fill a `padded_block_bytes` block with `0xA5`, store T
+tokens, then assert per token that the data region equals
+`Fp8DsMlaEncodeToken(...).nope_fp8` and the rope bit patterns byte for byte, that
+the scale region equals `scale_ue8m0` with an explicit zero pad byte, and **that
+every byte past `block_size*584` is still `0xA5`** -- the assertion a 3.5x
+overrun trips. Plus `slot < 0` leaves the block untouched, and a geometry
+cross-check tying the new arithmetic to `real_page_size_bytes()` /
+`page_size_bytes()` so the two cannot drift.
+
+Mutations that must each red at least one assertion: drop the scale region;
+interleave scales per token instead of after the data region; use a 584-byte
+per-token stride instead of 576 + region; skip the pad byte; store rope as f32;
+drop the `slot < 0` skip; off-by-one in `pos_in_block`. The `slot < 0` one must
+red ONLY the poison case, as an over-fire control.
+
+All host-side and unconditional -- no `HasCuda()` early return in slices 1-3, so
+a no-GPU run reports a real assertion count for every claim.
+
+#### The prize, at the target's own recipe
+
+384k context, 1 sequence. `2048/584 = 3.507x` exactly.
+
+| cache | fp8_ds_mla | f32 |
+|---|---|---|
+| latent, ratio 4, 21 layers | 1.123 GiB | 3.938 GiB |
+| latent, ratio 128, 20 layers | 0.033 GiB | 0.117 GiB |
+| **latent subtotal** | **1.156 GiB** | **4.055 GiB** |
+| SWA, 43 layers, if full-context | 9.196 GiB | 32.250 GiB |
+
+**+2.90 GiB per sequence on the latents alone**, against weights already taking
+81.95 GiB device + 15.73 GiB host.
+
+**Open, and not assumed:** whether the SWA group is window-bounded (128 tokens,
+~4.6 MiB) or full-context (9.2 GiB) in a real allocation. That single question is
+the difference between the last row being negligible and dominant, and no
+production path allocates it today, so it cannot be read off a running engine
+yet.
 
 ### W1 design — allocation metadata ([#1960](https://github.com/mudler/vllm.cpp/issues/1960))
 
@@ -1978,6 +2096,33 @@ config parse and upstream's disagree about the layer partition (that would be a
   row, falls due at **W4** with the `fa_draft`-on-`spec_on()` item above, which
   is the same seam. Tracked under
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
+
+
+- **W8 slices 1, 2 and 3 have landed UNREACHED**
+  ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
+  Slice 1 is the host packer -- `Fp8DsMlaPageLayout` / `MakeFp8DsMlaPageLayout` /
+  `Fp8DsMlaStoreToken` / `Fp8DsMlaLoadToken` in `deepseek_v4_compressor.{h,cpp}`,
+  beside the existing encode/decode pair. Slices 2 and 3 are the two ops built on
+  it: `vt::ConcatAndCacheDsMla` (`OpId::kConcatAndCacheDsMla`) and
+  `vt::DequantAndGatherDsMla` (`OpId::kDequantAndGatherDsMla`), CPU arms in
+  `src/vt/cpu/cpu_cache.cpp`, gated byte-exactly against a poison-filled block in
+  `tests/vt/test_ops_ds_mla_cache.cpp`.
+
+  **Nothing calls either op.** No model edit, no registry, no `include/vllm.h`
+  entry. That is deliberate rather than forgotten: the packer is the single host
+  reference the CUDA kernels of slice 5 are the other port of, so the layout is
+  written and gated once rather than three times, and the ops are the seam slice 4
+  routes onto. A slice that landed the model bridge first would have had nothing
+  byte-comparable to route TO.
+
+  What is owed is the wiring, and it is `### W8 design` slices 4 through 6 in
+  this document: the model bridge in `deepseek_v4.cpp` /
+  `ResolveDeepseekV4SwaPages` that picks the packed store when the bound page is
+  `kI8`/fp8_ds_mla, the CUDA arms, and only then the `ApplyCacheDType` resolution
+  question. Until slice 4 lands, `ApplyCacheDType` still refuses every
+  `MLAAttentionSpec` on the default path and the real artifact still dies there.
+  Owned by this row, tracked under
+  [#2455](https://github.com/mudler/vllm.cpp/issues/2455).
 
 ## Evidence
 

@@ -619,13 +619,31 @@ enum class Ltx2PhaseDenoiser { kGuided, kSimple };
 // `:50-51` says the same of DFR. Stage 1 `kNoAdapters` with stage 2 defaulted is
 // the first; both phases defaulted is the second.
 //
-// TWO ENUMERATORS, and two is the COMPLETE space rather than a boolean wearing
-// an enum's clothes: `Ltx2ResolveLoraReferenceFactors` refuses more than one
-// adapter by name (`ltx2_lora.h:167-172`, mirroring `dubit.py:364-365` and
-// `hdr_ic_lora.py:271-272`), so the powerset of the load's adapters has exactly
-// two members. "Some of them" has no spelling here because it has no spelling
-// anywhere in this engine yet; the day that arity cap lifts, the third value
-// goes here.
+// TWO ENUMERATORS, and the argument that made two COMPLETE has been retired.
+// It used to read: `Ltx2ResolveLoraReferenceFactors` refuses more than one
+// adapter, so the powerset of the load's adapters has exactly two members. Row
+// LTX25-LORA-FUSION lifted that cap, and the argument does not survive it.
+//
+// UPSTREAM DOES SCOPE A PROPER SUBSET, and it takes two adapters to see it.
+// `a2vid_two_stage.py:107` gives stage 1 `loras=tuple(loras)` — the USER
+// adapters — against stage 2's `(*tuple(loras), *tuple(distilled_lora))`
+// (`:114`, taken at `:116`); `ti2vid_two_stages.py:140` against `:151` is the
+// same shape. While the load holds ONE adapter that argument's conclusion still
+// held by accident: that adapter is the `distilled_lora` the recipe demands, so
+// upstream's `tuple(loras)` is EMPTY and `kNoAdapters` is exact. A second
+// adapter makes stage 1's set a proper subset, and this engine cannot say it —
+// it holds one resident DiT, `Ltx2RebindDitLoras` takes a BOOLEAN, and no load
+// extra says which of the N is the distilled one.
+//
+// SO THE LOAD REFUSES THAT COMBINATION rather than this enum growing a third
+// value that nothing could execute. `ltx2_video.cpp` refuses N > 1 adapters on
+// any recipe carrying a `kNoAdapters` phase, by name, and the row's spec lists
+// the arm under `## Owed`. `dfr_pipeline.py:212`'s `(*user_loras,
+// *distilled_lora)` on the one stage both phases share is unaffected, and it is
+// the composition N-adapter fusion was lifted for.
+//
+// What `ti2vid_two_stages_hq.py:154` against `:165` varies per stage is the
+// STRENGTH and not the membership, and that is #1144 below.
 //
 // AND UPSTREAM HOLDS ONE TRANSFORMER, not two. Both `from_checkpoint` calls name
 // the same `model_paths.transformer()` (`a2vid_two_stage.py:104` and `:116`,
@@ -659,7 +677,7 @@ enum class Ltx2PhaseLoraScope {
 // WHICH token count the sigma SHIFT is fitted on, for a phase whose schedule is
 // derived rather than frozen.
 //
-// `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+// `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
 // `tokens = math.prod(latent.shape[2:]) if latent is not None else
 // default_number_of_tokens`. So upstream selects between two anchors by passing
 // a latent or not, and `default_number_of_tokens` is `MAX_SHIFT_ANCHOR` = 4096
@@ -671,37 +689,51 @@ enum class Ltx2PhaseLoraScope {
 //
 //   ti2vid_one_stage.py:207      no latent      our `one_stage` x4
 //   t2a_one_stage.py:141         no latent      our `t2a_one_stage`
-//   retake.py:287                no latent      our `retake`, non-distilled arm
+//   retake.py:287                no latent      upstream's NON-DISTILLED arm,
+//                                               which this engine does not port
 //   a2vid_two_stage.py:226       no latent      our `a2vid_two_stage` stage 1
 //   ti2vid_two_stages.py:244     no latent      our `ti2vid_two_stage` stage 1
 //   keyframe_interpolation.py:200 no latent     our `keyframe_interpolation` stage 1
 //   ti2vid_two_stages_hq.py:267  latent=empty_latent   our `res2s_two_stage`
 //
-// So the LATENT-DERIVED anchor is upstream's exception, not its rule — which is
-// the opposite of how this engine has always behaved, since `ltx2_video.cpp`
-// passes `target_tokens` on every phase. That divergence is
-// https://github.com/mudler/vllm.cpp/issues/1150 and it is REAL rather than a
-// rounding: at the recipe default geometry the target latent is 6144 tokens,
-// giving a shift of 2.78 against upstream's 2.05, so every sigma in the
-// schedule moves while the frame count, the shapes and the sample rate do not.
+// So the LATENT-DERIVED anchor is upstream's exception, not its rule.
 //
-// THE DEFAULT IS TODAY'S BEHAVIOUR AND NOT UPSTREAM'S MAJORITY, deliberately.
-// Flipping it would re-sample `one_stage` at four version keys,
-// `a2vid_two_stage` stage 1 and `retake`, all shipped and gated, and rewrite
-// their goldens — on a finding made inside a row scoped to add one recipe. #1150
-// owns that flip and this enum is the seam it uses. The preserving default also
-// cannot fail SILENTLY: an arm moves only where a line says so, whereas under
-// the flip an arm nobody remembered to pin would move with nothing naming it.
+// AND VLLM-OMNI — THE PRIMARY ORACLE, SINCE IT REGISTERS `ltx2` — CANNOT EXPRESS
+// THE EXCEPTION AT ALL. `_official_ltx_sigmas` puts the anchor in the expression
+// with no token count anywhere near it: `sigma_shift = max_anchor * slope +
+// (base_shift - slope * base_anchor)`, under the comment "Official LTX2
+// one-stage intentionally uses the max sequence anchor, so the shift stays at
+// max_shift" (`ltx2_denoise.py:186-188` @ `a4ea67a2`). The branch a phase with
+// `use_official_sigma_schedule=False` takes passes `max_image_seq_len` into
+// `calculate_shift`'s `image_seq_len` parameter (`:256-260`), so it lands on
+// 4096 too. Two oracles, arrived at independently, one answer.
+//
+// THIS ENGINE READ THE TARGET GRID ON EVERY DERIVED PHASE UNTIL ROW
+// LTX25-SIGMA-SHIFT-MIRROR (https://github.com/mudler/vllm.cpp/issues/2521),
+// and the divergence was REAL rather than a rounding: at the prompt-adherence
+// gate geometry the `one_stage` target latent is 240 tokens, giving a shift of
+// 0.669271 against upstream's 2.050000, so every interior sigma moved while the
+// frame count, the shapes and the sample rate did not — which is why no shape
+// check and no token gate could see it.
+//
+// The row that closed it flipped `one_stage` x4, `t2a_one_stage` x4,
+// `a2vid_two_stage` stage 1 x4 and `dmd2` x2, and left `res2s_two_stage` on
+// `kTargetLatent`, which is the whole point: it is not a blanket flip, because
+// upstream's one exception is a real arm this engine ships. `retake` did NOT
+// move, because `RetakeRecipe` pins `DistilledSigmas()` and never derives a
+// schedule at all.
 //
 // Read in exactly one place, the phase loop's schedule block, and only on the
 // branch that derives a schedule at all. A phase carrying explicit `sigmas`
 // never reaches it.
 enum class Ltx2PhaseScheduleTokens {
   // `math.prod(latent.shape[2:])` of THIS phase's target grid, which is
-  // `ti2vid_two_stages_hq.py:267`'s `latent=empty_latent`. The default.
+  // `ti2vid_two_stages_hq.py:267`'s `latent=empty_latent`. Upstream's EXCEPTION,
+  // and `Res2sTwoStageRecipe` is the only recipe that names it.
   kTargetLatent,
   // `default_number_of_tokens`, i.e. 4096 — what the six call sites above get
-  // by passing no latent at all.
+  // by passing no latent at all, and what vLLM-Omni hard-codes on BOTH of its
+  // branches. The default, because it is upstream's rule.
   kSchedulerDefault,
 };
 
@@ -722,7 +754,14 @@ struct Ltx2PhaseRecipe {
   Ltx2PhaseDenoiser denoiser = Ltx2PhaseDenoiser::kGuided;
   bool use_official_sigma_schedule = true;
   // See `Ltx2PhaseScheduleTokens`. Only consulted when `sigmas` is empty.
-  Ltx2PhaseScheduleTokens schedule_tokens = Ltx2PhaseScheduleTokens::kTargetLatent;
+  //
+  // THE DEFAULT IS UPSTREAM'S RULE, and every recipe that reaches this field
+  // names its value anyway — including `Res2sTwoStageRecipe`, the one arm that
+  // wants the other branch. So the default moves nothing today, and what it
+  // decides is which way a recipe added LATER is wrong when its author forgets.
+  // Six of upstream's seven call sites pass no latent, so forgetting should land
+  // on 4096.
+  Ltx2PhaseScheduleTokens schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
   // The adapter set this phase runs. Read in exactly one place — the phase
   // loop's rebind, immediately before the phase's first DiT forward — and
   // honoured by `Ltx2RebindDitLoras`, which re-materializes only the tensors an
@@ -751,7 +790,7 @@ struct Ltx2PhaseRecipe {
 // The second has no branch at all — one loop, one item type. And the two items
 // do different things to the state: `VideoConditionByLatentIndex` REPLACES the
 // clean tokens of latent frame 0 and the token count never changes
-// (latent_cond.py:38-39), while `VideoConditionByKeyframeIndex` APPENDS a latent
+// (latent_cond.py:40-41), while `VideoConditionByKeyframeIndex` APPENDS a latent
 // frame of tokens at the end (keyframe_cond.py:79-82).
 //
 // A RECIPE FIELD RATHER THAN A PHASE ONE, because upstream picks the builder per
@@ -1094,7 +1133,7 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //                                  the derived arms it fits its sigma shift on
 //                                  the 4096 anchor rather than the target grid,
 //                                  because `execute(steps=...)` passes no latent
-//                                  (schedulers.py:31) — see
+//                                  (schedulers.py:32) — see
 //                                  `Ltx2PhaseScheduleTokens`
 //   ("t2a_one_stage",      "2")    Lightricks t2a_one_stage.py:43,109 (row
 //   ("t2a_one_stage",      "2.3")  LTX25-T2A-ONE-STAGE, #1005). The one_stage
@@ -1155,7 +1194,7 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
 // TWO KINDS live here, and conflating them overstated what this port refuses:
 //
 //   REACHABLE REFUSAL — a product path constructs the condition and throws, so a
-//   caller CAN trip it. `kSpatiotemporalUpsampler` (ltx2_upsampler.cpp:465) is
+//   caller CAN trip it. `kSpatiotemporalUpsampler` (ltx2_upsampler.cpp:497) is
 //   the ONE. `ltx2_video.cpp` reaches it through `Ltx2UpsampleVideoLatent` when a
 //   phase asks for the spatial-upsample transform. The TEMPORAL-ONLY x2
 //   upsampler is NOT among them: it is ported (`2e9d95e74`, spec

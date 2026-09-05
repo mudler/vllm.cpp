@@ -917,11 +917,11 @@ class AttributionIsEnforcedOnce(unittest.TestCase):
 
     What it produced instead was forgiveness work. Two mechanisms existed solely
     to excuse landed commits: `scripts/ci-enforcement-floor.txt`, whose current
-    value forgives 42 commits dated 2026-08-13 to 2026-08-24, and
-    `LANDED_MESSAGE_EXCEPTIONS`, which carried one. 43 commits on `main` violate
-    the contract and cannot be repaired, each forgiven by a deliberate reviewed
-    act. A gate whose three-week output is 43 forgiveness decisions rather than
-    43 prevented defects is measuring the wrong thing.
+    value forgives 43 commits dated 2026-08-13 to 2026-08-25, and
+    `LANDED_MESSAGE_EXCEPTIONS`, which carried one. 44 commits on `main` violate
+    a contract and cannot be repaired, each forgiven by a deliberate reviewed
+    act. A gate whose three-week output is 44 forgiveness decisions rather than
+    44 prevented defects is measuring the wrong thing.
     """
 
     WORKFLOW = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -963,8 +963,10 @@ class AttributionIsEnforcedOnce(unittest.TestCase):
         self.assertIn("documentation-checkpoint", governed)
         self.assertNotIn("commit-protocol-tag", governed)
         self.assertTrue(
-            floor.rstrip().endswith("c00b99c7c8b64f9247230ed6220598cc5c0e347e"),
-            "the floor VALUE must not move; only its scope narrowed",
+            floor.rstrip().endswith("e1b5df1a6b5b30555639e0a0459f79a467544579"),
+            "the floor VALUE moves only by a reviewed advance that re-pins this "
+            "assertion; #2322 narrowed its scope and did not move it, and #2743 "
+            "advanced it to e1b5df1a6 without widening the scope back",
         )
 
 

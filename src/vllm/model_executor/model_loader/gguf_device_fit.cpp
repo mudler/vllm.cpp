@@ -1,4 +1,6 @@
 // ENG-EXPERT-STREAM, issue #1123. See the header for what this decides and why.
+#include <regex>
+#include <vector>
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 
 #include <string>
@@ -129,12 +131,47 @@ bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
   return matched;
 }
 
+namespace {
+
+// #2517. Is this tensor a ROUTED-EXPERT tower whose layer the installed plan
+// runs somewhere other than the engine device?
+//
+// The name test is `_exps.weight`, which is the class the plan's own
+// `RoutedExpertTensorNames` composes and the class `RunMoePlaced` moves. The
+// layer term goes through `DeviceForRoutedExpertTensor`, so the bound and the
+// forward resolve the placement with ONE rule rather than two.
+//
+// The engine-device comparison is against the PLAN's engine device, not the
+// caller's: a plan resolved for a different device than the one being priced is
+// a caller bug, and answering "placed" for a tensor that will in fact stage here
+// would DELETE a correct refusal -- the unsafe direction #1378 names.
+bool PlacedAwayFromEngine(const MoePlacementPlan* plan,
+                          const std::string& name) {
+  if (plan == nullptr || !plan->PlacesAnything()) return false;
+  if (!NameHasSuffix(name, "_exps.weight")) return false;
+  return plan->DeviceForRoutedExpertTensor(name) != plan->engine_device();
+}
+
+}  // namespace
+
 GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
                                               size_t model_dtype_bytes,
                                               const StreamedExpertLane& lane,
-                                              bool policy_forces_full_expand) {
+                                              bool policy_forces_full_expand,
+                                              const MoePlacementPlan* placement) {
   GgufStagedFootprint out;
   for (const GgufTensorInfo& t : gguf.Tensors()) {
+    // BEFORE the lane test, because a placed tower does not reach the lane
+    // either: `RunMoePlaced` hands the block a CPU `Dev`, and the expert-stream
+    // seam's own admission test (`expert_stream_seam.cpp:431`) is about the
+    // ENGINE platform. Counting one tensor in both classes would report the same
+    // bytes twice in a message whose whole job is to account for them once.
+    if (PlacedAwayFromEngine(placement, t.name)) {
+      ++out.placed_tensor_count;
+      out.placed_bytes +=
+          StagedBytes(t, model_dtype_bytes, policy_forces_full_expand);
+      continue;
+    }
     // W0d: a tensor the slot lane serves is never staged, so it contributes
     // nothing to the bound and cannot be the largest single allocation either.
     // It is still COUNTED, in its own two fields, so the caller can say what was
@@ -165,6 +202,32 @@ GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
   return out;
 }
 
+std::vector<size_t> GgufRoutedExpertBytesPerLayer(const GgufFile& gguf,
+                                                  int64_t num_hidden_layers) {
+  std::vector<size_t> per_layer;
+  if (num_hidden_layers <= 0) return per_layer;
+  per_layer.assign(static_cast<size_t>(num_hidden_layers), 0);
+  const std::vector<GgufTensorInfo>& tensors = gguf.Tensors();
+  for (int64_t layer = 0; layer < num_hidden_layers; ++layer) {
+    // One regex per layer, built by the SHARED helper so this counts the same
+    // tensors an override moves. A bad pattern cannot throw here in practice --
+    // the helper composes a fixed literal with a decimal index -- but a throw
+    // would abort a load over a diagnostic, so it degrades to "priced nothing"
+    // for that layer instead.
+    std::regex re;
+    try {
+      re.assign(vllm::LlmFfnExpsBlockRegex(layer));
+    } catch (const std::regex_error&) {
+      continue;
+    }
+    size_t bytes = 0;
+    for (const GgufTensorInfo& t : tensors)
+      if (std::regex_search(t.name, re)) bytes += t.nbytes;
+    per_layer[static_cast<size_t>(layer)] = bytes;
+  }
+  return per_layer;
+}
+
 size_t DeviceWeightBudgetBytes(size_t device_memory_total_bytes) {
   // THE PRECEDENCE LIVES IN ONE PLACE, and since #1127 that place is
   // `vllm/config/weight_residency.h`: `VT_DEVICE_WEIGHT_BUDGET_BYTES` >
@@ -188,7 +251,8 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      size_t budget_bytes,
                                      size_t model_dtype_bytes,
                                      const StreamedExpertLane& lane,
-                                     bool policy_forces_full_expand) {
+                                     bool policy_forces_full_expand,
+                                     const MoePlacementPlan* placement) {
   DeviceWeightFit fit;
   fit.budget_bytes = budget_bytes;
   // A platform that does not stage weights reads them where they already are, so
@@ -201,7 +265,7 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
   if (budget_bytes == 0) return fit;
 
   const GgufStagedFootprint fp = GgufStagedWeightFootprint(
-      gguf, model_dtype_bytes, lane, policy_forces_full_expand);
+      gguf, model_dtype_bytes, lane, policy_forces_full_expand, placement);
   fit.needed_bytes = fp.lower_bound_bytes;
   if (fp.lower_bound_bytes <= budget_bytes) return fit;
 
@@ -254,6 +318,21 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
   // correction is appended rather than left to be read as a stale claim. The
   // lane-OFF message is untouched, byte for byte, because every CPU and discrete
   // user reads that one and it is still true for them.
+  // #2517. The plan announced a reduction on the line above this refusal and
+  // the refusal used to quote the un-reduced figure, which is two contradictory
+  // numbers in consecutive lines of one load. Whatever the verdict, say what the
+  // placement took out of it.
+  if (fp.placed_tensor_count > 0) {
+    fit.message +=
+        " NOTE: an installed hybrid MoE placement runs " +
+        std::to_string(fp.placed_tensor_count) +
+        " routed-expert tensors (" + std::to_string(fp.placed_bytes) +
+        " bytes, " + Gib(fp.placed_bytes) + ") on another device, so they are "
+        "ALREADY EXCLUDED from the figure above rather than being a reduction "
+        "still available. What does not fit is the remainder. Placing more "
+        "layers (\"cpu_moe\", \"n_cpu_moe\", VT_CPU_MOE=1) is the knob that "
+        "shrinks it further.";
+  }
   if (fp.streamed_tensor_count > 0) {
     fit.message +=
         " NOTE: the expert-stream lane IS active for this load, so the "

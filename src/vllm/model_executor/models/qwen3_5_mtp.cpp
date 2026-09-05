@@ -5,16 +5,20 @@
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vt/dtype.h"
 
 namespace vllm {
 namespace {
+
+using TensorExists = std::function<bool(const std::string&)>;
 
 OwnedTensor MakeOwned(vt::DType dtype, const std::vector<int64_t>& shape) {
   OwnedTensor out;
@@ -84,9 +88,25 @@ OwnedTensor CopyRawNK(const StTensor& source, int64_t offset, int64_t n,
 }
 
 FullAttnLayerWeights LoadFullAttention(const TensorResolver& get,
+                                       const TensorExists& has,
                                        const std::string& base) {
   const std::string attn = base + "self_attn.";
   FullAttnLayerWeights out;
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the EXL3 rung, FIRST and exclusive,
+  // mirroring `LoadAttnDense` in `qwen3_5_dense_weights.cpp`. It is first for
+  // the reason the dense resolver's is: an EXL3 projection ships no `.weight`,
+  // so the bf16 read below dies on a tensor the artifact correctly does not
+  // carry. The four are loaded TOGETHER, which is what makes
+  // `FullAttnLayerWeights::IsExl3`'s single `q_proj_exl3` key honest.
+  if (dense_loaders::IsExl3Projection(has, attn + "q_proj")) {
+    out.q_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "q_proj");
+    out.k_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "k_proj");
+    out.v_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "v_proj");
+    out.o_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "o_proj");
+    out.q_norm = LoadBf16Direct(get, attn + "q_norm.weight");
+    out.k_norm = LoadBf16Direct(get, attn + "k_norm.weight");
+    return out;
+  }
   out.q_proj = LoadBf16RawNK(get, attn + "q_proj.weight");
   out.k_proj = LoadBf16RawNK(get, attn + "k_proj.weight");
   out.v_proj = LoadBf16RawNK(get, attn + "v_proj.weight");
@@ -96,10 +116,21 @@ FullAttnLayerWeights LoadFullAttention(const TensorResolver& get,
   return out;
 }
 
-DenseMlpWeights LoadDenseMlp(const TensorResolver& get,
+DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
                              const std::string& base) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights out;
+  // The EXL3 rung, first and exclusive, mirroring `LoadMlpDense`. gate and up
+  // stay SEPARATE trellises: a merge on the output dimension interleaves per
+  // input tile, which is a real transform owed its own gate, and
+  // `layers::Exl3MlpGateUpMethod` consumes the pair on the shared
+  // `MlpGateUpMethodBase` seam without one.
+  if (dense_loaders::IsExl3Projection(has, mlp + "gate_proj")) {
+    out.gate_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "gate_proj");
+    out.up_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "up_proj");
+    out.down_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "down_proj");
+    return out;
+  }
   out.gate_proj = LoadBf16RawNK(get, mlp + "gate_proj.weight");
   out.up_proj = LoadBf16RawNK(get, mlp + "up_proj.weight");
   out.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
@@ -177,6 +208,21 @@ void RequireShape(const OwnedTensor& tensor,
   }
 }
 
+// The trellis twin of `RequireShape`. `in`/`out` are the LOGICAL Linear
+// dimensions -- `[K, N]` -- and both are read from the trellis tile counts
+// rather than from a config scalar, which is the rule `Exl3Weight` already
+// applies to `bits` (`qwen3_5_weights.h`: a 3.0bpw Llama ships a SIX-bit head).
+void RequireExl3(const Exl3Weight& weight, int64_t in, int64_t out,
+                 const std::string& name) {
+  VT_CHECK(!weight.Empty(),
+           "qwen3_5 MTP: empty EXL3 trellis for " + name);
+  VT_CHECK(weight.InFeatures() == in && weight.OutFeatures() == out,
+           "qwen3_5 MTP: unexpected EXL3 geometry for " + name + ": trellis says [K=" +
+               std::to_string(weight.InFeatures()) + ", N=" +
+               std::to_string(weight.OutFeatures()) + "], config says [K=" +
+               std::to_string(in) + ", N=" + std::to_string(out) + "]");
+}
+
 void ValidateAttention(const FullAttnLayerWeights& attention,
                        const HfConfig& config, const std::string& base) {
   const int64_t hidden = config.hidden_size;
@@ -187,6 +233,21 @@ void ValidateAttention(const FullAttnLayerWeights& attention,
                config.num_key_value_heads > 0 && head_dim > 0,
            "qwen3_5 MTP: invalid full-attention dimensions");
   // Qwen3.5 full attention is output-gated: q_proj packs q|gate.
+  //
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the trellis arm carries the SAME
+  // geometry through a different container, so it is checked and not skipped.
+  // `InFeatures`/`OutFeatures` come from the trellis tile counts, so this
+  // catches a transposed or mis-sized projection exactly as `RequireShape`
+  // does for the bf16 arm.
+  if (attention.IsExl3()) {
+    RequireExl3(attention.q_proj_exl3, hidden, 2 * query, base + "q_proj");
+    RequireExl3(attention.k_proj_exl3, hidden, key_value, base + "k_proj");
+    RequireExl3(attention.v_proj_exl3, hidden, key_value, base + "v_proj");
+    RequireExl3(attention.o_proj_exl3, query, hidden, base + "o_proj");
+    RequireShape(attention.q_norm, {head_dim}, base + "q_norm.weight");
+    RequireShape(attention.k_norm, {head_dim}, base + "k_norm.weight");
+    return;
+  }
   RequireShape(attention.q_proj, {2 * query, hidden}, base + "q_proj.weight");
   RequireShape(attention.k_proj, {key_value, hidden}, base + "k_proj.weight");
   RequireShape(attention.v_proj, {key_value, hidden}, base + "v_proj.weight");
@@ -208,6 +269,15 @@ void ValidateDenseLayer(const Qwen3_5DenseLayerWeights& layer,
   RequireShape(layer.post_attention_layernorm, {hidden},
                base + "post_attention_layernorm.weight");
   ValidateAttention(layer.attn, config, base + "self_attn.");
+  if (layer.mlp.IsExl3()) {
+    RequireExl3(layer.mlp.gate_proj_exl3, hidden, intermediate,
+                base + "mlp.gate_proj");
+    RequireExl3(layer.mlp.up_proj_exl3, hidden, intermediate,
+                base + "mlp.up_proj");
+    RequireExl3(layer.mlp.down_proj_exl3, intermediate, hidden,
+                base + "mlp.down_proj");
+    return;
+  }
   RequireShape(layer.mlp.gate_proj, {intermediate, hidden},
                base + "mlp.gate_proj.weight");
   RequireShape(layer.mlp.up_proj, {intermediate, hidden},
@@ -281,6 +351,7 @@ int64_t Qwen3_5MTPWeights::NumLayers() const {
 }
 
 Qwen3_5MTPWeights LoadQwen3_5MTP(const TensorResolver& get,
+                                 const std::function<bool(const std::string&)>& has,
                                  const HfConfig& config,
                                  Qwen3_5MTPKind kind) {
   VT_CHECK(config.hidden_size > 0, "qwen3_5 MTP: hidden_size must be > 0");
@@ -291,7 +362,16 @@ Qwen3_5MTPWeights LoadQwen3_5MTP(const TensorResolver& get,
 
   Qwen3_5MTPWeights out;
   out.kind = kind;
-  out.fc = LoadBf16RawNK(get, "mtp.fc.weight");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5). The fc-cat projection is quantized in
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (`mtp.fc.trellis I16 [640, 320, 64]`,
+  // K=2H=10240, N=H=5120, bits 4, `.mul1`), so the read asks the presence
+  // question first, exactly as the dense tower's resolver does, and never reads
+  // `quantization_config.mtp_bits`: the width is the trellis geometry's.
+  if (dense_loaders::IsExl3Projection(has, "mtp.fc")) {
+    out.fc_exl3 = dense_loaders::LoadExl3(get, has, "mtp.fc");
+  } else {
+    out.fc = LoadBf16RawNK(get, "mtp.fc.weight");
+  }
   out.pre_fc_norm_embedding =
       LoadBf16Direct(get, "mtp.pre_fc_norm_embedding.weight");
   out.pre_fc_norm_hidden =
@@ -308,8 +388,8 @@ Qwen3_5MTPWeights LoadQwen3_5MTP(const TensorResolver& get,
           LoadBf16Direct(get, base + "input_layernorm.weight");
       layer.post_attention_layernorm =
           LoadBf16Direct(get, base + "post_attention_layernorm.weight");
-      layer.attn = LoadFullAttention(get, base);
-      layer.mlp = LoadDenseMlp(get, base);
+      layer.attn = LoadFullAttention(get, has, base);
+      layer.mlp = LoadDenseMlp(get, has, base);
       out.dense_layers.push_back(std::move(layer));
     } else {
       Qwen3_5MoeLayerWeights layer;
@@ -318,14 +398,21 @@ Qwen3_5MTPWeights LoadQwen3_5MTP(const TensorResolver& get,
           LoadBf16Direct(get, base + "input_layernorm.weight");
       layer.post_attention_layernorm =
           LoadBf16Direct(get, base + "post_attention_layernorm.weight");
-      layer.attn = LoadFullAttention(get, base);
+      layer.attn = LoadFullAttention(get, has, base);
       layer.moe = LoadMoe(get, base, config);
       out.moe_layers.push_back(std::move(layer));
     }
   }
 
   const int64_t hidden = config.hidden_size;
-  RequireShape(out.fc, {hidden, 2 * hidden}, "mtp.fc.weight");
+  if (out.IsExl3()) {
+    // The trellis stores [K, N] and the torch Linear stores [N=out, K=in], so
+    // the same projection reads [2H, H] here and [H, 2H] there. Both are the
+    // same map; only the container's orientation differs.
+    RequireExl3(out.fc_exl3, 2 * hidden, hidden, "mtp.fc");
+  } else {
+    RequireShape(out.fc, {hidden, 2 * hidden}, "mtp.fc.weight");
+  }
   RequireShape(out.pre_fc_norm_embedding, {hidden},
                "mtp.pre_fc_norm_embedding.weight");
   RequireShape(out.pre_fc_norm_hidden, {hidden},
@@ -359,7 +446,9 @@ Qwen3_5MTPWeights LoadQwen3_5MTP(
              "qwen3_5 MTP: tensor not found: " + name);
     return it->second->Get(name);
   };
-  return LoadQwen3_5MTP(get, config, kind);
+  const std::function<bool(const std::string&)> has =
+      [&where](const std::string& name) { return where.count(name) != 0; };
+  return LoadQwen3_5MTP(get, has, config, kind);
 }
 
 }  // namespace vllm

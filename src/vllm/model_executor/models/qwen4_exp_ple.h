@@ -6,10 +6,10 @@
 // is integer-exact or it is silently wrong", and "PLE: a strided-history conv
 // with no vLLM op, confirmed").
 //
-// ─── WHY THIS FILE HAS NO vLLM ANCHOR ────────────────────────────────────────
-// These are the ONLY two components of this model with no vLLM op at all, so
-// AGENTS.md's mirror-vLLM polarity has nothing to bind here and the secondary
-// oracle is the sole source. The negative is CONFIRMED rather than unfound: at
+// ─── WHY THIS FILE HAD NO vLLM ANCHOR, AND WHY IT NOW HAS ONE ────────────────
+// SUPERSEDED 2026-08-31 (#2489): `nvidia/ple_layer.py` at `e126687a9a` is BOTH
+// the dilated conv (`:589-599`) and the n-gram embedding (`:151-436`). Mirror it.
+// The measured negative below was true when taken and is kept as history: at
 // vLLM `origin/main` = `6a5e8f5979`, `git grep -in dilat` returns zero lines in
 // `vllm/model_executor/layers/mamba/`, zero in `csrc/` and zero in `tests/`;
 // `layers/conv.py` defines only `Conv2dLayer` and `Conv3dLayer`. Upstream

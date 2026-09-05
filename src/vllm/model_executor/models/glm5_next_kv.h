@@ -30,21 +30,55 @@
 //     which is 11 + 11. The recurrent group contributes NOTHING to `attn_kv` —
 //     its 34 layers land in `ModelForwardInput::gdn_state` instead
 //     (`runner.cpp`, the `alloc_recurrent_layer_states` arm of the multi-cache
-//     path). That is why `MultiKvCacheIndex::num_groups()` answers TWO while
-//     `num_published_groups()` answers three.
+//     path). This line used to add "which is why `num_groups()` answers TWO
+//     while `num_published_groups()` answers three", and W5b-2d measured that
+//     and it is FALSE: `num_groups()` counts distinct ids over the whole
+//     `group_ids` vector, which `9e7621efc` widened to cover the recurrent
+//     group, so it answers THREE. The accessor's own comment in
+//     `model_registry.h` still describes the pre-widening behaviour and #2459
+//     owns it. Nothing on this row reads `num_groups()` for a decision — only
+//     `ChannelSummary` prints it — but the next reader would have inherited the
+//     stale number, which is exactly how this wave's defect travelled.
 //   * The 22 arrive in PUBLICATION order — group 0's eleven, then group 2's
 //     eleven — which is why the first published name is layer 3's MLA latent
 //     and not layer 0's anything. Layer 3 is this checkpoint's first DSA layer.
 //   * BLOCK TABLES are gathered for all three groups, indexed BY GROUP ID and
 //     not parallel to `attn_kv` (`MultiKvCacheIndex::BlockTableForGroup`).
 //
-// **NOTHING HERE IS RESOLVED BY POSITION.** Every attention cache is found by
-// the NAME `MakeGlm5NextKVCache` published it under, through
-// `MultiKvCacheIndex::Find`, and its group id is READ off the channel rather
-// than assumed to be 0 and 2. A port that indexed `attn_kv` by DSA-layer
-// ordinal would be right today and wrong the moment a group is added, reordered
-// or renamed — and it would be wrong SILENTLY, because every one of the 22
-// entries is a plausible float buffer.
+// **NOTHING HERE IS RESOLVED BY POSITION.** Every cache — paged and recurrent
+// alike — is found by the NAME `MakeGlm5NextKVCache` published it under, and its
+// group id is READ off the channel rather than assumed to be 0 and 2. A port
+// that indexed `attn_kv` by DSA-layer ordinal would be right today and wrong the
+// moment a group is added, reordered or renamed — and it would be wrong
+// SILENTLY, because every one of the 22 entries is a plausible float buffer.
+//
+// ─── THE FLAT INDEX IS NOT THE PAGED SLOT, and this row shipped that error ───
+//
+// W5b-2d ([#2445](https://github.com/mudler/vllm.cpp/issues/2445)). There are
+// TWO indices and `MultiKvCacheIndex` answers both, which is the distinction the
+// W5b-2c mapping did not carry:
+//
+//   * `Find(name)` returns the FLAT index — the cache's place among EVERY
+//     published cache, paged and recurrent together, in publication order. On
+//     this model that space is 56 wide: group 0's 11 latents, then group 1's 34
+//     recurrent states, then group 2's 11 indexer caches. `layer_names`,
+//     `group_ids`, `layer_indices`, `payload_kinds` and `payload_slots` are all
+//     parallel to THAT.
+//   * `PayloadAt(flat, &kind, &slot)` returns the slot in the container the
+//     cache actually lives in — `attn_kv` when `kind` is `kPaged`, `gdn_state`
+//     when it is `kRecurrent`. That space is 22 wide and 34 wide respectively.
+//
+// Layer 3's indexer side cache is flat 45 and paged slot 11. Feeding 45 to
+// `attn_kv` is what `--device cuda` on the real 101.25 GiB artifact died of, and
+// it died on `--device cpu` identically: it is not a device defect. It threw
+// only because 45 happens to be out of range for a 22-entry vector; a topology
+// whose recurrent group is published LAST would have made every flat index
+// in-range and every one of them a plausible float buffer for the wrong layer.
+// So the refusal that caught it is an accident of ordering and the payload
+// locator is the check.
+//
+// The group id is still read at the FLAT index, because `group_ids` is parallel
+// to the flat list. Two indices, two vectors, and each is used against its own.
 //
 // ─── GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR ─────────────────────────────
 //
@@ -73,17 +107,26 @@
 // block table and refuses by name if the two disagree, so a misread block table
 // is a refusal on the first step rather than a wrong token on every step.
 //
-// ─── THE RECURRENT GROUP IS NOT KEYED BY NAME, AND THAT IS STATED ───────────
+// ─── THE RECURRENT GROUP IS KEYED BY NAME TOO, AND IT WAS NOT ───────────────
 //
-// `MultiKvCacheIndex` describes `attn_kv` only. The KDA states arrive on
-// `ModelForwardInput::gdn_state`, one entry per recurrent layer in ASCENDING
-// LAYER ORDER (the runner's multi-cache arm calls
-// `alloc_recurrent_layer_states` inside `for (l : layers) if (gdn_layer_mask[l])`
-// before it allocates any attention buffer), and no name travels with them. The
-// correspondence is therefore POSITIONAL and the strongest available check is
-// the count: `gdn_state.size()` must equal `p.num_kda_layers()`, refused by
-// name otherwise. Recorded as a limit of the channel rather than left for the
-// next reader to discover.
+// This section used to read "THE RECURRENT GROUP IS NOT KEYED BY NAME", because
+// when W5b-2c landed `MultiKvCacheIndex` described `attn_kv` only: the KDA
+// states arrived on `ModelForwardInput::gdn_state` in ascending layer order with
+// no name, so the correspondence was POSITIONAL and a count against
+// `p.num_kda_layers()` was the strongest available check. ENG-MULTIKV-BYNAME
+// (`9e7621efc`) falsified that sentence 65 minutes later by widening the channel
+// over every published cache, and W5b-2d consumed it: each KDA layer resolves
+// `model.layers.<l>.linear_attn` through the same `PayloadAt` locator the paged
+// caches use, and reads its `gdn_state` slot off `payload_slots`.
+//
+// The positional ordinal SURVIVES as a check rather than as the answer. The
+// runner still allocates one state set per recurrent layer in layer order
+// (`alloc_recurrent_layer_states` inside
+// `for (l : layers) if (gdn_layer_mask[l])`), so the channel's slot and the
+// ordinal agree on every topology this tree builds, and `ResolveKvBinding`
+// refuses by name when they do not. The count survives too, and it now catches
+// what a per-layer lookup structurally cannot: `gdn_state` sets that no declared
+// layer claimed.
 //
 // The state SLOT within each of those buffers is the engine's, not ours:
 // `GDNAttentionMetadata::non_spec_state_indices_tensor` carries the compact
@@ -122,8 +165,10 @@ namespace vllm::glm5_next {
 struct LayerKvBinding {
   Glm5NextLayerKind kind = Glm5NextLayerKind::kLinearAttention;
 
-  // kDeepseekSparseAttention. Indices into `ModelForwardInput::attn_kv`, and
-  // the group ids they were PUBLISHED under, read off the channel.
+  // kDeepseekSparseAttention. PAGED SLOTS in `ModelForwardInput::attn_kv` — the
+  // channel's `payload_slots` answer and NOT `Find`'s flat index, see the
+  // header's "THE FLAT INDEX IS NOT THE PAGED SLOT" — and the group ids they
+  // were PUBLISHED under, read off the channel at the flat index.
   int64_t latent = -1;
   int64_t indexer = -1;
   int32_t latent_group = -1;
@@ -135,7 +180,8 @@ struct LayerKvBinding {
   // to `cached_len` rows would describe history the layer never wrote.
   bool has_own_indexer = false;
 
-  // kLinearAttention. Index into `ModelForwardInput::gdn_state`.
+  // kLinearAttention. The slot in `ModelForwardInput::gdn_state` the channel
+  // published this layer's state at — read off `payload_slots`, not counted.
   int64_t recurrent = -1;
 };
 

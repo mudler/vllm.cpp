@@ -313,9 +313,10 @@ void ApplyTokenMaskKernel(Queue&, Tensor& logits, const Tensor& rows, const Tens
 // The row argmax uses the SAME strict `>` lowest-index tie-break as
 // GreedyArgmaxKernel above, so a k == 0 request reduces exactly to plain greedy.
 void GreedyRejectionSampleKernel(Queue&, Tensor& sampled, Tensor& num_sampled,
-                                 const Tensor& logits, const Tensor& draft_sampled,
-                                 const Tensor& cu_num_logits) {
+                                 Tensor& target_argmax, const Tensor& logits,
+                                 const Tensor& draft_sampled, const Tensor& cu_num_logits) {
   const int64_t vocab = logits.shape[1];
+  const int64_t num_logits = logits.shape[0];
   const int64_t num_reqs = cu_num_logits.shape[0] - 1;
   const int64_t width = sampled.shape[1];
   const float* lp = logits.Ptr<float>();
@@ -323,6 +324,7 @@ void GreedyRejectionSampleKernel(Queue&, Tensor& sampled, Tensor& num_sampled,
   const int32_t* cu = cu_num_logits.Ptr<int32_t>();
   int32_t* sp = sampled.Ptr<int32_t>();
   int32_t* ns = num_sampled.Ptr<int32_t>();
+  int32_t* ta = target_argmax.Ptr<int32_t>();
 
   // argmax(logits[row]) with torch.argmax's lowest-index tie-break.
   const auto row_argmax = [&](int64_t row) -> int32_t {
@@ -338,6 +340,15 @@ void GreedyRejectionSampleKernel(Queue&, Tensor& sampled, Tensor& num_sampled,
     return static_cast<int32_t>(best);
   };
 
+  // PHASE 1, over every expanded row: upstream's `_compute_global_target_argmax`
+  // (rejection_sampler_utils.py:923-946), which the CUDA arm runs as its own
+  // kernel. This reference computed it inline inside the walk; it is hoisted so
+  // both arms have the SAME two phases and the same caller-owned buffer between
+  // them (SPEC-DFLASH2 A2-2, #2802). Same values, same tie-break, same order.
+  for (int64_t row = 0; row < num_logits; ++row) ta[row] = row_argmax(row);
+
+  // PHASE 2: one sequential accept walk per request over the phase-1 argmaxes
+  // (`_rejection_kernel`, launched num_warps=1 at :1032-1067).
   for (int64_t req = 0; req < num_reqs; ++req) {
     const int64_t start = cu[req];
     const int64_t end = cu[req + 1];
@@ -349,20 +360,20 @@ void GreedyRejectionSampleKernel(Queue&, Tensor& sampled, Tensor& num_sampled,
     int64_t accepted_length = 0;
     for (int64_t i = 0; i < num_draft_tokens; ++i) {
       if (!accepted) break;  // upstream `elif accepted:` guard
-      const int32_t target_argmax = row_argmax(start + i);
+      const int32_t row_target = ta[start + i];
       // NOTE the +1: draft token i is the INPUT id at the NEXT expanded row
       // (rejection_sampler_utils.py:534). A -1 placeholder can never equal an
       // argmax (>= 0), so it is rejected with no out-of-bounds read.
       const int32_t draft = dp[start + i + 1];
-      accepted = (target_argmax == draft);
-      row[i] = accepted ? draft : target_argmax;
+      accepted = (row_target == draft);
+      row[i] = accepted ? draft : row_target;
       accepted_length += accepted ? 1 : 0;
     }
     // Bonus token: every draft accepted -> resample (greedy: argmax) at the
     // bonus row. On a rejection the target argmax is already stored, so
     // _resample_kernel returns early (:846-849).
     if (accepted_length == num_draft_tokens) {
-      row[accepted_length] = row_argmax(start + accepted_length);
+      row[accepted_length] = ta[start + accepted_length];
     }
     // _insert_resampled_kernel:834 — num_sampled = accepted_length + 1.
     ns[req] = static_cast<int32_t>(accepted_length) + 1;

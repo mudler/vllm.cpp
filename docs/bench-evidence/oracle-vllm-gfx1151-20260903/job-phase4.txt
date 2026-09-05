@@ -1,0 +1,115 @@
+
+===== 0. identity =====
+2026-09-03T11:48:32Z
+hostname=rc-worker-lcjhd boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+RC_JOB_ID=bb2ffe74-83e9-4fed-9a35-f9367fefe76b RC_DEVICE=strix:gpu0
+HSA_OVERRIDE_GFX_VERSION=UNSET  <- must be UNSET
+WARNING 09-03 11:48:33 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+VLLM 0.26.0.dev0+g5559679229
+TORCH 2.13.0+rocm7.2 hip 7.2.53211
+ARCH gfx1151
+               total        used        free      shared  buff/cache   available
+Mem:              62           3           1           0          57          58
+
+===== 1. the INSTALLED plugin object's gfx targets =====
+2026-09-03T11:48:36Z
+INSTALLED_SO=/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+cc9c2440bf488ca22bd79ae4adf9e5f1931de52e55a221e3c45c214730b14eb3  /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+plugin_offload_rc=0  lines=4
+-- DISTINCT offload targets, verbatim --
+      1 amdgcn-amd-amdhsa--gfx1151
+PLUGIN_GFX1151_BUNDLES=1
+INSTALLED_PLUGIN_ARCH_OK: gfx1151 is in the object that was called
+-- the same instrument on an object that must NOT carry it, as a control --
+
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libc10.so:	file format elf64-x86-64
+
+===== 2. the two probes phase 3 called wrongly =====
+2026-09-03T11:48:43Z
+WARNING 09-03 11:48:44 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+EXT vllm._C                        LOADED
+EXT vllm._rocm_C                   LOADED
+EXT vllm._C_stable_libtorch        LOADED
+EXT vllm._moe_C_stable_libtorch    LOADED
+CUSTOM_OP rms_norm    max_abs_err = 0.014302253723144531
+CUSTOM_OP silu_and_mul max_abs_err = 0.016417503356933594
+CUSTOM_OP silu_and_mul rel_err     = 0.0029627832118421793
+CUSTOM_OPS=PASS
+probe_ext_rc=0
+WARNING 09-03 11:48:48 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+Traceback (most recent call last):
+  File "/workspace/vllm-gfx1151-2740/probe_registry.py", line 3, in <module>
+    cls, name = ModelRegistry.resolve_model_cls([arch])
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: _ModelRegistry.resolve_model_cls() missing 1 required positional argument: 'model_config'
+probe_registry_rc=1
+
+===== 3. a SECOND compiled leg -- the phase-3 compiled result is n=1 =====
+2026-09-03T11:48:53Z
+
+--- LEG gguf-compiled-2 ---
+2026-09-03T11:48:53Z
+GEN_RC[gguf-compiled-2]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+ENGINE_UP
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 393, 64, 61]
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 6165, 8380, 557, 34319, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 7752, 28513, 557, 3354, 11, 321, 303, 220, 16, 24, 22, 17, 11, 279, 1118, 2678, 1746, 2263, 557, 5698, 13]
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-compiled-2.json
+DONE_MARKER_VLLM_GFX1151_GEN
+--- tail of LEG gguf-compiled-2 ---
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 393, 64, 61]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as $a^'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 6165, 8380, 557, 34319, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 7752, 28513, 557, 3354, 11, 321, 303, 220, 16, 24, 22, 17, 11, 279, 1118, 2678, 1746, 2263, 557, 5698, 13]
+GEN_TEXT[4] = ' the moon, and in 1970, the first computer mouse was invented. In 1971, the first microprocessor was created, and in 1972, the first video game console was released.'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-compiled-2.json
+DONE_MARKER_VLLM_GFX1151_GEN
+(EngineCore pid=389675) INFO 09-03 11:59:17 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=389675) INFO 09-03 11:59:17 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=389675) INFO 09-03 11:59:17 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=389675) INFO 09-03 11:59:17 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+WARNING 09-03 11:59:22 [utils.py:626] [shutdown] Process manager: force killing remaining processes count=1
+
+===== 4. is the compiled leg self-reproducible, and does it differ from eager? =====
+2026-09-03T11:59:25Z
+/workspace/vllm-gfx1151-2740/phase4.sh: line 33: 389506 Killed                  ( while true; do
+    A=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "$(date +%s) $A" >> "$LOCAL/mem4.samples"; if [ "$A" -lt "$FLOOR_MB" ]; then
+        G=$(cat "$LOCAL/gen4.pgid" 2> /dev/null); echo "WATCHDOG: MemAvailable ${A}MB < ${FLOOR_MB}MB -- killing group $G"; [ -n "$G" ] && kill -9 -- "-$G" 2> /dev/null;
+    fi; sleep 2;
+done ) > "$LOCAL/watchdog4.log" 2>&1
+EAGER1_EQ_EAGER2 = True
+COMPILED1_EQ_COMPILED2 = True
+EAGER1_EQ_COMPILED1 = False
+   prompt 3: first diff at 45  EAGER1=25  COMPILED1=393
+   prompt 4: first diff at 13  EAGER1=19820  COMPILED1=6165
+reproducibility_rc=0
+
+===== 5. postcondition =====
+2026-09-03T11:59:25Z
+               total        used        free      shared  buff/cache   available
+Mem:              62           3           4           0          55          58
+minMemAvailable_MB=55293 samples=316
+034a1e303fc39ac72044e2d4bfa79b084cc10b2867b9ec701288c1ab2978de25  /tmp/vllm-gfx1151-2740/tokens-gguf-compiled-2.json
+034a1e303fc39ac72044e2d4bfa79b084cc10b2867b9ec701288c1ab2978de25  /tmp/vllm-gfx1151-2740/tokens-gguf-compiled.json
+350b5fae5de4a25a62fdc2a839eefbfc69e2538f1eadfaa463b60a4c5d39434a  /tmp/vllm-gfx1151-2740/tokens-gguf-eager-2.json
+350b5fae5de4a25a62fdc2a839eefbfc69e2538f1eadfaa463b60a4c5d39434a  /tmp/vllm-gfx1151-2740/tokens-gguf-eager.json

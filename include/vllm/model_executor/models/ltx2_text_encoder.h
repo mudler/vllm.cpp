@@ -79,17 +79,56 @@
 // When a fourth epsilon arrives, it owes the same pair —
 // not a comment saying it matches upstream.
 //
-// ─── DTYPE ───────────────────────────────────────────────────────────────────
-// Everything here is f32, exactly as phase L2 (ltx2.h) records for the DiT: that
-// is NOT a widening of a bf16 path, it is the PARITY dtype of this gate, which
-// compares the ALGORITHM against upstream run in torch float32. Upstream resolves
-// ONE model dtype and every layer inherits it — `LTXGemmaTextEncoder` takes a
-// single `dtype` (base_encoder.py:41) and `FeatureExtractorV2.forward` casts the
-// normalized tensor straight back to `encoded.dtype` (feature_extractor.py:122),
-// so the production bf16 / FP8 / NVFP4 arms are a single stream-dtype choice —
-// phase L6 — and are OWED, not shipped. Every entry point that takes a
-// `compute_dtype` REFUSES anything but `vt::DType::kF32` with a message naming
-// the missing phase rather than silently computing in f32.
+// ─── DTYPE — TWO ARMS, AND THEY ARE NOT THE SAME ARITHMETIC ──────────────────
+// Upstream resolves ONE model dtype and every component inherits it:
+// `distilled.py:109` sets `self.dtype = torch.bfloat16` and hands that object to
+// `PromptEncoder` at `:111-113`, and `base_encoder.py:41` carries the same
+// default. **BF16 is therefore the PRODUCTION arm**, and it is what the render
+// path runs (`Ltx2TextProjectionsAsBf16`, ltx2_loader.h). F32 remains the PARITY
+// arm: it is the dtype the goldens beside this file were produced in, by
+// executing upstream's own modules in `torch.float32`, and it is what
+// `Ltx2WidenTextProjectionsToF32` exists to build.
+//
+// The two arms share no arithmetic, and that is deliberate, because upstream's
+// two normalization variants do NOT compute in the same dtype as each other on a
+// bf16 input. All four facts below were MEASURED against the pinned oracle
+// (LTX-2 `fd4ded7f`), not read off its source, and each is a golden in
+// tests/vllm/models/ltx2_text_goldens.inc section 7:
+//
+//  1. `_norm_and_concat_padded_batch` (V1) RETURNS FLOAT32 ON A BF16 INPUT. Its
+//     mean denominator is `(sequence_lengths * d) + eps` — an int64 tensor plus a
+//     Python float, which promotes to the DEFAULT dtype — so the mean is f32 and
+//     every later term inherits it. That is why `FeatureExtractorV1.forward`
+//     writes `self.aggregate_embed(normed.to(dtype))` at feature_extractor.py:94:
+//     the cast is V1's ONLY narrowing. A port that runs V1's norm in bf16
+//     arithmetic is wrong everywhere, not in the last ulp. Gated by
+//     `kLtxTeBf16NormV1IsF32`.
+//  2. `norm_and_concat_per_token_rms` (V2) IS bf16 throughout, and
+//     `encoded_text**2` materializes a bf16 tensor — each square is rounded to 8
+//     mantissa bits BEFORE the f32-accumulated mean sees it. Squaring in f32 is
+//     bit-wrong. Gated by `kLtxTeBf16VarianceBf16Squares` against
+//     `kLtxTeBf16VarianceF32Squares`, whose disagreement is itself asserted.
+//  3. A PYTHON FLOAT PAIRED WITH A BF16 TENSOR IS NARROWED FIRST, so the epsilon
+//     that reaches this arm is `bf16(1e-6) = 9.98377799987793e-07` (`0x3586`) and
+//     the rescale factor is `bf16(f32(sqrt(target/source)))`. Measured over all
+//     32639 finite non-negative bf16 values: `t + 1e-6` equals
+//     `bf16(f32(t) + f32(bf16(1e-6)))` everywhere and `bf16(f32(t) + f32(1e-6))`
+//     nowhere. The epsilon is INVISIBLE at bf16 for any ordinary variance — it is
+//     8 orders below bf16's 2^-8 resolution — so it is gated on the two inputs
+//     where it is the whole denominator, not on random values.
+//  4. `nn.Linear` ACCUMULATES IN F32 AND ROUNDS ONCE, BIAS INCLUDED. Measured
+//     bit-exact against `(x.f32 @ W.f32.T + b.f32).to(bf16)`. A port that rounds
+//     the GEMM output and then adds a bias rounds twice. This is why the bf16
+//     projection below hands `vt::MatmulBT` an F32 output tensor.
+//
+// One consequence reaches outside the extractor: `convert_to_additive_mask` takes
+// the FEATURES' dtype (embeddings_processor.py:117), so the bf16 arm's pad value
+// is `-finfo(bfloat16).max` (`0xff7f`), not `-finfo(float32).max`.
+//
+// The FP8 and NVFP4 arms are NOT here. They are upstream's quantization policies
+// (A22), not its default dtype, and every entry point below refuses them by name.
+//
+// See `.agents/specs/ltx25-a24-text-tower-bf16.md`.
 #pragma once
 
 #include <cstdint>
@@ -253,14 +292,74 @@ std::vector<float> Ltx2NormAndConcatPerTokenRms(const float* stacked,
 // the same `math.sqrt` of a double ratio upstream uses. V2 only.
 double Ltx2RescaleNorm(int64_t target_dim, int64_t source_dim);
 
+// ───────────────────────── the BF16 arm of the three above ───────────────────
+//
+// Same functions, at upstream's own resolved dtype. They are separate symbols
+// rather than a dtype branch inside the f32 ones for two reasons: the RETURN TYPE
+// differs (a `uint16_t` buffer is the memory-format change this row is), and V1's
+// normalization is NOT bf16 arithmetic at all (fact 1 in the DTYPE note), so a
+// shared body would have to be two bodies anyway.
+
+// feature_extractor.py:120 at bf16. Each f32 hidden value is narrowed
+// round-to-nearest-even on the way in, which is what `torch.stack` of an already
+// bf16 tower output is. Halves the [B, T, D, L] buffer — 770 MB at the shipped
+// 3840 x 49 and a 1024-wide padded prompt.
+std::vector<uint16_t> Ltx2StackHiddenStatesBf16(const Ltx2TextHiddenStates& states);
+
+// feature_extractor.py:12-45 on a bf16 stack. RETURNS F32, because upstream does:
+// see fact 1 in the DTYPE note. The narrowing to bf16 happens at :94, inside the
+// extractor, not here.
+std::vector<float> Ltx2NormAndConcatPaddedBatchBf16(const uint16_t* stacked,
+                                                    const int32_t* mask, int64_t batch,
+                                                    int64_t seq, int64_t hidden,
+                                                    int64_t layers);
+
+// feature_extractor.py:48-64 on a bf16 stack, in bf16 throughout, squaring to
+// bf16 before the f32-accumulated mean (fact 2).
+std::vector<uint16_t> Ltx2NormAndConcatPerTokenRmsBf16(const uint16_t* stacked,
+                                                       const int32_t* mask, int64_t batch,
+                                                       int64_t seq, int64_t hidden,
+                                                       int64_t layers);
+
+// The factor that actually multiplies a bf16 activation — which is the F32 one,
+// UNNARROWED, and is the exception to fact 3 rather than an instance of it.
+// Measured exhaustively over the bf16 domain: `mul` by a Python float uses the
+// f32 scalar everywhere, while `add` uses the bf16-narrowed one everywhere. The
+// caller multiplies in f32 and rounds the product once, exactly as torch does.
+float Ltx2RescaleNormBf16(int64_t target_dim, int64_t source_dim);
+
 // One caption projection: `torch.nn.Linear(flat_dim, out_features, bias=...)`.
-// `weight` is row-major [out_features, in_features] — torch's own layout, so the
-// checkpoint tensor is used as stored.
+// The weight is row-major [out_features, in_features] — torch's own layout, so
+// the checkpoint tensor is used as stored.
+//
+// EXACTLY ONE of the two storages is populated, and `dtype` says which. This is a
+// storage choice, not a flag: the shipped projections are [4096, 188160] and
+// [2048, 188160], so the f32 arm holds 4.6 GB where the checkpoint holds 2.3 GB
+// (ltx2_loader.h prices the widening at the same number). A `dtype` field beside
+// one f32 buffer would have recorded the arm without changing the bytes, which is
+// precisely the defect A24 exists to remove — AGENTS.md: a token gate cannot
+// detect a dtype that is too wide.
 struct Ltx2TextAggregateEmbed {
-  std::vector<float> weight;
-  std::vector<float> bias;  // empty when the Linear has bias=False
+  vt::DType dtype = vt::DType::kF32;
+  std::vector<float> weight;         // dtype == kF32
+  std::vector<float> bias;           // empty when the Linear has bias=False
+  std::vector<uint16_t> weight_bf16;  // dtype == kBF16
+  std::vector<uint16_t> bias_bf16;    // empty when the Linear has bias=False
   int64_t out_features = 0;
   int64_t in_features = 0;
+
+  // Element count of whichever storage this projection carries.
+  int64_t WeightCount() const {
+    return static_cast<int64_t>(dtype == vt::DType::kBF16 ? weight_bf16.size()
+                                                          : weight.size());
+  }
+  int64_t BiasCount() const {
+    return static_cast<int64_t>(dtype == vt::DType::kBF16 ? bias_bf16.size() : bias.size());
+  }
+  // What this projection actually occupies. The number the row is about.
+  size_t WeightBytes() const {
+    return static_cast<size_t>(WeightCount()) * (dtype == vt::DType::kBF16 ? 2u : 4u);
+  }
 };
 
 // The text encoder's projection weights. V1 populates `video` only and reports
@@ -269,6 +368,17 @@ struct Ltx2TextEncoderWeights {
   Ltx2TextAggregateEmbed video;  // text_embedding_projection.video_aggregate_embed
                                  // (V1: .aggregate_embed)
   Ltx2TextAggregateEmbed audio;  // text_embedding_projection.audio_aggregate_embed
+
+  // The arm these projections carry. Upstream has no equivalent because a torch
+  // module cannot disagree with itself: `PromptEncoder` is constructed with ONE
+  // dtype (distilled.py:111-113) and every parameter under it inherits it. A port
+  // that loads the two projections separately CAN disagree, so the disagreement
+  // is a refusal rather than a silent arm choice — same discipline as
+  // `RequireDeclaredProjection`'s bias and out_features checks.
+  //
+  // V1 populates `video` alone (encoder_configurator.py:187-188), so an audio
+  // projection with no weights at all is not a disagreement.
+  vt::DType ComputeDtype() const;
 };
 
 // The extractor output. `audio` is empty when the config has no audio projection;
@@ -280,8 +390,12 @@ struct Ltx2TextFeatures {
 };
 
 // feature_extractor.py:85-129 — the whole extractor: stack, normalize by the
-// selected variant, (V2) rescale per projection, project. `compute_dtype` must be
-// vt::DType::kF32 — see the DTYPE note at the top of this header.
+// selected variant, (V2) rescale per projection, project.
+//
+// `compute_dtype` selects the arm and must be `kF32` or `kBF16`; anything else is
+// refused BY NAME, FP8 and NVFP4 pointing at A22. It must also AGREE with what
+// `weights` carries — see `Ltx2TextEncoderWeights::ComputeDtype`. Selecting an
+// arm the weights cannot serve is a refusal, never a silent widening.
 //
 // REFUSES, by name, any disagreement between what `config` DECLARES and what
 // `weights` actually carries: `aggregate_bias` vs `w.bias.empty()`,
@@ -302,16 +416,30 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(
 
 // embeddings_processor.py:16-20 — `(mask - 1) * finfo(f32).max`, i.e. 0.0 for a
 // kept position and -FLT_MAX for a pad. Returns [batch, 1, 1, seq] flattened.
+//
+// `dtype` is the FEATURES' dtype, not a formatting choice:
+// `EmbeddingsProcessor.process_hidden_states` passes `video_feats.dtype`
+// (embeddings_processor.py:117) and `convert_to_additive_mask` multiplies by
+// `torch.finfo(dtype).max`. So the bf16 arm's pad value is
+// -3.3895313892515355e38 (`0xff7f`), not -FLT_MAX. The values are returned in an
+// f32 container either way because every bf16 value is exactly representable in
+// f32; the DTYPE decides the magnitude, and getting it from the container rather
+// than from the features is the mis-mirror this parameter exists to prevent.
 std::vector<float> Ltx2ConvertToAdditiveMask(const int32_t* mask, int64_t batch,
-                                             int64_t seq);
+                                             int64_t seq,
+                                             vt::DType dtype = vt::DType::kF32);
 
 // embeddings_processor.py:23-38 — the STABLE descending argsort of the binary
 // mask that places valid positions before pads while preserving their relative
 // order. Idempotent on an already right-padded input. Fills `sort_index`
 // [batch, seq] and `reordered_additive_mask` [batch, 1, 1, seq].
+//
+// `dtype` is the FEATURES' dtype, for the same reason `Ltx2ConvertToAdditiveMask`
+// takes one: :37 rebuilds the reordered mask with `finfo(additive_mask.dtype).max`.
 void Ltx2ComputeRightPadOrder(const float* additive_mask, int64_t batch,
                               int64_t seq, std::vector<int32_t>& sort_index,
-                              std::vector<float>& reordered_additive_mask);
+                              std::vector<float>& reordered_additive_mask,
+                              vt::DType dtype = vt::DType::kF32);
 
 // embeddings_processor.py:41-43 — gather `features` [batch, seq, dim] along seq
 // by `sort_index`.
@@ -607,6 +735,14 @@ struct Ltx2PromptConditioning {
 
 // `queue` runs the tower. `weights`/`config` are the caption projections and the
 // resolved V1/V2 shape, exactly as `Ltx2TextFeatureExtractorForward` takes them.
+//
+// THE ARM COMES FROM THE WEIGHTS, and there is no `compute_dtype` parameter here
+// on purpose. Upstream's dtype is a property of the constructed module, not of
+// the call (`PromptEncoder` takes `self.dtype` at distilled.py:111-113 and every
+// parameter under it inherits it), so this function reads
+// `weights.ComputeDtype()`. Handing it bf16 projections is what makes the render
+// path run upstream's own dtype, and `ltx2_video.cpp` does that by loading them
+// through `Ltx2TextProjectionsAsBf16` rather than `Ltx2WidenTextProjectionsToF32`.
 Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
     const Ltx2GemmaTower& tower, const tok::Tokenizer& tokenizer,
     const Ltx2GemmaSpecialIds& ids, const Ltx2TextEncoderWeights& weights,

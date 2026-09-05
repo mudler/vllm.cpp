@@ -12,6 +12,10 @@ on stderr:
 
     vllm-cli: run=2/5 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=1.234 tok_s=51.863
 
+Since #2832 it also reports what an ATTRIBUTION needs, on its own line:
+
+    vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_drafted_request_steps=28
+
 `--repeat` loads the model ONCE and completes N times, so the legs after the
 first are warm. This harness discards leg 1 for that NAMED CAUSE and no other:
 `.agents/benchmarking.md` allows discarding a cold leg for a named cause and
@@ -21,7 +25,13 @@ rather than applied silently, and every leg is kept in `legs`.
 What it does NOT claim
 ----------------------
 `vllm-cli` reports wall time and completion tokens, so this arm produces exactly
-one axis: `output_throughput_tok_s`, the median over the warm legs.
+one THROUGHPUT axis: `output_throughput_tok_s`, the median over the warm legs.
+
+Beside it, and not as an axis, `spec_acceptance` records what the drafter
+achieved (#2832): the two oracles both publish acceptance and this arm published
+none, so a 0.928x deficit could not be attributed to execution speed or to
+acceptance. It gates nothing and has no floor. It is folded from the same warm
+legs by the same predicate, so the two can be read against each other.
 
 It reports no time to first token and no peak device allocation, so this harness
 records neither and `dflash2_speed_harness.axis_rows` renders both `NOT
@@ -67,10 +77,12 @@ from tools.bench.dflash2_oracle_capture import (
 )
 from tools.bench.dflash2_speed_harness import (
     SSE_PING_ENV,
+    acceptance_reasons,
     build_recipe_reasons,
     checkpoint_reasons,
     clock_state_reasons,
     contention_reasons,
+    fold_acceptance,
     fold_legs,
     is_warm_leg,
     leg_reasons,
@@ -92,9 +104,12 @@ from tools.bench.gpu_clock_state import (
 #: because the ORACLE ARM APPLIES THE SAME ONE: a ratio between a median folded
 #: here and a median folded there is a ratio between two statistics.
 __all__ = [
+    "acceptance_reasons",
+    "fold_acceptance",
     "fold_legs",
     "leg_reasons",
     "legs_with_spans",
+    "parse_leg_acceptance",
     "parse_leg_spans",
     "parse_legs",
     "warm_leg_spans",
@@ -160,6 +175,47 @@ def parse_leg_spans(stderr_text: str) -> dict[int, tuple[float, float]]:
     return spans
 
 
+#: The ACCEPTANCE marker, positional against the THIRD format string
+#: `examples/cli/main.cpp` prints per leg (#2832). A third line for the reason
+#: the span marker is a second one: the timing line is parsed by evidence and
+#: readers that predate both, so its bytes do not move.
+#:
+#: The counts are the DELTA over the leg. `vllm_engine_spec_acceptance` reports
+#: totals for the life of the handle and `--repeat` keeps one handle for every
+#: leg, so the binary subtracts and this harness never has to.
+#:
+#: UNITS: `spec_drafts_accepted` EXCLUDES the bonus/replacement token a verify
+#: step always emits, exactly as vLLM's `spec_decode_num_accepted_tokens` does.
+#: `spec_drafted_request_steps` counts (REQUEST, STEP) PAIRS that carried a
+#: draft and NOT forward passes -- one verify forward over 8 drafted requests
+#: adds 8 -- which is also how vLLM's `spec_decode_num_drafts` and SGLang's
+#: `spec_verify_ct` count, so the comparison is exact at every concurrency.
+#: `fold_acceptance` owns the two derived figures and states the convention on
+#: each of them.
+LEG_SPEC_RE = re.compile(
+    r"run=(?P<run>\d+)/(?P<of>\d+)\s+spec_drafts_proposed=(?P<proposed>\d+)\s+"
+    r"spec_drafts_accepted=(?P<accepted>\d+)\s+spec_drafted_request_steps=(?P<steps>\d+)"
+)
+
+
+def parse_leg_acceptance(stderr_text: str) -> dict[int, tuple[int, int, int]]:
+    """Every acceptance marker `vllm-cli` printed, keyed by its run number.
+
+    ONE PROCESS AT A TIME, for the same reason `parse_leg_spans` is: `--repeat N`
+    numbers its legs 1..N and this harness launches one process per prompt, so
+    the key is unique within one invocation's text and would collide across four.
+    """
+
+    counts: dict[int, tuple[int, int, int]] = {}
+    for match in LEG_SPEC_RE.finditer(stderr_text):
+        counts[int(match.group("run"))] = (
+            int(match.group("proposed")),
+            int(match.group("accepted")),
+            int(match.group("steps")),
+        )
+    return counts
+
+
 def legs_with_spans(stderr_text: str) -> list[dict[str, Any]]:
     """This process's legs, each carrying the instants it generated between.
 
@@ -172,6 +228,7 @@ def legs_with_spans(stderr_text: str) -> list[dict[str, Any]]:
 
     legs = parse_legs(stderr_text)
     spans = parse_leg_spans(stderr_text)
+    counts = parse_leg_acceptance(stderr_text)
     for leg in legs:
         span = spans.get(int(leg["run"]))
         if span is None:
@@ -183,6 +240,27 @@ def legs_with_spans(stderr_text: str) -> list[dict[str, Any]]:
                 "this arm"
             )
         leg["generate_start_unix"], leg["generate_end_unix"] = span
+        # THE SAME RULE AS THE SPAN, FOR THE SAME REASON (#2832). A leg with no
+        # acceptance marker is a refusal and never a leg with a null acceptance:
+        # this row exists because our arm recorded no acceptance at all while
+        # both oracles did, and a field that goes quietly null under an old
+        # binary reproduces that state under a new name.
+        count = counts.get(int(leg["run"]))
+        if count is None:
+            raise HarnessError(
+                f"legs: run {leg['run']} printed a timing line and NO acceptance "
+                "marker, so this run cannot say whether it is slower because it "
+                "EXECUTES slower or because it ACCEPTS less. The marker is "
+                "`spec_drafts_proposed=`/`spec_drafts_accepted=`/"
+                "`spec_drafted_request_steps=`, printed by `examples/cli/main.cpp` from "
+                "`vllm_engine_spec_acceptance` (ABI v25); a binary built before "
+                "it cannot drive this arm"
+            )
+        (
+            leg["spec_drafts_proposed"],
+            leg["spec_drafts_accepted"],
+            leg["spec_drafted_request_steps"],
+        ) = count
     return legs
 
 
@@ -412,7 +490,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             # cannot be placed in time would shrink it silently.
             legs += legs_with_spans(run_binary(args, prompt))
     require_no_reasons(
-        leg_reasons(legs, max_tokens=args.max_tokens), what="DFlash2 our-arm capture"
+        leg_reasons(legs, max_tokens=args.max_tokens)
+        # #2832. The acceptance axis is refused HERE, beside the throughput
+        # axis, and not left to be discovered as a null field in the record.
+        # `--speculative-config` is required by the precheck, so every leg of
+        # this arm speculated and a leg that proposed nothing is a defect.
+        + acceptance_reasons(legs, label="ours"),
+        what="DFlash2 our-arm capture",
     )
 
     clock, span_error = spanned_clock(window, legs)

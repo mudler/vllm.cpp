@@ -56,7 +56,7 @@ unless another file is named.
 |---|---|---|
 | `spatial_downscale` | 2 | `:223-229`, `width // 2` / `height // 2` |
 | `sigmas` | empty (derived) | `:243-245`, `self._scheduler.execute(steps=num_inference_steps)` |
-| `schedule_tokens` | `kSchedulerDefault` | the same call passes NO latent; `schedulers.py:31` |
+| `schedule_tokens` | `kSchedulerDefault` | the same call passes NO latent; `schedulers.py:32` |
 | `noise_scale` | 1.0 | `:266-267` sets none; `ModalitySpec.noise_scale` defaults 1.0 (`utils/types.py:110`) |
 | `video_guidance` | `params.video_guider` | `:251-254`, from `MultiModalGuiderParams` the CLI fills (`:343-350`) |
 | `audio_guidance` | `params.audio_guider` | `:255-258`, filled from `--audio-*` / `--v2a-guidance-scale` (`:351-358`) |
@@ -147,7 +147,7 @@ uses: the prompt travels with the GENERATION, not with the pipeline.
 ## The divergence this row resolves
 
 `ti2vid_two_stages.py:243-245` calls `execute(steps=num_inference_steps)` with
-**no latent**, and `schedulers.py:31` reads that as
+**no latent**, and `schedulers.py:32` reads that as
 `default_number_of_tokens` = `MAX_SHIFT_ANCHOR` = **4096** (`:11`, `:29`).
 This engine derives the shift from `target_tokens` on every phase
 (`ltx2_video.cpp:3442-3443`). So a faithful `ti2vid_two_stage` cannot be written

@@ -8,6 +8,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/entrypoints/model_loader.h"
 #include "vllm/v1/kv_cache_interface.h"
 
 #include <doctest/doctest.h>
@@ -435,4 +436,66 @@ TEST_CASE("deepseek-v4 kv-cache: a block_size that cannot hold a C128A row is re
   CHECK_THROWS_AS(RegistryKVCache(32, 8), std::runtime_error);
   // 128 divides 128 exactly and gives storage_block_size 1: representable.
   CHECK_NOTHROW(RegistryKVCache(128, 8));
+}
+
+// A LoadedModel that carries a registration and nothing else. The engine funnel
+// reads only `registration()` on the way to the KV geometry, so this is enough
+// to enter it without a checkpoint.
+namespace {
+class ScaffoldModel final : public vllm::LoadedModel {
+ public:
+  explicit ScaffoldModel(const vllm::ModelRegistration& r) : LoadedModel(r) {}
+};
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// THE DEFAULT CONFIGURATION. `AGENTS.md` measures reachability on the entry
+// point's DEFAULT configuration, and on 2026-08-31 the real 97.68 GiB artifact
+// did not load on one: `EngineParams::block_size` is 32, a `compress_ratio`-128
+// layer needs 256, and `MakeDeepseekV4KVCache` refused by name. `vllm-server`
+// takes `--block-size`; `vllm-cli` does not, so the model was reachable only by
+// an operator who guessed a number. Upstream does not ask -- it DERIVES the
+// geometry from the model (`sparse_swa.py:76-83`, `compressor.py:174-178`), and
+// `kv_block_size_floor` is that derivation.
+TEST_CASE("deepseek-v4 pages at the engine's DEFAULT block size") {
+  const HfConfig cfg = RealConfig();
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(cfg);
+
+  // READ the default, never retype it: what is gated is the number the engine
+  // actually starts from, so a change to that field must reach this test.
+  const int requested = vllm::entrypoints::EngineParams{}.block_size;
+
+  // The raw default must STAY unbuildable. If this stops throwing the geometry
+  // changed underneath, and the resolution below would be gating nothing.
+  CHECK_THROWS(reg.factory->make_kv_cache(cfg, requested, 64));
+
+  // THE ENGINE FUNNEL, not the resolver beneath it: `LoadedEngine` ctor ->
+  // MakeKVCacheResolved -> MakeKVCacheMaybeSpec. Entering at
+  // `ResolveKVBlockSize` would prove the arithmetic and leave the loader free to
+  // stop calling it -- measured on 2026-08-31, deleting that call site left this
+  // file, test_loaded_engine_dense and test_kv_cache_fp8_wiring all green.
+  ScaffoldModel model(reg);
+  vllm::v1::KVCacheConfig kv;
+  REQUIRE_NOTHROW(kv = vllm::entrypoints::LoadedEngine::MakeKVCacheMaybeSpec(
+                      model, cfg, requested, 64, std::nullopt));
+  CHECK_FALSE(kv.kv_cache_groups.empty());
+
+  // And the page the ratio-128 group publishes holds at least one token, which
+  // is the property the refusal exists to protect.
+  const int resolved = ModelRegistry::ResolveKVBlockSize(reg, requested);
+  CHECK(resolved > requested);
+  CHECK(resolved % 128 == 0);
+  CHECK(resolved / 128 >= 1);
+}
+
+// An architecture that declares NO floor keeps exactly what the caller asked
+// for. Without this the floor could be a blanket rewrite of every model's block
+// size and the case above would still pass.
+TEST_CASE("a model with no declared floor keeps the requested block size") {
+  HfConfig other;
+  other.architectures = {"Qwen3ForCausalLM"};
+  const vllm::ModelRegistration& reg = ModelRegistry::Resolve(other);
+  REQUIRE(reg.factory->kv_block_size_floor == 0);
+  for (int bs : {1, 16, 32, 256, 512})
+    CHECK(ModelRegistry::ResolveKVBlockSize(reg, bs) == bs);
 }

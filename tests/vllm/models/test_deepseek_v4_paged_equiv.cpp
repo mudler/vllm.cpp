@@ -375,6 +375,13 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   // name would drop a cache. All three produce plausible tokens.
   const int64_t L = 3, HD = 32;
   const vt::Device dev{vt::DeviceType::kCPU, 0};
+  // MODEL-DSV4-PAGED-ENTRY (#2447): the GGUF paged arm's three answers, spelled
+  // out. That arm forces every layer dense and carries no compressor state, so
+  // its compressor refusal is UNCHANGED by the narrowing this row makes -- which
+  // is what the cases below still measure.
+  constexpr bool kDsaDense = true;
+  constexpr bool kNoCompressorState = false;
+  constexpr int64_t kOneToken = 1;
   std::vector<std::vector<float>> storage;
   const auto caches = FakeCaches(static_cast<size_t>(L), HD, &storage);
   FakeIndex fx;
@@ -385,7 +392,9 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
 
   // THE SERVED SHAPE: one request, every layer SWA-only, every name resolving.
   std::vector<vt::Tensor> pages;
-  CHECK(vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 1, dev, &pages).empty());
+  CHECK(vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 1, dev, &pages,
+                                        kDsaDense, kNoCompressorState, kOneToken)
+            .empty());
   REQUIRE(pages.size() == static_cast<size_t>(L));
   for (const auto& t : pages) {
     CHECK(t.rank == 3);
@@ -396,7 +405,8 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   // 1. A BATCH refuses -- one `kv_base` cannot serve several context lengths.
   pages.clear();
   const std::string batched =
-      vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 2, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 2, dev, &pages,
+                                      kDsaDense, kNoCompressorState, kOneToken);
   CHECK(batched.find("one request per step only") != std::string::npos);
   CHECK(pages.empty());
 
@@ -404,7 +414,8 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   auto with_comp = params;
   with_comp.compress_ratios[1] = 128;
   const std::string comp =
-      vllm::ResolveDeepseekV4SwaPages(with_comp, mk, caches, 1, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(with_comp, mk, caches, 1, dev, &pages,
+                                      kDsaDense, kNoCompressorState, kOneToken);
   CHECK(comp.find("has a compressor") != std::string::npos);
   CHECK(comp.find("#2286") != std::string::npos);
 
@@ -414,15 +425,112 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   missing.names[1] = "model.layers.1.attn.some_other_cache";
   const auto mk_missing = missing.Index();
   const std::string unresolved =
-      vllm::ResolveDeepseekV4SwaPages(params, mk_missing, caches, 1, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(params, mk_missing, caches, 1, dev, &pages,
+                                      kDsaDense, kNoCompressorState, kOneToken);
   CHECK(unresolved.find("no published cache named") != std::string::npos);
 
   // 4. A WRONG head_size refuses -- the cache would be read at the wrong width.
   auto wrong = caches;
   wrong[2].head_size = HD / 2;
   const std::string bad_width =
-      vllm::ResolveDeepseekV4SwaPages(params, mk, wrong, 1, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(params, mk, wrong, 1, dev, &pages, kDsaDense,
+                                      kNoCompressorState, kOneToken);
   CHECK(bad_width.find("head_size") != std::string::npos);
+}
+
+TEST_CASE("PAGED-ENTRY: the resolver's compressor clause IS the composition's (#2447)") {
+  // `MODEL-DSV4-PAGED-ENTRY` (#2447). The refusal above was written when NOTHING
+  // composed a compressor layer. `deepseek_v4.cpp`'s `AttentionBlock` has
+  // admitted `compress_ratio` 4 and 128 with carried state since
+  // MODEL-DSV4-DSA-COMPOSE, so the two derivations disagreed -- and they
+  // disagreed over 41 of the real artifact's 43 layers, i.e. precisely the set
+  // the EXL3 paged arm exists to serve.
+  //
+  // The narrowing is not a second copy of the composition's clauses: both sides
+  // now CALL `DeepseekV4PagedArmComposesCompressor`. This case drives that one
+  // expression through every answer it has.
+  const int64_t L = 3, HD = 32;
+  const vt::Device dev{vt::DeviceType::kCPU, 0};
+  std::vector<std::vector<float>> storage;
+  const auto caches = FakeCaches(static_cast<size_t>(L), HD, &storage);
+  FakeIndex fx;
+  for (int64_t l = 0; l < L; ++l)
+    fx.names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  const auto mk = fx.Index();
+
+  auto with_ratio = [&](int64_t ratio) {
+    auto p = SwaOnlyParams(L, HD);
+    p.compress_ratios[1] = ratio;
+    return p;
+  };
+  std::vector<vt::Tensor> pages;
+
+  // THE PREDICATE ITSELF, at every answer. This is the expression `AttentionBlock`
+  // reads as `comp_arm`, so these four lines pin the composition's rule too.
+  const auto p128 = with_ratio(128);
+  CHECK(vllm::DeepseekV4PagedArmComposesCompressor(p128, 1, /*dsa_dense=*/false,
+                                                   /*have_state=*/true));
+  CHECK_FALSE(vllm::DeepseekV4PagedArmComposesCompressor(p128, 1, false, false));
+  CHECK_FALSE(vllm::DeepseekV4PagedArmComposesCompressor(p128, 1, true, true));
+  CHECK_FALSE(vllm::DeepseekV4PagedArmComposesCompressor(p128, 0, false, true));
+
+  // 1. A `compress_ratio == 128` layer with state on a non-dense arm is ADMITTED.
+  //    Before this row it refused, which is the whole defect.
+  pages.clear();
+  CHECK(vllm::ResolveDeepseekV4SwaPages(p128, mk, caches, 1, dev, &pages,
+                                        /*dsa_dense=*/false,
+                                        /*have_compressor_state=*/true,
+                                        /*num_tokens=*/1)
+            .empty());
+  CHECK(pages.size() == static_cast<size_t>(L));
+
+  // 2. `compress_ratio == 4` too -- the indexer family the composition admits.
+  pages.clear();
+  CHECK(vllm::ResolveDeepseekV4SwaPages(with_ratio(4), mk, caches, 1, dev, &pages,
+                                        false, true, 1)
+            .empty());
+
+  // 3. A ratio the composition does NOT compose still refuses. A narrowing that
+  //    went one clause too far would pass this by admitting everything.
+  pages.clear();
+  const std::string odd = vllm::ResolveDeepseekV4SwaPages(
+      with_ratio(7), mk, caches, 1, dev, &pages, false, true, 1);
+  CHECK(odd.find("has a compressor") != std::string::npos);
+  CHECK(odd.find("#2447") != std::string::npos);
+
+  // 4. WITHOUT carried state the same admitted layer refuses. Adding the arm
+  //    must not make the absence of its state silent.
+  pages.clear();
+  CHECK_FALSE(vllm::ResolveDeepseekV4SwaPages(p128, mk, caches, 1, dev, &pages,
+                                              false, /*have_state=*/false, 1)
+                  .empty());
+
+  // 5. DECODE ONLY on the composed arm: `MergeWindowAndCompressed` reshapes the
+  //    LSE buffers rather than transposing them.
+  pages.clear();
+  const std::string prefill = vllm::ResolveDeepseekV4SwaPages(
+      p128, mk, caches, 1, dev, &pages, false, true, /*num_tokens=*/4);
+  CHECK(prefill.find("DECODE") != std::string::npos);
+  // ... and the DENSE arm is untouched by it: a T > 1 prefill over SWA-only
+  // layers is exactly what `DeepseekV4ForwardGgufPaged` serves today.
+  pages.clear();
+  CHECK(vllm::ResolveDeepseekV4SwaPages(SwaOnlyParams(L, HD), mk, caches, 1, dev,
+                                        &pages, /*dsa_dense=*/true,
+                                        /*have_compressor_state=*/false,
+                                        /*num_tokens=*/4)
+            .empty());
+
+  // 6. A PACKED page refuses by name. The runner publishes the SWA pages at
+  //    `kI8` / `fp8_ds_mla`, and `vt::ConcatAndCacheMla` takes a float cache
+  //    only -- so without this the route aborts inside a kernel with a message
+  //    naming neither the topology nor the row that owes the store.
+  auto packed = caches;
+  packed[1].dtype = vt::DType::kI8;
+  pages.clear();
+  const std::string i8 = vllm::ResolveDeepseekV4SwaPages(
+      p128, mk, packed, 1, dev, &pages, false, true, 1);
+  CHECK(i8.find("PACKED page") != std::string::npos);
+  CHECK(i8.find("KV-DSV4-MULTICACHE W8") != std::string::npos);
 }
 
 TEST_CASE("W1: two LSE-merged passes equal one pass over the union — sink in EXACTLY one") {
@@ -659,7 +767,7 @@ TEST_CASE("W1: the compressor layer step is a STATE MACHINE across steps") {
     CHECK(last_out[i] == doctest::Approx(ref[i]).epsilon(1e-6));
 }
 
-TEST_CASE("W1: the compressor step REFUSES the coff == 2 shape") {
+TEST_CASE("W3: the compressor step now ACCEPTS coff == 2, and refuses other ratios") {
   // `compress_ratio == 4` is overlapped windows plus the Lightning Indexer, which
   // is W3. Accepting it here would run the coff == 1 arithmetic on a shape whose
   // gathering window is twice as wide.
@@ -675,9 +783,18 @@ TEST_CASE("W1: the compressor step REFUSES the coff == 2 shape") {
   const std::vector<float> ape(static_cast<size_t>(4 * hd), 0.01f);
   const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
   const std::vector<float> sink(static_cast<size_t>(nh), 0.0f);
-  CHECK_THROWS(vllm::deepseek_v4::CompressorLayerStep(
+  // `compress_ratio == 4` is coff == 2 and W3 implements it, so it is ACCEPTED
+  // now. The operands here are the collapsed width, which selects coff == 1 --
+  // upstream cannot emit that shape on a cr == 4 layer, but this tree's synthetic
+  // suites carry it and the forward has always read it.
+  CHECK_NOTHROW(vllm::deepseek_v4::CompressorLayerStep(
       q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, 1, 16, &st_kv, &st_score, &rows,
       {0}, 0, 1, nh, H, hd, /*compress_ratio=*/4, 4, 1e-6f, 1.0f));
+  // A ratio upstream does not emit still refuses (`sparse_swa.py:44-55`).
+  std::vector<float> s2_kv, s2_sc, r2;
+  CHECK_THROWS(vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, 1, 16, &s2_kv, &s2_sc, &r2,
+      {0}, 0, 1, nh, H, hd, /*compress_ratio=*/8, 4, 1e-6f, 1.0f));
 }
 
 TEST_CASE("W1: a step that CLOSES a window emits rows and the merge runs") {
@@ -786,4 +903,270 @@ TEST_CASE("W1: a step resuming past the compressor's state REFUSES (#2286)") {
       q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, nb, bs, &st_kv, &st_score,
       &rows, {1}, /*kv_base=*/1, 1, nh, H, hd, cr, win, 1e-6f, 1.0f));
   CHECK(st_kv.size() == static_cast<size_t>(2 * hd));
+}
+
+TEST_CASE("W3: the indexer's compressed KEYS come from its own second compressor") {
+  // `attention.py:768-776`. The indexer owns a second `DeepseekCompressor` at
+  // `head_dim = index_head_dim`, and its pooled rows are the KEYS the top-k
+  // scores against rather than an attention contributor -- so this produces keys
+  // and nothing else.
+  //
+  // `rope_dim` is the MODEL's `qk_rope_head_dim` and not a function of
+  // `index_head_dim` (`compressor.py:240`), which is the detail a reader would
+  // most likely derive wrongly from the indexer's own width.
+  // T == 8, so TWO windows close: at position 3 (base 0) and 7 (base 4). The
+  // first window's base is 0, where RoPE is the IDENTITY -- a case that stopped
+  // at T == 4 would compare a rotated row against an unrotated one and find them
+  // equal, which is exactly what the first version of this case did.
+  const int64_t H = 8, ihd = 8, cr = 4, rd = 4, T = 8;
+  const int64_t iw = 2 * ihd;  // coff is always 2 where the indexer exists
+
+  const std::vector<float> x = Rand(static_cast<size_t>(T * H), 3311u, 0.3f);
+  const std::vector<float> wk = Rand(static_cast<size_t>(iw * H), 3312u, 0.1f);
+  const std::vector<float> wg = Rand(static_cast<size_t>(iw * H), 3313u, 0.1f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * iw), 3314u, 0.05f);
+  const std::vector<float> nrm(static_cast<size_t>(ihd), 1.0f);
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = t;
+
+  std::vector<float> st_kv, st_sc;
+  const std::vector<float> keys = vllm::deepseek_v4::IndexerCompressedKeys(
+      x, wk, wg, ape, nrm, &st_kv, &st_sc, pos, T, H, ihd, cr, rd, 10000.0, 1e-6f);
+
+  // Boundaries at 3 and 7, so TWO key rows, each at the indexer's own width --
+  // NOT the doubled width the projections carry.
+  REQUIRE(keys.size() == static_cast<size_t>(2 * ihd));
+  double mag = 0.0;
+  for (const float v : keys) {
+    REQUIRE(std::isfinite(v));
+    mag = std::max(mag, std::abs(static_cast<double>(v)));
+  }
+  CHECK(mag > 1e-6);
+
+  // The state accumulated the DOUBLED rows, since a token carries both roles.
+  CHECK(st_kv.size() == static_cast<size_t>(T * iw));
+  CHECK(st_sc.size() == static_cast<size_t>(T * iw));
+
+  // THE KEY IS ROTATED: the same run with rope off must differ, or the indexer's
+  // keys would be position-blind exactly as the attention compressor's were.
+  std::vector<float> u_kv, u_sc;
+  const std::vector<float> unrot = vllm::deepseek_v4::IndexerCompressedKeys(
+      x, wk, wg, ape, nrm, &u_kv, &u_sc, pos, T, H, ihd, cr, /*rope_dim=*/0, 10000.0,
+      1e-6f);
+  REQUIRE(unrot.size() == keys.size());
+  // The FIRST row's base is 0, so rotation is the identity there and the two must
+  // AGREE -- that is the window-base rule showing itself.
+  for (int64_t d = 0; d < ihd; ++d)
+    CHECK(keys[static_cast<size_t>(d)] ==
+          doctest::Approx(unrot[static_cast<size_t>(d)]));
+  // The SECOND row's base is 4, so its rope tail MUST differ.
+  double diff = 0.0;
+  for (int64_t d = ihd - rd; d < ihd; ++d)
+    diff = std::max(diff, std::abs(static_cast<double>(keys[static_cast<size_t>(ihd + d)] -
+                                                       unrot[static_cast<size_t>(ihd + d)])));
+  CHECK(diff > 1e-6);
+  // ...and only the ROPE TAIL moved; the nope half is position-independent.
+  for (int64_t d = 0; d < ihd - rd; ++d)
+    CHECK(keys[static_cast<size_t>(ihd + d)] ==
+          doctest::Approx(unrot[static_cast<size_t>(ihd + d)]));
+
+  // THE KV AND THE GATE ARE DISTINCT OPERANDS. They are fused into one projection
+  // upstream but are not the same half: the KV is pooled, the gate only weights
+  // the pooling. Every assertion above is structural and holds for ANY
+  // non-degenerate KV, so a mutation pooling the GATE as the KV survived them.
+  // Running with the gate in both slots must give different keys.
+  std::vector<float> g_kv, g_sc;
+  const std::vector<float> gate_as_kv = vllm::deepseek_v4::IndexerCompressedKeys(
+      x, /*idx_wk=*/wg, wg, ape, nrm, &g_kv, &g_sc, pos, T, H, ihd, cr, rd, 10000.0,
+      1e-6f);
+  REQUIRE(gate_as_kv.size() == keys.size());
+  double swap = 0.0;
+  for (size_t i = 0; i < keys.size(); ++i)
+    swap = std::max(swap, std::abs(static_cast<double>(keys[i] - gate_as_kv[i])));
+  CHECK(swap > 1e-6);
+}
+
+TEST_CASE("W3: the indexer REFUSES a ratio it cannot exist at") {
+  const int64_t H = 4, ihd = 4, iw = 8;
+  const std::vector<float> x(static_cast<size_t>(H), 0.1f);
+  const std::vector<float> wk(static_cast<size_t>(iw * H), 0.1f);
+  const std::vector<float> wg(static_cast<size_t>(iw * H), 0.1f);
+  const std::vector<float> ape(static_cast<size_t>(128 * iw), 0.0f);
+  const std::vector<float> nrm(static_cast<size_t>(ihd), 1.0f);
+  std::vector<float> st_kv, st_sc;
+  // The indexer exists ONLY at cr == 4 (`attention.py:274`).
+  CHECK_THROWS(vllm::deepseek_v4::IndexerCompressedKeys(
+      x, wk, wg, ape, nrm, &st_kv, &st_sc, {0}, 1, H, ihd, /*cr=*/128, 2, 10000.0,
+      1e-6f));
+}
+
+TEST_CASE("W3: selection returns COMPRESSED-ROW indices, -1 padded") {
+  // `attention.py:71-87`: `num_compressed = (position + 1) / compress_ratio`
+  // rows exist at a position, an index addresses one of THOSE, and `-1` pads the
+  // row out to `top_k`. Reading `-1` as row zero would attend a real key at every
+  // unfilled slot, finitely and wrongly.
+  const int64_t inh = 1, ihd = 4, cr = 4, topk = 3, T = 3, n_rows = 4;
+  // Keys chosen so the score ORDER is decidable by hand: row r has magnitude r.
+  std::vector<float> keys(static_cast<size_t>(n_rows * ihd), 0.0f);
+  for (int64_t r = 0; r < n_rows; ++r)
+    for (int64_t d = 0; d < ihd; ++d)
+      keys[static_cast<size_t>(r * ihd + d)] = static_cast<float>(r);
+  // A uniform positive query and a unit fold, so the score is monotone in r.
+  const std::vector<float> iq(static_cast<size_t>(T * inh * ihd), 1.0f);
+  const std::vector<float> folded(static_cast<size_t>(T * inh), 1.0f);
+  // Positions 3, 7, 11 -> 1, 2, 3 closed rows respectively.
+  const std::vector<int64_t> pos{3, 7, 11};
+
+  const auto sel = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, folded, pos, T, n_rows, inh, ihd, topk, cr);
+  REQUIRE(sel.size() == static_cast<size_t>(T * topk));
+
+  // Token 0: ONE row available, so one index and two padding slots.
+  CHECK(sel[0] == 0);
+  CHECK(sel[1] == -1);
+  CHECK(sel[2] == -1);
+  // Token 1: two rows; the higher-scoring (larger r) comes first.
+  CHECK(sel[3] == 1);
+  CHECK(sel[4] == 0);
+  CHECK(sel[5] == -1);
+  // Token 2: three rows, best first.
+  CHECK(sel[6] == 2);
+  CHECK(sel[7] == 1);
+  CHECK(sel[8] == 0);
+}
+
+TEST_CASE("W3: a position with NO closed row selects nothing") {
+  // Below the first boundary there is nothing to select, and the whole row must
+  // stay padding rather than fall back to row zero.
+  const int64_t inh = 1, ihd = 2, cr = 4, topk = 2, T = 1, n_rows = 3;
+  const std::vector<float> keys(static_cast<size_t>(n_rows * ihd), 1.0f);
+  const std::vector<float> iq(static_cast<size_t>(T * inh * ihd), 1.0f);
+  const std::vector<float> folded(static_cast<size_t>(T * inh), 1.0f);
+  const auto sel = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, folded, {2}, T, n_rows, inh, ihd, topk, cr);  // (2+1)/4 == 0
+  REQUIRE(sel.size() == 2u);
+  CHECK(sel[0] == -1);
+  CHECK(sel[1] == -1);
+}
+
+TEST_CASE("W3: the per-head FOLD is load-bearing in the score") {
+  // The weights_proj fold weights each head's dot product. Flipping one head's
+  // sign must change which row wins, or the fold is decoration.
+  const int64_t inh = 2, ihd = 2, cr = 1, topk = 1, T = 1, n_rows = 2;
+  // head 0 prefers row 0, head 1 prefers row 1.
+  const std::vector<float> keys{2.0f, 0.0f, 0.0f, 2.0f};
+  const std::vector<float> iq{1.0f, 0.0f, 0.0f, 1.0f};  // [h0 q, h1 q]
+  const std::vector<int64_t> pos{1};  // (1+1)/1 == 2 rows available
+
+  const auto a = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, /*folded=*/{1.0f, 0.0f}, pos, T, n_rows, inh, ihd, topk, cr);
+  const auto b = vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, keys, /*folded=*/{0.0f, 1.0f}, pos, T, n_rows, inh, ihd, topk, cr);
+  CHECK(a[0] == 0);  // head 0 dominates
+  CHECK(b[0] == 1);  // head 1 dominates
+}
+
+TEST_CASE("W3: selection refuses PER-TOKEN keys, which is the operand it replaced") {
+  const int64_t inh = 1, ihd = 4, cr = 4, topk = 2, T = 2;
+  const std::vector<float> iq(static_cast<size_t>(T * inh * ihd), 1.0f);
+  const std::vector<float> folded(static_cast<size_t>(T * inh), 1.0f);
+  const std::vector<float> per_token(static_cast<size_t>(T * ihd), 1.0f);
+  // n_rows says 3 but the buffer holds 2 rows' worth: a mismatch, refused.
+  CHECK_THROWS(vllm::deepseek_v4::IndexerSelectCompressed(
+      iq, per_token, folded, {3, 7}, T, /*n_rows=*/3, inh, ihd, topk, cr));
+}
+
+TEST_CASE("W3: the gather drops -1 padding and keeps selection order") {
+  // The `cr == 4` family attends the window plus the rows the indexer CHOSE,
+  // where `cr == 128` attends the window plus ALL closed rows. This is the only
+  // difference at the attention, so it is the whole of what W3 adds there.
+  const int64_t hd = 3, n_rows = 4;
+  std::vector<float> rows(static_cast<size_t>(n_rows * hd), 0.0f);
+  for (int64_t r = 0; r < n_rows; ++r)
+    for (int64_t d = 0; d < hd; ++d)
+      rows[static_cast<size_t>(r * hd + d)] = static_cast<float>(10 * r + d);
+
+  // Selection order is best-first and NOT sorted by row; padding trails it.
+  const std::vector<int64_t> sel{2, 0, -1, -1};
+  const auto got = vllm::deepseek_v4::GatherSelectedCompressed(rows, sel, n_rows, hd);
+  REQUIRE(got.size() == static_cast<size_t>(2 * hd));
+  // Row 2 first, then row 0 -- selection order preserved.
+  CHECK(got[0] == doctest::Approx(20.0f));
+  CHECK(got[1] == doctest::Approx(21.0f));
+  CHECK(got[2] == doctest::Approx(22.0f));
+  CHECK(got[3] == doctest::Approx(0.0f));
+  CHECK(got[4] == doctest::Approx(1.0f));
+  CHECK(got[5] == doctest::Approx(2.0f));
+}
+
+TEST_CASE("W3: an ALL-padding selection gathers nothing") {
+  // Before the first boundary every slot is `-1`. The result must be EMPTY, which
+  // is what makes the caller fall back to the window pass alone rather than merge
+  // against a fabricated row.
+  const int64_t hd = 2, n_rows = 3;
+  const std::vector<float> rows(static_cast<size_t>(n_rows * hd), 1.0f);
+  const auto got =
+      vllm::deepseek_v4::GatherSelectedCompressed(rows, {-1, -1, -1}, n_rows, hd);
+  CHECK(got.empty());
+}
+
+TEST_CASE("W3: an index PAST the closed rows is refused, not clamped") {
+  // Distinct from padding: `-1` means "no row", while `n_rows` means the selection
+  // is wrong. Clamping would attend the newest row whenever selection overran.
+  const int64_t hd = 2, n_rows = 2;
+  const std::vector<float> rows(static_cast<size_t>(n_rows * hd), 1.0f);
+  CHECK_THROWS(
+      vllm::deepseek_v4::GatherSelectedCompressed(rows, {0, 2}, n_rows, hd));
+}
+
+TEST_CASE("W3: a SELECTION narrows which compressed rows the step attends") {
+  // The `cr == 4` family differs from `cr == 128` at the attention in exactly one
+  // way: the indexer chooses which closed rows to attend. This proves the
+  // selection reaches the merge, and that a null selection still means all rows.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 1, H = 16, cr = 128, win = 8, T = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const int64_t bs = 16, nb = (T + bs - 1) / bs;
+
+  const std::vector<float> wgate = Rand(static_cast<size_t>(hd * H), 4111u, 0.05f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * hd), 4112u, 0.05f);
+  const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
+  const std::vector<float> sink(static_cast<size_t>(nh), -0.1f);
+  const std::vector<float> x = Rand(static_cast<size_t>(T * H), 4200u, 0.2f);
+  const std::vector<float> kv = Rand(static_cast<size_t>(T * hd), 4250u, 0.2f);
+  const std::vector<float> qq = Rand(static_cast<size_t>(T * nh * hd), 4290u, 0.2f);
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = t;
+
+  const auto run = [&](const std::vector<int64_t>* sel) {
+    std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+    std::copy(kv.begin(), kv.end(), cache.begin());
+    vt::Tensor tc = Contig(cache.data(), vt::DType::kF32, q.device, {nb, bs, hd});
+    std::vector<float> sk, ss, rows;
+    return vllm::deepseek_v4::CompressorLayerStep(
+        q, x, kv, qq, wgate, ape, cnorm, sink, tc, nb, bs, &sk, &ss, &rows, pos,
+        /*kv_base=*/0, T, nh, H, hd, cr, win, 1e-6f, scale, /*rope_dim=*/0,
+        /*rope_theta=*/10000.0, sel);
+  };
+
+  // One window closes at position 127, so exactly one row exists.
+  const std::vector<float> all = run(nullptr);
+  const std::vector<int64_t> pick0{0};
+  const std::vector<float> chosen = run(&pick0);
+  const std::vector<int64_t> none{-1, -1};
+  const std::vector<float> padded = run(&none);
+
+  REQUIRE(all.size() == chosen.size());
+  REQUIRE(all.size() == padded.size());
+
+  // Selecting the only row equals attending all rows.
+  for (size_t i = 0; i < all.size(); ++i)
+    CHECK(all[i] == doctest::Approx(chosen[i]));
+
+  // An ALL-PADDING selection attends none, so the answer is the window pass
+  // alone -- and must therefore DIFFER from attending the row.
+  double diff = 0.0;
+  for (size_t i = 0; i < all.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(all[i] - padded[i])));
+  CHECK(diff > 1e-6);
 }

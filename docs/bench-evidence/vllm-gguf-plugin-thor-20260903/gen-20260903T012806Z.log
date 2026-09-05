@@ -1,0 +1,368 @@
+VLLM_FILE    = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/__init__.py
+VLLM_VERSION = 0.1.dev1+g555967922
+PLUGIN_FILE  = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py
+PLUGIN_C_EXT = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+PROMPT_LENS  = [6, 5, 6, 7, 11, 7]
+PROMPT_LENS_EXPECTED = [6, 5, 6, 7, 11, 7]
+PROMPT_LENS_MATCH = True
+PROMPT_IDS[0] = [760, 6511, 3177, 314, 9338, 369]
+PROMPT_IDS[1] = [760, 2250, 5839, 7736, 513]
+PROMPT_IDS[2] = [27336, 85895, 506, 264, 9039, 314]
+PROMPT_IDS[3] = [760, 5187, 92068, 43687, 55877, 5134, 421]
+PROMPT_IDS[4] = [623, 220, 16, 24, 21, 24, 11, 12313, 1118, 14428, 383]
+PROMPT_IDS[5] = [32, 9944, 1324, 369, 264, 5629, 1324]
+INFO 09-03 01:29:09 [__init__.py:112] Registered model loader `<class 'vllm_gguf_plugin.loader.GGUFModelLoader'>` with load format `gguf`
+INFO 09-03 01:29:09 [config.py:455] Registered config parser `<class 'vllm_gguf_plugin.config_parser.GGUFConfigParser'>` with config format `gguf`
+INFO 09-03 01:29:09 [api_utils.py:273] non-default args: {'tokenizer': '/workspace/ckpt/qwen3.8-27b-hf', 'max_model_len': 2048, 'gpu_memory_utilization': 0.3, 'max_num_batched_tokens': 2048, 'max_num_seqs': 1, 'disable_log_stats': True, 'quantization': 'gguf', 'enforce_eager': True, 'limit_mm_per_prompt': {'image': 0, 'video': 0}, 'model_loader_extra_config': {'mm_proj': '/workspace/ggufplugin/mmproj-BF16.gguf'}, 'attention_backend': 'FLASHINFER', 'model': '/workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf'}
+INFO 09-03 01:29:09 [model.py:627] Resolved architecture: Qwen3_5ForConditionalGeneration
+INFO 09-03 01:29:09 [model.py:1848] Using max model len 2048
+INFO 09-03 01:29:12 [registry.py:134] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+INFO 09-03 01:29:12 [model.py:807] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+INFO 09-03 01:29:12 [scheduler.py:242] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 09-03 01:29:12 [vllm.py:1114] Asynchronous scheduling is enabled.
+WARNING 09-03 01:29:12 [vllm.py:1168] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 09-03 01:29:12 [vllm.py:1218] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 09-03 01:29:12 [kernel.py:306] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-03 01:29:12 [vllm.py:1397] Cudagraph is disabled under eager mode
+INFO 09-03 01:29:12 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+WARNING 09-03 01:29:16 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+(EngineCore pid=586360) INFO 09-03 01:29:23 [__init__.py:112] Registered model loader `<class 'vllm_gguf_plugin.loader.GGUFModelLoader'>` with load format `gguf`
+(EngineCore pid=586360) INFO 09-03 01:29:23 [config.py:455] Registered config parser `<class 'vllm_gguf_plugin.config_parser.GGUFConfigParser'>` with config format `gguf`
+(EngineCore pid=586360) INFO 09-03 01:29:23 [core.py:121] Initializing a V1 LLM engine (v0.1.dev1+g555967922) with config: model='/workspace/ckpt/qwen3.8-27b-hf', speculative_config=None, tokenizer='/workspace/ckpt/qwen3.8-27b-hf', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=gguf, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=gguf, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=586360) INFO 09-03 01:29:25 [registry.py:134] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+(EngineCore pid=586360) INFO 09-03 01:29:25 [parallel_state.py:1612] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.42.0.167:36059 backend=nccl
+(EngineCore pid=586360) INFO 09-03 01:29:25 [parallel_state.py:1943] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=586360) INFO 09-03 01:29:26 [topk_topp_sampler.py:55] Using FlashInfer for top-p & top-k sampling.
+(EngineCore pid=586360) INFO 09-03 01:29:26 [gpu_model_runner.py:5300] Starting to load model /workspace/ckpt/qwen3.8-27b-hf...
+(EngineCore pid=586360) INFO 09-03 01:30:18 [cuda.py:541] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+(EngineCore pid=586360) INFO 09-03 01:30:18 [mm_encoder_attention.py:373] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+(EngineCore pid=586360) INFO 09-03 01:30:18 [qwen_gdn_linear_attn.py:150] Using Triton/FLA GDN prefill kernel (requested=auto, head_k_dim=128).
+(EngineCore pid=586360) INFO 09-03 01:30:18 [cuda.py:422] Using AttentionBackendEnum.FLASHINFER backend.
+(EngineCore pid=586360) INFO 09-03 01:38:18 [gpu_model_runner.py:5397] Model loading took 16.3 GiB memory and 530.729566 seconds
+(EngineCore pid=586360) INFO 09-03 01:38:18 [interface.py:905] Setting attention block size to 784 tokens to ensure that attention page size is >= mamba page size.
+(EngineCore pid=586360) INFO 09-03 01:38:18 [interface.py:929] Padding mamba page size by 0.13% to ensure that mamba page size and attention page size are exactly equal.
+[01:38:19 /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/include/torch/csrc/stable/ops.h:975] Exception across libtorch C API boundary: CUDA error: no kernel image is available for execution on the device
+Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+Exception raised from launch_vectorized_kernel at /__w/pytorch/pytorch/aten/src/ATen/native/cuda/CUDALoops.cuh:349 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xc8 (0xfffeebc8e158 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10::cuda::c10_cuda_check_implementation(int, char const*, char const*, unsigned int, bool) + 0x834 (0xfffeebdc9b54 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libc10_cuda.so)
+frame #2: void at::native::gpu_kernel_impl_nocast<at::native::FillFunctor<c10::BFloat16> >(at::TensorIteratorBase&, at::native::FillFunctor<c10::BFloat16> const&) + 0x434 (0xfffeed4c06c4 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: <unknown function> + 0x1a62a90 (0xfffeed4b2a90 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: at::native::fill_kernel_cuda(at::TensorIterator&, c10::Scalar const&) + 0xc (0xfffeed4b457c in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: <unknown function> + 0x131a79c (0xffff0385a79c in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #6: <unknown function> + 0x315c6fc (0xfffeeebac6fc in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #7: at::_ops::fill__Scalar::call(at::Tensor&, c10::Scalar const&) + 0x160 (0xffff0387ffc0 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: at::native::zero_(at::Tensor&) + 0x94 (0xffff03dd80f4 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: <unknown function> + 0x315a2cc (0xfffeeebaa2cc in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #10: at::_ops::zero_::call(at::Tensor&) + 0x154 (0xffff04a09714 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #11: at::native::new_zeros(at::Tensor const&, c10::ArrayRef<long>, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>) + 0x144 (0xffff0407a874 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #12: <unknown function> + 0x2a4aff4 (0xffff04f8aff4 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #13: <unknown function> + 0x6ea290c (0xffff093e290c in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #14: torch_call_dispatcher + 0x214 (0xffff093e2f64 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #15: <unknown function> + 0x4a774 (0xfffe5d3da774 in /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so)
+frame #16: <unknown function> + 0x40918 (0xfffe5d3d0918 in /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so)
+frame #17: <unknown function> + 0x4cf50 (0xfffe5d3dcf50 in /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so)
+frame #18: c10::BoxedKernel::makeFromFunctor<StableIValueBoxedKernel>(std::unique_ptr<StableIValueBoxedKernel, std::default_delete<StableIValueBoxedKernel> >)::{lambda(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*)#1}::_FUN(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*) + 0x180 (0xffff093e2420 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #19: <unknown function> + 0x6ec464c (0xffff0940464c in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #20: <unknown function> + 0xe18280 (0xffff0e5f8280 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #21: <unknown function> + 0xe188f8 (0xffff0e5f88f8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #22: torch::jit::_get_operation_for_overload_or_packet(std::vector<std::shared_ptr<torch::jit::Operator>, std::allocator<std::shared_ptr<torch::jit::Operator> > > const&, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) + 0x3c (0xffff0e5f8aec in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #23: <unknown function> + 0xced0e8 (0xffff0e4cd0e8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #24: <unknown function> + 0x627784 (0xffff0de07784 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #25: VLLM::EngineCore() [0x50336c]
+frame #26: _PyEval_EvalFrameDefault + 0x3f30 (0x567134 in VLLM::EngineCore)
+frame #27: _PyObject_Call_Prepend + 0xc4 (0x4c4654 in VLLM::EngineCore)
+frame #28: VLLM::EngineCore() [0x528aa0]
+frame #29: _PyObject_MakeTpCall + 0x78 (0x4c2b78 in VLLM::EngineCore)
+frame #30: _PyEval_EvalFrameDefault + 0x8a0 (0x563aa4 in VLLM::EngineCore)
+frame #31: PyObject_Vectorcall + 0x4c (0x4c372c in VLLM::EngineCore)
+frame #32: <unknown function> + 0x9289f4 (0xffff0e1089f4 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #33: <unknown function> + 0xd0c1a8 (0xffff0e4ec1a8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #34: <unknown function> + 0x10d4194 (0xffff0e8b4194 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #35: <unknown function> + 0x6ec464c (0xffff0940464c in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so)
+frame #36: <unknown function> + 0xe18280 (0xffff0e5f8280 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #37: <unknown function> + 0xe188f8 (0xffff0e5f88f8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #38: torch::jit::_get_operation_for_overload_or_packet(std::vector<std::shared_ptr<torch::jit::Operator>, std::allocator<std::shared_ptr<torch::jit::Operator> > > const&, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) + 0x3c (0xffff0e5f8aec in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #39: <unknown function> + 0xced0e8 (0xffff0e4cd0e8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #40: <unknown function> + 0x627784 (0xffff0de07784 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #41: VLLM::EngineCore() [0x50336c]
+frame #42: _PyEval_EvalFrameDefault + 0x3f30 (0x567134 in VLLM::EngineCore)
+frame #43: _PyObject_Call_Prepend + 0xc4 (0x4c4654 in VLLM::EngineCore)
+frame #44: VLLM::EngineCore() [0x528aa0]
+frame #45: PyObject_Call + 0xa4 (0x4c5094 in VLLM::EngineCore)
+frame #46: <unknown function> + 0x11106d8 (0xffff0e8f06d8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #47: VLLM::EngineCore() [0x5035ac]
+frame #48: _PyObject_MakeTpCall + 0x78 (0x4c2b78 in VLLM::EngineCore)
+frame #49: _PyEval_EvalFrameDefault + 0x8a0 (0x563aa4 in VLLM::EngineCore)
+frame #50: VLLM::EngineCore() [0x4c6c9c]
+frame #51: VLLM::EngineCore() [0x4c39b4]
+frame #52: PyObject_CallFunctionObjArgs + 0x80 (0x4c3874 in VLLM::EngineCore)
+frame #53: <unknown function> + 0x10abd54 (0xffff0e88bd54 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #54: torch::handle_torch_function_no_python_arg_parser(c10::ArrayRef<_object*>, _object*, _object*, char const*, _object*, char const*, torch::TorchFunctionName) + 0x1c (0xffff0e88d81c in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #55: torch::jit::_maybe_handle_torch_function(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, bool, pybind11::args const&, pybind11::kwargs const&) + 0x2d0 (0xffff0e5e80a0 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #56: <unknown function> + 0xe18768 (0xffff0e5f8768 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #57: torch::jit::_get_operation_for_overload_or_packet(std::vector<std::shared_ptr<torch::jit::Operator>, std::allocator<std::shared_ptr<torch::jit::Operator> > > const&, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) + 0x3c (0xffff0e5f8aec in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #58: <unknown function> + 0xced0e8 (0xffff0e4cd0e8 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #59: <unknown function> + 0x627784 (0xffff0de07784 in /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #60: VLLM::EngineCore() [0x50336c]
+frame #61: _PyEval_EvalFrameDefault + 0x3f30 (0x567134 in VLLM::EngineCore)
+frame #62: _PyObject_Call_Prepend + 0xc4 (0x4c4654 in VLLM::EngineCore)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345] EngineCore failed to start.
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345] Traceback (most recent call last):
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1314, in run_engine_core
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return func(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1070, in __init__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     super().__init__(
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 141, in __init__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return func(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 291, in _initialize_kv_caches
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     available_gpu_memory = self.model_executor.determine_available_memory()
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 147, in determine_available_memory
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self.collective_rpc("determine_available_memory")
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 92, in collective_rpc
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     result = run_method(self.driver_worker, method, args, kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/serial_utils.py", line 510, in run_method
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return func(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return func(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 495, in determine_available_memory
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     self.model_runner.profile_run()
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py", line 6471, in profile_run
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     hidden_states, last_hidden_states = self._dummy_run(
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                                         ^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return func(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py", line 6134, in _dummy_run
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     outputs = self.model(
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]               ^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return forward_call(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_5.py", line 506, in forward
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     hidden_states = self.language_model.model(
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/compilation/decorators.py", line 507, in __call__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self.forward(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_next.py", line 682, in forward
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     hidden_states, residual = layer(
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                               ^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return forward_call(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_next.py", line 554, in forward
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     hidden_states = self.mlp(hidden_states)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                     ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return forward_call(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen2_moe.py", line 115, in forward
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     out, _ = self.down_proj(out)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]              ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return forward_call(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/layers/linear.py", line 1763, in forward
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/quantization/linear.py", line 261, in apply
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     out = fused_mul_mat_gguf_op(x, weight, weight_type)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._op(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/parameter.py", line 126, in __torch_function__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return super().__torch_function__(func, types, args, kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._op(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/quantization/linear.py", line 49, in _fused_mul_mat_gguf
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/ops.py", line 207, in ggml_mul_mat_a8
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return torch.ops._C_gguf.ggml_mul_mat_a8(W, X, quant_type, row)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]     return self._op(*args, **kwargs)
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345] RuntimeError: CUDA error: no kernel image is available for execution on the device
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345] Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345] For more detailed error information, run with CUDA_LOG_FILE=stderr
+(EngineCore pid=586360) ERROR 09-03 01:38:19 [core.py:1345]  (originally from torch_call_dispatcher( "aten::new_zeros", "", stack.data(), TORCH_ABI_VERSION) API call failed at /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/include/torch/csrc/stable/ops.h, line 975)
+(EngineCore pid=586360) Process EngineCore:
+(EngineCore pid=586360) Traceback (most recent call last):
+(EngineCore pid=586360)   File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=586360)     self.run()
+(EngineCore pid=586360)   File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore pid=586360)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1349, in run_engine_core
+(EngineCore pid=586360)     raise e
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1314, in run_engine_core
+(EngineCore pid=586360)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=586360)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=586360)     return func(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1070, in __init__
+(EngineCore pid=586360)     super().__init__(
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 141, in __init__
+(EngineCore pid=586360)     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=586360)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=586360)     return func(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 291, in _initialize_kv_caches
+(EngineCore pid=586360)     available_gpu_memory = self.model_executor.determine_available_memory()
+(EngineCore pid=586360)                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 147, in determine_available_memory
+(EngineCore pid=586360)     return self.collective_rpc("determine_available_memory")
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 92, in collective_rpc
+(EngineCore pid=586360)     result = run_method(self.driver_worker, method, args, kwargs)
+(EngineCore pid=586360)              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/serial_utils.py", line 510, in run_method
+(EngineCore pid=586360)     return func(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=586360)     return func(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 495, in determine_available_memory
+(EngineCore pid=586360)     self.model_runner.profile_run()
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py", line 6471, in profile_run
+(EngineCore pid=586360)     hidden_states, last_hidden_states = self._dummy_run(
+(EngineCore pid=586360)                                         ^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=586360)     return func(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py", line 6134, in _dummy_run
+(EngineCore pid=586360)     outputs = self.model(
+(EngineCore pid=586360)               ^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360)     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360)     return forward_call(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_5.py", line 506, in forward
+(EngineCore pid=586360)     hidden_states = self.language_model.model(
+(EngineCore pid=586360)                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/compilation/decorators.py", line 507, in __call__
+(EngineCore pid=586360)     return self.forward(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_next.py", line 682, in forward
+(EngineCore pid=586360)     hidden_states, residual = layer(
+(EngineCore pid=586360)                               ^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360)     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360)     return forward_call(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_next.py", line 554, in forward
+(EngineCore pid=586360)     hidden_states = self.mlp(hidden_states)
+(EngineCore pid=586360)                     ^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360)     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360)     return forward_call(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen2_moe.py", line 115, in forward
+(EngineCore pid=586360)     out, _ = self.down_proj(out)
+(EngineCore pid=586360)              ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+(EngineCore pid=586360)     return self._call_impl(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+(EngineCore pid=586360)     return forward_call(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/layers/linear.py", line 1763, in forward
+(EngineCore pid=586360)     output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+(EngineCore pid=586360)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/quantization/linear.py", line 261, in apply
+(EngineCore pid=586360)     out = fused_mul_mat_gguf_op(x, weight, weight_type)
+(EngineCore pid=586360)           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360)     return self._op(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/model_executor/parameter.py", line 126, in __torch_function__
+(EngineCore pid=586360)     return super().__torch_function__(func, types, args, kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360)     return self._op(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/quantization/linear.py", line 49, in _fused_mul_mat_gguf
+(EngineCore pid=586360)     y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
+(EngineCore pid=586360)         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/ops.py", line 207, in ggml_mul_mat_a8
+(EngineCore pid=586360)     return torch.ops._C_gguf.ggml_mul_mat_a8(W, X, quant_type, row)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360)     return self._op(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) RuntimeError: CUDA error: no kernel image is available for execution on the device
+(EngineCore pid=586360) Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+(EngineCore pid=586360) For more detailed error information, run with CUDA_LOG_FILE=stderr
+(EngineCore pid=586360)  (originally from torch_call_dispatcher( "aten::new_zeros", "", stack.data(), TORCH_ABI_VERSION) API call failed at /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/include/torch/csrc/stable/ops.h, line 975)
+[rank0]:[W903 01:38:21.097797302 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+Traceback (most recent call last):
+  File "/workspace/ggufplugin/gen.py", line 122, in <module>
+    main()
+  File "/workspace/ggufplugin/gen.py", line 84, in main
+    llm = LLM(
+          ^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 338, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 179, in from_engine_args
+    return cls(
+           ^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 105, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 110, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 801, in __init__
+    super().__init__(
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 588, in __init__
+    with launch_core_engines(
+  File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1210, in launch_core_engines
+    wait_for_engine_startup(
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1269, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}

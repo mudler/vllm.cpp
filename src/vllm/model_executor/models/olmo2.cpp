@@ -19,6 +19,7 @@
 // whole MLP flow bf16; the standalone post-norms compute variance in f32 and round
 // to bf16; the plain residual adds compute in f32 and round to bf16 (vt::Add).
 // Returns [n_out, vocab] f32 logits.
+#include "vllm/model_executor/layers/attention/attention.h"
 #include "vllm/model_executor/models/olmo2.h"
 
 #include <cmath>
@@ -192,8 +193,12 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
   // OLMo-3 SLIDING-attention layer: mask to the last `sliding_window` keys (FA
   // window convention (W-1, 0)). Inert for contexts < sliding_window (the gate
   // battery is short), so the SACRED gate is unaffected; correct for long contexts.
+  // ENG-ATTENTION-WINDOW (#2388). No kill switch here either; see W3.
   if (sliding_window.has_value() && *sliding_window > 0)
-    pa.window_size = vt::AttentionWindow{static_cast<int32_t>(*sliding_window - 1), 0};
+    pa.window_size = ResolveAttentionWindow(
+        /*per_layer=*/std::nullopt, sliding_window,
+        v1::AttentionType::kDecoder,
+        /*disable_model_sliding_window=*/false);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

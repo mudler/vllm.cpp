@@ -28,6 +28,9 @@ CachedRequestState CachedRequestState::from_new_request(
   state.sampling_params = new_req.sampling_params.value();
   state.block_ids = new_req.block_ids;
   state.num_computed_tokens = new_req.num_computed_tokens;
+  // ENG-MM-INPUT-PIPELINE P2 (#2379), the worker end of the hop
+  // NewRequestData opened (gpu_model_runner.py:1293). Empty on text.
+  state.mm_features = new_req.mm_features;
   state.finalize();
 
   // MRV2 contract: prefill_token_ids == all_token_ids (prompt + output at

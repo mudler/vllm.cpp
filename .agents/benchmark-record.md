@@ -29286,3 +29286,227 @@ the entering-directory line and on compile order and both end
 `[515/515] Linking CXX executable examples/vllm-server` — the identical binary
 sha256 is the stronger statement — and `cmake-b.log`, which diffs against
 `cmake-a.log` on three lines only, two timings and the build directory name.
+
+## TT P150 #2003 CONFIRMED AND DECIDED: the inversion reproduces at 1.300x with the FIRMWARE cap verified on every busy slice; polarity = documented stand-pat, the EnsureDevice2D hypothesis is rejected by the per-op delta, #2003 closes (2026-08-30, `bench/tt-clock-state-w2`, P150 `thalia`)
+
+Spec [`tt-clock-state-w2.md`](specs/tt-clock-state-w2.md) close 3. The
+product binary is `a1d04bbc9` (origin/main at measurement time) logic untouched: the W2 commits
+on this branch change only `tools/` and `tests/`, so both arms run base
+code and the harness measures the shipped polarity, not itself. Workload,
+order-alternation (A,B)(B,A)(A,B), `--repeat 5` with run 1 discarded per
+leg, one `$HOME/gpu.lock` hold, `tt-smi -r` inside it first, fresh process
+per leg — the same method as the 2026-08-26 entries. Per leg a
+`tools/bench/tt_clock_state.py sample --leg-pid <pid>` window,
+`--sampler pyluwen --interval 0.25 --duration 75`. Evidence:
+[`../docs/bench-evidence/tt-p150-w2-confirmed-20260830.log`](../docs/bench-evidence/tt-p150-w2-confirmed-20260830.log)
+(run logs, per-leg tok/s, both analyzer outputs, identity/limits JSON,
+window census, refold verdict).
+
+**Run 1 (superseded, subprocess sampler, interval 1 s): ratio 1.303
+median / 1.300 mean** (14.268 vs 10.954), but the opt-out legs are FASTER,
+so 1 s cadence caught only 26 busy samples in three windows — under the
+30-busy-sample floor the judge requires. That failure is the in-process
+sampler's reason to exist: **run 2 (recorded) moved to `--sampler pyluwen`
+at interval 0.25 s.**
+
+**Run 2 (recorded, 12 warm samples per arm): default host-free eager
+median 10.998 tok/s** (mean 10.995, 10.841–11.127) **vs `VT_TT_HOST_FREE_DECODE=0`
+median 14.299** (mean 14.232, 13.480–14.497) — **ratio 1.300 median / 1.294
+mean**, confirming and sharpening the 2026-08-26 1.254 at `21fe11cf1`. Every
+window holds n=289–292 samples with busy=136–177, and the refold busy-slice
+judge returns **rc=0 PASS with zero reasons: all six windows have distinct
+AICLK set exactly {1350}, 100.0% at cap, pegged=True** — the slower default
+is again a real path difference at clock parity.
+
+**The claimed-max pin is no longer UNVERIFIED.** Every window resolves the
+cap from FIRMWARE: `limits.asic_fmax` (the DECIMAL string "1350" on this
+board; the raw smbus word 0x546 is also accepted) with provenance
+"tt-smi smbus telemetry AICLK_LIMIT_MAX (get_bh_chip_limits, tt_smi
+backend.py:830)", surfaced as `claimed_max_firmware_readout` and never
+guessed — the W1 Owed bullet is retired by measurement, not by code.
+
+**The in-process sampler earns its flag.** Idle-board cadence pair at the
+same 0.25 s request: pyluwen 81 samples/20 s vs subprocess 30 (~2.7x),
+same key set, both windows cap-resolved. The subprocess sampler stays the
+DEFAULT; system python3 has no pyluwen import, and the stated-skip path
+(empty window + `sampler_skip_reason` + exit 1) is real and tested.
+
+**Attribution: the EnsureDevice2D hypothesis is REJECTED, and per the W2
+spec's stop condition 3 the contradiction is the finding.** The per-op
+delta over `b86e3705f..21fe11cf1` contains exactly two `tenstorrent_ops.cpp`
+changes — `353511e72` (+46/−17) and `101b415d7` (+12) — and both are
+`EnsureDevice2D` CORRECTNESS fixes that ADD staging work on the interior
+slices the hybrid arm exercises per op. Adding work cannot explain the
+opt-out arm's ~2.5x improvement while the default arm sits unchanged
+inside its 2026-08-21 band. The corrected mechanism is UNKNOWN.
+
+**The polarity decision is a documented stand-pat.** Default stays
+host-free. A flip needs the corrected mechanism, not a faster number on
+the opt-out; no threshold was edited anywhere and the spread rule stays
+an offline refold. #2003 closes with this record; the corrected-mechanism
+residual is owned in the
+[host-free spec](specs/tenstorrent-host-free-forward.md) `## Owed`, and
+the open-gaps row carries the decided state.
+
+Not retested here: the captured opt-in arm (multi-request capture hang,
+[#1625](https://github.com/mudler/vllm.cpp/issues/1625)) and TT async
+readback ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)), both
+unchanged.
+
+## TT CAPTURED DECODE TOKEN-CLEAN AT THREE SIZES: after the #2461 slab repair and the #2469 stale-cur_pos repair, captured replay beats both eager arms everywhere measured — 0.6B 27.47, 4B 13.84, Mistral-7B 14.23 tok/s, and the Mistral-7B capture legs are token-identical to eager (2026-09-01, `row/BACKEND-TENSTORRENT-HOST-FREE-FORWARD` @ `081efabc7`, P150, [#2566](https://github.com/mudler/vllm.cpp/issues/2566))
+
+The R5-era captured-arm ratios (27.1 tok/s and the 2026-09-01 machinery
+figures) predate the two correctness repairs, so they measured the replay
+machinery on corrupted capture-leg output. This entry records the
+token-clean re-measurement at three model sizes on one binary at the
+repaired head, one `$HOME/gpu.lock` hold per batch, `tt-smi -r 0` first,
+order-alternated triples, `--repeat 5` with run 1 discarded per leg, warm
+medians, fresh process per leg.
+
+| model | default (host-free eager) | opt-out (`VT_TT_HOST_FREE_DECODE=0`) | captured (`VT_TT_DECODE_CAPTURE=1`) | captured vs default | captured vs opt-out |
+|---|---|---|---|---|---|
+| Qwen3-0.6B (`hf-gate3.sh`, 3 triples) | 12.90 | 17.80 | **27.47** | 2.13x | 1.54x |
+| Qwen3-4B (`hf-abc4b.sh`, 2 triples) | 9.25 | 8.89 | **13.84** | 1.50x | 1.56x |
+| Mistral-7B-v0.3 (`hf-mist-abc.sh`, 2 triples, `--max-tokens 64`) | 11.51 | 5.93 | **14.23** | 1.24x | 2.40x |
+
+Every leg: replays 474 (0.6B/4B) / 314 (Mistral), 0 fatals, rc 0. The
+capture legs are coherent at all three sizes; at Mistral-7B the capture
+arm's output text is TOKEN-IDENTICAL to the default arm's in both triples
+(`grep -E '^The robot'` diff over the leg outputs), and the A-vs-B text
+divergence is the known eager-kernel near-tie situation, adjudicated
+elsewhere by the row's ≤0.5-nat band.
+
+What this decides: captured replay's superiority over both eager arms is a
+capability verdict at every measured size, not only a machinery
+measurement — the CORRECTNESS CAVEAT on the R5-era and machinery-only
+figures is superseded. What it does not decide: the capture-default flip
+(#1625's captured multi-request hang and the #2469-residual near-tie cell
+still gate it, both recorded in the row spec's `## Owed`), and the
+default-vs-opt-out inversion mechanism, which the successful-path
+attribution narrows but does not close.
+
+### Reproduce
+
+```sh
+# 0.6B (3 triples): $HOME/hf-gate3.sh
+# 4B (2 triples):   $HOME/hf-abc4b.sh
+# Mistral (2 triples): $HOME/hf-mist-abc.sh
+# each: flock $HOME/gpu.lock inside; tt-smi -r 0 first;
+# VT_TT_DECODE_CAPTURE=1 / unset / VT_TT_HOST_FREE_DECODE=0 arms;
+# --max-tokens 80 (0.6B/4B) / 64 (Mistral); --repeat 5, discard run 1
+# model snapshots under $HOME/.cache/huggingface/hub (Qwen3-0.6B,
+# Qwen3-4B, Mistral-7B-v0.3); raw leg logs hf-{mist,}t{1,2}{A,B,C}.{out,err}
+```
+
+## SPEC-DFLASH2 — the ratio moves to **0.9280x** on the graph-pin tree, and TWO runs on two trees agree the 0.8017x record was stale (2026-09-02, `dgx:gpu0`, gate tree `42b30950837503d352ad0f8c50588b15335a715c`, [#2630](https://github.com/mudler/vllm.cpp/issues/2630))
+
+**The O26 entry above is not wrong; it is old.** It measured `d25730fbb` on
+2026-08-22. The gate has run twice since, on two later trees, and neither result
+was folded in. This entry folds them. Every figure is re-derivable from
+`/mnt/nas_share/rc/dflash2-staged/out-d1/`, which is READ-ONLY evidence. Every
+path below is relative to that directory, and the command that produces each
+figure is beside it.
+
+| axis | ours | vLLM | ratio | verdict |
+|---|---:|---:|---:|---|
+| `output_throughput_tok_s` | **14.951** | **16.11145768349725** | **0.9279731414565989** | `RECORDED, no floor declared` |
+| `peak_device_bytes` | null | null | null | `NOT MEASURED` |
+| `tpot_ms` | null | null | null | `NOT MEASURED` |
+| `ttft_ms` | null | null | null | `NOT MEASURED` |
+
+```sh
+python3 -c "import json;d=json.load(open('evidence/evidence-d1/dflash2-speed.json'));[print(a['axis'],a['ours'],a['vllm'],a['ratio'],a['verdict']) for a in d['axes']]"
+```
+
+**`RECORDED, no floor declared` IS STILL NOT A PASS**, for the same reason O26
+gives: no bar was ever declared for this axis on this row, so the gate had
+nothing to compare 0.9280 against and said so in the verdict field rather than
+inventing one. `floor` is `null` in the artifact. Three of the four axes remain
+`NOT MEASURED` for O26's unchanged reasons. **A ratio below 1.0 is a gap, and
+0.9280 is a gap**; the movement from 0.8017 is progress on that gap, not its
+closure.
+
+**Two runs, two trees, and they bracket each other.** The same `out-d1`
+directory holds an earlier gate on tree `85f65b0e8b6c`
+(`evidence/dflash2-speed.json`, 2026-08-30) reading **15.029 / 16.36343357698801
+= 0.9185**, and the run recorded here on `42b309508375`
+(`evidence/evidence-d1/dflash2-speed.json`, 2026-09-02) reading **0.9280**. Two
+independently built trees measured eight days apart land 0.0095 apart, which is
+what makes the 0.12 step away from 0.8017 a property of the trees rather than of
+one lucky lease. **Read the nested path carefully**: the two artifacts have the
+same basename, the outer one is the older tree, and taking the outer file for
+the newer run is the error this paragraph exists to prevent.
+
+```sh
+for f in evidence/dflash2-speed.json evidence/evidence-d1/dflash2-speed.json; do
+  python3 -c "
+import json,sys;d=json.load(open('$f'));a=[x for x in d['axes'] if x['axis']=='output_throughput_tok_s'][0]
+print('$f',d['preconditions']['build']['ours']['revision'][:12],a['ours'],a['vllm'],a['ratio'])"
+done
+```
+
+**Both medians are over the SAME sixteen warm legs of twenty**, folded by
+`dflash2_speed_harness.fold_legs`, which discards run 1 of each repetition group
+on both arms for its named cause. Ours folds 16 spanning **8.169 to 19.095
+tok/s** (median 14.951); the oracle folds 16 spanning **8.882 to 22.012 tok/s**
+(median 16.11145768349725). Every leg on both arms returned **64 completion
+tokens** with `finish_reason: length`, so no leg was short and the #1667 discard
+path was never entered.
+
+```sh
+python3 -c "
+import json,statistics
+for f in ('evidence/evidence-d1/our-arm.json','evidence/evidence-d1/vllm-arm.json'):
+    d=json.load(open(f)); w=[l['tok_s'] for l in d['legs'] if l['run']!=1]
+    print(f,len(d['legs']),'legs',d['warm_legs'],'warm',d['cold_legs_discarded'],'cold',
+          'span %.3f..%.3f'%(min(w),max(w)),'median',statistics.median(w),'==',d['metrics']['output_throughput_tok_s'],
+          sorted({l['finish_reason'] for l in d['legs']}),sorted({l['completion_tokens'] for l in d['legs']}))"
+```
+
+**The workload fingerprint is IDENTICAL on both arms**, which is what makes the
+division legal: `prompts_sha256 173f9e98c1e14ebf7121ecc5296d76961fa9b8fc468a5caa1e59b69940088e26`,
+4 prompts x `repeat 5`, `max_tokens 64`, `max_num_seqs 1`, `concurrency 1`,
+`temperature 0.0`, `seed null`, `num_speculative_tokens 7`, and
+**`enforce_eager: false`** on the denominator. The oracle is
+`0.1.dev1+g66e5414c6`, matching `oracle_expected_commit`, and both arms loaded
+byte-identical artifacts: target `ba0ce20aae489ad1`, draft `67fc76d68dc5a941`.
+
+**Both arms ran in ONE lease on ONE boot**, which is the condition the harness
+refuses to measure across. `lease_id c2b30732-1444-4819-817a-21fd40a3402e`,
+`boot_id 49b5d969-3870-4a2b-b5b8-71355083d5e6` on both sides, `same_boot: true`,
+`compute_processes: []` on both, `TEARDOWN_VERDICT=CLEAN`. Clock pairing: ours
+2529.31 MHz mean over 72 busy samples with 0.789% spread, the oracle 2519.44 MHz
+over 84 with 0.795%, a 0.392% mean offset, no throttle reason set on either
+(`0x0000000000000000`). The harness's own estimate of the clock's contribution
+is **0.600%**, reported and never gated on.
+
+```sh
+python3 -c "import json;p=json.load(open('evidence/evidence-d1/dflash2-speed.json'))['preconditions'];print(json.dumps(p['clock']['pairing'],indent=1,sort_keys=True));print(json.dumps(p['contention'],sort_keys=True))"
+```
+
+**`attention_backend: "TRITON_ATTN"` is a lossy scalar over a mixed stack, not a
+weakened denominator.** The same artifact carries
+`attention_backend_groups`, read back from the live engine rather than from the
+flag, and it resolves **`GDNAttentionBackend` on 48 linear-attention layers,
+`TritonAttentionBackend` on 16 self-attention layers, and
+`FlashAttentionBackend` on the 5 draft layers `model.layers.64..68`**. A single
+string cannot describe that, and the scalar reports the majority
+self-attention backend. Anyone comparing this row against a record that quotes
+only the scalar should compare the groups instead.
+
+```sh
+python3 -c "import json;g=json.load(open('evidence/evidence-d1/dflash2-speed.json'))['preconditions']['attention_backend_groups'];print(g['probe']);print(json.dumps(g['backends'],sort_keys=True))"
+```
+
+**The SGLang axis is still unmeasured, and its recorded reason is now out of
+date.** The artifact's `sglang` block says the pinned SGLang `f63458b5`
+(v0.5.15) registers only `DFlashDraftModel` and therefore cannot load this
+gate's `DFlash2DraftModel` draft, so no undrafted substitute may stand in — an
+undrafted arm would make the ratio measure the FEATURE rather than the engine.
+That refusal remains correct at the pin. What has changed is that a tree which
+CAN load the draft now exists: DFlash2 landed upstream in `c14312a664`
+(`CandidateSelector`, `DFlashGroupedConv`, `DFlash2DraftModel` in `EntryClass`),
+and `1cf2b8c54d` adds the quantized-lm_head path that also serves an NVFP4
+target. Neither is on any SGLang release; v0.5.18 branched before them. Until
+that arm is built and measured, this row has **no SGLang denominator**, and no
+number in this entry may be read as one.

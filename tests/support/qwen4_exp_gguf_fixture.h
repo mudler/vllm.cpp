@@ -500,15 +500,22 @@ inline std::string BuildFixture(const FixtureOpts& o = {}) {
 // load-bearing rather than stylistic. `Load` resolves the architecture, refuses
 // an unsupported FP8-block quantization, runs `parse_config` and THEN the weight
 // loader — which is the sequence `LoadedEngine::FromModelDir` runs at
-// `entrypoints/model_loader.cpp` (`ModelSource::FromGguf(gguf)` ->
+// `entrypoints/model_loader.cpp`
+// (`ModelSource::FromGguf(gguf, ResolveModelDeviceType(...))` ->
 // `ModelRegistry::Load(config, gguf_source)`). Calling the hook directly skips
 // `parse_config`, and that skip is exactly what hid #2064: the config builder
 // and the config VALIDATOR had never been composed, so a file that built a
 // config fine was refused the moment anything parsed it.
+//
+// `device` is what the ENGINE resolved for the load, and it is a parameter for
+// the reason `LoadQwen4ExpFromGguf`'s own `device` is: it is the only way a
+// CPU-only host can drive the CUDA arm of the registry hook. It defaults to
+// `kCPU` so every existing caller reads as the ordinary CPU load it always was.
 inline std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
-    const vllm::GgufFile& g) {
+    const vllm::GgufFile& g,
+    vt::DeviceType device = vt::DeviceType::kCPU) {
   const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
-  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g);
+  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g, device);
   return vllm::ModelRegistry::Load(config, source);
 }
 

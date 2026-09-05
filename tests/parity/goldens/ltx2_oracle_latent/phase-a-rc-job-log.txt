@@ -1,0 +1,141 @@
+# `rc` job a24f9336-897f-4810-9851-13dade5acb52, dgx:gpu0 (NVIDIA GB10),
+# 2026-09-01T23:13:03Z .. 23:45:37Z, 1954 s. Recovered with `rc logs` and
+# committed for LTX25-ADHERENCE-BISECT (#2514), because `## Evidence` otherwise
+# pointed only at /workspace on the worker -- a CIFS share outside the
+# repository -- and every claim this row takes from the run would then rest on
+# prose the row typed rather than on the run's own output. `rc` log retention is
+# not a guarantee, so the excerpt lives here. The `.txt` suffix is not a
+# preference: `.gitignore:34` ignores `*.log`, so a file named for what it is
+# would have been silently untracked.
+#
+# TWO EDITS, both to carriage-return progress frames and both noted: the git
+# checkout line is replaced by the marker below, and each tqdm line is collapsed
+# to its final frame. Nothing else is elided, reordered or reflowed.
+#
+# Read here in particular:
+#   - the `model_version=2.5.0` line the AGREE-row condition rests on
+#   - `torch 2.13.0+cu130 / triton 3.7.1`, the environment Phase A's manifest
+#     did not record
+#   - the four staged checkpoints, each verified by sha256 against the manifest
+#   - `matched committed digests = 25 of 25` and the control's own verdict
+[23:13:03 +0s] === [0] the box ===
+aarch64
+20
+               total        used        free      shared  buff/cache   available
+Mem:             119           4         105           0          10         114
+Swap:             29           0          29
+ 23:13:03 up 4 days,  1:47,  0 user,  load average: 3.85, 3.95, 3.03
+name, memory.total [MiB], memory.used [MiB], clocks.current.sm [MHz]
+NVIDIA GB10, [N/A], [N/A], 2411 MHz
+Filesystem             Size  Used Avail Use% Mounted on
+overlay                3.6T  1.6T  1.8T  48% /
+//192.168.68.102/Data  7.3T  5.9T  1.4T  82% /workspace
+[23:13:03 +0s] === [1] the tree this job runs (tools/oracle + the committed digests) ===
+  e5da373c249b88624da73d31d806e0856f52c5a84f3774a1a9c2f85a65143d69  /workspace/ltx25-adherence-bisect/tree/tools/oracle/ltx2_oracle.py
+  4a54bd9c0966fff1b816102ab42157438b6bd991efaf2f6073a404e3da0f093b  /workspace/ltx25-adherence-bisect/tree/tools/oracle/ltx2_latent_dump.py
+  efa43c8bd68c9a6581225fbe3f89ae51c6738431e913d1e505722602a8081ad5  /workspace/ltx25-adherence-bisect/tree/tools/oracle/jitprobe.py
+  5fc0d318f910b594f3d5d3fcb0aa28111efd4a8c5e014ecbb5cdd1c1946327be  /workspace/ltx25-adherence-bisect/tree/tests/parity/goldens/ltx2_oracle/SHA256SUMS
+[23:13:04 +1s] === [2] upstream at the pin ===
+Cloning into '/tmp/ltx2-bisect/LTX-2'...
+Cloning into '/tmp/ltx2-bisect/LTX-2'...   [git checkout progress elided: one 3,141-byte line of 'Updating files: N% (x/416)' carriage-return frames]
+From https://github.com/Lightricks/LTX-2
+ * branch            fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca -> FETCH_HEAD
+[23:13:08 +5s]   PIN_OK fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca clean
+[23:13:08 +5s] === [3] venv, torch and the import/JIT gates ===
+[hb +120s] alive
+[hb +240s] alive
+[hb +360s] alive
+  WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'RemoteDisconnected('Remote end closed connection without response')': /packages/fc/b4/d088047afe39827556df21118cac9ffd20cc3f968c99a7681494d1eb333c/cuda_pathfinder-1.6.0-py3-none-any.whl.metadata
+[23:20:39 +456s]   torch-from-pytorch-index secs=443
+[hb +480s] alive
+import-gate OK: torch 2.13.0+cu130 cuda True | RecordingDiffusionStage RecordingDiffusionStage
+JITPROBE torch 2.13.0+cu130 triton 3.7.1 cuda_avail True
+JITPROBE TRITON_CACHE_DIR (unset)
+JITPROBE driver OK, current device 0
+JITPROBE bmm_outer_product dispatch OK (1, 77, 128) 6116.505859375
+JITPROBE triton kernel compile+launch OK
+=== JITPROBE torch._native env switches (read-only) ===
+  TORCH_DISABLE_NATIVE_JIT TORCH_LOGS TORCH_NATIVE_SKIP_VERSION_CHECK TORCH_PYTHON_NATIVE_USER_GRAPH_ORDER_FN TORCH_TO_CUTE TRITON_DSL_NAME TRITON_MINIMUM_VERSION_MINOR TRITON_REQUIRED_VERSION_MAJOR
+JITPROBE rc=0
+[23:21:57 +534s] === [4] stage the four BF16 checkpoints, and VERIFY BY SHA256 ===
+[23:22:37 +574s]   STAGED vae/ltx-2.5-video-vae-conv-bf16.safetensors bytes=1452269922 secs=40 attempt=1
+[hb +600s] alive
+[hb +720s] alive
+[hb +840s] alive
+[hb +960s] alive
+[hb +1080s] alive
+[23:31:31 +1108s]   STAGED text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors bytes=26263858182 secs=534 attempt=1
+[23:31:38 +1115s]   STAGED vae/ltx-2.5-audio-vae-bf16.safetensors bytes=364866540 secs=7 attempt=1
+[hb +1200s] alive
+[hb +1320s] alive
+[hb +1440s] alive
+[hb +1560s] alive
+[hb +1680s] alive
+[23:42:39 +1776s]   STAGED diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors bytes=42018190584 secs=661 attempt=1
+[23:42:39 +1776s]   --- sha256, against the manifest's own digests ---
+[23:42:41 +1778s]   OK   vae/ltx-2.5-video-vae-conv-bf16.safetensors
+[hb +1800s] alive
+[23:43:16 +1813s]   OK   text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors
+[23:43:17 +1814s]   OK   vae/ltx-2.5-audio-vae-bf16.safetensors
+[23:44:09 +1866s]   OK   diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors
+[23:44:09 +1866s] === [5] THE DUMP, with its own control ===
+== pre-run state
+  loadavg=3.03 2.05 1.92
+  gpu=[N/A], 0 %, 208 MHz
+INFO:ltx_pipelines.utils.constants:Checkpoint declares model_version=2.5.0 (parsed as (2, 5, 0))
+INFO:ltx_pipelines.utils.blocks:Building text encoder from /tmp/ltx2-bisect/ckpt/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors
+INFO:ltx_pipelines.utils.blocks:Text encoder done, building embeddings processor from ('/tmp/ltx2-bisect/ckpt/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors', '/tmp/ltx2-bisect/ckpt/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors')
+INFO:ltx_pipelines.utils.blocks:Prompt encoding complete
+INFO:ltx_pipelines.utils.blocks:Building transformer (streaming) from /tmp/ltx2-bisect/ckpt/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors
+INFO:ltx_core.model.transformer.model:Building transformer with attention backends -- self: SDPA[CUDNN_ATTENTION>FLASH_ATTENTION>EFFICIENT_ATTENTION>MATH], masked: SDPA[CUDNN_ATTENTION>FLASH_ATTENTION>EFFICIENT_ATTENTION>MATH]
+INFO:ltx_pipelines.utils.blocks:Running denoising loop (8 steps, 320x192 25 frames @ 24.0 fps)
+=== IDENTITY (asserted before any weight is opened) ===
+IDENTITY_OK  revision=fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
+             worktree=clean
+             ltx_core -> /tmp/ltx2-bisect/LTX-2/packages/ltx-core/src/ltx_core/__init__.py
+             ltx_pipelines -> /tmp/ltx2-bisect/LTX-2/packages/ltx-pipelines/src/ltx_pipelines/__init__.py
+=== RENDER (upstream main(), in-process, recording stage installed) ===
+  ti2vid_one_stage --transformer-path /tmp/ltx2-bisect/ckpt/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors --text-encoder-path /tmp/ltx2-bisect/ckpt/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors --video-vae-path /tmp/ltx2-bisect/ckpt/vae/ltx-2.5-video-vae-conv-bf16.safetensors --audio-vae-path /tmp/ltx2-bisect/ckpt/vae/ltx-2.5-audio-vae-bf16.safetensors --height 192 --width 320 --num-frames 25 --num-inference-steps 8 --offload cpu --seed 42 --prompt A red fox walks slowly through a snowy pine forest at sunrise, cinematic. --output-path /workspace/ltx25-adherence-bisect/out/20260901T234409Z/upstream-render.mp4
+  0%|          | 0/8 [00:00<?, ?it/s][hb +1920s] alive
+100%|██████████| 8/8 [00:30<00:00,  3.78s/it]
+INFO:ltx_pipelines.utils.blocks:Building video decoder from /tmp/ltx2-bisect/ckpt/vae/ltx-2.5-video-vae-conv-bf16.safetensors
+INFO:ltx_pipelines.utils.blocks:Building audio decoder + vocoder from /tmp/ltx2-bisect/ckpt/vae/ltx-2.5-audio-vae-bf16.safetensors
+100%|██████████| 1/1 [00:00<00:00,  5.60it/s]
+INFO:ltx_pipelines.utils.media_io.encode:Video saved to /workspace/ltx25-adherence-bisect/out/20260901T234409Z/upstream-render.mp4
+RENDER secs=76
+=== RECORDED STATES: 1 ===
+=== LATENT DUMP ===
+  video  shape=[1, 128, 4, 6, 10] dtype=torch.bfloat16 expected=61440 raw=61440
+  audio  shape=[1, 8, 26, 16] dtype=torch.bfloat16 expected=6656 raw=6656
+=== DECODE (the control: these frames must match the committed digests) ===
+  video frames: 25
+  audio.wav: rate=48000 shape=(2, 49152)
+  committed frames = 25, decoded = 25, matched committed digests = 25 of 25
+{
+  "committed_entries": 28,
+  "committed_frames": 25,
+  "frames_decoded": 25,
+  "frames_observed": 25,
+  "matched": 25,
+  "ok": true,
+  "mismatches": []
+}
+CONTROL PASSED: this run reproduces the committed reference byte for byte, so the recording hook changed nothing and the dumped latent IS the reference render's latent.
+[23:45:35 +1952s]   ltx2_latent_dump.py rc=0 secs=85
+[23:45:35 +1952s] === [6] copy out ===
+total 432
+drwxrwxr-x 2 root 10001      0 Sep  1 23:45 .
+drwxrwxr-x 2 root 10001      0 Sep  1 23:45 ..
+-rw-rw-r-- 1 root 10001   6656 Sep  1 23:45 audio_latent_bfloat16.raw
+-rw-rw-r-- 1 root 10001  13440 Sep  1 23:45 audio_latent_f32.npy
+-rw-rw-r-- 1 root 10001   2672 Sep  1 23:45 ltx2_latent_dump_manifest.json
+drwxrwxr-x 2 root 10001      0 Sep  1 23:45 recorded_frames
+-rw-rw-r-- 1 root 10001 225174 Sep  1 23:45 upstream-render.mp4
+-rw-rw-r-- 1 root 10001  61440 Sep  1 23:45 video_latent_bfloat16.raw
+-rw-rw-r-- 1 root 10001 123008 Sep  1 23:45 video_latent_f32.npy
+65aea856a57e31e61a6b77e65c9b9018943c9f9f62c48bbf1be101436fc2f4c4  ./audio_latent_bfloat16.raw
+db94e2a0836e745382689020c0c41b29b2a66ce727a2886a3218e9681a0acab5  ./video_latent_bfloat16.raw
+f4a852b2b10b3761af4957f1841b4be86e90e21bcde9c9f5b841bbc38daa2b64  ./audio_latent_f32.npy
+297bd4083c45a073f3db5e9d70471cd4a2fc96cec35e2f040bee1a8e1c71c3ef  ./video_latent_f32.npy
+e7dc26b631e86364fd05a788b8120d6bb2ee6aa967ed7713a1ea86840559fce9  ./ltx2_latent_dump_manifest.json
+[23:45:37 +1954s] === PHASE A DONE: the oracle's latent is at /workspace/ltx25-adherence-bisect/result and its control PASSED ===

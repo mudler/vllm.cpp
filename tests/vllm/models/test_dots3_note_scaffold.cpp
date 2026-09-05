@@ -218,17 +218,29 @@ TEST_CASE("dots3-note: the architecture resolves through the model registry") {
   CHECK(reg.factory->forward != nullptr);
   CHECK(reg.factory->make_kv_cache != nullptr);
   CHECK(reg.info.is_text_generation_model);
-  // `supports_multimodal` is FALSE, and it was TRUE until W5 (#699). Upstream
-  // does put this architecture in `_MULTIMODAL_MODELS` with image, video AND
-  // audio (registry.py:381, multimodal.py:82-87 — the three branches of
-  // `get_placeholder_str` at :80-88), which is why W1 set it — but
-  // that is a statement about UPSTREAM, and it only became misleading about
-  // THIS port once W5 and W5c made the released config loadable. There is no
-  // vision tower (W6), no audio tower (W7) and no multimodal front end (W8):
-  // `EnumerateDots3NoteTensors` claims not one tensor of either tower and
-  // `Dots3NoteDeferredTowers()` records all 2625 as deferrals. W8 flips it
-  // back, and the true -> false -> true trail is the honest record.
-  CHECK_FALSE(reg.info.supports_multimodal);
+  // `supports_multimodal` is TRUE AGAIN, and the true -> false -> true trail is
+  // the honest record of what this port could back at each point (#699, #2512).
+  // W1 set it TRUE because upstream registers this architecture in
+  // `_MULTIMODAL_MODELS` with image, video AND audio (registry.py:381,
+  // multimodal.py:82-87) — a statement about UPSTREAM. W5 set it FALSE, because
+  // making the released config loadable turned that into a claim about THIS
+  // port that this port could not honour: there was no vision tower, no audio
+  // tower and no multimodal front end at all.
+  //
+  // W6a backs it. `kDots3NoteFactory` now carries `encode_mm` and `embed_mm`,
+  // `Dots3NoteForCausalLM` has its own `REGISTER_VLLM_MM_CHAT` translation
+  // unit, and a served `image_url` chat request reaches the model forward. The
+  // two assertions below are what makes this a CAPABILITY claim rather than a
+  // flag: `SupportsMmInputs` is DERIVED from the two hooks, never stored.
+  CHECK(reg.info.supports_multimodal);
+  CHECK(reg.factory->encode_mm != nullptr);
+  CHECK(reg.factory->embed_mm != nullptr);
+  // NOT an M-RoPE model: upstream's `Dots3NoteForCausalLM` is
+  // `SupportsMultiModal, SupportsPP` and NOT `SupportsMRoPE`
+  // (nvidia/multimodal.py:49 @ 9035151d6), so the runner hands it the ordinary
+  // 1-D positions. A non-null hook here would make the runner compute 3-D
+  // positions this forward never reads.
+  CHECK(reg.factory->mrope_prompt_positions == nullptr);
   // Both attention classes page the same MLA cache; the sliding half is a
   // window on it, not a recurrent state.
   CHECK_FALSE(reg.info.is_hybrid);
@@ -1116,7 +1128,7 @@ TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are clai
   CHECK(acc.duplicated.empty());
 }
 
-TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 2625") {
+TEST_CASE("dots3-note W2: the two tower files are NAMED W9/W7 deferrals, all 2625") {
   // A deferral is a record that names the brick, the file and what the tower
   // is. A bare counter is not one: it cannot tell a reader whether 2625 weights
   // are deferred on purpose or lost.
@@ -1124,7 +1136,12 @@ TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 262
   REQUIRE(towers.size() == 2);
   CHECK(std::string(towers[0].prefix) == "vision_encoder.");
   CHECK(std::string(towers[0].file) == "model-vision.safetensors");
-  CHECK(std::string(towers[0].brick) == "W6");
+  // W6a (#2512) landed the DENSE half of this tower and W6b (#2613) the
+  // PYRAMID half, so a bf16 checkpoint's tower LOADS and the brick moved again:
+  // what remains owed is the blockwise-FP8 arm, which is W9. The COUNT did not
+  // move and neither did the prefix — the accounting buckets by prefix, so all
+  // 2195 `vision_encoder.*` names land here whether the tower loaded or not.
+  CHECK(std::string(towers[0].brick) == "W9");
   CHECK(std::string(towers[1].prefix) == "audio_encoder.");
   CHECK(std::string(towers[1].file) == "model-audio.safetensors");
   CHECK(std::string(towers[1].brick) == "W7");
@@ -1658,7 +1675,7 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
     // W2: the message distinguishes UNKNOWN from DEFERRED by printing the
     // deferral table, so a reader is not left guessing which of the two the
     // loader thinks it hit.
-    CHECK_MESSAGE(refusal.find("vision_encoder.* (W6)") != std::string::npos,
+    CHECK_MESSAGE(refusal.find("vision_encoder.* (W9)") != std::string::npos,
                   "the refusal does not name the vision deferral: " << refusal);
     CHECK_MESSAGE(refusal.find("audio_encoder.* (W7)") != std::string::npos,
                   "the refusal does not name the audio deferral: " << refusal);
@@ -1762,15 +1779,33 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
   }
 
   SUBCASE("GGUF k-quants are OWED (W9), never silently dequantized") {
-    // llama.cpp has no `dots3_note` architecture, so the converter is ours to
-    // write and there is no quant-matched llama.cpp bar for this row.
+    // W9a (#2882) moved this text into `Dots3NoteGgufRefusal`, ONE owner shared
+    // with the entrypoint's GGUF architecture dispatch — which is the door a
+    // real `dots3note` file actually arrives at, strictly earlier than this
+    // guard. This case still holds THIS guard, for a direct `Kind::kGguf`
+    // caller, and it asserts the SAME string so the two cannot drift.
+    //
+    // The comment that used to sit here said llama.cpp has no `dots3_note`
+    // architecture, so the converter was ours to write and no quant-matched
+    // llama.cpp bar existed for this row. That was FALSE (spec §4.19.2):
+    // `LLM_ARCH_DOTS3NOTE -> "dots3note"` merged into `ggml-org/llama.cpp` on
+    // 2026-08-21 with a converter, and the bar is reachable behind a pin
+    // advance rather than absent.
     const vllm::ModelSource source = vllm::ModelSource::FromSafetensors({});
     vllm::ModelSource gguf = source;
     gguf.kind = vllm::ModelSource::Kind::kGguf;
     gguf.safetensors = nullptr;
     CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, gguf),
-                         doctest::Contains("GGUF k-quants are not ported"),
+                         doctest::Contains("the GGUF k-quant arm is OWED to W9"),
                          std::runtime_error);
+    // The two doors print the SAME bytes, which is the point of one owner.
+    std::string thrown;
+    try {
+      (void)reg.factory->load_weights(reg, config, gguf);
+    } catch (const std::runtime_error& e) {
+      thrown = e.what();
+    }
+    CHECK(thrown == vllm::Dots3NoteGgufRefusal());
   }
 }
 

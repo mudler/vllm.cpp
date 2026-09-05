@@ -241,13 +241,25 @@ std::string ReferenceTierRefusalReason(OpId op, DeviceType device) {
            "portable CPU reference tier has nothing to install onto";
   }
   if (!b->DeviceMemoryIsHostAddressable()) {
-    return std::string("the portable CPU reference tier is NOT eligible: this "
-                       "backend does not report its device memory "
-                       "host-addressable, so a host kernel may not dereference "
-                       "what it allocated (unified memory is ") +
-           (b->UnifiedMemory() ? "true" : "false") +
-           ", which is a DIFFERENT property). Build a native kernel for this op "
-           "or run it on the CPU device";
+    std::string why =
+        std::string("the portable CPU reference tier is NOT eligible: this "
+                    "backend does not report its device memory "
+                    "host-addressable, so a host kernel may not dereference "
+                    "what it allocated (unified memory is ") +
+        (b->UnifiedMemory() ? "true" : "false") +
+        ", which is a DIFFERENT property). Build a native kernel for this op "
+        "or run it on the CPU device";
+    // A backend that WITHDREW the property deliberately gets to say why, right
+    // here, where the user meets the consequence. The generic sentence above is
+    // true on every such device and useless on the one where the false is a
+    // decision rather than the hardware -- ROCm on an XNACK-less integrated
+    // part, issue #2511, is the case this exists for. Null on every backend
+    // with nothing to add, which leaves the message byte-identical.
+    if (const char* note = b->HostAddressabilityNote(); note != nullptr) {
+      why += ". ";
+      why += note;
+    }
+    return why;
   }
   if (!OpRegistered(op, DeviceType::kCPU)) {
     return "the portable CPU reference tier is eligible but has no CPU kernel "
@@ -286,6 +298,8 @@ const char* OpNameImpl(OpId op) {
       return "RopeNeox";
     case OpId::kEmbedding:
       return "Embedding";
+    case OpId::kEmbeddingQuant:
+      return "EmbeddingQuant";
     case OpId::kCausalConv1dFwd:
       return "CausalConv1dFwd";
     case OpId::kCausalConv1dUpdate:
@@ -336,6 +350,10 @@ const char* OpNameImpl(OpId op) {
       return "ReshapeAndCache";
     case OpId::kConcatAndCacheMla:
       return "ConcatAndCacheMla";
+    case OpId::kConcatAndCacheDsMla:
+      return "ConcatAndCacheDsMla";
+    case OpId::kDequantAndGatherDsMla:
+      return "DequantAndGatherDsMla";
     case OpId::kMlaDecodeAttention:
       return "MlaDecodeAttention";
     case OpId::kMlaPrefillAttention:
@@ -539,6 +557,10 @@ const char* OpNameImpl(OpId op) {
       return "Qwen4ExpGatedResidualWriteBack";
     case OpId::kQwen4ExpQsaCompress:
       return "Qwen4ExpQsaCompress";
+    case OpId::kGlm5NextKpoolCompress:
+      return "Glm5NextKpoolCompress";
+    case OpId::kGlm5NextKpoolSelect:
+      return "Glm5NextKpoolSelect";
     case OpId::kQwen4ExpQsaGatherAttention:
       return "Qwen4ExpQsaGatherAttention";
     case OpId::kConv2d:

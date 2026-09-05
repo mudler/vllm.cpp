@@ -89,6 +89,40 @@ Three options were considered.
    the workaround, and the declaration is never checked against the header
    (`docs/FEATURES.md:175`), so the lie would be undetectable — which makes it
    worse, not safer.
+
+   **BOTH anchors in that sentence are dead, re-resolved 2026-09-01 by row
+   `LTX25-ANCHOR-REPAIR`** ([`ltx25-anchor-repair.md`](ltx25-anchor-repair.md)
+   §4.1). `docs/USAGE.md` is 862 lines and contains no `keyframe_slot_sft` at all;
+   the topic moved to `docs/models/ltx-2-5.md`, under "Declare the checkpoint
+   family with `--checkpoint-class`". `docs/FEATURES.md:175` is worse than dead:
+   it resolves, and at `ed5ecea2e` it is a sentence about
+   `Ltx2TokenizeGemmaPrompt` and Gemma tokenization with nothing to do with
+   checkpoint classes — the shape where a stale anchor reads as evidence and
+   points at whatever now occupies the line.
+   The checkpoint-class row is the "LTX-2.5 checkpoint class" row of that
+   file's feature table.
+
+   **The REJECTION stands, and the documentation that contradicted it was the
+   side that was wrong.** `docs/models/ltx-2-5.md` stated the opposite of "never
+   checked": *"The loader checks it against the checkpoint rather than using it
+   as an unchecked hint, and refuses a missing or mismatched class before
+   generation."* Deciding between them is a read of the loader, not of an
+   anchor, so the loader was read.
+   `src/vllm/model_executor/models/ltx2_pipeline.cpp::Ltx2CheckpointClassRefusal`
+   compares the declared class against `recipe.checkpoint_class` — what the
+   PIPELINE needs — and against nothing in the checkpoint. Its own
+   `WhyNoDetector()` string says why, and is quoted into the refusal: the full
+   and distilled bf16 transformers are both 42,018,190,584 bytes with
+   byte-identical safetensors headers apart from `__metadata__` key order, so
+   *"this engine cannot tell, and it refuses rather than guessing"*. The
+   pre-#1491 text agreed, under the heading "`checkpoint_class` is REQUIRED, and
+   it is a declaration rather than a check"; the docs restructure in `aee6c48d6`
+   inverted it. **Fixed in flow** by row `LTX25-ANCHOR-REPAIR`, which rewrote
+   that paragraph of `docs/models/ltx-2-5.md` to say the loader refuses a
+   missing, unknown or pipeline-mismatched class and cannot check the file. The
+   sentence above therefore stands as written and the workaround stays REJECTED
+   for its original reason: the lie is undetectable, which makes it worse than a
+   refusal, not safer.
 3. **Gate on reduced-dimension synthetic fixtures through the production entry
    point.** TAKEN. This is how `test_ltx2_dfr` and every DFR case in
    `test_ltx2_video` already work (`test_ltx2_video.cpp:112` returns

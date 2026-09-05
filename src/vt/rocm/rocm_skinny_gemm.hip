@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
   }
   __syncthreads();
 
-  if (threadIdx.y >= _WvPrGrp) return;
+  if (threadIdx.y >= static_cast<uint32_t>(_WvPrGrp)) return;
 
   uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * kYtile;
 

@@ -1,5 +1,31 @@
 # Qwen3.8-27B Q4_K_M vs llama.cpp `b10451`: the token gate FAILS, 5 of 6 prompts
 
+> **CORRECTION, 2026-09-02 — one PREMISE below is falsified; no number, no
+> verdict and no refusal in this document changes.** The section "What this is
+> NOT" refuses the near-tie band on the ground that "this oracle's greedy decode
+> reproduced #857's output byte for byte from a different build, so it is
+> deterministic". That evidence covers a different BUILD of the same kernel path.
+> It does not cover a different kernel PATH within one build, and the general
+> claim is false: at `b10451`, stock `-nr/--no-repack` changes the oracle's own
+> greedy tokens on 1 of these 6 prompts — prompt 1 index 34, `3095` with repack
+> on and `198` with it off, where `198` is the token this document records as
+> OURS. Per-step the oracle perturbs its own final logits by min 0.2020 / median
+> 0.3790 / max 1.3657, so all six gaps recorded here are below its MINIMUM
+> self-perturbation.
+>
+> **The band stays unavailable and `TOKEN_GATE` stays FAIL.** What changes is the
+> stated reason. The band is not reached for because the oracle's
+> non-determinism is a KERNEL-SELECTION artefact that a gate must pin away —
+> `.agents/oracles/llama-cpp.md` now records how — not a distribution to
+> tolerate; and because being inside the oracle's noise band per divergence is
+> not the same as being at its noise floor by rate: it flips 1 of 6 and we flip 5
+> of 6, so we carry a larger term and that term is ours. No speed or memory axis
+> becomes admissible.
+>
+> Measurement:
+> [`qwen38-27b-q4km-oracle-self-consistency-20260902.md`](qwen38-27b-q4km-oracle-self-consistency-20260902.md).
+> Issue: [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+
 W3 of row `QUANT-QWEN38-27B-GGUF-ARM`, for
 [#821](https://github.com/mudler/vllm.cpp/issues/821). The declared gate is
 [`qwen38-27b-quant-arms.md`](../../.agents/specs/qwen38-27b-quant-arms.md)

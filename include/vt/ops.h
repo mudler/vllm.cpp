@@ -118,6 +118,16 @@ enum class OpId : uint8_t {
   kDflash2PathWalk,
   kReshapeAndCache,
   kConcatAndCacheMla,
+  // The fp8_ds_mla paged K cache (`KV-DSV4-MULTICACHE` W8, #2455). DeepSeek-V4's
+  // K cache is a REGION-SPLIT byte page and NOT a rank-3
+  // (num_blocks, block_size, width) tensor, so kConcatAndCacheMla — which
+  // requires exactly that rank — cannot express it and these are separate ops
+  // rather than a flag on it. Ported from
+  // `vllm/models/deepseek_v4/common/ops/cache_utils.py` @ `5559679229`:
+  // `quantize_and_insert_k_kernel` (`:36-159`) and
+  // `_dequantize_and_gather_k_kernel` (`:228-341`).
+  kConcatAndCacheDsMla,
+  kDequantAndGatherDsMla,
   kMlaDecodeAttention,
   kMlaPrefillAttention,
   // The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699). The
@@ -726,6 +736,90 @@ enum class OpId : uint8_t {
   // those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleGate,
+  // The DEQUANTIZING GATHER (KGATHER): `vt::Embedding` over a BLOCK-QUANTIZED
+  // table, decoding one row per gathered id. It is a separate op id from
+  // `kEmbedding` and not a dtype branch inside it, for one reason: a device's
+  // ability to decode a block row is a CAPABILITY the GGUF residency policy has
+  // to ask about BEFORE it decides where a tensor lives, and the only
+  // device-agnostic way to ask is the provider table. `DeviceQuantGatherSupported`
+  // (gguf_keep_quant.cpp) is `OpRegistered(kEmbeddingQuant, dev)` and names no
+  // device, exactly as `GgufQuantComputeAvailable()` beside it asks about
+  // `kMatmulBTQuant`; the alternative was a hand-kept per-device set in the
+  // shared loader, which `scripts/check-device-leakage.py` refuses and which
+  // could drift from the kernels it claims to describe.
+  //
+  // `vt::Embedding` routes here when `IsBlockQuant(table.dtype)`, so a device
+  // that registers only `kEmbedding` refuses a block table BY NAME through the
+  // ordinary GetOp message instead of silently gathering garbage. Registered on
+  // kCPU (src/vt/cpu/cpu_ops.cpp, the same kernel — it already branches on the
+  // table dtype) and on kCUDA (src/vt/cuda/cuda_ops.cu, decoders in
+  // src/vt/cuda/cuda_quant_dequant.cuh). METAL, VULKAN, ROCM and TENSTORRENT
+  // are NOT registered: each of their gather kernels asserts a float table by
+  // name, and their arms are owed.
+  // Appended before kCount so no existing op's id shifts.
+  kEmbeddingQuant,
+  // MODEL-MM-GLM53-FLASH W9c-0 ([#2415]) — GLM-5.3-Flash's K-POOL DSA indexer,
+  // the one primitive family on this model's critical path that nothing in this
+  // tree implemented on a device.
+  //
+  // THIS IS NOT THE LIGHTNING INDEXER AND THE PAIR ABOVE CANNOT SERVE IT.
+  // `kDsaIndexerLogits` / `kDsaTopkSelect` score RAW TOKENS and pick the top
+  // `index_topk` of them. `Glm5NextTextIndexer` (transformers v5.16.1,
+  // `models/glm5_next/modular_glm5_next.py`) compresses `index_kpool = 4`
+  // consecutive VALID tokens into one candidate under a LEARNED per-channel
+  // 4-way softmax, picks the top `index_topk / index_kpool = 512` POOLS, expands
+  // each back into its member token indices, and then appends the ragged visible
+  // tail raw and UNSCORED. Feeding raw candidates into a pooled top-k, or pooled
+  // candidates into a consumer expecting raw ones, yields plausible indices
+  // either way — which is why this is a separate op family and not a mode.
+  //
+  // Composition out of what already exists was checked and is not available:
+  // this `OpId` inventory has no general softmax, no general reduction and no
+  // pooled gather, and its only top-k entries are `kMoeRouterTopK` and the
+  // sampler's `kTopKValuesIndices`, neither of which selects over pools or
+  // expands a pool back to its members.
+  //
+  // kGlm5NextKpoolCompress — `get_pooled_states` (`:897-970`). The pool grid
+  // starts at the first VALID token and not at slot 0, so a left-padded row
+  // groups differently; a pool is a candidate only when ALL of its members are
+  // valid; and `keep = pool_valid.any(0)` (`:968`) COMPACTS the pool axis. That
+  // compaction is not cosmetic: `select_k = min(index_topk // index_kpool, P)`
+  // reads the compacted width, and a `P` too large by one moves the ragged
+  // tail's write offset and changes what the final truncation keeps. So the op
+  // compacts ON THE DEVICE and publishes `P` as a `[1]` i32 DEVICE scalar. It
+  // never synchronises and never returns anything to the host.
+  //
+  // kGlm5NextKpoolSelect — the selection half of `forward` (`:821-875`), with
+  // `get_visible_tokens` (`:877-895`) folded in as a PREDICATE rather than
+  // materialised (a `[B, S, kv_len]` visibility tensor is 2.7 GiB at 32k
+  // context for something a thread evaluates in two instructions; upstream
+  // materialises it because torch has no other way to gather under it) and
+  // `append_visible_tail` (`:972-1022`) folded in as the tail write, because the
+  // tail's write offset is `select_k * index_kpool` and only this op knows `P`.
+  // Output width is `index_topk + index_kpool - 1` = **2051** on the published
+  // checkpoint, not 2048, and it carries `-1` sentinels and duplicates, which
+  // upstream absorbs downstream with `scatter_add_` + `ne(0)`.
+  //
+  // f32 THROUGHOUT, which is upstream's own arithmetic and not a choice:
+  // `:823` scores in fp32 and `:960-964` takes the pool softmax in fp32. The
+  // HOST reference `glm5_next_dsa.cpp` accumulates in `double`, a
+  // host-reference widening the device deliberately does not copy — a fp64 pool
+  // softmax would put the model path on the 1/64-rate pipe to be more precise
+  // than the thing it mirrors.
+  //
+  // Registered on kCUDA ONLY (src/vt/cuda/cuda_glm5_next.cu). There is
+  // deliberately NO CPU provider: the CPU answer is `glm5_next_dsa.cpp`, which
+  // is this family's ORACLE, and registering it a second time under these ids
+  // would make the seam its own oracle. A CPU queue is therefore refused BY NAME
+  // by the dispatcher.
+  //
+  // Additive, and NOT REACHED from any production entry point yet: only
+  // `tests/vllm/models/test_glm5_next_kpool_device.cpp` and the availability
+  // probe `vllm::glm5_next::KpoolDeviceOpsAvailable()` call them. W9c-3 owns the
+  // wiring and #2410 tracks it; the spec's O36 says so in the specific.
+  // Appended before kCount so no existing op's id shifts.
+  kGlm5NextKpoolCompress,
+  kGlm5NextKpoolSelect,
   kCount
 };
 
@@ -1218,6 +1312,25 @@ struct Mamba2Args {
   // W1 lands tp_world_size == 1 only; see RmsNormGatedGroupArgs::tp_world_size.
   int64_t tp_world_size = 1;
 };
+
+// KERNEL-GDN-CHUNKED-MIRROR (.agents/specs/gdn-chunked-mirror.md D0/D3).
+// THE algorithm predicate for GDN prefill, shared by every backend so that a
+// `--device cpu` run and a `--device cuda` run cannot end up on different
+// algorithms because only one of them read the flag.
+//
+// `GdnChunkedPrefillEnabled()` is the raw `VT_GDN_CHUNKED` read, lifted
+// verbatim out of cuda_gdn.cu (the bespoke `e == nullptr || e[0] != '0'` parse
+// is KEPT as-is rather than rewritten to EnvOnOr: the off-value spelling is
+// recorded in four evidence files and six spec lines, so changing the accepted
+// spellings would be a semantic change wearing a cleanup).
+//
+// `GdnUseChunkedPrefill(dtype)` adds D0's dtype term. vLLM's chunked kernels
+// REFUSE f32 — the Triton wrapper asserts (`chunk.py:213-215`) and the CPU
+// kernel type-checks (`csrc/cpu/sgl-kernels/fla.cpp:2205-2207`, bf16 only) — so
+// at f32 the sequential recurrence IS the mirror, because it is the only gated
+// delta rule upstream will execute at that dtype.
+bool GdnChunkedPrefillEnabled();
+bool GdnUseChunkedPrefill(DType q_dtype);
 
 struct GdnArgs {
   // q scale, applied to q only after l2norm; upstream default Dk^-0.5
@@ -2294,6 +2407,37 @@ using Qwen4ExpQsaGatherAttentionFn = void (*)(Queue&, Tensor& /*out*/,
                                               const Tensor& /*block_ids*/,
                                               const Tensor& /*kv_lens*/,
                                               const Qwen4ExpQsaAttnArgs&);
+// GLM-5.3-Flash k-pool DSA indexer (MODEL-MM-GLM53-FLASH W9c-0, #2415). The
+// pooled-candidate selection `vt::DsaIndexerLogits` / `vt::DsaTopkSelect`
+// cannot express, because those two score RAW TOKENS. See the OpId comments.
+struct Glm5NextKpoolSelectArgs {
+  // `config.index_topk` — 2048 on the published checkpoint. The pool budget is
+  // `index_topk // index_kpool` and `validate_architecture` enforces that the
+  // division is exact (`configuration_glm5_next.py:219-220`).
+  int64_t index_topk = 0;
+  // `cache_layer.get_seq_length()` (`modular_glm5_next.py:811`). It differs from
+  // `kv_len` only on a STATIC cache padded to a maximum length; the query at
+  // step `s` sits at `current_length - seq_len + s`, which is what lets a decode
+  // step's single query see the whole cached prefix instead of only slot 0.
+  int64_t current_length = 0;
+  // `self.softmax_scale = self.head_dim ** -0.5` (`modeling_glm5_next.py:765`).
+  // The INDEXER head dim, not the MLA one.
+  float softmax_scale = 0.0f;
+  // `config.index_kpool_always_select_tail`. True on the published checkpoint,
+  // and it is what widens the output to `index_topk + index_kpool - 1`.
+  bool always_select_tail = true;
+};
+using Glm5NextKpoolCompressFn = void (*)(Queue&, Tensor& /*pool_keys*/,
+                                         Tensor& /*pool_indices*/, Tensor& /*pool_valid*/,
+                                         Tensor& /*num_pools*/, const Tensor& /*packed*/,
+                                         const Tensor& /*ape*/);
+using Glm5NextKpoolSelectFn =
+    void (*)(Queue&, Tensor& /*topk_indices*/, Tensor& /*index_scores*/,
+             const Tensor& /*q_states*/, const Tensor& /*head_weights*/,
+             const Tensor& /*pool_keys*/, const Tensor& /*pool_indices*/,
+             const Tensor& /*pool_valid*/, const Tensor& /*num_pools*/,
+             const Tensor& /*valid_keys*/, const Tensor& /*q_mask*/,
+             const Glm5NextKpoolSelectArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -2347,6 +2491,39 @@ using Dflash2PathWalkFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
                                    const Dflash2PathWalkArgs&);
 using TopKValuesIndicesFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                      const TopKValuesIndicesArgs&);
+// --- The fp8_ds_mla paged K-cache GEOMETRY (KV-DSV4-MULTICACHE W8, #2455) ----
+// Upstream's host wrapper `quantize_and_insert_k_cache` writes these four as
+// literals in its own body (`cache_utils.py:180-190` @ `5559679229`) and hands
+// them to the kernel as `tl.constexpr`s; its gather twin repeats them
+// (`:353-358`). They are named ONCE here because the op wrapper validates the
+// shapes they imply and the kernels build `Fp8DsMlaLayout` from them, and two
+// copies of 448 would be two things to keep in step.
+inline constexpr int64_t kFp8DsMlaNopeDim = 448;    // TOKEN_FP8_DIM   (`:180`)
+inline constexpr int64_t kFp8DsMlaRopeDim = 64;     // TOKEN_BF16_DIM  (`:181`)
+inline constexpr int64_t kFp8DsMlaScaleDim = 8;     // TOKEN_SCALE_DIM (`:182`), 7 real + 1 pad
+inline constexpr int64_t kFp8DsMlaQuantBlock = 64;  // QUANT_BLOCK_SIZE(`:183`)
+// `input_dim` 512 — the latent width upstream asserts on `k` (`:167-169`).
+inline constexpr int64_t kFp8DsMlaInputDim = kFp8DsMlaNopeDim + kFp8DsMlaRopeDim;
+// TOKEN_DATA_SIZE = 448 + 64*2 = 576 (`:190`): the rope half is stored bf16.
+inline constexpr int64_t kFp8DsMlaTokenDataSize =
+    kFp8DsMlaNopeDim + kFp8DsMlaRopeDim * 2;
+// 584 = 576 data + 8 scale, the per-token page cost
+// (`kv_cache_interface.py:401-403`, "448B NoPE + 128B RoPE + 8B fp8 scale").
+inline constexpr int64_t kFp8DsMlaTokenBytes =
+    kFp8DsMlaTokenDataSize + kFp8DsMlaScaleDim;
+
+// The fp8_ds_mla paged K-cache READ (W8 slice 3). Mirrors the two non-tensor
+// arguments of `dequantize_and_gather_k_cache_triton` (`cache_utils.py:339-389`).
+struct DequantAndGatherDsMlaArgs {
+  // `cache_block_size` (`:379`): STORAGE rows per block, i.e. the spec's
+  // `storage_block_size()` = `block_size / compress_ratio`. It is an argument
+  // and not a shape because the page is rank-2 bytes.
+  int64_t block_size = 0;
+  // `offset` (`:369`): the first output COLUMN this gather writes, so a caller
+  // can concatenate several gathers into one scratch row.
+  int64_t offset = 0;
+};
+
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -2358,6 +2535,19 @@ using ReshapeAndCacheFp8Fn = void (*)(Queue&, const Tensor& /*k*/, const Tensor&
                                       float /*k_scale*/, float /*v_scale*/);
 using ConcatAndCacheMlaFn =
     void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, const Tensor&);
+// The fp8_ds_mla paged K-cache STORE (`KV-DSV4-MULTICACHE` W8 slice 2, #2455).
+// `k` is the compressed latent [num_tokens, 512], `kv_cache` the rank-2 byte
+// page [num_blocks, block_bytes] (DType::kI8), `slot_mapping` [num_slots] i64,
+// and the trailing int64 is upstream's `block_size` argument — the STORAGE rows
+// per block, which a rank-2 page cannot carry in its own shape.
+using ConcatAndCacheDsMlaFn =
+    void (*)(Queue&, const Tensor&, Tensor&, const Tensor&, int64_t);
+using DequantAndGatherDsMlaFn = void (*)(Queue&, Tensor& /*out*/,
+                                         const Tensor& /*kv_cache*/,
+                                         const Tensor& /*seq_lens*/,
+                                         const Tensor* /*gather_lens*/,
+                                         const Tensor& /*block_table*/,
+                                         const DequantAndGatherDsMlaArgs&);
 using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
                                       const Tensor&, const Tensor&,
                                       const MlaDecodeAttentionArgs&);
@@ -2386,8 +2576,8 @@ using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3).
-using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&,
-                                         const Tensor&);
+using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&,
+                                         const Tensor&, const Tensor&);
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). See the section at the
 // bottom of this header for the full contracts.
 using ApplyPenaltiesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -4741,6 +4931,89 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
 void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
                        const Tensor& slot_mapping);
 
+// --- The fp8_ds_mla paged K cache (KV-DSV4-MULTICACHE W8, #2455) ------------
+// DeepSeek-V4's K cache is NOT a rank-3 (num_blocks, block_size, width) tensor,
+// and that is the whole reason these are separate ops. Its block is
+// REGION-SPLIT (`cache_utils.py:59-66` @ `5559679229`, verbatim):
+//
+//     K Cache block layout (block_size=64 tokens):
+//     - [0, 64*576):              Token data, each token has 448 fp8 + 128 bf16
+//     - [64*576, 64*576 + 64*8):  Scales, each token has 8 uint8 scales
+//     - [64*576 + 64*8, block_stride): Padding
+//
+// A token's scale bytes live in a DIFFERENT region of the block from its data
+// bytes, so no (block, row, column) indexing reaches both. `vt::ConcatAndCacheMla`
+// requires `rank == 3` and keeps its "auto path only, fp8_ds_mla refused"
+// contract unchanged — that refusal is what stops an f32 write (2048 bytes at
+// head_dim 512, 3.5x the 584 the spec declares) landing in a byte page.
+//
+// STORE — `quantize_and_insert_k_cache` / `quantize_and_insert_k_kernel`
+// (`cache_utils.py:36-159` kernel, `:162-227` host wrapper).
+//
+//   k             [num_tokens, 512] float   the compressed latent: NoPE part in
+//                 columns [0, 448), the already-rotated RoPE part in [448, 512).
+//                 Upstream asserts bf16 (`:167-171`); we accept any float dtype
+//                 because the encoder's FIRST act is upstream's own fp32->bf16
+//                 round, so an f32 row and its bf16 rounding produce the SAME
+//                 bytes.
+//   kv_cache      [num_blocks, block_bytes] DType::kI8 — the byte page. Its
+//                 block stride comes from `kv_cache.stride[0]`, exactly as
+//                 upstream reads `k_cache.stride(0)` (`:189`).
+//   slot_mapping  [num_slots] i64. `slot < 0` writes NOTHING — not a zero row,
+//                 not a partial row (upstream `if slot_idx == -1: return`,
+//                 `:77-78`). Upstream takes the token count from
+//                 `slot_mapping.shape[0]` (`:186-188`), so trailing rows of `k`
+//                 are padding and are ignored.
+//   block_size    STORAGE rows per block (`cache_block_size`, `:216`). A scalar
+//                 rather than a shape because the page is rank-2 bytes.
+//
+// For token t with slot s: block = s / block_size, pos = s % block_size; the
+// data lands at `pos * 576` inside the block and the 8 scale bytes at
+// `block_size * 576 + pos * 8`, with the 8th EXPLICITLY zeroed (`:148-149`).
+// Nothing past `block_size * 584` is ever written: the tail is the alignment
+// padding (`:63`).
+void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
+                         const Tensor& slot_mapping, int64_t block_size);
+
+// READ — `dequantize_and_gather_k_cache_triton` /
+// `_dequantize_and_gather_k_kernel` (`cache_utils.py:228-341` kernel,
+// `:339-389` host wrapper).
+//
+// A GATHER into a float scratch, not a fused fp8 attention. Upstream splits the
+// same way: its prefill dequant-gathers (`nvidia/flashmla.py:296`) while its
+// decode hands the packed page to a vendor kernel (`:219-226`) we do not have.
+// The scratch costs `seq_len * 512 * sizeof(out dtype)` per layer per step,
+// which is why the native fp8 decode is a later wave.
+//
+//   out          [num_reqs, max_num_tokens, 512] f32 or bf16
+//   kv_cache     [num_blocks, block_bytes] DType::kI8
+//   seq_lens     [num_reqs] i32
+//   gather_lens  [num_reqs] i32 or nullptr. nullptr is upstream's
+//                `gather_lens_ptr is None` arm: gather the WHOLE sequence
+//                (`:257-262`).
+//   block_table  [num_reqs, max_blocks_per_seq] i32
+//
+// For request b it walks `pos` in `[seq_len - gather_len, seq_len)` and writes
+// row `offset + i` of `out[b]` (`:263-296`).
+//
+// THE ASYMMETRY, and it is upstream's: the store writes `scale_dim == 8` scale
+// bytes and this read consumes `n_quant_blocks == 7` (`:385`). The 8th byte is
+// written and never read. Do not "tidy" the store's pad byte away — upstream
+// stores it explicitly so the page holds 0 there rather than whatever it held
+// before, and a later native-fp8 kernel reading 8 blocks would then read stale
+// bytes instead of a zero.
+//
+// DTYPE. Upstream's `out` is bf16 (`:328`, `:337`) and a bf16 `out` here is
+// bit-identical to it. An f32 `out` stores the dequantized value BEFORE that
+// final bf16 rounding — annotated per AGENTS.md rather than left to be found:
+// it is not a widened model buffer but a scratch whose dtype must equal the
+// query dtype that `vt::MlaDecodeAttention` will consume it with, and our CPU
+// MLA decode runs at f32.
+void DequantAndGatherDsMla(Queue& q, Tensor& out, const Tensor& kv_cache,
+                           const Tensor& seq_lens, const Tensor* gather_lens,
+                           const Tensor& block_table,
+                           const DequantAndGatherDsMlaArgs& args);
+
 // --- MLA decode attention (MLA campaign W4) ---------------------------------
 // The MQA decode half of Multi-head Latent Attention: every one of the Hq query
 // heads attends to the SAME single-head compressed latent row in the 3-D MLA
@@ -4858,6 +5131,56 @@ void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Te
 // because the online softmax then sees the identical summation order. CPU + CUDA.
 void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logits,
                    const Tensor& win_start, const Tensor& win_end);
+
+// GLM-5.3-Flash's k-pool DSA indexer — the LEARNED pooled compression
+// (`Glm5NextTextIndexer.get_pooled_states`, `modular_glm5_next.py:897-970` @
+// transformers v5.16.1) and the pooled selection that consumes it
+// (`forward` `:821-875`, with `get_visible_tokens` `:877-895` folded in as a
+// predicate and `append_visible_tail` `:972-1022` as the tail write). vLLM
+// implements `glm5_next` at no revision, so transformers is the reference here
+// under AGENTS.md "When vLLM has no implementation". CUDA only.
+//
+//   packed       f32 [batch, kv_len, 2 * head_dim + 1] — `concat[k, gate, valid]`
+//                (`:798-801`), the FULL key history the pool grid is re-formed
+//                over on every call
+//   ape          f32 [index_kpool, head_dim] — `index_kpool_compress_ape`
+//   pool_keys    f32 [batch, np, head_dim]        np = ceil(kv_len / index_kpool)
+//   pool_indices i32 [batch, np, index_kpool]     -1 for an invalid member
+//   pool_valid   i32 [batch, np]                  1 iff ALL members are valid
+//   num_pools    i32 [1]                          `P` AFTER `keep` (`:968-970`)
+//
+// `np` is the STATIC upper bound and `P <= np` is the live width. Only
+// `[0, P)` carries meaning; the slack is zeroed (and `pool_indices` filled with
+// the -1 sentinel) so a downstream read of it is empty rather than undefined.
+// `num_pools` stays on the DEVICE: the whole point of the family is that the
+// eleven DSA layers stop paying a device-to-host round trip per step.
+void Glm5NextKpoolCompress(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                           Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                           const Tensor& ape);
+
+// The selection over those pooled candidates.
+//
+//   q_states     f32 [batch, seq_len, index_n_heads, head_dim] — `wq_b(q_resid)` (`:795`)
+//   head_weights f32 [batch, seq_len, index_n_heads] — `weights_proj(hidden)` BEFORE
+//                the `n_heads ** -0.5` scale, which this op applies (`:827`)
+//   valid_keys   i32 [batch, kv_len] — the packed row's validity channel (`:814`)
+//   q_mask       i32 [batch, seq_len] — the query-side padding mask (`:873`)
+//   topk_indices i32 [batch, seq_len, index_topk (+ index_kpool - 1)] — **2051**
+//                wide on the published checkpoint, NOT 2048, carrying -1
+//                sentinels and possible duplicates, which upstream absorbs with
+//                `scatter_add_` + `ne(0)` (`:1119-1129`)
+//   index_scores f32 [batch, seq_len, np] — the per-pool score BEFORE the
+//                validity mask (`:828`). It is an output rather than an internal
+//                because it is the only way a gate can show the selection is a
+//                strict separation and not a coin flip: top-k error is BIMODAL,
+//                so a tolerance on the selected values passes a wrong set whose
+//                values happen to be close.
+void Glm5NextKpoolSelect(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                         const Tensor& q_states, const Tensor& head_weights,
+                         const Tensor& pool_keys, const Tensor& pool_indices,
+                         const Tensor& pool_valid, const Tensor& num_pools,
+                         const Tensor& valid_keys, const Tensor& q_mask,
+                         const Glm5NextKpoolSelectArgs& args);
 
 // --- MLA prefill attention (MLA campaign W5) --------------------------------
 // The MHA prefill half of Multi-head Latent Attention — upstream's
@@ -5136,12 +5459,24 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
 //                 deterministic and the ported legacy-sampler assertions read
 //                 directly. Recorded deviation.
 //   num_sampled   [num_reqs] i32            OUT; accepted_length + 1
+//   target_argmax [num_logits] i32          SCRATCH, written then read by this
+//                 op: the per-expanded-row argmax of `logits`, upstream's
+//                 `_compute_global_target_argmax` output (:923-946). It is a
+//                 PARAMETER and not a private static for one reason
+//                 (SPEC-DFLASH2 A2-2, #2802): the CUDA arm launches two kernels
+//                 and returns while both are still queued, so the buffer between
+//                 them has to be owned by whoever owns the in-flight window. A
+//                 process-global grow-only scratch cannot be: a second caller
+//                 with more rows frees it under the first caller's queued accept
+//                 kernel. The caller allocates it, keeps it alive until it has
+//                 waited, and frees it then —
+//                 `vllm::v1::RejectionSamplerDeviceOutput` is that owner.
 //
 // Argmax tie-break is LOWEST INDEX (torch.argmax), identical to vt::GreedyArgmax,
 // so a k=0 request reduces EXACTLY to the non-speculative greedy sampler.
 void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled,
-                           const Tensor& logits, const Tensor& draft_sampled,
-                           const Tensor& cu_num_logits);
+                           Tensor& target_argmax, const Tensor& logits,
+                           const Tensor& draft_sampled, const Tensor& cu_num_logits);
 
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). Ported from
 // vllm/model_executor/layers/utils.py (apply_penalties), vllm/_custom_ops.py
@@ -5250,7 +5585,14 @@ void MulColVecF32(Queue& q, Tensor& x, const Tensor& col);
 // gate_out are [T,Hq,Dh]. For t in [0,T), hq in [0,Hq):
 //   q_out[t,hq,:]    = qgate row t at offset (hq*2*Dh)      .. +Dh
 //   gate_out[t,hq,:] = qgate row t at offset (hq*2*Dh + Dh) .. +2*Dh
-// T/Hq/Dh are inferred from q_out's shape. All f32.
+// T/Hq/Dh are inferred from q_out's shape.
+//
+// DTYPES. `qgate` is f32 or bf16 (bf16 = a VT_BF16_GEMM_OUT q_proj). `q_out` is
+// f32 or bf16: the split is a pure copy, so a bf16 `q_out` over a bf16 `qgate` is
+// the IDENTITY on every element and costs half the bytes of an f32 one. That is
+// the width vLLM carries — `torch.chunk` does not widen (qwen3_next.py:430) and
+// `q_norm` promotes inside its own kernel, not into an allocation. `gate_out` is
+// f32 on every arm, because `vt::SigmoidGateBf16` takes an f32 gate.
 void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate);
 
 // out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])), sigmoid(x)=1/(1+exp(-x)); out
@@ -5346,7 +5688,16 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
 // `tile` is the tile's 16*bits int16 words as stored. Mirrors `dq`
 // (`exl3_dq.cuh:15-31`): the window ENDS at weight t, so t's own `bits` bits sit
 // in the low positions and weights t-1, t-2 … wrap around the tile above them.
-uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
+//
+// WHY `const void*` AND NOT `const uint16_t*` HERE AND IN THE THREE BELOW. A
+// trellis is a borrowed safetensors payload typed kI8 (`vt::Exl3Gemm`: "the
+// trellis travels as opaque i8 BYTES"), so its base is 1-byte aligned and lands
+// on an odd address in roughly half of all checkpoints. Forming a
+// `const uint16_t*` over it is undefined and `-fsanitize=alignment` aborts on
+// the load (#2558); these decoders read it through `vt::LoadUnaligned` off a
+// byte cursor instead. Every caller still passes the int16 words as stored, and
+// a `uint16_t*` converts implicitly, so no call site changed.
+uint16_t Exl3TileCodeword(const void* tile, int bits, int t);
 
 // The MCG codebook (cb == 1), three instructions (`codebook.cuh:67-75`):
 // `x *= 0xCBAC1FED; x = (x & 0x8fff8fff) ^ 0x3b603b60;` then the two fp16
@@ -5358,8 +5709,17 @@ float Exl3DecodeMcg(uint16_t codeword);
 //   cb 0  the original QTIP 3INST: `x *= 89226354; x += 64248484`
 //   cb 1  MCG:                     `x *= 0xCBAC1FED`
 //
-// then, for both, `x = (x & 0x8fff8fff) ^ 0x3b603b60` and the two fp16 halves
-// summed in fp16. Any other value REFUSES BY NAME.
+// then, for those two, `x = (x & 0x8fff8fff) ^ 0x3b603b60` and the two fp16
+// halves summed in fp16.
+//
+//   cb 2  `mul1`: `x *= 0x83DCD12D`, then a DIFFERENT SHAPE — the four unsigned
+//         bytes of the product are summed into 0x6400 (`__dp4a`), the sum is
+//         reinterpreted as an fp16 bit pattern, and an fp16 fused affine map
+//         (`* 0x1eee + 0xc931`) yields the value. It is not the mask/xor/pair-sum
+//         of the other two, so it cannot be reached by swapping the multiplier.
+//         `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` marks every linear this way (#2495).
+//
+// Any other value REFUSES BY NAME. Upstream defines no other value either.
 //
 // WHICH ONE A CHECKPOINT USES IS DECIDED BY TENSOR PRESENCE, AND THE POLARITY
 // IS THE OPPOSITE OF THE OBVIOUS GUESS. `LinearEXL3` sets `self.mcg =
@@ -5380,12 +5740,12 @@ float Exl3DecodeCodeword(uint16_t codeword, int codebook);
 int Exl3TileRowMajorIndex(int t);
 
 // Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
-void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256);
+void Exl3DecodeTile(const void* tile, int bits, int codebook, float* out256);
 
 // `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
 // reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
 // values. `k` and `n` must be multiples of 16.
-void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits, int codebook,
+void Exl3ReconstructInner(const void* trellis, int64_t k, int64_t n, int bits, int codebook,
                           float* out);
 
 // `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
@@ -5400,8 +5760,8 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
 // performs after each transform (`quantize.py:342-346,351-355` `.to(x_dtype)`)
 // absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
 // parity gate is stated against THIS function, not against torch.
-void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
-                       const uint16_t* svh, int64_t k, int64_t n, int bits, int codebook,
+void Exl3DequantLinear(const void* trellis, const void* suh,
+                       const void* svh, int64_t k, int64_t n, int bits, int codebook,
                        float* out);
 
 // ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────

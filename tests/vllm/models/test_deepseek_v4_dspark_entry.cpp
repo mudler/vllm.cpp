@@ -419,7 +419,9 @@ vllm::DeepseekV4MtpHead TinyHead(const vllm::DeepseekV4Params& p,
   add("attn.wq_a.weight", p.q_lora_rank, H);
   add("attn.wq_b.weight", p.num_attention_heads * D, p.q_lora_rank);
   add("attn.wkv.weight", D, H);
-  add("attn.wo_a.weight", p.o_groups * p.o_lora_rank, H);
+  // `[n_groups, o_lora_rank, n_heads*head_dim/n_groups]`, so the element count is
+  // `o_lora_rank * n_heads * head_dim` -- NOT `o_groups*o_lora_rank x hidden`.
+  add("attn.wo_a.weight", p.o_lora_rank * p.num_attention_heads, D);
   add("attn.wo_b.weight", H, p.o_groups * p.o_lora_rank);
   add("ffn.gate.weight", p.n_routed_experts, H);
   add("ffn.gate.bias", p.n_routed_experts, 1);
@@ -564,4 +566,175 @@ TEST_CASE("W-4b: a projection sized for the hidden half alone REFUSES") {
   const std::vector<float> short_proj{1.0f, 1.0f};  // H only, missing the rank half
   CHECK_THROWS(
       vllm::dspark::ConfidenceDraftLength(xpre, emb, short_proj, 0.5f, B, H, R));
+}
+
+// ── W-3: one DSpark block's attention half ──────────────────────────────────
+
+TEST_CASE("W-3: a block attends the rows BlockKvRows wrote, without rewriting them") {
+  // The whole point of the `kv_prewritten` seam. A DSpark block's KV comes from
+  // the TARGET's taps, so the block must attend rows it did not compute -- and
+  // must not overwrite them with rows derived from its own hidden state.
+  vllm::DeepseekV4Params p = TinyBlockParams();
+  p.num_hidden_layers = 1;
+  p.num_attention_heads = 2;
+  p.qk_rope_head_dim = 2;
+  p.rms_norm_eps = 1e-6f;
+  p.rope_theta = 10000.0;
+  p.sliding_window = 0;
+
+  std::vector<std::vector<float>> storage;
+  const vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+  vllm::DeepseekV4LayerHostWeights L;
+  bool missing = false;
+  REQUIRE(vllm::dspark::AssembleBlockWeights(h, p, &L, &missing).empty());
+  // The block forward needs the routed experts, which assembly deliberately does
+  // not fill (20.2 GiB at the real geometry). Fill them HERE, at tiny shape, so
+  // the attention half can be exercised.
+  const int64_t E = p.n_routed_experts, mi = p.moe_intermediate_size,
+                H = p.hidden_size;
+  L.exp_w1.assign(static_cast<size_t>(E * mi * H), 0.02f);
+  L.exp_w3.assign(static_cast<size_t>(E * mi * H), 0.02f);
+  L.exp_w2.assign(static_cast<size_t>(E * H * mi), 0.02f);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = p.head_dim, bs = 8, nb = 2, T = 1, kv_base = 3;
+  std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+  // A RECOGNISABLE pattern: these are the rows the taps wrote.
+  for (size_t i = 0; i < cache.size(); ++i)
+    cache[i] = 0.01f * static_cast<float>((i * 5) % 29) - 0.1f;
+  const std::vector<float> before = cache;
+  std::vector<vt::Tensor> pages{vt::Tensor::Contiguous(
+      cache.data(), vt::DType::kF32, q.device, {nb, bs, hd})};
+
+  const std::vector<float> x(static_cast<size_t>(T * H), 0.05f);
+  const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
+  const std::vector<float> o = vllm::DsparkBlockAttentionHost(q, L, p, x, pos, pages,
+                                                              /*layer=*/0, kv_base);
+  REQUIRE(o.size() == static_cast<size_t>(T * H));
+  for (const float v : o) REQUIRE(std::isfinite(v));
+
+  // THE CLAIM: the tap-written rows survive byte for byte.
+  for (size_t i = 0; i < before.size(); ++i) {
+    if (before[i] != cache[i]) {
+      CAPTURE(i);
+      REQUIRE(before[i] == cache[i]);
+    }
+  }
+  // ...and the attention actually READ them: zeroing the cache must change the
+  // output, or the block would be attending nothing and still returning finitely.
+  std::vector<float> zeroed(cache.size(), 0.0f);
+  std::vector<vt::Tensor> zpages{vt::Tensor::Contiguous(
+      zeroed.data(), vt::DType::kF32, q.device, {nb, bs, hd})};
+  const std::vector<float> oz =
+      vllm::DsparkBlockAttentionHost(q, L, p, x, pos, zpages, 0, kv_base);
+  double diff = 0.0;
+  for (size_t i = 0; i < o.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(o[i] - oz[i])));
+  CHECK(diff > 1e-9);
+}
+
+TEST_CASE("W-3: a block carrying a compressor is REFUSED") {
+  // `mtp_layer_types` is asserted "sliding" (`deepseek_v4_mtp.py:61-63`): a
+  // DSpark block is compressor-less and has no indexer. A layer carrying either
+  // is not a DSpark block, and running it as one would take the DSA path.
+  vllm::DeepseekV4Params p = TinyBlockParams();
+  p.num_hidden_layers = 1;
+  std::vector<std::vector<float>> storage;
+  const vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+  vllm::DeepseekV4LayerHostWeights L;
+  bool missing = false;
+  REQUIRE(vllm::dspark::AssembleBlockWeights(h, p, &L, &missing).empty());
+  L.comp_wgate.assign(4, 1.0f);  // not a DSpark block any more
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  std::vector<float> cache(static_cast<size_t>(16 * p.head_dim), 0.0f);
+  std::vector<vt::Tensor> pages{vt::Tensor::Contiguous(
+      cache.data(), vt::DType::kF32, q.device, {2, 8, p.head_dim})};
+  const std::vector<float> x(static_cast<size_t>(p.hidden_size), 0.05f);
+  // It must refuse BY NAME. Something downstream throws anyway on the widened
+  // tensor -- an anonymous size error -- so asserting only that it throws proves
+  // nothing about THIS guard, and a mutation removing the guard survived exactly
+  // that weaker assertion.
+  std::string msg;
+  try {
+    (void)vllm::DsparkBlockAttentionHost(q, L, p, x, {0}, pages, 0, 0);
+    FAIL("expected a refusal");
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  CAPTURE(msg);
+  CHECK(msg.find("COMPRESSOR-LESS") != std::string::npos);
+  CHECK(msg.find("sliding") != std::string::npos);
+}
+
+// ── W-5: the propose side's bookkeeping ─────────────────────────────────────
+
+TEST_CASE("W-5: cu_num_logits is 1 + the draft length, per request") {
+  // The sampler derives each request's length as `cu[r+1] - cu[r]`
+  // (`rejection_sampler.cpp:85-86`), and row `cu[r]` is the previous token,
+  // uncompared. `MarkovDraftLoop` returns `[seed, drafts...]`, so the seed IS
+  // that row.
+  const std::vector<std::vector<int32_t>> drafted{
+      {7, 11, 12, 13, 14, 15},  // seed 7, five drafts
+      {9, 21, 22, 23, 24, 25},
+  };
+  const std::vector<int64_t> lengths{5, 2};  // the second request was capped
+  std::vector<int32_t> cu;
+  const auto flat = vllm::dspark::ProposeToVerifyInputs(drafted, lengths, &cu);
+
+  REQUIRE(cu.size() == 3u);
+  CHECK(cu[0] == 0);
+  CHECK(cu[1] == 6);   // 1 + 5
+  CHECK(cu[2] == 9);   // + 1 + 2
+  REQUIRE(flat.size() == 9u);
+  // Request 0: seed then all five drafts.
+  CHECK(flat[0] == 7);
+  CHECK(flat[5] == 15);
+  // Request 1: seed then only the two the confidence cap kept.
+  CHECK(flat[6] == 9);
+  CHECK(flat[7] == 21);
+  CHECK(flat[8] == 22);
+}
+
+TEST_CASE("W-5: a length of 0 is a request that SKIPS drafting, not an error") {
+  // One row carrying the previous token yields the bonus token alone, which is a
+  // valid sampling row. Treating it as empty would give the request zero rows and
+  // desynchronise every later offset.
+  const std::vector<std::vector<int32_t>> drafted{{4, 5, 6}, {8, 9, 10}};
+  const std::vector<int64_t> lengths{0, 2};
+  std::vector<int32_t> cu;
+  const auto flat = vllm::dspark::ProposeToVerifyInputs(drafted, lengths, &cu);
+  REQUIRE(cu.size() == 3u);
+  CHECK(cu[0] == 0);
+  CHECK(cu[1] == 1);  // exactly the previous token
+  CHECK(cu[2] == 4);
+  REQUIRE(flat.size() == 4u);
+  CHECK(flat[0] == 4);   // the skipped request's seed survives
+  CHECK(flat[1] == 8);
+}
+
+TEST_CASE("W-5: cu is CUMULATIVE, so a short request does not shift the rest") {
+  // Three requests at different caps. The offsets must accumulate, since the
+  // sampler indexes rows by them and an off-by-one would compare one request's
+  // drafts against another's logits.
+  const std::vector<std::vector<int32_t>> drafted{
+      {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+  const std::vector<int64_t> lengths{3, 0, 1};
+  std::vector<int32_t> cu;
+  const auto flat = vllm::dspark::ProposeToVerifyInputs(drafted, lengths, &cu);
+  REQUIRE(cu.size() == 4u);
+  CHECK(cu[0] == 0);
+  CHECK(cu[1] == 4);
+  CHECK(cu[2] == 5);
+  CHECK(cu[3] == 7);
+  CHECK(static_cast<int32_t>(flat.size()) == cu.back());
+}
+
+TEST_CASE("W-5: a length past the drafted block REFUSES") {
+  // The confidence cap cannot exceed the block the loop produced; a length that
+  // does would name drafts nobody sampled.
+  const std::vector<std::vector<int32_t>> drafted{{1, 2, 3}};
+  std::vector<int32_t> cu;
+  CHECK_THROWS(vllm::dspark::ProposeToVerifyInputs(drafted, {3}, &cu));
+  CHECK_THROWS(vllm::dspark::ProposeToVerifyInputs(drafted, {-1}, &cu));
 }

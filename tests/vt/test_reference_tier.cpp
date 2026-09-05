@@ -68,8 +68,8 @@ class FakeBackend final : public Backend {
   // answers true then false (include/vt/backend.h), which is the pair the third
   // instance below carries. Everything else is a plain host allocator so a
   // fallback kernel dispatched here actually runs.
-  FakeBackend(bool unified, bool host_addressable)
-      : unified_(unified), host_addressable_(host_addressable) {}
+  FakeBackend(bool unified, bool host_addressable, const char* note = nullptr)
+      : unified_(unified), host_addressable_(host_addressable), note_(note) {}
   void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
   void Free(void* p) override { std::free(p); }
   void Memset(Queue&, void* p, int v, size_t bytes) override { std::memset(p, v, bytes); }
@@ -79,10 +79,12 @@ class FakeBackend final : public Backend {
   Queue CreateQueue() override { return Queue{Device{DeviceType::kXPU, 0}, nullptr}; }
   bool UnifiedMemory() const override { return unified_; }
   bool DeviceMemoryIsHostAddressable() const override { return host_addressable_; }
+  const char* HostAddressabilityNote() const override { return note_; }
 
  private:
   bool unified_;
   bool host_addressable_;
+  const char* note_ = nullptr;
 };
 
 FakeBackend& Unified() {
@@ -97,6 +99,19 @@ FakeBackend& Discrete() {
 // and a `cudaMalloc` pointer is still not host-dereferenceable.
 FakeBackend& UnifiedNotHostAddressable() {
   static FakeBackend b(true, false);
+  return b;
+}
+// A backend that WITHDREW host addressability deliberately and says why. This is
+// the ROCm-on-an-XNACK-less-APU shape (issue #2511): the managed allocator that
+// made those boards claim host-addressable memory is what page-faulted them, so
+// the claim was withdrawn and the reference tier went with it. The literal is
+// this test's own, not the ROCm one, because the assertion under test is that
+// the REFUSAL CARRIES THE BACKEND'S NOTE -- not what any particular backend
+// chose to write in it.
+inline constexpr const char* kNote =
+    "TESTNOTE: this device withdrew host addressability on purpose";
+FakeBackend& DiscreteWithNote() {
+  static FakeBackend b(false, false, kNote);
   return b;
 }
 
@@ -120,6 +135,49 @@ TEST_CASE("reference tier: a discrete (non-unified) device is refused and still 
   // run against what this device claims is discrete memory.
   CHECK_FALSE(vt::OpRegistered(OpId::kRelu, DeviceType::kXPU));
   CHECK_THROWS(vt::GetOp(OpId::kRelu, DeviceType::kXPU));
+}
+
+// A device that withdrew host addressability DELIBERATELY gets to say why, in
+// the refusal, where the user meets it. The generic sentence is true on every
+// such device and useless on the one where the false is a decision rather than
+// the hardware -- ROCm on gfx1151 after #2511, which is what
+// `Backend::HostAddressabilityNote()` exists for.
+//
+// Ordered immediately after the discrete case ON PURPOSE: it shares kXPU, and
+// the eligible case further down installs providers on that slot permanently.
+// The REQUIRE below turns a reordering into a diagnosable failure instead of a
+// silently vacuous pass.
+TEST_CASE("reference tier: the refusal carries the backend's own reason") {
+  REQUIRE(vt::OpProviderCount(OpId::kRelu, DeviceType::kXPU) == 0);
+  vt::RegisterBackend(DeviceType::kXPU, &DiscreteWithNote());
+  REQUIRE_FALSE(vt::ReferenceTierEligible(DeviceType::kXPU));
+
+  std::string message;
+  try {
+    vt::GetOp(OpId::kRelu, DeviceType::kXPU);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  REQUIRE_FALSE(message.empty());
+  // The generic clauses still stand -- the note ADDS, it never replaces.
+  CHECK(message.find("Relu") != std::string::npos);
+  CHECK(message.find("host-addressable") != std::string::npos);
+  // And the backend's own sentence is in it, verbatim.
+  CHECK(message.find(kNote) != std::string::npos);
+
+  // A backend with NOTHING to add leaves the message byte-identical, so the
+  // note cannot become a sentence every refusal drags along. Same slot, same
+  // op, same refusal path: the only difference is the note.
+  vt::RegisterBackend(DeviceType::kXPU, &Discrete());
+  std::string plain;
+  try {
+    vt::GetOp(OpId::kRelu, DeviceType::kXPU);
+  } catch (const std::exception& e) {
+    plain = e.what();
+  }
+  REQUIRE_FALSE(plain.empty());
+  CHECK(plain.find(kNote) == std::string::npos);
+  CHECK(plain.size() < message.size());
 }
 
 // The CPU device is the SOURCE of the reference kernels and is never a target.

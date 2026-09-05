@@ -235,11 +235,19 @@ TEST_CASE("IQ/MXFP4 keep-quant block dtypes (geometry + vec_dot)") {
 // bf16.
 //
 // IQ2_XS (17) and IQ4_XS (23) were its only file-type members, put there by
-// LOADER-GGUF-IQ (#2245) and taken out by QUANT-GGUF-IQ-VECDOT (#2247). The
-// class is not empty — Q8_K is still in it — but it now holds NO encoding a
-// checkpoint can be stored in, and this case states both halves so a later
-// reader can tell an empty class from an unwritten one.
-TEST_CASE("the decode-only class is Q8_K alone: no FILE type expands any more") {
+// LOADER-GGUF-IQ (#2245) and taken out by QUANT-GGUF-IQ-VECDOT (#2247). It then
+// held NO encoding a checkpoint could be stored in.
+//
+// QUANT-IQ3S (#2510) puts one back, DELIBERATELY and exactly one: IQ3_S (21)
+// has a `to_float` and no `vec_dot`, so the loader gathers it compressed and
+// EXPANDS it on the GEMM arm. That is stated here by NAME rather than left to a
+// count, because the whole point of the class is that nothing throws when a
+// member of it quietly costs memory. The `vec_dot` is owed jointly with the
+// CUDA `WType::kIQ3_S` arm — landing the CPU half alone would send every CUDA
+// IQ3_S GEMM down `IsCudaKeepQuantSupported`'s host fallback, which segfaults
+// on a discrete card — and the day it lands, this case reds and the tier table
+// in `.agents/specs/gguf-iq3s.md` has to move with it.
+TEST_CASE("the decode-only class is Q8_K and IQ3_S: exactly one FILE type expands") {
   // Q8_K is the K-quants' ACTIVATION encoding. Upstream gives it no `vec_dot`
   // row at all (ggml-cpu.c:391-393 carries only a `from_float`), so it can
   // never leave this class the way the two IQ*_XS rows did.
@@ -259,6 +267,10 @@ TEST_CASE("the decode-only class is Q8_K alone: no FILE type expands any more") 
     vt::DType d = vt::DType::kF32;
     if (!vt::BlockDTypeFromGgmlTypeId(id, &d)) continue;
     if (d == vt::DType::kQ8_K) continue;
+    // IQ3_S is the ONE file encoding that decodes without dotting. Skipped from
+    // the sweep and asserted explicitly below, so "it expands" is a written
+    // claim rather than a hole in a loop.
+    if (d == vt::DType::kIQ3_S) continue;
     CAPTURE(id);
     CAPTURE(vt::Name(d));
     ++swept;
@@ -274,6 +286,25 @@ TEST_CASE("the decode-only class is Q8_K alone: no FILE type expands any more") 
   // refusing every id would otherwise pass the loop above vacuously.
   CAPTURE(swept);
   CHECK(swept == 17);
+
+  // The decode-only FILE member, named and asserted in BOTH directions. Sizes
+  // written out from llama.cpp @ b10451 ggml-common.h:413-422, NOT copied from
+  // either table under test:
+  //   iq3_s :413-422  f16 d + 256/4 qs + 256/32 qh + 256/8 signs
+  //                   + 256/64 scales                    = 2+64+8+32+4 = 110
+  CHECK(vt::cpu::BlockToFloat(vt::DType::kIQ3_S) != nullptr);
+  CHECK(vt::cpu::BlockVecDot(vt::DType::kIQ3_S) == nullptr);
+  CHECK_FALSE(vt::cpu::HasQuantDotKernel(vt::DType::kIQ3_S));
+  CHECK(vt::cpu::BlockFromFloat(vt::DType::kIQ3_S) == nullptr);
+  CHECK(vt::BlockElems(vt::DType::kIQ3_S) == 256);
+  CHECK(vt::BlockBytes(vt::DType::kIQ3_S) == 2 + 64 + 8 + 32 + 4);
+  CHECK(vt::GgmlTypeId(vt::DType::kIQ3_S) == 21U);
+  CHECK(std::string(vt::Name(vt::DType::kIQ3_S)) == "iq3_s");
+  // The reader agrees, which is the half #2510 was actually about: without this
+  // trait `GgufFile::Open` refused the whole 16.4 GB artifact.
+  const vllm::GgmlTypeTraits& g_iq3s = vllm::GgmlTraits(21U);
+  CHECK(g_iq3s.block_elems == 256);
+  CHECK(g_iq3s.block_bytes == 2 + 64 + 8 + 32 + 4);
 
   // The pair that moved, named explicitly: the geometry and the reader
   // agreement are unchanged from #2245, only the dot arrived. Sizes written out

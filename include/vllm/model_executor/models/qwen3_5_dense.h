@@ -93,6 +93,21 @@ struct DenseMlpWeights {
   // host scalar in model-lifetime storage because Backend::Copy is asynchronous.
   mutable float gate_up_alpha = 0.0F;
   mutable std::shared_ptr<void> d_gate_up_alpha;
+
+  // QUANT-EXL3 (#2181) / MODEL-QWEN35-EXL3 (#2495 item 3): the exllamav3
+  // trellis arm of the dense SwiGLU MLP. gate and up stay SEPARATE for the
+  // same reason the attention shards do -- a trellis merge on the output dim
+  // interleaves per input tile -- and `layers::Exl3MlpGateUpMethod` is the
+  // shared seam that consumes the pair, so the model never learns which scheme
+  // it bound. Exactly one representation is populated per layer.
+  Exl3Weight gate_proj_exl3;  // [K=H, N=I]
+  Exl3Weight up_proj_exl3;    // [K=H, N=I]
+  Exl3Weight down_proj_exl3;  // [K=I, N=H]
+
+  // `down_proj_exl3`, mirroring `Qwen3DenseMlpWeights::IsExl3` in `qwen3.h`:
+  // down is the projection that has no merged twin in any arm, so it is the one
+  // whose presence cannot be confused with a partially built resident.
+  bool IsExl3() const { return !down_proj_exl3.Empty(); }
 };
 
 // Exact scalar processing for a two-shard CT NVFP4 MergedColumnParallelLinear.
@@ -138,6 +153,13 @@ struct Qwen3_5DenseWeights {
   // Mirrors tie_word_embeddings: logits reuse embed_tokens as raw [V,H]
   // torch-Linear storage, so no second host/device owner is created.
   bool tied_lm_head = false;
+  // MODEL-QWEN35-EXL3 (#2495 item 5): an EXL3 output head, kept in the trellis
+  // rather than materialized. Its WIDTH is its own and is read from the tensor,
+  // never from `quantization_config.bits`: `turboderp/Llama-3.2-1B-Instruct-exl3`
+  // @ 3.0bpw ships a SIX-bit head under a config that says 3.0, and a reader
+  // that trusts the scalar decodes it at the wrong width with every shape check
+  // still passing (`Exl3Weight::Bits`). Empty on every other head storage.
+  Exl3Weight lm_head_exl3;
   std::vector<Qwen3_5DenseLayerWeights> layers;
 };
 

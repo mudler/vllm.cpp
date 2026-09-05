@@ -169,13 +169,19 @@ struct Gemma4HiddenStatesResult {
   // `dtype: torch.dtype = torch.bfloat16`), and the `hidden_states` tuple it
   // passes to the feature extractor is bf16. These states are downloaded from BF16
   // device buffers (gemma4.cpp:571-578) and widened on the way out because this is
-  // the CPU REFERENCE ARM: it is what the LTX-2.5 parity gate compares against
-  // upstream executed in torch float32, and every LTX entry point REFUSES a
-  // non-f32 compute dtype by name rather than widening silently
-  // (ltx2_text_encoder.h, the DTYPE note). Cost of the widening, stated so it is
+  // the LTX-2.5 PARITY ARM's carrier: f32 is the dtype the text-tower goldens were
+  // produced in, and this tuple is what that gate compares against upstream
+  // executed in torch float32. It is NOT the only arm any more. Since
+  // LTX25-A24-TEXT-TOWER-BF16 the LTX text entry points accept bf16 as well and
+  // refuse everything else BY NAME (ltx2_text_encoder.h, the DTYPE note); bf16 is
+  // upstream's own resolved dtype (distilled.py:109) and the arm the render path
+  // runs, and it takes these f32 states through `Ltx2StackHiddenStatesBf16`, which
+  // narrows them at the boundary rather than computing at the wrong width. The
+  // FP8 and NVFP4 arms are A22 — upstream's quantization policies, not its default
+  // dtype — and are still OWED, not shipped. Cost of the widening, stated so it is
   // not discovered later: at the shipped 49 x 1024 x 3840 x 4B this holds ~771 MB
-  // host where upstream holds ~385 MB. The bf16 / FP8 / NVFP4 arms are phase L6 of
-  // .agents/specs/ltx-2-5.md and are OWED, not shipped.
+  // host where upstream holds ~385 MB, and narrowing this tuple to bf16 at the
+  // source is the row that would remove it.
   std::vector<std::vector<float>> hidden_states;
   std::vector<float> logits;  // [n_out, vocab], as Forward() returns
 };

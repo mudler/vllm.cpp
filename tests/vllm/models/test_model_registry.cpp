@@ -308,6 +308,7 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       CHECK(registration.info.is_hybrid);
       CHECK_FALSE(registration.info.supports_multimodal);
     } else if (registration.architecture == "Qwen3VLForConditionalGeneration" ||
+               registration.architecture == "Dots3NoteForCausalLM" ||
                registration.architecture == "Gemma4ForConditionalGeneration" ||
                registration.architecture ==
                    "Gemma4UnifiedForConditionalGeneration" ||
@@ -322,14 +323,24 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       // with the hybrids; its vision tower is scaffolded, not yet forwarding.
       // The non-hybrid multimodal registrations.
       //
-      // `Dots3NoteForCausalLM` USED TO BE IN THIS LIST and moved out at W5
-      // (#699). Upstream does register it in `_MULTIMODAL_MODELS` with image,
-      // video AND audio towers (multimodal.py:82-87, inside
-      // `get_placeholder_str` at :80-88), which is why W1 put it
-      // here — but this port has none of the three (W6/W7 for the towers, W8
-      // for the front end), and the flag only became misleading once W5/W5c
-      // made the released config loadable. It now sits in the text-only branch
-      // below, and W8 moves it back.
+      // `Dots3NoteForCausalLM` LEFT THIS LIST AT W5 AND CAME BACK AT W6a, and
+      // the round trip is the honest record rather than churn (#699, #2512).
+      // W1 put it here because upstream registers it in `_MULTIMODAL_MODELS`
+      // with image, video AND audio towers (multimodal.py:82-87, inside
+      // `get_placeholder_str` at :80-88) — a statement about UPSTREAM. W5/W5c
+      // made the released config loadable, at which point the flag became a
+      // claim about THIS port that this port could not honour, so it moved to
+      // the text-only branch below.
+      //
+      // W6a moved it back and BACKED it: `kDots3NoteFactory` carries `encode_mm`
+      // and `embed_mm`, and `mm_chat_dots3note.cpp` registers this
+      // architecture's own chat seam, so a served `image_url` request reaches
+      // the model forward. It is NOT hybrid for the same reason the others here
+      // are not: both its attention classes page one MLA cache, and the sliding
+      // half is a window on it rather than a recurrent state. What is still
+      // refused BY NAME is the pyramid MoE ViT (W6b), which is why the RELEASED
+      // checkpoint's tower does not load — a flag about the ARCHITECTURE, not a
+      // promise about every checkpoint of it.
       CHECK_FALSE(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
     } else {

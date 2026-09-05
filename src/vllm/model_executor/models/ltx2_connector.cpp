@@ -44,10 +44,22 @@ float RoundToBf16(float value) {
   return rounded;
 }
 
-// `rms_norm(x)` with no weight (utils.py:7-12), over the last dimension.
-void RmsNormRows(std::vector<float>& x, int64_t rows, int64_t width) {
+// Narrow one value the way `.to(torch.bfloat16)` does: round to nearest, ties to
+// even. `RoundToBf16` above is the same rule written for the f32 arm's register
+// table; this one goes through `vt::F32ToBF16`, which is where the tree's own
+// converter lives and is already round-to-nearest-EVEN.
+inline float NarrowOne(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)); }
+
+void NarrowBuffer(vt::DType dtype, float* p, size_t count) {
+  if (dtype != vt::DType::kBF16) return;
+  for (size_t i = 0; i < count; ++i) p[i] = NarrowOne(p[i]);
+}
+
+}  // namespace
+
+void Ltx2ConnectorRmsNormRows(float* x, int64_t rows, int64_t width, vt::DType compute_dtype) {
   for (int64_t r = 0; r < rows; ++r) {
-    float* row = x.data() + r * width;
+    float* row = x + r * width;
     // f64 SUM ACCUMULATOR, the suite-wide reduction escape (L3 precedent,
     // ltx2_text_encoder.cpp:259-269): upstream's `rms_norm` reduces in f32 but in
     // a BLOCKED order no straight loop reproduces, so accumulating exactly and
@@ -59,25 +71,43 @@ void RmsNormRows(std::vector<float>& x, int64_t rows, int64_t width) {
     const float inv = static_cast<float>(
         1.0 / std::sqrt(sum / static_cast<double>(width) + kLtx2ConnectorRmsNormEps));
     for (int64_t i = 0; i < width; ++i) row[i] *= inv;
+    // The ONE narrowing. `F.rms_norm` on a bf16 input widens to f32, computes
+    // entirely there and rounds the result once — measured bit-equal on
+    // 1 973 760 of 1 973 760 values, and STABLE under shape, which A24 wave 1's
+    // bf16 `rsqrt` was not (512 of 512 rows reproduce their batched answer when
+    // normalized alone).
+    NarrowBuffer(compute_dtype, row, static_cast<size_t>(width));
   }
 }
+
+namespace {
 
 // Bind one `Ltx2LinearWeight` from the bag, keeping the storage alive in `views`.
 struct WeightViews {
   std::vector<vt::Tensor> keep;
 };
 
+// The weight view for whichever arm the bag carries. The DTYPE TRAVELS WITH THE
+// TENSOR rather than being passed beside it, so a GEMM cannot be handed bf16
+// bytes it reads as f32: `vt::MatmulBT` widens each operand through `LoadF32`
+// according to the tensor's own dtype.
 vt::Tensor View(const Ltx2VaeWeights& weights, const std::string& name, int64_t rows,
                 int64_t cols) {
-  const std::vector<float>& buffer = weights.Get(name);
   const int64_t count = cols > 0 ? rows * cols : rows;
-  Require(buffer.size() == static_cast<size_t>(count),
+  Require(weights.Count(name) == static_cast<size_t>(count),
           "ltx2 connector: tensor " + name + " has the wrong element count");
-  float* data = const_cast<float*>(buffer.data());
-  if (cols > 0) {
-    return vt::Tensor::Contiguous(data, vt::DType::kF32, vt::Device{}, {rows, cols});
+  void* data = nullptr;
+  vt::DType dtype = vt::DType::kF32;
+  if (weights.dtype == vt::DType::kBF16) {
+    data = const_cast<uint16_t*>(weights.GetBf16(name).data());
+    dtype = vt::DType::kBF16;
+  } else {
+    data = const_cast<float*>(weights.Get(name).data());
   }
-  return vt::Tensor::Contiguous(data, vt::DType::kF32, vt::Device{}, {rows});
+  if (cols > 0) {
+    return vt::Tensor::Contiguous(data, dtype, vt::Device{}, {rows, cols});
+  }
+  return vt::Tensor::Contiguous(data, dtype, vt::Device{}, {rows});
 }
 
 }  // namespace
@@ -141,9 +171,23 @@ Ltx2ConnectorOutput Ltx2ConnectorReplaceRegisters(const Ltx2ConnectorConfig& con
               " (embeddings_connector.py:144)");
 
   const int64_t dim = config.inner_dim();
-  const std::vector<float>& registers = weights.Get(config.prefix + "learnable_registers");
-  Require(registers.size() == static_cast<size_t>(config.num_learnable_registers * dim),
+  const std::string register_name = config.prefix + "learnable_registers";
+  Require(weights.Count(register_name) == static_cast<size_t>(config.num_learnable_registers * dim),
           "ltx2 connector: learnable_registers has the wrong element count");
+  // `learnable_registers` is a BFLOAT16 parameter at BOTH widths (:135-137), and
+  // `.to(hidden_states.dtype)` (:146) is a widening on the f32 arm and an identity
+  // on the bf16 one. `RegisterAt` therefore returns the SAME number by two routes,
+  // which is what makes a register defect show up as a value mismatch on whichever
+  // arm carries it rather than as a difference between the arms.
+  const bool registers_bf16 = weights.dtype == vt::DType::kBF16;
+  const std::vector<float>* registers_f32 =
+      registers_bf16 ? nullptr : &weights.Get(register_name);
+  const std::vector<uint16_t>* registers_bits =
+      registers_bf16 ? &weights.GetBf16(register_name) : nullptr;
+  const auto RegisterAt = [&](size_t index) {
+    return registers_bf16 ? vt::BF16ToF32((*registers_bits)[index])
+                          : RoundToBf16((*registers_f32)[index]);
+  };
 
   Ltx2ConnectorOutput out;
   out.hidden_states.resize(static_cast<size_t>(batch * seq * dim));
@@ -162,11 +206,7 @@ Ltx2ConnectorOutput Ltx2ConnectorReplaceRegisters(const Ltx2ConnectorConfig& con
         if (keep) {
           out.hidden_states[dst] = hidden_states[dst];
         } else {
-          // `.to(hidden_states.dtype)` (:146) widens the BFLOAT16 table back to
-          // f32; the value it widens is already rounded, which is what this
-          // mirrors.
-          out.hidden_states[dst] =
-              RoundToBf16(registers[static_cast<size_t>(register_row * dim + i)]);
+          out.hidden_states[dst] = RegisterAt(static_cast<size_t>(register_row * dim + i));
         }
       }
     }
@@ -180,6 +220,13 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
                                          const float* additive_attention_mask, int64_t batch,
                                          int64_t seq) {
   Require(hidden_states != nullptr, "ltx2 connector: `hidden_states` is required");
+  // THE ARM FOLLOWS THE WEIGHTS, exactly as upstream's does: a module's dtype is
+  // a property of its parameters, and no render call site chooses one. A24 wave 2,
+  // issue #2720.
+  const vt::DType dt = weights.dtype;
+  Require(dt == vt::DType::kF32 || dt == vt::DType::kBF16,
+          "ltx2 connector: the compute dtype must be f32 (the parity arm) or bf16 (upstream's "
+          "own, distilled.py:109). The FP8 and NVFP4 arms are A22 and are not implemented");
   const int64_t dim = config.inner_dim();
   const int64_t heads = config.num_attention_heads;
 
@@ -195,6 +242,18 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
       state.mask.assign(static_cast<size_t>(batch * seq), 0.0f);
     }
   }
+  // ONE NARROWING, AFTER THE BRANCH, BECAUSE BOTH BRANCHES NEED IT. Upstream is
+  // handed a bf16 TENSOR, so the arm's input is bf16 whatever width the caller's
+  // container carries -- and the caller really does hand f32 in:
+  // `Ltx2VideoEngine::Load` and `GenerateAudioOnly` pass `RunConnectorFromFile`
+  // the output of `ReadF32File`, an arbitrary user file. The register
+  // substitution above replaces only the PADDED rows and copies the kept ones
+  // from the caller verbatim, so this narrowing sat inside the `else` while the
+  // SHIPPED branch is the register one (the checkpoint declares 128 registers)
+  // -- the first transformer block was reading sub-bf16 detail upstream cannot
+  // have. On the register side the substituted values are already bf16, so this
+  // pass is an identity over them and the fix costs that branch nothing.
+  NarrowBuffer(dt, state.hidden_states.data(), state.hidden_states.size());
 
   // :172-184 — a 1-D position grid over the token index. `use_middle_indices_grid`
   // is FALSE here: `indices_grid` carries one value per token, not a [start, end)
@@ -205,11 +264,19 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
       positions[static_cast<size_t>(b * seq + s)] = static_cast<double>(s);
     }
   }
-  const Ltx2FreqsCis pe = Ltx2PrecomputeFreqsCis(
+  Ltx2FreqsCis pe = Ltx2PrecomputeFreqsCis(
       positions.data(), batch, seq, /*n_pos_dims=*/1, /*source_n_pos_dims=*/1,
       /*use_middle_indices_grid=*/false, dim, config.positional_embedding_max_pos,
       config.positional_embedding_theta, heads, config.rope_type,
       config.double_precision_rope);
+  // THE TABLES THEMSELVES NARROW. `precompute_freqs_cis(out_dtype=hidden_states.dtype)`
+  // (:176) ends in `cos_freq.to(out_dtype)` (rope.py:224), so on a bf16 activation
+  // the cos/sin tables are bf16 — and measured bit-equal to `bf16(the f32 tables)`,
+  // which is why the grid is still computed at full width and rounded here rather
+  // than being computed narrow. The `double_precision_rope` arm computes its grid
+  // in f64 and lands in the same `.to(out_dtype)`, so it narrows too.
+  NarrowBuffer(dt, pe.cos.data(), pe.cos.size());
+  NarrowBuffer(dt, pe.sin.data(), pe.sin.size());
 
   for (int64_t layer = 0; layer < config.num_layers; ++layer) {
     const std::string b = config.prefix + "transformer_1d_blocks." + std::to_string(layer) + ".";
@@ -240,7 +307,7 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
 
     // :50 — rms_norm BEFORE the attention, on the residual stream.
     std::vector<float> normed = state.hidden_states;
-    RmsNormRows(normed, batch * seq, dim);
+    Ltx2ConnectorRmsNormRows(normed.data(), batch * seq, dim, dt);
 
     Ltx2AttentionArgs args;
     args.batch = batch;
@@ -260,25 +327,30 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
     // padding.
     args.bias = state.mask.data();
     args.bias_rows = 1;
+    args.compute_dtype = dt;
 
     const std::vector<float> attn_out =
         Ltx2Attention(vt::Device{}, attn, normed.data(), nullptr, args);
+    // `attn_output + hidden_states` is one torch op and materializes one tensor,
+    // so it rounds once. Every bf16 add is `bf16(f32 add)`, measured exhaustively.
     for (size_t i = 0; i < state.hidden_states.size(); ++i) {
       state.hidden_states[i] += attn_out[i];
     }
+    NarrowBuffer(dt, state.hidden_states.data(), state.hidden_states.size());
 
     // :62-67 — a second rms_norm, then the feed-forward, then the residual.
     std::vector<float> ff_in = state.hidden_states;
-    RmsNormRows(ff_in, batch * seq, dim);
+    Ltx2ConnectorRmsNormRows(ff_in.data(), batch * seq, dim, dt);
     const std::vector<float> ff_out =
-        Ltx2FeedForward(vt::Device{}, ff, ff_in.data(), batch * seq, dim, 4 * dim);
+        Ltx2FeedForward(vt::Device{}, ff, ff_in.data(), batch * seq, dim, 4 * dim, dt);
     for (size_t i = 0; i < state.hidden_states.size(); ++i) {
       state.hidden_states[i] += ff_out[i];
     }
+    NarrowBuffer(dt, state.hidden_states.data(), state.hidden_states.size());
   }
 
   // :189 — a FINAL rms_norm on top of the two each block already applies.
-  RmsNormRows(state.hidden_states, batch * seq, dim);
+  Ltx2ConnectorRmsNormRows(state.hidden_states.data(), batch * seq, dim, dt);
   return state;
 }
 
@@ -333,6 +405,9 @@ Ltx2ConnectorEmbeddings Ltx2ConnectorCreateEmbeddings(
     }
     return out;
   };
+  // `_apply_right_pad_order` is a GATHER — it moves rows and computes nothing —
+  // so it needs no narrowing of its own. `Ltx2ConnectorForward` narrows the stream
+  // it is handed, which is where upstream's bf16 tensor enters the module.
   const std::vector<float> video_sorted = gather(video_features, vdim);
   const std::vector<float> audio_sorted = gather(audio_features, adim);
 

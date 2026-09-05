@@ -1,0 +1,59 @@
+WHAT IS COMPARED AGAINST WHAT
+  prompts file        : /tmp/limb3-2884/prompts.txt
+  prompts_sha256      : c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e
+  prompts_sha256_want : c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e
+  PROMPTS_ARE_THE_PREREGISTERED_SET = True
+  tokens per prompt   : 48
+  side A (vllm.cpp ROCm)  : /workspace/limb3-2884/out/rc-worker-lcjhd-20260904T075051Z/ours_gen_ids_1.json   (vllm-bench --output-token-ids)
+  side B (vLLM eager)     : /tmp/limb3-2884/vllm-eager.json
+  side C (vLLM compiled)  : /tmp/limb3-2884/vllm-compiled.json
+A vllm.cpp ROCm k-quant: 6 prompts, lengths [48, 48, 48, 48, 48, 48]
+B vLLM eager: 6 prompts, lengths [48, 48, 48, 48, 48, 48]
+C vLLM compiled: 6 prompts, lengths [48, 48, 48, 48, 48, 48]
+
+### B vLLM eager  vs  C vLLM compiled
+| prompt | verdict | first diff | A | B |
+|---|---|---:|---:|---:|
+| 0 `The capital city of France is` | **TOKEN-EXACT 48/48** | — | — | — |
+| 1 `The three primary colors are` | DIVERGE | 8 | 1330 | 9238 |
+| 2 `Water boils at a temperature of` | **TOKEN-EXACT 48/48** | — | — | — |
+| 3 `The Pythagorean theorem states that` | DIVERGE | 41 | 23185 | 16134 |
+| 4 `In 1969, humans first walked on` | **TOKEN-EXACT 48/48** | — | — | — |
+| 5 `A prime number is a natural number` | **TOKEN-EXACT 48/48** | — | — | — |
+
+DIVERGENCES(B vLLM eager vs C vLLM compiled) = 2/6
+
+ORACLE_SELF_CONSISTENT_ACROSS_COMPILE = False
+ORACLE_REPRODUCES_ITSELF[eager] = True  (/tmp/limb3-2884/vllm-eager-2.json)
+ORACLE_REPRODUCES_ITSELF[compiled] = True  (/tmp/limb3-2884/vllm-compiled-2.json)
+PREFILL_ARGMAX[eager]_MISMATCHES = 3  AGREES_WITH_ITS_OWN_DECODE = False
+PREFILL_ARGMAX[compiled]_MISMATCHES = 2  AGREES_WITH_ITS_OWN_DECODE = False
+
+### A vllm.cpp  vs  B vLLM eager
+| prompt | verdict | first diff | A | B |
+|---|---|---:|---:|---:|
+| 0 `The capital city of France is` | **TOKEN-EXACT 48/48** | — | — | — |
+| 1 `The three primary colors are` | DIVERGE | 8 | 9238 | 1330 |
+| 2 `Water boils at a temperature of` | DIVERGE | 11 | 87840 | 11995 |
+| 3 `The Pythagorean theorem states that` | **TOKEN-EXACT 48/48** | — | — | — |
+| 4 `In 1969, humans first walked on` | DIVERGE | 33 | 383 | 303 |
+| 5 `A prime number is a natural number` | **TOKEN-EXACT 48/48** | — | — | — |
+
+DIVERGENCES(A vllm.cpp vs B vLLM eager) = 3/6
+
+### A vllm.cpp  vs  C vLLM compiled
+| prompt | verdict | first diff | A | B |
+|---|---|---:|---:|---:|
+| 0 `The capital city of France is` | **TOKEN-EXACT 48/48** | — | — | — |
+| 1 `The three primary colors are` | **TOKEN-EXACT 48/48** | — | — | — |
+| 2 `Water boils at a temperature of` | DIVERGE | 11 | 87840 | 11995 |
+| 3 `The Pythagorean theorem states that` | DIVERGE | 41 | 23185 | 16134 |
+| 4 `In 1969, humans first walked on` | DIVERGE | 33 | 383 | 303 |
+| 5 `A prime number is a natural number` | **TOKEN-EXACT 48/48** | — | — | — |
+
+DIVERGENCES(A vllm.cpp vs C vLLM compiled) = 3/6
+
+STRICT_EXACT_vs_VLLM_EAGER    = 3/6
+STRICT_EXACT_vs_VLLM_COMPILED = 3/6
+STRICT_LIMB3=NO
+REASON=the ORACLE is not deterministic on this vehicle: its own eager and compiled configurations disagree with each other, so there is no single denominator to be exact against

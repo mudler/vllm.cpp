@@ -46,6 +46,7 @@
 #include "vt/quant.h"
 
 #include "glm5_next_gguf_manifest.inc"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -542,7 +543,7 @@ TEST_CASE("glm5_next GGUF: the stacked expert banks keep their blocks") {
   // RESIDENCY. Under the production policy the Q8_0 banks KEEP their blocks —
   // which is the property the whole 101.14 GiB result on the published artifact
   // rests on — and the loaded tensor is Q8_0 rather than bf16.
-  const vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
+  const vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
   const vllm::GgufResidency r = vllm::PeekRoute(
       pol, g.Get("blk.2.ffn_gate_exps.weight"),
       vllm::GgufTensorRole::kStackedExpertWeight);
@@ -673,7 +674,7 @@ TEST_CASE("glm5_next GGUF: a GGUF source with no file is refused BY NAME") {
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig config = vllm::Glm5NextHfConfigFromGguf(g);
-  vllm::ModelSource source = vllm::ModelSource::FromGguf(g);
+  vllm::ModelSource source = vllm::ModelSource::FromGguf(g, vllm::platforms::CurrentPlatform().device_type());
   source.gguf = nullptr;
   bool named = false;
   try {

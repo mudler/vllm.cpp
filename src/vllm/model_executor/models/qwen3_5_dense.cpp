@@ -22,6 +22,7 @@
 #include "qwen3_5_internal.h"  // W4 DeviceTokenIdsScope
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -92,8 +93,15 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
     if (source.gguf == nullptr) {
       throw std::runtime_error("GGUF model source is empty");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<Qwen3_5DenseLoadedModel>(
-        registration, LoadQwen3_5DenseFromGguf(*source.gguf, config));
+        registration,
+        LoadQwen3_5DenseFromGguf(*source.gguf, config, &gguf_policy));
   }
   if (source.kind != ModelSource::Kind::kSafetensors) {
     throw std::runtime_error(
@@ -263,6 +271,7 @@ const ModelFactory kQwen3_5DenseFactory{
     .forward = &ForwardQwen3_5Dense,
     .make_kv_cache = &MakeQwen3_5KVCache,
     .is_dense_model = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

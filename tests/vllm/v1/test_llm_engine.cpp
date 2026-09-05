@@ -93,6 +93,28 @@ using vllm::v1::metrics::PrometheusStatLogger;
 using vt::DType;
 
 namespace {
+// Restores the previous value at scope exit (KERNEL-GDN-CHUNKED-MIRROR T9/R10:
+// a bare setenv here would make doctest's case order select a GDN algorithm).
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    if (old != nullptr) { had_old_ = true; old_ = old; }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_) setenv(name_.c_str(), old_.c_str(), 1);
+    else unsetenv(name_.c_str());
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
 
 // ─── Synthetic weights (mirrors tests/vllm/v1/worker/test_runner.cpp) ────────
 uint64_t Mix(uint64_t x) {
@@ -1435,32 +1457,78 @@ TEST_CASE("llm_engine: chunked prefill accumulates the identical prompt logprobs
   const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
   const int kK = 2;
 
-  const std::optional<vllm::PromptLogprobs> whole =
-      PromptLogprobsFor(c, w, tok, prompt, kK);
-  // A budget of 1 token per step forces one chunk per prompt token, which also
-  // walks the num_logits <= 0 exact-prefill edge (:5668-5671).
-  const std::optional<vllm::PromptLogprobs> chunked = PromptLogprobsFor(
-      c, w, tok, prompt, kK, /*max_tokens=*/2, /*max_num_batched_tokens=*/1);
+  // ─── THE STITCHING IS EXACT; THE ARITHMETIC UNDER IT NEED NOT BE ───────────
+  //
+  // This case is about the ACCUMULATION MACHINERY (gpu_model_runner.py:5646-5706)
+  // — that rows produced in separate scheduler steps are stitched back into the
+  // same tensor, at the same positions, for the same token ids. That claim is
+  // arm-independent, and it stays gated EXACTLY, on the arm where "identical"
+  // is achievable.
+  //
+  // It is not achievable on the other one, and that is upstream's arrangement
+  // rather than a defect. This config's layers are `linear_attention`, so every
+  // chunk boundary crosses a GDN prefill, and since KERNEL-GDN-CHUNKED-MIRROR
+  // (#2612 / #2845) that runs vLLM's chunked WY decomposition, in which the
+  // interactions across a boundary go through a BF16-ROUNDED state snapshot
+  // (chunk_delta_h.py:178,352) instead of the intra-chunk f32 path. With
+  // `max_num_batched_tokens=1` this case puts a boundary between EVERY pair of
+  // prompt tokens, which is the maximum discontinuity the algorithm admits.
+  // Upstream gates the same property on its own chunked kernel at 1e-3 state /
+  // 2e-2 output rather than at equality
+  // (tests/kernels/mamba/cpu/test_cpu_gdn_ops.py::
+  //  test_chunk_gated_delta_rule_cpu_two_call_split @ e126687a9a).
+  //
+  // Measured here: sequential arm 0 exactly; chunked arm max|d| 3.28e-3, max
+  // relative 1.2e-3.
+  auto compare = [&](const char* flag, bool require_exact) {
+    ScopedEnv pin("VT_GDN_CHUNKED", flag);
+    const std::optional<vllm::PromptLogprobs> whole =
+        PromptLogprobsFor(c, w, tok, prompt, kK);
+    // A budget of 1 token per step forces one chunk per prompt token, which also
+    // walks the num_logits <= 0 exact-prefill edge (:5668-5671).
+    const std::optional<vllm::PromptLogprobs> chunked = PromptLogprobsFor(
+        c, w, tok, prompt, kK, /*max_tokens=*/2, /*max_num_batched_tokens=*/1);
 
-  REQUIRE(whole.has_value());
-  REQUIRE(chunked.has_value());
-  // Assert the height explicitly: comparing two EMPTY payloads would otherwise
-  // pass vacuously against a runner that produces nothing.
-  REQUIRE(whole->size() == prompt.size());
-  REQUIRE(chunked->size() == prompt.size());
-  for (std::size_t i = 0; i < whole->size(); ++i) {
-    REQUIRE((*whole)[i].has_value() == (*chunked)[i].has_value());
-    if (!(*whole)[i].has_value()) continue;
-    const vllm::LogprobsOnePosition& a = *(*whole)[i];
-    const vllm::LogprobsOnePosition& b = *(*chunked)[i];
-    REQUIRE(a.entries.size() == b.entries.size());
-    for (const auto& [tid, lp] : a.entries) {
-      const vllm::Logprob* other = b.find(tid);
-      REQUIRE_MESSAGE(other != nullptr, "token " << tid << " missing at " << i);
-      CHECK(other->rank == lp.rank);
-      CHECK(other->logprob == doctest::Approx(lp.logprob).epsilon(1e-5));
+    REQUIRE(whole.has_value());
+    REQUIRE(chunked.has_value());
+    // Assert the height explicitly: comparing two EMPTY payloads would otherwise
+    // pass vacuously against a runner that produces nothing.
+    REQUIRE(whole->size() == prompt.size());
+    REQUIRE(chunked->size() == prompt.size());
+    double worst = 0.0;
+    int compared = 0;
+    for (std::size_t i = 0; i < whole->size(); ++i) {
+      REQUIRE((*whole)[i].has_value() == (*chunked)[i].has_value());
+      if (!(*whole)[i].has_value()) continue;
+      const vllm::LogprobsOnePosition& a = *(*whole)[i];
+      const vllm::LogprobsOnePosition& b = *(*chunked)[i];
+      REQUIRE(a.entries.size() == b.entries.size());
+      for (const auto& [tid, lp] : a.entries) {
+        const vllm::Logprob* other = b.find(tid);
+        // THE MACHINERY ASSERTIONS, EXACT ON BOTH ARMS: the same token ids land
+        // at the same positions with the same ranks. A stitching defect moves
+        // or drops rows; it does not perturb them by 1e-3.
+        REQUIRE_MESSAGE(other != nullptr, "token " << tid << " missing at " << i);
+        CHECK(other->rank == lp.rank);
+        if (require_exact) {
+          CHECK(other->logprob == lp.logprob);
+        } else {
+          CHECK(other->logprob == doctest::Approx(lp.logprob).epsilon(5e-3));
+        }
+        worst = std::max(worst, std::abs(static_cast<double>(other->logprob) - lp.logprob));
+        ++compared;
+      }
     }
-  }
+    // A `const char*` ternary directly inside MESSAGE() degrades to a bool and
+    // prints "1"; bind it to a std::string first.
+    const std::string arm = require_exact ? "SEQUENTIAL" : "CHUNKED";
+    MESSAGE(arm << " GDN arm: " << compared
+            << " logprobs compared, worst |d| = " << worst);
+    // A counted property: `assertions: 0 ... SUCCESS!` is a skip wearing a pass.
+    CHECK(compared > 0);
+  };
+  compare("0", /*require_exact=*/true);
+  compare("1", /*require_exact=*/false);
 }
 
 // (e) INERTNESS: a request that did not ask gets nothing, and asking must not

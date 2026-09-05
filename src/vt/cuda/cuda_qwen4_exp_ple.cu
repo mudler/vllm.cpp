@@ -15,8 +15,8 @@
 //         `short_conv_state_len = (conv_kernel_size - 1) * conv_dilation` (:1135),
 //         plus `LinearAttentionLayer.update_conv_state` (cache_utils.py:1036-1075)
 //   GATE  `Qwen4ExpTextPLELayer.forward` :1180-1182, flattened at :1184
-// vLLM has never registered `qwen4_exp` at any revision, so there is no vLLM
-// kernel to mirror; the KERNEL STRUCTURE is mirrored from
+// SUPERSEDED 2026-08-31: `nvidia/ple_layer.py` at `e126687a9a` implements BOTH
+// of these (#2489, beyond our pin). The KERNEL STRUCTURE is mirrored from
 // `src/vt/cuda/cuda_layernorm.cu` (`Check`, `AsStream`, `GridFor`, the Registrar)
 // and `src/vt/cuda/cuda_conv1d_general.cu` (the round-to-nearest intrinsics, and
 // the "byte-identical, not within a tolerance" position its own header argues).

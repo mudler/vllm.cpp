@@ -744,7 +744,7 @@ TEST_CASE("ltx2 image cond: the conditioned latent is what the goldens depend on
 
   SUBCASE("the conditioning applied AFTER the noiser") {
     // Upstream conditions the CLEAN tensor and lets the noiser compose it
-    // (latent_cond.py:38-39 + noisers.py:31-34). Applying it afterwards leaves
+    // (latent_cond.py:40-41 + noisers.py:31-34). Applying it afterwards leaves
     // the noised latent pinned to noise instead of to the image — with the
     // identical clean tensor and the identical mask, so only section 5 sees it.
     const Composition c =

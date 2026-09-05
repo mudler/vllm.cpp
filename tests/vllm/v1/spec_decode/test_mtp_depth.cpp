@@ -277,6 +277,10 @@ class MtpTensorStore {
     };
   }
 
+  std::function<bool(const std::string&)> Exists() const {
+    return [this](const std::string& name) { return tensors_.count(name) != 0; };
+  }
+
  private:
   struct Stored {
     std::vector<uint16_t> values;
@@ -312,7 +316,8 @@ Qwen3_5MTPWeights MakeMtpHead(const HfConfig& c) {
     store.Add("mtp.layers.0.mlp.down_proj.weight", {H, I}, 15);
     filled = true;
   }
-  return vllm::LoadQwen3_5MTP(store.Resolver(), c, Qwen3_5MTPKind::kDense);
+  return vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), c,
+                              Qwen3_5MTPKind::kDense);
 }
 
 // The tiny oracle-verified BPE fixture (ids 0..23, no holes).

@@ -40,12 +40,6 @@ inline void Check(hipError_t err, const char* what) {
 inline hipStream_t AsStream(const Queue& q) {
   return static_cast<hipStream_t>(q.handle);
 }
-inline unsigned GridFor(int64_t n) {
-  if (n <= 0) return 1;
-  const int64_t g = (n + kBlock - 1) / kBlock;
-  return static_cast<unsigned>(g > 65535 ? 65535 : g);
-}
-
 __device__ inline float Ld(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Ld(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline float Ld(const __hip_bfloat16* p, int64_t i) {

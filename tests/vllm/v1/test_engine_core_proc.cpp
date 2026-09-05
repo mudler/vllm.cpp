@@ -467,10 +467,20 @@ TEST_CASE("EngineCoreProc: abort-mode shutdown aborts in-flight requests") {
 
   // The abort output for the in-flight request is on the queue (it was
   // enqueued before the busy loop exited). Frames before it are token deltas.
+  //
+  // DRAIN TO EMPTY, do not budget the scan (#2482). `shutdown()` above JOINS the
+  // engine thread, so by here the producer is stopped and the queue is finite:
+  // this loop terminates, and it reads every frame the engine ever wrote. A
+  // fixed budget of 1000 dequeues did not, because `max_tokens=100000` lets the
+  // request free-run token deltas into an unbounded queue for as long as the
+  // engine thread is scheduled. Under parallel `ctest` it got more of that time
+  // and wrote more than 1000 deltas ahead of the abort frame, so the scan ran
+  // out of budget on a queue that still held the frame. The failing run reported
+  // 1004 assertions against a solo run's 11 -- every one of the 1000 `try_get`s
+  // returned true, which is the queue being deep and not the frame being absent.
   bool abort_seen = false;
-  for (int i = 0; i < 1000 && !abort_seen; ++i) {
-    EngineCoreOutputItem item;
-    REQUIRE(client.proc().output_queue.try_get(item));
+  EngineCoreOutputItem item;
+  while (client.proc().output_queue.try_get(item)) {
     for (const auto& out : item.outputs.outputs) {
       if (out.request_id == "0" && out.Finished()) {
         CHECK(*out.finish_reason == FinishReason::kAbort);

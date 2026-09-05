@@ -626,20 +626,39 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
       // HAS NO ROW SLICE. `Tensor::Slice` offsets by `stride[dim] *
       // SizeOf(dtype)` and `SizeOf` refuses a block dtype outright, so this
       // would throw four frames deeper with a message about dtypes rather than
-      // about the operator's switch. `vt::FusedNormRope` is registered on CPU
-      // (`cpu_ops.cpp`) and CUDA (`cuda_ops.cu`) and is default-ON, so the only
-      // way here on a keep-quant checkpoint is `VT_MLA_FUSED_NORM_ROPE=0`.
+      // about the operator's switch.
+      //
+      // TWO things can put a keep-quant checkpoint here, and the message says
+      // WHICH by reading the predicate terms back rather than naming one and
+      // hoping (#2564). The previous text named only the environment override,
+      // because it enumerated the backends that HAVE `vt::FusedNormRope` — CPU
+      // (`cpu_ops.cpp`) and CUDA (`cuda_ops.cu`) — and forgot the ones that do
+      // not. `vt::OpRegistered` is a NATIVE-ONLY probe by design
+      // (`src/vt/op_provider.cpp:779-803`), so a backend with no native kernel
+      // takes this branch with every environment variable unset even where the
+      // portable reference tier would have served the op. That is what #2564
+      // measured on `gfx1151` with GLM-5.3, and a reader sent looking for an
+      // unset variable finds nothing.
       if (vt::IsBlockQuant(w_kva.dtype)) {
+        const bool env_off = !MlaFusedNormRopeEnabled();
+        std::string why =
+            env_off ? "VT_MLA_FUSED_NORM_ROPE=0 is set, which disables the fused op"
+                    : (std::string("this backend (") + vt::DeviceTypeName(d.q.device.type) +
+                       ") registers NO NATIVE vt::FusedNormRope kernel, and "
+                       "vt::OpRegistered is a native-only probe that cannot see "
+                       "the portable reference tier");
         throw std::invalid_argument(
             "MLA block: the split A-projection path needs vt::FusedNormRope to "
             "read the merged [kv_lora_rank + qk_rope_head_dim] row, because a "
             "BLOCK-QUANTIZED kv_a_proj_with_mqa (" +
             std::string(vt::Name(w_kva.dtype)) +
             ") has no row slice — a quant block spans whole rows and "
-            "vt::SizeOf refuses a per-element size for it. This is reachable "
-            "only with VT_MLA_FUSED_NORM_ROPE=0 on a keep-quant MLA "
-            "checkpoint; unset it, or load this model with an expanded "
-            "residency");
+            "vt::SizeOf refuses a per-element size for it. The fused path was "
+            "not taken because " +
+            why +
+            (env_off ? "; unset it, or load this model with an expanded residency"
+                     : "; port kFusedNormRope to this backend, or load this "
+                       "model with an expanded residency"));
       }
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
       vt::MatmulBT(d.q, kv_c_t, hidden, w_kva.Slice(0, 0, L));

@@ -2317,6 +2317,47 @@ TEST_CASE("ltx2 loader: the torchao text encoder materializes onto the L3 contra
   const double max_abs = vllm_test::MaxAbsDiff(w.video.weight, te_want);
   INFO("te widen max abs = " << max_abs);
   CHECK(max_abs == 0.0);
+
+  // ── A24 wave 1: the arm the RENDER path takes (LTX25-A24-TEXT-TOWER-BF16) ──
+  //
+  // `ltx2_video.cpp` loads the caption projections through
+  // `Ltx2TextProjectionsAsBf16`, because bf16 is the single dtype upstream
+  // resolves for the whole pipeline (`distilled.py:109`, handed to
+  // `PromptEncoder` at `:111-113`). Swapping that call site back to the widening
+  // above is the mutation the row's spec names, and it is what this half of the
+  // case exists to make detectable.
+  const vllm::Ltx2TextEncoderWeights b = vllm::Ltx2TextProjectionsAsBf16(ck);
+  CHECK(b.ComputeDtype() == vt::DType::kBF16);
+  CHECK(b.video.out_features == video_out);
+  CHECK(b.video.in_features == hidden * (layers + 1));
+
+  // IT IS THE CHECKPOINT'S OWN BYTES, not a conversion of them. Asserted as
+  // equality of the 16-bit patterns rather than of values, so a round trip
+  // through f32 and back would still have to be exact — and asserted against the
+  // CHECKPOINT rather than against a recomputation, so nothing here can agree
+  // with itself.
+  REQUIRE(b.video.weight_bf16.size() == ck.video.weight_bf16.size());
+  size_t moved = 0;
+  for (size_t i = 0; i < ck.video.weight_bf16.size(); ++i)
+    if (b.video.weight_bf16[i] != ck.video.weight_bf16[i]) ++moved;
+  CHECK(moved == 0);
+  CHECK(b.video.bias_bf16 == ck.video.bias_bf16);
+  CHECK(b.audio.weight_bf16 == ck.audio.weight_bf16);
+
+  // AND IT IS HALF THE BYTES OF THE ARM ABOVE, measured on the SAME checkpoint so
+  // no number is quoted. This is the whole of A24 wave 1 on the weight side: the
+  // file was always bf16 and the tower was always computing on a copy at twice
+  // the width. `WeightBytes` reads the dtype the projection carries, so this
+  // comparison cannot pass for a `dtype` field bolted onto an f32 buffer.
+  INFO("caption projections: bf16 " << (b.video.WeightBytes() + b.audio.WeightBytes())
+                                    << " B vs f32 "
+                                    << (w.video.WeightBytes() + w.audio.WeightBytes())
+                                    << " B");
+  CHECK(b.video.WeightBytes() * 2 == w.video.WeightBytes());
+  CHECK(b.audio.WeightBytes() * 2 == w.audio.WeightBytes());
+  CHECK(b.video.weight.empty());
+  CHECK(b.audio.weight.empty());
+  CHECK(w.video.weight_bf16.empty());
   std::remove(path.c_str());
 }
 

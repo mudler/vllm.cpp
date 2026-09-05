@@ -508,9 +508,17 @@ struct SpeculativeConfig {
   // "dflash", same as upstream at b389ac2946 speculative.py:952-956), dspark,
   // eagle, eagle3. Host "ngram" is NOT upstream's async lane ("ngram_gpu" is a
   // different, GPU-side implementation this engine does not have), and
-  // "draft_model" is refused AT THE PIN (b389ac2946 later allows it —
-  // vllm/config/vllm.py:1291 there — but the pin governs; reconcile when the
-  // pin advances past that commit).
+  // "draft_model" is refused HERE, and that no longer mirrors the pin. The
+  // instruction this comment used to carry — "reconcile when the pin advances
+  // past that commit" — has come due: c0202c5603 (vllm#48341) adds
+  // `method != "draft_model"` to the branch that disables async scheduling, and
+  // it is an ancestor of the current pin e126687a9a and NOT of the prior
+  // 555967922 (both checked with `git merge-base --is-ancestor`). So upstream
+  // now auto-enables async scheduling for a draft_model speculator and this
+  // predicate does not. The change is `use_eagle() || uses_draft_model()` plus a
+  // behaviour test, and it is deliberately NOT made in the pin-advancing commit,
+  // because a sync cycle may not carry feature work (.agents/upstream-sync.md
+  // §Rules). Owed by #2649, unblocked by #2817.
   bool async_scheduling_compatible() const { return use_eagle(); }
 
   // NumLookaheadTokens: the scheduler's num_lookahead_tokens for this config

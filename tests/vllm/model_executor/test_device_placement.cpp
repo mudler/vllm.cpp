@@ -439,3 +439,55 @@ TEST_CASE("placement seam: an UNPLACEABLE arm REFUSES a real placement, and stay
   vllm::ResetActiveMoePlacementPlanForTesting();
   vt::DestroyQueue(q);
 }
+
+// ── BACKEND-ROCM-IQ-EXPERT-RESIDENCY (#2516) ────────────────────────────────
+// The name -> layer inverse. It exists because a weight LOADER has a tensor
+// name and no layer index, and the residency of a routed-expert tower is
+// decided there.
+TEST_CASE("GgufBlockIndexFromTensorName reads llama.cpp's blk.<N>. prefix") {
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.0.ffn_gate_exps.weight") == 0);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.7.ffn_up_exps.weight") == 7);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.77.ffn_down_exps.weight") == 77);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.3.attn_q.weight") == 3);
+
+  // ANCHORED. A name that merely CONTAINS the prefix is not that block's
+  // tensor, and answering as though it were would move a weight no plan
+  // claimed. This is the one place this rule differs from an operator's `-ot`
+  // pattern, which is deliberately `regex_search`.
+  CHECK(vllm::GgufBlockIndexFromTensorName("x.blk.3.weight") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("token_embd.weight") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("output_norm.weight") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.weight") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.3") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("blk.x.weight") == -1);
+  CHECK(vllm::GgufBlockIndexFromTensorName("") == -1);
+  // An index no `per_layer_` can hold is refused rather than wrapped onto a
+  // real layer.
+  CHECK(vllm::GgufBlockIndexFromTensorName(
+            "blk.99999999999999999999999.ffn_gate_exps.weight") == -1);
+}
+
+TEST_CASE("MoePlacementPlan::DeviceForRoutedExpertTensor answers by name") {
+  std::vector<vllm::PlacementOverride> ov;
+  for (int64_t l = 2; l < 4; ++l)
+    ov.push_back({vllm::LlmFfnExpsBlockRegex(l), "cpu"});
+  const vllm::MoePlacementPlan plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(ov, vt::DeviceType::kCUDA),
+      /*num_hidden_layers=*/4);
+  REQUIRE(plan.PlacesAnything());
+  REQUIRE(plan.placed_layer_count() == 2);
+
+  CHECK(plan.DeviceForRoutedExpertTensor("blk.2.ffn_gate_exps.weight") ==
+        vt::DeviceType::kCPU);
+  CHECK(plan.DeviceForRoutedExpertTensor("blk.3.ffn_down_exps.weight") ==
+        vt::DeviceType::kCPU);
+  CHECK(plan.DeviceForRoutedExpertTensor("blk.1.ffn_gate_exps.weight") ==
+        vt::DeviceType::kCUDA);
+  // A name with no block index, and a block beyond what the plan was resolved
+  // against, both take the inert answer rather than throwing on a load path.
+  CHECK(plan.DeviceForRoutedExpertTensor("token_embd.weight") ==
+        vt::DeviceType::kCUDA);
+  CHECK(plan.DeviceForRoutedExpertTensor("blk.9.ffn_gate_exps.weight") ==
+        vt::DeviceType::kCUDA);
+}

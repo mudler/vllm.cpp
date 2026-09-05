@@ -28,8 +28,10 @@
 #include <doctest/doctest.h>
 
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,7 +41,11 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/qwen3_5.h"   // PagedKvCache, GdnStateCache
+#include "vllm/v1/attention/backend.h"             // CommonAttentionMetadata
+#include "vllm/v1/attention/backends/gdn_attn.h"   // GDNAttentionMetadata
 #include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 // The fixture is SHARED with tests/vllm/models/test_deepseek_v4_exl3_forward.cpp,
@@ -1135,4 +1141,443 @@ TEST_CASE("W3: the compressor pools its OWN projection, not the MLA latent (#228
   }
   REQUIRE(mag > 1e-6);
   CHECK(diff > 1e-6);  // the projection is READ, not decoration
+}
+
+TEST_CASE("W3: the INDEXER's compressor family is materialized (#2286)") {
+  // The indexer carries its own `DeepseekCompressor` at `head_dim =
+  // index_head_dim` (`attention.py:768-776`). Three of its four tensors were
+  // accounted and dropped; only `idx_wk` had a host slot. They load now.
+  //
+  // Loading them does NOT make the indexer's compressor run, and this case does
+  // not pretend otherwise: the forward still refuses on `idx_wk`'s width. That
+  // order is deliberate -- narrowing a refusal before the capability exists turns
+  // it into a silent wrong answer, which this row has established twice.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 4};      // the indexer exists ONLY at cr == 4
+  opt.real_dsa_geometry = true;      // the artifact's widths, coff == 2
+  opt.index_n_heads = 2;
+  opt.index_head_dim = 8;
+  opt.index_topk = 2;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  const auto& L = w.host.layers[1];
+  const int64_t ihd = w.params.index_head_dim, H = w.params.hidden_size;
+  const int64_t cr = w.params.compress_ratio(1);
+  const int64_t iw = 2 * ihd;  // coff == 2, always, where the indexer exists
+
+  // Present, and at upstream's widths: the ape and the fused gate carry `coff`,
+  // the norm does NOT (`compressor.py:288`).
+  CHECK(static_cast<int64_t>(L.idx_comp_ape.size()) == cr * iw);
+  CHECK(static_cast<int64_t>(L.idx_comp_wgate.size()) == iw * H);
+  CHECK(static_cast<int64_t>(L.idx_comp_norm_weight.size()) == ihd);
+  // Its KV projection was already loaded and keeps the same width as the gate.
+  CHECK(static_cast<int64_t>(L.idx_wk.size()) == iw * H);
+
+  // NON-TRIVIAL: an all-zero slot would satisfy every size check above while
+  // carrying nothing the checkpoint wrote.
+  double mag = 0.0;
+  for (const float v : L.idx_comp_wgate) mag = std::max(mag, std::abs((double)v));
+  CHECK(mag > 1e-6);
+
+  // The refusal is UNCHANGED, because the cycle does not run yet.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::string msg = ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward({1}, {0}, {}, {}, w, q, {0});
+  });
+  CAPTURE(msg);
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
+}
+
+TEST_CASE("W3: the cr == 4 arm is REACHED, and its INDEXER state accumulates (#2286)") {
+  // The `cr == 128` arm was already reached. This is the `cr == 4` family, which
+  // differs by running a SECOND compressor -- the indexer's -- and using its
+  // selection to narrow which closed rows the attention merges.
+  //
+  // The claim is reachability of that second machine specifically: its state must
+  // grow, separately from the attention compressor's, or the selection is being
+  // built from nothing and every step would silently attend the window alone.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 4};  // layer 1 carries BOTH a compressor and an indexer
+  // The REAL widths: the loader derives `coff` for a cr == 4 layer and refuses a
+  // collapsed one, since upstream cannot emit it at this ratio.
+  opt.real_dsa_geometry = true;
+  opt.index_n_heads = 2;
+  // >= the model's `qk_rope_head_dim` (64 in this fixture). The indexer's pooled
+  // key is rotated on its rope TAIL, and that tail is the MODEL's rope width
+  // whatever the indexer's head is (`compressor.py:240`), so a head narrower than
+  // the rope width is a geometry upstream cannot produce.
+  opt.index_head_dim = 128;
+  opt.index_topk = 2;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  // Report the widths before running, so a mismatch names the tensor instead of
+  // surfacing as an anonymous MatVec error from inside the forward.
+  {
+    const auto& L1 = w.host.layers[1];
+    const int64_t H1 = w.params.hidden_size, hd1 = w.params.head_dim;
+    const int64_t ihd1 = w.params.index_head_dim, inh1 = w.params.index_n_heads;
+    CAPTURE(L1.comp_wgate.size()); CAPTURE(L1.comp_wkv.size());
+    CAPTURE(L1.comp_ape.size());   CAPTURE(L1.idx_wk.size());
+    CAPTURE(L1.idx_comp_wgate.size()); CAPTURE(L1.idx_comp_ape.size());
+    CAPTURE(L1.idx_wq.size());     CAPTURE(L1.idx_wproj.size());
+    CAPTURE(H1); CAPTURE(hd1); CAPTURE(ihd1); CAPTURE(inh1);
+    CAPTURE(w.params.q_lora_rank);
+    CHECK(static_cast<int64_t>(L1.idx_wproj.size()) == inh1 * H1);
+    CHECK(static_cast<int64_t>(L1.idx_wk.size()) == 2 * ihd1 * H1);
+    CHECK(static_cast<int64_t>(L1.comp_wkv.size()) ==
+          static_cast<int64_t>(L1.comp_wgate.size()));
+    // The one the forward DISPATCHES on: if this is neither shape it falls to the
+    // hidden-state branch and MatVec throws anonymously.
+    CHECK(static_cast<int64_t>(L1.idx_wq.size()) ==
+          inh1 * ihd1 * w.params.q_lora_rank);
+  }
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t nlayers = w.params.num_hidden_layers, hd = w.params.head_dim;
+  const int64_t bs = 16, nb = 8;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    storage[static_cast<size_t>(l)].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+        {nb, bs, hd});
+  }
+
+  vllm::DeepseekV4CompressorState cs;
+  cs.Resize(nlayers);
+
+  // Enough steps to cross a cr == 4 boundary, so rows actually close and the
+  // selection has something to choose from.
+  int64_t kv_base = 0;
+  for (int step = 0; step < 8; ++step) {
+    const std::vector<int32_t> tok{static_cast<int32_t>(1 + (step % 3))};
+    const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
+    const auto lg = vllm::DeepseekV4ForwardExl3Paged(w, q, pages, kv_base, tok, pos,
+                                                     {0}, &cs);
+    REQUIRE(lg.size() == static_cast<size_t>(w.params.vocab_size));
+    for (const float v : lg) REQUIRE(std::isfinite(v));
+    kv_base += 1;
+  }
+
+  // BOTH state machines ran on layer 1, and they are separate.
+  CHECK(!cs.state_kv[1].empty());       // the attention compressor's
+  CHECK(!cs.idx_state_kv[1].empty());   // the INDEXER's -- the reachability claim
+  CHECK(!cs.idx_state_score[1].empty());
+  // Eight tokens at ratio 4 close two windows, so the indexer produced two keys.
+  const int64_t ihd = w.params.index_head_dim;
+  CHECK(static_cast<int64_t>(cs.idx_comp_rows[1].size()) == 2 * ihd);
+  // Layer 0 is dense: neither machine touched it.
+  CHECK(cs.state_kv[0].empty());
+  CHECK(cs.idx_state_kv[0].empty());
+}
+
+// ── MODEL-DSV4-PAGED-ENTRY (#2447) ─────────────────────────────────────────
+//
+// THE REACHABILITY GATE. `DeepseekV4ForwardExl3Paged` worked before this row and
+// had only test callers, so every case above it proves a class rather than a
+// capability. This one enters through `ModelRegistry::Forward` -- the production
+// entry point AGENTS.md §"Nothing lands dead" names -- and it leaves
+// `gather_logits` AT ITS DEFAULT, because that default is the defect: it is true
+// on every step the runner builds, so it selected `ForwardDevice`, which binds
+// neither `paged_kv` nor `compressor`.
+//
+// WHAT IT DOES NOT DO. `DeepseekV4LoadedModel` lives in an anonymous namespace,
+// so no downcast can read its compressor state, and it must not gain a public
+// accessor for the purpose -- that would weaken the claim to "the member
+// exists". The two reachable observables carry it instead:
+//
+//   (A) the page bytes for the compressor layer are non-zero after step 1. Only
+//       `vt::ConcatAndCacheMla` writes them and only the paged arm calls it, so
+//       this is red if the new registry branch is deleted.
+//   (B) step 2 SUCCEEDS at `kv_base == 1`. `CompressorLayerStep` refuses unless
+//       the carried state has seen exactly `kv_base` tokens, so this is red if
+//       the state is constructed per call rather than persisted on the model.
+//
+// Two production defects, one assertion each.
+namespace {
+// One count, not one assertion per element.
+int64_t NonFinite(const std::vector<float>& v) {
+  int64_t n = 0;
+  for (const float x : v)
+    if (!std::isfinite(x)) ++n;
+  return n;
+}
+}  // namespace
+
+TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447)") {
+  dsv4_exl3_fixture::FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};  // layer 1 carries the compressor
+  opt.real_dsa_geometry = false;   // the collapsed width the host forward indexes
+  auto f = dsv4_exl3_fixture::BuildFixture(opt);
+
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(f->shards);
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::ModelRegistry::Load(f->config, source);
+  REQUIRE(model != nullptr);
+
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(f->config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t hd = params.head_dim;
+  REQUIRE(nlayers == 2);
+  REQUIRE(params.has_compressor(1));
+
+  // The pages the runner publishes, under the names `MakeDeepseekV4KVCache`
+  // publishes them under -- resolved BY NAME, exactly as the adapter does it.
+  // f32 rather than the shipped `kI8`: `vt::ConcatAndCacheMla` takes a float
+  // cache only, so the packed arm is refused by name and is owed to
+  // `KV-DSV4-MULTICACHE` W8.
+  const int64_t nb = 4, bs = 8;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+  std::vector<std::string> names;
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const size_t i = static_cast<size_t>(l);
+    storage[i].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    attn_kv[i].data = storage[i].data();
+    attn_kv[i].dtype = vt::DType::kF32;
+    attn_kv[i].num_blocks = nb;
+    attn_kv[i].block_size = bs;
+    attn_kv[i].num_kv_heads = 1;
+    attn_kv[i].head_size = hd;
+    names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  }
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+
+  const auto step = [&](int32_t token, int32_t position, int computed, int nreqs) {
+    const std::vector<int32_t> tok{token};
+    const std::vector<int32_t> pos{position};
+    const std::vector<int32_t> li{0};
+    vllm::v1::CommonAttentionMetadata attn_meta{};
+    attn_meta.num_reqs = nreqs;
+    attn_meta.num_computed_tokens_cpu = {computed};
+    vllm::ModelForwardInput in{.token_ids = tok,
+                               .positions = pos,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = f->config,
+                               .queue = queue,
+                               .logits_indices = li,
+                               .num_reqs = nreqs};
+    // NOT in the aggregate initializer, exactly as the runner sets it.
+    in.multi_kv = &mk;
+    // `gather_logits` is DELIBERATELY LEFT AT ITS DEFAULT (true). A test that
+    // set it false would route through the branch no runner step takes and
+    // would prove nothing about the path that runs.
+    REQUIRE(in.gather_logits);
+    return vllm::ModelRegistry::Forward(*model, in);
+  };
+
+  // ── step 1: kv_base == 0 ────────────────────────────────────────────────
+  const vllm::ForwardLogits s1 = step(/*token=*/1, /*position=*/0, /*computed=*/0,
+                                      /*nreqs=*/1);
+  CHECK(s1.rows == 1);
+  CHECK(s1.vocab == params.vocab_size);
+  REQUIRE(s1.host.size() == static_cast<size_t>(params.vocab_size));
+  // AGGREGATED, never one assertion per vocabulary entry: a per-entry loop
+  // buries the assertion COUNT, and a changed count is itself the signal a
+  // mutation is read by.
+  CHECK(NonFinite(s1.host) == 0);
+
+  // (A) THE PAGE WAS WRITTEN, on the compressor layer. Aggregated rather than one
+  // assertion per element: a changed assertion COUNT is itself the signal a
+  // mutation is read by, and `nb * bs * hd` REQUIREs would swamp it.
+  int64_t nonzero_l1 = 0;
+  double sum_l1 = 0.0;
+  for (const float v : storage[1]) {
+    if (v != 0.0f) ++nonzero_l1;
+    sum_l1 += std::abs(static_cast<double>(v));
+  }
+  CHECK(NonFinite(storage[1]) == 0);
+  MESSAGE("compressor-layer page: " << nonzero_l1 << " non-zero of "
+                                    << storage[1].size() << ", L1 " << sum_l1);
+  CHECK(nonzero_l1 > 0);
+  // Exactly the FIRST slot's row, and nothing beyond it: `kv_base == 0` writes
+  // slot 0. A route that wrote the whole page would also pass "non-zero".
+  int64_t nonzero_beyond = 0;
+  for (size_t i = static_cast<size_t>(hd); i < storage[1].size(); ++i)
+    if (storage[1][i] != 0.0f) ++nonzero_beyond;
+  CHECK(nonzero_beyond == 0);
+
+  // ── step 2: kv_base == 1 ────────────────────────────────────────────────
+  // (B) THE STATE PERSISTED. `CompressorLayerStep` refuses unless the carried
+  // state has seen exactly `kv_base` tokens, so a state built per call has seen
+  // 0 here and this throws.
+  const vllm::ForwardLogits s2 = step(/*token=*/2, /*position=*/1, /*computed=*/1,
+                                      /*nreqs=*/1);
+  CHECK(s2.rows == 1);
+  REQUIRE(s2.host.size() == static_cast<size_t>(params.vocab_size));
+  CHECK(NonFinite(s2.host) == 0);
+  // And the second token's row landed in slot 1, so the two steps did not write
+  // the same slot.
+  int64_t nonzero_slot1 = 0;
+  for (int64_t d = 0; d < hd; ++d)
+    if (storage[1][static_cast<size_t>(hd + d)] != 0.0f) ++nonzero_slot1;
+  CHECK(nonzero_slot1 > 0);
+
+  // ── the route's own refusal, which is the RESOLVER'S and not a copy ─────
+  // One `kv_base` cannot serve two context lengths, and the compressor state has
+  // no request dimension -- two requests at EQUAL length would sail past
+  // `seen == kv_base` into a plausible answer over a mixed history.
+  CHECK_THROWS(step(/*token=*/3, /*position=*/2, /*computed=*/2, /*nreqs=*/2));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ENG-ASYNC-DEVICE-IDS-2544 — THE ASYNCHRONOUS DEVICE-IDENTIFIER GATE.
+//
+// Spec `.agents/specs/eng-async-device-ids-2544.md`, issue
+// [#2544](https://github.com/mudler/vllm.cpp/issues/2544); the contract is
+// [#1305](https://github.com/mudler/vllm.cpp/issues/1305)'s.
+//
+// WHAT IT MEASURES. On the asynchronous serving path the runner's combine
+// splices each decode row's sampled token into the DEVICE identifiers on the
+// main queue and leaves the host `token_ids` deliberately stale for decode rows
+// (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on
+// CUDA). A forward that embeds the host vector generates every step after the
+// first from the previous step's identifiers — and because `token_ids_cpu` is
+// zero-initialised, from TOKEN ID 0. Silently, at rc=0, with plausible output.
+//
+// WIRED BUT NOT CONVICTED, and the case says so rather than implying otherwise.
+// #2544 named this registration on a `grep` and called it "a candidate, not a
+// conviction"; this row has no staged DeepSeek-V4 checkpoint and no GPU time for
+// one. What is proved here is that the identifiers reach the embed through
+// `ModelRegistry::Forward` — not that service ever hands this model a live
+// `device_token_ids`. Spec `## Owed` O4.
+//
+// THREE RUNS, because two of them cannot separate the cases:
+//
+//     A  right host id, no mirror            -> the reference
+//     B  ZERO host id, no mirror             -> must DIFFER from A
+//     C  ZERO host id, mirror carries A's    -> must EQUAL A, bit for bit
+//
+// B is the control. Without it a forward that ignored its identifiers entirely
+// would satisfy C. ZERO is the wrong value on purpose: it is what the real
+// defect feeds. A's identifier is NON-ZERO, so C cannot agree for the wrong
+// reason.
+//
+// ONE MODEL PER RUN. This arm carries a per-model compressor state that refuses
+// unless it has seen exactly `kv_base` tokens, so three runs sharing one
+// `LoadedModel` would be three different histories rather than three readings of
+// one step.
+TEST_CASE("dsv4 #2544: the paged arm embeds the async mirror's DEVICE id, not the stale host one") {
+  dsv4_exl3_fixture::FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};
+  opt.real_dsa_geometry = false;
+  auto f = dsv4_exl3_fixture::BuildFixture(opt);
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(f->config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t hd = params.head_dim;
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& be = vt::GetBackend(queue.device.type);
+
+  // The identifier the runner's combine would have written. NON-ZERO, and inside
+  // the fixture's vocabulary so run B is a wrong ANSWER and not a refusal.
+  constexpr int32_t kTrue = 3;
+  REQUIRE(kTrue < params.vocab_size);
+
+  // One step through `ModelRegistry::Forward` on a FRESH model, with the host
+  // identifier and the mirror chosen by the caller.
+  const auto run = [&](int32_t host_id, bool mirror) {
+    const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(f->shards);
+    std::unique_ptr<vllm::LoadedModel> model =
+        vllm::ModelRegistry::Load(f->config, source);
+    REQUIRE(model != nullptr);
+
+    const int64_t nb = 4, bs = 8;
+    std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+    std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+    std::vector<std::string> names;
+    for (int64_t l = 0; l < nlayers; ++l) {
+      const size_t i = static_cast<size_t>(l);
+      storage[i].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+      attn_kv[i].data = storage[i].data();
+      attn_kv[i].dtype = vt::DType::kF32;
+      attn_kv[i].num_blocks = nb;
+      attn_kv[i].block_size = bs;
+      attn_kv[i].num_kv_heads = 1;
+      attn_kv[i].head_size = hd;
+      names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+    }
+    vllm::MultiKvCacheIndex mk;
+    mk.layer_names = &names;
+
+    const std::vector<int32_t> tok{host_id};
+    const std::vector<int32_t> pos{0};
+    const std::vector<int32_t> li{0};
+    std::vector<vllm::GdnStateCache> gdn_state;
+    const vllm::v1::GDNAttentionMetadata gdn_meta{};
+    vllm::v1::CommonAttentionMetadata attn_meta{};
+    attn_meta.num_reqs = 1;
+    attn_meta.num_computed_tokens_cpu = {0};
+    vllm::ModelForwardInput in{.token_ids = tok,
+                               .positions = pos,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = f->config,
+                               .queue = queue,
+                               .logits_indices = li,
+                               .num_reqs = 1};
+    in.multi_kv = &mk;
+    // A REAL backend allocation, never the host vector's address. On CPU the two
+    // are the same kind of pointer, so this buys nothing today; it is what makes
+    // the case correct by construction on a device.
+    int32_t* dev = nullptr;
+    if (mirror) {
+      dev = static_cast<int32_t*>(be.Alloc(sizeof(int32_t)));
+      const int32_t truth = kTrue;
+      be.Copy(queue, dev, &truth, sizeof(int32_t));
+      be.Synchronize(queue);
+      // Set AFTER aggregate construction, exactly as `runner.cpp` sets it.
+      in.device_token_ids = dev;
+    }
+    const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
+    if (dev != nullptr) be.Free(dev);
+    REQUIRE(out.host.size() == static_cast<size_t>(params.vocab_size));
+    return out.host;
+  };
+
+  const std::vector<float> ref = run(kTrue, /*mirror=*/false);
+  // FINITENESS BEFORE ANY COMPARISON. Against a NaN both `==` and `!=` are
+  // false, so an equality gate and a difference gate BOTH report success on a
+  // forward that produced no numbers at all.
+  REQUIRE(NonFinite(ref) == 0);
+
+  const std::vector<float> stale = run(/*host_id=*/0, /*mirror=*/false);
+  REQUIRE(NonFinite(stale) == 0);
+  size_t moved = 0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    if (std::memcmp(&ref[i], &stale[i], sizeof(float)) != 0) ++moved;
+  CHECK_MESSAGE(moved > 0,
+                "zeroing the host id changed nothing, so this fixture cannot "
+                "see an identifier at all and the gate below proves nothing");
+
+  const std::vector<float> via_device = run(/*host_id=*/0, /*mirror=*/true);
+  size_t differing = 0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    if (std::memcmp(&ref[i], &via_device[i], sizeof(float)) != 0) ++differing;
+  CHECK_MESSAGE(differing == 0,
+                "registry forward, mirror vs host reference: " << differing
+                    << " of " << ref.size() << " logits differ, so this forward "
+                    "embedded the STALE host id (#2544, #1305)");
+  MESSAGE("dsv4 device-ids: control moved " << moved << " floats; mirror vs "
+          "reference differ in " << differing << " of " << ref.size());
 }

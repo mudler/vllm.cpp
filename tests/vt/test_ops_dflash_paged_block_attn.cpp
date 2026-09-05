@@ -397,3 +397,135 @@ TEST_CASE("dflash-paged-block-attn == materialized combined DFlashBlockAttention
   // (6) ZERO context (first draft step): pure in-block attention, must still match.
   RunScenario({16, 32, 8, 128, 4, 0, false, {0}, 600});
 }
+
+// ===========================================================================
+// SPEC-DFLASH2 (#2784, discharging #1900) — THE WINDOW MUST BIND ON A
+// NON-CAUSAL LAYER, AND THIS IS THE CASE THAT WOULD HAVE CAUGHT #2784.
+//
+// The published DFlash2 drafter declares five `sliding_attention` layers,
+// `sliding_window: 2048` and `is_causal: false`, so `ResolveQwen3DFlashAttnModes`
+// hands this op `(causal = false, sliding_window = 2048)` on every layer of
+// every draft step. Before this row every DFlash kernel guarded its window on
+// `causal &&` and therefore attended over the WHOLE combined sequence. Below
+// 2048 tokens of context that is a no-op; above it the draft attends to keys it
+// was never trained on, and #2784 measured acceptance falling from 0.77 at
+// 2,307 prompt tokens to 0.06 at 8,159, with speculation landing 23% BELOW the
+// no-draft baseline. Nothing saw it: the verify is lossless, so no output token
+// moves, and the benchmark harness runs at `--input-len 16` — below the window,
+// where the defect is provably inert.
+//
+// WHAT THIS MEASURES, IN WORDS. Two contexts that are IDENTICAL inside every
+// query row's symmetric window and DIFFERENT outside it must produce IDENTICAL
+// outputs. That is the guarantee `_maybe_symmetrize_window`
+// (vllm/v1/attention/backends/flash_attn.py:319-330 @ pin 5559679229) exists to
+// give, stated as a property of the op rather than as a transcription of its
+// bound — a transcription could not have caught this, because all eleven
+// transcriptions in the tree agreed with each other and with the defect.
+//
+// THE FIXTURE PROVES ITSELF FIRST. A test that only asserted equality would go
+// green on a fixture whose two contexts happened not to differ, so the
+// `window = 0` control below asserts that this SAME pair of contexts DOES move
+// the output when no window is asked for. Equality after that is a mask, not an
+// accident.
+namespace {
+
+// One CPU run of the production op over an explicit context pair.
+std::vector<float> RunPagedCpu(const Scenario& sc, const std::vector<float>& ctx_k,
+                               const std::vector<float>& ctx_v,
+                               const std::vector<float>& blk_q,
+                               const std::vector<float>& blk_k,
+                               const std::vector<float>& blk_v) {
+  const int P = static_cast<int>(sc.ctxlen.size());
+  const int64_t blen = 1 + sc.k;
+  const int64_t nq = P * blen;
+  Paged pg = PackPaged(sc, ctx_k, ctx_v);
+  std::vector<float> out(static_cast<size_t>(nq * sc.hq * sc.d), 0.0f);
+  Queue cpuq = Q();
+  Tensor tq = Contig(const_cast<float*>(blk_q.data()), DType::kF32, Cpu(), {nq, sc.hq, sc.d});
+  Tensor tbk = Contig(const_cast<float*>(blk_k.data()), DType::kF32, Cpu(), {nq, sc.hk, sc.d});
+  Tensor tbv = Contig(const_cast<float*>(blk_v.data()), DType::kF32, Cpu(), {nq, sc.hk, sc.d});
+  Tensor tck =
+      Contig(pg.ck.data(), DType::kF32, Cpu(), {pg.num_pages, sc.block_size, sc.hk, sc.d});
+  Tensor tcv =
+      Contig(pg.cv.data(), DType::kF32, Cpu(), {pg.num_pages, sc.block_size, sc.hk, sc.d});
+  Tensor tcu = Contig(pg.cu.data(), DType::kI32, Cpu(), {P + 1});
+  Tensor tsl = Contig(pg.seq_lens.data(), DType::kI32, Cpu(), {P});
+  Tensor tbt = Contig(pg.block_table.data(), DType::kI32, Cpu(), {P, pg.max_pages});
+  Tensor to = Contig(out.data(), DType::kF32, Cpu(), {nq, sc.hq, sc.d});
+  vt::DFlashPagedBlockAttention(cpuq, to, tq, tbk, tbv, tck, tcv, tcu, tsl, tbt, PagedArgs(sc));
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("dflash-paged-block-attn: a NON-CAUSAL window HIDES the far context (#2784)") {
+  // C = 40 context rows, a 1+8 = 9-row block, window 6. Query rows sit at
+  // combined positions [40, 48], so the widest symmetric window any of them has
+  // is [40 - 5, 48 + 5] = [35, 53]. Context rows [0, 35) are therefore outside
+  // EVERY query row's window and must not reach any output element.
+  const int64_t kCtx = 40, kOutside = 35;
+  Scenario sc{/*k=*/8,     /*hq=*/4,  /*hk=*/2,   /*d=*/16, /*block_size=*/4,
+              /*window=*/6, /*causal=*/false, /*ctxlen=*/{kCtx}, /*seed=*/9001};
+  const int64_t blen = 1 + sc.k;
+  const int64_t nq = blen;
+  auto blk_q = RandF32(static_cast<size_t>(nq * sc.hq * sc.d), sc.seed);
+  auto blk_k = RandF32(static_cast<size_t>(nq * sc.hk * sc.d), sc.seed + 1);
+  auto blk_v = RandF32(static_cast<size_t>(nq * sc.hk * sc.d), sc.seed + 2);
+
+  auto ctx_k_a = RandF32(static_cast<size_t>(kCtx * sc.hk * sc.d), sc.seed + 3);
+  auto ctx_v_a = RandF32(static_cast<size_t>(kCtx * sc.hk * sc.d), sc.seed + 4);
+  // B differs from A ONLY on context rows [0, kOutside).
+  auto ctx_k_b = ctx_k_a;
+  auto ctx_v_b = ctx_v_a;
+  auto far_k = RandF32(static_cast<size_t>(kOutside * sc.hk * sc.d), sc.seed + 77);
+  auto far_v = RandF32(static_cast<size_t>(kOutside * sc.hk * sc.d), sc.seed + 78);
+  for (size_t i = 0; i < far_k.size(); ++i) {
+    ctx_k_b[i] = far_k[i];
+    ctx_v_b[i] = far_v[i];
+  }
+  // The fixture's own precondition, asserted rather than assumed: the two
+  // contexts DO differ outside the window and are byte-equal inside it.
+  int differing = 0;
+  for (size_t i = 0; i < far_k.size(); ++i) differing += (ctx_k_a[i] != ctx_k_b[i]) ? 1 : 0;
+  REQUIRE(differing > 0);
+  for (size_t i = far_k.size(); i < ctx_k_a.size(); ++i) REQUIRE(ctx_k_a[i] == ctx_k_b[i]);
+
+  SUBCASE("the CONTROL: with NO window the same pair MOVES the output") {
+    Scenario full = sc;
+    full.window = 0;
+    const auto a = RunPagedCpu(full, ctx_k_a, ctx_v_a, blk_q, blk_k, blk_v);
+    const auto b = RunPagedCpu(full, ctx_k_b, ctx_v_b, blk_q, blk_k, blk_v);
+    int moved = 0;
+    for (size_t i = 0; i < a.size(); ++i) moved += (a[i] != b[i]) ? 1 : 0;
+    // If this is 0 the equality subcases below prove nothing, so it is a
+    // REQUIRE and not a CHECK.
+    REQUIRE(moved > 0);
+  }
+
+  SUBCASE("NON-CAUSAL + window: the far context cannot reach the output") {
+    const auto a = RunPagedCpu(sc, ctx_k_a, ctx_v_a, blk_q, blk_k, blk_v);
+    const auto b = RunPagedCpu(sc, ctx_k_b, ctx_v_b, blk_q, blk_k, blk_v);
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) REQUIRE(a[i] == b[i]);
+  }
+
+  SUBCASE("CAUSAL + window: unchanged, and still hides the far context") {
+    Scenario causal = sc;
+    causal.causal = true;
+    const auto a = RunPagedCpu(causal, ctx_k_a, ctx_v_a, blk_q, blk_k, blk_v);
+    const auto b = RunPagedCpu(causal, ctx_k_b, ctx_v_b, blk_q, blk_k, blk_v);
+    for (size_t i = 0; i < a.size(); ++i) REQUIRE(a[i] == b[i]);
+  }
+}
+
+// The pair the published checkpoint resolves, run through the SAME
+// paged-vs-materialized equivalence the battery above uses: the paged op and
+// the dense `DFlashBlockAttention` must agree on the non-causal symmetric
+// window too, or the two arms of the draft have parted. Window 6 over a 23 + 9
+// combined sequence BINDS on both sides.
+TEST_CASE("dflash-paged-block-attn: NON-CAUSAL with a BINDING window matches the combined path") {
+  RunScenario({8, 8, 2, 32, 4, 6, false, {23}, 4242});
+  // GQA + multi-page + ragged, so the bound is exercised past one page and past
+  // one request.
+  RunScenario({8, 8, 1, 16, 4, 5, false, {19, 11}, 4243});
+}

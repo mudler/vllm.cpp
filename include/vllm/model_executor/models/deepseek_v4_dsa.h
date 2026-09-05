@@ -264,6 +264,92 @@ std::vector<float> CompressorLayerStep(
     std::vector<float>* state_score, std::vector<float>* comp_rows,
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
-    int64_t sliding_window, float eps, float scale);
+    int64_t sliding_window, float eps, float scale,
+    // The pooled row's rope tail is rotated at the WINDOW'S BASE position
+    // (`fused_compress_quant_cache.py:272-297`). 0 leaves it unrotated.
+    int64_t rope_dim = 0, double rope_theta = 10000.0,
+    // W3 (#2286): the compressed rows this step may attend, as compressed-row
+    // indices with `-1` padding. NULL means ALL closed rows, which is the
+    // `cr == 128` family; a selection is the `cr == 4` family, where the indexer
+    // chooses. That is the ONLY difference between the two at the attention.
+    const std::vector<int64_t>* selected = nullptr);
+
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — the INDEXER's compressed keys.
+//
+// The indexer owns a second `DeepseekCompressor` at `head_dim = index_head_dim`
+// (`attention.py:768-776`), and its pooled rows are the KEYS its top-k scores
+// against -- not an attention contributor. So this produces keys and nothing
+// else; the selection consumes them.
+//
+// It is the SAME cycle: both compressors go through `compress_norm_rope_store_*`
+// and the dispatch names the split ("triton (indexer/AMD)",
+// `compressor.py:414-415`). So the rope rule is identical -- the last
+// `rope_head_dim` elements, at `(position / compress_ratio) * compress_ratio`.
+//
+// `rope_dim` is the MODEL's `qk_rope_head_dim`, not a function of
+// `index_head_dim`: `compressor.py:240` sets `self.rope_head_dim =
+// config.qk_rope_head_dim` whatever the compressor's own head is. At the real
+// geometry that is 64 inside a 128-wide indexer head.
+//
+// `coff` is always 2 here, because the indexer exists only at
+// `compress_ratio == 4` (`attention.py:274`).
+//
+//   returns the compressed key rows emitted this step, [k * index_head_dim]
+std::vector<float> IndexerCompressedKeys(
+    const std::vector<float>& x, const std::vector<float>& idx_wk,
+    const std::vector<float>& idx_comp_wgate, const std::vector<float>& idx_comp_ape,
+    const std::vector<float>& idx_comp_norm_weight, std::vector<float>* state_kv,
+    std::vector<float>* state_score, const std::vector<int64_t>& positions,
+    int64_t num_tokens, int64_t hidden, int64_t index_head_dim, int64_t compress_ratio,
+    int64_t rope_dim, double rope_theta, float eps);
+
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — the indexer's SELECTION, over compressed
+// rows.
+//
+// `_fill_short_context_topk_indices` (`attention.py:71-87`) fixes what an index
+// means: `num_compressed = (position + 1) / compress_ratio` rows are available at
+// a position, a selection index addresses one of THOSE, and `-1` pads the row out
+// to `top_k`. So this returns compressed-row indices, never token indices, and a
+// caller must honour `-1` as padding rather than read it as row zero.
+//
+// The scores are `q . k` over the indexer's heads, folded by the per-head
+// weights, which is the same shape the per-token path used -- only the candidate
+// set changes, from tokens to closed compressed rows.
+//
+//   iq        [num_tokens, index_n_heads * index_head_dim]
+//   keys      [n_rows, index_head_dim]  the compressed keys, oldest first
+//   folded    [num_tokens, index_n_heads]  the weights_proj fold
+//   returns   [num_tokens * top_k] compressed-row indices, `-1` padded
+std::vector<int64_t> IndexerSelectCompressed(const std::vector<float>& iq,
+                                             const std::vector<float>& keys,
+                                             const std::vector<float>& folded,
+                                             const std::vector<int64_t>& positions,
+                                             int64_t num_tokens, int64_t n_rows,
+                                             int64_t index_n_heads,
+                                             int64_t index_head_dim, int64_t top_k,
+                                             int64_t compress_ratio);
+
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — gather the SELECTED compressed rows.
+//
+// The `cr == 4` family attends its sliding window plus the compressed rows the
+// indexer CHOSE, where the `cr == 128` family attends the window plus ALL closed
+// rows. So the only difference at the attention is which rows reach
+// `MergeWindowAndCompressed`, and this is what narrows them.
+//
+// `-1` IS PADDING and is dropped, never read as row zero. A selection row is
+// padded out to `top_k` whenever fewer rows have closed than `top_k`, so the
+// padded slots are the common case rather than an edge one, and treating one as a
+// row attends a real key the indexer did not choose.
+//
+// Rows come back in SELECTION order, best first, because that is the order the
+// indices arrive in; the merge is order-independent, so this is a property of the
+// buffer rather than a requirement on it.
+//
+//   comp_rows  [n_rows, head_dim]   every closed row, oldest first
+//   sel        [top_k]              one token's indices, `-1` padded
+//   returns    [k, head_dim] with k <= top_k, the selected rows compacted
+std::vector<float> GatherSelectedCompressed(const std::vector<float>& comp_rows,
+                                            const std::vector<int64_t>& sel,
+                                            int64_t n_rows, int64_t head_dim);
 
 }  // namespace vllm::deepseek_v4

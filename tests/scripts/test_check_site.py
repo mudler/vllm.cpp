@@ -14,11 +14,32 @@ import sys
 import tempfile
 import unittest
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check-site.py"
+
+# The site is rendered under a path prefix, exactly as GitHub Pages serves it.
+# `BASE_PATH` is derived from `BASE_URL` rather than written twice, so the
+# rendered href and the on-disk lookup cannot drift apart.
+BASE_URL = "https://example.invalid/vllm.cpp/"
+BASE_PATH = urlparse(BASE_URL).path
+
+
+def benchmark_slug(href: str) -> str | None:
+    """The detail-page slug an index href names, or None if it names none.
+
+    A benchmark detail page is emitted at `<base>/docs/benchmarks/<slug>/`, so
+    the slug is the last path segment of an href whose parent is that section.
+    The index page itself, a link back out to another doc and an off-site URL
+    all answer None.
+    """
+    path = PurePosixPath(urlparse(href).path.rstrip("/"))
+    parent = path.parent
+    if parent.name != "benchmarks" or parent.parent.name != "docs":
+        return None
+    return path.name
 
 
 class LinkCollector(HTMLParser):
@@ -136,7 +157,7 @@ class SiteGuardTests(unittest.TestCase):
                 "--destination",
                 str(public),
                 "--baseURL",
-                "https://example.invalid/vllm.cpp/",
+                BASE_URL,
             ],
             capture_output=True,
             text=True,
@@ -147,19 +168,57 @@ class SiteGuardTests(unittest.TestCase):
         index = public / "docs" / "benchmarks" / "index.html"
         parser = LinkCollector()
         parser.feed(index.read_text(encoding="utf-8"))
+
+        # The population is every `docs/benchmarks/*.md`, section pages
+        # (`at-a-glance`, `how-we-measure`, `memory`, `open-gaps`, `reproduce`)
+        # included, and NOT only the files whose stem is a benchmark ID.
+        # `docs/BENCHMARKS.md` carries one table row per file in that directory,
+        # and `scripts/check-benchmark-index.py` already refuses an index row
+        # with no detail file and a detail file with no index row. So the source
+        # side of this relation is a bijection by contract, and the question
+        # left for a RENDERED page is whether Hugo carried it across intact.
         detail_slugs = {
             path.stem for path in (ROOT / "docs" / "benchmarks").glob("*.md")
         }
-        detail_hrefs = [
-            href
-            for href in parser.table_hrefs
-            if Path(urlparse(href).path.rstrip("/")).name in detail_slugs
+        # DERIVED from the URL shape, never from `detail_slugs`: filtering the
+        # hrefs by the slugs they are about to be compared against would make a
+        # link to a page that does not exist vanish from the comparison instead
+        # of failing it.
+        linked = [
+            slug
+            for slug in (benchmark_slug(href) for href in parser.table_hrefs)
+            if slug is not None
         ]
-        self.assertEqual(len(detail_hrefs), 10)
-        for href in detail_hrefs:
+
+        # Non-emptiness first, and explicitly. Set equality over two empty sets
+        # is a gate with its mute switch on: a render that emitted no table at
+        # all, or a `docs/benchmarks/` that lost every file, would satisfy the
+        # comparison below and report a pass.
+        self.assertTrue(
+            detail_slugs, "docs/benchmarks/ holds no detail pages to link"
+        )
+        self.assertTrue(
+            linked, "the rendered benchmark index links no detail page at all"
+        )
+        # Both sides are read off the tree and the render, so publishing a
+        # benchmark moves both together and no literal here has to be edited.
+        # Duplicates are deliberately tolerated: one detail page may legitimately
+        # be linked from another row's prose, and a duplicate INDEX ROW is
+        # already refused by scripts/check-benchmark-index.py.
+        self.assertEqual(
+            set(linked),
+            detail_slugs,
+            "the rendered benchmark index and docs/benchmarks/ disagree: "
+            f"linked but absent from the tree {sorted(set(linked) - detail_slugs)}, "
+            f"present in the tree but unlinked {sorted(detail_slugs - set(linked))}",
+        )
+
+        for href in parser.table_hrefs:
+            if benchmark_slug(href) is None:
+                continue
             emitted = (
                 public
-                / urlparse(href).path.removeprefix("/vllm.cpp/")
+                / urlparse(href).path.removeprefix(BASE_PATH)
                 / "index.html"
             )
             self.assertTrue(

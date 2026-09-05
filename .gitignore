@@ -38,3 +38,9 @@ generated/
 # Derived from `gh issue list` by scripts/agent-issue-index.py --refresh.
 # Untracked on purpose: a tracked index is a surface every PR writes (#2290).
 .agents/issue-index.generated.md
+
+# Pull-request body drafts. `d8b7ddc26` untracked these behind a per-worktree
+# `.git/info/exclude`, which is NOT shared, and the very next commit
+# (`651994a03`) re-added all three from another worktree. The ignore has to be
+# tracked to hold. Write a PR body OUTSIDE the repository.
+.prbody/

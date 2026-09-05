@@ -61,6 +61,17 @@ function(vllm_cpp_set_warnings target)
     # so the CXX genex above does not reach it. Without this line the Metal TUs
     # would be the only unwarned code in the tree (BACKEND-METAL-MLX W0).
     $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra -Werror>
-      $<$<COMPILE_LANGUAGE:CUDA>:-Werror=all-warnings>)
+      $<$<COMPILE_LANGUAGE:CUDA>:-Werror=all-warnings>
+    # HIP (.hip -- the ROCm backend) is a THIRD separate COMPILE_LANGUAGE, added
+    # by enable_language(HIP) at CMakeLists.txt:404, and the 23 .hip sources land
+    # on the `vllm` target this function is called on. Without this line they are
+    # the only project code whose diagnostics cannot fail a build, so a bare
+    # `hipError_t` warns and the build goes green (#2713).
+    #
+    # ${_vllm_cpp_werror}, not a literal -Werror: a HIP build under a sanitizer
+    # lane needs the diagnostics visible and non-fatal for the same reason the
+    # CXX arm does. ${_vllm_cpp_array_bounds} is NOT carried over -- it exists for
+    # GCC 15 and later, and the HIP compiler is clang.
+      $<$<COMPILE_LANGUAGE:HIP>:-Wall -Wextra ${_vllm_cpp_werror}>)
   endif()
 endfunction()

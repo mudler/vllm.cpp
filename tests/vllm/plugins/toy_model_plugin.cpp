@@ -55,13 +55,20 @@ vllm::v1::KVCacheConfig ToyMakeKVCache(const vllm::HfConfig& /*config*/,
   return vllm::v1::KVCacheConfig{};
 }
 
+// DESIGNATED, like the 36 other `ModelFactory` initializers in the tree (every
+// one of them under src/vllm/model_executor/models/). This site used
+// POSITIONAL `/*field=*/value` comments and #2379 inserted three function
+// pointers (`encode_mm`, `embed_mm`, `mrope_prompt_positions`) ahead of
+// `is_dense_model`, so `true` landed in `encode_mm` and every CPU CI lane failed
+// to compile. It was caught only because `bool` does not convert to a function
+// pointer; two adjacent same-typed fields would have MISASSIGNED SILENTLY.
 constexpr vllm::ModelFactory kToyFactory{
-    /*parse_config=*/ToyParseConfig,
-    /*load_weights=*/ToyLoadWeights,
-    /*prepare=*/ToyPrepare,
-    /*forward=*/ToyForward,
-    /*make_kv_cache=*/ToyMakeKVCache,
-    /*is_dense_model=*/true,
+    .parse_config = ToyParseConfig,
+    .load_weights = ToyLoadWeights,
+    .prepare = ToyPrepare,
+    .forward = ToyForward,
+    .make_kv_cache = ToyMakeKVCache,
+    .is_dense_model = true,
 };
 
 constexpr vllm::ModelInfo kToyInfo{

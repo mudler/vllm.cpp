@@ -50,6 +50,9 @@ PASSING_CI = """jobs:
       - name: The SGLang lease identity gate detects a tree that is not the pin
         run: |
           python3 tests/scripts/test_sglang_lease_identity.py
+      - name: The committed LTX-2 oracle goldens still hash to what records them
+        run: |
+          python3 tests/scripts/test_ltx2_oracle_goldens.py
 """
 
 PASSING_PREFLIGHT = """CHECKERS=(
@@ -58,6 +61,7 @@ PASSING_PREFLIGHT = """CHECKERS=(
 SUITES=(
   test_check_test_registration
   test_sglang_lease_identity
+  test_ltx2_oracle_goldens
 )
 for checker in "${CHECKERS[@]}"; do
   python3 "scripts/$checker.py"
@@ -329,6 +333,42 @@ class WiringMutationTests(unittest.TestCase):
             self.preflight,
             mutated,
             "test_sglang_lease_identity is missing from the CI suite lane",
+        )
+
+    # The SECOND pinned suite (#2553).  These two cases are what makes widening
+    # `REQUIRED_SUITE_REGISTRATIONS` a semantic change rather than a fixture
+    # edit.  Adding the suite to `PASSING_CI` and `PASSING_PREFLIGHT` alone is
+    # symmetric and additive, so the base checker -- which pins only
+    # `test_sglang_lease_identity` -- stays green on it and the widening carries
+    # no evidence at all; `check-pr-size.py` rejected exactly that, because a
+    # test whose only job is to KEEP an existing case green cannot fail for the
+    # intended reason.  Deleting one lane's registration must name THIS suite.
+    #
+    # They assert the checker's output on a mutated input, never
+    # `"test_ltx2_oracle_goldens" in mod.REQUIRED_SUITE_REGISTRATIONS`, which
+    # would be a tautology over the constant it is supposed to hold.  And they
+    # are deliberately not named `test_M*`: `mutation_suite_integrity_errors`
+    # requires the `test_M*` set to equal the digest-pinned manifest exactly, so
+    # an M-number here would drag `check_test_registration_mutations.txt` and
+    # `MUTATION_MANIFEST_SHA256` into a change that is not about the manifest.
+    def test_pinned_ltx2_goldens_suite_absent_from_ci_is_named(self) -> None:
+        mutated = self.ci.replace(
+            "          python3 tests/scripts/test_ltx2_oracle_goldens.py\n", ""
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(
+            self.preflight,
+            mutated,
+            "test_ltx2_oracle_goldens is missing from the CI suite lane",
+        )
+
+    def test_pinned_ltx2_goldens_suite_absent_from_preflight_is_named(self) -> None:
+        mutated = self.preflight.replace("  test_ltx2_oracle_goldens\n", "")
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(
+            mutated,
+            self.ci,
+            "test_ltx2_oracle_goldens is missing from preflight SUITES",
         )
 
     def test_M18_ci_commands_behind_false_shell_branch_fail(self) -> None:

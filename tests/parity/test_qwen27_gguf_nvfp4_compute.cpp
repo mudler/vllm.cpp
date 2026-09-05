@@ -52,6 +52,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/sampling_params.h"
+#include "vllm/platforms/interface.h"
 
 namespace fs = std::filesystem;
 
@@ -161,7 +162,7 @@ TEST_CASE("gguf nvfp4 compute: the dense loader really produces fp4-resident "
 
   // The fp4 arm. Built explicitly rather than from the environment so the case
   // states the policy it is gating instead of inheriting it.
-  vllm::GgufLoadPolicy fp4_pol = vllm::GgufLoadPolicy::FromEnv();
+  vllm::GgufLoadPolicy fp4_pol = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
   fp4_pol.nvfp4_fp4 = true;
   fp4_pol.nvfp4_w4a4 = true;
   int routed_fp4 = 0;

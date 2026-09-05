@@ -177,8 +177,20 @@ void MulColVecF32KernelCuda(Queue& q, Tensor& x, const Tensor& col) {
 // ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh]. Thread per
 // output element (flat index over T*Hq*Dh); (i,h,d) recovered from it.
-template <typename Tin>
-__global__ void AttnGateSplitKernel(float* q_out, float* gate_out, const Tin* qgate, int64_t t,
+//
+// `Tout` is the QUERY half's store width, and it exists for the same reason
+// `Tin` does. `Tin` was templated because VT_BF16_GEMM_OUT makes the `q_proj`
+// GEMM emit bf16; `Tout` is templated because vLLM's `torch.chunk` does not
+// widen either side of that split (qwen3_next.py:430 at vLLM `cdefd9d499`, an
+// unpinned forward reference), so a caller whose qgate is already the bf16 model
+// dtype has nothing to gain from an f32 destination and pays twice the bytes for
+// it. Both arms read through Load()/Store(), so `Tout = float` is byte-identical
+// to the hardcoded `float*` this replaces.
+//
+// `gate_out` stays `float*` on both arms: `vt::SigmoidGateBf16` takes an f32
+// gate on all four of its backends. #2488 carries that half.
+template <typename Tout, typename Tin>
+__global__ void AttnGateSplitKernel(Tout* q_out, float* gate_out, const Tin* qgate, int64_t t,
                                     int64_t hq, int64_t dh) {
   const int64_t n = t * hq * dh;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -193,20 +205,33 @@ __global__ void AttnGateSplitKernel(float* q_out, float* gate_out, const Tin* qg
   }
 }
 
+template <typename Tin>
+void LaunchAttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate, int64_t t,
+                         int64_t hq, int64_t dh, int64_t n) {
+  switch (q_out.dtype) {
+    case DType::kF32:
+      AttnGateSplitKernel<float, Tin><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+          q_out.Ptr<float>(), gate_out.Ptr<float>(), qgate.Ptr<Tin>(), t, hq, dh);
+      break;
+    case DType::kBF16:
+      AttnGateSplitKernel<__nv_bfloat16, Tin><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+          q_out.Ptr<__nv_bfloat16>(), gate_out.Ptr<float>(), qgate.Ptr<Tin>(), t, hq, dh);
+      break;
+    default: VT_CHECK(false, "attn_gate_split: q_out must be f32 or bf16");
+  }
+}
+
 void AttnGateSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
   const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
   const int64_t n = t * hq * dh;
   if (n == 0) return;
-  // qgate may be f32 (default) or bf16 (VT_BF16_GEMM_OUT — the q_proj GEMM emits bf16);
-  // q_out/gate_out stay f32 (the qk-norm/RoPE chain reads f32). Load() upcasts.
+  // qgate may be f32 (default) or bf16 (VT_BF16_GEMM_OUT — the q_proj GEMM emits bf16),
+  // and q_out may be f32 (Qwen3.5, whose qk-norm/RoPE chain reads f32) or bf16 (qwen4_exp,
+  // whose model dtype it is). gate_out is f32 on every arm. Load()/Store() convert.
   switch (qgate.dtype) {
-    case DType::kF32:
-      AttnGateSplitKernel<float><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
-          q_out.Ptr<float>(), gate_out.Ptr<float>(), qgate.Ptr<float>(), t, hq, dh);
-      break;
+    case DType::kF32: LaunchAttnGateSplit<float>(q, q_out, gate_out, qgate, t, hq, dh, n); break;
     case DType::kBF16:
-      AttnGateSplitKernel<__nv_bfloat16><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
-          q_out.Ptr<float>(), gate_out.Ptr<float>(), qgate.Ptr<__nv_bfloat16>(), t, hq, dh);
+      LaunchAttnGateSplit<__nv_bfloat16>(q, q_out, gate_out, qgate, t, hq, dh, n);
       break;
     default: VT_CHECK(false, "attn_gate_split: qgate must be f32 or bf16");
   }

@@ -32,6 +32,7 @@
 #include "vt/dtype.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/unaligned.h"
 
 namespace vt::cpu {
 namespace {
@@ -120,14 +121,35 @@ constexpr bool HadHalfOut(HadIo io) {
   return io == HadIo::kHalfHalf || io == HadIo::kFloatHalf;
 }
 
-void HadRowBlock(HadIo io, const void* in, void* out, const uint16_t* pre, const uint16_t* post,
+// THE SCALES ARE WEIGHTS AND MAY SIT AT ANY BYTE. `pre` and `post` are `suh`
+// and `svh`, which `BorrowStTensorBytes` hands over as the mapping's own bytes.
+// A safetensors payload starts at `8 + <JSON header length>`
+// (`safetensors_reader.cpp:78`) and a header length is arbitrary, so an F16
+// scale vector begins on an odd byte in roughly half of all checkpoints. That is
+// an ordinary file, not a corrupt one. They are therefore `const void*` here and
+// are read one element at a time with `vt::LoadUnaligned`: forming a
+// `const uint16_t*` over an odd address is undefined even where x86 executes
+// the load, and `-fsanitize=alignment` aborted `test_qwen35_exl3` on exactly
+// this operand (#2558). The load is free — at `-O2` it is the same `movzwl`
+// the raw index compiled to.
+//
+// `in` and `out` KEEP their typed pointers, and the asymmetry is the point:
+// they are the activation and the engine's own scratch, which
+// `cpu_backend.cpp:20,42` allocates through `std::aligned_alloc(64, ...)`. This
+// is the polarity `cpu_layernorm.cpp:44-46` states — an output is an
+// engine-allocated buffer, never a borrowed file mapping.
+inline uint16_t ScaleAt(const void* scales, int64_t i) {
+  return LoadUnaligned<uint16_t>(static_cast<const unsigned char*>(scales) + i * 2);
+}
+
+void HadRowBlock(HadIo io, const void* in, void* out, const void* pre, const void* post,
                  float r_scale, int64_t block_base) {
   float buf[128];
   if (HadHalfIn(io)) {
     const uint16_t* p = static_cast<const uint16_t*>(in);
     for (int i = 0; i < 128; ++i) {
       // pre_scale rides an fp16 multiply BEFORE the widen (hadamard_inner.cuh:112-114).
-      const uint16_t v = pre != nullptr ? MulF16(p[i], pre[block_base + i]) : p[i];
+      const uint16_t v = pre != nullptr ? MulF16(p[i], ScaleAt(pre, block_base + i)) : p[i];
       buf[i] = F16ToF32(v);
     }
   } else {
@@ -135,7 +157,7 @@ void HadRowBlock(HadIo io, const void* in, void* out, const uint16_t* pre, const
     for (int i = 0; i < 128; ++i) {
       // the float inners widen the fp16 scale and multiply in f32
       // (hadamard_inner.cuh:171-174).
-      buf[i] = pre != nullptr ? p[i] * F16ToF32(pre[block_base + i]) : p[i];
+      buf[i] = pre != nullptr ? p[i] * F16ToF32(ScaleAt(pre, block_base + i)) : p[i];
     }
   }
 
@@ -145,19 +167,19 @@ void HadRowBlock(HadIo io, const void* in, void* out, const uint16_t* pre, const
   if (!HadHalfOut(io)) {
     float* o = static_cast<float*>(out);
     for (int i = 0; i < 128; ++i)
-      o[i] = post != nullptr ? res[i] * F16ToF32(post[block_base + i]) : res[i];
+      o[i] = post != nullptr ? res[i] * F16ToF32(ScaleAt(post, block_base + i)) : res[i];
   } else {
     // Both half-output inners round FIRST and apply the post-scale as an fp16
     // multiply afterwards (hadamard_inner.cuh:137-146 and :264-278).
     uint16_t* o = static_cast<uint16_t*>(out);
     for (int i = 0; i < 128; ++i) {
       const uint16_t r = F32ToF16(res[i]);
-      o[i] = post != nullptr ? MulF16(r, post[block_base + i]) : r;
+      o[i] = post != nullptr ? MulF16(r, ScaleAt(post, block_base + i)) : r;
     }
   }
 }
 
-void HadRows(HadIo io, const void* in, void* out, const uint16_t* pre, const uint16_t* post,
+void HadRows(HadIo io, const void* in, void* out, const void* pre, const void* post,
              float r_scale, int64_t rows, int64_t cols) {
   const bool half_in = HadHalfIn(io);
   const bool half_out = HadHalfOut(io);
@@ -177,8 +199,10 @@ void Exl3HadR128KernelCpu(Queue& q, Tensor& out, const Tensor& in, const Exl3Had
   const int64_t rows = in.shape[0];
   const int64_t cols = in.shape[1];
   if (rows == 0 || cols == 0) return;
-  const uint16_t* pre = args.pre_scale != nullptr ? args.pre_scale->Ptr<uint16_t>() : nullptr;
-  const uint16_t* post = args.post_scale != nullptr ? args.post_scale->Ptr<uint16_t>() : nullptr;
+  // `.data`, not `Ptr<uint16_t>()`: these scales may be borrowed mapping bytes
+  // at an odd address, so no typed pointer is formed over them at all.
+  const void* pre = args.pre_scale != nullptr ? args.pre_scale->data : nullptr;
+  const void* post = args.post_scale != nullptr ? args.post_scale->data : nullptr;
   const float r_scale = args.scale * kInvSqrt128;  // hadamard.cu:107
   HadRows(in.dtype == DType::kF16 ? HadIo::kHalfHalf : HadIo::kFloatFloat, in.data, out.data, pre,
           post, r_scale, rows, cols);
@@ -204,13 +228,18 @@ void Exl3GemmKernelCpu(Queue& q, Tensor& c, const Tensor& a, const Tensor& trell
   if (m == 0 || k == 0 || n == 0) return;
 
   // 1. the input transform, into the caller's scratch (which may alias A).
-  HadRows(HadIo::kHalfHalf, a.data, a_had.data, suh.Ptr<uint16_t>(), nullptr, kInvSqrt128, m, k);
+  HadRows(HadIo::kHalfHalf, a.data, a_had.data, suh.data, nullptr, kInvSqrt128, m, k);
 
   // 2. the matmul against the decoded trellis, f32 accumulators.
   const uint16_t* ah = a_had.Ptr<uint16_t>();
-  const uint16_t* tw = trellis.Ptr<uint16_t>();
+  // The trellis is kI8 — opaque BYTES whose alignment requirement is 1 — and it
+  // is borrowed straight out of the mapping, so the tile cursor advances in
+  // bytes. `tile_bytes` is `tile_words * sizeof(uint16_t)`, and that factor of
+  // two is the one thing this cursor must not lose (#2558).
+  const auto* tw = static_cast<const unsigned char*>(trellis.data);
   const int64_t tiles_n = n / 16;
   const int64_t tile_words = 16 * static_cast<int64_t>(args.bits);
+  const int64_t tile_bytes = tile_words * static_cast<int64_t>(sizeof(uint16_t));
   std::vector<float> raw(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
 
   // PARALLEL OVER OUTPUT TILES, and the loop order is inverted for it: `tj`
@@ -230,7 +259,7 @@ void Exl3GemmKernelCpu(Queue& q, Tensor& c, const Tensor& a, const Tensor& trell
     float tile[256];
     for (int64_t tj = j0; tj < j1; ++tj) {
       for (int64_t ti = 0; ti < k / 16; ++ti) {
-        Exl3DecodeTile(tw + (ti * tiles_n + tj) * tile_words, args.bits, args.codebook, tile);
+        Exl3DecodeTile(tw + (ti * tiles_n + tj) * tile_bytes, args.bits, args.codebook, tile);
         for (int64_t r = 0; r < m; ++r) {
           float* orow = &raw[static_cast<size_t>(r * n + tj * 16)];
           for (int rr = 0; rr < 16; ++rr) {
@@ -247,7 +276,7 @@ void Exl3GemmKernelCpu(Queue& q, Tensor& c, const Tensor& a, const Tensor& trell
   // 3. the output transform. The device holds this tile in f32 shared memory and
   // finishes with had_ff (f32 C) or had_fh (fp16 C) — the same two arms here.
   HadRows(c.dtype == DType::kF32 ? HadIo::kFloatFloat : HadIo::kFloatHalf, raw.data(), c.data,
-          nullptr, svh.Ptr<uint16_t>(), kInvSqrt128, m, n);
+          nullptr, svh.data, kInvSqrt128, m, n);
 }
 
 // ── the fused MoE MLP, CPU arm (exl3_moe_kernel.cuh:17-283) ──────────────────
@@ -273,16 +302,19 @@ void Exl3GemmKernelCpu(Queue& q, Tensor& c, const Tensor& a, const Tensor& trell
 // the down GEMM's load; the loop arm widens to f32, activates in f32 and rounds
 // back. Same algebra, different rounding, and the spec's tier 4 is the bound on
 // the difference.
-void MoeGemm(const uint16_t* a_had, const uint16_t* trellis, float* raw, int64_t m, int64_t k,
+void MoeGemm(const uint16_t* a_had, const void* trellis, float* raw, int64_t m, int64_t k,
              int64_t n, int bits, int codebook) {
-  // The same tile walk `Exl3GemmKernelCpu` step 2 performs, over an m-row batch.
+  // The same tile walk `Exl3GemmKernelCpu` step 2 performs, over an m-row batch,
+  // and the same byte cursor for the same reason: an expert's trellis is kI8
+  // borrowed straight out of the mapping (#2558).
   const int64_t tiles_n = n / 16;
-  const int64_t tile_words = 16 * static_cast<int64_t>(bits);
+  const int64_t tile_bytes = 16 * static_cast<int64_t>(bits) * static_cast<int64_t>(sizeof(uint16_t));
+  const auto* tw = static_cast<const unsigned char*>(trellis);
   float tile[256];
   for (int64_t i = 0; i < m * n; ++i) raw[i] = 0.0f;
   for (int64_t ti = 0; ti < k / 16; ++ti) {
     for (int64_t tj = 0; tj < tiles_n; ++tj) {
-      Exl3DecodeTile(trellis + (ti * tiles_n + tj) * tile_words, bits, codebook, tile);
+      Exl3DecodeTile(tw + (ti * tiles_n + tj) * tile_bytes, bits, codebook, tile);
       for (int64_t r = 0; r < m; ++r) {
         float* orow = &raw[r * n + tj * 16];
         for (int rr = 0; rr < 16; ++rr) {
@@ -371,8 +403,11 @@ void Exl3MoeMlpKernelCpu(Queue& q, Tensor& output_state, const Tensor& hidden_st
   const uint16_t* hid = hidden_state.Ptr<uint16_t>();
   float* out = output_state.Ptr<float>();
 
-  auto table = [](const Tensor* tt, int64_t e) -> const uint16_t* {
-    return reinterpret_cast<const uint16_t*>(
+  // `const void*`, not `const uint16_t*`: every one of these is a borrowed
+  // safetensors payload and may begin at an odd byte, so no typed pointer is
+  // formed over one (#2558). The callees below take byte cursors.
+  auto table = [](const Tensor* tt, int64_t e) -> const void* {
+    return reinterpret_cast<const void*>(
         static_cast<uintptr_t>(tt->Ptr<int64_t>()[e]));
   };
 
@@ -398,15 +433,15 @@ void Exl3MoeMlpKernelCpu(Queue& q, Tensor& output_state, const Tensor& hidden_st
     // per-expert path covers the second case, exactly as upstream's does.
     if (tokens == 0 || tokens > max_rows) continue;
 
-    const uint16_t* g_tr = table(tables.gate_trellis, e);
-    const uint16_t* g_su = table(tables.gate_suh, e);
-    const uint16_t* g_sv = table(tables.gate_svh, e);
-    const uint16_t* u_tr = table(tables.up_trellis, e);
-    const uint16_t* u_su = table(tables.up_suh, e);
-    const uint16_t* u_sv = table(tables.up_svh, e);
-    const uint16_t* d_tr = table(tables.down_trellis, e);
-    const uint16_t* d_su = table(tables.down_suh, e);
-    const uint16_t* d_sv = table(tables.down_svh, e);
+    const void* g_tr = table(tables.gate_trellis, e);
+    const void* g_su = table(tables.gate_suh, e);
+    const void* g_sv = table(tables.gate_svh, e);
+    const void* u_tr = table(tables.up_trellis, e);
+    const void* u_su = table(tables.up_suh, e);
+    const void* u_sv = table(tables.up_svh, e);
+    const void* d_tr = table(tables.down_trellis, e);
+    const void* d_su = table(tables.down_suh, e);
+    const void* d_sv = table(tables.down_svh, e);
 
     // stage 1: gather + input Hadamard, one 128-block per warp upstream.
     for (int64_t r = 0; r < tokens; ++r) {

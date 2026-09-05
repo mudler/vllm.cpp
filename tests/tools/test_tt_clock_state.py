@@ -5,6 +5,7 @@ by the mutation driver: change a threshold here and its paired case must
 fail. The busy proxy's /proc walk runs against THIS process, not a mock.
 """
 
+import argparse
 import json
 import os
 import pathlib
@@ -478,6 +479,326 @@ class CrossArmRatioArithmetic(unittest.TestCase):
         all_reasons = ttc.clock_state_reasons(wb, wa)
         self.assertFalse(any("median offset" in r for r in all_reasons),
                         "Sub-threshold offset should not produce a reason")
+
+
+class FirmwareLimitReadout(unittest.TestCase):
+    def test_sample_from_snapshot_hex_limit(self):
+        """Snapshot with limits.asic_fmax='0x546' produces fw_aiclk_limit_max=1350."""
+        snapshot = {
+            "device_info": [{
+                "smbus_telem": {
+                    "AICLK": "0x320",
+                    "ARCCLK": "0x320",
+                    "AXICLK": "0x3c0",
+                    "VCORE": "0x2d6",
+                    "TDP": "0x13",
+                    "TDC": "0x1b",
+                    "ASIC_TEMPERATURE": "0x3474da",
+                    "FAN_RPM": "0x83b",
+                    "BOARD_ID_HIGH": "0x403",
+                    "BOARD_ID_LOW": "0x3191406b",
+                    "FLASH_BUNDLE_VERSION": "19.7.1.0",
+                },
+                "limits": {
+                    "asic_fmax": "0x546",
+                },
+            }],
+            "host_sw_vers": {
+                "tt_smi": "6.2.1",
+                "tt_umd": "0.9.9",
+            },
+            "host_info": {
+                "Driver": "TT-KMD 2.10.1-pre",
+            },
+        }
+        sample = ttc._sample_from_snapshot(snapshot)
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample["fw_aiclk_limit_max"], 1350)
+        self.assertEqual(sample["aiclk"], 800)  # 0x320
+
+    def test_sample_from_snapshot_decimal_limit(self):
+        """Snapshot with limits.asic_fmax='1350' (decimal string) produces 1350."""
+        snapshot = {
+            "device_info": [{
+                "smbus_telem": {
+                    "AICLK": "0x320",
+                    "ARCCLK": "0x320",
+                    "AXICLK": "0x3c0",
+                    "VCORE": "0x2d6",
+                    "TDP": "0x13",
+                    "TDC": "0x1b",
+                    "ASIC_TEMPERATURE": "0x3474da",
+                    "FAN_RPM": "0x83b",
+                    "BOARD_ID_HIGH": "0x403",
+                    "BOARD_ID_LOW": "0x3191406b",
+                    "FLASH_BUNDLE_VERSION": "19.7.1.0",
+                },
+                "limits": {
+                    "asic_fmax": "1350",
+                },
+            }],
+            "host_sw_vers": {
+                "tt_smi": "6.2.1",
+                "tt_umd": "0.9.9",
+            },
+            "host_info": {
+                "Driver": "TT-KMD 2.10.1-pre",
+            },
+        }
+        sample = ttc._sample_from_snapshot(snapshot)
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample["fw_aiclk_limit_max"], 1350)
+
+    def test_sample_from_snapshot_missing_limits(self):
+        """Snapshot without limits block produces fw_aiclk_limit_max=None."""
+        snapshot = {
+            "device_info": [{
+                "smbus_telem": {
+                    "AICLK": "0x320",
+                    "ARCCLK": "0x320",
+                    "AXICLK": "0x3c0",
+                    "VCORE": "0x2d6",
+                    "TDP": "0x13",
+                    "TDC": "0x1b",
+                    "ASIC_TEMPERATURE": "0x3474da",
+                    "FAN_RPM": "0x83b",
+                    "BOARD_ID_HIGH": "0x403",
+                    "BOARD_ID_LOW": "0x3191406b",
+                    "FLASH_BUNDLE_VERSION": "19.7.1.0",
+                },
+            }],
+            "host_sw_vers": {
+                "tt_smi": "6.2.1",
+                "tt_umd": "0.9.9",
+            },
+            "host_info": {
+                "Driver": "TT-KMD 2.10.1-pre",
+            },
+        }
+        sample = ttc._sample_from_snapshot(snapshot)
+        self.assertIsNotNone(sample)
+        self.assertIsNone(sample["fw_aiclk_limit_max"])
+
+    def test_fw_aiclk_limit_provenance_constant(self):
+        """FW_AICLK_LIMIT_PROVENANCE names the tt-smi source path."""
+        self.assertIn("tt-smi", ttc.FW_AICLK_LIMIT_PROVENANCE)
+        self.assertIn("AICLK_LIMIT_MAX", ttc.FW_AICLK_LIMIT_PROVENANCE)
+
+    def test_resolve_claimed_max_cli_override_wins(self):
+        """CLI override wins over firmware readout."""
+        cap, prov = ttc.resolve_claimed_max(1200, "ops pin", 1350)
+        self.assertEqual(cap, 1200)
+        self.assertEqual(prov, "ops pin")
+
+    def test_resolve_claimed_max_firmware_when_no_cli(self):
+        """Firmware readout wins when no CLI override."""
+        cap, prov = ttc.resolve_claimed_max(None, None, 1350)
+        self.assertEqual(cap, 1350)
+        self.assertEqual(prov, ttc.FW_AICLK_LIMIT_PROVENANCE)
+
+    def test_resolve_claimed_max_none_when_no_source(self):
+        """None when neither CLI nor firmware available."""
+        cap, prov = ttc.resolve_claimed_max(None, None, None)
+        self.assertIsNone(cap)
+        self.assertIsNone(prov)
+
+    def test_resolve_claimed_max_cli_default_provenance(self):
+        """CLI without explicit provenance gets 'cli-override'."""
+        cap, prov = ttc.resolve_claimed_max(1200, None, 1350)
+        self.assertEqual(cap, 1200)
+        self.assertEqual(prov, "cli-override")
+
+    def test_fold_with_firmware_limit(self):
+        """Fold surfaces firmware_aiclk_limit_max and resolves claimed_max."""
+        samples = [mk_sample(1350, busy=True) for _ in range(64)]
+        samples[0]["fw_aiclk_limit_max"] = 1350  # Add firmware limit
+        rec = ttc.fold(samples)
+        self.assertEqual(rec["firmware_aiclk_limit_max"], 1350)
+        self.assertEqual(rec["claimed_max_aiclk_mhz"], 1350)
+        self.assertEqual(rec["claimed_max_provenance"], ttc.FW_AICLK_LIMIT_PROVENANCE)
+
+    def test_fold_with_cli_override_over_firmware(self):
+        """CLI override wins over firmware in fold resolution."""
+        samples = [mk_sample(1350, busy=True) for _ in range(64)]
+        samples[0]["fw_aiclk_limit_max"] = 1350
+        rec = ttc.fold(samples, claimed_max_mhz=1200, provenance="ops pin")
+        self.assertEqual(rec["firmware_aiclk_limit_max"], 1350)  # Raw readout preserved
+        self.assertEqual(rec["claimed_max_aiclk_mhz"], 1200)  # Resolved cap
+        self.assertEqual(rec["claimed_max_provenance"], "ops pin")
+
+    def test_fold_without_firmware_limit_not_applicable_stated(self):
+        """Fold without firmware limit states NOT-APPLICABLE for claimed_max_firmware_readout."""
+        samples = [mk_sample(800, busy=True) for _ in range(64)]
+        rec = ttc.fold(samples)
+        self.assertIsNone(rec["firmware_aiclk_limit_max"])
+        self.assertIsNone(rec["claimed_max_aiclk_mhz"])
+        self.assertIsNone(rec["claimed_max_provenance"])
+        self.assertIn("claimed_max_firmware_readout", rec["not_applicable"])
+
+    def test_cap_report_pegged_at_resolved_cap(self):
+        """Window pegged at resolved cap reports cap_report correctly."""
+        samples = [mk_sample(1350, busy=True) for _ in range(64)]
+        samples[0]["fw_aiclk_limit_max"] = 1350
+        rec = ttc.fold(samples)
+        # Judge should generate cap_report
+        res = ttc.judge([rec])
+        win = res["windows"][0]
+        self.assertIn("cap_report", win)
+        cr = win["cap_report"]
+        self.assertTrue(cr["resolved"])
+        self.assertEqual(cr["busy_median_mhz"], 1350)
+        self.assertEqual(cr["busy_median_pct_of_cap"], 100.0)
+        self.assertTrue(cr["pegged_at_cap"])
+
+    def test_cap_report_unresolved_when_no_cap(self):
+        """Window without resolved cap reports unresolved cap_report."""
+        samples = [mk_sample(800, busy=True) for _ in range(64)]
+        rec = ttc.fold(samples)
+        res = ttc.judge([rec])
+        win = res["windows"][0]
+        self.assertIn("cap_report", win)
+        cr = win["cap_report"]
+        self.assertFalse(cr["resolved"])
+
+    def test_cap_report_survives_json_roundtrip(self):
+        """cap_report survives JSON serialization/deserialization."""
+        samples = [mk_sample(1350, busy=True) for _ in range(64)]
+        samples[0]["fw_aiclk_limit_max"] = 1350
+        rec = ttc.fold(samples)
+        res = ttc.judge([rec])
+        json_str = json.dumps(res)
+        restored = json.loads(json_str)
+        win = restored["windows"][0]
+        self.assertIn("cap_report", win)
+        cr = win["cap_report"]
+        self.assertTrue(cr["resolved"])
+        self.assertEqual(cr["busy_median_mhz"], 1350)
+
+
+class PyluwenSampler(unittest.TestCase):
+    def test_pyluwen_import_unavailable_stated(self):
+        """pyluwen_chip with ImportError returns stated skip reason."""
+        chip, reason = ttc.pyluwen_chip(
+            importer=lambda: (_ for _ in ()).throw(ImportError("no module named 'pyluwen'"))
+        )
+        self.assertIsNone(chip)
+        self.assertIsNotNone(reason)
+        self.assertIn("unavailable", reason.lower())
+        self.assertIn("pyluwen", reason.lower())
+
+    def test_pyluwen_chip_no_devices_stated(self):
+        """pyluwen_chip with detect_chips=[] returns stated no-chips reason."""
+        class FakePyluwen:
+            @staticmethod
+            def detect_chips():
+                return []
+
+        chip, reason = ttc.pyluwen_chip(importer=lambda: FakePyluwen())
+        self.assertIsNone(chip)
+        self.assertIsNotNone(reason)
+        self.assertIn("chip", reason.lower())
+
+    def test_pyluwen_chip_returns_first_detected(self):
+        """pyluwen_chip returns first detected chip."""
+        fake_chip = object()
+        class FakePyluwen:
+            @staticmethod
+            def detect_chips():
+                return [fake_chip]
+
+        chip, reason = ttc.pyluwen_chip(importer=lambda: FakePyluwen())
+        self.assertIs(chip, fake_chip)
+        self.assertIsNone(reason)
+
+    def test_sample_once_pyluwen_produces_correct_shape(self):
+        """sample_once_pyluwen produces same key set as _sample_from_snapshot."""
+        # Create a fake chip with get_telemetry() returning the expected attrs
+        class FakeTelemetry:
+            aiclk = 1350
+            arcclk = 800
+            axiclk = 960
+            vcore = 726
+            tdp = 19
+            tdc = 27
+            asic_temperature = 3425626
+            fan_rpm = 2105
+            board_id = 0x3191406b
+            board_id_high = 0x403
+            board_id_low = 0x3191406b
+            fw_bundle_version = "19.7.1.0"
+            aiclk_limit_max = 1350
+
+        class FakeChip:
+            def get_telemetry(self):
+                return FakeTelemetry()
+
+        fake_chip = FakeChip()
+        sample = ttc.sample_once_pyluwen(fake_chip)
+        self.assertIsNotNone(sample)
+        # Check key set matches
+        expected_keys = {
+            "t", "aiclk", "arcclk", "axiclk", "vcore", "tdp", "tdc",
+            "asic_temp_raw", "fan_rpm", "board_id", "flash_bundle",
+            "kmd_driver", "tt_smi_version", "umd_version", "fw_aiclk_limit_max"
+        }
+        self.assertEqual(set(sample.keys()), expected_keys)
+        # Check specific values
+        self.assertEqual(sample["aiclk"], 1350)
+        self.assertEqual(sample["fw_aiclk_limit_max"], 1350)
+        self.assertEqual(sample["board_id"], "0x403:0x3191406b")
+        self.assertIsNone(sample["kmd_driver"])  # pyluwen doesn't expose this
+        self.assertIsNone(sample["tt_smi_version"])
+        self.assertIsNone(sample["umd_version"])
+
+    def test_make_parser_default_sampler_subprocess(self):
+        """make_parser() default sampler is 'subprocess'."""
+        parser = ttc.make_parser()
+        args = parser.parse_args(["sample", "--out", "/tmp/test.json"])
+        self.assertEqual(args.sampler, "subprocess")
+
+    def test_make_parser_pyluwen_flag(self):
+        """make_parser() accepts --sampler pyluwen."""
+        parser = ttc.make_parser()
+        args = parser.parse_args(["sample", "--out", "/tmp/test.json", "--sampler", "pyluwen"])
+        self.assertEqual(args.sampler, "pyluwen")
+
+    def test_run_sampler_skip_with_import_error(self):
+        """run_sampler with pyluwen import error writes skip reason and returns 1."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "test.json")
+            args = argparse.Namespace(
+                cmd="sample",
+                out=out_path,
+                interval=1.0,
+                duration=0.1,
+                leg_pid=None,
+                claimed_max_aiclk_mhz=None,
+                claimed_max_provenance=None,
+                allow_cross_boot=False,
+                sampler="pyluwen",
+            )
+
+            # Mock _pyluwen_import to raise ImportError
+            original_import = getattr(ttc, "_pyluwen_import", None)
+            try:
+                def raise_import_error():
+                    raise ImportError("no module named 'pyluwen'")
+                ttc._pyluwen_import = raise_import_error
+
+                exit_code = ttc.run_sampler(args)
+
+                self.assertEqual(exit_code, 1)
+                # Check the written file has skip reason and n=0
+                rec = json.loads(pathlib.Path(out_path).read_text())
+                self.assertEqual(rec["n"], 0)
+                self.assertIn("sampler_skip_reason", rec)
+                self.assertIn("unavailable", rec["sampler_skip_reason"].lower())
+            finally:
+                if original_import is not None:
+                    ttc._pyluwen_import = original_import
+                elif hasattr(ttc, "_pyluwen_import"):
+                    delattr(ttc, "_pyluwen_import")
 
 
 if __name__ == "__main__":

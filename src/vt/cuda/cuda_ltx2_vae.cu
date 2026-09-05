@@ -25,19 +25,35 @@
 // must not be able to silently swap a correctly-rounded divide for an
 // approximation under this table.
 //
-// F32 ONLY, REFUSED BY NAME, in the message shape the CPU arm uses. The whole
-// LTX-2.5 conv video VAE decode is f32 in this tree after #1008 measured it, and
-// ltx2_video_vae_kernels.h states that polarity under its DTYPE heading. A bf16
-// storage arm is owed with the CUDA measurement (#1452) rather than guessed at.
+// F32 ONLY, REFUSED BY NAME, WHERE THE CPU ARM NOW SERVES BOTH WIDTHS -- and the
+// asymmetry is a REACHABILITY argument, not a budget one (A24 wave 3, row
+// LTX25-A24-VIDEO-VAE-BF16, issue #2786).
 //
-// NEVER COMPILED, NEVER EXECUTED, ANYWHERE IN THIS PROJECT'S REACH. There is no
-// nvcc on the box that wrote this file and no CI job here has a GPU runner, so
-// nothing has built this translation unit and nothing has run a single one of
-// these kernels. That is exactly what #1452 already records for
-// src/vt/cuda/cuda_conv3d.cu. Read the bit-identity paragraph above as a DESIGN
-// ARGUMENT and not as a measurement: it is a claim about what the arithmetic
-// says, made by a reader of both arms, and it is owed a hardware run against the
-// CPU arm on the same volume before anything cites it as a result.
+// `src/vt/cuda/cuda_conv3d.cu` refuses f16/bf16 storage by name ("this arm serves
+// f32 only; f16/bf16 storage is owed (#1007)"), and EVERY convolution of the
+// decode goes through `vt::Conv3d`. A bf16 volume on a CUDA queue therefore
+// cannot get past `conv_in`, so bf16 branches in this table would be code nothing
+// can reach -- the shape AGENTS.md `## Nothing lands dead` forbids. They are not
+// written. `Ltx2ConvVideoDecode` refuses a bf16 decode on a non-CPU queue in ONE
+// place, asking the same question this table refuses on, so the refusal and the
+// route predicate are the same predicate rather than two that can drift.
+//
+// Production is unaffected: the render passes no queue
+// (`grep -c 'Ltx2VideoDecodeStreaming(' src/vllm/multimodal/ltx2_video.cpp` = 1,
+// queue-less), so the conv video VAE decode runs on the CPU queue on every build
+// of this project. The device bf16 arm is owed with `cuda_conv3d`'s and needs a
+// lease to be measured.
+//
+// COMPILED BY CI, NEVER EXECUTED ANYWHERE IN THIS PROJECT'S REACH. This block
+// used to say "NEVER COMPILED" as well, and the tree has falsified that: the
+// `cuda-fat-build` job (.github/workflows/ci.yml) builds the `vllm` target inside
+// `nvidia/cuda:13.3.0-devel-ubuntu24.04` with `-DVLLM_CPP_CUDA=ON`, and this
+// translation unit is unconditional in the CUDA source list (CMakeLists.txt). So
+// nvcc does parse these kernels on every pull request; what still has never
+// happened is a RUN. There is no GPU runner here, so read the bit-identity
+// paragraph above as a DESIGN ARGUMENT and not as a measurement -- it is owed a
+// hardware run against the CPU arm on the same volume before anything cites it as
+// a result, which is what #1452 records.
 //
 // SELF-REGISTERING translation unit in the established additive pattern
 // (src/vt/cuda/cuda_ltx2.cu, src/vt/cuda/cuda_conv3d.cu): no existing kernel TU
@@ -81,8 +97,11 @@ unsigned GridFor(int64_t n) {
 void RequireF32(DType dtype, const char* what) {
   VT_CHECK(dtype == DType::kF32,
            std::string("ltx2 vae ") + what +
-               ": this arm serves f32 storage only; f16/bf16 is owed with the CUDA "
-               "measurement (#1452)");
+               ": the CUDA arm serves f32 storage only. The CPU arm serves bf16 (A24 wave 3, "
+               "#2786) and this one cannot until `vt::Conv3d` has a bf16 storage arm on this "
+               "device (#1007): every convolution of the decode goes through it, so a bf16 "
+               "volume cannot reach this kernel at all. Decode on the CPU queue, or load the "
+               "VAE weights at f32");
 }
 
 // `std::max`/`std::min` are host-only here; the pad's two clamps are written

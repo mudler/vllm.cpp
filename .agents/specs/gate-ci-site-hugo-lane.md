@@ -180,16 +180,20 @@ so it proves the protected assertion **executed** rather than skipped.
 
 ## Owed
 
-- [#1828](https://github.com/mudler/vllm.cpp/issues/1828) — `test_check_site.py`
-  asserts a literal `10` rendered detail links, a stored count of
+- DISCHARGED by `GATE-SITE-BENCH-INDEX-DERIVED`
+  ([spec](gate-site-bench-index-derived.md),
+  [#2643](https://github.com/mudler/vllm.cpp/issues/2643)). `test_check_site.py`
+  asserted a literal `10` rendered detail links, a stored count of
   `docs/benchmarks/*.md`. Until this change it was inert in CI, because the case
-  never reached the line; installing Hugo arms it. Measured on `d60692c89`: 10
+  never reached the line; installing Hugo armed it. Measured on `d60692c89`: 10
   slugs, 10 table hrefs, no duplicate target, no unlinked slug — a bijection,
-  and therefore derivable at read time. Left out of scope because deriving it
-  changes what the case asserts, which `AGENTS.md` routes through the normal
-  row, spec and fresh-review path rather than the in-flow rule, and because
-  `tests/scripts/test_check_site.py` has an open pull request against the same
-  case.
+  and therefore derivable at read time. It was left out of scope because
+  deriving it changes what the case asserts, which `AGENTS.md` routes through
+  the normal row, spec and fresh-review path rather than the in-flow rule. The
+  drift landed exactly as predicted: `454094f93` published an eleventh page and
+  the literal stayed at ten, reding `agent-record` on `main`. The successor row
+  derives both sides. Its issue is #2643 and not the number recorded here
+  before, which no longer resolves on the forge.
 
 ## Stop conditions
 

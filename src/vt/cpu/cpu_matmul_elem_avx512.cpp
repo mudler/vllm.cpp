@@ -139,7 +139,15 @@ void Nk16Avx512(const float* af, const void* bv, int64_t k, int64_t n, float* ac
 // vectors plus 6 accumulators plus a broadcast still fits without spilling.
 // The transpose is the dominant cost and is shared across all MR rows, which
 // is the whole point of M blocking and changes no output's order.
-constexpr int kMrAvx512 = 6;
+// MR = 8 rather than 6 so a full 16-row activation tile is exactly TWO
+// M-blocked calls. At 6 the same tile needed three, and the four rows the third
+// call could not cover fell through to the one-row kernel -- one whole weight
+// load and one whole 16x16 transpose each, six passes over the weight block
+// where the blocking factor allows two. AVX-512 has 32 ZMM and this kernel
+// holds 16 transposed weight vectors plus MR accumulators plus one broadcast:
+// 25 at MR = 8, against 23 at MR = 6.
+constexpr int kMrAvx512 = 8;
+static_assert(kMrAvx512 <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void BtM6Avx512(const float* af, int64_t a_stride, const void* bv, int64_t k, float* acc) {

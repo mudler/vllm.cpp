@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <vector>
 
 #include "vt/dtype.h"
@@ -220,6 +221,93 @@ TEST_CASE("attn_gate_split: splits [q|gate] per head") {
       CHECK(go[o + 0] == doctest::Approx(static_cast<float>(t * 100 + h * 10 + 5)));
       CHECK(go[o + 1] == doctest::Approx(static_cast<float>(t * 100 + h * 10 + 6)));
     }
+}
+
+// The bf16 `q_out` arm (#2488). vLLM's `torch.chunk` does not widen either half
+// of the fused q/gate projection (qwen3_next.py:430 at vLLM `cdefd9d499`, an
+// unpinned forward reference), so a caller whose `qgate` already carries the bf16
+// model dtype -- qwen4_exp -- wants a bf16 `q_out`.
+//
+// THE POINT IS THE WIDTH, AND A VALUE GATE CANNOT SEE A WIDTH. So this case
+// asserts BOTH: the bytes (`q_out` is bf16 and holds `T*Hq*Dh*2` of them), and
+// that narrowing changed no value -- over a bf16 `qgate` the split is a pure
+// copy, so every bf16 element must equal the f32 arm's element exactly, not
+// approximately.
+//
+// It also asserts the operand Qwen3.5 passes did not move: `gate_out` is compared
+// BYTE for byte between the two runs, and the f32 `q_out` arm is run in the same
+// case so its bytes are the ones being compared against.
+TEST_CASE("attn_gate_split: a bf16 q_out is the f32 arm's values at half the bytes") {
+  const int64_t T = 3, Hq = 2, Dh = 4;
+  const size_t n = static_cast<size_t>(T * Hq * Dh);
+  // A bf16 qgate, which is what `hidden.dtype` gives the qwen4_exp caller.
+  std::vector<uint16_t> qgate_b(static_cast<size_t>(T * Hq * 2 * Dh), 0);
+  {
+    size_t i = 0;
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t h = 0; h < Hq; ++h)
+        for (int64_t d = 0; d < 2 * Dh; ++d)
+          qgate_b[i++] = vt::F32ToBF16(0.37f * static_cast<float>(t + 1) -
+                                       0.11f * static_cast<float>(h) +
+                                       0.023f * static_cast<float>(d));
+  }
+  Tensor tqg = Bf16(qgate_b, {T, Hq * 2 * Dh});
+  Queue q = Q();
+
+  // Arm 1: the pre-change shape -- f32 q_out. This is the arm Qwen3.5 passes.
+  std::vector<float> qo_f(n, 0.0f), go_f(n, 0.0f);
+  Tensor tqo_f = F32(qo_f, {T, Hq, Dh}), tgo_f = F32(go_f, {T, Hq, Dh});
+  vt::AttnGateSplit(q, tqo_f, tgo_f, tqg);
+
+  // Arm 2: the narrowed shape -- bf16 q_out, f32 gate_out.
+  std::vector<uint16_t> qo_b(n, 0);
+  std::vector<float> go_b(n, 0.0f);
+  Tensor tqo_b = Bf16(qo_b, {T, Hq, Dh}), tgo_b = F32(go_b, {T, Hq, Dh});
+  vt::AttnGateSplit(q, tqo_b, tgo_b, tqg);
+
+  // THE WIDTH, stated as bytes rather than implied by the dtype name.
+  CHECK(tqo_b.dtype == DType::kBF16);
+  CHECK(static_cast<size_t>(tqo_b.Numel()) * vt::SizeOf(tqo_b.dtype) == n * 2);
+  CHECK(static_cast<size_t>(tqo_f.Numel()) * vt::SizeOf(tqo_f.dtype) == n * 4);
+
+  // THE VALUES. Exact equality, not Approx: over a bf16 source the round trip is
+  // the identity, so an Approx here would pass on a lossy split too.
+  for (size_t i = 0; i < n; ++i) {
+    CHECK(vt::BF16ToF32(qo_b[i]) == qo_f[i]);
+    CHECK(qo_b[i] == vt::F32ToBF16(qo_f[i]));
+  }
+  // QWEN3.5's OPERAND DID NOT MOVE: gate_out is byte-identical across the arms.
+  for (size_t i = 0; i < n; ++i) CHECK(go_b[i] == go_f[i]);
+}
+
+// The refusals that bound the widening. `gate_out` is NOT admitted at bf16 --
+// `vt::SigmoidGateBf16` takes an f32 gate on all four of its backends, and a
+// split that emitted one would move the failure to a deeper call. `q_out` at f16
+// is refused because no caller has one and the CUDA kernel instantiates two arms.
+TEST_CASE("attn_gate_split: refuses a bf16 gate_out and an f16 q_out by name") {
+  const int64_t T = 1, Hq = 1, Dh = 2;
+  const size_t n = static_cast<size_t>(T * Hq * Dh);
+  std::vector<float> qgate(static_cast<size_t>(T * Hq * 2 * Dh), 1.0f);
+  Tensor tqg = F32(qgate, {T, Hq * 2 * Dh});
+  Queue q = Q();
+
+  std::vector<uint16_t> half(n, 0);
+  std::vector<float> f(n, 0.0f);
+  {
+    Tensor tqo = F32(f, {T, Hq, Dh});
+    Tensor tgo = Bf16(half, {T, Hq, Dh});
+    CHECK_THROWS_WITH_AS(vt::AttnGateSplit(q, tqo, tgo, tqg),
+                         doctest::Contains("attn_gate_split: gate_out must be f32"),
+                         std::exception);
+  }
+  {
+    std::vector<uint16_t> qo(n, 0);
+    Tensor tqo = Tensor::Contiguous(qo.data(), DType::kF16, Cpu(), {T, Hq, Dh});
+    Tensor tgo = F32(f, {T, Hq, Dh});
+    CHECK_THROWS_WITH_AS(vt::AttnGateSplit(q, tqo, tgo, tqg),
+                         doctest::Contains("attn_gate_split: q_out must be f32 or bf16"),
+                         std::exception);
+  }
 }
 
 // ---------------------------------------------------------------------------

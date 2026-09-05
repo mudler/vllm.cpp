@@ -341,8 +341,17 @@ Ltx2FreqsCis Ltx2PrecomputeFreqsCis(const double* positions, int64_t batch, int6
 
 // apply_rotary_emb (rope.py:16-27) over `x` [batch, tokens, dim] IN PLACE.
 // `heads` is the head count the SPLIT layout was built with.
+// `compute_dtype` selects the ROUNDING STRUCTURE, and the two rope arms do NOT
+// share one — measured, six lines apart in upstream's own file. Split
+// (rope.py:69-76) multiplies by `cos` into a materialized tensor and then fuses
+// the second multiply into the add through `addcmul_`, so it rounds TWICE per
+// output; interleaved (rope.py:38) is a plain `a*cos + b*sin` and rounds THREE
+// times. Each was held bit-exact against the pinned module at 0 of 384, and each
+// alternative was measured wrong: 92 of 384 for split, 141 of 384 for
+// interleaved. Row LTX25-A24-CONNECTOR-BF16, issue #2720.
 void Ltx2ApplyRotaryEmb(float* x, int64_t batch, int64_t tokens, int64_t dim, int64_t heads,
-                        const Ltx2FreqsCis& pe, Ltx2RopeType rope_type);
+                        const Ltx2FreqsCis& pe, Ltx2RopeType rope_type,
+                        vt::DType compute_dtype = vt::DType::kF32);
 
 // ---------------------------------------------------------------------------
 // Bricks (each gated on its own so a failure localizes)
@@ -360,8 +369,16 @@ Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSin
                                     const float* timesteps, int64_t count, int64_t dim);
 
 // FeedForward.forward (feed_forward.py:14-15): net.0.proj -> gelu(tanh) -> net.2.
+//
+// `compute_dtype` is the MODEL dtype this module runs at, and `kF32` — every
+// caller that existed before A24 wave 2 — moves not one float. At `kBF16` the two
+// tensors upstream materializes are narrowed and nothing else is: the Linear
+// accumulates in f32, adds its bias in f32 and rounds ONCE (measured bit-exact),
+// and `F.gelu(..., approximate="tanh")` on a bf16 input is the f32 formula
+// rounded once (measured 0 of 6144). Row LTX25-A24-CONNECTOR-BF16, issue #2720.
 std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeights& w,
-                                   const float* x, int64_t rows, int64_t dim, int64_t inner);
+                                   const float* x, int64_t rows, int64_t dim, int64_t inner,
+                                   vt::DType compute_dtype = vt::DType::kF32);
 
 // The K/V half of Attention.forward, split out because a checkpoint that sets
 // `use_prompt_adaln_single=false` can CACHE it: the prompt modulation then
@@ -474,9 +491,44 @@ struct Ltx2AttentionArgs {
   // batched arm that reached this field would need the blend and would get the
   // all-or-nothing answer silently.
   bool all_perturbed = false;
+
+  // The MODEL dtype this attention runs at (A24 wave 2, issue #2720). `kF32` is
+  // every pre-existing caller and is byte-identical to the arm the DiT's goldens
+  // cover. At `kBF16` every tensor upstream materializes is narrowed and nothing
+  // else is — the projections, both RMSNorms, RoPE, the attention output, the
+  // per-head gate and `to_out`. The two arms share no rounding, so neither can
+  // silently become the other.
+  //
+  // THE ATTENTION ITSELF STAYS AN f32 ACCUMULATION, and that is upstream's
+  // answer rather than a shortcut: `SDPBackend.MATH` on bf16 inputs is bit-equal
+  // to an f32-accumulated attention with no intermediate rounding (measured 0 of
+  // 384 against both an f32 and an f64 reference), and the FLASH kernel torch
+  // actually selects is reproducible by no formula at all — eight hypotheses were
+  // measured and the closest still differs on 128 of 384 words. See
+  // .agents/specs/ltx25-a24-connector-bf16.md section 4.6.
+  vt::DType compute_dtype = vt::DType::kF32;
 };
 std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& w, const float* x,
                                  const float* context, const Ltx2AttentionArgs& args);
+
+// `torch.nn.functional.rms_norm` over the last dimension with an OPTIONAL
+// elementwise gain (utils.py:7-12; `torch.nn.RMSNorm`, attention.py:505-506).
+// `weight == nullptr` is the weightless form; `out_dtype` selects where the one
+// narrowing lands and not the arithmetic, which is f64-accumulated on both arms.
+//
+// This is `Ltx2Attention`'s OWN q/k norm -- `Ltx2Attention` calls it twice per
+// block and nothing else defines it -- and it is declared here for the same
+// reason `Ltx2ConnectorRmsNormRows` is declared in ltx2_connector.h: `eps` lives
+// in it, and at bf16 the difference between `1e-6` and `bf16(1e-6)` is INVISIBLE
+// in any tensor built from rows of ordinary magnitude. MEASURED on this tree:
+// narrowing this epsilon at kBF16 left `test_ltx2_pipeline` at
+// `4018 | 4018 passed` and `test_ltx2_video` at `4951 | 4951 passed`, while
+// setting it to 1.0 reds 11 -- ten across all five connector arms plus the probe
+// below. So the site is live and reached, and an arm golden simply cannot
+// resolve it. The probe that can needs rows near 2^-13, which no forward fixture
+// produces, so it calls this directly. A production path, not a test hook.
+void Ltx2RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
+                     int64_t width, double eps, vt::DType out_dtype = vt::DType::kF32);
 
 // ---------------------------------------------------------------------------
 // Forward

@@ -179,6 +179,7 @@ void Nk16Avx2(const float* af, const void* bv, int64_t k, int64_t n, float* acc)
 // accumulator groups plus the 8 transposed weight vectors fits without
 // spilling (SSE2 could only afford MR=2 with its 16 XMM).
 constexpr int kMrAvx2 = 4;
+static_assert(kMrAvx2 <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void BtM4Avx2(const float* af, int64_t a_stride, const void* bv, int64_t k, float* acc) {

@@ -2,6 +2,8 @@
 // See include/vllm/v1/core/sched/scheduler.h for the T0 scope + deferred list.
 #include "vllm/v1/core/sched/scheduler.h"
 
+#include "vllm/multimodal/utils.h"  // GetMmFeaturesInWindow (P2, #2379)
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -277,6 +279,18 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
       enable_caching, /*use_eagle=*/false, /*log_stats=*/true,
       enable_kv_cache_events_, /*dcp_world_size=*/1,
       /*pcp_world_size=*/1, scheduler_config.watermark);
+
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): the encoder cache + its per-step compute
+  // budget (scheduler.py:226-238). Upstream builds the manager unconditionally
+  // and passes cache_size 0 when the model declares no multimodal budget; the
+  // manager is then consulted only through `if request.has_encoder_inputs`, so
+  // a text engine never reaches it either way. The EncoderDecoderCacheManager
+  // arm (Whisper cross-attention) is not ported: is_encoder_decoder is not a
+  // config this scheduler carries.
+  max_num_encoder_input_tokens_ = scheduler_config.max_num_encoder_input_tokens;
+  disable_chunked_mm_input_ = scheduler_config.disable_chunked_mm_input;
+  encoder_cache_manager = std::make_unique<core::EncoderCacheManager>(
+      scheduler_config.encoder_cache_size);
 }
 
 void Scheduler::shutdown() {
@@ -324,6 +338,7 @@ void Scheduler::finish_requests(const std::string& request_id,
   request->status = finished_status;
   finished_req_ids.insert(request_id);
   kv_cache_manager->free(*request);
+  free_request_encoder_inputs(*request);
   requests.erase(it);
 }
 
@@ -332,6 +347,17 @@ void Scheduler::preempt_request(Request* request, double timestamp) {
          "Only running requests can be preempted");
   // _free_request_blocks (T0: defer_block_free off -> free immediately).
   kv_cache_manager->free(*request);
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): `self.encoder_cache_manager.free(request)`
+  // (scheduler.py:1213), in the SAME place and for the same reason as the block
+  // free on the line above. A preemption resets num_computed_tokens to 0, so the
+  // resumed request re-schedules every encoder input from the start; the
+  // references it held before the preemption would then never be dropped by
+  // `_free_encoder_inputs` (whose test is `offset + length <=
+  // num_computed_tokens`, and num_computed_tokens just went to zero). Each
+  // preemption of an image request would leak one cache entry until the request
+  // finished, and `CanAllocate` would start refusing admissions the cache had
+  // room for. No-op for a request with no mm_features.
+  free_request_encoder_inputs(*request);
   request->status = RequestStatus::kPreempted;
   request->num_computed_tokens = 0;
   // scheduler.py:1217-1218 (W7 #1824): drop un-verified drafts — real values
@@ -450,6 +476,140 @@ void Scheduler::maybe_reorder_waiting_for_lpm() {
   waiting->reorder(order);
 }
 
+
+// _try_schedule_encoder_inputs (scheduler.py:1379). See scheduler.h for why the
+// num_new_tokens clamp is a correctness guard rather than an optimization.
+std::vector<int> Scheduler::try_schedule_encoder_inputs(
+    const Request& request, int num_computed_tokens, int* num_new_tokens,
+    int* encoder_compute_budget) {
+  if (*num_new_tokens == 0 || request.mm_features.empty()) {
+    return {};
+  }
+  std::vector<int> encoder_inputs_to_schedule;
+  // Per-STEP trackers, because the scheduler decides at request granularity
+  // while the budget is spent at item granularity (upstream's own NOTE at
+  // :1414-1416).
+  std::set<std::string> mm_hashes_to_schedule;
+  int64_t num_embeds_to_schedule = 0;
+
+  const std::pair<int, int> window = multimodal::GetMmFeaturesInWindow(
+      request.mm_features, num_computed_tokens,
+      num_computed_tokens + *num_new_tokens);
+
+  for (int i = window.first; i < window.second; ++i) {
+    const multimodal::MultiModalFeatureSpec& feature =
+        request.mm_features[static_cast<size_t>(i)];
+    const int start_pos = feature.offset;
+    const int num_encoder_tokens = feature.length;
+    // get_num_embeds() upstream. Our MultiModalFeatureSpec carries no `is_embed`
+    // mask (that is the use_audio_in_video interleave, which nothing here
+    // produces), so every placeholder token IS an embedding row and the two
+    // counts coincide. Recorded rather than assumed, because if an interleaved
+    // modality ever lands, this is the line that has to change with it.
+    const int64_t num_encoder_embeds = num_encoder_tokens;
+
+    if (mm_hashes_to_schedule.count(feature.mm_hash) != 0) {
+      // The same encoder input is already scheduled this step (two placeholders
+      // that hash equal share one encoder run).
+      continue;
+    }
+    if (encoder_cache_manager->CheckAndUpdateCache(request.request_id, i,
+                                                   feature.mm_hash)) {
+      // Already computed and cached by an earlier step (or another request).
+      continue;
+    }
+
+    if (disable_chunked_mm_input_ && num_computed_tokens < start_pos &&
+        (num_computed_tokens + *num_new_tokens) <
+            (start_pos + num_encoder_tokens)) {
+      // Roll the whole step back to before this item rather than covering part
+      // of its span.
+      *num_new_tokens = std::max(0, start_pos - num_computed_tokens);
+      break;
+    }
+
+    if (!encoder_cache_manager->CanAllocate(num_encoder_embeds,
+                                            *encoder_compute_budget,
+                                            num_embeds_to_schedule)) {
+      // The encoder cache is full or the encoder budget is exhausted. NOTE
+      // (woosuk): encoder input tokens are processed altogether because the
+      // encoder is bidirectional, so there is no partial answer to fall back to.
+      if (num_computed_tokens < start_pos) {
+        // Schedule only the decoder tokens ahead of the encoder input.
+        *num_new_tokens = start_pos - num_computed_tokens;
+      } else {
+        // Prefix caching pushed num_computed_tokens past start_pos while this
+        // item's encoder output is not available, so nothing can be scheduled
+        // for this request this step.
+        *num_new_tokens = 0;
+      }
+      break;
+    }
+
+    // How much of this item's placeholder span the step actually covers. Zero
+    // means the window overlap is empty for this item and the encoder run is not
+    // needed yet (upstream's get_embeds_indices_in_range collapse).
+    const int start_idx_rel = std::max(0, num_computed_tokens - start_pos);
+    const int end_idx_rel = std::min(
+        num_encoder_tokens, num_computed_tokens + *num_new_tokens - start_pos);
+    if (end_idx_rel - start_idx_rel <= 0) {
+      continue;
+    }
+
+    num_embeds_to_schedule += num_encoder_embeds;
+    *encoder_compute_budget -= static_cast<int>(num_encoder_embeds);
+    mm_hashes_to_schedule.insert(feature.mm_hash);
+    encoder_inputs_to_schedule.push_back(i);
+  }
+  return encoder_inputs_to_schedule;
+}
+
+// _free_encoder_inputs (scheduler.py:2017).
+void Scheduler::free_encoder_inputs(const Request& request) {
+  if (request.mm_features.empty()) return;
+  const std::unordered_set<int> cached =
+      encoder_cache_manager->GetCachedInputIds(request.request_id);
+  if (cached.empty()) return;
+  // use_eagle is false in this tree, so the drafter's +1 look-ahead shift
+  // upstream applies (:2026-2028) is 0. Named rather than dropped: a later
+  // EAGLE row has to put it back or an entry frees one token too early.
+  const int spec_lookahead = 0;
+  // Copy: FreeEncoderInput mutates the set this iterates (upstream's own
+  // `list(set)` for the same reason).
+  const std::vector<int> input_ids(cached.begin(), cached.end());
+  for (const int input_id : input_ids) {
+    if (input_id < 0 ||
+        input_id >= static_cast<int>(request.mm_features.size())) {
+      continue;
+    }
+    const multimodal::MultiModalFeatureSpec& feature =
+        request.mm_features[static_cast<size_t>(input_id)];
+    if (feature.offset + feature.length + spec_lookahead <=
+        request.num_computed_tokens - request.num_output_placeholders) {
+      encoder_cache_manager->FreeEncoderInput(request.request_id, input_id,
+                                              feature.mm_hash, feature.length);
+    }
+  }
+}
+
+// encoder_cache_manager.free(request) (encoder_cache_manager.py:243).
+void Scheduler::free_request_encoder_inputs(const Request& request) {
+  if (request.mm_features.empty()) return;
+  const std::unordered_set<int> cached =
+      encoder_cache_manager->GetCachedInputIds(request.request_id);
+  const std::vector<int> input_ids(cached.begin(), cached.end());
+  for (const int input_id : input_ids) {
+    if (input_id < 0 ||
+        input_id >= static_cast<int>(request.mm_features.size())) {
+      continue;
+    }
+    const multimodal::MultiModalFeatureSpec& feature =
+        request.mm_features[static_cast<size_t>(input_id)];
+    encoder_cache_manager->FreeEncoderInput(request.request_id, input_id,
+                                            feature.mm_hash, feature.length);
+  }
+}
+
 SchedulerOutput Scheduler::schedule() {
   current_step_ += 1;
   // scheduled_timestamp (scheduler.py:461): one monotonic reading for the whole
@@ -472,6 +632,11 @@ SchedulerOutput Scheduler::schedule() {
   // this step (scheduler.py:593-609). Stays empty when no request carries drafts
   // (num_lookahead_tokens == 0 -> byte-identical to the pre-SPEC-MTP path).
   std::map<std::string, std::vector<int32_t>> scheduled_spec_decode_tokens;
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): req_id -> mm_features indices to encode
+  // this step (scheduler.py:453-454), and the per-step encoder compute budget
+  // both admission loops spend down. Both stay empty/untouched on a text step.
+  std::map<std::string, std::vector<int>> scheduled_encoder_inputs;
+  int encoder_compute_budget = max_num_encoder_input_tokens_;
   int token_budget = max_num_scheduled_tokens;
 
   kv_cache_manager->new_step_starts();
@@ -525,6 +690,20 @@ SchedulerOutput Scheduler::schedule() {
         std::min(num_new_tokens, max_model_len - request->num_computed_tokens -
                                      num_sampled_tokens_per_step_);
 
+    // Schedule encoder inputs (scheduler.py:522-536). May CLAMP num_new_tokens
+    // — including to 0, which the `continue` below then handles exactly as
+    // upstream's reason 2/3 ("the encoder budget/cache is exhausted"). Empty and
+    // budget-neutral for a request with no mm_features. `new_encoder_budget` is
+    // a COPY that only becomes the running budget once the request is actually
+    // scheduled, mirroring upstream's new_encoder_compute_budget.
+    std::vector<int> encoder_inputs_to_schedule;
+    int new_encoder_budget = encoder_compute_budget;
+    if (!request->mm_features.empty()) {
+      encoder_inputs_to_schedule = try_schedule_encoder_inputs(
+          *request, request->num_computed_tokens, &num_new_tokens,
+          &new_encoder_budget);
+    }
+
     if (num_new_tokens == 0) {
       // Nothing to schedule for this request (e.g. it has reached its cap).
       // NOTE(woosuk): `continue` (not `break`) — do not strictly follow FCFS,
@@ -569,7 +748,17 @@ SchedulerOutput Scheduler::schedule() {
           token_budget += num_scheduled_tokens[preempted_id];
           num_scheduled_tokens.erase(preempted_id);
           req_to_new_blocks.erase(preempted_id);
-          // (spec-decode / encoder budgets are deferred at T0.)
+          // Restore the encoder compute budget the victim's already-scheduled
+          // encoder inputs spent, and drop them from this step
+          // (scheduler.py:590-600). (The spec-decode undo is deferred at T0.)
+          const auto enc_it = scheduled_encoder_inputs.find(preempted_id);
+          if (enc_it != scheduled_encoder_inputs.end()) {
+            for (const int i : enc_it->second) {
+              encoder_compute_budget += static_cast<int>(
+                  preempted_req->mm_features[static_cast<size_t>(i)].length);
+            }
+            scheduled_encoder_inputs.erase(enc_it);
+          }
           req_index -= 1;
         }
       } else {
@@ -634,6 +823,20 @@ SchedulerOutput Scheduler::schedule() {
       // New spec tokens will be set in update_draft_token_ids before the next
       // step when applicable.
       request->spec_token_ids.clear();
+    }
+
+    // Encoder-related (scheduler.py:642-650). Reserve cache space for every
+    // encoder input this step will run, and only NOW commit the budget the
+    // decision above computed.
+    if (!encoder_inputs_to_schedule.empty()) {
+      for (const int i : encoder_inputs_to_schedule) {
+        const multimodal::MultiModalFeatureSpec& feature =
+            request->mm_features[static_cast<size_t>(i)];
+        encoder_cache_manager->Allocate(request_id, i, feature.mm_hash,
+                                        feature.length);
+      }
+      scheduled_encoder_inputs[request_id] = std::move(encoder_inputs_to_schedule);
+      encoder_compute_budget = new_encoder_budget;
     }
   }
 
@@ -707,6 +910,21 @@ SchedulerOutput Scheduler::schedule() {
       num_new_tokens = std::min(num_new_tokens, token_budget);
       assert(num_new_tokens > 0);
 
+      // Schedule encoder inputs (scheduler.py:862-876). The CLAMP is what keeps
+      // a chunked prefill from covering placeholder rows whose encoder could not
+      // run; `num_new_tokens == 0` means this request cannot be scheduled at all
+      // this step and upstream BREAKS out of the waiting loop (not `continue` —
+      // the waiting queue is FCFS here).
+      std::vector<int> encoder_inputs_to_schedule;
+      int new_encoder_budget = encoder_compute_budget;
+      if (!request->mm_features.empty()) {
+        encoder_inputs_to_schedule = try_schedule_encoder_inputs(
+            *request, num_computed_tokens, &num_new_tokens, &new_encoder_budget);
+        if (num_new_tokens == 0) {
+          break;
+        }
+      }
+
       std::optional<KVCacheBlocks> new_blocks = kv_cache_manager->allocate_slots(
           *request, num_new_tokens, num_new_local_computed_tokens,
           new_computed_blocks, /*num_lookahead_tokens=*/num_lookahead_tokens_,
@@ -715,7 +933,10 @@ SchedulerOutput Scheduler::schedule() {
           /*full_sequence_must_fit=*/scheduler_reserve_full_isl_,
           /*reserved_blocks=*/0, /*has_scheduled_reqs=*/!running.empty());
       if (!new_blocks.has_value()) {
-        // The request cannot be scheduled.
+        // The request cannot be scheduled. Untouch it from the encoder cache
+        // manager: CheckAndUpdateCache above may have added a reference for a
+        // request that is not going to run (scheduler.py:938-939).
+        free_request_encoder_inputs(*request);
         break;
       }
 
@@ -756,6 +977,19 @@ SchedulerOutput Scheduler::schedule() {
       // above so `already_computed` reports the prefix-cache hit, and still
       // before update_after_schedule adds this step's tokens.
       PrefillMarkScheduled(*request, num_new_tokens);
+
+      // Encoder-related (scheduler.py:1030-1038).
+      if (!encoder_inputs_to_schedule.empty()) {
+        for (const int i : encoder_inputs_to_schedule) {
+          const multimodal::MultiModalFeatureSpec& feature =
+              request->mm_features[static_cast<size_t>(i)];
+          encoder_cache_manager->Allocate(request_id, i, feature.mm_hash,
+                                          feature.length);
+        }
+        scheduled_encoder_inputs[request_id] =
+            std::move(encoder_inputs_to_schedule);
+        encoder_compute_budget = new_encoder_budget;
+      }
     }
     // KV-OFFLOAD W4: re-queue the connector-deferred requests to the FRONT of
     // waiting (reverse so FCFS order is preserved) to be re-asked next step.
@@ -826,14 +1060,19 @@ SchedulerOutput Scheduler::schedule() {
   scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens;
   // scheduled_spec_decode_tokens (scheduler.py:593-609): populated above only for
   // running requests carrying drafts; empty on the default (no-speculator) path.
-  // scheduled_encoder_inputs stays empty (encoder deferred).
+  scheduler_output.scheduled_encoder_inputs = std::move(scheduled_encoder_inputs);
   scheduler_output.scheduled_spec_decode_tokens =
       std::move(scheduled_spec_decode_tokens);
   scheduler_output.num_common_prefix_blocks = std::move(num_common_prefix_blocks);
   // finished_req_ids is EXISTING scheduler state (finished between the prior and
   // current step) — moved out here, then flushed in _update_after_schedule.
   scheduler_output.finished_req_ids = std::move(finished_req_ids);
-  // free_encoder_mm_hashes stays empty (encoder deferred).
+  // free_encoder_mm_hashes (scheduler.py:1084 mirror): the mm_hash entries the
+  // encoder cache actually EVICTED since the previous step. The worker drops
+  // exactly these from its own mm_hash-keyed cache, so the two caches cannot
+  // disagree about what is resident. Empty on every text step.
+  scheduler_output.free_encoder_mm_hashes =
+      encoder_cache_manager->GetFreedMmHashes();
 
   // num_spec_tokens_to_schedule (scheduler.py:1123-1156, W7 #1824): the count
   // the AsyncScheduler's update_after_schedule below turns into -1 placeholder
@@ -997,7 +1236,10 @@ EngineCoreOutputs Scheduler::update_from_output(
       }
       // (make_spec_decoding_stats telemetry is deferred — no SpecDecodingStats.)
     }
-    // DEFERRED: encoder-input free.
+    // Free encoder inputs only AFTER the step has actually executed
+    // (scheduler.py:1699-1701). Freeing at schedule time would drop an entry the
+    // forward is still about to gather.
+    free_encoder_inputs(*request);
 
     bool stopped = false;
     const RequestStatus status_before_stop = request->status;
@@ -1058,6 +1300,7 @@ EngineCoreOutputs Scheduler::update_from_output(
       // _free_request + _free_blocks (T0 subset): free the KV blocks and record
       // the finished id now; defer the requests-map erase (see above).
       kv_cache_manager->free(*request);
+      free_request_encoder_inputs(*request);
       finished_req_ids.insert(request->request_id);
       finished_ids_to_erase.push_back(request->request_id);
       if (status_before_stop == RequestStatus::kRunning) {

@@ -1,6 +1,10 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 // cuBLASLt matmul for the CUDA backend (M0.6, correctness-grade).
 // Supported dtype combos: (bf16,bf16)->f32, (bf16,bf16)->bf16, (f32,f32)->f32.
+// `matmul_bt` additionally serves (f32 activation, bf16 weight) -- see the
+// block comment above MixedF32ActBf16WeightBT for why that pair is not a
+// widened activation but the shape the CPU arm and this device's own
+// kMatmulBTQuant already answer.
 // Any other combo the public-op validation admits (e.g. f16 inputs) throws
 // here, naming the combo — never silently truncates. Compute type is
 // CUBLAS_COMPUTE_32F with f32 scale; all layouts are CUBLASLT_ORDER_ROW so no
@@ -410,6 +414,61 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
           "cublasLtMatmul");
 }
 
+// ---- (f32 activation, bf16 weight) for the BT lane -------------------------
+//
+// WHY THIS PAIR EXISTS AT ALL, AND WHY THE ANSWER IS NOT "NARROW THE ACTIVATION".
+// `vt::MatmulBT`'s contract is `IsFloat(a) && IsFloat(b)`, and THREE of the four
+// implementations behind it already answer an f32 activation against a typed
+// weight: the CPU elementwise kernel (`cpu_ops.cpp` MatmulChunked<true>, which
+// reads both operands through a dtype-generic getter), the CPU block-quant
+// kernel, and THIS DEVICE'S OWN `kMatmulBTQuant` (`vt::MatmulBTQuant` admits any
+// `IsFloat(a.dtype)`). The cuBLASLt elementwise lane was the only one that did
+// not, and `cuda_deepseek_v4.cu`'s `RouterGateKernel` says so in its own words --
+// it hand-wrote a GEMV because "the CUDA elementwise MatmulBT lacks" this pair.
+// A seam gap that makes callers write private kernels beside it is the shape
+// AGENTS.md "Shared seams" names.
+//
+// THE ACTIVATION IS NOT AN ACCIDENTAL WIDENING, AND THAT WAS CHECKED RATHER THAN
+// ASSUMED. The production caller is `Qwen4ExpGatedResidualKernelCuda`
+// (`cuda_qwen4_exp.cu:414,418,428`), whose three projections read `t_normed`,
+// the grouped-RMSNorm scratch. Upstream narrows there --
+// `Qwen4ExpTextRMSNorm.forward` ends in `output.type_as(x)`
+// (transformers 5.16.0, `models/qwen4_exp/modeling_qwen4_exp.py:173-178`, this
+// row's lane oracle) -- and this tree deliberately does NOT: widen on load,
+// compute in f32, round once on the store, "which is this tree's house contract
+// and what `vt::RmsNorm` says of itself in the same terms". That divergence is
+// RATIFIED and GATED, not incidental: it is recorded under `## Owed` in
+// `.agents/specs/qwen4-exp-flash-next.md`, and reproducing upstream's rounding is
+// mutation **M13**, which is RED in both the host and the device suite (1 of 9
+// cases, 8 assertions). Narrowing the activation here would BE that mutation.
+// On the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` the same three calls carry
+// Q8_0 mix weights and already run on this device through `kMatmulBTQuant`; the
+// float weight is the dequantized/synthetic arm of the identical call.
+//
+// HOW, AND WHAT IT COSTS. cuBLASLt takes ONE data type for A and B, so a mixed
+// pair has to be made uniform. Rounding the activation to bf16 is M13, so the
+// WEIGHT is upcast instead: bf16 -> f32 is EXACT (`bits << 16`, the same upcast
+// `RouterGateKernel` and the CPU `LoadF32` perform), so the f32 lane below then
+// computes the CPU arm's values, with only the GEMM's own K-reassociation
+// between them -- the divergence this file already owns for every other lane.
+// The cost is honest and is stated here rather than discovered later: one
+// [N,K] f32 scratch per call, so the weight is touched at 10 bytes/element
+// instead of 2. Today's only caller projects the hyper-connection mix weights,
+// which are small; a large-weight caller wants a native mixed kernel instead,
+// and that is a performance row, not a correctness one.
+//
+// `cudaMallocAsync`/`cudaFreeAsync` rather than `cudaMalloc`/`cudaFree`: the
+// latter pair is ILLEGAL during CUDA-graph capture and implicitly synchronizes
+// the device, and this is a shared GEMM seam that capture paths reach.
+__global__ void Bf16ToF32UpcastKernel(float* __restrict__ dst,
+                                      const uint16_t* __restrict__ src, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += step) {
+    dst[i] = __uint_as_float(static_cast<uint32_t>(src[i]) << 16);
+  }
+}
+
 // ---- cuBLASLt bf16/f32 "BT" dense GEMM (b = Linear weight [N,K]) -----------
 // out[M,N] = a[M,K] @ b^T with b [N,K] row-major — K contiguous in BOTH
 // operands, the TN layout vLLM's F.linear hits for its bf16 projections. On
@@ -421,16 +480,38 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   const bool bf16_in = a.dtype == DType::kBF16 && b.dtype == DType::kBF16;
   const bool f32_in = a.dtype == DType::kF32 && b.dtype == DType::kF32;
-  if (!bf16_in && !f32_in) {
-    throw std::runtime_error("vt cuda: matmul_bt: unsupported dtype combo " +
-                             ComboName(a, b, out) +
-                             "; supported: (bf16,bf16)->f32|bf16, (f32,f32)->f32|bf16");
+  const bool f32_act_bf16_w = a.dtype == DType::kF32 && b.dtype == DType::kBF16;
+  if (!bf16_in && !f32_in && !f32_act_bf16_w) {
+    throw std::runtime_error(
+        "vt cuda: matmul_bt: unsupported dtype combo " + ComboName(a, b, out) +
+        "; supported: (bf16,bf16)->f32|bf16, (f32,f32)->f32|bf16, (f32,bf16)->f32|bf16");
   }
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
   if (m == 0 || n == 0) return;
   cudaStream_t s = static_cast<cudaStream_t>(q.handle);
   if (k == 0) {
     CheckCuda(cudaMemsetAsync(out.data, 0, out.Bytes(), s), "bt k=0 memset");
+    return;
+  }
+
+  // The mixed pair, made uniform on the WEIGHT and re-entered on the f32 lane.
+  // See the block comment above Bf16ToF32UpcastKernel: the activation is the
+  // ratified f32 scratch of the hyper-connection mixer and rounding it here
+  // would be that row's red mutation M13.
+  if (f32_act_bf16_w) {
+    const int64_t elems = b.Numel();
+    float* w_f32 = nullptr;
+    CheckCuda(cudaMallocAsync(&w_f32, static_cast<size_t>(elems) * sizeof(float), s),
+              "bt mixed (f32,bf16): weight upcast alloc");
+    constexpr unsigned kUpcastBlock = 256;
+    int64_t blocks = (elems + kUpcastBlock - 1) / kUpcastBlock;
+    if (blocks > 65535) blocks = 65535;
+    Bf16ToF32UpcastKernel<<<static_cast<unsigned>(blocks), kUpcastBlock, 0, s>>>(
+        w_f32, static_cast<const uint16_t*>(b.data), elems);
+    CheckCuda(cudaGetLastError(), "bt mixed (f32,bf16): weight upcast launch");
+    Tensor w = Tensor::Contiguous(w_f32, DType::kF32, b.device, {n, k});
+    MatmulBTKernelCuda(q, out, a, w);
+    CheckCuda(cudaFreeAsync(w_f32, s), "bt mixed (f32,bf16): weight upcast free");
     return;
   }
 

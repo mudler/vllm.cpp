@@ -11,6 +11,21 @@ QK-norm+RoPE+gate path
 The first series free of both, at the pin, graphed, and at a pinned clock is in
 [the benchmark record](../../.agents/benchmark-record.md).
 
+**THE PIN MOVED UNDER THESE ROWS, AND THEY HAVE NOT BEEN RE-MEASURED.** The
+parity pin advanced to `e126687a9a` on 2026-09-03
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817)). Every row below that
+says "at the pin" was measured against the PREVIOUS pin `555967922`, with
+FlashInfer `0.6.15.post1`. FlashInfer moves to `0.6.18` at the new pin and is on
+the executed path of these numbers on both sides — it is the NVFP4 GEMM under the
+denominator and the CUTLASS source tree our own arm compiles against. **Four rows
+here owe a re-measurement**: the 27B NVFP4 `nvidia` and 35B-A3B NVFP4 rows, the
+Qwen3.8-27B bf16 c4 row, and the cold-to-`/health` startup row, which is also
+where `nvidia-cutlass-dsl` `4.6.0` to `4.6.2` can move a published number.
+Owed by [#2818](https://github.com/mudler/vllm.cpp/issues/2818). The advance
+preceded the re-measurement by a developer ruling that inverts the sync cycle's
+step order; **a red on the re-measurement requires reverting the pin, not
+withdrawing these rows on their own.** Nothing here is withdrawn today.
+
 | Model | Quant | vLLM oracle | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 (`unsloth` @`890bdef7`) | 0.25.0 ROLLBACK, SUPERSEDED | **115/124** | Effective parity-or-better, two-grid totality. Revision-PINNED (the gate no longer lets `readdir` choose): @`ccdaab7e` is the same repo name re-quantized to FP8 W8A8 throughout, not NVFP4 |

@@ -128,6 +128,7 @@ const ModelFactory kLlamaFactory{
     .forward = &ForwardLlamaForCausalLM,
     .make_kv_cache = &MakeLlamaForCausalLMKVCache,
     .is_dense_model = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

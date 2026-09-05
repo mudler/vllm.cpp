@@ -94,6 +94,48 @@ class DevicePlacement {
   bool trivial_ = true;
 };
 
+// ── W4: the `fit` auto-resolver (#2384) ──────────────────────────────────────
+
+// How the active placement was ARRIVED AT. The install is unconditional, so a
+// fit-resolved plan, a stated one and a bare one all report the same
+// `resolved_layer_count()`; without provenance a reachability test cannot tell a
+// working `--fit` from one that resolved nothing, which is the #2382 trap.
+enum class PlacementOrigin {
+  kNone,   // no placement asked for
+  kStated, // overrides / cpu_moe / n_cpu_moe: the operator said where
+  kFit,    // `--fit`: the resolver decided
+};
+
+const char* PlacementOriginName(PlacementOrigin origin);
+
+// What the fit resolver decided, and the arithmetic it decided it from. The
+// inputs are reported alongside the answer because an operator who cannot see
+// the budget and the footprint cannot tell a wrong placement from a wrong
+// budget.
+struct MoeFitResolution {
+  bool resolved = false;       // false => placed nothing, and `reason` says why
+  int64_t placed_layers = 0;   // trailing layers whose experts go to the CPU
+  size_t budget_bytes = 0;
+  size_t footprint_bytes = 0;
+  size_t placed_bytes = 0;     // what placing those layers removes from the device
+  bool still_exceeds = false;  // every layer placed and it STILL does not fit
+  std::string reason;          // why it resolved to nothing, empty when it did
+};
+
+// THE ARITHMETIC, as a pure function so it is testable with no device, no
+// checkpoint and no loader. `moe_bytes_per_layer` is indexed by layer, and a
+// dense layer contributes 0.
+//
+// Fills from the LAST layer backwards, mirroring `common/fit.cpp`'s back-to-front
+// order, so the layers nearest the output are the first to leave the device.
+//
+// A ZERO budget means UNKNOWN, not "nothing fits" — `device_memory_total_bytes`
+// is 0 on every platform that does not probe one, and treating that as a budget
+// of zero would place every layer on a box that was simply not measured.
+MoeFitResolution ResolveMoeFitFromSizes(
+    size_t footprint_bytes, size_t budget_bytes,
+    const std::vector<size_t>& moe_bytes_per_layer);
+
 // The per-LAYER decision, resolved once from a `DevicePlacement` at model build.
 //
 // WHY A SECOND TYPE. `DevicePlacement` answers by tensor NAME, which is the form
@@ -129,12 +171,41 @@ class MoePlacementPlan {
   // gets the inert answer rather than an exception on the decode path.
   vt::DeviceType DeviceForLayer(int64_t l) const;
 
+  // The device THIS ROUTED-EXPERT TENSOR's block runs on, keyed by the only
+  // thing a weight loader has: the name.
+  //
+  // WHY THE LOADER NEEDS THIS. `RunMoePlaced` hands the placed device to the
+  // forward, but the RESIDENCY of a routed-expert tower is decided far earlier,
+  // by `GgufLoadPolicy::Route`, and that decision is a question about the device
+  // that will EXECUTE the tower — whether it has a `vec_dot` for the encoding.
+  // Asking the engine device about a tower the plan has already sent elsewhere
+  // is how a checkpoint whose experts every placement device can execute is
+  // refused at load. A name with no `blk.<N>.` prefix, and a layer this plan was
+  // not resolved against, both answer the engine device.
+  vt::DeviceType DeviceForRoutedExpertTensor(const std::string& name) const;
+
   // True when at least one layer runs its experts somewhere other than the
   // engine device. The forward reads this to decide whether any of the placement
   // machinery runs at all, so an unplaced model pays nothing.
   bool PlacesAnything() const { return placed_ > 0; }
 
   int64_t placed_layer_count() const { return placed_; }
+
+  // How many layers this plan was RESOLVED against. On an engine whose device is
+  // the placement target — a CPU engine under `cpu_moe`, the ordinary case in a
+  // CPU-only build — an installed plan and a never-installed one agree on every
+  // other accessor: both answer the engine device and both place nothing. This is
+  // the one observable that separates "resolved against THIS model" from "never
+  // installed", which is exactly what the reachability gate has to see (#2314).
+  int64_t resolved_layer_count() const {
+    return static_cast<int64_t>(per_layer_.size());
+  }
+
+  // How this plan was arrived at. See `PlacementOrigin`.
+  PlacementOrigin origin() const { return origin_; }
+  void set_origin(PlacementOrigin origin) { origin_ = origin; }
+  const MoeFitResolution& fit() const { return fit_; }
+  void set_fit(const MoeFitResolution& fit) { fit_ = fit; }
   vt::DeviceType engine_device() const { return engine_device_; }
 
   // One line for the install log, empty when nothing is placed.
@@ -144,6 +215,8 @@ class MoePlacementPlan {
   std::vector<vt::DeviceType> per_layer_;
   vt::DeviceType engine_device_ = vt::DeviceType::kCPU;
   int64_t placed_ = 0;
+  PlacementOrigin origin_ = PlacementOrigin::kNone;
+  MoeFitResolution fit_{};
 };
 
 // The three routed-expert tensor names llama.cpp's GGUF export uses for a layer,
@@ -151,6 +224,12 @@ class MoePlacementPlan {
 // so a test asserts the same strings the resolver asks about rather than a copy
 // of them.
 std::vector<std::string> RoutedExpertTensorNames(int64_t layer);
+
+// The decoder-block index a llama.cpp GGUF tensor name carries (`blk.<N>.…`),
+// or -1 when it carries none. The inverse of `RoutedExpertTensorNames`' own
+// prefix, exposed so a caller resolves the layer with the same rule the plan was
+// built with instead of a private copy of it.
+int64_t GgufBlockIndexFromTensorName(const std::string& name);
 
 // ── The placement device's queue, and the active plan ────────────────────────
 
@@ -170,6 +249,26 @@ vt::Queue& PlacementQueue(vt::DeviceType device);
 // through several model entry points that do not share a config parameter, and
 // threading one through every architecture's signature to serve a feature most
 // loads do not use would be the wider change.
+// Dump layer `layer_index`'s MoE block output, ONCE, when `VT_PLACEMENT_DUMP_MOE`
+// names a file. Exists so the placement correctness gate can compare a PLACED
+// run against an UNPLACED one NUMERICALLY.
+//
+// WHY A NUMERIC COMPARISON AND NOT A TOKEN ONE. A placed layer computes its
+// experts with the CPU MoE kernels instead of the accelerator's, and this
+// project's cross-device bar for reducing arithmetic is NMSE <= 5e-4 rather than
+// bitwise equality (`tests/vt/test_backend_cross_device.cpp`). Greedy decode
+// amplifies any perturbation inside that tolerance into a different token, so
+// placed-vs-unplaced TOKEN equality asserts something unachievable -- measured
+// on GB10, both arms answer the prompt correctly and diverge mid-sentence. The
+// gateable claim is that the block outputs agree within the bar, and this is
+// what lets a gate read them.
+//
+// INERT unless the variable is set: no allocation, no copy, one `getenv` latched
+// on first use. First matching call only, so it costs nothing per token.
+void MaybeDumpMoeBlockOutput(int64_t layer_index, vt::Backend& b, vt::Queue& q,
+                             const void* data, int64_t elems, bool data_is_host,
+                             vt::DType dtype);
+
 void SetActiveMoePlacementPlan(const MoePlacementPlan& plan);
 const MoePlacementPlan& ActiveMoePlacementPlan();
 void ResetActiveMoePlacementPlanForTesting();

@@ -30,6 +30,7 @@
 #include "vt/device.h"  // kNumDeviceTypes
 #include "vt/dtype.h"   // VT_CHECK
 #include "vt/ops.h"
+#include "vt/tensor.h"  // vt::kMaxRank
 
 namespace vllm {
 namespace dense_attn {
@@ -44,8 +45,42 @@ struct Dev {
   Queue& q;
 };
 
+// The one rank bound, in one place, because it has TWO callers that must not
+// disagree: `MakeTensor` below, and `DBuf`'s constructor, which has to refuse
+// BEFORE it draws a pool block (see the comment there).
+inline void CheckRank(size_t rank) {
+  VT_CHECK(rank <= static_cast<size_t>(vt::kMaxRank),
+           "dense_attn: rank exceeds vt::Tensor's kMaxRank (4); vt::Tensor "
+           "stores shape and stride in fixed int64_t[4] arrays and a wider rank "
+           "writes past both");
+}
+
+// THE RANK BOUND (#2435) is `CheckRank` above, and it is the same one
+// `vt::Tensor::Contiguous` (src/vt/tensor.cpp:19-20) has always carried.
+// `vt::Tensor` fixes `kMaxRank = 4` and stores `int64_t shape[4]` and
+// `int64_t stride[4]` (include/vt/tensor.h:12); the loop below indexes both by
+// `i` up to `shape.size() - 1`, so a rank-5 shape wrote eight bytes past the
+// end of each.
+//
+// IT IS NOT A HARMLESS OVERRUN AND IT IS NOT A CRASH, which is why no value
+// gate could see it. `shape[4]` lands on `stride[0]`, which the `i == 0`
+// iteration then rewrites correctly, so the shape damage heals itself.
+// `stride[4]` lands on the three STORAGE MARKERS, and the first iteration
+// writes `acc == 1` there — setting `Tensor::repacked` on a tensor nothing ever
+// repacked. That marker is what `kMatmulBTQuant` reads to choose the i8mm
+// interleaved gemm over the plain one, so the damage is a wrong kernel choice
+// waiting for a weight, not a fault. `test_qwen4_exp_layer_loop` reported the
+// oracle match and aborted under `-fno-sanitize-recover=all` before a single
+// assertion ran; that abort is what has reddened `sanitize-cpu
+// (address,undefined)` on every open pull request.
+//
+// This throws rather than truncating. A silently truncated rank is the same
+// class of defect one level quieter: the buffer would still be sized from the
+// full product, and every consumer would read a tensor whose shape does not
+// describe its bytes.
 inline Tensor MakeTensor(void* data, DType dt, vt::Device dev,
                          const std::vector<int64_t>& shape) {
+  CheckRank(shape.size());
   Tensor t;
   t.data = data;
   t.dtype = dt;
@@ -139,6 +174,13 @@ class DBuf {
   DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
        const void* host = nullptr)
       : b_(&d.b) {
+    // THE RANK BOUND FIRST, ahead of the pool block (#2435). `MakeTensor` at
+    // the bottom of this body is the writer that refuses, and by then
+    // `pool_->Get` has already handed out an allocation. A constructor that
+    // throws never runs its own destructor, so the block would be stranded —
+    // the refusal would trade an out-of-bounds write for a leak. Checking here
+    // costs one comparison on a path that is about to allocate anyway.
+    CheckRank(shape.size());
     int64_t numel = 1;
     for (int64_t s : shape) numel *= s;
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
@@ -249,6 +291,60 @@ class DBuf {
   size_t cap_ = 0;
   Tensor t_{};
 };
+
+// ── The ONE install of an f32-upcast weight (#2711) ─────────────────────────
+//
+// `ResidentWeightF32` exists TWICE -- here in `dense_attn_block.h`, which 49
+// translation units under `src/vllm/model_executor/models/` include, and as a
+// private twin in `qwen3_5.cpp` that stays private on purpose (`:790`). Both
+// carried the same defect, so a repair applied once left it standing. This is
+// the body both now install through, and it is the reason there is one repair
+// rather than two.
+//
+// WHY `f` IS TAKEN BY VALUE AND NAMED. It is the copy SOURCE, and its lifetime
+// is the entire bug. `Backend::Copy` is ASYNCHRONOUS on both device backends --
+// `cudaMemcpyAsync` (`src/vt/cuda/cuda_backend.cu:116-118`) and `hipMemcpyAsync`
+// (`src/vt/rocm/rocm_backend.hip:269-271`) -- and this source is ordinary
+// PAGEABLE heap memory, which the driver may read at any point until the queue
+// drains. Both callers used to build it in a function-local vector and let it
+// die at their closing brace, with nothing in between that drained anything.
+//
+// THE `Synchronize` IS THE FIX, and the tree already states its rule for the
+// same hazard: `glm5_next_kv.cpp:143-150` drains on EVERY span rather than once
+// at the end, because a deferred wait "would hand the driver a pageable source
+// that the next iteration has already overwritten." Same hazard, now handled the
+// same way.
+//
+// WHY NOT KEEP THE SOURCE ALIVE INSTEAD. `vt::Backend` has no completion
+// callback and nothing polls `Event`, so "alive until the copy retires"
+// degenerates to "alive for the model's lifetime" -- a permanent host allocation
+// per upcast weight, reinstating exactly the second host copy
+// `AdoptDeviceBytesAsHost` and `ReleaseResidentQwen3_5DenseHostWeights` exist to
+// drop. The drain is memoised on `d_dev_f32`, so it runs ONCE per distinct
+// weight per process rather than per forward or per token.
+//
+// THE SIBLING `ResidentWeight` DOES NOT DRAIN, AND IS RIGHT NOT TO. Its source
+// is `w.bytes`, an owned buffer or a file mapping that outlives the call. The
+// asymmetry between the two helpers is the whole defect, not an oversight in
+// the other one.
+inline void InstallResidentF32(Dev d, const OwnedTensor& w,
+                               std::vector<float> f) {
+  // Aliasing is a CPU property and not a not-CUDA one (#125, #1946): the
+  // predicate this replaced was `!is_cuda()`, which handed a plain heap pointer
+  // to kMETAL, kVULKAN and kXPU. All three reach the upload arm below.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+    auto* buf = new std::vector<float>(std::move(f));
+    w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
+    return;
+  }
+  const size_t nb = f.size() * sizeof(float);
+  void* p = d.b.Alloc(nb);
+  d.b.Copy(d.q, p, f.data(), nb);
+  // BEFORE `f` GOES OUT OF SCOPE, and before this function returns. See above.
+  d.b.Synchronize(d.q);
+  Backend* bk = &d.b;
+  w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+}
 
 }  // namespace dense_attn
 }  // namespace vllm

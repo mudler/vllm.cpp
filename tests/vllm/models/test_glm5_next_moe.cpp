@@ -43,6 +43,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -51,6 +52,8 @@
 
 #include "nlohmann/json.hpp"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
+#include "vllm/model_executor/models/dense_device_glue.h"  // W9c-3a: dense_attn::Dev
+#include "vt/backend.h"                                    // W9c-3a: vt::GetBackend
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_bridge.h"  // W9a: AdmitMoeQuantBanks
 #include "vllm/transformers_utils/hf_config.h"
@@ -966,4 +969,286 @@ TEST_CASE("glm5_next moe keep-quant: admission declines, refuses, and admits") {
     // The view aims at the bank's own bytes: no copy, no decode.
     CHECK(banks.gate.data == static_cast<const void*>(src.gate_exps.bytes.data()));
   }
+}
+
+// ─── W9c-3a: the DEVICE arm of the routed-expert GEMM (#2464) ────────────────
+//
+// The arm runs here on a CPU-backed `dense_attn::Dev`, which is not a
+// simulation of the CUDA path but the SAME code with `ResidentWeight` taking
+// its host-alias branch (`dense_attn_block.h:196`) and `DBuf` allocating
+// through the CPU backend. What that gates is every part of the arm except the
+// kernels themselves: the source-pointer plumbing, the fit guard's CPU clause,
+// the operand shapes, the `[E*N, K]` rank change, the download, and the
+// selection between the two arms. The CUDA kernels are gated on `dgx:gpu0`,
+// because a `sm_121a` result is the only thing that speaks for `sm_121a`.
+
+TEST_CASE("glm5_next moe W9c-3a: the bridge hands the device arm the SOURCE "
+          "tensors and not the views") {
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights src = KqSource(d);
+  gn::MoeQuantBanks banks;
+  REQUIRE(gn::AdmitMoeQuantBanks(src, d, "moe", &banks));
+
+  // The three pointers exist and aim at the loader's own tensors. Pointer
+  // IDENTITY and not equality of contents: `ResidentWeight` memoizes its upload
+  // on `OwnedTensor::d_dev`, so a bank identified by a copy would re-upload
+  // 2.25 GiB per sparse layer per token at the published geometry, and every
+  // shape and dtype assertion would still pass.
+  CHECK(banks.HasSources());
+  CHECK(banks.gate_src == &src.gate_exps);
+  CHECK(banks.up_src == &src.up_exps);
+  CHECK(banks.down_src == &src.down_exps);
+
+  // A declined bank set leaves them null rather than dangling.
+  vllm::Glm5NextMoeWeights f32src = KqSource(d);
+  f32src.gate_exps = F32Tensor({d.n_routed_experts, d.moe_intermediate_size,
+                                d.hidden_size}, 0x11U, 0.02F);
+  f32src.up_exps = F32Tensor({d.n_routed_experts, d.moe_intermediate_size,
+                              d.hidden_size}, 0x12U, 0.02F);
+  f32src.down_exps = F32Tensor({d.n_routed_experts, d.hidden_size,
+                                d.moe_intermediate_size}, 0x13U, 0.02F);
+  gn::MoeQuantBanks declined;
+  CHECK_FALSE(gn::AdmitMoeQuantBanks(f32src, d, "moe", &declined));
+  CHECK_FALSE(declined.HasSources());
+}
+
+TEST_CASE("glm5_next moe W9c-3a: the device arm computes the SAME block as the "
+          "host keep-quant arm") {
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights src = KqSource(d);
+  vt::Queue q = CpuQueue();
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(src, d, "moe");
+  REQUIRE(w.has_quant_banks);
+  REQUIRE(w.quant_banks.HasSources());
+
+  constexpr int64_t kT = 3;
+  std::mt19937 rng(0x9C3A);
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  const std::vector<float> host = gn::MoeForward(d, w, hidden, kT, q, nullptr);
+  vllm::dense_attn::Dev dev{vt::GetBackend(vt::DeviceType::kCPU), q};
+  const std::vector<float> devd = gn::MoeForward(d, w, hidden, kT, q, &dev);
+
+  REQUIRE(host.size() == static_cast<size_t>(kT * d.hidden_size));
+  REQUIRE(devd.size() == host.size());
+  // EXACTLY equal, not within a band, and the reason is worth stating because a
+  // tolerance here would be a mute switch. Both arms hand the identical bytes
+  // to the identical CPU providers in the identical order; the only difference
+  // is where the operands live, and on a CPU `Dev` that is the same place. A
+  // band would pass a device arm that fed the kernels a different activation,
+  // which is the one defect this case exists to see.
+  size_t differing = 0;
+  for (size_t i = 0; i < host.size(); ++i) {
+    REQUIRE(std::isfinite(host[i]));
+    REQUIRE(std::isfinite(devd[i]));
+    if (host[i] != devd[i]) ++differing;
+  }
+  CHECK(differing == 0);
+  // NOT all zeros. A device arm that downloaded nothing would agree with a host
+  // arm that also produced nothing, and the loop above would report 0.
+  const double mag = std::accumulate(
+      devd.begin(), devd.end(), 0.0,
+      [](double a, float x) { return a + std::fabs(static_cast<double>(x)); });
+  CHECK(mag > 1e-3);
+}
+
+TEST_CASE("glm5_next moe W9c-3a: `dev` SELECTS the source-reading arm, and this "
+          "is what a numeric gate cannot see") {
+  // THE REACHABILITY DISCRIMINATOR for this seam.
+  //
+  // The two arms agree bit-for-bit on a CPU `Dev` (the case above), so a
+  // `MoeForward` that ignored `dev` entirely would pass every numeric assertion
+  // in this file. What separates them is WHICH pointer each reads: the host arm
+  // reads `quant_banks.gate/up/down` (the views), the device arm reads
+  // `gate_src/up_src/down_src` (the tensors). Point them at DIFFERENT weights
+  // and the two arms must disagree.
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights a = KqSource(d);
+  vllm::Glm5NextMoeWeights b = KqSource(d);
+  b.gate_exps = Q2KBank(d.n_routed_experts, d.moe_intermediate_size,
+                        d.hidden_size, 0xABCDU);
+  b.up_exps = Q2KBank(d.n_routed_experts, d.moe_intermediate_size,
+                      d.hidden_size, 0xDCBAU);
+  b.down_exps = Q2KBank(d.n_routed_experts, d.hidden_size,
+                        d.moe_intermediate_size, 0xFEEDU);
+
+  vt::Queue q = CpuQueue();
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(a, d, "moe");
+  REQUIRE(w.has_quant_banks);
+  // Views from A, sources from B.
+  w.quant_banks.gate_src = &b.gate_exps;
+  w.quant_banks.up_src = &b.up_exps;
+  w.quant_banks.down_src = &b.down_exps;
+
+  constexpr int64_t kT = 2;
+  std::mt19937 rng(0x5E1EC7);
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  const std::vector<float> from_views = gn::MoeForward(d, w, hidden, kT, q, nullptr);
+  vllm::dense_attn::Dev dev{vt::GetBackend(vt::DeviceType::kCPU), q};
+  const std::vector<float> from_sources = gn::MoeForward(d, w, hidden, kT, q, &dev);
+
+  REQUIRE(from_views.size() == from_sources.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < from_views.size(); ++i) {
+    REQUIRE(std::isfinite(from_views[i]));
+    REQUIRE(std::isfinite(from_sources[i]));
+    if (from_views[i] != from_sources[i]) ++differing;
+  }
+  // The SHARED expert is added to both and is identical, so a handful of
+  // coincidences are possible; a majority is not. Asserting "more than half"
+  // rather than "all" keeps this a statement about which weights were read and
+  // not about the arithmetic.
+  CHECK(differing > from_views.size() / 2);
+
+  // And with the sources REMOVED, `dev` cannot select that arm and the result
+  // returns to the views'. This is the second half of the discriminator: it
+  // shows the split is the source pointers and not the `dev` pointer alone.
+  gn::MoeLayerWeights nosrc = w;
+  nosrc.quant_banks.gate_src = nullptr;
+  nosrc.quant_banks.up_src = nullptr;
+  nosrc.quant_banks.down_src = nullptr;
+  const std::vector<float> fallback = gn::MoeForward(d, nosrc, hidden, kT, q, &dev);
+  REQUIRE(fallback.size() == from_views.size());
+  for (size_t i = 0; i < fallback.size(); ++i) CHECK(fallback[i] == from_views[i]);
+}
+
+TEST_CASE("glm5_next moe W9c-3a: the keep-quant HOST arm refuses a non-CPU "
+          "queue by name") {
+  // The host arm's four operands are `std::vector` buffers. It used to be
+  // unreachable on a device queue because the FORWARD refused one; now the
+  // forward admits CUDA and hands this function a CPU queue explicitly, so the
+  // precondition is asserted where it is depended on.
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights src = KqSource(d);
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(src, d, "moe");
+  REQUIRE(w.has_quant_banks);
+  vt::Queue cuda{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
+
+  constexpr int64_t kT = 1;
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size), 0.05F);
+  // No `dev`, so the device arm is not selected and the host arm sees the CUDA
+  // queue. `RouteTopk` refuses first and by its own name; that refusal is the
+  // one a caller meets, and it is asserted rather than the deeper one.
+  CHECK_THROWS_AS(gn::MoeForward(d, w, hidden, kT, cuda, nullptr), std::exception);
+}
+
+namespace {
+
+// A CUDA queue that is destroyed with the case. Mirrors
+// `test_glm5_next_kpool_device.cpp:113-120` rather than opening a second idiom.
+struct CudaQueueGuard {
+  vt::Backend& b;
+  vt::Queue q;
+  explicit CudaQueueGuard(vt::Backend& backend)
+      : b(backend), q(backend.CreateQueue()) {}
+  ~CudaQueueGuard() { b.DestroyQueue(q); }
+  CudaQueueGuard(const CudaQueueGuard&) = delete;
+  CudaQueueGuard& operator=(const CudaQueueGuard&) = delete;
+};
+
+vt::Backend* CudaBackendOrNull() {
+  return vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, 0});
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next moe W9c-3a: the CUDA device arm agrees with the host arm "
+          "within the activation band") {
+  // THE ONE CASE IN THIS FILE THAT NEEDS A GPU, and it skips loudly rather than
+  // passing quietly on a host lane. A doctest `assertions: 0` line is a skip
+  // wearing a pass, so the device job reads the count and not the exit code.
+  vt::Backend* cuda = CudaBackendOrNull();
+  if (cuda == nullptr) {
+    MESSAGE("no CUDA backend: the glm5_next MoE device-arm gate is SKIPPED");
+    return;
+  }
+  CudaQueueGuard cq(*cuda);
+  vt::Queue host_q = CpuQueue();
+
+  // Real ROW WIDTHS rather than a toy: `hidden_size` 4096 and
+  // `moe_intermediate_size` 2048 are the published checkpoint's, so the Q8_K
+  // super-block count per row is the artifact's. The EXPERT COUNT is 8 and not
+  // 288, because what changes with E is the size of the tower and not the
+  // kernel's arithmetic, and 288 experts at these widths is 2.4 GiB of fixture
+  // this case does not need to allocate to answer its question. The published
+  // 288-expert residency is measured by the end-to-end leg on `dgx:gpu0`.
+  gn::MoeDims d;
+  d.hidden_size = 4096;
+  d.n_routed_experts = 8;
+  d.n_shared_experts = 1;
+  d.num_experts_per_tok = 4;
+  d.moe_intermediate_size = 2048;
+  d.n_group = 1;
+  d.topk_group = 1;
+  d.routed_scaling_factor = 2.5;
+  d.norm_topk_prob = true;
+  d.swiglu_limit = 10.0F;
+  d.Validate();
+
+  vllm::Glm5NextMoeWeights src;
+  src.router = F32Tensor({d.n_routed_experts, d.hidden_size}, 0xC0DAU, 0.05F);
+  src.e_score_correction_bias =
+      F32Tensor({d.n_routed_experts}, 0xC0DBU, 0.01F);
+  src.gate_exps = Q2KBank(d.n_routed_experts, d.moe_intermediate_size,
+                          d.hidden_size, 0xC1U);
+  src.up_exps = Q2KBank(d.n_routed_experts, d.moe_intermediate_size,
+                        d.hidden_size, 0xC2U);
+  src.down_exps = Q2KBank(d.n_routed_experts, d.hidden_size,
+                          d.moe_intermediate_size, 0xC3U);
+  const int64_t si = d.shared_intermediate_size();
+  src.shared.gate_proj = F32Tensor({si, d.hidden_size}, 0xC4U, 0.03F);
+  src.shared.up_proj = F32Tensor({si, d.hidden_size}, 0xC5U, 0.03F);
+  src.shared.down_proj = F32Tensor({d.hidden_size, si}, 0xC6U, 0.03F);
+
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(src, d, "moe");
+  REQUIRE(w.has_quant_banks);
+  REQUIRE(w.quant_banks.HasSources());
+
+  constexpr int64_t kT = 3;
+  std::mt19937 rng(0xC0DA55U);
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  const std::vector<float> host = gn::MoeForward(d, w, hidden, kT, host_q, nullptr);
+  vllm::dense_attn::Dev dev{*cuda, cq.q};
+  const std::vector<float> devd = gn::MoeForward(d, w, hidden, kT, host_q, &dev);
+
+  REQUIRE(host.size() == static_cast<size_t>(kT * d.hidden_size));
+  REQUIRE(devd.size() == host.size());
+  // A BAND and not equality here, and the difference from the CPU-`Dev` case
+  // above is the reason: there the two arms ran the identical CPU provider on
+  // the identical bytes, so equality was the right assertion. Here the CUDA
+  // integer-dot GEMM and the CPU one reduce in different orders over the same
+  // Q8_K activation, so they agree to a band. The band is `kKeepQuantBand`, the
+  // one W9a already established between this seam and the f32 arm, and it is
+  // not widened for this case.
+  double num = 0.0;
+  double den = 0.0;
+  double maxabs = 0.0;
+  for (size_t i = 0; i < host.size(); ++i) {
+    REQUIRE(std::isfinite(host[i]));
+    REQUIRE(std::isfinite(devd[i]));
+    const double diff = static_cast<double>(host[i]) - static_cast<double>(devd[i]);
+    num += diff * diff;
+    den += static_cast<double>(host[i]) * static_cast<double>(host[i]);
+    maxabs = std::max(maxabs, std::fabs(static_cast<double>(devd[i])));
+  }
+  const double nmse = den > 0.0 ? num / den : num;
+  MESSAGE("glm5_next MoE device arm NMSE vs host arm: " << nmse);
+  CHECK(nmse < kKeepQuantBand);
+  // NOT zeros, and NOT the host buffer left untouched. A device arm that
+  // launched nothing would leave `expert_out` as the caller allocated it, and
+  // an NMSE against a zero vector is 1.0 rather than 0 -- but a device arm that
+  // never ran AND a combine that read a zero expert output would still produce
+  // the shared expert alone, which is finite and plausible. So the magnitude is
+  // asserted and the two are asserted to be CLOSE, not merely both finite.
+  CHECK(maxabs > 1e-3);
+  CHECK(nmse > 0.0);  // the two arms are DIFFERENT code; an exact 0 here would
+                      // mean the device arm was never selected.
 }

@@ -496,7 +496,7 @@ source is public and defines the packing**, and that is the cross-check owed.
 Recorded 2026-08-13 from L11. §3 says: *"Where they disagree, the disagreement is the
 finding."* This is the first place they actually do, and it is not a cosmetic difference.
 
-**The noised-state composition.** `ltx_core`'s `latent_cond.py:38-39` leaves the NOISY tensor
+**The noised-state composition.** `ltx_core`'s `latent_cond.py:40-41` leaves the NOISY tensor
 untouched and lets the noiser compose it. diffusers writes clean tokens INTO the noisy tensor
 (`pipeline_ltx2_condition.py:1002`). **The two agree only at `noise_scale == 1`.**
 

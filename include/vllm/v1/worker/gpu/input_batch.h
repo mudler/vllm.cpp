@@ -56,8 +56,11 @@
 //     SPEC-MTP (I2 ABI freeze). They are inert on the default path: with no
 //     speculator configured the runner never calls update_req_spec_token_ids, so
 //     spec_token_ids stays empty and num_accepted_tokens stays 1 everywhere.
-//   - Multimodal: mm_features / req_prompt_embeds / prompt_is_token_ids /
-//     is_token_ids.
+//   - Multimodal: mm_features (on CachedRequestState) and the M-RoPE pair are
+//     LANDED for ENG-MM-INPUT-PIPELINE P2 (#2379); see the field notes. All
+//     three are per-REQUEST state on CachedRequestState, not per-slot InputBatch
+//     arrays, so nothing in the slot machinery (add/remove/condense/swap) moves.
+//     STILL DEFERRED: req_prompt_embeds / prompt_is_token_ids / is_token_ids.
 //   - Structured output / logits processors: batch_update_builder's added/moved
 //     tracking, logitsprocs, allowed_token_ids_mask, bad_words_token_ids,
 //     thinking-budget. Only the REMOVED-index tracking (which drives add-hole
@@ -78,6 +81,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vllm/multimodal/inputs.h"  // MultiModalFeatureSpec (P2, #2379)
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/sched/output.h"  // NewRequestData (from_new_request)
 #include "vllm/v1/sample/metadata.h"    // SamplingMetadata (make_sampling_metadata)
@@ -87,7 +91,8 @@ namespace vllm::v1 {
 
 // The worker's cached, persistent copy of a scheduled request.
 // (Upstream: vllm/v1/worker/gpu_input_batch.py CachedRequestState — T0 field
-// subset; mm_features / generator / lora / prompt_embeds / pooling DEFERRED.)
+// subset; generator / lora / prompt_embeds / pooling DEFERRED. mm_features and
+// the M-RoPE pair are LANDED, P2 #2379.)
 struct CachedRequestState {
   std::string req_id;
   // Upstream list[int] | None; always the token path at T0.
@@ -103,6 +108,26 @@ struct CachedRequestState {
   // num_prompt_tokens (upstream __post_init__ via
   // length_from_prompt_token_ids_or_embeds); no prompt_embeds at T0.
   int num_prompt_tokens = 0;
+
+  // ── ENG-MM-INPUT-PIPELINE P2 (#2379) ──────────────────────────────────────
+  // mm_features: the worker's copy of the request's multimodal items
+  // (gpu_model_runner.py:1293 `mm_features=new_req_data.mm_features`, grep -c ==
+  // 1). The encoder step runs the tower over the items the scheduler named, the
+  // gather slices their outputs into this step's token window, and the M-RoPE
+  // init reads their spans. EMPTY on every text request, and the runner's whole
+  // mm arm is predicated on some request in the step having a non-empty one.
+  std::vector<multimodal::MultiModalFeatureSpec> mm_features;
+
+  // mrope_positions: [3 * num_prompt_tokens] row-major, computed ONCE at
+  // admission (gpu_model_runner.py:1654 `_init_mrope_positions`, grep -c == 1)
+  // because it needs the whole prompt. EMPTY unless the model declares an
+  // M-RoPE hook AND this request carries mm items.
+  std::vector<int32_t> mrope_positions;
+  // mrope_position_delta: THE cross-step carrier (gpu_model_runner.py:2786,
+  // grep -c == 1). A completion position is `context_len + i + delta` on all
+  // three axes, so no completion position is ever stored — which is why a
+  // request that decodes for a thousand steps still costs one int here.
+  int64_t mrope_position_delta = 0;
 
   // Build a CachedRequestState from the MRV2 NewRequestData contract. The seed
   // is prefill_token_ids (= all_token_ids): prompt_token_ids is the prompt,

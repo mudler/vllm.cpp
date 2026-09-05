@@ -21,6 +21,8 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <string>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -38,6 +40,28 @@ using vt::Queue;
 using vt::Tensor;
 
 namespace {
+// Restores the previous value at scope exit, so a pinned flag cannot leak into
+// a later case in the same binary (KERNEL-GDN-CHUNKED-MIRROR T9/R10).
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    if (old != nullptr) { had_old_ = true; old_ = old; }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_) setenv(name_.c_str(), old_.c_str(), 1);
+    else unsetenv(name_.c_str());
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
 
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Queue CpuQ() { return Queue{Cpu(), nullptr}; }
@@ -200,6 +224,82 @@ TEST_CASE("kda recurrence: g broadcast from per-head scalar == vt::GdnPrefill (b
     if (st_kda[i] != st_gdn[i]) ++st_diff;
   CHECK(out_diff == 0);
   CHECK(st_diff == 0);
+}
+
+// ── (1b) THE ARM THAT CLAIM HOLDS ON — KERNEL-GDN-CHUNKED-MIRROR T7/G6 ────────
+// The case above is entirely f32 (every tensor in it is kF32), so D0's dtype
+// predicate leaves it green after this row: at f32 vt::GdnPrefill still runs the
+// sequential recurrence, which is what vt::KdaGatedDeltaRule reduces to. That
+// green is TRUE, and it is also NARROWER than it reads. Left alone it would be a
+// true assertion standing in for one that stopped being true, which is worse
+// than a red.
+//
+// The spec's resolution, taken here rather than in the test: the KDA row's claim
+// is about the RECURRENCE, not about which evaluation order our GDN default
+// happens to take, so the reduction is restated as holding on the SEQUENTIAL
+// arm — and this case pins the other half explicitly. At bf16, vt::GdnPrefill
+// takes vLLM's chunked decomposition while vt::KdaGatedDeltaRule has no chunked
+// arm at all, so the two MUST differ. Asserting that is what stops the narrowing
+// from being silent. The `== 0` above is NOT weakened to a tolerance
+// (stop condition 6); it is scoped, and this is the scope.
+TEST_CASE("kda recurrence: at bf16 vt::GdnPrefill takes the chunked arm and KDA does not") {
+  // PINNED ON: this case is about what the CHUNKED arm does, so it must not
+  // depend on the ambient VT_GDN_CHUNKED.
+  ScopedEnv chunked_on("VT_GDN_CHUNKED", "1");
+  const int64_t T = 70, H = 2, D = 64;  // > one chunk, so the state carry runs
+  const int64_t proj = H * D;
+  auto q = L2NormRows(RandF32(static_cast<size_t>(T) * proj, 31), static_cast<size_t>(T) * H,
+                      static_cast<size_t>(D));
+  auto k = L2NormRows(RandF32(static_cast<size_t>(T) * proj, 32), static_cast<size_t>(T) * H,
+                      static_cast<size_t>(D));
+  auto v = RandF32(static_cast<size_t>(T) * proj, 33);
+  auto beta = RandF32(static_cast<size_t>(T) * H, 34, 0.1f, 0.9f);
+  auto ghead = RandF32(static_cast<size_t>(T) * H, 35, -1.0f, -0.01f);
+  std::vector<float> gchan(static_cast<size_t>(T) * proj);
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t h = 0; h < H; ++h)
+      for (int64_t d = 0; d < D; ++d)
+        gchan[static_cast<size_t>((t * H + h) * D + d)] = ghead[static_cast<size_t>(t * H + h)];
+  std::vector<uint16_t> qb(q.size()), kb(k.size()), vb(v.size());
+  for (size_t i = 0; i < q.size(); ++i) qb[i] = vt::F32ToBF16(q[i]);
+  for (size_t i = 0; i < k.size(); ++i) kb[i] = vt::F32ToBF16(k[i]);
+  for (size_t i = 0; i < v.size(); ++i) vb[i] = vt::F32ToBF16(v[i]);
+  const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+  const float scale = 0.125f;
+  Queue cq = CpuQ();
+
+  std::vector<uint16_t> o_kda(static_cast<size_t>(T) * proj, 0), o_gdn(o_kda.size(), 0);
+  std::vector<float> st_kda(static_cast<size_t>(H) * D * D, 0.0f), st_gdn(st_kda.size(), 0.0f);
+  Tensor tq = MakeT(qb.data(), DType::kBF16, Cpu(), {T, H, D});
+  Tensor tk = MakeT(kb.data(), DType::kBF16, Cpu(), {T, H, D});
+  Tensor tv = MakeT(vb.data(), DType::kBF16, Cpu(), {T, H, D});
+  Tensor tb = MakeT(beta.data(), DType::kF32, Cpu(), {T, H});
+  Tensor tqsl = MakeT(const_cast<int32_t*>(qsl), DType::kI32, Cpu(), {2});
+  {
+    Tensor to = MakeT(o_kda.data(), DType::kBF16, Cpu(), {T, H, D});
+    Tensor tg = MakeT(gchan.data(), DType::kF32, Cpu(), {T, H, D});
+    Tensor ts = MakeT(st_kda.data(), DType::kF32, Cpu(), {1, H, D, D});
+    vt::KdaGatedDeltaRule(cq, to, tq, tk, tv, tg, tb, ts, tqsl, GdnArgs{scale});
+  }
+  {
+    Tensor to = MakeT(o_gdn.data(), DType::kBF16, Cpu(), {T, H, D});
+    Tensor tg = MakeT(ghead.data(), DType::kF32, Cpu(), {T, H});
+    Tensor ts = MakeT(st_gdn.data(), DType::kF32, Cpu(), {1, H, D, D});
+    vt::GdnPrefill(cq, to, tq, tk, tv, tg, tb, ts, tqsl, GdnArgs{scale});
+  }
+  size_t out_diff = 0;
+  double max_st = 0.0;
+  for (size_t i = 0; i < o_kda.size(); ++i) out_diff += o_kda[i] != o_gdn[i] ? 1 : 0;
+  for (size_t i = 0; i < st_kda.size(); ++i)
+    max_st = std::max(max_st, std::abs(static_cast<double>(st_kda[i]) - st_gdn[i]));
+  MESSAGE("bf16: KDA(sequential) vs GdnPrefill(chunked) out elements differing: "
+          << out_diff << " / " << o_kda.size() << ", state max|d|=" << max_st);
+  // They are two evaluation orders of ONE recurrence, so they must differ...
+  CHECK(out_diff > 0);
+  CHECK(max_st > 0.0);
+  // ...and still agree to the chunk-vs-sequential scale, not arbitrarily. If
+  // this half fails, the two are not computing the same recurrence any more.
+  CHECK(max_st < 5e-2);
 }
 
 // ── (2) PER-CHANNEL: distinct per-channel decay vs the f64 island reference ───

@@ -1,0 +1,204 @@
+
+===== 0. worker identity, and the environment this run REFUSES to inherit =====
+2026-09-04T07:50:52Z
+hostname=rc-worker-lcjhd nproc=32
+RC_JOB_ID=0d0e57c3-eaad-4b1a-9d13-3cc586814d0c RC_DEVICE=strix:gpu0
+boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+HSA_OVERRIDE_GFX_VERSION=UNSET  <- must be UNSET
+inherited_env NONE
+podrun_resolves_to=function
+               total        used        free      shared  buff/cache   available
+Mem:              62           3          16           0          42          58
+Filesystem             Size  Used Avail Use% Mounted on
+overlay                1.9T  645G  1.2T  37% /
+//192.168.68.102/Data  7.3T  6.2T  1.2T  85% /workspace
+
+===== 1. THE VEHICLE, verified ON the worker =====
+2026-09-04T07:50:52Z
+staging /workspace/ckpt/qwen36-27b-q4km/Qwen3.6-27B-Q4_K_M.gguf -> /tmp/rocm-strix-q4k/models/Qwen3.6-27B-Q4_K_M.gguf
+gguf_bytes=16817244384  expected=16817244384
+gguf_sha256=5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0
+gguf_sha256_expected=5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0
+vehicle_repo=unsloth/Qwen3.6-27B-GGUF
+vehicle_revision=82d411acf4a06cfb8d9b073a5211bf410bfc29bf
+total 22400
+drwxrwxr-x 2 1002 10001        0 Sep  4 07:13 .
+drwxrwxr-x 2 1002 10001        0 Sep  4 07:13 ..
+-rw-rw-r-- 1 1002 10001     7764 Sep  4 07:13 chat_template.jinja
+-rw-rw-r-- 1 1002 10001     4308 Sep  4 07:13 config.json
+-rw-rw-r-- 1 1002 10001      202 Sep  4 07:13 generation_config.json
+-rw-rw-r-- 1 1002 10001  3353259 Sep  4 07:13 merges.txt
+-rw-rw-r-- 1 1002 10001      390 Sep  4 07:13 preprocessor_config.json
+-rw-rw-r-- 1 1002 10001 12807982 Sep  4 07:13 tokenizer.json
+-rw-rw-r-- 1 1002 10001    16718 Sep  4 07:13 tokenizer_config.json
+-rw-rw-r-- 1 1002 10001      385 Sep  4 07:13 video_preprocessor_config.json
+-rw-rw-r-- 1 1002 10001  6722759 Sep  4 07:13 vocab.json
+mmproj_bytes=931146304  expected=931146304
+mmproj_sha256=05353347512982ee62317b9d8c89372bc815f4b4043580e7ef3ad411ec1a1cd3
+
+===== 2. THE BINARY UNDER TEST IS THE ONE THE ARM'S GATE RAN =====
+2026-09-04T08:02:52Z
+vllm-bench   d7292e3895fb4887149ec3c5902cc08fa080f88e0f8851d61848753466b6501d
+tokenize     8673794406f1ef3a6239941c0a48a52e3d68a23b78303ac4e7b07335b589ce77
+libvllm.so   2c3ac67eae458763a2c282e1fc601b60d46d408296a7d56955a36d876c9b0b65
+BINARIES_ARE_THE_GATED_ONES=yes
+
+===== 3. THE PROMPTS ARE PRE-REGISTERED, AND HASHED BEFORE ANYTHING IS SCORED =====
+2026-09-04T08:02:52Z
+The capital city of France is$
+The three primary colors are$
+Water boils at a temperature of$
+The Pythagorean theorem states that$
+In 1969, humans first walked on$
+A prime number is a natural number$
+prompts_sha256=c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e
+prompts_sha256_expected=c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e
+n_prompts=6 n_predict=48
+PRE_REGISTERED=yes  (this set has been scored by this campaign since 2026-08-23;
+                     its hash is committed in three evidence documents that predate this run)
+
+===== 4. OUR tokenizer, off the VEHICLE's own GGUF vocab =====
+2026-09-04T08:02:52Z
+tokenize_rc=0
+760 6511 3177 314 9338 369
+760 2250 5839 7736 513
+27336 85895 506 264 9039 314
+760 5187 92068 43687 55877 5134 421
+623 220 16 24 21 24 11 12313 1118 14428 383
+32 9944 1324 369 264 5629 1324
+FEED_IDS n=6 lens=[6, 5, 6, 7, 11, 7]
+
+===== 5. OUR ROCm generation, 3 INDEPENDENT legs, SHIPPED DEFAULT, no knobs =====
+2026-09-04T08:03:03Z
+sharegpt_prompts=6
+MLEG 1 rc=0 status=OK rocm_device_lines=20 reference_tier_hits=0 fault_lines=0
+MLEG 2 rc=0 status=OK rocm_device_lines=20 reference_tier_hits=0 fault_lines=0
+MLEG 3 rc=139 status=BOARD_FAULT rocm_device_lines=20 reference_tier_hits=0 fault_lines=1
+HW Exception by GPU node-1 (Agent handle: 0x40340f60) reason :GPU Hang
+OUR_LEGS_OK=2 OUR_LEGS_BOARD_FAULT=1 OUR_LEGS_HARNESS_ERROR=0 OUR_LEGS_TOTAL=3
+
+===== 5b. do OUR own clean legs reproduce each other on the vehicle =====
+2026-09-04T08:06:50Z
+OUR_LEGS_REPRODUCE_EACH_OTHER=True over legs [1, 2]
+scoring leg 1: /workspace/limb3-2884/out/rc-worker-lcjhd-20260904T075051Z/ours_gen_ids_1.json
+
+===== 6. THE PINNED vLLM: is the phase-2 artifact still here, and is it the pin? =====
+2026-09-04T08:06:50Z
+WARNING 09-04 08:06:52 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+VLLM 0.26.0.dev0+g5559679229 /tmp/vllm-gfx1151-2740/vllm-pin/vllm/__init__.py
+TORCH 2.13.0+rocm7.2 hip 7.2.53211
+ARCH gfx1151
+CURRENT_PLATFORM RocmPlatform
+PLUGIN /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py
+PLUGIN_C_EXT /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+VLLM_ARTIFACT_OK
+
+===== 7. THE ORACLE ON THE VEHICLE: eager x2, compiled x2, fed OUR prompt ids =====
+2026-09-04T08:07:00Z
+--- leg eager eager=1 prefill_check=1 ---
+GEN_RC[eager]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PROMPT_IDS_MATCH_OURS = True
+PREFILL_ARGMAX_TOTAL_MISMATCHES = 3
+PREFILL_AGREES_WITH_DECODE = False
+DONE_MARKER_LIMB3_VEHICLE_GEN
+--- leg eager-2 eager=1 prefill_check=0 ---
+GEN_RC[eager-2]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PROMPT_IDS_MATCH_OURS = True
+DONE_MARKER_LIMB3_VEHICLE_GEN
+--- leg compiled eager=0 prefill_check=1 ---
+GEN_RC[compiled]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PROMPT_IDS_MATCH_OURS = True
+PREFILL_ARGMAX_TOTAL_MISMATCHES = 2
+PREFILL_AGREES_WITH_DECODE = False
+DONE_MARKER_LIMB3_VEHICLE_GEN
+--- leg compiled-2 eager=0 prefill_check=0 ---
+GEN_RC[compiled-2]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PROMPT_IDS_MATCH_OURS = True
+DONE_MARKER_LIMB3_VEHICLE_GEN
+GEN_RCS eager=0 eager2=0 compiled=0 compiled2=0
+
+===== 8. THE ORACLE'S OWN REPRODUCIBILITY on the vehicle =====
+2026-09-04T08:36:36Z
+EAGER1_EQ_EAGER2       = True
+COMPILED1_EQ_COMPILED2 = True
+EAGER1_EQ_COMPILED1    = False
+  prompt 1: first diff at 8  eager=1330 compiled=9238
+  prompt 3: first diff at 41  eager=23185 compiled=16134
+
+===== 9. THE STRICT VERDICT =====
+2026-09-04T08:36:36Z
+score_rc=0
+WHAT IS COMPARED AGAINST WHAT
+  prompts file        : /tmp/limb3-2884/prompts.txt
+  prompts_sha256      : c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e
+  prompts_sha256_want : c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e
+  PROMPTS_ARE_THE_PREREGISTERED_SET = True
+  tokens per prompt   : 48
+  side A (vllm.cpp ROCm)  : /workspace/limb3-2884/out/rc-worker-lcjhd-20260904T075051Z/ours_gen_ids_1.json   (vllm-bench --output-token-ids)
+  side B (vLLM eager)     : /tmp/limb3-2884/vllm-eager.json
+  side C (vLLM compiled)  : /tmp/limb3-2884/vllm-compiled.json
+A vllm.cpp ROCm k-quant: 6 prompts, lengths [48, 48, 48, 48, 48, 48]
+B vLLM eager: 6 prompts, lengths [48, 48, 48, 48, 48, 48]
+C vLLM compiled: 6 prompts, lengths [48, 48, 48, 48, 48, 48]
+
+### B vLLM eager  vs  C vLLM compiled
+| prompt | verdict | first diff | A | B |
+|---|---|---:|---:|---:|
+| 0 `The capital city of France is` | **TOKEN-EXACT 48/48** | — | — | — |
+| 1 `The three primary colors are` | DIVERGE | 8 | 1330 | 9238 |
+| 2 `Water boils at a temperature of` | **TOKEN-EXACT 48/48** | — | — | — |
+| 3 `The Pythagorean theorem states that` | DIVERGE | 41 | 23185 | 16134 |
+| 4 `In 1969, humans first walked on` | **TOKEN-EXACT 48/48** | — | — | — |
+| 5 `A prime number is a natural number` | **TOKEN-EXACT 48/48** | — | — | — |
+
+DIVERGENCES(B vLLM eager vs C vLLM compiled) = 2/6
+
+ORACLE_SELF_CONSISTENT_ACROSS_COMPILE = False
+ORACLE_REPRODUCES_ITSELF[eager] = True  (/tmp/limb3-2884/vllm-eager-2.json)
+ORACLE_REPRODUCES_ITSELF[compiled] = True  (/tmp/limb3-2884/vllm-compiled-2.json)
+PREFILL_ARGMAX[eager]_MISMATCHES = 3  AGREES_WITH_ITS_OWN_DECODE = False
+PREFILL_ARGMAX[compiled]_MISMATCHES = 2  AGREES_WITH_ITS_OWN_DECODE = False
+
+### A vllm.cpp  vs  B vLLM eager
+| prompt | verdict | first diff | A | B |
+|---|---|---:|---:|---:|
+| 0 `The capital city of France is` | **TOKEN-EXACT 48/48** | — | — | — |
+| 1 `The three primary colors are` | DIVERGE | 8 | 9238 | 1330 |
+| 2 `Water boils at a temperature of` | DIVERGE | 11 | 87840 | 11995 |
+| 3 `The Pythagorean theorem states that` | **TOKEN-EXACT 48/48** | — | — | — |
+| 4 `In 1969, humans first walked on` | DIVERGE | 33 | 383 | 303 |
+| 5 `A prime number is a natural number` | **TOKEN-EXACT 48/48** | — | — | — |
+
+DIVERGENCES(A vllm.cpp vs B vLLM eager) = 3/6
+
+### A vllm.cpp  vs  C vLLM compiled
+| prompt | verdict | first diff | A | B |
+|---|---|---:|---:|---:|
+| 0 `The capital city of France is` | **TOKEN-EXACT 48/48** | — | — | — |
+| 1 `The three primary colors are` | **TOKEN-EXACT 48/48** | — | — | — |
+| 2 `Water boils at a temperature of` | DIVERGE | 11 | 87840 | 11995 |
+| 3 `The Pythagorean theorem states that` | DIVERGE | 41 | 23185 | 16134 |
+| 4 `In 1969, humans first walked on` | DIVERGE | 33 | 383 | 303 |
+| 5 `A prime number is a natural number` | **TOKEN-EXACT 48/48** | — | — | — |
+
+DIVERGENCES(A vllm.cpp vs C vLLM compiled) = 3/6
+
+STRICT_EXACT_vs_VLLM_EAGER    = 3/6
+STRICT_EXACT_vs_VLLM_COMPILED = 3/6
+STRICT_LIMB3=NO
+REASON=the ORACLE is not deterministic on this vehicle: its own eager and compiled configurations disagree with each other, so there is no single denominator to be exact against
+
+===== 10. done =====
+2026-09-04T08:36:37Z

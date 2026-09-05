@@ -71,8 +71,8 @@ Ltx2WavFormat Ltx2ProbeWavFormat(const std::string& bytes) {
 }
 
 Ltx2DecodedAudio Ltx2DecodeAudioWav(const std::string& bytes, const std::string& label,
-                                    int64_t want_channels, int64_t want_sample_rate,
-                                    double start_time, double max_duration) {
+                                    int64_t want_channels, double start_time,
+                                    double max_duration) {
   const Ltx2WavFormat fmt = Ltx2ProbeWavFormat(bytes);
 
   // Refused BEFORE the decode, because `MiniMaxH3ReadWav` would silently repeat
@@ -94,17 +94,6 @@ Ltx2DecodedAudio Ltx2DecodeAudioWav(const std::string& bytes, const std::string&
     Fail("'" + label + "' is " + std::to_string(fmt.bits_per_sample) +
          "-bit PCM; only 16-bit is decoded here");
   }
-  if (want_sample_rate > 0 && fmt.sample_rate != want_sample_rate) {
-    Fail("'" + label + "' is sampled at " + std::to_string(fmt.sample_rate) +
-         " Hz and this checkpoint's mel front-end targets " + std::to_string(want_sample_rate) +
-         " Hz (audio_vae/ops.py:19-34). Upstream resamples with "
-         "`torchaudio.functional.resample` (ops.py:40), an arbitrary-ratio polyphase kaiser "
-         "resampler; this project ports only the integer-ratio hann-sinc variant, so the rate "
-         "is refused rather than assumed. Treating these samples as " +
-         std::to_string(want_sample_rate) +
-         " Hz would pitch- and time-shift the conditioning while every shape still checked out");
-  }
-
   Ltx2DecodedAudio out;
   out.channels = fmt.channels;
   out.sample_rate = fmt.sample_rate;

@@ -463,6 +463,28 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # 2026-09-02: +QUANT-EXL3-PERF. GROWTH, and re-pinned in the same change that
+    # caused it. The row is new (#2570) and its spec's `## Gates` section names
+    # two `ctest` invocations and `scripts/agent-preflight.sh --staged`, each of
+    # which can fail: `test_exl3_gemv` carries the envelope cases, which are pure
+    # integer arithmetic and run anywhere, and the device tier-3c case, which is
+    # RED for codebook 2 on any tree where that arm is not instantiated. A row
+    # enters this population by what its Gates section can RUN, and these run.
+    "QUANT-EXL3-PERF",
+    # 2026-09-01: +QUANT-EXL3-MUL1. GROWTH, and re-pinned in the same change
+    # that caused it, as this ratchet requires. The row is new (#2495) and its
+    # spec's `## Gates` section names four `ctest` invocations and
+    # `scripts/agent-preflight.sh --staged`, every one of which can fail: the
+    # host codebook-2 decode is gated against hand-computed upstream literals,
+    # and the loader and seam cases were RED on this tree before the row's
+    # implementation existed. A row enters this population by what its Gates
+    # section can RUN, and these run.
+    "QUANT-EXL3-MUL1",
+    # 2026-08-31: -ENG-PREFLIGHT-COMPILES leaves the runnable population when
+    # b39f14adb moves the row ACTIVE -> PARTIAL (#2401). PARTIAL is outside this
+    # lifecycle-scoped audit, so the baseline excludes the row. Its spec keeps
+    # both commands that can fail; this is a lifecycle shrink, not a weaker
+    # verdict or a lost gate command.
     # 2026-08-30: +MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm. GROWTH, and
     # not because the row gained a gate: it re-entered the AUDITED population
     # when W2 (#2214) moved it `SPIKE` -> `ACTIVE`, and its spec's `### Gates`

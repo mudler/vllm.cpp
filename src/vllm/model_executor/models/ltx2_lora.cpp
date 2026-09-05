@@ -249,16 +249,13 @@ Ltx2LoraReferenceFactors Ltx2ResolveLoraReferenceFactors(
     const std::vector<Ltx2LoraAdapter>& adapters) {
   Ltx2LoraReferenceFactors out;
   if (adapters.empty()) return out;
-  if (adapters.size() > 1) {
-    Fail("this port fuses exactly ONE adapter and " + std::to_string(adapters.size()) +
-         " were given. Upstream's own dubit.py enforces the same (dubit.py:364-365) and "
-         "hdr_ic_lora.py takes exactly one (hdr_ic_lora.py:271-272); ic_lora.py does "
-         "accept a list, and N-adapter fusion is recorded as owed by row LTX25-IC-LORA "
-         "rather than half-built.");
-  }
-  // ic_lora.py:150-173. The conflict branches are kept even though one adapter
-  // cannot trip them, because they are the loop N-adapter support will use and
-  // removing them would have to reinvent them.
+  // ic_lora.py:150-173, over the WHOLE list. Row LTX25-LORA-FUSION lifted the
+  // arity cap that used to refuse a second adapter here, so both conflict
+  // branches below are reachable rather than written for a later day.
+  //
+  // `dubit.py:364-365` and `hdr_ic_lora.py:271-272` still take exactly one
+  // adapter each; that is a property of those two PIPELINE ENTRY POINTS, not of
+  // the fuser, and `--lora` has always been repeatable (`utils/args.py:600-611`).
   for (const Ltx2LoraAdapter& lora : adapters) {
     const int64_t scale =
         Ltx2ReadLoraMetadataFactor(lora.metadata(), "reference_downscale_factor", lora.path());
@@ -305,16 +302,56 @@ bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
            "] delta, but that tensor is [" + std::to_string(rows) + ", " +
            std::to_string(cols) + "] in this checkpoint");
     }
+    // THE TWO PRODUCT FORMS (`fuse_loras.py:110-116`). Upstream's aggregator
+    // materializes its accumulator from the FIRST product and folds every one
+    // after it in with `addmm_`, and its own docstring (`:103-107`) says the
+    // difference in rounding is deliberate. Which form applies is a property of
+    // THIS TENSOR and not of the load: an adapter that targets a tensor no
+    // earlier adapter touched takes the first form there, because
+    // `_products_for_sd_key` skips a LoRA that lacks the key
+    // (`fuse_loras.py:200-201`) and the aggregator never sees it.
+    //
+    // MEASURED, NOT TRANSCRIBED. Three candidate models of `addmm_` on a bf16
+    // accumulator were run against the pinned module itself over 49 randomized
+    // trials; only the one below matched, on every one of them. The two that
+    // failed differ from it on 18 and 21 of the 120 elements of this row's own
+    // golden fixture — which is to say a wrong choice here is invisible to any
+    // tolerance and visible only to a byte comparison. The recipe and the counts
+    // are in .agents/specs/ltx25-lora-fusion.md §3.
     if (has_delta) {
-      // Unreachable: Ltx2ResolveLoraReferenceFactors refuses more than one
-      // adapter, so no second product can arrive. Upstream's second form is
-      // `addmm_(B, A, alpha=strength)`, which rounds differently from the first
-      // (`fuse_loras.py:103-116`); implementing it here would land a branch
-      // nothing can select, so it refuses instead of guessing.
-      Fail("two adapters both target '" + target +
-           "'. Upstream aggregates them with a SECOND rounding pattern "
-           "(addmm_ with alpha, fuse_loras.py:115) that this port does not implement, "
-           "because only one adapter is accepted. Recorded as owed by row LTX25-IC-LORA.");
+      // `aggregated.addmm_(B, A, alpha=strength)` (`fuse_loras.py:115`).
+      //
+      // THE STRENGTH ENTERS AFTER THE GEMM AND BEFORE THE ONLY ROUNDING. torch
+      // converts `alpha` to the op math type (f32 for a bf16 tensor) and applies
+      // it to the f32 accumulation, so there is NO bf16 store between `B @ A`
+      // and the scale. That is why the output tensor here is f32 where the first
+      // form's is bf16 — the same `vt::Matmul` seam, whose contract already
+      // admits "out f32 or bf16, f32 accumulation" (`vt/ops.h`), and not a
+      // widening of the landed first-form arm.
+      //
+      // IT COSTS ONE TRANSIENT f32 BUFFER of the target's shape, live only
+      // while this adapter folds in and only on a tensor a previous adapter
+      // already touched. `ltx2_loader.h`'s "one host buffer live at a time"
+      // invariant is about the DEVICE copy and is unaffected; the peak here is
+      // the bf16 aggregator plus this, freed before the next target.
+      if (pair->rank > 0 && !agg.empty()) {
+        std::vector<float> prod(agg.size(), 0.0F);
+        vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+        const vt::Device dev{vt::DeviceType::kCPU, 0};
+        vt::Tensor b_t = vt::Tensor::Contiguous(const_cast<uint16_t*>(pair->b.data()),
+                                                vt::DType::kBF16, dev, {rows, pair->rank});
+        vt::Tensor a_t = vt::Tensor::Contiguous(const_cast<uint16_t*>(pair->a.data()),
+                                                vt::DType::kBF16, dev, {pair->rank, cols});
+        vt::Tensor o_t =
+            vt::Tensor::Contiguous(prod.data(), vt::DType::kF32, dev, {rows, cols});
+        vt::Matmul(q, o_t, b_t, a_t);
+        const float alpha = static_cast<float>(lora.strength());
+        for (size_t i = 0; i < agg.size(); ++i) {
+          agg[i] = vt::F32ToBF16(vt::BF16ToF32(agg[i]) + alpha * prod[i]);
+        }
+      }
+      has_delta = true;
+      continue;
     }
     agg.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
 

@@ -123,6 +123,21 @@ class Binder {
     return r.offset;
   }
 
+  // A tensor bound through the uint16_t view ONLY, the mirror of AddU32Only for
+  // an operand every consumer reads at 16 bits: an fp16 scale vector, or the
+  // EXL3 trellis, whose i8 BYTES are read as the uint32 pairs exl3_dq.cuh reads
+  // and never as f32. Binding the unused 32-bit view would need the shader to
+  // declare it too, and glslang strips a block nothing references — which the
+  // generator then reports as a binding HOLE rather than passing silently.
+  // The 2-byte assertion is Add()'s, and it is the real constraint here.
+  uint32_t AddU16Only(const Tensor& t, const char* what) {
+    Resolved r = Resolve(t.data, what);
+    buffers_.push_back(r.buffer);
+    VT_CHECK(r.offset % 2 == 0,
+             std::string("vulkan: ") + what + " has an odd byte offset");
+    return r.offset;
+  }
+
   const void* const* data() const { return buffers_.data(); }
   uint32_t count() const { return static_cast<uint32_t>(buffers_.size()); }
 
@@ -243,6 +258,16 @@ struct GdnRecurrenceParams {
   float scale;
 };
 
+// BACKEND-VULKAN-EXL3 (#2530). vt_exl3_had.comp and vt_exl3_gemm.comp.
+struct Exl3HadParams {
+  uint32_t nblocks, blocks_per_row, cols, total_groups, has_pre, has_post;
+  uint32_t in_off, out_off, pre_off, post_off;
+  float r_scale;
+};
+struct Exl3GemmParams {
+  uint32_t m, k, n, bits, codebook, tiles_n, raw_off, ah_off, tr_off;
+};
+
 // Vulkan only GUARANTEES 128 bytes of push-constant space (maxPushConstantsSize);
 // staying inside it is what keeps this backend portable without a probe.
 static_assert(sizeof(RmsParams) <= 128, "push constants must fit the guaranteed 128 bytes");
@@ -265,6 +290,8 @@ static_assert(sizeof(GdnRecurrenceParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(AttnQkNormRopeGateParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(Exl3HadParams) <= 128, "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(Exl3GemmParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
 void Go(const char* name, const Binder& b, const P& p, uint32_t groups,
@@ -320,6 +347,154 @@ void CastKernel(Queue&, Tensor& out, const Tensor& in) {
   const uint32_t spec[2] = {DtypeCode(in.dtype), DtypeCode(out.dtype)};
   CastParams p{static_cast<uint32_t>(n), in_off, out_off};
   Go("vt_cast", bind, p, FlatGroupCount(n), spec, 2);
+}
+
+// ─── EXL3, BACKEND-VULKAN-EXL3 (#2530) ───────────────────────────────────────
+//
+// The fused chain, step for step as `Exl3GemmKernelCpu` runs it:
+//   1. A_had = had_r_128(A, pre_scale = suh)
+//   2. C_raw = A_had @ reconstruct(trellis)        [f32 accumulation]
+//   3. C     = had_r_128(C_raw, post_scale = svh)
+// Argument validation (shapes, dtypes, contiguity, the 16/128 multiples) is done
+// once in `vt::Exl3Gemm` for every backend and is not repeated here. What IS
+// checked is what selects device code: `bits` and `codebook` reach the shader as
+// values and an out-of-range one would decode SILENTLY, because a shader cannot
+// throw.
+//
+// See src/vt/vulkan/shaders/vt_exl3_gemm.comp for why the donor is the portable
+// CPU reference and not cuda_exl3.cu, and .agents/specs/backend-vulkan-exl3.md
+// for the byte-equality contract this arm carries instead of the CUDA arm's
+// 1.0e-3 RMS bound.
+
+// 1/sqrt(128) spelled as upstream spells it (hadamard.cu:107) and as
+// cpu_exl3_kernels.cpp spells it. Kept as the literal and NEVER recomputed: a
+// recomputed 1/sqrt(128) can differ in the last f32 bit, and that bit is the
+// difference between this arm's byte gate passing and failing.
+constexpr float kExl3InvSqrt128 = 0.088388347648f;
+
+// The f32 [m, n] staging buffer between steps 2 and 3. The CPU arm holds it in a
+// std::vector; a device needs the same bytes somewhere. GROW-ONLY and
+// process-wide, which is the discipline rocm_exl3.hip's EnsureRawScratch
+// documents.
+//
+// NAMED AS A COST rather than hidden. A fused kernel would not need it. A fused
+// kernel is the later speed row; this one buys the end of the reference tier.
+//
+// THE FLUSH BEFORE A GROW IS LOAD-BEARING. Dispatches are BATCHED into an open
+// command buffer, so the previous buffer may still be bound by work that has not
+// executed. Freeing it under an open batch is a use-after-free with no error and
+// no crash — the same hazard Backend::Copy's FlushIfBatchTouches exists for.
+float* EnsureExl3RawScratch(size_t need) {
+  static std::mutex mu;
+  static void* base = nullptr;
+  static size_t bytes = 0;
+  std::lock_guard<std::mutex> lock(mu);
+  if (need <= bytes) return static_cast<float*>(base);
+  void* buffer = nullptr;
+  void* memory = nullptr;
+  void* fresh = VulkanContext::Get().AllocBuffer(need, &buffer, &memory);
+  RegisterAllocation(fresh, need, buffer, memory);
+  if (base != nullptr) {
+    VulkanContext::Get().FlushBatch("exl3 raw scratch grow");
+    void* old_buffer = nullptr;
+    void* old_memory = nullptr;
+    if (UnregisterAllocation(base, &old_buffer, &old_memory))
+      VulkanContext::Get().FreeBuffer(old_buffer, old_memory);
+  }
+  base = fresh;
+  bytes = need;
+  return static_cast<float*>(base);
+}
+
+// One `had_r_128` dispatch. `pre` and `post` are optional and at most one is set,
+// which is upstream's own instantiation (hadamard.cu:112-172) and what
+// `vt::Exl3HadR128` checks; an absent one is bound aliasing `in`, because a
+// descriptor the shader statically uses must be valid even on the path that
+// never reads it.
+void Exl3HadDispatch(void* out, DType out_dtype, const void* in, DType in_dtype,
+                     const Tensor* pre, const Tensor* post, const Device& device, float r_scale,
+                     int64_t rows, int64_t cols) {
+  const int64_t blocks_per_row = cols / 128;
+  const int64_t nblocks = rows * blocks_per_row;
+  if (nblocks <= 0) return;
+  const int64_t total_groups = (nblocks + 3) / 4;
+
+  Tensor tin = Tensor::Contiguous(const_cast<void*>(in), in_dtype, device, {rows, cols});
+  Tensor tout = Tensor::Contiguous(out, out_dtype, device, {rows, cols});
+  Binder bind;
+  const uint32_t in_off = bind.Add(tin, "exl3_had: in");
+  const uint32_t out_off = bind.Add(tout, "exl3_had: out");
+  const uint32_t pre_off =
+      pre != nullptr ? bind.AddU16Only(*pre, "exl3_had: pre_scale") : bind.AddU16Only(tin, "exl3_had: in");
+  const uint32_t post_off = post != nullptr ? bind.AddU16Only(*post, "exl3_had: post_scale")
+                                            : bind.AddU16Only(tin, "exl3_had: in");
+  const uint32_t spec[2] = {in_dtype == DType::kF16 ? 1u : 0u,
+                            out_dtype == DType::kF16 ? 1u : 0u};
+  Exl3HadParams p{static_cast<uint32_t>(nblocks),
+                  static_cast<uint32_t>(blocks_per_row),
+                  static_cast<uint32_t>(cols),
+                  static_cast<uint32_t>(total_groups),
+                  pre != nullptr ? 1u : 0u,
+                  post != nullptr ? 1u : 0u,
+                  in_off,
+                  out_off,
+                  pre_off,
+                  post_off,
+                  r_scale};
+  // The shader carries a grid-stride loop, so the workgroup count is a
+  // PERFORMANCE choice and never a correctness one. 65535 is the Vulkan-
+  // guaranteed maxComputeWorkGroupCount[0], so this launch is valid on any
+  // conformant device no matter how large the tensor is.
+  const uint32_t groups = static_cast<uint32_t>(total_groups > 65535 ? 65535 : total_groups);
+  Go("vt_exl3_had", bind, p, groups, spec, 2);
+}
+
+void Exl3GemmKernelVulkan(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+                          const Tensor& suh, const Tensor& svh, Tensor& a_had,
+                          const Exl3GemmArgs& args) {
+  const int64_t m = a.shape[0];
+  const int64_t k = a.shape[1];
+  const int64_t n = c.shape[1];
+  if (m == 0 || k == 0 || n == 0) return;
+  VT_CHECK(args.bits >= 1 && args.bits <= 8,
+           "vt vulkan exl3: bits must be in [1, 8]; got " + std::to_string(args.bits));
+  VT_CHECK(args.codebook >= 0 && args.codebook <= 2,
+           "vt vulkan exl3: codebook " + std::to_string(args.codebook) +
+               " is not implemented (0 == 3INST, 1 == MCG, 2 == mul1). Upstream defines "
+               "no other value: `decode_3inst<cb>` (codebook.cuh:56-90) has arms for 0, "
+               "1 and 2 and falls off the end for anything else.");
+
+  // 1. the input transform, into the caller's scratch (which may alias A).
+  Exl3HadDispatch(a_had.data, a_had.dtype, a.data, a.dtype, &suh, nullptr, q.device,
+                  kExl3InvSqrt128, m, k);
+
+  // 2. the matmul against the decoded trellis, f32 accumulators.
+  float* raw = EnsureExl3RawScratch(static_cast<size_t>(m) * static_cast<size_t>(n) *
+                                    sizeof(float));
+  Tensor traw = Tensor::Contiguous(raw, DType::kF32, q.device, {m, n});
+  Binder bind;
+  const uint32_t raw_off = bind.AddU32Only(traw, "exl3_gemm: raw");
+  const uint32_t ah_off = bind.AddU16Only(a_had, "exl3_gemm: a_had");
+  const uint32_t tr_off = bind.AddU16Only(trellis, "exl3_gemm: trellis");
+  Exl3GemmParams p{static_cast<uint32_t>(m),
+                   static_cast<uint32_t>(k),
+                   static_cast<uint32_t>(n),
+                   static_cast<uint32_t>(args.bits),
+                   static_cast<uint32_t>(args.codebook),
+                   static_cast<uint32_t>(n / 16),
+                   raw_off,
+                   ah_off,
+                   tr_off};
+  // The grid is FLATTENED because Dispatch takes group_count_x only: one
+  // workgroup per (16-column output tile, 8-row block), and the shader
+  // decomposes the id with the same `tiles_n` it is handed here.
+  const int64_t groups = (n / 16) * ((m + 7) / 8);
+  Go("vt_exl3_gemm", bind, p, static_cast<uint32_t>(groups));
+
+  // 3. the output transform — had_ff for an f32 C, had_fh for an fp16 one, the
+  // same two arms the CPU reference picks between off `c.dtype`.
+  Exl3HadDispatch(c.data, c.dtype, raw, DType::kF32, nullptr, &svh, q.device, kExl3InvSqrt128, m,
+                  n);
 }
 
 // cpu_ops.cpp:252-264 SiluAndMulKernel.
@@ -1621,6 +1796,31 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastKernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastKernel)));
+    // BACKEND-VULKAN-EXL3 V1 (#2530). The THIRD sibling, and the same kernel: the
+    // dtype pair is a specialization constant, `DtypeCode` already maps
+    // DType::kF16 to VT_DT_F16, and vt_common.glsl's f16 codec is an integer
+    // transcription of src/vt/dtype.cpp -- so this registration adds a shader
+    // variant, not a shader. It was missing while its two siblings were present,
+    // which is why an EXL3 checkpoint's f16 activation cast was one of the two
+    // ops S1 measured falling to the portable CPU tier on a Vulkan queue.
+    //
+    // THE SHARED LIMITATION IS NAMED RATHER THAN INHERITED IN SILENCE. `vt::CastF16`
+    // and `vt::CastBf16` both TOLERATE a packed strided input (the merged-QKV view)
+    // whose rows are dense while the row stride spans a parent tensor, and
+    // `CastKernel` above indexes FLAT from one byte offset, so it would read such an
+    // input as contiguous. That is pre-existing for the two siblings and is not
+    // widened here; src/vt/ops.cpp says the merge is CUDA-only, and
+    // .agents/specs/backend-vulkan-exl3.md `## Owed` carries it.
+    RegisterOp(OpId::kCastF16, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<CastF16Fn>(&CastKernel)));
+    // BACKEND-VULKAN-EXL3 V2 (#2530). The other op S1 measured on the reference
+    // tier, and the whole EXL3 forward. `kExl3HadR128` is deliberately NOT
+    // registered: the shader that performs it ships here as steps 1 and 3 of this
+    // GEMM, but no dense forward path calls that op, and a registration nothing
+    // reaches is what `.agents/reachability.md` exists to prevent. The spec's
+    // `## Owed` carries it.
+    RegisterOp(OpId::kExl3Gemm, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelVulkan)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kVULKAN,

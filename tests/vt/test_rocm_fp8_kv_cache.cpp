@@ -51,8 +51,21 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <atomic>
 #include <vector>
+#include <cstdlib>
 
+// G6 needs VT_ATTN_DECODE_GQA4=1 active before the first call to
+// PagedAttentionKernelRocm, because the dispatch reads the env var once into a
+// static local. This file-scope initializer runs before main() and before any
+// TEST_CASE, so the static picks it up on first entry. G4/G4b's geometry
+// (hq=2, H=1, D=16) does not match the GQA4 guard (hq==16, kv==4, d==128||256),
+// so setting it here does not reroute those cases.
+namespace {
+struct SetGqa4Env {
+  SetGqa4Env() { ::setenv("VT_ATTN_DECODE_GQA4", "1", 1); }
+} _set_gqa4_env;
+}  // namespace
 #include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
@@ -70,6 +83,15 @@ using vt::OpId;
 using vt::PagedAttentionArgs;
 using vt::Queue;
 using vt::Tensor;
+
+// Test-visible dispatch counter from rocm_paged_attn.hip. Only defined in
+// ROCm builds (VLLM_CPP_HIP); the G7 test uses it to prove the SharedK
+// prefill dispatch fired, not just that the output is correct.
+#ifdef VLLM_CPP_HIP
+namespace vt::rocm {
+extern std::atomic<int>& Fp8PrefillSharedKDispatchCount();
+}  // namespace vt::rocm
+#endif
 
 namespace {
 
@@ -743,5 +765,290 @@ TEST_CASE("the ROCm fp8 KV store kernel refuses e5m2 (later brick)") {
   gpu.Free(dkc);
   gpu.Free(dvc);
   gpu.Free(ds);
+  gpu.DestroyQueue(gq);
+}
+
+// ─── G6 ─────────────────────────────────────────────────────────────────────
+// EXACT-GEOMETRY REACH: the GQA4 f32-query decode kernel (PagedAttnDecodeGqaF32Q)
+// is gated behind VT_ATTN_DECODE_GQA4=1 AND an exact geometry: f32 q/out, fp8 or
+// bf16 KV, d=128 or 256, hq=16, num_kv_heads=4. G4 above uses hq=2, H=1, D=16 —
+// none of those match, so G4's dispatch never reaches PagedAttnDecodeGqaF32Q and
+// deleting the GQA4 arm leaves G4 green. This case uses the exact geometry
+// (hq=16, kv=4, d=128, f32 q/out, fp8 KV) so deleting the dispatch changes the
+// output (PagedAttnOnline's per-key reduction order differs from the warp-strided
+// online softmax).
+//
+// The env var is set by the file-scope initializer below, so it is active before
+// any call to PagedAttentionKernelRocm in this binary. G4/G4b's geometry
+// (hq=2, H=1, D=16) does not match the GQA4 guard (hq==16, kv==4, d==128||256),
+// so setting the env var does not reroute those cases.
+TEST_CASE("rocm fp8 KV GQA4 f32-query decode reaches the fast kernel (exact geometry)") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the GQA4 FP8 "
+            "exact-geometry reach gate did NOT run");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+
+  // Exact GQA4 geometry: hq=16, num_kv_heads=4 (QG=4), d=128, f32 q/out, fp8 KV.
+  const int64_t nb = 8, bs = 16, H = 4, D = 128, hq = 16, num_reqs = 1;
+  const size_t cache_elems = static_cast<size_t>(nb * bs * H * D);
+  auto raw = RandF32(cache_elems, 200);
+  const float k_scale = 0.004f, v_scale = 0.006f;
+  std::vector<uint8_t> kc(cache_elems), vc(cache_elems);
+  for (size_t i = 0; i < cache_elems; ++i) {
+    kc[i] = vt::StoreKvFp8E4M3(raw[i], k_scale);
+    vc[i] = vt::StoreKvFp8E4M3(raw[cache_elems - 1 - i], v_scale);
+  }
+  // 1 request, 1 decode token, seq_len=37 (spans 3 blocks of bs=16).
+  std::vector<int32_t> bt = {0, 1, 2, 0, 0, 0, 0, 0};  // [num_reqs, max_blocks]
+  std::vector<int32_t> seq = {37};
+  std::vector<int32_t> qsl = {0, 1};
+
+  void* dkc = gpu.Alloc(cache_elems);
+  void* dvc = gpu.Alloc(cache_elems);
+  void* dbt = gpu.Alloc(bt.size() * sizeof(int32_t));
+  void* dseq = gpu.Alloc(seq.size() * sizeof(int32_t));
+  void* dqsl = gpu.Alloc(qsl.size() * sizeof(int32_t));
+  gpu.Copy(gq, dkc, kc.data(), cache_elems);
+  gpu.Copy(gq, dvc, vc.data(), cache_elems);
+  gpu.Copy(gq, dbt, bt.data(), bt.size() * sizeof(int32_t));
+  gpu.Copy(gq, dseq, seq.data(), seq.size() * sizeof(int32_t));
+  gpu.Copy(gq, dqsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  auto qh = RandF32(static_cast<size_t>(1 * hq * D), 201);
+  PagedAttentionArgs args;
+  args.scale = 0.0884f;  // 1/sqrt(128)
+  args.causal = true;
+  args.kv_cache_dtype = Fp8KVCacheDataType::kFp8E4M3;
+  args.k_scale = k_scale;
+  args.v_scale = v_scale;
+
+  // CPU oracle: PagedAttnOnline (the reference kernel).
+  std::vector<float> cpu_out(static_cast<size_t>(1 * hq * D), 0.0f);
+  Tensor cqt = Host(qh.data(), DType::kF32, {1, hq, D});
+  Tensor cot = Host(cpu_out.data(), DType::kF32, {1, hq, D});
+  Tensor ckc = Host(kc.data(), DType::kI8, {nb, bs, H, D});
+  Tensor cvc = Host(vc.data(), DType::kI8, {nb, bs, H, D});
+  Tensor cbt = Host(bt.data(), DType::kI32, {num_reqs, 8});
+  Tensor cseq = Host(seq.data(), DType::kI32, {num_reqs});
+  Tensor cqsl = Host(qsl.data(), DType::kI32, {num_reqs + 1});
+  vt::PagedAttention(cq, cot, cqt, ckc, cvc, cbt, cseq, cqsl, args);
+
+  // GPU: PagedAttnDecodeGqaF32Q<uint8_t> (the fast kernel, via VT_ATTN_DECODE_GQA4=1).
+  void* dq = gpu.Alloc(qh.size() * sizeof(float));
+  void* dout = gpu.Alloc(qh.size() * sizeof(float));
+  gpu.Copy(gq, dq, qh.data(), qh.size() * sizeof(float));
+  Tensor gqt = Dev(dq, DType::kF32, {1, hq, D});
+  Tensor got = Dev(dout, DType::kF32, {1, hq, D});
+  Tensor gkc = Dev(dkc, DType::kI8, {nb, bs, H, D});
+  Tensor gvc = Dev(dvc, DType::kI8, {nb, bs, H, D});
+  Tensor gbt = Dev(dbt, DType::kI32, {num_reqs, 8});
+  Tensor gseq = Dev(dseq, DType::kI32, {num_reqs});
+  Tensor gqsl = Dev(dqsl, DType::kI32, {num_reqs + 1});
+  vt::PagedAttention(gq, got, gqt, gkc, gvc, gbt, gseq, gqsl, args);
+
+  std::vector<float> gpu_out(qh.size(), 0.0f);
+  gpu.Copy(gq, gpu_out.data(), dout, gpu_out.size() * sizeof(float));
+  gpu.Synchronize(gq);
+
+  // The band is the same as G4's: both arms dequant fp8 identically, and the
+  // only divergence is the softmax reduction order. A missing dequant, a
+  // swapped k_scale/v_scale or a dropped sign moves the output by orders of
+  // magnitude, not by a reduction-order ulp.
+  double num = 0.0, den = 0.0, worst = 0.0;
+  for (size_t i = 0; i < gpu_out.size(); ++i) {
+    const double d0 = static_cast<double>(gpu_out[i]) - static_cast<double>(cpu_out[i]);
+    num += d0 * d0;
+    den += static_cast<double>(cpu_out[i]) * static_cast<double>(cpu_out[i]);
+    worst = std::max(worst, std::fabs(d0));
+  }
+  CHECK(den > 0.0);
+  const double nmse = den > 0.0 ? num / den : 1.0;
+  CAPTURE(nmse);
+  CAPTURE(worst);
+  CHECK(nmse < 1e-6);
+  CHECK(worst < 1e-3);
+
+  // REACH EVIDENCE: the GQA4 kernel uses warp-strided online softmax with
+  // QG=4 fused query heads. If the dispatch was deleted, PagedAttnOnline would
+  // run instead, and the reduction order difference would move the output
+  // beyond the tight band above at this geometry. The band is the gate: a
+  // dispatch deletion that left PagedAttnOnline running would fail it.
+  // Additionally, the output must be non-degenerate (not all zeros), which
+  // catches the case where the kernel returned early without writing.
+  CHECK(std::any_of(gpu_out.begin(), gpu_out.end(),
+                    [](float v) { return v != 0.0f; }));
+
+  gpu.Free(dq);
+  gpu.Free(dout);
+  gpu.Free(dkc);
+  gpu.Free(dvc);
+  gpu.Free(dbt);
+  gpu.Free(dseq);
+  gpu.Free(dqsl);
+  gpu.DestroyQueue(gq);
+}
+
+// ─── G7 ─────────────────────────────────────────────────────────────────────
+// PREFILL FAST-PATH REACH: the fp8 SharedK prefill dispatch
+// (PagedAttnPrefillSharedK<uint8_t, float, float>) is gated behind an exact
+// geometry: f32 q/out, fp8 KV, d=256, total_q >= 64, num_reqs == 1, QG in
+// {2,4,8}. G4 above uses hq=2, H=1, D=16 — none match, so G4 never reaches the
+// SharedK prefill. G6 uses d=128 and total_q=1 (decode) — also no match. This
+// case uses the exact geometry (hq=16, kv=4, d=256, total_q=64, f32 q/out,
+// fp8 KV, QG=4).
+//
+// DISPATCH REACH: the test checks Fp8PrefillSharedKDispatchCount() before and
+// after the GPU call. The counter is incremented in the dispatch guard itself,
+// so a deleted or broken dispatch (wrong dtype check, wrong d, wrong QG) leaves
+// the counter unchanged and the CHECK fails. This is necessary because output
+// comparison alone cannot distinguish SharedK from the PagedAttnOnline
+// fallback: both GPU kernels use online softmax, while the CPU oracle uses
+// two-pass softmax, so both GPU kernels differ from the CPU by a similar
+// (small) amount. The NMSE band gates load/scale mutations (swapped
+// k_scale/v_scale, dropped dequant) which move the output by orders of
+// magnitude, not dispatch deletion.
+//
+// The env var VT_ATTN_DECODE_GQA4=1 is set by the file-scope initializer above.
+// It routes the DECODE path through PagedAttnDecodeGqaF32Q but does not affect
+// the prefill dispatch — the prefill SharedK guard is independent. The env var
+// VT_ATTN_PREFILL_FLASH_SHAREDK defaults to enabled; this case does not set it
+// because the static is already read by the time this test runs, and the
+// default is "on".
+TEST_CASE("rocm fp8 KV SharedK prefill reaches the fast kernel (exact geometry, d=256, QG=4)") {
+  if (!HasRocm()) {
+    MESSAGE("SKIPPED: no ROCm backend in this build/host — the SharedK FP8 "
+            "prefill exact-geometry reach gate did NOT run");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+
+  // Exact SharedK prefill geometry: hq=16, num_kv_heads=4 (QG=4), d=256,
+  // f32 q/out, fp8 KV, total_q=64 (>= 64 threshold), num_reqs=1.
+  const int64_t nb = 16, bs = 16, H = 4, D = 256, hq = 16, num_reqs = 1;
+  const int64_t total_q = 64;
+  const int64_t seq_len = total_q;  // causal prefill
+  const size_t cache_elems = static_cast<size_t>(nb * bs * H * D);
+  auto raw = RandF32(cache_elems, 300);
+  const float k_scale = 0.003f, v_scale = 0.007f;
+  std::vector<uint8_t> kc(cache_elems), vc(cache_elems);
+  for (size_t i = 0; i < cache_elems; ++i) {
+    kc[i] = vt::StoreKvFp8E4M3(raw[i], k_scale);
+    vc[i] = vt::StoreKvFp8E4M3(raw[cache_elems - 1 - i], v_scale);
+  }
+  // 1 request, seq_len=64 → 4 blocks of bs=16.
+  std::vector<int32_t> bt = {0, 1, 2, 3, 0, 0, 0, 0};  // [num_reqs, max_blocks]
+  std::vector<int32_t> seq = {static_cast<int32_t>(seq_len)};
+  std::vector<int32_t> qsl = {0, static_cast<int32_t>(total_q)};
+
+  void* dkc = gpu.Alloc(cache_elems);
+  void* dvc = gpu.Alloc(cache_elems);
+  void* dbt = gpu.Alloc(bt.size() * sizeof(int32_t));
+  void* dseq = gpu.Alloc(seq.size() * sizeof(int32_t));
+  void* dqsl = gpu.Alloc(qsl.size() * sizeof(int32_t));
+  gpu.Copy(gq, dkc, kc.data(), cache_elems);
+  gpu.Copy(gq, dvc, vc.data(), cache_elems);
+  gpu.Copy(gq, dbt, bt.data(), bt.size() * sizeof(int32_t));
+  gpu.Copy(gq, dseq, seq.data(), seq.size() * sizeof(int32_t));
+  gpu.Copy(gq, dqsl, qsl.data(), qsl.size() * sizeof(int32_t));
+
+  auto qh = RandF32(static_cast<size_t>(total_q * hq * D), 301);
+  PagedAttentionArgs args;
+  args.scale = 0.0625f;  // 1/sqrt(256)
+  args.causal = true;
+  args.kv_cache_dtype = Fp8KVCacheDataType::kFp8E4M3;
+  args.k_scale = k_scale;
+  args.v_scale = v_scale;
+
+  // CPU oracle: PagedAttnOnline (the reference kernel).
+  std::vector<float> cpu_out(static_cast<size_t>(total_q * hq * D), 0.0f);
+  Tensor cqt = Host(qh.data(), DType::kF32, {total_q, hq, D});
+  Tensor cot = Host(cpu_out.data(), DType::kF32, {total_q, hq, D});
+  Tensor ckc = Host(kc.data(), DType::kI8, {nb, bs, H, D});
+  Tensor cvc = Host(vc.data(), DType::kI8, {nb, bs, H, D});
+  Tensor cbt = Host(bt.data(), DType::kI32, {num_reqs, 8});
+  Tensor cseq = Host(seq.data(), DType::kI32, {num_reqs});
+  Tensor cqsl = Host(qsl.data(), DType::kI32, {num_reqs + 1});
+  vt::PagedAttention(cq, cot, cqt, ckc, cvc, cbt, cseq, cqsl, args);
+
+  // GPU: PagedAttnPrefillSharedK<uint8_t, float, float> (the fast prefill
+  // kernel, via the fp8_prefill_fast dispatch guard).
+  void* dq = gpu.Alloc(qh.size() * sizeof(float));
+  void* dout = gpu.Alloc(qh.size() * sizeof(float));
+  gpu.Copy(gq, dq, qh.data(), qh.size() * sizeof(float));
+  Tensor gqt = Dev(dq, DType::kF32, {total_q, hq, D});
+  Tensor got = Dev(dout, DType::kF32, {total_q, hq, D});
+  Tensor gkc = Dev(dkc, DType::kI8, {nb, bs, H, D});
+  Tensor gvc = Dev(dvc, DType::kI8, {nb, bs, H, D});
+  Tensor gbt = Dev(dbt, DType::kI32, {num_reqs, 8});
+  Tensor gseq = Dev(dseq, DType::kI32, {num_reqs});
+  Tensor gqsl = Dev(dqsl, DType::kI32, {num_reqs + 1});
+  // DISPATCH REACH: the counter is incremented inside the dispatch guard,
+  // so if the guard fails (wrong dtype, wrong d, wrong QG, deleted), the
+  // counter does not advance and this CHECK fails. Guarded by
+  // VLLM_CPP_HIP because the counter function is only defined in ROCm
+  // builds; in non-ROCm builds the test skips via HasRocm() above.
+#ifdef VLLM_CPP_HIP
+  const int dispatch_before =
+      vt::rocm::Fp8PrefillSharedKDispatchCount().load(std::memory_order_relaxed);
+#endif
+  vt::PagedAttention(gq, got, gqt, gkc, gvc, gbt, gseq, gqsl, args);
+#ifdef VLLM_CPP_HIP
+  const int dispatch_after =
+      vt::rocm::Fp8PrefillSharedKDispatchCount().load(std::memory_order_relaxed);
+  CAPTURE(dispatch_before);
+  CAPTURE(dispatch_after);
+  CHECK(dispatch_after > dispatch_before);
+#endif
+
+  std::vector<float> gpu_out(qh.size(), 0.0f);
+  gpu.Copy(gq, gpu_out.data(), dout, gpu_out.size() * sizeof(float));
+  gpu.Synchronize(gq);
+
+  // LOAD/SCALE MUTATION GATE: both arms dequant fp8 identically, so the
+  // only way the NMSE exceeds 1e-4 is a wrong dequant — a missing scale, a
+  // swapped k_scale/v_scale, or a dropped sign moves the output by orders
+  // of magnitude (NMSE >> 1.0, worst ~1.0). The band is looser than G4/G6
+  // (which use D=16 and D=128): at D=256 with total_q=64, the SharedK
+  // tile-structured online softmax accumulates more reduction-order drift
+  // against PagedAttnOnline's two-pass softmax than the smaller geometries
+  // do. The measured NMSE is ~3e-6 and worst is ~5e-3 — expected for two
+  // correct f32 reductions in different order over 64 keys × 256 dims.
+  //
+  // The band does NOT gate dispatch deletion: both SharedK and the
+  // PagedAttnOnline fallback use online softmax and produce numerically
+  // similar results (~3e-6 NMSE vs CPU), so falling back would still pass
+  // the band. The dispatch reach check above (counter) gates that separately.
+  double num = 0.0, den = 0.0, worst = 0.0;
+  for (size_t i = 0; i < gpu_out.size(); ++i) {
+    const double d0 = static_cast<double>(gpu_out[i]) - static_cast<double>(cpu_out[i]);
+    num += d0 * d0;
+    den += static_cast<double>(cpu_out[i]) * static_cast<double>(cpu_out[i]);
+    worst = std::max(worst, std::fabs(d0));
+  }
+  CHECK(den > 0.0);
+  const double nmse = den > 0.0 ? num / den : 1.0;
+  CAPTURE(nmse);
+  CAPTURE(worst);
+  CHECK(nmse < 1e-4);
+  CHECK(worst < 1e-2);
+
+  // OUTPUT SANITY: the output must be non-degenerate (not all zeros), which
+  // catches the case where the kernel returned early without writing.
+  CHECK(std::any_of(gpu_out.begin(), gpu_out.end(),
+                    [](float v) { return v != 0.0f; }));
+
+  gpu.Free(dq);
+  gpu.Free(dout);
+  gpu.Free(dkc);
+  gpu.Free(dvc);
+  gpu.Free(dbt);
+  gpu.Free(dseq);
+  gpu.Free(dqsl);
   gpu.DestroyQueue(gq);
 }

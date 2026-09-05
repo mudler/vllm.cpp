@@ -156,10 +156,21 @@ void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M,
       "(src/vt/rocm/rocm_matmul_hipblaslt.hip); see issue #1205.");
 }
 
+bool HasMatmulBTFp8Channel(const Queue& q) {
+#if defined(VLLM_CPP_HIP)
+  return q.device.type == DeviceType::kROCM;
+#else
+  (void)q;
+  return false;
+#endif
+}
+
 void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,
                         const void* scale_bf16, int M, int N, int K, float alpha, float beta) {
 #if defined(VLLM_CPP_HIP)
-  if (q.device.type == DeviceType::kROCM) {
+  // Dispatch on the predicate rather than on a second copy of its condition, so
+  // `HasMatmulBTFp8Channel` cannot drift from what this function actually does.
+  if (HasMatmulBTFp8Channel(q)) {
     rocm::MatmulBTFp8ChannelRocm(q, out, a, b_fp8, scale_bf16, M, N, K, alpha, beta);
     return;
   }
@@ -177,10 +188,20 @@ void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,
   throw std::runtime_error("vt::MatmulBTFp8Channel: ROCm-only in this build");
 }
 
+bool HasDequantFp8ChannelBf16(const Queue& q) {
+#if defined(VLLM_CPP_HIP)
+  return q.device.type == DeviceType::kROCM;
+#else
+  (void)q;
+  return false;
+#endif
+}
+
 void DequantFp8ChannelBf16(Queue& q, void* out_bf16, const void* fp8, const void* scale_bf16,
                            int N, int K) {
 #if defined(VLLM_CPP_HIP)
-  if (q.device.type == DeviceType::kROCM) {
+  // Dispatch on the predicate, not on a second copy of its condition.
+  if (HasDequantFp8ChannelBf16(q)) {
     rocm::DequantFp8ChannelBf16Rocm(q, out_bf16, fp8, scale_bf16, N, K);
     return;
   }

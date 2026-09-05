@@ -671,7 +671,13 @@ python3 scripts/agent-integration.py --base origin/main
   capture path, and one of them puts a per-step D2H synchronisation on the path
   this row exists to make faster. Owned by `SPEC-DFLASH2`.
 - **[#1900](https://github.com/mudler/vllm.cpp/issues/1900) — non-causal SWA
-  layers drop their window in our attention kernels**, while upstream attends
+  layers drop their window in our attention kernels. DISCHARGED by
+  [`dflash2-noncausal-swa-window.md`](dflash2-noncausal-swa-window.md)
+  ([#2784](https://github.com/mudler/vllm.cpp/issues/2784)), which found the
+  cost this entry could only predict: acceptance 0.77 at 2,307 prompt tokens and
+  0.06 at 8,159, where speculation is 23% SLOWER than none. The eleven guards
+  are now one shared bound in `include/vt/dflash_attn_mask.h`.** The finding as
+  filed: upstream attends
   within it (`vllm/model_executor/models/qwen3_dflash.py:89-146,221-234`) and
   this repository's own loader comment says upstream's answer
   (`qwen3_dflash_weights.cpp:181-183`). Repo-wide and pre-existing —

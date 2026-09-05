@@ -20,8 +20,10 @@
 //     new_token_ids. The heavy per-request state already lives in the worker.
 //
 // DEFERRED upstream state (marked; T0 never populates these):
-//   NewRequestData: mm_features (multimodal), pooling_params, lora_request,
-//     prompt_embeds, prompt_is_token_ids. prefill_token_ids IS carried now (the
+//   NewRequestData: pooling_params, lora_request, prompt_embeds,
+//     prompt_is_token_ids. mm_features IS carried now — ENG-MM-INPUT-PIPELINE
+//     P2 (#2379) un-deferred it; see the field note. prefill_token_ids IS
+//     carried now (the
 //     MRV2 / V2 model-runner path — see the field note); the MRV1 path is not
 //     ported.
 //   SchedulerOutput trailing optionals, OMITTED here (a later unit slots them
@@ -62,6 +64,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/inputs.h"  // multimodal::MultiModalFeatureSpec
 #include "vllm/sampling_params.h"
 #include "vllm/v1/structured_output/backend_types.h"  // TokenBitmask
 
@@ -86,10 +89,21 @@ struct NewRequestData {
   // all_token_ids = prefill_token_ids). The MRV1 path passed nullopt; the V2
   // path passes request.AllTokenIds(). Upstream list[int] | None.
   std::optional<std::vector<int32_t>> prefill_token_ids;
+  // mm_features (NewRequestData.mm_features, output.py; copied at
+  // gpu_model_runner.py:1293 `mm_features=new_req_data.mm_features`, grep -c ==
+  // 1). The processed multimodal placeholder specs the WORKER needs: the
+  // encoder step runs the tower over them, the gather splices the results, and
+  // the MRoPE init reads their spans. Request.mm_features was already carried
+  // for the prefix-cache extra keys; this is the hop that lets it leave the
+  // scheduler. EMPTY on every text request, and the runner's mm path is
+  // predicated on it being non-empty somewhere in the step.
+  // ENG-MM-INPUT-PIPELINE P2 (#2379).
+  std::vector<multimodal::MultiModalFeatureSpec> mm_features;
 
   // from_request: build the full payload from the Request + its allocated
   // per-group block ids. Copies req_id, prompt_token_ids, sampling_params,
-  // block_ids, num_computed_tokens, and the (optional) prefill_token_ids seed.
+  // block_ids, num_computed_tokens, mm_features, and the (optional)
+  // prefill_token_ids seed.
   // The V2 model-runner path passes prefill_token_ids = request.AllTokenIds();
   // callers that do not need the seed omit it (nullopt). (Upstream
   // NewRequestData.from_request; mm/pooling/lora/prompt_embeds DEFERRED.)
@@ -153,7 +167,10 @@ struct SchedulerOutput {
   // Request ids finished between the previous and current step (free cached
   // worker state for these).
   std::set<std::string> finished_req_ids;
-  // mm_hash strings whose encoder outputs can be freed. DEFERRED: empty in T0.
+  // mm_hash strings the encoder cache actually EVICTED since the previous step
+  // (EncoderCacheManager::GetFreedMmHashes, encoder_cache_manager.py:255). The
+  // worker drops those entries from its own mm_hash-keyed cache. Empty on every
+  // text step.
   std::vector<std::string> free_encoder_mm_hashes;
 
   // Whether any structured-output request is scheduled this step and past its

@@ -62,15 +62,37 @@
 // kernel is wrong and the bound is not the thing to change.
 //
 // ─── SCOPE, HONESTLY ─────────────────────────────────────────────────────────
-// THREE OF THE SIX `qwen4_exp` OPS HAVE CUDA ARMS. `vt::Qwen4ExpGatedResidual`,
-// `vt::RmsNormGroup`, `vt::Qwen4ExpQsaCompress` and
-// `vt::Qwen4ExpQsaGatherAttention` do not, and neither does the block-decoding
-// n-gram gather `vt::Embedding` needs (`EmbeddingKernelCuda` refuses a
-// block-quantized table by name). So `ModelRegistry::Forward` still cannot run
-// this architecture on a CUDA queue, NOTHING IN PRODUCTION REACHES THESE THREE
-// KERNELS, and their reachability from a production entry point is VACUOUS
-// rather than proven. The spec's `## Owed` names each missing arm and the row
-// that owns the wiring. No token claim and no speed claim.
+// **THE PARAGRAPH THAT STOOD HERE IS STALE AND IS REPLACED RATHER THAN LEFT TO
+// AGE.** It read "THREE OF THE SIX `qwen4_exp` OPS HAVE CUDA ARMS", naming
+// `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup` and the two QSA ops as absent.
+// W6-CUDA-B landed all four, so ALL SIX `qwen4_exp` ops plus `vt::RmsNormGroup`
+// now have CUDA arms and the registration case at the bottom of this file
+// asserts each one RESOLVES.
+//
+// THE GATHER THIS PARAGRAPH NAMED AS MISSING HAS LANDED (KGATHER,
+// `.agents/specs/cuda-quant-gather.md`). `EmbeddingKernelCuda` decodes a
+// block-quantized table across all 18 encodings `vt::cpu::BlockToFloat` decodes,
+// and `DeviceQuantGatherSupported` answers yes on CUDA through
+// `OpRegistered(kEmbeddingQuant, dev)` -- so the loader no longer refuses this
+// device, and the sentence that the gather "refuses a block-quantized table by
+// name" is FALSE and is replaced.
+//
+// SO THE REACHABILITY OF THESE KERNELS IS NO LONGER VACUOUS FOR THE REASON GIVEN
+// ABOVE -- AND IT IS ALSO NOT YET PROVEN, WHICH IS A DIFFERENT CLAIM. With the
+// ops registered and the loader admitting the device, what a CUDA step meets
+// next is a PREDICTION and not a measurement: partial dispatch through the PLE,
+// then a NAMED REFUSAL at the first QSA layer, because `qwen4_exp_qsa_block.cpp`
+// still reads three operands on the HOST -- `CheckRopeLayoutsAgree`,
+// `IndexerRows` on the block table, and `Qwen4ExpQsaIndex` on `kv_lens`. That is
+// the QSADEV wave's territory, not this file's and not KGATHER's.
+//
+// A SECOND WALL THE SYNTHETIC FIXTURE NEVER REACHES: `IsCudaKeepQuantSupported`
+// still excludes IQ4_NL and Q5_0, which the released UD-IQ1_S stores its tensors
+// in, so the real checkpoint stops for a reason no fixture here can show
+// (issue #2423).
+//
+// NO TOKEN HAS COME OUT OF A GPU FOR THIS MODEL, no token claim, and no speed
+// claim. What changed is which blocker is next, not that there is none.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -843,14 +865,22 @@ TEST_CASE("the qwen4_exp CUDA arms are registered for kCUDA and refuse BY NAME e
   CHECK(vt::GetOp(vt::OpId::kQwen4ExpPleConv, DeviceType::kCUDA) != nullptr);
   CHECK(vt::GetOp(vt::OpId::kQwen4ExpPleGate, DeviceType::kCUDA) != nullptr);
   CHECK(vt::GetOp(vt::OpId::kQwen4ExpGatedResidualWriteBack, DeviceType::kCUDA) != nullptr);
-  // The three ops this wave did NOT give a CUDA arm. They must still refuse, by
-  // name, rather than silently falling back to a CPU kernel that would then
-  // dereference device pointers. If a later wave registers one, this case fails
-  // and the reader is sent to the spec's `## Owed` to strike the entry.
-  CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpGatedResidual, DeviceType::kCUDA));
-  CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpQsaCompress, DeviceType::kCUDA));
-  CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpQsaGatherAttention, DeviceType::kCUDA));
-  CHECK_THROWS(vt::GetOp(vt::OpId::kRmsNormGroup, DeviceType::kCUDA));
+  // **THESE FOUR WERE `CHECK_THROWS` UNTIL W6-CUDA-B, AND THE FLIP IS THIS
+  // WAVE'S RED.** The comment that stood here said "The three ops this wave did
+  // NOT give a CUDA arm ... If a later wave registers one, this case fails and
+  // the reader is sent to the spec's `## Owed` to strike the entry." That is
+  // exactly what happened, and it undercounted by one: `kQwen4ExpGatedResidual`
+  // is a DIFFERENT op from `kQwen4ExpGatedResidualWriteBack` two lines up, and a
+  // substring reading of the registration list makes the mixer look covered when
+  // it is not. W6-CUDA-B landed all four
+  // (`src/vt/cuda/cuda_qwen4_exp.cu`, `cuda_qwen4_exp_qsa.cu`,
+  // `cuda_rms_norm_group.cu`), so they must now RESOLVE rather than refuse — and
+  // a regression that loses a registration reds here, which is the reason to
+  // keep asserting the direction rather than deleting the lines.
+  CHECK(vt::GetOp(vt::OpId::kQwen4ExpGatedResidual, DeviceType::kCUDA) != nullptr);
+  CHECK(vt::GetOp(vt::OpId::kQwen4ExpQsaCompress, DeviceType::kCUDA) != nullptr);
+  CHECK(vt::GetOp(vt::OpId::kQwen4ExpQsaGatherAttention, DeviceType::kCUDA) != nullptr);
+  CHECK(vt::GetOp(vt::OpId::kRmsNormGroup, DeviceType::kCUDA) != nullptr);
 #endif
 }
 

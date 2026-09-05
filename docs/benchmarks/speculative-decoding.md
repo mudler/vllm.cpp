@@ -1,5 +1,17 @@
 # Speculative decoding
 
+**THE PIN MOVED UNDER TWO OF THESE ROWS.** The parity pin advanced to
+`e126687a9a` on 2026-09-03
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817)). The **MTP** row and
+the **DFlash** row carry a vLLM denominator measured against the PREVIOUS pin
+`555967922` with FlashInfer `0.6.15.post1`, which is the oracle's attention
+backend on that path and moves to `0.6.18` at the new pin. Both owe a
+re-measurement ([#2818](https://github.com/mudler/vllm.cpp/issues/2818)), and the
+DFlash re-take must record the oracle's SELECTED backend rather than assume it
+carries over. The advance preceded the re-measurement by a developer ruling that
+inverts the sync cycle's step order; a red there requires reverting the pin.
+Nothing here is withdrawn today.
+
 | Speculator | Model | Result | Status |
 |---|---|---|---|
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |

@@ -21,6 +21,7 @@
 //   - NO attention output gate, NO attention logit soft-cap, NO qkv bias.
 //
 // Numeric contract: bf16 per-op, matching vLLM's stores (dense_attn_block.h).
+#include "vllm/model_executor/layers/attention/attention.h"
 #include "vllm/model_executor/models/gemma3.h"
 
 #include <cmath>
@@ -189,8 +190,12 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
   vt::PagedAttentionArgs pa{attn_scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
-  if (sliding_window.has_value() && *sliding_window > 0 && SlidingWindowEnabled())
-    pa.window_size = vt::AttentionWindow{static_cast<int32_t>(*sliding_window - 1), 0};
+  // ENG-ATTENTION-WINDOW (#2388): see gemma2.cpp -- same shape, same reason.
+  if (sliding_window.has_value() && *sliding_window > 0)
+    pa.window_size = ResolveAttentionWindow(
+        /*per_layer=*/std::nullopt, sliding_window,
+        v1::AttentionType::kDecoder,
+        /*disable_model_sliding_window=*/!SlidingWindowEnabled());
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

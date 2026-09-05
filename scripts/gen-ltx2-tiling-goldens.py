@@ -507,8 +507,12 @@ def section_complementary(out) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _prepare_tiles(latent_shape, cfg):
-    """`ConvVideoDecoder._prepare_tiles` (conv_video_decoder.py:359-381)."""
+def _prepare_tiles(latent_shape, cfg, blocks=None, patch_size=None):
+    """`ConvVideoDecoder._prepare_tiles` (conv_video_decoder.py:359-381).
+
+    `blocks`/`patch_size` default to the section 6-7 fixture so those arms are
+    unchanged; section 8's shallow bf16 fixture passes its own.
+    """
     import torch
     from ltx_core.model.video_vae.video_vae import (
         map_spatial_slice,
@@ -522,7 +526,10 @@ def _prepare_tiles(latent_shape, cfg):
     )
     from ltx_core.types import SpatioTemporalScaleFactors
 
-    factors = SpatioTemporalScaleFactors.from_blocks(TILING_BLOCKS, TILING_DEC["patch_size"])
+    factors = SpatioTemporalScaleFactors.from_blocks(
+        TILING_BLOCKS if blocks is None else blocks,
+        TILING_DEC["patch_size"] if patch_size is None else patch_size,
+    )
     splitters = [DEFAULT_SPLIT_OPERATION] * 5
     mappers = [DEFAULT_MAPPING_OPERATION] * 5
     t_split, h_split, w_split = cfg.to_splitters(factors)
@@ -687,6 +694,223 @@ def section_decode(out) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Section 8 — the SHALLOW arm at upstream's own bfloat16 (A24 wave 3, #2786).
+#
+# WHY THE ARM ABOVE CANNOT DO THIS JOB. `tiled_decode` allocates its chunk buffer
+# at `dtype=latent.dtype` (conv_video_decoder.py:427) and its weights denominator
+# as `zeros_like(buffer)` (`:526`), so at bfloat16 every `+=` into either ROUNDS,
+# and so does the closing `previous_chunk / previous_weights`. Sections 6 and 7
+# run at f32, where all seven of the port's `RoundTo` sites are the identity: a
+# fresh review forced the port's buffer back to f32 and both suites stayed fully
+# green.
+#
+# MEASURED, on the section 7 fixture at bf16: widening ONLY the buffer moves
+# upstream's own tiled output by 0.00889754, and perturbing ONE `conv_in` weight
+# by ONE bf16 ulp moves it by 0.015625. Six blocks deep, the irreducible term is
+# LARGER than the defect, so no bound over that fixture can separate the buffer's
+# width -- the same wall section 5e of the VAE goldens hit, and for the same
+# reason.
+#
+# So this fixture is SHALLOW, exactly as `VIDEO_SHALLOW_BLOCKS` is: ONE
+# `compress_all` block between `conv_in` and `conv_out`, eight parameters in
+# total, and the TILED arm is held BIT-EXACT rather than to a bound. It still
+# tiles for real -- time 2 and height/width 4 (types.py:45-53) make an 8-frame /
+# 8px tile four latent frames and two latent cells, so a (6, 3, 3) latent splits
+# into 2 temporal groups x 2 x 2 = EIGHT tiles with real overlaps on all three
+# axes.
+#
+# THE LATENT IS SIX FRAMES AND NOT FIVE, AND THAT IS LOAD-BEARING. At five, the
+# temporal split is [0,4) and [2,5) and the tiles decode DIFFERENT latent shapes;
+# measured, the port then landed one bf16 ulp from upstream on 1 of 3888 outputs,
+# because torch's convolution reduction blocks differently at the odd shape. At
+# six the split is [0,4) and [2,6) and every tile decodes the same (4, 2, 2)
+# latent, and the tiled arm is bit-exact.
+#
+# THE UNTILED REFERENCE IS NOT. The same fixture decoded whole is a (6, 3, 3)
+# latent, a shape neither arm above covers, and the port sits one bf16 ulp from
+# upstream there -- 0.00195312 against upstream's own one-ulp sensitivity of
+# 0.0078125. It is held to that measured sensitivity, exactly as section 5e of the
+# VAE goldens holds its own deep arm, and the BIT-EXACT statement is made where it
+# can be made: on the tiled path, which is the one this section exists to gate.
+# ---------------------------------------------------------------------------
+
+TILING_BF16_BLOCKS = [("compress_all", {"multiplier": 1})]
+TILING_BF16_DEC = dict(
+    convolution_dimensions=3,
+    in_channels=6,
+    out_channels=3,
+    patch_size=2,
+    timestep_conditioning=False,
+    base_channels=8,
+)
+TILING_BF16_LATENT = (1, 6, 6, 3, 3)
+# THE RAMP LENGTHS ARE PART OF THE FIXTURE, and they are chosen rather than
+# inherited. `Ltx2TrapezoidalMask1d` builds its ramps with a double linspace and
+# narrows once; `torch.linspace` on a float32 tensor is NOT correctly rounded and
+# disagrees with that for 21 of the 31 lengths in n = 2..32, including 4, 7, 8 and 13
+# (tiling.py:39-47, #2816, which carries the swept set — do NOT pick a geometry
+# from a short list of three, which is what an earlier form of this comment
+# offered). At f32
+# the difference is a relative 6e-8 and every case in the suite passes; at bf16 it
+# is a whole word, and a 6-frame / 2-overlap temporal tile produces exactly an
+# n = 4 ramp and put 2 of 3888 blended outputs one bf16 ulp from upstream. An
+# 8-frame / 4-overlap tile does not reach a disagreeing length, so this arm
+# measures the accumulation BUFFER rather than the mask. #2816 owns the mask.
+TILING_BF16_FRAMES = (8, 4)   # 4 latent frames, 2 latent overlap
+TILING_BF16_SPATIAL = (8, 4)  # 2 latent cells, 1 latent overlap
+TILING_BF16_PREFIX = "ltx2.tiledecbf16."
+
+
+def _bf16_tiling_config():
+    from ltx_core.tiling import DimensionSizeConfig, TileSizeConfig
+
+    return TileSizeConfig(
+        frames=DimensionSizeConfig(tile_size=TILING_BF16_FRAMES[0],
+                                   overlap=TILING_BF16_FRAMES[1]),
+        height=DimensionSizeConfig(tile_size=TILING_BF16_SPATIAL[0],
+                                   overlap=TILING_BF16_SPATIAL[1]),
+        width=DimensionSizeConfig(tile_size=TILING_BF16_SPATIAL[0],
+                                  overlap=TILING_BF16_SPATIAL[1]),
+    )
+
+
+def section_decode_bf16(out) -> None:
+    import torch
+    from ltx_core.model.video_vae.conv_video_decoder import ConvVideoDecoder
+    from ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
+
+    def build():
+        d = ConvVideoDecoder(
+            decoder_blocks=TILING_BF16_BLOCKS,
+            norm_layer=NormLayerType.PIXEL_NORM,
+            decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+            causal=False,
+            **TILING_BF16_DEC,
+        ).eval()
+        return d, G.fill_from_stream(d, prefix=TILING_BF16_PREFIX)
+
+    # THE f32 LATENT IS KEPT. `.to(bfloat16)` narrows IN PLACE, so a value read
+    # back after the cast is already narrowed and any f32-vs-bf16 comparison taken
+    # from it is a false zero -- both the implementer and the fresh reviewer of
+    # this row hit that. The f32 arm below is run from `latent32`, never from a
+    # widened copy of `latent`.
+    latent32 = G.make_input(TILING_BF16_PREFIX + "input", TILING_BF16_LATENT, 1.0)
+    latent = latent32.to(torch.bfloat16)
+
+    def tiled(dec, lat, cfg):
+        with torch.no_grad():
+            return list(dec.tiled_decode(lat, cfg))
+
+    decoder, manifest = build()
+    decoder = decoder.to(torch.bfloat16)
+    with torch.no_grad():
+        untiled = decoder(latent)
+    chunks = tiled(decoder, latent, _bf16_tiling_config())
+    tiled_out = torch.cat(chunks, dim=2)
+    control_chunks = tiled(decoder, latent, _control_config())
+    control = torch.cat(control_chunks, dim=2)
+    assert untiled.dtype == torch.bfloat16, f"the bf16 arm returned {untiled.dtype}"
+    assert tiled_out.dtype == torch.bfloat16, f"the bf16 tiled arm returned {tiled_out.dtype}"
+
+    tiles = _prepare_tiles(TILING_BF16_LATENT, _bf16_tiling_config(),
+                           TILING_BF16_BLOCKS, TILING_BF16_DEC["patch_size"])
+    assert len(tiles) > 1, (
+        "the bf16 fixture resolved a SINGLE tile, on which every blend mask is 1 "
+        "and the accumulation is exact -- it would gate the buffer at nothing"
+    )
+    base = tiled_out.float().numpy()
+
+    # REJECTED 1: the port ignored `weights.dtype` and ran the whole thing at f32.
+    decoder32, _ = build()
+    arm = torch.cat(tiled(decoder32, latent32, _bf16_tiling_config()), dim=2).numpy()
+    arm_gap = float(np.max(np.abs(base - arm)))
+    with torch.no_grad():
+        untiled32 = decoder32(latent32)
+    untiled_arm_gap = float(np.max(np.abs(untiled.float().numpy() - untiled32.numpy())))
+
+    # REJECTED 2, AND IT IS THE ONE THIS SECTION EXISTS FOR: every convolution
+    # left at bf16 and ONLY the accumulation buffer and its weights widened to
+    # f32. That is the fresh review's own mutation of the port, asked of upstream,
+    # and it is what makes the BUFFER separable from the tile decodes. Only
+    # `conv_video_decoder.py:427` and `:526` reach these two names during
+    # `tiled_decode`; `tiling.py:460,485` already ask for f32 explicitly and the
+    # `nn.Parameter(torch.zeros(...))` calls all ran at construction.
+    real_zeros = torch.zeros
+    real_zeros_like = torch.zeros_like
+
+    def wide_zeros(*args, **kwargs):
+        kwargs["dtype"] = torch.float32
+        return real_zeros(*args, **kwargs)
+
+    def wide_zeros_like(t, *args, **kwargs):
+        kwargs["dtype"] = torch.float32
+        return real_zeros_like(t, *args, **kwargs)
+
+    torch.zeros = wide_zeros
+    torch.zeros_like = wide_zeros_like
+    try:
+        f32_buffer = torch.cat(tiled(decoder, latent, _bf16_tiling_config()), dim=2)
+    finally:
+        torch.zeros = real_zeros
+        torch.zeros_like = real_zeros_like
+    buffer_gap = float(np.max(np.abs(base - f32_buffer.float().numpy())))
+
+    # And how far ONE bf16 ulp of ONE `conv_in` weight moves this arm, emitted as
+    # the CONTEXT for holding it bit-exact rather than to a band. On the six-block
+    # fixture this number (0.015625) is larger than the buffer defect and no bound
+    # there can separate them; here it is emitted so a future reader can see that
+    # the shallow arm needs no bound at all.
+    perturbed, _ = build()
+    perturbed = perturbed.to(torch.bfloat16)
+    with torch.no_grad():
+        flat = perturbed.conv_in.conv.weight.data.view(-1)
+        word = flat[0].view(torch.int16).item()
+        flat[0] = torch.tensor([word + 1], dtype=torch.int16).view(torch.bfloat16)[0]
+    ulp = float(np.max(np.abs(
+        base - torch.cat(tiled(perturbed, latent, _bf16_tiling_config()), dim=2).float().numpy())))
+
+    print(f"[bf16 tiling] {len(tiles)} tiles; rejected: f32 arm {arm_gap:g}, "
+          f"f32 BUFFER {buffer_gap:g}; one-ulp sensitivity {ulp:g}", file=sys.stderr)
+    assert arm_gap > 0 and buffer_gap > 0, (
+        "a rejected hypothesis separates NOTHING on the bf16 tiling fixture, so "
+        "this section would gate the rule it names at zero -- rebuild it rather "
+        "than emitting it"
+    )
+
+    out.write(
+        "// --- section 8: the SHALLOW arm at upstream's own bfloat16, which is the\n"
+        "// only width at which the accumulation BUFFER exists as a rounding point\n"
+        "// (conv_video_decoder.py:427, 526; distilled.py:109) ---\n"
+    )
+    G.emit_manifest(out, "kLtx2TileDecBf16Param", manifest)
+    G.emit_scalar(out, "kLtx2TileDecBf16OutC", untiled.shape[1])
+    G.emit_scalar(out, "kLtx2TileDecBf16OutT", untiled.shape[2])
+    G.emit_scalar(out, "kLtx2TileDecBf16OutH", untiled.shape[3])
+    G.emit_scalar(out, "kLtx2TileDecBf16OutW", untiled.shape[4])
+    G.emit_scalar(out, "kLtx2TileDecBf16TileCount", len(tiles))
+    G.emit_scalar(out, "kLtx2TileDecBf16ChunkCount", len(chunks))
+    emit_i64_array(out, "kLtx2TileDecBf16ChunkFrames", [c.shape[2] for c in chunks])
+    G.emit_scalar(out, "kLtx2TileDecBf16ControlChunkCount", len(control_chunks))
+    control_gap = float(np.max(np.abs(untiled.float().numpy() - control.float().numpy())))
+    gap = float(np.max(np.abs(untiled.float().numpy() - base)))
+    out.write(
+        f"inline constexpr double kLtx2TileDecBf16UpstreamControlVsUntiled = {control_gap:.9g};\n"
+        f"inline constexpr double kLtx2TileDecBf16UpstreamTiledVsUntiled = {gap:.9g};\n"
+        f"inline constexpr double kLtx2TileDecBf16RejectF32Arm = {arm_gap:.9g};\n"
+        f"inline constexpr double kLtx2TileDecBf16UntiledRejectF32Arm = {untiled_arm_gap:.9g};\n"
+        f"inline constexpr double kLtx2TileDecBf16RejectF32Buffer = {buffer_gap:.9g};\n"
+        f"inline constexpr double kLtx2TileDecBf16UlpSensitivity = {ulp:.9g};\n"
+    )
+    G.emit_f32(out, "kLtx2TileDecBf16Untiled", untiled.float().numpy())
+    G.emit_f32(out, "kLtx2TileDecBf16Tiled", base)
+    # The rejected ANSWERS themselves, not only their distances, so a failing port
+    # can be told WHICH hypothesis it landed on.
+    G.emit_f32(out, "kLtx2TileDecBf16RejectedF32ArmTiled", arm)
+    G.emit_f32(out, "kLtx2TileDecBf16RejectedF32BufferTiled", f32_buffer.float().numpy())
+    out.write("\n")
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -733,6 +957,7 @@ def main() -> int:
         section_complementary(out)
         out.write("\n")
         section_decode(out)
+        section_decode_bf16(out)
         out.write("}  // namespace vllm_test\n")
 
     print(f"wrote {args.out}")

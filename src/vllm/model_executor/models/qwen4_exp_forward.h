@@ -188,11 +188,19 @@ HfConfig Qwen4ExpGdnHfConfig(const Qwen4ExpParams& p, const HfConfig& source);
 
 // Adapt one layer's loaded GDN weights onto the shared `GdnLayerWeights` seam.
 //
-// A FIELD COPY WITH ONE RENAME, which is what #2336 §3 measured and what this
-// function is: the `qwen4exp` and `qwen3_5` GGUF loaders read the same tensor
-// names and land on the same `[N, K]`-with-`nk` orientation, so nothing is
-// transposed, reordered or reallocated here — the returned `OwnedTensor`s are
-// COPIES OF THE HANDLES and share the loader's bytes.
+// A FIELD RENAME OVER ZERO-COPY VIEWS, which is what #2336 §3 measured and what
+// this function is: the `qwen4exp` and `qwen3_5` GGUF loaders read the same
+// tensor names and land on the same `[N, K]`-with-`nk` orientation, so nothing
+// is transposed, reordered or reallocated here — the returned `OwnedTensor`s
+// BORROW the loader's bytes through `BorrowWholeOwnedTensor`.
+//
+// THE SHARING IS LOAD-BEARING AND IT USED TO BE A LIE (issue #2476). The same
+// sentence stood above a body that spelled the pass-through as assignment, and
+// `OwnedTensor`'s implicit copy deep-copies an owned buffer. `ResidentWeight`'s
+// host-alias arm hands a device kernel `bytes.data()` directly, so the copy
+// became the GEMM's operand and was freed when the caller's scope closed, with
+// the GEMM still queued. `g` is NON-CONST because taking a keep-alive converts
+// the loader's owned buffer into a shared read-only one in place.
 //
 // `in_proj_ba` and `in_proj_qkvz` stay EMPTY, which is exact parity with
 // qwen3_5's own GGUF path and not an oversight: those two are the safetensors
@@ -204,7 +212,7 @@ HfConfig Qwen4ExpGdnHfConfig(const Qwen4ExpParams& p, const HfConfig& source);
 // Refuses by name on a shape that disagrees with `p`, because every check it
 // could skip is a wrong answer rather than a crash: the towers are all rank-2
 // and a swapped pair has the right element count.
-GdnLayerWeights Qwen4ExpGdnBlockWeights(const Qwen4ExpGdnWeights& g,
+GdnLayerWeights Qwen4ExpGdnBlockWeights(Qwen4ExpGdnWeights& g,
                                         const Qwen4ExpParams& p);
 
 // `Qwen4ExpTextModel.forward` (:1337-1433), end to end.
@@ -232,6 +240,25 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
     const v1::CommonAttentionMetadata& attn_meta,
     const v1::GDNAttentionMetadata& gdn_meta,
     const Qwen4ExpForwardCaches& caches, int64_t past_len);
+
+namespace detail {
+
+// Re-read `VT_Q4EXP_LAYER_FP` and put the fingerprint's step and tap counters
+// back to zero. TEST HOOK, and the only caller is the case that gates the
+// instrument.
+//
+// It exists because the budget is read ONCE per process. Every case in a doctest
+// binary shares that process, so whichever forward runs first spends the budget
+// and the case that sets the variable measures nothing and reports a pass --
+// which is `assertions: 0 ... SUCCESS!` wearing the instrument's own clothes.
+// Same shape and same reason as `detail::ExpertStreamSetForceFallback`.
+void Qwen4ExpLayerFpResetForTest();
+
+// Lines the instrument has printed since the last reset. The counted property a
+// gate asserts on, rather than grepping the process's stderr for a prefix.
+int64_t Qwen4ExpLayerFpTapsForTest();
+
+}  // namespace detail
 
 }  // namespace vllm
 

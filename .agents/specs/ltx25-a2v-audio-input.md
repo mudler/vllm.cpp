@@ -72,8 +72,10 @@ reads as a continuation of the LAST file named — here `minimax_h3.h`, not
 the layout `Ltx2WaveformToLogMel` takes, and it refuses a sample-rate mismatch
 rather than resampling (`minimax_h3_wav.cpp:128-131`) — the same policy
 `Ltx2WaveformToLogMel` already declares (`ltx2_audio_vae_encoder.h:171-177`).
-The other two WAV readers in the tree are mono-only
-(`audio_processor.cpp:67`, `speech_api.cpp:41-79`) and cannot serve the shipped
+The other two WAV readers in the tree still hand back ONE channel
+(`audio_processor.cpp:103-131` and its multi-channel sibling at `:183-209`,
+which W7c-1 added and which REDUCES to mono by upstream's mean rather than
+preserving channels; `speech_api.cpp:41-79`), so neither can serve the shipped
 encoder's `in_channels = 2`.
 
 **Missing:**
@@ -150,11 +152,14 @@ nameable. Upstream's stage 1 is **caller-configured and guided** —
 upstream's and the trajectory is not, and no claim is made that a render here
 reproduces upstream's A2Vid output. Recorded under `## Owed`.
 
-**Out, and refused by name rather than dropped.** Resampling: upstream resamples
-with `torchaudio.functional.resample` (`ops.py:40`), an arbitrary-ratio polyphase
-kaiser resampler; this project ports only the integer-ratio hann-sinc variant,
-so a sample rate other than the encoder's is refused with the two rates in the
-message. Non-PCM16 and non-RIFF containers: upstream reads anything PyAV opens
+**Out, and refused by name rather than dropped.** Resampling was out of this row
+and is now IN the tree: row `LTX25-AUDIO-RESAMPLE`
+([#2583](https://github.com/mudler/vllm.cpp/issues/2583)) ported
+`torchaudio.functional.resample` (`ops.py:40`) and deleted the refusal this
+paragraph described. It also corrected the reason: the filter is an
+arbitrary-ratio polyphase sinc with a HANN window, not a kaiser one, because
+`resample` defaults `resampling_method="sinc_interp_hann"` and `ops.py:40`
+passes no override. Non-PCM16 and non-RIFF containers: upstream reads anything PyAV opens
 (`decode.py:252`), and no demuxer is vendored here
 (`video_api.cpp:115-121` says so explicitly). MP3/FLAC/OGG are therefore refused
 by name. `RetakePipeline` (#924) and text-to-audio.
@@ -460,8 +465,9 @@ in the waveform's own dtype (`ops.py:54`) and the encoder in the parameters'
   `AudioEncoderConfigurator.from_metadata` and `decode_audio_from_file` at
   reduced dimensions, which needs PyAV and a written fixture file, and is why it
   did not ride here.
-- **Arbitrary-ratio resampling** — refused by name; needs the polyphase kaiser
-  resampler upstream uses at `ops.py:40`.
+- ~~**Arbitrary-ratio resampling**~~ — CLOSED by row `LTX25-AUDIO-RESAMPLE`
+  ([#2583](https://github.com/mudler/vllm.cpp/issues/2583)), which ported
+  `ops.py:36-42`. The filter it names is hann-windowed, not kaiser.
 - **Compressed audio containers** — refused by name; no demuxer is vendored.
 - **`Ltx2CreateAudioLatentState` and `Ltx2ConditionAudioByReference` remain
   test-only.** Both have exactly one call site each and it is a test

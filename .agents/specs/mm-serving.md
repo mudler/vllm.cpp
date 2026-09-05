@@ -270,11 +270,20 @@ engine's REGISTERED forward (`ModelRegistry::Forward`), not only the standalone
    (`model_registry.h`) carries the ALREADY-MERGED host bf16 inputs_embeds, the 3-D
    MRoPE positions `[3,T]`, and the DeepStack `[L,T,H]` (borrowed handles); it hangs
    off `ModelForwardInput` as `std::optional<MultiModalForwardInput> mm =
-   std::nullopt`. ADDITIVE + default-nullopt ⇒ every TEXT step leaves it nullopt, the
-   registered text forwards never read it, and the shared runner path is
-   byte-identical **by construction** (proven: `test_runner` 16/16 + `test_scheduler`
-   36/36 + `test_model_registry` 24/24 + `test_chat_mm` 8/8 + `test_openai_serving`
-   41/41, all green).
+   std::nullopt`. ADDITIVE + default-nullopt ⇒ every TEXT step leaves it nullopt and
+   the registered text forwards never read it.
+
+   **"by construction" is RETIRED here, and this line used to carry it.** It was
+   true only while the runner had no multimodal code: the field could not be set,
+   so no test could have observed it being set. `ENG-MM-INPUT-PIPELINE` P2 (#2379)
+   makes the assignment a live RUNTIME predicate — `supports_mm_inputs() &&
+   batch_carries_mm()` in `GPUModelRunner::execute_model` — and a predicate is
+   something a gate has to WATCH rather than something a type system settles. The
+   obligation is now discharged by the mutation in
+   `specs/multimodal-track.md` §6.5: force the predicate true unconditionally and
+   the text suites must go RED. Suites: `test_runner`, `test_scheduler`,
+   `test_model_registry`, `test_chat_mm`, `test_openai_serving`,
+   `test_openai_api_server`.
 2. **The M2c forward is FOLDED into the registered per-step contract.**
    `VLForwardLastLogits` is exposed as the shared `Qwen3VLForwardStepLastLogits`;
    `VLGenerateCore` is refactored to a shared `VLStepFn` driven by BOTH the standalone

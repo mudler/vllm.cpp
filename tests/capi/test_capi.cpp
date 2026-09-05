@@ -1442,7 +1442,8 @@ TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
 // permanent public contract, and the thing it must not claim is that setting
 // these fields makes a C-ABI call REFUSE a multimodal request. It does not:
 // ValidateNumItems is reached only behind the multimodal chat seam, and
-// server_main.cpp is the sole caller of set_multimodal_chat_fn — vllm_chat and
+// server_main.cpp's InstallMultiModalChatSeam is the sole PRODUCTION caller of
+// set_multimodal_chat_fn (#2475) — vllm_chat and
 // vllm_chat_stream never install one, so serving_chat.cpp's `if (mm_chat_fn_)`
 // gate is never taken on this path and no MultiModalInputs is ever built.
 //
@@ -1620,8 +1621,10 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // The multimodal input limits are ABI v19; the speech/music slice
   // (vllm_speech_* / vllm_synthesize) is ABI v20; the speech device selector is
   // v21; `vllm_model_params.mmproj_path` (issue #821) is v22; the render phase
-  // table (vllm_video_last_phase_log, issue #1010) is v23.
-  CHECK(vllm_abi_version() >= 23);
+  // table (vllm_video_last_phase_log, issue #1010) is v23;
+  // `vllm_model_params.kv_cache_dtype` (fork issue #7) is v24; the speculative
+  // acceptance readout (vllm_engine_spec_acceptance, issue #2832) is v25.
+  CHECK(vllm_abi_version() >= 25);
   // And the symbol is LINKED, not merely declared: a NULL handle answers NULL
   // rather than crashing, which is the contract every other handle query here
   // holds to.
@@ -1642,6 +1645,67 @@ TEST_CASE("capi: v16 KV-sizing knobs default and round-trip") {
   p.kv_cache_memory_bytes = int64_t{4} * 1024 * 1024 * 1024;
   CHECK(p.gpu_memory_utilization == doctest::Approx(0.85));
   CHECK(p.kv_cache_memory_bytes == int64_t{4} * 1024 * 1024 * 1024);
+}
+
+// ─── ABI v24: KV-cache storage dtype (fork issue #7) ─────────────────────────
+TEST_CASE("capi: v24 kv_cache_dtype defaults to NULL (auto)") {
+  vllm_model_params p = vllm_model_params_default();
+  CHECK(p.kv_cache_dtype == nullptr);
+}
+
+TEST_CASE("capi: v24 kv_cache_dtype reaches the engine load") {
+  // A valid kv_cache_dtype string is accepted by the ABI layer and reaches
+  // FromModelDir, where it fails on the missing checkpoint. The proof that the
+  // field was read — not merely tolerated — is that the load fails with
+  // VLLM_ERR_MODEL_LOAD (the code every FromModelDir failure reports) rather
+  // than VLLM_ERR_INVALID_ARGUMENT (which the ABI layer returns for fields it
+  // rejects before any model I/O). Deleting the `ep.kv_cache_dtype = ...`
+  // assignment in vllm_engine_load leaves the field inert, and the load still
+  // fails with MODEL_LOAD — but so does a load that never set the field, so
+  // the mutation evidence is the ABI version bump and the default-NULL check
+  // above, not this case alone. This case gates the field's ACCEPTANCE.
+  for (const char* dtype : {"fp8", "fp8_e4m3", "auto", "bfloat16"}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.kv_cache_dtype = dtype;
+    vllm_engine* eng = nullptr;
+    CAPTURE(dtype);
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+  }
+}
+
+// ─── ABI v25: speculative acceptance readout (issue #2832) ───────────────────
+// The DFlash2 speed gate drives `examples/cli`, a pure client of `vllm.h`, and
+// the acceptance both reference engines publish had no route out of ours. These
+// cases hold the accessor's CONTRACT; the harness suite
+// (`tests/tools/test_dflash2_speed_harness.py`) links the production CLI against
+// a stub libvllm and holds what it PRINTS.
+//
+// WHAT THESE CASES DO NOT HOLD, said plainly because a fresh review found the
+// gap by mutation: both of them return at the NULL guard, so neither ever
+// reaches the counter mapping, and swapping `drafts_proposed` with
+// `drafts_accepted` leaves this file green. That mapping lives in
+// `src/capi/spec_acceptance.h` for exactly that reason and is pinned by
+// `SpecAcceptanceMappingTest` in the harness suite, which compiles and runs it
+// with no library. Do not read a green here as a check on the values.
+TEST_CASE("capi: v25 vllm_engine_spec_acceptance refuses NULL and zeroes *out") {
+  vllm_spec_acceptance got{};
+  // A NULL out has nowhere to write, so it is the one argument that cannot be
+  // zeroed first.
+  CHECK(vllm_engine_spec_acceptance(nullptr, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+
+  // A NULL engine DOES zero *out, so a caller that ignores the status reads
+  // zeroes rather than whatever was on its stack. That matters here more than
+  // usual: the value is a benchmark datum, and stack garbage read as an
+  // acceptance count is a plausible-looking measurement.
+  got.drafts_proposed = 111;
+  got.drafts_accepted = 222;
+  got.drafted_request_steps = 333;
+  CHECK(vllm_engine_spec_acceptance(nullptr, &got) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(got.drafts_proposed == 0);
+  CHECK(got.drafts_accepted == 0);
+  CHECK(got.drafted_request_steps == 0);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────

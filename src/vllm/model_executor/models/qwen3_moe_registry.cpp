@@ -151,6 +151,7 @@ const ModelFactory kQwen3MoeFactory{
     // it marks the step boundary, and that is why it holds an `EndStepGuard` at
     // all — so its experts reach `KqExpertSlice` and the slot lane serves its
     // `*_exps.weight` towers.
+    .consumes_device_token_ids = true,
     .streams_routed_experts = true,
 };
 

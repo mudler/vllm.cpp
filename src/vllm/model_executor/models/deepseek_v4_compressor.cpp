@@ -2,8 +2,11 @@
 // See deepseek_v4_compressor.h for the full port map (file:line on both sides).
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
 
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
+
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // F32ToF8E4M3, kFloat8E4M3Max
@@ -178,6 +181,112 @@ std::vector<float> Fp8DsMlaDecodeToken(const Fp8DsMlaToken& token,
   return out;
 }
 
+// ── (B2) The paged fp8_ds_mla BLOCK — `KV-DSV4-MULTICACHE` W8 slice 1 ────────
+// See the header for the region-split block comment this ports verbatim.
+
+namespace {
+// Upstream's `round_up` as `_apply_alignment_padding` uses it
+// (`kv_cache_interface.py:345-351`). `alignment` is > 0 by construction here.
+int64_t RoundUpTo(int64_t value, int64_t alignment) {
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+// Upstream passes `alignment=576` as a LITERAL on both fp8_ds_mla specs
+// (`attention.py:642`, `sparse_swa.py:99`). At V4's geometry it happens to equal
+// `token_stride_bytes`; it is upstream's own constant and is NOT derived from
+// the token layout, so it is written here as upstream writes it.
+constexpr int64_t kFp8DsMlaAlignmentBytes = 576;
+}  // namespace
+
+Fp8DsMlaPageLayout MakeFp8DsMlaPageLayout(const Fp8DsMlaLayout& layout,
+                                          int64_t block_size) {
+  VT_CHECK(block_size > 0, "fp8_ds_mla page: block_size must be > 0");
+  VT_CHECK(layout.token_stride_bytes > 0 && layout.scale_dim > 0,
+           "fp8_ds_mla page: layout is not initialized "
+           "(use MakeFp8DsMlaLayout)");
+  Fp8DsMlaPageLayout P;
+  P.token = layout;
+  P.block_size = block_size;
+  // "Token data pointer: token data is stored contiguously at start of block"
+  // (`cache_utils.py:90-92`).
+  P.token_data_size = layout.token_stride_bytes;  // 576 for V4
+  // "Scale pointer: scales are stored after ALL token data in the block"
+  // (`cache_utils.py:94-98`): `cache_block_size * token_data_size`.
+  P.scale_region_offset = block_size * P.token_data_size;
+  P.scale_dim = layout.scale_dim;  // 8 = 7 real + 1 pad
+  P.alignment_bytes = kFp8DsMlaAlignmentBytes;
+  // 584 = 576 data + 8 scale, per token (`kv_cache_interface.py:401-403`).
+  P.real_block_bytes = block_size * (P.token_data_size + P.scale_dim);
+  P.padded_block_bytes = RoundUpTo(P.real_block_bytes, P.alignment_bytes);
+  return P;
+}
+
+void Fp8DsMlaStoreToken(uint8_t* block_base, const Fp8DsMlaPageLayout& page,
+                        int64_t pos_in_block, const Fp8DsMlaToken& token) {
+  // Upstream's `if slot_idx == -1: return` (`cache_utils.py:77-78`). A padded
+  // or masked token writes NOTHING — not a zero row, not a partial row.
+  if (pos_in_block < 0) return;
+  VT_CHECK(block_base != nullptr, "fp8_ds_mla store: null block");
+  VT_CHECK(pos_in_block < page.block_size,
+           "fp8_ds_mla store: pos_in_block out of range");
+  const Fp8DsMlaLayout& L = page.token;
+  VT_CHECK(static_cast<int64_t>(token.nope_fp8.size()) == L.nope_head_dim,
+           "fp8_ds_mla store: nope_fp8 size mismatch");
+  VT_CHECK(static_cast<int64_t>(token.scale_ue8m0.size()) == L.n_nope_blocks,
+           "fp8_ds_mla store: scale size mismatch");
+  VT_CHECK(static_cast<int64_t>(token.rope_bf16.size()) == L.rope_head_dim,
+           "fp8_ds_mla store: rope size mismatch");
+
+  // token_data_ptr = cache_block_ptr + pos_in_block * token_data_size (`:92`).
+  uint8_t* data = block_base + pos_in_block * page.token_data_size;
+  // "Token data layout: [0:448] fp8, [448:576] bf16" (`:100-102`).
+  std::memcpy(data, token.nope_fp8.data(),
+              static_cast<size_t>(L.nope_head_dim));
+  // `:155-159`: the rope half is stored through a bf16 pointer, i.e. host-native
+  // 16-bit words, verbatim and unquantized.
+  std::memcpy(data + L.nope_head_dim, token.rope_bf16.data(),
+              static_cast<size_t>(L.rope_head_dim) * sizeof(uint16_t));
+
+  // token_scale_ptr = cache_block_ptr + cache_block_size * token_data_size
+  //                   + pos_in_block * scale_dim  (`:96-98`).
+  uint8_t* scales =
+      block_base + page.scale_region_offset + pos_in_block * page.scale_dim;
+  std::memcpy(scales, token.scale_ue8m0.data(),
+              static_cast<size_t>(L.n_nope_blocks));
+  // "Padding scale at index 7": `tl.store(token_scale_ptr + 7, zeros)` (`:148-149`).
+  // Written EXPLICITLY, so the byte is 0 rather than whatever the page held.
+  for (int64_t b = L.n_nope_blocks; b < page.scale_dim; ++b)
+    scales[static_cast<size_t>(b)] = 0;
+}
+
+Fp8DsMlaToken Fp8DsMlaLoadToken(const uint8_t* block_base,
+                                const Fp8DsMlaPageLayout& page,
+                                int64_t pos_in_block) {
+  VT_CHECK(block_base != nullptr, "fp8_ds_mla load: null block");
+  VT_CHECK(pos_in_block >= 0 && pos_in_block < page.block_size,
+           "fp8_ds_mla load: pos_in_block out of range");
+  const Fp8DsMlaLayout& L = page.token;
+
+  Fp8DsMlaToken t;
+  t.nope_fp8.resize(static_cast<size_t>(L.nope_head_dim));
+  t.scale_ue8m0.resize(static_cast<size_t>(L.n_nope_blocks));
+  t.rope_bf16.resize(static_cast<size_t>(L.rope_head_dim));
+
+  // Identical addressing to the store (`cache_utils.py:281-292`).
+  const uint8_t* data = block_base + pos_in_block * page.token_data_size;
+  std::memcpy(t.nope_fp8.data(), data, static_cast<size_t>(L.nope_head_dim));  // :306
+  std::memcpy(t.rope_bf16.data(), data + L.nope_head_dim,
+              static_cast<size_t>(L.rope_head_dim) * sizeof(uint16_t));  // :333-339
+
+  // `:319` reads `token_scale_ptr + qblock_idx` for `qblock_idx` in
+  // `static_range(n_quant_blocks)` with n_quant_blocks = 7 (`:385`) — ONE FEWER
+  // than the store writes. The 8th byte is deliberately not read.
+  const uint8_t* scales =
+      block_base + page.scale_region_offset + pos_in_block * page.scale_dim;
+  std::memcpy(t.scale_ue8m0.data(), scales,
+              static_cast<size_t>(L.n_nope_blocks));
+  return t;
+}
+
 
 // MODEL-DSV4-DSA-COMPOSE W1 (#2286). See the header for the cycle's contract.
 std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
@@ -188,6 +297,7 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        const std::vector<int64_t>& positions,
                                        const std::vector<float>& rms_weight, float eps,
                                        int64_t compress_ratio, int64_t head_dim,
+                                       int64_t rope_dim, double rope_theta,
                                        int64_t coff) {
   VT_CHECK(state_kv != nullptr && state_score != nullptr,
            "CompressorStepCycle: state buffers are required");
@@ -252,8 +362,24 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
       std::copy(state_score->begin() + base, state_score->begin() + base + head_dim,
                 wsc.begin() + i * head_dim);
     }
-    const std::vector<float> pooled =
+    std::vector<float> pooled =
         CompressorPoolNorm(wkv, wsc, valid, rms_weight, eps, win, head_dim);
+    // ROTATE THE POOLED ROW. `fused_compress_quant_cache.py:272-297` applies
+    // GPT-J RoPE to the rope tail only, and does so UNCONDITIONALLY -- the
+    // `rotate` constructor flag is dead and both compressors pass it. The
+    // position is `(position / compress_ratio) * compress_ratio`, the window's
+    // BASE rather than the emitting token's, so every row of one window shares a
+    // phase.
+    if (rope_dim > 0) {
+      VT_CHECK(rope_dim % 2 == 0 && rope_dim <= head_dim,
+               "CompressorStepCycle: the rope tail is rotated in PAIRS and lies "
+               "inside the head");
+      const int64_t compressed_pos = (pos / compress_ratio) * compress_ratio;
+      RopeInplaceLayer(pooled.data() + (head_dim - rope_dim), rope_dim,
+                       compressed_pos, rope_theta, /*freq_scale=*/1.0,
+                       /*ext_factor=*/0.0, /*n_ctx_orig=*/0, /*beta_fast=*/0.0,
+                       /*beta_slow=*/0.0);
+    }
     emitted.insert(emitted.end(), pooled.begin(), pooled.end());
   }
   return emitted;

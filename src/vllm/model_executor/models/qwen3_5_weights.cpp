@@ -337,6 +337,36 @@ bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
   return report(HostAliasOutcome::kRehomed, true);
 }
 
+OwnedTensor BorrowWholeOwnedTensor(OwnedTensor& src) {
+  // An empty source has nothing to keep alive, and `OwnedBytes::Borrow` refuses
+  // a null owner by name. A block adapter legitimately passes an unpopulated
+  // arm through (the GGUF path leaves `in_proj_ba` and `in_proj_qkvz` empty),
+  // so this is a normal case and not a refusal.
+  if (src.bytes.empty()) return src;
+  // BEFORE `data()`: `KeepAlive()` moves an owned vector into a refcounted
+  // holder, and although `std::vector`'s move preserves the heap address,
+  // ordering the two calls means this view never depends on that.
+  std::shared_ptr<const void> keep = src.bytes.KeepAlive();
+  OwnedTensor v;
+  v.bytes = OwnedBytes::Borrow(src.bytes.data(), src.bytes.size(), std::move(keep));
+  v.dtype = src.dtype;
+  v.rank = src.rank;
+  for (int i = 0; i < src.rank; ++i) v.shape[i] = src.shape[i];
+  v.nk = src.nk;
+  // EVERY LAYOUT MARKER THE KERNEL KEYS ON. Dropping `repacked` makes
+  // `kMatmulBTQuant` read i8mm-interleaved bytes as plain q8_0, which is the
+  // CIQ-G7 all-zero-token failure; the other three have the same shape.
+  v.repacked = src.repacked;
+  v.q8_0_aligned = src.q8_0_aligned;
+  v.elem_kn_repacked = src.elem_kn_repacked;
+  v.mmap_fd = src.mmap_fd;
+  v.mmap_file_offset = src.mmap_file_offset;
+  // `mmap_src` is deliberately NOT carried. It is the direct-upload release
+  // record, and it names bytes exactly one owner may release; a view that
+  // inherited it would let `ReleaseDirectUploadSource` run twice.
+  return v;
+}
+
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
   if (w.d_dev == nullptr) return;
   // ENG-LOAD-DIRECT-UPLOAD: a direct-upload borrow is the ONE borrow that may be

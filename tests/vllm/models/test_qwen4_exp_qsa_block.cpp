@@ -1475,3 +1475,267 @@ TEST_CASE("qwen4_exp qsa block: refuses by name rather than computing something 
         doctest::Contains("indexer_kv_heads == 1"), std::exception);
   }
 }
+
+// ── 8. THE DEVICE ARM: A DEVICE-RESIDENT OPERAND IS READ, NOT REFUSED ────────
+//
+// WHAT CHANGED AND WHAT THIS GATES (#2421). The block resolves three things on
+// the host — group 2's page table (`IndexerRows`), the two rope layouts' probe
+// rows (`CheckRopeLayoutsAgree`) and `kv_lens` (`Qwen4ExpQsaIndex`) — and each
+// used to REFUSE a tensor that was not CPU-resident. Every operand the
+// production forward hands the block is a `dense_attn::DBuf`, which carries the
+// queue's device, so on a CUDA queue the first of the three fired before any
+// arithmetic ran and no CUDA step could enter this block at all. The three reads
+// now copy the words they read.
+//
+// THE CASE HAS TWO TIERS, AND THE FIRST DOES NOT DEPEND ON ANOTHER WAVE.
+// `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention` have no `kCUDA`
+// registration at this head (#2380), and `GetOp` throws on an unregistered
+// (op, device) rather than falling back. So on a CUDA device the block may still
+// stop — but it must stop for THAT reason and never for a residency one, and
+// tier 1 asserts exactly that. Tier 2 is the CPU-vs-device parity comparison and
+// runs only once the block completes; when it does not, the case says in its own
+// output which op is still missing rather than reporting a pass.
+//
+// THE SELECTION IS COMPARED AS A SET, NOT WITHIN A TOLERANCE. `block_ids` is the
+// output of a top-k, whose error is BIMODAL: an index either flips to a
+// different block or it does not, and a float bound on it gates nothing. The
+// comparison is set equality per query token, and the MARGIN between the last
+// selected and the first rejected logit is printed so a reader can see how far
+// the CPU reference was from a flip rather than being told it agreed.
+//
+// A SKIP IS NOT A PASS, and doctest reports a case that returns early as
+// `assertions: 0 ... SUCCESS!`. That is stated here rather than papered over:
+// on a build with no CUDA backend this case measures NOTHING, and the spec's
+// `## Owed` records the device arm as unmeasured until this runs on a device.
+namespace {
+
+bool HasCudaBackend() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// The three refusals this change removed, by the words they refused with. Tier 1
+// asserts none of them can come back. Matching on the MESSAGE is deliberate:
+// what the change owns is that a residency is no longer a reason to stop, and
+// the message is where a reason is stated.
+bool IsResidencyRefusal(const std::string& what) {
+  return what.find("CPU-resident") != std::string::npos ||
+         what.find("read on the host") != std::string::npos ||
+         what.find("cross-checked on the host") != std::string::npos;
+}
+
+std::vector<uint16_t> DownloadBf16(vt::Backend& b, Queue& q, const Tensor& t, int64_t n) {
+  std::vector<uint16_t> host(static_cast<size_t>(n));
+  b.Copy(q, host.data(), t.data, static_cast<size_t>(n) * 2);
+  b.Synchronize(q);
+  return host;
+}
+
+std::vector<int32_t> DownloadI32(vt::Backend& b, Queue& q, const Tensor& t, int64_t n) {
+  std::vector<int32_t> host(static_cast<size_t>(n));
+  b.Copy(q, host.data(), t.data, static_cast<size_t>(n) * 4);
+  b.Synchronize(q);
+  return host;
+}
+
+std::vector<float> DownloadF32(vt::Backend& b, Queue& q, const Tensor& t, int64_t n) {
+  std::vector<float> host(static_cast<size_t>(n));
+  b.Copy(q, host.data(), t.data, static_cast<size_t>(n) * 4);
+  b.Synchronize(q);
+  return host;
+}
+
+}  // namespace
+
+TEST_CASE("qwen4_exp qsa block: a CUDA queue enters the block, and its selection is the CPU's") {
+  if (!HasCudaBackend()) {
+    MESSAGE("no CUDA backend in this build: the device arm is UNMEASURED by this run");
+    return;
+  }
+  const Qwen4ExpParams p = GoldenParams();
+  const Qwen4ExpQsaWeights w = GoldenWeights(DType::kBF16);
+  const Case& c = kOverBudget;  // 23 tokens: OVER budget, so the top-k really rejects
+  const int64_t H = p.hidden_size, rot = p.rotary_dim;
+  const int64_t Hkv = p.num_key_value_heads, Dh = p.head_dim;
+  const int64_t IH = p.qsa.n_heads, ID = p.qsa.head_dim, CR = p.qsa.compress_ratio;
+  const int64_t topk = p.qsa.block_topk();
+  const int64_t nb = c.seq / CR;
+  REQUIRE(nb > topk);  // the fixture must actually reject blocks, or there is no set to compare
+
+  // ── the CPU reference, from the same production entry points ──────────────
+  Caches cpu_caches(c.seq, Hkv, Dh, ID);
+  const BlockRun ref = RunCase(c, w, p, cpu_caches, /*tap_logits=*/true);
+  REQUIRE(static_cast<int64_t>(ref.ids.size()) == c.seq * topk);
+
+  // ── the device run ────────────────────────────────────────────────────────
+  vt::Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = gpu.CreateQueue();
+  vllm::dense_attn::Dev d{gpu, q};
+  using vllm::dense_attn::DBuf;
+
+  RopeTables rope = BuildRope(c);
+  const std::vector<uint16_t> hidden = Bf16Of(c.hidden, c.seq * H);
+  std::vector<int32_t> positions(static_cast<size_t>(c.seq));
+  for (int64_t t = 0; t < c.seq; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  DBuf d_h(d, DType::kBF16, {c.seq, H}, hidden.data());
+  DBuf d_pos(d, DType::kI32, {c.seq}, positions.data());
+  DBuf d_cs(d, DType::kBF16, {c.seq, rot}, rope.packed.data());
+  DBuf d_cos(d, DType::kF32, {c.seq, rot}, rope.cos.data());
+  DBuf d_sin(d, DType::kF32, {c.seq, rot}, rope.sin.data());
+  DBuf d_key(d, DType::kBF16, {c.seq, Hkv, Dh});
+  DBuf d_val(d, DType::kBF16, {c.seq, Hkv, Dh});
+  DBuf d_ikey(d, DType::kBF16, {c.seq, ID});
+  d_key.Zero(d);
+  d_val.Zero(d);
+  d_ikey.Zero(d);
+  Qwen4ExpQsaCaches dev_caches;
+  dev_caches.key = d_key.t();
+  dev_caches.value = d_val.t();
+  dev_caches.index_key = d_ikey.t();
+
+  // TIER 1. The block is entered. Whatever stops it, a RESIDENCY must not, and
+  // the reason it did stop is printed so this case names the next thing in the
+  // way instead of implying there is nothing.
+  std::string stopped_with;
+  std::vector<uint16_t> dev_out_bits;
+  int64_t dev_visited = 0;
+  try {
+    vllm::Qwen4ExpQsaBlockOutput o =
+        vllm::RunQwen4ExpQsaBlock(d, w, p, d_h.t(), d_pos.t(), d_cs.t(), d_cos.t(), d_sin.t(),
+                                  dev_caches, /*past_len=*/0, &dev_visited);
+    dev_out_bits = DownloadBf16(gpu, q, o.tensor, c.seq * H);
+  } catch (const std::exception& e) {
+    stopped_with = e.what();
+  }
+  INFO("the CUDA block stopped with: ", stopped_with.empty() ? "(it did not stop)" : stopped_with);
+  CHECK_FALSE(IsResidencyRefusal(stopped_with));
+
+  if (!stopped_with.empty()) {
+    MESSAGE("the CUDA block did not complete; the residency refusals are gone and what "
+            "remains is another wave's: ", stopped_with);
+    gpu.DestroyQueue(q);
+    return;
+  }
+
+  // TIER 2a. THE OUTPUT, against the same oracle golden the CPU arm answers to.
+  // FINITENESS FIRST: `MaxRelDiff` folds with `std::max`, and `std::max(x, NaN)`
+  // returns `x`, so an all-NaN device run would report a relative difference of
+  // exactly 0 and sail through any bound. That absorption was MEASURED on the
+  // paged case one section up and it is guarded the same way here.
+  constexpr double kOutTol = 3e-2;  // the bf16 quantum the paged case already carries
+  const std::vector<float> dev_out = F32Of(dev_out_bits.data(), c.seq * H);
+  for (float v : dev_out) CHECK(std::isfinite(v));
+  const double rel_oracle = MaxRelDiff(dev_out, c.out, c.seq * H);
+  INFO("CUDA block max relative difference vs the ORACLE ", rel_oracle);
+  CHECK(rel_oracle < kOutTol);
+
+  // TIER 2b. THE DEVICE AGAINST THE CPU ARM, reported as an absolute max|diff|.
+  // Not asserted bit-identical: a device GEMM re-associates the K reduction, so
+  // the two arms are close and not equal, and claiming equality here would be a
+  // claim about `vt::MatmulBT` that this case cannot make.
+  double max_abs = 0.0;
+  for (int64_t i = 0; i < c.seq * H; ++i)
+    max_abs = std::max(max_abs, std::fabs(static_cast<double>(dev_out[static_cast<size_t>(i)]) -
+                                          static_cast<double>(ref.out[static_cast<size_t>(i)])));
+  // REPORTED, NOT ASSERTED. A bound picked to fit this one fixture would be a
+  // number wearing a gate's clothes; the ORACLE bound above is the gate, and
+  // this is the axis the reader asked for.
+  MESSAGE("CUDA vs CPU block output max|diff|: ", max_abs);
+
+  // TIER 2c. THE SELECTION, AS A SET, PLUS THE MARGIN.
+  const int64_t IHID = IH * ID;
+  DBuf d_qi(d, DType::kBF16, {c.seq, IHID});
+  {
+    Tensor t_qi = d_qi.t();
+    vt::MatmulBT(q, t_qi, d_h.t(), vllm::dense_attn::ResidentWeight(d, w.idx_q_proj, {IHID, H}));
+    Tensor flat = vllm::dense_attn::Reshape(d_qi.t(), {c.seq * IH, ID});
+    vt::RmsNorm(q, flat, flat, vllm::dense_attn::ResidentWeight(d, w.idx_q_norm, {ID}),
+                vt::RmsNormArgs{static_cast<float>(p.rms_norm_eps), /*gemma=*/true});
+  }
+  Tensor d_q3 = vllm::dense_attn::Reshape(d_qi.t(), {c.seq, IH, ID});
+  {
+    vt::RopeArgs ra;
+    ra.rotary_dim = static_cast<int>(rot);
+    ra.is_neox_style = true;
+    vt::RopeFromCache(q, d_q3, nullptr, d_pos.t(), d_cs.t(), ra);
+  }
+  std::vector<int32_t> kv_lens_host(static_cast<size_t>(c.seq));
+  for (int64_t t = 0; t < c.seq; ++t)
+    kv_lens_host[static_cast<size_t>(t)] = static_cast<int32_t>(t + 1);
+  // DEVICE-RESIDENT `kv_lens`, which is the operand the third refusal named and
+  // the one the production block now hands this function.
+  DBuf d_len(d, DType::kI32, {c.seq}, kv_lens_host.data());
+  DBuf d_lg(d, DType::kF32, {c.seq, nb});
+  Tensor t_lg = d_lg.t();
+  vllm::Qwen4ExpQsaSelection sel = vllm::Qwen4ExpQsaIndex(
+      d, p.qsa, static_cast<float>(p.rms_norm_eps), d_q3, d_ikey.t(),
+      vllm::dense_attn::ResidentWeight(d, w.idx_k_norm, {ID}), d_cos.t(), d_sin.t(), d_len.t(),
+      c.seq, /*round_intermediates_to_bf16=*/true, &t_lg);
+  const std::vector<int32_t> dev_ids = DownloadI32(gpu, q, sel.block_ids, c.seq * topk);
+  const std::vector<float> dev_logits = DownloadF32(gpu, q, t_lg, c.seq * nb);
+
+  int64_t tokens_with_a_selection = 0;
+  double worst_margin = std::numeric_limits<double>::infinity();
+  for (int64_t t = 0; t < c.seq; ++t) {
+    std::vector<int32_t> a(ref.ids.begin() + static_cast<ptrdiff_t>(t * topk),
+                           ref.ids.begin() + static_cast<ptrdiff_t>((t + 1) * topk));
+    std::vector<int32_t> b(dev_ids.begin() + static_cast<ptrdiff_t>(t * topk),
+                           dev_ids.begin() + static_cast<ptrdiff_t>((t + 1) * topk));
+    // The op emits ASCENDING with `-1` padding, so the vectors are already
+    // canonical; sorting anyway makes the comparison a SET comparison rather
+    // than an ordering one, which is what the claim is.
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    INFO("query token ", t, ": the CPU and CUDA selections differ");
+    CHECK(a == b);
+
+    // The margin, read off the CPU reference's own logits: the gap between the
+    // WORST selected block and the BEST rejected one inside this token's window.
+    // A selection flips when a value error exceeds this gap, so it is the number
+    // that says whether the agreement above was robust or lucky.
+    const int64_t win_end = (t + 1) / CR;
+    if (win_end <= 0) continue;
+    std::vector<char> chosen(static_cast<size_t>(nb), 0);
+    int64_t n_chosen = 0;
+    for (int64_t j = 0; j < topk; ++j) {
+      const int32_t id = a[static_cast<size_t>(j)];
+      if (id < 0) continue;
+      chosen[static_cast<size_t>(id)] = 1;
+      ++n_chosen;
+    }
+    if (n_chosen == 0 || n_chosen >= win_end) continue;  // nothing was rejected: no margin
+    ++tokens_with_a_selection;
+    double worst_in = std::numeric_limits<double>::infinity();
+    double best_out = -std::numeric_limits<double>::infinity();
+    for (int64_t j = 0; j < win_end; ++j) {
+      const double v = ref.logits[static_cast<size_t>(t * nb + j)];
+      if (chosen[static_cast<size_t>(j)] != 0) {
+        worst_in = std::min(worst_in, v);
+      } else {
+        best_out = std::max(best_out, v);
+      }
+    }
+    worst_margin = std::min(worst_margin, worst_in - best_out);
+  }
+  INFO("tokens whose window actually rejected a block: ", tokens_with_a_selection);
+  CHECK(tokens_with_a_selection > 0);
+  MESSAGE("selection margin (worst over query tokens, CPU logits): ", worst_margin);
+
+  // The LOGITS themselves, as a max|diff|. This is the value axis the selection
+  // rides on, so it is reported rather than only the verdict it produced.
+  double logit_diff = 0.0;
+  for (int64_t i = 0; i < c.seq * nb; ++i)
+    logit_diff = std::max(logit_diff, std::fabs(static_cast<double>(dev_logits[static_cast<size_t>(i)]) -
+                                                static_cast<double>(ref.logits[static_cast<size_t>(i)])));
+  MESSAGE("CUDA vs CPU indexer logits max|diff|: ", logit_diff);
+  INFO("the CUDA logits must stay far enough from the CPU's that no selection can flip");
+  CHECK(logit_diff < worst_margin / 2.0);
+
+  CHECK(dev_visited > 0);
+  gpu.DestroyQueue(q);
+}

@@ -1,0 +1,182 @@
+# TT P150 W2 confirming A/B, 2026-08-30 — thalia, base a1d04bbc9 + 4fe8a5eaf (bench/tt-clock-state-w2)
+# build: cmake Release -DVLLM_CPP_TENSTORRENT=ON -DCMAKE_PREFIX_PATH=tt-metal build_Release lib64/share; vllm-cli via C ABI
+# lock: ~/gpu.lock across ALL legs; tt-smi -r first; workload greedy b1 prompt='Write a short story about a robot learning to paint.' --max-tokens 96 --repeat 5, in-process run 1 discarded
+# sampler v2: tools/bench/tt_clock_state.py --sampler pyluwen --interval 0.25 --duration 75 --leg-pid <pid> (run 1 used subprocess --interval 1: same ratio, 3 windows under the 30-busy floor, superseded)
+# FIRMWARE CAP: every window records limits.asic_fmax=1350 with provenance 'tt-smi smbus telemetry AICLK_LIMIT_MAX (get_bh_chip_limits, tt_smi backend.py:830)' — the W1 'UNVERIFIED pin owed' is retired
+
+===== run.log (v2) =====
+lock held 2026-08-30T23:06:19+02:00
+== tt-smi -r reset (before L0) ==
+== leg p1a arm A start 2026-08-30T23:07:06+02:00 ==
+== leg p1a arm A done legrc=0 samplerrc=1 2026-08-30T23:08:21+02:00 ==
+== leg p1b arm B start 2026-08-30T23:08:21+02:00 ==
+== leg p1b arm B done legrc=0 samplerrc=1 2026-08-30T23:09:36+02:00 ==
+== leg p2a arm B start 2026-08-30T23:09:36+02:00 ==
+== leg p2a arm B done legrc=0 samplerrc=1 2026-08-30T23:10:51+02:00 ==
+== leg p2b arm A start 2026-08-30T23:10:51+02:00 ==
+== leg p2b arm A done legrc=0 samplerrc=1 2026-08-30T23:12:06+02:00 ==
+== leg p3a arm A start 2026-08-30T23:12:06+02:00 ==
+== leg p3a arm A done legrc=0 samplerrc=1 2026-08-30T23:13:22+02:00 ==
+== leg p3b arm B start 2026-08-30T23:13:22+02:00 ==
+== leg p3b arm B done legrc=0 samplerrc=1 2026-08-30T23:14:37+02:00 ==
+== cadence pair: pyluwen vs subprocess at interval 0.25, idle board ==
+pyluwen window rc=0
+subproc window rc=0
+ALL-LEGS-DONE 2026-08-30T23:15:17+02:00
+===== analyzer output (run 2, recorded; run 1 in git-noted /tmp, ratio 1.303 median / 1.300 mean) =====
+leg p1a (arm A): all=[8.749, 10.975, 10.899, 10.935, 11.01] warm=[10.975, 10.899, 10.935, 11.01]
+leg p1b (arm B): all=[10.963, 14.397, 14.199, 14.497, 14.473] warm=[14.397, 14.199, 14.497, 14.473]
+leg p2a (arm B): all=[10.762, 13.48, 14.111, 14.134, 13.99] warm=[13.48, 14.111, 14.134, 13.99]
+leg p2b (arm A): all=[8.79, 11.127, 11.026, 11.114, 11.058] warm=[11.127, 11.026, 11.114, 11.058]
+leg p3a (arm A): all=[8.72, 11.037, 10.841, 10.934, 10.987] warm=[11.037, 10.841, 10.934, 10.987]
+leg p3b (arm B): all=[10.888, 14.2, 14.403, 14.473, 14.426] warm=[14.2, 14.403, 14.473, 14.426]
+arm A: n=12 median=10.998 mean=10.995 min=10.841 max=11.127
+arm B: n=12 median=14.299 mean=14.232 min=13.480 max=14.497
+ratio B/A median=1.300 mean=1.294
+
+== windows ==
+win-p1a.json: n=289 busy=176 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-p1b.json: n=292 busy=137 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-p2a.json: n=291 busy=140 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-p2b.json: n=289 busy=174 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-p3a.json: n=289 busy=177 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-p3b.json: n=292 busy=136 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-pyluwen.json: n=81 busy=81 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-subproc.json: n=30 busy=30 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+
+== refold busy-slice judge over the six leg windows ==
+refold judge rc: 0 reasons: []
+  n=176 distinct-set=[1350..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+  n=137 distinct-set=[1350..1350] cap=1350 busy_med=1350 pct=100.0 pegged=True
+  n=140 distinct-set=[1350..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+  n=174 distinct-set=[1343..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+  n=177 distinct-set=[1343..1350] cap=1350 busy_med=1350 pct=100.0 pegged=True
+  n=136 distinct-set=[1350..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+===== run-1 analyzer output =====
+leg p1a (arm A): all=[8.702, 11.081, 10.848, 11.034, 11.058] warm=[11.081, 10.848, 11.034, 11.058]
+leg p1b (arm B): all=[10.89, 14.35, 14.01, 14.476, 14.389] warm=[14.35, 14.01, 14.476, 14.389]
+leg p2a (arm B): all=[10.88, 14.304, 14.099, 14.277, 14.242] warm=[14.304, 14.099, 14.277, 14.242]
+leg p2b (arm A): all=[8.688, 10.997, 10.966, 10.675, 11.036] warm=[10.997, 10.966, 10.675, 11.036]
+leg p3a (arm A): all=[8.519, 10.929, 10.942, 10.918, 10.942] warm=[10.929, 10.942, 10.918, 10.942]
+leg p3b (arm B): all=[10.887, 14.206, 14.259, 14.365, 13.847] warm=[14.206, 14.259, 14.365, 13.847]
+arm A: n=12 median=10.954 mean=10.952 min=10.675 max=11.081
+arm B: n=12 median=14.268 mean=14.235 min=13.847 max=14.476
+ratio B/A median=1.303 mean=1.300
+
+== windows ==
+win-p1a.json: n=53 busy=33 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+win-p1b.json: n=53 busy=26 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+win-p2a.json: n=53 busy=26 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+win-p2b.json: n=53 busy=33 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+win-p3a.json: n=53 busy=33 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+win-p3b.json: n=53 busy=26 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+win-pyluwen.json: n=21 busy=21 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=pyluwen skip=-
+win-subproc.json: n=15 busy=15 fw_cap=1350 cap=1350 prov='tt-smi smbus telemetry AICLK_LIMIT_MAX (get_' sampler=subprocess skip=-
+
+== refold busy-slice judge over the six leg windows ==
+refold judge rc: 1 reasons: ['retained busy samples 26 < MIN_BUSY_SAMPLES=30', 'retained busy samples 26 < MIN_BUSY_SAMPLES=30', 'retained busy samples 26 < MIN_BUSY_SAMPLES=30']
+  n=33 distinct-set=[1350..1350] cap=1350 busy_med=1350 pct=100.0 pegged=True
+  n=26 distinct-set=[1350..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+  n=26 distinct-set=[1350..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+  n=33 distinct-set=[1350..1350] cap=1350 busy_med=1350 pct=100.0 pegged=True
+  n=33 distinct-set=[1350..1350] cap=1350 busy_med=1350 pct=100.0 pegged=True
+  n=26 distinct-set=[1350..1350] cap=1350 busy_med=1350.0 pct=100.0 pegged=True
+===== smi-after-reset.json (identity + limits) =====
+{
+ "host_info": {
+  "OS": "Linux",
+  "Distro": "Gentoo Linux",
+  "Kernel": "7.0.1-gentoo",
+  "Hostname": "thalia",
+  "Platform": "aarch64",
+  "Python": "3.13.12",
+  "Memory": "255.18 GB",
+  "Driver": "TT-KMD 2.10.1-pre"
+ },
+ "host_sw_vers": {
+  "tt_smi": "6.2.1",
+  "pyluwen": "0.9.0",
+  "tt_umd": "0.9.9"
+ },
+ "limits": {
+  "vdd_min": "0.70",
+  "vdd_max": "0.90",
+  "tdp_limit": "150",
+  "tdc_limit": "200",
+  "asic_fmax": "1350",
+  "therm_trip_l1_limit": "90",
+  "thm_limit": "110",
+  "bus_peak_limit": 0,
+  "fan_rpm_limit": 0,
+  "board_power_limit": "300"
+ },
+ "board_id": "0x403:0x3191406b",
+ "flash_bundle": "0x13070100"
+}
+===== per-leg vllm-cli .err (tok/s lines) =====
+--- /tmp/w2-ab2/leg-p1a.err
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=10.973 tok_s=8.749
+vllm-cli: run=1/5 generate_start_unix=1788124027.220047 generate_end_unix=1788124038.192629
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.747 tok_s=10.975
+vllm-cli: run=2/5 generate_start_unix=1788124038.192683 generate_end_unix=1788124046.939566
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.809 tok_s=10.899
+vllm-cli: run=3/5 generate_start_unix=1788124046.939611 generate_end_unix=1788124055.748124
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.779 tok_s=10.935
+vllm-cli: run=4/5 generate_start_unix=1788124055.748168 generate_end_unix=1788124064.527457
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.719 tok_s=11.010
+vllm-cli: run=5/5 generate_start_unix=1788124064.527513 generate_end_unix=1788124073.246846
+--- /tmp/w2-ab2/leg-p1b.err
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.757 tok_s=10.963
+vllm-cli: run=1/5 generate_start_unix=1788124102.454543 generate_end_unix=1788124111.211197
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.668 tok_s=14.397
+vllm-cli: run=2/5 generate_start_unix=1788124111.211266 generate_end_unix=1788124117.879210
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.761 tok_s=14.199
+vllm-cli: run=3/5 generate_start_unix=1788124117.879250 generate_end_unix=1788124124.640124
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.622 tok_s=14.497
+vllm-cli: run=4/5 generate_start_unix=1788124124.640158 generate_end_unix=1788124131.262115
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.633 tok_s=14.473
+vllm-cli: run=5/5 generate_start_unix=1788124131.262153 generate_end_unix=1788124137.895038
+--- /tmp/w2-ab2/leg-p2a.err
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.921 tok_s=10.762
+vllm-cli: run=1/5 generate_start_unix=1788124177.648466 generate_end_unix=1788124186.569019
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=7.121 tok_s=13.480
+vllm-cli: run=2/5 generate_start_unix=1788124186.569078 generate_end_unix=1788124193.690537
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.803 tok_s=14.111
+vllm-cli: run=3/5 generate_start_unix=1788124193.690579 generate_end_unix=1788124200.493890
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.792 tok_s=14.134
+vllm-cli: run=4/5 generate_start_unix=1788124200.493926 generate_end_unix=1788124207.285959
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.862 tok_s=13.990
+vllm-cli: run=5/5 generate_start_unix=1788124207.286001 generate_end_unix=1788124214.148116
+--- /tmp/w2-ab2/leg-p2b.err
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=10.922 tok_s=8.790
+vllm-cli: run=1/5 generate_start_unix=1788124252.781841 generate_end_unix=1788124263.703619
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.628 tok_s=11.127
+vllm-cli: run=2/5 generate_start_unix=1788124263.703677 generate_end_unix=1788124272.331478
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.706 tok_s=11.026
+vllm-cli: run=3/5 generate_start_unix=1788124272.331518 generate_end_unix=1788124281.037997
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.638 tok_s=11.114
+vllm-cli: run=4/5 generate_start_unix=1788124281.038035 generate_end_unix=1788124289.675682
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.682 tok_s=11.058
+vllm-cli: run=5/5 generate_start_unix=1788124289.675742 generate_end_unix=1788124298.357393
+--- /tmp/w2-ab2/leg-p3a.err
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=11.009 tok_s=8.720
+vllm-cli: run=1/5 generate_start_unix=1788124328.066194 generate_end_unix=1788124339.075658
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.698 tok_s=11.037
+vllm-cli: run=2/5 generate_start_unix=1788124339.075702 generate_end_unix=1788124347.773704
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.856 tok_s=10.841
+vllm-cli: run=3/5 generate_start_unix=1788124347.773740 generate_end_unix=1788124356.629368
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.780 tok_s=10.934
+vllm-cli: run=4/5 generate_start_unix=1788124356.629398 generate_end_unix=1788124365.409326
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.737 tok_s=10.987
+vllm-cli: run=5/5 generate_start_unix=1788124365.409374 generate_end_unix=1788124374.146806
+--- /tmp/w2-ab2/leg-p3b.err
+vllm-cli: run=1/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=8.817 tok_s=10.888
+vllm-cli: run=1/5 generate_start_unix=1788124403.065711 generate_end_unix=1788124411.882860
+vllm-cli: run=2/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.761 tok_s=14.200
+vllm-cli: run=2/5 generate_start_unix=1788124411.882921 generate_end_unix=1788124418.643485
+vllm-cli: run=3/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.665 tok_s=14.403
+vllm-cli: run=3/5 generate_start_unix=1788124418.643528 generate_end_unix=1788124425.309008
+vllm-cli: run=4/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.633 tok_s=14.473
+vllm-cli: run=4/5 generate_start_unix=1788124425.309046 generate_end_unix=1788124431.942217
+vllm-cli: run=5/5 finish_reason=length prompt_tokens=11 completion_tokens=96 secs=6.655 tok_s=14.426
+vllm-cli: run=5/5 generate_start_unix=1788124431.942255 generate_end_unix=1788124438.597101

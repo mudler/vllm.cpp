@@ -258,10 +258,17 @@ Measured from the safetensors headers of the NAS EXL3 checkpoint (177 files,
 | **resident, tp1, mtp skipped** | **90.82** |
 | MTP heads (all three) | 8.62 |
 
-A GB10's ~119 GiB usable pool leaves **~28 GiB of headroom**, so all three heads
-load with roughly 19.6 GiB left for KV and activations. The loader already
-coalesces TP4 to TP1, so the four rank files are disjoint slices and this is the
-whole tower rather than a quarter of it.
+**That table is a header count, and the load MEASURED 2026-08-31 falsifies the
+headroom it implied.** The artifact's weights materialize to **97.68 GiB**
+(81.952 GiB coalesced TP1 tower + 15.726 GiB carried host tower) at a **peak RSS
+of 111 GiB**; the "everything else" row roughly DOUBLES, 15.726 GiB against 8.23
+GiB packed. So a ~119 GiB pool leaves about **8 GiB**, not ~28 GiB, and the 8.62
+GiB MTP tail does NOT obviously fit beside the tower with room for KV and
+activations. Evidence and recipe in `.agents/specs/model-dsv4-exl3.md`. Size
+against 97.68/111 from here; the 90.82 figure is a floor.
+
+The loader already coalesces TP4 to TP1, so the four rank files are disjoint
+slices and this is the whole tower rather than a quarter of it.
 
 That matters because the two arms split the two properties this row needs. The
 **GGUF** arm runs on one Spark at ~14.96 tok/s and carries NO MTP tensors, the
@@ -274,10 +281,24 @@ for the row.
 about the 156.7 GiB NVFP4 safetensors. Two artifacts, two verdicts, and this
 spec previously named only one of them.
 
-Still unmeasured, and named so it is not mistaken for settled: whether the
-carried FP8 half is widened at load, which would move the 8.23 GiB row, and the
-real resident total from `ReportDeepseekV4Exl3Residency` on the box. 90.82 GiB is
-a packed byte count taken from headers, not a residency measurement.
+**Both of those are now measured, and both moved.** The carried FP8 half IS
+widened at load -- the 8.23 GiB row is really 15.726 GiB -- and the real resident
+total is 97.68 GiB at a 111 GiB peak, not 90.82. 90.82 was a packed byte count
+taken from headers, and reading it as a residency understated the tower by ~7 GiB
+and the peak allocation by ~20 GiB.
+
+**The BOX side of that is now checked, on hardware rather than a spec sheet.**
+Under an `rc` lease on `thor:gpu0` (`NVIDIA-Thor`, 2026-08-31) the worker reports
+**122 GiB total and 117 GiB available**, and sees the staged checkpoint as 190
+files on the same NAS folder `dgx` uses. So the headroom against 90.82 GiB is
+real, and it does not depend on `dgx:gpu0`, which this campaign spent a session
+queueing behind. Against the MEASURED 97.68 GiB it is much thinner: 117 GiB
+available with a 111 GiB peak leaves ~6 GiB, which is why the load succeeded on
+this box and why the MTP tail's 8.62 GiB is not a settled fit. What that does NOT settle is the load itself, and therefore
+whether the resident total agrees with the header count once the carried half is
+materialized. A fit inferred from a datasheet and a fit reported by the worker
+that would host the load are different claims, and this row has already carried
+one memory verdict that belonged to a different artifact.
 
 ### THE ARTIFACT'S HEAD IS NOT THE SHAPE W1b BUILT FOR
 

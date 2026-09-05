@@ -100,7 +100,9 @@
 #include <cstdint>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev
 #include "vllm/model_executor/models/glm5_next.h"
+#include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vt/ops.h"  // vt::Queue, vt::MoeRouterTopK, vt::MoeCombine
 
 namespace vllm::glm5_next {
@@ -242,10 +244,43 @@ class ExpertSource {
 // BORROWED, exactly like `expert_source`: every `data` pointer here aims into
 // the loader's mmap or its owned block bytes, and must outlive every
 // `MoeForward` call that reads the enclosing struct.
+//
+// ─── W9c-3a: THE SAME BANKS, ON A DEVICE ─────────────────────────────────────
+//
+// The three `vt::Tensor` views above are HOST views and stay that way: they are
+// the CPU arm's operands and the parity operand the device arm is measured
+// against. The device arm cannot use them, because `vt::MatmulBTQuantGrouped`
+// and `vt::MoeGateUpSwiGLUGrouped` require every operand to sit on the queue's
+// device (`src/vt/ops.cpp:243`, `:277`) and a `cudaMalloc` pointer is not a host
+// pointer even on GB10, where `UnifiedMemory()` answers true
+// (`cuda_backend.cu:354-362`). Retagging `.device` on a host view is therefore
+// the specific mistake `minimax_h3_device.cpp:339-342` records: "a raw host-byte
+// view reads as ALL ZEROS on the GPU".
+//
+// So the device arm needs the SOURCE tensor, not the view.
+// `dense_attn::ResidentWeight` (`dense_attn_block.h:181`) uploads
+// `OwnedTensor::bytes` verbatim, keeps the block dtype, and memoizes the
+// allocation on the tensor's own mutable `d_dev`. Memoizing on the TOWER is the
+// whole reason these three pointers exist: `Glm5NextGgufLayerSource` rebuilds
+// this struct on every layer of every step, so a bank identified only by a view
+// would re-upload 2.25 GiB per sparse layer per token, while one identified by
+// its `OwnedTensor` is uploaded once for the life of the model.
+//
+// BORROWED and non-owning, with the lifetime the views already have: they aim
+// into `Glm5NextWeights`, which outlives every forward. Null on a layer whose
+// banks were not admitted, and the device arm checks all three rather than
+// assuming they travel together.
 struct MoeQuantBanks {
   vt::Tensor gate;  // [E * moe_intermediate_size, hidden_size], block-quant
   vt::Tensor up;    // [E * moe_intermediate_size, hidden_size], the SAME dtype
   vt::Tensor down;  // [E * hidden_size, moe_intermediate_size], block-quant
+  // The tensors those three views were taken over, for the device arm.
+  const OwnedTensor* gate_src = nullptr;
+  const OwnedTensor* up_src = nullptr;
+  const OwnedTensor* down_src = nullptr;
+  bool HasSources() const {
+    return gate_src != nullptr && up_src != nullptr && down_src != nullptr;
+  }
 };
 
 // One sparse layer's weights, in the checkpoint's own packing: the routed
@@ -378,9 +413,16 @@ std::vector<float> DenseMlpForward(const DenseMlpWeights& w,
 //
 //   hidden : [num_tokens, hidden_size]  row-major
 // Returns  : [num_tokens, hidden_size]  row-major
+//
+// `queue` is the HOST queue and must be a CPU queue: the router
+// (`vt::MoeRouterTopK`) and the combine (`vt::MoeCombine`) read host pointers.
+// `dev`, when non-null, is the DEVICE the routed-expert GEMM runs on — the one
+// arm of this block W9c-3a moved. It is `nullptr` on every CPU-only caller, and
+// on a device caller whose layer carries no keep-quant banks, and the host arm
+// below is byte-identical in both cases.
 std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
                               const std::vector<float>& hidden, int64_t num_tokens,
-                              vt::Queue& queue);
+                              vt::Queue& queue, dense_attn::Dev* dev = nullptr);
 
 }  // namespace vllm::glm5_next
 

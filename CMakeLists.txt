@@ -769,6 +769,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.cpp
   src/vllm/model_executor/models/qwen3_5_weights.cpp
   src/vllm/model_executor/models/qwen3_5_dense_weights.cpp
+  # MODEL-QWEN35-EXL3 (#2495): the EXL3 linear seam, in its own TU because
+  # qwen3_5.cpp cannot include dense_attn_block.h (ADL collision on
+  # ResidentWeight; see the header).
+  src/vllm/model_executor/models/dense_exl3_linear.cpp
   src/vllm/model_executor/models/qwen3_5_mtp.cpp
   src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp
@@ -801,12 +805,15 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
   src/vllm/model_executor/models/deepseek_v4_dspark.cpp
   src/vllm/model_executor/models/deepseek_v4_compressor.cpp
+  src/vllm/model_executor/models/deepseek_v4_exl3_device.cpp
   src/vllm/model_executor/models/deepseek_v4_mhc.cpp
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/dots3_note.cpp
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
+  src/vllm/model_executor/models/dots3_note_vision.cpp
+  src/vllm/model_executor/models/dots3_note_audio.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
@@ -823,6 +830,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_moe.cpp
   src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
+  src/vllm/model_executor/models/glm5_next_device.cpp
+  src/vllm/model_executor/models/host_token_ids.cpp
   src/vllm/model_executor/models/glm_moe_dsa.cpp
   src/vllm/model_executor/models/glm_moe_dsa_forward.cpp
   src/vllm/model_executor/models/glm_moe_dsa_loader.cpp
@@ -1075,12 +1084,20 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
+  src/vllm/multimodal/utils.cpp
   # Per-modality input-count limits and the refusal they carry
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
+  src/vllm/multimodal/processing/processor.cpp
+  src/vllm/multimodal/dots3_note_processor.cpp
+  src/vllm/multimodal/mel_filter_bank.cpp
+  # Pillow's BICUBIC resampler, which is NOT torchvision's and NOT a four-tap
+  # cubic (dots3-note W6c, #2537).
+  src/vllm/multimodal/pil_resize.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/deepseek_v4_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
+  src/vllm/multimodal/audio_resample.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
   # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone
   # forward composed from the P1-P3 vt:: kernels, NOT a registry architecture —
@@ -1238,6 +1255,12 @@ add_library(vllm STATIC
   src/capi/chat_prompt.cpp
   src/vllm/entrypoints/openai/protocol.cpp
   src/vllm/entrypoints/openai/chat_mm.cpp
+  # ENG-MM-INPUT-PIPELINE (#2475): the per-architecture multimodal chat seam
+  # registry, and Qwen3-VL's registration into it. The registration TU is
+  # SELF-REGISTERING and is reached through vllm's INTERFACE --whole-archive.
+  src/vllm/entrypoints/openai/mm_chat_registry.cpp
+  src/vllm/entrypoints/openai/mm_chat_dots3note.cpp
+  src/vllm/entrypoints/openai/mm_chat_qwen3vl.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp
@@ -1704,12 +1727,15 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_moe_chain.hip
     src/vt/rocm/rocm_grouped_gemm.hip
+    src/vt/rocm/rocm_exl3.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
     src/vt/rocm/rocm_gdn_conv.hip
     src/vt/rocm/rocm_gdn_postconv.hip
     src/vt/rocm/rocm_gdn_scan.hip
     src/vt/rocm/rocm_gdn_fused.hip
+    src/vt/rocm/rocm_mla_fused_norm_rope.hip
+    src/vt/rocm/rocm_mla_ops.hip
     src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1727,12 +1753,15 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_moe_chain.hip
       src/vt/rocm/rocm_grouped_gemm.hip
+      src/vt/rocm/rocm_exl3.hip
       src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_gdn_state.hip
       src/vt/rocm/rocm_gdn_conv.hip
       src/vt/rocm/rocm_gdn_postconv.hip
       src/vt/rocm/rocm_gdn_scan.hip
       src/vt/rocm/rocm_gdn_fused.hip
+      src/vt/rocm/rocm_mla_fused_norm_rope.hip
+      src/vt/rocm/rocm_mla_ops.hip
       src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
@@ -1825,6 +1854,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
+    src/vt/cuda/cuda_glm5_next.cu
     src/vt/cuda/cuda_exl3.cu
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
@@ -1843,7 +1873,15 @@ if(VLLM_CPP_CUDA)
     # if(VLLM_CPP_CUDA) depth one, which is what check-cuda-op-arch-gate.py
     # requires of any TU that registers an op.
     src/vt/cuda/cuda_qwen4_exp.cu
-    src/vt/cuda/cuda_qwen4_exp_ple.cu)
+    src/vt/cuda/cuda_qwen4_exp_ple.cu
+    # W6-CUDA-B: the two QSA arms and the ungated grouped RMS norm. The norm is a
+    # SHARED `vt::` seam and not a qwen4_exp op, so it gets its own TU rather
+    # than joining cuda_layernorm.cu -- that file is a surface several rows
+    # write, and AGENTS.md "Records" calls a shared file a lock. Both are
+    # unconditional and at if(VLLM_CPP_CUDA) depth one, which is what
+    # check-cuda-op-arch-gate.py requires of any TU that registers an op.
+    src/vt/cuda/cuda_qwen4_exp_qsa.cu
+    src/vt/cuda/cuda_rms_norm_group.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
@@ -2779,6 +2817,27 @@ target_include_directories(vllm_ltx2_connector_gemm_probe SYSTEM PRIVATE
 target_compile_features(vllm_ltx2_connector_gemm_probe PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_ltx2_connector_gemm_probe)
 
+# ── BIT-ROT GUARD: the vt CPU per-element dispatch survey probe ──────────────
+# `tools/bench/vt_cpu_elem_survey_probe.cpp` is the artifact behind the ranking
+# in `.agents/specs/vt-cpu-elem-survey.md`: one `--op <name>` runs ONE CPU
+# kernel alone, at a shape a shipped model actually uses, so a `perf record`
+# over it reads that kernel's `LoadF32` self percentage with no other vt work in
+# the process. It reaches every kernel through the production `vt::` entry
+# point, so a signature change must break the build rather than the ranking.
+#
+# CI COMPILES IT AND RUNS NOTHING, like its siblings above: one leg allocates
+# gigabytes and spends tens of seconds of a core, and the recorded runs come
+# from the direct g++ compile in the file's own header, because this devbox has
+# no room for a CMake build tree.
+add_executable(vllm_vt_cpu_elem_survey_probe tools/bench/vt_cpu_elem_survey_probe.cpp)
+target_link_libraries(vllm_vt_cpu_elem_survey_probe PRIVATE vllm)
+target_include_directories(vllm_vt_cpu_elem_survey_probe PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_vt_cpu_elem_survey_probe SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_vt_cpu_elem_survey_probe PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_vt_cpu_elem_survey_probe)
+
 # ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
 # `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
 # `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier
@@ -2933,6 +2992,12 @@ endif()
 # thing that has to know about the ordering.
 if(TARGET test_cli_offload_config AND TARGET vllm-cli)
   add_dependencies(test_cli_offload_config vllm-cli)
+endif()
+# KV-FP8 W7 (#2619): the same ordering, for the same reason, for the benchmark
+# harness's own flag gate. Without this the gate can run against a stale or
+# absent `vllm-bench` and report a verdict about a binary it did not build.
+if(TARGET test_bench_kv_cache_dtype AND TARGET vllm-bench)
+  add_dependencies(test_bench_kv_cache_dtype vllm-bench)
 endif()
 
 # Render the compiled-arch manifest (issue #1357). Last, so it observes whatever

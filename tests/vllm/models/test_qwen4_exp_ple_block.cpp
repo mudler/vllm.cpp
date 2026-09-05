@@ -62,10 +62,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <new>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "support/max_abs_diff.h"
+#include "vllm/platforms/interface.h"
 #include "vllm/model_executor/models/qwen4_exp_ple.h"
 #include "vllm/model_executor/models/qwen4_exp_ple_block.h"
 #include "vt/backend.h"
@@ -265,14 +269,13 @@ bool AllFinite(const std::vector<float>& v) {
 // Run the block over one chunk and DOWNLOAD its output. `hidden` and the block
 // output carry `dt`; the returned values are f32 either way, so the caller
 // compares against the f32 golden in one place.
-std::vector<float> RunChunk(DType dt, const Qwen4ExpPleWeights& w,
-                            const OwnedTensor& table, const Qwen4ExpParams& p,
-                            const qwen4_exp::NGramTableLayout& layout,
-                            const float* hidden_rows, const int64_t* ids,
-                            const unsigned char* mask, int64_t tokens,
-                            Qwen4ExpPleCaches& caches, int64_t past_len) {
-  Queue q = CpuQ();
-  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+std::vector<float> RunChunkOn(vllm::dense_attn::Dev d, DType dt,
+                              const Qwen4ExpPleWeights& w,
+                              const OwnedTensor& table, const Qwen4ExpParams& p,
+                              const qwen4_exp::NGramTableLayout& layout,
+                              const float* hidden_rows, const int64_t* ids,
+                              const unsigned char* mask, int64_t tokens,
+                              Qwen4ExpPleCaches& caches, int64_t past_len) {
   std::vector<float> h32(hidden_rows, hidden_rows + tokens * kW);
   std::vector<uint16_t> hbf;
   Tensor hidden;
@@ -283,6 +286,11 @@ std::vector<float> RunChunk(DType dt, const Qwen4ExpPleWeights& w,
   } else {
     hidden = MakeT(h32.data(), DType::kF32, {tokens, kW});
   }
+  // The step's activations live where the step runs. `MakeT` tags kCPU because
+  // every other arm here IS kCPU; on a device queue this is the same host bytes
+  // under the queue's own device, which is what the block is handed in
+  // production.
+  hidden.device = d.q.device;
   Qwen4ExpPleBlockOutput out =
       RunQwen4ExpPleBlock(d, w, table, p, layout, hidden, ids, mask, caches, past_len);
   std::vector<float> got(static_cast<size_t>(tokens * kW));
@@ -296,6 +304,107 @@ std::vector<float> RunChunk(DType dt, const Qwen4ExpPleWeights& w,
   }
   return got;
 }
+
+std::vector<float> RunChunk(DType dt, const Qwen4ExpPleWeights& w,
+                            const OwnedTensor& table, const Qwen4ExpParams& p,
+                            const qwen4_exp::NGramTableLayout& layout,
+                            const float* hidden_rows, const int64_t* ids,
+                            const unsigned char* mask, int64_t tokens,
+                            Qwen4ExpPleCaches& caches, int64_t past_len) {
+  Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  return RunChunkOn(d, dt, w, table, p, layout, hidden_rows, ids, mask, tokens, caches,
+                    past_len);
+}
+
+// ─── A BACKEND WHOSE HOST-BOUND `Copy` ENQUEUES, WHICH IS WHAT CUDA IS (#2496) ─
+// The CPU backend's `Copy` is a `memcpy` that has already happened when it
+// returns, so NO CPU-only test can see an ordering defect in a caller that reads
+// the destination without draining the queue. CUDA's `Copy` is
+// `cudaMemcpyAsync` on the queue's stream (src/vt/cuda/cuda_backend.cu:116-118)
+// and only ENQUEUES. `CUDA_LAUNCH_BLOCKING=1` does not change that -- it
+// serialises kernel LAUNCHES -- which is why #2496 reproduces under the
+// serialisation that suppresses its sibling #2476.
+//
+// WHICH COPIES DEFER, AND WHY IT IS NOT "ALL OF THEM". A copy INTO device memory
+// is stream-ordered ahead of every kernel that later reads it, so on real
+// hardware it is safe and a fake that deferred it would manufacture a failure
+// the device does not have -- an instrument that injects the defect it reports.
+// `dense_attn::ResidentWeight` stages every weight that way. The hazard is the
+// other direction: a copy into HOST memory that the HOST then dereferences, with
+// nothing draining the queue in between. That is the one this defers, and it is
+// exactly the branch the PLE block takes to read the n-gram history.
+//
+// `Memset` is performed eagerly for the same reason: it is stream-ordered
+// against the kernel that reads the ring.
+class DeferringBackend : public vt::Backend {
+ public:
+  ~DeferringBackend() override = default;
+  void* Alloc(size_t bytes) override {
+    void* p = ::operator new(bytes, std::align_val_t(64));
+    device_.insert(p);
+    sizes_[p] = bytes;
+    return p;
+  }
+  void Free(void* p) override {
+    device_.erase(p);
+    sizes_.erase(p);
+    ::operator delete(p, std::align_val_t(64));
+  }
+  void Memset(Queue&, void* p, int value, size_t bytes) override {
+    std::memset(p, value, bytes);
+  }
+  void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
+    if (IsDevice(dst)) {  // stream-ordered ahead of its readers on real hardware
+      std::memcpy(dst, src, bytes);
+      ++eager_;
+      return;
+    }
+    // Host-bound: ENQUEUED. The source is snapshotted rather than read at flush,
+    // so this instrument measures the READ ordering alone and a green result
+    // cannot be credited to some other half of the change.
+    pending_.push_back(Pending{dst, std::vector<unsigned char>(
+                                       static_cast<const unsigned char*>(src),
+                                       static_cast<const unsigned char*>(src) + bytes)});
+    ++deferred_;
+  }
+  Queue CreateQueue() override { return Queue{Device{DeviceType::kXPU, 0}, nullptr}; }
+  void Synchronize(Queue&) override {
+    for (const Pending& c : pending_) std::memcpy(c.dst, c.bytes.data(), c.bytes.size());
+    drained_ += pending_.size();
+    pending_.clear();
+    ++syncs_;
+  }
+  bool UnifiedMemory() const override { return true; }
+  // Host memory throughout, so the portable reference tier may install the CPU
+  // kernels for this device and every `vt::` op in the block runs the SAME code
+  // the arms above gate. Only the transfer ordering differs.
+  bool DeviceMemoryIsHostAddressable() const override { return true; }
+
+  bool IsDevice(const void* p) const {
+    for (const auto& kv : sizes_) {
+      const auto* b = static_cast<const unsigned char*>(kv.first);
+      const auto* q = static_cast<const unsigned char*>(p);
+      if (q >= b && q < b + kv.second) return true;
+    }
+    return false;
+  }
+  size_t deferred() const { return deferred_; }
+  size_t eager() const { return eager_; }
+  size_t drained() const { return drained_; }
+  size_t syncs() const { return syncs_; }
+  size_t outstanding() const { return pending_.size(); }
+
+ private:
+  struct Pending {
+    void* dst;
+    std::vector<unsigned char> bytes;
+  };
+  std::vector<Pending> pending_;
+  std::set<void*> device_;
+  std::map<void*, size_t> sizes_;
+  size_t deferred_ = 0, eager_ = 0, drained_ = 0, syncs_ = 0;
+};
 
 }  // namespace
 
@@ -355,6 +464,94 @@ TEST_CASE("prefill(10) + decode + decode equals the single shot, so the RING WRA
   for (int64_t i = 0; i < kCtx; ++i) {
     CHECK(c.tokens[static_cast<size_t>(i)] == kNgramTokens[kNgramTotalLen - kCtx + i]);
   }
+}
+
+TEST_CASE(
+    "DECODE over a device cache whose host-bound Copy ENQUEUES: the n-gram "
+    "history must be drained before it is hashed (#2496)") {
+  // WHAT THIS SEPARATES, AND WHY NO EXISTING CASE COULD. The case above runs the
+  // same prefill(10)+decode+decode over a HOST-resident history, where the block
+  // takes `std::memcpy` and no ordering question exists. On the production CUDA
+  // path the history is the engine's own cache on `input.queue.device`, the block
+  // takes `Backend::Copy`, and that call only ENQUEUES. Every arm on this row was
+  // CPU-only, so the tree had never run this branch with a Copy that is not
+  // already complete when it returns.
+  //
+  // THE BRANCH IS DECODE-ONLY. At `past_len == 0` the block seeds the history
+  // with EOS on the host and reads nothing; only `past_len != 0` takes the
+  // device read. A defect there leaves a prefill exactly right and every decode
+  // step wrong, which is the shape #2496 measured on `thor:gpu0`: token 0 equal
+  // to the CPU control and tokens 1-7 not.
+  REQUIRE(kNgramTotalLen > kTinyShortConvStateLen);
+  const Qwen4ExpParams p = GoldenParams();
+  const qwen4_exp::NGramTableLayout layout = vllm::Qwen4ExpPleLayout(p, 0);
+  const Qwen4ExpPleWeights w = GoldenWeights(DType::kF32);
+  const OwnedTensor table =
+      OwnedFrom(DType::kF32, {kTinyPaddedVocabSize, kHd}, kPleNgramEmbeddingWeight);
+
+  // kXPU is unused by this build and by this binary; registering the double here
+  // gives the block a device queue whose ops resolve to the CPU kernels through
+  // the documented portable reference tier (include/vt/op_provider.h), which
+  // installs only because this backend's memory really is host-addressable.
+  static DeferringBackend b;
+  vt::RegisterBackend(DeviceType::kXPU, &b);
+  // The block's weight staging consults the platform registry. kXPU has no
+  // platform in a CPU build, and the double's memory IS host memory, so the CPU
+  // platform is the truthful answer for it rather than a stub.
+  vllm::platforms::RegisterPlatform(DeviceType::kXPU,
+                                    &vllm::platforms::GetPlatform(DeviceType::kCPU));
+  const int installed = vt::RegisterReferenceTier(DeviceType::kXPU);
+  REQUIRE(installed > 0);  // the ops resolve; a 0 here would run nothing
+
+  Queue q = b.CreateQueue();
+  vllm::dense_attn::Dev d{b, q};
+
+  // BOTH caches live on the device, as they do on the production by-name path.
+  // Their storage comes from the backend's own allocator, which is what makes
+  // the write-back a device-bound copy and the read a host-bound one.
+  const size_t ring_bytes = static_cast<size_t>(kW * kTinyShortConvStateLen) * sizeof(float);
+  const size_t tok_bytes = static_cast<size_t>(kCtx) * sizeof(int64_t);
+  void* d_ring = b.Alloc(ring_bytes);
+  void* d_tok = b.Alloc(tok_bytes);
+  std::memset(d_ring, 0, ring_bytes);
+  std::memset(d_tok, 0, tok_bytes);
+  Qwen4ExpPleCaches cv;
+  cv.conv_state = MakeT(d_ring, DType::kF32, {1, kW, kTinyShortConvStateLen});
+  cv.tokens = MakeT(d_tok, DType::kI64, {1, kCtx});
+  cv.conv_state.device = q.device;
+  cv.tokens.device = q.device;
+  cv.state_row = 0;
+
+  std::vector<float> got;
+  int64_t lo = 0;
+  for (int64_t count : {kNgramPrefillLen, static_cast<int64_t>(1), static_cast<int64_t>(1)}) {
+    const std::vector<float> part =
+        RunChunkOn(d, DType::kF32, w, table, p, layout, kPleHiddenStates + lo * kW,
+                   kNgramTokens + lo, nullptr, count, cv, /*past_len=*/lo);
+    got.insert(got.end(), part.begin(), part.end());
+    lo += count;
+  }
+  REQUIRE(lo == kNgramTotalLen);
+
+  // THE INSTRUMENT RAN, as a counted property rather than an assumption. The two
+  // decode steps are the only calls that read the history back to the host, so
+  // exactly two host-bound copies are enqueued; a harness that quietly took the
+  // host-resident branch would report zero and its PASS would mean nothing.
+  CHECK(b.deferred() == 2);
+  CHECK(b.drained() == b.deferred());
+  CHECK(b.outstanding() == 0);
+  CHECK(b.eager() > 0);  // the weights and the write-backs did move
+
+  REQUIRE(AllFinite(got));
+  // THE SAME oracle the host-resident arm above is held to. Residency is not a
+  // value, so a device cache cannot move one.
+  CHECK(MaxAbsDiff(got, kPleExpectedOutput, static_cast<size_t>(kNgramTotalLen * kW)) < kTol);
+  const auto* left = static_cast<const int64_t*>(d_tok);
+  for (int64_t i = 0; i < kCtx; ++i) {
+    CHECK(left[i] == kNgramTokens[kNgramTotalLen - kCtx + i]);
+  }
+  b.Free(d_ring);
+  b.Free(d_tok);
 }
 
 TEST_CASE("the STREAM DTYPE is inherited: a bf16 arm moves bf16 bytes end to end") {

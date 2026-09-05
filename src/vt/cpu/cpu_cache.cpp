@@ -5,7 +5,9 @@
 //    layout — see .agents/discipline.md and the M1.6 Task-2 layout trap note).
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"  // the W8 slice-1 packer
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -177,6 +179,135 @@ void ReshapeAndCacheFp8Kernel(Queue&, const Tensor& k, const Tensor& v, Tensor& 
   }
 }
 
+// ── The fp8_ds_mla paged K cache (KV-DSV4-MULTICACHE W8, #2455) ─────────────
+// These two are the CPU arms of `vt::ConcatAndCacheDsMla` and
+// `vt::DequantAndGatherDsMla`, and they are deliberately THIN: the byte layout
+// lives once, in the W8 slice-1 host packer
+// (`vllm/model_executor/models/deepseek_v4_compressor.{h,cpp}`), which the CUDA
+// kernels of slice 5 are the other port of. Writing the region arithmetic a
+// second time here is exactly the drift the shared packer exists to prevent.
+
+// One source row of `k` as f32. The encoder's first act is upstream's own
+// fp32 -> bf16 round (`cache_utils.py:110-118`), so widening f16/bf16 to f32
+// here changes no stored byte.
+void LoadDsMlaRow(const Tensor& k, int64_t token, std::vector<float>* head) {
+  const int64_t width = k.shape[1];
+  const int64_t off = token * k.stride[0];
+  head->resize(static_cast<size_t>(width));
+  switch (k.dtype) {
+    case DType::kF32:
+      std::memcpy(head->data(), k.Ptr<float>() + off,
+                  static_cast<size_t>(width) * sizeof(float));
+      break;
+    case DType::kF16:
+      for (int64_t d = 0; d < width; ++d)
+        (*head)[static_cast<size_t>(d)] = F16ToF32(k.Ptr<uint16_t>()[off + d]);
+      break;
+    case DType::kBF16:
+      for (int64_t d = 0; d < width; ++d)
+        (*head)[static_cast<size_t>(d)] = BF16ToF32(k.Ptr<uint16_t>()[off + d]);
+      break;
+    default:
+      VT_CHECK(false, "concat_and_cache_ds_mla: unsupported k dtype");
+  }
+}
+
+const vllm::deepseek_v4::Fp8DsMlaLayout& DsMlaTokenLayout() {
+  // 448 / 64 / 64 — upstream's TOKEN_FP8_DIM, TOKEN_BF16_DIM and
+  // QUANT_BLOCK_SIZE (`cache_utils.py:180-183`), named once in vt/ops.h.
+  static const vllm::deepseek_v4::Fp8DsMlaLayout layout =
+      vllm::deepseek_v4::MakeFp8DsMlaLayout(kFp8DsMlaNopeDim, kFp8DsMlaRopeDim,
+                                            kFp8DsMlaQuantBlock);
+  return layout;
+}
+
+// `quantize_and_insert_k_kernel` (`cache_utils.py:36-159`), one program per
+// token (`:71`), serialised.
+void ConcatAndCacheDsMlaKernel(Queue&, const Tensor& k, Tensor& kv_cache,
+                               const Tensor& slot_mapping, int64_t block_size) {
+  const vllm::deepseek_v4::Fp8DsMlaLayout& L = DsMlaTokenLayout();
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout page =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(L, block_size);
+  // Upstream reads the block stride from the TENSOR (`:189`, `k_cache.stride(0)`),
+  // so a padded page row (37440 for the 37376-byte C4A block) works unchanged.
+  const int64_t block_stride = kv_cache.stride[0];
+  // Upstream's token count is slot_mapping's, never k's (`:186-188`).
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  auto* base = kv_cache.Ptr<uint8_t>();
+
+  std::vector<float> head;
+  for (int64_t t = 0; t < num_slots; ++t) {
+    const int64_t slot = slots[t];
+    // `if slot_idx == -1: return` (`:77-78`). Load-bearing, and not merely
+    // duplicated by `Fp8DsMlaStoreToken`'s own negative-position skip: C++
+    // truncating division sends slot == -block_size to (block -1, pos 0), which
+    // the packer would happily write — one whole block BELOW the page.
+    if (slot < 0) continue;
+    const int64_t block_idx = slot / block_size;   // `:80`
+    const int64_t pos_in_block = slot % block_size;  // `:81`
+    LoadDsMlaRow(k, t, &head);
+    vllm::deepseek_v4::Fp8DsMlaStoreToken(base + block_idx * block_stride, page,
+                                          pos_in_block,
+                                          vllm::deepseek_v4::Fp8DsMlaEncodeToken(head, L));
+  }
+}
+
+// `_dequantize_and_gather_k_kernel` (`cache_utils.py:228-341`), the (batch,
+// worker) grid collapsed to one serial walk per request.
+void DequantAndGatherDsMlaKernel(Queue&, Tensor& out, const Tensor& kv_cache,
+                                 const Tensor& seq_lens, const Tensor* gather_lens,
+                                 const Tensor& block_table,
+                                 const DequantAndGatherDsMlaArgs& args) {
+  const vllm::deepseek_v4::Fp8DsMlaLayout& L = DsMlaTokenLayout();
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout page =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(L, args.block_size);
+  const int64_t num_reqs = out.shape[0];
+  const int64_t max_blocks_per_seq = block_table.shape[1];
+  const int64_t block_stride = kv_cache.stride[0];  // `:388`
+  const auto* base = kv_cache.Ptr<uint8_t>();
+  const int32_t* lens = seq_lens.Ptr<int32_t>();
+  const int32_t* glens = gather_lens != nullptr ? gather_lens->Ptr<int32_t>() : nullptr;
+  const int32_t* table = block_table.Ptr<int32_t>();
+
+  for (int64_t b = 0; b < num_reqs; ++b) {
+    const int64_t seq_len = lens[b];
+    // `gather_lens_ptr is None` gathers the whole sequence (`:257-262`).
+    const int64_t gather_len = glens != nullptr ? glens[b] : seq_len;
+    const int64_t start_pos = seq_len - gather_len;  // `:264`
+    VT_CHECK(gather_len >= 0 && start_pos >= 0,
+             "dequant_and_gather_ds_mla: gather_len must be in [0, seq_len]");
+    VT_CHECK(args.offset + gather_len <= out.shape[1],
+             "dequant_and_gather_ds_mla: offset + gather_len overruns out");
+    for (int64_t i = 0; i < gather_len; ++i) {
+      const int64_t pos = start_pos + i;                        // `:268`
+      const int64_t block_in_seq = pos / args.block_size;       // `:271`
+      const int64_t pos_in_block = pos % args.block_size;       // `:272`
+      VT_CHECK(block_in_seq < max_blocks_per_seq,
+               "dequant_and_gather_ds_mla: seq_len exceeds the block table");
+      // `block_table_ptr + batch_idx * max_blocks_per_seq` (`:275-276`).
+      const int64_t physical_block = table[b * block_table.stride[0] + block_in_seq];
+      VT_CHECK(physical_block >= 0 && physical_block < kv_cache.shape[0],
+               "dequant_and_gather_ds_mla: block table entry out of range");
+      // The read consumes n_quant_blocks = 7 (`:385`), one FEWER than the store
+      // writes; `Fp8DsMlaLoadToken` drops the pad byte exactly as the gather does.
+      const std::vector<float> latent = vllm::deepseek_v4::Fp8DsMlaDecodeToken(
+          vllm::deepseek_v4::Fp8DsMlaLoadToken(base + physical_block * block_stride,
+                                               page, pos_in_block),
+          L);
+      // `out_ptr + batch_idx*out_stride0 + (offset + i)*out_stride1` (`:295-296`).
+      const int64_t row = b * out.stride[0] + (args.offset + i) * out.stride[1];
+      if (out.dtype == DType::kF32) {
+        std::memcpy(out.Ptr<float>() + row, latent.data(),
+                    latent.size() * sizeof(float));
+      } else {
+        uint16_t* dst = out.Ptr<uint16_t>() + row;
+        for (size_t d = 0; d < latent.size(); ++d) dst[d] = F32ToBF16(latent[d]);
+      }
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kCPU,
@@ -187,6 +318,12 @@ struct Registrar {
     RegisterOp(
         OpId::kConcatAndCacheMla, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernel)));
+    RegisterOp(OpId::kConcatAndCacheDsMla, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatAndCacheDsMlaFn>(&ConcatAndCacheDsMlaKernel)));
+    RegisterOp(OpId::kDequantAndGatherDsMla, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DequantAndGatherDsMlaFn>(&DequantAndGatherDsMlaKernel)));
   }
 } registrar;
 

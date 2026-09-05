@@ -168,6 +168,13 @@ struct Qwen4ExpQsaCaches {
 // makes this addressable with `vt::IndexSelect` / `vt::IndexCopy` and no new op:
 // see `IndexerRows` in the .cpp for the translation and for what it costs.
 //
+// THE TRANSLATION RUNS ON THE HOST AND THE TABLE MAY LIVE ANYWHERE. `index_block_table`
+// used to have to be CPU-resident, which refused every device queue inside the
+// block; it is now resolved to host words once per call. What that costs is one
+// queue synchronize per block call on a device arm, recorded under `## Owed` in
+// `.agents/specs/qwen4-exp-qsa-device-residency.md` (#2421), and what removes it
+// is folding the resolution into the consuming op's own address mode.
+//
 // ONE ROW PER TOKEN, not one per `indexer_compress_ratio`. W5h established that
 // against upstream — `Cache.update_indexer` concatenates one raw key per token
 // (`cache_utils.py:350-351`, returning `[batch, total_len, index_head_dim]`) and
@@ -231,7 +238,9 @@ struct Qwen4ExpQsaSelection {
 //              applies `(1.0 + w)` itself, mirroring `Qwen4ExpTextRMSNorm`
 //   cos/sin    [>= kv_len, rotary_dim] f32 FULL-position tables; the compressor
 //              reads row `compress_ratio * b`, the block's FIRST token
-//   kv_lens    [T] i32, the causal visible length of each query token
+//   kv_lens    [T] i32, the causal visible length of each query token. READ ON
+//              THE HOST to build the scoring window, from EITHER residency: a
+//              device-resident one is copied, not refused (#2421)
 //   logits     OPTIONAL [T, kv_len / compress_ratio] f32 OUT — the VALUE-gate
 //              surface. Two of the four settings cannot be seen any other way;
 //              see the header comment. `nullptr` on the production path.

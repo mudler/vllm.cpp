@@ -50,6 +50,7 @@
 #include <numeric>
 #include <numbers>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/mla_attention.h"
@@ -80,14 +81,66 @@ namespace {
 
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 
-bool HasCuda() {
+// #2571 -- this guard must answer "can this device SERVE these cases", not
+// "does a CUDA backend exist". Asking only the latter turned two UNRELATED
+// environmental refusals into `3 failed`, which reads identically to a
+// correctness red in every summary that quotes it:
+//
+//   * an exhausted box  -> `cuda mla_prefill_attention: cudaStreamCreate: out of memory`
+//   * a non-FA2 build   -> `cuda mla_prefill_attention: built without the vendored
+//                           FlashAttention-2 (VLLM_CPP_FLASH_ATTN)`
+//
+// Both were observed on `dgx:gpu0` on the same three cases, days apart, and the
+// second was filed as the first. `0 failed assertions` was the only
+// discriminator between "the device refused" and "the maths is wrong", and it
+// was misread once. THREE terms, because three distinct things can refuse.
+//
+// TERM 3 CANNOT BE ASKED OF THE OP TABLE. `OpId::kMlaPrefillAttention` is
+// registered on CUDA UNCONDITIONALLY (`src/vt/cuda/cuda_mla_prefill.cu:457`)
+// and the refusal is thrown at CALL time from inside the kernel (`:180`), so
+// `vt::OpRegistered` answers true on a build that cannot serve it. The
+// compile-time macro is the only honest source here, and it reaches this
+// translation unit because `CMakeLists.txt:2421` applies it PUBLIC on `vllm`.
+// Note the macro is NOT simply the `VLLM_CPP_FLASH_ATTN` option, which defaults
+// ON: `CMakeLists.txt:2381` also requires CUTLASS headers and a non-empty
+// `VT_FA2_ARCHS`, so an ON option and a non-FA2 build coexist happily.
+bool CudaCanServeMlaPrefill(std::string* why) {
+  // RUNTIME TERMS FIRST, so the reported reason is the one that actually
+  // applies. Checking the build macro first would tell a CPU-only build it
+  // "lacks FlashAttention", when what it lacks is a CUDA device.
   try {
-    vt::GetBackend(DeviceType::kCUDA);
-    return true;
-  } catch (const std::runtime_error&) {
+    Backend& b = vt::GetBackend(DeviceType::kCUDA);
+    // Allocate a real queue and let it go. This is the term an exhausted box
+    // fails, and it is why the probe CREATES one instead of trusting that
+    // `GetBackend` succeeding means the device can do work.
+    Queue probe = b.CreateQueue();
+    (void)probe;
+  } catch (const std::runtime_error& e) {
+    if (why != nullptr) *why = e.what();
     return false;
   }
+#ifndef VLLM_CPP_FLASH_ATTN
+  if (why != nullptr) {
+    *why = "built without the vendored FlashAttention-2 (VLLM_CPP_FLASH_ATTN); "
+           "MLA prefill on sm_121 IS FlashAttention and has no fallback";
+  }
+  return false;
+#else
+  return true;
+#endif
 }
+
+// Report the refusal instead of returning silently. A bare `return` leaves a
+// doctest case at ZERO assertions, which prints as a pass and hides exactly the
+// condition this guard exists to name.
+#define VT_REQUIRE_CUDA_MLA()                                                 \
+  do {                                                                        \
+    std::string why_;                                                         \
+    if (!CudaCanServeMlaPrefill(&why_)) {                                     \
+      MESSAGE("SKIPPED -- this device cannot serve MLA prefill: " << why_);   \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
 
 std::vector<float> RandF32(size_t n, uint32_t seed, float amp = 1.0f) {
   std::vector<float> v(n);
@@ -1215,7 +1268,7 @@ TEST_CASE("CPU MLA block is BIT-exact run to run") {
 
 // ════════════════════════════════════════════════════════════════════════════
 TEST_CASE("CUDA MLA block (bf16) reproduces the unabsorbed oracle and is bit-exact") {
-  if (!HasCuda()) return;
+  VT_REQUIRE_CUDA_MLA();
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   Queue q = b.CreateQueue();
   MlaBlockDims d = LiteDims();
@@ -1260,7 +1313,7 @@ TEST_CASE("CUDA MLA block (bf16) reproduces the unabsorbed oracle and is bit-exa
 }
 
 TEST_CASE("CUDA: the absorbed decode path and the unabsorbed prefill path agree") {
-  if (!HasCuda()) return;
+  VT_REQUIRE_CUDA_MLA();
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   Queue q = b.CreateQueue();
   MlaBlockDims d = LiteDims();
@@ -1718,7 +1771,7 @@ TEST_CASE("CUDA MLA block: the NoPE geometry runs at the PUBLISHED 512/256 head 
   // The published pair is head_size 512 (the latent alone) with `qk_head_dim`
   // 256 on the prefill side; FA-2 compiles {128, 192, 256} and refuses > 256 by
   // name, so 256 is the widest legal prefill head and it is exercised here.
-  if (!HasCuda()) return;
+  VT_REQUIRE_CUDA_MLA();
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   Queue q = b.CreateQueue();
   MlaBlockDims d;

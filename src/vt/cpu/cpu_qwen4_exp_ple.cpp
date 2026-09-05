@@ -7,8 +7,8 @@
 //
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
 // This row splits its oracles by developer direction (spec `## Oracles`):
-// transformers supplies the ALGORITHM, vLLM supplies the OP FORM. Here vLLM
-// supplies NEITHER, and that negative is confirmed rather than unfound: at vLLM
+// transformers supplied the ALGORITHM and vLLM the OP FORM. SUPERSEDED
+// 2026-08-31 (#2489): `nvidia/ple_layer.py:589-599` IS this conv. Formerly: at
 // `origin/main` = `6a5e8f5979`, `git grep -in dilat` returns zero lines in
 // `vllm/model_executor/layers/mamba/`, zero in `csrc/` and zero in `tests/`, and
 // `layers/conv.py` defines only `Conv2dLayer` and `Conv3dLayer`. Upstream

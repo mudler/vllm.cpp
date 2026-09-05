@@ -6,9 +6,9 @@
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
 // This row splits its oracles by design (spec `## Oracles`, developer direction
 // 2026-08-26): transformers supplies the ALGORITHM, vLLM supplies the OP FORM.
-// vLLM has never registered `qwen4_exp` — surveyed at `origin/main` 6a5e8f5979,
-// zero hits tree-wide — so there is no vLLM model to mirror, but the grouped
-// RMSNorm is a vLLM op and is mirrored as one.
+// SUPERSEDED 2026-08-31: vLLM DOES register `qwen4_exp`, at `e126687a9a`, which
+// is 595 commits BEYOND our pin `555967922` and not reachable from it. It is now
+// this row's primary oracle; see the spec's reconciliation (#2489).
 //
 //   OURS                       <-  ALGORITHM (transformers v5.16.0, the lane pin,
 //                                  `models/qwen4_exp/modeling_qwen4_exp.py`)

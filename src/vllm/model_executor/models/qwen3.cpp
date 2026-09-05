@@ -698,6 +698,12 @@ struct Qwen3DenseDecodeGraph::Impl {
     int fa_cols = -1;  // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
+    // #2469: the on-device cur_pos value THIS slot's trace expects. A seeding
+    // step (cold/warm/capture, or a boundary step the predicate below forces)
+    // sets it to seq_lens-1; every completed replay's in-trace plus_one adds
+    // one. A steady same-request step has seq_lens-1 == expected_cur_pos; a
+    // mismatch is a request boundary (or a missed warm) and must re-seed.
+    int64_t expected_cur_pos = -1;
 
     // In-place refresh of the persistent host inputs (fixed addresses once the
     // slot's vectors reach size S) so a replay re-reads this step's tokens.
@@ -805,6 +811,10 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   // captured H2D copy's source address moves) -> invalidate this slot's graph and
   // re-warm/re-capture.
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
+  // #2469: continuation is the per-slot boundary predicate — seq_lens-1 must
+  // equal the cur_pos this slot's replays produced. Read by the WarmDecodePos
+  // regime AND by the boundary re-capture below (both need the same answer).
+  bool seq_continuation = true;  // no seq_lens -> no boundary to detect
   s.Refresh(ptok, ppos, pam);
   // HOST-FREE-FORWARD item 5 (TT only): populate the persistent device
   // rope cos/sin tensors for THIS step's UNPADDED positions (the same T-row
@@ -842,9 +852,27 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     // captured plus_one; cold/warm/capture steps re-seed it, which is what
     // makes a post-boundary RE-capture read the right position (#1476).
     if (!pam.seq_lens.empty()) {
+      // #2469: replay regime requires this step to CONTINUE the request the
+      // trace was last driven with: seq_lens-1 must equal the on-device
+      // cur_pos this slot's replays produced. A bare captured() flag also
+      // holds on a request boundary, where every re-seed path is already
+      // disabled (WarmDecodePos's replay branch, WarmRacIdx's steady state,
+      // WarmPaMeta's process-global r2_steady), so the recycled size slot
+      // replays the previous request's final cur_pos: PA attends the dead
+      // request's decode KV rows still in the recycled physical block and RAC
+      // writes at the stale virtual position. A mismatch forces the existing
+      // seeding path; RAC and PA alias the same DecodePos buffer, so the one
+      // copy_to_device fixes both consumers.
+      const bool continuation =
+          (static_cast<int64_t>(pam.seq_lens[0]) - 1) == s.expected_cur_pos;
+      seq_continuation = continuation;
       vt::tenstorrent::WarmDecodePos(
           pam.seq_lens.data(), static_cast<int64_t>(pam.num_reqs),
-          /*replay_regime=*/s.graph.captured());
+          /*replay_regime=*/s.graph.captured() && continuation);
+      // A seeding step leaves the device holding seq_lens-1; a continuation
+      // step already did (that is the predicate). Either way this is the
+      // value the trace's plus_one starts this step from.
+      s.expected_cur_pos = pam.seq_lens[0] - 1;
     }
     vt::tenstorrent::WarmRacIdx(
         pam.slot_mapping.data(), pam.slot_mapping.data(),
@@ -864,7 +892,18 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     }
   }
   s.fa_cols = cols;
-  if (cols_changed && s.graph.captured()) {
+  // #2469: a same-size request boundary must re-capture, not seed-and-replay.
+  // With the boundary seed alone the first post-boundary replay still drifts
+  // (near-tie wrong token, flaky across builds: 374 unfixed; 13/11/264 with
+  // the seed verified correct on device), so the recycled trace replays some
+  // state the per-step warms do not refresh. Route the boundary through the
+  // same proven lane as a cols change (#1476): destroy the trace, let THIS
+  // step run eagerly against the freshly seeded cur_pos, and re-capture on
+  // the next step, which records addresses built from the new request's own
+  // state. Costs one eager step and one capture per request boundary.
+  const bool tt_boundary =
+      d.q.device.type == vt::DeviceType::kTENSTORRENT && !seq_continuation;
+  if ((cols_changed || tt_boundary) && s.graph.captured()) {
     // Reset() releases every segment through Backend::DestroyGraph and returns
     // the container to its as-constructed state, which is also what lets the
     // next capture open a scope on it (the scope refuses a container that
@@ -921,6 +960,7 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
     // gate reads.
     s.graph.Replay(impl_->queue);
     ++s.replays;
+    ++s.expected_cur_pos;  // the replay's in-trace plus_one advanced cur_pos
     ++impl_->replays;
     impl_->replay_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - replay_t0)
@@ -950,6 +990,22 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
       // Stage ids for the captured embedding (outside capture).
       vt::tenstorrent::WarmDecodeIds(
           s.token_ids.data(), static_cast<int64_t>(s.token_ids.size()));
+      // HOST-FREE-FORWARD R4 (#1105): _dummy_run mirror for the capture-only
+      // embed segment. The eager step's EmbedInto never runs the device
+      // embedding or the hidden-shadow copy, so both programs are cold at
+      // first capture and tt-metal refuses to load new binaries mid-trace
+      // (TT_FATAL mesh_workload.cpp:153 !is_capturing_trace). Run the exact
+      // captured segment once OUTSIDE the scope; the captured pass then hits
+      // the program cache. Safe to run twice: the hold in
+      // EmbedDeviceIdsInto replaces the previous out tensor, and nothing
+      // references the dummy run's output.
+      Tensor dtab = ResidentWeight(d, impl_->weights.embed_tokens,
+                                   {impl_->config.vocab_size,
+                                    impl_->config.hidden_size});
+      vt::tenstorrent::EmbedDeviceIdsInto(
+          s.hidden->ptr(), S, impl_->config.hidden_size, dtab.data,
+          impl_->config.vocab_size, impl_->config.hidden_size,
+          static_cast<int64_t>(s.token_ids.size()));
     } else {
       EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     }
@@ -1051,6 +1107,7 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
                    static_cast<long long>(S), static_cast<long long>(B));
     s.graph.Replay(impl_->queue);
     s.replays = 1;
+    ++s.expected_cur_pos;  // the capture step's launch ran the trace once
     ++impl_->replays;
     if (TtDumpKv(d)) {
       std::vector<float> logits_dump(static_cast<size_t>(vocab));

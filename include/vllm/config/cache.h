@@ -5,6 +5,14 @@
 //               DTYPE_MAP), :310-362 (get_kv_cache_quant_algo_string) and
 //               :374-392 (resolve_kv_cache_dtype_string).
 //
+// `calculate_kv_scales` NO LONGER EXISTS UPSTREAM. vllm#49389 `dd11df04f3`
+// deleted the field outright, and that commit is inside the pin advance to
+// `e126687a9a` (#2817). The `:111` anchor above resolves only at the header's
+// own `555967922`, which is now BELOW the parity pin; the identifier survives at
+// the pin in one unrelated comment and in no config. Our refusal keeps the
+// parameter and is described at
+// include/vllm/model_executor/layers/quantization/kv_cache.h.
+//
 // This is the CONFIG half of `KV-FP8` W3: how `--kv-cache-dtype` and the
 // checkpoint's own `kv_cache_quant_algo` combine into ONE resolved CacheDType
 // string, before anything sizes a block or writes a byte. `include/vllm/v1/

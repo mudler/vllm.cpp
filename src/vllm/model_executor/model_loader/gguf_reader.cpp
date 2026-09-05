@@ -302,6 +302,27 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{32, 18, "IQ4_NL"};
       return &t;
     }
+    case 21: {
+      // block_iq3_s (llama.cpp @ b10451 ggml-common.h:413-422): f16 d
+      // + QK_K/4 u8 qs + QK_K/32 u8 qh + QK_K/8 u8 signs + IQ3S_N_SCALE u8
+      // scales = 2 + 64 + 8 + 32 + 4 = 110, i.e. 3.4375 bpw. The 110 is the
+      // ORACLE's own `sizeof(block_iq3_s)`, printed by the harness in
+      // tests/vt/iq3s_golden_vectors.h, not read off the struct.
+      //
+      // NOT a variant of IQ3_XXS (18) despite the family name: it reads the
+      // 512-entry `iq3s_grid` where IQ3_XXS reads the 256-entry `iq3xxs_grid`,
+      // it splices the ninth index bit out of `qh`, and it carries DIRECT sign
+      // bytes like IQ2_S rather than IQ3_XXS's packed `ksigns_iq2xs` selector.
+      // Codebook dequant in cpu_quant_dequant.cpp / vt DType kIQ3_S.
+      //
+      // This was the ONE hole in the i-quant run 16..23, and it cost whole
+      // artifacts: `unsloth/Qwen3.8-27B-GGUF UD-Q4_K_M` stores 4 of its 866
+      // tensors in it (UD-Q4_K_XL stores 1 of 866), and every other id in
+      // those files this reader already handled, so `GgufFile::Open` refused
+      // 16.4 GB of loadable weights over 146 MiB of them (#2510).
+      static constexpr GgmlTypeTraits t{256, 110, "IQ3_S"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.

@@ -5,10 +5,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4_moe.h"  // deepseek_v4::ClampedSwiGLU
+#include "vllm/model_executor/models/dense_attn_block.h"  // dense_attn::ResidentWeight
+#include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev, DBuf
+#include "vllm/platforms/interface.h"                    // platforms::GetPlatform
+#include "vt/backend.h"                                  // vt::Backend
 #include "vt/dtype.h"                                    // VT_CHECK
 
 namespace vllm::glm5_next {
@@ -83,9 +88,93 @@ vt::Tensor MakeT(void* data, vt::DType dt, vt::Device dev,
 // is what these ops are: they take `expert_ids` and index the stacked tower per
 // row themselves. The hand-rolled `hit`/`slots` walk in the f32 arms exists
 // only because those arms hold one weight pointer at a time.
+// THE FIT GUARD's margin. A shared fleet box carries the engine's KV pool, the
+// CUDA context and whatever else the process already staged, and `cudaMemGetInfo`
+// answers about the whole device rather than about us. Staging a 2.25 GiB bank
+// that leaves the allocator with nothing does not fail here -- it fails later, in
+// somebody else's allocation, on a lease that cannot be retaken cheaply. So the
+// guard keeps a floor free and falls back to the host arm by name instead.
+//
+// 2 GiB, and the number is a judgement rather than a measurement: it is roughly
+// one sparse layer's three banks at this model's published geometry, so a device
+// that cannot hold one more layer stops staging one layer early.
+constexpr size_t kGlm5NextDeviceStagingFloorBytes = size_t{2} << 30;
+
+// Whether this layer's three banks can be staged. Already-resident banks cost
+// nothing and are always admitted; a bank that still needs uploading is charged
+// against the device's free memory.
+//
+// It answers per LAYER and not per model on purpose. The tower is 94.6758 GiB
+// across 42 sparse layers and is staged lazily as the first step walks them, so
+// a model that fits gets every layer and a model that does not gets a prefix of
+// them plus the host arm for the rest -- which is a degraded but correct run,
+// and is what an OOM is not.
+bool DeviceBanksFit(const MoeQuantBanks& b, const dense_attn::Dev& d) {
+  // A CPU "device" allocates nothing. `ResidentWeight`'s host-alias arm
+  // (`dense_attn_block.h:196`) hands back a view over the tensor's own bytes,
+  // so there is no upload to charge and no free-memory question to ask. This is
+  // also what makes the device ARM runnable on a CPU-only host, which is where
+  // its operand construction is gated: without this clause the guard would read
+  // `DeviceMemoryInfo`'s `false` default and route every such run to the host
+  // arm, and the gate would measure the arm it was not testing.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) return true;
+  size_t need = 0;
+  const OwnedTensor* srcs[3] = {b.gate_src, b.up_src, b.down_src};
+  for (const OwnedTensor* t : srcs) {
+    if (t->d_dev) continue;  // already resident: this call uploads nothing
+    need += t->bytes.size();
+  }
+  if (need == 0) return true;
+  size_t free_b = 0;
+  size_t total_b = 0;
+  // A backend that cannot answer is NOT a backend with room. `Backend::
+  // DeviceMemoryInfo` returns false by default (`vt/backend.h:104`) and CUDA
+  // overrides it with `cudaMemGetInfo` (`cuda_backend.cu:93`), so a false here
+  // means an unmeasured device, and staging 94.7 GiB against an unmeasured
+  // device is exactly the bet this guard exists to decline.
+  if (!d.b.DeviceMemoryInfo(&free_b, &total_b)) return false;
+  return free_b >= need + kGlm5NextDeviceStagingFloorBytes;
+}
+
+// The POSITIVE counterpart of the fallback warning below, and it is here for
+// reachability rather than for telemetry.
+//
+// AGENTS.md "Nothing lands dead" asks what reaches a capability from a
+// production entry point. On a device this cannot be answered by a value: the
+// device arm and the host arm compute the same block, and on a CPU-backed `Dev`
+// they agree bit-for-bit, which is exactly what makes them safe to swap and
+// exactly what makes a numeric gate blind to WHICH one ran. One line on stderr,
+// naming the device, is the observable that separates them -- so the end-to-end
+// `--device cuda` job greps for it, and a mutation that stops threading `dev`
+// through the layer removes it and produces the fallback line instead.
+void AnnounceDeviceArmOnce(const vt::Device& dev) {
+  static bool said = false;
+  if (said) return;
+  said = true;
+  std::fprintf(stderr,
+               "[glm5-next] the routed-expert keep-quant GEMM is running on "
+               "DEVICE type %d index %d; every other primitive of this model is "
+               "on the host (spec section W9c-3a, O43, issue #2464).\n",
+               static_cast<int>(dev.type), static_cast<int>(dev.index));
+}
+
+// Said ONCE per process, not once per layer per step. 42 sparse layers x every
+// decode step is a log that hides the run it is describing.
+void WarnDeviceFallbackOnce(const char* why) {
+  static bool said = false;
+  if (said) return;
+  said = true;
+  std::fprintf(stderr,
+               "[glm5-next] the routed-expert GEMM is running on the HOST arm: %s. "
+               "The run is correct and slower; see .agents/specs/glm5-next-flash.md "
+               "section W9c-3a and issue #2464.\n",
+               why);
+}
+
 void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
                          const std::vector<float>& hidden, const MoeRouting& r,
                          int64_t num_tokens, vt::Queue& queue,
+                         dense_attn::Dev* dev,
                          std::vector<float>* expert_out) {
   const int64_t H = d.hidden_size;
   const int64_t I = d.moe_intermediate_size;
@@ -115,25 +204,84 @@ void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
               act.begin() + static_cast<std::ptrdiff_t>(p * H));
   }
 
+  const int64_t E = d.n_routed_experts;
+
+  // --- W9c-3a: THE DEVICE ARM -----------------------------------------------
+  //
+  // The ONE arm of this model that computes on a GPU. Everything above and below
+  // it -- the router that produced `r`, the combine that consumes `expert_out`,
+  // and every other primitive in this forward -- runs on the host, and the row's
+  // spec records that as O43 rather than leaving it to be inferred from a
+  // `--device cuda` that returns a token.
+  //
+  // Nothing is retagged. The three banks become DEVICE tensors by being
+  // uploaded (`ResidentWeight`), and the four activations are real device
+  // allocations (`DBuf`), so the ops' `a.device == b.device == out.device ==
+  // q.device` check passes because it is TRUE and not because it was made to
+  // look true.
+  if (dev != nullptr && b.HasSources() && DeviceBanksFit(b, *dev)) {
+    AnnounceDeviceArmOnce(dev->q.device);
+    // `ResidentWeight` uploads `bytes` verbatim and keeps the block dtype, so
+    // these stay Q2_K / IQ2_XS / IQ3_XXS / IQ4_XS on the device. The shapes are
+    // the ones the ops declare; `OwnedTensor` records `[E, N, K]` and the tower
+    // the seam wants is `[E * N, K]`, which is a rank change over the same
+    // bytes. It also drops the three load-time repack markers, which is safe
+    // here ONLY because `AdmitMoeQuantBanks` refuses a bank carrying any of
+    // them (`glm5_next_bridge.cpp`).
+    const vt::Tensor g_dev = dense_attn::ResidentWeight(*dev, *b.gate_src, {E * I, H});
+    const vt::Tensor u_dev = dense_attn::ResidentWeight(*dev, *b.up_src, {E * I, H});
+    const vt::Tensor d_dev = dense_attn::ResidentWeight(*dev, *b.down_src, {E * H, I});
+    dense_attn::DBuf d_act(*dev, vt::DType::kF32, {P, H}, act.data());
+    dense_attn::DBuf d_mid(*dev, vt::DType::kF32, {P, I});
+    dense_attn::DBuf d_ids(*dev, vt::DType::kI32, {P}, r.topk_ids.data());
+    dense_attn::DBuf d_out(*dev, vt::DType::kF32, {P, H});
+    vt::MoeGateUpSwiGLUGrouped(dev->q, d_mid.t(), d_act.t(), g_dev, u_dev, d_ids.t(),
+                               d.swiglu_limit);
+    vt::MatmulBTQuantGrouped(dev->q, d_out.t(), d_mid.t(), d_dev, d_ids.t());
+    // `Download` synchronises, so the combine below reads a completed buffer
+    // rather than a stream the caller would have to remember to drain -- and
+    // `act` and `r.topk_ids`, whose bytes the two uploads above copy
+    // asynchronously on this queue, are still alive at that point.
+    d_out.Download(*dev, expert_out->data());
+    return;
+  }
+  if (dev != nullptr) {
+    WarnDeviceFallbackOnce(b.HasSources()
+                               ? "the device has no room to stage this layer's "
+                                 "expert banks (see DeviceBanksFit)"
+                               : "this layer's keep-quant banks carry no source "
+                                 "tensors, so nothing can be made resident");
+  }
+
   std::vector<float> mid(static_cast<size_t>(P * I));
-  const vt::Device dev = queue.device;
-  vt::Tensor t_act = MakeT(act.data(), vt::DType::kF32, dev, {P, H});
-  vt::Tensor t_mid = MakeT(mid.data(), vt::DType::kF32, dev, {P, I});
+  const vt::Device hdev = queue.device;
+  // HOST pointers on a HOST queue. This arm is unchanged and is the operand the
+  // device arm above is gated against.
+  VT_CHECK(hdev.type == vt::DeviceType::kCPU,
+           "glm5_next moe: the keep-quant HOST arm was handed a non-CPU queue. "
+           "Its four operands are `std::vector` buffers, and the grouped ops "
+           "require every operand on the queue's device, so this would be a "
+           "refusal or a crash and never a fallback. The device arm is the "
+           "branch above; see .agents/specs/glm5-next-flash.md section W9c-3a.");
+  vt::Tensor t_act = MakeT(act.data(), vt::DType::kF32, hdev, {P, H});
+  vt::Tensor t_mid = MakeT(mid.data(), vt::DType::kF32, hdev, {P, I});
   vt::Tensor t_ids = MakeT(const_cast<int32_t*>(r.topk_ids.data()),
-                           vt::DType::kI32, dev, {P});
+                           vt::DType::kI32, hdev, {P});
 
   // The bank views are passed THROUGH, with their own `device` untouched. Both
   // ops require every operand to be on the queue's device and refuse otherwise,
   // and that refusal is the guard that keeps a host-resident bank out of a CUDA
   // kernel. Overwriting `.device` here to make the check pass would hand a
-  // device kernel host pointers, which is the crash `glm5_next_forward.cpp`
-  // refuses a non-CPU queue to avoid.
+  // device kernel host pointers, which is what `minimax_h3_device.cpp:339-342`
+  // records as reading "ALL ZEROS on the GPU". The device arm above does not
+  // retag anything: it UPLOADS, and gets a device tensor because the bytes are
+  // on the device.
   vt::MoeGateUpSwiGLUGrouped(queue, t_mid, t_act, b.gate, b.up, t_ids,
                              d.swiglu_limit);
 
   // `expert_out` is the combine's `[T, K, H]` and `P * H == T * K * H`, so slot
   // p IS row p of a `[P, H]` view. The reshape is the identity on the bytes.
-  vt::Tensor t_eo = MakeT(expert_out->data(), vt::DType::kF32, dev, {P, H});
+  vt::Tensor t_eo = MakeT(expert_out->data(), vt::DType::kF32, hdev, {P, H});
   vt::MatmulBTQuantGrouped(queue, t_eo, t_mid, b.down, t_ids);
 }
 
@@ -328,7 +476,7 @@ std::vector<float> DenseMlpForward(const DenseMlpWeights& w,
 
 std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
                               const std::vector<float>& hidden, int64_t num_tokens,
-                              vt::Queue& queue) {
+                              vt::Queue& queue, dense_attn::Dev* dev) {
   d.Validate();
   const int64_t H = d.hidden_size;
   const int64_t E = d.n_routed_experts;
@@ -398,7 +546,7 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   // fold: they are the operand the parity gate compares against, and deleting
   // them deletes the gate.
   if (w.has_quant_banks) {
-    MoeExpertsKeepQuant(d, w.quant_banks, hidden, r, num_tokens, queue,
+    MoeExpertsKeepQuant(d, w.quant_banks, hidden, r, num_tokens, queue, dev,
                         &expert_out);
   } else {
     std::vector<float> gate_up(static_cast<size_t>(2 * I));
@@ -482,14 +630,19 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   }
 
   std::vector<float> out(static_cast<size_t>(num_tokens * H), 0.0f);
-  const vt::Device dev = queue.device;
-  vt::Tensor t_out = MakeT(out.data(), vt::DType::kF32, dev, {num_tokens, H});
-  vt::Tensor t_eo = MakeT(expert_out.data(), vt::DType::kF32, dev, {num_tokens, K, H});
-  vt::Tensor t_w = MakeT(const_cast<float*>(r.topk_weights.data()), vt::DType::kF32, dev,
+  // `cdev` and not `dev`: the parameter of that name is the DEVICE ARM, and
+  // this is the combine's HOST device. The combine reads `expert_out` and
+  // `topk_weights`, both host buffers, whichever arm filled them -- the device
+  // arm downloads before it returns -- so the combine stays on the host queue
+  // and W9c-3a does not move it. O43 lists it among the ten arms still there.
+  const vt::Device cdev = queue.device;
+  vt::Tensor t_out = MakeT(out.data(), vt::DType::kF32, cdev, {num_tokens, H});
+  vt::Tensor t_eo = MakeT(expert_out.data(), vt::DType::kF32, cdev, {num_tokens, K, H});
+  vt::Tensor t_w = MakeT(const_cast<float*>(r.topk_weights.data()), vt::DType::kF32, cdev,
                          {num_tokens, K});
   vt::Tensor t_sh;
   if (!shared.empty()) {
-    t_sh = MakeT(shared.data(), vt::DType::kF32, dev, {num_tokens, H});
+    t_sh = MakeT(shared.data(), vt::DType::kF32, cdev, {num_tokens, H});
   }
   // `routed_scale` stays 1.0f: `routed_scaling_factor` is already in the router
   // weights (`MoeRouterTopKArgs::routed_scaling_factor` above), which is

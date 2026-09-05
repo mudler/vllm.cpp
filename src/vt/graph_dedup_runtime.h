@@ -143,7 +143,7 @@ struct Runtime {
   // entry point (vt/graph_dedup_latch.h) rather than beside each fallible call. On the
   // HIP leg VTGD_FN resolves this to hipGetLastError, which has the same latch
   // semantics; one line covers both arms because there is one source.
-  static void ClearLatchedError() { VTGD_FN(GetLastError)(); }
+  static void ClearLatchedError() { (void)VTGD_FN(GetLastError)(); }
 
   static bool GetNodes(Graph graph, std::vector<Node>* out) {
     std::size_t num_nodes = 0;
@@ -276,11 +276,11 @@ inline bool Update(void* exec, void* raw_graph, std::string* detail) {
 }
 
 inline void DestroyExec(void* exec) {
-  if (exec != nullptr) VTGD_FN(GraphExecDestroy)(reinterpret_cast<GraphExec>(exec));
+  if (exec != nullptr) (void)VTGD_FN(GraphExecDestroy)(reinterpret_cast<GraphExec>(exec));
 }
 
 inline void DestroyGraph(void* raw_graph) {
-  if (raw_graph != nullptr) VTGD_FN(GraphDestroy)(static_cast<Graph>(raw_graph));
+  if (raw_graph != nullptr) (void)VTGD_FN(GraphDestroy)(static_cast<Graph>(raw_graph));
 }
 
 inline void Launch(void* exec, void* stream) {

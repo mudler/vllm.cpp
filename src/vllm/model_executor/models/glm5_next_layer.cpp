@@ -78,7 +78,8 @@ DecoderLayerResult DecoderLayerForward(
     const std::vector<float>& hidden_streams,
     const std::vector<uint8_t>& mask,
     const std::vector<int32_t>* prev_topk_indices, int64_t prev_topk_width,
-    int64_t batch, int64_t seq_len, LayerCache* cache, vt::Queue& queue) {
+    int64_t batch, int64_t seq_len, LayerCache* cache, vt::Queue& queue,
+    dense_attn::Dev* dev) {
   if (batch <= 0 || seq_len <= 0) Fail("batch and seq_len must be > 0");
   if (layer_idx < 0 || layer_idx >= p.num_hidden_layers) {
     Fail("layer_idx " + std::to_string(layer_idx) + " is outside [0, " +
@@ -266,7 +267,7 @@ DecoderLayerResult DecoderLayerForward(
     mlp_out = DenseMlpForward(w.dense_mlp, normed, H, p.intermediate_size, tokens,
                               static_cast<float>(p.swiglu_limit));
   } else {
-    mlp_out = MoeForward(MoeDimsFrom(p), w.moe, normed, tokens, queue);
+    mlp_out = MoeForward(MoeDimsFrom(p), w.moe, normed, tokens, queue, dev);
   }
   RequireSize("feed-forward output", mlp_out.size(), tokens * H);
   if (diag::Level() > 1) {
@@ -318,10 +319,10 @@ std::vector<float> TextModelForward(const TextModelWeights& w,
                                     const std::vector<uint8_t>& mask,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
-                                    vt::Queue& queue) {
+                                    vt::Queue& queue, dense_attn::Dev* dev) {
   ResidentLayerSource src(w);
   return TextModelForward(w.params, w.norm, src, inputs_embeds, mask, batch,
-                          seq_len, caches, queue);
+                          seq_len, caches, queue, dev);
 }
 
 std::vector<float> TextModelForward(const Glm5NextParams& p,
@@ -331,7 +332,7 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
                                     const std::vector<uint8_t>& mask,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
-                                    vt::Queue& queue) {
+                                    vt::Queue& queue, dense_attn::Dev* dev) {
   const int64_t hc = p.mhc.mult;
   const int64_t H = p.hidden_size;
   const int64_t tokens = batch * seq_len;
@@ -378,7 +379,8 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
     DecoderLayerResult r = DecoderLayerForward(
         p, i, layers.Layer(i), streams, mask,
         topk.empty() ? nullptr : &topk, topk_width, batch, seq_len,
-        caches != nullptr ? &(*caches)[static_cast<size_t>(i)] : nullptr, queue);
+        caches != nullptr ? &(*caches)[static_cast<size_t>(i)] : nullptr, queue,
+        dev);
     streams = std::move(r.hidden_streams);
     topk = std::move(r.topk_indices);
     topk_width = topk.empty() ? 0 : r.topk_width;

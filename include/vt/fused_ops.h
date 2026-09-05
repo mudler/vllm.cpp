@@ -37,8 +37,25 @@ bool HasMatmulBTAlphaBeta(const Queue& q);
 void MatmulBTAlphaBeta(Queue& q, void* out, const void* a, const void* b, int M, int N, int K,
                        float alpha, float beta, DType dtype);
 
+// Does `MatmulBTFp8Channel` have an arm for this queue's device in THIS build?
+//
+// The sibling of `HasMatmulBTAlphaBeta` above, for the same reason and with the
+// same contract: `MatmulBTFp8Channel` dispatches on this predicate, so false here
+// means the very next line throws (`fused_ops.cpp:177`).
+//
+// It is a SEPARATE symbol from `HasMatmulBTAlphaBeta` even though the two answer
+// alike today, because they describe different ops. A caller that commits to
+// both — Gemma-4's FP8-native expert arm does (issue #2623) — has to ask about
+// both, and a future device that gains one kernel and not the other must not
+// wake a path that needs the pair.
+bool HasMatmulBTFp8Channel(const Queue& q);
+
 void MatmulBTFp8Channel(Queue& q, void* out, const void* a, const void* b_fp8,
                         const void* scale_bf16, int M, int N, int K, float alpha, float beta);
+
+// Does `DequantFp8ChannelBf16` have an arm for this queue's device in THIS build?
+// Same contract as the two predicates above; the refusal is `fused_ops.cpp:194`.
+bool HasDequantFp8ChannelBf16(const Queue& q);
 
 // Device FP8 E4M3 + BF16 channel scale → BF16 weights [N,K] (prefill hipBLAS path).
 void DequantFp8ChannelBf16(Queue& q, void* out_bf16, const void* fp8, const void* scale_bf16,

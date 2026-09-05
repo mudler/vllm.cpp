@@ -130,16 +130,17 @@ TEST_CASE("the reference tier follows UnifiedMemory, which is the memory-safety 
   }
 }
 
-TEST_CASE("approach (b): the alloc path and UnifiedMemory() move together") {
+TEST_CASE("#2511: the alloc path, the unified claim and the fault window move together") {
   if (NoDevice()) return;
   Backend& rocm = vt::GetBackend(DeviceType::kROCM);
   const bool integrated = vt::rocm::IntegratedDevice(0);
   const bool managed = vt::rocm::ManagedAllocActive(0);
   const bool unified = rocm.UnifiedMemory();
-  // Printed unconditionally: this triple is the first thing a bring-up report
-  // on issue #41 should carry.
+  const bool host_pageable = vt::rocm::HostMemoryIsDeviceAddressable(0);
+  // Printed unconditionally: this quadruple is the first thing a bring-up report
+  // on issue #41 or #2511 should carry.
   MESSAGE("ROCm device 0 integrated: ", integrated, " managed-alloc: ", managed,
-          " UnifiedMemory(): ", unified);
+          " UnifiedMemory(): ", unified, " integrated+pageable: ", host_pageable);
 
   if (!integrated) {
     // DISCRETE (7900 XTX, R9700): the managed branch must be provably dead and
@@ -150,20 +151,38 @@ TEST_CASE("approach (b): the alloc path and UnifiedMemory() move together") {
     CHECK_FALSE(unified);
     return;
   }
-  // INTEGRATED. Every board measured on issue #41 (gfx1151 F6 attribute table,
-  // gfx1103 confirmation) reports ManagedMemory=1 + ConcurrentManagedAccess=1,
-  // so the managed branch is active and UnifiedMemory() is true by
-  // construction. An integrated device that probes NOT managed-capable would
-  // fail here: that is a hardware class the (b) fix does not cover, and a loud
-  // failure carrying the triple above is more useful than a silent skip —
-  // please post it on https://github.com/mudler/vllm.cpp/issues/41.
-  CHECK_MESSAGE(managed,
-                "integrated device without the managed-alloc branch: "
-                "ManagedMemory or ConcurrentManagedAccess probed 0 — post the "
-                "triple above on issue #41");
-  CHECK_MESSAGE(unified == managed,
-                "UnifiedMemory() must be true EXACTLY when the managed branch "
-                "is active on an XNACK-less integrated part");
+
+  // INTEGRATED. This case asserted the OPPOSITE until #2511, and the reason it
+  // changed is measured rather than argued: approach (b) gave every integrated
+  // managed-capable device migratable memory, and on an XNACK-less part —
+  // PageableMemoryAccess = 0, so no recoverable page fault — the driver
+  // migrating a page out from under a live queue is a hard violation. gfx1151
+  // measured 17 GPU faults in 21 legs on that branch and 0 in 21 without it.
+  //
+  // So the managed branch now requires the part to be able to fault and recover,
+  // which is exactly `HostMemoryIsDeviceAddressable(0)` on an integrated device.
+  CHECK_MESSAGE(managed == host_pageable,
+                "the managed branch must be taken EXACTLY where the device can "
+                "take a recoverable page fault (#2511) — post the quadruple "
+                "above on https://github.com/mudler/vllm.cpp/issues/2511");
+  // And the capability claim follows the ALLOCATOR, never the capability the
+  // allocator declined. Under the shipped default the managed branch implies
+  // ground 1, so this collapses to the W0 conjunction on every integrated part.
+  CHECK_MESSAGE(unified == host_pageable,
+                "UnifiedMemory() must follow the allocation path actually taken");
+  CHECK(rocm.DeviceMemoryIsHostAddressable() == unified);
+
+  // The reference tier is the consequence, and it is the whole reason this
+  // needed a decision. Where the claim was withdrawn, the backend must be able
+  // to SAY WHY: an op that loses its fallback is refused with this sentence
+  // appended, so a Strix Halo owner learns the cause at the point of failure.
+  if (!unified) {
+    CHECK_FALSE(vt::ReferenceTierEligible(DeviceType::kROCM));
+    REQUIRE(rocm.HostAddressabilityNote() != nullptr);
+    CHECK(std::string(rocm.HostAddressabilityNote()).find("2511") != std::string::npos);
+  } else {
+    CHECK(rocm.HostAddressabilityNote() == nullptr);
+  }
 }
 
 TEST_CASE("unified path: a kernel-written value is host-readable with no copy") {
@@ -210,6 +229,78 @@ TEST_CASE("unified path: a kernel-written value is host-readable with no copy") 
   CHECK(dout[0] == doctest::Approx(1.697056f));
   CHECK(dout[1] == doctest::Approx(0.565685f));
 
+  rocm.Free(dx);
+  rocm.Free(dw);
+  rocm.Free(dout);
+  rocm.DestroyQueue(q);
+}
+
+TEST_CASE("FlushPending orders in-flight device work before a host read (#2498)") {
+  if (NoDevice()) return;
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  // Same precondition as the unified-path case above: a host dereference of
+  // Backend::Alloc memory is only defined where UnifiedMemory() says so. That is
+  // also exactly where the portable CPU reference tier installs
+  // (op_provider.h SAFETY), so this case runs on precisely the boards where the
+  // behavior under test is reachable.
+  if (!rocm.UnifiedMemory()) return;
+
+  // WHAT THIS PINS. `GetOp` calls Backend::FlushPending() before handing back a
+  // reference-tier kernel (src/vt/op_provider.cpp:707-711), and so does the
+  // decline path (762-765), because that kernel is a HOST function about to read
+  // DEVICE memory with no Queue in hand. Metal and Vulkan override it. ROCm
+  // inherited the `{}` default from vt/backend.h, whose contract says it "suits
+  // every backend that submits eagerly" -- and HIP submits eagerly but COMPLETES
+  // asynchronously, since CreateQueue builds a real hipStreamCreate stream.
+  //
+  // So the assertion is deliberately about ORDERING and not about arithmetic:
+  // the host must not observe its own pre-launch sentinels after FlushPending().
+  // Note what is NOT called below -- there is no Synchronize(q) anywhere. The
+  // only thing between the launches and the host read is FlushPending().
+  const int64_t rows = 2048;
+  const int64_t cols = 1024;
+  const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const size_t bytes = n * sizeof(float);
+
+  float* dx = static_cast<float*>(rocm.Alloc(bytes));
+  float* dw = static_cast<float*>(rocm.Alloc(cols * sizeof(float)));
+  float* dout = static_cast<float*>(rocm.Alloc(bytes));
+  REQUIRE(dx != nullptr);
+  REQUIRE(dw != nullptr);
+  REQUIRE(dout != nullptr);
+
+  // Host stores BEFORE anything is enqueued, so this fill races nothing. Every
+  // element of a row is 3, so mean(x^2) = 9 and rms = 3 exactly; with eps 0 the
+  // row reduces to out[j] = (3/3) * w[j] = w[j] = 2. An exact power-of-two-free
+  // identity, chosen so a partially-written row cannot round into the answer.
+  for (size_t i = 0; i < n; ++i) dx[i] = 3.0f;
+  for (int64_t j = 0; j < cols; ++j) dw[j] = 2.0f;
+  for (size_t i = 0; i < n; ++i) dout[i] = -1.0f;
+
+  const Device dev{DeviceType::kROCM, 0};
+  Tensor tx = Tensor::Contiguous(dx, DType::kF32, dev, {rows, cols});
+  Tensor tw = Tensor::Contiguous(dw, DType::kF32, dev, {cols});
+  Tensor to = Tensor::Contiguous(dout, DType::kF32, dev, {rows, cols});
+
+  Queue q = rocm.CreateQueue();
+  // Enough queued work that the stream is genuinely busy when the host regains
+  // control. One launch would make the outcome a coin toss on launch latency;
+  // this makes the un-drained window milliseconds wide, so the mutation below
+  // fails for the reason it names rather than by luck.
+  for (int i = 0; i < 128; ++i) {
+    vt::RmsNorm(q, to, tx, tw, vt::RmsNormArgs{0.0f, false});
+  }
+
+  rocm.FlushPending();
+
+  // The host reads managed memory directly, exactly as a reference-tier kernel
+  // would. Reading -1.0f here is the defect: it means the host observed bytes
+  // the device had not written.
+  CHECK(dout[0] == doctest::Approx(2.0f));
+  CHECK(dout[n / 2] == doctest::Approx(2.0f));
+  CHECK(dout[n - 1] == doctest::Approx(2.0f));
+
+  rocm.Synchronize(q);
   rocm.Free(dx);
   rocm.Free(dw);
   rocm.Free(dout);
@@ -464,5 +555,90 @@ TEST_CASE("ROCm backend: a pre-warmed GEMM captures and replays") {
   rocm.Free(da);
   rocm.Free(db);
   rocm.Free(dc);
+  rocm.DestroyQueue(q);
+}
+
+// NO COMMA IN THE NAME BELOW, DELIBERATELY. doctest's -tc filter splits its
+// argument on commas, so a case whose name contains one can never be selected by
+// name: the filter matches nothing, the binary runs zero cases and exits 0, and
+// that reads as a pass. Any mutation run that selects this case by -tc would then
+// be measuring nothing at all.
+//
+// DELIBERATELY LAST IN THIS FILE. It installs the portable reference tier, which
+// makes GetReferenceTierHits() non-zero for the rest of the process, and the
+// native-RmsNorm case above asserts that counter is exactly 0. doctest runs cases
+// in declaration order, so keeping this one at the end is what keeps the two
+// compatible. Do not move it, and do not weaken the absolute assertion above.
+TEST_CASE("the reference tier's flush is REACHED through GetOp and not merely callable (#2498)") {
+  if (NoDevice()) return;
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  if (!rocm.UnifiedMemory()) return;
+
+  // WHY THIS CASE EXISTS SEPARATELY FROM THE ONE ABOVE. That case calls
+  // Backend::FlushPending() by hand, so it proves the override does its job --
+  // and it would go on passing if the production call site were deleted, because
+  // it never goes through one. This case enters where production enters:
+  // vt::GetOp, which is what dispatches every op in the engine. Deleting the
+  // guarded flush at op_provider.cpp:707-711 must make THIS fail.
+  //
+  // kBatchedMatmul is chosen because it has a CPU kernel and no native ROCm one,
+  // which is exactly the shape that installs the tier. If a later wave ports it
+  // to ROCm the REQUIRE below fails loudly, which is the intended signal to
+  // repoint this case at another still-unported op rather than to delete it. As
+  // of this commit the ROCm MLA/DSA arm supplies seven more candidates.
+  REQUIRE_MESSAGE(!vt::OpRegistered(vt::OpId::kBatchedMatmul, DeviceType::kROCM),
+                  "kBatchedMatmul now has a native ROCm kernel; repoint this case "
+                  "at an op that still has none (see the MLA/DSA arm)");
+  REQUIRE(vt::OpRegistered(vt::OpId::kBatchedMatmul, DeviceType::kCPU));
+
+  const int64_t rows = 2048;
+  const int64_t cols = 1024;
+  const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const size_t bytes = n * sizeof(float);
+
+  float* dx = static_cast<float*>(rocm.Alloc(bytes));
+  float* dw = static_cast<float*>(rocm.Alloc(cols * sizeof(float)));
+  float* dout = static_cast<float*>(rocm.Alloc(bytes));
+  REQUIRE(dx != nullptr);
+  REQUIRE(dw != nullptr);
+  REQUIRE(dout != nullptr);
+
+  // Same identity as the case above: every element 3, so rms is exactly 3 and
+  // out[j] = w[j] = 2. Host stores happen before anything is enqueued.
+  for (size_t i = 0; i < n; ++i) dx[i] = 3.0f;
+  for (int64_t j = 0; j < cols; ++j) dw[j] = 2.0f;
+  for (size_t i = 0; i < n; ++i) dout[i] = -1.0f;
+
+  const Device dev{DeviceType::kROCM, 0};
+  Tensor tx = Tensor::Contiguous(dx, DType::kF32, dev, {rows, cols});
+  Tensor tw = Tensor::Contiguous(dw, DType::kF32, dev, {cols});
+  Tensor to = Tensor::Contiguous(dout, DType::kF32, dev, {rows, cols});
+
+  Queue q = rocm.CreateQueue();
+  for (int i = 0; i < 128; ++i) {
+    vt::RmsNorm(q, to, tx, tw, vt::RmsNormArgs{0.0f, false});
+  }
+
+  // THE PRODUCTION ENTRY POINT. Resolving an op with no native ROCm kernel
+  // installs the CPU host kernel and, because the slot is now reference-tier,
+  // GetOp drains the device before handing it back. Nothing else here syncs.
+  const unsigned long long before = vt::GetReferenceTierHits();
+  void* fn = vt::GetOp(vt::OpId::kBatchedMatmul, DeviceType::kROCM);
+  CHECK(fn != nullptr);
+  // The tier really was what answered -- otherwise the drain above never ran and
+  // the reads below would be measuring nothing.
+  CHECK(vt::GetReferenceTierHits() > before);
+
+  // A reference-tier kernel would now dereference these host-addressable
+  // pointers. Sentinels here mean it would have read bytes the device had not
+  // written.
+  CHECK(dout[0] == doctest::Approx(2.0f));
+  CHECK(dout[n / 2] == doctest::Approx(2.0f));
+  CHECK(dout[n - 1] == doctest::Approx(2.0f));
+
+  rocm.Synchronize(q);
+  rocm.Free(dx);
+  rocm.Free(dw);
+  rocm.Free(dout);
   rocm.DestroyQueue(q);
 }

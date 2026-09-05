@@ -159,6 +159,30 @@ int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
                               const std::vector<float>& proj_w, float threshold,
                               int64_t block, int64_t hidden, int64_t rank);
 
+// W-5, THE PROPOSE SIDE'S BOOKKEEPING.
+//
+// The shared `RejectionSampler` needs no new verify path: it already derives each
+// request's draft length from `cu_num_logits` as `cu[r+1] - cu[r]`
+// (`rejection_sampler.cpp:85-86`), which is exactly the shape the confidence cap
+// produces. So W-5 is the propose side plus this.
+//
+// Its contract, from the sampler's own header: row `cu[r]` holds the PREVIOUS
+// step's token and is never compared, and row `cu[r]+i+1` holds request r's i-th
+// draft. `MarkovDraftLoop` already returns `[seed, drafts...]` with the seed
+// first, so the seed IS that uncompared row and the block maps across unchanged.
+//
+// A confidence length of 0 is a REQUEST THAT SKIPS DRAFTING, not an error: it
+// contributes one row carrying the previous token, which yields the bonus token
+// alone and is a valid sampling row rather than an empty one.
+//
+//   drafted   per request, `MarkovDraftLoop`'s output: [seed, d0, d1, ...]
+//   lengths   per request, the confidence-capped draft length in [0, block]
+//   out_cu    [num_reqs + 1] cumulative row offsets
+//   returns   `draft_sampled`, flat over requests
+std::vector<int32_t> ProposeToVerifyInputs(
+    const std::vector<std::vector<int32_t>>& drafted,
+    const std::vector<int64_t>& lengths, std::vector<int32_t>* out_cu);
+
 // W-3, THE BLOCK'S WEIGHTS. A DSpark block IS a V4 decoder layer of the
 // compressor-less kind -- `DSparkAttention` with `compress_rate = None` over a
 // `BlockSparseMLP` with a shared expert and two `HyperConnection`s
@@ -194,5 +218,20 @@ std::vector<std::vector<float>> DeepseekV4TrunkTapsHost(
     const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int64_t>& layer_ids);
+
+// W-3: ONE DSpark block's attention half, host oracle.
+//
+// A DSpark block is a compressor-less V4 decoder layer, so this drives the SAME
+// `AttentionBlock` the trunk uses -- extending that seam rather than writing a
+// second attention. The one difference is where the KV comes from: the rows were
+// written by `BlockKvRows` from the projected trunk taps, so the step attends
+// them WITHOUT writing its own, through the `kv_prewritten` mode.
+//
+// `pages` must already hold this block's rows at `[0, kv_base + num_tokens)`.
+std::vector<float> DsparkBlockAttentionHost(
+    vt::Queue& queue, const DeepseekV4LayerHostWeights& L,
+    const DeepseekV4Params& p, const std::vector<float>& x,
+    const std::vector<int32_t>& positions, std::vector<vt::Tensor>& pages,
+    int64_t layer, int64_t kv_base);
 
 }  // namespace vllm

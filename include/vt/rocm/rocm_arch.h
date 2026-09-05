@@ -88,4 +88,112 @@ constexpr bool GcnArchNameIsGfx12PrefillWmma(std::string_view gcn_arch) {
   return prefix_ok(gcn_arch, "gfx1200") || prefix_ok(gcn_arch, "gfx1201");
 }
 
+
+// --- The memory-model decision (BACKEND-ROCM, issue #2511) -------------------
+//
+// Which allocator `RocmBackend::Alloc` uses, and whether the backend may claim
+// its allocations are host-addressable. It lives HERE, beside
+// `CapabilityFromGcnArch`, for the reason the header comment above already
+// gives: it is a DECISION, not an API call, and a wrong answer breaks silently
+// rather than throwing. Keeping it HIP-free means the whole policy table is
+// unit-tested in the ordinary CPU build (tests/vt/test_rocm_arch.cpp) on a
+// machine with no AMD GPU, while `rocm_backend.hip` stays glue that reads four
+// attributes and calls this.
+
+// The four probed device attributes this decision reads, and nothing else.
+// Named rather than passed as four bools so a caller cannot transpose two.
+struct RocmMemoryAttributes {
+  bool integrated = false;
+  bool managed_memory = false;
+  bool concurrent_managed_access = false;
+  // hipDeviceAttributePageableMemoryAccess. THE attribute #2511 turns on: a
+  // device reporting 0 cannot take a RECOVERABLE page fault, so a migratable
+  // managed page that the driver moves out from under a live queue is a hard
+  // memory violation rather than a fault-and-retry.
+  bool pageable_memory_access = false;
+};
+
+// `VT_ROCM_MANAGED_ALLOC`. Tri-state because a two-state knob cannot express
+// the pre-fix arm once the default moves, and a single-binary interleaved A/B
+// is the only shape that measures anything on a board that GPU-resets between
+// legs (.agents/specs/rocm-gfx1151-q4k-hang.md, W9/W10).
+enum class RocmManagedAllocOverride {
+  kUnset = 0,   // the narrowed default: managed only where the part can fault and recover
+  kForceOff,    // never managed, on any device
+  kForceOn,     // managed wherever the ATTRIBUTES allow it: the pre-#2511 behaviour
+};
+
+// Parses the environment value; `nullptr` and every unrecognised string mean
+// kUnset, so a typo takes the shipped default rather than a surprising arm.
+constexpr RocmManagedAllocOverride ParseManagedAllocOverride(std::string_view v) {
+  if (v == "0") return RocmManagedAllocOverride::kForceOff;
+  if (v == "1") return RocmManagedAllocOverride::kForceOn;
+  return RocmManagedAllocOverride::kUnset;
+}
+
+// What the registrar needs, resolved in one place so the allocator and the
+// capability claim cannot drift apart.
+struct RocmMemoryPolicy {
+  // Take the hipMallocManaged branch in Backend::Alloc.
+  bool managed_alloc = false;
+  // UnifiedMemory() AND DeviceMemoryIsHostAddressable(). Written OVER
+  // `managed_alloc`, never over the managed CAPABILITY: the sentence the
+  // capability makes is "every block Alloc handed out is host-addressable",
+  // and reading it off a branch the allocator did not take is exactly how the
+  // two answers could disagree.
+  bool unified_memory = false;
+  // Non-null only when the managed branch was WITHHELD from a device that has
+  // the managed attributes, which is the one case where a false
+  // host-addressability answer is a deliberate narrowing rather than a
+  // discrete card's ordinary state. `Backend::HostAddressabilityNote()`
+  // returns it and the reference tier's refusal path quotes it, so a reader
+  // who loses a CPU fallback learns why at the point of failure.
+  const char* host_addressability_note = nullptr;
+};
+
+// The note text, exported so a test can assert the exact string rather than a
+// substring it chose itself.
+inline constexpr const char* kRocmManagedWithheldNote =
+    "this ROCm device reports hipDeviceAttributePageableMemoryAccess = 0, so it "
+    "cannot take a recoverable page fault; vllm.cpp therefore allocates with "
+    "hipMalloc instead of hipMallocManaged and makes no host-addressability "
+    "claim (issue #2511, which measured 17 GPU faults in 21 legs on the managed "
+    "branch and 0 in 21 without it). Set VT_ROCM_MANAGED_ALLOC=1 to restore the "
+    "previous managed behaviour, at that risk";
+
+constexpr RocmMemoryPolicy ResolveMemoryPolicy(const RocmMemoryAttributes& a,
+                                               RocmManagedAllocOverride ov) {
+  RocmMemoryPolicy p;
+  // The managed API contract needs all three attributes. The override cannot
+  // conjure a capability, so a discrete card (Integrated = 0) keeps the branch
+  // provably dead whatever the environment says.
+  const bool managed_capable =
+      a.integrated && a.managed_memory && a.concurrent_managed_access;
+  if (managed_capable) {
+    switch (ov) {
+      case RocmManagedAllocOverride::kForceOff:
+        p.managed_alloc = false;
+        break;
+      case RocmManagedAllocOverride::kForceOn:
+        p.managed_alloc = true;
+        break;
+      case RocmManagedAllocOverride::kUnset:
+        // THE #2511 NARROWING. Managed memory is migratable, and migration
+        // under a live queue is only survivable where the device can fault and
+        // recover. gfx1151 and gfx1103 report this 0.
+        p.managed_alloc = a.pageable_memory_access;
+        break;
+    }
+  }
+  // Two independent grounds, both API-anchored: the hipMallocManaged contract,
+  // or the W0 CUDA-shaped conjunction (cuda_backend.cu). Under kUnset the first
+  // now IMPLIES the second, so the unified claim collapses to exactly the W0
+  // conjunction and the managed branch no longer widens it at all.
+  p.unified_memory = p.managed_alloc || (a.pageable_memory_access && a.integrated);
+  if (managed_capable && !p.managed_alloc && !p.unified_memory) {
+    p.host_addressability_note = kRocmManagedWithheldNote;
+  }
+  return p;
+}
+
 }  // namespace vt::rocm

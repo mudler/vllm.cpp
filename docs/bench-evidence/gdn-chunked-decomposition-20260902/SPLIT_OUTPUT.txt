@@ -1,0 +1,53 @@
+==============================================================================
+A. T=6, the 27B continuity case's shape. max|d| of a SPLIT prefill
+   against the SAME tokens prefilled in one call.
+==============================================================================
+       split arm              out max|d|   state max|d|
+      [3, 3] sequential     0.000000e+00   0.000000e+00
+      [3, 3] chunk_up       6.103516e-05   1.694679e-03
+      [3, 3] chunk_f32      3.725290e-09   2.980232e-08
+   [2, 2, 2] sequential     0.000000e+00   0.000000e+00
+   [2, 2, 2] chunk_up       6.103516e-05   1.700044e-03
+   [2, 2, 2] chunk_f32      2.793968e-09   4.470348e-08
+
+  READ: `sequential` is EXACTLY 0 -- that is the property the 1e-4
+  bar encoded. `chunk_f32` is ~1e-8, so the chunked REASSOCIATION is
+  continuous. `chunk_up` is ~2e-3, and it differs from chunk_f32 only
+  in where the bf16 rounding falls. The bf16 PLACEMENT is the cause,
+  and it is the half that cannot be dropped without dropping the mirror.
+
+==============================================================================
+B. upstream's own TWO_CALL_SPLITS (test_cpu_gdn_ops.py:332-336), scored
+   as a FRACTION of upstream's own assert_close bound (1.0 == its bar).
+==============================================================================
+
+  upstream's own gating (g ~ -0.7..-11/token)
+     total/split arm            out ratio  state ratio
+          128/64 chunk_up         0.00000      0.00000
+          145/64 chunk_up         0.00000      0.00000
+          145/73 chunk_up         0.00038      0.00000
+         273/128 chunk_up         0.00000      0.00000
+          192/65 chunk_up         0.00076      0.00000
+    worst state ratio, sequential   =  0.00000  (meets upstream's own bar)
+    worst state ratio, chunk_up     =  0.00000  (meets upstream's own bar)
+    worst state ratio, chunk_f32    =  0.00002  (meets upstream's own bar)
+
+  this suite's g ~ U(-0.5, 0)
+     total/split arm            out ratio  state ratio
+          128/64 chunk_up         0.00000      0.00000
+          145/64 chunk_up         0.00000      0.00000
+          145/73 chunk_up         0.01193      1.77049
+         273/128 chunk_up         0.00000      0.00000
+          192/65 chunk_up         0.01187      0.00420
+    worst state ratio, sequential   =  0.00000  (meets upstream's own bar)
+    worst state ratio, chunk_up     =  1.77049  (EXCEEDS upstream's own bar)
+    worst state ratio, chunk_f32    =  0.00009  (meets upstream's own bar)
+
+  READ: on upstream's own gating the state is decayed to nothing
+  inside a chunk, so every arm reads ~0 and the split cannot matter --
+  which is the workload upstream's 1e-3 was set on. On the gentler
+  decay this suite uses, UPSTREAM'S OWN PLACEMENT exceeds upstream's
+  own bound while `sequential` and `chunk_f32` stay at 0. So the bar
+  does not transfer across the workload, and the port is not what
+  fails to meet it. That is why tests/vt/test_ops_gdn.cpp derives its
+  own state bar instead of carrying 1e-3 over unchanged.

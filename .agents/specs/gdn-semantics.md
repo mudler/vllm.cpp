@@ -249,7 +249,85 @@ dtype. There is NO torch-native reference implementation of the chunked path
 at this pin (all five sub-ops are Triton-only); the sequential Triton kernel
 `fused_recurrent_gated_delta_rule` (same file family, accepts f32) is the
 pinned sequential statement of the same recurrence and is what the M0.7 C++
-implements directly.
+implemented directly.
+
+**UPDATED 2026-09-03, `KERNEL-GDN-CHUNKED-MIRROR`
+([#2612](https://github.com/mudler/vllm.cpp/issues/2612),
+[gdn-chunked-mirror.md](gdn-chunked-mirror.md)). Two of the sentences above have
+stopped being true, and the third has a second half.**
+
+1. **"The chunked oracle" is no longer only an oracle: it is what we run.** The
+   chunked decomposition is the DEFAULT GDN prefill on CUDA, Tenstorrent and now
+   CPU, selected by one shared predicate, `vt::GdnUseChunkedPrefill`. The
+   sequential recurrence is the arm behind `VT_GDN_CHUNKED=0` and on f32, and it
+   is porting-inventory §9 exception 19.
+
+2. **There IS now an upstream non-Triton reference for the chunked path**, added
+   after this section was written: `chunk_gated_delta_rule_cpu`, a C++ CPU
+   kernel at `csrc/cpu/sgl-kernels/fla.cpp:2178` (the intra kernel at :1021, the
+   inter kernel at :1263), reached from
+   `vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py:247,629,705` via
+   `_custom_ops.py:3571`. It is a SECOND upstream implementation of the same
+   decomposition, not a replacement for the Triton one, and it type-checks bf16
+   only (:2205-2207) exactly as `chunk.py:213-215` asserts.
+
+3. **The dtype placement, which this section carried none of.** Upstream
+   accumulates f32 and STORES bf16 at nine sites; that placement, not the
+   reassociation, is the whole of the chunked path's distance from the exact
+   recurrence (the reassociation alone reproduces it to `2.428613e-17` at f64).
+   Per chunk of `BT = 64`:
+
+       G      = inclusive cumsum of g within the chunk            f32   cumsum.py
+       A[i,j] = beta_i (k_i.k_j) exp(G_i-G_j), j<i                f32   chunk_scaled_dot_kkt.py:86-116,161
+       Ai     = (I + A)^-1        f32 substitution, STORED        BF16  solve_tril.py:77-89 + chunk.py:50
+       u      = Ai @ bf16(beta v)          f32 acc, STORED        BF16  wy_fast.py:92-94
+       w      = Ai @ bf16(beta exp(G) k)   f32 acc, STORED        BF16  wy_fast.py:114-116
+       h_c    = the chunk-start state snapshot        STORED      BF16  chunk_delta_h.py:352
+       v_new  = u - w @ bf16(H)^T          f32 acc, STORED        BF16  chunk_delta_h.py:178,206
+       vdec   = bf16(v_new exp(G_last-G))                         BF16  chunk_delta_h.py:274
+       H      = H exp(G_last) + vdec^T k              H in        F32   chunk_delta_h.py:208-302
+       o      = exp(G)(q.h_c)*scale + (bf16(A_o) @ v_new)*scale   BF16  chunk_o.py:111-138
+       final_state                                                F32   chunk_delta_h.py:353-355
+
+   Two rounding sites are easy to miss and both are load bearing.
+   `chunk_o.py:137` is `b_o * scale + tl.dot(...) * scale`, two separate f32
+   multiplies rather than one factored out, and the two are not the same in f32.
+   `chunk_delta_h.py:178` casts the f32 register state down to bf16 AS AN
+   OPERAND -- the state is f32 and the product that reads it is not. `A` and
+   `final_state` stay f32, and the `K K^T` dot keeps ieee f32 operands
+   (`chunk_scaled_dot_kkt.py:103`); a TF32 variant was measured FURTHER from the
+   real kernel (`1.2207e-04` against `6.1035e-05`).
+
+   **Upstream's CPU kernel confirms the dtype FAMILY and differs in three
+   secondary sites.** `attn` f32, the triangular inverse bf16, `w`/`u` bf16 and
+   state f32 are all the same (`fla.cpp:1057-1061`, `:2213-2214`). It pre-scales
+   `q` into bf16 (`query.mul(scale)`, `:2231`) rather than applying `scale` at
+   the end; it folds the decay into `k` rather than `v_new` (`:1519`); and its
+   `solve_tril` rounds every row rather than once at the store (`:524`). Our CPU
+   port follows TRITON at all three, because the only oracle dump this tree owns
+   is a Triton dump. Measured against it (max|d| out / state): Triton placement
+   `6.103516e-05` / `5.059987e-04`; pre-scaled q `2.441406e-04` / `5.059987e-04`;
+   decay-on-k `6.103516e-05` / `1.281053e-03`; row-wise solve `6.103516e-05` /
+   `5.059987e-04`, i.e. INERT on this golden; and the CPU kernel's bf16 `attn2`
+   buffer `6.103516e-05` / `8.501429e-04`. The gate bar is `1.5e-04` / `1.5e-03`,
+   so the pre-scale difference alone decides it. (An earlier version of this
+   list credited `8.501429e-04` to the row-wise solve; that variant had bundled
+   the bf16 `attn2` buffer in with it, and the two are separated above.)
+
+   **Say which upstream this mirrors.** The CPU arm mirrors vLLM's **Triton**
+   kernel — what vLLM runs on a GPU. A `vllm --device cpu` run executes
+   `chunk_gated_delta_rule_cpu`, so a CPU-vs-CPU oracle comparison would show
+   our CPU arm about `2.44e-04` from vLLM-on-CPU rather than agreeing with it.
+
+   **The q pre-scale is not the CPU kernel's production behaviour either.**
+   `fla.cpp:2231`'s `query.mul(scale)` is the `use_qk_l2norm_in_kernel == false`
+   branch; on the true branch — production, and what upstream's own CPU test
+   uses — `l2norm_fwd` applies the same `Dk^-0.5` in-kernel and stores bf16
+   once. Upstream rounds `q` once either way, and our seam already spent that
+   rounding before `GdnPrefill` (`dql2` is bf16 and L2-normalised; `scale`
+   travels in `GdnArgs`). Applying it again would be a double rounding no
+   upstream implementation performs, so Triton is right here structurally and
+   the measurement only confirms it.
 
 **Decode**: the default `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`
 (`envs.py:117,1123-1125`) selects

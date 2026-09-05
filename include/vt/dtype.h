@@ -74,6 +74,23 @@ namespace vt {
 // 1412 tensors only TWO are Q2_K, while 82 are IQ2_XS and 3 are IQ4_XS, so the
 // loader stopped on `blk.3.ffn_gate_exps.weight` (#2240).
 //
+// kIQ3_S (ggml id 21, 3.4375 bpw) is the one hole that was left in the reader's
+// i-quant run, and it locked out the `unsloth` "UD" dynamic-quant family:
+// `Qwen3.8-27B-UD-Q4_K_M.gguf` stores 4 of its 866 tensors in it and
+// `UD-Q4_K_XL` stores 1 of 866, while every OTHER encoding in those files was
+// already handled, so `GgufFile::Open` refused 16.4 GB of loadable weights over
+// 146 MiB of them (#2510). It is NOT a variant of kIQ3_XXS: it reads the
+// 512-entry `iq3s_grid` against IQ3_XXS's 256-entry `iq3xxs_grid` (both u32,
+// both read four bytes at a time, so the wrong one still decodes), it splices
+// the ninth index bit out of `qh`, and it carries DIRECT sign bytes like IQ2_S
+// rather than IQ3_XXS's packed `ksigns_iq2xs` selector. It is the one FILE
+// encoding in this tree that DECODES and does not DOT: `HasQuantDotKernel` is
+// FALSE, so the loader expands it to bf16 on the GEMM arm and keeps it
+// compressed only on the gather. The `vec_dot` is owed together with the CUDA
+// `WType` arm, because landing the CPU half alone would send every CUDA IQ3_S
+// GEMM down `IsCudaKeepQuantSupported`'s host fallback. See
+// `.agents/specs/gguf-iq3s.md`.
+//
 // IQ2_XS is the middle member of the IQ2 family and shares neither table nor
 // sign convention with its siblings: its 9-bit index addresses a 512-entry
 // `iq2xs_grid` (against 256 for IQ2_XXS and 1024 for IQ2_S) and the 7-bit
@@ -118,6 +135,7 @@ enum class DType : uint8_t {
   kMXFP4,
   kIQ2_XS,
   kIQ4_XS,
+  kIQ3_S,
 };
 
 const char* Name(DType dtype);
@@ -174,6 +192,7 @@ inline size_t SizeOf(DType dtype) {
     case DType::kMXFP4:
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
+    case DType::kIQ3_S:
       ThrowBlockQuantHasNoElementSize(dtype);
   }
   ThrowUnknownDType();

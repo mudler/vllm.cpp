@@ -1,0 +1,523 @@
+
+===== 0. worker identity and contention state =====
+2026-09-02T22:52:51Z
+hostname=rc-worker-lcjhd
+Linux rc-worker-lcjhd 6.14.0-36-generic #36~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Oct 15 15:45:17 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+host_arch=x86_64
+nproc=32
+RC_JOB_ID=ff18a029-cd10-42d1-a5f7-9129c1c8af09 RC_DEVICE=strix:gpu0
+boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+HSA_ENABLE_SDMA is deliberately NOT set on any leg of this job (retired, #2511)
+inherited_env NONE
+               total        used        free      shared  buff/cache   available
+Mem:              62           3           2           0          57          58
+Swap:             15           0          15
+Filesystem             Size  Used Avail Use% Mounted on
+overlay                1.9T  561G  1.2T  32% /
+//192.168.68.102/Data  7.3T  6.0T  1.3T  83% /workspace
+
+===== 1. the artifact, verified ON the worker =====
+2026-09-02T22:52:51Z
+gguf_path=/tmp/rocm-strix-q4k/models/Qwen3.8-27B-Q4_K_M.gguf
+gguf_bytes=17106775008  expected=17106775008
+gguf_sha256=7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169
+gguf_sha256_expected=7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169
+ARTIFACT_OK
+
+===== 2. the container image =====
+2026-09-02T22:53:01Z
+image_present=YES
+
+===== 3. the pinned llama.cpp SOURCE identity, as content and not as framing =====
+2026-09-02T22:53:01Z
+llamacpp_source=ALREADY STAGED
+llama_pin=10bf611e533d81f739128304991c5e133c6aebd8 label=b10451
+10bf611e533d81f739128304991c5e133c6aebd8 b10451
+llama_src_files=3425  expected=3425
+llama_src_manifest_collation=LC_ALL=C (locale-independent by construction)
+llama_src_manifest_sha256=56c26d15c2acf11b8621ac26663b4316dc29719d765ba1d95231ffacaddf3cda
+llama_src_manifest_expected=56c26d15c2acf11b8621ac26663b4316dc29719d765ba1d95231ffacaddf3cda
+SOURCE_OK
+
+===== 4. build llama-bench and llama-cli for gfx1151, or prove them present =====
+2026-09-02T22:53:01Z
+llamacpp_build=ALREADY PRESENT
+llama_bench e2acbe26f4ef214ca5b3658a1062929242345a1205f9a13d6af841bfa6c3f2c1  /tmp/rocm-strix-q4k/build-llamacpp/bin/llama-bench
+llama_cli d563d9877adb49b4ae2c0a6c23e4019548ffc0c7e2d3a7c4339af3f636646a55  /tmp/rocm-strix-q4k/build-llamacpp/bin/llama-cli
+== every libllama/libggml shared object this run links ==
+1de779ff5e8c3d29f73e0ff37775c36eb1ec69f8fce438419bac07c330a800f6  /tmp/rocm-strix-q4k/build-llamacpp/bin/libggml-base.so.0.20.0
+7c44f77abf43c71f3e3cb0ac888a370d032b10084f9cb34e0c6f1c9d747aa910  /tmp/rocm-strix-q4k/build-llamacpp/bin/libggml-cpu.so.0.20.0
+778a512b1a764c4288b5e2d86597bb541cc54d6393ce9d95efaece2c1a238050  /tmp/rocm-strix-q4k/build-llamacpp/bin/libggml-hip.so.0.20.0
+9a04df51f6083d536355b8318615679171f1025a1aef6c6e72c1f0999df4e132  /tmp/rocm-strix-q4k/build-llamacpp/bin/libggml.so.0.20.0
+c4b3e80215904fbe833a8ede82cd9357732088f36a2c4b29e27ebdfa8451ae56  /tmp/rocm-strix-q4k/build-llamacpp/bin/libllama.so.0.1.0
+llama_src_manifest_after_build=56c26d15c2acf11b8621ac26663b4316dc29719d765ba1d95231ffacaddf3cda
+LD_LIBRARY_PATH=/tmp/rocm-strix-q4k/build-llamacpp/bin:/tmp/rocm-strix-q4k/build-llamacpp/lib:/opt/rocm/lib
+
+===== 5. the oracle STARTS, and sees the GPU =====
+2026-09-02T22:53:02Z
+llama-bench -h rc=0
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 65536 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 65536 MiB
+usage: /tmp/rocm-strix-q4k/build-llamacpp/bin/llama-bench [options]
+llama_cli_version version: 0.1.0-dev (build 0, commit unknown)
+built with GNU 13.3.0 for Linux x86_64
+llama-bench --list-devices rc=0
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 65536 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 65536 MiB
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61351304
+Available devices:
+  ROCm0: Radeon 8060S Graphics (65536 MiB, 59913 MiB free)
+
+===== 6. system_info, from the oracle itself =====
+2026-09-02T22:53:15Z
+llama-cli system_info leg rc=124 (a timeout here is EXPECTED: the TUI does not exit)
+system_info_err_bytes=348370
+-- system_info line --
+0.00.018.703 I cmn  common_param: system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+-- the buffer types the tensors actually landed in (this is use_extra_bufts, observed) --
+0.00.247.681 I load_tensors: loading model tensors, this can take a while... (load_mode = none)
+0.00.247.807 D load_tensors: layer   0 assigned to device ROCm0, is_swa = 0
+0.00.247.807 D load_tensors: layer   1 assigned to device ROCm0, is_swa = 0
+0.00.247.808 D load_tensors: layer   2 assigned to device ROCm0, is_swa = 0
+0.00.247.808 D load_tensors: layer   3 assigned to device ROCm0, is_swa = 0
+0.00.247.808 D load_tensors: layer   4 assigned to device ROCm0, is_swa = 0
+0.00.247.808 D load_tensors: layer   5 assigned to device ROCm0, is_swa = 0
+0.00.247.808 D load_tensors: layer   6 assigned to device ROCm0, is_swa = 0
+0.00.247.809 D load_tensors: layer   7 assigned to device ROCm0, is_swa = 0
+0.00.247.809 D load_tensors: layer   8 assigned to device ROCm0, is_swa = 0
+0.00.247.809 D load_tensors: layer   9 assigned to device ROCm0, is_swa = 0
+0.00.247.809 D load_tensors: layer  10 assigned to device ROCm0, is_swa = 0
+0.00.247.809 D load_tensors: layer  11 assigned to device ROCm0, is_swa = 0
+0.00.247.810 D load_tensors: layer  12 assigned to device ROCm0, is_swa = 0
+0.00.247.810 D load_tensors: layer  13 assigned to device ROCm0, is_swa = 0
+0.00.247.810 D load_tensors: layer  14 assigned to device ROCm0, is_swa = 0
+0.00.247.810 D load_tensors: layer  15 assigned to device ROCm0, is_swa = 0
+0.00.247.810 D load_tensors: layer  16 assigned to device ROCm0, is_swa = 0
+0.00.247.810 D load_tensors: layer  17 assigned to device ROCm0, is_swa = 0
+0.00.247.811 D load_tensors: layer  18 assigned to device ROCm0, is_swa = 0
+-- what the oracle declined to load (the blk.64 / MTP question) --
+0.00.069.604 I llama_model_loader: loaded meta data with 51 key-value pairs and 866 tensors from /tmp/rocm-strix-q4k/models/Qwen3.8-27B-Q4_K_M.gguf (version GGUF V3 (latest))
+0.00.069.675 I llama_model_loader: - kv  28:                qwen35.nextn_predict_layers u32              = 1
+0.00.100.681 I llama_model_loader: - type  f32:  456 tensors
+0.00.100.681 I llama_model_loader: - type q8_0:    1 tensors
+0.00.100.682 I llama_model_loader: - type q4_K:  294 tensors
+0.00.100.682 I llama_model_loader: - type q5_K:   48 tensors
+0.00.100.682 I llama_model_loader: - type q6_K:   67 tensors
+0.00.177.095 I load: 0 unused tokens
+0.00.247.626 I print_info: n_layer               = 64
+0.00.247.626 I print_info: n_layer_all           = 65
+0.00.247.681 I load_tensors: loading model tensors, this can take a while... (load_mode = none)
+0.00.247.807 D load_tensors: layer   0 assigned to device ROCm0, is_swa = 0
+
+===== 7. the measured legs: 6 legs, -ngl 99, n_gen 64, -r 3 each =====
+2026-09-02T22:58:20Z
+design: LEGS=6 REPS=3 NGEN=64 NGL=99
+one leg = one llama-bench process = one model load + its own warmup + 3 timed generations
+--- leg 1 of 6 (order index 1) ---
+leg1 rc=0 clock_samples=102 finished_utc=2026-09-02T22:58:45Z
+leg1 "n_threads": 16
+leg1 "n_gpu_layers": 99
+leg1 "n_gen": 64
+leg1 "avg_ts": 12.217631
+leg1 "stddev_ts": 0.006468
+--- leg 2 of 6 (order index 2) ---
+leg2 rc=0 clock_samples=97 finished_utc=2026-09-02T22:59:10Z
+leg2 "n_threads": 16
+leg2 "n_gpu_layers": 99
+leg2 "n_gen": 64
+leg2 "avg_ts": 12.243689
+leg2 "stddev_ts": 0.065205
+--- leg 3 of 6 (order index 3) ---
+leg3 rc=0 clock_samples=96 finished_utc=2026-09-02T22:59:34Z
+leg3 "n_threads": 16
+leg3 "n_gpu_layers": 99
+leg3 "n_gen": 64
+leg3 "avg_ts": 12.242348
+leg3 "stddev_ts": 0.055772
+--- leg 4 of 6 (order index 4) ---
+leg4 rc=0 clock_samples=110 finished_utc=2026-09-02T23:00:02Z
+leg4 "n_threads": 16
+leg4 "n_gpu_layers": 99
+leg4 "n_gen": 64
+leg4 "avg_ts": 12.254731
+leg4 "stddev_ts": 0.072958
+--- leg 5 of 6 (order index 5) ---
+leg5 rc=0 clock_samples=98 finished_utc=2026-09-02T23:00:27Z
+leg5 "n_threads": 16
+leg5 "n_gpu_layers": 99
+leg5 "n_gen": 64
+leg5 "avg_ts": 12.224141
+leg5 "stddev_ts": 0.031676
+--- leg 6 of 6 (order index 6) ---
+leg6 rc=0 clock_samples=97 finished_utc=2026-09-02T23:00:52Z
+leg6 "n_threads": 16
+leg6 "n_gpu_layers": 99
+leg6 "n_gen": 64
+leg6 "avg_ts": 12.223897
+leg6 "stddev_ts": 0.073902
+
+===== 8. fold, with N taken from the design =====
+2026-09-02T23:00:52Z
+{
+  "clock_attribution": "AD-HOC. Every clock figure below comes from the carried sysfs sampler, not from the committed helper (#2381).",
+  "denominator": {
+    "leg_count": 6,
+    "max_tok_s": 12.255,
+    "mean_tok_s": 12.234,
+    "median_tok_s": 12.233,
+    "min_tok_s": 12.218,
+    "population": "one avg_ts per leg, 6 legs, each the mean of that leg's own repetitions",
+    "repetition_count": 18,
+    "repetition_max_tok_s": 12.333,
+    "repetition_median_tok_s": 12.223,
+    "repetition_min_tok_s": 12.151,
+    "spread_pct_of_median": 0.303
+  },
+  "legs": [
+    {
+      "avg_ts": 12.217631,
+      "backends": "ROCm",
+      "build_commit": "unknown",
+      "build_number": 0,
+      "clock": {
+        "boot_ids": [
+          "a5bc8128-f6ad-4767-8614-6923f88032e1"
+        ],
+        "compute_window": {
+          "samples": 56,
+          "sclk_mhz": {
+            "max": 2799,
+            "mean": 2668.7,
+            "median": 2662.0,
+            "min": 2578,
+            "spread_pct": 8.3
+          },
+          "window": "gpu_busy_percent >= 90"
+        },
+        "instrument": "AD-HOC /sys/class/drm sampler carried beside the job; NOT tools/bench/gpu_clock_state.py, which reads NVIDIA fields and does not run on this board (#2381 owns the in-tree gap)",
+        "interval_s": 0.25,
+        "whole_window": {
+          "samples": 102,
+          "sclk_mhz": {
+            "max": 2799,
+            "mean": 2064.0,
+            "median": 2619.5,
+            "min": 600,
+            "spread_pct": 83.9
+          },
+          "window": "whole leg, including the 17 GiB model load"
+        }
+      },
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "flash_attn": -1,
+      "gpu_info": "Radeon 8060S Graphics",
+      "leg": 1,
+      "model_size": 17095778304,
+      "model_type": "qwen35 27B Q4_K - Medium",
+      "n_gen": 64,
+      "n_gpu_layers": 99,
+      "n_prompt": 0,
+      "n_threads": 16,
+      "order": 1,
+      "rc": 0,
+      "samples_ts": [
+        12.2243,
+        12.2171,
+        12.2114
+      ],
+      "stddev_ts": 0.006468,
+      "type_k": "f16",
+      "type_v": "f16"
+    },
+    {
+      "avg_ts": 12.243689,
+      "backends": "ROCm",
+      "build_commit": "unknown",
+      "build_number": 0,
+      "clock": {
+        "boot_ids": [
+          "a5bc8128-f6ad-4767-8614-6923f88032e1"
+        ],
+        "compute_window": {
+          "samples": 56,
+          "sclk_mhz": {
+            "max": 2835,
+            "mean": 2663.6,
+            "median": 2635.5,
+            "min": 2565,
+            "spread_pct": 10.2
+          },
+          "window": "gpu_busy_percent >= 90"
+        },
+        "instrument": "AD-HOC /sys/class/drm sampler carried beside the job; NOT tools/bench/gpu_clock_state.py, which reads NVIDIA fields and does not run on this board (#2381 owns the in-tree gap)",
+        "interval_s": 0.25,
+        "whole_window": {
+          "samples": 97,
+          "sclk_mhz": {
+            "max": 2835,
+            "mean": 2089.5,
+            "median": 2614,
+            "min": 602,
+            "spread_pct": 85.4
+          },
+          "window": "whole leg, including the 17 GiB model load"
+        }
+      },
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "flash_attn": -1,
+      "gpu_info": "Radeon 8060S Graphics",
+      "leg": 2,
+      "model_size": 17095778304,
+      "model_type": "qwen35 27B Q4_K - Medium",
+      "n_gen": 64,
+      "n_gpu_layers": 99,
+      "n_prompt": 0,
+      "n_threads": 16,
+      "order": 2,
+      "rc": 0,
+      "samples_ts": [
+        12.319,
+        12.2055,
+        12.2066
+      ],
+      "stddev_ts": 0.065205,
+      "type_k": "f16",
+      "type_v": "f16"
+    },
+    {
+      "avg_ts": 12.242348,
+      "backends": "ROCm",
+      "build_commit": "unknown",
+      "build_number": 0,
+      "clock": {
+        "boot_ids": [
+          "a5bc8128-f6ad-4767-8614-6923f88032e1"
+        ],
+        "compute_window": {
+          "samples": 56,
+          "sclk_mhz": {
+            "max": 2827,
+            "mean": 2670.2,
+            "median": 2644.0,
+            "min": 2584,
+            "spread_pct": 9.2
+          },
+          "window": "gpu_busy_percent >= 90"
+        },
+        "instrument": "AD-HOC /sys/class/drm sampler carried beside the job; NOT tools/bench/gpu_clock_state.py, which reads NVIDIA fields and does not run on this board (#2381 owns the in-tree gap)",
+        "interval_s": 0.25,
+        "whole_window": {
+          "samples": 96,
+          "sclk_mhz": {
+            "max": 2827,
+            "mean": 2118.7,
+            "median": 2629.5,
+            "min": 604,
+            "spread_pct": 84.5
+          },
+          "window": "whole leg, including the 17 GiB model load"
+        }
+      },
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "flash_attn": -1,
+      "gpu_info": "Radeon 8060S Graphics",
+      "leg": 3,
+      "model_size": 17095778304,
+      "model_type": "qwen35 27B Q4_K - Medium",
+      "n_gen": 64,
+      "n_gpu_layers": 99,
+      "n_prompt": 0,
+      "n_threads": 16,
+      "order": 3,
+      "rc": 0,
+      "samples_ts": [
+        12.3017,
+        12.191,
+        12.2344
+      ],
+      "stddev_ts": 0.055772,
+      "type_k": "f16",
+      "type_v": "f16"
+    },
+    {
+      "avg_ts": 12.254731,
+      "backends": "ROCm",
+      "build_commit": "unknown",
+      "build_number": 0,
+      "clock": {
+        "boot_ids": [
+          "a5bc8128-f6ad-4767-8614-6923f88032e1"
+        ],
+        "compute_window": {
+          "samples": 56,
+          "sclk_mhz": {
+            "max": 2849,
+            "mean": 2672.2,
+            "median": 2647.0,
+            "min": 2559,
+            "spread_pct": 11.0
+          },
+          "window": "gpu_busy_percent >= 90"
+        },
+        "instrument": "AD-HOC /sys/class/drm sampler carried beside the job; NOT tools/bench/gpu_clock_state.py, which reads NVIDIA fields and does not run on this board (#2381 owns the in-tree gap)",
+        "interval_s": 0.25,
+        "whole_window": {
+          "samples": 110,
+          "sclk_mhz": {
+            "max": 2849,
+            "mean": 1928.0,
+            "median": 2594.0,
+            "min": 600,
+            "spread_pct": 86.7
+          },
+          "window": "whole leg, including the 17 GiB model load"
+        }
+      },
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "flash_attn": -1,
+      "gpu_info": "Radeon 8060S Graphics",
+      "leg": 4,
+      "model_size": 17095778304,
+      "model_type": "qwen35 27B Q4_K - Medium",
+      "n_gen": 64,
+      "n_gpu_layers": 99,
+      "n_prompt": 0,
+      "n_threads": 16,
+      "order": 4,
+      "rc": 0,
+      "samples_ts": [
+        12.3334,
+        12.1893,
+        12.2415
+      ],
+      "stddev_ts": 0.072958,
+      "type_k": "f16",
+      "type_v": "f16"
+    },
+    {
+      "avg_ts": 12.224141,
+      "backends": "ROCm",
+      "build_commit": "unknown",
+      "build_number": 0,
+      "clock": {
+        "boot_ids": [
+          "a5bc8128-f6ad-4767-8614-6923f88032e1"
+        ],
+        "compute_window": {
+          "samples": 56,
+          "sclk_mhz": {
+            "max": 2797,
+            "mean": 2659.8,
+            "median": 2642.5,
+            "min": 2571,
+            "spread_pct": 8.6
+          },
+          "window": "gpu_busy_percent >= 90"
+        },
+        "instrument": "AD-HOC /sys/class/drm sampler carried beside the job; NOT tools/bench/gpu_clock_state.py, which reads NVIDIA fields and does not run on this board (#2381 owns the in-tree gap)",
+        "interval_s": 0.25,
+        "whole_window": {
+          "samples": 98,
+          "sclk_mhz": {
+            "max": 2797,
+            "mean": 2075.9,
+            "median": 2628.0,
+            "min": 602,
+            "spread_pct": 83.5
+          },
+          "window": "whole leg, including the 17 GiB model load"
+        }
+      },
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "flash_attn": -1,
+      "gpu_info": "Radeon 8060S Graphics",
+      "leg": 5,
+      "model_size": 17095778304,
+      "model_type": "qwen35 27B Q4_K - Medium",
+      "n_gen": 64,
+      "n_gpu_layers": 99,
+      "n_prompt": 0,
+      "n_threads": 16,
+      "order": 5,
+      "rc": 0,
+      "samples_ts": [
+        12.2457,
+        12.2389,
+        12.1878
+      ],
+      "stddev_ts": 0.031676,
+      "type_k": "f16",
+      "type_v": "f16"
+    },
+    {
+      "avg_ts": 12.223897,
+      "backends": "ROCm",
+      "build_commit": "unknown",
+      "build_number": 0,
+      "clock": {
+        "boot_ids": [
+          "a5bc8128-f6ad-4767-8614-6923f88032e1"
+        ],
+        "compute_window": {
+          "samples": 56,
+          "sclk_mhz": {
+            "max": 2815,
+            "mean": 2656.7,
+            "median": 2635.5,
+            "min": 2561,
+            "spread_pct": 9.6
+          },
+          "window": "gpu_busy_percent >= 90"
+        },
+        "instrument": "AD-HOC /sys/class/drm sampler carried beside the job; NOT tools/bench/gpu_clock_state.py, which reads NVIDIA fields and does not run on this board (#2381 owns the in-tree gap)",
+        "interval_s": 0.25,
+        "whole_window": {
+          "samples": 97,
+          "sclk_mhz": {
+            "max": 2815,
+            "mean": 2081.0,
+            "median": 2616,
+            "min": 602,
+            "spread_pct": 84.6
+          },
+          "window": "whole leg, including the 17 GiB model load"
+        }
+      },
+      "cpu_info": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "flash_attn": -1,
+      "gpu_info": "Radeon 8060S Graphics",
+      "leg": 6,
+      "model_size": 17095778304,
+      "model_type": "qwen35 27B Q4_K - Medium",
+      "n_gen": 64,
+      "n_gpu_layers": 99,
+      "n_prompt": 0,
+      "n_threads": 16,
+      "order": 6,
+      "rc": 0,
+      "samples_ts": [
+        12.2989,
+        12.1512,
+        12.2216
+      ],
+      "stddev_ts": 0.073902,
+      "type_k": "f16",
+      "type_v": "f16"
+    }
+  ],
+  "legs_by_design": 6,
+  "legs_folded": 6,
+  "reasons": [],
+  "status": "MEASURED",
+  "what_this_is": "llama.cpp b10451 decode on gfx1151, ONE engine. A denominator, measured alone.",
+  "what_this_is_not": "It is not a comparison. No vllm.cpp figure was produced by this run and no ratio is computed here: that arm's declared token gate reads FAIL at 3 of 6 (docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-v2-20260902.md) and AGENTS.md Gates admits no performance result from it."
+}
+fold_rc=0
+
+===== 9. what this job did NOT do =====
+2026-09-02T23:00:53Z
+vllmcpp_binaries_built=0
+vllmcpp_legs_run=0
+ratios_computed=0
+reason=this arm's declared token gate reads FAIL at 3 of 6; AGENTS.md Gates
+reason=admits no performance result from it, and #2497 already retracted one

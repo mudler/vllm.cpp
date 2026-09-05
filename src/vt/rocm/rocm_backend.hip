@@ -37,9 +37,11 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vt/backend.h"
@@ -136,21 +138,77 @@ DeviceCaps ProbeDevice(int index) noexcept {
 // managed route makes the aliasing a documented API property instead. All three
 // attributes measured 1 on gfx1151 (Strix Halo) and gfx1103 (Radeon 780M).
 //
-// A discrete card reports Integrated=0, so this returns false — the branch is
-// provably dead — on every dGPU, and the discrete path stays byte-identical to
-// W0.
-bool UseManagedAlloc(const DeviceCaps& caps) noexcept {
-  return caps.integrated && caps.managed_memory && caps.concurrent_managed_access;
+// A discrete card reports Integrated=0, so the managed branch is provably dead
+// — on every dGPU — and the discrete path stays byte-identical to W0.
+//
+// THAT RATIFICATION HAS SINCE BEEN REVISITED, AND THE PARAGRAPH ABOVE IS
+// HISTORY. It is kept because it states what the branch was for, and because
+// its last sentence — "host dereference of hipMalloc memory demonstrably
+// worked" — is the claim the alternative repair would have had to rest on.
+// Read the next block for what ships.
+//
+// THE #2511 NARROWING, and the decision that used to live here.
+//
+// `gfx1151` reports PageableMemoryAccess = 0 and
+// PageableMemoryAccessUsesHostPageTables = 0 (measured on the board,
+// .agents/specs/rocm-gfx1151-q4k-hang.md), so it CANNOT take a recoverable page
+// fault — and yet approach (b) routed every Backend::Alloc through
+// hipMallocManaged, putting about 25 GiB of MIGRATABLE memory on it. A page
+// migrated out from under a live queue is then a hard violation, which is why
+// the eight recorded fault addresses are page-aligned and none lies inside any
+// allocation the process made. Measured, one binary, one boot, the knob read at
+// runtime, arms interleaved: hipMallocManaged 17 failures in 21 legs, plain
+// hipMalloc 0 in 21, and the hipMalloc arm is the first thing that has ever
+// completed a gate-sized run on this board.
+//
+// So the managed branch is now taken only where PageableMemoryAccess is 1, and
+// UnifiedMemory() follows the ALLOCATOR rather than the capability. That
+// withdraws the CPU reference tier on this class of part; see
+// `HostAddressabilityNote` below, which is what a losing op is refused with.
+//
+// The DECISION is in include/vt/rocm/rocm_arch.h (`ResolveMemoryPolicy`), not
+// here, for the reason that header already states about `CapabilityFromGcnArch`:
+// it is the piece a wrong answer breaks silently, and there it is compiled and
+// table-tested in the ordinary CPU build (tests/vt/test_rocm_arch.cpp) on a
+// machine with no AMD GPU. This translation unit reads four attributes and
+// calls it.
+//
+// VT_ROCM_MANAGED_ALLOC is tri-state: unset takes the narrowed default, `0`
+// never takes the managed branch, and `1` takes it wherever the managed
+// ATTRIBUTES allow — the pre-#2511 behaviour, restored whole (allocator AND
+// unified claim), because a red-before arm that moves only half the
+// configuration is not the configuration it claims to reproduce.
+RocmManagedAllocOverride ManagedAllocOverride() {
+  static const RocmManagedAllocOverride ov = [] {
+    const char* e = std::getenv("VT_ROCM_MANAGED_ALLOC");
+    return ParseManagedAllocOverride(e != nullptr ? std::string_view(e) : std::string_view());
+  }();
+  return ov;
+}
+
+// The probed attributes, in the shape the pure decision takes them.
+RocmMemoryAttributes MemoryAttributes(const DeviceCaps& caps) noexcept {
+  RocmMemoryAttributes a;
+  a.integrated = caps.integrated;
+  a.managed_memory = caps.managed_memory;
+  a.concurrent_managed_access = caps.concurrent_managed_access;
+  a.pageable_memory_access = caps.pageable_memory_access;
+  return a;
+}
+
+RocmMemoryPolicy MemoryPolicy(const DeviceCaps& caps) {
+  return ResolveMemoryPolicy(MemoryAttributes(caps), ManagedAllocOverride());
 }
 
 class RocmBackend final : public Backend {
  public:
   // Non-throwing by design: constructed during static init by the registrar,
   // which probes the device beforehand. Same contract as CudaBackend.
-  RocmBackend(int device, bool unified_memory, bool managed_alloc, int major, int minor) noexcept
+  RocmBackend(int device, const RocmMemoryPolicy& policy, int major, int minor) noexcept
       : device_(device),
-        unified_memory_(unified_memory),
-        managed_alloc_(managed_alloc),
+        unified_memory_(policy.unified_memory),
+        managed_alloc_(policy.managed_alloc),
+        host_addressability_note_(policy.host_addressability_note),
         major_(major),
         minor_(minor) {}
 
@@ -223,6 +281,34 @@ class RocmBackend final : public Backend {
   }
   void Synchronize(Queue& q) override {
     Check(hipStreamSynchronize(AsStream(q)), "hipStreamSynchronize");
+  }
+
+  // Drains without a Queue in hand, for the portable CPU reference tier
+  // (#2498). `GetOp` calls this before returning a reference-tier kernel
+  // (op_provider.cpp:707-711), as does the decline path (762-765), because that
+  // kernel is a HOST function that reads and writes DEVICE memory directly.
+  //
+  // The `{}` default in vt/backend.h documents itself as suiting "every backend
+  // that submits eagerly". HIP submits eagerly and COMPLETES asynchronously:
+  // CreateQueue above builds a genuine hipStreamCreate stream, so work is still
+  // in flight when the host regains control. Inheriting the default therefore
+  // let a host kernel read managed memory that device kernels were still
+  // writing, with nothing ordering the two. Metal (metal_backend.mm) and Vulkan
+  // (vulkan_backend.cpp) both override this; ROCm was the only backend
+  // reporting DeviceMemoryIsHostAddressable() that did not.
+  //
+  // hipDeviceSynchronize rather than a stream sync BECAUSE there is no Queue
+  // here: the tier's caller cannot say which stream produced the bytes it is
+  // about to read, and this backend hands out a fresh stream per CreateQueue.
+  // Waiting on the device waits on all of them.
+  //
+  // Cost is confined to the path that needs it. The call site is guarded by
+  // `slot.ref_selected` (op_provider.cpp:707), so a run that reaches no
+  // reference-tier op never calls this at all, and a discrete AMD board never
+  // installs the tier in the first place.
+  void FlushPending() override {
+    Check(hipSetDevice(device_), "hipSetDevice");
+    Check(hipDeviceSynchronize(), "hipDeviceSynchronize");
   }
 
   // --- hipGraph capture/replay (BACKEND-ROCM W1) ------------------------------
@@ -333,17 +419,27 @@ class RocmBackend final : public Backend {
   // would be memory corruption, so the tier must stay off and unimplemented ops
   // must throw instead.
   //
-  // TRUE on exactly two grounds, both API-anchored, computed by the registrar:
+  // TRUE on exactly two grounds, both API-anchored, resolved by
+  // `ResolveMemoryPolicy` (include/vt/rocm/rocm_arch.h):
   //   1. The W0 conjunction, CudaBackend's own (cuda_backend.cu:295-303):
   //      Integrated AND PageableMemoryAccess. Pageable-memory-access ALONE is
   //      not enough, because a discrete part can report it while the driver
   //      services host pointers through HMM page migration — not the zero-copy
   //      aliasing this contract needs. Kept byte-for-byte for any part that
   //      reports both (NVIDIA-style integrated semantics).
-  //   2. The approach-(b) managed branch (UseManagedAlloc above): every
-  //      Backend::Alloc block on this device is hipMallocManaged memory, so
-  //      host access is guaranteed by construction. This is the route
-  //      XNACK-less RDNA3 APUs take, where ground 1 reads false (issue #41 F6).
+  //   2. The managed branch actually TAKEN: every Backend::Alloc block is then
+  //      hipMallocManaged memory, so host access is guaranteed by construction.
+  //
+  // #2511 CHANGED WHICH PARTS REACH GROUND 2, and this is the sentence to read
+  // if you are wondering where an APU's CPU reference tier went. Approach (b)
+  // (#41 F6) took ground 2 on any integrated managed-capable device, which is
+  // how XNACK-less RDNA3 APUs claimed unified while ground 1 read false. Those
+  // are exactly the parts that cannot fault and recover, and the managed
+  // allocation is what faults them. Ground 2 now requires PageableMemoryAccess
+  // too, so under the shipped default it IMPLIES ground 1 and this bool is
+  // simply the W0 conjunction. On gfx1151 and gfx1103 it is therefore FALSE,
+  // the tier is withheld, and `HostAddressabilityNote()` below is what an op
+  // that loses its fallback is refused with.
   // Probed, never inferred from the gfx name.
   // The GDN conv-update and scan kernels registered for this backend carry
   // bf16/f16 state arms (f32 register math, boundary conversion), so both
@@ -355,20 +451,37 @@ class RocmBackend final : public Backend {
 
   bool UnifiedMemory() const override { return unified_memory_; }
 
-  // The SAME value, and deliberately not `managed_alloc_`. The registrar sets
-  // `unified_memory_ = managed_alloc || (pageable_memory_access && integrated)`,
-  // and BOTH branches give host code a pointer it may dereference: the managed
-  // branch by the hipMallocManaged API contract, the other by the
-  // PageableMemoryAccess attribute on an integrated device. So every allocation
-  // this backend hands out on a `unified_memory_` device is host-addressable.
+  // The SAME value, and deliberately not `managed_alloc_`. `ResolveMemoryPolicy`
+  // sets `unified_memory = managed_alloc || (pageable_memory_access &&
+  // integrated)`, and BOTH branches give host code a pointer it may
+  // dereference: the managed branch by the hipMallocManaged API contract, the
+  // other by the PageableMemoryAccess attribute on an integrated device. So
+  // every allocation this backend hands out on a `unified_memory_` device is
+  // host-addressable. Note the left operand is the branch TAKEN, not the
+  // capability: reading it off the capability is precisely how the allocator
+  // and the claim could disagree, which is the shape #2511 shipped for three
+  // weeks.
   //
   // Answered explicitly because `DeviceMemoryIsHostAddressable()` defaults to
   // false and is what gates the portable CPU reference tier (#844, #1435). That
   // gate used to read `UnifiedMemory()`, which is a WIDER property — true on
   // CUDA/GB10, where a cudaMalloc pointer is still not host-dereferenceable.
-  // Without this override ROCm would lose the tier that makes an APU run a model
-  // with one registered kernel.
   bool DeviceMemoryIsHostAddressable() const override { return unified_memory_; }
+
+  // Why THIS device answers the two bools above false, when a reader might
+  // reasonably have expected an APU to answer them true. Null on every device
+  // where the answer is unremarkable — a discrete card, or a part that takes
+  // the managed branch — so the generic refusal text stands alone there.
+  //
+  // `Backend`'s default is nullptr and the reference tier's refusal path
+  // (src/vt/op_provider.cpp, ReferenceTierRefusalReason) appends this when it
+  // is set. Without it, an op that used to fall back on Strix Halo now refuses
+  // with a sentence that is true and useless: "this backend does not report its
+  // device memory host-addressable". With it, the refusal names the attribute,
+  // the issue, and the knob that puts the old behaviour back.
+  const char* HostAddressabilityNote() const override {
+    return host_addressability_note_;
+  }
 
   bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes) const override {
     size_t free_b = 0, tot_b = 0;
@@ -383,6 +496,7 @@ class RocmBackend final : public Backend {
   int device_ = 0;
   bool unified_memory_ = false;
   bool managed_alloc_ = false;
+  const char* host_addressability_note_ = nullptr;
   int major_ = 0;
   int minor_ = 0;
   // Single-graph slot for the EndCapture/Replay pair. The handle API
@@ -414,11 +528,8 @@ struct Registrar {
     for (int i = 0; i < count; ++i) {
       const DeviceCaps caps = ProbeDevice(i);
       if (!caps.valid) continue;
-      const bool managed_alloc = UseManagedAlloc(caps);
-      const bool unified =
-          managed_alloc || (caps.pageable_memory_access && caps.integrated);
       backends.push_back(
-          std::make_unique<RocmBackend>(i, unified, managed_alloc, caps.major, caps.minor));
+          std::make_unique<RocmBackend>(i, MemoryPolicy(caps), caps.major, caps.minor));
       RegisterBackend(Device{DeviceType::kROCM, i}, backends.back().get());
     }
   }
@@ -445,19 +556,27 @@ bool IntegratedDevice(int index) noexcept {
 
 bool HostMemoryIsDeviceAddressable(int index) noexcept {
   // The CONJUNCTION, not `pageable_memory_access` alone: see the declaration.
-  // It is deliberately NOT `unified_memory_`, which the registrar widens with
-  // `managed_alloc` — a hipMallocManaged device reports unified because ITS OWN
+  // It is deliberately NOT `unified_memory_`, which the managed branch can
+  // widen — a hipMallocManaged device reports unified because ITS OWN
   // allocations are migratable, which says nothing about a plain host pointer.
+  // Since #2511 the two coincide under the shipped default, and they separate
+  // again the moment VT_ROCM_MANAGED_ALLOC=1 forces the managed branch back on,
+  // so the distinction is still load-bearing rather than historical.
   const DeviceCaps caps = ProbeDevice(index);
   return caps.valid && caps.integrated && caps.pageable_memory_access;
 }
 
 bool ManagedAllocActive(int index) noexcept {
-  // Answers from the SAME pure predicate over the SAME probe the registrar
-  // used, so this cannot drift from what the registered backend decided at
-  // static init: the attributes are immutable hardware properties.
+  // Answers from the SAME pure decision over the SAME probe the registrar used,
+  // so this cannot drift from what the registered backend chose at static init:
+  // the attributes are immutable hardware properties and the override is read
+  // once into a function-local static. It reports the branch Alloc ACTUALLY
+  // takes, which is the question a board owner is asking; #2511's narrowing
+  // means the managed CAPABILITY and the managed BRANCH are no longer the same
+  // answer, and reporting the capability here would have hidden exactly the
+  // change this probe exists to surface.
   const DeviceCaps caps = ProbeDevice(index);
-  return caps.valid && UseManagedAlloc(caps);
+  return caps.valid && MemoryPolicy(caps).managed_alloc;
 }
 
 size_t DeviceMemoryTotalBytes(int index) noexcept {

@@ -449,7 +449,15 @@ class OneRenderOrTwo(unittest.TestCase):
         self.assertIsNone(rep["identity_verdict"])
         self.assertIsNone(rep["control_verdict"])
         self.assertEqual(rep["mode"], "absolute_only")
-        self.assertIn("PROMPT ADHERENCE IS NOT MEASURED HERE", out)
+        # A run with no scorer must still SAY that it measured no adherence, and
+        # must not carry an adherence check into the table. The wording moved
+        # when #2295 landed the scorer -- the declaration used to read "not
+        # measured anywhere in this tree", which stopped being true -- and the
+        # obligation did not: the 77-position bound is stated in both states.
+        self.assertIn("PROMPT ADHERENCE IS NOT MEASURED IN THIS RUN", out)
+        self.assertIn("77 positions", out)
+        self.assertEqual([n for n in names if "adherence" in n], [])
+        self.assertNotIn("adherence", rep)
 
     def test_a_reference_changes_no_arm_to_arm_check(self) -> None:
         """#1743's checks keep their names, their values and their verdicts.

@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,68 @@ using dense_attn::Dev;
 using dense_attn::DBuf;
 using vt::DType;
 using vt::Tensor;
+
+// ─── A HOST READ OF A TENSOR THAT MAY NOT BE HOST-RESIDENT (#2421) ──────────
+// `count` elements of `t` starting at ELEMENT `offset`, written to `dst` on the
+// host. `StageHostWords` only ENQUEUES the read; nothing is readable until the
+// caller synchronises the queue once for every range it staged.
+//
+// THIS IS WHAT REPLACED THREE REFUSALS. This block resolves exactly three things
+// on the host — group 2's page table, the two rope layouts' probe rows, and
+// `kv_lens` — and each of the three used to refuse a tensor that was not
+// CPU-resident BY NAME, which made every CUDA step stop at the first of them
+// before any arithmetic ran. None of the three has a device-side consumer to
+// hand the work to: two produce an index vector that is uploaded again
+// immediately, and the third produces no tensor at all. So the read stays a host
+// read, and the words it reads are COPIED, with the element range named at the
+// call site so the copy's size is visible where the read is.
+//
+// IT IS NOT A SILENT DEVICE DEREFERENCE, which is what those refusals existed to
+// prevent and what this file must never become: a host loop walking a device
+// pointer faults on a discrete device and, on a unified-memory one, reads
+// plausible bytes and produces a quietly wrong SELECTION that no downstream
+// value gate can convict. `Backend::Copy` infers its direction from the pointer
+// values (`cudaMemcpyDefault`, src/vt/cuda/cuda_backend.cu:116), so one entry
+// point covers every arm, and the `kCPU` tensor takes the memcpy below and
+// enqueues nothing at all.
+//
+// THE SPLIT INTO STAGE-THEN-SYNCHRONISE IS THE WHOLE POINT OF THE SHAPE.
+// `CheckRopeLayoutsAgree` reads NINE ranges, and the cost of a device read here
+// is the synchronise and not the four kilobytes; nine synchronises per QSA layer
+// per step would be a decode cost paid to re-check a constant. The spec's
+// `## Owed` carries the one that remains.
+template <typename T>
+void StageHostWords(Dev d, const Tensor& t, int64_t offset, int64_t count, T* dst) {
+  VT_CHECK(offset >= 0 && count >= 0,
+           "qwen4_exp qsa block: a host read names a negative element range");
+  VT_CHECK(vt::SizeOf(t.dtype) == sizeof(T),
+           "qwen4_exp qsa block: a host read's element width disagrees with the tensor dtype");
+  VT_CHECK(t.IsContiguous(),
+           "qwen4_exp qsa block: a host read needs a contiguous tensor — a strided one would "
+           "copy the wrong elements rather than fail");
+  VT_CHECK(offset + count <= t.Numel(),
+           "qwen4_exp qsa block: a host read names elements outside the tensor");
+  if (count == 0) return;
+  VT_CHECK(t.data != nullptr, "qwen4_exp qsa block: a host read of an unallocated tensor");
+  const auto bytes = static_cast<size_t>(count) * sizeof(T);
+  const char* src = static_cast<const char*>(t.data) + static_cast<size_t>(offset) * sizeof(T);
+  if (t.device.type == vt::DeviceType::kCPU) {
+    std::memcpy(dst, src, bytes);
+    return;
+  }
+  d.b.Copy(d.q, dst, src, bytes);
+}
+
+// One range, read and made readable. `Backend::Synchronize` is a no-op on the
+// base class, so the CPU arm pays nothing for the unconditional call and the
+// device arm cannot forget it.
+template <typename T>
+std::vector<T> HostWords(Dev d, const Tensor& t, int64_t offset, int64_t count) {
+  std::vector<T> host(static_cast<size_t>(count));
+  StageHostWords(d, t, offset, count, host.data());
+  d.b.Synchronize(d.q);
+  return host;
+}
 
 // A contiguous ROW-RANGE view of a contiguous tensor, reshaped. `t` is the
 // owner, `start`/`count` index its OUTERMOST dimension, and `shape` describes
@@ -72,21 +135,24 @@ Tensor Reshape(const Tensor& t, const std::vector<int64_t>& shape) {
 // exactly the `idx` operand `vt::IndexSelect` and `vt::IndexCopy` take, and the
 // gather and the scatter need NO NEW OP.
 //
-// THE TABLE IS READ ON THE HOST, and the caller is REFUSED BY NAME when it is not
-// host-resident rather than being read through a device pointer. That is
-// `CheckRopeLayoutsAgree`'s rule a few lines up, for the same reason: this block
-// has no device arm to run the translation on — the CUDA arm is the QSA ops' own
-// owed item — and a check or a translation that silently does not run on a
-// device arm is a mute switch.
-std::vector<int32_t> IndexerRows(const Tensor& table, int64_t block_size, int64_t begin,
-                                 int64_t n) {
-  VT_CHECK(table.device.type == vt::DeviceType::kCPU,
-           "qwen4_exp qsa block: the indexer block table is read on the HOST to resolve a "
-           "physical row, so it must be CPU-resident; a device-resident table needs that "
-           "translation moved onto the device, which the CUDA arm owes (see the spec's "
-           "`## Owed`)");
-  const int64_t pages = table.shape[1];
-  const auto* tb = table.Ptr<int32_t>();
+// THE TABLE IS READ ON THE HOST, and it ARRIVES on the host: `QsaBlockCore`
+// resolves it once per call through `HostWords` above, whatever device it lives
+// on, and hands the resolved words here. It used to be a `const Tensor&` that
+// REFUSED a table that was not CPU-resident by name, which was correct — the
+// alternative on offer at the time was a host loop over a device pointer — and
+// which stopped every CUDA step inside this block. What the refusal was really
+// asking for is a translation with a device-side home; until that exists the
+// words are copied, explicitly, and the copy is priced in the spec's `## Owed`
+// rather than hidden.
+//
+// TAKING A VECTOR RATHER THAN A TENSOR IS THE POINT. The type now says that this
+// arithmetic runs on host words and cannot be handed a device pointer at all, so
+// the residency question is settled at the ONE place that resolves it instead of
+// re-asked at every use.
+std::vector<int32_t> IndexerRows(const std::vector<int32_t>& table, int64_t block_size,
+                                 int64_t begin, int64_t n) {
+  const auto pages = static_cast<int64_t>(table.size());
+  const int32_t* tb = table.data();
   std::vector<int32_t> rows(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) {
     const int64_t pos = begin + i;
@@ -138,34 +204,40 @@ constexpr int kRopeProbeRows = 3;
 // them by two orders of magnitude; it is a LAYOUT check, not an epsilon.
 constexpr float kRopeAgreeTol = 1.0F / 128.0F;
 
-void CheckRopeLayoutsAgree(const Tensor& cos_sin, const Tensor& cos, const Tensor& sin) {
-  // The comparison is a HOST read of both tables, so both must be host-readable.
-  // Refused by name rather than skipped: a check that silently does not run on a
-  // device arm is a mute switch, and this block has no device arm to run on —
-  // the CUDA arm is the QSA ops' own owed item and the wave that adds it owes
-  // this cross-check a device-side home or an argued removal.
-  VT_CHECK(cos_sin.device.type == vt::DeviceType::kCPU &&
-               cos.device.type == vt::DeviceType::kCPU &&
-               sin.device.type == vt::DeviceType::kCPU,
-           "qwen4_exp qsa block: the two rope layouts are cross-checked on the host, so "
-           "both must be CPU-resident; a device-resident pair needs that check moved onto "
-           "the device, which the CUDA arm owes (see the spec's `## Owed`)");
+void CheckRopeLayoutsAgree(Dev d, const Tensor& cos_sin, const Tensor& cos, const Tensor& sin) {
+  // The comparison is a HOST read of both tables, and it STAYS one on a device
+  // arm: the probe rows are copied to the host rather than the check being
+  // skipped. Skipping is what a mute switch looks like, and refusing — which is
+  // what this line did until #2421 — stopped every CUDA step here before any
+  // arithmetic ran. The check the wave was owed a device-side home for is
+  // O(kRopeProbeRows * rotary_dim) words, so the home it gets is a copy.
   VT_CHECK(cos.shape[0] == cos_sin.shape[0] && sin.shape[0] == cos_sin.shape[0],
            "qwen4_exp qsa block: the PACKED cos_sin cache and the SEPARATE cos/sin tables "
            "must have the same number of rows — they are two layouts of ONE [P, rotary_dim] "
            "table and two heights cannot have come from one build");
   const int64_t P = cos_sin.shape[0], rot = cos_sin.shape[1], half = rot / 2;
   const int64_t probes[kRopeProbeRows] = {P > 1 ? 1 : 0, P / 2, P - 1};
-  const auto* pk = cos_sin.Ptr<uint16_t>();
-  const auto* cf = cos.Ptr<float>();
-  const auto* sf = sin.Ptr<float>();
+  // NINE RANGES, ONE SYNCHRONISE. The three probe rows are gathered out of three
+  // tensors, so they are staged together and made readable once; on a CPU queue
+  // every one of the nine is a memcpy and the synchronise is the base class's
+  // no-op, which is why this costs the CPU arm nothing.
+  std::vector<uint16_t> pk(static_cast<size_t>(kRopeProbeRows * rot));
+  std::vector<float> cf(static_cast<size_t>(kRopeProbeRows * rot));
+  std::vector<float> sf(static_cast<size_t>(kRopeProbeRows * rot));
   for (int i = 0; i < kRopeProbeRows; ++i) {
     const int64_t r = probes[i];
+    StageHostWords(d, cos_sin, r * rot, rot, pk.data() + static_cast<size_t>(i * rot));
+    StageHostWords(d, cos, r * rot, rot, cf.data() + static_cast<size_t>(i * rot));
+    StageHostWords(d, sin, r * rot, rot, sf.data() + static_cast<size_t>(i * rot));
+  }
+  d.b.Synchronize(d.q);
+  for (int i = 0; i < kRopeProbeRows; ++i) {
+    const int64_t r = i * rot;
     for (int64_t j = 0; j < half; ++j) {
-      const float pc = vt::BF16ToF32(pk[r * rot + j]);
-      const float ps = vt::BF16ToF32(pk[r * rot + half + j]);
-      VT_CHECK(std::fabs(pc - cf[r * rot + j]) <= kRopeAgreeTol &&
-                   std::fabs(ps - sf[r * rot + j]) <= kRopeAgreeTol,
+      const float pc = vt::BF16ToF32(pk[static_cast<size_t>(r + j)]);
+      const float ps = vt::BF16ToF32(pk[static_cast<size_t>(r + half + j)]);
+      VT_CHECK(std::fabs(pc - cf[static_cast<size_t>(r + j)]) <= kRopeAgreeTol &&
+                   std::fabs(ps - sf[static_cast<size_t>(r + j)]) <= kRopeAgreeTol,
                "qwen4_exp qsa block: the PACKED cos_sin cache and the SEPARATE cos/sin "
                "tables do not describe the same angles — both must be built from ONE "
                "table, or the query and the pooled indexer keys are roped differently and "
@@ -270,12 +342,15 @@ Qwen4ExpQsaSelection Qwen4ExpQsaIndex(Dev d, const Qwen4ExpQsaParams& qsa, float
   {
     VT_CHECK(kv_lens.rank == 1 && kv_lens.shape[0] == T && kv_lens.dtype == DType::kI32,
              "qwen4_exp qsa indexer: kv_lens must be i32 [T]");
-    VT_CHECK(kv_lens.device.type == vt::DeviceType::kCPU,
-             "qwen4_exp qsa indexer: kv_lens is read on the host to build the scoring "
-             "window; a device-resident one needs the window built on the device");
-    const auto* kl = kv_lens.Ptr<int32_t>();
+    // READ ON THE HOST, whatever device it lives on. This used to REFUSE a
+    // device-resident `kv_lens` by name; it is `[T]` i32 words whose only
+    // product is `win_start`/`win_end`, two `[T]` i32 vectors uploaded three
+    // lines below, so the window is built where it was always built and the
+    // words are copied to get there (#2421).
+    const std::vector<int32_t> kl = HostWords<int32_t>(d, kv_lens, 0, T);
     for (int64_t t = 0; t < T; ++t)
-      we_host[static_cast<size_t>(t)] = static_cast<int32_t>(kl[t] / CR);
+      we_host[static_cast<size_t>(t)] =
+          static_cast<int32_t>(kl[static_cast<size_t>(t)] / CR);
   }
   DBuf win_start(d, DType::kI32, {T}, ws_host.data());
   DBuf win_end(d, DType::kI32, {T}, we_host.data());
@@ -387,7 +462,7 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
            "the two ops were ported from two upstreams that spell it differently");
   // The two layouts are cross-checked rather than trusted. See
   // `CheckRopeLayoutsAgree` for what the bounded row sample can and cannot see.
-  CheckRopeLayoutsAgree(cos_sin, cos, sin);
+  CheckRopeLayoutsAgree(d, cos_sin, cos, sin);
   VT_CHECK(past_len >= 0, "qwen4_exp qsa block: past_len must not be negative");
   if (!paged) {
     const Qwen4ExpQsaCaches& caches = *arm.contig;
@@ -475,6 +550,19 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   // separates the two: on the paged arm a logical position must go through
   // `IndexerRows` before it names a row here, and on the contiguous arm it is the
   // row.
+  // ─── GROUP 2'S BLOCK TABLE, RESOLVED ON THE HOST ONCE PER CALL (#2421) ────
+  // `IndexerRows` runs TWICE below — the scatter of this step's rows, and the
+  // gather of the visible prefix — and both read the same `[1, pages]` table. It
+  // is resolved here, above both, so a device arm pays ONE round trip per block
+  // call rather than one per use. Placed after the paged validation above,
+  // because that is what establishes the rank, dtype and contiguity this read
+  // relies on.
+  std::vector<int32_t> idx_table;
+  if (paged) {
+    idx_table = HostWords<int32_t>(d, arm.paged->index_block_table, 0,
+                                   arm.paged->index_block_table.shape[1]);
+  }
+
   const int64_t idx_page = paged ? arm.paged->index_key.shape[1] : 0;
   Tensor index_rows =
       paged ? Reshape(arm.paged->index_key,
@@ -523,8 +611,7 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
     Tensor slot = paged ? idx_stage.t() : RowsView(index_rows, past_len, T, {T, IdxD});
     vt::MatmulBT(d.q, slot, hidden, dense_attn::ResidentWeight(d, w.idx_k_proj, {IdxD, H}));
     if (paged) {
-      const std::vector<int32_t> rows =
-          IndexerRows(arm.paged->index_block_table, idx_page, past_len, T);
+      const std::vector<int32_t> rows = IndexerRows(idx_table, idx_page, past_len, T);
       DBuf ridx(d, DType::kI32, {T}, rows.data());
       vt::IndexCopy(d.q, index_rows, idx_stage.t(), ridx.t());
     }
@@ -556,8 +643,15 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   std::vector<int32_t> kv_lens_host(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t)
     kv_lens_host[static_cast<size_t>(t)] = static_cast<int32_t>(past_len + t + 1);
-  Tensor kv_lens_cpu = dense_attn::MakeTensor(kv_lens_host.data(), DType::kI32,
-                                              vt::Device{vt::DeviceType::kCPU, 0}, {T});
+  // ONE tensor for one value, and it is the DEVICE one (#2421). Until this
+  // change the same `[T]` i32 words were wrapped TWICE — a CPU `Tensor` over
+  // `kv_lens_host` for the indexer, whose refusal made a host tensor the only
+  // legal operand, and this `DBuf` for the gather consumer. Two objects for one
+  // value is a drift hazard for the sake of a refusal that is now gone, so the
+  // gather's operand is the indexer's operand. On a CPU queue the `DBuf` IS host
+  // memory and the indexer's read is a memcpy; on a device arm it is one round
+  // trip, which is what makes that path REACHED from the production forward
+  // rather than exercised only by a test.
   DBuf kv_lens(d, DType::kI32, {T}, kv_lens_host.data());
 
   // WHAT THE INDEXER READS. `Qwen4ExpQsaIndex` takes a CONTIGUOUS `[rows, D]`
@@ -579,15 +673,14 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   Tensor index_visible = index_rows;
   if (paged) {
     idx_gathered = DBuf(d, index_rows.dtype, {kv_len, IdxD});
-    const std::vector<int32_t> rows =
-        IndexerRows(arm.paged->index_block_table, idx_page, 0, kv_len);
+    const std::vector<int32_t> rows = IndexerRows(idx_table, idx_page, 0, kv_len);
     DBuf ridx(d, DType::kI32, {kv_len}, rows.data());
     vt::IndexSelect(d.q, idx_gathered.t(), index_rows, ridx.t());
     index_visible = idx_gathered.t();
   }
   Qwen4ExpQsaSelection sel = Qwen4ExpQsaIndex(
       d, params.qsa, eps, q_index, index_visible,
-      dense_attn::ResidentWeight(d, w.idx_k_norm, {IdxD}), cos, sin, kv_lens_cpu, kv_len,
+      dense_attn::ResidentWeight(d, w.idx_k_norm, {IdxD}), cos, sin, kv_lens.t(), kv_len,
       /*round_intermediates_to_bf16=*/index_visible.dtype == DType::kBF16);
 
   // ─── THE ATTENTION ─────────────────────────────────────────────────────────
@@ -598,16 +691,39 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   DBuf qgate(d, hidden.dtype, {T, Hq * 2 * Dh});
   vt::MatmulBT(d.q, qgate.t(), hidden,
                dense_attn::ResidentWeight(d, w.q_proj, {Hq * 2 * Dh, H}));
-  DBuf q_f32(d, DType::kF32, {T, Hq, Dh});
+  //
+  // THE QUERY HALF IS SPLIT AT THE MODEL DTYPE, NOT WIDENED (#2488). vLLM reaches
+  // this point through `torch.chunk` (qwen3_next.py:430) and hands `q` to `q_norm`
+  // unwidened (:437), so `q` carries `model_config.dtype` — bf16 for this
+  // architecture — from the GEMM to the norm.
+  //
+  // An earlier comment here justified an f32 `q` as upstream's `_norm(x.float())`
+  // then `.type_as(x)`. That was RIGHT about the rounding count and WRONG about
+  // what it licenses: upstream's `.float()` is a promotion inside the norm kernel's
+  // registers (ple_layer.py:70 then :80 `.to(input_dtype)`), not a materialised
+  // `[T, Hq, Dh]` allocation. The rounding count is one either way, because `qgate`
+  // is ALREADY at `hidden.dtype` — so widening each element to f32 and narrowing it
+  // back is the identity, and all it buys is `T*Hq*Dh*4` bytes where upstream moves
+  // half that. `AGENTS.md` names this exactly: a token gate cannot see a dtype that
+  // is too wide, so the gate on this line reads the dtype and the byte count.
+  //
+  // It is also what made #2477 a wall. An f32 `q` beside the bf16 gamma the loader
+  // produces was the pairing the CUDA RmsNorm kernel refused; #2493 taught the
+  // kernel that pairing and said it was treating a symptom. This is the cause.
+  //
+  // The GATE half stays f32: `vt::SigmoidGateBf16` takes an f32 gate on each of
+  // its four backends. #2488 stays open for it.
+  DBuf q_split(d, hidden.dtype, {T, Hq, Dh});
   DBuf gate(d, DType::kF32, {T, Hq, Dh});
-  vt::AttnGateSplit(d.q, q_f32.t(), gate.t(), qgate.t());
+  vt::AttnGateSplit(d.q, q_split.t(), gate.t(), qgate.t());
 
-  // q_norm reads the f32 split and stores the block dtype, which is upstream's
-  // `_norm(x.float()) * (1 + w)` followed by `.type_as(x)`: one rounding, at the
-  // store, exactly where upstream has one.
+  // q_norm reads the split and stores the block dtype, which is upstream's
+  // `_norm(x.float()) * (1 + w)` followed by `.to(input_dtype)`: one rounding, at
+  // the store, exactly where upstream has one. Both operands are now the block
+  // dtype, which is the pairing every backend's RmsNorm already served.
   DBuf q(d, hidden.dtype, {T, Hq, Dh});
   {
-    Tensor src = Reshape(q_f32.t(), {T * Hq, Dh});
+    Tensor src = Reshape(q_split.t(), {T * Hq, Dh});
     Tensor dst = Reshape(q.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dst, src, dense_attn::ResidentWeight(d, w.q_norm, {Dh}),
                 vt::RmsNormArgs{eps, /*gemma=*/true});
@@ -694,9 +810,11 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   }
 
   // `attn_output * torch.sigmoid(gate)` then `o_proj` (:838-840). The gate is
-  // read at f32 because the sigmoid's input must not be rounded, which is the
-  // contract `vt::SigmoidGateBf16` states and the reason `AttnGateSplit` emits
-  // f32 in the first place.
+  // read at f32 because that is the operand `vt::SigmoidGateBf16` states on each
+  // of its four backends. It is NOT because this value needs the width: `qgate` is
+  // `hidden.dtype`, so the f32 gate holds bf16 values in f32 storage, exactly as
+  // the query did before #2488's first half. Narrowing it means widening that op
+  // on four backends for zero rounding change, which is why #2488 stays open.
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
   vt::SigmoidGateBf16(d.q, gated.t(), Reshape(attn.t(), {T, Hq * Dh}),
                       Reshape(gate.t(), {T, Hq * Dh}));

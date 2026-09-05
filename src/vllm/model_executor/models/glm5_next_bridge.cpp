@@ -668,6 +668,19 @@ bool AdmitMoeQuantBanks(const Glm5NextMoeWeights& src, const MoeDims& d,
   out->gate = src.gate_exps.View().View({E * I, H});
   out->up = src.up_exps.View().View({E * I, H});
   out->down = src.down_exps.View().View({E * H, I});
+  // W9c-3a: and the tensors those views were taken over, for the device arm.
+  // `View()` produces a host tensor whose `device` is CPU and cannot be
+  // retagged onto a GPU (`minimax_h3_device.cpp:339-342`), so the device arm
+  // uploads from the SOURCE instead and memoizes the allocation on the source's
+  // own `d_dev`. These three pointers are what make that upload happen once per
+  // MODEL rather than once per layer per step, because this whole struct is
+  // rebuilt on every layer of every step by `Glm5NextGgufLayerSource`.
+  //
+  // They are borrowed and they point into `Glm5NextWeights`, which outlives
+  // every `MoeForward` call, exactly as `expert_source` does.
+  out->gate_src = &src.gate_exps;
+  out->up_src = &src.up_exps;
+  out->down_src = &src.down_exps;
   return true;
 }
 

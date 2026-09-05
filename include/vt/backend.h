@@ -85,6 +85,25 @@ class Backend {
   // device pointer to a host memcpy and segfaults.
   virtual bool DeviceMemoryIsHostAddressable() const { return false; }
 
+  // Optional: why THIS backend answers the predicate above false, when a reader
+  // might reasonably have expected otherwise. Null by default, and null is the
+  // right answer for a discrete card, where the false is unremarkable and the
+  // generic sentence already says everything.
+  //
+  // It exists because the portable CPU reference tier's refusal
+  // (src/vt/op_provider.cpp, ReferenceTierRefusalReason) is the only place a
+  // user meets this predicate, and a backend that WITHDREW host addressability
+  // deliberately has something to add there that no generic text can carry. The
+  // first case is ROCm on an XNACK-less integrated part (issue #2511): the
+  // managed allocator that made those boards claim host-addressable memory is
+  // also what page-faulted them, so the claim was withdrawn, and an op that
+  // loses its fallback there should be told that rather than left to infer it.
+  //
+  // Contract: a string literal or otherwise static storage. The refusal path
+  // reads it long after the backend was constructed, and callers must not free
+  // it.
+  virtual const char* HostAddressabilityNote() const { return nullptr; }
+
   // Optional device free/total VRAM probe (bytes). Default false = unknown.
   // ROCm overrides it with hipMemGetInfo (src/vt/rocm/rocm_backend.hip) so model
   // code can size LRU caches without including vendor headers (device-leakage).

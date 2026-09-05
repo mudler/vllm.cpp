@@ -714,6 +714,53 @@ TEST_CASE("kIq1xxxsGrid is the PINNED FORK table, not a look-alike") {
   CHECK(lanes[2] == 397);   // +1
 }
 
+TEST_CASE("kIq3sGrid is the pinned 512-entry table, not kIq3xxsGrid") {
+  // Two u32 codebooks, both read four bytes at a time, one 256 rows and one
+  // 512. A decoder pointed at the sibling indexes in range for the first 256
+  // rows and returns plausible magnitudes, so nothing but a digest over the
+  // bytes we actually ported separates them. IQ3_S carries no `vec_dot` and so
+  // no golden DOT case, which makes this seal the whole of its table evidence
+  // beyond the decode golden in tests/vt/iq3s_golden_vectors.h.
+  CHECK(std::size(vt::cpu::kIq3sGrid) == 512);
+  CHECK(std::size(vt::cpu::kIq3xxsGrid) == 256);
+
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (uint32_t v : vt::cpu::kIq3sGrid) {
+    for (int b = 0; b < 4; ++b) {
+      h ^= static_cast<uint8_t>(v >> (8 * b));
+      h *= 0x100000001b3ULL;
+    }
+  }
+  CHECK(h == 0xfa37020c25b44829ULL);
+
+  // The grid alphabet is a second, independent handle. Every lane byte of
+  // iq3s_grid is an ODD value in 1..15 -- a different alphabet from
+  // iq3xxs_grid's {0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e}, so a
+  // look-alike table of the same size still fails this.
+  int counts[16] = {0};
+  for (uint32_t v : vt::cpu::kIq3sGrid) {
+    for (int b = 0; b < 4; ++b) {
+      const uint8_t lane = static_cast<uint8_t>(v >> (8 * b));
+      REQUIRE(lane < 16);
+      REQUIRE((lane % 2) == 1);
+      ++counts[lane];
+    }
+  }
+  CHECK(counts[1] == 436);
+  CHECK(counts[3] == 344);
+  CHECK(counts[5] == 327);
+  CHECK(counts[7] == 271);
+  CHECK(counts[9] == 223);
+  CHECK(counts[11] == 185);
+  CHECK(counts[13] == 112);
+  CHECK(counts[15] == 150);
+  // The first two entries pin the table's ORIGIN as well as its content:
+  // ggml-common.h:1053 begins 0x01010101, 0x01010103.
+  CHECK(vt::cpu::kIq3sGrid[0] == 0x01010101u);
+  CHECK(vt::cpu::kIq3sGrid[1] == 0x01010103u);
+  CHECK(vt::cpu::kIq3sGrid[511] == 0x0f0f0101u);
+}
+
 TEST_CASE("kIq2xsGrid is the pinned 512-entry table, not a sibling grid") {
   // The IQ2 family carries THREE codebooks with the identical 8-byte-per-entry
   // shape — iq2xxs_grid (256), iq2xs_grid (512) and iq2s_grid (1024) — and this

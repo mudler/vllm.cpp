@@ -22,6 +22,8 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -3216,4 +3218,207 @@ TEST_CASE("runner: no speculator keeps the reorder threshold at 1") {
     CHECK(want_region.at(order[static_cast<size_t>(i - 1)]) <=
           want_region.at(order[static_cast<size_t>(i)]));
   }
+}
+
+// --- #2534: the final-logit dump instrument ---------------------------------
+//
+// `VT_DUMP_LOGITS=<dir>` is the instrument the arm's remaining question needs:
+// our per-step logit vector, so our delta against llama.cpp b10451 can be placed
+// against the oracle's own measured 0.2020-to-1.3657 self-perturbation band. See
+// .agents/specs/qwen38-27b-q4km-logit-dump.md.
+//
+// Two things have to hold or the measurement is worthless, and they are the two
+// the spec pre-registered before the code existed:
+//
+//   ALIGNMENT — the argmax of the dumped row must be the token the runner
+//   actually sampled at that step. If it is not, the two sides are not
+//   describing the same context and every delta computed from them is noise.
+//
+//   NON-PERTURBATION — the dump must not change what it measures. It reads a
+//   buffer that already exists and writes nothing back, and the ids must be
+//   identical to a run with the instrument off.
+//
+// `VT_DUMP_LOGITS` is read ONCE at static init, so one process observes one
+// value and this case cannot test both arms. The default registration runs with
+// it unset and asserts the dump is INERT (no files, ids still produced); the
+// second registration in tests/CMakeLists.txt sets it and asserts the dump
+// exists, is the right size, and agrees with the sampled ids.
+TEST_CASE("runner: the logit dump agrees with the sampled ids and never perturbs them") {
+  const char* dump_dir = std::getenv("VT_DUMP_LOGITS");
+
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+
+  // One greedy decode row: prompt 3 tokens + 1 already-produced, so this step
+  // samples a real token rather than a discarded prefill position.
+  NewRequestData d = MakeNewReq("D", {6, 7, 8}, {9}, /*num_computed=*/3,
+                                /*fa_blocks=*/{0, 1}, /*gdn_block=*/0, Greedy());
+  SchedulerOutput so = NewStep({d}, {{"D", 1}});
+
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());  // MRV2 split: forward done, sampling next.
+  ModelRunnerOutput out = runner.sample_tokens(std::nullopt);
+
+  REQUIRE(out.req_ids.size() == 1);
+  CHECK(out.req_ids[0] == "D");
+  REQUIRE(out.sampled_token_ids.size() == 1);
+  REQUIRE(out.sampled_token_ids[0].size() == 1);
+  const int32_t sampled = out.sampled_token_ids[0][0];
+  CHECK(sampled >= 0);
+  CHECK(sampled < static_cast<int32_t>(c.vocab_size));
+
+  if (dump_dir == nullptr) {
+    // INERT arm. The instrument is off, the step still samples, and nothing is
+    // written. A dump that wrote unconditionally would red here.
+    const std::string stray = std::string("ours_D.f32");
+    std::ifstream f(stray, std::ios::binary);
+    CHECK_FALSE(f.good());
+    return;
+  }
+
+  // ACTIVE arm.
+  const std::string base = std::string(dump_dir) + "/ours_D";
+
+  // One step of a [1, vocab] f32 row, and NOTHING else: a dump that also wrote
+  // the discarded prefill rows, or wrote the whole [num_tokens, vocab] forward
+  // output instead of the gathered sample rows, reds on this size.
+  std::ifstream bin(base + ".f32", std::ios::binary | std::ios::ate);
+  REQUIRE(bin.good());
+  const std::streamsize bytes = bin.tellg();
+  CHECK(bytes == static_cast<std::streamsize>(sizeof(float) *
+                                              static_cast<size_t>(c.vocab_size)));
+
+  // ALIGNMENT: recompute the argmax from the dumped bytes and require the
+  // runner's own sampled id. This is the control the spec named, executed on
+  // the same data the comparison will use.
+  bin.seekg(0);
+  std::vector<float> row(static_cast<size_t>(c.vocab_size));
+  bin.read(reinterpret_cast<char*>(row.data()),
+           static_cast<std::streamsize>(row.size() * sizeof(float)));
+  size_t best = 0;
+  for (size_t v = 1; v < row.size(); ++v) {
+    if (row[v] > row[best]) best = v;
+  }
+  CHECK(static_cast<int32_t>(best) == sampled);
+
+  // The sidecar carries the same claim in text, keyed by step, and step 1 is
+  // this row's 0-based decode index (prompt 3 + 1 produced = 4 tokens, minus 3
+  // prompt tokens). A sidecar keyed by the wrong counter reds here.
+  std::ifstream ids(base + ".ids.txt");
+  REQUIRE(ids.good());
+  int step = -1;
+  long long tok = -1;
+  ids >> step >> tok;
+  CHECK(step == 1);
+  CHECK(tok == static_cast<long long>(sampled));
+}
+
+// #2534, and the reason this case exists at all. The first version of the dump
+// was gated only through `sample_tokens`, and a case that called that method
+// DIRECTLY passed 13 of 13 while the instrument wrote nothing in the real
+// engine. `async_input_combine_` is assigned directly in the runner ctor from
+// `AsyncRunnerEnvDefault()`, and `AsyncRunnerFlagIsOn` answers TRUE when
+// VT_ASYNC_RUNNER is unset, so the PRODUCTION default samples in the
+// device-resident branch of `sample_tokens_async`. A gate that only drives
+// `sample_tokens` measures a class and not the capability.
+//
+// This drives the async branch explicitly and requires the dump to appear there
+// too. Deleting either `dump_step_logits` call site reds exactly one of the two
+// cases, which is what makes them independent rather than duplicates.
+TEST_CASE("runner: the logit dump fires on the ASYNC branch the default takes") {
+  const char* dump_dir = std::getenv("VT_DUMP_LOGITS");
+  if (dump_dir == nullptr) return;  // inert arm: covered by the case above.
+
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+  runner.set_async_input_combine(true);  // the production default
+  REQUIRE(runner.async_input_combine());
+
+  NewRequestData d = MakeNewReq("A", {6, 7, 8}, {9}, /*num_computed=*/3,
+                                /*fa_blocks=*/{0, 1}, /*gdn_block=*/0, Greedy());
+  SchedulerOutput so = NewStep({d}, {{"A", 1}});
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());
+
+  std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> async_out =
+      runner.sample_tokens_async(std::nullopt);
+  REQUIRE(async_out != nullptr);
+  ModelRunnerOutput out = async_out->get_output();
+  REQUIRE(out.sampled_token_ids.size() == 1);
+  REQUIRE(out.sampled_token_ids[0].size() == 1);
+  const int32_t sampled = out.sampled_token_ids[0][0];
+
+  // The dump must exist for THIS request, one step of [1, vocab] f32.
+  std::ifstream bin(std::string(dump_dir) + "/ours_A.f32",
+                    std::ios::binary | std::ios::ate);
+  REQUIRE(bin.good());
+  CHECK(bin.tellg() == static_cast<std::streamsize>(
+                           sizeof(float) * static_cast<size_t>(c.vocab_size)));
+  bin.seekg(0);
+  std::vector<float> row(static_cast<size_t>(c.vocab_size));
+  bin.read(reinterpret_cast<char*>(row.data()),
+           static_cast<std::streamsize>(row.size() * sizeof(float)));
+  size_t best = 0;
+  for (size_t v = 1; v < row.size(); ++v) if (row[v] > row[best]) best = v;
+  CHECK(static_cast<int32_t>(best) == sampled);
+}
+
+// ─── SPEC-DFLASH2 A2-2 (#2802): THE VERIFY DOWNLOAD'S PAGE-LOCKED STAGING ────
+//
+// A fresh review found the copy-queue verify route copying into a plain
+// `std::vector<int32_t>`. A device-to-host `cudaMemcpyAsync` into PAGEABLE host
+// memory is host-synchronous — the driver stages it through its own pinned
+// buffer and the call returns only when the bytes are across — so the fork and
+// ready events around that copy were decorative and no later wave could have
+// obtained overlap from them. The destination is now `PinnedGrowStaging`, which
+// allocates through `vt::Backend::AllocPinned`, as this tree's async sampled-id
+// route already did (`src/vllm/v1/worker/gpu/async_output.cpp`) and as upstream
+// gets for free by copying into torch CPU memory (async_utils.py:124-125).
+//
+// THE PART THIS TIER CAN GATE is the growth rule, and it is the part that could
+// silently reintroduce the defect the same review found in the accept walk's
+// argmax scratch. A grow must RETAIN the block it replaces: a copy already
+// issued into the old block is still writing it, and freeing it is a
+// use-after-free that is invisible while the wait is in step and wrong the
+// moment A2-4 moves the wait. On CPU `AllocPinned` forwards to `Alloc`, so page
+// locking itself is not observable here; the retain rule is.
+//
+// RED-first, by mutation: making `Get` free the previous block before allocating
+// the new one (the shape the CUDA argmax global had) reds the `live_blocks()`
+// assertions below while every token case in this binary stays green — the
+// tokens never move on this backend either, which is exactly why the rule needs
+// its own assertion.
+TEST_CASE("A2-2: the verify download staging is page-locked and a grow RETAINS the old block") {
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::v1::PinnedGrowStaging staging;
+  CHECK(staging.live_blocks() == 0);
+
+  int32_t* small = staging.Get(backend, 4);
+  REQUIRE(small != nullptr);
+  CHECK(staging.live_blocks() == 1);
+  CHECK(staging.elems() == 4);
+  for (int i = 0; i < 4; ++i) small[i] = 100 + i;
+
+  // A request that FITS returns the same block: the steady state allocates
+  // nothing, which is the reason this is a member and not a local.
+  CHECK(staging.Get(backend, 4) == small);
+  CHECK(staging.Get(backend, 1) == small);
+  CHECK(staging.live_blocks() == 1);
+
+  // A GROW hands back a new block and keeps the old one allocated.
+  int32_t* big = staging.Get(backend, 64);
+  REQUIRE(big != nullptr);
+  CHECK(big != small);
+  CHECK(staging.live_blocks() == 2);
+  CHECK(staging.elems() == 64);
+  // The retained block is still ours to read: nothing freed it, so a copy that
+  // was already writing it is writing memory this object still owns.
+  CHECK(small[0] == 100);
+  CHECK(small[3] == 103);
+
+  // A second grow retains again; the destructor releases every block.
+  staging.Get(backend, 256);
+  CHECK(staging.live_blocks() == 3);
 }

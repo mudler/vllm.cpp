@@ -37,6 +37,7 @@
 #include "vt/quant.h"
 
 #include "qwen4_exp_gguf_manifest.inc"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -417,7 +418,7 @@ TEST_CASE("per_layer_token_embd is kept QUANTIZED, and the arithmetic says why")
   CHECK(vllm::RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
                               /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
                               vllm::GgufTensorRole::kEmbeddingTable,
-                              /*ggml_type=*/20u, {rows, k}) ==
+                              /*ggml_type=*/20u, {rows, k}, vllm::platforms::CurrentPlatform().device_type()) ==
         vllm::GgufResidency::kKeepQuant);
 
   // The numbers that make it load-bearing rather than a preference. 51.2 G
@@ -450,7 +451,7 @@ TEST_CASE("the OTHER IQ4_NL tensors are GEMM weights and route as such") {
   CHECK(640 % 256 != 0);
   CHECK(vllm::RouteGgufTensor(true, false, false, false,
                               vllm::GgufTensorRole::kStackedExpertWeight, 20u,
-                              {512, 2560, 640}) ==
+                              {512, 2560, 640}, vllm::platforms::CurrentPlatform().device_type()) ==
         vllm::GgufResidency::kKeepQuant);
   // Which requires the GEMM predicate, not the gather one: a `vec_dot` against
   // Q8_0 activations. Without it these 48 tensors expand to bf16 and the box is

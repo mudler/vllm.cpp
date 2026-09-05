@@ -5,11 +5,11 @@
 //
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
 // This row splits its oracles by developer direction (spec `## Oracles`):
-// transformers supplies the ALGORITHM, vLLM supplies the OP FORM. vLLM has never
-// registered `qwen4_exp` at any revision, so there is no vLLM kernel to mirror
-// for QSA itself; what vLLM supplies is the shape of the DeepSeek-V4 indexer
-// lane, which QSA matches on nine independent structural points including the
-// literal `compress_ratio == 4`.
+// transformers supplied the ALGORITHM and vLLM the OP FORM. SUPERSEDED
+// 2026-08-31 (#2489): vLLM registers `qwen4_exp` at `e126687a9a`, beyond our pin
+// `555967922`, and `nvidia/ops/qsa.py` is QSA's own kernel. It CONFIRMS the two
+// calls made from the DeepSeek-V4 shape below: the mean pool over
+// `compress_ratio`, and the divide placed after the head sum.
 //
 //   ALGORITHM  transformers v5.16.0 (the lane pin),
 //              `models/qwen4_exp/modeling_qwen4_exp.py`

@@ -34,6 +34,15 @@ namespace vt::cpu {
 // FP-add latency bottleneck of the one-accumulator scalar loop.
 inline constexpr int kElemLanes = 16;
 
+// The largest `mr` any tier may declare. `MatmulOneChunk` carries ONE
+// stack accumulator tile of `kElemLanes * kElemMaxMr` floats and pads its
+// activation tile up to a whole number of `mr` blocks against it, so a tier
+// that raised `mr` past this bound would write past that tile. Every tier
+// static_asserts its own `mr` against this constant, so the refusal is at
+// compile time in the file that sets the value rather than at run time in the
+// file that trusts it.
+inline constexpr int kElemMaxMr = 8;
+
 // The three elementwise dtypes a GEMM operand may have.
 enum class ElemKind : int { kF32 = 0, kF16 = 1, kBF16 = 2, kCount = 3 };
 
@@ -108,5 +117,17 @@ bool ElemGemmUseRef();
 // Widen `n` contiguous elements of `src` (dtype `dt`) into `dst` as f32.
 // Bit-identical to a per-element LoadF32.
 void WidenRowToF32(DType dt, const void* src, int64_t n, float* dst);
+
+// The output counterpart: narrow `n` f32 values into `dst`'s storage dtype with
+// ONE branch for the row instead of one per element. Same supported set and the
+// same round-to-nearest-even (`F32ToBF16`) / `F32ToF16` as a per-element
+// `StoreF32`, so it is bit-identical to one.
+//
+// Row VT-CPU-ELEM-SURVEY, .agents/specs/vt-cpu-elem-survey.md. It lives here,
+// beside `WidenRowToF32`, because that is where a caller already looks for the
+// pair; `cpu_paged_attn.cpp` carries a file-private `StoreRowF32` that predates
+// it and differs only in its refusal MESSAGE, which is why folding the two is a
+// separate row rather than a silent behaviour change (see that spec's `## Owed`).
+void NarrowRowFromF32(DType dt, void* dst, int64_t n, const float* src);
 
 }  // namespace vt::cpu

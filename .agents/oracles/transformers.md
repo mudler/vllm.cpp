@@ -44,7 +44,40 @@ gateable = yes
 evidence = .agents/specs/audio-track.md
 ```
 
-## ACCEPTED lane exception: `qwen4_exp` (`MODEL-MM-QWEN4-EXP`, [#1978](https://github.com/mudler/vllm.cpp/issues/1978))
+## EXPIRED lane exception: `qwen4_exp` (`MODEL-MM-QWEN4-EXP`, [#1978](https://github.com/mudler/vllm.cpp/issues/1978))
+
+**EXPIRED 2026-08-31, on its own stated condition. Kept in full, not deleted,
+because a lane that vanishes cannot be audited and the next reader needs to see
+what was accepted as well as what ended it.**
+
+The exception's stop condition is written into it below: "It expires the moment
+vLLM registers `qwen4_exp`." vLLM landed `[Model] Support Qwen3.8-Flash-Next
+(#53896)` at `e126687a9a` on 2026-08-31, adding `vllm/models/qwen4_exp/` and
+registering `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` and
+`Qwen4ExpMTP`. The condition has fired.
+
+What that changes: `transformers` stops being the ALGORITHM oracle for
+`model_type: qwen4_exp` and demotes to the preprocessing and
+checkpoint-semantics role it holds for every other model in this file. The row
+reconciles onto vLLM, and the reconciliation is recorded in
+[`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md) under
+`## Oracles` and `### Component-by-component reconciliation`
+([#2489](https://github.com/mudler/vllm.cpp/issues/2489)).
+
+What it does NOT change: the pin above stays where it is, because 5.16.0 is
+still the release that contains the architecture and `transformers` is still an
+oracle for its ordinary role. Nothing built under the exception is invalidated
+by its expiry; two of its load-bearing calls, the unweighted mean pool and the
+divide-after-the-head-sum block score, were checked against vLLM's own kernels
+and CONFIRMED.
+
+Also worth carrying: `e126687a9a` is NOT reachable from the vLLM parity pin
+`555967922` and is 595 commits ahead of it. Every citation of it is a forward
+reference to an unpinned upstream. That does not un-fire the condition, which is
+about what vLLM implements and not about what our pin has caught up with.
+
+The accepted record follows unchanged.
+
 
 **ACCEPTED by the developer, 2026-08-26.** The `oracle-pin` block above is unchanged
 and remains the pin for every other consumer; this lane pin is additional and
@@ -115,6 +148,9 @@ pin_label = 5.16.0
 pinned_on = 2026-08-26
 accepted_by = developer, 2026-08-26
 expires = when vLLM registers qwen4_exp
+expired_on = 2026-08-31
+expired_by = vllm-project/vllm e126687a9a ([Model] Support Qwen3.8-Flash-Next #53896)
+expiry_record = https://github.com/mudler/vllm.cpp/issues/2489
 gateable = no
 gateable_reason = no published artifact fits any fleet device; blocked on memory, not software
 owner_row = MODEL-MM-QWEN4-EXP

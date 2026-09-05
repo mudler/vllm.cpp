@@ -3,6 +3,7 @@
 // Correctness-grade (M0.6): plain grid-stride / one-block-per-row kernels, f32
 // accumulation, double-precision RoPE angles matching the CPU reference.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -15,9 +16,11 @@
 #include <string>
 #include <type_traits>
 
+#include "vt/cuda/cuda_embedding_quant.h"  // the KGATHER seam: block-table gather + its error record
 #include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
 #include "vt/dflash_attn_grid.h"
+#include "vt/dflash_attn_mask.h"
 
 namespace vt::cuda {
 
@@ -58,6 +61,22 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
 // N is a compile-time width, so N==4/2 collapse to one LDG.128/LDG.64 (f32) or
 // LDG.64/LDG.32 (bf16) instead of N separate scalar loads. Callers guarantee the
 // element offset is a multiple of N, which is what makes the wide load legal.
+// GAMMA-ONLY element type (#2503). `vt::RmsNorm` and `vt::RmsNormQuantFp8` both
+// admit `IsFloat(weight.dtype)` (ops.cpp:24, :1030, :748), which includes kF16,
+// and the CPU siblings widen a kF16 gamma like any other (`WidenRowToF32`,
+// cpu_ops.cpp:554-557; `LoadF32`, cpu_ops.cpp:1042) -- so the CUDA arm refusing
+// it was a device arm refusing a dtype its CPU sibling accepts, which
+// `cuda_qwen4_exp.cu:60-62` says must not stand unrecorded. vLLM's own
+// `GemmaRMSNorm` upcasts whatever the gamma is (`self.weight.float()`,
+// vllm/models/qwen4_exp/nvidia/ple_layer.py:80 at vLLM origin/main cdefd9d499 --
+// AHEAD of this project's pin 5559679229, a forward reference, #2502), and
+// `CudaPlatform::supported_dtypes` already promises kF16 (platforms/cuda.cpp:112).
+//
+// kF16 is admitted ONLY as a gamma. `Tin` (the activation) and `out` are still
+// f32/bf16 on this arm, which is a SEPARATE divergence of the same class and is
+// recorded, not fixed, here (#2542).
+__device__ inline float Load(const __half* p, int64_t i) { return __half2float(p[i]); }
+
 template <int N>
 __device__ inline void LoadVec(const float* p, int64_t i, float* o) {
   if (N == 4) {
@@ -103,8 +122,34 @@ template <> __device__ inline float ResRound<__nv_bfloat16>(float v) {
 // rmsnorm: one block per row, shared-memory f32 tree reduction.
 // Upstream csrc counterpart: csrc/layernorm_kernels.cu (rms_norm_kernel / fused_add_rms_norm_kernel) — align signatures post-MVP.
 
-template <typename Tin, typename Tout, typename Tres>
-__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual,
+// `Tw` is the GAMMA's own dtype and is INDEPENDENT of `Tin` (#2477). It used to be
+// `Tin`, which welded the two and forced the dispatcher to refuse the pairing the
+// qwen4_exp QSA block issues: an **f32 ACTIVATION against a bf16 GAMMA**, at
+// qwen4_exp_qsa_block.cpp:705, where `vt::AttnGateSplit` fills a `DType::kF32`
+// `q_f32` (:694) and the gamma is bf16.
+//
+// NOT the reverse, and an earlier revision of this comment said the reverse. The
+// released GGUF stores norm tensors as F32 ON DISK, but the loader converts:
+// `LoadNormBf16` (qwen4_exp_weights.cpp) runs `DequantAll` into an f32 vector and
+// returns `Bf16From(...)` = `MakeTensor(kBF16, ...)` (glm_moe_dsa_loader.cpp:145-151).
+// On-disk dtype is not runtime dtype.
+//
+// THIS IS A SYMPTOM FIX AND THE SPEC SAYS SO. The cause is #2488: upstream chunks
+// `q` off the bf16 QKV GEMM and hands it to `q_norm` unwidened
+// (vllm/model_executor/models/qwen3_next.py:384-440), so the f32 buffer is the
+// divergence. Narrowing it is blocked on `AttnGateSplit`'s f32 output being welded
+// into its own CUDA signature (cuda_glue.cu:181) and shared with Qwen3.5.
+//
+// Decoupling the two dtypes is nevertheless right on its own terms: vLLM never
+// couples them (`GemmaRMSNorm` does `self.weight.float()`, vllm/models/qwen4_exp/
+// nvidia/ple_layer.py:80 -- read at vLLM origin/main 25efcfa788, which is AHEAD of
+// this project's pin 5559679229; see #2502), this file's CPU sibling widens `w` and
+// `x` separately (cpu_ops.cpp:554-557, :576), and the CUDA grouped-norm sibling
+// already carries an independent weight tag (cuda_rms_norm_group.cu:194).
+// `Load()` is overloaded for both element types above, so the body is unchanged and
+// the f32 arithmetic below is bit-identical for every pairing that already worked.
+template <typename Tin, typename Tw, typename Tout, typename Tres>
+__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual,
                                  int64_t h, float eps, bool gemma) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
@@ -408,21 +453,21 @@ inline bool TryLaunchRmsNormDecodeFastF32(cudaStream_t s, Tensor& out, const Ten
 // bf16 model dtype (model_config.dtype=bfloat16): the residual stream is bf16, only
 // the variance/normalize accumulation below stays f32. A f32 residual (or none)
 // takes the byte-identical previous path.
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tw, typename Tout>
 void LaunchRmsNormRes(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                       const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h) {
   if (residual != nullptr && residual->dtype == DType::kBF16) {
-    RmsNormRowKernel<Tin, Tout, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__nv_bfloat16>(), h,
+    RmsNormRowKernel<Tin, Tw, Tout, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__nv_bfloat16>(), h,
         args.eps, args.gemma);
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-    RmsNormRowKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma);
+    RmsNormRowKernel<Tin, Tw, Tout, float><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma);
   }
 }
 
-template <typename Tin>
+template <typename Tin, typename Tw>
 void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
@@ -447,23 +492,52 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   }
   switch (out.dtype) {
     case DType::kF32:
-      LaunchRmsNormRes<Tin, float>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h);
       break;
     case DType::kBF16:
-      LaunchRmsNormRes<Tin, __nv_bfloat16>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, __nv_bfloat16>(s, out, x, w, args, residual, rows, h);
       break;
     default: VT_CHECK(false, "cuda rmsnorm: unsupported out dtype");
   }
   Check(cudaGetLastError(), "rmsnorm launch");
 }
 
+// The gamma's dtype is dispatched SEPARATELY from the activation's (#2477). This
+// read `VT_CHECK(w.dtype == x.dtype)`, which was an honest mirror of the kernel's
+// old `const Tin* w` -- accepting the mismatch without retyping the kernel would
+// have read the bf16 `[256]` gamma through a `const float*` and run off its end,
+// because at qwen4_exp_qsa_block.cpp:705 `Tin` IS `float` and `head_dim` is 256.
+// (`[128]` here previously; that is the indexer's head_dim, from the abandoned
+// reading in which :632 was the refusing site.) The
+// refusal is therefore NARROWED, not deleted: an unsupported gamma dtype is still
+// refused, and now says which one it got.
+template <typename Tin>
+void DispatchRmsNormWeight(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                           const RmsNormArgs& args, Tensor* residual) {
+  switch (w.dtype) {
+    case DType::kF32: LaunchRmsNorm<Tin, float>(s, out, x, w, args, residual); break;
+    // kF16 (#2503): the seam admits it and the CPU arm serves it, so this arm has
+    // to as well. Added rather than recorded as a divergence because vLLM upcasts
+    // any float gamma and this platform advertises kF16 (see the `Load(const
+    // __half*)` comment above). The `default:` below is what stops a future dtype
+    // from being read through the wrong pointer type.
+    case DType::kF16: LaunchRmsNorm<Tin, __half>(s, out, x, w, args, residual); break;
+    case DType::kBF16: LaunchRmsNorm<Tin, __nv_bfloat16>(s, out, x, w, args, residual); break;
+    default:
+      VT_CHECK(false, std::string("cuda rmsnorm: unsupported weight dtype "
+                                  "(f32/f16/bf16 only), got ") +
+                          Name(w.dtype));
+  }
+}
+
 void RmsNormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
-  VT_CHECK(w.dtype == x.dtype, "cuda rmsnorm: weight dtype must match x");
   switch (x.dtype) {
-    case DType::kF32: LaunchRmsNorm<float>(AsStream(q), out, x, w, args, residual); break;
+    case DType::kF32:
+      DispatchRmsNormWeight<float>(AsStream(q), out, x, w, args, residual);
+      break;
     case DType::kBF16:
-      LaunchRmsNorm<__nv_bfloat16>(AsStream(q), out, x, w, args, residual);
+      DispatchRmsNormWeight<__nv_bfloat16>(AsStream(q), out, x, w, args, residual);
       break;
     default: VT_CHECK(false, "cuda rmsnorm: unsupported input dtype (f32/bf16 only)");
   }
@@ -482,9 +556,17 @@ __device__ __forceinline__ uint8_t RmsNormF32ToFp8Dev(float f) {
   return static_cast<uint8_t>(__nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3));
 }
 
-template <typename Tin, typename Tres>
+// `Tw` is the GAMMA's own dtype and is INDEPENDENT of `Tin` -- the same decoupling
+// `RmsNormRowKernel` above got in #2477, applied to its fused twin (#2492). It used
+// to be `Tin`, which welded the two and forced `RmsNormQuantFp8KernelCuda` to
+// refuse `w.dtype != x.dtype` while its CPU sibling read the gamma through
+// `LoadF32(w, j)` (cpu_ops.cpp:1042) and accepted every float dtype. `Load()` is
+// overloaded for all three gamma element types above, so the reduction, the
+// bf16 intermediate and the fp8 conversion below are unchanged and bit-identical
+// for every pairing that already worked.
+template <typename Tin, typename Tw, typename Tres>
 __global__ void RmsNormQuantFp8RowKernel(uint8_t* out_fp8, __nv_bfloat16* out_bf16, const Tin* x,
-                                         const Tin* w, Tres* residual, int64_t h, float eps,
+                                         const Tw* w, Tres* residual, int64_t h, float eps,
                                          bool gemma, float inv_scale) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
@@ -520,7 +602,7 @@ __global__ void RmsNormQuantFp8RowKernel(uint8_t* out_fp8, __nv_bfloat16* out_bf
   }
 }
 
-template <typename Tin>
+template <typename Tin, typename Tw>
 void LaunchRmsNormQuantFp8(cudaStream_t s, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
                            const Tensor& w, const RmsNormArgs& args, Tensor* residual,
                            float input_scale) {
@@ -530,30 +612,55 @@ void LaunchRmsNormQuantFp8(cudaStream_t s, Tensor& out_fp8, Tensor* out_bf16, co
   const float inv_scale = 1.0f / input_scale;
   __nv_bfloat16* bf16 = out_bf16 == nullptr ? nullptr : out_bf16->Ptr<__nv_bfloat16>();
   if (residual != nullptr && residual->dtype == DType::kBF16) {
-    RmsNormQuantFp8RowKernel<Tin, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
-        out_fp8.Ptr<uint8_t>(), bf16, x.Ptr<Tin>(), w.Ptr<Tin>(),
+    RmsNormQuantFp8RowKernel<Tin, Tw, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
+        out_fp8.Ptr<uint8_t>(), bf16, x.Ptr<Tin>(), w.Ptr<Tw>(),
         residual->Ptr<__nv_bfloat16>(), h, args.eps, args.gemma, inv_scale);
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-    RmsNormQuantFp8RowKernel<Tin, float><<<rows, kBlock, 0, s>>>(
-        out_fp8.Ptr<uint8_t>(), bf16, x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma,
+    RmsNormQuantFp8RowKernel<Tin, Tw, float><<<rows, kBlock, 0, s>>>(
+        out_fp8.Ptr<uint8_t>(), bf16, x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma,
         inv_scale);
   }
   Check(cudaGetLastError(), "rmsnorm_quant_fp8 launch");
 }
 
+// The gamma's dtype is dispatched SEPARATELY from the activation's (#2492),
+// exactly as `DispatchRmsNormWeight` does for the unfused op. The refusal is
+// NARROWED, not deleted: accepting a mismatch without retyping the kernel would
+// have read a bf16 gamma through a `const float*` and run off the end of it.
+template <typename Tin>
+void DispatchRmsNormQuantFp8Weight(cudaStream_t s, Tensor& out_fp8, Tensor* out_bf16,
+                                   const Tensor& x, const Tensor& w, const RmsNormArgs& args,
+                                   Tensor* residual, float input_scale) {
+  switch (w.dtype) {
+    case DType::kF32:
+      LaunchRmsNormQuantFp8<Tin, float>(s, out_fp8, out_bf16, x, w, args, residual, input_scale);
+      break;
+    case DType::kF16:
+      LaunchRmsNormQuantFp8<Tin, __half>(s, out_fp8, out_bf16, x, w, args, residual, input_scale);
+      break;
+    case DType::kBF16:
+      LaunchRmsNormQuantFp8<Tin, __nv_bfloat16>(s, out_fp8, out_bf16, x, w, args, residual,
+                                                input_scale);
+      break;
+    default:
+      VT_CHECK(false, std::string("cuda rmsnorm_quant_fp8: unsupported weight dtype "
+                                  "(f32/f16/bf16 only), got ") +
+                          Name(w.dtype));
+  }
+}
+
 void RmsNormQuantFp8KernelCuda(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
                                const Tensor& w, const RmsNormArgs& args, Tensor* residual,
                                float input_scale) {
-  VT_CHECK(w.dtype == x.dtype, "cuda rmsnorm_quant_fp8: weight dtype must match x");
   switch (x.dtype) {
     case DType::kF32:
-      LaunchRmsNormQuantFp8<float>(AsStream(q), out_fp8, out_bf16, x, w, args, residual,
-                                   input_scale);
+      DispatchRmsNormQuantFp8Weight<float>(AsStream(q), out_fp8, out_bf16, x, w, args, residual,
+                                           input_scale);
       break;
     case DType::kBF16:
-      LaunchRmsNormQuantFp8<__nv_bfloat16>(AsStream(q), out_fp8, out_bf16, x, w, args, residual,
-                                           input_scale);
+      DispatchRmsNormQuantFp8Weight<__nv_bfloat16>(AsStream(q), out_fp8, out_bf16, x, w, args,
+                                                   residual, input_scale);
       break;
     default: VT_CHECK(false, "cuda rmsnorm_quant_fp8: unsupported input dtype (f32/bf16 only)");
   }
@@ -740,11 +847,11 @@ void SoftCapKernelCuda(Queue& q, Tensor& out, const Tensor& x, double cap) {
 // M0.9/M2).
 // No direct csrc counterpart (upstream uses torch embedding); keep vt-native.
 
-struct EmbeddingErr {
-  int status;    // 0 = ok, 1 = bad id recorded
-  int pad;       // keep `id` naturally aligned
-  long long id;  // first out-of-range id seen (valid when status != 0)
-};
+// The error record moved to vt/cuda/cuda_embedding_quant.h when the BLOCK arm
+// landed: the block kernels live in cuda_quant_dot.cu (the only TU that may
+// include the device codebooks) and write this same latch, and two hand-mirrored
+// layouts would report a wrong id without ever failing to compile.
+using EmbeddingErr = EmbeddingQuantErr;
 
 template <typename Tin, typename Tout, typename Tid>
 __global__ void EmbeddingKernel(Tout* out, const Tin* table, const Tid* ids, int64_t n,
@@ -858,8 +965,23 @@ bool ConsumeEmbeddingErr(EmbeddingErrSlot& slot, bool force, EmbeddingErr* err_o
 
 void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   // Validate dtypes before touching the ring so a throw cannot leave a slot armed.
-  VT_CHECK(table.dtype == DType::kF32 || table.dtype == DType::kBF16,
-           "cuda embedding: unsupported table dtype (f32/bf16 only)");
+  //
+  // BLOCK-QUANTIZED tables are admitted here (KGATHER). This kernel asserted
+  // f32/bf16 until then, which is why `DeviceQuantGatherSupported` refused every
+  // non-CPU device and a kept table expanded at load instead -- 26.822 GiB of
+  // IQ4_NL becoming 95.368 GiB of bf16 for the shipped n-gram table, which fits
+  // nothing in this fleet. The decode is one row per gathered id, mirroring the
+  // CPU arm (cpu_ops.cpp EmbeddingKernel) and `ggml_compute_forward_get_rows_q`.
+  const bool block_table = IsBlockQuant(table.dtype);
+  VT_CHECK(block_table || table.dtype == DType::kF32 || table.dtype == DType::kBF16,
+           "cuda embedding: unsupported table dtype (f32/bf16 or a block quant)");
+  // A block dtype with NO device decoder must say so by name. It cannot be
+  // reached from the loader, whose `DeviceQuantGatherSupported` gate is pinned
+  // to this same list, but a direct `vt::Embedding` caller can reach it and the
+  // alternative to a named refusal is a silently untouched output buffer.
+  VT_CHECK(!block_table || EmbeddingQuantSupported(table.dtype),
+           std::string("cuda embedding: no device row decoder for block dtype ") +
+               Name(table.dtype));
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
            "cuda embedding: unsupported out dtype");
   const int64_t n = ids.shape[0] * table.shape[1];
@@ -895,7 +1017,8 @@ void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tenso
 
   cudaError_t st = cudaMemsetAsync(slot.dev, 0, sizeof(EmbeddingErr), s);
   if (st == cudaSuccess) {
-    st = table.dtype == DType::kF32
+    st = block_table ? LaunchEmbeddingQuant(s, out, table, ids, slot.dev)
+         : table.dtype == DType::kF32
              ? LaunchEmbeddingIn<float>(s, out, table, ids, slot.dev)
              : LaunchEmbeddingIn<__nv_bfloat16>(s, out, table, ids, slot.dev);
   }
@@ -1607,9 +1730,12 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;                        // combined intra-block offset
-  const int64_t jhi = causal ? ii : (qe - qs - 1);  // last visible intra-block key
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h). A NON-CAUSAL layer
+  // carrying a window attends SYMMETRICALLY within it; it used to attend over
+  // the whole block.
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = span.hi;  // last visible intra-block key
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
 
   extern __shared__ float smem[];
@@ -1746,11 +1872,10 @@ __global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* k
     const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
     const int64_t qs = sp.ks, qe = sp.ke;
     const int64_t ii = sp.ic;
-    const int64_t rel_hi = causal ? ii : (qe - qs - 1);
-    int64_t rel_lo = 0;
-    if (causal && window > 0) rel_lo = (ii - (window - 1) > 0) ? ii - (window - 1) : 0;
-    jlo[u] = qs + rel_lo;
-    jhi[u] = qs + rel_hi;
+    // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+    const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+    jlo[u] = qs + span.lo;
+    jhi[u] = qs + span.hi;
     lo = min(lo, jlo[u]);
     hi = max(hi, jhi[u]);
     const int64_t qoff = (i * hq + h) * d;
@@ -1820,9 +1945,10 @@ __global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, cons
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;
-  const int64_t jhi = causal ? ii : (qe - qs - 1);
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = span.hi;
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
 
   // Q and the accumulator in registers: lane L holds elements L, L+32, L+64, ...
@@ -1983,9 +2109,10 @@ __global__ void DFlashAttnKeyLaneKernel(Tout* out, const Tin* query, const Tin* 
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;
-  const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
-  int64_t jlo = qs;
-  if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = qs + span.hi;  // last visible GLOBAL key
+  const int64_t jlo = qs + span.lo;
 
   const int64_t qoff = (i * hq + h) * kD;
   for (int e = lane; e < kD; e += 32) qsh[e] = Load(query, qoff + e);
@@ -2261,9 +2388,10 @@ __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* ke
   const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, i);
   const int64_t qs = sp.ks, qe = sp.ke;
   const int64_t ii = sp.ic;
-  const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
-  int64_t jlo = qs;
-  if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+  const int64_t jhi = qs + span.hi;  // last visible GLOBAL key
+  const int64_t jlo = qs + span.lo;
 
   const int64_t qoff = (i * hq + h) * kD;
   float qreg[kPerLane], acc[kPerLane];
@@ -2429,12 +2557,16 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
   const int64_t qrs = qcu[rq], qre = qcu[rq + 1];
   const int64_t rs = cu[rq], re = cu[rq + 1];
   const int64_t off = (re - rs) - (qre - qrs);  // bottom-right anchor
-  const int64_t khi = causal ? (rs + off + (qend - 1 - qrs)) : (re - 1);
-  int64_t klo = rs;
-  if (causal && window > 0) {
-    const int64_t ii = off + (qblk - qrs);
-    klo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
-  }
+  // #2784: the block's STAGING range is the union of its rows' masks. Both
+  // bounds of `vt::DFlashMaskSpanOf` are non-decreasing in the query row
+  // (asserted in tests/vt/test_dflash_attn_mask.cpp), so the union is the FIRST
+  // row's `lo` and the LAST row's `hi` — no third formula to keep in step.
+  const vt::DFlashMaskSpan sfirst =
+      vt::DFlashMaskSpanOf(off + (qblk - qrs), re - rs, causal, window);
+  const vt::DFlashMaskSpan slast =
+      vt::DFlashMaskSpanOf(off + (qend - 1 - qrs), re - rs, causal, window);
+  const int64_t khi = rs + slast.hi;
+  const int64_t klo = rs + sfirst.lo;
   if (khi < klo) return;  // block-uniform
 
   // --- this lane's TWO query rows and their per-row mask bounds -------------
@@ -2453,9 +2585,10 @@ __global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
     const DFlashRowSpan sp = DFlashResolveRow(qcu, cu, num_reqs, ic);
     const int64_t qs = sp.ks, qe = sp.ke;
     const int64_t ii = sp.ic;
-    rhi[u] = qs + (causal ? ii : (qe - qs - 1));
-    rlo[u] = qs;
-    if (causal && window > 0) rlo[u] = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+    // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+    const vt::DFlashMaskSpan rspan = vt::DFlashMaskSpanOf(ii, qe - qs, causal, window);
+    rhi[u] = qs + rspan.hi;
+    rlo[u] = qs + rspan.lo;
   }
 
   // --- Q A-fragments, read ONCE straight from global into registers ---------
@@ -2891,9 +3024,10 @@ __global__ void DFlashPagedBlockAttentionKernel(
   const int64_t C = slen[req];
   const int64_t N = C + blen;  // combined key length
   const int64_t ii_comb = C + (i - qs);
-  const int64_t jhi = causal ? ii_comb : (N - 1);
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii_comb, N, causal, window);
+  const int64_t jhi = span.hi;
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
 
   extern __shared__ float smem[];
@@ -2997,9 +3131,10 @@ __global__ void DFlashPagedBlockAttentionWarpKernel(
   const int64_t C = slen[req];
   const int64_t N = C + blen;  // combined key length
   const int64_t ii_comb = C + (i - qs);
-  const int64_t jhi = causal ? ii_comb : (N - 1);
-  int64_t jlo = 0;
-  if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+  // #2784: the ONE shared bound (vt/dflash_attn_mask.h).
+  const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii_comb, N, causal, window);
+  const int64_t jhi = span.hi;
+  const int64_t jlo = span.lo;
   const int64_t qoff = (i * hq + h) * d;
   const int npl = static_cast<int>((d + 31) / 32);
   float qreg[kMaxPerLane];
@@ -3929,6 +4064,25 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+    // KGATHER. `EmbeddingKernelCuda` branches on `IsBlockQuant(table.dtype)` and
+    // routes a block table to `LaunchEmbeddingQuant` (decoders in
+    // vt/cuda/cuda_quant_dequant.cuh). Registering it under the quant id is what
+    // makes this device's block-gather capability visible to `OpRegistered`,
+    // which is what `DeviceQuantGatherSupported` asks -- so this call IS the
+    // GGUF residency flip, and there is no separate boolean anywhere.
+    //
+    // It was withheld until a GPU had executed the decoders, because registering
+    // it early would route EVERY GGUF model's block-typed gather table on CUDA
+    // into never-executed code, with no throw and no log if a decode were wrong.
+    // MEASURED on thor:gpu0 (Jetson Thor, sm_110, nvcc 13.0.88, aarch64),
+    // 2026-08-31, job e53a20f5: the RED leg without this arm failed BY NAME on
+    // 4 of 5 cases at 32 assertions ("cuda embedding: unsupported table dtype"),
+    // and with it `tests/vt/test_cuda_embedding_quant.cpp` passed 6 of 6 cases
+    // at 231 of 231 assertions -- every one of the 18 block encodings gathered
+    // BIT-EXACTLY against the CPU arm, in f32 and bf16 out, i32 and i64 ids.
+    // Deleting this call reds that gate, which is how the mutation leg proved it
+    // is the reachable call site and not a duplicate.
+    RegisterCudaBlockGather();
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
     RegisterOp(
@@ -3973,4 +4127,13 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+// See vt/cuda/cuda_embedding_quant.h. Defined out here, outside the anonymous
+// namespace, because `EmbeddingKernelCuda` has internal linkage and the gate
+// cannot name it -- this function is the only way in, which is also what keeps
+// the flip auditable as a single call site.
+void RegisterCudaBlockGather() {
+  RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCUDA,
+             reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+}
+
 }  // namespace vt::cuda

@@ -1,0 +1,874 @@
+===== 0. identity =====
+2026-09-04T04:17:16Z
+tree             = /home/mudler/_git/vllm.cpp-limb3-2864
+tree_head        = f2930e9182e046ce8196337ed8e5ef5c4e503a8d
+vllm_checkout    = /home/mudler/_git/vllm
+vllm_head        = 5559679229bc961848b121ccdeaa8fa5d79bec98
+vllm_pin_wanted  = 5559679229bc961848b121ccdeaa8fa5d79bec98
+VLLM_CHECKOUT_IS_THE_PIN = yes
+
+===== 1. CONDITION 2: the GGUF architectures OUR build dispatches on =====
+constexpr GgufArchArm kGgufArchArms[] = {
+    {"deepseek4", &vllm::DeepseekV4HfConfigFromGguf},
+    {vllm::kMuseGlimmerGgufArch, &vllm::MuseGlimmerHfConfigFromGguf},
+    {"qwen35", &vllm::HfConfigFromGguf},
+    {"qwen35moe", &vllm::HfConfigFromGguf},
+    {"qwen3next", &vllm::HfConfigFromGguf},
+    {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
+    {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
+    {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
+};
+-- the four constants, resolved --
+38:inline constexpr const char* kQwen4ExpGgufArch = "qwen4exp";
+44:inline constexpr const char* kGlm5NextGgufArch = "glm5next";
+52:inline constexpr const char* kGlmMoeDsaGgufArch = "glm-dsa";
+69:inline constexpr const char* kClipGgufArch = "clip";
+99:inline constexpr const char* kMuseGlimmerGgufArch = "muse-glimmer";
+
+===== 2. CONDITION 1 precondition: the ggml type ids our reader ACCEPTS =====
+ACCEPTED_GGML_TYPE_IDS = 0 1 2 6 8 10 11 12 13 14 16 17 18 19 20 21 22 23 24 25 26 27 28 30 39 40 41 66 
+  id 3 REFUSED  (GgmlTraits throws)
+  id 5 REFUSED  (GgmlTraits throws)
+  id 7 REFUSED  (GgmlTraits throws)
+  id 9 REFUSED  (GgmlTraits throws)
+  id 15 REFUSED  (GgmlTraits throws)
+  id 21 ACCEPTED
+  id 29 REFUSED  (GgmlTraits throws)
+  id 31 REFUSED  (GgmlTraits throws)
+  id 34 REFUSED  (GgmlTraits throws)
+  id 35 REFUSED  (GgmlTraits throws)
+
+===== 3. CONDITION 3: does the PINNED vLLM register each of our arms? =====
+REGISTRY  DeepseekV4ForCausalLM                  hits=1
+REGISTRY  MuseGlimmer                            hits=0
+REGISTRY  Qwen3_5ForConditionalGeneration        hits=1
+REGISTRY  Qwen3_5MoeForConditionalGeneration     hits=2
+REGISTRY  Qwen3NextForCausalLM                   hits=1
+REGISTRY  Qwen4Exp                               hits=0
+REGISTRY  Glm5Next                               hits=0
+REGISTRY  GlmMoeDsaForCausalLM                   hits=1
+REGISTRY  Laguna                                 hits=1
+REGISTRY  NemotronHForCausalLM                   hits=2
+-- can ANY pinned oracle reach muse-glimmer? four surfaces, not one --
+vllm_pin_glimmer_files   = 0
+vllm_omni_glimmer_files  = 0
+llama_cpp_glimmer_files  = 0
+gguf_py_glimmer_files    = 0
+gguf_py_qwen35_files     = 2  <- the positive control
+-- and the plugin's own adapter registry, from the staged source archive --
+plugin_tgz_sha256 = 9e15c20e0b75f75bbf886966df07843c4b70a7952fad4b80e8e8183e2f70743b
+_ADAPTER_REGISTRY: list[type[BaseGGUFWeightsAdapter]] = [
+    Gemma3GGUFAdapter,
+    Gemma4GGUFAdapter,
+    OLMoEGGUFAdapter,
+    Qwen35GGUFAdapter,
+    Qwen35MtpGGUFAdapter,
+]
+
+===== 4. CONDITIONS 1, 4, 5: every GGUF staged on this fleet =====
+n_gguf_found = 77
+-------------------------------------------------------------------
+BYTES              405752480
+PATH               /mnt/nas_share/checkpoints/minimax-music3-gguf/rvq_depth_decoder_q4_k.gguf
+GGUF_VERSION       3
+N_TENSORS          47
+ARCHITECTURE       audiocpp
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 9, "F16": 2, "Q4_K": 36}
+
+-------------------------------------------------------------------
+BYTES              1631205312
+PATH               /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/dflash-kquant.gguf
+GGUF_VERSION       3
+N_TENSORS          58
+ARCHITECTURE       dflash
+SIZE_LABEL         2.6B
+SHAPE_KV           dflash.block_count = 5
+SHAPE_KV           dflash.embedding_length = 6656
+SHAPE_KV           dflash.feed_forward_length = 19968
+TYPE_HISTOGRAM     {"F32": 22, "Q4_K": 26, "Q6_K": 10}
+
+-------------------------------------------------------------------
+BYTES              1400328928
+PATH               /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/mmproj-kquant.gguf
+GGUF_VERSION       3
+N_TENSORS          809
+ARCHITECTURE       clip
+SIZE_LABEL         1.9B
+SHAPE_KV           clip.vision.block_count = 50
+SHAPE_KV           clip.vision.embedding_length = 1536
+SHAPE_KV           clip.vision.feed_forward_length = 8960
+TYPE_HISTOGRAM     {"BF16": 3, "F32": 506, "Q4_K": 200, "Q6_K": 100}
+
+-------------------------------------------------------------------
+BYTES              16756681056
+PATH               /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/muse-glimmer-30B-kquant-17gb.gguf
+GGUF_VERSION       3
+N_TENSORS          731
+ARCHITECTURE       muse-glimmer
+SIZE_LABEL         28B
+SHAPE_KV           muse-glimmer.block_count = 52
+SHAPE_KV           muse-glimmer.embedding_length = 6656
+SHAPE_KV           muse-glimmer.feed_forward_length = 19968
+TYPE_HISTOGRAM     {"F32": 313, "Q4_K": 365, "Q5_K": 1, "Q6_K": 52}
+
+-------------------------------------------------------------------
+BYTES              19653957984
+PATH               /mnt/nas_share/checkpoints/muse-glimmer-30b-gguf/muse-glimmer-30B-kquant-dynamic.gguf
+GGUF_VERSION       3
+N_TENSORS          731
+ARCHITECTURE       muse-glimmer
+SIZE_LABEL         28B
+SHAPE_KV           muse-glimmer.block_count = 52
+SHAPE_KV           muse-glimmer.embedding_length = 6656
+SHAPE_KV           muse-glimmer.feed_forward_length = 19968
+TYPE_HISTOGRAM     {"F32": 313, "Q4_K": 51, "Q5_K": 130, "Q6_K": 237}
+
+-------------------------------------------------------------------
+BYTES              35004643392
+PATH               /mnt/nas_share/checkpoints/nemotron-3.5-lightning-30b-gguf/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf
+GGUF_VERSION       3
+N_TENSORS          417
+ARCHITECTURE       nemotron_h_moe
+SIZE_LABEL         30B-A3B
+SHAPE_KV           nemotron_h_moe.block_count = 53
+SHAPE_KV           nemotron_h_moe.embedding_length = 2688
+SHAPE_KV           nemotron_h_moe.expert_count = 128
+SHAPE_KV           nemotron_h_moe.expert_used_count = 6
+SHAPE_KV           nemotron_h_moe.feed_forward_length = [0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 1856, 0, 1856, 1856]
+TYPE_HISTOGRAM     {"BF16": 1, "F32": 243, "Q8_0": 173}
+
+-------------------------------------------------------------------
+BYTES              25505724480
+PATH               /mnt/nas_share/checkpoints/nemotron-3.5-lightning-30b-gguf/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf
+GGUF_VERSION       3
+N_TENSORS          417
+ARCHITECTURE       nemotron_h_moe
+SIZE_LABEL         30B-A3B
+SHAPE_KV           nemotron_h_moe.block_count = 53
+SHAPE_KV           nemotron_h_moe.embedding_length = 2688
+SHAPE_KV           nemotron_h_moe.expert_count = 128
+SHAPE_KV           nemotron_h_moe.expert_used_count = 6
+SHAPE_KV           nemotron_h_moe.feed_forward_length = [0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 1856, 0, 0, 1856, 0, 1856, 0, 1856, 0, 1856, 0, 1856, 1856]
+TYPE_HISTOGRAM     {"BF16": 1, "F32": 243, "Q5_0": 23, "Q5_1": 20, "Q8_0": 130}
+
+-------------------------------------------------------------------
+BYTES              10943264
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-iq1_s/Qwen3.8-2.4T-A95B-UD-IQ1_S-00001-of-00012.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen35moe
+SIZE_LABEL         2.4T-A95B
+SHAPE_KV           qwen35moe.block_count = 93
+SHAPE_KV           qwen35moe.embedding_length = 8192
+SHAPE_KV           qwen35moe.expert_count = 512
+SHAPE_KV           qwen35moe.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49124072192
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-iq1_s/Qwen3.8-2.4T-A95B-UD-IQ1_S-00002-of-00012.gguf
+GGUF_VERSION       3
+N_TENSORS          158
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 76, "IQ1_S": 26, "Q4_K": 2, "Q5_K": 39, "Q6_K": 15}
+
+-------------------------------------------------------------------
+BYTES              170270720
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-iq1_s/Qwen3.8-2.4T-A95B-UD-IQ1_S-00003-of-00012.gguf
+GGUF_VERSION       3
+N_TENSORS          165
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 82, "IQ1_S": 27, "Q5_K": 40, "Q6_K": 16}
+
+-------------------------------------------------------------------
+BYTES              10943264
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen35moe
+SIZE_LABEL         2.4T-A95B
+SHAPE_KV           qwen35moe.block_count = 93
+SHAPE_KV           qwen35moe.embedding_length = 8192
+SHAPE_KV           qwen35moe.expert_count = 512
+SHAPE_KV           qwen35moe.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              48759636544
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00002-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          213
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 106, "Q4_K": 2, "Q5_K": 52, "Q6_K": 20, "UNK66": 33}
+
+-------------------------------------------------------------------
+BYTES              49951472352
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00003-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          211
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 105, "Q5_K": 50, "Q6_K": 20, "UNK66": 36}
+
+-------------------------------------------------------------------
+BYTES              49054612640
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00004-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          210
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 101, "Q5_K": 53, "Q6_K": 21, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              49046553504
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00005-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          215
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 106, "Q5_K": 53, "Q6_K": 21, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              49061135392
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00006-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          217
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 108, "Q5_K": 54, "Q6_K": 20, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              48736861088
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00007-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          206
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 100, "Q5_K": 51, "Q6_K": 20, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              49046553504
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00008-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          215
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 106, "Q5_K": 53, "Q6_K": 21, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              47768863488
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00009-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          204
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 100, "Q2_K": 1, "Q5_K": 52, "Q6_K": 19, "UNK66": 32}
+
+-------------------------------------------------------------------
+BYTES              5819761472
+PATH               /mnt/nas_share/checkpoints/qwen3.8-2.4t-a95b-ud-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00010-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          11
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 6, "Q2_K": 2, "Q5_K": 2, "Q8_0": 1}
+
+-------------------------------------------------------------------
+BYTES              53808281952
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-bf16/Qwen3.8-27B-BF16.gguf
+GGUF_VERSION       3
+N_TENSORS          851
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 64
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"BF16": 498, "F32": 353}
+
+-------------------------------------------------------------------
+BYTES              3860293152
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-dflash2-gguf/Qwen3.8-27B-DFlash2-BF16.gguf
+GGUF_VERSION       3
+N_TENSORS          81
+ARCHITECTURE       dflash
+SIZE_LABEL         1.9B
+SHAPE_KV           dflash.block_count = 5
+SHAPE_KV           dflash.embedding_length = 5120
+SHAPE_KV           dflash.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"BF16": 49, "F32": 32}
+
+-------------------------------------------------------------------
+BYTES              1143006752
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+GGUF_VERSION       3
+N_TENSORS          81
+ARCHITECTURE       dflash
+SIZE_LABEL         1.9B
+SHAPE_KV           dflash.block_count = 5
+SHAPE_KV           dflash.embedding_length = 5120
+SHAPE_KV           dflash.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 32, "Q4_K": 45, "Q6_K": 4}
+
+-------------------------------------------------------------------
+BYTES              2056414752
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-dflash2-gguf/Qwen3.8-27B-DFlash2-Q8_0.gguf
+GGUF_VERSION       3
+N_TENSORS          81
+ARCHITECTURE       dflash
+SIZE_LABEL         1.9B
+SHAPE_KV           dflash.block_count = 5
+SHAPE_KV           dflash.embedding_length = 5120
+SHAPE_KV           dflash.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 32, "Q8_0": 49}
+
+-------------------------------------------------------------------
+BYTES              931146432
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-gguf/mmproj-BF16.gguf
+GGUF_VERSION       3
+N_TENSORS          334
+ARCHITECTURE       clip
+SIZE_LABEL         461M
+SHAPE_KV           clip.vision.block_count = 27
+SHAPE_KV           clip.vision.embedding_length = 1152
+SHAPE_KV           clip.vision.feed_forward_length = 4304
+TYPE_HISTOGRAM     {"BF16": 110, "F32": 224}
+
+-------------------------------------------------------------------
+BYTES              17106775008
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-gguf/Qwen3.8-27B-Q4_K_M.gguf
+GGUF_VERSION       3
+N_TENSORS          866
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 65
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 456, "Q4_K": 294, "Q5_K": 48, "Q6_K": 67, "Q8_0": 1}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq1_m/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49988981792
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq1_m/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          568
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 10, "F32": 259, "IQ1_M": 28, "IQ2_XXS": 16, "IQ4_NL": 23, "Q4_K": 2, "Q5_K": 95, "Q6_K": 21, "Q8_0": 114}
+
+-------------------------------------------------------------------
+BYTES              24538827360
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq1_m/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          656
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 14, "F32": 298, "IQ1_M": 20, "IQ2_XXS": 32, "IQ4_NL": 26, "Q5_K": 117, "Q6_K": 19, "Q8_0": 130}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq1_s/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49990818368
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq1_s/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          595
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 10, "F32": 272, "IQ1_S": 36, "IQ2_XXS": 10, "IQ4_NL": 24, "Q4_K": 2, "Q5_K": 100, "Q6_K": 22, "Q8_0": 119}
+
+-------------------------------------------------------------------
+BYTES              22544696352
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq1_s/UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          629
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 14, "F32": 285, "IQ1_S": 32, "IQ2_XXS": 18, "IQ4_NL": 25, "Q5_K": 112, "Q6_K": 18, "Q8_0": 125}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq3_xxs/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49567921344
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq3_xxs/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          468
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 8, "F32": 213, "IQ2_S": 34, "IQ3_S": 2, "IQ4_NL": 19, "Q6_K": 94, "Q8_0": 98}
+
+-------------------------------------------------------------------
+BYTES              32382955968
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq3_xxs/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          756
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 16, "F32": 344, "IQ2_S": 60, "IQ4_NL": 30, "Q6_K": 156, "Q8_0": 150}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq4_xs/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49835229856
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq4_xs/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          373
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 6, "F32": 169, "IQ3_S": 27, "IQ4_NL": 14, "IQ4_XS": 2, "Q6_K": 1, "Q8_0": 154}
+
+-------------------------------------------------------------------
+BYTES              43836407744
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-iq4_xs/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          851
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 18, "F32": 388, "IQ3_S": 67, "IQ4_NL": 30, "Q8_0": 348}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q2_k_xl/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49979779296
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q2_k_xl/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          503
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 8, "F32": 229, "IQ2_XS": 37, "IQ3_XXS": 2, "IQ4_NL": 21, "Q4_K": 1, "Q5_K": 76, "Q6_K": 29, "Q8_0": 100}
+
+-------------------------------------------------------------------
+BYTES              28878402944
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q2_k_xl/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          721
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 16, "F32": 328, "IQ2_XS": 57, "IQ4_NL": 28, "Q5_K": 113, "Q6_K": 35, "Q8_0": 144}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q3_k_xl/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49983253824
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q3_k_xl/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          402
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 6, "F32": 183, "IQ3_XXS": 29, "IQ4_NL": 15, "IQ4_XS": 2, "Q6_K": 1, "Q8_0": 166}
+
+-------------------------------------------------------------------
+BYTES              39992153376
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q3_k_xl/UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          822
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 18, "F32": 374, "IQ3_XXS": 65, "IQ4_NL": 29, "Q8_0": 336}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q4_k_xl/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49859583136
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q4_k_xl/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          297
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 4, "F32": 135, "IQ4_NL": 1, "Q4_K": 20, "Q5_1": 10, "Q5_K": 2, "Q8_0": 125}
+
+-------------------------------------------------------------------
+BYTES              49376141504
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q4_k_xl/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          752
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 16, "F32": 342, "Q4_K": 60, "Q5_1": 28, "Q8_0": 306}
+
+-------------------------------------------------------------------
+BYTES              12087983520
+PATH               /mnt/nas_share/checkpoints/qwen3.8-flash-next-ud-q4_k_xl/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          175
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 4, "F32": 80, "Q4_K": 14, "Q5_1": 5, "Q8_0": 72}
+
+-------------------------------------------------------------------
+BYTES              9429859
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       glm5next
+SIZE_LABEL         288x10B
+SHAPE_KV           glm5next.block_count = 46
+SHAPE_KV           glm5next.embedding_length = 4096
+SHAPE_KV           glm5next.expert_count = 288
+SHAPE_KV           glm5next.expert_used_count = 8
+SHAPE_KV           glm5next.feed_forward_length = 12288
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49294975936
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          676
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 305, "IQ2_XS": 36, "IQ3_XXS": 19, "IQ4_XS": 2, "Q4_K": 1, "Q5_K": 87, "Q6_K": 61, "Q8_0": 165}
+
+-------------------------------------------------------------------
+BYTES              49949266048
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00003-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          622
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 280, "IQ2_XS": 40, "IQ3_XXS": 21, "Q5_K": 80, "Q6_K": 51, "Q8_0": 150}
+
+-------------------------------------------------------------------
+BYTES              9466399584
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf
+GGUF_VERSION       3
+N_TENSORS          114
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 53, "IQ2_XS": 6, "IQ3_XXS": 1, "IQ4_XS": 1, "Q2_K": 2, "Q3_K": 1, "Q5_K": 14, "Q6_K": 5, "Q8_0": 31}
+
+-------------------------------------------------------------------
+BYTES              1164010080
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/mmproj-BF16.gguf
+GGUF_VERSION       3
+N_TENSORS          348
+ARCHITECTURE       clip
+SIZE_LABEL         564M
+SHAPE_KV           clip.vision.block_count = 24
+SHAPE_KV           clip.vision.embedding_length = 1024
+SHAPE_KV           clip.vision.feed_forward_length = 4096
+TYPE_HISTOGRAM     {"BF16": 124, "F32": 224}
+
+-------------------------------------------------------------------
+BYTES              9428677
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/GLM-5.3-UD-IQ1_S-00001-of-00006.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       glm-dsa
+SIZE_LABEL         256x22B
+SHAPE_KV           glm-dsa.block_count = 79
+SHAPE_KV           glm-dsa.embedding_length = 6144
+SHAPE_KV           glm-dsa.expert_count = 256
+SHAPE_KV           glm-dsa.expert_used_count = 8
+SHAPE_KV           glm-dsa.feed_forward_length = 12288
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49968868928
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/GLM-5.3-UD-IQ1_S-00002-of-00006.gguf
+GGUF_VERSION       3
+N_TENSORS          455
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 178, "IQ1_S": 24, "IQ2_XXS": 10, "IQ3_XXS": 16, "IQ4_XS": 1, "Q4_K": 2, "Q5_K": 78, "Q6_K": 23, "Q8_0": 123}
+
+-------------------------------------------------------------------
+BYTES              49728982688
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/GLM-5.3-UD-IQ1_S-00003-of-00006.gguf
+GGUF_VERSION       3
+N_TENSORS          419
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 163, "IQ1_S": 34, "IQ2_XXS": 2, "IQ3_XXS": 19, "Q5_K": 72, "Q6_K": 19, "Q8_0": 110}
+
+-------------------------------------------------------------------
+BYTES              49210788064
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/GLM-5.3-UD-IQ1_S-00004-of-00006.gguf
+GGUF_VERSION       3
+N_TENSORS          412
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 162, "IQ1_S": 24, "IQ2_XXS": 12, "IQ3_XXS": 17, "Q5_K": 72, "Q6_K": 17, "Q8_0": 108}
+
+-------------------------------------------------------------------
+BYTES              49471673632
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/GLM-5.3-UD-IQ1_S-00005-of-00006.gguf
+GGUF_VERSION       3
+N_TENSORS          397
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 155, "IQ1_S": 24, "IQ2_XXS": 11, "IQ3_XXS": 18, "Q5_K": 69, "Q6_K": 18, "Q8_0": 102}
+
+-------------------------------------------------------------------
+BYTES              18325623904
+PATH               /mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/GLM-5.3-UD-IQ1_S-00006-of-00006.gguf
+GGUF_VERSION       3
+N_TENSORS          126
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 51, "IQ2_XXS": 9, "IQ3_XXS": 1, "IQ4_XS": 3, "Q2_K": 2, "Q3_K": 1, "Q5_K": 21, "Q6_K": 5, "Q8_0": 33}
+
+-------------------------------------------------------------------
+BYTES              3683648
+PATH               /mnt/nas_share/rc/ckpt/laguna-s21-ud-q4kxl/Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       laguna
+SIZE_LABEL         256x4.5B
+SHAPE_KV           laguna.block_count = 48
+SHAPE_KV           laguna.embedding_length = 3072
+SHAPE_KV           laguna.expert_count = 256
+SHAPE_KV           laguna.expert_used_count = 10
+SHAPE_KV           laguna.feed_forward_length = 12288
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49971821312
+PATH               /mnt/nas_share/rc/ckpt/laguna-s21-ud-q4kxl/Laguna-S-2.1-UD-Q4_K_XL-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          564
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 199, "Q4_K": 64, "Q5_K": 32, "Q8_0": 269}
+
+-------------------------------------------------------------------
+BYTES              23419667040
+PATH               /mnt/nas_share/rc/ckpt/laguna-s21-ud-q4kxl/Laguna-S-2.1-UD-Q4_K_XL-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          250
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 88, "Q4_K": 28, "Q5_K": 15, "Q6_K": 2, "Q8_0": 117}
+
+-------------------------------------------------------------------
+BYTES              17106775008
+PATH               /mnt/nas_share/rc/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf
+GGUF_VERSION       3
+N_TENSORS          866
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 65
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 456, "Q4_K": 294, "Q5_K": 48, "Q6_K": 67, "Q8_0": 1}
+
+-------------------------------------------------------------------
+BYTES              16464440224
+PATH               /mnt/nas_share/rc/ckpt/qwen38-27b-ud-q4km/Qwen3.8-27B-UD-Q4_K_M.gguf
+GGUF_VERSION       3
+N_TENSORS          866
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 65
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 360, "IQ3_S": 4, "IQ4_NL": 7, "IQ4_XS": 117, "Q3_K": 7, "Q4_K": 104, "Q5_K": 131, "Q6_K": 30, "Q8_0": 106}
+
+-------------------------------------------------------------------
+BYTES              10943264
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen35moe
+SIZE_LABEL         2.4T-A95B
+SHAPE_KV           qwen35moe.block_count = 93
+SHAPE_KV           qwen35moe.embedding_length = 8192
+SHAPE_KV           qwen35moe.expert_count = 512
+SHAPE_KV           qwen35moe.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              48759636544
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00002-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          213
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 106, "Q4_K": 2, "Q5_K": 52, "Q6_K": 20, "UNK66": 33}
+
+-------------------------------------------------------------------
+BYTES              49951472352
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00003-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          211
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 105, "Q5_K": 50, "Q6_K": 20, "UNK66": 36}
+
+-------------------------------------------------------------------
+BYTES              49054612640
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00004-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          210
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 101, "Q5_K": 53, "Q6_K": 21, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              49046553504
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00005-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          215
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 106, "Q5_K": 53, "Q6_K": 21, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              49061135392
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00006-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          217
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 108, "Q5_K": 54, "Q6_K": 20, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              48736861088
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00007-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          206
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 100, "Q5_K": 51, "Q6_K": 20, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              49046553504
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00008-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          215
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 106, "Q5_K": 53, "Q6_K": 21, "UNK66": 35}
+
+-------------------------------------------------------------------
+BYTES              47768863488
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00009-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          204
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 100, "Q2_K": 1, "Q5_K": 52, "Q6_K": 19, "UNK66": 32}
+
+-------------------------------------------------------------------
+BYTES              5819761472
+PATH               /mnt/nas_share/rc/ckpt/qwen3.8-q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00010-of-00010.gguf
+GGUF_VERSION       3
+N_TENSORS          11
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"F32": 6, "Q2_K": 2, "Q5_K": 2, "Q8_0": 1}
+
+-------------------------------------------------------------------
+BYTES              10946624
+PATH               /mnt/nas_share/rc/ckpt/qwen4exp-flash-next-iq1s/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          0
+ARCHITECTURE       qwen4exp
+SIZE_LABEL         512x56B
+SHAPE_KV           qwen4exp.block_count = 48
+SHAPE_KV           qwen4exp.embedding_length = 2560
+SHAPE_KV           qwen4exp.expert_count = 512
+SHAPE_KV           qwen4exp.expert_used_count = 10
+TYPE_HISTOGRAM     {}
+
+-------------------------------------------------------------------
+BYTES              49990818368
+PATH               /mnt/nas_share/rc/ckpt/qwen4exp-flash-next-iq1s/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          595
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 10, "F32": 272, "IQ1_S": 36, "IQ2_XXS": 10, "IQ4_NL": 24, "Q4_K": 2, "Q5_K": 100, "Q6_K": 22, "Q8_0": 119}
+
+-------------------------------------------------------------------
+BYTES              22544696352
+PATH               /mnt/nas_share/rc/ckpt/qwen4exp-flash-next-iq1s/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf
+GGUF_VERSION       3
+N_TENSORS          629
+ARCHITECTURE       None
+SIZE_LABEL         None
+TYPE_HISTOGRAM     {"BF16": 14, "F32": 285, "IQ1_S": 32, "IQ2_XXS": 18, "IQ4_NL": 25, "Q5_K": 112, "Q6_K": 18, "Q8_0": 125}
+
+
+===== 5. done =====
+2026-09-04T04:17:25Z
+=== VEHICLE_SCAN DONE ===

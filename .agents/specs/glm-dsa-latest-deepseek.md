@@ -3434,3 +3434,290 @@ invented.
 
 **Next action:** W1 and W2, both CPU, both independent. W1 belongs to
 `QUANT-GGUF-IQ4_XS` and unlocks two arms at once. W4 is now unblocked on W3.
+
+### 3.11 The second decode step, and the read-key registered before it runs
+
+**Status: the legs are QUEUED on `dgx:gpu0` and nothing below is a result.**
+Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596). This section is
+written before the measurement on purpose, so that what it predicts cannot be
+fitted to what it later reports.
+
+**The gap §3.10 leaves open, stated as the counter that says it.** §3.10's
+landed run is `--max-tokens 1`, and its token comes out of prefill. Its own
+final line is `steps=1 hits=0 misses=6399 evictions=0 fills=4096
+exhausted=2303`. `hits=0` and `evictions=0` are not measurements of slot reuse;
+they are the absence of any. The lane was filled and never read, because nothing
+asked it for a second step. **No second decode step has ever run on this model,
+on this box or any other**, so the slot cache — the whole mechanism this row
+depends on — is exercised here at its weakest possible point.
+
+**Why the first multi-token run is also a correctness question.**
+[#2544](https://github.com/mudler/vllm.cpp/issues/2544) names `glm_moe_dsa`
+among five architectures that never read
+`ModelForwardInput::device_token_ids`, and it is explicit that its list is filed
+on a `grep` and that each entry is "a candidate, not a conviction". Two facts
+make the candidate reachable on precisely the box this row is gated on, and both
+are read off the tree at `5649e07d2`:
+
+1. No `glm_moe_dsa` translation unit mentions `device_token_ids`.
+   `ForwardGlmMoeDsaForCausalLM` (`glm_moe_dsa_registry.cpp:96-107`) passes
+   `input.token_ids` through with no `detail::DeviceTokenIdsScope`, where
+   `qwen3_moe_registry.cpp:100` takes one.
+2. `GPUModelRunner::async_device_mirror()` (`runner.cpp:4577-4601`) engages on
+   **integrated OR discrete** CUDA, and its own comment names the integrated arm
+   "GB10, UnifiedMemory AND is_integrated_gpu" as DEFAULT ON. `dgx:gpu0` is a
+   GB10, so the mirror is live and the host `token_ids` a decode row reads is
+   the stale one.
+
+**The read-key.** Two legs, one variable, the same binary and the same artifact,
+with expert streaming ON in BOTH (`VT_MOE_EXPERT_STREAM=1`,
+`VT_MOE_EXPERT_STREAM_SLOTS=8192`), `--device cuda`, prompt
+`The capital of France is`, `--max-tokens 4`, `--temperature 0`:
+
+| leg | env |
+|---|---|
+| C | default |
+| E | `VT_ASYNC_DEVICE_MIRROR=0` |
+
+- **C and E differ ⇒ CONVICTION.** `glm_moe_dsa` embeds the stale host
+  identifiers, so every decode step after the first generates from token id 0.
+  This is the same isolation that convicted
+  `Glm5NextForConditionalGeneration` (#2544's comment, `dgx:gpu0`, 2026-09-01),
+  and leg E is then the only arm whose text may be quoted.
+- **C and E agree ⇒ FALSIFICATION.** #2544's grep-based candidacy is wrong about
+  this model, and that is recorded as such rather than left as a suspicion.
+
+**Neither outcome says anything about expert streaming**, which is ON in both
+legs. Whichever leg emits text, that text is streamed text. The variable moved
+is the async device mirror and nothing else.
+
+**The recipe is the script that runs, not a description of one.**
+[`.agents/scripts/glm53-dsa-second-step.sh`](../scripts/glm53-dsa-second-step.sh)
+is byte-identical to the file the lease executes (sha256
+`b811f4b54c43e830f2990e93e6fde45905e888f17b25c87add6ee4174a18038f`), and it
+carries the read-key above in its own header so the prediction travels with
+the numbers. Every verdict it prints is an expression over bytes it reads
+back off disk; no conclusion string in it is a constant. That is deliberate:
+a job on this box has reported `3 runs all rc=0` over its own captured
+`rc=1`, from a label that never read its input.
+
+**Bytes are compared as bytes.** The sibling's divergence was ` Paris.` against
+` Paris Paris`, which agrees for five characters; a `diff` of rendered text is
+not the instrument, and the runner records `od -An -tx1` of each leg's stdout.
+
+**What the run may NOT produce.** A rate. This row has no vLLM denominator at
+any revision, and `## Gates` binds: correctness first, and a decode whose
+identifiers are in question is not a correctness result. If the legs diverge, no
+tok/s from either arm is admissible.
+
+**Owed if the lease does not free.** `dgx:gpu0` is the only GB10 the project can
+reach, and it is the only part where `host_memory_is_device_addressable()`
+answers true for this artifact's 187.312 GiB of towers. If the legs do not run,
+the gap above stays exactly as written and is owned by
+[#2596](https://github.com/mudler/vllm.cpp/issues/2596): the reuse counters stay
+unmeasured, and #2544's candidacy for this model stays unresolved. It is not
+inferrable from the one-token run, and this section does not infer it.
+
+### 3.12 The candidacy is CONVICTED on CPU, and the repair is two lines
+
+**Status: measured and fixed here. The `dgx:gpu0` legs of §3.11 are still
+QUEUED and are still owed**, because what they answer is not what this section
+answers. Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596).
+
+**What was measured.** A new case in `test_glm_moe_dsa_forward.cpp` drives four
+pure-decode steps through `ModelRegistry::Forward` — the production entry point,
+not a hand-built type — on the tiny fixture, as the A/B/C triple
+`test_moe_async_device_ids.cpp` established for the same contract:
+
+| run | host ids | mirror | expected |
+|---|---|---|---|
+| A | true | none | the reference |
+| B | zeros | none | must DIFFER from A |
+| C | zeros | carries A's | must EQUAL A |
+
+B is the control. Without it a forward that ignored its identifiers entirely
+would satisfy C, and so would a gate whose two runs shared a buffer.
+
+**RED, at `d0f7fd2c6` plus the test alone:**
+
+```text
+CHECK( differing == 0 ) is NOT correct!  values: CHECK( 128 == 0 )
+[doctest] test cases:  1 |  0 passed | 1 failed | 7 skipped
+[doctest] assertions: 81 | 80 passed | 1 failed |
+```
+
+**Both counts are quoted because only the pair separates a failed assertion from
+a thrown case.** 80 of 81 assertions passed, so run B's control fired correctly
+and the case FAILED rather than threw: all 128 logits (4 steps x 32 vocab)
+differ. `glm_moe_dsa` did not read `device_token_ids` at all.
+
+**The repair is two lines and neither is new.** The registry publishes the field
+for the duration of the forward (`detail::DeviceTokenIdsScope`, exactly as
+`qwen3_moe_registry.cpp:100` does), and the embed consumes it
+(`detail::ApplyDeviceTokenIds`, exactly as `deepseek_v2.cpp:586` does). Both
+helpers already exist in `qwen3_5_internal.h` beside the publisher, because
+#1305 put them there to stop a fifth hand-rolled copy. Nothing here is a new
+mechanism; this registration simply never joined the nine that consume it.
+
+**GREEN, whole suite:** `8 | 8 passed | 0 failed`, `assertions: 5339 | 5339
+passed | 0 failed`, `0 differing`. Seven adjacent suites are green on the same
+build: `test_glm_moe_dsa_{config,gguf_load,gguf_census,schedule}`,
+`test_moe_async_device_ids`, `test_expert_stream_{wiring,steps}` — 60 cases and
+11,319 assertions in total, none failing.
+
+**Three mutations, each REBUILT and each restored byte-for-byte.** A mutation
+that does not rebuild reads as a passing test, so the build rc is recorded
+beside the verdict and each mutant binary's sha256 differs from the green one's
+`f367624476c5b584961c3d1d00c41d03220df85be9256828aa6ad74f704450c6`:
+
+| mutation | build rc | result |
+|---|---|---|
+| delete the CONSUMER (`ApplyDeviceTokenIds`) | 0 | RED, `CHECK( 128 == 0 )` |
+| delete the PUBLISHER (`DeviceTokenIdsScope`) | 0 | RED, `CHECK( 128 == 0 )` |
+| neuter the CONTROL (run B stops staling the host ids) | 0 | RED, `CHECK( 0 > 0 )` on every step |
+
+The first two are the reachability proof `## Nothing lands dead` asks for:
+deleting either production call site reds the gate, so the case measures a
+capability and not a class. The third proves the control is not vacuous — it is
+the arm that stops a forward which ignores identifiers entirely from passing.
+All three source files restored to their pristine sha256, verified by `diff`
+against the hashes taken before the first mutation.
+
+**WHAT THIS DOES NOT SETTLE, and why §3.11's legs still owe their run.** This is
+a CPU gate on a 1/1000th-scale fixture. It proves the CONTRACT was unmet and is
+now met. It does not show the symptom on the published 201.83 GiB checkpoint, it
+does not exercise the slot cache at the real model's working-set size, and it
+says nothing about the reuse counters §3.11 exists to measure. The staged
+runner deliberately builds from **base `main` without this repair**, so its leg
+C still carries the defect and its leg E is still the discriminator: that pair
+is what convicts on the real artifact, as it did for the sibling model. A CPU
+fixture agreeing with a two-line fix is not a 753.33B model generating text.
+
+**No rate is claimed here either.** Nothing in this section is a performance
+measurement, and the row still has no vLLM denominator at any revision.
+
+### 3.13 The legs ran: four tokens, the lane reused slots, and the read-key CONVICTED
+
+**Status: measured.** `dgx:gpu0` (`NVIDIA GB10`, `sm_121a`, CUDA arch `121a`,
+FA2 manifest `[121a]`), one `rc` lease, job
+`c7f4c7ea-73d1-4c00-82af-61aae5617979`, worker `rc-worker-4b8lj`, base
+`5649e07d2`, both legs from ONE binary, 2026-09-02.
+Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596).
+
+**THE GENERATED TEXT, verbatim, from the real 201.83 GiB artifact.**
+
+| leg | env | rc | wall | stdout | bytes |
+|---|---|---|---|---|---|
+| C | default | 0 | 1059 s | ` Paris The Paris Paris` | `20 50 61 72 69 73 20 54 68 65 20 50 61 72 69 73 20 50 61 72 69 73 0a` |
+| E | `VT_ASYNC_DEVICE_MIRROR=0` | 0 | 1061 s | ` Paris, which is` | `20 50 61 72 69 73 2c 20 77 68 69 63 68 20 69 73 0a` |
+
+**The read-key §3.11 registered BEFORE the run is resolved, and it CONVICTS.**
+The bytes differ on one variable, and that variable is not the streaming lane.
+`glm_moe_dsa` read `token_ids` and ignored `device_token_ids`, so every decode
+step after the first was generated from token id 0. Leg C's ` Paris The Paris
+Paris` is that symptom; leg E's ` Paris, which is` is the same model, same
+binary, same artifact, with the mirror off. **This is the behavioural half of
+§3.12's CPU conviction, on the published checkpoint**, and it is the same
+isolation that convicted `Glm5NextForConditionalGeneration` under #2544.
+
+**THE LANE WAS ON IN BOTH LEGS, AND FOR THE FIRST TIME IT REUSED SLOTS.**
+
+```text
+                    [expert-stream] ON slots=8192 slot_bytes=6684672 resident=51.00 GiB
+leg C  steps=1 hits=0    misses=6393 evictions=0   fills=6393 bytes=22026289152 exhausted=0
+       steps=2 hits=789  misses=7404 evictions=0   fills=7404 bytes=25511657472 exhausted=0
+       steps=3 hits=1791 misses=8202 evictions=10  fills=8202 bytes=28255223808 exhausted=0
+       steps=4 hits=3156 misses=8637 evictions=445 fills=8637 bytes=29729193984 exhausted=0
+leg E  steps=4 hits=2688 misses=9105 evictions=913 fills=9105 bytes=31334006784 exhausted=0
+```
+
+`steps=4` and `exhausted=0` are the two `docs/ENVIRONMENT.md` names as the test
+of a live lane, and both hold in both legs. **`hits` moved 0 -> 789 -> 1791 ->
+3156**, which is the slot reuse §3.10's one-token run could not measure and
+§3.11 was written to obtain: at 8192 slots the working set fits, nothing is
+refused to the mmap, and eviction begins only at step 3. 29.73 GB moved through
+a 51.00 GiB arena in leg C against 187.312 GiB of towers.
+
+**Peak resident: 76,092,816 kB = 72.57 GiB (leg C) and 76,442,608 kB = 72.90 GiB
+(leg E), against the pool's 119.631 GiB.** `nvidia-smi memory.used` reads 0 MiB
+on this part and is not a residency figure here; `VmHWM` tracks page-cache
+pressure while the towers are mmap-resident and is not one either (O9).
+
+**Reference-tier hits: `exhausted=0` on every line of both legs.** No slice fell
+back to reading the tower in place, which is the §3.10 run's `exhausted=2303`
+resolved by the larger budget.
+
+#### THIS WAS ALSO A PLACEMENT RUN, AND THAT IS NOT WHAT THE ROW ASKED FOR
+
+`VT_CPU_MOE` was unset and the runner asserts that rather than claiming it.
+The engine placed experts anyway, on its own `--fit`, in BOTH legs:
+
+```text
+engine: device placement INSTALLED: 33 layers run their routed experts on cpu,
+        the rest on cuda (resolved against 78 layers, origin fit)
+engine: device placement: --fit placed 33 layer(s) (89288343552 B) to bring a
+        216433205760 B footprint under a 128452960256 B budget
+```
+
+**So these numbers are a HYBRID and must be read as one.** The streaming lane is
+genuinely live — the banner, `steps=4`, the climbing `hits` and `exhausted=0`
+are its own counters, and 83.14 GiB of expert bytes moved through slots that no
+placement performs. But 33 of 78 layers ran their routed experts on the HOST
+CPU, so this is not the pure streamed configuration, and no line above may be
+quoted as one. The pure arm needs the fit suppressed, and it has not run.
+
+**#2568 is live on exactly this shape.** `quant_repack` is a per-load flag read
+off the ENGINE device, so on this aarch64 CUDA engine the 33 host-executed
+layers loaded WITHOUT the i8mm repack. That is throughput, not correctness, and
+it is another reason no rate below is publishable.
+
+**NO RATE IS CLAIMED, and `tok_s=0.005` in the logs is not one.** Leg C's tokens
+are wrong, so its timing measures a defect. Leg E's are coherent but it has no
+vLLM denominator at any revision, it ran the hybrid placement above, it is n=1,
+and its reads came off CIFS. `## Gates` binds: correctness first.
+
+#### What is still owed
+
+1. **The repair has not been driven on the artifact.** §3.12's fix landed after
+   the tarball this lease built, deliberately, so leg C carried the defect and
+   the pair stayed a discriminator. What is owed is one leg on a FIXED binary
+   proving the DEFAULT arm now emits leg E's bytes without the env var.
+2. **The pure streaming arm**, with the `--fit` placement suppressed, so the
+   lane's numbers are not entangled with 33 host layers.
+3. **A second slot budget**, since 8192 never exhausted and 4096 exhausted on a
+   third of its misses at one token: the floor between them is unmeasured.
+
+## §3.14 -- the #2596 fix is DRIVEN ON THE ARTIFACT, and the default arm is correct
+
+`devids2544`, `dgx:gpu0`, finished 2026-09-03T18:38:56Z, on the real 201.83 GiB
+`UD-IQ1_S` artifact (six shards, shard 1 sha256 `b3e9838651a5c279...`).
+
+**This is the validation §3.13 recorded as OWED.** The `device_token_ids` repair
+landed at `d8683402b` but the lease that found the defect deliberately built base
+`main` to keep its two legs a discriminator, so "the default arm now emits leg E's
+bytes unaided" was an INFERENCE from a CPU gate. It is now measured.
+
+| leg | env | rc | bytes | stdout |
+|---|---|---|---|---|
+| D1 | **no mirror variable** | 0 | 17 | `20 50 61 72 69 73 2c 20 77 68 69 63 68 20 69 73 0a` = ` Paris, which is` |
+| D2 | `VT_ASYNC_DEVICE_MIRROR=0` | 0 | 17 | identical |
+
+D1 and D2 agree byte-for-byte, so the mirror variable no longer changes the
+answer for this model. That is the close, not D1 alone.
+
+**EXPERT STREAMING WAS LIVE WHILE IT RAN, and the counters say so rather than the
+configuration:** `steps=4 hits=2688 misses=9105 evictions=913 fills=9105
+bytes=31334006784 exhausted=0`. Climbing `hits` at `exhausted=0` is slot REUSE;
+`VT_MOE_EXPERT_STREAM_SLOTS=8192`, stats every step. Configuration alone cannot
+distinguish a streamed run from a fallback (#2505), which is why the counters and
+not the env are quoted here.
+
+**Not claimed.** No speed number: `wall=1549 s` (D1) and `1487 s` (D2) are
+DURATIONS, ~85% GGUF load off CIFS. This says nothing about the pure streamed arm
+either -- the engine's own `--fit` places layers on the host, so these legs remain
+a HYBRID, exactly as §3.13 records.
+
+The FA2 build requirement was asserted twice before any leg ran
+(`VLLM_CPP_FLASH_ATTN:BOOL=ON` plus 1296 TUs carrying the define), because this
+model is MLA and a silently non-FA2 build throws in the first forward in a way
+that reads as a model defect.

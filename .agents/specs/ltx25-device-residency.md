@@ -260,7 +260,13 @@ of one core to 78.421 s (8.57x)** on x86 and records the projection as
 **39-100%** of the ~1731 s resolution-constant phase
 ([#1087](https://github.com/mudler/vllm.cpp/issues/1087)) — a bound, because the
 GB10-to-x86 per-core ratio was never measured. `docs/BENCHMARKS.md:494` carries
-that bound. **Neither landing has been re-measured end to end**, and
+that bound. (**Dead by RESTRUCTURING, re-resolved 2026-09-01 by row
+`LTX25-ANCHOR-REPAIR`**: `docs/BENCHMARKS.md` is now an 18-line index over
+`docs/benchmarks/<benchmark-id>.md`, so `:494` has no successor line. `:494` sat
+under that file's `## Open gaps` heading -- recorded independently in
+`.agents/specs/public-docs-readability.md` -- which is today
+[`docs/benchmarks/open-gaps.md`](../../docs/benchmarks/open-gaps.md). The bound
+is cited there by section, not by coordinate.) **Neither landing has been re-measured end to end**, and
 `LTX25-DECODE-DTYPE`'s speed magnitude was never measured either
 ([`ltx25-decode-dtype.md`](ltx25-decode-dtype.md) `## Owed`). The spike's own
 re-ordering note (*"the remaining order is 6, 3, then 1"*) predates #1208

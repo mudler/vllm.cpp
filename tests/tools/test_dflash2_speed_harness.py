@@ -767,6 +767,43 @@ class SpeedResultTest(unittest.TestCase):
         for fragment in ("PLAIN RELEASE", "post-hoc relabel", "AGENTS.md", "a default is not a record", "no lease id"):
             self.assertIn(fragment, message)
 
+    def test_the_result_puts_the_THREE_arms_acceptance_side_by_side(self) -> None:
+        """#2832. The gap has two agreeing denominators and no attribution, and
+        the artifact `.agents/benchmark-record.md` cites is where the reader
+        looks. Ours is folded over the WARM legs; vLLM's own counters are
+        cumulative over the whole run, so each side's population is NAMED."""
+
+        ours, theirs = self.good()
+        ours["spec_acceptance"] = {
+            "warm_legs": 4,
+            "drafts_proposed": 84,
+            "drafts_accepted": 24,
+            "drafted_request_steps": 12,
+            "accept_rate": 24 / 84,
+            "mean_acceptance_length": 3.0,
+            "per_leg": [],
+            "bonus_token": "EXCLUDED from accept_rate; INCLUDED in mean_acceptance_length",
+        }
+        theirs["metrics"]["vllm:spec_decode_num_accepted_tokens"] = 1000
+        theirs["metrics"]["vllm:spec_decode_num_draft_tokens"] = 2170
+        theirs["metrics"]["vllm:spec_decode_num_drafts"] = 310
+        result = harness.build_speed_result(ours=ours, theirs=theirs)
+        block = result["acceptance"]
+        self.assertAlmostEqual(block["ours"]["accept_rate"], 24 / 84)
+        self.assertAlmostEqual(block["vllm"]["accept_rate"], 1000 / 2170)
+        self.assertAlmostEqual(block["vllm"]["mean_acceptance_length"], 1000 / 310 + 1)
+        self.assertIn("warm", block["ours"]["leg_population"])
+        self.assertIn("COLD", block["vllm"]["leg_population"])
+        self.assertIn("EXCLUD", block["bonus_token"])
+
+    def test_an_arm_that_recorded_NO_acceptance_says_so_rather_than_reading_zero(
+        self,
+    ) -> None:
+        ours, theirs = self.good()
+        result = harness.build_speed_result(ours=ours, theirs=theirs)
+        self.assertIsNone(result["acceptance"]["ours"]["accept_rate"])
+        self.assertIsNone(result["acceptance"]["vllm"]["accept_rate"])
+
     def test_a_number_is_never_produced_without_a_clock(self) -> None:
         ours, theirs = self.good()
         ours["clock"] = None
@@ -1341,6 +1378,148 @@ class SharedLegFoldTest(unittest.TestCase):
     def test_legs_that_are_ALL_cold_leave_nothing_to_fold(self) -> None:
         with self.assertRaises(HarnessError):
             harness.fold_legs([{"run": 1, "tok_s": 40.0, "completion_tokens": 64, "secs": 1.0}])
+
+
+def acceptance_leg(run: int, proposed: int, accepted: int, steps: int) -> dict:
+    """A leg in the shape `our_arm.legs_with_spans` produces, with counters."""
+
+    return {
+        "run": run,
+        "tok_s": 40.0 + run,
+        "completion_tokens": 64,
+        "secs": 1.0,
+        "spec_drafts_proposed": proposed,
+        "spec_drafts_accepted": accepted,
+        "spec_drafted_request_steps": steps,
+    }
+
+
+#: One cold leg that would DOMINATE any pooled total it reached, and two warm
+#: legs whose pooled arithmetic distinguishes every quantity from every other:
+#: P=35, A=13, S=5, so accept_rate is 13/35 = 0.3714 and
+#: mean_acceptance_length is (13+5)/5 = 3.6, while the wrong reading
+#: accepted/steps is 2.6.
+ACCEPTANCE_LEGS = [
+    acceptance_leg(1, proposed=1000, accepted=1000, steps=1000),
+    acceptance_leg(2, proposed=21, accepted=9, steps=3),
+    acceptance_leg(3, proposed=14, accepted=4, steps=2),
+]
+
+
+class AcceptanceFoldTest(unittest.TestCase):
+    """#2832: our arm records acceptance, in the oracles' own units.
+
+    The gate records ours 14.951 against vLLM 16.111 and SGLang 16.034, and no
+    field on our side says whether we are slower because we EXECUTE slower or
+    because we ACCEPT less. These cases hold the instrument that answers it.
+    """
+
+    def test_the_fold_is_over_the_WARM_legs_and_ONLY_the_warm_legs(self) -> None:
+        """The same predicate the throughput median uses, or the two axes
+        describe two different populations and neither qualifies the other."""
+
+        block = harness.fold_acceptance(ACCEPTANCE_LEGS)
+        self.assertEqual(block["warm_legs"], 2)
+        self.assertEqual(block["drafts_proposed"], 35)
+        self.assertEqual(block["drafts_accepted"], 13)
+        self.assertEqual(block["drafted_request_steps"], 5)
+
+    def test_the_rate_EXCLUDES_the_bonus_and_the_step_count_INCLUDES_it(self) -> None:
+        """The one-token error the two oracles invite.
+
+        vLLM's `num_accepted_tokens` excludes the bonus token; SGLang's
+        `accept_length` includes it. Reporting one number under both names is a
+        one-token-per-step error, which at k=7 is a quarter of the quantity.
+        """
+
+        block = harness.fold_acceptance(ACCEPTANCE_LEGS)
+        self.assertAlmostEqual(block["accept_rate"], 13 / 35)
+        self.assertAlmostEqual(block["mean_acceptance_length"], 3.6)
+        # NOT accepted/steps: that is the same number with the bonus dropped.
+        self.assertNotAlmostEqual(block["mean_acceptance_length"], 13 / 5)
+        self.assertIn("EXCLUD", block["bonus_token"])
+        self.assertIn("INCLUD", block["bonus_token"])
+
+    def test_the_PER_LEG_values_survive_so_a_COLLAPSE_is_visible(self) -> None:
+        """A mean hides the shape this row has already seen twice: acceptance
+        going to zero for part of a run, and an arm moving it 8.7% -> 41.6%."""
+
+        legs = [
+            acceptance_leg(1, proposed=21, accepted=9, steps=3),
+            acceptance_leg(2, proposed=21, accepted=9, steps=3),
+            acceptance_leg(3, proposed=21, accepted=0, steps=3),
+        ]
+        block = harness.fold_acceptance(legs)
+        self.assertEqual([leg["run"] for leg in block["per_leg"]], [2, 3])
+        self.assertAlmostEqual(block["per_leg"][0]["accept_rate"], 9 / 21)
+        self.assertAlmostEqual(block["per_leg"][1]["accept_rate"], 0.0)
+        # The pooled rate alone would read 0.214 and look like a mild deficit.
+        self.assertAlmostEqual(block["accept_rate"], 9 / 42)
+
+    def test_legs_that_DISAGREE_about_carrying_the_counters_are_refused(self) -> None:
+        """Partial data is a defect, never a smaller sample."""
+
+        legs = [ACCEPTANCE_LEGS[0], ACCEPTANCE_LEGS[1], {"run": 3, "tok_s": 43.0}]
+        with self.assertRaises(HarnessError) as raised:
+            harness.fold_acceptance(legs)
+        self.assertIn("run 3", str(raised.exception))
+
+    def test_an_arm_that_reports_NO_counters_folds_to_None_and_not_to_zero(self) -> None:
+        """The ORACLE arm's legs carry none, and a zero there would read as a
+        measurement of an engine that accepted nothing."""
+
+        legs = [{"run": run, "tok_s": 40.0 + run} for run in (1, 2, 3)]
+        self.assertIsNone(harness.fold_acceptance(legs))
+
+    def test_fold_legs_carries_the_block_so_ONE_predicate_folds_BOTH_axes(self) -> None:
+        folded = harness.fold_legs(ACCEPTANCE_LEGS)
+        self.assertEqual(folded["warm_legs"], 2)
+        self.assertIsNotNone(folded["spec_acceptance"])
+        self.assertEqual(folded["spec_acceptance"]["warm_legs"], folded["warm_legs"])
+        self.assertAlmostEqual(folded["spec_acceptance"]["accept_rate"], 13 / 35)
+
+    def test_fold_legs_still_carries_the_KEY_when_no_arm_reported_acceptance(self) -> None:
+        """Present-and-null, never absent: a missing key reads as an oversight
+        and a null one says the arm reported nothing."""
+
+        legs = [{"run": run, "tok_s": 40.0 + run} for run in (1, 2)]
+        self.assertIn("spec_acceptance", harness.fold_legs(legs))
+        self.assertIsNone(harness.fold_legs(legs)["spec_acceptance"])
+
+
+class AcceptanceReasonsTest(unittest.TestCase):
+    """The refusals. A null acceptance field is what this row is repairing."""
+
+    def test_a_declared_drafter_that_PROPOSED_NOTHING_is_a_refusal(self) -> None:
+        legs = [acceptance_leg(run, proposed=0, accepted=0, steps=0) for run in (1, 2)]
+        reasons = harness.acceptance_reasons(legs, label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("proposed no drafts", reasons[0])
+
+    def test_legs_carrying_NO_counters_are_a_refusal_naming_the_binary(self) -> None:
+        legs = [{"run": run, "tok_s": 40.0 + run} for run in (1, 2)]
+        reasons = harness.acceptance_reasons(legs, label="ours")
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("examples/cli/main.cpp", reasons[0])
+
+    def test_more_ACCEPTED_than_PROPOSED_is_impossible_and_is_refused(self) -> None:
+        legs = [
+            acceptance_leg(1, proposed=21, accepted=9, steps=3),
+            acceptance_leg(2, proposed=21, accepted=22, steps=3),
+        ]
+        reasons = harness.acceptance_reasons(legs, label="ours")
+        self.assertTrue(any("run 2" in reason for reason in reasons), reasons)
+
+    def test_drafts_with_NO_verify_step_to_carry_them_is_refused(self) -> None:
+        legs = [
+            acceptance_leg(1, proposed=21, accepted=9, steps=3),
+            acceptance_leg(2, proposed=21, accepted=9, steps=0),
+        ]
+        reasons = harness.acceptance_reasons(legs, label="ours")
+        self.assertTrue(any("run 2" in reason for reason in reasons), reasons)
+
+    def test_a_healthy_set_of_legs_produces_NO_reasons(self) -> None:
+        self.assertEqual(harness.acceptance_reasons(ACCEPTANCE_LEGS, label="ours"), [])
 
 
 def our_arm_argv(root: pathlib.Path, digest: str, **overrides: object) -> list[str]:
@@ -2652,10 +2831,12 @@ class OurArmRunEntryPointTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def fake_run(self, args, prompt: str) -> str:
-        # BOTH LINES per leg. The boundary marker is not optional to this arm:
-        # `legs_with_spans` refuses a leg without one, because the clock window
-        # is built out of those boundaries (#1671). A stand-in that printed only
-        # the timing line would test a binary that cannot drive this harness.
+        # ALL THREE LINES per leg. Neither marker is optional to this arm:
+        # `legs_with_spans` refuses a leg without a boundary, because the clock
+        # window is built out of those boundaries (#1671), and refuses one
+        # without acceptance, because that is the axis #2832 added. A stand-in
+        # that printed only the timing line would test a binary that cannot
+        # drive this harness.
         #
         # WAS THE WINDOW OPEN while this leg ran? `vllm-cli` is one process per
         # prompt, so the arm's sampler necessarily spans its loads as well as
@@ -2666,6 +2847,8 @@ class OurArmRunEntryPointTest(unittest.TestCase):
             "completion_tokens={completion} secs=1.250 tok_s={tps}\n"
             "vllm-cli: run={run}/2 generate_start_unix={start:.6f} "
             "generate_end_unix={end:.6f}\n"
+            "vllm-cli: run={run}/2 spec_drafts_proposed=21 "
+            "spec_drafts_accepted=9 spec_drafted_request_steps=3\n"
         )
         return "".join(
             line.format(
@@ -2826,7 +3009,12 @@ CLI_SOURCE = ROOT / "examples/cli/main.cpp"
 
 #: `"..." "..."` continuation literals, minus the escapes C and Python share.
 _C_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
-_CONVERSION_RE = re.compile(r"%[-+ #0]*[0-9]*(?:\.[0-9]+)?[a-zA-Z]")
+# The optional length modifier is part of the conversion: `%lld` is ONE
+# conversion and not `%l` followed by stray text, and an int64 counter
+# needs it (#2832).
+_CONVERSION_RE = re.compile(
+    r"%[-+ #0]*[0-9]*(?:\.[0-9]+)?(?:hh|ll|[hljztL])?[a-zA-Z]"
+)
 
 
 def cli_format_string(anchor: str) -> str:
@@ -2899,7 +3087,9 @@ class LegMarkerContractTest(unittest.TestCase):
             "vllm-cli: run={run}/3 finish_reason=length prompt_tokens=5 "
             "completion_tokens=64 secs=1.250 tok_s=51.200\n"
             "vllm-cli: run={run}/3 generate_start_unix={start:.6f} "
-            "generate_end_unix={end:.6f}\n".format(
+            "generate_end_unix={end:.6f}\n"
+            "vllm-cli: run={run}/3 spec_drafts_proposed=21 "
+            "spec_drafts_accepted=9 spec_drafted_request_steps=3\n".format(
                 run=run, start=1755000000.0 + run * 10.0, end=1755000001.25 + run * 10.0
             )
             for run in (1, 2, 3)
@@ -2908,6 +3098,70 @@ class LegMarkerContractTest(unittest.TestCase):
         self.assertEqual([leg["run"] for leg in legs], [1, 2, 3])
         self.assertAlmostEqual(legs[1]["generate_start_unix"], 1755000020.0, places=6)
         self.assertAlmostEqual(legs[1]["generate_end_unix"], 1755000021.25, places=6)
+
+    def test_the_ACCEPTANCE_line_the_cli_prints_is_the_one_the_harness_parses(
+        self,
+    ) -> None:
+        """#2832. Read positionally out of the binary's own format string.
+
+        `%lld` is rewritten to `%d` for the Python substitution only: Python's
+        `%` takes one length modifier and C needs two for an int64. The regex
+        under test still sees the C spelling.
+        """
+
+        fmt = cli_format_string("spec_drafts_proposed=")
+        self.assertEqual(
+            _CONVERSION_RE.findall(fmt),
+            ["%d", "%d", "%lld", "%lld", "%lld"],
+            f"the acceptance line's arity changed: {fmt!r}",
+        )
+        line = fmt.replace("%lld", "%d") % (2, 5, 21, 9, 3)
+        match = our_arm.LEG_SPEC_RE.search(line)
+        self.assertIsNotNone(match, f"LEG_SPEC_RE does not match {line!r}")
+        self.assertEqual(int(match.group("run")), 2)
+        self.assertEqual(int(match.group("proposed")), 21)
+        self.assertEqual(int(match.group("accepted")), 9)
+        self.assertEqual(int(match.group("steps")), 3)
+
+    def test_the_counters_reach_the_LEG_the_harness_folds(self) -> None:
+        text = "".join(
+            "vllm-cli: run={run}/3 finish_reason=length prompt_tokens=5 "
+            "completion_tokens=64 secs=1.250 tok_s=51.200\n"
+            "vllm-cli: run={run}/3 generate_start_unix={start:.6f} "
+            "generate_end_unix={end:.6f}\n"
+            "vllm-cli: run={run}/3 spec_drafts_proposed={p} "
+            "spec_drafts_accepted={a} spec_drafted_request_steps={s}\n".format(
+                run=run,
+                start=1755000000.0 + run * 10.0,
+                end=1755000001.25 + run * 10.0,
+                p=7 * run,
+                a=3 * run,
+                s=run,
+            )
+            for run in (1, 2, 3)
+        )
+        legs = our_arm.legs_with_spans(text)
+        self.assertEqual([leg["spec_drafts_proposed"] for leg in legs], [7, 14, 21])
+        self.assertEqual([leg["spec_drafts_accepted"] for leg in legs], [3, 6, 9])
+        self.assertEqual([leg["spec_drafted_request_steps"] for leg in legs], [1, 2, 3])
+
+    def test_a_leg_with_NO_ACCEPTANCE_line_is_a_REFUSAL_naming_the_binary(self) -> None:
+        """#2832. The same rule the span marker already has, for the same
+        reason: a binary built before the instrument cannot drive this arm, and
+        the alternative is a null acceptance field nobody notices."""
+
+        text = (
+            "vllm-cli: run=1/2 finish_reason=length prompt_tokens=5 "
+            "completion_tokens=64 secs=1.250 tok_s=51.200\n"
+            "vllm-cli: run=1/2 generate_start_unix=1755000000.000000 "
+            "generate_end_unix=1755000001.250000\n"
+        )
+        with self.assertRaises(HarnessError) as raised:
+            our_arm.legs_with_spans(text)
+        message = str(raised.exception)
+        self.assertIn("run 1", message)
+        self.assertIn("examples/cli/main.cpp", message)
+        self.assertIn("acceptance", message)
 
     def test_a_leg_with_NO_marker_is_a_REFUSAL_naming_the_binary(self) -> None:
         """A binary built before the marker must stop the run, not silently
@@ -2988,6 +3242,7 @@ class OurArmSpannedWindowTest(unittest.TestCase):
         our_arm.read_boot_id = lambda *a, **k: "boot-a"  # type: ignore[assignment]
         self.mark = True
         self.calls = 0
+        self.report_acceptance = True
         self.addCleanup(self._restore)
 
     def _restore(self) -> None:
@@ -3042,6 +3297,13 @@ class OurArmSpannedWindowTest(unittest.TestCase):
                 text += (
                     f"vllm-cli: run={run}/2 generate_start_unix={start:.6f} "
                     f"generate_end_unix={end:.6f}\n"
+                )
+            if self.report_acceptance:
+                # Run 2 accepts HALF what run 1 did, so a fold that let the cold
+                # leg in reads a different rate from one that did not.
+                text += (
+                    f"vllm-cli: run={run}/2 spec_drafts_proposed=21 "
+                    f"spec_drafts_accepted={12 // run} spec_drafted_request_steps=3\n"
                 )
         return text
 
@@ -3115,6 +3377,39 @@ class OurArmSpannedWindowTest(unittest.TestCase):
             record["clock"]["window"]["retained_samples"],
             4 * (PROCESS_SAMPLES - LOAD_SAMPLES) - 4 * COLD_SAMPLES,
         )
+
+    def test_the_written_record_carries_ACCEPTANCE_per_leg_and_folded(self) -> None:
+        """#2832, end to end through `our_arm.main()`.
+
+        Four processes x two legs. Every leg proposes 21 over 3 drafted
+        request-steps;
+        run 1 accepts 12 and run 2 accepts 6. The warm fold must therefore read
+        6/21, not the 9/21 a fold over all eight legs would give.
+        """
+
+        record = self.run_arm()
+        self.assertEqual(len(record["legs"]), 8)
+        for leg in record["legs"]:
+            self.assertEqual(leg["spec_drafts_proposed"], 21)
+            self.assertEqual(leg["spec_drafted_request_steps"], 3)
+        block = record["spec_acceptance"]
+        self.assertEqual(block["warm_legs"], 4)
+        self.assertEqual(block["drafts_proposed"], 4 * 21)
+        self.assertEqual(block["drafts_accepted"], 4 * 6)
+        self.assertEqual(block["drafted_request_steps"], 4 * 3)
+        self.assertAlmostEqual(block["accept_rate"], 6 / 21)
+        # (24 + 12) / 12: the bonus token is one per drafted request-step and
+        # is IN here.
+        self.assertAlmostEqual(block["mean_acceptance_length"], 3.0)
+        self.assertEqual([leg["run"] for leg in block["per_leg"]], [2, 2, 2, 2])
+
+    def test_a_binary_that_reports_NO_acceptance_stops_the_run(self) -> None:
+        """The field this row exists to add cannot become null in silence."""
+
+        self.report_acceptance = False
+        with self.assertRaises(HarnessError) as raised:
+            self.run_arm()
+        self.assertIn("acceptance", str(raised.exception))
 
     def test_each_leg_carries_the_instants_it_generated_between(self) -> None:
         record = self.run_arm()
@@ -3190,15 +3485,29 @@ vllm_status vllm_engine_load(const vllm_model_params*, vllm_engine** out) {
 
 void vllm_engine_free(vllm_engine*) {}
 
+// CUMULATIVE over the handle's life, exactly like the real counters. Four
+// drafted request-steps per completion, so a CLI that printed the RAW value
+// would report 4, 8, 12 over three legs and one that subtracts reports 4, 4, 4.
+static long long g_drafted_request_steps = 0;
+
 vllm_status vllm_complete(vllm_engine*, const char*, const vllm_sampling_params*,
                           vllm_completion* out) {
   // A measurable leg: the marker must bracket a span with a positive width.
   timespec nap{0, 30L * 1000L * 1000L};
   ::nanosleep(&nap, nullptr);
+  g_drafted_request_steps += 4;
   out->text = ::strdup("stub");
   out->finish_reason = "length";
   out->prompt_tokens = 5;
   out->completion_tokens = 64;
+  return VLLM_OK;
+}
+
+vllm_status vllm_engine_spec_acceptance(const vllm_engine*,
+                                        vllm_spec_acceptance* out) {
+  out->drafts_proposed = g_drafted_request_steps * 7;
+  out->drafts_accepted = g_drafted_request_steps * 3;
+  out->drafted_request_steps = g_drafted_request_steps;
   return VLLM_OK;
 }
 
@@ -3292,6 +3601,38 @@ class CliMarkerRuntimeTest(unittest.TestCase):
             self.assertLess(legs[0]["generate_end_unix"], legs[1]["generate_start_unix"])
             self.assertLess(legs[1]["generate_end_unix"], legs[2]["generate_start_unix"])
 
+    def test_the_binary_reports_a_per_leg_DELTA_and_not_a_cumulative_TOTAL(
+        self,
+    ) -> None:
+        """#2832, against the PRODUCTION `examples/cli/main.cpp`, linked and run.
+
+        The engine's counters run for the life of the handle and `--repeat`
+        keeps one handle for every leg, so the number a reader wants is a
+        difference. A CLI that printed the raw counter would give 28, 56, 84
+        here and every leg after the first would be wrong by everything before
+        it. Deleting the production call site makes this case fail, which is
+        what makes it a reachability witness rather than a unit test.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = pathlib.Path(raw)
+            binary = self._build(directory)
+            completed = subprocess.run(
+                [
+                    str(binary), "--model", raw, "--prompt", "hi",
+                    "--max-tokens", "64", "--repeat", "3",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            legs = our_arm.legs_with_spans(completed.stderr)
+            self.assertEqual([leg["run"] for leg in legs], [1, 2, 3])
+            for leg in legs:
+                self.assertEqual(leg["spec_drafted_request_steps"], 4)
+                self.assertEqual(leg["spec_drafts_proposed"], 28)
+                self.assertEqual(leg["spec_drafts_accepted"], 12)
+
     def test_the_spans_land_inside_a_window_sampled_around_the_run(self) -> None:
         """The end-to-end claim, with a real sampler stream around a real run.
 
@@ -3329,6 +3670,220 @@ class CliMarkerRuntimeTest(unittest.TestCase):
             self.assertLess(
                 record["window"]["retained_samples"], record["window"]["stream_samples"]
             )
+
+#: The C-ABI accessor's source, and the header that owns the mapping it reads.
+CAPI_SOURCE = ROOT / "src/capi/vllm_c.cpp"
+SPEC_ACCEPTANCE_HEADER = ROOT / "src/capi/spec_acceptance.h"
+
+#: A probe that instantiates the PRODUCTION mapping (`src/capi/spec_acceptance.h`)
+#: against a stand-in runner and prints what it produced. No library, no engine,
+#: no GPU: the header is a template over the three runner accessors, so this
+#: compiles in a second on any box.
+#:
+#: THE FIXTURE IS A RAGGED SPECULATIVE RUN, and the numbers are chosen so that no
+#: two of them are equal. `by_depth[d]` counts the (request, step) pairs whose
+#: draft list was longer than `d`, so `{5, 3, 2}` is five drafted request-steps,
+#: three of which drafted at least twice and two of which drafted three times --
+#: which sums to the ten draft tokens `spec_drafts_proposed` reports, exactly as
+#: the runner's own two adjacent increments guarantee. A uniform k would make
+#: `front()` and `back()` the same number and hide half of what this pins.
+_SPEC_ACCEPTANCE_PROBE = r"""
+#include "capi/spec_acceptance.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+namespace {
+
+// ONLY the three accessors the mapping reads, so the probe cannot accidentally
+// agree with the real runner through some other member.
+struct StandInRunner {
+  int64_t proposed = 0;
+  int64_t accepted = 0;
+  std::vector<int64_t> by_depth;
+
+  int64_t spec_drafts_proposed() const { return proposed; }
+  int64_t spec_drafts_accepted() const { return accepted; }
+  const std::vector<int64_t>& spec_drafts_proposed_by_depth() const {
+    return by_depth;
+  }
+};
+
+void Emit(const char* name, const StandInRunner& runner) {
+  // Pre-seeded with a value the mapping can never produce, so a field the
+  // mapping FAILS to write is visible instead of reading as a plausible 0.
+  vllm_spec_acceptance out{};
+  out.drafts_proposed = -1;
+  out.drafts_accepted = -1;
+  out.drafted_request_steps = -1;
+  vllm::capi::FillSpecAcceptance(runner, &out);
+  std::printf("%s proposed=%lld accepted=%lld drafted_request_steps=%lld\n",
+              name, static_cast<long long>(out.drafts_proposed),
+              static_cast<long long>(out.drafts_accepted),
+              static_cast<long long>(out.drafted_request_steps));
+}
+
+}  // namespace
+
+int main() {
+  StandInRunner ragged;
+  ragged.proposed = 10;
+  ragged.accepted = 4;
+  ragged.by_depth = {5, 3, 2};
+  Emit("ragged", ragged);
+
+  // Nothing ever speculated, so the runner never grew the vector.
+  StandInRunner never;
+  Emit("never", never);
+  return 0;
+}
+"""
+
+
+class SpecAcceptanceMappingTest(unittest.TestCase):
+    """WHICH counter becomes WHICH field, compiled and RUN (#2832).
+
+    A fresh review swapped `drafts_proposed` with `drafts_accepted` AND changed
+    `front()` to `back()` inside the accessor and got a full green: the focused
+    gate, the release-binary contract and the surface-coverage checker all
+    passed. The capi suite could not have caught it either, because both of its
+    cases call the accessor with a NULL argument and return at the null guard
+    before the mapping runs; only a case that builds an engine reaches it, and
+    building an engine means linking the whole library.
+
+    So the mapping was moved into `src/capi/spec_acceptance.h`, a template over
+    the three runner accessors, and this case instantiates THAT header. It is
+    the pin the swap has to fail: `back()` reads 2 where `front()` reads 5, and
+    the swap reads 4 where 10 belongs.
+
+    What it does not claim: that the object handed in is the engine's own runner.
+    `SpecAcceptanceSourceContractTest` holds the call site to passing exactly
+    that and to keeping no second copy of the mapping, and
+    `CliMarkerRuntimeTest` holds the whole route through the linked binary.
+    """
+
+    def _compiler(self) -> str:
+        for candidate in (os.environ.get("CXX"), "g++", "c++", "clang++"):
+            if candidate and shutil.which(candidate):
+                return candidate
+        self.skipTest(
+            "no C++ compiler on PATH, so the production counter mapping cannot "
+            "be run here. THIS IS NOT A PASS: which counter becomes which field "
+            "goes unchecked and only SpecAcceptanceSourceContractTest's source "
+            "contract still holds"
+        )
+
+    def _run_probe(self) -> dict[str, dict[str, int]]:
+        compiler = self._compiler()
+        with tempfile.TemporaryDirectory() as raw:
+            directory = pathlib.Path(raw)
+            probe = directory / "spec_acceptance_probe.cpp"
+            probe.write_text(_SPEC_ACCEPTANCE_PROBE, encoding="utf-8")
+            binary = directory / "spec-acceptance-probe"
+            built = subprocess.run(
+                [
+                    compiler, "-std=c++20", "-O0",
+                    "-I", str(ROOT / "include"),
+                    "-I", str(ROOT / "src"),
+                    str(probe), "-o", str(binary),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            completed = subprocess.run(
+                [str(binary)], capture_output=True, text=True
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+        parsed: dict[str, dict[str, int]] = {}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            parsed[fields[0]] = {
+                key: int(value)
+                for key, _, value in (field.partition("=") for field in fields[1:])
+            }
+        return parsed
+
+    def test_each_counter_reaches_the_field_that_is_NAMED_for_it(self) -> None:
+        got = self._run_probe()["ragged"]
+        # 10 drafts verified, 4 accepted. A swap makes these 4 and 10.
+        self.assertEqual(got["proposed"], 10)
+        self.assertEqual(got["accepted"], 4)
+
+    def test_the_step_count_is_by_depth_FRONT_and_never_BACK(self) -> None:
+        """The half a uniform-k gate can never see.
+
+        Every leg of this suite's other fixtures drafts the same k, so
+        `by_depth.front()` and `by_depth.back()` are one number there and a
+        `back()` would stay green forever. On a ragged batch `back()` counts only
+        the rows that drafted to the deepest k ever seen -- 2 of the 5 here --
+        and every per-step figure computed from it is inflated by 2.5x.
+        """
+
+        got = self._run_probe()["ragged"]
+        self.assertEqual(got["drafted_request_steps"], 5)
+        self.assertNotEqual(got["drafted_request_steps"], 2)
+
+    def test_an_engine_that_never_speculated_reads_ZERO_and_not_stale(self) -> None:
+        got = self._run_probe()["never"]
+        self.assertEqual(
+            got, {"proposed": 0, "accepted": 0, "drafted_request_steps": 0}
+        )
+
+
+class SpecAcceptanceSourceContractTest(unittest.TestCase):
+    """The ABI entry point delegates the mapping and keeps no copy of it.
+
+    `SpecAcceptanceMappingTest` runs the header. This one holds the one thing the
+    header cannot: that `vllm_engine_spec_acceptance` still routes the engine's
+    OWN runner through it, rather than growing a second, unpinned mapping beside
+    it.
+    """
+
+    def _accessor_body(self) -> str:
+        text = CAPI_SOURCE.read_text(encoding="utf-8")
+        start = text.find("vllm_status vllm_engine_spec_acceptance(")
+        self.assertGreater(start, 0, f"{CAPI_SOURCE} defines no accessor")
+        end = text.find("\n}\n", start)
+        self.assertGreater(end, start, "the accessor's body has no end")
+        return text[start:end]
+
+    def test_the_header_that_owns_the_mapping_exists(self) -> None:
+        self.assertTrue(
+            SPEC_ACCEPTANCE_HEADER.is_file(),
+            f"{SPEC_ACCEPTANCE_HEADER} is where the mapping lives",
+        )
+
+    def test_the_accessor_hands_the_ENGINES_OWN_runner_to_the_mapping(self) -> None:
+        body = self._accessor_body()
+        self.assertIn(
+            "vllm::capi::FillSpecAcceptance(engine->loaded->runner(), out)", body
+        )
+
+    def test_the_accessor_keeps_NO_second_copy_of_the_mapping(self) -> None:
+        """A re-inlined mapping is unreachable by every gate that can run here.
+
+        The zeroing before the guards is not one: it writes literal 0 to all
+        three and is what makes a refusal return zeroes instead of stack
+        garbage. What must not come back is an assignment from a counter.
+        """
+
+        body = self._accessor_body()
+        for counter in (
+            "spec_drafts_proposed()",
+            "spec_drafts_accepted()",
+            "spec_drafts_proposed_by_depth()",
+        ):
+            self.assertNotIn(
+                counter,
+                body,
+                f"{counter} is read in the accessor again; the mapping belongs "
+                f"in {SPEC_ACCEPTANCE_HEADER.name}, where a test can run it",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

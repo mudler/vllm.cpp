@@ -1999,6 +1999,13 @@ pieces).**
 
 ## 5. P1 — the forward seam carries DEVICE handles (#1358, #2300)
 
+> **A claim below has been retired.** Every "text steps are byte-identical BY
+> CONSTRUCTION" in this section — and in the LANDED records above it — was true
+> when it was written, because nothing could set `ModelForwardInput::mm`. P2
+> (§6) makes that assignment a live runtime predicate in the runner, so from its
+> landing the property is proven **by test**, not by construction. §6.5 states
+> the mutation that proves it. Read the sentences below as history.
+
 **Scope.** `MultiModalForwardInput`'s five fields, the three sites that construct
 it, and what the three registered forwards do to read them. Nothing else. The
 scheduler, the GPU runner, `NewRequestData` and `EncoderCacheManager` are the NEXT
@@ -2102,10 +2109,248 @@ mutate for reach here, and the wiring is owned by `ENG-MM-INPUT-PIPELINE` under
 
 ---
 
+## 6. P2 — the RUNNER carries multimodal into the forward ([#2379](https://github.com/mudler/vllm.cpp/issues/2379))
+
+**Scope.** The three hops between `Request.mm_features` and
+`ModelForwardInput::mm`, and nothing else. P1 (§5) settled what the forward seam
+carries; this settles what fills it.
+
+1. `NewRequestData::mm_features` — the scheduler->worker payload.
+2. The scheduler's encoder scheduling: an `EncoderCacheManager` that is actually
+   constructed, `_try_schedule_encoder_inputs` in both admission loops,
+   `scheduled_encoder_inputs`, `free_encoder_mm_hashes`, `_free_encoder_inputs`.
+3. The GPU runner: `CachedRequestState::mm_features` / `mrope_positions` /
+   `mrope_position_delta`, the encoder step, the gather, the merge, and the
+   `.mm` assignment.
+
+Out of scope, and named so a reader does not read silence as coverage: the
+`MM-SERVE-E2E` token-exact closing gate on real Qwen3-VL weights (GPU + a
+checkpoint), any new vision tower, video/audio through the runner, and the
+Qwen3.5/3.6 `ForConditionalGeneration` drivers, whose forwards do not read
+`input.mm`.
+
+### 6.1 Upstream anchors, with uniqueness discriminators
+
+Every row re-read in `/home/mudler/_git/vllm` at `5559679229`, the
+`parity-pin` block's `vllm_commit`. A `grep -c` count is over the named file
+unless the row says `-rn vllm/`.
+
+| Upstream anchor | Discriminator | What it fixes here |
+|---|---|---|
+| `vllm/v1/core/sched/scheduler.py:1379` `def _try_schedule_encoder_inputs` | `grep -c 'def _try_schedule_encoder_inputs'` == **1** | the whole encoder admission decision, both loops |
+| `scheduler.py:526` and `:863` `if request.has_encoder_inputs:` | `grep -c 'if request.has_encoder_inputs:'` == **3** — `:526` running loop, `:863` waiting loop, `:938` the post-admit free; discriminated by the surrounding loop | the two call sites, and that there are exactly two admission ones |
+| `scheduler.py:2017` `def _free_encoder_inputs` | `grep -c 'def _free_encoder_inputs'` == **1** | the free runs in `update_from_output`, AFTER the step executed |
+| `vllm/v1/core/encoder_cache_manager.py` `def check_and_update_cache` | `grep -c 'def check_and_update_cache'` == **2** — `EncoderDecoderCacheManager` overrides every method; the FIRST (`:94`) is `EncoderCacheManager`'s | which of the two classes we mirror (we ported the first) |
+| `vllm/multimodal/utils.py:116` `def get_mm_features_in_window` | `grep -rn 'def get_mm_features_in_window' vllm/` == **1** | the `[lo,hi)` window both the scheduler and the runner use |
+| `vllm/v1/worker/gpu_model_runner.py:1293` `mm_features=new_req_data.mm_features` | `grep -c 'mm_features=new_req_data.mm_features'` == **1** | the payload lands on `CachedRequestState` |
+| `gpu_model_runner.py:2998` `def _execute_mm_encoder` | `grep -c 'def _execute_mm_encoder'` == **1** | the encoder step |
+| `gpu_model_runner.py:2995` `self.encoder_cache[mm_hash] = output` | `grep -c 'self.encoder_cache\[mm_hash\] = output'` == **1** | the runner cache is keyed by **mm_hash**, never by `(req_id, input_id)` |
+| `gpu_model_runner.py:3220` `def _gather_mm_embeddings` | `grep -c 'def _gather_mm_embeddings'` == **1** | returns `(mm_embeds, is_mm_embed)` |
+| `gpu_model_runner.py:3600` `self.model.embed_input_ids(` | `grep -c 'self.model.embed_input_ids('` == **3** in the file (`:3588` prompt-embeds arm, `:3600` the mm arm, `:3635` the token-id-only arm); the mm arm is the one in the `else` of `if self.enable_prompt_embeds and ...` | the merge is a MODEL method, not runner code |
+| `gpu_model_runner.py:3607` `self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(` | `grep -c` == **1** | the merged result is copied into a PERSISTENT device buffer |
+| `gpu_model_runner.py:1654` `def _init_mrope_positions` | `grep -c 'def _init_mrope_positions'` == **1** | MRoPE prompt positions are computed ONCE, at admission |
+| `gpu_model_runner.py:2748` `def _calc_mrope_positions` | `grep -c 'def _calc_mrope_positions'` == **1** | the per-step slice, and the completion part SYNTHESISED from one scalar |
+| `gpu_model_runner.py:2786` `mrope_position_delta=req.mrope_position_delta,` | `grep -c 'mrope_position_delta=req.mrope_position_delta'` == **1** | the cross-step carrier is ONE scalar per request |
+| `vllm/model_executor/models/interfaces.py:383` `multimodal_embeddings: MultiModalEmbeddings \| None = None,` | `grep -c` == **1** in the file. `def embed_input_ids` is NOT unique — **322** hits `-rn vllm/`, **3** in this file, two of them `@overload` stubs | the concrete `SupportsMultiModal.embed_input_ids` |
+| `grep -c deepstack vllm/v1/worker/gpu_model_runner.py` == **0** | — | DeepStack is NOT the runner's business; it rides inside the encoder output and is unpacked model-side |
+
+### 6.2 Design — where each upstream method lands
+
+Upstream's runner calls **model methods** (`model.embed_multimodal`,
+`model.embed_input_ids`, `model.get_mrope_input_positions`) through the
+`SupportsMultiModal` / `SupportsMRoPE` protocols. Our registry is type-erased
+over `LoadedModel`, so the protocol becomes three optional function pointers on
+`ModelFactory`, beside `forward` and `make_kv_cache`:
+
+| Upstream protocol method | Our seam | Required? |
+|---|---|---|
+| `SupportsMultiModal.embed_multimodal` | `ModelFactory::encode_mm` | yes, for any mm model |
+| `SupportsMultiModal.embed_input_ids(ids, multimodal_embeddings, is_multimodal)` | `ModelFactory::embed_mm` | yes, for any mm model |
+| `SupportsMRoPE.get_mrope_input_positions` | `ModelFactory::mrope_prompt_positions` | **optional** — null is upstream's `uses_mrope == False` (Gemma-4's mm branch reads the 1-D `input.positions`) |
+
+All three default null. `GPUModelRunner` runs its mm path only when
+`encode_mm != nullptr && embed_mm != nullptr` **and** some request in the step
+carries `mm_features`, so a text model and a text step are unchanged. That
+condition is a RUNTIME PREDICATE, which is the point of §6.5.
+
+### 6.3 Chunked prefill across a straddling multimodal item
+
+Upstream never chunks the ENCODER. `_try_schedule_encoder_inputs` either
+truncates `num_new_tokens` to stop just before `start_pos`, or (when the prefix
+cache already carried `num_computed_tokens` past `start_pos`) refuses the
+request this step by returning `num_new_tokens = 0`. That truncation is the only
+reason `_gather_mm_embeddings`'s `Encoder cache miss for {mm_hash}` is
+unreachable: without it a decoder chunk can cover placeholder rows whose encoder
+output was never computed, and the gather would splice a stale or absent buffer.
+
+`ServerHarness` runs `enable_chunked_prefill = true`, so this is a live path in
+the CPU gate rather than a GPU-only concern. The gate case is a prompt whose
+image span straddles a chunk boundary under a token budget smaller than the
+prompt: without the guard the step schedules across the span, and the runner
+raises the miss.
+
+`disable_chunked_mm_input` (`SchedulerConfig`) selects the stricter
+roll-back-to-before-the-item arm; the default arm is the budget/cache one.
+
+### 6.4 MRoPE across decode steps
+
+`mrope_positions` `[3, num_prompt_tokens]` is computed once per request at
+admission and sliced per step for the prompt part. The completion part is
+SYNTHESISED from `mrope_position_delta`, one int per request: position
+`context_len + i + delta` on all three axes. Nothing stores completion
+positions, and a request that is preempted and resumed recomputes nothing,
+because the prompt array and the delta both live on `CachedRequestState`.
+
+### 6.5 The SACRED text-neutrality obligation, retired from "by construction"
+
+§5 and `mm-serving.md` both claim every text step is byte-identical **by
+construction**, and that claim was TRUE while the runner had no mm code: the
+field could not be set. After this row it is a live runtime predicate, and the
+claim is therefore retired and replaced by one proven **by mutation**.
+
+The mutation: force the runner's mm path unconditionally and require the
+text-only suites to go RED. A green mutant would mean the text gates never
+observe the mm path and the neutrality claim is untested. Named suites:
+`test_runner`, `test_scheduler`, `test_model_registry`, `test_chat_mm`,
+`test_openai_serving`, `test_openai_api_server`.
+
+**THE FIRST WORDING OF THIS MUTATION WAS NOT DISCRIMINATING, and the implementer
+found that by running it.** It said "drop the `any request carries mm_features`
+half of the predicate", which was written before the predicate existed in code.
+The landed predicate is `supports_mm_inputs() && batch_carries_mm()`, and
+`supports_mm_inputs()` is FALSE for every model the text suites load — they run
+Qwen3.5-MoE, whose registration declares no `encode_mm`. Dropping only the
+second conjunct therefore leaves every named suite GREEN while proving nothing.
+The mutation that discriminates replaces the WHOLE predicate with `true`: the
+text suites then reach `ModelRegistry::EmbedMm` on a registration that leaves
+`embed_mm` null, it refuses by name, and they go red. That is the form to run.
+
+**RUN, and only HALF the named suites can observe it.** With
+`if (supports_mm_inputs() && batch_carries_mm())` replaced by `if (true)` in
+`GPUModelRunner::execute_model`:
+
+| Suite | Result under the mutant | Why |
+|---|---|---|
+| `test_runner` | **RED** — 5 cases fail, exit 139 | it drives `execute_model` |
+| `test_openai_serving` | **RED** — 24 of 48 cases fail | it drives the engine |
+| `test_openai_api_server` | **RED** — 28 of 79 cases fail | it drives the server |
+| `test_scheduler` | green, 46/46 | constructs NO runner |
+| `test_model_registry` | green, 24/24 | constructs NO runner |
+| `test_chat_mm` | green, 11/11 | constructs NO runner |
+
+The three green ones are not a hole in the gate; they are suites with nothing to
+observe, and listing them as neutrality witnesses was the error. The
+obligation is discharged by the three that go red. The `139` is a segfault
+rather than the refusal's message, because forcing the predicate reaches
+`ModelRegistry::EmbedMm` on the direct-runner adapter models those cases build;
+a crash is a stronger red than a throw and no weaker, so it is recorded as it
+came out rather than tuned into a message.
+
+### 6.6 Gates
+
+- `test_scheduler`: encoder admission, the budget decrement, the cache
+  check-and-update, the straddling-item truncation, and `free_encoder_mm_hashes`.
+- `test_runner`: the encoder step, the gather window, `.mm` assignment, and the
+  MRoPE prompt/completion split.
+- `test_api_server`: the SERVER end-to-end — a `data:image/x-raw-rgb` chat
+  request through the real `ApiServer` -> `AsyncLLM` -> `Scheduler` ->
+  `GPUModelRunner` -> `ModelRegistry::Forward`, asserting the tower ran, the
+  merged rows reached the forward, and the response is a 200.
+
+### 6.7 Reachability
+
+Production entry point: `ApiServer::handle_chat_completions`. The chain is
+`OpenAIServingChat::create_chat_completion` -> `AsyncLLM::generate(MultiModalInputs)`
+-> `EngineCore` -> `Scheduler::schedule` -> `Executor` -> `GPUModelRunner::execute_model`
+-> `ModelRegistry::Forward`. Each of these five call sites is deleted in a scratch
+copy and the focused gate must go RED:
+
+1. the runner's `.mm` assignment;
+2. `mm_features` in `NewRequestData::from_request`;
+3. the runner's encoder-execute call;
+4. the TOWER call inside the encoder step;
+5. the seam install in `server_main.cpp`.
+
+**RUN.** Each mutation was applied to the tree, built, and the focused gate
+re-run; the tree was restored and re-verified green (7 suites, 4623 assertions,
+0 failed) after the last one.
+
+| Mutation | Gate | Result |
+|---|---|---|
+| 1. delete `forward_input.mm = mm_buffers->mm` | `test_openai_api_server_mm_forward` | **RED** 3/4 cases — `registered forward requires multimodal inputs` |
+| 2. delete `data.mm_features = request.mm_features` | same, and `test_scheduler` | **RED** 3/4 and 1/46 — `the scheduler named multimodal item 0 … which carries 0 items` |
+| 3. delete `execute_mm_encoder(scheduler_output)` | `test_openai_api_server_mm_forward` | **RED** 3/4 — `Encoder cache miss for 209fe433…` |
+| 4a. tower replaced by a correctly SHAPED constant | same | **RED** 1/4 — only the two-different-images case, which is the case that exists for it |
+| 4b. delete the `Qwen3VLVisionForward` call site | same | **RED** 3/4 — `tower produced 0 floats` |
+| 5. delete `chat.set_multimodal_chat_fn` in `server_main.cpp` | — | **NOT RED, and recorded as owed.** The P2 gate installs the seam itself, because a unit test cannot drive `server_main`'s argv path. |
+
+4a is the one worth reading twice. Every other mutation trips a shape or a
+presence check, so a hook that returned a correctly sized constant would satisfy
+all of them — and that is exactly what "the tower ran" would have meant without
+a case comparing TWO DIFFERENT images. That case compares the first generated
+token's LOGPROBS rather than the sampled text, because on a random tiny
+checkpoint the argmax over 17 vocabulary entries does not move for a small
+change in the hidden state while the float logprobs do (measured: -2.7739384 vs
+-2.7739506, same sampled text).
+
 ## Owed
 
 Carried by `ENG-MM-INPUT-PIPELINE`. The first block was filed while landing
-L4 (§1.6); the second while landing L3 (§1.5).
+L4 (§1.6); the second while landing L3 (§1.5); the P2 block below while landing
+§6 (#2379).
+
+### Owed by P2 — the runner multimodal path ([#2408](https://github.com/mudler/vllm.cpp/issues/2408))
+
+Each of these is a path P2 made REACHABLE without making it complete. They are
+listed rather than left to be discovered, and each one refuses by name in the
+code instead of producing an answer.
+
+**Owner.** [#2408](https://github.com/mudler/vllm.cpp/issues/2408). These five
+first pointed at #2379, which is the issue P2 CLOSED, so the owner would have
+been a closed issue the moment the work landed. #2379 stays below as the history
+of how the path landed; #2408 is who owes the rest.
+
+- **Qwen3-VL serves ONE request per step.** `ForwardQwen3VLForConditionalGeneration`
+  returns the last token's logits and does not read `input.logits_indices`, so a
+  batched step cannot be answered; it now refuses with `num_reqs <= 1` rather
+  than letting the sampler index past a one-row tensor. Closing it is a per-row
+  gather inside the VL forward (`VLForwardLastLogitsDBuf`), which moves the
+  numbers the M2c golden was measured on and therefore needs its own gate run.
+  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
+  [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by #2379).
+- **The merge pays a HOST round-trip.** `EmbedMmQwen3VLForConditionalGeneration`
+  downloads the gathered tower rows, runs `Qwen3VLMergeMultimodal` and
+  `Qwen3VLComputeDeepstack` on the host in f32, and uploads the result. That is
+  exactly the arithmetic the gated M2c driver runs, which is why it was chosen —
+  the registered runner path is numerically identical to the path the golden
+  tokens were measured on. A device-resident merge is a measured change against
+  that golden, not a cleanup. Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
+  [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by #2379).
+- **Only the `image` modality reaches the runner.** `EncodeMmQwen3VL...` refuses
+  `video` and `audio` by name. Qwen3-VL has a video tower and a video driver
+  (§3) but no runner path: the video item's placeholder structure is
+  timestamp-interleaved and needs `Qwen3VLGetRopeIndexVideo`, a different M-RoPE
+  entry point from the one the hook calls. Owned by `ENG-MM-INPUT-PIPELINE`,
+  tracked under [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed
+  by #2379).
+- **Gemma-4's `ForwardMm` and Muse Glimmer's are still compile-only, and P2 did
+  NOT change that.** Both consume `ModelForwardInput::mm` and both are exercised
+  only by their own tests, because neither registration declares `encode_mm` /
+  `embed_mm` — so `ModelRegistry::SupportsMmInputs` is false for them and the
+  runner's whole multimodal arm is never entered. Declaring the hooks is the
+  small half; the blocker is that neither model has a chat seam or a processor
+  producing `mm_features` (the only one in the tree is
+  `MakeQwen3VLImageChatFn`, which is Qwen3-VL-shaped), so nothing upstream of
+  the runner would ever build an item for them. Each needs its own brick.
+  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
+  [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by #2379).
+- **The seam install in `server_main.cpp` has no reachability mutation of its
+  own.** `chat.set_multimodal_chat_fn(...)` is the production install and it
+  landed before P2; the P2 e2e gate installs the same seam itself, because a
+  unit test cannot drive `server_main`'s argv path. Deleting the production line
+  therefore leaves the P2 suite green. Owned by `ENG-MM-INPUT-PIPELINE`, tracked
+  under [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by
+  #2379).
 
 - [#1340](https://github.com/mudler/vllm.cpp/issues/1340) — `VT_FUSE_ATTN_PREAMBLE=0`
   on the MRoPE path silently applies 1-D RoPE instead of refusing. Needs a GPU

@@ -13,6 +13,7 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `mlx-lm-apple-m4` | Apple M4 comparison with MLX-LM | Measured | [Details](benchmarks/mlx-lm-apple-m4.md) |
 | `dwarfstar-gguf` | GGUF comparison with DwarfStar | Measured | [Details](benchmarks/dwarfstar-gguf.md) |
 | `speculative-decoding` | Speculative decoding measurements | Mixed | [Details](benchmarks/speculative-decoding.md) |
+| `qwen38-27b-exl3-gb10` | Qwen3.8-27B EXL3 3.5bpw with its DFlash2 draft, on GB10 | Measured | [Details](benchmarks/qwen38-27b-exl3-gb10.md) |
 | `how-we-measure` | Benchmark method and acceptance rules | Method | [Details](benchmarks/how-we-measure.md) |
 | `open-gaps` | Pending, failed, void, and superseded measurements | Open | [Details](benchmarks/open-gaps.md) |
 | `reproduce` | Reproduction commands and artifacts | Method | [Details](benchmarks/reproduce.md) |

@@ -107,9 +107,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <numeric>
 #include <string>
 #include <vector>
+
+// MOEDIV (#2552): the selected-expert-id tap prints on stderr, so this suite
+// captures the descriptor around ONE `RunBlock` call. POSIX only; the tap case
+// refuses to report on a platform without it rather than passing vacuously.
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#define VLLM_MOE_SEL_FP_CAPTURE 1
+#endif
 
 #include "vllm/model_executor/models/qwen4_exp.h"
 #include "vllm/model_executor/models/qwen4_exp_weights.h"
@@ -318,6 +327,10 @@ struct RefOut {
   std::vector<double> y;                    // [T, H]
   std::vector<std::vector<int>> selected;   // [T][top_k], oracle order
   std::vector<double> margin;               // [T] p_k - p_{k+1}
+  // MOEDIV (#2552): the bf16 BITS of the router logits. The tap's margin is in
+  // logit space and its unit is bf16 ulps, so gating it needs the bit patterns
+  // and not the doubles they were rounded from.
+  std::vector<uint16_t> logit_bits;         // [T * E]
 };
 
 RefOut MoeReference(const MoeSource& s, const std::vector<int>& xc) {
@@ -325,6 +338,7 @@ RefOut MoeReference(const MoeSource& s, const std::vector<int>& xc) {
   r.y.assign(static_cast<size_t>(kT) * kH, 0.0);
   r.selected.resize(static_cast<size_t>(kT));
   r.margin.assign(static_cast<size_t>(kT), 0.0);
+  r.logit_bits.assign(static_cast<size_t>(kT) * kE, 0);
   for (int64_t t = 0; t < kT; ++t) {
     std::vector<double> x(static_cast<size_t>(kH));
     for (int64_t h = 0; h < kH; ++h)
@@ -339,6 +353,7 @@ RefOut MoeReference(const MoeSource& s, const std::vector<int>& xc) {
         a += x[static_cast<size_t>(h)] *
              (static_cast<double>(s.router[static_cast<size_t>(e * kH + h)]) * kWU);
       logit[static_cast<size_t>(e)] = Bf16(a);
+      r.logit_bits[static_cast<size_t>(t * kE + e)] = vt::F32ToBF16(static_cast<float>(a));
     }
     const double mx = *std::max_element(logit.begin(), logit.end());
     std::vector<double> prob(static_cast<size_t>(kE));
@@ -709,4 +724,208 @@ TEST_CASE("Qwen4Exp MoE: the router and shared gate reach the seam as bf16") {
   for (size_t i = 0; i < s.router.size(); ++i)
     if (vt::BF16ToF32(rg[i]) == static_cast<float>(s.router[i]) * kWU) ++exact;
   CHECK(exact == s.router.size());
+}
+
+// ─── MOEDIV (#2552): the SELECTED-EXPERT-ID tap ──────────────────────────────
+//
+// `VT_Q4EXP_LAYER_FP` taps values, and a value tap cannot separate an
+// expert-selection FLIP from re-association inside the expert GEMM: a discrete
+// selection has BIMODAL error and not a tolerance. `VT_MOE_SEL_FP` prints the
+// selection instead. This case is what makes the printed line trustworthy —
+// it gates the ids against `MoeReference`, this suite's independent
+// double-precision reimplementation of the lane-pinned oracle, and it gates
+// `ulps` against the reference's own bf16 logit BITS.
+//
+// THE CASE NAME CONTAINS NO COMMA. `-tc` splits its filter on commas, so a
+// comma in a case name silently selects nothing and the run reports
+// `assertions: 0 ... SUCCESS!` at rc 0 — a skip wearing a pass. The ctest entry
+// `test_qwen4_exp_moe_sel_fp` re-runs this binary with the switch set and
+// filters on this exact string.
+//
+// IT ASSERTS ITS OWN CAPTURE. A sentinel is written into the redirected
+// descriptor and read back, so a capture that silently caught nothing fails
+// here rather than reading as "the tap printed nothing", which is the polarity
+// the OFF arm asserts and the one a broken instrument would fake.
+namespace {
+
+#ifdef VLLM_MOE_SEL_FP_CAPTURE
+// Everything written to stderr while `body` runs, as a string.
+template <typename F>
+std::string CaptureStderr(F&& body) {
+  std::fflush(stderr);
+  int saved = ::dup(2);
+  char path[] = "/tmp/vllm_moesel_XXXXXX";
+  int fd = ::mkstemp(path);
+  REQUIRE(saved >= 0);
+  REQUIRE(fd >= 0);
+  ::dup2(fd, 2);
+  body();
+  std::fflush(stderr);
+  ::dup2(saved, 2);
+  ::close(saved);
+  ::lseek(fd, 0, SEEK_SET);
+  std::string out;
+  char buf[4096];
+  ssize_t n = 0;
+  while ((n = ::read(fd, buf, sizeof(buf))) > 0) out.append(buf, static_cast<size_t>(n));
+  ::close(fd);
+  ::unlink(path);
+  return out;
+}
+
+std::vector<std::string> LinesWithPrefix(const std::string& s, const std::string& pfx) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  while (i < s.size()) {
+    const size_t e = s.find('\n', i);
+    const std::string line = s.substr(i, e == std::string::npos ? std::string::npos : e - i);
+    if (line.rfind(pfx, 0) == 0) out.push_back(line);
+    if (e == std::string::npos) break;
+    i = e + 1;
+  }
+  return out;
+}
+
+// `key=` of a `moesel` line, as a string.
+std::string Field(const std::string& line, const std::string& key) {
+  const std::string k = " " + key + "=";
+  const size_t i = line.find(k);
+  if (i == std::string::npos) return std::string();
+  const size_t b = i + k.size();
+  const size_t e = line.find(' ', b);
+  return line.substr(b, e == std::string::npos ? std::string::npos : e - b);
+}
+
+// bf16 under the sign-magnitude total order — the tap's own `Bf16Ordered`,
+// re-derived here rather than shared, so a sign-handling defect in the tap has
+// nothing on this side agreeing with it.
+int32_t RefBf16Ordered(uint16_t b) {
+  return (b & 0x8000U) != 0 ? -static_cast<int32_t>(b & 0x7fffU)
+                            : static_cast<int32_t>(b & 0x7fffU);
+}
+#endif  // VLLM_MOE_SEL_FP_CAPTURE
+
+}  // namespace
+
+TEST_CASE("Qwen4Exp MoE: the selected-expert-id tap names the oracle's own set") {
+#ifndef VLLM_MOE_SEL_FP_CAPTURE
+  MESSAGE("no POSIX stderr capture on this platform; the tap is NOT gated here");
+  return;
+#else
+  MoeSource s = BuildSource(/*keep_quant=*/false);
+  const Qwen4ExpParams p = Params();
+  MoeBlockWeights mw = vllm::Qwen4ExpMoeBlockWeights(s.w, p);
+  const std::vector<int> xc = HiddenCodes();
+  const RefOut ref = MoeReference(s, xc);
+  AssertRoutingIsNonTrivial(ref);
+
+  std::vector<float> got;
+  const std::string cap = CaptureStderr([&] {
+    std::fprintf(stderr, "moesel-capture-sentinel\n");
+    got = RunBlock(mw, p, xc);
+  });
+  // The capture's OWN precondition. Without this line the OFF arm below is an
+  // assertion of absence from a redirect that may never have happened.
+  REQUIRE(cap.find("moesel-capture-sentinel") != std::string::npos);
+  REQUIRE(got.size() == static_cast<size_t>(kT) * kH);
+
+  const std::vector<std::string> lines = LinesWithPrefix(cap, "moesel call=");
+  const char* budget = std::getenv("VT_MOE_SEL_FP");
+  if (budget == nullptr || budget[0] == '\0' || std::string(budget) == "0") {
+    // A DIAGNOSTIC MUST BE INERT ON THE DEFAULT PATH. The sentinel above proves
+    // the capture ran, so this is a measurement and not a failed grep.
+    MESSAGE("VT_MOE_SEL_FP unset: the tap must print nothing");
+    CHECK(lines.empty());
+    return;
+  }
+
+  // ON. One value line per token plus one digest line.
+  REQUIRE(lines.size() == static_cast<size_t>(kT) + 1);
+  const std::string& digest = lines.back();
+  CHECK(Field(digest, "T") == std::to_string(kT));
+  CHECK(Field(digest, "E") == std::to_string(kE));
+  CHECK(Field(digest, "k") == std::to_string(kTopK));
+  // `lines` is the PROCESS-WIDE running total, and this entry runs the whole
+  // binary, so other cases have already spent some of it. The exact per-call
+  // count is asserted above as `lines.size() == kT + 1` over the captured
+  // window; this asserts the running total is at least what this call added,
+  // which is the property the measuring job reads back.
+  CHECK(std::stoll(Field(digest, "lines")) >= static_cast<long long>(kT));
+
+  uint64_t want_sel = 1469598103934665603ULL;
+  int64_t want_min_ulps = -1;
+  int64_t want_min_tok = -1;
+  for (int64_t t = 0; t < kT; ++t) {
+    const std::string& ln = lines[static_cast<size_t>(t)];
+    CAPTURE(ln);
+    CHECK(Field(ln, "tok") == std::to_string(t));
+
+    // (1) THE SET. Sorted, because two arms selecting the same experts in a
+    // different order have made the same routing decision.
+    std::vector<int> want = ref.selected[static_cast<size_t>(t)];
+    std::sort(want.begin(), want.end());
+    std::string want_ids;
+    for (size_t j = 0; j < want.size(); ++j) {
+      if (j != 0) want_ids += ",";
+      want_ids += std::to_string(want[j]);
+      const uint32_t v = static_cast<uint32_t>(want[j]);
+      for (int b = 0; b < 4; ++b) {
+        want_sel ^= static_cast<uint64_t>((v >> (8 * b)) & 0xffU);
+        want_sel *= 1099511628211ULL;
+      }
+    }
+    CHECK(Field(ln, "ids") == want_ids);
+
+    // (2) THE BOUNDARY, from the reference's OWN bf16 logit bits.
+    int lo_e = -1, hi_e = -1;
+    for (int64_t e = 0; e < kE; ++e) {
+      const bool picked = std::find(want.begin(), want.end(), static_cast<int>(e)) != want.end();
+      const uint16_t b = ref.logit_bits[static_cast<size_t>(t * kE + e)];
+      const int32_t o = RefBf16Ordered(b);
+      if (picked) {
+        if (lo_e < 0 || o < RefBf16Ordered(ref.logit_bits[static_cast<size_t>(t * kE + lo_e)]))
+          lo_e = static_cast<int>(e);
+      } else {
+        if (hi_e < 0 || o > RefBf16Ordered(ref.logit_bits[static_cast<size_t>(t * kE + hi_e)]))
+          hi_e = static_cast<int>(e);
+      }
+    }
+    REQUIRE(lo_e >= 0);
+    REQUIRE(hi_e >= 0);
+    const int64_t want_ulps =
+        static_cast<int64_t>(RefBf16Ordered(ref.logit_bits[static_cast<size_t>(t * kE + lo_e)])) -
+        static_cast<int64_t>(RefBf16Ordered(ref.logit_bits[static_cast<size_t>(t * kE + hi_e)]));
+    CHECK(Field(ln, "lo_e") == std::to_string(lo_e));
+    CHECK(Field(ln, "hi_e") == std::to_string(hi_e));
+    CHECK(Field(ln, "ulps") == std::to_string(want_ulps));
+    // The margin has to be POSITIVE and the ulp count has to agree with it: a
+    // selected logit below a rejected one is a routing defect, not a rounding.
+    CHECK(want_ulps > 0);
+    if (want_min_ulps < 0 || want_ulps < want_min_ulps) {
+      want_min_ulps = want_ulps;
+      want_min_tok = t;
+    }
+  }
+  // (3) The digest hash IS the set-equality assertion two arms use. Recomputed
+  // here from the oracle's sets, so a tap that hashed the SELECTION ORDER (and
+  // would therefore report a false flip between two arms that agree) reds.
+  char want_hex[32];
+  std::snprintf(want_hex, sizeof(want_hex), "%016llx",
+                static_cast<unsigned long long>(want_sel));
+  CHECK(Field(digest, "sel") == std::string(want_hex));
+  CHECK(Field(digest, "minulps") == std::to_string(want_min_ulps));
+  CHECK(Field(digest, "mintok") == std::to_string(want_min_tok));
+
+  // (4) The four decomposition axes are POPULATED and finite. `x` is the block
+  // input and is checkable in closed form; the other three are only asserted
+  // non-zero, because their value is the measurement and not the contract.
+  double want_x = 0.0;
+  for (size_t i = 0; i < xc.size(); ++i)
+    want_x += std::fabs(static_cast<double>(
+        vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(xc[i]) * kAU))));
+  CHECK(std::stod(Field(digest, "x")) == doctest::Approx(want_x).epsilon(1e-9));
+  CHECK(std::stod(Field(digest, "logit")) > 0.0);
+  CHECK(std::stod(Field(digest, "exp")) > 0.0);
+  CHECK(std::stod(Field(digest, "shr")) > 0.0);
+#endif
 }

@@ -1,0 +1,321 @@
+
+===== 0. identity, and the one knob that would void every number below =====
+2026-09-03T18:17:38Z
+hostname=rc-worker-lcjhd boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+RC_JOB_ID=e1afb349-98c4-4e8b-a684-26fdeaa4ba24 RC_DEVICE=strix:gpu0
+HSA_OVERRIDE_GFX_VERSION=UNSET  <- must be UNSET
+inherited_env NONE
+               total        used        free      shared  buff/cache   available
+Mem:              62           3           8           0          51          58
+overlay         1.9T  602G  1.2T  34% /
+32
+x86_64
+
+===== 1. inputs -- an absent one is an ABSENCE, never a result =====
+2026-09-03T18:17:38Z
+PRESENT /workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf
+PRESENT /workspace/ckpt/qwen38-27b-q4km/config.json
+PRESENT /workspace/ggufplugin/mmproj-BF16.gguf
+PRESENT /workspace/ckpt/qwen3.8-27b-hf/tokenizer_config.json
+PRESENT /workspace/vllm-gfx1151-2740/vllm-pin.tar.gz
+PRESENT /workspace/vllm-gfx1151-2740/ggufplugin-src.tar.gz
+PRESENT /workspace/q4km-neartie-2809/neartie_vllm.py
+PRESENT /workspace/q4km-neartie-2809/ours_gen_ids_1.json
+PRESENT /workspace/q4km-neartie-2809/oracle_hip.txt
+PRESENT /workspace/q4km-neartie-2809/tokens-gguf-eager.json
+PRESENT /workspace/q4km-neartie-2809/tokens-gguf-compiled.json
+GGUF_BYTES=17106775008 EXPECTED=17106775008
+SHA ours_gen_ids_1.json 8b542c718fd38721d5dd3286a77c91ed30ab495b0c604783b9a2681fcc1ad107
+SHA tokens-gguf-eager.json 350b5fae5de4a25a62fdc2a839eefbfc69e2538f1eadfaa463b60a4c5d39434a
+SHA tokens-gguf-compiled.json 034a1e303fc39ac72044e2d4bfa79b084cc10b2867b9ec701288c1ab2978de25
+RECORDED_STREAMS_OK  (our arm's ids, and both of #2788's vLLM legs)
+
+===== 2. venv + torch 2.13.0+rocm7.2 (CMakeLists.txt:72's TORCH_SUPPORTED_VERSION_ROCM) =====
+2026-09-03T18:17:39Z
+Looking in indexes: https://download.pytorch.org/whl/rocm7.2
+Collecting torch==2.13.0+rocm7.2
+  Downloading torch-2.13.0%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl (6227.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.2/6.2 GB 17.7 MB/s  0:04:41
+Collecting filelock (from torch==2.13.0+rocm7.2)
+  Downloading filelock-3.32.3-py3-none-any.whl.metadata (2.0 kB)
+Collecting typing-extensions>=4.10.0 (from torch==2.13.0+rocm7.2)
+  Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+Requirement already satisfied: setuptools>=77.0.3 in ./tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages (from torch==2.13.0+rocm7.2) (84.0.0)
+Collecting sympy>=1.13.3 (from torch==2.13.0+rocm7.2)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch==2.13.0+rocm7.2)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch==2.13.0+rocm7.2)
+  Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch==2.13.0+rocm7.2)
+  Downloading fsspec-2026.7.0-py3-none-any.whl.metadata (10 kB)
+Collecting triton-rocm==3.7.1 (from torch==2.13.0+rocm7.2)
+  Downloading triton_rocm-3.7.1-cp312-cp312-linux_x86_64.whl.metadata (1.7 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch==2.13.0+rocm7.2)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.13.0+rocm7.2)
+  Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Downloading triton_rocm-3.7.1-cp312-cp312-linux_x86_64.whl (311.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 311.7/311.7 MB 21.6 MB/s  0:00:15
+Downloading fsspec-2026.7.0-py3-none-any.whl (206 kB)
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 3.1 MB/s  0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 4.4 MB/s  0:00:01
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 4.6 MB/s  0:00:00
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+Downloading filelock-3.32.3-py3-none-any.whl (98 kB)
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Installing collected packages: mpmath, typing-extensions, triton-rocm, sympy, networkx, MarkupSafe, fsspec, filelock, jinja2, torch
+
+Successfully installed MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 sympy-1.14.0 torch-2.13.0+rocm7.2 triton-rocm-3.7.1 typing-extensions-4.16.0
+torch_install_rc=0
+/tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch.__version__ = 2.13.0+rocm7.2
+torch.version.hip = 7.2.53211
+arch_list         = ['gfx900', 'gfx906', 'gfx908', 'gfx90a', 'gfx942', 'gfx1030', 'gfx1100', 'gfx1101', 'gfx1102', 'gfx1103', 'gfx1200', 'gfx1201', 'gfx950', 'gfx1150', 'gfx1151']
+device[0] AMD Radeon 8060S gfx1151 68719476736
+TORCH_IDENTITY=OK
+
+===== 3. the packages whose absence has three times read as a device verdict =====
+2026-09-03T18:23:29Z
+-rw-r--r-- 1 root root 2854 Jul 15 23:46 /usr/include/python3.12/Python.h
+/usr/include/libdrm
+AMDSMI_HANDLES = 1
+
+===== 4. stage the PINNED source and ASSERT it =====
+2026-09-03T18:23:30Z
+vllm-pin.tar.gz sha256 = 7d8bd182057aa17d227caacb7c343258a39af1b8e320fb2bd484c0358b3a98e5
+src=/tmp/q4km-neartie-2809/vllm-pin files=6110
+src_manifest_LC_ALL_C=b037645415bb07eccbf9b69f6a8d69b51b14131bac3f1e93a143961af0f46483
+set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201")
+set(TORCH_SUPPORTED_VERSION_ROCM "2.13.0")
+214:_ON_GFX1151 = "gfx1151" in _GCN_ARCH
+
+===== 5. BUILD vLLM for gfx1151 ONLY =====
+2026-09-03T18:23:32Z
+VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1151 MAX_JOBS=4 CCACHE_DIR=/workspace/ccache-2740
+[heartbeat 2026-09-03T18:23:44Z] free=58G build_lines=0
+[heartbeat 2026-09-03T18:24:45Z] free=58G build_lines=726
+[heartbeat 2026-09-03T18:25:47Z] free=58G build_lines=759
+[heartbeat 2026-09-03T18:26:47Z] free=58G build_lines=823
+[heartbeat 2026-09-03T18:27:48Z] free=58G build_lines=919
+[heartbeat 2026-09-03T18:28:49Z] free=58G build_lines=945
+[heartbeat 2026-09-03T18:29:50Z] free=58G build_lines=945
+[heartbeat 2026-09-03T18:30:50Z] free=57G build_lines=1073
+[heartbeat 2026-09-03T18:31:50Z] free=57G build_lines=1073
+[heartbeat 2026-09-03T18:32:51Z] free=57G build_lines=1073
+[heartbeat 2026-09-03T18:33:52Z] free=57G build_lines=1073
+[heartbeat 2026-09-03T18:34:52Z] free=57G build_lines=1073
+[heartbeat 2026-09-03T18:35:53Z] free=57G build_lines=1073
+[heartbeat 2026-09-03T18:36:55Z] free=57G build_lines=1288
+[heartbeat 2026-09-03T18:37:56Z] free=56G build_lines=1328
+[heartbeat 2026-09-03T18:38:57Z] free=50G build_lines=1419
+[heartbeat 2026-09-03T18:39:58Z] free=56G build_lines=1421
+[heartbeat 2026-09-03T18:40:58Z] free=58G build_lines=1580
+BUILD_RC=0   (read from the program, not through a pipe)
+      7 gfx1151
+      1 gfx1201
+      1 gfx1200
+      1 gfx1153
+      1 gfx1152
+      1 gfx1150
+WARNING 09-03 18:41:23 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+vllm.__version__ = 0.26.0.dev0+g5559679229
+CURRENT_PLATFORM = RocmPlatform
+DEVICE_NAME      = AMD_Radeon_8060S
+DEVICE_CAP       = DeviceCapability(major=11, minor=5)
+PLATFORM_OK
+
+===== 6. torchvision must be the ROCm build, or transformers cannot be imported =====
+2026-09-03T18:41:25Z
+TORCHVISION_OPS=OK 0.29.0+rocm7.2
+
+===== 7. build and install the GGUF plugin FOR gfx1151 =====
+2026-09-03T18:41:29Z
+PLUGIN_TGZ_OK 9e15c20e0b75f75bbf886966df07843c4b70a7952fad4b80e8e8183e2f70743b
+PLUGIN_BUILD_RC=0
+6b7e0f4fd8e73b2090b8302f80dd10f65e6232ced0299c486e10ba145de58821  /tmp/q4km-neartie-2809/gplug-wheel/vllm_gguf_plugin-0.0.5-cp310-abi3-linux_x86_64.whl
+INSTALLED_SO=/tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+4417184250995733a61d352146e36062d60e4a8c44581eb2631fbcc48600f0de  /tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+      1 amdgcn-amd-amdhsa--gfx1151
+INSTALLED_PLUGIN_ARCH_OK
+GENERAL_PLUGIN_ENTRY_POINTS = [('quark_online_quant', 'quark.online_quantization.vllm.plugin:register'), ('gguf', 'vllm_gguf_plugin:register'), ('lora_filesystem_resolver', 'vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver'), ('lora_hf_hub_resolver', 'vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver')]
+REGISTRATION OK
+
+===== 8. THE MEASUREMENT -- teacher-force, both oracle configurations =====
+2026-09-03T18:43:46Z
+
+--- LEG eager (enforce_eager=1) ---
+2026-09-03T18:43:46Z
+NEARTIE_RC[eager]=0
+--- LEG eager: the four conjuncts ---
+=== §12.2 NEAR-TIE BAND | oracle vLLM eager | stream ours ===
+  p1/36 our     11 lp -0.909987  top    369 lp -0.784987  gap  0.125000  rank 2
+  p1/45 our    303 lp -1.349277  top   1521 lp -1.099277  gap  0.250000  rank 3
+  p2/29 our     20 lp -1.438583  top     16 lp -1.313583  gap  0.125000  rank 2
+  p3/45 our     25 lp -1.374806  top    393 lp -1.249806  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 4 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.250000 @ (1, 45)
+  token mismatches     = 4 (exact ties 0, strictly positive 4)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM eager | stream self ===
+  p1/35 our   4350 lp -1.721187  top   5844 lp -1.596187  gap  0.125000  rank 2
+  p2/ 4 our  11995 lp -1.054173  top  29922 lp -0.929173  gap  0.125000  rank 2
+  p3/45 our     25 lp -1.374806  top    393 lp -1.249806  gap  0.125000  rank 2
+  p4/14 our   4593 lp -1.111856  top  22486 lp -0.986857  gap  0.125000  rank 2
+  p4/28 our   1452 lp -1.865096  top   8380 lp -1.802596  gap  0.062500  rank 2
+  p5/32 our     15 lp -1.594296  top     16 lp -1.469296  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 6 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.125000 @ (1, 35)
+  token mismatches     = 6 (exact ties 0, strictly positive 6)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM eager | stream llamacpp ===
+  p1/36 our     11 lp -0.909987  top    369 lp -0.784987  gap  0.125000  rank 2
+  p2/29 our     20 lp -1.438583  top     16 lp -1.313583  gap  0.125000  rank 2
+  p5/32 our     15 lp -1.594296  top     16 lp -1.469296  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 3 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.125000 @ (1, 36)
+  token mismatches     = 3 (exact ties 0, strictly positive 3)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM eager | stream control_corrupt ===
+  p0/10 our   9999 lp -21.081854  top     13 lp -0.011542  gap 21.070312  rank 78230
+  result               = FAIL
+  n_divergent          = 1 of 48
+  over_band_failures   = 1
+  worst_gap_nats       = 21.070312 @ (0, 10)
+  token mismatches     = 1 (exact ties 0, strictly positive 1)
+  FOUR CONJUNCTS       = FAIL
+
+INSTRUMENT_CONTROL corrupt-step discriminates = PASS (n_divergent 1, worst 21.070312)
+WROTE /tmp/q4km-neartie-2809/neartie-eager.json
+DONE_MARKER_Q4KM_NEARTIE_VLLM
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+--- tail of LEG eager, in case it died ---
+  p2/29 our     20 lp -1.438583  top     16 lp -1.313583  gap  0.125000  rank 2
+  p5/32 our     15 lp -1.594296  top     16 lp -1.469296  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 3 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.125000 @ (1, 36)
+  token mismatches     = 3 (exact ties 0, strictly positive 3)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM eager | stream control_corrupt ===
+  p0/10 our   9999 lp -21.081854  top     13 lp -0.011542  gap 21.070312  rank 78230
+  result               = FAIL
+  n_divergent          = 1 of 48
+  over_band_failures   = 1
+  worst_gap_nats       = 21.070312 @ (0, 10)
+  token mismatches     = 1 (exact ties 0, strictly positive 1)
+  FOUR CONJUNCTS       = FAIL
+
+INSTRUMENT_CONTROL corrupt-step discriminates = PASS (n_divergent 1, worst 21.070312)
+WROTE /tmp/q4km-neartie-2809/neartie-eager.json
+DONE_MARKER_Q4KM_NEARTIE_VLLM
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=393709) INFO 09-03 18:58:01 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+
+--- LEG compiled (enforce_eager=0) ---
+2026-09-03T18:58:08Z
+NEARTIE_RC[compiled]=0
+--- LEG compiled: the four conjuncts ---
+=== §12.2 NEAR-TIE BAND | oracle vLLM compiled | stream ours ===
+  result               = PASS
+  n_divergent          = 0 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.000000 @ None
+  token mismatches     = 0 (exact ties 0, strictly positive 0)
+  FOUR CONJUNCTS       = PASS
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM compiled | stream self ===
+  p4/13 our   6165 lp -3.238075  top  19820 lp -3.175575  gap  0.062500  rank 2
+  p4/38 our     17 lp -0.921848  top     18 lp -0.796848  gap  0.125000  rank 2
+  p5/32 our     15 lp -1.562733  top     16 lp -1.437733  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 3 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.125000 @ (4, 38)
+  token mismatches     = 3 (exact ties 0, strictly positive 3)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM compiled | stream llamacpp ===
+  p5/32 our     15 lp -1.562733  top     16 lp -1.437733  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 1 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.125000 @ (5, 32)
+  token mismatches     = 1 (exact ties 0, strictly positive 1)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM compiled | stream control_corrupt ===
+  p0/10 our   9999 lp -21.252218  top     13 lp -0.010032  gap 21.242187  rank 79792
+  result               = FAIL
+  n_divergent          = 1 of 48
+  over_band_failures   = 1
+  worst_gap_nats       = 21.242187 @ (0, 10)
+  token mismatches     = 1 (exact ties 0, strictly positive 1)
+  FOUR CONJUNCTS       = FAIL
+
+INSTRUMENT_CONTROL corrupt-step discriminates = PASS (n_divergent 1, worst 21.242187)
+WROTE /tmp/q4km-neartie-2809/neartie-compiled.json
+DONE_MARKER_Q4KM_NEARTIE_VLLM
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+WARNING 09-03 19:15:24 [utils.py:626] [shutdown] Process manager: force killing remaining processes count=1
+--- tail of LEG compiled, in case it died ---
+  p5/32 our     15 lp -1.562733  top     16 lp -1.437733  gap  0.125000  rank 2
+  result               = PASS
+  n_divergent          = 1 of 288
+  over_band_failures   = 0
+  worst_gap_nats       = 0.125000 @ (5, 32)
+  token mismatches     = 1 (exact ties 0, strictly positive 1)
+  FOUR CONJUNCTS       = FAIL
+
+=== §12.2 NEAR-TIE BAND | oracle vLLM compiled | stream control_corrupt ===
+  p0/10 our   9999 lp -21.252218  top     13 lp -0.010032  gap 21.242187  rank 79792
+  result               = FAIL
+  n_divergent          = 1 of 48
+  over_band_failures   = 1
+  worst_gap_nats       = 21.242187 @ (0, 10)
+  token mismatches     = 1 (exact ties 0, strictly positive 1)
+  FOUR CONJUNCTS       = FAIL
+
+INSTRUMENT_CONTROL corrupt-step discriminates = PASS (n_divergent 1, worst 21.242187)
+WROTE /tmp/q4km-neartie-2809/neartie-compiled.json
+DONE_MARKER_Q4KM_NEARTIE_VLLM
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=395389) INFO 09-03 19:15:19 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+WARNING 09-03 19:15:24 [utils.py:626] [shutdown] Process manager: force killing remaining processes count=1
+
+===== 9. postcondition =====
+2026-09-03T19:15:27Z
+/workspace/q4km-neartie-2809/job.sh: line 46: 393561 Killed                  ( while true; do
+    A=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "$(date +%s) $A" >> "$LOCAL/mem.samples"; if [ "$A" -lt "$FLOOR_MB" ]; then
+        G=$(cat "$LOCAL/gen.pgid" 2> /dev/null); echo "WATCHDOG: MemAvailable ${A}MB < ${FLOOR_MB}MB -- killing group $G"; [ -n "$G" ] && kill -9 -- "-$G" 2> /dev/null;
+    fi; sleep 2;
+done ) > "$LOCAL/watchdog.log" 2>&1
+minMemAvailable_MB=54371 samples=949
+f2edef503eaef227751bb8ed519bc106ee61fd35578e9800866bb2372ad0c19c  /tmp/q4km-neartie-2809/neartie-compiled.json
+9b6fed75d24d8ee1cbef9557ae29ce25bc5d18518cb96f7c1601f7ac8cbb3a37  /tmp/q4km-neartie-2809/neartie-eager.json

@@ -105,11 +105,18 @@ constexpr int kMaxModelLen = 32;
 // construction is byte-for-byte what it was; #1919's long-context case raises
 // it, because a store sized from `max_model_len` can only be SHOWN to be sized
 // from it by a `max_model_len` that differs from the constant it replaced.
-HfConfig MakeDenseConfig(int max_pos = kMaxModelLen) {
+// `hidden` is DEFAULTED to the 32 every construction before
+// MODEL-DFLASH2-EXL3 (#2495 item 7) used, so every existing binary that
+// includes this header builds a byte-identical target. The EXL3 arm raises it,
+// and has no choice: `vt::Exl3HadR128` refuses a row length that is not a
+// multiple of 128 because the transform IS blockwise Hadamard-128, the draft's
+// hidden size IS the target's, and 32 is therefore a width no trellis can
+// describe.
+HfConfig MakeDenseConfig(int max_pos = kMaxModelLen, int hidden = 32) {
   HfConfig c;
   c.model_type = "qwen3_5_text";
   c.architectures = {"Qwen3_5ForConditionalGeneration"};
-  c.hidden_size = 32;
+  c.hidden_size = hidden;
   c.num_hidden_layers = 4;
   c.vocab_size = kVocab;
   c.num_attention_heads = 6;
@@ -278,21 +285,65 @@ constexpr int kSelRank = 4;
 constexpr int kSelTopK = 3;
 constexpr int kSpecTokens = 3;  // k; the conv's query block is 1 + k = 4
 
+// MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 draft arm's geometry and format.
+// Every K and N is a multiple of 128 because the Hadamard block is, and the
+// bits and codebook are the published artifact's:
+// `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` @ `4f043626` stores all 36 of its
+// modules at `bits_per_weight: 5` with `mul1_multiplier: 2212286765`, which is
+// the 0x83DCD12D that `exl3_lib/quantize.py:1421-1424` writes.
+constexpr int kExl3Hidden = 128;    // the TARGET's hidden, and so the draft's
+constexpr int kExl3DraftHq = 8;     // qdim  = 256
+constexpr int kExl3DraftHkv = 4;    // kvdim = 128
+constexpr int kExl3DraftDh = 32;
+constexpr int kExl3DraftI = 256;
+constexpr int kExl3Bits = 5;
+constexpr uint32_t kExl3Mul1 = 0x83DCD12DU;
+
 class DraftTensorStore {
  public:
   void Add(const std::string& name, std::vector<int64_t> shape, uint64_t seed) {
     int64_t n = 1;
     for (int64_t d : shape) n *= d;
-    Stored& st = tensors_[name];
-    st.values.resize(static_cast<size_t>(n));
+    std::vector<uint16_t> v(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i)
-      st.values[static_cast<size_t>(i)] =
-          vt::F32ToBF16(RandV(seed * 977 + static_cast<uint64_t>(i)));
-    st.view.dtype = "BF16";
-    st.view.shape = std::move(shape);
-    st.view.data = reinterpret_cast<const uint8_t*>(st.values.data());
-    st.view.nbytes = st.values.size() * sizeof(uint16_t);
+      v[static_cast<size_t>(i)] = vt::F32ToBF16(RandV(seed * 977 + static_cast<uint64_t>(i)));
+    AddRaw(name, "BF16", std::move(shape), std::move(v));
   }
+
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): one EXL3 module, under the four names
+  // the published checkpoint stores it under.
+  //
+  // THE TRELLIS IS OPAQUE BITS, so pseudo-random 16-bit words are exactly as
+  // valid an operand as a fitted one. What this fixture has to get right is the
+  // SHAPE, the dtypes and the marker, because those are what the loader reads;
+  // whether the decoded numbers approximate anything is measured against a
+  // decoded twin in tests/vllm/models/test_qwen3_dflash2_exl3.cpp and not here.
+  void AddExl3(const std::string& proj, int64_t k, int64_t n, uint64_t seed) {
+    REQUIRE(k % 128 == 0);
+    REQUIRE(n % 128 == 0);
+    const size_t words = static_cast<size_t>(k / 16) * static_cast<size_t>(n / 16) *
+                         static_cast<size_t>(16 * kExl3Bits);
+    std::vector<uint16_t> tr(words);
+    for (size_t i = 0; i < words; ++i)
+      tr[i] = static_cast<uint16_t>(Mix(seed * 7919 + static_cast<uint64_t>(i)) & 0xffffULL);
+    AddRaw(proj + ".trellis", "I16", {k / 16, n / 16, 16 * kExl3Bits}, std::move(tr));
+    // `suh`/`svh` are fp16 SIGN vectors (`exl3.py:48-49`).
+    std::vector<uint16_t> suh(static_cast<size_t>(k));
+    for (int64_t i = 0; i < k; ++i)
+      suh[static_cast<size_t>(i)] = vt::F32ToF16(
+          (Mix(seed * 31 + static_cast<uint64_t>(i)) & 1ULL) != 0 ? 1.0F : -1.0F);
+    AddRaw(proj + ".suh", "F16", {k}, std::move(suh));
+    std::vector<uint16_t> svh(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+      svh[static_cast<size_t>(i)] = vt::F32ToF16(
+          (Mix(seed * 131 + static_cast<uint64_t>(i)) & 1ULL) != 0 ? 1.0F : -1.0F);
+    AddRaw(proj + ".svh", "F16", {n}, std::move(svh));
+    // One I32 holding the codebook's own multiplier, written as two LE words.
+    AddRaw(proj + ".mul1", "I32", {},
+           {static_cast<uint16_t>(kExl3Mul1 & 0xffffU),
+            static_cast<uint16_t>(kExl3Mul1 >> 16)});
+  }
+
   TensorResolver Resolver() const {
     return [this](const std::string& name) -> const StTensor& {
       auto it = tensors_.find(name);
@@ -301,8 +352,24 @@ class DraftTensorStore {
       return it->second.view;
     };
   }
+  // What `dense_loaders::IsExl3Projection` asks. A `TensorResolver` can only
+  // throw, so the EXL3 rung needs a predicate that answers.
+  std::function<bool(const std::string&)> Has() const {
+    return [this](const std::string& name) { return tensors_.count(name) != 0; };
+  }
 
  private:
+  // The one writer. `tensors_` is a node-based map, so the address `view.data`
+  // holds stays valid for the life of the store.
+  void AddRaw(const std::string& name, const char* dtype, std::vector<int64_t> shape,
+              std::vector<uint16_t> words) {
+    Stored& st = tensors_[name];
+    st.values = std::move(words);
+    st.view.dtype = dtype;
+    st.view.shape = std::move(shape);
+    st.view.data = reinterpret_cast<const uint8_t*>(st.values.data());
+    st.view.nbytes = st.values.size() * sizeof(uint16_t);
+  }
   struct Stored {
     std::vector<uint16_t> values;
     StTensor view;
@@ -313,15 +380,19 @@ class DraftTensorStore {
 // The draft's own config.json, as `MakeQwen3FlashDraftConfig` would produce it.
 // `target_layer_ids` name TARGET layers, so they must sit inside the target's
 // four; the aux multi-tap is captured at exactly these.
-HfConfig MakeDraftConfig(const HfConfig& target, bool muse_glimmer_scalars) {
+HfConfig MakeDraftConfig(const HfConfig& target, bool muse_glimmer_scalars,
+                         bool exl3 = false) {
   HfConfig c;
   c.hidden_size = target.hidden_size;
-  c.num_attention_heads = 4;
-  c.num_key_value_heads = 2;
-  c.head_dim = 8;
-  c.rotary_dim = 8;
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 arm's head geometry is the
+  // narrowest one whose every projection width is a multiple of 128. It is
+  // DEFAULTED off, so a bf16 draft is byte-identical to what it was.
+  c.num_attention_heads = exl3 ? kExl3DraftHq : 4;
+  c.num_key_value_heads = exl3 ? kExl3DraftHkv : 2;
+  c.head_dim = exl3 ? kExl3DraftDh : 8;
+  c.rotary_dim = c.head_dim;
   c.rope_theta = 10000.0;
-  c.intermediate_size = 16;
+  c.intermediate_size = exl3 ? kExl3DraftI : 16;
   c.vocab_size = target.vocab_size;
   c.num_hidden_layers = kDraftLayers;
   c.rms_norm_eps = 1e-6;
@@ -348,16 +419,35 @@ HfConfig MakeDraftConfig(const HfConfig& target, bool muse_glimmer_scalars) {
 }
 
 std::unique_ptr<DflashDraft> MakeDflash2Draft(const HfConfig& target,
-                                              bool muse_glimmer_scalars) {
-  static DraftTensorStore store;
-  static bool filled = false;
-  const HfConfig c = MakeDraftConfig(target, muse_glimmer_scalars);
+                                              bool muse_glimmer_scalars,
+                                              bool exl3 = false) {
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): one store per ARM. The two hold
+  // different tensor names at different widths, so a single cache keyed on
+  // nothing would serve one arm's tensors to the other.
+  static DraftTensorStore bf16_store;
+  static DraftTensorStore exl3_store;
+  static bool bf16_filled = false;
+  static bool exl3_filled = false;
+  DraftTensorStore& store = exl3 ? exl3_store : bf16_store;
+  bool& filled = exl3 ? exl3_filled : bf16_filled;
+  const HfConfig c = MakeDraftConfig(target, muse_glimmer_scalars, exl3);
   const int64_t H = c.hidden_size, V = c.vocab_size, I = c.intermediate_size;
   const int64_t Hq = c.num_attention_heads, Hkv = c.num_key_value_heads, Dh = c.head_dim;
   const int64_t taps_fc = 2;  // len(target_layer_ids)
   const int64_t groups = H / kConvGroup;
   if (!filled) {
-    store.Add("fc.weight", {H, H * taps_fc}, 1);
+    // MODEL-DFLASH2-EXL3 (#2495 item 7): the eight projections are trellises on
+    // the EXL3 arm and merged bf16 owners on the other. Everything else --
+    // norms, base kernels, both selector codebooks -- is BF16 on both, which is
+    // what the published artifact ships.
+    const auto proj = [&](const std::string& name, int64_t k, int64_t n, uint64_t seed) {
+      if (exl3) {
+        store.AddExl3(name, k, n, seed);
+      } else {
+        store.Add(name + ".weight", {n, k}, seed);
+      }
+    };
+    proj("fc", H * taps_fc, H, 1);
     store.Add("hidden_norm.weight", {H}, 2);
     store.Add("norm.weight", {H}, 3);
     for (int64_t l = 0; l < kDraftLayers; ++l) {
@@ -365,15 +455,15 @@ std::unique_ptr<DflashDraft> MakeDflash2Draft(const HfConfig& target,
       const uint64_t s = 100 + static_cast<uint64_t>(l) * 50;
       store.Add(b + "input_layernorm.weight", {H}, s + 1);
       store.Add(b + "post_attention_layernorm.weight", {H}, s + 2);
-      store.Add(b + "self_attn.q_proj.weight", {Hq * Dh, H}, s + 3);
-      store.Add(b + "self_attn.k_proj.weight", {Hkv * Dh, H}, s + 4);
-      store.Add(b + "self_attn.v_proj.weight", {Hkv * Dh, H}, s + 5);
-      store.Add(b + "self_attn.o_proj.weight", {H, Hq * Dh}, s + 6);
+      proj(b + "self_attn.q_proj", H, Hq * Dh, s + 3);
+      proj(b + "self_attn.k_proj", H, Hkv * Dh, s + 4);
+      proj(b + "self_attn.v_proj", H, Hkv * Dh, s + 5);
+      proj(b + "self_attn.o_proj", Hq * Dh, H, s + 6);
       store.Add(b + "self_attn.q_norm.weight", {Dh}, s + 7);
       store.Add(b + "self_attn.k_norm.weight", {Dh}, s + 8);
-      store.Add(b + "mlp.gate_proj.weight", {I, H}, s + 9);
-      store.Add(b + "mlp.up_proj.weight", {I, H}, s + 10);
-      store.Add(b + "mlp.down_proj.weight", {H, I}, s + 11);
+      proj(b + "mlp.gate_proj", H, I, s + 9);
+      proj(b + "mlp.up_proj", H, I, s + 10);
+      proj(b + "mlp.down_proj", I, H, s + 11);
       for (const char* which : {"attention_conv.", "mlp_conv."}) {
         store.Add(b + which + "base_kernel", {2, kConvTaps, H}, s + 12);
         store.Add(b + which + "kernel_projection.weight",
@@ -388,9 +478,12 @@ std::unique_ptr<DflashDraft> MakeDflash2Draft(const HfConfig& target,
   auto draft = std::make_unique<DflashDraft>();
   draft->config = c;
   draft->k = kSpecTokens;
+  // `Has()` is passed on BOTH arms. On the bf16 store it answers false for
+  // every `.trellis`, which is what keeps that arm on the byte-identical path
+  // while still exercising the predicate the EXL3 rung reads.
   draft->weights = vllm::LoadQwen3DFlash(
       store.Resolver(), c, taps_fc,
-      /*mask_token_id=*/static_cast<int32_t>(V - 1));
+      /*mask_token_id=*/static_cast<int32_t>(V - 1), store.Has());
   // What the loader's SharedHeadSource does: the draft reads the target's
   // embed_tokens and lm_head. Built to the same shapes the safetensors arm
   // produces -- [vocab, H] with nk=false for the gather table and the same

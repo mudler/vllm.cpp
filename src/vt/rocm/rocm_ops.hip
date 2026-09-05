@@ -14,11 +14,25 @@ void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+// MLA/DSA campaign W1 (#2715). The batched GEMM lives beside its dense siblings
+// in rocm_matmul_hipblaslt.hip; the three data-movement ops in rocm_mla_ops.hip.
+void BatchedMatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+void ConcatAndCacheMlaKernelRocm(Queue& q, const Tensor& kv_c, const Tensor& k_pe,
+                                 Tensor& kv_cache, const Tensor& slot_mapping);
+void ConcatMlaNopeRopeKernelRocm(Queue& q, Tensor& out, const Tensor& nope,
+                                 const Tensor& rope);
+void GatherMlaCacheKernelRocm(Queue& q, Tensor& dst, const Tensor& src_cache,
+                              const Tensor& block_table, const Tensor& cu_seq_lens,
+                              const Tensor& token_to_seq, const Tensor* seq_starts,
+                              int64_t num_tokens);
 void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
                                const RopeArgs& args);
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits);
 void CastBf16KernelRocm(Queue& q, Tensor& out, const Tensor& in);
 void CastF32KernelRocm(Queue& q, Tensor& out, const Tensor& in);
+// The NARROWING third sibling (rocm_dense_basic.hip). BACKEND-ROCM-EXL3 / #2433:
+// one of the exactly two ops an EXL3 checkpoint ran on the CPU reference tier.
+void CastF16KernelRocm(Queue& q, Tensor& out, const Tensor& in);
 void QkvSplitKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
                         const Tensor& qkv);
 void LayerNormKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
@@ -105,6 +119,20 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
                             const Tensor& w, const RmsNormGatedArgs& args);
 void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
                                const Tensor& gate);
+// BACKEND-ROCM-EXL3 (rocm_exl3.hip): the fused EXL3 trellis linear, transcribed
+// from the PORTABLE CPU reference (cpu_exl3_kernels.cpp / cpu_exl3_dequant.cpp)
+// and not from the CUDA kernel, whose 90 KiB shared-memory budget, m16n8k16 mma,
+// ldmatrix and cp.async have no gfx1151 form. See .agents/specs/backend-rocm-exl3.md.
+void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+                        const Tensor& suh, const Tensor& svh, Tensor& a_had,
+                        const Exl3GemmArgs& args);
+// ROCM-FUSED-NORM-ROPE (rocm_mla_fused_norm_rope.hip, #2564): the MLA
+// norm-rope fold. Registering it is what makes `mla_attention.cpp`'s `fused_nr`
+// predicate true on this backend, and that predicate -- not the op call -- is
+// what a keep-quant MLA checkpoint depends on.
+void FusedNormRopeKernelRocm(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
+                             const Tensor& w, const Tensor& positions, const Tensor& cache,
+                             const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                                   const Tensor& qgate, const Tensor& kf,
                                   const Tensor& q_norm, const Tensor& k_norm,
@@ -141,6 +169,8 @@ struct Registrar {
                    static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernelRocm)));
     RegisterOp(OpId::kCastBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16KernelRocm)));
+    RegisterOp(OpId::kCastF16, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<CastF16Fn>(&CastF16KernelRocm)));
     RegisterOp(OpId::kCastF32, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32KernelRocm)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kROCM,
@@ -238,9 +268,33 @@ struct Registrar {
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
+    RegisterOp(OpId::kExl3Gemm, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelRocm)));
+    RegisterOp(
+        OpId::kFusedNormRope, DeviceType::kROCM,
+        reinterpret_cast<void*>(static_cast<FusedNormRopeFn>(&FusedNormRopeKernelRocm)));
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
+    // MLA/DSA campaign W1 (#2715). Before these lines each of these four
+    // resolved to NO native ROCm kernel: the portable CPU reference tier where
+    // it is eligible (which docs/ROCM.md:60-61 disqualifies a performance result
+    // on) and a REFUSAL where #2511 withdrew it — see rocm_mla_ops.hip's header.
+    // The remaining three gating ops (kDsaIndexerLogits, kDsaTopkSelect,
+    // kMlaDecodeAttention) are still absent, so the GLM-5.3 speed axis stays
+    // VOID after this wave.
+    RegisterOp(OpId::kBatchedMatmul, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<BatchedMatmulFn>(&BatchedMatmulKernelRocm)));
+    RegisterOp(OpId::kConcatAndCacheMla, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernelRocm)));
+    RegisterOp(OpId::kConcatMlaNopeRope, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatMlaNopeRopeFn>(&ConcatMlaNopeRopeKernelRocm)));
+    RegisterOp(OpId::kGatherMlaCache, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<GatherMlaCacheFn>(&GatherMlaCacheKernelRocm)));
   }
 } registrar;
 

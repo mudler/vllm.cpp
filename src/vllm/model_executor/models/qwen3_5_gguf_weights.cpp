@@ -832,7 +832,7 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   const GgufResidency head_r =
       RouteGgufTensor(pol.keep_quant, pol.keep_f16, /*nvfp4_fp4=*/false,
                       pol.cpu_ref, GgufTensorRole::kMatmulWeight, ht.ggml_type,
-                      ht.shape);
+                      ht.shape, pol.device);
 
   // The two coincide (share one buffer) iff both kept f16, OR both expanded in
   // the file's own [N, K] order (expand_nk). share_tied_head already implies
@@ -1360,7 +1360,10 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
                                          const GgufLoadPolicy* policy) {
   // Null policy => the process environment, whose defaults reproduce the
   // historical all-bf16 expansion byte for byte.
-  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
+  // A null `policy` means NO ENGINE RESOLVED A DEVICE: every production GGUF
+  // entry point now builds one from `ModelSource::device` in its registry hook.
+  // `kCPU` is STATED rather than probed — see `GgufLoadPolicy::FromEnv`.
+  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
   // Read-once file pages are dropped as the load goes, but only when the kept
   // weights are the ones staying resident (mmap residency). With the copy arm or
@@ -1524,7 +1527,10 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
                                              const GgufLoadPolicy* policy) {
   // Null policy => the process environment, whose defaults reproduce the
   // historical all-bf16 expansion byte for byte.
-  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
+  // A null `policy` means NO ENGINE RESOLVED A DEVICE: every production GGUF
+  // entry point now builds one from `ModelSource::device` in its registry hook.
+  // `kCPU` is STATED rather than probed — see `GgufLoadPolicy::FromEnv`.
+  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
   // Read-once file pages are dropped as the load goes, but only when the kept
   // weights are the ones staying resident (mmap residency). With the copy arm or

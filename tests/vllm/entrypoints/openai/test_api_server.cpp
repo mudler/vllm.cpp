@@ -13,6 +13,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/multimodal/parakeet_transcription.h"
+#include "vllm/multimodal/speech_engine.h"
 
 #include <doctest/doctest.h>
 
@@ -3886,6 +3887,125 @@ TEST_CASE("api_server: /v1/audio/speech route registration is ADDITIVE over a re
       CHECK(videos->status == 404);  // still unregistered, no video runner attached
     });
   }
+}
+
+// CONCURRENCY, entered through the production route (#2836,
+// SERVE-SPEECH-ENGINE-SERIALIZE).
+//
+// `speech_engine.h` states of `Synthesize`: "Implementations serialize
+// internally (staged weights are shared state)". Nothing held anyone to it, and
+// this route is where that costs something: `handle_audio_speech` calls the
+// synthesizer INLINE on whichever cpp-httplib worker served the request
+// (`api_server.cpp:636`), it takes no lock, and the pool is TWELVE threads on a
+// stock server -- `HttpWorkerCount` is `max_concurrent_streams + headroom`, and
+// the defaults are 8 and 4 (`api_server.h:70-71`). So the shape #2712 called
+// "the one that would make it live" is reachable on the default configuration,
+// not behind a flag.
+//
+// This case measures that rather than arguing it: four real clients on four
+// threads, over a real socket, through the registered route and the production
+// mapping `vllm::openai::SynthesizeSpeechRequest`. The engine records how deep
+// the seam ever got. The test_speech_engine sibling holds the same contract at
+// the seam and is the one the sanitized lane builds; this one is here because a
+// contract nothing production-side reaches is a class, not a capability.
+namespace {
+
+class RouteConcurrencyProbe final : public ::vllm::multimodal::SpeechEngine {
+ public:
+  std::string family() const override { return "concurrency-probe"; }
+  int64_t sample_rate() const override { return 22050; }
+  bool requires_reference_audio() const override { return false; }
+
+  ::vllm::multimodal::SpeechResult SynthesizeLocked(
+      const ::vllm::multimodal::SpeechGenParams&) override {
+    const int depth = depth_.fetch_add(1) + 1;
+    int seen = max_depth_.load();
+    while (depth > seen && !max_depth_.compare_exchange_weak(seen, depth)) {
+    }
+    // Long enough that four requests dispatched together overlap when nothing
+    // serialises them, and short enough that four serialised runs finish well
+    // inside the client's 15 s read timeout. A real synthesis is minutes.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    depth_.fetch_sub(1);
+    calls_.fetch_add(1);
+    ::vllm::multimodal::SpeechResult r;
+    r.sample_rate = 22050;
+    r.channels = 1;
+    r.samples.assign(64, 0.25F);
+    return r;
+  }
+
+  int max_depth() const { return max_depth_.load(); }
+  int calls() const { return calls_.load(); }
+
+ private:
+  std::atomic<int> depth_{0};
+  std::atomic<int> max_depth_{0};
+  std::atomic<int> calls_{0};
+};
+
+}  // namespace
+
+TEST_CASE("api_server: concurrent /v1/audio/speech requests do NOT enter one engine at once") {
+  constexpr int kClients = 4;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  RouteConcurrencyProbe engine;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "concurrency-probe";
+  caps.sample_rate = 22050;
+  caps.channels = 1;
+  caps.requires_reference_audio = false;
+  // The PRODUCTION wiring, byte for byte what `server_main.cpp:1717-1722` and
+  // `:1014-1019` install: the route's lambda calls the library mapping, which
+  // calls the seam. Nothing here stands in for a step of that chain.
+  h.server.set_synthesizer(
+      [&engine](const vllm::openai::SpeechRequest& req) {
+        return vllm::openai::SynthesizeSpeechRequest(engine, req);
+      },
+      caps);
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  ScopedServerThread server_thread(h.server);
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  std::atomic<int> ready{0};
+  std::atomic<int> served{0};
+  std::vector<std::thread> clients;
+  clients.reserve(kClients);
+  for (int i = 0; i < kClients; ++i) {
+    clients.emplace_back([port, &ready, &served] {
+      httplib::Client client("127.0.0.1", port);
+      client.set_connection_timeout(5, 0);
+      client.set_read_timeout(15, 0);
+      // Released together, so an overlap is a property of the server and not of
+      // how fast each thread happened to start.
+      ready.fetch_add(1);
+      while (ready.load() < kClients) std::this_thread::yield();
+      auto res = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+      if (res && res->status == 200 && res->body.compare(0, 4, "RIFF") == 0) {
+        served.fetch_add(1);
+      }
+    });
+  }
+  for (std::thread& t : clients) t.join();
+  server_thread.join();  // stops the server, then joins
+
+  // EVERY request is still answered. Serialising must queue the second caller,
+  // never refuse it: no upstream behaviour turns a concurrent speech request
+  // into a 429, and a test that accepted fewer than four answers would be
+  // passing on a regression.
+  CHECK(served.load() == kClients);
+  CHECK(engine.calls() == kClients);
+  // THE ASSERTION. One is what the seam's own contract says; anything above it
+  // is two cpp-httplib workers inside one engine's staged weights and one
+  // `vt::Queue`.
+  CHECK(engine.max_depth() == 1);
 }
 
 // The REQUEST-KEY contract, entered through the production route rather than

@@ -3,12 +3,22 @@
 # the binary that took the correctness reading, so the phase decomposition has a
 # spread beside it instead of one number.
 #
+# THE PIN ADVANCED ON 2026-09-01, AND IT WAS EARNED RATHER THAN EDITED
+# (LTX25-RENDER-CONFIRM, #2457). It named `4b0666ee`'s pre-repair binary, which
+# is why `LTX25-CONNECTOR-REPAIR` could only PROJECT the post-repair render. The
+# way past that guard is not to relax it: `scripts/ltx25-render-confirm.sh` built
+# the head, re-took #1864's blockiness verdict on THAT binary, and only then
+# timed it. `rc` job 93a60151 returned VERDICT PASS with margins +0.113 and
+# +0.124 on the two gated ratios, and 302.954 s at n = 3. The digests below are
+# that binary's. The guard itself is unchanged: still exit 51 on anything else,
+# still never builds.
+#
 # WHAT THIS IS NOT. It is not `ltx25-oracle-absolute-render.sh` with a loop
 # around it. That job's subject is the PICTURE and it renders once; this job's
 # subject is the WALL, and a wall quoted from one run is an anecdote. It also
 # never builds: it REFUSES on a cache miss (51), because a rebuilt binary is a
-# different measurement subject and the whole point is to time the tree that
-# `fa9903b86` established `VERDICT PASS` on.
+# different measurement subject and the whole point is to time a tree that has
+# itself established `VERDICT PASS`.
 #
 # THE REQUEST IS THE MANIFEST'S, byte for byte, and identical to the neighbouring
 # harness's. A decomposition of a different request measures the request.
@@ -35,7 +45,7 @@
 #   44 the CUDA unit gate FAILED     45 the CUDA unit gate BINARY IS ABSENT
 #   48 a render produced the wrong number of frames, or no audio
 #   49 a render exited non-zero
-#   51 the build cache is absent, or its binary is not `4b0666ee`'s
+#   51 the build cache is absent, or its binary is not the VERIFIED one
 #   52 a phase table covers less than 99% of its own wall
 #   53 a render did not run 8 steps / 32 DiT forwards
 set -u
@@ -43,26 +53,33 @@ set -u
 T0=$SECONDS
 say() { echo "[$(date -u +%H:%M:%S) +$((SECONDS-T0))s] $*"; }
 
-W=${W:-/workspace/ltx25-oracle-absolute}      # the cache and the checkpoints this row reuses
+# THE CACHE MOVED WITH THE PIN. The verified artefacts now live where the job
+# that verified them wrote them, so the digests below and the files they name
+# cannot drift apart.
+W=${W:-/workspace/ltx25-render-confirm}       # the cache and the source this row reuses
 OUTROOT=${OUTROOT:-/workspace/ltx25-render-speed}
 FULL=${FULL:-/workspace/ltx25-fullmodel}
 CKROOT=${CKROOT:-/workspace/ckpt/ltx-2.5}
 SRC=/root/src
 BIN=/root/speedbin
 CK=/root/ckpt
-CACHE=$W/absref-bin
+CACHE=$W/confirm-bin
 N=${N:-3}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 OUT=$OUTROOT/run/$RUN_ID
 mkdir -p "$OUT" "$CK" "$BIN"
 
-# THE MEASUREMENT SUBJECT, asserted rather than assumed. These two digests are
-# `rc` job 4b0666ee's own PROVENANCE, the run whose comparison returned
-# VERDICT PASS. A harness that rebuilds and then reports a decomposition has
-# timed a binary nobody verified.
-WANT_BIN_SHA=${WANT_BIN_SHA:-7b1f4367abce3af9a0611ddad091987275787101d752ebcadb7cdb016817c05d}
-WANT_LIB_SHA=${WANT_LIB_SHA:-9e3dc6f47024757c587a90a6a6946c753c31baa7c5dc22085baf93f141287329}
-WANT_SRC_SHA=${WANT_SRC_SHA:-0002ddfba26b59279732aeb4e3c99e092b436f28}
+# THE MEASUREMENT SUBJECT, asserted rather than assumed. These digests are `rc`
+# job 93a60151's own PROVENANCE, the run whose comparison returned VERDICT PASS
+# against #1864's reference on the SAME binary it then timed. A harness that
+# rebuilds and then reports a decomposition has timed a binary nobody verified.
+#
+# The previous values were 4b0666ee's -- ltx2-gen 7b1f4367, libvllm 9e3dc6f4,
+# source 0002ddfba -- and they are recorded here because a pin that changes
+# without saying what it replaced is a pin nobody can audit.
+WANT_BIN_SHA=${WANT_BIN_SHA:-600cf798c48ebabebc1fa25fb4891fe0b550f31f995501105aea856cced4c54d}
+WANT_LIB_SHA=${WANT_LIB_SHA:-c4692db9025899463122b64b26cc40486dd445d37f9b7835e06cbf26daf83492}
+WANT_SRC_SHA=${WANT_SRC_SHA:-790c582bbba45ab0f7b74aafee361e4557a84bf2}
 
 PROMPT='A red fox walks slowly through a snowy pine forest at sunrise, cinematic.'
 WW=320; HH=192; FRAMES=25; STEPS=8; SEED=42
@@ -172,8 +189,8 @@ LIBSHA=$(sha256sum "$BIN/libvllm.so.0.0.3" | awk '{print $1}')
 # launcher whose digest has been byte-identical across builds hundreds of commits
 # apart while the libraries differed by megabytes. Checking only the launcher
 # would pass a completely different engine.
-[ "$BINSHA" = "$WANT_BIN_SHA" ] || { echo "FATAL: ltx2-gen is $BINSHA, 4b0666ee's is $WANT_BIN_SHA"; exit 51; }
-[ "$LIBSHA" = "$WANT_LIB_SHA" ] || { echo "FATAL: libvllm is $LIBSHA, 4b0666ee's is $WANT_LIB_SHA"; exit 51; }
+[ "$BINSHA" = "$WANT_BIN_SHA" ] || { echo "FATAL: ltx2-gen is $BINSHA, the verified binary's is $WANT_BIN_SHA"; exit 51; }
+[ "$LIBSHA" = "$WANT_LIB_SHA" ] || { echo "FATAL: libvllm is $LIBSHA, the verified binary's is $WANT_LIB_SHA"; exit 51; }
 say "  identity holds: ltx2-gen=$BINSHA lib=$LIBSHA"
 "$BIN/ltx2-gen" --help >/dev/null 2>&1 || {
   echo "FATAL: ltx2-gen will not exec (126 = no exec bit, 127 = missing lib)"; ldd "$BIN/ltx2-gen" | head; exit 25; }

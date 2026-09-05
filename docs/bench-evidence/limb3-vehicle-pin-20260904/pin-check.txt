@@ -1,0 +1,125 @@
+===== 0. identity =====
+2026-09-04T08:02:49Z
+tree             = /home/mudler/_git/vllm.cpp/.wt/limb3-vehicle
+tree_head        = a1ada1471e72079d161c72f7c3bcdc0b9ad096bf
+vllm_checkout    = /home/mudler/_git/vllm
+vllm_head        = 5559679229bc961848b121ccdeaa8fa5d79bec98
+VLLM_CHECKOUT_IS_THE_PIN = yes
+candidate_repo   = unsloth/Qwen3.6-27B-GGUF
+candidate_rev    = 82d411acf4a06cfb8d9b073a5211bf410bfc29bf
+candidate_file   = Qwen3.6-27B-Q4_K_M.gguf
+
+===== 1. THE PIN IS A REVISION, NOT A REPO ID =====
+HF_SIZE            16817244384
+HF_GIT_OID         f3015758f351abf31db20bf5cd92d598f3f415d9
+HF_LFS_SHA256      5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0
+EXPECT_SIZE        16817244384
+EXPECT_LFS_SHA256  5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0
+NOTE: the LFS oid is what the forge ADVERTISES. The authoritative value is
+      the sha256 measured on the staged bytes after transfer (§5).
+
+===== 2. CONDITIONS 1, 2, 4, 5: the candidate's OWN header, by RANGE REQUEST =====
+URL                https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-Q4_K_M.gguf
+PREFIX_MIB         16
+PATH               <range-prefix>
+GGUF_VERSION       3
+N_TENSORS          851
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 64
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 449, "Q4_K": 289, "Q5_K": 48, "Q6_K": 65}
+
+
+===== 2b. the ARM's own artifact, read by the same instrument =====
+PATH               /mnt/nas_share/checkpoints/qwen3.8-27b-gguf/Qwen3.8-27B-Q4_K_M.gguf
+GGUF_VERSION       3
+N_TENSORS          866
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 65
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 456, "Q4_K": 294, "Q5_K": 48, "Q6_K": 67, "Q8_0": 1}
+
+
+===== 2c. THE REJECTED SIBLING, read by the same instrument =====
+URL                https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/3221f178a6b842d04f1fb42f1c413534adcc0a6a/Qwen3.5-27B-Q4_K_M.gguf
+PREFIX_MIB         16
+PATH               <range-prefix>
+GGUF_VERSION       3
+N_TENSORS          851
+ARCHITECTURE       qwen35
+SIZE_LABEL         27B
+SHAPE_KV           qwen35.block_count = 64
+SHAPE_KV           qwen35.embedding_length = 5120
+SHAPE_KV           qwen35.feed_forward_length = 17408
+TYPE_HISTOGRAM     {"F32": 353, "Q4_K": 263, "Q5_K": 96, "Q6_K": 43, "Q8_0": 96}
+
+
+===== 3. CONDITION 2: is qwen35 in OUR dispatch? printed from the tree =====
+constexpr GgufArchArm kGgufArchArms[] = {
+    {"deepseek4", &vllm::DeepseekV4HfConfigFromGguf},
+    {vllm::kMuseGlimmerGgufArch, &vllm::MuseGlimmerHfConfigFromGguf},
+    {"qwen35", &vllm::HfConfigFromGguf},
+    {"qwen35moe", &vllm::HfConfigFromGguf},
+    {"qwen3next", &vllm::HfConfigFromGguf},
+    {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
+    {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
+    {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
+};
+38:inline constexpr const char* kQwen4ExpGgufArch = "qwen4exp";
+44:inline constexpr const char* kGlm5NextGgufArch = "glm5next";
+52:inline constexpr const char* kGlmMoeDsaGgufArch = "glm-dsa";
+69:inline constexpr const char* kClipGgufArch = "clip";
+99:inline constexpr const char* kMuseGlimmerGgufArch = "muse-glimmer";
+-- the ggml type ids our reader ACCEPTS (one refused id refuses the file WHOLE) --
+ACCEPTED_GGML_TYPE_IDS = 0 1 2 6 8 10 11 12 13 14 16 17 18 19 20 21 22 23 24 25 26 27 28 30 39 40 41 66 
+  candidate stores id 0 -- ACCEPTED
+  candidate stores id 12 -- ACCEPTED
+  candidate stores id 13 -- ACCEPTED
+  candidate stores id 14 -- ACCEPTED
+
+===== 4. CONDITION 3: the FOUR-SURFACE oracle check, with BOTH controls =====
+-- the candidate declares this HF architecture --
+HF_ARCHITECTURES   ['Qwen3_5ForConditionalGeneration']
+HF_MODEL_TYPE      qwen3_5
+HF_LAYERS          64
+HF_HIDDEN          5120
+HF_FFN             17408
+HF_EXPERT_KEYS     []
+REGISTRY  Qwen3_5ForConditionalGeneration        hits=1
+REGISTRY  MuseGlimmer                            hits=0
+-- surface 1..4, candidate (expect >0) against negative control (expect 0) --
+vllm_pin_qwen35_files      = 20
+vllm_pin_glimmer_files     = 0  <- negative control
+vllm_omni_qwen35_files     = 2
+vllm_omni_glimmer_files    = 0  <- negative control
+llama_cpp_qwen35_files     = 10
+llama_cpp_glimmer_files    = 0  <- negative control
+gguf_py_qwen35_files       = 2
+gguf_py_glimmer_files      = 0  <- negative control
+llama_cpp_head             = 237ad9b961f009ae19ac29dbce4cd0c1251f94b3
+-- the PLUGIN's adapter registry, from the staged source archive --
+plugin_tgz_sha256 = 9e15c20e0b75f75bbf886966df07843c4b70a7952fad4b80e8e8183e2f70743b
+_ADAPTER_REGISTRY: list[type[BaseGGUFWeightsAdapter]] = [
+    Gemma3GGUFAdapter,
+    Gemma4GGUFAdapter,
+    OLMoEGGUFAdapter,
+    Qwen35GGUFAdapter,
+    Qwen35MtpGGUFAdapter,
+]
+-- and the Qwen35 adapter's own architecture predicate --
+plugin_file tests/diffusion/test_qwen_image_adapter.py
+plugin_file vllm_gguf_plugin/weights_adapter/diffusion/qwen_image.py
+plugin_file vllm_gguf_plugin/weights_adapter/qwen3_5.py
+
+===== 5. CONDITION 5, and the AUTHORITATIVE sha256 of the STAGED bytes =====
+STAGED_PATH        /mnt/nas_share/rc/ckpt/qwen36-27b-q4km/Qwen3.6-27B-Q4_K_M.gguf
+STAGED_BYTES       16817244384
+STAGED_SHA256      5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0
+STAGED_SHA256_MATCHES_FORGE_LFS_OID  yes
+
+=== VEHICLE_PIN_CHECK DONE ===
+2026-09-04T08:16:45Z

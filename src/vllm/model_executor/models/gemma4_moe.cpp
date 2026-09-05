@@ -440,13 +440,18 @@ struct DevExpertLru {
 
   // Free VRAM via Backend::DeviceMemoryInfo. No HIP in this TU.
   //
-  // ROCm ONLY: `CudaBackend` does not override that seam, so this returns false on
-  // every CUDA device and `MakeRoom` below then refuses the device upload, which
-  // makes this whole cache dead on CUDA today. That is issue #1126, not an
-  // accident of this call site — the refuse-on-unknown polarity here is correct,
-  // because an Alloc without headroom has hung hipMalloc. This comment said
-  // "(ROCm/CUDA)" until #1123 measured it (the same false claim as the one on
-  // `vt::Backend::DeviceMemoryInfo` itself).
+  // ROCm AND CUDA answer this today. `CudaBackend::DeviceMemoryInfo` exists
+  // (`src/vt/cuda/cuda_backend.cu:93`, added by PERF-QWEN35-STAGE-WEIGHTS), so
+  // `MakeRoom` below now ADMITS on a CUDA device where it used to refuse, and
+  // this cache is live there rather than dead. The text here said the opposite
+  // until #2623 re-read it; that claim was true when it was written and the
+  // CUDA override falsified it without touching this file. Two device-expert
+  // upload paths depended on the dead premise for their safety, which is why
+  // both now carry an explicit op-availability guard instead.
+  //
+  // The refuse-on-unknown polarity is unchanged and still correct: an Alloc
+  // without headroom has hung hipMalloc, so a backend that cannot answer must
+  // not be admitted.
   static bool FreeBytes(Dev d, size_t* free_out) {
     *free_out = 0;
     size_t free_b = 0, tot_b = 0;
@@ -610,6 +615,54 @@ bool EnsureGemma4Fp8ExpertOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t
 
 // Upload FP8 weights + channel scales (no BF16 dequant). Half weight VRAM vs BF16 path.
 bool EnsureGemma4Fp8NativeOnDevice(Dev d, const Gemma4Fp8ExpertMats& ex, int64_t I, int64_t H) {
+  // Refuse BEFORE the upload on a device that cannot run the arm this `true`
+  // promises, exactly as `EnsureGemma4Fp8ExpertOnDevice` does above (#2623).
+  // This is the DEFAULT arm -- `VT_GEMMA4_FP8_NATIVE` unset returns true at
+  // :1071-1077 -- so it is reached before the guarded BF16 sibling is.
+  //
+  // THREE TERMS, NOT THE SIBLING'S ONE, because this promise commits the caller
+  // to three different ops and the sibling's predicate names only one of them.
+  // Every consumer of the four slots this function fills ends in an op whose
+  // sole arm is ROCm's: `ExpertGeGLUFp8TopKFusedGelu` (:134) calls
+  // `vt::MatmulBTFp8Channel` (:165, :176), and `ExpertGeGLUFp8Native` (:96)
+  // calls `vt::DequantFp8ChannelBf16` (:118, :120) and `vt::MatmulBTAlphaBeta`
+  // (:129). None of those calls sits inside the try/catch below, which wraps
+  // only the upload, so without this line the throw leaves the DECODE STEP
+  // instead of degrading to the host fallback the `else` arms already hold.
+  //
+  // TWO DIFFERENT OPS ACTUALLY FIRE, which is why one predicate will not do, and
+  // this is measured rather than argued. Three call sites admit through this
+  // function -- the `use_dev_expert_lru` prefetch (:1419), the `!fp8_res_peer`
+  // branch (:1495) and the per-expert branch (:1620) -- and they do not all land
+  // in the same place. Deleting this guard makes
+  // `test_gemma4_moe_fp8_native_arm_guard` throw
+  // `vt::MatmulBTFp8Channel: ROCm-only in this build`, through
+  // `ExpertGeGLUFp8TopKFusedGelu` after `vt::ExpertGeGLUFp8TopKM1` declines by
+  // returning false. Deleting it AND disabling :1419 and :1495 makes the same
+  // test throw `vt::DequantFp8ChannelBf16` instead, through
+  // `ExpertGeGLUFp8Native` at :1620. Neither of those two ops is the one
+  // `HasMatmulBTAlphaBeta` names, so the sibling's single predicate would have
+  // guarded against the op this path reaches LAST and missed both of the ops it
+  // actually reaches.
+  //
+  // WHAT THE GATE DOES NOT PROVE, stated because a green mutation is not a
+  // silent one. All three predicates are the SAME EXPRESSION today
+  // (`VLLM_CPP_HIP` and `kROCM`), so any one term alone already refuses on every
+  // device this suite can run: deleting the first term is GREEN, and keeping
+  // only the first term is GREEN. The three terms are therefore justified by the
+  // ops this function commits to and NOT by a mutation that separates them, and
+  // nothing here will notice if a future device gains one kernel of the three.
+  // Recorded under `## Owed` in .agents/specs/gemma4-fp8-native-arm-guard.md.
+  //
+  // Each term asks whether the arm EXISTS rather than testing a device name or
+  // a build macro, and each op dispatches on its own predicate
+  // (`src/vt/fused_ops.cpp`), so a predicate cannot drift from the function it
+  // describes and writing all three kernels for a new device wakes this arm with
+  // no edit here. Writing only one of them correctly does NOT wake it.
+  if (!vt::HasMatmulBTFp8Channel(d.q) || !vt::HasDequantFp8ChannelBf16(d.q) ||
+      !vt::HasMatmulBTAlphaBeta(d.q))
+    return false;
+  // When device LRU disabled, do NOT host-cache-dequant here.
   if (!ExpertLru().Enabled()) return false;
   if (ex.dev_fp8_gu && ex.dev_fp8_dn && ex.dev_s_gu && ex.dev_s_dn) {
     ExpertLru().Touch(&ex);

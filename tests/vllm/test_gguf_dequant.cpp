@@ -628,3 +628,69 @@ TEST_CASE("GgufFile reads IQ2_XS and IQ4_XS tensors and they dequant") {
                                 vllm_test::kIq4xsGoldenBits,
                                 std::size(vllm_test::kIq4xsGoldenBits));
 }
+
+// --- IQ3_S (21): the one hole in the reader's i-quant run, and the one that
+// locks out the `unsloth` "UD" dynamic-quant family (#2510).
+//
+// `Qwen3.8-27B-UD-Q4_K_M.gguf` is 866 tensors of which exactly FOUR are IQ3_S,
+// and every other id in that file -- F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_NL,
+// IQ4_XS -- this reader already handled. Four tensors cost the whole artifact,
+// because `GgufFile::Open` cannot size a tensor whose type it does not know and
+// refuses the file before any dequant code runs.
+//
+//   block_iq3_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4]; }
+//                                                                 (110 bytes)
+//     Codebook decode over 8 sub-blocks of 32, 4 lanes of 8 each. NOT an IQ3_XXS
+//     variant: the table is the 512-entry `iq3s_grid` (against IQ3_XXS's
+//     256-entry `iq3xxs_grid`), and the 9th index bit is spliced out of `qh`
+//     with an ASYMMETRIC shift pair -- `qh << (8-2*l)` for the even lane of a
+//     pair and `qh << (7-2*l)` for the odd one, both masked with 256. The sign
+//     is a DIRECT byte in `signs[]`, like IQ2_S and unlike IQ3_XXS's 7-bit
+//     `ksigns_iq2xs` selector packed into the per-32 `aux32`. The sub-block
+//     scale is a nibble of `scales[ib32/2]` and the multiplier is
+//     `db = d * (1 + 2*ls)` -- an ODD-integer scale with neither the `0.5 +`
+//     offset nor the `* 0.25` factor every IQ2 member in this tree carries.
+//     Nothing in the IQ3_XXS decode transfers, and a decoder written from it
+//     still runs and still produces plausible magnitudes.
+//
+// Gated against ORACLE-produced goldens over REAL checkpoint bytes, not against
+// "does not throw" and not against a hand-transcribed expectation. The input is
+// the very tensor the loader refused; the expected values come from the pinned
+// upstream's own `dequantize_row_iq3_s`. Provenance in
+// tests/vt/iq3s_golden_vectors.h.
+#include "../vt/iq3s_golden_vectors.h"
+
+TEST_CASE("DequantGgufRowToF32 IQ3_S row matches the pinned oracle") {
+  CheckGgufDequantAgainstOracle(21, vllm_test::kIq3sGoldenBlocks,
+                                vllm_test::kIq3sGoldenBits,
+                                std::size(vllm_test::kIq3sGoldenBits));
+}
+
+// The decisive one: the SAME bytes reached through the production GGUF READER
+// rather than handed to the dequantizer directly. Before this row the file could
+// not be OPENED at all -- `FindGgmlTraits` had no case 21, so `GgufFile::Open`
+// threw `tensor "blk.11.ffn_gate.weight" has unknown ggml type id 21`, which is
+// exactly where the real 16.4 GB artifact stopped, and it stopped there BEFORE
+// any dequant code ran. Registering the block stride and porting the decoder are
+// therefore two separate obligations, and a test that only calls
+// `DequantGgufRowToF32` proves the second one only.
+TEST_CASE("GgufFile reads an IQ3_S tensor and it dequants") {
+  gguf_test::GgufModelBuilder b;
+  // ne0 is the fastest-varying dim: 1024 elements = 4 whole blocks of 256,
+  // which is exactly the golden slice.
+  b.AddTensor("blk.11.ffn_gate.weight", {1024},
+              21, std::string(reinterpret_cast<const char*>(
+                                  vllm_test::kIq3sGoldenBlocks),
+                              sizeof(vllm_test::kIq3sGoldenBlocks)));
+  const gguf_test::TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  const vllm::GgufTensorInfo& t = g.Get("blk.11.ffn_gate.weight");
+  CHECK(t.ggml_type == 21U);
+  // 1024 elements at 110 bytes per 256-element block. The 110 is the ORACLE's
+  // own `sizeof(block_iq3_s)`, printed by the harness in the goldens header.
+  CHECK(t.nbytes == 4U * 110U);
+  CheckGgufDequantAgainstOracle(t.ggml_type, t.data,
+                                vllm_test::kIq3sGoldenBits,
+                                std::size(vllm_test::kIq3sGoldenBits));
+}

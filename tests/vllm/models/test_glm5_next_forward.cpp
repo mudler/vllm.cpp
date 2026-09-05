@@ -61,6 +61,8 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>  // W9c-3b: the shadow backend's memcpy/memset
 #include <limits>
 #include <memory>
 #include <string>
@@ -70,6 +72,7 @@
 #include "support/glm5_next_gguf_fixture.h"
 #include "vllm/model_executor/models/glm5_next_bridge.h"
 #include "vllm/model_executor/models/glm5_next_forward.h"
+#include "vllm/model_executor/models/glm5_next_kv.h"  // W9c-3b (#2480)
 #include "vllm/model_executor/models/glm5_next_layer.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
 #include "vllm/model_executor/models/glm5_next_moe.h"
@@ -77,6 +80,8 @@
 #include "vllm/model_executor/models/qwen3_5.h"      // ForwardLogits, *KvCache
 #include "vllm/v1/attention/backend.h"               // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"     // GDNAttentionMetadata
+#include "vt/backend.h"  // W9c-3a: vt::TryGetBackend
+#include "vt/op_provider.h"  // W9c-3a: vt::OpRegistered
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -114,12 +119,32 @@ struct Topology {
   static int64_t ConvElems() { return 3 * kKdaHeads * kKdaHeadDim * kConvKernel; }
   static int64_t RecElems() { return kKdaHeads * kKdaHeadDim * kKdaHeadDim; }
 
+  // ─── W5b-2d (#2445): THE FLAT CHANNEL, and it is NOT `attn_kv`'s order ────
+  //
+  // This fixture used to publish TWO names, both paged, with no payload
+  // locators — which made `MultiKvCacheIndex::Find` answer an `attn_kv` index
+  // and every case below pass against a channel shape the runner STOPPED
+  // producing at `9e7621efc`. The runner emits one entry per published cache in
+  // PUBLICATION order over ALL groups (`runner.cpp`, the by-name index pass),
+  // so the recurrent group lands BETWEEN the two attention groups and the flat
+  // index of the indexer side cache is not 1.
+  //
+  // At this miniature: flat 0 is the MLA latent (paged slot 0), flat 1..3 are
+  // the three KDA layers' recurrent states (gdn_state slots 0..2), and flat 4
+  // is the indexer side cache (paged slot 1). `Find(indexer) == 4` against
+  // `attn_kv.size() == 2` is the published checkpoint's `45` against `22`,
+  // scaled down.
+  static constexpr size_t kLatentFlat = 0;
+  static constexpr size_t kIndexerFlat = 1 + static_cast<size_t>(kLayers - 1);
+
   vt::DType dtype = vt::DType::kF32;
   std::vector<std::vector<uint8_t>> attn_bytes;
   std::vector<vllm::PagedKvCache> attn_kv;
   std::vector<std::string> names;
   std::vector<int32_t> group_ids;
   std::vector<int32_t> layer_indices;
+  std::vector<uint8_t> payload_kinds;
+  std::vector<int32_t> payload_slots;
   std::vector<std::vector<int32_t>> group_bt;
   std::vector<int32_t> group_cols;
   std::vector<std::vector<uint8_t>> conv_bytes;
@@ -133,15 +158,35 @@ struct Topology {
     // vector per token each (`MLAAttentionSpec`), so the page is
     // block_size * 1 * head_size and NOT twice that.
     const int64_t rows[2] = {LatentRow(), IndexerRow()};
-    const int32_t gid[2] = {0, 2};
     const char* suffix[2] = {".self_attn.attn", ".self_attn.indexer.k_cache"};
     for (int i = 0; i < 2; ++i) {
       attn_bytes.emplace_back(
           static_cast<size_t>(kNumBlocks * kBlockSize * rows[i] * elt), 0);
-      names.push_back("model.layers." + std::to_string(kDsaLayer) + suffix[i]);
-      group_ids.push_back(gid[i]);
-      layer_indices.push_back(static_cast<int32_t>(kDsaLayer));
     }
+    // THE FLAT CHANNEL, in PUBLICATION order: group 0, then group 1, then group
+    // 2 — one pass over the groups, exactly as `runner.cpp` builds it. The
+    // paged slot is a RUNNING COUNTER over the paged entries only, which is the
+    // whole distinction this fixture exists to carry.
+    const auto emit = [&](const std::string& name, int32_t gid, int32_t layer,
+                          vllm::KvCachePayload kind, int32_t slot) {
+      names.push_back(name);
+      group_ids.push_back(gid);
+      layer_indices.push_back(layer);
+      payload_kinds.push_back(static_cast<uint8_t>(kind));
+      payload_slots.push_back(slot);
+    };
+    emit("model.layers." + std::to_string(kDsaLayer) + suffix[0], 0,
+         static_cast<int32_t>(kDsaLayer), vllm::KvCachePayload::kPaged, 0);
+    {
+      int32_t rslot = 0;
+      for (int64_t l = 0; l < kLayers; ++l) {
+        if (l == kDsaLayer) continue;
+        emit("model.layers." + std::to_string(l) + ".linear_attn", 1,
+             static_cast<int32_t>(l), vllm::KvCachePayload::kRecurrent, rslot++);
+      }
+    }
+    emit("model.layers." + std::to_string(kDsaLayer) + suffix[1], 2,
+         static_cast<int32_t>(kDsaLayer), vllm::KvCachePayload::kPaged, 1);
     for (int i = 0; i < 2; ++i) {
       vllm::PagedKvCache kv;
       kv.data = attn_bytes[static_cast<size_t>(i)].data();
@@ -152,10 +197,21 @@ struct Topology {
       kv.head_size = rows[i];
       attn_kv.push_back(kv);
     }
-    // Three published groups, so three gathered tables; group 1 is the
-    // recurrent one and nothing on this path reads its table.
+    // Three published groups, so three gathered tables — `gather_group_block_tables`
+    // walks EVERY published group, the recurrent one included, so an empty entry
+    // here would be a shape the runner does not produce.
+    //
+    // W5b-2d (#2445): group 1's table is the RECURRENT group's and it is
+    // deliberately NOT a copy of the attention groups'. On the real model that
+    // table is one unified page per sequence, not `kNumBlocks` of them, and the
+    // difference is what makes reading `group_ids` at the wrong index fatal
+    // instead of invisible: a binding that took the indexer's group id from the
+    // PAGED slot rather than the FLAT index lands on group 1 and finds a table
+    // one column wide.
     group_bt.assign(3, std::vector<int32_t>(kBlockPerm, kBlockPerm + kNumBlocks));
     group_cols.assign(3, static_cast<int32_t>(kNumBlocks));
+    group_bt[1] = std::vector<int32_t>{0};
+    group_cols[1] = 1;
 
     // The recurrent group: one state set per KDA layer, in ASCENDING LAYER
     // ORDER, exactly as `alloc_recurrent_layer_states` pushes them. ONE slot,
@@ -192,6 +248,8 @@ struct Topology {
     mk.layer_names = &names;
     mk.group_ids = &group_ids;
     mk.layer_indices = &layer_indices;
+    mk.payload_kinds = &payload_kinds;
+    mk.payload_slots = &payload_slots;
     mk.group_block_tables = &group_bt;
     mk.group_block_table_cols = &group_cols;
   }
@@ -668,20 +726,118 @@ TEST_CASE("glm5_next forward: a TIED head reads the embedding table") {
 
 // ═══ (4) the narrow refusals ═══════════════════════════════════════════════
 
-TEST_CASE("glm5_next forward: a NON-CPU queue is refused BY NAME") {
-  // Every buffer on this path is a host `std::vector<float>` and
-  // `vt::MoeRouterTopK` dispatches on the queue's device, so a device queue
-  // here hands a kernel host pointers. That is a crash and not a fallback, and
-  // a refusal is what stands between the two.
+TEST_CASE("glm5_next forward W9c-3a: the queue is SPLIT, and a device that is "
+          "neither CPU nor CUDA is refused BY NAME") {
+  // W9c-3a replaced the blanket non-CPU refusal. The premise it stood on is
+  // unchanged and is now asserted one level down (`MoeExpertsKeepQuant`'s host
+  // arm refuses a non-CPU queue): nearly every buffer on this path is a host
+  // `std::vector<float>`, and the ops dispatch on the queue's device. What
+  // changed is that ONE arm can put its operands on a device, so the forward
+  // interposes a CPU queue for the rest instead of refusing the step.
+  //
+  // Two things must still be refused, and this case is both of them.
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
-  Step step({1, 2});
-  step.queue = vt::Queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
-  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                       doctest::Contains("non-CPU queue"), std::runtime_error);
-  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                       doctest::Contains("#2241"), std::runtime_error);
+
+  SUBCASE("a device with no provider for the two grouped ops") {
+    // kMETAL registers neither `kMoeGateUpSwiGLUGrouped` nor
+    // `kMatmulBTQuantGrouped`. Refusing here names this model, both ops and
+    // which of them is missing; letting it through would throw from inside an
+    // op about a device type, several frames from anything a reader could act
+    // on.
+    //
+    // The refusal asks the OP TABLE and names no device, which is what
+    // `scripts/check-device-leakage.py` requires of the device-agnostic layer
+    // and is why this case asserts on the provider words rather than on
+    // "--device cuda".
+    Step step({1, 2});
+    step.queue = vt::Queue{vt::Device{vt::DeviceType::kMETAL, 0}, nullptr};
+    REQUIRE_FALSE(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped,
+                                   vt::DeviceType::kMETAL));
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("routed-expert keep-quant GEMM"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("provider: NO"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("#2464"), std::runtime_error);
+  }
+
+  SUBCASE("the device arm is OPT-IN, so the DEFAULT refuses a device queue") {
+    // W9c-3a's device split defaults OFF after both `--device cuda` legs on the
+    // real artifact died with SIGSEGV (spec O46). The default must therefore be
+    // a REFUSAL, byte-for-byte the behaviour of the tree before this wave --
+    // turning a clean error into a segfault is strictly worse for a user.
+    //
+    // This case only has something to assert where the op table admits the
+    // device, because the op-table refusal above is ordered first and wins.
+    // On a CPU-only build nothing registers the pair, so the guard under test
+    // is unreachable and the case says so rather than asserting a message it
+    // would get for the wrong reason.
+    const vt::DeviceType dev = vt::DeviceType::kCUDA;
+    const bool pair_here = vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, dev) &&
+                           vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, dev) &&
+                           vt::TryGetBackend(vt::Device{dev, 0}) != nullptr;
+    if (!pair_here) {
+      MESSAGE("no CUDA provider for the grouped pair: the OPT-IN guard is "
+              "unreachable on this build and is gated on dgx:gpu0 instead");
+    } else if (std::getenv("VT_GLM5_NEXT_DEVICE_EXPERTS") != nullptr) {
+      MESSAGE("VT_GLM5_NEXT_DEVICE_EXPERTS is set in this environment: the "
+              "default-off guard cannot be observed here");
+    } else {
+      Step step({1, 2});
+      step.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("OPT-IN"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("SIGSEGV"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("--device cpu"), std::runtime_error);
+    }
+  }
+
+  SUBCASE("the probe follows the OP TABLE and not a device name") {
+    // The discriminating half of the previous case. A refusal that hardcoded a
+    // device name would answer identically for kMETAL and differently for a
+    // device that DOES register the pair -- so the assertion is that the
+    // predicate and the op table agree, whatever this build registered.
+    //
+    // On a CPU-only build no non-CPU device registers the pair and every such
+    // queue is refused. On a CUDA build kCUDA registers both and the step
+    // proceeds, which is what the `dgx:gpu0` end-to-end leg measures and what
+    // this host lane cannot.
+    const vt::DeviceType dev = vt::DeviceType::kCUDA;
+    const bool pair_here = vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, dev) &&
+                           vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, dev) &&
+                           vt::TryGetBackend(vt::Device{dev, 0}) != nullptr;
+    Step step({1, 2});
+    step.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+    if (!pair_here) {
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("routed-expert keep-quant GEMM"),
+                           std::runtime_error);
+    } else {
+      // The op-table refusal is correctly NOT taken here. The step is still
+      // refused, by the OPT-IN guard the subcase above covers, so this branch
+      // asserts only that whatever fires is NOT the op-table one -- caught by
+      // hand, because doctest::Contains has no negation.
+      Step s2({1, 2});
+      s2.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+      std::string what;
+      try {
+        vllm::ModelRegistry::Forward(*model, s2.Get());
+      } catch (const std::exception& e) {
+        what = e.what();
+      }
+      CHECK(what.find("cannot run the one primitive") == std::string::npos);
+    }
+  }
+
+  SUBCASE("a CPU queue is NOT refused, so the split is not a blanket") {
+    Step step({1, 2});
+    CHECK_NOTHROW(vllm::ModelRegistry::Forward(*model, step.Get()));
+  }
 }
 
 TEST_CASE("glm5_next forward: a MULTI-REQUEST step is refused BY NAME") {
@@ -934,9 +1090,16 @@ TEST_CASE("glm5_next W5b-2c: the PUBLICATION ORDER does not matter, the NAME doe
   const vllm::ForwardLogits a = vllm::ModelRegistry::Forward(*model, plain.Get());
 
   Topology flipped;
-  std::swap(flipped.names[0], flipped.names[1]);
-  std::swap(flipped.group_ids[0], flipped.group_ids[1]);
-  std::swap(flipped.layer_indices[0], flipped.layer_indices[1]);
+  // The runner publishing group 2 BEFORE group 0: the two attention entries
+  // trade flat positions, the recurrent group stays where it is, and the paged
+  // SLOTS stay 0 and 1 because the runner's counter is positional — so
+  // `attn_kv` is allocated in the new group order too and moves with them.
+  std::swap(flipped.names[Topology::kLatentFlat],
+            flipped.names[Topology::kIndexerFlat]);
+  std::swap(flipped.group_ids[Topology::kLatentFlat],
+            flipped.group_ids[Topology::kIndexerFlat]);
+  std::swap(flipped.layer_indices[Topology::kLatentFlat],
+            flipped.layer_indices[Topology::kIndexerFlat]);
   std::swap(flipped.attn_kv[0], flipped.attn_kv[1]);
   std::swap(flipped.attn_bytes[0], flipped.attn_bytes[1]);
   flipped.Publish();
@@ -983,7 +1146,8 @@ TEST_CASE("glm5_next W5b-2c: the two DSA caches cannot be SWAPPED") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
   Topology topo;
-  std::swap(topo.names[0], topo.names[1]);
+  std::swap(topo.names[Topology::kLatentFlat],
+            topo.names[Topology::kIndexerFlat]);
   topo.Publish();
   Step s({1, 2, 3});
   s.Bind(topo);
@@ -996,7 +1160,8 @@ TEST_CASE("glm5_next W5b-2c: a MISSING published name is refused BY NAME") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
   Topology topo;
-  topo.names[1] = "model.layers.2.self_attn.indexer.WRONG";
+  topo.names[Topology::kIndexerFlat] =
+      "model.layers.2.self_attn.indexer.WRONG";
   topo.Publish();
   Step s({1, 2, 3});
   s.Bind(topo);
@@ -1013,7 +1178,8 @@ TEST_CASE("glm5_next W5b-2c: ONE group cannot hold both DSA caches") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
   Topology topo;
-  topo.group_ids[1] = topo.group_ids[0];
+  topo.group_ids[Topology::kIndexerFlat] =
+      topo.group_ids[Topology::kLatentFlat];
   topo.Publish();
   Step s({1, 2, 3});
   s.Bind(topo);
@@ -1021,10 +1187,13 @@ TEST_CASE("glm5_next W5b-2c: ONE group cannot hold both DSA caches") {
                        doctest::Contains("SAME group id"), std::runtime_error);
 }
 
-TEST_CASE("glm5_next W5b-2c: the RECURRENT set count is the only check there is") {
-  // `MultiKvCacheIndex` keys the ATTENTION caches only. The KDA states arrive
-  // on `gdn_state` positionally with no name, so the count is the whole check
-  // and it has to be a real one.
+TEST_CASE("glm5_next W5b-2d: a SHORT gdn_state is refused, by name and by count") {
+  // This case was titled "the RECURRENT set count is the only check there is",
+  // and W5b-2d made that sentence false: the channel carries every published
+  // recurrent cache with a payload locator, so each KDA layer now resolves its
+  // own state BY NAME. The count survives beside the lookup because it catches
+  // the other direction — sets no declared layer claimed — and a short
+  // `gdn_state` must still refuse rather than read slot 2 of a two-entry vector.
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
@@ -1034,6 +1203,145 @@ TEST_CASE("glm5_next W5b-2c: the RECURRENT set count is the only check there is"
   s.Bind(topo);
   CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
                        doctest::Contains("recurrent state set"),
+                       std::runtime_error);
+}
+
+// ═══ (6b) W5b-2d — the FLAT index against the PAYLOAD SLOT (#2445) ══════════
+
+TEST_CASE("glm5_next W5b-2d: the FLAT index is NOT the paged slot") {
+  // THE DEFECT THIS WAVE REPAIRED, pinned as an assertion rather than as a
+  // shape. `MultiKvCacheIndex::Find` answers a cache's place among EVERY
+  // published cache; `PayloadAt` answers its slot in the container it lives in.
+  // Before `9e7621efc` those were the same number and `glm5_next_kv.cpp` used
+  // `Find`'s directly; after it they are not, and on the real artifact the
+  // indexer side cache of the first DSA layer is flat 45 against an `attn_kv`
+  // of 22. A future edit that reverts to `Find` fails HERE, on a stated
+  // inequality, instead of on an out-of-range access that another topology
+  // would not even produce.
+  Topology topo;
+  const vllm::MultiKvCacheIndex& mk = topo.mk;
+  const std::string latent = "model.layers.2.self_attn.attn";
+  const std::string indexer = "model.layers.2.self_attn.indexer.k_cache";
+
+  // The channel covers every published cache, not only the paged ones.
+  CHECK(mk.size() == static_cast<size_t>(kLayers + 1));
+  CHECK(mk.num_paged() == 2);
+  CHECK(mk.num_recurrent() == static_cast<int>(kLayers - 1));
+  // THREE, and the header of `MultiKvCacheIndex` still says TWO. `num_groups()`
+  // is documented as "how many DISTINCT published groups THEY came from" about
+  // the caches in `attn_kv`, and it is implemented as a distinct-count over the
+  // whole `group_ids` vector — which `9e7621efc` widened to cover the recurrent
+  // group as well. So the accessor answers 3 here and `glm5_next_kv.h` used to
+  // repeat the stale 2. The value is asserted rather than the prose, and #2459
+  // owns the shared header. `num_published_groups()` is unaffected: it counts
+  // the block-table vector, which was always per published group.
+  CHECK(mk.num_groups() == 3);
+  CHECK(mk.num_published_groups() == 3);
+  CHECK(topo.attn_kv.size() == 2);
+
+  CHECK(mk.Find(latent) == static_cast<int64_t>(Topology::kLatentFlat));
+  CHECK(mk.Find(indexer) == static_cast<int64_t>(Topology::kIndexerFlat));
+  // 4 against 2 here IS 45 against 22 on the published checkpoint.
+  CHECK(mk.Find(indexer) >= static_cast<int64_t>(topo.attn_kv.size()));
+
+  vllm::KvCachePayload kind = vllm::KvCachePayload::kRecurrent;
+  int32_t slot = -1;
+  REQUIRE(mk.Resolve(indexer, &kind, &slot));
+  CHECK(kind == vllm::KvCachePayload::kPaged);
+  CHECK(slot == 1);
+  // The inequality is the whole point, stated so it cannot silently collapse.
+  CHECK(static_cast<int64_t>(slot) != mk.Find(indexer));
+
+  REQUIRE(mk.Resolve(latent, &kind, &slot));
+  CHECK(kind == vllm::KvCachePayload::kPaged);
+  CHECK(slot == 0);
+
+  // The recurrent half, addressable by name since `9e7621efc` and consumed by
+  // this wave. Layer 3 is this miniature's LAST KDA layer and its state is
+  // gdn_state slot 2 — not 3, which is what its layer index would have said.
+  REQUIRE(mk.Resolve("model.layers.3.linear_attn", &kind, &slot));
+  CHECK(kind == vllm::KvCachePayload::kRecurrent);
+  CHECK(slot == static_cast<int32_t>(kLayers - 2));
+  CHECK(mk.Find("model.layers.3.linear_attn") == static_cast<int64_t>(kLayers - 1));
+  CHECK(static_cast<int64_t>(slot) != mk.Find("model.layers.3.linear_attn"));
+
+  // And the group id is read at the FLAT index, which is the other half of the
+  // repair: `group_ids` is parallel to the flat list and not to `attn_kv`.
+  REQUIRE(mk.group_ids != nullptr);
+  CHECK((*mk.group_ids)[Topology::kLatentFlat] == 0);
+  CHECK((*mk.group_ids)[Topology::kIndexerFlat] == 2);
+  CHECK((*mk.group_ids)[1] == 1);
+}
+
+TEST_CASE("glm5_next W5b-2d: the recurrent slot is READ, not counted") {
+  // WITHOUT THIS CASE THE BY-NAME RECURRENT RESOLUTION IS NOT GATED. The runner
+  // assigns gdn_state slots in ascending layer order, which is exactly what a
+  // KDA-ordinal counter would produce, so on every topology this tree builds the
+  // two agree and a test that only ran the forward could not tell them apart.
+  // Permuting the published slots makes them disagree — and the binding must
+  // then REFUSE, because it read the channel. A counter would sail through.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  // Flat 1 is layer 0's state (slot 0) and flat 3 is layer 3's (slot 2).
+  REQUIRE(topo.payload_slots[1] == 0);
+  REQUIRE(topo.payload_slots[3] == static_cast<int32_t>(kLayers - 2));
+  std::swap(topo.payload_slots[1], topo.payload_slots[3]);
+  topo.Publish();
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("gdn_state slot"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next W5b-2d: an attention name published as RECURRENT is refused") {
+  // `attn_kv` and `gdn_state` are two containers, so a slot read against the
+  // wrong one is an unrelated buffer with NO shape error — the same
+  // wrong-answer-not-a-crash shape the MLA-latent refusal exists for.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  topo.payload_kinds[Topology::kIndexerFlat] =
+      static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent);
+  topo.payload_slots[Topology::kIndexerFlat] = 0;  // in range for gdn_state
+  topo.Publish();
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("RECURRENT cache"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next W5b-2d: a recurrent name published as PAGED is refused") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  topo.payload_kinds[1] = static_cast<uint8_t>(vllm::KvCachePayload::kPaged);
+  topo.payload_slots[1] = 0;  // in range for attn_kv
+  topo.Publish();
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("PAGED cache"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next W5b-2d: a channel with NO payload locator is refused") {
+  // The pre-`9e7621efc` channel shape, which is what this fixture published
+  // until this wave. It is not silently tolerated: without the locator there is
+  // no way to turn a name into a slot, and the flat index is not one.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  topo.Publish();
+  topo.mk.payload_kinds = nullptr;
+  topo.mk.payload_slots = nullptr;
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("no payload locator"),
                        std::runtime_error);
 }
 
@@ -1123,4 +1431,526 @@ TEST_CASE("glm5_next W5b-2c: ModelRegistry::Forward NARROWS its refusal, not dro
   const vllm::ModelRegistration& kimi = vllm::ModelRegistry::Resolve(kimi_archs);
   REQUIRE(kimi.factory != nullptr);
   CHECK_FALSE(kimi.factory->consumes_multi_kv);
+}
+
+// ─── W9c-3b (#2480): THE ENGINE'S PAGES ARE NOT ALWAYS HOST MEMORY ───────────
+//
+// WHAT WENT WRONG AND WHY NOTHING SAW IT. Every case above hands this model a
+// CPU queue, and on a CPU queue `GPUModelRunner::CacheBuffer` keeps its pages in
+// a `std::vector<uint8_t>` (`v1/worker/gpu/runner.cpp:575-593`). On any other
+// queue `kv_cache_backend_resident_` is true (`:1119-1122`) and every paged
+// cache and every recurrent state is a `vt::Alloc` allocation -- `cudaMalloc` on
+// CUDA, which is NOT host-dereferenceable even on GB10
+// (`src/vt/cuda/cuda_backend.cu:354-391`, held by a `static_assert` that names
+// #844 and #1435 as the same fault twice already).
+//
+// `glm5_next_kv.cpp` read and wrote those pages with plain host loops, so a
+// `--device cuda` step was a host store into device memory. `LoadCaches` returns
+// before touching a page on a fresh sequence, so the first such access on step 1
+// is inside `StoreCaches`, AFTER the whole forward has returned -- which is why
+// the three legs in spec O46 died with SIGSEGV having emitted no token, and why
+// the last two lines on their stderr were the MoE arm's two once-flags. O49
+// carries the bisect.
+//
+// WHAT THIS CASE MEASURES, AND WHY IT IS NOT A CRASH TEST. A test binary cannot
+// hold a `cudaMalloc` pointer, and a SIGSEGV is not an assertion. `ShadowBackend`
+// is the next-strongest thing and is deterministic on every platform: the
+// pointer `Alloc` hands back is a DECOY filled with a poison pattern, and the
+// real storage lives in a side block only `Copy` can reach. Code that
+// dereferences the pointer therefore reads poison and writes where nothing will
+// ever look, and code that goes through the backend is correct -- which is
+// exactly the distinction the defect is, with the fault turned into a value.
+namespace {
+
+class ShadowBackend final : public vt::Backend {
+ public:
+  void* Alloc(size_t bytes) override {
+    const size_t n = bytes == 0 ? 1 : bytes;
+    auto block = std::make_unique<Block>();
+    block->decoy.assign(n, kPoison);
+    block->shadow.assign(n, 0);
+    void* p = block->decoy.data();
+    blocks_.push_back(std::move(block));
+    ++allocs;
+    return p;
+  }
+  void Free(void*) override {}
+  void Memset(vt::Queue&, void* p, int v, size_t bytes) override {
+    uint8_t* dst = Translate(p, bytes);
+    std::memset(dst, v, bytes);
+  }
+  void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    ++copies;
+    uint8_t* d = Translate(dst, bytes);
+    const uint8_t* s = Translate(const_cast<void*>(src), bytes);
+    std::memcpy(d, s, bytes);
+  }
+  vt::Queue CreateQueue() override {
+    return vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  }
+  void DestroyQueue(vt::Queue&) override {}
+  // The GB10 CUDA backend's own two answers (`cuda_backend.cu:113` and the
+  // inherited default): one physical RAM, and still not host-dereferenceable.
+  bool UnifiedMemory() const override { return true; }
+  bool DeviceMemoryIsHostAddressable() const override { return false; }
+
+  // Is `p` a byte a HOST loop would have had to fault on? Used by the case to
+  // read the shadow without going through `Copy` twice.
+  const uint8_t* ShadowOf(const void* p, size_t bytes) const {
+    for (const std::unique_ptr<Block>& b : blocks_) {
+      const uint8_t* base = b->decoy.data();
+      const auto* q = static_cast<const uint8_t*>(p);
+      if (q >= base && q + bytes <= base + b->decoy.size())
+        return b->shadow.data() + (q - base);
+    }
+    return nullptr;
+  }
+
+  static constexpr uint8_t kPoison = 0xDD;
+  int allocs = 0;
+  int copies = 0;
+
+ private:
+  struct Block {
+    std::vector<uint8_t> decoy;
+    std::vector<uint8_t> shadow;
+  };
+  // A pointer into one of our decoys resolves to the SAME offset in its shadow;
+  // anything else is an ordinary host buffer and is used as it is.
+  uint8_t* Translate(void* p, size_t bytes) {
+    for (const std::unique_ptr<Block>& b : blocks_) {
+      uint8_t* base = b->decoy.data();
+      auto* q = static_cast<uint8_t*>(p);
+      if (q >= base && q + bytes <= base + b->decoy.size())
+        return b->shadow.data() + (q - base);
+    }
+    return static_cast<uint8_t*>(p);
+  }
+  std::vector<std::unique_ptr<Block>> blocks_;
+};
+
+ShadowBackend& Shadow() {
+  static ShadowBackend b;
+  return b;
+}
+
+struct ShadowRegistrar {
+  ShadowRegistrar() {
+    vt::RegisterBackend(vt::Device{vt::DeviceType::kXPU, 0}, &Shadow());
+  }
+};
+const ShadowRegistrar kShadowRegistrar;
+
+// A `Topology` whose every page and every recurrent state has been re-homed
+// onto the shadow backend, with the sizes and the block permutation unchanged.
+// The `vt::Tensor` device tags move with them, because a state that says kCPU
+// while its bytes are on a device is the lie this whole case is about.
+struct ShadowTopology {
+  Topology t;
+  ShadowTopology() {
+    for (size_t i = 0; i < t.attn_kv.size(); ++i) {
+      const size_t n = t.attn_bytes[i].size();
+      t.attn_kv[i].data = Shadow().Alloc(n);
+    }
+    for (size_t j = 0; j < t.gdn.size(); ++j) {
+      t.gdn[j].conv_state.data = Shadow().Alloc(t.conv_bytes[j].size());
+      t.gdn[j].conv_state.device = vt::Device{vt::DeviceType::kXPU, 0};
+      t.gdn[j].ssm_state.data = Shadow().Alloc(t.ssm_bytes[j].size());
+      t.gdn[j].ssm_state.device = vt::Device{vt::DeviceType::kXPU, 0};
+      t.gdn[j].states = {t.gdn[j].conv_state, t.gdn[j].ssm_state};
+    }
+    // NOT `Publish()`: that re-points `attn_kv[i].data` back at the host
+    // vectors, which would silently undo this whole fixture.
+    t.mk.layer_names = &t.names;
+    t.mk.group_ids = &t.group_ids;
+    t.mk.layer_indices = &t.layer_indices;
+    t.mk.payload_kinds = &t.payload_kinds;
+    t.mk.payload_slots = &t.payload_slots;
+    t.mk.group_block_tables = &t.group_bt;
+    t.mk.group_block_table_cols = &t.group_cols;
+  }
+};
+
+// Read `n` f32 values out of the SHADOW at element offset `first`. Deliberately
+// not `Copy`: a case that read the storage the same way the code under test does
+// would pass whenever the two agreed, including when both were the decoy.
+std::vector<float> ShadowFloats(const void* base, int64_t first, int64_t n) {
+  const auto* p = static_cast<const uint8_t*>(base) +
+                  static_cast<size_t>(first) * sizeof(float);
+  const uint8_t* s = Shadow().ShadowOf(p, static_cast<size_t>(n) * sizeof(float));
+  REQUIRE(s != nullptr);
+  std::vector<float> out(static_cast<size_t>(n));
+  std::memcpy(out.data(), s, out.size() * sizeof(float));
+  return out;
+}
+
+// A deterministic, non-constant pattern. Constant fill would pass against a
+// zeroed shadow for the zero value and against poison for nothing, so the values
+// are spread and none of them is 0.
+float Pattern(int64_t tag, int64_t i) {
+  return 1.0F + static_cast<float>(tag) * 0.125F + static_cast<float>(i) * 0.03125F;
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next W9c-3b: the KV binding COPIES the engine's pages instead "
+          "of dereferencing them") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  REQUIRE(model != nullptr);
+  const vllm::Glm5NextParams& p = Weights(model).params;
+  REQUIRE(p.num_hidden_layers == kLayers);
+
+  ShadowTopology pages;
+  const int64_t latent_row = Topology::LatentRow();
+  const int64_t indexer_row = Topology::IndexerRow();
+  const int64_t conv_elems = Topology::ConvElems();
+  const int64_t rec_elems = Topology::RecElems();
+  constexpr int64_t kNewTokens = 2;
+
+  Step s1({1, 2});
+  s1.queue = vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  s1.Bind(pages.t);
+  const vllm::ModelForwardInput in1 = s1.Get();
+  const gn::KvBinding b1 = gn::ResolveKvBinding(p, in1);
+  REQUIRE(b1.cached_len == 0);
+  REQUIRE(b1.new_tokens == kNewTokens);
+
+  // A fresh sequence reads NOTHING, so this call must not touch a page at all.
+  std::vector<gn::LayerCache> caches;
+  gn::LoadCaches(p, b1, in1, &caches);
+  REQUIRE(caches.size() == static_cast<size_t>(kLayers));
+
+  // Fill the states the forward would have produced. The VALUES are the point:
+  // they have to arrive in the shadow, at the offsets the block permutation
+  // puts them at, or the write went to the decoy.
+  for (int64_t l = 0; l < kLayers; ++l) {
+    gn::LayerCache& c = caches[static_cast<size_t>(l)];
+    if (l == Topology::kDsaLayer) {
+      c.dsa.cached_len = kNewTokens;
+      c.dsa.k_pass.resize(static_cast<size_t>(kNewTokens * latent_row));
+      for (size_t i = 0; i < c.dsa.k_pass.size(); ++i)
+        c.dsa.k_pass[i] = Pattern(l, static_cast<int64_t>(i));
+      c.dsa.indexer_packed.resize(static_cast<size_t>(kNewTokens * indexer_row));
+      for (size_t i = 0; i < c.dsa.indexer_packed.size(); ++i)
+        c.dsa.indexer_packed[i] = Pattern(l + 64, static_cast<int64_t>(i));
+      continue;
+    }
+    c.kda.assign(1, vllm::glm5_next_kda::Glm5NextKdaCache{});
+    c.kda[0].conv_state.resize(static_cast<size_t>(conv_elems));
+    for (size_t i = 0; i < c.kda[0].conv_state.size(); ++i)
+      c.kda[0].conv_state[i] = Pattern(l + 128, static_cast<int64_t>(i));
+    c.kda[0].recurrent_state.resize(static_cast<size_t>(rec_elems));
+    for (size_t i = 0; i < c.kda[0].recurrent_state.size(); ++i)
+      c.kda[0].recurrent_state[i] = Pattern(l + 192, static_cast<int64_t>(i));
+  }
+
+  const int copies_before = Shadow().copies;
+  gn::StoreCaches(p, b1, caches, in1);
+  // The write went through the backend at all. Necessary, never sufficient --
+  // the value checks below are what say it went to the right place.
+  CHECK(Shadow().copies > copies_before);
+
+  // (1) THE PAGED ROWS. Read out of the SHADOW, at the flat slot the gathered
+  // block table maps each logical position to, so an implementation that
+  // addressed page `p` at block `p` lands on the wrong row rather than passing.
+  const gn::LayerKvBinding& lb =
+      b1.layers[static_cast<size_t>(Topology::kDsaLayer)];
+  const void* lat = in1.attn_kv[static_cast<size_t>(lb.latent)].data;
+  const void* ix = in1.attn_kv[static_cast<size_t>(lb.indexer)].data;
+  for (int64_t t = 0; t < kNewTokens; ++t) {
+    const std::vector<float> got =
+        ShadowFloats(lat, Topology::Slot(t) * latent_row, latent_row);
+    for (int64_t i = 0; i < latent_row; ++i) {
+      CHECK(got[static_cast<size_t>(i)] ==
+            doctest::Approx(Pattern(Topology::kDsaLayer, t * latent_row + i)));
+    }
+    const std::vector<float> gix =
+        ShadowFloats(ix, Topology::Slot(t) * indexer_row, indexer_row);
+    for (int64_t i = 0; i < indexer_row; ++i) {
+      CHECK(gix[static_cast<size_t>(i)] ==
+            doctest::Approx(Pattern(Topology::kDsaLayer + 64, t * indexer_row + i)));
+    }
+  }
+
+  // (2) THE RECURRENT STATES, which are the FIRST thing `StoreCaches` writes on
+  // this model and therefore the byte the three `dgx:gpu0` legs died on.
+  for (int64_t l = 0; l < kLayers; ++l) {
+    if (l == Topology::kDsaLayer) continue;
+    const gn::LayerKvBinding& rb = b1.layers[static_cast<size_t>(l)];
+    const vllm::GdnStateCache& gs =
+        in1.gdn_state[static_cast<size_t>(rb.recurrent)];
+    const std::vector<float> conv = ShadowFloats(gs.conv_state.data, 0, conv_elems);
+    for (int64_t i = 0; i < conv_elems; ++i) {
+      CHECK(conv[static_cast<size_t>(i)] == doctest::Approx(Pattern(l + 128, i)));
+    }
+    const std::vector<float> rec = ShadowFloats(gs.ssm_state.data, 0, rec_elems);
+    for (int64_t i = 0; i < rec_elems; ++i) {
+      CHECK(rec[static_cast<size_t>(i)] == doctest::Approx(Pattern(l + 192, i)));
+    }
+  }
+
+  // (3) THE READ DIRECTION, on a second step that has history. The decoy still
+  // holds nothing but poison, so a `LoadCaches` that dereferenced the page would
+  // hydrate every state from 0xDDDDDDDD instead of from what step 1 stored.
+  Step s2({3}, {}, kNewTokens);
+  s2.queue = vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  s2.Bind(pages.t);
+  const vllm::ModelForwardInput in2 = s2.Get();
+  const gn::KvBinding b2 = gn::ResolveKvBinding(p, in2);
+  REQUIRE(b2.cached_len == kNewTokens);
+  std::vector<gn::LayerCache> back;
+  gn::LoadCaches(p, b2, in2, &back);
+  REQUIRE(back.size() == static_cast<size_t>(kLayers));
+
+  const gn::LayerCache& dsa = back[static_cast<size_t>(Topology::kDsaLayer)];
+  REQUIRE(dsa.dsa.k_pass.size() ==
+          static_cast<size_t>(kNewTokens * latent_row));
+  for (size_t i = 0; i < dsa.dsa.k_pass.size(); ++i) {
+    CHECK(dsa.dsa.k_pass[i] ==
+          doctest::Approx(Pattern(Topology::kDsaLayer, static_cast<int64_t>(i))));
+  }
+  REQUIRE(dsa.dsa.indexer_packed.size() ==
+          static_cast<size_t>(kNewTokens * indexer_row));
+  for (size_t i = 0; i < dsa.dsa.indexer_packed.size(); ++i) {
+    CHECK(dsa.dsa.indexer_packed[i] ==
+          doctest::Approx(Pattern(Topology::kDsaLayer + 64,
+                                  static_cast<int64_t>(i))));
+  }
+  for (int64_t l = 0; l < kLayers; ++l) {
+    if (l == Topology::kDsaLayer) continue;
+    const gn::LayerCache& c = back[static_cast<size_t>(l)];
+    REQUIRE(c.kda.size() == 1);
+    REQUIRE(c.kda[0].conv_state.size() == static_cast<size_t>(conv_elems));
+    for (size_t i = 0; i < c.kda[0].conv_state.size(); ++i) {
+      CHECK(c.kda[0].conv_state[i] ==
+            doctest::Approx(Pattern(l + 128, static_cast<int64_t>(i))));
+    }
+    REQUIRE(c.kda[0].recurrent_state.size() == static_cast<size_t>(rec_elems));
+    for (size_t i = 0; i < c.kda[0].recurrent_state.size(); ++i) {
+      CHECK(c.kda[0].recurrent_state[i] ==
+            doctest::Approx(Pattern(l + 192, static_cast<int64_t>(i))));
+    }
+  }
+}
+
+TEST_CASE("glm5_next W9c-3b: a CPU queue writes the pages IN PLACE, and the "
+          "shadow backend is not involved") {
+  // The `--device cpu` arm, which is the one this wave must not move. The bytes
+  // land in the topology's OWN host vectors, at the slot the block permutation
+  // maps each position to, and no other backend is touched on the way.
+  //
+  // WHAT THIS CASE CANNOT SEE, stated because a mutation proved it. Deleting
+  // `PageIo`'s `if (q.device.type == kCPU) return;` -- so that a CPU queue
+  // resolves `vt::GetBackend(kCPU)` and bounces through it as well -- SURVIVES
+  // this case and the whole suite. It has to: the CPU backend's `Copy` IS
+  // `std::memcpy`, so the bytes are identical either way, and `Shadow().copies`
+  // below counts the SHADOW backend, which a CPU queue never reaches under
+  // either version. The early return is therefore not load-bearing for
+  // correctness. It is there so that a build with no CPU backend registered
+  // does not `Fail` on the host path, and so the `--device cpu` instruction
+  // stream is the one that was already measured. Spec `## Owed` O49 records the
+  // survival rather than leaving it for the next reader to rediscover.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  const vllm::Glm5NextParams& p = Weights(model).params;
+
+  Topology host;
+  Step s({1, 2});
+  s.Bind(host);
+  const vllm::ModelForwardInput in = s.Get();
+  const gn::KvBinding b = gn::ResolveKvBinding(p, in);
+  std::vector<gn::LayerCache> caches;
+  gn::LoadCaches(p, b, in, &caches);
+  const int64_t latent_row = Topology::LatentRow();
+  gn::LayerCache& c = caches[static_cast<size_t>(Topology::kDsaLayer)];
+  c.dsa.cached_len = 2;
+  c.dsa.k_pass.assign(static_cast<size_t>(2 * latent_row), 0.0F);
+  for (size_t i = 0; i < c.dsa.k_pass.size(); ++i)
+    c.dsa.k_pass[i] = Pattern(7, static_cast<int64_t>(i));
+  c.dsa.indexer_packed.assign(
+      static_cast<size_t>(2 * Topology::IndexerRow()), 0.5F);
+  for (int64_t l = 0; l < kLayers; ++l) {
+    if (l == Topology::kDsaLayer) continue;
+    gn::LayerCache& k = caches[static_cast<size_t>(l)];
+    k.kda.assign(1, vllm::glm5_next_kda::Glm5NextKdaCache{});
+    k.kda[0].conv_state.assign(static_cast<size_t>(Topology::ConvElems()), 0.25F);
+    k.kda[0].recurrent_state.assign(static_cast<size_t>(Topology::RecElems()), 0.75F);
+  }
+  const int copies_before = Shadow().copies;
+  gn::StoreCaches(p, b, caches, in);
+  CHECK(Shadow().copies == copies_before);
+
+  // And the bytes landed in the topology's OWN host vectors, at the permuted
+  // slot, so "no backend" did not become "no write".
+  const gn::LayerKvBinding& lb =
+      b.layers[static_cast<size_t>(Topology::kDsaLayer)];
+  const auto* lat = static_cast<const float*>(
+      in.attn_kv[static_cast<size_t>(lb.latent)].data);
+  for (int64_t t = 0; t < 2; ++t) {
+    for (int64_t i = 0; i < latent_row; ++i) {
+      CHECK(lat[Topology::Slot(t) * latent_row + i] ==
+            doctest::Approx(Pattern(7, t * latent_row + i)));
+    }
+  }
+}
+
+// ═══ (5) THE ASYNCHRONOUS DEVICE-IDENTIFIER GATE ════════════════════════════
+//
+// Row `ENG-ASYNC-DEVICE-IDS-2544`, spec
+// `.agents/specs/eng-async-device-ids-2544.md`, issue
+// [#2544](https://github.com/mudler/vllm.cpp/issues/2544); the contract is
+// [#1305](https://github.com/mudler/vllm.cpp/issues/1305)'s.
+//
+// WHAT IT MEASURES. On the asynchronous serving path the runner's combine
+// splices each decode row's sampled token into the DEVICE identifiers on the
+// main queue and leaves the host `token_ids` deliberately stale for decode rows
+// (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on
+// CUDA -- integrated parts included). A forward that embeds the host vector
+// therefore generates every step after the first from the previous step's
+// identifiers, and because `token_ids_cpu` is zero-initialised that means from
+// TOKEN ID 0.
+//
+// This was MEASURED for this model, not inferred. On `dgx:gpu0` over the real
+// 101.25 GiB UD-Q2_K_XL artifact, one binary, one variable flipped:
+//
+//     default                     ->  ' Paris Paris'
+//     VT_ASYNC_DEVICE_MIRROR=0    ->  ' Paris.'
+//     --max-tokens 1 (prefill)    ->  ' Paris'
+//
+// The prefill agrees, so the first token looked right and everything after it
+// came from id 0 -- silently, at rc=0.
+//
+// THE DEFECT IS SILENTLY WRONG TOKENS AND NOT A FAULT, so this asserts the
+// identifiers themselves rather than that the call returns. Three runs, because
+// two of them cannot separate the cases:
+//
+//     A  right host ids, no mirror              -> the reference
+//     B  ZERO host ids, no mirror               -> must DIFFER from A
+//     C  ZERO host ids, mirror carries A's      -> must EQUAL A, bit for bit
+//
+// B is the control. Without it a forward that ignored its identifiers entirely
+// would satisfy C, and so would a gate whose two runs happened to share a
+// buffer. ZERO is the wrong-host value on purpose: it is the value the real
+// defect feeds.
+//
+// EVERY IDENTIFIER IN A IS NON-ZERO, so C cannot agree with A for the wrong
+// reason.
+//
+// WHAT A CPU HARNESS CANNOT SHOW, stated the right way round: `vt::Backend::Alloc`
+// returns host-addressable memory on this backend, so the mirror's buffer and the
+// host vector are the same kind of pointer. That the copy reads DEVICE memory and
+// that it is ordered on the main queue after the combine are the two halves this
+// cannot see; the spec's `## Gates` carries the hardware legs that can.
+namespace {
+
+// The mirror's buffer is a REAL backend allocation, never the host vector's
+// address. On CPU the two are the same kind of pointer, so this buys nothing
+// today; it is what makes the case correct by construction on a device, where
+// `device_token_ids` is a pointer the runner's combine wrote.
+struct MirrorIds {
+  vt::Backend* b = nullptr;
+  int32_t* p = nullptr;
+  MirrorIds(vt::Queue& q, const std::vector<int32_t>& ids) {
+    b = &vt::GetBackend(q.device.type);
+    const size_t bytes = ids.size() * sizeof(int32_t);
+    p = static_cast<int32_t*>(b->Alloc(bytes));
+    b->Copy(q, p, ids.data(), bytes);
+    b->Synchronize(q);
+  }
+  ~MirrorIds() { if (b != nullptr && p != nullptr) b->Free(p); }
+  MirrorIds(const MirrorIds&) = delete;
+  MirrorIds& operator=(const MirrorIds&) = delete;
+};
+
+size_t DifferingFloats(const std::vector<float>& a, const std::vector<float>& b) {
+  REQUIRE(a.size() == b.size());
+  size_t n = 0;
+  // memcmp rather than `!=`, because `NaN != NaN` is TRUE and would read as a
+  // difference on a forward that produced no numbers at all.
+  for (size_t i = 0; i < a.size(); ++i)
+    if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next: the forward embeds the async mirror's DEVICE ids, not the stale host vector") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  REQUIRE(model != nullptr);
+
+  // NON-ZERO throughout, and inside the fixture's vocabulary so run B is a
+  // wrong ANSWER rather than a refusal.
+  const std::vector<int32_t> truth{5, 11, 23, 17};
+  const std::vector<int32_t> stale(truth.size(), 0);
+
+  // ── RUN A — the reference ───────────────────────────────────────────────
+  Step a(truth);
+  const vllm::ForwardLogits ref = vllm::ModelRegistry::Forward(*model, a.Get());
+  REQUIRE(ref.host.size() == static_cast<size_t>(truth.size() * kVocab));
+  // FINITENESS BEFORE ANY COMPARISON. Against a NaN both `==` and `!=` are
+  // false, so an equality gate and a difference gate BOTH report success on a
+  // forward that produced no numbers -- which is exactly how this row's sibling
+  // read an all-NaN forward as a perfect match.
+  {
+    int nonfinite = 0;
+    for (float v : ref.host) if (!std::isfinite(v)) ++nonfinite;
+    REQUIRE(nonfinite == 0);
+  }
+
+  // ── RUN B — THE CONTROL. Stale host ids, no mirror: the logits must MOVE. ─
+  Step b(stale);
+  const vllm::ForwardLogits zeroed = vllm::ModelRegistry::Forward(*model, b.Get());
+  REQUIRE(zeroed.host.size() == ref.host.size());
+  {
+    int nonfinite = 0;
+    for (float v : zeroed.host) if (!std::isfinite(v)) ++nonfinite;
+    REQUIRE(nonfinite == 0);
+  }
+  const size_t moved = DifferingFloats(ref.host, zeroed.host);
+  CHECK_MESSAGE(moved > 0,
+                "zeroing the host ids changed nothing, so this fixture cannot "
+                "see an identifier at all and run C would prove nothing");
+
+  // ── RUN C — THE GATE. The same stale host vector, the true identifiers
+  //    reaching the model ONLY through `device_token_ids`. ─────────────────
+  Step c(stale);
+  vllm::ModelForwardInput in = c.Get();
+  MirrorIds mirror(in.queue, truth);
+  // Set after aggregate construction, exactly as `runner.cpp` sets it.
+  in.device_token_ids = mirror.p;
+  const vllm::ForwardLogits via_device = vllm::ModelRegistry::Forward(*model, in);
+  REQUIRE(via_device.host.size() == ref.host.size());
+  const size_t differing = DifferingFloats(ref.host, via_device.host);
+  CHECK_MESSAGE(differing == 0,
+                "registry forward, mirror vs host reference: " << differing
+                    << " of " << ref.host.size() << " logits differ, so this "
+                    "forward embedded the STALE host ids and the model generates "
+                    "from token id 0 on every decode step after the first "
+                    "(#2544, #1305)");
+  MESSAGE("glm5_next device-ids: control moved " << moved << " floats; mirror "
+          "vs reference differ in " << differing << " of " << ref.host.size());
+}
+
+TEST_CASE("glm5_next: a published device buffer over an EMPTY step is refused by name") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+
+  // A runner that published identifiers for a step whose host vector is empty
+  // and a model that shortened the step both reach here, and the two disagree
+  // about the step's shape. Refused rather than silently reduced to a no-op,
+  // because a no-op here IS the defect.
+  Step e(std::vector<int32_t>{});
+  vllm::ModelForwardInput in = e.Get();
+  const std::vector<int32_t> one{5};
+  MirrorIds mirror(in.queue, one);
+  in.device_token_ids = mirror.p;
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, in),
+                       doctest::Contains("disagree about the step's shape"),
+                       std::runtime_error);
 }

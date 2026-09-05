@@ -68,6 +68,169 @@ expert over `TEMP_ROWS_FUSED` tokens and as the `VT_DSV4_EXL3_FUSED_MOE=0`
 rollback. W2c adds the m<=8 GEMV arm and its selection policy, ported verbatim
 and reached from the CUDA GEMM launcher.
 
+**THE ARTIFACT'S WEIGHTS LOAD (2026-08-31).** Measured on `thor:gpu0` under an
+`rc` lease, source `a87f2cbe4`, reading the checkpoint off `/workspace`:
+
+```
+[vt load] dsv4-exl3: coalesced TP1 tower resident_bytes=87994957824 (81.952 GiB)
+  over 43 layers, tp4->tp1, 3-bit trellis;
+  carried host tower host_bytes=16885558876 (15.726 GiB);
+  host MemAvailable=101.381 GiB
+```
+
+The tower coalesces TP4 to TP1 and the whole weight body materializes:
+**81.952 + 15.726 = 97.68 GiB**, at a measured peak RSS of **111 GiB** inside a
+118 GiB pool. This is the first time this row's checkpoint has been loaded at
+all, and it took ~38 minutes to read over CIFS.
+
+**IT ANSWERS THE RESIDENCY QUESTION, and not in the direction the arithmetic
+suggested.** The carried FP8 half DOES widen at load: 15.726 GiB against the 8.23
+GiB its packed headers hold, so it roughly doubles. The 90.82 GiB header figure
+is therefore a FLOOR, understating the tower by ~7 GiB and peak allocation by
+~20 GiB. Planning that treated 90.82 GiB as residency was planning against the
+wrong number, and this row now has the measurement.
+
+**IT THEN REFUSED, BY NAME, ON THE DEFAULT KV BLOCK SIZE:**
+
+```
+deepseek-v4 kv-cache: block_size 32 cannot express a compress_ratio-128 page
+(storage_block_size = block_size / compress_ratio would be 0).
+Upstream derives this geometry at block_size 256
+```
+
+`EngineParams::block_size` defaults to 32, and a `cr == 128` layer cannot be paged
+at that size. The refusal is correct and its message is exactly the diagnostic
+this project's discipline exists to produce -- but it means the artifact does NOT
+load on the DEFAULT configuration, which is where `AGENTS.md`
+§"Nothing lands dead" measures reachability. Upstream derives 256. `vllm-server`
+accepts `--block-size`; `vllm-cli` does not.
+
+**FIXED 2026-08-31 (#2441), by deriving the geometry rather than asking for it.**
+`ModelFactory::kv_block_size_floor` is the smallest block size an architecture
+can be paged at, 0 meaning unconstrained. DeepSeek-V4 declares 256, which is the
+number upstream spells throughout (`sparse_swa.py:76-83`,
+`compressor.py:174-178`). `ModelRegistry::ResolveKVBlockSize` is the single
+resolution point, and `LoadedEngine::MakeKVCacheMaybeSpec` -- the funnel BOTH the
+probe config and the resized config pass through -- raises its block size to the
+floor before building the cache. A model that declares no floor gets exactly what
+the caller asked for, so nothing else moves.
+
+A CLI flag was considered and rejected: it leaves the model unreachable on the
+default configuration, which is where `AGENTS.md` §"Nothing lands dead" measures,
+and it is not what upstream does. Upstream never asks an operator for this
+number.
+
+Gated by `tests/vllm/models/test_deepseek_v4_scaffold.cpp`, which enters at
+`MakeKVCacheMaybeSpec` rather than at the resolver beneath it. That choice was
+measured, not assumed: with the gate entering at `ResolveKVBlockSize`, deleting
+the loader's call site left `test_deepseek_v4_scaffold`,
+`test_loaded_engine_dense` and `test_kv_cache_fp8_wiring` ALL GREEN. Entering at
+the funnel reds it. Three mutations, each red, tree restored between:
+
+| mutation | result |
+|---|---|
+| `kv_block_size_floor` 256 -> 0 | 2 assertions FAIL |
+| `ResolveKVBlockSize` ignores the floor | 2 assertions FAIL |
+| the loader stops applying the resolved size | 1 assertion FAILS |
+
+`MakeKVCacheMaybeSpec` became public for that gate. It is a pure function of its
+arguments and holds no engine state, so publishing it widens nothing else.
+
+**The first version of this fix was wrong, and the way it was wrong is the point.**
+Raising the block size inside `MakeKVCacheMaybeSpec` fixed the KV config and left
+the other three consumers reading `params.block_size` -- the max-model-len fit,
+the scheduler's block table, and the prefix-cache hasher. Each spelled the same
+`params.block_size > 0 ? params.block_size : 32` fallback, so before a floor
+existed they could not disagree; with one they can. A pool paged at 256 read
+through a block table striding 32 attends over the wrong tokens and returns
+plausible output. It does not throw.
+
+So the engine resolves the size ONCE into `block_size_`, declared before
+`kv_cfg_`, and all four sites read that member. The constructor then asserts the
+property the disagreement would violate -- no group may page wider than the
+stride -- written over the built config rather than as a repetition of the
+assignment, because repeating the assignment gates nothing. Inverting that
+assertion reds `test_loaded_engine_dense` (3 assertions), which is what proves a
+real engine load reaches it.
+
+**The floor is a per-architecture CONSTANT, not a function of the config, and
+that is a real limit worth naming.** `kv_block_size_floor` lives on
+`ModelFactory`, so DeepSeek-V4 declares one number for every DeepSeek-V4 config.
+256 is right for every `compress_ratio` this architecture uses and is the number
+upstream spells, but a future config carrying `compress_ratio > 256` would need a
+larger floor and would not get one. It would not be silent: `MakeDeepseekV4KVCache`
+still refuses that geometry by name, which is the same loud failure as before this
+change. Deriving the floor from the config needs the factory field to become a
+callback, and no config in reach justifies that yet.
+
+**MEASURED 2026-09-01 on the real artifact, and the refusal this fixed is GONE.**
+Under an `rc` lease on `thor:gpu0`, source `693f17e08`, through `vllm-cli` with
+NO flags, the tower loads (81.952 GiB + 15.726 GiB carried, MemAvailable 101.407
+GiB) and the `block_size 32 cannot express a compress_ratio-128 page` refusal
+does not appear at all -- 0 occurrences in the run log. The load now proceeds
+PAST the KV geometry.
+
+**It then stops one layer deeper, and that one is not this change's**
+([#2455](https://github.com/mudler/vllm.cpp/issues/2455)). `MakeDeepseekV4KVCache`
+publishes an fp8_ds_mla topology on purpose, mirroring upstream, with `kI8`
+specs; `ApplyCacheDType`'s early-out needs `spec.dtype == resolved.storage` and
+on `auto` that is the model's bf16, so the early-out misses and
+`RetypeAttentionSpec` refuses every `MLAAttentionSpec`. The model's own factory
+declares a layout the retype path then refuses, and no flag was passed -- the
+message's "requesting it here" misattributes it.
+
+That refusal is CORRECT and must not be widened, and the investigation behind
+that sentence is worth keeping because both obvious small fixes are harmful.
+
+The published topology is a GATED mirror: `test_deepseek_v4_scaffold.cpp` pins
+`real_page_size_bytes() == 37376` (64 x 584) twice and `== 1168` (2 x 584) once
+-- **three** `CHECK` assertions, at `:253`, `:269` and `:319`, anchored to
+upstream's 448B NoPE + 128B RoPE + 8B scale. (An earlier revision of this
+paragraph and commit `b12523e08` said "seven". That number came from
+`grep -c "584"`, which counts COMMENT mentions as well as assertions. Three is
+the gate; seven was the word count.)
+
+The paged
+STORE, meanwhile, writes **f32** -- `deepseek_v4.cpp:1013-1036` builds `t_kvc` /
+`t_pe` as `kF32` views over `deck` and calls `vt::ConcatAndCacheMla`, which at
+`head_dim` 512 is 2048 bytes/token, **3.5x** the declared page. The
+`Fp8DsMlaLayout` round-trip in the same function is NUMERIC and not storage: it
+encodes and decodes back to floats.
+
+So the model declares a 584-byte layout and writes 2048 bytes, and the refusal is
+the system noticing.
+
+- **Widening the guard** (skipping the retype for specs that declare their own
+  `cache_dtype_str`) would let the runner allocate 584-byte pages the forward
+  overruns by 3.5x. It would appear to work only because no production path binds
+  a paged cache at all ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)),
+  so the pages are allocated and never read -- a trap set for whoever fixes that.
+- **Republishing the topology at f32/bf16** would red the three gated assertions
+  above, which correctly mirror upstream, and triple the KV footprint at the 384k
+  context the throughput target is measured at.
+
+The fix is the fp8_ds_mla **store and read**, owed to `KV-DSV4-MULTICACHE` W5.
+The encode/decode reference already exists (`Fp8DsMlaEncodeToken`); what is
+missing is the packed 584-byte store in `vt::ConcatAndCacheMla` and the matching
+read in `PagedCausalMlaAttention`. That is a vt-level change owned by that row.
+
+What this row DID change is the refusal message, which blamed
+`--kv-cache-dtype` when `vllm-cli` has no such flag and none was passed. It now
+names both causes and points at W5.
+
+So the reachability claim this row can make is exact: the block-size floor is
+proven on the real artifact, and the artifact still does not reach a forward,
+for a different and separately owned reason.
+
+**Superseded: the load has not been re-measured on the default
+configuration.** The fix removes the refusal that stopped it; that the 97.68 GiB
+artifact now reaches a forward is a claim this row cannot make until the probe
+runs again under an `rc` lease.
+
+Note what this refusal is NOT: it is not an OOM, and it is not the DSA
+composition. W3's path was never reached, because the KV-cache spec is built
+before the forward runs.
+
 **THE CUDA ARM COMPILES AND ITS DEVICE GATES PASS ON GB10 (2026-08-31).** Measured
 under an `rc` lease on `dgx:gpu0` (GB10, driver 580.173.02), source at
 `f5c70789`, `cuda-nvcc-13-0` installed per run:
@@ -2183,13 +2346,254 @@ which is precisely how this landed green locally in the first place.
   `indexer.wq_b` input-space defect (`x` where upstream uses `qr`) is real at any
   geometry. Design, anchors and mutations in
   [`specs/dsv4-dsa-loader-accept-forward-refuse.md`](dsv4-dsa-loader-accept-forward-refuse.md).
-- **Real-checkpoint residency for the coalesced tower — W2.** W1b copies each
+- **No production path gives an EXL3 checkpoint a paged KV cache**
+  ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)), and this sits IN
+  FRONT of the residency item below. `DeepseekV4ForwardExl3Paged` is the only V4
+  forward taking both `paged_kv` and a `DeepseekV4CompressorState`, and it has
+  only test callers. The registered `ForwardDeepseekV4ForCausalLM` has three
+  branches and none reaches it: `gather_logits` goes to `ForwardDevice` (binds
+  neither), `multi_kv` goes to `DeepseekV4ForwardGgufPaged` (which REFUSES by
+  name without a GGUF tower, so it is not a path for this arm), and the fallback
+  goes to `DeepseekV4ForwardExl3` (binds neither).
+
+  `V4Backend` states the consequence itself: a null `paged_kv` is "stateless
+  full-recompute (the default / --gpu path)". The EXL3 arm recomputes the whole
+  prefix every decode step. The 44-47 tok/s target is measured at 384k context,
+  so a step that recomputes 384k tokens is not a decode and no tower residency or
+  speculation changes that.
+
+  It also leaves W3's DSA composition unreachable in production: `compressor` is
+  non-null only on the paged entry. The gates are real; the callers are tests.
+
+  **The dispatch is sharper than "one branch of three".** `ModelForwardInput::gather_logits`
+  DEFAULTS TO TRUE (`model_registry.h:585`) and only multimodal models set it
+  false, so for DeepSeek-V4 the FIRST branch always wins: production is
+  `ForwardDevice`, always, and the `multi_kv` and fallback branches are not
+  reached in ordinary serving at all. The factory does declare
+  `.consumes_multi_kv = true`, so the runner does hand it a cache set -- which
+  the first branch then ignores.
+
+  **What the fix needs, from reading rather than guessing.** The paged arm is NOT
+  gated on `V4Backend::device`: `ForwardComposeImpl` keys on `be.paged_kv !=
+  nullptr` and `be.compressor != nullptr` independently of the device flag
+  (`deepseek_v4.cpp:860, 915, 987`). So `ForwardDevice` can bind both and the
+  paged DSA path engages -- this is a wiring gap, not a missing composition.
+  Three pieces:
+
+  1. Resolve the pages, which `ResolveDeepseekV4SwaPages` already does for the
+     GGUF branch.
+  2. Hold a `DeepseekV4CompressorState` that PERSISTS ACROSS STEPS. It is
+     currently constructed per call by tests, and decode state cannot be.
+     `DeepseekV4LoadedModel` holds only `weights_`, so this is a new member.
+  3. Bind both on `dev_be` and let the existing predicates do the rest.
+
+  **A limit to record before it is discovered as a bug.**
+  `DeepseekV4CompressorState` is `std::vector<std::vector<float>>` PER LAYER with
+  no request dimension -- one sequence's state machine. The 44-47 tok/s target is
+  1 seq, so it is sufficient for the target and NOT sufficient for a server with
+  concurrent requests. Whoever wires this owes either a per-request state or a
+  refusal by name when `num_reqs > 1`; silently sharing one state across requests
+  is the "refusal and its route predicate must be the same predicate" failure
+  this tree has already paid for once.
+  §"Nothing lands dead" allows a staged slice to land unreached ONLY when the
+  commit body, the pull-request body and this section all name it, and this was
+  named in none of them until now.
+
+- **Real-checkpoint residency for the coalesced tower — W2. THIS NOW BLOCKS THE
+  THROUGHPUT TARGET** ([#2442](https://github.com/mudler/vllm.cpp/issues/2442)).
+  `Exl3Linear` refuses a non-CPU queue unless
+  `Backend::DeviceMemoryIsHostAddressable()`, and `CudaBackend` answers false by
+  design even on GB10 (`cuda_backend.cu:354-391` pins it with a `static_assert`;
+  a `cudaMalloc` pointer is not host-dereferenceable even where `UnifiedMemory()`
+  is true). So every routed expert on this arm runs on a CPU queue, and no
+  drafter recovers that -- speculation multiplies the step rate, and 2.64x a
+  CPU-bound MoE step is still CPU-bound. This item is therefore ahead of
+  `DSV4-DSPARK-DRAFTER` W-6 rather than beside it. W1b copies each
   TP1-coalesced linear into host owner buffers. That is right for the fixture
   and for W2's byte-parity gate, and it is ~100 GB on the real 216-expert
   artifact, so the real load needs borrow / device-resident / per-layer
   streaming. Coalescing cannot borrow the mmap directly: an OUT split
   interleaves ranks along trellis dim 1, so some copy is inherent and the fix is
   to make the destination device-resident rather than host-resident.
+
+  **The mechanism already exists in this tree, which makes this a port rather
+  than a design.** Two loaders stage weights into a `cudaMalloc` buffer on
+  `OwnedTensor::d_dev` and then release the host bytes:
+  `StageKimiResidentBf16` (`kimi_linear.h:378-382`, per-tensor stage-then-release
+  interleaved with each direct load) and Qwen3.5's adoption path
+  (`qwen3_5_weights.cpp:360-402`), whose non-host-addressable branch is exactly
+  the CUDA case here -- it keeps `d_dev` and leaves the borrow alone. The EXL3
+  coalescer would do the same to each TP1-coalesced trellis tensor as it
+  produces it, so the ~82 GiB is never resident on the host twice, and
+  `Exl3Linear` / `Exl3MoeMlp` would build their `vt::Tensor`s over the device
+  pointer instead of the host owner buffer. The refusal at
+  `deepseek_v4.cpp:1295-1302` then has nothing left to refuse.
+
+  Sizing, from the measured load: 81.952 GiB has to fit in device allocations on
+  a ~119 GiB GB10 beside the 15.726 GiB carried host tower, KV and activations.
+  Stage-then-release per tensor is what keeps the peak near the total rather than
+  near twice it, which is why the interleaving in the Kimi helper matters and is
+  not an implementation detail.
+
+  **IMPLEMENTED 2026-08-31.** `deepseek_v4_exl3_device.{h,cpp}` stages each
+  coalesced linear through `dense_attn::ResidentWeight` -- the same helper every
+  other model's weights go through, not a second uploader -- and frees the host
+  vector immediately after, so only one tensor's host bytes are live at a time.
+  `DeepseekV4Exl3Linear` gained `d_trellis/d_suh/d_svh` (`OwnedTensor`, which is
+  the type `ResidentWeight` memoizes `d_dev` on) and a `device_staged` predicate.
+  Both the per-expert `Exl3Linear` and the fused MoE arm gained device arms, and
+  the fused arm needed MORE than the weights: the nine per-expert POINTER TABLES,
+  the three routing arrays and the four temps were all host `std::vector`s
+  wearing the forward's device label, and the kernel indexes `g_tr[expert]` on
+  the device. The tables were the easier half to miss, being 216 int64s.
+
+  Staging is called from all three production EXL3 entries (`DeepseekV4ForwardExl3`,
+  `DeepseekV4ForwardExl3Paged`, `DeepseekV4Model::ForwardDevice`), because the
+  loader has no queue in hand and a forward is the first point at which the tower
+  and its device both exist.
+
+  **What is gated, and what is NOT.** Staging is a no-op on a CPU queue by
+  construction, so a host-only lane can prove the CPU branch, the per-expert
+  refusal that replaced the blanket one, the partial-tower guard and the
+  vacuous-truth guard -- `test_deepseek_v4_exl3_device_residency.cpp`, 25
+  assertions, three mutations red:
+
+  | mutation | result |
+  |---|---|
+  | empty tower reads as staged | 2 assertions FAIL |
+  | the per-linear CPU guard removed | 2 assertions FAIL |
+  | a partially staged tower reads as staged | 2 assertions FAIL |
+
+  A fourth mutation SURVIVES and is kept as a recorded fact rather than papered
+  over: deleting the tower walk's own CPU early-out changes nothing, because the
+  per-linear guard already no-ops. It is there for the ~28k redundant predicate
+  reads per CPU forward, not for semantics.
+
+  **THE UPLOAD IS PROVEN ON HARDWARE (2026-09-01), AND THE COMPUTE IS NOT.**
+  Measured under an `rc` lease on `thor:gpu0` (Jetson Thor, **sm_110** -- the
+  arch is DERIVED from `nvidia-smi` now, because the first script hardcoded
+  dgx's 121 and a wrong arch does not fail loudly, it builds kernels the device
+  cannot launch), source `693f17e08`, CUDA build, 27 cases and 90,077 assertions.
+
+  Case 1, `the EXL3 tower stages to CUDA`, PASSES on the device:
+
+  | assertion | value |
+  |---|---|
+  | bytes uploaded | `304128 > 0` |
+  | `device_staged` / tower staged | `true` / `true` |
+  | `d_trellis.d_dev` | `0x32a800000` (a device pointer) |
+  | `d_suh.d_dev` / `d_svh.d_dev` | `0x32a80c000` / `0x32a80c200` |
+  | host `trellis/suh/svh.capacity()` | `0` -- the host bytes are GONE |
+  | the staging borrows | dropped |
+
+  So the tower reaches device memory and the host copy is released, which is
+  exactly what W2 owed and what no host lane could show.
+
+  Case 2, `the EXL3 routed experts COMPUTE on CUDA and agree with the CPU arm`,
+  **CRASHES**: `terminate called after throwing an instance of
+  'std::runtime_error', what(): vt cuda: cudaStreamDestroy: an illegal memory
+  access was encountered` (SIGABRT). `cudaStreamDestroy` is where the fault
+  SURFACED, not where it happened -- CUDA reports an asynchronous fault at the
+  next synchronising call -- so the kernel and address are being located with
+  `compute-sanitizer` rather than guessed at.
+
+  **THE ARM IS BISECTED, AND THE EXPERTS DO COMPUTE ON CUDA.** Re-run on
+  `thor:gpu0` with the tree's own `VT_DSV4_EXL3_FUSED_MOE=0` lever
+  (`deepseek_v4.h:552-566`), which selects the per-expert `vt::Exl3Gemm` loop
+  instead of the fused kernel:
+
+  | arm | result |
+  |---|---|
+  | per-expert loop, `VT_DSV4_EXL3_FUSED_MOE=0` | **rc=0, 5/5 assertions, `max \|diff\| = 0`** |
+  | fused `vt::Exl3MoeMlp`, default ON | illegal memory access, 0 assertions |
+
+  The loop arm's logits are **BIT-IDENTICAL** to the CPU arm's through the
+  production entry `DeepseekV4Model::Forward`, on a tower the same case asserts is
+  device-staged (and asserts the CPU side is not). So the routed experts of an
+  EXL3 checkpoint compute on a GPU, which is what W2 set out to make possible and
+  what the blanket refusal prevented entirely.
+
+  **THE DEFAULT DEVICE PATH FIRST WORKED ON 2026-09-01 on `thor:gpu0`, on the
+  PER-EXPERT arm.** That run is kept here because it is what the kernel fix below
+  is measured against. With the fused arm defaulted off on a device queue, the
+  path an operator got -- no environment variables set -- computed on CUDA and
+  matched the CPU arm exactly:
+
+  | run, pre-fix | result |
+  |---|---|
+  | default path, no env vars | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | the same under `compute-sanitizer --tool memcheck` | **`ERROR SUMMARY: 0 errors`** (was 66) |
+  | `VT_DSV4_EXL3_FUSED_MOE=1` (forced fused) | rc=134, still faults |
+
+  The zero-error sanitizer run is the one that matters beyond the diff: it says
+  the device path this row serves has no out-of-bounds or invalid access at all,
+  not merely that its numbers happen to agree. And the forced run still faulting
+  is what proved the predicate gated something rather than decorating a path that
+  was already fine.
+
+  **THE FUSED ARM IS FIXED, MEASURED 2026-09-01 on `thor:gpu0` (sm_110).**
+  `compute-sanitizer` had placed the fault in `exl3_moe_kernel` as an 8-byte read
+  at `base + tid*8` with base NULL (`0x0, 0x8 ... 0x200, 0x208`), and the
+  per-pointer and eighteen-operand checks did not fire, so the null arose inside
+  the kernel rather than at the boundary. It did: the port of
+  `exl3_gemm_kernel_inner` had DROPPED upstream's `shmem_out_had` template
+  parameter (`exl3_gemm_inner.cuh:22`) and hardwired the output Hadamard on, so
+  the epilogue called `output_had_sh_gl()` unconditionally and dereferenced the
+  NULL `post_scale` that upstream's own MoE bands pass
+  (`exl3_moe_kernel.cuh:138,212` instantiate it `false`; `exl3_gemm_kernel.cuh:40`
+  instantiates `true` with a real `svh`). Restoring the parameter takes the
+  `write_sum_gl()` store on the MoE path, which rounds the f32 accumulator to fp16
+  through `__floats2half2_rn` -- exactly the rounding
+  `src/vt/cpu/cpu_exl3_kernels.cpp:420-425` reproduces on the host and the MoE
+  header comment already claimed. So the fix is the numerically correct answer and
+  not merely the non-faulting one.
+
+  | run, fused arm ON | result |
+  |---|---|
+  | default path, no env vars | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | `VT_DSV4_EXL3_FUSED_MOE=1` | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | `VT_DSV4_EXL3_FUSED_MOE=0` (per-expert control) | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | `compute-sanitizer --tool memcheck`, `VT_POOL_BYPASS=1` | **`ERROR SUMMARY: 0 errors`** (was 66) |
+
+  The device-queue predicate that kept the fused arm off is DELETED with the
+  defect it was written for. One flag, `VT_DSV4_EXL3_FUSED_MOE`, selects the arm
+  on the host and on a device queue alike, and the routed experts of an EXL3
+  checkpoint now compute on a GPU through the FAST arm.
+
+  **READ THOSE `max |diff| = 0` ROWS NARROWLY: they gate the ABSENCE OF A FAULT,
+  not the arithmetic** ([#2500](https://github.com/mudler/vllm.cpp/issues/2500)).
+  Measured on `thor:gpu0` after the fix: doubling EVERY value the fused MoE band
+  stores moves the compared logits by `4.57764e-05`, which is exactly `3/65536`
+  -- one fp16 quantization step, against this case's `1e-2` tolerance. That is
+  **218x of headroom over a 2x error**, so the suite cannot see a wrong number
+  out of that kernel, and two smaller mutations of the same epilogue read as
+  exactly `0` for the same reason.
+
+  The routing is NOT degenerate, which is what rules out the comfortable
+  explanation: the fixture sends 3 tokens to one expert with `num_active=1` and
+  `3 <= max_rows=128`, so the fused arm owns that expert and the host loop skips
+  it -- its output is the sole source of those logits. The CPU-side sibling
+  proves the algebra IS gateable when measured closer: doubling the CPU
+  scatter-add takes `test_deepseek_v4_exl3_forward`'s `rel_rms` from ~0 to 0.373
+  and reds at once.
+
+  So the fault fix stands on the M1 evidence -- putting `shmem_out_had = true`
+  back reproduces the original crash exactly -- and the numeric claim was
+  deliberately never made. #2500 owns the replacement gate, and its acceptance
+  condition is stated there: doubling the band's stored intermediate must red it.
+
+  **The upload was UNPROVEN on a host-only lane and must not be claimed
+  from one.** `test_cuda_deepseek_v4.cpp` carries the two cases that prove it --
+  bytes moved, `d_dev` non-null, host `capacity() == 0`, and the CUDA forward
+  agreeing with the CPU forward through `DeepseekV4Model::Forward` -- and on a
+  CPU box the whole file reports `assertions: 0`, which is a skip wearing a pass.
+  It is owed a run under an `rc` lease before W2 is called done.
+
+  That file now EXITS 77 on a host with no CUDA, so the skip cannot be read as a
+  pass. `vllm_cpp_add_test` has registered `SKIP_RETURN_CODE 77` since #463 for
+  exactly this, and this suite was not using it: its W2 residency cases -- the
+  only proof the tower reaches a GPU -- reported `Status: SUCCESS!` and exit 0 on
+  a box with no GPU.
 - **The MTP NVFP4 draft experts.** Skipped-and-counted today (see `## Evidence`);
   no row owns reaching them yet.
 - Upstream's own `ext.reconstruct` run against the W1a anchors, so the

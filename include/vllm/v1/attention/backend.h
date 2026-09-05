@@ -544,6 +544,13 @@ class RocmAttentionBackend final : public AttentionBackend {
   // MultipleOf(1) in place, so this backend advertised every block size and
   // then refused most of them (#1608).
   std::vector<int> get_supported_kernel_block_sizes() const override { return {16}; }
+  // KV-FP8 W6: the ROCm paged-attn kernel reads fp8-e4m3 cache pages with
+  // per-tensor k_scale/v_scale dequant. The GQA decode arm on this branch
+  // (PagedAttnDecodeGqaF32Q) also accepts kI8 KV. e5m2 is refused at the
+  // ops layer (ops.cpp) with a named message.
+  std::vector<std::string> supported_kv_cache_dtypes() const override {
+    return {"auto", "float16", "bfloat16", "fp8", "fp8_e4m3"};
+  }
 
   std::vector<int64_t> get_kv_cache_shape(
       int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,

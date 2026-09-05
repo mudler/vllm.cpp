@@ -319,27 +319,28 @@ TEST_CASE("dflash block route: causal-SWA is byte-identical, window BINDING") {
 // `DflashBlockPagedMaskOf` left both suites green, because no case combined a
 // false `causal` with a non-zero window.
 //
-// WHAT THIS CASE MEASURES, AND WHAT IT DOES NOT. It measures that the two
-// routes agree BYTE FOR BYTE on the pair the production resolver yields:
-// `vt::DFlashPagedBlockAttention` drops the window when `!causal` (its lower
-// bound is guarded on `causal && window > 0`) and `DflashBlockPagedMaskOf`
-// resolves the paged arm to the same mask, so a divergence between the two is
-// caught. It does NOT say that dropping the window is the CORRECT answer, and
-// an earlier revision of this header and of
-// `.agents/specs/dflash2-draft-block-fa2.md` asserted that it was, without an
-// upstream anchor. Against the pin it reads false:
-// `vllm/model_executor/models/qwen3_dflash.py:89-146` resolves the window and
-// the causal flag as two INDEPENDENT answers and `:221-234` passes
-// `per_layer_sliding_window` irrespective of `causal`, and this repository's own
-// loader says the same in prose
-// (`src/vllm/model_executor/models/qwen3_dflash_weights.cpp:181-183`: a
-// non-causal SWA layer still attends within its window). That is a repo-wide
-// kernel property, not a W11 one — the same `causal && window > 0` guard stands
-// at `src/vt/cpu/cpu_ops.cpp:2917,2994` and nine sites in
-// `src/vt/cuda/cuda_ops.cu` — and it is tracked by
-// [#1900](https://github.com/mudler/vllm.cpp/issues/1900). When #1900 changes
-// the kernel's mask semantics, this case still holds: it pins the two routes to
-// EACH OTHER, whatever the shared semantics become.
+// WHAT THIS CASE MEASURES. It measures that the two routes agree BYTE FOR BYTE
+// on the pair the production resolver yields, whatever the shared mask
+// semantics are — it pins the two arms to EACH OTHER, not to a rule.
+//
+// #2784 CHANGED THAT RULE, and this case is the reason the change is safe. Both
+// arms used to drop the window when `!causal`: the kernels guarded their lower
+// bound on `causal && window > 0` and `DflashBlockPagedMaskOf` emitted no
+// `window_size`. Against the pin that reads false —
+// `vllm/model_executor/models/qwen3_dflash.py:84-146` resolves the window and
+// the causal flag as two INDEPENDENT answers, `:221-234` passes
+// `per_layer_sliding_window` irrespective of `causal`, and
+// `vllm/v1/attention/backends/flash_attn.py:319-330`
+// (`_maybe_symmetrize_window`) turns a causal `(w, 0)` into a SYMMETRIC
+// `(w, w)` on the non-causal arm rather than into nothing. Both now do that,
+// and because this case compares them element for element it is what catches
+// one arm moving without the other. The CORRECTNESS of the new bound is gated
+// separately, as a property rather than a transcription:
+// `tests/vt/test_ops_dflash_paged_block_attn.cpp` asserts that context outside
+// the symmetric window cannot reach the output, and
+// `tests/vt/test_dflash_attn_mask.cpp` sweeps the bound itself. #1900's
+// `## Owed` entry in `.agents/specs/dflash2-draft-block-fa2.md` is discharged
+// by `.agents/specs/dflash2-noncausal-swa-window.md`.
 //
 // The window is 5 over a 37+9 combined sequence, so it BINDS if it is applied —
 // a case with a window wider than the sequence would go green either way and
@@ -474,6 +475,24 @@ TEST_CASE("dflash block paged args: mask, scale and uniform qlen still flow (#22
     CHECK(swa.window_size->left == expect.window_left);
     CHECK(swa.window_size->right == expect.window_right);
   }
+  // THE PAIR THE PUBLISHED CHECKPOINT RESOLVES (#2784). Five
+  // `sliding_attention` layers, `sliding_window: 2048`, `is_causal: false`, so
+  // `ResolveQwen3DFlashAttnModes` yields (causal=false, window>0) on every
+  // layer of every draft step. Upstream's `_maybe_symmetrize_window` makes that
+  // window SYMMETRIC; this arm used to emit no window at all, and the draft
+  // then attended over the whole context. Spelled as LITERALS rather than
+  // through `DflashBlockPagedMaskOf`, because reading the expectation out of
+  // the function under test is a tautology.
+  const vt::PagedAttentionArgs nc_swa = vllm::detail::DflashBlockPagedArgsOf(
+      /*scale=*/0.25F, /*causal=*/false, /*sliding_window=*/2048, /*tq=*/4, hm);
+  CHECK(nc_swa.causal == false);
+  REQUIRE(nc_swa.window_size.has_value());
+  CHECK(nc_swa.window_size->left == 2047);
+  CHECK(nc_swa.window_size->right == 2047);
+  // The causal arm keeps the one-sided form, so the fix cannot have widened it.
+  CHECK(swa.window_size->left == 1);
+  CHECK(swa.window_size->right == 0);
+
   // And the host metadata is not disturbed by the mask arm.
   REQUIRE(swa.query_start_loc_host != nullptr);
   CHECK(swa.max_seq_len == 4096);

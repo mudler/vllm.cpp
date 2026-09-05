@@ -1,0 +1,103 @@
+# Which launch set cudaErrorNoKernelImageForDevice on thor:gpu0
+#
+# Measured 2026-09-03 on the dev box, NO lease. Two instruments: fatbin_blocks.py
+# over the exact objects the job installed, and ir_dispatch_probe.py over the
+# pinned vLLM checkout 5559679229. Neither needs the device.
+#
+# THE WINDOW. gen-20260903T012806Z.log raises at qwen2_moe.py:115 down_proj, in
+# ggml_mul_mat_a8's new_zeros bf16 fill -- a torch launch, and torch checks its
+# launches. gate_up_proj at qwen2_moe.py:113 takes the identical route and its
+# own new_zeros did NOT raise, so the last-error slot was clean there. Every
+# launch between the two is a candidate, and there are exactly three:
+#
+#   1. gate_up's quantize_row_q8_1_cuda      (plugin, unchecked)
+#   2. gate_up's ggml_mul_mat_*_q8_1_cuda    (plugin, unchecked)
+#   3. act_fn at :114 -> torch.ops._C.silu_and_mul  (vLLM _C, unchecked)
+#
+# Nothing between them launches a checked kernel: SiluAndMul.forward_cuda's
+# torch.empty allocates without filling, and the reshapes in the plugin's
+# apply() are metadata-only.
+
+## 1. Candidates 1-2 CANNOT return this error: their object has an image.
+
+$ python3 fatbin_arch.py <venv>/vllm_gguf_plugin/_C_gguf.abi3.so
+vllm_gguf_plugin/_C_gguf.abi3.so
+  .nv_fatbin          3705480 bytes, 1 fat_elf blocks, 3705480 bytes covered (100.0%)
+    ELF  sm_110  entries=1
+    PTX  sm_110  entries=1
+  SASS archs: [110]
+  PTX  archs: [110]
+
+The lease said the same thing independently: cuobjdump --list-elf on the
+INSTALLED object reported _C_gguf.abi3.1.sm_110.cubin (INSTALLED_CUBIN_ARCH_OK,
+rc-job-40a1d8dd.log). cudaErrorNoKernelImageForDevice is returned exactly when
+no compatible image exists, so a launch out of this object cannot produce it.
+
+## 2. Candidate 3's kernel has NO image for sm_110.
+
+$ python3 fatbin_blocks.py <venv>/vllm/_C_stable_libtorch.abi3.so \
+      act_and_mul_kernel rms_norm_kernel rotary_embedding_kernel
+  block   3  archs=[('ELF', 120)]  matches=['act_and_mul_kernel']
+  block  12  archs=[('ELF', 120)]  matches=['rotary_embedding_kernel']
+  block  15  archs=[('ELF', 120)]  matches=['rms_norm_kernel']
+
+block 3 holds 54 act_and_mul_kernel specializations, 18 of them BFloat16,
+including _ZN4vllm18act_and_mul_kernelIN3c108BFloat16E14__nv_bfloat162...
+It is ELF sm_120 with no PTX, so on sm_110 it can neither load nor JIT.
+csrc/libtorch_stable/torch_bindings.cpp:10 registers this object's ops under
+namespace _C, so torch.ops._C.silu_and_mul IS this object.
+
+## 3. The counter-argument is refuted: those norms never run through _C.
+
+The reason this attribution stayed open was that rms_norm_kernel sits in the
+same arch class (block 15 above), and the forward plainly got past
+post_attention_layernorm (qwen3_next.py:546) to reach the MLP at :554. If _C
+were uniformly imageless AND the norms called it, the run would have died in
+layer 0. It does not call it:
+
+$ python3 ir_dispatch_probe.py --vllm <pinned vllm 5559679229>
+qwen3_next.py: GemmaRMSNorm as Qwen3NextRMSNorm,
+layernorm.py: weight = self.weight.float() + 1.0
+vllm_c.py: exec'd rms_no_var_size, rms_add_no_var_size
+
+x.dtype=torch.bfloat16  weight.dtype=torch.float32
+vllm_c rms_norm            supports_args = False
+vllm_c fused_add_rms_norm  supports_args = False
+CONTROL, dtype-matched weight            = True
+
+VERDICT: vllm_c is INADMISSIBLE for every Qwen3.5 norm; ir.op.dispatch falls
+through to native, so no _C layernorm kernel is ever launched
+PROBE_RC=0
+
+Qwen3.5's norm is GemmaRMSNorm under an alias (qwen3_next.py:28), and
+GemmaRMSNorm widens its weight to f32 before calling the IR op
+(layernorm.py:157). vllm/kernels/vllm_c.py registers its rms_norm and
+fused_add_rms_norm impls with supports_args predicates that require
+weight.dtype == x.dtype, and vllm/ir/op.py:344-351 skips an impl whose
+supports_args is False and takes the next entry of the priority list, which the
+run's own logged kernel_config gives as ['vllm_c', 'native'].
+
+The rotary kernel is in the same position, and it constrains the crashing
+layer rather than being an input to the deduction: rotary_embedding_kernel is
+sm_120-only too, so had this been one of Qwen3-Next's FULL-attention layers it
+would have raised earlier. The crashing layer is therefore one of the
+linear-attention layers, which carry no rotary embedding at all.
+
+## CONCLUSION
+
+Of the three launches in the window, two are in an object that carries an
+sm_110 image and one is in an object that does not. The failing launch is
+torch.ops._C.silu_and_mul, at qwen2_moe.py:114, between the two GGUF
+projections. It is the FIRST vLLM _C kernel the forward reaches, which is why
+the model loads and 40-odd layers' worth of norms and GDN attention run first.
+
+This is a deduction from a complete enumeration of the window plus two offline
+measurements, not a direct observation. CUDA_LAUNCH_BLOCKING=1 on the box, or a
+cudaGetLastError after each launch, observes it directly and is still owed.
+It predicts that dgx:gpu0 does NOT hit this wall, because that box is sm_121a
+and the wheel's sm_120 SASS covers it -- and the wheel was built there and has
+generated text there before (/workspace/oracle-vllm/README-WHEELS.md). rc job
+7a45427e-ad86-4042-aeea-cdf8db535a54 is the run that reads that prediction out.
+
+It also says the wall is NOT about GGUF, the plugin or this checkpoint: it is
+the pinned vLLM wheel's own arch list, which is a build input.

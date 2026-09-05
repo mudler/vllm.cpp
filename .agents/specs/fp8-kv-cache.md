@@ -29,8 +29,8 @@ re-port).
   defaulted.
 - **Out (named later bricks):** fp8_e5m2 compute on either backend,
   per-attention-head scales, the Metal fp8-KV arm (refuses by name
-  — see `## W2` below), `--calculate-kv-scales` (upstream's deprecated dynamic
-  scale), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
+  — see `## W2` below), `--calculate-kv-scales` (upstream's dynamic scale, since
+  DELETED there by vllm#49389), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
   attention blocks W3 refuses rather than routes, and the vendor
   KV dtypes (`fp8_inc`, `fp8_ds_mla` — `QUANT-KV-FP8-VENDOR`) and turboquant /
   nvfp4 / per-token-head KV (`KV-NVFP4-TURBO`).
@@ -44,7 +44,12 @@ store/read kernels are vLLM's own csrc:
   `auto`/`fp8`/`fp8_e4m3`/`fp8_e5m2` (+ `fp8_inc`/`fp8_ds_mla`/`turboquant_*`/
   `int*_per_token_head`/`nvfp4`); `cache_dtype: CacheDType = "auto"`
   (`:76`, "if auto, use model dtype; fp8 == fp8_e4m3"); `calculate_kv_scales`
-  (`:99-104`, dynamic on-the-fly k/v scale when the checkpoint has none).
+  (dynamic on-the-fly k/v scale when the checkpoint has none). **That last one is
+  GONE upstream** — vllm#49389 `dd11df04f3` deleted the field, inside the advance
+  to the current pin `e126687a9a` (#2817). Its `:99-104` anchor was wrong even at
+  the prior pin, where the field sits at `:111` and `:99-104` is
+  `prefix_caching_hash_algo`'s docstring; it is dropped rather than re-numbered,
+  since there is nothing left to number.
   `is_quantized_kv_cache` (`vllm/utils/torch_utils.py`) = `cache_dtype != "auto"`.
 - **Scale handling.** `BaseKVCacheMethod` (`kv_cache.py:42`) adds `_k_scale`/
   `_v_scale`/`_q_scale`/`_prob_scale` to the Attention layer;
@@ -173,6 +178,7 @@ vendor/turbo/nvfp4 KV dtypes are separate rows.
 | W4 | memory-halving e2e on a gate model (the binding gate, DGX) | later |
 | W5 | fp8_e5m2 CPU+CUDA compute; per-attention-head scales | later |
 | W6 | ROCm fp8-e4m3 store + fp8 paged-attention read (parity vs W1) | DONE (code + gate landed + MEASURED on gfx1100 — see `## Outcome (W6 ROCm arm)`) |
+| W7 | `--kv-cache-dtype` on `vllm-bench` + the resolved dtype in the report header | DONE (code + CPU gate landed; see `## W7`) |
 
 ## W2 — the CUDA arm (#1593)
 
@@ -765,6 +771,139 @@ oracle (`VLLM_ORACLE`) is configured; the CPU kernels are the oracle, and
 upstream anchors are cited from the W2 spec section (already verified at
 pin `555967922`).
 
+## W7 — the benchmark harness flag (#2619)
+
+Issue: [#2619](https://github.com/mudler/vllm.cpp/issues/2619). Row: `KV-FP8`.
+
+### The gap
+
+`--kv-cache-dtype` reached the server in W3 and the C ABI plus `vllm-cli` at ABI
+v24. It never reached `vllm-bench`. `examples/bench/main.cpp` carried no such
+flag and `examples/bench/bench_core.h` never wrote
+`vllm::entrypoints::EngineParams::kv_cache_dtype`, so every number this
+repository publishes was measured on whatever KV dtype the checkpoint and the
+default resolved to, and the fp8 arm — landed, gated and reachable from three
+other entry points — was unmeasurable through the harness that produces the
+gate-#1 figures.
+
+That is the `## Shared seams` shape rather than a missing capability. Nothing
+here implements anything: W1 stores, W2 and W6 store on device, W3 sizes the
+blocks, and the resolution against the checkpoint already happens inside
+`LoadedEngine::FromModelDir`. W7 is plumbing plus one line of report.
+
+### What it does
+
+1. `BenchConfig::kv_cache_dtype` (default `"auto"`, byte-identical to the
+   previous behaviour) and a `--kv-cache-dtype` arm in `ParseArgs`, mirroring
+   `src/vllm/entrypoints/openai/server_main.cpp:515-516` and
+   `examples/cli/main.cpp:142-143` verbatim: the same accepted set, the same
+   pass-through of the raw string, and the same refusal for an unknown name.
+   The bench adds NO validation of its own. `vllm::v1::ParseCacheDType` is the
+   one place a `CacheDType` name is accepted or refused, and a second spelling
+   of that list in a benchmark client is exactly the drift the seam exists to
+   stop.
+2. The pass-through, on BOTH engine constructions in `RunBench` — the real
+   checkpoint path and the synthetic CPU engine. The synthetic arm matters for
+   more than symmetry: it is what makes the gate hermetic. The synthetic model
+   is a Qwen3.5-MoE, whose attention block W3 routed, so a `--kv-cache-dtype
+   fp8` bench run allocates 1-byte pages and decodes through them with no
+   checkpoint and no device.
+3. The REPORT names the KV dtype. Two lines, and they are deliberately not the
+   same line:
+   - `KV cache dtype (requested):` is the string the operator typed.
+   - `KV cache dtype (resolved storage):` is read back out of
+     `LoadedEngine::kv_cache_config()`, i.e. out of the attention spec the
+     loader actually sized blocks from.
+
+   The second is the load-bearing one. A checkpoint that declares
+   `kv_cache_quant_algo` gets an fp8 cache when the operator typed nothing at
+   all, so a report that echoed only the flag would print `auto` over an fp8
+   measurement. Reading the spec back also means the line cannot drift from the
+   allocation: it IS the allocation.
+
+### Gate
+
+`tests/examples/test_bench_kv_cache_dtype.cpp`, entering through the built
+`vllm-bench` binary's own command line — the `$<TARGET_FILE:...>` +
+`SKIP_RETURN_CODE 77` idiom `test_cli_offload_config` and
+`test_cli_kv_cache_dtype` established, for the reason
+[`.agents/reachability.md`](../reachability.md) gives: `test_kv_cache_fp8_wiring`
+already drives `EngineParams::kv_cache_dtype` through `LoadedEngine`, so a test
+that constructed a `BenchConfig` here would re-prove W3 and would have passed on
+every day the flag did not exist.
+
+The cases are a polarity pair plus the refusal:
+
+| Case | Command | Asserts |
+|---|---|---|
+| G1 | `--kv-cache-dtype fp8` on the synthetic engine | the run succeeds AND the report's resolved line names `fp8_e4m3` over 1-byte pages |
+| G2 | no flag (the default) | the same report line names `bf16`, and does NOT name fp8 |
+| G3 | `--kv-cache-dtype nvfp4` | non-zero exit, and the message names `nvfp4` and comes from `ParseCacheDType` |
+| G4 | `--kv-cache-dtype fp8_e5m2` | non-zero exit — the name PARSES but no attention block writes it, and the bench must not present that as a measurable arm |
+
+| G5 | `--model <dir with only hf_quant_config.json>`, with and without the flag | the `--model` arm: the loader's "the checkpoint declares kv_cache_quant_algo" line is PRESENT with no flag and ABSENT with one |
+
+G2 is what makes G1 mean anything. A resolved line hard-coded to `fp8`, or a
+pass-through deleted so the flag is parsed and dropped, is caught by exactly one
+of the two.
+
+**G5 exists because G1-G4 measured only half the change.** G1-G4 drive the
+SYNTHETIC engine, whose `EngineParams` go to a direct `LoadedEngine`
+constructor. Deleting the pass-through on the OTHER branch -- the `--model`
+one, which is the arm every published number is actually measured on -- left
+all of them green (mutation M6, MEASURED as a survivor before G5 existed and
+red after it). G5 closes it without a checkpoint by the same route
+`tests/vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp` uses: a directory
+carrying only `hf_quant_config.json` makes `FromModelDir` print the line naming
+the checkpoint as the decider and then fail on the absent weights, and an
+explicit flag suppresses that line because the checkpoint is never consulted
+(`torch_utils.py:380-381`). A dropped flag would leave "auto" in the resolver
+and the line would appear in both cases.
+
+### Measured
+
+`tests/examples/test_bench_kv_cache_dtype.cpp` 9/9 cases, 47/47 assertions,
+exit 0, CPU Release `-Werror`, on `47f4ca636`. RED-FIRST: built against the
+pre-change `examples/bench/` it is 7/7 cases FAILED, 13/31 assertions failed.
+Sibling `test_bench` 11/11, 80/80 unchanged. Six mutations, each one restored
+byte-for-byte: M1 the synthetic pass-through, M2 the `ParseArgs` arm, M3 a
+hard-coded resolved line, M4 the `ParseCacheDType` refusal, M5 both report
+lines, M6 the `--model` pass-through -- all RED after G5.
+
+No fp8 KV run on a device. This change makes the arm SELECTABLE and makes the
+report state it; whether an fp8 KV bench run produces correct output on a real
+checkpoint is `## W4`'s gate and still needs a GPU.
+
+### Not in scope
+
+The nvfp4 KV arm (`KV-NVFP4-TURBO`, [#2620](https://github.com/mudler/vllm.cpp/issues/2620)),
+an fp8 bench RUN on a device, and any change to the accepted-name set.
+
+### A record correction, made here because this change is what found it
+
+[#2620](https://github.com/mudler/vllm.cpp/issues/2620) is filed on the premise
+that `include/vllm/v1/kv_cache_dtype.h:39-41` names an owner row
+`KV-NVFP4-TURBO` that "does not exist in any matrix", and it quotes `git grep
+KV-NVFP4-TURBO -- .agents/*-matrix.md` returning nothing. **The tree falsifies
+that.** At `637d75f16` the command returns
+[`.agents/engine-matrix.md`](../engine-matrix.md) line 106:
+
+```text
+| `KV-NVFP4-TURBO` | NVFP4, per-token-head, and TurboQuant KV | T2 | `vllm/config/cache.py:14,28-35,272` | - | - | `planned: specs/nvfp4-kv-cache.md` | `INVENTORIED` | - |
+```
+
+The row exists, it is `INVENTORIED`, and its planned spec is
+`specs/nvfp4-kv-cache.md`. The header comment was accurate the whole time, so
+there is nothing to repair in code and no new row to create. Creating a second
+row, or adding an `## Owed` bullet here for a member another row already owns,
+would have produced the duplicate ownership the records section exists to
+prevent — and would have written a shared matrix file for no gain.
+
+The correct and complete fix is on the issue: its `Row:` line becomes
+`KV-NVFP4-TURBO`. The nvfp4 KV arm stays unimplemented and stays owned, which
+is the state AGENTS.md asks for. `#2620` remains OPEN under that row; this
+change does not close it.
+
 ## Owed
 
 - **The W2 device gates are UNEXECUTED** (#1593). `tests/vt/test_cuda_fp8_kv_cache.cpp`
@@ -822,6 +961,12 @@ pin `555967922`).
   for an fp8 KV cache today unless the CHECKPOINT declares one, which the loader
   does honour on every path including that one. The ABI field, its version bump
   and its `test_capi` case are owed here.
+  **RESOLVED 2026-09 by `724b6bdd0` (ABI v24).** `vllm_model_params.kv_cache_dtype`
+  is a `const char*` on the ABI, `vllm_engine_load` maps it to
+  `EngineParams::kv_cache_dtype`, and `vllm-cli` takes the flag. This bullet is
+  kept rather than deleted because it names the shape the gap had. `vllm-bench`
+  was the one entry point the ABI bump did not carry with it, and `## W7` closed
+  that ([#2619](https://github.com/mudler/vllm.cpp/issues/2619)).
 - **W3: 16 architectures are refused rather than routed, at 17 call sites**
   (#1593). W3 routes the shared seam `dense_attn::AttnBlock` and
   `src/vllm/model_executor/models/qwen3_5.cpp`. The other direct
@@ -901,9 +1046,12 @@ pin `555967922`).
   per-layer scale-tensor read, and a per-layer (rather than per-engine) scale on
   `AttentionSpec`, are owed.
 - **W3: `--calculate-kv-scales` is refused, not implemented** (#1593). Upstream's
-  dynamic on-the-fly scale (`config/cache.py:111`) is deprecated there for
-  removal in v0.19; `ResolveKvCacheScales` refuses it BY NAME rather than
-  silently taking the static arm, and no flag exposes it.
+  dynamic on-the-fly scale was `config/cache.py:111` at the prior pin
+  `555967922`, deprecated there for removal in v0.19; vllm#49389 `dd11df04f3`
+  then DELETED it, and that commit is inside the advance to the current pin
+  `e126687a9a` (#2817), so no such key exists upstream now.
+  `ResolveKvCacheScales` still takes the parameter and refuses it BY NAME rather
+  than silently taking the static arm, and no flag exposes it.
 - **W3: an fp8 KV cache is served by the SLOW attention kernels only** (#1593).
   `fa2_prefill` and `fa2_decode` in `src/vllm/model_executor/models/qwen3_5.cpp`
   both require `kv.dtype == DType::kBF16`, and

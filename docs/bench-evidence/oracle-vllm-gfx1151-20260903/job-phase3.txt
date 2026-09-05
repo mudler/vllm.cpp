@@ -1,0 +1,324 @@
+
+===== 0. identity =====
+2026-09-03T10:44:10Z
+hostname=rc-worker-lcjhd boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+RC_JOB_ID=b2a8d0e1-67ea-4275-bb5a-7006bd1d06aa RC_DEVICE=strix:gpu0
+HSA_OVERRIDE_GFX_VERSION=UNSET  <- must be UNSET
+inherited_env NONE
+               total        used        free      shared  buff/cache   available
+Mem:              62           3           2           0          57          58
+overlay         1.9T  601G  1.2T  34% /
+WARNING 09-03 10:44:11 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+VLLM 0.26.0.dev0+g5559679229 /tmp/vllm-gfx1151-2740/vllm-pin/vllm/__init__.py
+TORCH 2.13.0+rocm7.2 hip 7.2.53211
+ARCH gfx1151
+PHASE2_ARTIFACT_OK
+
+===== 0a. torchvision must be the ROCm build, or transformers cannot be imported =====
+2026-09-03T10:44:14Z
+torchvision_present = True
+    Found existing installation: torchvision 0.28.0
+    Uninstalling torchvision-0.28.0:
+      Successfully uninstalled torchvision-0.28.0
+Successfully installed torchvision-0.29.0+rocm7.2
+pip_torchvision_rc=0
+TORCHVISION = 0.29.0+rocm7.2 against torch 2.13.0+rocm7.2
+TORCHVISION_OPS=OK
+torchvision_rc=0
+
+===== 0b. amdsmi -- vLLM RESOLVES ITS PLATFORM THROUGH IT =====
+2026-09-03T10:44:18Z
+AMDSMI_HANDLES = 1
+WARNING 09-03 10:44:19 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+CURRENT_PLATFORM = RocmPlatform
+DEVICE_NAME      = AMD_Radeon_8060S
+DEVICE_CAP       = DeviceCapability(major=11, minor=5)
+ON_GFX1151 = True  ON_GFX1X = True
+PLATFORM_RESOLVES=RocmPlatform
+platform_rc=0
+
+===== 0c. the compiled extensions, probed correctly this time =====
+2026-09-03T10:44:21Z
+WARNING 09-03 10:44:22 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+Traceback (most recent call last):
+  File "/workspace/vllm-gfx1151-2740/probe_ext.py", line 18, in <module>
+    ops.silu_and_mul(o2, y)
+    ^^^^^^^^^^^^^^^^
+AttributeError: module 'vllm._custom_ops' has no attribute 'silu_and_mul'
+EXT vllm._C                        LOADED
+EXT vllm._rocm_C                   LOADED
+EXT vllm._C_stable_libtorch        LOADED
+EXT vllm._moe_C_stable_libtorch    LOADED
+CUSTOM_OP rms_norm    max_abs_err = 0.015288829803466797
+CUSTOM_OPS=FAIL
+customop_rc=0
+
+===== 0d. does the ARCHITECTURE resolve, now that the platform does? =====
+2026-09-03T10:44:25Z
+WARNING 09-03 10:44:26 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+Traceback (most recent call last):
+  File "/workspace/vllm-gfx1151-2740/probe_registry.py", line 3, in <module>
+    print("is_text_generation_model =", ModelRegistry.is_text_generation_model([arch]))
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: _ModelRegistry.is_text_generation_model() missing 1 required positional argument: 'model_config'
+registry_rc=1
+
+===== 1. python3-dev -- Triton's AMD driver COMPILES hip_utils.c at import time =====
+2026-09-03T10:44:31Z
+-rw-r--r-- 1 root root 2854 Jul 15 23:46 /usr/include/python3.12/Python.h
+triton.__version__ = 3.8.0
+TRITON_JIT_ON_GFX1151 = PASS
+triton_probe_rc=0
+
+===== 2. inputs exist -- a missing one is an ABSENCE, never a result =====
+2026-09-03T10:44:33Z
+PRESENT /workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf
+PRESENT /workspace/ckpt/qwen38-27b-q4km/config.json
+PRESENT /workspace/ggufplugin/mmproj-BF16.gguf
+PRESENT /workspace/ckpt/qwen3.8-27b-hf/tokenizer_config.json
+PRESENT /workspace/vllm-gfx1151-2740/ggufplugin-src.tar.gz
+PRESENT /workspace/vllm-gfx1151-2740/gen_rocm.py
+GGUF_BYTES=17106775008 EXPECTED=17106775008
+hashing the GGUF on the worker (17 GB, a few minutes)
+7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169  /workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf
+GGUF_SHA_OK
+PLUGIN_TGZ_OK (git-archive of d4c1f0d082fc7cd4350da56689109a01c1f29d6c; the sha256 is what binds it)
+
+===== 3. build the GGUF plugin FOR gfx1151 =====
+2026-09-03T10:50:17Z
+dequantize.cuh
+ggml-common.h
+gguf_kernel.cu
+mmq.cuh
+mmvq.cuh
+moe.cuh
+moe_vec.cuh
+vecdotq.cuh
+32:    is_rocm = getattr(torch.version, "hip", None) is not None
+40:    if not is_rocm:
+PYTORCH_ROCM_ARCH=gfx1151 MAX_JOBS=4
+PLUGIN_BUILD_RC=0
+Processing ./.
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: vllm-gguf-plugin
+  Building wheel for vllm-gguf-plugin (pyproject.toml): started
+  Building wheel for vllm-gguf-plugin (pyproject.toml): still running...
+  Building wheel for vllm-gguf-plugin (pyproject.toml): finished with status 'done'
+  Created wheel for vllm-gguf-plugin: filename=vllm_gguf_plugin-0.0.5-cp310-abi3-linux_x86_64.whl size=2081214 sha256=432c21abe80bec2a8156e1c4883d9ac848dfdd8c1bf00ca6acc75b9ac230c615
+  Stored in directory: /tmp/pip-ephem-wheel-cache-l3t05a9u/wheels/b4/bd/b6/b593ea0d89de34a045852127dcaede3a1a7fa5256bf0dccf83
+Successfully built vllm-gguf-plugin
+total 2036
+-rw-r--r-- 1 root root 2081214 Sep  3 10:52 vllm_gguf_plugin-0.0.5-cp310-abi3-linux_x86_64.whl
+432c21abe80bec2a8156e1c4883d9ac848dfdd8c1bf00ca6acc75b9ac230c615  /workspace/vllm-gfx1151-2740/out/rc-worker-lcjhd-20260903T104410Z/vllm_gguf_plugin-0.0.5-cp310-abi3-linux_x86_64.whl
+
+===== 4. install the plugin AND its declared dependencies =====
+2026-09-03T10:52:24Z
+deps_rc=0
+    Found existing installation: vllm-gguf-plugin 0.0.5
+    Uninstalling vllm-gguf-plugin-0.0.5:
+      Successfully uninstalled vllm-gguf-plugin-0.0.5
+Successfully installed vllm-gguf-plugin-0.0.5
+plugin_install_rc=0
+INSTALLED_SO=WARNING 09-03 10:52:27 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+WARNING 09-03 10:52:35 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+PLUGIN_FILE = /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py
+GENERAL_PLUGIN_ENTRY_POINTS = [('quark_online_quant', 'quark.online_quantization.vllm.plugin:register'), ('gguf', 'vllm_gguf_plugin:register'), ('lora_filesystem_resolver', 'vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver'), ('lora_hf_hub_resolver', 'vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver')]
+REGISTRATION OK
+registration_rc=0
+
+===== 5. GENERATION (watchdogged: this fleet has OOM-REBOOTED) =====
+2026-09-03T10:52:39Z
+
+--- LEG gguf-eager ---
+2026-09-03T10:52:39Z
+GEN_RC[gguf-eager]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+TORCH        = 2.13.0+rocm7.2 hip 7.2.53211
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PLUGIN_C_EXT = /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+PROMPT_LENS          = [6, 5, 6, 7, 11, 7]
+PROMPT_IDS_MATCH_ORACLE = True
+ENGINE_UP
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_TEXT[0] = ' Paris.\nThe capital city of Germany is Berlin.\nThe capital city of Italy is Rome.\nThe capital city of Spain is Madrid.\nThe capital city of Portugal is Lisbon.\nThe capital city of Greece is Athens.\n'
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_TEXT[1] = ' red, blue, and yellow. These colors are considered primary because they cannot be created by mixing other colors together. Instead, they are used to create all other colors.\nWhen you mix red and blue, you get purple. When you'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 25, 271, 64]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as:\n\na'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 19820, 4593, 557, 91580, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 6165, 1452, 9877, 5518, 318, 1123, 8, 8307, 557, 10345, 13, 733, 220, 16, 24, 22, 17, 11, 279, 1118, 19861]
+GEN_TEXT[4] = ' the moon, and in 1970, the first artificial heart was implanted. In 1971, the first computerized tomography (CT) scan was performed. In 1972, the first laser'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-eager.json
+DONE_MARKER_VLLM_GFX1151_GEN
+--- tail of LEG gguf-eager, in case it died ---
+(EngineCore pid=382801) WARNING 09-03 11:03:53 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=382801) WARNING 09-03 11:03:53 [chunked_prefill_paged_decode.py:419] Cannot use ROCm custom paged attention kernel, falling back to Triton implementation.
+(EngineCore pid=382801) WARNING 09-03 11:03:54 [jit_monitor.py:135] Triton kernel JIT compilation during inference: kernel_paged_attention_2d. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=382801) WARNING 09-03 11:03:54 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _causal_conv1d_update_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=382801) WARNING 09-03 11:03:54 [jit_monitor.py:135] Triton kernel JIT compilation during inference: fused_recurrent_gated_delta_rule_packed_decode_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+Processed prompts:  17%|█▋        | 1/6 [00:11<00:59, 11.91s/it, est. speed input: 0.50 toks/s, output: 4.03 toks/s]Processed prompts:  33%|███▎      | 2/6 [00:20<00:40, 10.10s/it, est. speed input: 0.53 toks/s, output: 4.63 toks/s]Processed prompts:  50%|█████     | 3/6 [00:29<00:28,  9.55s/it, est. speed input: 0.57 toks/s, output: 4.86 toks/s]Processed prompts:  67%|██████▋   | 4/6 [00:39<00:19,  9.61s/it, est. speed input: 0.61 toks/s, output: 4.88 toks/s]Processed prompts:  83%|████████▎ | 5/6 [00:49<00:09,  9.64s/it, est. speed input: 0.71 toks/s, output: 4.90 toks/s]Processed prompts: 100%|██████████| 6/6 [00:58<00:00,  9.65s/it, est. speed input: 0.72 toks/s, output: 4.91 toks/s]Processed prompts: 100%|██████████| 6/6 [00:58<00:00,  9.65s/it, est. speed input: 0.72 toks/s, output: 4.91 toks/s]Processed prompts: 100%|██████████| 6/6 [00:58<00:00,  9.78s/it, est. speed input: 0.72 toks/s, output: 4.91 toks/s]
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_TEXT[0] = ' Paris.\nThe capital city of Germany is Berlin.\nThe capital city of Italy is Rome.\nThe capital city of Spain is Madrid.\nThe capital city of Portugal is Lisbon.\nThe capital city of Greece is Athens.\n'
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_TEXT[1] = ' red, blue, and yellow. These colors are considered primary because they cannot be created by mixing other colors together. Instead, they are used to create all other colors.\nWhen you mix red and blue, you get purple. When you'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 25, 271, 64]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as:\n\na'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 19820, 4593, 557, 91580, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 6165, 1452, 9877, 5518, 318, 1123, 8, 8307, 557, 10345, 13, 733, 220, 16, 24, 22, 17, 11, 279, 1118, 19861]
+GEN_TEXT[4] = ' the moon, and in 1970, the first artificial heart was implanted. In 1971, the first computerized tomography (CT) scan was performed. In 1972, the first laser'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-eager.json
+DONE_MARKER_VLLM_GFX1151_GEN
+(EngineCore pid=382801) INFO 09-03 11:04:49 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=382801) INFO 09-03 11:04:49 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=382801) INFO 09-03 11:04:49 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=382801) INFO 09-03 11:04:49 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+
+--- LEG gguf-eager-2 ---
+2026-09-03T11:04:56Z
+GEN_RC[gguf-eager-2]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+TORCH        = 2.13.0+rocm7.2 hip 7.2.53211
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PLUGIN_C_EXT = /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+PROMPT_LENS          = [6, 5, 6, 7, 11, 7]
+PROMPT_IDS_MATCH_ORACLE = True
+ENGINE_UP
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_TEXT[0] = ' Paris.\nThe capital city of Germany is Berlin.\nThe capital city of Italy is Rome.\nThe capital city of Spain is Madrid.\nThe capital city of Portugal is Lisbon.\nThe capital city of Greece is Athens.\n'
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_TEXT[1] = ' red, blue, and yellow. These colors are considered primary because they cannot be created by mixing other colors together. Instead, they are used to create all other colors.\nWhen you mix red and blue, you get purple. When you'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 25, 271, 64]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as:\n\na'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 19820, 4593, 557, 91580, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 6165, 1452, 9877, 5518, 318, 1123, 8, 8307, 557, 10345, 13, 733, 220, 16, 24, 22, 17, 11, 279, 1118, 19861]
+GEN_TEXT[4] = ' the moon, and in 1970, the first artificial heart was implanted. In 1971, the first computerized tomography (CT) scan was performed. In 1972, the first laser'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-eager-2.json
+DONE_MARKER_VLLM_GFX1151_GEN
+--- tail of LEG gguf-eager-2, in case it died ---
+(EngineCore pid=384277) WARNING 09-03 11:16:36 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=384277) WARNING 09-03 11:16:36 [chunked_prefill_paged_decode.py:419] Cannot use ROCm custom paged attention kernel, falling back to Triton implementation.
+(EngineCore pid=384277) WARNING 09-03 11:16:36 [jit_monitor.py:135] Triton kernel JIT compilation during inference: kernel_paged_attention_2d. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=384277) WARNING 09-03 11:16:36 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _causal_conv1d_update_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=384277) WARNING 09-03 11:16:36 [jit_monitor.py:135] Triton kernel JIT compilation during inference: fused_recurrent_gated_delta_rule_packed_decode_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+Processed prompts:  17%|█▋        | 1/6 [00:08<00:43,  8.79s/it, est. speed input: 0.68 toks/s, output: 5.46 toks/s]Processed prompts:  33%|███▎      | 2/6 [00:17<00:35,  8.76s/it, est. speed input: 0.63 toks/s, output: 5.47 toks/s]Processed prompts:  50%|█████     | 3/6 [00:26<00:26,  8.75s/it, est. speed input: 0.65 toks/s, output: 5.48 toks/s]Processed prompts:  67%|██████▋   | 4/6 [00:35<00:18,  9.02s/it, est. speed input: 0.67 toks/s, output: 5.38 toks/s]Processed prompts:  83%|████████▎ | 5/6 [00:45<00:09,  9.16s/it, est. speed input: 0.78 toks/s, output: 5.32 toks/s]Processed prompts: 100%|██████████| 6/6 [00:54<00:00,  9.22s/it, est. speed input: 0.77 toks/s, output: 5.29 toks/s]Processed prompts: 100%|██████████| 6/6 [00:54<00:00,  9.22s/it, est. speed input: 0.77 toks/s, output: 5.29 toks/s]Processed prompts: 100%|██████████| 6/6 [00:54<00:00,  9.08s/it, est. speed input: 0.77 toks/s, output: 5.29 toks/s]
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_TEXT[0] = ' Paris.\nThe capital city of Germany is Berlin.\nThe capital city of Italy is Rome.\nThe capital city of Spain is Madrid.\nThe capital city of Portugal is Lisbon.\nThe capital city of Greece is Athens.\n'
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_TEXT[1] = ' red, blue, and yellow. These colors are considered primary because they cannot be created by mixing other colors together. Instead, they are used to create all other colors.\nWhen you mix red and blue, you get purple. When you'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 25, 271, 64]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as:\n\na'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 19820, 4593, 557, 91580, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 6165, 1452, 9877, 5518, 318, 1123, 8, 8307, 557, 10345, 13, 733, 220, 16, 24, 22, 17, 11, 279, 1118, 19861]
+GEN_TEXT[4] = ' the moon, and in 1970, the first artificial heart was implanted. In 1971, the first computerized tomography (CT) scan was performed. In 1972, the first laser'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-eager-2.json
+DONE_MARKER_VLLM_GFX1151_GEN
+(EngineCore pid=384277) INFO 09-03 11:17:31 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=384277) INFO 09-03 11:17:31 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=384277) INFO 09-03 11:17:31 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=384277) INFO 09-03 11:17:31 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+
+--- LEG gguf-compiled ---
+2026-09-03T11:17:37Z
+GEN_RC[gguf-compiled]=0
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+TORCH        = 2.13.0+rocm7.2 hip 7.2.53211
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PLUGIN_C_EXT = /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+PROMPT_LENS          = [6, 5, 6, 7, 11, 7]
+PROMPT_IDS_MATCH_ORACLE = True
+ENGINE_UP
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_TEXT[0] = ' Paris.\nThe capital city of Germany is Berlin.\nThe capital city of Italy is Rome.\nThe capital city of Spain is Madrid.\nThe capital city of Portugal is Lisbon.\nThe capital city of Greece is Athens.\n'
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_TEXT[1] = ' red, blue, and yellow. These colors are considered primary because they cannot be created by mixing other colors together. Instead, they are used to create all other colors.\nWhen you mix red and blue, you get purple. When you'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 393, 64, 61]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as $a^'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 6165, 8380, 557, 34319, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 7752, 28513, 557, 3354, 11, 321, 303, 220, 16, 24, 22, 17, 11, 279, 1118, 2678, 1746, 2263, 557, 5698, 13]
+GEN_TEXT[4] = ' the moon, and in 1970, the first computer mouse was invented. In 1971, the first microprocessor was created, and in 1972, the first video game console was released.'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-compiled.json
+DONE_MARKER_VLLM_GFX1151_GEN
+--- tail of LEG gguf-compiled, in case it died ---
+ENGINE_UP
+Rendering prompts:   0%|          | 0/6 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 6/6 [00:00<00:00, 205.73it/s]
+Processed prompts:   0%|          | 0/6 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=385822) WARNING 09-03 11:31:20 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=385822) WARNING 09-03 11:31:22 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+Processed prompts:  17%|█▋        | 1/6 [00:09<00:49,  9.96s/it, est. speed input: 0.60 toks/s, output: 4.82 toks/s]Processed prompts:  33%|███▎      | 2/6 [00:18<00:35,  8.84s/it, est. speed input: 0.61 toks/s, output: 5.33 toks/s]Processed prompts:  50%|█████     | 3/6 [00:26<00:25,  8.48s/it, est. speed input: 0.65 toks/s, output: 5.52 toks/s]Processed prompts:  67%|██████▋   | 4/6 [00:34<00:17,  8.61s/it, est. speed input: 0.69 toks/s, output: 5.51 toks/s]Processed prompts:  83%|████████▎ | 5/6 [00:43<00:08,  8.68s/it, est. speed input: 0.80 toks/s, output: 5.50 toks/s]Processed prompts: 100%|██████████| 6/6 [00:52<00:00,  8.72s/it, est. speed input: 0.80 toks/s, output: 5.49 toks/s]Processed prompts: 100%|██████████| 6/6 [00:52<00:00,  8.72s/it, est. speed input: 0.80 toks/s, output: 5.49 toks/s]Processed prompts: 100%|██████████| 6/6 [00:52<00:00,  8.75s/it, est. speed input: 0.80 toks/s, output: 5.49 toks/s]
+GEN_IDS[0] = [11751, 13, 198, 760, 6511, 3177, 314, 9564, 369, 19241, 13, 198, 760, 6511, 3177, 314, 14898, 369, 21047, 13, 198, 760, 6511, 3177, 314, 17163, 369, 23327, 13, 198, 760, 6511, 3177, 314, 32208, 369, 77916, 13, 198, 760, 6511, 3177, 314, 23655, 369, 44299, 13, 198]
+GEN_TEXT[0] = ' Paris.\nThe capital city of Germany is Berlin.\nThe capital city of Italy is Rome.\nThe capital city of Spain is Madrid.\nThe capital city of Portugal is Lisbon.\nThe capital city of Greece is Athens.\n'
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 4350, 488, 6311, 2438, 321, 6105, 11, 488, 615, 24142, 13, 3095, 488]
+GEN_TEXT[1] = ' red, blue, and yellow. These colors are considered primary because they cannot be created by mixing other colors together. Instead, they are used to create all other colors.\nWhen you mix red and blue, you get purple. When you'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 11995, 59275, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 1206, 5335, 264, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 279, 2614, 14377, 369, 1429, 25, 271, 13682, 198, 56498, 283, 1088, 2282, 7]
+GEN_TEXT[2] = ' 100 degrees Celsius. What is this temperature in degrees Fahrenheit?\n\nTo convert a temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), the following formula is used:\n\n$$\n°F = \\left('
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 393, 64, 61]
+GEN_TEXT[3] = ' in a right triangle, the square of the length of the hypotenuse (the side opposite the right angle) is equal to the sum of the squares of the lengths of the other two sides. This relationship is expressed as $a^'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 321, 303, 220, 16, 24, 22, 15, 11, 279, 1118, 6165, 8380, 557, 34319, 13, 733, 220, 16, 24, 22, 16, 11, 279, 1118, 7752, 28513, 557, 3354, 11, 321, 303, 220, 16, 24, 22, 17, 11, 279, 1118, 2678, 1746, 2263, 557, 5698, 13]
+GEN_TEXT[4] = ' the moon, and in 1970, the first computer mouse was invented. In 1971, the first microprocessor was created, and in 1972, the first video game console was released.'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. Using this definition, determine whether 1,000,000,000,000,000,00'
+GEN_LEN[5] = 48
+WROTE /tmp/vllm-gfx1151-2740/tokens-gguf-compiled.json
+DONE_MARKER_VLLM_GFX1151_GEN
+(EngineCore pid=385822) INFO 09-03 11:32:12 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=385822) INFO 09-03 11:32:12 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=385822) INFO 09-03 11:32:12 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=385822) INFO 09-03 11:32:12 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+WARNING 09-03 11:32:17 [utils.py:626] [shutdown] Process manager: force killing remaining processes count=1
+
+--- LEG gguf-compiled ---
+2026-09-03T11:32:20Z

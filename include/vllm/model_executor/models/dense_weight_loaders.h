@@ -404,9 +404,21 @@ inline OwnedTensor LoadBf16Transposed(const TensorResolver& get,
 // output rows, preserving the exact listed order and setting `nk=true` for
 // vt::MatmulBT (the cuBLASLt TN fast path). This is vLLM's physical ownership
 // rule for MergedColumnParallelLinear/QKVParallelLinear (one merged param).
+//
+// MODEL-QWEN35-GDN-EXL3 (#2495 item 4): `allow_f16` is OPT-IN and scoped to an
+// EXL3 load, the same polarity `LoadModelVectorForScheme` uses for the same
+// reason. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` stores `linear_attn.in_proj_a` and
+// `linear_attn.in_proj_b` at F16 -- exllamav3 keeps the unquantized linear
+// remainder at fp16 because it runs the linear in fp16 -- while storing
+// `conv1d`, `norm`, `A_log` and `dt_bias` beside them at BF16. Without this the
+// EXL3 GDN tower is refused a second time, on a tensor that is not quantized at
+// all. Teaching this loader F16 UNCONDITIONALLY would widen acceptance for every
+// dense model through a conversion that drops three mantissa bits, which is the
+// argument `LoadF16AsBf16Direct` already makes at its own declaration.
 inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
                                        const std::vector<std::string>& names,
-                                       const TensorParallel* tp = nullptr) {
+                                       const TensorParallel* tp = nullptr,
+                                       bool allow_f16 = false) {
   VT_CHECK(!names.empty(),
            "dense loader: merged BF16 projection requires at least one shard");
   int64_t in_dim = -1;
@@ -420,9 +432,11 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     // in_proj_qkv F8_E4M3 [10240,5120] + scalar weight_scale/input_scale). The
     // shard is materialized to BF16 below so the merge, the TP row split and the
     // nk=true MatmulBT orientation stay exactly as they were for a BF16 shard.
-    VT_CHECK(tensor.dtype == "BF16" || tensor.dtype == "F8_E4M3",
+    VT_CHECK(tensor.dtype == "BF16" || tensor.dtype == "F8_E4M3" ||
+                 (allow_f16 && tensor.dtype == "F16"),
              "dense loader: unsupported dtype '" + tensor.dtype + "' for " + name +
-                 "; supported: BF16, F8_E4M3 (+ <name>_scale)");
+                 "; supported: BF16, F8_E4M3 (+ <name>_scale)" +
+                 (allow_f16 ? ", F16" : ""));
     VT_CHECK(tensor.shape.size() == 2,
              "dense loader: expected 2-D weight for " + name);
     VT_CHECK(tensor.shape[0] > 0 && tensor.shape[1] > 0,
@@ -472,6 +486,23 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     }
     const int64_t rows = shard.shape[0];
     const int64_t cols = shard.shape[1];
+    // MODEL-QWEN35-GDN-EXL3: the F16 shard is CONVERTED, never reinterpreted.
+    // The two formats share a width and nothing else, so a byte copy would read
+    // an exponent field as a mantissa and produce a correctly shaped, entirely
+    // wrong weight.
+    if (shard.dtype == "F16") {
+      staged[i].resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+      const auto* src = static_cast<const uint8_t*>(shard.data);
+      for (size_t e = 0; e < staged[i].size(); ++e) {
+        uint16_t half = 0;
+        std::memcpy(&half, src + e * 2, 2);
+        staged[i][e] = vt::F32ToBF16(vt::F16ToF32(half));
+      }
+      MaybeReleaseSourcePages(shard.data, shard.nbytes);
+      src_ptr[i] = reinterpret_cast<const uint8_t*>(staged[i].data());
+      src_bytes[i] = staged[i].size() * sizeof(uint16_t);
+      continue;
+    }
     const StTensor& sc = get(names[i] + "_scale");
     const int64_t n_scale =
         static_cast<int64_t>(sc.nbytes) / (sc.dtype == "BF16" ? 2 : 4);
@@ -722,17 +753,18 @@ inline Exl3Weight LoadExl3(const TensorResolver& get,
   VT_CHECK(!(has_mcg && has_mul1),
            "dense loader: " + proj + " carries BOTH an mcg and a mul1 marker, which "
            "selects two codebooks at once (QUANT-EXL3, #2181)");
-  VT_CHECK(!has_mul1,
-           "dense loader: " + proj +
-               " selects exllamav3's `mul1` codebook (cb 2), upstream's dp4a "
-               "byte-sum variant, which this tree does not implement "
-               "(QUANT-EXL3, #2181). It is REFUSED rather than decoded as another "
-               "codebook, because the wrong multiplier yields a correctly "
-               "distributed and completely wrong weight.");
   if (has_mcg) {
     const StTensor& mcg = get(proj + ".mcg");
     VT_CHECK(mcg.dtype == "I32",
              "dense loader: expected I32 mcg marker for " + proj + ", got " + mcg.dtype);
+  }
+  if (has_mul1) {
+    // `quantize.py:1421-1424` writes it as
+    // `torch.tensor(0x83DCD12D, uint32).view(torch.int)` -- one I32 holding the
+    // codebook's own multiplier -- exactly as it writes `mcg`.
+    const StTensor& mul1 = get(proj + ".mul1");
+    VT_CHECK(mul1.dtype == "I32",
+             "dense loader: expected I32 mul1 marker for " + proj + ", got " + mul1.dtype);
   }
   VT_CHECK(!has(proj + ".had"),
            "dense loader: " + proj +
@@ -745,7 +777,18 @@ inline Exl3Weight LoadExl3(const TensorResolver& get,
            "dense loader: " + proj +
                " carries packed `su`/`sv` sign vectors, which this reader does not "
                "unpack (QUANT-EXL3, #2181)");
-  r.codebook = has_mcg ? 1 : 0;
+  // The three-way form of the SAME presence rule. `LinearEXL3` sets `self.mcg`
+  // and `self.mul1` from two independent tensor lookups and passes both booleans
+  // to `ext.reconstruct` (`exl3.py:74-77,197,223`); with both false the codebook
+  // is 0. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` marks every quantized linear
+  // `mul1` and is cb 2 (QUANT-EXL3-MUL1, #2495).
+  //
+  // A `mul1` marker was REFUSED here until cb 2 was ported, and the refusal was
+  // right for as long as it stood: the wrong multiplier yields a correctly
+  // distributed and completely wrong weight, which no shape check can see.
+  // Lifting it is safe now only because `Exl3DecodeCodeword(cw, 2)` implements
+  // upstream's byte-sum decode and is gated against hand-computed values.
+  r.codebook = has_mul1 ? 2 : (has_mcg ? 1 : 0);
 
   // ENG-LOAD-DIRECT-UPLOAD (#150): all three are taken VERBATIM into a
   // same-size destination, so all three qualify for the borrow path. The

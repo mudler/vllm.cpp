@@ -102,12 +102,23 @@ $ vllm-server --model … --language-model-only     # then any image request:
 Two things follow from how the limit is computed
 (`min(user limit, what the model/seam supports)`):
 
-- A user limit can only **lower** the ceiling. `--limit-mm-per-prompt
-  '{"image": 99}'` on this server still refuses a second image, because the
-  OpenAI chat seam handles exactly one image today (video and audio parts are
-  not routed at all, so their limit is 0 and they are refused by name rather
-  than dropped, this is what closed
-  [#686](https://github.com/mudler/vllm.cpp/issues/686)).
+- A user limit can only **lower** the ceiling, and what it lowers is declared
+  **per architecture** by the chat seam that architecture registers. On a
+  `Qwen3VLForConditionalGeneration` server — which is also the `--mmproj`
+  projector path — `--limit-mm-per-prompt '{"image": 99}'` still refuses a
+  second image, because that seam declares `{"image": 1}` and routes no video or
+  audio part at all, so those limits are 0 and such a part is refused by name
+  rather than dropped, which is what closed
+  [#686](https://github.com/mudler/vllm.cpp/issues/686).
+  **`Dots3NoteForCausalLM` is the exception, since W8a**
+  ([#2860](https://github.com/mudler/vllm.cpp/issues/2860)): its seam applies
+  every item of every modality in ONE pass over the prompt, so it declares
+  upstream's own `{"image": 512}`, plus `{"audio": 128}` when the checkpoint
+  carries an `audio_config`. There `'{"image": 99}'` resolves to
+  `min(99, 512) = 99` and the second image is SERVED, and one request may carry
+  an image and an audio part together. `video` is absent from that seam too, so
+  a video part is still refused by name at limit 0. `--limit-mm-per-prompt
+  '{"image": 1}'` is how an operator puts the single-image ceiling back.
 - The ``Set `--limit-mm-per-prompt` to increase this limit.`` hint appears only
   when raising the limit would actually help, that is, when the seam could take
   the items and the configuration is what refused them. Its absence is currently

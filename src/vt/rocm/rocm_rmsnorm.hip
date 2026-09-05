@@ -1,7 +1,28 @@
 // ROCm RmsNorm — the ONE op the W0 skeleton registers (BACKEND-ROCM, W0).
 //
-// **UNBUILT.** Never compiled: no AMD GPU on the authoring machine. See the
-// header of rocm_backend.hip.
+// BUILD STATE, kept honest per issue #41, in the shape rocm_backend.hip uses.
+// **THIS TU COMPILES.** `hipcc` (ROCm 7.2.4) built it clean for `gfx1151` with
+// ZERO warnings on `strix:gpu0`, under `rc` job
+// `d99a30fa-3336-4b90-bc9e-877717c9b54e`, from tree
+// `2d1fdc19bd60cffec64fd2e66eb8abb5b5c1e1c5` -- the revision that gave this file
+// its independent gamma type `Tw` (#2492).
+//
+// This line used to read "**UNBUILT.** Never compiled: no AMD GPU on the
+// authoring machine", and that half is STILL TRUE of the authoring machine:
+// there is no `hipcc` and no HIP header there, and no lane in
+// `.github/workflows/` sets `VLLM_CPP_HIP`, which defaults to `AUTO` = OFF
+// (CMakeLists.txt:124). The compile came from a leased device, not from CI, so
+// this is a DATED REPORT ABOUT ONE REVISION and not a standing gate: if this
+// file changes again, the report does not follow it, and the next editor is in
+// the same position the previous one was.
+//
+// It is a COMPILE report and nothing more. No kernel in this file has been RUN
+// on an AMD device. What makes even the compile mean something is the negative
+// control the job ran: it broke the `case DType::kF16` arm, asserted the break
+// applied, and required `hipcc` to REJECT the rebuild -- because a green `ninja`
+// can otherwise mean "nothing to do". That, the five source guards, and the
+// absent-object precondition are recorded in
+// `.agents/specs/rmsnorm-gamma-dtype-twins.md`.
 //
 // PORTED FROM: src/vt/cuda/cuda_ops.cu:96-126 `RmsNormRowKernel` (one block per
 // row, shared-memory f32 tree reduction), whose own upstream counterpart is
@@ -27,7 +48,10 @@
 // being faster on NVIDIA, they are tuned against sm_121a, and W0 is not a speed
 // milestone. RmsNormQuantFp8 and the gated variants are likewise out of scope.
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+
+#include <string>
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
@@ -45,6 +69,14 @@ __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __hip_bfloat16* p, int64_t i) {
   return __bfloat162float(p[i]);
 }
+// GAMMA-ONLY element type. `vt::RmsNorm` admits `IsFloat(weight.dtype)`
+// (ops.cpp:24, :1030), which includes kF16, and the CPU sibling widens a kF16
+// gamma like any other (`WidenRowToF32`, cpu_ops.cpp:554-557) -- so a device arm
+// that refused it would be a divergence to record (cuda_qwen4_exp.cu:60-62). It
+// is NOT admitted as an ACTIVATION (`Tin`) or as an output: `RmsNormKernelRocm`
+// still refuses a kF16 `x`, which is a SEPARATE divergence of the same class,
+// recorded rather than fixed here (#2542).
+__device__ inline float Load(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);  // round-to-nearest-even, as the CUDA path and the host do
@@ -65,8 +97,20 @@ __device__ inline float ResRound<__hip_bfloat16>(float v) {
   return __bfloat162float(__float2bfloat16(v));
 }
 
-template <typename Tin, typename Tout, typename Tres>
-__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual, int64_t h,
+// `Tw` is the GAMMA's own dtype and is INDEPENDENT of `Tin` (#2492, the ROCm twin
+// of #2477). It used to be `Tin`, which welded the two and forced
+// `RmsNormKernelRocm` to refuse `w.dtype != x.dtype` -- a refusal that is a
+// property of THIS kernel's signature and of nothing upstream. vLLM never couples
+// them (`GemmaRMSNorm` reads `normalized * (1.0 + self.weight.float())`,
+// vllm/models/qwen4_exp/nvidia/ple_layer.py:80 at vLLM origin/main cdefd9d499,
+// which is AHEAD of this project's pin 5559679229 -- a forward reference, see
+// #2502), this tree's CPU sibling widens `w` and `x` separately
+// (cpu_ops.cpp:554-557, :576), and the CUDA sibling was decoupled by #2493
+// (cuda_ops.cu `RmsNormRowKernel`). `Load()` is overloaded for every gamma element
+// type below, so the body is unchanged and its f32 arithmetic is bit-identical for
+// every pairing that already worked.
+template <typename Tin, typename Tw, typename Tout, typename Tres>
+__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual, int64_t h,
                                  float eps, bool gemma) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
@@ -98,21 +142,21 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
   }
 }
 
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tw, typename Tout>
 void LaunchRmsNormRes(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                       const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h) {
   if (residual != nullptr && residual->dtype == DType::kBF16) {
-    RmsNormRowKernel<Tin, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__hip_bfloat16>(), h, args.eps,
+    RmsNormRowKernel<Tin, Tw, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__hip_bfloat16>(), h, args.eps,
         args.gemma);
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-    RmsNormRowKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma);
+    RmsNormRowKernel<Tin, Tw, Tout, float><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma);
   }
 }
 
-template <typename Tin>
+template <typename Tin, typename Tw>
 void LaunchRmsNorm(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
@@ -120,13 +164,39 @@ void LaunchRmsNorm(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
   const unsigned rows = static_cast<unsigned>(t);
   switch (out.dtype) {
     case DType::kF32:
-      LaunchRmsNormRes<Tin, float>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h);
       break;
     case DType::kBF16:
-      LaunchRmsNormRes<Tin, __hip_bfloat16>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, __hip_bfloat16>(s, out, x, w, args, residual, rows, h);
       break;
     default:
       VT_CHECK(false, "rocm rmsnorm: unsupported out dtype (f32/bf16 only)");
+  }
+}
+
+// The gamma's dtype is dispatched SEPARATELY from the activation's, mirroring
+// `DispatchRmsNormWeight` in cuda_ops.cu. The refusal that used to live in
+// `RmsNormKernelRocm` as `VT_CHECK(w.dtype == x.dtype)` is NARROWED here rather
+// than deleted: accepting a mismatch without retyping the kernel above would have
+// read a bf16 gamma through a `const float*` and run off the end of it. An
+// unsupported gamma dtype is still refused, and now says which one it got.
+template <typename Tin>
+void DispatchRmsNormWeight(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                           const RmsNormArgs& args, Tensor* residual) {
+  switch (w.dtype) {
+    case DType::kF32:
+      LaunchRmsNorm<Tin, float>(s, out, x, w, args, residual);
+      break;
+    case DType::kF16:
+      LaunchRmsNorm<Tin, __half>(s, out, x, w, args, residual);
+      break;
+    case DType::kBF16:
+      LaunchRmsNorm<Tin, __hip_bfloat16>(s, out, x, w, args, residual);
+      break;
+    default:
+      VT_CHECK(false, std::string("rocm rmsnorm: unsupported weight dtype "
+                                  "(f32/f16/bf16 only), got ") +
+                          Name(w.dtype));
   }
 }
 
@@ -167,14 +237,13 @@ void RmsNormKernelRocm(Queue& q,
  Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
   EnsureQueueDevice(q);
-  VT_CHECK(w.dtype == x.dtype, "rocm rmsnorm: weight dtype must match x");
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   switch (x.dtype) {
     case DType::kF32:
-      LaunchRmsNorm<float>(s, out, x, w, args, residual);
+      DispatchRmsNormWeight<float>(s, out, x, w, args, residual);
       break;
     case DType::kBF16:
-      LaunchRmsNorm<__hip_bfloat16>(s, out, x, w, args, residual);
+      DispatchRmsNormWeight<__hip_bfloat16>(s, out, x, w, args, residual);
       break;
     default:
       VT_CHECK(false, "rocm rmsnorm: unsupported input dtype (f32/bf16 only)");

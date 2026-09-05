@@ -1,0 +1,5 @@
+DEVICE      STATE  HOLDER                    ELAPSED  COMMAND
+dgx:gpu0    busy   mudler@mudler-ubuntu-box  12m21s   bash /workspace/qwen38-exl3-bench/job3.sh
+orin:gpu0   ready  -                         -        -
+strix:gpu0  ready  -                         -        -
+thor:gpu0   busy   mudler@mudler-ubuntu-box  44m55s   bash /workspace/runhalf-e126687/job.sh

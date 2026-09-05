@@ -1,0 +1,39 @@
+{
+  "row": "LTX25-PROMPT-ADHERENCE",
+  "issue": 2295,
+  "owns": 1854,
+  "what": "The fixed decoy prompts S2 ranks the true prompt against. Committed so the set cannot be chosen after the scores are seen, and NOT overridable from the command line: a caller who could pass their own decoys could pass trivially far ones and clear S2 by construction.",
+  "true_prompt_source": {
+    "file": "tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json",
+    "key": "request.prompt",
+    "why": "The true prompt is the one the #1864 reference render was actually taken at. Reading it from the manifest rather than from a flag means the prompt and the reference cannot disagree."
+  },
+  "null_is": "1/(N+1) with N decoys, which is the chance that an argmax over N+1 prompts lands on the true one when the scorer is uninformative. It is derived, not chosen, and the tool prints it beside every S2 verdict.",
+  "decoys": [
+    {
+      "kind": "near",
+      "text": "A red fox walks slowly through a green summer forest at midday, cinematic."
+    },
+    {
+      "kind": "near",
+      "text": "A grey wolf walks slowly through a snowy pine forest at sunrise, cinematic."
+    },
+    {
+      "kind": "near",
+      "text": "A red fox sleeps curled up in a snowy pine forest at night, cinematic."
+    },
+    {
+      "kind": "far",
+      "text": "A busy city street at night with neon signs and heavy traffic, cinematic."
+    },
+    {
+      "kind": "far",
+      "text": "A close-up of a bowl of hot soup on a wooden kitchen table, cinematic."
+    },
+    {
+      "kind": "far",
+      "text": "An empty beach with turquoise water under a bright midday sun, cinematic."
+    }
+  ],
+  "why_these": "The spec requires both a NEAR decoy and a FAR one. A set of only far decoys measures almost nothing: a scorer that can tell a snowy forest from a bowl of soup has been shown very little. The three near decoys each change ONE attribute the prompt names -- season, species, action -- so a render that got the season wrong is separable from one that got the animal wrong. The three far decoys are the floor: failing one of those is a broken instrument rather than a bad render."
+}

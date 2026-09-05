@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>  // cudaStream_t for the Brick 12 pair/group-diag externs
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -63,6 +64,13 @@
 #include "vt/cpu/cpu_quant_iq_tables.h"
 #include "vt/cuda/cuda_iq_table_seal.h"
 #endif
+
+// UNCONDITIONAL: `CurrentPlatform()` is used at the `RouteGgufTensor` call in
+// the IQ header case below, which is NOT inside `VLLM_CPP_CUDA`. This include
+// spent one CI cycle inside that guard and broke `build-newest-gcc` and
+// `build-test-cpu` while every CPU-only focused gate stayed green, because no
+// suite in that target list builds this TU.
+#include "vllm/platforms/interface.h"
 
 using vt::Backend;
 using vt::Device;
@@ -165,9 +173,36 @@ const WeightCase kCases[] = {
     {DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
     {DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
     {DType::kQ8_0, 32, 34, 0, -1, "q8_0"},          // DeepSeek-V4 AProj/SExp/Out (Q8_0-act path)
-    // NOTE (box-deferred): MXFP4 (39, UD-IQ2_M ffn_down) is NOT here — it dots a
-    // 32-elem Q8_0 activation and has no native CUDA GEMM yet (CPU-fallback). The
-    // CPU dot IS gated in tests/vt/test_ops_quant_dot.cpp.
+    // QUANT-CUDA-KEEPQUANT-32B (#2419). The 32-element Q8_0-ACTIVATION lane.
+    // These three cannot be served by the Q8_K GEMM the twelve rows above use --
+    // their vec_dot pairs a 32-element block with a `BlockQ8_0`, not a 256-element
+    // super-block with a `BlockQ8_K` -- so they run on a second templated GEMM
+    // (`IsCuda32BlockKeepQuantSupported`).
+    //
+    // IQ4_NL and Q5_0 are what the released `unsloth/Qwen3.8-Flash-Next-GGUF`
+    // UD-IQ1_S stores its routed-expert towers in, and that is forced rather than
+    // chosen: `expert_feed_forward_length` is 640, so every routed expert row is
+    // indivisible by 256 and NO K-quant can encode it.
+    //
+    // Adding the rows drives five gates in this file. The dense, grouped and
+    // fused-MoE value gates say the new kernels are CORRECT; none of them can say
+    // the device ran, because the pre-change tree drained the stream and returned
+    // the same numbers from the CPU arm. The CAPTURE gate is the discriminator --
+    // `cudaStreamSynchronize` on a capturing stream fails -- and the fused-MoE
+    // gate is a second RED, because that seam THREW by name for these dtypes.
+    //
+    // Offsets restated from ggml-common.h @ b10451 rather than copied:
+    //   q4_0   :213  d@0  qs@2 (u8[16])                 (18 B)
+    //   q5_0   :229  d@0  qh@2 (u8[4])  qs@6 (u8[16])   (22 B)
+    //   iq4_nl :447  d@0  qs@2 (u8[16])                 (18 B)
+    // None carries a `dmin`, so `dmin_off` is -1 on all three; `d_off` is 0.
+    {DType::kIQ4_NL, 32, 18, 0, -1, "iq4_nl"},      // Qwen3.8-Flash-Next experts
+    {DType::kQ5_0, 32, 22, 0, -1, "q5_0"},          // Qwen3.8-Flash-Next experts
+    {DType::kQ4_0, 32, 18, 0, -1, "q4_0"},          // same lane, one more case
+    // NOTE (owed, #2419): MXFP4 (39, UD-IQ2_M ffn_down) is NOT here — it is the
+    // fourth 32-element encoding and the lane above is the seam it needs, but no
+    // artifact gated here uses it, so it still CPU-fallbacks. The CPU dot IS
+    // gated in tests/vt/test_ops_quant_dot.cpp.
 };
 
 void GenerateData(float offset, size_t n, float* dst) {
@@ -1231,7 +1266,7 @@ TEST_CASE("a REAL GGUF header carries IQ2_XS / IQ4_XS to the CUDA keep-quant GEM
     const vllm::GgufResidency res = vllm::RouteGgufTensor(
         /*keep_quant=*/true, /*keep_f16=*/true, /*nvfp4_fp4=*/false,
         /*cpu_ref=*/false, vllm::GgufTensorRole::kMatmulWeight,
-        arm.ggml_type, {1, 1024});
+        arm.ggml_type, {1, 1024}, vllm::platforms::CurrentPlatform().device_type());
     CHECK(res == vllm::GgufResidency::kKeepQuant);
 
     if (!cuda) continue;
@@ -1380,6 +1415,153 @@ TEST_CASE("CUDA keep-quant runs every kCases dtype INSIDE a stream capture") {
 // to running the plain Q8_0 GEMV twice (via vt::MatmulBTQuant). RED-first: a wrong
 // activation-load factoring, a swapped weight row-stride, or a reduction re-order would
 // diverge the two outputs (this is the wq_a+wkv / shared-gate+up decode fusion).
+// ─── QUANT-CUDA-KEEPQUANT-32B (#2419): the two things `kCases` cannot say ────
+//
+// 1. THE LANE STRIDE. Every `kCases` gate runs `k = 8 * block_elems`, which for a
+//    32-element encoding is nb = 8 blocks. The dense and grouped kernels walk
+//    `for (b = lane; b < nb; b += 32)`, so at nb = 8 only lanes 0-7 ever enter
+//    the body and NO LANE TAKES THE LOOP TWICE. A defect in the stride, in the
+//    per-lane block address, or in the warp reduce's treatment of idle lanes is
+//    byte-for-byte invisible at that shape. This case runs nb = 40 > 32, where
+//    lanes 0-7 take the loop twice and lanes 8-31 take it once.
+//
+// 2. THE RELEASED GEOMETRY. K = 640 is the shipped Qwen3.8-Flash-Next
+//    `expert_feed_forward_length`, and it is the reason this lane exists at all:
+//    640 is 20 whole 32-element blocks and is NOT a whole number of 256-element
+//    super-blocks, so the Q8_K seams refuse that shape BY NAME whatever the
+//    dtype carried. A gate that only ever ran K % 256 == 0 cannot tell that
+//    refusal apart from a missing `case`.
+//
+// What this case observes: that the device numbers track the CPU arm at shapes
+// the other gates do not reach. What it CANNOT observe, exactly like every value
+// gate in this file: whether the device ran. The capture case above is the only
+// discriminator for that, and this one is deliberately not dressed up as a
+// second.
+TEST_CASE("32-block keep-quant lane: crosses the lane stride, and takes K = 640") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; 32-block lane gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+
+  // The three dtypes the 32-block lane serves, named here rather than filtered
+  // out of `kCases`: a filter that matched nothing would leave this case running
+  // zero shapes and still printing SUCCESS.
+  const WeightCase k32[] = {
+      {DType::kIQ4_NL, 32, 18, 0, -1, "iq4_nl"},
+      {DType::kQ5_0, 32, 22, 0, -1, "q5_0"},
+      {DType::kQ4_0, 32, 18, 0, -1, "q4_0"},
+  };
+  // 640 = the released expert row (20 blocks, and NOT a multiple of 256).
+  // 1280 = 40 blocks, which is the first shape past the 32-lane stride.
+  const int64_t kKs[] = {640, 1280};
+
+  int64_t combos = 0;
+  for (const WeightCase& c : k32) {
+    // Worst margin over this dtype's shapes. A gate that only says "within
+    // tolerance" cannot be read for HOW MUCH room it had, so a later tightening
+    // or a slow drift has nothing to be compared against. Reported below.
+    double worst_ratio = 0.0, worst_diff = 0.0;
+    for (int64_t k : kKs) {
+      const int64_t nb = k / c.block_elems;
+      for (int64_t m : {int64_t{1}, int64_t{5}}) {
+        for (int64_t n : {int64_t{1}, int64_t{33}}) {
+          const std::string case_name(c.name);
+          CAPTURE(case_name);
+          CAPTURE(k);
+          CAPTURE(nb);
+          CAPTURE(m);
+          CAPTURE(n);
+          ++combos;
+
+          std::vector<uint8_t> wq = RandomBlocks(c, n * nb, 0x5EEDU);
+          std::vector<float> a(static_cast<size_t>(m * k));
+          GenerateData(1.0F, a.size(), a.data());
+
+          std::vector<float> cpu_out(static_cast<size_t>(m * n), 0.0F);
+          {
+            Tensor at = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {m, k});
+            Tensor bt = Tensor::Contiguous(wq.data(), DType::kF32, Cpu(), {n, k});
+            bt.dtype = c.dtype;
+            Tensor ot = Tensor::Contiguous(cpu_out.data(), DType::kF32, Cpu(), {m, n});
+            vt::MatmulBTQuant(cq, ot, at, bt);
+          }
+
+          void* d_a = gpu.Alloc(a.size() * sizeof(float));
+          void* d_w = gpu.Alloc(wq.size());
+          void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+          gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+          gpu.Copy(gq, d_w, wq.data(), wq.size());
+          // Poison, so a kernel that never launched is a FAILURE and not a
+          // buffer that happened to hold the right zeros.
+          std::vector<float> poison(static_cast<size_t>(m * n), kPoison);
+          gpu.Copy(gq, d_o, poison.data(), poison.size() * sizeof(float));
+          Tensor at = DevTensor(d_a, DType::kF32, {m, k});
+          Tensor bt = DevTensor(d_w, c.dtype, {n, k});
+          Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
+          vt::MatmulBTQuant(gq, ot, at, bt);
+          std::vector<float> cuda_out(static_cast<size_t>(m * n), 0.0F);
+          gpu.Copy(gq, cuda_out.data(), d_o, cuda_out.size() * sizeof(float));
+          gpu.Synchronize(gq);
+          gpu.Free(d_a);
+          gpu.Free(d_w);
+          gpu.Free(d_o);
+
+          double max_abs_diff = 0, max_abs_cpu = 0, num = 0, den = 0;
+          int64_t poisoned = 0;
+          for (size_t i = 0; i < cuda_out.size(); ++i) {
+            const double got = cuda_out[i], cpu = cpu_out[i];
+            if (cuda_out[i] == kPoison) ++poisoned;
+            REQUIRE(std::isfinite(got));
+            max_abs_diff = std::max(max_abs_diff, std::abs(got - cpu));
+            max_abs_cpu = std::max(max_abs_cpu, std::abs(cpu));
+            num += (got - cpu) * (got - cpu);
+            den += cpu * cpu;
+          }
+          const double nmse = den > 0 ? num / den : num;
+          // DERIVED, not fitted to this fixture. Both sides accumulate nb f32
+          // terms; they differ only in ASSOCIATION -- the CPU arm sums blocks
+          // sequentially, the kernel sums them per lane and then down a 32-wide
+          // warp tree. Worst-case f32 accumulation error over nb terms is
+          // nb * eps relative, so the bound is 8 * nb * eps with the 8 as
+          // headroom. It GROWS with nb, which is the direction the error grows;
+          // a constant here would tighten as K rose and start failing on the
+          // long rows this lane exists to serve.
+          const double eps = 1.1920929e-7;  // FLT_EPSILON
+          const double tol = 8.0 * static_cast<double>(nb) * eps;
+          const double bound = tol * max_abs_cpu;
+          CAPTURE(max_abs_diff);
+          CAPTURE(max_abs_cpu);
+          CAPTURE(bound);
+          CAPTURE(nmse);
+          CAPTURE(poisoned);
+          CHECK(poisoned == 0);
+          CHECK(max_abs_diff <= bound);
+          CHECK(nmse <= kMaxNmseVsCpu);
+          if (bound > 0 && max_abs_diff / bound > worst_ratio) worst_ratio = max_abs_diff / bound;
+          if (max_abs_diff > worst_diff) worst_diff = max_abs_diff;
+        }
+      }
+    }
+    // ALWAYS printed, unlike CAPTURE, which doctest emits only for a FAILING
+    // assertion -- so a green run reported no number at all and the measured
+    // device-vs-CPU margin could not be quoted from a passing gate.
+    // std::string, NOT the bare `c.name`: doctest stringifies a `const char*`
+    // as a BOOL, so the first run of this line labelled all three dtypes "1"
+    // and the margins could only have been attributed by trusting loop order.
+    MESSAGE("32-block lane " << std::string(c.name) << ": worst device-vs-CPU max|diff| = "
+                             << worst_diff << ", worst fraction of the derived bound = "
+                             << worst_ratio);
+  }
+  // A loop that ran nothing prints the same SUCCESS as one that ran everything.
+  CAPTURE(combos);
+  CHECK(combos == static_cast<int64_t>(std::size(k32) * std::size(kKs) * 2 * 2));
+  CHECK(combos > 0);
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("Brick 12: CUDA Q8_0 PAIR == two separate matmuls (bit-identical)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend on this host; Q8_0 pair gate skipped");

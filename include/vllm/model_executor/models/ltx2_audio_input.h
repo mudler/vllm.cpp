@@ -118,13 +118,17 @@ Ltx2WavFormat Ltx2ProbeWavFormat(const std::string& bytes);
 //
 // `want_channels` is the encoder's `in_channels`; a file that declares anything
 // else is REFUSED rather than mixed, for the reason in this header's third
-// bullet. `want_sample_rate` is the mel front-end's target; a mismatch is
-// REFUSED rather than resampled, because this project ports only the
-// integer-ratio hann-sinc resampler and upstream's `ops.py:40` is an
-// arbitrary-ratio polyphase kaiser one.
+// bullet.
+//
+// THERE IS NO TARGET RATE HERE, and that is upstream's shape rather than an
+// omission: `decode_audio_from_file` reads at the file's own rate
+// (`decode.py:240-300`) and the resample happens two hops later, inside the mel
+// front-end (`ops.py:44-49`). The rendered soundtrack is this decode's output,
+// so it stays at the file's rate too (`a2vid_two_stage.py:301-303`). Row
+// LTX25-AUDIO-RESAMPLE (#2583) removed the refusal that used to sit here.
 Ltx2DecodedAudio Ltx2DecodeAudioWav(const std::string& bytes, const std::string& label,
-                                    int64_t want_channels, int64_t want_sample_rate,
-                                    double start_time, double max_duration);
+                                    int64_t want_channels, double start_time,
+                                    double max_duration);
 
 // `encode_audio` (audio_vae.py:249-274) followed by A2Vid's truncation
 // (a2vid_two_stage.py:201-202): waveform -> log-mel -> encoder -> keep at most

@@ -1,0 +1,4 @@
+
+/tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so:	file format elf64-x86-64
+Extracting offload bundle: /tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so.0.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /tmp/q4km-neartie-2809/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so.0.hipv4-amdgcn-amd-amdhsa--gfx1151

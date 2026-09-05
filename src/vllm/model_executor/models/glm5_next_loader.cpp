@@ -119,9 +119,10 @@ OwnedTensor ExpandBf16(const GgufFile& g, const std::string& name,
 // THE REPACK IS DECLINED ON THIS ROW, and the constant exists so the three
 // call sites below say so once rather than three times.
 //
-// `GgufLoadPolicy::quant_repack` is
-// `keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`, and
-// `QuantRepackActive()` is TRUE on every aarch64 i8mm box in this fleet. It
+// `GgufLoadPolicy::quant_repack` is `keep_quant && !cpu_ref &&
+// vt::cpu::QuantRepackActive() && dev == kCPU` (the device term is #2406), and
+// `QuantRepackActive()` is TRUE on every aarch64 i8mm box in this fleet, which
+// is where this row runs. It
 // permutes an eligible q8_0 weight into the `block_q8_0x4` interleave for the
 // CPU i8mm GEMM. **Nothing on this row consumes that layout.** The forward is a
 // host f32 reference (`glm5_next_forward.h`): every weight it touches goes
@@ -480,7 +481,7 @@ Glm5NextWeights LoadGlm5NextFromGguf(const GgufFile& gguf,
                                      const HfConfig& config,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
-      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
 
   // WHAT THIS BOX WOULD HAVE DONE, printed beside what this row does instead.
   // The repack defect (#2241) was reachable only where `QuantRepackActive()` is

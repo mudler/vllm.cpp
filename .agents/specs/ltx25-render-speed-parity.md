@@ -319,19 +319,42 @@ Stop and report, do not work around:
 
 ## Owed
 
-- **The repair is not here.** `conditioning.connector` and `generate.guiders` are
-  measured and unowned by any row that could move them.
-  [#1269](https://github.com/mudler/vllm.cpp/issues/1269) owns the tower's CPU
-  pinning and is the closest existing owner; it does not carry the connector, and
-  it does not carry that all four passes are two duplicated halves. Owner of the
-  gap record: this row, through #2296.
+- ~~**The repair is not here.**~~ **THE CONNECTOR HALF OF IT IS DONE, and it was
+  done by a `vt` row rather than by an LTX-2.5 one.** `VT-CPU-ELEM-DISPATCH`
+  (#2376) hoisted the per-element dtype dispatch out of `AttentionCrossKernel`,
+  and `LTX25-CONNECTOR-REPAIR` (#2434) re-measured this leaf on GB10 with the
+  probe `LTX25-CONNECTOR-GEMM` decomposed it with: one `RunConnector` call is
+  **128.808 s -> 50.34 s, 2.56x**, its attention leg **85.704 -> 8.47 s**, and
+  the GEMM unmoved. At that ratio the 224.882 s of connector compute this row
+  measured becomes about **87.9 s** and the render about **380 s**, which would
+  put the oracle gap near **4.05x** instead of 5.53x. **That last sentence is a
+  PROJECTION**, and it has since been REPLACED BY A WALL.
+  `LTX25-RENDER-CONFIRM` ([#2457](https://github.com/mudler/vllm.cpp/issues/2457))
+  advanced the pin by earning it -- building the head, re-taking #1864's
+  blockiness verdict on that binary, and timing that same binary in the same
+  job. `rc` job `93a60151` on `dgx:gpu0`, 2026-09-01: **`VERDICT PASS`**, then
+  **302.954 s at n = 3, spread 8.03%**, against this row's **518.398 s**. That is
+  **1.711x**, and **3.230x the oracle's 93.8 s instead of 5.53x**. It BEAT the
+  ~380 s / ~4.05x projection by 20%, and not because the connector overperformed:
+  the connector's own leaf came in at **81.338 s** against a projected 87.9 s,
+  while `4fef1f413` (`LTX25-AUDIO-DECODE-COST`) independently took
+  `decode.audio.mel` from **47.175 to 4.926 s**, which the connector projection
+  never carried. This row's two attributed phases both collapsed --
+  `conditioning.connector` 122.388 -> 49.960 (2.45x) and `generate.guiders`
+  190.016 -> 95.506 (1.99x) -- while `denoise` (15.129 -> 15.122) and `load`
+  (94.483 -> 94.550) did not move at all. Owner: `LTX25-RENDER-CONFIRM`, closed.
+  `generate.guiders` is the same connector twice, so it moves with it; the tower
+  half remains [#1269](https://github.com/mudler/vllm.cpp/issues/1269)'s.
+  Owner of the gap record: this row, through #2296.
 - **The oracle's own 93.8 s is undecomposed.** Upstream emits no phase table and
   this row did not instrument it, so which part of the 5.4x is load and which is
   compute is known on our side only. Owner: this row.
-- **`decode.audio.mel` is unattributed.** Measured at n = 3 it is inside
-  `decode.audio`'s 50.745 s, which is 9.79% of the wall and **3.35x the whole
-  denoise loop**, for 1.02 s of audio. Nothing in this tree explains it and this
-  row does not guess. Owner: this row.
+- ~~**`decode.audio.mel` is unattributed.**~~ **ANSWERED and REPAIRED.**
+  `4fef1f413` (`LTX25-AUDIO-DECODE-COST`) found the audio VAE running on one of
+  20 cores. Re-measured by `LTX25-RENDER-CONFIRM` at n = 3 on the same host, the
+  leaf reads **47.175 -> 4.926 s, a 9.58x**, and `decode.audio` as a whole
+  50.745 -> 8.773 s. It is now 1.63% of the wall rather than 9.10%. Owner: this
+  row, closed.
 - **The 206.0 s that remains after `guiders` and `connector` is a second
   question and it is open.** Removing both entirely still leaves 2.20x. `load`
   is 94.5 s of it, `decode.audio` 50.7 s, `decode.video` 16.0 s and `denoise`

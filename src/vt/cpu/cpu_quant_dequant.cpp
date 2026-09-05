@@ -374,6 +374,71 @@ void DequantIQ3_XXS(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+
+// block_iq3_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4] }
+// (110 bytes) llama.cpp @ b10451 ggml/src/ggml-quants.c:2607
+// dequantize_row_iq3_s.
+//
+// NOT an IQ3_XXS variant. Three things differ and none of the sibling's decode
+// transfers:
+//   - the table is the 512-entry kIq3sGrid, not the 256-entry kIq3xxsGrid;
+//   - the ninth index bit comes out of `qh` with an ASYMMETRIC shift pair —
+//     `qh[..] << (8 - 2*l)` for the even lane of a pair and `<< (7 - 2*l)` for
+//     the odd one, both masked with 256. A decoder that uses one shift for both
+//     lanes still decodes most of the table correctly, which is why the golden
+//     set deliberately carries 73 indices >= 256;
+//   - the sign is a DIRECT byte in `signs[]`, like IQ2_S, where IQ3_XXS packs a
+//     7-bit kKsignsIq2xs selector into its per-32 aux word.
+// The scale is a fourth difference: ONE nibble of `scales[ib32/2]` serves TWO
+// 32-element sub-blocks, and the multiplier is `db = d * (1 + 2*ls)` — an
+// odd-integer scale with neither the `0.5 +` offset nor the `* 0.25` factor
+// every IQ2 member in this tree carries. Upstream walks the sub-blocks in PAIRS
+// for exactly that reason, and this port keeps that loop shape rather than
+// normalising it to a per-ib32 loop, so the pointer advances (`qs += 8` twice,
+// `signs += 4` twice, `qh += 2` once per pair) stay diffable by eye.
+void DequantIQ3_S(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 110;
+    const float d = ReadF16(blk);
+    const uint8_t* qs = blk + 2;         // 64 grid-index low bytes
+    const uint8_t* qh = blk + 66;        // 8 ninth-bit planes, one per ib32
+    const uint8_t* signs = blk + 74;     // 32 direct sign bytes
+    const uint8_t* scales = blk + 106;   // 4 packed nibbles, one per ib32 PAIR
+    for (int ib32 = 0; ib32 < qk / 32; ib32 += 2) {
+      const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+      const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(
+            kIq3sGrid + (qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)));
+        const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(
+            kIq3sGrid + (qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)));
+        for (int j = 0; j < 4; ++j) {
+          y[j + 0] = db1 * grid1[j] * ((signs[l] & kKmaskIq2xs[j + 0]) ? -1.f : 1.f);
+          y[j + 4] = db1 * grid2[j] * ((signs[l] & kKmaskIq2xs[j + 4]) ? -1.f : 1.f);
+        }
+        y += 8;
+      }
+      qs += 8;
+      signs += 4;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(
+            kIq3sGrid + (qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)));
+        const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(
+            kIq3sGrid + (qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)));
+        for (int j = 0; j < 4; ++j) {
+          y[j + 0] = db2 * grid1[j] * ((signs[l] & kKmaskIq2xs[j + 0]) ? -1.f : 1.f);
+          y[j + 4] = db2 * grid2[j] * ((signs[l] & kKmaskIq2xs[j + 4]) ? -1.f : 1.f);
+        }
+        y += 8;
+      }
+      qh += 2;
+      qs += 8;
+      signs += 4;
+    }
+  }
+}
+
 // block_iq2_xs = { f16 d; u16 qs[32]; u8 scales[8]; } (74 bytes)
 // llama.cpp @ b10451 ggml/src/ggml-quants.c:2516 dequantize_row_iq2_xs.
 // Codebook decode over 8 sub-blocks of 32, 4 lanes of 8 each. Lane l reads ONE
@@ -588,6 +653,7 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kMXFP4: return &ToFloatAdapter<&DequantMXFP4, 32>;
     case DType::kIQ2_XS: return &ToFloatAdapter<&DequantIQ2_XS, 256>;
     case DType::kIQ4_XS: return &ToFloatAdapter<&DequantIQ4_XS, 256>;
+    case DType::kIQ3_S: return &ToFloatAdapter<&DequantIQ3_S, 256>;
     default: return nullptr;
   }
 }

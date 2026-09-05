@@ -43,12 +43,10 @@ inline unsigned GridFor(int64_t n) {
 }
 
 __device__ inline float Ld(const float* p, int64_t i) { return p[i]; }
-__device__ inline float Ld(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline float Ld(const __hip_bfloat16* p, int64_t i) {
   return __bfloat162float(p[i]);
 }
 __device__ inline void St(float* p, int64_t i, float v) { p[i] = v; }
-__device__ inline void St(__half* p, int64_t i, float v) { p[i] = __float2half_rn(v); }
 __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
 }

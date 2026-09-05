@@ -3,6 +3,9 @@
 #include "vllm/model_executor/models/qwen4_exp_forward.h"
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -10,6 +13,7 @@
 #include "vllm/model_executor/models/qwen3_5_gdn_block.h"    // RunGdnBlockPaged
 #include "vllm/model_executor/models/qwen3_5_mrope.h"        // BuildMropeCosSinHost
 #include "vllm/model_executor/models/qwen4_exp_moe.h"        // RunQwen4ExpMoeBlock
+#include "vllm/model_executor/moe_placement_seam.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -49,6 +53,124 @@ void CheckOwned(const OwnedTensor& t, const char* name,
                  std::to_string(i) + " is " + std::to_string(t.shape[i]) +
                  ", expected " + std::to_string(shape[i]));
   }
+}
+
+// ─── VT_Q4EXP_LAYER_FP — the per-layer, per-tap arm fingerprint (#2547) ──────
+//
+// `VT_Q4EXP_STATE_FP` (#2496) prints the layer loop's OUTPUT once per step. It
+// has no LAYER axis, so it can say that a CUDA prefill disagrees with a CPU one
+// — measured at 0.3% on `sumabs` at step 0 — and it cannot say WHERE. This
+// prints one line per tap per layer for the first `VT_Q4EXP_LAYER_FP` forward
+// calls, which is the axis that converts that aggregate into one op.
+//
+// THE DTYPE IS PART OF THE LINE, and that is not decoration. A token gate cannot
+// see a dtype and a value gate cannot see a lifetime; this row has paid for both
+// (#2493, #2476). A tap that reported values alone would pass a buffer that is
+// f32 on one arm and bf16 on the other while moving twice the bytes.
+//
+// IT COUNTS ITS OWN TAPS, and prints the count at the end of every fingerprinted
+// step. A grep that matches nothing is not evidence of absence, and an
+// instrument that never ran reads as an arm whose taps agreed. `taps=` is the
+// counted property that separates the two.
+//
+// IT DRAINS THE QUEUE AT EVERY TAP, so it CANNOT see a race. That is admissible
+// here only because #2547 measured this divergence as bit-stable across builds,
+// across trees and across `CUDA_LAUNCH_BLOCKING`, which is a deterministic
+// arithmetic difference. A symptom that appears only WITHOUT this instrument is
+// a race and belongs to a different method.
+// The instrument's whole mutable state, in one object so a test can put it back
+// (`detail::Qwen4ExpLayerFpResetForTest`). A `static const bool` read once at
+// first use would be cheaper by one branch and untestable: every case in a
+// doctest binary shares the process, so the budget would be spent by whichever
+// forward ran first and the case that sets the variable would measure nothing
+// and pass. The tree already carries this shape for the same reason --
+// `detail::ExpertStreamSetForceFallback` in qwen3_5.cpp.
+struct LayerFpState {
+  int64_t budget = 0;  // forward calls to fingerprint; 0 == the instrument is off
+  int64_t step = 0;    // the forward call this process is on
+  int64_t taps = 0;    // lines printed, the counted property
+};
+
+int64_t LayerFpBudgetFromEnv() {
+  const char* e = std::getenv("VT_Q4EXP_LAYER_FP");
+  if (e == nullptr || e[0] == '\0') return 0;
+  const long long parsed = std::atoll(e);
+  return parsed > 0 ? static_cast<int64_t>(parsed) : 0;
+}
+
+LayerFpState& LayerFpS() {
+  static LayerFpState s = [] {
+    LayerFpState t;
+    t.budget = LayerFpBudgetFromEnv();
+    return t;
+  }();
+  return s;
+}
+
+// One tap. `il` is the decoder layer, or -1 for a tap outside the loop.
+//
+// THE COPY GOES THROUGH `Backend::Copy`, which is `cudaMemcpyDefault` on a CUDA
+// queue and a `memcpy` on a CPU one, so ONE spelling reads both arms and neither
+// arm gets a private readback path the other does not have. `Synchronize` after
+// it is what makes the bytes the ones this tap names.
+void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
+  LayerFpState& s = LayerFpS();
+  if (s.step >= s.budget) return;
+  VT_CHECK(t.IsContiguous(),
+           "qwen4_exp forward: VT_Q4EXP_LAYER_FP taps a contiguous tensor");
+  int64_t n = 1;
+  for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
+  if (n <= 0) return;
+  const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(t.dtype);
+  std::vector<uint8_t> host(bytes);
+  d.b.Copy(d.q, host.data(), t.data, bytes);
+  d.b.Synchronize(d.q);
+
+  double sumabs = 0.0;
+  double maxabs = 0.0;
+  int64_t nonfinite = 0;
+  float head[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int64_t i = 0; i < n; ++i) {
+    float v = 0.0f;
+    switch (t.dtype) {
+      case DType::kF32: v = reinterpret_cast<const float*>(host.data())[i]; break;
+      case DType::kF16: v = vt::F16ToF32(reinterpret_cast<const uint16_t*>(host.data())[i]); break;
+      case DType::kBF16: v = vt::BF16ToF32(reinterpret_cast<const uint16_t*>(host.data())[i]); break;
+      default:
+        VT_CHECK(false,
+                 std::string("qwen4_exp forward: VT_Q4EXP_LAYER_FP cannot read dtype ") +
+                     vt::Name(t.dtype));
+    }
+    if (i < 4) head[i] = v;
+    if (!std::isfinite(v)) {
+      ++nonfinite;
+      continue;
+    }
+    const double a = std::fabs(static_cast<double>(v));
+    sumabs += a;
+    if (a > maxabs) maxabs = a;
+  }
+  ++s.taps;
+  std::fprintf(stderr,
+               "q4fp step=%lld L%+03lld tag=%-10s dtype=%-4s dev=%d n=%lld "
+               "nonfinite=%lld maxabs=%.9g sumabs=%.9g "
+               "v=%.9g,%.9g,%.9g,%.9g\n",
+               static_cast<long long>(s.step), static_cast<long long>(il), tag,
+               vt::Name(t.dtype), static_cast<int>(t.device.type),
+               static_cast<long long>(n), static_cast<long long>(nonfinite), maxabs, sumabs,
+               static_cast<double>(head[0]), static_cast<double>(head[1]),
+               static_cast<double>(head[2]), static_cast<double>(head[3]));
+}
+
+// Closes a fingerprinted step. `taps=` is the counted property that says the
+// instrument RAN on the run being reported.
+void LayerFpEndStep() {
+  LayerFpState& s = LayerFpS();
+  if (s.step < s.budget) {
+    std::fprintf(stderr, "q4fp step=%lld taps=%lld END\n",
+                 static_cast<long long>(s.step), static_cast<long long>(s.taps));
+  }
+  ++s.step;
 }
 
 }  // namespace
@@ -101,7 +223,7 @@ HfConfig Qwen4ExpGdnHfConfig(const Qwen4ExpParams& p, const HfConfig& source) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-GdnLayerWeights Qwen4ExpGdnBlockWeights(const Qwen4ExpGdnWeights& g,
+GdnLayerWeights Qwen4ExpGdnBlockWeights(Qwen4ExpGdnWeights& g,
                                         const Qwen4ExpParams& p) {
   const int64_t H = p.hidden_size;
   const int64_t num_v = p.linear_num_value_heads;
@@ -124,16 +246,28 @@ GdnLayerWeights Qwen4ExpGdnBlockWeights(const Qwen4ExpGdnWeights& g,
   CheckOwned(g.norm_weight, "gdn.norm_weight", {p.linear_value_head_dim});
   CheckOwned(g.out_proj, "gdn.out_proj", {H, value_dim});
 
+  // ZERO-COPY VIEWS, NOT ASSIGNMENT (issue #2476,
+  // `.agents/specs/gdn-qkvz-operand-lifetime.md`). This block used to spell the
+  // pass-through as `w.in_proj_qkv = g.in_proj_qkv;`, and the comment above the
+  // declaration in the header already said what that was supposed to mean:
+  // "nothing is ... reallocated here". `OwnedTensor`'s implicit copy DEEP-COPIES
+  // an owned buffer, so the assignment reallocated ~115 MiB of Gated DeltaNet
+  // weights per linear layer per step — and `ResidentWeight`'s host-alias arm
+  // then handed cuBLASLt a pointer INTO that per-step copy, which this
+  // function's caller destroys at the end of the layer while the GEMM is still
+  // queued. `compute-sanitizer` on `thor:gpu0` reported that as `Warp illegal
+  // address` in `nvjet_sm110_tst_512x8_64x3_2x1_v_bz_TNT` with every declared
+  // extent correct. The view is what makes the operand belong to the model.
   GdnLayerWeights w;
-  w.in_proj_qkv = g.in_proj_qkv;
-  w.in_proj_z = g.in_proj_z;
-  w.in_proj_b = g.in_proj_b;
-  w.in_proj_a = g.in_proj_a;
-  w.conv1d_weight = g.conv1d;
-  w.a_log = g.a_log;
-  w.dt_bias = g.dt_bias;
-  w.norm_weight = g.norm_weight;
-  w.out_proj = g.out_proj;
+  w.in_proj_qkv = BorrowWholeOwnedTensor(g.in_proj_qkv);
+  w.in_proj_z = BorrowWholeOwnedTensor(g.in_proj_z);
+  w.in_proj_b = BorrowWholeOwnedTensor(g.in_proj_b);
+  w.in_proj_a = BorrowWholeOwnedTensor(g.in_proj_a);
+  w.conv1d_weight = BorrowWholeOwnedTensor(g.conv1d);
+  w.a_log = BorrowWholeOwnedTensor(g.a_log);
+  w.dt_bias = BorrowWholeOwnedTensor(g.dt_bias);
+  w.norm_weight = BorrowWholeOwnedTensor(g.norm_weight);
+  w.out_proj = BorrowWholeOwnedTensor(g.out_proj);
   // `in_proj_ba` and `in_proj_qkvz` are left EMPTY — see the header. That is
   // what keeps the split fields above live and it is exactly what qwen3_5's own
   // GGUF loader does.
@@ -294,6 +428,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
     Tensor out = embed.t();
     vt::Embedding(d.q, out, table, d_ids.t());
   }
+  LayerFp(d, -1, "emb", embed.t());
 
   // ─── :1417  hidden_states = hidden_states.repeat(1, 1, hc_count) ──────────
   // THE WIDEN, and it is `vt::IndexSelect` over a repeat index rather than a new
@@ -311,6 +446,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
     Tensor out = Reshape(stream.t(), {T * hc, H});
     vt::IndexSelect(d.q, out, embed.t(), d_idx.t());
   }
+  LayerFp(d, -1, "wide", stream.t());
 
   // ─── :1416  position_embeddings, built ONCE for the whole step ────────────
   // Upstream builds them at the model level and hands the SAME pair to every
@@ -354,6 +490,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
   int64_t gdn_i = 0, qsa_i = 0;
   for (int64_t il = 0; il < L; ++il) {
     Qwen4ExpLayerWeights& lw = w.layers[static_cast<size_t>(il)];
+    LayerFp(d, il, "in", stream.t());
     const bool linear = p.layer_types[static_cast<size_t>(il)] ==
                         Qwen4ExpLayerKind::kLinearAttention;
     VT_CHECK(lw.is_linear_attention == linear,
@@ -392,8 +529,10 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       const Qwen4ExpPleBlockOutput ple = RunQwen4ExpPleBlock(
           d, lw.ple, w.ngram_table, p, layout, stream.t(), ple_ids.data(),
           /*conv_mask=*/nullptr, caches.ple[static_cast<size_t>(ple_i)], past_len);
+      LayerFp(d, il, "ple", ple.tensor);
       Tensor s = stream.t();
       vt::Add(d.q, s, s, ple.tensor);
+      LayerFp(d, il, "s.ple", s);
     }
 
     // ─── :1222  the ATTENTION hyper-connection ──────────────────────────────
@@ -414,7 +553,15 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
                    "`use_combine=False` is the MODEL-level mixer alone");
       Tensor m = mixed.t();
       Tensor inj = injection.t();
-      Tensor bi = lw.attn_hc.inject.View();
+      // W5r/#2449: THROUGH THE SAME STAGING ITS SIBLINGS USE. `View()` builds a
+      // tensor over the OwnedTensor's HOST bytes and tags it with the queue's
+      // device, so on a CUDA queue `vt::Qwen4ExpGatedResidual` refused this
+      // operand -- `block_inject_weight device mismatch` -- at decoder layer 0,
+      // before PLE and before the MoE, which is every CUDA forward for this
+      // architecture. `hc_norm`, `down` and `up` in this same call already go
+      // through `dense_attn::ResidentWeight`; the inject weight is a matmul
+      // operand of the same op and had no reason to be the exception.
+      Tensor bi = dense_attn::ResidentWeight(d, lw.attn_hc.inject, {hc, W});
       vt::Qwen4ExpGatedResidual(
           d.q, m, &inj, stream.t(),
           dense_attn::ResidentWeight(d, lw.attn_hc.hc_norm, {W}),
@@ -422,14 +569,25 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
           dense_attn::ResidentWeight(d, lw.attn_hc.up, {W, p.hc_lowrank}), &bi,
           args);
     }
+    LayerFp(d, il, "ahc.mix", mixed.t());
+    LayerFp(d, il, "ahc.inj", injection.t());
 
     // ─── :1224 / :1228  the mixer block, one arm per layer kind ─────────────
     Tensor block_out;
     std::shared_ptr<void> block_store;
     if (linear) {
-      const GdnLayerWeights gw = Qwen4ExpGdnBlockWeights(lw.gdn, p);
+      // BUILT ONCE AND HELD BY THE MODEL (issue #2476). A `GdnLayerWeights`
+      // built here per step is a set of handles this scope OWNS, and
+      // `ResidentWeight` writes its residency memo — the device copy, and the
+      // host-alias decision that hands a kernel `bytes.data()` — onto the
+      // handle it is given. So a per-step adapter both re-established residency
+      // every step and destroyed the operand at the closing brace below, with
+      // the block's GEMMs still queued. `lw.gdn_block` outlives every step,
+      // holds no bytes of its own, and is the memo.
+      if (!lw.gdn_block.has_value())
+        lw.gdn_block.emplace(Qwen4ExpGdnBlockWeights(lw.gdn, p));
       const GdnBlockOutput o = RunGdnBlockPaged(
-          d.q, gw, gdn_config, mixed.t(), gdn_step, gdn_meta,
+          d.q, *lw.gdn_block, gdn_config, mixed.t(), gdn_step, gdn_meta,
           caches.gdn[static_cast<size_t>(gdn_i)], T);
       block_out = o.tensor;
       block_store = o.storage;
@@ -445,6 +603,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       block_store = o.storage;
       ++qsa_i;
     }
+    LayerFp(d, il, "blk", block_out);
 
     // ─── :1236-1237  the rank-1 write-back, IN PLACE on the raw stream ──────
     {
@@ -456,6 +615,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       Tensor s = stream.t();
       vt::Qwen4ExpGatedResidualWriteBack(d.q, s, block_out, injection.t(), args);
     }
+    LayerFp(d, il, "s.attn", stream.t());
     block_store.reset();
 
     // ─── :1239  the MLP hyper-connection ────────────────────────────────────
@@ -472,7 +632,9 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
                    "'s MLP hyper-connection has no block_inject_weight");
       Tensor m = mlp_in.t();
       Tensor inj = mlp_injection.t();
-      Tensor bi = lw.mlp_hc.inject.View();
+      // #2449, the MLP twin of the attention site above: same op, same operand
+      // role, same staging.
+      Tensor bi = dense_attn::ResidentWeight(d, lw.mlp_hc.inject, {hc, W});
       vt::Qwen4ExpGatedResidual(
           d.q, m, &inj, stream.t(),
           dense_attn::ResidentWeight(d, lw.mlp_hc.hc_norm, {W}),
@@ -480,6 +642,8 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
           dense_attn::ResidentWeight(d, lw.mlp_hc.up, {W, p.hc_lowrank}), &bi,
           args);
     }
+    LayerFp(d, il, "mhc.mix", mlp_in.t());
+    LayerFp(d, il, "mhc.inj", mlp_injection.t());
 
     // ─── :1240  hidden_states = self.mlp(hidden_states) ─────────────────────
     // Through the SHARED sparse-MoE seam, which is what W5d-4's adapter exists
@@ -493,9 +657,46 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       // `ResidentWeight::d_dev` and re-uploads the tower on a device arm — and
       // it is a SPEED ceiling this wave inherits rather than a wrong answer;
       // the spec's `## Owed` carries the hoist.
-      const MoeBlockWeights mw = Qwen4ExpMoeBlockWeights(
+      //
+      // "RATHER THAN A WRONG ANSWER" HOLDS HERE ONLY BECAUSE THE ADAPTER
+      // BORROWS. `Qwen4ExpMoeBlockWeights` passes the towers through
+      // `BorrowWhole`, so the buffer a queued kernel reads belongs to the model
+      // and the per-step rebuild costs residency work and nothing else. The GDN
+      // adapter next door spelled the same pass-through as assignment, which
+      // deep-copies, and there the per-step rebuild was a freed operand
+      // underneath a queued GEMM (issue #2476). Whoever hoists this must not
+      // read the sentence above as a general licence.
+      // Built OUTSIDE the placed body on purpose: `Qwen4ExpMoeBlockWeights`
+      // takes a non-const reference and mutates it via `OwnedBytes::KeepAlive()`,
+      // so it is not a pure function of the layer and must not be re-evaluated
+      // per placement arm.
+      MoeBlockWeights mw = Qwen4ExpMoeBlockWeights(
           w.layers[static_cast<size_t>(il)].moe, p);
-      const MoeBlockOutput o = RunQwen4ExpMoeBlock(d.q, mw, p, mlp_in.t(), T);
+
+      // ENG-HYBRID-PLACEMENT (#2424): through the SHARED placement seam, inert by
+      // construction when this layer is not placed. The block already has the
+      // seam's shape — a `[T,H]` bf16 block in, an owning `MoeBlockOutput` pair
+      // out — so this is the `qwen3_moe.cpp` adapter verbatim and not a refactor.
+      //
+      // NO `placeable` REFUSAL IS OWED HERE. `Qwen4ExpMoeBlockWeights` fills only
+      // the keep-quant stacked arm or the per-expert bf16 borrowed-view arm and
+      // hard-refuses a third dtype; it never touches `expert_*_fp4`, so this
+      // architecture has no eagerly-device-resident expert arm for the fp4
+      // refusal to protect against. Passing `expert_gate_fp4.empty()` would be
+      // correct but permanently dead, which reads as a guard that is doing
+      // something.
+      //
+      // The lambda's device parameter is `pd`, NOT `p`: `p` is the
+      // `Qwen4ExpParams` this body captures, and shadowing it would silently
+      // compile against the wrong object.
+      const MoePlacedOutput placed = vllm::RunMoePlacedPair(
+          d, il, mlp_in.t(), T, H,
+          [&](dense_attn::Dev pd, const Tensor& h) {
+            MoeBlockOutput b = RunQwen4ExpMoeBlock(pd.q, mw, p, h, T);
+            return MoePlacedOutput{b.tensor, std::move(b.storage)};
+          });
+      const MoeBlockOutput o{placed.tensor, placed.storage};
+      LayerFp(d, il, "moe", o.tensor);
 
       vt::Qwen4ExpGatedResidualArgs args;
       args.hc_count = hc;
@@ -506,6 +707,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       vt::Qwen4ExpGatedResidualWriteBack(d.q, s, o.tensor, mlp_injection.t(),
                                          args);
     }
+    LayerFp(d, il, "s.mlp", stream.t());
   }
 
   VT_CHECK(gdn_i == n_gdn && qsa_i == n_qsa,
@@ -539,11 +741,26 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
         dense_attn::ResidentWeight(d, w.mixer.up, {W, p.hc_lowrank}),
         /*block_inject=*/nullptr, args);
   }
+  LayerFp(d, -1, "out", out.t());
+  LayerFpEndStep();
 
   Qwen4ExpTextModelOutput r;
   r.tensor = out.t();
   r.storage = out.ReleaseShared();
   return r;
 }
+
+namespace detail {
+
+void Qwen4ExpLayerFpResetForTest() {
+  LayerFpState& s = LayerFpS();
+  s.budget = LayerFpBudgetFromEnv();
+  s.step = 0;
+  s.taps = 0;
+}
+
+int64_t Qwen4ExpLayerFpTapsForTest() { return LayerFpS().taps; }
+
+}  // namespace detail
 
 }  // namespace vllm

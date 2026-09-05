@@ -5,10 +5,10 @@
 //
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
 // This row splits its oracles by developer direction (spec `## Oracles`):
-// transformers supplies the ALGORITHM, vLLM supplies the OP FORM. vLLM has never
-// registered `qwen4_exp` at any revision, so there is no vLLM kernel to mirror
-// for the gated residual itself; the grouped RMS norm at its front IS a vLLM op
-// and is mirrored as one.
+// transformers supplied the ALGORITHM and vLLM the OP FORM. SUPERSEDED
+// 2026-08-31 (#2489): vLLM registers `qwen4_exp` at `e126687a9a`, beyond our pin
+// `555967922`, and `nvidia/hyperconnection.py` is the gated residual to mirror.
+// The grouped RMS norm at its front was already a vLLM op and already mirrors.
 //
 //   ALGORITHM  transformers v5.16.0 (the lane pin),
 //              `models/qwen4_exp/modeling_qwen4_exp.py`

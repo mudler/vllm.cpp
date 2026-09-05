@@ -480,6 +480,23 @@ Re-captured with the CANONICAL per-golden capture config (apples-to-apples) and 
 | **~30 model-matrix `*_greedy` rows** (llama/opt/phi/mistral/internlm/minicpm/yi/olmo2/deepseek-v2/glm4-moe-lite/…) | already RATIFIED near-tie-robust gates (`greedy_dist.npy`, `kNearTieMnats=500`) | no re-capture: the distributional gates absorb near-tie drift by construction; validated against OUR unchanged engine by the re-gate ctest. |
 | **op-level goldens** (rmsnorm/rope/silu/moe/causal_conv1d/gdn/l2norm/matmul) | `forward_native` reference math; f32 = dtype-stable/inert, bf16 shown stable via the 27B op-goldens | no re-capture; validated by the op-parity ctests. |
 
+**CORRECTION 2026-09-03 (#2794): the `~30 model-matrix *_greedy rows` row above does NOT
+cover OPT-125m, and OPT's golden was therefore never re-validated at this pin.** That row
+discharges its members on the ground that they are "already RATIFIED near-tie-robust gates
+(`greedy_dist.npy`, `kNearTieMnats=500`)" whose "distributional gates absorb near-tie drift by
+construction". `tests/vllm/models/test_opt_paged_engine.cpp` is not one: its bar is STRICT
+token-exact and its header says "no near-tie band is used here at all", and the body carries no
+`kNearTieMnats`. `git log --follow` over `tests/parity/goldens/opt_greedy/greedy_ids.npy`
+returns one commit, `b8358a5b9`, an ancestor of the `bc415a3e4` pin flip, so nothing has
+touched the golden since it was captured against vLLM 0.25.0 / `e24d1b24`. The premise is false
+for this member, so the discharge does not reach it; the re-capture is owed and is tracked by
+[#2794](https://github.com/mudler/vllm.cpp/issues/2794) together with the same capture at
+`e126687a9a`. The other members of that row are not re-examined here, and this correction makes
+no claim about them. Nothing else in W3b is affected: 27B W4A4, 32B-NVFP4A16, 35B and Coder
+were each really re-captured or re-measured at `55596792`, so the pin does have declared
+token-exact gates. What is false is the wider claim that every strict golden crossed the
+advance.
+
 **No committed golden drifts under apples-to-apples capture.** The W0-W2 §6(d) "27B DRIFTS"
 row is superseded: it measured a near-tie config artifact, not oracle drift.
 

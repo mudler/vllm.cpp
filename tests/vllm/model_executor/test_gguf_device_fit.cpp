@@ -19,9 +19,11 @@
 
 #include "support/test_env.h"
 #include "vllm/gguf_builder.h"
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -699,12 +701,24 @@ TEST_CASE(
 
   // And the residency itself, stated directly in the same role, so a reader
   // does not have to infer it from the predicate above.
+  //
+  // #2516: NAMED DEVICES, not `CurrentPlatform()`. This case is about the CPU
+  // and CUDA `vec_dot` kernels #2247 added, and asking the running platform made
+  // it RED on every ROCm build for a reason the case did not state --
+  // `DeviceKeepQuantSupported` serves exactly {Q8_0, Q4_K, Q5_K, Q6_K} there
+  // (#1940 owns the gap). Both answers are pinned instead, because the ROCm one
+  // is a real property of this tree and a case that merely skipped it would stop
+  // noticing when #1940 lands.
   for (const vllm::GgufTensorInfo& t : gguf.Tensors()) {
     CAPTURE(t.name);
     CHECK(vllm::RouteGgufTensor(true, false, false, false,
                                 vllm::GgufTensorRole::kStackedExpertWeight,
-                                t.ggml_type,
-                                t.shape) == vllm::GgufResidency::kKeepQuant);
+                                t.ggml_type, t.shape, vt::DeviceType::kCPU) ==
+          vllm::GgufResidency::kKeepQuant);
+    CHECK(vllm::RouteGgufTensor(true, false, false, false,
+                                vllm::GgufTensorRole::kStackedExpertWeight,
+                                t.ggml_type, t.shape, vt::DeviceType::kROCM) ==
+          vllm::GgufResidency::kExpandBf16);
   }
 }
 
@@ -773,4 +787,176 @@ TEST_CASE(
   CHECK(on.streamed_tensor_count == 1);
   CHECK(on.streamed_bytes == kF16TowerStaged);
   CHECK(on.lower_bound_bytes == 256);
+}
+
+// ── #2517: the fit check credits the plan installed 220 lines above it ───────
+//
+// Measured on `strix:gpu0`, three consecutive lines of ONE load:
+//   "device placement INSTALLED: 56 layers run their routed experts on cpu"
+//   "--fit placed 56 layer(s) (147798884352 B) to bring a 216433205760 B
+//    footprint under a 68719476736 B budget"
+//   "cannot serve this GGUF: staging its weights needs at least 216433205760
+//    bytes"
+// The refusal quoted the UN-reduced figure. Nothing in `CheckDeviceWeightFit`
+// carried any representation of a resolved placement, so there was no path by
+// which the placed bytes could be subtracted.
+namespace {
+
+// Three layers, one routed-expert tower each, plus one non-expert tensor.
+//   tower: Q8_0 [E=4, N=2, K=32] = 256 elems = 8 blocks * 34 = 272 B on disk,
+//          512 B expanded to bf16, so `min` takes 272.
+//   embd:  F32 8 elems = 32 B on disk, 16 B expanded, so `min` takes 16.
+// Whole-file bound with no plan: 3*272 + 16 = 832.
+constexpr size_t kPlaceTowerStaged = 272;
+constexpr size_t kPlaceEmbdStaged = 16;
+constexpr size_t kPlaceLayers = 3;
+constexpr size_t kPlaceWholeBound =
+    kPlaceLayers * kPlaceTowerStaged + kPlaceEmbdStaged;
+
+std::string BuildGgufWithPerLayerExpertTowers() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  for (size_t l = 0; l < kPlaceLayers; ++l) {
+    b.AddTensor("blk." + std::to_string(l) + ".ffn_gate_exps.weight",
+                {32, 2, 4}, /*ggml_type=*/8, [] {
+                  std::string s;
+                  for (int i = 0; i < 8; ++i) s += Q8Block();
+                  return s;
+                }());
+  }
+  b.AddTensor("token_embd.weight", {4, 2}, /*ggml_type=*/0,
+              std::string(32, '\1'));
+  return b.Build();
+}
+
+// Built through the production resolver, not by hand, so a pass cannot come
+// from a per-layer vector this test invented.
+vllm::MoePlacementPlan PlanPlacingTrailing(vt::DeviceType engine,
+                                           int64_t first_placed) {
+  std::vector<vllm::PlacementOverride> ov;
+  for (int64_t l = first_placed; l < static_cast<int64_t>(kPlaceLayers); ++l)
+    ov.push_back({vllm::LlmFfnExpsBlockRegex(l), "cpu"});
+  return vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(ov, engine),
+      static_cast<int64_t>(kPlaceLayers));
+}
+
+}  // namespace
+
+TEST_CASE("#2517: a placed routed-expert tower leaves the staged footprint") {
+  TempFile f(BuildGgufWithPerLayerExpertTowers());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+
+  // NULL PLAN: byte-for-byte the pre-#2517 answer, which is what every load in
+  // this tree that configured no placement gets.
+  const vllm::GgufStagedFootprint bare = vllm::GgufStagedWeightFootprint(gguf);
+  CHECK(bare.lower_bound_bytes == kPlaceWholeBound);
+  CHECK(bare.placed_tensor_count == 0);
+  CHECK(bare.placed_bytes == 0);
+  CHECK(bare.tensor_count == kPlaceLayers + 1);
+
+  // A plan that PLACES NOTHING is the same answer again, through the other
+  // door: `cpu_moe` on a CPU engine resolves to exactly this.
+  const vllm::MoePlacementPlan trivial =
+      PlanPlacingTrailing(vt::DeviceType::kCPU, /*first_placed=*/0);
+  REQUIRE_FALSE(trivial.PlacesAnything());
+  const vllm::GgufStagedFootprint inert = vllm::GgufStagedWeightFootprint(
+      gguf, 2, {}, false, &trivial);
+  CHECK(inert.lower_bound_bytes == kPlaceWholeBound);
+  CHECK(inert.placed_tensor_count == 0);
+
+  // TWO OF THREE LAYERS PLACED. The two towers move into `placed_*` and leave
+  // the bound; the third tower and the vocabulary table stay.
+  const vllm::MoePlacementPlan plan =
+      PlanPlacingTrailing(vt::DeviceType::kCUDA, /*first_placed=*/1);
+  REQUIRE(plan.PlacesAnything());
+  const vllm::GgufStagedFootprint placed = vllm::GgufStagedWeightFootprint(
+      gguf, 2, {}, false, &plan);
+  CHECK(placed.placed_tensor_count == 2);
+  CHECK(placed.placed_bytes == 2 * kPlaceTowerStaged);
+  CHECK(placed.lower_bound_bytes == kPlaceTowerStaged + kPlaceEmbdStaged);
+  CHECK(placed.tensor_count == 2);
+  // The bytes are ACCOUNTED, not lost: what left plus what stayed is what was
+  // there. A subtraction that merely shrank the figure would pass the line
+  // above and fail this one.
+  CHECK(placed.lower_bound_bytes + placed.placed_bytes == kPlaceWholeBound);
+}
+
+TEST_CASE("#2517: CheckDeviceWeightFit refuses without the plan and passes "
+          "with it") {
+  TempFile f(BuildGgufWithPerLayerExpertTowers());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+  // A budget that straddles the two figures: 832 does not fit, 288 does. One
+  // file, one budget, one difference.
+  constexpr size_t kBudget = 500;
+  REQUIRE(kPlaceWholeBound > kBudget);
+
+  const vllm::DeviceWeightFit no_plan = vllm::CheckDeviceWeightFit(
+      gguf, "cuda", /*needs_weight_staging=*/true, kBudget, 2, {}, false,
+      nullptr);
+  CHECK(no_plan.refuse);
+  CHECK(no_plan.needed_bytes == kPlaceWholeBound);
+
+  const vllm::MoePlacementPlan plan =
+      PlanPlacingTrailing(vt::DeviceType::kCUDA, /*first_placed=*/1);
+  const vllm::DeviceWeightFit with_plan = vllm::CheckDeviceWeightFit(
+      gguf, "cuda", /*needs_weight_staging=*/true, kBudget, 2, {}, false,
+      &plan);
+  CHECK_FALSE(with_plan.refuse);
+  CHECK(with_plan.needed_bytes == kPlaceTowerStaged + kPlaceEmbdStaged);
+
+  // A plan that does not place enough still refuses -- and then SAYS what the
+  // placement already took out, so the operator can never again read two
+  // contradictory numbers in consecutive lines of one load.
+  const vllm::MoePlacementPlan partial =
+      PlanPlacingTrailing(vt::DeviceType::kCUDA, /*first_placed=*/2);
+  const vllm::DeviceWeightFit still = vllm::CheckDeviceWeightFit(
+      gguf, "cuda", /*needs_weight_staging=*/true, /*budget_bytes=*/200, 2, {},
+      false, &partial);
+  CHECK(still.refuse);
+  CHECK(still.message.find("ALREADY EXCLUDED") != std::string::npos);
+  CHECK(still.message.find(std::to_string(kPlaceTowerStaged)) !=
+        std::string::npos);
+}
+
+TEST_CASE(
+    "#2516: PeekRoute follows the placement, so the lane predicate and the "
+    "loader agree about a placed tower") {
+  // `GgufExpertTowersReachSlotLane` is the PRODUCTION consumer of `PeekRoute`,
+  // and it asks about the same tensors, in the same role, that
+  // `LoadStackedExperts` then routes. This case enters through that predicate
+  // rather than through `Route` directly, so it measures the pair rather than
+  // the function.
+  TempFile f(BuildGgufWithIQuantExpertTowers());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+  vllm::GgufLoadPolicy rocm = PolicyWith(true, false, false, false);
+  rocm.device = vt::DeviceType::kROCM;
+
+  // NO PLAN: ROCm has no IQ `vec_dot` (#1940), so the towers expand and the
+  // predicate is false. This is the state #2516 reports and the inertness pin
+  // for every ROCm load that configures no placement.
+  vllm::ResetActiveMoePlacementPlanForTesting();
+  CHECK_FALSE(
+      vllm::GgufExpertTowersReachSlotLane(gguf, "_exps.weight", rocm));
+
+  // A PLAN over both layers, placing them on the CPU whose `vec_dot` table
+  // covers IQ2_XXS and IQ4_XS: the same file, the same policy, the same
+  // predicate, and now true.
+  {
+    std::vector<vllm::PlacementOverride> ov;
+    for (int64_t l = 0; l < 2; ++l)
+      ov.push_back({vllm::LlmFfnExpsBlockRegex(l), "cpu"});
+    const vllm::MoePlacementPlan plan = vllm::MoePlacementPlan::Resolve(
+        vllm::DevicePlacement::FromOverrides(ov, vt::DeviceType::kROCM),
+        /*num_hidden_layers=*/2);
+    REQUIRE(plan.PlacesAnything());
+    vllm::SetActiveMoePlacementPlan(plan);
+    CHECK(vllm::GgufExpertTowersReachSlotLane(gguf, "_exps.weight", rocm));
+  }
+  vllm::ResetActiveMoePlacementPlanForTesting();
+
+  // ...and it is false again once the plan is gone, so the override belongs to
+  // the plan and is not a latch some earlier case set.
+  CHECK_FALSE(
+      vllm::GgufExpertTowersReachSlotLane(gguf, "_exps.weight", rocm));
 }

@@ -49,6 +49,27 @@ struct DecodedAudio {
 // samples with zero decode ambiguity.
 DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav_bytes, size_t num_bytes);
 
+// The same buffer, but with ANY channel count, reduced to mono by the per-sample
+// MEAN over channels -- upstream's own reduction
+// (`vllm/multimodal/media/audio.py:207-208` @ `9035151d6`, reached by
+// `load_audio`'s `mono=True` default at `:220`; and `ChannelReduction.MEAN` /
+// `AudioSpec.target_channels = 1` at `vllm/multimodal/audio.py:69-70`, which
+// dots3-note selects at
+// `vllm/models/dots3_note/common/processor.py:523-525`).
+//
+// A SIBLING RATHER THAN A WIDENING, so that `DecodeWavPcm16Mono`'s three
+// callers -- parakeet transcription, the ROAD-V1-MM parse path and the voxtral
+// e2e gate -- decode the same bytes to the same samples. Both share ONE chunk
+// walk, which moves two REFUSAL MESSAGES and no sample; `audio_processor.cpp`
+// names both. The mean is accumulated in int32 -- exact over the whole uint16
+// channel domain, and no overflow is representable -- and the answer is the
+// CORRECTLY-ROUNDED float of that exact mean. It is BIT-IDENTICAL to upstream's
+// float32 mean for every power-of-two channel count UP TO 512, C = 1 and C = 2
+// included; that bound is TIGHT, and past it the two may differ by half an ulp
+// with this arm the more accurate. See `.agents/specs/dots3-note.md` 4.16.2.
+// W7c-1, issue #2813.
+DecodedAudio DecodeWavPcm16MeanToMono(const uint8_t* wav_bytes, size_t num_bytes);
+
 // The subset of the whisper-small feature-extractor + config the audio path needs.
 struct AudioProcessorConfig {
   int n_fft = 400;
@@ -73,6 +94,12 @@ class WhisperAudioProcessor {
   WhisperAudioProcessor(AudioProcessorConfig cfg, std::vector<float> mel_filters);
 
   const AudioProcessorConfig& config() const { return cfg_; }
+  // The [num_freq_bins, n_mels] bank this processor multiplies with. Exposed
+  // by dots3-note W7a (#2703) so a gate can compare the SHARED
+  // `MelFilterBankSlaney` construction against the committed
+  // `voxtral_mel_filters_f32.bin` oracle through the object the front end
+  // actually uses, rather than against a second construction beside it.
+  const std::vector<float>& mel_filters() const { return mel_filters_; }
 
   // Compute the log-mel `input_features` [n_mels, n_frames] from a mono waveform
   // at `sample_rate`. If sample_rate != cfg.sampling_rate the (deferred) resample

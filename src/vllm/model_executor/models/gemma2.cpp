@@ -19,6 +19,7 @@
 //     faithfulness and unit-gated bit-exact (W3).
 //
 // Numeric contract: bf16 per-op, matching vLLM's stores (dense_attn_block.h).
+#include "vllm/model_executor/layers/attention/attention.h"
 #include "vllm/model_executor/models/gemma2.h"
 
 #include <cmath>
@@ -194,8 +195,15 @@ DBuf Gemma2AttnBlock(Dev d, const Gemma2AttnWeights& w, const HfConfig& cfg,
   pa.logits_soft_cap = attn_logit_softcap;
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
-  if (sliding_window.has_value() && *sliding_window > 0 && SlidingWindowEnabled())
-    pa.window_size = vt::AttentionWindow{static_cast<int32_t>(*sliding_window - 1), 0};
+  // ENG-ATTENTION-WINDOW (#2388): the window DERIVATION is the shared
+  // resolver's; the predicate stays here because it is model shape, not the
+  // window rule. `SlidingWindowEnabled()` IS the resolver's
+  // `disable_model_sliding_window`, under a local name.
+  if (sliding_window.has_value() && *sliding_window > 0)
+    pa.window_size = ResolveAttentionWindow(
+        /*per_layer=*/std::nullopt, sliding_window,
+        v1::AttentionType::kDecoder,
+        /*disable_model_sliding_window=*/!SlidingWindowEnabled());
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

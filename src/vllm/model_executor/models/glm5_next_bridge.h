@@ -60,12 +60,15 @@
 //
 // **That throw no longer exists.** #2260 landed `DotIQ2XS` and `DotIQ4XS` and
 // wired both into all three CUDA keep-quant dispatch switches, so the fused
-// seam now serves these two encodings instead of refusing them. What still
-// stops this model reaching any of it is one level up and is this row's own:
-// `Glm5NextHostForward` refuses a non-CPU queue by name, because every
-// primitive here is host f32. So the paragraph below is UNCHANGED in force --
-// this file still cannot reach the fused MoE seam -- and only its reason has
-// moved from "the seam would throw" to "the seam is never called from here".
+// seam now serves these two encodings instead of refusing them. W9c-3a
+// (#2464) then spent that discharge: on a CUDA queue `MoeExpertsKeepQuant`
+// stages the routed-expert banks with `dense_attn::ResidentWeight` and runs the
+// fused seam on the device. The paragraph below is UNCHANGED in force all the
+// same, and for a reason that is now structural rather than circumstantial:
+// THIS FILE is the f32 BRIDGE, and the device arm deliberately does not go
+// through it -- it uploads from the `OwnedTensor` sources, which is why
+// `MoeQuantBanks` grew three source pointers. Nothing this bridge decodes
+// reaches a device kernel.
 //
 // It is gated rather than argued:
 //

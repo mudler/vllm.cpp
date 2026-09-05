@@ -77,6 +77,7 @@
 #include "vllm/entrypoints/openai/server_main.h"
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
+#include "vllm/entrypoints/openai/mm_chat_registry.h"
 #include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/config/generation.h"
@@ -1478,85 +1479,91 @@ int VllmServerMain(int argc, char** argv) {
                    " defaults instead)\n";
     }
 
-    // ── MM-SERVE-E2E: wire the multimodal chat seam for image-capable models.
-    // When the model dir carries a preprocessor_config.json the Qwen3-VL image
-    // processor loads, we construct the seam body (MakeQwen3VLImageChatFn) so an
-    // OpenAI image_url request renders the placeholder marker → tokenizes to the
-    // single image_pad id → EXPANDS to N image tokens + mm_features carried onto
-    // the engine request. A text-only model (no preprocessor_config.json) leaves
-    // the seam UNSET → the chat path is byte-identical. The container-format
-    // image codec (PNG/JPEG → RGB) is a NAMED residual: no codec is vendored, so
-    // the production codec rejects encoded images with a clear message (the M2c
-    // single-sequence gate consumes pre-decoded raw RGB). The mm FORWARD (vision
-    // tower + merge + MRoPE/DeepStack on the GPU worker consuming
-    // Request.mm_features) is the remaining MM-SERVE-E2E residual — the engine
-    // model runner has no mm-forward path yet. Kept alive for the server loop.
+    // ── MM-SERVE-E2E: install the multimodal chat seam BY ARCHITECTURE.
     //
-    // #607 L2 / #686: the seam now REFUSES rather than truncates. It is
-    // constructed with a BaseProcessingInfo folding the engine's limits
-    // (loaded->mm_config(), where --limit-mm-per-prompt / --language-model-only
-    // landed) against this seam's own ceiling (Qwen3VLChatSupportedMmLimits —
-    // one image, no video, no audio), so a three-image request is answered with
-    // HTTP 400 "At most 1 image(s) may be provided in one prompt." instead of
-    // being served with its first image. Declared AFTER `loaded` so it is
-    // destroyed BEFORE the MultiModalConfig it references. It shares
-    // `mm_image_proc`'s lifetime shape exactly — both are borrowed by the
-    // closure `chat` holds and both outlive the server loop, which is the only
-    // time the closure runs.
-    std::unique_ptr<vllm::multimodal::BaseProcessingInfo> mm_proc_info;
-    std::unique_ptr<vllm::multimodal::Qwen3VLImageProcessor> mm_image_proc;
-    const std::string preprocessor_config_path =
-        PathUtf8(dir / "preprocessor_config.json");
-    if (fs::exists(NativeUtf8Path(preprocessor_config_path))) {
-      try {
-        vllm::multimodal::Qwen3VLProcessorConfig pcfg =
-            vllm::multimodal::LoadQwen3VLProcessorConfig(
-                preprocessor_config_path, config_path, served_model_name);
-        mm_image_proc =
-            std::make_unique<vllm::multimodal::Qwen3VLImageProcessor>(pcfg);
-        oai::ImageCodecFn codec =
-            [](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
-          // Raw-RGB passthrough (image/x-raw-rgb): the single-sequence e2e /
-          // gate fixture format. A square raw-RGB payload is decoded directly;
-          // any container format (PNG/JPEG) is the NAMED codec residual.
-          if (media.media_type == "image/x-raw-rgb") {
-            const std::size_t n = media.bytes.size();
-            const std::size_t px = n / 3;
-            const auto side =
-                static_cast<int64_t>(std::llround(std::sqrt(
-                    static_cast<double>(px))));
-            if (side <= 0 || static_cast<std::size_t>(side * side * 3) != n) {
-              throw std::runtime_error(
-                  "image/x-raw-rgb payload is not a square HxWx3 buffer");
-            }
-            oai::DecodedImageRgb out;
-            out.rgb = media.bytes;
-            out.height = side;
-            out.width = side;
-            return out;
-          }
+    // ENG-MM-INPUT-PIPELINE (#2475). This block used to decide whether the
+    // server could serve images by asking whether
+    // `<model_dir>/preprocessor_config.json` existed, and then construct
+    // `Qwen3VLImageProcessor` + `MakeQwen3VLImageChatFn` with no branch on the
+    // architecture anywhere in it. `preprocessor_config.json` is not a Qwen3-VL
+    // marker, so a second multimodal checkpoint got Qwen3-VL's processor read
+    // against its own `vision_config` shape, or threw into a swallowed `catch`
+    // and left the server silently on the text-only path. Dispatch is now the
+    // registry's, keyed on the architecture the model registry resolved
+    // (mm_chat_registry.h; mirrors vllm/multimodal/registry.py:176-186, which
+    // resolves `get_model_architecture(model_config)` and refuses BY NAME).
+    //
+    // The three outcomes are `MultiModalChatInstall`: a text-only architecture
+    // installs nothing and the chat path stays byte-identical; a registered
+    // architecture gets its seam; an architecture that declares multimodal
+    // support and cannot build one gets a seam that REFUSES with HTTP 400,
+    // never a silent text answer.
+    //
+    // An image_url request served through an installed seam renders the
+    // placeholder marker → tokenizes to the single image_pad id → EXPANDS to N
+    // image tokens + mm_features carried onto the engine request, and is
+    // answered by `ModelRegistry::Forward`: the runner calls the registration's
+    // `encode_mm` per item, `embed_mm` per step, and fills
+    // `ModelForwardInput::mm` (runner.cpp `execute_mm_encoder`,
+    // `ModelRegistry::EmbedMm`, `forward_input.mm = mm_buffers->mm`). What
+    // ENG-MM-INPUT-PIPELINE P2 (#2379) left owed is named in
+    // `.agents/specs/multimodal-track.md` `## Owed`: one request per step, the
+    // host round-trip inside the merge, and image as the only modality that
+    // reaches the runner.
+    //
+    // The seam OWNS its processor and its `BaseProcessingInfo` (the factory
+    // captures them), so no locals live here for them and a future architecture
+    // cannot get their lifetime wrong by forgetting to add one. `chat` is
+    // declared AFTER `loaded`, and destruction runs in REVERSE of declaration
+    // order, so the closure is destroyed BEFORE the `MultiModalConfig` its
+    // `BaseProcessingInfo` holds by reference. Reordering those two
+    // declarations reverses that and leaves the info holding a dangling
+    // `const MultiModalConfig&`, so the order is load-bearing rather than
+    // incidental.
+    oai::MultiModalChatContext mm_ctx;
+    mm_ctx.architecture = loaded->architecture();
+    mm_ctx.model_dir = PathUtf8(dir);
+    mm_ctx.config_path = config_path;
+    mm_ctx.served_model_name = served_model_name;
+    mm_ctx.tokenizer = &tokenizer;
+    mm_ctx.prompt_fn = chat_prompt_fn;
+    // The container-format image codec (PNG/JPEG → RGB) is a NAMED MM-SERVE
+    // residual: no codec is vendored, so this one rejects encoded images with a
+    // clear message and the M2c single-sequence gate's raw RGB passes through.
+    // It belongs to the SERVER and not to an architecture, which is why it is
+    // supplied here once for every factory rather than grown per model.
+    mm_ctx.codec = [](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
+      // Raw-RGB passthrough (image/x-raw-rgb): the single-sequence e2e /
+      // gate fixture format. A square raw-RGB payload is decoded directly;
+      // any container format (PNG/JPEG) is the NAMED codec residual.
+      if (media.media_type == "image/x-raw-rgb") {
+        const std::size_t n = media.bytes.size();
+        const std::size_t px = n / 3;
+        const auto side =
+            static_cast<int64_t>(std::llround(std::sqrt(
+                static_cast<double>(px))));
+        if (side <= 0 || static_cast<std::size_t>(side * side * 3) != n) {
           throw std::runtime_error(
-              "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
-              "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
-        };
-        mm_proc_info =
-            std::make_unique<vllm::multimodal::BaseProcessingInfo>(
-                loaded->mm_config(), oai::Qwen3VLChatSupportedMmLimits());
-        chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
-            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec),
-            *mm_proc_info));
-        for (const auto& [modality, limit] : mm_proc_info->AllowedMmLimits()) {
-          std::cerr << "server: multimodal limit " << modality << "=" << limit
-                    << " (over the request limit for this seam)\n";
+              "image/x-raw-rgb payload is not a square HxWx3 buffer");
         }
-        std::cerr << "server: multimodal image seam wired (Qwen3-VL processor "
-                     "from "
-                  << preprocessor_config_path << ")\n";
-      } catch (const std::exception& e) {
-        std::cerr << "server: no multimodal image seam (" << e.what()
-                  << "); image requests fall back to the text path\n";
+        oai::DecodedImageRgb out;
+        out.rgb = media.bytes;
+        out.height = side;
+        out.width = side;
+        return out;
       }
-    }
+      throw std::runtime_error(
+          "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
+          "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
+    };
+    // #607 L2 / #686: where --limit-mm-per-prompt / --language-model-only
+    // landed. The seam folds them by min() against the architecture's own
+    // ceiling, so a three-image request is answered with HTTP 400 "At most 1
+    // image(s) may be provided in one prompt." instead of being served with its
+    // first image.
+    mm_ctx.mm_config = &loaded->mm_config();
+    oai::InstallMultiModalChatSeam(chat, loaded->is_multimodal_model(), mm_ctx,
+                                   std::cerr);
 
     // Diagnostic opt-out exists only for same-binary attribution. Production
     // defaults to the capacity-derived fixed pool.

@@ -29,6 +29,8 @@ Upstream sources (Lightricks/LTX-2, packages/ltx-core/src/ltx_core/):
   text_encoders/gemma/encoders/base_encoder.py:49-71 -> which hidden states, and their order
   text_encoders/gemma/gemma_assets.py:104-142       -> the EMBEDDED tokenizer/sidecar tensors
   text_encoders/gemma/feature_extractor.py:28,41,61 -> the EPSILONS, measured by probe
+  text_encoders/gemma/feature_extractor.py:92,94,122 -> the two `.to(dtype)` casts that
+      make the BF16 arm (section 7) two different dtypes rather than one
 
 Usage:
     python3 scripts/gen-ltx2-text-goldens.py \
@@ -285,6 +287,24 @@ def emit_f64(out, name: str, values) -> None:
     for i in range(0, len(flat), 6):
         chunk = ", ".join(_cxx_float(v, 17) for v in flat[i : i + 6])
         out.write("    " + chunk + ",\n")
+    out.write("};\n\n")
+
+
+def emit_u16(out, name: str, values) -> None:
+    """Raw BF16 BIT PATTERNS, not decimal values.
+
+    A bf16 golden emitted as a decimal float and re-narrowed on the C++ side
+    would gate the port against its own rounding, not against upstream's: the
+    two narrowings could disagree and the comparison would still pass. Emitting
+    the 16 bits upstream actually produced makes every bf16 case an EXACT
+    integer comparison instead, so `torch.bfloat16` -> `uint16_t` is the only
+    conversion in the loop and nothing rounds twice.
+    """
+    t = values if isinstance(values, torch.Tensor) else torch.as_tensor(values)
+    flat = t.detach().to(torch.bfloat16).contiguous().view(torch.uint16).reshape(-1).tolist()
+    out.write(f"inline constexpr uint16_t {name}[] = {{\n")
+    for i in range(0, len(flat), 12):
+        out.write("    " + ", ".join(f"0x{int(v):04x}" for v in flat[i : i + 12]) + ",\n")
     out.write("};\n\n")
 
 
@@ -637,6 +657,392 @@ def emit_epsilons(out) -> None:
     out.write("\n")
 
 
+# ---------------------------------------------------------------------------
+# The BF16 arm — A24 wave 1 (LTX25-A24-TEXT-TOWER-BF16)
+# ---------------------------------------------------------------------------
+
+
+class _StableRsqrt:
+    """Run upstream with `torch.rsqrt` replaced by the CORRECTLY ROUNDED one.
+
+    `torch.rsqrt` on bf16 is not a function of its input — the vectorized body
+    and the scalar tail round differently, so the same value gives 0x4065 in a
+    length-1 tensor and 0x4066 in a length-1000 one (measured; 0x4066 is the
+    correctly rounded answer). A port cannot be bit-equal to a kernel that is not
+    bit-equal to itself, and chasing one would fit this machine's SIMD width.
+
+    So each bf16 golden below is emitted TWICE. The module's own output is the
+    oracle and is compared loosely. This variant — upstream's SAME module, with
+    exactly one non-deterministic kernel replaced by the CORRECTLY ROUNDED value,
+    `bf16(1.0 / sqrt(f32(x)))` — is what the port is held to BIT-EXACTLY, so
+    nothing about our arithmetic is left on a tolerance. That is deliberately not
+    "the value the vectorized path computes": the two agree on all but 6 of the
+    32639 finite positive bf16 values, so the phrasings are not interchangeable.
+
+    Nothing else is patched, and `torch.rsqrt` is restored on the way out.
+    """
+
+    def __enter__(self):
+        self._orig = torch.rsqrt
+
+        def correctly_rounded(x, *args, **kwargs):
+            if x.dtype in (torch.bfloat16, torch.float16):
+                return (1.0 / torch.sqrt(x.to(torch.float32))).to(x.dtype)
+            return self._orig(x, *args, **kwargs)
+
+        torch.rsqrt = correctly_rounded
+        return self
+
+    def __exit__(self, *exc):
+        torch.rsqrt = self._orig
+        return False
+
+
+def build_bf16(builder):
+    """The SAME module the f32 section builds, narrowed to upstream's own dtype.
+
+    `distilled.py:109` resolves one pipeline dtype, `torch.bfloat16`, and hands
+    it to `PromptEncoder` at `:111-113`; `base_encoder.py:41` carries the same
+    default. So the bf16 arm is not a second architecture, it is this one at the
+    width upstream constructs it in — which is why the module is built by the
+    f32 builder and cast, rather than rebuilt.
+    """
+    fx = builder()
+    return fx.to(torch.bfloat16)
+
+
+def _bf16_eps_separating_bits() -> list[int]:
+    """The bf16 inputs at which the V2 norm CAN see the epsilon's width.
+
+    A constant slice of `GEMMA_HIDDEN` copies of one bf16 value `x` has variance
+    `bf16(x*x)`, so the whole norm collapses to a function of `x` alone and the
+    domain is sweepable exhaustively. This returns the finite non-negative bf16
+    values at which `x * rsqrt(var + bf16(1e-6))` and `x * rsqrt(var + f32(1e-6))`
+    disagree in bits — the only inputs on which a port that fails to narrow the
+    epsilon is observably wrong. `rsqrt` here is the correctly rounded one, for
+    the reason `_StableRsqrt` gives.
+    """
+    bits = torch.arange(0, 0x7F80, dtype=torch.int32).to(torch.uint16)
+    x = bits.view(torch.bfloat16)
+    var = torch.mean((x * x).unsqueeze(1).expand(-1, GEMMA_HIDDEN), dim=1)
+    def normed(ve: torch.Tensor) -> torch.Tensor:
+        inv = (1.0 / torch.sqrt(ve.to(torch.float32))).to(torch.bfloat16)
+        return (x * inv).view(torch.uint16)
+    narrowed = normed(var + 1e-6)
+    f32_scalar = normed((var.to(torch.float32) + 1e-6).to(torch.bfloat16))
+    return [int(b) for b in bits[narrowed != f32_scalar].tolist()]
+
+
+def emit_bf16_arm(out) -> None:
+    """Upstream executed in bfloat16, and the four facts that are NOT guessable.
+
+    Each of these was measured out of the pinned oracle rather than read off it,
+    and each is emitted so a port cannot restate its own assumption:
+
+      1. `_norm_and_concat_padded_batch` returns FLOAT32 on a bf16 input. Its
+         mean denominator is `(sequence_lengths * d) + eps`, an int64 tensor plus
+         a Python float, which promotes to the default dtype; the f32 mean then
+         carries through every later term. That is why `FeatureExtractorV1.forward`
+         writes `self.aggregate_embed(normed.to(dtype))` at :94 — the cast is the
+         only narrowing V1 does, and a port that runs V1's norm in bf16 is wrong
+         everywhere rather than in the last ulp.
+      2. `norm_and_concat_per_token_rms` IS bf16 throughout, and `encoded_text**2`
+         materializes a bf16 tensor, so each square is rounded to 8 mantissa bits
+         BEFORE the f32-accumulated mean sees it. Squaring in f32 is bit-wrong.
+      3. A Python float paired with a bf16 tensor is narrowed FIRST, so the
+         epsilon that actually reaches this arm is `bf16(1e-6)`, and the rescale
+         factor is `bf16(f32(sqrt(target/source)))`.
+      4. `convert_to_additive_mask` takes the FEATURES' dtype
+         (embeddings_processor.py:117), so the pad value here is
+         `-finfo(bfloat16).max`, not `-finfo(float32).max`.
+
+    Every array is emitted as raw bf16 BIT PATTERNS (`emit_u16`) except the V1
+    norm, which is emitted as f32 because fact 1 says it IS f32.
+    """
+    from ltx_core.text_encoders.gemma.embeddings_processor import (  # noqa: PLC0415
+        _apply_right_pad_order,
+        _compute_right_pad_order,
+        convert_to_additive_mask,
+    )
+    from ltx_core.text_encoders.gemma.feature_extractor import (  # noqa: PLC0415
+        _norm_and_concat_padded_batch,
+        _rescale_norm,
+        norm_and_concat_per_token_rms,
+    )
+
+    out.write("// --- section 7: the BF16 arm, upstream's own resolved dtype (A24) ---\n")
+
+    states_bf16 = [h.to(torch.bfloat16) for h in hidden_states()]
+    stacked_bf16 = torch.stack(states_bf16, dim=-1)
+    emit_u16(out, "kLtxTeBf16Stacked", stacked_bf16)
+
+    # FACT 1, as a gateable scalar and as the f32 array it implies.
+    v1_left = _norm_and_concat_padded_batch(stacked_bf16, mask_left())
+    emit_scalar(out, "kLtxTeBf16NormV1IsF32", int(v1_left.dtype == torch.float32))
+    emit_scalar(
+        out,
+        "kLtxTeBf16NormV2IsBf16",
+        int(norm_and_concat_per_token_rms(stacked_bf16, mask_left()).dtype == torch.bfloat16),
+    )
+
+    for tag, fn in MASK_CASES:
+        mask = fn()
+        emit_f32(out, f"kLtxTeBf16NormV1{tag}", tensor(_norm_and_concat_padded_batch(stacked_bf16, mask)))
+        emit_u16(out, f"kLtxTeBf16NormV2{tag}", norm_and_concat_per_token_rms(stacked_bf16, mask))
+        with _StableRsqrt():
+            emit_u16(
+                out,
+                f"kLtxTeBf16NormV2{tag}Stable",
+                norm_and_concat_per_token_rms(stacked_bf16, mask),
+            )
+
+    # FACT 3, and the reason it is gated by BITS and by a degenerate input rather
+    # than by the algebraic probe the f32 section uses.
+    #
+    # MEASURED: that probe returns 0.0 at bf16. It inverts
+    # `y = v * rsqrt(v**2 + eps)` for eps, and bf16 carries 8 mantissa bits, so
+    # for any v whose square is large against 1e-6 the epsilon does not survive
+    # `variance + eps` at all — `bf16(f32(0.015625) + f32(1e-6))` IS 0.015625.
+    # Emitting the probe's answer would therefore have published `eps == 0`, which
+    # is true of the arithmetic and false of the port's obligation.
+    #
+    # So the epsilon is held two ways that DO discriminate at this width. Its
+    # BITS, which is the value upstream actually adds and the value the port has
+    # to add. And the inputs on which it is the only thing between the port and a
+    # division by zero, run through upstream and emitted as full output tensors.
+    emit_u16(out, "kLtxTeBf16NormEpsBits", torch.tensor([1e-6], dtype=torch.bfloat16))
+
+    # A token whose whole hidden slice is zero: variance == 0, and the epsilon is
+    # the entire denominator. The f32 section's case 5, at upstream's own dtype.
+    zero_var = stacked_bf16.clone()
+    zero_var[0, 0, :, :] = 0.0
+    zero_var_out = norm_and_concat_per_token_rms(zero_var, mask_right())
+    emit_scalar(
+        out, "kLtxTeBf16NormV2ZeroVarianceFinite", int(bool(torch.isfinite(zero_var_out).all()))
+    )
+    emit_u16(out, "kLtxTeBf16NormV2ZeroVariance", zero_var_out)
+    with _StableRsqrt():
+        emit_u16(
+            out,
+            "kLtxTeBf16NormV2ZeroVarianceStable",
+            norm_and_concat_per_token_rms(zero_var, mask_right()),
+        )
+
+    # A variance of the SAME ORDER as the epsilon, which is the only regime in
+    # which a wrong-but-nonzero epsilon is visible at bf16. 2**-10 squares to
+    # 9.5e-07 against the epsilon's 1e-06.
+    tiny = torch.full_like(stacked_bf16, 2.0**-10)
+    tiny_out = norm_and_concat_per_token_rms(tiny, mask_right())
+    emit_u16(out, "kLtxTeBf16NormV2TinyVariance", tiny_out)
+    # What the SAME input reads with the epsilon dropped and with it 100x too
+    # large. Emitted so the C++ side can assert this input DISCRIMINATES rather
+    # than assume it does — if these ever stop differing from the golden above,
+    # the case that uses them reds here instead of passing a wrong port.
+    tiny_f = tiny.to(torch.float32)
+    var_t = torch.mean(tiny**2, dim=2, keepdim=True)
+    for label, eps in (("NoEps", 0.0), ("Eps1e4", 1e-4)):
+        alt = tiny * torch.rsqrt(var_t + eps)
+        alt = alt.reshape(BATCH, SEQ, GEMMA_HIDDEN * NUM_LAYERS)
+        alt = torch.where(mask_right().bool().unsqueeze(-1), alt, torch.zeros_like(alt))
+        emit_u16(out, f"kLtxTeBf16NormV2TinyVariance{label}", alt)
+    del tiny_f
+
+    # AND THE PROBE THAT SEPARATES THE TWO EPSILON WIDTHS, which the tiny-variance
+    # input above does NOT. `2**-10` discriminates against a DROPPED epsilon and
+    # against a 100x one, and it reads the same under `bf16(1e-6)` and under the
+    # un-narrowed `1e-6` — so the arm's own constant could be widened to the f32
+    # literal and every case above would stay green. The port's obligation is to
+    # add the value upstream adds, and this is the input on which that is visible.
+    #
+    # MEASURED at the pin over the whole bf16 domain: exactly 140 of the 32640
+    # finite non-negative bf16 values, all inside [0x384a, 0x3b25], make
+    # `x * rsqrt(var + bf16(1e-6))` differ from `x * rsqrt(var + f32(1e-6))` for a
+    # constant-D slice. Forty of them go in below, one per (b, t, layer) slice, so
+    # every slice's variance is a separating one and the two hypotheses part on
+    # every unmasked output rather than on a lucky few.
+    #
+    # Each slice is CONSTANT over d, so upstream's two rsqrt paths see one value
+    # per slice and this case is held BIT-EXACT, exactly as the tiny-variance and
+    # zero-variance cases are.
+    eps_probe_bits = _bf16_eps_separating_bits()[: BATCH * SEQ * NUM_LAYERS]
+    if len(eps_probe_bits) < BATCH * SEQ * NUM_LAYERS:
+        raise SystemExit(
+            "fewer than B*T*L bf16 values now separate bf16(1e-6) from f32(1e-6) "
+            "in the V2 norm; the epsilon's width is no longer gateable by this "
+            "probe, so pick a new one rather than emitting a golden that cannot fail"
+        )
+    eps_probe = (
+        torch.tensor(eps_probe_bits, dtype=torch.uint16)
+        .view(torch.bfloat16)
+        .reshape(BATCH, SEQ, 1, NUM_LAYERS)
+        .expand(BATCH, SEQ, GEMMA_HIDDEN, NUM_LAYERS)
+        .contiguous()
+    )
+    eps_probe_out = norm_and_concat_per_token_rms(eps_probe, mask_right())
+    emit_u16(out, "kLtxTeBf16NormV2EpsProbeIn", eps_probe)
+    emit_u16(out, "kLtxTeBf16NormV2EpsProbe", eps_probe_out)
+    # THE REJECTED HYPOTHESIS on that same input: upstream's own body with the one
+    # change of adding the epsilon at f32 instead of letting torch narrow it.
+    # Emitted so the C++ side asserts the probe discriminates instead of assuming
+    # it does, and so a port that widens the constant reds against a MEASURED
+    # alternative rather than against an argument.
+    eps_var = torch.mean(eps_probe**2, dim=2, keepdim=True)
+    eps_rejected = eps_probe * torch.rsqrt(
+        (eps_var.to(torch.float32) + 1e-6).to(torch.bfloat16)
+    )
+    eps_rejected = eps_rejected.reshape(BATCH, SEQ, GEMMA_HIDDEN * NUM_LAYERS)
+    eps_rejected = torch.where(
+        mask_right().bool().unsqueeze(-1), eps_rejected, torch.zeros_like(eps_rejected)
+    )
+    if torch.equal(eps_probe_out.view(torch.uint16), eps_rejected.view(torch.uint16)):
+        raise SystemExit(
+            "the V2 epsilon probe no longer separates the bf16-narrowed epsilon "
+            "from the f32 one; pick new probe values rather than emitting a "
+            "golden that cannot fail"
+        )
+    emit_u16(out, "kLtxTeBf16NormV2EpsProbeF32Scalar", eps_rejected)
+
+    # THE RESCALE, AND WHY IT IS PROBED ON A NON-TRIVIAL VECTOR.
+    #
+    # "A Python float paired with a bf16 tensor is narrowed first" holds for `add`
+    # and NOT for `mul`. MEASURED exhaustively over the bf16 domain at the pin:
+    # `t + 1e-6` equals the bf16-narrowed-scalar form at ALL 32640 points and the
+    # f32-scalar form at all but 387, while `t * sqrt(8/6)` equals the F32-scalar
+    # form at all 32639 and the bf16-narrowed one at all but 7881. So the epsilon
+    # really is narrowed and the rescale factor is NOT: two scalar ops, two
+    # answers, and no single rule covers both.
+    #
+    # `_rescale_norm(ones, ...)` CANNOT SEE THAT, and an earlier revision of this
+    # section emitted exactly that probe: `1.0 * f` narrows to `bf16(f)` under
+    # both hypotheses, so its golden agreed with a port that was wrong on nearly a
+    # quarter of every other value. The vector below carries products that
+    # separate them.
+    # The last four are values at which the two hypotheses are KNOWN to differ,
+    # found by sweeping the bf16 exponent range against each factor — two for the
+    # video factor sqrt(8/6) and two for the audio factor sqrt(4/6), because a
+    # value that separates one does not necessarily separate the other. The
+    # generator asserts below that both arms really are discriminated; a probe
+    # that silently stopped separating them would make this whole section a
+    # tautology.
+    probe = torch.tensor(
+        [
+            0.3, -1.7, 0.04, 2.5,
+            0.008056640625, -0.0084228515625,   # video factor
+            0.00872802734375, -0.011474609375,  # audio factor
+        ],
+        dtype=torch.bfloat16,
+    )
+    emit_u16(out, "kLtxTeBf16RescaleProbeIn", probe)
+    emit_u16(out, "kLtxTeBf16RescaleVideoOut", _rescale_norm(probe, VIDEO_INNER, GEMMA_HIDDEN))
+    emit_u16(out, "kLtxTeBf16RescaleAudioOut", _rescale_norm(probe, AUDIO_INNER, GEMMA_HIDDEN))
+    # The REJECTED hypothesis on the same input, emitted so the C++ side asserts
+    # this probe discriminates instead of assuming it does.
+    for label, dim in (("Video", VIDEO_INNER), ("Audio", AUDIO_INNER)):
+        narrowed = torch.tensor(math.sqrt(dim / GEMMA_HIDDEN), dtype=torch.bfloat16)
+        rejected = (probe.to(torch.float32) * narrowed.to(torch.float32)).to(torch.bfloat16)
+        accepted = _rescale_norm(probe, dim, GEMMA_HIDDEN)
+        if torch.equal(accepted.view(torch.uint16), rejected.view(torch.uint16)):
+            raise SystemExit(
+                f"the {label} rescale probe no longer separates the f32-scalar "
+                "hypothesis from the bf16-narrowed one; pick new probe values "
+                "rather than emitting a golden that cannot fail"
+            )
+        emit_u16(out, f"kLtxTeBf16Rescale{label}OutNarrowedScalar", rejected)
+
+    # FACT 5, WHICH IS WHY THE V2 LANE IS GATED AT ONE BF16 ULP AND NOT BIT-EXACT.
+    #
+    # `torch.rsqrt` ON BF16 IS NOT A FUNCTION OF ITS INPUT. The same value gives a
+    # different bf16 answer depending on the tensor's LENGTH, because the
+    # vectorized body and the scalar tail round differently. MEASURED at the pin:
+    # `torch.rsqrt(t)` for t = 0.07763671875 is 0x4065 in a length-1 tensor and
+    # 0x4066 in a length-1000 one. 0x4066 is the correctly rounded answer
+    # (`bf16(1/sqrt(f32))`); 0x4065 is one bf16 ulp below it.
+    #
+    # So there is no implementation a port can choose that is bit-equal to
+    # upstream everywhere, and chasing one would be fitting to this machine's SIMD
+    # width. The port takes the correctly rounded single rounding, and the V2 lane
+    # is held to ONE ULP of upstream's own module output — the format's own
+    # resolution, and exactly the distance upstream disagrees with itself by.
+    #
+    # The count below is what makes that allowance a measurement rather than
+    # slack: it is the number of variance entries, out of B*T*L, at which torch's
+    # two kernel paths disagree on this fixture. The C++ side asserts it is
+    # non-zero, so if a future torch makes rsqrt path-independent the bound stops
+    # being justified HERE rather than silently staying loose.
+    ve = torch.mean(stacked_bf16**2, dim=2, keepdim=True) + 1e-6
+    rsqrt_module = torch.rsqrt(ve)
+    rsqrt_correct = (1.0 / torch.sqrt(ve.to(torch.float32))).to(torch.bfloat16)
+    disagree = int((rsqrt_module.view(torch.uint16) != rsqrt_correct.view(torch.uint16)).sum())
+    emit_scalar(out, "kLtxTeBf16RsqrtSelfDisagree", disagree)
+    emit_scalar(out, "kLtxTeBf16RsqrtEntries", int(ve.numel()))
+    emit_u16(out, "kLtxTeBf16RsqrtModule", rsqrt_module)
+    emit_u16(out, "kLtxTeBf16RsqrtCorrectlyRounded", rsqrt_correct)
+
+    # FACT 2, as a bit-level discriminator: the same variance computed with and
+    # without the intermediate bf16 rounding of each square. If a future torch
+    # stops materializing the square, these two stop differing and the C++ case
+    # that asserts they differ reds HERE rather than passing a wrong port.
+    var_upstream = torch.mean(stacked_bf16**2, dim=2, keepdim=True)
+    var_f32_squares = torch.mean(stacked_bf16.to(torch.float32) ** 2, dim=2, keepdim=True).to(
+        torch.bfloat16
+    )
+    emit_u16(out, "kLtxTeBf16VarianceBf16Squares", var_upstream)
+    emit_u16(out, "kLtxTeBf16VarianceF32Squares", var_f32_squares)
+    emit_scalar(
+        out,
+        "kLtxTeBf16SquaresRoundingIsObservable",
+        int(not torch.equal(var_upstream, var_f32_squares)),
+    )
+
+    # The two extractors, and the conditioning hand-off, at bf16.
+    v1 = build_bf16(build_v1_extractor)
+    v2 = build_bf16(build_v2_extractor)
+    with torch.no_grad():
+        for tag, fn in MASK_CASES:
+            mask = fn()
+            v1_video, v1_audio = v1(states_bf16, mask)
+            v2_video, v2_audio = v2(states_bf16, mask)
+            emit_u16(out, f"kLtxTeBf16V1Video{tag}", v1_video)
+            emit_u16(out, f"kLtxTeBf16V1Audio{tag}", v1_audio)
+            emit_u16(out, f"kLtxTeBf16V2Video{tag}", v2_video)
+            emit_u16(out, f"kLtxTeBf16V2Audio{tag}", v2_audio)
+            with _StableRsqrt():
+                sv, sa = v2(states_bf16, mask)
+            emit_u16(out, f"kLtxTeBf16V2Video{tag}Stable", sv)
+            emit_u16(out, f"kLtxTeBf16V2Audio{tag}Stable", sa)
+
+            # FACT 4: the additive mask inherits the FEATURES' dtype.
+            additive = convert_to_additive_mask(mask, v2_video.dtype)
+            sort_idx, reordered_mask = _compute_right_pad_order(additive)
+            emit_u16(out, f"kLtxTeBf16AdditiveMask{tag}", additive)
+            # `_compute_right_pad_order` REBUILDS the mask with
+            # `finfo(additive_mask.dtype).max` (:37), so the reordered one is bf16
+            # too. THIS is what `Ltx2TextConditioning.additive_mask` holds; the
+            # unreordered array above is what `Ltx2ConvertToAdditiveMask` returns,
+            # and comparing the conditioning against the wrong one of the two was
+            # a real defect in this suite's first draft.
+            emit_u16(out, f"kLtxTeBf16ReorderedMask{tag}", reordered_mask)
+            emit_i64(out, f"kLtxTeBf16SortIdx{tag}", sort_idx)
+            emit_u16(
+                out, f"kLtxTeBf16ReorderedVideo{tag}", _apply_right_pad_order(v2_video, sort_idx)
+            )
+            emit_u16(
+                out, f"kLtxTeBf16ReorderedAudio{tag}", _apply_right_pad_order(v2_audio, sort_idx)
+            )
+            emit_u16(
+                out, f"kLtxTeBf16ReorderedVideo{tag}Stable", _apply_right_pad_order(sv, sort_idx)
+            )
+            emit_u16(
+                out, f"kLtxTeBf16ReorderedAudio{tag}Stable", _apply_right_pad_order(sa, sort_idx)
+            )
+    emit_scalar(
+        out,
+        "kLtxTeBf16AdditiveMaskDtypeIsBf16",
+        int(convert_to_additive_mask(mask_left(), torch.bfloat16).dtype == torch.bfloat16),
+    )
+    out.write("\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -667,6 +1073,7 @@ def main() -> int:
         emit_extractors(out, v1, v2)
         emit_conditioning(out, v2)
         emit_epsilons(out)
+        emit_bf16_arm(out)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

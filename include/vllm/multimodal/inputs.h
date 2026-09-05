@@ -65,6 +65,50 @@ struct AudioKwargs {
   int64_t n_mels = 0;
   int64_t n_frames = 0;
 
+  // ── ADDED BY dots3-note W7a (#2703), additively ────────────────────────────
+  //
+  // Two lengths a mel matrix cannot carry, both DEFAULTED to 0 so every
+  // existing producer and consumer is unchanged: Whisper's `RouteAudioWav`
+  // fills neither and reads neither, and the runner and scheduler never look
+  // inside this struct at all.
+  //
+  // `num_samples` is the waveform's OWN length BEFORE the front end padded it
+  // to a whole chunk. dots3-note's stem masks the padded tail to zero at four
+  // stages from `valid_mel_lens = num_samples // hop_length`
+  // (`nvidia/audio_encoder.py:570-574` @ `9035151d6`), and it MUST: the mel of a
+  // zero-padded tail is not zero, it is the `-8` global-max floor pushed
+  // through `(x + 4) / 4`, a nonzero constant that would otherwise leak through
+  // the 3x3 receptive fields into the last VALID tokens.
+  //
+  // `num_tokens` is the placeholder run length and the tower's output row
+  // count, `ceil(num_samples / token_stride)` (`common/processor.py:771`).
+  // It is NOT derivable from `num_samples // hop_length` halved three times:
+  // at 1281 samples that gives 1 and this gives 2, and the difference is a
+  // stem row the mask zeroed that the span still covers. Two numbers, carried
+  // separately, because upstream computes them separately.
+  int64_t num_samples = 0;
+  int64_t num_tokens = 0;
+
+  // ── ADDED BY dots3-note W7b (#2797), additively ────────────────────────────
+  //
+  // The CHUNK axis. `input_features` is `[num_chunks, n_mels, n_frames]`, one
+  // `chunk_mel_frames`-wide padded mel per `chunk_seconds` segment, which is
+  // upstream's `torch.stack(mel_features, dim=0)` (`nvidia/audio.py:220` @
+  // `9035151d6`). At `num_chunks == 1` that layout is BYTE-IDENTICAL to the one
+  // W7a produced, which is why the default is 1 and why every pre-W7b producer
+  // and consumer is unchanged: Whisper's `RouteAudioWav` fills one mel and
+  // leaves the two vectors empty.
+  //
+  // The two vectors are upstream's `audio_sample_lens` and `token_lens`
+  // (`audio.py:217-218`) and they are NOT derivable from `num_samples` and
+  // `num_tokens` above, which stay the WHOLE waveform's numbers: `num_tokens`
+  // is the placeholder run length the prompt was expanded with, and
+  // `chunk_num_tokens[i]` is how many rows chunk `i` contributes to it. The
+  // last chunk is short, so its two entries are smaller than the others'.
+  int64_t num_chunks = 1;
+  std::vector<int64_t> chunk_num_samples;
+  std::vector<int64_t> chunk_num_tokens;
+
   bool empty() const { return n_frames == 0; }
 };
 

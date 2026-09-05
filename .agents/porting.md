@@ -75,7 +75,7 @@ it. So it has to be checked deliberately, once per ported path:
 
 | Ask | Where upstream answers it |
 |---|---|
-| What dtype does the linear method OUTPUT? | the quant method's `apply`/`out_dtype` (e.g. ModelOpt fp8 uses `torch.get_default_dtype()` = bf16) |
+| What dtype does the linear method OUTPUT? | the quant method's `apply`/`out_dtype` (e.g. ModelOpt fp8 uses `get_current_vllm_config().model_config.dtype` — the MODEL dtype, not the torch default. It read `torch.get_default_dtype()` until vllm#48861 `0b37d8389f`, which is inside the `555967922..e126687a9a` pin advance, so a port that copied the old form now diverges wherever the two differ) |
 | What `kv_cache_dtype` is RESOLVED for this checkpoint? | it is not always the CLI default — vLLM derives it from `kv_cache_quant_algo` in the checkpoint's `quantization_config` |
 | What dtype do the intermediate activation buffers carry? | read the consumer, not the producer: a buffer is only as narrow as whoever reads it |
 | Is a projection one physical GEMM or several? | merged linears (`QKVParallelLinear`, `MergedColumnParallelLinear`) are one, and upstream may requantize mismatched shards rather than decline to merge |

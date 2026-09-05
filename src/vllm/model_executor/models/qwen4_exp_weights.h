@@ -85,6 +85,7 @@
 #define VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_WEIGHTS_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -184,6 +185,23 @@ struct Qwen4ExpLayerWeights {
   Qwen4ExpGatedResidualWeights mlp_hc;
   bool has_ple = false;
   Qwen4ExpPleWeights ple;
+
+  // The shared-seam view of `gdn`, built ONCE and reused by every step (issue
+  // #2476).
+  //
+  // IT IS THE RESIDENCY MEMO, not a speed cache. `ResidentWeight` records its
+  // device copy and its host-alias decision ON THE `OwnedTensor` IT IS HANDED
+  // (`d_dev`, and the re-home that `MakeHostBytesDeviceAliasable` performs). A
+  // `GdnLayerWeights` rebuilt per step is a fresh set of handles, so every step
+  // re-established residency from scratch and every step's temporary OWNED the
+  // buffer a queued kernel was reading. Holding one adapter for the model's
+  // life is what makes the memo mean anything, and it costs no bytes: the
+  // fields are zero-copy views over `gdn`.
+  //
+  // `std::optional` rather than a populated-by-default member, because
+  // `GdnLayerWeights` is only meaningful on a linear-attention layer and an
+  // empty one there would be indistinguishable from a half-built load.
+  std::optional<GdnLayerWeights> gdn_block;
 };
 
 struct Qwen4ExpWeights {

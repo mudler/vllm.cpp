@@ -133,7 +133,34 @@ struct ParamBag {
     names.push_back(name);
     weights.tensors[name] = std::move(values);
   }
+
+  // The SAME stream stored at the module's own dtype, which is what
+  // `param.data.copy_` does on a bf16 module upstream: it ROUNDS into the
+  // parameter rather than keeping the f32 value beside it. A bag that kept the
+  // f32 values here would be WIDER than upstream and its goldens would still be
+  // close — the polarity a value gate cannot catch. A24 wave 2, issue #2720.
+  void PutBf16(const std::string& name, const std::vector<int64_t>& shape) {
+    const std::vector<float> values = ParamValues(name, shape);
+    counts.push_back(static_cast<int64_t>(values.size()));
+    names.push_back(name);
+    std::vector<uint16_t> narrow(values.size());
+    for (size_t i = 0; i < values.size(); ++i) narrow[i] = vt::F32ToBF16(values[i]);
+    weights.bf16[name] = std::move(narrow);
+    weights.dtype = vt::DType::kBF16;
+  }
 };
+
+// How many of these values do NOT survive a bf16 round trip. This is the whole
+// A24 instrument: a digest detects CHANGE and an absmax detects COLLAPSE, and
+// both read identically whichever width produced the buffer. AGENTS.md names the
+// blind spot exactly -- "a token gate cannot detect a dtype that is too wide".
+int64_t CountWiderThanBf16(const std::vector<float>& v) {
+  int64_t n = 0;
+  for (const float x : v) {
+    if (vt::BF16ToF32(vt::F32ToBF16(x)) != x) ++n;
+  }
+  return n;
+}
 
 void CheckManifest(const ParamBag& bag, const char* const* want_names, const int64_t* want_counts,
                    size_t want_size) {
@@ -1299,7 +1326,7 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
   //
   // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
   // trip this. ONE of the five is, not two. The engine reaches
-  // `ltx2_upsampler.cpp:465` through `Ltx2UpsampleVideoLatent`, which
+  // `ltx2_upsampler.cpp:497` through `Ltx2UpsampleVideoLatent`, which
   // `ltx2_video.cpp` calls when a phase asks for the spatial-upsample transform.
   //
   // `kBetaScheduler` USED TO BE LISTED HERE and is not reachable. Its call site
@@ -1432,8 +1459,8 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
 // enumerator that appears in `src/` proves only that the compiler can see it.
 // So the check is on the ENTRY FUNCTION of each arm's chain:
 //
-//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:465)
-//                             <- `Ltx2UpsampleVideoLatent` (:566)
+//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:497)
+//                             <- `Ltx2UpsampleVideoLatent` (:681)
 //                             <- `ltx2_video.cpp`, the phase that upsamples
 //   kBetaScheduler            `Ltx2Schedule` (ltx2_pipeline.cpp:199)
 //                             <- NOTHING
@@ -1573,7 +1600,7 @@ TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable")
   const std::string doc = buf.str();
   REQUIRE(doc.size() > 1000);
 
-  // The ONE arm with a product call site: `ltx2_upsampler.cpp:465` constructs the
+  // The ONE arm with a product call site: `ltx2_upsampler.cpp:497` constructs the
   // SPATIOTEMPORAL upsampler condition, and `ltx2_video.cpp` reaches it through
   // `Ltx2UpsampleVideoLatent`. Named by the word the doc uses for it, since that
   // is what a reader sees.
@@ -1950,6 +1977,39 @@ vllm::Ltx2LatentVolume TemporalUpsamplerLatent() {
   return latent;
 }
 
+
+// `dims=2` (model.py:47) — `conv = torch.nn.Conv2d if dims == 2 else Conv3d`,
+// which reaches `initial_conv`, both ResBlock stacks and `final_conv`. The
+// `upsampler` branch (:55-72) does NOT read `dims`, so the flags stay at the
+// shipped default and this arm differs from `PixelShuffle` above in kernel RANK
+// and in the GroupNorm reduction, nothing else.
+vllm::Ltx2UpsamplerConfig Dims2UpsamplerConfig(const std::string& prefix) {
+  vllm::Ltx2UpsamplerConfig config;
+  config.in_channels = vllm_test::kLtx2UpsInChannels;
+  config.mid_channels = vllm_test::kLtx2UpsMidChannels;
+  config.num_blocks_per_stage = vllm_test::kLtx2UpsBlocksPerStage;
+  config.dims = 2;
+  config.spatial_upsample = true;
+  config.temporal_upsample = false;
+  config.spatial_scale = 2.0;
+  config.rational_resampler = false;
+  config.prefix = prefix;
+  return config;
+}
+
+// 3 frames, so the folded axis differs from H (4) and W (6) and a fold that
+// dropped or transposed it cannot pass by coincidence.
+vllm::Ltx2LatentVolume Dims2UpsamplerLatent() {
+  vllm::Ltx2LatentVolume latent;
+  latent.batch = 1;
+  latent.channels = vllm_test::kLtx2UpsInChannels;
+  latent.frames = vllm_test::kLtx2UpsDims2Frames;
+  latent.height = vllm_test::kLtx2UpsHeight;
+  latent.width = vllm_test::kLtx2UpsWidth;
+  latent.data = Make("ltx2.ups.dims2.latent", latent.elems(), 1.0);
+  return latent;
+}
+
 }  // namespace
 
 TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
@@ -1968,7 +2028,7 @@ TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
   //     the argument does not make the default unreachable — the default IS the
   //     shipped width, which ltx2_upsampler.h has said all along. Only the
   //     Rational1p5 arm reaches it, because `BlurDownsample` runs on the
-  //     rational `den` (ltx2_upsampler.cpp:439) and 1.5 -> {3, 2} is the only
+  //     rational `den` (ltx2_upsampler.cpp:599) and 1.5 -> {3, 2} is the only
   //     one of the THREE ARMS with den != 1. (0.75 -> {3, 4} would reach it too
   //     and no arm covers it, so this is arm coverage, not a property of the
   //     supported-scale map.)
@@ -2014,6 +2074,421 @@ TEST_CASE("ltx2 the binomial anti-alias kernel is built, not loaded") {
   const std::string message = RefusalMessage([] { (void)vllm::Ltx2RationalForScale(3.0); });
   INFO("refusal = ", message);
   CHECK(Mentions(message, "Unsupported scale"));
+}
+
+// ── A24 WAVE 5: the latent upsampler's BFLOAT16 arm (#2857) ────────────────
+//
+// Upstream resolves ONE model dtype (`distilled.py:109`) and hands it to the
+// latent upsampler at `:138-141`. The case above is the f32 PARITY arm and is
+// unchanged; this one runs the SAME modules, the SAME parameter stream and the
+// SAME latents at the dtype upstream constructs.
+//
+// WHY THIS IS A BAND AND THE ROW'S OTHER GATES ARE NOT. Upstream's own bf16
+// `Conv3d` differs from the same convolution on f32 inputs in 2 of 3840
+// elements -- oneDNN blocks the bf16 path differently -- and the next GroupNorm
+// amplifies those two. No accumulation order reproduces it, so a bit-exact chain
+// gate would be a gate nothing could pass. What makes the band trustworthy is
+// not its size: it is `Separates`, measured by the generator by re-running the
+// whole chain with ONE rule replaced by the alternative the port rejects. A band
+// that reached a rejected rule's distance would admit that rule, and the
+// generator REFUSES to emit such an arm rather than shipping a number beside a
+// mute switch.
+namespace {
+
+ParamBag BuildUpsamplerParamsBf16(const vllm::Ltx2UpsamplerConfig& config) {
+  ParamBag bag;
+  for (const vllm::Ltx2UpsamplerTensorSpec& spec :
+       vllm::EnumerateLtx2UpsamplerTensors(config)) {
+    bag.PutBf16(spec.name, spec.shape);
+  }
+  return bag;
+}
+
+// The latent AS UPSTREAM HANDS IT: the f32 stream rounded into the model dtype,
+// because the tensor reaching `upsample_video` came out of a bf16 DiT. Building
+// it any other way would make the two arms differ in their input as well as in
+// their dtype.
+vllm::Ltx2LatentVolume Bf16Latent(const std::string& stream, int64_t frames, double scale) {
+  vllm::Ltx2LatentVolume latent;
+  latent.batch = 1;
+  latent.channels = vllm_test::kLtx2UpsInChannels;
+  latent.frames = frames;
+  latent.height = vllm_test::kLtx2UpsHeight;
+  latent.width = vllm_test::kLtx2UpsWidth;
+  latent.data = Make(stream, latent.elems(), 1.0);
+  for (float& v : latent.data) {
+    v = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(v * scale)));
+  }
+  return latent;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 the latent upsampler computes at upstream's bfloat16") {
+  auto run = [&](const std::string& tag, const vllm::Ltx2UpsamplerConfig& config,
+                 const vllm::Ltx2LatentVolume& latent, const int64_t* out_shape,
+                 const float* golden, size_t golden_count, double band,
+                 const double* rejected, const int64_t* separates) {
+    const ParamBag bag = BuildUpsamplerParamsBf16(config);
+    REQUIRE(bag.weights.dtype == vt::DType::kBF16);
+
+    const vllm::Ltx2LatentVolume got = vllm::Ltx2LatentUpsample(config, bag.weights, latent);
+    CHECK(got.channels == out_shape[1]);
+    CHECK(got.frames == out_shape[2]);
+    CHECK(got.height == out_shape[3]);
+    CHECK(got.width == out_shape[4]);
+    REQUIRE(got.data.size() == golden_count);
+
+    // THE DTYPE IS THE DELIVERABLE AND THE VALUES CANNOT SHOW IT. A build that
+    // computed this whole chain at f32 would land within the band on most
+    // elements; what it could not do is come back reporting bf16 and carrying
+    // only bf16-representable values.
+    CHECK(got.dtype == vt::DType::kBF16);
+    int64_t wide = 0;
+    for (const float v : got.data) {
+      if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++wide;
+    }
+    INFO("ltx2 upsampler bf16 arm = ", tag, " values wider than bf16 = ", wide);
+    CHECK(wide == 0);
+
+    const double worst = MaxAbsDiff(got.data, golden, golden_count);
+    INFO("ltx2 upsampler bf16 arm = ", tag, " max|diff| = ", worst, " band = ", band);
+    CHECK(worst <= band);
+
+    // AND THE BAND EXCLUDES EVERY RULE THIS ARM CLAIMS TO SEE. Without this the
+    // band is a number nobody checked against anything: it is the assertion that
+    // makes a widened band fail here instead of quietly admitting a wrong rule.
+    for (size_t i = 0; i < 4; ++i) {
+      if (separates[i] == 0) continue;
+      INFO("ltx2 upsampler bf16 arm = ", tag, " rejected rule ", i, " sits at ", rejected[i],
+           " and the band is ", band);
+      CHECK(rejected[i] > band);
+    }
+  };
+
+  SUBCASE("the three spatial arms") {
+#define LTX2_UPS_BF16_SPATIAL(TAG)                                                          \
+  {                                                                                          \
+    const vllm::Ltx2UpsamplerConfig cfg = ReducedUpsamplerConfig(                            \
+        vllm_test::kLtx2Ups##TAG##Rational, vllm_test::kLtx2Ups##TAG##Scale,                 \
+        "ltx2.ups." #TAG ".");                                                               \
+    run(#TAG, cfg, Bf16Latent("ltx2.ups.latent", vllm_test::kLtx2UpsFrames, 1.0),            \
+        vllm_test::kLtx2UpsBf16##TAG##OutShape, vllm_test::kLtx2UpsBf16##TAG##Golden,        \
+        std::size(vllm_test::kLtx2UpsBf16##TAG##Golden),                                     \
+        vllm_test::kLtx2UpsBf16##TAG##Band[0],                                               \
+        vllm_test::kLtx2UpsBf16##TAG##RejectedMaxAbs,                                        \
+        vllm_test::kLtx2UpsBf16##TAG##Separates);                                            \
+  }
+    LTX2_UPS_BF16_SPATIAL(PixelShuffle);
+    LTX2_UPS_BF16_SPATIAL(Rational2);
+    LTX2_UPS_BF16_SPATIAL(Rational1p5);
+#undef LTX2_UPS_BF16_SPATIAL
+  }
+
+  SUBCASE("the TEMPORAL arm, whose upsampler is a Conv3d and which drops a frame") {
+    run("Temporal", TemporalUpsamplerConfig("ltx2.ups.Temporal."),
+        Bf16Latent("ltx2.ups.temporal.latent", vllm_test::kLtx2UpsTemporalFrames, 1.0),
+        vllm_test::kLtx2UpsBf16TemporalOutShape, vllm_test::kLtx2UpsBf16TemporalGolden,
+        std::size(vllm_test::kLtx2UpsBf16TemporalGolden),
+        vllm_test::kLtx2UpsBf16TemporalBand[0], vllm_test::kLtx2UpsBf16TemporalRejectedMaxAbs,
+        vllm_test::kLtx2UpsBf16TemporalSeparates);
+  }
+
+  SUBCASE("the dims=2 arm, whose GroupNorm reduces PER FRAME") {
+    run("Dims2", Dims2UpsamplerConfig("ltx2.ups.Dims2."),
+        Bf16Latent("ltx2.ups.dims2.latent", vllm_test::kLtx2UpsDims2Frames, 1.0),
+        vllm_test::kLtx2UpsBf16Dims2OutShape, vllm_test::kLtx2UpsBf16Dims2Golden,
+        std::size(vllm_test::kLtx2UpsBf16Dims2Golden), vllm_test::kLtx2UpsBf16Dims2Band[0],
+        vllm_test::kLtx2UpsBf16Dims2RejectedMaxAbs, vllm_test::kLtx2UpsBf16Dims2Separates);
+  }
+
+  // THE ARM THAT EXISTS FOR ONE RULE, and the reason it is not "PixelShuffle with
+  // a smaller number in it". `torch.nn.GroupNorm`'s `eps` is a plain Python
+  // attribute, so `.to(bfloat16)` leaves it at f32 -- unlike a registered buffer,
+  // which it narrows. That difference is unobservable while the variance is order
+  // 1, and the FIRST attempt at this suite proved it: the generator refused
+  // `PixelShuffle` outright with the bf16-eps chain at 0.00390625 against a
+  // correct chain at exactly 0.00390625. Scaling the latent puts the first
+  // GroupNorm's variance where the two epsilons part.
+  SUBCASE("the SMALL-VARIANCE arm, where the f32 epsilon becomes observable") {
+    run("SmallVar",
+        ReducedUpsamplerConfig(vllm_test::kLtx2UpsPixelShuffleRational,
+                               vllm_test::kLtx2UpsPixelShuffleScale, "ltx2.ups.PixelShuffle."),
+        Bf16Latent("ltx2.ups.latent", vllm_test::kLtx2UpsFrames,
+                   vllm_test::kLtx2UpsBf16SmallVarScale[0]),
+        vllm_test::kLtx2UpsBf16SmallVarOutShape, vllm_test::kLtx2UpsBf16SmallVarGolden,
+        std::size(vllm_test::kLtx2UpsBf16SmallVarGolden),
+        vllm_test::kLtx2UpsBf16SmallVarBand[0], vllm_test::kLtx2UpsBf16SmallVarRejectedMaxAbs,
+        vllm_test::kLtx2UpsBf16SmallVarSeparates);
+  }
+
+  // EVERY RULE IS SEEN BY SOMETHING. Four goldens that together gate three rules
+  // is the failure this asserts against, and it is asserted on the emitted
+  // coverage rather than on the six subcases above -- an arm that stopped
+  // separating would otherwise just make its own loop body empty.
+  SUBCASE("every rejected rule is separated by at least one arm") {
+    for (size_t i = 0; i < std::size(vllm_test::kLtx2UpsBf16RuleCoverage); ++i) {
+      INFO("rejected rule ", i, " is separated by ", vllm_test::kLtx2UpsBf16RuleCoverage[i],
+           " of the six arms");
+      CHECK(vllm_test::kLtx2UpsBf16RuleCoverage[i] > 0);
+    }
+  }
+}
+
+TEST_CASE("ltx2 upsample_video's per-channel statistics narrow and round twice at bf16") {
+  // R7, and it has TWO halves a single hypothesis would miss. `un_normalize`
+  // writes `self.get_buffer("std-of-means").view(...).to(x)`
+  // (video_vae/ops.py:77-79), and `x` is the bf16 latent, so BOTH buffers are
+  // rounded to the model dtype before either multiplies anything; and `x * std`
+  // and `+ mean` are two tensor operations, so there are TWO roundings and not
+  // the one a C++ `a * b + c` would give. The generator measured 71 and 88
+  // separating bf16 words for those two alternatives at this fixture and refuses
+  // to emit if either falls to zero.
+  for (const int64_t sep : vllm_test::kLtx2UpsBf16StatsSeparating) {
+    INFO("R7's alternatives separate on ", sep, " bf16 words");
+    CHECK(sep > 0);
+  }
+
+  vllm::Ltx2UpsamplerConfig config = ReducedUpsamplerConfig(
+      vllm_test::kLtx2UpsPixelShuffleRational, vllm_test::kLtx2UpsPixelShuffleScale,
+      "ltx2.ups.PixelShuffle.");
+  const ParamBag bag = BuildUpsamplerParamsBf16(config);
+
+  vllm::Ltx2LatentVolume latent;
+  latent.batch = 1;
+  latent.channels = vllm_test::kLtx2UpsInChannels;
+  latent.frames = vllm_test::kLtx2UpsFrames;
+  latent.height = vllm_test::kLtx2UpsHeight;
+  latent.width = vllm_test::kLtx2UpsWidth;
+  latent.data.assign(std::begin(vllm_test::kLtx2UpsBf16StatsIn),
+                     std::end(vllm_test::kLtx2UpsBf16StatsIn));
+
+  const std::vector<float> std_of_means(std::begin(vllm_test::kLtx2UpsBf16StatsStd),
+                                        std::end(vllm_test::kLtx2UpsBf16StatsStd));
+  const std::vector<float> mean_of_means(std::begin(vllm_test::kLtx2UpsBf16StatsMean),
+                                         std::end(vllm_test::kLtx2UpsBf16StatsMean));
+
+  // THE GOLDEN IS THE GATE AND THE WIDTH CHECKS ARE NOT, which this case learned
+  // the hard way. Its first version asserted only that the result reported bf16
+  // and carried bf16-representable values, and the mutation that fuses R7's two
+  // roundings into one PASSED it: 4 assertions, 0 failed. A fused rounding
+  // produces a bf16 value too. Only a comparison against upstream's own output
+  // can see which bf16 value it is.
+  const vllm::Ltx2LatentVolume got =
+      vllm::Ltx2UpsampleVideoLatent(config, bag.weights, latent, std_of_means, mean_of_means);
+  REQUIRE(got.data.size() == std::size(vllm_test::kLtx2UpsBf16UpsampleVideoGolden));
+  CHECK(got.channels == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[1]);
+  CHECK(got.frames == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[2]);
+  CHECK(got.height == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[3]);
+  CHECK(got.width == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[4]);
+
+  const double worst = MaxAbsDiff(got.data, vllm_test::kLtx2UpsBf16UpsampleVideoGolden,
+                                  std::size(vllm_test::kLtx2UpsBf16UpsampleVideoGolden));
+  INFO("upsample_video at bf16, max|diff| from upstream = ", worst);
+  CHECK(worst == 0.0);
+
+  // And both R7 alternatives move this output well clear of that, measured
+  // through the SAME function rather than on the isolated tensors: a rule that
+  // separates in isolation and not here would gate nothing where it matters.
+  for (const double rejected : vllm_test::kLtx2UpsBf16UpsampleVideoRejectedMaxAbs) {
+    INFO("a rejected R7 rule sits at ", rejected, " and this port is at ", worst);
+    CHECK(rejected > worst);
+  }
+
+  CHECK(got.dtype == vt::DType::kBF16);
+  int64_t wide = 0;
+  for (const float v : got.data) {
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++wide;
+  }
+  INFO("upsample_video bf16 values wider than bf16 = ", wide);
+  CHECK(wide == 0);
+}
+
+TEST_CASE("ltx2 the upsampler's bf16 arm is EXACTLY half the f32 arm's bytes") {
+  // THE ROW'S STATED DELIVERABLE IS A STORAGE WIDTH, and until this case nothing
+  // measured one. Every other assertion in this file is value-shaped: it reads
+  // the width a stage REPORTS and the bits its output carries. The review of this
+  // row built the counter-example and ran it -- `Volume::Alloc` sizing by
+  // `sizeof(float)` on both arms, `Load`/`Store` always f32, `Store` still
+  // rounding each value to bf16 -- and every value, every golden and every
+  // reported `dtype` came out bit-identical across 9125 assertions while the
+  // buffers held twice the bytes. That is the polarity AGENTS.md names: "a token
+  // gate cannot detect a dtype that is too wide".
+  //
+  // WHY TWO RUNS AND NOT A NUMBER. `Ltx2VaeWeights::Bytes()` documents the shape
+  // for the weight bag -- "the bf16 arm must be exactly half the f32 arm's on the
+  // same tensor set, taken on the same input so no number is quoted"
+  // (ltx2_audio_vae.h:104-107) -- and this is that shape applied to the volumes
+  // and parameter reads the bag does not cover. A fixture size baked into an
+  // expectation would have to be re-measured every time the fixture moved; a
+  // ratio between two runs of the SAME config does not.
+  //
+  // WHY EVERY ARM AND NOT ONE. The first version of this case ran `PixelShuffle`
+  // alone, and one arm does not reach one file. `ltx2_upsampler.cpp` has nine
+  // `Volume::Alloc` call sites; `PixelShuffle` reaches four of them, and the two
+  // byte cases in this tree together reached six. `BlurDownsample`'s output
+  // volume is reachable only through `SpatialRationalResampler` at `den > 1`
+  // (`Ltx2RationalForScale(2.0)` is `{2, 1}`, so scale 2.0 short-circuits and
+  // only 1.5 reaches it), and the `dims == 2` fold's two volumes are reachable
+  // only at `dims == 2` -- and both fixtures pinned those arms off. That hole was
+  // not argued, it was executed: widening ONLY `BlurDownsample`'s buffer to
+  // `sizeof(float)`, done inside `Alloc` so the counter reports the widened size
+  // honestly and the values are untouched, left both suites green -- 71 cases /
+  // 4159 assertions and 116 / 5005 -- while the site ran at
+  // `elems=3456 bytes=13824`, four bytes per element where two is correct. So the
+  // ratio is taken PER ARM over every arm this file has a config for, and the
+  // arms together reach all nine sites.
+  // `tag` is a `std::string` and not a `const char*` on purpose: doctest's `INFO`
+  // stringifies a `char*` as a BOOL, so an arm label passed that way prints `1`
+  // and the failing arm is exactly the thing the message has to name.
+  auto measure = [](const std::string& tag, const vllm::Ltx2UpsamplerConfig& config,
+                    const vllm::Ltx2LatentVolume& latent) {
+    // Drain first. The accumulator is read-and-clear and every other case in this
+    // file calls the upsampler without draining, so a leftover would be charged to
+    // whichever arm ran next.
+    (void)vllm::Ltx2TakeUpsamplerStorage();
+
+    const ParamBag f32_bag = BuildUpsamplerParams(config);
+    const vllm::Ltx2LatentVolume f32_out =
+        vllm::Ltx2LatentUpsample(config, f32_bag.weights, latent);
+    const vllm::Ltx2UpsamplerStorage f32_storage = vllm::Ltx2TakeUpsamplerStorage();
+
+    const ParamBag bf16_bag = BuildUpsamplerParamsBf16(config);
+    const vllm::Ltx2LatentVolume bf16_out =
+        vllm::Ltx2LatentUpsample(config, bf16_bag.weights, latent);
+    const vllm::Ltx2UpsamplerStorage bf16_storage = vllm::Ltx2TakeUpsamplerStorage();
+
+    INFO("upsampler storage arm = ", tag);
+
+    // THE SAME WORK ON BOTH ARMS, or the ratio below compares two different runs.
+    CHECK(f32_out.dtype == vt::DType::kF32);
+    CHECK(bf16_out.dtype == vt::DType::kBF16);
+    CHECK(f32_out.data.size() == bf16_out.data.size());
+    REQUIRE(f32_storage.volumes > 0);
+    CHECK(bf16_storage.volumes == f32_storage.volumes);
+    REQUIRE(f32_storage.elems > 0);
+    CHECK(bf16_storage.elems == f32_storage.elems);
+    REQUIRE(f32_storage.param_views > 0);
+    CHECK(bf16_storage.param_views == f32_storage.param_views);
+    REQUIRE(f32_storage.param_elems > 0);
+    CHECK(bf16_storage.param_elems == f32_storage.param_elems);
+
+    // THE VOLUMES. Half, exactly, on identical element counts.
+    INFO("upsampler volumes: f32 held ", f32_storage.bytes, " bytes and bf16 held ",
+         bf16_storage.bytes, ", over ", f32_storage.elems, " elements each");
+    CHECK(bf16_storage.bytes * 2 == f32_storage.bytes);
+
+    // THE PARAMETERS, which is the separate claim that `WeightView` is a VIEW and
+    // not a widened copy. The review replaced it with an owned f32 vector
+    // materialised per construction: bit-identical values, doubled and
+    // re-materialised memory, 4139 assertions green. `param_bytes` is taken off the
+    // member `WeightView::operator[]` dispatches on, so a widened copy reports the
+    // width it reads THROUGH and this ratio breaks.
+    INFO("upsampler parameters: f32 read through ", f32_storage.param_bytes,
+         " bytes and bf16 read through ", bf16_storage.param_bytes, ", over ",
+         f32_storage.param_elems, " parameters each");
+    CHECK(bf16_storage.param_bytes * 2 == f32_storage.param_bytes);
+
+    // AND THE ACCUMULATOR REALLY CLEARS, so the two readings above are two
+    // measurements and not one measurement plus a running total.
+    const vllm::Ltx2UpsamplerStorage drained = vllm::Ltx2TakeUpsamplerStorage();
+    CHECK(drained.volumes == 0);
+    CHECK(drained.bytes == 0);
+    CHECK(drained.param_views == 0);
+    CHECK(drained.param_bytes == 0);
+  };
+
+  // The three SPATIAL arms, taken from the same constants the golden cases use so
+  // the scales are the emitted ones and not a second opinion about them. Only
+  // `Rational1p5` has `den > 1`, and it is the one that reaches `BlurDownsample`.
+  measure("PixelShuffle",
+          ReducedUpsamplerConfig(vllm_test::kLtx2UpsPixelShuffleRational,
+                                 vllm_test::kLtx2UpsPixelShuffleScale, "ltx2.ups.PixelShuffle."),
+          ReducedUpsamplerLatent());
+  measure("Rational2",
+          ReducedUpsamplerConfig(vllm_test::kLtx2UpsRational2Rational,
+                                 vllm_test::kLtx2UpsRational2Scale, "ltx2.ups.Rational2."),
+          ReducedUpsamplerLatent());
+  measure("Rational1p5",
+          ReducedUpsamplerConfig(vllm_test::kLtx2UpsRational1p5Rational,
+                                 vllm_test::kLtx2UpsRational1p5Scale, "ltx2.ups.Rational1p5."),
+          ReducedUpsamplerLatent());
+
+  // The TEMPORAL arm, whose `PixelShuffle1d` and `DropFirstFrame` volumes no
+  // spatial arm allocates.
+  measure("Temporal", TemporalUpsamplerConfig("ltx2.ups.Temporal."), TemporalUpsamplerLatent());
+
+  // And the `dims == 2` fold, whose per-frame `plane` and the `folded` output it
+  // is written back into are the file's remaining two allocation sites.
+  measure("Dims2", Dims2UpsamplerConfig("ltx2.ups.Dims2."), Dims2UpsamplerLatent());
+}
+
+TEST_CASE("ltx2 the upsampler refuses a THIRD storage width by name") {
+  // `RequireUpsamplerDType` is the one place a width other than f32 or bf16 is
+  // refused, and it shipped without a case naming its message. Wave 4's lesson,
+  // applied: asserting a SHARED refusal string gates a different site. The
+  // sibling `RequireVaeDType` (ltx2_video_vae.cpp:214-221) says "ltx2 video vae:
+  // the decode serves", so the token below is asserted precisely because it is
+  // the half no other refusal in this tree emits.
+  const vllm::Ltx2UpsamplerConfig config = ReducedUpsamplerConfig(
+      vllm_test::kLtx2UpsPixelShuffleRational, vllm_test::kLtx2UpsPixelShuffleScale,
+      "ltx2.ups.PixelShuffle.");
+  const vllm::Ltx2LatentVolume latent = ReducedUpsamplerLatent();
+
+  // A bag carrying real parameters, whose `dtype` is a width this stage does not
+  // serve. A bag with no tensors would be refused by `Get` instead, and would
+  // gate the wrong thing.
+  ParamBag bag = BuildUpsamplerParamsBf16(config);
+  bag.weights.dtype = vt::DType::kF16;
+
+  CHECK_THROWS_WITH_AS(vllm::Ltx2LatentUpsample(config, bag.weights, latent),
+                       doctest::Contains("ltx2 upsampler: this stage serves"),
+                       std::runtime_error);
+  // It names the width it was handed, so the message identifies the caller's
+  // mistake rather than only the stage's contract.
+  CHECK_THROWS_WITH(vllm::Ltx2LatentUpsample(config, bag.weights, latent),
+                    doctest::Contains(vt::Name(vt::DType::kF16)));
+  // And `upsample_video` refuses on the same predicate rather than computing the
+  // statistics first and failing three headers away.
+  const std::vector<float> stats(static_cast<size_t>(latent.channels), 1.0f);
+  CHECK_THROWS_WITH_AS(
+      vllm::Ltx2UpsampleVideoLatent(config, bag.weights, latent, stats, stats),
+      doctest::Contains("ltx2 upsampler: this stage serves"), std::runtime_error);
+}
+
+TEST_CASE("ltx2 the blur kernel is a registered buffer, so the bf16 arm narrows it") {
+  // R6, the rule that reads as a no-op and is not. `BlurDownsample` REGISTERS its
+  // binomial kernel (blur_downsample.py:33) and `.to(bfloat16)` narrows a
+  // registered buffer -- unlike a Python float, which it leaves alone. At the
+  // PINNED kernel_size the narrowing moves no entry, because every value is
+  // `{1,4,6,16,24,36}/256` and bf16 holds each exactly.
+  //
+  // That is asserted as ZERO here rather than skipped, and the 9 and 11 entries
+  // beside it are what make the assertion mean something: they prove the probe
+  // CAN see a difference, so "0 at the shipped width" is a measurement and not a
+  // blind spot.
+  REQUIRE(std::size(vllm_test::kLtx2UpsBf16BlurKernelSizes) ==
+          std::size(vllm_test::kLtx2UpsBf16BlurNarrowedEntries));
+  bool control_is_live = false;
+  for (size_t i = 0; i < std::size(vllm_test::kLtx2UpsBf16BlurKernelSizes); ++i) {
+    const int64_t size = vllm_test::kLtx2UpsBf16BlurKernelSizes[i];
+    const int64_t moved = vllm_test::kLtx2UpsBf16BlurNarrowedEntries[i];
+    if (size == vllm::kLtx2BlurKernelSize) {
+      INFO("at the pinned kernel_size ", size, " narrowing moved ", moved, " entries");
+      CHECK(moved == 0);
+    }
+    if (moved > 0) control_is_live = true;
+  }
+  INFO("some kernel_size in the emitted sweep must narrow lossily, or this probe is blind");
+  CHECK(control_is_live);
+
+  // And the narrowed kernel this port builds IS upstream's narrowed buffer.
+  const std::vector<float> kernel = vllm::Ltx2BlurKernel(vllm::kLtx2BlurKernelSize);
+  REQUIRE(kernel.size() == std::size(vllm_test::kLtx2UpsBf16BlurKernel));
+  for (size_t i = 0; i < kernel.size(); ++i) {
+    CHECK(vt::BF16ToF32(vt::F32ToBF16(kernel[i])) ==
+          doctest::Approx(vllm_test::kLtx2UpsBf16BlurKernel[i]));
+  }
 }
 
 TEST_CASE("ltx2 the latent spatial upsampler reproduces upstream") {
@@ -2106,6 +2581,78 @@ TEST_CASE("ltx2 the latent temporal upsampler reproduces upstream") {
   CHECK(vllm::kLtx2UpsamplerTemporalFactor == vllm_test::kLtx2UpsTemporalFactor);
 }
 
+TEST_CASE("ltx2 the latent upsampler reproduces upstream on the dims=2 arm") {
+  // model.py:47 picks Conv2d over Conv3d, and :85-100 folds the frame axis into
+  // the BATCH before running the whole stack and unfolding at :100. Two things
+  // follow and this case is aimed at exactly those two.
+  const vllm::Ltx2UpsamplerConfig config = Dims2UpsamplerConfig("ltx2.ups.Dims2.");
+  const ParamBag bag = BuildUpsamplerParams(config);
+
+  // THE PARAMETER CONTRACT FIRST, and it is the stronger half of this gate.
+  // Four groups are 4-D here where every dims=3 arm builds them 5-D:
+  // `initial_conv` is [mid, in, 3, 3] = 1728 against [mid, in, 3, 3, 3] = 5184,
+  // and each ResBlock conv is [mid, mid, 3, 3] = 9216 against 27648. A port that
+  // reused the 3-D enumeration dies HERE, before a single value is compared.
+  CheckManifest(bag, vllm_test::kLtx2UpsDims2ParamNames, vllm_test::kLtx2UpsDims2ParamCounts,
+                std::size(vllm_test::kLtx2UpsDims2ParamNames));
+  // `upsampler.0.weight` is the ONE conv that does not move: the upsampler
+  // branch never reads `dims`, so it is a Conv2d in the dims=3 spatial arm too.
+  CHECK(bag.weights.Get("ltx2.ups.Dims2.upsampler.0.weight").size() ==
+        static_cast<size_t>(4 * vllm_test::kLtx2UpsMidChannels * vllm_test::kLtx2UpsMidChannels *
+                            3 * 3));
+
+  const vllm::Ltx2LatentVolume latent = Dims2UpsamplerLatent();
+  const vllm::Ltx2LatentVolume got = vllm::Ltx2LatentUpsample(config, bag.weights, latent);
+  CHECK(got.batch == vllm_test::kLtx2UpsDims2OutShape[0]);
+  CHECK(got.channels == vllm_test::kLtx2UpsDims2OutShape[1]);
+  // THE FRAME COUNT COMES BACK UNCHANGED. This is the property that makes the
+  // arm consumable rather than merely computed: both spatial call sites in
+  // ltx2_video.cpp require it (`vshape.frames` at :3525-3531 and
+  // `slot_positions.size()` at :3552-3563).
+  CHECK(got.frames == vllm_test::kLtx2UpsDims2OutShape[2]);
+  CHECK(got.frames == latent.frames);
+  CHECK(got.height == vllm_test::kLtx2UpsDims2OutShape[3]);
+  CHECK(got.width == vllm_test::kLtx2UpsDims2OutShape[4]);
+
+  const double worst =
+      MaxAbsDiff(got.data, vllm_test::kLtx2UpsDims2Golden, std::size(vllm_test::kLtx2UpsDims2Golden));
+  INFO("LatentUpsampler arm = Dims2 max|diff| = ", worst);
+  CHECK(worst <= kRoundOff);
+
+  // THE GROUPNORM REDUCTION, isolated. `(b f)` makes every frame its own sample,
+  // so the statistics run over (channels_per_group, H, W) and NOT over the clip.
+  // With mid_channels = 32 and GroupNorm(32, ...) there is one channel per group,
+  // so the two reductions genuinely differ; running the dims=3 statistic here
+  // returns a correctly shaped, finite, plausible latent that is wrong in every
+  // element, which is why the value golden above — not a shape check — is what
+  // holds this down. Asserted as a PROPERTY too: a per-frame normaliser cannot
+  // make the arm's output depend on frames it was not shown, so upsampling the
+  // middle frame ALONE must reproduce that frame's slice of the full result.
+  vllm::Ltx2LatentVolume one = latent;
+  one.frames = 1;
+  const int64_t plane = latent.height * latent.width;
+  one.data.assign(static_cast<size_t>(latent.channels) * static_cast<size_t>(plane), 0.0f);
+  for (int64_t c = 0; c < latent.channels; ++c) {
+    for (int64_t i = 0; i < plane; ++i) {
+      one.data[static_cast<size_t>(c * plane + i)] =
+          latent.data[static_cast<size_t>((c * latent.frames + 1) * plane + i)];
+    }
+  }
+  const vllm::Ltx2LatentVolume got_one = vllm::Ltx2LatentUpsample(config, bag.weights, one);
+  REQUIRE(got_one.frames == 1);
+  const int64_t out_plane = got.height * got.width;
+  double worst_slice = 0.0;
+  for (int64_t c = 0; c < got.channels; ++c) {
+    for (int64_t i = 0; i < out_plane; ++i) {
+      const double a = got.data[static_cast<size_t>((c * got.frames + 1) * out_plane + i)];
+      const double b = got_one.data[static_cast<size_t>(c * out_plane + i)];
+      worst_slice = std::max(worst_slice, std::fabs(a - b));
+    }
+  }
+  INFO("dims=2 per-frame independence max|diff| = ", worst_slice);
+  CHECK(worst_slice <= kRoundOff);
+}
+
 TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   const vllm::Ltx2LatentVolume latent = ReducedUpsamplerLatent();
   const ParamBag bag = BuildUpsamplerParams(ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.x."));
@@ -2131,16 +2678,95 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   CHECK(Mentions(spatiotemporal_message, "temporal"));
   CHECK(Mentions(spatiotemporal_message, "PixelShuffleND(3)"));
 
-  vllm::Ltx2UpsamplerConfig two_d = ReducedUpsamplerConfig(false, 2.0, "");
-  two_d.dims = 2;
-  CHECK(Mentions(refuse("dims=2", two_d), "dims"));
-
-  // dims=2 is refused for the TEMPORAL arm too, and it has to be checked
-  // separately: the two arms take different branches, so a `dims` guard placed
-  // inside the spatial branch would let a 2-D temporal config through.
+  // `dims=2` is NO LONGER refused — it is ported, and "reproduces upstream on
+  // the dims=2 arm" above gates it against the executed module. What survives
+  // here is the one 2-D combination upstream itself cannot run: the temporal
+  // upsampler is a Conv3d (model.py:68-71) and the dims=2 forward (:85-100)
+  // folds the frame axis into the batch before reaching it.
+  //
+  // NOT "torch raises on the rank", which is what this paragraph used to say and
+  // what `ltx2_upsampler.cpp` and `ltx2_upsampler.h` were corrected to stop
+  // saying. `Conv3d` accepts a 4-D input as an UNBATCHED 5-D one, so the folded
+  // `(b*f, c, h, w)` is read as `(C, D, H, W)` and the CHANNEL count is what
+  // disagrees; at `frames == mid_channels` that Conv3d would pass and
+  // `PixelShuffleND(1)`'s einops pattern fails instead. Two mechanisms behind
+  // one shape coincidence, which is why the port refuses the configuration by
+  // NAME rather than by either of them. `scripts/gen-ltx2-pipeline-goldens.py`
+  // runs both contradictions through the real module and asserts the message.
+  //
+  // Checked through the TEMPORAL config specifically, because the two arms take
+  // different branches and a guard placed inside one of them would let the other
+  // through.
   vllm::Ltx2UpsamplerConfig temporal_two_d = TemporalUpsamplerConfig("");
   temporal_two_d.dims = 2;
-  CHECK(Mentions(refuse("temporal dims=2", temporal_two_d), "dims"));
+  const std::string two_d_message = refuse("temporal dims=2", temporal_two_d);
+  CHECK(Mentions(two_d_message, "dims=2 with temporal_upsample=true"));
+  // NOT the retired "is not ported" refusal, which is the whole point of the
+  // change: a caller who supplies an ordinary 2-D spatial checkpoint must now be
+  // served, and only this contradiction refused.
+  CHECK(two_d_message.find("is not ported") == std::string::npos);
+
+  // THE EIGHTH CELL, where the two dims=2 contradictions are BOTH set and only
+  // one of them is upstream's. `__init__` is an if/elif chain: with
+  // `spatial_upsample` false, `elif temporal_upsample` (model.py:68) builds the
+  // Conv3d and never reads `rational_resampler`, so this config owns no
+  // SpatialRationalResampler at all. Refusing it while naming a module upstream
+  // did not construct sends the caller to the wrong flag.
+  //
+  // This asserts the MESSAGE, not the polarity, because the polarity cannot see
+  // the defect: the config is refused whichever `Require` fires first. Swapping
+  // the two back in `ltx2_upsampler.cpp` leaves every other case green and reds
+  // exactly these two lines.
+  vllm::Ltx2UpsamplerConfig temporal_and_rational = TemporalUpsamplerConfig("");
+  temporal_and_rational.dims = 2;
+  temporal_and_rational.rational_resampler = true;
+  const std::string both_message = refuse("temporal+rational dims=2", temporal_and_rational);
+  CHECK(Mentions(both_message, "dims=2 with temporal_upsample=true"));
+  CHECK(both_message.find("rational_resampler=true") == std::string::npos);
+
+  // THE SIBLING OF THE GUARD ABOVE, and the one this row first shipped without.
+  // `dims=2` with the RATIONAL resampler is upstream's OTHER 2-D contradiction:
+  // `SpatialRationalResampler.forward` opens with `b, _, f, _, _ = x.shape`
+  // (model/upsampler/spatial_rational_resampler.py:41), and the dims=2 forward
+  // reaches it at model.py:94 having ALREADY folded the frame axis into the
+  // batch at :86. Upstream raises
+  // `ValueError: not enough values to unpack (expected 5, got 4)` — the same
+  // mechanism as the temporal case, one line further in.
+  //
+  // Driven with its OWN correctly enumerated weights, because that is the whole
+  // point: every operator inside the rational branch is already per-frame, so a
+  // one-frame volume satisfies all of them and this config computes a complete,
+  // finite, plausible latent that upstream cannot produce. No shape check
+  // anywhere can see it. Only a refusal can.
+  vllm::Ltx2UpsamplerConfig rational_two_d = ReducedUpsamplerConfig(true, 2.0, "ltx2.ups.r2.");
+  rational_two_d.dims = 2;
+  const ParamBag rational_bag = BuildUpsamplerParams(rational_two_d);
+  const std::string rational_two_d_message = RefusalMessage(
+      [&] { (void)vllm::Ltx2LatentUpsample(rational_two_d, rational_bag.weights, latent); });
+  INFO("arm = rational dims=2 refusal = ", rational_two_d_message);
+  CHECK(Mentions(rational_two_d_message, "dims=2 with rational_resampler=true"));
+  CHECK(Mentions(rational_two_d_message, "spatial_rational_resampler.py:41"));
+
+  // THE CONV2D BIAS CONTRACT, which the 3-D helper has had since #644
+  // (`Conv3dPad1`, ltx2_upsampler.cpp:82) and the 2-D one did not. Before this
+  // repair `Conv2dPad1PerFrame` checked only the weight, so a dims=2 checkpoint
+  // carrying a correct kernel and a bias one element short read past the end of
+  // a std::vector — UB and silent garbage — where the identical dims=3 defect
+  // gets a named refusal. Nothing upstream of the helper validates it:
+  // `Ltx2LoadVaeWeights` (ltx2_video.cpp:1490) loads by NAME and checks no shape.
+  //
+  // `initial_conv` is the first of the four groups the dims=2 arm routes through
+  // this helper, so it is the earliest place the read would happen.
+  vllm::Ltx2UpsamplerConfig short_bias_cfg = ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.b2.");
+  short_bias_cfg.dims = 2;
+  ParamBag short_bias = BuildUpsamplerParams(short_bias_cfg);
+  std::vector<float>& initial_bias = short_bias.weights.tensors["ltx2.ups.b2.initial_conv.bias"];
+  REQUIRE(initial_bias.size() == static_cast<size_t>(vllm_test::kLtx2UpsMidChannels));
+  initial_bias.pop_back();
+  const std::string short_bias_message = RefusalMessage(
+      [&] { (void)vllm::Ltx2LatentUpsample(short_bias_cfg, short_bias.weights, latent); });
+  INFO("short conv2d bias refusal = ", short_bias_message);
+  CHECK(Mentions(short_bias_message, "conv2d bias has the wrong element count"));
 
   // Upstream's own ValueError when neither flag is set (model.py:73-74).
   vllm::Ltx2UpsamplerConfig neither = ReducedUpsamplerConfig(false, 2.0, "");
@@ -2372,6 +2998,374 @@ TEST_CASE("ltx2 the Embeddings1DConnector reproduces upstream on every arm") {
   LTX2_CONN_ARM(NoRegisters);
   LTX2_CONN_ARM(GatedNoBias);
 #undef LTX2_CONN_ARM
+}
+
+// ===========================================================================
+// Section 10b — the connector's BFLOAT16 arm (A24 wave 2, row
+// LTX25-A24-CONNECTOR-BF16, issue #2720)
+// ===========================================================================
+
+TEST_CASE("ltx2 the Embeddings1DConnector at BFLOAT16 reproduces upstream on every arm") {
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  const int64_t inner = vllm_test::kLtx2ConnInnerDim;
+
+  // The SAME input the f32 arm runs, narrowed. Upstream is handed a bf16 tensor,
+  // so this IS the input and not a rounding of it.
+  std::vector<float> hidden(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                            std::end(vllm_test::kLtx2ConnBf16Hidden));
+  REQUIRE(hidden.size() == static_cast<size_t>(batch * seq * inner));
+
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+
+  auto run = [&](const std::string& tag, bool interleaved, bool double_precision,
+                 int64_t registers, bool gated, bool ff_bias, const char* const* names,
+                 const int64_t* counts, size_t manifest_size, const float* golden,
+                 size_t golden_count, const float* unpatched, double kernel_gap) {
+    const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+        std::string("ltx2.conn.") + tag + ".", interleaved, double_precision, registers, gated,
+        ff_bias);
+    ParamBag bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      bag.PutBf16(spec.name, spec.shape);
+    }
+    CheckManifest(bag, names, counts, manifest_size);
+    REQUIRE(bag.weights.dtype == vt::DType::kBF16);
+    REQUIRE(bag.weights.tensors.empty());
+
+    const vllm::Ltx2ConnectorOutput got =
+        vllm::Ltx2ConnectorForward(config, bag.weights, hidden.data(), mask.data(), batch, seq);
+
+    // BIT-EXACT, and no tolerance sits under this port's arithmetic. A
+    // format-derived bound was tried first -- two bf16 ulps, 2^-8 relative to the
+    // golden's own magnitude -- and it is 0.0177 to 0.0229 on these five arms
+    // while the port sits at 0.0. A bound with that much slack is a mute switch:
+    // it let a deliberate mis-rounding of SPLIT rope through on four of the five
+    // arms. It is still COMPUTED and REPORTED, so a reader can see how much room
+    // the format would have allowed, and it is not what the gate rests on.
+    double scale = 0.0;
+    for (size_t i = 0; i < golden_count; ++i) scale = std::max(scale, static_cast<double>(std::fabs(golden[i])));
+    const double bound = 2.0 * std::pow(2.0, -8.0) * scale;
+    const double worst = MaxAbsDiff(got.hidden_states, golden, golden_count);
+    INFO("bf16 Embeddings1DConnector arm = ", tag, " max|diff| = ", worst,
+         " (the format would have allowed ", bound, " at max|golden| ", scale, ")");
+    CHECK(worst == 0.0);
+
+    // AND THE DISTANCE TO THE KERNEL TORCH ACTUALLY PICKED IS EXACTLY THE TWO
+    // KERNELS' OWN. The oracle above is `SDPBackend.MATH`, which is bit-equal to
+    // an f32-accumulated attention; the FLASH kernel `AttentionFunction.AUTOMATIC`
+    // resolves to is reproducible by no formula, so holding a port to it would be
+    // fitting this machine's SIMD width instead of upstream's arithmetic. Because
+    // the port is bit-equal to MATH, its distance to the unpatched module must
+    // equal the distance the GENERATOR measured between the two kernels -- a
+    // statement that follows from the line above and would break if either the
+    // port or the goldens moved. It is a sharper claim than any inequality.
+    const double to_unpatched = MaxAbsDiff(got.hidden_states, unpatched, golden_count);
+    INFO("bf16 arm = ", tag, " distance to the UNPATCHED module = ", to_unpatched,
+         ", the two kernels' own distance measured by the generator = ", kernel_gap);
+    CHECK(to_unpatched == doctest::Approx(kernel_gap));
+    // Not vacuous: the two kernels really do disagree on this fixture, so
+    // "bit-exact to MATH" is a choice of oracle and not a coincidence.
+    CHECK(kernel_gap > 0.0);
+    CHECK(kernel_gap <= bound);
+
+    // ── THE DTYPE GATE, IN BOTH DIRECTIONS, ON ONE FIXTURE ────────────────
+    //
+    // (1) every value this arm returns survives a bf16 round trip. An f32 path
+    // cannot pass this. (2) the f32 arm, on the SAME config and the SAME input,
+    // fails it on most of the stream. A fixture whose numbers happened to land on
+    // bf16 grid points would pass (1) whatever arithmetic produced it and would
+    // FAIL (2), so the pair is what makes (1) mean something.
+    ParamBag f32_bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      f32_bag.Put(spec.name, spec.shape);
+    }
+    const vllm::Ltx2ConnectorOutput wide = vllm::Ltx2ConnectorForward(
+        config, f32_bag.weights, hidden.data(), mask.data(), batch, seq);
+    const int64_t narrow_wider = CountWiderThanBf16(got.hidden_states);
+    const int64_t f32_wider = CountWiderThanBf16(wide.hidden_states);
+    INFO("bf16 arm = ", tag, ": wider than bf16 -- bf16 arm ", narrow_wider, " of ",
+         got.hidden_states.size(), ", f32 arm ", f32_wider, " of ", wide.hidden_states.size());
+    CHECK(narrow_wider == 0);
+    // The floor is "most of the stream" and the real number is the WHOLE of it on
+    // every arm measured, so half leaves a factor of two of headroom. A floor
+    // below the real count is a mute switch.
+    CHECK(f32_wider > static_cast<int64_t>(wide.hidden_states.size()) / 2);
+
+    // The mask does NOT narrow. `torch.zeros_like(additive_attention_mask)`
+    // (:152) takes the CALLER's dtype, and the caller's mask is f32 on both arms
+    // — measured on the bf16 module, which reports `zeroed dtype: torch.float32`.
+    // Both arms must therefore agree on it exactly.
+    CHECK(MaxAbsDiff(got.mask, wide.mask.data(), wide.mask.size()) == 0.0);
+  };
+
+#define LTX2_CONN_BF16_ARM(TAG)                                                                \
+  run(#TAG, vllm_test::kLtx2Conn##TAG##Interleaved, vllm_test::kLtx2Conn##TAG##DoublePrecision, \
+      vllm_test::kLtx2Conn##TAG##Registers, vllm_test::kLtx2Conn##TAG##Gated,                   \
+      vllm_test::kLtx2Conn##TAG##FfBias, vllm_test::kLtx2ConnBf16##TAG##ParamNames,             \
+      vllm_test::kLtx2ConnBf16##TAG##ParamCounts,                                               \
+      std::size(vllm_test::kLtx2ConnBf16##TAG##ParamNames),                                     \
+      vllm_test::kLtx2ConnBf16##TAG##Golden,                                                    \
+      std::size(vllm_test::kLtx2ConnBf16##TAG##Golden),                                         \
+      vllm_test::kLtx2ConnBf16##TAG##UnpatchedGolden, vllm_test::kLtx2ConnBf16##TAG##KernelGap)
+  LTX2_CONN_BF16_ARM(Split);
+  LTX2_CONN_BF16_ARM(Interleaved);
+  LTX2_CONN_BF16_ARM(Float64);
+  LTX2_CONN_BF16_ARM(NoRegisters);
+  LTX2_CONN_BF16_ARM(GatedNoBias);
+#undef LTX2_CONN_BF16_ARM
+}
+
+TEST_CASE("ltx2 the connector's bf16 register table is the STORED word, not a re-rounding") {
+  // `learnable_registers` is a BFLOAT16 parameter at BOTH widths
+  // (embeddings_connector.py:135-137), so the two arms must place the SAME number
+  // — one by widening a stored word, the other by rounding an f32 copy. This is
+  // the one place the arms provably agree, and a divergence here says the f32
+  // arm's `RoundToBf16` and the bf16 arm's storage disagree about the value.
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  std::vector<float> hidden(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                            std::end(vllm_test::kLtx2ConnBf16Hidden));
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+  const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+      "ltx2.conn.Split.", /*interleaved=*/false, /*double_precision=*/false,
+      vllm_test::kLtx2ConnSplitRegisters, /*gated=*/false, /*ff_bias=*/true);
+  ParamBag narrow_bag, wide_bag;
+  for (const vllm::Ltx2ConnectorTensorSpec& spec : vllm::EnumerateLtx2ConnectorTensors(config)) {
+    narrow_bag.PutBf16(spec.name, spec.shape);
+    wide_bag.Put(spec.name, spec.shape);
+  }
+  const vllm::Ltx2ConnectorOutput narrow = vllm::Ltx2ConnectorReplaceRegisters(
+      config, narrow_bag.weights, hidden.data(), mask.data(), batch, seq);
+  const vllm::Ltx2ConnectorOutput wide = vllm::Ltx2ConnectorReplaceRegisters(
+      config, wide_bag.weights, hidden.data(), mask.data(), batch, seq);
+
+  // THE STORED TABLE ITSELF, before anything selects from it. At bf16 upstream's
+  // `.to(hidden_states.dtype)` (:146) is an identity, so the parameter as stored
+  // IS the value the substitution places, and widening our stored word must
+  // reproduce it exactly. Only the `Split` arm emits this trio, because the other
+  // three register arms are already gated end to end by their forward goldens,
+  // which the substitution feeds.
+  const std::vector<uint16_t>& stored_bits =
+      narrow_bag.weights.GetBf16(config.prefix + "learnable_registers");
+  REQUIRE(stored_bits.size() == std::size(vllm_test::kLtx2ConnBf16SplitRegistersGolden));
+  std::vector<float> stored_table(stored_bits.size());
+  for (size_t i = 0; i < stored_bits.size(); ++i) stored_table[i] = vt::BF16ToF32(stored_bits[i]);
+  CHECK(MaxAbsDiff(stored_table, vllm_test::kLtx2ConnBf16SplitRegistersGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitRegistersGolden)) == 0.0);
+
+  // Against UPSTREAM first, so this is a port check and not a self-consistency
+  // one. The substitution is a select between two bf16-valued streams, so it is
+  // exact on both arms and no tolerance belongs under it.
+  CHECK(MaxAbsDiff(narrow.hidden_states, vllm_test::kLtx2ConnBf16SplitReplacedGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitReplacedGolden)) == 0.0);
+  CHECK(MaxAbsDiff(narrow.mask, vllm_test::kLtx2ConnBf16SplitZeroedMaskGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitZeroedMaskGolden)) == 0.0);
+  // And then the two routes against each other, which is the claim above.
+  CHECK(MaxAbsDiff(narrow.hidden_states, wide.hidden_states.data(), wide.hidden_states.size()) ==
+        0.0);
+  // NOT VACUOUS: the fixture really does substitute. Row 0 keeps 5 of 8 rows, so
+  // 3 rows per batch element are registers, and a substitution that never fired
+  // would make the equality above a statement about the input.
+  int64_t substituted = 0;
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) ++substituted;
+    }
+  }
+  CHECK(substituted > 0);
+}
+
+TEST_CASE("ltx2 the connector's bf16 rms_norm takes the f32 epsilon, not the narrowed one") {
+  // THE ARM GOLDENS CANNOT HOLD THIS AND SAYING SO IS THE POINT. `1e-6` and
+  // `bf16(1e-6) = 9.98377799987793e-07` differ by 1.6e-9, which is eight orders
+  // below bf16's own resolution, so on rows of ordinary magnitude the two choices
+  // narrow to the same bits everywhere: measured 0 separating values of 49152 at
+  // row scale 2^-2 and above. A24 wave 1's epsilon gate turned out to be a
+  // transcription check on a constant that never reached the arithmetic; this one
+  // reaches it, and the generator refuses to emit the fixture if the two answers
+  // ever stop parting.
+  const int64_t rows = vllm_test::kLtx2ConnBf16EpsRows;
+  const int64_t width = vllm_test::kLtx2ConnBf16EpsWidth;
+  REQUIRE(std::size(vllm_test::kLtx2ConnBf16EpsInput) == static_cast<size_t>(rows * width));
+
+  std::vector<float> got(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                         std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  vllm::Ltx2ConnectorRmsNormRows(got.data(), rows, width, vt::DType::kBF16);
+
+  // Bit-exact against upstream. No tolerance sits under this: both sides are
+  // bf16 values and the reduction is over 24 terms.
+  const double worst = MaxAbsDiff(got, vllm_test::kLtx2ConnBf16EpsGolden,
+                                  std::size(vllm_test::kLtx2ConnBf16EpsGolden));
+  INFO("bf16 rms_norm epsilon probe: max|diff| = ", worst);
+  CHECK(worst == 0.0);
+
+  // THE PROBE SEPARATES, and it says by how much. `kLtx2ConnBf16EpsRejected` is
+  // the answer the bf16-narrowed scalar produces on the same rows; the generator
+  // measured how many values the two part on, and the suite asserts that the port
+  // landed on upstream's and NOT on that one. Without this pair the case above is
+  // a golden that both hypotheses satisfy.
+  INFO("separating values measured by the generator: ", vllm_test::kLtx2ConnBf16EpsSeparating,
+       " of ", rows * width);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsSeparating > 0);
+  const double to_rejected = MaxAbsDiff(got, vllm_test::kLtx2ConnBf16EpsRejected,
+                                        std::size(vllm_test::kLtx2ConnBf16EpsRejected));
+  CHECK(to_rejected > 0.0);
+
+  // And the whole result is bf16-valued, which the f32 arm on the same rows is
+  // not — the same both-directions pair the arm case uses.
+  std::vector<float> as_f32(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                            std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  vllm::Ltx2ConnectorRmsNormRows(as_f32.data(), rows, width, vt::DType::kF32);
+  INFO("wider than bf16: bf16 arm ", CountWiderThanBf16(got), ", f32 arm ",
+       CountWiderThanBf16(as_f32), " of ", got.size());
+  CHECK(CountWiderThanBf16(got) == 0);
+  CHECK(CountWiderThanBf16(as_f32) > static_cast<int64_t>(as_f32.size()) / 2);
+
+  // ── AND THE SAME PROBE ON THE WEIGHTED NORM, WHICH IS A DIFFERENT FUNCTION ──
+  //
+  // Everything above holds `Ltx2ConnectorRmsNormRows`, the connector's WEIGHTLESS
+  // residual norm. The q/k norms inside the attention are
+  // `torch.nn.RMSNorm(inner_dim, eps=norm_eps)` (attention.py:505-506); they run
+  // in the SAME forward on the SAME constant -- `Ltx2ConnectorForward` assigns
+  // `Ltx2AttentionArgs::norm_eps = kLtx2ConnectorRmsNormEps` -- and they reach it
+  // through `Ltx2RmsNormRows`, which had no probe of its own. Measured on this
+  // tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left this binary at
+  // `4018 | 4018 passed` and `test_ltx2_video` at `4951 | 4951 passed`, while
+  // setting it to 1.0 reds 11 -- ten across all five connector arms plus this
+  // probe. So the site is live and reached, and the arm goldens cannot resolve
+  // it -- exactly the hole this case exists to close for the weightless form.
+  std::vector<float> gain(std::begin(vllm_test::kLtx2ConnBf16EpsGain),
+                          std::end(vllm_test::kLtx2ConnBf16EpsGain));
+  REQUIRE(gain.size() == static_cast<size_t>(width));
+  std::vector<float> weighted_in(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                                 std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  std::vector<float> weighted(weighted_in.size());
+  vllm::Ltx2RmsNormRows(weighted_in.data(), gain.data(), weighted.data(), rows, width,
+                        vllm::kLtx2ConnectorRmsNormEps, vt::DType::kBF16);
+  const double weighted_worst = MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedGolden,
+                                           std::size(vllm_test::kLtx2ConnBf16EpsWeightedGolden));
+  INFO("bf16 WEIGHTED rms_norm epsilon probe: max|diff| = ", weighted_worst);
+  CHECK(weighted_worst == 0.0);
+
+  // TWO rejected hypotheses, both emitted beside upstream's answer and both
+  // measured to separate on these rows. (a) the bf16-narrowed epsilon, the same
+  // alternative the weightless probe rejects. (b) rounding the normalized value
+  // into bf16 and THEN multiplying by the gain, instead of the single rounding
+  // `F.rms_norm` does. Spec section 4.1 recorded (b) as "not separable"; executed,
+  // it parts from upstream on 3166 of 12288 values here and on 12647 of 49152 at
+  // ordinary magnitude, so it gets a golden rather than a sentence.
+  INFO("weighted probe separations measured by the generator: eps ",
+       vllm_test::kLtx2ConnBf16EpsWeightedSeparating, ", round-then-multiply ",
+       vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMulSeparating, " of ", rows * width);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsWeightedSeparating > 0);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMulSeparating > 0);
+  CHECK(MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedRejected,
+                   std::size(vllm_test::kLtx2ConnBf16EpsWeightedRejected)) > 0.0);
+  CHECK(MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMul,
+                   std::size(vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMul)) > 0.0);
+
+  // The same both-directions dtype pair the weightless half uses.
+  std::vector<float> weighted_f32(weighted_in.size());
+  vllm::Ltx2RmsNormRows(weighted_in.data(), gain.data(), weighted_f32.data(), rows, width,
+                        vllm::kLtx2ConnectorRmsNormEps, vt::DType::kF32);
+  INFO("weighted, wider than bf16: bf16 arm ", CountWiderThanBf16(weighted), ", f32 arm ",
+       CountWiderThanBf16(weighted_f32), " of ", weighted.size());
+  CHECK(CountWiderThanBf16(weighted) == 0);
+  CHECK(CountWiderThanBf16(weighted_f32) > static_cast<int64_t>(weighted_f32.size()) / 2);
+}
+
+TEST_CASE("ltx2 the bf16 connector narrows the CALLER's stream on BOTH branches") {
+  // WHAT THIS CATCHES, and why no other case here can. Upstream's connector is a
+  // bf16 module and is handed a bf16 TENSOR: `Embeddings1DConnector` is built
+  // inside `PromptEncoder` at the one pipeline dtype (distilled.py:109, :113) and
+  // the encoder hands it its own bf16 output. This port takes `const float*`, so
+  // the narrowing of the caller's stream is the port's own job, and it has to
+  // happen on every branch of the entry point.
+  //
+  // The register branch is the SHIPPED one -- the checkpoint declares 128
+  // registers (ltx2_loader.cpp) -- and the caller really does hand f32 in:
+  // `Ltx2VideoEngine::Load` and `GenerateAudioOnly` feed `RunConnectorFromFile`
+  // the output of `ReadF32File`, an arbitrary user file. The substitution
+  // replaces only the PADDED rows; the kept rows are copied verbatim, so a
+  // narrowing placed inside the no-register branch alone leaves the shipped path
+  // reading sub-bf16 detail upstream cannot have.
+  //
+  // EVERY OTHER bf16 CASE IN THIS FILE IS BLIND TO IT: their fixture is
+  // `hidden.to(bf16)` on both sides, so the input is already bf16-valued and a
+  // missing narrowing is an identity. This case perturbs the fixture by a QUARTER
+  // of a bf16 ulp -- x * (1 + 2^-10), against bf16's own 2^-8 -- and asserts the
+  // forward answers exactly as it does on the pre-narrowed stream. Measured
+  // before the repair: 0.015625 on the register arm, 0 on the no-register one.
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  const int64_t inner = vllm_test::kLtx2ConnInnerDim;
+
+  std::vector<float> perturbed(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                               std::end(vllm_test::kLtx2ConnBf16Hidden));
+  REQUIRE(perturbed.size() == static_cast<size_t>(batch * seq * inner));
+  for (float& v : perturbed) v *= 1.0f + std::ldexp(1.0f, -10);
+  std::vector<float> prenarrowed(perturbed.size());
+  for (size_t i = 0; i < perturbed.size(); ++i) {
+    prenarrowed[i] = vt::BF16ToF32(vt::F32ToBF16(perturbed[i]));
+  }
+  // NOT VACUOUS: the perturbed stream really does carry detail bf16 cannot hold,
+  // and the two inputs really are different numbers. Without this the equality
+  // below would hold for a forward that narrows nothing.
+  INFO("perturbed values wider than bf16: ", CountWiderThanBf16(perturbed), " of ",
+       perturbed.size());
+  REQUIRE(CountWiderThanBf16(perturbed) > static_cast<int64_t>(perturbed.size()) / 2);
+  REQUIRE(MaxAbsDiff(perturbed, prenarrowed.data(), prenarrowed.size()) > 0.0);
+
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+
+  auto both_ways = [&](const std::string& tag, int64_t registers) {
+    const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+        std::string("ltx2.conn.") + tag + ".", /*interleaved=*/false,
+        /*double_precision=*/false, registers, /*gated=*/false, /*ff_bias=*/true);
+    ParamBag bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      bag.PutBf16(spec.name, spec.shape);
+    }
+    REQUIRE(bag.weights.dtype == vt::DType::kBF16);
+    const vllm::Ltx2ConnectorOutput raw = vllm::Ltx2ConnectorForward(
+        config, bag.weights, perturbed.data(), mask.data(), batch, seq);
+    const vllm::Ltx2ConnectorOutput narrowed = vllm::Ltx2ConnectorForward(
+        config, bag.weights, prenarrowed.data(), mask.data(), batch, seq);
+    const double worst =
+        MaxAbsDiff(raw.hidden_states, narrowed.hidden_states.data(), narrowed.hidden_states.size());
+    INFO("bf16 connector arm = ", tag, " (registers = ", registers,
+         "): max|diff| between the raw f32 caller stream and the pre-narrowed one = ", worst);
+    CHECK(worst == 0.0);
+  };
+  // The shipped shape first. `NoRegisters` is the branch that already narrowed,
+  // and it is here so the pair says WHICH branch moved when this reds.
+  both_ways("Split", vllm_test::kLtx2ConnSplitRegisters);
+  both_ways("NoRegisters", vllm_test::kLtx2ConnNoRegistersRegisters);
 }
 
 TEST_CASE("ltx2 the connector's learnable registers are stored BFLOAT16, and rounded") {
@@ -3556,17 +4550,21 @@ TEST_CASE("ltx2 ti2vid: the recipe is the PLAIN two-stage pipeline, not the HQ o
 
   // THE SCHEDULE ANCHOR, and the one field this arm could not be written with
   // before this row. That same `execute` call passes NO latent, so
-  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // `schedulers.py:32` resolves `tokens` to `default_number_of_tokens` = 4096
   // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
   // recipe below — is the ONE upstream site that passes `latent=empty_latent`,
   // and it is the control here precisely because it is the exception. Six other
-  // call sites side with this row; that the engine still derives from the
-  // target grid on three shipped arms is #1150.
+  // call sites side with this row, and #2521 moved the three shipped arms that
+  // still derived from the target grid onto the anchor as well.
   CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
   CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  // The default is today's behaviour, so nothing that predates this row moved.
-  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // #2521 moved these two onto the anchor the other six call sites take.
+  // `ti2vid_one_stage.py:207` and `a2vid_two_stage.py:226` both pass no latent,
+  // and vLLM-Omni hard-codes the max anchor for the one-stage schedule
+  // (`ltx2_denoise.py:188`). `res2s` above stays the control BECAUSE it is
+  // upstream's exception, so this is still a 2-against-1 and not a constant.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
 
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :266-267
   // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
@@ -3821,17 +4819,19 @@ TEST_CASE("ltx2 keyframe: the recipe is the INTERPOLATION pipeline, not the plai
   CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control
 
   // THE SCHEDULE ANCHOR. That same `execute` call passes NO latent, so
-  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // `schedulers.py:32` resolves `tokens` to `default_number_of_tokens` = 4096
   // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
   // recipe — is the ONE upstream site that passes `latent=empty_latent`, and it
-  // is the control here precisely because it is the exception. That three other
-  // shipped arms still derive from the target grid is #1150, not this row.
+  // is the control here precisely because it is the exception. #2521 moved the
+  // three other shipped arms onto the anchor.
   CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
   CHECK(ti2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
   CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  // Nothing that predates this row moved.
-  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // #2521: these two now take the anchor as well, and `res2s` above is still the
+  // one arm that does not — which is what keeps this a discrimination rather
+  // than a constant.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
 
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :244-247
   // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
@@ -3985,6 +4985,147 @@ TEST_CASE("ltx2 keyframe: the recipe is the INTERPOLATION pipeline, not the plai
   CHECK(ti2v.requires_distilled_lora);
   CHECK_FALSE(one.requires_distilled_lora);
   CHECK_FALSE(distilled.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 recipes: the sigma-shift anchor table, every arm that derives a schedule") {
+  // #2521. The arm-by-arm claim in one place, so that "which anchor does this
+  // arm take" is a table a reader can run rather than a property spread over
+  // eight recipe builders.
+  //
+  // THE POPULATION IS CLOSED, and that is the point of asserting it here. Only a
+  // phase whose `sigmas` are EMPTY reaches the anchor at all; a phase carrying
+  // frozen distilled sigmas never evaluates the field. So every row below is
+  // paired with that precondition, and the recipes that cannot reach it are
+  // asserted NOT to, rather than left unmentioned.
+  //
+  // Upstream's split is 6 no-latent against 1 latent
+  // (`git grep -n '\.execute(' fd4ded7f -- packages/ltx-pipelines/src/ltx_pipelines/`),
+  // and vLLM-Omni hard-codes the max anchor on both of its branches
+  // (`ltx2_denoise.py:188`, `:256-260` @ `a4ea67a2`).
+  struct Arm {
+    const char* kind;
+    const char* version;
+    size_t phase;
+    vllm::Ltx2PhaseScheduleTokens want;
+    const char* upstream;
+  };
+  const std::vector<Arm> derived = {
+      {"one_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207 / ltx2_denoise.py:188"},
+      {"one_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207 / ltx2_denoise.py:188"},
+      {"one_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207"},
+      {"one_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207"},
+      {"t2a_one_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"t2a_one_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"t2a_one_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"t2a_one_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"a2vid_two_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      {"a2vid_two_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      {"a2vid_two_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      {"a2vid_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      // ALL FOUR version keys, not the two this table first listed. The resolver
+      // keys `ti2vid_two_stage` and `keyframe_interpolation` at 2, 2.3, 2.4 and
+      // 2.5 alike (`ltx2_pipeline.cpp` resolver, the two `else if` arms that say
+      // "All four generations"), so naming two of four left half the shipped
+      // population of these kinds unasserted.
+      {"ti2vid_two_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"keyframe_interpolation", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"dmd2", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ltx2_denoise.py:256-260, calculate_shift(max_image_seq_len, ...)"},
+      {"dmd2", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ltx2_denoise.py:256-260, calculate_shift(max_image_seq_len, ...)"},
+      // THE EXCEPTION, and the row that stops this table being a constant.
+      {"res2s_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kTargetLatent,
+       "ti2vid_two_stages_hq.py:261-267, execute(latent=empty_latent)"},
+  };
+
+  size_t target_latent_rows = 0;
+  for (const Arm& arm : derived) {
+    // `std::string`, not the bare `const char*`. doctest has no `toString` for a
+    // character pointer, so `<<` decays it to `bool` and every row of this table
+    // logs `kind = 1` — measured, on the mutation that added the `dfr` row
+    // below. A closed population whose failure cannot name the member that
+    // tripped is a list, not a diagnostic.
+    INFO("kind = " << std::string(arm.kind) << "  version = " << std::string(arm.version)
+                   << "  upstream = " << std::string(arm.upstream));
+    const vllm::Ltx2PipelineRecipe recipe =
+        vllm::ResolveLtx2PipelineRecipe(arm.kind, arm.version);
+    REQUIRE(recipe.phases.size() > arm.phase);
+    const vllm::Ltx2PhaseRecipe& phase = recipe.phases[arm.phase];
+    // THE PRECONDITION, asserted rather than assumed: the anchor is consulted
+    // only where the schedule is derived. Were this phase to grow frozen sigmas,
+    // the row below would be pinning a field nothing reads.
+    REQUIRE_MESSAGE(phase.sigmas.empty(),
+                    "this arm no longer derives its schedule, so its anchor is unread and this "
+                    "row asserts nothing");
+    CHECK(phase.schedule_tokens == arm.want);
+    if (arm.want == vllm::Ltx2PhaseScheduleTokens::kTargetLatent) ++target_latent_rows;
+  }
+
+  // NOT A CONSTANT. A build that hard-coded either value would pass one half of
+  // the table and fail the other; this says the table discriminates at all.
+  CHECK_MESSAGE(target_latent_rows == 1u,
+                "the anchor table no longer contains exactly one `kTargetLatent` arm, so it is "
+                "either a constant or upstream's exception has moved");
+
+  // ── and the recipes that CANNOT reach the anchor, asserted as such ────────
+  //
+  // `retake` is the correction this row owed the record: the header comment
+  // predicted the flip would re-sample it, and it does not, because
+  // `RetakeRecipe` pins `DISTILLED_SIGMAS` and so takes upstream's distilled
+  // branch of `retake.py:287` rather than the derived one.
+  //
+  // `dfr` is here for the SAME reason and it is the closure this list was
+  // missing: it is a live shipped kind (resolver, `pipeline_kind == "dfr"`, 2.5
+  // only) that CAN derive, because `DfrRecipe` is `DistilledTwoStageRecipe` with
+  // renamed phases. It cannot today, because that recipe's phases carry frozen
+  // sigmas — which is exactly the fact this loop asserts rather than assumes.
+  // Without the row, a later change that gave DFR's base stage a derived
+  // schedule would move a shipped arm with nothing naming it, which is the
+  // failure the anchor table above exists to prevent.
+  for (const char* kind : {"distilled_two_stage", "retake", "dfr"}) {
+    INFO("kind = " << std::string(kind));
+    const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe(kind, "2.5");
+    REQUIRE_FALSE(recipe.phases.empty());
+    CHECK_MESSAGE(!recipe.phases[0].sigmas.empty(),
+                  "this recipe now derives its schedule, so it has joined the anchor table "
+                  "above and needs a row there");
+  }
+  // Every stage 2 of every two-stage arm is frozen too, which is why the table
+  // above only ever names phase 0.
+  for (const char* kind : {"a2vid_two_stage", "ti2vid_two_stage", "keyframe_interpolation",
+                           "res2s_two_stage"}) {
+    INFO("kind = " << std::string(kind));
+    const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe(kind, "2.5");
+    REQUIRE(recipe.phases.size() == 2u);
+    CHECK_MESSAGE(!recipe.phases[1].sigmas.empty(),
+                  "a stage 2 now derives its schedule and needs its own anchor row");
+  }
 }
 
 TEST_CASE("ltx2 keyframe: all four generations resolve and nothing else does") {

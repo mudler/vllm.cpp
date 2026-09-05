@@ -36,8 +36,15 @@
 //     get_request_counts / has_finished_requests (T0 subset).
 //
 // DEFERRED (marked; matches upstream structure so re-adding is mechanical):
-//   - Encoder inputs (_try_schedule_encoder_inputs), the encoder cache manager,
-//     encoder compute budget.
+//   - Encoder inputs (_try_schedule_encoder_inputs), the encoder cache manager
+//     and the encoder compute budget are LANDED (ENG-MM-INPUT-PIPELINE P2,
+//     #2379). Every one of them is predicated on Request::mm_features being
+//     non-empty, so a text-only engine never constructs an encoder input, never
+//     spends encoder budget, and emits an empty scheduled_encoder_inputs /
+//     free_encoder_mm_hashes exactly as before. STILL DEFERRED inside that
+//     port: the encoder-DECODER manager subclass (Whisper cross-attention),
+//     the EC connector's remote encoder cache, and the EAGLE +1 look-ahead
+//     shift (use_eagle is false here).
 //   - SPEC-MTP (I2, scheduler-half) LANDED the core spec-decode scheduler
 //     plumbing: num_lookahead_tokens (derived from an optional SpeculativeConfig,
 //     0 by default), num_tokens_with_spec in the running-loop budget, the
@@ -81,6 +88,7 @@
 
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
+#include "vllm/v1/core/encoder_cache_manager.h"  // EncoderCacheManager (P2, #2379)
 #include "vllm/distributed/kv_events.h"  // KVEventsConfig, EventPublisher
 #include "vllm/v1/core/kv_cache_manager.h"
 #include "vllm/v1/core/sched/output.h"
@@ -323,6 +331,16 @@ class Scheduler {
   // The KV cache manager the scheduler drives (heap-owned; non-movable).
   std::unique_ptr<KVCacheManager> kv_cache_manager;
 
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): the encoder cache the multimodal
+  // admission path budgets against (scheduler.py:230-238). Upstream builds a
+  // manager unconditionally and gives it `cache_size = 0` when the model has no
+  // multimodal budget; ours is built the same way from
+  // SchedulerConfig::encoder_cache_size. It is only ever CONSULTED for a
+  // request whose mm_features are non-empty, so a text engine's steps do not
+  // touch it. Public because the ported encoder tests inspect it, mirroring
+  // upstream's plain attribute.
+  std::unique_ptr<core::EncoderCacheManager> encoder_cache_manager;
+
   // The rolling prefix-cache hit rate over the most recent 1000 REQUESTS.
   // schedule() folds each step's take-and-swap delta in. This is the engine's
   // answer to "prove the cache is being hit", which the benchmark protocol
@@ -408,6 +426,43 @@ class Scheduler {
   // PREEMPTED event when log_stats_ is on.
   void preempt_request(Request* request, double timestamp);
 
+  // _try_schedule_encoder_inputs (scheduler.py:1379, grep -c == 1). Decide which
+  // of `request`'s multimodal items must have their ENCODER run this step, and
+  // CLAMP `num_new_tokens` so the decoder never runs past an item whose encoder
+  // could not be scheduled.
+  //
+  // THE CLAMP IS THE CORRECTNESS PART, not an optimization. Upstream never
+  // chunks an encoder input: an item is encoded whole the first time any part of
+  // its placeholder span is scheduled, and every later chunk hits the cache. The
+  // one way a decoder chunk can cover placeholder rows with no encoder output is
+  // when the item could NOT be scheduled (budget or cache exhausted), and this
+  // function's fallback — truncate to just before `start_pos`, or refuse the
+  // request this step when prefix caching already carried num_computed_tokens
+  // past it — is what stops that. Without it the runner's gather raises
+  // "Encoder cache miss", which on the serving path is an HTTP 500 for a
+  // perfectly ordinary image request under a small token budget.
+  //
+  // Returns the mm_features INDICES to encode. `num_new_tokens` and
+  // `encoder_compute_budget` are IN/OUT, exactly as upstream returns new values
+  // for both. A request with no mm_features returns {} and touches neither.
+  std::vector<int> try_schedule_encoder_inputs(const Request& request,
+                                               int num_computed_tokens,
+                                               int* num_new_tokens,
+                                               int* encoder_compute_budget);
+
+  // _free_encoder_inputs (scheduler.py:2017, grep -c == 1). Drop this request's
+  // reference to every encoder input whose placeholder span is now fully behind
+  // num_computed_tokens — i.e. already folded into the decoder KV, so no later
+  // step can gather it again. Called from update_from_output, AFTER the step
+  // executed (upstream's comment at :1699 says exactly why). No-op for a request
+  // with no mm_features.
+  void free_encoder_inputs(const Request& request);
+
+  // encoder_cache_manager.free(request) (encoder_cache_manager.py:243): drop
+  // every reference this request holds, on finish or abort. Ours has no
+  // request-shaped overload, so the scheduler spells the loop.
+  void free_request_encoder_inputs(const Request& request);
+
   // ENG-SGLANG-BEHAVIOR-FLAG (SW1): under the `lpm` policy, reorder the waiting
   // queue by descending longest cached-prefix match before the admission loop,
   // so high-cache-hit requests are admitted first (maximizing hit rate). Ported
@@ -478,6 +533,15 @@ class Scheduler {
   // check can convert its block-granular match into tokens for the threshold
   // comparison (see maybe_reorder_waiting_for_lpm).
   int block_size_ = 0;
+  // max_num_encoder_input_tokens (scheduler.py:226-228): the PER-STEP encoder
+  // compute budget in encoder tokens, reset at the top of every schedule().
+  int max_num_encoder_input_tokens_ = 0;
+  // disable_chunked_mm_input (scheduler_config.disable_chunked_mm_input, read at
+  // scheduler.py:1470): when set, a step may not cover only PART of a
+  // multimodal item's placeholder span — the admission rolls back to before the
+  // item instead. Default false, which is upstream's default and the arm the
+  // budget/cache fallback above covers.
+  bool disable_chunked_mm_input_ = false;
   // num_lookahead_tokens (scheduler.py:275-292): reserved verify slots per running
   // request. 0 when no SpeculativeConfig is supplied (default), else derived from
   // it in the ctor via SpeculativeConfig::NumLookaheadTokens (k for MTP). Threaded

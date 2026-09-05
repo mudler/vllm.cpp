@@ -740,7 +740,7 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
   // checkpoint as well as a temporal-only one, so a genuine SPATIOTEMPORAL
   // checkpoint was told it is the temporal x2 upsampler and pointed at the spatial
   // one. Wrong on both counts: it is neither, it is the third arm, and the ledger
-  // refusal that names it (`ltx2_upsampler.cpp:465`) sat behind a guard that could
+  // refusal that names it (`ltx2_upsampler.cpp:497`) sat behind a guard that could
   // not be reached from a request.
   //
   // The defect is an IMPLICATION between two guards over one variable, which no
@@ -778,6 +778,40 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       // is touched, which is what the ledger arm promises.
       CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
+  }
+  // THE REACHABILITY CASE FOR THE dims=2 ARM, and the reason it asserts a
+  // COMPLETED RENDER rather than a changed message. `dims` is read off the
+  // checkpoint's own config (`Ltx2ParseUpsamplerConfig`, mirroring
+  // model_configurator.py:17), so a 2-D upsampler is an ordinary input that a
+  // caller supplies through the `upsampler_path` load extra — the same entry
+  // point the three subcases above use, on its default configuration.
+  //
+  // It is CONSUMABLE and not merely computed, which is what separates this arm
+  // from the spatiotemporal one that stays refused. The fold at model.py:86/:100
+  // returns the frame count unchanged and PixelShuffleND(2) doubles H and W, so
+  // the result is exactly the `[c, f, 2h, 2w]` the phase requires at
+  // ltx2_video.cpp:3525-3531. A port that got the fold wrong would still satisfy
+  // that check, which is why the VALUE gate lives in test_ltx2_pipeline and this
+  // case is about reach.
+  //
+  // The fixture writes 4-D kernels here without being told to: it enumerates
+  // through `EnumerateLtx2UpsamplerTensors(cfg)`, so the rank follows `dims` on
+  // both sides and a 5-D enumeration would fail to load rather than mis-render.
+  SUBCASE("a dims=2 upsampler checkpoint RENDERS, at the full requested size") {
+    vllm::Ltx2UpsamplerConfig dims2 =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    dims2.dims = 2;
+    const std::string path = ws.root + "/dims2_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(dims2, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    const vllm::multimodal::VideoResult result =
+        engine->Generate(FixtureGen(ws.root + "/dims2_ups"));
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
   }
   SUBCASE("with one, the render lands at the FULL requested size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
@@ -1251,6 +1285,14 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // arm by name, the request surface refuses positive rounds without it, and
       // the rounds loop calls it once per round.
       vllm::multimodal::kLtx2TemporalUpsamplerPathExtra,
+      // Row LTX25-LORA-FUSION (#932): the INDEXED IC-LoRA family, upstream's
+      // repeatable `--lora` (utils/args.py:600-611). A pattern rather than a
+      // key, which is why it is spelled here exactly as the listing prints it —
+      // `kKnownLoadExtras[]` is an enumerated array and cannot hold an unbounded
+      // family. Its reader is `ResolveLoraSpecs`, which walks 1..N and builds one
+      // `Ltx2LoraSpec` per adapter, so both names are SERVED and not refused.
+      "lora_path_<n>",
+      "lora_strength_<n> (n >= 2)",
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect #611 records.
@@ -2587,6 +2629,44 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     // you. Deleting the `Ltx2UpsampleVideoLatent` call in the rounds loop must
     // turn this red; that mutation is the row's headline evidence.
     CHECK(trace.temporal_upsample_calls == 1);
+    // THE TEMPORAL CHECKPOINT'S OWN WIDTH (A24 wave 5, #2857). The row asks BOTH
+    // upsampler loaders for `kBF16`, and until this line only the spatial one was
+    // observed: reverting the temporal loader alone left this suite at 116/116
+    // and test_ltx2_dfr at 11/11, 5638 assertions green. `temporal_upsample_calls`
+    // above says the arm RAN; this says it ran off narrow bytes. The two are a
+    // pair, because a bag nobody loaded also reports zero wide bytes.
+    const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+    INFO("temporal upsampler weights: " << trace.temporal_upsampler_weight_bytes
+                                        << " bytes over "
+                                        << trace.temporal_upsampler_weight_elems
+                                        << " parameters");
+    REQUIRE(trace.temporal_upsampler_weight_elems > 0);
+    CHECK(trace.temporal_upsampler_weight_bytes ==
+          trace.temporal_upsampler_weight_elems * bf16_bytes);
+    // And the SPATIAL bag on the same render, so a change that narrowed one arm
+    // by widening the other cannot pass here either.
+    REQUIRE(trace.upsampler_weight_elems > 0);
+    CHECK(trace.upsampler_weight_bytes == trace.upsampler_weight_elems * bf16_bytes);
+
+    // THE CALL SITES, COUNTED EXACTLY rather than as "more than zero". This row's
+    // M8 mutation deleted all three `Ltx2UpsampleVideoLatent` calls at once and
+    // read the red as covering each of them; deleting only the `up_slots` and DFR
+    // sites left the suite green, because no assertion pinned the count.
+    //
+    // THREE, and the number was MEASURED here rather than derived: this case's
+    // first version predicted two and read 3, so the prediction is reported as
+    // the wrong one it was. A DFR round-1 render reaches ALL THREE sites --
+    // stage 2's video latent, the generated keyframe slots, and this round --
+    // which is why this one subcase pins every one of them, and why deleting any
+    // single site now reds it.
+    INFO("upsample calls on a one-round DFR render: " << trace.upsample_calls);
+    CHECK(trace.upsample_calls == 3);
+    // And the bytes those calls really moved. Same reasoning as the spatial
+    // render's case: every other counter here is value-shaped.
+    REQUIRE(trace.upsample_volume_elems > 0);
+    CHECK(trace.upsample_volume_bytes == trace.upsample_volume_elems * bf16_bytes);
+    REQUIRE(trace.upsample_param_elems > 0);
+    CHECK(trace.upsample_param_bytes == trace.upsample_param_elems * bf16_bytes);
     // (:415) `2**round_idx` windows — AND THE CLAMP, which this expectation got
     // wrong on the first pass and which is worth recording rather than quietly
     // fixing. `tile_ranges` takes `min(num_tiles, n_segments)`
@@ -2626,6 +2706,12 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     // that upsampled once and then re-tiled twice produces a clip of the right
     // length at half the temporal detail.
     CHECK(trace.temporal_upsample_calls == 2);
+    // ONE MORE `Ltx2UpsampleVideoLatent` PER ROUND, and this is the assertion the
+    // round-1 count cannot make on its own: a build that upsampled once and
+    // reused the result would report 3 there and 3 here. The two fixed sites
+    // plus one call per round is 3 at one round and 4 at two.
+    INFO("upsample calls on a two-round DFR render: " << trace.upsample_calls);
+    CHECK(trace.upsample_calls == 4);
     // THE TILE COUNT GROWS WITH THE ROUND, which is the assertion that separates
     // a real re-tiling from a loop that denoises the canvas whole. Both values
     // are clamped by `min(num_tiles, n_segments)` (dfr_layout.py:171) — see the
@@ -2777,6 +2863,48 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     CHECK(trace.round_merged_slot_tiles[0] == 0);
     CHECK(trace.round_merged_slot_tiles[1] == 0);
     CHECK(trace.round_merged_slot_tiles[2] == 1);
+  }
+
+  SUBCASE("a dims=2 TEMPORAL upsampler checkpoint is refused AT LOAD, not minutes in") {
+    // THE PLACEMENT IS THE POINT. `dims=2` with `temporal_upsample` is a
+    // contradiction upstream cannot run, and `Ltx2LatentUpsample` refuses it —
+    // but that refusal fires inside the rounds loop (ltx2_video.cpp:5058), which
+    // is reached only after two full denoise stages. The load block that owns
+    // `temporal_upsampler_path` exists precisely so a caller who supplied the
+    // wrong file learns at load rather than several minutes in, and it says so
+    // in its own comment. It checked `temporal_upsample` and `spatial_upsample`
+    // there and did not check `dims`, so this one checkpoint cleared both
+    // siblings and failed downstream anyway.
+    //
+    // Asserted at `LoadVideoEngine`, not at `Generate`: a case that only checks
+    // the message would stay green with the guard back in the rounds loop, which
+    // is the exact defect.
+    vllm::Ltx2UpsamplerConfig temporal_two_d =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal_two_d.spatial_upsample = false;
+    temporal_two_d.temporal_upsample = true;
+    temporal_two_d.dims = 2;
+    const std::string two_d_path = ws.root + "/dfr_temporal_dims2.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal_two_d, two_d_path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_dims2_lora.safetensors");
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = two_d_path;
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL_CHECK("a dims=2 temporal upsampler must be refused at LOAD, beside its two siblings");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("dims=2") != std::string::npos);
+      CHECK(msg.find(std::string(vllm::multimodal::kLtx2TemporalUpsamplerPathExtra)) !=
+            std::string::npos);
+      // The upstream site that makes it a contradiction rather than a taste.
+      CHECK(msg.find("model.py:68-71") != std::string::npos);
+    }
   }
 
   SUBCASE("rounds without a temporal upsampler are refused, not silently skipped") {
@@ -6431,20 +6559,49 @@ TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is tr
     auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
     REQUIRE(ltx2 != nullptr);
 
-    vllm::multimodal::VideoGenParams gen = request("one_stage_kf", kf_a_path);
-    gen.steps = 2;  // one_stage admits a step override; 50 would gate nothing extra
-    OneStageFixtureGuidance(&gen);
-    (void)engine->Generate(gen);
-    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    auto trace_for = [&](const std::string& tag, const std::string& keyframe) {
+      vllm::multimodal::VideoGenParams gen = request(tag, keyframe);
+      gen.steps = 2;  // one_stage admits a step override; 50 would gate nothing extra
+      OneStageFixtureGuidance(&gen);
+      (void)engine->Generate(gen);
+      return ltx2->last_conditioning();
+    };
+    const vllm::multimodal::Ltx2ConditioningTrace without = trace_for("one_stage_nokf", "");
+    const vllm::multimodal::Ltx2ConditioningTrace with = trace_for("one_stage_kf", kf_a_path);
 
-    // Both numbers are MEASURED, and the statement is the relation between them.
-    // Pinning either to a literal would pass on a build that read the grown
-    // count everywhere.
-    CHECK(trace.schedule_tokens > 0);
-    CHECK_MESSAGE(trace.video_tokens > trace.schedule_tokens,
-                  "the DiT ran over " << trace.video_tokens << " tokens and the schedule was "
-                                      << "built for " << trace.schedule_tokens
-                                      << "; equal means the append re-shifted the schedule");
+    // THE CLAIM, STATED DIRECTLY RATHER THAN THROUGH A PROXY (#2521).
+    //
+    // This subcase used to assert `video_tokens > schedule_tokens` on a single
+    // render. That inequality was never the claim; it was a SIDE EFFECT of the
+    // anchor happening to track the target grid, so it could only detect a
+    // re-shift while the engine sampled on `kTargetLatent`. Once `one_stage`
+    // moved to the 4096 anchor the inequality reversed — while the property it
+    // was standing in for became MORE true, not less.
+    //
+    // So the pair is measured instead: the same request rendered with and
+    // without a keyframe must build the SAME schedule. That detects a re-shift
+    // under either anchor, which the inequality could not, and it is the
+    // sentence the comment above has always been making.
+    CHECK(without.schedule_tokens > 0);
+    CHECK(with.schedule_tokens > 0);
+    CHECK_MESSAGE(with.schedule_tokens == without.schedule_tokens,
+                  "supplying a keyframe changed the schedule anchor from "
+                      << without.schedule_tokens << " to " << with.schedule_tokens
+                      << ", so the append re-shifted the whole trajectory");
+
+    // AND THE INSTRUMENT IS NOT BLIND: the append really did grow the sequence
+    // on the very renders compared above. Without this, a build where the
+    // keyframe never reached the forward would satisfy the equality trivially
+    // and this subcase would be measuring nothing.
+    CHECK_MESSAGE(with.video_tokens > without.video_tokens,
+                  "the keyframe render used " << with.video_tokens << " tokens against "
+                      << without.video_tokens << " without, so nothing was appended and the "
+                         "equality above is vacuous");
+
+    // The anchor `one_stage` actually took, named. `ti2vid_one_stage.py:207`
+    // passes no latent and vLLM-Omni hard-codes the max anchor
+    // (`ltx2_denoise.py:188`), so it is upstream's constant and not the grid.
+    CHECK(without.schedule_tokens == vllm::Ltx2SchedulerParams{}.default_number_of_tokens);
   }
 }
 
@@ -6829,6 +6986,257 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
   CHECK(again.trace.video_digest == fox.trace.video_digest);
   CHECK(again.trace.audio_digest == fox.trace.audio_digest);
   CHECK(again.bytes == fox.bytes);
+
+  // 7. AND IT WAS COMPUTED AT UPSTREAM'S DTYPE (A24 wave 1, #2676).
+  //
+  //    Upstream resolves ONE dtype for the whole pipeline and it is bfloat16
+  //    (`distilled.py:109`, handed to `PromptEncoder` at `:111-113`), so the
+  //    engine loads the caption projections through `Ltx2TextProjectionsAsBf16`
+  //    and every value the DiT cross-attends over is a bf16 value.
+  //
+  //    NONE OF CHECKS 1-6 CAN SEE THAT, and that is the whole reason this one
+  //    exists. Swap the engine's loader call back to
+  //    `Ltx2WidenTextProjectionsToF32` and the tower computes the same
+  //    conditioning twice as wide: the digests still differ between prompts, the
+  //    absmax is still non-zero, the frames still change with the caption, and
+  //    the render is still deterministic. Checks 1-6 stay green to the last
+  //    assertion. AGENTS.md names this exactly — "a token gate cannot detect a
+  //    dtype that is too wide" — and it is why A24 sat invisible in this tree
+  //    while every gate on this path passed.
+  //
+  //    The counter is over the SAME buffers the digests are taken from, at the
+  //    same moment, so it cannot be reporting a different tensor.
+  //    SAMPLED BEFORE THE CONNECTOR. `Ltx2ConnectorForward` is A24's SECOND wave
+  //    and still computes in f32, so the buffer the DiT finally cross-attends
+  //    over is f32-wide even on a bf16 tower. That is owed, named in the row's
+  //    spec, and NOT what this row delivers — measuring after the connector would
+  //    report the connector's width and read this row's work as absent.
+  INFO("tower output wider than bf16: video "
+       << fox.trace.tower_video_not_bf16 << " of " << fox.trace.tower_video_values
+       << ", audio " << fox.trace.tower_audio_not_bf16 << " of "
+       << fox.trace.tower_audio_values);
+  //    Not vacuous: the tower really did produce a stream, and checks 3 and 4
+  //    already established it is neither zeros nor constant across prompts. So
+  //    "zero values wider than bf16" is a statement about real conditioning
+  //    rather than about an empty buffer.
+  REQUIRE(fox.trace.tower_video_values > 0);
+  REQUIRE(fox.trace.tower_audio_values > 0);
+  CHECK(fox.trace.tower_video_not_bf16 == 0);
+  CHECK(fox.trace.tower_audio_not_bf16 == 0);
+  CHECK(whale.trace.tower_video_not_bf16 == 0);
+  CHECK(whale.trace.tower_audio_not_bf16 == 0);
+
+  //    AND THE PREDICATE DISCRIMINATES ON THIS FIXTURE. "Not vacuous" above says
+  //    the buffer is non-empty and prompt-dependent; it does not say a stream of
+  //    THESE numbers computed at f32 width would have failed the predicate. A
+  //    fixture whose conditioning happened to land on bf16 grid points would read
+  //    zero here whatever arithmetic produced it, and this whole case would go
+  //    quietly green on an f32 tower — the same shape of hole A24 sat in.
+  //
+  //    The connector is the measurement. It is A24's SECOND wave, it computes in
+  //    f32, and it runs on the buffers the tower just handed it inside this same
+  //    render, so it is a live f32 arm on this fixture rather than an argument
+  //    about one. The unit-level gate asserts the mirror of this at
+  //    tests/vllm/models/test_ltx2_text_encoder.cpp's "the production entry point
+  //    computes in bf16".
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count. A floor
+  //    below the real number is a mute switch: the f32 arm reads 16384 of 16384
+  //    and 8192 of 8192 here, so half the stream leaves a factor of two of room
+  //    for fixture drift while still being unreachable by any accident that
+  //    matters. A regression that narrowed the connector to bf16 would take it to
+  //    zero, and a fixture that lost its sub-bf16 detail would take it there too;
+  //    either way this reds rather than muting the four checks above.
+  INFO("connector (f32, wave 2) wider than bf16: video "
+       << fox.trace.connector_video_not_bf16 << " of " << fox.trace.connector_video_values
+       << ", audio " << fox.trace.connector_audio_not_bf16 << " of "
+       << fox.trace.connector_audio_values);
+  REQUIRE(fox.trace.connector_video_values > 0);
+  REQUIRE(fox.trace.connector_audio_values > 0);
+  CHECK(fox.trace.connector_video_not_bf16 == 0);
+  CHECK(fox.trace.connector_audio_not_bf16 == 0);
+}
+
+TEST_CASE("ltx2 video: the VAE DECODE runs at upstream's dtype") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // Upstream constructs `VideoDecoder` with the ONE pipeline dtype
+  // (`distilled.py:146-149`, `self.dtype` at `:148`) and its forward casts the
+  // latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`). It carries no float32 pin of the kind
+  // the audio vocoder has (`vocoder.py:575-580`), which is the one place in this
+  // pipeline where f32 is argued rather than owed.
+  //
+  // THE COUNTER IS SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the
+  // one production route into the decoder. A unit test that builds
+  // `Ltx2ConvVideoDecode` itself would prove the class works and never that
+  // anything reaches it (AGENTS.md `## Nothing lands dead`).
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const Rendered fox = RenderPrompt(mp, ws.root + "/p_vaedtype", "a b c");
+
+  // 1. THE FIXTURE CARRIES SUB-BF16 DETAIL INTO THE DECODE, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose numbers happen to land on bf16 grid points -- which is exactly the
+  //    hole A24 sat in for the whole tree. The latent is the decoder's own input
+  //    in this same render, produced by the f32 CPU reference DiT arm, so it is a
+  //    LIVE wide stream rather than an argument about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("latent into the decode, wider than bf16: "
+       << fox.trace.vae_latent_not_bf16 << " of " << fox.trace.vae_latent_values);
+  REQUIRE(fox.trace.vae_latent_values > 0);
+  CHECK(fox.trace.vae_latent_not_bf16 > fox.trace.vae_latent_values / 2);
+
+  // 2. AND THE DECODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE PIXELS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The frame digests detect CHANGE
+  //    and the absmax detects COLLAPSE; both are computed over the same f32
+  //    container on either arm and are identical in shape whichever width filled
+  //    it. AGENTS.md names the blind spot exactly -- "a token gate cannot detect a
+  //    dtype that is too wide."
+  INFO("VAE decode output, wider than bf16: "
+       << fox.trace.vae_decode_not_bf16 << " of " << fox.trace.vae_decode_values);
+  REQUIRE(fox.trace.vae_decode_values > 0);
+  CHECK(fox.trace.vae_decode_not_bf16 == 0);
+}
+
+// A24 wave 4 (#2850). The DECODER's width above; this is the ENCODER's, and it
+// is a separate case rather than two more lines in that one because it enters
+// the engine by a different request: the decoder runs on every render and the
+// encoder only when a conditioning image is supplied.
+TEST_CASE("ltx2 video: the video VAE ENCODER computes at upstream's bfloat16") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/p_encdtype");
+  gen.first_frame_ppm = ConditioningPpm(20, 28, 7);
+  // crf 0 because an LTX-2.5 checkpoint otherwise resolves 18 and the H.264
+  // round trip is refused by name here. The CRF is not what this case measures.
+  gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  REQUIRE(trace.completed);
+  REQUIRE(result.frame_count > 0);
+
+  // 1. THE ENCODER'S INPUT CARRIES SUB-BF16 DETAIL, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose pixels happen to land on bf16 grid points, which is exactly the
+  //    hole A24 sat in for the whole tree. `Ltx2LoadImageAndPreprocess` produces
+  //    this stream in the same render, so it is LIVE rather than an argument
+  //    about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("pixels into the encode, wider than bf16: "
+       << trace.vae_encode_in_not_bf16 << " of " << trace.vae_encode_in_values);
+  REQUIRE(trace.vae_encode_in_values > 0);
+  CHECK(trace.vae_encode_in_not_bf16 > trace.vae_encode_in_values / 2);
+
+  // 2. AND THE ENCODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE LATENTS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The latent is a
+  //    `std::vector<float>` on either arm and every digest, absmax and token
+  //    count downstream is computed over that same container, identical in shape
+  //    whichever width filled it. AGENTS.md names the blind spot exactly -- "a
+  //    token gate cannot detect a dtype that is too wide."
+  INFO("VAE encode output, wider than bf16: " << trace.vae_encode_not_bf16 << " of "
+                                              << trace.vae_encode_values);
+  REQUIRE(trace.vae_encode_values > 0);
+  CHECK(trace.vae_encode_not_bf16 == 0);
+}
+
+TEST_CASE("ltx2 video: the latent upsampler COMPUTES at bfloat16 on the render path") {
+  // A24 wave 5, row LTX25-A24-UPSAMPLER-BF16 (#2857). Upstream resolves ONE model
+  // dtype (`distilled.py:109`) and hands it to the latent upsampler at
+  // `:138-141`. The parity suite gates the ARITHMETIC against the executed
+  // module; this case gates the thing the parity suite structurally cannot see.
+  //
+  // WHY A RENDER AND NOT A UNIT TEST. `Ltx2LatentUpsample` constructed by hand
+  // proves the class narrows. It cannot prove that the ENGINE reaches the narrow
+  // path -- the loader could still widen the checkpoint, and every frame, digest
+  // and byte count downstream would be identical. AGENTS.md: "A unit test that
+  // constructs the type by hand proves that the class works, never that anything
+  // reaches it." So this drives `LoadVideoEngine` -> `Generate` on its default
+  // configuration through `upsampler_path`, which is the same entry a caller uses.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["upsampler_path"] = ws.paths.upsampler;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(FixtureGen(ws.root + "/ups_bf16"));
+  // A REAL two-stage render, so the upsampler is on the path that produced it
+  // rather than on one this case constructed for itself.
+  CHECK(result.width == 64);
+  CHECK(result.height == 64);
+  const auto* ltx2 = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+
+  // 1. SOMETHING RAN. Without this the two assertions below are satisfied by a
+  //    build that stopped calling the upsampler at all: zero wide calls and zero
+  //    wide values is what "never ran" looks like, and it reads as perfect.
+  INFO("upsampler calls on the render path: " << trace.upsample_calls);
+  REQUIRE(trace.upsample_calls > 0);
+
+  // 2. IT RAN AT UPSTREAM'S WIDTH, read off the latent the stage returned rather
+  //    than off the config that asked for it.
+  INFO("upsampler calls reporting a width other than bf16: " << trace.upsample_wide_calls
+                                                             << " of " << trace.upsample_calls);
+  CHECK(trace.upsample_wide_calls == 0);
+
+  // 3. AND THE VALUES AGREE WITH THE REPORT. A `dtype` field can be set
+  //    correctly by a path that computed wide; only the values can say whether
+  //    the arithmetic actually landed in bf16. This is the half that survives a
+  //    correct-looking field, and it is why both are here.
+  INFO("upsampled latent values wider than bf16: " << trace.upsample_not_bf16 << " of "
+                                                   << trace.upsample_values);
+  REQUIRE(trace.upsample_values > 0);
+  CHECK(trace.upsample_not_bf16 == 0);
+
+  // 4. AND THE STORAGE IS THE WIDTH, which is what 1-3 structurally cannot say.
+  //    All three above are VALUE-shaped. Sizing every internal buffer by
+  //    `sizeof(float)` while still rounding each stored value to bf16 leaves each
+  //    of them bit-identical -- that build was made and run during this row's
+  //    review and 9125 assertions stayed green -- and it moves twice the bytes,
+  //    which is the polarity AGENTS.md says a token gate cannot see. These are
+  //    the bytes the upsampler really reserved and really read through, drained
+  //    per call, so `bytes / elems` IS the storage width.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("upsampler volumes: " << trace.upsample_volumes << ", " << trace.upsample_volume_bytes
+                             << " bytes over " << trace.upsample_volume_elems << " elements");
+  REQUIRE(trace.upsample_volumes > 0);
+  REQUIRE(trace.upsample_volume_elems > 0);
+  CHECK(trace.upsample_volume_bytes == trace.upsample_volume_elems * bf16_bytes);
+
+  INFO("upsampler parameter views: " << trace.upsample_param_views << ", "
+                                     << trace.upsample_param_bytes << " bytes over "
+                                     << trace.upsample_param_elems << " elements");
+  REQUIRE(trace.upsample_param_views > 0);
+  REQUIRE(trace.upsample_param_elems > 0);
+  CHECK(trace.upsample_param_bytes == trace.upsample_param_elems * bf16_bytes);
+
+  // 5. AND THE LOADER HANDED IT NARROW BYTES. The volumes above would still be
+  //    bf16 if the checkpoint had been widened to f32 on the way in and rounded
+  //    at the first store: the arm comes off the bag, so the bag is what has to
+  //    be narrow. `Ltx2VaeWeights::Bytes()` is the tree's own measurement for
+  //    this and had no caller at all before this row.
+  INFO("spatial upsampler weights: " << trace.upsampler_weight_bytes << " bytes over "
+                                     << trace.upsampler_weight_elems << " parameters");
+  REQUIRE(trace.upsampler_weight_elems > 0);
+  CHECK(trace.upsampler_weight_bytes == trace.upsampler_weight_elems * bf16_bytes);
+
+  // 6. THE SPATIAL SITE IS NOT THE ONLY ONE. This fixture renders one stage-2
+  //    upsample; the DFR case below carries the temporal arm's own counters,
+  //    which this render cannot observe at all.
+  CHECK(trace.temporal_upsampler_weight_elems == 0);
 }
 
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
@@ -7092,6 +7500,140 @@ TEST_CASE("ltx2 video: the IC-LoRA strength reaches the PIXELS, and 0 is a no-op
   CHECK(full != baseline);
   CHECK(half != full);
   CHECK(half != baseline);
+}
+
+TEST_CASE("ltx2 video: a SECOND IC-LoRA supplied through lora_path_2 reaches the PIXELS") {
+  // ROW LTX25-LORA-FUSION, issue #932. THE REACHABILITY CLAIM for N-adapter
+  // fusion, and it is a different claim from the one above: `test_ltx2_lora`
+  // builds two `Ltx2LoraAdapter`s by hand and proves the AGGREGATOR composes
+  // them, which says nothing about whether a user can ask for two.
+  //
+  // THE MUTATION. Delete the `index > 1` arm of `ResolveLoraSpecs` in
+  // ltx2_video.cpp — make its loop `for (int64_t index = 1; index <= 1; ++index)`
+  // — and the whole of `test_ltx2_lora` stays green, the one-adapter cases above
+  // stay green, and this case REDs. That difference is the whole point
+  // (.agents/reachability.md).
+  Workspace ws;
+
+  // Two adapters on the SAME target, which is the composing case: `to_q` gets a
+  // delta from each, so the second one takes upstream's `addmm_` form
+  // (`fuse_loras.py:115`). Different scales so neither can stand in for the
+  // other.
+  const std::string first =
+      WriteFixtureLora(ws.root + "/ic1.safetensors", kFixtureLoraTarget, 1.0F);
+  const std::string second =
+      WriteFixtureLora(ws.root + "/ic2.safetensors", kFixtureLoraTarget, 0.5F);
+
+  const auto render = [&](bool with_second, const char* out) {
+    vllm::multimodal::VideoModelParams mp = ConditioningParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = first;
+    if (with_second) mp.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+    return RenderBytes(mp, std::string(ws.root) + "/" + out);
+  };
+
+  const std::string one = render(false, "one");
+  const std::string two = render(true, "two");
+  REQUIRE(one.size() == two.size());
+  REQUIRE(one.size() > 0);
+
+  size_t differing = 0;
+  for (size_t i = 0; i < one.size(); ++i) {
+    if (one[i] != two[i]) ++differing;
+  }
+  MESSAGE("the second IC-LoRA moves " << differing << " of " << one.size()
+                                      << " artifact bytes");
+  // Every byte of the REQUEST is identical and so is the first adapter; the only
+  // difference is the `lora_path_2` LOAD EXTRA. Strictly greater than zero with
+  // no count floor above it, because a count-based tolerance bounds nothing —
+  // and the count IS small here (single digits of 91169) because the witness is
+  // a COMPRESSED artifact, not the latent. It does not grow with the adapter's
+  // scale: 2.0 moves fewer bytes than 0.5 does. What carries the weight of this
+  // case is therefore the equality below, over all 91169 bytes.
+  CHECK(differing > 0);
+
+  // AND THE SECOND ADAPTER'S OWN STRENGTH IS READ. `lora_strength_2` at 0 fuses
+  // a zero delta for the second adapter alone, which must land exactly on the
+  // one-adapter render. Without this, an implementation that opened the second
+  // file and dropped its strength would still pass the check above.
+  vllm::multimodal::VideoModelParams zeroed = ConditioningParams(ws.paths);
+  zeroed.extras[vllm::multimodal::kLtx2LoraPathExtra] = first;
+  zeroed.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+  zeroed.extras[std::string(vllm::multimodal::kLtx2LoraStrengthExtra) + "_2"] = "0.0";
+  CHECK(RenderBytes(zeroed, ws.root + "/zeroed") == one);
+}
+
+TEST_CASE("ltx2 video: the INDEXED IC-LoRA load extras refuse by name on misuse") {
+  // Row LTX25-LORA-FUSION. Every one of these is a caller who believes an
+  // adapter is being fused; the failure mode each refusal prevents is a render
+  // that succeeds with fewer adapters than were asked for.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/ic.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const auto refused = [&](const std::map<std::string, std::string>& extras) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    for (const auto& kv : extras) mp.extras[kv.first] = kv.second;
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a GAP in the numbering refuses rather than renumbering") {
+    // `lora_path_3` with no `lora_path_2` would otherwise fuse two adapters and
+    // report success to a caller who asked for three.
+    const std::string msg = refused({{"lora_path", lora}, {"lora_path_3", lora}});
+    INFO(msg);
+    CHECK(msg.find("lora_path_3") != std::string::npos);
+    CHECK(msg.find("lora_path_2") != std::string::npos);
+    CHECK(msg.find("no gaps") != std::string::npos);
+  }
+
+  SUBCASE("an indexed adapter with no FIRST one refuses") {
+    // The same gap rule at the bottom: `lora_path_2` alone is a load with zero
+    // adapters, not a load with one.
+    const std::string msg = refused({{"lora_path_2", lora}});
+    INFO(msg);
+    CHECK(msg.find("lora_path_2") != std::string::npos);
+    CHECK(msg.find("no gaps") != std::string::npos);
+  }
+
+  SUBCASE("an indexed strength with no adapter at that index refuses") {
+    const std::string msg =
+        refused({{"lora_path", lora}, {"lora_strength_2", "0.5"}});
+    INFO(msg);
+    CHECK(msg.find("lora_strength_2") != std::string::npos);
+    CHECK(msg.find("lora_path_2") != std::string::npos);
+  }
+
+  SUBCASE("a non-numeric indexed strength names ITS OWN key, not the first one") {
+    // A message naming `lora_strength` for a defect in `lora_strength_2` sends
+    // the reader to a key that is fine.
+    const std::string msg = refused(
+        {{"lora_path", lora}, {"lora_path_2", lora}, {"lora_strength_2", "strong"}});
+    INFO(msg);
+    CHECK(msg.find("lora_strength_2") != std::string::npos);
+    CHECK(msg.find("not a finite number") != std::string::npos);
+  }
+
+  SUBCASE("`lora_path_1` refuses BY NAME rather than as an unknown key") {
+    // Two spellings for one adapter could disagree with no defensible winner, so
+    // the unindexed one is the only one — and a caller who got that wrong is
+    // told which spelling to use instead of being sent to hunt for a typo.
+    const std::string msg = refused({{"lora_path_1", lora}});
+    INFO(msg);
+    CHECK(msg.find("lora_path_1") != std::string::npos);
+    CHECK(msg.find("with no index") != std::string::npos);
+  }
+
+  SUBCASE("a nearby key is still an unknown extra, and the listing says so") {
+    const std::string msg = refused({{"lora_path_x", lora}});
+    INFO(msg);
+    CHECK(msg.find("unknown load extra") != std::string::npos);
+    CHECK(msg.find("lora_path_<n>") != std::string::npos);
+  }
 }
 
 TEST_CASE("ltx2 video: the IC-LoRA load extras refuse by name on misuse") {
@@ -7459,6 +8001,106 @@ TEST_CASE("ltx2 video: a supplied audio file CONDITIONS the render, and stays FR
   }
 }
 
+TEST_CASE("ltx2 video: a take at ANOTHER rate is RESAMPLED, not refused") {
+  // Row LTX25-AUDIO-RESAMPLE, issue #2583, gap A19 of the completion plan.
+  //
+  // Enters through the PRODUCTION path — `LoadVideoEngine` + `Generate`, what
+  // `vllm_video_generate` calls straight through (`vllm_c.cpp:1646`) — for the
+  // reason in this section's header: a unit test over `Ltx2ResampleWaveform`
+  // proves the filter works and never that a request can arrive at it. Until
+  // this row, a request at any rate but the checkpoint's was refused three hops
+  // earlier and NOTHING downstream of that refusal ran.
+  //
+  // Upstream refuses nothing here: `waveform_to_mel` calls `resample_audio`
+  // before the mel transform (ops.py:44-49) and `resample_audio` filters
+  // whenever the rates differ (ops.py:36-42).
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  // THREE takes of the same 220 Hz tone, and the third is the control:
+  //   native — 2.0 s at the fixture's own 24000, the arm that always worked.
+  //   high   — 2.0 s at 44100. Same sound, more samples; must resample.
+  //   misread— `high`'s PCM bytes with 24000 written in the header. This is
+  //            what reading the samples "as if they were already at the target
+  //            rate" produces: 3.675 s of a 119.7 Hz tone. It is a legal WAV, so
+  //            it renders, and it is the wrong answer the refusal prevented.
+  const std::string native = WriteWav(ws.root + "/native.wav", 2, kFixtureAudioRate, 2.0);
+  const std::string high = WriteWav(ws.root + "/high.wav", 2, 44100, 2.0);
+  const std::string misread = ws.root + "/misread.wav";
+  {
+    std::string bytes = MakeWavPcm16(2, 44100, 2.0);
+    // The `fmt ` chunk's sample-rate field: "RIFF" + size + "WAVE" + "fmt " +
+    // size = 20 bytes, then wFormatTag(2) + nChannels(2) = 4 more.
+    const auto rate = static_cast<uint32_t>(kFixtureAudioRate);
+    for (int i = 0; i < 4; ++i) {
+      bytes[24 + static_cast<size_t>(i)] = static_cast<char>((rate >> (8 * i)) & 0xFF);
+    }
+    std::ofstream out(misread, std::ios::binary);
+    REQUIRE(out.good());
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    out.close();
+  }
+
+  auto render = [&](const std::string& dir, const std::string& wav) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+    gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    return std::make_pair(result, ltx2->last_conditioning());
+  };
+
+  const auto [native_result, native_trace] = render("rs_native", native);
+  const auto [high_result, high_trace] = render("rs_high", high);
+  const auto [misread_result, misread_trace] = render("rs_misread", misread);
+
+  // (1) Accepted, conditioned, and not zeroed. Before this row the second call
+  //     threw, which is the red this case was written on.
+  CHECK(high_trace.completed);
+  CHECK(high_trace.audio_conditioned);
+  CHECK(high_trace.audio_tokens > 0);
+  CHECK(high_trace.audio_latent_absmax > 0.0);
+  CHECK(high_trace.audio_latent_digest != 0);
+
+  // (2) The RETURNED soundtrack stays at the FILE's rate. Upstream hands back
+  //     the original `Audio` untouched (a2vid_two_stage.py:301-303), so the
+  //     resample reaches the encoder and nothing else. A build that resampled
+  //     the take in place instead of inside the mel front-end passes every
+  //     assertion above and fails this one.
+  CHECK(high_result.sample_rate == 44100);
+  CHECK(native_result.sample_rate == kFixtureAudioRate);
+
+  // (3) The rate was READ, not ignored. `high` and `misread` carry BYTE
+  //     IDENTICAL PCM and differ only in the header's rate field, so a build
+  //     that never resampled gives them the same latent.
+  CHECK(high_trace.audio_latent_digest != misread_trace.audio_latent_digest);
+
+  // (4) THE VALUES ARE NOT GATED HERE, and that is a measurement rather than a
+  //     gap left open. The obvious video-level claim is "`high` is the same two
+  //     seconds of the same tone as `native`, so its latent must land NEARER
+  //     `native` than the mis-read take does" — and `audio_latent_absmax` cannot
+  //     carry it. Measured on this fixture, the three takes read 1.07194
+  //     (native), 1.07293 (high) and 1.07208 (misread): a 0.1% spread across
+  //     three genuinely different waveforms, because the trace's absmax is
+  //     dominated by the encoder's per-channel statistics and not by the take.
+  //     A one-scalar ordering over that population would have passed or failed
+  //     on noise either way.
+  //
+  //     So the numbers live where they can be gated: `test_ltx2_vae`'s sections
+  //     8d and 8e hold the resampler and the resampled mel against goldens the
+  //     generator produced by EXECUTING upstream, at 2.5e-07. This case proves
+  //     the request arrives, the rate is read, and the soundtrack comes back
+  //     untouched — the three things a unit test over the filter cannot.
+  INFO("audio_latent_absmax native=" << native_trace.audio_latent_absmax
+       << " high=" << high_trace.audio_latent_absmax
+       << " misread=" << misread_trace.audio_latent_absmax);
+
+  // The render still produced its artifacts; resampling is not a bypass.
+  CHECK(high_result.frame_count > 0);
+  CHECK(misread_result.frame_count > 0);
+}
+
 TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") {
   // Each of these renders a finished clip if it is accepted, which is why every
   // one is a refusal rather than a conversion. The assertions hold each message
@@ -7483,24 +8125,6 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
   auto just_path = [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
     g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
   };
-
-  SUBCASE("a sample rate the mel front-end does not target") {
-    // Upstream RESAMPLES here (ops.py:40) with an arbitrary-ratio polyphase
-    // kaiser resampler this project has not ported. Reading 44.1 kHz samples at
-    // the checkpoint's rate pitches and time-shifts the conditioning while every
-    // shape checks out, so both rates go in the message.
-    //
-    // The TARGET rate asserted here is the fixture's 24000, which is neither the
-    // shipped 16000 nor `Ltx2ParseAudioEncoderConfig`'s own default. That is the
-    // point: with the fixture at 16000 this assertion passed against a parser
-    // that never read `params.sampling_rate` at all.
-    const std::string wav = WriteWav(ws.root + "/44k.wav", 2, 44100, 2.0);
-    const std::string message = refusal("rate", just_path, wav);
-    INFO("refusal: " << message);
-    CHECK(message.find("44100") != std::string::npos);
-    CHECK(message.find(std::to_string(kFixtureAudioRate)) != std::string::npos);
-    CHECK(message.find("ops.py:40") != std::string::npos);
-  }
 
   SUBCASE("a channel count the encoder does not declare") {
     // `MiniMaxH3ReadWav` would REPEAT a mono take across both channels
@@ -10990,8 +11614,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   const std::string lora =
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
 
-  // `max_phase` is a LOAD extra, so each arm is its own engine.
-  const auto render = [&](const char* strength, const char* max_phase, const char* out) {
+  // `max_phase` is a LOAD extra, so each arm is its own engine. `trace` is an
+  // out-parameter rather than a second render, because two renders of the same
+  // arm would be two chances for the comparison to be about noise.
+  const auto render = [&](const char* strength, const char* max_phase, const char* out,
+                          vllm::multimodal::Ltx2ConditioningTrace* trace = nullptr) {
     vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = strength;
     if (max_phase != nullptr) mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = max_phase;
@@ -11000,6 +11627,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
     REQUIRE(engine != nullptr);
     const std::string dir = std::string(ws.root) + "/" + out;
     const vllm::multimodal::VideoResult result = engine->Generate(A2VidGen(dir, wav));
+    if (trace != nullptr) {
+      const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+      REQUIRE(ltx != nullptr);
+      *trace = ltx->last_conditioning();
+    }
     return A2VidArtifacts(dir, result);
   };
 
@@ -11022,8 +11654,9 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   CHECK(s1_differing == 0);
 
   // ── both stages, the same two strengths ───────────────────────────────────
-  const std::string both_full = render("1.0", nullptr, "both_full");
-  const std::string both_zero = render("0.0", nullptr, "both_zero");
+  vllm::multimodal::Ltx2ConditioningTrace both_full_trace, both_zero_trace;
+  const std::string both_full = render("1.0", nullptr, "both_full", &both_full_trace);
+  const std::string both_zero = render("0.0", nullptr, "both_zero", &both_zero_trace);
   REQUIRE(both_full.size() == both_zero.size());
 
   size_t both_differing = 0;
@@ -11033,14 +11666,34 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   MESSAGE("both stages: the adapter moves " << both_differing << " of " << both_full.size()
                                             << " artifact bytes");
   // THE HALF THAT REDS ON "STOPPED FUSING ALTOGETHER". `stage_2_loras` at `:114`
-  // DOES carry the distilled adapter, so it must reach the pixels through stage
+  // DOES carry the distilled adapter, so it must reach the render through stage
   // 2. Without this line the case above is satisfied by an engine that ignores
   // `lora_path` entirely, which is the same shape of green-but-proves-nothing
   // the row's spec rejects.
   //
-  // Strictly greater than zero and no count floor above it: a count-based
-  // tolerance would bound nothing.
-  CHECK(both_differing > 0);
+  // THE ARTIFACT-BYTE COMPARISON THAT USED TO CARRY THIS CANNOT ANY MORE, AND THE
+  // NUMBERS ARE WHY (A24 wave 3, #2786). On an f32 decode the adapter moved 19 of
+  // 146753 PPM bytes -- 0.013% of the clip, a handful of pixels that happened to
+  // straddle an 8-bit quantization boundary. The decode now runs at upstream's
+  // own bfloat16 (`distilled.py:109`, handed to `VideoDecoder` at `:148`), whose
+  // mantissa is also 8 bits, and a difference that small rounds away: measured 0
+  // of 146753. Raising the fixture's delta does NOT recover it -- at scale 8 the
+  // count is 0 as well, because a larger delta pushes the render further into the
+  // writer's clamp and both arms saturate to the same bytes. The instrument had a
+  // narrow window and the shipping dtype closed it.
+  //
+  // So the claim is made ONE STEP UPSTREAM, on the latent the decoder is handed,
+  // which is where the adapter's effect lives and which no pixel quantization
+  // touches. This is strictly a different statement from "reaches the pixels" and
+  // is written as such: it proves the adapter reaches the DECODER'S INPUT. That
+  // the decode depends on its input is gated separately and numerically by
+  // tests/vllm/models/test_ltx2_vae.cpp's decoder goldens, so the two together
+  // still close the path the byte comparison used to close alone.
+  MESSAGE("both stages: latent digest full=" << both_full_trace.vae_latent_digest
+                                             << " zero=" << both_zero_trace.vae_latent_digest);
+  REQUIRE(both_full_trace.vae_latent_values > 0);
+  REQUIRE(both_full_trace.vae_latent_absmax > 1e-6);
+  CHECK(both_full_trace.vae_latent_digest != both_zero_trace.vae_latent_digest);
 
   // ── and the two arms are not the same render ──────────────────────────────
   // Stage 2 upsamples, so a stage-1-only artifact cannot equal a two-stage one.
@@ -11079,6 +11732,54 @@ TEST_CASE("ltx2 a2vid: the rebind leaves the DiT where the NEXT generation expec
   // DiT unfused after the first render would make the second render's stage 2
   // run on base weights, and these would differ.
   CHECK(a == b);
+}
+
+TEST_CASE("ltx2 a2vid: a SECOND adapter refuses, because stage 1 cannot hold a SUBSET") {
+  // ROW LTX25-LORA-FUSION. THE ARM THAT LIFTING THE ARITY CAP MADE EXPRESSIBLE
+  // AND THIS ENGINE CANNOT RUN, refused by name rather than rendered.
+  //
+  // While the load held ONE adapter, `kNoAdapters` on stage 1 mirrored upstream
+  // EXACTLY: that adapter is the `distilled_lora` the recipe demands, and
+  // upstream's stage 1 argument is `loras=tuple(loras)` — the USER adapters,
+  // necessarily empty. `a2vid_two_stage.py:107` against `:114`. With TWO,
+  // upstream's stage 1 carries the user adapter and not the distilled one, which
+  // is a PROPER SUBSET; this engine holds one resident DiT that `Ltx2RebindDitLoras`
+  // fuses with all or none, and no load extra says which of the two is distilled.
+  //
+  // ENTRY POINT: `LoadVideoEngine` on the documented load extras. Deleting the
+  // `dit_options.loras.size() > 1` guard in `ltx2_video.cpp` REDs this case and
+  // leaves every other LoRA case in this file and the whole of `test_ltx2_lora`
+  // green, which is the difference that makes it a capability claim.
+  Workspace ws;
+  const std::string first =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+  const std::string second =
+      WriteFixtureLora(ws.root + "/user.safetensors", kFixtureLoraTarget, 0.5F);
+
+  vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, first);
+  mp.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+  std::string message;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO(message);
+  REQUIRE_FALSE(message.empty());
+  CHECK(message.find("stage_1") != std::string::npos);
+  CHECK(message.find("2 adapters were supplied") != std::string::npos);
+  CHECK(message.find("a2vid_two_stage.py:107") != std::string::npos);
+  CHECK(message.find("dfr_pipeline.py:212") != std::string::npos);
+
+  // NOT A BLANKET REFUSAL OF THE SECOND ADAPTER. The same two adapters on a
+  // pipeline whose phases all run fused are ACCEPTED — that is the composition
+  // `dfr_pipeline.py:212` builds and the one this row was lifted for. Without
+  // this, a guard that simply refused `loras.size() > 1` everywhere would pass
+  // the checks above while deleting the row's whole capability.
+  vllm::multimodal::VideoModelParams one_stage = ConditioningParams(ws.paths);
+  one_stage.extras[vllm::multimodal::kLtx2LoraPathExtra] = first;
+  one_stage.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(one_stage));
 }
 
 // ─── LTX25-TI2VID-RECIPE (#1093) ─────────────────────────────────────────────
@@ -11262,7 +11963,7 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   // rather than on the recipe struct — the recipe case proves the field is SET,
   // and this one proves it is CONSUMED (#1013).
   //
-  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
   // `tokens = math.prod(latent.shape[2:]) if latent is not None else
   // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
   // = 4096 (`:11`, `:29`). `ti2vid_two_stages.py:243-245` passes NO latent;
@@ -11419,6 +12120,179 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   CHECK(vllm::Ltx2SigmaSchedule(rendered_steps, 0) == at_anchor);
 }
 
+TEST_CASE("ltx2 one_stage: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
+  // ISSUE #2521, and the same 2x2 the `ti2vid` and `keyframe` cases above run,
+  // pointed at the arm that still fitted the shift on its own target grid.
+  //
+  // BOTH ORACLES SAY 4096, AND THEY SAY IT INDEPENDENTLY. vLLM-Omni — the
+  // PRIMARY, since it registers `ltx2` — puts the anchor in the expression and
+  // no token count anywhere near it: `sigma_shift = max_anchor * slope +
+  // (base_shift - slope * base_anchor)`, under the comment "Official LTX2
+  // one-stage intentionally uses the max sequence anchor, so the shift stays at
+  // max_shift" (ltx2_denoise.py:186-188 @ a4ea67a2). Lightricks selects by
+  // whether a latent is passed — `tokens = math.prod(latent.shape[2:]) if
+  // latent is not None else default_number_of_tokens` (schedulers.py:32, with
+  // `default_number_of_tokens = MAX_SHIFT_ANCHOR = 4096` at `:29`, `:11`) — and
+  // `ti2vid_one_stage.py:207` passes none.
+  //
+  // THROUGH THE PRODUCTION ENTRY POINT, not on the recipe struct. The recipe
+  // case in test_ltx2_pipeline.cpp proves the field is SET; this one proves it
+  // is CONSUMED, which is the half #1013 showed can be false on its own.
+  //
+  // A 2x2 OVER (recipe, geometry), because neither half is load-bearing alone.
+  // The equalities pass on a build that hard-codes 4096 for every arm; the
+  // inequalities pass on the tree this case was written against, where every
+  // derived arm read its target grid. Only the pair says the anchor is per-phase
+  // AND selected correctly. `res2s_two_stage` is the control precisely because
+  // it is upstream's ONE exception: `ti2vid_two_stages_hq.py:261-267` builds
+  // `empty_latent` from the stage-1 output shape and passes it, so its shift
+  // legitimately tracks the grid and must NOT move.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  // Two geometries whose target grids differ. `one_stage` runs at
+  // `spatial_downscale = 1`, so `Ltx2AssertResolution`'s divisor is 32 here and
+  // 64 on the `res2s_two_stage` control; both sizes divide both.
+  const int64_t kSmall = 64;
+  const int64_t kLarge = 128;
+
+  // TWO NUMBERS OUT OF EACH RENDER. The trajectory assertions at the end
+  // recompute at the step count the RENDER used, read back out of it rather than
+  // restated as a literal down there — a literal would let someone lower
+  // `gen.steps` to 2 and leave every assertion green while making the trajectory
+  // claim vacuous.
+  struct Rendered {
+    int64_t schedule_tokens;
+    int64_t steps;
+  };
+
+  auto rendered_for = [&](const char* kind, int64_t size, const std::string& tag) -> Rendered {
+    vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = Ti2VidGen(ws.root + "/" + tag, size);
+    // THREE STEPS, NOT THE FIXTURE'S TWO. `stretch` pins sigma[0] at 1.0 and the
+    // LAST non-zero sigma at `terminal` = 0.1 (schedulers.py:48-55), so a 2-step
+    // schedule is {1, 0.1, 0} for EVERY token count and the anchor cannot reach
+    // the trajectory at all. Three is the shortest schedule with an interior
+    // sigma for the shift to move. Lowering it is REFUSED rather than
+    // deprecated: the count comes back out of this lambda and the assertions at
+    // the end red by name on it.
+    gen.steps = 3;
+    // `Ti2VidGen` carries the STG override, which `one_stage` NEEDS — the
+    // reduced fixture DiT has two blocks and the params row names block 28, so
+    // without it the perturbed pass is refused by name. The HQ preset ships
+    // `stg_blocks = []` beside `stg_scale = 0.0` (constants.py:105, :113) and
+    // FIXES its stage-2 guidance, so giving it the same override is refused
+    // outright and the control has to take it back off.
+    if (std::string(kind) == "res2s_two_stage") {
+      gen.extras.erase(vllm::multimodal::kLtx2VideoStgBlocksExtra);
+      gen.extras.erase(vllm::multimodal::kLtx2AudioStgBlocksExtra);
+    }
+    (void)engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // Written only on the branch that CALLS `Ltx2SigmaSchedule`, so a phase
+    // carrying frozen sigmas leaves it 0.
+    REQUIRE(t.schedule_tokens > 0);
+    return Rendered{t.schedule_tokens, gen.steps};
+  };
+
+  const Rendered one_small_r = rendered_for("one_stage", kSmall, "one_small");
+  const Rendered one_large_r = rendered_for("one_stage", kLarge, "one_large");
+  const Rendered hq_small_r = rendered_for("res2s_two_stage", kSmall, "hq_small");
+  const Rendered hq_large_r = rendered_for("res2s_two_stage", kLarge, "hq_large");
+
+  const int64_t one_small = one_small_r.schedule_tokens;
+  const int64_t one_large = one_large_r.schedule_tokens;
+  const int64_t hq_small = hq_small_r.schedule_tokens;
+  const int64_t hq_large = hq_large_r.schedule_tokens;
+
+  // The step count the four renders ACTUALLY ran at, read back out of them. All
+  // four have to agree, or "the step count" is not one number and nothing below
+  // can be recomputed at it.
+  const int64_t rendered_steps = one_small_r.steps;
+  REQUIRE(one_large_r.steps == rendered_steps);
+  REQUIRE(hq_small_r.steps == rendered_steps);
+  REQUIRE(hq_large_r.steps == rendered_steps);
+
+  MESSAGE("one_stage: " << one_small << " / " << one_large << "   res2s: " << hq_small << " / "
+                        << hq_large);
+
+  // ── this arm's schedule is RESOLUTION-INDEPENDENT, at upstream's constant ──
+  const int64_t anchor = vllm::Ltx2SchedulerParams{}.default_number_of_tokens;
+  CHECK(anchor == 4096);  // schedulers.py:11 — pinned, not read back from the build
+  CHECK_MESSAGE(one_small == anchor,
+                "one_stage's sigma shift was fitted on " << one_small << " tokens, but upstream "
+                    "passes no latent (ti2vid_one_stage.py:207) and vLLM-Omni hard-codes the max "
+                    "anchor (ltx2_denoise.py:188), so both get " << anchor);
+  CHECK(one_large == anchor);
+
+  // ── and the HQ arm's is NOT, which is what stops the above being a constant ─
+  CHECK_MESSAGE(hq_small != hq_large,
+                "the res_2s arm reported the same anchor at two resolutions, so this fixture "
+                "cannot tell the two branches apart and the equalities above prove nothing");
+  CHECK(hq_small != anchor);
+  CHECK(hq_large != anchor);
+
+  // ── and the two anchors really do produce DIFFERENT sigmas ────────────────
+  //
+  // The strongest half: a claim about the trajectory rather than about the
+  // counter that reports it. `sigma_shift = tokens*mm + b` (schedulers.py:35-39),
+  // so two token counts give two schedules — unless the shift arithmetic has
+  // been flattened, in which case selecting the anchor would be inert and every
+  // assertion above would still pass.
+  const std::vector<float> at_anchor = vllm::Ltx2SigmaSchedule(rendered_steps, anchor);
+  const std::vector<float> at_target = vllm::Ltx2SigmaSchedule(rendered_steps, hq_small);
+  REQUIRE(at_anchor.size() == at_target.size());
+  CHECK_MESSAGE(at_anchor != at_target,
+                "the 4096 anchor and the target grid produce the SAME schedule on this fixture, "
+                "so nothing above measures which one was taken");
+
+  // AND THE RENDER'S STEP COUNT IS LOAD-BEARING. Two assertions, because they
+  // fail for different reasons: the first names the render's own count, so
+  // lowering `gen.steps` reds HERE rather than silently turning the comparison
+  // above into a value against itself; the second pins the degeneracy itself, so
+  // it reds if a scheduler change ever makes a 2-step schedule token-dependent.
+  CHECK_MESSAGE(rendered_steps > 2,
+                "the renders above ran at " << rendered_steps << " steps, and a schedule that "
+                "short is {1, 0.1, 0} for EVERY token count (schedulers.py:48-55), so the "
+                "trajectory comparison above compares a value with itself");
+  CHECK_MESSAGE(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor) ==
+                    vllm::Ltx2SigmaSchedule(/*steps=*/2, hq_small),
+                "a 2-step schedule now DOES depend on the token count, so the stretch no longer "
+                "pins both of its non-zero sigmas and the comment above is wrong");
+
+  // THE ORACLE'S OWN NUMBERS, at the geometry the adherence gate renders
+  // (320x192x25 -> a 4x6x10 one_stage grid, 240 tokens). Produced by running the
+  // PINNED `LTX2Scheduler.execute` at fd4ded7f both ways — not by transcribing
+  // this engine's output, which could not gate the function that produced it.
+  // The two sequences are what the flip is FOR: every interior sigma moves, and
+  // the target-grid arm leaves the high-noise regime early.
+  const std::vector<float> upstream_no_latent = {0.999999762F, 0.734179258F, 0.100000024F, 0.0F};
+  const std::vector<float> upstream_240 = {0.999999881F, 0.637402773F, 0.099999964F, 0.0F};
+  REQUIRE(upstream_no_latent != upstream_240);
+  const std::vector<float> ours_anchor = vllm::Ltx2SigmaSchedule(/*steps=*/3, anchor);
+  const std::vector<float> ours_240 = vllm::Ltx2SigmaSchedule(/*steps=*/3, /*tokens=*/240);
+  REQUIRE(ours_anchor.size() == upstream_no_latent.size());
+  for (size_t i = 0; i < ours_anchor.size(); ++i) {
+    INFO("i = " << i);
+    CHECK(ours_anchor[i] == doctest::Approx(upstream_no_latent[i]).epsilon(1e-6));
+    CHECK(ours_240[i] == doctest::Approx(upstream_240[i]).epsilon(1e-6));
+  }
+
+  // `Ltx2SigmaSchedule` reads 0 as "take the default", so the concrete 4096 the
+  // engine passes and the sentinel are the same schedule. Pinned because the
+  // engine deliberately passes the concrete value, so the trace reports an
+  // anchor rather than a sentinel.
+  CHECK(vllm::Ltx2SigmaSchedule(rendered_steps, 0) == at_anchor);
+}
+
 TEST_CASE("ltx2 ti2vid: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
   // `--distilled-lora` is `required=True` (utils/args.py:1140-1155) on the
   // parser ti2vid_two_stages.py:319 selects, and stage 2's three-sigma
@@ -11513,7 +12387,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   // `image_conditionings_by_adding_guiding_latent` (helpers.py:343-367) from
   // `combined_image_conditionings` (:272-308): the second sends `frame_idx == 0`
   // to `VideoConditionByLatentIndex`, which REPLACES latent frame 0's clean
-  // tokens and never changes the token count (latent_cond.py:38-39); the first
+  // tokens and never changes the token count (latent_cond.py:40-41); the first
   // has NO branch and sends it to `VideoConditionByKeyframeIndex`, which APPENDS
   // a latent frame of tokens (keyframe_cond.py:79-82).
   //
@@ -11593,7 +12467,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   CHECK_MESSAGE(ti.video_tokens == bare.video_tokens,
                 "`combined_image_conditionings` sends frame 0 to "
                 "`VideoConditionByLatentIndex`, which replaces tokens that already exist "
-                "(latent_cond.py:38-39), so the count must not move — it went from "
+                "(latent_cond.py:40-41), so the count must not move — it went from "
                     << bare.video_tokens << " to " << ti.video_tokens);
   CHECK(kf_bare.video_tokens == bare.video_tokens);
 
@@ -11862,7 +12736,7 @@ TEST_CASE("ltx2 keyframe: the pipeline renders through vllm.h, guided on the UNA
 }
 
 TEST_CASE("ltx2 keyframe: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
-  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
   // `tokens = math.prod(latent.shape[2:]) if latent is not None else
   // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
   // = 4096 (`:11`, `:29`). `keyframe_interpolation.py:199-200` passes NO latent;

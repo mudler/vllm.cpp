@@ -852,6 +852,192 @@ def is_warm_leg(leg: Mapping[str, Any]) -> bool:
     return int(leg["run"]) > 1
 
 
+#: The three counters `vllm-cli` prints per leg (#2832), in the order the
+#: refusals name them. A leg carries all three or none: a partial set is a
+#: defect and never a smaller sample.
+ACCEPTANCE_KEYS = ("spec_drafts_proposed", "spec_drafts_accepted", "spec_drafted_request_steps")
+
+#: Written into every acceptance block, because the two reference engines
+#: disagree here and one sentence of prose is cheaper than the error.
+#:
+#: IT NAMES vLLM AND NOT SGLang FOR THE SECOND FIGURE. `mean_acceptance_length`
+#: is `1 + accepted/steps`, which is vLLM's `mean_acceptance_length` EXACTLY
+#: (`vllm/v1/spec_decode/metrics.py:114`). SGLang's `accept_length` is
+#: `completion_tokens / spec_verify_ct`
+#: (`python/sglang/srt/managers/tokenizer_manager.py:2363`) and that numerator
+#: also carries the PREFILL token, which came from no verify step; the two
+#: differ by about one token per request, roughly +0.07 on a 64-token request
+#: over ~15 steps.
+BONUS_TOKEN_CONVENTION = (
+    "the bonus/replacement token a verify step always emits is EXCLUDED from "
+    "drafts_accepted and from accept_rate, which is vLLM's own convention for "
+    "vllm:spec_decode_num_accepted_tokens, and INCLUDED in "
+    "mean_acceptance_length, which is vLLM's own mean_acceptance_length "
+    "(1 + accepted/steps) EXACTLY. It is NOT SGLang's accept_length: that "
+    "divides completion_tokens by spec_verify_ct, so its numerator also carries "
+    "the prefill token and it runs about one token per request higher. "
+    "drafted_request_steps counts (request, step) pairs that carried a draft "
+    "and NOT forward passes, which is how vllm:spec_decode_num_drafts and "
+    "spec_verify_ct both count; it equals the number of verify forwards only at "
+    "max_num_seqs=1"
+)
+
+
+def _acceptance_of(leg: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    """This leg's three counts, or None when it carries no acceptance at all.
+
+    A leg with SOME of the three is neither, and raises: the oracle arm carries
+    none of them and our arm carries all three, so a leg holding one or two came
+    from a parse that half-matched and its counts cannot be trusted.
+    """
+
+    present = [key for key in ACCEPTANCE_KEYS if key in leg]
+    if not present:
+        return None
+    if len(present) != len(ACCEPTANCE_KEYS):
+        missing = [key for key in ACCEPTANCE_KEYS if key not in leg]
+        raise HarnessError(
+            f"acceptance: run {leg.get('run')} carries {present} and not "
+            f"{missing}. A leg holds all three counts or none of them; a partial "
+            "set is a half-matched parse, not a smaller sample"
+        )
+    return (
+        int(leg["spec_drafts_proposed"]),
+        int(leg["spec_drafts_accepted"]),
+        int(leg["spec_drafted_request_steps"]),
+    )
+
+
+def fold_acceptance(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Speculative acceptance over the WARM legs, in the oracles' own units.
+
+    THE SAME PREDICATE THE THROUGHPUT MEDIAN USES. `is_warm_leg` selects the
+    legs here and in `fold_legs`, so the two axes cannot come to describe
+    different leg populations -- which would make the acceptance figure unable
+    to explain the throughput figure beside it, the one thing #2832 wants it for.
+
+    POOLED, NOT AVERAGED. An acceptance rate's estimator is a ratio of sums; a
+    median of per-leg ratios weights a leg that verified three steps the same as
+    one that verified three hundred. The per-leg values are kept BESIDE the
+    pooled ones rather than instead of them, because a mean hides the shape this
+    row has twice measured: acceptance falling to zero for part of a run, and an
+    MMA arm moving it from 8.7% to 41.6%.
+
+    `None` when NO leg reports acceptance, which is what the oracle arm's legs
+    are. A zero there would read as an engine that accepted nothing.
+
+    The two derived figures are `None` when their denominator is 0. That is not
+    a silent pass: `acceptance_reasons` refuses a run that proposed nothing, and
+    this function is called while the arm record is being BUILT, before the
+    refusal, so raising here would destroy the evidence that names the cause.
+    """
+
+    warm = [leg for leg in legs if is_warm_leg(leg)]
+    counted = [(leg, _acceptance_of(leg)) for leg in warm]
+    reported = [(leg, value) for leg, value in counted if value is not None]
+    if not reported:
+        return None
+    # SOME AND NOT ALL is a defect, never a smaller sample. Every leg of an arm
+    # comes from the same binary, so a set where one leg reported and another
+    # did not means a parse that half-matched -- and pooling only the legs that
+    # reported would quietly fold a different population from the throughput
+    # median beside it, which is the one thing this function exists to prevent.
+    silent = [leg for leg, value in counted if value is None]
+    if silent:
+        runs = ", ".join(str(leg.get("run")) for leg in silent)
+        raise HarnessError(
+            f"acceptance: warm run {runs} reported no speculative counters while "
+            f"{len(reported)} other warm leg(s) did, so the legs disagree about "
+            "what was measured and the pooled figure would describe a different "
+            "population from the throughput median"
+        )
+
+    proposed = sum(value[0] for _, value in reported)
+    accepted = sum(value[1] for _, value in reported)
+    steps = sum(value[2] for _, value in reported)
+    return {
+        "warm_legs": len(reported),
+        "drafts_proposed": proposed,
+        "drafts_accepted": accepted,
+        "drafted_request_steps": steps,
+        "accept_rate": (accepted / proposed) if proposed > 0 else None,
+        "mean_acceptance_length": ((accepted + steps) / steps) if steps > 0 else None,
+        "per_leg": [
+            {
+                "run": int(leg["run"]),
+                "drafts_proposed": value[0],
+                "drafts_accepted": value[1],
+                "drafted_request_steps": value[2],
+                "accept_rate": (value[1] / value[0]) if value[0] > 0 else None,
+                "mean_acceptance_length": (
+                    (value[1] + value[2]) / value[2] if value[2] > 0 else None
+                ),
+            }
+            for leg, value in reported
+        ],
+        "bonus_token": BONUS_TOKEN_CONVENTION,
+    }
+
+
+def acceptance_reasons(legs: Sequence[Mapping[str, Any]], *, label: str) -> list[str]:
+    """Reasons a set of legs does not establish an acceptance figure.
+
+    THE FIELD THIS ROW ADDS MUST NOT BE ABLE TO BECOME NULL IN SILENCE. #2832
+    exists because our arm recorded no acceptance while both oracles did, and an
+    instrument that reports `null` whenever the binary is old, the drafter never
+    ran, or the parse half-matched would reproduce that state under a new field
+    name.
+
+    Applied to EVERY leg and not only the warm ones: a cold leg that proposed
+    nothing is the same broken drafter, and finding it costs a lease either way.
+    """
+
+    reasons: list[str] = []
+    if not legs:
+        return reasons
+    counted = [(leg, _acceptance_of(leg)) for leg in legs]
+    if all(value is None for _, value in counted):
+        return [
+            f"acceptance: the {label} arm's legs carry no speculative counters, so "
+            "the run cannot say whether it is slower because it EXECUTES slower or "
+            "because it ACCEPTS less. The counters are `spec_drafts_proposed=` / "
+            "`spec_drafts_accepted=` / `spec_drafted_request_steps=`, printed per "
+            "leg by `examples/cli/main.cpp`; a binary built before them cannot "
+            "drive this arm"
+        ]
+    total_proposed = 0
+    for leg, value in counted:
+        if value is None:
+            reasons.append(
+                f"acceptance: run {leg.get('run')} reported no speculative counters "
+                f"while other legs of the {label} arm did, so the legs disagree "
+                "about what was measured"
+            )
+            continue
+        proposed, accepted, steps = value
+        total_proposed += proposed
+        if accepted > proposed:
+            reasons.append(
+                f"acceptance: run {leg.get('run')} accepted {accepted} of "
+                f"{proposed} proposed drafts, which is impossible. The accepted "
+                "count EXCLUDES the bonus token, so it can never exceed the "
+                "proposed count; the counters or the parse are wrong"
+            )
+        if proposed > 0 and steps <= 0:
+            reasons.append(
+                f"acceptance: run {leg.get('run')} verified {proposed} draft tokens "
+                "over 0 drafted request-steps, so mean_acceptance_length has no "
+                "denominator"
+            )
+    if total_proposed <= 0:
+        reasons.append(
+            f"acceptance: the {label} arm proposed no drafts across any leg, so it "
+            "ran a plain decode under a declared drafter. A 0% acceptance rate "
+            "would read as a measurement of the drafter rather than of its absence"
+        )
+    return reasons
+
+
 def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Median of the WARM legs, with the cold discard recorded, not applied silently.
 
@@ -882,6 +1068,13 @@ def fold_legs(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "metrics": {"output_throughput_tok_s": statistics.median(leg["tok_s"] for leg in warm)},
         "legs": list(legs),
+        # #2832. ALWAYS PRESENT, and null when the arm reported no counters.
+        # An absent key reads as an oversight; a null one says what is true,
+        # which is that this arm's legs carried no acceptance to fold. Folded
+        # from the WARM legs by construction -- `fold_acceptance` applies the
+        # same `is_warm_leg` predicate -- so the throughput median and the
+        # acceptance figure beside it always describe one leg population.
+        "spec_acceptance": fold_acceptance(legs),
         "warm_legs": len(warm),
         "cold_legs_discarded": len(legs) - len(warm),
         "cold_discard_cause": (
@@ -1071,6 +1264,90 @@ def sglang_axis_status() -> dict[str, Any]:
     return dict(SGLANG_AXIS_STATUS)
 
 
+def acceptance_comparison(
+    ours: Mapping[str, Any], theirs: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The two arms' acceptance, in one place and in one set of units (#2832).
+
+    The gate records ours 14.951 against vLLM 16.111 and a same-workload SGLang
+    run folds to 16.034. Two independent oracles agree within 0.5% of each other,
+    so the deficit is an engine property -- and throughput alone cannot say which
+    one, because those two oracles reach the same number by DIFFERENT balances:
+    SGLang accepts more per drafted request-step than vLLM and lands beside it.
+    This block is the axis that separates them, on the record a reader actually
+    cites.
+
+    ONLY THE vLLM SIDE IS RENDERED HERE, and that is deliberate. `ours` and
+    `vllm` are the same quantity in the same units, so they subtract. SGLang's
+    published `accept_length` is NOT that quantity -- see
+    `BONUS_TOKEN_CONVENTION` -- and putting it in this block under the same key
+    would invite exactly the one-token error the block exists to prevent.
+
+    THE TWO SIDES DO NOT FOLD THE SAME LEG POPULATION, and that is recorded
+    rather than hidden. Ours is pooled over the WARM legs, which is the
+    population the throughput median uses. vLLM's `vllm:spec_decode_*` counters
+    are cumulative over the engine's whole run, COLD LEGS INCLUDED, because the
+    oracle arm reads them once at the end. Correcting it needs per-leg
+    `llm.get_metrics()` deltas on that arm and is owed, not silently assumed
+    away.
+
+    NO VERDICT AND NO FLOOR. This measures; the axes gate.
+    """
+
+    block = ours.get("spec_acceptance") or {}
+    metrics = theirs.get("metrics") or {}
+    their_accepted = metrics.get("vllm:spec_decode_num_accepted_tokens")
+    their_proposed = metrics.get("vllm:spec_decode_num_draft_tokens")
+    their_steps = metrics.get("vllm:spec_decode_num_drafts")
+
+    def _rate(accepted: Any, proposed: Any) -> float | None:
+        if accepted is None or proposed is None or float(proposed) <= 0:
+            return None
+        return float(accepted) / float(proposed)
+
+    def _per_step(accepted: Any, steps: Any) -> float | None:
+        if accepted is None or steps is None or float(steps) <= 0:
+            return None
+        # The bonus token is one per drafted request-step and is IN this
+        # figure, which makes it vLLM's own mean_acceptance_length.
+        return (float(accepted) + float(steps)) / float(steps)
+
+    return {
+        "bonus_token": BONUS_TOKEN_CONVENTION,
+        "ours": {
+            "drafts_proposed": block.get("drafts_proposed"),
+            "drafts_accepted": block.get("drafts_accepted"),
+            "drafted_request_steps": block.get("drafted_request_steps"),
+            "accept_rate": block.get("accept_rate"),
+            "mean_acceptance_length": block.get("mean_acceptance_length"),
+            "per_leg": block.get("per_leg"),
+            "leg_population": (
+                "the warm legs only, the same population the throughput median "
+                "is folded from"
+            ),
+            "source": (
+                "`spec_drafts_proposed=` / `spec_drafts_accepted=` / "
+                "`spec_drafted_request_steps=` printed per leg by `examples/cli/main.cpp` "
+                "through `vllm_engine_spec_acceptance` (ABI v25)"
+            ),
+        },
+        "vllm": {
+            "drafts_proposed": their_proposed,
+            "drafts_accepted": their_accepted,
+            "drafted_request_steps": their_steps,
+            "accept_rate": _rate(their_accepted, their_proposed),
+            "mean_acceptance_length": _per_step(their_accepted, their_steps),
+            "per_leg": None,
+            "leg_population": (
+                "the whole run, COLD legs included: the oracle arm reads "
+                "`llm.get_metrics()` once at the end, so these counters cannot be "
+                "restricted to the warm legs the throughput median uses"
+            ),
+            "source": "vllm:spec_decode_num_accepted_tokens / _num_draft_tokens / _num_drafts",
+        },
+    }
+
+
 def build_speed_result(
     *,
     ours: Mapping[str, Any],
@@ -1121,6 +1398,10 @@ def build_speed_result(
         # The goal names TWO denominators. This one carries no number yet, and
         # says so in the artifact rather than being absent from it.
         "sglang": sglang_axis_status(),
+        # #2832: WHY the ratio is what it is, beside the ratio. Neither arm's
+        # acceptance gates anything; an axis below a floor is a gap, and this is
+        # the datum that says which gap to chase.
+        "acceptance": acceptance_comparison(ours, theirs),
         "axes": axis_rows(
             ours.get("metrics") or {}, theirs.get("metrics") or {}, floors or {}
         ),

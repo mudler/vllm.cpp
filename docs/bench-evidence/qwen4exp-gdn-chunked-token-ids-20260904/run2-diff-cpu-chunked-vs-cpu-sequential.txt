@@ -1,0 +1,22 @@
+=== CPU-CHUNKED vs CPU-SEQ : rows base=42 other=42 ===
+step  L    tag       dtype     sumabs_base   sumabs_other  rel_sumabs
+0     None emb       bf16        37.242316      37.242316   0.000e+00
+0     None wide      bf16       148.969264     148.969264   0.000e+00
+0     None in        bf16       148.969264     148.969264   0.000e+00
+0     None ahc.mix   bf16        6517.5925      6517.5925   0.000e+00
+0     None ahc.inj   bf16      0.952026367    0.952026367   0.000e+00
+0     None blk       bf16       1074.05248     1073.65489   3.702e-04
+0     None s.attn    bf16       232.272312     232.225395   2.020e-04
+0     None mhc.mix   bf16       3615.47142     3613.82031   4.567e-04
+0     None mhc.inj   bf16       2.92224121     2.92212772   3.884e-05
+0     None moe       bf16       389.936505     389.976283   1.020e-04
+0     None s.mlp     bf16       392.790737     392.881629   2.313e-04
+0     None ple       bf16       232.508111     232.752729   1.051e-03
+0     None s.ple     bf16       568.716336      569.04265   5.734e-04
+0     None out       bf16       27981.5263     27964.6752   6.022e-04
+--- CPU-CHUNKED vs CPU-SEQ SUMMARY ---
+TAPS COMPARED                 : 42
+TAPS WITH rel(sumabs) != 0    : 26
+FIRST TAP THAT DIFFERS        : ('0', None, 'blk')
+LARGEST rel(sumabs)           : 1.471839e-02 at ('2', None, 'out')
+L00 blk rel(sumabs)           : 3.701774e-04  (base=1074.05248 other=1073.65489)

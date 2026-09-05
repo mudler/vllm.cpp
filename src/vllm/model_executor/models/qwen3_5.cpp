@@ -19,11 +19,13 @@
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
+#include "vllm/model_executor/models/dense_exl3_linear.h"  // MODEL-QWEN35-EXL3 (#2495): the EXL3 linear seam
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 #include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
+#include "vllm/model_executor/models/act_dump.h"  // ROCM-TIER-DIVERGENCE (#2590)
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/device_placement.h"
@@ -40,6 +42,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +68,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
+#include "vt/unaligned.h"
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 #endif
@@ -123,6 +127,11 @@ bool detail::ShouldUsePackedGdnDecode(
 // the BF16 one, so predicting the FP8 dtype there would be wrong.
 vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
   if (in.has_bf16_qkvz_owner) return in.in_dtype;
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): the trellis arm emits `indt` for
+  // `mixed_qkv`, which is what `ProjectGdnQkvz`'s EXL3 rung allocates. Placed
+  // in ProjectGdnQkvz's own branch order, ahead of the fp8 terms, so the two
+  // orders read the same way down the page.
+  if (in.has_exl3_qkv_owner) return in.in_dtype;
   // PERF-GDN-PACKED-BRIDGE (#365): only the MERGED fp8 arm can carry the
   // narrowed epilogue dtype; the split arm hardcodes F32 (ProjectGdnQkvz).
   if (in.has_fp8_qkv_owner)
@@ -185,6 +194,72 @@ vt::DType detail::GdnOutDType() {
   static const bool bf16 =
       detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
   return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
+}
+
+// --- The model's ONE resolved activation dtype (#2534) -----------------------
+//
+// vLLM resolves one model dtype and every layer inherits it; this is that value
+// for the qwen35 trunk. It answers BF16 everywhere by default, which is what the
+// device tiers measured and ship, and it answers F32 on the CPU tier -- and only
+// there -- when `VT_ACT_F32=1`.
+//
+// WHY THE CPU TIER CAN HAVE A DIFFERENT ANSWER AT ALL. On a device tier the BF16
+// activation is the format the GEMM consumes, so the narrow store is what the
+// hardware wants. On the CPU tier nothing consumes it: `LoadActF32`
+// (cpu_quant_gemm.cpp:41) widens every activation element straight back to f32
+// before the row is quantized, and `WidenRowToF32` (cpu_ops.cpp:577) does the
+// same inside RMSNorm. There the narrow store buys memory traffic and costs up
+// to 2^-9 = 1.95e-3 relative per store -- twice per layer on the residual alone,
+// which is added in f32, rounded, and then RE-READ (cpu_ops.cpp:576-583).
+//
+// WHY IT EXISTS. The Q4_K_M arm's declared oracle is llama.cpp b10451, whose CPU
+// graph is f32 with an f16 KV cache (llama-context.cpp:3538-3539), so the token
+// gate has been comparing two engines at different precisions. That difference
+// is about two hundred times ggml's own arch-versus-generic k-quant spread,
+// measured at the pin at 1.4e-05 to 9.8e-05 rms relative. This is the
+// same-binary A/B that separates the two. See
+// .agents/specs/qwen38-27b-q4km-token-exactness.md and issue #2534.
+//
+// Default OFF, so no shipped default and no recorded device measurement moves
+// until that A/B exists. The polarity is opt-IN, unlike `VT_GDN_OUT_BF16`: a
+// leading '1' is the only thing that turns it on.
+bool detail::ActF32FlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
+vt::DType detail::ActDType(vt::DeviceType dev_type) {
+  static const bool f32 = detail::ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  if (!f32) return vt::DType::kBF16;
+  // `VT_ACT_F32=1` is REFUSED, and refusing is the point. The f32 conversion is
+  // INCOMPLETE, so honouring the flag does not produce an f32 engine: it
+  // produces a broken one. Measured on thor:gpu0, rc job 18fc60f0 -- the default
+  // arm stays 33/33 and 780/780 while the f32 arm fails 9 cases and 293
+  // assertions, all of them CROSS-PATH consistency assertions (the indexed
+  // versus fallback GDN pools, the tap versus plain routes, one
+  // CHECK(2.69807 < 0.001)), plus a SIGABRT in the NVFP4 lm_head case. Paired
+  // paths required to agree bitwise no longer do, because one side is retyped
+  // and its reference is not.
+  //
+  // AGENTS.md: refuse an unimplemented arm with a message that NAMES the missing
+  // part, and never leave the missing path to be discovered later. A SIGABRT in
+  // the ninth test case is exactly "discovered later", so the flag aborts here,
+  // once, by name, before any buffer is allocated.
+  //
+  // The resolver itself stays, and it is not dead: every qwen35 activation
+  // buffer reads its answer on every forward, which is the one-model-dtype shape
+  // vLLM resolves and every layer inherits. What is missing is only the f32
+  // ANSWER, and this names what that would take.
+  VT_CHECK(false,
+           "VT_ACT_F32=1 is REFUSED: the qwen35 f32 activation conversion is "
+           "incomplete and would run a numerically inconsistent engine. Missing: "
+           "retype every PAIRED path together (the indexed and fallback GDN "
+           "pools, the tap and plain routes) so the cross-path equality gates "
+           "still hold, and resolve the two bf16 dtype CONTRACTS the trunk feeds "
+           "-- vt::SigmoidGateBf16 (ops.cpp:5105) and the NVFP4 lm_head. Owed in "
+           ".agents/specs/qwen38-27b-q4km-token-exactness.md; issue #2534. Unset "
+           "VT_ACT_F32 to run the shipped bf16 path.");
+  (void)dev_type;
+  return vt::DType::kBF16;  // unreachable; VT_CHECK(false) always throws
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -564,7 +639,20 @@ detail::DeviceTokenIds detail::TakeDeviceTokenIds() {
 
 bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
                                  void* dst, int64_t dst_count, const char* what) {
-  const DeviceTokenIds ov = TakeDeviceTokenIds();
+  return ApplyDeviceTokenIds(backend, queue, dst, dst_count,
+                             TakeDeviceTokenIds(), what);
+}
+
+// #2730 — the body, once, for both publishers. The override arm above takes and
+// clears the thread-local; the multimodal arm is handed
+// `MmEmbedInputs::device_token_ids` directly, because `ModelRegistry::EmbedMm`
+// runs before any forward has established a scope. Everything after the source
+// differs by nothing at all, and that is the point: the bounds check that refuses
+// a shape disagreement, and the `Copy` that goes ON `queue` so it is ordered
+// AFTER the runner's combine rather than racing it, are one expression.
+bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
+                                 void* dst, int64_t dst_count,
+                                 DeviceTokenIds ov, const char* what) {
   if (ov.ids == nullptr) return false;
   VT_CHECK(ov.count <= dst_count,
            std::string(what) + ": device input ids longer than the embed input");
@@ -952,11 +1040,23 @@ float Silu(float x) { return x / (1.0F + std::exp(-x)); }
 // conv kernels require the weight dtype to match the activation dtype; where
 // activations are f32 (GDN conv/gated-norm, attention qk-norm, final-norm
 // replay), the bf16 weight must be presented as f32.
+//
+// `w.bytes` MAY BE A BORROWED MAPPING AT AN ODD ADDRESS, so the bytes are read
+// through `vt::LoadUnaligned` off a byte cursor rather than a `const uint16_t*`.
+// A safetensors payload starts at `8 + <JSON header length>`
+// (`safetensors_reader.cpp:78`), a header length is arbitrary, and
+// `BorrowStTensorBytes` hands those bytes over verbatim. This site aborted
+// `test_qwen35_exl3` under `-fsanitize=alignment`, reached from
+// `ModelRegistry::Forward` through `FullAttnBlockPaged`, and it was hidden
+// behind the EXL3 finding because that lane stops at the first report (#2578,
+// the sixth recurrence of the class in
+// `.agents/specs/unaligned-safetensors-consumers.md`).
 std::vector<float> WeightF32(const OwnedTensor& w) {
-  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  const auto* src = w.bytes.data();
   const int64_t n = w.Numel();
   std::vector<float> out(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  for (int64_t i = 0; i < n; ++i)
+    out[static_cast<size_t>(i)] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
   return out;
 }
 
@@ -1094,14 +1194,25 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // interleave, and it was missing until now (issue #1320). The CUDA
   // quant dot reads `block_q8_0`; `VT_CPU_QUANT_REPACK` rewrites the buffer to
   // `block_q8_0x4` at load and only the CPU MatmulBTKernel understands that.
-  // Unlike `elem_kn_repack`, whose policy IS gated on the CPU platform
-  // (gguf_keep_quant.cpp), `quant_repack` rides `QuantRepackActive()` alone —
-  // a HOST-CPU i8mm probe — so an aarch64 box doing `--device cuda` can repack a
-  // Q8_0 weight and then upload it verbatim to a kernel that misreads it. That is
-  // silent wrong tokens, not a crash. Measured harmless on the target checkpoint
-  // (one Q8_0 tensor, 0.01% of parameters, and the instrumented load recorded
-  // `quant_repack = 0`), which is why it is a tripwire here rather than a
-  // campaign; `VT_CPU_QUANT_REPACK=0` is the operator's way past it.
+  // THE POLICY NOW AGREES WITH THIS GUARD (#2406). `quant_repack` used to ride
+  // `QuantRepackActive()` alone — a HOST-CPU i8mm probe with no device term —
+  // so an aarch64 box doing `--device cuda` repacked a Q8_0 weight and uploaded
+  // it verbatim to a kernel that misreads it. `GgufLoadPolicy::FromEnv` now
+  // resolves it through `QuantRepackForDevice(..., dev)`, gated `dev == kCPU`
+  // exactly as its sibling `elem_kn_repack` always was.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY. It called the gap
+  // "measured harmless on the target checkpoint (one Q8_0 tensor, 0.01% of
+  // parameters, and the instrumented load recorded `quant_repack = 0`)". The
+  // released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores **194** Q8_0
+  // hyper-connection mix weights (docs/USAGE.md), so the population was never
+  // one tensor; and a repacked `block_q8_0x4` weight DID reach device residency
+  // and refuse here by name on `thor:gpu0`, so the reading of `quant_repack = 0`
+  // did not generalise past the run that took it. The guard stays as belt to
+  // the policy's braces — a runtime refusal is what catches a future caller that
+  // builds a policy by hand — but it is no longer the only thing standing
+  // between an i8mm host and a device upload. `VT_CPU_QUANT_REPACK=0` remains
+  // the operator's same-binary way past the transform entirely.
   VT_CHECK(!w.repacked,
            "qwen3_5: an i8mm-repacked (block_q8_0x4) weight reached device "
            "residency; VT_CPU_QUANT_REPACK is a CPU-only load transform and the "
@@ -1219,29 +1330,56 @@ Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
 
 namespace {
 
+// ROCM-TIER-DIVERGENCE (#2590): the device-side half of the activation dump.
+// The keying, the manifest and every refusal live in
+// `vllm/model_executor/models/act_dump.h`, apart from these two so that a test
+// can drive the writer with no backend at all. See that header for why the
+// three predecessor dumps could not answer this question.
+// Download a device tensor and write it. `rows`/`cols` are the logical [T,H] or
+// [T,N] view; the manifest carries them so the comparator never guesses.
+void ActDumpTensor(Dev d, const char* knob, const std::string& dir,
+                   const char* stage, const Tensor& t, int64_t rows, int64_t cols) {
+  const actdump::Where w = actdump::Current();
+  const int64_t n = rows * cols;
+  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
+  DBuf tmp(d, t.dtype, {n});
+  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+  tmp.Download(d, raw.data());  // Copy + Synchronize
+  actdump::WriteBlob(knob, dir, w.step, w.layer, stage, t.dtype, rows, cols,
+                     raw.data(), raw.size());
+}
+
+
+// Both halves of the residual stream at one position. `layer` is -1 for the
+// post-embedding snapshot and the loop index otherwise. Inert unless
+// `VT_DUMP_ACT` names a directory.
+void ActDumpStream(Dev d, int64_t step, int64_t layer, DBuf& hidden, DBuf& res,
+                   int64_t T, int64_t H) {
+  const char* dir = actdump::StreamDir();
+  if (dir == nullptr || step < 0) return;
+  const actdump::LayerScope here(step, layer);
+  ActDumpTensor(d, "VT_DUMP_ACT", dir, "hidden", hidden.t(), T, H);
+  ActDumpTensor(d, "VT_DUMP_ACT", dir, "res", res.t(), T, H);
+  // Counted apart from every other stage: see `g_stream_blobs_step`. A gate
+  // keyed on the total cannot tell this call site from the GDN stage probes.
+  actdump::g_stream_blobs_step.fetch_add(2, std::memory_order_relaxed);
+}
+
 // Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
 // CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
 // activation dtype (GDN conv1d / gated-norm, attention qk-norm). `shape` is the
 // logical view (e.g. {conv_dim, Kw}).
 Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
-  if (!w.d_dev_f32) {
-    std::vector<float> f = WeightF32(w);
-    // Same defect and same fix as ResidentWeight above (issue #125): this handed
-    // out `std::vector<float>::data()`, a plain heap pointer, to any non-CUDA
-    // device backend. It would have thrown immediately after the embed one was
-    // fixed, on the q/k-norm and GDN f32 weights.
-    if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-      auto* buf = new std::vector<float>(std::move(f));
-      w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
-    } else {
-      const size_t nb = f.size() * sizeof(float);
-      void* p = d.b.Alloc(nb);
-      d.b.Copy(d.q, p, f.data(), nb);
-      Backend* bk = &d.b;
-      w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
-    }
-  }
+  // THIS HELPER STAYS PRIVATE (see :790) BUT ITS UPLOAD DOES NOT. The install
+  // is `dense_attn::InstallResidentF32` (dense_device_glue.h, included at :24),
+  // the same one `dense_attn_block.h` uses. What used to be private was a
+  // verbatim second copy of the upload, which is why #2711 -- an asynchronous
+  // `Copy` out of a function-local `std::vector<float>` that died at this
+  // closing brace -- had to be found and repaired twice. The behaviour this
+  // file's version carries beyond the shared one is in `ResidentWeight`, not
+  // here: the two f32 bodies were identical.
+  if (!w.d_dev_f32) dense_attn::InstallResidentF32(d, w, WeightF32(w));
   return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
 }
 
@@ -1618,6 +1756,14 @@ std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int
 // Linear [N,K], LoadBf16RawNK) -> vt::MatmulBT, the cuBLASLt TN fast path;
 // nk=false (loader-transposed [K,N]) -> row-major vt::Matmul, unchanged.
 
+// --- The model's ONE resolved activation dtype (#2534) -----------------------
+//
+// The RESOLVER lives in `detail::` (qwen3_5_internal.h) beside `GdnOutDType`
+// and for the same reason: a gate that only reads the parser proves nothing
+// about what the model calls, and this lever is the denominator of the arm's
+// same-binary A/B. This file keeps only the `Dev` adapter.
+DType ActDType(Dev d) { return detail::ActDType(d.q.device.type); }
+
 DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
@@ -1632,7 +1778,7 @@ DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
 DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
-  DBuf dout(d, DType::kBF16, {M, N});
+  DBuf dout(d, ActDType(d), {M, N});
   if (w.nk)
     vt::MatmulBT(d.q, dout.t(), x, dw);
   else
@@ -2482,8 +2628,24 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
                                  direct_scale ? &as.t() : nullptr);
   }
 #endif
+  // BF16 here is `vt::SigmoidGateBf16`'s own contract ("out must be bf16",
+  // ops.cpp:5105), NOT the trunk's activation dtype, so it does NOT follow
+  // `ActDType`. Every other consumer this row retyped takes `IsOutFloat`, which
+  // admits f32; this one does not, and routing an f32 buffer into it aborted 9
+  // cases of test_qwen27_paged_forward under VT_ACT_F32=1. Widening the trunk
+  // therefore leaves ONE bf16 rounding on the gated-attention output, which the
+  // spec records as owed: closing it needs an f32-capable gate kernel, not a
+  // dtype change here.
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // MODEL-QWEN35-EXL3 (#2495 item 3): o_proj is a single projection in every
+  // arm, so the EXL3 form differs from the bf16 one only in the kernel the
+  // shared linear seam binds. The gated bf16 activation IS the input the
+  // trellis GEMM stages to fp16.
+  if (w.IsExl3()) {
+    return dense_exl3::Linear(d, gated.t(), w.o_proj, w.o_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
   // the same dtype every other arm of this o_proj returns.
   if (!w.o_proj_fp8_block.Empty()) {
@@ -2517,6 +2679,31 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
   FullAttnQkvOutput out;
   out.fp4 = !w.q_proj_fp4.Empty();
   const bool fp8 = !w.q_proj_fp8.Empty();
+
+  // MODEL-QWEN35-EXL3 (#2495 item 3). FIRST and exclusive: the loader fills the
+  // trellis fields and leaves the bf16, fp4, per-tensor fp8 and block fp8 ones
+  // EMPTY, so a non-empty EXL3 weight IS the scheme -- the same rung order the
+  // loader uses, read from the forward's end.
+  //
+  // THREE projections, never the merged operand the branches below build. A
+  // trellis is `[k/16, n/16, 32*bits]`, so joining on the output dim
+  // interleaves per input tile rather than row-stacking; that merge is valid
+  // for this family and worth doing, and it is owed its own gate (`## Owed` in
+  // `specs/quant-exl3-shared.md`). `packed_consumers` is therefore never
+  // consulted here, and no `QkvSplit` runs.
+  //
+  // `out_dtype` is bf16 -- upstream's `out_dtype` at this site, the MODEL dtype
+  // every layer inherits -- and NOT the f32 the plain-bf16 arm below happens to
+  // emit. A token gate cannot see a dtype that is too wide.
+  if (w.IsExl3()) {
+    out.q_owner.emplace(dense_exl3::Linear(d, h, w.q_proj, w.q_proj_exl3, DType::kBF16));
+    out.k_owner.emplace(dense_exl3::Linear(d, h, w.k_proj, w.k_proj_exl3, DType::kBF16));
+    out.v_owner.emplace(dense_exl3::Linear(d, h, w.v_proj, w.v_proj_exl3, DType::kBF16));
+    out.qgate = out.q_owner->t();
+    out.key = out.k_owner->t();
+    out.value = out.v_owner->t();
+    return out;
+  }
 
   // MODEL-FP8-BLOCK-MERGED (#1189 M6): vLLM's QKVParallelLinear, as ONE
   // block-scaled GEMM over the N-concatenated q|k|v operand
@@ -2967,7 +3154,7 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
         vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
                           static_cast<int>(K), false});
   }
-  DBuf act(d, DType::kBF16, {M, N});
+  DBuf act(d, ActDType(d), {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;
 }
@@ -3075,9 +3262,50 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
 // (eager ForwardDense, the gathered and non-gathered paged arms) routes here, so
 // exactly one head layout is selected; the bf16 arm keeps both of its shapes.
 DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights) {
+  // MODEL-QWEN35-EXL3 (#2495 item 5): a trellis head, kept quantized and read
+  // through the shared linear seam. f32 out, because that is the dtype every
+  // other arm of this function returns and the sampler's contract; the trellis
+  // GEMM writes f32 directly, so nothing is widened on the way.
+  if (!weights.lm_head_exl3.Empty()) {
+    return dense_exl3::Linear(d, x, weights.lm_head, weights.lm_head_exl3,
+                              DType::kF32);
+  }
   if (!weights.lm_head_fp4.Empty())
     return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
   const OwnedTensor& lm_head = DenseLmHead(weights);
+  // #2534: a GGUF KEEP-QUANT head takes the f32-output GEMM, joining the EXL3
+  // and NVFP4 heads above rather than the bf16 helper below.
+  //
+  // It used to take the bf16 helper, and only because `nk` is a LAYOUT flag:
+  // `qwen3_5_gguf_weights.cpp::OwnGgufQuantBlocks` sets it true because "GGUF
+  // disk order [out, in] IS the MatmulBT [N, K] orientation", which says nothing
+  // about numerics. It therefore inherited a rule authored for the TIED BF16
+  // torch-Linear head the helper's own comment names. Measured cost of that
+  // inheritance: 288 of 288 of the Q4_K_M arm's top-1 logits landed exactly on
+  // the bf16 grid, whose ULP is 0.125 at the magnitude 16-32 these logits carry,
+  // while the six near-ties the llama.cpp token gate convicts us on are gaps of
+  // 0.027 to 0.178 -- five of six below our own resolution, and six steps EXACT
+  // TIES (#2534, docs/bench-evidence/qwen38-27b-q4km-logit-delta-20260902.md).
+  //
+  // This DIVERGES from vLLM's default, deliberately, and the divergence is
+  // argued in .agents/specs/qwen38-27b-q4km-logits-f32.md rather than assumed.
+  // Upstream keeps the head in the model dtype (`logits_processor.py:99-136`
+  // `_apply_head`; `config/model.py:2187-2208` `_get_head_dtype` defaults a
+  // GENERATION model to the model dtype) and widens afterwards in the sampler
+  // (`v1/sample/sampler.py:96`), exactly as `MatmulBf16LogitsF32D` does. But
+  // vLLM has no in-tree GGUF reader at the pin, so it resolves no model dtype
+  // for this checkpoint at all (#979); and where upstream DOES select an f32
+  // head it accumulates straight into f32 rather than casting operands
+  // (`logits_processor.py:127-131`, `torch.mm(..., out_dtype=...)`), which is
+  // what this arm now does -- the keep-quant kernels already accumulate in f32
+  // and only round at the store, so no weight copy and no cast pass is added.
+  // Upstream's refusal of an f32 head on a QUANTIZED head
+  // (`logits_processor.py:111-115`) guards its `.to(f32)` weight-cast fallback,
+  // a mechanism we do not use.
+  //
+  // Elementwise bf16/f16 heads are untouched below, so no safetensors default
+  // and no recorded device measurement on those arms moves.
+  if (vt::IsBlockQuant(lm_head.dtype)) return MatmulF32D(d, x, lm_head);
   return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
                     : MatmulF32D(d, x, lm_head);
 }
@@ -3480,11 +3708,27 @@ using detail::GdnOutDType;
 // f32 variance/normalize accumulation regardless — only the residual load/store
 // dtype changes) and halves that traffic. A/B: VT_BF16_RESIDUAL=0 restores the f32
 // residual in the same binary.
-DType ResidualDType() {
+// DISPOSITION, measured 2026-09-02 (#2534), so nobody re-runs this experiment:
+// the bf16 default STAYS, and the `VT_BF16_RESIDUAL=0` rollback was tried
+// against the Qwen3.8-27B Q4_K_M token gate and DID NOT HELP. Same binary, same
+// artifact and recipe, one lever: the divergence rate held at 5 of 6 and two
+// prompts diverged EARLIER (first difference 34 -> 21 and 20 -> 4), so the
+// agreeing-prefix total fell from 155 tokens to 126. The lever is live -- the
+// outputs changed -- it simply does not buy correctness on this arm. So this
+// knob remains what its comment above says it is: a MEMORY-TRAFFIC choice that
+// mirrors vLLM's bf16 residual, plus a diagnostic A/B. It is not a correctness
+// lever and must not be reached for as one.
+//
+// #2534 also wired the trunk in: when `ActDType` resolves f32 the residual
+// inherits it, because a residual narrower than the stream it accumulates is the
+// same lost mantissa twice per layer. That arm is currently REFUSED at the
+// resolver (see ActDType), so this term is bf16-unless-`VT_BF16_RESIDUAL=0`.
+DType ResidualDType(Dev d) {
   static const bool bf16 = [] {
     const char* e = std::getenv("VT_BF16_RESIDUAL");
     return e == nullptr || e[0] != '0';
   }();
+  if (ActDType(d) == DType::kF32) return DType::kF32;
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
@@ -3910,6 +4154,48 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                              int64_t conv_dim, int64_t value_dim, DType indt,
                              DType outdt, const Tensor* h_fp8) {
   GdnQkvzOutput out;
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4). FIRST and EXCLUSIVE, mirroring the
+  // loader rung: an EXL3 load populates NO other in-projection field, so every
+  // branch below would fall through to an empty owner and refuse by name.
+  //
+  // TWO GEMMs, because the artifact ships two independently quantized
+  // trellises (see `GdnLayerWeights::in_proj_qkv_exl3`). This is not a
+  // regression against vLLM's single merged `in_proj_qkvz` GEMM: there is no
+  // merged trellis operand to issue, and the split native-FP8 arm the 35B runs
+  // already takes this same shape when the merged owner is empty.
+  //
+  // `indt` for mixed and `outdt` for z are the dtypes the SPLIT BF16 arm below
+  // emits, so `VT_GDN_IN_BF16`'s and `VT_GDN_OUT_BF16`'s documented rollbacks
+  // stay honest on this arm too. `dense_exl3::Linear` forwards to
+  // `layers::MakeLinearMethod` -> `Exl3LinearMethod` -> the ONE
+  // `dense_attn::Exl3MatmulD`; no second EXL3 matmul exists.
+  if (!w.in_proj_qkv_exl3.Empty()) {
+    VT_CHECK(w.in_proj_qkv_exl3.OutFeatures() == conv_dim &&
+                 w.in_proj_z_exl3.OutFeatures() == value_dim &&
+                 w.in_proj_qkv_exl3.InFeatures() == h.shape[1],
+             "qwen3_5 EXL3 GDN qkvz: the trellis geometry and the layer's "
+             "conv_dim/value_dim disagree");
+    out.mixed_owner.emplace(
+        dense_exl3::Linear(d, h, w.in_proj_qkv, w.in_proj_qkv_exl3, indt));
+    out.z_owner.emplace(
+        dense_exl3::Linear(d, h, w.in_proj_z, w.in_proj_z_exl3, outdt));
+    // The same anti-drift guard the merged fp8 arm carries, read off the
+    // ALLOCATED buffer rather than off a literal, so it fails whichever side
+    // moves. The packed-decode eligibility runs before this function and must
+    // have predicted exactly this dtype.
+    VT_CHECK(out.mixed_owner->t().dtype ==
+                 detail::GdnProjectedMixedQkvDType(
+                     detail::GdnMixedQkvDTypeInputs{
+                         !w.in_proj_qkvz.Empty(), !w.in_proj_qkv_fp8.Empty(),
+                         /*fp8_merged_arm=*/false, indt,
+                         GdnFp8MergedInProjDType(indt, outdt),
+                         /*has_exl3_qkv_owner=*/true}),
+             "qwen3_5 EXL3 GDN qkvz: the allocated mixed_qkv dtype and the "
+             "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   if (!w.in_proj_qkvz.Empty()) {
     VT_CHECK(w.in_proj_qkvz.nk && w.in_proj_qkvz.rank == 2 &&
                  w.in_proj_qkvz.shape[0] == conv_dim + value_dim &&
@@ -4276,7 +4562,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -4291,6 +4577,18 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
+  // every other arm here is exclusive. An EXL3 load populates none of the
+  // fields below, so each would fall through to an empty owner and refuse by
+  // name. bf16 out, as every other arm of this out_proj returns.
+  //
+  // The gated-RMSNorm above already wrote `gated_bf16`, so the fp8 fusion
+  // branch earlier in this function cannot have fired: it requires
+  // `out_proj_fp8`, which an EXL3 load leaves empty.
+  if (!w.out_proj_exl3.Empty()) {
+    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
@@ -4753,7 +5051,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -4765,6 +5063,18 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
     vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
+  }
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
+  // every other arm here is exclusive. An EXL3 load populates none of the
+  // fields below, so each would fall through to an empty owner and refuse by
+  // name. bf16 out, as every other arm of this out_proj returns.
+  //
+  // The gated-RMSNorm above already wrote `gated_bf16`, so the fp8 fusion
+  // branch earlier in this function cannot have fired: it requires
+  // `out_proj_fp8`, which an EXL3 load leaves empty.
+  if (!w.out_proj_exl3.Empty()) {
+    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+                              DType::kBF16);
   }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
@@ -4780,22 +5090,19 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
-// VT_DUMP_ACT stage probe (GDN): dump named intermediates per invocation so a
-// layer-level divergence can be pinned to one kernel. Debug-only; Download
-// syncs, never set on capture paths.
+// VT_DUMP_ACT stage probe (GDN): dump named intermediates so a layer-level
+// divergence can be pinned to one kernel. Debug-only; Download syncs, never set
+// on capture paths.
+//
+// ROCM-TIER-DIVERGENCE (#2590): keyed on (step, layer) through `actdump` instead
+// of on a process-global call counter. The counter named an invocation ordinal,
+// which is a different quantity on two runs whose forward-call counts differ by
+// one and cannot be joined across two tiers at all.
 void DumpGdnStage(Dev d, const char* stage, const Tensor& t) {
-  if (std::getenv("VT_DUMP_ACT") == nullptr) return;
-  static std::atomic<int> gdn_seq{0};
-  const int call = gdn_seq.fetch_add(1, std::memory_order_relaxed);
-  const int64_t n = t.Numel();
-  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
-  DBuf tmp(d, t.dtype, {n}, t.data);
-  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
-  tmp.Download(d, raw.data());
-  const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/gdn" +
-                           std::to_string(call) + "_" + stage + ".bin";
-  std::FILE* f = std::fopen(path.c_str(), "wb");
-  if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+  const char* dir = actdump::StreamDir();
+  if (dir == nullptr) return;
+  ActDumpTensor(d, "VT_DUMP_ACT", dir, (std::string("gdn_") + stage).c_str(),
+                      t, 1, t.Numel());
 }
 
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
@@ -4854,7 +5161,9 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       detail::GdnMixedQkvDTypeInputs{!w.in_proj_qkvz.Empty(),
                                      !w.in_proj_qkv_fp8.Empty(),
                                      gdn_fp8_merged_arm, indt,
-                                     GdnFp8MergedInProjDType(indt, outdt)});
+                                     GdnFp8MergedInProjDType(indt, outdt),
+                                     // MODEL-QWEN35-GDN-EXL3 (#2495 item 4).
+                                     !w.in_proj_qkv_exl3.Empty()});
   const bool packed_decode = detail::ShouldUsePackedGdnDecode(
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
@@ -5243,7 +5552,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -5260,6 +5569,18 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
+  // every other arm here is exclusive. An EXL3 load populates none of the
+  // fields below, so each would fall through to an empty owner and refuse by
+  // name. bf16 out, as every other arm of this out_proj returns.
+  //
+  // The gated-RMSNorm above already wrote `gated_bf16`, so the fp8 fusion
+  // branch earlier in this function cannot have fired: it requires
+  // `out_proj_fp8`, which an EXL3 load leaves empty.
+  if (!w.out_proj_exl3.Empty()) {
+    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
@@ -5329,9 +5650,15 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
-    // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
-    // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
-    // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
+    // `RmsNorm` NO LONGER requires `w.dtype == x.dtype`; #2477/#2493 gave the CUDA
+    // kernel its own `Tw`, and #2492 did the same for the ROCm and fp8 twins. This
+    // selection is therefore a WORK-AROUND FOR A CONSTRAINT THAT NO LONGER EXISTS,
+    // and it is left in place rather than removed because it is behaviourally
+    // neutral (the f32 upcast of a bf16 on-disk gamma is exact, so both arms feed
+    // the kernel the same values) and removing it changes a shipped model's code
+    // for no measured gain. When kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use
+    // the raw bf16 on-disk k_norm; otherwise (fp8/35B or toggle off) keep the f32
+    // upcast. bf16 kf · bf16 dkw -> f32.
     Tensor dkw = (kf.dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
                                            : ResidentWeightF32(d, w.k_norm, {Dh});
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
@@ -6683,6 +7010,163 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// ─── VT_MOE_SEL_FP — the SELECTED-EXPERT-ID tap (MOEDIV, #2552) ──────────────
+//
+// `VT_Q4EXP_LAYER_FP` (#2547) taps VALUES, and a value tap cannot separate an
+// expert-selection FLIP from re-association inside the expert GEMM. A discrete
+// selection has BIMODAL error and not a tolerance: a token's top-k set either
+// changes — and that token's MoE output moves by an O(1) amount — or it does not
+// change at all and the residue is rounding. One `rel(sum|x|)` averages the two
+// together and destroys exactly the bit that says which happened.
+//
+// So this prints the SELECTION. Per token: the selected ids SORTED, because the
+// assertion between two arms is SET equality and the selection ORDER is not part
+// of it (`vt::MoeCombine` sums over the k slots and is order-invariant given the
+// weights). Per call: `sel`, an FNV-1a hash over every token's sorted list, so
+// comparing two arms' selections at one layer is ONE string comparison.
+//
+// THE MARGIN IS IN LOGIT SPACE AND ITS UNIT IS bf16 ULPS. Probability space is
+// the wrong space: the softmax denominator is a device-order f32 reduction and
+// differs between the arms, while the bf16 logits are what the selection is
+// actually a function of. And a probability difference reads as "small" for a
+// gap of one representable step and for a gap of fifty. `ulps` is the number of
+// representable bf16 values between the largest REJECTED logit and the smallest
+// SELECTED one under the sign-magnitude total order; `ulps == 0` means the two
+// are the SAME bf16 value and the boundary was decided by the lowest-index
+// tie-break, which one ulp of re-association anywhere upstream will flip.
+//
+// `lines=` IS THE COUNTED PROPERTY. An instrument that never ran and two arms
+// whose taps agreed look identical in a diff. The measuring job asserts
+// `lines == calls * T` and refuses to report a comparison otherwise.
+//
+// IT IS ON THE REFERENCE ARM ONLY, which is the arm a stacked keep-quant
+// checkpoint takes and the only arm any `qwen4_exp` checkpoint reaches. The
+// three fused CUDA arms keep their ids on device; adding a readback to a
+// capturable path, to instrument a model that cannot enter it, would be dead
+// code by construction. See the spec's "Wave MOEDIV" section.
+int64_t MoeSelFpCalls() {
+  static const int64_t n = [] {
+    const char* e = std::getenv("VT_MOE_SEL_FP");
+    if (e == nullptr || e[0] == '\0') return static_cast<int64_t>(0);
+    const long long parsed = std::atoll(e);
+    return parsed > 0 ? static_cast<int64_t>(parsed) : static_cast<int64_t>(0);
+  }();
+  return n;
+}
+int64_t& MoeSelFpCall() {
+  static int64_t call = 0;
+  return call;
+}
+int64_t& MoeSelFpLines() {
+  static int64_t lines = 0;
+  return lines;
+}
+
+// bf16 under the sign-magnitude TOTAL ORDER, as a signed key. Monotone in the
+// value it encodes, so the difference of two keys counts representable steps.
+// -0 and +0 both map to 0, which is what makes an exact tie read `ulps=0`.
+int32_t Bf16Ordered(uint16_t b) {
+  return (b & 0x8000u) != 0 ? -static_cast<int32_t>(b & 0x7fffu)
+                            : static_cast<int32_t>(b & 0x7fffu);
+}
+
+double SumAbsBf16(const std::vector<uint16_t>& v) {
+  double s = 0.0;
+  for (uint16_t b : v) {
+    const float f = vt::BF16ToF32(b);
+    if (std::isfinite(f)) s += std::fabs(static_cast<double>(f));
+  }
+  return s;
+}
+
+// One tapped MoE block invocation. Every buffer here is one the reference path
+// had ALREADY downloaded, so the tap moves no extra bytes off the device except
+// the one guarded shared-expert read its caller passes in.
+void MoeSelFp(int dev_type, int64_t T, int64_t E, int64_t top_k,
+              const std::vector<uint16_t>& h, const std::vector<uint16_t>& logits,
+              const std::vector<int32_t>& ids,
+              const std::vector<uint16_t>& expert_out,
+              const std::vector<uint16_t>* shared) {
+  const int64_t call = MoeSelFpCall();
+  if (call >= MoeSelFpCalls()) return;
+  uint64_t sel = 1469598103934665603ull;  // FNV-1a offset basis
+  int64_t min_ulps = -1;
+  int64_t min_tok = -1;
+  std::vector<int32_t> sorted(static_cast<size_t>(top_k));
+  std::vector<char> picked(static_cast<size_t>(E));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t j = 0; j < top_k; ++j)
+      sorted[static_cast<size_t>(j)] = ids[static_cast<size_t>(t * top_k + j)];
+    std::sort(sorted.begin(), sorted.end());
+    std::string idstr;
+    for (int64_t j = 0; j < top_k; ++j) {
+      if (j != 0) idstr += ",";
+      idstr += std::to_string(sorted[static_cast<size_t>(j)]);
+      // The hash is over the SORTED list, so it is a set identity and not a
+      // selection-order identity.
+      const uint32_t v = static_cast<uint32_t>(sorted[static_cast<size_t>(j)]);
+      for (int b = 0; b < 4; ++b) {
+        sel ^= static_cast<uint64_t>((v >> (8 * b)) & 0xffu);
+        sel *= 1099511628211ull;
+      }
+    }
+    // The boundary: the smallest SELECTED logit against the largest REJECTED
+    // one, read from the bf16 the router GEMM actually stored.
+    for (int64_t e = 0; e < E; ++e) picked[static_cast<size_t>(e)] = 0;
+    for (int64_t j = 0; j < top_k; ++j)
+      picked[static_cast<size_t>(sorted[static_cast<size_t>(j)])] = 1;
+    int64_t lo_e = -1, hi_e = -1;
+    for (int64_t e = 0; e < E; ++e) {
+      const uint16_t b = logits[static_cast<size_t>(t * E + e)];
+      if (picked[static_cast<size_t>(e)] != 0) {
+        if (lo_e < 0 || Bf16Ordered(b) < Bf16Ordered(logits[static_cast<size_t>(t * E + lo_e)]))
+          lo_e = e;
+      } else {
+        if (hi_e < 0 || Bf16Ordered(b) > Bf16Ordered(logits[static_cast<size_t>(t * E + hi_e)]))
+          hi_e = e;
+      }
+    }
+    const uint16_t lo_b = lo_e >= 0 ? logits[static_cast<size_t>(t * E + lo_e)] : 0;
+    const uint16_t hi_b = hi_e >= 0 ? logits[static_cast<size_t>(t * E + hi_e)] : 0;
+    // top_k == E leaves nothing rejected; the boundary is then undefined and is
+    // reported as such rather than as a zero margin.
+    const int64_t ulps = hi_e >= 0 && lo_e >= 0
+                             ? static_cast<int64_t>(Bf16Ordered(lo_b)) -
+                                   static_cast<int64_t>(Bf16Ordered(hi_b))
+                             : -1;
+    if (ulps >= 0 && (min_ulps < 0 || ulps < min_ulps)) {
+      min_ulps = ulps;
+      min_tok = t;
+    }
+    ++MoeSelFpLines();
+    std::fprintf(stderr,
+                 "moesel call=%lld dev=%d tok=%lld ids=%s lo_e=%lld lo=%.9g "
+                 "lo_raw=0x%04x hi_e=%lld hi=%.9g hi_raw=0x%04x margin=%.9g "
+                 "ulps=%lld\n",
+                 static_cast<long long>(call), dev_type, static_cast<long long>(t),
+                 idstr.c_str(), static_cast<long long>(lo_e),
+                 static_cast<double>(vt::BF16ToF32(lo_b)), static_cast<unsigned>(lo_b),
+                 static_cast<long long>(hi_e), static_cast<double>(vt::BF16ToF32(hi_b)),
+                 static_cast<unsigned>(hi_b),
+                 static_cast<double>(vt::BF16ToF32(lo_b)) -
+                     static_cast<double>(vt::BF16ToF32(hi_b)),
+                 static_cast<long long>(ulps));
+  }
+  // The digest. `x`/`logit`/`exp`/`shr` decompose the block's own output, so
+  // with the selection sets equal these four say WHICH GEMM carries the residue.
+  std::fprintf(stderr,
+               "moesel call=%lld dev=%d T=%lld E=%lld k=%lld sel=%016llx "
+               "minulps=%lld mintok=%lld x=%.9g logit=%.9g exp=%.9g shr=%.9g "
+               "lines=%lld END\n",
+               static_cast<long long>(call), dev_type, static_cast<long long>(T),
+               static_cast<long long>(E), static_cast<long long>(top_k),
+               static_cast<unsigned long long>(sel), static_cast<long long>(min_ulps),
+               static_cast<long long>(min_tok), SumAbsBf16(h), SumAbsBf16(logits),
+               SumAbsBf16(expert_out), shared != nullptr ? SumAbsBf16(*shared) : 0.0,
+               static_cast<long long>(MoeSelFpLines()));
+  ++MoeSelFpCall();
+}
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -6808,6 +7292,19 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   std::optional<DBuf> shared;
   if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, fp4));
 
+  // MOEDIV (#2552): the selected-expert-id tap. Inert unless VT_MOE_SEL_FP is
+  // set; the outer guard is what keeps the shared-expert readback off the
+  // default path. Everything else it reads was already downloaded above.
+  if (MoeSelFpCalls() > 0) {
+    std::vector<uint16_t> shr;
+    if (has_shared) {
+      shr.resize(static_cast<size_t>(T) * H);
+      shared->Download(d, shr.data());
+    }
+    MoeSelFp(static_cast<int>(dh.device.type), T, E, top_k, h, logits, ids,
+             expert_out, has_shared ? &shr : nullptr);
+  }
+
   // Combine (moe-semantics.md §6): out = shared + sum_j w_j * expert_out_j.
   DBuf deo(d, DType::kBF16, {T, top_k, H}, expert_out.data());
   DBuf dwt(d, DType::kF32, {T, top_k}, weights.data());
@@ -6889,7 +7386,7 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
@@ -6898,7 +7395,7 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
                   : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T, h_fp8);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
   // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
@@ -6923,6 +7420,17 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
 DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                    const Tensor& dh, int64_t T) {
   const int64_t I = cfg.intermediate_size;
+  // MODEL-QWEN35-EXL3 (#2495 item 3). FIRST and exclusive. Routed through the
+  // SHARED `layers::MlpGateUpMethodBase` seam AGENTS.md names, exactly as
+  // `qwen3.cpp:136-145` does for the Llama/Qwen3 dense MLP -- the model calls
+  // one method and never asks which scheme it bound.
+  if (w.IsExl3()) {
+    DBuf act = dense_exl3::GateUp(d, dh, w.gate_up_proj, w.gate_proj_exl3,
+                                  w.up_proj_exl3, I);
+    (void)T;
+    return dense_exl3::Linear(d, act.t(), w.down_proj, w.down_proj_exl3,
+                              DType::kBF16);
+  }
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
@@ -6950,7 +7458,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                w.down_proj_fp4.input_global_scale_inv,
                                scale_layout);
       } else {
-        DBuf act(d, DType::kBF16, {T, I});
+        DBuf act(d, ActDType(d), {T, I});
         vt::SiluAndMul(d.q, act.t(), gate_up.t());
         vt::ScaledFp4Quant(d.q, ap.t(), as.t(), act.t(),
                            w.down_proj_fp4.input_global_scale_inv,
@@ -6960,7 +7468,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                    DType::kBF16,
                                    direct_scale ? &as.t() : nullptr);
     }
-    DBuf act(d, DType::kBF16, {T, I});
+    DBuf act(d, ActDType(d), {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
@@ -6980,7 +7488,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     // Qwen3.5's MergedColumnParallelLinear: one raw-NK [2I,H] projection,
     // followed by SiluAndMul and the raw-NK down projection.
     DBuf gate_up = MatmulBf16D(d, dh, w.gate_up_proj);
-    DBuf act(d, DType::kBF16, {T, I});
+    DBuf act(d, ActDType(d), {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
     return MatmulBf16D(d, act.t(), w.down_proj);
   }
@@ -7098,7 +7606,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
         d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16,
         direct_scale ? &as.t() : nullptr);
   }
-  DBuf act(d, DType::kBF16, {T, I});
+  DBuf act(d, ActDType(d), {T, I});
   vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16
   return fp4 ? MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4)
              : MatmulBf16D(d, act.t(), w.down_proj);  // [T,H] bf16
@@ -7115,7 +7623,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
 
   DBuf attn = layer.is_linear_attention
@@ -7123,7 +7631,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
                   : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
@@ -7142,7 +7650,12 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf dhn(d, DType::kBF16, {T, H});
+  // ROCM-TIER-DIVERGENCE (#2590): carry (step, layer) to every dump nested in
+  // this layer's mixer, so the GDN stage probes stop keying on a counter of
+  // their own. Inert when no dump knob is set.
+  const actdump::LayerScope dump_here(actdump::Current().step, layer_index);
+
+  DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
@@ -7157,7 +7670,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   }();
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   // KERNEL-FUSION-FRAMEWORK W0 — the first production adoption of the declared
   // fusion seam. post_attention_layernorm is a plain add+residual+gemma-RMSNorm
   // (res += attn; dh2 = norm(res)), the exact chain kFusedAddRmsNorm transcribes.
@@ -7195,46 +7708,43 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
                         const CommonAttentionMetadata& attn_meta,
                         const GDNAttentionMetadata& gdn_meta,
                         const PagedKvCache* attn_kv,
-                        const GdnStateCache* gdn_state, int64_t T) {
+                        const GdnStateCache* gdn_state, int64_t T,
+                        int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  // VT_DUMP_ACT layer index: the paged loop's per-layer counter (0-based), used
-  // by the sub-stage dump below. Declared per-process; only the dump reads it.
-  static thread_local int64_t dump_layer_idx = -1;
-  dump_layer_idx++;
-  const bool dump_sub = std::getenv("VT_DUMP_ACT_SUB") != nullptr;
+  // ROCM-TIER-DIVERGENCE (#2590): the sub-stage dump is keyed on (step, layer),
+  // taken from the caller the way the MoE sibling `RunLayerPaged` already takes
+  // `layer_index`. It used to be keyed on a `static thread_local` counter that
+  // was never reset, so a file name encoded an invocation ordinal rather than a
+  // position in the model, and one extra forward call on either side of a
+  // comparison silently shifted the whole join. The scope also carries the key
+  // to every dump NESTED inside the mixer, so the GDN stage probes no longer
+  // keep a counter of their own.
+  const actdump::LayerScope dump_here(actdump::Current().step, layer_index);
+  const char* dump_sub_dir = actdump::StageDir();
   auto DumpStage = [&](const char* stage, DBuf& buf) {
-    if (!dump_sub) return;
-    std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                             vt::SizeOf(buf.t().dtype));
-    buf.Download(d, raw.data());
-    const std::string path = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
-                             "/layer_" + std::to_string(dump_layer_idx) + "_" +
-                             stage + ".bin";
-    std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    if (dump_sub_dir == nullptr) return;
+    ActDumpTensor(d, "VT_DUMP_ACT_SUB", dump_sub_dir, stage, buf.t(), T, H);
   };
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
-  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
-    std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
-                 static_cast<const void*>(dhn.t().data), (long long)T);
   DumpStage("post_input_norm", dhn);
-  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
-    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if
-    // these two disagree, the download patterns themselves diverge.
+  if (dump_sub_dir != nullptr) {
+    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if these
+    // two disagree, the download patterns themselves diverge. Kept because it
+    // is the control that tells a download artefact from a kernel difference,
+    // and a cross-tier comparison needs that told apart before it can report a
+    // layer.
     std::vector<uint8_t> rawD(static_cast<size_t>(T) * static_cast<size_t>(H) *
                               vt::SizeOf(dhn.t().dtype));
     d.b.Synchronize(d.q);
     d.b.Copy(d.q, rawD.data(), dhn.t().data, rawD.size());
-    const std::string pd = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
-                           "/layer_" + std::to_string(dump_layer_idx) +
-                           "_post_input_norm_DIRECT.bin";
-    std::FILE* fd = std::fopen(pd.c_str(), "wb");
-    if (fd != nullptr) { std::fwrite(rawD.data(), 1, rawD.size(), fd); std::fclose(fd); }
+    actdump::WriteBlob("VT_DUMP_ACT_SUB", dump_sub_dir, actdump::Current().step,
+                       layer_index, "post_input_norm_DIRECT", dhn.t().dtype, T, H,
+                       rawD.data(), rawD.size());
   }
 
   DBuf attn = [&] {
@@ -7250,23 +7760,15 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   }();
   DumpStage("block_out", attn);
 
-  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
-    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer
-    // ran. If it differs from the pre-mixer dump, something between them
-    // writes it; if equal, the earlier disagreement is a download artifact.
-    std::vector<uint8_t> raw2(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                              vt::SizeOf(dhn.t().dtype));
-    DBuf tmp2(d, dhn.t().dtype, {T * H}, dhn.t().data);
-    d.b.Copy(d.q, tmp2.ptr(), dhn.t().data, raw2.size());
-    tmp2.Download(d, raw2.data());
-    const std::string p2 = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
-                           "/layer_" + std::to_string(dump_layer_idx) +
-                           "_post_input_norm_RECHECK.bin";
-    std::FILE* f2 = std::fopen(p2.c_str(), "wb");
-    if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
+  if (dump_sub_dir != nullptr) {
+    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer ran.
+    // If it differs from the pre-mixer dump, something between them writes it;
+    // if equal, the earlier disagreement is a download artifact.
+    ActDumpTensor(d, "VT_DUMP_ACT_SUB", dump_sub_dir,
+                        "post_input_norm_RECHECK", dhn.t(), T, H);
   }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   DumpStage("post_attn_norm", dh2);
 
@@ -7320,6 +7822,15 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
     device.b.Copy(device.q, cat + target_offset, embed + source_offset, row_bytes);
     device.b.Copy(device.q, cat + target_offset + row_bytes, target + source_offset,
                   row_bytes);
+  }
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the fc-cat projection through the ONE
+  // EXL3 linear seam when the checkpoint quantized it, bf16 out because that is
+  // what `MatmulBf16D` returns and what the decoder layer below consumes. There
+  // is no second matmul: `dense_exl3::Linear` forwards to
+  // `layers::Exl3LinearMethod`, which calls `dense_attn::Exl3MatmulD`.
+  if (weights.IsExl3()) {
+    return dense_exl3::Linear(device, concatenated.t(), weights.fc,
+                              weights.fc_exl3, DType::kBF16);
   }
   return MatmulBf16D(device, concatenated.t(), weights.fc);
 }
@@ -7840,11 +8351,11 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Working copy of the embedded hidden (device->device; captured). RunLayerPaged
   // reassigns `hidden` per layer, so this must NOT alias the persistent buffer.
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
@@ -7891,22 +8402,21 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
   }
 
-  int64_t fa_idx = 0, gdn_idx = 0;
-    if (std::getenv("VT_DUMP_ACT") != nullptr) {
-    for (int which = 0; which < 2; ++which) {
-      const Tensor& t = which == 0 ? hidden.t() : res.t();
-      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                               vt::SizeOf(t.dtype));
-      DBuf tmp(d, t.dtype, {T * H}, t.data);
-      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
-      tmp.Download(d, raw.data());
-      const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/layer_-1_" +
-                               (which == 0 ? "hidden" : "res") + ".bin";
-      std::FILE* f = std::fopen(path.c_str(), "wb");
-      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
-    }
+  // ROCM-TIER-DIVERGENCE (#2590): the MoE arm is keyed the same way as the dense
+  // one. It used to write ONE hand-rolled pre-layer snapshot with the silent
+  // `if (f != nullptr)` shape, no per-layer rows, and a name (`layer_-1_*`) that
+  // no step index could distinguish — so a second forward overwrote the first.
+  // It now shares the writer, the (step, layer) key and the manifest, and its
+  // nested GDN stage probes get a valid key from the same scope.
+  const int64_t dump_step = actdump::BeginStep();
+  if (dump_step >= 0) {
+    actdump::NarrateOnce(d.q.device.type, "Qwen3_5Model",
+                         config.num_hidden_layers, T, H);
   }
-for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+  ActDumpStream(d, dump_step, -1, hidden, res, T, H);
+
+  int64_t fa_idx = 0, gdn_idx = 0;
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5MoeLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     const PagedKvCache* kv =
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
@@ -7917,11 +8427,19 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
+    ActDumpStream(d, dump_step, l, hidden, res, T, H);
   }
+  // The MoE loop carries no sub-stage probes, so a VT_DUMP_ACT_SUB-only run here
+  // legitimately writes nothing and `any_due` follows the stream knob.
+  actdump::EndStep(dump_step,
+                   actdump::StreamDir() == nullptr
+                       ? 0
+                       : 2 * (config.num_hidden_layers + 1),
+                   /*any_due=*/actdump::StreamDir() == nullptr ? 0 : 1);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the
@@ -7979,7 +8497,7 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const Tensor* aux_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices, hidden_tap,
@@ -8364,10 +8882,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -8376,7 +8894,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   // Final norm is GemmaRMSNorm too (weight applied as 1+w).
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
@@ -8411,10 +8929,10 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -8423,7 +8941,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // lm_head (the one host Download): PACKED NVFP4 (PERF-27B-LMHEAD-FP4) when the
@@ -8443,7 +8961,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       lm_head_(&DenseLmHead(target)),
       // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
       // the packed one too. Empty on every BF16/FP8/tied dense target.
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): and the TRELLIS one, for the same
+      // reason. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships no `lm_head.weight` at
+      // all, so on that target `DenseLmHead(target)` above is EMPTY and this is
+      // the only head there is. Empty on every other dense target.
+      lm_head_exl3_(&target.lm_head_exl3) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -8455,7 +8978,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       config_(&config),
       embed_tokens_(&target.embed_tokens),
       lm_head_(&target.lm_head),
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // `Qwen3_5MoeWeights` has NO EXL3 head owner, so there is nothing to point
+      // at. Said out loud rather than left to a default, and rather than adding a
+      // field to the MoE container that no loader fills: no EXL3 MoE checkpoint
+      // is in scope (.agents/specs/model-qwen35-exl3-head.md `## Owed`).
+      lm_head_exl3_(nullptr) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kMoe,
            "qwen3_5 MTP: MoE target requires MoE MTP weights");
 }
@@ -8482,10 +9010,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
 
   (void)vocab_size;
   // ONE decode step. A DRAFT forward is a complete forward with its own working
@@ -8509,7 +9045,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
   // RMSNorms + cat + fc (extracted into MtpHeadHidden, shared with ForwardPaged).
   DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
                               input_ids, target_hidden_states, tokens);
-  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  DBuf residual(device, ResidualDType(device), {tokens, hidden_size});
   residual.Zero(device);
   const size_t layer_index =
       static_cast<size_t>(spec_step_idx % num_layers);
@@ -8545,10 +9081,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP paged forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
   VT_CHECK(attn_meta.num_actual_tokens == tokens,
            "qwen3_5 MTP paged forward: attn metadata token count must equal T");
   VT_CHECK(draft_kv.num_kv_heads == config_->num_key_value_heads &&
@@ -8563,7 +9107,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   // paged (writes/reads the draft KV layer via slot_mapping/block_table).
   DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
                               input_ids, target_hidden_states, tokens);
-  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  DBuf residual(device, ResidualDType(device), {tokens, hidden_size});
   residual.Zero(device);
 
   // Per-step device inputs for the single full-attention layer (no GDN state) +
@@ -8579,7 +9123,8 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   if (weights_->kind == Qwen3_5MTPKind::kDense) {
     RunDenseLayerPaged(device, weights_->dense_layers[layer_index], *config_,
                        hidden, residual, sdi, attn_meta, gdn_meta_unused,
-                       &draft_kv, /*gdn_state=*/nullptr, tokens);
+                       &draft_kv, /*gdn_state=*/nullptr, tokens,
+                       static_cast<int64_t>(layer_index));
   } else {
     RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
                   residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
@@ -8638,9 +9183,20 @@ ForwardLogits Qwen3_5MTPModel::ComputeLogits(
            "qwen3_5 MTP logits: hidden states must be contiguous bf16 [T,H] "
            "on the queue device");
   Dev device{vt::GetBackend(queue.device.type), queue};
-  DBuf logits = (lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
-                    ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
-                    : MatmulF32D(device, hidden_states, *lm_head_);
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5). The arms are ordered
+  // `exl3 -> fp4 -> bf16`, which is `DenseLogitsF32D`'s order and
+  // `DflashLogitsF32D`'s, so the three readers of ONE target head cannot
+  // disagree about precedence. The trellis head is COMPUTED WITH, never widened:
+  // a dequantized copy of the real 248320x5120 head is 2.543 GB, and upstream
+  // reaches the packed path without a branch because `_apply_head` calls
+  // `lm_head.quant_method.apply` (logits_processor.py:132-142).
+  DBuf logits =
+      (lm_head_exl3_ != nullptr && !lm_head_exl3_->Empty())
+          ? dense_exl3::Linear(device, hidden_states, *lm_head_, *lm_head_exl3_,
+                               DType::kF32)
+          : ((lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
+                 ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
+                 : MatmulF32D(device, hidden_states, *lm_head_));
   return WrapDeviceLogits(device, std::move(logits), config_->vocab_size);
 }
 
@@ -8747,11 +9303,11 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Working copy of the embedded hidden (device->device; captured). RunDenseLayer
   // Paged reassigns `hidden` per layer, so this must NOT alias the persistent buf.
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
@@ -8798,6 +9354,23 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
   // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the
   // 35B paged forward).
+  // ROCM-TIER-DIVERGENCE (#2590). One forward-call ordinal for every dump this
+  // step writes, so two runs are joined on a POSITION IN THE MODEL rather than
+  // on an invocation counter. -1, and every dump below inert, unless a knob is
+  // set.
+  const int64_t dump_step = actdump::BeginStep();
+  if (dump_step >= 0) {
+    actdump::NarrateOnce(d.q.device.type, "Qwen3_5DenseModel",
+                         config.num_hidden_layers, T, H);
+  }
+  // The POST-EMBEDDING snapshot, layer -1. The dense path never had one, so a
+  // cross-tier profile could not tell "the two tiers embed the token
+  // differently" from "layer 0 computes differently" -- and those two are a live
+  // pair here, because `token_embd` keeps its Q4_K blocks on the CPU tier and
+  // expands to bf16 on ROCm (gguf_keep_quant.cpp `DeviceQuantGatherSupported`).
+  // The MoE sibling has carried this snapshot since the Tenstorrent bisect.
+  ActDumpStream(d, dump_step, -1, hidden, res, T, H);
+
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5DenseLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
@@ -8806,33 +9379,37 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
-                       gdn_meta, kv, gs, T);
+                       gdn_meta, kv, gs, T, l);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
-    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1): dump
-    // the residual stream after each layer as raw little-endian bf16 to
-    // $VT_DUMP_ACT/layer_<l>.bin (inert when unset; a debug hook, never the
-    // hot path — the Download forces a sync, so capture-graph paths must not
-    // set the env).
-    if (std::getenv("VT_DUMP_ACT") != nullptr) {
-      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                               vt::SizeOf(hidden.t().dtype));
-      hidden.Download(d, raw.data());  // Copy + Synchronize
-      const char* dir = std::getenv("VT_DUMP_ACT");
-      const std::string path =
-          std::string(dir) + "/layer_" + std::to_string(l) + ".bin";
-      std::FILE* f = std::fopen(path.c_str(), "wb");
-      if (f != nullptr) {
-        std::fwrite(raw.data(), 1, raw.size(), f);
-        std::fclose(f);
-      }
-    }
+    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1; keyed
+    // and completed for #2590): dump the residual stream after each layer.
+    //
+    // BOTH HALVES, because in this model neither one is the hidden state. The
+    // stream is carried as a pair -- `res` accumulates and `hidden` holds the
+    // layer's MLP delta -- and they are summed only at the final norm, which is
+    // also what `MaybeCaptureAuxTap` above computes. The predecessor hook wrote
+    // `hidden` alone and called it "the residual stream"; it was the MLP delta,
+    // and half a stream cannot be compared against another engine or another
+    // tier.
+    //
+    // A debug hook, never the hot path: the Download forces a sync, so
+    // capture-graph paths must not set the env.
+    ActDumpStream(d, dump_step, l, hidden, res, T, H);
   }
+  // Two stream halves per layer, plus the pre-layer snapshot. Zero due when the
+  // stream knob is not the one that is set. This path also carries the
+  // sub-stage probes, so SOMETHING is always due here whichever knob it was.
+  actdump::EndStep(dump_step,
+                   actdump::StreamDir() == nullptr
+                       ? 0
+                       : 2 * (config.num_hidden_layers + 1),
+                   /*any_due=*/1);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the MTP
@@ -8882,7 +9459,7 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
@@ -9512,7 +10089,7 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   // Seed the fused stream with the combined residual input: res = hidden_in,
   // hidden delta = 0. The layer's input_layernorm then normalizes hidden_in.
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   hidden.Zero(d);
   // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
   // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
@@ -9547,7 +10124,7 @@ std::vector<float> Qwen3_5ReplayDenseLayer(
   // input is the combined stream, so seed it as `res` and start the bf16 delta
   // at zero before running the real dense attention + SwiGLU layer.
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   hidden.Zero(d);
   RunDenseLayer(d, layer, config, hidden, res, positions, T);
 
@@ -10017,6 +10594,10 @@ struct Qwen3_5DecodeGraph::Impl {
         // `Backend::DestroyGraph`. That routing is what lets
         // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
         // editing this driver (spec `## Risks/decisions` D4).
+        // #2274: the graph dies with this slot, so its baked scratch stops being
+        // baked. Give the pinned blocks back before the pool outlives us.
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -10056,6 +10637,13 @@ struct Qwen3_5DecodeGraph::Impl {
     // than per pool because two shapes interleave through one pool and the pool's
     // own last-step state would answer for whichever step ran most recently.
     DevicePool::StepDemand demand;
+    // #2274: the pool blocks this slot's CAPTURE baked, held OUT of the free
+    // list for as long as the graph that baked them lives. Taken right after the
+    // capture succeeds and given back at every site that drops the graph. The
+    // counterpart to the `PreGrowForCapture` above: pre-grow guarantees the
+    // blocks exist before the capture, this keeps them from being handed to
+    // anyone else after it.
+    std::vector<std::pair<size_t, void*>> pinned;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10272,6 +10860,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     // next capture open a scope on it (the scope refuses a container that
     // already holds one).
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -10323,6 +10913,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   s.fa_cols = cols;
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
     // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
@@ -10502,6 +11094,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       if (s.graph.capture_failed()) {
         const std::exception_ptr err = s.graph.capture_error();
         s.graph.Reset();  // clear the failure with the graph it described
+        Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+        s.pinned.clear();
         // The runtime's OWN diagnosis where the seam holds it. It is empty only
         // on the arm where an exception was already propagating THROUGH the
         // scope, which cannot reach this line; the refusal below makes that
@@ -10521,6 +11115,30 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       }
       return drained;
     }
+    // #2274 THE FIX. The capture succeeded, so from here the graph's replays
+    // write through the device pointers it just baked. `ForwardLayers` has
+    // already RETURNED its working scratch to the pool's free list, and the
+    // comment at `PreGrowForCapture` above argues that is safe because the two
+    // graphs "replay sequentially on one stream". That argument covers the two
+    // GRAPHS. It does not cover a THIRD party: a DFlash2 draft store created
+    // later takes a pool block for its block table, is handed one of these
+    // blocks, and the next replay writes f32 activations over the table -- which
+    // is why a live block table reads `bt[0] = 1060730955` (0.727f) and
+    // `vt::PagedAttention` indexes page 1.06e9 in a 513-page pool.
+    //
+    // So take the capture's demand back OUT of the free list. `PreGrowForCapture`
+    // guaranteed `s.demand` free blocks per class BEFORE the capture and nothing
+    // else allocated in between, so the free list is LIFO-ordered with exactly
+    // those blocks on top; this pops the same count off the same end.
+    //
+    // BEFORE the `s.logits` assignment below, and the order is load-bearing on
+    // the RE-capture path (a column-count change resets this slot's graph, which
+    // is what a new draft store's wider block table causes). That assignment
+    // destroys the previous `s.logits` and frees ITS block to the same free list,
+    // where it would be popped first and leave one of the graph's own blocks
+    // reachable. Freeing the old logits is correct -- the graph it belonged to
+    // was Reset -- it just must not happen while we are counting.
+    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     s.graph.Replay(impl_->queue);
@@ -10599,6 +11217,10 @@ struct Qwen3_5DenseDecodeGraph::Impl {
         // `Backend::DestroyGraph`. That routing is what lets
         // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
         // editing this driver (spec `## Risks/decisions` D4).
+        // #2274: the graph dies with this slot, so its baked scratch stops being
+        // baked. Give the pinned blocks back before the pool outlives us.
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -10634,6 +11256,13 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     // than per pool because two shapes interleave through one pool and the pool's
     // own last-step state would answer for whichever step ran most recently.
     DevicePool::StepDemand demand;
+    // #2274: the pool blocks this slot's CAPTURE baked, held OUT of the free
+    // list for as long as the graph that baked them lives. Taken right after the
+    // capture succeeds and given back at every site that drops the graph. The
+    // counterpart to the `PreGrowForCapture` above: pre-grow guarantees the
+    // blocks exist before the capture, this keeps them from being handed to
+    // anyone else after it.
+    std::vector<std::pair<size_t, void*>> pinned;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10847,6 +11476,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // next capture open a scope on it (the scope refuses a container that
     // already holds one).
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -10897,6 +11528,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   s.fa_cols = cols;
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
     // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
@@ -11084,6 +11717,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       if (s.graph.capture_failed()) {
         const std::exception_ptr err = s.graph.capture_error();
         s.graph.Reset();  // clear the failure with the graph it described
+        Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+        s.pinned.clear();
         // The runtime's OWN diagnosis where the seam holds it. It is empty only
         // on the arm where an exception was already propagating THROUGH the
         // scope, which cannot reach this line; the refusal below makes that
@@ -11103,6 +11738,30 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       }
       return drained;
     }
+    // #2274 THE FIX. The capture succeeded, so from here the graph's replays
+    // write through the device pointers it just baked. `ForwardLayers` has
+    // already RETURNED its working scratch to the pool's free list, and the
+    // comment at `PreGrowForCapture` above argues that is safe because the two
+    // graphs "replay sequentially on one stream". That argument covers the two
+    // GRAPHS. It does not cover a THIRD party: a DFlash2 draft store created
+    // later takes a pool block for its block table, is handed one of these
+    // blocks, and the next replay writes f32 activations over the table -- which
+    // is why a live block table reads `bt[0] = 1060730955` (0.727f) and
+    // `vt::PagedAttention` indexes page 1.06e9 in a 513-page pool.
+    //
+    // So take the capture's demand back OUT of the free list. `PreGrowForCapture`
+    // guaranteed `s.demand` free blocks per class BEFORE the capture and nothing
+    // else allocated in between, so the free list is LIFO-ordered with exactly
+    // those blocks on top; this pops the same count off the same end.
+    //
+    // BEFORE the `s.logits` assignment below, and the order is load-bearing on
+    // the RE-capture path (a column-count change resets this slot's graph, which
+    // is what a new draft store's wider block table causes). That assignment
+    // destroys the previous `s.logits` and frees ITS block to the same free list,
+    // where it would be popped first and leave one of the graph's own blocks
+    // reachable. Freeing the old logits is correct -- the graph it belonged to
+    // was Reset -- it just must not happen while we are counting.
+    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)

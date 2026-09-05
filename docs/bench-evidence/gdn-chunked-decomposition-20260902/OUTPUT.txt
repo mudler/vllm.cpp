@@ -1,0 +1,117 @@
+########## check_bf16_helper.py
+torch 2.11.0+cu130, numpy 2.3.5
+  magnitude sweep, 12 decades        n= 10000  identical= 10000/10000  OK
+  exact ties (low half == 0x8000)    n=  5000  identical=  5000/5000  OK
+  structural corners                 n=   531  identical=   531/531  OK
+
+TOTAL: 15531/15531 bit-identical to torch.bfloat16
+PASS: gdn_decomp.bf16 IS torch.bfloat16, bit for bit
+########## run_golden.py
+shapes/dtypes: {'q': ((32, 1, 128), '<f4'), 'k': ((32, 1, 128), '<f4'), 'v': ((32, 2, 128), '<f4'), 'g': ((32, 2), '<f4'), 'beta': ((32, 2), '<f4'), 'state_in': ((2, 2, 128, 128), '<f4'), 'out': ((32, 2, 128), '<f4'), 'state_out': ((2, 2, 128, 128), '<f4'), 'qsl': ((3,), '<i4')}
+qsl: [ 0 20 32]  scale: 0.08838834764831845  Hk,Hv,Dk,Dv: 1 2 128 128
+state_in seq0 nonzero: 32768  seq1 nonzero: 0
+CHECK q,k,v are bf16-exact values: OK
+
+=== A. reproduce the manifest's own numbers ===
+  manifest chunk_vs_sequential_max_abs_out   = 2.441406e-04
+  manifest chunk_vs_sequential_max_abs_state = 2.248675e-03
+  GOLDEN out.npy       vs my f64 sequential ref : max|d| = 2.286426e-04
+  GOLDEN state_out.npy vs my f64 sequential ref : max|d| = 2.248661e-03
+
+=== B. does the numpy replica reproduce the REAL Triton kernel? ===
+  chunk_up       vs GOLDEN out.npy : max|d| = 6.103516e-05   vs state_out.npy : 5.059987e-04
+  chunk_up_tf32  vs GOLDEN out.npy : max|d| = 1.220703e-04   vs state_out.npy : 1.771212e-03
+  chunk_f32      vs GOLDEN out.npy : max|d| = 2.286416e-04   vs state_out.npy : 2.248645e-03
+  chunk_f64      vs GOLDEN out.npy : max|d| = 2.286426e-04   vs state_out.npy : 2.248661e-03
+  seq_f32        vs GOLDEN out.npy : max|d| = 2.286453e-04   vs state_out.npy : 2.248675e-03
+
+=== C. THE DECOMPOSITION, on this golden, max|diff| vs the exact f64 recurrence ===
+  arm                  max|d| out   max|d| state
+  seq_f32            1.150589e-08   5.079557e-08
+  chunk_f64          2.428613e-17   1.110223e-16
+  chunk_f32          3.855455e-08   1.144919e-07
+  chunk_up           2.286426e-04   2.175109e-03
+  chunk_up_tf32      2.286426e-04   2.175109e-03
+
+  chunks processed by the chunked arms: 4 (expect 4)
+
+=== D. where would an f32-chunked CPU port SIT? (max|diff| on out) ===
+  f32-chunked  vs  our CPU sequential f32 : 3.725290e-08
+  f32-chunked  vs  vLLM golden out.npy    : 2.286416e-04
+  our CPU seq  vs  vLLM golden out.npy    : 2.286453e-04
+########## run_golden_ablate.py
+all bf16 ON  (vLLM)  : out 2.2864e-04  state 2.1751e-03
+all bf16 OFF (f32)   : out 3.8555e-08  state 1.1449e-07
+
+site                              OFF: out  OFF: state   ONLY: out  ONLY: state  moved o
+solve_tril out -> bf16       chunk.py:50  2.2864e-04  2.1751e-03  2.6174e-06   4.1629e-05      yes
+(beta*v),(beta*eG*k) -> bf16 wy_fast.py:92,114  2.0735e-04  1.6246e-03  7.4423e-05   1.6092e-03      yes
+u,w stores -> bf16           wy_fast.py:94,116  2.2864e-04  2.1412e-03  7.8918e-05   1.6046e-03      yes
+h chunk-start snap -> bf16   chunk_delta_h.py:352  2.2864e-04  2.1751e-03  1.3397e-04   1.1449e-07      yes
+h operand of w@h^T -> bf16   chunk_delta_h.py:178  2.2864e-04  2.1751e-03  1.3131e-05   1.7410e-07      yes
+v_new store -> bf16          chunk_delta_h.py:206  2.2864e-04  2.2486e-03  7.8918e-05   1.6046e-03      yes
+decayed v_new -> bf16        chunk_delta_h.py:274  2.2864e-04  2.2493e-03  3.8555e-08   1.6043e-03       NO
+intra-chunk A -> bf16        chunk_o.py:137  3.2218e-04  2.1751e-03  8.8539e-05   1.1449e-07      yes
+o store -> bf16              chunk_o.py:138  2.2783e-04  2.1751e-03  2.0735e-04   1.1449e-07      yes
+########## run_prodview.py
+=== at the PRODUCTION output dtype (bf16) ===  elements: 8192
+  arm                                 max|d| vs vLLM golden   bf16 elems differing
+  vLLM golden out.npy                            0.0000e+00                 0/8192
+  bf16-placement replica                         6.1035e-05                62/8192
+  chunked, f32 intermediates                     2.4414e-04              4157/8192
+  chunked, f32, f32 out                          2.2864e-04              4157/8192
+  our CPU sequential f32                         2.2865e-04              4157/8192
+  exact f64 sequential                           2.2864e-04              4157/8192
+
+  f32-intermediate chunked vs our CPU sequential: max|d|=2.0735e-04 bf16 differing=2/8192
+
+=== STATE (f32, never bf16) ===
+  vLLM golden state_out              max|d| vs vLLM golden = 0.0000e+00
+  bf16-placement replica             max|d| vs vLLM golden = 5.0600e-04
+  chunked f32 intermediates          max|d| vs vLLM golden = 2.2486e-03
+  our CPU sequential f32             max|d| vs vLLM golden = 2.2487e-03
+########## run_final.py
+
+### T=5  n=32 (head,seed) samples   metric = median [min,max]
+arm                     ||o-oref||/||oref||             |S|o|-S|oref||/max                  state rel err
+seq_f32       1.155e-07 [8.10e-08,2.49e-07]  3.870e-08 [2.26e-09,1.32e-07]  5.088e-08 [3.50e-08,8.18e-08]
+chunk_f64     2.792e-16 [1.88e-16,6.01e-16]  0.000e+00 [0.00e+00,3.83e-16]  1.288e-16 [1.02e-16,1.60e-16]
+chunk_f32     8.246e-08 [5.53e-08,1.58e-07]  3.870e-08 [3.67e-09,1.85e-07]  5.042e-08 [3.50e-08,1.41e-07]
+chunk_up      3.026e-03 [2.13e-03,4.13e-03]  5.747e-04 [3.20e-05,2.39e-03]  1.807e-03 [1.35e-03,3.41e-03]
+  bf16 term / reassociation term (fro) = 36701x
+  d(f32chunk_vs_ourCPU    ) = 1.362e-07 [9.66e-08,2.70e-07]
+  d(f32chunk_vs_vLLM      ) = 3.027e-03 [2.13e-03,4.14e-03]
+  d(ourCPU_vs_vLLM        ) = 3.027e-03 [2.13e-03,4.14e-03]
+
+### T=64  n=32 (head,seed) samples   metric = median [min,max]
+arm                     ||o-oref||/||oref||             |S|o|-S|oref||/max                  state rel err
+seq_f32       1.081e-07 [9.01e-08,1.28e-07]  2.440e-08 [4.80e-11,1.19e-07]  5.329e-08 [3.49e-08,7.09e-08]
+chunk_f64     2.490e-16 [2.08e-16,2.92e-16]  0.000e+00 [0.00e+00,1.69e-16]  1.130e-16 [9.60e-17,1.38e-16]
+chunk_f32     4.734e-07 [1.55e-07,2.29e-06]  6.598e-08 [1.00e-08,3.86e-07]  3.185e-07 [3.46e-08,1.09e-05]
+chunk_up      3.096e-03 [2.68e-03,3.38e-03]  1.821e-04 [2.70e-05,5.75e-04]  1.916e-03 [1.44e-03,2.47e-03]
+  bf16 term / reassociation term (fro) = 6539x
+  d(f32chunk_vs_ourCPU    ) = 4.877e-07 [1.83e-07,2.29e-06]
+  d(f32chunk_vs_vLLM      ) = 3.096e-03 [2.68e-03,3.38e-03]
+  d(ourCPU_vs_vLLM        ) = 3.096e-03 [2.68e-03,3.38e-03]
+
+### T=256  n=32 (head,seed) samples   metric = median [min,max]
+arm                     ||o-oref||/||oref||             |S|o|-S|oref||/max                  state rel err
+seq_f32       1.075e-07 [9.75e-08,1.19e-07]  3.294e-08 [1.79e-10,1.09e-07]  5.162e-08 [3.61e-08,8.44e-08]
+chunk_f64     2.473e-16 [2.26e-16,2.77e-16]  0.000e+00 [0.00e+00,1.82e-16]  1.160e-16 [1.01e-16,1.46e-16]
+chunk_f32     5.316e-07 [1.37e-07,1.16e-06]  3.750e-08 [1.85e-09,1.26e-07]  7.550e-08 [3.60e-08,3.71e-06]
+chunk_up      2.961e-03 [2.81e-03,3.42e-03]  6.825e-05 [6.62e-06,2.48e-04]  1.858e-03 [1.53e-03,2.84e-03]
+  bf16 term / reassociation term (fro) = 5569x
+  d(f32chunk_vs_ourCPU    ) = 5.406e-07 [1.65e-07,1.16e-06]
+  d(f32chunk_vs_vLLM      ) = 2.960e-03 [2.81e-03,3.42e-03]
+  d(ourCPU_vs_vLLM        ) = 2.960e-03 [2.81e-03,3.42e-03]
+
+### T=1024  n=32 (head,seed) samples   metric = median [min,max]
+arm                     ||o-oref||/||oref||             |S|o|-S|oref||/max                  state rel err
+seq_f32       1.062e-07 [9.95e-08,1.13e-07]  3.520e-08 [1.00e-09,1.35e-07]  5.138e-08 [3.40e-08,8.88e-08]
+chunk_f64     2.452e-16 [2.18e-16,2.59e-16]  0.000e+00 [0.00e+00,1.73e-16]  1.164e-16 [0.00e+00,1.37e-16]
+chunk_f32     5.383e-07 [8.67e-08,9.54e-07]  3.417e-08 [3.56e-09,9.43e-08]  2.532e-07 [3.40e-08,4.98e-06]
+chunk_up      3.030e-03 [2.83e-03,3.29e-03]  4.507e-05 [2.16e-06,1.17e-04]  1.970e-03 [1.46e-03,3.02e-03]
+  bf16 term / reassociation term (fro) = 5629x
+  d(f32chunk_vs_ourCPU    ) = 5.489e-07 [1.26e-07,9.61e-07]
+  d(f32chunk_vs_vLLM      ) = 3.030e-03 [2.82e-03,3.29e-03]
+  d(ourCPU_vs_vLLM        ) = 3.030e-03 [2.82e-03,3.29e-03]

@@ -29,6 +29,7 @@
 // KV-sharing is handled in the forward (kv_idx = target for shared layers); the
 // shared layers' own — unused — buffers are still allocated (memory-only G1c
 // residual, not a correctness gap).
+#include "vllm/model_executor/layers/attention/attention.h"
 #include "vllm/model_executor/models/gemma4.h"
 
 #include <atomic>
@@ -332,8 +333,13 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
   if (g.attn_logit_softcap > 0.0f) pa.logits_soft_cap = g.attn_logit_softcap;
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  // ENG-ATTENTION-WINDOW (#2388). NOTE: this model has no kill switch, unlike
+  // gemma2/gemma3; the asymmetry is real and owed as W3, not invented here.
   if (sliding_window.has_value() && *sliding_window > 0)
-    pa.window_size = vt::AttentionWindow{static_cast<int32_t>(*sliding_window - 1), 0};
+    pa.window_size = ResolveAttentionWindow(
+        /*per_layer=*/std::nullopt, sliding_window,
+        v1::AttentionType::kDecoder,
+        /*disable_model_sliding_window=*/false);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

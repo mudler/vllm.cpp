@@ -23,7 +23,7 @@
 //
 // ─── THE FOUR THINGS THAT FAIL SILENTLY ──────────────────────────────────────
 //  * `Ltx2ConditionVideoByLatentIndex` LEAVES THE NOISY TENSOR ALONE. Only
-//    `clean_latent` and `denoise_mask` are written (latent_cond.py:38-39); the
+//    `clean_latent` and `denoise_mask` are written (latent_cond.py:40-41); the
 //    noiser then composes them as
 //    `lerp(clean, lerp(latent, noise, ns), mask)` (components/noisers.py:31-34).
 //    diffusers instead writes the clean tokens into the noisy tensor too

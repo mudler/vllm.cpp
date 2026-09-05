@@ -220,6 +220,7 @@ const ModelFactory kNemotronHFactory{
     .forward = &ForwardNemotronHForCausalLM,
     .make_kv_cache = &MakeNemotronHKVCache,
     .is_dense_model = false,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

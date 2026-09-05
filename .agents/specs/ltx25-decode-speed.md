@@ -987,12 +987,14 @@ machine at all:
 
 **~59 GB in 24 seconds with the process's own RSS flat at 4.9 GB.** The fall is
 on the decode side of the denoise-to-decode boundary — which is the one part of
-`docs/USAGE.md:868` that *is* supported — but no frame was ever written, and
+`docs/USAGE.md:868` at `332aed738` that *is* supported — but no frame was ever
+written, and
 `Ltx2ConvVideoDecode` at that size cannot allocate it (§4.1).
 
 **A plateau followed by a cliff refutes the hypothesis this row reached first.**
-The render's documented residency is large and real — `docs/USAGE.md:862-864`
-gives ~44 GB for the staged transformer and ~24 GB for the text tower — and it
+The render's documented residency is large and real — `docs/USAGE.md:862-864` at
+`332aed738` gives ~44 GB for the staged transformer and ~24 GB for the text
+tower — and it
 is tempting to sum the resident objects and land on "about 60 GiB". **That sum
 is a load-time total and cannot explain a fall that starts after a flat
 plateau.** The residency was already paid for at 75.2 GiB. This row wrote the
@@ -1307,7 +1309,15 @@ row does not have the authority to make alone:
   (`supports_step_execution=False`)"*), and the cross-check it names, Lightricks
   `ltx-pipelines`, is **not** admitted;
   `docs/BENCHMARKS.md:465` leaves the LTX-2.5 speed axis *and* the binding oracle
-  both `PENDING`, and does not name `diffusers` at all. **No record treats the
+  both `PENDING`, and does not name `diffusers` at all. (**That anchor is now
+  dead by RESTRUCTURING rather than by drift**: `docs/BENCHMARKS.md` is an
+  18-line index of `docs/benchmarks/<benchmark-id>.md` detail files, so there is
+  no line 465 and no successor line either. The `LTX-2.5 axes` row of
+  [`docs/benchmarks/open-gaps.md`](../../docs/benchmarks/open-gaps.md) is where
+  that `PENDING` lives now, and it still reads
+  *"Speed `PENDING` … binding oracle too"*, so the claim is unchanged. Repointed
+  by file and row label -- neither of which a line-count edit can move -- by row
+  `LTX25-ANCHOR-REPAIR`, 2026-09-01.) **No record treats the
   `diffusers` repo at its own pin as the LTX-2.5 oracle**, and the campaign has
   been proceeding as though no admitted oracle covered 2.5. That is the record
   defect [#1012](https://github.com/mudler/vllm.cpp/issues/1012) files: not a
@@ -1347,8 +1357,9 @@ choosing a different oracle for a future one.
 **Scope.** This row ships a spec and issues. It writes no product code, changes
 no checker, and makes no lifecycle transition, so it owes no `docs/STATUS.md`,
 `docs/BENCHMARKS.md` or `docs/FEATURES.md` edit under AGENTS.md's projection
-table. The `docs/USAGE.md:868` correction that §1.2 identifies — the *"inside the
-decode"* half of that sentence — is **owed and deliberately not taken here**: it
+table. The `docs/USAGE.md:868` (at `332aed738`) correction that §1.2 identifies
+— the *"inside the decode"* half of that sentence — is **owed and deliberately
+not taken here**: it
 belongs with the row whose probe settles §4, so the doc changes once, to
 something measured, rather than twice. The separate `:873-874` sentence
 (*"0% GPU"*, understated by §5) is owed to

@@ -1,0 +1,111 @@
+WARNING 09-04 08:07:01 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+VLLM_FILE    = /tmp/vllm-gfx1151-2740/vllm-pin/vllm/__init__.py
+VLLM_VERSION = 0.26.0.dev0+g5559679229
+TORCH        = 2.13.0+rocm7.2 hip 7.2.53211
+DEVICE       = gfx1151
+ON_GFX1151   = True  ON_GFX1X = True
+PLUGIN_FILE  = /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py
+PLUGIN_C_EXT = /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+FED_PROMPT_IDS = [[760, 6511, 3177, 314, 9338, 369], [760, 2250, 5839, 7736, 513], [27336, 85895, 506, 264, 9039, 314], [760, 5187, 92068, 43687, 55877, 5134, 421], [623, 220, 16, 24, 21, 24, 11, 12313, 1118, 14428, 383], [32, 9944, 1324, 369, 264, 5629, 1324]]
+VLLM_TOKENIZER_IDS[0] = [760, 6511, 3177, 314, 9338, 369]
+VLLM_TOKENIZER_IDS[1] = [760, 2250, 5839, 7736, 513]
+VLLM_TOKENIZER_IDS[2] = [27336, 85895, 506, 264, 9039, 314]
+VLLM_TOKENIZER_IDS[3] = [760, 5187, 92068, 43687, 55877, 5134, 421]
+VLLM_TOKENIZER_IDS[4] = [623, 220, 16, 24, 21, 24, 11, 12313, 1118, 14428, 383]
+VLLM_TOKENIZER_IDS[5] = [32, 9944, 1324, 369, 264, 5629, 1324]
+PROMPT_IDS_MATCH_OURS = True
+LLM_KWARGS   = {'model': '/tmp/rocm-strix-q4k/models/Qwen3.6-27B-Q4_K_M.gguf', 'tokenizer': '/workspace/ckpt/qwen3.6-27b-hf', 'gpu_memory_utilization': 0.6, 'max_model_len': 2048, 'max_num_seqs': 1, 'max_num_batched_tokens': 2048, 'limit_mm_per_prompt': {'image': 0, 'video': 0}, 'enforce_eager': True, 'trust_remote_code': False, 'quantization': 'gguf', 'model_loader_extra_config': {'mm_proj': '/workspace/ckpt/qwen36-27b-q4km/mmproj-BF16.gguf'}}
+WARNING 09-04 08:07:10 [quark_ocp_mx.py:146] AITER is not found or not supported on the current platform, QuarkOCP_MX will fall back to emulation.Native MXFP4/MXFP6 acceleration will not be available.
+INFO 09-04 08:07:10 [__init__.py:112] Registered model loader `<class 'vllm_gguf_plugin.loader.GGUFModelLoader'>` with load format `gguf`
+INFO 09-04 08:07:10 [config.py:455] Registered config parser `<class 'vllm_gguf_plugin.config_parser.GGUFConfigParser'>` with config format `gguf`
+INFO 09-04 08:07:10 [api_utils.py:273] non-default args: {'tokenizer': '/workspace/ckpt/qwen3.6-27b-hf', 'max_model_len': 2048, 'gpu_memory_utilization': 0.6, 'max_num_batched_tokens': 2048, 'max_num_seqs': 1, 'disable_log_stats': True, 'quantization': 'gguf', 'enforce_eager': True, 'limit_mm_per_prompt': {'image': 0, 'video': 0}, 'model_loader_extra_config': {'mm_proj': '/workspace/ckpt/qwen36-27b-q4km/mmproj-BF16.gguf'}, 'model': '/tmp/rocm-strix-q4k/models/Qwen3.6-27B-Q4_K_M.gguf'}
+INFO 09-04 08:07:11 [model.py:627] Resolved architecture: Qwen3_5ForConditionalGeneration
+INFO 09-04 08:07:11 [model.py:1848] Using max model len 2048
+INFO 09-04 08:07:13 [registry.py:134] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+INFO 09-04 08:07:13 [model.py:807] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+INFO 09-04 08:07:13 [scheduler.py:242] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 09-04 08:07:14 [vllm.py:1114] Asynchronous scheduling is enabled.
+WARNING 09-04 08:07:14 [vllm.py:1168] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 09-04 08:07:14 [vllm.py:1218] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 09-04 08:07:14 [kernel.py:306] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 09-04 08:07:14 [vllm.py:1397] Cudagraph is disabled under eager mode
+INFO 09-04 08:07:14 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+WARNING 09-04 08:07:16 [system_utils.py:157] We must use the `spawn` multiprocessing start method. Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. See https://docs.vllm.ai/en/latest/usage/troubleshooting.html#python-multiprocessing for more information. Reasons: CUDA is initialized
+WARNING 09-04 08:07:17 [rocm.py:123] Using CUDA_VISIBLE_DEVICES on ROCm is deprecated and support will be removed in vLLM v0.26.0. Please use HIP_VISIBLE_DEVICES instead.
+(EngineCore pid=422756) WARNING 09-04 08:07:22 [quark_ocp_mx.py:146] AITER is not found or not supported on the current platform, QuarkOCP_MX will fall back to emulation.Native MXFP4/MXFP6 acceleration will not be available.
+(EngineCore pid=422756) INFO 09-04 08:07:22 [__init__.py:112] Registered model loader `<class 'vllm_gguf_plugin.loader.GGUFModelLoader'>` with load format `gguf`
+(EngineCore pid=422756) INFO 09-04 08:07:22 [config.py:455] Registered config parser `<class 'vllm_gguf_plugin.config_parser.GGUFConfigParser'>` with config format `gguf`
+(EngineCore pid=422756) INFO 09-04 08:07:22 [core.py:121] Initializing a V1 LLM engine (v0.26.0.dev0+g5559679229) with config: model='/workspace/ckpt/qwen3.6-27b-hf', speculative_config=None, tokenizer='/workspace/ckpt/qwen3.6-27b-hf', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=gguf, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=True, quantization=gguf, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/tmp/rocm-strix-q4k/models/Qwen3.6-27B-Q4_K_M.gguf, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+sparse_attn_indexer', 'all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=422756) INFO 09-04 08:07:24 [registry.py:134] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+(EngineCore pid=422756) INFO 09-04 08:07:24 [parallel_state.py:1612] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.42.1.13:52779 backend=nccl
+(EngineCore pid=422756) INFO 09-04 08:07:24 [parallel_state.py:1943] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=422756) INFO 09-04 08:07:25 [gpu_model_runner.py:5300] Starting to load model /workspace/ckpt/qwen3.6-27b-hf...
+(EngineCore pid=422756) INFO 09-04 08:08:08 [rocm.py:683] Using Torch SDPA backend for ViT model.
+(EngineCore pid=422756) WARNING 09-04 08:08:08 [activation.py:811] [ROCm] PyTorch's native GELU with tanh approximation is unstable. Falling back to GELU(approximate='none').
+(EngineCore pid=422756) INFO 09-04 08:08:08 [mm_encoder_attention.py:373] Using AttentionBackendEnum.TORCH_SDPA for MMEncoderAttention.
+(EngineCore pid=422756) INFO 09-04 08:08:08 [qwen_gdn_linear_attn.py:150] Using Triton/FLA GDN prefill kernel (requested=auto, head_k_dim=128).
+(EngineCore pid=422756) INFO 09-04 08:08:09 [rocm.py:615] Found incompatible backend(s) [TURBOQUANT] with AttentionType.DECODER. Overriding with ROCM_ATTN out of potential backends: ['ROCM_ATTN', 'TRITON_ATTN'].
+(EngineCore pid=422756) WARNING 09-04 08:08:09 [compilation.py:1337] Op 'sparse_attn_indexer' not present in model, enabling with '+sparse_attn_indexer' has no effect
+(EngineCore pid=422756) INFO 09-04 08:09:26 [gpu_model_runner.py:5397] Model loading took 16.08 GiB memory and 118.451871 seconds
+(EngineCore pid=422756) INFO 09-04 08:09:26 [interface.py:905] Setting attention block size to 784 tokens to ensure that attention page size is >= mamba page size.
+(EngineCore pid=422756) INFO 09-04 08:09:26 [interface.py:929] Padding mamba page size by 0.13% to ensure that mamba page size and attention page size are exactly equal.
+(EngineCore pid=422756) INFO 09-04 08:11:51 [gpu_worker.py:554] Available KV cache memory: 20.83 GiB
+(EngineCore pid=422756) INFO 09-04 08:11:51 [kv_cache_utils.py:2214] GPU KV cache size: 148,480 tokens
+(EngineCore pid=422756) INFO 09-04 08:11:51 [kv_cache_utils.py:2215] Maximum concurrency for 2,048 tokens per request: 72.50x
+(EngineCore pid=422756) INFO 09-04 08:11:51 [qwen_triton_warmup.py:374] Warming up Qwen Triton kernels for model_type=qwen3_5_text.
+(EngineCore pid=422756) INFO 09-04 08:11:51 [ll_bf16.py:30] cuteDSL (CUTLASS Python) not available, ll_bf16_gemm disabled
+(EngineCore pid=422756) INFO 09-04 08:11:51 [cutedsl_warmup.py:100] Skipping CuTeDSL warmup on non-CUDA platform.
+(EngineCore pid=422756) INFO 09-04 08:11:51 [gpu_worker.py:780] Free memory on device (63.85/64.0 GiB) on startup. Desired GPU memory utilization is (0.6, 38.4 GiB). Actual usage is 17.23 GiB for consumed memory (weights + non-torch), 0.33 GiB for peak activation, and 0.0 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=22213007770` (20.69 GiB) to fit into requested memory, or `--kv-cache-memory=49537220608` (46.14 GiB) to fully utilize gpu memory. Current kv cache memory in use is 20.83 GiB.
+(EngineCore pid=422756) INFO 09-04 08:11:52 [jit_monitor.py:79] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(EngineCore pid=422756) INFO 09-04 08:11:52 [core.py:352] init engine (profile, create kv cache, warmup model) took 146.20 s
+(EngineCore pid=422756) INFO 09-04 08:11:52 [vllm.py:1114] Asynchronous scheduling is enabled.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [vllm.py:1168] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [vllm.py:1218] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=422756) INFO 09-04 08:11:52 [kernel.py:306] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(EngineCore pid=422756) INFO 09-04 08:11:52 [vllm.py:1397] Cudagraph is disabled under eager mode
+(EngineCore pid=422756) INFO 09-04 08:11:52 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+ENGINE_UP
+Rendering prompts:   0%|          | 0/6 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 6/6 [00:00<00:00, 1030.54it/s]
+Processed prompts:   0%|          | 0/6 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s](EngineCore pid=422756) WARNING 09-04 08:11:52 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _triton_mrope_forward. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _fwd_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [chunked_prefill_paged_decode.py:419] Cannot use ROCm custom paged attention kernel, falling back to Triton implementation.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [jit_monitor.py:135] Triton kernel JIT compilation during inference: kernel_paged_attention_2d. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [jit_monitor.py:135] Triton kernel JIT compilation during inference: _causal_conv1d_update_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=422756) WARNING 09-04 08:11:52 [jit_monitor.py:135] Triton kernel JIT compilation during inference: fused_recurrent_gated_delta_rule_packed_decode_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+Processed prompts:  17%|█▋        | 1/6 [00:08<00:43,  8.63s/it, est. speed input: 0.70 toks/s, output: 5.56 toks/s]Processed prompts:  33%|███▎      | 2/6 [00:17<00:35,  8.99s/it, est. speed input: 0.62 toks/s, output: 5.37 toks/s]Processed prompts:  50%|█████     | 3/6 [00:26<00:26,  8.89s/it, est. speed input: 0.64 toks/s, output: 5.41 toks/s]Processed prompts:  67%|██████▋   | 4/6 [00:36<00:18,  9.15s/it, est. speed input: 0.66 toks/s, output: 5.31 toks/s]Processed prompts:  83%|████████▎ | 5/6 [00:45<00:09,  9.27s/it, est. speed input: 0.77 toks/s, output: 5.26 toks/s]Processed prompts: 100%|██████████| 6/6 [00:55<00:00,  9.36s/it, est. speed input: 0.76 toks/s, output: 5.22 toks/s]Processed prompts: 100%|██████████| 6/6 [00:55<00:00,  9.36s/it, est. speed input: 0.76 toks/s, output: 5.22 toks/s]Processed prompts: 100%|██████████| 6/6 [00:55<00:00,  9.20s/it, est. speed input: 0.76 toks/s, output: 5.22 toks/s]
+GEN_IDS[0] = [11751, 13, 198, 32, 13, 2912, 198, 33, 13, 3439, 271, 248068, 271, 248069, 271, 760, 6511, 3177, 314, 9338, 369, 12456, 11751, 13, 1049, 369, 279, 3046, 579, 7526, 3177, 321, 16545, 430, 1141, 4788, 11, 6739, 11, 321, 12387, 3990, 13, 271, 332, 32, 13, 2912]
+GEN_TEXT[0] = " Paris.\nA. True\nB. False\n\n<think>\n\n</think>\n\nThe capital city of France is indeed Paris. It is the country's largest city and serves as its political, economic, and cultural center.\n\n**A. True"
+GEN_LEN[0] = 48
+GEN_IDS[1] = [2438, 11, 6105, 11, 321, 13358, 13, 3095, 1330, 5839, 7736, 513, 9238, 11, 781, 7936, 264, 13838, 1829, 13, 15451, 314, 279, 2614, 369, 264, 13838, 1829, 30, 271, 32, 13, 3605, 695, 33, 13, 8432, 695, 34, 13, 7592, 695, 35, 13, 24655, 271, 16, 13]
+GEN_TEXT[1] = ' red, blue, and yellow. When two primary colors are mixed, they produce a secondary color. Which of the following is a secondary color?\n\nA. Red \nB. Blue \nC. Green \nD. Yellow\n\n1.'
+GEN_LEN[1] = 48
+GEN_IDS[2] = [220, 16, 15, 15, 29922, 13, 3437, 369, 411, 9039, 303, 11995, 66401, 30, 271, 248068, 271, 248069, 271, 1206, 5335, 279, 9039, 494, 11995, 59275, 318, 11283, 34, 8, 310, 11995, 66401, 318, 11283, 37, 681, 567, 958, 279, 2614, 14377, 25, 271, 13682, 37, 283, 1088]
+GEN_TEXT[2] = ' 100°C. What is this temperature in degrees Fahrenheit?\n\n<think>\n\n</think>\n\nTo convert the temperature from degrees Celsius (°C) to degrees Fahrenheit (°F), we use the following formula:\n\n$$F = \\'
+GEN_LEN[2] = 48
+GEN_IDS[3] = [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 9460, 63414, 784, 16327, 279, 2542, 314, 279, 30308, 314, 279, 975, 1330, 10744, 25, 393, 264, 61, 17, 478, 292, 61, 17, 283, 272, 61, 17, 8408, 1061, 4864, 628, 381, 23185, 1608, 264, 50717, 7832, 15394, 30308]
+GEN_TEXT[3] = ' in a right triangle, the square of the hypotenuse equals the sum of the squares of the other two sides: $ a^2 + b^2 = c^2 $. This relationship can be verified using a geometric construction involving squares'
+GEN_LEN[3] = 48
+GEN_IDS[4] = [279, 17257, 11, 33767, 264, 4927, 40793, 303, 3433, 25559, 13, 1061, 24621, 557, 919, 314, 279, 33986, 1957, 11, 864, 5312, 279, 1118, 13234, 290, 8684, 11, 33986, 220, 22, 11, 6830, 303, 6324, 220, 16, 24, 21, 23, 13, 561, 33986, 220, 16, 16, 8684, 11]
+GEN_TEXT[4] = ' the moon, marking a significant milestone in space exploration. This achievement was part of the Apollo program, which saw the first crewed mission, Apollo 7, launch in October 1968. The Apollo 11 mission,'
+GEN_LEN[4] = 48
+GEN_IDS[5] = [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 1946, 7995, 3315, 264, 1324, 369, 9944, 11, 567, 628, 1716, 413, 424, 369, 72364, 539, 866, 7308, 494, 220, 17, 685, 310, 1141, 9057, 3578, 13, 1368, 874, 1680, 47461]
+GEN_TEXT[5] = ' greater than 1 that has no positive divisors other than 1 and itself. To determine whether a number is prime, we can check if it is divisible by any integer from 2 up to its square root. If no such divisor'
+GEN_LEN[5] = 48
+Rendering prompts:   0%|          | 0/6 [00:00<?, ?it/s]Rendering prompts: 100%|██████████| 6/6 [00:00<00:00, 3584.36it/s]
+Processed prompts:   0%|          | 0/6 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:  17%|█▋        | 1/6 [00:06<00:34,  6.88s/it, est. speed input: 7.85 toks/s, output: 0.15 toks/s]Processed prompts:  33%|███▎      | 2/6 [00:11<00:21,  5.36s/it, est. speed input: 9.57 toks/s, output: 0.18 toks/s]Processed prompts:  50%|█████     | 3/6 [00:15<00:15,  5.03s/it, est. speed input: 10.18 toks/s, output: 0.19 toks/s]Processed prompts:  67%|██████▋   | 4/6 [00:20<00:09,  4.88s/it, est. speed input: 10.56 toks/s, output: 0.20 toks/s]Processed prompts:  83%|████████▎ | 5/6 [00:25<00:04,  4.79s/it, est. speed input: 10.96 toks/s, output: 0.20 toks/s]Processed prompts: 100%|██████████| 6/6 [00:29<00:00,  4.74s/it, est. speed input: 11.09 toks/s, output: 0.20 toks/s]Processed prompts: 100%|██████████| 6/6 [00:29<00:00,  4.74s/it, est. speed input: 11.09 toks/s, output: 0.20 toks/s]Processed prompts: 100%|██████████| 6/6 [00:29<00:00,  4.96s/it, est. speed input: 11.09 toks/s, output: 0.20 toks/s]
+PREFILL_ARGMAX_MISMATCHES[0] = 0 []
+PREFILL_ARGMAX_MISMATCHES[1] = 0 []
+PREFILL_ARGMAX_MISMATCHES[2] = 1 [[26, 1651, 318]]
+PREFILL_ARGMAX_MISMATCHES[3] = 1 [[41, 16134, 23185]]
+PREFILL_ARGMAX_MISMATCHES[4] = 1 [[33, 383, 303]]
+PREFILL_ARGMAX_MISMATCHES[5] = 0 []
+PREFILL_ARGMAX_TOTAL_MISMATCHES = 3
+PREFILL_AGREES_WITH_DECODE = False
+WROTE /tmp/limb3-2884/vllm-eager.json
+DONE_MARKER_LIMB3_VEHICLE_GEN
+(EngineCore pid=422756) INFO 09-04 08:13:17 [core.py:1328] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=422756) INFO 09-04 08:13:17 [core.py:1448] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=422756) INFO 09-04 08:13:17 [core.py:1479] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=422756) INFO 09-04 08:13:17 [core.py:1341] [shutdown] EngineCore: exiting busy loop
+WARNING 09-04 08:13:22 [utils.py:626] [shutdown] Process manager: force killing remaining processes count=1

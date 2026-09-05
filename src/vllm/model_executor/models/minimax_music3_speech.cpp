@@ -574,7 +574,12 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
   // would reject every valid music request.
   bool requires_reference_audio() const override { return false; }
 
-  multimodal::SpeechResult Synthesize(const multimodal::SpeechGenParams& params) override {
+  // The seam holds the engine's lock across this call (#2836,
+  // speech_engine.h): the staged weights, the one `queue_` built in the
+  // constructor and the `profile::` table this brackets are all per-engine
+  // state, and `music3_profile.h` states outright that a caller bracketing from
+  // a pool worker would corrupt it. `POST /v1/audio/speech` IS a pool worker.
+  multimodal::SpeechResult SynthesizeLocked(const multimodal::SpeechGenParams& params) override {
     // Validate FIRST: every field refusal is free, and a caller learns its
     // request was malformed without waiting for 28.5 GB to stage.
     profile::Begin();

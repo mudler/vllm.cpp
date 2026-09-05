@@ -59,21 +59,45 @@ namespace {
 
 // A [C, T, H, W] pixel buffer for ONE temporal group, always rebased so its
 // frame 0 is the group's first frame (conv_video_decoder.py:521-522).
+// ─── THE BUFFER FOLLOWS THE LATENT (A24 wave 3, #2786) ─────────────────────
+//
+// Upstream allocates it as `torch.zeros(..., dtype=latent.dtype)`
+// (conv_video_decoder.py:427-431) and its WEIGHTS buffer as
+// `torch.zeros_like(buffer)` (`:526`) -- the same dtype, by construction, as the
+// tensor the decoder returns (`output_dtype = sample.dtype`, `:282`, returned at
+// `:357`). The masks stay f32 (`:548, :554`; tiling.py:425 says why: "Prefer
+// float32 masks so bf16/fp16 `x` promotes"), so `tile * mask` promotes to f32 as
+// a per-tile intermediate and the `+=` into the buffer rounds it straight back.
+//
+// The storage stays `std::vector<float>` and the ROUNDING is applied at each
+// accumulation instead, because this buffer is a PIXEL volume -- three channels,
+// not the base channel width -- and its bytes are a hundredth of the
+// intermediates inside `Ltx2ConvVideoDecode` that this row did narrow. What
+// matters numerically is that every `+=` and the final quotient land on the
+// buffer's grid, and `Round` is where that happens.
 struct ChunkBuffer {
   int64_t channels = 0, t = 0, h = 0, w = 0;
+  vt::DType dtype = vt::DType::kF32;
   std::vector<float> data;
 
   size_t At(int64_t c, int64_t ti, int64_t hi, int64_t wi) const {
     return static_cast<size_t>(((c * t + ti) * h + hi) * w + wi);
   }
-  void Allocate(int64_t c, int64_t frames, int64_t height, int64_t width) {
+  void Allocate(int64_t c, int64_t frames, int64_t height, int64_t width, vt::DType dt) {
     channels = c;
     t = frames;
     h = height;
     w = width;
+    dtype = dt;
     data.assign(static_cast<size_t>(c * frames * height * width), 0.0f);
   }
 };
+
+// The buffer's grid. At f32 it is the identity, which is what keeps the reference
+// arm byte-identical to its committed goldens.
+inline float RoundTo(float v, vt::DType dt) {
+  return dt == vt::DType::kBF16 ? vt::BF16ToF32(vt::F32ToBF16(v)) : v;
+}
 
 float MaskAt(const Ltx2AxisMapping& m, int64_t i) {
   // A length-1 mask is the untiled axis and BROADCASTS (tiling.py:121-123, 431-434).
@@ -143,26 +167,47 @@ std::vector<float> AccumulateTemporalGroup(const Ltx2ConvVideoDecoderConfig& con
 
     // `buffer[chunk_coords] += scale_by_masks_1d(decoded_slice, masks)`
     // (conv_video_decoder.py:552) — SEPARABLE 1-D masks, never a dense N-D one.
+    //
+    // AND THE MASKS ARE APPLIED ONE AXIS AT A TIME, NOT FUSED (#2815).
+    // `scale_by_masks_1d` walks the axes and multiplies the running value by each
+    // mask in turn (tiling.py:430-434), so the arithmetic is `((x * mt) * mh) * mw`
+    // and NOT `x * ((mt * mh) * mw)`. The two round differently, and this port
+    // fused them until the bf16 arm below could see it: at f32 the difference is a
+    // relative ~1e-7 and sits far under the 5e-6 golden band every tiling case
+    // uses, so all of them stayed green. At upstream's own bfloat16 it is a whole
+    // word — upstream re-run with the fused product lands 0.001953125 from its own
+    // answer, which is exactly where this port sat.
     for (int64_t c = 0; c < buffer->channels; ++c) {
       for (int64_t ti = 0; ti < actual; ++ti) {
         const float mt = MaskAt(tile.out_t, ti);
         for (int64_t hi = 0; hi < tile_h; ++hi) {
-          const float mth = mt * MaskAt(tile.out_h, hi);
+          const float mh = MaskAt(tile.out_h, hi);
+          // The WEIGHTS denominator may keep the fused product: it accumulates the
+          // same masks over a tensor of ones (conv_video_decoder.py:553-555), and
+          // `((1 * mt) * mh) * mw` is bit-identical to `(mt * mh) * mw`.
+          const float mth = mt * mh;
           const size_t dst_row =
               buffer->At(c, temporal_offset + ti, tile.out_h.start + hi, tile.out_w.start);
           const size_t src_row = static_cast<size_t>(
               ((c * decoded.frames + ti) * decoded.height + hi) * decoded.width);
           for (int64_t wi = 0; wi < tile_w; ++wi) {
-            const float m = mth * MaskAt(tile.out_w, wi);
-            buffer->data[dst_row + static_cast<size_t>(wi)] +=
-                decoded.data[src_row + static_cast<size_t>(wi)] * m;
+            const float mw = MaskAt(tile.out_w, wi);
+            const float m = mth * mw;
+            buffer->data[dst_row + static_cast<size_t>(wi)] =
+                RoundTo(buffer->data[dst_row + static_cast<size_t>(wi)] +
+                            ((decoded.data[src_row + static_cast<size_t>(wi)] * mt) * mh) * mw,
+                        buffer->dtype);
             if (!complementary) {
               // conv_video_decoder.py:553-555: the weights accumulate the SAME
               // masks over a tensor of ones. The value does not depend on the
               // channel, but upstream's weights buffer is `zeros_like(buffer)`
               // and therefore channel-shaped, so the divide at :471 is elementwise
               // and this must be too.
-              group_weights[dst_row + static_cast<size_t>(wi)] += m;
+              // `zeros_like(buffer)` (conv_video_decoder.py:526), so the weights
+              // buffer is the buffer's dtype too -- a fact `ltx2_tiling.h` did not
+              // record and this row adds.
+              group_weights[dst_row + static_cast<size_t>(wi)] =
+                  RoundTo(group_weights[dst_row + static_cast<size_t>(wi)] + m, buffer->dtype);
             }
           }
         }
@@ -245,7 +290,7 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
     const int64_t curr_stop = group.front().out_t.stop;
 
     ChunkBuffer buffer;
-    buffer.Allocate(config.out_channels, curr_stop - curr_start, full_h, full_w);
+    buffer.Allocate(config.out_channels, curr_stop - curr_start, full_h, full_w, weights.dtype);
     // W0 (#1010): THE VIDEO DECODE'S OWN WORK, bounded by production events on
     // both ends. One record per temporal group, which is one record per chunk
     // the sink is handed, so the count is a quantity the instrument cannot move.
@@ -283,12 +328,17 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
             for (int64_t i = 0; i < plane; ++i) {
               // conv_video_decoder.py:453 — a bare `+=` of two ALREADY-MASKED
               // halves, not a lerp. See the header note.
-              previous.data[p + static_cast<size_t>(i)] += buffer.data[b + static_cast<size_t>(i)];
+              previous.data[p + static_cast<size_t>(i)] =
+                  RoundTo(previous.data[p + static_cast<size_t>(i)] +
+                              buffer.data[b + static_cast<size_t>(i)],
+                          buffer.dtype);
             }
             if (!complementary) {
               for (int64_t i = 0; i < plane; ++i) {
-                previous_weights[p + static_cast<size_t>(i)] +=
-                    curr_weights[b + static_cast<size_t>(i)];
+                previous_weights[p + static_cast<size_t>(i)] =
+                    RoundTo(previous_weights[p + static_cast<size_t>(i)] +
+                                curr_weights[b + static_cast<size_t>(i)],
+                            buffer.dtype);
               }
             }
             for (int64_t i = 0; i < plane; ++i) {
@@ -350,7 +400,8 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
             chunk.frames.data[dst + static_cast<size_t>(i)] =
                 complementary
                     ? v
-                    : v / std::max(previous_weights[src + static_cast<size_t>(i)], 1e-8f);
+                    : RoundTo(v / std::max(previous_weights[src + static_cast<size_t>(i)], 1e-8f),
+                              previous.dtype);
           }
         }
       }
@@ -375,7 +426,9 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
   chunk.frames.data.resize(previous.data.size());
   for (size_t i = 0; i < previous.data.size(); ++i) {
     chunk.frames.data[i] =
-        complementary ? previous.data[i] : previous.data[i] / std::max(previous_weights[i], 1e-8f);
+        complementary
+            ? previous.data[i]
+            : RoundTo(previous.data[i] / std::max(previous_weights[i], 1e-8f), previous.dtype);
   }
   emit(chunk);
 }

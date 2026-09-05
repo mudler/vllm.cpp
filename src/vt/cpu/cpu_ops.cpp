@@ -6,6 +6,7 @@
 // kernel keeps its exact per-element math and per-output sequential reduction
 // order; parallelism partitions OUTPUT elements only, so results are
 // bit-identical to single-thread by construction (spec § Dispatch behavior).
+#include "vt/dflash_attn_mask.h"  // #2784: the ONE mask bound, shared with the CUDA kernels
 #include "vt/ops.h"
 
 #include <algorithm>
@@ -184,6 +185,11 @@ inline const void* ElemPtr(const Tensor& t, int64_t off) {
   return static_cast<const uint8_t*>(t.data) + static_cast<size_t>(off) * SizeOf(t.dtype);
 }
 
+// The writable form of ElemPtr, for the row-typed STORE helpers.
+inline void* ElemMutPtr(const Tensor& t, int64_t off) {
+  return static_cast<uint8_t*>(t.data) + static_cast<size_t>(off) * SizeOf(t.dtype);
+}
+
 // Specialized/vectorized elementwise GEMM chunk (row `CPU-ELEM-GEMM`,
 // .agents/specs/cpu-elementwise-gemm.md). Structurally identical to
 // MatmulOneChunkRef — same 16x16 tile from ggml_compute_forward_mul_mat_one_chunk
@@ -219,35 +225,82 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
   // per worker for the process lifetime (no per-chunk allocation).
   static thread_local std::vector<float> af;
 
+  // M blocking applies to BOTH orientations. It used to be gated on kBT, so
+  // the [K,N] path always ran mr=1 and re-read the whole weight tile once per
+  // activation row (a 131-row activation read it 131 times). Each family is
+  // guarded on its own function pointer because a tier may provide one and
+  // not the other (the portable tier has no btm, having no transpose to
+  // amortize, but its nkm still amortizes the weight load).
+  const ElemNkMFn nkm_fn = tier.nkm[bi];
+  const int mr = (kBT ? (tier.btm[bi] != nullptr) : (nkm_fn != nullptr)) ? tier.mr : 1;
+  VT_CHECK(mr >= 1 && mr <= kElemMaxMr,
+           "cpu matmul: the tier's mr exceeds the accumulator tile the chunk walker "
+           "carries; raise kElemMaxMr in cpu_matmul_elem.h together with it");
+
   for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
     const int64_t i_hi = std::min(iir1 + blck_1, ir1_end);
     const int64_t nrows = i_hi - iir1;
-    af.resize(static_cast<size_t>(nrows * k));
+    // PAD THE TILE UP TO A WHOLE NUMBER OF `mr` BLOCKS. One `btm`/`nkm` call
+    // costs one pass over the 16-column weight block -- the load, and on the
+    // [N,K] orientation the 4x4-group register transpose -- and that pass is
+    // what M blocking exists to amortize. `mr` does not have to divide
+    // `blck_1`: at mr = 6 a 16-row tile used to take two M-blocked calls and
+    // then send its last FOUR rows through the one-row kernel, one whole weight
+    // pass each, so the tile performed SIX passes where its own blocking factor
+    // allows three. Padding the tile and clamping the store below puts every
+    // row on the M-blocked kernel; the pad rows are computed and never stored.
+    //
+    // It moves no output's accumulation order. `ElemBtMFn` accumulates lane `l`
+    // of row `r` over `p` in strict increasing order whatever `mr` is, exactly
+    // as `ElemBt16Fn` does for one row -- which is why the tree already ran some
+    // rows of the same call through `btm` and the rest through `bt` and asserted
+    // both byte-identical to `MatmulOneChunkRef`.
+    //
+    // IT PADS ONLY WHERE PADDING REMOVES A PASS, which is what stops it being
+    // a decode regression. With `rem = nrows % mr`, the tile costs
+    // `floor(nrows/mr) + rem` passes unpadded and `ceil(nrows/mr)` padded, so
+    // padding saves `rem - 1` passes and is a strict win only at `rem >= 2`.
+    // At `nrows < mr` -- a decode chunk of one or two rows -- both forms cost
+    // ONE pass and padding would only add arithmetic, so it is declined there
+    // and those shapes keep today's kernel exactly.
+    const int64_t rem = mr > 1 ? nrows % mr : 0;
+    const bool pad = mr > 1 && nrows >= mr && rem >= 2;
+    const int64_t nrows_padded = pad ? ((nrows + mr - 1) / mr) * mr : nrows;
+    af.resize(static_cast<size_t>(nrows_padded * k));
     for (int64_t i = iir1; i < i_hi; ++i) {
       WidenRowToF32(a.dtype, ElemPtr(a, i * a_rs), k, af.data() + (i - iir1) * k);
     }
-    // M blocking applies to BOTH orientations. It used to be gated on kBT, so
-    // the [K,N] path always ran mr=1 and re-read the whole weight tile once per
-    // activation row (a 131-row activation read it 131 times). Each family is
-    // guarded on its own function pointer because a tier may provide one and
-    // not the other (the portable tier has no btm, having no transpose to
-    // amortize, but its nkm still amortizes the weight load).
-    const ElemNkMFn nkm_fn = tier.nkm[bi];
-    const int mr = (kBT ? (tier.btm[bi] != nullptr) : (nkm_fn != nullptr)) ? tier.mr : 1;
+    if (nrows_padded > nrows) {
+      // `af` is thread_local and reused across calls, so without this the pad
+      // rows would carry whatever the previous call left there -- including the
+      // inf and nan operands tests/vt/test_ops_matmul_elem.cpp feeds. Their
+      // products are never stored, so this changes no output; it keeps stale
+      // operands out of the FP pipeline rather than out of the result.
+      std::memset(af.data() + nrows * k, 0,
+                  static_cast<size_t>((nrows_padded - nrows) * k) * sizeof(float));
+    }
     for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
       const int64_t j_hi = std::min(iir0 + blck_0, ir0_end);
       int64_t i = iir1;
       // M-blocked fast path: `mr` activation rows share one weight load +
       // transpose per column block (see ElemBtMFn).
       if (j_hi - iir0 == blck_0 && mr > 1) {
-        float accm[kElemLanes * 8];
-        for (; i + mr <= i_hi; i += mr) {
+        float accm[kElemLanes * kElemMaxMr];
+        // Padded: every row of the tile, the last block partly discarded.
+        // Unpadded: the whole blocks only, and the one-row loop below takes the
+        // remainder exactly as it did before this change.
+        const int64_t mr_end = pad ? i_hi : (iir1 + (nrows / mr) * mr);
+        for (; i < mr_end; i += mr) {
           if (kBT) {
             tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
           } else {
             nkm_fn(af.data() + (i - iir1) * k, k, ElemPtr(b, iir0), k, n, accm);
           }
-          for (int r = 0; r < mr; ++r) {
+          // Only the rows the tile actually holds are stored; the padded
+          // remainder above `i_hi` was computed against zeroed activations and
+          // is discarded here.
+          const int rows_here = static_cast<int>(std::min<int64_t>(mr, i_hi - i));
+          for (int r = 0; r < rows_here; ++r) {
             for (int64_t j = iir0; j < j_hi; ++j) {
               StoreF32(out, (i + r) * n + j, accm[r * kElemLanes + (j - iir0)]);
             }
@@ -459,31 +512,82 @@ void ConcatMlaNopeRopeKernel(Queue&, Tensor& out, const Tensor& nope, const Tens
   });
 }
 
+// The per-element dtype dispatch, hoisted. Row VT-CPU-ELEM-SURVEY,
+// .agents/specs/vt-cpu-elem-survey.md.
+//
+// The loop below used to read every operand element through `LoadF32`, which
+// switches on `t.dtype` and multiplies by `SizeOf(t.dtype)` once PER ELEMENT.
+// It did that TWICE over `x` (the variance pass and the scale pass) and once
+// over `w` PER ROW, although `w` is a single [h] vector every one of the `t`
+// rows reuses. `perf record -e cpu-clock` over `vt::RmsNorm` alone at the
+// Qwen3.6-27B `input_layernorm` shape (x[1024,5120] f32, one thread) measured
+// the consequence: `LoadF32` 49.06%, `StoreF32` 12.05%, the loop body 36.48%.
+//
+// This is the SAME transformation `AttentionKernel` and `MatmulOneChunk`
+// already apply in this file: resolve the dtype once and go through the shared
+// `WidenRowToF32` / `NarrowRowFromF32` row helpers.
+//
+// BIT-EXACT BY CONSTRUCTION, and this is the whole argument:
+//   * `WidenRowToF32` writes exactly the f32 values `LoadF32` returned, through
+//     the same `F16ToF32`/`BF16ToF32`, so every operand is the same bits;
+//   * `sumsq` still accumulates over `j` in the same increasing order into one
+//     f32 accumulator — a serial float reduction, which `-ffp-contract=off`
+//     (CMakeLists.txt:55) and the absence of `-ffast-math` forbid reassociating;
+//   * the scale pass computes `v * inv * wj` in the same order and rounds once
+//     on store through `NarrowRowFromF32`, which is `StoreF32`'s rounding;
+//   * `args.gemma`'s `wj += 1.0f` moves onto the widened `w` copy. It is the
+//     same f32 add on the same value, hoisted out of `t` repetitions of it;
+//   * the residual stream keeps its add / round-on-store / RE-READ order, which
+//     is what makes a bf16 residual faithful. `x` is widened into scratch BEFORE
+//     anything is stored, so a caller that aliases `residual` onto `x` sees the
+//     same values the per-element interleave produced;
+//   * each row is independent, so the threadpool partition is unchanged.
+// No accumulator is split and no sum is reordered; the outputs are
+// memcmp-identical, not close (tests/vt/test_ops_rmsnorm_elem_dispatch.cpp).
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
+  // `w` is loop-invariant across rows. Widen it ONCE per call, and fold the
+  // gemma `+1` in here, where it costs h adds instead of t*h. The refusal for a
+  // dtype with no per-element size is produced by `LoadF32`/`SizeOf` themselves
+  // (the `AttnResolveOrRefuse` shape above), so its message cannot drift from
+  // the per-element one, and it is raised before any element is read.
+  if (w.dtype != DType::kF32 && w.dtype != DType::kF16 && w.dtype != DType::kBF16)
+    (void)LoadF32(w, 0);
+  std::vector<float> wf(static_cast<size_t>(h));
+  WidenRowToF32(w.dtype, w.data, h, wf.data());
+  if (args.gemma)
+    for (float& v : wf) v += 1.0f;
+  // Same refusal for the operands the row helpers below will read.
+  if (x.dtype != DType::kF32 && x.dtype != DType::kF16 && x.dtype != DType::kBF16)
+    (void)LoadF32(x, 0);
+  if (residual != nullptr && residual->dtype != DType::kF32 &&
+      residual->dtype != DType::kF16 && residual->dtype != DType::kBF16)
+    (void)LoadF32(*residual, 0);
+  if (out.dtype != DType::kF32 && out.dtype != DType::kF16 && out.dtype != DType::kBF16)
+    StoreF32(out, 0, 0.0f);
   // Row-chunked over tokens (ops.cpp:9070-9126 pattern); each row's f32
   // variance reduction stays sequential on one thread — bit-identical.
   ForRows(t, [&](int64_t r0, int64_t r1) {
+  // One scratch pair per CHUNK, not per row and not per element.
+  std::vector<float> rowf(static_cast<size_t>(h)), outf(static_cast<size_t>(h));
+  std::vector<float> resf(residual != nullptr ? static_cast<size_t>(h) : 0);
   for (int64_t i = r0; i < r1; ++i) {
     const int64_t rbase = i * h;
+    WidenRowToF32(x.dtype, ElemPtr(x, rbase), h, rowf.data());
+    if (residual != nullptr) {
+      WidenRowToF32(residual->dtype, ElemPtr(*residual, rbase), h, resf.data());
+      for (int64_t j = 0; j < h; ++j) resf[j] += rowf[j];  // add in f32
+      // New residual stream: round to its dtype on store, then RE-READ the
+      // rounded value, exactly as the per-element loop did.
+      NarrowRowFromF32(residual->dtype, ElemMutPtr(*residual, rbase), h, resf.data());
+      WidenRowToF32(residual->dtype, ElemPtr(*residual, rbase), h, rowf.data());
+    }
     float sumsq = 0.0f;
-    for (int64_t j = 0; j < h; ++j) {
-      float v = LoadF32(x, i * h + j);
-      if (residual) {
-        v += LoadF32(*residual, rbase + j);   // add in f32
-        StoreF32(*residual, rbase + j, v);     // new residual stream (rounds to its dtype)
-        v = LoadF32(*residual, rbase + j);     // re-read rounded value (bf16-faithful)
-      }
-      sumsq += v * v;
-    }
-    float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
-    for (int64_t j = 0; j < h; ++j) {
-      float v = residual ? LoadF32(*residual, rbase + j) : LoadF32(x, i * h + j);
-      float wj = LoadF32(w, j);
-      if (args.gemma) wj += 1.0f;
-      StoreF32(out, i * h + j, v * inv * wj);
-    }
+    for (int64_t j = 0; j < h; ++j) sumsq += rowf[j] * rowf[j];
+    const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
+    for (int64_t j = 0; j < h; ++j) outf[j] = rowf[j] * inv * wf[j];
+    NarrowRowFromF32(out.dtype, ElemMutPtr(out, rbase), h, outf.data());
   }
   });
 }
@@ -1756,6 +1860,252 @@ void GdnTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Ten
   }
 }
 
+// Per-work-item scratch for the chunked arm. Hoisted out of the chunk loop so
+// the allocation is once per thread, not once per chunk.
+struct GdnChunkScratch {
+  std::vector<float> G, eG, A, Ai, vb, kbg, u, w, hb, vnew, vdec, Ao;
+  GdnChunkScratch(int64_t bt, int64_t dk, int64_t dv)
+      : G(static_cast<size_t>(bt)), eG(static_cast<size_t>(bt)),
+        A(static_cast<size_t>(bt * bt), 0.0f), Ai(static_cast<size_t>(bt * bt), 0.0f),
+        vb(static_cast<size_t>(bt * dv)), kbg(static_cast<size_t>(bt * dk)),
+        u(static_cast<size_t>(bt * dv)), w(static_cast<size_t>(bt * dk)),
+        hb(static_cast<size_t>(dv * dk)), vnew(static_cast<size_t>(bt * dv)),
+        vdec(static_cast<size_t>(bt * dv)), Ao(static_cast<size_t>(bt * bt), 0.0f) {}
+};
+
+// ===========================================================================
+// KERNEL-GDN-CHUNKED-MIRROR (.agents/specs/gdn-chunked-mirror.md D1/D2).
+//
+// vLLM's CHUNKED WY decomposition of the gated delta rule, on CPU. This is the
+// algorithm vLLM runs for ALL GDN prefill; the sequential recurrence above is
+// retained behind VT_GDN_CHUNKED=0 and on f32, where it IS the mirror.
+//
+// Ported from the pinned FLA tree (vLLM e126687a9a,
+// vllm/third_party/flash_linear_attention/ops/):
+//   chunk.py:37-82                driver, and :50 solve_tril(output_dtype=k.dtype)
+//   cumsum.py                     chunk_local_cumsum, f32
+//   chunk_scaled_dot_kkt.py:86-116,161   A = tril(beta_i (k_i.k_j) e^(G_i-G_j), -1), f32
+//   solve_tril.py:77-89           (I+A)^-1 by forward substitution, then +I
+//   wy_fast.py:92-94,114-116      u, w
+//   chunk_delta_h.py:178,206,274,302,352-357   v_new, the decay, the state
+//   chunk_o.py:111-138            o, and :137's TWO separate *scale factors
+//
+// vLLM ALSO ships a chunked CPU kernel, `chunk_gated_delta_rule_cpu`
+// (csrc/cpu/sgl-kernels/fla.cpp:2178, reached from
+// vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py:247,629,705). It
+// confirms this dtype FAMILY on a CPU target — `attn` f32, `attn2` (the
+// triangular inverse) bf16, `w`/`u` bf16, state f32 (fla.cpp:1059-1060,
+// :2213-2214) — and it type-checks bf16 only (:2205-2207), which is D0's
+// dtype term stated a second time by a second upstream implementation.
+//
+// WHICH UPSTREAM BEHAVIOUR THIS MIRRORS, SAID PLAINLY: the TRITON kernel, which
+// is what vLLM runs on a GPU. A `vllm --device cpu` run executes
+// `chunk_gated_delta_rule_cpu` instead, so a CPU-vs-CPU oracle comparison would
+// show this arm differing from vLLM-on-CPU by about the 2.44e-04 the table
+// below prices, NOT agreeing with it. That is a deliberate choice and it is the
+// one the evidence supports: the only oracle dump this tree owns
+// (tests/parity/goldens/gdn_prefill_bf16_realdims) is a Triton dump, and G1's
+// bar was derived from it.
+//
+// It differs from the Triton path in three SECONDARY sites. Measured on that
+// golden (max|d| vs the dump), each applied to the Triton placement alone:
+//
+//   placement                                        out          state
+//   Triton (this port)                          6.103516e-05  5.059987e-04
+//   + q pre-scaled into bf16 (fla.cpp:2231)     2.441406e-04  5.059987e-04
+//   + decay folded into k (fla.cpp:1519)        6.103516e-05  1.281053e-03
+//   + row-wise bf16 solve_tril (fla.cpp:524)    6.103516e-05  5.059987e-04
+//   + bf16 `attn2` buffer (fla.cpp:1060)        6.103516e-05  8.501429e-04
+//   full CPU-kernel placement                   2.441406e-04  1.281053e-03
+//
+// The fourth row is INERT on this golden -- rounding each substitution row
+// changes nothing, because `A` is f32 going in and the result is rounded once
+// either way. An earlier version of this table attributed 8.501429e-04 to it;
+// that number belongs to the FIFTH row, the CPU kernel's bf16 `attn2` buffer,
+// which the fourth row's variant had silently bundled in.
+//
+// G1's bar is 1.5e-04 out / 1.5e-03 state, so the q pre-scale is the one site
+// that decides the gate.
+//
+// AND THE q PRE-SCALE IS NOT EVEN THE CPU KERNEL'S PRODUCTION BEHAVIOUR.
+// `fla.cpp:2231`'s `query.mul(scale)` sits on the `use_qk_l2norm_in_kernel ==
+// false` branch; on the TRUE branch -- which is production, and which upstream's
+// own CPU test uses -- `l2norm_fwd` applies the same Dk^-0.5 inside the kernel
+// and stores bf16 once. Upstream rounds `q` ONCE either way, and our seam has
+// already spent that rounding upstream of GdnPrefill (`dql2` arrives bf16 and
+// L2-normalised, with `scale` carried separately in GdnArgs). Applying it again
+// here would be a DOUBLE rounding neither upstream implementation performs. So
+// following Triton on this site is right structurally, and the measurement
+// above is the confirmation rather than the reason. The measurement harness is
+// docs/bench-evidence/gdn-chunked-decomposition-20260902/ (gdn_decomp.py's
+// UPSTREAM map is the site-by-site placement this code implements).
+//
+// The output is rounded to the INPUT dtype before it is stored, because
+// upstream's `o` is allocated `q.options()` (fla.cpp:2158, and Triton's
+// chunk_o.py:138 stores to a bf16 tensor) — never to the caller's buffer dtype.
+// Storing f32 instead costs 1.911595e-04 on the same golden, which also fails
+// G1. A token gate cannot see this; G1 and G3 are what catch it.
+//
+// Byte-identical across thread counts by construction, exactly as the
+// sequential arm is: the parallel axis is the (sequence, value-head) product,
+// every reduction is inside one work item, and the cross-chunk state recurrence
+// stays sequential within it (R4/T6).
+constexpr int64_t kGdnChunk = 64;  // FLA_CHUNK_SIZE (utils.py:31), == cuda_gdn.cu:169 kChunk
+
+// Round to bf16 and widen back. Upstream stores bf16 and reloads it as an
+// operand; our CPU arm has no bf16 arithmetic, so every site below is
+// round-then-widen, which is what Triton does too (f32 accumulate, bf16 store).
+inline float Bf16(float v) { return BF16ToF32(F32ToBF16(v)); }
+
+// One (sequence, value-head) work item: the chunk loop, carrying `h` forward.
+// `h` is the [Dv,Dk] f32 state block, updated in place (chunk_delta_h.py:353-355
+// keeps the state f32; only the OPERAND that reads it is rounded).
+void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
+                           const Tensor& v_in, const Tensor& g, const Tensor& beta,
+                           float* h, int64_t t0, int64_t t1, int64_t hv, int64_t hk,
+                           int64_t hk_n, int64_t hv_n, int64_t dk, int64_t dv, float scale,
+                           GdnChunkScratch& s) {
+  const int64_t bt = kGdnChunk;
+  for (int64_t c0 = t0; c0 < t1; c0 += bt) {
+    const int64_t n = std::min(bt, t1 - c0);
+    // --- chunk_local_cumsum (cumsum.py): inclusive prefix sum of g, f32.
+    float acc = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+      acc += g.Ptr<float>()[(c0 + i) * hv_n + hv];
+      s.G[static_cast<size_t>(i)] = acc;
+      s.eG[static_cast<size_t>(i)] = std::exp(acc);
+    }
+    const float g_last = s.G[static_cast<size_t>(n - 1)];
+    // --- chunk_scaled_dot_kkt (:86-116): A[i][j] = beta_i (k_i.k_j) e^(G_i-G_j),
+    // strictly lower. Stored f32 (chunk.py:47 output_dtype=torch.float32), and
+    // the dot keeps ieee f32 operands (:103 on non-RDNA) — a TF32 variant was
+    // measured FURTHER from the real kernel (1.22e-04 vs 6.10e-05).
+    for (int64_t i = 0; i < n; ++i) {
+      const float b_i = beta.Ptr<float>()[(c0 + i) * hv_n + hv];
+      for (int64_t j = 0; j < i; ++j) {
+        float d = 0.0f;
+        for (int64_t x = 0; x < dk; ++x)
+          d += LoadF32(k_in, ((c0 + i) * hk_n + hk) * dk + x) *
+               LoadF32(k_in, ((c0 + j) * hk_n + hk) * dk + x);
+        s.A[static_cast<size_t>(i * bt + j)] =
+            b_i * d * std::exp(s.G[static_cast<size_t>(i)] - s.G[static_cast<size_t>(j)]);
+      }
+    }
+    // --- solve_tril (:77-89): Ai = (I+A)^-1, unit lower triangular, by forward
+    // substitution in f32; STORED bf16 (chunk.py:50 output_dtype=k.dtype).
+    // D2: the inverse is MATERIALISED rather than fused into the two WY columns,
+    // because a fused solve has no A^-1 to store and would skip this rounding
+    // site — the one site of the nine a fused solve structurally cannot
+    // reproduce (ablated at 2.6174e-06 on `out`).
+    for (int64_t i = 0; i < n; ++i) {
+      for (int64_t j = 0; j < i; ++j) {
+        float m = -s.A[static_cast<size_t>(i * bt + j)];
+        for (int64_t p = j + 1; p < i; ++p)
+          m -= s.A[static_cast<size_t>(i * bt + p)] * s.Ai[static_cast<size_t>(p * bt + j)];
+        s.Ai[static_cast<size_t>(i * bt + j)] = m;
+      }
+      s.Ai[static_cast<size_t>(i * bt + i)] = 1.0f;
+    }
+    for (int64_t i = 0; i < n; ++i)
+      for (int64_t j = 0; j <= i; ++j)
+        s.Ai[static_cast<size_t>(i * bt + j)] = Bf16(s.Ai[static_cast<size_t>(i * bt + j)]);
+    // --- recompute_w_u (wy_fast.py:92-94,114-116). The two operands are cast to
+    // k's dtype BEFORE the dot (:92, :114) and both results are STORED bf16.
+    for (int64_t i = 0; i < n; ++i) {
+      const float b_i = beta.Ptr<float>()[(c0 + i) * hv_n + hv];
+      for (int64_t x = 0; x < dv; ++x)
+        s.vb[static_cast<size_t>(i * dv + x)] =
+            Bf16(LoadF32(v_in, ((c0 + i) * hv_n + hv) * dv + x) * b_i);
+      for (int64_t x = 0; x < dk; ++x)
+        s.kbg[static_cast<size_t>(i * dk + x)] =
+            Bf16(LoadF32(k_in, ((c0 + i) * hk_n + hk) * dk + x) * b_i *
+                 s.eG[static_cast<size_t>(i)]);
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      for (int64_t x = 0; x < dv; ++x) {
+        float a = 0.0f;
+        for (int64_t j = 0; j <= i; ++j)
+          a += s.Ai[static_cast<size_t>(i * bt + j)] * s.vb[static_cast<size_t>(j * dv + x)];
+        s.u[static_cast<size_t>(i * dv + x)] = Bf16(a);
+      }
+      for (int64_t x = 0; x < dk; ++x) {
+        float a = 0.0f;
+        for (int64_t j = 0; j <= i; ++j)
+          a += s.Ai[static_cast<size_t>(i * bt + j)] * s.kbg[static_cast<size_t>(j * dk + x)];
+        s.w[static_cast<size_t>(i * dk + x)] = Bf16(a);
+      }
+    }
+    // --- chunk_delta_h. h_snap (:352, read by chunk_o) and the `w @ h^T`
+    // operand (:178) are two separate bf16 READS of the same f32 state; the
+    // state itself stays f32. Same values, so one buffer serves both.
+    for (int64_t vi = 0; vi < dv; ++vi)
+      for (int64_t ki = 0; ki < dk; ++ki)
+        s.hb[static_cast<size_t>(vi * dk + ki)] = Bf16(h[vi * dk + ki]);
+    for (int64_t i = 0; i < n; ++i) {
+      for (int64_t vi = 0; vi < dv; ++vi) {
+        float a = 0.0f;
+        for (int64_t ki = 0; ki < dk; ++ki)
+          a += s.w[static_cast<size_t>(i * dk + ki)] * s.hb[static_cast<size_t>(vi * dk + ki)];
+        // :206 v_new store -> bf16
+        s.vnew[static_cast<size_t>(i * dv + vi)] = Bf16(s.u[static_cast<size_t>(i * dv + vi)] - a);
+        // :274 the decayed copy, cast to k's dtype, is what the state reads.
+        // The decay rides on v_new here, NOT on k (that is upstream's Triton
+        // placement; the CPU kernel folds it into k instead, at 1.28e-03 state).
+        s.vdec[static_cast<size_t>(i * dv + vi)] =
+            Bf16(s.vnew[static_cast<size_t>(i * dv + vi)] *
+                 std::exp(g_last - s.G[static_cast<size_t>(i)]));
+      }
+    }
+    // --- the state recurrence (:208-302), f32: h = h e^(G_last) + vdec^T k.
+    const float decay_last = std::exp(g_last);
+    for (int64_t vi = 0; vi < dv; ++vi) {
+      float* hrow = h + vi * dk;
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        float a = hrow[ki] * decay_last;
+        for (int64_t i = 0; i < n; ++i)
+          a += s.vdec[static_cast<size_t>(i * dv + vi)] *
+               LoadF32(k_in, ((c0 + i) * hk_n + hk) * dk + ki);
+        hrow[ki] = a;
+      }
+    }
+    // --- chunk_o (:111-138). A_o = tril(q.k^T e^(G_i-G_j), 0) — the diagonal
+    // IS included (:124 uses `>=`) — cast to bf16 as the dot operand (:137).
+    // q carries NO scale here: :137 is `b_o * scale + tl.dot(...) * scale`, two
+    // separate f32 multiplies, not one factored out, and the two are not the
+    // same in f32.
+    for (int64_t i = 0; i < n; ++i) {
+      for (int64_t j = 0; j <= i; ++j) {
+        float d = 0.0f;
+        for (int64_t x = 0; x < dk; ++x)
+          d += LoadF32(q_in, ((c0 + i) * hk_n + hk) * dk + x) *
+               LoadF32(k_in, ((c0 + j) * hk_n + hk) * dk + x);
+        s.Ao[static_cast<size_t>(i * bt + j)] =
+            Bf16(d * std::exp(s.G[static_cast<size_t>(i)] - s.G[static_cast<size_t>(j)]));
+      }
+    }
+    for (int64_t i = 0; i < n; ++i) {
+      for (int64_t vi = 0; vi < dv; ++vi) {
+        float cross = 0.0f;
+        for (int64_t ki = 0; ki < dk; ++ki)
+          cross += LoadF32(q_in, ((c0 + i) * hk_n + hk) * dk + ki) *
+                   s.hb[static_cast<size_t>(vi * dk + ki)];
+        float intra = 0.0f;
+        for (int64_t j = 0; j <= i; ++j)
+          intra += s.Ao[static_cast<size_t>(i * bt + j)] * s.vnew[static_cast<size_t>(j * dv + vi)];
+        const float o = cross * s.eG[static_cast<size_t>(i)] * scale + intra * scale;
+        // The store rounds to the DESTINATION dtype, which is upstream's own
+        // rule: `o` is allocated `q.options()` (fla.cpp:2158) and chunk_o.py:138
+        // stores into it, so on the production path (a bf16 `dcore`) StoreF32's
+        // F32ToBF16 performs exactly the rounding the oracle performed. An
+        // explicit round-to-input-dtype here instead would silently defeat
+        // `VT_GDN_OUT_BF16=0`, whose documented job is to restore f32 for this
+        // very tensor, and would be wrong for any dtype but bf16.
+        StoreF32(out, ((c0 + i) * hv_n + hv) * dv + vi, o);
+      }
+    }
+  }
+}
+
 void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                       const Tensor& g, const Tensor& beta, Tensor& state, const Tensor& qsl,
                       const GdnArgs& args) {
@@ -1778,6 +2128,31 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
   const int64_t hk_n = q_in.shape[1];
   const int64_t ratio = hv_n / hk_n;
   const int64_t nitems = n * hv_n;
+  // KERNEL-GDN-CHUNKED-MIRROR D0/D3. One predicate, shared with every other
+  // backend (vt::GdnUseChunkedPrefill), so the CPU and CUDA arms cannot run
+  // different algorithms because only one of them read VT_GDN_CHUNKED. At f32
+  // this is false and the sequential recurrence below runs, because that is the
+  // only gated delta rule vLLM itself will execute at that dtype.
+  if (GdnUseChunkedPrefill(q_in.dtype)) {
+    // Upstream requires q, k and v to share one dtype (chunk.py:212) and its CPU
+    // kernel type-checks all three as bf16 (fla.cpp:2205-2207). Carry that
+    // rather than silently reading a mixed set through LoadF32.
+    VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+             "gdn_prefill: the chunked arm needs q/k/v in one dtype (bf16); "
+             "set VT_GDN_CHUNKED=0 for the sequential recurrence");
+    ForRows(nitems, [&](int64_t r0, int64_t r1) {
+      GdnChunkScratch sc(kGdnChunk, dk, dv);
+      for (int64_t item = r0; item < r1; ++item) {
+        const int64_t s = item / hv_n;
+        const int64_t hv = item % hv_n;
+        const int64_t hk = hv / ratio;
+        float* s_head = state.Ptr<float>() + (s * hv_n + hv) * dv * dk;
+        GdnChunkedHeadPrefill(out, q_in, k, v, g, beta, s_head, qslp[s], qslp[s + 1], hv, hk,
+                              hk_n, hv_n, dk, dv, args.scale, sc);
+      }
+    });
+    return;
+  }
   ForRows(nitems, [&](int64_t r0, int64_t r1) {
   std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
       vbuf(static_cast<size_t>(dv));
@@ -3117,10 +3492,12 @@ void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const 
       for (int64_t iq = 0; iq < qlen; ++iq) {
         const int64_t i = qqs + iq;      // global QUERY row
         const int64_t ii = qoffset + iq;  // this query's COMBINED intra-block offset
-        // Visible key range within the block (intra-block offsets [jlo,jhi]).
-        const int64_t jhi = causal ? ii : blen - 1;
-        int64_t jlo = 0;
-        if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+        // Visible key range within the block (intra-block offsets [jlo,jhi]),
+        // from the ONE shared bound (#2784): a NON-CAUSAL layer carrying a
+        // window attends SYMMETRICALLY within it rather than over everything.
+        const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, blen, causal, window);
+        const int64_t jhi = span.hi;
+        const int64_t jlo = span.lo;
         const int64_t qoff = (i * hq + h) * d;
         // Pass 1: scores + running max.
         float m = -std::numeric_limits<float>::infinity();
@@ -3196,9 +3573,9 @@ void DFlashPagedBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query,
       for (int64_t ii = 0; ii < blen; ++ii) {
         const int64_t i = qs + ii;          // global block-query row
         const int64_t ii_comb = C + ii;     // query offset in the combined sequence
-        const int64_t jhi = causal ? ii_comb : N - 1;
-        int64_t jlo = 0;
-        if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+        const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii_comb, N, causal, window);
+        const int64_t jhi = span.hi;
+        const int64_t jlo = span.lo;
         const int64_t qoff = (i * hq + h) * d;
         // Pass 1: scores + running max over combined keys [jlo, jhi].
         float m = -std::numeric_limits<float>::infinity();
@@ -3896,6 +4273,13 @@ struct Registrar {
     RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4Kernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    // The same kernel serves both ids: `EmbeddingKernel` already branches on
+    // `IsBlockQuant(table.dtype)` and decodes one row per id through
+    // `BlockToFloat`. Registering it under the quant id is what makes the CPU's
+    // block-gather capability VISIBLE to `OpRegistered`, which is how the GGUF
+    // residency policy asks the question without naming a device.
+    RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));

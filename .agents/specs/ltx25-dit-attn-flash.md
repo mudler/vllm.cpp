@@ -3068,12 +3068,19 @@ and the between-class gaps clear it anyway.
   reaches it: production is bf16, and the f32 arm is a parity reference exercised
   at the fixture's reduced dimensions (§5). Owner: this row, under
   [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
-- **`scripts/attention-rung-allowlist.txt` will carry two STALE stems.** Once
-  #1578 is on `main`, its checker sees the `// VT-ATTN-NAIVE:` markers this row
-  adds and reports `ltx2` and `ltx2_device` as `STALE (not a failure)`. Deleting
-  the two stems also edits that checker's pinned-set test, which is #1578's file
-  and not this row's, so it is left to whoever runs preflight next — the handoff
-  that allowlist's own header describes. Owner: this row until it is deleted.
+- **DISCHARGED 2026-09-01: `scripts/attention-rung-allowlist.txt` carries no
+  stem at all.** This bullet said "Owner: this row until it is deleted", and it
+  is deleted. The file's IN FLIGHT section is EMPTY, and its own header records
+  the removal by name: `ltx2` and `ltx2_device` were dropped under #1663 by the
+  preflight run this handoff was addressed to, once `90e8c3c85` (#1557, issue
+  #1549) swapped the device DiT forward to `vt::AttentionDenseFlash` and each
+  surviving `vt::Attention` call recorded its own `// VT-ATTN-NAIVE:` reason.
+  The pinned-set test `tests/scripts/test_check_attention_rung_consistency.py`
+  `::ShippedTreeTests::test_allowlist_holds_only_the_in_flight_stems` was
+  updated in that same change, which is the coupling this bullet flagged.
+  Verified by row `LTX25-ANCHOR-REPAIR`, spec
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §5, against the file rather
+  than against a report of it. Nothing is owed here.
 - **Most of the harness still runs nowhere but a lease.**
   `tests/scripts/test_ltx25_pixel_ab_harness.py` exercises the memory
   precondition and the arm-completeness check, which are extracted verbatim from

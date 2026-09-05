@@ -112,6 +112,67 @@ NpyInts ReadNpyInts(const std::string& path) {
 
 }  // namespace
 
+// #2840 — WHAT LICENSES THE BAR, made executable.
+//
+// `.agents/specs/kimi-linear.md` §589-591 records "ALL 8 prompts DETERMINISTIC
+// over K=3 -> STRICT token-exact gate" in prose. The capture that supports it is
+// committed and machine-readable, and nothing read it. This case does, with no
+// checkpoint and no GPU, so the bar the case below applies is selected by a
+// measurement rather than by a sentence.
+//
+// `greedy_dist.npy` is [N,T,K]: K independent greedy runs of the pinned oracle.
+// A cell holding more than one id is a cell the oracle cannot reproduce against
+// itself. Zero such cells is what `CLAUDE.md` §Gates requires before STRICT is
+// the bar, and it is equally what DENIES a distributional bar: that is licensed
+// "only when the oracle's greedy decode is non-deterministic".
+TEST_CASE("kimi-linear committed golden: the oracle is deterministic over K=3, so the bar is STRICT") {
+  const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / "kimi_linear_greedy";
+  REQUIRE_MESSAGE(fs::exists(gdir / "greedy_dist.npy"),
+                  "kimi-linear: the committed K-run capture is what selects the "
+                  "bar; without it neither STRICT nor a band is licensed");
+  const NpyInts dist = ReadNpyInts((gdir / "greedy_dist.npy").string());
+  REQUIRE(dist.shape.size() == 3);
+  const int64_t N = dist.shape[0], T = dist.shape[1], K = dist.shape[2];
+  REQUIRE(K > 1);
+
+  int64_t multi_cells = 0;
+  for (int64_t i = 0; i < N; ++i)
+    for (int64_t j = 0; j < T; ++j) {
+      const int64_t base = (i * T + j) * K;
+      for (int64_t k = 1; k < K; ++k)
+        if (dist.data[static_cast<size_t>(base + k)] !=
+            dist.data[static_cast<size_t>(base)]) {
+          ++multi_cells;
+          break;
+        }
+    }
+  std::fprintf(stderr,
+               "[fold-gate] oracle self-determinism over K=%lld runs: "
+               "%lld multi-valued (prompt,pos) cells of %lld\n",
+               static_cast<long long>(K), static_cast<long long>(multi_cells),
+               static_cast<long long>(N * T));
+  CHECK_MESSAGE(multi_cells == 0,
+                "kimi-linear: the oracle is NOT self-deterministic on this "
+                "capture; re-derive the bar, do not loosen it");
+
+  // The capture must be a capture OF the committed golden. Without this the
+  // determinism count is a property of an array rather than of the oracle whose
+  // ids the gate below compares against.
+  const NpyInts gold = ReadNpyInts((gdir / "greedy_ids.npy").string());
+  REQUIRE(gold.shape.size() == 2);
+  REQUIRE(gold.shape[0] == N);
+  REQUIRE(gold.shape[1] == T);
+  int64_t run0_mismatch = 0;
+  for (int64_t i = 0; i < N; ++i)
+    for (int64_t j = 0; j < T; ++j)
+      if (dist.data[static_cast<size_t>((i * T + j) * K)] !=
+          gold.data[static_cast<size_t>(i * T + j)])
+        ++run0_mismatch;
+  CHECK_MESSAGE(run0_mismatch == 0,
+                "kimi-linear: the K-run capture's first run does not reproduce "
+                "greedy_ids.npy, so the two artifacts describe different runs");
+}
+
 TEST_CASE("kimi fold-gate environment enables model and golden together") {
   const bool have_model = std::getenv("VT_KIMI_MODEL_DIR") != nullptr;
   const bool have_golden = std::getenv("VT_KIMI_GOLDEN_DIR") != nullptr;
@@ -232,9 +293,23 @@ TEST_CASE("kimi fold-gate reference: CLI-incremental battery on the real checkpo
   REQUIRE(total == prompts * steps);
   REQUIRE(steady_steps == prompts * (steps - 1));
   REQUIRE(steady_s > 0.0);
-  // Preserve the last independently measured coherent reference floor.  For
-  // the canonical 8x16 battery this is 122/128; scaling the integer inequality
-  // keeps deliberate smaller diagnostic subsets honest without rounding up.
-  CHECK(static_cast<int64_t>(matched) * 128 >=
-        static_cast<int64_t>(total) * 122);
+  // #2840 — THE BAR IS EXACTNESS, and it used to be a floor.
+  //
+  // What stood here was `matched * 128 >= total * 122`, which admits six wrong
+  // tokens in a 128-token battery. The case above measures the oracle
+  // reproducing itself exactly over K=3, and `CLAUDE.md` §Gates licenses a
+  // distributional bar "only when the oracle's greedy decode is
+  // non-deterministic". So 122/128 is a FAILING STRICT GATE, which is what this
+  // row's own spec has called it all along (`kimi-linear.md` §1295-1296, §1354),
+  // and not an "intrinsic near-tie profile".
+  //
+  // Exactness scales to a deliberate diagnostic subset without an inequality,
+  // which is what the floor was reaching for. The two admissible exits are
+  // 128/128, or an explicit ratification of a distributional bar over an oracle
+  // that reproduces itself. Do not tune this number.
+  CHECK_MESSAGE(matched == total,
+                "kimi-linear vs the committed golden: " << matched << "/" << total
+                << " tokens. The oracle is K=3 self-deterministic, so STRICT is "
+                   "the licensed bar and any mismatch fails it. Repair the "
+                   "forward or ratify a different bar; do not widen this.");
 }

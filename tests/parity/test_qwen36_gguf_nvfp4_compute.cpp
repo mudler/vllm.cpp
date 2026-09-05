@@ -61,6 +61,7 @@
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/sampling_params.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/platforms/interface.h"
 
 namespace fs = std::filesystem;
 
@@ -118,7 +119,7 @@ TEST_CASE("gguf nvfp4 moe: the 35B loader produces fp4-resident stacked "
   vllm::GgufFile g = vllm::GgufFile::Open(path);
   const vllm::HfConfig config = vllm::HfConfigFromGguf(g);
 
-  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
+  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
   pol.nvfp4_fp4 = true;
   int routed_fp4 = 0;
   int routed_total = 0;
@@ -288,7 +289,7 @@ TEST_CASE("gguf nvfp4 moe: VT_GGUF_NVFP4_FP4=0 restores the bf16 expansion") {
   }
   vllm::GgufFile g = vllm::GgufFile::Open(path);
   const vllm::HfConfig config = vllm::HfConfigFromGguf(g);
-  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
+  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
   pol.nvfp4_fp4 = false;
   pol.nvfp4_w4a4 = false;
   const vllm::Qwen3_5MoeWeights w =

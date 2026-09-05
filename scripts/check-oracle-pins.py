@@ -15,17 +15,40 @@ pin. This checker is what stops that rule decaying into prose:
     that is a path EXISTING IN THIS TREE. An issue number is a promise of a
     measurement, so it is refused here and required in the other direction:
     `gateable = no` must name the issue that owes it, which is what keeps an
-    ungateable lane visible debt instead of a mid-campaign discovery.
+    ungateable lane visible debt instead of a mid-campaign discovery;
+  * the `vllm` record's `pin` and `pin_label` AGREE with the ```parity-pin
+    block in `.agents/upstream-sync.md`, which is the authority (#2829).
+
+THE PARITY RECONCILIATION, because it reverses what this docstring used to say.
+
+Until #2829 this file argued that comparing the two surfaces would "BLESS the
+duplication, not remove it", and declined to. That reasoning is right about the
+FIX and it left the hole open in the meantime: with `upstream-sync.md` advanced
+and `oracles/vllm.md` rolled back to the prior revision, this checker,
+`tests/tools/test_oracle_pin` and `check-agent-record.py` were all measured
+GREEN over a tree whose two pin surfaces named different vLLM commits. A pin
+advance is exactly the edit that leaves one surface behind, and the value had
+not moved since 2026-07-26, so the drift had never had an opportunity to appear.
+
+So the rule below is the INTERIM, and it says which file is authoritative rather
+than syncing two equals. The expectation is read from `upstream-sync.md`; the
+value under test is read from `oracles/vllm.md`; an anchor checker that read its
+expectation out of the file it checks would be a tautology. Removing the copy
+altogether is still the better fix and is still available on top of this: see
+`.agents/specs/oracle-pin-parity-reconcile.md` for why it needs a per-id
+exemption from `REQUIRED_KEYS` that this change did not take.
+
+It is scoped to `vllm.md` BY FILENAME STEM. Every other oracle holds its pin
+only in its own file and has no `parity-pin` counterpart, so a registry-wide
+version of this rule would fail all thirteen of them for being correct.
 
 WHAT IT DOES NOT DO, so nobody cites it for more than it delivers:
 
   * It does not verify that a pin EXISTS upstream. It is deliberately
     network-free — a gate that fails when GitHub is unreachable fails on the
     wrong thing. A fabricated 40-hex string passes shape and fails review.
-  * It does not read the vLLM parity pin out of `upstream-sync.md` and compare
-    it to `vllm.md`. Two transcriptions of one value is the drift this registry
-    exists to stop; `vllm.md` says so in prose and points there. Teaching the
-    checker to sync them would BLESS the duplication, not remove it.
+  * It does not REMOVE the duplication it now reconciles. `oracles/vllm.md`
+    still stores a literal, and a checked copy is weaker than no copy.
   * The `**Secondary oracle:**` declaration check is OPT-IN by syntax. A spec
     that merely mentions llama.cpp in prose is not scanned, because a checker
     that fired on the word "SGLang" would go red on hundreds of files that are
@@ -48,6 +71,10 @@ ROOT = Path(__file__).resolve().parents[1]
 ORACLES = ROOT / ".agents/oracles"
 AGENTS_MD = ROOT / "AGENTS.md"
 DECLARATION_ROOTS = (ROOT / ".agents",)
+# The AUTHORITY for the vLLM revision. `tools/bench/serve_low_common.py` reads
+# this same block and `tools/bench/online_gate.py` refuses a mismatched oracle
+# on it, so it is what a measurement actually ran against.
+UPSTREAM_SYNC = ROOT / ".agents/upstream-sync.md"
 
 REQUIRED_KEYS = (
     "id",
@@ -64,6 +91,15 @@ REQUIRED_KEYS = (
 PRIMARY_ID = "vllm"
 
 BLOCK = re.compile(r"^```oracle-pin\n(.*?)^```", re.M | re.S)
+PARITY_BLOCK = re.compile(r"^```parity-pin\n(.*?)^```", re.M | re.S)
+# Mirrors `tools/bench/serve_low_common.py:_PIN_FIELDS`. Kept as a shape rule
+# here and not imported: this checker must run with no `tools/` on the path.
+PARITY_FIELDS = (
+    "vllm_commit",
+    "vllm_runtime_version",
+    "vllm_distribution_version",
+    "flashinfer_version",
+)
 FIELD = re.compile(r"^([a-z_]+)\s*=\s*(.*)$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ISSUE_REF = re.compile(r"^#\d+$")
@@ -149,6 +185,100 @@ def check_record(record: Record, errors: list[str]) -> None:
         errors.append(
             f"{name}: gateable = no must name the owing issue as `#N`, got {evidence!r}"
         )
+
+
+def parse_parity_pin(label: str, text: str, errors: list[str]) -> dict[str, str] | None:
+    """Extract the one ```parity-pin block from *text*, the pin's AUTHORITY.
+
+    FAILS CLOSED on every defect -- no block, two blocks, an unparsable line, an
+    unknown key, a duplicate key, an empty value, a missing key. A rule that
+    silently stops checking when it cannot find its expectation is a mute
+    switch, and this repository has shipped one of those before.
+    """
+    blocks = PARITY_BLOCK.findall(text)
+    if len(blocks) != 1:
+        errors.append(
+            f"{label}: expected exactly one ```parity-pin block, found {len(blocks)} "
+            "-- it is the authority the vllm oracle record is reconciled against"
+        )
+        return None
+    fields: dict[str, str] = {}
+    for line_no, line in enumerate(blocks[0].splitlines(), 1):
+        if not line.strip():
+            continue
+        match = FIELD.match(line)
+        if match is None:
+            errors.append(f"{label}: parity-pin line {line_no} is not `key = value`: {line!r}")
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        if key not in PARITY_FIELDS:
+            errors.append(f"{label}: parity-pin carries unknown key {key!r}")
+            continue
+        if key in fields:
+            errors.append(f"{label}: duplicate key {key!r} in parity-pin block")
+        if not value:
+            errors.append(f"{label}: parity-pin key {key!r} is empty")
+            continue
+        fields[key] = value
+    for key in PARITY_FIELDS:
+        if key not in fields:
+            errors.append(f"{label}: parity-pin block omits {key!r}")
+    return fields
+
+
+def public_version(version: str) -> str:
+    """The PEP 440 public version: everything before the `+local` segment.
+
+    setuptools-scm builds the pinned oracle's version as `<public>+g<sha>`, so
+    `0.28.1rc1.dev132+ge126687a9` has the public version `0.28.1rc1.dev132`.
+    A build from a tag carries no local segment and `partition` returns the
+    whole string, which is the degenerate case this rule wants.
+    """
+    return version.partition("+")[0]
+
+
+def check_parity_reconciliation(
+    record: Record | None, parity: dict[str, str] | None, errors: list[str]
+) -> None:
+    """Reconcile the vllm record's `pin`/`pin_label` against the AUTHORITY.
+
+    *parity* comes from `.agents/upstream-sync.md` and *record* from
+    `.agents/oracles/vllm.md`. The expectation is a PARAMETER and this function
+    opens no file, which is what stops it degenerating into a checker that reads
+    its expectation out of the same file it is checking.
+
+    `pin_label` is compared to the PUBLIC part of `vllm_runtime_version`, by
+    equality after that decomposition and NOT by prefix. A `startswith` rule
+    would accept `0.28.1rc1.dev13`, a truncated and wrong label that is
+    nevertheless a prefix of the right one.
+    """
+    if record is None:
+        errors.append(
+            f"{PRIMARY_ID}.md: the parity reconciliation could not read the primary "
+            "oracle record, so the pin is unchecked against .agents/upstream-sync.md"
+        )
+        return
+    if parity is None:
+        return  # parse_parity_pin already reported why, and it reported it once.
+
+    authority = UPSTREAM_SYNC.name
+    name = record.path.name
+    commit = parity.get("vllm_commit")
+    if commit and record.fields.get("pin") != commit:
+        errors.append(
+            f"{name}: pin {record.fields.get('pin')!r} does not match "
+            f"{authority} vllm_commit {commit!r} -- the parity-pin block is the "
+            "authority, and this record restates it"
+        )
+    runtime = parity.get("vllm_runtime_version")
+    if runtime:
+        expected = public_version(runtime)
+        if record.fields.get("pin_label") != expected:
+            errors.append(
+                f"{name}: pin_label {record.fields.get('pin_label')!r} does not match "
+                f"the public version {expected!r} of {authority} "
+                f"vllm_runtime_version {runtime!r}"
+            )
 
 
 def agents_registry_ids(text: str, errors: list[str]) -> list[str]:
@@ -253,8 +383,114 @@ FIXTURES: tuple[tuple[str, str, bool], ...] = (
 )
 
 
+# The parity reconciliation's own corpus, swept in both directions beside the
+# one above. It is separate because the rule is CROSS-FILE: every case pairs a
+# synthetic authority with a synthetic record, so none of it moves when the real
+# pin advances.
+_PARITY_RECORD = """```oracle-pin
+id = vllm
+role = primary
+upstream = https://github.com/vllm-project/vllm
+scope = everything vLLM implements
+pin = 1111111111111111111111111111111111111111
+pin_label = 9.9.9rc1.dev1
+pinned_on = 2026-09-04
+gateable = yes
+evidence = AGENTS.md
+```
+"""
+
+_PARITY_SYNC = """```parity-pin
+vllm_commit = 1111111111111111111111111111111111111111
+vllm_runtime_version = 9.9.9rc1.dev1+g1111111111
+vllm_distribution_version = 9.9.9rc1.dev1+g1111111111.precompiled
+flashinfer_version = 0.6.18
+```
+"""
+
+PARITY_FIXTURES: tuple[tuple[str, str, str, bool], ...] = (
+    ("agree", _PARITY_RECORD, _PARITY_SYNC, False),
+    # The #2829 shape: the authority advanced and the record did not.
+    (
+        "stale pin",
+        _PARITY_RECORD.replace(
+            "pin = 1111111111111111111111111111111111111111",
+            "pin = 2222222222222222222222222222222222222222",
+        ),
+        _PARITY_SYNC,
+        True,
+    ),
+    ("stale label", _PARITY_RECORD.replace("9.9.9rc1.dev1", "9.8.0"), _PARITY_SYNC, True),
+    # A PROPER PREFIX of the right label. A substring rule accepts this one.
+    (
+        "truncated label",
+        _PARITY_RECORD.replace("9.9.9rc1.dev1", "9.9.9rc1.dev"),
+        _PARITY_SYNC,
+        True,
+    ),
+    # The full runtime string, local segment included, is NOT the label.
+    (
+        "label carries the local segment",
+        _PARITY_RECORD.replace(
+            "pin_label = 9.9.9rc1.dev1", "pin_label = 9.9.9rc1.dev1+g1111111111"
+        ),
+        _PARITY_SYNC,
+        True,
+    ),
+    # A tagged build reports a bare public version, and the rule degrades to
+    # plain equality rather than going red on a correct authority.
+    (
+        "authority with no local segment",
+        _PARITY_RECORD,
+        _PARITY_SYNC.replace(
+            "vllm_runtime_version = 9.9.9rc1.dev1+g1111111111",
+            "vllm_runtime_version = 9.9.9rc1.dev1",
+        ),
+        False,
+    ),
+    ("no parity block", _PARITY_RECORD, "# nothing here\n", True),
+    ("two parity blocks", _PARITY_RECORD, _PARITY_SYNC + _PARITY_SYNC, True),
+    (
+        "unparsable parity line",
+        _PARITY_RECORD,
+        _PARITY_SYNC.replace("flashinfer_version = 0.6.18", "flashinfer 0.6.18"),
+        True,
+    ),
+    (
+        "unknown parity key",
+        _PARITY_RECORD,
+        _PARITY_SYNC.replace("flashinfer_version = 0.6.18", "torch_version = 2.13.0"),
+        True,
+    ),
+    (
+        "empty parity value",
+        _PARITY_RECORD,
+        _PARITY_SYNC.replace(
+            "vllm_commit = 1111111111111111111111111111111111111111", "vllm_commit ="
+        ),
+        True,
+    ),
+    ("no record", "# no oracle-pin block\n", _PARITY_SYNC, True),
+)
+
+
+def parity_errors(record_text: str, sync_text: str) -> list[str]:
+    """Only the reconciliation's own complaints, for one synthetic pair."""
+    errors: list[str] = []
+    record = parse_record(Path(f"{PRIMARY_ID}.md"), record_text, [])
+    parity = parse_parity_pin(UPSTREAM_SYNC.name, sync_text, errors)
+    check_parity_reconciliation(record, parity, errors)
+    return errors
+
+
 def self_test() -> int:
     failures: list[str] = []
+    for name, record_text, sync_text, bad in PARITY_FIXTURES:
+        errors = parity_errors(record_text, sync_text)
+        reported = bool(errors)
+        if reported != bad:
+            verb = "was not reported" if bad else "was reported"
+            failures.append(f"parity fixture {name!r} {verb}: {errors}")
     for name, text, bad in FIXTURES:
         errors: list[str] = []
         record = parse_record(Path(name), text, errors)
@@ -266,10 +502,14 @@ def self_test() -> int:
             failures.append(f"fixture {name} {verb}: {errors}")
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)
+    total = len(FIXTURES) + len(PARITY_FIXTURES)
     if failures:
-        print(f"self-test FAILED ({len(failures)} of {len(FIXTURES)})", file=sys.stderr)
+        print(f"self-test FAILED ({len(failures)} of {total})", file=sys.stderr)
         return 1
-    print(f"self-test ok ({len(FIXTURES)} fixtures)")
+    print(
+        f"self-test ok ({len(FIXTURES)} record fixtures, "
+        f"{len(PARITY_FIXTURES)} parity fixtures)"
+    )
     return 0
 
 
@@ -297,6 +537,27 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[str] = []
     agents_ids = agents_registry_ids(agents_text, errors)
     errors.extend(check_registry(files, agents_ids))
+
+    # The parity reconciliation (#2829). Scoped to the primary record BY
+    # FILENAME STEM: no other oracle has an external authority, and a
+    # registry-wide version of this rule would fail every one of them.
+    primary_path = ORACLES / f"{PRIMARY_ID}.md"
+    # check_registry already reported any parse defect in this file; a second
+    # parse into a scratch list is how the record is obtained without printing
+    # the same complaint twice.
+    primary = (
+        parse_record(primary_path, files[primary_path], [])
+        if primary_path in files
+        else None
+    )
+    try:
+        sync_text = UPSTREAM_SYNC.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"{UPSTREAM_SYNC.name}: the parity pin authority is unreadable: {error}")
+        parity = None
+    else:
+        parity = parse_parity_pin(UPSTREAM_SYNC.name, sync_text, errors)
+    check_parity_reconciliation(primary, parity, errors)
 
     registry_ids = {path.stem for path in files}
     declarations = {

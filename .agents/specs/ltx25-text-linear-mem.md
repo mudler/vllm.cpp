@@ -214,21 +214,56 @@ paragraph describes the plan rather than what shipped.
   (`check-symbol-anchors.py:87-90`) requires a literal `::` between the path and
   a C++ identifier, so it cannot match `path:line` at all. Counted over every
   `.md` in this tree with the checker's own pattern against the line-anchor
-  form: **613 `path::Symbol` citations and 14,448 `path:line` citations**, of
-  which the second number is checked by nothing. That is how the wrong
-  `cpu_ops.cpp:125` in this row's own records survived the implementation
+  form: **613 `path::Symbol` citations and 14,448 `path:line` citations** at
+  `8d46223fd`, of which the second number is checked by nothing. That is how the
+  wrong `cpu_ops.cpp:125` in this row's own records survived the implementation
   commit, the merge, and the gate. Extending the checker needs its own spec and
   its own red-first mutation and is not attempted here — the 24:1 ratio is the
   reason it deserves one rather than a follow-up line.
-- **The `cpu_ops.cpp:125` anchor cannot be corrected in `.agents/issue-index.md`.**
-  Row `#1286` at `issue-index.md:423` cites `cpu_ops.cpp:125` twice for
-  `static thread_local std::vector<float> af`, which is at **line 130**; `:125`
-  is `const int64_t blck_1 = 16;`. The index is append-only and keyed, and its
-  checker reads commits rather than the working tree, so the row cannot be
-  edited and a corrective row would be a duplicate key. **The correction lives
-  here and in the pull request body**, which is where a reader following the row
-  arrives. The same wrong anchor is frozen in the two commit bodies of
-  `0377cde70` and `8d46223fd` for the same reason.
+
+  **Re-measured 2026-09-01 at `ed5ecea2e`: 998 and 20,557 over 983 `.md` files,
+  a 21:1 ratio.** Both numbers are stamped with the tree they were read on,
+  because a bare count in a document is a drift lock: every later change makes
+  it wrong and nothing tells the next reader which count is the measurement.
+  Nine hundred more line anchors landed in the twelve days between the two
+  readings and the gap did not narrow. Row `LTX25-ANCHOR-REPAIR` resolved the
+  1,708 of them that live in the `ltx25-*` specs at `855905f59` and returned the checker
+  extension as `NEEDS_DECISION` rather than taking it, for the reason this
+  bullet gives and for one more that is design rather than budget: a bare line
+  number carries no claim, so a checker for it has no expectation to check
+  against, and #911 already shipped that mistake -- an anchor gate reading its
+  expectation out of the file it checked reported 27/27 FRESH while five anchors
+  pointed at unrelated code. What the expectation SHOULD be is the row's
+  question, not its implementation detail. See
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §"Scope".
+- **The `cpu_ops.cpp:125` anchor cannot be corrected in the index, and BOTH the
+  reason and the correction have since changed.** Row `#1286` cites
+  `cpu_ops.cpp:125` twice for `static thread_local std::vector<float> af`; `:125`
+  was `const int64_t blck_1 = 16;`. What this bullet originally said -- that the
+  index is append-only and keyed, that its checker reads commits rather than the
+  working tree, and that a corrective row would be a duplicate key -- is no
+  longer the operative reason. `.agents/issue-index.md` was RETIRED: the index is
+  derived at read time by `scripts/agent-issue-index.py --refresh`, and the old
+  file moved to `.agents/completed/issue-index.md`. It is unreachable now because
+  it is the FROZEN ARCHIVE -- AGENTS.md `## Records` keeps an archived
+  document's provenance and `check-symbol-anchors.py`'s `FROZEN_PREFIXES` agrees
+  -- so rewriting that row would forge what a past session wrote. Same
+  conclusion, different rule, and the difference matters because the old rule
+  would have permitted an appended corrective row and this one does not.
+
+  **The correction this bullet recorded is itself now stale**, which is the
+  defect it was written about. `af` is not at line 130 either: it is at line
+  **225**, moved by the dtype-dispatch hoist out of `LoadF32`'s per-element path.
+  A correction spelled as a line number expires, so the correction is restated
+  in the form AGENTS.md and `scripts/check-symbol-anchors.py` both ask for and
+  that the existing gate actually checks: the buffer is the `af` tile inside
+  `src/vt/cpu/cpu_ops.cpp::MatmulOneChunk`, one per `kBT` instantiation. That
+  survives every edit which does not rename the function, and a rename is
+  exactly when a reader wants the citation to break. Restated by row
+  `LTX25-ANCHOR-REPAIR`, spec
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §4. The wrong anchor stays
+  frozen in the two commit bodies of `0377cde70` and `8d46223fd`, which is Git
+  history and is not editable by anyone.
 - **Linux-only registration is a calibration and toolchain scope, not a `/proc`
   dependency.** The counter reads nothing under `/proc` and the threadpool is
   portable. Three things bind it instead. The gate needs every `delete` in the
@@ -248,6 +283,16 @@ paragraph describes the plan rather than what shipped.
   `MemTotal` — beside `rss = 0.001` for a child that had just started. A column
   that reads 31.553 GiB before the process has allocated anything is
   system-wide by construction, whatever line of `runguard.py` computes it.
+
+  **Confirmed UNCORRECTABLE 2026-09-01 by row `LTX25-ANCHOR-REPAIR`**
+  ([`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §6), and the reason is
+  sharper than "unstable". No revision of that file is pinned anywhere in this
+  repository, so there is no text the citation can be resolved against in either
+  direction: this is not a number that needs correcting, it is a citation with
+  no denominator. Naming a symbol instead would not help, because the symbol
+  would be unresolvable for the same reason. The substitute evidence above is
+  what the claim rests on and it is retained in-tree, which is the disposition
+  that actually holds.
 
 ## Now
 

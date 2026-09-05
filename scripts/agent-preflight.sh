@@ -40,7 +40,10 @@
 # anything was skipped, and it does not change what any gate demands or what a
 # plain run reports. Ask for it when a skip must not read as success.
 #
-# It never writes anything, so it is always safe to run.
+# It writes NOTHING into the source tree. The compile gate below configures a
+# CMake build directory under the system temporary directory and removes it
+# again, because reading a build's real flags is the only way to compile with
+# them; nothing else here writes at all. It is still always safe to run.
 
 set -uo pipefail
 
@@ -60,7 +63,18 @@ FAIL_ON_SKIP=0
 # Checkers the range and trailer blocks below invoke WITH arguments. The
 # discovered sweep skips these names so a gate that already ran properly is not
 # re-run bare and reported as a usage skip.
-NAMED_CHECKERS="check-agent-record.py check-commit-style.py check-commit-trailers.py check-now-current.py"
+#
+# check-tree-compiles.py is here for a HARDER reason than tidiness, and it is
+# here because the omission cost a run. The sweep runs every `scripts/check-*.py`
+# bare, so a name missing from this list executes TWICE. For the four names above
+# the second run is a cheap usage error. For this one it is a second full
+# `-fsyntax-only` pass at -j8: measured 65 s, 39 units and 531 MB RSS on a branch
+# behind main, started while the first pass had just finished, on a box already
+# at load 157 from other agents' builds. The run it was added to died there
+# without writing an exit line. Parallel builds have OOM-killed this box before,
+# and a gate that spawns a second copy of its own compiler is that hazard wearing
+# a checker's name.
+NAMED_CHECKERS="check-agent-record.py check-commit-style.py check-commit-trailers.py check-now-current.py check-tree-compiles.py"
 # ON by default: an undeclared session is a FAILING gate. The mutation suite
 # anchors on THIS line (`^REQUIRE_ROLE=1$`) and refuses any line-anchored
 # assignment of zero, quoted or not, so a silent revert of the default goes red
@@ -95,6 +109,10 @@ CHECKERS=(
   check-container-matrix
   check-container-workflow
   check-build-runtime-deps
+  # A lease script that keeps its ccache cache on the CIFS share reads as
+  # compliance and caches nothing: symlink(2) is EOPNOTSUPP there, so every
+  # lock fails and `ccache -s` shows zero of everything (#2473).
+  check-lease-ccache
   check-role-discipline
   claim-view
   check-readme-structure
@@ -107,6 +125,7 @@ CHECKERS=(
   check-attention-rung-consistency
   check-fp4-resident-consistency
   check-cuda-op-arch-gate
+  check-rocm-dp4a-intrinsic
   check-runner-routing-consistency
   check-surface-coverage
   check-test-registration
@@ -131,6 +150,7 @@ SUITES=(
   test_check_container_matrix
   test_check_container_workflow
   test_check_build_runtime_deps
+  test_check_lease_ccache
   test_validate_container_image
   test_release_index
   test_release_metadata
@@ -156,6 +176,7 @@ SUITES=(
   test_check_attention_rung_consistency
   test_check_fp4_resident_consistency
   test_check_cuda_op_arch_gate
+  test_check_rocm_dp4a_intrinsic
   test_check_runner_routing_consistency
   test_check_surface_coverage
   test_check_test_registration
@@ -171,13 +192,28 @@ SUITES=(
   test_agent_issue_index
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
+  test_rocm_strix_ourarm_staged
+  # The TOKENGATE job's build stage (#2895). `--no-build-isolation` makes pip
+  # skip the pin's [build-system] requires, so the harness has to install them
+  # itself, and the hand-kept list it used had drifted three names behind the
+  # pin. That cost a dgx lease and a queue position for a 3-second traceback.
+  # Bash and the standard library over one committed script: no GPU, no lease,
+  # no toolchain, no network, and nothing in it can skip.
+  test_tokengate_buildreq
   test_check_conflict_markers
+  test_check_tree_compiles
   test_prepush_checker_names
   test_ab_arms_differ
   test_ltx25_pixel_ab_harness
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
   test_ltx2_oracle_goldens
+  # The latent-dump driver's own controls (#2514). Nothing executed that file,
+  # so an incomplete rename (`raw_bf16` for `raw_native`) killed every control
+  # in it with an uncaught KeyError, and its frame check passed on ZERO decoded
+  # frames. Both were catchable with no GPU, no torch and no weights; neither
+  # was caught, and both reached a queued dgx lease.
+  test_ltx2_latent_dump
   test_tower_skip_rss_report
   # The other half of that harness: `run_arm`, its readiness poll and its
   # teardown, against a fake server on a scratch port (#1844). The reporter
@@ -423,6 +459,42 @@ else
     "numpy is not importable here, and the tool this suite exercises needs it." \
     "CI installs python3-numpy and runs the same suite."
 fi
+# THE PROMPT-ADHERENCE SUITE (#2295, owning #1854's first sub-question),
+# registered in the SAME change that adds it, for the reason the paragraph above
+# records. It exercises the third half of this tool: not "are these two renders
+# the same" and not "does this render have artefacts in it", but "does it depict
+# what was asked for".
+#
+# Same numpy condition and the same SKIP-never-ok discipline. FIVE of its 47
+# cases need the pinned CLIP checkpoint and skip themselves, individually, with
+# their own reason when `VT_LTX25_ADHERENCE_MODEL` is unset -- the other 42
+# need numpy and nothing else, no checkpoint, no network and no GPU, because
+# every bound they check is arithmetic over a score matrix the case builds.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_prompt_adherence" python3 tests/scripts/test_ltx25_prompt_adherence.py
+else
+  skip "test_ltx25_prompt_adherence" \
+    "numpy is not importable here, and the tool this suite exercises needs it." \
+    "CI installs python3-numpy and runs the same suite."
+fi
+# THE DIAGNOSIS THAT DECIDED WHETHER THE SMOOTHNESS CAUSES THE ADHERENCE GAP
+# (`LTX25-ADHERENCE-DETAIL-LOSS`, #2513). The row published a NEGATIVE result --
+# the spectrum says our render is not smoother, the within-render correlation
+# points the wrong way, and blurring the reference does not reproduce the gap --
+# and a negative result is the shape a BROKEN instrument produces for free. So
+# every case feeds a part of that instrument a signal whose answer is known in
+# closed form, and several assert it moves in the direction the falsified
+# hypothesis would have needed. Two of them were red on arrival and found real
+# defects: an empty radial bin read as "below unity" and pushed the crossover
+# upward, and a colour fixture measured luma's channel mixing rather than the
+# gamma fit. numpy only -- no checkpoint, no frames, no network, no GPU.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_adherence_detail_loss" python3 tests/scripts/test_ltx25_adherence_detail_loss.py
+else
+  skip "test_ltx25_adherence_detail_loss" \
+    "numpy is not importable here, and every case computes over arrays." \
+    "CI installs python3-numpy and runs the same suite."
+fi
 # THE GLM-5.3-Flash GGUF CONVERTER (#2011). Same shape and the same one
 # dependency: `scripts/convert-glm5-next-gguf.py` deliberately does not use
 # gguf-py -- upstream has no `glm5_next` and, decisively, `gguf.quants.Q2_K`
@@ -492,11 +564,24 @@ run "tools suites" python3 -m unittest discover -s tests/tools -t . -p "test_*.p
 #
 # This block used to name five: check-agent-record, check-commit-style,
 # check-commit-trailers, check-issue-index-append-only and check-now-current.
-# There are 42. "All gates green." therefore described 12% of the gates, and the
-# other 37 reached the working tree only where their own test suite happened to
-# call them against the real ROOT -- a property of the test, not of the gate
-# (#467). A named list is also the record-lock shape AGENTS.md §Records forbids:
-# every new checker would have to edit one shared line here.
+# scripts/ holds many more than five. "All gates green." therefore described a
+# small minority of the gates, and every checker the list omitted reached the
+# working tree only where its own test suite happened to call it against the real
+# ROOT -- a property of the test, not of the gate (#467).
+#
+# How many is deliberately not written here. A count of one file stored inside
+# another goes stale on an edit whose author never reads this line, and it
+# couples every unrelated change to a line it does not own, which AGENTS.md
+# §Records forbids. This comment carried `There are 42.` and it was wrong twice
+# over: `7dc2ef1ea` took the directory to 41, and later checkers have since put
+# it back at 42, so the stale line happened to read true again for a reason
+# nobody intended.
+#
+# `check-issue-index-append-only` above is history, not a file. `7dc2ef1ea`
+# deleted it together with the append-only issue index it gated. The loop below
+# discovers whatever scripts/check-*.py holds today, which is the point, and a
+# named list is the same record-lock shape: every new checker would have to edit
+# one shared line here.
 #
 # A checker that needs arguments this block cannot supply is a SKIP carrying the
 # reason, never silence. The argparse USAGE TEXT is what distinguishes that case,
@@ -544,15 +629,69 @@ else
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}: empty, HEAD adds no commits."
 fi
 
+# DOES THE TREE COMPILE? Nothing above this line asks (#2401).
+#
+# Every gate above validates a record, a document, an anchor or a trailer
+# against a tree, and every one of them passes on a tree that does not build.
+# `main` was pushed twice on 2026-08-31 in exactly that state -- `5263ac31f`, a
+# shell line continuation inside a `//` comment that `-Wcomment` under this
+# tree's `-Werror` rejects, and `08fa2f5aa` (#2395), `MlaSharedSelection*` bound
+# to a `vt::Tensor*` parameter -- with this script green both times. CI compiles
+# four ways and would have caught both, up to two hours after the push, and both
+# landed by a direct push. So the missing verdict is not "does anything build",
+# it is "does anything build BEFORE the push".
+#
+# It is diff-scoped, and the scope is the only reason this is affordable: over
+# the 60 commits ending at 9fa3be388, 30 touch no C++ at all and cost nothing
+# here, 20 reach 1-4 translation units, and the worst reaches 783. A full build
+# is ~12 minutes and 9.4 GiB, which is a gate that fires on ordinary work.
+#
+# THREE states, and the third is not a pass. The checker exits 2 when it could
+# not take the measurement -- no cmake, a failed configure, a base that does not
+# resolve -- and that maps onto SKIP, which forfeits the banner below and exits
+# 1 under --fail-on-skip. It is NOT mapped onto FAIL, because a box without a
+# compiler is not a defective change; and it is NOT mapped onto ok, because
+# nothing was verified.
+#
+# BASE_SHA is passed when it resolved, and the REF when it did not, so the
+# checker reports the unresolvable base in its own words rather than being
+# handed an empty string that would read as an empty diff.
+#
+# The notice prints BEFORE the run, and it is not decoration. Every other gate
+# here finishes in under a few seconds, so `run()` captures output and shows
+# only a label. This one can take minutes on a wide header change, and a silent
+# multi-minute gate in a list of one-second gates reads as a hang.
+echo "Tree compiles:"
+printf '       compiling what this change reaches. A records-only change returns\n'
+printf '       at once; a wide header change can take minutes.\n'
+compile_output="$(python3 scripts/check-tree-compiles.py --base "${BASE_SHA:-$BASE_REF}" 2>&1)"
+# Read from the ASSIGNMENT, never after a pipe: `$?` after `cmd | head` is
+# head's status, and a failing gate then reports rc=0.
+compile_status=$?
+case "$compile_status" in
+  0)
+    printf '  \033[32mok\033[0m   tree-compiles\n'
+    printf '%s\n' "$compile_output" | tail -1 | sed 's/^/         /'
+    ;;
+  2)
+    skip "tree-compiles" "$compile_output"
+    ;;
+  *)
+    printf '  \033[31mFAIL\033[0m tree-compiles\n'
+    printf '%s\n' "$compile_output" | sed 's/^/         /' | head -40
+    failed+=("tree-compiles")
+    ;;
+esac
+
 # Trailer enforcement reads only committed Git objects.
 #
 # The ancestry arm is the one #998 was filed for. It USED to be spelled as a
 # silent `&&` in the condition, so a base that was not an ancestor deleted both
-# gates from the report and the run still printed "All gates green.". The guard
-# itself stays, because check-commit-style.py refuses a non-ancestor base at
-# validate_range (#999 owes that repair, and until it lands, dropping the guard
-# would turn every branch behind main RED instead of honest). What changes is
-# that the skip now SAYS SO and costs the banner.
+# gates from the report and the run still printed "All gates green.". The SKIP
+# arm that replaced it is gone now (#2366): check-commit-style.py walks from
+# the merge base, and `rev-list ${BASE_SHA}..HEAD` selects the branch's own
+# commits under any ancestry, so a branch behind the base runs both gates
+# instead of being told to merge first.
 if [ -z "$BASE_SHA" ]; then
   echo "Commit trailers vs ${BASE_REF}:"
   skip "commit-trailers" "$BASE_UNRESOLVED"
@@ -561,13 +700,6 @@ elif [ "$ANCESTRY_STATUS" -gt 1 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   skip "commit-trailers" "$ANCESTRY_UNKNOWN"
   skip "commit-style" "$ANCESTRY_UNKNOWN"
-elif [ "$ANCESTRY_STATUS" -ne 0 ]; then
-  echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
-  TRAILER_BEHIND="${BASE_REF} ${BASE_SHA} is not an ancestor of HEAD, so this
-branch is behind it and the trailer gates did NOT run. Merge ${BASE_REF} and
-rerun. Neither gate reported anything about this tree."
-  skip "commit-trailers" "$TRAILER_BEHIND"
-  skip "commit-style" "$TRAILER_BEHIND"
 elif [ "$RANGE_STATUS" -ne 0 ] || [ "$RANGE_NUMERIC" -eq 0 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   skip "commit-trailers" "$RANGE_UNKNOWN"
@@ -617,7 +749,8 @@ fi
 
 # Reachable ONLY when both arrays are empty. A skip used to survive this line,
 # which made the banner a claim the run had not earned (#998). The DEFAULT exit
-# status stays 0 for a skip: a branch behind origin/main is ordinary work, and
+# status stays 0 for a skip: a checkout whose base does not resolve is ordinary
+# work, and
 # exit 1 would merge "a gate did not run" into the signal that means "a gate ran
 # and failed". A caller that cannot read the report asks for --fail-on-skip.
 if [ "${#skipped[@]}" -eq 0 ]; then

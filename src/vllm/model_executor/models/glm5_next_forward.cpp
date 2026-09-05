@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>  // std::getenv
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -14,10 +15,44 @@
 #include "vllm/model_executor/models/glm5_next_diag.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
 #include "vllm/model_executor/models/glm5_next_moe.h"
-#include "vt/dtype.h"  // vt::DeviceType
+#include "vt/backend.h"      // vt::TryGetBackend
+#include "vt/op_provider.h"  // vt::OpRegistered
+#include "vt/dtype.h"    // vt::DeviceType
 
 namespace vllm::glm5_next {
 namespace {
+
+// W9c-3a's device split is OPT-IN and DEFAULTS OFF, and the reason is a
+// measurement rather than caution.
+//
+// Driven on `dgx:gpu0` against the real 101.24 GiB UD-Q2_K_XL artifact, all three
+// `--device cuda` legs died with **SIGSEGV** (rc=139) having emitted no token,
+// where `origin/main` produced a clean named refusal in 1066 s. The crash is
+// reproducible (3 of 3, against 3 of 3 CPU legs emitting ` Paris.` on the same
+// binary, interleaved) and it appears only in the MIXED residency state this
+// row's per-layer fit guard creates: each leg logged the device arm engaging
+// for one layer and then `DeviceBanksFit` declining a later one, and died after
+// that. 94.6758 GiB of expert banks do not fit beside the KV pool and the GGUF
+// page cache on a 119 GiB box, which was always the risk; what is broken is the
+// FALLBACK that was supposed to make that safe.
+//
+// Turning a clean refusal into a segfault is strictly worse for a user, so the
+// default is restored to exactly what it was and the arm is reachable only when
+// asked for by name. The mechanism is not diagnosed -- O46 records the three
+// hypotheses already killed, so the next wave does not spend a lease re-killing
+// them -- and shipping a guessed fix for a defect that cannot be reproduced off
+// the box is the failure this comment exists to refuse.
+//
+// `1` and nothing else, deliberately: this enables a path MEASURED to crash on
+// the one artifact it has been driven against, so it does not get the tree's
+// usual "any first character but 0" polarity.
+bool DeviceExpertsOptedIn() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GLM5_NEXT_DEVICE_EXPERTS");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
 
 [[noreturn]] void Fail(const std::string& why) {
   throw std::runtime_error("glm5_next forward: " + why);
@@ -223,19 +258,88 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
     Fail("the resolved config has hidden_size " + std::to_string(H) +
          " and vocab_size " + std::to_string(V) + "; both must be > 0");
   }
-  // Every buffer on this path is a host `std::vector<float>`, and
-  // `vt::MoeRouterTopK` / `vt::MoeCombine` dispatch on the QUEUE's device. A
-  // CUDA queue here hands a device kernel host pointers, which is a crash and
-  // not a fallback, so it is refused by name. The device arm of this model is
-  // owed; see .agents/specs/glm5-next-flash.md `## Owed`.
+  // --- W9c-3a: THE DEVICE SPLIT ---------------------------------------------
+  //
+  // This forward used to refuse a non-CPU queue outright, and the refusal was
+  // RIGHT about its premise: nearly every buffer here is a host
+  // `std::vector<float>`, and `vt::MoeRouterTopK`, `vt::MoeCombine` and the two
+  // grouped keep-quant GEMMs all require every operand to sit on the queue's
+  // device (`src/vt/ops.cpp:214`, `:243`, `:277`). Handing them a CUDA queue
+  // over host pointers is a refusal or a crash and never a fallback.
+  //
+  // What changed is not that premise. It is that ONE arm of this model can now
+  // put its operands on the device: the routed-expert keep-quant GEMM, whose
+  // banks `dense_attn::ResidentWeight` uploads verbatim and whose activations
+  // are `DBuf`s. #2260 landed the last two encodings this artifact needs
+  // (`cuda_quant_dot.cu:1832-1843`, IQ2_XS and IQ4_XS, named for this model),
+  // which is what makes that arm reachable at all.
+  //
+  // So the queue is SPLIT rather than the refusal lifted. `host_queue` is a CPU
+  // queue this function constructs -- the shape `VaeCpuQueue()`
+  // (`ltx2_video_vae.cpp:459`) already uses -- and every host-reference arm runs
+  // on it, unchanged and byte-identical to a `--device cpu` run. The caller's
+  // device reaches exactly one consumer.
+  //
+  // READ THAT AS THE DISCLOSURE IT IS. On `--device cuda` this model computes
+  // one arm of eleven on the GPU. The KDA recurrence, the k-pool indexer, the
+  // eager MLA attention, both mHC sites, the router, the combine, the MLPs, the
+  // embedding gather and the `lm_head` all still run on the host. The row's
+  // spec records it as O43 and issue #2410 owns the rest.
+  vt::Queue host_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Queue& hq = queue.device.type == vt::DeviceType::kCPU ? queue : host_queue;
+  // A POINTER and not a `dense_attn::Dev`, because `Dev` holds two references
+  // and therefore cannot be assigned after construction. The `Dev` itself is
+  // built once, below, at the only place that has one to build.
+  vt::Backend* dev_backend = nullptr;
   if (queue.device.type != vt::DeviceType::kCPU) {
-    Fail("this forward is a HOST f32 reference and was handed a non-CPU queue. "
-         "Every glm5_next primitive on this row -- the KDA recurrence, the DSA "
-         "indexer, the mHC blocks, the MoE router and the attention -- is host "
-         "code, and `vt::MoeRouterTopK` dispatches on the queue's device, so a "
-         "device queue here would hand a kernel host pointers. Run this model "
-         "on the CPU device; the device arm is owed. See "
-         ".agents/specs/glm5-next-flash.md and issue #2241.");
+    // ASK THE OP TABLE, NOT A DEVICE LIST. This read
+    // `queue.device.type != kCUDA` for one commit, and
+    // `scripts/check-device-leakage.py` was right to red it: a device name in
+    // the device-agnostic layer is a list that goes stale the day another
+    // backend registers these ops, and it answers the wrong question anyway.
+    // The question is whether THIS device has a provider for the two grouped
+    // keep-quant GEMMs, which is exactly what `OpRegistered` answers -- the
+    // same move `gguf_keep_quant.cpp` made when its device list became
+    // `OpRegistered(kEmbeddingQuant, dev)` (`ops.h:735`).
+    //
+    // Both ops, because half the pair is not half the capability: the fused
+    // gate/up op produces the operand the grouped down-projection consumes.
+    const bool gate_up_here =
+        vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, queue.device.type);
+    const bool down_here =
+        vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, queue.device.type);
+    // `TryGetBackend`, not `GetBackend`: a registered op with no backend to run
+    // it on is a different fault from an unregistered op, and the message says
+    // which rather than throwing out of the registry about a device type.
+    vt::Backend* backend = vt::TryGetBackend(queue.device);
+    if (!gate_up_here || !down_here || backend == nullptr) {
+      Fail(std::string(
+               "this device cannot run the one primitive of this model that "
+               "leaves the host -- the routed-expert keep-quant GEMM. "
+               "`vt::MoeGateUpSwiGLUGrouped` provider: ") +
+           (gate_up_here ? "yes" : "NO") +
+           ", `vt::MatmulBTQuantGrouped` provider: " + (down_here ? "yes" : "NO") +
+           ", backend registered: " + (backend != nullptr ? "yes" : "NO") +
+           ". Every other primitive here is a host reference, so a device that "
+           "cannot run that GEMM has nothing to offer this forward: run it with "
+           "--device cpu. See .agents/specs/glm5-next-flash.md section W9c-3a "
+           "and issue #2464.");
+    }
+    // ORDER MATTERS: the op-table refusal above is the more specific diagnosis
+    // and must win, so a device with no provider still gets told that rather
+    // than being told to set a variable that would not help it.
+    if (!DeviceExpertsOptedIn()) {
+      Fail("the routed-expert device arm is OPT-IN and is not enabled, so this "
+           "forward will not take a non-CPU queue. It defaults off because both "
+           "`--device cuda` legs against the published 101.24 GiB UD-Q2_K_XL "
+           "artifact on dgx:gpu0 died with SIGSEGV having emitted no token, 3 of 3, "
+           "reproducibly, once the expert banks stopped fitting and the arm fell "
+           "back to the host mid-model. Run this model with --device cpu, which "
+           "emits ` Paris.` on that artifact. Set VT_GLM5_NEXT_DEVICE_EXPERTS=1 "
+           "to reach the arm anyway -- that is for debugging the crash, not for "
+           "serving. See .agents/specs/glm5-next-flash.md O46 and issue #2464.");
+    }
+    dev_backend = backend;
   }
 
   diag::Banner("Glm5NextHostForward");
@@ -288,9 +392,19 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
   // that is not exactly `num_hidden_layers` long by name
   // (`glm5_next_layer.cpp`), so a binding that produced the wrong count stops
   // here rather than reading a default-constructed state as a zero one.
-  const std::vector<float> hidden =
-      TextModelForward(p, norm, layers, embeds, mask, /*batch=*/1, /*seq_len=*/T,
-                       caches, queue);
+  // ONE call, two argument sets, and no second copy of the stack: `Dev`'s
+  // reference members make it unassignable, so the device one is constructed
+  // inside the branch that has a backend and lives exactly as long as the call
+  // that reads it.
+  const std::vector<float> hidden = [&]() -> std::vector<float> {
+    if (dev_backend == nullptr) {
+      return TextModelForward(p, norm, layers, embeds, mask, /*batch=*/1,
+                              /*seq_len=*/T, caches, hq, /*dev=*/nullptr);
+    }
+    dense_attn::Dev d{*dev_backend, queue};
+    return TextModelForward(p, norm, layers, embeds, mask, /*batch=*/1,
+                            /*seq_len=*/T, caches, hq, &d);
+  }();
   diag::Stats("hidden (final, entering the head)", hidden);
   if (static_cast<int64_t>(hidden.size()) != T * H) {
     Fail("the text model returned " + std::to_string(hidden.size()) +

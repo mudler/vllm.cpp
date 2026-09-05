@@ -45,15 +45,49 @@
 //    block already applies.
 //
 // ─── DTYPE ───────────────────────────────────────────────────────────────────
-// f32 for the activations, which is the parity dtype of this gate and matches
-// what upstream computes when handed an f32 input (there is no per-layer dtype in
-// the module). The ONE deliberate narrowing is `learnable_registers`, above,
-// because upstream stores it narrow. The production bf16 arm is phase L6.
+// TWO ARMS, AND THE WEIGHTS CHOOSE. `Ltx2VaeWeights::dtype` says which, because
+// upstream's module dtype is a property of the parameters and not of the call.
+//
+//  * `kBF16` is what the PRODUCTION path runs, and it is upstream's answer:
+//    `distilled.py:109` resolves ONE pipeline dtype, `torch.bfloat16`, hands it to
+//    `PromptEncoder` at `:113`, and `Embeddings1DConnector` is a `PromptEncoder`
+//    submodule. Row LTX25-A24-CONNECTOR-BF16, issue #2720, A24 wave 2.
+//  * `kF32` is the PARITY arm the five upstream goldens of section 10 cover. It
+//    is kept, not deprecated: it is the reference the bf16 arm's own
+//    discrimination gate is measured against, and deleting it would delete the
+//    only stream on this fixture that is provably wider than bf16.
+//
+// THREE ROUNDING FACTS THE bf16 ARM CANNOT BE READ OFF THE SOURCE FOR. Each was
+// measured by executing the pinned module and each has a rejected hypothesis
+// recorded beside it in .agents/specs/ltx25-a24-connector-bf16.md section 4:
+//
+//  * `rms_norm` widens to f32, accumulates there, adds the f32 `1e-6` — NOT
+//    `bf16(1e-6)`, which is A24 wave 1's answer for the TOWER's norm — and rounds
+//    ONCE. The two epsilons part on 0 of 49152 values at ordinary magnitude, so
+//    the arm goldens gate nothing about it and a separate small-row probe does.
+//  * SPLIT rope rounds TWICE per output and INTERLEAVED rope rounds THREE times,
+//    six lines apart in upstream's own file, because `addcmul_` fuses one
+//    multiply into the add and a plain `a*cos + b*sin` does not.
+//  * the attention accumulates in f32 and rounds ONCE, because that is exactly
+//    `SDPBackend.MATH`; the kernel torch actually selects is reproducible by no
+//    formula at all, so the goldens are emitted against MATH and the distance to
+//    the unpatched module is reported rather than absorbed.
+//
+// `learnable_registers` is bf16 at BOTH widths (:135-137). On the f32 arm that
+// costs an explicit `RoundToBf16`; on the bf16 arm it is the stored word and the
+// rounding is an identity. Same number by two routes, and the one place the two
+// arms provably agree.
+//
+// The FP8 and NVFP4 arms are A22 — upstream's quantization policies
+// (`quantization_factory.py:22-26`), not its default dtype — and are refused by
+// name in `Linear`.
 #pragma once
 
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include "vt/dtype.h"
 
 #include "vllm/model_executor/models/ltx2.h"            // Ltx2RopeType and the DiT's parts
 #include "vllm/model_executor/models/ltx2_audio_vae.h"  // Ltx2VaeWeights, the shared bag
@@ -113,6 +147,20 @@ struct Ltx2ConnectorOutput {
   std::vector<float> hidden_states;  // [batch, seq, inner_dim]
   std::vector<float> mask;           // [batch, 1, 1, seq], additive
 };
+
+// `rms_norm(x)` with no weight over the last dimension (utils.py:7-12), exposed
+// for the same reason `Ltx2ConnectorReplaceRegisters` is: it is where the epsilon
+// lives, and at bf16 the epsilon is INVISIBLE in the final tensor on rows of
+// ordinary magnitude. `Ltx2ConnectorForward` calls this three times per block plus
+// once at the end, so it is the production path and not a test hook.
+//
+// `compute_dtype` selects the rounding, not the arithmetic: BOTH arms accumulate
+// the mean square in f64 and add the f64 epsilon, and the bf16 arm then rounds the
+// result once. The f64 accumulator was MEASURED against upstream rather than
+// inherited -- at the shipped width 3840 a sequential f32 accumulation mismatches
+// 11000 of 15 360 000 values and this one mismatches 24.
+void Ltx2ConnectorRmsNormRows(float* x, int64_t rows, int64_t width,
+                              vt::DType compute_dtype = vt::DType::kF32);
 
 // _replace_padded_with_learnable_registers (:139-152), exposed on its own because
 // it is where the bf16 narrowing lives and a defect there is otherwise absorbed

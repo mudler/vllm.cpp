@@ -85,13 +85,29 @@
 // 4 frames against a 10-latent-frame temporal tile, so upstream calls `forward`
 // once on the whole volume there — see .agents/specs/ltx25-tiled-decode.md §0.
 //
-// ─── DTYPE ───────────────────────────────────────────────────────────────────
-// f32 throughout, for the same reason ltx2_video_vae.h:47-54 gives: this is the
-// CPU REFERENCE arm. Upstream's tiled buffer inherits `latent.dtype`
-// (conv_video_decoder.py:427-431) while the masks stay float32 so a bf16/fp16
-// tile PROMOTES (tiling.py:425). When phase L6 lands the checkpoint-dtype arm the
-// buffer follows the latent and the masks do not; recorded here so it does not
-// have to be rediscovered.
+// ─── DTYPE: THE BUFFER FOLLOWS THE LATENT, THE MASKS DO NOT ─────────────────
+// A24 wave 3 (row LTX25-A24-VIDEO-VAE-BF16, issue #2786) landed the arm this
+// block was written owing. Upstream's group buffer is
+// `torch.zeros(..., dtype=latent.dtype)` (conv_video_decoder.py:427-431) and ITS
+// WEIGHTS BUFFER IS `torch.zeros_like(buffer)` (`:526`) -- the second sentence
+// this record was missing, and the one that decides the blend quotient's width.
+// The masks stay float32 (`:548, :554`) so a bf16 tile PROMOTES on the multiply
+// (tiling.py:425 says why in as many words), and the `+=` into the buffer rounds
+// it straight back, so the promotion is a per-tile intermediate only.
+//
+// `ChunkBuffer` keeps `std::vector<float>` STORAGE and rounds at each
+// accumulation and at the quotient instead of narrowing its bytes, and the
+// reason is proportion rather than principle: this is a PIXEL volume, three
+// channels wide, and its bytes are a hundredth of the base-channel-width
+// intermediates inside `Ltx2ConvVideoDecode` that wave 3 did narrow. What
+// matters numerically is that every accumulation lands on the buffer's grid,
+// which is where `RoundTo` is applied in ltx2_video_vae_tiled.cpp.
+//
+// WHETHER THE SHIPPED BENCH GEOMETRIES REACH A MULTI-TILE BLEND AT ALL IS
+// UNMEASURED, and it decides whether the buffer's width is observable in a gated
+// render: `:70-71` below records that one-tile routing is safe below 81 frames
+// and NOT within 81..120, and `:84-86` that the 448x256/25f geometry is one tile.
+// It is named under `## Owed` in .agents/specs/ltx25-a24-video-vae-bf16.md.
 #pragma once
 
 #include <cstdint>

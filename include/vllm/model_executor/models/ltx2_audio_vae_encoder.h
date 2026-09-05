@@ -17,6 +17,7 @@
 //                                     model/audio_vae/attention.py:16-55
 //   (the audio patchifier)        <-  components/patchifiers.py:287-305
 //   (per-channel statistics)      <-  model/audio_vae/ops.py:58-75
+//   Ltx2ResampleWaveform          <-  model/audio_vae/ops.py:36-42
 //   Ltx2WaveformToLogMel          <-  model/audio_vae/ops.py:8-55
 //   Ltx2SlaneyMelFilterbank       <-  torchaudio.functional.melscale_fbanks
 //                                     (reached from ops.py:20-34)
@@ -165,22 +166,44 @@ struct Ltx2AudioProcessorConfig {
 std::vector<float> Ltx2SlaneyMelFilterbank(int64_t n_freqs, double f_min, double f_max,
                                            int64_t n_mels, int64_t sample_rate);
 
-// `AudioProcessor.waveform_to_mel` (ops.py:44-55) at any channel count.
-// `waveform` is [channels, samples], channel-major, at `sampling_rate`.
+// `AudioProcessor.resample_audio` (ops.py:36-42), which is
+// `torchaudio.functional.resample` at every default: the arbitrary
+// rational-ratio polyphase sinc resampler with `lowpass_filter_width = 6`,
+// `rolloff = 0.99` and — `ops.py:40` passes neither `resampling_method` nor
+// `beta` — a HANN window (functional.py:1441). It is NOT kaiser, which nine
+// statements in this tree asserted before row LTX25-AUDIO-RESAMPLE (#2583).
 //
-// A SAMPLE RATE THAT DOES NOT MATCH `target_sample_rate` IS REFUSED BY NAME.
-// Upstream resamples with `torchaudio.functional.resample` (ops.py:40), a
-// polyphase kaiser resampler for an arbitrary rational ratio; this project ports
-// only the integer-ratio hann-sinc variant the BWE stage needs
-// (Ltx2HannSincResampleFilter1d). Refusing is deliberate: silently treating
-// 44.1 kHz samples as 16 kHz produces audio conditioning that is pitched and
-// time-scaled wrong while every shape still checks out.
+// `waveform` is [channels, samples] channel-major and each channel resamples
+// independently against one kernel, as torchaudio's packed batch does. Returns
+// `ceil(new_freq * samples / orig_freq)` samples per channel, CLAMPED to the
+// columns the convolution produced — upstream's two closing lines, not one
+// (functional.py:1427-1428). The quotient is NARROWED TO f32 BEFORE the ceil,
+// because `torch.as_tensor` of a Python float takes the default dtype (`:1427`),
+// and the narrowing moves BOTH ways: one sample fewer than an exact integer ceil
+// at 180697 samples for 44100 -> 16000 and at 48102 of the first 60 s worth of
+// lengths, one sample MORE at 33554438 samples for 44100 -> 22050. The clamp is
+// the Python slice at `:1428`, and it decides the answer wherever the upward
+// narrowing overshoots the last column — at 48000 -> 16000 and 100663303 samples,
+// for one. Returns the INPUT unfiltered when the rates already match
+// (ops.py:38-39). Computed in f32, which is the dtype upstream resamples in — see
+// the note at the definition.
+std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int64_t channels,
+                                        int64_t samples, int64_t orig_freq, int64_t new_freq,
+                                        int64_t* out_samples);
+
+// `AudioProcessor.waveform_to_mel` (ops.py:44-55) at any channel count.
+// `source` is [channels, source_samples], channel-major, at `sampling_rate`.
+//
+// A SAMPLE RATE THAT DOES NOT MATCH `target_sample_rate` IS RESAMPLED, not
+// refused: `waveform_to_mel` calls `resample_audio` before the mel transform
+// (ops.py:49), so the frame count this reports is over the RESAMPLED length.
 //
 // Returns [channels, frames, mel_bins] channel-major — the layout
 // `Ltx2AudioEncoderForward` takes, which is upstream's final
 // `permute(0, 1, 3, 2)` (ops.py:55).
 std::vector<float> Ltx2WaveformToLogMel(const Ltx2AudioProcessorConfig& config,
-                                        const std::vector<float>& waveform, int64_t channels,
-                                        int64_t samples, int64_t sampling_rate, int64_t* out_frames);
+                                        const std::vector<float>& source, int64_t channels,
+                                        int64_t source_samples, int64_t sampling_rate,
+                                        int64_t* out_frames);
 
 }  // namespace vllm

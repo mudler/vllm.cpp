@@ -41,8 +41,9 @@ role-discipline commits are disjoint from the 35. **41 distinct commits.**
 
 That count is the measurement at `bacb71109` and is left as measured. A 42nd
 commit, `c00b99c7c`, landed on 2026-08-24 while this row was in flight and moved
-the split to 35 trailers / 7 role discipline. `## The 42 forgiven commits` and
-`### The first advance` carry it.
+the split to 35 trailers / 7 role discipline. A 43rd, `e1b5df1a6`, landed on
+2026-08-25 and moved it to 35 / 8. `## The 43 forgiven commits`,
+`### The first advance` and `### The second advance` carry them.
 
 ### Why no remedy exists
 
@@ -91,15 +92,17 @@ A commit date is author-controlled and can go backwards across a rebase, so a
 date comparison can choose the wrong commit; ancestry on a linear first-parent
 `main` cannot.
 
-The floor is set to `c00b99c7c8b64f9247230ed6220598cc5c0e347e`, which is the
-last of the 42 commits enumerated below. The floor is the forgiven commit
+The floor is set to `e1b5df1a6b5b30555639e0a0459f79a467544579`, which is the
+last of the 43 commits enumerated below. The floor is the forgiven commit
 itself rather than its child, because the walk is `FLOOR..HEAD` and excludes
 `FLOOR`; every commit after it stays enforced.
 
 It was first set to `bacb71109c8d63b5f862c9b121dd86e04e1a07ee`, which was past
 the 41 commits then known. `c00b99c7c` landed while this row was in flight and
-the value was advanced once, before merge, under
-`### Advancing the floor`. See `### The first advance` below.
+the value was advanced once, before merge, under `### Advancing the floor`.
+`e1b5df1a6` landed on 2026-08-25 and the value was advanced a second time, on
+2026-09-03, under the same section. See `### The first advance` and
+`### The second advance` below.
 
 ### The base selection moves into a script
 
@@ -202,10 +205,10 @@ push resolves to C2 and its range does NOT contain C2.
 
 ### What is narrowed, and the argument for it
 
-This change narrows enforcement: 42 commits that the gate currently reports are
+This change narrows enforcement: 43 commits that the gate currently reports are
 no longer walked. The argument is that enforcing on an immutable already-landed
 commit is not enforcement. There is no action any contributor can take that
-turns those 42 reds green, because the only action that would is a `main`
+turns those 43 reds green, because the only action that would is a `main`
 rewrite the protocol forbids. A gate with no available remedy is a permanent
 red, and a permanent red is read by nobody — which is a strictly worse outcome
 than a smaller gate that is read.
@@ -219,10 +222,16 @@ and `check-now-current.py` are not modified by this row, and the grep step's
 condition is unchanged. Only the base of the walk moves.
 
 **The floor forgives by RANGE, not by violation, and that is a real cost.** The
-42 commits are what the three checkers report *today*. A checker written
+43 commits are what the three checkers report *today*. A checker written
 tomorrow that finds a new class of defect in the pre-floor range will be
 forgiven for that range too, silently, without anybody deciding to forgive it
-and without a line appearing anywhere. An exemption list would not have that
+and without a line appearing anywhere. **This is no longer hypothetical.**
+#2745, found while measuring the second advance, is a cutover constant in
+`check-role-discipline.py` that names an unlanded sha, so the integration-path
+rule it was meant to switch on has never run. Repairing it would make the
+checker report a class of defect across the whole pre-floor range, and this
+floor would forgive every instance of it without a line appearing anywhere.
+The cost is real, it is paid in advance, and #2745 is where it is recorded. An exemption list would not have that
 property: it names shas and one error each, so a new checker's finding on an
 old commit would still red. This is the strongest argument against the shape
 chosen here, and `### The alternative that was rejected` is not an honest
@@ -252,8 +261,11 @@ because deleting it would erase the record that `281b4bc76c0e` violated the
 contract at all. THIS FILE remains the only place that says so.
 
 The floor itself is untouched and still governs `documentation-checkpoint` and
-`agent-record`'s role-discipline step, which do walk the push lane. Its value is
-unchanged and it still forgives the same 42 commits for those two gates.
+`agent-record`'s role-discipline step, which do walk the push lane. That change
+narrowed the floor's SCOPE and did not move its VALUE, which stayed at
+`c00b99c7c` and forgave the same 42 commits for those two gates.
+`### The second advance` later moved the value to `e1b5df1a6` and left the
+narrowed scope exactly as #2322 set it; the count for those two gates is now 43.
 
 ### Advancing the floor
 
@@ -288,7 +300,7 @@ Rejected homes:
 ### The alternative that was rejected
 
 **A per-commit exemption list**: keep walking `LAST_GREEN..HEAD` forever and
-name the 42 shas in a file the checkers consult. It records more precisely than a
+name the 43 shas in a file the checkers consult. It records more precisely than a
 floor does, and `check-commit-trailers.py` already carries one landed-message
 exception, so the mechanism is not foreign.
 
@@ -297,7 +309,7 @@ Rejected on three grounds:
 1. `AGENTS.md` `## Changing the rules or a checker` states the project has no
    waiver registry, because an exception registry is a state log and this
    protocol has no state log. One in-checker exception carrying its reason is
-   not a registry; a file of 42 growing to N is precisely one.
+   not a registry; a file of 43 growing to N is precisely one.
 2. It needs the mechanism built three more times. The grep step and
    `check-role-discipline.py` have no exemption concept, so the change would add
    an exemption surface to code that currently has none — more new enforcement
@@ -325,21 +337,22 @@ In scope:
 
 Out of scope, deliberately:
 
-- Repairing the 42 commits. It cannot be done without rewriting `main`.
+- Repairing the 43 commits. It cannot be done without rewriting `main`.
 - The three checkers themselves. Not one line changes.
 - `agent-record`'s missing-`hugo` red (#1722, fix in flight as #1726) and the two
   `windows-msvc` reds (#584). Both are inherited and neither is this row's.
 - The PR lane's base selection, which is unchanged.
 
-## The 42 forgiven commits
+## The 43 forgiven commits
 
-Real protocol violations that landed unread between 2026-08-13 and 2026-08-24,
+Real protocol violations that landed unread between 2026-08-13 and 2026-08-25,
 recorded here because after the floor advances no gate will name them again.
 
-35 fail the strict trailer contract and 7 fail role discipline. The two sets are
+35 fail the strict trailer contract and 8 fail role discipline. The two sets are
 disjoint. 41 of them were enumerated when the floor was first recorded at
 `bacb71109`; the 42nd, `c00b99c7c`, arrived afterwards and moved the split from
-35/6 to 35/7 — see `### The first advance`.
+35/6 to 35/7 — see `### The first advance`. The 43rd, `e1b5df1a6`, arrived on
+2026-08-25 and moved it to 35/8 — see `### The second advance`.
 
 ### Fail `check-commit-trailers.py --range` (35)
 
@@ -389,7 +402,7 @@ carries no `FOLLOWING_AGENTS_PROTOCOL` string at all: `7572b0f4e2fb`,
 `e34d71379e70`, `aba8d5ffb77c`, `2d2a66715ef4`, `1757330006f6`. The remaining 15
 carry the marker in a form the strict contract rejects.
 
-### Fail `check-role-discipline.py` (7)
+### Fail `check-role-discipline.py` (8)
 
 Repository changes that reached `main` without arriving on a task branch.
 
@@ -402,8 +415,9 @@ Repository changes that reached `main` without arriving on a task branch.
 | `65d6cdaed3e2` | 2026-08-18 | build: make the tree compile on gcc 16, and add a CI lane so it stays that way |
 | `6e73bdee3ea1` | 2026-08-23 | fix(LTX25-POSITION-CONTRACT): gate the tower positions as integers |
 | `c00b99c7c8b6` | 2026-08-24 | fix(LTX25-DIT-ATTN-ARM-PARSE): match every DiT attention arm exactly and refuse a fourth value |
+| `e1b5df1a6b5b` | 2026-08-25 | fix(LTX25-DIT-ATTN-FA2-HD128): pin the distilled NVFP4 DiT to the artefact every measurement loaded, and hash it |
 
-`c00b99c7c8b6` is the 42nd and the newest. It landed
+`c00b99c7c8b6` is the 42nd. It landed
 `src/vllm/model_executor/models/ltx2_device.cpp` and
 `tests/vllm/models/test_ltx2_device.cpp` — product code and its test — straight
 onto `main` with no `row/<ID>` branch in its history, which is what
@@ -419,16 +433,43 @@ ERROR: c00b99c7c: repository change (src/vllm/model_executor/models/ltx2_device.
 Its message is clean: it carries `FOLLOWING_AGENTS_PROTOCOL` and passes
 `check-commit-trailers.py`. This is a **role-discipline** violation and not a
 trailer one, so it is the seventh row of this table and not the thirty-sixth of
-the one above, and the split across the 42 is 35 trailers / 7 role discipline
+the one above, and the split across the 42 was 35 trailers / 7 role discipline
 rather than 35 / 6.
+
+`e1b5df1a6b5b` is the 43rd and the newest, authored by
+`mudler's LocalAI [bot]` on 2026-08-25. It changed four paths —
+`.agents/specs/ltx25-dit-attn-fa2-hd128.md`, `docs/USAGE.md`,
+`docs/models/ltx-2-5.md` and `tests/vllm/multimodal/ltx2_video_fixture.h` —
+and reached `main` with no `row/<ID>` branch and no `(#N)` in its message, so
+`arrives_via_row_pr` finds nothing to accept. The checker writes one unwrapped
+line, and this is that line verbatim, copied from
+`python3 scripts/check-role-discipline.py --base c7ad92f87 --head e1b5df1a6`,
+which exits 1:
+
+```
+ERROR: e1b5df1a6: repository change (tests/vllm/multimodal/ltx2_video_fixture.h) reached main without arriving on a task branch. Work happens in its own worktree on a `row/<ID>` branch and lands through a reviewed PR or an authorized local merge naming that branch; never directly on the shared checkout
+```
+
+**Only one of its four paths is named, and that is worth reading.** The other
+three are integration paths, which `policy_commit_violations` still exempts
+because `worktree_enforced` is `False` — `WORKTREE_DISCIPLINE_SINCE` names
+`f236ca960`, which is not an ancestor of `main`. That is #2745, filed from this
+advance and not repaired by it. The violation stands on the feature path alone,
+so the finding does not depend on #2745 either way.
+
+Its message is clean too: it carries `FOLLOWING_AGENTS_PROTOCOL` and passes
+`check-commit-trailers.py`, so it is the eighth row of this table and not the
+thirty-sixth of the one above, and the split across the 43 is 35 trailers /
+8 role discipline.
 
 `check-now-current.py` passes over the whole range and forgives nothing.
 
-**Every one of the 42 shas above resolves.** Verified with
+**Every one of the 43 shas above resolves.** Verified with
 `git rev-parse --verify -q '<sha>^{commit}'` over all 42, first at `origin/main`
-`d60692c89` and again at `3574065e7` after the merge, both times against the
-shas parsed back out of this committed table rather than a hand-kept copy: 42
-resolved, 0 missing, and all 42 are ancestors of `origin/main` by
+`d60692c89` and again at `3574065e7` after the merge, and re-run over all 43 at
+`origin/main` `8853af6bf` for the second advance, every time against the shas
+parsed back out of this committed table rather than a hand-kept copy: 43
+resolved, 0 missing, and all 43 are ancestors of `origin/main` by
 `git merge-base --is-ancestor`. This is a full sweep and not a
 spot-check, because after this lands the enumeration is the only witness that
 these violations happened, and an earlier round of this list carried two shas
@@ -457,6 +498,81 @@ it to `origin/main` instead would have been one character of extra typing and
 would have forgiven `e6f4f566f` and `d60692c89` unexamined, which is the abuse
 risk 2 says nothing in this mechanism can detect. Both stay enforced.
 
+### The second advance
+
+**Advanced from `c00b99c7c` to `e1b5df1a6` on 2026-09-03, for #2743.** This is
+the second exercise of `### Advancing the floor`, and unlike the first it
+happened long after the mechanism merged, on the failure the mechanism was built
+for: `agent-record`'s role-discipline step was red on `main` with no action any
+contributor could take to clear it.
+
+**Why it surfaced when it did.** It is not a regression from any recent merge.
+`agent-record` runs under `set -e` and two earlier defects were failing ahead of
+the role-discipline step, so it was never reached: a hardcoded benchmark-index
+count in `tests/scripts/test_check_site.py` (#2643, fixed in `d9f394459`) and
+the #2590 tier suites running before numpy was installed (#2705, fixed in
+`975ade3de`). `main`'s previous run at `4d10c8acc` failed `agent-record` at
+`AssertionError: 11 != 10`. This is the third defect in one stack, each hidden
+behind the last, and reaching it is progress rather than breakage.
+
+**The advance is minimal by construction, and this was measured rather than
+assumed.** `c00b99c7c..e1b5df1a6` is **30 commits, 0 of them merges**. Each was
+also checked on its own with `--commit`, which for a non-merge is exactly what
+the range walk does, because `merged_pr_content` is empty when the range holds
+no merge and so nothing can be exempted as reviewed content. **29 are clean and
+exactly one violates**: `e1b5df1a6`. The floor moved to that commit and no
+further. Setting it to `origin/main` `8853af6bf` instead would have been the
+same edit and would have forgiven every commit above it unexamined, which is
+the abuse risk 2 says nothing in this mechanism can detect.
+
+That the whole walk names exactly one commit is measured too, and it is the
+same number from both ends. Measured at `origin/main` `8853af6bf`, each rc
+captured as `rc=$?` on the command itself and never after a pipe, because a
+pipe reports its last stage and has misread a red as a green twice in this
+row's history:
+
+| Floor | `check-role-discipline.py --head origin/main` | `ERROR:` lines | `REPORT:` lines |
+|---|---|---|---|
+| `c00b99c7c` (old) | **rc 1** | 1, `e1b5df1a6` | 0 |
+| `e1b5df1a6` (new) | rc 0, `OK: every change on main arrived on a task branch.` | 0 | 0 |
+
+`git merge-base --is-ancestor e1b5df1a6b5b30555639e0a0459f79a467544579
+origin/main` is rc 0, so the new floor is on this history and the resolver's
+ancestry guard accepts it. `tests/scripts/test_ci_walk_base.py` re-run over the
+new value: 31 tests, 0 failures, 0 errors, with
+`RecordedFloorTests::test_recorded_floor_is_an_ancestor_of_head` reading the
+committed file rather than a literal.
+
+**One test pinned the old value and had to be re-pinned.**
+`tests/scripts/test_check_commit_trailers.py`'s
+`test_the_enforcement_floor_no_longer_claims_the_trailer_steps` asserts the file
+ends with an exact sha, so that #2322 could prove it narrowed the floor's scope
+without moving its value. It is 64/64 green at the base commit, reds with
+exactly that one failure the moment the floor line changes, and is green again
+at 64/64 once re-pinned — a red-before/green-after proof that the pin is live
+and not decorative. The assertion keeps its exact-sha form and its strength;
+only the sha and its message move. Deriving the expected value from this spec's
+table instead would remove the re-pin, but that is a checker-semantics change
+and it is deliberately not made here: an advance having to edit the pin is a
+tripwire that puts the value in front of a reviewer, which is what
+`### Advancing the floor` asks for.
+
+**The arrival rate DID fall, and that is worth recording because the first
+advance predicted the opposite.** Three role-discipline violations landed on
+three consecutive days — `6e73bdee3ea1` on 2026-08-23, `c00b99c7c` on
+2026-08-24, `e1b5df1a6` on 2026-08-25 — and `### The first advance` read that
+run as "the violations are still arriving". Measured over
+`e1b5df1a6..origin/main` at `8853af6bf`: **1365 commits, 297 of them merges,
+spanning 2026-08-25 to 2026-09-03, and zero role-discipline violations.** Nine
+days and 1365 commits is a far better denominator than the three-day run the
+first advance generalised from, so the honest reading is that the three
+consecutive days were a cluster and not a rate.
+
+What the advance still does not do is fix anything. `### Advancing the floor`
+costs one reviewed commit per unrepairable violation and buys nothing else; the
+floor stops an unrepairable commit freezing a gate, and if a fourth violation
+lands it will cost a third advance.
+
 ## Gates
 
 | Gate | Command | Result |
@@ -474,11 +590,14 @@ risk 2 says nothing in this mechanism can detect. Both stay enforced.
    row.** The gate reds on that one commit, correctly, and the remedy now exists:
    advance the floor in a reviewed commit that names it. This is the designed
    behaviour and not a regression, but it means the floor value has to be
-   re-checked immediately before merge. **This risk fired.** `c00b99c7c` landed
-   on 2026-08-24 and the floor was advanced to it by exactly that remedy; see
-   `### The first advance`. The obligation it names does not expire with this
-   one discharge — `main` moves roughly every twenty minutes, so whoever merges
-   re-runs the four commands over `<floor>..origin/main` again.
+   re-checked immediately before merge. **This risk has fired twice.**
+   `c00b99c7c` landed on 2026-08-24 and the floor was advanced to it by exactly
+   that remedy (`### The first advance`); `e1b5df1a6` landed on 2026-08-25 and
+   the floor was advanced again on 2026-09-03 (`### The second advance`). The
+   obligation it names does not expire with a discharge — `main` moves roughly
+   every twenty minutes, so whoever merges re-runs the four commands over
+   `<floor>..origin/main` again. Twice is enough to call this the steady state
+   rather than an anomaly.
 2. **The floor is set too far forward by mistake.** It would skip commits nobody
    examined, and **nothing in this change detects it.** The two ancestry guards
    cover a different mistake: `resolve_base` warns and leaves the base alone
@@ -510,8 +629,18 @@ risk 2 says nothing in this mechanism can detect. Both stay enforced.
 
 ## Owed
 
-Nothing. The 42 commits are recorded above rather than owed: no future change can
-repair them.
+The 43 commits are recorded above rather than owed: no future change can repair
+them.
+
+- [#2745](https://github.com/mudler/vllm.cpp/issues/2745) —
+  `check-role-discipline.py`'s `WORKTREE_DISCIPLINE_SINCE` names `f236ca960`,
+  which is not an ancestor of `main`; its landed twin is `bd6b3936b`. The
+  second cutover has therefore never switched on, so integration paths keep the
+  exemption the module docstring says it removed. Found while measuring
+  `### The second advance`. Not repaired there: repointing the constant changes
+  checker semantics and needs its own red-before measurement of how much landed
+  history it newly names, which `AGENTS.md` routes to a row and a fresh review
+  rather than an in-flow fix.
 
 
 ## Outcome
@@ -738,8 +867,11 @@ was restored and the restore proved by sha256 on both changed files, not by a
 `git status` that a mutation can leave clean.
 
 Nothing about the value is permanent. `main` keeps moving, so whoever merges
-repeats the four commands over `c00b99c7c..origin/main` and, if one reds again,
-performs another advance the same way.
+repeats the four commands over `<floor>..origin/main` and, if one reds again,
+performs another advance the same way. **One did.** `check-role-discipline.py`
+reddened on `e1b5df1a6` and the floor was advanced a second time on 2026-09-03
+for #2743; the measurement is in `### The second advance` rather than here,
+because this section records the FIRST advance and is left as measured.
 
 `test_cpu_x86_llamacpp_floor` was red in two earlier runs and is #618, not this
 row. It was discriminated rather than asserted, twice over. Pristine

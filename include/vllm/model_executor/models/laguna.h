@@ -319,7 +319,8 @@ LagunaWeights LoadLagunaForCausalLMWeights(
 // blk.N.* name-map; the MoE expert blocks stay COMPRESSED (Q4_K/Q5_K/Q6_K/Q8_0
 // all already decoded — ZERO new kernel). Single-shard wrapper of the multi-shard
 // entrypoint below (the real model ships 3 shards; a single-file GGUF works too).
-LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config);
+LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config,
+                                 const GgufLoadPolicy* policy = nullptr);
 
 // W5 multi-shard GGUF keep-quant loader. `shards[0]` is the METADATA shard (the
 // laguna.* KV geometry + tokenizer live only in shard-1); the tensors are routed

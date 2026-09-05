@@ -1143,6 +1143,19 @@ Ltx2PhaseRecipe OneStagePhase(const Ltx2PipelineParams& params) {
   // and a zero-initialized denoise still returns a finite clip of the right
   // size, frame count and sample rate.
   phase.noise_scale = 1.0;
+  // THE SCHEDULE ANCHOR (#2521). `ti2vid_one_stage.py:207` calls
+  // `self._scheduler.execute(steps=num_inference_steps)` and passes NO latent,
+  // so `schedulers.py:32` takes `default_number_of_tokens` = 4096 rather than
+  // the target grid. vLLM-Omni says the same thing and cannot say otherwise:
+  // `ltx2_denoise.py:188` hard-codes `max_anchor` under a comment naming this
+  // exact behaviour. Set on the PHASE rather than on `OneStageRecipe`, because
+  // `T2aOneStageRecipe` is built by calling that function
+  // (`t2a_one_stage.py:141` passes no latent either) and both arms need it.
+  //
+  // Restated even though it is now the struct default: this is the field's whole
+  // subject, and a reader of a one-stage recipe should not have to go to the
+  // header to learn which anchor it samples.
+  phase.schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
   return phase;
 }
 
@@ -1211,6 +1224,15 @@ Ltx2PipelineRecipe PositiveOnlyRecipe() {
   Ltx2PhaseRecipe phase;
   phase.name = "generate";
   phase.use_official_sigma_schedule = false;
+  // This recipe comes from vLLM-Omni rather than from Lightricks, so vLLM-Omni
+  // decides its anchor — and `use_official_sigma_schedule = false` above is
+  // exactly what selects the OTHER branch there. That branch still lands on
+  // 4096: it passes `max_image_seq_len` into `calculate_shift`'s
+  // `image_seq_len` parameter (`ltx2_denoise.py:256-260` against the signature
+  // at `:116-125`). Both of vLLM-Omni's branches agree on the shift and differ
+  // only in how the rest of the schedule is built, which is why this line is
+  // safe to state while `use_official_sigma_schedule` itself stays owed (#2521).
+  phase.schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
   recipe.phases = {phase};
   recipe.negative_prompt = kOmniNegativePrompt;
   // `dmd2` is the ONE kind with no stated checkpoint class. It has no row in
@@ -1331,9 +1353,11 @@ Ltx2PipelineRecipe DfrRecipe(const std::string& version) {
   // THE DETAILING IC-LoRA IS NOT A SECOND REQUIREMENT, which #1445 asks for a
   // decision on. `detailing_lora` defaults to `None` (`:176`), `--detailing-lora`
   // carries `default=[]` and no `required` (`:569-577`), and `CLAUDE.md:51` says
-  // stage 2 "may add" it. So ONE adapter is the complete requirement here, and
-  // the arity cap in `Ltx2ResolveLoraReferenceFactors` that refuses a second one
-  // is a missing capability rather than an unmet requirement of this flag.
+  // stage 2 "may add" it. So ONE adapter is the complete requirement here. A
+  // SECOND one is now expressible — row LTX25-LORA-FUSION lifted the arity cap
+  // in `Ltx2ResolveLoraReferenceFactors`, and `dfr_pipeline.py:212`'s
+  // `(*user_loras, *distilled_lora)` is exactly this composition — but it is
+  // still not a requirement of this flag.
   recipe.requires_distilled_lora = true;
   // THE CHECKPOINT IS NOT THE DISTILLED ONE, although the schedule is. The
   // `Model` column reads `Keyframe-slot SFT + distilled LoRA (+ detailing
@@ -1467,6 +1491,19 @@ Ltx2PipelineRecipe Res2sTwoStageRecipe(const std::string& version) {
   // one, whose stage 1 carries `DISTILLED_SIGMAS` and cannot honour a step
   // override.
   stage1.noise_scale = 1.0;
+  // THE ONE ARM THAT KEEPS THE TARGET GRID, and the only reason
+  // `kTargetLatent` still exists. `:261-267` builds `empty_latent` from
+  // `VideoLatentShape.from_pixel_shape(stage_1_output_shape, ...)` and passes it
+  // as `execute(latent=empty_latent, ...)`, so `math.prod(latent.shape[2:])` IS
+  // this phase's target grid. It is upstream's single exception among seven call
+  // sites.
+  //
+  // STATED, NOT DEFAULTED, and that is load-bearing: #2521 moved the struct
+  // default to `kSchedulerDefault` because six of seven sites want it. Without
+  // this line that flip would sweep this arm silently, which is the exact
+  // failure the enum's header comment warns a default can cause. MEASURED:
+  // deleting this one line reds three cases in each of the two LTX-2.5 suites.
+  stage1.schedule_tokens = Ltx2PhaseScheduleTokens::kTargetLatent;
   // :271-281 — a `GuidedDenoiser` with a negative context and the HQ guider
   // params, so guidance is live and a request may override it.
   stage1.video_guidance = params.video_guider;
@@ -1622,6 +1659,10 @@ Ltx2PipelineRecipe A2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   // as the `one_stage` rows are.
   stage1.sigmas = {};
   stage1.use_official_sigma_schedule = true;
+  // ...AND THAT SAME CALL PASSES NO LATENT (`:225-227`), which `schedulers.py:32`
+  // reads as `default_number_of_tokens` = 4096 rather than as the target grid.
+  // #2521; this arm was one of the three the anchor field was introduced without.
+  stage1.schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and
   // `:247-250` sets none, so stage 1 starts from pure noise. #1013 is the defect
   // this line exists to not repeat: at 0.0 the state stays as
@@ -1766,13 +1807,15 @@ Ltx2PipelineRecipe Ti2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   // (`:243-245`) is resolved at run time from the request's step count.
   stage1.sigmas = {};
   stage1.use_official_sigma_schedule = true;
-  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:31` reads as
+  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:32` reads as
   // `default_number_of_tokens` = 4096 rather than as the target grid. This is
   // the field this arm could not be written with before row
   // LTX25-TI2VID-RECIPE, and the ONE upstream site that goes the other way is
   // `ti2vid_two_stages_hq.py:267` — i.e. `Res2sTwoStageRecipe` above, which
-  // leaves this at the default. That the three remaining derived arms still
-  // take the target grid is #1150, not this line.
+  // now says so explicitly. The three arms that still took the target grid when
+  // this line was written — `one_stage`, `t2a_one_stage` and `a2vid_two_stage`
+  // stage 1 — were moved onto the anchor by #2521, so this is no longer the
+  // exception among siblings that it was.
   stage1.schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and
   // `:266-267` sets none, so stage 1 starts from pure noise. #1013 is the defect
@@ -1953,11 +1996,12 @@ Ltx2PipelineRecipe KeyframeInterpolationRecipe(const Ltx2PipelineParams& params,
   // (`:199-200`) is resolved at run time from the request's step count.
   stage1.sigmas = {};
   stage1.use_official_sigma_schedule = true;
-  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:31` reads as
+  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:32` reads as
   // `default_number_of_tokens` = 4096 rather than as the target grid. The ONE
   // upstream site that goes the other way is `ti2vid_two_stages_hq.py:267`, i.e.
-  // `Res2sTwoStageRecipe`, which leaves this at the default. That three shipped
-  // arms still take the target grid is #1150, not this line.
+  // `Res2sTwoStageRecipe`, which now says so explicitly. The three shipped arms
+  // that still took the target grid when this line was written were moved onto
+  // the anchor by #2521.
   stage1.schedule_tokens = Ltx2PhaseScheduleTokens::kSchedulerDefault;
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and
   // `:244-247` sets none, so stage 1 starts from pure noise. #1013 is the defect

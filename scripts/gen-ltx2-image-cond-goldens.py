@@ -489,7 +489,7 @@ def section_condition_and_noise(out, latent, tol) -> None:
         "the item must CHANGE the denoise mask or section 4 gates nothing"
     )
     assert torch.equal(conditioned.latent, base.latent), (
-        "upstream leaves the NOISY tensor untouched (latent_cond.py:38-39). diffusers does "
+        "upstream leaves the NOISY tensor untouched (latent_cond.py:40-41). diffusers does "
         "NOT (pipeline_ltx2_condition.py:1002-1004); if this ever flips, spec §3.3's choice "
         "has to be revisited rather than the assertion deleted"
     )

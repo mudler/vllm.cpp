@@ -122,6 +122,7 @@ const ModelFactory kKimiLinearFactory{
     // ROW 7 (§20.3): the engine selects the queue BEFORE loading so the 91.5 GiB
     // bf16-resident tower stages per tensor into the CUDA context (§13 recipe).
     .stage_on_load = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

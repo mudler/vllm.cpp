@@ -66,6 +66,7 @@
 
 #include "doctest/doctest.h"
 #include "support/max_abs_diff.h"
+#include "vt/dtype.h"
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 
@@ -184,6 +185,22 @@ struct ParamBag {
   }
 };
 
+// The SAME bag, narrowed once -- what `Ltx2LoadVaeWeights` at `kBF16` does to a
+// checkpoint and what `module.to(torch.bfloat16)` does to the generator's f32
+// state dict. Mirrors tests/vllm/models/test_ltx2_vae.cpp's helper of the same
+// name; both sides therefore round the same f32 values at the same single point,
+// so a mismatch is the ARITHMETIC and never the fixture (A24 wave 3, #2786).
+vllm::Ltx2VaeWeights NarrowToBf16(const vllm::Ltx2VaeWeights& f32) {
+  vllm::Ltx2VaeWeights out;
+  out.dtype = vt::DType::kBF16;
+  for (const auto& kv : f32.tensors) {
+    std::vector<uint16_t> narrow(kv.second.size());
+    for (size_t i = 0; i < kv.second.size(); ++i) narrow[i] = vt::F32ToBF16(kv.second[i]);
+    out.bf16[kv.first] = std::move(narrow);
+  }
+  return out;
+}
+
 void CheckManifest(const ParamBag& bag, const char* const* want_names, const int64_t* want_counts,
                    size_t want_size) {
   REQUIRE(bag.names.size() == want_size);
@@ -239,6 +256,60 @@ vllm::Ltx2TileSizeConfig ControlTiling() {
   cfg.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
   cfg.height = vllm::Ltx2DimensionSizeConfig{10000, 0};
   cfg.width = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  return cfg;
+}
+
+// scripts/gen-ltx2-tiling-goldens.py :: TILING_BF16_* — the SHALLOW fixture the
+// bf16 arm runs, and it is shallow for the reason `VIDEO_SHALLOW_BLOCKS` is in
+// tests/vllm/models/test_ltx2_vae.cpp. ONE `compress_all` between `conv_in` and
+// `conv_out`, eight parameters, so the arm is held BIT-EXACT instead of to a
+// band. It still tiles for real: time 2 and height/width 4 (types.py:45-53) make
+// an 8-frame / 8px tile four latent frames and two latent cells, so a (6, 3, 3)
+// latent splits into 2 temporal groups x 2 x 2 = EIGHT tiles overlapping on all
+// three axes.
+//
+// SIX LATENT FRAMES AND NOT FIVE, AND THAT IS LOAD-BEARING. At five the temporal
+// split is [0,4) and [2,5), so the tiles decode DIFFERENT latent shapes and
+// torch's convolution reduction blocks differently at the odd one; measured, the
+// port then sat one bf16 ulp from upstream on 1 of 3888 outputs. At six the split
+// is [0,4) and [2,6), every tile decodes the same (4, 2, 2) latent, and the tiled
+// arm is bit-exact.
+//
+// THE RAMP LENGTHS ARE CHOSEN, NOT INHERITED. `Ltx2TrapezoidalMask1d` builds its
+// ramps with a double linspace and narrows once; `torch.linspace` on a float32
+// tensor is not correctly rounded and disagrees with that for 21 of the 31 lengths in n = 2..32, including 4, 7, 8 and 13
+// (tiling.py:39-47, #2816, which carries the swept set — do NOT pick a geometry
+// from a short list of three, which is what an earlier form of this comment
+// offered). At f32 the difference is a relative 6e-8 and the
+// suite's 5e-6 band hides it; at bf16 it is a whole word, and a 6-frame /
+// 2-overlap temporal tile — which produces exactly an n = 4 ramp — put 2 of 3888
+// blended outputs one bf16 ulp from upstream. 8/4 does not reach a disagreeing
+// length, so this case measures the accumulation BUFFER and not the mask. #2816
+// owns the mask and is named in this row's `## Owed`.
+vllm::Ltx2ConvVideoDecoderConfig TilingBf16FixtureConfig() {
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  cfg.prefix = "ltx2.tiledecbf16.";
+  cfg.in_channels = 6;
+  cfg.out_channels = 3;
+  cfg.patch_size = 2;
+  cfg.base_channels = 8;
+  cfg.causal = false;  // the shipped polarity
+  cfg.timestep_conditioning = false;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReflect;
+  cfg.decoder_blocks = {{"compress_all", 1, 1, false, false}};
+  return cfg;
+}
+
+constexpr int64_t kBf16LatentT = 6;
+constexpr int64_t kBf16LatentH = 3;
+constexpr int64_t kBf16LatentW = 3;
+
+vllm::Ltx2TileSizeConfig Bf16FixtureTiling() {
+  vllm::Ltx2TileSizeConfig cfg;
+  cfg.frames = vllm::Ltx2DimensionSizeConfig{8, 4};
+  cfg.height = vllm::Ltx2DimensionSizeConfig{8, 4};
+  cfg.width = vllm::Ltx2DimensionSizeConfig{8, 4};
   return cfg;
 }
 
@@ -874,6 +945,172 @@ TEST_CASE("ltx2 tiled decode matches upstream ltx_core — NON-CAUSAL, the shipp
       vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseFile,
       vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseLine,
       vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseMessage);
+}
+
+TEST_CASE("ltx2 tiled decode at BF16: the accumulation BUFFER is upstream's own width") {
+  // A24 wave 3 fresh review (#2786), and the finding it repairs is that this
+  // component landed with NO gate at all. `Ltx2ConvVideoDecodeTiled` allocates
+  // its chunk buffer at `weights.dtype` and rounds at every accumulation, at the
+  // temporal blend and at the closing division, mirroring
+  // `torch.zeros(..., dtype=latent.dtype)` (conv_video_decoder.py:427) and its
+  // `zeros_like` weights denominator (`:526`). Every case above runs at f32,
+  // where all seven `RoundTo` sites are the identity: the reviewer forced the
+  // buffer back to `kF32` and this file stayed 10/10 green with 915/915
+  // assertions, as did the 114 cases of test_ltx2_video.
+  //
+  // AND IT IS A SHALLOW FIXTURE, which is the second half of the finding.
+  // Measured on the SIX-BLOCK fixture above at bf16, widening only the buffer
+  // moves upstream by 0.00889754 while one bf16 ulp of one `conv_in` weight moves
+  // it by 0.015625 — the irreducible term is LARGER than the defect, so no bound
+  // over that fixture could ever separate the buffer's width. One block deep the
+  // arm is bit-exact and needs no bound at all.
+  const vllm::Ltx2ConvVideoDecoderConfig cfg = TilingBf16FixtureConfig();
+  ParamBag bag = BuildFixtureParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2TileDecBf16ParamNames,
+                vllm_test::kLtx2TileDecBf16ParamCounts,
+                std::size(vllm_test::kLtx2TileDecBf16ParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+  // Half the bytes, on the same bag. An arm that computed in bf16 and kept f32
+  // parameters would satisfy every value check below and move twice the bytes.
+  CHECK(bf16.Bytes() * 2 == bag.weights.Bytes());
+  CHECK(bf16.tensors.empty());
+
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.tiledecbf16.input",
+                cfg.in_channels * kBf16LatentT * kBf16LatentH * kBf16LatentW, 1.0);
+  NoNoise noise;
+
+  // (B) the untiled bf16 reference FIRST: if this is wrong the tiled comparison
+  // proves nothing about the buffer.
+  const vllm::Ltx2VideoFrames untiled = vllm::Ltx2ConvVideoDecode(
+      cfg, bf16, latent, cfg.in_channels, kBf16LatentT, kBf16LatentH, kBf16LatentW, &noise);
+  CHECK(untiled.channels == vllm_test::kLtx2TileDecBf16OutC);
+  CHECK(untiled.frames == vllm_test::kLtx2TileDecBf16OutT);
+  CHECK(untiled.height == vllm_test::kLtx2TileDecBf16OutH);
+  CHECK(untiled.width == vllm_test::kLtx2TileDecBf16OutW);
+  {
+    // THE UNTILED REFERENCE CARRIES A BOUND AND THE TILED GATE BELOW DOES NOT.
+    // Decoded whole, this fixture is a (6, 3, 3) latent -- a shape no tile has --
+    // and the port sits one bf16 ulp from upstream there. The bound is upstream's
+    // own one-ulp sensitivity: how far this arm moves when ONE `conv_in` weight
+    // changes by ONE bf16 ulp, which is the size of the difference the port
+    // cannot avoid. Nothing about the port's own distance went into it. This is
+    // section 5e of the VAE goldens' discipline, applied to the reference and not
+    // to the gate.
+    const double err = MaxAbsDiff(untiled.data, vllm_test::kLtx2TileDecBf16Untiled,
+                                  std::size(vllm_test::kLtx2TileDecBf16Untiled));
+    INFO("bf16 untiled max|diff| = " << err << " against a one-ulp sensitivity of "
+         << vllm_test::kLtx2TileDecBf16UlpSensitivity << "; the two upstream arms are "
+         << vllm_test::kLtx2TileDecBf16UntiledRejectF32Arm << " apart");
+    CHECK(err <= vllm_test::kLtx2TileDecBf16UlpSensitivity);
+    CHECK(vllm_test::kLtx2TileDecBf16UlpSensitivity > 0.0);
+    // ...and the bound sits well inside the gap between the two upstream arms, so
+    // "the port quietly ran the f32 path" is a red here rather than a
+    // hypothetical.
+    CHECK(vllm_test::kLtx2TileDecBf16UntiledRejectF32Arm >
+          2 * vllm_test::kLtx2TileDecBf16UlpSensitivity);
+  }
+
+  // THE FIXTURE REALLY TILES. On a single tile every blend mask is 1 and the
+  // accumulation is exact, so the buffer's width would be unobservable however
+  // this case were written — which is precisely how the component reached the
+  // reviewer ungated.
+  const vllm::Ltx2ScaleFactors factors =
+      vllm::Ltx2VideoScaleFactorsFromBlocks(cfg.decoder_blocks, cfg.patch_size);
+  REQUIRE(static_cast<int64_t>(vllm::Ltx2CreateTiles(kBf16LatentT, kBf16LatentH, kBf16LatentW,
+                                                     Bf16FixtureTiling(), factors)
+                                   .size()) == vllm_test::kLtx2TileDecBf16TileCount);
+  REQUIRE(vllm_test::kLtx2TileDecBf16TileCount > 1);
+
+  // (A) the correctness gate.
+  Collected collected;
+  vllm::Ltx2ConvVideoDecodeTiled(
+      cfg, bf16, latent, cfg.in_channels, kBf16LatentT, kBf16LatentH, kBf16LatentW, &noise,
+      Bf16FixtureTiling(), [&](const vllm::Ltx2VideoChunk& c) { collected.chunks.push_back(c); });
+  REQUIRE(static_cast<int64_t>(collected.chunks.size()) ==
+          vllm_test::kLtx2TileDecBf16ChunkCount);
+  int64_t expect_first = 0;
+  for (int64_t i = 0; i < vllm_test::kLtx2TileDecBf16ChunkCount; ++i) {
+    INFO("chunk " << i);
+    CHECK(collected.chunks[static_cast<size_t>(i)].frames.frames ==
+          vllm_test::kLtx2TileDecBf16ChunkFrames[i]);
+    CHECK(collected.chunks[static_cast<size_t>(i)].first_frame == expect_first);
+    expect_first += vllm_test::kLtx2TileDecBf16ChunkFrames[i];
+  }
+  CHECK(expect_first == vllm_test::kLtx2TileDecBf16OutT);
+  const vllm::Ltx2VideoFrames tiled = collected.Concat();
+
+  // THE TWO REJECTED ANSWERS SEPARATE, asserted before the comparison that
+  // depends on them: a zero in either would mean the bit-exact check below is
+  // satisfied by a port that never narrowed anything.
+  //
+  //   * `RejectF32Arm` is this fixture decoded end to end at f32 — where a port
+  //     that ignored `weights.dtype` altogether lands.
+  //   * `RejectF32Buffer` is upstream re-run with every convolution left at bf16
+  //     and ONLY `torch.zeros`/`zeros_like` widened to f32. That is the fresh
+  //     review's own mutation of this port asked of upstream, and it is what
+  //     makes the BUFFER separable from the tile decodes rather than merely
+  //     bundled with them.
+  INFO("rejected distances: f32 arm " << vllm_test::kLtx2TileDecBf16RejectF32Arm
+       << ", f32 accumulation buffer " << vllm_test::kLtx2TileDecBf16RejectF32Buffer);
+  CHECK(vllm_test::kLtx2TileDecBf16RejectF32Arm > 0.0);
+  CHECK(vllm_test::kLtx2TileDecBf16RejectF32Buffer > 0.0);
+
+  const double err = MaxAbsDiff(tiled.data, vllm_test::kLtx2TileDecBf16Tiled,
+                                std::size(vllm_test::kLtx2TileDecBf16Tiled));
+  const double rej_arm = MaxAbsDiff(tiled.data, vllm_test::kLtx2TileDecBf16RejectedF32ArmTiled,
+                                    std::size(vllm_test::kLtx2TileDecBf16RejectedF32ArmTiled));
+  const double rej_buffer =
+      MaxAbsDiff(tiled.data, vllm_test::kLtx2TileDecBf16RejectedF32BufferTiled,
+                 std::size(vllm_test::kLtx2TileDecBf16RejectedF32BufferTiled));
+  // EACH REJECTED ANSWER IS EMITTED AS A TENSOR and not only as a distance, so a
+  // failing port is told WHICH hypothesis it landed on.
+  MESSAGE("bf16 tiled arm: vs upstream " << err << " vs f32-arm " << rej_arm
+          << " vs f32-buffer " << rej_buffer);
+  INFO("bf16 tiled max|diff| vs upstream = " << err);
+  // BIT-EXACT, not within a band. One block leaves no room for torch's blocked
+  // reduction to compound, and both rejected answers are further away than zero.
+  CHECK(err == 0.0);
+  // AND THE PORT SELECTS UPSTREAM'S ANSWER rather than merely sitting near it.
+  // Distance to a golden is one number; which of three goldens is nearest is a
+  // DISCRETE selection, and it is the form that survives the mutation in both
+  // directions. Widening `buffer.Allocate`'s dtype — or any of the seven
+  // `RoundTo` sites that read it — puts this port ON `RejectedF32BufferTiled`,
+  // which makes `rej_buffer` the residue and `err` the defect, and flips these.
+  CHECK(err < rej_buffer);
+  CHECK(err < rej_arm);
+  // The two distances the port measures are upstream's own, to the nine
+  // significant digits these constants are emitted with.
+  CHECK(std::abs(rej_arm - vllm_test::kLtx2TileDecBf16RejectF32Arm) <= kLtx2GoldenTol);
+  CHECK(std::abs(rej_buffer - vllm_test::kLtx2TileDecBf16RejectF32Buffer) <= kLtx2GoldenTol);
+
+  // (C) upstream's own tiled-vs-untiled gap at this width, held like section 7's.
+  const double gap = MaxAbsDiff(tiled.data, untiled.data.data(), untiled.data.size());
+  INFO("our bf16 max|tiled - untiled| = " << gap << ", upstream's = "
+       << vllm_test::kLtx2TileDecBf16UpstreamTiledVsUntiled);
+  CHECK(std::abs(gap - vllm_test::kLtx2TileDecBf16UpstreamTiledVsUntiled) <= kLtx2GoldenTol);
+
+  // (B') and the ONE-TILE CONTROL is still exact at bf16. Upstream measures 0
+  // here too, so a buffer that rounded where upstream does not would show as a
+  // non-zero even with no overlap in play.
+  CHECK(vllm_test::kLtx2TileDecBf16UpstreamControlVsUntiled == 0.0);
+  Collected control;
+  vllm::Ltx2ConvVideoDecodeTiled(
+      cfg, bf16, latent, cfg.in_channels, kBf16LatentT, kBf16LatentH, kBf16LatentW, &noise,
+      ControlTiling(), [&](const vllm::Ltx2VideoChunk& c) { control.chunks.push_back(c); });
+  CHECK(static_cast<int64_t>(control.chunks.size()) ==
+        vllm_test::kLtx2TileDecBf16ControlChunkCount);
+  const vllm::Ltx2VideoFrames control_frames = control.Concat();
+  REQUIRE(control_frames.data.size() == untiled.data.size());
+  const double control_gap =
+      MaxAbsDiff(control_frames.data, untiled.data.data(), untiled.data.size());
+  INFO("bf16 one-tile control max|diff| vs untiled = " << control_gap);
+  CHECK(control_gap == 0.0);
+  // ...and this is why the TILED gate is bit-exact rather than bounded: the
+  // buffer defect (0.00507808) is SMALLER than the one-ulp sensitivity
+  // (0.0078125), so a bound of that size would admit it. Exactness on the tiled
+  // path, plus the selection above, is what carries the buffer.
+  CHECK(vllm_test::kLtx2TileDecBf16RejectF32Buffer < vllm_test::kLtx2TileDecBf16UlpSensitivity);
 }
 
 TEST_CASE("ltx2 tiled decode: the diffusion decoder is REFUSED, never downgraded") {

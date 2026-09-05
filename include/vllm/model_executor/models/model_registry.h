@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "vllm/config/multimodal.h"
+#include "vllm/multimodal/inputs.h"  // MultiModalFeatureSpec (the P2 encoder seam)
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
@@ -95,7 +96,12 @@ struct ModelSource {
   static ModelSource FromSafetensorsOwned(
       std::shared_ptr<const std::vector<SafetensorsFile>> shards,
       vt::Queue* load_queue = nullptr);
-  static ModelSource FromGguf(const GgufFile& gguf);
+  // `device` is the device the ENGINE resolved for this load
+  // (`ResolveModelDeviceType`), and it has NO DEFAULT. Every GGUF weight
+  // loader reaches its residency policy through this value; the parameter is
+  // required so a new GGUF entry point cannot fall back to the accelerator
+  // probe by saying nothing. See `.agents/specs/gguf-residency-resolved-device.md`.
+  static ModelSource FromGguf(const GgufFile& gguf, vt::DeviceType device);
 
   Kind kind = Kind::kSafetensors;
   const std::vector<SafetensorsFile>* safetensors = nullptr;
@@ -124,6 +130,24 @@ struct ModelSource {
   // NULL means "no limits configured for this load": load everything, which is
   // byte-identical to pre-L3 and is what every non-engine caller gets.
   const MultiModalConfig* multimodal = nullptr;
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the device the ENGINE RESOLVED for this
+  // load, which is what the GGUF residency policy must read.
+  //
+  // It is NOT `vllm::platforms::CurrentPlatform().device_type()`. That probe
+  // answers `kCUDA` on any process where the CUDA platform registered, while
+  // `LoadedEngine::ResolveExplicitDeviceType` returns `kCPU` for an explicit
+  // `--device cpu` "even on a CUDA-capable build/process". The two therefore
+  // disagreed by construction, and the GGUF registries — the only production
+  // loaders with no policy argument of their own — took the probe's answer.
+  // `--device cpu` on a CUDA box got the CUDA residency policy, and on
+  // `qwen4_exp` that is a refusal whose own remedy text is `--device cpu`.
+  //
+  // It belongs on `ModelSource` for the reason `load_queue` and `multimodal`
+  // do: this struct is already the per-load CONTEXT and not only the
+  // checkpoint. `FromGguf` REQUIRES it. The struct default below is only ever
+  // reached by a safetensors source, and no safetensors path reads it — the
+  // residency policy is GGUF-only.
+  vt::DeviceType device = vt::DeviceType::kCPU;
 };
 
 struct ModelFactory;
@@ -540,6 +564,49 @@ struct MultiKvCacheIndex {
 // arrival, and the refusal's message reads the payload so it can say so.
 bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv);
 
+// ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): must a step whose HOST token identifiers
+// are stale be refused, because the forward it is bound for does not read the
+// device ones?
+//
+// A PURE PREDICATE for the same reason its `MultiKvRefusalApplies` sibling above
+// is one: the decision is gateable without a model, a runner or a registry, so
+// both polarities can be pinned directly rather than only through a full engine.
+// An inline copy inside `ModelRegistry::Forward` would be a second derivation,
+// and a second derivation is the thing that can disagree with the one a test
+// pins.
+//
+// TRUE when all three hold:
+//
+//   `device_token_ids != nullptr`   the mirror is live and the device buffer is
+//                                   authoritative for this step.
+//   `host_token_ids_stale`          and at least one row of this step actually
+//                                   HAS a spliced identifier, so the host vector
+//                                   and the device buffer disagree.
+//   `!consumes_device_token_ids`    and the registered forward never reads the
+//                                   device buffer.
+//
+// WHY THE MIDDLE TERM IS NOT REDUNDANT. Without it this reduces to nullness, and
+// nullness refuses `ForwardLlamaModelEmbedding` — a pooling forward that reads
+// host identifiers, never reads the pointer, and is CORRECT because every request
+// it serves is prefill-only. A refusal that fires on a model which actually works
+// is worse than the defect it prevents, so the guard turns on the DISAGREEMENT
+// and not on the arrival.
+//
+// THE MIDDLE TERM IS A PER-STEP FACT AND MUST STAY ONE. `v1::AnyRowSplicedByCombine`
+// computes it as an OR over every row, so a step that mixes prefill rows with one
+// decode row refuses as a whole. Evaluating the same rule per REQUEST would let
+// such a step through for its prefill rows while its decode row read identifiers
+// the runner never wrote — a refusal disagreeing with its own route predicate,
+// which is a failure this tree has shipped before.
+//
+// NOTE THE ASYMMETRY WITH THE SIBLING, which is why that one needs no such term:
+// a multi-cache topology is a property of the whole model and the whole step, so
+// its arrival IS its disagreement. Staleness here is a property of a ROW, so
+// arrival and disagreement come apart and both have to be asked.
+bool DeviceTokenIdsRefusalApplies(const int32_t* device_token_ids,
+                                  bool host_token_ids_stale,
+                                  bool consumes_device_token_ids);
+
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
 // concrete LoadedModel rather than leaking concrete weight types into runner.
@@ -614,10 +681,46 @@ struct ModelForwardInput {
   // since materializing it on the host is the synchronize W4 removes.
   //
   // A model that honors this embeds from the device pointer instead of uploading
-  // `token_ids`; a model that ignores it is simply never given one (the runner
-  // only sets it on the discrete-CUDA async path, which the Qwen3.5 gate vehicle
-  // owns). Null on every other path, so every other forward is byte-identical.
+  // `token_ids`.
+  //
+  // WHAT THIS COMMENT USED TO SAY, AND WHY IT IS GONE (#2710). It said "a model
+  // that ignores it is simply never given one (the runner only sets it on the
+  // discrete-CUDA async path, which the Qwen3.5 gate vehicle owns)". THAT
+  // SENTENCE WAS FALSE, and it is the sentence the defect hid behind for five
+  // architectures. `GPUModelRunner::execute_model` assigns this field
+  // UNCONDITIONALLY, for every registered forward, whenever the mirror is
+  // engaged — and `async_device_mirror()` is the DEFAULT on CUDA, integrated
+  // parts included, not a discrete-only opt-in. A model that ignored it was not
+  // spared; it was handed identifiers it then failed to read.
+  //
+  // IT IS NO LONGER ADVISORY. A forward may only be handed a step whose host
+  // identifiers are stale when its `ModelFactory::consumes_device_token_ids` is
+  // true; `ModelRegistry::Forward` refuses the step otherwise, exactly as the
+  // `multi_kv` channel below is refused. See `DeviceTokenIdsRefusalApplies`.
+  //
+  // Null on every non-mirror path, so every such forward is byte-identical.
   const int32_t* device_token_ids = nullptr;
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): does `token_ids` actually DISAGREE with
+  // `device_token_ids` for this step?
+  //
+  // The pointer above says "the device buffer is authoritative". This says "and
+  // it differs", which is a different fact and is the one a refusal must turn on.
+  // The runner's combine splices a row only when
+  // `v1::CombineSplicesRow(seq_len, prefill_len)` holds, so on a step whose rows
+  // are ALL prefill — every step of a pooling model, and the first step of every
+  // ordinary one — nothing is spliced and the host vector is perfectly good.
+  //
+  // WITHOUT THIS FIELD THE GUARD WOULD BE WORSE THAN THE DEFECT. It would refuse
+  // `ForwardLlamaModelEmbedding`, which reads host `token_ids`, never reads the
+  // pointer, and is CORRECT because every request it serves is prefill-only.
+  // Taking a working path away is a worse outcome than the silent staleness the
+  // guard exists to stop.
+  //
+  // PER-STEP, computed by `v1::AnyRowSplicedByCombine` as an OR over the whole
+  // batch. It is never a per-request answer; the header of that function says
+  // what a per-request reading would let through. FALSE by default, so every
+  // caller that is not the async runner is byte-identical.
+  bool host_token_ids_stale = false;
   // KV-DSV4-MULTICACHE W3 (#2068): the THIRD cache channel. Non-null only when
   // the runner allocated a MULTI-CACHE topology — one whose published groups the
   // positional `attn_kv` convention cannot address. THREE architectures publish
@@ -631,6 +734,125 @@ struct ModelForwardInput {
   // above, so no positional initializer moves.
   const MultiKvCacheIndex* multi_kv = nullptr;
 };
+
+// ── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal MODEL seam ─────────────
+//
+// Upstream's runner does not implement multimodal itself. It calls three MODEL
+// methods through two protocols, and the runner code is generic over them:
+//
+//   SupportsMultiModal.embed_multimodal      -> the vision/audio tower
+//   SupportsMultiModal.embed_input_ids       -> embed ids + splice the mm rows
+//   SupportsMRoPE.get_mrope_input_positions  -> the 3-D prompt positions
+//
+// `ModelRegistry` is type-erased over `LoadedModel`, so a Python protocol
+// becomes three optional function pointers on `ModelFactory`. All three default
+// null, and `GPUModelRunner` runs its multimodal path only when the first two
+// are set AND some request in the step carries mm_features — so a text model
+// and a text step are byte-identical.
+//
+// WHY DEEPSTACK IS NOT IN THIS SEAM. `grep -c deepstack` over upstream's
+// `gpu_model_runner.py` is 0. Qwen3-VL's multiscale features ride INSIDE the
+// tower output and are unpacked model-side into a model-owned buffer
+// (`qwen3_vl.py:1757 self.deepstack_input_embeds`, the ctor one of two,
+// discriminated by its `# register buffer for deepstack` comment). A runner
+// that knew about DeepStack would be a runner that knows about one
+// architecture, so the runner here does not either: `MmEncoderOutput` carries
+// exactly one tensor, and what a model chooses to stash beside it is its own.
+
+// One multimodal item's encoder output — the mirror of one element of
+// `MultiModalEmbeddings` (`embed_multimodal`'s return).
+struct MmEncoderOutput {
+  // Owns the device allocation `embeds` views. The runner keeps this alive for
+  // as long as the mm_hash stays in its encoder cache, and drops it when the
+  // scheduler reports the hash freed.
+  std::shared_ptr<void> storage;
+  // [num_embeds, hidden] in the model dtype.
+  vt::Tensor embeds;
+};
+
+// What the runner hands the model's `embed_input_ids` mirror for ONE step.
+// Every pointer is BORROWED and valid only for the duration of the call.
+struct MmEmbedInputs {
+  // [num_scheduled_tokens] the step's input ids, in batch (dense) order.
+  const std::vector<int32_t>* token_ids = nullptr;
+  // The gathered encoder-output ROW SLICES, in the order their `true` positions
+  // appear in `is_mm_embed` — upstream's `multimodal_embeddings` list.
+  const std::vector<vt::Tensor>* mm_embeds = nullptr;
+  // [num_scheduled_tokens] upstream's `is_multimodal` bool mask. `char` rather
+  // than `bool` because `std::vector<bool>` has no contiguous buffer to upload.
+  const std::vector<char>* is_mm_embed = nullptr;
+  // [3 * num_scheduled_tokens] row-major M-RoPE positions, or EMPTY when the
+  // registration declares no `mrope_prompt_positions` (upstream's
+  // `uses_mrope == False`, which is Gemma-4's multimodal arm: it reads the 1-D
+  // `ModelForwardInput::positions` instead).
+  const std::vector<int32_t>* mrope_positions = nullptr;
+  // ENG-MM-EMBED-DEVICE-IDS ([#2730](https://github.com/mudler/vllm.cpp/issues/2730)):
+  // the DEVICE twin of `token_ids`, and the reason this struct exists in the
+  // shape it does.
+  //
+  // `token_ids` above is the host step vector, and the asynchronous runner
+  // deliberately leaves it STALE for decode rows: its combine splices each decode
+  // row's sampled token into the DEVICE buffer on the main queue and never writes
+  // it back, because materialising it on the host is the synchronise that path
+  // exists to remove. `token_ids_cpu` is zero-initialised, so a hook that embeds
+  // the host vector alone builds `inputs_embeds` from TOKEN ID 0 on every decode
+  // row -- at rc=0, with plausible-looking output. `batch_carries_mm()` returns
+  // true on the decode steps of an image request BY DESIGN (see its own comment
+  // in `runner.cpp`), so this is reached rather than theoretical, and
+  // `async_device_mirror()` is the DEFAULT on CUDA, integrated parts included.
+  //
+  // The two fields carry exactly what `ModelForwardInput::device_token_ids` and
+  // `ModelForwardInput::host_token_ids_stale` carry, set by the runner from the
+  // SAME two values in the same step, so the embed's guard and the forward's
+  // guard cannot disagree about one step.
+  //
+  // NOT ADVISORY. A hook may only be handed a step whose host identifiers are
+  // stale when its `ModelFactory::embed_mm_consumes_device_token_ids` is true;
+  // `ModelRegistry::EmbedMm` refuses the step otherwise, on the same
+  // `DeviceTokenIdsRefusalApplies` predicate `ModelRegistry::Forward` uses.
+  //
+  // Null on every non-mirror path, so every such step is byte-identical.
+  const int32_t* device_token_ids = nullptr;
+  // Whether `token_ids` actually DISAGREES with `device_token_ids` for this step.
+  // The pointer says the device buffer is authoritative; this says the two
+  // differ, which is a different fact and the one a refusal must turn on. FALSE
+  // on an image request's PREFILL step, where the combine splices no row -- and
+  // every image request reaches its first token through such a step, so a guard
+  // that ignored this term would take multimodal serving away entirely.
+  bool host_token_ids_stale = false;
+};
+
+// The per-step device buffers the model staged, plus the seam view over them.
+// `storage` keeps them alive until the runner's forward has returned.
+struct MmForwardBuffers {
+  std::vector<std::shared_ptr<void>> storage;
+  MultiModalForwardInput mm;
+};
+
+// `get_mrope_input_positions` (`SupportsMRoPE`). Computed ONCE per request at
+// admission (upstream `_init_mrope_positions`, gpu_model_runner.py:1654,
+// grep -c == 1) because it needs the WHOLE prompt; the per-step slice and the
+// synthesised completion part are the runner's.
+struct MropePromptPositions {
+  // [3 * num_prompt_tokens] row-major.
+  std::vector<int32_t> positions;
+  // The ONE scalar that carries M-RoPE across decode steps
+  // (gpu_model_runner.py:2786, grep -c == 1): a completion position is
+  // `context_len + i + delta` on all three axes.
+  int64_t delta = 0;
+};
+
+using ModelEncodeMmFn = MmEncoderOutput (*)(
+    LoadedModel& model, const HfConfig& config, vt::Queue& queue,
+    const multimodal::MultiModalFeatureSpec& item);
+using ModelEmbedMmFn = MmForwardBuffers (*)(LoadedModel& model,
+                                            const HfConfig& config,
+                                            vt::Queue& queue,
+                                            const MmEmbedInputs& inputs);
+using ModelMropePromptFn = MropePromptPositions (*)(
+    LoadedModel& model, const HfConfig& config,
+    const std::vector<int32_t>& prompt_token_ids,
+    const std::vector<multimodal::MultiModalFeatureSpec>& mm_features);
 
 using ModelConfigHook = void (*)(const HfConfig& config);
 using ModelWeightLoader = std::unique_ptr<LoadedModel> (*)(
@@ -652,6 +874,28 @@ struct ModelFactory {
   ModelPrepareFn prepare = nullptr;
   ModelForwardFn forward = nullptr;
   KVCacheSpecBuilder make_kv_cache = nullptr;
+  // ENG-MM-INPUT-PIPELINE P2 (#2379). See the seam note above the typedefs.
+  // Null on every text architecture, which is what keeps `GPUModelRunner`'s
+  // multimodal path off for them entirely rather than merely inert.
+  ModelEncodeMmFn encode_mm = nullptr;
+  ModelEmbedMmFn embed_mm = nullptr;
+  // OPTIONAL even for a multimodal model: null is upstream's `uses_mrope ==
+  // False`, and the runner then leaves `MmEmbedInputs::mrope_positions` empty
+  // and the model reads the ordinary 1-D positions.
+  ModelMropePromptFn mrope_prompt_positions = nullptr;
+  // The SMALLEST KV block size this architecture can be paged at, or 0 when it
+  // has no constraint. Upstream DERIVES this geometry rather than taking it from
+  // an operator: DeepSeek-V4 spells `[256 // compress_ratio, head_dim]`
+  // throughout (`sparse_swa.py:76-83`, `compressor.py:174-178`), so a
+  // `compress_ratio == 128` layer cannot be paged below 256 -- at the engine's
+  // default of 32, `block_size / compress_ratio` is 0 and the page holds no
+  // token.
+  //
+  // Declared here rather than left to a flag because `AGENTS.md` measures
+  // reachability on the DEFAULT configuration. A model that loads only when an
+  // operator happens to pass `--block-size 256` is not reachable by default, and
+  // `vllm-cli` does not expose that flag at all.
+  int kv_block_size_floor = 0;
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
@@ -698,6 +942,63 @@ struct ModelFactory {
   // while doing asymptotically more work, so no token gate can see it. A
   // capability whose absence is invisible must be opt-in.
   bool consumes_multi_kv = false;
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL ([#2710](https://github.com/mudler/vllm.cpp/issues/2710)):
+  // whether THIS model's registered forward READS
+  // `ModelForwardInput::device_token_ids` rather than embedding from the host
+  // `token_ids` vector the async runner deliberately leaves stale.
+  //
+  // THE DEFAULT IS FALSE AND THAT IS THE MECHANISM, the polarity
+  // `consumes_multi_kv` above and `stage_on_load` already use. A model added
+  // tomorrow that does not read the field is REFUSED on a step whose host
+  // identifiers are stale, instead of being handed them and decoding from
+  // whatever `token_ids_cpu` was zero-initialised to. Five architectures were
+  // caught doing exactly that before this bit existed (#1305, #2496, #2544); the
+  // sixth is the one this default is for.
+  //
+  // WHY A BIT AND NOT A LIST IN THE GUARD. The fact is a property of the forward
+  // and it lives beside the forward: the translation unit that reads the field is
+  // the one that sets this. A list inside `ModelRegistry::Forward` would have to
+  // be edited by every model row, which is the shared-file lock AGENTS.md
+  // `## Records` forbids.
+  //
+  // WHAT IT DOES NOT CLAIM. It says "this forward reads the field", not "on every
+  // path it can take". A forward with one arm that reads the device identifiers
+  // and another that does not is a defect in that forward, and this bit cannot
+  // see it. Setting it is a statement about the code, not a warrant for it.
+  //
+  // AND IT IS A STATEMENT ABOUT THE REGISTRATION, NOT ONLY ABOUT THE FUNCTION
+  // NAMED `forward` (ENG-MM-EMBED-DEVICE-IDS,
+  // [#2730](https://github.com/mudler/vllm.cpp/issues/2730)). A multimodal
+  // registration can resolve the step's identifiers in its `embed_mm` hook and
+  // hand the forward merged embeds instead, in which case the forward reads no
+  // identifier at all and the registration is still correct. `qwen3_vl` is that
+  // case and is the only one today: its forward REFUSES a step without
+  // `input.mm` by name, and the runner only ever supplies `mm` from the same
+  // branch that just called `ModelRegistry::EmbedMm` with the same device
+  // pointer, so every step it can reach came through the hook. Leaving this
+  // comment saying "forward" while a registration sets it on the strength of its
+  // embed is how a capability bit becomes a lie, so it says both. The HOOK's own
+  // fact is `embed_mm_consumes_device_token_ids` below and the two are separate,
+  // because `dots3_note` has one and not the other.
+  bool consumes_device_token_ids = false;
+  // ENG-MM-EMBED-DEVICE-IDS ([#2730](https://github.com/mudler/vllm.cpp/issues/2730)):
+  // the same question asked of the MULTIMODAL hook -- whether THIS model's
+  // `embed_mm` reads `MmEmbedInputs::device_token_ids` rather than gathering from
+  // the host vector the async runner leaves stale for decode rows.
+  //
+  // WHY A SECOND BIT AND NOT THE ONE ABOVE. `dots3_note` is the counterexample
+  // that makes one bit impossible: its `embed_mm` consumes the channel and its
+  // `forward` does not -- it reaches
+  // `Dots3NoteModel::ForwardDevice(input.token_ids, ...)` on a text-only batch,
+  // which is class (b) of `.agents/specs/eng-async-device-ids-refusal.md` and
+  // owed by [#2732](https://github.com/mudler/vllm.cpp/issues/2732). Collapsing
+  // the two facts would either un-refuse its stale text step or refuse its
+  // correct image step.
+  //
+  // THE DEFAULT IS FALSE AND THAT IS THE MECHANISM, the polarity every capability
+  // bit beside it uses. A hook added tomorrow that ignores the channel is REFUSED
+  // rather than served identifiers it never reads.
+  bool embed_mm_consumes_device_token_ids = false;
   // MODEL-MM-QWEN4-EXP W5L ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)):
   // whether THIS model's forward serves exactly ONE sequence per step, so the
   // engine must not schedule a batch it will refuse.
@@ -875,7 +1176,35 @@ class ModelRegistry {
   static v1::KVCacheConfig MakeKVCache(const LoadedModel& model,
                                        const HfConfig& config, int block_size,
                                        int num_blocks);
+
+  // The block size the engine must page this architecture at, given what the
+  // caller asked for. Returns `requested` unchanged for an architecture that
+  // declares no floor. THE single resolution point: `LoadedEngine` calls this
+  // before `MakeKVCache`, and a gate calls it with `EngineParams{}.block_size`
+  // to prove the model's DEFAULT configuration reaches a buildable geometry
+  // (writing the arithmetic out a second time in a test would only transcribe
+  // it, and could not detect it changing here).
+  static int ResolveKVBlockSize(const ModelRegistration& reg, int requested);
   static bool IsDenseModel(const LoadedModel& model);
+
+  // ── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal model seam ──
+  // SupportsMmInputs mirrors upstream's `self.supports_mm_inputs`
+  // (gpu_model_runner.py:530, `grep -c 'self.supports_mm_inputs ='` == 1), which
+  // is the predicate the whole mm arm of `execute_model` hangs on. Here it asks
+  // whether the REGISTRATION declares the two required hooks, which is the same
+  // question: a model that cannot run a tower and cannot embed with a splice has
+  // no mm path to take.
+  static bool SupportsMmInputs(const LoadedModel& model);
+  static bool UsesMrope(const LoadedModel& model);
+  static MmEncoderOutput EncodeMm(LoadedModel& model, const HfConfig& config,
+                                  vt::Queue& queue,
+                                  const multimodal::MultiModalFeatureSpec& item);
+  static MmForwardBuffers EmbedMm(LoadedModel& model, const HfConfig& config,
+                                  vt::Queue& queue, const MmEmbedInputs& inputs);
+  static MropePromptPositions MropePromptPositionsFor(
+      LoadedModel& model, const HfConfig& config,
+      const std::vector<int32_t>& prompt_token_ids,
+      const std::vector<multimodal::MultiModalFeatureSpec>& mm_features);
 };
 
 // Compatibility adapters for synthetic in-memory Qwen tests and callers that

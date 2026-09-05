@@ -174,14 +174,16 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "--a2v-guidance-scale is the guider\'s modality_scale; a take here rides whichever\n"
       "recipe the checkpoint resolves, in practice distilled_two_stage, whose sigmas are\n"
       "fixed. So no claim is made that this reproduces upstream\'s A2Vid output.\n\n"
-      "The WAV must already match the checkpoint: its sample rate must equal the audio\n"
-      "VAE\'s mel front-end rate and its channel count the encoder\'s in_channels.\n"
-      "Neither is converted, because upstream resamples with a polyphase kaiser\n"
-      "resampler that is not ported here and feeds the file\'s own channel count into a\n"
-      "fixed-width convolution; both mismatches are refused with both numbers, since a\n"
-      "resampled-wrong or upmixed take renders a finished clip conditioned on audio you\n"
-      "never supplied. The take must also be at least as long as the clip: upstream\n"
-      "truncates a long one and asserts on a short one, so a short one is refused.\n\n"
+      "ANY sample rate is accepted: a take whose rate differs from the audio VAE\'s\n"
+      "mel front-end rate is RESAMPLED to it, with upstream\'s own filter — the\n"
+      "gcd-reduced rational-ratio hann-windowed sinc `torchaudio.functional.resample`\n"
+      "builds at its defaults, which is what ops.py:40 calls. The CHANNEL COUNT must\n"
+      "still equal the encoder\'s in_channels and a mismatch is refused with both\n"
+      "numbers: upstream feeds the file\'s own channel count into a fixed-width\n"
+      "convolution, so up- or downmixing here would render a finished clip conditioned\n"
+      "on audio you never supplied. The take must also be at least as long as the clip:\n"
+      "upstream truncates a long one and asserts on a short one, so a short one is\n"
+      "refused.\n\n"
       "--audio-start-time seeks into the file (default 0) and --audio-max-duration caps\n"
       "how much is read (default: the clip\'s own duration). Either without\n"
       "--audio-path is refused rather than ignored. The rendered audio.wav is your own\n"
@@ -304,7 +306,10 @@ int main(int argc, char** argv) {
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
   // takes, built once after parsing.
   std::vector<std::string> extra_keys, extra_values;
-  auto SetExtra = [&](const char* key, std::string value) {
+  // How many `--lora` flags have been seen, which is how the engine's indexed
+  // load extras are numbered. See the flag below.
+  int lora_count = 0;
+  auto SetExtra = [&](const std::string& key, std::string value) {
     for (size_t i = 0; i < extra_keys.size(); ++i) {
       if (extra_keys[i] == key) {
         extra_values[i] = std::move(value);
@@ -371,12 +376,21 @@ int main(int argc, char** argv) {
     // strength is optional and defaults to upstream's DEFAULT_LORA_STRENGTH.
     // LOAD extras, because upstream fuses the adapter into the weights at
     // construction (ic_lora.py:104-114) and it cannot vary per request.
+    //
+    // REPEATABLE since row LTX25-LORA-FUSION (#932), which is what upstream's
+    // own help text has always said: "Can be specified multiple times. Example:
+    // --lora path/to/lora1.safetensors 0.8 --lora path/to/lora2.safetensors"
+    // (`utils/args.py:608-609`). The engine numbers adapters from 1 with the
+    // first unindexed, so this appends `_2`, `_3`, ... in the order given —
+    // which is the order they fuse in, and that order is observable.
     else if (f == "--lora") {
-      SetExtra("lora_path", Need(argc, argv, ++i, f.c_str()));
+      ++lora_count;
+      const std::string suffix = lora_count == 1 ? "" : "_" + std::to_string(lora_count);
+      SetExtra("lora_path" + suffix, Need(argc, argv, ++i, f.c_str()));
       // The optional second word. Consumed only when it does not look like the
       // next flag, which is how upstream's `nargs="+"` LoraAction disambiguates.
       if (i + 1 < argc && argv[i + 1][0] != '-') {
-        SetExtra("lora_strength", argv[++i]);
+        SetExtra("lora_strength" + suffix, argv[++i]);
       }
     }
     // Image conditioning (row LTX25-IMAGE-COND, issue #644). `--first-frame` is

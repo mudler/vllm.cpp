@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -374,6 +375,79 @@ std::vector<std::vector<uint8_t>> RunBattery(Threadpool& pool) {
     args.scale = 0.353553f;
     vt::GdnPrefill(q, to, tq, tk, tv, tg, tb, ts, tqsl, args);
     outs.push_back(Bytes(out.data(), out.size() * sizeof(float)));
+    outs.push_back(Bytes(state.data(), state.size() * sizeof(float)));
+  }
+  // GdnPrefill BF16, 2 sequences (one EMPTY), Hk=2 Hv=4 Dk=Dv=64, 130 tokens.
+  // KERNEL-GDN-CHUNKED-MIRROR T6/G5/R4. The two GdnPrefill entries above are
+  // f32, so under D0's dtype predicate NEITHER of them reaches the chunked arm
+  // -- they prove thread byte-identity for the algorithm this row did not
+  // change. This entry is bf16 and does reach it, at 130 tokens so the
+  // cross-chunk state carry (3 chunks incl. a partial tail) is inside the work
+  // item rather than skipped.
+  //
+  // The chunked arm keeps byte-identity the same way the sequential one does:
+  // the parallel axis is the (sequence, value-head) product, every reduction
+  // lives inside one work item, and the chunk recurrence stays sequential
+  // within it. Parallelising ACROSS chunks would break this, which is why R4
+  // names it as a constraint on the parallelisation rather than a property to
+  // hope for.
+  {
+    const int64_t total = 130, Hk = 2, Hv = 4, Dk = 64, Dv = 64;
+    std::vector<float> qf(total * Hk * Dk), kf(total * Hk * Dk), vf(total * Hv * Dv),
+        g(total * Hv), beta(total * Hv), state(2 * Hv * Dv * Dk, 0.0f),
+        outf(total * Hv * Dv);
+    FillF32(qf, 41);
+    FillF32(kf, 42);
+    FillF32(vf, 43);
+    FillF32(g, 44);
+    FillF32(beta, 45);
+    // q and k reach GdnPrefill L2-NORMALISED, on every production path and in
+    // every committed golden (`q_k_prenormalized: true`): the Qwen GDN layer
+    // normalises in fused_post_conv_prep, and upstream's own CPU chunked test
+    // runs the kernel with use_qk_l2norm_in_kernel=True. It is a PRECONDITION of
+    // the op, not decoration, and un-normalised inputs make this suite useless
+    // rather than merely noisy.
+    //
+    // THE MECHANISM IS THE GATED DELTA RULE ITSELF, NOT THE CHUNKED ARM. An
+    // earlier draft of this comment blamed the materialised `(I+A)^-1`, on the
+    // strength of seeing a 2.8e7 DIFFERENCE between the arms and assuming the
+    // sequential one was well behaved. It is not: measured over 12 seeds at
+    // T=70, Dk=Dv=128 with un-normalised q/k, the SEQUENTIAL recurrence reaches
+    // max|out| of 1e23 to 1e31 and the chunked arm is SMALLER in every one of
+    // them. With |k|^2 ~ Dk, the update S <- S(I - beta k k^T) + beta v k^T has a
+    // per-token factor of order (1 - beta|k|^2), so |S| grows geometrically for
+    // both arms. Normalisation is what makes |k|^2 = 1 and the recurrence a
+    // contraction. There is no asymmetry between the arms to attribute here.
+    auto l2 = [](std::vector<float>& x, int64_t rows, int64_t d) {
+      for (int64_t r = 0; r < rows; ++r) {
+        double ss = 0.0;
+        for (int64_t j = 0; j < d; ++j) ss += static_cast<double>(x[r * d + j]) * x[r * d + j];
+        const float inv = 1.0f / std::sqrt(static_cast<float>(ss) + 1e-6f);
+        for (int64_t j = 0; j < d; ++j) x[r * d + j] *= inv;
+      }
+    };
+    l2(qf, total * Hk, Dk);
+    l2(kf, total * Hk, Dk);
+    for (auto& x : g) x = -std::abs(x) * 0.25f;   // g is a log-decay: <= 0
+    for (auto& x : beta) x = 0.1f + 0.8f * std::abs(x - std::floor(x));
+    std::vector<uint16_t> qb(qf.size()), kb(kf.size()), vb(vf.size()),
+        ob(outf.size(), 0);
+    for (size_t i = 0; i < qf.size(); ++i) qb[i] = vt::F32ToBF16(qf[i]);
+    for (size_t i = 0; i < kf.size(); ++i) kb[i] = vt::F32ToBF16(kf[i]);
+    for (size_t i = 0; i < vf.size(); ++i) vb[i] = vt::F32ToBF16(vf[i]);
+    std::vector<int32_t> qsl = {0, 130, 130};
+    Tensor tq = Tensor::Contiguous(qb.data(), DType::kBF16, Cpu(), {total, Hk, Dk});
+    Tensor tk = Tensor::Contiguous(kb.data(), DType::kBF16, Cpu(), {total, Hk, Dk});
+    Tensor tv = Tensor::Contiguous(vb.data(), DType::kBF16, Cpu(), {total, Hv, Dv});
+    Tensor tg = Tensor::Contiguous(g.data(), DType::kF32, Cpu(), {total, Hv});
+    Tensor tb = Tensor::Contiguous(beta.data(), DType::kF32, Cpu(), {total, Hv});
+    Tensor ts = Tensor::Contiguous(state.data(), DType::kF32, Cpu(), {2, Hv, Dv, Dk});
+    Tensor tqsl = Tensor::Contiguous(qsl.data(), DType::kI32, Cpu(), {3});
+    Tensor to = Tensor::Contiguous(ob.data(), DType::kBF16, Cpu(), {total, Hv, Dv});
+    vt::GdnArgs args;
+    args.scale = 0.125f;
+    vt::GdnPrefill(q, to, tq, tk, tv, tg, tb, ts, tqsl, args);
+    outs.push_back(Bytes(ob.data(), ob.size() * sizeof(uint16_t)));
     outs.push_back(Bytes(state.data(), state.size() * sizeof(float)));
   }
   // PagedAttention: one prefill sequence of 37 tokens (c1 prefill shape) — the

@@ -28,29 +28,90 @@ using vt::Tensor;
 
 // vt::MatmulBT + optional bias. `weight` is [out_features, in_features], torch's
 // own nn.Linear layout, so y = x @ W^T + b reads straight off the module.
+// `.to(torch.bfloat16)`: round to nearest, ties to even on the discarded low 16
+// bits. Every bf16 elementwise op torch performs is "compute in f32, round with
+// this rule" — measured exhaustively over the bf16 domain for mul, sub, add and
+// pow(2) by A24 wave 1 — so this one function is the whole narrowing contract.
+// `vt::F32ToBF16` is already round-to-nearest-EVEN, so widening its result is the
+// value upstream holds.
+inline float NarrowOne(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)); }
+
+// Narrow a whole buffer, or leave it alone. `kF32` is every caller that existed
+// before A24 wave 2 and this is then a no-op by construction, which is what keeps
+// the DiT's reference arm byte-identical.
+void NarrowTo(DType dtype, float* p, size_t count) {
+  if (dtype != DType::kBF16) return;
+  for (size_t i = 0; i < count; ++i) p[i] = NarrowOne(p[i]);
+}
+
+// A weight the caller must read as f32 while the bag may hold it as bf16. The
+// widening is EXACT — bf16 is a truncation of f32's exponent-and-high-mantissa
+// field — so this changes storage and never a value.
+const float* AsF32(const Tensor& t, std::vector<float>& scratch) {
+  if (t.data == nullptr) return nullptr;
+  if (t.dtype == DType::kF32) return t.Ptr<float>();
+  VT_CHECK(t.dtype == DType::kBF16,
+           "ltx2: a weight the forward reads elementwise is neither f32 nor bf16");
+  int64_t n = 1;
+  for (int r = 0; r < t.rank; ++r) n *= t.shape[r];
+  scratch.resize(static_cast<size_t>(n));
+  const auto* src = static_cast<const uint16_t*>(t.data);
+  for (int64_t i = 0; i < n; ++i) scratch[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  return scratch.data();
+}
+
 void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
-            const Ltx2LinearWeight& w, float* out) {
+            const Ltx2LinearWeight& w, float* out, DType compute_dtype = DType::kF32) {
   VT_CHECK(w.weight.rank == 2 && w.weight.shape[1] == in_features,
            "ltx2 linear: weight shape does not match input width");
-  VT_CHECK(w.weight.dtype == DType::kF32, "ltx2 linear: L2 forward expects f32 weights");
+  // A24 wave 2 (#2720) NARROWS this refusal; it does not remove it. bf16 is
+  // upstream's default dtype for every non-DiT component (`distilled.py:109`),
+  // and the FP8 / NVFP4 arms are A22 and are still refused here by name.
+  VT_CHECK(w.weight.dtype == DType::kF32 || w.weight.dtype == DType::kBF16,
+           "ltx2 linear: the forward serves f32 and bf16 weights. The FP8 and NVFP4 arms are "
+           "A22 (upstream's quantization policies, quantization_factory.py:22-26) and are not "
+           "implemented");
   const int64_t out_features = w.weight.shape[0];
   Tensor a = Tensor::Contiguous(const_cast<float*>(in), DType::kF32, w.weight.device,
                                 {rows, in_features});
   Tensor o = Tensor::Contiguous(out, DType::kF32, w.weight.device, {rows, out_features});
+  // The GEMM keeps an f32 ACCUMULATOR and an f32 output tensor whichever width
+  // the operands carry (`MatmulOneChunkRef`, cpu_ops.cpp:151-180), which is
+  // exactly `nn.Linear`'s bf16 contract: accumulate in f32, add the bias in f32,
+  // round ONCE. Measured bit-exact. A port that rounded the GEMM output and then
+  // added the bias would round twice and be wrong.
   vt::MatmulBT(q, o, a, w.weight);
   if (w.bias.data != nullptr) {
-    const float* b = w.bias.Ptr<float>();
+    std::vector<float> bias_scratch;
+    const float* b = AsF32(w.bias, bias_scratch);
     for (int64_t r = 0; r < rows; ++r) {
       float* dst = out + r * out_features;
       for (int64_t i = 0; i < out_features; ++i) dst[i] += b[i];
     }
   }
+  NarrowTo(compute_dtype, out, static_cast<size_t>(rows * out_features));
 }
+
+}  // namespace
 
 // torch.nn.functional.rms_norm over the last dim (ltx_core/utils.py:7-12), with
 // an optional elementwise weight (torch.nn.RMSNorm, attention.py:505-506).
-void RmsNormRows(const float* in, const float* weight, float* out, int64_t rows, int64_t width,
-                 double eps) {
+// `out_dtype` is the dtype the RESULT is materialized in, and at bf16 that is the
+// ONLY narrowing in this function. MEASURED, and it is the opposite of A24 wave
+// 1's tower norm: `F.rms_norm` on a bf16 input widens to f32, accumulates the
+// mean square in f32, adds the f32 `1e-6` — NOT `bf16(1e-6)` — multiplies, and
+// rounds once. Bit-equal on 1 973 760 of 1 973 760 values, against 0 for the
+// bf16-narrowed epsilon on the 4 values where the two part. Two norms in one
+// pipeline, two rules.
+//
+// THE f64 SUM STAYS, and that was measured rather than inherited. Upstream's
+// `mean` is a blocked f32 reduction no straight loop reproduces; against it, at
+// the shipped width 3840, a sequential f32 accumulation mismatches 11000 of
+// 15 360 000 values and this f64 one mismatches 24. Accumulating exactly and
+// rounding once is the closest single-rounding approximation to any order, which
+// is the same argument the f32 arm's own header makes.
+void Ltx2RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
+                     int64_t width, double eps, DType out_dtype) {
   for (int64_t r = 0; r < rows; ++r) {
     const float* src = in + r * width;
     double sum = 0.0;
@@ -62,8 +123,11 @@ void RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
     } else {
       for (int64_t i = 0; i < width; ++i) dst[i] = src[i] * inv * weight[i];
     }
+    NarrowTo(out_dtype, dst, static_cast<size_t>(width));
   }
 }
+
+namespace {
 
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
@@ -702,9 +766,19 @@ Ltx2FreqsCis Ltx2PrecomputeFreqsCis(const double* positions, int64_t batch, int6
 }
 
 void Ltx2ApplyRotaryEmb(float* x, int64_t batch, int64_t tokens, int64_t dim, int64_t heads,
-                        const Ltx2FreqsCis& pe, Ltx2RopeType rope_type) {
+                        const Ltx2FreqsCis& pe, Ltx2RopeType rope_type, DType compute_dtype) {
+  // The narrowing is per-EXPRESSION and the two arms disagree about where, so it
+  // cannot be applied from outside this function. `Round` is the identity on the
+  // f32 arm, which is what keeps every pre-existing caller byte-identical.
+  const bool bf16 = compute_dtype == DType::kBF16;
+  const auto Round = [bf16](float v) { return bf16 ? NarrowOne(v) : v; };
   if (rope_type == Ltx2RopeType::kInterleaved) {
     // apply_interleaved_rotary_emb (rope.py:30-40): rotate the (even, odd) pairs.
+    //
+    // `out = input * cos + input_rot * sin` is THREE torch ops, so at bf16 it
+    // materializes THREE bf16 tensors and rounds three times. Measured 0 of 384
+    // against the pinned module; the "all f32, one round" reading differs on 141
+    // of 384, so the probe separates them and this is not a stylistic choice.
     VT_CHECK(pe.shape.size() == 3 && pe.shape[2] == dim,
              "ltx2 rope: interleaved tables must be [batch, tokens, dim]");
     for (int64_t r = 0; r < batch * tokens; ++r) {
@@ -713,8 +787,8 @@ void Ltx2ApplyRotaryEmb(float* x, int64_t batch, int64_t tokens, int64_t dim, in
       const float* sin = pe.sin.data() + r * dim;
       for (int64_t c = 0; c < dim; c += 2) {
         const float a = row[c], b = row[c + 1];
-        row[c] = a * cos[c] + (-b) * sin[c];
-        row[c + 1] = b * cos[c + 1] + a * sin[c + 1];
+        row[c] = Round(Round(a * cos[c]) + Round((-b) * sin[c]));
+        row[c + 1] = Round(Round(b * cos[c + 1]) + Round(a * sin[c + 1]));
       }
     }
     return;
@@ -739,8 +813,16 @@ void Ltx2ApplyRotaryEmb(float* x, int64_t batch, int64_t tokens, int64_t dim, in
           const float cos = pe.cos[base + static_cast<size_t>(r)];
           const float sin = pe.sin[base + static_cast<size_t>(r)];
           const float lo = v[r], hi = v[per_head + r];
-          v[r] = lo * cos - hi * sin;
-          v[per_head + r] = hi * cos + lo * sin;
+          // `output = split_input * cos` materializes a bf16 tensor (rope.py:71)
+          // and `addcmul_` then FUSES the second multiply into the add with a
+          // single rounding (:75-76). So TWO roundings per output, not three and
+          // not one — and the second operand is the ORIGINAL half, not the
+          // already-scaled one. Measured 0 of 384; "all f32, one round" differs on
+          // 92 of 384 and "every op rounded" on 101, so the probe separates all
+          // three. This is the OPPOSITE structure from the interleaved arm six
+          // lines of upstream away.
+          v[r] = Round(Round(lo * cos) - hi * sin);
+          v[per_head + r] = Round(Round(hi * cos) + lo * sin);
         }
       }
     }
@@ -812,13 +894,19 @@ Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSin
 }
 
 std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeights& w,
-                                   const float* x, int64_t rows, int64_t dim, int64_t inner) {
+                                   const float* x, int64_t rows, int64_t dim, int64_t inner,
+                                   DType compute_dtype) {
   vt::Queue q{device, nullptr};
   std::vector<float> hidden(static_cast<size_t>(rows * inner));
-  Linear(q, x, rows, dim, w.proj_in, hidden.data());
+  Linear(q, x, rows, dim, w.proj_in, hidden.data(), compute_dtype);
+  // `F.gelu(self.proj(x), approximate="tanh")` (gelu_approx.py:10) on a bf16
+  // input is the f32 tanh formula applied to the bf16 Linear output and rounded
+  // ONCE — measured bit-exact on 6144 of 6144 values. The tanh itself is
+  // evaluated at f32, which is what `opmath_type` gives it.
   for (float& v : hidden) v = GeluTanh(v);
+  NarrowTo(compute_dtype, hidden.data(), hidden.size());
   std::vector<float> out(static_cast<size_t>(rows * dim));
-  Linear(q, hidden.data(), rows, inner, w.proj_out, out.data());
+  Linear(q, hidden.data(), rows, inner, w.proj_out, out.data(), compute_dtype);
   return out;
 }
 
@@ -842,18 +930,30 @@ static std::vector<float> Ltx2AttentionEpilogue(vt::Queue& q, const Ltx2Attentio
   // attention output. Gating after `to_out` would be a different model.
   if (w.to_gate_logits.weight.data != nullptr) {
     std::vector<float> logits(static_cast<size_t>(batch * tq * heads));
-    Linear(q, x, batch * tq, args.query_dim, w.to_gate_logits, logits.data());
+    Linear(q, x, batch * tq, args.query_dim, w.to_gate_logits, logits.data(),
+           args.compute_dtype);
+    const bool bf16 = args.compute_dtype == DType::kBF16;
     for (int64_t r = 0; r < batch * tq; ++r) {
       for (int64_t h = 0; h < heads; ++h) {
-        const float gate = 2.0f / (1.0f + std::exp(-logits[static_cast<size_t>(r * heads + h)]));
+        // `gates = 2.0 * torch.sigmoid(gate_logits)` (ops.py:104). At bf16 the
+        // sigmoid materializes a bf16 tensor — measured `bf16(f32 sigmoid)` on
+        // 200000 of 200000 values — and the multiply by 2 is EXACT at any width,
+        // so the gate itself is the narrowed sigmoid doubled. The product with
+        // the attention output is a third bf16 tensor.
+        float gate = 1.0f / (1.0f + std::exp(-logits[static_cast<size_t>(r * heads + h)]));
+        if (bf16) gate = NarrowOne(gate);
+        gate *= 2.0f;
         float* dst = attn.data() + r * inner + h * dim_head;
-        for (int64_t e = 0; e < dim_head; ++e) dst[e] *= gate;
+        for (int64_t e = 0; e < dim_head; ++e) {
+          dst[e] *= gate;
+          if (bf16) dst[e] = NarrowOne(dst[e]);
+        }
       }
     }
   }
 
   std::vector<float> out(static_cast<size_t>(batch * tq * args.query_dim));
-  Linear(q, attn.data(), batch * tq, inner, w.to_out, out.data());
+  Linear(q, attn.data(), batch * tq, inner, w.to_out, out.data(), args.compute_dtype);
   return out;
 }
 
@@ -888,7 +988,7 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
              "ltx2 attention: a perturbed pass computes no K, so it can neither fill nor read a "
              "prompt K/V cache");
     std::vector<float> vp(static_cast<size_t>(batch * tq * inner));
-    Linear(q, ctx, batch * s, ctx_dim, w.to_v, vp.data());
+    Linear(q, ctx, batch * s, ctx_dim, w.to_v, vp.data(), args.compute_dtype);
     return Ltx2AttentionEpilogue(q, w, x, std::move(vp), args, device);
   }
 
@@ -905,26 +1005,33 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
     kn = args.kv_in->k;
   } else {
     v.resize(static_cast<size_t>(batch * s * inner));
-    Linear(q, ctx, batch * s, ctx_dim, w.to_v, v.data());
+    Linear(q, ctx, batch * s, ctx_dim, w.to_v, v.data(), args.compute_dtype);
   }
   std::vector<float> qb(static_cast<size_t>(batch * tq * inner));
-  Linear(q, x, batch * tq, args.query_dim, w.to_q, qb.data());
+  Linear(q, x, batch * tq, args.query_dim, w.to_q, qb.data(), args.compute_dtype);
 
   // PytorchPreAttention (ops.py:22-37): the q/k RMSNorm runs over the FULL inner
   // width, before the head split, and RoPE follows it.
   std::vector<float> qn(qb.size());
-  RmsNormRows(qb.data(), w.q_norm.Ptr<float>(), qn.data(), batch * tq, inner, args.norm_eps);
+  // The q/k norms are `torch.nn.RMSNorm(inner_dim)` (attention.py:505-506) and
+  // the bag may hold their gains at either width; the widening is exact.
+  std::vector<float> qnorm_scratch, knorm_scratch;
+  Ltx2RmsNormRows(qb.data(), AsF32(w.q_norm, qnorm_scratch), qn.data(), batch * tq, inner,
+                  args.norm_eps, args.compute_dtype);
   if (!reuse_kv) {
     std::vector<float> kb(static_cast<size_t>(batch * s * inner));
-    Linear(q, ctx, batch * s, ctx_dim, w.to_k, kb.data());
+    Linear(q, ctx, batch * s, ctx_dim, w.to_k, kb.data(), args.compute_dtype);
     kn.resize(kb.size());
-    RmsNormRows(kb.data(), w.k_norm.Ptr<float>(), kn.data(), batch * s, inner, args.norm_eps);
+    Ltx2RmsNormRows(kb.data(), AsF32(w.k_norm, knorm_scratch), kn.data(), batch * s, inner,
+                    args.norm_eps, args.compute_dtype);
   }
   if (args.pe != nullptr) {
-    Ltx2ApplyRotaryEmb(qn.data(), batch, tq, inner, heads, *args.pe, args.rope_type);
+    Ltx2ApplyRotaryEmb(qn.data(), batch, tq, inner, heads, *args.pe, args.rope_type,
+                       args.compute_dtype);
     if (!reuse_kv) {
       const Ltx2FreqsCis& kpe = args.k_pe != nullptr ? *args.k_pe : *args.pe;
-      Ltx2ApplyRotaryEmb(kn.data(), batch, s, inner, heads, kpe, args.rope_type);
+      Ltx2ApplyRotaryEmb(kn.data(), batch, s, inner, heads, kpe, args.rope_type,
+                         args.compute_dtype);
     }
   }
   if (args.kv_out != nullptr) {
@@ -975,6 +1082,14 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
       vt::AttentionCross(q, to_t, tq_t, tk_t, tv_t, args.bias != nullptr ? &bias : nullptr, a);
     }
   }
+
+  // ONE narrowing for the whole attention, because upstream materializes exactly
+  // one bf16 tensor here. `SDPBackend.MATH` on bf16 inputs is bit-equal to an
+  // f32-accumulated attention with NO intermediate rounding — measured 0 of 384
+  // against both an f32 and an f64 reference — so rounding the scores or the
+  // probabilities would be a defect, not extra fidelity. The three hypotheses
+  // that do round them were measured and differ on 140, 180 and 195 of 384.
+  NarrowTo(args.compute_dtype, attn.data(), attn.size());
 
   return Ltx2AttentionEpilogue(q, w, x, std::move(attn), args, device);
 }

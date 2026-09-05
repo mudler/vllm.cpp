@@ -39,6 +39,7 @@
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/multimodal/inputs.h"  // MultiModalFeatureSpec (P2, #2379)
 #include "vllm/v1/request.h"
 #include "vt/dtype.h"
 
@@ -1557,4 +1558,348 @@ TEST_CASE("Scheduler.schedule: the token budget splits a 4x1024 prefill wave") {
     CHECK(out2.num_scheduled_tokens.at("d") == 2);
     CHECK(out2.total_num_scheduled_tokens == 5);  // a,b,c decode + d's tail
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENG-MM-INPUT-PIPELINE P2 (#2379) — the ENCODER half of the scheduler.
+//
+// Ported from tests/v1/core/test_scheduler.py::test_schedule_partial_requests
+// and test_encoder_cache_* @ 5559679229, reduced to the paths this tree has:
+// no encoder-decoder manager, no EC connector, no EAGLE shift.
+//
+// Before this row every one of these observables was hardcoded: the scheduler
+// wrote `num_encoder_tokens = 0`, left `scheduled_encoder_inputs` empty and
+// never called `free_encoder_mm_hashes`, and `EncoderCacheManager` — fully
+// ported — was constructed nowhere in the tree.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A scheduler with the encoder knobs the mm cases need. Separate from
+// CreateScheduler so every existing case keeps the exact config it had.
+std::unique_ptr<Scheduler> CreateMmScheduler(int max_num_batched_tokens,
+                                             int encoder_compute_budget,
+                                             int encoder_cache_size,
+                                             bool disable_chunked_mm_input = false,
+                                             int max_num_seqs = 16,
+                                             int num_blocks = 10000,
+                                             int block_size = 16) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = max_num_seqs;
+  cfg.max_num_batched_tokens = max_num_batched_tokens;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.max_num_encoder_input_tokens = encoder_compute_budget;
+  cfg.encoder_cache_size = encoder_cache_size;
+  cfg.disable_chunked_mm_input = disable_chunked_mm_input;
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = num_blocks;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(block_size, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  return std::make_unique<Scheduler>(cfg, kv_cfg, block_size,
+                                     /*enable_caching=*/true);
+}
+
+// One placeholder span. `mm_hash` is what the encoder cache is keyed by, so two
+// items that share it are ONE encoder run — which is the property the
+// same-image-twice case below turns on.
+vllm::multimodal::MultiModalFeatureSpec Item(const std::string& mm_hash,
+                                             int offset, int length) {
+  vllm::multimodal::MultiModalFeatureSpec spec;
+  spec.mm_hash = mm_hash;
+  spec.modality = "image";
+  spec.offset = offset;
+  spec.length = length;
+  return spec;
+}
+
+// A request whose prompt carries the given placeholder spans. The prompt ids
+// themselves are irrelevant to the scheduler — it budgets on the SPANS.
+std::unique_ptr<Request> MmRequest(
+    const std::string& id, int num_tokens,
+    std::vector<vllm::multimodal::MultiModalFeatureSpec> items) {
+  static bool none_hash_initialized = false;
+  if (!none_hash_initialized) {
+    init_none_hash(sha256_cbor);
+    none_hash_initialized = true;
+  }
+  auto block_hasher = get_request_block_hasher(16, sha256_cbor);
+  SamplingParams params;
+  params.max_tokens = 16;
+  std::vector<int32_t> prompt(static_cast<size_t>(num_tokens), 7);
+  auto req = std::make_unique<Request>(id, prompt, params, /*arrival_time=*/0.0,
+                                       block_hasher);
+  req->mm_features = std::move(items);
+  return req;
+}
+
+}  // namespace
+
+TEST_CASE("Scheduler.schedule: a text step schedules NO encoder input and frees none") {
+  // The neutrality floor. Every encoder observable stays at the value it had
+  // before this row, and it stays there because the request carries no items —
+  // not because the code is absent.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/64,
+                                     /*encoder_compute_budget=*/64,
+                                     /*encoder_cache_size=*/64);
+  auto requests = CreateRequests(/*num_requests=*/2, /*num_tokens=*/8);
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  const SchedulerOutput out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 2);
+  CHECK(out.scheduled_encoder_inputs.empty());
+  CHECK(out.free_encoder_mm_hashes.empty());
+  CHECK(out.total_num_scheduled_tokens == 16);
+  // The payload hop is a no-op for a text request rather than absent.
+  for (const auto& n : out.scheduled_new_reqs) CHECK(n.mm_features.empty());
+}
+
+TEST_CASE("Scheduler.schedule: an image request carries mm_features to the worker") {
+  // NewRequestData::from_request is the hop that used to drop the payload.
+  auto scheduler = CreateMmScheduler(64, 64, 64);
+  AddRequest(*scheduler, MmRequest("img", /*num_tokens=*/12,
+                                   {Item("hash-a", /*offset=*/4, /*length=*/4)}));
+
+  const SchedulerOutput out = scheduler->schedule();
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  REQUIRE(out.scheduled_new_reqs[0].mm_features.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].mm_features[0].mm_hash == "hash-a");
+  CHECK(out.scheduled_new_reqs[0].mm_features[0].offset == 4);
+  CHECK(out.scheduled_new_reqs[0].mm_features[0].length == 4);
+
+  // ...and the encoder admission named the item to run.
+  REQUIRE(out.scheduled_encoder_inputs.count("img") == 1);
+  REQUIRE(out.scheduled_encoder_inputs.at("img").size() == 1);
+  CHECK(out.scheduled_encoder_inputs.at("img")[0] == 0);
+  CHECK(out.total_num_scheduled_tokens == 12);
+}
+
+TEST_CASE("Scheduler.schedule: the same mm_hash twice is ONE encoder run") {
+  // check_and_update_cache keys on the CONTENT hash, so a prompt that repeats
+  // one image pays for one encoder pass. Keying on (req_id, input_id) would
+  // schedule both and spend the budget twice.
+  auto scheduler = CreateMmScheduler(64, 64, 64);
+  AddRequest(*scheduler, MmRequest("twice", /*num_tokens=*/16,
+                                   {Item("same", 2, 4), Item("same", 8, 4)}));
+
+  const SchedulerOutput out = scheduler->schedule();
+  REQUIRE(out.scheduled_encoder_inputs.count("twice") == 1);
+  CHECK(out.scheduled_encoder_inputs.at("twice").size() == 1);
+  CHECK(out.scheduled_encoder_inputs.at("twice")[0] == 0);
+}
+
+TEST_CASE("Scheduler.schedule: an already-encoded item is not re-scheduled") {
+  // The second step covers the same span again (chunked prefill), and the cache
+  // answers for it. A scheduler that re-scheduled would re-run the tower on
+  // every chunk of a long prompt.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/8, 64, 64);
+  AddRequest(*scheduler, MmRequest("img", /*num_tokens=*/16,
+                                   {Item("hash-a", /*offset=*/0, /*length=*/4)}));
+
+  const SchedulerOutput first = scheduler->schedule();
+  CHECK(first.num_scheduled_tokens.at("img") == 8);
+  REQUIRE(first.scheduled_encoder_inputs.count("img") == 1);
+
+  const SchedulerOutput second = scheduler->schedule();
+  CHECK(second.num_scheduled_tokens.at("img") == 8);
+  CHECK(second.scheduled_encoder_inputs.empty());
+}
+
+// ---------------------------------------------------------------------------
+// THE STRADDLING ITEM — the case the whole three-hop landing exists to keep
+// safe. Upstream never chunks an ENCODER: when an item cannot be admitted, the
+// admission TRUNCATES the decoder chunk to stop before the item's span. Without
+// that truncation a chunk covers placeholder rows whose encoder never ran, and
+// the runner's gather raises "Encoder cache miss" — which on the serving path
+// is an HTTP 500 for an ordinary image request under a small token budget.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: an unschedulable encoder input TRUNCATES the chunk before its span") {
+  // Encoder compute budget 2 < the item's 4 placeholder tokens, so the item
+  // cannot run this step at all. The step must stop at offset 6.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/32,
+                                     /*encoder_compute_budget=*/2,
+                                     /*encoder_cache_size=*/64);
+  AddRequest(*scheduler, MmRequest("img", /*num_tokens=*/16,
+                                   {Item("hash-a", /*offset=*/6, /*length=*/4)}));
+
+  const SchedulerOutput out = scheduler->schedule();
+  // WITHOUT the clamp this is 16 and the step covers rows 6..9 with no encoder
+  // output behind them.
+  CHECK(out.num_scheduled_tokens.at("img") == 6);
+  CHECK(out.scheduled_encoder_inputs.empty());
+  // The tokens that WERE scheduled stop exactly at the span.
+  CHECK(out.total_num_scheduled_tokens == 6);
+}
+
+TEST_CASE("Scheduler.schedule: the encoder CACHE, not only the budget, truncates") {
+  // Same clamp, reached through the other arm: the compute budget is ample and
+  // the cache is too small to hold the item. Two arms, one guard — a fix that
+  // only consulted the budget would leave this one covering unencoded rows.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/32,
+                                     /*encoder_compute_budget=*/64,
+                                     /*encoder_cache_size=*/2);
+  AddRequest(*scheduler, MmRequest("img", /*num_tokens=*/16,
+                                   {Item("hash-a", /*offset=*/6, /*length=*/4)}));
+
+  const SchedulerOutput out = scheduler->schedule();
+  CHECK(out.num_scheduled_tokens.at("img") == 6);
+  CHECK(out.scheduled_encoder_inputs.empty());
+}
+
+TEST_CASE("Scheduler.schedule: disable_chunked_mm_input rolls back to before the item") {
+  // The stricter arm (scheduler.py:1470). The budget is ample, so the item WOULD
+  // be admitted; what refuses is that the token budget covers only PART of its
+  // span. 10 tokens would reach row 9 and the span is [6, 10) — so the step
+  // rolls back to 6 rather than splitting the item.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/9,
+                                     /*encoder_compute_budget=*/64,
+                                     /*encoder_cache_size=*/64,
+                                     /*disable_chunked_mm_input=*/true);
+  AddRequest(*scheduler, MmRequest("img", /*num_tokens=*/16,
+                                   {Item("hash-a", /*offset=*/6, /*length=*/4)}));
+
+  const SchedulerOutput out = scheduler->schedule();
+  CHECK(out.num_scheduled_tokens.at("img") == 6);
+  CHECK(out.scheduled_encoder_inputs.empty());
+
+  // The DEFAULT arm on the same shape splits the span and admits the encoder,
+  // which is upstream's default and is safe because the encoder ran.
+  auto lenient = CreateMmScheduler(/*max_num_batched_tokens=*/9, 64, 64,
+                                   /*disable_chunked_mm_input=*/false);
+  AddRequest(*lenient, MmRequest("img", 16, {Item("hash-a", 6, 4)}));
+  const SchedulerOutput out2 = lenient->schedule();
+  CHECK(out2.num_scheduled_tokens.at("img") == 9);
+  REQUIRE(out2.scheduled_encoder_inputs.count("img") == 1);
+}
+
+TEST_CASE("Scheduler: a finished request's encoder entry becomes freeable and is EVICTED under pressure") {
+  // free_encoder_mm_hashes is the worker's only signal to drop a vision
+  // embedding. It reports what the cache actually EVICTED, not what became
+  // unreferenced, so a cache with room reports nothing and the worker keeps the
+  // entry for the next request that shares the hash.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/64,
+                                     /*encoder_compute_budget=*/64,
+                                     /*encoder_cache_size=*/4);
+  AddRequest(*scheduler, MmRequest("a", /*num_tokens=*/8, {Item("hash-a", 0, 4)}));
+  const SchedulerOutput first = scheduler->schedule();
+  REQUIRE(first.scheduled_encoder_inputs.count("a") == 1);
+  CHECK(first.free_encoder_mm_hashes.empty());
+
+  scheduler->finish_requests("a", vllm::v1::RequestStatus::kFinishedAborted);
+
+  // A second request needs the whole 4-slot cache for a DIFFERENT image, so the
+  // first entry is evicted and named.
+  AddRequest(*scheduler, MmRequest("b", /*num_tokens=*/8, {Item("hash-b", 0, 4)}));
+  const SchedulerOutput second = scheduler->schedule();
+  REQUIRE(second.scheduled_encoder_inputs.count("b") == 1);
+  REQUIRE(second.free_encoder_mm_hashes.size() == 1);
+  CHECK(second.free_encoder_mm_hashes[0] == "hash-a");
+}
+
+// ---------------------------------------------------------------------------
+// PREEMPTION frees the victim's encoder references — `_preempt_request`'s
+// `self.encoder_cache_manager.free(request)` (scheduler.py:1213), which sits
+// beside the block free and had NO test: deleting the call left this whole file
+// and `test_openai_api_server_mm_forward` green, because no case constructed a
+// preempted request that carried `mm_features`.
+//
+// WHAT GOES WRONG WITHOUT IT, precisely. A preemption resets
+// `num_computed_tokens` to 0, and `_free_encoder_inputs` frees an entry only
+// once `offset + length <= num_computed_tokens`. So the victim's references
+// survive the preemption and nothing drops them until the request either
+// re-passes the span or finishes. That is an UNRECLAIMABLE WINDOW, not an
+// unbounded leak: on resume `check_and_update_cache` re-references the same
+// entry idempotently, and the entry frees normally once the span is re-passed.
+// For the length of the window the slots are pinned, and `can_allocate` refuses
+// admissions the cache in fact has room for.
+//
+// WHY THE WAITING LOOP MUST NOT RUN, AND WHAT ACTUALLY STOPS IT. The loop would
+// re-visit the victim (a preemption prepends it to the waiting FRONT) and either
+// re-reference the entry through `CheckAndUpdateCache` or drop it through the
+// `allocate_slots` failure untouch (`free_request_encoder_inputs`,
+// scheduler.cpp:939; scheduler.py:938-939) — and BOTH arms converge on the same
+// counter whether or not `preempt_request` freed anything, which is exactly a
+// test that cannot see the defect. What keeps the loop out is the guard, not the
+// token budget: `Scheduler::schedule` wraps the whole waiting section in
+// `if (preempted_reqs.empty())` (scheduler.cpp:849), which sits BEFORE
+// `while (!waiting->empty() && token_budget > 0)` (scheduler.cpp:855). A step
+// that preempted anything can never reach the loop, whatever the budget is.
+// Upstream is identical at the pin (5559679229): `if not preempted_reqs and
+// self._pause_state == PauseState.UNPAUSED:` (scheduler.py:668). So the sizing
+// below buys the step's SHAPE — one decode chunk, one preemption, one 4-embed
+// item — and it does not buy the loop's skip. Re-sizing it does not disarm this
+// case, and a reviewer who widens the budget will still see both assertions go
+// red when the free in `preempt_request` is deleted.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: preemption RELEASES the victim's encoder cache slots") {
+  // Budget 16 == one block, so a single decode chunk spends the whole step.
+  // 8 blocks (one is the null block) leaves 7 usable: 5 for the hog's 80-token
+  // prompt and 2 for the image request's 32. The encoder cache holds exactly one
+  // 4-embed item, so "released" and "still pinned" are the only two states.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/16,
+                                     /*encoder_compute_budget=*/64,
+                                     /*encoder_cache_size=*/4,
+                                     /*disable_chunked_mm_input=*/false,
+                                     /*max_num_seqs=*/16,
+                                     /*num_blocks=*/8, /*block_size=*/16);
+  // The KV hog is TEXT and its prompt is all zeros, while MmRequest's is all
+  // sevens: distinct prompts, so prefix caching cannot let one ride on the
+  // other's blocks.
+  auto hog_owner = CreateRequests(/*num_requests=*/1, /*num_tokens=*/80, {"hog"});
+  Request* hog = hog_owner[0].get();
+  AddRequest(*scheduler, std::move(hog_owner[0]));
+  for (int i = 0; i < 5; ++i) {
+    const SchedulerOutput out = scheduler->schedule();
+    REQUIRE(out.num_scheduled_tokens.at("hog") == 16);
+  }
+  REQUIRE(hog->num_computed_tokens == 80);
+
+  // The image request is admitted BEHIND the hog, so it is the FCFS tail and
+  // therefore the preemption victim. Its item spans [0, 4), inside the first
+  // 16-token chunk, so this step is the one that runs the encoder.
+  Request* img = AddRequest(
+      *scheduler, MmRequest("img", /*num_tokens=*/32,
+                            {Item("hash-a", /*offset=*/0, /*length=*/4)}));
+  const SchedulerOutput admit = scheduler->schedule();
+  REQUIRE(admit.scheduled_encoder_inputs.count("img") == 1);
+  // The item is allocated: the whole 4-slot cache is spoken for, and none of it
+  // is reclaimable while the reference stands.
+  REQUIRE(scheduler->encoder_cache_manager->num_free_slots() == 0);
+  REQUIRE(scheduler->encoder_cache_manager->num_freeable_slots() == 0);
+
+  // Finish the image request's prefill so both requests hold their full block
+  // count and the cache is exactly full.
+  const SchedulerOutput fill = scheduler->schedule();
+  REQUIRE(fill.num_scheduled_tokens.at("img") == 16);
+  REQUIRE(img->num_computed_tokens == 32);
+
+  // The hog now has 16 sampled tokens the scheduler has not seen: one full
+  // budget's worth, needing a sixth block that the KV cache cannot give. The
+  // FCFS tail (the image request) is preempted to pay for it.
+  for (int i = 0; i < 16; ++i) hog->AppendOutputToken(0);
+  const SchedulerOutput out = scheduler->schedule();
+  REQUIRE(out.num_scheduled_tokens.at("hog") == 16);
+  REQUIRE(img->status == RequestStatus::kPreempted);
+  REQUIRE(img->num_computed_tokens == 0);
+  // INSTRUMENT PRECONDITION: this step preempted, so the `preempted_reqs.empty()`
+  // guard (scheduler.cpp:849) skipped the waiting loop and nothing touched the
+  // victim's encoder references after `preempt_request`. Without that skip the
+  // two assertions below would read the resume rather than the preemption.
+  REQUIRE(out.num_scheduled_tokens.count("img") == 0);
+  REQUIRE(scheduler->waiting->peek_request() == img);
+
+  // THE ASSERTION. The victim's reference is gone, so the entry is reclaimable
+  // again and the counter is back at the value it had before the allocation
+  // (cache_size == 4). Without the free in preempt_request this reads 0.
+  CHECK(scheduler->encoder_cache_manager->num_freeable_slots() == 4);
+  // And the consequence that makes it matter: an admission the pinned slots
+  // would have refused now succeeds. can_allocate has no free slot to give, so
+  // it can only say yes by reclaiming the preempted request's entry.
+  CHECK(scheduler->encoder_cache_manager->CanAllocate(
+      /*num_embeds=*/4, /*encoder_compute_budget=*/64,
+      /*num_embeds_to_schedule=*/0));
 }

@@ -551,7 +551,8 @@ std::atomic<uint64_t>& StagingAvoidedDeviceCopy() {
 ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
                             MeshDevice& device) {
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr, "[TT-UP] UploadRowsBf16 from_span WRITE during capture\n");
+    std::fprintf(stderr, "[TT-UP] UploadRowsBf16 from_span WRITE during capture ptr=%p rows=%u cols=%u\n",
+                 (const void*)t.data, rows, cols);
   const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   // The bytes at t.Ptr are the window's own bf16 bits (bfloat16 is a 2-byte
   // class wrapping the same uint16 pattern).
@@ -588,7 +589,8 @@ ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
     // tensor creation. Bytes on the device are the same packed bytes, into a
     // buffer of the same geometry, fully overwritten: bit-identical.
     if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-      std::fprintf(stderr, "[TT-UP] UploadRowsBf16 persistent enqueue_write during capture\n");
+      std::fprintf(stderr, "[TT-UP] UploadRowsBf16 persistent enqueue_write during capture ptr=%p rows=%u cols=%u\n",
+                   (const void*)t.data, rows, cols);
     ttnn::Tensor host = ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
                                                 TileSpecOf(rows, cols),
                                                 /*device=*/nullptr);
@@ -814,19 +816,40 @@ void DropPagedKvShadow(void* host) {
   PagedKvShadows().erase(reinterpret_cast<uintptr_t>(host));
 }
 
+// The flash-KV unbind(1) slice of the combined [nb,2,bs,nkv,d] paged store
+// (dense_attn_block.h KvSlice): dense inner dims, block stride 2*bs*nkv*d.
+// WarmPagedKvShadow stages exactly this view; nothing else may relax the
+// contiguity requirement.
+bool IsFlashKvUnbindView(const Tensor& t) {
+  return t.rank == 4 && t.stride[1] == t.shape[2] * t.shape[3] &&
+         t.stride[2] == t.shape[3] && t.stride[3] == 1;
+}
+
 // Convert host NHD blocks [0, used_nb) → ttnn [used_nb, nkv, bs, d] f32.
-std::vector<float> NhdToTtnnLayoutPrefix(const Tensor& cache, uint32_t used_nb) {
+// `accept_unbind_view` also admits the flash-KV unbind view above — vetted,
+// never assumed: the caller must pass the flag and the inner strides must
+// still be dense, so a genuinely misdescribed cache still fails the check
+// instead of silently reading the wrong slab. Default false keeps every
+// existing caller strict.
+std::vector<float> NhdToTtnnLayoutPrefix(const Tensor& cache, uint32_t used_nb,
+                                         bool accept_unbind_view = false) {
   EnsureHost(cache);
-  VT_CHECK(cache.rank == 4 && cache.IsContiguous(), "NhdToTtnn: rank-4 contiguous");
+  VT_CHECK(cache.rank == 4, "NhdToTtnn: rank-4");
   const int64_t nb = cache.shape[0], bs = cache.shape[1], nkv = cache.shape[2],
                 d = cache.shape[3];
+  VT_CHECK(cache.IsContiguous() || (accept_unbind_view && IsFlashKvUnbindView(cache)),
+           "NhdToTtnn: rank-4 contiguous (or vetted unbind view)");
   VT_CHECK(used_nb > 0 && static_cast<int64_t>(used_nb) <= nb, "NhdToTtnn: used_nb");
   std::vector<float> out(static_cast<size_t>(used_nb) * static_cast<size_t>(nkv * bs * d));
   for (int64_t b = 0; b < static_cast<int64_t>(used_nb); ++b) {
     for (int64_t g = 0; g < nkv; ++g) {
       for (int64_t off = 0; off < bs; ++off) {
         for (int64_t e = 0; e < d; ++e) {
-          const int64_t src = ((b * bs + off) * nkv + g) * d + e;
+          // General stride form: for a contiguous cache this is exactly the
+          // previous dense formula; for the unbind view it is the only form
+          // that reads block b's own slab instead of its neighbor's.
+          const int64_t src = b * cache.stride[0] + off * cache.stride[1] +
+                              g * cache.stride[2] + e;
           const int64_t dst = ((b * nkv + g) * bs + off) * d + e;
           out[static_cast<size_t>(dst)] = LoadElemF32(cache, src);
         }
@@ -1034,9 +1057,15 @@ bool TryDevicePagedFusedUpdateBatch(ttnn::Tensor& k_dev, ttnn::Tensor& v_dev, Me
   (void)nkv; (void)d;  // suppress unused-param warnings
 }
 
-// Prefer fill for longer sequential prefills; otherwise batched update.
-// Threshold keeps short decode/smoke on the height-sharded update path.
-constexpr uint32_t kPagedFillMinTokens = 16;
+// Sequential prefills always take paged_fill_cache, at any chunk length. The
+// batched update is per token: one batch user per token over a synthetic
+// one-entry page-table stick, so a short chunk sends several users at the SAME
+// physical block, and paged_update_cache's page-granular concurrent
+// read-modify-write turns that into last-writer-wins — the block keeps the
+// previous occupant's rows while the push publishes the shadow as current
+// (#2669). Decode pushes never satisfy the eligibility predicate (their first
+// offset is mid-block), so they stay on the height-sharded update path.
+constexpr uint32_t kPagedFillMinTokens = 1;
 
 bool TryDevicePagedPush(ttnn::Tensor& cache_dev, MeshDevice& device,
                         const std::vector<uint32_t>& blocks, const std::vector<uint32_t>& offsets,
@@ -1175,9 +1204,12 @@ void NotePagedKvRacWrites(Tensor& k_cache, Tensor& v_cache, const std::vector<ui
 // ("buffers may be corrupted once a trace is executed"). Observed as every
 // replay collapsing to all-zero logits at the first block-table growth
 // (slot 63→64 with block_size 32). A pool-sized shadow never moves.
-ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint32_t used_nb) {
-  VT_CHECK(cache_nhd.rank == 4 && cache_nhd.IsContiguous(),
-           "EnsurePagedKvTtnn: contiguous rank-4 NHD cache");
+ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint32_t used_nb,
+                               bool accept_unbind_view = false) {
+  VT_CHECK(cache_nhd.rank == 4, "EnsurePagedKvTtnn: rank-4 NHD cache");
+  VT_CHECK(cache_nhd.IsContiguous() ||
+               (accept_unbind_view && IsFlashKvUnbindView(cache_nhd)),
+           "EnsurePagedKvTtnn: contiguous rank-4 NHD cache (or vetted unbind view)");
   const uint32_t pool_nb = static_cast<uint32_t>(cache_nhd.shape[0]);
   const uint32_t bs = static_cast<uint32_t>(cache_nhd.shape[1]);
   const uint32_t nkv = static_cast<uint32_t>(cache_nhd.shape[2]);
@@ -1206,7 +1238,7 @@ ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint
       s.mirror_valid = false;  // content below [0,used) not trustworthy yet
     }
   }
-  used = NhdToTtnnLayoutPrefix(cache_nhd, used_nb);
+  used = NhdToTtnnLayoutPrefix(cache_nhd, used_nb, accept_unbind_view);
   {
     std::lock_guard<std::mutex> g(PagedKvMutex());
     PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(cache_nhd.data)];
@@ -2671,6 +2703,22 @@ namespace {
 struct DecodePosEntry {
   ttnn::Tensor cur_pos;  // int32 [num_reqs] device — advanced in-trace
   bool allocated = false;
+  // #2469: host mirror of what cur_pos holds on device. The seed branch
+  // records seq_lens-1 (its copy_to_device lands); the replay branch adds 1
+  // per step it declines seeding for (each launched trace plus_one'd the
+  // device). WarmPaMeta echoes this into PaMetaEntry.cp_host so the
+  // TryPagedAttentionDeviceDecode guard reads what the DEVICE holds — a
+  // stale device tensor can no longer be masked by echoing the step's
+  // freshly computed seq_lens-1 into the entry.
+  std::vector<int32_t> host_val;
+  // #2469: the plus_one program-cache warm runs its op on a scratch tensor.
+  // Allocate it ONCE, at this entry's first (always trace-free) seed, and
+  // reuse it after: a fresh device allocation per seed is what the allocator
+  // warns about under a live trace ("these buffers may be corrupted once a
+  // trace is executed"), and the boundary seed is the one seeding step that
+  // runs with THIS slot's trace still live.
+  ttnn::Tensor plus_one_scratch;
+  bool scratch_ready = false;
 };
 std::mutex& DecodePosMutex() { static std::mutex m; return m; }
 std::map<int64_t, DecodePosEntry>& DecodePosCache() {
@@ -5996,9 +6044,76 @@ bool MemsetDeviceIfCapture(void* p, int value) {
       dev = *s->device;
     }
   }
+  std::optional<ttnn::Tensor> fresh;
   if (!dev.has_value()) {
-    // No shadow yet: DBuf::Zero on a brand-new buffer with no device tensor.
-    return false;  // fall back to host memset; the buffer is host-only for now
+    // HOST-FREE-FORWARD R4 (#1105): a brand-new buffer (registered at Alloc,
+    // no device tensor yet) still takes the device lane. res.Zero at the top
+    // of the captured layer region must leave the slot device-resident, or
+    // the first EnsureDevice2D(*residual) restages from the recycled slot's
+    // persistent buffer — an enqueue_write, which trace capture fatals on
+    // (fd_mesh_command_queue.cpp:760).
+    // bf16-only, the same polarity as the W7 reservation arm: the geometry
+    // is derived from the registered byte size, which is dtype-unambiguous
+    // only for 2-byte elements.
+    // CAPTURE-ONLY: an eager fresh-slot zero keeps the host fallback. The
+    // byte size does not name a dtype (the f32 KV masters share these pool
+    // blocks), so serving one eagerly would install a wrongly-typed shadow;
+    // inside the capture the write is banned and the buffer is scratch whose
+    // every consumer reads on device, which is what makes the guess safe.
+    // The capture-time zero still finds its tensor: the cold step's
+    // EnsureDevice2D restage primed the zero at this exact spec
+    // (ZeroCachePrime) and the copy program is warm from the eager copy
+    // lane — ZeroCacheGet refuses a capture-time miss by design.
+    if (!tt_capture_active()) return false;
+    MeshDevice& device_fresh = SharedMeshDevice();
+    device_fresh.enable_program_cache();
+    uint32_t cols = 0;
+    {
+      std::lock_guard<std::mutex> g(SlotMutex());
+      BufferSlot* s = FindSlot(p);
+      if (s == nullptr) return false;  // untracked buffer: host memset
+      if (s->bytes == 0 || (s->bytes % 2) != 0) return false;
+      cols = static_cast<uint32_t>(s->bytes / 2);
+      if (s->persistent.has_value() && s->persist_rows == 1 &&
+          s->persist_cols == cols) {
+        // Recycled staging: zero the persistent buffer IN PLACE — the device
+        // address stays stable across steps, which is what lets the captured
+        // zero-copy replay against the same buffer.
+        fresh = *s->persistent;
+      }
+    }
+    if (!fresh.has_value()) {
+      fresh = ttnn::empty(ttnn::Shape({1u, cols}), ttnn::DataType::BFLOAT16,
+                          ttnn::Layout::TILE, &device_fresh,
+                          ttnn::MemoryConfig{});
+      std::lock_guard<std::mutex> g(SlotMutex());
+      if (BufferSlot* s = FindSlot(p)) {
+        // W5 semantics: the allocation becomes the slot's persistent buffer,
+        // so the next zero reuses the same device address.
+        s->persistent = fresh;
+        s->persist_rows = 1;
+        s->persist_cols = cols;
+      }
+    }
+    ttnn::Tensor zero_src = ZeroCacheGet(*fresh, device_fresh);
+    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
+      std::fprintf(stderr, "[TT-TRACE] device zero-fill (fresh slot %p cols=%u)\n",
+                   p, cols);
+    ttnn::Tensor z = ttnn::copy(zero_src, *fresh);
+    (void)z;
+    {
+      std::lock_guard<std::mutex> g(SlotMutex());
+      BufferSlot* s = FindSlot(p);
+      if (s == nullptr) return false;
+      s->device = *fresh;
+      s->dev_rows = 1;
+      s->dev_cols = cols;
+      s->device_current = true;
+      s->host_current = false;
+      s->conv_transposed = false;
+      s->device_reserved = false;  // real zeros installed — reservation spent
+    }
+    return true;
   }
   MeshDevice& device = SharedMeshDevice();
   const ttnn::Tensor& shadow = *dev;
@@ -6190,12 +6305,32 @@ void WarmPagedKvShadow(void* k_cache_data, void* v_cache_data,
   if (num_blocks < 1 || block_size < 1 || used_blocks < 1) return;
   MeshDevice& device = SharedMeshDevice();
   auto warm_one = [&](void* data) {
-    Tensor cache = Tensor::Contiguous(
-        data, DType::kBF16, Device{DeviceType::kTENSTORRENT, 0},
-        {num_blocks, block_size, num_kv_heads, head_size});
+    // The flash KV store is one combined [nb,2,bs,nkv,d] buffer and the driver
+    // hands us its dim-1 unbind slices (dense_attn_block.h KvSlice): rank-4
+    // views whose block stride is 2*bs*nkv*d. Describing that view as
+    // Tensor::Contiguous fabricated dense strides, so the shadow prefix upload
+    // read block b at b*bs*nkv*d — one slab early inside the combined store.
+    // For every block >= 1 the K shadow received the previous block's V slab
+    // (zeros at prefill positions) and the V shadow the next block's K slab;
+    // block 0 stayed correct only because offset 0 is each view's own base.
+    // Describe the view with its real strides instead, and let
+    // EnsurePagedKvTtnn admit it explicitly.
+    Tensor cache;
+    cache.data = data;
+    cache.dtype = DType::kBF16;
+    cache.device = Device{DeviceType::kTENSTORRENT, 0};
+    cache.rank = 4;
+    cache.shape[0] = num_blocks;
+    cache.shape[1] = block_size;
+    cache.shape[2] = num_kv_heads;
+    cache.shape[3] = head_size;
+    cache.stride[0] = 2 * block_size * num_kv_heads * head_size;
+    cache.stride[1] = num_kv_heads * head_size;
+    cache.stride[2] = head_size;
+    cache.stride[3] = 1;
     const uint32_t used = static_cast<uint32_t>(
         std::min(used_blocks, num_blocks));
-    EnsurePagedKvTtnn(cache, device, used);
+    EnsurePagedKvTtnn(cache, device, used, /*accept_unbind_view=*/true);
     if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr) {
       std::lock_guard<std::mutex> pg(PagedKvMutex());
       auto& sh = PagedKvShadows();
@@ -6437,6 +6572,8 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
                 ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
   std::lock_guard<std::mutex> g(PaMetaMutex());
   PaMetaEntry& e = PaMetaCache()[key];
+  bool cur_pos_aliased = false;  // e.cur_pos shares the DecodePos device buffer
+  bool pt_changed = true;        // a fresh allocation is a content change
   if (!e.allocated) {
     e.page_table = ttnn::Tensor::from_vector<int32_t>(
         pt, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_reqs),
@@ -6453,6 +6590,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
       if (dit != DecodePosCache().end() && dit->second.allocated) {
         e.cur_pos = dit->second.cur_pos;  // share the same device buffer
         aliased = true;
+        cur_pos_aliased = true;
       }
     }
     // After the first capture, a standalone cur_pos is never plus_one'd.
@@ -6470,7 +6608,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
   } else {
     // R2 steady state: page_table refreshes ONLY when content changed (block
     // boundary crossed). cur_pos/update_idxs advance on-device via plus_one.
-    const bool pt_changed = (e.pt_host != pt);
+    pt_changed = (e.pt_host != pt);
     if (pt_changed || !r2_steady) {
       ttnn::copy_to_device(pt_host, e.page_table);
     }
@@ -6480,13 +6618,45 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
                        ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
       ttnn::copy_to_device(cp_host, e.cur_pos);
     }
+    // #2469: the alias was recorded at allocation; it still holds. Detect it
+    // here too — flagging only the alloc branch left cp_host frozen at the
+    // last seeding step's value for every steady step, so the guard compared
+    // a stale host value against the step's expectation.
+    if (HostFreeDecodeEnabled()) {
+      std::lock_guard<std::mutex> dg(DecodePosMutex());
+      auto dit = DecodePosCache().find(num_reqs);
+      if (dit != DecodePosCache().end() && dit->second.allocated) {
+        cur_pos_aliased = true;
+      }
+    }
   }
   e.pt_host = pt;
-  e.cp_host = cpos;
+  // #2469: cp_host must reflect what the DEVICE holds, not what this step
+  // computes. For an aliased cur_pos the device side is the DecodePos buffer,
+  // advanced in trace; at a request boundary this step's cpos is exactly the
+  // value the device does NOT hold, and echoing it unconditionally made
+  // TryPagedAttentionDeviceDecode's `cp_host[0] == seq_lens[0]-1` guard
+  // compare the host against itself — it could never fire on a stale device
+  // tensor.
+  if (cur_pos_aliased) {
+    std::lock_guard<std::mutex> dg(DecodePosMutex());
+    auto dit = DecodePosCache().find(num_reqs);
+    if (dit != DecodePosCache().end() && !dit->second.host_val.empty()) {
+      e.cp_host = dit->second.host_val;  // the seeded/advanced device value
+    } else if (!r2_steady) {
+      e.cp_host = cpos;  // this call seeded the buffer with cpos content
+    }
+    // else: no mirror to read — leave the entry's last recorded value.
+  } else if (!r2_steady) {
+    e.cp_host = cpos;  // the copy/allocation above made the device hold cpos
+  }
+  // else: standalone in steady state — the copy was skipped, so the device
+  // still holds the value cp_host already records. Leave it stale, honestly.
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
-    std::fprintf(stderr, "[TT-TRACE] WarmPaMeta n=%lld mb=%lld cp0=%d r2=%d pt_chg=%d\n",
+    std::fprintf(stderr, "[TT-TRACE] WarmPaMeta n=%lld mb=%lld cp0=%d host0=%d r2=%d pt_chg=%d\n",
                  (long long)num_reqs, (long long)max_blocks, (int)cpos[0],
-                 (int)r2_steady, (int)(e.pt_host != pt));
+                 e.cp_host.empty() ? -1 : (int)e.cp_host[0],
+                 (int)r2_steady, (int)pt_changed);
 }
 
 // R2: seed the persistent cur_pos device tensor (= seq_lens - 1) and warm the
@@ -6505,6 +6675,12 @@ void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime
              "tenstorrent: WarmDecodePos after capture for a num_reqs that "
              "was never seeded — cur_pos would freeze. Seed DecodePos per "
              "cache entry; recapture does NOT clear this (#1105).");
+    // No device update here: the previous step's trace plus_one'd it once.
+    // Keep the host mirror exactly one plus_one ahead of the last recorded
+    // seed so WarmPaMeta's cp_host stays honest (#2469).
+    if (!it->second.host_val.empty()) {
+      for (auto& v : it->second.host_val) v += 1;
+    }
     return;
   }
   // Cold/warm/capture step: (re-)seed cur_pos = seq_lens - 1 for THIS step.
@@ -6533,15 +6709,24 @@ void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime
                      ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
     ttnn::copy_to_device(cp_host, e.cur_pos);
   }
+  e.host_val = cpos;  // the copy/allocation above made the device hold cpos
   // Warm plus_one (program cache) on a SCRATCH tensor so the in-trace call
   // doesn't trigger "Cannot load new binaries during trace capture" — but
   // leave e.cur_pos at its seeded value (the warm must NOT advance it, or the
-  // captured body reads cur_pos+1).
+  // captured body reads cur_pos+1). The scratch is allocated ONCE per entry
+  // (the first seed always runs before any trace is live) and only REUSED
+  // after: the boundary seed runs with this slot's trace live, and a fresh
+  // device allocation then is the corruption the allocator warns about — it
+  // made the first post-boundary replay read garbage KV rows and emit flaky
+  // near-tie tokens (#2469).
   {
-    ttnn::Tensor scratch = ttnn::Tensor::from_vector<int32_t>(
-        cpos, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_reqs)}),
-                     ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR), &device);
-    ttnn::operations::experimental::plus_one(scratch,
+    if (!e.scratch_ready) {
+      e.plus_one_scratch = ttnn::Tensor::from_vector<int32_t>(
+          cpos, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_reqs)}),
+                       ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR), &device);
+      e.scratch_ready = true;
+    }
+    ttnn::operations::experimental::plus_one(e.plus_one_scratch,
         /*sub_core_grids=*/std::nullopt, /*skip_negative_entries=*/true);
   }
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)

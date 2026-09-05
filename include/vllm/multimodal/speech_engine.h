@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -154,16 +155,59 @@ class SpeechEngine {
   // honestly without being edited, so IndexTTS-2.5 is untouched by this seam.
   virtual vt::Device device() const;
 
-  // Run one blocking synthesis. Implementations serialize internally (staged
-  // weights are shared state); throws std::runtime_error to fail the request.
-  virtual SpeechResult Synthesize(const SpeechGenParams& params) = 0;
+  // Run one blocking synthesis; throws std::runtime_error to fail the request.
+  //
+  // NON-VIRTUAL, AND THAT IS THE CONTRACT (#2836). This declaration used to say
+  // "Implementations serialize internally (staged weights are shared state)" and
+  // then leave a pure virtual for each family to forget. Both shipped families
+  // forgot: `minimax_music3_speech.cpp` and `indextts2.cpp` each contained zero
+  // `mutex`, `lock_guard`, `unique_lock` and `scoped_lock` occurrences. That was
+  // not a corner case -- `POST /v1/audio/speech` runs the synthesizer INLINE on
+  // whichever cpp-httplib worker served the request
+  // (`api_server.cpp:636`, and `handle_audio_speech` takes no lock), and the pool
+  // is twelve threads on a stock server (`max_concurrent_streams` 8 +
+  // `kControlWorkerHeadroom` 4). So twelve requests could enter one engine's
+  // staged weights, one `vt::Queue` and one MiniMax-Music3 profile table at once.
+  //
+  // The lock lives here rather than in the route because the tree already had
+  // two callers with opposite dispositions and no seam to say which was right.
+  // The C ABI got it right in a WRAPPER: `include/vllm.h` promises "Serialized
+  // per engine handle" and `src/capi/vllm_c.cpp:1790,1915` holds a per-handle
+  // mutex to deliver it. The HTTP route had no such wrapper, and nothing told it
+  // that it needed one. Now the guarantee is the seam's, and a future entry
+  // point cannot be added without it, because there is no virtual left to
+  // override. The C ABI's own mutex is now redundant and nests strictly inside
+  // this one, always in that order, so it cannot deadlock.
+  //
+  // It is held for the WHOLE synthesis, which for MiniMax-Music3 is minutes. The
+  // second caller therefore waits rather than corrupting, and that mirrors vLLM's
+  // own serving, where every request enters one engine core loop and one forward
+  // runs at a time. Refusing the second caller with 429 or 503 would be a new
+  // HTTP contract that no upstream behaviour asks for.
+  SpeechResult Synthesize(const SpeechGenParams& params) {
+    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    return SynthesizeLocked(params);
+  }
 
  protected:
+  // One synthesis, with the engine's lock ALREADY HELD. A family implements this
+  // and never has to remember the lock, because there is no longer a virtual it
+  // could override without one. It must not call `Synthesize` on this engine:
+  // the mutex is not recursive, and no family does.
+  virtual SpeechResult SynthesizeLocked(const SpeechGenParams& params) = 0;
+
   SpeechEngine() = default;
+  // Defined as DELETED by the mutex member, deliberately and by name: an engine
+  // is held through a `unique_ptr` or a `shared_ptr` everywhere in this tree, and
+  // a future copy would be a second engine sharing one lock's worth of nothing.
+  // A compile error at the seam is the right place to learn that.
   SpeechEngine(const SpeechEngine&) = default;
   SpeechEngine& operator=(const SpeechEngine&) = default;
   SpeechEngine(SpeechEngine&&) = default;
   SpeechEngine& operator=(SpeechEngine&&) = default;
+
+ private:
+  std::mutex synthesize_mutex_;
 };
 
 // Does this checkpoint set belong to the family? A detector must not throw: an

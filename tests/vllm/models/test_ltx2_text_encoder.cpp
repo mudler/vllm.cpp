@@ -1594,16 +1594,65 @@ TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
   }
 }
 
-TEST_CASE("ltx2 text: a non-f32 compute dtype is REFUSED, never silently widened") {
+TEST_CASE("ltx2 text: BOTH entry points refuse a dtype the weights do not carry") {
+  // RENAMED, because the old name ("a non-f32 compute dtype is REFUSED") stopped
+  // being true when LTX25-A24-TEXT-TOWER-BF16 made bf16 a shipped arm. The two
+  // calls below still throw, but for a DIFFERENT reason than the name claimed:
+  // `V2Weights()` carries f32 storage, so it is the weights/arm mismatch that
+  // fires, not a refusal of bf16. A case whose name outlives its subject reads as
+  // coverage of something nobody is testing any more.
+  //
+  // It is kept rather than folded into "the arm refuses to disagree with the
+  // weights it was given", which covers the same refusal only through
+  // `Ltx2TextFeatureExtractorForward`. `Ltx2TextEncoderConditioning` is the
+  // SECOND entry point and reaches `RequireTextComputeDtype` on its own line;
+  // deleting this would leave that line untested.
   const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
   const Ltx2TextHiddenStates states = MakeStates(buffers);
   const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskLeft);
-  CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(),
-                                                        V2Config(), vt::DType::kBF16),
-                  std::runtime_error);
-  CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(),
-                                                    V2Config(), vt::DType::kBF16),
-                  std::runtime_error);
+
+  // The message is checked, not just the throw, because the two refusals on this
+  // path are one `catch` apart and the mismatch one is what these calls hit.
+  auto refused_for = [](auto&& call, const char* needle) {
+    try {
+      call();
+    } catch (const std::runtime_error& e) {
+      const std::string what = e.what();
+      INFO("message: " << what);
+      CHECK(what.find(needle) != std::string::npos);
+      return;
+    }
+    FAIL("the call returned instead of refusing");
+  };
+
+  refused_for(
+      [&] {
+        vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(), V2Config(),
+                                              vt::DType::kBF16);
+      },
+      "the caption projections carry");
+  refused_for(
+      [&] {
+        vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(), V2Config(),
+                                          vt::DType::kBF16);
+      },
+      "the caption projections carry");
+
+  // And the arm selector itself still refuses everything that is neither f32 nor
+  // bf16 BY NAME, at both entry points. This is the half the old name promised
+  // and the file had nowhere else for `Ltx2TextEncoderConditioning`.
+  refused_for(
+      [&] {
+        vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(), V2Config(),
+                                              vt::DType::kF16);
+      },
+      "compute_dtype must be f32 or bf16");
+  refused_for(
+      [&] {
+        vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(), V2Config(),
+                                          vt::DType::kF16);
+      },
+      "compute_dtype must be f32 or bf16");
 }
 
 TEST_CASE("ltx2 text: the tokenizer and HF sidecars come out of TENSORS, not files") {
@@ -2927,4 +2976,823 @@ TEST_CASE("ltx2 e2e: a PROMPT drives the real Gemma-4 12B tower to conditioning"
                                  static_cast<double>(other.conditioning.video[i])));
   MESSAGE("ltx2 e2e: two different prompts differ by max|diff| = " << gap);
   CHECK(gap > 1e-3);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE BF16 ARM — A24 wave 1 (LTX25-A24-TEXT-TOWER-BF16, #2676)
+//
+// Upstream resolves ONE dtype for the whole pipeline and it is bfloat16
+// (distilled.py:109, handed to PromptEncoder at :111-113). Everything above this
+// line is the f32 PARITY arm; everything below is the arm the render path runs.
+//
+// WHY A VALUE GOLDEN IS NOT ENOUGH HERE, and why these cases look different from
+// every other case in this file. AGENTS.md: "A token gate cannot detect a dtype
+// that is too wide." f32 is strictly wider than bf16, so a value comparison at
+// any tolerance a bf16 result needs is ALSO passed by the f32 arm computing the
+// same quantity. That is the whole defect A24 exists to remove, and a gate built
+// only from goldens would sit green under it exactly as this tree did.
+//
+// So the arm is gated on THREE things that are independent of each other:
+//
+//   1. the VALUES, against upstream executed in torch.bfloat16, compared as raw
+//      16-BIT PATTERNS rather than as decimals — an exact integer comparison, so
+//      nothing rounds twice and no tolerance can absorb an arithmetic error;
+//   2. the MEMORY FORMAT, measured: the bf16 weight arm's byte count against the
+//      f32 arm's on the SAME checkpoint, and the width of each intermediate;
+//   3. the OUTPUT DTYPE, which is the assertion an f32 path cannot pass: every
+//      value the production entry point returns must survive a bf16 round trip
+//      unchanged. The same case asserts the f32 arm FAILS that predicate, so the
+//      gate is proven to discriminate rather than assumed to.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The generator builds its bf16 modules by filling the f32 parameters from this
+// same stream and casting the module (`build_bf16`), so narrowing here is the
+// identical operation on the identical values.
+std::vector<uint16_t> Ltx2ParamBf16(const std::string& name,
+                                    const std::vector<int64_t>& shape) {
+  const std::vector<float> f32 = Ltx2Param(name, shape);
+  std::vector<uint16_t> out(f32.size());
+  for (size_t i = 0; i < f32.size(); ++i) out[i] = vt::F32ToBF16(f32[i]);
+  return out;
+}
+
+vllm::Ltx2TextEncoderWeights V2WeightsBf16() {
+  vllm::Ltx2TextEncoderWeights w;
+  const int64_t flat = vllm_test::kLtxTeFlatDim;
+  w.video.dtype = vt::DType::kBF16;
+  w.video.out_features = vllm_test::kLtxTeVideoInner;
+  w.video.in_features = flat;
+  w.video.weight_bf16 =
+      Ltx2ParamBf16("video_aggregate_embed.weight", {w.video.out_features, flat});
+  w.video.bias_bf16 = Ltx2ParamBf16("video_aggregate_embed.bias", {w.video.out_features});
+  w.audio.dtype = vt::DType::kBF16;
+  w.audio.out_features = vllm_test::kLtxTeAudioInner;
+  w.audio.in_features = flat;
+  w.audio.weight_bf16 =
+      Ltx2ParamBf16("audio_aggregate_embed.weight", {w.audio.out_features, flat});
+  w.audio.bias_bf16 = Ltx2ParamBf16("audio_aggregate_embed.bias", {w.audio.out_features});
+  return w;
+}
+
+vllm::Ltx2TextEncoderWeights V1WeightsBf16() {
+  vllm::Ltx2TextEncoderWeights w;
+  const int64_t flat = vllm_test::kLtxTeFlatDim;
+  w.video.dtype = vt::DType::kBF16;
+  w.video.out_features = kHidden;
+  w.video.in_features = flat;
+  w.video.weight_bf16 = Ltx2ParamBf16("aggregate_embed.weight", {kHidden, flat});
+  // bias stays EMPTY: encoder_configurator.py:187 builds V1's Linear bias=False.
+  // The AUDIO projection is left with no storage at all, which under V1 is the
+  // shape and not a dtype disagreement (`is_av` returns the video tensor twice).
+  w.audio.dtype = vt::DType::kBF16;
+  return w;
+}
+
+// ULP DISTANCE between two bf16 patterns of the same sign class. bf16 shares
+// f32's exponent layout, so for finite values of one sign the bit pattern is
+// monotonic in the value and the integer difference IS the ulp distance.
+int64_t Bf16UlpGap(uint16_t a, uint16_t b) {
+  auto ordered = [](uint16_t v) -> int64_t {
+    // Map to a monotonic integer so a sign crossing counts the zeros once.
+    return (v & 0x8000u) ? -static_cast<int64_t>(v & 0x7FFFu)
+                         : static_cast<int64_t>(v & 0x7FFFu);
+  };
+  const int64_t d = ordered(a) - ordered(b);
+  return d < 0 ? -d : d;
+}
+
+// WHY NOTHING BELOW COMPARES AGAINST THE UNPATCHED MODULE BIT-EXACTLY.
+//
+// `torch.rsqrt` on bf16 is NOT a function of its input: the vectorized body and
+// the scalar tail round differently, so the same value gives 0x4065 in a
+// length-1 tensor and 0x4066 in a length-1000 one (MEASURED at the pin; 0x4066
+// is the correctly rounded answer, and is what this port computes). No
+// implementation can be bit-equal to a kernel that is not bit-equal to itself,
+// and chasing one would fit this machine's SIMD width rather than upstream's
+// arithmetic.
+//
+// So the generator emits every bf16 golden TWICE. The `*Stable` twin is
+// upstream's SAME module with that one kernel replaced by the CORRECTLY ROUNDED
+// value, bf16(1/sqrt(f32(x))), and the port is held to it BIT-EXACTLY — no
+// tolerance sits under this port's arithmetic. That is not the same statement as
+// "the value the vectorized path computes": the two agree on all but 6 of the
+// 32639 finite positive bf16 values. The unpatched module's output is
+// the real oracle and is reported through `ReportBf16Gap`, so the distance to it
+// is visible rather than dropped.
+
+// The distance to the UNPATCHED module — the real oracle — reported alongside
+// the bit-exact check against its stable twin, so nothing is dropped.
+//
+// The bound is on the COUNT and on the ABSOLUTE gap scaled by the tensor's own
+// magnitude, NOT on ulp distance, and the reason is arithmetic rather than
+// convenience: each projection output is a dot of 24 terms, so an output that
+// lands near zero through cancellation can move many bf16 ulp on a one-ulp input
+// change while being correct to a part in ten thousand of the stream. A pure ulp
+// bound calls that a defect; an absolute bound anchored on max|golden| does not,
+// and still catches the whole-stream shift an arithmetic error produces.
+void ReportBf16Gap(const char* what, const std::vector<float>& got, const uint16_t* want,
+                   size_t count, size_t max_differing) {
+  REQUIRE(got.size() == count);
+  size_t differing = 0;
+  double worst_abs = 0.0, scale = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    const double w = vt::BF16ToF32(want[i]);
+    scale = std::max(scale, std::abs(w));
+    if (vt::F32ToBF16(got[i]) != want[i]) ++differing;
+    worst_abs = std::max(worst_abs, std::abs(static_cast<double>(got[i]) - w));
+  }
+  // 2^-8 is bf16's unit roundoff; the bound is one such step at the stream's own
+  // magnitude, doubled once for the two roundings between the rsqrt and here.
+  const double bound = 2.0 * std::ldexp(1.0, -8) * scale;
+  MESSAGE(what << ": " << differing << " of " << count << " differ, worst |diff| "
+               << worst_abs << " against " << bound << " (2 x 2^-8 x max|golden| = "
+               << scale << ")");
+  CHECK(differing <= max_differing);
+  CHECK(worst_abs <= bound);
+}
+
+// Compare a run of f32 values that are supposed to BE bf16 values against
+// upstream's own 16-bit patterns. Exact, and it reports the first offender.
+void CheckBf16Bits(const char* what, const std::vector<float>& got,
+                   const uint16_t* want, size_t count) {
+  REQUIRE(got.size() == count);
+  size_t bad = 0;
+  size_t first = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (vt::F32ToBF16(got[i]) != want[i]) {
+      if (bad == 0) first = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    MESSAGE(what << ": " << bad << " of " << count
+                 << " bf16 patterns differ; first at " << first << ", bits got "
+                 << static_cast<unsigned>(vt::F32ToBF16(got[first])) << " want "
+                 << static_cast<unsigned>(want[first]) << " (value got " << got[first]
+                 << " want " << vt::BF16ToF32(want[first]) << ")");
+  }
+  CHECK(bad == 0);
+}
+
+void CheckBf16WithinRaw(const char* what, const std::vector<uint16_t>& got,
+                        const uint16_t* want, size_t count, int64_t max_ulp,
+                        size_t max_differing) {
+  REQUIRE(got.size() == count);
+  size_t differing = 0, first = 0;
+  int64_t worst = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const int64_t gap = Bf16UlpGap(got[i], want[i]);
+    if (gap != 0) {
+      if (differing == 0) first = i;
+      ++differing;
+    }
+    worst = std::max(worst, gap);
+  }
+  MESSAGE(what << ": " << differing << " of " << count << " differ, worst " << worst
+               << " bf16 ulp (budget " << max_ulp << " ulp on at most " << max_differing
+               << ")");
+  if (differing != 0) {
+    MESSAGE("  first at " << first << ": got " << vt::BF16ToF32(got[first]) << " want "
+                          << vt::BF16ToF32(want[first]));
+  }
+  CHECK(worst <= max_ulp);
+  CHECK(differing <= max_differing);
+}
+
+void CheckBf16BitsRaw(const char* what, const std::vector<uint16_t>& got,
+                      const uint16_t* want, size_t count) {
+  REQUIRE(got.size() == count);
+  size_t bad = 0, first = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (got[i] != want[i]) {
+      if (bad == 0) first = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    MESSAGE(what << ": " << bad << " of " << count << " differ; first at " << first
+                 << ", bits got " << static_cast<unsigned>(got[first]) << " want "
+                 << static_cast<unsigned>(want[first]) << " (value got "
+                 << vt::BF16ToF32(got[first]) << " want " << vt::BF16ToF32(want[first])
+                 << ")");
+  }
+  CHECK(bad == 0);
+}
+
+// The DTYPE predicate. A value that came through a bf16 store is unchanged by a
+// bf16 round trip; an f32 value is not, except by coincidence.
+bool IsBf16Exact(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)) == v; }
+
+size_t CountNotBf16Exact(const std::vector<float>& v) {
+  size_t n = 0;
+  for (float x : v)
+    if (!IsBf16Exact(x)) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 text bf16: the two normalizations are NOT the same dtype upstream") {
+  // FACT 1 AND FACT 2 OF THE HEADER'S DTYPE NOTE, as goldens the generator
+  // measured out of upstream rather than restated from our source.
+  //
+  // These two scalars are the reason this row is not a one-line dtype flip. If
+  // upstream ever changes either, the generator emits a 0 and this case reds
+  // BEFORE any value comparison — which is what stops the port from being
+  // "corrected" to a symmetry that upstream does not have.
+  REQUIRE(vllm_test::kLtxTeBf16NormV1IsF32 == 1);
+  REQUIRE(vllm_test::kLtxTeBf16NormV2IsBf16 == 1);
+
+  const int64_t B = vllm_test::kLtxTeBatch, T = vllm_test::kLtxTeSeq;
+  const int64_t D = kHidden, L = kLayers;
+
+  // The stack itself, as bits. A port that narrowed with truncation instead of
+  // round-to-nearest-even reds here and nowhere else.
+  const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const Ltx2TextHiddenStates states = MakeStates(buffers);
+  const std::vector<uint16_t> stacked = vllm::Ltx2StackHiddenStatesBf16(states);
+  CheckBf16BitsRaw("bf16 stack", stacked, vllm_test::kLtxTeBf16Stacked,
+                   static_cast<size_t>(B * T * D * L));
+
+  SUBCASE("V1's normalization returns f32, and its value is upstream's") {
+    // Emitted as f32 goldens precisely BECAUSE fact 1 says the result is f32.
+    // Comparing them as bf16 patterns would hide the very promotion under test.
+    const std::vector<float> left = vllm::Ltx2NormAndConcatPaddedBatchBf16(
+        stacked.data(), MaskFrom(vllm_test::kLtxTeMaskLeft).data(), B, T, D, L);
+    const double wl = MaxAbsDiff(left, vllm_test::kLtxTeBf16NormV1Left, left.size());
+    MESSAGE("bf16 V1 norm (left):  max|diff| = " << wl);
+    CHECK(wl < kTol);
+    const std::vector<float> right = vllm::Ltx2NormAndConcatPaddedBatchBf16(
+        stacked.data(), MaskFrom(vllm_test::kLtxTeMaskRight).data(), B, T, D, L);
+    const double wr = MaxAbsDiff(right, vllm_test::kLtxTeBf16NormV1Right, right.size());
+    MESSAGE("bf16 V1 norm (right): max|diff| = " << wr);
+    CHECK(wr < kTol);
+
+    // AND IT IS NOT A BF16 RESULT. If it were, this port would be narrowing
+    // where upstream does not, and every V1 conditioning value would be wrong.
+    // Measured on the goldens themselves, so the claim is about UPSTREAM's
+    // output and not about ours.
+    size_t not_bf16 = 0;
+    for (size_t i = 0; i < left.size(); ++i)
+      if (!IsBf16Exact(vllm_test::kLtxTeBf16NormV1Left[i])) ++not_bf16;
+    MESSAGE("upstream's V1 bf16-arm norm: " << not_bf16 << " of " << left.size()
+                                            << " values are NOT bf16-representable");
+    CHECK(not_bf16 > 0);
+  }
+
+  SUBCASE("V2's normalization is bf16, bit for bit") {
+    for (int side = 0; side < 2; ++side) {
+      const std::vector<int32_t> mask =
+          MaskFrom(side == 0 ? vllm_test::kLtxTeMaskLeft : vllm_test::kLtxTeMaskRight);
+      const std::vector<uint16_t> got =
+          vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), mask.data(), B, T, D, L);
+      // BIT-EXACT against upstream's own module with its one non-deterministic
+      // kernel replaced by the CORRECTLY ROUNDED value, bf16(1/sqrt(f32(x))) —
+      // which agrees with that kernel's vectorized path on all but 6 of the 32639
+      // finite positive bf16 values, so the two are not the same oracle.
+      // Nothing about this port's arithmetic rides on a tolerance.
+      CheckBf16BitsRaw(side == 0 ? "bf16 V2 norm (left)" : "bf16 V2 norm (right)", got,
+                       side == 0 ? vllm_test::kLtxTeBf16NormV2LeftStable
+                                 : vllm_test::kLtxTeBf16NormV2RightStable,
+                       static_cast<size_t>(B * T * D * L));
+      // And close to the UNPATCHED module, which is the real oracle. One rsqrt
+      // feeds a whole (b, t, layer) slice of D values, so upstream's own path
+      // instability can reach at most `self-disagree x D` outputs — a budget
+      // computed from the generator's measurement rather than chosen.
+      // TWO ulp, and the second one is arithmetic rather than slack. The norm's
+      // last step is `x * inv`, and upstream's `inv` differs from the correctly
+      // rounded one by at most one ulp. `|x*inv1 - x*inv2| = |x| * ulp(inv)`,
+      // which is 2^-8 RELATIVE to the product — and 2^-8 relative is TWO ulp of a
+      // product sitting at the top of its binade, where one ulp is 2^-9 relative.
+      // So a one-ulp multiplier difference is a two-ulp product difference, and
+      // no tighter bound is available while upstream's rsqrt disagrees with
+      // itself at all.
+      CheckBf16WithinRaw(side == 0 ? "bf16 V2 norm vs module (left)"
+                                   : "bf16 V2 norm vs module (right)",
+                         got,
+                         side == 0 ? vllm_test::kLtxTeBf16NormV2Left
+                                   : vllm_test::kLtxTeBf16NormV2Right,
+                         static_cast<size_t>(B * T * D * L), 2,
+                         static_cast<size_t>(vllm_test::kLtxTeBf16RsqrtSelfDisagree * D));
+    }
+  }
+
+  SUBCASE("the bf16 squares rounding is observable, and we do it") {
+    // `encoded_text**2` materializes a BF16 tensor, so each square is rounded to
+    // 8 mantissa bits before the f32-accumulated mean sees it. The generator
+    // asserts the two variances disagree on this fixture, so this is a
+    // discriminator rather than a restatement of our own arithmetic.
+    REQUIRE(vllm_test::kLtxTeBf16SquaresRoundingIsObservable == 1);
+    size_t differ = 0;
+    const size_t n = static_cast<size_t>(B * T * L);
+    for (size_t i = 0; i < n; ++i)
+      if (vllm_test::kLtxTeBf16VarianceBf16Squares[i] !=
+          vllm_test::kLtxTeBf16VarianceF32Squares[i])
+        ++differ;
+    MESSAGE("bf16-squares vs f32-squares variance: " << differ << " of " << n
+                                                     << " bf16 patterns differ");
+    CHECK(differ > 0);
+  }
+}
+
+TEST_CASE("ltx2 text bf16: the epsilon and the rescale are the BF16-narrowed ones") {
+  // A Python float paired with a bf16 tensor is narrowed BEFORE the op, so the
+  // epsilon that reaches this arm is bf16(1e-6) and the rescale factor is the
+  // bf16-rounded one. Both are pinned against upstream's OWN narrowing, emitted
+  // by the generator, not against a constant restated here.
+  // THE EPSILON IS NARROWED AND THE RESCALE FACTOR IS NOT, and the two live one
+  // line of upstream apart. Both are pinned against upstream's OWN behaviour,
+  // emitted by the generator, never against a constant restated here.
+  CHECK(vt::F32ToBF16(static_cast<float>(vllm::kLtx2TextNormV2Eps)) ==
+        vllm_test::kLtxTeBf16NormEpsBits[0]);
+
+  // The rescale, on a vector chosen because `_rescale_norm(ones, ...)` CANNOT
+  // separate the two hypotheses: `1.0 * f` narrows to `bf16(f)` under both. The
+  // suite's first draft used exactly that probe and passed a port that narrowed
+  // the factor, which is wrong on nearly a quarter of all other values.
+  {
+    const size_t n = sizeof(vllm_test::kLtxTeBf16RescaleProbeIn) / sizeof(uint16_t);
+    struct Arm {
+      int64_t out_features;
+      const uint16_t* want;
+      const uint16_t* rejected;
+      const char* name;
+    };
+    const Arm arms[2] = {
+        {vllm_test::kLtxTeVideoInner, vllm_test::kLtxTeBf16RescaleVideoOut,
+         vllm_test::kLtxTeBf16RescaleVideoOutNarrowedScalar, "video"},
+        {vllm_test::kLtxTeAudioInner, vllm_test::kLtxTeBf16RescaleAudioOut,
+         vllm_test::kLtxTeBf16RescaleAudioOutNarrowedScalar, "audio"},
+    };
+    for (const Arm& arm : arms) {
+      const float scale =
+          vllm::Ltx2RescaleNormBf16(arm.out_features, kHidden);  // f32, unnarrowed
+      std::vector<float> got(n);
+      for (size_t i = 0; i < n; ++i)
+        got[i] = vt::BF16ToF32(vt::F32ToBF16(
+            vt::BF16ToF32(vllm_test::kLtxTeBf16RescaleProbeIn[i]) * scale));
+      CheckBf16Bits(arm.name, got, arm.want, n);
+      // AND THE PROBE DISCRIMINATES: upstream's answer differs from the rejected
+      // bf16-narrowed-scalar hypothesis on this very input. Without this the two
+      // arrays could coincide and the check above would be a tautology.
+      size_t separating = 0;
+      for (size_t i = 0; i < n; ++i)
+        if (arm.want[i] != arm.rejected[i]) ++separating;
+      MESSAGE(arm.name << " rescale probe separates the two scalar hypotheses at "
+                       << separating << " of " << n << " values");
+      CHECK(separating > 0);
+    }
+  }
+
+  const int64_t B = vllm_test::kLtxTeBatch, T = vllm_test::kLtxTeSeq;
+  const int64_t D = kHidden, L = kLayers;
+  const size_t n = static_cast<size_t>(B * T * D * L);
+  const std::vector<int32_t> right = MaskFrom(vllm_test::kLtxTeMaskRight);
+
+  SUBCASE("a zero-variance token, where the epsilon is the whole denominator") {
+    REQUIRE(vllm_test::kLtxTeBf16NormV2ZeroVarianceFinite == 1);
+    const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const Ltx2TextHiddenStates states = MakeStates(buffers);
+    std::vector<uint16_t> stacked = vllm::Ltx2StackHiddenStatesBf16(states);
+    // stacked[b=0, t=0, :, :] = 0 — the [B,T,D,L] layout puts that slice at
+    // indices (0 * D + d) * L + l.
+    for (int64_t d = 0; d < D; ++d)
+      for (int64_t l = 0; l < L; ++l)
+        stacked[static_cast<size_t>((0 * D + d) * L + l)] = 0;
+    const std::vector<uint16_t> got =
+        vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), right.data(), B, T, D, L);
+    CheckBf16BitsRaw("bf16 V2 norm, zero variance", got,
+                     vllm_test::kLtxTeBf16NormV2ZeroVarianceStable, n);
+  }
+
+  SUBCASE("a variance of the epsilon's own order, where a WRONG epsilon shows") {
+    // At bf16 the epsilon is 8 orders below the format's 2^-8 resolution, so it
+    // changes nothing for an ordinary variance — which is why the generator's
+    // algebraic probe returns 0.0 at this width and is not used. 2^-10 squares
+    // to 9.5e-07 against the epsilon's 1e-06, and there it is the whole story.
+    const uint16_t tiny = vt::F32ToBF16(std::ldexp(1.0f, -10));
+    const std::vector<uint16_t> stacked(n, tiny);
+    const std::vector<uint16_t> got =
+        vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), right.data(), B, T, D, L);
+    // A CONSTANT input: every slice has the same variance, so upstream's two
+    // kernel paths either both agree here or both disagree — which is why this
+    // one is held BIT-EXACT and the random-value cases are not.
+    CheckBf16BitsRaw("bf16 V2 norm, tiny variance", got,
+                     vllm_test::kLtxTeBf16NormV2TinyVariance, n);
+
+    // AND THIS INPUT DISCRIMINATES. Upstream's answer with the epsilon dropped,
+    // and with it 100x too large, both differ from the golden above — measured
+    // here rather than assumed, so if a future torch stops separating them this
+    // case reds instead of silently accepting a wrong epsilon.
+    size_t d0 = 0, d1 = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (vllm_test::kLtxTeBf16NormV2TinyVariance[i] !=
+          vllm_test::kLtxTeBf16NormV2TinyVarianceNoEps[i])
+        ++d0;
+      if (vllm_test::kLtxTeBf16NormV2TinyVariance[i] !=
+          vllm_test::kLtxTeBf16NormV2TinyVarianceEps1e4[i])
+        ++d1;
+    }
+    MESSAGE("tiny-variance discrimination: vs no-eps " << d0 << ", vs 1e-4 " << d1
+                                                       << " of " << n);
+    CHECK(d0 > 0);
+    CHECK(d1 > 0);
+  }
+
+  SUBCASE("an input on which the epsilon's own WIDTH is visible") {
+    // THE CASE THAT GATES `kLtx2TextNormEpsBf16` ITSELF, and the one the two
+    // cases above do not. `2**-10` separates the epsilon from no epsilon and
+    // from a 100x one; it reads IDENTICALLY under `bf16(1e-6)` and under the
+    // un-narrowed `1e-6`, so the arm's constant could be widened to the f32
+    // literal and every other case here would stay green. The transcription
+    // check at the top of this TEST_CASE cannot close that either: it compares
+    // one constant against another and never reaches the arithmetic.
+    //
+    // The generator sweeps the whole bf16 domain for the values at which the two
+    // widths part after the norm's rsqrt and multiply — 140 of 32640 at the pin —
+    // and lays one per (b, t, layer) slice. It REFUSES to emit this probe if they
+    // ever stop parting, so the discrimination is measured on upstream and not
+    // asserted here.
+    const std::vector<uint16_t> stacked(
+        vllm_test::kLtxTeBf16NormV2EpsProbeIn,
+        vllm_test::kLtxTeBf16NormV2EpsProbeIn + n);
+    const std::vector<uint16_t> got =
+        vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), right.data(), B, T, D, L);
+    // Every slice is CONSTANT over d, so upstream's two rsqrt paths see one value
+    // per slice and this is held BIT-EXACT, like the two cases above.
+    CheckBf16BitsRaw("bf16 V2 norm, epsilon-width probe", got,
+                     vllm_test::kLtxTeBf16NormV2EpsProbe, n);
+
+    // AND THE PROBE DISCRIMINATES: upstream's answer differs from the rejected
+    // f32-scalar-epsilon hypothesis on this very input. Without this the two
+    // arrays could coincide and the bit check above would be a tautology — which
+    // is exactly what the tiny-variance input turned out to be for this question.
+    size_t separating = 0;
+    for (size_t i = 0; i < n; ++i)
+      if (vllm_test::kLtxTeBf16NormV2EpsProbe[i] !=
+          vllm_test::kLtxTeBf16NormV2EpsProbeF32Scalar[i])
+        ++separating;
+    MESSAGE("epsilon-width probe separates bf16(1e-6) from f32(1e-6) at "
+            << separating << " of " << n << " values");
+    CHECK(separating > 0);
+  }
+}
+
+TEST_CASE("ltx2 text bf16: torch's own rsqrt is not a function of its input") {
+  // THE MEASUREMENT THAT JUSTIFIES THE ONE-ULP BOUND EVERY V2 CASE ABOVE USES,
+  // and it is upstream's property, not ours.
+  //
+  // `torch.rsqrt` on bf16 rounds differently in its vectorized body than in its
+  // scalar tail, so the SAME value gives a different answer depending on the
+  // tensor's length. The generator recomputes upstream's variance-plus-epsilon
+  // both ways and counts the entries where torch disagrees with itself.
+  //
+  // If a future torch makes rsqrt path-independent, this count goes to zero and
+  // this case REDS — at which point the one-ulp allowance above has lost its
+  // justification and has to be tightened rather than silently kept. That is the
+  // whole reason the number is a golden instead of a sentence in a comment.
+  REQUIRE(vllm_test::kLtxTeBf16RsqrtEntries > 0);
+  MESSAGE("torch bf16 rsqrt disagrees with itself on "
+          << vllm_test::kLtxTeBf16RsqrtSelfDisagree << " of "
+          << vllm_test::kLtxTeBf16RsqrtEntries << " variance entries");
+  CHECK(vllm_test::kLtxTeBf16RsqrtSelfDisagree > 0);
+  CHECK(vllm_test::kLtxTeBf16RsqrtSelfDisagree < vllm_test::kLtxTeBf16RsqrtEntries);
+
+  // The port takes the CORRECTLY ROUNDED single rounding, which is the answer
+  // torch's own vectorized path gives on all but 6 of the 32639 finite positive
+  // bf16 values — near enough to call it that in passing, not near enough to be
+  // the same oracle. Held bit-exact against the correctly rounded one, so our
+  // arithmetic is pinned even though the module's output is not reproducible.
+  size_t bad = 0;
+  int64_t worst = 0;
+  for (int64_t i = 0; i < vllm_test::kLtxTeBf16RsqrtEntries; ++i) {
+    const int64_t gap =
+        Bf16UlpGap(vllm_test::kLtxTeBf16RsqrtModule[static_cast<size_t>(i)],
+                   vllm_test::kLtxTeBf16RsqrtCorrectlyRounded[static_cast<size_t>(i)]);
+    worst = std::max(worst, gap);
+    if (gap > 1) ++bad;
+  }
+  MESSAGE("worst module-vs-correctly-rounded gap: " << worst << " bf16 ulp");
+  // And upstream never disagrees with the correct answer by MORE than one ulp,
+  // which is what makes one ulp the right bound rather than a first guess.
+  CHECK(bad == 0);
+}
+
+TEST_CASE("ltx2 text bf16: both extractors and the conditioning hand-off, vs upstream") {
+  const int64_t B = vllm_test::kLtxTeBatch, T = vllm_test::kLtxTeSeq;
+  const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const Ltx2TextHiddenStates states = MakeStates(buffers);
+
+  SUBCASE("FeatureExtractorV1 in bf16") {
+    const vllm::Ltx2TextEncoderWeights w = V1WeightsBf16();
+    REQUIRE(w.ComputeDtype() == vt::DType::kBF16);
+    const Ltx2TextFeatureConfig cfg = V1Config();
+    for (int side = 0; side < 2; ++side) {
+      const std::vector<int32_t> mask =
+          MaskFrom(side == 0 ? vllm_test::kLtxTeMaskLeft : vllm_test::kLtxTeMaskRight);
+      const vllm::Ltx2TextFeatures f = vllm::Ltx2TextFeatureExtractorForward(
+          states, mask.data(), w, cfg, vt::DType::kBF16);
+      const size_t n = static_cast<size_t>(B * T * cfg.video_out_features);
+      CheckBf16Bits(side == 0 ? "bf16 V1 video (left)" : "bf16 V1 video (right)", f.video,
+                    side == 0 ? vllm_test::kLtxTeBf16V1VideoLeft
+                              : vllm_test::kLtxTeBf16V1VideoRight,
+                    n);
+      // is_av returns the SAME tensor twice, not a second projection.
+      CheckBf16Bits("bf16 V1 audio", f.audio,
+                    side == 0 ? vllm_test::kLtxTeBf16V1AudioLeft
+                              : vllm_test::kLtxTeBf16V1AudioRight,
+                    n);
+    }
+  }
+
+  SUBCASE("FeatureExtractorV2 in bf16") {
+    const vllm::Ltx2TextEncoderWeights w = V2WeightsBf16();
+    REQUIRE(w.ComputeDtype() == vt::DType::kBF16);
+    const Ltx2TextFeatureConfig cfg = V2Config();
+    for (int side = 0; side < 2; ++side) {
+      const std::vector<int32_t> mask =
+          MaskFrom(side == 0 ? vllm_test::kLtxTeMaskLeft : vllm_test::kLtxTeMaskRight);
+      const vllm::Ltx2TextFeatures f = vllm::Ltx2TextFeatureExtractorForward(
+          states, mask.data(), w, cfg, vt::DType::kBF16);
+      // Downstream of the rsqrt, so the same one-ulp allowance applies — but the
+      // COUNT budget is a quarter of the stream, far above what upstream's own
+      // path instability produces here (printed) and far below the whole-stream
+      // shift any arithmetic defect would cause.
+      const size_t nv = static_cast<size_t>(B * T * cfg.video_out_features);
+      const size_t na = static_cast<size_t>(B * T * cfg.audio_out_features);
+      CheckBf16Bits(side == 0 ? "bf16 V2 video (left)" : "bf16 V2 video (right)", f.video,
+                    side == 0 ? vllm_test::kLtxTeBf16V2VideoLeftStable
+                              : vllm_test::kLtxTeBf16V2VideoRightStable,
+                    nv);
+      CheckBf16Bits(side == 0 ? "bf16 V2 audio (left)" : "bf16 V2 audio (right)", f.audio,
+                    side == 0 ? vllm_test::kLtxTeBf16V2AudioLeftStable
+                              : vllm_test::kLtxTeBf16V2AudioRightStable,
+                    na);
+      // The UNPATCHED module, reported so the distance to the real oracle is
+      // visible rather than dropped. The budget is a quarter of the stream at one
+      // ulp of each value's own magnitude — far above what upstream's own rsqrt
+      // instability produces here, and far below the whole-stream shift any
+      // arithmetic defect would cause. `ReportBf16Gap` also prints the largest
+      // ABSOLUTE gap, because a near-zero output of a 24-term dot can move many
+      // ulp on a one-ulp input change without anything being wrong.
+      ReportBf16Gap("bf16 V2 video vs module", f.video,
+                    side == 0 ? vllm_test::kLtxTeBf16V2VideoLeft
+                              : vllm_test::kLtxTeBf16V2VideoRight,
+                    nv, nv / 4);
+      ReportBf16Gap("bf16 V2 audio vs module", f.audio,
+                    side == 0 ? vllm_test::kLtxTeBf16V2AudioLeft
+                              : vllm_test::kLtxTeBf16V2AudioRight,
+                    na, na / 4);
+    }
+  }
+
+  SUBCASE("the conditioning hand-off, and the additive mask's dtype-borne value") {
+    REQUIRE(vllm_test::kLtxTeBf16AdditiveMaskDtypeIsBf16 == 1);
+    const vllm::Ltx2TextEncoderWeights w = V2WeightsBf16();
+    const Ltx2TextFeatureConfig cfg = V2Config();
+    for (int side = 0; side < 2; ++side) {
+      const std::vector<int32_t> mask =
+          MaskFrom(side == 0 ? vllm_test::kLtxTeMaskLeft : vllm_test::kLtxTeMaskRight);
+      const vllm::Ltx2TextConditioning c = vllm::Ltx2TextEncoderConditioning(
+          states, mask.data(), w, cfg, vt::DType::kBF16);
+      const size_t nv = static_cast<size_t>(B * T * cfg.video_out_features);
+      const size_t na = static_cast<size_t>(B * T * cfg.audio_out_features);
+      CheckBf16Bits(side == 0 ? "bf16 reordered video (left)"
+                              : "bf16 reordered video (right)",
+                    c.video,
+                    side == 0 ? vllm_test::kLtxTeBf16ReorderedVideoLeftStable
+                              : vllm_test::kLtxTeBf16ReorderedVideoRightStable,
+                    nv);
+      CheckBf16Bits("bf16 reordered audio", c.audio,
+                    side == 0 ? vllm_test::kLtxTeBf16ReorderedAudioLeftStable
+                              : vllm_test::kLtxTeBf16ReorderedAudioRightStable,
+                    na);
+      ReportBf16Gap("bf16 reordered video vs module", c.video,
+                    side == 0 ? vllm_test::kLtxTeBf16ReorderedVideoLeft
+                              : vllm_test::kLtxTeBf16ReorderedVideoRight,
+                    nv, nv / 4);
+
+      // THE PAD VALUE IS -finfo(bfloat16).max, NOT -FLT_MAX, because
+      // `convert_to_additive_mask` takes the FEATURES' dtype
+      // (embeddings_processor.py:117). Compared EXACTLY — MaxAbsDiff refuses
+      // saturating values by design and the two candidates differ by 1.3e36,
+      // which no tolerance on a 3.4e38 magnitude would separate.
+      REQUIRE(c.additive_mask.size() == static_cast<size_t>(B * T));
+      for (size_t i = 0; i < c.additive_mask.size(); ++i) {
+        // The REORDERED mask, which is what `Ltx2ComputeRightPadOrder` rebuilds
+        // and what `Ltx2TextConditioning` returns — NOT the unreordered
+        // `kLtxTeBf16AdditiveMask*` that `Ltx2ConvertToAdditiveMask` produces.
+        // Comparing against the wrong one of the two was a real defect in this
+        // suite's first draft, and it read as a value error rather than as the
+        // ordering mistake it was.
+        const float want = vt::BF16ToF32(side == 0
+                                             ? vllm_test::kLtxTeBf16ReorderedMaskLeft[i]
+                                             : vllm_test::kLtxTeBf16ReorderedMaskRight[i]);
+        CHECK(c.additive_mask[i] == want);
+      }
+      // And it is NOT the f32 arm's value. Stated as its own assertion because
+      // "equals upstream" would still pass if upstream's bf16 max happened to
+      // equal FLT_MAX, and the whole point is that it does not.
+      for (size_t i = 0; i < c.additive_mask.size(); ++i)
+        CHECK(c.additive_mask[i] != -std::numeric_limits<float>::max());
+    }
+  }
+}
+
+TEST_CASE("ltx2 text bf16: the MEMORY FORMAT, measured rather than declared") {
+  // A24 IS THIS CASE. Every other case above compares values, and a value
+  // comparison cannot see a dtype that is too wide — the f32 arm computes the
+  // same quantity more precisely and passes any bound a bf16 result needs.
+  const int64_t flat = vllm_test::kLtxTeFlatDim;
+
+  SUBCASE("the weight arm holds exactly half the bytes, on the same tensors") {
+    const vllm::Ltx2TextEncoderWeights bf16 = V2WeightsBf16();
+    const vllm::Ltx2TextEncoderWeights f32 = V2Weights();
+    REQUIRE(bf16.video.WeightCount() == f32.video.WeightCount());
+    REQUIRE(bf16.audio.WeightCount() == f32.audio.WeightCount());
+    // No number is quoted: both sides are measured off the same shapes.
+    MESSAGE("caption projections: bf16 " << (bf16.video.WeightBytes() +
+                                             bf16.audio.WeightBytes())
+                                         << " B, f32 "
+                                         << (f32.video.WeightBytes() + f32.audio.WeightBytes())
+                                         << " B");
+    CHECK(bf16.video.WeightBytes() * 2 == f32.video.WeightBytes());
+    CHECK(bf16.audio.WeightBytes() * 2 == f32.audio.WeightBytes());
+    // The f32 storage of a bf16 projection must be EMPTY. A `dtype` field beside
+    // a populated f32 buffer would record the arm without changing the bytes,
+    // which is the defect rather than the fix.
+    CHECK(bf16.video.weight.empty());
+    CHECK(bf16.video.bias.empty());
+    CHECK(bf16.audio.weight.empty());
+    CHECK(f32.video.weight_bf16.empty());
+  }
+
+  SUBCASE("every full-width intermediate is 16 bits wide") {
+    const int64_t B = vllm_test::kLtxTeBatch, T = vllm_test::kLtxTeSeq;
+    const int64_t D = kHidden, L = kLayers;
+    const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const Ltx2TextHiddenStates states = MakeStates(buffers);
+    const std::vector<uint16_t> stacked = vllm::Ltx2StackHiddenStatesBf16(states);
+    const std::vector<float> stacked_f32 = vllm::Ltx2StackHiddenStates(states);
+    static_assert(sizeof(decltype(stacked)::value_type) == 2, "the bf16 stack must be 16-bit");
+    REQUIRE(stacked.size() == stacked_f32.size());
+    CHECK(stacked.size() * sizeof(uint16_t) * 2 == stacked_f32.size() * sizeof(float));
+
+    const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskRight);
+    const std::vector<uint16_t> normed =
+        vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), mask.data(), B, T, D, L);
+    static_assert(sizeof(decltype(normed)::value_type) == 2, "the V2 bf16 norm must be 16-bit");
+    CHECK(normed.size() * sizeof(uint16_t) * 2 ==
+          vllm::Ltx2NormAndConcatPerTokenRms(stacked_f32.data(), mask.data(), B, T, D, L)
+                  .size() *
+              sizeof(float));
+  }
+
+  SUBCASE("the arm refuses to disagree with the weights it was given") {
+    const vllm::Ltx2TextEncoderWeights bf16 = V2WeightsBf16();
+    const vllm::Ltx2TextEncoderWeights f32 = V2Weights();
+    const Ltx2TextFeatureConfig cfg = V2Config();
+    const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const Ltx2TextHiddenStates states = MakeStates(buffers);
+    const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskRight);
+    // Asking for f32 with bf16 weights, or bf16 with f32 weights, is the mis-wire
+    // that would otherwise compute a correct-looking answer at the wrong width.
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), bf16, cfg,
+                                                          vt::DType::kF32),
+                    std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), f32, cfg,
+                                                          vt::DType::kBF16),
+                    std::runtime_error);
+    // The quantization arms are A22 and are still refused BY NAME.
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), f32, cfg,
+                                                          vt::DType::kF16),
+                    std::runtime_error);
+    // And two projections at different widths cannot be resolved by preference.
+    vllm::Ltx2TextEncoderWeights mixed = V2WeightsBf16();
+    mixed.audio = f32.audio;
+    CHECK_THROWS_AS(mixed.ComputeDtype(), std::runtime_error);
+  }
+  (void)flat;
+}
+
+TEST_CASE("ltx2 text bf16: the production entry point computes in bf16") {
+  // THE ASSERTION AN F32 PATH CANNOT PASS, through the entry point the render
+  // path actually calls: `Ltx2EncodePromptToConditioning`, which
+  // src/vllm/multimodal/ltx2_video.cpp calls from three sites --
+  // `grep -c '= Ltx2EncodePromptToConditioning(' src/vllm/multimodal/ltx2_video.cpp`
+  // reports 3. Cited as a string because the three line numbers this comment used
+  // to carry went stale twice inside this row's own pull request. Nothing here
+  // constructs the extractor by hand: a unit test on the class would prove the
+  // class works and never that anything reaches it.
+  //
+  // The arm is selected the way the render selects it — by the DTYPE THE WEIGHTS
+  // CARRY, not by a parameter — so this case also gates the wiring.
+  const vllm::HfConfig cfg = TowerConfig();
+  const nlohmann::json gemma_config =
+      nlohmann::json::parse(vllm_test::kLtxTowerTextConfigJson);
+  const fs::path dir = fs::temp_directory_path() / "vllm_ltx2_tower_bf16";
+  fs::create_directories(dir);
+  const std::string path =
+      WriteTypedPack(dir / "tower.safetensors", TowerPackTensors(cfg), "");
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+  const vllm::Ltx2GemmaTower tower =
+      vllm::Ltx2LoadGemmaTowerFromSafetensors(file, gemma_config);
+
+  const vllm::tok::Tokenizer tokenizer =
+      vllm::tok::Tokenizer::FromHfJsonBytes(TowerTokenizerJson(), "<tower fixture>");
+  vllm::Ltx2GemmaSpecialIds ids;
+  ids.bos_id = vllm_test::kLtxTowerTokens[0];
+  ids.pad_id = static_cast<int32_t>(vllm_test::kLtxTowerPadId);
+  std::string prompt;
+  for (int64_t i = 1; i < vllm_test::kLtxTowerSeq; ++i)
+    prompt += "<t" + std::to_string(vllm_test::kLtxTowerTokens[static_cast<size_t>(i)]) + ">";
+
+  const vllm::Ltx2TextFeatureConfig fcfg = TowerFeatureConfig();
+  vt::Queue q = Qcpu();
+
+  // The same projections as the f32 case above, narrowed — so the ONLY difference
+  // between the two runs below is the width they are held and computed at.
+  const int64_t flat = vllm_test::kLtxTowerHidden * vllm_test::kLtxTowerNumStates;
+  vllm::Ltx2TextEncoderWeights bf16;
+  bf16.video.dtype = vt::DType::kBF16;
+  bf16.video.out_features = 24;
+  bf16.video.in_features = flat;
+  bf16.video.weight_bf16 = Ltx2ParamBf16("tower.video_aggregate_embed.weight", {24, flat});
+  bf16.video.bias_bf16 = Ltx2ParamBf16("tower.video_aggregate_embed.bias", {24});
+  bf16.audio.dtype = vt::DType::kBF16;
+  bf16.audio.out_features = 12;
+  bf16.audio.in_features = flat;
+  bf16.audio.weight_bf16 = Ltx2ParamBf16("tower.audio_aggregate_embed.weight", {12, flat});
+  bf16.audio.bias_bf16 = Ltx2ParamBf16("tower.audio_aggregate_embed.bias", {12});
+  REQUIRE(bf16.ComputeDtype() == vt::DType::kBF16);
+
+  const vllm::Ltx2PromptConditioning got = vllm::Ltx2EncodePromptToConditioning(
+      tower, tokenizer, ids, bf16, fcfg, prompt, q, vllm_test::kLtxTowerPaddedSeq);
+  const vllm::Ltx2PromptConditioning ref = vllm::Ltx2EncodePromptToConditioning(
+      tower, tokenizer, ids, TowerProjections(), fcfg, prompt, q,
+      vllm_test::kLtxTowerPaddedSeq);
+
+  REQUIRE(got.conditioning.video.size() == ref.conditioning.video.size());
+  REQUIRE(!got.conditioning.video.empty());
+  REQUIRE(!got.conditioning.audio.empty());
+
+  // (1) EVERY value the bf16 arm returns survives a bf16 round trip unchanged.
+  //     No arrangement of f32 arithmetic produces that by accident at this size.
+  CHECK(CountNotBf16Exact(got.conditioning.video) == 0);
+  CHECK(CountNotBf16Exact(got.conditioning.audio) == 0);
+
+  // (2) AND THE PREDICATE DISCRIMINATES. The f32 arm, on the identical prompt,
+  //     identical tower and identical projection VALUES, fails it on most of the
+  //     stream. Without this half, (1) would be a property nobody had shown the
+  //     f32 path lacks — and a gate that both arms pass measures nothing, which
+  //     is the exact failure A24 was invisible to.
+  const size_t f32_wide = CountNotBf16Exact(ref.conditioning.video);
+  MESSAGE("bf16 arm: 0 of " << got.conditioning.video.size()
+                            << " video values are wider than bf16; f32 arm: " << f32_wide);
+  CHECK(f32_wide > got.conditioning.video.size() / 2);
+
+  // (3) The two arms still agree to within the format's own resolution, so (1)
+  //     is not being satisfied by a path that computes something else. bf16
+  //     carries 8 explicit mantissa bits, so the unit roundoff is 2^-9 relative
+  //     and the bound below is that against each value's own magnitude —
+  //     derived from the format, not fitted to the measurement. Doubled once for
+  //     the accumulated roundings the extractor performs between the stack and
+  //     the projection output, and the measured worst ratio is printed so the
+  //     margin is visible rather than asserted.
+  //
+  // The bound is ABSOLUTE and anchored on the stream's own magnitude, NOT
+  // per-element relative, and that is a property of the computation rather than a
+  // convenience. Each conditioning value is a dot of `flat` terms; an output that
+  // lands near zero through cancellation moves arbitrarily far in RELATIVE terms
+  // on a last-bit input change while being correct to a part in thousands of the
+  // stream. A per-element relative bound calls that a defect and would have to be
+  // loosened to something that gates nothing.
+  //
+  // `sqrt(flat) * 2^-9` is the random-walk accumulation of one bf16 unit roundoff
+  // per term over a `flat`-term reduction — the standard bound for this shape,
+  // derived from the format and the depth, not fitted to the measurement. The
+  // measured worst is printed beside it.
+  const double reduction_depth = static_cast<double>(flat);
+  double worst_abs = 0.0, ref_scale = 0.0;
+  for (size_t i = 0; i < got.conditioning.video.size(); ++i) {
+    const double a = got.conditioning.video[i], b = ref.conditioning.video[i];
+    ref_scale = std::max(ref_scale, std::abs(b));
+    worst_abs = std::max(worst_abs, std::abs(a - b));
+  }
+  const double bound = std::sqrt(reduction_depth) * std::ldexp(1.0, -9) * ref_scale;
+  MESSAGE("bf16 vs f32 arm: worst |diff| " << worst_abs << " against sqrt(" << reduction_depth
+                                           << ") * 2^-9 * max|f32| = " << bound
+                                           << " (max|f32| = " << ref_scale << ")");
+  CHECK(worst_abs <= bound);
+
+  // (4) The mask the DiT is handed carries the bf16 pad magnitude, end to end.
+  REQUIRE(!got.conditioning.additive_mask.empty());
+  for (float v : got.conditioning.additive_mask)
+    CHECK((v == 0.0f || v == vt::BF16ToF32(0xff7f)));  // 0xff7f IS negative
+  bool any_pad = false;
+  for (float v : ref.conditioning.additive_mask)
+    if (v == -std::numeric_limits<float>::max()) any_pad = true;
+  CHECK(any_pad);  // the f32 arm still carries -FLT_MAX, so the two really differ
 }

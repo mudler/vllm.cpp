@@ -158,6 +158,74 @@ class UnquantizedMlpGateUpSplitMethod : public MlpGateUpMethodBase {
   int64_t I_;
 };
 
+// Unquantized (bf16) SwiGLU gate_up WITH A BIAS on the merged projection:
+// `silu(gate) * up` where `gate|up = x @ W^T + b`. Same merged [2I,H] operand
+// and same single MatmulBT as `UnquantizedMlpGateUpMethod`, plus one
+// row-broadcast `vt::Add` of the [2I] bias before the activation.
+//
+// WHY THE SEAM GREW AN ARM RATHER THAN A CALLER GROWING TWO GEMMS. AGENTS.md's
+// "Shared seams" says to extend a shared seam when it cannot represent the
+// upstream behaviour, and otherwise to record one exact tracked exception —
+// never to write a parallel path. Every member above returns `silu(gate) * up`
+// from WEIGHTS ALONE, so an MLP whose projection carries a bias could not be
+// expressed at all. Three upstream MLPs in this tree's reach do carry one:
+//
+//   * dots3-note's `dots` SPEECH encoder (`nvidia/audio_encoder.py:334-335` @
+//     `9035151d6`): `nn.Linear(1280, 2*5120)` and `nn.Linear(5120, 1280)`, both
+//     with torch's DEFAULT `bias=True`, and the released
+//     `dots-studio/dots3-note-prev` ships `fc1.bias [10240]` and
+//     `fc2.bias [1280]` for all 32 layers. That is the caller this arm has, and
+//     it is why the arm lands REACHED (AGENTS.md, "Nothing lands dead") rather
+//     than as a capability written for a fixture.
+//   * dots3-note's VISION tower under `use_bias = true` (`vision.py:129-133`,
+//     `:159` @ `9035151d6`), which is still refused BY NAME for reasons this arm
+//     does not lift — see issue #2616 and
+//     `.agents/specs/dots3-note.md` §4.14.4.
+//   * OPT (`opt.py:149-163`), whose fc1/fc2 carry one under `config.enable_bias`
+//     — but OPT is a plain ReLU MLP, not a gated one, so it does not route here.
+//
+// EVERY EXISTING CALLER IS BYTE-IDENTICAL BY CONSTRUCTION. This is a FOURTH
+// derived class; the three above are untouched, so "no bias" is not a runtime
+// branch through new code, it is the same code it always was. That is the same
+// shape `UnquantizedMlpGateUpSplitMethod` and `UnquantizedMlpGateUpGeluMethod`
+// took when they were added, and it is why the vision suites are re-run at
+// their existing counts as the proof rather than at a tolerance.
+//
+// THE BIAS IS ADDED BEFORE THE ACTIVATION, on BOTH halves, which is what
+// `F.linear(x, W, b)` followed by `x.chunk(2, -1)` means. Adding it after the
+// SiLU, or to only the `up` half, would produce correctly-shaped wrong numbers;
+// the dots3-note audio gate's reference computes the upstream order and the
+// tower is compared against it.
+class UnquantizedMlpGateUpBiasMethod : public MlpGateUpMethodBase {
+ public:
+  UnquantizedMlpGateUpBiasMethod(const OwnedTensor* gate_up,
+                                 const OwnedTensor* bias, int64_t intermediate)
+      : gate_up_(gate_up), bias_(bias), I_(intermediate) {}
+
+  DBuf Apply(Dev d, const vt::Tensor& x) const override {
+    const int64_t M = x.shape[0];
+    vt::Tensor wgu = ResidentWeight(d, *gate_up_);  // [2I, H] raw-NK
+    DBuf gate_up(d, vt::DType::kBF16, {M, 2 * I_});
+    vt::MatmulBT(d.q, gate_up.t(), x, wgu);
+    // ROW-BROADCAST: `b` is rank-1 [2I] matching the last dim, applied to every
+    // row (`vt::Add`'s second shape, ops.h:3486-3495). `out` aliases `a`, which
+    // that op documents as supported.
+    vt::Tensor bias = ResidentWeight(d, *bias_);
+    vt::Tensor gu = gate_up.t();
+    vt::Add(d.q, gu, gu, bias);
+    DBuf act(d, vt::DType::kBF16, {M, I_});
+    vt::SiluAndMul(d.q, act.t(), gate_up.t());  // silu(gate + bg) * (up + bu)
+    return act;
+  }
+
+  const char* Name() const override { return "bf16-gate-up-bias"; }
+
+ private:
+  const OwnedTensor* gate_up_;
+  const OwnedTensor* bias_;
+  int64_t I_;
+};
+
 // UnquantizedMlpGateUpMethod: same merged [2I,H] operand and same single MatmulBT;
 // the ONLY difference is the activation epilogue (GeluAndMul(approximate="tanh")
 // instead of SiluAndMul), mirroring vLLM's GemmaMLP (gemma.py::GemmaMLP.act_fn =

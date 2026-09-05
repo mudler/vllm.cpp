@@ -42,6 +42,7 @@
 // Numeric contract: bf16 per-op, matching vLLM's stores (dense_attn_block.h). The
 // output gate's sigmoid argument stays f32 (vt::SigmoidGateBf16's contract: the
 // sigmoid input must not be rounded), the same convention qwen3_5.cpp uses.
+#include "vllm/model_executor/layers/attention/attention.h"
 #include "vllm/model_executor/models/muse_glimmer.h"
 
 #include <cmath>
@@ -226,8 +227,14 @@ DBuf MuseGlimmerAttnBlock(Dev d, const MuseGlimmerAttnWeights& w,
   vt::PagedAttentionArgs pa{g.attn_scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  // ENG-ATTENTION-WINDOW (#2388). `use_rope` is this model's own routing
+  // predicate and stays: a NoPE layer takes no window at all, which is a
+  // different question from how wide the window is.
   if (use_rope && g.sliding_window > 0)
-    pa.window_size = vt::AttentionWindow{static_cast<int32_t>(g.sliding_window - 1), 0};
+    pa.window_size = ResolveAttentionWindow(
+        /*per_layer=*/std::nullopt, g.sliding_window,
+        v1::AttentionType::kDecoder,
+        /*disable_model_sliding_window=*/false);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

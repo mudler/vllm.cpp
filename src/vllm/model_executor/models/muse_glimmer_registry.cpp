@@ -30,6 +30,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -78,8 +79,15 @@ std::unique_ptr<LoadedModel> LoadMuseGlimmer(const ModelRegistration& registrati
   if (source.kind == ModelSource::Kind::kGguf) {
     if (source.gguf == nullptr)
       throw std::runtime_error("muse_glimmer GGUF model source is empty");
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<MuseGlimmerLoadedModel>(
-        registration, LoadMuseGlimmerFromGguf(*source.gguf, config));
+        registration,
+        LoadMuseGlimmerFromGguf(*source.gguf, config, &gguf_policy));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");

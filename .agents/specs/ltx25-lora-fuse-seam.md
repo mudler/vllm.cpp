@@ -221,8 +221,13 @@ run here.
   for phase 1, so the load-time pass is provably wasted. This row makes each pass
   ~143x cheaper and **leaves the wasted round trip exactly where it was**. The two
   fixes are independent and #1210 owns the second.
-* **N-adapter fusion.** The second-adapter refusal stays, and `LTX25-IC-LORA`
-  still owns it.
+* **N-adapter fusion.** The second-adapter refusal stayed, and `LTX25-IC-LORA`
+  owned it, at the time this row landed. **Both clauses are now false and are
+  kept in past tense rather than deleted**: row `LTX25-LORA-FUSION`
+  ([`ltx25-lora-fusion.md`](ltx25-lora-fusion.md)) lifted the refusal and ported
+  upstream's second product form (`addmm_` with `alpha`), so N adapters fuse.
+  What this row did is unchanged by that — it is the `vt::Matmul` routing, and
+  the N-adapter loop reuses it per adapter.
 * **Any GB10 number.** §7.
 
 ## 7. What is not established

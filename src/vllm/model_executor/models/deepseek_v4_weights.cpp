@@ -1182,8 +1182,24 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
                     "`compress_ratio == 4` (attention.py:274) where `coff` is 2 "
                     "(compressor.py:247-248)");
       hl.idx_wk = carried.Float(ik, {iw, H});
-      for (const char* c : {"ape", "norm.weight", "wgate.weight"})
-        carried.Account(a + "indexer.compressor." + c);
+      // W3 (#2286): MATERIALIZED, where all three were accounted-and-dropped.
+      // The indexer's compressor is the same machine at `index_head_dim`, so the
+      // same widths apply: the ape and the fused gate carry `coff`, and `norm`
+      // does not (`compressor.py:288`).
+      //
+      // Loading them does NOT make the indexer's compressor run. The forward
+      // still refuses on `idx_wk`'s width, deliberately: narrowing a refusal
+      // before the capability exists turns it into a silent wrong answer, which
+      // this row has already established twice.
+      const std::string iape = a + "indexer.compressor.ape";
+      const std::string iwg = a + "indexer.compressor.wgate.weight";
+      RequireDsaDim(carried.PeekShape(iwg), 0, iw, iwg,
+                    "`coff * index_head_dim`, the same width as the KV it is "
+                    "fused with (compressor.py:279-287)");
+      hl.idx_comp_ape = carried.Float(iape, {p.compress_ratio(l), iw});
+      hl.idx_comp_wgate = carried.Float(iwg, {iw, H});
+      hl.idx_comp_norm_weight =
+          carried.Float(a + "indexer.compressor.norm.weight", {ihd});
       hl.idx_wproj = carried.Float(a + "indexer.weights_proj.weight", {inh, H});
       // NOT A WIDTH PROBLEM AT ALL, and worth separating from the rest. Upstream
       // builds this as `ReplicatedLinear(self.q_lora_rank, self.head_dim *
@@ -1834,7 +1850,10 @@ HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& g) {
 DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& config,
                                         const GgufLoadPolicy* policy) {
   (void)config;  // params resolved from the GGUF KV (self-describing vehicle)
-  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv();
+  // A null `policy` means NO ENGINE RESOLVED A DEVICE: every production GGUF
+  // entry point now builds one from `ModelSource::device` in its registry hook.
+  // `kCPU` is STATED rather than probed — see `GgufLoadPolicy::FromEnv`.
+  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env;
   const DeepseekV4Params p = DeepseekV4ParamsFromGguf(g);
 

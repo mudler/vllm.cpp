@@ -285,6 +285,46 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].path.name, "engine-matrix.md")
 
+    def test_dead_capability_rows_are_inside_the_engine_ratchet(self) -> None:
+        """The four dead-capability rows and the 173 -> 177 bump are one change.
+
+        Each row records a symbol or knob with a user-facing promise and no
+        production caller, found while gating the MoE placement install: the
+        `VT_QWEN35_STAGE_MIN_FREE_FRAC` knob whose only hit in compiled code is a
+        comment, jump-forward's `DrainForcedTokens`, the unreachable
+        `ResolveAttentionWindow`, and the one-directional env-doc gate that let
+        the first one outlive its reader.
+
+        This is the ratchet's own evidence contract, and it is load-bearing in
+        both directions. Against the BASE checker, pinned at 173 while the matrix
+        carries 177, `check_matrices` reports an engine-row count error and this
+        test FAILS. Against HEAD it passes. That is what separates a bump made
+        for four real rows from a bump made to silence a failure -- the
+        distinction `test_engine_row_ratchet_is_load_bearing` exists to protect
+        and that this case supplies the instance of.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+        # INVENTORIED, not SPIKE: a SPIKE row obliges a `CLAIM-*` owner, and
+        # inventing one would record work nobody is doing. `ENG-GATE-ENV-DOC`
+        # left that state when #2389 landed the reverse direction of the gate,
+        # so the ratchet's evidence for it is now GATING; the row is still one
+        # of the four the bump paid for, which is what this case measures.
+        expected_state = {
+            "ENG-WEIGHT-RESIDENCY": "INVENTORIED",
+            "ENG-STRUCTURED-OUTPUT": "INVENTORIED",
+            "ENG-ATTENTION-WINDOW": "INVENTORIED",
+            "ENG-GATE-ENV-DOC": "GATING",
+        }
+        for item_id, state in expected_state.items():
+            with self.subTest(item_id=item_id):
+                found = [row for row in rows if row.item_id == item_id]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0].path.name, "engine-matrix.md")
+                self.assertEqual(found[0].state, state)
+
     def test_serve_recipe_args_row_is_inside_the_engine_ratchet(self) -> None:
         """The #606 row and its 152 -> 153 ratchet bump are one semantic change.
 
@@ -794,14 +834,47 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(found[0].path.name, "quantization-matrix.md", item_id)
         self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
 
-        # One row, not two: the rank-sliced layout is the same scheme and must
-        # not acquire a sibling SCHEME row. Scoped to `QUANT-` deliberately --
-        # `MODEL-DSV4-EXL3` also carries EXL3 in its id and is a MODEL row for
-        # the checkpoint that uses the scheme, which is a different axis and
-        # must not be swept in here.
+        # TWO rows, and the second one is NAMED rather than allowed by a
+        # loosened predicate. The original assertion was "one row, not two",
+        # against the rank-sliced LAYOUT acquiring a sibling scheme row: that
+        # layout is the same scheme read differently and still must not.
+        #
+        # `QUANT-EXL3-MUL1` (#2495) is admitted because it is a different
+        # CODEBOOK, which is a different decode and not a different layout: cb 0
+        # and cb 1 mask, xor and sum the two fp16 halves of the product, while cb
+        # 2 sums the product's four bytes into an fp16 bit pattern and maps it
+        # with a fused fp16 affine (`codebook.cuh:82-89`). It carries its own
+        # artifact, its own bit widths and its own owed GEMV arm, none of which
+        # `QUANT-EXL3`'s cells can hold without saying two things at once.
+        #
+        # `QUANT-EXL3-PERF` (#2570) is the THIRD, and it is admitted on a
+        # different ground from the second. It is not a codebook, a width or a
+        # layout: it is the only row on a different AXIS. `QUANT-EXL3` and
+        # `QUANT-EXL3-MUL1` are correctness rows and their cells say so -- they
+        # answer "does this width RUN" -- while this one answers "what does it
+        # COST", which is the question #2570 asked and no row owned. Its `P`
+        # cell is the one cell neither sibling can carry: `QUANT-EXL3-MUL1`
+        # reads `E` `-` and `P` `-` precisely BECAUSE it ports the format and not
+        # the benchmark, and overwriting those to hold a throughput verdict would
+        # make one row say two things about two different measurements.
+        #
+        # The concrete surface is also disjoint. This row owns
+        # `Exl3GemvArmInstantiated` and `GemvKernel` -- the `m <= 8` GEMV arm set
+        # and its envelope -- which `QUANT-EXL3-MUL1`'s own claim file EXCLUDES
+        # by name ("EXCLUDES the GEMV kernel itself"). A row whose scope another
+        # row explicitly excluded is not a sibling scheme row; it is the owner
+        # that exclusion implies.
+        #
+        # Listing all three by name keeps the force of the original: a FOURTH
+        # `QUANT-*EXL3*` row still fails here and has to argue for itself in this
+        # comment, which is exactly what a rank-sliced-layout row could not do.
+        # Scoped to `QUANT-` deliberately -- `MODEL-DSV4-EXL3` also carries EXL3
+        # in its id and is a MODEL row for the checkpoint that uses the scheme,
+        # which is a different axis and must not be swept in here.
         siblings = [row for row in rows
                     if row.item_id.startswith("QUANT-") and "EXL3" in row.item_id]
-        self.assertEqual([row.item_id for row in siblings], [item_id])
+        self.assertEqual(sorted(row.item_id for row in siblings),
+                         ["QUANT-EXL3", "QUANT-EXL3-MUL1", "QUANT-EXL3-PERF"])
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.

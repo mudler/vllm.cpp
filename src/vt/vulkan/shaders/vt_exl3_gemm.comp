@@ -1,0 +1,210 @@
+#version 450
+// EXL3 step 2 — the GEMM against the trellis, DECODED INSIDE the loop. Row
+// BACKEND-VULKAN-EXL3 (#2530), spec .agents/specs/backend-vulkan-exl3.md.
+//
+// THE DONOR IS THE PORTABLE CPU REFERENCE:
+//   src/vt/cpu/cpu_exl3_kernels.cpp   Exl3GemmKernelCpu step 2
+//   src/vt/cpu/cpu_exl3_dequant.cpp   Exl3TileCodeword, Exl3DecodeCodeword,
+//                                     Exl3TileRowMajorIndex, Exl3DecodeTile
+// themselves 1:1 ports of exllamav3 @ 2398c05635fbbad01a0a51dce63c85c6c8a8450e
+// (MIT) — exl3_dq.cuh:15-31, codebook.cuh:56-90, quantize.py:22-42,
+// exl3_gemm_kernel.cuh:8-80.
+//
+// THE WEIGHTS ARE NEVER MATERIALISED, which is EXL3's whole point. A real
+// projection is k = 4096, n = 2048 and its f32 reconstruction would be 32 MiB;
+// this decodes one 16x16 TILE at a time into 1 KiB of shared memory, exactly as
+// the host reference does.
+//
+// GEOMETRY. One workgroup owns one 16-column output tile and up to EIGHT rows;
+// one invocation owns one output element. Per k-tile the 128 invocations decode
+// that tile's 256 codewords TWO EACH into shared memory, which is
+// `Exl3DecodeTile` with its `t` loop unrolled across invocations and the only
+// place an invocation reads a codeword it does not own.
+//
+// EIGHT ROWS AND NOT THE ROCm ARM'S SIXTEEN, because 128 is the
+// Vulkan-GUARANTEED maxComputeWorkGroupInvocations and vt_common.glsl § VT_TG
+// makes it this backend's portability floor. The grid is FLATTENED to one
+// dimension because VulkanContext::Dispatch takes `group_count_x` only. Neither
+// choice moves a bit.
+//
+// THE ACCUMULATION ORDER IS THE HOST'S — `ti` ascending outermost, `rr`
+// ascending inside, into ONE f32 accumulator — which is the host loop nest read
+// down a single accumulator. Two consequences, and both are load-bearing:
+//
+//   * `acc` is `precise`. Without it the driver may contract `acc + xv * w` into
+//     an FMA, which rounds ONCE where the host rounds twice. The host build sets
+//     `-ffp-contract=off` for exactly this reason; `precise` is the GLSL
+//     spelling of it and emits SPIR-V NoContraction.
+//   * the host's `if (xv == 0.0f) continue` is KEPT, and is not an optimisation.
+//     With `acc == -0.0f`, adding a `+0.0f` product flips the sign of the zero,
+//     so dropping the guard would make this arm differ from its own reference on
+//     exactly the values a byte gate exists to catch.
+//
+// fp16 IS A SOFTWARE CODEC HERE. These shaders require only 16-bit STORAGE
+// (vt_common.glsl:44-45) and there is no fp16 arithmetic extension, so the
+// codebook 0/1 pair-sum and the codebook 2 affine are evaluated in f32 and
+// rounded by vt_f32_to_f16 — which is what the host does anyway
+// (`Exl3DecodeCodeword` widens to `float` and calls `RoundHalf`), and which is
+// why nothing is approximated to make this run.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Three operands, three bindings, each through the ONE view it uses: `raw` is
+// f32 by contract (it is the kernel's own staging buffer), while `a_had` is f16
+// and the trellis is opaque BYTES read as the uint32 pairs exl3_dq.cuh reads.
+layout(binding = 0) buffer Rb32 { uint v[]; } RAW;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } AH;
+layout(binding = 2) readonly buffer Tb16 { uint16_t v[]; } TR;
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint k;
+  uint n;
+  uint bits;
+  uint codebook;
+  uint tiles_n;    // n / 16, so the shader does not re-divide per k-tile
+  uint raw_off;    // BYTE offsets, see vt_common.glsl § STORAGE MODEL
+  uint ah_off;
+  uint tr_off;
+} p;
+
+shared float tile[256];  // 1 KiB, one decoded 16x16 tile
+
+// cpu_exl3_dequant.cpp RoundHalf.
+float vt_round_half(float v) { return vt_f16_to_f32(vt_f32_to_f16(v)); }
+
+// The tile's uint32 view (exl3_dq.cuh:25-26), assembled by hand from the 16-bit
+// view so the trellis may sit at any 2-byte alignment inside the buffer.
+// `base` is an ELEMENT index into the uint16 view.
+uint vt_tile_word32(uint base, int index) {
+  const uint lo = uint(TR.v[base + 2u * uint(index)]);
+  const uint hi = uint(TR.v[base + 2u * uint(index) + 1u]);
+  return lo | (hi << 16);
+}
+
+// Exl3TileCodeword, verbatim. `+ 256*bits` is upstream's way of keeping the
+// tail-biting wrap non-negative; the `% words32` on the word index is the wrap.
+//
+// THE FUNNEL SHIFT IS 32-BIT, and that is the one place this differs in FORM
+// from the host. The host builds a uint64 and shifts it; Vulkan 1.1 has no
+// 64-bit integer without VK_KHR_shader_int64, which this backend does not probe.
+// `s0` is provably in [0, 31] — `i1*32 <= b1-1 <= i1*32+31` gives
+// `(i1+1)*32 - b1` in exactly that range — so the two-word form below is the
+// same bits, with the `s0 == 0` case split out because a 32-bit shift by 32 is
+// UNDEFINED in GLSL.
+uint vt_tile_codeword(uint base, int bits, int t) {
+  const int words32 = bits * 256 / 32;
+  const int b0 = t * bits + bits - 16 + 256 * bits;
+  const int b1 = b0 + 16;
+  const int i0 = b0 / 32;
+  const int i1 = (b1 - 1) / 32;
+  const uint s0 = uint((i1 + 1) * 32 - b1);
+  const uint a = vt_tile_word32(base, i0 % words32);
+  const uint b = vt_tile_word32(base, i1 % words32);
+  const uint merged = s0 == 0u ? b : ((b >> s0) | (a << (32u - s0)));
+  return merged & 0xffffu;
+}
+
+// Exl3DecodeCodeword (codebook.cuh:56-90). ALL THREE codebooks, because a Vulkan
+// device has no reason to see fewer artifacts than a CUDA one:
+//   cb 0  3INST, the DEFAULT — a checkpoint shipping neither an `mcg` nor a
+//         `mul1` marker lands here, which is every stock turboderp/*-exl3
+//   cb 1  MCG, which the SparkInfer DeepSeek-V4 artifact marks
+//   cb 2  mul1, a DIFFERENT SHAPE and not a third multiplier
+// `codebook` is validated on the host before dispatch, so there is no fall-off
+// arm here; a shader cannot throw, and a silent wrong decode is exactly the
+// failure this family documents (right distribution, no correlation).
+float vt_decode_codeword(uint codeword, uint codebook) {
+  uint x = codeword;
+  if (codebook == 2u) {
+    // cb 2 -- `mul1` (codebook.cuh:82-89). NOT the mask/xor/pair-sum of cb 0 and
+    // cb 1: the 32-bit product's four UNSIGNED BYTES are summed into a fixed
+    // accumulator, the sum is REINTERPRETED as an fp16 bit pattern, and an fp16
+    // affine map turns it into the codebook value.
+    x *= 0x83DCD12Du;
+    // `__dp4a(x, 0x01010101u, acc)` == acc + the four unsigned bytes of x. Four
+    // shifts and three adds; deliberately NOT VK_KHR_shader_integer_dot_product,
+    // which this backend does not probe and which would narrow the device set
+    // for arithmetic that is exact either way.
+    const uint byte_sum =
+        (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + ((x >> 24) & 0xffu);
+    // 0x6400 is chosen so the reinterpretation is EXACT: the fp16 binade
+    // [1024, 2048) has an ULP of exactly 1.0 and the byte sum is at most 4*255,
+    // so the pattern never leaves that binade.
+    const uint sum = 0x6400u + byte_sum;
+    const float h = vt_f16_to_f32(sum);
+    // BIT PATTERNS, not the rounded decimals upstream's comments carry: 0x1eee is
+    // 887/131072 and 0xc931 is -1329/128.
+    const float k_inv = vt_f16_to_f32(0x1eeeu);
+    const float k_bias = vt_f16_to_f32(0xc931u);
+    // Upstream ends in __hfma, ONE rounding, and this is the one expression here
+    // that does NOT need `precise`: `h` is an integer in [1024, 2044] and `k_inv`
+    // is 887*2^-17, so the product needs at most 21 significant bits and is exact
+    // in f32; `k_bias` is an integer multiple of the same 2^-17 quantum, so the
+    // sum is exact too. Contracted or not, the value is identical, and the only
+    // rounding is vt_round_half's -- which is where __hfma rounds as well.
+    return vt_round_half(h * k_inv + k_bias);
+  }
+  if (codebook == 0u) {
+    x *= 89226354u;
+    x += 64248484u;
+  } else {
+    x *= 0xCBAC1FEDu;
+  }
+  // `lop3.b32 ... 0x6a` IS `(a & b) ^ c` — upstream's own comment says so at
+  // codebook.cuh:64-66 (immLut 0x6a with the canonical a=0xF0, b=0xCC, c=0xAA).
+  x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
+  const float lo = vt_f16_to_f32(x & 0xffffu);
+  const float hi = vt_f16_to_f32(x >> 16);
+  return vt_round_half(lo + hi);  // __hadd: the sum is taken in fp16
+}
+
+// Exl3TileRowMajorIndex (quantize.py:28-42). `t / 8` is the tensor-core lane,
+// `t % 8` its eight fragment slots. The host's kRowOffset[8] = {0,1,8,9,0,1,8,9}
+// is written as arithmetic so no constant array is needed.
+uint vt_tile_row_major_index(uint t) {
+  const uint lane = t >> 3;
+  const uint sub = t & 7u;
+  const uint q = sub & 3u;
+  const uint row_offset = q < 2u ? q : q + 6u;  // 0,1,8,9
+  const uint r = (lane % 4u) * 2u + row_offset;
+  const uint c = lane / 4u + (sub < 4u ? 0u : 8u);
+  return r * 16u + c;
+}
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x;
+  // The flattened grid: `tiles_n` output column tiles by ceil(m/8) row blocks.
+  const uint tj = gl_WorkGroupID.x % p.tiles_n;
+  const uint rb = gl_WorkGroupID.x / p.tiles_n;
+  const uint row = rb * 8u + (tid >> 4);
+  const uint cc = tid & 15u;
+  const bool live = row < p.m;
+  const uint tile_words = 16u * p.bits;   // uint16 words per 16x16 tile
+  const uint tr_base = p.tr_off >> 1;
+  const uint ah_base = p.ah_off >> 1;
+
+  // See the head of this file: `precise` is what stops `acc + xv * w` becoming an
+  // FMA and rounding once where the host rounds twice.
+  precise float acc = 0.0;
+  const uint ktiles = p.k / 16u;
+  for (uint ti = 0u; ti < ktiles; ++ti) {
+    const uint tp = tr_base + (ti * p.tiles_n + tj) * tile_words;
+    barrier();  // the previous iteration's readers are done with `tile`
+    for (uint t = tid; t < 256u; t += 128u)
+      tile[vt_tile_row_major_index(t)] =
+          vt_decode_codeword(vt_tile_codeword(tp, int(p.bits), int(t)), p.codebook);
+    barrier();
+    if (live) {
+      const uint arow = ah_base + row * p.k + ti * 16u;
+      for (uint rr = 0u; rr < 16u; ++rr) {
+        const float xv = vt_f16_to_f32(uint(AH.v[arow + rr]));
+        if (xv == 0.0) continue;  // load-bearing, see the head of this file
+        acc += xv * tile[rr * 16u + cc];
+      }
+    }
+  }
+  if (live) RAW.v[(p.raw_off >> 2) + row * p.n + tj * 16u + cc] = floatBitsToUint(acc);
+}

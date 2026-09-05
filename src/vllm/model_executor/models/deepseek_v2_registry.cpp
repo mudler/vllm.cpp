@@ -143,6 +143,7 @@ const ModelFactory kDeepseekV2Factory{
     .forward = &ForwardDeepseekV2ForCausalLM,
     .make_kv_cache = &MakeDeepseekV2KVCache,
     .is_dense_model = false,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

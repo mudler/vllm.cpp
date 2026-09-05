@@ -58,6 +58,22 @@
 //   Fp8DsMlaDecodeToken           <-  SGLang dsv4/dequant_k_cache.py:122-136
 //                                     (nope = e4m3->f32 * 2^(scale_byte-127);
 //                                      rope = bf16->f32) — the paged-KV READ side
+//   MakeFp8DsMlaPageLayout        <-  cache_utils.py:59-63 (the region-split block
+//                                     comment) + kv_cache_interface.py:401-403
+//                                     (storage_block_size*584) + :345-351
+//                                     (_apply_alignment_padding, round_up 576)
+//   Fp8DsMlaStoreToken            <-  cache_utils.py:36-159
+//                                     (quantize_and_insert_k_kernel: :77-78 the
+//                                      slot<0 skip, :92 data offset, :96-98 the
+//                                      scale-region offset, :146 the 7 scale
+//                                      bytes, :148-149 the zero pad byte,
+//                                      :155-159 the bf16 rope store)
+//   Fp8DsMlaLoadToken             <-  cache_utils.py:228-341
+//                                     (_dequantize_and_gather_k_kernel: :281-292
+//                                      the same addressing, :306 the fp8 bytes,
+//                                      :319 the scale byte, :333-339 the rope);
+//                                      it reads n_quant_blocks=7 (`:385`), one
+//                                      FEWER than the store writes
 #pragma once
 
 #include <cstdint>
@@ -154,6 +170,70 @@ Fp8DsMlaToken Fp8DsMlaEncodeToken(const std::vector<float>& head,
 std::vector<float> Fp8DsMlaDecodeToken(const Fp8DsMlaToken& token,
                                        const Fp8DsMlaLayout& layout);
 
+// ── (B2) The paged fp8_ds_mla BLOCK layout — `KV-DSV4-MULTICACHE` W8 slice 1 ──
+//
+// `Fp8DsMlaLayout` above is the geometry of ONE token. This is the geometry of a
+// PAGE, and the two are not the same shape, because the block is REGION-SPLIT
+// (`common/ops/cache_utils.py:59-63`, verbatim):
+//
+//     K Cache block layout (block_size=64 tokens):
+//     - [0, 64*576):              Token data, each token has 448 fp8 + 128 bf16
+//     - [64*576, 64*576 + 64*8):  Scales, each token has 8 uint8 scales
+//     - [64*576 + 64*8, block_stride): Padding
+//
+// A token's scale bytes therefore live in a DIFFERENT region of the block from
+// its data bytes, so the page is NOT a rank-3 `(num_blocks, block_size, width)`
+// tensor and `vt::ConcatAndCacheMla` — which requires exactly that — cannot
+// write it. See `.agents/specs/kv-dsv4-multicache.md` `### W8 design`.
+//
+// UNREACHED, and declared so under AGENTS.md "Nothing lands dead": this slice is
+// the shared host reference that W8 slices 2 (`kConcatAndCacheDsMla`), 3 (the
+// dequant gather) and 5 (the CUDA kernels) are each a port of. Nothing in the
+// tree calls it yet; the owning row is `KV-DSV4-MULTICACHE`, the issue is #2455,
+// and the spec lists it under `## Owed`.
+struct Fp8DsMlaPageLayout {
+  Fp8DsMlaLayout token;         // the per-token geometry (576 data + 8 scale).
+  int64_t block_size;           // STORAGE rows per block (`storage_block_size()`).
+  int64_t token_data_size;      // = token.token_stride_bytes (576) — `cache_utils.py:92`.
+  int64_t scale_region_offset;  // = block_size * token_data_size — `:96-98`.
+  int64_t scale_dim;            // = token.scale_dim (8 = 7 real + 1 pad) — `:148-149`.
+  int64_t alignment_bytes;      // upstream's literal 576 (`attention.py:642`,
+                                // `sparse_swa.py:99`). It coincides with
+                                // `token_data_size` at V4's geometry; it is
+                                // upstream's own constant, NOT derived from it.
+  int64_t real_block_bytes;     // = block_size * 584 — `kv_cache_interface.py:401-403`.
+  int64_t padded_block_bytes;   // = round_up(real, alignment) — `:345-351`.
+};
+
+// `block_size` is the STORAGE block size (upstream's `cache_block_size` kernel
+// argument, i.e. `block_size // compress_ratio`), not the logical block size.
+Fp8DsMlaPageLayout MakeFp8DsMlaPageLayout(const Fp8DsMlaLayout& layout,
+                                          int64_t block_size);
+
+// Write one token into a block, mirroring `quantize_and_insert_k_kernel`
+// (`cache_utils.py:36-159`) with the quantization already done by
+// `Fp8DsMlaEncodeToken`:
+//   data  at `pos_in_block * token_data_size`      — nope bytes then rope bf16
+//                                                    (`:92`, `:100-101`, `:155-159`)
+//   scale at `scale_region_offset + pos_in_block * scale_dim`
+//                                                    (`:96-98`, `:146`)
+// plus an explicit ZERO pad byte at scale index `n_nope_blocks` (`:148-149`).
+// A negative `pos_in_block` is upstream's `slot_idx == -1` skip (`:77-78`) and
+// leaves the block byte-for-byte untouched.
+void Fp8DsMlaStoreToken(uint8_t* block_base, const Fp8DsMlaPageLayout& page,
+                        int64_t pos_in_block, const Fp8DsMlaToken& token);
+
+// The exact inverse, mirroring `_dequantize_and_gather_k_kernel`'s addressing
+// (`cache_utils.py:281-292`, `:306`, `:319`, `:333-339`).
+//
+// ASYMMETRY, and it is upstream's: the store writes `scale_dim` (8) scale bytes,
+// the read consumes `n_quant_blocks = 7` (`cache_utils.py:385`). The 8th byte is
+// written and never read, so the returned `scale_ue8m0` has `n_nope_blocks`
+// entries and the pad byte is dropped here exactly as the gather drops it.
+Fp8DsMlaToken Fp8DsMlaLoadToken(const uint8_t* block_base,
+                                const Fp8DsMlaPageLayout& page,
+                                int64_t pos_in_block);
+
 
 // `MODEL-DSV4-DSA-COMPOSE` W1 (#2286) — ONE COMPRESSOR STEP, state machine and all.
 //
@@ -186,6 +266,19 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        const std::vector<int64_t>& positions,
                                        const std::vector<float>& rms_weight, float eps,
                                        int64_t compress_ratio, int64_t head_dim,
+                                       // THE POOLED ROW IS ROTATED. The kernel that
+                                       // writes the compressed cache applies GPT-J
+                                       // RoPE to the ROPE TAIL only, unconditionally,
+                                       // at `compressed_pos = (position /
+                                       // compress_ratio) * compress_ratio` -- the
+                                       // WINDOW'S BASE position, not the emitting
+                                       // token's
+                                       // (`fused_compress_quant_cache.py:272-297`).
+                                       // `rope_dim == 0` leaves the row unrotated,
+                                       // which is what every gate written before this
+                                       // parameter existed expects.
+                                       int64_t rope_dim = 0,
+                                       double rope_theta = 10000.0,
                                        // `coff = 1 + (compress_ratio == 4)`
                                        // (compressor.py:247-248). At 2 the kv/score
                                        // rows are `coff*head_dim` wide and a window

@@ -42,6 +42,7 @@
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -201,7 +202,7 @@ TEST_CASE("gguf mtp: the head loads with trunk-consistent conventions") {
       c.num_experts > 0 ? vllm::Qwen3_5MTPKind::kMoe
                         : vllm::Qwen3_5MTPKind::kDense;
   const vllm::Qwen3_5MTPWeights w = vllm::LoadQwen3_5MTPFromGguf(
-      g, c, kind, vllm::GgufLoadPolicy::FromEnv());
+      g, c, kind, vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()));
 
   const int64_t H = c.hidden_size;
 

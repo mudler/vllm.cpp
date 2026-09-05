@@ -1,0 +1,194 @@
+cmn  common_param: common_params_print_info: build 0 (unknown) with GNU 13.3.0 for Linux x86_64
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61319552
+cmn  common_param:   - ROCm0   : Radeon 8060S Graphics (65536 MiB, 59882 MiB free)
+cmn  common_param:   - CPU     : AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (63933 MiB, 63933 MiB free)
+cmn  common_param: system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+llama_model_loader: - type  f32:  456 tensors
+llama_model_loader: - type q8_0:    1 tensors
+llama_model_loader: - type q4_K:  294 tensors
+llama_model_loader: - type q5_K:   48 tensors
+llama_model_loader: - type q6_K:   67 tensors
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61282768
+llama_prepare_model_devices: using device ROCm0 (Radeon 8060S Graphics) (0000:c5:00.0) - 59846 MiB free
+print_info: n_layer               = 64
+print_info: n_layer_all           = 65
+load_tensors: loading model tensors, this can take a while... (load_mode = none)
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61248692
+load_tensors: layer   0 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   1 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   2 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   3 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   4 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   5 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   6 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   7 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   8 assigned to device ROCm0, is_swa = 0
+load_tensors: layer   9 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  10 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  11 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  12 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  13 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  14 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  15 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  16 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  17 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  18 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  19 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  20 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  21 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  22 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  23 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  24 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  25 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  26 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  27 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  28 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  29 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  30 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  31 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  32 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  33 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  34 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  35 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  36 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  37 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  38 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  39 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  40 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  41 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  42 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  43 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  44 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  45 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  46 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  47 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  48 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  49 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  50 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  51 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  52 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  53 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  54 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  55 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  56 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  57 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  58 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  59 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  60 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  61 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  62 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  63 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  64 assigned to device ROCm0, is_swa = 0
+load_tensors: layer  65 assigned to device ROCm0, is_swa = 0
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61248928
+load_tensors: offloading output layer to GPU
+load_tensors: offloading 64 repeating layers to GPU
+load_tensors: offloaded 66/66 layers to GPU
+load_tensors:        ROCm0 model buffer size =     0.00 MiB
+load_tensors:    ROCm_Host model buffer size =     0.00 MiB
+llama_kv_cache: layer   0: filtered
+llama_kv_cache: layer   1: filtered
+llama_kv_cache: layer   2: filtered
+llama_kv_cache: layer   3: dev = ROCm0
+llama_kv_cache: layer   4: filtered
+llama_kv_cache: layer   5: filtered
+llama_kv_cache: layer   6: filtered
+llama_kv_cache: layer   7: dev = ROCm0
+llama_kv_cache: layer   8: filtered
+llama_kv_cache: layer   9: filtered
+llama_kv_cache: layer  10: filtered
+llama_kv_cache: layer  11: dev = ROCm0
+llama_kv_cache: layer  12: filtered
+llama_kv_cache: layer  13: filtered
+llama_kv_cache: layer  14: filtered
+llama_kv_cache: layer  15: dev = ROCm0
+llama_kv_cache: layer  16: filtered
+llama_kv_cache: layer  17: filtered
+llama_kv_cache: layer  18: filtered
+llama_kv_cache: layer  19: dev = ROCm0
+llama_kv_cache: layer  20: filtered
+llama_kv_cache: layer  21: filtered
+llama_kv_cache: layer  22: filtered
+llama_kv_cache: layer  23: dev = ROCm0
+llama_kv_cache: layer  24: filtered
+llama_kv_cache: layer  25: filtered
+llama_kv_cache: layer  26: filtered
+llama_kv_cache: layer  27: dev = ROCm0
+llama_kv_cache: layer  28: filtered
+llama_kv_cache: layer  29: filtered
+llama_kv_cache: layer  30: filtered
+llama_kv_cache: layer  31: dev = ROCm0
+llama_kv_cache: layer  32: filtered
+llama_kv_cache: layer  33: filtered
+llama_kv_cache: layer  34: filtered
+llama_kv_cache: layer  35: dev = ROCm0
+llama_kv_cache: layer  36: filtered
+llama_kv_cache: layer  37: filtered
+llama_kv_cache: layer  38: filtered
+llama_kv_cache: layer  39: dev = ROCm0
+llama_kv_cache: layer  40: filtered
+llama_kv_cache: layer  41: filtered
+llama_kv_cache: layer  42: filtered
+llama_kv_cache: layer  43: dev = ROCm0
+llama_kv_cache: layer  44: filtered
+llama_kv_cache: layer  45: filtered
+llama_kv_cache: layer  46: filtered
+llama_kv_cache: layer  47: dev = ROCm0
+llama_kv_cache: layer  48: filtered
+llama_kv_cache: layer  49: filtered
+llama_kv_cache: layer  50: filtered
+llama_kv_cache: layer  51: dev = ROCm0
+llama_kv_cache: layer  52: filtered
+llama_kv_cache: layer  53: filtered
+llama_kv_cache: layer  54: filtered
+llama_kv_cache: layer  55: dev = ROCm0
+llama_kv_cache: layer  56: filtered
+llama_kv_cache: layer  57: filtered
+llama_kv_cache: layer  58: filtered
+llama_kv_cache: layer  59: dev = ROCm0
+llama_kv_cache: layer  60: filtered
+llama_kv_cache: layer  61: filtered
+llama_kv_cache: layer  62: filtered
+llama_kv_cache: layer  63: dev = ROCm0
+llama_kv_cache: layer  64: filtered
+llama_kv_cache:      ROCm0 KV buffer size =     0.00 MiB
+llama_kv_cache: size = 16384.00 MiB (262144 cells,  16 layers,  1/1 seqs), K (f16): 8192.00 MiB, V (f16): 8192.00 MiB
+llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 256
+llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 256
+llama_memory_recurrent: layer   3: skipped
+llama_memory_recurrent: layer   7: skipped
+llama_memory_recurrent: layer  11: skipped
+llama_memory_recurrent: layer  15: skipped
+llama_memory_recurrent: layer  19: skipped
+llama_memory_recurrent: layer  23: skipped
+llama_memory_recurrent: layer  27: skipped
+llama_memory_recurrent: layer  31: skipped
+llama_memory_recurrent: layer  35: skipped
+llama_memory_recurrent: layer  39: skipped
+llama_memory_recurrent: layer  43: skipped
+llama_memory_recurrent: layer  47: skipped
+llama_memory_recurrent: layer  51: skipped
+llama_memory_recurrent: layer  55: skipped
+llama_memory_recurrent: layer  59: skipped
+llama_memory_recurrent: layer  63: skipped
+llama_memory_recurrent:      ROCm0 RS buffer size =   149.62 MiB
+llama_memory_recurrent: size =  149.62 MiB (     1 cells,  64 layers,  1 seqs  0 rs_seq), R (f32):    5.62 MiB, S (f32):  144.00 MiB
+sched_reserve: reserving ...
+sched_reserve: max_nodes = 27232
+sched_reserve: reserving full memory module
+sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
+sched_reserve:      ROCm0 compute buffer size =   122.00 MiB
+sched_reserve:  ROCm_Host compute buffer size =   266.02 MiB
+sched_reserve: graph nodes  = 3655
+sched_reserve: graph splits = 1
+sched_reserve: reserve took 10.44 ms, sched copies = 1
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61204336
+llama_prepare_model_devices: using device ROCm0 (Radeon 8060S Graphics) (0000:c5:00.0) - 59769 MiB free
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61204480
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61204604
+load_tensors:        ROCm0 model buffer size = 15345.66 MiB
+load_tensors:    ROCm_Host model buffer size =   682.03 MiB
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 60692840
+llama_kv_cache:      ROCm0 KV buffer size = 16384.00 MiB
+sched_reserve: reserve took 89.72 ms, sched copies = 1
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 59917204

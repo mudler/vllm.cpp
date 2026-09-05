@@ -60,7 +60,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 26);
+  CHECK(n == 28);  // +2: BACKEND-VULKAN-EXL3 (#2530)
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -84,7 +84,12 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
                            // BACKEND-VULKAN-GDN-CORE: the two recurrences.
                            "vt_gdn_prefill", "vt_gdn_decode",
                            // BACKEND-VULKAN-QKNORM: the fused attn preamble.
-                           "vt_attn_qk_norm_rope_gate"}) {
+                           "vt_attn_qk_norm_rope_gate",
+                           // BACKEND-VULKAN-EXL3: the EXL3 trellis linear. ONE op
+                           // (kExl3Gemm) is served by BOTH modules -- the had is
+                           // steps 1 and 3 of the same fused chain -- so a
+                           // module-per-op reading of this list is wrong here.
+                           "vt_exl3_had", "vt_exl3_gemm"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -145,6 +150,15 @@ TEST_CASE("the committed SPIR-V table records each module's WRITABLE bindings") 
       {"vt_greedy_argmax", 2u, 0x02u},
       {"vt_rms_norm", 8u, 0xf0u},
       {"vt_matmul_vec", 8u, 0x30u},
+      // vt_exl3_had.comp: in at 0/1 readonly, out at 2/3 writable, and the two
+      // OPTIONAL fp16 scale vectors at 4 and 5 -- single 16-bit views, because
+      // both are fp16 by contract on every arm, and both read-only.
+      {"vt_exl3_had", 6u, 0x0cu},
+      // vt_exl3_gemm.comp: the f32 `raw` staging buffer at 0 WRITABLE, a_had at 1
+      // and the trellis at 2 read-only. THREE bindings and not six: each operand
+      // is bound through the ONE view it uses, so there is no unused 32-bit view
+      // for glslang to strip into a binding hole.
+      {"vt_exl3_gemm", 3u, 0x01u},
   };
   for (const auto& e : kExpect) {
     CAPTURE(e.name);
@@ -264,6 +278,15 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // the cos/sin cache are f32 by contract and are therefore NOT axes.
       REQUIRE(m.spec_id_count == 3);
       for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_exl3_had") == 0) {
+      // The input width and the output width, which are INDEPENDENT bits and not
+      // one enum: upstream's three inners are (half,half), (float,float) and
+      // (float,half), and Exl3GemmKernelCpu selects between exactly those off
+      // `c.dtype`. TWO, and a third would mean the shader had grown an axis the
+      // op does not promise -- the scale vectors are fp16 BY CONTRACT on every
+      // arm (hadamard_inner.cuh:109/:171) and are therefore not axes.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else {
       CHECK(m.spec_id_count == 0);
     }
@@ -485,9 +508,11 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
     CHECK(prio[0] == "FLASH_ATTN");
   }
   // MLA stays EMPTY, and that is a capability statement rather than a stub:
-  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla have no
-  // Vulkan kernel, so naming a backend here would route an MLA model into one
-  // that cannot serve it. Selection must fail loudly instead.
+  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla — and
+  // kConcatAndCacheDsMla / kDequantAndGatherDsMla, the fp8_ds_mla byte-page pair
+  // (KV-DSV4-MULTICACHE W8, #2455) — have no Vulkan kernel, so naming a backend
+  // here would route an MLA model into one that cannot serve it. Selection must
+  // fail loudly instead.
   {
     vllm::platforms::AttnSelectorConfig mla;
     mla.use_mla = true;
@@ -532,7 +557,13 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       // BACKEND-VULKAN-GDN-CORE: the two gated-delta recurrences
                       // themselves, which are where a GDN hybrid's prefill time
                       // actually was.
-                      vt::OpId::kGdnPrefill, vt::OpId::kGdnDecode}) {
+                      vt::OpId::kGdnPrefill, vt::OpId::kGdnDecode,
+                      // BACKEND-VULKAN-EXL3 (#2530): the exactly two ops an EXL3
+                      // checkpoint ran on the portable CPU tier when the queue was
+                      // Vulkan. kCastF16 is not an EXL3 op -- the EXL3 linear
+                      // demands an f16 activation while models carry bf16/f32 --
+                      // and its two siblings were registered here from W0.
+                      vt::OpId::kCastF16, vt::OpId::kExl3Gemm}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // No NATIVE Vulkan kernel yet for the rotary TABLE BUILD (kRopeCosSinCache and

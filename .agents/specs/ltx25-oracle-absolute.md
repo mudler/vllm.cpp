@@ -436,16 +436,56 @@ Stop and report, do not work around:
   that flatters us, and passed. `OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`)
   sets no sigmas and `OneStageRecipe` (`:1149-1163`) never assigns
   `allow_request_sigmas`, so `one_stage` takes the branch that reads `steps`.
-- **Five line anchors into `examples/ltx2_gen/main.cpp` are now STALE and cannot
-  be repaired, because they live in the append-only issue index.** Adding
-  `--steps` moved that file's later lines by +12, and
-  `.agents/issue-index.md` rows 324, 325, 356, 373 and **821** cite it by line.
-  Row 821 is this row's own #2130 entry, so one of the five is mine: the guidance
+- **Five line anchors into `examples/ltx2_gen/main.cpp` are STALE and cannot be
+  repaired in the index.** Adding `--steps` moved that file's later lines by
+  +12, and the index rows for #1096, #1097, #1151, #1191 and this row's own
+  #2130 all cite it by line. One of the five is mine: the guidance
   `never-cite-a-line-number-in-an-append-only-file` names exactly this, and I
-  wrote a line number into an append-only row anyway. AGENTS.md forbids editing a
-  row, so the correction lives here instead: **`tools/oracle/ltx2_oracle.py:88` in
-  that row should read `:89`**, and its `examples/ltx2_gen/main.cpp:306-451`
-  should read `:318-476`. Owner: this row.
+  wrote a line number into an append-only row anyway. The correction lives here
+  instead: **`tools/oracle/ltx2_oracle.py:88` in that row should read `:89`**,
+  and its `examples/ltx2_gen/main.cpp:306-451` should read `:318-476`.
+  Owner: this row.
+
+  **RE-RESOLVED 2026-09-01 by row `LTX25-ANCHOR-REPAIR`**, spec
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §4 and §5. The paragraph
+  above is wrong in ONE place: its REASON. Both of its line numbers hold.
+
+  1. **The reason it cannot be repaired changed.** `.agents/issue-index.md` was
+     RETIRED; the index is derived at read time by
+     `scripts/agent-issue-index.py --refresh` and the old file moved to
+     `.agents/completed/issue-index.md`. The rows are unreachable because that
+     directory is the FROZEN ARCHIVE, whose provenance AGENTS.md `## Records`
+     keeps and which `check-symbol-anchors.py` skips by prefix -- not because a
+     live append-only rule forbids the edit. The conclusion holds under the new
+     rule too, and the row NUMBERS are dropped above because a row number in a
+     retired file is itself an anchor into a moving document; the five rows are
+     named by their issue instead.
+  2. **NEITHER correction has expired.** Both were re-resolved at `855905f59`.
+     `tools/oracle/ltx2_oracle.py:89` still reads `NUM_INFERENCE_STEPS = 8`.
+     `examples/ltx2_gen/main.cpp:318-476` still covers the flag loop exactly:
+     `:318` is the file's only `for (int i = 1; i < argc; ++i)`, `:476` is its
+     closing brace, and `:477` is `if (mp.dit_path == nullptr) Usage(2);`, which
+     is outside it. `--steps` is at `:461` and `--seed` at `:464`, both inside
+     the range. An earlier draft of `LTX25-ANCHOR-REPAIR` asserted that the loop
+     now ran past `:490` and that this correction had rotted; that assertion was
+     FALSE -- `:490` is a post-parse assignment to `vp.last_frame` -- and it is
+     withdrawn here rather than left standing, because a row about stale anchors
+     read as evidence must not leave a fresh anchor recorded as stale. All four
+     numbers are stamped with the tree they were read on, because a coordinate
+     written to explain why coordinates rot would otherwise rot in the same
+     paragraph.
+
+  The `main.cpp` correction is nonetheless restated in a form that cannot expire,
+  which is an IMPROVEMENT rather than a repair and is labelled as one. What
+  #2130's row was pointing at is the argument loop of
+  `examples/ltx2_gen/main.cpp::main`, whose flag cases are greppable by their own
+  literals: `git grep -n '"--steps"' examples/ltx2_gen/` returns exactly ONE
+  line, the assignment to `vp.steps`. Uniqueness is the property asserted, not
+  existence -- AGENTS.md asks for the first and a line number gives neither. A
+  reader following the row wants the flag, not a coordinate, and the flag string
+  survives every insertion above it. That grep is prose and no gate checks it;
+  `ltx25-anchor-repair.md` §8 says so, and says which of that row's two symbol
+  anchors a gate can actually falsify.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1,
   prompt adherence, stays OPEN and is not narrowed by this row.** It needs a
   vision-language model scoring frames against the prompt, with its own
@@ -458,6 +498,28 @@ Stop and report, do not work around:
   row ends in a `NEEDS_DECISION` — whether a scoring model is an oracle or an
   instrument — and it implements nothing until that is answered. The sentence
   above stays as this row wrote it, because it was true when this row landed.
+
+  **UPDATE, 2026-08-31: that decision is ANSWERED and the scorer now RUNS.** The
+  developer's answer is INSTRUMENT, so `ltx-2` remains the oracle and AGENTS.md's
+  table is unchanged. `LTX25-PROMPT-ADHERENCE` W1 and W2 landed the pinned
+  checkpoint, an S0 precondition, an S1 bound recomputed from THIS row's
+  reference render, and an S2 argmax over committed decoys. So "this tree runs
+  none" and "is not narrowed by this row" are both superseded, and the bullet is
+  kept rather than rewritten because it records what was true at
+  `fa9903b86`. #1854 stays OPEN: what is still owed is OUR render's frames,
+  scored. Owner is unchanged.
+
+  **UPDATE, 2026-09-01: our frames HAVE now been scored, and they FAIL.**
+  `LTX25-PROMPT-ADHERENCE` W3 took the 25 frames `rc` job
+  `93a60151-7d4d-4718-842c-ef724208be0e` retained at this row's exact request and
+  ran them through the landed gate. S1 reads 35.2719 against a bound of 36.0087,
+  a margin of -0.7368, and S2 PASSES with the true prompt first by +0.3370.
+  **It is ONE render, n = 1**: that lease retained only its first render's
+  frames, so the run-to-run stability of the reading is UNMEASURED, and a
+  reading that moved by 0.74 between runs would make the verdict a coin toss
+  rather than a finding. #1854 still stays OPEN, and the reason has changed: it
+  is now a MEASURED shortfall rather than an unmeasured question. Owner is
+  unchanged.
 - The three REPORTED statistics of §5 stay reported. Each has a stated
   derivation that failed, not an absence of effort. Owner: this row.
 
@@ -757,3 +819,71 @@ worse on blockiness.
 Nothing above says the 25 frames depict a red fox in a snowy pine forest. That is
 #1854's first sub-question, it needs a vision-language model pinned as an oracle,
 and it stays open.
+
+**UPDATE, 2026-08-31.** The paragraph above was true at `fa9903b86` and is no
+longer. `LTX25-PROMPT-ADHERENCE` (#2295) landed `--adherence-model`, and the
+reference render's own 25 frames now read a mean CLIP score of 38.1278 against
+that prompt, ranking it first over six committed decoys on 25 of 25 frames. What
+is still not measured is OUR render, whose frames were never committed. The
+paragraph stays as written because it records this row's own state, and the
+correction lives here rather than in a rewrite of it.
+
+**UPDATE, 2026-09-01.** The last sentence of the paragraph above is itself no
+longer true. `LTX25-PROMPT-ADHERENCE` W3 scored our render from the 25 frames a
+later lease retained, without committing them, and it reads a mean of 35.2719
+against the reference's 38.1278. That is 2.8559 below, with 20 of our 25 frames
+under the bound, and it FAILS the S1 bound this row's reference supplies. S2
+PASSES, so our render depicts the asked-for scene and depicts it less well.
+**It is ONE render, n = 1**, because that lease retained only its first render's
+frames, so nothing here measures how far the reading moves between runs.
+**It is consistent with the smoothness this row's
+`## Outcome` declared its blockiness ceiling was blind to, and consistency is
+all it is.** No measurement here connects the two, the ablation that would is
+not specified, and this row does not own it.
+
+**UPDATE, 2026-09-01, and this one CORRECTS a claim above rather than extending
+it.** The sentence "**our render is somewhat SMOOTHER than upstream's**" is
+FALSE, and `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) measured it. The two REPORTED
+statistics that motivated it are unchanged and were read correctly; the
+inference drawn from them was not, and no spectrum had ever been taken.
+
+Measured border-free -- Welch over interior 64-pixel tiles, which is the only
+estimator here that the frame's own wrap step cannot reach -- our render carries
+**1.4031x the reference's ABSOLUTE high-band power** (>= 0.20 cycles per pixel)
+at **1.0373x its mid-band power**, so the fine-scale end is up by 40% while the
+mid band is equal. `sharpness_mean` is a mean absolute gradient and therefore
+reads the mid band, which is why it fell while the high band rose. There is no
+high-frequency rolloff, and "smoother" describes a rolloff.
+
+**An earlier version of this paragraph said "77.79% MORE" and cited a crossover
+that does not exist. Both came from a Hann-windowed whole-frame spectrum and are
+WITHDRAWN.** A window removes the wrap step but tapers half the frame's area
+away; without one, the step's `1/f^2` leak inflates the low bins instead. The two
+renders do not carry the same step -- our wrap jump is 73.39 against 49.48 -- so
+the error does not cancel in a ratio, and the same comparison read -25.25% raw
+and +77.51% windowed. `ltx25-adherence-detail-loss.md` `## CORRECTION` carries the
+derivation and the four-convention table.
+
+The intervention settles the direction that the statistics alone could not, and
+it is the one applied to the REFERENCE's frames. Blurring upstream's own render
+until its sharpness is **a fifth** of ours -- a visibly destroyed picture -- costs
+it **1.9687** CLIP points against an observed gap of **2.7305**, and it still
+ranks the true prompt first on 23 of 25 frames. Blurring it merely to our own
+sharpness costs **0.1192**, which is 4.4% of the gap. No achievable amount of
+smoothing reproduces our shortfall, so detail loss is not sufficient to produce
+it.
+
+**An earlier version of this paragraph said "blurring our own frames at sigma
+1.0 RAISES their CLIP score by +1.9131", and that figure is WITHDRAWN.** On our
+frames a decoy outranks the true prompt from sigma 0.50 upward, so those arms
+score no adherence at all; the only row of that sweep the scorer can still read
+moves our score by **-0.0029**. `ltx25-adherence-detail-loss.md`
+`## CORRECTION 2` carries the derivation. The conclusion this paragraph supports
+is unchanged, because the reference sweep above carries it on its own.
+
+The blockiness ceiling this row landed is untouched and its verdict stands. What
+changes is the sentence a reader was left with about WHY: the gate is blind to a
+smoothness difference by construction, and on these two renders there is no
+smoothness difference for it to be blind to. The numbers are in
+[`ltx25-adherence-detail-loss.md`](ltx25-adherence-detail-loss.md) `## Outcome`
+and the full JSON is at `tests/parity/goldens/ltx25_detail_loss/detail-loss.json`.

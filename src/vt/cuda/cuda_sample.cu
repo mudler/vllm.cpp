@@ -964,31 +964,31 @@ __global__ void GreedyRejectAcceptKernel(int32_t* sampled, int32_t* num_sampled,
   num_sampled[req] = static_cast<int32_t>(accepted_length) + 1;
 }
 
-// Persistent grow-only scratch for the per-row argmax (a few KB), so a verify
-// step pays no cudaMalloc/cudaFree. Same pattern as the greedy-argmax partials.
-int32_t* g_reject_argmax = nullptr;
-size_t g_reject_argmax_cap = 0;
-
-void EnsureRejectArgmaxScratch(size_t elems) {
-  if (elems <= g_reject_argmax_cap) return;
-  if (g_reject_argmax) cudaFree(g_reject_argmax);
-  Check(cudaMalloc(&g_reject_argmax, elems * sizeof(int32_t)), "rejection argmax scratch");
-  g_reject_argmax_cap = elems;
-}
-
-void GreedyRejectionSampleCuda(Queue& q, Tensor& sampled, Tensor& num_sampled, const Tensor& logits,
+// The per-row argmax buffer between the two kernels is the CALLER's, and it used
+// to be a file-scope grow-only global here (SPEC-DFLASH2 A2-2, #2802). It could
+// not stay one. This function RETURNS with both kernels still queued, so the
+// buffer the accept kernel reads is live after the call; a later call with more
+// rows grew the global and `cudaFree`d exactly that buffer. The accept kernel
+// then read freed memory, and because speculative decoding is lossless the loud
+// outcome (an illegal access) is the lucky one — the quiet outcome is a garbage
+// accept prefix and silently wrong emitted ids. The grow path's `cudaFree` was
+// also a device-wide synchronize inside a function that advertises waiting on
+// nothing. Both go away with the global: the scratch is now a parameter whose
+// lifetime the caller ties to the in-flight window.
+void GreedyRejectionSampleCuda(Queue& q, Tensor& sampled, Tensor& num_sampled,
+                               Tensor& target_argmax, const Tensor& logits,
                                const Tensor& draft_sampled, const Tensor& cu_num_logits) {
   const int64_t num_logits = logits.shape[0], v = logits.shape[1];
   const int64_t num_reqs = cu_num_logits.shape[0] - 1;
   if (num_reqs == 0 || num_logits == 0 || v == 0) return;
   cudaStream_t s = AsStream(q);
 
-  EnsureRejectArgmaxScratch(static_cast<size_t>(num_logits));
+  int32_t* argmax = target_argmax.Ptr<int32_t>();
   RejectionRowArgmaxKernel<<<static_cast<unsigned>(num_logits), kBlock, 0, s>>>(
-      g_reject_argmax, logits.Ptr<float>(), v);
+      argmax, logits.Ptr<float>(), v);
   Check(cudaGetLastError(), "greedy_rejection_sample argmax launch");
   GreedyRejectAcceptKernel<<<static_cast<unsigned>(num_reqs), 1, 0, s>>>(
-      sampled.Ptr<int32_t>(), num_sampled.Ptr<int32_t>(), g_reject_argmax,
+      sampled.Ptr<int32_t>(), num_sampled.Ptr<int32_t>(), argmax,
       draft_sampled.Ptr<int32_t>(), cu_num_logits.Ptr<int32_t>(), sampled.shape[1]);
   Check(cudaGetLastError(), "greedy_rejection_sample accept launch");
 }

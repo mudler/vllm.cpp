@@ -127,3 +127,124 @@ TEST_CASE("skinny GEMM architecture eligibility follows device hops") {
   CHECK(vt::rocm::SkinnyGemmArchOk(0, SimulatedSkinnyArch));
   CHECK(skinny_arch_resolves == std::array<int, 4>{1, 1, 1, 1});
 }
+
+// --- The memory-model decision (issue #2511) --------------------------------
+//
+// `ResolveMemoryPolicy` decides which allocator `RocmBackend::Alloc` uses and
+// whether the backend may claim its allocations are host-addressable. It is the
+// second piece of the ROCm skeleton that holds a DECISION rather than an API
+// call, and it is here for the same reason the capability parse is: the whole
+// table is checkable on a machine with no AMD GPU, while the board-gated case
+// in tests/vt/test_rocm_backend.cpp can only ever check the ONE row its own
+// silicon happens to be.
+//
+// The rows are the real parts. gfx1151 (Strix Halo) and gfx1103 (Radeon 780M)
+// probed Integrated/ManagedMemory/ConcurrentManagedAccess = 1 and
+// PageableMemoryAccess = 0 (issue #41 F6 attribute table, re-read on the board
+// for #2511). A discrete Radeon reports Integrated = 0. The fourth row is the
+// NVIDIA-style integrated shape -- everything 1 -- which is the only shape the
+// managed branch still serves.
+using vt::rocm::ParseManagedAllocOverride;
+using vt::rocm::ResolveMemoryPolicy;
+using vt::rocm::RocmManagedAllocOverride;
+using vt::rocm::RocmMemoryAttributes;
+
+namespace {
+constexpr RocmMemoryAttributes kXnackless{/*integrated=*/true, /*managed=*/true,
+                                          /*concurrent=*/true, /*pageable=*/false};
+constexpr RocmMemoryAttributes kDiscrete{/*integrated=*/false, /*managed=*/false,
+                                         /*concurrent=*/false, /*pageable=*/false};
+constexpr RocmMemoryAttributes kFullyIntegrated{/*integrated=*/true, /*managed=*/true,
+                                                /*concurrent=*/true, /*pageable=*/true};
+// Integrated and pageable, but WITHOUT the managed attributes: the W0 ground
+// stands on its own and the managed branch is not available at all.
+constexpr RocmMemoryAttributes kPageableNoManaged{/*integrated=*/true, /*managed=*/false,
+                                                  /*concurrent=*/false, /*pageable=*/true};
+}  // namespace
+
+TEST_CASE("#2511: a part that cannot fault and recover gets no managed allocation") {
+  // THE ROW THIS CHANGE EXISTS FOR. gfx1151 measured 17 GPU faults in 21 legs on
+  // the managed branch and 0 in 21 without it.
+  constexpr auto p = ResolveMemoryPolicy(kXnackless, RocmManagedAllocOverride::kUnset);
+  static_assert(!p.managed_alloc, "an XNACK-less APU must not get migratable memory");
+  // And the capability answer FOLLOWS the allocator. This is the consequence the
+  // decision was taken with, not an accident: the CPU reference tier goes with
+  // it, and an op that loses its fallback refuses.
+  static_assert(!p.unified_memory);
+  static_assert(p.host_addressability_note != nullptr,
+                "a DELIBERATE withdrawal must be able to say so in the refusal");
+  CHECK(std::string(p.host_addressability_note).find("PageableMemoryAccess") !=
+        std::string::npos);
+  CHECK(std::string(p.host_addressability_note).find("2511") != std::string::npos);
+  CHECK(std::string(p.host_addressability_note).find("VT_ROCM_MANAGED_ALLOC=1") !=
+        std::string::npos);
+}
+
+TEST_CASE("#2511: the managed branch survives where the device CAN fault and recover") {
+  // The narrowing is a narrowing, not a removal. An integrated part reporting
+  // PageableMemoryAccess = 1 keeps approach (b) exactly as #41 F6 ratified it.
+  constexpr auto p = ResolveMemoryPolicy(kFullyIntegrated, RocmManagedAllocOverride::kUnset);
+  static_assert(p.managed_alloc);
+  static_assert(p.unified_memory);
+  static_assert(p.host_addressability_note == nullptr,
+                "nothing was withheld here, so the refusal has nothing extra to say");
+}
+
+TEST_CASE("the discrete path stays byte-identical to W0, whatever the knob says") {
+  // A discrete card must never take the managed branch and must never claim
+  // host-addressable memory, because a CPU reference kernel there is corruption
+  // rather than a slow path. The override cannot conjure a capability.
+  for (auto ov : {RocmManagedAllocOverride::kUnset, RocmManagedAllocOverride::kForceOff,
+                  RocmManagedAllocOverride::kForceOn}) {
+    const auto p = ResolveMemoryPolicy(kDiscrete, ov);
+    CHECK_FALSE(p.managed_alloc);
+    CHECK_FALSE(p.unified_memory);
+    // Unremarkable, so no note: the generic refusal already says everything a
+    // reader needs about a discrete card.
+    CHECK(p.host_addressability_note == nullptr);
+  }
+}
+
+TEST_CASE("the W0 conjunction stands on its own without the managed attributes") {
+  constexpr auto p = ResolveMemoryPolicy(kPageableNoManaged, RocmManagedAllocOverride::kUnset);
+  static_assert(!p.managed_alloc);
+  static_assert(p.unified_memory, "Integrated AND PageableMemoryAccess is ground 1");
+  static_assert(p.host_addressability_note == nullptr);
+}
+
+TEST_CASE("VT_ROCM_MANAGED_ALLOC=1 restores the pre-#2511 configuration WHOLE") {
+  // A red-before arm that moves only the allocator and leaves the capability
+  // claim where it was is not the configuration it claims to reproduce, and the
+  // single-binary interleaved A/B on strix:gpu0 depends on this being exact.
+  constexpr auto on = ResolveMemoryPolicy(kXnackless, RocmManagedAllocOverride::kForceOn);
+  static_assert(on.managed_alloc);
+  static_assert(on.unified_memory);
+  static_assert(on.host_addressability_note == nullptr);
+
+  // `=0` is the other direction and is now redundant on this part -- the default
+  // already declines -- but it must still never turn the branch back on.
+  constexpr auto off = ResolveMemoryPolicy(kXnackless, RocmManagedAllocOverride::kForceOff);
+  static_assert(!off.managed_alloc);
+  static_assert(!off.unified_memory);
+
+  // On a part that CAN fault and recover, `=0` is the live A/B lever: it drops
+  // the allocator while ground 1 keeps the unified claim, which is exactly the
+  // isolation the W9 measurement needed.
+  constexpr auto lever = ResolveMemoryPolicy(kFullyIntegrated, RocmManagedAllocOverride::kForceOff);
+  static_assert(!lever.managed_alloc);
+  static_assert(lever.unified_memory);
+  static_assert(lever.host_addressability_note == nullptr);
+  CHECK(true);
+}
+
+TEST_CASE("the knob parses to the shipped default on anything it does not recognise") {
+  CHECK(ParseManagedAllocOverride("0") == RocmManagedAllocOverride::kForceOff);
+  CHECK(ParseManagedAllocOverride("1") == RocmManagedAllocOverride::kForceOn);
+  // Unset, empty, and a typo all take the shipped default rather than a
+  // surprising arm. "00" and "true" are the two shapes a reader most plausibly
+  // writes by hand.
+  CHECK(ParseManagedAllocOverride("") == RocmManagedAllocOverride::kUnset);
+  CHECK(ParseManagedAllocOverride("00") == RocmManagedAllocOverride::kUnset);
+  CHECK(ParseManagedAllocOverride("true") == RocmManagedAllocOverride::kUnset);
+  CHECK(ParseManagedAllocOverride("2") == RocmManagedAllocOverride::kUnset);
+}

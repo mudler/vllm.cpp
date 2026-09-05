@@ -416,6 +416,28 @@ ALLOWLIST: dict[str, dict[str, tuple[object, str]]] = {
                      "resolvers so they become device-parameterized lookups "
                      "(`GetOp(op, runner.device.type)`) instead of hardcoding kCUDA."),
     },
+    "src/vllm/model_executor/models/glm5_next_device.cpp": {
+        "kcuda": (2, "the GLM-5.3-Flash k-pool DSA indexer's device PROBE TU "
+                     "(W9c-0, #2415) — the SAME shape as laguna_device.cpp below: "
+                     "2 `OpRegistered` lookups asking whether cuda_glm5_next.cu "
+                     "registered `kGlm5NextKpool{Compress,Select}` on kCUDA. The TU "
+                     "is always compiled and holds NO CUDA code. There is "
+                     "deliberately no CPU provider for either op — the CPU answer "
+                     "is `glm5_next_dsa.cpp`, which is the ORACLE these kernels are "
+                     "gated against, and registering it again under the same ids "
+                     "would make the seam its own golden — so a CPU build finds "
+                     "nothing on `(op, kCUDA)`, the probe returns false, and "
+                     "`vt::Glm5NextKpoolCompress` refuses a CPU queue BY NAME "
+                     "through `GetOp`. `tests/vllm/models/"
+                     "test_glm5_next_kpool_device.cpp` asserts that refusal and "
+                     "asserts both ops are absent on kCPU. FOLLOW-UP (deferred, "
+                     "shares the DeepSeek-V4 and Laguna row): thread the runner "
+                     "`DeviceType` through this resolver so it becomes "
+                     "`OpRegistered(op, runner.device.type)` instead of hardcoding "
+                     "kCUDA. W9c-3 (#2410) owns the forward that would supply that "
+                     "device, and until it lands there is no runner to read one "
+                     "from."),
+    },
     "src/vllm/model_executor/models/laguna_device.cpp": {
         "kcuda": (2, "the Laguna CUDA device-forward RESOLVER TU — the SAME shape as "
                      "deepseek_v4_device.cpp above: 1 `GetOp` + 1 `OpRegistered` "

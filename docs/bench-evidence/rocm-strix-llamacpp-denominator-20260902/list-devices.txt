@@ -1,0 +1,5 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 65536 MiB):
+  Device 0: Radeon 8060S Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 65536 MiB
+ggml_backend_cuda_get_available_uma_memory: final available_memory_kb: 61351304
+Available devices:
+  ROCm0: Radeon 8060S Graphics (65536 MiB, 59913 MiB free)

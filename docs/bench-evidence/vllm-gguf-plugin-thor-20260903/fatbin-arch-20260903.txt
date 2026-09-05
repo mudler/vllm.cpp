@@ -1,0 +1,69 @@
+# Which SM architectures each object in the thor:gpu0 process actually carries
+#
+# Measured 2026-09-03 on the dev box, NO lease, from the exact artifacts the
+# job installed. fatbin_arch.py parses .nv_fatbin directly; fatbin_blocks.py
+# additionally zstd-decompresses each cubin to name its kernels (needs the
+# 'zstandard' module; nothing else here does).
+#
+# POSITIVE CONTROL: the plugin's own object, whose coverage the lease
+# established independently with 'cuobjdump --list-elf' ->
+# '_C_gguf.abi3.1.sm_110.cubin' (rc-job-40a1d8dd.log, INSTALLED_CUBIN_ARCH_OK).
+
+$ python3 fatbin_arch.py <plugin>/_C_gguf.abi3.so   # from the job's own wheel
+vllm_gguf_plugin/_C_gguf.abi3.so
+  .nv_fatbin          3705480 bytes, 1 fat_elf blocks, 3705480 bytes covered (100.0%)
+  .nvFatBinSegment         24 bytes, 0 fat_elf blocks, 0 bytes covered (0.0%)
+    ELF  sm_110  entries=1
+    PTX  sm_110  entries=1
+  SASS archs: [110]
+  PTX  archs: [110]
+
+$ python3 fatbin_arch.py torch/lib/libtorch_cuda.so   # torch 2.13.0+cu130,
+#   cp312-cp312-manylinux_2_28_aarch64, git_version cf30153c4c131c8164ee7798e5022d810682e2cb
+torch/lib/libtorch_cuda.so
+  .nv_fatbin        290781272 bytes, 449 fat_elf blocks, 290725952 bytes covered (100.0%)
+  .nvFatBinSegment      10776 bytes, 0 fat_elf blocks, 0 bytes covered (0.0%)
+    ELF  sm_80   entries=449
+    ELF  sm_90   entries=453
+    ELF  sm_100  entries=508
+    ELF  sm_103  entries=59
+    ELF  sm_110  entries=508
+    ELF  sm_120  entries=450
+    ELF  sm_121  entries=1
+  SASS archs: [80, 90, 100, 103, 110, 120, 121]
+  PTX  archs: []
+
+$ python3 fatbin_arch.py vllm/_C_stable_libtorch.abi3.so vllm/_moe_C_stable_libtorch.abi3.so
+#   from vllm-0.1.dev1+g555967922-FLASHINFER-ONLY-cp312-cp312-linux_aarch64.whl (built on GB10)
+vllm/_C_stable_libtorch.abi3.so
+  .nv_fatbin         13226728 bytes, 70 fat_elf blocks, 13218936 bytes covered (99.9%)
+  .nvFatBinSegment       1680 bytes, 0 fat_elf blocks, 0 bytes covered (0.0%)
+    ELF  sm_80   entries=4
+    ELF  sm_89   entries=1
+    ELF  sm_90   entries=1
+    ELF  sm_120  entries=64
+    PTX  sm_80   entries=4
+    PTX  sm_89   entries=1
+    PTX  sm_90   entries=1
+  SASS archs: [80, 89, 90, 120]
+  PTX  archs: [80, 89, 90]
+vllm/_moe_C_stable_libtorch.abi3.so
+  .nv_fatbin          9884472 bytes, 30 fat_elf blocks, 9880832 bytes covered (100.0%)
+  .nvFatBinSegment        720 bytes, 0 fat_elf blocks, 0 bytes covered (0.0%)
+    ELF  sm_80   entries=1
+    ELF  sm_120  entries=29
+    PTX  sm_80   entries=1
+  SASS archs: [80, 120]
+  PTX  archs: [80]
+
+$ python3 fatbin_blocks.py vllm/_C_stable_libtorch.abi3.so act_and_mul_kernel rms_norm_kernel
+block   3  archs=[('ELF', 120)]  matches=['act_and_mul_kernel']
+      _ZN4vllm18act_and_mul_kernelIN3c104HalfE7__half2XadL_ZNS_11gelu_kernelIS2_EET_RKS5_fEEXadL_ZNS_18packed_gelu_kernelIS3_EES5_S7_fEELb1ELb0ELb0ELb0EEEvP
+      _ZN4vllm18act_and_mul_kernelIN3c104HalfE7__half2XadL_ZNS_11gelu_kernelIS2_EET_RKS5_fEEXadL_ZNS_18packed_gelu_kernelIS3_EES5_S7_fEELb1ELb1ELb0ELb0EEEvP
+      _ZN4vllm18act_and_mul_kernelIN3c104HalfE7__half2XadL_ZNS_11gelu_kernelIS2_EET_RKS5_fEEXadL_ZNS_18packed_gelu_kernelIS3_EES5_S7_fEELb1ELb1ELb0ELb1EEEvP
+      _ZN4vllm18act_and_mul_kernelIN3c104HalfE7__half2XadL_ZNS_11silu_kernelIS2_EET_RKS5_fEEXadL_ZNS_18packed_silu_kernelIS3_EES5_S7_fEELb0ELb0ELb0ELb0EEEvP
+block  15  archs=[('ELF', 120)]  matches=['rms_norm_kernel']
+      _ZN4vllm15rms_norm_kernelIN3c104HalfELi16ELi2ELb0EEEvPT_PKS3_lllllS6_lfii
+      _ZN4vllm15rms_norm_kernelIN3c104HalfELi16ELi2ELb1EEEvPT_PKS3_lllllS6_lfii
+      _ZN4vllm15rms_norm_kernelIN3c104HalfELi16ELi3ELb0EEEvPT_PKS3_lllllS6_lfii
+      _ZN4vllm15rms_norm_kernelIN3c104HalfELi16ELi3ELb1EEEvPT_PKS3_lllllS6_lfii

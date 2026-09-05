@@ -23,6 +23,7 @@
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -89,8 +90,14 @@ std::unique_ptr<LoadedModel> LoadQwen3_5MoeModel(
   if (source.gguf == nullptr) {
     throw std::runtime_error("GGUF model source is empty");
   }
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+  // the device the ENGINE resolved for this load, never from
+  // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+  // CUDA-capable process, and this hook is where the disagreement reached the
+  // loader.
+  const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
   return std::make_unique<Qwen3_5MoeLoadedModel>(
-      registration, LoadQwen3_5MoeFromGguf(*source.gguf, config));
+      registration, LoadQwen3_5MoeFromGguf(*source.gguf, config, &gguf_policy));
 }
 
 void PrepareQwen3_5Moe(LoadedModel& model, const HfConfig& config,
@@ -226,6 +233,7 @@ const ModelFactory kQwen3_5MoeFactory{
     // the lane is on. Both arms registered below share this factory and therefore
     // this answer; the DENSE Qwen3.5 arms have no expert tower and keep the
     // default.
+    .consumes_device_token_ids = true,
     .streams_routed_experts = true,
 };
 

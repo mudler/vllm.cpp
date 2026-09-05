@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-17 -->
+<!-- now-updated: 2026-09-03 -->
 
 Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
@@ -22,7 +22,9 @@ no per-row change needs to touch this file at all.
 
 Token-exact (or ratified distributional) vs pinned vLLM; ≥ throughput and ≤
 latency/memory on every axis, both gate models, reproduced 2–3x idle. See
-[verification](verification.md). Pin: vLLM `555967922` (0.26.0.dev0).
+[verification](verification.md). Pin: vLLM `e126687a9a` (0.28.1rc1.dev132) since
+2026-09-03 (#2817). **NO gate has run at it**: goldens predate it (#2794) and the
+benchmark baselines were measured at `555967922` and owe step 6 (#2818).
 
 
 ## Next actions

@@ -383,12 +383,30 @@ void RetypeAttentionSpec(AttentionSpec& spec, const ResolvedCacheDType& resolved
   // into it, which is wrong tokens rather than a crash. `ParseCacheDType`
   // refuses the string one level up (`kv_cache_dtype.h:87-90`); this is the
   // second door. Owed to W5, the wave that lands the read and write side.
+  //
+  // THE MESSAGE USED TO SAY "requesting it here", AND ON THE PATH THAT ACTUALLY
+  // FIRES, NOTHING REQUESTED ANYTHING (#2455). DeepSeek-V4 reaches this on
+  // `--kv-cache-dtype auto` through `vllm-cli`, which has no such flag to pass:
+  // `MakeDeepseekV4KVCache` PUBLISHES fp8_ds_mla specs at `vt::DType::kI8`,
+  // mirroring upstream where `use_fp8_ds_mla_layout` is `ClassVar[bool] = True`
+  // (`attention.py:140`), and the early-out above needs
+  // `spec.dtype == resolved.storage`, which `auto` resolves to the model's bf16.
+  // So the model's own factory declares a layout this function then refuses, and
+  // an operator reading the old text went looking for a flag they never set.
+  // Naming both possible causes is the difference between one grep and a
+  // measured investigation.
   VT_CHECK(dynamic_cast<const MLAAttentionSpec*>(&spec) == nullptr,
            "cache_dtype: an MLA KV cache has its own quantized page formula "
            "upstream (fp8_ds_mla, kv_cache_interface.py:398-410). W1 landed "
-           "that page formula but no fp8_ds_mla store or read, so requesting "
-           "it here would size the page for bytes nothing writes; run the MLA "
-           "model on --kv-cache-dtype auto");
+           "that page formula but no fp8_ds_mla store or read, so a page sized "
+           "for it would hold bytes nothing writes. EITHER --kv-cache-dtype "
+           "asked for a non-auto dtype, OR (DeepSeek-V4, #2455) the model's own "
+           "KV factory published fp8_ds_mla specs and no flag was passed at "
+           "all: check the spec's cache_dtype_str before you check the command "
+           "line. The fix for the second case is the fp8_ds_mla store and read "
+           "(KV-DSV4-MULTICACHE W5), not a wider guard here -- this model's "
+           "paged store writes f32 latents through vt::ConcatAndCacheMla, which "
+           "is 3.5x the 584-byte page this layout declares");
   if (resolved.is_fp8) {
     VT_CHECK(resolved.storage == vt::DType::kI8,
              "cache_dtype: an fp8 KV cache stores 1 byte per element "

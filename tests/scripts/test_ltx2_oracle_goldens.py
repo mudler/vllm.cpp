@@ -21,6 +21,11 @@ are the artefacts on the NAS at `/workspace/ltx2-oracle/out/` and the job log
 that printed the executing script's own sha256, and neither is committed. Adding
 machinery here would not change that, so the limit is written down instead.
 
+It covers TWO golden directories, because a second suite is a second thing to
+remember to run: `ltx2_oracle/`, the #1864 reference render, and
+`ltx2_oracle_latent/`, the #2514 Phase A latent dump. The second landed with
+a `SHA256SUMS` that nothing read.
+
 It needs no build, no GPU, no network and no third-party module.
 """
 from __future__ import annotations
@@ -37,6 +42,9 @@ SUMS = GOLDENS / "SHA256SUMS"
 MANIFEST = GOLDENS / "ltx2_oracle_manifest.json"
 MP4 = GOLDENS / "upstream-render.mp4"
 ORACLE = ROOT / ".agents/oracles/ltx-2.md"
+LATENT = ROOT / "tests/parity/goldens/ltx2_oracle_latent"
+LATENT_SUMS = LATENT / "SHA256SUMS"
+LATENT_MANIFEST = LATENT / "ltx2_latent_dump_manifest.json"
 
 failures: list[str] = []
 
@@ -125,6 +133,56 @@ for name, entry in manifest["checkpoints"].items():
           f"checkpoint {name} loaded at its expected size")
     check(re.fullmatch(r"[0-9a-f]{64}", entry["sha256"] or "") is not None,
           f"checkpoint {name} carries a 64-hex sha256")
+
+
+# ---------------------------------------------------------------------------
+# The Phase A latent goldens (#2514), in the SAME suite, because a parallel one
+# would be a second thing to remember to run. Everything this directory holds is
+# committed -- unlike `ltx2_oracle/`, whose frames live on the NAS -- so the
+# coverage rule here is total: every artefact has a row, every row has an
+# artefact, and both agree with the bytes.
+#
+# Without this, `ltx2_oracle_latent/SHA256SUMS` had no consumer anywhere in the
+# tree. Re-running Phase A and copying a new `video_latent_bfloat16.raw` over
+# the committed one, while leaving the sums untouched, would have reddened
+# nothing, and a cross-decode would then be run against a latent nobody could
+# tie back to the run that produced it.
+print("ltx2 latent goldens (#2514):")
+
+check(LATENT_SUMS.is_file(), f"{LATENT_SUMS.relative_to(ROOT)} exists")
+if LATENT_SUMS.is_file():
+    latent_sums = parse_sums(LATENT_SUMS.read_text())
+    # Names, not a count, for the same reason the block above gives.
+    on_disk = {q.name for q in LATENT.iterdir() if q.name != "SHA256SUMS"}
+    check(set(latent_sums) == on_disk,
+          "SHA256SUMS names exactly the artefacts committed beside it"
+          + ("" if set(latent_sums) == on_disk else
+             f" (unrecorded on disk: {sorted(on_disk - set(latent_sums))}, "
+             f"recorded but absent: {sorted(set(latent_sums) - on_disk)})"))
+    check(len(latent_sums) >= 4,
+          f"and it records at least the four Phase A artefacts (read {len(latent_sums)})")
+    for name in sorted(set(latent_sums) & on_disk):
+        check(sha256(LATENT / name) == latent_sums[name],
+              f"{name} matches its recorded sha256")
+
+    # A third anchor, and the one that is not self-referential the way a
+    # digest file beside its own artefacts always is: the manifest the RUN
+    # wrote carries its own sha256 for each latent it dumped, computed on the
+    # worker before anything was copied out. A `.raw` swapped here has to
+    # defeat that too, and the manifest's digest is itself in the sums.
+    if LATENT_MANIFEST.is_file() and LATENT_MANIFEST.name in latent_sums:
+        latents = json.loads(LATENT_MANIFEST.read_text())["latents"]
+        check(bool(latents), "the dump manifest records at least one latent")
+        for kind, record in sorted(latents.items()):
+            raw = LATENT / f"{kind}_latent_bfloat16.raw"
+            check(raw.is_file(), f"the {kind} latent the manifest names is committed")
+            if raw.is_file():
+                check(sha256(raw) == record["raw_native"]["sha256"],
+                      f"the committed {kind} latent is the one the run itself "
+                      f"digested on the worker")
+                check(raw.stat().st_size == record["expected_bytes"],
+                      f"and its length is the product of the {kind} shape and "
+                      f"itemsize the manifest records")
 
 if failures:
     print(f"FAILED ({len(failures)})")

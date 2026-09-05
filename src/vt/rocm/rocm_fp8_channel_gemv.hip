@@ -79,29 +79,6 @@ __device__ inline float gelu_tanh(float g) {
   return 0.5f * g * (1.f + tanhf(inner));
 }
 
-__device__ inline float DotFp8Row(const float* __restrict__ x_cache, const uint8_t* __restrict__ wrow,
-                                  int K) {
-  float acc = 0.f;
-  const int tid = static_cast<int>(threadIdx.x);
-  const int K16 = K & ~15;
-  for (int k = tid * 16; k < K16; k += kBlock * 16) {
-    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-#pragma unroll
-    for (int t = 0; t < 4; ++t) {
-      const int base = k + t * 4;
-      a0 += x_cache[base + 0] * F8E4M3ToF32(wrow[base + 0]);
-      a1 += x_cache[base + 1] * F8E4M3ToF32(wrow[base + 1]);
-      a2 += x_cache[base + 2] * F8E4M3ToF32(wrow[base + 2]);
-      a3 += x_cache[base + 3] * F8E4M3ToF32(wrow[base + 3]);
-    }
-    acc += (a0 + a1) + (a2 + a3);
-  }
-  for (int k = K16 + tid; k < K; k += kBlock) {
-    acc += x_cache[k] * F8E4M3ToF32(wrow[k]);
-  }
-  return BlockSum256(acc);
-}
-
 // Dot x_bf16[K] with pre-dequantized float weight row w_f[K].
 __device__ inline float DotBf16xFloat(const __hip_bfloat16* __restrict__ xrow,
                                       const float* __restrict__ w_f, int K) {

@@ -618,7 +618,11 @@ std::vector<std::string> EnumerateMuseGlimmerGgufTensors(
 MuseGlimmerWeights LoadMuseGlimmerFromGguf(const GgufFile& gguf,
                                            const HfConfig& config,
                                            const GgufLoadPolicy* policy) {
-  const GgufLoadPolicy pol = policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+  // A null `policy` means NO ENGINE RESOLVED A DEVICE: every production GGUF
+  // entry point now builds one from `ModelSource::device` in its registry hook.
+  // `kCPU` is STATED rather than probed — see `GgufLoadPolicy::FromEnv`.
+  const GgufLoadPolicy pol =
+      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
 
   MuseGlimmerWeights w;
   w.params = ParseMuseGlimmerParams(config);

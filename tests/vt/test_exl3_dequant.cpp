@@ -474,3 +474,160 @@ TEST_CASE("exl3: a REAL rank-sliced DeepSeek-V4 expert linear dequants to its an
                     s.value) < tol);
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// E. The `mul1` codebook (cb 2), gated against HAND-COMPUTED upstream values.
+//
+// `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` marks every quantized linear `mul1`
+// (#2495), and until this row the host decoder refused cb 2 by name.
+//
+// THE EXPECTED VALUES BELOW WERE NOT PRODUCED BY THIS TREE. Each is
+// `decode_3inst<2>` (codebook.cuh:82-89) carried out independently in exact
+// rational arithmetic: `x = cw * 0x83DCD12D` mod 2^32, the four unsigned bytes
+// of `x` summed, `0x6400 + sum` READ AS AN FP16 BIT PATTERN, then
+// `h * 0x1eee + 0xc931` with one rounding, as `__hfma` does. Gating cb 2
+// against our own `Exl3DecodeCodeword` would be a tautology, so the literals
+// are the oracle and the table carries each intermediate for a reader to redo.
+//
+// The shape is NOT the shape of cb 0 and cb 1. Those mask, xor and sum the two
+// fp16 halves of the product; cb 2 sums its BYTES. So a cb 2 arm cannot be
+// obtained by swapping the multiplier, and the ordinary failure of getting it
+// wrong is a correctly distributed, completely uncorrelated weight.
+// ───────────────────────────────────────────────────────────────────────────
+namespace {
+
+struct Cb2Case {
+  uint16_t codeword;
+  uint16_t expect_f16_bits;
+};
+
+// x = codeword * 0x83DCD12D (mod 2^32); bytesum = sum of its four unsigned
+// bytes; h = 1024 + bytesum exactly, because fp16 has an ULP of 1.0 across the
+// whole [1024, 2048) binade and bytesum <= 1020.
+const Cb2Case kMul1Cases[] = {
+    {0x0000, 0xC2E8},  // x=0x00000000 bytesum=   0  h=1024.0  -> -3.453125
+    {0x0001, 0x3921},  // x=0x83DCD12D bytesum= 605  h=1629.0  ->  0.64111328125
+    {0x0002, 0xB72D},  // x=0x07B9A25A bytesum= 444  h=1468.0  -> -0.448486328125
+    {0x00FF, 0x3AB3},  // x=0x58F45BD3 bytesum= 634  h=1658.0  ->  0.83740234375
+    {0x0100, 0xB3DB},  // x=0xDCD12D00 bytesum= 474  h=1498.0  -> -0.2454833984375
+    {0x1234, 0xB89E},  // x=0x4F8FA724 bytesum= 425  h=1449.0  -> -0.5771484375
+    {0x7FFF, 0x3FCA},  // x=0xE4B9AED3 bytesum= 798  h=1822.0  ->  1.947265625
+    {0x8000, 0xBAF2},  // x=0x68968000 bytesum= 382  h=1406.0  -> -0.8681640625
+    {0xABCD, 0xBD42},  // x=0x178C9009 bytesum= 316  h=1340.0  -> -1.314453125
+    {0xDEAD, 0x24BC},  // x=0x999E6169 bytesum= 513  h=1537.0  ->  0.01849365234375
+    {0xFFFE, 0x3702},  // x=0xC9735DA6 bytesum= 575  h=1599.0  ->  0.43798828125
+    {0xFFFF, 0xB936},  // x=0x4D502ED3 bytesum= 414  h=1438.0  -> -0.6513671875
+    // THE EXTREME of the byte sum over all 65536 codewords, which is what pins
+    // the top of the binade: no codeword reaches a sum above 1005, and 0x0000
+    // above is the only one that reaches 0.
+    {0x7B5B, 0x42B2},  // x=0xF7FEF9FF bytesum=1005  h=2029.0  ->  3.34765625
+};
+
+// cb 0 and cb 1, hand-carried the same way from codebook.cuh:58-74, so that
+// "unchanged" is asserted against upstream and not against this tree.
+struct Cb01Case {
+  uint16_t codeword;
+  uint16_t expect_cb0_bits;
+  uint16_t expect_cb1_bits;
+};
+
+const Cb01Case kCb01Cases[] = {
+    {0x0000, 0x3A25, 0x3F60},  // cb0= 0.76806640625   cb1= 1.84375
+    {0x0001, 0xBB5B, 0x304E},  // cb0=-0.91943359375   cb1= 0.134521484375
+    {0x0002, 0x3B74, 0xBA13},  // cb0= 0.931640625     cb1=-0.75927734375
+    {0x00FF, 0x3CD1, 0xBD26},  // cb0= 1.2041015625    cb1=-1.287109375
+    {0x0100, 0x3C3F, 0xBAF0},  // cb0= 1.0615234375    cb1=-0.8671875
+    {0x1234, 0xC066, 0x3E0F},  // cb0=-2.19921875      cb1= 1.5146484375
+    {0x7FFF, 0xBA96, 0x4172},  // cb0=-0.8232421875    cb1= 2.72265625
+    {0x8000, 0xB7F8, 0xB915},  // cb0=-0.498046875     cb1=-0.63525390625
+};
+
+// codebook.cuh:58-64 (cb == 0), written out, for the full-domain sweep.
+float TestQtipDecode(uint16_t codeword) {
+  uint32_t x = static_cast<uint32_t>(codeword) * 89226354u;
+  x += 64248484u;
+  x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
+  const float lo = vt::F16ToF32(static_cast<uint16_t>(x & 0xffffu));
+  const float hi = vt::F16ToF32(static_cast<uint16_t>(x >> 16));
+  return vt::F16ToF32(vt::F32ToF16(lo + hi));
+}
+
+}  // namespace
+
+TEST_CASE("exl3: the mul1 codebook decodes to independently computed upstream values") {
+  for (const Cb2Case& c : kMul1Cases) {
+    CAPTURE(c.codeword);
+    const float got = vt::Exl3DecodeCodeword(c.codeword, /*codebook=*/2);
+    const float want = vt::F16ToF32(c.expect_f16_bits);
+    CAPTURE(got);
+    CAPTURE(want);
+    // BIT-EXACT, both ways. The value comparison catches a wrong number and the
+    // bit-pattern comparison catches a value that is right but not an fp16 --
+    // upstream's decode ends in fp16, so a f32-precision result is a defect even
+    // when it prints the same.
+    CHECK(got == want);
+    CHECK(vt::F32ToF16(got) == c.expect_f16_bits);
+  }
+}
+
+TEST_CASE("exl3: mul1 is a DISTINCT codebook over the whole 16-bit domain") {
+  // Not a smoke test: the failure this guards is an arm that compiles, runs and
+  // returns a plausible codebook -- the wrong one. If cb 2 were reachable by
+  // reusing the cb 0 or cb 1 tail, these would collide far more than by chance.
+  int agree_cb0 = 0;
+  int agree_cb1 = 0;
+  int nonfinite = 0;
+  float lo = 1.0e30f;
+  float hi = -1.0e30f;
+  for (int cw = 0; cw < 65536; ++cw) {
+    const float v = vt::Exl3DecodeCodeword(static_cast<uint16_t>(cw), 2);
+    if (!std::isfinite(v)) ++nonfinite;
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+    if (v == TestQtipDecode(static_cast<uint16_t>(cw))) ++agree_cb0;
+    if (v == TestMcgDecode(static_cast<uint16_t>(cw))) ++agree_cb1;
+  }
+  CAPTURE(agree_cb0);
+  CAPTURE(agree_cb1);
+  CHECK(nonfinite == 0);
+  // The reachable range, derived rather than observed: byte sums span [0, 1005]
+  // over the domain, so h spans [1024, 2029] and the affine map sends that to
+  // [1024*k_inv + k_bias, 2029*k_inv + k_bias] == [-3.453125, 3.34765625] after
+  // the fp16 rounding. Both endpoints are in the table above.
+  CHECK(lo == vt::F16ToF32(0xC2E8));
+  CHECK(hi == vt::F16ToF32(0x42B2));
+  // Chance agreement only. cb 2's image is 1006 distinct values (one per byte
+  // sum) against cb 0/cb 1's tens of thousands, so a handful of coincidences is
+  // expected; wholesale agreement would mean the arm aliased.
+  CHECK(agree_cb0 < 4096);
+  CHECK(agree_cb1 < 4096);
+}
+
+TEST_CASE("exl3: adding mul1 leaves codebooks 0 and 1 byte-identical") {
+  for (const Cb01Case& c : kCb01Cases) {
+    CAPTURE(c.codeword);
+    CHECK(vt::F32ToF16(vt::Exl3DecodeCodeword(c.codeword, 0)) == c.expect_cb0_bits);
+    CHECK(vt::F32ToF16(vt::Exl3DecodeCodeword(c.codeword, 1)) == c.expect_cb1_bits);
+  }
+  // …and over the whole domain against the written-out upstream forms, so the
+  // regression surface is every codeword and not the eight above.
+  int cb0_mismatch = 0;
+  int cb1_mismatch = 0;
+  for (int cw = 0; cw < 65536; ++cw) {
+    const uint16_t w = static_cast<uint16_t>(cw);
+    if (vt::Exl3DecodeCodeword(w, 0) != TestQtipDecode(w)) ++cb0_mismatch;
+    if (vt::Exl3DecodeCodeword(w, 1) != TestMcgDecode(w)) ++cb1_mismatch;
+  }
+  CHECK(cb0_mismatch == 0);
+  CHECK(cb1_mismatch == 0);
+}
+
+TEST_CASE("exl3: a codebook upstream does not define is still refused BY NAME") {
+  // `decode_3inst<cb>` (codebook.cuh:56-90) has arms for 0, 1 and 2 and falls
+  // off the end for anything else, so 3 is not a codebook this tree merely has
+  // not ported -- it does not exist. Widening the host arm to cb 2 must not
+  // have widened it to "anything >= 2".
+  CHECK_THROWS(vt::Exl3DecodeCodeword(0x1234, 3));
+  CHECK_THROWS(vt::Exl3DecodeCodeword(0x1234, -1));
+  CHECK_THROWS(vt::Exl3DecodeCodeword(0x1234, 255));
+}

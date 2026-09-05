@@ -15,11 +15,18 @@
 // store), compressor.py:307-309 (layout), cross-checked against SGLang v0.5.15
 // dsv4/fused_compress_triton.py + dsv4/quant_k_cache.py + dsv4/dequant_k_cache.py.
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
+#include "vllm/v1/kv_cache_interface.h"
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <optional>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace vllm::deepseek_v4;
@@ -377,7 +384,7 @@ TEST_CASE("W3: coff == 2 gathers coff*ratio rows and splits their ROLE by index"
 
   std::vector<float> st_kv, st_sc;
   const std::vector<float> emitted = vllm::deepseek_v4::CompressorStepCycle(
-      &st_kv, &st_sc, kv, score, ape, pos, rms, /*eps=*/0.0f, cr, hd, coff);
+      &st_kv, &st_sc, kv, score, ape, pos, rms, /*eps=*/0.0f, cr, hd, /*rope_dim=*/0, /*rope_theta=*/10000.0, coff);
 
   // Boundaries at positions 3 and 7, so TWO rows are emitted.
   REQUIRE(emitted.size() == static_cast<size_t>(2 * hd));
@@ -414,7 +421,7 @@ TEST_CASE("W3: coff == 1 is unchanged by the overlap parameter") {
   const auto def = vllm::deepseek_v4::CompressorStepCycle(&a_kv, &a_sc, kv, score, ape,
                                                           pos, rms, 1e-6f, cr, hd);
   const auto one = vllm::deepseek_v4::CompressorStepCycle(&b_kv, &b_sc, kv, score, ape,
-                                                          pos, rms, 1e-6f, cr, hd, 1);
+                                                          pos, rms, 1e-6f, cr, hd, /*rope_dim=*/0, /*rope_theta=*/10000.0, 1);
   REQUIRE(def.size() == one.size());
   for (size_t i = 0; i < def.size(); ++i) CHECK(def[i] == doctest::Approx(one[i]));
   CHECK(a_kv == b_kv);
@@ -427,5 +434,299 @@ TEST_CASE("W3: a coff outside {1, 2} REFUSES") {
   const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
   std::vector<float> st_kv, st_sc;
   CHECK_THROWS(vllm::deepseek_v4::CompressorStepCycle(&st_kv, &st_sc, kv, score, ape,
-                                                      {0}, rms, 0.0f, cr, hd, 3));
+                                                      {0}, rms, 0.0f, cr, hd, /*rope_dim=*/0, /*rope_theta=*/10000.0, 3));
+}
+
+// ── W3: the pooled row is ROTATED, at the WINDOW'S base position ─────────────
+//
+// `fused_compress_quant_cache.py:272-297` applies GPT-J RoPE to the rope tail of
+// the pooled row, unconditionally -- the `rotate` constructor flag is dead and
+// both compressors pass it. The position is
+// `compressed_pos = (position / COMPRESS_RATIO) * COMPRESS_RATIO`, the window's
+// BASE and not the emitting token's, so every window shares one phase.
+
+TEST_CASE("W3: the pooled row's ROPE TAIL is rotated and its nope half is not") {
+  const int64_t cr = 2, hd = 4, rd = 2, T = 2;
+  std::vector<float> kv(static_cast<size_t>(T * hd), 0.0f), score(kv.size(), 0.0f);
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t d = 0; d < hd; ++d)
+      kv[static_cast<size_t>(t * hd + d)] = 1.0f + static_cast<float>(d);
+  const std::vector<float> ape(static_cast<size_t>(cr * hd), 0.0f);
+  const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
+  const std::vector<int64_t> pos{0, 1};  // boundary closes at position 1
+
+  std::vector<float> a_kv, a_sc, b_kv, b_sc;
+  const auto unrot = vllm::deepseek_v4::CompressorStepCycle(
+      &a_kv, &a_sc, kv, score, ape, pos, rms, 0.0f, cr, hd, /*rope_dim=*/0);
+  const auto rot = vllm::deepseek_v4::CompressorStepCycle(
+      &b_kv, &b_sc, kv, score, ape, pos, rms, 0.0f, cr, hd, /*rope_dim=*/rd,
+      /*rope_theta=*/10000.0);
+  REQUIRE(unrot.size() == static_cast<size_t>(hd));
+  REQUIRE(rot.size() == unrot.size());
+
+  // The NOPE half is untouched by the rotation.
+  for (int64_t d = 0; d < hd - rd; ++d)
+    CHECK(rot[static_cast<size_t>(d)] == doctest::Approx(unrot[static_cast<size_t>(d)]));
+
+  // The rope tail IS touched. `compressed_pos = (1 / 2) * 2 = 0`, and RoPE at
+  // position 0 is the identity -- so at THIS boundary the two must still agree,
+  // which is the window-base rule showing itself.
+  for (int64_t d = hd - rd; d < hd; ++d)
+    CHECK(rot[static_cast<size_t>(d)] == doctest::Approx(unrot[static_cast<size_t>(d)]));
+}
+
+TEST_CASE("W3: the rotation uses the WINDOW's base position, not the token's") {
+  // The distinguishing case. At `cr == 2`, a boundary at position 3 has
+  // `compressed_pos = (3 / 2) * 2 = 2`, NOT 3. Rotating at 3 would be a different
+  // phase, and both are finite and plausible.
+  const int64_t cr = 2, hd = 4, rd = 2, T = 4;
+  std::vector<float> kv(static_cast<size_t>(T * hd), 0.0f), score(kv.size(), 0.0f);
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t d = 0; d < hd; ++d)
+      kv[static_cast<size_t>(t * hd + d)] = 1.0f + static_cast<float>(d);
+  const std::vector<float> ape(static_cast<size_t>(cr * hd), 0.0f);
+  const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
+  const std::vector<int64_t> pos{0, 1, 2, 3};
+
+  std::vector<float> st_kv, st_sc;
+  const auto got = vllm::deepseek_v4::CompressorStepCycle(
+      &st_kv, &st_sc, kv, score, ape, pos, rms, 0.0f, cr, hd, rd, 10000.0);
+  REQUIRE(got.size() == static_cast<size_t>(2 * hd));  // boundaries at 1 and 3
+
+  // Build the SECOND row's expectation by hand: pool (unrotated) then rotate at
+  // compressed_pos = 2.
+  std::vector<float> u_kv, u_sc;
+  const auto unrot = vllm::deepseek_v4::CompressorStepCycle(
+      &u_kv, &u_sc, kv, score, ape, pos, rms, 0.0f, cr, hd, /*rope_dim=*/0);
+  std::vector<float> expect(unrot.begin() + hd, unrot.end());
+  vllm::deepseek_v4::RopeInplaceLayer(expect.data() + (hd - rd), rd, /*pos=*/2,
+                                      10000.0, 1.0, 0.0, 0, 0.0, 0.0);
+  for (int64_t d = 0; d < hd; ++d)
+    CHECK(got[static_cast<size_t>(hd + d)] ==
+          doctest::Approx(expect[static_cast<size_t>(d)]).epsilon(1e-5));
+
+  // And rotating at the TOKEN's position (3) would differ, or the case proves
+  // nothing about which position was used.
+  std::vector<float> wrong(unrot.begin() + hd, unrot.end());
+  vllm::deepseek_v4::RopeInplaceLayer(wrong.data() + (hd - rd), rd, /*pos=*/3,
+                                      10000.0, 1.0, 0.0, 0, 0.0, 0.0);
+  double sep = 0.0;
+  for (int64_t d = 0; d < hd; ++d)
+    sep = std::max(sep, std::abs(static_cast<double>(expect[static_cast<size_t>(d)] -
+                                                     wrong[static_cast<size_t>(d)])));
+  CHECK(sep > 1e-4);
+}
+
+// ── (B2) The paged fp8_ds_mla BLOCK — `KV-DSV4-MULTICACHE` W8 slice 1 ────────
+//
+// Upstream's block is REGION-SPLIT (`common/ops/cache_utils.py:59-63`): every
+// token's 576 data bytes come first, and every token's 8 scale bytes follow
+// after ALL of the data. That is why the page cannot be a rank-3
+// `(num_blocks, block_size, width)` tensor and why `vt::ConcatAndCacheMla`
+// cannot write it — see `.agents/specs/kv-dsv4-multicache.md` `### W8 design`.
+//
+// The gate is BYTE-EXACT against a POISON-FILLED block, never a tolerance: this
+// is integer packing, so a tolerance would hide a wrong region offset. Every
+// expected offset below is recomputed in the test from the geometry rather than
+// read back from the function under test, so an off-by-one in `pos_in_block`
+// has nowhere to hide.
+//
+// All host-side and unconditional. No `HasCuda()` early return, so a no-GPU run
+// reports a real assertion count for every claim.
+
+namespace {
+constexpr uint8_t kPoison = 0xA5;
+
+// DeepSeek-V4-Flash's real per-token geometry: head_dim 512 = 448 NoPE + 64
+// RoPE, UE8M0 quant_block 64 (`compressor.py:307-309`).
+Fp8DsMlaLayout RealV4TokenLayout() {
+  return MakeFp8DsMlaLayout(/*nope_head_dim=*/448, /*rope_head_dim=*/64,
+                            /*quant_block=*/64);
+}
+
+// A deterministic latent with a wide dynamic range across the seven NoPE
+// blocks, so the seven scale bytes are not all equal and a scale written to the
+// wrong slot is visible.
+std::vector<float> MakeLatent(int64_t seed, const Fp8DsMlaLayout& L) {
+  const int64_t D = L.nope_head_dim + L.rope_head_dim;
+  std::mt19937 rng(static_cast<uint32_t>(seed * 7919u + 13u));
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  std::vector<float> head(static_cast<size_t>(D));
+  for (int64_t d = 0; d < L.nope_head_dim; ++d) {
+    // Per-quant-block magnitude 2^(block - 3): distinct exponents per block.
+    const float mag = std::exp2(static_cast<float>(d / L.quant_block) - 3.0f);
+    head[static_cast<size_t>(d)] = u(rng) * mag;
+  }
+  for (int64_t j = 0; j < L.rope_head_dim; ++j)
+    head[static_cast<size_t>(L.nope_head_dim + j)] = u(rng) * 4.0f;
+  return head;
+}
+}  // namespace
+
+TEST_CASE("dsv4-fp8_ds_mla page: the geometry matches the spec's page bytes") {
+  using vllm::v1::KVQuantMode;
+  using vllm::v1::MLAAttentionSpec;
+
+  const Fp8DsMlaLayout L = RealV4TokenLayout();
+  CHECK(L.token_stride_bytes == 576);
+  CHECK(L.scale_dim == 8);
+  CHECK(L.n_nope_blocks == 7);
+
+  // C4A: upstream block_size 256, compress_ratio 4 -> storage_block_size 64
+  // (`kv_cache_interface.py:393-395`). This is the SAME arithmetic
+  // `test_deepseek_v4_scaffold.cpp:253` / `:269` asserts on the published
+  // topology; tying the two together is what stops them drifting apart.
+  const Fp8DsMlaPageLayout c4a = MakeFp8DsMlaPageLayout(L, /*block_size=*/64);
+  CHECK(c4a.token_data_size == 576);
+  CHECK(c4a.scale_region_offset == 64 * 576);  // 36864 — cache_utils.py:96-98
+  CHECK(c4a.scale_dim == 8);
+  CHECK(c4a.alignment_bytes == 576);
+  CHECK(c4a.real_block_bytes == 37376);    // 64 * 584
+  CHECK(c4a.padded_block_bytes == 37440);  // round_up(37376, 576) = 65 * 576
+
+  const MLAAttentionSpec spec_c4a(
+      /*block_size=*/256, /*head_size=*/512, vt::DType::kI8, /*num_kv_heads=*/1,
+      KVQuantMode::kFp8PerTensor, /*page_size_padded=*/std::nullopt,
+      /*indexes_kv_by_block_stride=*/false,
+      /*cache_dtype_str=*/std::string("fp8_ds_mla"), /*alignment=*/576,
+      /*compress_ratio=*/4, /*model_version=*/std::string("deepseek_v4"));
+  REQUIRE(spec_c4a.storage_block_size() == 64);
+  CHECK(c4a.real_block_bytes == spec_c4a.real_page_size_bytes());
+  CHECK(c4a.padded_block_bytes == spec_c4a.page_size_bytes());
+
+  // C128A: the same block_size 256 at compress_ratio 128 -> 2 storage rows
+  // (`test_deepseek_v4_scaffold.cpp:269`). A second point on the line, so the
+  // cross-check cannot be satisfied by a coincidence at one geometry.
+  const Fp8DsMlaPageLayout c128a = MakeFp8DsMlaPageLayout(L, /*block_size=*/2);
+  CHECK(c128a.scale_region_offset == 2 * 576);
+  CHECK(c128a.real_block_bytes == 1168);    // 2 * 584
+  CHECK(c128a.padded_block_bytes == 1728);  // round_up(1168, 576) = 3 * 576
+  const MLAAttentionSpec spec_c128a(
+      /*block_size=*/256, /*head_size=*/512, vt::DType::kI8, /*num_kv_heads=*/1,
+      KVQuantMode::kFp8PerTensor, /*page_size_padded=*/std::nullopt,
+      /*indexes_kv_by_block_stride=*/false,
+      /*cache_dtype_str=*/std::string("fp8_ds_mla"), /*alignment=*/576,
+      /*compress_ratio=*/128, /*model_version=*/std::string("deepseek_v4"));
+  REQUIRE(spec_c128a.storage_block_size() == 2);
+  CHECK(c128a.real_block_bytes == spec_c128a.real_page_size_bytes());
+  CHECK(c128a.padded_block_bytes == spec_c128a.page_size_bytes());
+}
+
+TEST_CASE("dsv4-fp8_ds_mla page: the store lands byte for byte in both regions") {
+  const Fp8DsMlaLayout L = RealV4TokenLayout();
+  const Fp8DsMlaPageLayout P = MakeFp8DsMlaPageLayout(L, /*block_size=*/64);
+
+  std::vector<uint8_t> block(static_cast<size_t>(P.padded_block_bytes), kPoison);
+
+  // Four positions including both ends of the block, so a stride error at the
+  // first row and at the last row are both in range.
+  const std::vector<int64_t> slots = {0, 1, 17, 63};
+  std::vector<Fp8DsMlaToken> expect;
+  for (size_t i = 0; i < slots.size(); ++i) {
+    const Fp8DsMlaToken t =
+        Fp8DsMlaEncodeToken(MakeLatent(static_cast<int64_t>(i) + 1, L), L);
+    Fp8DsMlaStoreToken(block.data(), P, slots[i], t);
+    expect.push_back(t);
+  }
+
+  // THE LOAD-BEARING ASSERTION, and it is FIRST on purpose: every REQUIRE
+  // below aborts the test case, so an assertion placed after one of them is
+  // never reached on the very mutations it exists to catch. Everything from
+  // `real_block_bytes` to `padded_block_bytes` is alignment padding
+  // (`cache_utils.py:63`) and no store may touch it. A 3.5x overrun — the f32
+  // write the paged store does today, 2048 bytes/token against 584 — trips
+  // exactly this.
+  for (int64_t off = P.real_block_bytes; off < P.padded_block_bytes; ++off)
+    REQUIRE(static_cast<int>(block[static_cast<size_t>(off)]) ==
+            static_cast<int>(kPoison));
+
+  for (size_t i = 0; i < slots.size(); ++i) {
+    const int64_t pos = slots[i];
+    const Fp8DsMlaToken& t = expect[i];
+    // Data region: [pos*576, pos*576+448) NoPE fp8, then 64 bf16 words
+    // (`cache_utils.py:92`, `:100-101`).
+    const uint8_t* data = block.data() + pos * 576;
+    CHECK(std::memcmp(data, t.nope_fp8.data(), 448) == 0);
+    CHECK(std::memcmp(data + 448, t.rope_bf16.data(), 64 * sizeof(uint16_t)) == 0);
+    // Scale region: 64*576 + pos*8 (`:96-98`), 7 real bytes...
+    const uint8_t* scales = block.data() + 64 * 576 + pos * 8;
+    CHECK(std::memcmp(scales, t.scale_ue8m0.data(), 7) == 0);
+    // ...and the 8th byte EXPLICITLY zeroed (`:148-149`), not left poisoned.
+    CHECK(static_cast<int>(scales[7]) == 0);
+  }
+
+  // The scale bytes must actually discriminate: if every block encoded to the
+  // same exponent, the memcmp above would pass with the scales interleaved.
+  {
+    const Fp8DsMlaToken& t = expect[0];
+    std::vector<uint8_t> distinct(t.scale_ue8m0);
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    CHECK(distinct.size() >= 4u);
+  }
+
+  // Rows NOT written stay poisoned, in BOTH regions. This is what an off-by-one
+  // in `pos_in_block` and a per-token stride of 584 each disturb.
+  for (int64_t pos = 0; pos < 64; ++pos) {
+    if (std::find(slots.begin(), slots.end(), pos) != slots.end()) continue;
+    for (int64_t b = 0; b < 576; ++b)
+      REQUIRE(static_cast<int>(block[static_cast<size_t>(pos * 576 + b)]) ==
+              static_cast<int>(kPoison));
+    for (int64_t b = 0; b < 8; ++b)
+      REQUIRE(static_cast<int>(block[static_cast<size_t>(64 * 576 + pos * 8 + b)]) ==
+              static_cast<int>(kPoison));
+  }
+
+}
+
+TEST_CASE("dsv4-fp8_ds_mla page: a negative slot writes NOTHING") {
+  // Upstream's `if slot_idx == -1: return` (`cache_utils.py:77-78`). A padded or
+  // masked token writes no bytes at all — not a zero row, not a partial row.
+  const Fp8DsMlaLayout L = RealV4TokenLayout();
+  const Fp8DsMlaPageLayout P = MakeFp8DsMlaPageLayout(L, /*block_size=*/64);
+
+  std::vector<uint8_t> block(static_cast<size_t>(P.padded_block_bytes), kPoison);
+  const Fp8DsMlaToken t = Fp8DsMlaEncodeToken(MakeLatent(5, L), L);
+  Fp8DsMlaStoreToken(block.data(), P, /*pos_in_block=*/-1, t);
+  Fp8DsMlaStoreToken(block.data(), P, /*pos_in_block=*/-7, t);
+
+  for (int64_t off = 0; off < P.padded_block_bytes; ++off)
+    REQUIRE(static_cast<int>(block[static_cast<size_t>(off)]) ==
+            static_cast<int>(kPoison));
+}
+
+TEST_CASE("dsv4-fp8_ds_mla page: store then load round-trips BIT-EXACTLY") {
+  const Fp8DsMlaLayout L = RealV4TokenLayout();
+  const Fp8DsMlaPageLayout P = MakeFp8DsMlaPageLayout(L, /*block_size=*/64);
+  std::vector<uint8_t> block(static_cast<size_t>(P.padded_block_bytes), kPoison);
+
+  const std::vector<int64_t> slots = {0, 3, 62, 63};
+  std::vector<Fp8DsMlaToken> encoded;
+  for (size_t i = 0; i < slots.size(); ++i) {
+    encoded.push_back(
+        Fp8DsMlaEncodeToken(MakeLatent(static_cast<int64_t>(i) + 11, L), L));
+    Fp8DsMlaStoreToken(block.data(), P, slots[i], encoded.back());
+  }
+
+  for (size_t i = 0; i < slots.size(); ++i) {
+    const Fp8DsMlaToken got = Fp8DsMlaLoadToken(block.data(), P, slots[i]);
+    // The read consumes n_quant_blocks = 7 (`cache_utils.py:385`), one FEWER
+    // than the store writes; the pad byte is dropped, exactly as upstream drops
+    // it, so the loaded token carries 7 scales and not 8.
+    REQUIRE(got.scale_ue8m0.size() == 7u);
+    REQUIRE(got.nope_fp8.size() == 448u);
+    REQUIRE(got.rope_bf16.size() == 64u);
+    CHECK(got.nope_fp8 == encoded[i].nope_fp8);
+    CHECK(got.scale_ue8m0 == encoded[i].scale_ue8m0);
+    CHECK(got.rope_bf16 == encoded[i].rope_bf16);
+
+    // And the dequantized latent is EQUAL, not close: both sides are an e4m3
+    // table lookup times an integer exp2. A tolerance here would pass a wrong
+    // scale-region offset that happened to land on a neighbouring exponent.
+    const std::vector<float> via_page = Fp8DsMlaDecodeToken(got, L);
+    const std::vector<float> direct = Fp8DsMlaDecodeToken(encoded[i], L);
+    REQUIRE(via_page.size() == direct.size());
+    for (size_t d = 0; d < direct.size(); ++d)
+      REQUIRE(via_page[d] == direct[d]);
+  }
 }

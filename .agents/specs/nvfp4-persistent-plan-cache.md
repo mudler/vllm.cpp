@@ -518,3 +518,418 @@ and 11,947 bytes.
 Each implementation/gate result updates README, BENCHMARKS, the roadmap and
 owning matrices in the same checkpoint. A failed component stops before the
 exact grid and cannot authorize 35B performance.
+
+## W3-F draw-quality survey (#2751) and the pinned GB10 artifact (#2752)
+
+Status: **SPEC ONLY. The harness is committed and has NEVER RUN on a device.**
+Every number below is a threshold written before the measurement, not a result.
+W3-C3 above stands unchanged and is the baseline this section is measured
+against.
+
+Issues: [#2751](https://github.com/mudler/vllm.cpp/issues/2751),
+[#2752](https://github.com/mudler/vllm.cpp/issues/2752).
+
+The harness is shared with `KERNEL-GEMM-BF16`'s #2750 measurement and is
+described once, in
+[`cublaslt-cross-process-algo-stability.md`](cublaslt-cross-process-algo-stability.md)
+§"Port and harness map". One job produces the evidence for all three issues,
+because the three questions are answered by the same N fresh processes: the
+`[VT_GEMM_ALGO]` lines are #2750's data and the `[VT_FP4_CACHE]` lines are
+#2751's, and running them twice would spend two leases to learn what one can.
+
+### What the tuner actually does, read from the tree
+
+#2751 was corrected on 2026-09-03 and its original "min-of-10" framing was
+wrong. The mechanism below was re-verified in this worktree at base
+`22986c3f4` before it was written down, because the correction changes what the
+gates can even ask for.
+
+Per candidate, `TimeCandidate` (`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-363`):
+
+- three warmup launches (`kWarmupIterations`);
+- `cudaStreamSynchronize`, then a one-thread GPU delay kernel of
+  `VT_FP4_AUTOTUNE_DELAY_US` (default 5,000) microseconds, so host enqueue
+  latency cannot bias near-tied tactics;
+- **one** `cudaEvent` pair spanning **all ten** iterations
+  (`kTimingIterations`), then `elapsed_ms / kTimingIterations`. A candidate that
+  rejected the shape returns `kFp4Inf` (`:361`).
+
+**That last line is load-bearing.** The per-candidate result is a MEAN, and
+because a single event pair spans the whole loop, **no per-iteration timing
+exists anywhere in the tree**. There is no distribution to take a median or a
+minimum of. "Minimum wins" describes the argmin ACROSS CANDIDATES at `:758-764`
+-- strict `<`, first-registered wins a tie -- and never a min-of-ten. Producing
+a robust statistic would mean ADDING per-iteration events, which is
+instrumentation work and not a reduction swap. **No gate in this section may
+assume per-iteration samples exist.**
+
+### The damper that already exists, in the arm that is not the default
+
+The comment at `:767-769`, over the branch it describes at `:770-776`:
+
+> `// W1 used a >1% threshold relative to its fixed M baseline. Preserve that`
+> `// only in the fallback arm. FlashInfer's full autotuner chooses the`
+> `// minimum valid event time directly.`
+
+In the legacy `VT_FP4_FULL_TACTICS=0` arm (4 candidates) a tactic displaces the
+fixed baseline only if it beats it by more than 1%; otherwise the baseline is
+kept. That is deliberate stickiness against sub-1% noise, and it is already
+shipped.
+
+`Fp4FullTacticsEnabled()` (`:189-195`) reads
+`value == nullptr || value[0] != '0'`, so `VT_FP4_FULL_TACTICS` is **default
+ON**. The shipped default is therefore the 32-candidate arm with pure argmin and
+**no** damper, while the non-default arm has one.
+
+So the question this row owes is sharper than "add a selector": **does the
+default arm need the stickiness the legacy arm already has?** The in-tree
+comment answers "no" because FlashInfer picks the minimum directly. That is a
+mirror argument, not a measurement, and the draw spread is the evidence that was
+never brought against it.
+
+**Two consequences for the harness, both enforced rather than documented.**
+Draws are collected in BOTH arms, because they select by different rules and a
+spread pooled across them names no rule; the judge refuses an evidence root that
+mixes them (exit `81`), and the scoring legs are given the same arm as the draw
+they replay, since the tactic-set version is part of the cache metadata and a
+map replayed under the other arm is rejected by `ParseNativeCache`.
+
+### Why W3-C3 does not already answer #2751
+
+W3-C3 proved that a FROZEN plan map removes tactic selection as a confounder:
+64/64 equal IDs, zero tuning misses, and a steady-state component of c2
+**1.0045x** / c16 **1.0050x** that STRICT-FAILED at 39/40 timing + 1/8 memory.
+Persistence is credited as a control, not a speedup, and that is still true.
+
+What it did not ask is whether the draws it froze were **good** draws. The
+mirror carries one draw per process, kept whole, and the timing noise at
+selection time is not averaged away across candidates -- it is *selected on*.
+The identity spread is known to be wide (18--33 of 64 shared IDs across paired
+runs). The **speed** spread has never been measured, and until it is, "which
+draw" is a question with no answer and #2752 has nothing defensible to pin.
+
+### The draw is disjoint from the score by construction, not by discipline
+
+#2751 and [`.agents/benchmarking.md`](../benchmarking.md) both refuse a selector
+that picks a plan on the workload the plan will later be scored on. On this lane
+that separation is structural and can be pointed at:
+
+- The tuning pass is the pre-serve NVFP4 warmup at
+  `src/vllm/entrypoints/model_loader.cpp:2388-2410`. It submits ONE synthetic
+  request of `max_num_batched_tokens` repeated dummy tokens under
+  `Nvfp4AutotuneWarmupScope` and completes the tuner before serving begins.
+- No prompt of the scoring workload exists when the draw is taken.
+
+What is **not** structural, and is enforced by the harness, is that
+`--max-num-batched-tokens` be held constant across draws. It decides which plan
+keys get tuned, so a draw taken at another value tuned a different key set; the
+judge refuses that outright (exit `74`) rather than comparing tactic maps that
+describe different shapes.
+
+### The identity gate
+
+From the `issue_2751_identity` block of `REPORT.json`, over N >= 8 draws whose
+plan-key sets and metadata fingerprints are identical:
+
+| Reported | Meaning |
+|---|---|
+| `pairwise_shared_min/median/max` | the "shared X of 64 tactic IDs" statistic W3-C3 already uses, now over every pair |
+| `keys_unanimous` | keys on which all N draws agree; W3-C3's per-arm figure was 9--17 of 64 at c16 and 12--15 at c2 across three repetitions |
+| `max_distinct_tactics_on_one_key` | whether the spread is concentrated on a few keys or spread across all of them |
+
+This half needs no clock and no timing admissibility. It stands even on a run
+whose speed half is refused.
+
+### Two speed axes, and only one of them gates
+
+| Axis | Where it comes from | Status |
+|---|---|---|
+| **S, selection time** | `[VT_FP4_AUTOTUNE] ... -> id=%d %s (%.1f us)` at `:777-788`, which prints `timings[chosen] * 1000` | **DIAGNOSTIC ONLY** |
+| **E, end-to-end** | a frozen replay of each draw on a disjoint serving workload, clock-attributed | the gate |
+
+Axis S is the only timing number the tuner exposes, and this spec records it
+because #2751 asks how far apart the draws are. It **cannot** gate, for three
+independent reasons, any one of which is sufficient:
+
+1. it is ONE ten-iteration mean per key, with no spread, median or minimum
+   computable from it;
+2. it is produced by the instrument whose noise is the subject of the
+   investigation, so ranking draws by it settles the question with the
+   measurement under suspicion;
+3. it is measured on the tuner's own synthetic warmup shapes -- which is the
+   workload the draw was taken on -- and scoring a draw on the workload that
+   produced it is the shape #2751 and
+   [`.agents/benchmarking.md`](../benchmarking.md) refuse.
+
+What S is good for: two draws that picked different tactic IDs at
+near-identical selection-time means are the "performance-equivalent selections
+differing only in reduction order" hypothesis made visible. A large S gap is a
+reason to look harder at E, never a substitute for it. The report's
+`issue_2751_selection_time` block carries a `state`, deliberately never a
+`verdict`, so it cannot be handed to the shipping rule by mistake.
+
+Note also that S reports the **chosen** candidate, not the fastest one. In the
+`w1` arm the damper can keep the baseline even when another candidate timed
+lower, so `chosen` and `best` differ there and the line reports what was
+installed.
+
+### The speed gate on axis E, and the bar it has to clear
+
+Scoring replays each draw **frozen** -- `VT_FP4_AUTOTUNE_CACHE_PATH` at that
+draw's document plus `VT_FP4_AUTOTUNE_CACHE_READONLY=1`, so a frozen miss is
+rejected before any tuning. The leg is refused (exit `78`) unless its
+`[VT_FP4_CACHE] complete` line reads `tuned=0` and `loaded` equal to the draw's
+own plan count. Without that control the scoring phase is N MORE DRAWS wearing
+the label of a replay, and each number would be attributed to a plan map nobody
+recorded.
+
+Legs are interleaved with the opening arm repeated last, through
+`tools/bench/c8_leg_runner.py` and `tools/bench/resumable_legs.py`: a block of
+one arm followed by a block of the next measures the hour as much as the draw,
+the terminal control is what makes a drifting box declare itself, and folding
+refuses across a boot change.
+
+| Verdict | Condition | Consequence |
+|---|---|---|
+| `EQUIVALENT` | best/worst draw ratio does not exceed the POOLED within-draw repeat spread | **#2751 closes as "no divergence warranted"**, which is the outcome the issue names first; the persistent cache alone is the right answer and #2752 unblocks |
+| `SEPARATED_BELOW_BAR` | ratio exceeds the pooled within-draw spread but is under **1.02x** | the draws differ and the difference is not worth a divergence from the mirror; #2751 records the number and closes without a selector; #2752 stays blocked, because "which draw" is no longer arbitrary |
+| `ABOVE_BAR` | ratio >= **1.02x** | #2751 escalates for **developer ratification** of one of the two options it names; no selector is written before that answer |
+| `INCOMPARABLE` | fewer than **three** legs on some draw, a non-positive mean or leg, or ANY draw's own repeat spread over the **1.02x noise ceiling** | no number; the sequence is repeated |
+
+**A noisier run reads more favourably, and the ceiling is what bounds that.**
+The first two rows are decided against the run's OWN pooled repeat spread, so
+the same draw-to-draw gap can land in either. A 1.9% gap reads `EQUIVALENT` --
+closing #2751 and shipping `draw00` -- when the pooled repeat spread is also
+1.9%, and `SEPARATED_BELOW_BAR` -- shipping nothing -- when the repeats are
+clean at 0.05%. That polarity is intended: a gap a run cannot distinguish from
+its own noise is not a gap that run measured. It is also why the ceiling is not
+optional. Because no draw may carry a spread over 1.02x, the pooled floor can
+never exceed 2%, so noise can only ever swallow a gap that was already under the
+ratification bar. A gap worth diverging for cannot be bought with a bad run.
+
+**The noise floor is pooled, and a restless run is repeated rather than called
+equivalent.** Three rules, and the LAST one is why `--score-reps` is 3 above:
+
+- **Every draw must HAVE a spread.** A draw whose minimum leg is not positive
+  has no defined repeat spread, and a leg records zero rather than nothing when
+  its run produced no tokens. Both rules below read a per-draw spread, so such a
+  draw would be exempt from each of them while its own depressed mean still
+  decided which draw was worst -- the wildest draw in the run being the one
+  neither guard could see. It is refused by name instead.
+- **The ceiling.** If any single draw's own repeat spread exceeds 1.02x, the
+  verdict is `INCOMPARABLE` and the run is repeated. Without it, one restless
+  draw sets the floor for every other draw, and a draw-to-draw gap larger than
+  the ratification bar reads `EQUIVALENT` -- the verdict that closes #2751 AND
+  unblocks #2752 to pin a draw. This is not an exotic case here: one unchanged
+  binary has read 36.82 and 78.86 tok/s at c8 on this host
+  ([`c8-measurement-admissibility.md`](c8-measurement-admissibility.md),
+  [#2154](https://github.com/mudler/vllm.cpp/issues/2154)).
+- **The floor itself** is the MEDIAN of the per-draw spreads, not the maximum,
+  so a draw sitting just under the ceiling cannot certify the others. Both the
+  pooled and the worst figure are reported.
+
+**The ceiling is 1.02x and it is NOT the ratification bar**, even though the two
+share that value today. The bar says how much a draw-to-draw gap must be worth
+before diverging from the mirrored FlashInfer method is arguable. The ceiling
+says how much repeat noise a run may carry before it can answer that question at
+all: a run whose own repeats are as wide as the effect it was built to resolve
+has not measured the effect. They are separate parameters
+(`--ratification-bar`, `--noise-ceiling`) and moving one must not move the other.
+
+**Three legs per draw, not two.** The within-draw spread is the floor the
+draw-to-draw gap is compared against, and over two legs it is a single
+difference rather than an estimate of anything. `speed_spread` returns
+`INCOMPARABLE` below three, so `--score-reps 2` would buy a lease and return no
+verdict.
+
+**The two options ratification would choose between**, both of which diverge
+from the pinned FlashInfer oracle for the default arm and are therefore product
+decisions rather than inferred ones:
+
+1. **Extend the legacy arm's >1% stickiness to the default arm.** This is the
+   cheaper option and it is not an invention: the damper is already in the tree
+   at `:770-776` and already ships in the `w1` arm. The measurement makes it
+   arguable because the harness runs both arms, so the identity spread of the
+   damped arm and the undamped arm are directly comparable.
+2. **Add per-iteration events so a robust statistic is computable at all.**
+   This is instrumentation work, not a reduction swap, because `TimeCandidate`
+   holds no per-iteration figure to reduce.
+
+Compute authority for the measurement is recorded. Ratification for either
+option is **not** granted and is asked for with the numbers in hand.
+
+**Why 1.02x.** The control this lane already has is worth 1.0045x/1.0050x and
+still strict-failed. A selector is a deliberate divergence from a mirrored
+upstream method, so it has to be worth meaningfully more than the control it
+would sit beside. 1.02x is four times that magnitude and sits above both the 1%
+cross-arm clock-mean rule and the noise a lease can produce with no lever to pin
+the SM clock (`LGC_RC=4`, [#1354](https://github.com/mudler/vllm.cpp/issues/1354)).
+It is a threshold, not a measurement, and it is written here before the run so
+that it cannot be chosen after seeing the numbers.
+
+**Concurrency: c2 and c16, and NOT c8.** Those two rungs held still enough in
+W3-C3 to resolve sub-percent effects across 12 legs (20/20 and 19/20 timing
+axes). c8 on this host has produced a severity metric ranging 0.0 to 79.6 across
+runs of ONE unchanged binary
+([`c8-measurement-admissibility.md`](c8-measurement-admissibility.md),
+[#2154](https://github.com/mudler/vllm.cpp/issues/2154)); a rung that cannot
+gate its own effects cannot gate this one. The harness takes one
+`--concurrency` per evidence root, so c2 and c16 are two roots and two folds,
+never one pooled population.
+
+### #2752: the shipping rule, and why it is "the first one"
+
+`select_shipping_draw` returns a draw **only** on `EQUIVALENT`, and then it
+returns the FIRST draw in draw order.
+
+That is the whole rule, deliberately. Ranking N draws on a workload and shipping
+the winner selects a kernel plan by a measurement of its own speed, which is the
+shape #2751 refuses by name and which this repository's benchmark protocol
+refuses generally. When the draws are equivalent the choice is arbitrary *by the
+measurement's own finding*, so an a-priori rule -- draw order, fixed before the
+first number existed -- is the one choice no measurement can bias. When they are
+not equivalent, the function ships nothing and names #2751 as the blocker, which
+is exactly what #2752's own "blocked-by consideration" paragraph asks for.
+
+If and only if #2751 returns `EQUIVALENT`, the artifact lands with:
+
+- the native document `SerializeNativeCache` emitted for that draw, verbatim;
+- its **sha256**, and the `PersistentCacheMetadataFingerprint`
+  (`src/vt/cuda/nvfp4_persistent_cache.cpp:528`) recorded beside it, so identity
+  is checkable without running anything;
+- the install step in [`docs/USAGE.md`](../../docs/USAGE.md), which is the
+  projection that owns an install step and a config key;
+- a plain note that the draw is a starting point for that exact configuration
+  and not a guarantee. `ParseNativeCache` already validates metadata against the
+  running configuration, so a draw installed onto a host it does not describe is
+  **rejected, not silently used** -- the mismatch mode this artifact could
+  otherwise introduce is already closed.
+
+**This is a reproducibility and warmup artifact, not a speed artifact.** What it
+buys is that two people benchmarking this tree on the same silicon start from
+the same kernel plan and that the first serve does not pay a tuning pass. Any
+claim beyond that needs its own measurement.
+
+Nothing in this change writes `docs/USAGE.md`, because no artifact exists yet.
+
+### Gates for W3-F
+
+One root per (arm, concurrency) pair, because the arms select by different
+rules and the rungs are different populations. The default `full` arm is the
+one the product ships and is the priority; the `w1` arm is what makes the
+damper question answerable.
+
+```sh
+# the shipped arm, c2
+bash scripts/dgx-gemm-tactic-draw-survey.sh \
+     --evidence /workspace/gemm-draw-survey/<stamp>-full-c2 \
+     --src /workspace/gemm-draw-survey/src.tar.gz \
+     --model /workspace/ckpt/<nvfp4-checkpoint> \
+     --tactic-set full --draws 8 --score-reps 3 --concurrency 2
+
+# the shipped arm, c16
+bash scripts/dgx-gemm-tactic-draw-survey.sh \
+     --evidence /workspace/gemm-draw-survey/<stamp>-full-c16 \
+     --src /workspace/gemm-draw-survey/src.tar.gz \
+     --model /workspace/ckpt/<nvfp4-checkpoint> \
+     --tactic-set full --draws 8 --score-reps 3 --concurrency 16
+
+# the damped arm, c2 -- the comparison that answers the damper question
+bash scripts/dgx-gemm-tactic-draw-survey.sh \
+     --evidence /workspace/gemm-draw-survey/<stamp>-w1-c2 \
+     --src /workspace/gemm-draw-survey/src.tar.gz \
+     --model /workspace/ckpt/<nvfp4-checkpoint> \
+     --tactic-set w1 --draws 8 --score-reps 3 --concurrency 2
+
+# the judgement, offline, per root
+python3 tools/bench/gemm_tactic_draw_survey.py reduce \
+     --evidence /workspace/gemm-draw-survey/<stamp>-full-c2
+```
+
+The `full` roots alone answer #2751's "are the draws performance-equivalent"
+question and unblock or block #2752. The `w1` root is what turns "does the
+default arm need the damper" from a mirror argument into a comparison: if the
+damped arm's `keys_unanimous` is materially higher at a comparable end-to-end
+result, option 1 above has evidence behind it.
+
+The judge refuses before it prints a verdict when a precondition failed: `72`
+when the persistent runtime never started, `73` when a "draw" LOADED a map
+instead of tuning one (a copy, not a sample), `74` on divergent plan-key sets,
+`75` on divergent metadata fingerprints, `77` when a draw published no document,
+`78` on a scoring leg that re-tuned, `79` when the legs were not one binary, and
+`81` when one root holds both tactic-set arms.
+
+The frozen control has **two witnesses** and both must agree: the runtime's own
+`tuned=0` on the `[VT_FP4_CACHE] complete` line, and zero
+`[VT_FP4_AUTOTUNE]` selection lines from the tuner itself. The legs therefore
+run with `VT_FP4_AUTOTUNE_VERBOSE=1` even though a frozen leg should print none
+-- a control with one witness is a control that cannot be cross-checked.
+
+**The control is RECORDED, one file per leg, and `reduce` reads it.** Each leg
+writes `score/<arm>-<n>/frozen.json` through `check-frozen --record` as it
+finishes, pass or fail; `reduce` globs those files and exits `78` when any leg
+failed the control OR when a leg that contributed a number to the ledger carries
+no passing record. A leg whose control was never recorded measured a plan map
+nobody checked, which is the same defect as a leg that re-tuned. Without that
+read, `REPORT.json` could carry `EQUIVALENT` and "ship draw00" with no evidence
+that any leg was frozen at all, and the `78` in the table above would have no
+path to fire. One file per leg rather than one shared control document, because
+a file every leg has to write is the lock shape the protocol refuses.
+
+## Owed
+
+### A pinned GB10 draw, so that a fresh checkout does not re-tune (#2752)
+
+The tree ships the persistent-cache machinery and no cache document.
+`src/vt/cuda/nvfp4_persistent_cache.cpp::ResolvePersistentCacheOptions` defaults
+the cache on and resolves it under
+`${XDG_CACHE_HOME:-$HOME/.cache}/vllm.cpp/nvfp4_autotune/...`, so every fresh
+checkout on every host tunes all 64 plans on its first serve and keeps whatever
+draw it drew. The tree carries no committed artifact and no way to get one, so
+the reproducibility control this row built reaches only a host that has already
+run once.
+
+[Issue #2752](https://github.com/mudler/vllm.cpp/issues/2752) owes:
+
+- one native-format GB10 draw for `sm_121`, measured under a lease, with its
+  SHA-256
+- its `src/vt/cuda/nvfp4_persistent_cache.cpp::PersistentCacheMetadataFingerprint`
+  value recorded beside it, so that a reader can check the identity without
+  running the engine
+- the install step, documented in [`docs/USAGE.md`](../../docs/USAGE.md) beside
+  the operating section this row landed for
+  [#2754](https://github.com/mudler/vllm.cpp/issues/2754)
+- a statement that the draw is a starting point for that exact configuration and
+  not a guarantee
+
+The debt is this row's, and not a documentation row's, because the capability
+landed reachable and default-on here.
+
+The artifact is a reproducibility and warmup control, and not a speed artifact.
+The measured frozen-plan steady-state component on this lane is 1.0045x at c2
+and 1.0050x at c16, and the strict result FAILED at 39 of 40 timing axes and 1
+of 8 memory axes, as
+[§ "W3-C3 corrected frozen-plan component result"](#w3-c3-corrected-frozen-plan-component-result-2026-07-13)
+records. A claim past that needs its own measurement.
+
+The path identity already closes the mismatch mode that an installed artifact
+could otherwise introduce.
+`src/vt/cuda/nvfp4_persistent_cache.cpp::ValidateMetadataMatch` compares every
+keyed field against the running configuration, so a draw installed onto a host
+it does not describe is rejected rather than silently used.
+
+**Blocked-by consideration.** If the draw-quality investigation on this row
+finds that draws differ materially in speed, which draw the tree ships stops
+being arbitrary, and this item waits for that answer rather than pinning a lucky
+or unlucky sample.
+
+### The draw-quality survey itself (#2751)
+
+[Issue #2751](https://github.com/mudler/vllm.cpp/issues/2751) owes the run, not
+the harness. `scripts/dgx-gemm-tactic-draw-survey.sh` and the thresholds in
+`## W3-F` above land with this change; the measurement is owed to an operator
+with a `dgx:gpu0` lease.
+
+The two debts are ordered. The pinned draw above is blocked on this survey:
+until #2751 returns `EQUIVALENT`, which draw we would ship is not a settled
+question, and nothing is committed.

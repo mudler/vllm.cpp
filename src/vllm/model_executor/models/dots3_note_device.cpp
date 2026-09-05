@@ -1079,7 +1079,8 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const Dots3NoteWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const MultiModalForwardInput* mm) {
   const Dots3NoteParams& p = weights.params;
   // The scope boundary, stated as a refusal rather than as a comment. Every
   // branch names ONE unrepresentable feature and the brick that owes it; the
@@ -1192,8 +1193,35 @@ ForwardLogits Dots3NoteModel::ForwardDevice(
            "dots3-note forward: one KV cache per backbone layer is required");
 
   // ── embed ─────────────────────────────────────────────────────────────────
+  //
+  // W6a (#2512): `inputs_embeds is not None` is upstream's own arm, and it is
+  // the ONLY way the vision rows reach the residual stream. The runner ran the
+  // encoder, gathered its rows and asked the model's `embed_mm` hook to scatter
+  // them over the placeholder positions; what arrives here is the RESULT of
+  // that scatter, so the embedding-table lookup must be SKIPPED rather than run
+  // and overwritten. Running it anyway would be invisible on a text step and
+  // would silently discard every vision row on an image step.
   DBuf hidden_buf(d, DType::kBF16, {T, H});
-  {
+  const bool have_mm_embeds =
+      mm != nullptr && mm->inputs_embeds.data != nullptr;
+  if (have_mm_embeds) {
+    const Tensor& emb = mm->inputs_embeds;
+    VT_CHECK(emb.rank == 2 && emb.shape[0] == T && emb.shape[1] == H,
+             "dots3-note forward: ModelForwardInput.mm carries inputs_embeds of "
+             "rank " + std::to_string(emb.rank) + " shaped [" +
+                 std::to_string(emb.shape[0]) + ", " +
+                 std::to_string(emb.shape[1]) + "], expected [" +
+                 std::to_string(T) + ", " + std::to_string(H) +
+                 "]. A merged embedding stream that does not cover the step's "
+                 "tokens would splice vision features onto the wrong rows.");
+    VT_CHECK(emb.dtype == DType::kBF16,
+             "dots3-note forward: mm.inputs_embeds is not BF16. The model dtype "
+             "IS bf16 here and a wider stream moves twice the bytes through "
+             "every layer while producing tokens a gate cannot tell apart "
+             "(porting.md's memory-format rule).");
+    d.b.Copy(d.q, hidden_buf.ptr(), emb.data,
+             static_cast<size_t>(T * H) * vt::SizeOf(DType::kBF16));
+  } else {
     DBuf ids(d, DType::kI32, {T}, token_ids.data());
     Tensor tab = ResidentWeight(d, dw.embed_tokens, {vocab, H});
     Tensor h = hidden_buf.t();

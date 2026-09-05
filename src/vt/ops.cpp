@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -54,6 +55,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kMXFP4:
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
+    case DType::kIQ3_S:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
@@ -1547,7 +1549,14 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
            "embedding: contiguous required");
   VT_CHECK(table.device == out.device && ids.device == table.device && table.device == q.device,
            "embedding: device mismatch (table/out/ids/queue)");
-  reinterpret_cast<EmbeddingFn>(GetOp(OpId::kEmbedding, q.device.type))(q, out, table, ids);
+  // A block table is a DIFFERENT capability, so it is a different op id. The
+  // split is what lets the GGUF residency policy ask "can this device decode a
+  // block row" through the provider table instead of naming devices in the
+  // loader, and it is what makes a device that lacks the arm refuse BY NAME
+  // here -- GetOp throws naming the op and the device -- rather than dispatch
+  // into a kernel that would assert on the dtype one frame later.
+  const OpId op = IsBlockQuant(table.dtype) ? OpId::kEmbeddingQuant : OpId::kEmbedding;
+  reinterpret_cast<EmbeddingFn>(GetOp(op, q.device.type))(q, out, table, ids);
 }
 
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
@@ -2179,6 +2188,36 @@ void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                                                                               weight, args);
 }
 
+// KERNEL-GDN-CHUNKED-MIRROR D3: the one flag, read in the shared op layer so
+// every backend's GdnPrefill answers the same question. Lifted verbatim from
+// cuda_gdn.cu's bespoke ChunkedPrefillEnabled(), which now delegates here.
+// Read on each call: prefill is coarse-grained, so the getenv cost is
+// negligible, and it lets one process drive both arms (T4).
+bool GdnChunkedPrefillEnabled() {
+  const char* e = std::getenv("VT_GDN_CHUNKED");
+  return e == nullptr || e[0] != '0';
+}
+
+// KERNEL-GDN-CHUNKED-MIRROR D0. `chunked = (dtype == bf16) && VT_GDN_CHUNKED != 0`.
+// The dtype term is NOT a concession to this tree's three f32 goldens; it is the
+// mirror. Upstream has no chunked path at any dtype but bf16 to mirror, on
+// either of its two implementations of the kernel, so f32 AND f16 route to the
+// sequential recurrence that upstream's own f32-capable kernel computes.
+//
+// The spec's D0 states this as `dtype != f32`, and implementing it that way was
+// a defect: f16 then took the chunked arm and was silently bf16-rounded at all
+// nine placement sites. `== bf16` is the rule; see the reason on the body below.
+bool GdnUseChunkedPrefill(DType q_dtype) {
+  // BF16 ONLY, not merely "not f32". Upstream's chunked kernels accept exactly
+  // one input dtype on BOTH implementations: the Triton wrapper asserts
+  // `q.dtype != torch.float32` (chunk.py:213-215) and every FLA store is
+  // `k.dtype`, while the CPU kernel type-checks `at::kBFloat16` outright
+  // (csrc/cpu/sgl-kernels/fla.cpp:2205-2207). There is no f16 chunked gated
+  // delta rule upstream to mirror, so f16 takes the sequential recurrence for
+  // the same reason f32 does.
+  return q_dtype == DType::kBF16 && GdnChunkedPrefillEnabled();
+}
+
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                 const Tensor& g, const Tensor& beta, Tensor& state,
                 const Tensor& query_start_loc, const GdnArgs& args) {
@@ -2560,9 +2599,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
   // float here refused the released checkpoint at its first prefill.
   //
-  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
-  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
-  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM
+  // registered `qwen4_exp` on 2026-08-31 (#2489) but never loads a GGUF, so it
+  // has no opinion on a block-typed operand; llama.cpp merged it on 2026-08-27
   // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
   // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
   // — down, up AND inject, on both the attention and the feed-forward side) and
@@ -4093,6 +4132,118 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
       q, kv_c, k_pe, kv_cache, slot_mapping);
 }
 
+void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
+                         const Tensor& slot_mapping, int64_t block_size) {
+  // Upstream: `assert k.dim() == 2 and k.shape[1] == 512` (cache_utils.py:167-169).
+  VT_CHECK(k.rank == 2 && k.shape[1] == kFp8DsMlaInputDim,
+           "concat_and_cache_ds_mla: k must be rank-2 [num_tokens, 512] — the "
+           "compressed latent, NoPE in [0, 448) and the rotated RoPE in [448, 512)");
+  // The page is RANK-2 BYTES. This is the difference from concat_and_cache_mla
+  // and it is not a formality: a token's scales live in a different REGION of
+  // the block from its data (cache_utils.py:59-66), so no (block, row, column)
+  // indexing reaches both and a rank-3 page cannot describe this cache.
+  VT_CHECK(kv_cache.rank == 2,
+           "concat_and_cache_ds_mla: kv_cache must be rank-2 "
+           "[num_blocks, block_bytes] — the fp8_ds_mla block is REGION-SPLIT "
+           "(cache_utils.py:59-66), so it is not a rank-3 page");
+  VT_CHECK(kv_cache.dtype == DType::kI8,
+           "concat_and_cache_ds_mla: kv_cache must be DType::kI8 (a BYTE page). A "
+           "float cache here would be the 3.5x overrun this op exists to stop: "
+           "2048 f32 bytes per token against the 584 the spec declares");
+  VT_CHECK(slot_mapping.rank == 1,
+           "concat_and_cache_ds_mla: slot_mapping must be rank-1 [num_slots]");
+  VT_CHECK(slot_mapping.dtype == DType::kI64,
+           "concat_and_cache_ds_mla: slot_mapping must be i64");
+  // Upstream asserts bf16 (`:170-171`). We accept any float dtype because the
+  // encoder's first act is upstream's own fp32 -> bf16 round
+  // (`:110-118`, "Load bf16 input"), so an f32 row and its bf16 rounding
+  // produce identical bytes; a non-float source has no such reading.
+  VT_CHECK(IsFloat(k.dtype),
+           "concat_and_cache_ds_mla: k must be a float dtype (upstream asserts "
+           "bf16; the encoder rounds to bf16 first, so f32/f16 agree bit for bit)");
+  VT_CHECK(block_size > 0,
+           "concat_and_cache_ds_mla: block_size must be > 0 (it is the STORAGE "
+           "block size, block_size / compress_ratio)");
+  // 584 bytes per token (kv_cache_interface.py:401-403). Everything past that is
+  // the block's alignment padding (`:63`) and no store may reach it, so the page
+  // must be at least the real size; a LARGER row is the padded page and is fine.
+  const int64_t real_block_bytes = block_size * kFp8DsMlaTokenBytes;
+  VT_CHECK(kv_cache.shape[1] >= real_block_bytes,
+           "concat_and_cache_ds_mla: kv_cache row must hold block_size * 584 bytes");
+  VT_CHECK(k.stride[1] == 1 && kv_cache.stride[1] == 1 && slot_mapping.IsContiguous(),
+           "concat_and_cache_ds_mla: k/kv_cache innermost stride must be 1 and "
+           "slot_mapping contiguous");
+  VT_CHECK(k.stride[0] >= kFp8DsMlaInputDim,
+           "concat_and_cache_ds_mla: k token rows must not overlap");
+  VT_CHECK(kv_cache.stride[0] >= kv_cache.shape[1],
+           "concat_and_cache_ds_mla: kv_cache blocks must not overlap");
+  // Upstream takes the token count from slot_mapping (`:186-188`): the tail of
+  // `k` is DP padding and is ignored.
+  VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
+           "concat_and_cache_ds_mla: num_tokens must be >= slot_mapping length");
+  VT_CHECK(k.device == q.device && kv_cache.device == q.device &&
+               slot_mapping.device == q.device,
+           "concat_and_cache_ds_mla: device mismatch (k/kv_cache/slot_mapping/queue)");
+  reinterpret_cast<ConcatAndCacheDsMlaFn>(
+      GetOp(OpId::kConcatAndCacheDsMla, q.device.type))(q, k, kv_cache, slot_mapping,
+                                                        block_size);
+}
+
+void DequantAndGatherDsMla(Queue& q, Tensor& out, const Tensor& kv_cache,
+                           const Tensor& seq_lens, const Tensor* gather_lens,
+                           const Tensor& block_table,
+                           const DequantAndGatherDsMlaArgs& args) {
+  VT_CHECK(out.rank == 3 && out.shape[2] == kFp8DsMlaInputDim,
+           "dequant_and_gather_ds_mla: out must be rank-3 "
+           "[num_reqs, max_num_tokens, 512]");
+  // Upstream stores bf16 (`cache_utils.py:328`, `:337`). f32 is the annotated
+  // widening: the scratch dtype must equal the query dtype the following
+  // vt::MlaDecodeAttention runs at, and our CPU MLA decode runs at f32.
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "dequant_and_gather_ds_mla: out must be f32 or bf16 (bf16 mirrors "
+           "upstream exactly; f32 is the scratch dtype our CPU MLA decode consumes)");
+  VT_CHECK(kv_cache.rank == 2 && kv_cache.dtype == DType::kI8,
+           "dequant_and_gather_ds_mla: kv_cache must be rank-2 "
+           "[num_blocks, block_bytes] DType::kI8 — the REGION-SPLIT byte page");
+  VT_CHECK(seq_lens.rank == 1 && seq_lens.dtype == DType::kI32,
+           "dequant_and_gather_ds_mla: seq_lens must be rank-1 [num_reqs] i32");
+  VT_CHECK(block_table.rank == 2 && block_table.dtype == DType::kI32,
+           "dequant_and_gather_ds_mla: block_table must be rank-2 "
+           "[num_reqs, max_blocks_per_seq] i32");
+  const int64_t num_reqs = out.shape[0];
+  VT_CHECK(num_reqs > 0, "dequant_and_gather_ds_mla: num_reqs must be > 0");
+  VT_CHECK(seq_lens.shape[0] == num_reqs && block_table.shape[0] == num_reqs,
+           "dequant_and_gather_ds_mla: seq_lens/block_table must have num_reqs rows");
+  // nullptr is upstream's `gather_lens_ptr is None` arm — gather the WHOLE
+  // sequence (`:257-262`) — and NOT an error.
+  if (gather_lens != nullptr) {
+    VT_CHECK(gather_lens->rank == 1 && gather_lens->dtype == DType::kI32 &&
+                 gather_lens->shape[0] == num_reqs,
+             "dequant_and_gather_ds_mla: gather_lens must be rank-1 [num_reqs] i32");
+    VT_CHECK(gather_lens->IsContiguous() && gather_lens->device == q.device,
+             "dequant_and_gather_ds_mla: gather_lens must be contiguous and on the "
+             "queue's device");
+  }
+  VT_CHECK(args.block_size > 0,
+           "dequant_and_gather_ds_mla: args.block_size must be > 0 (the STORAGE "
+           "block size, block_size / compress_ratio)");
+  VT_CHECK(args.offset >= 0 && args.offset < out.shape[1],
+           "dequant_and_gather_ds_mla: args.offset must index a column of out");
+  VT_CHECK(kv_cache.shape[1] >= args.block_size * kFp8DsMlaTokenBytes,
+           "dequant_and_gather_ds_mla: kv_cache row must hold block_size * 584 bytes");
+  VT_CHECK(out.stride[2] == 1 && kv_cache.stride[1] == 1 && block_table.stride[1] == 1 &&
+               seq_lens.IsContiguous(),
+           "dequant_and_gather_ds_mla: out/kv_cache/block_table innermost stride must "
+           "be 1 and seq_lens contiguous");
+  VT_CHECK(out.device == q.device && kv_cache.device == q.device &&
+               seq_lens.device == q.device && block_table.device == q.device,
+           "dequant_and_gather_ds_mla: device mismatch "
+           "(out/kv_cache/seq_lens/block_table/queue)");
+  reinterpret_cast<DequantAndGatherDsMlaFn>(
+      GetOp(OpId::kDequantAndGatherDsMla, q.device.type))(q, out, kv_cache, seq_lens,
+                                                          gather_lens, block_table, args);
+}
+
 void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                         const Tensor& kv_cache, const Tensor& block_table,
                         const Tensor& seq_lens, const MlaDecodeAttentionArgs& args) {
@@ -4336,6 +4487,166 @@ void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logi
            "dsa_topk_select: device mismatch (indices/counts/logits/win_start/win_end/queue)");
   reinterpret_cast<DsaTopkSelectFn>(GetOp(OpId::kDsaTopkSelect, q.device.type))(
       q, indices, counts, logits, win_start, win_end);
+}
+
+void Glm5NextKpoolCompress(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                           Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                           const Tensor& ape) {
+  VT_CHECK(packed.rank == 3,
+           "glm5_next_kpool_compress: packed must be rank-3 [batch, kv_len, "
+           "2 * index_head_dim + 1] — the indexer cache row is "
+           "`concat[k, gate_scores, valid]` (modular_glm5_next.py:798-801 @ "
+           "transformers v5.16.1), not the 128-wide key DeepSeek-V4 caches");
+  VT_CHECK(ape.rank == 2,
+           "glm5_next_kpool_compress: ape must be rank-2 [index_kpool, index_head_dim]");
+  VT_CHECK(pool_keys.rank == 3 && pool_indices.rank == 3 && pool_valid.rank == 2 &&
+               num_pools.rank == 1,
+           "glm5_next_kpool_compress: pool_keys/pool_indices must be rank-3, pool_valid "
+           "rank-2, num_pools rank-1");
+  const int64_t batch = packed.shape[0];
+  const int64_t kv_len = packed.shape[1];
+  const int64_t kpool = ape.shape[0];
+  const int64_t head_dim = ape.shape[1];
+  VT_CHECK(batch > 0 && kv_len > 0 && head_dim > 0,
+           "glm5_next_kpool_compress: batch/kv_len/index_head_dim must be > 0");
+  VT_CHECK(kpool >= 1,
+           "glm5_next_kpool_compress: index_kpool must be >= 1 "
+           "(configuration_glm5_next.py:216-217); it is 4 on the published checkpoint "
+           "and 16 in the config class, so a defaulted value is wrong by a factor of "
+           "four");
+  VT_CHECK(packed.shape[2] == 2 * head_dim + 1,
+           "glm5_next_kpool_compress: packed's row must be 2 * index_head_dim + 1 wide");
+  const int64_t np = (kv_len + kpool - 1) / kpool;
+  VT_CHECK(pool_keys.shape[0] == batch && pool_keys.shape[1] == np &&
+               pool_keys.shape[2] == head_dim,
+           "glm5_next_kpool_compress: pool_keys must be [batch, ceil(kv_len / "
+           "index_kpool), index_head_dim] — the STATIC upper bound, because the live "
+           "width P is only known after the `keep` compaction (:968-970)");
+  VT_CHECK(pool_indices.shape[0] == batch && pool_indices.shape[1] == np &&
+               pool_indices.shape[2] == kpool,
+           "glm5_next_kpool_compress: pool_indices must be [batch, np, index_kpool]");
+  VT_CHECK(pool_valid.shape[0] == batch && pool_valid.shape[1] == np,
+           "glm5_next_kpool_compress: pool_valid must be [batch, np]");
+  VT_CHECK(num_pools.shape[0] == 1,
+           "glm5_next_kpool_compress: num_pools must be a [1] DEVICE scalar — reading P "
+           "back to the host is the round trip this op family exists to remove");
+  VT_CHECK(packed.dtype == DType::kF32 && ape.dtype == DType::kF32 &&
+               pool_keys.dtype == DType::kF32,
+           "glm5_next_kpool_compress: packed/ape/pool_keys must be f32 — upstream scores "
+           "and pools in fp32 (:823, :960-964)");
+  VT_CHECK(pool_indices.dtype == DType::kI32 && pool_valid.dtype == DType::kI32 &&
+               num_pools.dtype == DType::kI32,
+           "glm5_next_kpool_compress: pool_indices/pool_valid/num_pools must be i32");
+  VT_CHECK(packed.IsContiguous() && ape.IsContiguous() && pool_keys.IsContiguous() &&
+               pool_indices.IsContiguous() && pool_valid.IsContiguous() &&
+               num_pools.IsContiguous(),
+           "glm5_next_kpool_compress: every operand must be contiguous");
+  VT_CHECK(packed.device == q.device && ape.device == q.device &&
+               pool_keys.device == q.device && pool_indices.device == q.device &&
+               pool_valid.device == q.device && num_pools.device == q.device,
+           "glm5_next_kpool_compress: device mismatch (operands/queue)");
+  reinterpret_cast<Glm5NextKpoolCompressFn>(
+      GetOp(OpId::kGlm5NextKpoolCompress, q.device.type))(q, pool_keys, pool_indices,
+                                                          pool_valid, num_pools, packed,
+                                                          ape);
+}
+
+void Glm5NextKpoolSelect(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                         const Tensor& q_states, const Tensor& head_weights,
+                         const Tensor& pool_keys, const Tensor& pool_indices,
+                         const Tensor& pool_valid, const Tensor& num_pools,
+                         const Tensor& valid_keys, const Tensor& q_mask,
+                         const Glm5NextKpoolSelectArgs& args) {
+  VT_CHECK(q_states.rank == 4,
+           "glm5_next_kpool_select: q_states must be rank-4 [batch, seq_len, "
+           "index_n_heads, index_head_dim]");
+  VT_CHECK(head_weights.rank == 3,
+           "glm5_next_kpool_select: head_weights must be rank-3 [batch, seq_len, "
+           "index_n_heads] — the weights_proj output BEFORE the n_heads ** -0.5 scale, "
+           "which this op applies (:827)");
+  VT_CHECK(pool_keys.rank == 3 && pool_indices.rank == 3 && pool_valid.rank == 2,
+           "glm5_next_kpool_select: the pooled candidate set must come from "
+           "vt::Glm5NextKpoolCompress unchanged");
+  VT_CHECK(num_pools.rank == 1 && num_pools.shape[0] == 1,
+           "glm5_next_kpool_select: num_pools must be the [1] DEVICE scalar the compress "
+           "op published");
+  VT_CHECK(valid_keys.rank == 2 && q_mask.rank == 2,
+           "glm5_next_kpool_select: valid_keys must be [batch, kv_len] and q_mask "
+           "[batch, seq_len]");
+  VT_CHECK(topk_indices.rank == 3 && index_scores.rank == 3,
+           "glm5_next_kpool_select: topk_indices/index_scores must be rank-3");
+  const int64_t batch = q_states.shape[0];
+  const int64_t seq_len = q_states.shape[1];
+  const int64_t n_heads = q_states.shape[2];
+  const int64_t head_dim = q_states.shape[3];
+  const int64_t np = pool_keys.shape[1];
+  const int64_t kpool = pool_indices.shape[2];
+  const int64_t kv_len = valid_keys.shape[1];
+  VT_CHECK(batch > 0 && seq_len > 0 && n_heads > 0 && head_dim > 0 && kv_len > 0,
+           "glm5_next_kpool_select: batch/seq_len/index_n_heads/index_head_dim/kv_len "
+           "must be > 0");
+  VT_CHECK(kpool >= 1, "glm5_next_kpool_select: index_kpool must be >= 1");
+  VT_CHECK(args.index_topk > 0, "glm5_next_kpool_select: index_topk must be > 0");
+  VT_CHECK(args.index_topk % kpool == 0,
+           "glm5_next_kpool_select: index_topk must be divisible by index_kpool — the "
+           "pool budget `index_topk // index_kpool` is exact upstream "
+           "(configuration_glm5_next.py:219-220)");
+  VT_CHECK(kv_len >= seq_len,
+           "glm5_next_kpool_select: kv_len must be at least seq_len — the current window "
+           "is always part of the key history it selects over");
+  VT_CHECK(args.current_length >= seq_len,
+           "glm5_next_kpool_select: current_length must be at least seq_len; the query at "
+           "step s sits at current_length - seq_len + s (:892)");
+  VT_CHECK(pool_keys.shape[0] == batch && pool_keys.shape[2] == head_dim,
+           "glm5_next_kpool_select: pool_keys must be [batch, np, index_head_dim]");
+  VT_CHECK(pool_indices.shape[0] == batch && pool_indices.shape[1] == np,
+           "glm5_next_kpool_select: pool_indices must be [batch, np, index_kpool]");
+  VT_CHECK(pool_valid.shape[0] == batch && pool_valid.shape[1] == np,
+           "glm5_next_kpool_select: pool_valid must be [batch, np]");
+  VT_CHECK(np == (kv_len + kpool - 1) / kpool,
+           "glm5_next_kpool_select: np must be ceil(kv_len / index_kpool), the same "
+           "static bound the compress op allocated against");
+  VT_CHECK(head_weights.shape[0] == batch && head_weights.shape[1] == seq_len &&
+               head_weights.shape[2] == n_heads,
+           "glm5_next_kpool_select: head_weights must be [batch, seq_len, index_n_heads]");
+  VT_CHECK(q_mask.shape[0] == batch && q_mask.shape[1] == seq_len,
+           "glm5_next_kpool_select: q_mask must be [batch, seq_len]");
+  VT_CHECK(valid_keys.shape[0] == batch,
+           "glm5_next_kpool_select: valid_keys must be [batch, kv_len]");
+  const int64_t out_w = args.index_topk + (args.always_select_tail ? kpool - 1 : 0);
+  VT_CHECK(topk_indices.shape[0] == batch && topk_indices.shape[1] == seq_len &&
+               topk_indices.shape[2] == out_w,
+           "glm5_next_kpool_select: topk_indices must be [batch, seq_len, index_topk + "
+           "index_kpool - 1] with the always-kept tail (:864-867) — 2051 and not 2048 on "
+           "the published checkpoint; sizing it 2048 truncates the tail the model always "
+           "keeps");
+  VT_CHECK(index_scores.shape[0] == batch && index_scores.shape[1] == seq_len &&
+               index_scores.shape[2] == np,
+           "glm5_next_kpool_select: index_scores must be [batch, seq_len, np]");
+  VT_CHECK(q_states.dtype == DType::kF32 && head_weights.dtype == DType::kF32 &&
+               pool_keys.dtype == DType::kF32 && index_scores.dtype == DType::kF32,
+           "glm5_next_kpool_select: q_states/head_weights/pool_keys/index_scores must be "
+           "f32");
+  VT_CHECK(pool_indices.dtype == DType::kI32 && pool_valid.dtype == DType::kI32 &&
+               num_pools.dtype == DType::kI32 && valid_keys.dtype == DType::kI32 &&
+               q_mask.dtype == DType::kI32 && topk_indices.dtype == DType::kI32,
+           "glm5_next_kpool_select: every integer operand must be i32");
+  VT_CHECK(q_states.IsContiguous() && head_weights.IsContiguous() &&
+               pool_keys.IsContiguous() && pool_indices.IsContiguous() &&
+               pool_valid.IsContiguous() && num_pools.IsContiguous() &&
+               valid_keys.IsContiguous() && q_mask.IsContiguous() &&
+               topk_indices.IsContiguous() && index_scores.IsContiguous(),
+           "glm5_next_kpool_select: every operand must be contiguous");
+  VT_CHECK(q_states.device == q.device && head_weights.device == q.device &&
+               pool_keys.device == q.device && pool_indices.device == q.device &&
+               pool_valid.device == q.device && num_pools.device == q.device &&
+               valid_keys.device == q.device && q_mask.device == q.device &&
+               topk_indices.device == q.device && index_scores.device == q.device,
+           "glm5_next_kpool_select: device mismatch (operands/queue)");
+  reinterpret_cast<Glm5NextKpoolSelectFn>(GetOp(OpId::kGlm5NextKpoolSelect,
+                                                q.device.type))(
+      q, topk_indices, index_scores, q_states, head_weights, pool_keys, pool_indices,
+      pool_valid, num_pools, valid_keys, q_mask, args);
 }
 
 void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
@@ -4718,8 +5029,9 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
                                                                               seeds);
 }
 
-void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, const Tensor& logits,
-                           const Tensor& draft_sampled, const Tensor& cu_num_logits) {
+void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, Tensor& target_argmax,
+                           const Tensor& logits, const Tensor& draft_sampled,
+                           const Tensor& cu_num_logits) {
   const int64_t num_logits = CheckSamplingLogits(q, logits, "greedy_rejection_sample");
   VT_CHECK(cu_num_logits.rank == 1 && cu_num_logits.shape[0] >= 1 &&
                cu_num_logits.dtype == DType::kI32 && cu_num_logits.IsContiguous() &&
@@ -4741,9 +5053,19 @@ void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, const
                num_sampled.device == q.device,
            "greedy_rejection_sample: num_sampled must be i32 [num_reqs] contiguous on the queue "
            "device");
+  // The per-row argmax scratch is the CALLER's buffer, for the lifetime reason
+  // spelled out beside the declaration (SPEC-DFLASH2 A2-2, #2802). It is checked
+  // exactly like the outputs, because it is one: the argmax kernel writes it and
+  // the accept kernel reads it, both after this call returns on a discrete
+  // backend.
+  VT_CHECK(target_argmax.rank == 1 && target_argmax.shape[0] == num_logits &&
+               target_argmax.dtype == DType::kI32 && target_argmax.IsContiguous() &&
+               target_argmax.device == q.device,
+           "greedy_rejection_sample: target_argmax must be i32 [num_logits] contiguous on the "
+           "queue device");
   if (num_reqs == 0) return;
   reinterpret_cast<GreedyRejectionSampleFn>(GetOp(OpId::kGreedyRejectionSample, q.device.type))(
-      q, sampled, num_sampled, logits, draft_sampled, cu_num_logits);
+      q, sampled, num_sampled, target_argmax, logits, draft_sampled, cu_num_logits);
 }
 
 namespace {
@@ -4922,8 +5244,21 @@ void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgat
            "attn_gate_split: gate_out must match q_out [T,Hq,Dh]");
   VT_CHECK(qgate.shape[0] == t && qgate.shape[1] == hq * 2 * dh,
            "attn_gate_split: qgate must be [T, Hq*2*Dh]");
-  VT_CHECK(q_out.dtype == DType::kF32 && gate_out.dtype == DType::kF32,
-           "attn_gate_split: q_out/gate_out must be f32");
+  // q_out is f32 OR bf16. bf16 is what vLLM's `torch.chunk` produces for a
+  // checkpoint whose model dtype is bf16 (qwen4_exp: qwen3_next.py:430 then :437
+  // hands `q` to q_norm unwidened), and an f32 destination there would move twice
+  // the bytes to hold values a bf16 qgate already rounded. f32 is Qwen3.5's, whose
+  // qk-norm/RoPE chain reads f32.
+  //
+  // gate_out is f32 and only f32: `vt::SigmoidGateBf16` — the only consumer of
+  // this operand — states an f32 gate on each of its four backends. Narrowing it
+  // is #2488's remaining half and is NOT admitted here, because a refusal that
+  // widened ahead of its consumer would move the failure from this call to a
+  // deeper one.
+  VT_CHECK(q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16,
+           "attn_gate_split: q_out must be f32 or bf16");
+  VT_CHECK(gate_out.dtype == DType::kF32,
+           "attn_gate_split: gate_out must be f32 (vt::SigmoidGateBf16 takes an f32 gate)");
   VT_CHECK(qgate.dtype == DType::kF32 || qgate.dtype == DType::kBF16,
            "attn_gate_split: qgate must be f32 or bf16 (bf16 = VT_BF16_GEMM_OUT q_proj)");
   VT_CHECK(q_out.IsContiguous() && gate_out.IsContiguous() && qgate.IsContiguous(),
@@ -5154,23 +5489,32 @@ void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const
               const Tensor& svh, Tensor& a_had, const Exl3GemmArgs& args) {
   VT_CHECK(args.bits >= 1 && args.bits <= 8,
            "exl3_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
-  // Codebook 0 (the original QTIP 3INST) and 1 (MCG) are both implemented; cb 2
-  // (upstream's `mul1` dp4a byte-sum variant) is not and refuses by name.
+  // ALL THREE CODEBOOKS UPSTREAM DEFINES: 0 (the original QTIP 3INST), 1 (MCG)
+  // and 2 (`mul1`). `decode_3inst<cb>` (`codebook.cuh:56-90`) has arms for those
+  // three and falls off the end for any other value, so a fourth is not an arm
+  // this tree has yet to port -- it does not exist.
   //
-  // The narrowing to MCG here was WRONG rather than merely conservative, and it
-  // was written when the only checkpoint in view was the SparkInfer DeepSeek-V4
-  // artifact, which ships an `mcg` marker. `LinearEXL3` derives the codebook
-  // from tensor PRESENCE (`exl3.py:74-77`), so every stock `turboderp/*-exl3`
-  // artifact -- shipping neither `mcg` nor `mul1` -- is cb 0, and cb 0 is
-  // therefore the COMMON case rather than an exotic one.
+  // The earlier narrowing to MCG here was WRONG rather than merely conservative,
+  // and it was written when the only checkpoint in view was the SparkInfer
+  // DeepSeek-V4 artifact, which ships an `mcg` marker. `LinearEXL3` derives the
+  // codebook from tensor PRESENCE (`exl3.py:74-77`), so every stock
+  // `turboderp/*-exl3` artifact -- shipping neither `mcg` nor `mul1` -- is cb 0,
+  // and cb 0 is therefore the COMMON case rather than an exotic one.
   //
-  // The DEVICE arm still refuses anything but cb 1 at its own launcher
-  // (`cuda_exl3.cu`), because it instantiates `kInstantiatedCb = 1` only. That
-  // refusal is correct and stays; this one was hiding it behind a wrong reason.
-  VT_CHECK(args.codebook == 0 || args.codebook == 1,
-           "exl3_gemm: codebook must be 0 (3INST) or 1 (mcg); codebook " +
+  // Cb 2 joined it for the same reason one step later:
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships a `mul1` marker on every quantized
+  // linear, so refusing cb 2 here refused that checkpoint whole
+  // (QUANT-EXL3-MUL1, #2495).
+  //
+  // THIS IS THE SEAM CHECK, NOT THE ARM CHECK, and the difference matters. The
+  // host arm decodes every (bits, codebook) pair; the DEVICE arm instantiates a
+  // named few and refuses the rest at its own launcher (`cuda_exl3.cu`), which
+  // is where an uninstantiated pair is caught. Widening this one does not widen
+  // that one.
+  VT_CHECK(args.codebook >= 0 && args.codebook <= 2,
+           "exl3_gemm: codebook must be 0 (3INST), 1 (mcg) or 2 (mul1); codebook " +
                std::to_string(args.codebook) +
-               " is an upstream arm this tree has not ported (QUANT-EXL3, #2181)");
+               " is not an arm upstream defines at all (QUANT-EXL3-MUL1, #2495)");
   VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_gemm: A and C must be rank-2");
   // `ldmatrix.sync.aligned.m8n8.x4.shared.b16` + `mma...f16.f16` read fp16
   // fragments (ptx.cuh:52-74,203-212), so A has no dtype freedom at all.

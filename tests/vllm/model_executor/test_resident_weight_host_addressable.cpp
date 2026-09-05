@@ -323,15 +323,24 @@ TEST_CASE("an i8mm-repacked weight reaching device residency is refused BY NAME"
   // interleave at load. Only the CPU `MatmulBTKernel` understands that layout;
   // the CUDA quant dot reads plain `block_q8_0`. Its sibling transform
   // `elem_kn_repack` has BOTH a CPU-platform gate in the loader policy and the
-  // refusal above — `quant_repack` had NEITHER. It rides `QuantRepackActive()`,
+  // refusal above — `quant_repack` had NEITHER. It rode `QuantRepackActive()`,
   // which probes the HOST CPU for Arm i8mm, so an aarch64 box doing
-  // `--device cuda` (which is precisely the target box) can repack a weight and
-  // then hand it to a kernel that misreads it. The result is wrong tokens, not a
-  // crash, and no gate in this tree could see it.
+  // `--device cuda` (which is precisely the target box) repacked a weight and
+  // then handed it to a kernel that misreads it. The result is wrong tokens, not
+  // a crash, and no gate in this tree could see it.
   //
-  // Harmless on the target checkpoint as measured — one Q8_0 tensor, 0.01% of
-  // parameters, and the instrumented load recorded `quant_repack = 0` — which is
-  // why this is a tripwire beside its sibling rather than a campaign.
+  // SINCE #2406 IT HAS BOTH. `GgufLoadPolicy::FromEnv` resolves the flag through
+  // `QuantRepackForDevice(..., dev)`, gated `dev == kCPU`. This case keeps its
+  // value either way, and gains one: it is the assertion that the refusal
+  // survives a policy built BY HAND, which is the path the loader gate cannot
+  // cover.
+  //
+  // AN EARLIER VERSION OF THIS COMMENT CALLED THE GAP HARMLESS on the target
+  // checkpoint — "one Q8_0 tensor, 0.01% of parameters, and the instrumented
+  // load recorded `quant_repack = 0`". The released UD-IQ1_S artifact stores 194
+  // Q8_0 hyper-connection weights (docs/USAGE.md), and one of them reached
+  // device residency and refused by name on `thor:gpu0`. The population was
+  // never one tensor.
   const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/9);
   w.repacked = true;

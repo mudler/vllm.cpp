@@ -138,7 +138,44 @@ done
 echo "mem_available_at_start_gib=$(mem_avail_gib)" >> "$OUT/PROVENANCE"
 
 say "=== [1] tools ==="
-apt-get install -y -qq ffmpeg python3-numpy > /root/apt.log 2>&1 || say "  apt returned non-zero; probing anyway"
+apt-get install -y -qq ffmpeg python3-numpy ccache > /root/apt.log 2>&1 || say "  apt returned non-zero; probing anyway"
+
+# CCACHE, AND SPECIFICALLY NOT WHERE THE USAGE SHEET PUTS IT (#2473).
+# `rc describe`'s host-wide sheet requires ccache for every C/C++/CUDA build here
+# and instructs `CCACHE_DIR=/workspace/ccache`. That instruction is wrong and it
+# is expensive: `/workspace` is CIFS mounted `nounix`, ccache 4.9.1 takes every
+# cache AND stats lock with symlink(2), and symlink(2) there returns EOPNOTSUPP.
+# Nothing is stored, no counter moves, and `ccache -s` reports zero hits, zero
+# misses and zero stores -- which reads as a launcher that never ran rather than
+# as a cache whose every write was refused. `rc` job 93a60151 configured all
+# three launchers and paid its 1404 s build in full under that reading.
+#
+# So CCACHE_DIR is LOCAL, and persistence comes from ccache's remote storage,
+# which may sit on the NAS because its `file` backend uses open plus rename and
+# takes no lock. Measured 18 s -> 5 s at 8/8 remote hits (`rc` job e4793984).
+# This script had no cache at all before, so it paid a cold build every lease.
+if command -v ccache >/dev/null; then
+  export CCACHE_DIR=${CCACHE_DIR:-/root/ccache}
+  mkdir -p "$CCACHE_DIR" 2>/dev/null
+  if ln -sf . "$CCACHE_DIR/.symlink-probe" 2>/dev/null; then
+    rm -f "$CCACHE_DIR/.symlink-probe"
+    export CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE:-file:/workspace/ccache-remote}
+    mkdir -p "${CCACHE_REMOTE_STORAGE#file:}" 2>/dev/null || true
+    export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-20G}
+    CCACHE_LAUNCHERS=(-DCMAKE_C_COMPILER_LAUNCHER=ccache
+                      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+                      -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
+    say "  ccache $(ccache --version | head -1 | awk '{print $3}') dir=$CCACHE_DIR remote=$CCACHE_REMOTE_STORAGE"
+  else
+    # A cache that cannot lock is worse than none: each refused acquisition costs
+    # a retry timeout. Drop the launchers rather than configure a slow no-op.
+    CCACHE_LAUNCHERS=()
+    say "  ccache DISABLED: $CCACHE_DIR cannot hold a symlink (#2473)"
+  fi
+else
+  CCACHE_LAUNCHERS=()
+  say "  ccache absent; this build is cold and stays cold"
+fi
 for t in ffmpeg python3 cmake ninja; do command -v "$t" >/dev/null || { echo "FATAL: no $t"; exit 38; }; done
 python3 -c 'import numpy' || { echo "FATAL: no numpy, and the comparison tool needs it"; exit 38; }
 
@@ -262,7 +299,8 @@ else
   # instead of rendering ungated.
   BUILT_FROM=in-lease
   cmake -S "$SRC" -B "$BLD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
-        -DVLLM_CPP_CUTLASS_DIR="$CUT" -DCUDAToolkit_ROOT="$TKLIB" > "$OUT/configure.log" 2>&1 \
+        -DVLLM_CPP_CUTLASS_DIR="$CUT" -DCUDAToolkit_ROOT="$TKLIB" \
+        "${CCACHE_LAUNCHERS[@]}" > "$OUT/configure.log" 2>&1 \
         || { echo "FATAL: configure failed"; tail -30 "$OUT/configure.log"; exit 33; }
   # NAMED TARGETS ONLY. A bare `ninja -C build` links every test binary and writes
   # 9.4 GiB, and the ENOSPC that follows makes checkers emit false refusals.

@@ -817,3 +817,67 @@ TEST_CASE("device pool: DBuf::Download from an EMPTY buffer is refused by name")
   // zero-byte copy that silently succeeded.
   CHECK(host == 1.0f);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2435 — the RANK BOUND on the glue's tensor writer.
+//
+// `dense_attn::MakeTensor` writes `t.shape[i]` and `t.stride[i]` for every `i`
+// below the shape's size, over two `int64_t[4]` arrays. It had no bound, so a
+// rank-5 shape wrote past both. `vt::Tensor::Contiguous` — the only other
+// writer of those arrays — has always had one; this is the parallel path
+// closing.
+//
+// WHY THIS CASE EXISTS WHEN A SANITIZER LANE ALREADY CATCHES IT. That lane
+// catches it by ABORTING: `-fno-sanitize-recover=all` kills the process at the
+// first finding, so `test_qwen4_exp_layer_loop` produced one UBSan report and
+// not one doctest assertion. A finding whose only witness is a lane that is
+// `continue-on-error` and that runs on two of a dozen jobs is a finding that
+// can come back unnoticed. This case is the one that fires everywhere.
+//
+// It asserts the REFUSAL and the boundary on both sides: rank 4 is still
+// served, rank 5 throws by name. A bound written as `<` instead of `<=` passes
+// the throw half and reds the serve half, which is the mutation that a
+// one-sided case would miss.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST_CASE("dense_attn::MakeTensor refuses a rank above vt::kMaxRank") {
+  TagBackend& a = NewBackend();
+  Queue qa = QueueOn(0);
+  std::vector<int64_t> host(2 * 3 * 4 * 5 * 6, 0);
+
+  // Rank 4 is the boundary and is SERVED — the shape, the strides and the
+  // element count all come out as they always did.
+  const vt::Tensor t4 = vllm::dense_attn::MakeTensor(
+      host.data(), DType::kI64, Device{DeviceType::kCPU, 0}, {2, 3, 4, 5});
+  CHECK(t4.rank == 4);
+  CHECK(t4.shape[0] == 2);
+  CHECK(t4.shape[3] == 5);
+  CHECK(t4.stride[0] == 60);
+  CHECK(t4.stride[3] == 1);
+  CHECK(t4.Numel() == 120);
+  // And the storage markers are untouched. `stride[4]` of a rank-5 write lands
+  // exactly here, so this is the assertion that separates "the arrays are the
+  // right size" from "nothing else moved".
+  CHECK(t4.repacked == false);
+  CHECK(t4.q8_0_aligned == false);
+  CHECK(t4.elem_kn_repacked == false);
+
+  // Rank 5 is refused BY NAME rather than written past the end.
+  CHECK_THROWS_WITH_AS(
+      vllm::dense_attn::MakeTensor(host.data(), DType::kI64,
+                                   Device{DeviceType::kCPU, 0}, {2, 3, 4, 5, 6}),
+      doctest::Contains("exceeds vt::Tensor's kMaxRank"), std::exception);
+
+  // The same bound through `DBuf`, which is how every rank-5 caller in this
+  // tree actually reached it: the refusal must arrive BEFORE the pool hands out
+  // a block, or a throw past the allocation leaks it.
+  CHECK_THROWS_WITH_AS(
+      DBuf(Dev{a, qa}, DType::kI64, std::vector<int64_t>{2, 3, 4, 5, 6}),
+      doctest::Contains("exceeds vt::Tensor's kMaxRank"), std::exception);
+  // AND THE BLOCK WAS NEVER DRAWN. `DBuf`'s constructor calls `pool_->Get`
+  // before `MakeTensor`, and a constructor that throws never runs its own
+  // destructor, so a refusal raised by `MakeTensor` alone would strand the
+  // allocation — trading an out-of-bounds write for a leak. This is the
+  // assertion that pins the check AHEAD of the pool, and it is what reds if the
+  // constructor's own `CheckRank` is removed while `MakeTensor` keeps its.
+  CHECK(a.allocs() == 0);
+}

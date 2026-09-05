@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "vllm/multimodal/mel_filter_bank.h"
+
 namespace vllm::multimodal {
 namespace {
 
@@ -24,85 +26,37 @@ constexpr double kEpsilon = 1e-5;
 // parakeet.py:135 / feature_extraction_parakeet.py:29 — 2**-24, the log guard.
 constexpr double kLogZeroGuard = 5.9604644775390625e-08;
 
-// np.linspace(start, stop, num): step = (stop-start)/(num-1), and the LAST
-// element is set to `stop` exactly.
-std::vector<double> Linspace(double start, double stop, int num) {
-  std::vector<double> out(static_cast<size_t>(num));
-  if (num == 1) {
-    out[0] = start;
-    return out;
-  }
-  const double step = (stop - start) / static_cast<double>(num - 1);
-  for (int i = 0; i < num; ++i) out[static_cast<size_t>(i)] = start + step * i;
-  out[static_cast<size_t>(num - 1)] = stop;
-  return out;
-}
-
 }  // namespace
 
-double ParakeetHertzToMelSlaney(double hertz) {
-  // audio_utils.py:285-296.
-  constexpr double kMinLogHertz = 1000.0;
-  constexpr double kMinLogMel = 15.0;
-  const double logstep = 27.0 / std::log(6.4);
-  if (hertz >= kMinLogHertz) {
-    return kMinLogMel + std::log(hertz / kMinLogHertz) * logstep;
-  }
-  return 3.0 * hertz / 200.0;
-}
+// ─── THE FILTERBANK MOVED TO A SHARED SEAM (dots3-note W7a, #2703) ──────────
+//
+// The construction that used to live here is now
+// `vllm::multimodal::MelFilterBankSlaney`
+// (include/vllm/multimodal/mel_filter_bank.h), because dots3-note's `dots`
+// speech encoder needs the SAME `mel_filter_bank(norm="slaney",
+// mel_scale="slaney")` at a different `(num_frequency_bins, num_mel_filters)`
+// and AGENTS.md forbids a parallel path. Every arithmetic line moved unchanged;
+// the only difference is that `min_frequency` and `max_frequency` became
+// arguments instead of the `0.0` and `sampling_rate / 2.0` this call still
+// passes. The three names below stay as Parakeet's own spelling so this file's
+// upstream anchors keep pointing at `parakeet.py` rather than at a shared
+// header, and so the two gated tolerances in
+// test_parakeet_audio_processor.cpp keep testing the names they were written
+// against.
+//
+// BYTE-IDENTICAL, not merely equivalent: `MelFilterBankSlaneyTransposed`
+// rounds once, on the same `static_cast<float>` this code always did, and then
+// only REORDERS the results. There is no second rounding for a transpose to
+// introduce.
+double ParakeetHertzToMelSlaney(double hertz) { return HertzToMelSlaney(hertz); }
 
-double ParakeetMelToHertzSlaney(double mels) {
-  // audio_utils.py:321-331.
-  constexpr double kMinLogHertz = 1000.0;
-  constexpr double kMinLogMel = 15.0;
-  const double logstep = std::log(6.4) / 27.0;
-  if (mels >= kMinLogMel) {
-    return kMinLogHertz * std::exp(logstep * (mels - kMinLogMel));
-  }
-  return 200.0 * mels / 3.0;
-}
+double ParakeetMelToHertzSlaney(double mels) { return MelToHertzSlaney(mels); }
 
 std::vector<float> ParakeetMelFilterBank(const ParakeetExtractorConfig& cfg) {
-  const int n_freq = cfg.num_freq_bins();
-  const int n_mels = cfg.feature_size;
-  if (n_freq < 2) throw std::runtime_error("parakeet mel: num_frequency_bins < 2");
-
-  // audio_utils.py:516-519 — the filter centres, equally spaced in mel space.
-  const double mel_min = ParakeetHertzToMelSlaney(0.0);
-  const double mel_max =
-      ParakeetHertzToMelSlaney(static_cast<double>(cfg.sampling_rate) / 2.0);
-  const std::vector<double> mel_freqs = Linspace(mel_min, mel_max, n_mels + 2);
-  std::vector<double> filter_freqs(mel_freqs.size());
-  for (size_t i = 0; i < mel_freqs.size(); ++i) {
-    filter_freqs[i] = ParakeetMelToHertzSlaney(mel_freqs[i]);
-  }
-  // :528 — `np.linspace(0, sampling_rate // 2, num_frequency_bins)`, so the top
-  // is the INTEGER-divided Nyquist.
-  const std::vector<double> fft_freqs =
-      Linspace(0.0, static_cast<double>(cfg.sampling_rate / 2), n_freq);
-
-  // :371-375 `_create_triangular_filter_bank`, then :532-535 the slaney area
-  // normalisation. Emitted transposed to [n_mels, n_freq].
-  std::vector<float> out(static_cast<size_t>(n_mels) * n_freq, 0.0f);
-  for (int m = 0; m < n_mels; ++m) {
-    const double diff_lo = filter_freqs[static_cast<size_t>(m) + 1] -
-                           filter_freqs[static_cast<size_t>(m)];
-    const double diff_hi = filter_freqs[static_cast<size_t>(m) + 2] -
-                           filter_freqs[static_cast<size_t>(m) + 1];
-    const double enorm = 2.0 / (filter_freqs[static_cast<size_t>(m) + 2] -
-                                filter_freqs[static_cast<size_t>(m)]);
-    for (int k = 0; k < n_freq; ++k) {
-      const double down =
-          -(filter_freqs[static_cast<size_t>(m)] - fft_freqs[static_cast<size_t>(k)]) /
-          diff_lo;
-      const double up =
-          (filter_freqs[static_cast<size_t>(m) + 2] - fft_freqs[static_cast<size_t>(k)]) /
-          diff_hi;
-      const double tri = std::max(0.0, std::min(down, up));
-      out[static_cast<size_t>(m) * n_freq + k] = static_cast<float>(tri * enorm);
-    }
-  }
-  return out;
+  // parakeet.py:159-167 — `min_frequency=0.0`, `max_frequency=sr/2`.
+  return MelFilterBankSlaneyTransposed(
+      cfg.num_freq_bins(), cfg.feature_size, 0.0,
+      static_cast<double>(cfg.sampling_rate) / 2.0, cfg.sampling_rate);
 }
 
 ParakeetAudioProcessor::ParakeetAudioProcessor(ParakeetExtractorConfig cfg)

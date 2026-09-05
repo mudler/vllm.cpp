@@ -9,9 +9,12 @@
 // first real family (IndexTTS-2.5) arrives with W3-W5; until then a load must
 // REFUSE and say what is missing, because an arm that is silently absent is the
 // failure this project has already recorded.
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -34,7 +37,7 @@ class FakeEngine final : public SpeechEngine {
   std::string family() const override { return family_; }
   int64_t sample_rate() const override { return 22050; }
   bool requires_reference_audio() const override { return true; }
-  SpeechResult Synthesize(const SpeechGenParams& params) override {
+  SpeechResult SynthesizeLocked(const SpeechGenParams& params) override {
     if (params.reference_audio.empty()) {
       throw std::runtime_error("fake-tts: reference audio is required");
     }
@@ -257,4 +260,103 @@ TEST_CASE("speech: device 1 on a build with no accelerator is refused, never sub
                       std::runtime_error);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// The serialisation contract (#2836, SERVE-SPEECH-ENGINE-SERIALIZE)
+//
+// `speech_engine.h` states of `Synthesize`: "Implementations serialize
+// internally (staged weights are shared state)". Until this row that sentence
+// was a comment on a pure virtual, so nothing held an implementation to it, and
+// neither shipped family did it -- `minimax_music3_speech.cpp` and
+// `indextts2.cpp` both contain zero `mutex`, `lock_guard`, `unique_lock` and
+// `scoped_lock` occurrences. Meanwhile `POST /v1/audio/speech` runs the
+// synthesizer INLINE on a cpp-httplib worker thread and that pool is twelve
+// threads on a stock server, so the contract was violated on the default
+// configuration rather than in a corner.
+//
+// The probe below measures the contract instead of restating it: it records how
+// DEEP the seam ever got, and the only value that satisfies "serialize" is one.
+//
+// TWO COUNTERS, ON PURPOSE. `depth_` is atomic, so the overlap assertion is
+// deterministic -- the sleep inside the critical section makes the window real
+// rather than hoped for. `unguarded_` is a PLAIN int, and it is the detector for
+// the half an overlap counter cannot see: it stands in for the unguarded tables
+// the real families touch inside a run (`music3_profile.h`'s buckets, which that
+// header calls "SINGLE-THREADED BY CONTRACT"), and it is what makes this case
+// fail under `VLLM_CPP_SANITIZE=thread`. #2712 measured why that matters: its
+// plain concurrent test passed every race assertion in all 24 rounds and failed
+// only a retire count, so a green non-sanitized run is not coverage for this
+// class of defect.
+namespace {
+
+class ConcurrencyProbeEngine final : public SpeechEngine {
+ public:
+  std::string family() const override { return "concurrency-probe"; }
+  int64_t sample_rate() const override { return 22050; }
+  bool requires_reference_audio() const override { return false; }
+
+  int max_depth() const { return max_depth_.load(); }
+  int calls() const { return calls_.load(); }
+  int unguarded() const { return unguarded_; }
+
+ protected:
+  SpeechResult SynthesizeLocked(const SpeechGenParams&) override {
+    const int depth = depth_.fetch_add(1) + 1;
+    int seen = max_depth_.load();
+    while (depth > seen && !max_depth_.compare_exchange_weak(seen, depth)) {
+    }
+    // Wide enough that four threads dispatched together are inside at once when
+    // the seam does not serialise. A real synthesis is minutes long, so this
+    // understates the window rather than manufacturing one.
+    ++unguarded_;
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    ++unguarded_;
+    calls_.fetch_add(1);
+    depth_.fetch_sub(1);
+    SpeechResult r;
+    r.sample_rate = 22050;
+    r.samples.assign(4, 0.5F);
+    return r;
+  }
+
+ private:
+  std::atomic<int> depth_{0};
+  std::atomic<int> max_depth_{0};
+  std::atomic<int> calls_{0};
+  // Deliberately NOT atomic. See the comment above the class.
+  int unguarded_ = 0;
+};
+
+}  // namespace
+
+TEST_CASE("speech engine: the seam serializes Synthesize across threads") {
+  constexpr int kThreads = 4;
+  ConcurrencyProbeEngine engine;
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  std::atomic<int> ready{0};
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&engine, &ready] {
+      // Release them together, so the overlap is a property of the seam and not
+      // of how fast each thread happened to start.
+      ready.fetch_add(1);
+      while (ready.load() < kThreads) std::this_thread::yield();
+      SpeechGenParams params;
+      params.text = "hello";
+      const SpeechResult r = engine.Synthesize(params);
+      CHECK(r.samples.size() == 4);
+    });
+  }
+  for (std::thread& t : threads) t.join();
+
+  CHECK(engine.calls() == kThreads);
+  // THE ASSERTION. One is what "serialize internally" means; anything above it
+  // is two host threads inside one engine's staged weights, one `vt::Queue` and
+  // one profile table.
+  CHECK(engine.max_depth() == 1);
+  // Only reachable without tearing when the increments are ordered. This is the
+  // assertion the sanitized lane reports as a data race on the unrepaired seam.
+  CHECK(engine.unguarded() == 2 * kThreads);
 }

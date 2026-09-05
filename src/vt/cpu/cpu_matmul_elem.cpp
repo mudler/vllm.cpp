@@ -6,6 +6,7 @@
 #include "vt/cpu/cpu_isa_arm.h"
 #include "vt/cpu/cpu_isa_x86.h"
 #include "vt/quant.h"
+#include "vt/unaligned.h"
 #include <vector>
 
 #include <cstdlib>
@@ -85,6 +86,7 @@ void Nk16Portable(const float* af, const void* bv, int64_t k, int64_t n, float* 
 // amortize without any transpose: the 16-wide weight load per p is shared by
 // every activation row. Accumulation order per output is unchanged.
 constexpr int kMrNkPortable = 4;
+static_assert(kMrNkPortable <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void NkM4Portable(const float* af, int64_t a_stride, const void* bv, int64_t k,
@@ -190,6 +192,7 @@ void Bt16Neon(const float* af, const void* bv, int64_t k, float* acc) {
 // transpose. 16 accumulator vectors + 4 weight vectors + the broadcast row
 // values fit AArch64's 32 SIMD registers.
 constexpr int kMrNeon = 4;
+static_assert(kMrNeon <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void BtM4Neon(const float* af, int64_t a_stride, const void* bv, int64_t k, float* acc) {
@@ -334,6 +337,7 @@ void Bt16Sse2(const float* af, const void* bv, int64_t k, float* acc) {
 // registers, so 2 rows x 4 groups of accumulators plus the 4 transposed weight
 // vectors is what fits without spilling.
 constexpr int kMrSse2 = 2;
+static_assert(kMrSse2 <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void BtM2Sse2(const float* af, int64_t a_stride, const void* bv, int64_t k, float* acc) {
@@ -559,19 +563,59 @@ bool ElemGemmUseRef() {
   return v;
 }
 
+// `src` MAY BE ODD, and on the model path it routinely is. A safetensors
+// payload starts at `8 + <JSON header length>` (`safetensors_reader.cpp:78`)
+// and a header length is arbitrary, so a 16-bit weight begins on an odd byte in
+// roughly half of all checkpoints. `BorrowStTensorBytes` then hands those bytes
+// to the kernel verbatim, which is the whole point of direct upload. Forming a
+// `const uint16_t*` over that address is undefined even where x86 executes the
+// load, and `-fsanitize=alignment` aborts on it: the bf16 RMSNorm gamma of
+// `dots3_note` and `muse_glimmer` reached here at an odd address and took the
+// `sanitize-cpu` lane down (#2540).
+//
+// The byte cursor plus `vt::LoadUnaligned` is the shape `vt::cpu::LoadF32`
+// (cpu_ops.cpp:32) and `cpu_layernorm.cpp:47` already use, and it is free: at
+// `-O2` it compiles to the same `movzwl (%rdi,%rax,2)` the raw cast did, with
+// no `memcpy` call emitted (measured for `FIX-UNALIGNED-LOADERS-772`). Fixing
+// the CONSUMER rather than refusing the borrow is deliberate — a producer-side
+// alignment gate would switch direct upload off for every tensor in half of all
+// checkpoints. See `.agents/specs/unaligned-safetensors-consumers.md`.
+//
+// The kF32 arm already read its bytes through `std::memcpy` and is unchanged.
 void WidenRowToF32(DType dt, const void* src, int64_t n, float* dst) {
+  const auto* bytes = static_cast<const unsigned char*>(src);
   switch (dt) {
     case DType::kF32:
       std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
       break;
     case DType::kF16: {
-      const uint16_t* s = static_cast<const uint16_t*>(src);
-      for (int64_t i = 0; i < n; ++i) dst[i] = F16ToF32(s[i]);
+      for (int64_t i = 0; i < n; ++i)
+        dst[i] = F16ToF32(LoadUnaligned<uint16_t>(bytes + i * 2));
       break;
     }
     case DType::kBF16: {
-      const uint16_t* s = static_cast<const uint16_t*>(src);
-      for (int64_t i = 0; i < n; ++i) dst[i] = BF16ToF32(s[i]);
+      for (int64_t i = 0; i < n; ++i)
+        dst[i] = BF16ToF32(LoadUnaligned<uint16_t>(bytes + i * 2));
+      break;
+    }
+    default:
+      VT_CHECK(false, "matmul: unsupported elementwise dtype");
+  }
+}
+
+void NarrowRowFromF32(DType dt, void* dst, int64_t n, const float* src) {
+  switch (dt) {
+    case DType::kF32:
+      std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
+      break;
+    case DType::kF16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      for (int64_t i = 0; i < n; ++i) d[i] = F32ToF16(src[i]);
+      break;
+    }
+    case DType::kBF16: {
+      uint16_t* d = static_cast<uint16_t*>(dst);
+      for (int64_t i = 0; i < n; ++i) d[i] = F32ToBF16(src[i]);
       break;
     }
     default:

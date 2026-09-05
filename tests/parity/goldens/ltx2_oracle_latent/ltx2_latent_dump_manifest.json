@@ -1,0 +1,94 @@
+{
+  "issue": 2514,
+  "row": "LTX25-ADHERENCE-BISECT",
+  "oracle": "ltx-2",
+  "identity": {
+    "revision": "fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca",
+    "worktree_dirty": false,
+    "module_origins": {
+      "ltx_core": "/tmp/ltx2-bisect/LTX-2/packages/ltx-core/src/ltx_core/__init__.py",
+      "ltx_pipelines": "/tmp/ltx2-bisect/LTX-2/packages/ltx-pipelines/src/ltx_pipelines/__init__.py"
+    }
+  },
+  "request": {
+    "prompt": "A red fox walks slowly through a snowy pine forest at sunrise, cinematic.",
+    "height": 192,
+    "width": 320,
+    "num_frames": 25,
+    "num_inference_steps": 8,
+    "seed": 42,
+    "offload": "cpu",
+    "device": "cuda"
+  },
+  "latents": {
+    "video": {
+      "shape": [
+        1,
+        128,
+        4,
+        6,
+        10
+      ],
+      "torch_dtype": "torch.bfloat16",
+      "itemsize": 2,
+      "expected_bytes": 61440,
+      "raw_native": {
+        "path": "/workspace/ltx25-adherence-bisect/out/20260901T234409Z/video_latent_bfloat16.raw",
+        "bytes": 61440,
+        "sha256": "db94e2a0836e745382689020c0c41b29b2a66ce727a2886a3218e9681a0acab5"
+      },
+      "npy_f32": {
+        "path": "/workspace/ltx25-adherence-bisect/out/20260901T234409Z/video_latent_f32.npy",
+        "bytes": 123008,
+        "sha256": "297bd4083c45a073f3db5e9d70471cd4a2fc96cec35e2f040bee1a8e1c71c3ef"
+      },
+      "stats_f32": {
+        "min": -3.296875,
+        "max": 3.484375,
+        "mean": 0.01505329366773367,
+        "std": 0.8016337156295776,
+        "abs_sum": 19540.9453125
+      }
+    },
+    "audio": {
+      "shape": [
+        1,
+        8,
+        26,
+        16
+      ],
+      "torch_dtype": "torch.bfloat16",
+      "itemsize": 2,
+      "expected_bytes": 6656,
+      "raw_native": {
+        "path": "/workspace/ltx25-adherence-bisect/out/20260901T234409Z/audio_latent_bfloat16.raw",
+        "bytes": 6656,
+        "sha256": "65aea856a57e31e61a6b77e65c9b9018943c9f9f62c48bbf1be101436fc2f4c4"
+      },
+      "npy_f32": {
+        "path": "/workspace/ltx25-adherence-bisect/out/20260901T234409Z/audio_latent_f32.npy",
+        "bytes": 13440,
+        "sha256": "f4a852b2b10b3761af4957f1841b4be86e90e21bcde9c9f5b841bbc38daa2b64"
+      },
+      "stats_f32": {
+        "min": -6.53125,
+        "max": 3.984375,
+        "mean": -0.3939552307128906,
+        "std": 1.5636018514633179,
+        "abs_sum": 4428.931640625
+      }
+    }
+  },
+  "frame_control": {
+    "committed_entries": 28,
+    "committed_frames": 25,
+    "frames_decoded": 25,
+    "frames_observed": 25,
+    "matched": 25,
+    "ok": true,
+    "mismatches": []
+  },
+  "render_seconds": 75.9,
+  "total_seconds": 83.9,
+  "generated_by": "tools/oracle/ltx2_latent_dump.py"
+}

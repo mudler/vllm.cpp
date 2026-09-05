@@ -312,7 +312,24 @@ evidence here.
 | Draft, GGUF — DRAFTS | `z-lab/Qwen3.8-27B-DFlash2-GGUF` @ `57ab3265056d4024870b0621cfc2c127537020ed` | `Qwen3.8-27B-DFlash2-BF16.gguf` | 3 860 293 152 | `26af33a15b21475d668e4ee55639beea49932e7360b1144c6282721bcd127c14` |
 | Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
 | Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
+| Draft, EXL3 safetensors — LOADS | `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` @ `4f0436269bca761b071f05319e8e04a87cc633f9` | `model.safetensors` | 1 470 916 078 | `6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56` |
 | Target the draft heads | `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | published shards | — | — |
+
+**The EXL3 draft row says LOADS and not DRAFTS, and the difference is exact.**
+That file was read by `vllm::LoadQwen3DFlash`, the function
+`--speculative-config` reaches, and all 36 of its quantized modules came back at
+bits 5 with the `mul1` codebook and the geometry its `config.json` declares
+([#2495](https://github.com/mudler/vllm.cpp/issues/2495) item 7,
+[spec](../.agents/specs/model-dflash2-exl3.md)). No generation against a real
+target has been run with it and no throughput number is claimed. Its published
+partner target, `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`, stores an EXL3 `lm_head`
+that `SharedHeadSource::LoadInto` does not yet read — items 5 and 6 of the same
+issue — so today this draft has to be paired with a target whose head this
+engine already reads. That target also carries 137 modules at 3 bpw, and `(3, 2)`
+is not in the CUDA instantiation list, so the published pair cannot run on a CUDA
+queue at all ([#2574](https://github.com/mudler/vllm.cpp/issues/2574)). This
+draft's own 36 modules are bits 5, which is instantiated; it is the target half
+that refuses.
 
 A repo id alone is not a pin, because checkpoints get re-quantized in place
 under an unchanged name. The revisions above are what these results describe.

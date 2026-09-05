@@ -532,6 +532,28 @@ into this row is clean. While it stood, this branch could not take `main`, so
 real merge base instead of left silent. Against the merged tree all three now
 run normally and report OK.
 
+### The final preflight's one red is a LOAD FLAKE, re-run serially and green
+
+`agent-preflight.sh --fail-on-skip` on the landing head reports every gate `ok`
+except `test_cpu_x86_llamacpp_floor`, which failed
+`test_a_contended_leg_is_discarded_and_never_summarised` with `4 != 2`. Its own
+captured output names the cause: `load=40.06 36.53 26.73` and
+`waiting for quiet: 15s busy=108%` on a 20-core box. The case forces a synthetic
+discard path and asserts rc=2, and a genuinely contended box routes through the
+harness's quiet-wait refusal (rc=4) first.
+
+**Attributed before it was dismissed, two ways.** The test
+`tests/scripts/test_cpu_x86_llamacpp_floor.py` and the harness it drives
+`scripts/cpu-x86-llamacpp-floor.sh` are BYTE-IDENTICAL to `origin/main`
+(sha256 `a43d7049…` and `16f13e8a…` on both), so no byte this row changed is
+under test. And re-run serially, as
+[`verification.md`](../verification.md) requires before calling a starved test a
+regression, it passes **10 of 10, rc=0**, at load 34 against the 48 the preflight
+run saw.
+
+Recorded rather than waved away because the flake is real and load-dependent, and
+the next reader of a red preflight on this branch should not spend a cycle on it.
+
 ### `check-pr-size.py` was red on this branch, base-caused -- also RETIRED
 
 ```text

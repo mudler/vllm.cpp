@@ -1,0 +1,285 @@
+
+===== 0. identity =====
+2026-09-03T10:03:23Z
+hostname=rc-worker-lcjhd
+boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+RC_JOB_ID=5dfdcc50-2220-4649-b5a1-99f20dd547de RC_DEVICE=strix:gpu0
+HSA_OVERRIDE_GFX_VERSION=UNSET  <- must be UNSET
+inherited_env NONE
+               total        used        free      shared  buff/cache   available
+Mem:              62           3           7           0          51          58
+overlay         1.9T  561G  1.2T  32% /
+
+===== 1. the ROCm userspace in this container, and the device =====
+2026-09-03T10:03:23Z
+rocm_info_version 7.2.4
+/opt/rocm-7.2.4
+  Name:                    AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  Uuid:                    CPU-XX                             
+  Marketing Name:          AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  Vendor Name:             CPU                                
+  Compute Unit:            32                                 
+  Name:                    gfx1151                            
+  Uuid:                    GPU-XX                             
+  Marketing Name:          AMD Radeon Graphics                
+  Vendor Name:             AMD                                
+  Compute Unit:            40                                 
+      Name:                    amdgcn-amd-amdhsa--gfx1151         
+      Name:                    amdgcn-amd-amdhsa--gfx11-generic   
+  Name:                    aie2p                              
+  Uuid:                    AIE-XX                             
+  Marketing Name:          RyzenAI-npu5                       
+  Vendor Name:             AMD                                
+  Compute Unit:            0                                  
+-- rocminfo agent gfx targets (verbatim) --
+      2 gfx1151
+
+===== 2. THE INDEX, read with a regex that is proven to match =====
+2026-09-03T10:03:23Z
+local_python_tag=cp312
+INDEX rocm7.2 http=200 bytes=37268 cp312_manylinux_2_28_x86_64: 2.11.0+rocm7.2 2.12.0+rocm7.2 2.12.1+rocm7.2 2.13.0+rocm7.2 2.14.0+rocm7.2 
+INDEX rocm7.1 http=200 bytes=36778 cp312_manylinux_2_28_x86_64: 2.10.0+rocm7.1 2.11.0+rocm7.1 2.12.0+rocm7.1 2.12.1+rocm7.1 2.13.0+rocm7.1 
+INDEX rocm7.0 http=200 bytes=29159 cp312_manylinux_2_28_x86_64: 2.10.0+rocm7.0 
+INDEX rocm6.4 http=200 bytes=35109 cp312_manylinux_2_28_x86_64: 2.8.0+rocm6.4 2.9.0+rocm6.4 2.9.1+rocm6.4 
+INSTRUMENT_CHECK positive_control=FOUND torch-2.13.0+rocm7.2
+INSTRUMENT_CHECK negative_control=absent (the grep discriminates)
+
+===== 3. install torch 2.13.0+rocm7.2 -- the exact version vLLM CMakeLists.txt:72 names =====
+2026-09-03T10:03:24Z
+Looking in indexes: https://download.pytorch.org/whl/rocm7.2
+Collecting torch==2.13.0+rocm7.2
+  Downloading torch-2.13.0%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl (6227.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.2/6.2 GB 18.1 MB/s  0:04:08
+Collecting filelock (from torch==2.13.0+rocm7.2)
+  Downloading filelock-3.32.3-py3-none-any.whl.metadata (2.0 kB)
+Collecting typing-extensions>=4.10.0 (from torch==2.13.0+rocm7.2)
+  Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+Requirement already satisfied: setuptools>=77.0.3 in ./tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages (from torch==2.13.0+rocm7.2) (84.0.0)
+Collecting sympy>=1.13.3 (from torch==2.13.0+rocm7.2)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch==2.13.0+rocm7.2)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch==2.13.0+rocm7.2)
+  Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch==2.13.0+rocm7.2)
+  Downloading fsspec-2026.7.0-py3-none-any.whl.metadata (10 kB)
+Collecting triton-rocm==3.7.1 (from torch==2.13.0+rocm7.2)
+  Downloading triton_rocm-3.7.1-cp312-cp312-linux_x86_64.whl.metadata (1.7 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch==2.13.0+rocm7.2)
+  Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.13.0+rocm7.2)
+  Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Downloading triton_rocm-3.7.1-cp312-cp312-linux_x86_64.whl (311.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 311.7/311.7 MB 21.6 MB/s  0:00:14
+Downloading fsspec-2026.7.0-py3-none-any.whl (206 kB)
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 5.3 MB/s  0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 7.5 MB/s  0:00:00
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 10.0 MB/s  0:00:00
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+Downloading filelock-3.32.3-py3-none-any.whl (98 kB)
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Installing collected packages: mpmath, typing-extensions, triton-rocm, sympy, networkx, MarkupSafe, fsspec, filelock, jinja2, torch
+
+Successfully installed MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 sympy-1.14.0 torch-2.13.0+rocm7.2 triton-rocm-3.7.1 typing-extensions-4.16.0
+pip_install_rc=0   (read from the program, not through a pipe)
+Name: torch
+Version: 2.13.0+rocm7.2
+Summary: Tensors and Dynamic neural networks in Python with strong GPU acceleration
+Home-page: https://pytorch.org
+Author: 
+Author-email: PyTorch Team <packages@pytorch.org>
+ERROR: Pipe to stdout was broken
+
+===== 4. THE MEASUREMENT: gfx targets in the installed libtorch_hip.so =====
+2026-09-03T10:08:34Z
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch_lib=/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib
+drwxr-xr-x  3 root root       4096 Sep  3 10:08 hipblaslt
+-rwxr-xr-x  1 root root   26758833 Sep  3 10:08 libamdhip64.so
+-rwxr-xr-x  1 root root     886625 Sep  3 10:08 libhipblas.so
+-rwxr-xr-x  1 root root    9309209 Sep  3 10:08 libhipblaslt.so
+-rwxr-xr-x  1 root root     718536 Sep  3 10:08 libhsa-amd-aqlprofile64.so
+-rwxr-xr-x  1 root root    4230361 Sep  3 10:08 libhsa-runtime64.so
+-rwxr-xr-x  1 root root  659768953 Sep  3 10:08 libtorch_hip.so
+1c4555561a3771a068179f7460a77a29f1f72af00828515f5f6103888ce4da75  /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so
+libtorch_hip.so bytes=659768953
+
+--- llvm-objdump --offloading (VERBATIM) ---
+
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so:	file format elf64-x86-64
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1030
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1100
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1101
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1102
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1103
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1150
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1151
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1200
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx1201
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx900
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx906
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx908
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx90a
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx942
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.0.hipv4-amdgcn-amd-amdhsa--gfx950
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1030
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1100
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1101
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1102
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1103
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1150
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1151
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1200
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx1201
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx900
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx906
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx908
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx90a
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx942
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.1.hipv4-amdgcn-amd-amdhsa--gfx950
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1030
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1100
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1101
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1102
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1103
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1150
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1151
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1200
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx1201
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx900
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx906
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx908
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx90a
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx942
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.2.hipv4-amdgcn-amd-amdhsa--gfx950
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1030
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1100
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1101
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1102
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1103
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1150
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1151
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1200
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx1201
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx900
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx906
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx908
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx90a
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx942
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.3.hipv4-amdgcn-amd-amdhsa--gfx950
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.host-x86_64-unknown-linux-gnu-
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1030
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1100
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1101
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1102
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1103
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1150
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1151
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1200
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx1201
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx900
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx906
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx908
+Extracting offload bundle: /tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/lib/libtorch_hip.so.4.hipv4-amdgcn-amd-amdhsa--gfx90a
+objdump_rc=141
+
+--- roc-obj-ls (VERBATIM) ---
+Warning:  This tool has been DEPRECATED. Similar functionality is provided by llvm-objdump in the rocm-llvm package.
+rocobjls_rc=0
+
+--- clang-offload-bundler --list (VERBATIM) ---
+cob_rc=0
+
+--- cross-check only (weakest instrument): gfx strings in the .so ---
+   5549 gfx950
+    471 gfx942
+      5 gfx906
+      4 gfx1100
+      3 gfx908
+      3 gfx1101
+      2 gfx900
+      2 gfx1250
+      2 gfx1201
+      2 gfx1200
+      2 gfx1102
+      1 gfx942:sramecc+:xnack-
+      1 gfx803
+      1 gfx1153
+      1 gfx1152
+      1 gfx1151
+      1 gfx1150
+      1 gfx1103
+      1 gfx1030
+GFX1151_IN_LIBTORCH_HIP=1
+
+===== 5. what the torch build says about ITSELF, by execution =====
+2026-09-03T10:08:46Z
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch.__version__          = 2.13.0+rocm7.2
+torch.version.hip          = 7.2.53211
+torch.version.cuda         = None
+torch.cuda.get_arch_list() = ['gfx900', 'gfx906', 'gfx908', 'gfx90a', 'gfx942', 'gfx1030', 'gfx1100', 'gfx1101', 'gfx1102', 'gfx1103', 'gfx1200', 'gfx1201', 'gfx950', 'gfx1150', 'gfx1151']
+torch.cuda.is_available()  = True
+device_count               = 1
+device[0] name='AMD Radeon 8060S' gcnArchName='gfx1151' total_memory=68719476736 CUs=20
+self_report_rc=0
+
+===== 6. DOES IT COMPUTE? real kernels on the real device =====
+2026-09-03T10:08:48Z
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+SMOKE_MATMUL    torch.float32 1024^3 max_rel_err = 1.303e-06
+SMOKE_MATMUL    torch.float16 1024^3 max_rel_err = 3.727e-04
+SMOKE_MATMUL   torch.bfloat16 1024^3 max_rel_err = 2.984e-03
+SMOKE_SOFTMAX sum = 1.0
+SMOKE_SDPA       = 0.7279645204544067
+MEM free=68270686208 total=68719476736
+SMOKE=PASS
+smoke_rc=0
+
+===== 7. Triton: vLLM's RDNA paths on this board are Triton kernels =====
+2026-09-03T10:08:50Z
+/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Traceback (most recent call last):
+  File "/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 462, in __init__
+    self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
+                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/inspect.py", line 1260, in getsourcelines
+    lines, lnum = findsource(object)
+                  ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/inspect.py", line 1089, in findsource
+    raise OSError('could not get source code')
+OSError: could not get source code
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+  File "/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 970, in jit
+    return decorator(fn)
+           ^^^^^^^^^^^^^
+  File "/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 958, in decorator
+    return JITFunction(
+           ^^^^^^^^^^^^
+  File "/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 773, in __init__
+    super().__init__(fn)
+  File "/tmp/vllm-gfx1151-2740/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 464, in __init__
+    raise ValueError("@jit functions should be defined in a Python file") from e
+ValueError: @jit functions should be defined in a Python file
+triton.__version__ = 3.7.1
+TRITON_JIT_ON_GFX1151 = FAIL ValueError
+triton_rc=0
+
+===== 8. done =====
+2026-09-03T10:08:51Z

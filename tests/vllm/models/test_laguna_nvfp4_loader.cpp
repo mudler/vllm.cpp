@@ -19,6 +19,9 @@
 #include "doctest/doctest.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/laguna.h"
+#include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits carrier
+#include "vllm/v1/attention/backend.h"
 
 namespace vllm {
 void StageLagunaGraphEmbedding(const OwnedTensor& embed, int32_t token,
@@ -205,13 +208,23 @@ uint16_t Bf16Bits(float v) {
   std::memcpy(&bits, &v, 4);
   return static_cast<uint16_t>(bits >> 16);  // truncate f32 -> bf16 (finite in, finite out)
 }
-// BF16 tensor with small deterministic values in [-0.08, 0.07].
+// BF16 tensor with small deterministic values in [-0.06, 0.06].
+//
+// #2834: the period of this sequence MUST NOT divide the row stride of the
+// tensors it fills. It was 16, and `model.embed_tokens.weight` and
+// `lm_head.weight` are both `[V,H] = [8,32]`, so a row advanced the sequence by
+// `32*7 = 224 == 0 (mod 16)` and every row came out byte-identical to every
+// other row. The forward then returned one constant for all 24 logits, and no
+// gate on this fixture could see a token id, a position, a causal mask or an
+// embedding gather. 13 is coprime with 7 and with the strides here: a row
+// advances the phase by `224 == 3 (mod 13)`, so the eight vocabulary rows take
+// eight distinct phases. The case at the foot of this file holds that.
 Fx Bf16Finite(const std::string& n, std::vector<int64_t> shape, int seed) {
   int64_t ne = 1;
   for (int64_t d : shape) ne *= d;
   std::string s(static_cast<size_t>(ne) * 2, '\0');
   for (int64_t i = 0; i < ne; ++i) {
-    const float v = static_cast<float>(((i * 7 + seed) % 16) - 8) * 0.01F;
+    const float v = static_cast<float>(((i * 7 + seed) % 13) - 6) * 0.01F;
     const uint16_t bf = Bf16Bits(v);
     std::memcpy(&s[static_cast<size_t>(i) * 2], &bf, 2);
   }
@@ -431,4 +444,224 @@ TEST_CASE("laguna nvfp4 forward: fp4 MoE branch runs finite + deterministic (CPU
   for (size_t i = 0; i < out1.size(); ++i)
     if (out1[i] != out3[i]) { differs = true; break; }
   CHECK(differs);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2618 — the REGISTRY step. Everything above enters `LagunaForwardGguf` by
+// name; nothing above proves that the PRODUCTION entry point reaches it. It did
+// not: `ForwardLagunaForCausalLM` sent both of its branches to
+// `LagunaModel::Forward`, the f32 reference, whose `moe.experts_*` this
+// safetensors loader leaves EMPTY (it fills `experts_*_fp4` instead), so the
+// reference sliced `exp_g.begin() + id*gu_stride` out of an empty vector and the
+// process died inside `memcpy`. The GGUF arm did not crash — its
+// `moe.experts_*` ARE filled, with Q4_K/Q5_K blocks that `ReadF32` refuses by
+// name — so the two arms failed differently and only one of them failed loudly.
+//
+// These cases enter ONLY through `ModelRegistry::Load` + `ModelRegistry::Forward`.
+// See `.agents/specs/laguna-registry-forward-2618.md`.
+namespace {
+
+// A `ModelForwardInput` over one sequence, built the way the runner builds one.
+// `multi_kv` stays NULL: `kLagunaFactory` leaves `consumes_multi_kv` false, so a
+// topology here would be refused by the engine guard before dispatch and the
+// case would measure that guard instead of this forward.
+struct RegistryStep {
+  std::vector<int32_t> token_ids;
+  std::vector<int32_t> positions;
+  std::vector<int32_t> logits_indices;
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  vllm::v1::GDNAttentionMetadata gdn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  vllm::HfConfig config = TinyConfig();
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  explicit RegistryStep(std::vector<int32_t> ids, std::vector<int32_t> want)
+      : token_ids(std::move(ids)), logits_indices(std::move(want)) {
+    const int T = static_cast<int>(token_ids.size());
+    positions.resize(token_ids.size());
+    for (int i = 0; i < T; ++i) positions[static_cast<size_t>(i)] = i;
+    attn_meta.num_reqs = 1;
+    attn_meta.num_actual_tokens = T;
+    attn_meta.num_computed_tokens_cpu = {0};
+    attn_meta.seq_lens_cpu = {T};
+    attn_meta.seq_lens = attn_meta.seq_lens_cpu;
+    attn_meta.query_start_loc = {0, T};
+    attn_meta.query_start_loc_cpu = attn_meta.query_start_loc;
+  }
+
+  vllm::ModelForwardInput Get() {
+    vllm::ModelForwardInput in{.token_ids = token_ids,
+                               .positions = positions,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = config,
+                               .queue = queue,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    return in;
+  }
+};
+
+std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
+    const std::vector<SafetensorsFile>& shards) {
+  return vllm::ModelRegistry::Load(TinyConfig(),
+                                   vllm::ModelSource::FromSafetensors(shards));
+}
+
+}  // namespace
+
+// (1) The step RUNS through the production entry point and produces finite
+// logits of the right shape. RED on `ca07f6e94` is a SIGSEGV, not an assertion:
+// the process dies inside `LagunaModel::Forward`, so doctest prints no counts.
+TEST_CASE("laguna registry forward: ModelRegistry::Forward runs the NVFP4 arm") {
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  REQUIRE(model != nullptr);
+
+  RegistryStep step({1, 3, 2}, {0, 1, 2});
+  const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, step.Get());
+  CHECK(out.vocab == V);
+  CHECK(out.rows == 3);
+  REQUIRE(out.host.size() == static_cast<size_t>(3 * V));
+  for (float x : out.host) CHECK(std::isfinite(x));
+}
+
+// (2) WHICH forward it reached. (1) alone passes for any forward that returns
+// finite numbers of the right shape, so it cannot tell `LagunaForwardGguf` from
+// a zero-filled stub. These logits must be BYTE-IDENTICAL to the direct
+// `LagunaForwardGguf` call the loader run-gate above already trusts.
+TEST_CASE("laguna registry forward: registry logits == LagunaForwardGguf logits") {
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  REQUIRE(model != nullptr);
+
+  const LagunaWeights w = LoadLagunaForCausalLMWeights(shards, TinyConfig());
+  REQUIRE(w.has_nvfp4_weights);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 3, 2};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const std::vector<int32_t> want = {0, 1, 2};
+  const std::vector<float> direct =
+      vllm::LagunaForwardGguf(w, cpuq, tokens, positions, want);
+
+  RegistryStep step(tokens, want);
+  const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, step.Get());
+  REQUIRE(out.host.size() == direct.size());
+  CHECK(std::memcmp(out.host.data(), direct.data(),
+                    direct.size() * sizeof(float)) == 0);
+}
+
+// (3) The routed experts are CONSUMED on the registry path, not only on the
+// direct one: zeroing every routed expert's packed gate codes (e2m1 code 0 ==
+// 0.0, so silu(gate) collapses the routed contribution regardless of which
+// expert top-1 picks) must move the registry's logits.
+TEST_CASE("laguna registry forward: routed experts reach the registry step") {
+  RegistryStep step({1, 3, 2}, {0, 1, 2});
+
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  const vllm::ForwardLogits base = vllm::ModelRegistry::Forward(*model, step.Get());
+
+  std::vector<Fx> ts2 = BuildFiniteTensors();
+  for (Fx& t : ts2)
+    if (t.name.find("mlp.experts.") != std::string::npos &&
+        t.name.find("gate_proj.weight_packed") != std::string::npos)
+      std::fill(t.bytes.begin(), t.bytes.end(), '\x00');
+  TempFile f2(BuildSt(ts2));
+  std::vector<SafetensorsFile> shards2;
+  shards2.push_back(SafetensorsFile::Open(f2.path()));
+  std::unique_ptr<vllm::LoadedModel> model2 = LoadThroughRegistry(shards2);
+  const vllm::ForwardLogits zeroed =
+      vllm::ModelRegistry::Forward(*model2, step.Get());
+
+  REQUIRE(base.host.size() == zeroed.host.size());
+  bool differs = false;
+  for (size_t i = 0; i < base.host.size(); ++i)
+    if (base.host[i] != zeroed.host[i]) { differs = true; break; }
+  CHECK(differs);
+}
+
+// (4) #2834 — THE FIXTURE ITSELF MUST DISCRIMINATE.
+//
+// (1) to (3) above, and the two direct-entry cases before them, all run on
+// `BuildFiniteTensors()`. None of them can fail while that fixture returns one
+// constant for every logit, which is what it did until this case existed:
+// `Bf16Finite` had period 16 and the `[V,H] = [8,32]` row stride advanced it by
+// `32*7 = 224 == 0 (mod 16)`, so every row of `model.embed_tokens.weight` and of
+// `lm_head.weight` was byte-identical to every other row. A constant output is
+// finite, is deterministic, and is byte-identical to itself across two entry
+// points, so the finite/deterministic run-gate and the registry byte-identity
+// case both held trivially. `MODEL-LAGUNA-REGISTRY-FORWARD-2618`'s M5 mutation
+// (zeroing `positions`) SURVIVED for exactly this reason.
+//
+// This case asserts the three properties those gates need and could not have:
+// the logits move with the TOKEN ID, they move with the POSITION, and they are
+// not all the same number. It enters through `ModelRegistry::Forward`, so it
+// measures the production path rather than the fixture in isolation.
+TEST_CASE("laguna registry forward: the fixture discriminates token, position and row") {
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  REQUIRE(model != nullptr);
+
+  auto run = [&](const std::vector<int32_t>& ids,
+                 const std::vector<int32_t>& pos) {
+    RegistryStep step(ids, {0, 1, 2});
+    step.positions = pos;
+    const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, step.Get());
+    REQUIRE(out.host.size() == static_cast<size_t>(3 * V));
+    return out.host;
+  };
+  auto maxdiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    float m = 0.0F;
+    for (size_t i = 0; i < a.size(); ++i) m = std::max(m, std::fabs(a[i] - b[i]));
+    return m;
+  };
+
+  const std::vector<float> base = run({1, 3, 2}, {0, 1, 2});
+
+  // T1 — the TOKEN ID reaches the logits. A fixture whose embedding rows are all
+  // equal cannot fail this by any amount, so it is the embedding gather's gate.
+  const float tok_diff = maxdiff(base, run({5, 5, 5}, {0, 1, 2}));
+  MESSAGE("laguna fixture: maxdiff tokens {1,3,2} vs {5,5,5} = " << tok_diff);
+  CHECK(tok_diff > 0.0F);
+
+  // T2 — the POSITION reaches the logits, which is RoPE plus the position
+  // plumbing. {0,0,0} leaves RoPE at the identity for every row.
+  const float pos_diff = maxdiff(base, run({1, 3, 2}, {0, 0, 0}));
+  MESSAGE("laguna fixture: maxdiff positions {0,1,2} vs {0,0,0} = " << pos_diff);
+  CHECK(pos_diff > 0.0F);
+
+  const float far_diff = maxdiff(base, run({1, 3, 2}, {0, 2000, 4000}));
+  MESSAGE("laguna fixture: maxdiff positions {0,1,2} vs {0,2000,4000} = " << far_diff);
+  CHECK(far_diff > 0.0F);
+
+  // T3 — the output is not one repeated number. Two ways it could be: every row
+  // equal to every other row (the causal mask and the row plumbing), and every
+  // vocabulary entry within a row equal (the `lm_head` rows).
+  float row_spread = 0.0F;
+  for (int v = 0; v < V; ++v)
+    row_spread = std::max(row_spread, std::fabs(base[static_cast<size_t>(v)] -
+                                                base[static_cast<size_t>(V + v)]));
+  MESSAGE("laguna fixture: maxdiff row0 vs row1 = " << row_spread);
+  CHECK(row_spread > 0.0F);
+
+  float lo = base[0], hi = base[0];
+  for (int v = 0; v < V; ++v) {
+    lo = std::min(lo, base[static_cast<size_t>(v)]);
+    hi = std::max(hi, base[static_cast<size_t>(v)]);
+  }
+  MESSAGE("laguna fixture: row0 logit min " << lo << " max " << hi);
+  CHECK(hi > lo);
 }

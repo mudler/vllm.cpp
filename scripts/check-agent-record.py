@@ -205,7 +205,24 @@ MATRICES = {
     # kernels have existed since `MODEL-DSV4-EXL3` W2 and are device-proven, but
     # the ONLY consumer is the DeepSeek-V4 loader, so no other architecture can
     # reach the scheme -- which is what the row is for (#2181).
-    "QUANT": (AGENTS / "quantization-matrix.md", 85),
+    # 86 since 2026-09-01: +`QUANT-EXL3-MUL1`, exllamav3's `mul1` codebook (cb 2)
+    # and the 4- and 5-bit trellis widths. A separate row from `QUANT-EXL3` and
+    # not a state transition on it, because cb 2 is a DIFFERENT DECODE rather
+    # than a third multiplier: cb 0 and cb 1 mask, xor and sum the two fp16
+    # halves of the product, while cb 2 sums the product's four bytes into an
+    # fp16 bit pattern and maps it with a fused fp16 affine
+    # (`codebook.cuh:82-89`). It has its own artifact
+    # (`Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`), its own widths, and its own owed
+    # GEMV arm, none of which `QUANT-EXL3`'s cells can carry without saying two
+    # things at once (#2495).
+    # 87 since 2026-09-02: +`QUANT-EXL3-PERF`, the EXL3 `m<=8` GEMV arm set and
+    # its selection envelope. A separate row from `QUANT-EXL3` and
+    # `QUANT-EXL3-MUL1` because both of those are CORRECTNESS rows and say so --
+    # they make a width RUN -- while this one owns what the format COSTS, which
+    # is a different verdict on a different axis. #2570 named a verified
+    # instantiation gap with no owner, and an unowned gap is one nobody reruns
+    # (#2570).
+    "QUANT": (AGENTS / "quantization-matrix.md", 87),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
@@ -455,7 +472,14 @@ MATRICES = {
      # linear-attention op chain as native TT kernels — the hard prerequisite
      # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
      # implementation yet.
-    "BACKEND": (AGENTS / "backend-matrix.md", 87),
+    # 88 since 2026-09-01: +`BACKEND-GATE-ROCM-LLAMACPP` (#2497), the ROCm
+    # GGUF k-quant floor. Every other backend already had its llama.cpp
+    # gate row; ROCm had only the vLLM and SGLang rows, and neither has a
+    # denominator on `gfx1151` because vLLM has no entry on that
+    # architecture. The first measurement landed with nowhere to record
+    # it. `INVENTORIED`, no owner, no spec of its own. Bumped for a real
+    # new row, never to make a failing state transition pass.
+    "BACKEND": (AGENTS / "backend-matrix.md", 88),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -802,7 +826,20 @@ ENGINE_PREFIXES = (
 # counts one of the two new rows and silently drops the other. The counter is
 # the union, so it is 173. Bumped for real new rows, never to make a failing
 # state transition pass.
-ENGINE_ROWS = 173
+# 174 since 2026-08-31: +`ENG-PREFLIGHT-COMPILES` (no gate compiles a translation
+# unit before a push, and `main` was pushed twice on 2026-08-31 in a state that
+# does not build with every record gate green -- `5263ac31f` and `08fa2f5aa`,
+# #2401). A genuinely-new row rather than a state move: `GATE-PREPUSH-FAIL-LOUD`
+# owns whether the hook can find the checkers it names, `ENG-CI-*` owns the CI
+# lanes, and nothing owned whether anything compiles before the push at all.
+# `ACTIVE`, spec `specs/preflight-compiles.md`. Bumped for a real new row, never
+# to make a failing state transition pass.
+# +4 on 2026-08-31: four dead-capability rows catalogued while gating the MoE
+# placement install -- `ENG-WEIGHT-RESIDENCY`, `ENG-STRUCTURED-OUTPUT`,
+# `ENG-ATTENTION-WINDOW` and `ENG-GATE-ENV-DOC`. Each is a symbol or knob with a
+# user-facing promise and no production caller, verified by `git grep` restricted
+# to `src include`. Real new rows, which is the only reason this number moves.
+ENGINE_ROWS = 178
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

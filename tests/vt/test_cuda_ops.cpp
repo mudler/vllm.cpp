@@ -715,7 +715,12 @@ TEST_CASE("CUDA greedy_rejection_sample matches CPU bit-exactly at gate vocab (2
     Tensor tc = MakeTensor(cu_num_logits.data(), DType::kI32, Cpu(), {num_reqs + 1});
     Tensor ts = MakeTensor(cpu_sampled.data(), DType::kI32, Cpu(), {num_reqs, width});
     Tensor tn = MakeTensor(cpu_num_sampled.data(), DType::kI32, Cpu(), {num_reqs});
-    vt::GreedyRejectionSample(cq, ts, tn, tl, td, tc);
+    // The per-row argmax scratch is the CALLER's buffer (SPEC-DFLASH2 A2-2,
+    // #2802): the op returns with both CUDA kernels still queued, so nothing
+    // inside the backend may own the buffer between them.
+    std::vector<int32_t> cpu_argmax(static_cast<size_t>(num_logits), 0);
+    Tensor ta = MakeTensor(cpu_argmax.data(), DType::kI32, Cpu(), {num_logits});
+    vt::GreedyRejectionSample(cq, ts, tn, ta, tl, td, tc);
   }
 
   // CUDA.
@@ -725,8 +730,9 @@ TEST_CASE("CUDA greedy_rejection_sample matches CPU bit-exactly at gate vocab (2
   DeviceTensor dc(gpu, gq.q, DType::kI32, {num_reqs + 1}, cu_num_logits.data());
   DeviceTensor ds(gpu, gq.q, DType::kI32, {num_reqs, width});
   DeviceTensor dn(gpu, gq.q, DType::kI32, {num_reqs});
-  vt::GreedyRejectionSample(gq.q, ds.tensor(), dn.tensor(), dl.tensor(), dd.tensor(),
-                            dc.tensor());
+  DeviceTensor da(gpu, gq.q, DType::kI32, {num_logits});
+  vt::GreedyRejectionSample(gq.q, ds.tensor(), dn.tensor(), da.tensor(), dl.tensor(),
+                            dd.tensor(), dc.tensor());
   std::vector<int32_t> gpu_sampled(static_cast<size_t>(num_reqs * width));
   std::vector<int32_t> gpu_num_sampled(static_cast<size_t>(num_reqs));
   ds.Download(gq.q, gpu_sampled.data());

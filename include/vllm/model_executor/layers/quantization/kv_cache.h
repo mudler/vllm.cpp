@@ -87,10 +87,15 @@ struct ResolvedKvCacheScales {
 // are `kKvScaleUnloaded` when the checkpoint carried no such tensor, exactly as
 // `KVCacheScaleParameter` leaves them.
 //
-// `calculate_kv_scales` is upstream's DEPRECATED dynamic path (`cache.py:111`,
-// removal announced for v0.19): when it is set, upstream skips this whole block
-// and computes the scales from the first forward instead. We do not implement
-// that, so it is refused BY NAME rather than silently taking the static arm.
+// `calculate_kv_scales` is upstream's dynamic path, and upstream has REMOVED it.
+// It was deprecated at the prior pin `555967922` (`config/cache.py:111`, removal
+// announced for v0.19); vllm#49389 `dd11df04f3` then deleted the field, and that
+// commit is inside the advance to the current pin `e126687a9a` (#2817), where
+// `config/cache.py` carries no such key at all. When it WAS set, upstream skipped
+// this whole block and computed the scales from the first forward instead. We
+// never implemented that, so we keep the parameter and refuse it BY NAME rather
+// than silently taking the static arm -- which is now also what upstream does to
+// the flag, by not having it.
 inline ResolvedKvCacheScales ResolveKvCacheScales(std::string_view kv_cache_dtype,
                                                   bool calculate_kv_scales,
                                                   float loaded_k_scale,
@@ -105,8 +110,8 @@ inline ResolvedKvCacheScales ResolveKvCacheScales(std::string_view kv_cache_dtyp
   }
   VT_CHECK(!calculate_kv_scales,
            "kv_cache scales: --calculate-kv-scales (the on-the-fly dynamic k/v "
-           "scale, deprecated upstream at config/cache.py:111) is not "
-           "implemented; the checkpoint scale path is (KV-FP8 W3)");
+           "scale, REMOVED upstream by vllm#49389) is not implemented; the "
+           "checkpoint scale path is (KV-FP8 W3)");
   if (loaded_k_scale > 0.0F && loaded_v_scale > 0.0F) {
     // kv_cache.py:104-111 — prefer separate k_scale and v_scale when present.
     r.k_scale = loaded_k_scale;

@@ -121,7 +121,7 @@ port of those deleted kernels, so there is no corresponding local code to retire
 | `reshape_and_cache` (write K/V into paged NHD cache at slot_mapping) | `csrc/.../cache_kernels.cu::reshape_and_cache_flash` | T0 ✅ `e231196`→`7de4f0c` (vt::ReshapeAndCache, stride-based NHD write CPU+CUDA; GB10 gates pass; other CUDA targets unvalidated) |
 | Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 🚧 on GB10 gate workloads: correctness passes; immutable `3f256ab` binds at **55/124** with c1→c32 total ratios 0.993504/0.954464/0.966438/0.980678/1.027889/1.039417× and host PSS/RSS red. W3-E/W3-F/W3-G earn no speed credit. W3-H `c498a413` passes status `84d15970…6e66`; FA2 main is only the third positive mapped residual behind fused and normal FP4 production. No attention speed credit or 35B performance follows. Broader coverage remains in `kernel-matrix.md` |
 | **GDN backend**: metadata segmentation (prefill/decode/spec) | `v1/attention/backends/gdn_attn.py` | T0 ✅ `370ddaf` (GDNAttentionMetadata decode/prefill split + has_initial_state mask + prefill rebasing; spec segments + align col-gather deferred; GDN-state zeroing = caller obligation, see state.md) |
-| GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` (correctness-grade sequential; chunked perf kernel M2.3) |
+| GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` seeded a correctness-grade SEQUENTIAL recurrence; M2.3 then landed the chunked WY decomposition on **CUDA only** (`cuda_gdn.cu:6117`, default on, `VT_GDN_CHUNKED=0` falls back). `KERNEL-GDN-CHUNKED-MIRROR` then landed it on **CPU** and made the choice one shared, dtype-conditioned predicate on every backend (`vt::GdnUseChunkedPrefill`); the retained sequential arm is §9 exception 19. Tenstorrent is chunked; **ROCm and Vulkan are still sequential**, which upstream never runs for prefill — `qwen_gdn_linear_attn.py:1424-1450` has no sequential branch. The gap is measured (`2.29e-04` out / `2.25e-03` state from the exact recurrence, and it is 100% the bf16 intermediates, not the reassociation) and owned by `KERNEL-GDN-CHUNKED-MIRROR` (`.agents/specs/gdn-chunked-mirror.md`, [#2612](https://github.com/mudler/vllm.cpp/issues/2612)); the retained sequential arm becomes one tracked §9 exception when that row lands. |
 | GDN fused sigmoid-gating decode recurrence (mixed/spec and packed-disabled fallback) | `layers/fla/ops/fused_sigmoid_gating.py` | T0 ✅ `ead59d6` correctness-grade decomposed recurrence; exact mixed/spec breadth remains under its engine rows |
 | GDN packed pure non-spec decode (default-on FP16/BF16/F32 path) | `layers/fla/ops/fused_recurrent.py:255-478`; Qwen dispatch `qwen_gdn_linear_attn.py:1286-1298,1644-1695` | T0 🚧 `KERNEL-GDN-PACKED-DECODE` `ACTIVE`: clean `f344dec` closes W1D2/G2 for exact dispatch, rollback and safety; `7ff713e` + `24cea4f` close exact structure. Clean `d82d282` passed model gates/all c2 legs, then failed incomplete at c16 packed r1 with 96/96 HTTP 500 responses and no marker. Partial legs earn no speed credit |
 | GDN post-conv prep (q,k,v,g,beta + L2 norm) + causal conv1d fn/update | `layers/fla/ops/fused_gdn_prefill_post_conv.py`, `layers/mamba/ops/causal_conv1d.py` | T0 ✅ prefill/mixed path; pure decode bypasses materialized q/k/g/beta only after the packed row gates |
@@ -1041,27 +1041,48 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     Muse Glimmer on 2026-08-08, well after the parity pin `555967922`
     (2026-07-26). There is no `muse_glimmer` code at the pin — `grep -ril
     'muse\|glimmer' vllm/model_executor/models/` at the pin returns nothing —
-    and none on vLLM `main` either. The ONLY upstream implementation is
-    [vllm#51655](https://github.com/vllm-project/vllm/pull/51655), OPEN and
-    approved but unmerged, with 3 of 20 CI checks red, at head `075d645af`
-    (a descendant of the pin). Every `file:line` this row cites therefore points
+    and none on vLLM `main` either. The upstream implementation is
+    [vllm#51655](https://github.com/vllm-project/vllm/pull/51655). When this row
+    landed it was OPEN and approved but unmerged, with 3 of 20 CI checks red, at
+    head `075d645af` (a descendant of the pin). **It MERGED on 2026-08-14 as the
+    squash `6adad08767`**, `Add Muse Glimmer model support (#51655)`, which is an
+    ancestor of the sync target `cdefd9d499` (verified with `git merge-base
+    --is-ancestor`, and `MuseGlimmerForCausalLM` is absent from `registry.py` at
+    the pin and present exactly once at the target). Every `file:line` this row cites therefore points
     at a **branch head, not the pin** — a deliberate exception to "port from the
     pinned oracle", taken on explicit developer direction (2026-08-10). It is
     recorded here, and argued for in the commit that introduced it, because no
     checker enforces the anchor rule and the waiver registry has since been
     retired (`a4f72f86`): an exception now lives in the commit message that
     needs it, attached to the diff it excuses. Consequences, all binding while this stands:
-    (a) the anchor is mutable — a force-push or review round on #51655 rewrites
-    what we cite, so the fetched ref is kept and re-diffed before every
-    re-anchor; (b) upstream's own gates have NOT fully passed, so where our
-    HF-reference gate disagrees with #51655 the HF reference wins and the
-    divergence is reported upstream rather than mirrored; (c) **no speed axis is
-    claimable for this model** — the pinned oracle cannot load `muse_glimmer`
-    at all (and the checkpoint wants transformers 5.15.0.dev0 vs the pin's
-    5.14.1), so there is no honest denominator and every performance axis is an
-    OPEN GAP by construction, not a waived one. The exception is discharged by
-    #51655 merging plus a pin advance that includes it; until then the row
-    carries this deviation. Scope and gates: [muse-glimmer
+    (a) **DISCHARGED by the merge.** "The anchor is mutable — a force-push or
+    review round on #51655 rewrites what we cite" was true of a branch head. A
+    merged squash is immutable, so the re-diff-before-re-anchor duty ends.
+    (b) **DISCHARGED by the merge.** "Upstream's own gates have NOT fully passed,
+    so where our HF-reference gate disagrees with #51655 the HF reference wins"
+    was true while the pull request was red. The merged commit passed upstream's
+    gates, and under AGENTS.md vLLM then outranks the HF reference.
+    (c) **STILL BINDING, and it is the one consequence the pin advance does not
+    discharge on its own.** "No speed axis is claimable for this model" is TRUE
+    AT THE PIN and FALSE AT THE TARGET: the pinned oracle cannot load
+    `muse_glimmer` at all, so at `555967922` there is no honest denominator and
+    every performance axis is an OPEN GAP by construction rather than a waived
+    one. At `cdefd9d499` the architecture is registered and a denominator becomes
+    obtainable, so the axis stops being closed by construction and becomes merely
+    unmeasured. It does NOT open on the pin advance alone: a denominator needs a
+    gateable oracle, and `cdefd9d499` is `gateable = no` until somebody builds it
+    and runs the model (#2524). Until that measurement exists, quote no speed
+    number for this model and cite this line rather than the pin.
+    **Anchor drift, measured 2026-09-01.** Our port is anchored on the UNMERGED
+    branch head `075d645af6`, not on the merge. `muse_glimmer.py` moves +93/-46
+    between that head and the target, of which +54/-30 lands in the 6 commits
+    after the merge (`76f3249fbd`, `8c2bbe00d5`, `ebcd606467`, `0b19ebcacd`,
+    `b00f475f09`, `deeeae75d0`). Re-anchoring onto `6adad08767` and then onto the
+    target is owed by #2524; it is not done here, because this cycle does not
+    advance the pin.
+    The exception is discharged by #51655 merging plus a pin advance that
+    includes it. **The first half is met.** The second half is what the cycle in
+    #2524 prepares, so the row still carries this deviation. Scope and gates: [muse-glimmer
     spec](specs/muse-glimmer.md) §0.
 17. **From-necessity dense non-causal CROSS attention (`vt::OpId::kAttentionCross`,
     2026-08-11, `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L2,
@@ -1634,7 +1655,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (a) this row does **not** advance the pin and reconciles nothing else in the
     `555967922..ad5d29db7` range — the next [upstream-sync](upstream-sync.md)
     cycle reconciles it deliberately, and until then a Qwen3.5 change must check
-    both anchors; (b) **no token or speed axis is claimable for
+    both anchors. **Status 2026-09-01: the anchor is confirmed real, reachable
+    and merged.** `ad5d29db70` is the merged squash of vllm#50210, dated
+    2026-07-29, and it IS an ancestor of the sync target `cdefd9d499` (verified
+    with `git merge-base --is-ancestor`; both `Qwen3_5ForCausalLM` and
+    `Qwen3_5MoeForCausalLM` are absent from `registry.py` at the pin and present
+    exactly once at the target). A first pass of the `cdefd9d499` sync report
+    recorded that `ad5d29db7` "is not an ancestor of the target, for the same
+    squash reason"; that was an artefact of a shallow reference checkout, in
+    which `merge-base --is-ancestor` answers no for an unreachable object, and it
+    is retracted. **The anchor is now BEHIND the target rather than off it**: 8
+    commits touch `qwen3_5.py` after `ad5d29db70`, +60/-22 (`d154d90d6c`,
+    `1fe3a1571a`, `5a4c8d9924`, `88b2bff2c6`, `80d6d557f3`, `f2bfad9167`,
+    `febea17f6a`, `0601850791`). Re-anchoring is owed by #2524 and is not done
+    here, because this cycle does not advance the pin; (b) **no token or speed axis is claimable for
     `Qwen/Qwen3.8-2.4T-A95B`** — 2.4T bf16 is ~4.8 TB and the released FP8
     variant ~2.4 TB against GB10's 128 GB unified, so the run gate for that
     checkpoint is OWED (both rows are `PARTIAL`, never `DONE`, and
@@ -1757,9 +1791,23 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     is recorded here, and argued for in the commit that introduced it,
     because no checker enforces the anchor rule. Consequences, binding while
     this stands: (a) this row advances nothing in `555967922..main` and the
-    next [upstream-sync](upstream-sync.md) cycle reconciles it deliberately;
+    next [upstream-sync](upstream-sync.md) cycle reconciles it deliberately.
+    **Status 2026-09-01: the origin commit is identified.** vllm#51255 merged on
+    2026-08-12 as `9035151d6c`, `[Model] Add native Dots3 NOTE multimodal
+    support`, an ancestor of the sync target `cdefd9d499` (verified with `git
+    merge-base --is-ancestor`; `Dots3NoteForCausalLM` is absent from
+    `registry.py` at the pin and present exactly once at the target).
+    Reconciliation onto the target is owed by #2524 and is not done here,
+    because this cycle does not advance the pin;
     (b) upstream is STILL MOVING here — vllm#52172 landed 2026-08-13 — so a
-    dots3 change re-reads its anchors rather than trusting a cited line;
+    dots3 change re-reads its anchors rather than trusting a cited line.
+    **That warning stayed correct, and it is now measured.** Exactly one commit
+    touches `vllm/models/dots3_note/` after W3's re-read at `06ecec7a84`:
+    `da0b2d8b17` vllm#53517 `[Performance] Optimize Dots3 NOTE runtime`, +92/-85
+    over five files (`nvidia/attention.py`, `nvidia/model.py`, `nvidia/mtp.py`,
+    `nvidia/vision.py`, `nvidia/vision_attention.py`). W3's anchors therefore
+    predate the current upstream content, and a dots3 change re-reads at the
+    revision it names rather than inheriting W3's;
     (c) **no token, throughput, latency or memory number is claimable for
     this model on any axis**, and that is a memory ceiling rather than a
     scheduling gap: `dots-studio/dots3-note-prev` is ~576 GB bf16 and its
@@ -1787,24 +1835,66 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     debt, W4 owns the wiring and the seam extension, and spec `## Owed` names
     both.
 
-19. **Beyond-pin model-author port: DeepSeek-V4-Flash-Vision-Exp has no vLLM
-    implementation to mirror (2026-08-31,
+19. **Retained sequential GDN prefill (`KERNEL-GDN-CHUNKED-MIRROR`, 2026-09-03,
+    [#2612](https://github.com/mudler/vllm.cpp/issues/2612)):** vLLM runs the
+    chunked WY decomposition for ALL GDN prefill, and after this row so do we by
+    default, on CPU as well as CUDA and Tenstorrent
+    (`cpu_ops.cpp GdnChunkedHeadPrefill`, `cuda_gdn.cu:6117`). The exact
+    SEQUENTIAL recurrence (`cpu_ops.cpp GdnHeadTokenStep`) is retained behind
+    `VT_GDN_CHUNKED=0` and on f32 inputs, as ONE tracked exception covering every
+    backend — the same predicate (`vt::GdnUseChunkedPrefill`), the same kernel
+    family, the same reason.
+
+    The reason: the sequential form is not an alternative implementation of
+    vLLM's prefill. It is the recurrence vLLM's prefill is a reassociation of —
+    reproduced at f64 to `2.428613e-17` — and it is measurably nearer the exact
+    answer, `1.15e-08` against `2.29e-04`. It is retained for two jobs no mirror
+    can do. It is the reference an implementation error in the chunked arm is
+    caught by, because a chunked arm cannot check itself against another chunked
+    arm. And it is the only gated delta rule upstream will run on f32 inputs, on
+    EITHER of its two implementations — the Triton wrapper asserts
+    (`chunk.py:213-215`) and the CPU kernel type-checks bf16 only
+    (`csrc/cpu/sgl-kernels/fla.cpp:2205-2207`) — so on that dtype it IS the
+    mirror. It is off by default wherever upstream's own kernel would run, and it
+    is not an ABI surface.
+
+    **This row also moved CUDA's f32 default.** `ChunkedPrefillEnabled()` carried
+    no dtype term, so an f32 CUDA `GdnPrefill` took the chunked arm before this
+    row and takes the sequential scan after it.
+
+    ROCm and Vulkan still run the sequential recurrence and are NOT yet on the
+    chunked arm; the shared predicate reaches them, the kernel does not. That is
+    named under the spec's `## Owed`, not here, because it is unfinished work
+    rather than a deviation.
+
+20. **Beyond-pin model-author port: DeepSeek-V4-Flash-Vision-Exp has no vLLM
+    implementation to mirror (2026-08-31, amended 2026-09-05,
     `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, issue
     [#2411](https://github.com/mudler/vllm.cpp/issues/2411)).** The parity pin
     `555967922` registers `DeepseekV4ForCausalLM` as text generation. Code search
     at vLLM main `dafbef15a1c879c64ebb99427917e4ca8d5bca1e` finds neither the
     released model id nor `vision_n_layers`; Transformers main
     `a3f3da8f87dc65d724d500eeb44777e4716aaa46` implements DeepSeek-V4 text but
-    not the vision path. The only complete source is the model author's Hugging
-    Face Git repository at
-    `86f746b36186f0e567729a5c06a8c918caba82a9`, which is registered as the
+    not the vision path. The complete algorithm source is the model author's
+    Hugging Face Git repository at
+    `86f746b36186f0e567729a5c06a8c918caba82a9`, registered as the
     `deepseek-v4-vision` secondary oracle for prompt encoding, preprocessing,
     ViT, aligner, sentinel merge and image-span visibility. vLLM remains primary
     for the shared language behavior. The deviation expires when vLLM registers
     the model; that sync cycle reconciles this row onto vLLM rather than keeping
-    two authorities. The oracle starts `gateable = no`: source was read, but the
-    156.287 GiB TP4 artifact did not run. No correctness or performance claim
-    follows from this records change.
+    two authorities.
+
+    **Amendment, 2026-09-05.** llama.cpp merged the model on 2026-09-02 and
+    release `b10766` runs it, so this row is no longer sourced from a single
+    unrunnable repository. `llama-cpp-dsv4vision` is registered as a scoped
+    second llama.cpp oracle for the `deepseek4v` projector, the mmproj
+    container, the `exp_probs_b_vl` media routing bias and the non-causal
+    image-span window. It is a runnable reference and a quant-matched
+    denominator for `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`, which the
+    developer named as the shipped vehicle. It is NOT a mirror source and it does
+    not outrank the model author or vLLM. Both oracles start `gateable = no`:
+    source and artifact headers were read, nothing was built or run. No
+    correctness or performance claim follows from this records change.
 
 ## 10. E2E test suites (T0 deliverable)
 

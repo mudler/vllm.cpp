@@ -51,14 +51,54 @@ namespace {
   throw std::runtime_error("ltx2 text encoder: " + message);
 }
 
-void RequireF32(vt::DType dtype) {
-  if (dtype != vt::DType::kF32) {
-    Fail(
-        "compute_dtype must be f32. The bf16 / FP8 / NVFP4 arms of the text tower "
-        "are phase L6 of .agents/specs/ltx-2-5.md and are NOT implemented; "
-        "computing them in f32 would silently return a wider-than-checkpoint "
-        "result rather than the requested arm.");
-  }
+// bf16 helpers. Both are exact in one direction and round-to-nearest-even in the
+// other, which is what torch's own narrowing does — measured over the bf16 domain
+// (see the DTYPE note, fact 3's sibling measurement).
+inline float Wide(uint16_t b) { return vt::BF16ToF32(b); }
+inline uint16_t Narrow(float f) { return vt::F32ToBF16(f); }
+
+// feature_extractor.py:61's `1e-6`, AS THE BF16 TENSOR OP SEES IT. A Python float
+// paired with a bf16 tensor is narrowed before the add, so this — 0x3586,
+// 9.98377799987793e-07 — is the value upstream actually adds, and `kLtx2TextNormV2Eps`
+// is NOT. Pinned against `kLtxTeBf16NormEpsBits`, which the generator emits from
+// upstream's own narrowing rather than from this constant.
+constexpr uint16_t kLtx2TextNormEpsBf16 = 0x3586;
+
+// `torch.finfo(torch.bfloat16).max` — the additive mask's pad magnitude when the
+// features are bf16 (embeddings_processor.py:19-20 with :117's dtype). 0x7f7f
+// widened, which is exact.
+constexpr float kBf16Max = 3.38953138925153547590470800371487866880e+38f;
+
+// The arm selector. It NARROWED rather than disappeared when the bf16 arm landed
+// (LTX25-A24-TEXT-TOWER-BF16): f32 and bf16 are upstream's parity and production
+// dtypes, and everything else is still refused by name.
+void RequireTextComputeDtype(vt::DType dtype) {
+  if (dtype == vt::DType::kF32 || dtype == vt::DType::kBF16) return;
+  Fail(
+      "compute_dtype must be f32 or bf16. bf16 is the dtype upstream resolves for "
+      "the whole pipeline (distilled.py:109, handed to PromptEncoder at :111-113) "
+      "and is the arm the render path runs; f32 is the PARITY arm the goldens are "
+      "measured in. The FP8 and NVFP4 arms are A22 — upstream's quantization "
+      "policies (quantization_factory.py:22-26), not its default dtype — and are "
+      "NOT implemented; computing them in f32 or bf16 would silently return a "
+      "wider-than-requested result rather than the requested arm.");
+}
+
+// The weights and the requested arm must agree. Upstream cannot disagree with
+// itself, because one dtype constructs the whole module; a port that loads the
+// two projections separately can, and a mismatch here is exactly the case where
+// the answer would be finite, correctly shaped and computed at the wrong width.
+void RequireDtypeMatchesWeights(vt::DType compute_dtype,
+                                const Ltx2TextEncoderWeights& weights) {
+  const vt::DType carried = weights.ComputeDtype();
+  if (carried == compute_dtype) return;
+  Fail(std::string("compute_dtype is ") +
+       (compute_dtype == vt::DType::kBF16 ? "bf16" : "f32") +
+       " but the caption projections carry " +
+       (carried == vt::DType::kBF16 ? "bf16" : "f32") +
+       " storage. The arm is a property of the weights, not of the call: load "
+       "them with Ltx2TextProjectionsAsBf16 for the bf16 arm or with "
+       "Ltx2WidenTextProjectionsToF32 for the f32 parity arm.");
 }
 
 // `torch.nn.functional.linear`: out[b, o] = sum_i x[b, i] * W[o, i] + bias[o],
@@ -112,6 +152,57 @@ std::vector<float> Linear(vt::Queue& q, const std::vector<float>& x, int64_t row
   return out;
 }
 
+// `torch.nn.functional.linear` at bf16, and the ONE thing that makes it different
+// from narrowing the f32 arm's answer: upstream accumulates in f32 and rounds
+// ONCE, with the bias inside that single rounding. Measured bit-exact against
+// `(x.f32 @ W.f32.T + b.f32).to(bf16)`, maxdiff 0.0 — a port that rounds the GEMM
+// output to bf16 and then adds a bias rounds twice and is wrong.
+//
+// So the GEMM's output tensor is F32. `vt::MatmulBT`'s CPU kernel already has
+// exactly this contract — the accumulator is f32, `LoadF32` widens a bf16 operand
+// exactly, and `StoreF32` rounds on the way out (cpu_ops.cpp:151-180) — so an f32
+// output tensor IS upstream's unrounded accumulator, and no new kernel is needed.
+// The scratch is [rows, out_features], which is the SMALL side: at the shipped
+// widths it is 16 MB against the 188160-wide operands this arm halves.
+std::vector<uint16_t> LinearBf16(vt::Queue& q, const std::vector<uint16_t>& x,
+                                 int64_t rows, const Ltx2TextAggregateEmbed& w) {
+  if (static_cast<int64_t>(x.size()) != rows * w.in_features)
+    Fail("linear (bf16): input size does not match in_features");
+  if (w.WeightCount() != w.out_features * w.in_features)
+    Fail("linear (bf16): weight size does not match [out_features, in_features]");
+  const bool has_bias = !w.bias_bf16.empty();
+  if (has_bias && w.BiasCount() != w.out_features)
+    Fail("linear (bf16): bias size does not match out_features");
+
+  std::vector<uint16_t> out(static_cast<size_t>(rows * w.out_features));
+  if (rows == 0 || w.out_features == 0) return out;
+
+  // The f32 arm's zero-width case, mirrored exactly: no GEMM, but the bias add
+  // still runs, so every output is the bias alone.
+  std::vector<float> acc(static_cast<size_t>(rows * w.out_features), 0.0f);
+  if (w.in_features > 0) {
+    const vt::Device dev{vt::DeviceType::kCPU, 0};
+    vt::Tensor a = vt::Tensor::Contiguous(const_cast<uint16_t*>(x.data()), vt::DType::kBF16,
+                                          dev, {rows, w.in_features});
+    vt::Tensor b = vt::Tensor::Contiguous(const_cast<uint16_t*>(w.weight_bf16.data()),
+                                          vt::DType::kBF16, dev,
+                                          {w.out_features, w.in_features});
+    vt::Tensor o = vt::Tensor::Contiguous(acc.data(), vt::DType::kF32, dev,
+                                          {rows, w.out_features});
+    vt::MatmulBT(q, o, a, b);
+  }
+
+  for (int64_t r = 0; r < rows; ++r) {
+    const size_t base = static_cast<size_t>(r * w.out_features);
+    for (int64_t i = 0; i < w.out_features; ++i) {
+      float v = acc[base + static_cast<size_t>(i)];
+      if (has_bias) v += Wide(w.bias_bf16[static_cast<size_t>(i)]);
+      out[base + static_cast<size_t>(i)] = Narrow(v);
+    }
+  }
+  return out;
+}
+
 // encoder_configurator.py:163-168 — the EXACT V2 marker set, values included.
 struct V2Marker {
   const char* key;
@@ -143,7 +234,11 @@ constexpr V2Marker kV2Markers[] = {
 // projection). Finite, correctly shaped, wrong prompt.
 void RequireDeclaredProjection(const char* which, const Ltx2TextAggregateEmbed& w,
                                int64_t declared_out, bool declared_bias, int64_t flat) {
-  const bool has_bias = !w.bias.empty();
+  // Through the DTYPE-AWARE accessor, so the check holds on both arms. Reading
+  // `w.bias` directly made this refuse every bf16 projection by name, because a
+  // bf16 bias lives in `bias_bf16` — the check would have been correct about a
+  // disagreement that was not there.
+  const bool has_bias = w.BiasCount() != 0;
   if (has_bias != declared_bias)
     Fail(std::string(which) + " projection: the config declares aggregate_bias=" +
          (declared_bias ? "true" : "false") + " but the supplied weights carry " +
@@ -258,6 +353,24 @@ Ltx2TextFeatureConfig Ltx2SelectTextFeatureVariant(const nlohmann::json& transfo
 }
 
 // ───────────────────────────── feature aggregation ───────────────────────────
+
+vt::DType Ltx2TextEncoderWeights::ComputeDtype() const {
+  // V1 populates `video` alone (encoder_configurator.py:187-188), so an audio
+  // projection with no storage at all is not a disagreement — it is the shape.
+  const bool audio_present = audio.WeightCount() != 0;
+  if (audio_present && audio.dtype != video.dtype) {
+    throw std::runtime_error(
+        "ltx2 text encoder: the video caption projection carries " +
+        std::string(video.dtype == vt::DType::kBF16 ? "bf16" : "f32") +
+        " storage and the audio one carries " +
+        std::string(audio.dtype == vt::DType::kBF16 ? "bf16" : "f32") +
+        ". Upstream constructs both from ONE resolved dtype "
+        "(distilled.py:109, PromptEncoder at :111-113) and cannot disagree with "
+        "itself; a port that loads them separately can, so this is refused rather "
+        "than resolved by preference.");
+  }
+  return video.dtype;
+}
 
 std::vector<float> Ltx2StackHiddenStates(const Ltx2TextHiddenStates& states) {
   const int64_t B = states.batch, T = states.seq, D = states.hidden;
@@ -389,6 +502,154 @@ std::vector<float> Ltx2NormAndConcatPerTokenRms(const float* stacked, const int3
   return out;
 }
 
+// ───────────────────────── the BF16 arm of the three above ───────────────────
+
+std::vector<uint16_t> Ltx2StackHiddenStatesBf16(const Ltx2TextHiddenStates& states) {
+  const int64_t B = states.batch, T = states.seq, D = states.hidden;
+  const int64_t L = static_cast<int64_t>(states.layers.size());
+  if (B <= 0 || T <= 0 || D <= 0 || L <= 0) Fail("hidden states have a zero extent");
+  // Same `d * L + l` interleave as the f32 arm — feature_extractor.py:120 stacks
+  // on a NEW LAST axis and the reshape is hidden-major, layer-minor. What differs
+  // is only the width: upstream's tower already emits bf16, so narrowing here is
+  // the identity on a value the tower would have produced, and it halves the
+  // buffer this function returns.
+  std::vector<uint16_t> out(static_cast<size_t>(B * T * D * L));
+  for (int64_t l = 0; l < L; ++l) {
+    const float* src = states.layers[static_cast<size_t>(l)];
+    if (src == nullptr) Fail("hidden state layer pointer is null");
+    for (int64_t bt = 0; bt < B * T; ++bt)
+      for (int64_t d = 0; d < D; ++d)
+        out[static_cast<size_t>((bt * D + d) * L + l)] =
+            Narrow(src[static_cast<size_t>(bt * D + d)]);
+  }
+  return out;
+}
+
+std::vector<float> Ltx2NormAndConcatPaddedBatchBf16(const uint16_t* stacked,
+                                                    const int32_t* mask, int64_t batch,
+                                                    int64_t seq, int64_t hidden,
+                                                    int64_t layers) {
+  if (stacked == nullptr || mask == nullptr) Fail("null input to the V1 bf16 normalization");
+  const int64_t B = batch, T = seq, D = hidden, L = layers;
+  // THIS FUNCTION RETURNS F32 AND THAT IS UPSTREAM'S ANSWER, not a widening.
+  // `denom` is an int64 tensor, `denom + eps` promotes to the default dtype, and
+  // `bf16_sum / f32_denom` carries float32 through every later term. Measured:
+  // `_norm_and_concat_padded_batch` on a bf16 input has `.dtype == torch.float32`
+  // (kLtxTeBf16NormV1IsF32). The single narrowing V1 does is
+  // `self.aggregate_embed(normed.to(dtype))` at feature_extractor.py:94, which is
+  // in the extractor below, not here.
+  std::vector<float> out(static_cast<size_t>(B * T * D * L));
+
+  for (int64_t b = 0; b < B; ++b) {
+    int64_t seq_len = 0;
+    for (int64_t t = 0; t < T; ++t)
+      if (mask[static_cast<size_t>(b * T + t)] != 0) ++seq_len;
+    const int64_t denom = seq_len * D;
+
+    for (int64_t l = 0; l < L; ++l) {
+      // :33 — `masked.sum(dim=(1,2))` on a bf16 tensor accumulates in f32
+      // (torch's `opmath_type`) and ROUNDS THE RESULT TO BF16 before the division.
+      // Measured: `masked.sum` on a bf16 input has `.dtype == torch.bfloat16`.
+      // The f32 arm accumulates in f64 for a reason its own comment gives; here
+      // the accumulator width is upstream's own f32 and the rounding after it is
+      // the thing that would be missed by simply reusing that arm.
+      float sum = 0.0f;
+      float lo = std::numeric_limits<float>::infinity();
+      float hi = -std::numeric_limits<float>::infinity();
+      for (int64_t t = 0; t < T; ++t) {
+        if (mask[static_cast<size_t>(b * T + t)] == 0) continue;
+        for (int64_t d = 0; d < D; ++d) {
+          const float v = Wide(stacked[static_cast<size_t>((((b * T) + t) * D + d) * L + l)]);
+          sum += v;
+          lo = std::min(lo, v);
+          hi = std::max(hi, v);
+        }
+      }
+      const float sum_bf16 = Wide(Narrow(sum));
+      // :35 — the f32 add of the int64 denominator, identical to the f32 arm's
+      // and for the identical reason: it is upstream's width, not the finest one.
+      const float mean = sum_bf16 / (static_cast<float>(denom) +
+                                     static_cast<float>(kLtx2TextNormV1Eps));
+      // :39-41 — `x_max - x_min` is a BF16 subtraction and rounds, and
+      // `range_ + eps` is a bf16 add of the bf16-narrowed epsilon. `amin`/`amax`
+      // themselves return exact input values, so `lo`/`hi` need no narrowing.
+      const float range = Wide(Narrow(hi - lo));
+      const float range_eps = Wide(Narrow(range + Wide(kLtx2TextNormEpsBf16)));
+
+      for (int64_t t = 0; t < T; ++t) {
+        const bool valid = mask[static_cast<size_t>(b * T + t)] != 0;
+        for (int64_t d = 0; d < D; ++d) {
+          const size_t src = static_cast<size_t>((((b * T) + t) * D + d) * L + l);
+          const size_t dst = static_cast<size_t>(((b * T) + t) * D * L + d * L + l);
+          // `8 * (x - mean) / (range_ + eps)`: `x - mean` is bf16 - f32 -> f32,
+          // `8 *` keeps f32, and `/ (range_ + eps)` is f32 / bf16 -> f32.
+          out[dst] = valid ? 8.0f * (Wide(stacked[src]) - mean) / range_eps : 0.0f;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<uint16_t> Ltx2NormAndConcatPerTokenRmsBf16(const uint16_t* stacked,
+                                                       const int32_t* mask, int64_t batch,
+                                                       int64_t seq, int64_t hidden,
+                                                       int64_t layers) {
+  if (stacked == nullptr || mask == nullptr) Fail("null input to the V2 bf16 normalization");
+  const int64_t B = batch, T = seq, D = hidden, L = layers;
+  std::vector<uint16_t> out(static_cast<size_t>(B * T * D * L));
+
+  for (int64_t bt = 0; bt < B * T; ++bt) {
+    const bool valid = mask[static_cast<size_t>(bt)] != 0;
+    for (int64_t l = 0; l < L; ++l) {
+      // :60 — `torch.mean(encoded_text**2, dim=2)`. `encoded_text**2` MATERIALIZES
+      // A BF16 TENSOR, so every square is rounded to 8 mantissa bits BEFORE the
+      // mean accumulates it; the mean itself accumulates in f32 and rounds its
+      // result. Squaring in f32 and accumulating in f32 is bit-wrong, and
+      // kLtxTeBf16VarianceF32Squares is the golden that says so — the generator
+      // asserts the two disagree, so this is a discriminator and not a
+      // restatement.
+      float sum_sq = 0.0f;
+      for (int64_t d = 0; d < D; ++d) {
+        const float v = Wide(stacked[static_cast<size_t>((bt * D + d) * L + l)]);
+        sum_sq += Wide(Narrow(v * v));
+      }
+      const float variance = Wide(Narrow(sum_sq / static_cast<float>(D)));
+      // :61 — `torch.rsqrt(variance + 1e-6)`, both steps bf16, and the epsilon is
+      // the bf16-narrowed one (fact 3). At this width the epsilon changes nothing
+      // for an ordinary variance; it is the whole denominator when the variance
+      // collapses, which is where it is gated.
+      const float var_eps = Wide(Narrow(variance + Wide(kLtx2TextNormEpsBf16)));
+      const float inv = Wide(Narrow(1.0f / std::sqrt(var_eps)));
+      for (int64_t d = 0; d < D; ++d) {
+        const size_t src = static_cast<size_t>((bt * D + d) * L + l);
+        const size_t dst = static_cast<size_t>(bt * D * L + d * L + l);
+        // :64 — `torch.where(mask, normed, zeros)`. A bf16 zero is 0x0000.
+        out[dst] = valid ? Narrow(Wide(stacked[src]) * inv) : uint16_t{0};
+      }
+    }
+  }
+  return out;
+}
+
+float Ltx2RescaleNormBf16(int64_t target_dim, int64_t source_dim) {
+  // THE FACTOR IS THE F32 ONE, AND IT IS NOT NARROWED. This is the opposite of
+  // what the epsilon does one line of upstream away, so it is measured rather
+  // than derived from a rule: `t * sqrt(8/6)` on a bf16 tensor equals the
+  // F32-SCALAR form at all 32639 finite non-negative bf16 values and the
+  // bf16-narrowed form at all but 7881, while `t + 1e-6` equals the
+  // BF16-NARROWED form at all 32640 and the f32 form at all but 387. Two scalar
+  // ops on the same dtype, two answers.
+  //
+  // An earlier revision of this function narrowed the factor, which is what the
+  // symmetry with the epsilon suggests. The probe that let it through multiplied
+  // by ONE, where `1.0 * f` narrows to `bf16(f)` under either hypothesis — the
+  // golden agreed with a port that was wrong on nearly a quarter of every other
+  // value. `kLtxTeBf16RescaleProbeIn` is now a vector that separates them, and
+  // the generator refuses to emit it if it ever stops doing so.
+  return static_cast<float>(Ltx2RescaleNorm(target_dim, source_dim));
+}
+
 double Ltx2RescaleNorm(int64_t target_dim, int64_t source_dim) {
   if (source_dim <= 0) Fail("rescale: source_dim must be positive");
   // feature_extractor.py:69 — `x * math.sqrt(target_dim / source_dim)`. torch
@@ -406,7 +667,8 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
                                                  const Ltx2TextEncoderWeights& weights,
                                                  const Ltx2TextFeatureConfig& config,
                                                  vt::DType compute_dtype) {
-  RequireF32(compute_dtype);
+  RequireTextComputeDtype(compute_dtype);
+  RequireDtypeMatchesWeights(compute_dtype, weights);
   if (mask == nullptr) Fail("attention mask is null");
   if (static_cast<int64_t>(states.layers.size()) != config.num_layers)
     Fail("hidden state count " + std::to_string(states.layers.size()) +
@@ -430,6 +692,64 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
     RequireDeclaredProjection("audio", weights.audio, config.audio_out_features,
                               config.aggregate_bias, flat);
 
+  // The text tower is host-only by construction, so the projection's queue is the
+  // CPU one, which is what every caller of `Ltx2EncodePromptToConditioning`
+  // already builds for the tower itself:
+  // `grep -c 'vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};'
+  //  src/vllm/multimodal/ltx2_video.cpp` reports 3, one per call site. The three
+  // line numbers this comment used to carry (:2085, :2799, :4479) were stale by
+  // hundreds of lines, so it cites the string and its count instead.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  Ltx2TextFeatures features;
+
+  // ── the BF16 arm — upstream's own resolved dtype ─────────────────────────
+  //
+  // Its shape is the f32 arm's below, at half the bytes on every full-width
+  // buffer, with the three narrowings upstream actually performs and no others.
+  // V1's normalization is F32 here exactly as it is upstream (fact 1 in the
+  // header's DTYPE note), which is why the two variants do not share a body: the
+  // `.to(dtype)` at feature_extractor.py:94 is V1's ONLY narrowing and it belongs
+  // to the extractor, not to the norm.
+  if (compute_dtype == vt::DType::kBF16) {
+    const std::vector<uint16_t> stacked_bf16 = Ltx2StackHiddenStatesBf16(states);
+
+    if (config.variant == Ltx2TextNormVariant::kPaddedBatchV1) {
+      // :92-96 — `dtype = encoded.dtype`, one projection, no rescale, and `is_av`
+      // returns the SAME tensor twice rather than running a second projection.
+      const std::vector<float> normed_f32 = Ltx2NormAndConcatPaddedBatchBf16(
+          stacked_bf16.data(), mask, B, T, states.hidden, config.num_layers);
+      std::vector<uint16_t> normed(normed_f32.size());
+      for (size_t i = 0; i < normed_f32.size(); ++i) normed[i] = Narrow(normed_f32[i]);
+      const std::vector<uint16_t> video = LinearBf16(q, normed, B * T, weights.video);
+      features.video.resize(video.size());
+      for (size_t i = 0; i < video.size(); ++i) features.video[i] = Wide(video[i]);
+      if (config.is_av) features.audio = features.video;
+      return features;
+    }
+
+    // :121-129 — `normed.to(encoded.dtype)` is a no-op here because V2's norm is
+    // already bf16, and the rescale is applied SEPARATELY per projection with
+    // that projection's OWN out_features over the Gemma hidden size.
+    const std::vector<uint16_t> normed = Ltx2NormAndConcatPerTokenRmsBf16(
+        stacked_bf16.data(), mask, B, T, states.hidden, config.num_layers);
+    auto project_bf16 = [&](const Ltx2TextAggregateEmbed& w, int64_t out_features) {
+      const float scale = Ltx2RescaleNormBf16(out_features, config.embedding_dim);
+      std::vector<uint16_t> scaled(normed.size());
+      for (size_t i = 0; i < normed.size(); ++i)
+        scaled[i] = Narrow(Wide(normed[i]) * scale);
+      const std::vector<uint16_t> projected = LinearBf16(q, scaled, B * T, w);
+      std::vector<float> widened(projected.size());
+      for (size_t i = 0; i < projected.size(); ++i) widened[i] = Wide(projected[i]);
+      return widened;
+    };
+    features.video = project_bf16(weights.video, config.video_out_features);
+    if (config.audio_out_features > 0)
+      features.audio = project_bf16(weights.audio, config.audio_out_features);
+    return features;
+  }
+
+  // ── the F32 parity arm — the dtype the goldens were produced in ──────────
   const std::vector<float> stacked = Ltx2StackHiddenStates(states);
 
   std::vector<float> normed =
@@ -439,13 +759,6 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
           : Ltx2NormAndConcatPerTokenRms(stacked.data(), mask, B, T, states.hidden,
                                          config.num_layers);
 
-  // The text tower is host-only by construction — `Ltx2TextEncoderWeights` holds
-  // `std::vector<float>` — so the projection's queue is the CPU one, which is what
-  // every caller of `Ltx2EncodePromptToConditioning` already builds for the tower
-  // itself (ltx2_video.cpp:2085, :2799, :4479).
-  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-
-  Ltx2TextFeatures features;
   if (config.variant == Ltx2TextNormVariant::kPaddedBatchV1) {
     // feature_extractor.py:93-97 — ONE projection, no rescale, and `is_av` returns
     // the same tensor twice rather than running a second projection.
@@ -472,11 +785,16 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
 // ──────────────────── the encoder -> conditioning hand-off ───────────────────
 
 std::vector<float> Ltx2ConvertToAdditiveMask(const int32_t* mask, int64_t batch,
-                                             int64_t seq) {
+                                             int64_t seq, vt::DType dtype) {
   if (mask == nullptr) Fail("attention mask is null");
-  // embeddings_processor.py:18-20 — (mask - 1) * finfo(f32).max: 0.0 for a kept
-  // position, -FLT_MAX for a pad.
-  const float big = std::numeric_limits<float>::max();
+  RequireTextComputeDtype(dtype);
+  // embeddings_processor.py:18-20 — (mask - 1) * finfo(dtype).max: 0.0 for a kept
+  // position, -finfo(dtype).max for a pad. The dtype is the FEATURES', which
+  // `process_hidden_states` passes at :117, so the bf16 arm's pad value is
+  // -3.3895313892515355e38 and not -FLT_MAX. Both are exactly representable in
+  // the f32 container this returns.
+  const float big =
+      dtype == vt::DType::kBF16 ? kBf16Max : std::numeric_limits<float>::max();
   std::vector<float> out(static_cast<size_t>(batch * seq));
   for (size_t i = 0; i < out.size(); ++i)
     out[i] = static_cast<float>(mask[i] != 0 ? 0 : -1) * big;
@@ -485,9 +803,15 @@ std::vector<float> Ltx2ConvertToAdditiveMask(const int32_t* mask, int64_t batch,
 
 void Ltx2ComputeRightPadOrder(const float* additive_mask, int64_t batch, int64_t seq,
                               std::vector<int32_t>& sort_index,
-                              std::vector<float>& reordered_additive_mask) {
+                              std::vector<float>& reordered_additive_mask,
+                              vt::DType dtype) {
   if (additive_mask == nullptr) Fail("additive mask is null");
-  const float big = std::numeric_limits<float>::max();
+  RequireTextComputeDtype(dtype);
+  // :37 rebuilds the mask with `finfo(additive_mask.dtype).max`, so the magnitude
+  // follows the INPUT mask's dtype — which is the features' dtype. Reading it
+  // from the container instead would silently hand a bf16 arm an f32 pad value.
+  const float big =
+      dtype == vt::DType::kBF16 ? kBf16Max : std::numeric_limits<float>::max();
   sort_index.assign(static_cast<size_t>(batch * seq), 0);
   reordered_additive_mask.assign(static_cast<size_t>(batch * seq), 0.0f);
 
@@ -506,7 +830,7 @@ void Ltx2ComputeRightPadOrder(const float* additive_mask, int64_t batch, int64_t
       if (additive_mask[static_cast<size_t>(b * seq + t)] < 0.0f)
         sort_index[static_cast<size_t>(b * seq + w++)] = static_cast<int32_t>(t);
     // :37 — the reordered mask is rebuilt from the reordered BINARY values, so it
-    // carries the canonical -FLT_MAX rather than whatever the input held.
+    // carries the canonical -finfo(dtype).max rather than whatever the input held.
     for (int64_t t = 0; t < seq; ++t)
       reordered_additive_mask[static_cast<size_t>(b * seq + t)] =
           t < valid ? 0.0f : -big;
@@ -543,19 +867,22 @@ Ltx2TextConditioning Ltx2TextEncoderConditioning(const Ltx2TextHiddenStates& sta
                                                  const Ltx2TextEncoderWeights& weights,
                                                  const Ltx2TextFeatureConfig& config,
                                                  vt::DType compute_dtype) {
-  RequireF32(compute_dtype);
+  RequireTextComputeDtype(compute_dtype);
+  RequireDtypeMatchesWeights(compute_dtype, weights);
   // embeddings_processor.py:114-116 — extract, convert the mask, then normalize
   // the padding layout to right-padded before the connector sees anything.
   const Ltx2TextFeatures features =
       Ltx2TextFeatureExtractorForward(states, mask, weights, config, compute_dtype);
+  // :117 — `convert_to_additive_mask(attention_mask, video_feats.dtype)`. The
+  // FEATURES' dtype, which is why this takes `compute_dtype` and not a default.
   const std::vector<float> additive =
-      Ltx2ConvertToAdditiveMask(mask, states.batch, states.seq);
+      Ltx2ConvertToAdditiveMask(mask, states.batch, states.seq, compute_dtype);
 
   Ltx2TextConditioning out;
   // :84 — the sort index depends only on the mask, so it is computed ONCE and
   // reused for the audio arm.
   Ltx2ComputeRightPadOrder(additive.data(), states.batch, states.seq, out.sort_index,
-                           out.additive_mask);
+                           out.additive_mask, compute_dtype);
   out.video = Ltx2ApplyRightPadOrder(features.video.data(), out.sort_index.data(),
                                      states.batch, states.seq, config.video_out_features);
   if (!features.audio.empty()) {
@@ -1192,8 +1519,12 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
   states.seq = out.seq;
   states.hidden = H;
 
-  out.conditioning =
-      Ltx2TextEncoderConditioning(states, out.mask.data(), weights, feature_config);
+  // THE ARM COMES FROM THE WEIGHTS. Upstream's dtype is a property of the
+  // constructed module, not of the call (distilled.py:111-113), so bf16
+  // projections make this a bf16 tower and f32 ones make it the parity arm.
+  out.conditioning = Ltx2TextEncoderConditioning(states, out.mask.data(), weights,
+                                                 feature_config,
+                                                 weights.ComputeDtype());
   return out;
 }
 

@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -58,6 +59,7 @@
 #include "vllm/model_executor/models/qwen4_exp_forward.h"
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"
 #include "vllm/model_executor/models/qwen4_exp_weights.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform — the instrument's own precondition
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -352,6 +354,12 @@ Qwen4ExpWeights MakeWeights(const Qwen4ExpParams& p) {
   return w;
 }
 
+// The address of a weight's bytes as a NUMBER, so a red prints the two
+// addresses instead of doctest's bool-stringified `1 == 1` for a `uint8_t*`.
+uintptr_t Addr(const OwnedTensor& t) {
+  return reinterpret_cast<uintptr_t>(t.bytes.data());
+}
+
 std::vector<float> Download(vllm::dense_attn::Dev d, const vt::Tensor& t) {
   int64_t n = 1;
   for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
@@ -485,8 +493,16 @@ TEST_CASE(
   std::vector<int32_t> bt{0};
   std::vector<int64_t> slots(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t) slots[static_cast<size_t>(t)] = t;
+  // RANK 4, NOT 5 (#2435). The paged K/V page is logically
+  // `[2, num_blocks, block_size, num_kv_heads, head_size]`, and `vt::Tensor`
+  // holds four dimensions (`vt::kMaxRank`). Folding the leading K/V axis into
+  // the block axis keeps the same bytes, the same element count and the same
+  // `data` pointer -- which is all this fixture takes from the buffer, because
+  // `PagedKvCache` carries the five extents as separate scalars. The rank-5
+  // spelling wrote past `Tensor::shape` and `Tensor::stride` and set
+  // `Tensor::repacked` as a side effect; `dense_attn::MakeTensor` now refuses it.
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, p.num_key_value_heads, p.head_dim},
+                              {2, T, p.num_key_value_heads, p.head_dim},
                               kv.data());
   // W5i: the indexer side cache is PAGED, `[num_pages, block_size, D]`. One page
   // of `T` rows here, matching the single-page K/V beside it.
@@ -676,7 +692,7 @@ TEST_CASE(
   std::vector<uint16_t> kv(
       static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;
   attn_kv[0].dtype = DType::kBF16;
@@ -819,7 +835,7 @@ TEST_CASE(
   std::vector<uint16_t> kv2(
       static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv2_b(d, DType::kBF16,
-                               {2, 1, T, kKvHeads, kHeadDim}, kv2.data());
+                               {2, T, kKvHeads, kHeadDim}, kv2.data());
   std::vector<vllm::PagedKvCache> attn_kv2(1);
   attn_kv2[0] = attn_kv[0];
   attn_kv2[0].data = kv2_b.t().data;
@@ -841,8 +857,124 @@ TEST_CASE(
   // `MaxAbsDiff` RAISES on a non-finite operand rather than folding it away, so
   // this is also the second row's finiteness check.
   const double moved = vllm_test::MaxAbsDiff(host, host2);
-  MESSAGE("qwen4_exp second-prompt logit movement: " << moved);
-  CHECK(moved > 0.0);
+  MESSAGE("qwen4_exp second-prompt logit movement (row T-1 only, DIAGNOSTIC): " << moved);
+
+  // ─── #2851: THE ROW ABOVE CANNOT CARRY THIS CLAIM, AND NEVER COULD ────────
+  //
+  // `logits_indices` is `{T - 1}`, so `moved` compares exactly ONE row — and
+  // both prompts are deliberately EOS-terminated, so it is the row for the SAME
+  // final token. Only 3 tokens of context can move it, and in this synthetic
+  // fixture that is below the arithmetic noise floor. `CHECK(moved > 0.0)` was
+  // therefore satisfied by rounding, not by prompt dependence, and it is a mute
+  // switch in both directions. Measured on `origin/main`'s own arithmetic,
+  // varying only `ids2`'s formula:
+  //
+  //   (t + 1) * 4 + 1  (committed)  0.0546875     kVocab - 2 - t        0
+  //   t + 2                         0.0546875     (t + 1) * 3           0.0546875
+  //   (t * 5 + 2) % (kVocab - 1)    0.0546875     kVocab - 4 + t        0
+  //
+  // Two of six valid prompts make `origin/main` itself read exactly 0, so the
+  // committed prompt is a winning ticket rather than a demonstration; and the
+  // SAME 0.0546875 (= 7/128) for four different prompts is a fixed rounding
+  // artifact, because a quantity that does not move when the prompt moves is
+  // not measuring the prompt. `max|logit|` is 95090.7, so it is ~5.7e-7 of the
+  // compared magnitude, against sibling movement gates in this same file that
+  // read 31.8438 (:1349) and 129102 (:2158) on rows whose token differs.
+  //
+  // So the claim is re-asserted where it is unambiguous: over ALL T rows, of
+  // which rows 0..T-2 carry a DIFFERENT TOKEN in the two prompts. That is the
+  // "a token came out of THIS prompt" the comment above asks for, and it does
+  // not depend on which arithmetic the GDN prefill takes.
+  auto run_fresh_all_rows = [&](const std::vector<int32_t>& prompt) {
+    std::vector<std::vector<float>> fs(3), fc(3);
+    std::vector<vllm::dense_attn::DBuf> fs_b, fc_b;
+    std::vector<vllm::GdnStateCache> fg(3);
+    fs_b.reserve(3);
+    fc_b.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      fs[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+      fc[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+      fs_b.emplace_back(
+          d, DType::kF32,
+          std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+          fs[i].data());
+      fc_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len}, fc[i].data());
+      fg[static_cast<size_t>(i)].ssm_state = fs_b.back().t();
+      fg[static_cast<size_t>(i)].conv_state = fc_b.back().t();
+    }
+    std::vector<uint16_t> fkv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+    vllm::dense_attn::DBuf fkv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim},
+                                 fkv.data());
+    std::vector<vllm::PagedKvCache> fattn(1);
+    fattn[0] = attn_kv[0];
+    fattn[0].data = fkv_b.t().data;
+    std::vector<int32_t> all_rows(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) all_rows[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+    vllm::ModelForwardInput fin{prompt, pos,    am, gm, fattn,
+                                fg,     config, q,  all_rows};
+    fin.num_reqs = 1;
+    fin.gdn_state_slots = 1;
+    vllm::ForwardLogits ffl;
+    REQUIRE_NOTHROW(ffl = vllm::ModelRegistry::Forward(*model, fin));
+    REQUIRE(ffl.on_device());
+    REQUIRE(ffl.rows == T);
+    std::vector<float> h(static_cast<size_t>(ffl.rows * ffl.vocab), 0.0F);
+    d.b.Copy(q, h.data(), ffl.device_tensor.data, h.size() * sizeof(float));
+    d.b.Synchronize(q);
+    return h;
+  };
+  const std::vector<float> all1 = run_fresh_all_rows(ids);
+  const std::vector<float> all2 = run_fresh_all_rows(ids2);
+  REQUIRE(all1.size() == all2.size());
+  const double moved_all = vllm_test::MaxAbsDiff(all1, all2);
+  // Rerunning the SAME prompt must be bit-identical, or `moved_all` is measuring
+  // run-to-run noise rather than the prompt. This is the control that stops the
+  // floor below from being a second mute switch.
+  const std::vector<float> all1_again = run_fresh_all_rows(ids);
+  const double self = vllm_test::MaxAbsDiff(all1, all1_again);
+  // MAX-ABS IS SATURATED IN THIS FIXTURE AND DOES NOT TRACK THE PROMPT.
+  // `moved_all` reads the identical 31.8438 for every one of the six `ids2`
+  // formulas swept in #2851 — which is the same shape of defect this case was
+  // repaired for, one order up: a value that does not move when the prompt
+  // moves is not measuring the prompt. Whole-vector statistics DO move
+  // (L2 107.857 / 108.49 / 108.572 / 76.7717 and 16-or-32 of 64 elements
+  // differing across those six), so the gate below asserts on one of those as
+  // well and the MESSAGE reports all three. The residue is the fixture's
+  // prompt-invariant common mode (`max|logit|` 95090.7), which is #2851's
+  // remaining half and belongs to the qwen4_exp row.
+  double l2_diff = 0.0;
+  std::size_t n_diff = 0;
+  for (std::size_t i = 0; i < all1.size(); ++i) {
+    const double d = static_cast<double>(all1[i]) - all2[i];
+    if (all1[i] != all2[i]) ++n_diff;
+    l2_diff += d * d;
+  }
+  l2_diff = std::sqrt(l2_diff);
+  MESSAGE("qwen4_exp second-prompt logit movement over ALL " << T
+          << " rows: max|d|=" << moved_all << " (SATURATED — see comment) L2="
+          << l2_diff << " elements differing=" << n_diff << "/" << all1.size()
+          << " (same-prompt rerun control: " << self << ")");
+  // THE DETERMINISM CONTROL IS WHAT MAKES `> 0.0` A GATE RATHER THAN A MUTE
+  // SWITCH, and it is the half the one-row form never had. With the same prompt
+  // reproducing bit-for-bit, a nonzero difference between two prompts can only
+  // have come from the prompt. Without it, `> 0.0` is satisfied by any noise —
+  // which is exactly how the row-T-1 form passed on a 7/128 rounding artifact.
+  CHECK(self == 0.0);
+  CHECK(moved_all > 0.0);
+  // The statistic that actually tracks the prompt, asserted alongside the one
+  // that does not, so a future regression to a saturated constant is visible
+  // here rather than only in an issue.
+  CHECK(l2_diff > 0.0);
+  CHECK(n_diff > 0);
+  // NO MAGNITUDE FLOOR IS ASSERTED, and that is deliberate rather than lazy.
+  // This fixture's logits are dominated by a prompt-INVARIANT common mode
+  // (`max|logit|` 95090.7 against a prompt-driven movement of 0.32 on the
+  // sequential arm and 31.84 on the chunked one), so max-abs-diff has no
+  // meaningful scale here and any constant would be picked to fit rather than
+  // derived. Whether this fixture SHOULD have that common mode is #2851's
+  // remaining half and belongs to the qwen4_exp row, not to a GDN kernel row.
+  // What is gated here is the claim the comment above actually makes.
 
   // ─── THE TWO REFUSALS THIS HOOK ADVERTISES, GATED BY THEIR MESSAGE ────────
   //
@@ -1107,7 +1239,7 @@ TEST_CASE(
     std::vector<uint16_t> kv(
         static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
     vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                                {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+                                {2 * kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
     // GROUP 2: the fused MLA page, [num_blocks, block_size, indexer_head_dim],
     // POISONED so an unwritten row is distinguishable from a written zero.
     std::vector<uint16_t> idx(static_cast<size_t>(kIdxRows * kIdxHeadDim), kPoison);
@@ -1475,7 +1607,7 @@ TEST_CASE(
     std::vector<uint16_t> kv(
         static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
     vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                                {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+                                {2 * kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
     std::vector<uint16_t> idx(
         static_cast<size_t>(kBlocks2 * kPage * kIdxHeadDim), 0);
     vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
@@ -1712,7 +1844,7 @@ TEST_CASE("qwen4_exp: a SECOND step decodes on the engine's own persistent cache
   std::vector<uint16_t> kv(
       static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+                              {2 * kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
   constexpr uint16_t kPoison = 0x3F80;
   std::vector<uint16_t> idx(static_cast<size_t>(kIdxRows * kIdxHeadDim), kPoison);
   vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
@@ -2029,7 +2161,7 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward runs a Q8_0 hyper-connection mix we
 
   std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;
   attn_kv[0].dtype = DType::kBF16;
@@ -2122,7 +2254,7 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward runs a Q8_0 hyper-connection mix we
   }
   std::vector<uint16_t> kv2(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv2_b(d, DType::kBF16,
-                               {2, 1, T, kKvHeads, kHeadDim}, kv2.data());
+                               {2, T, kKvHeads, kHeadDim}, kv2.data());
   std::vector<vllm::PagedKvCache> attn_kv2(1);
   attn_kv2[0] = attn_kv[0];
   attn_kv2[0].data = kv2_b.t().data;
@@ -2141,4 +2273,1337 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward runs a Q8_0 hyper-connection mix we
   const double moved = vllm_test::MaxAbsDiff(host, host2);
   MESSAGE("qwen4_exp Q8_0-mix second-prompt logit movement: " << moved);
   CHECK(moved > 0.0);
+}
+
+// ── THE PRODUCTION ENTRY POINT, ON A CUDA QUEUE ─────────────────────────────
+//
+// `ModelRegistry::Forward` is the entry point AGENTS.md names, and until #2396
+// and #2391 landed it could not be driven on a device at all: the loader refused
+// every non-CPU device before a tensor was read, and four of this model's `vt::`
+// ops had no `kCUDA` arm. Both are gone, so this case asks the question that
+// could not previously be asked — HOW FAR does a CUDA forward of this
+// architecture get, and what stops it?
+//
+// IT IS A MEASUREMENT, NOT AN ASSERTION THAT THE MODEL RUNS. The case prints
+// where the forward stopped and asserts only what this row owns: that the reason
+// is not a RESIDENCY. Before #2421 the answer was
+// `the two rope layouts are cross-checked on the host, so both must be
+// CPU-resident`, thrown from `CheckRopeLayoutsAgree` at decoder layer 3 — the
+// first `qwen_sparse_attention` layer, after PLE and three MoE blocks. A reader
+// who wants to see that red should check out the parent of #2421's commit and
+// run this case; that is the red this case was written against.
+//
+// THE INSTRUMENT'S OWN PRECONDITION IS ASSERTED FIRST. `LoadThroughRegistry`
+// takes its device from `platforms::CurrentPlatform()`, not from an argument, so
+// on a build where CUDA did not register this case would quietly load on the CPU
+// and measure nothing while reporting a pass. That is checked rather than
+// assumed.
+namespace {
+
+bool LayerLoopHasCuda() {
+  try {
+    vt::GetBackend(vt::DeviceType::kCUDA);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// The three refusals #2421 removed, by the words they refused with.
+bool LayerLoopIsResidencyRefusal(const std::string& what) {
+  return what.find("CPU-resident") != std::string::npos ||
+         what.find("read on the host") != std::string::npos ||
+         what.find("cross-checked on the host") != std::string::npos;
+}
+
+}  // namespace
+
+TEST_CASE("qwen4_exp: ModelRegistry::Forward on a CUDA queue gets past the QSA block") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  if (!LayerLoopHasCuda()) {
+    MESSAGE("no CUDA backend in this build: the device forward is UNMEASURED by this run");
+    return;
+  }
+  // THE PRECONDITION. The loader reads the device off the platform registry, so
+  // this is what separates "loaded on CUDA" from "loaded on the CPU and told you
+  // nothing".
+  REQUIRE(vllm::platforms::CurrentPlatform().device_type() == vt::DeviceType::kCUDA);
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  // THE LOAD IS PART OF THE MEASUREMENT. #2396 opened this gate; if it closes
+  // again the case must say so rather than fail somewhere later.
+  std::unique_ptr<vllm::LoadedModel> model;
+  std::string load_stopped_with;
+  try {
+    model = LoadThroughRegistry(g);
+  } catch (const std::exception& e) {
+    load_stopped_with = e.what();
+  }
+  INFO("CUDA load stopped with: ", load_stopped_with);
+  REQUIRE(load_stopped_with.empty());
+  REQUIRE(model != nullptr);
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  // THE CUDA QUEUE. Everything the hook allocates is a `dense_attn::DBuf` over
+  // `d.q.device`, so this one line is what makes every operand the QSA block
+  // sees device-resident — which is exactly the condition the three refusals
+  // this row removed used to reject.
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = gpu.CreateQueue();
+  vllm::dense_attn::Dev d{gpu, q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos, am, gm, attn_kv, gdn, config, q,
+                             logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl;
+  std::string stopped_with;
+  try {
+    fl = vllm::ModelRegistry::Forward(*model, in);
+  } catch (const std::exception& e) {
+    stopped_with = e.what();
+  }
+
+  // ─── WHAT THIS ROW OWNS ───────────────────────────────────────────────────
+  MESSAGE("CUDA ModelRegistry::Forward stopped with: ",
+          stopped_with.empty() ? std::string("(it did not stop)") : stopped_with);
+  CHECK_FALSE(LayerLoopIsResidencyRefusal(stopped_with));
+
+  if (!stopped_with.empty()) {
+    // NOT A PASS DRESSED AS ONE. The forward did not complete, the case says so
+    // in its own output, and the assertion above is the only claim it makes.
+    MESSAGE("the CUDA forward did not complete; a residency is no longer the reason");
+    gpu.DestroyQueue(q);
+    return;
+  }
+
+  // ─── AND WHAT IT DOES NOT ─────────────────────────────────────────────────
+  // FINITENESS FIRST: a fold over `std::max` returns the non-NaN operand, so an
+  // all-NaN row reads as a perfect match to any tolerance and an argmax over it
+  // still returns an index in range.
+  REQUIRE(fl.on_device());
+  REQUIRE(fl.device_tensor.data != nullptr);
+  REQUIRE(fl.device_tensor.dtype == DType::kF32);
+  std::vector<float> host(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+  gpu.Copy(q, host.data(), fl.device_tensor.data, host.size() * sizeof(float));
+  gpu.Synchronize(q);
+  int finite = 0;
+  for (float v : host) finite += std::isfinite(v) ? 1 : 0;
+  CHECK(finite == static_cast<int>(host.size()));
+  float lo = host[0], hi = host[0];
+  for (float v : host) {
+    lo = v < lo ? v : lo;
+    hi = v > hi ? v : hi;
+  }
+  // A CONSTANT row is finite, in range, and argmaxes to 0 while meaning the
+  // tower contributed nothing.
+  CHECK(hi > lo);
+
+  std::vector<int64_t> tok(1, -1);
+  {
+    vllm::dense_attn::DBuf tok_b(d, DType::kI64, {1});
+    vt::Tensor tt = tok_b.t();
+    vt::GreedyArgmax(q, tt, fl.device_tensor);
+    tok_b.Download(d, tok.data());
+  }
+  MESSAGE("qwen4_exp CUDA forward sampled token id: ", tok[0], " of ", kVocab,
+          " (logit range [", lo, ", ", hi, "])");
+  CHECK(tok[0] >= 0);
+  CHECK(tok[0] < kVocab);
+  gpu.DestroyQueue(q);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPERAND LIFETIME (issue #2476, spec `.agents/specs/gdn-qkvz-operand-lifetime.md`)
+//
+// WHAT FAILED, AND WHY NO EXISTING CASE COULD SEE IT. `compute-sanitizer` on
+// `thor:gpu0` reported `Warp illegal address` inside
+// `nvjet_sm110_tst_512x8_64x3_2x1_v_bz_TNT`, reached through `cublasLtMatmul` <-
+// `MatmulBTKernelCuda` <- `MatmulBf16D` <- `ProjectGdnQkvz`. Every extent that
+// GEMM was given — `M`, `N`, `K`, and the declared byte length of each operand —
+// agreed with the allocation AT LAUNCH TIME. What did not survive was the
+// allocation: `Qwen4ExpGdnBlockWeights` DEEP-COPIED the loader's owned weight
+// bytes into a per-step temporary, `ResidentWeight`'s host-alias arm handed
+// cuBLASLt a pointer INTO that temporary, and the temporary was destroyed at the
+// end of the layer's scope while the GEMM was still only queued.
+//
+// A CPU forward cannot fault on that, so this case does not try to. It asserts
+// the PROPERTY whose violation is the defect: the bytes a block hands to a
+// kernel belong to the model, not to a temporary. That is checkable with no
+// device, and it is what `qwen4_exp_forward.h` already CLAIMS above the
+// declaration ("nothing is ... reallocated here — the returned `OwnedTensor`s
+// are COPIES OF THE HANDLES and share the loader's bytes"). The claim was true
+// of the comment and false of the code.
+TEST_CASE(
+    "qwen4_exp: the GDN block adapter shares the loader's bytes rather than "
+    "copying them into a per-step temporary") {
+  const Qwen4ExpParams p = MakeParams();
+  Qwen4ExpWeights w = MakeWeights(p);
+
+  // The layer the fixture builds as a Gated DeltaNet one.
+  vllm::Qwen4ExpLayerWeights& lw = w.layers[0];
+  REQUIRE(lw.is_linear_attention);
+  REQUIRE(!lw.gdn.in_proj_qkv.bytes.empty());
+
+  const vllm::GdnLayerWeights gw = vllm::Qwen4ExpGdnBlockWeights(lw.gdn, p);
+
+  // POINTER IDENTITY, PER TENSOR. A pair that compares EQUAL is a view; a pair
+  // that differs is a second allocation the kernel will be pointed at and the
+  // model will not keep alive. Listed one by one rather than folded, so a red
+  // names the tensor.
+  // `Addr` and not the raw `const uint8_t*`: doctest stringifies a `char`-like
+  // pointer as a bool, so a raw comparison reds with the useless `1 == 1` and a
+  // reader cannot tell a second allocation from an offset one.
+  CHECK(Addr(gw.in_proj_qkv) == Addr(lw.gdn.in_proj_qkv));
+  CHECK(Addr(gw.in_proj_z) == Addr(lw.gdn.in_proj_z));
+  CHECK(Addr(gw.in_proj_b) == Addr(lw.gdn.in_proj_b));
+  CHECK(Addr(gw.in_proj_a) == Addr(lw.gdn.in_proj_a));
+  CHECK(Addr(gw.conv1d_weight) == Addr(lw.gdn.conv1d));
+  CHECK(Addr(gw.a_log) == Addr(lw.gdn.a_log));
+  CHECK(Addr(gw.dt_bias) == Addr(lw.gdn.dt_bias));
+  CHECK(Addr(gw.norm_weight) == Addr(lw.gdn.norm_weight));
+  CHECK(Addr(gw.out_proj) == Addr(lw.gdn.out_proj));
+
+  // ...AND THE VIEW CARRIES ITS OWN KEEP-ALIVE, which is the half that makes
+  // the identity SAFE rather than merely equal: a raw equal pointer with no
+  // ownership is the dangling operand this case exists to stop.
+  CHECK(gw.in_proj_qkv.bytes.borrowed());
+  CHECK(gw.out_proj.bytes.borrowed());
+
+  // The shape/orientation metadata a wrong-answer defect would ride on is
+  // unchanged by the sharing.
+  CHECK(gw.in_proj_qkv.nk == lw.gdn.in_proj_qkv.nk);
+  CHECK(gw.in_proj_qkv.dtype == lw.gdn.in_proj_qkv.dtype);
+  CHECK(gw.in_proj_qkv.bytes.size() == lw.gdn.in_proj_qkv.bytes.size());
+  CHECK(gw.out_proj.bytes.size() == lw.gdn.out_proj.bytes.size());
+
+  // AND THE BYTES OUTLIVE THE ADAPTER. Destroying the block's view must leave
+  // the model's own buffer readable and unchanged — the exact ordering the CUDA
+  // arm violated, stated where a host run can check it.
+  const uint8_t* base = lw.gdn.in_proj_qkv.bytes.data();
+  const size_t nb = lw.gdn.in_proj_qkv.bytes.size();
+  std::vector<uint8_t> before(base, base + nb);
+  {
+    const vllm::GdnLayerWeights scoped =
+        vllm::Qwen4ExpGdnBlockWeights(lw.gdn, p);
+    CHECK(Addr(scoped.in_proj_qkv) == reinterpret_cast<uintptr_t>(base));
+  }
+  REQUIRE(lw.gdn.in_proj_qkv.bytes.data() == base);
+  REQUIRE(lw.gdn.in_proj_qkv.bytes.size() == nb);
+  CHECK(std::memcmp(lw.gdn.in_proj_qkv.bytes.data(), before.data(), nb) == 0);
+}
+
+// The same property, entered through a PRODUCTION entry point rather than the
+// adapter, because a unit assertion on `Qwen4ExpGdnBlockWeights` proves the
+// function shares and proves nothing about what the forward calls.
+// `ModelRegistry::Forward` runs the layer loop over a real `qwen4exp` GGUF; the
+// observable afterwards is that the loaded model's OWN Gated DeltaNet buffers
+// have been shared with the step's adapter (`OwnedBytes::borrowed()`), which is
+// only reachable through the sharing construction the loop performs. Before the
+// fix the loop copied instead, the model's buffers stayed owned, and every step
+// allocated and freed a duplicate underneath a queued kernel.
+TEST_CASE(
+    "qwen4_exp: a forward through ModelRegistry::Forward leaves the model's own "
+    "GDN buffers shared, not duplicated") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  auto* loaded = dynamic_cast<vllm::Qwen4ExpLoadedModel*>(model.get());
+  REQUIRE(loaded != nullptr);
+
+  // The loader leaves them OWNED. Asserted, so the case cannot pass because the
+  // load already shared them for some unrelated reason.
+  {
+    const vllm::Qwen4ExpWeights& before = loaded->weights();
+    REQUIRE(before.layers[0].is_linear_attention);
+    REQUIRE(!before.layers[0].gdn.in_proj_qkv.bytes.borrowed());
+  }
+  const uint8_t* base = loaded->weights().layers[0].gdn.in_proj_qkv.bytes.data();
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim},
+                              kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos,     am, gm, attn_kv,
+                             gdn, config,  q,  logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  REQUIRE(fl.rows == 1);
+
+  // THE OBSERVABLE. The forward's own adapter took a view of these bytes, which
+  // `OwnedBytes::KeepAlive()` records ON THE SOURCE by turning it into a shared
+  // read-only buffer. A forward that copied instead leaves this false.
+  const vllm::Qwen4ExpWeights& after = loaded->weights();
+  CHECK(after.layers[0].gdn.in_proj_qkv.bytes.borrowed());
+  CHECK(after.layers[0].gdn.out_proj.bytes.borrowed());
+  // ...and sharing did not MOVE the bytes: the address the first step handed a
+  // kernel is the address every later step hands it.
+  CHECK(Addr(after.layers[0].gdn.in_proj_qkv) ==
+        reinterpret_cast<uintptr_t>(base));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODEDIV (#2496) — WHERE THE CUDA ARM LEAVES THE CPU ARM, BY STEP AND BY
+// TENSOR.
+//
+// The defect this case was written against is a whole-output symptom: on
+// `thor:gpu0`, over the released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S
+// artifact, a CUDA server emits `11751 271 271 271 271 271 0 0` where the CPU
+// arm on the same tree and the same file emits `11751 13 15767 411 2029 11 1092
+// 369`. Token 0 agrees, so PREFILL is right; every decode token is wrong, and
+// bit-stably so across builds, trees and `CUDA_LAUNCH_BLOCKING`. That excludes
+// the whole async/ordering class and points at STATE the second step carries.
+//
+// A whole-output symptom cannot name a tensor. This case converts it into one:
+// it drives the SAME two steps — one prefill, one decode — through
+// `ModelRegistry::Forward` on a CPU queue and on a CUDA queue over the SAME
+// fixture and the SAME token ids, and compares, in order:
+//
+//   1. the prefill logits,
+//   2. every PERSISTENT buffer the prefill wrote and the decode reads — the GDN
+//      conv ring, the GDN temporal state, the PLE conv ring, the PLE n-gram
+//      history, the paged K/V and the indexer side cache,
+//   3. the decode logits.
+//
+// The first row of that list that disagrees IS the answer, and the ordering is
+// the point: a state buffer that differs after a prefill whose logits agree is
+// exactly the shape "prefill right, decode wrong" describes. Every difference is
+// PRINTED whether or not it trips an assertion, because a diagnostic that only
+// says pass/fail cannot name a tensor either.
+//
+// WHY THE INPUTS ARE PINNED RATHER THAN SAMPLED. The second step's token is a
+// CONSTANT here, not the first step's argmax. Sampling it per arm would feed the
+// two arms different ids the moment the prefill logits disagree at all, and the
+// decode comparison would then be measuring two different questions.
+//
+// WHAT IT CANNOT SEE. `qwen4_exp_gguf_fixture.h` is a miniature whose layer-3
+// activations sit near 2^18, where one bf16 ULP is ~1024 and the K/V store
+// saturates — W5j measured 0 of 192 paged K/V words moving across two different
+// prompts. A CPU/CUDA difference small enough to be absorbed by that store is
+// invisible here. So a GREEN result on this case is NOT a claim that the device
+// arm decodes correctly at released width; it is the statement that the
+// difference is not one this fixture can hold.
+namespace {
+
+struct DecodeDivArm {
+  std::vector<float> logits1, logits2;
+  // After the prefill, in the published order: [gdn_conv, temporal, ple_conv,
+  // ngram] per linear layer, then the two paged pools.
+  std::vector<std::vector<unsigned char>> gdn_conv, ssm, ple_conv;
+  std::vector<std::vector<int64_t>> ngram;
+  std::vector<uint16_t> kv, idx;
+  // The same six after the decode.
+  std::vector<std::vector<unsigned char>> gdn_conv2, ssm2, ple_conv2;
+  std::vector<std::vector<int64_t>> ngram2;
+  std::vector<uint16_t> kv2, idx2;
+};
+
+// The largest absolute difference between two f32 vectors, and the largest
+// magnitude on the CPU side, so the caller can report a RELATIVE figure without
+// dividing by a zero row.
+void DecodeDivMaxAbs(const std::vector<float>& a, const std::vector<float>& b,
+                     double* max_diff, double* max_mag) {
+  *max_diff = 0.0;
+  *max_mag = 0.0;
+  REQUIRE(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    const double x = static_cast<double>(a[i]);
+    const double y = static_cast<double>(b[i]);
+    const double m = std::fabs(x) > std::fabs(y) ? std::fabs(x) : std::fabs(y);
+    if (m > *max_mag) *max_mag = m;
+    const double dd = std::fabs(x - y);
+    if (dd > *max_diff) *max_diff = dd;
+  }
+}
+
+// How many bytes of two raw buffers differ, and the index of the FIRST one. Raw
+// rather than typed because these snapshots carry three different element
+// widths and the question here is "did the two arms write the same bytes", not
+// "how far apart are the values".
+size_t DecodeDivBytesDiffer(const std::vector<unsigned char>& a,
+                            const std::vector<unsigned char>& b, size_t* first) {
+  *first = a.size();
+  size_t n = 0;
+  REQUIRE(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) {
+      if (n == 0) *first = i;
+      ++n;
+    }
+  }
+  return n;
+}
+
+// `device_next_id`, when non-null, is what the runner's asynchronous combine
+// spliced into the DEVICE identifier buffer for the decode row, while `next_id`
+// stays the STALE host value that combine deliberately never wrote back. Null on
+// the plain two-arm comparison, where both arms read the host vector.
+DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
+                                     const vllm::HfConfig& config,
+                                     vt::DeviceType dev_type,
+                                     const std::vector<int32_t>& prompt,
+                                     int32_t next_id,
+                                     const int32_t* device_next_id = nullptr) {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g, dev_type);
+  REQUIRE(model != nullptr);
+
+  constexpr int64_t kQsaLayer = 3;
+  constexpr int64_t kGdnLayers = 3;
+  constexpr int64_t kPage = 4;
+  constexpr int64_t kCols = 3;
+  constexpr int64_t kBlocks0 = 4;
+  constexpr int64_t kBlocks2 = 5;
+  const int64_t kIdxRows = kBlocks2 * kPage;
+  const auto T1 = static_cast<int64_t>(prompt.size());
+
+  const int64_t kConvDimL = 2 * kKeyDim + kValueDim;
+  const int64_t kGdnConvLen = kConvKernel - 1;
+  const int64_t kSsmRow = kNumVHeads * kLinHeadDim * kLinHeadDim;
+  const int64_t kPleStateLen = (kConvKernel - 1) * kNgramSize;
+  const int64_t kCtx = kNgramSize - 1;
+
+  const std::vector<int32_t> bt0{2, 0, 3};
+  const std::vector<int32_t> bt2{1, 3, 4};
+
+  vt::Backend& backend = vt::GetBackend(dev_type);
+  vt::Queue q = dev_type == vt::DeviceType::kCPU
+                    ? vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}
+                    : backend.CreateQueue();
+  vllm::dense_attn::Dev d{backend, q};
+
+  const size_t gdn_conv_bytes =
+      static_cast<size_t>(kConvDimL * kGdnConvLen) * sizeof(float);
+  const size_t ssm_bytes = static_cast<size_t>(kSsmRow) * sizeof(float);
+  // QUALIFIED, and that qualification is the whole of a heap overflow this file
+  // already paid for once. This translation unit has a SECOND `kStream` in scope
+  // — the golden fixture's, 16 — and an unqualified use here resolved to it while
+  // the `DBuf` below was built from `qwen4_exp_fixture::kStream`, 128. The
+  // snapshot then downloaded 2304 bytes into a 288-byte destination: 2016 bytes
+  // of heap corruption, which surfaced as `malloc(): unsorted double linked list
+  // corrupted` inside an unrelated `operator new` three statements later.
+  const int64_t kStreamWidth = qwen4_exp_fixture::kStream;
+  const size_t ple_conv_bytes = static_cast<size_t>(kStreamWidth * kPleStateLen) *
+                                vt::SizeOf(vllm::kQwen4ExpStreamDType);
+
+  std::vector<std::vector<unsigned char>> host_gdn_conv(kGdnLayers),
+      host_ssm(kGdnLayers), host_ple_conv(kGdnLayers);
+  std::vector<std::vector<int64_t>> host_ngram(kGdnLayers);
+  std::vector<vllm::dense_attn::DBuf> b_gdn_conv, b_ssm, b_ple_conv, b_ngram;
+  std::vector<vllm::GdnStateCache> gdn(kGdnLayers);
+  b_gdn_conv.reserve(kGdnLayers);
+  b_ssm.reserve(kGdnLayers);
+  b_ple_conv.reserve(kGdnLayers);
+  b_ngram.reserve(kGdnLayers);
+  for (int i = 0; i < kGdnLayers; ++i) {
+    host_gdn_conv[i].assign(gdn_conv_bytes, 0);
+    host_ssm[i].assign(ssm_bytes, 0);
+    host_ple_conv[i].assign(ple_conv_bytes, 0);
+    host_ngram[i].assign(static_cast<size_t>(kCtx), 0);
+    b_gdn_conv.emplace_back(d, DType::kF32,
+                            std::vector<int64_t>{1, kConvDimL, kGdnConvLen},
+                            host_gdn_conv[i].data());
+    b_ssm.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        host_ssm[i].data());
+    b_ple_conv.emplace_back(
+        d, vllm::kQwen4ExpStreamDType,
+        std::vector<int64_t>{1, qwen4_exp_fixture::kStream, kPleStateLen},
+        host_ple_conv[i].data());
+    b_ngram.emplace_back(d, DType::kI64, std::vector<int64_t>{1, kCtx},
+                         host_ngram[i].data());
+    gdn[static_cast<size_t>(i)].conv_state = b_gdn_conv.back().t();
+    gdn[static_cast<size_t>(i)].ssm_state = b_ssm.back().t();
+    gdn[static_cast<size_t>(i)].states = {b_gdn_conv.back().t(), b_ssm.back().t(),
+                                          b_ple_conv.back().t(), b_ngram.back().t()};
+  }
+
+  std::vector<uint16_t> kv_host(
+      static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2 * kBlocks0, kPage, kKvHeads, kHeadDim},
+                              kv_host.data());
+  constexpr uint16_t kPoison = 0x3F80;
+  std::vector<uint16_t> idx_host(static_cast<size_t>(kIdxRows * kIdxHeadDim),
+                                 kPoison);
+  vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
+                               idx_host.data());
+
+  std::vector<vllm::PagedKvCache> attn_kv(2);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = kBlocks0;
+  attn_kv[0].block_size = kPage;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+  attn_kv[1].data = idx_b.t().data;
+  attn_kv[1].dtype = DType::kBF16;
+  attn_kv[1].num_blocks = kBlocks2;
+  attn_kv[1].block_size = kPage;
+  attn_kv[1].num_kv_heads = kIdxKvHeads;
+  attn_kv[1].head_size = kIdxHeadDim;
+
+  std::vector<std::string> names;
+  std::vector<int32_t> group_ids, layer_indices, payload_slots;
+  std::vector<uint8_t> payload_kinds;
+  names.push_back("model.layers." + std::to_string(kQsaLayer) + ".self_attn.attn");
+  group_ids.push_back(0);
+  layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+  payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+  payload_slots.push_back(0);
+  for (int i = 0; i < kGdnLayers; ++i) {
+    names.push_back("model.layers." + std::to_string(i) + ".linear_attn");
+    group_ids.push_back(1);
+    layer_indices.push_back(i);
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent));
+    payload_slots.push_back(i);
+  }
+  names.push_back("model.layers." + std::to_string(kQsaLayer) +
+                  ".self_attn.indexer.k_cache");
+  group_ids.push_back(2);
+  layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+  payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+  payload_slots.push_back(1);
+
+  const std::vector<int32_t> bt_recurrent{0};
+  std::vector<std::vector<int32_t>> group_tables{bt0, bt_recurrent, bt2};
+  std::vector<int32_t> group_cols{static_cast<int32_t>(kCols), 1,
+                                  static_cast<int32_t>(kCols)};
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+  mk.group_ids = &group_ids;
+  mk.layer_indices = &layer_indices;
+  mk.payload_kinds = &payload_kinds;
+  mk.payload_slots = &payload_slots;
+  mk.group_block_tables = &group_tables;
+  mk.group_block_table_cols = &group_cols;
+
+  const auto slot_of = [&](int64_t t) {
+    return static_cast<int32_t>(bt0[static_cast<size_t>(t / kPage)] * kPage +
+                                t % kPage);
+  };
+
+  // The device identifier buffer this step publishes, or null. Declared out here
+  // so it outlives the `run` call that hands its address to the forward.
+  vllm::dense_attn::DBuf dev_ids_buf;
+  const int32_t* dev_ids_ptr = nullptr;
+
+  const auto run = [&](const std::vector<int32_t>& tok_ids, int64_t past_len) {
+    const auto T = static_cast<int64_t>(tok_ids.size());
+    std::vector<int32_t> pos(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      pos[static_cast<size_t>(t)] = static_cast<int32_t>(past_len + t);
+
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.max_query_len = static_cast<int>(T);
+    am.query_start_loc.assign({0, static_cast<int32_t>(T)});
+    am.seq_lens.assign(1, static_cast<int32_t>(past_len + T));
+    am.block_table_tensor = bt0;
+    am.block_table_num_cols = static_cast<int>(kCols);
+    am.max_seq_len = static_cast<int>(past_len + T);
+    am.slot_mapping.resize(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      am.slot_mapping[static_cast<size_t>(t)] = slot_of(past_len + t);
+
+    vllm::v1::GDNAttentionMetadata gm;
+    gm.num_actual_tokens = static_cast<int>(T);
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    if (past_len == 0) {
+      gm.num_prefills = 1;
+      gm.num_prefill_tokens = static_cast<int>(T);
+      gm.has_initial_state = std::vector<uint8_t>{0};
+      gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+      gm.prefill_state_indices = std::vector<int32_t>{0};
+      gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+      const auto conv =
+          vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+      gm.batch_ptr = conv.batch_ptr;
+      gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+    } else {
+      gm.num_decodes = 1;
+      gm.num_decode_tokens = static_cast<int>(T);
+    }
+
+    const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+    vllm::ModelForwardInput in{tok_ids, pos,    am, gm, attn_kv,
+                               gdn,     config, q,  logits_indices};
+    in.num_reqs = 1;
+    in.gdn_state_slots = 1;
+    in.multi_kv = &mk;
+    in.device_token_ids = dev_ids_ptr;
+
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+    REQUIRE(fl.on_device());
+    REQUIRE(fl.rows == 1);
+    std::vector<float> out(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+    d.b.Copy(q, out.data(), fl.device_tensor.data, out.size() * sizeof(float));
+    d.b.Synchronize(q);
+    return out;
+  };
+
+  DecodeDivArm r;
+  r.gdn_conv.resize(kGdnLayers);
+  r.ssm.resize(kGdnLayers);
+  r.ple_conv.resize(kGdnLayers);
+  r.ngram.resize(kGdnLayers);
+  r.gdn_conv2.resize(kGdnLayers);
+  r.ssm2.resize(kGdnLayers);
+  r.ple_conv2.resize(kGdnLayers);
+  r.ngram2.resize(kGdnLayers);
+
+  const auto snapshot = [&](std::vector<std::vector<unsigned char>>& gc,
+                            std::vector<std::vector<unsigned char>>& ss,
+                            std::vector<std::vector<unsigned char>>& pc,
+                            std::vector<std::vector<int64_t>>& ng,
+                            std::vector<uint16_t>& kvo, std::vector<uint16_t>& idxo) {
+    for (int i = 0; i < kGdnLayers; ++i) {
+      gc[static_cast<size_t>(i)].assign(gdn_conv_bytes, 0);
+      ss[static_cast<size_t>(i)].assign(ssm_bytes, 0);
+      pc[static_cast<size_t>(i)].assign(ple_conv_bytes, 0);
+      ng[static_cast<size_t>(i)].assign(static_cast<size_t>(kCtx), 0);
+      b_gdn_conv[static_cast<size_t>(i)].Download(d, gc[static_cast<size_t>(i)].data());
+      b_ssm[static_cast<size_t>(i)].Download(d, ss[static_cast<size_t>(i)].data());
+      b_ple_conv[static_cast<size_t>(i)].Download(d, pc[static_cast<size_t>(i)].data());
+      b_ngram[static_cast<size_t>(i)].Download(d, ng[static_cast<size_t>(i)].data());
+    }
+    kvo.assign(kv_host.size(), 0);
+    idxo.assign(idx_host.size(), 0);
+    kv_b.Download(d, kvo.data());
+    idx_b.Download(d, idxo.data());
+  };
+
+  r.logits1 = run(prompt, /*past_len=*/0);
+  snapshot(r.gdn_conv, r.ssm, r.ple_conv, r.ngram, r.kv, r.idx);
+  // PUBLISHED ONLY FOR THE DECODE ROW, which is the only row the runner's
+  // combine ever patches. The prefill above ran with a null pointer, so it is
+  // byte-identical to the plain arm.
+  std::vector<int32_t> dev_ids{device_next_id != nullptr ? *device_next_id : next_id};
+  if (device_next_id != nullptr) {
+    dev_ids_buf = vllm::dense_attn::DBuf(d, DType::kI32, {1}, dev_ids.data());
+    dev_ids_ptr = static_cast<const int32_t*>(dev_ids_buf.ptr());
+  }
+  r.logits2 = run(std::vector<int32_t>{next_id}, /*past_len=*/T1);
+  snapshot(r.gdn_conv2, r.ssm2, r.ple_conv2, r.ngram2, r.kv2, r.idx2);
+  return r;
+}
+
+}  // namespace
+
+TEST_CASE("qwen4_exp #2496: the CUDA decode step agrees with the CPU decode step") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  if (!LayerLoopHasCuda()) {
+    MESSAGE("no CUDA backend in this build: #2496's CPU-vs-CUDA decode "
+            "comparison is UNMEASURED by this run");
+    return;
+  }
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  // The prompt carries an EOS in the INTERIOR, which is a segment boundary in
+  // the hashed n-gram construction, so the ids after it are not a straight ramp.
+  const std::vector<int32_t> prompt{5, 9, 13, static_cast<int32_t>(kEosTokenId), 7, 2};
+  const int32_t next_id = 11;  // PINNED; see the header for why it is not sampled.
+  for (int32_t v : prompt) REQUIRE(v < static_cast<int32_t>(kVocab));
+  REQUIRE(next_id < static_cast<int32_t>(kVocab));
+
+  DecodeDivArm cpu = RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCPU,
+                                             prompt, next_id);
+  DecodeDivArm gpu = RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCUDA,
+                                             prompt, next_id);
+
+  for (float v : cpu.logits1) REQUIRE(std::isfinite(v));
+  for (float v : cpu.logits2) REQUIRE(std::isfinite(v));
+  for (float v : gpu.logits1) REQUIRE(std::isfinite(v));
+  for (float v : gpu.logits2) REQUIRE(std::isfinite(v));
+
+  double d1 = 0.0, m1 = 0.0, d2 = 0.0, m2 = 0.0;
+  DecodeDivMaxAbs(cpu.logits1, gpu.logits1, &d1, &m1);
+  DecodeDivMaxAbs(cpu.logits2, gpu.logits2, &d2, &m2);
+  const double rel1 = m1 > 0.0 ? d1 / m1 : d1;
+  const double rel2 = m2 > 0.0 ? d2 / m2 : d2;
+  MESSAGE("#2496 STEP 1 (prefill) logits: max|cpu-cuda| = " << d1 << " over a max "
+          "magnitude of " << m1 << " (relative " << rel1 << ")");
+  MESSAGE("#2496 STEP 2 (decode)  logits: max|cpu-cuda| = " << d2 << " over a max "
+          "magnitude of " << m2 << " (relative " << rel2 << ")");
+
+  // EVERY PERSISTENT BUFFER, PRINTED WHETHER OR NOT IT TRIPS. This is the list
+  // whose first disagreeing row names the defect; a diagnostic that only reports
+  // the logits repeats the symptom instead of locating it.
+  const char* kNames[4] = {"gdn_conv", "gdn_temporal", "ple_conv_ring", "ngram_history"};
+  for (int i = 0; i < 3; ++i) {
+    const std::vector<std::vector<unsigned char>>* pairs[3][2] = {
+        {&cpu.gdn_conv, &gpu.gdn_conv},
+        {&cpu.ssm, &gpu.ssm},
+        {&cpu.ple_conv, &gpu.ple_conv}};
+    for (int k = 0; k < 3; ++k) {
+      size_t first = 0;
+      const size_t n = DecodeDivBytesDiffer((*pairs[k][0])[static_cast<size_t>(i)],
+                                            (*pairs[k][1])[static_cast<size_t>(i)],
+                                            &first);
+      MESSAGE("#2496 after PREFILL, linear layer " << i << " " << kNames[k]
+              << ": " << n << " differing bytes, first at " << first);
+    }
+    MESSAGE("#2496 after PREFILL, linear layer " << i << " " << kNames[3]
+            << ": cpu/cuda equal = "
+            << (cpu.ngram[static_cast<size_t>(i)] == gpu.ngram[static_cast<size_t>(i)]));
+    // THE HISTORY IS INT64 TOKEN IDS, so it is the one cross-step state whose
+    // disagreement cannot be a rounding difference.
+    CHECK(cpu.ngram[static_cast<size_t>(i)] == gpu.ngram[static_cast<size_t>(i)]);
+    CHECK(cpu.ngram2[static_cast<size_t>(i)] == gpu.ngram2[static_cast<size_t>(i)]);
+  }
+  {
+    std::vector<unsigned char> a(reinterpret_cast<const unsigned char*>(cpu.kv.data()),
+                                 reinterpret_cast<const unsigned char*>(cpu.kv.data()) +
+                                     cpu.kv.size() * sizeof(uint16_t));
+    std::vector<unsigned char> b(reinterpret_cast<const unsigned char*>(gpu.kv.data()),
+                                 reinterpret_cast<const unsigned char*>(gpu.kv.data()) +
+                                     gpu.kv.size() * sizeof(uint16_t));
+    size_t first = 0;
+    MESSAGE("#2496 after PREFILL, paged K/V: " << DecodeDivBytesDiffer(a, b, &first)
+            << " differing bytes, first at " << first);
+  }
+  {
+    std::vector<unsigned char> a(reinterpret_cast<const unsigned char*>(cpu.idx.data()),
+                                 reinterpret_cast<const unsigned char*>(cpu.idx.data()) +
+                                     cpu.idx.size() * sizeof(uint16_t));
+    std::vector<unsigned char> b(reinterpret_cast<const unsigned char*>(gpu.idx.data()),
+                                 reinterpret_cast<const unsigned char*>(gpu.idx.data()) +
+                                     gpu.idx.size() * sizeof(uint16_t));
+    size_t first = 0;
+    MESSAGE("#2496 after PREFILL, indexer side cache: "
+            << DecodeDivBytesDiffer(a, b, &first) << " differing bytes, first at "
+            << first);
+  }
+
+  // THE HEADLINE, AND IT IS A COMPARISON OF THE TWO STEPS RATHER THAN AN
+  // ABSOLUTE BAND. #2496's whole shape is that the prefill agrees and the decode
+  // does not, so the assertion that convicts it is that the decode's arm-to-arm
+  // distance is not an order of magnitude worse than the prefill's. An absolute
+  // tolerance would have to be picked against this fixture's own noise floor and
+  // would say nothing about the defect.
+  // THE ASSERTION IS THE RATIO, AND THE ABSOLUTE BAND THIS REPLACES WAS A
+  // DIFFERENT CLAIM FROM THE ONE THE HEADER ARGUES FOR. It read
+  // `rel1 <= 1e-3 && rel2 <= 1e-3`, which asserts that the two arms AGREE
+  // NUMERICALLY -- and they do not, for reasons this case does not own:
+  // [#2547](https://github.com/mudler/vllm.cpp/issues/2547) measures the released
+  // artifact's PREFILL hidden state differing by about 0.3% between the arms,
+  // before any decode state is read, and names
+  // `vt::Qwen4ExpGatedResidual`'s CUDA arm — which routes its three projections
+  // through the shared `vt::MatmulBT` and so re-associates the K reduction, as
+  // `src/vt/cuda/cuda_qwen4_exp.cu` states in its own words — as the largest
+  // non-bit-identical surface on the path. An absolute band here would red on
+  // that, and reporting #2547 through this case would be reporting it in the
+  // wrong place.
+  //
+  // What #2496 IS, and what this case therefore asserts, is that the DECODE step
+  // is not an order of magnitude further apart than the PREFILL already is. The
+  // stale-identifier defect made the decode arm-to-arm distance O(1) against a
+  // prefill distance of ~1e-3, which this ratio convicts and a widened absolute
+  // band would not. The floor keeps the ratio meaningful when `rel1` is at or
+  // near zero.
+  const double floor = 1.0e-3;
+  const double allowed = 32.0 * (rel1 > floor ? rel1 : floor);
+  MESSAGE("#2496 decode-vs-prefill arm distance ratio: " << (rel1 > 0.0 ? rel2 / rel1 : rel2)
+          << " (decode " << rel2 << " against an allowance of " << allowed << ")");
+  CHECK(rel2 <= allowed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #2496 — THE FORWARD RUNS ON THE DEVICE IDENTIFIERS, NOT THE STALE HOST VECTOR.
+//
+// `ModelForwardInput::device_token_ids` states its own contract: "the input ids
+// for this step are ALREADY on the device; the host vector is stale for decode
+// rows". The asynchronous runner's combine splices each decode row's sampled
+// token into that DEVICE buffer on the main queue and never writes it back,
+// because materialising it on the host is the synchronise that path exists to
+// remove. Nine registries consume the field under [#1305]; this architecture did
+// not, so on `--device cuda` — where the mirror is the default — every decode
+// row embedded, and hashed into the PLE n-gram context, whatever the host array
+// happened to hold. For a row the host never wrote that is ZERO.
+//
+// MEASURED, before the fix, on `thor:gpu0` over the released
+// `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact with `VT_Q4EXP_STATE_FP=1`,
+// the n-gram history after each step:
+//
+//     --device cpu    [9338, 369] -> [369, 11751] -> [11751, 13] -> [13, 15767] …
+//     --device cuda   [9338, 369] -> [369,     0] -> [    0,  0] -> [ 0,     0] …
+//
+// The prefill agrees; from the first decode the model is fed token id 0 for ever.
+//
+// ─── WHY THIS CASE RUNS ON A CPU QUEUE AND STILL CONVICTS ───────────────────
+// The defect is not arithmetic and not a device kernel: it is WHICH ARRAY the
+// hook reads. So the case publishes a device identifier buffer that DISAGREES
+// with the host vector and asks which one the answer came from — a question a
+// CPU queue answers exactly, and one no GPU is needed to ask.
+//
+// THE PRECONDITION IS ASSERTED FIRST, and it is what stops this being a
+// tautology: the two identifiers must actually produce different logits on this
+// fixture. If `kFresh` and `kStale` decoded to the same row, the gate below
+// would pass on a hook that read either array.
+// THE NAME CARRIES NO COMMA, AND THAT IS LOAD-BEARING. `doctest`'s `-tc`
+// filter SPLITS ITS ARGUMENT ON COMMAS, so a case whose name contains one can
+// never be selected by name: the run reports `assertions: 0 | 0 passed | 0
+// failed` at rc 0, which reads as a pass. This case was first written as
+// "... DEVICE identifiers, not the stale host vector" and its red leg AND its
+// green leg both came back as that empty success on `thor:gpu0` -- a mutation
+// that measured nothing while reporting rc 0.
+TEST_CASE("qwen4_exp #2496: the decode step reads the DEVICE identifiers rather than the stale host vector") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  const std::vector<int32_t> prompt{5, 9, 13, static_cast<int32_t>(kEosTokenId), 7, 2};
+  // What the runner sampled and spliced into the device buffer.
+  const int32_t kFresh = 11;
+  // What a host row the combine never wrote holds. ZERO IS THE REAL VALUE, not a
+  // stand-in: `token_ids_cpu` is zero-initialised and the mirror arm never writes
+  // a decode row, which is why the released artifact hashed id 0 every step.
+  const int32_t kStale = 0;
+  REQUIRE(kFresh < static_cast<int32_t>(kVocab));
+
+  // THE PLE LAYER'S RANK AMONG THE LINEAR LAYERS, which is the index the arm
+  // helper snapshots under — never the decoder layer index.
+  constexpr size_t kPleRank = 1;
+
+  const DecodeDivArm fresh =
+      RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCPU, prompt, kFresh);
+  const DecodeDivArm stale =
+      RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCPU, prompt, kStale);
+  const DecodeDivArm spliced = RunQwen4ExpDecodeDivArm(
+      g, config, vt::DeviceType::kCPU, prompt, kStale, &kFresh);
+
+  REQUIRE(fresh.logits2.size() == stale.logits2.size());
+  REQUIRE(fresh.logits2.size() == spliced.logits2.size());
+  const size_t bytes = fresh.logits2.size() * sizeof(float);
+  for (float v : fresh.logits2) REQUIRE(std::isfinite(v));
+  for (float v : spliced.logits2) REQUIRE(std::isfinite(v));
+
+  // THE PRECONDITION. Two different identifiers must decode to two different
+  // rows, or nothing below is being measured.
+  REQUIRE(std::memcmp(fresh.logits2.data(), stale.logits2.data(), bytes) != 0);
+
+  // THE GATE. The published DEVICE identifier decides the answer, BIT FOR BIT:
+  // one queue, one order, one arithmetic, so the only thing that can differ is
+  // which array was read.
+  CHECK(std::memcmp(spliced.logits2.data(), fresh.logits2.data(), bytes) == 0);
+  CHECK(std::memcmp(spliced.logits2.data(), stale.logits2.data(), bytes) != 0);
+
+  // AND THE N-GRAM HISTORY CARRIES IT TOO, which the logits alone do not prove:
+  // the history is what the NEXT step reads, and it is int64 token ids, so its
+  // disagreement can never be a rounding difference. This is the observable the
+  // released-artifact measurement above was taken on.
+  REQUIRE(spliced.ngram2.size() > kPleRank);
+  REQUIRE(!spliced.ngram2[kPleRank].empty());
+  CHECK(spliced.ngram2[kPleRank].back() == static_cast<int64_t>(kFresh));
+  CHECK(stale.ngram2[kPleRank].back() == static_cast<int64_t>(kStale));
+}
+
+// ─── THE QSA QUERY BUFFER'S WIDTH, AT THE PRODUCTION ENTRY POINT (#2488) ─────
+// vLLM keeps the query at `model_config.dtype` from the fused q/gate GEMM to
+// `q_norm`: `torch.chunk` takes two views and does not widen
+// (`vllm/model_executor/models/qwen3_next.py:430`), and the norm's `.float()`
+// lives inside its own kernel (`vllm/models/qwen4_exp/nvidia/ple_layer.py:70`
+// then `:80` `.to(input_dtype)`). Both citations are FORWARD REFERENCES to vLLM
+// `origin/main` `cdefd9d499`, 1566 commits past this row's pin, which has no
+// `qwen4_exp` at all.
+//
+// WHY THIS CANNOT BE A VALUE TEST. `AGENTS.md`: "A token gate cannot detect a
+// dtype that is too wide. The tokens still match, and the goldens still pass,
+// although the path moves twice the bytes." Every other case in this file reads
+// logits, and not one of them could see an f32 `q`. So this case reads the
+// DTYPE and the BYTE COUNT of the buffer the block actually allocates.
+//
+// HOW IT SEES A BUFFER INSIDE `QsaBlockCore`. A pass-through provider is
+// installed for `kAttnGateSplit` on kCPU above the `vt-native` priority. It
+// records `q_out` and forwards to the native kernel, captured BEFORE the
+// registration so the forward cannot recurse into the spy. Nothing else changes:
+// the same kernel runs on the same tensors, so this instrument cannot alter the
+// result it is measuring.
+//
+// WHY IT IS A REACHABILITY GATE AND NOT A CLASS TEST. It enters through
+// `vllm::ModelRegistry::Forward`, and the count it asserts is a COUNTED PROPERTY:
+// deleting the `RunQwen4ExpQsaBlockPaged` call in `qwen4_exp_forward.cpp` takes
+// `calls` from 1 to 0 and reds this case. A test that constructed the block by
+// hand would stay green through that deletion.
+namespace qsa_q_width {
+
+struct Record {
+  int calls = 0;
+  bool every_q_is_bf16 = true;
+  int64_t last_bytes = -1;
+  int64_t last_numel = -1;
+};
+
+Record& Rec() {
+  static Record r;
+  return r;
+}
+
+vt::AttnGateSplitFn& Native() {
+  static vt::AttnGateSplitFn f = nullptr;
+  return f;
+}
+
+void SpySplit(vt::Queue& q, vt::Tensor& q_out, vt::Tensor& gate_out, const vt::Tensor& qgate) {
+  Record& r = Rec();
+  ++r.calls;
+  r.every_q_is_bf16 = r.every_q_is_bf16 && q_out.dtype == DType::kBF16;
+  r.last_numel = q_out.Numel();
+  r.last_bytes = q_out.Numel() * static_cast<int64_t>(vt::SizeOf(q_out.dtype));
+  Native()(q, q_out, gate_out, qgate);
+}
+
+// Idempotent: doctest may enter this file's cases in any order, and a second
+// registration under the same name is dropped by `RegisterOpProvider` anyway.
+void InstallOnce() {
+  static bool installed = false;
+  if (installed) return;
+  Native() = reinterpret_cast<vt::AttnGateSplitFn>(
+      vt::GetOp(vt::OpId::kAttnGateSplit, vt::DeviceType::kCPU));
+  vt::OpProvider p;
+  p.name = "qsa-q-width-spy";
+  p.priority = 1;  // above kNativeProviderName's 0, so Choose() takes it
+  p.supports = nullptr;
+  p.fn = reinterpret_cast<void*>(static_cast<vt::AttnGateSplitFn>(&SpySplit));
+  vt::RegisterOpProvider(vt::OpId::kAttnGateSplit, vt::DeviceType::kCPU, p);
+  installed = true;
+}
+
+}  // namespace qsa_q_width
+
+TEST_CASE("qwen4_exp: ModelRegistry::Forward splits the QSA query at the MODEL dtype") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  // THE INSTRUMENT'S OWN PRECONDITION, before anything it measures. A null
+  // native pointer would make the spy forward into nothing.
+  qsa_q_width::InstallOnce();
+  REQUIRE(qsa_q_width::Native() != nullptr);
+  qsa_q_width::Rec() = qsa_q_width::Record{};
+  REQUIRE(qsa_q_width::Rec().calls == 0);
+
+  const gguf_test::TempFile f(BuildFixture(FixtureOpts{}));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv = vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(d, DType::kF32,
+                       std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+                       ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32, std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim}, kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos, am, gm, attn_kv, gdn, config, q, logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  REQUIRE(fl.rows == 1);
+
+  // 1. THE INSTRUMENT RAN. Without this the three assertions below are vacuous
+  //    on a forward that never reached the QSA layer, and a `[SKIP]` would wear
+  //    a PASS. This is also the count the reachability mutation drives to zero.
+  const qsa_q_width::Record r = qsa_q_width::Rec();
+  INFO("kAttnGateSplit calls seen through ModelRegistry::Forward: ", r.calls);
+  REQUIRE(r.calls > 0);
+
+  // 2. THE SHAPE the block asked for is the model's query, not something else.
+  CHECK(r.last_numel == T * kQHeads * kHeadDim);
+
+  // 3. THE DTYPE and 4. THE BYTES. `T*kQHeads*kHeadDim*2` = 128 here. Before
+  //    #2488 this buffer was `DType::kF32` and this number was 256 — the same
+  //    tokens, twice the traffic, which is the whole reason the assertion is on
+  //    the width and not on the output.
+  CHECK(r.every_q_is_bf16);
+  CHECK(r.last_bytes == T * kQHeads * kHeadDim * 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE LAYER FINGERPRINT (issue #2547, wave PREFILLDIV)
+//
+// #2547 measured that a CUDA prefill of this architecture disagrees with a CPU
+// prefill at step 0, by about 0.3% on `sum(|x|)` over the model's own output,
+// and could not say WHERE: `VT_Q4EXP_STATE_FP` prints that output once per step
+// and has no layer axis. `VT_Q4EXP_LAYER_FP` adds one, and this case is what
+// says the axis exists and is reached from the production entry point.
+//
+// WHAT IT ASSERTS IS A COUNT, not the presence of a string in a stream. The tap
+// total for this fixture is derivable and exact: 2 taps outside the loop
+// (`emb`, `wide`), 9 per decoder layer, 2 more on the one PLE layer, and 1 for
+// the model output. `kLayers` is 4 and `kPleLayer` is 1, so 2 + 4*9 + 2 + 1 =
+// 41. A count is the assertion that survives a redirect that did not happen and
+// a grep that matched nothing, both of which read as a pass.
+//
+// AND IT IS A REACHABILITY CASE. `ModelRegistry::Forward` is the production
+// entry point; nothing here constructs `Qwen4ExpTextModelForward` by hand. The
+// paired mutation is to delete any one `LayerFp(` call site in the forward: the
+// total drops below 41 and this case reds.
+TEST_CASE("qwen4_exp: VT_Q4EXP_LAYER_FP taps every layer of ModelRegistry::Forward") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos, am, gm, attn_kv, gdn, config, q,
+                             logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  // 2 outside the loop + 9 per layer + 2 on the one PLE layer + 1 output.
+  const int64_t kExpectedTaps = 2 + kLayers * 9 + 2 + 1;
+
+  // ─── OFF IS THE RED. The switch unset must print NOTHING, because an
+  // instrument that runs whether or not it was asked for is a permanent cost on
+  // every forward and its `taps=` line stops being evidence that this run set
+  // the variable.
+  ::unsetenv("VT_Q4EXP_LAYER_FP");
+  vllm::detail::Qwen4ExpLayerFpResetForTest();
+  {
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  }
+  CHECK(vllm::detail::Qwen4ExpLayerFpTapsForTest() == 0);
+
+  // ─── ON, budget 1. One forward's worth of taps and not two.
+  ::setenv("VT_Q4EXP_LAYER_FP", "1", 1);
+  vllm::detail::Qwen4ExpLayerFpResetForTest();
+  {
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  }
+  const int64_t after_one = vllm::detail::Qwen4ExpLayerFpTapsForTest();
+  INFO("taps after one forward: ", after_one, " expected ", kExpectedTaps);
+  CHECK(after_one == kExpectedTaps);
+
+  // THE BUDGET IS A BUDGET. A second forward under a budget of 1 adds nothing,
+  // which is what keeps a decode loop from printing 41 lines a step forever.
+  {
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  }
+  CHECK(vllm::detail::Qwen4ExpLayerFpTapsForTest() == after_one);
+
+  // Leave the process as this case found it: another case in this binary that
+  // runs a forward must not inherit an armed instrument.
+  ::unsetenv("VT_Q4EXP_LAYER_FP");
+  vllm::detail::Qwen4ExpLayerFpResetForTest();
+  CHECK(vllm::detail::Qwen4ExpLayerFpTapsForTest() == 0);
 }

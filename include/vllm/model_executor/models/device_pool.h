@@ -416,6 +416,53 @@ class DevicePool {
   // past it, or make the captured region's `Put` cap-exempt. Recorded under
   // `## Owed` in `.agents/specs/eng-cudagraph-break.md`; owner row
   // `ENG-CUDAGRAPH-BREAK`.
+  // #2274: THE COUNTERPART TO PreGrowForCapture, and the invariant it restores.
+  //
+  // A capture BAKES the addresses of the blocks it allocates. Those blocks are
+  // freed back to the free list when `ForwardLayers` returns, and the replay then
+  // writes through the baked pointers. `qwen3_5.cpp` states the assumption:
+  // working scratch is "still SAFELY shared between the two graphs -- they replay
+  // sequentially on one stream". That covers the two GRAPHS. It does not cover a
+  // THIRD party allocating the same size class in between, which is what a newly
+  // created DFlash2 draft store does when it takes a block for its block table --
+  // and the next replay then writes f32 activations over that table.
+  //
+  // PreGrow guarantees `demand` free blocks per class BEFORE the capture; this
+  // takes the same count back OUT of the free list AFTER it, so the blocks the
+  // graph baked cannot be handed to anyone else while the graph lives. The
+  // holder returns them on graph reset. Memory cost is one step's scratch per
+  // live graph, which the graph was always going to need.
+  std::vector<std::pair<size_t, void*>> PinForGraph(vt::Backend& b, const StepDemand& demand) {
+    RequireOwnDevice(b, "PinForGraph");
+    std::vector<std::pair<size_t, void*>> pinned;
+    if (Bypass()) return pinned;  // no free list to pin out of
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& want : demand) {
+      ClassState& cs = classes_[want.first];
+      for (int64_t taken = 0; taken < want.second && !cs.free.empty(); ++taken) {
+        void* p = cs.free.back();
+        cs.free.pop_back();
+        retained_ -= want.first;
+        pinned.emplace_back(want.first, p);
+      }
+    }
+    return pinned;
+  }
+
+  // Give the pinned blocks back when the graph that baked them is gone.
+  void UnpinForGraph(vt::Backend& b, const std::vector<std::pair<size_t, void*>>& pinned) {
+    // Empty FIRST: a release site is a destructor, and `RequireOwnDevice` throws.
+    // A slot that never captured has nothing to give back, so it must not be able
+    // to raise on the teardown path.
+    if (pinned.empty()) return;
+    RequireOwnDevice(b, "UnpinForGraph");
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& kv : pinned) {
+      classes_[kv.first].free.push_back(kv.second);
+      retained_ += kv.first;
+    }
+  }
+
   size_t PreGrowForCapture(vt::Backend& b, const StepDemand& demand) {
     RequireOwnDevice(b, "PreGrowForCapture");
     if (Bypass()) return 0;  // no free list to grow; every Get is a driver call

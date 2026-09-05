@@ -79,6 +79,13 @@ class TensorStore {
     };
   }
 
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the presence predicate
+  // `LoadQwen3_5MTP` now REQUIRES, so a caller cannot silently turn the EXL3
+  // arm off by omitting it.
+  std::function<bool(const std::string&)> Exists() const {
+    return [this](const std::string& name) { return tensors_.count(name) != 0; };
+  }
+
  private:
   std::map<std::string, StoredTensor> tensors_;
 };
@@ -271,7 +278,7 @@ TEST_CASE("test_mtp_load_model_unified: dense MTP shares target embedding and lm
   TensorStore store;
   AddDenseMtp(store, config);
   const Qwen3_5MTPWeights weights = vllm::LoadQwen3_5MTP(
-      store.Resolver(), config, Qwen3_5MTPKind::kDense);
+      store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense);
   const Qwen3_5DenseWeights target = MakeDenseTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -300,7 +307,7 @@ TEST_CASE("test_mtp_load_model_unified: MoE fused stacks split per expert and sh
   TensorStore store;
   AddMoeMtp(store, config);
   const Qwen3_5MTPWeights weights = vllm::LoadQwen3_5MTP(
-      store.Resolver(), config, Qwen3_5MTPKind::kMoe);
+      store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kMoe);
   const Qwen3_5MoeWeights target = MakeMoeTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -333,13 +340,19 @@ TEST_CASE("test_mtp_load_model_unified: MoE fused stacks split per expert and sh
   CHECK(up0[0] == gate_up[static_cast<size_t>(intermediate * hidden)]);
 }
 
-TEST_CASE("test_mtp_load_model_unified: every mtp tensor is strictly BF16") {
+// MODEL-QWEN35-EXL3-HEAD (#2495 item 5) NARROWS this title and nothing else.
+// The assertion is unchanged and still fires: `mtp.fc.weight` is the BF16
+// arm's tensor, which an EXL3 checkpoint does not ship at all, so the trellis
+// rung is not selected and the strictness refusal is still the right answer
+// for the arm this case is about. "every mtp tensor" is simply no longer
+// true of every checkpoint.
+TEST_CASE("test_mtp_load_model_unified: every mtp tensor on the BF16 arm is strictly BF16") {
   const HfConfig config = MakeConfig(Qwen3_5MTPKind::kDense);
   TensorStore store;
   AddDenseMtp(store, config);
   store.MutableView("mtp.fc.weight").dtype = "F16";
   CHECK_THROWS_AS(
-      vllm::LoadQwen3_5MTP(store.Resolver(), config,
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config,
                            Qwen3_5MTPKind::kDense),
       std::runtime_error);
 }
@@ -353,7 +366,7 @@ TEST_CASE("test_mtp_load_model_unified: wrong same-byte-count shape is rejected"
   // storage size.
   store.MutableView("mtp.layers.0.self_attn.q_proj.weight").shape = {4, 8};
   CHECK_THROWS_AS(
-      vllm::LoadQwen3_5MTP(store.Resolver(), config,
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config,
                            Qwen3_5MTPKind::kDense),
       std::runtime_error);
 }
@@ -364,7 +377,7 @@ TEST_CASE("test_mtp_load_model_unified: dedicated embeddings are rejected for ga
   TensorStore store;
   AddDenseMtp(store, config);
   CHECK_THROWS_AS(
-      vllm::LoadQwen3_5MTP(store.Resolver(), config,
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config,
                            Qwen3_5MTPKind::kDense),
       std::runtime_error);
 }
@@ -374,7 +387,7 @@ TEST_CASE("test_mtp_propose k=1: MTP forward returns hidden states directly") {
   TensorStore store;
   AddDenseMtp(store, config);
   const Qwen3_5MTPWeights weights = vllm::LoadQwen3_5MTP(
-      store.Resolver(), config, Qwen3_5MTPKind::kDense);
+      store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense);
   const Qwen3_5DenseWeights target = MakeDenseTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -406,7 +419,7 @@ TEST_CASE("test_mtp_propose k=1: MoE MTP forward returns hidden states directly"
   TensorStore store;
   AddMoeMtp(store, config);
   const Qwen3_5MTPWeights weights = vllm::LoadQwen3_5MTP(
-      store.Resolver(), config, Qwen3_5MTPKind::kMoe);
+      store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kMoe);
   const Qwen3_5MoeWeights target = MakeMoeTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -472,7 +485,7 @@ TEST_CASE("i5c paged MTP forward equals standalone (dense head)") {
   TensorStore store;
   AddDenseMtp(store, config);
   const Qwen3_5MTPWeights weights =
-      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense);
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense);
   const Qwen3_5DenseWeights target = MakeDenseTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -509,7 +522,7 @@ TEST_CASE("i5c paged MTP forward equals standalone (MoE head)") {
   TensorStore store;
   AddMoeMtp(store, config);
   const Qwen3_5MTPWeights weights =
-      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kMoe);
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kMoe);
   const Qwen3_5MoeWeights target = MakeMoeTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -548,7 +561,7 @@ TEST_CASE("i5c draft KV two-step: decode attends over written K/V") {
   TensorStore store;
   AddDenseMtp(store, config);
   const Qwen3_5MTPWeights weights =
-      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense);
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense);
   const Qwen3_5DenseWeights target = MakeDenseTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -604,7 +617,7 @@ TEST_CASE("i5c MtpProposePrefill k=1 returns the argmax over the shifted draft")
   TensorStore store;
   AddDenseMtp(store, config);
   const Qwen3_5MTPWeights weights =
-      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense);
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense);
   const Qwen3_5DenseWeights target = MakeDenseTarget(config);
   const Qwen3_5MTPModel model(weights, target, config);
 
@@ -680,7 +693,7 @@ TEST_CASE("i5d-pre LoadedModel::BuildMtpDraft builds a Qwen3.5 draft, null other
 
   // Attach the loaded mtp.* draft weights, then build the draft.
   model->AttachMtpDraftWeights(
-      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense));
+      vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense));
   std::unique_ptr<Qwen3_5MTPModel> draft = model->BuildMtpDraft(config);
   REQUIRE(draft != nullptr);
   // load_eagle_model sharing: the draft borrows the target's embed_tokens/lm_head.
@@ -698,6 +711,6 @@ TEST_CASE("i5d-pre LoadedModel::BuildMtpDraft builds a Qwen3.5 draft, null other
   CHECK(non_mtp.BuildMtpDraft(config) == nullptr);
   CHECK_THROWS_AS(
       non_mtp.AttachMtpDraftWeights(
-          vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense)),
+          vllm::LoadQwen3_5MTP(store.Resolver(), store.Exists(), config, Qwen3_5MTPKind::kDense)),
       std::runtime_error);
 }

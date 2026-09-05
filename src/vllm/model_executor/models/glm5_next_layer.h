@@ -226,12 +226,19 @@ struct DecoderLayerResult {
 //                    run agrees with the one-shot run over the same tokens.
 //   queue          : must be a CPU queue; the KDA recurrence and the MoE router
 //                    dispatch on it.
+//   dev            : W9c-3a. Non-null on a device run, and read by exactly ONE
+//                    consumer -- `MoeForward`'s routed-expert GEMM. Every other
+//                    arm of this layer runs on `queue`, which is why the two
+//                    are separate parameters rather than one: a single queue
+//                    would have to be either CPU (no device arm) or CUDA (host
+//                    pointers into device kernels), and neither is this layer.
 DecoderLayerResult DecoderLayerForward(
     const Glm5NextParams& p, int64_t layer_idx, const DecoderLayerWeights& w,
     const std::vector<float>& hidden_streams,
     const std::vector<uint8_t>& mask,
     const std::vector<int32_t>* prev_topk_indices, int64_t prev_topk_width,
-    int64_t batch, int64_t seq_len, LayerCache* cache, vt::Queue& queue);
+    int64_t batch, int64_t seq_len, LayerCache* cache, vt::Queue& queue,
+    dense_attn::Dev* dev = nullptr);
 
 // The assembled text stack's weights (`Glm5NextTextModel.__init__`, `:1412-1426`)
 // minus the embedding table, which the caller gathers.
@@ -288,7 +295,8 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
                                     const std::vector<uint8_t>& mask,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
-                                    vt::Queue& queue);
+                                    vt::Queue& queue,
+                                    dense_attn::Dev* dev = nullptr);
 
 // `Glm5NextTextModel.forward` (`:1431-1494`), from `inputs_embeds`.
 //
@@ -312,7 +320,8 @@ std::vector<float> TextModelForward(const TextModelWeights& w,
                                     const std::vector<uint8_t>& mask,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
-                                    vt::Queue& queue);
+                                    vt::Queue& queue,
+                                    dense_attn::Dev* dev = nullptr);
 
 // `Glm5NextTextKdaDims` from the resolved config. Every field comes from
 // `p.kda` and none is defaulted here: `linear_head_dim`, `linear_num_heads` and

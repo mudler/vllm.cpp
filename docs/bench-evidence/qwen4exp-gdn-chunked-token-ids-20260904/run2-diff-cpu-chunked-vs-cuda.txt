@@ -1,0 +1,22 @@
+=== CPU-CHUNKED vs CUDA-CTRL : rows base=42 other=42 ===
+step  L    tag       dtype     sumabs_base   sumabs_other  rel_sumabs
+0     None emb       bf16        37.242316      37.242316   0.000e+00
+0     None wide      bf16       148.969264     148.969264   0.000e+00
+0     None in        bf16       148.969264     148.969264   0.000e+00
+0     None ahc.mix   bf16        6517.5925      6517.5925   0.000e+00
+0     None ahc.inj   bf16      0.952026367    0.952026367   0.000e+00
+0     None blk       bf16       1074.05248     1074.03345   1.772e-05
+0     None s.attn    bf16       232.272312     232.270443   8.047e-06
+0     None mhc.mix   bf16       3615.47142     3615.62777   4.324e-05
+0     None mhc.inj   bf16       2.92224121     2.92224121   0.000e+00
+0     None moe       bf16       389.936505     390.025768   2.289e-04
+0     None s.mlp     bf16       392.790737     392.853498   1.598e-04
+0     None ple       bf16       232.508111     232.818457   1.333e-03
+0     None s.ple     bf16       568.716336     569.080593   6.401e-04
+0     None out       bf16       27981.5263     28054.1436   2.588e-03
+--- CPU-CHUNKED vs CUDA-CTRL SUMMARY ---
+TAPS COMPARED                 : 42
+TAPS WITH rel(sumabs) != 0    : 24
+FIRST TAP THAT DIFFERS        : ('0', None, 'blk')
+LARGEST rel(sumabs)           : 2.320338e-02 at ('2', None, 'out')
+L00 blk rel(sumabs)           : 1.771794e-05  (base=1074.05248 other=1074.03345)

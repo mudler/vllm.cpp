@@ -673,9 +673,38 @@ numbers are under `## Owed`, and the gate that could exist lives on the seam in
   `docs/USAGE.md` edit this change did not owe, and manufacturing one to turn a
   gate green is what AGENTS.md forbids. Both effects are properties of doing it
   piecemeal. The records this row writes state the anchors CORRECTLY -- the
-  table at `:97` and `:129` above, and #1219's index row -- so the record says
-  what is true while the source stays uniformly stale until #1230 sweeps it in
-  one commit with its own reviewer.
+  table at §(d)'s `what frame 0 does to the state` row and the Stage 1 port
+  map's `schedule_tokens` row above, and #1219's index row -- so the record
+  says what is true while the source stays uniformly stale until #1230 sweeps it
+  in one commit with its own reviewer.
+
+  **SWEPT 2026-09-01 by row `LTX25-ANCHOR-REPAIR`**, spec
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §3, in one commit with its
+  own reviewer, which is the shape this bullet asked for. Both anchors were
+  re-derived independently at the same pin -- `~/_git/LTX-2` with
+  `HEAD = fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`, read with
+  `git show <pin>:<path>` so a working tree cannot substitute another revision
+  -- and the re-derivation AGREES with the paragraph above line for line. The
+  sweep took every live site in 12 files: `latent_cond.py:38-39` -> `:40-41` at
+  13 sites and `schedulers.py:31` -> `:32` at 11, leaving zero mixed files.
+  Nothing but comments and spec prose moved.
+
+  **The second obstacle this bullet names is gone rather than worked around**:
+  `scripts/check-doc-checkpoint.py` no longer exists in the tree, so the
+  `USER_USAGE_PREFIXES` path match that made a comment-only edit in
+  `include/vllm/` demand a `docs/USAGE.md` edit cannot fire. That is what made
+  the sweep takeable now and not then.
+
+  **Three anchors in this bullet's own text had themselves rotted**, which is
+  the class it is about. `ltx2_video.cpp` no longer cites `schedulers.py` at
+  `:3618` or `latent_cond.py` at `:2208` and `:3174`; those lines moved with the
+  file. They are left as written because the sentence is a HISTORICAL claim
+  about the mixed state at the time of writing, and the mixed state it describes
+  no longer exists. The `:97` and `:129` anchors into this same file, which were
+  LIVE claims about a table a reader is meant to go and read, are replaced above
+  with the row labels they point at, inside sections named rather than
+  numbered: §(d) "THE DIFFERENCE THE AUDIT DOES NOT NAME: the conditioning
+  builder" and "### Stage 1" under "## Port map, each line read at the pin".
 
 ## Stop conditions
 

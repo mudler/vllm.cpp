@@ -120,10 +120,21 @@ inline DflashBlockAttnRoute ClassifyDflashBlockAttn(
 // the same store, element for element. A transcription in the test would gate
 // nothing.
 //
-// `causal == false` carries NO window, because the block kernel ignores
-// `sliding_window` when it is non-causal (its lower bound is guarded on
-// `causal && window > 0`). A non-causal DFlash layer is bidirectional over the
-// whole combined sequence.
+// `causal == false` CARRIES A SYMMETRIC WINDOW, and until #2784 it carried
+// none. Upstream's `_maybe_symmetrize_window`
+// (vllm/v1/attention/backends/flash_attn.py:319-330 @ the parity pin
+// 5559679229) makes a causal `(w, 0)` window `(w, w)` when attention is
+// non-causal, "so bidirectional queries attend in both directions", and
+// `:665-696` puts that value in the metadata every DFlash group reads. This
+// function used to drop the window entirely on that arm, matching a `causal &&`
+// guard the eleven DFlash kernels also carried — and the published DFlash2
+// drafter declares five `sliding_attention` layers, `sliding_window: 2048` and
+// `is_causal: false`, so on the checkpoint this engine ships EVERY draft layer
+// ran unwindowed. Below 2048 tokens of context that is inert; above it #2784
+// measured acceptance falling from 0.77 at 2,307 prompt tokens to 0.06 at
+// 8,159. Both backends already implement the right-hand bound
+// (`src/vt/cpu/cpu_paged_attn.cpp:223-225`,
+// `src/vt/cuda/cuda_paged_attn.cu:220-224`), so only this translation moved.
 struct DflashBlockPagedMask {
   bool causal = false;
   bool has_window = false;
@@ -134,10 +145,12 @@ struct DflashBlockPagedMask {
 inline DflashBlockPagedMask DflashBlockPagedMaskOf(bool causal, int64_t sliding_window) {
   DflashBlockPagedMask m;
   m.causal = causal;
-  if (causal && sliding_window > 0) {
+  if (sliding_window > 0) {
     m.has_window = true;
     m.window_left = static_cast<int32_t>(sliding_window - 1);
-    m.window_right = 0;
+    // (w-1, 0) causal, (w-1, w-1) symmetric — upstream's two forms, and the
+    // two `vt::AttentionWindow` names in include/vt/ops.h.
+    m.window_right = causal ? 0 : static_cast<int32_t>(sliding_window - 1);
   }
   return m;
 }

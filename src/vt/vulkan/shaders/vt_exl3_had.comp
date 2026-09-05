@@ -1,0 +1,190 @@
+#version 450
+// EXL3 `had_r_128` — the blockwise Hadamard-128 that is steps 1 and 3 of
+// `vt::Exl3Gemm`. Row BACKEND-VULKAN-EXL3 (#2530), spec
+// .agents/specs/backend-vulkan-exl3.md.
+//
+// THE DONOR IS THE PORTABLE CPU REFERENCE, NOT THE CUDA KERNEL:
+//   src/vt/cpu/cpu_exl3_kernels.cpp   HadBlock128, ShuffleHadWarp, HadRowBlock
+// which is itself a 1:1 port of exllamav3 @
+// 2398c05635fbbad01a0a51dce63c85c6c8a8450e (MIT), hadamard_inner.cuh:17-44
+// (shuffle_had_f4x32) and :93-279 (the hf / ff / fh inners). vLLM implements no
+// EXL3 at the parity pin and has no Vulkan backend at all, so exllamav3 is this
+// format's registered secondary oracle (.agents/oracles/exllamav3.md) while the
+// DISPATCH SHAPE is llama.cpp's, exactly as vt_common.glsl records.
+//
+// WHY THE OPERATION ORDER IS COPIED AND NOT SIMPLIFIED. The obvious portable
+// Hadamard is a two-line loop nest. This one instead reproduces upstream's warp
+// decomposition exactly: levels 1-2 on the four values a "lane" holds, levels
+// 4-64 as five xor-partner steps over 32 lanes, the sign flip performed by
+// XORing the f32 SIGN BIT, every add in f32, one multiply by `r_scale` at the
+// end and one round at the store. That is what makes the gate on this file a
+// BYTE claim rather than a tolerance: this arm and the host arm perform the same
+// f32 operations on the same values in the same ORDER. Written as a plain loop
+// it would be close, and close is not checkable.
+//
+// GEOMETRY. One 32-lane group per 128-block, FOUR groups per 128-invocation
+// workgroup, `sh[group][j][lane]` in shared memory (2 KiB, against Vulkan's
+// 16 KiB GUARANTEED maxComputeSharedMemorySize). Lane `t` holds the four values
+// of columns 4t..4t+3, so lane bit `i` carries Hadamard level 4*i — which is why
+// levels 4..64 are exactly the five xor-partner steps below and not a rewritten
+// butterfly.
+//
+// 128 INVOCATIONS AND NOT THE ROCm ARM'S 256: 128 is the Vulkan-guaranteed
+// maxComputeWorkGroupInvocations, which vt_common.glsl § VT_TG makes this
+// backend's portability floor. 256 would need a device probe and a second
+// module for the fallback.
+//
+// IN-PLACE IS SAFE, and by construction rather than by luck: every lane loads
+// its four inputs BEFORE the first barrier() and stores AFTER the last one, so
+// no element is written while any lane may still read it. `vt::Exl3Gemm`'s
+// contract permits `a_had` to alias `a`, and upstream says the same of its own
+// kernel ("Works inplace if y == x", hadamard.cu:86).
+//
+// EVERY barrier() IS REACHED BY EVERY INVOCATION. The grid-stride loop bound and
+// the five-step inner loop are uniform across the workgroup, and no barrier sits
+// inside the `live` branch — which GLSL requires and which a per-lane block
+// count would silently violate.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// in / out get the u32+u16 PAIR because the width is a specialization constant
+// and both branches are statically present in this module. pre / post are fp16
+// BY CONTRACT on both arms (upstream's `const half*` in the half and the float
+// kernels alike, hadamard_inner.cuh:109/:171), so each needs only the 16-bit
+// view. An absent scale vector is bound aliasing `in`, the same arrangement
+// vt_rms_norm uses for its optional residual: a descriptor a shader statically
+// uses must be valid even on the path that never reads it.
+layout(binding = 0) readonly buffer Ib32 { uint v[]; } I32;
+layout(binding = 1) readonly buffer Ib16 { uint16_t v[]; } I16;
+layout(binding = 2) buffer Ob32 { uint v[]; } O32;
+layout(binding = 3) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 4) readonly buffer Pb16 { uint16_t v[]; } PRE;
+layout(binding = 5) readonly buffer Qb16 { uint16_t v[]; } POST;
+
+// The four (input, output) width combinations upstream's inners come in, as the
+// two independent bits they actually are. `had_hf` is (1,1), `had_ff` is (0,0)
+// and `had_fh` is (0,1) — the three `Exl3GemmKernelCpu` selects between.
+layout(constant_id = 0) const uint VT_HAD_HALF_IN = 1u;
+layout(constant_id = 1) const uint VT_HAD_HALF_OUT = 1u;
+
+layout(push_constant) uniform Params {
+  uint nblocks;         // rows * blocks_per_row
+  uint blocks_per_row;  // cols / 128
+  uint cols;
+  uint total_groups;    // ceil(nblocks / 4)
+  uint has_pre;
+  uint has_post;
+  uint in_off;          // BYTE offsets, see vt_common.glsl § STORAGE MODEL
+  uint out_off;
+  uint pre_off;
+  uint post_off;
+  float r_scale;        // scale / sqrt(128), folded by the host
+} p;
+
+// [group][j][lane]. 4*4*32 floats = 2 KiB.
+shared float sh[4][4][32];
+
+// cpu_exl3_kernels.cpp NegBySignBit. XORing the sign bit, not `0.0 - v`: the two
+// differ on a zero, and this arm reproduces the host operation rather than an
+// equivalent-looking one.
+float vt_neg_sign(float v) { return uintBitsToFloat(floatBitsToUint(v) ^ 0x80000000u); }
+
+// cpu_exl3_kernels.cpp MulF16 — the fp16 multiply __hmul2 performs. The exact
+// product of two fp16 significands is 22 bits and fits f32 exactly, so rounding
+// once from f32 is the value an fp16 multiply produces. vt_f16_to_f32 /
+// vt_f32_to_f16 are integer transcriptions of src/vt/dtype.cpp, so this is the
+// SAME function the host calls and not merely one that agrees.
+uint vt_mul_f16(uint a, uint b) {
+  return vt_f32_to_f16(vt_f16_to_f32(a) * vt_f16_to_f32(b));
+}
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x;
+  const uint ty = tid >> 5;    // which of the four 32-lane groups
+  const uint t = tid & 31u;    // the lane within it
+
+  for (uint g = gl_WorkGroupID.x; g < p.total_groups; g += gl_NumWorkGroups.x) {
+    const uint gb = g * 4u + ty;
+    const bool live = gb < p.nblocks;
+    const uint row = live ? gb / p.blocks_per_row : 0u;
+    const uint blk = live ? gb % p.blocks_per_row : 0u;
+    const uint base = row * p.cols + blk * 128u;
+    const uint sbase = blk * 128u;  // the scale vectors are indexed by COLUMN
+
+    // load + pre-scale. The half arm multiplies in fp16 BEFORE the widen
+    // (hadamard_inner.cuh:112-114); the float arm widens the fp16 scale and
+    // multiplies in f32 (:171-174). Those are different roundings and the
+    // distinction is upstream's, not an accident of transcription.
+    float v[4];
+    for (uint j = 0u; j < 4u; ++j) {
+      const uint off = base + 4u * t + j;
+      const uint soff = sbase + 4u * t + j;
+      if (!live) {
+        v[j] = 0.0;
+      } else if (VT_HAD_HALF_IN != 0u) {
+        uint w = uint(I16.v[(p.in_off >> 1) + off]);
+        if (p.has_pre != 0u) w = vt_mul_f16(w, uint(PRE.v[(p.pre_off >> 1) + soff]));
+        v[j] = vt_f16_to_f32(w);
+      } else {
+        const float x = uintBitsToFloat(I32.v[(p.in_off >> 2) + off]);
+        v[j] = p.has_pre != 0u ? x * vt_f16_to_f32(uint(PRE.v[(p.pre_off >> 1) + soff])) : x;
+      }
+    }
+
+    // levels 1 and 2, on the four values this lane holds
+    // (hadamard_inner.cuh:118-129).
+    const float s0 = v[0] + v[1];
+    const float d0 = v[0] - v[1];
+    const float s1 = v[2] + v[3];
+    const float d1 = v[2] - v[3];
+    barrier();  // every load above is now complete, so an aliased write is safe
+    sh[ty][0][t] = s0 + s1;
+    sh[ty][1][t] = d0 + d1;
+    sh[ty][2][t] = s0 - s1;
+    sh[ty][3][t] = d0 - d1;
+
+    // levels 4..64: ShuffleHadWarp's five xor-partner steps. Read both operands
+    // out of shared memory, barrier, then write — `next[][]` on the host is that
+    // same "no lane overwrites a value another lane still needs" separation.
+    for (uint i = 1u; i < 32u; i <<= 1) {
+      barrier();
+      const uint pl = t ^ i;
+      const bool flip = (t & i) != 0u;
+      float own[4];
+      float par[4];
+      for (uint j = 0u; j < 4u; ++j) {
+        own[j] = flip ? vt_neg_sign(sh[ty][j][t]) : sh[ty][j][t];
+        par[j] = sh[ty][j][pl];
+      }
+      barrier();
+      // own FIRST, as the host adds (`own + h[j][p]`). Float addition is
+      // commutative on every value this reaches, but the order is copied rather
+      // than reasoned about, which is the discipline that makes a byte gate cheap.
+      for (uint j = 0u; j < 4u; ++j) sh[ty][j][t] = own[j] + par[j];
+    }
+    barrier();
+
+    // r_scale, then the store and the post-scale. Both half-output inners round
+    // FIRST and apply the post-scale as an fp16 multiply afterwards
+    // (hadamard_inner.cuh:137-146 and :264-278); the float arms multiply in f32.
+    if (live) {
+      for (uint j = 0u; j < 4u; ++j) {
+        const float res = sh[ty][j][t] * p.r_scale;
+        const uint off = base + 4u * t + j;
+        const uint soff = sbase + 4u * t + j;
+        if (VT_HAD_HALF_OUT != 0u) {
+          uint r = vt_f32_to_f16(res);
+          if (p.has_post != 0u) r = vt_mul_f16(r, uint(POST.v[(p.post_off >> 1) + soff]));
+          O16.v[(p.out_off >> 1) + off] = uint16_t(r);
+        } else {
+          const float o =
+              p.has_post != 0u ? res * vt_f16_to_f32(uint(POST.v[(p.post_off >> 1) + soff])) : res;
+          O32.v[(p.out_off >> 2) + off] = floatBitsToUint(o);
+        }
+      }
+    }
+    barrier();  // the next `g` overwrites sh
+  }
+}

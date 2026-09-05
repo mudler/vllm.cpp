@@ -79,6 +79,17 @@ REQUIRED_LABEL_SELECTIONS = {
 # the M9-M12 mutation cases match on.
 REQUIRED_SUITE_REGISTRATIONS = {
     "test_sglang_lease_identity": "tests/scripts/test_sglang_lease_identity.py",
+    # #2553. Added the moment the suite reached both lanes, which is the only
+    # moment it costs nothing: it was preflight-only, so the CI step landing
+    # beside this line would otherwise have been deletable at rc=0 -- the exact
+    # #1833 finding this set exists to answer. It recomputes the sha256 of the
+    # #1864 reference render and the #2514 Phase A latents, the evidence
+    # `.agents/oracles/ltx-2.md` cites for `gateable = yes`.
+    #
+    # This is the widening the seeding comment above anticipates, one classified
+    # suite at a time. It is NOT the symmetric population rule, which still
+    # belongs to #408 and #1509.
+    "test_ltx2_oracle_goldens": "tests/scripts/test_ltx2_oracle_goldens.py",
 }
 
 def _without_line_comments(text: str) -> str:

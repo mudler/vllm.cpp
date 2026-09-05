@@ -310,13 +310,16 @@ inline constexpr char kLtx2ImageCrfExtra[] = "image_crf";
 // the ordinary text-to-video render.
 //
 // A 16-bit PCM RIFF/WAVE file whose channel count matches the checkpoint's audio
-// VAE encoder `in_channels` and whose sample rate matches its mel front-end.
-// Neither is converted: upstream resamples with an arbitrary-ratio polyphase
-// kaiser resampler (`ops.py:40`) this project has not ported, and it feeds the
-// file's own channel count straight into a conv that declares 2
-// (`model_configurator.py:172`). Both mismatches are refused with both numbers
-// in the message, because a resampled-wrong or upmixed-wrong take conditions the
-// render on a waveform the caller never supplied and still finishes.
+// VAE encoder `in_channels`. ANY SAMPLE RATE is accepted: the mel front-end
+// resamples it to the checkpoint's own, exactly as upstream does
+// (`ops.py:36-49`, ported by row LTX25-AUDIO-RESAMPLE, #2583). The rendered
+// soundtrack still comes back at the FILE's rate, because upstream returns the
+// caller's original take rather than a VAE round trip (`:301-303`).
+//
+// The CHANNEL count is still refused, with both numbers in the message:
+// upstream feeds the file's own count straight into a conv that declares 2
+// (`model_configurator.py:172`), so an upmixed-wrong take would condition the
+// render on a waveform the caller never supplied and still finish.
 //
 // The audio is held FROZEN through every denoise phase — upstream's
 // `ModalitySpec(frozen=True, noise_scale=0.0)` at `a2vid_two_stage.py:251-256`
@@ -631,6 +634,158 @@ struct Ltx2ConditioningTrace {
   // two prompts the SAME digest and RED any dependence check, but it would do so
   // for the wrong reason; this says which happened.
   double video_absmax = 0.0, audio_absmax = 0.0;
+  // ── the TOWER's output WIDTH, which no digest can report (A24 wave 1) ────
+  //
+  // How many values the TEXT TOWER produced that do NOT survive a bf16 round
+  // trip, out of how many it produced. Upstream resolves ONE pipeline dtype and
+  // it is bfloat16 (`distilled.py:109`, handed to `PromptEncoder` at `:111-113`),
+  // so on a bf16 tower these counts are ZERO and on the f32 parity arm they are
+  // essentially the whole stream.
+  //
+  // IT EXISTS BECAUSE NOTHING ELSE HERE CAN SEE THE DTYPE. The digests detect
+  // CHANGE and the absmax detects COLLAPSE; both are computed over the same f32
+  // container on either arm and are identical in shape whichever width filled it.
+  // AGENTS.md names this exact blind spot — "a token gate cannot detect a dtype
+  // that is too wide" — and it is why A24 sat invisible in this tree while every
+  // gate on this path passed. This counter is what makes the engine's arm choice
+  // (`Ltx2TextProjectionsAsBf16`) gateable from OUTSIDE the text encoder: swap
+  // that call back to `Ltx2WidenTextProjectionsToF32` and these go from 0 to the
+  // full stream with every digest, every frame byte and every other assertion on
+  // this path unmoved.
+  //
+  // SAMPLED BEFORE THE CONNECTOR, and that is a scope statement rather than a
+  // convenience. `Ltx2ConnectorForward` is A24's SECOND wave and still computes
+  // in f32, so the conditioning the DiT finally cross-attends over is f32-wide
+  // even on a bf16 tower. Measuring after it would report the connector's width
+  // and call this row's work absent. The connector's own arm is OWED — see
+  // `.agents/specs/ltx25-a24-text-tower-bf16.md` under `## Owed`.
+  int64_t tower_video_not_bf16 = 0, tower_audio_not_bf16 = 0;
+  int64_t tower_video_values = 0, tower_audio_values = 0;
+  // AND THE SAME COUNT AFTER THE CONNECTOR, which is what stops the four above
+  // from being vacuous. "Zero values wider than bf16" is a property a stream can
+  // also have for uninteresting reasons — all zeros, all small integers, a
+  // fixture whose numbers happen to land on bf16 grid points — and a gate that
+  // reads zero for one of THOSE reasons measures nothing. The connector is A24's
+  // second wave and computes in f32 on the very buffers the tower just handed it,
+  // in the same render, so it is a LIVE f32 arm on this fixture; if the fixture
+  // ever stopped being able to express sub-bf16 detail these would collapse to
+  // zero too, and the test that asserts they do not reds instead of passing.
+  // Zero when the request carried no prompt, or when the model has no connector.
+  int64_t connector_video_not_bf16 = 0, connector_audio_not_bf16 = 0;
+  int64_t connector_video_values = 0, connector_audio_values = 0;
+  // ── the VIDEO VAE DECODE's width (A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16,
+  //    issue #2786) ────────────────────────────────────────────────────────
+  //
+  // How many of the DECODED PIXELS could not have come out of a bf16 store, out
+  // of how many were produced. Upstream constructs `VideoDecoder` with the one
+  // pipeline dtype (`distilled.py:146-149`, `self.dtype` at `:148`) and its
+  // forward casts the latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`), so on the bf16 arm this is ZERO and
+  // on the f32 reference arm it is essentially the whole clip.
+  //
+  // SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the ONE production
+  // route into the decoder (`grep -c 'Ltx2VideoDecodeStreaming('
+  // src/vllm/multimodal/ltx2_video.cpp` = 1). Not on a hand-constructed decode:
+  // a unit test that builds the decoder itself proves the class works and never
+  // that anything reaches it.
+  //
+  // Summed over CHUNKS, because the tiled decode emits one chunk per temporal
+  // group and a counter taken on the last one would report the last group's
+  // width as the render's.
+  int64_t vae_decode_not_bf16 = 0, vae_decode_values = 0;
+  // AND THE SAME COUNT ON THE LATENT THAT ENTERS IT, which is what stops the two
+  // above from being vacuous. "Zero values wider than bf16" is a property a
+  // stream can also have for uninteresting reasons -- all zeros, all small
+  // integers, a fixture whose numbers happen to land on bf16 grid points -- and a
+  // gate that reads zero for one of THOSE reasons measures nothing. The latent is
+  // the decoder's own input in the same render, produced by the f32 CPU reference
+  // DiT arm (`ltx2.h`'s DTYPE block), so it is a LIVE wide stream on this exact
+  // fixture rather than an argument about one. If the fixture ever stopped being
+  // able to express sub-bf16 detail this would collapse to zero too, and the test
+  // that asserts it does not reds instead of muting.
+  int64_t vae_latent_not_bf16 = 0, vae_latent_values = 0;
+  // FNV-1a over the raw f32 bytes of that same latent, and its max|x|. Same
+  // instrument, same limits, as the two conditioning digests above: it detects
+  // CHANGE and it does not pin VALUES. It exists because the pixels stopped being
+  // able to report a small change once the decode moved to upstream's bfloat16 --
+  // a PPM byte is 8-bit and the decode's mantissa is now 8-bit, so an effect
+  // worth a few thousandths of a percent of the clip rounds away twice. A test
+  // that has to prove something REACHED the decoder asks the decoder's input,
+  // which no pixel quantization touches.
+  uint64_t vae_latent_digest = 0;
+  double vae_latent_absmax = 0.0;
+  // A24 wave 4 (#2850): THE ENCODER'S OWN WIDTH, on the production route into
+  // `Ltx2ConvVideoEncode`. The pair is the same instrument as the decoder's two
+  // above and it is here for the same reason: the latent is a
+  // `std::vector<float>` on either arm, so nothing else on this path can see
+  // which width computed it. AGENTS.md: "A token gate cannot detect a dtype that
+  // is too wide."
+  //
+  // SAMPLED IN `encode_conditioning_image`, which is one of the encoder's two
+  // production call sites and the direct mirror of upstream's
+  // `combined_image_conditionings` (utils/helpers.py:285-294). The retake route
+  // shares one `Ltx2ConvVideoEncode` with it, so the arithmetic is gated once;
+  // that route's own coverage is owed by name in the row's spec.
+  //
+  // `_in_` is the ENCODER'S INPUT and it is what stops the output count from
+  // being vacuous. `Ltx2LoadImageAndPreprocess` produces f32 pixels here where
+  // upstream's `load_image_and_preprocess(..., dtype=bfloat16)` produces bf16
+  // ones, so the input is a LIVE wide stream on this fixture and the port
+  // narrows it once at the boundary. A fixture that stopped carrying sub-bf16
+  // detail would make the output count read zero for an uninteresting reason,
+  // and the case that asserts the input is wide reds instead of muting.
+  //
+  // Summed over IMAGES, because a request may carry more than one conditioning
+  // image and a counter taken on the last would report the last image's width as
+  // the render's.
+  int64_t vae_encode_not_bf16 = 0, vae_encode_values = 0;
+  int64_t vae_encode_in_not_bf16 = 0, vae_encode_in_values = 0;
+  // ── the LATENT UPSAMPLER's width (A24 wave 5, row LTX25-A24-UPSAMPLER-BF16,
+  //    issue #2857) ────────────────────────────────────────────────────────
+  //
+  // A24's deliverable is a DTYPE, and no token gate can see one: the clip is
+  // identical whether the upsampler computed at bf16 or at twice the bytes.
+  // These are what a production path reads instead.
+  //
+  // TWO INSTRUMENTS, because either alone is a mute switch. `upsample_wide_calls`
+  // counts the calls whose returned latent REPORTS a width other than bf16 --
+  // the arm the weight bag selected, read back off the result. It answers "did
+  // the narrow path run" and it cannot answer "did anything run at all", which
+  // is why `upsample_calls` is beside it: a build that stops calling the
+  // upsampler drives the first counter to zero and looks perfect.
+  //
+  // `upsample_not_bf16` is the VALUE-level half: how many elements of the
+  // upsampled latent carry bits bf16 cannot hold. It is the one that survives a
+  // `dtype` field that is set correctly and computed wide, because the values
+  // would then still be f32-wide. Summed over all three production call sites --
+  // the video latent, the generated keyframe slots and DFR's temporal rounds --
+  // because a counter taken at one would report that site's width as the
+  // render's.
+  int64_t upsample_calls = 0, upsample_wide_calls = 0;
+  int64_t upsample_not_bf16 = 0, upsample_values = 0;
+  // THE THIRD INSTRUMENT, and it is the one the two above cannot stand in for.
+  // Both of them are VALUE-shaped: they read the width a stage reports and the
+  // bits its output carries. A build that rounds every stored value to bf16 and
+  // reserves `sizeof(float)` for it satisfies both, reports bf16, and moves twice
+  // the bytes -- built and run during this row's review, 9125 assertions green.
+  // A24's deliverable is the storage, so the storage is counted:
+  // `Ltx2UpsamplerStorage` (ltx2_upsampler.h), drained per call so no byte is
+  // counted twice, summed over all three production call sites.
+  //
+  // `*_volume_*` are the upsampler's intermediate buffers and `*_param_*` are
+  // the parameters it reads through. `bytes / elems` is the width, and it is 4
+  // rather than 2 wherever an arm widened.
+  int64_t upsample_volumes = 0, upsample_volume_elems = 0, upsample_volume_bytes = 0;
+  int64_t upsample_param_views = 0, upsample_param_elems = 0, upsample_param_bytes = 0;
+  // THE LOADER'S OWN FOOTPRINT, per upsampler, because the render path has TWO
+  // of them and one counter over the render reports whichever ran. Reverting the
+  // temporal loader alone to f32 left 5638 assertions green during this row's
+  // review: every value counter above is fed by the SPATIAL arm on the fixture
+  // that observes them, so the temporal checkpoint's width had no gate at all.
+  // `Ltx2VaeWeights::Bytes()` is the measurement (ltx2_audio_vae.h:104-107) and
+  // it had no caller in this tree before this row.
+  int64_t upsampler_weight_elems = 0, upsampler_weight_bytes = 0;
+  int64_t temporal_upsampler_weight_elems = 0, temporal_upsampler_weight_bytes = 0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how
@@ -663,12 +818,21 @@ struct Ltx2ConditioningTrace {
   // `video_tokens` is the length of the sequence the DiT forward actually ran
   // over on the LAST phase — the target grid plus whatever an appending
   // conditioning item added (keyframe_cond.py:79-82). `schedule_tokens` is the
-  // count the sigma schedule read, which upstream fixes at the TARGET: its shift
-  // comes from `math.prod(latent.shape[2:])` (schedulers.py:32), the
-  // UNPATCHIFIED target latent, and the pipelines compute sigmas before any state
-  // exists (ti2vid_one_stage.py:207, distilled.py:200-201). So a render that
-  // appends must show `video_tokens > schedule_tokens`, and a build that let the
-  // append re-shift the schedule shows them equal.
+  // count the sigma schedule read, which upstream fixes BEFORE any state exists
+  // (ti2vid_one_stage.py:207, distilled.py:200-201) and which therefore cannot
+  // see an append.
+  //
+  // WHICH count that is depends on the phase, and after #2521 it is usually not
+  // the target grid: `LTX2Scheduler.execute` takes an OPTIONAL latent
+  // (schedulers.py:32) and six of upstream's seven call sites pass none, so they
+  // get `default_number_of_tokens` = 4096. See `Ltx2PhaseScheduleTokens`.
+  //
+  // SO DO NOT READ `video_tokens > schedule_tokens` AS THE APPEND INVARIANT.
+  // It was one while every derived arm sampled on its target grid, and it
+  // reversed on `one_stage` the moment that arm took the 4096 anchor — with the
+  // invariant itself untouched. The claim "an append must not re-shift the
+  // schedule" is a statement about TWO renders, and the test that makes it
+  // compares `schedule_tokens` across a pair that differs only by the keyframe.
   //
   // Both are written INSIDE the phase loop, like `image_tokens` and unlike every
   // field above them. That distinction is the whole reason they exist: the rest

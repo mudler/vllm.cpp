@@ -1,0 +1,84 @@
+# The ORACLE's OWN final latents at the #1864 request, dumped by
+# tools/oracle/ltx2_latent_dump.py on rc job a24f9336-897f-4810-9851-13dade5acb52
+# (dgx:gpu0, GB10, 2026-09-01T23:45Z), for LTX25-ADHERENCE-BISECT (#2514).
+# The job's own log is committed beside them as phase-a-rc-job-log.txt, so every
+# claim below can be read off the run rather than off this preamble.
+#
+# WHY THE VIDEO BYTES ARE TRUSTWORTHY. The same run decoded 25 video frames and
+# all 25 matched tests/parity/goldens/ltx2_oracle/SHA256SUMS byte for byte. That
+# control proves three things ABOUT THE VIDEO PATH at this request: the oracle is
+# reproducible on it, installing upstream's own RecordingDiffusionStage perturbed
+# nothing on it, and the in-process driver is equivalent to upstream's main() on
+# it. A latent from a run that had NOT reproduced the reference frames would not
+# be the reference's latent. The control gates frame_*.ppm and nothing else, so
+# it says nothing about the audio path -- see the next paragraph, which is an
+# OPEN observation and not a resolved one.
+#
+# THE AUDIO HALF IS NOT REPRODUCIBLE AND NOBODY HAS ATTRIBUTED IT. The re-run's
+# audio.wav has the same header and length as the committed one and differs on
+# 94.2% of its samples, by at most 215 LSB of int16 against a peak amplitude of
+# 13010. The container also moved, 225,174 bytes against the committed 225,151.
+# "A different noise draw" is NOT available as a benign explanation here:
+# AudioDecoder.__call__(self, latent) -> Audio (blocks.py:1180) takes no
+# torch.Generator and no tiling config, unlike VideoDecoder.__call__
+# (blocks.py:1124-1143). What remains is a nondeterministic audio VAE or vocoder
+# kernel, a different torch, or a DIFFERENT AUDIO LATENT -- which would come from
+# the very stage RecordingDiffusionStage wraps. The third case would be a finding
+# about the probe. Phase A recorded no environment, so the one variable that
+# separates "a different torch moved the audio" from "the probe moved it" was not
+# captured; the reference render's own manifest records torch 2.13.0+cu130 on an
+# NVIDIA GB10, and this run's job log records the same pair across two lines --
+# phase-a-rc-job-log.txt:51 the torch, :29 the GB10 -- which narrows it but does
+# not close it. tools/oracle/ltx2_latent_dump.py now writes an environment block
+# so a future run does not repeat the omission.
+# audio_latent_bfloat16.raw is therefore recorded WITHOUT a reproducibility claim
+# and its row below is marked. Nothing in this row's verdict rests on it.
+#
+# THE DECODE CONFIGURATION THESE BYTES MUST BE CROSS-DECODED UNDER. Upstream's
+# decode seam is ti2vid_one_stage.py:243, which passes three inputs besides the
+# latent, and Phase A's manifest recorded the SAMPLING request rather than any of
+# them. All three are recovered statically from the pin (fd4ded7f) plus this
+# checkpoint's own 57,464-byte safetensors metadata header, with no lease:
+#
+#   vae_dtype      torch.bfloat16. --hdr defaults to None (args.py:41-45), there
+#                  is no EXR input, so resolve_hdr_color_space returns None
+#                  (color_config.py:82-92) and vae_dtype_for_hdr returns its
+#                  default (:64-66, called at ti2vid_one_stage.py:264).
+#   tiling_config  TileSizeConfig(frames=80/24, height=448/64, width=768/64),
+#                  which is ONE tile on this 4x6x10 latent grid. config.vae.
+#                  _class_name is CausalVideoAutoencoder, i.e. the conv arm
+#                  (model_configurator.py:18, :26-33), so ensure_tiling_config
+#                  takes the aspect-only branch (helpers.py:89-97) and never
+#                  reads free VRAM.
+#   generator      the seed-42 torch.Generator from ti2vid_one_stage.py:160,
+#                  shared with GaussianNoiser and so NOT in its seeded state by
+#                  the time decode gets it -- and NEVER CONSUMED here. This
+#                  checkpoint sets timestep_conditioning: false, which gates the
+#                  decode-noise draw (conv_video_decoder.py:287-298,
+#                  memory_efficient_decode.py:562-567), and none of its nine
+#                  decoder_blocks carries an inject_noise key, which gates the
+#                  per-block draws (conv_video_decoder.py:81/92/106 ->
+#                  resnet.py:115, :153, :171). A consumed generator would have
+#                  made these 68 KB insufficient on their own.
+#
+# The committed ltx2_latent_dump_manifest.json below is the artefact the run
+# produced, byte for byte, and it PREDATES the driver's environment block. A
+# re-run under today's driver writes one more key and therefore a different
+# manifest digest; that is the driver moving, not the run being irreproducible.
+#
+# DTYPE IS THE POINT, WHICH IS WHY THESE ARE RAW. numpy cannot hold bfloat16, so
+# a .npy would have to upcast, and an f32 file labelled "the bf16 record" is the
+# on-disk-dtype-is-not-runtime-dtype defect. These are the bytes the VAE read.
+# Read one back with, shapes per ltx2_latent_dump_manifest.json:
+#   torch.frombuffer(bytearray(open(p,'rb').read()), dtype=torch.bfloat16).reshape(1,128,4,6,10)
+# The f32 form the C++ side consumes is EXACTLY derivable from this and is not
+# committed, because storing the same numbers twice invites the two to drift.
+#
+# video_latent  (1, 128, 4, 6, 10)  bf16  61,440 bytes
+# audio_latent  (1, 8, 26, 16)      bf16   6,656 bytes
+db94e2a0836e745382689020c0c41b29b2a66ce727a2886a3218e9681a0acab5  video_latent_bfloat16.raw
+# NOT REPRODUCIBLE -- the next row's bytes carry no reproducibility claim; the
+# re-run's audio differed on 94.2% of samples and nobody has attributed it.
+65aea856a57e31e61a6b77e65c9b9018943c9f9f62c48bbf1be101436fc2f4c4  audio_latent_bfloat16.raw
+e7dc26b631e86364fd05a788b8120d6bb2ee6aa967ed7713a1ea86840559fce9  ltx2_latent_dump_manifest.json
+3a8adb83b65b070f63ef797d590f5b61d3f125a377713a03a32bee7092c423d5  phase-a-rc-job-log.txt

@@ -70,6 +70,76 @@ superseded measurements stay where they are, with their provenance, including
 [`../specs/cpu-llamacpp-floor-remeasure-2026-07-22.md`](../specs/cpu-llamacpp-floor-remeasure-2026-07-22.md)
 and the A76 dot-product, elementwise-GEMM, GDN-orientation and threadpool specs.
 
+**This oracle's greedy decode is NOT deterministic across its own supported
+kernel paths, so a gate must pin the EXECUTED PATH and not only the revision.**
+Measured 2026-09-02 on `thor:gpu0` (aarch64, `NEON=1 MATMUL_INT8=1 SVE=1
+DOTPROD=1 REPACK=1`), rc job `deb6322d-bd06-4dd1-a5ac-2dec9987fbe1`. Stock
+`b10451`, one artifact, one recipe, greedy, run twice with the only difference
+being `use_extra_bufts` — the field the STOCK `-nr/--no-repack` flag sets
+(`common/arg.cpp:2411-2418`, `LLAMA_ARG_REPACK`; `common/common.cpp:1669` feeds
+`make_cpu_buft_list`, `src/llama-model.cpp:910,942,1304`, default true). Both
+arms are supported stock configurations, and they emit different greedy tokens:
+
+```text
+ORACLE_SELF_DIVERGENCES=1/6
+prompt 1, index 34: repack ON -> 3095,  repack OFF -> 198
+```
+
+Teacher-forcing one arm along the other's ids and diffing all 71,516,160 final
+logits, the per-step max abs logit delta is **min 0.2020, median 0.3790, max
+1.3657** over 288 steps (rms min 0.0412, median 0.0729, max 0.1856). The repack
+is a byte permutation of the same quantized values (`make_block_q4_Kx8`,
+`ggml/src/ggml-cpu/repack.cpp:2836-2870`), so the dequantized weights are
+identical and only the order and granularity of the fp32 arithmetic differs.
+`b10451` has four distinct fp32 rounding schedules for a Q4_K matvec — the
+aarch64 repacked gemv, the aarch64 NEON/SVE vec_dot, the portable `_generic`
+vec_dot, and the generic repacked gemv — and which one runs is decided by host
+architecture, `-mcpu` feature set, repack state and batch size.
+
+**Three stock levers move this oracle's greedy tokens, and one does not.**
+Measured 2026-09-02 on `thor:gpu0`, rc job
+`8480a30e-0d6d-44a7-b1b4-00e9d36c888d`, twelve runs of the stock oracle over one
+artifact and one recipe, ten of them teacher-forced along the stock default's own
+ids so every arm's argmax describes the identical preceding context. Evidence:
+[`../../docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md).
+
+| lever | stock flag | moves the tokens? |
+|---|---|---|
+| `use_extra_bufts` | `-nr/--no-repack` | yes, 1 of 6 prompts |
+| `n_ubatch = 1` | `-ub/--ubatch-size` | yes, 1 of 6 prompts; `-ub 4` moves nothing at these prompt lengths |
+| flash attention off | `-fa/--flash-attn` | yes, 2 of 6 prompts |
+| `n_threads` | `-t/--threads` | **no**: 1, 4 and 13 threads are byte-identical to 14 over all 288 steps |
+
+`n_ubatch` matters because `forward_mul_mat_one_chunk` calls `gemm` only when
+`nrows > 3` and `gemv` for the tail (`ggml/src/ggml-cpu/repack.cpp:4240`), so an
+ubatch of 1 sends every prefill row through the GEMV body, and the prefill writes
+the KV cache every later step reads. `n_threads` does not, because
+`repack.cpp:4317-4372` lets a chunk boundary select WHICH rows a thread computes
+while each row's dot product completes inside one kernel call over the full
+`ne00`.
+
+**`flash_attn_type` defaults to `AUTO`, and on this host `AUTO` resolves to
+`ENABLED`** -- the explicit `enabled` arm is byte-identical to the default over
+all 288 steps and the `disabled` arm is not. A record that names the revision and
+the repack state but not the attention kernel is still under-specified.
+
+**What this obliges of any token gate against this oracle on the CPU tier.**
+Record the executed path, not just the pin: assert and record
+`use_extra_bufts`, `n_ubatch`, and the RESOLVED flash-attention type (not the
+`AUTO` request), together with the `system_info` capability line, the host
+architecture, the feature set the binary was compiled for, and the thread count
+-- the last for completeness, since it is measured not to matter here. A gate that pins only the revision is
+under-specified, and a 6-of-6 token-exactness demand at a sub-0.2-logit margin is
+asking for bit-reproduction of one specific kernel rather than for arithmetic
+quality — `b10451` scores 5 of 6 against itself when asked.
+
+**This is not a licence to excuse a divergence against this oracle.** Being
+inside the oracle's noise band per divergence is not the same as being at its
+noise floor by rate: that perturbation flips 1 of 6 prompts, and an engine that
+flips more than that carries an additional term of its own. Evidence and the
+worked case:
+[`../../docs/bench-evidence/qwen38-27b-q4km-oracle-self-consistency-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-oracle-self-consistency-20260902.md).
+
 **Assert the tree, not only the commit.** A pin names a commit, and a commit
 cannot tell you what was built. The measurements above came from a directory
 somebody develops in. Before any number is recorded against this oracle, either

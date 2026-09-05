@@ -76,9 +76,24 @@ neither method (still false). `RocmPlatform` overrides ONLY this new method to
 `target.allocates_bounded_device_memory()` instead of
 `target.needs_weight_staging()`. The OTHER `needs_weight_staging()` read in the
 same function (the streamed-expert-lane condition, a few lines above) is
-UNTOUCHED — that one genuinely asks "is the fully-optimized device-resident
-forward what's running", which `needs_weight_staging()` still correctly
-answers.
+UNTOUCHED by THIS row.
+
+**That last sentence's REASON was wrong, and issue
+[#2507](https://github.com/mudler/vllm.cpp/issues/2507) measured the cost.** It
+said the lane condition "genuinely asks 'is the fully-optimized device-resident
+forward what's running'". It does not. The lane is the EXEMPTION inside this
+same refusal's arithmetic — towers it serves leave the bound and the slot arena
+enters it — so it needs the same predicate the refusal is keyed on, and the
+runtime seam that decides whether the lane can serve at all (`ExpertSlice`,
+`expert_stream_seam.cpp`) reads `cpu || host_memory_is_device_addressable()`
+with no staging term whatsoever. Leaving the two halves of one sum on two
+predicates is what let them disagree on the one platform where they diverge:
+ROCm refused GLM-5.3 at load, charging 187.3125 GiB of towers it declares it
+streams, because the refusal fired and the exemption did not. Repaired by
+`BACKEND-ROCM-LANE-GUARD` (`.agents/specs/rocm-expert-lane-guard.md`), which
+moves that read and no platform's answer to either predicate. This row's own
+scope decision — do not touch `needs_weight_staging()` itself — still stands and
+is unaffected.
 
 **Why not just flip `needs_weight_staging()`.** Read literally:
 `IndexedGdnStateIoEnabled` (`qwen3_5.cpp`) ALREADY takes ROCm's fast arm today,

@@ -340,21 +340,13 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
 // Device-resident f32 upcast of a bf16 owned weight (per-head q/k norm weights,
 // consumed by the f32 RMSNorm), uploaded ONCE.
 inline Tensor ResidentWeightF32(Dev d, const OwnedTensor& w, const std::vector<int64_t>& shape) {
-  if (!w.d_dev_f32) {
-    std::vector<float> f = WeightF32(w);
-    // Same defect, same fix as ResidentWeight above: `!is_cuda()` aliased a
-    // host std::vector<float> into a tensor for kMETAL/kVULKAN/kXPU.
-    if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-      auto* buf = new std::vector<float>(std::move(f));
-      w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
-    } else {
-      const size_t nb = f.size() * sizeof(float);
-      void* p = d.b.Alloc(nb);
-      d.b.Copy(d.q, p, f.data(), nb);
-      Backend* bk = &d.b;
-      w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
-    }
-  }
+  // ONE BODY, in dense_device_glue.h, shared with the private twin in
+  // qwen3_5.cpp. It used to be spelled out here and again there, which is how
+  // #2711 came to be one defect in two places: the upload handed an
+  // asynchronous `Copy` a function-local `std::vector<float>` and destroyed it
+  // at this closing brace. The alias-vs-upload branch (#1946), the upload and
+  // the drain that closes #2711 all live in `InstallResidentF32` now.
+  if (!w.d_dev_f32) InstallResidentF32(d, w, WeightF32(w));
   return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
 }
 

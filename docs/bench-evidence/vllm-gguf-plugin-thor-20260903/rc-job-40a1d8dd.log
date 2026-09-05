@@ -1,0 +1,184 @@
+rc: job 40a1d8dd-529b-456b-8e46-2789354cce5a on thor:gpu0
+GGUFPLUGIN run dir: /workspace/ggufplugin/20260903T012806Z
+
+########## 0. BOX ##########
+2026-09-03T01:28:06Z
+aarch64
+RC[uname -m]=0
+name, compute_cap, memory.total [MiB], driver_version
+NVIDIA Thor, 11.0, [N/A], 595.78
+RC[nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv]=0
+pid, used_gpu_memory [MiB]
+               total        used        free      shared  buff/cache   available
+Mem:          125748        4610        9978           1       82232      121137
+7ac96c66-5444-4e67-87d2-3b9f0e44f39a
+Filesystem             Size  Used Avail Use% Mounted on
+overlay                918G  622G  249G  72% /
+//192.168.68.102/Data  7.3T  6.0T  1.3T  83% /workspace
+
+########## 1. INPUTS EXIST -- a missing one is an ABSENCE, never a result ##########
+2026-09-03T01:28:06Z
+RC[test -f /workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf]=0
+GGUF_BYTES=17106775008 EXPECTED=17106775008 MATCH=yes
+RC[test -f /workspace/ckpt/qwen38-27b-q4km/config.json]=0
+45d9009888b40b71af58ac82f7151393c113b4eabb870ca3c3bbd237667d18cc  /workspace/ckpt/qwen38-27b-q4km/config.json
+RC[test -f /workspace/ckpt/qwen3.8-27b-hf/tokenizer_config.json]=0
+RC[test -f /workspace/ggufplugin/mmproj-BF16.gguf]=0
+931146432 /workspace/ggufplugin/mmproj-BF16.gguf
+RC[test -f /workspace/ggufplugin/ggufplugin-src.tar.gz]=0
+SRC_TGZ 9e15c20e0b75f75bbf886966df07843c4b70a7952fad4b80e8e8183e2f70743b  /workspace/ggufplugin/ggufplugin-src.tar.gz
+WHEEL_CANDIDATES=1 CHOSEN=vllm-0.1.dev1+g555967922-FLASHINFER-ONLY-cp312-cp312-linux_aarch64.whl
+89805161e5ac9905beae21b585b529a0343dccce290ccfeefa680effd2cf7523  /workspace/oracle-vllm/vllm-0.1.dev1+g555967922-FLASHINFER-ONLY-cp312-cp312-linux_aarch64.whl
+
+########## 2. TOOLCHAIN -- nvcc is REQUIRED and its absence would read as a MODEL failure ##########
+2026-09-03T01:28:19Z
+RC[apt-get update]=0
+RC[apt-get install]=0
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+RC[nvcc --version]=0
+
+########## 3. VENV FROM THE PINNED WHEEL ##########
+2026-09-03T01:28:24Z
+VENV_EXISTING_VERSION=0.1.dev1+g555967922
+REUSING the venv this worker already built
+
+########## 4. IDENTITY, asserted from OUTSIDE any source tree ##########
+2026-09-03T01:28:28Z
+vllm.__file__    = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/__init__.py
+vllm.__version__ = 0.1.dev1+g555967922
+IDENTITY OK
+IDENTITY_RC=0
+cuda True NVIDIA Thor
+RC[torch cuda]=0
+
+########## 5. BUILD THE PLUGIN FROM SOURCE, at a named revision ##########
+2026-09-03T01:28:34Z
+RC[untar]=0
+PLUGIN_SHA_CLAIMED=d4c1f0d082fc7cd4350da56689109a01c1f29d6c (the archive is git-archive of that object; the sha256 above is what binds it)
+dequantize.cuh
+ggml-common.h
+gguf_kernel.cu
+mmq.cuh
+mmvq.cuh
+moe.cuh
+moe_vec.cuh
+vecdotq.cuh
+TORCH_CUDA_ARCH_LIST=11.0+PTX
+
+real	0m3.113s
+user	0m3.216s
+sys	0m0.630s
+PLUGIN_BUILD_RC=0
+Processing ./.
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: vllm-gguf-plugin
+  Building wheel for vllm-gguf-plugin (pyproject.toml): started
+  Building wheel for vllm-gguf-plugin (pyproject.toml): finished with status 'done'
+  Created wheel for vllm-gguf-plugin: filename=vllm_gguf_plugin-0.0.5-cp310-abi3-linux_aarch64.whl size=1507791 sha256=a79bcc2d1398c3b708bf336e17379632e418e348fbb5f22ab71a102b3a25f43a
+  Stored in directory: /tmp/pip-ephem-wheel-cache-h_6gu9zd/wheels/a6/ed/2a/2fe1c77b3e8802f4e57d7e9c39dc216d4de0f8fc0fa6ac9be5
+Successfully built vllm-gguf-plugin
+total 1476
+-rw-r--r-- 1 root root 1507791 Sep  3 01:28 vllm_gguf_plugin-0.0.5-cp310-abi3-linux_aarch64.whl
+RC[persist plugin wheel]=0
+a79bcc2d1398c3b708bf336e17379632e418e348fbb5f22ab71a102b3a25f43a  /workspace/ggufplugin/20260903T012806Z/vllm_gguf_plugin-0.0.5-cp310-abi3-linux_aarch64.whl
+aarch64
+NVIDIA Thor, 11.0
+TORCH_CUDA_ARCH_LIST=11.0+PTX
+EXTENSION_SO=/tmp/sochk/vllm_gguf_plugin/_C_gguf.abi3.so
+--- ELF sections the extension actually carries ---
+ELF file    1: _C_gguf.abi3.1.sm_110.cubin
+CUBIN_ARCH_OK: sm_110 present
+RC[pip install plugin deps]=0
+RC[pip install plugin]=0
+  Attempting uninstall: vllm-gguf-plugin
+    Found existing installation: vllm-gguf-plugin 0.0.5
+    Uninstalling vllm-gguf-plugin-0.0.5:
+      Successfully uninstalled vllm-gguf-plugin-0.0.5
+Successfully installed vllm-gguf-plugin-0.0.5
+DEPS OK gguf /tmp/ggufplug-venv/lib/python3.12/site-packages/gguf/__init__.py
+RC[deps import]=0
+INSTALLED_SO=/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+ELF file    1: _C_gguf.abi3.1.sm_110.cubin
+INSTALLED_CUBIN_ARCH_OK: sm_110 present in the object that will be called
+
+########## 6. THE PLUGIN IS REGISTERED, and its CUDA extension IMPORTS ##########
+2026-09-03T01:28:50Z
+PLUGIN_FILE = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py
+PLUGIN_C_EXT = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+GENERAL_PLUGIN_ENTRY_POINTS = [('gguf', 'vllm_gguf_plugin:register'), ('lora_filesystem_resolver', 'vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver'), ('lora_hf_hub_resolver', 'vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver')]
+HAS_GGUF_OPS = ['__doc__', '__loader__', '__name__', '__package__', '__spec__', '_dir', 'ggml_dequantize', 'ggml_moe_a8_vec', 'name']
+REGISTRATION OK
+REGISTRATION_RC=0
+
+########## 7. GENERATION (watchdogged: this box has OOM-REBOOTED) ##########
+2026-09-03T01:28:59Z
+GEN_RC=1
+/workspace/ggufplugin/job.sh: line 282: 586199 Killed                  ( while true; do
+    A=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "$(date +%s) $A $(awk '/^MemTotal/{print int($2/1024)}' /proc/meminfo)" >> "$RUN/mem.samples"; if [ "$A" -lt "$FLOOR_MB" ]; then
+        G=$(cat /tmp/ggufplug.pgid 2> /dev/null); echo "WATCHDOG: MemAvailable ${A}MB < ${FLOOR_MB}MB -- killing process GROUP $G to save the box"; [ -n "$G" ] && kill -9 -- "-$G" 2> /dev/null;
+    fi; sleep 1;
+done ) > "$RUN/watchdog.log" 2>&1
+--- postcondition ---
+MemAvailable now: 121127 MB
+
+########## 8. WHAT IT SAID ##########
+2026-09-03T01:38:30Z
+VLLM_FILE    = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/__init__.py
+VLLM_VERSION = 0.1.dev1+g555967922
+PLUGIN_FILE  = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py
+PLUGIN_C_EXT = /tmp/ggufplug-venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so
+PROMPT_LENS  = [6, 5, 6, 7, 11, 7]
+PROMPT_LENS_EXPECTED = [6, 5, 6, 7, 11, 7]
+PROMPT_LENS_MATCH = True
+PROMPT_IDS[0] = [760, 6511, 3177, 314, 9338, 369]
+PROMPT_IDS[1] = [760, 2250, 5839, 7736, 513]
+PROMPT_IDS[2] = [27336, 85895, 506, 264, 9039, 314]
+PROMPT_IDS[3] = [760, 5187, 92068, 43687, 55877, 5134, 421]
+PROMPT_IDS[4] = [623, 220, 16, 24, 21, 24, 11, 12313, 1118, 14428, 383]
+PROMPT_IDS[5] = [32, 9944, 1324, 369, 264, 5629, 1324]
+--- tail, in case it died ---
+(EngineCore pid=586360)   File "/tmp/ggufplug-venv/lib/python3.12/site-packages/torch/_ops.py", line 1279, in __call__
+(EngineCore pid=586360)     return self._op(*args, **kwargs)
+(EngineCore pid=586360)            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=586360) RuntimeError: CUDA error: no kernel image is available for execution on the device
+(EngineCore pid=586360) Search for `cudaErrorNoKernelImageForDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+(EngineCore pid=586360) For more detailed error information, run with CUDA_LOG_FILE=stderr
+(EngineCore pid=586360)  (originally from torch_call_dispatcher( "aten::new_zeros", "", stack.data(), TORCH_ABI_VERSION) API call failed at /tmp/ggufplug-venv/lib/python3.12/site-packages/torch/include/torch/csrc/stable/ops.h, line 975)
+[rank0]:[W903 01:38:21.097797302 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+Traceback (most recent call last):
+  File "/workspace/ggufplugin/gen.py", line 122, in <module>
+    main()
+  File "/workspace/ggufplugin/gen.py", line 84, in main
+    llm = LLM(
+          ^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 338, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 179, in from_engine_args
+    return cls(
+           ^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 105, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 110, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 801, in __init__
+    super().__init__(
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 588, in __init__
+    with launch_core_engines(
+  File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1210, in launch_core_engines
+    wait_for_engine_startup(
+  File "/tmp/ggufplug-venv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1269, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+MemTotal_MB=125748 minMemAvailable_MB=88595 peakUsed_MB=37153 samples=244
+ALL LOGS: /workspace/ggufplugin/20260903T012806Z
+DONE_MARKER_GGUFPLUGIN_JOB

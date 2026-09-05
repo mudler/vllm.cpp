@@ -43,6 +43,7 @@
 #include "vllm/model_executor/models/glm5_next_weights.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vt/dtype.h"
+#include "vllm/platforms/interface.h"
 
 namespace glm5_next_fixture {
 
@@ -461,7 +462,7 @@ inline std::string BuildFixture(const FixtureOpts& o = FixtureOpts{}) {
 inline std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
     const vllm::GgufFile& g) {
   const vllm::HfConfig config = vllm::Glm5NextHfConfigFromGguf(g);
-  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g);
+  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g, vllm::platforms::CurrentPlatform().device_type());
   return vllm::ModelRegistry::Load(config, source);
 }
 

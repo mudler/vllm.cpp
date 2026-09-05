@@ -128,6 +128,39 @@ class PathClassification(unittest.TestCase):
             "evidence",
         )
 
+    def test_a_python_probe_in_a_per_run_evidence_dir_is_evidence(self) -> None:
+        """#2612: wave GDNDECOMP's instrument is a numpy replica of FLA, so its
+        five scripts land as `.py` inside
+        `docs/bench-evidence/gdn-chunked-decomposition-20260902/`. The extension
+        list carried `txt|log|gz|sh|cu` and not `py`, `classify_path` fails
+        closed, and the whole-tree sweep below went RED on the branch carrying
+        them -- and would have gone red on `main` on the day they landed, the
+        same shape as #1448 and #2316.
+
+        A `.py` is the recipe exactly as a `.sh` is. RED before the `py` arm of
+        BENCH_EVIDENCE_RUN.
+        """
+        for path in (
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/gdn_decomp.py",
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/run_golden.py",
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/check_bf16_helper.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+    def test_a_python_file_outside_a_per_run_evidence_dir_fails_closed(self) -> None:
+        """The suffix is not a licence, and this is the arm that keeps a product
+        or checker script from taking the evidence class by being spelled `.py`.
+        A flat `docs/bench-evidence/*.py` is NOT a per-run directory and does not
+        classify either."""
+        for path in (
+            "docs/some-other-place/whatever.py",
+            "docs/bench-evidence/flat-not-a-run-dir.py",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_a_csv_outside_bench_evidence_still_fails_closed(self) -> None:
         """The extension is not a licence. Widening by suffix alone would let a
         csv anywhere in docs/ take the evidence class without review."""
@@ -277,6 +310,55 @@ class PathClassification(unittest.TestCase):
         # the ones someone remembered to think about.
         with self.assertRaises(ValueError):
             checker.classify_path(".agents/not-a-real-guide-xyz.md")
+
+    def test_a_measurement_runs_own_artifact_kinds_classify_as_evidence(self) -> None:
+        """#2497: a `rc` job's own OUTPUT is evidence, not unclassified paths.
+
+        Distinct from the `py` arm #2629 landed hours earlier, and found
+        independently in another directory. That arm covers the RECIPE. These
+        two are what the job emitted: `docs/bench-evidence/rocm-strix-llamacpp-
+        denominator-20260902/` carries six `clock-leg*.jsonl` and six `leg*.rc`
+        with no class, and `classify_path` fails closed, so
+        `test_every_tracked_and_current_change_path_is_classified` was RED
+        against the WHOLE TREE. Landing that would have reddened `main` itself
+        and then refused every later change touching this checker through its
+        own evidence contract. It went unseen because this checker is CI-only
+        and `agent-preflight.sh` never runs it.
+
+        RED-BEFORE for the `jsonl|rc` arms: both raise `ValueError` against the
+        base checker. The `.py` line is a REGRESSION GUARD and is green at base
+        as well as at head -- #2629 made it so, and it is kept because these two
+        files are the row's own and a later narrowing of that arm would silently
+        take them with it.
+        """
+        run = "docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902"
+        for path in (
+            f"{run}/clock-leg1.jsonl",     # RED at base: the instrument stream
+            f"{run}/leg1.rc",              # RED at base: one leg's exit status
+            f"{run}/fold.py",              # green at base since #2629
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+        # The additions are a closed enumeration over ONE directory shape, not a
+        # relaxation. A sibling extension nobody has argued for still fails
+        # closed, both new suffixes fail closed outside a per-run evidence
+        # directory, and names that already had a class keep it.
+        for path in (
+            f"{run}/leg1.pickle",
+            "docs/bench-evidence/flat-not-a-run-dir.jsonl",
+            "docs/some-other-place/whatever.rc",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+        self.assertEqual(
+            checker.classify_path("scripts/check-pr-size.py"), "governance_checker"
+        )
+        # `.json` stays OUT of the evidence arm: DOC already claims it, and the
+        # evidence arm is tested first, so admitting it would reclassify
+        # docs/bench-evidence/mxfp4-qwen's golden.
+        self.assertEqual(checker.classify_path(f"{run}/leg1.json"), "public_document")
 
     def test_every_tracked_and_current_change_path_is_classified(self) -> None:
         paths = set(
@@ -631,6 +713,14 @@ class BudgetEnforcement(unittest.TestCase):
             # all 31 cases red on AttributeError. Measured, not asserted: the
             # suite has no case that passes without touching the checker.
             "scripts/check-attention-rung-consistency.py",
+            # 2026-09-02: the ROCm hardware-dp4a intrinsic gate (ROCM-HW-DP4A).
+            # Created in the same range, so it has no BASE version to mutate.
+            # Its suite imports the checker as a module and every case calls
+            # `check(root=...)`, which the disabled stub does not define, so all
+            # 6 cases go red on AttributeError. Measured with the stub in place,
+            # not asserted: "Ran 6 tests" then "FAILED (errors=6)", with no case
+            # passing on a reduced contract.
+            "scripts/check-rocm-dp4a-intrinsic.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

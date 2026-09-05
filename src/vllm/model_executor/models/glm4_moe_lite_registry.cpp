@@ -185,6 +185,7 @@ const ModelFactory kGlm4MoeLiteFactory{
     .forward = &ForwardGlm4MoeLiteForCausalLM,
     .make_kv_cache = &MakeGlm4MoeLiteKVCache,
     .is_dense_model = false,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

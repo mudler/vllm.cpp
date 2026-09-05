@@ -5,7 +5,10 @@
 // Upstream anchors, all verified in /home/mudler/_git/vllm at the parity pin
 // `555967922`:
 //   * `vllm/config/cache.py:19-36` CacheDType, `:76` cache_dtype default,
-//     `:111` calculate_kv_scales (deprecated).
+//     `:111` calculate_kv_scales -- the last is a PRIOR-PIN anchor: vllm#49389
+//     `dd11df04f3` deleted the field, and that commit is inside the advance to
+//     the current pin `e126687a9a` (#2817), so `config/cache.py` there has no
+//     such key. G2's last case gates our refusal, which outlives the flag.
 //   * `vllm/utils/torch_utils.py:32-52` STR_DTYPE_TO_TORCH_DTYPE (every fp8
 //     CacheDType maps to `torch.uint8` — ONE byte), `:64-67`
 //     MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP, `:75-80` is_quantized_kv_cache,
@@ -676,8 +679,10 @@ TEST_CASE("kv-fp8 W3 G2: the three LOADED arms mirror kv_cache.py:104-127") {
   CHECK(e5m2.origin == KvScaleOrigin::kDeclaredButAbsent);
   CHECK_FALSE(e5m2.uncalibrated);
 
-  // The deprecated dynamic path is refused BY NAME rather than silently taking
-  // the static arm (cache.py:111).
+  // The dynamic path is refused BY NAME rather than silently taking the static
+  // arm. It was `cache.py:111` at the prior pin and vllm#49389 has since deleted
+  // it upstream; we still accept the parameter, so the refusal still needs a
+  // case.
   CHECK_THROWS_AS(vllm::ResolveKvCacheScales("fp8_e4m3",
                                              /*calculate_kv_scales=*/true,
                                              vllm::kKvScaleUnloaded,

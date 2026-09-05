@@ -147,6 +147,19 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{256, 136, 23, "iq4_xs"};
       return &g;
     }
+    case DType::kIQ3_S: {
+      // block_iq3_s (llama.cpp @ b10451 ggml/src/ggml-common.h:413-422):
+      // f16 d + u8 qs[QK_K/4] + u8 qh[QK_K/32] + u8 signs[QK_K/8]
+      // + u8 scales[QK_K/64] = 2 + 64 + 8 + 32 + 4 = 110, i.e. 3.4375 bpw.
+      // ggml type id 21 (ggml/include/ggml.h:411). The 110 is the ORACLE's own
+      // `sizeof(block_iq3_s)`, printed by the harness in
+      // tests/vt/iq3s_golden_vectors.h, not a sum read off the struct.
+      // Codebook (iq3s_grid, 512 entries) decode with the ninth index bit
+      // spliced out of `qh` and DIRECT sign bytes; see include/vt/dtype.h for
+      // why none of the IQ3_XXS decode transfers.
+      static constexpr BlockGeometry g{256, 110, 21, "iq3_s"};
+      return &g;
+    }
     case DType::kMXFP4: {
       // block_mxfp4 (ggml-common.h:204-209): u8 e (E8M0 shared exponent)
       // + u8 qs[QK_MXFP4/2] = 1 + 16 = 17, QK_MXFP4 = 32. ggml type id 39.
@@ -189,7 +202,7 @@ bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
       DType::kQ4_K, DType::kQ5_K,  DType::kQ6_K,     DType::kQ8_K,
       DType::kIQ2_XXS, DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4,
       DType::kIQ1_S, DType::kIQ1_XXXS, DType::kIQ4_NL,
-      DType::kIQ2_XS, DType::kIQ4_XS};
+      DType::kIQ2_XS, DType::kIQ4_XS, DType::kIQ3_S};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -251,6 +264,7 @@ const char* Name(DType dtype) {
     case DType::kMXFP4: return "mxfp4";
     case DType::kIQ2_XS: return "iq2_xs";
     case DType::kIQ4_XS: return "iq4_xs";
+    case DType::kIQ3_S: return "iq3_s";
   }
   return "?";
 }

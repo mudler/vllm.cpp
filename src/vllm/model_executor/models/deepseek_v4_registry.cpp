@@ -34,11 +34,13 @@
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/host_token_ids.h"  // ResolveHostTokenIds
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -61,8 +63,32 @@ class DeepseekV4LoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
   const DeepseekV4Weights& weights() const { return weights_; }
 
+  // MODEL-DSV4-PAGED-ENTRY (#2447): the compressor's carried state, which must
+  // survive between steps -- it pools a CLOSED window into one row, so a state
+  // rebuilt per call has seen nothing and `CompressorLayerStep` refuses on the
+  // first decode step. Sized on first use, because the layer count comes from
+  // the parsed params rather than from the registration.
+  //
+  // A STAGED SHORTCUT, DECLARED AS ONE. Upstream keeps this state in the
+  // runner's KV-cache pool, and `MakeDeepseekV4KVCache` below ALREADY publishes
+  // three compressor-state groups (`c4_attn_state`, `c4_indexer_state`,
+  // `c128_attn_state`) that nothing reads yet. A model-object member is ONE
+  // sequence's state by construction, which is also why the route refuses
+  // `num_reqs > 1`. Consuming the published groups is the correct end state and
+  // is owed in `.agents/specs/model-dsv4-paged-entry.md` `## Owed`.
+  //
+  // No `mutable` is needed: the forward hook takes `LoadedModel&` non-const and
+  // `ModelAs<T>` returns non-const. Precedent: `Qwen3MoeLoadedModel::decode_graph()`.
+  DeepseekV4CompressorState& compressor_state(int64_t num_hidden_layers) {
+    if (static_cast<int64_t>(compressor_.state_kv.size()) != num_hidden_layers) {
+      compressor_.Resize(num_hidden_layers);
+    }
+    return compressor_;
+  }
+
  private:
   DeepseekV4Weights weights_;
+  DeepseekV4CompressorState compressor_;
 };
 
 std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
@@ -82,8 +108,15 @@ std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     if (source.gguf == nullptr) {
       throw std::runtime_error("deepseek-v4 GGUF model source is empty");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<DeepseekV4LoadedModel>(
-        registration, LoadDeepseekV4FromGguf(*source.gguf, config));
+        registration,
+        LoadDeepseekV4FromGguf(*source.gguf, config, &gguf_policy));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
@@ -103,8 +136,60 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
   auto& ds = ModelAs<DeepseekV4LoadedModel>(model, "DeepseekV4ForCausalLM");
   const DeepseekV4Weights& weights = ds.weights();
+  // #2544/#1305 -- TAKE the asynchronous runner's DEVICE identifiers, BEFORE any
+  // arm below reads them. On the async serving path the runner's combine splices
+  // each decode row's sampled token into the DEVICE buffer on the main queue and
+  // leaves `token_ids` deliberately stale for decode rows
+  // (`v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on CUDA).
+  // A forward that embeds the host vector generates every step after the first
+  // from token id 0 -- silently, at rc=0, with plausible-looking output.
+  //
+  // ALL FOUR ARMS take the resolved vector, because the mirror is a property of
+  // the STEP and not of the arm the step routes to. Every one of them is a HOST
+  // gather, which is why this is the host arm of the seam and not
+  // `detail::ApplyDeviceTokenIds`; `host_token_ids.h` carries the argument.
+  //
+  // WIRED BUT NOT CONVICTED, and the spec says so under O4: #2544 named this
+  // registration on a grep and this row has no staged checkpoint for it, so what
+  // is proved here is that the identifiers reach the embed through
+  // `ModelRegistry::Forward`, not that service ever hands this model a live
+  // `device_token_ids`.
+  std::vector<int32_t> device_ids;
+  const std::vector<int32_t>& ids =
+      ResolveHostTokenIds(input, &device_ids, "DeepseekV4ForCausalLM");
+  // MODEL-DSV4-PAGED-ENTRY (#2447): THE EXL3 PAGED ARM, and it is FIRST for the
+  // reason the row exists. `ModelForwardInput::gather_logits` defaults to true
+  // and the runner leaves it true on every default step, so a branch placed
+  // after the `gather_logits` test below is unreachable on a default
+  // configuration. That is what left `DeepseekV4ForwardExl3Paged` with only test
+  // callers, and it is not a throughput bug: `token_ids` is the step's SCHEDULED
+  // tokens, so with no paged cache bound a decode step attends over ONE token at
+  // `kv_base == 0` while RoPE still uses the true absolute position.
+  //
+  // Every refusal comes out of `ResolveDeepseekV4SwaPages` rather than being
+  // re-derived here -- one request per step, one token per step on the composed
+  // arm, a compressor layer this arm actually composes, every published name
+  // resolving, and a FLOAT page. The route predicate is therefore the resolver's
+  // own predicate, not a copy of its clauses.
+  if (input.multi_kv != nullptr && weights.has_exl3_weights) {
+    std::vector<vt::Tensor> pages;
+    const std::string refusal = ResolveDeepseekV4SwaPages(
+        weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
+        input.queue.device, &pages, /*dsa_dense=*/false,
+        /*have_compressor_state=*/true,
+        /*num_tokens=*/static_cast<int64_t>(ids.size()));
+    VT_CHECK(refusal.empty(), refusal);
+    const int64_t kv_base =
+        input.attn_meta.num_computed_tokens_cpu.empty()
+            ? 0
+            : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
+    return DeepseekV4ForwardExl3PagedLogits(
+        weights, input.queue, pages, kv_base, ids, input.positions,
+        input.logits_indices,
+        &ds.compressor_state(weights.params.num_hidden_layers));
+  }
   if (input.gather_logits) {
-    return DeepseekV4Model::ForwardDevice(input.token_ids, input.positions,
+    return DeepseekV4Model::ForwardDevice(ids, input.positions,
                                           input.attn_meta, input.attn_kv, weights,
                                           input.queue, input.logits_indices);
   }
@@ -112,21 +197,27 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
   // so consume it instead of recomputing the prefix every step.
   if (input.multi_kv != nullptr) {
     std::vector<vt::Tensor> pages;
+    // `dsa_dense = true` and no compressor state: this arm binds the GGUF tower,
+    // which forces every layer dense, so a compressor layer would attend the raw
+    // prefix and stays refused. Passing the two values explicitly is what makes
+    // the difference between the arms readable rather than implicit.
     const std::string refusal = ResolveDeepseekV4SwaPages(
         weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
-        input.queue.device, &pages);
+        input.queue.device, &pages, /*dsa_dense=*/true,
+        /*have_compressor_state=*/false,
+        /*num_tokens=*/static_cast<int64_t>(ids.size()));
     VT_CHECK(refusal.empty(), refusal);
     const int64_t kv_base =
         input.attn_meta.num_computed_tokens_cpu.empty()
             ? 0
             : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
     return HostLogits(
-        DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, input.token_ids,
+        DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, ids,
                                    input.positions, input.logits_indices),
         weights.params.vocab_size);
   }
   return HostLogits(
-      DeepseekV4Model::Forward(input.token_ids, input.positions, input.attn_meta,
+      DeepseekV4Model::Forward(ids, input.positions, input.attn_meta,
                                input.attn_kv, weights, input.queue,
                                input.logits_indices),
       weights.params.vocab_size);
@@ -138,12 +229,20 @@ const ModelFactory kDeepseekV4Factory{
     .prepare = &PrepareDeepseekV4ForCausalLM,
     .forward = &ForwardDeepseekV4ForCausalLM,
     .make_kv_cache = &MakeDeepseekV4KVCache,
+    // Upstream derives `[256 // compress_ratio, head_dim]` everywhere
+    // (`sparse_swa.py:76-83`, `compressor.py:174-178`), and a
+    // `compress_ratio == 128` layer cannot be paged below 256: at the engine's
+    // default of 32 the storage block would hold zero tokens and
+    // `MakeDeepseekV4KVCache` refuses. Declaring the floor is what makes this
+    // architecture load on its DEFAULT configuration.
+    .kv_block_size_floor = 256,
     .is_dense_model = false,
     // KV-DSV4-MULTICACHE W5 (#2323): this forward consumes a cache set keyed by
     // layer name. Declaring it is what stops `ModelRegistry::Forward` refusing
     // the topology -- and the adapter above refuses by name every shape it
     // cannot serve, so the guard moves rather than disappearing.
     .consumes_multi_kv = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

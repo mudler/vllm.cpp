@@ -478,25 +478,112 @@ TEST_CASE("ltx2 lora: a delta whose shape disagrees with the target refuses") {
   std::remove(path.c_str());
 }
 
-TEST_CASE("ltx2 lora: more than one adapter refuses BY NAME") {
-  // Upstream's ic_lora.py accepts a list; dubit.py:364-365 enforces exactly one
-  // and hdr_ic_lora.py:271-272 takes exactly one. N-adapter fusion is recorded
-  // as owed by the row rather than half-built, and the refusal says so.
-  const std::string a = WriteAdapter(2, 2, 2, {1, 2, 0, 1}, {1, 0, 0, 1});
-  const std::string b = WriteAdapter(2, 2, 2, {1, 2, 0, 1}, {1, 0, 0, 1});
+namespace {
+
+// Open N adapters, each declaring the metadata given, against a one-name
+// contract. Every one targets `kTarget`, which is what makes them compose.
+std::vector<vllm::Ltx2LoraAdapter> OpenAll(
+    const std::vector<std::map<std::string, std::string>>& metadata,
+    std::vector<std::string>* paths) {
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  for (const std::string& p : {a, b}) {
+  for (const auto& md : metadata) {
+    const std::string path = WriteAdapter(2, 2, 2, {1, 2, 0, 1}, {1, 0, 0, 1}, md);
+    paths->push_back(path);
     vllm::Ltx2LoraSpec spec;
-    spec.path = p;
+    spec.path = path;
     adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
   }
-  const std::string err =
-      Caught([&] { (void)vllm::Ltx2ResolveLoraReferenceFactors(adapters); });
-  INFO("error = ", err);
-  CHECK(Mentions(err, "exactly ONE adapter"));
-  CHECK(Mentions(err, "LTX25-IC-LORA"));
-  std::remove(a.c_str());
-  std::remove(b.c_str());
+  return adapters;
+}
+
+void RemoveAll(const std::vector<std::string>& paths) {
+  for (const std::string& p : paths) std::remove(p.c_str());
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 lora: N adapters resolve their reference factors TOGETHER") {
+  // ROW LTX25-LORA-FUSION. `ICLoraPipeline` takes a LIST (`ic_lora.py:75`) and
+  // resolves both scale factors ACROSS it (`ic_lora.py:155-173`). This function
+  // used to refuse a second adapter by name, which made every branch below
+  // unreachable — they were written for the day the cap lifted and this is that
+  // day. `dubit.py:364-365` and `hdr_ic_lora.py:271-272` still narrow their own
+  // entry points to one adapter; that is those two pipelines, not the fuser.
+  SUBCASE("two adapters declaring nothing resolve to upstream's 1/1") {
+    std::vector<std::string> paths;
+    const std::vector<vllm::Ltx2LoraAdapter> adapters = OpenAll({{}, {}}, &paths);
+    const vllm::Ltx2LoraReferenceFactors f = vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+    CHECK(f.downscale == 1);
+    CHECK(f.temporal == 1);
+    RemoveAll(paths);
+  }
+
+  SUBCASE("one adapter declaring a factor carries it for the whole list") {
+    // `if scale != 1` (`ic_lora.py:157`): a 1 is upstream's ABSENT value and
+    // never enters the conflict test, so a silent adapter cannot veto a
+    // declared factor and the order of the two cannot matter. Both orders are
+    // run, because an implementation that seeded the accumulator from the FIRST
+    // adapter unconditionally would pass one of them.
+    for (bool declared_first : {true, false}) {
+      const std::map<std::string, std::string> declares = {
+          {"reference_downscale_factor", "2"}, {"reference_temporal_scale_factor", "4"}};
+      std::vector<std::string> paths;
+      const std::vector<vllm::Ltx2LoraAdapter> adapters =
+          declared_first ? OpenAll({declares, {}}, &paths) : OpenAll({{}, declares}, &paths);
+      const vllm::Ltx2LoraReferenceFactors f =
+          vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+      INFO("declared_first = ", declared_first);
+      CHECK(f.downscale == 2);
+      CHECK(f.temporal == 4);
+      RemoveAll(paths);
+    }
+  }
+
+  SUBCASE("two adapters AGREEING on a factor is not a conflict") {
+    // The second disjunct of `not in (1, scale)` (`ic_lora.py:158`). Upstream
+    // combines IC-LoRAs trained at the same reference scale, and refusing that
+    // would be stricter than the reference.
+    std::vector<std::string> paths;
+    const std::vector<vllm::Ltx2LoraAdapter> adapters =
+        OpenAll({{{"reference_downscale_factor", "2"}}, {{"reference_downscale_factor", "2"}}},
+                &paths);
+    const vllm::Ltx2LoraReferenceFactors f = vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+    CHECK(f.downscale == 2);
+    RemoveAll(paths);
+  }
+
+  SUBCASE("two adapters DISAGREEING refuse, naming both values") {
+    // `ic_lora.py:159-163`, reachable for the first time.
+    std::vector<std::string> paths;
+    const std::vector<vllm::Ltx2LoraAdapter> adapters =
+        OpenAll({{{"reference_downscale_factor", "2"}}, {{"reference_downscale_factor", "3"}}},
+                &paths);
+    const std::string err =
+        Caught([&] { (void)vllm::Ltx2ResolveLoraReferenceFactors(adapters); });
+    INFO("error = ", err);
+    CHECK(Mentions(err, "conflicting reference_downscale_factor"));
+    CHECK(Mentions(err, "already have 2"));
+    CHECK(Mentions(err, "specifies 3"));
+    RemoveAll(paths);
+  }
+
+  SUBCASE("the TEMPORAL factor conflicts independently of the downscale one") {
+    // Two separate accumulators upstream, and two separate raises
+    // (`ic_lora.py:167-172`). Sharing one would let an agreeing downscale mask a
+    // disagreeing temporal scale.
+    std::vector<std::string> paths;
+    const std::vector<vllm::Ltx2LoraAdapter> adapters = OpenAll(
+        {{{"reference_downscale_factor", "2"}, {"reference_temporal_scale_factor", "4"}},
+         {{"reference_downscale_factor", "2"}, {"reference_temporal_scale_factor", "8"}}},
+        &paths);
+    const std::string err =
+        Caught([&] { (void)vllm::Ltx2ResolveLoraReferenceFactors(adapters); });
+    INFO("error = ", err);
+    CHECK(Mentions(err, "conflicting reference_temporal_scale_factor"));
+    CHECK(Mentions(err, "already have 4"));
+    CHECK(Mentions(err, "specifies 8"));
+    RemoveAll(paths);
+  }
 }
 
 TEST_CASE("ltx2 lora: an unreadable factor dtype refuses, naming the RIGHT factor") {
@@ -814,4 +901,205 @@ TEST_CASE("ltx2 lora: the delta product runs on the shared vt::Matmul seam") {
   // the portable reference tier, which would be correct and slow.
   REQUIRE(stats.last_selected != nullptr);
   CHECK(std::string(stats.last_selected) == std::string(vt::kNativeProviderName));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// N adapters (row LTX25-LORA-FUSION, issue #932)
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The strengths and seeds the golden below was generated from. Held here so the
+// generator recipe in the row's spec and the fixture cannot drift apart.
+struct AdapterRecipe {
+  uint32_t b_seed, a_seed;
+  float strength;
+};
+const AdapterRecipe kThree[] = {{11111U, 22222U, 0.75F},
+                                {33333U, 44444U, 0.35F},
+                                {55555U, 66666U, 1.0F}};
+constexpr int64_t kGoldRows = 6;
+constexpr int64_t kGoldRank = 3;
+constexpr int64_t kGoldCols = 20;
+constexpr uint32_t kGoldWeightSeed = 24680U;
+
+// `sum` over the adapters of `(B * strength) @ A` with the FIRST product form
+// used for EVERY member — the plausible wrong port, and the reason this case
+// asserts against a generated golden rather than against a transcription of the
+// formula. It pre-rounds `B * strength` to bf16 before each matmul, which is
+// `fuse_loras.py:113` applied where `:115` belongs.
+std::vector<uint16_t> EveryProductPreScaled(const std::vector<std::vector<float>>& b,
+                                            const std::vector<std::vector<float>>& a,
+                                            const std::vector<float>& w) {
+  std::vector<uint16_t> agg(static_cast<size_t>(kGoldRows * kGoldCols), 0);
+  for (size_t n = 0; n < b.size(); ++n) {
+    const std::vector<uint16_t> one =
+        ScalarDeltaPlusWeight(b[n], a[n], std::vector<float>(agg.size(), 0.0F), kGoldRows,
+                              kGoldRank, kGoldCols, kThree[n].strength);
+    for (size_t i = 0; i < agg.size(); ++i) {
+      agg[i] = vt::F32ToBF16(vt::BF16ToF32(agg[i]) + vt::BF16ToF32(one[i]));
+    }
+  }
+  for (size_t i = 0; i < agg.size(); ++i) {
+    agg[i] = vt::F32ToBF16(vt::BF16ToF32(agg[i]) + vt::BF16ToF32(vt::F32ToBF16(w[i])));
+  }
+  return agg;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 lora: N adapters aggregate through upstream's SECOND product form") {
+  // THE EXPECTATION WAS EXECUTED, NOT TRANSCRIBED. It is the output of
+  // `ltx_core.loader.fuse_loras.aggregate_lora_products` followed by
+  // `bf16_fuse_rule`, imported from Lightricks/LTX-2 at the pin
+  // `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` and run under torch
+  // 2.11.0+cu130 on the same bf16 inputs this case builds. The recipe is in
+  // .agents/specs/ltx25-lora-fusion.md and reproduces `Spread` exactly.
+  //
+  // WHAT IT PINS THAT A FORMULA COULD NOT. `aggregate_lora_products` uses two
+  // different products: `matmul(B * strength, A)` for the FIRST
+  // (`fuse_loras.py:113`) and `addmm_(B, A, alpha=strength)` for every one after
+  // it (`:115`). The difference is WHERE the strength enters — the first rounds
+  // `B * strength` to bf16 BEFORE its matmul, the second applies `alpha` to an
+  // f32 accumulation and rounds ONCE at the store. Three candidate models were
+  // run against the pinned module; only that one matched, over 40 randomized
+  // trials and over K in {16, 64, 256, 1024}.
+  //
+  // AND THE CASE CAN SEE THE DIFFERENCE, which is asserted rather than assumed:
+  // `EveryProductPreScaled` is the wrong port, and it is separated from the
+  // expectation on 26 of these 120 elements.
+  const std::vector<uint16_t> want = {
+      0xBF1C, 0xBE2C, 0x3EE6, 0xC004, 0x3DCC, 0xBE18, 0x3F2F, 0xBE54,
+      0x3F9E, 0xBF23, 0x3FC6, 0x3F76, 0x3EA2, 0x3F1C, 0x3D30, 0xBFAA,
+      0x3E45, 0xBEAA, 0x3EB7, 0xBF02, 0x3F59, 0xBF20, 0xBEAF, 0xBFAD,
+      0x3F7D, 0xBFD8, 0xBD98, 0xC010, 0xBF1E, 0xBCC0, 0xBF66, 0x3CD4,
+      0x3FC0, 0xC021, 0xBE30, 0xBF9A, 0x3E98, 0xBF88, 0x3F18, 0xBF14,
+      0xBE25, 0xBF0A, 0xBF8F, 0x3F90, 0xBFE2, 0xBF91, 0x3FBB, 0x3FD4,
+      0x3E68, 0x3ECE, 0x3FEB, 0x3F2C, 0x3FB4, 0x3F06, 0x3E9A, 0xBF04,
+      0x3F3B, 0xBFBE, 0x3E80, 0x3F28, 0x3D50, 0x3F42, 0xBECE, 0xBF24,
+      0x3F5F, 0x3EC6, 0xBE48, 0xBEFA, 0x3EBF, 0x3E95, 0x3F32, 0x3F6C,
+      0x4009, 0xBEE9, 0x3FA5, 0xBC80, 0xBFD8, 0xBE3C, 0xBD48, 0xBEB3,
+      0x3D90, 0x3E44, 0x3F1C, 0xBF82, 0x3F4C, 0x3F82, 0x3F97, 0x3DF2,
+      0x3F22, 0xBF20, 0xBF24, 0x3E8A, 0x3ED6, 0x3F58, 0x3EB8, 0xBEF4,
+      0xBF88, 0xBE94, 0xBFA3, 0xBF8A, 0xBFE7, 0x3EF8, 0x3E64, 0xBF8C,
+      0xBF0E, 0x3FF2, 0x3F04, 0xBFF6, 0x3FB3, 0x3D0C, 0xBFAA, 0x3F41,
+      0xBEE8, 0xBF6E, 0x3F88, 0x3E9C, 0x3E3C, 0x3F89, 0x3EE0, 0x3F94
+  };
+  REQUIRE(want.size() == static_cast<size_t>(kGoldRows * kGoldCols));
+
+  const std::vector<float> w =
+      Spread(static_cast<size_t>(kGoldRows * kGoldCols), kGoldWeightSeed);
+  std::vector<std::string> paths;
+  std::vector<vllm::Ltx2LoraAdapter> adapters;
+  std::vector<std::vector<float>> bs;
+  std::vector<std::vector<float>> as;
+  for (const AdapterRecipe& r : kThree) {
+    bs.push_back(Spread(static_cast<size_t>(kGoldRows * kGoldRank), r.b_seed));
+    as.push_back(Spread(static_cast<size_t>(kGoldRank * kGoldCols), r.a_seed));
+    const std::string path =
+        WriteAdapter(kGoldRows, kGoldRank, kGoldCols, bs.back(), as.back());
+    paths.push_back(path);
+    vllm::Ltx2LoraSpec spec;
+    spec.path = path;
+    spec.strength = r.strength;
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  }
+
+  const std::vector<uint16_t> got = FuseBf16Bits(adapters, kTarget, kGoldRows, kGoldCols, w);
+  REQUIRE(got.size() == want.size());
+  size_t mismatched = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (got[i] != want[i]) ++mismatched;
+  }
+  CHECK(mismatched == 0);
+
+  // NOT VACUOUS, three ways.
+  //
+  // 1. The wrong rounding is DISTINGUISHABLE here. Without this the case would
+  //    pass on a port that reused the first product form for all three
+  //    adapters, and would look like it had gated the thing it was generated to
+  //    gate.
+  const std::vector<uint16_t> pre_scaled = EveryProductPreScaled(bs, as, w);
+  size_t separated = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    if (pre_scaled[i] != want[i]) ++separated;
+  }
+  MESSAGE("the pre-scaled second form differs from upstream on " << separated << " of "
+                                                                 << want.size());
+  CHECK(separated == 26);
+
+  // 2. Every adapter after the first CONTRIBUTED. One adapter alone differs from
+  //    the three on all 120 elements, so a loop that stopped after the first —
+  //    which is exactly what the lifted refusal used to enforce — cannot pass.
+  std::vector<vllm::Ltx2LoraAdapter> only_first;
+  {
+    vllm::Ltx2LoraSpec spec;
+    spec.path = paths[0];
+    spec.strength = kThree[0].strength;
+    only_first.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  }
+  const std::vector<uint16_t> one =
+      FuseBf16Bits(only_first, kTarget, kGoldRows, kGoldCols, w);
+  size_t moved_by_the_rest = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    if (one[i] != want[i]) ++moved_by_the_rest;
+  }
+  CHECK(moved_by_the_rest == want.size());
+
+  // 3. ORDER IS UPSTREAM'S LIST ORDER. `_products_for_sd_key` yields in the
+  //    order of `lora_sd_and_strengths` (`fuse_loras.py:199-204`), and the first
+  //    member is the only one that takes the first product form — so reversing
+  //    the list is a DIFFERENT computation, not a re-association. If this
+  //    matched, the fuser would not be preserving the order the load supplied.
+  std::vector<vllm::Ltx2LoraAdapter> reversed(adapters.rbegin(), adapters.rend());
+  const std::vector<uint16_t> other =
+      FuseBf16Bits(reversed, kTarget, kGoldRows, kGoldCols, w);
+  size_t moved_by_order = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    if (other[i] != want[i]) ++moved_by_order;
+  }
+  MESSAGE("reversing the adapter order moves " << moved_by_order << " of " << want.size());
+  CHECK(moved_by_order > 0);
+
+  RemoveAll(paths);
+}
+
+TEST_CASE("ltx2 lora: an adapter that does not target a tensor is SKIPPED, not refused") {
+  // `_products_for_sd_key` yields nothing for a LoRA whose state dict lacks the
+  // key (`fuse_loras.py:200-201`, `continue`), and `aggregate_lora_products`
+  // then sees a shorter list. So the SECOND adapter of a two-adapter load can
+  // legitimately take the FIRST product form on a tensor only it targets, and
+  // the aggregator must therefore be seeded per TENSOR rather than per load.
+  const char* const kOther = "transformer_blocks.0.attn1.to_k.weight";
+  const char* const kOtherModule = "transformer_blocks.0.attn1.to_k";
+  const std::vector<float> b = {1, 2, 0, 1};
+  const std::vector<float> a = {1, 0, 0, 1};
+  const std::vector<float> w = {10, 20, 30, 40};
+
+  const std::string first = WriteAdapter(2, 2, 2, b, a);
+  const std::string second = WriteAdapter(2, 2, 2, b, a, {}, kOtherModule);
+  std::vector<vllm::Ltx2LoraAdapter> adapters;
+  for (const std::string& path : {first, second}) {
+    vllm::Ltx2LoraSpec spec;
+    spec.path = path;
+    spec.strength = 2.0;
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, {kTarget, kOther}));
+  }
+
+  // Each tensor sees exactly ONE product, and it is the first form: `W + 2*B@A`.
+  bool fused = false;
+  const std::vector<float> q = FuseBf16(adapters, kTarget, 2, 2, w, &fused);
+  CHECK(fused);
+  CHECK(q[0] == doctest::Approx(12.0));
+  CHECK(q[1] == doctest::Approx(24.0));
+  CHECK(q[3] == doctest::Approx(42.0));
+
+  const std::vector<float> k = FuseBf16(adapters, kOther, 2, 2, w, &fused);
+  CHECK(fused);
+  CHECK(k[0] == doctest::Approx(12.0));
+  CHECK(k[1] == doctest::Approx(24.0));
+  CHECK(k[3] == doctest::Approx(42.0));
+
+  std::remove(first.c_str());
+  std::remove(second.c_str());
 }

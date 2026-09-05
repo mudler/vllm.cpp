@@ -751,7 +751,10 @@ LagunaWeights LoadLagunaFromGgufShards(const std::vector<const GgufFile*>& shard
                                        const GgufLoadPolicy* policy) {
   VT_CHECK(!shards.empty() && shards[0] != nullptr,
            "laguna gguf: shards[0] (the metadata shard) is required");
-  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv();
+  // A null `policy` means NO ENGINE RESOLVED A DEVICE: every production GGUF
+  // entry point now builds one from `ModelSource::device` in its registry hook.
+  // `kCPU` is STATED rather than probed — see `GgufLoadPolicy::FromEnv`.
+  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env;
 
   LagunaWeights w;
@@ -815,9 +818,10 @@ LagunaWeights LoadLagunaFromGgufShards(const std::vector<const GgufFile*>& shard
   return w;
 }
 
-LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config) {
+LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config,
+                                 const GgufLoadPolicy* policy) {
   (void)config;  // geometry resolved from the GGUF KV (self-describing vehicle)
-  return LoadLagunaFromGgufShards({&gguf});
+  return LoadLagunaFromGgufShards({&gguf}, policy);
 }
 
 }  // namespace vllm

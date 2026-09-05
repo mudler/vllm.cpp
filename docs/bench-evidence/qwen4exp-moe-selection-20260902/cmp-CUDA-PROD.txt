@@ -1,0 +1,80 @@
+=== CPU-CTRL vs CUDA-PROD ===
+COUNT base_calls=384 other_calls=384 base_tok_lines=576 other_tok_lines=576
+COUNTED-PROPERTY base: last digest lines=576, value lines seen=576, agree=True
+COUNTED-PROPERTY other: last digest lines=576, value lines seen=576, agree=True
+CALLS common=384 prefill(T=5)=48 decode(T=1)=336
+--- PREFILL ---
+COUNT PREFILL calls=48 sel-hash MISMATCH=40
+COUNT PREFILL token-slots=240 FLIPPED=78
+FIRST PREFILL FLIP call=0 tok=2
+   base  ids=21,64,76,101,265,293,301,314,338,361 ulps=0 lo=-5(0xc0a0) hi=-5(0xc0a0)
+   other ids=21,76,101,265,293,301,314,338,361,369 ulps=1 lo=-5(0xc0a0) hi=-5.03125(0xc0a1)
+   FLIP call=0    tok=2 base=21,64,76,101,265,293,301,314,338,361 other=21,76,101,265,293,301,314,338,361,369 base_ulps=0        other_ulps=1
+   FLIP call=2    tok=3 base=29,75,83,100,163,329,370,446,473,487 other=29,75,83,100,163,218,329,446,473,487 base_ulps=0        other_ulps=0
+   FLIP call=3    tok=1 base=26,122,186,253,302,352,377,405,418,476 other=26,122,186,253,302,352,377,405,421,476 base_ulps=0        other_ulps=1
+   FLIP call=4    tok=1 base=112,133,205,252,273,309,360,419,469,488 other=133,159,205,252,273,309,360,419,469,488 base_ulps=1        other_ulps=2
+   FLIP call=4    tok=4 base=41,48,54,63,133,205,252,309,393,469 other=41,48,54,133,205,252,309,360,393,469 base_ulps=0        other_ulps=1
+   FLIP call=5    tok=4 base=34,162,220,236,254,421,423,450,460,493 other=34,162,220,236,254,278,336,421,460,493 base_ulps=2        other_ulps=0
+   FLIP call=6    tok=4 base=44,86,92,135,145,168,177,305,377,501 other=44,86,92,124,135,145,168,305,377,501 base_ulps=1        other_ulps=0
+   FLIP call=7    tok=2 base=66,97,269,292,303,337,346,439,458,470 other=66,97,269,283,292,303,337,346,439,470 base_ulps=1        other_ulps=0
+   FLIP call=7    tok=4 base=20,66,72,93,221,303,337,374,435,458 other=20,66,72,93,97,303,337,374,435,458 base_ulps=3        other_ulps=0
+   FLIP call=8    tok=4 base=94,167,224,231,275,308,365,414,448,462 other=94,167,224,231,275,308,414,422,448,462 base_ulps=0        other_ulps=2
+   FLIP call=9    tok=3 base=17,75,318,356,406,424,453,462,486,509 other=17,318,326,356,406,424,453,462,486,509 base_ulps=0        other_ulps=1
+   FLIP call=9    tok=4 base=52,63,75,139,230,238,406,424,462,509 other=17,52,63,75,139,238,406,424,462,509 base_ulps=1        other_ulps=1
+   FLIP call=11   tok=0 base=4,104,108,130,132,180,361,393,430,464 other=4,104,108,128,130,132,393,400,430,464 base_ulps=0        other_ulps=0
+   FLIP call=11   tok=1 base=90,108,163,201,238,261,268,350,397,477 other=90,108,163,201,261,268,293,350,397,477 base_ulps=1        other_ulps=1
+   FLIP call=12   tok=3 base=10,90,139,180,257,281,302,433,436,489 other=10,90,139,180,257,281,302,344,433,436 base_ulps=1        other_ulps=0
+   FLIP call=13   tok=4 base=148,162,250,273,282,290,296,385,387,488 other=148,250,273,282,290,296,385,387,418,488 base_ulps=5        other_ulps=2
+   FLIP call=16   tok=1 base=92,141,150,206,228,307,392,429,487,497 other=92,141,206,228,270,307,392,429,487,497 base_ulps=0        other_ulps=1
+   FLIP call=16   tok=3 base=206,228,274,314,350,392,487,489,497,504 other=40,206,228,274,314,350,487,489,497,504 base_ulps=2        other_ulps=0
+   FLIP call=18   tok=4 base=3,92,93,116,139,194,201,226,314,428 other=3,39,92,93,116,139,194,201,226,428 base_ulps=2        other_ulps=6
+   FLIP call=19   tok=3 base=30,58,64,111,146,147,202,343,394,434 other=30,64,111,146,147,202,343,394,426,434 base_ulps=0        other_ulps=2
+MIN PREFILL base minulps over calls: min=0 p10=0 median=0
+AXIS PREFILL x     first_nonzero_call=0 worst_rel=1.121e-02 at call=5
+AXIS PREFILL logit first_nonzero_call=0 worst_rel=2.882e-03 at call=32
+AXIS PREFILL exp   first_nonzero_call=0 worst_rel=3.878e-02 at call=45
+AXIS PREFILL shr   first_nonzero_call=0 worst_rel=3.095e-02 at call=39
+CALL0 PREFILL base   x=3613.82031 logit=17079.5703 exp=2540.09374 shr=250.805253
+CALL0 PREFILL other  x=3615.62777 logit=17083.2891 exp=2527.65707 shr=250.743384
+CALL0 PREFILL rel x     = 4.999e-04
+CALL0 PREFILL rel logit = 2.177e-04
+CALL0 PREFILL rel exp   = 4.896e-03
+CALL0 PREFILL rel shr   = 2.467e-04
+--- DECODE ---
+COUNT DECODE calls=336 sel-hash MISMATCH=336
+COUNT DECODE token-slots=336 FLIPPED=336
+FIRST DECODE FLIP call=48 tok=0
+   base  ids=91,106,308,366,367,386,434,466,503,505 ulps=2 lo=-4.9375(0xc09e) hi=-5(0xc0a0)
+   other ids=31,109,168,205,212,240,251,258,294,442 ulps=7 lo=-4.28125(0xc089) hi=-4.5(0xc090)
+   FLIP call=48   tok=0 base=91,106,308,366,367,386,434,466,503,505 other=31,109,168,205,212,240,251,258,294,442 base_ulps=2        other_ulps=7
+   FLIP call=49   tok=0 base=83,113,114,222,266,298,320,357,500,504 other=19,57,95,113,125,320,370,383,389,475 base_ulps=1        other_ulps=2
+   FLIP call=50   tok=0 base=29,75,100,163,218,327,446,473,484,487 other=11,32,71,75,137,203,222,280,403,502 base_ulps=2        other_ulps=1
+   FLIP call=51   tok=0 base=26,83,143,156,224,227,295,302,366,476 other=82,190,202,205,237,243,253,335,394,476 base_ulps=1        other_ulps=0
+   FLIP call=52   tok=0 base=48,78,133,160,205,239,280,309,313,415 other=41,68,163,252,294,346,382,388,410,496 base_ulps=1        other_ulps=4
+   FLIP call=53   tok=0 base=6,34,104,216,220,254,338,421,460,476 other=20,68,110,137,163,220,236,326,420,435 base_ulps=2        other_ulps=0
+   FLIP call=54   tok=0 base=15,18,92,169,177,228,270,344,403,424 other=66,168,220,237,285,326,397,403,409,498 base_ulps=4        other_ulps=0
+   FLIP call=55   tok=0 base=31,69,104,151,225,303,389,435,448,510 other=52,129,194,208,302,325,346,351,458,499 base_ulps=0        other_ulps=0
+   FLIP call=56   tok=0 base=81,94,167,183,231,280,355,362,455,462 other=210,224,227,231,244,308,316,422,426,462 base_ulps=7        other_ulps=10
+   FLIP call=57   tok=0 base=17,52,159,230,274,281,321,406,463,509 other=71,75,111,139,238,318,355,396,424,452 base_ulps=1        other_ulps=1
+   FLIP call=58   tok=0 base=139,194,207,267,296,307,393,399,405,461 other=203,225,296,320,322,357,393,417,433,461 base_ulps=3        other_ulps=1
+   FLIP call=59   tok=0 base=30,86,90,201,238,246,261,310,371,500 other=30,35,69,84,98,108,261,273,397,477 base_ulps=0        other_ulps=1
+   FLIP call=60   tok=0 base=10,36,139,180,216,281,344,366,381,436 other=67,82,139,164,180,192,392,418,421,505 base_ulps=3        other_ulps=1
+   FLIP call=61   tok=0 base=36,92,162,250,259,282,290,292,453,488 other=148,162,273,282,330,381,387,400,463,480 base_ulps=0        other_ulps=1
+   FLIP call=62   tok=0 base=2,106,135,181,297,299,300,400,415,501 other=75,77,82,86,94,106,160,365,407,454 base_ulps=4        other_ulps=1
+   FLIP call=63   tok=0 base=120,251,317,319,378,432,443,470,490,496 other=6,12,199,283,327,351,432,470,490,501 base_ulps=2        other_ulps=3
+   FLIP call=64   tok=0 base=40,141,206,228,270,274,314,350,489,497 other=92,191,228,272,274,277,350,392,480,489 base_ulps=1        other_ulps=3
+   FLIP call=65   tok=0 base=3,107,131,152,291,299,351,363,412,498 other=68,84,105,160,172,221,299,363,454,469 base_ulps=2        other_ulps=1
+   FLIP call=66   tok=0 base=3,194,201,278,314,350,401,402,418,442 other=11,28,89,101,194,201,264,275,287,475 base_ulps=2        other_ulps=0
+   FLIP call=67   tok=0 base=25,31,45,81,84,140,202,328,343,434 other=30,64,84,225,246,249,263,364,434,454 base_ulps=0        other_ulps=0
+MIN DECODE base minulps over calls: min=0 p10=0 median=1
+AXIS DECODE x     first_nonzero_call=48 worst_rel=3.418e-01 at call=149
+AXIS DECODE logit first_nonzero_call=48 worst_rel=8.848e-02 at call=55
+AXIS DECODE exp   first_nonzero_call=48 worst_rel=4.084e-01 at call=372
+AXIS DECODE shr   first_nonzero_call=48 worst_rel=6.339e-01 at call=183
+CALL0 DECODE base   x=711.202027 logit=3398.40625 exp=412.329928 shr=43.5615003
+CALL0 DECODE other  x=723.664909 logit=3430.46875 exp=563.497883 shr=31.5413151
+CALL0 DECODE rel x     = 1.722e-02
+CALL0 DECODE rel logit = 9.346e-03
+CALL0 DECODE rel exp   = 2.683e-01
+CALL0 DECODE rel shr   = 2.759e-01
+VERDICT prefill expert-selection SET EQUALITY: DIFFERS (78 flipped token-slots)

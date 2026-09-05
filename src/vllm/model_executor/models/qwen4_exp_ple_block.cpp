@@ -420,7 +420,24 @@ Qwen4ExpPleBlockOutput RunQwen4ExpPleBlock(Dev d, const Qwen4ExpPleWeights& w,
   } else if (tokens_on_host) {
     std::memcpy(hist, tokens_row, hist_bytes);
   } else {
+    // THE DRAIN IS THE READ'S OTHER HALF, NOT A DEFENSIVE ADDITION (#2496).
+    // `Backend::Copy` ENQUEUES: on CUDA it is `cudaMemcpyAsync` on the queue's
+    // stream (src/vt/cuda/cuda_backend.cu:116-118), so `stage` holds its own
+    // zero-fill until the copy lands. The host reads it a few lines below, at
+    // `hash_state.tokens.assign`, and a zeroed history hashes token id 0 into
+    // every context slot -- the exact "fluent wrong answer" the seeding branch
+    // above warns about, on every step and only when `past_len != 0`.
+    //
+    // `CUDA_LAUNCH_BLOCKING=1` DOES NOT COVER THIS. It serialises kernel
+    // launches; it does not make `cudaMemcpyAsync` synchronous. That is why
+    // #2496 reproduces under the serialisation that suppresses #2476.
+    //
+    // The sibling translation unit already states this rule at the definition of
+    // `StageHostWords` -- "nothing is readable until the caller synchronises" --
+    // and its `HostWords` wrapper ends in exactly this call. `Synchronize` is a
+    // no-op on the base backend, so the host branch above pays nothing.
     d.b.Copy(d.q, hist, tokens_row, hist_bytes);
+    d.b.Synchronize(d.q);
   }
 
   // ─── THE MASK'S PAIRED HALF, ENFORCED (spec `## Owed`, since W2) ───────────
@@ -461,7 +478,12 @@ Qwen4ExpPleBlockOutput RunQwen4ExpPleBlock(Dev d, const Qwen4ExpPleWeights& w,
   if (tokens_on_host) {
     std::memcpy(tokens_row, hist, hist_bytes);
   } else {
+    // AND THE WRITE-BACK IS DRAINED BEFORE ITS SOURCE DIES (#2496). `stage` is a
+    // function-local vector; this function returns a few lines below. An
+    // enqueued `cudaMemcpyAsync` still scheduled against it is a DMA reading
+    // freed host memory, which is a use-after-free rather than a slow copy.
     d.b.Copy(d.q, tokens_row, hist, hist_bytes);
+    d.b.Synchronize(d.q);
   }
 
   DBuf d_ids(d, DType::kI64, {T * heads}, ids.data());

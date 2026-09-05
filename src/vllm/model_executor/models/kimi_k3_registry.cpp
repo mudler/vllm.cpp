@@ -76,6 +76,23 @@ void PrepareKimiK3ForConditionalGeneration(LoadedModel& model,
   (void)queue;
 }
 
+// #2544 NAMED THIS REGISTRATION AND THE TREE FALSIFIES IT, which is why there is
+// no `ResolveHostTokenIds` call here and no `detail::ApplyDeviceTokenIds` either.
+//
+// That issue listed five translation units that never read
+// `ModelForwardInput::device_token_ids`, filed the list on a `grep`, and said in
+// its own words that each entry is "a candidate, not a conviction". Four of them
+// embed something. This one does not: both `KimiK3Model::Forward` and
+// `KimiK3Model::ForwardDevice` (`kimi_k3.cpp:54-84`) are
+// `VT_CHECK(false, kPending)` skeletons that `(void)token_ids` and refuse BY
+// NAME, so there is no embed for a stale identifier to reach and no wrong token
+// this model can emit. Wiring the seam in would be a device download whose only
+// successor is a throw -- dead code, which AGENTS.md §"Nothing lands dead"
+// forbids landing in silence.
+//
+// It becomes affected the day the forward stops refusing. Recorded as
+// `## Owed` O3 of `.agents/specs/eng-async-device-ids-2544.md` rather than left
+// for the next `grep` to re-file.
 ForwardLogits ForwardKimiK3ForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
   auto& k3 = ModelAs<KimiK3LoadedModel>(model, "KimiK3ForConditionalGeneration");

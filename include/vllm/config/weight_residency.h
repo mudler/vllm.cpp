@@ -564,6 +564,37 @@ std::vector<PlacementOverride> ResolvePlacementOverrides();
 // to COMPUTE them, and the two are mutually exclusive (`common/fit.cpp:398-399`).
 bool ResolvePlacementFit();
 
+// Whether the operator ASKED for `--fit`, as opposed to inheriting it from the
+// built-in default.
+//
+// The distinction decides what an arm the resolver cannot answer must do. An
+// explicit request that cannot be honoured is an ERROR — the operator asked for
+// something and must not be told silently that it did not happen. A DEFAULT that
+// does not apply is a no-op, because refusing a load over a feature nobody asked
+// for would make `--fit` defaulting on a breaking change for every safetensors
+// checkpoint. Same condition, opposite correct behaviour, so the two cases have
+// to be distinguishable.
+bool PlacementFitWasRequested();
+
+// The message for an EXPLICIT `--fit` standing beside a manual placement, or
+// empty when there is no collision.
+//
+// Mirrors `common/fit.cpp:398-399` ("model_params::tensor_buft_overrides already
+// set by user, abort"): auto and manual are mutually exclusive, not merged.
+//
+// RESOLVE-TIME, and that is what makes it complete. The parse-time refusal sees
+// ONE document, so it misses two ways to reach the same state: a multi-document
+// merge, which copies `fit` and the override fields field by field and never
+// re-runs the check, and the environment, where `VT_PLACEMENT_FIT=1` beside
+// `VT_CPU_MOE=1` was refused nowhere at all. Asking the resolved values closes
+// both without a second checker.
+//
+// ONLY for an explicit fit. Since `fit` now defaults ON, a defaulted fit stands
+// beside every manual placement ever configured; refusing that would make
+// `cpu_moe` unusable. A default that yields to an explicit instruction is not a
+// collision -- the manual placement simply wins.
+std::string DescribePlacementFitCollision();
+
 // THE mmap/placement COLLISION, DECIDED: it WARNS, it does not refuse, and it
 // does not silently win. Returns the warning line, or an empty string when the
 // pairing is not present.

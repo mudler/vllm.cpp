@@ -987,6 +987,56 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dropping_exl3_perf_from_the_pin_breaks_it(self):
+        # MUTATION for the QUANT-EXL3-PERF re-pin (#2570). The row is new and it
+        # entered the runnable population the moment its spec carried a `## Gates`
+        # section naming commands that can FAIL -- two `ctest` invocations and
+        # `scripts/agent-preflight.sh --staged`. Remove the entry and set equality
+        # has to go red, which is what proves the pin was taken BECAUSE the row
+        # entered the population rather than to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"QUANT-EXL3-PERF"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"QUANT-EXL3-PERF"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_exl3_perf_gates_can_actually_fail(self):
+        # The population is defined by what a Gates section can RUN, and a
+        # `## Gates` block whose only command is a `git diff` gates nothing --
+        # this tree has shipped one. So assert the CONTENT, not just membership:
+        # the row's gates name a real ctest target that exists in the tree, and
+        # the suite it names is the one this row's arm is measured by.
+        spec = ROOT / ".agents/specs/quant-exl3-perf.md"
+        text = spec.read_text(encoding="utf-8")
+        self.assertIn("test_exl3_gemv", text)
+        self.assertIn("ctest", text)
+        # The named suite must EXIST, or the gate is a string.
+        self.assertTrue((ROOT / "tests/vt/test_exl3_gemv.cpp").is_file())
+        # And it must be registered, or `ctest -R` matches nothing and exits 0
+        # having run no test at all -- a gate that cannot run must not pass.
+        cmake = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("test_exl3_gemv", cmake)
+
+    def test_preflight_compiles_left_the_gated_population_cleanly(self):
+        # b39f14adb moves ENG-PREFLIGHT-COMPILES (#2401) ACTIVE -> PARTIAL.
+        # PARTIAL is outside GATED_STATES, so the row must leave both sides of
+        # the exact pin without losing the runnable commands preserved in its
+        # spec. These three assertions distinguish lifecycle shrinkage from a
+        # weaker verdict or a silently deleted gate command.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("ENG-PREFLIGHT-COMPILES"))
+        self.assertNotIn("ENG-PREFLIGHT-COMPILES", gates.RUNNABLE_BASELINE)
+        spec = ROOT / ".agents/specs/preflight-compiles.md"
+        text = spec.read_text(encoding="utf-8")
+        section = gates.gates_section(text)
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        self.assertIn("python3 tests/scripts/test_check_tree_compiles.py", commands)
+        self.assertIn(
+            "python3 scripts/check-tree-compiles.py --base origin/main", commands
+        )
+
     def test_hf_model_download_earns_its_runnable_baseline_entry(self):
         # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
         # population for the first time and the baseline grows by one. Same

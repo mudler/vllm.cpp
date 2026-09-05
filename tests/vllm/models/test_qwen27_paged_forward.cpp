@@ -700,6 +700,76 @@ TEST_CASE("qwen27 GDN out dtype is bf16 by default and keys on no model shape") 
   CHECK(GdnOutBf16FlagIsOn(""));  // not a leading '0'.
 }
 
+// #2534. The qwen35 trunk's ONE resolved activation dtype. Two cases, because
+// the parser and the resolver are separable and severing them is silent: an
+// `ActDType` hardwired to BF16 keeps every default-environment gate green while
+// `VT_ACT_F32=1` stops doing anything, and that variable is the denominator of
+// the Q4_K_M arm's same-binary A/B, so a disconnected lever would invalidate the
+// measurement rather than merely lose coverage. That is the same failure
+// `test_qwen35_paged_forward_gdn_out_f32` exists for.
+//
+// The polarity is opt-IN and is the OPPOSITE of `GdnOutBf16FlagIsOn` above:
+// nothing but a leading '1' turns it on, because turning it on changes numerics
+// on a shipped path and the default has to stay the behaviour every recorded
+// device measurement was taken under.
+TEST_CASE("qwen27 activation-dtype flag is opt-in on a leading 1 only") {
+  using vllm::detail::ActF32FlagIsOn;
+
+  CHECK_FALSE(ActF32FlagIsOn(nullptr));  // unset IS the production default.
+  CHECK_FALSE(ActF32FlagIsOn("0"));
+  CHECK_FALSE(ActF32FlagIsOn(""));
+  CHECK_FALSE(ActF32FlagIsOn("true"));  // leading char decides, as elsewhere.
+  CHECK(ActF32FlagIsOn("1"));
+  CHECK(ActF32FlagIsOn("1x"));
+}
+
+// The RESOLVER, asked against the environment this process actually has.
+// `ActDType` caches its getenv in a function-local static, so one process
+// observes exactly one value; the second registration of this binary under
+// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm. That
+// entry is SCOPED to `qwen27 activation*` on purpose: the lever is refused, so
+// every case that CONSTRUCTS a qwen35 model legitimately cannot run under it,
+// and dragging them in would red the entry for obeying the refusal. These two
+// cases build no model, which is why they are the ones that can carry it.
+//
+// The f32 ARM IS REFUSED, and this case holds the refusal to its contract.
+// Honouring the flag does not produce an f32 engine, it produces a numerically
+// inconsistent one: rc job 18fc60f0 measured 9 failed cases and 293 failed
+// assertions, all of them cross-PATH consistency assertions, plus a SIGABRT in
+// the NVFP4 lm_head case. AGENTS.md requires an unimplemented arm to refuse with
+// a message that NAMES the missing part rather than be discovered later, so this
+// asserts the refusal AND its message -- a bare throw that said nothing would
+// satisfy a test that only checked that it threw.
+//
+// The default arm is the shipped path and must be BF16 on EVERY device type. A
+// resolver that ignored the device type, or that quietly answered f32 anywhere,
+// reds this case, and every recorded device measurement was taken at BF16.
+TEST_CASE("qwen27 activation dtype is bf16 by default and REFUSES the f32 arm") {
+  using vllm::detail::ActDType;
+  using vllm::detail::ActF32FlagIsOn;
+
+  const bool on = ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  INFO("VT_ACT_F32 as this process reads it: on=" << on);
+
+  const vt::DeviceType kEvery[] = {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                                   vt::DeviceType::kROCM,
+                                   vt::DeviceType::kMETAL};
+  for (vt::DeviceType dt : kEvery) {
+    CAPTURE(static_cast<int>(dt));
+    if (on) {
+      CHECK_THROWS_WITH_AS(ActDType(dt),
+                           doctest::Contains("VT_ACT_F32=1 is REFUSED"),
+                           std::runtime_error);
+      CHECK_THROWS_WITH_AS(ActDType(dt), doctest::Contains("incomplete"),
+                           std::runtime_error);
+      CHECK_THROWS_WITH_AS(ActDType(dt), doctest::Contains("#2534"),
+                           std::runtime_error);
+    } else {
+      CHECK(ActDType(dt) == vt::DType::kBF16);
+    }
+  }
+}
+
 // GDN-MOE-BF16-OUT (#1168), Edit 2. The eligibility carries NO model-shape term:
 // an eligibility whose every remaining term is true selects packed decode, and
 // nothing in it can say whether the checkpoint is dense or MoE.
@@ -1774,17 +1844,28 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
   const std::vector<int32_t> blocks = {0, 1};  // block_size 8 => all in block 0
 
   // One-shot reference: full prefill of the whole sequence (fresh state).
-  CachePool ref_pool(c, /*num_blocks=*/8, /*block_size=*/8);
-  const CommonAttentionMetadata ref_am = PrefillAttnMeta(T, blocks, 8, 0);
-  const GDNAttentionMetadata ref_gm = PrefillGdnMeta(T, 0);
-  const std::vector<float> one_shot = Qwen3_5DenseModel::Forward(
-      ids, pos, ref_am, ref_gm, ref_pool.attn_kv, ref_pool.gdn_state, w, c, q);
-  REQUIRE(one_shot.size() == static_cast<size_t>(T * vocab));
+  // Recomputed PER ARM below: the reference and the split legs must run the same
+  // GDN prefill algorithm, or the comparison is between two arms rather than
+  // between one-shot and split. (Computing it once, outside the arm scope, made
+  // the sequential leg read 0.00296655 against a CHUNKED reference.)
+  auto run_one_shot = [&]() {
+    CachePool ref_pool(c, /*num_blocks=*/8, /*block_size=*/8);
+    const CommonAttentionMetadata ref_am = PrefillAttnMeta(T, blocks, 8, 0);
+    const GDNAttentionMetadata ref_gm = PrefillGdnMeta(T, 0);
+    std::vector<float> r = Qwen3_5DenseModel::Forward(
+        ids, pos, ref_am, ref_gm, ref_pool.attn_kv, ref_pool.gdn_state, w, c, q);
+    REQUIRE(r.size() == static_cast<size_t>(T * vocab));
+    return r;
+  };
 
   // Drive the SAME sequence split at these cumulative boundaries, resuming each
   // chunk from the persisted state. Two splittings: {3,3} and {2,2,2} (multiple
   // resumptions). state index 0 for all chunks (single request, single block).
-  auto run_chunked = [&](const std::vector<int64_t>& chunk_lens) {
+  // `carry_state=false` DROPS the carried GDN state on the resumed chunks. That
+  // is the defect this case exists to catch, and it is run below as a POSITIVE
+  // CONTROL so that the chunked arm's bar is proven to still catch it rather
+  // than merely chosen to admit the arm.
+  auto run_chunked = [&](const std::vector<int64_t>& chunk_lens, bool carry_state) {
     CachePool pool(c, /*num_blocks=*/8, /*block_size=*/8);
     int64_t context = 0;
     std::vector<float> last_logits;
@@ -1794,27 +1875,107 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
       std::vector<int32_t> cpos(pos.begin() + context,
                                 pos.begin() + context + qlen);
       const CommonAttentionMetadata am = ChunkAttnMeta(context, qlen, blocks, 8);
-      const GDNAttentionMetadata gm =
-          ChunkGdnMeta(qlen, /*sidx=*/0, /*has_initial=*/context > 0);
+      const GDNAttentionMetadata gm = ChunkGdnMeta(
+          qlen, /*sidx=*/0, /*has_initial=*/carry_state && context > 0);
       last_logits = Qwen3_5DenseModel::Forward(cids, cpos, am, gm, pool.attn_kv,
                                                pool.gdn_state, w, c, q);
       context += qlen;
     }
     return last_logits;  // logits of the FINAL chunk's tokens.
   };
-
-  for (const std::vector<int64_t>& split :
-       std::vector<std::vector<int64_t>>{{3, 3}, {2, 2, 2}}) {
-    const std::vector<float> chunked = run_chunked(split);
-    const int64_t tail = split.back();
+  auto diff_vs_one_shot = [&](const std::vector<float>& one_shot,
+                              const std::vector<float>& chunked, int64_t tail) {
     REQUIRE(chunked.size() == static_cast<size_t>(tail * vocab));
-    // Compare the final chunk's logits against the matching one-shot tail rows.
     std::vector<float> ref_tail(
         one_shot.begin() + static_cast<int64_t>(T - tail) * vocab, one_shot.end());
-    const double d = MaxAbsDiff(chunked, ref_tail, chunked.size());
-    MESSAGE("chunked (split tail=" << tail << ") vs one-shot max|diff| = " << d
-            << " (must be ~0 — bit-identical state continuity)");
-    CHECK(d < 1e-4);
+    return MaxAbsDiff(chunked, ref_tail, chunked.size());
+  };
+
+  // ─── THE BAR DEPENDS ON THE GDN PREFILL ALGORITHM, AND THAT IS UPSTREAM'S ──
+  //     OWN POSITION (KERNEL-GDN-CHUNKED-MIRROR, #2612 / #2845)
+  //
+  // This case was written when GDN prefill was an exact SEQUENTIAL recurrence,
+  // for which one-shot == split is EXACT: the recurrence is token-by-token, so
+  // where the scheduler cuts the prefill cannot change the arithmetic. `1e-4`
+  // encoded that.
+  //
+  // vLLM does not run that recurrence. It runs the chunked WY decomposition, in
+  // which each additional chunk boundary sends the token interactions across it
+  // through a BF16-ROUNDED state snapshot (`chunk_delta_h.py:178,352`) instead
+  // of the intra-chunk f32 path. The split therefore changes the arithmetic, by
+  // construction and on purpose. It is not a state-continuity failure.
+  //
+  // Upstream says so itself. `tests/kernels/mamba/cpu/test_cpu_gdn_ops.py`
+  // (@ e126687a9a) has this exact test for its own chunked CPU kernel —
+  // `test_chunk_gated_delta_rule_cpu_two_call_split`, a prefill split across two
+  // scheduler steps with the second seeded from the first's `final_state` — and
+  // gates it at `atol=rtol=1e-3` on the STATE and `2e-2` on the OUTPUT, with the
+  // comment "State must be near-exact; output allows a looser bound for the
+  // bf16 round-trip". vLLM does not claim bit-exactness here and neither can a
+  // faithful mirror of it.
+  //
+  // Reproduced independently of our C++, and the driver is COMMITTED so this
+  // table is checkable without writing one:
+  //   docs/bench-evidence/gdn-chunked-decomposition-20260902/run_split.py
+  // (`python3 run_split.py`, experiment A, no GPU; SPLIT_OUTPUT.txt is its
+  // captured run). At T=6, which is exactly this case's shape, state max|d| of
+  // a split prefill against the same tokens in one call:
+  //
+  //     arm                          split {3,3}     split {2,2,2}
+  //     sequential recurrence        0.0             0.0            <- what 1e-4 encoded
+  //     chunked, upstream bf16       1.694679e-03    1.700044e-03   <- the mirror
+  //     chunked, f32 intermediates   2.980232e-08    4.470348e-08   <- NOT the mirror (the R1 trap)
+  //
+  // The middle row is the one vLLM computes. The bottom row is the control that
+  // makes this an explanation rather than an observation: it runs the SAME
+  // chunked decomposition and differs only in where the bf16 rounding falls, so
+  // the discontinuity is the BF16 PLACEMENT and not the reassociation — and the
+  // placement is the half that cannot be dropped without dropping the mirror.
+  //
+  // SO THE CLAIM IS SPLIT ONTO THE ARM THAT CAN CARRY IT, AND THE OTHER ARM
+  // GETS A BAR WITH A CONTROL. The machinery claim — that state is carried and
+  // not re-zeroed or dropped — is arm-independent, so it stays gated at FULL
+  // strength (tightened from `< 1e-4` to `== 0`) on the sequential arm.
+  for (const std::vector<int64_t>& split :
+       std::vector<std::vector<int64_t>>{{3, 3}, {2, 2, 2}}) {
+    const int64_t tail = split.back();
+    {
+      ScopedEnv sequential("VT_GDN_CHUNKED", "0");
+      const std::vector<float> ref_seq = run_one_shot();
+      const double d = diff_vs_one_shot(ref_seq, run_chunked(split, true), tail);
+      MESSAGE("SEQUENTIAL arm, split tail=" << tail
+              << ": chunked-prefill vs one-shot max|diff| = " << d
+              << " (must be EXACTLY 0 — this arm's split is bit-identical)");
+      CHECK(d == 0.0);
+    }
+    // PINNED ON. Without this the block below runs whatever the ambient
+    // VT_GDN_CHUNKED selects, and under `=0` it takes the SEQUENTIAL recurrence
+    // and reads d = 0 while still calling itself the chunked arm — passing, and
+    // measuring nothing. That is the exact failure class this whole change is
+    // about, and it does not red, so nothing would tell you.
+    ScopedEnv chunked("VT_GDN_CHUNKED", "1");
+    // The production default. Bar 1e-2, and it is DERIVED: the geometric mean of
+    // the correct arm's worst (3.76107e-3) and a dropped state's best
+    // (2.70987e-2) on this fixture, which is 1.0096e-2.
+    const std::vector<float> one_shot = run_one_shot();
+    const double d = diff_vs_one_shot(one_shot, run_chunked(split, true), tail);
+    const double dropped = diff_vs_one_shot(one_shot, run_chunked(split, false), tail);
+    MESSAGE("CHUNKED arm, split tail=" << tail
+            << ": chunked-prefill vs one-shot max|diff| = " << d
+            << "; SAME with the carried state DROPPED = " << dropped
+            << " (ratio " << (d > 0.0 ? dropped / d : 0.0) << "x)");
+    CHECK(d < 1e-2);
+    // Without this the bar above is just a looser number. With it, the case
+    // still fails if the state stops being carried — which is the whole point
+    // of the case. NOTE THE COST HONESTLY: on the sequential arm the ratio
+    // between these two is INFINITE (a correct split is exactly 0); on the
+    // chunked arm it is finite — measured 9.75x at tail=3 and 10.37x at tail=2.
+    // Mirroring vLLM buys that discriminating power down and no bar in this
+    // window buys it back. The 3.0 demanded below is deliberately well under
+    // the measured ratio, so this fails on a real regression rather than on
+    // fixture noise.
+    CHECK(dropped > 1e-2);
+    CHECK(dropped > d * 3.0);
   }
 }
 

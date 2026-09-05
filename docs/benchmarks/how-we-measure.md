@@ -18,10 +18,23 @@ memory compete; end-to-end wall-clock on a cold page cache is unusable there,
 and steady-state per-step timing or `nsys` GPU-busy is the anchor. The
 2026-08-06 #77-slip tree-revert changed no benchmark content or number.
 
-**Oracle pin.** vLLM 0.26.0.dev0 (`55596792`) plus transformers 5.14.1, built from
-source for sm_121a; the running oracle reports `0.23.1rc1.dev1511+g555967922` with
-FlashInfer `0.6.15.post1`, and the binding series selects it by explicit path and
-asserts that identity per leg. Speed figures labelled 0.25.0 ran the ROLLBACK the
+**Oracle pin.** vLLM 0.28.1rc1.dev132 (`e126687a9a`) since 2026-09-03, with
+FlashInfer `0.6.18` and CUTLASS DSL `4.6.2`.
+
+**EVERY BINDING RATIO ON THESE PAGES WAS MEASURED AGAINST THE PREVIOUS PIN**,
+vLLM 0.26.0.dev0 (`55596792`) plus transformers 5.14.1, built from source for
+sm_121a, the running oracle reporting `0.23.1rc1.dev1511+g555967922` with
+FlashInfer `0.6.15.post1`, selected by explicit path and asserted per leg. The
+pin advanced before those baselines were re-measured, by a developer ruling that
+inverts the sync cycle's own step order (`.agents/upstream-sync.md`), because the
+committed harness refuses to run at any revision but the pinned one. **The
+re-measurement is owed against the new pin
+([#2818](https://github.com/mudler/vllm.cpp/issues/2818)), it covers five rows
+across `vllm-online-serving` and `speculative-decoding`, and a red there requires
+reverting the pin rather than re-arguing the rows.** No gate of any kind has yet
+run at the new pin: the declared token-exact gate is owed by
+[#2794](https://github.com/mudler/vllm.cpp/issues/2794) and every committed
+golden predates the advance. Speed figures labelled 0.25.0 ran the ROLLBACK the
 harness enforced until 2026-08-12 and are SUPERSEDED, never binding (#520).
 Correctness re-validated bit-identical across the advance, zero golden drift.
 The llama.cpp oracle is stock `b10451` since 2026-08-16, `gateable = no` until

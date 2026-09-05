@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,9 +45,14 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/glm_moe_dsa.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits carrier
 #include "vllm/sampling_params.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/persistent_step_input.h"  // StepInputStats: the seam this arm must NOT touch
+
+#include "support/test_env.h"
 
 #include "../gguf_builder.h"
 #include "glm_moe_dsa_gguf_fixture.h"
@@ -57,6 +63,22 @@ using namespace glm_dsa_fixture;  // NOLINT: the fixture IS this file's vocabula
 using vllm::GlmMoeDsaWeights;
 using vllm::PagedKvCache;
 using vllm::v1::CommonAttentionMetadata;
+
+// THE LANE'S ENVIRONMENT, SET BEFORE DOCTEST'S MAIN RUNS (#2450).
+// `tests/CMakeLists.txt` also sets `VT_MOE_EXPERT_STREAM=1` on this target, and
+// that property is kept, but it is a CTEST property: it exists only when ctest
+// launches the binary. Run the binary DIRECTLY -- which is what an implementer
+// debugging one case does -- and the variable is absent, so
+// `expert_stream::StreamRequested()` latches its function-local static to false
+// in whichever case reads it first and the W9 seam case reds on a REQUIRE that
+// says nothing about the seam. Namespace-scope static initialisation runs before
+// main, so this sets the variable ahead of the first latch on either launch
+// path. Same hazard and same remedy as
+// `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp:362-385`.
+struct EnableExpertStreaming {
+  EnableExpertStreaming() { vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1"); }
+};
+const EnableExpertStreaming kEnableExpertStreaming;
 
 // LONGER THAN `index_topk` (64), ON PURPOSE. The sparse route is a property of
 // the STEP: `use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
@@ -394,9 +416,10 @@ TEST_CASE("glm-dsa W9: the routed experts go through the expert-stream seam") {
   // OFF, and with it off `ExpertSlice` never builds a store, both arms below
   // read the tower in place, and the comparison passes on a forward that never
   // touched the seam at all — the "instrument whose failure looks like a
-  // result" shape. `VT_MOE_EXPERT_STREAM=1` is set on this target in
-  // `tests/CMakeLists.txt`, and the assertions after the first run are what
-  // prove it took effect.
+  // result" shape. `VT_MOE_EXPERT_STREAM=1` is set twice on purpose -- by this
+  // file's own `EnableExpertStreaming` static, which covers a direct run of the
+  // binary, and by the ctest property on this target -- and the assertions after
+  // the first run are what prove it took effect.
   REQUIRE(vllm::expert_stream::StreamRequested());
 
   MlaCachePool pool_a(w.params);
@@ -491,4 +514,226 @@ TEST_CASE("glm-dsa W9: weights that never went through the absorption are refuse
       "GlmMoeDsaModel::Forward on unabsorbed weights");
   CHECK(msg.find("post-load absorption") != std::string::npos);
   CHECK(msg.find("w_uk_t") != std::string::npos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (8) THE ASYNCHRONOUS DEVICE-IDENTIFIER GATE, on the lane this model has.
+//
+//     Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596), which is
+//     the row's; the contract itself is #1305's and the candidacy is
+//     [#2544](https://github.com/mudler/vllm.cpp/issues/2544)'s.
+//
+// WHAT IT MEASURES. On the asynchronous serving path the runner's combine
+// splices each decode row's sampled token into the DEVICE identifiers on the
+// main queue and leaves the host `token_ids` deliberately stale for decode rows
+// (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm). A forward that embeds
+// the host vector therefore generates every step after the first from the
+// previous step's identifiers — in this tree's zero-initialised carrier, from
+// token id 0. The defect is SILENTLY WRONG TOKENS and not a fault, so this
+// asserts the identifiers themselves rather than that the call returns.
+//
+// WHY IT IS HERE RATHER THAN IN `test_moe_async_device_ids.cpp`. That suite
+// enters `ModelRegistry::Load` through `ModelSource::FromSafetensors`, and this
+// arm has no safetensors loader at all: `LoadGlmMoeDsaFromGguf` is the only
+// producer of usable weights. The lane is the same; the source is not.
+//
+// ONE LANE, NOT TWO, and that is a property of the registration rather than an
+// omission. `ForwardGlmMoeDsaForCausalLM` branches only on `gather_logits` —
+// there is no decode-GRAPH driver for this model — so the EAGER arm is every arm
+// it has. `vt::PersistentStepInput`'s counters must therefore stay at zero
+// throughout, and that is asserted rather than assumed: a case that quietly
+// acquired a graph lane would move them, and this would red.
+//
+// THE STEPS ARE UNDER `index_topk`(=64) ON PURPOSE. A resumed step whose
+// selection PRUNES is refused by name (case 7 above), and that refusal is a
+// different, correct behaviour owned by `KV-DSV4-MULTICACHE` (#1925). Decoding
+// at a context of 8..11 keeps the selection unpruned, so what this case
+// exercises is the identifier path and not the refusal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// One pure-decode step: one request, one query token, `computed` tokens already
+// in the cache. `seq_len = computed + 1` stays well under `index_topk`.
+CommonAttentionMetadata DecodeStep(int64_t computed) {
+  CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = 1;
+  m.query_start_loc = {0, 1};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(computed + 1)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.num_computed_tokens_cpu = {static_cast<int32_t>(computed)};
+  m.max_query_len = 1;
+  m.max_seq_len = static_cast<int>(computed + 1);
+  m.block_table_num_cols = kBlocks;
+  m.block_table_tensor.assign(static_cast<size_t>(kBlocks), 0);
+  for (int64_t c = 0; c < kBlocks; ++c) {
+    m.block_table_tensor[static_cast<size_t>(c)] = static_cast<int32_t>(c);
+  }
+  m.slot_mapping = {static_cast<int32_t>(computed)};
+  m.causal = true;
+  return m;
+}
+
+constexpr int kIdSteps = 4;
+constexpr int64_t kFirstComputed = 8;
+
+// The identifiers a runner's combine would have written, one per step. All are
+// NON-ZERO, because the stale carrier this gate is about is zero-filled: an
+// identifier that happened to be 0 would make runs B and C agree for the wrong
+// reason.
+const std::vector<int32_t>& TrueIdOf(int t) {
+  static const std::vector<std::vector<int32_t>> kIds = {
+      {5}, {11}, {23}, {17}};
+  return kIds[static_cast<size_t>(t)];
+}
+
+struct BackendFree {
+  vt::Backend* b = nullptr;
+  void operator()(void* p) const {
+    if (p != nullptr && b != nullptr) b->Free(p);
+  }
+};
+
+// Drive `kIdSteps` pure-decode steps through `ModelRegistry::Forward`, and
+// return each step's downloaded [1, vocab] logits. `mirror` selects run C: the
+// host vector is zeros and the true identifiers travel ONLY through
+// `ModelForwardInput::device_token_ids`.
+std::vector<std::vector<float>> RunDecodeIds(const gguf_test::TempFile& f,
+                                             const vllm::GlmMoeDsaParams& params,
+                                             bool stale_host, bool mirror) {
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig cfg = vllm::GlmMoeDsaHfConfigFromGguf(g);
+  vt::Queue q;
+  vt::Backend& be = vt::GetBackend(q.device.type);
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::ModelRegistry::Load(cfg, vllm::ModelSource::FromGguf(g, q.device.type));
+  REQUIRE(model != nullptr);
+
+  MlaCachePool pool(params);
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const std::vector<int32_t> no_gather;
+
+  std::vector<std::vector<float>> out;
+  for (int t = 0; t < kIdSteps; ++t) {
+    const std::vector<int32_t>& truth = TrueIdOf(t);
+    const std::vector<int32_t> stale(truth.size(), 0);
+    const std::vector<int32_t>& host = stale_host ? stale : truth;
+    const std::vector<int32_t> positions = {
+        static_cast<int32_t>(kFirstComputed + t)};
+    const CommonAttentionMetadata am = DecodeStep(kFirstComputed + t);
+    vllm::ModelForwardInput in{host,          positions,  am,
+                               gdn_meta,      pool.attn_kv, gdn_state,
+                               cfg,           q,          no_gather};
+    in.num_reqs = 1;
+    in.pure_decode = true;
+    in.uniform_query_len = 1;
+    // THE MIRROR'S BUFFER IS A REAL BACKEND ALLOCATION, not the host vector's
+    // address. On CPU the two are the same kind of pointer, so this buys nothing
+    // today; it is what makes the case correct by construction on a device,
+    // where `device_token_ids` is a pointer the runner's combine wrote.
+    std::unique_ptr<void, BackendFree> mirror_ids;
+    if (mirror) {
+      const size_t bytes = truth.size() * sizeof(int32_t);
+      mirror_ids.reset(be.Alloc(bytes));
+      mirror_ids.get_deleter().b = &be;
+      be.Copy(q, mirror_ids.get(), truth.data(), bytes);
+      in.device_token_ids = static_cast<const int32_t*>(mirror_ids.get());
+    }
+    const vllm::ForwardLogits fl = vllm::ModelRegistry::Forward(*model, in);
+    REQUIRE(fl.on_device());
+    // THE INSTRUMENT'S OWN PRECONDITION, before a single float is read. A step
+    // that returned a different number of rows would have this case comparing
+    // whatever followed the first row in the buffer, and the comparison would
+    // still look like a result.
+    REQUIRE(fl.rows == 1);
+    REQUIRE(fl.vocab == kVocab);
+    std::vector<float> row(static_cast<size_t>(kVocab));
+    be.Copy(q, row.data(), fl.device_tensor.data, row.size() * sizeof(float));
+    be.Synchronize(q);
+    out.push_back(std::move(row));
+  }
+  return out;
+}
+
+size_t DifferingFloats(const std::vector<float>& a, const std::vector<float>& b) {
+  REQUIRE(a.size() == b.size());
+  size_t n = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE(
+    "glm-dsa: the EAGER arm embeds the async mirror's DEVICE ids, not the stale "
+    "host vector") {
+  gguf_test::TempFile f(BuildCompleteGlmDsa());
+  const GlmMoeDsaWeights w = LoadFixture(f);
+
+  // RUN A — the reference: the identifiers arrive on the host, no mirror.
+  vt::ResetStepInputStats();
+  const std::vector<std::vector<float>> ref =
+      RunDecodeIds(f, w.params, /*stale_host=*/false, /*mirror=*/false);
+  {
+    // NOTHING BINDS, because this registration has no decode-graph slot. Held as
+    // an assertion so a case that silently acquired one could not stay green.
+    const vt::StepInputStats s = vt::GetStepInputStats();
+    CHECK(s.binds == 0);
+    CHECK(s.host_refreshes == 0);
+    CHECK(s.device_refreshes == 0);
+  }
+  // FINITENESS BEFORE ANY COMPARISON. Against a NaN both `==` and `!=` are
+  // false, so an equality gate and a difference gate BOTH report success on a
+  // forward that produced no numbers — which is exactly how the sibling row read
+  // an all-NaN forward as a perfect match.
+  for (int t = 0; t < kIdSteps; ++t) {
+    CAPTURE(t);
+    const LogitReport r = Describe(ref[static_cast<size_t>(t)], "ids-reference");
+    REQUIRE(r.nan_count == 0);
+    REQUIRE(r.inf_count == 0);
+  }
+
+  // RUN B — THE CONTROL. Stale host identifiers and no mirror: the logits must
+  // MOVE. Without this arm a forward that ignored its identifiers entirely would
+  // satisfy run C, and so would a gate whose two runs happened to share a buffer.
+  const std::vector<std::vector<float>> stale =
+      RunDecodeIds(f, w.params, /*stale_host=*/true, /*mirror=*/false);
+  for (int t = 0; t < kIdSteps; ++t) {
+    CAPTURE(t);
+    const size_t moved =
+        DifferingFloats(ref[static_cast<size_t>(t)], stale[static_cast<size_t>(t)]);
+    CHECK_MESSAGE(moved > 0,
+                  "step " << t << ": zeroing the host ids changed nothing, so "
+                          "this fixture cannot see an identifier at all");
+  }
+
+  // RUN C — THE GATE. The same stale host vector, with the true identifiers
+  // reaching the model ONLY through `device_token_ids`.
+  vt::ResetStepInputStats();
+  const std::vector<std::vector<float>> via_device =
+      RunDecodeIds(f, w.params, /*stale_host=*/true, /*mirror=*/true);
+  {
+    const vt::StepInputStats s = vt::GetStepInputStats();
+    CHECK(s.binds == 0);
+    CHECK(s.device_refreshes == 0);
+  }
+  size_t differing = 0;
+  for (int t = 0; t < kIdSteps; ++t) {
+    differing += DifferingFloats(ref[static_cast<size_t>(t)],
+                                 via_device[static_cast<size_t>(t)]);
+  }
+  CHECK_MESSAGE(differing == 0,
+                "registry forward, mirror vs host reference: " << differing
+                    << " of " << (kIdSteps * kVocab) << " logits differ, so the "
+                    "forward embedded the STALE host ids and this model "
+                    "generates from token id 0 on every decode step after the "
+                    "first (#2544, #2596)");
+  MESSAGE("registry forward, mirror vs host reference, bit for bit: "
+          << kIdSteps << " steps x " << kVocab << " values, " << differing
+          << " differing");
 }

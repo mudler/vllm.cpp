@@ -19,6 +19,11 @@ NewRequestData NewRequestData::from_request(
   data.block_ids = std::move(block_ids);
   data.num_computed_tokens = request.num_computed_tokens;
   data.prefill_token_ids = std::move(prefill_token_ids);
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): the hop that used to drop the multimodal
+  // payload. Upstream's dataclass carries `mm_features=request.mm_features`
+  // (output.py NewRequestData.from_request); ours dropped it, so the worker
+  // never learned a request had an image. Empty vector on every text request.
+  data.mm_features = request.mm_features;
   return data;
 }
 

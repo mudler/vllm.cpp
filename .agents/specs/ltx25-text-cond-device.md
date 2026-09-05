@@ -154,10 +154,15 @@ one shape in this suite that runs `ltx2_video.cpp:3073-3094`.
 4. **Correctness, before any speed result is accepted**: `ltx25-render-compare.py`
    against `tests/parity/goldens/ltx2_oracle/`'s committed #1864 reference on the
    changed arm, PLUS a same-arm pixel comparison of arm B's frames against arm
-   A's. The blockiness gate is one-sided and our render is already smoother than
-   upstream's, so a PASS on it is necessary and not sufficient; the same-arm
-   comparison is the sharper instrument and for a bit-exact repair it should be
-   byte equality.
+   A's. The blockiness gate is one-sided, so a PASS on it is necessary and not
+   sufficient; the same-arm comparison is the sharper instrument and for a
+   bit-exact repair it should be byte equality. (This item used to justify that
+   with "our render is already smoother than upstream's". **That premise is
+   FALSE** -- `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) measured the spectrum and our
+   render carries 1.4031x the reference's absolute high-band power at 1.0373x its
+   mid-band power, so there is no rolloff to call smoothness. The gate's
+   one-sidedness is reason enough on its own, and it is the reason that
+   survives.)
 5. `scripts/agent-preflight.sh`.
 
 ## Dependencies
@@ -220,8 +225,18 @@ Stop and report, do not work around:
   same code path with the materialization inlined rather than a second copy of
   it. Owner: this row, through #2354.
 - **The oracle's 93.8 s is still undecomposed.** Inherited from #2296 unchanged.
-- **`decode.audio.mel` at 47 s is still unattributed.** Not this row.
+- **~~`decode.audio.mel` at 47 s is still unattributed.~~ RESOLVED 2026-08-31 by
+  `LTX25-AUDIO-DECODE-COST`** (`79ee71b71`), which measured it as 28 convolutions
+  totalling 31.46 GMAC at 1.30 GMAC/s on one core -- one multiply-accumulate per
+  roughly four cycles, the latency of a dependent scalar `double` chain -- and
+  parallelised `Conv2d` over output lines, byte-identical at seven worker counts.
+  Struck rather than deleted, because the bullet is the record of what this row
+  did not own. Owner: `LTX25-AUDIO-DECODE-COST`.
 - **The 206.0 s that remains after `guiders` and `connector` is still open.**
+  Owner: `LTX25-RENDER-SPEED-PARITY`, whose `## Owed` carries it with the split
+  (`load` 94.5 s, `decode.audio` 50.7 s, `decode.video` 16.0 s, `denoise` 15.1 s).
+  Named here without an owner until now, which is the one gap a sweep of the LTX
+  specs' owed items found.
   Removing both entirely leaves 2.20x. Naming it here is what stops this row's
   result being read as the whole answer.
 

@@ -221,6 +221,26 @@ struct OwnedTensor {
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
+// The whole of `src` as a ZERO-COPY view: same bytes, shape, dtype, `nk` and
+// layout markers, with a keep-alive on `src`'s buffer.
+//
+// WHY THIS EXISTS RATHER THAN `OwnedTensor b = a;`. `OwnedTensor`'s implicit
+// copy DEEP-COPIES an owned `OwnedBytes`, and a per-step block adapter that
+// spells the pass-through as assignment therefore reallocates the weight on
+// every step. That is not only traffic. `ResidentWeight`'s host-alias arm hands
+// a device kernel `w.bytes.data()` directly, so the copy's buffer becomes the
+// GEMM's operand, and the copy dies at the end of the layer's scope while the
+// GEMM is still queued: `Warp illegal address` inside cuBLASLt, with every
+// declared extent correct (issue #2476, `.agents/specs/gdn-qkvz-operand-lifetime.md`).
+// The view keeps the operand owned by the model, which is the invariant.
+//
+// `src` is NON-CONST because `OwnedBytes::KeepAlive()` converts an owned buffer
+// into a shared read-only one in place. Nothing may write through `src` after
+// that, which is already true of every weight this serves: they are read-only
+// from the end of the load. `KeepAlive()` is taken BEFORE `data()`, so the view
+// can never depend on `std::vector`'s move preserving the heap address.
+OwnedTensor BorrowWholeOwnedTensor(OwnedTensor& src);
+
 // The alignment a HOST pointer must meet before a device kernel may be handed it
 // in place of the `Backend::Alloc` pointer it would otherwise have received.
 //
@@ -517,7 +537,7 @@ struct Exl3Weight {
   // `Exl3Weight`, which is the same shape as reading marker ABSENCE as MCG.
   // -1 is not a codebook, so anything that forgets to set it refuses at
   // `Exl3DecodeCodeword` by name instead of decoding to plausible garbage.
-  int codebook = -1;  // 0 == 3INST, 1 == MCG; SET IT EXPLICITLY
+  int codebook = -1;  // 0 == 3INST, 1 == MCG, 2 == mul1; SET IT EXPLICITLY
 
   bool Empty() const { return trellis.Empty(); }
 
@@ -789,6 +809,37 @@ struct GdnLayerWeights {
   // the GEMM scalar instead). Empty on every non-fp8 owner.
   mutable std::shared_ptr<void> d_qkvz_fp8_packed;
   mutable std::shared_ptr<void> d_qkvz_fp8_alpha;
+
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4) — the EXL3 (exllamav3 trellis) arm of
+  // this tower, and it is THREE projections rather than the merged qkvz owner
+  // above.
+  //
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships `in_proj_qkv` and `in_proj_z` as
+  // two INDEPENDENTLY quantized trellises: `in_proj_qkv.svh [10240]` and
+  // `in_proj_z.svh [6144]`, each fitted at quantization time against its own
+  // projection. The bf16 loader N-concatenates the two `.weight` shards because
+  // concatenating bf16 rows is a byte copy. A trellis is a 16x16-tiled
+  // bitstream whose two Hadamard sign vectors are per projection, so the same
+  // concatenation is defined only when both shards share `suh` bit-for-bit, and
+  // nothing in the calibration gives a reason to expect that. There is no
+  // merged-trellis operand in this tree either (`quant-exl3-shared.md` records
+  // "no merged EXL3 QKV or gate_up" as owed).
+  //
+  // So the arm MIRRORS THE ARTIFACT and issues two in-projection GEMMs. That is
+  // the shape `ProjectGdnQkvz` already has a precedent for: the split native-FP8
+  // arm the 35B runs takes exactly this path when the merged owner is empty.
+  //
+  // Exactly one representation is ever populated. When these are filled, the
+  // bf16 `in_proj_qkvz`/`out_proj` and every FP8 and NVFP4 field above are empty.
+  Exl3Weight in_proj_qkv_exl3;  // [K=H,         N=conv_dim]
+  Exl3Weight in_proj_z_exl3;    // [K=H,         N=value_dim]
+  Exl3Weight out_proj_exl3;     // [K=value_dim, N=H]
+
+  // ONE truth for the arm, keyed on the first projection alone, exactly as
+  // `FullAttnLayerWeights::IsExl3` keys on `q_proj_exl3`. A predicate that
+  // OR-ed the three would report a half-populated container as an arm, which is
+  // the state no loader may produce and no consumer may accept.
+  bool IsExl3() const { return !in_proj_qkv_exl3.Empty(); }
 };
 
 // Full (dense causal) attention layer weights.
@@ -865,6 +916,23 @@ struct FullAttnLayerWeights {
   // wherever the site exposes packed q/k/v views, because there is nothing to
   // trade off. Empty on every non-block owner.
   Fp8BlockMergedResident qkv_fp8_block_merged;
+
+  // QUANT-EXL3 (#2181) / MODEL-QWEN35-EXL3 (#2495 item 3): the exllamav3
+  // trellis arm of this tower. Q/K/V stay SEPARATE where the bf16, NVFP4 and
+  // block-FP8 arms above hold (or build) one merged owner: a trellis is
+  // `[k/16, n/16, 32*bits]`, so joining on the output dim interleaves per input
+  // tile rather than row-stacking, which is a real transform and owed its own
+  // gate (`## Owed` in `specs/quant-exl3-shared.md`). Exactly one of {bf16,
+  // fp4, per-tensor fp8, block fp8, exl3} is populated per layer.
+  Exl3Weight q_proj_exl3;  // [K=H,       N=2*Hq*Dh]
+  Exl3Weight k_proj_exl3;  // [K=H,       N=Hkv*Dh]
+  Exl3Weight v_proj_exl3;  // [K=H,       N=Hkv*Dh]
+  Exl3Weight o_proj_exl3;  // [K=Hq*Dh,   N=H]
+
+  // `q_proj_exl3` and not "any of the four": the loader fills all four together
+  // or none, and asking about the FIRST one keeps this predicate the same
+  // question the loader's own `IsExl3Projection(has, "...q_proj")` probe asked.
+  bool IsExl3() const { return !q_proj_exl3.Empty(); }
 };
 
 // Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.
@@ -1318,8 +1386,8 @@ multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
 // route to the text-only path deliberately instead of discovering the refusal.
 bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 
-// Does a weight of `bytes` still fit as a TRUE DEVICE COPY, leaving the box
-// enough headroom to serve?
+// THE STAGING POLICY. The three declarations below decide ONE question: do this
+// model's dense weights get a true device copy, or do they keep the retag above?
 //
 // WHY THIS EXISTS, MEASURED. The retag above costs real decode throughput on
 // GB10: interleaved A/B on `dgx:gpu0`, one boot, Qwen3.8-27B bf16 + DFlash2
@@ -1334,13 +1402,18 @@ bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 // box precisely because the CUDA arm paid for its weights TWICE — host bytes
 // plus a device copy. Staging is the right default for a model that fits and
 // is fatal for one that does not, so the question has to be asked of the BOX
-// rather than answered once for the file.
+// and of this model's own total, rather than answered once for the file.
 //
-// The rule is deliberately conservative: stage only while the device still has
-// `VT_QWEN35_STAGE_MIN_FREE_FRAC` of its total memory free (default 0.55).
-// A 50 GiB model on a 119.6 GiB box starts at ~94% free and stages; the 2.4T
-// model is already past the floor when its first dense weight arrives, so it
-// never stages and keeps exactly the behaviour #1299 shipped.
+// THE RULE, IN FULL. `StagingFitsModel` below is arithmetic over two STABLE
+// numbers: `2 * model_weight_bytes + reserve_bytes <= device_total_bytes`,
+// where `reserve_bytes` comes from `VT_QWEN35_STAGE_RESERVE_BYTES` (12 GiB by
+// default). `SetSafetensorsWeightBudget` latches that answer ONCE per process.
+// NOTHING here is asked per weight, and no fraction of LIVE FREE memory is read
+// — an earlier form did both, and the comment on `SetSafetensorsWeightBudget`
+// below records what that cost. A 50 GiB model on a 119.6 GiB box clears the
+// rule and stages; the 2.4T checkpoint cannot and never does, keeping exactly
+// the behaviour #1299 shipped.
+
 // Does a model of `model_weight_bytes` leave room for a SECOND, device-resident
 // copy of itself on a device of `device_total_bytes`, keeping `reserve_bytes`
 // for the KV cache and activations?

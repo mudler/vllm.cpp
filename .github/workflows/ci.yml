@@ -186,7 +186,7 @@ jobs:
         run: |
           python3 scripts/check-agent-record.py --report
           python3 tests/scripts/test_agent_record.py
-          python3 tests/scripts/test_check_issue_index_append_only.py
+          python3 tests/scripts/test_agent_issue_index.py
       - name: Accepted binary-release design and record anchors stay in sync
         run: |
           python3 scripts/check-release-binary-contract.py
@@ -204,12 +204,14 @@ jobs:
           python3 scripts/check-container-matrix.py
           python3 scripts/check-container-workflow.py
           python3 scripts/check-build-runtime-deps.py
+          python3 scripts/check-lease-ccache.py
           python3 tests/scripts/test_release_pipeline.py
           python3 tests/scripts/test_check_windows_release_state.py
           python3 tests/scripts/test_release_postpublish_audit.py
           python3 tests/scripts/test_check_container_matrix.py
           python3 tests/scripts/test_check_container_workflow.py
           python3 tests/scripts/test_check_build_runtime_deps.py
+          python3 tests/scripts/test_check_lease_ccache.py
           python3 tests/scripts/test_validate_container_image.py
           python3 tests/scripts/test_release_index.py
       - name: CPU release metadata and tier execution gates fail closed
@@ -246,6 +248,13 @@ jobs:
       - name: The gate bring-up script resolves its values or refuses
         run: |
           python3 tests/scripts/test_gate_bringup.py
+      - name: The pre-push compile gate scopes, reports and fails closed
+        # Registered in TWO places, like the bring-up suite above: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`. The suite builds
+        # four-file CMake projects in scratch repositories and needs a compiler,
+        # which this lane has; it does not build this tree.
+        run: |
+          python3 tests/scripts/test_check_tree_compiles.py
       - name: scripts/ and tools/ resolve their values, refuse, and keep records
         # Registered in TWO places, like the bring-up suite above: here and in
         # the `SUITES` array of `scripts/agent-preflight.sh`. Half of it guards
@@ -477,6 +486,17 @@ jobs:
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_agent_issue_index.py
           python3 tests/scripts/test_ab_arms_differ.py
+          # The ROCM-TIER-DIVERGENCE (#2590) attribution suite stays HERE, and
+          # its two siblings do not (#2705). This one drives
+          # `scripts/tier-delta-attribution.py`, which imports `statistics` and
+          # nothing else, so it runs in a step with no numpy. The hidden-state
+          # and logit comparators both `import numpy as np`, and they landed on
+          # these lines by mistake: numpy is installed in the NEXT step, so all
+          # three were invoked before the dependency existed and the first of
+          # them reduced the whole step to a `ModuleNotFoundError` wearing an
+          # `AssertionError: 1 != 0`. The two that need numpy moved to the lane
+          # that installs it. Do not reunite them here.
+          python3 tests/scripts/test_tier_delta_attribution.py
       - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
         # Registered in TWO places, like the baseline and preflight suites above:
         # here and in `scripts/agent-preflight.sh`. Both suites ran on NO lane
@@ -505,6 +525,18 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
           python3 tests/scripts/test_ltx25_render_compare.py && python3 tests/scripts/test_ltx25_absolute_reference.py
+          # The prompt-adherence half of the same tool (#2295, owning #1854's
+          # first sub-question). 42 of its 47 cases need numpy only; the five
+          # that need the pinned CLIP checkpoint skip themselves individually,
+          # because this lane has no 598 MB checkpoint and a case that cannot
+          # run must say so rather than pass.
+          python3 tests/scripts/test_ltx25_prompt_adherence.py
+          # The diagnosis that decided whether the render's smoothness CAUSES
+          # that adherence gap (#2513). Its answer is NEGATIVE, and a negative
+          # answer is what a broken instrument returns for free, so the suite
+          # feeds each part a signal with a closed-form answer. numpy only: no
+          # checkpoint, no frames, no GPU, so nothing here can skip silently.
+          python3 tests/scripts/test_ltx25_adherence_detail_loss.py
           # Same numpy-only lane, same reason (#2011): the GLM-5.3-Flash
           # GGUF converter avoids gguf-py on purpose -- upstream has no
           # `glm5_next`, and `gguf.quants.Q2_K` has a dequantizer and NO
@@ -513,6 +545,55 @@ jobs:
           # never be silent.
           python3 tests/scripts/test_convert_glm5_next_gguf.py
           python3 tests/scripts/test_ltx25_pixel_ab_harness.py
+          # Same numpy-only lane, same reason (#2705, repairing #2590): the two
+          # ROCM-TIER-DIVERGENCE comparators read raw activation and logit dumps
+          # with `np.fromfile`, and `tier-hidden-delta.py` decodes bf16 by
+          # widening `uint16` and viewing it as `float32`, so numpy is not a
+          # convenience there. Both suites shell out to their tool and assert on
+          # its return code, which is why a missing import presented as a content
+          # failure. Neither is in preflight's `SUITES`, so this lane is the ONLY
+          # place either one runs, and a skip-when-absent guard is therefore not
+          # the repair: the paragraph above records why a skip is honest on a
+          # developer box and would be silence on a lane, and for these two it
+          # would be silence everywhere.
+          python3 tests/scripts/test_tier_hidden_delta.py
+          python3 tests/scripts/test_tier_logit_delta.py
+      - name: The LTX-2 latent-dump driver's own controls are executed (#2514)
+        # `tools/oracle/ltx2_latent_dump.py` runs only inside an `rc` lease, and
+        # nothing in this tree executed it: two defects rode a merged branch to a
+        # queued dgx job that would have paid ~42 GB of CIFS staging, a torch
+        # install and a ~94 s render before dying. An incomplete rename made the
+        # reporting block raise `KeyError` unconditionally, so the byte-length
+        # assertion, the frame control and the manifest never ran and the process
+        # exited rc 1, which the module documents nowhere. The frame control
+        # itself compared only the frames that appeared, so a decode producing
+        # NONE of them printed "CONTROL PASSED" and returned 0. This suite drives
+        # both paths on fabricated records and scratch frame files: no GPU, no
+        # lease, no torch, no numpy, no checkpoint.
+        run: |
+          python3 tests/scripts/test_ltx2_latent_dump.py
+      - name: The committed LTX-2 oracle goldens still hash to what records them (#2553)
+        # Registered in TWO places, like the suites above: here and in
+        # `scripts/agent-preflight.sh`. It was in ONE of them. `SUITES` held it
+        # from the start and this file never did, so the digests that anchor the
+        # oracle evidence gated on a developer box and were green on the forge.
+        #
+        # #2520 made that expensive. The suite now also covers
+        # `tests/parity/goldens/ltx2_oracle_latent/` -- the Phase A latents a
+        # future cross-decode reads INSTEAD of taking a GPU lease, 68 KB whose
+        # whole value is that they are the bytes the leased run produced. Without
+        # this step a pull request could overwrite `video_latent_bfloat16.raw`,
+        # or rewrite `SHA256SUMS` to match a corrupted one, and merge green.
+        #
+        # Nothing here can skip: standard library only -- `hashlib`, `json`,
+        # `re`, `pathlib` -- over four committed files, no numpy, no build, no
+        # GPU, no lease, no checkpoint, no network, 0.02 s. The step needs no
+        # guard, and a guard is what would turn this absence into false coverage.
+        # The registration itself is pinned in `REQUIRED_SUITE_REGISTRATIONS`,
+        # so deleting this step reds `check-test-registration.py` rather than
+        # restoring the gap.
+        run: |
+          python3 tests/scripts/test_ltx2_oracle_goldens.py
       - name: Every LTX-2.5 A/B arm sets a knob value the dispatch parses (#1751)
         # The `VLLM_LTX2_DIT_FLASH_ATTN` values a harness exports and the values
         # `ltx2_device.cpp` matches are two literals in two languages, and nothing
@@ -537,6 +618,36 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: The staged gfx1151 paired measurement still refuses to run (#2497)
+        # Registered in TWO places, like the suites above, and it was in ONE.
+        # `scripts/agent-preflight.sh` held it from the start and this file never
+        # did, so the ONE behaviour of `BACKEND-GATE-ROCM-LLAMACPP` that a test
+        # can falsify -- `.agents/scripts/rocm-strix-ourarm-staged.sh` refusing
+        # unless `STRIX_ARM_SPEED_RATIFIED_BY` names a ratifying decision --
+        # gated on a developer box and was green on the forge. #2497 has already
+        # had one measurement retracted for being taken ahead of that arm's token
+        # gate, which reads `TOKEN_GATE=FAIL` at 3 of 6, so a staged script whose
+        # refusal nothing on a lane enforces is that defect parked in a file.
+        #
+        # Nothing here can skip: `bash` and the standard library over one
+        # committed script, in a scratch working directory. No GPU, no lease, no
+        # toolchain, no checkpoint, no network, under a second.
+        run: |
+          python3 tests/scripts/test_rocm_strix_ourarm_staged.py
+      - name: The TOKENGATE job installs the PIN's build requirements (#2895)
+        # Registered in TWO places, like the suites above, and in the same change
+        # that adds it -- the paragraph on the render-compare suite records what
+        # happens otherwise. `.agents/scripts/tokengate-e126687-job.sh` builds
+        # vLLM with `pip wheel --no-build-isolation`, which makes pip skip
+        # `pyproject.toml`'s `[build-system] requires` entirely, and the list the
+        # script installed by hand had fallen three names behind the pin. Job
+        # efc30c74 spent a lease and a queue position to die in 3 seconds on
+        # `No module named 'setuptools_rust'`.
+        #
+        # Nothing here can skip: the standard library over one committed script,
+        # in scratch directories. No GPU, no lease, no vLLM checkout, no network.
+        run: |
+          python3 tests/scripts/test_tokengate_buildreq.py
       - name: The pre-push hook refuses a checker it names but cannot find
         # #1779. The hook named six checkers, three of which had been deleted,
         # and skipped each missing one in silence while still exiting 0. The

@@ -8,12 +8,39 @@ into a generated header (`ggml-vulkan-shaders.hpp`).
 
 ONE DELIBERATE DIFFERENCE, and it is the whole reason this is a script and not a
 build step: llama.cpp runs its generator AT BUILD TIME and therefore REQUIRES
-`glslc` on every build machine. Neither of our boxes has one — `dgx.casa`
+`glslc` on every build machine. Runtime GLSL compilation would need libshaderc
+linked in, which we do not have and which would be a compiled third-party
+dependency (.agents/discipline.md forbids those; third_party/ is single-header
+only).
+
+WHICH COMPILER TO RUN THIS WITH, corrected 2026-09-02 (BACKEND-VULKAN-EXL3,
+#2530). This paragraph used to read "Neither of our boxes has one -- `dgx.casa`
 (aarch64, the GB10 gate box) and the dev box both ship the Vulkan LOADER but no
 `glslc`/`glslangValidator`/`libshaderc`, and neither grants sudo to install one
-(measured 2026-07-22). Runtime GLSL compilation would need libshaderc linked in,
-which we also do not have and which would be a compiled third-party dependency
-(.agents/discipline.md forbids those; third_party/ is single-header only).
+(measured 2026-07-22)". That is now stale in BOTH directions, and the correction
+matters because the first half reads as permission to use the system compiler:
+
+  * `/usr/bin/glslc` DOES exist on the dev box today -- shaderc 2023.8,
+    spirv-tools 2023.6, glslang 14.0.0.
+  * It CANNOT regenerate this tree. `vt_matmul_coopmat.comp` requires
+    `GL_EXT_bfloat16`, which glslang 14.0.0 does not know, so `--check` with the
+    system compiler exits on that shader before reaching any other:
+    `error: '#extension' : extension not supported: GL_EXT_bfloat16`.
+  * The working route needs NO sudo and CI already uses it: unpack the PINNED
+    glslang 16.5.0 RELEASE TARBALL into a temp directory and put it first on
+    PATH. That is what .github/workflows/ci.yml's `vulkan-spirv-freshness` job
+    does, and it is what reproduces the committed blob byte for byte.
+
+        curl -fsSL -o /tmp/glslang.tar.gz \
+          https://github.com/KhronosGroup/glslang/releases/download/16.5.0/glslang-16.5.0-linux-x86_64-release.tar.gz
+        mkdir -p /tmp/glslang && tar xzf /tmp/glslang.tar.gz -C /tmp/glslang
+        PATH=/tmp/glslang/bin:$PATH scripts/gen-vulkan-spirv.py
+
+VERIFY BEFORE YOU REGENERATE, because this script rewrites a 1.5 MB generated
+file and the WRONG compiler rewrites every module rather than only yours. Run
+`--check` on the UNMODIFIED tree first; it must print "committed SPIR-V is up to
+date". Then your regeneration's diff is additions only, which is how
+BACKEND-VULKAN-EXL3 added two modules for +948 lines and -0.
 
 So the SPIR-V is COMMITTED, as a generated header, and the build needs NO shader
 toolchain at all — it is hermetic on every box including CI. The cost is that

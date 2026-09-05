@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "vllm/multimodal/hasher.h"
 
@@ -32,10 +33,24 @@ constexpr double kPi = 3.14159265358979323846;
 
 }  // namespace
 
-DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav, size_t n) {
+namespace {
+
+// The `fmt `/`data` chunk walk, ONE copy for both entry points below. W7c-1
+// (#2813) added the multi-channel arm and did NOT write it a second parser:
+// a hand-written parallel path is what AGENTS.md's shared-seam rule forbids,
+// and the two decoders differ only in what they do with the frames.
+struct RawWavPcm16 {
+  const uint8_t* frames = nullptr;  // interleaved: L0 R0 L1 R1 ...
+  size_t num_frames = 0;
+  int channels = 0;
+  int sampling_rate = 0;
+};
+
+RawWavPcm16 ParseWavPcm16(const uint8_t* wav, size_t n, const char* who) {
+  const std::string me(who);
   if (n < 44 || std::memcmp(wav, "RIFF", 4) != 0 ||
       std::memcmp(wav + 8, "WAVE", 4) != 0) {
-    throw std::runtime_error("DecodeWavPcm16Mono: not a RIFF/WAVE buffer");
+    throw std::runtime_error(me + ": not a RIFF/WAVE buffer");
   }
   // Walk chunks after the 12-byte RIFF header.
   size_t pos = 12;
@@ -53,7 +68,7 @@ DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav, size_t n) {
       channels = static_cast<int>(ReadLE(wav + body + 2, 2));
       rate = static_cast<int>(ReadLE(wav + body + 4, 4));
       bits = static_cast<int>(ReadLE(wav + body + 14, 2));
-      if (fmt != 1) throw std::runtime_error("DecodeWavPcm16Mono: not PCM (fmt!=1)");
+      if (fmt != 1) throw std::runtime_error(me + ": not PCM (fmt!=1)");
       have_fmt = true;
     } else if (std::memcmp(id, "data", 4) == 0) {
       data = wav + body;
@@ -62,18 +77,123 @@ DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav, size_t n) {
     pos = body + sz + (sz & 1);  // chunks are word-aligned
   }
   if (!have_fmt || data == nullptr) {
-    throw std::runtime_error("DecodeWavPcm16Mono: missing fmt/data chunk");
+    throw std::runtime_error(me + ": missing fmt/data chunk");
   }
-  if (channels != 1) throw std::runtime_error("DecodeWavPcm16Mono: not mono");
-  if (bits != 16) throw std::runtime_error("DecodeWavPcm16Mono: not 16-bit PCM");
+  if (bits != 16) throw std::runtime_error(me + ": not 16-bit PCM");
+  // A zero channel count is a malformed header, not an arm anybody owes.
+  if (channels < 1) {
+    throw std::runtime_error(me + ": the `fmt ` chunk declares a channel count of " +
+                             std::to_string(channels));
+  }
+
+  RawWavPcm16 raw;
+  raw.frames = data;
+  raw.channels = channels;
+  raw.sampling_rate = rate;
+  // A TRAILING PARTIAL FRAME IS DROPPED, not refused. libsndfile reads whole
+  // frames and ignores a short tail (`sf_readf_*` returns whole frames), so
+  // refusing here would be STRICTER than the oracle. The mono path has always
+  // truncated this way, through `data_len / 2`.
+  raw.num_frames = data_len / (2 * static_cast<size_t>(channels));
+  return raw;
+}
+
+}  // namespace
+
+DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav, size_t n) {
+  const RawWavPcm16 raw = ParseWavPcm16(wav, n, "DecodeWavPcm16Mono");
+  if (raw.channels != 1) throw std::runtime_error("DecodeWavPcm16Mono: not mono");
 
   DecodedAudio out;
-  out.sampling_rate = rate;
-  const size_t num = data_len / 2;
+  out.sampling_rate = raw.sampling_rate;
+  const size_t num = raw.num_frames;
   out.samples.resize(num);
+  // UNCHANGED, deliberately. `parakeet_transcription.cpp:123`,
+  // `chat_mm.cpp:137` and `test_voxtral_e2e.cpp:170` call this, and W7c-1 moves
+  // NO SAMPLE they decode: fuzzed differentially against the pre-W7c-1 decoder
+  // over 400000 randomized RIFF buffers, the accept/refuse decision, every
+  // decoded byte and the sampling rate are identical.
+  //
+  // TWO REFUSAL MESSAGES DID MOVE, on 63268 of those buffers, and this loop is
+  // not where they live -- the shared walk is. `bits != 16` is now tested
+  // BEFORE `channels != 1`, so "not mono" became "not 16-bit PCM" (33830
+  // buffers), and a zero channel count now has its own guard rather than
+  // falling into "not mono" (29438). Both name the real defect where the old
+  // string did not, and no test pinned the old ones -- but they ARE operator
+  // visible through `chat_mm.cpp:137` and `parakeet_transcription.cpp:123`, so
+  // "nothing moved" is false and this says what did. The multi-channel arm is
+  // the sibling below.
   for (size_t i = 0; i < num; ++i) {
-    const int16_t s = static_cast<int16_t>(ReadLE(data + 2 * i, 2));
+    const int16_t s = static_cast<int16_t>(ReadLE(raw.frames + 2 * i, 2));
     out.samples[i] = static_cast<float>(s) / 32768.0f;
+  }
+  return out;
+}
+
+// W7c-1 (#2813). Upstream reduces to mono with a plain MEAN over the channel
+// axes, and it does so in two independent places:
+//
+//   * the decode side, `vllm/multimodal/media/audio.py:207-208 @ 9035151d6` --
+//     `if mono and y.ndim > 1: y = np.mean(y, axis=tuple(range(y.ndim - 1)))`,
+//     reached because `load_audio`'s `mono` default is True (`:220`); the PyAV
+//     fallback arm takes the same mean at `:168-169`;
+//   * the parser side, `vllm/multimodal/audio.py:150-152 @ 9035151d6`, where
+//     `AudioSpec.target_channels` is 1 and `channel_reduction` is
+//     `ChannelReduction.MEAN` (`:69-70`, and the MEAN member's own comment
+//     reads "default, preserves energy balance"). dots3-note selects that spec
+//     at `vllm/models/dots3_note/common/processor.py:523-525 @ 9035151d6`.
+//
+// THE INTERMEDIATE TYPE IS A DECISION, NOT A TRANSLATION, because upstream
+// reduces a float32 array (`soundfile.read(dtype="float32")`) and this port has
+// interleaved int16 frames. It accumulates in INT32, divides once in DOUBLE and
+// narrows once to FLOAT:
+//
+//   * the int32 sum CANNOT OVERFLOW anywhere in the PARSER'S OWN DOMAIN, which
+//     is C <= 65535 because `channels` is a uint16 field of the `fmt ` chunk:
+//     |s| <= 32768, so |acc| <= 32768 * 65535 = 2147450880 < 2^31. It is EXACT
+//     over that whole domain, which no float32 accumulator can promise past 512
+//     channels;
+//   * the ANSWER IS THE CORRECTLY-ROUNDED float of the exact mean, for every C
+//     in that same domain. `acc` and `32768 * C` are both exact in double, so
+//     the divide is correctly rounded to double. The narrowing store is a
+//     SECOND rounding whenever that quotient is not itself exact, so "exactly
+//     one rounding" would be wrong -- but double's 53 bits clear the 2*24 + 2
+//     = 50 that makes a division's double rounding innocuous, and an exhaustive
+//     sweep of all 1300542267 (C, acc) pairs for every non-power-of-two C in
+//     [2, 200] finds zero anomalies. The CONSEQUENCE holds; the mechanism is
+//     two roundings that cannot disagree with one;
+//   * for a POWER-OF-TWO channel count UP TO 512 the result is BIT-IDENTICAL to
+//     upstream's float32 mean, in whatever order numpy sums. With C = 2^k,
+//     |acc| <= 2^(15+k) <= 2^24, and every integer of magnitude at most 2^24 is
+//     exact in float32 -- so both arms hold the exact sum (every partial sum of
+//     upstream's is a multiple of 2^-15 under the same bound) and the divide by
+//     2^k only moves an exponent. THE BOUND IS TIGHT: at C = 1024 the sum
+//     reaches 2^25 and an odd `acc` above 2^24 is not a float32 at all. This
+//     covers C = 1 (so no mono waveform moves), C = 2 (the case this exists to
+//     serve), and every channel count a WAV container plausibly carries;
+//   * past C = 512, or at a channel count that is not a power of two, the two
+//     arms may differ and THIS one is the more accurate: it stays correctly
+//     rounded -- measured worst |ours - long double| of 2.98e-08, half an ulp,
+//     at C = 1024, 2048 and 32768 -- where numpy's float32 sum is not exact. A
+//     sequential float32 accumulator agrees with this arm on 126 of 2000
+//     near-full-scale draws at C = 1024. Stated in
+//     `.agents/specs/dots3-note.md` 4.16.2 and gated in
+//     `test_dots3_note_audio.cpp`, whose C = 512 / C = 1024 pair is what a
+//     float32 accumulator here fails.
+DecodedAudio DecodeWavPcm16MeanToMono(const uint8_t* wav, size_t n) {
+  const RawWavPcm16 raw = ParseWavPcm16(wav, n, "DecodeWavPcm16MeanToMono");
+
+  DecodedAudio out;
+  out.sampling_rate = raw.sampling_rate;
+  out.samples.resize(raw.num_frames);
+  const size_t c = static_cast<size_t>(raw.channels);
+  const double denom = 32768.0 * static_cast<double>(raw.channels);
+  for (size_t f = 0; f < raw.num_frames; ++f) {
+    int32_t acc = 0;
+    for (size_t ch = 0; ch < c; ++ch) {
+      acc += static_cast<int16_t>(ReadLE(raw.frames + 2 * (f * c + ch), 2));
+    }
+    out.samples[f] = static_cast<float>(static_cast<double>(acc) / denom);
   }
   return out;
 }

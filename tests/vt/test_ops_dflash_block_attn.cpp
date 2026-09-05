@@ -1184,3 +1184,86 @@ TEST_CASE("dflash-block-attn D1 bf16 TENSOR-CORE: the query cu reaches the MMA k
   RunD1Bf16Parity("mma PRODUCTION SCALE 1 req Tq=9 ctx~1200 d128 nc", {1203}, {9}, 2, 2,
                   128, std::pow(128.0f, -0.5f), false, 0, 0x2154D1A5C0FFEE06ULL, 5e-3);
 }
+
+// ===========================================================================
+// SPEC-DFLASH2 (#2784) — THE RIGHT-HAND HALF OF THE SYMMETRIC WINDOW.
+//
+// `_maybe_symmetrize_window` (vllm/v1/attention/backends/flash_attn.py:319-330
+// @ the parity pin 5559679229) gives a non-causal layer `(w-1, w-1)`, not
+// `(w-1, 0)`: "so bidirectional queries attend in both directions". The LEFT
+// half is what #2784 measured, because the DFlash draft block's query rows sit
+// at the END of the combined sequence and their right bound therefore falls off
+// the axis. This case is here because that makes the right half UNGATED by the
+// paged battery — the #2784 mutation run proved it: deleting the upper clamp
+// left `test_ops_dflash_paged_block_attn` fully green.
+//
+// The dense op is where it binds. `ForwardWithCtxKVDev`'s materialized
+// [context; block] form runs EVERY combined row as a query, so a row in the
+// middle has keys on both sides of it, and that is also the reference the
+// paged battery compares against. A query row must not see a key more than
+// `w-1` positions AFTER it.
+TEST_CASE("dflash-block-attn: a NON-CAUSAL window bounds the key range on the RIGHT (#2784)") {
+  const int64_t blen = 40, hq = 2, hk = 1, d = 8, window = 6;
+  const int64_t kProbe = 10;         // the query row under test
+  const int64_t kFirstHidden = 16;   // kProbe + (window - 1) + 1
+  std::vector<int32_t> cu = {0, static_cast<int32_t>(blen)};
+
+  auto rnd = [](size_t n, uint32_t seed) {
+    std::vector<float> v(n);
+    uint32_t s = seed;
+    for (auto& x : v) {
+      s = s * 1664525u + 1013904223u;
+      x = (static_cast<float>(s >> 8) / static_cast<float>(1u << 24)) * 4.0f - 2.0f;
+    }
+    return v;
+  };
+  auto q = rnd(static_cast<size_t>(blen * hq * d), 31);
+  auto k_a = rnd(static_cast<size_t>(blen * hk * d), 32);
+  auto v_a = rnd(static_cast<size_t>(blen * hk * d), 33);
+  auto k_b = k_a;
+  auto v_b = v_a;
+  // B differs from A ONLY on key rows [kFirstHidden, blen) — strictly to the
+  // RIGHT of the probe row's symmetric window.
+  auto tail_k = rnd(static_cast<size_t>((blen - kFirstHidden) * hk * d), 91);
+  auto tail_v = rnd(static_cast<size_t>((blen - kFirstHidden) * hk * d), 92);
+  for (size_t i = 0; i < tail_k.size(); ++i) {
+    k_b[static_cast<size_t>(kFirstHidden * hk * d) + i] = tail_k[i];
+    v_b[static_cast<size_t>(kFirstHidden * hk * d) + i] = tail_v[i];
+  }
+  int differing = 0;
+  for (size_t i = 0; i < k_a.size(); ++i) differing += (k_a[i] != k_b[i]) ? 1 : 0;
+  REQUIRE(differing > 0);  // the fixture's own precondition
+
+  auto run = [&](std::vector<float>& kk, std::vector<float>& vv, int64_t win) {
+    std::vector<float> out(static_cast<size_t>(blen * hq * d), 0.0f);
+    Queue cq = Q();
+    Tensor tq = F32(q, {blen, hq, d});
+    Tensor tk = F32(kk, {blen, hk, d});
+    Tensor tv = F32(vv, {blen, hk, d});
+    Tensor to = F32(out, {blen, hq, d});
+    vt::DFlashBlockAttention(cq, to, tq, tk, tv, Args(cu.data(), 1, /*causal=*/false, win));
+    return out;
+  };
+  auto probe = [&](const std::vector<float>& o, int64_t h) {
+    return std::vector<float>(o.begin() + static_cast<long>((kProbe * hq + h) * d),
+                              o.begin() + static_cast<long>((kProbe * hq + h) * d + d));
+  };
+
+  SUBCASE("the CONTROL: with NO window the same pair MOVES the probe row") {
+    const auto a = run(k_a, v_a, 0), b = run(k_b, v_b, 0);
+    int moved = 0;
+    for (int64_t h = 0; h < hq; ++h) {
+      const auto pa = probe(a, h), pb = probe(b, h);
+      for (size_t i = 0; i < pa.size(); ++i) moved += (pa[i] != pb[i]) ? 1 : 0;
+    }
+    REQUIRE(moved > 0);
+  }
+
+  SUBCASE("with the window, keys to the RIGHT of it cannot reach the probe row") {
+    const auto a = run(k_a, v_a, window), b = run(k_b, v_b, window);
+    for (int64_t h = 0; h < hq; ++h) {
+      const auto pa = probe(a, h), pb = probe(b, h);
+      for (size_t i = 0; i < pa.size(); ++i) REQUIRE(pa[i] == pb[i]);
+    }
+  }
+}

@@ -35,6 +35,7 @@
 #include "vllm/config/weight_residency.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -145,17 +146,17 @@ TEST_CASE("residency reach: the GGUF load POLICY consults the installed config")
   vllm::WeightResidencyConfig off;
   off.mmap = false;
   vllm::SetWeightResidencyConfig(off);
-  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()).mmap_residency);
 
   vllm::ResetWeightResidencyConfigForTesting();
   vllm::WeightResidencyConfig on;
   on.mmap = true;
   vllm::SetWeightResidencyConfig(on);
-  CHECK(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+  CHECK(vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()).mmap_residency);
 
   // The environment still wins at the site, not merely in the resolver.
   ::setenv("VT_GGUF_MMAP", "0", 1);
-  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()).mmap_residency);
   ::unsetenv("VT_GGUF_MMAP");
 
   // ...and `VT_CPU_REF` still beats BOTH. The oracle switch is not a residency
@@ -163,7 +164,7 @@ TEST_CASE("residency reach: the GGUF load POLICY consults the installed config")
   // config that could turn borrowing back on under it would silently void an
   // oracle comparison.
   ::setenv("VT_CPU_REF", "1", 1);
-  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()).mmap_residency);
   ::unsetenv("VT_CPU_REF");
 }
 
@@ -193,7 +194,7 @@ TEST_CASE("residency reach: a SECOND engine can still install, because a first l
   // has not been latched in this process — must install.
   vllm::entrypoints::EngineParams a;
   CHECK_THROWS(vllm::entrypoints::LoadedEngine::FromModelDir(kMissingModel, a));
-  const vllm::GgufLoadPolicy policy_a = vllm::GgufLoadPolicy::FromEnv();
+  const vllm::GgufLoadPolicy policy_a = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
   (void)policy_a;
 
   vllm::entrypoints::EngineParams b;
@@ -211,7 +212,7 @@ TEST_CASE("residency reach: a SECOND engine can still install, because a first l
   CHECK(*active.expert_stream == true);
   REQUIRE(active.expert_stream_slots.has_value());
   CHECK(*active.expert_stream_slots == 8000);
-  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()).mmap_residency);
 }
 
 TEST_CASE("residency reach: two DIFFERENT PARTIAL documents after a streaming latch") {
@@ -269,7 +270,7 @@ TEST_CASE("residency reach: two DIFFERENT PARTIAL documents after a streaming la
     REQUIRE(now.prefault.has_value());
     CHECK(*now.prefault == false);
   }
-  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type()).mmap_residency);
 
   // Engine C: a SECOND, DIFFERENT partial document, this time through the loader.
   vllm::entrypoints::EngineParams c;

@@ -30,12 +30,14 @@
 // COVERAGE. The eight Q8_K-family encodings (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
 // IQ2_XXS, IQ3_XXS, IQ2_S — all dot against a Q8_K activation) run natively on
 // the GPU; DeepSeek-V4's experts are IQ2_XXS / IQ3_XXS / Q2_K (UD-IQ2_XXS) and
-// IQ2_S (UD-IQ2_M gate/up). The Q8_0-activation encodings (Q4_0, Q8_0, and MXFP4
-// — the UD-IQ2_M ffn_down) fall back to the CPU keep-quant kernel over the SAME
-// unified-memory tensors (correct, just not GPU-accelerated): they dot against a
-// 32-element Q8_0 activation, not the 256-element Q8_K super-block this templated
-// GEMM quantizes to, so a native GPU path for them needs a separate
-// Q8_0-activation GEMM variant (DotMXFP4 has the ready device math). BOX-DEFERRED.
+// IQ2_S (UD-IQ2_M gate/up). The Q8_0-ACTIVATION encodings dot a 32-element block
+// against a BlockQ8_0, not the 256-element Q8_K super-block this templated GEMM
+// quantizes to, so they run on a SECOND templated GEMM beside it: Q8_0 on its own
+// tuned path (MatmulQ8_0Cuda), and IQ4_NL / Q5_0 / Q4_0 on the 32-block lane
+// (IsCuda32BlockKeepQuantSupported). MXFP4 (the UD-IQ2_M ffn_down) is the one
+// encoding still falling back to the CPU keep-quant kernel over the same tensors
+// — correct, host-speed, and NOT graph-capturable. DotMXFP4 has its device math
+// ready and the 32-block lane is the seam it needs; owed, not box-deferred.
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -48,6 +50,7 @@
 #include <unordered_map>
 
 #include "vt/cpu/cpu_quant_blocks.h"        // vt::cpu::Block* struct mirror (single source)
+#include "vt/cuda/cuda_embedding_quant.h"   // EmbeddingQuantErr + the KGATHER seam
 #include "vt/cuda/cuda_iq_table_seal.h"      // IqTableSnapshot (the device-codebook drift seal)
 #include "vt/cuda/cuda_quant_iq_tables.cuh"  // d_iq2xxs_grid / d_iq3xxs_grid / d_ksigns / d_kmask
 #include "vt/cuda/graph_safe_scratch.h"      // RetireGraphScratch (cudagraph-safe grow-only)
@@ -62,16 +65,21 @@ using vt::cpu::BlockIQ1_XXXS;
 using vt::cpu::BlockIQ2_S;
 using vt::cpu::BlockIQ2_XS;
 using vt::cpu::BlockIQ2_XXS;
+using vt::cpu::BlockIQ3_S;
 using vt::cpu::BlockIQ3_XXS;
+using vt::cpu::BlockIQ4_NL;
 using vt::cpu::BlockIQ4_XS;
 using vt::cpu::BlockMXFP4;
 using vt::cpu::BlockQ2_K;
 using vt::cpu::BlockQ3_K;
+using vt::cpu::BlockQ4_0;
 using vt::cpu::BlockQ4_K;
+using vt::cpu::BlockQ5_0;
 using vt::cpu::BlockQ5_K;
 using vt::cpu::BlockQ6_K;
 using vt::cpu::BlockQ8_0;
 using vt::cpu::BlockQ8_K;
+using vt::cpu::kQK4_NL;    // 32
 using vt::cpu::kQK8_0;     // 32
 using vt::cpu::kQK_K;      // 256
 using vt::cpu::kQK_MXFP4;  // 32
@@ -167,6 +175,86 @@ __device__ inline float DLoadAct(const void* base, ActDT dt, int64_t idx) {
     case ActDT::kF16: return DF16ToF32(static_cast<const uint16_t*>(base)[idx]);
     default: return DBF16ToF32(static_cast<const uint16_t*>(base)[idx]);
   }
+}
+
+// The dequantizing gather's device row decoders (KGATHER). Included HERE, inside
+// `vt::cuda::{anonymous}`, because it uses the DF16ToF32/DF32ToBF16/DE8M0ToF32Half
+// helpers above and the device codebooks below, and because those codebooks are
+// DEFINED by cuda_quant_iq_tables.cuh -- a second including TU is a duplicate
+// symbol, not a second copy. It opens no namespace of its own.
+#include "vt/cuda/cuda_quant_dequant.cuh"
+
+// The block geometry the decoders hard-code, tied to the SINGLE source of block
+// layout (cpu_quant_blocks.h, itself static_asserted against ggml-common.h). A
+// stride typed by hand into a decoder above is a compile error here, not a row
+// of plausible garbage at the first forward.
+static_assert(DqQ4_0::kBytes == sizeof(vt::cpu::BlockQ4_0), "q4_0 gather stride");
+static_assert(DqQ5_0::kBytes == sizeof(vt::cpu::BlockQ5_0), "q5_0 gather stride");
+static_assert(DqQ8_0::kBytes == sizeof(vt::cpu::BlockQ8_0), "q8_0 gather stride");
+static_assert(DqIQ4_NL::kBytes == sizeof(vt::cpu::BlockIQ4_NL), "iq4_nl gather stride");
+static_assert(DqMXFP4::kBytes == sizeof(vt::cpu::BlockMXFP4), "mxfp4 gather stride");
+static_assert(DqQ2_K::kBytes == sizeof(vt::cpu::BlockQ2_K), "q2_K gather stride");
+static_assert(DqQ3_K::kBytes == sizeof(vt::cpu::BlockQ3_K), "q3_K gather stride");
+static_assert(DqQ4_K::kBytes == sizeof(vt::cpu::BlockQ4_K), "q4_K gather stride");
+static_assert(DqQ5_K::kBytes == sizeof(vt::cpu::BlockQ5_K), "q5_K gather stride");
+static_assert(DqQ6_K::kBytes == sizeof(vt::cpu::BlockQ6_K), "q6_K gather stride");
+static_assert(DqQ8_K::kBytes == sizeof(vt::cpu::BlockQ8_K), "q8_K gather stride");
+static_assert(DqIQ2_XXS::kBytes == sizeof(vt::cpu::BlockIQ2_XXS), "iq2_xxs gather stride");
+static_assert(DqIQ3_XXS::kBytes == sizeof(vt::cpu::BlockIQ3_XXS), "iq3_xxs gather stride");
+static_assert(DqIQ2_XS::kBytes == sizeof(vt::cpu::BlockIQ2_XS), "iq2_xs gather stride");
+static_assert(DqIQ2_S::kBytes == sizeof(vt::cpu::BlockIQ2_S), "iq2_s gather stride");
+static_assert(DqIQ4_XS::kBytes == sizeof(vt::cpu::BlockIQ4_XS), "iq4_xs gather stride");
+static_assert(DqIQ3_S::kBytes == sizeof(vt::cpu::BlockIQ3_S), "iq3_s gather stride");
+static_assert(DqIQ1_S::kBytes == sizeof(vt::cpu::BlockIQ1_S), "iq1_s gather stride");
+static_assert(DqIQ1_XXXS::kBytes == sizeof(vt::cpu::BlockIQ1_XXXS), "iq1_xxxs gather stride");
+
+// One row of the dispatch: the vt DType, its codec, and nothing else. Every
+// list below is generated from this macro so a dtype cannot be decodable in one
+// place and refused in another -- the asymmetry that made the CPU-only gather a
+// silent load-time expansion instead of a loud refusal.
+#define VT_DQ_GATHER_TYPES(X)     \
+  X(kQ4_0, DqQ4_0)                \
+  X(kQ5_0, DqQ5_0)                \
+  X(kQ8_0, DqQ8_0)                \
+  X(kQ2_K, DqQ2_K)                \
+  X(kQ3_K, DqQ3_K)                \
+  X(kQ4_K, DqQ4_K)                \
+  X(kQ5_K, DqQ5_K)                \
+  X(kQ6_K, DqQ6_K)                \
+  X(kQ8_K, DqQ8_K)                \
+  X(kIQ2_XXS, DqIQ2_XXS)          \
+  X(kIQ3_XXS, DqIQ3_XXS)          \
+  X(kIQ2_S, DqIQ2_S)              \
+  X(kIQ2_XS, DqIQ2_XS)            \
+  X(kIQ1_S, DqIQ1_S)              \
+  X(kIQ1_XXXS, DqIQ1_XXXS)        \
+  X(kIQ4_NL, DqIQ4_NL)            \
+  X(kIQ4_XS, DqIQ4_XS)            \
+  X(kIQ3_S, DqIQ3_S)              \
+  X(kMXFP4, DqMXFP4)
+
+template <typename Tout, typename Tid>
+cudaError_t LaunchEmbeddingQuantTyped(cudaStream_t s, Tout* out, const uint8_t* table,
+                                      const Tid* ids, DType dt, int64_t t, int64_t nb,
+                                      int64_t h, int64_t v, size_t row_bytes,
+                                      EmbeddingQuantErr* err) {
+  constexpr int kGatherBlock = 128;
+  const int64_t total = t * nb;
+  int64_t blocks = (total + kGatherBlock - 1) / kGatherBlock;
+  if (blocks > 65535) blocks = 65535;  // grid-stride loop covers the remainder
+  const unsigned grid = static_cast<unsigned>(blocks < 1 ? 1 : blocks);
+  switch (dt) {
+#define VT_DQ_LAUNCH(DT, CODEC)                                                   \
+  case DType::DT:                                                                 \
+    EmbeddingQuantGatherKernel<Tout, Tid, CODEC>                                   \
+        <<<grid, kGatherBlock, 0, s>>>(out, table, ids, t, nb, h, v, row_bytes, err); \
+    break;
+    VT_DQ_GATHER_TYPES(VT_DQ_LAUNCH)
+#undef VT_DQ_LAUNCH
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +1821,315 @@ void* EnsureScratch(size_t need, cudaStream_t s) {
   return sc.buf;
 }
 
+// ===========================================================================
+// The 32-ELEMENT keep-quant lane: IQ4_NL, Q5_0 and Q4_0.
+//
+// Everything above this point is the Q8_K lane: 256-element super-blocks dotted
+// against a BlockQ8_K activation, dispatched by IsCudaKeepQuantSupported below.
+// These three encodings cannot join it, and the reason is structural rather than
+// a missing `case`. Their vec_dot pairs a 32-element weight block with a
+// BlockQ8_0 activation, so `DotSuperblock<W>(const void*, const BlockQ8_K*)`
+// cannot take them: the activation TYPE differs, and 640 (the released
+// Qwen3.8-Flash-Next expert_feed_forward_length) is not a whole number of
+// 256-element super-blocks in the first place.
+//
+// So this is a SECOND templated GEMM beside the first, sharing the Q8_0
+// activation prologue (QuantizeQ8_0Kernel + EnsureScratch) that the Q8_0 path
+// above already owns and already gates.
+//
+// WHY IT IS HERE. Without these arms the seams do not refuse. The dense and
+// grouped GEMMs `cudaStreamSynchronize` and run the CPU kernel over the same
+// tensors, which emits CORRECT tokens at host speed -- invisible to every value
+// comparison in this file -- and cannot be graph-captured at all, because a sync
+// on a capturing stream fails. The fused MoE seam simply THROWS. The released
+// `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores its routed experts in IQ4_NL
+// and Q5_0, so that is the shipped artifact's every expert GEMM.
+//
+// Q8_0 is deliberately NOT routed through this template. It has its own tuned
+// path above (aligned layout, sub-warp tiling, ILP, prefetch, pair and
+// block-diagonal levers, all separately gated), and replacing it with this
+// generic kernel would trade measured DeepSeek-V4 decode work for uniformity.
+//
+// ORACLE = this tree's CPU arm, which is the same kernel the host drain runs
+// today, ported from llama.cpp b10451:
+//   cpu_quant_dot.cpp:50  VecDotQ4_0Q8_0    (quants.c:174)
+//   cpu_quant_dot.cpp:92  VecDotQ5_0Q8_0    (quants.c:365)
+//   cpu_quant_dot.cpp:140 VecDotIQ4_NLQ8_0  (quants.c:1254)
+//
+// THE THREE FOLD THEIR SCALES IN THREE DIFFERENT ORDERS, and that is upstream's,
+// not an accident to be normalised:
+//   q4_0   : sumf += sumi * f16(x.d) * f16(y.d)      -- left-assoc, sum first
+//   q5_0   : sumf += (f16(x.d) * f16(y.d)) * (float)sumi -- scale product first
+//   iq4_nl : d = f16(y.d) * f16(x.d); sumf += d * (float)(s1+s2)
+//            -- scale product first AND the operands the other way round
+// Reproduced literally below. See the __fmul_rn/__fadd_rn note at the top of
+// DotIQ4XS: -ffp-contract=off is CXX-only (CMakeLists.txt:55) and never reaches
+// a .cu, so nvcc would contract each of these into an FMA that rounds ONCE where
+// upstream rounds twice. That was MEASURED here, not feared.
+enum class W32 { kQ4_0, kQ5_0, kIQ4_NL };
+
+// One 32-element weight block against ONE BlockQ8_0 activation block.
+template <W32 W>
+__device__ inline float Dot32(const void* vwb, const BlockQ8_0* ab);
+
+// quants.c:174 -- ggml_vec_dot_q4_0_q8_0_generic, one block.
+template <>
+__device__ inline float Dot32<W32::kQ4_0>(const void* vwb, const BlockQ8_0* ab) {
+  const BlockQ4_0* xb = static_cast<const BlockQ4_0*>(vwb);
+  int sumi0 = 0;
+  int sumi1 = 0;
+#pragma unroll
+  for (int j = 0; j < kQK8_0 / 2; ++j) {
+    const int v0 = (xb->qs[j] & 0x0F) - 8;
+    const int v1 = (xb->qs[j] >> 4) - 8;
+    sumi0 += v0 * ab->qs[j];
+    sumi1 += v1 * ab->qs[j + kQK8_0 / 2];
+  }
+  const int sumi = sumi0 + sumi1;
+  // `sumi * f16(x.d) * f16(y.d)` associates LEFT: the integer sum meets the
+  // weight scale first. Two explicit rounds, matching upstream's two.
+  return __fmul_rn(__fmul_rn(static_cast<float>(sumi), DF16ToF32(xb->d)), DF16ToF32(ab->d));
+}
+
+// quants.c:365 -- ggml_vec_dot_q5_0_q8_0_generic, one block. The `(int8_t)` casts
+// upstream applies are kept for the same reason cpu_quant_dot.cpp keeps them: the
+// value range is [-16,15] so the cast is a no-op, but it is what fixes the type
+// of the multiply.
+template <>
+__device__ inline float Dot32<W32::kQ5_0>(const void* vwb, const BlockQ8_0* ab) {
+  const BlockQ5_0* xb = static_cast<const BlockQ5_0*>(vwb);
+  // `qh` is at offset 2 of a 22-byte block, so it is 2-byte aligned and a
+  // `uint32_t` load through it is MISALIGNED -- undefined on the host and a
+  // fault or a silently wrong read on the device. Assembled from bytes, which is
+  // exactly what the CPU arm's `memcpy` compiles to. Little-endian, as upstream.
+  const uint32_t qh = static_cast<uint32_t>(xb->qh[0]) |
+                      (static_cast<uint32_t>(xb->qh[1]) << 8) |
+                      (static_cast<uint32_t>(xb->qh[2]) << 16) |
+                      (static_cast<uint32_t>(xb->qh[3]) << 24);
+  int sumi0 = 0;
+  int sumi1 = 0;
+#pragma unroll
+  for (int j = 0; j < kQK8_0 / 2; ++j) {
+    const uint8_t xh_0 = static_cast<uint8_t>(((qh & (1u << (j + 0))) >> (j + 0)) << 4);
+    const uint8_t xh_1 = static_cast<uint8_t>((qh & (1u << (j + 16))) >> (j + 12));
+    const int32_t x0 = static_cast<int8_t>(((xb->qs[j] & 0x0F) | xh_0) - 16);
+    const int32_t x1 = static_cast<int8_t>(((xb->qs[j] >> 4) | xh_1) - 16);
+    sumi0 += x0 * ab->qs[j];
+    sumi1 += x1 * ab->qs[j + kQK8_0 / 2];
+  }
+  const int sumi = sumi0 + sumi1;
+  // `(f16(x.d) * f16(y.d)) * (float)sumi` -- the scale PRODUCT is formed first.
+  return __fmul_rn(__fmul_rn(DF16ToF32(xb->d), DF16ToF32(ab->d)), static_cast<float>(sumi));
+}
+
+// quants.c:1254 -- ggml_vec_dot_iq4_nl_q8_0_generic, one block. Shares q4_0's
+// byte layout; the nibble is a CODEBOOK INDEX into d_kvalues_iq4nl (the same
+// device table IQ4_XS already reads) rather than an affine quant.
+template <>
+__device__ inline float Dot32<W32::kIQ4_NL>(const void* vwb, const BlockQ8_0* ab) {
+  const BlockIQ4_NL* xb = static_cast<const BlockIQ4_NL*>(vwb);
+  // `f16(y.d) * f16(x.d)` -- ACTIVATION scale first, and formed before the
+  // integer sum is folded in. Both differences from q4_0 above are upstream's.
+  const float d = __fmul_rn(DF16ToF32(ab->d), DF16ToF32(xb->d));
+  int sumi1 = 0;
+  int sumi2 = 0;
+#pragma unroll
+  for (int j = 0; j < kQK4_NL / 2; ++j) {
+    sumi1 += ab->qs[j + 0] * d_kvalues_iq4nl[xb->qs[j] & 0x0F];
+    sumi2 += ab->qs[j + kQK4_NL / 2] * d_kvalues_iq4nl[xb->qs[j] >> 4];
+  }
+  return __fmul_rn(d, static_cast<float>(sumi1 + sumi2));
+}
+
+// Block size in bytes, restated per encoding rather than read from BlockBytes()
+// so a decoder change cannot silently re-stride this GEMM. ggml-common.h @ b10451:
+// q4_0 :213 (18 B), q5_0 :229 (22 B), iq4_nl :447 (18 B).
+template <W32 W>
+__device__ __host__ inline constexpr size_t W32Bytes() {
+  return W == W32::kQ4_0 ? sizeof(BlockQ4_0)
+         : W == W32::kQ5_0 ? sizeof(BlockQ5_0)
+                           : sizeof(BlockIQ4_NL);
+}
+
+// DENSE 32-block GEMM: one warp per output (i,j); lane `w` walks blocks
+// b = w, w+32, ...; warp-tree reduce. Mirrors QuantDotGemmQ8_0Kernel exactly,
+// with Dot32<W> in place of the inline q8_0 dot. The accumulator is f32, the
+// same width as the CPU arm's `float sumf` and as the Q8_K lane's.
+template <W32 W, typename OutT>
+__global__ void QuantDotGemm32Kernel(OutT* __restrict__ out,
+                                     const uint8_t* __restrict__ weight,
+                                     const BlockQ8_0* __restrict__ act, int64_t m, int64_t n,
+                                     int64_t nb, size_t w_row_bytes) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= m * n) return;
+  const int64_t i = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    partial = __fadd_rn(partial,
+                        Dot32<W>(w_row + static_cast<size_t>(b) * W32Bytes<W>(), a_row + b));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// GROUPED 32-block variant (weight row = expert_ids[p]*n + j, activation row
+// broadcast when Pa==1). Mirrors QuantDotGemmGroupedQ8_0Kernel.
+template <W32 W, typename OutT>
+__global__ void QuantDotGemmGrouped32Kernel(OutT* __restrict__ out,
+                                            const uint8_t* __restrict__ weight,
+                                            const BlockQ8_0* __restrict__ act,
+                                            const int32_t* __restrict__ expert_ids, int64_t P,
+                                            int64_t n, int64_t nb, size_t w_row_bytes,
+                                            bool bcast) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= P * n) return;
+  const int64_t p = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const int64_t e = expert_ids[p];
+  const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + (bcast ? 0 : p) * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    partial = __fadd_rn(partial,
+                        Dot32<W>(w_row + static_cast<size_t>(b) * W32Bytes<W>(), a_row + b));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[p * n + j] = partial;
+    else out[p * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// FUSED grouped gate+up+SwiGLU over the 32-block lane. One warp computes BOTH
+// towers' output (p,j) against the same broadcast Q8_0 activation and writes the
+// clamped-SwiGLU product, never spilling the gate/up intermediates to HBM. The
+// epilogue is the SAME ClampedSwiGLUKernel formula the Q8_K fused kernel uses
+// (cuda_deepseek_v4.cu:612-619, alpha=1, beta=0); there is no FinalFactor on this
+// lane because the 32-block encodings fold their scale per BLOCK, inside Dot32.
+template <W32 W>
+__global__ void QuantDotGemmGroupedFusedSwiGLU32Kernel(
+    float* __restrict__ out, const uint8_t* __restrict__ gate_w,
+    const uint8_t* __restrict__ up_w, const BlockQ8_0* __restrict__ act,
+    const int32_t* __restrict__ expert_ids, int64_t P, int64_t n, int64_t nb,
+    size_t w_row_bytes, float limit, bool bcast) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= P * n) return;
+  const int64_t p = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const int64_t e = expert_ids[p];
+  const uint8_t* g_row = gate_w + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const uint8_t* u_row = up_w + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + (bcast ? 0 : p) * nb;
+  float pg = 0.0f, pu = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const size_t off = static_cast<size_t>(b) * W32Bytes<W>();
+    pg = __fadd_rn(pg, Dot32<W>(g_row + off, a_row + b));
+    pu = __fadd_rn(pu, Dot32<W>(u_row + off, a_row + b));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    pg += __shfl_down_sync(0xffffffffu, pg, off);
+    pu += __shfl_down_sync(0xffffffffu, pu, off);
+  }
+  if (lane == 0) {
+    const float gate = fminf(pg, limit);
+    const float up = fminf(fmaxf(pu, -limit), limit);
+    out[p * n + j] = gate * (1.0f / (1.0f + expf(-gate))) * up;
+  }
+}
+
+// The 32-block sibling of IsCudaKeepQuantSupported below. Structured the same way
+// on purpose: the two predicates answer the same question for the two activation
+// lanes, and a reader who finds one must find the other.
+//
+// MXFP4 is the fourth 32-element encoding and is deliberately NOT here. Its
+// device math (DotMXFP4, above) is written and still unreferenced; this template
+// is the seam it needs, but no artifact this row gates uses it, and an ungated
+// arm is a dead arm. Owed in .agents/specs/cuda-keepquant-32block.md.
+bool IsCuda32BlockKeepQuantSupported(DType dt, W32* out) {
+  switch (dt) {
+    // The two encodings the released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S
+    // stores its routed-expert towers in. Not a free choice by the quantizer:
+    // expert_feed_forward_length is 640, so every routed expert row is
+    // indivisible by 256 and no K-quant can encode it at all
+    // (qwen4_exp_gguf_weights.cpp:117-119 says so in the tree).
+    case DType::kIQ4_NL: *out = W32::kIQ4_NL; return true;
+    case DType::kQ5_0: *out = W32::kQ5_0; return true;
+    // Q4_0 shares IQ4_NL's block layout and costs one more `case` plus one
+    // template instantiation; leaving it out would have meant a second row for
+    // a dot this one already had to write.
+    case DType::kQ4_0: *out = W32::kQ4_0; return true;
+    default: return false;  // Q8_0 (own path above) / MXFP4 (owed) / K-quants
+  }
+}
+
+template <W32 W>
+void LaunchGemm32(Tensor& out, const uint8_t* weight, const BlockQ8_0* act, int64_t m, int64_t n,
+                  int64_t nb, cudaStream_t s) {
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const size_t w_row_bytes = static_cast<size_t>(nb) * W32Bytes<W>();
+  if (out.dtype == DType::kF32)
+    QuantDotGemm32Kernel<W, float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out.data), weight, act, m, n, nb, w_row_bytes);
+  else
+    QuantDotGemm32Kernel<W, uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out.data), weight, act, m, n, nb, w_row_bytes);
+}
+
+template <W32 W>
+void LaunchGrouped32(Tensor& out, const uint8_t* weight, const BlockQ8_0* act,
+                     const int32_t* expert_ids, int64_t P, int64_t n, int64_t nb, bool bcast,
+                     cudaStream_t s) {
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const size_t w_row_bytes = static_cast<size_t>(nb) * W32Bytes<W>();
+  if (out.dtype == DType::kF32)
+    QuantDotGemmGrouped32Kernel<W, float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out.data), weight, act, expert_ids, P, n, nb, w_row_bytes, bcast);
+  else
+    QuantDotGemmGrouped32Kernel<W, uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out.data), weight, act, expert_ids, P, n, nb, w_row_bytes, bcast);
+}
+
+template <W32 W>
+void LaunchGroupedFusedSwiGLU32(Tensor& out, const uint8_t* gate_w, const uint8_t* up_w,
+                                const BlockQ8_0* act, const int32_t* expert_ids, int64_t P,
+                                int64_t n, int64_t nb, float limit, bool bcast, cudaStream_t s) {
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const size_t w_row_bytes = static_cast<size_t>(nb) * W32Bytes<W>();
+  QuantDotGemmGroupedFusedSwiGLU32Kernel<W><<<static_cast<unsigned>(grid), block, 0, s>>>(
+      static_cast<float*>(out.data), gate_w, up_w, act, expert_ids, P, n, nb, w_row_bytes, limit,
+      bcast);
+}
+
+// Dispatch helper: `W32` is a runtime value at the seam and a template parameter
+// in the kernel. One switch per seam, and no `default:` that silently launches
+// nothing -- past IsCuda32BlockKeepQuantSupported there is no CPU fallback left,
+// so a missing arm would leave `out` untouched with CheckCuda still reporting
+// success. That is the exact failure #967 shipped on the Q8_K lane.
+#define VT_DISPATCH_W32(w, CALL)                                                 \
+  switch (w) {                                                                   \
+    case W32::kQ4_0: CALL(W32::kQ4_0); break;                                    \
+    case W32::kQ5_0: CALL(W32::kQ5_0); break;                                    \
+    case W32::kIQ4_NL: CALL(W32::kIQ4_NL); break;                                \
+  }
+
 bool IsCudaKeepQuantSupported(DType dt, WType* out) {
   switch (dt) {
     case DType::kIQ2_XXS: *out = WType::kIQ2_XXS; return true;
@@ -1762,10 +2159,11 @@ bool IsCudaKeepQuantSupported(DType dt, WType* out) {
     // GLM-5.3 non-flash UD-IQ1_S arm, whose other five encodings are all above.
     case DType::kIQ2_XS: *out = WType::kIQ2_XS; return true;
     case DType::kIQ4_XS: *out = WType::kIQ4_XS; return true;
-    // MXFP4 (Q8_0-activation, 32-elem blocks) is NOT handled by this Q8_K GEMM;
-    // it falls through to CPU like Q4_0 / Q8_0 until a Q8_0-activation GEMM lands.
-    // Q5_0 and IQ4_NL join them: both are 32-element Q8_0-activation encodings.
-    default: return false;  // Q4_0 / Q5_0 / Q8_0 / IQ4_NL / MXFP4 -> CPU fallback
+    // The 32-element Q8_0-activation encodings are NOT handled by this Q8_K GEMM
+    // and never can be. IQ4_NL, Q5_0 and Q4_0 are answered by
+    // IsCuda32BlockKeepQuantSupported above; Q8_0 has its own path; MXFP4 alone
+    // still falls through to the CPU keep-quant kernel.
+    default: return false;  // 32-block lane (IQ4_NL/Q5_0/Q4_0), Q8_0, or MXFP4
   }
 }
 
@@ -1814,6 +2212,26 @@ void LaunchQuantizeQ8K(BlockQ8_K* qact, const void* data, ActDT adt, int64_t a_r
     QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(qact, data, adt, a_rs, rows,
                                                                       nsb);
   }
+}
+
+// Quantize `rows` activation rows to Q8_0 into the per-stream grow-only scratch.
+// Shared verbatim with the Q8_0 path above -- same kernels, same flag, same
+// scratch -- so this lane inherits its graph-safety and its gates rather than
+// re-deriving them.
+BlockQ8_0* Ensure32BlockAct(const Tensor& a, int64_t rows, int64_t nb, cudaStream_t s) {
+  const size_t act_bytes = static_cast<size_t>(rows) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
+  if (Q8PreqQuantOn(std::getenv("VT_V4_Q8_PREQ_QUANT"))) {
+    dim3 qgrid(static_cast<unsigned>(nb), static_cast<unsigned>(rows), 1);
+    QuantizeQ8_0PreqKernel<<<qgrid, 32, 0, s>>>(qact, a.data, ActDtOf(a.dtype), a.stride[0], rows,
+                                                nb);
+  } else {
+    constexpr int kQBlock = 128;
+    const int64_t grid = (rows * nb + kQBlock - 1) / kQBlock;
+    QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
+        qact, a.data, ActDtOf(a.dtype), a.stride[0], rows, nb);
+  }
+  return qact;
 }
 
 // Q8_0 keep-quant GEMM (single). Quantize the m activation rows to Q8_0 on the GPU
@@ -1989,11 +2407,33 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
     return;
   }
 
+  // The 32-element Q8_0-activation lane (IQ4_NL / Q5_0 / Q4_0), asked BEFORE the
+  // Q8_K predicate because these dtypes can never satisfy it: their vec_dot pairs
+  // a 32-element block with a BlockQ8_0, and the released Qwen3.8-Flash-Next
+  // expert rows are 640 elements, which is not a whole number of 256-element
+  // super-blocks either. Falling through would drain the stream instead.
+  W32 w32{};
+  if (IsCuda32BlockKeepQuantSupported(b.dtype, &w32)) {
+    if (k % kQK8_0 != 0)
+      throw std::runtime_error(
+          "vt cuda: matmul_bt_quant: K must be a multiple of 32 on the 32-block keep-quant lane");
+    const int64_t nb32 = k / kQK8_0;
+    const BlockQ8_0* qact = Ensure32BlockAct(a, m, nb32, s);
+    const uint8_t* w32b = static_cast<const uint8_t*>(b.data);
+#define VT_KQ32_DENSE(WV) LaunchGemm32<WV>(out, w32b, qact, m, n, nb32, s)
+    VT_DISPATCH_W32(w32, VT_KQ32_DENSE);
+#undef VT_KQ32_DENSE
+    CheckCuda(cudaGetLastError(), "matmul_bt_quant 32-block launch");
+    return;
+  }
+
   WType w{};
   if (!IsCudaKeepQuantSupported(b.dtype, &w)) {
-    // Q4_0 (the only remaining Q8_0-activation encoding) — not used by DeepSeek-V4.
+    // MXFP4 is what still reaches here (see IsCuda32BlockKeepQuantSupported).
     // Run the CPU keep-quant kernel over the SAME unified-memory tensors: drain
     // the stream first so any GPU-produced activation is visible to the host.
+    // This drain is NOT capturable, which is what the capture gate in
+    // tests/vt/test_cuda_quant_dot.cpp measures.
     CheckCuda(cudaStreamSynchronize(s), "keepquant CPU-fallback drain");
     reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBTQuant, DeviceType::kCPU))(q, out, a, b);
     return;
@@ -2083,6 +2523,28 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
 
   if (weight.dtype == DType::kQ8_0) {  // on-GPU Q8_0 grouped path (no CPU sync)
     MatmulQ8_0GroupedCuda(out, act, weight, expert_ids, s);
+    return;
+  }
+
+  // The 32-element lane, for the same reason as the dense seam above. This is the
+  // one the shipped qwen4_exp MoE actually takes: its three expert towers are
+  // IQ4_NL / Q5_0 and reach `vt::MatmulBTQuantGrouped` stacked as [E*N, K].
+  W32 w32{};
+  if (IsCuda32BlockKeepQuantSupported(weight.dtype, &w32)) {
+    if (k % kQK8_0 != 0)
+      throw std::runtime_error(
+          "vt cuda: matmul_bt_quant_grouped: K must be a multiple of 32 on the 32-block lane");
+    const int64_t nb32 = k / kQK8_0;
+    const int64_t Pa32 = act.shape[0];
+    const bool bcast32 = (Pa32 == 1 && P > 1);
+    const BlockQ8_0* qact = Ensure32BlockAct(act, Pa32, nb32, s);
+    const uint8_t* w32b = static_cast<const uint8_t*>(weight.data);
+    const int32_t* eids32 = static_cast<const int32_t*>(expert_ids.data);
+#define VT_KQ32_GROUPED(WV) \
+  LaunchGrouped32<WV>(out, w32b, qact, eids32, P, n, nb32, bcast32, s)
+    VT_DISPATCH_W32(w32, VT_KQ32_GROUPED);
+#undef VT_KQ32_GROUPED
+    CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped 32-block launch");
     return;
   }
 
@@ -2316,6 +2778,31 @@ void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const 
   const int64_t k = act.shape[1];
   if (P == 0 || n == 0) return;
 
+  // The 32-element lane. This seam has NO fallback behind it -- before this arm it
+  // THREW by name for IQ4_NL and Q5_0, which is the released qwen4_exp MoE's own
+  // encodings, so the fused path was unreachable for the shipped checkpoint.
+  W32 wg32{}, wu32{};
+  if (IsCuda32BlockKeepQuantSupported(gate_w.dtype, &wg32) &&
+      IsCuda32BlockKeepQuantSupported(up_w.dtype, &wu32) && wg32 == wu32) {
+    if (k % kQK8_0 != 0)
+      throw std::runtime_error(
+          "vt cuda: moe_gate_up_swiglu: K must be a multiple of 32 on the 32-block lane");
+    const int64_t nb32 = k / kQK8_0;
+    const int64_t Pa32 = act.shape[0];
+    const bool bcast32 = (Pa32 == 1 && P > 1);
+    const BlockQ8_0* qact32 = Ensure32BlockAct(act, Pa32, nb32, s);
+    const uint8_t* gw32 = static_cast<const uint8_t*>(gate_w.data);
+    const uint8_t* uw32 = static_cast<const uint8_t*>(up_w.data);
+    const int32_t* eids32 = static_cast<const int32_t*>(expert_ids.data);
+#define VT_KQ32_FUSED(WV)                                                          \
+  LaunchGroupedFusedSwiGLU32<WV>(out, gw32, uw32, qact32, eids32, P, n, nb32, limit, \
+                                 bcast32, s)
+    VT_DISPATCH_W32(wg32, VT_KQ32_FUSED);
+#undef VT_KQ32_FUSED
+    CheckCuda(cudaGetLastError(), "moe_gate_up_swiglu 32-block launch");
+    return;
+  }
+
   WType w{}, wu{};
   if (!IsCudaKeepQuantSupported(gate_w.dtype, &w) || !IsCudaKeepQuantSupported(up_w.dtype, &wu) ||
       w != wu) {
@@ -2382,5 +2869,55 @@ struct FusedMoeSharedRegistrar {
                    static_cast<MoeGateUpSwiGLUGroupedFn>(&MoeGateUpSwiGLUGroupedCuda)));
   }
 } fused_moe_shared_registrar;
+
+
+// --- the KGATHER seam (see vt/cuda/cuda_embedding_quant.h) -------------------
+
+bool EmbeddingQuantSupported(DType dt) {
+  switch (dt) {
+#define VT_DQ_SUPPORTED(DT, CODEC) \
+  case DType::DT:                  \
+    return true;
+    VT_DQ_GATHER_TYPES(VT_DQ_SUPPORTED)
+#undef VT_DQ_SUPPORTED
+    default:
+      return false;
+  }
+}
+
+cudaError_t LaunchEmbeddingQuant(cudaStream_t s, Tensor& out, const Tensor& table,
+                                 const Tensor& ids, EmbeddingQuantErr* err) {
+  const int64_t t = ids.shape[0];
+  const int64_t h = table.shape[1];
+  const int64_t v = table.shape[0];
+  const int64_t be = BlockElems(table.dtype);
+  // `vt::Embedding` already refused a ragged K; restated because this function
+  // computes a BYTE stride from it and a wrong stride is silent.
+  if (be <= 0 || h % be != 0) return cudaErrorInvalidValue;
+  const int64_t nb = h / be;
+  const size_t row_bytes = RowSizeBytes(table.dtype, h);
+  if (row_bytes != static_cast<size_t>(nb) * static_cast<size_t>(BlockBytes(table.dtype))) {
+    return cudaErrorInvalidValue;
+  }
+  const uint8_t* tbl = static_cast<const uint8_t*>(table.data);
+  if (out.dtype == DType::kF32) {
+    if (ids.dtype == DType::kI32) {
+      return LaunchEmbeddingQuantTyped<float, int32_t>(
+          s, static_cast<float*>(out.data), tbl, static_cast<const int32_t*>(ids.data),
+          table.dtype, t, nb, h, v, row_bytes, err);
+    }
+    return LaunchEmbeddingQuantTyped<float, int64_t>(
+        s, static_cast<float*>(out.data), tbl, static_cast<const int64_t*>(ids.data),
+        table.dtype, t, nb, h, v, row_bytes, err);
+  }
+  if (ids.dtype == DType::kI32) {
+    return LaunchEmbeddingQuantTyped<uint16_t, int32_t>(
+        s, static_cast<uint16_t*>(out.data), tbl, static_cast<const int32_t*>(ids.data),
+        table.dtype, t, nb, h, v, row_bytes, err);
+  }
+  return LaunchEmbeddingQuantTyped<uint16_t, int64_t>(
+      s, static_cast<uint16_t*>(out.data), tbl, static_cast<const int64_t*>(ids.data),
+      table.dtype, t, nb, h, v, row_bytes, err);
+}
 
 }  // namespace vt::cuda

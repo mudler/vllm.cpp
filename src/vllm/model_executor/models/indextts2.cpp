@@ -69,7 +69,10 @@ class IndexTts2Engine : public multimodal::SpeechEngine {
   // reject before staging any weights.
   bool requires_reference_audio() const override { return true; }
 
-  multimodal::SpeechResult Synthesize(const multimodal::SpeechGenParams& params) override {
+  // The seam holds the engine's lock across this call (#2836,
+  // speech_engine.h). The staged weights are shared state, as that header has
+  // always said and as no family used to enforce.
+  multimodal::SpeechResult SynthesizeLocked(const multimodal::SpeechGenParams& params) override {
     if (params.reference_audio.empty()) {
       throw std::runtime_error(
           "indextts2: a reference clip is REQUIRED -- IndexTTS-2 has no "

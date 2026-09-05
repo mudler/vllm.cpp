@@ -27,6 +27,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -111,14 +112,61 @@ TEST_CASE("exl3 native loader: an mcg marker means codebook 1") {
   CHECK(w.Bits() == 6);
 }
 
-TEST_CASE("exl3 native loader: an unported codebook REFUSES rather than decoding") {
+TEST_CASE("exl3 native loader: a mul1 marker means codebook 2") {
   FakeShard s;
-  s.AddProjection("p", 128, 128, 3);
+  s.AddProjection("p", 128, 128, 4);
   s.Add("p.mul1", "I32", {1}, 4);
-  // cb 2 is upstream's dp4a byte-sum variant. Decoding it as 0 or 1 would be
-  // silently wrong in exactly the way this suite's header documents, so the
-  // reader refuses by name instead.
-  CHECK_THROWS(LoadExl3(s.Get(), s.Has(), "p"));
+  // THIS CASE USED TO ASSERT A REFUSAL, and the refusal was correct for as long
+  // as it stood: cb 2 is upstream's dp4a byte-sum variant, and decoding it as 0
+  // or 1 would be silently wrong in exactly the way this suite's header
+  // documents. What changed is the implementation, not the standard -- cb 2 is
+  // ported and gated against hand-computed upstream values
+  // (`tests/vt/test_exl3_dequant.cpp`), so the reader now RESOLVES the marker
+  // instead of refusing it (QUANT-EXL3-MUL1, #2495).
+  //
+  // The marker itself is `torch.tensor(0x83DCD12D, uint32).view(torch.int)`
+  // (`quantize.py:1421-1424`) -- one I32, holding the very multiplier the
+  // codebook uses -- which is why the dtype check below mirrors mcg's.
+  const vllm::Exl3Weight w = LoadExl3(s.Get(), s.Has(), "p");
+  CHECK(w.codebook == 2);
+  // …and the width travels with it. 270 of the 409 trellis modules of
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` are FOUR-bit, which is a width no
+  // codebook-0 or codebook-1 artifact in this tree has used. The count read
+  // 272 until #2574 re-derived it from the local safetensors headers; the 137
+  // modules that reading omitted are THREE-bit, and the CUDA arm for them was
+  // widened against the wrong number and left them refusing by name.
+  CHECK(w.Bits() == 4);
+  CHECK(w.InFeatures() == 128);
+  CHECK(w.OutFeatures() == 128);
+}
+
+TEST_CASE("exl3 native loader: BOTH markers still REFUSE, and so does a wrong-dtype marker") {
+  // Two markers select two codebooks at once. `LinearEXL3` would silently let
+  // `mul1` win inside `decode_3inst`, so an artifact carrying both is malformed
+  // rather than ambiguous, and the reader says so instead of picking one.
+  {
+    FakeShard s;
+    s.AddProjection("p", 128, 128, 3);
+    s.Add("p.mcg", "I32", {1}, 4);
+    s.Add("p.mul1", "I32", {1}, 4);
+    std::string what;
+    try {
+      LoadExl3(s.Get(), s.Has(), "p");
+      FAIL("exl3 native loader: mcg + mul1 together did NOT throw");
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    INFO("refusal: " << what);
+    CHECK(what.find("mul1") != std::string::npos);
+  }
+  // The marker is an I32 upstream writes from a uint32 (`quantize.py:1421-1424`).
+  // A different dtype is a different tensor wearing the name.
+  {
+    FakeShard s;
+    s.AddProjection("p", 128, 128, 4);
+    s.Add("p.mul1", "F16", {1}, 2);
+    CHECK_THROWS(LoadExl3(s.Get(), s.Has(), "p"));
+  }
 }
 
 TEST_CASE("exl3 native loader: the storage predicate is upstream's, all three tensors") {
@@ -270,6 +318,99 @@ TEST_CASE("exl3 native loader: the F16 remainder is CONVERTED to bf16, not reint
   REQUIRE(w.embed_tokens.dtype == vt::DType::kBF16);
   const auto* emb = reinterpret_cast<const uint16_t*>(w.embed_tokens.bytes.data());
   CHECK(emb[0] == vt::F32ToBF16(0.25f));
+
+  fs::remove_all(dir);
+}
+
+// ── the mul1 codebook, through the PRODUCTION entry point ────────────────────
+//
+// The resolver cases above prove that `LoadExl3` resolves a `mul1` marker. They
+// do NOT prove that anything reaches it, and this suite's own header records
+// what that distinction has already cost here: a fresh review replaced
+// `LoadF16AsBf16Direct` with a bare bit-copy and the whole declared gate stayed
+// green, because nothing executed it.
+//
+// So this case builds a 4-bit `mul1` checkpoint on disk and loads it through
+// `LoadLlamaForCausalLMWeights` — the same function `vllm-cli` calls. Both
+// halves of the widening have to survive that trip: the codebook must arrive as
+// 2, and the WIDTH must arrive as 4, which is a width no codebook-0 or
+// codebook-1 artifact in this tree has used.
+TEST_CASE("exl3 native loader: a 4-bit mul1 checkpoint loads through the production entry") {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "exl3_native_loader_mul1_fixture";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  const int64_t H = 128, I = 128, V = 128, Hq = 4, Hkv = 2, Dh = 64;
+  const int64_t qdim = Hq * Dh, kvdim = Hkv * Dh;
+  const int kBits = 4;
+  // `quantize.py:1421-1424`: one I32 holding the codebook's own multiplier.
+  const uint32_t kMul1Mult = 0x83DCD12Du;
+  std::vector<uint8_t> mul1_bytes(4);
+  std::memcpy(mul1_bytes.data(), &kMul1Mult, 4);
+
+  std::vector<dsv4_exl3_fixture::StEntry> e;
+  const auto add_proj = [&](const std::string& p, int64_t k, int64_t n, uint32_t seed) {
+    e.push_back({p + ".trellis", "I16", {k / 16, n / 16, 16 * kBits},
+                 TrellisBytes(k, n, kBits, seed)});
+    e.push_back({p + ".suh", "F16", {k}, F16Bytes(std::vector<float>(static_cast<size_t>(k), 1.0f))});
+    e.push_back({p + ".svh", "F16", {n}, F16Bytes(std::vector<float>(static_cast<size_t>(n), -1.0f))});
+    e.push_back({p + ".mul1", "I32", {1}, mul1_bytes});
+  };
+  const std::vector<float> norm_vals(static_cast<size_t>(H), 1.0f);
+  e.push_back({"model.embed_tokens.weight", "F16", {V, H},
+               F16Bytes(std::vector<float>(static_cast<size_t>(V * H), 0.25f))});
+  e.push_back({"model.norm.weight", "F16", {H}, F16Bytes(norm_vals)});
+  e.push_back({"model.layers.0.input_layernorm.weight", "F16", {H}, F16Bytes(norm_vals)});
+  e.push_back({"model.layers.0.post_attention_layernorm.weight", "F16", {H}, F16Bytes(norm_vals)});
+  add_proj("model.layers.0.self_attn.q_proj", H, qdim, 21);
+  add_proj("model.layers.0.self_attn.k_proj", H, kvdim, 22);
+  add_proj("model.layers.0.self_attn.v_proj", H, kvdim, 23);
+  add_proj("model.layers.0.self_attn.o_proj", qdim, H, 24);
+  add_proj("model.layers.0.mlp.gate_proj", H, I, 25);
+  add_proj("model.layers.0.mlp.up_proj", H, I, 26);
+  add_proj("model.layers.0.mlp.down_proj", I, H, 27);
+  add_proj("lm_head", H, V, 28);
+  const std::string st =
+      dsv4_exl3_fixture::WriteSafetensors(dir / "model.safetensors", e);
+  {
+    std::ofstream cfg(dir / "config.json");
+    cfg << R"({"architectures":["LlamaForCausalLM"],"model_type":"llama",)"
+        << R"("hidden_size":128,"num_hidden_layers":1,"num_attention_heads":4,)"
+        << R"("num_key_value_heads":2,"head_dim":64,"intermediate_size":128,)"
+        << R"("vocab_size":128,"rms_norm_eps":1e-5,"rope_theta":500000.0,)"
+        << R"("torch_dtype":"bfloat16","tie_word_embeddings":true,)"
+        << R"("quantization_config":{"quant_method":"exl3","bits":4.0}})";
+  }
+
+  const vllm::HfConfig config = vllm::LoadHfConfig((dir / "config.json").string());
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(st));
+  // BEFORE this row this line THREW: the loader refused the first `mul1` marker
+  // it saw, so no mul1 checkpoint reached the EXL3 arm at all.
+  const vllm::LlamaWeights w = vllm::LoadLlamaForCausalLMWeights(shards, config);
+
+  REQUIRE(w.layers.size() == 1);
+  REQUIRE(w.layers[0].attn.IsExl3());
+  REQUIRE(w.layers[0].mlp.IsExl3());
+  CHECK(w.layers[0].attn.q_proj_exl3.codebook == 2);
+  CHECK(w.layers[0].attn.o_proj_exl3.codebook == 2);
+  CHECK(w.layers[0].mlp.down_proj_exl3.codebook == 2);
+  CHECK(w.layers[0].attn.q_proj_exl3.Bits() == kBits);
+  CHECK(w.layers[0].mlp.gate_proj_exl3.Bits() == kBits);
+  REQUIRE_FALSE(w.lm_head_exl3.Empty());
+  CHECK(w.lm_head_exl3.codebook == 2);
+
+  // …and the trellis actually arrived, at the 4-bit stride. The reader may
+  // BORROW the mmap rather than own the bytes, so the geometry is asserted on
+  // the SHAPE, which both paths carry: `32 * bits` BYTES per 16x16 tile is what
+  // `Bits()` divides, and a width that did not travel would show up here as a
+  // last dim for some other width.
+  const auto& tr = w.layers[0].attn.q_proj_exl3.trellis;
+  REQUIRE(tr.rank == 3);
+  CHECK(tr.shape[0] == H / 16);
+  CHECK(tr.shape[1] == qdim / 16);
+  CHECK(tr.shape[2] == 32 * kBits);
 
   fs::remove_all(dir);
 }

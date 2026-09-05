@@ -1,0 +1,24 @@
+vllm-bench: /tmp/rocm-strix-q4k/models/Qwen3.6-27B-Q4_K_M.gguf engine | num_prompts=6 input_len=64 output_len=48 concurrency=1 seed=1234 temp=0.00 dataset=/tmp/limb3-2884/prompts.sharegpt.json
+engine: device placement: --fit resolved NO placement: the model has no routed-expert layers, so a placement has nothing to move
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[vt op-provider] op=4 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=77 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=1 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=83 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=88 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=5 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=89 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=76 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=10 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=9 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=84 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=63 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=78 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=64 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=28 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=38 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=69 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=40 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=6 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=11 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed

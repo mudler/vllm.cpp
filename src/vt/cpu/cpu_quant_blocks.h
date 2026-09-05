@@ -166,6 +166,29 @@ struct BlockIQ3_XXS {
 };
 static_assert(sizeof(BlockIQ3_XXS) == 98, "wrong iq3_xxs block size/padding");
 
+// llama.cpp @ b10451 ggml-common.h:413-422 block_iq3_s. 3.4375 bpw codebook
+// quant, and NOT a variant of BlockIQ3_XXS above despite the family name. Three
+// things differ and none of the IQ3_XXS decode transfers:
+//   - the table is the 512-entry kIq3sGrid, not the 256-entry kIq3xxsGrid;
+//   - the ninth index bit is spliced out of `qh` with an ASYMMETRIC shift pair
+//     (`qh << (8-2*l)` for the even lane of a pair, `<< (7-2*l)` for the odd
+//     one, both masked with 256), where IQ3_XXS indexes with a plain byte;
+//   - the sign is a DIRECT byte in `signs[]`, like IQ2_S, where IQ3_XXS packs a
+//     7-bit kKsignsIq2xs selector into its per-32 aux word.
+// `scales` is IQ3S_N_SCALE = QK_K/64 = 4 bytes: ONE nibble per TWO 32-element
+// sub-blocks, and the multiplier is `db = d * (1 + 2*ls)` — an odd-integer
+// scale with neither the `0.5 +` offset nor the `* 0.25` factor of the IQ2
+// family. The 110 is the ORACLE's own `sizeof(block_iq3_s)` (harness in
+// tests/vt/iq3s_golden_vectors.h), not a sum read off the struct.
+struct BlockIQ3_S {
+  uint16_t d;                        // super-block scale (ggml_half)
+  uint8_t qs[kQK_K / 4];             // 64 — grid-index low bytes, 2 per lane
+  uint8_t qh[kQK_K / 32];            // 8 — one ninth-bit plane per ib32
+  uint8_t signs[kQK_K / 8];          // 32 — direct sign bytes, one per lane
+  uint8_t scales[kQK_K / 64];        // 4 — one 4-bit ls per TWO sub-blocks
+};
+static_assert(sizeof(BlockIQ3_S) == 110, "wrong iq3_s block size/padding");
+
 // ggml-common.h:386-392 block_iq2_s. 2.5625 bpw codebook quant: `qs` holds the
 // 8-bit grid-index low bytes (first QK_K/8 = 32) followed by the per-lane sign
 // bytes (last QK_K/8 = 32, applied DIRECTLY — no ksigns lookup, unlike IQ2_XXS);

@@ -17,6 +17,7 @@
 // behavior-preserving outcome.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -778,4 +779,35 @@ TEST_CASE("empty priority yields no backend (base Platform default)") {
   } none;
   CHECK(none.get_attn_backend_priority(AttnSelectorConfig{}).empty());
   CHECK_THROWS_AS(SelectAttentionBackendName(none), std::runtime_error);
+}
+
+// fork issue #7: ROCM_ATTN advertises fp8 and fp8_e4m3 in its
+// supported_kv_cache_dtypes, so a request for an fp8 KV cache selects ROCM_ATTN
+// rather than being refused. The override was added with the fp8 decode GQA
+// kernel; without a gate, deleting the override widens the list back to the base
+// default {"auto", "float16", "bfloat16"} and every binary stays green.
+TEST_CASE("ROCM_ATTN accepts the advertised fp8 KV cache configuration") {
+  std::unique_ptr<AttentionBackend> b =
+      MakeAttentionBackend(DeviceType::kROCM, "ROCM_ATTN");
+  REQUIRE(b != nullptr);
+  CHECK(b->get_name() == "ROCM_ATTN");
+
+  // The advertised list includes fp8 and fp8_e4m3 (fork issue #7, mirroring
+  // FLASH_ATTN's list at flash_attn.py:74-80). The base default omits both, so
+  // a deleted override fails here.
+  const auto dtypes = b->supported_kv_cache_dtypes();
+  CHECK(std::find(dtypes.begin(), dtypes.end(), "fp8") != dtypes.end());
+  CHECK(std::find(dtypes.begin(), dtypes.end(), "fp8_e4m3") != dtypes.end());
+
+  // The predicate the selector reads: supports_kv_cache_dtype is derived from
+  // the list, so this is the assertion that binds the declaration to selection.
+  CHECK(b->supports_kv_cache_dtype("fp8"));
+  CHECK(b->supports_kv_cache_dtype("fp8_e4m3"));
+  CHECK(b->supports_kv_cache_dtype("auto"));
+  CHECK(b->supports_kv_cache_dtype("bfloat16"));
+  // e5m2 is NOT advertised — no ROCm kernel reads it, so claiming it would
+  // select this backend for a cache it cannot read.
+  CHECK_FALSE(b->supports_kv_cache_dtype("fp8_e5m2"));
+  // An empty name is upstream's None and is accepted outright.
+  CHECK(b->supports_kv_cache_dtype(""));
 }

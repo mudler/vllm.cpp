@@ -67,7 +67,39 @@ The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
 |---|---|---|
 | `dgx:gpu0` | `gpu_model=GB10`, `class=train`, `k8s=true`, driver 580.173.02, `cpus=20`, 128 GB | the house NAS |
 | `thor:gpu0` | `gpu_model=NVIDIA-Thor`, `class=train`, `k8s=true`, driver 595.78, `cpus=14`, 132 GB | the house NAS, the SAME folder as `dgx` |
-| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, and NO detected GPU labels because Jetson carries no `nvidia-smi` | LOCAL disk, invisible from `dgx` and `thor` |
+| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, L4T R36.4.7 (JetPack 6), and NO detected GPU labels because Jetson carries no `nvidia-smi` | the house NAS, the SAME folder as `dgx` and `thor` |
+
+### `orin:gpu0` needs L4T CUDA 12.6, and the DGX recipe breaks it
+
+**Do not install `cuda-toolkit-13-*` from the generic `sbsa` repo on `orin`.** That
+is the correct recipe for `dgx` and `thor` and it is wrong for a Jetson. Measured
+inside a lease on 2026-09-03:
+
+| | |
+|---|---|
+| L4T release | `R36 (release), REVISION: 4.7` — JetPack 6 |
+| driver CUDA API | `cuDriverGetVersion` = **12060**, i.e. CUDA **12.6** |
+| device visible | `cuInit` rc 0, `cuDeviceGetCount` rc 0, **count 1** |
+| what a job had left at `/usr/local/cuda` | `cuda-13.3` |
+
+The board is healthy and the driver sees the GPU. A CUDA **runtime** of version N
+requires a driver API of at least N, so a 13.3 toolkit against a 12.6 driver makes
+`cudaGetDeviceCount` return **35** (`CUDA_ERROR_INSUFFICIENT_DRIVER`). That 35 is
+correct behaviour reporting a packaging mistake, not a broken board, and it is why
+`orin` has read as "cannot run CUDA".
+
+The OS image is not at fault and needs no change. `kairos-init` already pins CUDA
+**12.6** for `nvidia-jetson-agx-orin` from the L4T repo
+(`repo.download.nvidia.com/jetson/{common,t234}` at `r36.4`) and moves it to
+`/opt/cuda-12.6`; no Dockerfile in the `dockerfiles` repo installs a toolkit at
+all. The 13.x came from a JOB, and the worker container is long-lived, so one
+job's global install is still there for the next one.
+
+**What to do in a job on `orin`:** use the CUDA already on the board, or install
+`cuda-*-12-6` from the jetson repo. Never `developer.download.nvidia.com/.../sbsa`
+and never `cuda-toolkit-13-*`. **Compilation is unaffected** — `nvcc` needs no
+matching driver, so a 13.3 toolchain builds this tree for `sm_87` cleanly; only
+running does.
 
 **Select on `class` or `gpu_model`, never on `vram`.** `rc describe` reports
 `vram=[N/A]M` and `vram_free=[N/A]M` on this fleet. That is a probe reporting
@@ -111,13 +143,28 @@ history and take the toolchain from
   the same day the worker ran as `uid=0(root)` with `/usr/bin/gcc`,
   `/usr/bin/python3` and a working `apt-get`
   ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
+- **A leased worker's `github.com` egress is not guaranteed, and its absence
+  reads as an authentication failure rather than as a network one.** On
+  2026-09-02 a `thor:gpu0` job that had fetched llama.cpp from `ggml-org` earlier
+  the same day failed at `git fetch` with `could not read Username for
+  'https://github.com'` followed by `fatal: expected flush after ref listing`
+  (rc job `019596fd-5e88-4d0d-aa93-2749ab618524`). Nothing about that message
+  says "no route"; a reader chasing credentials would look in the wrong place.
+  **A job that needs pinned upstream source should stage it rather than fetch
+  it**, and staging costs no rigour if the tree is verified rather than named:
+  `git archive <PIN>` on the dev box, then `git init && git add -A --force &&
+  git write-tree` on the worker, asserted equal to `<PIN>^{tree}`. That rehashes
+  every blob from the bytes that get compiled, which is a stronger statement than
+  `git rev-parse HEAD` plus an empty porcelain
+  ([#2534](https://github.com/mudler/vllm.cpp/issues/2534),
+  `docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md`).
 - **The host filesystem is not visible.** `/home/mudler` does not exist inside
   the worker.
 - `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,
   4.0T available, 46% used`, writable from the job, mounted on the dgx host at
   `/usr/local/nas_share/rc` (SMB, NodePort 31516, subfolder `rc/`). It is the
-  SAME folder from `dgx` and from `thor`, and it is the one surface both ends
-  can see. It is NOT shared with `orin`.
+  SAME folder from `dgx`, from `thor` AND from `orin`, and it is the one surface
+  every end can see.
 
 **The consequence, and it is now narrower than a blocker.** The pinned oracle
 venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST, and a leased
@@ -534,6 +581,89 @@ the fallback was never taken; the box went `unhealthy … worker_lost` for 3h20m
 time. `rc` job `1ad519b1-4e75-41d7-9386-9932076390f1`, exit 34,
 [#2220](https://github.com/mudler/vllm.cpp/issues/2220).
 
+### `ccache` is mandatory here and the usage sheet puts it where it cannot work, measured 2026-09-01
+
+**Do not put `CCACHE_DIR` on `/workspace`.** `rc describe <device>`'s host-wide
+usage sheet requires `ccache` for every supported C, C++, CUDA and HIP build on
+this fleet, and instructs `export CCACHE_DIR=/workspace/ccache`. That instruction
+is wrong. Follow this section instead, and read the sheet's requirement to *use*
+ccache as still binding.
+
+The mechanism is the SONAME defect above ([#2220](https://github.com/mudler/vllm.cpp/issues/2220))
+arriving at a second consumer. `/workspace` is CIFS mounted `nounix`, so
+`symlink(2)` on it returns `EOPNOTSUPP`. `ccache` 4.9.1 takes every cache **and
+stats** lock by creating a symlink, so on that mount nothing is stored and no
+counter is written:
+
+```text
+Could not acquire /workspace/.../ccdir/4/c/stats.lock: Operation not supported
+Failed to acquire lock for /workspace/.../ccdir/4/c/stats
+```
+
+**`ccache -s` then reports zero hits, zero misses AND zero stores, and that
+reading points the wrong way.** A cache that was consulted and empty records
+MISSES. Zero of everything looks like proof that the launcher never reached the
+compile line; it in fact means every write was refused. `rc` job
+`93a60151-7d4d-4718-842c-ef724208be0e` passed all three
+`-DCMAKE_*_COMPILER_LAUNCHER=ccache` flags, had `ccache` on `PATH`, and paid its
+**1404 s (23.4 min)** build in full. Its `ccache-before.txt` and
+`ccache-after.txt` are byte-identical. `/workspace/ccache` still holds the
+residue: a complete 16x16 bucket tree, mtimes from inside that build's window,
+**one** file and zero bytes.
+
+**It is worse than doing nothing.** Each refused acquisition costs a retry
+timeout of roughly 0.4 to 0.6 s, and `ccache -s` walks all 256 stats buckets.
+Against a `/workspace` cache, `ccache -s -v` produced no output at all inside the
+probe window after 278 consecutive failures and the job had to be killed. A cache
+there adds time to every build it cannot accelerate.
+
+**The recipe. `CCACHE_DIR` local, the persistence on the NAS.**
+
+```sh
+command -v ccache >/dev/null || { apt-get update -qq; apt-get install -y -qq ccache; }
+export CCACHE_DIR=/root/ccache                              # local: it needs symlink(2)
+export CCACHE_REMOTE_STORAGE=file:/workspace/ccache-remote  # survives the container
+export CCACHE_MAXSIZE=20G
+mkdir -p "$CCACHE_DIR" "${CCACHE_REMOTE_STORAGE#file:}"
+cmake -S "$SRC" -B "$BLD" -G Ninja ... \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+```
+
+The remote store MAY live on `/workspace`, and the difference is not a guess:
+ccache's `file` backend stores through `open` plus `rename`, which this mount
+serves, and takes no lock at all. Measured on `strix:gpu0`, `rc` job
+`e4793984-10e8-4b2e-b6a7-7f931d6d40fe`, over eight translation units:
+
+| Arm | `CCACHE_DIR` | Remote store | Result |
+|---|---|---|---|
+| local | `/tmp` | none | healthy: 1 hit, 1 miss over 2 calls |
+| cifs | `/workspace` | none | 278 lock failures; `ccache -s -v` never returned |
+| remote-seed | `/tmp`, empty | `file:/workspace/...` | 18 s, 0/8 hits, 16 remote writes |
+| remote-cold | `/tmp`, **fresh and empty** | the same store | **5 s, 8/8 remote hits, 0 misses** |
+
+`remote-cold` is the arm that carries it: its local cache was created empty, so
+every hit came off the NAS. A tarball of the local cache on `/workspace` also
+works (seed 4 s, save 1 s, restore 0 s, warm 2 s) and is the fallback if remote
+storage is ever unavailable; it is not the default because it needs an explicit
+save step that a job killed by `--max-runtime` never reaches.
+
+**The three causes this is NOT, each excluded by the same probe** (`rc` job
+`9b287a1f-d94d-476d-9732-0f649509cdd8`). The CMake launcher DOES reach the
+compile line: `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache` put `ccache` on 9 lines of a
+verbose Ninja build and produced `Cacheable calls: 9 / 9 (100.0%)`. `ccache` IS
+on `PATH` and resolves to `/usr/bin/ccache`. No wrapper or generator bypasses it.
+Only the filesystem is at fault.
+
+**Assert that the cache took part, rather than logging its counters.** A line
+that prints hits and continues is what let this run for a month.
+`scripts/ltx25-render-confirm.sh` now probes `symlink(2)` on `CCACHE_DIR` before
+the build and exits 37 if it fails, and refuses after a build that compiled if
+`Cacheable calls` is zero. The assertion is on cacheable CALLS and not on hits,
+because an honest first build has every right to zero hits.
+`scripts/check-lease-ccache.py` holds the rule for every script under `scripts/`.
+
 ### Two packages a DFlash2 oracle lease needs, and the lease variable that exists, measured 2026-08-22
 
 Measured on `dgx:gpu0` across leases `11cee02a`, `52ac5673` and `a03f34e4`
@@ -883,7 +1013,7 @@ environment:
     | `nvcc` | **NOT part of the image. Install it.** Both of this lane's jobs happened to find `/usr/local/cuda-13.0` and nvcc 13.0.88 already there, and that was another job's leftover — see below |
     | ABSENT | **`shellcheck`**, **`cuobjdump`**, **`nsys`**, `sudo`, `docker` — and `cuobjdump` stays absent after the `PATH` prepend, which matters below |
     | `nvidia-smi` | plain, no `sudo`, **exit 0 with ZERO bytes on stderr**, reporting `NVIDIA Thor`, driver 595.78, `compute_cap 11.0` |
-    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` sees, and `/mnt/nas_share/rc` on the devbox. NOT shared with `orin`. `rc` copies nothing for you |
+    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` and `orin` see, and `/mnt/nas_share/rc` on the devbox. `rc` copies nothing for you |
     | `/tmp` | the worker's own overlay, 918 G — but it was **94% used with 58 G free** on 2026-08-22. Read "Disk is shared" below before you build |
     | swap | **30.7 G of `zram`** (`/dev/zram0`, PRIO 100), with `vm.overcommit_memory=1`. Compressed RAM, not a backing store — see the reboot warning below |
     | reuse | **the container is REUSED between jobs**, so `/tmp` carries other jobs' trees and your own from last week |
@@ -1816,14 +1946,20 @@ environment:
   16 GB Mac mini only** — it is not general advice, and in particular the DGX
   profile above requires `-j 1` because its unified memory OOM-reboots the box
   under a parallel CUDA suite.
-  `test_engine_core_proc` is likewise a timing flake under heavy parallel ctest:
-  the case "EngineCoreProc: abort-mode shutdown aborts in-flight requests"
-  (`test_engine_core_proc.cpp:315`) races the busy-loop teardown against the
-  abort-output enqueue and intermittently misses `abort_seen` (measured ~1/5 in
-  isolation under load, 2026-07-28); it is a pre-existing test-side timing race
-  (untouched by the C7 sampling work) and passes on rerun. A dedicated fix would
-  make the loop block for the abort frame (bounded wait) instead of a
-  best-effort non-blocking `try_get` sweep.
+  `test_engine_core_proc` used to fail under heavy parallel ctest in the case
+  "EngineCoreProc: abort-mode shutdown aborts in-flight requests" (measured ~1/5
+  in isolation under load, 2026-07-28). **FIXED 2026-09-01
+  ([#2482](https://github.com/mudler/vllm.cpp/issues/2482)), and this page named
+  the wrong cause and the wrong remedy until then.** It was never a race with the
+  teardown: `InprocClient::shutdown()` JOINS the engine thread, so the abort frame
+  is already on the queue by the time the scan starts. The scan was capped at 1000
+  dequeues while the request carried `max_tokens=100000`, so it free-ran token
+  deltas into an unbounded queue and, given more scheduler time under load, wrote
+  more than 1000 of them ahead of the abort frame. The failing run reported 1004
+  assertions against a solo run's 11 -- all 1000 `try_get`s returned true, so the
+  scan ran out of budget on a queue that was never empty. The fix drains the queue
+  to empty. Waiting for the frame, which this page recommended, would have waited
+  on a frame that had already arrived.
 
   **LOCALAI WORKER — must be DOWN for any timing/benchmark work on this box
   (user-directed 2026-07-22).** It is a **root LaunchDaemon**, not a container

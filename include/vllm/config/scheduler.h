@@ -139,9 +139,19 @@ struct SchedulerConfig {
   // ModelConfig is not ported yet. default_factory uses 8192.
   int max_model_len = 8192;
 
-  // Derived in __post_init__ (= max_num_batched_tokens). Encoder path deferred.
+  // Derived in __post_init__ (= max_num_batched_tokens). Consumed by the
+  // scheduler's encoder admission from ENG-MM-INPUT-PIPELINE P2 (#2379) on;
+  // inert for a text-only engine, whose requests carry no mm_features.
   int max_num_encoder_input_tokens = kDefaultMaxNumBatchedTokens;
   int encoder_cache_size = kDefaultMaxNumBatchedTokens;
+
+  // disable_chunked_mm_input (scheduler_config.disable_chunked_mm_input, read at
+  // scheduler.py:1470). When true a step may not cover only PART of a
+  // multimodal item's placeholder span: the admission rolls the step back to
+  // just before the item rather than splitting it. FALSE is upstream's default
+  // and the arm the encoder budget/cache fallback covers, so leaving it alone is
+  // byte-identical. ENG-MM-INPUT-PIPELINE P2 (#2379) un-deferred it.
+  bool disable_chunked_mm_input = false;
 
   // __post_init__(max_model_len, is_encoder_decoder): applies the
   // encoder-decoder disabling, sets the derived encoder budgets, then runs

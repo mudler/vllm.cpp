@@ -683,6 +683,52 @@ states it as a delta over a named baseline rather than as a bare count.
   2026-08-19 evidence. A hand-built distribution proves the arithmetic and not
   the claim.
 
+### Four ways this instrument fails while still printing a result
+
+Measured 2026-09-04 while arming the host-side pin on `dgx:gpu0`. **All four are
+fail-OPEN: the instrument dies and the log still reads like a measurement.**
+`gpu_clock_state.py` itself is fail-*closed* by design; every one of these is in
+the scaffolding around it.
+
+1. **The pin record must be staged beside the tool.**
+   `serve_low_common.py:47` resolves `_PIN_RECORD = parents[2]/.agents/upstream-sync.md`.
+   A staged copy of `tools/` without it makes `gpu_clock_state.py` die in a
+   traceback on import.
+
+2. **`rc` from a pipe is the rc of the last stage, not of python.**
+   `python3 … sample … | tail -20; echo "SAMPLE_RC=$?"` reports `tail`'s status, so
+   **a crashed sampler reads as a clean `rc 0`** — and in one run `IMPORT_RC=0`
+   printed directly over the traceback from (1). Capture python's own rc
+   (`out=$(cmd); rc=$?`, or `PIPESTATUS`) **and** assert the summary artifact is
+   non-empty, printing something like `..._SUMMARY=ABSENT — nothing below
+   describes a clock` when it is not.
+
+3. **The dgx HOST cannot write to the share.**
+   `/workspace` is mounted `uid=0,forceuid,gid=10001,forcegid,dir_mode=0775` and
+   the host login is uid 1002/gid 1002, so it lands in "other" and `mkdir` fails
+   `EACCES`. Every later write goes nowhere while the script keeps printing
+   normally. Work in `/tmp` and copy back under `sudo`, reporting **that copy's**
+   rc.
+
+4. **A staged pin record is a stale-oracle trap.**
+   Staging `.agents/upstream-sync.md` beside the sampler freezes the parity pin at
+   the SHA you copied it from. `main` moved the same day it was staged. A stale
+   ```parity-pin``` block next to a runnable clock sampler lets a future run assert
+   the WRONG oracle identity while looking healthy. Re-stage from a current tree at
+   use time, or read the pin with `git show origin/main:.agents/upstream-sync.md`.
+
+**A fifth, not in the tool at all:** a worktree can be reaped underneath a running
+session. When that happened here, a `cd` failed and the next check silently ran in
+the SHARED CHECKOUT — 1095 commits behind — returning plausible hits with line
+numbers. Prefer `git show origin/main:<path>` for read-only checks: it needs no
+worktree and cannot be reaped.
+
+**And one property of the gate itself, which decides when a window can be taken at
+all:** `MIN_BUSY_SAMPLES` is 30 at roughly 1 s cadence, and an idle box yielded 5
+busy samples in 10 s. An idle-box probe can answer the *acceptance* question ("does
+pinning work on this boot") but can never satisfy the *gate*. A clock window must be
+recorded inside the workload it characterises.
+
 ## What was not measured
 
 Three absences bound what this spec may conclude, and each of them touches an

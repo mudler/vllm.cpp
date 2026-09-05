@@ -982,6 +982,21 @@ slice to land unreached only when this list, the commit body and the pull
 request body all name it, so this section is the record that permission depends
 on and not a summary.
 
+**The OpenAI server exports no speculative-decoding acceptance metric**
+([#2770](https://github.com/mudler/vllm.cpp/issues/2770)). vLLM at the parity pin
+`5559679229` exports `vllm:spec_decode_num_accepted_tokens_total` and three
+siblings; we export none. `spec_drafts_proposed()` and `spec_drafts_accepted()`
+are `GpuRunner` accessors whose only non-test readers are in
+`examples/bench/bench_core.h`, so acceptance is obtainable from the bench binary
+and nowhere else. Two consequences make it worth a wave rather than a footnote.
+Anyone serving this model gets no acceptance figure at all, and a head-to-head
+against another engine over HTTP is asymmetric for a reason that is plumbing.
+Compounding it, `bench_core.h:558` hardcodes `ignore_eos = true`
+([#2759](https://github.com/mudler/vllm.cpp/issues/2759)), so **no configuration
+of this tree reports acceptance for an EOS-terminated generation** — which is
+what every published comparison measures. Not fixed where it was found because
+it is a server-surface wave, not a change to the speculator.
+
 **W2 DISCHARGED O1, O2, O3 and O4.** They are kept below, struck through in
 prose rather than deleted, because the reason each existed is what a later reader
 needs and `.agents/completed/` is for superseded documents rather than for four
@@ -3052,7 +3067,19 @@ list items.
   retraction, and it IS needed before anybody claims the forward JIT is free.
 
 - **O-W12a — [#2088](https://github.com/mudler/vllm.cpp/issues/2088): a
-  non-causal SWA draft layer runs with NO sliding window.** Found while reading
+  non-causal SWA draft layer runs with NO sliding window. DISCHARGED by
+  [dflash2-noncausal-swa-window.md](dflash2-noncausal-swa-window.md)
+  ([#2784](https://github.com/mudler/vllm.cpp/issues/2784)).** The read this
+  entry made a precondition — the campaign draft's own `config.json` — came back
+  the LIVE way: five `sliding_attention` layers, `sliding_window: 2048`,
+  `is_causal: false`, so the window was dropped on every draft layer of the
+  campaign subject rather than only on the MiMo and Gemma-4 drafts. #2784
+  measured the cost: acceptance 0.77 at 2,307 prompt tokens and 0.06 at 8,159,
+  with speculation landing 23% BELOW the no-draft baseline. The eleven kernel
+  guards and the paged seam's mask map now share one bound
+  (`include/vt/dflash_attn_mask.h`). The entry as filed follows.
+
+  Found while reading
   the `P > 1` propose route for W12
   ([dflash2-batch-propose.md](dflash2-batch-propose.md)), not fixed there.
   Upstream resolves `(sliding_window, causal)` independently and passes

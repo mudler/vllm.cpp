@@ -119,6 +119,7 @@ const ModelFactory kInternLM2Factory{
     .forward = &ForwardInternLM2ForCausalLM,
     .make_kv_cache = &MakeInternLM2ForCausalLMKVCache,
     .is_dense_model = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

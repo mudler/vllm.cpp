@@ -123,6 +123,7 @@ const ModelFactory kQwen3DenseFactory{
     .forward = &ForwardQwen3ForCausalLM,
     .make_kv_cache = &MakeQwen3ForCausalLMKVCache,
     .is_dense_model = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

@@ -62,6 +62,8 @@
 
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
 #include "vllm/model_executor/models/deepseek_v4_device.h"
+#include "vllm/model_executor/models/deepseek_v4_exl3_device.h"
+#include "vllm/model_executor/models/dense_attn_block.h"  // Dev, DBuf, ResidentWeight
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
@@ -706,7 +708,15 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 // so a mutation could not tell a live check from a dead one.
 void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
                                 const DeepseekV4Params& p, int64_t layer,
-                                bool is_comp, bool is_indexer) {
+                                bool is_comp, bool is_indexer,
+                                // W3 (#2286): true only where the PAGED arm will
+                                // compose this layer. The widened indexer geometry
+                                // is readable THERE and nowhere else, because the
+                                // legacy per-token branch still projects `idx_wk`
+                                // at `index_head_dim`. Narrowing the refusal for a
+                                // path that cannot handle it is the mistake this
+                                // parameter prevents.
+                                bool paged_dsa_arm) {
   const int64_t H = p.hidden_size;
   const int64_t hd = p.head_dim;
   std::string bad;
@@ -719,10 +729,31 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
   };
   if (is_comp) {
     const int64_t cr = p.compress_ratio(layer);
-    want("compressor.ape", "[compress_ratio, head_dim]", L.comp_ape.size(), cr * hd);
-    want("compressor.wgate.weight", "[head_dim, hidden_size]", L.comp_wgate.size(),
-         hd * H);
+    // W3 (#2286): `coff = 1 + (compress_ratio == 4)` (`compressor.py:247-248`)
+    // widens the ape and the fused wkv|wgate; `norm` does NOT, because upstream
+    // is `RMSNorm(self.head_dim, ...)` (`compressor.py:288`).
+    //
+    // Read from the TENSOR rather than derived from `compress_ratio`, the same
+    // way `idx_wq`'s K is. Upstream emits only the derived width, but this tree's
+    // synthetic suites are written at a COLLAPSED `coff == 1` shape on `cr == 4`
+    // layers -- a shape upstream cannot produce and this forward has always
+    // accepted. Deriving the requirement instead would refuse all of them at
+    // once, which is a fixture migration and not this wave.
+    const int64_t cw = (hd > 0 && H > 0 && L.comp_wgate.size() % (hd * H) == 0 &&
+                        L.comp_wgate.size() / (hd * H) == 2)
+                           ? 2 * hd
+                           : hd;
+    const int64_t coff = cw / hd;
+    (void)coff;
+    want("compressor.ape", "[compress_ratio, coff*head_dim]", L.comp_ape.size(), cr * cw);
+    want("compressor.wgate.weight", "[coff*head_dim, hidden_size]", L.comp_wgate.size(),
+         cw * H);
     want("compressor.norm.weight", "[head_dim]", L.comp_norm_weight.size(), hd);
+    // Materialized since W3; empty only on a checkpoint that carries none, where
+    // the collapsed convention still applies.
+    if (!L.comp_wkv.empty())
+      want("compressor.wkv.weight", "[coff*head_dim, hidden_size]", L.comp_wkv.size(),
+           cw * H);
   }
   if (is_indexer) {
     const int64_t inh = p.index_n_heads;
@@ -735,8 +766,19 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
            "[index_n_heads*index_head_dim, q_lora_rank] (upstream) or "
            "[index_n_heads*index_head_dim, hidden_size] (collapsed)",
            L.idx_wq.size(), inh * ihd * H);
-    want("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
-         L.idx_wk.size(), ihd * H);
+    // W3 (#2286): NARROWED, and only now. The indexer's compressor is implemented
+    // -- its keys are produced, the selection scores over them, and the gather
+    // narrows the merge -- so the widened width is READ rather than refused. The
+    // order matters and this row has broken it twice: narrowing a refusal before
+    // the capability exists turns a loud refusal into a silent wrong answer.
+    //
+    // Read from the TENSOR, like the compressor family's, because the synthetic
+    // suites carry a collapsed shape upstream cannot emit.
+    if (!(paged_dsa_arm && static_cast<int64_t>(L.idx_wk.size()) == 2 * ihd * H))
+      want("indexer.compressor.wkv.weight",
+           "[coff*index_head_dim, hidden_size] (upstream) or "
+           "[index_head_dim, hidden_size] (collapsed)",
+           L.idx_wk.size(), ihd * H);
     want("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
          L.idx_wproj.size(), inh * H);
   }
@@ -814,7 +856,10 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   // none of them, and the GGUF arm (`dsa_dense`) enters it on no layer at all —
   // so that arm's behaviour is byte for byte unchanged by #1970, and its own
   // separate defect stays owed under #1964.
-  RequireDsaGeometryOrRefuse(L, p, layer, is_comp, is_indexer);
+  RequireDsaGeometryOrRefuse(L, p, layer, is_comp, is_indexer,
+                             /*paged_dsa_arm=*/be.paged_kv != nullptr &&
+                                 be.compressor != nullptr &&
+                                 p.compress_ratio(layer) == 4);
 
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
@@ -860,7 +905,16 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   //    into the cached latent (deepseek_v4_compressor.h : CompressorSaveScoreApe /
   //    CompressorPoolNorm). Non-compressor layers cache the raw latent directly.
   std::vector<float> latent = kraw;
-  if (is_comp) {
+  // W3 (#2286): the PAGED compressor arm supersedes this placeholder entirely. It
+  // pools a 2-wide window over the MLA's own latent, where upstream pools a
+  // `compress_ratio`-wide window over the compressor's own projection, and it
+  // projects `comp_wgate` at `head_dim` where the real geometry is
+  // `coff * head_dim`. Running both throws an anonymous `MatVec weight size
+  // mismatch` -- the diagnostic the DSA refusal exists to replace.
+  const bool paged_comp_arm =
+      is_comp && be.paged_kv != nullptr && be.compressor != nullptr &&
+      (p.compress_ratio(layer) == 4 || p.compress_ratio(layer) == 128);
+  if (is_comp && !paged_comp_arm) {
     const int64_t cr = p.compress_ratio(layer);
     const int64_t win = 2;  // tiny pooling window (device gather addressing = W7 seam)
     // compressor pool-score projection (keep-quant comp_wgate) : [T,H] -> [T,hd].
@@ -935,9 +989,22 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // supplies compressor state, because `CompressorLayerStep` composes it. Every
     // other compressor shape, and the indexer, still refuse: `compress_ratio == 4`
     // is `coff == 2` plus the Lightning Indexer and is W3's.
-    const bool comp_arm =
-        is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128;
-    VT_CHECK(!is_indexer && (!is_comp || comp_arm),
+    // W3 (#2286): `cr == 4` joins the arm now. It is the same composition with a
+    // SELECTION -- the indexer chooses which closed rows to attend -- and the
+    // indexer's own compressor produces the keys it selects over.
+    const int64_t cr_arm = p.compress_ratio(layer);
+    // MODEL-DSV4-PAGED-ENTRY (#2447): THE shared expression, not a local one.
+    // `ResolveDeepseekV4SwaPages` routes on this same call, so the route cannot
+    // admit a layer this block then refuses. It reduces to the expression that
+    // stood here -- `is_comp` is `p.has_compressor(layer) && !dsa_dense` -- and
+    // the reduction is the reason it can be shared rather than approximated.
+    const bool comp_arm = DeepseekV4PagedArmComposesCompressor(
+        p, layer, dsa_dense, /*have_compressor_state=*/be.compressor != nullptr);
+    // At `cr == 4` the layer carries an indexer too, and the same arm composes
+    // it: its own compressor produces the keys and its selection narrows the
+    // merge. So the indexer is admitted exactly where the compressor is.
+    const bool idx_arm = is_indexer && comp_arm && cr_arm == 4;
+    VT_CHECK((!is_indexer || idx_arm) && (!is_comp || comp_arm),
              "deepseek-v4: the paged MLA arm is dense-causal only; the indexer and "
              "compressor layers belong to MODEL-DSV4-DSA-COMPOSE (#2286)");
     VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
@@ -990,7 +1057,16 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   // 4. selection: DSA Lightning-Indexer top-k on indexer layers, else dense causal
   //    over GLOBAL positions [0..kv_base+t] (kv_base==0 in the stateless path).
   std::vector<std::vector<int64_t>> sel(static_cast<size_t>(T));
-  if (is_indexer) {
+  // W3 (#2286): the PAGED `cr == 4` arm supersedes this selection -- it runs the
+  // indexer's own compressor and selects over COMPRESSED rows, where this branch
+  // scores PER-TOKEN keys. Both must not run: this one projects `idx_wk` at
+  // `index_head_dim`, and at the real geometry that tensor is
+  // `coff * index_head_dim`, so it throws an anonymous `MatVec weight size
+  // mismatch` -- the diagnostic the DSA refusal exists to replace.
+  const bool paged_indexer_arm = is_indexer && be.paged_kv != nullptr &&
+                                 be.compressor != nullptr &&
+                                 p.compress_ratio(layer) == 4;
+  if (is_indexer && !paged_indexer_arm) {
     const int64_t inh = p.index_n_heads, ihd = p.index_head_dim, itopk = p.index_topk;
     // indexer q/k projections keep-quant (idx_wq_b / indexer_compressor_kv); the
     // weights_proj (idx_wproj) is a small V role and stays f32 (host).
@@ -1058,13 +1134,48 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // tensor, one op call for the whole step. Proven equal to the loop below by
     // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
     // several `kv_base` values, with both off-by-one directions mutation-proven.
-    if (is_comp && be.compressor != nullptr && p.compress_ratio(layer) == 128) {
+    if (is_comp && be.compressor != nullptr &&
+        (p.compress_ratio(layer) == 128 || p.compress_ratio(layer) == 4)) {
       // The compressor arm. `deck` is this step's latents, `x` the hidden state the
       // pool score projects from, and the state grows across steps.
       DeepseekV4CompressorState& cs = *be.compressor;
       VT_CHECK(static_cast<int64_t>(cs.state_kv.size()) > layer,
                "deepseek-v4 compressor: state has no entry for this layer");
       std::vector<int64_t> pos64(positions.begin(), positions.end());
+
+      // W3 (#2286): at `cr == 4` the indexer CHOOSES which closed rows to attend.
+      // Its own compressor produces the keys, the selection scores against them,
+      // and the result narrows the merge. At `cr == 128` there is no indexer and
+      // every closed row is attended, which is a null selection.
+      std::vector<int64_t> sel_rows;
+      const std::vector<int64_t>* sel_ptr = nullptr;
+      if (p.compress_ratio(layer) == 4) {
+        VT_CHECK(!L.idx_comp_wgate.empty() && !L.idx_wk.empty(),
+                 "deepseek-v4 indexer: the compressor family did not load for a "
+                 "cr == 4 layer (MODEL-DSV4-DSA-COMPOSE, #2286)");
+        const int64_t inh = p.index_n_heads, ihd = p.index_head_dim;
+        const std::vector<float> ikeys = deepseek_v4::IndexerCompressedKeys(
+            x, L.idx_wk, L.idx_comp_wgate, L.idx_comp_ape, L.idx_comp_norm_weight,
+            &cs.idx_state_kv[static_cast<size_t>(layer)],
+            &cs.idx_state_score[static_cast<size_t>(layer)], pos64, T, H, ihd,
+            p.compress_ratio(layer), rope, rope_base, eps);
+        std::vector<float>& irows = cs.idx_comp_rows[static_cast<size_t>(layer)];
+        irows.insert(irows.end(), ikeys.begin(), ikeys.end());
+
+        const std::vector<float> iq =
+            static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr
+                ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
+                       inh * ihd, qlr)
+                : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
+                       inh * ihd, H);
+        const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
+        const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
+        sel_rows = deepseek_v4::IndexerSelectCompressed(
+            iq, irows, folded, pos64, T,
+            static_cast<int64_t>(irows.size()) / ihd, inh, ihd, p.index_topk,
+            p.compress_ratio(layer));
+        sel_ptr = &sel_rows;
+      }
       // W3 (#2286): pool the compressor's OWN projection of the hidden state when
       // the checkpoint carries one. Upstream's `fused_wkv_wgate` emits the KV and
       // the gate together (`compressor.py:279-287`) and never reuses the MLA
@@ -1084,7 +1195,10 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           &cs.state_kv[static_cast<size_t>(layer)],
           &cs.state_score[static_cast<size_t>(layer)],
           &cs.comp_rows[static_cast<size_t>(layer)], pos64, kv_base, T, nh, H, hd,
-          p.compress_ratio(layer), p.sliding_window, eps, scale);
+          p.compress_ratio(layer), p.sliding_window, eps, scale,
+          // The compressed row carries RoPE on its tail, at this layer's own
+          // base -- compressed layers use `compress_rope_theta`.
+          rope, rope_base, sel_ptr);
     } else
     o = deepseek_v4::PagedCausalMlaAttention(
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
@@ -1185,16 +1299,57 @@ std::vector<float> Exl3Linear(const V4Backend& be, const DeepseekV4Exl3Linear& l
     own_local = true;
     q = &local;
   }
-  if (q->device.type != vt::DeviceType::kCPU) {
-    VT_CHECK(vt::GetBackend(q->device).DeviceMemoryIsHostAddressable(),
-             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies "
-             "each TP1 linear into a host owner buffer) and this device cannot dereference "
-             "host pointers. The device-resident tower is MODEL-DSV4-EXL3's owed "
-             "'Real-checkpoint residency for the coalesced tower'; run the EXL3 arm on a "
-             "CPU queue until it lands.");
-  }
   const vt::Device dev = q->device;
 
+  // ── THE DEVICE ARM (MODEL-DSV4-EXL3 W2, #2442) ────────────────────────────
+  // Every buffer a kernel touches has to live where the kernel runs. The weights
+  // get there once, at staging time, through `dense_attn::ResidentWeight`; the
+  // activation, the Hadamard scratch and the output are per-call and get there
+  // through `DBuf`, the same pooled device scratch every other device forward
+  // uses. Before this, ALL SIX were host `std::vector`s wearing the forward's
+  // device label -- which is why this function refused a non-CPU queue rather
+  // than dereference them.
+  if (dev.type != vt::DeviceType::kCPU) {
+    VT_CHECK(lin.device_staged,
+             "deepseek-v4 exl3: this expert linear is not device-staged, so its "
+             "trellis tower is still HOST memory and a device kernel cannot "
+             "dereference it (#844 / #1435). Call "
+             "StageDeepseekV4Exl3TowerToDevice before the first device forward; "
+             "a CPU queue serves an unstaged tower.");
+    dense_attn::Dev d{vt::GetBackend(dev), *q};
+
+    std::vector<uint16_t> a_host(static_cast<size_t>(k));
+    for (int64_t i = 0; i < k; ++i) a_host[static_cast<size_t>(i)] = vt::F32ToF16(xin[i]);
+    dense_attn::DBuf a(d, vt::DType::kF16, {1, k}, a_host.data());
+    dense_attn::DBuf a_had(d, vt::DType::kF16, {1, k});
+    dense_attn::DBuf c(d, vt::DType::kF16, {1, n});
+
+    // The memoized device views. `ResidentWeight` returns the `d_dev` copy
+    // staging already uploaded, so this costs a pointer read per call and NOT a
+    // second upload -- the reason the shapes live on the OwnedTensor.
+    vt::Tensor tb = dense_attn::ResidentWeight(d, lin.d_trellis);
+    vt::Tensor tsuh = dense_attn::ResidentWeight(d, lin.d_suh);
+    vt::Tensor tsvh = dense_attn::ResidentWeight(d, lin.d_svh);
+
+    vt::Exl3GemmArgs dargs;
+    dargs.bits = lin.bits;
+    dargs.codebook = 1;  // mcg; the loader refuses any other marker by name
+    vt::Exl3Gemm(*q, c.t(), a.t(), tb, tsuh, tsvh, a_had.t(), dargs);
+    vt::GetBackend(dev).Synchronize(*q);
+
+    std::vector<uint16_t> c_host(static_cast<size_t>(n), 0);
+    vt::GetBackend(dev).Copy(*q, c_host.data(), c.t().data,
+                             static_cast<size_t>(n) * sizeof(uint16_t));
+    vt::GetBackend(dev).Synchronize(*q);
+    if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+    std::vector<float> dout(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+      dout[static_cast<size_t>(i)] = vt::F16ToF32(c_host[static_cast<size_t>(i)]);
+    return dout;
+  }
+
+  // ── THE HOST ARM, unchanged. Aliasing host pointers into a tensor is correct
+  // exactly here, where the "device" IS the host.
   std::vector<uint16_t> a(static_cast<size_t>(k));
   for (int64_t i = 0; i < k; ++i) a[static_cast<size_t>(i)] = vt::F32ToF16(xin[i]);
   std::vector<uint16_t> a_had(static_cast<size_t>(k), 0);
@@ -1215,7 +1370,6 @@ std::vector<float> Exl3Linear(const V4Backend& be, const DeepseekV4Exl3Linear& l
   args.bits = lin.bits;
   args.codebook = 1;  // mcg; the loader refuses any other marker by name
   vt::Exl3Gemm(*q, tc, ta, tb, tsuh, tsvh, tah, args);
-  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
   if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
 
   std::vector<float> out(static_cast<size_t>(n));
@@ -1268,15 +1422,14 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
     own_local = true;
     q = &local;
   }
-  if (q->device.type != vt::DeviceType::kCPU &&
-      !vt::GetBackend(q->device).DeviceMemoryIsHostAddressable()) {
-    VT_CHECK(false,
-             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies each "
-             "TP1 linear into a host owner buffer) and this device cannot dereference host "
-             "pointers. The device-resident tower is MODEL-DSV4-EXL3's owed 'Real-checkpoint "
-             "residency for the coalesced tower'; run the EXL3 arm on a CPU queue until it "
-             "lands.");
-  }
+  // MODEL-DSV4-EXL3 W2 (#2442). This used to refuse EVERY non-CPU queue, because
+  // the tower was host memory and the kernel dereferences the per-expert pointer
+  // tables ON THE DEVICE. It now asks the narrower question that is actually
+  // load-bearing: are these experts staged? An unstaged tower on a device queue
+  // is still the #844 / #1435 crash, and a PARTIALLY staged one is the same
+  // crash for whichever expert the router happens to pick -- so this is checked
+  // per expert in the table loop below rather than once here.
+  const bool device_arm = q->device.type != vt::DeviceType::kCPU;
   const vt::Device dev = q->device;
 
   // The nine per-expert pointer tables. Every expert must agree on shape and
@@ -1297,6 +1450,49 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
              "deepseek-v4 exl3: the fused MoE op carries ONE bit width per projection "
              "(exl3_moe.cu:114-116) and expert " + std::to_string(e) + " disagrees");
     const size_t i = static_cast<size_t>(e);
+    if (device_arm) {
+      // PER EXPERT, not once for the tower: the kernel dereferences whichever
+      // expert the router picked, so one unstaged expert among 216 is a crash
+      // that a tower-level check would have called safe.
+      VT_CHECK(xe.w1.device_staged && xe.w2.device_staged && xe.w3.device_staged,
+               "deepseek-v4 exl3: expert " + std::to_string(e) +
+                   " is not device-staged, so its trellis tower is still HOST "
+                   "memory and the fused MoE kernel cannot dereference it "
+                   "(#844 / #1435). Call StageDeepseekV4Exl3TowerToDevice before "
+                   "the first device forward; a CPU queue serves an unstaged tower.");
+      dense_attn::Dev dd{vt::GetBackend(dev), *q};
+      // `ResidentWeight` returns the memoized `d_dev` view staging uploaded, so
+      // these are DEVICE addresses and the read costs no copy.
+      //
+      // VALIDATED AS THEY ARE FILLED (#2458). A null here is not a crash where
+      // it happens: the kernel dereferences `g_tr[expert]` on the device and the
+      // fault surfaces later at the next synchronising call, as
+      // `cudaStreamDestroy: an illegal memory access`, naming neither the expert
+      // nor the projection. compute-sanitizer had to be run to learn that much.
+      // One predicate per pointer, at the site that knows both names, turns that
+      // into a refusal a reader can act on.
+      const auto dev_ptr = [&](const OwnedTensor& t, const char* proj,
+                               const char* part) {
+        void* p = dense_attn::ResidentWeight(dd, t).data;
+        VT_CHECK(p != nullptr,
+                 std::string("deepseek-v4 exl3: expert ") + std::to_string(e) +
+                     " projection " + proj + " has a NULL device " + part +
+                     " after staging. The fused MoE kernel would dereference "
+                     "this on the device and surface the fault later as an "
+                     "illegal memory access naming nothing (#2458).");
+        return reinterpret_cast<int64_t>(p);
+      };
+      g_tr[i] = dev_ptr(xe.w1.d_trellis, "w1", "trellis");
+      g_su[i] = dev_ptr(xe.w1.d_suh, "w1", "suh");
+      g_sv[i] = dev_ptr(xe.w1.d_svh, "w1", "svh");
+      u_tr[i] = dev_ptr(xe.w3.d_trellis, "w3", "trellis");
+      u_su[i] = dev_ptr(xe.w3.d_suh, "w3", "suh");
+      u_sv[i] = dev_ptr(xe.w3.d_svh, "w3", "svh");
+      d_tr[i] = dev_ptr(xe.w2.d_trellis, "w2", "trellis");
+      d_su[i] = dev_ptr(xe.w2.d_suh, "w2", "suh");
+      d_sv[i] = dev_ptr(xe.w2.d_svh, "w2", "svh");
+      continue;
+    }
     g_tr[i] = reinterpret_cast<int64_t>(xe.w1.trellis.data());
     g_su[i] = reinterpret_cast<int64_t>(xe.w1.suh.data());
     g_sv[i] = reinterpret_cast<int64_t>(xe.w1.svh.data());
@@ -1346,6 +1542,130 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
   std::vector<uint16_t> in_g(static_cast<size_t>(max_rows * mi), 0);
   std::vector<uint16_t> in_u(in_g.size(), 0);
 
+  vt::Exl3MoeArgs args;
+  args.bits_gate = e0.w1.bits;
+  args.bits_up = e0.w3.bits;
+  args.bits_down = e0.w2.bits;
+  args.codebook = 1;  // mcg; the loader refuses any other marker by name
+  args.act = vt::Exl3MoeAct::kSiluAndMulClamp;
+  args.act_limit = lim;
+  args.num_active = num_active;
+
+  if (device_arm) {
+    // EVERY operand the kernel touches, on the device. The weights got there at
+    // staging; these are the per-call ones. The nine pointer TABLES need it as
+    // much as the weights do -- the kernel indexes `g_tr[expert]` on the device,
+    // so a host table is dereferenced there just the same, and it was the easier
+    // half of this defect to miss because the table is only 216 int64s.
+    dense_attn::Dev d{vt::GetBackend(dev), *q};
+    // `out` is ACCUMULATED into by the fused arm, so its current contents are an
+    // input and not just a destination. Uploading it is what keeps the device
+    // arm's arithmetic identical to the host arm's rather than dropping whatever
+    // a previous call had already summed there.
+    dense_attn::DBuf b_out(d, vt::DType::kF32, {T, H}, out->data());
+    dense_attn::DBuf b_hid(d, vt::DType::kF16, {T, H}, hidden.data());
+    auto dpt = [&](std::vector<int64_t>& v) {
+      return dense_attn::DBuf(d, vt::DType::kI64, {ne}, v.data());
+    };
+    dense_attn::DBuf bg1 = dpt(g_tr), bg2 = dpt(g_su), bg3 = dpt(g_sv);
+    dense_attn::DBuf bu1 = dpt(u_tr), bu2 = dpt(u_su), bu3 = dpt(u_sv);
+    dense_attn::DBuf bd1 = dpt(d_tr), bd2 = dpt(d_su), bd3 = dpt(d_sv);
+    vt::Tensor tg1 = bg1.t(), tg2 = bg2.t(), tg3 = bg3.t();
+    vt::Tensor tu1 = bu1.t(), tu2 = bu2.t(), tu3 = bu3.t();
+    vt::Tensor td1 = bd1.t(), td2 = bd2.t(), td3 = bd3.t();
+    vt::Exl3MoeExpertTables dtables{&tg1, &tg2, &tg3, &tu1, &tu2, &tu3, &td1, &td2, &td3};
+
+    dense_attn::DBuf b_cnt(d, vt::DType::kI64, {ne + 1}, expert_count.data());
+    dense_attn::DBuf b_tok(d, vt::DType::kI64, {assignments}, token_sorted.data());
+    dense_attn::DBuf b_wgt(d, vt::DType::kF16, {assignments}, weight_sorted.data());
+    vt::Tensor t_cnt = b_cnt.t(), t_tok = b_tok.t(), t_wgt = b_wgt.t();
+    vt::Exl3MoeRouting drouting{&t_cnt, &t_tok, &t_wgt};
+
+    // The temps are pure scratch, so they are ALLOCATED on the device and never
+    // uploaded -- the host vectors above exist only to size them on the CPU arm.
+    dense_attn::DBuf b_sg(d, vt::DType::kF16, {1, max_rows, H});
+    dense_attn::DBuf b_su(d, vt::DType::kF16, {1, max_rows, H});
+    dense_attn::DBuf b_ig(d, vt::DType::kF16, {1, max_rows, mi});
+    dense_attn::DBuf b_iu(d, vt::DType::kF16, {1, max_rows, mi});
+    vt::Tensor s_g = b_sg.t(), s_u = b_su.t(), i_g = b_ig.t(), i_u = b_iu.t();
+    vt::Exl3MoeTemps dtemps{&s_g, &s_u, &i_g, &i_u};
+
+    vt::Tensor t_out_d = b_out.t();
+    vt::Tensor t_hid_d = b_hid.t();
+
+    // EVERY operand, checked by name before the launch (#2458). The kernel takes
+    // eighteen pointers and dereferences them on the device, so a null among
+    // them is an asynchronous fault reported at the next synchronising call --
+    // `cudaStreamDestroy: an illegal memory access` -- which names none of them.
+    // The pool can also hand back a null (`DevicePool::Get`), and that failure
+    // is silent by construction. Checking here costs eighteen predicates per
+    // layer against a kernel that decodes a 216-expert trellis tower.
+    const auto need = [](const vt::Tensor& t, const char* what) {
+      VT_CHECK(t.data != nullptr,
+               std::string("deepseek-v4 exl3: the fused MoE device arm has a "
+                           "NULL ") + what +
+                   " operand. The kernel dereferences it on the device and the "
+                   "fault surfaces later as an illegal memory access naming "
+                   "nothing (#2458).");
+    };
+    need(t_out_d, "output");
+    need(t_hid_d, "hidden");
+    need(tg1, "gate trellis table"); need(tg2, "gate suh table");
+    need(tg3, "gate svh table");     need(tu1, "up trellis table");
+    need(tu2, "up suh table");       need(tu3, "up svh table");
+    need(td1, "down trellis table"); need(td2, "down suh table");
+    need(td3, "down svh table");
+    need(t_cnt, "expert_count"); need(t_tok, "token_sorted");
+    need(t_wgt, "weight_sorted");
+    need(s_g, "state_g"); need(s_u, "state_u");
+    need(i_g, "intermediate_g"); need(i_u, "intermediate_u");
+
+    // VT_DSV4_EXL3_MOE_TRACE=1 dumps every operand the kernel receives (#2458).
+    // The per-pointer and per-operand checks above pass and the kernel still
+    // faults at a NULL base, so what is left to establish is what the VALUES
+    // are -- pointer identity, the routing arithmetic, and the launch geometry.
+    // Deduction has already cost two hardware round-trips; this makes one round
+    // trip answer it. Off by default and read once per call, which is the same
+    // shape as VT_POOL_BYPASS and the fused-arm rollback beside it.
+    if (const char* tr = std::getenv("VT_DSV4_EXL3_MOE_TRACE");
+        tr != nullptr && tr[0] == '1') {
+      int64_t cnt_sum = 0;
+      for (int64_t e = 0; e < ne; ++e) cnt_sum += expert_count[static_cast<size_t>(e)];
+      std::fprintf(stderr,
+                   "[dsv4 moe trace] ne=%lld T=%lld topk=%lld H=%lld mi=%lld "
+                   "assignments=%lld max_rows=%lld num_active=%d cnt_sum=%lld "
+                   "cnt[ne]=%lld\n",
+                   (long long)ne, (long long)T, (long long)topk, (long long)H,
+                   (long long)mi, (long long)assignments, (long long)max_rows,
+                   args.num_active, (long long)cnt_sum,
+                   (long long)expert_count[static_cast<size_t>(ne)]);
+      std::fprintf(stderr,
+                   "[dsv4 moe trace] tables g_tr=%p g_su=%p cnt=%p tok=%p wgt=%p "
+                   "out=%p hid=%p s_g=%p i_g=%p\n",
+                   tg1.data, tg2.data, t_cnt.data, t_tok.data, t_wgt.data,
+                   t_out_d.data, t_hid_d.data, s_g.data, i_g.data);
+      // The ENTRIES, which is what the kernel actually dereferences. A null here
+      // with a non-null table is the shape the sanitizer's NULL base implies.
+      for (int64_t e = 0; e < ne && e < 4; ++e)
+        std::fprintf(stderr,
+                     "[dsv4 moe trace] expert %lld count=%lld g_tr=%p g_su=%p "
+                     "g_sv=%p d_tr=%p\n",
+                     (long long)e, (long long)expert_count[static_cast<size_t>(e)],
+                     (void*)g_tr[static_cast<size_t>(e)],
+                     (void*)g_su[static_cast<size_t>(e)],
+                     (void*)g_sv[static_cast<size_t>(e)],
+                     (void*)d_tr[static_cast<size_t>(e)]);
+    }
+    vt::Exl3MoeMlp(*q, t_out_d, t_hid_d, dtables, drouting, dtemps, args);
+    vt::GetBackend(dev).Synchronize(*q);
+    vt::GetBackend(dev).Copy(*q, out->data(), b_out.t().data,
+                             static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(float));
+    vt::GetBackend(dev).Synchronize(*q);
+    if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+    (void)p;
+    return taken;
+  }
+
   vt::Tensor t_out = vt::Tensor::Contiguous(out->data(), vt::DType::kF32, dev, {T, H});
   vt::Tensor t_hid = vt::Tensor::Contiguous(hidden.data(), vt::DType::kF16, dev, {T, H});
   auto pt = [&](std::vector<int64_t>& v) {
@@ -1370,16 +1690,7 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
   vt::Tensor i_u = vt::Tensor::Contiguous(in_u.data(), vt::DType::kF16, dev, {1, max_rows, mi});
   vt::Exl3MoeTemps temps{&s_g, &s_u, &i_g, &i_u};
 
-  vt::Exl3MoeArgs args;
-  args.bits_gate = e0.w1.bits;
-  args.bits_up = e0.w3.bits;
-  args.bits_down = e0.w2.bits;
-  args.codebook = 1;  // mcg; the loader refuses any other marker by name
-  args.act = vt::Exl3MoeAct::kSiluAndMulClamp;
-  args.act_limit = lim;
-  args.num_active = num_active;
   vt::Exl3MoeMlp(*q, t_out, t_hid, tables, routing, temps, args);
-  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
   if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
   (void)p;
   return taken;
@@ -1487,6 +1798,15 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   //    keep-quant tower and a trellis tower cannot have its routed experts
   //    accumulated twice.
   std::vector<char> exl3_fused_expert;
+  // The fused arm ran on the host only until #2458, because `vt::Exl3MoeMlp`
+  // faulted on a device queue: `compute-sanitizer` on `thor:gpu0` put it inside
+  // `exl3_moe_kernel<3, 256, 1>` as an 8-byte read at `base + tid*8` with base
+  // NULL. The port of `exl3_gemm_kernel_inner` had dropped upstream's
+  // `shmem_out_had` template parameter and hardwired the output Hadamard on, so
+  // the MoE epilogue dereferenced the NULL `post_scale` that upstream's own MoE
+  // bands pass (`exl3_moe_kernel.cuh:138,212` instantiate it `false`). With that
+  // parameter restored the kernel takes the fp16 store the CPU arm reproduces,
+  // so the arm is selected by the flag alone on every queue again.
   if (!kq && Le != nullptr && Dsv4Exl3FusedMoe())
     exl3_fused_expert = Exl3FusedMoePass(be, *Le, p, x, route, T, H, mi, topk, lim, &out);
 
@@ -2951,6 +3271,30 @@ std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
 
 }  // namespace dspark
 
+// DSV4-DSPARK-DRAFTER W-3: one block's attention half, host oracle.
+// Drives the SAME `AttentionBlock` the trunk uses, with `kv_prewritten` on so the
+// rows `BlockKvRows` wrote from the trunk taps are attended rather than
+// overwritten. A DSpark block is a compressor-less V4 layer, so nothing else
+// differs and no second attention exists to drift.
+std::vector<float> DsparkBlockAttentionHost(
+    vt::Queue& queue, const DeepseekV4LayerHostWeights& L,
+    const DeepseekV4Params& p, const std::vector<float>& x,
+    const std::vector<int32_t>& positions, std::vector<vt::Tensor>& pages,
+    int64_t layer, int64_t kv_base) {
+  VT_CHECK(static_cast<int64_t>(pages.size()) > layer,
+           "dspark block attention: no page tensor for this block");
+  VT_CHECK(L.comp_wgate.empty() && L.idx_wk.empty(),
+           "dspark block attention: a DSpark block is COMPRESSOR-LESS and carries "
+           "no indexer (`mtp_layer_types` is asserted \"sliding\", "
+           "deepseek_v4_mtp.py:61-63); this layer carries one");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.paged_kv = &pages;
+  be.paged_kv_prewritten = true;
+  be.kv_base = kv_base;
+  return AttentionBlock(L, /*Lq=*/nullptr, p, x, positions, layer, V4Miswire::kNone,
+                        /*trace=*/nullptr, be);
+}
+
 // DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
 // Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream
 // mean per requested layer, IN REQUEST ORDER -- which is the order `main_proj`
@@ -3248,12 +3592,24 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
 
+// MODEL-DSV4-PAGED-ENTRY (#2447). See the header: this is the ONE derivation,
+// and `AttentionBlock` above reads it as its `comp_arm`.
+bool DeepseekV4PagedArmComposesCompressor(const DeepseekV4Params& params,
+                                          int64_t layer, bool dsa_dense,
+                                          bool have_compressor_state) {
+  const int64_t cr = params.compress_ratio(layer);
+  return params.has_compressor(layer) && !dsa_dense && have_compressor_state &&
+         (cr == 128 || cr == 4);
+}
+
 // KV-DSV4-MULTICACHE W5 (#2323). See the header for why this is pure.
 std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
                                       const MultiKvCacheIndex& multi_kv,
                                       const std::vector<PagedKvCache>& attn_kv,
                                       int num_reqs, vt::Device device,
-                                      std::vector<vt::Tensor>* out_pages) {
+                                      std::vector<vt::Tensor>* out_pages,
+                                      bool dsa_dense, bool have_compressor_state,
+                                      int64_t num_tokens) {
   // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
   // step, so a batch at differing context lengths would silently attend the
   // wrong history for every request but one.
@@ -3262,17 +3618,39 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
            "differing context lengths needs a per-request kv_base "
            "(KV-DSV4-MULTICACHE W5, #2323)";
   }
-  // SWA-ONLY LAYERS. A layer with a compressor composes its window with selected
-  // compressed history; attending the raw prefix instead would produce entirely
-  // plausible tokens from the wrong key set.
+  // DECODE ONLY, on the composed arm. `MergeWindowAndCompressed` reshapes the
+  // two LSE buffers rather than transposing them, which is only legal when T or
+  // H is 1 (`deepseek_v4_dsa.cpp`). A prefill therefore refuses at real geometry
+  // anyway -- but inside the composition, with a message about LSE layouts.
+  // Refusing here names the row instead. Routing the prefill to the STATELESS
+  // path is not an escape: the compressor state would then never see the prompt
+  // and `CompressorLayerStep` fires `seen == kv_base` on the first decode step.
+  // MODEL-DSV4-PAGED-ENTRY (#2447), `## Owed`.
+  if (have_compressor_state && num_tokens != 1) {
+    return "deepseek-v4 paged forward: the composed compressor arm is DECODE "
+           "ONLY (this step carries " +
+           std::to_string(num_tokens) +
+           " tokens). Its window/compressed merge reshapes the two LSE buffers "
+           "instead of transposing them, so it needs one token per step. "
+           "Refusing rather than merging the wrong layout "
+           "(MODEL-DSV4-PAGED-ENTRY, #2447)";
+  }
+  // A COMPRESSOR LAYER composes its window with selected compressed history;
+  // attending the raw prefix instead would produce entirely plausible tokens
+  // from the wrong key set. So it is admitted only where the paged arm actually
+  // COMPOSES it, and that question is answered by the same expression
+  // `AttentionBlock` enforces -- never by a copy of its clauses.
   for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
-    if (params.has_compressor(l)) {
+    if (params.has_compressor(l) &&
+        !DeepseekV4PagedArmComposesCompressor(params, l, dsa_dense,
+                                              have_compressor_state)) {
       return "deepseek-v4 paged forward: layer " + std::to_string(l) +
              " has a compressor (compress_ratio " +
              std::to_string(params.compress_ratio(l)) +
-             "), whose window-plus-compressed-history composition is unported. "
-             "Refusing rather than attending over the raw prefix "
-             "(MODEL-DSV4-DSA-COMPOSE, #2286)";
+             ") this arm does not compose, so it would attend the raw prefix. "
+             "The composed arm needs compress_ratio 4 or 128, carried "
+             "compressor state, and an arm whose layers are not forced dense "
+             "(MODEL-DSV4-DSA-COMPOSE, #2286; MODEL-DSV4-PAGED-ENTRY, #2447)";
     }
   }
   std::vector<vt::Tensor> pages(static_cast<size_t>(params.num_hidden_layers));
@@ -3290,6 +3668,24 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
       return "deepseek-v4 paged forward: the SWA cache for '" + name +
              "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
              std::to_string(params.head_dim);
+    }
+    // A PACKED PAGE. `vt::ConcatAndCacheMla` refuses a non-float cache dtype by
+    // name, and `MakeDeepseekV4KVCache` publishes the SWA pages as `kI8` with
+    // `cache_dtype_str == "fp8_ds_mla"` -- upstream's own default
+    // (`attention.py:140`). The write would abort either way; refusing here says
+    // WHICH row owns the gap instead of surfacing a kernel precondition.
+    //
+    // The fix is the packed 584-byte store (`KV-DSV4-MULTICACHE` W8), NOT a
+    // wider guard in `ApplyCacheDType`: widening that would let a packed page be
+    // written as though it were float, which is the wrong-tokens shape this
+    // whole path exists to remove. MODEL-DSV4-PAGED-ENTRY (#2447), `## Owed`.
+    if (c.dtype != vt::DType::kF32 && c.dtype != vt::DType::kF16 &&
+        c.dtype != vt::DType::kBF16) {
+      return "deepseek-v4 paged forward: the SWA cache for '" + name +
+             "' is a PACKED page (vt::ConcatAndCacheMla takes a float cache "
+             "only, and this topology publishes fp8_ds_mla). The packed store "
+             "is owed to KV-DSV4-MULTICACHE W8 "
+             "(MODEL-DSV4-PAGED-ENTRY, #2447)";
     }
     pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
         c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
@@ -3458,6 +3854,12 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
   // `has_exl3_weights`, and it now materializes the carried tower and sets
   // `has_host_weights` in the same function before returning, so
   // `has_exl3_weights && !has_host_weights` cannot come out of a load.
+  // MODEL-DSV4-EXL3 W2 (#2442): make the routed-expert tower device-resident
+  // before anything dispatches on it. THE PRODUCTION CALL SITE -- the loader has
+  // no queue in hand, so this is the first point at which the tower and the
+  // device it will run on both exist. A no-op on a CPU queue and on an already
+  // staged tower, so the host arm and every repeat forward pay one predicate.
+  (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
@@ -3485,6 +3887,12 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
            "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
   VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
            "DeepseekV4ForwardExl3Paged: one page tensor per layer is required");
+  // MODEL-DSV4-EXL3 W2 (#2442): make the routed-expert tower device-resident
+  // before anything dispatches on it. THE PRODUCTION CALL SITE -- the loader has
+  // no queue in hand, so this is the first point at which the tower and the
+  // device it will run on both exist. A no-op on a CPU queue and on an already
+  // staged tower, so the host arm and every repeat forward pay one predicate.
+  (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   be.paged_kv = &paged_kv;
@@ -3551,6 +3959,22 @@ static ForwardLogits WrapV4DeviceLogits(std::vector<float>&& flat, int64_t rows,
   return fl;
 }
 
+// MODEL-DSV4-PAGED-ENTRY (#2447): the EXL3 paged arm, returning the runner's
+// carrier. See the header for why the wrap happens here and not at the registry.
+ForwardLogits DeepseekV4ForwardExl3PagedLogits(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices,
+    DeepseekV4CompressorState* compressor) {
+  std::vector<float> flat =
+      DeepseekV4ForwardExl3Paged(weights, queue, paged_kv, kv_base, token_ids,
+                                 positions, logits_indices, compressor);
+  const int64_t vocab = weights.params.vocab_size;
+  const int64_t rows = vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;
+  return WrapV4DeviceLogits(std::move(flat), rows, vocab, queue);
+}
+
 // ── W7-DEVICE: the DEVICE forward. Runs the SAME composition as
 //    DeepseekV4ForwardHost but routes the four NEW V4 op families through the
 //    CUDA kernels (kDeepseekV4{Mhc,Dsa,Compressor,Moe}) via the OpProvider seam,
@@ -3575,12 +3999,17 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
   VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending);
-  // MODEL-DSV4-EXL3 W2: the device entry point routes the routed experts through
-  // the same trellis op rather than carrying a second policy. `Exl3Linear`
-  // refuses BY NAME when the queue's device cannot dereference the host-resident
-  // tower, which is the owed residency item and not a silent wrong number.
+  // MODEL-DSV4-EXL3 W2 (#2442): the device entry point routes the routed experts
+  // through the same trellis op rather than carrying a second policy, and it is
+  // THE path on which the tower has to be device-resident -- this is the forward
+  // the runner's default `gather` reaches. Staging first is what turns
+  // `Exl3Linear`'s refusal from "this arm cannot run on a GPU" into a
+  // precondition that is already satisfied.
   V4Backend dev_be{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr};
-  if (weights.has_exl3_weights) dev_be.exl3 = &weights.exl3;
+  if (weights.has_exl3_weights) {
+    (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
+    dev_be.exl3 = &weights.exl3;
+  }
   std::vector<float> flat =
       ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                          V4Miswire::kNone, /*trace=*/nullptr, dev_be);

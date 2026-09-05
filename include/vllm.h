@@ -194,7 +194,9 @@ extern "C" {
  * and that config is what BaseProcessingInfo::ValidateNumItems refuses against.
  * The caller that reaches ValidateNumItems on a live request is the OPENAI
  * SERVER: it is the one place that installs the multimodal chat seam
- * (server_main.cpp `chat.set_multimodal_chat_fn(...)`), and serving_chat.cpp
+ * (server_main.cpp `oai::InstallMultiModalChatSeam(...)`, which since #2475 is
+ * the ONE production caller of `set_multimodal_chat_fn` and dispatches on the
+ * model's architecture), and serving_chat.cpp
  * gates the whole multimodal branch on that seam being set. So a server started
  * with --language-model-only answers a multimodal chat request with HTTP 400
  * "At most 0 image(s) may be provided in one prompt." rather than serving it.
@@ -326,7 +328,21 @@ extern "C" {
  * this one moved. The dependent sites moved with it: the >= floor in
  * `tests/capi/test_capi.cpp`, the table row and the version line in
  * `docs/USAGE.md`, and the surface row in `docs/FEATURES.md`. */
-#define VLLM_ABI_VERSION 23
+/* v24 — vllm_model_params.kv_cache_dtype, KV-CACHE STORAGE DTYPE (row
+ * `KV-FP8` W6, fork issue #7). Mirrors vLLM CacheConfig.cache_dtype and its
+ * `--kv-cache-dtype` flag (config/cache.py:19-36,76). NULL or "auto" (the
+ * zero value) uses the model dtype and is byte-identical to before; "fp8" or
+ * "fp8_e4m3" stores 1-byte fp8-e4m3 K/V. Appended at the END of
+ * vllm_model_params, so a zero-initialized v23 struct is byte-identical. */
+/* v25 — vllm_engine_spec_acceptance, SPECULATIVE ACCEPTANCE TELEMETRY (row
+ * `SPEC-DFLASH2`, issue #2832). A pure READ of three counters the engine
+ * already increments; it computes nothing and changes no decision. Added
+ * because the DFlash2 speed gate drives `examples/cli`, a pure client of this
+ * header, so the acceptance both reference engines publish had no route out of
+ * ours and a 0.928x deficit could not be attributed to execution speed or to
+ * acceptance. A NEW ENTRY POINT, so every existing struct and call is
+ * byte-identical. */
+#define VLLM_ABI_VERSION 25
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -665,6 +681,13 @@ typedef struct vllm_model_params {
    * other half. Every one of those fires BEFORE the tokenizer and before any
    * language-model weight byte is read. Borrowed for the call only. */
   const char* mmproj_path;
+  /* ── KV-cache storage dtype (ABI v24) ──────────────────────────────────────
+   * Mirrors vLLM CacheConfig.cache_dtype and its `--kv-cache-dtype` flag
+   * (config/cache.py:19-36,76). NULL or "auto" (the default) uses the model
+   * dtype and is byte-identical to before this field existed; "fp8" or
+   * "fp8_e4m3" stores 1-byte fp8-e4m3 K/V, halving the bytes per KV block.
+   * Borrowed for the call only. */
+  const char* kv_cache_dtype;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────
@@ -775,6 +798,65 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
 
 /* Destroy an engine handle and everything it owns. NULL is a no-op. */
 VLLM_API void vllm_engine_free(vllm_engine* engine);
+
+/* ── Speculative-decoding acceptance (ABI v25) ────────────────────────────────
+ * The counters the engine already keeps for its own speculative decode, read
+ * back so a benchmark driven through this ABI can say WHY a throughput number
+ * is what it is. CUMULATIVE over the handle's whole life: a caller that wants a
+ * per-request or per-leg figure subtracts two reads.
+ *
+ * THE UNITS ARE STATED HERE BECAUSE THE TWO REFERENCE ENGINES DISAGREE ON ONE
+ * OF THEM, and conflating the two is a one-token-per-step error:
+ *
+ *   drafts_proposed        draft tokens the target VERIFIED. Mirrors vLLM's
+ *                          `vllm:spec_decode_num_draft_tokens`.
+ *   drafts_accepted        draft tokens the rejection sampler ACCEPTED.
+ *                          EXCLUDES the bonus/replacement token a verify step
+ *                          always emits, which is what vLLM's
+ *                          `vllm:spec_decode_num_accepted_tokens` counts.
+ *   drafted_request_steps  (REQUEST, STEP) PAIRS that carried at least one
+ *                          draft — NOT forward passes. The engine increments it
+ *                          once per request per step, so a single verify step
+ *                          over a batch of 8 drafted requests adds 8. It equals
+ *                          the number of verify forwards ONLY at
+ *                          `max_num_seqs=1`.
+ *
+ * THE FIELD IS NAMED FOR WHAT IT COUNTS, because a reader who divides by a
+ * "verify step" count that is really a request-step count is wrong by the batch
+ * size — and the concurrent rungs are exactly where this instrument gets
+ * pointed. The unit is nevertheless the SAME one both reference engines
+ * publish, so the comparison is exact and needs no correction: vLLM's
+ * `vllm:spec_decode_num_drafts` is incremented per request per step
+ * (`vllm/v1/spec_decode/metrics.py:41-42`, called from
+ * `vllm/v1/core/sched/scheduler.py:1691` under the same `num_draft_tokens > 0`
+ * predicate at `:2445`), and SGLang's `spec_verify_ct` likewise
+ * (`python/sglang/srt/managers/schedule_batch.py:961`).
+ *
+ * So `drafts_accepted / drafts_proposed` is the acceptance RATE with the bonus
+ * token OUT of it, and
+ * `1 + drafts_accepted / drafted_request_steps` is vLLM's
+ * `mean_acceptance_length` EXACTLY (`vllm/v1/spec_decode/metrics.py:114`), with
+ * the bonus token IN it.
+ *
+ * IT IS NOT SGLang's `accept_length`, and the two must not be quoted as one
+ * number. SGLang divides `completion_tokens` by `spec_verify_ct`
+ * (`python/sglang/srt/managers/tokenizer_manager.py:2363`) and that numerator
+ * includes the request's PREFILL token, which came from no verify step at all.
+ * The difference is about one token per request — roughly +0.07 on a 64-token
+ * request over ~15 steps, which is a seventh of the 4.67-versus-4.23 spread
+ * this instrument exists to explain.
+ *
+ * All three read 0 on an engine that never speculated, which is a true answer
+ * and not an error. Returns VLLM_ERR_INVALID_ARGUMENT for a NULL argument or a
+ * handle with no text-generation path (*out is zeroed first either way). */
+typedef struct vllm_spec_acceptance {
+  int64_t drafts_proposed;
+  int64_t drafts_accepted;
+  int64_t drafted_request_steps;
+} vllm_spec_acceptance;
+
+VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,
+                                                 vllm_spec_acceptance* out);
 
 /* ── Completion (blocking) ────────────────────────────────────────────────────
  * Run a single blocking completion for `prompt` with `params`, filling *out.

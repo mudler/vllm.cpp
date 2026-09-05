@@ -40,16 +40,32 @@
 // Everything else is below, and every entry names the host helper it replaces
 // and the upstream line that helper came from.
 //
-// ─── DTYPE: f32, AND THAT IS NOT A WIDENING ─────────────────────────────────
+// ─── DTYPE: TWO WIDTHS ON THE CPU ARM, ONE ON THE CUDA ONE ──────────────────
 //
-// Every kernel here serves f32 STORAGE only and refuses anything else BY NAME,
-// the same way `src/vt/cuda/cuda_conv3d.cu:154-156` refuses f16/bf16. This is
-// not the "f32 is a rare annotated exception" case AGENTS.md warns about: the
-// whole LTX-2.5 conv video VAE decode is f32 in this tree, deliberately and
-// after a measurement — #1008 found the decode computing in f64 where torch
-// computes in f32 and narrowed it, and `ltx2_video_vae.cpp:50` records the
-// resulting polarity. A bf16 storage arm is owed with the CUDA measurement
-// (#1452) rather than guessed at here.
+// Every entry below takes a `vt::DType` and the CPU arm
+// (src/vt/cpu/cpu_ltx2_vae.cpp) serves f32 AND bf16 behind it (A24 wave 3, row
+// LTX25-A24-VIDEO-VAE-BF16, issue #2786). Upstream resolves ONE pipeline dtype
+// and it is bfloat16 (distilled.py:109, handed to `VideoDecoder` at :148), so
+// bf16 is the arm the render loads and f32 is the parity reference every
+// committed golden is measured against. #1008's finding still stands and is what
+// the f32 arm keeps: the decode used to accumulate in f64 where torch computes
+// in f32, and narrowing that is why these kernels have the accumulator widths
+// they do.
+//
+// FIVE OF THE TEN ENTRIES ROUND NOWHERE. `depth_to_space`, `frame_slice`,
+// `channel_repeat`, `unpatchify` and `pad` are pure shape movement -- one source
+// element per destination element -- so their bf16 arm moves 16-bit WORDS and
+// converts nothing. The other five each apply a rounding rule that was EXECUTED
+// against the pinned modules, and each rule is gated bit-exactly against
+// upstream, with the hypothesis it rejects beside it, in
+// tests/vllm/models/test_ltx2_vae.cpp.
+//
+// THE CUDA ARM STILL REFUSES bf16 BY NAME, and the reason is reachability rather
+// than budget: `src/vt/cuda/cuda_conv3d.cu` refuses f16/bf16 storage (#1007) and
+// every convolution of the decode goes through `vt::Conv3d`, so bf16 branches
+// here would be code nothing can reach. `Ltx2ConvVideoDecode` refuses a bf16
+// decode on a non-CPU queue with the same predicate, so the refusal and the route
+// predicate cannot drift apart. The device bf16 arm is owed with a lease.
 //
 // ─── SEAM ────────────────────────────────────────────────────────────────────
 //

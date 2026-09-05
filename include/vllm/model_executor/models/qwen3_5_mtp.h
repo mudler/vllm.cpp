@@ -8,7 +8,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -23,6 +25,14 @@ enum class Qwen3_5MTPKind : uint8_t { kDense, kMoe };
 struct Qwen3_5MTPWeights {
   Qwen3_5MTPKind kind = Qwen3_5MTPKind::kDense;
   OwnedTensor fc;  // bf16 raw torch Linear [H,2H], nk=true
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the fc-cat projection as an
+  // exllamav3 trellis [K=2H, N=H]. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`
+  // quantizes it -- `mtp.fc.trellis I16 [640, 320, 64]`, K=10240, N=5120,
+  // bits 4, with a `.mul1` marker (codebook 2), read from the shard's own
+  // safetensors header by range request. It is NOT remainder: it is the ninth
+  // EXL3 tensor of the head, and the one the forward's own `fc.nk` precondition
+  // refused outright. Exactly one of {`fc`, `fc_exl3`} is populated.
+  Exl3Weight fc_exl3;
   OwnedTensor pre_fc_norm_embedding;  // bf16 [H], Gemma RMSNorm
   OwnedTensor pre_fc_norm_hidden;     // bf16 [H], Gemma RMSNorm
   OwnedTensor final_norm;             // bf16 [H], Gemma RMSNorm
@@ -30,6 +40,15 @@ struct Qwen3_5MTPWeights {
   std::vector<Qwen3_5MoeLayerWeights> moe_layers;
 
   int64_t NumLayers() const;
+
+  // ONE truth for "is this head's EXL3 arm active", keyed on the TRELLIS alone
+  // and never on a config scalar, mirroring `FullAttnLayerWeights::IsExl3`
+  // (keyed on `q_proj_exl3`) and `DenseMlpWeights::IsExl3` (on
+  // `down_proj_exl3`). The loader fills `fc_exl3` together with the layer
+  // projections, so a half-populated container cannot read as an arm; the
+  // predicate answers the same question the loader's own `IsExl3Projection`
+  // probe asked about `mtp.fc`.
+  bool IsExl3() const { return !fc_exl3.Empty(); }
 };
 
 // The MTP head depth, read from the checkpoint config (`mtp_num_hidden_layers`,
@@ -48,7 +67,15 @@ bool UsesDedicatedEmbeddings(const HfConfig& config);
 // tensor is required to be BF16 (the NVFP4 checkpoint exclusion mirrored from
 // qwen3_5_mtp.py:86-103). Dedicated embeddings are rejected for this bounded
 // Qwen3.6 leaf; both gate checkpoints set mtp_use_dedicated_embeddings=false.
+//
+// MODEL-QWEN35-EXL3-HEAD (#2495 item 5) adds the EXL3 arm and, with it, `has`.
+// It is REQUIRED and has no default: an EXL3 projection ships no `.weight`, so
+// selecting the arm means asking whether `<proj>.trellis` EXISTS, and a
+// defaulted "assume nothing is quantized" predicate is exactly the silent-off
+// shape `SharedHeadSource::LoadInto` documents at length. Dropping it is a
+// compile error, not a green run that quietly loads no EXL3 head.
 Qwen3_5MTPWeights LoadQwen3_5MTP(const TensorResolver& get,
+                                 const std::function<bool(const std::string&)>& has,
                                  const HfConfig& config,
                                  Qwen3_5MTPKind kind);
 
@@ -83,6 +110,14 @@ class Qwen3_5MTPModel {
   const OwnedTensor& embed_tokens() const { return *embed_tokens_; }
   const OwnedTensor* lm_head() const { return lm_head_; }
   const Nvfp4Weight* lm_head_fp4() const { return lm_head_fp4_; }
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5). The draft shares the TARGET's head,
+  // so it must see the TRELLIS one too, and compute with it packed rather than
+  // widen it -- which is what upstream does without a branch, because its head
+  // is an `nn.Module` and `_apply_head` calls `lm_head.quant_method.apply`
+  // (logits_processor.py:132-142). NULL on the MoE target: `Qwen3_5MoeWeights`
+  // has no EXL3 head owner, and an absent field is said out loud here rather
+  // than added as something nothing fills.
+  const Exl3Weight* lm_head_exl3() const { return lm_head_exl3_; }
 
   // input_ids/positions and target_hidden_states all have T rows. The target
   // hidden states are the target model's post-final-norm bf16 output, matching
@@ -145,6 +180,7 @@ class Qwen3_5MTPModel {
   const OwnedTensor* embed_tokens_ = nullptr;
   const OwnedTensor* lm_head_ = nullptr;
   const Nvfp4Weight* lm_head_fp4_ = nullptr;
+  const Exl3Weight* lm_head_exl3_ = nullptr;
 };
 
 }  // namespace vllm

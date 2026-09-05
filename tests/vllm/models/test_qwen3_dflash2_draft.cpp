@@ -81,6 +81,7 @@
 #include "vllm/entrypoints/model_loader.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"  // #2495 item 6: vt::Exl3DequantLinear, for the decoded twin
 
 // SPEC-DFLASH2 (#1919): the draft context store's capacity is a REQUIRED
 // argument now, resolved in production from the engine's own `max_model_len`
@@ -1227,6 +1228,94 @@ std::vector<StEntry> Bf16LmHeadEntries(int64_t V, int64_t H, double seed) {
   return {StEntry{"lm_head.weight", {V, H}, Fill(V * H, seed, 0.3)}};
 }
 
+// ─── The EXL3 SHARED HEAD — MODEL-QWEN35-EXL3-HEAD (#2495 item 6) ────────────
+//
+// `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships `lm_head.{trellis,suh,svh,mul1}`
+// and NO `lm_head.weight`: k=5120, n=248320, bits 6, codebook 2, read from its
+// safetensors header by range request (#2569). The draft owns no head and runs
+// the target's, so this is the third storage form its shared read has to take.
+//
+// Held once and written TWO ways -- as the trellis, and as the SAME bytes
+// decoded into a bf16 `.weight` -- so the forward comparison below is an
+// equivalence between two readings of one head rather than a tolerance between
+// two heads.
+constexpr int kExl3HeadBits = 4;
+constexpr int kExl3HeadCodebook = 2;  // `mul1`, the artifact's own
+constexpr uint32_t kExl3Mul1Multiplier = 0x83DCD12DU;
+
+struct Exl3Head {
+  int64_t k = 0, n = 0;
+  std::vector<uint16_t> trellis, suh, svh;
+};
+
+Exl3Head MakeExl3Head(int64_t V, int64_t H) {
+  Exl3Head p;
+  p.k = H;
+  p.n = V;
+  uint32_t s = 0x51ED270Fu;
+  auto next = [&s] {
+    s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s;
+  };
+  p.trellis.resize(static_cast<size_t>(H / 16) * static_cast<size_t>(V / 16) *
+                   16 * kExl3HeadBits);
+  for (auto& w : p.trellis) w = static_cast<uint16_t>(next() & 0xffffu);
+  p.suh.resize(static_cast<size_t>(H));
+  p.svh.resize(static_cast<size_t>(V));
+  // Sign vectors, which is what they are: +-1 in fp16 (`exl3.py:48-49`).
+  for (auto& v : p.suh) v = vt::F32ToF16((next() & 1u) != 0u ? 1.0F : -1.0F);
+  for (auto& v : p.svh) v = vt::F32ToF16((next() & 1u) != 0u ? 1.0F : -1.0F);
+  return p;
+}
+
+std::vector<uint8_t> RawBytes16(const std::vector<uint16_t>& v) {
+  std::vector<uint8_t> b(v.size() * 2);
+  std::memcpy(b.data(), v.data(), b.size());
+  return b;
+}
+
+std::vector<StEntry> Exl3LmHeadEntries(const Exl3Head& p) {
+  std::vector<uint8_t> mul1(4);
+  std::memcpy(mul1.data(), &kExl3Mul1Multiplier, 4);
+  return {
+      StEntry{"lm_head.trellis", {p.k / 16, p.n / 16, 16 * kExl3HeadBits}, "I16",
+              RawBytes16(p.trellis)},
+      StEntry{"lm_head.suh", {p.k}, "F16", RawBytes16(p.suh)},
+      StEntry{"lm_head.svh", {p.n}, "F16", RawBytes16(p.svh)},
+      StEntry{"lm_head.mul1", {1}, "I32", mul1},
+  };
+}
+
+// The decoded twin. `Exl3DequantLinear` yields [k, n]; a torch Linear stores
+// [out, in] = [n, k], which is the raw-NK layout the bf16 arm reads.
+std::vector<StEntry> Exl3DecodedLmHeadEntries(const Exl3Head& p) {
+  std::vector<float> w(static_cast<size_t>(p.k) * static_cast<size_t>(p.n), 0.0F);
+  vt::Exl3DequantLinear(p.trellis.data(), p.suh.data(), p.svh.data(), p.k, p.n,
+                        kExl3HeadBits, kExl3HeadCodebook, w.data());
+  std::vector<uint16_t> bf(static_cast<size_t>(p.k) * static_cast<size_t>(p.n));
+  for (int64_t i = 0; i < p.n; ++i)
+    for (int64_t j = 0; j < p.k; ++j)
+      bf[static_cast<size_t>(i) * static_cast<size_t>(p.k) + static_cast<size_t>(j)] =
+          vt::F32ToBF16(w[static_cast<size_t>(j) * static_cast<size_t>(p.n) +
+                          static_cast<size_t>(i)]);
+  return {StEntry{"lm_head.weight", {p.n, p.k}, bf}};
+}
+
+// EVERY EXL3 K and N is a multiple of 128: each side carries a blockwise
+// Hadamard-128 at quantization time (`exl3_lib/quantize.py:15`) and the
+// reference dequant declines anything else. That is what sizes `H` and `vocab`
+// here, and it is the artifact's constraint rather than this fixture's taste.
+Dims Exl3Dims() {
+  Dims dm = Dflash2Dims(/*muse_glimmer_scalars=*/false);
+  dm.H = 128;
+  dm.Hq = 8;
+  dm.Hkv = 2;
+  dm.Dh = 16;
+  dm.I = 64;
+  dm.vocab = 128;
+  dm.conv_group = 4;
+  return dm;
+}
+
 std::vector<vllm::SafetensorsFile> OpenShards(const ScratchCkpt& ck) {
   std::vector<vllm::SafetensorsFile> shards;
   shards.push_back(vllm::SafetensorsFile::Open(ck.shard()));
@@ -1981,7 +2070,8 @@ TEST_CASE("dflash2 shared lm_head: a NVFP4 target head is loaded PACKED, never w
 
   vllm::OwnedTensor bf16;
   vllm::Nvfp4Weight packed;
-  vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+  vllm::Exl3Weight trellis;  // #2495 item 6: the third owner, always offered
+  vllm::LoadDflashSharedLmHead(shards, &bf16, &packed, &trellis);
 
   CHECK(bf16.Empty());  // exactly ONE owner, as the target's own head has
   REQUIRE_FALSE(packed.Empty());
@@ -2022,7 +2112,8 @@ TEST_CASE("dflash2 shared lm_head: the BF16 arm is byte-unchanged (the DFlash1 l
 
   vllm::OwnedTensor bf16;
   vllm::Nvfp4Weight packed;
-  vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+  vllm::Exl3Weight trellis;  // #2495 item 6: the third owner, always offered
+  vllm::LoadDflashSharedLmHead(shards, &bf16, &packed, &trellis);
 
   CHECK(packed.Empty());
   REQUIRE_FALSE(bf16.Empty());
@@ -2037,7 +2128,8 @@ TEST_CASE("dflash2 shared lm_head: the BF16 arm is byte-unchanged (the DFlash1 l
   // A lane that CANNOT hold a packed head (DSpark passes `head_fp4 = nullptr`)
   // still gets the bf16 arm unchanged.
   vllm::OwnedTensor bf16_only;
-  vllm::LoadDflashSharedLmHead(shards, &bf16_only, /*head_fp4=*/nullptr);
+  vllm::LoadDflashSharedLmHead(shards, &bf16_only, /*head_fp4=*/nullptr,
+                               /*head_exl3=*/nullptr);
   REQUIRE(bf16_only.bytes.size() == bf16.bytes.size());
   CHECK(std::memcmp(bf16_only.bytes.data(), bf16.bytes.data(),
                     bf16.bytes.size()) == 0);
@@ -2091,7 +2183,8 @@ TEST_CASE("dflash2 shared lm_head (W9): the bf16 arm BORROWS the shard mapping")
     const ScopedDirectUpload on(true);
     vllm::OwnedTensor bf16;
     vllm::Nvfp4Weight packed;
-    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    vllm::Exl3Weight trellis;  // #2495 item 6: the third owner, always offered
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed, &trellis);
     CHECK(packed.Empty());
     REQUIRE_FALSE(bf16.Empty());
     CHECK(bf16.nk);
@@ -2106,7 +2199,8 @@ TEST_CASE("dflash2 shared lm_head (W9): the bf16 arm BORROWS the shard mapping")
     const ScopedDirectUpload off(false);
     vllm::OwnedTensor bf16;
     vllm::Nvfp4Weight packed;
-    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    vllm::Exl3Weight trellis;  // #2495 item 6: the third owner, always offered
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed, &trellis);
     REQUIRE_FALSE(bf16.Empty());
     CHECK(bf16.nk);
     CHECK_FALSE(AliasesMapping(bf16, src));
@@ -2191,9 +2285,10 @@ TEST_CASE("dflash2 shared lm_head: a DEQUANTIZED-ONLY storage form is STILL refu
 
   vllm::OwnedTensor bf16;
   vllm::Nvfp4Weight packed;
+  vllm::Exl3Weight trellis;  // #2495 item 6: the third owner, always offered
   std::string what;
   try {
-    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed);
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed, &trellis);
     FAIL("expected a refusal for an FP8 target lm_head");
   } catch (const std::exception& e) {
     what = e.what();
@@ -2225,7 +2320,8 @@ TEST_CASE("dflash2 selector: a PACKED target lm_head gives the TARGET'S OWN top-
   const ScratchCkpt target(head.entries);
   // What `LoadDflashDraft` does: the draft's own `lm_head` is REPLACED by the
   // target's, and the draft vocabulary comes from whichever owner holds it.
-  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4);
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4,
+                               &w.lm_head_exl3);
   REQUIRE_FALSE(w.lm_head_fp4.Empty());
   REQUIRE(w.lm_head.Empty());
   w.draft_vocab_size = w.lm_head_fp4.n;
@@ -2255,7 +2351,7 @@ TEST_CASE("dflash2 selector: a PACKED target lm_head gives the TARGET'S OWN top-
   const Fp4Head head2 = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/1);
   const ScratchCkpt target2(head2.entries);
   vllm::LoadDflashSharedLmHead(OpenShards(target2), &other.lm_head,
-                               &other.lm_head_fp4);
+                               &other.lm_head_fp4, &other.lm_head_exl3);
   other.draft_vocab_size = other.lm_head_fp4.n;
   std::vector<float> hidden2;
   const std::vector<float> logits2 =
@@ -2287,7 +2383,8 @@ TEST_CASE("dflash2 selector: a PACKED head is ADMITTED and a DEQUANTIZED one is 
   Qwen3DFlashWeights w = LoadDraft(draft_ck, dm, c);
   const Fp4Head head = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/0);
   const ScratchCkpt target(head.entries);
-  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4);
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4,
+                               &w.lm_head_exl3);
   w.draft_vocab_size = w.lm_head_fp4.n;
 
   CHECK_FALSE(w.lm_head_dequantized);
@@ -2312,7 +2409,8 @@ TEST_CASE("dflash2 draft logits: a W4A4 shared head is REFUSED, not silently rer
   Qwen3DFlashWeights w = LoadDraft(draft_ck, dm, c);
   const Fp4Head head = MakeNvfp4LmHead(dm.vocab, dm.H, /*variant=*/0);
   const ScratchCkpt target(head.entries);
-  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4);
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4,
+                               &w.lm_head_exl3);
   w.draft_vocab_size = w.lm_head_fp4.n;
   REQUIRE_FALSE(w.lm_head_fp4.IsTrueW4A4());
 
@@ -3103,4 +3201,85 @@ TEST_CASE("dflash2 W8: the device aux pre-phase == the host aux pre-phase, store
       sd, ctx_cu, ids, pos, cu, w, c, q);
   REQUIRE_FALSE(out_host.empty());
   CHECK(out_host == out_dev);
+}
+
+// ─── The TRELLIS shared head, computed with — #2495 item 6 ──────────────────
+//
+// The draft owns no head: it runs the TARGET's over its own hidden states. This
+// is that read and that GEMM for the third storage form, and it is the case the
+// benchmark target actually is -- `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships no
+// `lm_head.weight` at all, so before this row the shared read had nothing to
+// return and said nothing about it (#2569).
+//
+// THE REFERENCE IS THE SAME BYTES DECODED, not the same helper called twice. A
+// case that compared `DflashLogitsF32D`'s trellis arm against a second call to
+// `dense_exl3::Linear` would prove the two calls agree and nothing about the
+// decode.
+TEST_CASE("dflash2 shared lm_head: an EXL3 target head is COMPUTED WITH, packed") {
+  const Dims dm = Exl3Dims();
+  const ScratchCkpt draft_ck(DraftEntries(dm));
+  const HfConfig c = DraftConfig(dm);
+  const Exl3Head head = MakeExl3Head(dm.vocab, dm.H);
+
+  Qwen3DFlashWeights w = LoadDraft(draft_ck, dm, c);
+  REQUIRE(w.IsDflash2());
+  const ScratchCkpt target(Exl3LmHeadEntries(head));
+  // What `LoadDflashDraft` does: the draft's own `lm_head` is REPLACED by the
+  // target's, and the draft vocabulary comes from whichever owner holds it --
+  // `OutFeatures()` on this arm, which is the trellis geometry and not a
+  // declared number.
+  vllm::LoadDflashSharedLmHead(OpenShards(target), &w.lm_head, &w.lm_head_fp4,
+                               &w.lm_head_exl3);
+  REQUIRE_FALSE(w.lm_head_exl3.Empty());
+  REQUIRE(w.lm_head.Empty());
+  REQUIRE(w.lm_head_fp4.Empty());
+  CHECK(w.lm_head_exl3.codebook == kExl3HeadCodebook);
+  CHECK(w.lm_head_exl3.Bits() == kExl3HeadBits);
+  CHECK(w.lm_head_exl3.InFeatures() == dm.H);
+  CHECK(w.lm_head_exl3.OutFeatures() == dm.vocab);
+  w.draft_vocab_size = w.lm_head_exl3.OutFeatures();
+  CHECK(w.draft_vocab_size == dm.vocab);
+
+  // THE FORWARD. `DflashLogitsF32D`'s trellis arm, entered from the draft's own
+  // block forward. Deleting that arm does not merely move the numbers: the
+  // packed case falls through to a `lm_head` an EXL3 read leaves EMPTY, which
+  // the named refusal one line down reports.
+  const std::vector<float> logits = Forward(w, c, dm.block);
+  REQUIRE(logits.size() == static_cast<size_t>(dm.block * dm.vocab));
+  for (const float x : logits) REQUIRE(std::isfinite(x));
+
+  // The twin: the SAME trellis bytes decoded to a dense bf16 head, read through
+  // the bf16 arm of the same function, run through the same forward.
+  Qwen3DFlashWeights twin = LoadDraft(draft_ck, dm, c);
+  const ScratchCkpt target_bf16(Exl3DecodedLmHeadEntries(head));
+  vllm::LoadDflashSharedLmHead(OpenShards(target_bf16), &twin.lm_head,
+                               &twin.lm_head_fp4, &twin.lm_head_exl3);
+  REQUIRE_FALSE(twin.lm_head.Empty());
+  REQUIRE(twin.lm_head_exl3.Empty());
+  twin.draft_vocab_size = twin.lm_head.shape[0];
+  const std::vector<float> reference = Forward(twin, c, dm.block);
+  REQUIRE(reference.size() == logits.size());
+
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < logits.size(); ++i) {
+    const double d = static_cast<double>(logits[i]) - reference[i];
+    num += d * d;
+    den += static_cast<double>(reference[i]) * reference[i];
+  }
+  // NOT VACUOUS: a forward returning zeros satisfies any relative bound whose
+  // reference is also zero.
+  REQUIRE(den > 0.0);
+  const double rel = std::sqrt(num / den);
+  MESSAGE("dflash exl3 shared head vs decoded twin: rel_rms = ", rel);
+  // A BOUND, not an equality: EXL3 rides the Hadamards on the activations while
+  // the decoded twin has them baked in, and the twin rounds the decode to bf16.
+  CHECK(rel <= 5.0e-2);
+
+  // The D12 guard is untouched. A packed head is COMPUTED WITH, which is the
+  // opposite of the widened state `lm_head_dequantized` records.
+  CHECK_FALSE(w.lm_head_dequantized);
+  CHECK_NOTHROW(vllm::RefuseQuantizedDflash2LmHead(w));
+  Qwen3DFlashWeights widened = w;
+  widened.lm_head_dequantized = true;
+  CHECK_THROWS(vllm::RefuseQuantizedDflash2LmHead(widened));
 }

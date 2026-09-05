@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/device.h"           // vt::DeviceType, for the ActDType resolver
 #include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 #include "vt/tensor.h"
 
@@ -225,6 +226,22 @@ struct GdnMixedQkvDTypeInputs {
   bool fp8_merged_arm = false;
   vt::DType in_dtype = vt::DType::kF32;       // GdnInDType()
   vt::DType fp8_out_dtype = vt::DType::kF32;  // the fp8 in_proj epilogue's dtype
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4). `w.in_proj_qkv_exl3` populated, i.e.
+  // ProjectGdnQkvz takes the trellis arm.
+  //
+  // EXTENDED here rather than left to the fallthrough, because the fallthrough
+  // is a DEFAULT and this is a statement. The predictor names every arm the
+  // projection has, so the two branch orders can be read against each other; an
+  // arm resolved by "whatever is left" is how the deleted
+  // `in_proj_qkv_fp8.Empty()` proxy above came to stand for a dtype question it
+  // could not answer.
+  //
+  // LAST, and defaulted, so the existing aggregate initializers keep their
+  // meaning. At today's dtypes this answers `in_dtype`, exactly as the trailing
+  // default does, so no test can separate the two; that is recorded rather than
+  // hidden. The branch earns its place when the trellis arm's epilogue dtype
+  // moves, which is the same event that moves `ProjectGdnQkvz`'s EXL3 rung.
+  bool has_exl3_qkv_owner = false;
 };
 
 vt::DType GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in);
@@ -319,6 +336,24 @@ bool GdnOutBf16FlagIsOn(const char* env_value);
 // SAME binary is registered a second time with `VT_GDN_OUT_BF16=0`, and the case
 // asserts against the environment as it reads it directly.
 vt::DType GdnOutDType();
+
+// #2534. The qwen35 trunk's ONE resolved activation dtype, and the parser that
+// feeds it, declared here for exactly the reason `GdnOutDType` is: a gate that
+// can only reach the parser cannot see a resolver that has been severed from it,
+// and this lever is the denominator of the Q4_K_M arm's same-binary A/B.
+//
+// `ActF32FlagIsOn` is opt-IN (only a leading '1' turns it on), the OPPOSITE
+// polarity to `GdnOutBf16FlagIsOn`, because turning it on changes numerics on a
+// shipped path and the default must be the behaviour every recorded measurement
+// was taken under. `ActDType` answers BF16 for every device type when the flag
+// is off, and F32 only for a CPU device type when it is on -- so a test that
+// asserts the CUDA answer is unchanged is a real assertion and not a tautology.
+// The getenv is cached in a function-local static, so one process observes one
+// value; the second registration of the same binary under `VT_ACT_F32=1` is what
+// exercises the other arm, as tests/CMakeLists.txt already does for
+// `VT_GDN_OUT_BF16`.
+bool ActF32FlagIsOn(const char* env_value);
+vt::DType ActDType(vt::DeviceType dev_type);
 
 // W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is
@@ -587,6 +622,25 @@ DeviceTokenIds TakeDeviceTokenIds();
 // byte-identical to its pre-#1305 self.
 bool ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue, void* dst,
                          int64_t dst_count, const char* what);
+
+// THE SAME SPLICE, over identifiers the caller was handed EXPLICITLY rather than
+// through the thread-local override.
+//
+// ENG-MM-EMBED-DEVICE-IDS (#2730). `ModelRegistry::EmbedMm` runs BEFORE the
+// forward, from `GPUModelRunner::execute_model`, so no `DeviceTokenIdsScope` is
+// live when a multimodal `embed_mm` hook reaches its identifier buffer -- the
+// scope is documented as set ONLY from the registry entry points that receive a
+// `ModelForwardInput`, and the runner's channel to that hook is
+// `MmEmbedInputs`. The publisher differs; the splice must not.
+//
+// So the seam is EXTENDED rather than copied: this is the body, and the entry
+// point above is one line that passes `TakeDeviceTokenIds()` into it. One bounds
+// check, one `Copy`, one queue argument -- which is what makes a mutation of any
+// of the three turn BOTH the text gates and the multimodal gate red instead of
+// one of them.
+bool ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue, void* dst,
+                         int64_t dst_count, DeviceTokenIds ids,
+                         const char* what);
 
 // ─── ENG-EXPERT-STREAM (#912): the streamed-expert lane, seen from outside ───
 //

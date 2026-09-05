@@ -9,7 +9,10 @@
 // own value-exact case here:
 //
 //   (a) the file stores `attn_q` / `attn_k` / `attn_v` SEPARATELY and W2 wants
-//       one fused `qkv_weight [3*hidden, hidden]`;
+//       one fused `qkv_weight [3*hidden, hidden]`. THE SPLIT IS THIS FILE'S,
+//       not the family's: the pinned `convert_hf_to_gguf.py` emits the FUSED
+//       `v.blk.{bid}.attn_qkv` instead, which this build does not implement and
+//       refuses by name;
 //   (b) the file stores `ffn_gate` and `ffn_up` SEPARATELY and W2 wants one
 //       `mlp_w1_weight [2*intermediate, hidden]`;
 //   (c) `v.patch_embd.weight` is a 4-D conv2d weight and W2 wants a 2-D torch
@@ -18,6 +21,9 @@
 //   (d) the file stores every 1-D tensor and the patch embedding as F32 while
 //       W2's contract says RMSNorm weights stay f32 and every linear weight and
 //       bias is the model dtype.
+//
+// It also gates the refusals: the unimplemented fused arm, an out-of-range
+// geometry, a wrong shape, and a projector that declares no activation.
 //
 // It does NOT prove that anything reaches this reader. W4 owns the production
 // call site for row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, and the

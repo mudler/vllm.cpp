@@ -66,6 +66,16 @@ struct DeepSeekV4VisionWeights {
   vt::Tensor aligner_w2_bias;    // model dtype [output]
 };
 
+// One internal scratch buffer's declared storage dtype, recorded in allocation
+// order. AGENTS.md, "Inherit vLLM defaults": a token gate CANNOT detect a dtype
+// that is too wide, because the values still match while the path moves twice
+// the bytes. Widening the attention-output buffer to f32 left every stage
+// golden green, so the memory format needs its own assertion.
+struct DeepSeekV4VisionScratchDType {
+  const char* name = nullptr;
+  vt::DType dtype = vt::DType::kBF16;
+};
+
 // Optional device-tensor captures for parity gates. Production passes nullptr
 // and performs no stage copies. A non-null tensor must have the documented
 // contiguous shape, the model dtype, and the queue device.
@@ -76,7 +86,15 @@ struct DeepSeekV4VisionCapture {
   vt::Tensor* aligner_unfold = nullptr;         // [aligned_rows, hidden*r^2]
   vt::Tensor* aligner_hidden = nullptr;         // [aligned_rows, output]
   vt::Tensor* aligner_gelu = nullptr;           // [aligned_rows, output]
+
+  // Non-null: the forward appends one entry per internal scratch buffer it
+  // allocates, in allocation order, so a test can assert the memory format of
+  // the model path. The vision stage CLEARS it and the aligner stage APPENDS,
+  // so a whole Forward records both stages as one sequence and an aligner call
+  // on its own adds to whatever the caller's vector already holds.
+  std::vector<DeepSeekV4VisionScratchDType>* scratch_dtypes = nullptr;
 };
+
 
 // Host f32 oracle helper. For each patch row it returns head_dim/2 values per
 // table: all height frequencies first, then all width frequencies, exactly as

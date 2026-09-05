@@ -655,3 +655,149 @@ TEST_CASE("DeepSeek-V4 aligner emits merged cells in llama.cpp row-major order")
   }
   backend.DestroyQueue(queue);
 }
+
+// W2 repair, F4 (#2411). THE MEMORY FORMAT OF THE MODEL PATH.
+//
+// AGENTS.md, "Inherit vLLM defaults": a token gate CANNOT detect a dtype that is
+// too wide. Widening the attention-output buffer to f32 left every stage golden
+// green, because `vt::MatmulBT` and `vt::Add` accept the mix and the VALUES are
+// unchanged while the path moves twice the bytes. This case reads the dtypes the
+// forward actually allocated, so the width is asserted rather than assumed.
+//
+// The two f32 entries are the documented exceptions and keep their reason: the
+// pinned `apply_rotary` widens q and k before multiplying by its f32 cos/sin
+// table and narrows once afterward. The RoPE cos/sin cache itself is f32 for the
+// same reason and lives in the geometry cache, not in this per-call list.
+TEST_CASE("DeepSeek-V4 vision keeps the model path bf16 except the rotary scratch") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  TensorStore store(backend, queue);
+  DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+  Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                              {10, config.patch_dim()});
+  Tensor output = store.Empty(config.compute_dtype, {2, config.output_size});
+
+  std::vector<vllm::multimodal::DeepSeekV4VisionScratchDType> scratch;
+  DeepSeekV4VisionCapture capture;
+  capture.scratch_dtypes = &scratch;
+  model.Forward(queue, output, patches, 2, 5, &capture);
+
+  const std::vector<std::pair<std::string, DType>> expected = {
+      {"vision.hidden_state", DType::kBF16},
+      {"vision.normalized", DType::kBF16},
+      {"vision.query", DType::kBF16},
+      {"vision.key", DType::kBF16},
+      {"vision.value", DType::kBF16},
+      {"vision.attention", DType::kBF16},
+      {"vision.projected", DType::kBF16},
+      {"vision.rope_query_f32", DType::kF32},
+      {"vision.rope_key_f32", DType::kF32},
+      {"vision.mlp_gate_up_activated", DType::kBF16},
+      {"aligner.padded", DType::kBF16},
+      {"aligner.unfolded", DType::kBF16},
+      {"aligner.hidden_state", DType::kBF16},
+  };
+  REQUIRE(scratch.size() == expected.size());
+  int f32_entries = 0;
+  for (size_t i = 0; i < expected.size(); ++i) {
+    CAPTURE(i);
+    CAPTURE(expected[i].first);
+    REQUIRE(scratch[i].name != nullptr);
+    CHECK(std::string(scratch[i].name) == expected[i].first);
+    CHECK(scratch[i].dtype == expected[i].second);
+    if (scratch[i].dtype == DType::kF32) ++f32_entries;
+  }
+  // Stated from the other end so a NEW f32 buffer cannot be added silently:
+  // exactly two, and both are the rotary pair.
+  CHECK(f32_entries == 2);
+  CHECK(model.config().compute_dtype == DType::kBF16);
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F5 (#2411). PER-LAYER SCRATCH IS HOISTED, and that is now measured
+// at the only observable that can see it.
+//
+// The allocation case above compares driver Alloc counts and pool statistics
+// across TWO Forward calls at one shape. A per-layer pooled Get/Put inside a
+// single call reuses the same warm block, so moving a buffer into the block loop
+// changes neither, and it stayed green. Measured on this tree, one Forward from
+// a drained pool, hoisted against un-hoisted:
+//
+//   depth 2   17 gets (13 misses, 4 hits)   vs   18 gets (13 misses,  5 hits)
+//   depth 4   21 gets (13 misses, 8 hits)   vs   24 gets (13 misses, 11 hits)
+//   depth 8   29 gets (13 misses, 16 hits)  vs   36 gets (13 misses, 23 hits)
+//
+// `misses` is 13 in BOTH forms at every depth, so bounding misses alone cannot
+// see this defect: the fixed working set is the same either way and the pool
+// serves every extra request from its own free list. What separates them is the
+// pool GET traffic PER LAYER, which is 2 hoisted and 3 un-hoisted. At the
+// production depth of 32 the un-hoisted form is 32 extra pool round trips per
+// image, invisibly.
+//
+// The slope is 2 because the shared MlpGateUpMethodBase seam legitimately owns
+// two per-layer buffers, the merged gate_up output and the activation it returns
+// (`UnquantizedMlpGateUpMethod::Apply`). Everything this file allocates is
+// hoisted, so it contributes 0 to the slope.
+TEST_CASE("DeepSeek-V4 vision allocates no per-layer scratch of its own") {
+  // The two per-layer buffers the shared MLP seam owns, and nothing else.
+  constexpr uint64_t kPerLayerPooledBuffers = 2;
+
+  Backend& inner = vt::GetBackend(vt::DeviceType::kCPU);
+  CountingBackend backend(inner);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+
+  struct Reading {
+    uint64_t gets = 0;
+    uint64_t misses = 0;
+  };
+  auto measure = [&](int64_t depth) {
+    DeepSeekV4VisionConfig config = Config(fixture);
+    TensorStore store(backend, queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    while (static_cast<int64_t>(weights.blocks.size()) < depth) {
+      weights.blocks.push_back(weights.blocks[0]);
+    }
+    config.depth = depth;
+    DeepSeekV4Vision model(backend, config, std::move(weights));
+    Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                                {10, config.patch_dim()});
+    Tensor output = store.Empty(config.compute_dtype, {2, config.output_size});
+    // Drain AFTER the weights are staged so the reading covers the forward only.
+    vllm::Pool(backend).Drain(backend);
+    const auto before = vllm::Pool(backend).stats();
+    model.Forward(queue, output, patches, 2, 5);
+    backend.Synchronize(queue);
+    const auto after = vllm::Pool(backend).stats();
+    Reading reading;
+    reading.misses = after.misses - before.misses;
+    reading.gets = reading.misses + (after.hits - before.hits);
+    return reading;
+  };
+
+  const int64_t shallow = Config(fixture).depth;
+  REQUIRE(shallow >= 1);
+  const Reading at_shallow = measure(shallow);
+  const Reading at_deep = measure(2 * shallow);
+
+  // The fixed working set does not scale with depth. This is the bound the
+  // review asked for, and it holds; it is kept because it is true and useful,
+  // not because it can see the defect below.
+  CHECK(at_deep.misses == at_shallow.misses);
+
+  // The bound that CAN see it: pool traffic per layer.
+  REQUIRE(at_deep.gets >= at_shallow.gets);
+  const uint64_t per_layer =
+      (at_deep.gets - at_shallow.gets) / static_cast<uint64_t>(shallow);
+  CHECK(per_layer == kPerLayerPooledBuffers);
+  // Exactly divisible, so the slope is a real per-layer count and not a rounded
+  // one.
+  CHECK((at_deep.gets - at_shallow.gets) %
+            static_cast<uint64_t>(shallow) == 0);
+
+  backend.DestroyQueue(queue);
+}

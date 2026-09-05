@@ -182,6 +182,15 @@ void CopyTensor(Backend& backend, Queue& queue, Tensor* destination,
                static_cast<size_t>(source.Numel()) * vt::SizeOf(source.dtype));
 }
 
+// Record one internal scratch buffer's declared dtype. See
+// DeepSeekV4VisionScratchDType: a value gate cannot see a buffer that is too
+// wide, so the memory format is reported and asserted separately.
+void RecordScratch(DeepSeekV4VisionCapture* capture, const char* name,
+                   const Tensor& buffer) {
+  if (capture == nullptr || capture->scratch_dtypes == nullptr) return;
+  capture->scratch_dtypes->push_back({name, buffer.dtype});
+}
+
 void ValidateCaptureTensor(const Tensor* tensor, DType dtype,
                            const std::vector<int64_t>& shape,
                            vt::Device device, const char* name) {
@@ -562,6 +571,24 @@ class DeepSeekV4Vision::Impl {
       key_f32 = DBuf(device, DType::kF32, {tokens, hidden});
     }
 
+    // The memory format of the model path, in allocation order. Everything the
+    // tower carries between operations is the model dtype; the two rotary
+    // buffers are the only f32 entries and they have the reason above.
+    if (capture != nullptr && capture->scratch_dtypes != nullptr) {
+      capture->scratch_dtypes->clear();
+    }
+    RecordScratch(capture, "vision.hidden_state", hidden_state.t());
+    RecordScratch(capture, "vision.normalized", normalized.t());
+    RecordScratch(capture, "vision.query", query.t());
+    RecordScratch(capture, "vision.key", key.t());
+    RecordScratch(capture, "vision.value", value.t());
+    RecordScratch(capture, "vision.attention", attention.t());
+    RecordScratch(capture, "vision.projected", projected.t());
+    if (config_.compute_dtype == DType::kBF16) {
+      RecordScratch(capture, "vision.rope_query_f32", query_f32.t());
+      RecordScratch(capture, "vision.rope_key_f32", key_f32.t());
+    }
+
     vt::RopeArgs rope_args;
     rope_args.rotary_dim = static_cast<int>(head_dim);
     rope_args.is_neox_style = true;
@@ -627,6 +654,11 @@ class DeepSeekV4Vision::Impl {
           &mlp_gate_up_weights_[static_cast<size_t>(layer_index)],
           intermediate);
       DBuf activated = gate_up_method.Apply(device, normalized.t());
+      // The shared seam owns this buffer; record it once so its width is
+      // asserted beside the buffers this file allocates.
+      if (layer_index == 0) {
+        RecordScratch(capture, "vision.mlp_gate_up_activated", activated.t());
+      }
       vt::MatmulBT(queue, projected.t(), activated.t(), layer.mlp_w2_weight);
       vt::Add(queue, hidden_state.t(), hidden_state.t(), projected.t());
 
@@ -671,6 +703,12 @@ class DeepSeekV4Vision::Impl {
 
     DBuf hidden_state(device, config_.compute_dtype,
                       {rows, config_.output_size});
+    // Appended, never cleared: a whole Forward records the vision stage first
+    // and then these, in one sequence. The aligner called on its own appends to
+    // whatever the caller's vector already holds.
+    RecordScratch(capture, "aligner.padded", padded.t());
+    RecordScratch(capture, "aligner.unfolded", unfolded.t());
+    RecordScratch(capture, "aligner.hidden_state", hidden_state.t());
     LinearBias(queue, hidden_state.t(), unfolded.t(),
                weights_.aligner_w1_weight, weights_.aligner_w1_bias);
     if (capture != nullptr) {

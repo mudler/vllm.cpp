@@ -1013,6 +1013,25 @@ i8mm fast path instead of fixing the loss. It is host-conditional
 (`vt::cpu::QuantRepackActive()` is true only on aarch64 i8mm) so no golden can
 move here, and W3A's mmproj reader is what makes it live rather than latent.
 
+**`ValidateTensor` has 21 call sites, not 15, and both groups are now driven.**
+Fifteen are the weight checks; five more sit behind `ValidateCaptureTensor`,
+whose entire body could be replaced by a no-op with the suite staying green,
+because the stage goldens pass CORRECT captures and exercise only the happy
+path. Neutering that helper now reds 13 of the 14 capture rows. The fourteenth,
+the block-capture count, stays green under that mutation and correctly so: it is
+a separate check in `ValidateVisionIo` rather than a `ValidateCaptureTensor`
+call. Those refusals are gate-facing rather than production-facing, since
+production passes nullptr and copies nothing, which is exactly why they needed
+driving: a capture contract nothing checks lets a future parity gate read a
+wrongly shaped buffer and compare whatever is in it.
+
+**Both coverage guards were proved non-vacuous rather than assumed to be.**
+A guard that passes because it asserts nothing is the same failure as the
+degenerate fixture it exists to prevent. Setting the new fixture's theta back to
+the 10000.0 default and regenerating reds the frequency guard at `0 >= 1`, and
+replacing its grids with a single (2,5) reds the row-order guard. The tree was
+restored and re-run at 14 of 14 cases and 7376 of 7376 assertions after both.
+
 **W4 must size against the geometry cache.** The `IndexSelect` gather index is
 `aligned_rows * hidden_size * downsample_ratio^2` i32 values per cached geometry.
 At the production `hidden_size` 1024 and ratio 3, a 73x73 patch grid gives

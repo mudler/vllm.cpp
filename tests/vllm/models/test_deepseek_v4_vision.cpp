@@ -1094,3 +1094,136 @@ TEST_CASE("DeepSeek-V4 vision refuses every mis-declared weight tensor") {
   }
   backend.DestroyQueue(queue);
 }
+
+// W2 repair, F6 continued (#2411). THE CAPTURE VALIDATIONS TOO.
+//
+// `ValidateTensor` has 21 call sites. Fifteen are the weight checks the table
+// above drives; five more sit behind `ValidateCaptureTensor`, and the whole body
+// of that helper could be replaced by a no-op with the suite staying green. The
+// stage goldens pass CORRECT captures, so they exercise the happy path and no
+// refusal.
+//
+// These are gate-facing rather than production-facing, because production passes
+// nullptr and copies nothing. That is precisely why they need driving: a capture
+// contract nothing checks lets a future parity gate read a wrongly shaped buffer
+// and compare whatever happens to be in it.
+TEST_CASE("DeepSeek-V4 vision refuses every mis-declared capture tensor") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  const int64_t height = 2;
+  const int64_t width = 5;
+  const int64_t patch_rows = height * width;
+  const int64_t output_rows = config.aligned_rows(height, width);
+
+  struct Case {
+    const char* label;
+    const char* message;
+    void (*corrupt)(CaptureTensors&, TensorStore&,
+                    const DeepSeekV4VisionConfig&, int64_t, int64_t);
+  };
+  const std::vector<Case> cases = {
+      {"patch capture dtype",
+       "DeepSeek-V4 vision patch capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) { c.patch = s.Empty(DType::kF32, {p, f.hidden_size}); }},
+      {"patch capture shape",
+       "DeepSeek-V4 vision patch capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.patch = s.Empty(f.compute_dtype, {p + 1, f.hidden_size});
+       }},
+      {"patch capture device",
+       "DeepSeek-V4 vision patch capture is on the wrong device",
+       [](CaptureTensors& c, TensorStore&, const DeepSeekV4VisionConfig&,
+          int64_t, int64_t) { c.patch.device.type = vt::DeviceType::kCUDA; }},
+      {"block capture dtype",
+       "DeepSeek-V4 vision block capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.blocks[1] = s.Empty(DType::kF32, {p, f.hidden_size});
+       }},
+      {"block capture shape",
+       "DeepSeek-V4 vision block capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.blocks[0] = s.Empty(f.compute_dtype, {p, f.hidden_size + 1});
+       }},
+      {"block capture count",
+       "DeepSeek-V4 vision block capture count must match depth",
+       [](CaptureTensors& c, TensorStore&, const DeepSeekV4VisionConfig&,
+          int64_t, int64_t) { c.capture.block_outputs.push_back(&c.patch); }},
+      {"final norm capture dtype",
+       "DeepSeek-V4 vision final norm capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.final_norm = s.Empty(DType::kF32, {p, f.hidden_size});
+       }},
+      {"final norm capture shape",
+       "DeepSeek-V4 vision final norm capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.final_norm = s.Empty(f.compute_dtype, {p + 1, f.hidden_size});
+       }},
+      {"unfold capture dtype",
+       "DeepSeek-V4 vision unfold capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.unfold = s.Empty(DType::kF32, {o, f.aligner_input_size()});
+       }},
+      {"unfold capture shape",
+       "DeepSeek-V4 vision unfold capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.unfold = s.Empty(f.compute_dtype, {o, f.aligner_input_size() + 1});
+       }},
+      {"aligner hidden capture dtype",
+       "DeepSeek-V4 vision aligner hidden capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.aligner_hidden = s.Empty(DType::kF32, {o, f.output_size});
+       }},
+      {"aligner hidden capture shape",
+       "DeepSeek-V4 vision aligner hidden capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.aligner_hidden = s.Empty(f.compute_dtype, {o + 1, f.output_size});
+       }},
+      {"aligner GELU capture dtype",
+       "DeepSeek-V4 vision aligner GELU capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.gelu = s.Empty(DType::kF32, {o, f.output_size});
+       }},
+      {"aligner GELU capture shape",
+       "DeepSeek-V4 vision aligner GELU capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.gelu = s.Empty(f.compute_dtype, {o, f.output_size + 1});
+       }},
+  };
+
+  for (const Case& one : cases) {
+    const std::string label(one.label);
+    CAPTURE(label);
+    TensorStore store(backend, queue);
+    DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+    Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                                {patch_rows, config.patch_dim()});
+    Tensor output = store.Empty(config.compute_dtype,
+                                {output_rows, config.output_size});
+    CaptureTensors captures(store, config, patch_rows, output_rows);
+    one.corrupt(captures, store, config, patch_rows, output_rows);
+    bool refused = false;
+    try {
+      model.Forward(queue, output, patches, height, width, &captures.capture);
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      CHECK(std::string(error.what()) == std::string(one.message));
+    }
+    CHECK(refused);
+  }
+  backend.DestroyQueue(queue);
+}

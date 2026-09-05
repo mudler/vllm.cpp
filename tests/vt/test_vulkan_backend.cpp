@@ -4340,3 +4340,157 @@ TEST_CASE("tq2_0 keep-quant dequantizer matches the shader's trit extraction") {
   CHECK(vt::BlockElems(DType::kTQ2_0) == 256);
   CHECK(vt::BlockBytes(DType::kTQ2_0) == 66);
 }
+// --- PR #2248 production reachability: loader routes TQ1_0 to keep-quant ---
+//
+// The blocking finding from the CHANGES_REQUESTED review (2026-08-31): the GGUF
+// loader expands TQ weights before MoeBlockVulkanTQ can receive them, so the
+// production path is unreachable. This test proves the opposite by entering
+// through the production loader — not by hand-constructing MoeBlockVulkanTQ.
+//
+// A synthetic maple GGUF with TQ1_0 expert towers is built, opened, and loaded
+// through LoadMapleFromGguf on a Vulkan device. The test asserts the expert
+// weights arrive as keep-quant blocks (expert_gate_kq populated, dtype kTQ1_0)
+// and NOT as expanded bf16 (expert_gate empty). That is the shape
+// MoeBlockVulkanTQ's `if (!w.expert_gate_kq.Empty())` branch consumes, and
+// the mutation that would falsify this test — flipping KeepQuantDType or
+// DeviceKeepQuantSupported to return false for TQ1_0 on Vulkan — is exactly the
+// defect the review names.
+#include "vllm/model_executor/models/maple.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/gguf_builder.h"
+
+TEST_CASE("loader routes TQ1_0 expert weights to keep-quant on Vulkan (production reachability)") {
+  if (!VulkanPresent()) {
+    MESSAGE("no Vulkan loader or no conformant device on this host; skipping");
+    return;
+  }
+
+  // The ops whose registration makes GgufQuantComputeAvailable(kVULKAN) return
+  // true, which is what flips keep_quant ON in GgufLoadPolicy::FromEnv. Without
+  // these, the loader expands TQ to bf16 — the unreachable state.
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kVULKAN));
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped,
+                           vt::DeviceType::kVULKAN));
+  REQUIRE(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped,
+                           vt::DeviceType::kVULKAN));
+
+  // Minimal maple model: 1 layer, 2 experts, H=256, I=256.
+  // H and I are 256 — exactly one TQ1_0 block wide — so every dimension is
+  // block-aligned (256 % 256 == 0).
+  constexpr int64_t H = 256, Hq = 4, Hkv = 2, Dh = 64;
+  constexpr int64_t E = 2, top_k = 1, I = 256;
+  constexpr int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
+  constexpr int64_t vocab = 256;
+  constexpr int64_t n_layers = 1;
+
+  gguf_test::GgufModelBuilder builder;
+
+  // KV keys (from MapleHfConfigFromGguf).
+  builder.AddKv(gguf_test::StrKv("general.architecture", "maple"));
+  builder.AddKv(gguf_test::U32Kv("maple.embedding_length", H));
+  builder.AddKv(gguf_test::U32Kv("maple.block_count", n_layers));
+  builder.AddKv(gguf_test::U32Kv("maple.attention.head_count", Hq));
+  builder.AddKv(gguf_test::U32Kv("maple.attention.head_count_kv", Hkv));
+  builder.AddKv(gguf_test::U32Kv("maple.attention.key_length", Dh));
+  builder.AddKv(gguf_test::U32Kv("maple.vocab_size", vocab));
+  builder.AddKv(gguf_test::U32Kv("maple.expert_count", E));
+  builder.AddKv(gguf_test::U32Kv("maple.expert_used_count", top_k));
+  builder.AddKv(gguf_test::U32Kv("maple.expert_feed_forward_length", I));
+  builder.AddKv(gguf_test::F32Kv("maple.attention.layer_norm_rms_epsilon",
+                                 1e-6f));
+  builder.AddKv(gguf_test::F32Kv("maple.rope.freq_base", 10000.0f));
+  builder.AddKv(gguf_test::U32Kv("maple.rope.dimension_count", Dh));
+
+  // Helpers for zero-filled tensor data.
+  auto f32_data = [](int64_t count) -> std::string {
+    return std::string(static_cast<size_t>(count) * 4, 0);
+  };
+  auto f16_data = [](int64_t count) -> std::string {
+    return std::string(static_cast<size_t>(count) * 2, 0);
+  };
+  // TQ1_0: 256 elements per 54-byte block (type id 34).
+  auto tq1_0_data = [](int64_t numel) -> std::string {
+    const int64_t blocks = numel / 256;
+    return std::string(static_cast<size_t>(blocks) * 54, 0);
+  };
+
+  // GGUF dims are ggml order: fastest/inner dim first.
+  // Non-expert tensors (F32, type 0).
+  builder.AddTensor("token_embd.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(vocab)},
+                    0, f32_data(vocab * H));
+  builder.AddTensor("output.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(vocab)},
+                    0, f32_data(vocab * H));
+  builder.AddTensor("output_norm.weight",
+                    {static_cast<uint64_t>(H)}, 0, f32_data(H));
+  builder.AddTensor("blk.0.attn_norm.weight",
+                    {static_cast<uint64_t>(H)}, 0, f32_data(H));
+  builder.AddTensor("blk.0.ffn_norm.weight",
+                    {static_cast<uint64_t>(H)}, 0, f32_data(H));
+  builder.AddTensor("blk.0.attn_q_norm.weight",
+                    {static_cast<uint64_t>(qdim)}, 0, f32_data(qdim));
+  builder.AddTensor("blk.0.attn_k_norm.weight",
+                    {static_cast<uint64_t>(kdim)}, 0, f32_data(kdim));
+  builder.AddTensor("blk.0.ffn_gate_inp.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(E)},
+                    0, f32_data(E * H));
+
+  // Attention projections (F16, type 1).
+  builder.AddTensor("blk.0.attn_q.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(qdim)},
+                    1, f16_data(qdim * H));
+  builder.AddTensor("blk.0.attn_k.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(kdim)},
+                    1, f16_data(kdim * H));
+  builder.AddTensor("blk.0.attn_v.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(kdim)},
+                    1, f16_data(kdim * H));
+  builder.AddTensor("blk.0.attn_output.weight",
+                    {static_cast<uint64_t>(qdim), static_cast<uint64_t>(H)},
+                    1, f16_data(H * qdim));
+
+  // Expert towers (TQ1_0, type 34).
+  // Logical [E, I, H] -> ggml dims [H, I, E].
+  const int64_t expert_numel = E * I * H;
+  builder.AddTensor("blk.0.ffn_gate_exps.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(I),
+                     static_cast<uint64_t>(E)},
+                    34, tq1_0_data(expert_numel));
+  builder.AddTensor("blk.0.ffn_up_exps.weight",
+                    {static_cast<uint64_t>(H), static_cast<uint64_t>(I),
+                     static_cast<uint64_t>(E)},
+                    34, tq1_0_data(expert_numel));
+  // down: logical [E, H, I] -> ggml dims [I, H, E].
+  builder.AddTensor("blk.0.ffn_down_exps.weight",
+                    {static_cast<uint64_t>(I), static_cast<uint64_t>(H),
+                     static_cast<uint64_t>(E)},
+                    34, tq1_0_data(expert_numel));
+
+  // Build, open, parse config, and load through the production loader.
+  std::string gguf_bytes = builder.Build();
+  gguf_test::TempFile file(gguf_bytes);
+
+  vllm::GgufFile gguf = vllm::GgufFile::Open(file.path());
+  vllm::HfConfig config = vllm::MapleHfConfigFromGguf(gguf);
+
+  // Load with Vulkan as the target device — this is the production path.
+  // nullptr policy => GgufLoadPolicy::FromEnv(kVULKAN), which is what the
+  // engine uses when it loads a maple GGUF on a Vulkan device.
+  vllm::MapleWeights w =
+      vllm::LoadMapleFromGguf(gguf, config, nullptr, vt::DeviceType::kVULKAN);
+
+  // THE PROOF: expert towers arrived as keep-quant blocks, not expanded bf16.
+  REQUIRE(w.layers.size() == 1);
+  REQUIRE_FALSE(w.layers[0].moe.expert_gate_kq.Empty());
+  REQUIRE_FALSE(w.layers[0].moe.expert_up_kq.Empty());
+  REQUIRE_FALSE(w.layers[0].moe.expert_down_kq.Empty());
+  CHECK(w.layers[0].moe.expert_gate_kq.dtype == vt::DType::kTQ1_0);
+  CHECK(w.layers[0].moe.expert_up_kq.dtype == vt::DType::kTQ1_0);
+  CHECK(w.layers[0].moe.expert_down_kq.dtype == vt::DType::kTQ1_0);
+  // The expanded bf16 arm is NOT populated — that would be the unreachable
+  // state the review found.
+  CHECK(w.layers[0].moe.expert_gate.empty());
+  CHECK(w.layers[0].moe.expert_up.empty());
+  CHECK(w.layers[0].moe.expert_down.empty());
+}

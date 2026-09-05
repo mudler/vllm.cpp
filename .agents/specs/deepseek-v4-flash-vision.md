@@ -650,6 +650,35 @@ a ceiling.
   types or the DeepSeek attention/KV seams: return `NEEDS_DECISION` with the
   unrepresentable behavior and the smallest seam extension.
 
+## The language-side tensor delta is closed, and it is 43 names
+
+Measured 2026-09-05 by range-reading all three `UD-IQ1_S` shard headers of
+`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` at revision
+`b977d3c0ea2da58dbc12ddae8fb8951a7b3854d0` and diffing the 1371 names against
+`scripts/dsv4_gguf_manifest_names.txt`, the 1328-name manifest that
+`scripts/check-dsv4-gguf-namemap.py` already pins for the TEXT artifact
+`unsloth/DeepSeek-V4-Flash-GGUF`:
+
+| Direction | Count | Names |
+|---|---:|---|
+| in vision, not in text | 43 | `blk.N.exp_probs_b_vl.bias`, `N` in 0..42 |
+| in text, not in vision | 0 | — |
+
+The two artifacts declare the same topology, so the counts are comparable:
+`block_count = 43`, `expert_count = 256`, `hash_layer_count = 3`, and an
+identical `attention.compress_ratios` array.
+
+This is a completeness result, not a convenience. It says the vision checkpoint's
+language half needs **nothing** from this port beyond the bias W3B loads, and
+that the entire tower, aligner and sentinel group lives in `mmproj-BF16.gguf`,
+which is W3A's scope. W4 therefore has no third unknown tensor family waiting for
+it. `scripts/dsv4_vision_gguf_manifest_names.txt` is the committed fixture.
+
+`check-dsv4-gguf-namemap.py` asserts EXACT set-equality against the text
+manifest, so it cannot see this artifact at all today. Extending it to the vision
+manifest is a semantic checker change and is owed below, with the measurement
+above as its red-before input.
+
 ## Owed
 
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
@@ -657,6 +686,12 @@ a ceiling.
   hashes above, is owed by issue #2411 and W3.
 - The first `llama-cpp-dsv4vision` build and run is owed by issue #2411; the
   oracle file records `gateable = no` until then.
+- `scripts/check-dsv4-gguf-namemap.py` is owed the vision manifest. It generates
+  1328 expected names and asserts exact set-equality, so the 1371-name vision
+  artifact fails it by construction and no gate covers the shipped vehicle's
+  language half. The fixture is committed; the checker change is not made here
+  because it is a semantic checker change and needs its own red-before evidence.
+  Issue #2411 and W3 own it.
 - `exp_probs_b_vl` accounting and per-token selection are owed by W3 and W4. The
   non-causal image-span window is owed by W4. Neither existed in this spec before
   2026-09-05 and neither is implemented.

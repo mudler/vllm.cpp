@@ -2997,6 +2997,11 @@ endif()
 if(TARGET test_bench_kv_cache_dtype AND TARGET vllm-bench)
   add_dependencies(test_bench_kv_cache_dtype vllm-bench)
 endif()
+# #2759: the same ordering, for the same reason, for the EOS / chat-template
+# flag gate.
+if(TARGET test_bench_eos_chat_template AND TARGET vllm-bench)
+  add_dependencies(test_bench_eos_chat_template vllm-bench)
+endif()
 
 # Render the compiled-arch manifest (issue #1357). Last, so it observes whatever
 # the FA2 gencode site above did or did not set. Generated per build into the

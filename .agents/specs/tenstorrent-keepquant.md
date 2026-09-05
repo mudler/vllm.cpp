@@ -200,13 +200,15 @@ to make a failure pass.
 
 ## Now
 
-`ACTIVE`, 2026-09-05. W1 complete: the Q4_K block-decode device kernel
-(`KeepQuantDecodeKernel`, `tenstorrent_ops.cpp`) is bit-exact against
-`vt::cpu::BlockToFloat` on the full sweep (rows {1,3,17} x nb {1,2,16},
-memcmp-level, 53/53 cases green), with the signed-zero repair all-TILE:
-`ttnn::where` demands a TILE predicate and silently writes only its first 16
-elements when a TILE predicate is mixed with ROW_MAJOR branches; the f32
-{0,1}-mask multiply pred replaces `logical_and` (rank promotion of a broadcast
-predicate); m1 is repaired at its final {B,8,1} shape. Next: W2, the dot
-provider + `kTENSTORRENT` predicate arm + registration, mutation-red. The
-vehicle pin stays owed until the arm first runs (W3).
+`ACTIVE`, 2026-09-06. W1 complete (#2989, open). W2 complete on the row
+branch: the dot (`MatmulBTQuantKernel` — `DecodeQ4KBlocksF32` factored out of
+the W1 kernel, one bf16 RNE, the `kMatmulBT` tile matmul) is reached through
+`vt::MatmulBT`'s block-weight dispatch and sits inside the analytic
+operand-rounding envelope (bound ratios 0.28-0.53, M=1 GEMV included); the
+`kTENSTORRENT` predicate arm admits exactly `{Q4_K}` and the routing test
+reds any widening past the registered set. Both red-first: the registration
+REQUIRE and the six wrongly-admitted encodings reded before the
+implementation. Next: W3, the capture leg (dump ×2 byte-identity, capture-
+safe staging for the per-call decode upload) + the e2e vehicle battery on
+the P150 (vehicle fetched and hashed). W4 owed: Q5_K/Q6_K/Q8_0, the int8
+lever, the 27B arm.

@@ -884,3 +884,213 @@ TEST_CASE("DeepSeek-V4 vision carries the load-time repack markers into the MLP 
   }
   backend.DestroyQueue(queue);
 }
+
+
+// W2 repair, F6 (#2411). THE WEIGHT-SHAPE REFUSALS ARE NOW LOAD-BEARING.
+//
+// `ValidateWeights` makes fifteen `ValidateTensor` calls and NONE of them was
+// exercised. Deleting the `aligner_w2_weight` refusal outright left the suite
+// green, and the header's "RMSNorm weights stay f32" claim rested on three
+// refusals nothing drove, so relaxing one to accept the model dtype was green
+// too. A refusal nothing reaches is not a contract, it is a comment.
+//
+// One table rather than thirty-five cases, but every row is INDIVIDUALLY
+// falsifiable: deleting any one `ValidateTensor` call reds exactly the two rows
+// that name it, and relaxing one from f32 to the model dtype reds that tensor's
+// dtype row. The dtypes are driven in both directions, a model-dtype weight
+// offered as f32 and an f32 norm offered as bf16, so the polarity cannot be
+// flipped silently either. Two blocks are covered rather than only block 0,
+// because these checks sit inside a loop over every block.
+TEST_CASE("DeepSeek-V4 vision refuses every mis-declared weight tensor") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  REQUIRE(config.depth >= 2);
+
+  struct Sizes {
+    int64_t h;
+    int64_t inter;
+    int64_t out;
+    int64_t patch_dim;
+    int64_t aligner_input;
+    DType model;
+    DType f32;
+  };
+  const Sizes z{config.hidden_size,  config.intermediate_size,
+                config.output_size,  config.patch_dim(),
+                config.aligner_input_size(), config.compute_dtype,
+                DType::kF32};
+
+  struct Case {
+    const char* label;
+    const char* message;
+    void (*corrupt)(DeepSeekV4VisionWeights&, TensorStore&, const Sizes&);
+  };
+
+  const std::vector<Case> cases = {
+      {"patch weight dtype", "DeepSeek-V4 vision patch weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_weight = s.Empty(z.f32, {z.h, z.patch_dim});
+       }},
+      {"patch weight shape", "DeepSeek-V4 vision patch weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_weight = s.Empty(z.model, {z.h + 1, z.patch_dim});
+       }},
+      {"patch bias dtype", "DeepSeek-V4 vision patch bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_bias = s.Empty(z.f32, {z.h});
+       }},
+      {"patch bias shape", "DeepSeek-V4 vision patch bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_bias = s.Empty(z.model, {z.h + 1});
+       }},
+      {"block 0 norm1 dtype", "DeepSeek-V4 vision norm1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm1_weight = s.Empty(z.model, {z.h});
+       }},
+      {"block 0 norm1 shape", "DeepSeek-V4 vision norm1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm1_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"block 1 norm1 dtype", "DeepSeek-V4 vision norm1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].norm1_weight = s.Empty(z.model, {z.h});
+       }},
+      {"block 1 norm1 shape", "DeepSeek-V4 vision norm1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].norm1_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"block 0 qkv weight dtype", "DeepSeek-V4 vision qkv weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_weight = s.Empty(z.f32, {3 * z.h, z.h});
+       }},
+      {"block 0 qkv weight shape", "DeepSeek-V4 vision qkv weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_weight = s.Empty(z.model, {3 * z.h, z.h + 1});
+       }},
+      {"block 0 qkv bias dtype", "DeepSeek-V4 vision qkv bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_bias = s.Empty(z.f32, {3 * z.h});
+       }},
+      {"block 0 qkv bias shape", "DeepSeek-V4 vision qkv bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_bias = s.Empty(z.model, {3 * z.h + 1});
+       }},
+      {"block 0 attn out weight dtype", "DeepSeek-V4 vision attention output weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_weight = s.Empty(z.f32, {z.h, z.h});
+       }},
+      {"block 0 attn out weight shape", "DeepSeek-V4 vision attention output weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_weight = s.Empty(z.model, {z.h, z.h + 1});
+       }},
+      {"block 0 attn out bias dtype", "DeepSeek-V4 vision attention output bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_bias = s.Empty(z.f32, {z.h});
+       }},
+      {"block 0 attn out bias shape", "DeepSeek-V4 vision attention output bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_bias = s.Empty(z.model, {z.h + 1});
+       }},
+      {"block 0 norm2 dtype", "DeepSeek-V4 vision norm2 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm2_weight = s.Empty(z.model, {z.h});
+       }},
+      {"block 0 norm2 shape", "DeepSeek-V4 vision norm2 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm2_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"block 1 MLP w1 dtype", "DeepSeek-V4 vision MLP w1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].mlp_w1_weight = s.Empty(z.f32, {2 * z.inter, z.h});
+       }},
+      {"block 1 MLP w1 shape", "DeepSeek-V4 vision MLP w1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].mlp_w1_weight = s.Empty(z.model, {2 * z.inter, z.h + 1});
+       }},
+      {"block 0 MLP w2 dtype", "DeepSeek-V4 vision MLP w2 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].mlp_w2_weight = s.Empty(z.f32, {z.h, z.inter});
+       }},
+      {"block 0 MLP w2 shape", "DeepSeek-V4 vision MLP w2 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].mlp_w2_weight = s.Empty(z.model, {z.h, z.inter + 1});
+       }},
+      {"final norm dtype", "DeepSeek-V4 vision final norm weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.final_norm_weight = s.Empty(z.model, {z.h});
+       }},
+      {"final norm shape", "DeepSeek-V4 vision final norm weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.final_norm_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"aligner w1 weight dtype", "DeepSeek-V4 vision aligner w1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_weight = s.Empty(z.f32, {z.out, z.aligner_input});
+       }},
+      {"aligner w1 weight shape", "DeepSeek-V4 vision aligner w1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_weight = s.Empty(z.model, {z.out, z.aligner_input + 1});
+       }},
+      {"aligner w1 bias dtype", "DeepSeek-V4 vision aligner w1 bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_bias = s.Empty(z.f32, {z.out});
+       }},
+      {"aligner w1 bias shape", "DeepSeek-V4 vision aligner w1 bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_bias = s.Empty(z.model, {z.out + 1});
+       }},
+      {"aligner w2 weight dtype", "DeepSeek-V4 vision aligner w2 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_weight = s.Empty(z.f32, {z.out, z.out});
+       }},
+      {"aligner w2 weight shape", "DeepSeek-V4 vision aligner w2 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_weight = s.Empty(z.model, {z.out, z.out + 1});
+       }},
+      {"aligner w2 bias dtype", "DeepSeek-V4 vision aligner w2 bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_bias = s.Empty(z.f32, {z.out});
+       }},
+      {"aligner w2 bias shape", "DeepSeek-V4 vision aligner w2 bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_bias = s.Empty(z.model, {z.out + 1});
+       }},
+      // The two remaining ValidateTensor branches, on one representative tensor
+      // each: a rank that does not match, and storage that is absent.
+      {"patch weight rank", "DeepSeek-V4 vision patch weight has the wrong rank",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_weight = s.Empty(z.model, {z.h});
+       }},
+      {"qkv weight contiguity",
+       "DeepSeek-V4 vision qkv weight must be contiguous",
+       [](DeepSeekV4VisionWeights& w, TensorStore&, const Sizes&) {
+         w.blocks[0].qkv_weight.stride[0] += 1;
+       }},
+      {"aligner w2 weight storage",
+       "DeepSeek-V4 vision aligner w2 weight has no storage",
+       [](DeepSeekV4VisionWeights& w, TensorStore&, const Sizes&) {
+         w.aligner_w2_weight.data = nullptr;
+       }},
+  };
+
+  for (const Case& one : cases) {
+    // As a std::string: doctest stringifies a bare const char* as a pointer,
+    // which makes a failing row unidentifiable.
+    const std::string label(one.label);
+    CAPTURE(label);
+    TensorStore store(backend, queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    one.corrupt(weights, store, z);
+    bool refused = false;
+    try {
+      DeepSeekV4Vision model(backend, config, std::move(weights));
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      CHECK(std::string(error.what()) == std::string(one.message));
+    }
+    CHECK(refused);
+  }
+  backend.DestroyQueue(queue);
+}

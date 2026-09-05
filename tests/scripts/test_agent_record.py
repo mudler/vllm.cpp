@@ -2430,11 +2430,21 @@ class GdnDevicePureBackendRowBacksTheRatchet(unittest.TestCase):
         on a fresh checkout. The row line itself carries the reference, and
         that is the tree-truthful place to pin it.
 
+        The CLAIM owner follows the lifecycle, not the test. The checker
+        requires a `CLAIM-*` owner on ACTIVE rows only, and the row's move to
+        DONE (bcbfee7bf) retired its claim file into the frozen claims
+        archive -- an unconditional claim assertion froze the ACTIVE-era row
+        and red on `main` the moment the lifecycle moved. The row carries the
+        claim exactly while it is ACTIVE, and never afterwards.
+        """
         text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("#2907", row)
         self.assertIn("tenstorrent-gdn-device-pure.md", row)
-        self.assertIn("CLAIM-BACKEND-TENSTORRENT-GDN-DEVICE-PURE", row)
+        if "`ACTIVE`" in row:
+            self.assertIn("CLAIM-BACKEND-TENSTORRENT-GDN-DEVICE-PURE", row)
+        else:
+            self.assertNotIn("CLAIM-", row)
 
     def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
         path, expected = agent_record.MATRICES["BACKEND"]

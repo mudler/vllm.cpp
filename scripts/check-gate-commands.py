@@ -463,6 +463,14 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # 2026-09-05: +BACKEND-TENSTORRENT-KEEPQUANT. GROWTH, and re-pinned in the
+    # same change that caused it. The row is new (#2959, W0 staging) and its
+    # spec's `## Gates` section names `scripts/agent-preflight.sh` per wave,
+    # which can genuinely fail -- the first full preflight on this very tree
+    # reded through this checker until the entry was pinned. The wave-local
+    # command surfaces (op-level suite, capture identity, e2e battery) enter
+    # the section as the waves land, not in the staging change.
+    "BACKEND-TENSTORRENT-KEEPQUANT",
     # 2026-09-02: +QUANT-EXL3-PERF. GROWTH, and re-pinned in the same change that
     # caused it. The row is new (#2570) and its spec's `## Gates` section names
     # two `ctest` invocations and `scripts/agent-preflight.sh --staged`, each of

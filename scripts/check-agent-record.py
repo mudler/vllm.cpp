@@ -472,7 +472,9 @@ MATRICES = {
     # 89 since 2026-09-05: +`BACKEND-TENSTORRENT-GDN-DEVICE-PURE`, the
     # device-resident GDN decode wave split out of the Qwen35 wiring row
     # (#2907, owed from #2812); spec committed first on the row branch.
-    "BACKEND": (AGENTS / "backend-matrix.md", 89),
+    # 90 since 2026-09-05: +`BACKEND-TENSTORRENT-KEEPQUANT`, the dense
+    # keep-quant dot row (#2959); spec committed first on the row branch.
+    "BACKEND": (AGENTS / "backend-matrix.md", 90),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

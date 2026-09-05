@@ -335,6 +335,14 @@ class RocmBackend final : public Backend {
   // an illegal op during capture a loud failure on THIS thread rather than a
   // process-wide mode change.
   bool SupportsGraphCapture() const override { return true; }
+  // The sampled token id is device-mirrored (async_device_mirror(), the ROCm
+  // port of the W3/W4 combine/scatter kernels in rocm_combine_tokens.hip), so
+  // the between-steps host readback the depth-2 async input-combine needs is
+  // valid. Mirrors the CUDA backend's override (cuda_backend.cu:229-230);
+  // without this the ported kernels are dead code — runner_supports_async()
+  // resolves false and async scheduling stays off (AGENTS.md "Nothing lands
+  // dead").
+  bool SupportsAsyncSampledTokenReadback() const override { return true; }
   void BeginCapture(Queue& q) override {
     Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeThreadLocal),
           "hipStreamBeginCapture");

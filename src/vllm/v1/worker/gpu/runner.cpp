@@ -45,19 +45,22 @@
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
-#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
+#ifdef VLLM_CPP_CUDA
 #include "vt/cuda/combine_tokens.h"  // W3 device combine/scatter (removes the sync)
+#endif
 #ifdef VLLM_CPP_HIP
 #include "vt/rocm/combine_tokens.h"  // W3 device combine/scatter (ROCm port)
 #endif
-#endif
-
 
 // Device-agnostic dispatch for the combine/scatter/ops kernels. The CUDA and
 // ROCm backends expose identical signatures in vt::cuda and vt::rocm; this
 // dispatch compiles the right one in at build time. On a CPU-only build both
-// backends are absent and these are no-ops. No runtime device-type check: the
-// build is single-backend, so the #if selects unconditionally.
+// backends are absent, so the entire block is compiled out — an empty anonymous
+// namespace with three unused functions is a -Werror=unused-function break
+// there (same treatment as AsyncDeviceMirrorEnvDefault below). No runtime
+// device-type check: the build is single-backend, so the #if selects
+// unconditionally.
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
 namespace {
 void DispatchCombineSampledAndDraftTokens(
     vt::Queue& q, int32_t* input_ids, const int32_t* idx_mapping,
@@ -99,6 +102,7 @@ void DispatchApplyLastSampledOps(vt::Queue& q, int32_t* last_sampled_tokens,
 #endif
 }
 }  // namespace
+#endif  // VLLM_CPP_CUDA || VLLM_CPP_HIP
 
 namespace vllm::v1 {
 
@@ -153,12 +157,14 @@ static bool AsyncRunnerEnvDefault() {
 // steps. Whether that read is VALID is a backend CAPABILITY, not a device name:
 // ask the backend (vt::Backend::SupportsAsyncSampledTokenReadback, backend.h),
 // which answers true for CPU (host and device memory are one allocation) and
-// CUDA (the sampled id is device-mirrored, async_device_mirror()), and false for
-// a DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) whose sample_tokens_async leg
-// host-dereferences a device Alloc — the root cause of the "!" tokens on the lab
-// R9700 (2026-08-07). An absent backend (device not built into this binary)
-// yields nullptr and therefore false, which also subsumes the old
-// #if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP) guard. Keeping the question on the backend is what stops
+// CUDA and ROCm (the sampled id is device-mirrored, async_device_mirror() — the
+// W3/W4 combine/scatter kernels ported to both backends), and false for a
+// DISCRETE GPU whose backend has not ported those kernels, whose
+// sample_tokens_async leg host-dereferences a device Alloc — the root cause of
+// the "!" tokens on the lab R9700 (2026-08-07). An absent backend (device not
+// built into this binary) yields nullptr and therefore false, which also
+// subsumes the old #if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP) guard.
+// Keeping the question on the backend is what stops
 // this device-agnostic shared layer from naming a device (check-device-leakage).
 static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
   const vt::Backend* backend = vt::TryGetBackend(queue.device.type);

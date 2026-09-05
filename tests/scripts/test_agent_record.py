@@ -504,8 +504,11 @@ class AgentRecordMutationTests(unittest.TestCase):
         (`c8fc24a50`); the seven recipe architectures that had no row at all took
         it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
         (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
-        architectures (#634); MiniMax-Music3 took it to 373 (#672); and the two
-        text-only Qwen3.5 arms took it 373 -> 375 (#490). Without this,
+        architectures (#634); MiniMax-Music3 took it to 373 (#672); the two
+        text-only Qwen3.5 arms took it 373 -> 375 (#490); dots3-note took it
+        375 -> 377, being two architectures (#699); qwen4-exp took it 377 -> 378
+        (#1978); glm5-next took it 378 -> 379 (#1998); and the DeepSeek-V4 Flash
+        Vision row took it 379 -> 380 (#2411, `b1122cf5a`). Without this,
         bumping the number to silence a failure is indistinguishable from bumping
         it because a row really landed.
         """
@@ -790,6 +793,79 @@ class AgentRecordMutationTests(unittest.TestCase):
         # sibling row, and adding one to mirror the upstream PR is the mistake.
         siblings = [row for row in rows if "glm5-next" in row.item_id]
         self.assertEqual([row.item_id for row in siblings], [item_id])
+
+    def test_deepseek_v4_vision_row_is_inside_the_model_ratchet(self) -> None:
+        """The #2411 row and the 379 -> 380 bump are one semantic change.
+
+        Same contract as the qwen4-exp and glm5-next tests above, guarding the
+        arithmetic against the opposite pull. Those two had to resist SPLITTING
+        one model into two or three rows. This one has to resist COLLAPSING two
+        rows into one, because the vision configuration is published under an
+        architecture string the matrix already carries.
+        `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` and
+        `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` both name
+        `DeepseekV4ForCausalLM`, and only the MM row qualifies it with
+        `vision_n_layers=32`.
+
+        That is what makes this bump look like a duplicate to anyone who
+        re-derives the count from architecture strings. Deleting the MM row as a
+        duplicate takes the tree back to 379 and the pin follows it: internally
+        consistent, and silently short the entire image path. The two rows are
+        not one target. The text row mirrors vLLM's registered text-only module,
+        while this row owns the model-author processor, ViT, aligner, sentinel
+        merge and image-span visibility, which vLLM implements at no revision.
+
+        What this catches that nothing else does: renaming the row, or removing
+        it as an architecture-string duplicate, each leaves the count reachable
+        by a compensating edit elsewhere in the matrix while every other check
+        stays green. Only an assertion that names the row goes red.
+
+        The sibling list is spelled out in full rather than reduced to one row,
+        because `deepseek-v4` is the lane where several rows are correct: the
+        text arm, this vision arm, the DSpark draft and the MTP head are four
+        separately owned targets. A fifth appearing, or any of the four
+        vanishing, is what the list sees.
+
+        The state is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied, for the reason the qwen4-exp test gives. The
+        justification block on the pin itself records `READY`, which is the state
+        the row LANDED in at `b1122cf5a`, when the spec was committed and no
+        product code existed. W1 landed the prompt encoder and the image
+        processor, so the row reads `ACTIVE` now. The comment is the log of what
+        the bump was for and stays as written. This assertion is the live value.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        item_id = "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm"
+        found = [row for row in rows if row.item_id == item_id]
+        self.assertEqual(len(found), 1, item_id)
+        self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+        self.assertEqual(found[0].field("state").strip().strip("`"), "ACTIVE", item_id)
+
+        # The architecture string is shared with the text row on purpose, and the
+        # MM row is the one that qualifies it. Asserting both halves is what makes
+        # "not a duplicate" checkable rather than a claim in a comment.
+        text_id = "MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm"
+        text = [row for row in rows if row.item_id == text_id]
+        self.assertEqual(len(text), 1, text_id)
+        self.assertIn("DeepseekV4ForCausalLM", found[0].field("item"), item_id)
+        self.assertIn("DeepseekV4ForCausalLM", text[0].field("item"), text_id)
+        self.assertIn("vision_n_layers=32", found[0].field("item"), item_id)
+        self.assertNotIn("vision_n_layers", text[0].field("item"), text_id)
+
+        # Four rows on this lane, not one and not five.
+        siblings = sorted(row.item_id for row in rows if "deepseek-v4" in row.item_id)
+        self.assertEqual(
+            siblings,
+            [
+                "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm",
+                "MODEL-SPEC-deepseek-v4-deep-seek-v4-mtp",
+                "MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm",
+                "MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm",
+            ],
+        )
 
     def test_quant_exl3_row_is_inside_the_quant_ratchet(self) -> None:
         """The #2181 row and the QUANT 84 -> 85 bump are one semantic change.

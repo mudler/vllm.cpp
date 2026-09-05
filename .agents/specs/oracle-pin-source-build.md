@@ -13,7 +13,7 @@ row over the same record.
 ## The failure
 
 `main` is red at `c796fea41` on `tools suites`, which
-`scripts/agent-preflight.sh:522` runs in every preflight, so every row that
+`scripts/agent-preflight.sh:561` runs in every preflight, so every row that
 merges current `main` inherits it:
 
 ```
@@ -78,10 +78,12 @@ premise without weakening the guarantee.
   test that keeps the durable prefix relation, and (b) a **behavioural** test in
   `OracleIdentityIsWiredIntoEveryEntryPointTests` that fails against the
   `metadata == runtime == CONST` shape itself.
-- Three code comments the landed sync falsified, corrected in the same change so
+- Five code comments the landed sync falsified, corrected in the same change so
   no reader is told a fact the tree contradicts: `tools/bench/online_gate.py:3527-3530`,
-  `tools/bench/serve_low_common.py:42-46` and `:104-106`, and the inline comment at
-  `tests/tools/test_oracle_pin.py:153`.
+  `tools/bench/serve_low_common.py:42-46` and `:104-106`, the inline comment at
+  `tests/tools/test_oracle_pin.py:153`, and
+  `tools/bench/gdn_packed_component.py:1596-1598`, which sits above the same
+  two-field comparison and carried the same present-tense falsehood.
 
 **Out of scope, deliberately.**
 
@@ -177,7 +179,7 @@ under a name that says what it means.
 | The replacement is a mute switch — it cannot fail | Shown failing in §"Tests" red-before against the exact pre-#520 `metadata == runtime == CONST` diff, restored byte-for-byte after |
 | The replacement is narrower than what it replaced | It is strictly wider: the old assertion could not observe `online_gate.py` at all, and the new one executes the call site. The record-level half it drops (strict inequality) is a property of one build mode, and §"The ruling" shows why it is not the guarantee |
 | The `.precompiled` value in the new test becomes a fourth copy of the pin | It is not a pin value. It is `VLLM_ORACLE_VERSION + ".precompiled"`, derived from the constant at test time, so it tracks any future pin advance and no literal version string is written |
-| Correcting the three comments hides a real intent | Each is corrected to state what is now true *and why it changed*, naming the source build, not simply deleted |
+| Correcting the five comments hides a real intent | Each is corrected to state what is now true *and why it changed*, naming the source build, not simply deleted |
 | A future precompiled-mode pin re-breaks this | It cannot. Both new cases are patched, so they are independent of what the live pin holds — which is exactly the defect in the assertion being replaced |
 | The distribution field is quietly dropped from the record because "it equals the other one" | `read_parity_pin`'s `omits` refusal plus `test_missing_field_is_fatal`, unchanged. Named here so the next reader knows it is held elsewhere and not by this row |
 
@@ -219,12 +221,12 @@ python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
 python3 scripts/check-oracle-pins.py
 python3 scripts/check-oracle-pins.py --self-test
 python3 scripts/agent-issue-index.py --refresh && python3 scripts/check-agent-record.py
-python3 scripts/check-commit-style.py --base origin/main --head HEAD
+python3 scripts/check-commit-style.py --range origin/main..HEAD
 python3 scripts/check-pr-size.py --base origin/main --head HEAD
 scripts/agent-preflight.sh
 ```
 
-No compile. This row edits one test module and three comments.
+No compile. This row edits one test module and five comments.
 
 ## Evidence
 
@@ -249,11 +251,21 @@ restored-tree diff shown empty, and the green-after.
   that carries `.precompiled` on aarch64 is not a runnable oracle"*, resting on
   a 13,872-byte editable install observed once. Nothing in `tests/` holds that,
   and nothing can without a build. It is the reason the pin has the value it
-  has, so it deserves better than prose. Tracked by
-  [#2931](https://github.com/mudler/vllm.cpp/issues/2931), which this row closes
-  — the follow-up therefore needs its own issue when someone next builds the
-  oracle, and `.agents/upstream-sync.md` already instructs that builder to
-  record which mode they used.
+  has, so it deserves better than prose. **This bullet is the owner.**
+  [#2931](https://github.com/mudler/vllm.cpp/issues/2931) raised it and this row
+  closes that issue, so after the merge nothing but this entry carries the debt;
+  it is written to stand without it. The next person to build the oracle files
+  the follow-up issue and points it back here, and
+  `.agents/upstream-sync.md` already instructs that builder to record which
+  build mode they used.
+- **`tools/bench/serve_low_common.py:135` names a pin sha the record advanced
+  past.** The `assert_oracle_commit` docstring says *"today that constant
+  already CONTAINS `+g555967922`"*; `VLLM_ORACLE_VERSION` has read
+  `0.28.1rc1.dev132+ge126687a9` since `e8467758e` (2026-09-03) moved the parity
+  pin. It was falsified by that **pin advance**, not by the `5d97007c2` sync
+  this row answers, so it is outside the row's scope and the row does not touch
+  it. Filed as [#2949](https://github.com/mudler/vllm.cpp/issues/2949), which
+  names no owning row and needs one; it is listed here so it is not orphaned.
 - **The token gate has still not run at this pin.** `5d97007c2` says so and this
   row changes nothing about it: every committed golden predates `e126687a9a`.
   Owned by `.agents/specs/upstream-sync-headpin-tokengate.md`, not by this row.
@@ -263,4 +275,4 @@ restored-tree diff shown empty, and the green-after.
 `ORACLE-PIN-SOURCE-BUILD` is `ACTIVE` on the repair of the stale invariant, and
 `DONE` when `tools suites` is green on a tree that has merged `origin/main`. The
 row has no roadmap entry and needs none: it owns one test module's premise and
-the three comments the sync falsified, and its lifecycle is this file.
+the five comments the sync falsified, and its lifecycle is this file.

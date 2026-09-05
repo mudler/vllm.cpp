@@ -657,9 +657,21 @@ a ceiling.
   hashes above, is owed by issue #2411 and W3.
 - The first `llama-cpp-dsv4vision` build and run is owed by issue #2411; the
   oracle file records `gateable = no` until then.
-- `exp_probs_b_vl` accounting and per-token selection are owed by W3 and W4. The
-  non-causal image-span window is owed by W4. Neither existed in this spec before
-  2026-09-05 and neither is implemented.
+- `exp_probs_b_vl` is ACCOUNTED FOR in all three loader arms by W3B and LOADED
+  in the two that materialize a tower, the GGUF arm and the EXL3 carried arm.
+  The official dense safetensors arm accounts without materializing, exactly as
+  it does for every other tensor, so its W2b residual covers this one too.
+  Nothing selects the bias. Three behaviours stay owed by
+  issue #2411 and W4, and row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring:
+  per-token selection between the two biases in `deepseek_v4_moe.cpp`; the
+  hash-layer replacement at forward time, where an image row takes
+  `exp_probs_b_vl` while a text row takes `tid2eid` and no bias; and the
+  non-causal image-span sliding-window change. The loaded bias is a staged slice
+  until W4 lands, in the sense of `AGENTS.md` "Nothing lands dead".
+- `scripts/check-dsv4-gguf-namemap.py` gates the TEXT artifact's 1328-tensor
+  manifest and does not know `exp_probs_b_vl`. A name-map gate over the vision
+  artifact's own manifest is owed by issue #2411 and W3.
 - CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
   W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
   any of the three.
@@ -765,3 +777,65 @@ suite `tests/scripts/test_check_attention_rung_consistency.py` passes 39/39.
 
 A fresh reviewer has not yet mutated W2's claimed guarantees. That review is
 owed before this row's pull request is opened.
+
+### W3B evidence
+
+The artifact was read again before the wave started, not taken from the brief.
+An HTTP range request over the first 14 MB of
+`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`
+`UD-IQ1_S/DeepSeek-V4-Flash-Vision-Exp-UD-IQ1_S-00001-of-00003.gguf` printed 72
+key-value pairs and 43 tensors on 2026-09-05. The tensors are exactly
+`blk.0..42.exp_probs_b_vl.bias`, each F32 `[256]`, and nothing else. The same
+header carries `deepseek4.hash_layer_count = 3`, `deepseek4.block_count = 43`,
+`deepseek4.expert_count = 256`, `split.tensors.count = 1371` and
+`split.count = 3`.
+
+llama.cpp PR #28154, at oracle `llama-cpp-dsv4vision`, is the reference for the
+shape of the change. Its converter maps `ffn.gate.bias_vl` to
+`blk.{bid}.exp_probs_b_vl`, drops `ffn.gate.bias` on every layer below
+`num_hash_layers`, and creates `ffn_exp_probs_b_vl` OUTSIDE the hash branch with
+`TENSOR_NOT_REQUIRED`. W3B mirrors the optionality and the every-layer scope. It
+does NOT mirror the selection, which that PR makes per ubatch on
+`ubatch.embd != nullptr`; the spec's `## Port map` requires a per-token rule and
+W4 owns it.
+
+RED first. `tests/vllm/models/test_deepseek_v4_mm_loader.cpp` failed 5 of its 6
+cases before the loader changed. The GGUF cases threw
+`deepseek-v4 gguf loader: LEFTOVER tensor not covered by the blk.N.* name map:
+blk.0.exp_probs_b_vl.bias`. The EXL3 safetensors cases threw
+`deepseek-v4 exl3 loader: checkpoint tensor no arm routes:
+layers.0.ffn.gate.bias_vl`, so a vision checkpoint was REFUSED by that arm
+rather than merely unaccounted. The official dense arm read
+`CHECK( 112 == 114 )`: it accepted the two extra tensors and counted neither.
+The sixth case, `dsv4 TEXT GGUF: the absent vision bias is accepted and changes
+nothing`, passed before the change and after it.
+
+Green after. `ctest --test-dir build-w3b -R test_deepseek_v4_mm_loader
+--output-on-failure` passes on a Release CPU build configured with
+`-DVLLM_CPP_CUDA=OFF`, and the test binary reports 6 of 6 cases and 83 of 83
+assertions.
+
+The inertness claim was mutated rather than read. Removing the optionality from
+the GGUF arm, so `exp_probs_b_vl` is taken unconditionally, made
+`dsv4 TEXT GGUF: the absent vision bias is accepted and changes nothing` the one
+red case, with `gguf: no tensor named "blk.0.exp_probs_b_vl.bias"`. The source
+was restored byte for byte afterwards; its SHA-256 is
+`794c00f7557bbe71c858e82f0e85016475a7937264f5a93755e35705e2f070c2` before the
+mutation and after the restore.
+
+The text checkpoint's inertness was also checked outside this suite. The eleven
+DeepSeek-V4 targets a Release CPU build can run --- `scaffold`, `moe`, `forward`,
+`gguf_load`, `mtp_inventory`, `exl3_loader`, `mm_loader`,
+`exl3_device_residency`, `exl3_forward`, `exl3_forward_loop_arm` and
+`paged_equiv` --- all pass. `test_deepseek_v4_gguf_load` is the one that reads a
+text `deepseek4` file end to end.
+
+The two biases are filled from different functions in every fixture, so a loader
+that routed one into the other's slot would still be caught. A gated layer's
+`gate_bias` and `gate_bias_vl` are asserted to differ, and the hash-layer case
+asserts that layer 0 carries `tid2eid` and `e_score_bias_vl` and an EMPTY
+`e_score_bias`.
+
+Nothing selects the loaded bias. The commit body names it unreached, names the
+owning row and issue #2411, and `## Owed` above lists the three behaviours W4
+owns.

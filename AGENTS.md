@@ -275,6 +275,7 @@ only when it appears in this table and has a recorded pin:
 | SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models served by SGLang's pipeline runtime, in a third repository that is not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
 | `unslothai/llama.cpp` fork | `llama-cpp-unsloth` | the sub-IQ1_S quant encodings (IQ1_XS, IQ1_XXS, IQ1_XXXS) that no upstream llama.cpp defines, and that a published Qwen3.8-2.4T checkpoint stores its experts in |
+| llama.cpp release `b10766` | `llama-cpp-dsv4vision` | the `deepseek4` VISION variant: the `deepseek4v` clip projector, its mmproj container, the `exp_probs_b_vl` media routing bias and the non-causal image-span window, none of which the stock `llama-cpp` pin at `b10451` contains |
 | `ggml-org/llama.cpp` PR #27742 | `llama-cpp-qwen4exp` | the `qwen4exp` architecture, its GGUF conversion and its graph, which no released llama.cpp defines, so the stock `llama-cpp` pin cannot supply a denominator for it |
 | `ggml-org/llama.cpp` PR #27752 | `llama-cpp-glm5next` | the `glm5next` TEXT architecture, its GGUF conversion and its graph, which no released llama.cpp defines either; it is the head whose architecture string matches the published artifact, and it carries no vision tower |
 | turboderp-org `exllamav3` | `exllamav3` | the EXL3 trellis quantization format and its kernels, and the DeepSeek-V4 support the pinned HEAD carries, which neither vLLM nor vLLM-Omni implements |

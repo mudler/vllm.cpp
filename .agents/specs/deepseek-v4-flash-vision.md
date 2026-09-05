@@ -50,9 +50,18 @@ The port includes:
 - Video and audio. The released model accepts images only.
 - A DeepSeek-only server, multimodal input container or attention stack. Shared
   seams are extended where their current contracts are too narrow.
-- A sidecar format that combines a text GGUF with separate vision weights. The
-  shipped quantized arm is one documented model artifact, not an assembly recipe
-  users have to reconstruct.
+- ~~A sidecar format that combines a text GGUF with separate vision weights.~~
+  **Withdrawn on 2026-09-05 by developer direction.** The developer named
+  `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` as the artifact this row has to
+  run. That repository ships the llama.cpp two-file shape: a split text GGUF plus
+  a `mmproj-BF16.gguf`. The original non-goal was written when no published
+  quantization of this checkpoint existed and the row would have had to produce
+  one; producing a private combined artifact nobody downloads is what would now
+  be the assembly recipe. This tree already reads the two-file shape in
+  `src/vllm/model_executor/models/clip_mmproj_gguf.cpp` (row `LOAD-GGUF-MMPROJ`,
+  #821), so the seam exists and no new container is invented. What survives of
+  the non-goal is its intent: a user names a documented repository and revision,
+  and the loader finds both files itself.
 - A token-only proof for the tower or attention visibility. Stage numerics and
   memory format are load-bearing because an omitted image mechanism can leave an
   argmax unchanged.
@@ -64,6 +73,39 @@ across 48 safetensors shards. It does not fit a 119 GiB GB10. The model author's
 reference conversion and launch recipe use tensor parallelism 4. A single-device
 production gate therefore depends on the GGUF k-quant arm; the official
 safetensors arm remains a multi-device gate.
+
+### The shipped quantized vehicle
+
+`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` at revision
+`b977d3c0ea2da58dbc12ddae8fb8951a7b3854d0`, read on 2026-09-05. It publishes ten
+imatrix quantizations of the language model, each split across three to five
+shards, and one vision file shared by all of them. The GGUF `general.architecture`
+is `deepseek4`; the mmproj's is `clip` with `clip.projector_type = deepseek4v`.
+
+`UD-IQ1_S` is the smallest complete arm and the one a single 119 GiB GB10 can
+hold. Its identity, from the Hugging Face `paths-info` API at that revision:
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `UD-IQ1_S/...-00001-of-00003.gguf` | 5,305,248 | `be862fb3ecdeb99a9a47fabd091b9c7bd32d0de89c9a85589cd007b822bb6305` |
+| `UD-IQ1_S/...-00002-of-00003.gguf` | 49,991,832,128 | `c21604991c40674ac1612f16dcedf84b857bb5a2bace00b47a7ab7e5f5e3296e` |
+| `UD-IQ1_S/...-00003-of-00003.gguf` | 32,441,484,736 | `8326a8a98fb224a16f8e83e6236fc346222bc9131f6495644c5c988b8a6101f4` |
+| `mmproj-BF16.gguf` | 934,462,656 | `e4914c6c8063d01f4cbb6dafdf2f959c7d06fbe8ad11ae5b11ad032edd42642e` |
+
+That is 82,438,622,112 bytes of language weights (76.78 GiB) plus 0.870 GiB of
+vision weights, 77.65 GiB resident before KV cache and activations. A repository
+id alone is not a pin, so the revision and every SHA-256 above are load-bearing.
+
+The mmproj header confirms the geometry this spec derived from `config.json`:
+427 tensors, `clip.vision.block_count = 32`, `embedding_length = 1024`,
+`feed_forward_length = 2816`, `attention.head_count = 16`, `patch_size = 14`,
+`projection_dim = 4096`, `projector.scale_factor = 3`,
+`image_min_pixels = 147456`, `use_silu = true`, and **no position-embedding
+tensor**, which is what makes the 2-D RoPE load-bearing rather than optional. The
+aligner is `mm.1.weight [9216, 4096]` and `mm.2.weight [4096, 4096]`, so the 3x3
+unfold of a 1024-wide tower is exactly `mm.1`'s input. The four learned vectors
+are `v.token_embd.img_start`, `v.token_embd.img_end`, `v.token_embd.img_pad` and
+`v.image_newline`, all f32 `[4096]`.
 
 The released `config.json` resolves:
 
@@ -112,13 +154,38 @@ DeepSeek-V4 Flash, not this vision path.
 - SGLang main `52e1c24744bf4efe75fe976e26596ae1c9f279e2` and vLLM-Omni main
   `b81aeb7b86837f6fe8956f3aef83798ad26c5a26` contain no exact model
   implementation in code search on 2026-08-31.
-- llama.cpp has no released DeepSeek-V4 Vision architecture or combined GGUF
-  converter. It may become the quantized speed floor only after a pinned
-  implementation exists; it is not the algorithm oracle now.
+- llama.cpp **had** no released DeepSeek-V4 Vision architecture when this spec
+  was written. That changed on 2026-09-02. See the next section.
 
 Calling the model-author runtime the `transformers` oracle would be false. The
 executing vision code lives in the Hugging Face checkpoint repository under
 `inference/`, not in `huggingface/transformers`.
+
+### llama.cpp now implements this model, and is pinned separately
+
+`ggml-org/llama.cpp` merged `#28133` (the `deepseek4v` clip projector, image
+preprocessor and mmproj container) and `#28154` (the language-side vision
+behaviour) on 2026-09-02. Release `b10766` is
+`9400c8946e4da5e7694f2c26d6d4e50e14b690fa`, the merge commit of `#28154`, and it
+is the first release that carries `tools/mtmd/models/deepseek4v.cpp`. The stock
+[`llama-cpp`](../oracles/llama-cpp.md) pin `b10451` returns HTTP 404 for that
+path and is 315 commits behind it.
+
+This is registered as its own oracle, [`llama-cpp-dsv4vision`](../oracles/llama-cpp-dsv4vision.md),
+rather than by advancing the stock pin, because every floor already measured
+against `b10451` means "what that release does".
+
+What it buys this row is not a second algorithm source. It is the first
+**runnable** reference for the exact artifact the developer named: it converts
+and loads `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`, on hardware this project
+leases, at a quantization our arm can match. The model author's TP4 runtime
+remains the algorithm oracle and outranks it wherever the two disagree; vLLM
+outranks both wherever vLLM implements the behaviour.
+
+Two llama.cpp approximations are recorded in the oracle file and are NOT mirrored
+without checking the model author: it selects the vision routing bias per ubatch
+rather than per token, and it drops hash-layer `tid2eid` routing entirely for a
+media ubatch.
 
 ### New secondary oracle
 
@@ -172,6 +239,68 @@ All rows below are from
 | tensor-parallel conversion | `inference/convert.py:65-150` |
 | reference generation loop | `inference/generate.py:27-90` |
 
+### Anchors at `llama-cpp-dsv4vision` (`b10766`)
+
+Read for the GGUF container and as the runnable cross-check. They are never the
+mirror source.
+
+| Behaviour | Pinned source |
+|---|---|
+| mmproj tensor names and block layout helper | `tools/mtmd/clip-impl.h` (`TN_TOK_IMG_START/_END/_PAD`, `dsv4_get_block_layout`) |
+| `deepseek4v` hyper-parameters from `clip.*` | `tools/mtmd/clip.cpp::clip_model_loader`, `PROJECTOR_TYPE_DEEPSEEK4V` case |
+| tower, aligner and block assembly graph | `tools/mtmd/models/deepseek4v.cpp` |
+| the N-layout permutation, as an index vector | `tools/mtmd/clip.cpp::clip_encode`, `PROJECTOR_TYPE_DEEPSEEK4V` case |
+| resize solver and image loading | `tools/mtmd/mtmd-image.cpp::mtmd_image_preprocessor_deepseek4v` |
+| image span decodes non-causally | `tools/mtmd/mtmd.cpp::mtmd_decode_use_non_causal` |
+| **the vision routing bias** | `src/models/deepseek4.cpp`, `ffn_exp_probs_b_vl` |
+| **SWA suppressed inside the image span** | `src/llama-hparams.h::swa_full_non_causal`, `src/llama-kv-cache.cpp::set_input_kq_mask_impl` |
+| converter drops `aligner.*`, `image_*` and hash-layer `ffn.gate.bias` | `conversion/deepseek.py` |
+
+## Language-side vision behaviour this spec originally missed
+
+Two DeepSeek-V4 **language** behaviours change when the input carries an image.
+Neither appears in the design section above, both are load-bearing, and both are
+exactly the failure mode risk 3 names: dropping either one leaves an argmax
+plausible and a token gate green.
+
+### 1. `exp_probs_b_vl`, a second MoE routing bias
+
+The unsloth text GGUF's first shard holds 43 tensors and nothing else: one
+`blk.N.exp_probs_b_vl.bias`, f32 `[256]`, for every one of the 43 language
+layers. It is the expert-probability bias the router adds when the token being
+routed is an image token, in place of the text `exp_probs_b`.
+
+For the three hash layers (`deepseek4.hash_layer_count = 3`) it does more than
+substitute a bias. Text tokens on a hash layer are routed by the `tid2eid` hash
+table and take no bias at all; the converter drops `ffn.gate.bias` there for
+that reason. An image token has no meaningful token id to hash, so on those
+layers `exp_probs_b_vl` **replaces the hash routing itself**.
+
+Our loader must therefore account for `exp_probs_b_vl` on all 43 layers and
+select it per token, and `deepseek_v4_moe.cpp` must take the vision bias on the
+image rows. `src/vllm/model_executor/models/deepseek_v4_weights.cpp` already
+reads `exp_probs_b.bias` in both the hash-layer and noaux_tc arms, so this is a
+scoped extension of an existing accounting path, not a new one.
+
+**llama.cpp's version is coarser than ours may be.** It selects the vision bias
+for the whole ubatch whenever `ubatch.embd != nullptr`, so a mixed text/image
+ubatch routes its text rows on the vision bias too. Mirror the model author's
+per-token rule, and record the divergence from llama.cpp rather than copying it.
+
+### 2. SWA does not apply inside the image span
+
+`deepseek4.attention.sliding_window = 128`. The pinned reference lets the tokens
+of one image span attend across the whole span, and window-clips only the older
+tokens outside it. llama.cpp models this as `swa_full_non_causal`: when the
+batch decodes non-causally, the window mask is skipped for positions at or after
+the span start, and applied normally below it.
+
+This is the same rule as the spec's existing visible-window design
+(`inference/model.py:289-299`), stated on the mask instead of on the index list.
+W4 owns it, and its test must be an index or mask test: a 128-token window with a
+384-token image span is a case where a token gate can pass while more than half
+the span is invisible.
+
 The model-author tests are ported with their parameters and failures. This
 includes plain and multi-turn text stability, top-level image blocks, tagged
 text equivalence, multiple-image order, TXT/JSON equivalence, malformed tags,
@@ -187,7 +316,11 @@ user-injected placeholder refusal and missing-source refusal.
 | `inference/vision.py` | `include/vllm/model_executor/models/deepseek_v4_vision.h` and `src/vllm/model_executor/models/deepseek_v4_vision.cpp` | New model composition over existing `vt` operations |
 | `inference/model.py:276-299,464-540` | existing DeepSeek attention metadata and `dense_attn::AttnBlock` | Extend visible-window metadata; no second cache or attention stack |
 | `inference/model.py:904-990` | `deepseek_v4.h`, `deepseek_v4.cpp` and `deepseek_v4_registry.cpp` | Optional tower/merge selected by config and input; text path stays unchanged |
-| released safetensors index and `inference/convert.py` | `deepseek_v4_weights.cpp` plus a separate DeepSeek-V4 Vision GGUF loader/converter | Account every official tensor and ship one combined k-quant artifact |
+| released safetensors index and `inference/convert.py` | `deepseek_v4_weights.cpp` | Account for every official tensor, including `exp_probs_b_vl` on all 43 layers |
+| `unsloth/...-GGUF` mmproj + `deepseek4v` projector | `clip_mmproj_gguf.cpp` and `deepseek_v4_vision.cpp` | Extend the existing mmproj reader with the `deepseek4v` projector type and its four sentinel vectors; refuse every other type by name as it does today |
+| `unsloth/...-GGUF` split text shards | `deepseek_v4_weights.cpp` GGUF arm | Load `blk.*.exp_probs_b_vl.bias` beside the existing `exp_probs_b.bias` |
+| `inference/model.py` router bias for image tokens | `deepseek_v4_moe.cpp` | Select the vision bias per token; on hash layers it replaces `tid2eid` routing |
+| `inference/model.py:289-299` window, as a mask | DeepSeek attention metadata | Suppress the 128-token window inside the image span only |
 | OpenAI image content blocks | shared `chat_mm` and runner preparation | Model-selected placeholders, multiple images and production reachability |
 
 ## Our baseline
@@ -281,17 +414,35 @@ normalization and RoPE intermediates where the pinned runtime widens them.
 
 ### GGUF arm
 
-A separate DeepSeek-V4 Vision GGUF conversion and loader TU extends the existing
-`deepseek4` architecture rather than creating a sidecar. Language tensors use
-the shared k-quant/i-quant loader and keep-quant compute. The approximately
-0.869 GiB vision/aligner/sentinel group remains BF16 in the first artifact.
+**The vehicle is `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` at
+`b977d3c0ea2da58dbc12ddae8fb8951a7b3854d0`, not an artifact this row produces.**
+It is a published third-party imatrix quantization, it is what users download,
+and `llama-cpp-dsv4vision` runs it, so it is the only quantized arm with a
+runnable denominator. `docs/USAGE.md` labels it as third-party.
 
-Before capability publication, `docs/USAGE.md` records the exact Hugging Face
-repository and revision, artifact filename, byte size, resident size and
-SHA-256. The official 48-shard arm and every refused arm are listed beside the
-GGUF vehicle. A third-party quant is labelled as third-party. If no combined
-quant can be produced, the row stays incomplete; loader scaffolding is not
-model support.
+It has the llama.cpp two-file shape, which this tree already reads:
+
+- the split language shards carry `general.architecture = deepseek4` and load
+  through the existing `deepseek_v4_weights.cpp` GGUF arm, extended with
+  `blk.*.exp_probs_b_vl.bias`;
+- `mmproj-BF16.gguf` carries `general.architecture = clip`,
+  `clip.projector_type = deepseek4v`, and loads through
+  `clip_mmproj_gguf.cpp`, whose scope today is `qwen3vl_merger` and whose
+  refusal of every other projector type is by name. `deepseek4v` is added to
+  that reader; nothing else about its contract changes.
+
+The vision weights stay BF16, which is what unsloth already ships, so the 0.870
+GiB figure this spec derived is the shipped one rather than a target.
+
+The user names one repository and revision. The loader resolves both files from
+it. Requiring a user to hand-assemble two paths would be the assembly recipe the
+withdrawn non-goal was written against, and is refused.
+
+Before capability publication, `docs/USAGE.md` records the repository, revision,
+every shard filename, byte size and SHA-256, the resident size, the official
+48-shard arm, and every refused arm by name. Loader scaffolding is not model
+support: the arm is done when this artifact generates from an image through the
+production entry point.
 
 ## Dependencies
 
@@ -332,7 +483,7 @@ model support.
 | W0 | This spec, issue, oracle pin and roadmap row | `READY`; oracle explicitly `gateable = no`; record gates pass |
 | W1 | Prompt encoder and image processor | All pinned encoding cases ported; processor goldens cover resize boundaries, wide images, start-position padding, multi-image order and named failures |
 | W2 | Vision tower and aligner | Reduced-shape and real-weight stage outputs agree with the pinned oracle within recorded numeric bounds; wrong RoPE axis, attention causality, downsample order and GELU each make the focused gate red |
-| W3 | Official weights and combined GGUF arm | Pinned index has zero unaccounted tensors; official arm loads on its eligible topology; the documented GGUF artifact loads without a sidecar and fits one gate device |
+| W3 | Official weights and the unsloth GGUF arm | Pinned safetensors index has zero unaccounted tensors, `exp_probs_b_vl` included; the pinned unsloth `UD-IQ1_S` shards and `mmproj-BF16.gguf` both load from one named repository and revision and fit one gate device |
 | W4 | Merge, visibility and cached language forward | Registered forward consumes image embeddings, image-span attention matches the oracle, image prefill is atomic, decode does not rerun vision, text-only DeepSeek remains byte-identical |
 | W5 | Runner, public ABI and OpenAI serving | Multiple data-URI and HTTP(S) PNG/JPEG images reach `ModelRegistry::Forward` in order; Qwen and Gemma multimodal smoke cases remain unchanged |
 | W6 | Real-checkpoint correctness, speed and publication | Greedy gate passes on the pinned reference and quantized arm; TTFT, vision encode, prefill, decode and memory are recorded; user documents name exact weights |
@@ -359,7 +510,19 @@ does not repair them.
 - `test_deepseek_v4_mm_forward`: sentinel replacement, image visibility,
   atomic-prefill refusal, no vision work on decode and text-only inertness.
 - `test_deepseek_v4_mm_loader`: real config, complete pinned index, official
-  storage formats, GGUF name map and named refusals.
+  storage formats, GGUF name map and named refusals. Includes: all 43
+  `blk.N.exp_probs_b_vl.bias` are accounted for and loaded; the `deepseek4v`
+  mmproj's 427 tensors map with none unaccounted; every other
+  `clip.projector_type` still refuses by name.
+- `test_deepseek_v4_mm_router_bias`: an image row takes `exp_probs_b_vl` and a
+  text row in the same batch takes `exp_probs_b`; on a hash layer the image row
+  takes `exp_probs_b_vl` while the text row takes `tid2eid` and no bias. Swapping
+  the two biases must make this red, and it must not be observable only through
+  generated tokens.
+- `test_deepseek_v4_mm_window`: with `sliding_window = 128` and an image span
+  longer than the window, every position inside the span is visible to every
+  other position in it, and positions below the span start stay window-clipped.
+  Restoring the plain window mask must make this red.
 - `test_deepseek_v4_mm_e2e`: production `ModelRegistry::Forward` on the pinned
   image prompts, then real-checkpoint generated ids.
 - `test_deepseek_v4_mm_server`: OpenAI multi-image request through the actual
@@ -448,8 +611,9 @@ a ceiling.
    defense, not the first user-visible failure.
 5. **The reference preprocessing test is missing.** Execute pinned code to
    generate evidence; do not infer expected pixels from PIL behavior.
-6. **The official artifact cannot fit one GB10.** A combined GGUF is a completion
-   dependency, not an optional optimization.
+6. **The official artifact cannot fit one GB10.** The pinned unsloth `UD-IQ1_S`
+   pair is 77.65 GiB resident and does fit, so the single-device gate is now
+   reachable. It is a completion dependency, not an optional optimization.
 7. **Remote image fetching is security-sensitive.** Reuse the shared HTTP/TLS
    transport and its timeouts; do not shell out or add a DeepSeek-only fetcher.
 8. **DSpark weights are present.** Account for them and keep the optional
@@ -470,9 +634,12 @@ a ceiling.
 - A complete oracle cannot build or run on an eligible leased topology: keep
   `gateable = no`, record the exact dependency or hardware blocker, and do not
   claim end-to-end support.
-- The combined quantized arm cannot preserve the released tensor set or fit an
-  available gate device: the row remains incomplete; do not publish a sidecar
-  workaround as support.
+- The pinned unsloth revision no longer resolves, or a shard's SHA-256 changes
+  under an unchanged name: stop and obtain a new pin decision. Re-quantization in
+  place is why the revision and hashes are pinned rather than the repository id.
+- The pinned quantized arm cannot preserve the released tensor set or fit an
+  available gate device: the row remains incomplete; loader scaffolding that
+  cannot generate from an image is not support.
 - Resource-controller reports no matching healthy device or loses a worker:
   keep only that backend gate `PENDING`, record the controller/device state, and
   do not bypass the lease with direct SSH or substitute another backend.
@@ -486,8 +653,13 @@ a ceiling.
 ## Owed
 
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
-- The combined GGUF artifact, its revision and SHA-256 are owed by issue #2411
-  and W3.
+- The unsloth GGUF arm's first load and generation, on the pinned revision and
+  hashes above, is owed by issue #2411 and W3.
+- The first `llama-cpp-dsv4vision` build and run is owed by issue #2411; the
+  oracle file records `gateable = no` until then.
+- `exp_probs_b_vl` accounting and per-token selection are owed by W3 and W4. The
+  non-causal image-span window is owed by W4. Neither existed in this spec before
+  2026-09-05 and neither is implemented.
 - CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
   W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
   any of the three.
@@ -502,7 +674,12 @@ a ceiling.
 
 ## Now
 
-`ACTIVE`. W1 and W2 have landed on the row branch. W2 adds the standalone
+`ACTIVE`. W1 and W2 have landed on the row branch, and this spec was amended on
+2026-09-05: the quantized vehicle is now the pinned
+`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`, `llama-cpp-dsv4vision` is
+registered as a runnable reference for it, and two language-side vision
+behaviours the original spec missed (`exp_probs_b_vl` and the non-causal
+image-span window) are specified and owed. W2 adds the standalone
 32-layer-capable ViT and the downsample-3 aligner as a config-driven composition
 over public `vt` operations. Neither wave is reachable from production: W3 owns
 weights, W4 owns the registered forward and image-span visibility, and W5 owns

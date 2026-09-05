@@ -39,11 +39,12 @@ class HarnessError(RuntimeError):
 # REFUSING the oracle the record required, so no measurement in it could name a
 # compliant denominator even deliberately.  One reader, one record, no copy.
 #
-# The block is parsed, not the prose.  The pin paragraph names the release
-# ("vLLM 0.26.0.dev0"); a running oracle reports 0.23.1rc1.dev1511+g555967922,
-# and its distribution metadata appends ".precompiled" where the runtime string
-# does not.  A parser over the prose would therefore have produced a constant no
-# oracle can ever match -- more code AND wrong.  Only measured strings go in.
+# The block is parsed, not the prose.  At #520 the pin paragraph named the
+# release ("vLLM 0.26.0.dev0") while the running oracle reported
+# 0.23.1rc1.dev1511+g555967922, and its distribution metadata appended
+# ".precompiled" where the runtime string did not.  A parser over the prose
+# would therefore have produced a constant no oracle can ever match -- more code
+# AND wrong.  Only measured strings go in.
 _PIN_RECORD = pathlib.Path(__file__).resolve().parents[2] / ".agents" / "upstream-sync.md"
 _PIN_BLOCK_RE = re.compile(r"^```parity-pin$\n(.*?)^```$", re.MULTILINE | re.DOTALL)
 _PIN_FIELDS = (
@@ -101,9 +102,14 @@ _PIN = read_parity_pin()
 # The exact source commit of the pinned oracle -- the parity pin itself, no
 # longer a separate "executable oracle" commit tracked apart from it.
 VLLM_COMMIT = _PIN["vllm_commit"]
-# What `vllm.__version__` reports, and what `importlib.metadata` reports.  They
-# are DIFFERENT strings on the pin (the editable/precompiled build appends a
-# suffix), so a check that equates them cannot pass at any single value.
+# What `vllm.__version__` reports, and what `importlib.metadata` reports.  TWO
+# fields because they are two observations, not because they always differ:
+# under `VLLM_USE_PRECOMPILED=1` the distribution string appends a suffix and a
+# check equating them cannot pass at any single value, while a SOURCE build
+# appends nothing and they coincide.  Today's pin is a source build
+# (`5d97007c2`, #2896), so they are equal here and each is still compared
+# against its own recorded string.  The invariant is that the distribution
+# string EXTENDS the runtime string, never that it differs from it (#2931).
 VLLM_ORACLE_VERSION = _PIN["vllm_runtime_version"]
 VLLM_DISTRIBUTION_VERSION = _PIN["vllm_distribution_version"]
 FLASHINFER_VERSION = _PIN["flashinfer_version"]

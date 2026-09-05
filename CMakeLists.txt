@@ -1067,6 +1067,7 @@ add_library(vllm STATIC
   # SAME Qwen3VLVisionWeights from a SECOND GGUF file beside the language one.
   src/vllm/model_executor/models/clip_mmproj_gguf.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
+  src/vllm/model_executor/models/deepseek_v4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
   src/vllm/model_executor/models/qwen3_vl_text.cpp

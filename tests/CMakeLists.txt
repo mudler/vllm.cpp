@@ -1430,6 +1430,11 @@ vllm_cpp_add_test(test_deepseek_v4_encoding
                   vllm/multimodal/test_deepseek_v4_encoding.cpp)
 vllm_cpp_add_test(test_deepseek_v4_image_processor
                   vllm/multimodal/test_deepseek_v4_image_processor.cpp)
+# DeepSeek-V4 Vision W2: pinned reduced-shape ViT and aligner stage parity.
+vllm_cpp_add_test(test_deepseek_v4_vision
+                  vllm/models/test_deepseek_v4_vision.cpp)
+target_compile_definitions(test_deepseek_v4_vision PRIVATE
+  DEEPSEEK_V4_VISION_GOLDEN="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/goldens.json")
 # Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
 # (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
 # 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).

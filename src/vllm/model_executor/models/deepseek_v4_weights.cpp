@@ -1667,13 +1667,21 @@ struct V4GgufCtx {
   // arm already gets this from `carried.Float(..., {ne})`, and the GLM loaders
   // beside this one already pass their expected width to `LoadVecF32`; this is
   // the same guarantee for the GGUF arm's two router biases.
+  //
+  // The width is read from the FILE HEADER and refused BEFORE the value is
+  // materialized. Checking it on the loaded tensor instead would dequantize
+  // first and refuse second, so a corrupt or absurd declared width would surface
+  // as a failed allocation rather than as this named refusal. A guard whose only
+  // failure mode is `bad_alloc` is a crash, not a gate, and an allocation that
+  // large takes the whole machine down with it rather than one test.
   OwnedTensor Vec1D(const std::string& name, GgufTensorRole role, int64_t n) {
-    OwnedTensor t = Vec(name, role);
-    VT_CHECK(t.rank == 1 && t.shape[0] == n,
+    const std::vector<int64_t>& s = g.Get(name).shape;  // throws when missing
+    VT_CHECK(s.size() == 1 && s[0] == n,
              "deepseek-v4 gguf: " + name + " must be a 1-D [" + std::to_string(n) +
-                 "] vector (n_routed_experts), got rank " + std::to_string(t.rank) +
-                 " first dim " + std::to_string(t.rank >= 1 ? t.shape[0] : 0));
-    return t;
+                 "] vector (n_routed_experts), got rank " +
+                 std::to_string(s.size()) + " first dim " +
+                 std::to_string(s.empty() ? 0 : s[0]));
+    return Vec(name, role);
   }
   // `token_embd.weight`, in BOTH of the roles this model gives it: the GATHER
   // table (`hw.embed`, indexed as a flat host f32 array at deepseek_v4.cpp:1844)

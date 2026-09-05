@@ -95,6 +95,24 @@ struct DeepSeekV4VisionCapture {
   std::vector<DeepSeekV4VisionScratchDType>* scratch_dtypes = nullptr;
 };
 
+// The load-time storage-layout markers the shared MlpGateUpMethodBase seam
+// actually holds for one block's gate-up weight.
+//
+// Observable because a borrow that DROPS them is invisible to every value gate
+// on this host: dtype, rank, shape and byte count are all unchanged, and
+// `vt::cpu::QuantRepackActive()` is true only on an aarch64 i8mm host, so the
+// wrongly-decoded weight is not even wrong here. It was wrong on `thor`: the
+// shared `dense_attn::ResidentWeight` dropped `repacked` and an i8mm-interleaved
+// `block_q8_0x4` buffer (136-byte blocks) was decoded as flat `q8_0` (34-byte
+// blocks), which produced NaN, then all-zero logits, then token id 0, with
+// nothing logged because the `lm_head` GEMM swallowed the NaN. Fixed on `main`
+// at `7a937db8a` (#2031); this accessor is what keeps the same loss from being
+// re-introduced by a private borrow helper here.
+struct DeepSeekV4VisionStorageMarkers {
+  bool repacked = false;
+  bool q8_0_aligned = false;
+  bool elem_kn_repacked = false;
+};
 
 // Host f32 oracle helper. For each patch row it returns head_dim/2 values per
 // table: all height frequencies first, then all width frequencies, exactly as
@@ -134,6 +152,10 @@ class DeepSeekV4Vision {
   // Observable cache size for allocation-stability tests. Geometry entries hold
   // reusable f32 RoPE data, positions, and exact unfold indices by shape/device.
   size_t cached_geometry_count() const;
+
+  // Observable storage-layout markers for the gate-up weight this model handed
+  // to the shared MLP seam. See DeepSeekV4VisionStorageMarkers.
+  DeepSeekV4VisionStorageMarkers mlp_gate_up_markers(int64_t block) const;
 
  private:
   class Impl;

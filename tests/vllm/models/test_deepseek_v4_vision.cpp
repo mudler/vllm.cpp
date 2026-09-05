@@ -801,3 +801,86 @@ TEST_CASE("DeepSeek-V4 vision allocates no per-layer scratch of its own") {
 
   backend.DestroyQueue(queue);
 }
+
+// W2 repair, F7 (#2411). THE BORROW MUST NOT DROP THE REPACK MARKERS.
+//
+// `BorrowResidentWeight` hands each block's gate-up weight to the shared
+// MlpGateUpMethodBase seam as an OwnedTensor. It copied dtype, rank, shape, `nk`,
+// bytes and `d_dev` and stopped there, so `repacked`, `q8_0_aligned` and
+// `elem_kn_repacked` were lost. Those three say the BYTES were rewritten at load
+// into a different block interleave or orientation while the byte count and the
+// [N,K] shape stayed the same, so nothing downstream can notice: `ValidateTensor`
+// does not check them and no value gate can see them.
+//
+// THIS IS THE SAME DEFECT `main` FIXED AT `7a937db8a` (#2031), in the shared
+// `dense_attn::ResidentWeight`, re-introduced in a private helper. There it cost
+// a debugging campaign: an i8mm-interleaved `block_q8_0x4` buffer (136-byte
+// blocks) reached the quant GEMM flagged as flat `q8_0` (34-byte blocks) and
+// decoded to NaN, then all-zero logits, then token id 0, with nothing logged
+// because the `lm_head` GEMM swallowed the NaN.
+//
+// It is HOST-CONDITIONAL: `vt::cpu::QuantRepackActive()` is true only on an
+// aarch64 i8mm host, so this x86 box can never show it as a wrong number. That is
+// exactly why the markers are asserted structurally instead. W3A's mmproj reader
+// is what turns it from latent into live, because it can now hand this tower
+// block-quantized weights.
+//
+// The forward is deliberately NOT run here. `elem_kn_repacked` claims the bytes
+// are physically [K,N], and this fixture's bytes are not, so a forward would read
+// a genuinely mislabelled buffer. The markers are metadata and the assertion is
+// about whether they survive the borrow.
+TEST_CASE("DeepSeek-V4 vision carries the load-time repack markers into the MLP seam") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  REQUIRE(config.depth >= 2);
+
+  SUBCASE("every marker survives, and an unmarked block stays unmarked") {
+    TensorStore store(backend, queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    weights.blocks[0].mlp_w1_weight.repacked = true;
+    weights.blocks[0].mlp_w1_weight.q8_0_aligned = true;
+    weights.blocks[0].mlp_w1_weight.elem_kn_repacked = true;
+    DeepSeekV4Vision model(backend, config, std::move(weights));
+
+    const auto marked = model.mlp_gate_up_markers(0);
+    CHECK(marked.repacked);
+    CHECK(marked.q8_0_aligned);
+    CHECK(marked.elem_kn_repacked);
+
+    // Opposite polarity, so a stub that answers true cannot pass either.
+    const auto plain = model.mlp_gate_up_markers(1);
+    CHECK_FALSE(plain.repacked);
+    CHECK_FALSE(plain.q8_0_aligned);
+    CHECK_FALSE(plain.elem_kn_repacked);
+  }
+
+  SUBCASE("each marker travels on its own") {
+    for (int which = 0; which < 3; ++which) {
+      CAPTURE(which);
+      TensorStore store(backend, queue);
+      DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+      if (which == 0) weights.blocks[0].mlp_w1_weight.repacked = true;
+      if (which == 1) weights.blocks[0].mlp_w1_weight.q8_0_aligned = true;
+      if (which == 2) weights.blocks[0].mlp_w1_weight.elem_kn_repacked = true;
+      DeepSeekV4Vision model(backend, config, std::move(weights));
+      const auto markers = model.mlp_gate_up_markers(0);
+      CHECK(markers.repacked == (which == 0));
+      CHECK(markers.q8_0_aligned == (which == 1));
+      CHECK(markers.elem_kn_repacked == (which == 2));
+    }
+  }
+
+  SUBCASE("the accessor refuses a block that does not exist") {
+    TensorStore store(backend, queue);
+    DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+    CHECK_THROWS_WITH_AS(model.mlp_gate_up_markers(-1),
+                         "DeepSeek-V4 vision block index is out of range",
+                         std::invalid_argument);
+    CHECK_THROWS_WITH_AS(model.mlp_gate_up_markers(config.depth),
+                         "DeepSeek-V4 vision block index is out of range",
+                         std::invalid_argument);
+  }
+  backend.DestroyQueue(queue);
+}

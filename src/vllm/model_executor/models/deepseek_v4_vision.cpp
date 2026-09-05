@@ -263,6 +263,33 @@ OwnedTensor BorrowResidentWeight(const Tensor& tensor) {
     weight.shape[index] = tensor.shape[index];
   }
   weight.nk = true;
+  // CARRY THE LOAD-TIME STORAGE-LAYOUT MARKERS. `repacked`, `q8_0_aligned` and
+  // `elem_kn_repacked` say the bytes were rewritten at load into a different
+  // block interleave or orientation; the byte count and the [N,K] shape are
+  // unchanged, so a borrow that copies dtype, rank, shape and bytes and stops
+  // there produces a weight that is wrong only in how the kernel decodes it.
+  //
+  // This is the defect `main` fixed at `7a937db8a` (#2031) in the SHARED
+  // `dense_attn::ResidentWeight`, re-introduced here in a private helper. There
+  // it cost a debugging campaign: an i8mm-interleaved `block_q8_0x4` buffer
+  // (136-byte blocks) reached `kMatmulBTQuant` flagged as flat `q8_0` (34-byte
+  // blocks) and decoded to NaN, then all-zero logits, then token id 0, with no
+  // crash and no refusal, because the `lm_head` GEMM swallowed the NaN.
+  //
+  // PROPAGATE RATHER THAN REFUSE. A fail-closed check here would reject the
+  // repacked weight instead of decoding it, which removes the CPU i8mm fast
+  // path rather than fixing the loss. `ResidentWeight` re-reads `repacked` and
+  // `elem_kn_repacked` off this OwnedTensor on its host-alias arm and keeps its
+  // own audit guard for the device-staging arm, so the markers only have to
+  // survive the borrow.
+  //
+  // Host-conditional and therefore invisible here: `vt::cpu::QuantRepackActive()`
+  // is true only on an aarch64 i8mm host. W3A's mmproj reader is what makes it a
+  // live trigger rather than a latent one, because it can now hand this tower
+  // block-quantized weights.
+  weight.repacked = tensor.repacked;
+  weight.q8_0_aligned = tensor.q8_0_aligned;
+  weight.elem_kn_repacked = tensor.elem_kn_repacked;
   const size_t bytes =
       static_cast<size_t>(tensor.Numel()) * vt::SizeOf(tensor.dtype);
   auto keep_alive =
@@ -350,6 +377,20 @@ class DeepSeekV4Vision::Impl {
   Backend& backend() { return backend_; }
 
   size_t cached_geometry_count() const { return geometries_.size(); }
+
+  DeepSeekV4VisionStorageMarkers mlp_gate_up_markers(int64_t block) const {
+    if (block < 0 ||
+        block >= static_cast<int64_t>(mlp_gate_up_weights_.size())) {
+      Invalid("DeepSeek-V4 vision block index is out of range");
+    }
+    const OwnedTensor& weight =
+        mlp_gate_up_weights_[static_cast<size_t>(block)];
+    DeepSeekV4VisionStorageMarkers markers;
+    markers.repacked = weight.repacked;
+    markers.q8_0_aligned = weight.q8_0_aligned;
+    markers.elem_kn_repacked = weight.elem_kn_repacked;
+    return markers;
+  }
 
   Geometry& GeometryFor(Queue& queue, int64_t height, int64_t width) {
     for (size_t i = 0; i < geometries_.size(); ++i) {
@@ -801,6 +842,11 @@ void DeepSeekV4Vision::AlignerForward(Queue& queue, Tensor& output,
 
 size_t DeepSeekV4Vision::cached_geometry_count() const {
   return impl_->cached_geometry_count();
+}
+
+DeepSeekV4VisionStorageMarkers DeepSeekV4Vision::mlp_gate_up_markers(
+    int64_t block) const {
+  return impl_->mlp_gate_up_markers(block);
 }
 
 }  // namespace vllm::multimodal

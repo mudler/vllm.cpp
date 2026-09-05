@@ -141,6 +141,16 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
              dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+    case vt::DeviceType::kTENSTORRENT:
+      // KEEPQUANT W2: the P150 is discrete with no CPU fallback tier, so this
+      // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a
+      // registered decode for — MatmulBTQuantKernel implements Q4_K (through
+      // the W1 bit-exact DecodeQ4KBlocksF32 chain). Q5_K/Q6_K/Q8_0 are the
+      // row's W4; admitting them here before their kernels land throws at
+      // first forward with the model resident, which is the exact failure
+      // this predicate exists to prevent. tests/vllm/test_gguf_keep_quant.cpp
+      // pins the set; widening the arm without widening the kernel reds it.
+      return dt == vt::DType::kQ4_K;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.

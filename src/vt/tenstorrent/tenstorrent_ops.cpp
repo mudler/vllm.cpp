@@ -1743,21 +1743,14 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
 // host value and the device buffer (multiply and the i32<->f32 bitcast both
 // canonicalize -0 to +0). where() consumes it as the true branch of the
 // signed-zero repair.
-void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
-  TT_OP_TRACE("KeepQuantDecode");
-  VT_CHECK(packed.rank == 2 && out.rank == 2,
-           "tenstorrent kKeepQuantDecode: packed rank-2 [rows, nb], out "
-           "rank-2 [rows, nb*256]");
-  VT_CHECK(packed.dtype == DType::kQ4_K,
-           "tenstorrent kKeepQuantDecode: packed dtype must be kQ4_K");
-  VT_CHECK(out.dtype == DType::kF32,
-           "tenstorrent kKeepQuantDecode: out must be f32");
-  VT_CHECK(packed.IsContiguous() && out.IsContiguous(),
-           "tenstorrent kKeepQuantDecode: contiguous required");
-  const int64_t rows = packed.shape[0];
-  const int64_t nb = packed.shape[1];
-  VT_CHECK(out.shape[0] == rows && out.shape[1] == nb * 256,
-           "tenstorrent kKeepQuantDecode: out shape mismatch");
+//
+// THE SHARED DECODE (KEEPQUANT W2): the packed-Q4_K -> f32 chain verbatim,
+// returning the repaired f32 {rows, nb*256} in ROW_MAJOR. KeepQuantDecode
+// commits it to the host-visible output; the quant matmul (MatmulBTQuantKernel
+// below) consumes it as the weight operand. One decode, two consumers, one
+// numerics authority.
+ttnn::Tensor DecodeQ4KBlocksF32(const Tensor& packed, int64_t rows, int64_t nb,
+                                MeshDevice& device) {
   const int64_t b64 = rows * nb;
   const uint32_t B = static_cast<uint32_t>(b64);
 
@@ -1777,7 +1770,6 @@ void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
           (static_cast<uint32_t>(p[3]) << 24)));
     }
   }
-  MeshDevice& device = SharedMeshDevice();
   ttnn::Tensor w = ttnn::Tensor::from_vector<int32_t>(
       std::move(words),
       SpecOf(tt::tt_metal::Shape({B, 36u}), ttnn::DataType::INT32,
@@ -1968,10 +1960,84 @@ void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
   m1 = ttnn::to_layout(
       ttnn::where(pred8, neg0T8, m1T), ttnn::Layout::ROW_MAJOR);
   ttnn::Tensor y = ttnn::subtract(prod, m1);
-  y = ttnn::reshape(ttnn::to_layout(std::move(y), ttnn::Layout::ROW_MAJOR),
-                    ttnn::Shape({B, 256u}));
+  return ttnn::reshape(ttnn::to_layout(std::move(y), ttnn::Layout::ROW_MAJOR),
+                       ttnn::Shape({static_cast<uint32_t>(rows),
+                                    static_cast<uint32_t>(nb) * 256u}));
+}
+
+void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
+  TT_OP_TRACE("KeepQuantDecode");
+  VT_CHECK(packed.rank == 2 && out.rank == 2,
+           "tenstorrent kKeepQuantDecode: packed rank-2 [rows, nb], out "
+           "rank-2 [rows, nb*256]");
+  VT_CHECK(packed.dtype == DType::kQ4_K,
+           "tenstorrent kKeepQuantDecode: packed dtype must be kQ4_K");
+  VT_CHECK(out.dtype == DType::kF32,
+           "tenstorrent kKeepQuantDecode: out must be f32");
+  VT_CHECK(packed.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kKeepQuantDecode: contiguous required");
+  const int64_t rows = packed.shape[0];
+  const int64_t nb = packed.shape[1];
+  VT_CHECK(out.shape[0] == rows && out.shape[1] == nb * 256,
+           "tenstorrent kKeepQuantDecode: out shape mismatch");
+  ttnn::Tensor y = DecodeQ4KBlocksF32(packed, rows, nb, SharedMeshDevice());
   CommitDeviceLogical2D(out, std::move(y), static_cast<uint32_t>(rows),
                         static_cast<uint32_t>(nb * 256));
+}
+
+// kMatmulBTQuant (KEEPQUANT W2): `a` is [M,K] float, `b` is [N,K] packed
+// Q4_K blocks — out = a @ b^T, reached through vt::MatmulBT's block-weight
+// dispatch (ops.cpp:163), the entry every model matmul helper already uses.
+// tt-metal has no packed-weight GEMM primitive (row survey), so the
+// composition decodes the blocks through the W1 bit-exact f32 chain
+// (DecodeQ4KBlocksF32 above), rounds the decoded weight ONCE to bf16 (RNE,
+// the device's round-once convention), and runs the same bf16 tile matmul as
+// kMatmulBT. The activation takes the device's ordinary bf16 tile path (an
+// f32 master rounds once on device, the same widen-on-load rule as bf16
+// weights). Numerics sit inside the analytic bf16 operand-rounding envelope
+// of the decode-based reference — the W2 test pins it, not a picked
+// tolerance. Eager staging only today: the decode reads the host-mapped
+// blocks per call; capture-safe residency is W3 (#2959).
+void MatmulBTQuantKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  TT_OP_TRACE("MatmulBTQuant");
+  VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
+           "tenstorrent kMatmulBTQuant: rank-2 a/b/out required");
+  // Exactly the encodings DeviceKeepQuantSupported admits on kTENSTORRENT
+  // (gguf_keep_quant.cpp). Q5_K/Q6_K/Q8_0 decodes are owed by the row's W4;
+  // refusing here BY NAME keeps an admitted-but-unimplemented encoding from
+  // reaching the device.
+  VT_CHECK(b.dtype == DType::kQ4_K,
+           "tenstorrent kMatmulBTQuant: only kQ4_K decodes on TENSTORRENT "
+           "today; kQ5_K/kQ6_K/kQ8_0 are owed by BACKEND-TENSTORRENT-"
+           "KEEPQUANT W4");
+  VT_CHECK(b.shape[1] % 256 == 0,
+           "tenstorrent kMatmulBTQuant: K must be a whole number of Q4_K "
+           "blocks (256 elems)");
+  VT_CHECK(IsFloatDType(a.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMatmulBTQuant: float activation, f32/bf16 out");
+  const uint32_t M = static_cast<uint32_t>(a.shape[0]);
+  const uint32_t K = static_cast<uint32_t>(a.shape[1]);
+  const uint32_t N = static_cast<uint32_t>(b.shape[0]);
+  VT_CHECK(b.shape[1] == K, "tenstorrent kMatmulBTQuant: a/b inner dim mismatch");
+  VT_CHECK(out.shape[0] == M && out.shape[1] == N,
+           "tenstorrent kMatmulBTQuant: out shape mismatch");
+  VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kMatmulBTQuant: strided tensors are not supported in W2");
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor w_f32 = DecodeQ4KBlocksF32(b, N, K / 256, device);
+  ttnn::Tensor w_bf16 = ttnn::to_layout(
+      ttnn::typecast(std::move(w_f32), ttnn::DataType::BFLOAT16),
+      ttnn::Layout::TILE);
+  ttnn::Tensor dev_a = EnsureDevice2D(a, device);
+  if (a.dtype == DType::kF32)
+    dev_a = ttnn::to_layout(
+        ttnn::typecast(std::move(dev_a), ttnn::DataType::BFLOAT16),
+        ttnn::Layout::TILE);
+  ttnn::Tensor dev_c = ttnn::operations::matmul::matmul(
+      dev_a, w_bf16, /*transpose_a=*/false, /*transpose_b=*/true);
+  CommitDevice2D(out, std::move(dev_c));
 }
 
 // Upload a rank-1 affine vector as TILE BFLOAT16 [1, d], caching on the weight's
@@ -6658,6 +6724,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kKeepQuantDecode, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<KeepQuantDecodeFn>(&KeepQuantDecodeKernel)));
+    RegisterOp(OpId::kMatmulBTQuant, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kTENSTORRENT,

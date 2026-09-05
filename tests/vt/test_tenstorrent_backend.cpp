@@ -5207,3 +5207,114 @@ TEST_CASE("kTENSTORRENT kKeepQuantDecode matches vt::cpu::BlockToFloat bit-exact
     }
   }
 }
+
+// W2: the keep-quant DOT. Enters through vt::MatmulBT's public dispatch (the
+// entry point every model matmul helper already uses — ops.cpp:163 routes a
+// block-typed [N,K] weight to kMatmulBTQuant), not through a hand-cast op
+// pointer, so the test proves the routing a GGUF load actually takes. The
+// oracle is the DECODE-based bf16 reference computed here: the weight decoded
+// by vt::cpu::BlockToFloat (bit-exact per W1) and BOTH operands rounded to
+// bf16 once (RNE), accumulated in f32 in ascending k — the same convention
+// the device arm runs (decode f32 → one bf16 RNE → bf16 tile matmul). The
+// envelope is the analytic bf16 operand-rounding bound, not a picked
+// tolerance: rounding a and w to bf16 perturbs each product by at most
+// 2^-8 relative to |a||w|, and the bf16 matmul output adds one more output
+// rounding, so |device - ref| <= 1.05 * 2^-8 * (sum_k |a_k w_k| + |ref|)
+// must hold elementwise; a bigger gap is a real defect, not noise.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant Q4_K via vt::MatmulBT matches the decode-based bf16 oracle") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_K);
+  constexpr int64_t N = 16;
+  std::mt19937 rng(20260906u);
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+
+  for (int64_t M : {int64_t{1}, int64_t{5}}) {     // M=1 is the decode GEMV
+    for (int64_t nb : {int64_t{1}, int64_t{2}}) {  // K spans 1 and 2 blocks
+      const int64_t K = nb * 256;
+      std::vector<uint8_t> packed(N * nb * kBlockBytes);
+      for (int64_t b = 0; b < N * nb; ++b) {
+        uint8_t* blk = packed.data() + b * kBlockBytes;
+        const float d = (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                        ((rng() % 2) != 0 ? 1.0f : -1.0f);
+        const float dmin = (0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f) *
+                           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+        const uint16_t d_bits = vt::F32ToF16(d);
+        const uint16_t dmin_bits = vt::F32ToF16(dmin);
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
+        for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<uint8_t>(rng() & 0xFF);
+        for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<uint8_t>(rng() & 0xFF);
+      }
+      std::vector<float> a_f32(M * K);
+      for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+
+      // Oracle: decode (bit-exact W1 authority) -> round ONCE to bf16 ->
+      // f32 accumulate in ascending k; plus the analytic envelope.
+      std::vector<float> w_f32(N * K);
+      vt::cpu::BlockToFloat(vt::DType::kQ4_K)(packed.data(), w_f32.data(), N * K);
+      std::vector<uint16_t> a_bf(M * K), w_bf(N * K);
+      for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+      for (size_t i = 0; i < w_f32.size(); ++i) w_bf[i] = vt::F32ToBF16(w_f32[i]);
+      std::vector<float> ref(M * N), bound(M * N);
+      for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+          float acc = 0.0f, mag = 0.0f;
+          for (int64_t k = 0; k < K; ++k) {
+            const float p = widen(a_bf[static_cast<size_t>(m) * K + k]) *
+                            widen(w_bf[static_cast<size_t>(n) * K + k]);
+            acc += p;
+            mag += std::fabs(p);
+          }
+          ref[static_cast<size_t>(m) * N + n] = acc;
+          bound[static_cast<size_t>(m) * N + n] =
+              1.05f * std::ldexp(1.0f, -8) * (mag + std::fabs(acc));
+        }
+
+      void* mem_a = backend.Alloc(M * K * sizeof(uint16_t));
+      void* mem_b = backend.Alloc(packed.size());
+      void* mem_o = backend.Alloc(M * N * sizeof(float));
+      backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+      backend.Copy(q, mem_b, packed.data(), packed.size());
+      Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+      Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+      Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+      vt::MatmulBT(q, o_t, a_t, b_t);  // the PUBLIC dispatch: block weight -> kMatmulBTQuant
+      std::vector<float> out(M * N, 0.0f);
+      backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+      backend.Free(mem_a);
+      backend.Free(mem_b);
+      backend.Free(mem_o);
+
+      float worst = 0.0f, worst_ratio = 0.0f;
+      for (int64_t i = 0; i < M * N; ++i) {
+        const float diff = std::fabs(out[static_cast<size_t>(i)] -
+                                     ref[static_cast<size_t>(i)]);
+        worst = std::max(worst, diff);
+        worst_ratio = std::max(worst_ratio, diff / bound[static_cast<size_t>(i)]);
+        CHECK(std::isfinite(out[static_cast<size_t>(i)]));
+        CHECK_MESSAGE(diff <= bound[static_cast<size_t>(i)],
+                      "M=" << M << " K=" << K << " i=" << i << " out=" << out[i]
+                           << " ref=" << ref[i] << " bound=" << bound[i]);
+      }
+      MESSAGE("kMatmulBTQuant M=", M, " K=", K,
+              ": worst_abs=", worst, " worst bound-ratio=", worst_ratio);
+    }
+  }
+}

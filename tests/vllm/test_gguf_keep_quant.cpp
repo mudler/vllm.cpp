@@ -274,6 +274,40 @@ TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #
   CHECK(!pol.keep_f16);
 }
 
+TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decodes (KEEPQUANT W2)") {
+  // The P150 is discrete with no CPU fallback tier, so the same #523 shape as
+  // ROCm applies: the TT arm may admit only what tenstorrent_ops.cpp has a
+  // registered decode for. W2 registers Q4_K (MatmulBTQuantKernel, decoding
+  // through the W1 bit-exact chain); Q5_K/Q6_K/Q8_0 are owed by the row's W4
+  // and MUST keep the pre-existing expand-bf16 residency until their kernels
+  // land — admitting one early throws at first forward with the model
+  // resident. This is the mutation red made structural: a reviewer who
+  // widens the TT arm past the registered set reds this case.
+  const std::vector<int64_t> shape = {4, 256};  // [out, in]: whole blocks
+  const auto route = [&](uint32_t ty) {
+    return RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/true,
+                           /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                           GgufTensorRole::kMatmulWeight, ty, shape,
+                           vt::DeviceType::kTENSTORRENT);
+  };
+  CHECK(route(kQ4_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ8_0) == GgufResidency::kExpandBf16);  // owed W4
+  CHECK(route(kQ5_K) == GgufResidency::kExpandBf16);  // owed W4
+  CHECK(route(kQ6_K) == GgufResidency::kExpandBf16);  // owed W4
+  CHECK(route(kQ4_0) == GgufResidency::kExpandBf16);  // no TT arm at all
+  CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);
+  CHECK(route(kQ3_K) == GgufResidency::kExpandBf16);
+  // The loader boolean flips only when the op is registered, so a host with a
+  // P150 resolves keep-quant on by default; without the card the default arm
+  // stays false and the load is unchanged.
+  if (vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT)) {
+    const GgufLoadPolicy tt = GgufLoadPolicy::FromEnv(vt::DeviceType::kTENSTORRENT);
+    CHECK(tt.keep_quant);
+  } else {
+    MESSAGE("kMatmulBTQuant not registered on this host; loader boolean unchecked");
+  }
+}
+
 TEST_CASE("quant_repack is decided WITH the resolved device (#2406)") {
   // THE DEFECT. `quant_repack` selects the CIQ G7 load-time permutation of a
   // Q8_0 weight into the ARM i8mm `block_q8_0x4` interleave. Only the CPU

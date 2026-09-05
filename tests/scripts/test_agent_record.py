@@ -2429,12 +2429,112 @@ class GdnDevicePureBackendRowBacksTheRatchet(unittest.TestCase):
         derived snapshot is untracked -- `tracked_issues` cannot vouch for it
         on a fresh checkout. The row line itself carries the reference, and
         that is the tree-truthful place to pin it.
-        """
+
         text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("#2907", row)
         self.assertIn("tenstorrent-gdn-device-pure.md", row)
         self.assertIn("CLAIM-BACKEND-TENSTORRENT-GDN-DEVICE-PURE", row)
+
+    def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
+        path, expected = agent_record.MATRICES["BACKEND"]
+        text = path.read_text(encoding="utf-8")
+        actual = sum(
+            1 for line in text.splitlines() if line.startswith("| `BACKEND-")
+        )
+        self.assertGreater(actual, 0, "the BACKEND matrix must carry rows")
+        self.assertEqual(
+            expected,
+            actual,
+            "the recorded BACKEND pin must equal the rows the matrix ships",
+        )
+
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+
+        for wrong in (actual - 1, actual + 1):
+            errors: list[str] = []
+            patched = dict(agent_record.MATRICES)
+            patched["BACKEND"] = (path, wrong)
+            with mock.patch.object(agent_record, "MATRICES", patched):
+                agent_record.check_matrices(errors)
+            self.assertTrue(
+                any("backend rows" in e.lower() for e in errors),
+                f"pinning BACKEND at {wrong} against {actual} shipped rows must red",
+            )
+
+    def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the BACKEND matrix at a mutated copy on disk, under
+        ROOT because `check_matrices` reports through `relative_to(ROOT)`;
+        `MATRICES` and `MATRIX_PATHS` move TOGETHER, because rows are parsed
+        from the list while the count is taken against the dict.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+
+        path, count = agent_record.MATRICES["BACKEND"]
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "backend-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            patched = dict(agent_record.MATRICES)
+            patched["BACKEND"] = (mutated, count)
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "MATRICES", patched):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("backend rows" in e.lower() for e in errors),
+            f"removing {self.ROW} must break the BACKEND count; got {errors}",
+        )
+
+
+class KeepquantBackendRowBacksTheRatchet(unittest.TestCase):
+    """The BACKEND ratchet bump 89 -> 90 is backed by the keep-quant row
+    (#2959).
+
+    Same shape as `GdnDevicePureBackendRowBacksTheRatchet`, applied to the pin
+    that moved in this change: `MATRICES["BACKEND"]` is re-pinned BY HAND, so
+    a bump with nothing behind it is indistinguishable from a bump for a row
+    that landed. The cases tie THIS value of the pin to the row the matrix
+    carries, derive the expected count from the shipped file rather than
+    restating the constant, and prove the comparison real by moving the pin
+    one in EACH direction -- an off-by-one that only reds downward would let
+    the count grow silently, which is how an unrecorded row hides.
+    """
+
+    ROW = "BACKEND-TENSTORRENT-KEEPQUANT"
+
+    def test_the_row_exists_in_the_backend_matrix(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_its_spec_and_its_claim(self) -> None:
+        """A row whose issue lives only in the PR body is untraceable.
+
+        #2959 is OPEN, so it has no entry in the frozen archive and the
+        derived snapshot is untracked -- `tracked_issues` cannot vouch for it
+        on a fresh checkout. The row line itself carries the reference, and
+        that is the tree-truthful place to pin it.
+        """
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("#2959", row)
+        self.assertIn("tenstorrent-keepquant.md", row)
+        self.assertIn("CLAIM-BACKEND-TENSTORRENT-KEEPQUANT", row)
 
     def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
         path, expected = agent_record.MATRICES["BACKEND"]

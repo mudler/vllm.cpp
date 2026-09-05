@@ -707,6 +707,20 @@ above as its red-before input.
 - CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
   W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
   any of the three.
+- The W2 vision tower and aligner are unreachable from a production entry
+  point. `DeepSeekV4Vision`, its `Forward`, `VisionForward` and
+  `AlignerForward` seams, `DeepSeekV4VisionRopeCosSin` and the
+  `DeepSeekV4VisionCapture` type have no production call site: nothing in
+  `include/vllm.h`, the loader, `ModelRegistry::Forward` or a registered server
+  or command-line path constructs the class, and the stage goldens reach it by
+  building it in the test. The only non-test file that includes the W2 header is
+  `clip_mmproj_gguf.h`, for the `DeepSeekV4VisionConfig` and
+  `DeepSeekV4VisionWeights` types W3A's reader fills, and that reader is
+  unreached for its own reason below. Row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring in W4, which
+  routes the tower through the registered model forward, and issue #2411 tracks
+  it. W2's own commit body claimed this entry was already here when it was not,
+  which is the omission the W2 repair closes.
 - W1 prompt encoding and image preprocessing remain unreachable from a
   production entry point. W4 wires them into the registered model forward, and
   W5 wires the runner, public ABI and OpenAI server for row

@@ -173,9 +173,20 @@ void RefuseUnaccountedClipMmproj(const GgufFile& gguf,
 //       `ffn_gate` + `ffn_up` with `chunk(2, dim=0)`, and
 //       `vision.patch_embed.proj.weight` is VIEWED as a conv2d weight with
 //       `data_torch.reshape(shape[0], 3, p, p)`
-//   gguf-py/gguf/tensor_mapping.py — `vision.blocks.{bid}.attn.wqkv` maps to
-//       V_ENC_ATTN_QKV, which the shared mmproj base then writes as three
-//       SEPARATE `attn_q` / `attn_k` / `attn_v` tensors
+//   gguf-py/gguf/tensor_mapping.py and gguf-py/gguf/constants.py —
+//       `vision.blocks.{bid}.attn.wqkv` maps to V_ENC_ATTN_QKV, which
+//       `constants.py` spells `v.blk.{bid}.attn_qkv`. NOTHING SPLITS IT.
+//       `conversion/base.py` contains no occurrence of `qkv` at all, the only
+//       converter that splits a fused vision qkv is the model-specific
+//       `conversion/qwenvl.py`, and
+//       `conversion/deepseek.py::DeepseekV4FlashVisionModel.modify_tensors`
+//       splits `mlp.w1` only. So the pinned `convert_hf_to_gguf.py` emits the
+//       FUSED `v.blk.{bid}.attn_qkv.{weight,bias}`, which is 299 tensors at
+//       depth 32, while the shipped
+//       `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` mmproj-BF16.gguf carries
+//       the SPLIT `attn_q` / `attn_k` / `attn_v` form, which is 427. This
+//       reader reads the SPLIT form and refuses the FUSED one by name; the
+//       fused arm is not implemented and the spec lists it under `## Owed`
 //   tools/mtmd/clip-impl.h — `TN_TOK_IMG_START/_END/_PAD` and the `TN_*`
 //       spellings of every `v.*` / `mm.*` name
 //   tools/mtmd/clip.cpp::clip_model_loader, PROJECTOR_TYPE_DEEPSEEK4V — the
@@ -199,10 +210,18 @@ inline constexpr const char* kClipProjectorDeepSeekV4 = "deepseek4v";
 // `deepseek4v` would route this file into the Qwen3-VL reader and build a tower
 // that runs and is wrong, so it keeps refusing and this one exists beside it.
 //
-// It also refuses a projector declaring `clip.use_silu = false`. W2's MLP is
-// SwiGLU by construction (it routes through `layers::MlpGateUpMethodBase`), the
-// pinned converter writes the key as `true` for exactly that reason, and a
-// GELU-MLP variant loaded as SwiGLU is fluent and wrong rather than broken.
+// It also refuses a projector declaring `clip.use_silu = false`, AND one that
+// declares nothing. W2's MLP is SwiGLU by construction (it routes through
+// `layers::MlpGateUpMethodBase`), the pinned converter writes the key as `true`
+// for exactly that reason, and a GELU-MLP variant loaded as SwiGLU is fluent
+// and wrong rather than broken. An ABSENT key is not "SwiGLU by omission":
+// `tools/mtmd/clip.cpp` defaults to FFN_GELU_QUICK when neither `use_gelu` nor
+// `use_silu` is set, so silence means the other activation.
+//
+// It refuses the FUSED `v.blk.{bid}.attn_qkv` layout by name as well, BEFORE
+// `RefuseUnaccountedDeepSeekV4ClipMmproj` can blame the file for carrying
+// tensors this reader never reads. That layout is what the pinned converter
+// emits, so the file is correct and this build is the one with the gap.
 void RefuseUnsupportedDeepSeekV4ClipMmproj(const GgufFile& gguf,
                                            const std::string& path);
 
@@ -212,7 +231,17 @@ void RefuseUnsupportedDeepSeekV4ClipMmproj(const GgufFile& gguf,
 // this projector in the same `clip_model_loader` case that reads the keys
 // above, and the pinned converter's `get_vision_config` defaults
 // `vision_rope_theta` to the same value without writing it, so the W2 default
-// stands and is not invented here.
+// stands and is not invented here. It is also a KNOWN GAP shared with the
+// oracle: the converter asserts `vision_max_n_token == 384` and
+// `vision_max_wh_ratio == 8` but never the theta, so a future variant with a
+// different one would be silently mis-read by llama.cpp too. The spec lists it
+// under `## Owed`.
+//
+// Every field this reads is BOUNDED before it is returned. Each becomes a
+// `Require` shape, a loop bound or a `resize` argument, `KvInt` widens any
+// integer spelling a converter chose, and this path runs on a user-supplied
+// `--mmproj`, so an out-of-range value is refused with the key that carried it
+// rather than surfacing as `length_error` or `bad_alloc`.
 multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
     const GgufFile& gguf);
 

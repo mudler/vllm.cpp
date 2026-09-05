@@ -731,6 +731,46 @@ above as its red-before input.
 - DeepSeek-V4 DSpark remains owned by
   `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm`; this row only
   accounts for and names its tensors.
+- The FUSED `v.blk.{bid}.attn_qkv` mmproj arm is NOT IMPLEMENTED, and it is
+  owed by issue #2411 and row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`. `gguf-py/gguf/constants.py`
+  at the pin spells V_ENC_ATTN_QKV `v.blk.{bid}.attn_qkv`, and nothing splits it
+  for this family: `conversion/base.py` contains no occurrence of `qkv` at all,
+  the only converter that splits a fused vision qkv is the model-specific
+  `conversion/qwenvl.py`, and
+  `conversion/deepseek.py::DeepseekV4FlashVisionModel.modify_tensors` splits
+  `mlp.w1` only. So a projector converted by the pinned oracle's OWN
+  `convert_hf_to_gguf.py` carries `v.blk.N.attn_qkv.{weight,bias}` and is 299
+  tensors at depth 32, and this build refuses it BY NAME.
+  `RefuseUnsupportedDeepSeekV4ClipMmproj` states that the fused arm is not
+  implemented and points at #2411, so no user reads the unaccounted-tensor
+  refusal and re-converts a file that is already correct. THIS DOES NOT BLOCK
+  THE SHIPPED VEHICLE: `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` carries the
+  SPLIT form, 427 tensors, verified against its own header. It DOES block
+  converting the checkpoint with the oracle's own script, which is a
+  quant-matched denominator W6 may need.
+- The vision `rope_theta` is unkeyed on BOTH sides and is owed by issue #2411.
+  `tools/mtmd/clip.cpp` hardcodes `10000.0f` for this projector and
+  `conversion/deepseek.py` defaults `vision_rope_theta` to 10000.0 without
+  writing a key. That is correct for this artifact, and the same converter
+  asserts `vision_max_n_token == 384` and `vision_max_wh_ratio == 8` while
+  asserting NOTHING about the theta, so a future variant with a different one
+  would be read silently wrong — by llama.cpp as well as by this reader. No
+  code change is made here, because there is no key to read.
+- Four `clip.*` keys the real `mmproj-BF16.gguf` carries are read by nothing in
+  this tree yet, and they are the PREPROCESSOR CONTRACT that W4 and W5 owe
+  under issue #2411: `clip.vision.image_size = 672`,
+  `clip.vision.image_mean = [0.5, 0.5, 0.5]`,
+  `clip.vision.image_std = [0.5, 0.5, 0.5]` and
+  `clip.vision.image_min_pixels = 147456`. W1's preprocessor currently takes
+  these from its own configuration rather than from the projector that shipped
+  with the weights.
+- The reader's `general.alignment` fallback is never exercised. The fixture's
+  builder always writes the key, and the real artifact carries no alignment key
+  at all, so the default-32 path the shipped file actually takes is the one path
+  the gate does not cover. Widening the fixture is owed by issue #2411 and W3;
+  it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
+  test uses, so it is not made inside a W3A repair.
 
 ### W3A evidence
 
@@ -755,8 +795,11 @@ four sentinel vectors are F32. The reader's own enumeration returns 427 names at
 
 Four layout mismatches separate what the file stores from what W2 consumes, and
 each is a silent wrong answer rather than a crash. `attn_q` / `attn_k` /
-`attn_v` are stored separately and fuse in that row order, which is the order
-`deepseek_v4_vision.cpp` slices back out with `RowSlice`. `ffn_gate` and
+`attn_v` are stored separately IN THIS FILE and fuse in that row order, which is
+the order `deepseek_v4_vision.cpp` slices back out with `RowSlice`. The split is
+a property of the shipped artifact and not of the family: the pinned
+`convert_hf_to_gguf.py` emits the FUSED `v.blk.{bid}.attn_qkv` instead, which
+`## Owed` records as an unimplemented arm. `ffn_gate` and
 `ffn_up` are stored separately and concatenate gate-first, which is the half
 `vt::SiluAndMul` applies SiLU to and the half the pinned converter's
 `gate, up = data_torch.chunk(2, dim=0)` took. `v.patch_embd.weight` is a conv2d

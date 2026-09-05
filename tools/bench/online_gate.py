@@ -3524,10 +3524,17 @@ def record_oracle_manifest(
         raise HarnessError("vLLM distribution metadata is unavailable") from error
     metadata_version = distribution.version
     runtime_version = getattr(vllm, "__version__", None)
-    # Metadata and runtime are checked against their OWN recorded strings. They
-    # differ on the pin (metadata appends ".precompiled"), so the previous
-    # `metadata == runtime == CONST` shape was unsatisfiable there at any value,
-    # and a `startswith` would have accepted an arbitrary suffix instead.
+    # Metadata and runtime are checked against their OWN recorded strings. The
+    # shape this replaced was `metadata == runtime == CONST`, one constant for
+    # both fields; it was unsatisfiable at the pin of the day at ANY value,
+    # because `VLLM_USE_PRECOMPILED=1` appended ".precompiled" to the metadata
+    # string only, and a `startswith` would have accepted an arbitrary suffix
+    # instead. AT TODAY'S PIN THE TWO RECORDED STRINGS ARE EQUAL: `5d97007c2`
+    # (#2896) recorded the SOURCE build, which appends nothing. That changes
+    # nothing here -- two fields, two comparisons -- and it does mean no real
+    # input can tell this shape from the one-constant shape while they stay
+    # equal, which is why the test that holds this line patches the
+    # distribution constant to separate them (#2931).
     if (
         metadata_version != VLLM_DISTRIBUTION_VERSION
         or runtime_version != VLLM_ORACLE_VERSION

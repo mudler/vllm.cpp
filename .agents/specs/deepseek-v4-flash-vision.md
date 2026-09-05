@@ -1000,6 +1000,15 @@ width and refuses. This mirrors what the safetensors arm already gets from
 `carried.Float(..., {ne})` and what `glm5_next_loader.cpp` and
 `glm_moe_dsa_loader.cpp` already get from `LoadVecF32(g, name, e)`.
 
+`Vec1D` reads that width from the FILE HEADER and refuses before the value is
+materialized. A guard that reads the width off the LOADED tensor dequantizes
+first and refuses second, so a corrupt or absurd declared width surfaces as a
+failed allocation rather than as the named refusal. A guard whose only failure
+mode is `bad_alloc` is a crash and not a gate, and an allocation sized from an
+unvalidated header takes the machine down rather than one test. Mutation:
+deleting the `VT_CHECK` makes both `NARROW` cases fail together against an empty
+message, four assertions, which is the red the guard was introduced against.
+
 **Both router biases are now checked, not only the vision one.** The text
 `exp_probs_b.bias` beside it carried the identical weakness. It is a
 long-standing gap rather than a W3B regression, and repairing one while leaving

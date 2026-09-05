@@ -265,10 +265,14 @@ plausible and a token gate green.
 
 ### 1. `exp_probs_b_vl`, a second MoE routing bias
 
-The unsloth text GGUF's first shard holds 43 tensors and nothing else: one
-`blk.N.exp_probs_b_vl.bias`, f32 `[256]`, for every one of the 43 language
-layers. It is the expert-probability bias the router adds when the token being
-routed is an image token, in place of the text `exp_probs_b`.
+The shard in question belongs to the **language half of the VISION repository**,
+`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`. Its first shard holds 43 tensors and
+nothing else: one `blk.N.exp_probs_b_vl.bias`, f32 `[256]`, for every one of the
+43 language layers. A genuine DeepSeek-V4 **text** checkpoint carries none of
+these tensors, which is why every loader arm takes this one as optional and why
+a text checkpoint stays byte-identical without it. It is the expert-probability
+bias the router adds when the token being routed is an image token, in place of
+the text `exp_probs_b`.
 
 For the three hash layers (`deepseek4.hash_layer_count = 3`) it does more than
 substitute a bias. Text tokens on a hash layer are routed by the `tid2eid` hash
@@ -956,3 +960,103 @@ asserts that layer 0 carries `tid2eid` and `e_score_bias_vl` and an EMPTY
 Nothing selects the loaded bias. The commit body names it unreached, names the
 owning row and issue #2411, and `## Owed` above lists the three behaviours W4
 owns.
+
+### W3B repair evidence
+
+A fresh review of W3B (`ebca4db83`) returned four findings. This section records
+what each repair changed, the red result that was captured before it, and the
+green result after it. The counts here supersede the `6 of 6 cases and 83 of 83
+assertions` figure recorded above for `test_deepseek_v4_mm_loader`.
+
+**F1 (blocking): the EXL3 carried arm asserted a slot, not the bytes.** The case
+`dsv4 vision safetensors: the EXL3 carried arm routes and loads gate.bias_vl`
+checked the width of `gate_bias_vl`, its non-emptiness, and `text[i] != vl[i]`.
+Two defects pass all three. A slot filled with zeros keeps its width, and a swap
+of the two biases keeps them unequal. The case now asserts every element of
+`gate_bias_vl` on every layer, and every element of `gate_bias` on the gated
+layer, against `dsv4_exl3_fixture::CarriedValue` for the tensor's own name.
+
+The repair is a test repair. The loader was correct, and no product line changed
+for this finding.
+
+Both reviewer mutations were reapplied to `deepseek_v4_weights.cpp` and both are
+now red. Replacing the read with `carried.Account(name)` plus an all-zero
+`assign` gives four failures of the form
+`CHECK( 0 == Approx( -0.999559 ) )` at layers 0 and 1. Transposing the two
+biases on the gated layers gives four more,
+`CHECK( 0.0988742 == Approx( -1.24119 ) )` on `gate_bias_vl` and
+`CHECK( -1.24119 == Approx( 0.0988742 ) )` on `gate_bias`. The source was
+restored byte for byte after each one; its SHA-256 read
+`794c00f7557bbe71c858e82f0e85016475a7937264f5a93755e35705e2f070c2` before the
+first mutation and after each restore, which is the same value the W3B evidence
+above records.
+
+**F2 (medium): the GGUF arm validated no width.** `V4GgufCtx::Vec` validates the
+residency the policy elected and the role a tensor was routed under. It
+validates no geometry, so a `[E-1]` router bias published under an unchanged name
+loaded in silence and would be indexed by expert id, which reads past the end of
+a short host `std::vector<float>`. The new `V4GgufCtx::Vec1D` takes the expected
+width and refuses. This mirrors what the safetensors arm already gets from
+`carried.Float(..., {ne})` and what `glm5_next_loader.cpp` and
+`glm_moe_dsa_loader.cpp` already get from `LoadVecF32(g, name, e)`.
+
+`Vec1D` reads that width from the FILE HEADER and refuses before the value is
+materialized. A guard that reads the width off the LOADED tensor dequantizes
+first and refuses second, so a corrupt or absurd declared width surfaces as a
+failed allocation rather than as the named refusal. A guard whose only failure
+mode is `bad_alloc` is a crash and not a gate, and an allocation sized from an
+unvalidated header takes the machine down rather than one test. Mutation:
+deleting the `VT_CHECK` makes both `NARROW` cases fail together against an empty
+message, four assertions, which is the red the guard was introduced against.
+
+**Both router biases are now checked, not only the vision one.** The text
+`exp_probs_b.bias` beside it carried the identical weakness. It is a
+long-standing gap rather than a W3B regression, and repairing one while leaving
+its neighbour would leave the two to drift the first time either is touched. The
+widened scope is stated here and in the commit body rather than left silent.
+
+Red before: two new cases build a file whose KV declares `expert_count` and
+whose tensor is one narrower. `LoadDeepseekV4FromGguf` raised nothing, so both
+`CHECK(msg.find(...))` assertions failed against an empty message. Green after,
+the refusals read
+
+```text
+vt: deepseek-v4 gguf: blk.0.exp_probs_b_vl.bias must be a 1-D [4] vector
+(n_routed_experts), got rank 1 first dim 3
+vt: deepseek-v4 gguf: blk.1.exp_probs_b.bias must be a 1-D [4] vector
+(n_routed_experts), got rank 1 first dim 3
+```
+
+**F3 (low): per-layer optionality is deliberate, and is now executable.** No arm
+requires the bias to be present on all layers or on none. The decision is to
+MIRROR the oracle rather than to enforce the dichotomy. llama.cpp declares
+`ffn_exp_probs_b_vl` with `TENSOR_NOT_REQUIRED` for each layer independently
+(`src/models/deepseek4.cpp`, PR #28154 at the `llama-cpp-dsv4vision` pin), so a
+partially converted file loads there. Refusing a file the oracle accepts is a
+divergence that needs its own justification, and this one has none: the empty
+slot is a state the consumer must already handle, because a text checkpoint
+presents it on every layer.
+
+The prose in W3B that reads "on every layer of a vision artifact and on no layer
+of a text one" describes the two PUBLISHED artifacts. It is not a constraint the
+loader enforces, and the new case
+`dsv4 PARTIAL GGUF: the vision bias is optional PER LAYER, as in llama.cpp`
+pins the behaviour. A later change to an all-or-nothing refusal is then a red
+test somebody has to argue with, instead of a silent change of contract.
+
+**F4 (record): the artifact the shard belongs to.** Section 1 above opened by
+calling it "the unsloth text GGUF's first shard". The shard belongs to the
+language half of the VISION repository. Section 1 now names the repository and
+states that a text checkpoint carries none of these tensors, which is the fact
+the optionality design rests on.
+
+Gate after the repair, on a Release CPU build configured with
+`-DVLLM_CPP_CUDA=OFF`. `ctest -R 'deepseek_v4_(mm_loader|gguf_load|exl3_loader|
+moe|forward)'` passes 5 of 5. `test_deepseek_v4_mm_loader` reports 9 cases and
+105 assertions, up from 6 and 83. The other four are unchanged at their reviewed
+values: `gguf_load` 19 cases and 1056 assertions, `exl3_loader` 22 and 613,
+`moe` 12 and 716, `forward` 6 and 34.
+
+Nothing in this repair selects the loaded bias. W4 still owns the per-token
+choice, the hash-layer replacement and the image-span window, and `## Owed`
+above still lists them.

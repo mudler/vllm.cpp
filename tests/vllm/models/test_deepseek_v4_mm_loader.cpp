@@ -139,9 +139,26 @@ std::string Blk(int64_t l, const std::string& s) {
   return "blk." + std::to_string(l) + "." + s;
 }
 
+// The declared width of each router bias. Both default to `expert_count`, which
+// is what every published artifact carries. A case that narrows one is asking
+// the loader the question a re-quantized publish under an unchanged name asks:
+// a bias emitted at `[E-1]` has to be REFUSED, because the router indexes it by
+// expert and a short `std::vector<float>` is read past its end rather than
+// caught. The fixture writes the KV `expert_count` from `kExperts` regardless,
+// so the file states one width and the tensor another — exactly the disagreement
+// the loader is the only thing positioned to see.
+struct BiasWidths {
+  int64_t text = kExperts;
+  int64_t vision = kExperts;
+};
+
 // `vision` writes `blk.N.exp_probs_b_vl.bias` on EVERY layer, which is what the
 // pinned vision artifact carries; false is the text checkpoint.
-std::string BuildDeepseek4Gguf(bool vision) {
+// `vision_from` is the first layer that carries `exp_probs_b_vl.bias`. 0 is the
+// whole artifact, which is what the pinned build holds; a higher value builds
+// the PARTIALLY converted file that llama.cpp's `TENSOR_NOT_REQUIRED` accepts.
+std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
+                               int64_t vision_from = 0) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -217,12 +234,12 @@ std::string BuildDeepseek4Gguf(bool vision) {
                     return static_cast<float>(i % kExperts);
                   }));
     } else {
-      b.AddTensor(Blk(l, "exp_probs_b.bias"), GgmlDims({kExperts}), /*F32=*/0,
-                  F32Data(kExperts, [l](int64_t i) { return TextBiasFill(l, i); }));
+      b.AddTensor(Blk(l, "exp_probs_b.bias"), GgmlDims({bw.text}), /*F32=*/0,
+                  F32Data(bw.text, [l](int64_t i) { return TextBiasFill(l, i); }));
     }
-    if (vision) {
-      b.AddTensor(Blk(l, "exp_probs_b_vl.bias"), GgmlDims({kExperts}), /*F32=*/0,
-                  F32Data(kExperts, [l](int64_t i) { return VisionBiasFill(l, i); }));
+    if (vision && l >= vision_from) {
+      b.AddTensor(Blk(l, "exp_probs_b_vl.bias"), GgmlDims({bw.vision}), /*F32=*/0,
+                  F32Data(bw.vision, [l](int64_t i) { return VisionBiasFill(l, i); }));
     }
   }
   return b.Build();
@@ -377,6 +394,74 @@ TEST_CASE("dsv4 TEXT GGUF: the absent vision bias is accepted and changes nothin
   }
 }
 
+// A `[E]` assertion on the LOADED vector is right only by construction while the
+// fixture is the only thing that decides the width. These two cases move the
+// decision to the loader: the file declares `expert_count` in its KV and writes a
+// NARROWER tensor, which is what an artifact re-quantized in place under an
+// unchanged name can ship. `Vec` checks residency and role and no geometry at
+// all, so before the `Vec1D` repair both of these loaded in silence and only the
+// suite's own read-back noticed — which measures the fixture, not the loader.
+TEST_CASE("dsv4 vision GGUF: a NARROW exp_probs_b_vl is REFUSED, not read past") {
+  BiasWidths narrow;
+  narrow.vision = kExperts - 1;
+  TempFile file(BuildDeepseek4Gguf(/*vision=*/true, narrow));
+  const vllm::GgufFile g = vllm::GgufFile::Open(file.path());
+  const vllm::GgufLoadPolicy pol = KeepPolicy();
+  const std::string msg = ThrowMessage(
+      [&] { (void)vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &pol); });
+  CAPTURE(msg);
+  // Named, so the refusal says WHICH tensor and WHAT width it owed — a bare
+  // "shape mismatch" would leave the operator to find that out themselves.
+  CHECK(msg.find("exp_probs_b_vl.bias") != std::string::npos);
+  CHECK(msg.find("[" + std::to_string(kExperts) + "]") != std::string::npos);
+}
+
+TEST_CASE("dsv4 TEXT GGUF: a NARROW exp_probs_b is REFUSED too") {
+  BiasWidths narrow;
+  narrow.text = kExperts - 1;
+  TempFile file(BuildDeepseek4Gguf(/*vision=*/false, narrow));
+  const vllm::GgufFile g = vllm::GgufFile::Open(file.path());
+  const vllm::GgufLoadPolicy pol = KeepPolicy();
+  const std::string msg = ThrowMessage(
+      [&] { (void)vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &pol); });
+  CAPTURE(msg);
+  CHECK(msg.find("exp_probs_b.bias") != std::string::npos);
+  CHECK(msg.find("[" + std::to_string(kExperts) + "]") != std::string::npos);
+}
+
+// The DECISION about per-layer optionality, made executable. llama.cpp declares
+// `ffn_exp_probs_b_vl` with `TENSOR_NOT_REQUIRED` for every layer independently
+// (`src/models/deepseek4.cpp`, PR #28154 at `llama-cpp-dsv4vision`), so a file
+// converted with the tensor on only some layers LOADS there. This arm mirrors
+// that rather than enforcing the all-or-nothing dichotomy W3B's own prose
+// describes, because refusing a file the oracle accepts is a divergence, and
+// because the empty slot is a state the consumer must already handle: a text
+// checkpoint presents it on EVERY layer. Pinned here so that switching to a
+// refusal is a red test somebody has to argue with, not a silent change.
+TEST_CASE("dsv4 PARTIAL GGUF: the vision bias is optional PER LAYER, as in llama.cpp") {
+  TempFile file(BuildDeepseek4Gguf(/*vision=*/true, BiasWidths{},
+                                   /*vision_from=*/kLayers - 1));
+  const vllm::GgufFile g = vllm::GgufFile::Open(file.path());
+  const vllm::GgufLoadPolicy pol = KeepPolicy();
+  vllm::DeepseekV4Weights w;
+  const std::string msg = ThrowMessage(
+      [&] { w = vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &pol); });
+  CAPTURE(msg);
+  REQUIRE(msg.empty());
+  CHECK(w.accounted_tensors == static_cast<int64_t>(g.Tensors().size()));
+  REQUIRE(w.host.layers.size() == static_cast<size_t>(kLayers));
+  for (int64_t l = 0; l < kLayers - 1; ++l) {
+    CAPTURE(l);
+    CHECK(w.gguf.layers[static_cast<size_t>(l)].e_score_bias_vl.Empty());
+    CHECK(w.host.layers[static_cast<size_t>(l)].gate_bias_vl.empty());
+  }
+  const int64_t last = kLayers - 1;
+  const std::vector<float>& vl = w.host.layers[static_cast<size_t>(last)].gate_bias_vl;
+  REQUIRE(vl.size() == static_cast<size_t>(kExperts));
+  for (int64_t i = 0; i < kExperts; ++i)
+    CHECK(vl[static_cast<size_t>(i)] == doctest::Approx(VisionBiasFill(last, i)));
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 TEST_CASE("dsv4 vision safetensors: the EXL3 carried arm routes and loads gate.bias_vl") {
   const FixtureOptions opt = TwoLayerHashOptions();
@@ -390,10 +475,22 @@ TEST_CASE("dsv4 vision safetensors: the EXL3 carried arm routes and loads gate.b
   REQUIRE(msg.empty());
 
   REQUIRE(w.host.layers.size() == static_cast<size_t>(opt.layers));
+  // The BYTES, on every layer, against the generator the fixture wrote them
+  // with. A width check and a `text != vl` inequality both survive the two
+  // defects that matter here: a slot filled with zeros is still `[E]` wide, and
+  // a SWAP of the two biases still leaves them unequal. Only the fixture's own
+  // value for THIS name can say that THIS tensor reached THIS slot. The
+  // scale/center pair repeats `BuildStFixture`'s `F32Entry` call above.
   for (int l = 0; l < opt.layers; ++l) {
     CAPTURE(l);
-    CHECK(w.host.layers[static_cast<size_t>(l)].gate_bias_vl.size() ==
-          static_cast<size_t>(dsv4_exl3_fixture::kExperts));
+    const std::string name = "layers." + std::to_string(l) + ".ffn.gate.bias_vl";
+    const std::vector<float>& vl = w.host.layers[static_cast<size_t>(l)].gate_bias_vl;
+    REQUIRE(vl.size() == static_cast<size_t>(dsv4_exl3_fixture::kExperts));
+    for (int64_t i = 0; i < dsv4_exl3_fixture::kExperts; ++i) {
+      CAPTURE(i);
+      CHECK(vl[static_cast<size_t>(i)] ==
+            doctest::Approx(dsv4_exl3_fixture::CarriedValue(name, i, 0.9f, -1.0f)));
+    }
   }
   // The hash layer still carries its table and no text bias; the gated layer
   // carries a text bias that differs from the vision one.
@@ -404,6 +501,15 @@ TEST_CASE("dsv4 vision safetensors: the EXL3 carried arm routes and loads gate.b
   const std::vector<float>& vl = w.host.layers[1].gate_bias_vl;
   REQUIRE(text.size() == vl.size());
   for (size_t i = 0; i < text.size(); ++i) CHECK(text[i] != doctest::Approx(vl[i]));
+  // The OTHER half of the swap. `gate_bias_vl` asserted alone catches a
+  // transposition on the layer that carries both, but this states the text slot
+  // independently, so a one-way misroute cannot hide behind the vision check.
+  for (int64_t i = 0; i < dsv4_exl3_fixture::kExperts; ++i) {
+    CAPTURE(i);
+    CHECK(text[static_cast<size_t>(i)] ==
+          doctest::Approx(dsv4_exl3_fixture::CarriedValue("layers.1.ffn.gate.bias", i,
+                                                          0.3f, 0.0f)));
+  }
 }
 
 TEST_CASE("dsv4 TEXT safetensors: the EXL3 carried arm is byte-identical without it") {

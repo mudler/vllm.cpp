@@ -29,10 +29,19 @@
 #   PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     ~/venvs/vllm-oracle/bin/python scripts/qwen3-oracle-capture.py \
 #       --model Qwen/Qwen3-4B  --runs 3  --out-dir <goldens>/qwen3_greedy_4b
+#
+# The historical Qwen3 distributional workflow above remains available.
+# Qwen3.5 uses verified provenance and at least ten deterministic repeats
+# under #2773. See docs/USAGE.md for its capture and launcher inputs.
 import argparse
+import io
+from pathlib import Path
 import os
 import sys
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qwen3_oracle_common as common
 
 PROMPTS = [
     "The capital of France is",
@@ -61,12 +70,12 @@ def default_out_dir():
     )
 
 
-def parse_args():
+def _parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=os.environ.get("QWEN3_MODEL", "Qwen/Qwen3-0.6B"))
     ap.add_argument("--out-dir", default=None,
                     help="golden dir (default tests/parity/goldens/qwen3_greedy_0_6b)")
-    ap.add_argument("--runs", type=int, default=int(os.environ.get("QWEN3_RUNS", "10")),
+    ap.add_argument("--runs", "--repetitions", type=int, default=int(os.environ.get("QWEN3_RUNS", "10")),
                     help="K greedy runs to build the observed distribution (K>=1)")
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--gpu-mem", type=float,
@@ -77,7 +86,20 @@ def parse_args():
                     help="decode each prompt in its OWN generate() call (batch size 1) "
                          "to match the paged-engine gate's single-request decode "
                          "regime; otherwise all prompts are batched in one call")
-    return ap.parse_args()
+    common.add_options(ap)
+    return common.finish_args(ap, argv)
+
+
+def parse_args(argv=None):
+    return _parse_args(argv)
+
+
+def _llm_kwargs(args):
+    return common.llm_kwargs(args, args.gpu_mem)
+
+
+def _mode_narration(args):
+    return common.mode_narration(args)
 
 
 def generate_all(llm, sp, per_prompt):
@@ -94,67 +116,65 @@ def generate_all(llm, sp, per_prompt):
 
 
 def main():
-    args = parse_args()
+    args = _parse_args()
+    prompt_record = common.check_prompts(__file__, PROMPTS)
+    model = common.model_identity(args)
+    common.strict_inputs(args, model)
+    import vllm
     from vllm import LLM, SamplingParams
 
-    out_dir = args.out_dir or default_out_dir()
-    os.makedirs(out_dir, exist_ok=True)
-    N = len(PROMPTS)
-    T = args.max_tokens
-    K = max(1, args.runs)
-
-    llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
-              gpu_memory_utilization=args.gpu_mem)
-    sp = SamplingParams(temperature=0.0, max_tokens=T)
-
-    # runs[k][i] = list of token ids for prompt i on run k (padded to T with -1).
+    strict = common.is_qwen35(model["identity"])
+    runtime = common.runtime_identity(vllm, args, strict) if strict else None
+    print(_mode_narration(args))
+    llm = LLM(**_llm_kwargs(args))
+    runtime = runtime or common.runtime_identity(vllm, args, False)
+    context = common.resolved_context(args, llm, model, runtime, prompt_record,
+                                      1 if args.per_prompt else len(PROMPTS))
+    context["tool"] = "qwen3-oracle-capture"
+    strict = context["regime"] == "qwen3_5_strict"
+    out_dir = Path(args.out_dir or default_out_dir())
+    common.require(not strict or not out_dir.exists() or not any(out_dir.iterdir()),
+                   f"capture directory is not empty: {out_dir}")
+    N, T, K = len(PROMPTS), args.max_tokens, args.runs
+    sp = SamplingParams(temperature=0.0, max_tokens=T, seed=args.seed or 0)
+    common.record_sampling(context, sp)
     dist = np.full((N, T, K), -1, dtype="<i4")
-    run0 = np.zeros((N, T), dtype="<i4")
-    print(f"capture regime: {'PER-PROMPT (batch=1)' if args.per_prompt else 'BATCHED'}")
+    prompt_ids = []
+    deterministic = True
+    print(f"capture regime: {context['regime']}; batch={context['batching']['batch_size']}; repeats={K}")
     for k in range(K):
         by_prompt = generate_all(llm, sp, args.per_prompt)
-        for i, p in enumerate(PROMPTS):
-            o = by_prompt[p]
-            ids = list(o.outputs[0].token_ids)
-            if len(ids) < T:
-                print(f"NOTE run{k} prompt[{i}] produced {len(ids)} tokens (< {T}); "
-                      f"padding with -1", file=sys.stderr)
-            for j in range(min(T, len(ids))):
-                dist[i, j, k] = ids[j]
+        common.require(set(by_prompt) == set(PROMPTS), "oracle returned a different prompt set", "STRUCTURE_MISMATCH")
+        for i, prompt in enumerate(PROMPTS):
+            output = by_prompt[prompt]
+            common.require(len(output.outputs) == 1, "oracle returned multiple continuations", "STRUCTURE_MISMATCH")
+            ids = list(output.outputs[0].token_ids)
+            prefix = list(output.prompt_token_ids)
+            common.require(prefix and all(isinstance(x, int) and 0 <= x <= 2147483647 for x in prefix + ids)
+                           and len(ids) <= T, "invalid oracle token sequence", "STRUCTURE_MISMATCH")
+            dist[i, :len(ids), k] = ids
             if k == 0:
-                for j in range(min(T, len(ids))):
-                    run0[i, j] = ids[j]
-                np.array(o.prompt_token_ids, dtype="<i4").tofile(
-                    os.path.join(out_dir, f"p{i}_prompt.i32"))
-                print(f"prompt[{i}] {p!r} -> {ids}  ({o.outputs[0].text!r})")
-
-    np.save(os.path.join(out_dir, "greedy_ids.npy"), run0)
-    np.save(os.path.join(out_dir, "greedy_dist.npy"), dist)
-
-    # ---- determinism report -------------------------------------------------
-    print(f"\n=== determinism report: {args.model}  N={N} T={T} K={K} ===")
-    deterministic = True
-    total_multi_pos = 0
-    for i in range(N):
-        # distinct full sequences across the K runs
-        seqs = {tuple(int(x) for x in dist[i, :, k]) for k in range(K)}
-        # per-position distinct-token count
-        multi = [j for j in range(T) if len({int(dist[i, j, k]) for k in range(K)}) > 1]
-        total_multi_pos += len(multi)
-        if len(seqs) > 1:
-            deterministic = False
-            print(f"  prompt[{i}] NON-DET: {len(seqs)} distinct sequences; "
-                  f"near-tie positions {multi}")
-            for j in multi:
-                observed = sorted({int(dist[i, j, k]) for k in range(K)})
-                print(f"      pos {j:2d}: observed tokens {observed}")
-        else:
-            print(f"  prompt[{i}] deterministic (1 sequence over {K} runs)")
-    print(f"=== {'ALL DETERMINISTIC' if deterministic else 'NON-DETERMINISTIC'} "
-          f"over K={K}; {total_multi_pos} multi-member (prompt,pos) cells ===")
-    print(f"wrote {out_dir}/greedy_ids.npy {run0.shape} + "
-          f"{out_dir}/greedy_dist.npy {dist.shape}")
+                prompt_ids.append(prefix)
+            else:
+                deterministic &= prefix == prompt_ids[i] and np.array_equal(dist[i, :, k], dist[i, :, 0])
+    context["deterministic"] = bool(deterministic)
+    common.require(not strict or deterministic, "oracle tokens or prompt tokenization changed across repeats", "NONDETERMINISTIC")
+    common.confirm_inputs(args, vllm, context, __file__, PROMPTS)
+    run0 = dist[:, :, 0].copy()
+    payloads = {f"p{i}_prompt.i32": np.asarray(ids, dtype="<i4").tobytes()
+                for i, ids in enumerate(prompt_ids)}
+    for name, array in (("greedy_ids.npy", run0), ("greedy_dist.npy", dist)):
+        buffer = io.BytesIO()
+        np.save(buffer, array, allow_pickle=False)
+        payloads[name] = buffer.getvalue()
+    common.publish(out_dir, payloads, context, "oracle-provenance.json", args.provenance_out,
+                   protected_inputs=common.capture_input_paths(args, vllm, context, __file__))
+    print(f"wrote {out_dir}; deterministic={bool(deterministic)}; output_sha256={context['output_sha256']}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (common.CaptureError, OSError, ValueError) as error:
+        print(str(error) if isinstance(error, common.CaptureError) else f"ARTIFACT_MISMATCH: {error}", file=sys.stderr)
+        raise SystemExit(1)

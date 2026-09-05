@@ -1136,6 +1136,57 @@ checkout at exactly the recorded byte counts, so those two sizes are locally
 confirmed. The distilled bf16 DiT is absent from the shared checkout, so its
 42,018,190,584 bytes rest on the tree listing and a range request alone.
 
+## Capture Qwen oracle evidence
+
+Use `scripts/qwen3-oracle-capture.py` for greedy continuations and
+`scripts/qwen3-neartie-gap.py` for gaps under the local engine's exact token
+prefix. Both accept `--kv-cache-dtype auto|bfloat16|fp8_e4m3`, `--seed`,
+`--max-tokens`, and `--runs`. `--repetitions` is an alias for `--runs`.
+Production execution is the default. `--execution-mode eager` and its
+`--enforce-eager` alias select diagnostics, which cannot be a denominator.
+
+Qwen3.5 captures require verified local model artifacts and at least 10
+deterministic repeats. Supply full model and vLLM revisions, the installed
+vLLM wheel archive, and a launcher JSON manifest. That manifest contains
+`vllm_revision`, `wheel_sha256`, and an immutable `sha256:` `image_digest`.
+Model files need matching HuggingFace download metadata or immutable cache
+snapshot paths. The tools hash the files and compare wheel members with the
+imported package. An installed `+g` version suffix verifies only its recorded
+VCS prefix. Image identity remains a launcher attestation.
+
+After supplying these paths and revisions, use an empty capture directory:
+
+```sh
+python3 scripts/qwen3-oracle-capture.py \
+  --model "$MODEL_DIR" --model-revision "$MODEL_REV" \
+  --vllm-revision "$VLLM_REV" --vllm-wheel "$VLLM_WHEEL" \
+  --runtime-manifest "$RUNTIME_MANIFEST" --kv-cache-dtype auto \
+  --execution-mode production --seed 0 --max-tokens 16 --runs 10 \
+  --per-prompt --out-dir "$CAPTURE_DIR"
+```
+
+Place the matching local gate's `our_ids.i32` dump in that directory before
+running `qwen3-neartie-gap.py`. Pass the same model, revisions, runtime inputs,
+cache mode, seed, and token count, replacing `--out-dir` with `--golden-dir`.
+The near-tie tool uses one request at a time, so its strict input capture must
+use `--per-prompt`. Each tool writes a provenance JSON file beside its NumPy
+outputs. `--provenance-out PATH` writes an identical additional copy. Strict
+captures refuse existing outputs and mismatched or incomplete evidence.
+Output and provenance paths cannot overwrite capture inputs, including symbolic
+links and hardlinks to those inputs.
+
+`sampling_normalized` records the supplied `SamplingParams` after constructor
+normalization. vLLM resolves engine requests on a clone. `sampling_resolved`
+remains null, and `sampling_resolution` records that observation limit.
+Teacher-forcing sampling carries the same qualification.
+
+Legacy Qwen3 distributional calls remain usable, including captures without
+complete provenance and near-tie inputs without manifests. Their manifests
+record missing provenance and observed nondeterminism. A legacy capture cannot
+supply a Qwen3.5 near-tie run. These tool checks do not establish GPU execution
+or accept new permanent goldens. Active-pin acceptance remains pending in
+[#2773](https://github.com/mudler/vllm.cpp/issues/2773).
+
 ## Look up interface details
 
 [Reference pages](reference/README.md) collect dense lookup material such as

@@ -524,6 +524,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
+          python3 tests/scripts/test_qwen3_capture_tools.py
+          python3 tests/scripts/test_qwen3_capture_outputs.py
           python3 tests/scripts/test_ltx25_render_compare.py && python3 tests/scripts/test_ltx25_absolute_reference.py
           # The prompt-adherence half of the same tool (#2295, owning #1854's
           # first sub-question). 42 of its 47 cases need numpy only; the five

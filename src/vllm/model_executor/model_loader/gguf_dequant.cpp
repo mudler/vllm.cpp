@@ -126,6 +126,8 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
     case 21:   // IQ3_S   (3.4375 bpw, 512-entry codebook with a qh-spliced
                //           ninth index bit and DIRECT sign bytes; the 4
                //           blocking tensors of Qwen3.8-27B UD-Q4_K_M, #2510)
+    case 34:   // TQ1_0 (ternary keep-quant, 256-elem blocks)
+    case 35:   // TQ2_0 (ternary keep-quant, 256-elem blocks)
     case 16: {  // IQ2_XXS (~2-bit codebook; UD-IQ2_XXS DeepSeek-V4 vehicle)
       // The block decoders moved to vt (src/vt/cpu/cpu_quant_dequant.cpp) so
       // the loader oracle and the compute-in-quant GEMM's generic fallback

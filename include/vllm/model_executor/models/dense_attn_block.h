@@ -742,5 +742,87 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   return o;
 }
 
+inline DBuf AttnBlockMaple(Dev d, const Qwen3DenseAttnWeights& w, bool is_swa,
+                           const HfConfig& cfg, const Tensor& dhn,
+                           const StepInputs& si,
+                           const CommonAttentionMetadata& meta,
+                           const PagedKvCache& kv, int64_t T) {
+  // Global layers skip RoPE entirely: rotary_dim=0 disables every rope arm.
+  HfConfig layer_cfg = cfg;
+  if (!is_swa) layer_cfg.rotary_dim = 0;
+
+  const int64_t H = cfg.hidden_size;
+  const int64_t Hq = cfg.num_attention_heads;
+  const int64_t Hkv = cfg.num_key_value_heads;
+  const int64_t Dh = cfg.head_dim;
+  const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
+  const float eps = static_cast<float>(cfg.rms_norm_eps);
+  const int rot = static_cast<int>(layer_cfg.rotary_dim);
+  VT_CHECK(w.qkv_bias.Empty(), "maple: no attention bias");
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
+           "maple: KV cache must be bf16 or f32");
+
+  // Merged QKV (single MatmulBT over the [qdim+2kdim, H] owner + QkvSplit).
+  DBuf q(d, DType::kBF16, {T, qdim});
+  DBuf k(d, DType::kBF16, {T, kdim});
+  DBuf v(d, DType::kBF16, {T, kdim});
+  {
+    Tensor wqkv = ResidentWeight(d, w.qkv_proj);
+    DBuf qkv(d, DType::kBF16, {T, qdim + 2 * kdim});
+    vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
+    vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+  }
+
+  // Per-head q/k RMSNorm then (SWA-only) partial NeoX RoPE.
+  Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
+  Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
+  if (!w.q_norm.Empty()) {
+    Tensor wqn = ResidentWeight(d, w.q_norm, {Dh});
+    Tensor wkn = ResidentWeight(d, w.k_norm, {Dh});
+    Tensor q2 = Reshape(q.t(), {T * Hq, Dh});
+    vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
+    Tensor k2 = Reshape(k.t(), {T * Hkv, Dh});
+    vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+  }
+  if (rot > 0) {
+    vt::RopeNeox(d.q, q3, k3, si.positions.t(),
+                 MakeRopeArgs(layer_cfg));
+  }
+
+  // K/V into the paged cache, windowed causal GQA attention.
+  Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
+  Tensor kw = k3, vw = v3;
+  DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
+  DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
+  if (kv.dtype != DType::kBF16) {
+    vt::CastF32(d.q, kcast.t(), k3);
+    vt::CastF32(d.q, vcast.t(), v3);
+    kw = kcast.t();
+    vw = vcast.t();
+  }
+  Tensor k_cache = KvSlice(kv, d.q.device, 0);
+  Tensor v_cache = KvSlice(kv, d.q.device, 1);
+  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
+
+  DBuf attn(d, DType::kBF16, {T, Hq, Dh});
+  const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
+  vt::PagedAttentionArgs pa{scale, meta.causal};
+  pa.query_start_loc_host = meta.query_start_loc.data();
+  pa.max_seq_len = meta.max_seq_len;
+  if (is_swa && cfg.sliding_window.has_value() && *cfg.sliding_window > 0) {
+    pa.window_size =
+        vt::AttentionWindow{static_cast<int32_t>(*cfg.sliding_window - 1), 0};
+  }
+  vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
+                     si.seq_lens.t(), si.query_start_loc.t(), pa);
+
+  // o_proj (RowParallelLinear, no bias).
+  Tensor o_in = Reshape(attn.t(), {T, Hq * Dh});
+  Tensor wo = ResidentWeight(d, w.o_proj);
+  DBuf o(d, DType::kBF16, {T, H});
+  vt::MatmulBT(d.q, o.t(), o_in, wo);
+  return o;
+}
+
 }  // namespace dense_attn
 }  // namespace vllm

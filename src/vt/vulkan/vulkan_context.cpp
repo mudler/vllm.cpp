@@ -164,6 +164,20 @@ const bool kHostProfile = [] {
   return v != nullptr && std::strcmp(v, "0") != 0;
 }();
 
+// FENCE STALL GUARD (BACKEND-VULKAN-FENCE-TIMEOUT). By default a dispatch that
+// never completes blocks in vkWaitForFences(.., UINT64_MAX) forever, holding the
+// host at ~100% CPU while a wedged GPU burns a core. VT_VK_FENCE_TIMEOUT_MS sets
+// a ceiling (ms); when it fires the process ABORTS with a loud message naming the last
+// dispatch instead of spinning until someone power-cycles the box. 0 = block forever
+// (stock behaviour, kept for correctness-identical runs).
+const int64_t kFenceTimeoutMs = [] {
+  const char* v = std::getenv("VT_VK_FENCE_TIMEOUT_MS");
+  if (v == nullptr) return int64_t(0);
+  char* end = nullptr;
+  int64_t ms = std::strtoll(v, &end, 10);
+  return (end != v && ms > 0) ? ms : int64_t(0);
+}();
+
 // Accumulators for the above. Every one of these is touched only under the
 // dispatch mutex, which Dispatch and FlushBatchLocked's caller already hold.
 struct HostProfile {
@@ -306,6 +320,8 @@ struct Probe {
   VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   uint32_t queue_family = 0;
   uint32_t api_version = 0;
+  bool shader_float64 = false;
+  bool integer_dot_product_4x8 = false;
   char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
 };
 
@@ -325,6 +341,30 @@ VkInstance CreateInstance() {
   VkInstance instance = VK_NULL_HANDLE;
   if (vk.vkCreateInstance(&ci, nullptr, &instance) != VK_SUCCESS) return VK_NULL_HANDLE;
   return instance;
+}
+
+
+bool HasShaderFloat64(VkPhysicalDevice pd) {
+  const VulkanApi& vk = Api();
+  VkPhysicalDeviceFeatures2 f2{};
+  f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  vk.vkGetPhysicalDeviceFeatures2(pd, &f2);
+  return f2.features.shaderFloat64 == VK_TRUE;
+}
+
+// Probe shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product). The 4x8
+// packed signed variant is what the TQ keep-quant shaders use for
+// dotPacked4x8EXT. Use the extension-specific struct rather than the 1.2
+// core struct so this compiles on older Vulkan headers.
+bool HasIntegerDotProduct4x8(VkPhysicalDevice pd) {
+  const VulkanApi& vk = Api();
+  VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idot{};
+  idot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+  VkPhysicalDeviceFeatures2 f2{};
+  f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  f2.pNext = &idot;
+  vk.vkGetPhysicalDeviceFeatures2(pd, &f2);
+  return idot.shaderIntegerDotProduct == VK_TRUE;
 }
 
 bool HasStorageBuffer16BitAccess(VkPhysicalDevice pd) {
@@ -444,6 +484,8 @@ Probe ProbeDevice(VkInstance instance) {
     if (rank <= best_rank) continue;
     best_rank = rank;
     best.ok = true;
+    best.shader_float64 = HasShaderFloat64(devices[i]);
+    best.integer_dot_product_4x8 = HasIntegerDotProduct4x8(devices[i]);
     best.physical_device = devices[i];
     best.queue_family = static_cast<uint32_t>(qf);
     best.api_version = props.apiVersion;
@@ -724,6 +766,8 @@ VulkanContext::VulkanContext() {
   api_major_ = static_cast<int>(VK_API_VERSION_MAJOR(probe.api_version));
   api_minor_ = static_cast<int>(VK_API_VERSION_MINOR(probe.api_version));
   device_name_ = probe.name;
+  shader_float64_ = probe.shader_float64;
+  integer_dot_product_4x8_ = probe.integer_dot_product_4x8;
 
   // Float controls — probed and recorded, not pinned; see § RELAXED PRECISION.
   VkPhysicalDeviceFloatControlsProperties fc{};
@@ -735,6 +779,7 @@ VulkanContext::VulkanContext() {
   denorm_preserve_f32_ = fc.shaderDenormPreserveFloat32 == VK_TRUE;
   sz_inf_nan_preserve_f32_ = fc.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
   max_workgroup_count_x_ = props2.properties.limits.maxComputeWorkGroupCount[0];
+  max_workgroup_count_y_ = props2.properties.limits.maxComputeWorkGroupCount[1];
   max_workgroup_invocations_ = props2.properties.limits.maxComputeWorkGroupInvocations;
   max_workgroup_size_x_ = props2.properties.limits.maxComputeWorkGroupSize[0];
   // GPU TIMESTAMP SUPPORT, probed rather than assumed. `timestampPeriod` is
@@ -801,6 +846,12 @@ VulkanContext::VulkanContext() {
       (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
       (sub.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0 &&
       (sub.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+  // Shuffle is core Vulkan 1.1 alongside basic and arithmetic, but a device
+  // can expose basic+arithmetic without shuffle. Probe it separately because
+  // the TQ shaders use subgroupShuffleXor for the per-block amax reduction.
+  subgroup_shuffle_compute_ =
+      (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+      (sub.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0;
   wide_reduce_ = subgroup_arithmetic_compute_ && subgroup_size_ > 0 &&
                  max_workgroup_invocations_ >= kWideWorkgroupSize &&
                  max_workgroup_size_x_ >= kWideWorkgroupSize;
@@ -826,6 +877,15 @@ VulkanContext::VulkanContext() {
     // Chain: f16 -> coopmat -> bf16.
     coop_feat.pNext = &bf16_feat;
     f16.pNext = &coop_feat;
+  }
+
+  // --- INTEGER DOT PRODUCT (VK-IDOT). Enable VK_KHR_shader_integer_dot_product
+  // when the device supports it, so the TQ keep-quant shaders can use
+  // dotPacked4x8EXT. The feature is CORE in Vulkan 1.2, but we request 1.1 so
+  // the extension must be named explicitly. On a 1.2+ device the extension is
+  // already in core and naming it is a no-op.
+  if (integer_dot_product_4x8_) {
+    device_exts.push_back("VK_KHR_shader_integer_dot_product");
   }
 
   const float priority = 1.0f;
@@ -1561,7 +1621,21 @@ void VulkanContext::RetireSlotLocked(uint32_t s) {
   // Counted BEFORE the wait and only when the fence is genuinely unsignalled, so
   // the counter measures blocked retirements rather than retirements.
   if (vk.vkGetFenceStatus(device, fence) == VK_NOT_READY) ++fence_wait_count_;
-  Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  if (kFenceTimeoutMs > 0) {
+    VkResult wr = vk.vkWaitForFences(device, 1, &fence, VK_TRUE,
+                                      static_cast<uint64_t>(kFenceTimeoutMs) * 1000000ull);
+    if (wr != VK_SUCCESS) {
+      const char* reason = wr == VK_TIMEOUT
+          ? "retired dispatch did not signal in time - GPU wedged"
+          : "vkWaitForFences returned a non-timeout error - device lost or other fatal error";
+      std::fprintf(stderr,
+        "[vt vulkan] FATAL: %s (wr=%d, VT_VK_FENCE_TIMEOUT_MS=%lld), aborting\n",
+        reason, static_cast<int>(wr), static_cast<long long>(kFenceTimeoutMs));
+      std::fflush(stderr); std::abort();
+    }
+  } else {
+    Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  }
   const uint64_t hp_t1 = kHostProfile ? NowNs() : 0;
 
   // Read the timestamps back, now that this slot has certainly completed.
@@ -1688,9 +1762,13 @@ void VulkanContext::FlushBatchLocked(const char* why) {
 
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
                              uint32_t buffer_count, const void* push_constants,
-                             uint32_t push_size, uint32_t group_count_x,
+                             uint32_t push_size, uint32_t group_count_x, uint32_t group_count_y,
                              const uint32_t* spec_values, uint32_t spec_count) {
-  if (group_count_x == 0) return;  // nothing to do; an empty dispatch is illegal
+  if (group_count_x == 0 || group_count_y == 0) return;
+  VT_CHECK(group_count_y <= max_workgroup_count_y_,
+           "vulkan: dispatch needs " + std::to_string(group_count_y) +
+               " Y workgroups, above the device limit of " +
+               std::to_string(max_workgroup_count_y_));  // nothing to do; an empty dispatch is illegal
   VT_CHECK(group_count_x <= max_workgroup_count_x_,
            "vulkan: dispatch needs " + std::to_string(group_count_x) +
                " workgroups, above the device limit of " +
@@ -1889,7 +1967,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                            Unpack<VkQueryPool>(query_pool_), query_base);
   }
-  vk.vkCmdDispatch(cmd, group_count_x, 1, 1);
+  vk.vkCmdDispatch(cmd, group_count_x, group_count_y, 1);
   if (timed) {
     vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                            Unpack<VkQueryPool>(query_pool_), query_base + 1);

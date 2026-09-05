@@ -136,6 +136,14 @@ enum class DType : uint8_t {
   kIQ2_XS,
   kIQ4_XS,
   kIQ3_S,
+  // --- ternary keep-quant (Vulkan-native, Q8_K-activation) ---
+  // TQ2_0 (llama.cpp PR #25850): 2-bit ternary codes, 256-elem blocks.
+  // TQ1_0: packed base-3 trits, 256-elem blocks. Both are weight-only encodings
+  // dotted against Q8_K activations; the Vulkan backend has native keep-quant
+  // shaders for both, and the CPU dequant-composite path serves as the
+  // reference oracle. No CPU vec_dot (the keep-quant dot is Vulkan-only).
+  kTQ2_0,
+  kTQ1_0,
 };
 
 const char* Name(DType dtype);
@@ -193,6 +201,8 @@ inline size_t SizeOf(DType dtype) {
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
     case DType::kIQ3_S:
+    case DType::kTQ2_0:
+    case DType::kTQ1_0:
       ThrowBlockQuantHasNoElementSize(dtype);
   }
   ThrowUnknownDType();

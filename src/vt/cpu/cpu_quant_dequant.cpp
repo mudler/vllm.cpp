@@ -622,6 +622,70 @@ void DequantMXFP4(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+// block_tq2_0 = { u8 qs[64]; f16 d; } (66 bytes) — 2-bit ternary codes.
+// Element e = j*4 + l*32 + k (j in {0,32}, l in 0..3, k in 0..31) reads byte
+// qs[j+k], value ((qs[j+k] >> (l*2)) & 3) - 1, scaled by d.
+// Matches the shader's tq2_0_trit (vt_matmul_bt_tq2.comp) and the test's
+// hand-built block layout.
+void DequantTQ2_0(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 66;
+    const float d = ReadF16(blk + 64);
+    const uint8_t* qs = blk;
+    for (int e = 0; e < qk; ++e) {
+      const int j = (e >= 128) ? 32 : 0;
+      const int l = (e % 128) / 32;
+      const int k = e % 32;
+      const uint8_t code = (qs[j + k] >> (l * 2)) & 3;
+      y[i * qk + e] = static_cast<float>(static_cast<int>(code) - 1) * d;
+    }
+  }
+}
+
+// block_tq1_0 = { u8 qs[48]; u8 qh[4]; f16 d; } (54 bytes) — packed base-3
+// trits. Trit extraction: q = byte * pow3[l] (uint8 wrap); xi = (q * 3) >> 8;
+// w = (xi - 1) * d. Element layout:
+//   [0,160):   qs[m],        l = e/32,        m = e%32       (5 trits × 32)
+//   [160,240): qs[32+m],     l = (e-160)/16,  m = (e-160)%16 (5 trits × 16)
+//   [240,256): qh[j],        l = (e-240)/4,   j = (e-240)%4  (4 trits × 4)
+// Matches the shader's trit extraction (vt_matmul_bt_tq1_0.comp).
+void DequantTQ1_0(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 54;
+    const float d = ReadF16(blk + 52);
+    const uint8_t* qs = blk;
+    const uint8_t* qh = blk + 48;
+    // [0,160): 5 trits × 32 elements from qs[0..31]
+    for (int l = 0; l < 5; ++l) {
+      for (int m = 0; m < 32; ++m) {
+        const uint8_t q = static_cast<uint8_t>(qs[m] * pow3[l]);
+        const int xi = (q * 3) >> 8;
+        y[i * qk + l * 32 + m] = static_cast<float>(xi - 1) * d;
+      }
+    }
+    // [160,240): 5 trits × 16 elements from qs[32..47]
+    for (int l = 0; l < 5; ++l) {
+      for (int m = 0; m < 16; ++m) {
+        const uint8_t q = static_cast<uint8_t>(qs[32 + m] * pow3[l]);
+        const int xi = (q * 3) >> 8;
+        y[i * qk + 160 + l * 16 + m] = static_cast<float>(xi - 1) * d;
+      }
+    }
+    // [240,256): 4 trits × 4 elements from qh[0..3]
+    for (int l = 0; l < 4; ++l) {
+      for (int j = 0; j < 4; ++j) {
+        const uint8_t p3 = (l == 0) ? 1u : (l == 1) ? 3u : (l == 2) ? 9u : 27u;
+        const uint8_t q = static_cast<uint8_t>(qh[j] * p3);
+        const int xi = (q * 3) >> 8;
+        y[i * qk + 240 + l * 4 + j] = static_cast<float>(xi - 1) * d;
+      }
+    }
+  }
+}
+
 // Adapt a whole-row `(data, nb, y)` decoder to upstream's
 // `ggml_to_float_t(x, y, k)` shape.
 template <void (*Kernel)(const uint8_t*, int64_t, float*), int64_t kBlockElems>
@@ -654,6 +718,8 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kIQ2_XS: return &ToFloatAdapter<&DequantIQ2_XS, 256>;
     case DType::kIQ4_XS: return &ToFloatAdapter<&DequantIQ4_XS, 256>;
     case DType::kIQ3_S: return &ToFloatAdapter<&DequantIQ3_S, 256>;
+    case DType::kTQ2_0: return &ToFloatAdapter<&DequantTQ2_0, 256>;
+    case DType::kTQ1_0: return &ToFloatAdapter<&DequantTQ1_0, 256>;
     default: return nullptr;
   }
 }

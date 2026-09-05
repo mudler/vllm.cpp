@@ -56,6 +56,8 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
     case DType::kIQ3_S:
+    case DType::kTQ2_0:
+    case DType::kTQ1_0:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
@@ -258,15 +260,16 @@ void MoeGateUpSwiGLUGrouped(Queue& q, Tensor& out, const Tensor& act, const Tens
   VT_CHECK(out.rank == 2 && act.rank == 2 && gate_w.rank == 2 && up_w.rank == 2,
            "moe_gate_up_swiglu: rank-2 out/act/gate_w/up_w required");
   const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
-  VT_CHECK(act.shape[0] == P || act.shape[0] == 1,
-           "moe_gate_up_swiglu: act rows must be P (per-expert) or 1 (broadcast)");
+  VT_CHECK(act.shape[0] == P || act.shape[0] == 1 ||
+           (act.shape[0] > 1 && act.shape[0] < P && P % act.shape[0] == 0),
+           "moe_gate_up_swiglu: act rows must be P (per-expert), 1 (broadcast), or T (gather, P=T*top_k)");
   VT_CHECK(gate_w.shape[1] == K && up_w.shape[1] == K,
            "moe_gate_up_swiglu: gate_w/up_w K mismatch (both are [E*N,K])");
   VT_CHECK(gate_w.shape[0] % N == 0 && up_w.shape[0] == gate_w.shape[0],
            "moe_gate_up_swiglu: gate_w/up_w rows must be a whole multiple of N and equal");
   VT_CHECK(IsBlockQuant(gate_w.dtype) && gate_w.dtype == up_w.dtype,
            "moe_gate_up_swiglu: gate_w/up_w must be the SAME block-quantized dtype");
-  VT_CHECK(IsFloat(act.dtype) && out.dtype == DType::kF32,
+  VT_CHECK(IsFloat(act.dtype) && (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
            "moe_gate_up_swiglu: float activation and f32 output required");
   VT_CHECK(gate_w.shape[1] % BlockElems(gate_w.dtype) == 0,
            "moe_gate_up_swiglu: K must be a whole number of weight blocks");

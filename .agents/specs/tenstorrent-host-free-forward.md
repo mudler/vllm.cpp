@@ -326,6 +326,57 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **Qwen3-4B TT forward beyond the near-tie band on both arms
+  ([#2811](https://github.com/mudler/vllm.cpp/issues/2811)).** Found by the
+  #1625 flip's 4B bring-up (2026-09-03): deterministic on both arms, but
+  5/16 prompts past the 500-mnat band against teacher-forced gaps on each
+  arm's own prefix (capture worst 1000 mnats @ (11,3), eager worst 2000 @
+  (5,6)). The 4B dense gate skips loudly on TT until the lane lands a passing
+  pair or a falsified-drift root cause. The two 4B capture FATALS found on
+  the way are NOT owed — fixed in commit `1872aeb16` (shadow-volume
+  contract).
+- **Qwen3.5-GDN captured arm: structurally blocked mid-capture; the
+  device-pure GDN wave is owed
+  ([#2907](https://github.com/mudler/vllm.cpp/issues/2907), found by
+  [#2812](https://github.com/mudler/vllm.cpp/issues/2812)).**
+  RE-CORRECTION (2026-09-04, P150 repro 2/2 deterministic): the previous
+  CORRECTION on this bullet was WRONG — the original "Qwen3.5-GDN
+  TT_FATALs mid-capture" record was right. Its supporting M2 mutation
+  almost certainly hit the INERT MoE driver site (`Qwen3_5DecodeGraph`),
+  not the dense driver (`Qwen3_5DenseDecodeGraph`) the 0.8B checkpoint
+  exercises, so its 16/16 green measured the eager default, not the
+  captured arm. The captured 0.8B battery dies deterministically on
+  tt-metal "Writes are not supported during trace capture"
+  (fd_mesh_command_queue.cpp:760). Root cause: three per-call staging
+  classes inside `Qwen3_5DenseDecodeGraph::Step`. (1) The `RmsNormKernel`
+  gemma branch re-uploaded the baked w+1 f32 buffer every call — FIXED
+  (a `gemma_device` slot on `BufferSlot` caches it). (2) `MatmulBT` weight
+  interior views — the non-merged GDN path Slice's `packed_weight` per
+  call, which `EnsureDevice2D` refuses (W2c) — fell to anonymous
+  `from_span` uploads every call — FIXED (a weight-view shadow cache keyed
+  by view pointer and geometry; tracked bases keep `EnsureDevice2D`).
+  (3) The GDN ops themselves (`CausalConv1dUpdateKernel`,
+  `GdnDecodeKernel`) are host-orchestrated BY DESIGN — EnsureHost on
+  x/q/k/v/g/beta, ReadIdxHost, per-call host vector builds, per-call
+  UploadTensor — which no trace capture can admit; removing that is the
+  device-pure GDN wave, a separate row and issue. Blindness: the ambient
+  q35 gate still adjudicates only the eager arm and no captured pair gate
+  exists; a conjunct's deletion for q35 now fails loudly (the captured
+  battery hits the deterministic fatal) rather than passing silently, but
+  the arm stays ungated until the wave lands.
+- **Mistral-7B captured pair LANDED (2026-09-04, #2812);
+  `MistralForCausalLM` joins the default-on arch set.** The captured arm
+  is byte-identical across two runs with a card reset between, and differs
+  from the committed eager pair in 34/256 cells spanning 5 prompts (worst
+  p1 t8-t15 — the same p[1] t=8 cell the M1 mutation flagged), so
+  #2566's CLI-level token identity does not extend to the battery. The
+  pair is teacher-forced via transformers: every cell sits inside the
+  500-mnat band, worst 250 mnats at (1,8). The captured gate greens
+  128/128 against its own pair, and the ambient mistral gate now
+  adjudicates the CAPTURED arm against the capture pair. Llama and
+  InternLM2 keep the explicit opt-in until their own captured arms are
+  brought up.
+
 - **The capture arm's cold step emits a deterministic wrong first decode
   token ([#2461](https://github.com/mudler/vllm.cpp/issues/2461)) — REPAIR
   LANDED in this change (2026-09-01, root cause and evidence in `## Now`);
@@ -557,6 +608,25 @@ input, not a gate result.
 
 `ACTIVE`. R1-R3b and the R2 on-device `cur_pos` / `update_idxs` advance are
 implemented on this branch, env-gated by `VT_TT_HOST_FREE_DECODE`.
+
+### Capture-default flip staged (2026-09-03)
+
+The #1625 wave is specced under `## Capture-default flip` below: capture
+becomes the DEFAULT (`VT_TT_DECODE_CAPTURE=0` opts out), the Qwen3-4B
+captured pair is brought up in the same change, the published benchmark
+figure is re-taken on the flip tree, and the flip lands stacked on the #2669
+repair once PR #2672 merges.
+
+### #2812 pairs lane (2026-09-04)
+
+Mistral-7B's captured pair is committed and its captured arm gates green
+against it (teacher-forced, worst 250 mnats); `MistralForCausalLM` joins
+`DecodeCaptureDefaultArch`, so the ambient mistral gates adjudicate the
+CAPTURED arm. The Qwen3.5-0.8B captured arm stays owed: it dies
+deterministically mid-capture on the host-orchestrated GDN ops; the
+per-call gemma-norm and weight-view staging classes found on the way are
+fixed on this branch, and the device-pure GDN wave owns the rest
+(#2907). See `## Owed`.
 
 ### Repair (2026-09-03): short-chunk device KV push clobber (#2669)
 
@@ -1017,3 +1087,163 @@ fixed at its three consumed surfaces.
   arm beats both — captured replay's superiority over eager now holds at
   all three measured sizes on token-clean legs. The per-model record entry
   is in `.agents/benchmark-record.md`.
+
+## Capture-default flip (#1625)
+
+The captured decode arm becomes the DEFAULT on Tenstorrent Blackhole:
+`support_static_graph_mode()` returns `HostFreeDecodeEnabled() &&
+DecodeCaptureEnabled()`, where `DecodeCaptureEnabled()` mirrors
+`HostFreeDecodeEnabled()`'s polarity (`VT_TT_DECODE_CAPTURE` unset or any
+value except "0" arms capture; `VT_TT_DECODE_CAPTURE=0` opts out and restores
+today's eager host-free arm). The platform comment that declined this flip —
+"the captured arm hangs deterministically on the FIRST multi-request run" —
+names #1625, and that hang is root-caused and repaired on this row: the
+short-chunk device KV push clobber (#2669, this branch) was the defect, the
+captured multi-request battery is 16/16 green and hang-free across the
+focused, recap8, and full-battery lanes, and the flip it held back is now
+unblocked. The captured arm is also the fastest measured arm (28.61 tok/s
+warm median against 12.21 for the eager host-free default and 15.61 for the
+host opt-out, same-binary order-alternated triples, #2566 recipe), so the
+flip ships the payoff rather than a risk.
+
+### Scope
+
+- `src/vt/tenstorrent/tenstorrent_device.h`: add `DecodeCaptureEnabled()`
+  beside `HostFreeDecodeEnabled()`, same one-line parse.
+- `src/vllm/platforms/tenstorrent.cpp`: rewrite the R5-flip comment block to
+  record WHY capture is now default (the #2669 root cause and the measured
+  payoff) and how to opt out; change the one-line conjunct.
+- `tests/parity/test_qwen3_paged_engine.cpp`: the `_capture` golden selection
+  currently keys on `std::getenv("VT_TT_DECODE_CAPTURE") != nullptr`
+  (presence, not value). It must key on the SAME parsed polarity as the
+  platform, so `VT_TT_DECODE_CAPTURE=0` selects the eager pair in the test
+  exactly as it selects the eager path in the engine. A drift here produces a
+  test that passes while the engine runs a different arm than the goldens
+  adjudicate.
+- Qwen3-4B captured bring-up (AMENDED 2026-09-03 — outcome in
+  `## Capture-default flip (#1625)` → `### Bring-up amendment`): the pair was
+  dumped, teacher-forced, and CANNOT be committed — both TT arms land beyond
+  the near-tie band. Owned by #2811.
+- `docs/FEATURES.md` TT host-free row: "Capture opt-in only (#1625 hang)"
+  becomes "capture DEFAULT since #<PR> (`VT_TT_DECODE_CAPTURE=0` opts out)",
+  with the payoff figure.
+- Benchmark publication: `docs/BENCHMARKS.md` has no Tenstorrent entry. The
+  flip owns one `docs/benchmarks/<benchmark-id>.md` detail file plus its
+  index row, publishing the #2566-recipe rate figure RE-TAKEN ON THE FLIP
+  TREE (capture is the default there, so the published number must be the
+  shipped default, not the opt-in arm): capture/default leg, opt-out leg,
+  order-alternated triples, `--repeat 5`, leg 1 discarded, warm medians,
+  flock + tt-smi reset per batch.
+- Closes #1625 (hang root-caused to #2669; flip landed; multi-request
+  captured battery hang-free).
+
+### Not in scope
+
+- The host opt-out inversion residual (eager host-free 12.21 vs host opt-out
+  15.61 tok/s) — pre-existing, stays open on its own lane.
+- #2670 (reader-side `device_current` trust) and #2671 (dump verdict mark) —
+  remain `## Owed` on this row.
+- Async readback (#1627) — unchanged.
+
+### Tests and gates (red-first)
+
+1. RED-FIRST (no card needed): a default-polarity assertion — with NO env
+   set, the engine arms capture and the test selects `_capture` goldens; with
+   `VT_TT_DECODE_CAPTURE=0`, both stay eager. On the pre-flip tree this reds
+   (capture requires env presence); on the flip tree it greens.
+2. The focused #2669 boundary gate and the captured 0.6B battery run with NO
+   capture env (they now arm capture by default): 2/2 and 16/16 against the
+   committed capture pair.
+3. `VT_TT_DECODE_CAPTURE=0` runs the eager arm on the flipped tree: 0.6B
+   eager battery 16/16 anchor-exact (the eager pair keeps gating the opt-out
+   arm).
+4. 4B battery with NO env (captured default): 16/16 against the
+   brought-up pair (or byte-equality evidence).
+5. recap8 lane with NO env: 16/16 (recapture cadence survives the flip).
+6. `test_tenstorrent_backend` full suite; site suite (docs changed);
+   staged preflight; fresh review with mutations (threshold-style: revert
+   the platform conjunct and watch gate 1/2 red).
+
+### Stop conditions
+
+- If the captured 4B arm fatals or hangs on the P150 (the 0.6B capture
+  fatals were fixed in an earlier wave, but 4B has NEVER run captured), the
+  flip scopes down to 0.6B-only: the 4B case pins `VT_TT_DECODE_CAPTURE=0`
+  explicitly with a comment naming the Owed 4B-capture issue, and the row
+  records the fatal as owed evidence. A default the test cannot reach is not
+  shippable, so the flip does NOT land with 4B captured-but-ungated.
+- If the flip-tree benchmark shows the captured default regressed below the
+  eager host-free default (it should not; same code path as the 28.61
+  measurement), stop and re-root-cause before landing.
+
+### Decisions recorded
+
+- One PR for spec and implementation (user: "prepare the next PR",
+  2026-09-03; matches the recorded pattern for the other TT rows).
+- 4B captured pair is IN this PR (a default the tests never exercise is the
+  nothing-lands-dead smell; scoping it out requires the stop-condition
+  evidence above).
+- The published benchmark figure is re-taken on the flip tree.
+
+### Bring-up amendment (2026-09-03)
+
+The 4B bring-up the scope bullet promised produced findings the spec did not
+anticipate. Recorded here because the code and Git history do not carry the
+decisions.
+
+**Finding 1 — the 4B TT forward diverges beyond the near-tie band on BOTH
+arms.** Both arms are deterministic (capture dumps byte-identical across runs,
+sha256 `7e77e6ea…`; eager `8325ff10…`) and the two fatal bugs on the 4B
+capture path are FIXED (commit `1872aeb16`: D2D copy and capture memset took
+`BufferSlot::bytes` — the #1922 best-fit lend's host-block CAPACITY — as the
+content contract; on 4B the 5120-B `s.hidden` shadow sat in a 10240-B block
+and the D2D lane declined, falling through to a host read mid-capture
+(TT_FATAL, `fd_mesh_command_queue.cpp:807`), and the memset derived its zero
+geometry from capacity and staged a [1,5120] zero no warm step primed
+(zero-cache miss, `tenstorrent_ops.cpp:255`). 0.6B survived on its size-class
+bins.) But against `transformers`-teacher-forced gaps on each arm's OWN
+prefix, 5 of 16 prompts land beyond the 500-mnat band — capture worst 1000
+mnats @ (11,3), eager worst 2000 @ (5,6); first-divergence margins 0.625-2.0
+nats, which is a real forward difference and not a bf16 tie (0.6B TT worst
+500; the committed CUDA 4B pair's worst 250). A pair that fails its own gate
+cannot be committed. DECISION (user, 2026-09-03): scope 4B down per the stop
+condition's pattern — the 4B dense gate skips loudly on TT naming #2811,
+`VT_DUMP_IDS=1` still bootstraps a dump for the bring-up, and the finding is
+owed. Hypothesis to falsify on #2811's lane: diffuse bf16 accumulation drift
+at H=2560/36L (the divergence is concentrated: most prompts are fully
+vLLM-endorsed, gap 0 on every cell).
+
+**Finding 2 — the flip's blast radius was every TT decode-graph driver, and
+one of them crashes.** `support_static_graph_mode()` is consulted by ten
+driver sites beyond Qwen3-dense (Qwen3.5-GDN ×2, Qwen3.5-dense, Qwen3-MoE
+driver + registry, GLM4.5-MoE-lite registry, DeepSeek-V2 driver + registry,
+Qwen3-DFlash, Voxtral). The flip as first committed armed capture for ALL of
+them by default; the Qwen3.5-0.8B gate battery TT_FATALs mid-capture
+("Writes are not supported during trace capture",
+`fd_mesh_command_queue.cpp:760`) — a product-default crash for a model that
+worked pre-flip. Mistral-7B (which rides the Qwen3-dense machinery) completes
+but its captured sequence drifts from its committed EAGER pair (anchor drift
+p[1] t=8, `engine=1924 anchor=1988`) — pair debt, not a crash. SHAPE: the
+platform gains `static_graph_requires_opt_in()` (base false; TT returns
+`!DecodeCaptureRequested()`), every driver conjuncts the seam — the ten
+non-Qwen3-dense sites call the no-arg overload — and the Qwen3-dense driver
+calls the
+architecture-aware overload, because its ONE graph class also serves the
+Mistral, Llama and InternLM2 registries, and the TT override carves default
+capture to exactly `Qwen3ForCausalLM` (DECISION, user, 2026-09-03: carve by
+architecture — an ungated default arm for three registries is the failure the
+scope-down exists to prevent). Those three keep the pre-flip explicit opt-in
+until their captured arms are brought up (#2812). The Qwen3.5 and Mistral
+gate harnesses mirror the engine arm (`DecodeCaptureEnabled() &&
+DecodeCaptureRequested()`); a hardcoded eager name would adjudicate a
+captured run against eager goldens.
+
+**Gates this amendment adds:** Qwen3.5-0.8B ambient (no env) greens against
+its committed ambient pair (pre-amendment tree: TT_FATAL red,
+`flip-q35-prefix.out`); Qwen3.5 with `VT_TT_DECODE_CAPTURE=1` loud-skips;
+Mistral ambient greens against its committed eager pair — the architecture
+carve restores the pre-flip eager default (pre-carve red: captured-vs-eager
+anchor drift, `flip-mist-prefix.out`); Mistral with `VT_TT_DECODE_CAPTURE=1`
+loud-skips; 4B dense loud-skips (#2811); 0.6B both
+legs and the backend suite stay green. `flip-{q35-ambient,q35-optin,mist-skip,4b-skip,
+06b-ambient,06b-eager,backend-scope}.out` hold the green side.

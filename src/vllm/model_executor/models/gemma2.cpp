@@ -61,17 +61,6 @@ int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   return it->get<int64_t>();
 }
 
-// VT_GEMMA2_SLIDING (default ON): thread the per-layer sliding window into paged
-// attention on sliding layers (faithful to vLLM). Inert for contexts <
-// sliding_window (the gate battery is short), so the SACRED gate is unaffected.
-bool SlidingWindowEnabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_GEMMA2_SLIDING");
-    return !(e != nullptr && e[0] == '0');
-  }();
-  return on;
-}
-
 // Per-layer Gemma-2 routing derived from the config.
 struct Gemma2Layout {
   double rope_theta;               // single per-model theta
@@ -197,13 +186,14 @@ DBuf Gemma2AttnBlock(Dev d, const Gemma2AttnWeights& w, const HfConfig& cfg,
   pa.max_seq_len = meta.max_seq_len;
   // ENG-ATTENTION-WINDOW (#2388): the window DERIVATION is the shared
   // resolver's; the predicate stays here because it is model shape, not the
-  // window rule. `SlidingWindowEnabled()` IS the resolver's
-  // `disable_model_sliding_window`, under a local name.
+  // window rule. W3 replaced the local `VT_GEMMA2_SLIDING` reader with the ONE
+  // model-agnostic switch, so Gemma-4, OLMo-2 and Muse-Glimmer now have the same
+  // control that only Gemma-2 and Gemma-3 carried.
   if (sliding_window.has_value() && *sliding_window > 0)
     pa.window_size = ResolveAttentionWindow(
         /*per_layer=*/std::nullopt, sliding_window,
         v1::AttentionType::kDecoder,
-        /*disable_model_sliding_window=*/!SlidingWindowEnabled());
+        /*disable_model_sliding_window=*/DisableSlidingWindowActive());
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

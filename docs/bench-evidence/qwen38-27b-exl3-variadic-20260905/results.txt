@@ -1,0 +1,66 @@
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 89be3474-f015-4470-b371-937b2a802c07
+RESULT LEASE_ID=7b5084ab-f214-4d8d-b1fe-1eca86efb1e8
+RESULT SCRATCH_FREE_GiB 1559
+RESULT LOAD 2.99 4.29 4.09 2/861 10154
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=22  chars min=2634 p50=3361 max=4186
+RESULT CORPUS_BAND M   n=58  chars min=133 p50=392 max=1360
+RESULT CORPUS_BAND S   n=50  chars min=95 p50=223 max=475
+RESULT CORPUS_BAND XL  n=14  chars min=7217 p50=9572 max=10048
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=23be01c338457038fe8354b01d92c7aa
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT OURS server pid=18334 paged_env='shipped default'
+RESULT OURS ready after 6s
+RESULT OURS resolved max_num_seqs=8 (need 8) at --num-blocks 2048
+RESULT PAGED PROBE rc=0 on 'shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS server pid=18390
+RESULT THEIRS ready after 62s
+RESULT THEIRS-r1-c1 client rc=0
+RESULT THEIRS-r1-c4 client rc=0
+RESULT THEIRS-r1-c8 client rc=0
+RESULT OURS server pid=19306 paged_env='shipped default'
+RESULT OURS ready after 6s
+RESULT OURS resolved max_num_seqs=8 (need 8) at --num-blocks 2048
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 1282.5 MiB of device memory at max_num_seqs 8 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r1-c1 client rc=0
+RESULT OURS-r1-c4 client rc=0
+RESULT OURS-r1-c8 client rc=0
+RESULT OURS server pid=19442 paged_env='shipped default'
+RESULT OURS ready after 6s
+RESULT OURS resolved max_num_seqs=8 (need 8) at --num-blocks 2048
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 1282.5 MiB of device memory at max_num_seqs 8 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r2-c8 client rc=0
+RESULT OURS-r2-c4 client rc=0
+RESULT OURS-r2-c1 client rc=0
+RESULT THEIRS server pid=19577
+RESULT THEIRS ready after 18s

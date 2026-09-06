@@ -1,0 +1,75 @@
+{
+ "generator": "benchmarks/variadic/build_corpus.py",
+ "seed": 0,
+ "count": 144,
+ "weights": {
+  "S": 0.35,
+  "M": 0.4,
+  "L": 0.15,
+  "XL": 0.1
+ },
+ "band_counts": {
+  "S": 50,
+  "M": 58,
+  "L": 22,
+  "XL": 14
+ },
+ "sources": {
+  "gsm8k": {
+   "path": "/workspace/exl3-variadic/corpora/gsm8k-test.jsonl",
+   "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+   "rows": 1319
+  },
+  "humaneval": {
+   "path": "/workspace/exl3-variadic/corpora/HumanEval.jsonl",
+   "sha256": "1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2",
+   "rows": 164
+  },
+  "sonnet": {
+   "path": "/workspace/exl3-variadic/corpora/sonnet.txt",
+   "sha256": "d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4",
+   "lines": 518
+  }
+ },
+ "rules": {
+  "L_block_lines_mid": 75,
+  "L_block_lines_range": [
+   56,
+   94
+  ],
+  "L_target_chars": 3200,
+  "XL_k_mid": 20,
+  "XL_target_chars": 9000
+ },
+ "realised_chars": {
+  "L": {
+   "n": 22,
+   "min": 2634,
+   "median": 3361,
+   "max": 4186,
+   "mean": 3390.681818181818
+  },
+  "M": {
+   "n": 58,
+   "min": 133,
+   "median": 392,
+   "max": 1360,
+   "mean": 436.1896551724138
+  },
+  "S": {
+   "n": 50,
+   "min": 95,
+   "median": 223,
+   "max": 475,
+   "mean": 227.76
+  },
+  "XL": {
+   "n": 14,
+   "min": 7217,
+   "median": 9572,
+   "max": 10048,
+   "mean": 9011.285714285714
+  }
+ },
+ "corpus_sha256": "6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e"
+}

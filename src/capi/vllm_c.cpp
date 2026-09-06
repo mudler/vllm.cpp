@@ -532,6 +532,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.scheduling_policy = nullptr;   // NULL => "fcfs" (ABI v9).
   p.kv_transfer_config = nullptr;  // NULL => no connector (ABI v9).
   p.enable_jump_forward = 0;       // 0 => env-resolved, default OFF (ABI v10).
+  p.disable_sliding_window = 0;    // 0 => sliding window ENABLED (ABI v26).
   p.device = 0;  // 0 => auto: the accelerator-first probe (ABI v14).
   p.gpu_memory_utilization = 0.92;  // vLLM default fraction (ABI v16).
   p.kv_cache_memory_bytes = 0;      // 0 => unset (ABI v16).
@@ -733,6 +734,28 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         SetError(
             "vllm_engine_load: enable_jump_forward must be 0 (default), 1 (on), "
             "or 2 (off)");
+        return VLLM_ERR_INVALID_ARGUMENT;
+    }
+    // ABI v26: model-level sliding-window kill switch (0=default/enabled,
+    // 1=disable, 2=explicitly enable), mirroring vLLM's
+    // ModelConfig.disable_sliding_window (vllm/config/model.py:248). 0 leaves
+    // ep.disable_sliding_window unset (nullopt), which resolves to upstream's own
+    // `= False` -- the byte-identical default. There is NO environment override
+    // here, on purpose: this field replaces two env knobs and a third spelling
+    // would re-create what it removes.
+    switch (params->disable_sliding_window) {
+      case 0:
+        break;  // default (nullopt) => window ENABLED.
+      case 1:
+        ep.disable_sliding_window = true;
+        break;
+      case 2:
+        ep.disable_sliding_window = false;
+        break;
+      default:
+        SetError(
+            "vllm_engine_load: disable_sliding_window must be 0 (default), 1 "
+            "(disable), or 2 (enable)");
         return VLLM_ERR_INVALID_ARGUMENT;
     }
     // ABI v14: explicit device selection (0=auto, 1=cpu, 2=cuda), mirroring

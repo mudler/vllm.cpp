@@ -9,9 +9,10 @@
 // pinned vLLM oracle (commit 555967922, runtime 0.23.1rc1.dev1511+g555967922).
 //
 // ORACLE PROVENANCE — DIFFERENT FROM THE QWEN3-DENSE GATE. There is no dgx/CUDA
-// capture for this model: the 0.8B GDN checkpoint was only ever stood up on the
-// gfx1100 box (issue #41 lane), which is also the only board that hosts a
-// vLLM-ROCm oracle. The base golden pair here is therefore ROCm-captured:
+// capture for this model. The 0.8B GDN checkpoint runs on the gfx1100 box, which
+// also hosts the vLLM-ROCm oracle. Issue #2772 refreshed the committed base
+// files from the restored immutable image in production mode. The default
+// production oracle and the local default both select wvSplitK. The files are:
 //   greedy_ids.npy  [N,T]   i32  the pinned ROCm oracle's per-prompt greedy
 //                                (K=10 per-prompt runs DETERMINISTIC in every
 //                                cell — see greedy_dist.npy).
@@ -26,13 +27,14 @@
 // forced via scripts/qwen3-neartie-gap-transformers.py — vLLM has no TT
 // backend, so `transformers` is the secondary oracle per AGENTS.md's registry).
 //
-// PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the
-// FIXED engine's sequence, oracle-re-derived after the AttnQkNormRopeGate
-// output-dtype dispatch fix (row/ROCM-GDN-08B-FIX). The PRE-FIX capture
-// (13/16 forward-divergent, max first-divergence gap 1.062 nats) is recorded
-// as evidence in .agents/specs/rocm-m4-oracle.md and the parity ledger — the
-// gate landed green-shaped per review, with the RED capture kept as history
-// rather than as committed goldens.
+// PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the fixed
+// engine's sequence. The oracle was re-derived after the AttnQkNormRopeGate
+// output-dtype dispatch fix in row/ROCM-GDN-08B-FIX. Issue #2772 then re-derived
+// all four ROCm arrays in production mode. The historical eager capture is
+// diagnostic evidence only. It selected a different branch of an exact tie.
+// The pre-fix capture had 13/16 forward-divergent prompts and a maximum first-
+// divergence gap of 1.062 nats. That result remains in
+// .agents/specs/rocm-m4-oracle.md and the parity ledger.
 //
 // METHODOLOGY — identical to the Qwen3-dense gate (see that file's header and
 // [[near-tie-distributional-gate]]): STRICT token-exact is reported, but the
@@ -70,6 +72,7 @@
 #include "vllm/sampling_params.h"
 #include "vt/op_provider.h"  // the "which backend actually ran" proof
 #include "vt/ops.h"
+#include "vt/tenstorrent/tenstorrent_device.h"
 
 namespace fs = std::filesystem;
 
@@ -233,7 +236,7 @@ void RunGate(const std::string& golden_subdir, const char* label) {
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
 
-  // The base golden pair for this model is ROCm-captured (see the file header).
+  // The base golden pair is production-mode ROCm evidence after issue #2772.
   // The Tenstorrent device lane carries its OWN oracle-backed golden pair
   // (the Mistral gate's treatment); every other device still skips loudly.
   const vt::DeviceType run_dev = loaded->runner().device().type;
@@ -282,33 +285,51 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   // goldens).
   //
   // Each Tenstorrent decode ARM gates against its OWN captured pair (#2115).
-  // VT_TT_HOST_FREE_DECODE=0 (the eager opt-out; same parsing convention as
-  // vt::tenstorrent::HostFreeDecodeEnabled) is a LEGITIMATE ALTERNATE GREEDY
-  // PATH, not a drift: it differs from the ambient pair at 61 of 256 cells
-  // across prompts 2,7,8,10,13,15 (first splits at (2,1),(7,3),(8,4),(10,10),
-  // (13,2),(15,9); prompt 2's suffix re-agrees transiently at (2,8)). Every
-  // differing cell is a near-tie on BOTH teacher-forced paths — ambient gaps
-  // <= 375 mnats at all 61 cells; eager max is exactly 500 mnats at (15,9),
-  // the band edge (stored int 500, so the `mn > kNearTieMnats` check passes).
-  // At (2,1) the top-2 logits are TIED (gap 0 on both paths): the ambient arm
-  // takes the oracle-greedy 1814, the eager arm flips to the tied runner-up
-  // 15039. So the eager leg loads the host_free_off pair captured on that arm,
-  // and the near-tie band (kNearTieMnats) and the exact-match anchor REQUIRE
-  // stay as they are. An earlier "differs at exactly one cell (2,1), re-syncs
-  // at tok=2" note was an artifact of this REQUIRE aborting at the first
-  // divergence — retired by the #2115 full-suffix diff (c31cad9c1 precedent).
+  // The ambient pair (refreshed 2026-09-05 with the device-pure GDN wave:
+  // the PA bf16 decode cast unlocked device sdpa_decode on the eager arm,
+  // and the boundary re-capture + conv-shadow gate fixed the captured arm)
+  // is a LEGITIMATE ALTERNATE GREEDY PATH, not a drift: teacher-forced
+  // against the transformers oracle it diverges from greedy_ids at 81 cells
+  // with max gap 375 mnats (69 of 81 cells our token IS the teacher-forced
+  // argmax), inside the 500-mnat band. The captured pair diverges at 68
+  // cells, also max gap 375 mnats. The two arms differ from each other at
+  // 59 of 256 cells — near-ties on both paths, the same shape the Mistral
+  // gate records. At exact ties the arm may take the tied runner-up, so the
+  // near-tie band (kNearTieMnats) and the exact-match anchor REQUIRE stay
+  // as they are. The pre-wave pairs' "uniform tok3 divergence" was a real
+  // defect (prefill dual-role transitions replaced the conv/ssm shadow
+  // device tensors the captured graph had baked; see the row spec), not an
+  // alternate path — retired with the fix, not adjudicated.
   const char* hf_env = std::getenv("VT_TT_HOST_FREE_DECODE");
   const bool host_free_off =
       tenstorrent && hf_env != nullptr && std::string_view(hf_env) == "0";
-  const char* ids_name = tenstorrent ? (host_free_off
+  // Selection follows the engine's arm: the #1625 flip defaults TT capture
+  // on for the evidence families (Qwen3.5-GDN joined with its own committed
+  // pair), so — like the qwen3 test — the ambient leg keys on
+  // DecodeCaptureEnabled() alone ("0" opts out to the eager arm and its
+  // pair). A hardcoded eager name would adjudicate a captured run against
+  // eager goldens when the arm IS captured.
+  const bool tt_capture =
+      tenstorrent && !host_free_off && vt::tenstorrent::DecodeCaptureEnabled();
+  const char* ids_name = tenstorrent
+                             ? (tt_capture
+                                    ? "our_ids_tenstorrent_capture.npy"
+                                    : (host_free_off
                                            ? "our_ids_tenstorrent_host_free_off.npy"
-                                           : "our_ids_tenstorrent.npy")
-                                     : "our_ids.npy";
+                                           : "our_ids_tenstorrent.npy"))
+                             : "our_ids.npy";
   const char* gap_name = tenstorrent
-                             ? (host_free_off
-                                    ? "neartie_gap_mnats_tenstorrent_host_free_off.npy"
-                                    : "neartie_gap_mnats_tenstorrent.npy")
+                             ? (tt_capture
+                                    ? "neartie_gap_mnats_tenstorrent_capture.npy"
+                                    : (host_free_off
+                                           ? "neartie_gap_mnats_tenstorrent_host_free_off.npy"
+                                           : "neartie_gap_mnats_tenstorrent.npy"))
                              : "neartie_gap_mnats.npy";
+  if (tt_capture && !fs::exists(gdir / ids_name) && !dump) {
+    MESSAGE(label << " TT capture pair absent (the committed pair was removed "
+            "or renamed); skipping on Tenstorrent");
+    return;
+  }
   parity::NpyArray o_dev, gap_dev;  // keep the device arrays alive for the loop
   bool bootstrap_only = false;
   if (device_golden) {
@@ -447,7 +468,8 @@ void RunGate(const std::string& golden_subdir, const char* label) {
 
   if (dump) {
     const std::string dump_name =
-        tenstorrent ? "our_ids_tenstorrent.i32" : "our_ids.i32";
+        tt_capture ? "our_ids_tenstorrent_capture.i32"
+                   : (tenstorrent ? "our_ids_tenstorrent.i32" : "our_ids.i32");
     const std::string path = (gdir / dump_name).string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f != nullptr) {

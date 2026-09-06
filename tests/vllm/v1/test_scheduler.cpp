@@ -1293,6 +1293,102 @@ TEST_CASE(
   }
 }
 
+// ---------------------------------------------------------------------------
+// The STATS half of upstream's test_schedule_spec_decoding_stats
+// (tests/v1/core/test_scheduler.py:1307-1439): the same six parameterised cases
+// and the same `expected` tuple, read off SchedulerStats rather than off the
+// request. The case above already asserts the scheduling and the rollback; this
+// one asserts what /metrics is fed (#2770).
+//
+// It enters through the two production functions the exposition depends on,
+// `update_from_output` and `make_stats`, and asserts BOTH polarities: empty
+// after a step that verified no draft, populated after one that did. RED before
+// this row's change: SchedulerStats had no spec_decoding_stats field at all.
+// ---------------------------------------------------------------------------
+TEST_CASE(
+    "Scheduler: spec-decoding stats count drafts, draft tokens, accepted "
+    "tokens and per-position acceptance") {
+  struct Case {
+    std::vector<std::vector<int32_t>> spec_tokens;
+    std::vector<std::vector<int32_t>> output_tokens;
+    int64_t num_drafts;
+    int64_t num_draft_tokens;
+    int64_t num_accepted_tokens;
+    std::vector<int64_t> num_accepted_tokens_per_pos;
+  };
+  // Upstream's parametrize list verbatim, expected == (num_drafts,
+  // num_draft_tokens, num_accepted_tokens, num_accepted_tokens_per_pos).
+  const std::vector<Case> cases = {
+      {{{1, 2, 3}}, {{1, 2, 3, 4}}, 1, 3, 3, {1, 1, 1}},   // perfect match
+      {{{1, 2, 3}}, {{1, 5}}, 1, 3, 1, {1, 0, 0}},         // early mismatch
+      {{{1, 2}, {3}}, {{1, 2, 5}, {3, 4}}, 2, 3, 3, {2, 1}},  // multiple seqs
+      {{{1}}, {{1, 2}}, 1, 1, 1, {1}},                     // single token
+      {{{}}, {{5}}, 0, 0, 0, {0}},                         // empty sequence
+      {{{1, 2, 3}, {4, 5, 6}}, {{1, 2, 7}, {4, 8}}, 2, 6, 3, {2, 1, 0}},
+  };
+
+  for (const auto& c : cases) {
+    int k = 1;
+    for (const auto& s : c.spec_tokens) {
+      k = std::max(k, static_cast<int>(s.size()));
+    }
+    auto scheduler = CreateSpecScheduler(/*num_speculative_tokens=*/k);
+    const int num_reqs = static_cast<int>(c.spec_tokens.size());
+    auto requests = CreateRequests(num_reqs, /*num_tokens=*/1);
+    std::vector<std::string> req_ids;
+    for (auto& r : requests) {
+      req_ids.push_back(r->request_id);
+      AddRequest(*scheduler, std::move(r));
+    }
+
+    // Step 1 — a decode that verifies nothing. Upstream: "No draft or accepted
+    // tokens counted yet".
+    auto out = scheduler->schedule();
+    FeedModelOutput(*scheduler, out,
+                    std::vector<std::vector<int32_t>>(
+                        num_reqs, std::vector<int32_t>{0}));
+    CHECK_FALSE(scheduler->make_stats().spec_decoding_stats.has_value());
+
+    DraftTokenIds drafts;
+    drafts.req_ids = req_ids;
+    drafts.draft_token_ids = c.spec_tokens;
+    scheduler->update_draft_token_ids(drafts);
+
+    // Step 2 — verify the drafts.
+    out = scheduler->schedule();
+    FeedModelOutput(*scheduler, out, c.output_tokens);
+    const auto stats = scheduler->make_stats().spec_decoding_stats;
+
+    if (c.num_drafts == 0) {
+      // The empty-sequence case. make_spec_decoding_stats returns empty for a
+      // request that verified no draft, so a step in which NO request drafted
+      // reports nothing at all rather than a zero-valued aggregate
+      // (scheduler.py:2722-2723).
+      CHECK_FALSE(stats.has_value());
+      continue;
+    }
+    REQUIRE(stats.has_value());
+    CHECK(stats->num_drafts == c.num_drafts);
+    CHECK(stats->num_draft_tokens == c.num_draft_tokens);
+    CHECK(stats->num_accepted_tokens == c.num_accepted_tokens);
+    CHECK(stats->num_accepted_tokens_per_pos ==
+          c.num_accepted_tokens_per_pos);
+    // The per-position vector is sized by the CONFIG, not by what was drafted
+    // (metrics.py:37-38), which is what makes the Prometheus label cardinality
+    // fixed at construction.
+    CHECK(stats->num_spec_tokens == k);
+    CHECK(static_cast<int>(stats->num_draft_tokens_per_pos.size()) == k);
+
+    // A third step that verifies nothing CLEARS the stash: a stale aggregate
+    // republished every step would multiply the counters without bound.
+    out = scheduler->schedule();
+    FeedModelOutput(*scheduler, out,
+                   std::vector<std::vector<int32_t>>(
+                       num_reqs, std::vector<int32_t>{9}));
+    CHECK_FALSE(scheduler->make_stats().spec_decoding_stats.has_value());
+  }
+}
+
 TEST_CASE(
     "Scheduler.update_from_output: empty spec output does not underflow "
     "num_computed (regression)") {

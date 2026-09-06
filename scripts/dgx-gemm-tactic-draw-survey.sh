@@ -114,7 +114,13 @@
 #        --src /workspace/gemm-draw-survey/src.tar.gz \
 #        --model /workspace/ckpt/<nvfp4-checkpoint> \
 #        [--draws 8] [--score-reps 3] [--concurrency 2] [--phase all] \
-#        [--tactic-set full|w1]
+#        [--tactic-set full|w1] [--smoke]
+#
+# `--smoke` walks the COMPLETE phase sequence at the smallest size it runs at --
+# one draw, one scoring leg, four short prompts -- so a sequencing defect
+# surfaces in one lease instead of one lease each. It is NOT a measurement: it
+# marks every record it writes, `reduce` reports no speed verdict for a marked
+# root, and no draw can be pinned from one. It refuses any size given with it.
 #
 # `--phase` is one of: all build draw score reduce. `--score-leg ARM` is the
 # INTERNAL re-entry the leg runner calls; do not pass it by hand.
@@ -151,6 +157,7 @@ DRAWS=8
 # and return no verdict.
 SCORE_REPS=3
 CHECK_ART=""
+CHECK_TK=""
 CONCURRENCY=2
 NUM_PROMPTS=32
 INPUT_LEN=512
@@ -161,29 +168,75 @@ PHASE=all
 TACTIC_SET=full
 SCORE_LEG=""
 LOCAL_ROOT=/tmp/gtds
+SMOKE=0
+SIZES_GIVEN=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --evidence)      EV_SHARE=${2:?}; shift 2 ;;
     --src)           SRC_IN=${2-}; shift 2 ;;
     --model)         MODEL=${2:?}; shift 2 ;;
-    --draws)         DRAWS=${2:?}; shift 2 ;;
-    --score-reps)    SCORE_REPS=${2:?}; shift 2 ;;
-    --concurrency)   CONCURRENCY=${2:?}; shift 2 ;;
-    --num-prompts)   NUM_PROMPTS=${2:?}; shift 2 ;;
-    --input-len)     INPUT_LEN=${2:?}; shift 2 ;;
-    --output-len)    OUTPUT_LEN=${2:?}; shift 2 ;;
+    --draws)         DRAWS=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --draws"; shift 2 ;;
+    --score-reps)    SCORE_REPS=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --score-reps"; shift 2 ;;
+    --concurrency)   CONCURRENCY=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --concurrency"; shift 2 ;;
+    --num-prompts)   NUM_PROMPTS=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --num-prompts"; shift 2 ;;
+    --input-len)     INPUT_LEN=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --input-len"; shift 2 ;;
+    --output-len)    OUTPUT_LEN=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --output-len"; shift 2 ;;
     --seed)          SEED=${2:?}; shift 2 ;;
-    --max-num-batched-tokens) MAX_BATCHED=${2:?}; shift 2 ;;
+    --max-num-batched-tokens) MAX_BATCHED=${2:?}; SIZES_GIVEN="$SIZES_GIVEN --max-num-batched-tokens"; shift 2 ;;
+    --smoke)         SMOKE=1; shift ;;
     --phase)         PHASE=${2:?}; shift 2 ;;
     --tactic-set)    TACTIC_SET=${2:?}; shift 2 ;;
     --score-leg)     SCORE_LEG=${2:?}; shift 2 ;;
     --check-artefacts) CHECK_ART=${2:?}; shift 2 ;;
+    --check-toolkit) CHECK_TK=${2:?}; shift 2 ;;
     --local-root)    LOCAL_ROOT=${2:?}; shift 2 ;;
-    -h|--help)       sed -n '2,120p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,126p' "$0"; exit 0 ;;
     *)               die "$E_USAGE" "unknown argument '$1'" ;;
   esac
 done
+
+# === --smoke: THE WHOLE SEQUENCE, AT THE SMALLEST SIZE IT RUNS AT (#2972) ===
+# Three precondition defects were found one at a time, each by its own GPU
+# lease, each blocking the phase after the one before it: the artefact check
+# that required a shared library no build emits (#2912), a checkpoint with no
+# SHA256SUMS, and a phase [A] that never installed a toolkit (#2967). None was
+# visible to the CPU suite, because the shell tests write `phase/build.ok` and
+# skip the build phase outright. The build dominates the cost at ~20 minutes and
+# every one of those defects sat AFTER it, so a smoke run pays the build once
+# and walks everything left in minutes -- and all three would have been found
+# together.
+#
+# IT CHANGES SIZE AND NOTHING ELSE. Same phases, same preconditions, same judge,
+# same thresholds. A size given alongside it is REFUSED rather than resolved:
+# a mode that can be argued back up to measurement sizes while still carrying
+# the marker is worse than no mode, because its report would then be both
+# quotable-looking and refused.
+if [ "$SMOKE" = 1 ] && [ -n "$SIZES_GIVEN" ]; then
+  die "$E_USAGE" "--smoke sets every size itself and was given$SIZES_GIVEN as well. --smoke is a shape, not a default: pass one or the other"
+fi
+if [ "$SMOKE" = 1 ]; then
+  DRAWS=1
+  SCORE_REPS=1
+  CONCURRENCY=1
+  NUM_PROMPTS=4
+  INPUT_LEN=32
+  OUTPUT_LEN=8
+  # THE ENGINE'S OWN FLOOR, NOT A NUMBER CHOSEN HERE. `ResolveMaxNumBatchedTokens`
+  # (src/vllm/entrypoints/model_loader.cpp:1333-1348) returns
+  # `max(requested, max_num_seqs)` and the bench sets `max_num_seqs =
+  # max(concurrency, 1)` (examples/bench/bench_core.h:708,722), so the smallest
+  # value the engine will not raise is the concurrency. It is also what makes
+  # the smoke run short: the pre-serve warmup tunes one plan per shape for every
+  # bucket in `HybridMTuningBuckets(max_num_batched_tokens)`
+  # (src/vt/cuda/nvfp4_plan_cache.h:58-84), which is 21 buckets at the survey's
+  # own 8192 and ONE here. Chunked prefill is on unconditionally
+  # (model_loader.cpp:1419), so a prompt longer than the budget is split rather
+  # than refused, and every scheduled step is then one token -- the single
+  # bucket the warmup tuned, which is what keeps the frozen replay consistent.
+  MAX_BATCHED=$CONCURRENCY
+fi
+SMOKE_ARG=""; [ "$SMOKE" = 1 ] && SMOKE_ARG="--smoke"
 
 [ -n "$EV_SHARE" ] || die "$E_USAGE" "--evidence is required"
 [ -n "$MODEL" ] || die "$E_USAGE" "--model is required; this harness NEVER defaults a checkpoint path"
@@ -231,6 +284,31 @@ resolve_artefacts() {
   [ -n "$ART_BIN" ]
 }
 
+# WHAT COUNTS AS A TOOLKIT, AND IT IS NOT `command -v nvcc` (#2967 A).
+# Asserted on BOTH names the linker can ask for: a staged toolkit that satisfies
+# `find_package` can still fail 21 minutes later with 38 undefined references
+# against `@libcudart.so.13`, because the SONAME is a THIRD name that CIFS did
+# not carry (.agents/environment.md, #2220). The header is asserted too, because
+# a PARTIAL leftover -- `cuda-nvcc-13-0` alone, or a copy that lost its
+# `include` symlink -- puts nvcc on PATH and then dies at
+# `find_package(CUDAToolkit REQUIRED)` with "Could NOT find CUDA (missing:
+# CUDA_INCLUDE_DIRS CUDA_CUDART_LIBRARY)", a line that names the version and
+# denies the toolkit at once. `/usr/local/cuda/include` is normally a symlink to
+# `targets/sbsa-linux/include` and `/workspace` is CIFS with `nounix`, which
+# stores no symlink, so a toolkit staged off the share carries only the second
+# path: both are accepted.
+toolkit_ok() {
+  [ -x "$1/bin/nvcc" ] || return 1
+  local lib="$1/targets/sbsa-linux/lib"
+  for stem in libcudart libcublasLt; do
+    [ -e "$lib/$stem.so" ] || return 1
+    ls "$lib/$stem.so."[0-9]* >/dev/null 2>&1 || return 1
+  done
+  [ -f "$1/include/cuda_runtime.h" ] \
+    || [ -f "$1/targets/sbsa-linux/include/cuda_runtime.h" ] || return 1
+  return 0
+}
+
 # `--check-artefacts DIR` is the INTERNAL gate handle: it runs the same
 # predicate the build phase runs, so a test exercises the production code path
 # rather than a transcription of it. The shell tests skip the build phase by
@@ -242,6 +320,19 @@ if [ -n "$CHECK_ART" ]; then
     exit 0
   fi
   die "$E_ARTEFACT" "build artefacts not found under $CHECK_ART: no vllm-bench"
+fi
+
+# `--check-toolkit DIR` is the same handle for phase [A]'s postcondition. The
+# install itself writes /usr/local as root on a leased pod and no CPU suite can
+# run it; the predicate that decides whether the install WORKED is checkable
+# anywhere, and it is the half that has been wrong.
+if [ -n "$CHECK_TK" ]; then
+  if toolkit_ok "$CHECK_TK"; then
+    echo "toolkit=$CHECK_TK"
+    echo "nvcc=$CHECK_TK/bin/nvcc"
+    exit 0
+  fi
+  die "$E_TOOLKIT" "no COMPLETE CUDA toolkit under $CHECK_TK (nvcc + cuda_runtime.h + libcudart.so/.so.MAJOR + libcublasLt.so/.so.MAJOR)"
 fi
 mark_phase() { mkdir -p "$PHASEDIR"; date -u +%Y-%m-%dT%H:%M:%SZ > "$PHASEDIR/$1.ok"; mirror_out; }
 
@@ -380,6 +471,7 @@ PROV="$EV_LOCAL/PROVENANCE"
   echo "harness_sha256=$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
   echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
   echo "model=$MODEL"
+  echo "smoke=$SMOKE"
   echo "draws=$DRAWS score_reps=$SCORE_REPS concurrency=$CONCURRENCY tactic_set=$TACTIC_SET"
   echo "num_prompts=$NUM_PROMPTS input_len=$INPUT_LEN output_len=$OUTPUT_LEN seed=$SEED"
   echo "max_num_batched_tokens=$MAX_BATCHED"
@@ -387,21 +479,52 @@ PROV="$EV_LOCAL/PROVENANCE"
 } >> "$PROV"
 say "EV_LOCAL=$EV_LOCAL EV_SHARE=$EV_SHARE"
 
-# === [A] CUDA toolkit, resolved BEFORE anything probes it ==================
-# Lifted from scripts/ltx25-dit-attn-flash-ab.sh, which records why each branch
-# exists. The postcondition is asserted on BOTH names the linker can ask for:
-# a staged toolkit that satisfies `find_package` can still fail 21 minutes later
-# with 38 undefined references against `@libcudart.so.13`, because the SONAME is
-# a THIRD name that CIFS did not carry (.agents/environment.md, #2220).
-toolkit_ok() {
-  [ -x "$1/bin/nvcc" ] || return 1
-  local lib="$1/targets/sbsa-linux/lib"
-  for stem in libcudart libcublasLt; do
-    [ -e "$lib/$stem.so" ] || return 1
-    ls "$lib/$stem.so."[0-9]* >/dev/null 2>&1 || return 1
-  done
+# === [A] CUDA toolkit, resolved, repaired, or INSTALLED =====================
+# The search and repair branches are lifted from
+# scripts/ltx25-dit-attn-flash-ab.sh, which records why each exists. What counts
+# as a toolkit is `toolkit_ok` above, beside the other predicate a test can
+# reach, and it is the postcondition rather than the binary.
+#
+# THE POD HAS NO TOOLKIT, SO [A] INSTALLS ONE (#2967 A).
+# AGENTS.md: "No CUDA toolkit is preinstalled, so a job that compiles CUDA
+# installs one first." This harness only ever LOOKED for one, and the run that
+# built 857/857 succeeded because an earlier job's global install was still
+# sitting in the long-lived worker container. `dgx:gpu0` then read `unhealthy
+# (no contact 12h24m)`, the pod was recreated, and the next two jobs died at [A]
+# in one second.
+#
+# The recipe is the one `.agents/environment.md` documents and
+# `scripts/rc-sglang-oracle-lease.sh` implements, mirrored rather than varied.
+# `cuda-toolkit-13-0` is NOT in Ubuntu's own archive, so NVIDIA's repo is added
+# first -- without it the install fails to resolve on a freshly recreated pod
+# and SUCCEEDS on a pod where an earlier job already added it, which is the same
+# leftover-state trap in a second guise. The `sbsa` path in that URL is the
+# aarch64 one and is what this fleet needs.
+#
+# NO APT EXIT STATUS IS TESTED HERE, ON PURPOSE. `resolve_toolkit` re-runs the
+# complete postcondition afterwards, and that is what decides. An apt-get that
+# reports 0 having installed a compiler-only leftover is exactly the shape this
+# whole section exists to catch.
+install_toolkit() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    say "cannot install a CUDA toolkit here: no apt-get on this host"
+    return 1
+  fi
+  if [ "$(id -u)" != 0 ]; then
+    say "cannot install a CUDA toolkit here: not root, and the install writes /usr/local"
+    return 1
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq; say "APT_UPDATE_RC=$?"
+  apt-get install -y -qq wget ca-certificates gnupg; say "APT_BASE_RC=$?"
+  wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb \
+       -O "$LOCAL_ROOT/cuda-keyring.deb"; say "KEYRING_DL_RC=$?"
+  dpkg -i "$LOCAL_ROOT/cuda-keyring.deb"; say "KEYRING_RC=$?"
+  apt-get update -qq; say "APT_REPO_UPDATE_RC=$?"
+  apt-get install -y -qq cuda-toolkit-13-0; say "CUDA_APT_RC=$?"
   return 0
 }
+
 resolve_toolkit() {
   local r
   for r in /usr/local/cuda /usr/local/cuda-13.0 "$LOCAL_ROOT/cudatk"; do
@@ -422,6 +545,18 @@ resolve_toolkit() {
         b=${f%%.so.*}
         [ -e "$b.so" ] || ln -sf "$f" "$b.so"
       done )
+    if toolkit_ok "$r"; then TKLIB="$r"; return 0; fi
+  done
+  # THE INSTALL, AND IT IS THE LAST BRANCH RATHER THAN THE FIRST. The
+  # environment doc asks for an UNCONDITIONAL install because a `command -v
+  # nvcc` guard skips the repair on a second job and then fails for the reason
+  # the guard was meant to remove. The guard above is not that guard: it is the
+  # COMPLETE postcondition, the same one asserted after the install, so a pod
+  # that already carries a usable toolkit does not pay apt again and a pod that
+  # carries a partial one still does. apt-get is idempotent either way.
+  say "no complete CUDA toolkit on this pod; installing cuda-toolkit-13-0"
+  install_toolkit || return 1
+  for r in /usr/local/cuda /usr/local/cuda-13.0; do
     if toolkit_ok "$r"; then TKLIB="$r"; return 0; fi
   done
   return 1
@@ -447,9 +582,17 @@ stage_source() {
 # never restores them -- while `phase/build.ok` IS mirrored and comes back. A
 # wiped `/tmp` under a surviving share therefore reads as "the build is done"
 # with no binary anywhere, and the run dies further down on a missing file.
+#
+# THE POLARITY IS `resolve_artefacts`'s, AND IT HAS TO BE (#2967 B). This
+# predicate required a shared `libvllm.so.*` for months after #2913 corrected
+# the build-phase check, which is #2912 repeating in the resume guard: the
+# configuration this harness invokes emits a STATIC `libvllm.a` and links
+# `vllm-bench` against it, so `$BIN` holds the binary and nothing else on EVERY
+# build this harness performs. A resume therefore refused its own good tree and
+# blamed a wiped `/tmp`, which is not what happened. Require the binary and the
+# recorded source; a shared library is optional here exactly as it is there.
 build_artefacts_ok() {
   [ -x "$BIN/vllm-bench" ] || return 1
-  ls "$BIN"/libvllm.so.* >/dev/null 2>&1 || return 1
   local recorded
   recorded=$(cat "$PHASEDIR/src.path" 2>/dev/null) || return 1
   [ -n "$recorded" ] && [ -f "$recorded/tools/bench/gemm_tactic_draw_survey.py" ] || return 1
@@ -464,7 +607,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = build ]; then
     # into this evidence root would therefore spend the whole draw phase again
     # to be refused at the end. Remove the marker only when this root holds no
     # draws, or start a fresh evidence root.
-    die "$E_ARTEFACT" "phase/build.ok came back from the share but $BIN/vllm-bench, its library, or the source at $(cat "$PHASEDIR/src.path" 2>/dev/null) did not: /tmp was wiped under a surviving evidence root. Draws already recorded here carry the previous binary's sha256 and the judge refuses two binaries (79), so start a FRESH --evidence root, or restore the binary, or delete $PHASEDIR/build.ok if this root holds no draws yet"
+    die "$E_ARTEFACT" "phase/build.ok came back from the share but $BIN/vllm-bench or the source at $(cat "$PHASEDIR/src.path" 2>/dev/null) did not: /tmp was wiped under a surviving evidence root. Draws already recorded here carry the previous binary's sha256 and the judge refuses two binaries (79), so start a FRESH --evidence root, or restore the binary, or delete $PHASEDIR/build.ok if this root holds no draws yet"
   fi
   if phase_done build; then
     say "=== [A-D] build already complete for this evidence root; skipping ==="
@@ -473,7 +616,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = build ]; then
   else
     say "=== [A] CUDA toolkit ==="
     TKLIB=""
-    resolve_toolkit || die "$E_TOOLKIT" "no COMPLETE CUDA toolkit (nvcc + libcudart.so/.so.MAJOR + libcublasLt.so/.so.MAJOR)"
+    resolve_toolkit || die "$E_TOOLKIT" "no COMPLETE CUDA toolkit after searching, repairing and installing one (want nvcc + cuda_runtime.h + libcudart.so/.so.MAJOR + libcublasLt.so/.so.MAJOR under /usr/local/cuda). The install prints its own apt exit codes above; read those before anything else"
     export PATH="$TKLIB/bin:$PATH" CUDAToolkit_ROOT="$TKLIB"
     say "CUDAToolkit_ROOT=$TKLIB"; nvcc --version | tail -2
 
@@ -572,10 +715,11 @@ fi
 if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
   if ! phase_done preflight; then
     say "=== [P] preflight draw ==="
+    # shellcheck disable=SC2086
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws 1 --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" \
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" $SMOKE_ARG \
         --mirror "$EV_SHARE" )
     P=$?
     mirror_out
@@ -589,10 +733,11 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
     # DRAW. Mirroring when the phase returns loses every completed draw to a
     # crash inside it, and the draw phase is hours of model loads on a box that
     # has gone down four times in one session (#545).
+    # shellcheck disable=SC2086
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws "$DRAWS" --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" \
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" $SMOKE_ARG \
         --mirror "$EV_SHARE" )
     G=$?
     mirror_out

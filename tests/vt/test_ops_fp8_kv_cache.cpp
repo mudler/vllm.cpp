@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/v1/attention/backend.h"
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vt/dtype.h"
 #include "vt/fp8_kv.h"
@@ -388,4 +389,234 @@ TEST_CASE("ParseCacheDType mirrors the vLLM CacheDType surface") {
   // Members owned by later rows are refused (mirrored surface, scoped compute).
   CHECK_THROWS_AS(ParseCacheDType("nvfp4", DType::kBF16), std::runtime_error);
   CHECK_THROWS_AS(ParseCacheDType("fp8_ds_mla", DType::kBF16), std::runtime_error);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KV-NVFP4-TURBO W0 (#2620). The CacheDType surface as an ENUM, and a refusal
+// that names its owner.
+//
+// Ported from vllm/v1/kv_cache_interface.py:39-101,126-128 (KVQuantMode,
+// get_kv_quant_mode, is_quantized_kv_cache, kv_cache_uses_per_token_head_scales)
+// and vllm/utils/torch_utils.py:546-548 (nvfp4_kv_cache_full_dim) @ `e126687a9a`,
+// the ACTIVE parity pin.
+//
+// WHY THE PARAMETER SET IS THE LITERAL. Upstream ships no unit test over
+// `get_kv_quant_mode`; its input domain is the `CacheDType` Literal
+// (config/cache.py:39-57) and nothing else. So the case below enumerates that
+// Literal member by member. A member added upstream and not mirrored here fails
+// `IsCacheDTypeName`, which is the only way a table like this can notice.
+
+namespace {
+
+// vllm/config/cache.py:39-57, in upstream's own order. Kept beside the
+// assertions rather than read out of the header, so the header's list and this
+// one have to be written to agree instead of agreeing by construction.
+constexpr const char* kCacheDTypeLiteral[] = {
+    "auto",           "float16",
+    "bfloat16",       "fp8",
+    "fp8_e4m3",       "fp8_e5m2",
+    "fp8_inc",        "fp8_ds_mla",
+    "turboquant_k8v4", "turboquant_4bit_nc",
+    "turboquant_k3v4_nc", "turboquant_3bit_nc",
+    "int4_per_token_head", "int8_per_token_head",
+    "fp8_per_token_head", "nvfp4",
+    "nvfp4_4over6",
+};
+
+// The message a refusal produced, or "" when the call did not throw.
+std::string RefusalMessage(const char* name) {
+  try {
+    (void)vllm::v1::ParseCacheDType(name, DType::kBF16);
+  } catch (const std::exception& e) {
+    return std::string(e.what());
+  }
+  return std::string();
+}
+
+}  // namespace
+
+TEST_CASE("GetKvQuantMode mirrors vLLM's KVQuantMode over the whole CacheDType Literal") {
+  using vllm::v1::GetKvQuantMode;
+  using vllm::v1::IsCacheDTypeName;
+  using vllm::v1::KVQuantMode;
+  using vllm::v1::KvQuantModeIsNvfp4;
+  using vllm::v1::KvQuantModeIsPerTokenHead;
+  using vllm::v1::KvQuantModeIsTurboquant;
+
+  // Every member of the Literal IS a CacheDType name; nothing else is.
+  for (const char* s : kCacheDTypeLiteral) {
+    CHECK(IsCacheDTypeName(s) == true);
+  }
+  CHECK(IsCacheDTypeName("not_a_dtype") == false);
+  CHECK(IsCacheDTypeName("") == false);
+  CHECK(IsCacheDTypeName("fp8_e4m3fn") == false);  // a torch dtype, not a CacheDType
+
+  // kv_cache_interface.py:83-97, arm by arm.
+  CHECK(GetKvQuantMode("auto") == KVQuantMode::kNone);
+  CHECK(GetKvQuantMode("float16") == KVQuantMode::kNone);
+  CHECK(GetKvQuantMode("bfloat16") == KVQuantMode::kNone);
+  // `:95-96` — the startswith("fp8") arm, which catches five members.
+  for (const char* s : {"fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc", "fp8_ds_mla"}) {
+    CHECK(GetKvQuantMode(s) == KVQuantMode::kFp8PerTensor);
+  }
+  // `:85-90` — the three per-token-head members are matched BEFORE that arm, so
+  // fp8_per_token_head is NOT kFp8PerTensor. Getting this order wrong is the one
+  // way to mirror the function and still answer differently.
+  CHECK(GetKvQuantMode("int4_per_token_head") == KVQuantMode::kInt4PerTokenHead);
+  CHECK(GetKvQuantMode("int8_per_token_head") == KVQuantMode::kInt8PerTokenHead);
+  CHECK(GetKvQuantMode("fp8_per_token_head") == KVQuantMode::kFp8PerTokenHead);
+  // `:91-92` — the nvfp4 arm is startswith, not equality, so the 4over6 variant
+  // folds onto the same mode. Equality here would answer kNone for it and
+  // silently drop it out of every nvfp4 predicate.
+  CHECK(GetKvQuantMode("nvfp4") == KVQuantMode::kNvfp4);
+  CHECK(GetKvQuantMode("nvfp4_4over6") == KVQuantMode::kNvfp4);
+  // `:93-94` — turboquant_* maps to its OWN member. At the prior pin 555967922
+  // there were no such members and these names fell through to NONE; the four
+  // modes and the is_turboquant predicate arrived with e126687a9a. Mirroring the
+  // stale answer would invert `is_quantized_kv_cache`, which is derived from it.
+  CHECK(GetKvQuantMode("turboquant_k8v4") == KVQuantMode::kTurboquantK8v4);
+  CHECK(GetKvQuantMode("turboquant_4bit_nc") == KVQuantMode::kTurboquant4bitNc);
+  CHECK(GetKvQuantMode("turboquant_k3v4_nc") == KVQuantMode::kTurboquantK3v4Nc);
+  CHECK(GetKvQuantMode("turboquant_3bit_nc") == KVQuantMode::kTurboquant3bitNc);
+
+  // `:58-65` is_per_token_head, `:67-70` is_nvfp4, `:72-80` is_turboquant.
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kInt8PerTokenHead) == true);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kFp8PerTokenHead) == true);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kInt4PerTokenHead) == true);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kFp8PerTensor) == false);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kNvfp4) == false);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kNone) == false);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kTurboquantK8v4) == false);
+  CHECK(KvQuantModeIsNvfp4(KVQuantMode::kNvfp4) == true);
+  CHECK(KvQuantModeIsNvfp4(KVQuantMode::kFp8PerTensor) == false);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquantK8v4) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquant4bitNc) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquantK3v4Nc) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquant3bitNc) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kNvfp4) == false);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kNone) == false);
+
+  // The enum values are upstream's IntEnum values, because a spec field carries
+  // this and a wrong ordinal is invisible until something serialises it.
+  CHECK(static_cast<int>(KVQuantMode::kNone) == 0);
+  CHECK(static_cast<int>(KVQuantMode::kFp8PerTensor) == 1);
+  CHECK(static_cast<int>(KVQuantMode::kInt8PerTokenHead) == 2);
+  CHECK(static_cast<int>(KVQuantMode::kFp8PerTokenHead) == 3);
+  CHECK(static_cast<int>(KVQuantMode::kInt4PerTokenHead) == 4);
+  CHECK(static_cast<int>(KVQuantMode::kNvfp4) == 5);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquantK8v4) == 6);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquant4bitNc) == 7);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquantK3v4Nc) == 8);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquant3bitNc) == 9);
+
+  // The two upstream copies of is_quantized_kv_cache DISAGREE at this pin, and
+  // this tree mirrors both. `IsQuantizedKvCache` is the enum copy
+  // (kv_cache_interface.py:100-101) and answers true for turboquant_*;
+  // `IsQuantizedKvCacheName` (backend.cpp:106) is the string copy
+  // (torch_utils.py:77-82) and answers false. Asserting both is what stops a
+  // later reader from "reconciling" them onto one predicate upstream has not
+  // picked.
+  CHECK(vllm::v1::IsQuantizedKvCache("turboquant_k8v4") == true);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("turboquant_k8v4") == false);
+  CHECK(vllm::v1::IsQuantizedKvCache("auto") == false);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("auto") == false);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("nvfp4") == true);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("nvfp4_4over6") == true);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("fp8_per_token_head") == true);
+
+  // The mode reaches the resolved config for the arms that parse, so a later
+  // wave dispatches on the enum instead of re-testing the string.
+  CHECK(vllm::v1::ParseCacheDType("auto", DType::kBF16).quant_mode ==
+        KVQuantMode::kNone);
+  CHECK(vllm::v1::ParseCacheDType("bfloat16", DType::kBF16).quant_mode ==
+        KVQuantMode::kNone);
+  CHECK(vllm::v1::ParseCacheDType("fp8", DType::kBF16).quant_mode ==
+        KVQuantMode::kFp8PerTensor);
+  CHECK(vllm::v1::ParseCacheDType("fp8_e5m2", DType::kBF16).quant_mode ==
+        KVQuantMode::kFp8PerTensor);
+}
+
+// torch_utils.py:546-548 — head_size//2 packed fp4 bytes + head_size//16 fp8
+// block-scale bytes. The head sizes are the ones the shipped registries build
+// attention specs with, plus upstream's own admission bound (head_size % 16).
+TEST_CASE("Nvfp4KvCacheFullDim mirrors nvfp4_kv_cache_full_dim") {
+  using vllm::v1::Nvfp4KvCacheFullDim;
+  CHECK(Nvfp4KvCacheFullDim(64) == 32 + 4);
+  CHECK(Nvfp4KvCacheFullDim(80) == 40 + 5);
+  CHECK(Nvfp4KvCacheFullDim(128) == 64 + 8);
+  CHECK(Nvfp4KvCacheFullDim(192) == 96 + 12);
+  CHECK(Nvfp4KvCacheFullDim(256) == 128 + 16);
+  // The whole point of the number: an nvfp4 page is 9/16 of a bf16 page's
+  // per-element width, not 1/4 — the block scales are not free.
+  CHECK(Nvfp4KvCacheFullDim(128) * 16 == 128 * 9);
+}
+
+// A refusal that does not name its owner sends the reader to the wrong row.
+// This case asserts the OWNER IDENTITY per member, never the prose, so a
+// reworded message stays green and a message that loses the owner reds.
+TEST_CASE("An unserved CacheDType member refuses and names the row that owes it") {
+  // nvfp4 — this row (#2620). The message must carry the name the operator
+  // typed, the owning row, and the issue, or the refusal is a dead end.
+  const std::string nvfp4 = RefusalMessage("nvfp4");
+  REQUIRE_FALSE(nvfp4.empty());
+  CHECK(nvfp4.find("nvfp4") != std::string::npos);
+  CHECK(nvfp4.find("cache_dtype") != std::string::npos);
+  CHECK(nvfp4.find("KV-NVFP4-TURBO") != std::string::npos);
+  CHECK(nvfp4.find("#2620") != std::string::npos);
+  // And it must say what an operator can do instead, because "no" without an
+  // alternative is what sends them to bf16 without noticing.
+  CHECK(nvfp4.find("--kv-cache-dtype fp8") != std::string::npos);
+
+  // nvfp4_4over6 is the same row's, and it must reach the SAME arm: the refusal
+  // dispatches on the mode, not on the literal string, so the variant cannot
+  // fall through to the "no row claims it yet" tail.
+  const std::string over6 = RefusalMessage("nvfp4_4over6");
+  REQUIRE_FALSE(over6.empty());
+  CHECK(over6.find("nvfp4_4over6") != std::string::npos);
+  CHECK(over6.find("KV-NVFP4-TURBO") != std::string::npos);
+  CHECK(over6.find("#2620") != std::string::npos);
+  CHECK(over6.find("no row here") == std::string::npos);
+
+  // The per-token-head and turboquant members are this row's too.
+  for (const char* s : {"int4_per_token_head", "int8_per_token_head",
+                        "fp8_per_token_head", "turboquant_k8v4",
+                        "turboquant_4bit_nc", "turboquant_k3v4_nc",
+                        "turboquant_3bit_nc"}) {
+    const std::string msg = RefusalMessage(s);
+    INFO("cache_dtype: " << s);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find(s) != std::string::npos);
+    CHECK(msg.find("KV-NVFP4-TURBO") != std::string::npos);
+  }
+
+  // The vendor members belong to OTHER rows, and saying so is the whole reason
+  // this is a per-member message instead of one shared string.
+  const std::string inc = RefusalMessage("fp8_inc");
+  REQUIRE_FALSE(inc.empty());
+  CHECK(inc.find("fp8_inc") != std::string::npos);
+  CHECK(inc.find("QUANT-KV-FP8-VENDOR") != std::string::npos);
+  CHECK(inc.find("KV-NVFP4-TURBO") == std::string::npos);
+
+  const std::string ds = RefusalMessage("fp8_ds_mla");
+  REQUIRE_FALSE(ds.empty());
+  CHECK(ds.find("fp8_ds_mla") != std::string::npos);
+  CHECK(ds.find("KV-DSV4-MULTICACHE") != std::string::npos);
+  CHECK(ds.find("KV-NVFP4-TURBO") == std::string::npos);
+
+  // A name outside the Literal is a DIFFERENT fact from a member this engine
+  // does not serve, and upstream draws that line at the pydantic Literal
+  // (config/cache.py:19-35). It must not claim a row owes it.
+  const std::string nonsense = RefusalMessage("not_a_dtype");
+  REQUIRE_FALSE(nonsense.empty());
+  CHECK(nonsense.find("not_a_dtype") != std::string::npos);
+  CHECK(nonsense.find("CacheDType") != std::string::npos);
+  CHECK(nonsense.find("KV-NVFP4-TURBO") == std::string::npos);
+
+  // Polarity control: every SERVED member still parses. Without this, a
+  // refusal widened to "everything" would pass every assertion above.
+  for (const char* s : {"auto", "float16", "bfloat16", "fp8", "fp8_e4m3",
+                        "fp8_e5m2"}) {
+    INFO("cache_dtype: " << s);
+    CHECK(RefusalMessage(s).empty());
+  }
 }

@@ -102,7 +102,15 @@ const char* KvCacheDTypeName(vt::DType dtype) {
   }
 }
 
-// vllm/utils/torch_utils.py:75-80.
+// vllm/utils/torch_utils.py:77-82 @ `e126687a9a` -- the STRING copy of
+// is_quantized_kv_cache, which `vllm/config/cache.py:13-16` imports. It is not
+// the enum copy at `kv_cache_interface.py:100-101`, and at this pin the two
+// disagree about the four `turboquant_*` members: the enum copy answers TRUE and
+// this one answers FALSE. Both are live upstream, so both are mirrored, and the
+// note above `KVQuantMode` in `include/vllm/v1/kv_cache_dtype.h` says why.
+//
+// The nvfp4 arm is `startswith`, not equality: `nvfp4_4over6` joined the
+// `CacheDType` Literal at this pin and upstream answers TRUE for it here.
 bool IsQuantizedKvCacheName(const std::string& kv_cache_dtype) {
   const auto ends_with = [&](const std::string& suffix) {
     return kv_cache_dtype.size() >= suffix.size() &&
@@ -110,7 +118,7 @@ bool IsQuantizedKvCacheName(const std::string& kv_cache_dtype) {
                                   suffix.size(), suffix) == 0;
   };
   return kv_cache_dtype.rfind("fp8", 0) == 0 || ends_with("per_token_head") ||
-         kv_cache_dtype == "nvfp4";
+         kv_cache_dtype.rfind("nvfp4", 0) == 0;
 }
 
 // backend.py:158-161 — an EMPTY supported list means "no constraint".

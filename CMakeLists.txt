@@ -1149,6 +1149,7 @@ add_library(vllm STATIC
   src/vllm/v1/sample/ops/bad_words.cpp
   src/vllm/v1/sample/logits_processor/builtin.cpp
   src/vllm/v1/sample/sampler.cpp
+  src/vllm/v1/spec_decode/metrics.cpp
   src/vllm/v1/spec_decode/rejection_sampler.cpp
   src/vllm/v1/spec_decode/ngram_proposer.cpp
   src/vllm/v1/spec_decode/draft_model_proposer.cpp
@@ -1736,6 +1737,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_fused.hip
     src/vt/rocm/rocm_mla_fused_norm_rope.hip
     src/vt/rocm/rocm_mla_ops.hip
+    src/vt/rocm/rocm_mla_attn.hip
     src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1762,6 +1764,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_mla_fused_norm_rope.hip
       src/vt/rocm/rocm_mla_ops.hip
+      src/vt/rocm/rocm_mla_attn.hip
       src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")

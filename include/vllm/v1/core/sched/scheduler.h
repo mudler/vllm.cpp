@@ -96,6 +96,7 @@
 #include "vllm/v1/engine/types.h"  // ModelRunnerOutput, EngineCoreOutputs
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
+#include "vllm/v1/spec_decode/metrics.h"  // spec_decode::SpecDecodingStats
 
 namespace vllm::v1::kv_offload {
 class KVConnector;  // vllm/v1/kv_offload/kv_connector.h (KV-CONNECTORS W5 ABI)
@@ -418,6 +419,27 @@ class Scheduler {
   // on a step that produced no observation so make_stats() never re-reports a
   // stale delta.
   PrefixCacheStats last_prefix_cache_stats_;
+
+  // This step's speculative-decoding aggregate, stashed by update_from_output
+  // for make_stats() (#2770). Same arrangement, and the same reason, as
+  // last_prefix_cache_stats_ above: EngineCore calls make_stats() after
+  // update_from_output returns, so the value cannot be passed down the call the
+  // way scheduler.py:2211 passes it. EMPTY on every step that verified no
+  // draft, which is what keeps SchedulerStats::spec_decoding_stats an honest
+  // "this step speculated" signal rather than a running total.
+  std::optional<spec_decode::SpecDecodingStats> last_spec_decoding_stats_;
+
+  // make_spec_decoding_stats (scheduler.py:2714-2731): fold ONE request's
+  // verify result into the step aggregate, constructing it on first use.
+  // Returns empty when stats are off or the request verified no draft, which is
+  // upstream's own return shape. `num_invalid_spec_tokens` is
+  // SchedulerOutput's map of drafts the drafter could not fill (scheduled as -1
+  // placeholders); they were never really drafted and are subtracted here.
+  std::optional<spec_decode::SpecDecodingStats> make_spec_decoding_stats(
+      std::optional<spec_decode::SpecDecodingStats> spec_decoding_stats,
+      int num_draft_tokens, int num_accepted_tokens,
+      const std::map<std::string, int>& num_invalid_spec_tokens,
+      const std::string& request_id) const;
 
   // _preempt_request (scheduler.py:1203-1224): free the request's KV, mark it
   // PREEMPTED, reset its computed tokens, and re-queue it to the FRONT of waiting

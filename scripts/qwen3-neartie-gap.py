@@ -38,7 +38,8 @@ PROMPTS = [
 ]
 OUTSIDE_TOPK_MNATS = 99_999_000  # our token not even in vLLM's top-K => real bug
 
-def main():
+
+def _parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--golden-dir", required=True)
@@ -48,7 +49,29 @@ def main():
     # over-commits and REBOOTS the box. 0.40 is the safe ceiling (does not affect the
     # teacher-forced logprobs — only KV-cache capacity, unused here at max_tokens=1).
     ap.add_argument("--gpu-mem-util", type=float, default=0.40)
-    args = ap.parse_args()
+    ap.add_argument("--enforce-eager", action="store_true",
+                    help="use eager execution for diagnostics instead of the "
+                         "production execution mode")
+    return ap.parse_args(argv)
+
+
+def _llm_kwargs(args):
+    return {
+        "model": args.model,
+        "dtype": "bfloat16",
+        "enforce_eager": args.enforce_eager,
+        "gpu_memory_utilization": args.gpu_mem_util,
+    }
+
+
+def _mode_narration(args):
+    eager = args.enforce_eager
+    mode = "eager diagnostic" if eager else "production"
+    return f"oracle execution mode: {mode} (enforce_eager={eager})"
+
+
+def main():
+    args = _parse_args()
     from vllm import LLM, SamplingParams
 
     N, T = len(PROMPTS), args.max_tokens
@@ -56,8 +79,8 @@ def main():
                       dtype="<i4").reshape(N, T)
     greedy = np.load(os.path.join(args.golden_dir, "greedy_ids.npy"))
 
-    llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
-              gpu_memory_utilization=args.gpu_mem_util)
+    print(_mode_narration(args), flush=True)
+    llm = LLM(**_llm_kwargs(args))
 
     gap_mnats = np.zeros((N, T), dtype="<i4")
     print(f"=== teacher-forced near-tie gap: {args.model} (OUR prefix) ===")

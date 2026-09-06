@@ -29510,3 +29510,31 @@ and `1cf2b8c54d` adds the quantized-lm_head path that also serves an NVFP4
 target. Neither is on any SGLang release; v0.5.18 branched before them. Until
 that arm is built and measured, this row has **no SGLang denominator**, and no
 number in this entry may be read as one.
+
+## TT #1625 FLIP-TREE RATE RE-TAKE: the shipped default (captured, no env) holds 27.70 tok/s warm-median at c=1 and 2.15x over its own opt-out arm; six legs, zero replays, zero fatals (2026-09-04, `row/BACKEND-TENSTORRENT-HOST-FREE-FORWARD` @ `d88aed67b`, P150 `thalia`, [#1625](https://github.com/mudler/vllm.cpp/issues/1625), [#2566](https://github.com/mudler/vllm.cpp/issues/2566))
+
+The #2566 recipe re-run on the flip tree, where captured decode is the
+SHIPPED default for Qwen3-dense and the opt-out arm needs the env. Qwen3-0.6B,
+batch 1, 96 completion tokens, `--repeat 5`, leg 1 of each arm discarded,
+warm medians of the remaining four, order-alternated A/B triples, one
+`flock $HOME/gpu.lock` and one full-path `tt-smi -r 0` for the batch.
+
+| arm | warm median tok/s | triple medians | replays | fatals |
+|---|---:|---|---:|---:|
+| default (capture on) | **27.70** | 27.63 / 27.67 / 27.97 | 0 | 0 |
+| `VT_TT_DECODE_CAPTURE=0` | 12.86 | 12.88 / 13.02 / 12.76 | 0 | 0 |
+
+Agreement with earlier records: the captured leg within 1% of the
+2026-09-01 opt-in figure (27.47, entry above); the opt-out leg reproduces
+the 2026-08-30 eager host-free class (12.21). Raw per-leg output:
+`/tmp/r1625-issues/flip-rate-retake2.out` and `~/hf-flip-t{1,2,3}{A,B}.out`
+on `thalia`; the published figure lives in
+`docs/benchmarks/tt-capture-default-decode.md`.
+
+An earlier attempt the same evening aborted wholesale (rc=134/135): the
+batch script reset the card with a bare `tt-smi`, which is not on PATH in a
+non-interactive shell (rc=127), so the card stayed dirty from a killed
+process and UMD refused device 0 ("Query mappings failed",
+`pci_device.cpp:452`). The fix is the full path
+`$HOME/Sources/tt/.venv/bin/tt-smi -r 0` plus an abort-guard on the reset's
+exit status; every script that resets a card needs the full path.

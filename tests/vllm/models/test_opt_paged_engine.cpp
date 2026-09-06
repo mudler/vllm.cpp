@@ -12,7 +12,9 @@
 // deterministic on this model. It is: `scripts/opt-oracle-capture.py --runs 5`
 // reported ALL SIX prompts deterministic over K=5 runs with **0 multi-valued
 // (prompt,pos) cells** (evidence committed in greedy_dist.npy, and re-asserted
-// at the top of this test). Where vLLM is self-consistent the honest bar is
+// at the top of this test — REQUIRED there, not merely re-asserted when the
+// file happens to be present: a licence that can go missing without a red is
+// a mute switch, #2805). Where vLLM is self-consistent the honest bar is
 // exact agreement — so no near-tie band is used here at all, and any divergence
 // is reported with its first position for diagnosis rather than absorbed.
 //
@@ -85,6 +87,14 @@ const std::vector<std::string>& Prompts() {
   return p;
 }
 
+// The floor on K for the self-determinism measurement that SELECTS this
+// gate. scripts/opt-oracle-capture.py documents `--runs K (K>=5)` and the
+// committed evidence was captured at K=5, but the script clamps with
+// `K = max(1, args.runs)` and enforces no floor — and a K=1 dist is
+// single-valued by construction, so it reports perfect determinism while
+// measuring none. The gate that DEPENDS on the number therefore checks it.
+constexpr int64_t kMinDeterminismRuns = 5;
+
 // The materialized bf16-safetensors OPT-125m dir (config.json +
 // model.safetensors + tokenizer.json). Overridable for a non-default location.
 std::string FindOptModelDir() {
@@ -132,6 +142,100 @@ std::vector<int32_t> LoadI32File(const fs::path& p) {
 }  // namespace
 
 TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (CUDA + Metal + Tenstorrent, SACRED)") {
+  // ---- THE BAR (committed repository bytes) --------------------------------
+  // Read BEFORE the dgx-only checkpoint guard, deliberately. The goldens are
+  // bytes in this repository, so whether they are complete, and whether they
+  // still license the strict bar, does not depend on a machine having the
+  // checkpoint staged. Behind that guard this whole section would be
+  // unexecuted on every host that skips — a precondition nothing measures,
+  // which is how a re-capture could have retired the licence unnoticed
+  // everywhere but on dgx (#2805).
+  const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / "opt_greedy";
+  if (!fs::exists(gdir / "greedy_ids.npy")) {
+    MESSAGE("SKIP: OPT greedy golden absent — capture on dgx: "
+            "scripts/opt-oracle-capture.py --runs 5");
+    return;
+  }
+  const parity::NpyArray g = parity::LoadNpy((gdir / "greedy_ids.npy").string());
+  REQUIRE(g.dtype == "<i4");
+  REQUIRE(g.shape.size() == 2);
+  const int64_t N = g.shape[0];
+  const int64_t T = g.shape[1];
+  REQUIRE(static_cast<size_t>(N) == Prompts().size());
+  const int32_t* gd = AsI32(g);
+
+  // ---- GATE SELECTION (the ratified methodology) ---------------------------
+  // Re-assert vLLM's own self-determinism from the committed K-run evidence.
+  // Zero multi-valued cells is what licenses the STRICT bar below; if this ever
+  // becomes non-zero the gate must be re-derived, not silently loosened.
+  //
+  // THE LICENCE IS A PRECONDITION OF THE BAR, SO IT FAILS CLOSED (#2805). This
+  // block used to sit inside `if (fs::exists(gdir / "greedy_dist.npy"))` with
+  // `multi_cells` initialised to -1, so REMOVING the evidence removed the check
+  // instead of failing it: no CHECK fired, and the strict comparison below ran
+  // unlicensed and green. A licence that stops being taken has to red.
+  //
+  // Each REQUIRE below names one input that makes "0 multi-valued cells" true
+  // for a reason OTHER than vLLM being deterministic — the instrument reading
+  // clean because it was given nothing to find:
+  //   absent            the count is never taken at all
+  //   unreadable        LoadNpy throws, which doctest reports as a failure
+  //   DK < kMinDeterminismRuns
+  //                     an [N,T,1] dist is single-valued BY CONSTRUCTION;
+  //                     opt-oracle-capture.py documents K>=5 (its `--runs`
+  //                     help) and enforces nothing, and `K = max(1, args.runs)`
+  //                     makes `--runs 1` a well-formed capture
+  //   DN,DT != N,T      a dist smaller than the bar licenses only part of it
+  //   dtype != "<i4"    AsI32 reinterprets the buffer blindly, so a wider or
+  //                     narrower descr yields a count of nothing in particular
+  //   a negative value  opt-oracle-capture.py:93,101 pre-fills the dist with -1
+  //                     and pads a short generation with it in EVERY run, so an
+  //                     unmeasured position agrees with itself
+  //   run 0 != the bar  a dist from some other capture measures some other
+  //                     generation and says nothing about this one
+  REQUIRE_MESSAGE(
+      fs::exists(gdir / "greedy_dist.npy"),
+      "OPT GOLDEN SET INCOMPLETE: greedy_ids.npy (the bar) is present but "
+      "greedy_dist.npy — the K-run evidence that SELECTS the strict "
+      "token-exact bar — is not. The bar is not licensed without it. "
+      "Re-capture with scripts/opt-oracle-capture.py --runs 5.");
+  const parity::NpyArray d = parity::LoadNpy((gdir / "greedy_dist.npy").string());
+  REQUIRE(d.dtype == "<i4");
+  REQUIRE(d.shape.size() == 3);
+  const int64_t DN = d.shape[0], DT = d.shape[1], DK = d.shape[2];
+  REQUIRE(DN == N);
+  REQUIRE(DT == T);
+  REQUIRE(DK >= kMinDeterminismRuns);
+  const auto* dd = AsI32(d);
+  int64_t multi_cells = 0;
+  int64_t unmeasured_values = 0;
+  int64_t bar_mismatches = 0;
+  for (int64_t i = 0; i < DN; ++i)
+    for (int64_t j = 0; j < DT; ++j) {
+      std::set<int32_t> s;
+      for (int64_t k = 0; k < DK; ++k) {
+        const int32_t v = dd[(i * DT + j) * DK + k];
+        if (v < 0) ++unmeasured_values;
+        s.insert(v);
+      }
+      if (s.size() > 1) ++multi_cells;
+      if (dd[(i * DT + j) * DK] != gd[i * T + j]) ++bar_mismatches;
+    }
+  const std::string verdict =
+      multi_cells == 0
+          ? std::string(" (DETERMINISTIC -> STRICT token-exact gate)")
+          : std::string(" (NON-DET: the strict bar below is no longer the "
+                        "right gate — re-derive it)");
+  MESSAGE("opt-125m: vLLM self-determinism over K=" << DK
+          << " runs — multi-valued (prompt,pos) cells = " << multi_cells
+          << ", unmeasured (padded) values = " << unmeasured_values
+          << ", run-0 cells disagreeing with the bar = " << bar_mismatches
+          << verdict);
+  REQUIRE(unmeasured_values == 0);
+  REQUIRE(bar_mismatches == 0);
+  CHECK(multi_cells == 0);
+
+  // ---- THE CHECKPOINT (dgx / Apple M4 only) --------------------------------
   const std::string dir = FindOptModelDir();
   if (dir.empty()) {
     MESSAGE(
@@ -140,48 +244,6 @@ TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (CUDA + Metal + 
         "scripts/opt-materialize-checkpoint.py");
     return;
   }
-  const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / "opt_greedy";
-  if (!fs::exists(gdir / "greedy_ids.npy")) {
-    MESSAGE("SKIP: OPT greedy golden absent — capture on dgx: "
-            "scripts/opt-oracle-capture.py --runs 5");
-    return;
-  }
-
-  // ---- GATE SELECTION (the ratified methodology) ---------------------------
-  // Re-assert vLLM's own self-determinism from the committed K-run evidence.
-  // Zero multi-valued cells is what licenses the STRICT bar below; if this ever
-  // becomes non-zero the gate must be re-derived, not silently loosened.
-  int64_t multi_cells = -1;
-  if (fs::exists(gdir / "greedy_dist.npy")) {
-    const parity::NpyArray d = parity::LoadNpy((gdir / "greedy_dist.npy").string());
-    REQUIRE(d.shape.size() == 3);
-    const int64_t DN = d.shape[0], DT = d.shape[1], DK = d.shape[2];
-    const auto* dd = AsI32(d);
-    multi_cells = 0;
-    for (int64_t i = 0; i < DN; ++i)
-      for (int64_t j = 0; j < DT; ++j) {
-        std::set<int32_t> s;
-        for (int64_t k = 0; k < DK; ++k) s.insert(dd[(i * DT + j) * DK + k]);
-        if (s.size() > 1) ++multi_cells;
-      }
-    const std::string verdict =
-        multi_cells == 0
-            ? std::string(" (DETERMINISTIC -> STRICT token-exact gate)")
-            : std::string(" (NON-DET: the strict bar below is no longer the "
-                          "right gate — re-derive it)");
-    MESSAGE("opt-125m: vLLM self-determinism over K=" << DK
-            << " runs — multi-valued (prompt,pos) cells = " << multi_cells
-            << verdict);
-    CHECK(multi_cells == 0);
-  }
-
-  const parity::NpyArray g = parity::LoadNpy((gdir / "greedy_ids.npy").string());
-  REQUIRE(g.dtype == "<i4");
-  REQUIRE(g.shape.size() == 2);
-  const int64_t N = g.shape[0];
-  const int64_t T = g.shape[1];
-  REQUIRE(static_cast<size_t>(N) == Prompts().size());
-  const int32_t* gd = AsI32(g);
 
   MESSAGE("opt-125m: loading via FromModelDir(" << dir << ") — bf16 dense, "
           "LEARNED positions (offset 2), biased projections, LayerNorm, ReLU MLP...");

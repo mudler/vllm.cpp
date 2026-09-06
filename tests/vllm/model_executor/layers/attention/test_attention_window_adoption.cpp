@@ -60,8 +60,11 @@ TEST_CASE("attention window: a per-layer window overrides the model window") {
 }
 
 TEST_CASE("attention window: the model-level disable yields NO window") {
-  // `SlidingWindowEnabled()` in gemma2.cpp / gemma3.cpp is this parameter, under
-  // a different name and duplicated. #2388 claimed no such flag existed; it does.
+  // W3 retired the two duplicated local spellings this comment used to name.
+  // `SlidingWindowEnabled()` in gemma2.cpp / gemma3.cpp read `VT_GEMMA2_SLIDING`
+  // and `VT_GEMMA3_SLIDING`; all five call sites now pass
+  // `DisableSlidingWindowActive()`, the one switch mirroring
+  // `ModelConfig.disable_sliding_window`. See test_disable_sliding_window.cpp.
   CHECK_FALSE(vllm::ResolveAttentionWindow(std::nullopt, 4096,
                                            vllm::v1::AttentionType::kDecoder,
                                            /*disable=*/true)

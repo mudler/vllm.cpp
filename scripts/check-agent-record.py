@@ -479,7 +479,12 @@ MATRICES = {
     # architecture. The first measurement landed with nowhere to record
     # it. `INVENTORIED`, no owner, no spec of its own. Bumped for a real
     # new row, never to make a failing state transition pass.
-    "BACKEND": (AGENTS / "backend-matrix.md", 88),
+    # 89 since 2026-09-05: +`BACKEND-TENSTORRENT-GDN-DEVICE-PURE`, the
+    # device-resident GDN decode wave split out of the Qwen35 wiring row
+    # (#2907, owed from #2812); spec committed first on the row branch.
+    # 90 since 2026-09-05: +`BACKEND-TENSTORRENT-KEEPQUANT`, the dense
+    # keep-quant dot row (#2959); spec committed first on the row branch.
+    "BACKEND": (AGENTS / "backend-matrix.md", 90),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -1970,12 +1975,26 @@ def check_model_invariants(errors: list[str]) -> None:
         "targets": len({target for _, target in rows}),
         "modules": len({target.split("::", 1)[0] for _, target in rows}),
     }
+    # `targets` 310 -> 309 and `modules` 261 -> 245 on 2026-09-05 (#2819). NOT a
+    # change of inventory: `rows`, `memberships` and `architectures` are all
+    # unchanged, because no row was added, removed, merged or re-aliased. Twenty
+    # rows had their upstream anchor re-pointed because the module each one cited
+    # no longer exists at the `e126687a9a` pin. Eighteen of them now cite
+    # `vllm/model_executor/models/registry.py::<Arch>` -- the only place the
+    # architecture string survives upstream, in `_PREVIOUSLY_SUPPORTED_MODELS`
+    # for a retired arch or `_TRANSFORMERS_SUPPORTED_MODELS` for one migrated to
+    # the generic Transformers backend -- which is why 18 distinct modules
+    # collapse into 1. The remaining two are shipped models whose implementation
+    # merely moved: `KimiLinearForCausalLM` to
+    # `vllm/models/kimi_k3/nvidia/model.py` and the OLMo row to
+    # `vllm/model_executor/models/transformers/__init__.py`, a module the matrix
+    # already cited. Net: 19 targets out, 18 in; 18 modules out, 2 in.
     expected = {
         "rows": 324,
         "memberships": 373,
         "architectures": 356,
-        "targets": 310,
-        "modules": 261,
+        "targets": 309,
+        "modules": 245,
     }
     if actual != expected:
         errors.append(f"{path.relative_to(ROOT)}: model inventory {actual}, expected {expected}")

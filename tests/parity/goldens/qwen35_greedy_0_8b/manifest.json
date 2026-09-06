@@ -1,15 +1,37 @@
 {
  "op": "qwen35_0_8b_greedy",
  "oracle": {
-  "engine": "pinned vLLM-ROCm oracle built from source on the gate host (issue #41 M4)",
+  "engine": "pinned vLLM-ROCm oracle built from source on the gate host",
+  "image_id": "sha256:80aab4c182a1f3eeebe286173977e57fcaf10a049b41f475655b35d285de31dc",
+  "image_tag": "vllm-rocm-oracle:555967922-gfx1100-restored-20260903",
+  "network": "disabled by /home/vikash/oracle/vllm-rocm-oracle-python",
   "vllm_commit": "5559679229bc961848b121ccdeaa8fa5d79bec98",
   "vllm_runtime_version": "0.23.1rc1.dev1511+g555967922",
   "wheel": "vllm-0.23.1rc1.dev1511+g555967922.rocm723-cp312-cp312-linux_x86_64.whl",
-  "container_image": "vllm-rocm-oracle:555967922-gfx1100 (rocm/vllm-dev:base + the wheel)",
-  "hardware": "4x RX 7900 XTX (gfx1100), ROCm 7.14 host driver, HIP 7.2.5 userland",
-  "invocation": "scripts/qwen3-oracle-capture.py --model Qwen/Qwen3.5-0.8B --runs 10 --per-prompt --gpu-mem 0.8 (enforce_eager=True, batch=1); teacher-forced gaps via scripts/qwen3-neartie-gap.py",
-  "date": "2026-08-12",
-  "note": "There is no dgx/CUDA capture of this model: the 0.8B GDN checkpoint was only ever stood up on the gfx1100 box, which is also the only board hosting a vLLM-ROCm oracle. The base golden pair is ROCm-captured; K=10 per-prompt greedy is deterministic in every (prompt,pos) cell (greedy_dist.npy). GATE STATUS: GREEN -- 16/16 PASS (15/16 strict token-exact, 1/16 near-tie band, max gap 0.125 nats) with the AttnQkNormRopeGate output-dtype dispatch fix (row/ROCM-GDN-08B-FIX). The PRE-FIX capture showed 13/16 forward-divergent with first-token divergences on 6 prompts (first-divergence gaps 0.375-1.062 nats; 5 of 6 over the 0.5-nat band) -- recorded in the spec and parity ledger."
+  "wheel_sha256": "c4892c729daaff1ac3e8ad72d4e4753118b84e7d7c265634a1326b261a44ee43",
+  "base_image_digest": "sha256:ba82bf93fc2d3787550b77fb2a79fe230130f05bec737c671093251c55459309",
+  "hip_userland": "7.2.53211",
+  "hardware": "4x RX 7900 XTX (gfx1100)",
+  "gpu_lock": "/home/vikash/gpu.lock",
+  "execution": {
+   "mode": "production",
+   "enforce_eager": false,
+   "compilation_mode": "VLLM_COMPILE",
+   "graph_mode": "FULL_AND_PIECEWISE",
+   "VLLM_ROCM_USE_SKINNY_GEMM": "unset; resolved true",
+   "gpu_memory_utilization": 0.8
+  },
+  "capture_commands": [
+   "rm -rf -- /tmp/qwen35-skinny-sacred-2772-reproduction build-qwen35-skinny-sacred-2772-reproduction && mkdir -- /tmp/qwen35-skinny-sacred-2772-reproduction",
+   "cmake -S . -B build-qwen35-skinny-sacred-2772-reproduction -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ -DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1100 -DVLLM_CPP_BUILD_TESTS=ON",
+   "cmake --build build-qwen35-skinny-sacred-2772-reproduction --target test_qwen35_paged_engine -j 4",
+   "env -u VT_ROCM_SKINNY HIP_VISIBLE_DEVICES=0,1,2,3 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib CHECKPOINT_ROOT=/home/vikash/models VT_QWEN35_08B_SNAPSHOT=/home/vikash/models/Qwen3.5-0.8B VT_DUMP_IDS=1 flock /home/vikash/gpu.lock build-qwen35-skinny-sacred-2772-reproduction/tests/test_qwen35_paged_engine",
+   "mv tests/parity/goldens/qwen35_greedy_0_8b/our_ids.i32 /tmp/qwen35-skinny-sacred-2772-reproduction/our_ids.i32",
+   "env -u VLLM_ROCM_USE_SKINNY_GEMM HIP_VISIBLE_DEVICES=0 /home/vikash/oracle/vllm-rocm-oracle-python scripts/qwen3-oracle-capture.py --model /home/vikash/models/Qwen3.5-0.8B --runs 10 --max-tokens 16 --per-prompt --gpu-mem 0.80 --out-dir /tmp/qwen35-skinny-sacred-2772-reproduction",
+   "env -u VLLM_ROCM_USE_SKINNY_GEMM HIP_VISIBLE_DEVICES=0 /home/vikash/oracle/vllm-rocm-oracle-python scripts/qwen3-neartie-gap.py --model /home/vikash/models/Qwen3.5-0.8B --golden-dir /tmp/qwen35-skinny-sacred-2772-reproduction --max-tokens 16 --topk 20 --gpu-mem-util 0.80"
+  ],
+  "capture_date": "2026-09-03",
+  "diagnostic_history": "The historical eager capture selected a different branch of an exact tie. Eager mode is diagnostic only and is not the denominator."
  },
  "model": {
   "repo": "Qwen/Qwen3.5-0.8B",
@@ -17,7 +39,12 @@
   "architectures": [
    "Qwen3_5ForConditionalGeneration"
   ],
-  "note": "revision verified via the checkpoint's huggingface_hub download metadata (2026-08-12)"
+  "note": "The revision was verified through the checkpoint huggingface_hub download metadata."
  },
- "prompts": "the standard 16-prompt battery shared with scripts/qwen3-oracle-capture.py / test_qwen3_paged_engine.cpp"
+ "capture": {
+  "greedy": "K=10 per-prompt greedy generation",
+  "teacher_forcing": "exact-prefix teacher forcing against the local production sequence",
+  "result": "16/16 prompts accepted; 15/16 strict; 1/16 tied; maximum gap 0.0 nats; zero forward divergence"
+ },
+ "prompts": "the standard 16-prompt battery shared with scripts/qwen3-oracle-capture.py and test_qwen3_paged_engine.cpp"
 }

@@ -1,0 +1,56 @@
+CLASSIFIER PARITY, job.sh vs fold.py -- a defect found and fixed BEFORE the lease
+#2944, 2026-09-05, on synthetic legs; no GPU time was used to find this.
+
+THE DEFECT. job.sh classified a leg with a chain of independent assignments:
+
+    cls=OK
+    grep -qa 'no kernel for op'    ... && cls=OPREFUSED
+    grep -qa 'Memory access fault' ... && cls=MEMFAULT
+    grep -qa 'GPU Hang'            ... && cls=GPUHANG
+
+Each line overwrites the last, so the LAST match wins. Its own comment said the
+opposite -- "A refusal is not a board fault and must never be reported as one".
+fold.py returns on FIRST match, so the two instruments put different classes on
+identical bytes. This is not hypothetical: #2933's own logs carry BOTH
+`Memory access fault` AND `GPU Hang` on the same leg.
+
+RED-BEFORE, the old job.sh block against fold.py:
+
+  case                     old job.sh   fold.py      verdict
+  a  memfault + hang       GPUHANG      MEMFAULT     DISAGREE
+  b  refusal  + hang       GPUHANG      OPREFUSED    DISAGREE -- and a REFUSAL
+                                                     reported as a BOARD FAULT
+  c  refusal only          OPREFUSED    OPREFUSED    agree
+
+Case b is the damaging one. This run exists to answer "does the current head
+still fault on gfx1151?". An op refusal is NOT a board fault; it is the specific
+failure the narrowing in 6b97a6800 could introduce, because that commit withdrew
+the portable CPU reference tier on this board. Reporting one as the other would
+have answered the campaign's central question WRONG, in the direction that looks
+like #2933's finding reproducing.
+
+THE FIX. job.sh now uses first-match-wins with fold.py's priority:
+
+    if   grep -qa 'no kernel for op'    ...; then cls=OPREFUSED
+    elif grep -qa 'Memory access fault' ...; then cls=MEMFAULT
+    elif grep -qa 'GPU Hang'            ...; then cls=GPUHANG
+    elif [ "$rc" = 124 ];                    then cls=TIMEOUT
+    elif [ "$rc" != 0 ];                     then cls="OTHER_rc$rc"
+    else                                          cls=OK
+    fi
+
+GREEN-AFTER, both classifiers on identical bytes:
+
+  a  memfault + hang        job=MEMFAULT    fold=MEMFAULT    AGREE
+  b  refusal  + hang        job=OPREFUSED   fold=OPREFUSED   AGREE
+  c  refusal only           job=OPREFUSED   fold=OPREFUSED   AGREE
+  d  clean timing lines     job=OK          fold=OK          AGREE
+  e  rc=124, no signature   job=TIMEOUT     fold=TIMEOUT     AGREE
+
+The spec already said the classifier orders OPREFUSED before MEMFAULT before
+GPUHANG. Before this fix the SPEC was true and the CODE was false; the spec
+needs no change, the code did.
+
+The patch was applied while both rc jobs were still QUEUED and `out/` was empty,
+so the run reads the fixed script. Verified: job.sh mtime 02:52:10Z, both jobs
+`queued` in rc ps at 02:52, no output directory content.

@@ -334,7 +334,12 @@ whichever answer the board gives is measured rather than derived.
 
 ## Now
 
-W1 in flight. W2 and W3 unclaimed.
+W1 landed at `928d89a9b`. **W3 landed by [#2926](https://github.com/mudler/vllm.cpp/issues/2926)**
+together with `kMlaPrefillAttention`, which this spec placed under `## Owed`
+rather than in a wave -- see `.agents/specs/rocm-mla-attention-nonflash.md`
+for why the two ship together and why the decode arm is a single-pass
+kernel rather than the split this spec priced. W2 (the DSA indexer pair)
+is unclaimed, so a SPARSE step still has no native path.
 
 ## Owed
 

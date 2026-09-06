@@ -197,6 +197,7 @@ a stop token early.
 | `--max-num-seqs N` | `32` | Maximum concurrent sequences and HTTP workers. For GDN or Mamba speculative decoding, it also sizes recurrent state as `N x (k+1)`. The loader refuses an unsupported state budget. |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
+| `--disable-sliding-window` / `--enable-sliding-window` | enabled | Disable the model-level sliding window for every model that has one, mirroring vLLM's `ModelConfig.disable_sliding_window` (`vllm/config/model.py:248`). A model without a window ignores the flag, which is upstream's own stated behaviour. A per-layer window still wins, matching upstream precedence. Covers Gemma-2, Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer; it replaced `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING`, which reached only the first two. |
 | `--scheduling-policy fcfs\|priority\|lpm` | `fcfs` | Scheduler policy (`lpm` is the SGLang cache-aware policy, see [the SGLang compatibility guide](../SGLANG-COMPAT.md)) |
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` / `--disable-jump-forward` | off | **Accepted and validated, and nothing decodes with it yet.** See [What `--enable-jump-forward` does not do yet](#what---enable-jump-forward-does-not-do-yet) |

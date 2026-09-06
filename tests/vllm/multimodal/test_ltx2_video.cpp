@@ -1223,27 +1223,21 @@ TEST_CASE("ltx2 video: an unknown extra is refused, not ignored") {
 // extra", which is a DIFFERENT and wrong claim — the family defines the key and
 // understands what it means; what is missing is the head. Hence the assertion on
 // the missing piece and the alternative, not only on the key.
-TEST_CASE("ltx2 video: duration_head_path is REFUSED by name, not silently ignored") {
+// ROW LTX25-DURATION-HEAD-WIRE (#2900) TURNED THIS CASE OVER. It used to assert
+// that `duration_head_path` was REFUSED by name, which was the right behaviour
+// while nothing constructed a head: accepting the key would have pointed a
+// caller at a file nobody opened and rendered the recipe default instead. The
+// key now has a reader, so what has to be gated is the opposite -- that the file
+// is OPENED and that its head decides the frame count. That assertion lives in
+// the row's own cases at the end of this file; what remains here is the half
+// they cannot see, which is that the key is no longer refused at all.
+TEST_CASE("ltx2 video: duration_head_path is SERVED, not refused") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
-  // Any path at all: the point is that NOTHING opens it. Naming a file that does
-  // exist keeps a not-found error from standing in for the refusal.
-  mp.extras["duration_head_path"] = ws.paths.dit;
-  try {
-    (void)vllm::multimodal::LoadVideoEngine(mp);
-    FAIL("duration_head_path is served by no code; accepting it substitutes the recipe default");
-  } catch (const std::exception& e) {
-    const std::string msg = e.what();
-    INFO(msg);
-    CHECK(msg.find("duration_head_path") != std::string::npos);
-    // The MISSING PIECE, which is what separates this from "unknown key".
-    CHECK(msg.find("duration head") != std::string::npos);
-    // And what to use instead, so the refusal is actionable.
-    CHECK(msg.find("num_frames") != std::string::npos);
-    // Not the unknown-key message: that one would say the family does not define
-    // it, and this family does.
-    CHECK(msg.find("unknown load extra") == std::string::npos);
-  }
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
+  REQUIRE(engine != nullptr);
 }
 
 // The INVENTORY, so the defect above cannot come back as a different key. Every
@@ -1285,6 +1279,11 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // arm by name, the request surface refuses positive rounds without it, and
       // the rounds loop calls it once per round.
       vllm::multimodal::kLtx2TemporalUpsamplerPathExtra,
+      // Row LTX25-DURATION-HEAD-WIRE (#2900): the head itself. Three readers --
+      // the load opens the file and builds the predictor, the top-of-call guard
+      // asks whether one exists, and `resolve_num_frames` runs it -- so it is
+      // SERVED, and `refused` below is empty for the first time.
+      "duration_head_path",
       // Row LTX25-LORA-FUSION (#932): the INDEXED IC-LoRA family, upstream's
       // repeatable `--lora` (utils/args.py:600-611). A pattern rather than a
       // key, which is why it is spelled here exactly as the listing prints it —
@@ -1295,8 +1294,15 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       "lora_strength_<n> (n >= 2)",
   };
   // The keys the family defines and does NOT serve. Growing this list is a
-  // deliberate act; growing it silently is the defect #611 records.
-  const std::vector<std::string> refused = {"duration_head_path"};
+  // deliberate act; growing it silently is the defect this case exists to catch.
+  //
+  // IT IS NOW EMPTY, and that is the row LTX25-DURATION-HEAD-WIRE (#2900)
+  // result: `duration_head_path` was the last decorative key, and it has a
+  // reader. An empty vector is deliberately kept rather than deleted along with
+  // the machinery around it -- the next key that arrives without a reader has
+  // somewhere to be recorded, and the sweep below still runs over the real
+  // `kKnownLoadExtras` either way.
+  const std::vector<std::string> refused = {};
 
   // THE HANDLE ON THE REAL ARRAY. The unknown-extra refusal builds its listing
   // from `kKnownLoadExtras` itself, so parsing that listing gates the ACTUAL
@@ -1434,6 +1440,10 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
       "kLtx2LoraPathExtra",          "kLtx2LoraStrengthExtra",
       "kLtx2NegativePromptEmbedsExtra", "kLtx2NegativeAudioPromptEmbedsExtra",
       "kLtx2CheckpointClassExtra",
+      // Row LTX25-DURATION-HEAD-WIRE (#2900). The FIFTEENTH, and the one this
+      // list was written to exclude: it moved here the moment `Ltx2VideoEngine::
+      // Load` started opening the file it names.
+      "kLtx2DurationHeadPathExtra",
   };
   std::vector<size_t> derived;
   for (const std::string& token : served_tokens) {
@@ -1477,31 +1487,15 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
                                          << "]. Paste the actual list into the READER ANCHORS "
                                             "comment; the spec's §2.1 table is dated and stays.");
 
-  // And the UNSERVED key is touched only by the refusal, never by a reader. This
-  // is the half a "has a reader" sweep cannot express.
-  const size_t refuse_line = UniqueLineWith(lines, "void CheckUnservedExtras(");
-  REQUIRE(refuse_line != 0);
-  size_t refuse_end = 0;
-  for (size_t i = refuse_line; i < lines.size(); ++i) {
-    if (lines[i] == "}") {
-      refuse_end = i + 1;
-      break;
-    }
-  }
-  REQUIRE(refuse_end > refuse_line);
-  size_t duration_hits = 0;
-  for (size_t i = array_end; i < lines.size(); ++i) {
-    if (lines[i].find("kLtx2DurationHeadPathExtra") == std::string::npos) continue;
-    ++duration_hits;
-    const size_t at = i + 1;
-    const bool inside_refusal = (at >= refuse_line) && (at <= refuse_end);
-    CHECK_MESSAGE(inside_refusal,
-                  "ltx2_video.cpp:" << at
-                                    << " touches the duration-head extra OUTSIDE "
-                                       "CheckUnservedExtras; if it now has a real reader, move "
-                                       "it to the served list and drop the refusal (#611)");
-  }
-  CHECK(duration_hits > 0);
+  // THE UNSERVED HALF OF THIS CASE IS GONE, AND SO IS WHAT IT GATED. It used to
+  // assert that `kLtx2DurationHeadPathExtra` was touched ONLY inside
+  // `CheckUnservedExtras` -- the half a "has a reader" sweep cannot express --
+  // and it named the exit condition itself: "if it now has a real reader, move
+  // it to the served list and drop the refusal". Row LTX25-DURATION-HEAD-WIRE
+  // (#2900) did exactly that, `CheckUnservedExtras` no longer exists because the
+  // one key it refused was the only one it ever held, and the token is now in
+  // `served_tokens` above where the derived-anchor check covers it like any
+  // other. Re-adding an unserved key means re-adding this half beside it.
 }
 
 // ─── the config the SHAPES cannot see ───────────────────────────────────────
@@ -13388,4 +13382,352 @@ TEST_CASE("ltx2 checkpoint class: the declaration is a CLAIM, and the engine say
   // The SAME file, two contradictory declarations, both accepted. The pair is
   // the assertion: it is one file and the two loads disagree about what it is.
   CHECK(as_full.dit_path == as_distilled.dit_path);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROW LTX25-DURATION-HEAD-WIRE (#2900) — the head gets a driver.
+//
+// `Ltx2DurationPredict` has been a gated brick since phase L5 and no production
+// path constructed one, so `duration_head_path` was refused by name and an auto
+// duration silently became the recipe default. These cases reach the head the
+// only way that proves anything: through `LoadVideoEngine` and `Generate`, the
+// two entry points a caller arrives at. A case that built an
+// `Ltx2DurationHeadConfig` by hand would prove the class works, which was never
+// in doubt and was never the defect.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// UPSTREAM'S `None`, WHICH IS NOT AN ERROR. `DurationPredictor.from_checkpoint`
+// (blocks.py:816-848) returns `None` when the file carries no head, because
+// every checkpoint predating LTX-2.5 / gemma4 is that file. Refusing the load
+// would make this port reject checkpoints upstream runs happily.
+//
+// `paths.dit` is a real, openable safetensors file with no `duration_head.*`
+// tensors in it, so this separates "no head in the file" from "no file".
+TEST_CASE("ltx2 video: a duration_head_path with no head weights LOADS, as upstream's None") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.dit;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
+  REQUIRE(engine != nullptr);
+}
+
+// AND `None` IS OBSERVED HERE, not above. A load that succeeds is what BOTH
+// polarities look like: whether the file yielded a predictor or yielded none,
+// `LoadVideoEngine` returns an engine either way, so `REQUIRE_NOTHROW` plus a
+// non-null pointer cannot tell the two apart. Mutation M5 proved that — making
+// the bare-prefix fallback report a predictor for a headless file left the whole
+// suite green, and the caller then paid for the entire prompt encode before
+// dying in the VAE on a parameter the file never had, which is precisely what
+// upstream's `any(param.is_meta)` check exists to prevent (blocks.py:838-846).
+//
+// The observable difference is the CONSEQUENCE: with no predictor, an auto
+// duration is unsatisfiable and `require_num_frames_source` says so by name. The
+// positive arm of this pair is "a loaded duration head DECIDES the frame count"
+// below, where the same request against the WHOLE head renders instead.
+TEST_CASE("ltx2 video: a headless duration_head_path yields NO predictor, and the auto request says so") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.dit;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  try {
+    (void)engine->Generate(gen);
+    FAIL("a headless duration_head_path must leave the auto duration unsatisfiable");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("no DurationHead weights") != std::string::npos);
+  }
+}
+
+// THE PARTIAL HEAD IS `None` TOO, and that is the half a complete-or-absent
+// fixture cannot see. Upstream builds with `strict=False` and then asks whether
+// ANY parameter is still on the meta device (blocks.py:838-844), so a file
+// holding fourteen of fifteen tensors yields no predictor rather than a
+// predictor that would fault in the forward.
+TEST_CASE("ltx2 video: a PARTIAL duration head is upstream's None, not a refusal") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_partial;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
+  REQUIRE(engine != nullptr);
+}
+
+// THE PARTIAL FILE'S `None`, OBSERVED. Same argument as the headless pair above,
+// and this is the half that matters most: a partial head is the file that WOULD
+// bind fourteen of fifteen tensors, so a loader that reported a predictor here
+// would run a module with a hole in it. The refusal is what says it reported
+// none.
+TEST_CASE("ltx2 video: a PARTIAL duration head yields NO predictor, and the auto request says so") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_partial;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  try {
+    (void)engine->Generate(gen);
+    FAIL("a partial duration head must leave the auto duration unsatisfiable");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("no DurationHead weights") != std::string::npos);
+  }
+}
+
+// A PRESENT TENSOR AT THE WRONG SHAPE IS THE ONE CASE THAT REFUSES. It is not
+// the `None` path: nothing is missing, so `any(param.is_meta)` is False upstream
+// and the Builder would have had to bind it. Binding a differently-shaped tensor
+// runs the head as a silently different module, which is the failure this
+// distinction exists to prevent.
+TEST_CASE("ltx2 video: a duration head tensor at the WRONG SHAPE refuses by name") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_wrong_shape;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("a wrong-shaped head tensor must refuse, not bind a different module");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("mlp_out.weight") != std::string::npos);
+    // NOT the None path's silence, and not the unknown-key message.
+    CHECK(msg.find("unknown load extra") == std::string::npos);
+  }
+}
+
+// THE POSITION IS THE BEHAVIOUR, and this case gates the position rather than
+// the message. `require_num_frames_source` runs at the very top of upstream's
+// `__call__`, before prompt encoding or any other work (blocks.py:896-899), so a
+// checkpoint with no head fails fast instead of paying for work whose result is
+// discarded.
+//
+// HOW THE ORDER IS OBSERVED. Two legs, because the first one alone measures
+// less than it appears to and a mutation proved it.
+//
+// LEG 1 -- THE PHASE TABLE, which is the leg that actually says "before any
+// work". The engine names every stage it enters, so after the refusal the render
+// must have opened `generate.setup` and NOTHING downstream of it: no
+// `conditioning.*`, no `denoise*`, no `decode*`. This is a statement about work
+// PERFORMED rather than about which of two refusals won a race, and it is what
+// upstream's "before prompt encoding or any other work" means.
+//
+// LEG 2 -- A SECOND REFUSAL THAT WOULD FIRE LATER. The width is 33, which
+// `Ltx2AssertResolution` refuses further down. Both refusals are correct in
+// isolation, so hearing about the DURATION rather than the WIDTH pins their
+// order.
+//
+// WHY BOTH. Leg 2 was the whole case at first, and moving the guard down to just
+// above the frame resolution -- below prompt encoding and below the connector,
+// which is the defect this case exists to catch -- left it GREEN, because
+// `Ltx2AssertResolution` is further down still. Leg 2 gates "the guard precedes
+// the resolution check" and reads like it gates "the guard precedes everything".
+// Leg 1 is the one that does.
+TEST_CASE("ltx2 video: an auto duration with no head refuses at the TOP before any work") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;  // no explicit count
+  gen.width = 33;      // and a width that refuses LATER
+  gen.extras["auto_duration"] = "1,20";
+
+  const size_t before = vllm::multimodal::phase::PhaseLog::Instance().Records().size();
+  try {
+    (void)engine->Generate(gen);
+    FAIL("an auto duration with no duration head must refuse");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("DurationHead") != std::string::npos);
+    // LEG 2: the later refusal must NOT be the one that fired.
+    CHECK(msg.find("not divisible") == std::string::npos);
+  }
+
+  // LEG 1: nothing downstream of the setup phase was ever entered.
+  const std::vector<vllm::multimodal::phase::Record> records =
+      vllm::multimodal::phase::PhaseLog::Instance().Records();
+  REQUIRE(records.size() >= before);
+  std::vector<std::string> after_refusal;
+  for (size_t i = before; i < records.size(); ++i) after_refusal.push_back(records[i].name);
+  // `generate` and `generate.setup` are expected -- the guard runs INSIDE the
+  // setup phase, which is what "the top of __call__" means here. Everything the
+  // engine names after those is work this request must not have paid for.
+  for (const std::string& name : after_refusal) {
+    INFO("phase entered after the auto-duration request: " << name);
+    CHECK(name != "generate.conditioning");
+    CHECK(name != "generate.geometry");
+    CHECK(name != "generate.guiders");
+    CHECK(name.rfind("conditioning.", 0) != 0);
+    CHECK(name.rfind("denoise", 0) != 0);
+    CHECK(name.rfind("decode", 0) != 0);
+    CHECK(name.rfind("artifacts", 0) != 0);
+  }
+  // THE CONTROL, so the check above is not vacuous through an empty table. The
+  // same request WITHOUT the auto duration runs, and the phases this asserts the
+  // absence of are the ones it produces -- if the engine stopped naming them,
+  // this case would go quiet rather than red.
+  vllm::multimodal::VideoModelParams ok_mp = FixtureParams(ws.paths);
+  ok_mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> ok = vllm::multimodal::LoadVideoEngine(ok_mp);
+  const size_t control_before =
+      vllm::multimodal::phase::PhaseLog::Instance().Records().size();
+  (void)ok->Generate(FixtureGen(ws.root + "/out_control"));
+  const std::vector<vllm::multimodal::phase::Record> control =
+      vllm::multimodal::phase::PhaseLog::Instance().Records();
+  bool saw_geometry = false, saw_denoise = false;
+  for (size_t i = control_before; i < control.size(); ++i) {
+    if (control[i].name == "generate.geometry") saw_geometry = true;
+    if (control[i].name.rfind("denoise", 0) == 0) saw_denoise = true;
+  }
+  // `generate.geometry` is the FIRST phase after setup, and it is where a guard
+  // that slid down would most plausibly land -- which is exactly the mutation
+  // that left the width leg green. Asserting the control produces it is what
+  // makes its absence above mean something.
+  CHECK(saw_geometry);
+  CHECK(saw_denoise);
+}
+
+// THE CAPABILITY, REACHED. A head named at load is opened, and the frame count
+// the render uses comes from it rather than from the recipe. The assertion is
+// that the count is the head's and NOT the recipe's, because a wiring that
+// loaded the head and then ignored it passes any check that only asks whether
+// the render succeeded.
+TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  // Phase 0 only, for the reason the first e2e case above gives: the recipe's
+  // second phase needs the latent spatial upsampler and running without one is a
+  // refusal. Nothing about the duration head changes with the phase count.
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  // THE TRACE IS WHAT MAKES THIS NON-VACUOUS. A frame count alone cannot say
+  // where it came from -- a recipe could have produced the same integer -- so
+  // the assertion is that the HEAD ran and that the render used what it said.
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  INFO("predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                    << " frames, rendered " << res.frame_count);
+  CHECK(trace.duration_frames > 0);
+  CHECK(trace.duration_seconds > 0.0);
+  CHECK(res.frame_count == trace.duration_frames);
+  // Every count this path emits sits on the causal temporal grid.
+  CHECK((trace.duration_frames - 1) % 8 == 0);
+
+  // AND IT IS NOT THE RECIPE'S. The same request against an engine with no head
+  // renders the recipe default; a predicted count that happened to equal it would
+  // make everything above pass for the wrong reason.
+  vllm::multimodal::VideoModelParams plain_mp = FixtureParams(ws.paths);
+  plain_mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> plain =
+      vllm::multimodal::LoadVideoEngine(plain_mp);
+  vllm::multimodal::VideoGenParams recipe_gen = FixtureGen(ws.root + "/out_recipe");
+  recipe_gen.num_frames = 0;
+  const vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
+  CHECK(res.frame_count != recipe_res.frame_count);
+}
+
+// A RETAKE HAS NO PREDICTOR, AND THIS ROW REFUSED TO LET ONE SILENTLY WIN
+// TWO STATEMENTS EARLIER. `retake.py` reads its frame count off the source
+// clip's metadata (`:220`) and constructs no `DurationPredictor`, so an
+// `auto_duration` on a retake would be dropped -- exactly the shape the
+// explicit-count refusal above exists to prevent. Refusing an explicit
+// combination and then quietly ignoring this one is the inconsistency this case
+// closes.
+//
+// THE CONTROL IS THE SECOND SUBCASE, and without it the first proves nothing:
+// the retake path refuses several OTHER things, so "it threw" is not the same as
+// "it threw for this reason". The second leg drops `auto_duration` and keeps the
+// same retake request, and asserts the refusal that arrives is a DIFFERENT one.
+TEST_CASE("ltx2 video: auto_duration on a retake refuses by name rather than being dropped") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  SUBCASE("auto_duration plus a retake window") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_retake_auto");
+    gen.num_frames = 0;
+    gen.extras["auto_duration"] = "1,20";
+    gen.extras[vllm::multimodal::kLtx2RetakeStartTimeExtra] = "0.0";
+    gen.extras[vllm::multimodal::kLtx2RetakeEndTimeExtra] = "1.0";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("auto_duration on a retake must refuse, not be silently dropped");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") != std::string::npos);
+      CHECK(msg.find("retake") != std::string::npos);
+    }
+  }
+  SUBCASE("the same retake WITHOUT auto_duration refuses something else") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_retake_plain");
+    gen.num_frames = 0;
+    gen.extras[vllm::multimodal::kLtx2RetakeStartTimeExtra] = "0.0";
+    gen.extras[vllm::multimodal::kLtx2RetakeEndTimeExtra] = "1.0";
+    try {
+      (void)engine->Generate(gen);
+      // A clean run is also a pass for this leg: it says the retake request is
+      // not what the first leg refused.
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") == std::string::npos);
+    }
+  }
+}
+
+// The request surface, mirrored from `--auto-duration MIN_SECONDS MAX_SECONDS`
+// (utils/args.py:108-122) including its own MIN > MAX refusal.
+TEST_CASE("ltx2 video: auto_duration refuses MIN > MAX and refuses doubling an explicit count") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  SUBCASE("MIN > MAX") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_a");
+    gen.num_frames = 0;
+    gen.extras["auto_duration"] = "9,2";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("auto_duration with MIN > MAX must refuse");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") != std::string::npos);
+    }
+  }
+  SUBCASE("two frame sources") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_b");
+    gen.num_frames = 9;  // explicit AND auto
+    gen.extras["auto_duration"] = "1,20";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("an explicit count and auto_duration together must refuse, not pick one");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") != std::string::npos);
+    }
+  }
 }

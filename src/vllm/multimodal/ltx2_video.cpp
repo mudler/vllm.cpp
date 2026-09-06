@@ -42,6 +42,7 @@
 #include "vllm/model_executor/models/ltx2_device.h"
 #include "vllm/model_executor/models/ltx2_dfr.h"
 #include "vllm/model_executor/models/ltx2_image_preprocess.h"
+#include "vllm/model_executor/models/ltx2_duration_head.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_samplers.h"
@@ -451,31 +452,37 @@ std::string LoraIndexedListing() {
          "_<n> (n >= 2)";
 }
 
-// The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
-// ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
-// constructs one, so a supplied path names a file the engine never opens.
+// The head's checkpoint. SERVED since row LTX25-DURATION-HEAD-WIRE (#2900):
+// the load opens the file, builds a predictor when it carries a whole head, and
+// the frame count a render uses comes from that predictor. It was the one key
+// this family defined and did not serve, which is why the paragraph below still
+// explains the distinction the list exists to keep.
 constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
+// Row LTX25-DURATION-HEAD-WIRE (#2900): upstream's `--auto-duration MIN MAX`
+// (utils/args.py:108), as a per-generation extra so no ABI change is needed.
+constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 
 // Every extra key this family DEFINES. An extra outside this set is refused
 // rather than ignored, for the same reason H3 refuses one
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
 //
-// DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
-// these ten reach a reader, and `duration_head_path` reached none, so supplying a
-// duration head substituted the recipe default in silence — the failure mode this
-// very list exists to prevent, one level in. It stays in the list because the
-// family DOES define the key and DOES know what it means; `CheckUnservedExtras`
-// refuses it by name instead, which is a different and truer message than
-// "unknown load extra". The full audit is in
-// .agents/specs/ltx25-retire-dead-arms.md §2.1.
+// DEFINED IS NOT THE SAME AS SERVED, and conflating the two is the failure this
+// list exists to prevent one level in: a key the family accepts, and no code
+// reads, substitutes a default in silence. `duration_head_path` was the tree's
+// own example of it and is no longer — row LTX25-DURATION-HEAD-WIRE (#2900)
+// gave it a reader, and `CheckUnservedExtras` no longer names it. Every key in
+// the array below now reaches one. The audit that found the class is in
+// .agents/specs/ltx25-retire-dead-arms.md §2.1; the issue it was filed under is
+// one of the three numbers that 404, tracked by
+// https://github.com/mudler/vllm.cpp/issues/2899.
 //
 // The first hand-written set of these anchors named nine lines that were readers
 // of NOTHING, in this very file, and a later merge moved the real ones again. So
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 647 649 1281 1377 1473 1489 1624 1628 1786 1869 1987 2029 2071 2073
+// 680 682 1324 1420 1516 1532 1667 1671 1829 1865 2015 2133 2175 2217 2219
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -604,26 +611,52 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
   }
 }
 
-// A key this family DEFINES but does not SERVE, refused BY NAME when supplied
-// (#611). The alternative — accepting it — is the worst of the three options:
-// worse than refusing, and worse than not defining the key, because the caller
-// pointed at a specific file and got the recipe default with no diagnostic.
-//
-// Deliberately NOT the "unknown load extra" path above. That message says the
-// family does not define the key, which is false here and would send the reader
-// looking for a typo instead of for the unported head.
-void CheckUnservedExtras(const std::map<std::string, std::string>& extras) {
-  const std::string duration_head = VideoExtra(extras, kLtx2DurationHeadPathExtra);
-  if (!duration_head.empty()) {
-    Fail("the '" + std::string(kLtx2DurationHeadPathExtra) + "' extra names '" + duration_head +
-         "', but the duration head is NOT WIRED into this engine: `Ltx2DurationPredict` is ported "
-         "and gated as a brick (ltx2_duration_head.h, upstream duration_head.py:89-118) and "
-         "nothing here constructs one, so that file would never be opened and an AUTO duration "
-         "would fall back to the recipe default. Give 'num_frames', or 'duration' (exact "
-         "arithmetic against the recipe frame rate), instead. Refused rather than ignored; "
-         "recorded as owed in .agents/specs/ltx25-retire-dead-arms.md (#611).");
+// `auto_duration`'s two bounds, parsed from the "MIN,MAX" spelling that mirrors
+// upstream's `--auto-duration MIN_SECONDS MAX_SECONDS` (utils/args.py:108-122).
+// The MIN > MAX refusal is upstream's own (`:121-123`), kept here rather than
+// left to the clamp, because a reversed window is a typo and clamping it
+// silently would render something the caller did not ask for.
+struct Ltx2AutoDuration {
+  bool requested = false;
+  double min_seconds = 1.0;  // AutoDuration's defaults (utils/types.py:122-123)
+  double max_seconds = 20.0;
+};
+
+Ltx2AutoDuration ParseAutoDuration(const std::map<std::string, std::string>& extras,
+                                   const char* key) {
+  Ltx2AutoDuration out;
+  const auto it = extras.find(key);
+  if (it == extras.end() || it->second.empty()) return out;
+  const std::string& text = it->second;
+  const size_t comma = text.find(',');
+  if (comma == std::string::npos) {
+    Fail("the '" + std::string(key) + "' extra is '" + text +
+         "', and it takes TWO bounds in seconds spelled 'MIN,MAX' -- upstream's "
+         "`--auto-duration MIN_SECONDS MAX_SECONDS` (utils/args.py:108-122)");
   }
+  try {
+    out.min_seconds = std::stod(text.substr(0, comma));
+    out.max_seconds = std::stod(text.substr(comma + 1));
+  } catch (const std::exception&) {
+    Fail("the '" + std::string(key) + "' extra is '" + text +
+         "', whose two halves must each parse as a number of seconds");
+  }
+  // UPSTREAM REFUSES EXACTLY ONE THING HERE, and a `MIN <= 0` refusal was not
+  // it. `AutoDurationAction` (utils/args.py:117-122) checks `min_seconds >
+  // max_seconds` and nothing else, and `AutoDuration(min_seconds=0.0,
+  // max_seconds=20.0)` constructs at the pin, after which
+  // `seconds_to_clamped_num_frames(3.0, frame_rate=25.0, min_frames=0,
+  // max_frames=500)` returns 73. So `--auto-duration 0 20` is a request upstream
+  // serves, and refusing it by name made this port reject a working one.
+  if (out.min_seconds > out.max_seconds) {
+    Fail("the '" + std::string(key) + "' extra names MIN " + std::to_string(out.min_seconds) +
+         " > MAX " + std::to_string(out.max_seconds) +
+         ", which upstream's own parser refuses (utils/args.py:121-123)");
+  }
+  out.requested = true;
+  return out;
 }
+
 
 // Every IC-LoRA adapter the load names, in `--lora` order (row
 // LTX25-LORA-FUSION, #932).
@@ -1052,6 +1085,17 @@ struct Ltx2VideoEngine::Impl {
   // of f32 at the shipped widths (ltx2_loader.h), the conditioning they process
   // is resolved once at load, and this box reboots rather than OOM-killing — so
   // they are loaded, used and dropped inside one scope below.
+  // ── THE DURATION HEAD (row LTX25-DURATION-HEAD-WIRE, #2900) ─────────────
+  //
+  // `has_duration_head` false IS upstream's `None` (blocks.py:838-844), and it
+  // is the state every checkpoint predating LTX-2.5 / gemma4 loads into. Unlike
+  // the connector's ~8 GB, the head is under 2 M parameters, so it is HELD
+  // rather than rebuilt per call -- which is upstream's own reasoning for this
+  // one block (blocks.py:805-808).
+  bool has_duration_head = false;
+  Ltx2VaeWeights duration_head_weights;
+  Ltx2DurationHeadConfig duration_head_cfg;
+
   bool has_connector = false;
   Ltx2ConnectorConfig video_connector_cfg, audio_connector_cfg;
   int64_t prompt_valid_rows = 0;
@@ -1099,7 +1143,6 @@ Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
   CheckKnownExtras(params.extras);
-  CheckUnservedExtras(params.extras);
 
   auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
@@ -1798,6 +1841,109 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.has_upsampler = true;
   }
 
+  // ── the optional DURATION HEAD (row LTX25-DURATION-HEAD-WIRE, #2900) ──────
+  //
+  // `DurationPredictor.from_checkpoint` (blocks.py:816-848), at upstream's own
+  // position: the pipeline CONSTRUCTOR (t2a_one_stage.py:103,
+  // ti2vid_one_stage.py:126, distilled.py:163, dfr_pipeline.py:262), not the
+  // first request. The head is under 2 M parameters, so it is held for the
+  // engine's life rather than rebuilt per call -- upstream's own reasoning for
+  // this one block (blocks.py:805-808), and the opposite of what the connector
+  // does two hundred lines up for a module three orders of magnitude larger.
+  //
+  // A FILE WITH NO HEAD IN IT LOADS AND LEAVES NO PREDICTOR. That is upstream's
+  // `None` and not an error: every checkpoint predating LTX-2.5 / gemma4 is such
+  // a file, and refusing would reject checkpoints upstream runs happily. A
+  // PARTIAL head is `None` too (`:838` asks `any(param.is_meta)`), so this
+  // cannot hand `Generate` a predictor that faults in the forward.
+  //
+  // THE CONFIG'S TWO CROSS-ATTENTION DIMS MIRROR THE DiT'S, exactly as
+  // `DurationHeadConfigurator.from_metadata` reads them off the transformer
+  // config (model_configurator.py:28-29). Everything else takes upstream's
+  // placeholder defaults, which is what that configurator does too.
+  const std::string duration_head_path =
+      VideoExtra(params.extras, kLtx2DurationHeadPathExtra);
+  if (!duration_head_path.empty()) {
+    const phase::Scope duration_phase("load.duration_head");
+    const SafetensorsFile f = SafetensorsFile::Open(duration_head_path);
+    im.duration_head_cfg = Ltx2DurationHeadConfig{};
+    // The two cross-attention dims default to the DiT's own, which is what
+    // `from_metadata` reads out of the transformer config
+    // (model_configurator.py:28-29) and what a head shipped beside this DiT was
+    // trained against.
+    im.duration_head_cfg.video_cross_attention_dim = im.dit.params.cross_attention_dim;
+    im.duration_head_cfg.audio_cross_attention_dim = im.dit.params.audio_cross_attention_dim;
+    im.duration_head_cfg.prefix = "duration_head.";
+    // THE HEAD'S FOUR HYPERPARAMETERS COME FROM THE CHECKPOINT, NOT FROM HERE.
+    // `DurationHeadConfigurator.from_metadata` reads them out of a `duration_head`
+    // sub-dict with `.get(name, default)` (model_configurator.py:24-35), and
+    // upstream's own docstring says why the indirection exists: the head "has no
+    // finalized config schema yet", so the sub-dict is a PLACEHOLDER whose
+    // defaults match JAX. Taking the defaults unconditionally would load every
+    // head at 256 pooler channels and refuse any checkpoint trained at another
+    // width -- a refusal that would read as a corrupt file rather than as this
+    // port ignoring the config.
+    //
+    // AN ABSENT CONFIG IS NOT AN ERROR, because `.get` has a default and a head
+    // stored inside a DiT monolith carries no config of its own. That is why
+    // this reads `__metadata__` directly instead of through
+    // `Ltx2ReadCheckpointConfig`, which refuses a checkpoint with no config and
+    // is right to for a VAE, whose geometry cannot be guessed.
+    {
+      const auto meta = f.Metadata().find("config");
+      if (meta != f.Metadata().end()) {
+        nlohmann::json parsed;
+        try {
+          parsed = nlohmann::json::parse(meta->second);
+        } catch (const std::exception& e) {
+          Fail(std::string("the duration head's __metadata__[\"config\"] is not readable JSON: ") +
+               e.what());
+        }
+        if (parsed.is_object()) {
+          const auto read_int = [](const nlohmann::json& obj, const char* key, int64_t fallback) {
+            if (!obj.is_object()) return fallback;
+            const auto at = obj.find(key);
+            if (at == obj.end() || !at->is_number_integer()) return fallback;
+            return at->get<int64_t>();
+          };
+          const nlohmann::json transformer =
+              parsed.contains("transformer") ? parsed["transformer"] : nlohmann::json::object();
+          const nlohmann::json head =
+              parsed.contains("duration_head") ? parsed["duration_head"] : nlohmann::json::object();
+          Ltx2DurationHeadConfig& cfg = im.duration_head_cfg;
+          cfg.video_cross_attention_dim =
+              read_int(transformer, "cross_attention_dim", cfg.video_cross_attention_dim);
+          cfg.audio_cross_attention_dim =
+              read_int(transformer, "audio_cross_attention_dim", cfg.audio_cross_attention_dim);
+          cfg.pooler_hidden_dim = read_int(head, "pooler_hidden_dim", 256);
+          cfg.num_queries = read_int(head, "num_queries", 1);
+          cfg.num_pooler_heads = read_int(head, "num_pooler_heads", 4);
+          cfg.mlp_hidden = read_int(head, "mlp_hidden", 256);
+        }
+      }
+    }
+    // f32 IS THE PARITY ARM AND IT IS OWED A NARROWING. Upstream builds the head
+    // at the pipeline dtype, `torch.bfloat16` (distilled.py:109,163-167), so this
+    // is WIDER than the reference -- the polarity AGENTS.md names, recorded here
+    // beside the call rather than left for a reader to derive. The bf16 arm is
+    // gap A24's eighth component and is owed by
+    // .agents/specs/ltx25-duration-head-wire.md `## Owed`; the `compute_dtype`
+    // parameter exists so landing it is this one argument.
+    im.has_duration_head = Ltx2LoadDurationHeadWeights(f, im.duration_head_cfg,
+                                                       vt::DType::kF32,
+                                                       &im.duration_head_weights);
+    if (!im.has_duration_head) {
+      // The BARE spelling, for a head stored without upstream's key prefix.
+      // `DURATION_HEAD_KEY_OPS` strips `duration_head.` on the way in
+      // (model_configurator.py:9-11), so a file written from an already-stripped
+      // state dict carries bare names and is the same head.
+      im.duration_head_cfg.prefix = "";
+      im.has_duration_head = Ltx2LoadDurationHeadWeights(f, im.duration_head_cfg,
+                                                         vt::DType::kF32,
+                                                         &im.duration_head_weights);
+    }
+  }
+
   // ── the optional latent TEMPORAL upsampler (DFR's rounds loop, #986) ───────
   //
   // Refused at LOAD rather than at the first round, because the round is paid
@@ -2478,6 +2624,55 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
   if (gen.output_dir.empty()) Fail("output_dir is required");
   phase::Scope setup_phase("generate.setup");
+
+  // ── `require_num_frames_source` (blocks.py:894-905), AT THE TOP ────────────
+  //
+  // THE POSITION IS THE BEHAVIOUR. Upstream is explicit that this belongs at the
+  // very top of `__call__`, before prompt encoding or any other work, so a
+  // checkpoint with no head fails fast instead of paying for work whose result
+  // is discarded (`:896-899`). A guard that refused the same requests from
+  // further down would be a different pipeline from the reference, which is why
+  // `test_ltx2_video` gates the ORDER -- with a request that is ALSO invalid
+  // later -- and not only the message.
+  //
+  // AUTO IS REQUESTED TWO WAYS, and the second is upstream's DEFAULT rather than
+  // a convenience. `num_frames` defaults to `DEFAULT_AUTO_DURATION` upstream
+  // (distilled.py:195, dfr_pipeline.py:276), so omitting every frame source
+  // means auto-predict. This port has a RECIPE where upstream has a required
+  // argument, so omission auto-predicts exactly when a head is loaded and keeps
+  // the recipe default otherwise: an engine given no `duration_head_path`
+  // behaves as it did before this row, and nothing changes for a caller who did
+  // not opt in.
+  const Ltx2AutoDuration auto_duration =
+      ParseAutoDuration(gen.extras, kLtx2AutoDurationExtra);
+  const bool has_explicit_frames = gen.num_frames > 1 || gen.duration_seconds > 0.0;
+  if (auto_duration.requested && has_explicit_frames) {
+    Fail("this request carries both '" + std::string(kLtx2AutoDurationExtra) +
+         "' and an explicit frame count or duration. Upstream's `num_frames` is ONE "
+         "argument that is either a count or an `AutoDuration` (utils/types.py:116), so "
+         "there is no request that is both; refusing rather than letting one silently win");
+  }
+  // A RETAKE HAS NO PREDICTOR TO ASK, and this refuses rather than ignoring the
+  // request. `retake.py` takes its frame count from the SOURCE clip's metadata
+  // (`get_videostream_metadata`, :220) and never constructs a `DurationPredictor`
+  // at all, so there is no upstream behaviour for an auto duration here to
+  // mirror -- the source clip already fixes the length. Ignoring the extra would
+  // be the same silent win this call refuses two statements up for an explicit
+  // count, so it refuses by name for the same reason. The IMPLICIT auto request
+  // -- no count, a head loaded -- is NOT refused: it asked for nothing, and the
+  // retake's own geometry is what an omitted count resolves to.
+  const bool retake_requested = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
+                                 !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  if (auto_duration.requested && retake_requested) {
+    Fail("this request carries both '" + std::string(kLtx2AutoDurationExtra) +
+         "' and a retake window. A retake's length is the SOURCE clip's "
+         "(retake.py:220 reads it from the file, and that pipeline constructs no "
+         "DurationPredictor), so an auto duration here would be dropped; refusing rather "
+         "than letting the retake silently win");
+  }
+  const bool wants_auto_duration =
+      auto_duration.requested || (!has_explicit_frames && im.has_duration_head);
+  Ltx2RequireNumFramesSource(wants_auto_duration, im.has_duration_head);
   for (const auto& kv : gen.extras) {
     // The per-generation extras this family DEFINES, and the list is the one
     // below rather than this sentence: `image_crf` (row LTX25-IMAGE-COND), the
@@ -2486,11 +2681,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // SERVED by row LTX25-DFR-PIPELINE #986) and `temporal_upsample_rounds`
     // (#986). DEFINED is still not SERVED — the last one is defined so that its
     // own refusal can name the missing loop, exactly as `CheckUnservedExtras`
-    // does on the load side (#611). Everything OUTSIDE the list is refused
+    // does on the load side. Everything OUTSIDE the list is refused
     // rather than ignored, for the reason `CheckKnownExtras` gives for the load
     // side: a mistyped knob that is silently dropped renders the DEFAULT and
     // looks like the feature not working.
-    const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
+    const bool known = kv.first == kLtx2AutoDurationExtra ||
+                       kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
                        kv.first == kLtx2AudioStartTimeExtra ||
                        kv.first == kLtx2AudioMaxDurationExtra ||
                        kv.first == kLtx2GeneratedKeyframesExtra ||
@@ -2658,8 +2854,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // statement (:211-212) and its CLI refuses the source geometry before the
   // pipeline is even constructed (:340-353) — both before any model work is
   // paid for.
-  const bool wants_retake = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
-                            !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  // Resolved at the TOP of this call, where the auto-duration guard needs it;
+  // named again here so the retake block below reads as one thing. One
+  // expression, so the two cannot drift apart into disagreeing about what a
+  // retake request is.
+  const bool wants_retake = retake_requested;
   double retake_start = 0.0, retake_end = 0.0, retake_fps = 0.0;
   bool regenerate_video = true, regenerate_audio = true;
   Ltx2RetakeSourceGeometry retake_source;
@@ -2931,7 +3130,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // about a video stream this pipeline does not have, and a `t2a` request that
   // fell through would be refused by a message about latent grids.
   if (im.recipe.audio_only) {
-    VideoResult audio_only = GenerateAudioOnly(im, gen, audio_context, context_tokens);
+    VideoResult audio_only = GenerateAudioOnly(im, gen, audio_context, context_tokens,
+                                              wants_auto_duration, auto_duration.min_seconds,
+                                              auto_duration.max_seconds);
     generate_span.Close();
     WritePhaseLog(gen.output_dir, kLtx2VideoFamily, phase_device, &audio_only.phase_log_path);
     return audio_only;
@@ -3194,22 +3395,36 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                       : (gen.height > 0 ? gen.height : recipe.height);
   const int64_t width = wants_retake ? retake_source.width
                                      : (gen.width > 0 ? gen.width : recipe.width);
+  // The VAE's causal temporal factor, named before `factors` is declared below
+  // so the auto-duration snap and the latent shapes cannot disagree about it.
+  const int64_t factors_time_for_duration = Ltx2ScaleFactors{}.time;
   int64_t frames =
       wants_retake ? retake_source.frames : (gen.num_frames > 1 ? gen.num_frames : recipe.num_frames);
   if (gen.duration_seconds > 0.0) {
-    // `resolve_num_frames` (utils/blocks.py) turns an AUTO duration into frames
-    // through the DURATION HEAD. THE REASON THIS IS UNSERVED MOVED IN L13 and the
-    // old one is recorded so a reader can re-check it: it used to be "the head
-    // needs an encoded prompt this engine cannot produce", and since `has_encoder`
-    // above the engine produces exactly that. What is missing now is the head
-    // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
-    // here constructs one. `duration_head_path` used to be ACCEPTED while no code
-    // read it, so a caller who supplied a head silently landed on this line
-    // instead; `CheckUnservedExtras` now refuses that key by name at load (#611,
-    // .agents/specs/ltx25-retire-dead-arms.md §2). What remains owed is the head
-    // itself. An explicit duration is exact arithmetic, so it is served; the AUTO
-    // path is what is missing, and `num_frames` is how to avoid it.
+    // An EXPLICIT duration is exact arithmetic against the recipe frame rate.
+    // This is not `resolve_num_frames`: upstream has no "duration in seconds"
+    // request field at all, so nothing here is being mirrored and nothing is
+    // owed. The auto path below is the one that mirrors upstream.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
+  } else if (wants_auto_duration && !wants_retake) {
+    // ── `resolve_num_frames` (utils/blocks.py:908-928) ──────────────────────
+    //
+    // AT UPSTREAM'S POSITION: after prompt encoding, where the connector outputs
+    // exist (distilled.py:231-238 sits below its `PromptEncoder` call, and
+    // `:908-913` says so in as many words). `require_num_frames_source` already
+    // ran at the top of this call, so a missing head was refused before any of
+    // the work above was paid for and `im.has_duration_head` is true here.
+    //
+    // BOTH STREAMS ARE PASSED. `DurationHead.forward` takes either or both
+    // (duration_head.py:104-105) and the video path has both, so withholding one
+    // would predict from half the signal the reference uses.
+    float predicted_seconds = 0.0F;
+    frames = Ltx2DurationPredictFrames(
+        im.duration_head_cfg, im.duration_head_weights, video_context, context_tokens,
+        audio_context, context_tokens, fps, auto_duration.min_seconds,
+        auto_duration.max_seconds, factors_time_for_duration, &predicted_seconds);
+    im.trace.duration_seconds = predicted_seconds;
+    im.trace.duration_frames = frames;
   }
   if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
 
@@ -6061,7 +6276,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 // move every anchor under it for a reason that has nothing to do with this row.
 VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& gen,
                                                const float* audio_context,
-                                               int64_t context_tokens) {
+                                               int64_t context_tokens, bool wants_auto_duration,
+                                               double auto_min_seconds,
+                                               double auto_max_seconds) {
   const Ltx2PipelineRecipe& recipe = im.recipe;
   VT_CHECK(recipe.audio_only, "ltx2 t2a: reached the audio-only path on a video recipe");
   // This path does NOT run the phase loop — it reads `phases.front()` and
@@ -6100,6 +6317,20 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
   int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
   if (gen.duration_seconds > 0.0) {
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
+  } else if (wants_auto_duration) {
+    // `resolve_num_frames` on the AUDIO-ONLY pipeline, which is why
+    // `DurationHead.forward` has to admit a null video stream at all:
+    // `T2AOneStagePipeline` passes `video_encoding=None` (t2a_one_stage.py:103-107)
+    // because a text-to-audio request never builds a video conditioning. Passing
+    // the audio stream twice, or refusing here, would each be a different
+    // prediction from the reference's.
+    float predicted_seconds = 0.0F;
+    frames = Ltx2DurationPredictFrames(
+        im.duration_head_cfg, im.duration_head_weights, /*video_tokens=*/nullptr,
+        /*video_token_count=*/0, audio_context, context_tokens, fps, auto_min_seconds,
+        auto_max_seconds, Ltx2ScaleFactors{}.time, &predicted_seconds);
+    im.trace.duration_seconds = predicted_seconds;
+    im.trace.duration_frames = frames;
   }
 
   // ── the guider (t2a_one_stage.py:196-205) ─────────────────────────────────

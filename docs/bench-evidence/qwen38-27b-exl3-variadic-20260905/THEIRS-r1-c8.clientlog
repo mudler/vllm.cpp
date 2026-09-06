@@ -1,0 +1,8 @@
+[THEIRS-r1-c8] warmup 8 at c=8
+[THEIRS-r1-c8] measured 128 at c=8
+  [THEIRS-r1-c8/measured] 25/128 t=39s
+  [THEIRS-r1-c8/measured] 50/128 t=36s
+  [THEIRS-r1-c8/measured] 75/128 t=42s
+  [THEIRS-r1-c8/measured] 100/128 t=39s
+  [THEIRS-r1-c8/measured] 125/128 t=34s
+CLIENT_RESULT {"leg": "THEIRS-r1-c8", "arm": "THEIRS", "round": 1, "concurrency": 8, "warmup_requests": 8, "measured_requests": 128, "warm_wall_s": 36.64405172400075, "measured_wall_s": 665.544219387999, "headline_warm": {"ok": 128, "requests": 128, "wall_s": 665.544219387999, "output_tokens": 22310, "output_tok_s": 33.52143907209525, "mean_ttft_ms": 36600.57818478914, "median_ttft_ms": 36498.093636500016, "mean_tpot_ms": 22.566651133252336, "decode_only_tok_s": 44.31317673566918}, "headline_all": {"ok": 136, "requests": 136, "wall_s": 702.1882711119997, "output_tokens": 23697, "output_tok_s": 33.74735946881162, "mean_ttft_ms": 35387.85156994125, "median_ttft_ms": 36136.0050659996, "mean_tpot_ms": 22.493126156297446, "decode_only_tok_s": 44.45802655670555}}

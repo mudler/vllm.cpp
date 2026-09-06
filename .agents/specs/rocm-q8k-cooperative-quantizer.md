@@ -6,27 +6,38 @@ Row: `BACKEND-ROCM`
 
 ## Now
 
-The local implementation, gfx1100-only unset default, acceptance evidence, and
-fresh review are accepted. Review of immutable head
+The accepted `gfx1100` Q8_K implementation is upstream. Its cooperative unset
+default, acceptance evidence, and fresh review remain unchanged. Review of immutable head
 `be70d25bbc67e3ce4d242c44d1bd4b47cdd52328` found no findings and returned
 `PASS`.
 
 Pull request [#2270](https://github.com/mudler/vllm.cpp/pull/2270) landed as
 `5575f689f`. Its tracked `tools/tg200-prompt.txt` satisfies the publication
-ordering prerequisite. The Q8_K implementation in this branch is not yet
-upstream. Runtime and default validation on gfx1200 and gfx1201 remain
-`PENDING` external hardware. The owning `BACKEND-ROCM` row remains `ACTIVE`.
+ordering prerequisite. Pull request
+[#2472](https://github.com/mudler/vllm.cpp/pull/2472) merged as
+`9f96b74465441ebbee3651f4b316cdb0bf183715`.
+
+Issue [#1876](https://github.com/mudler/vllm.cpp/issues/1876) is `OPEN` with
+state reason `REOPENED` and canonical `BACKEND-ROCM` row ownership. It owns
+`gfx1200` and `gfx1201` runtime and default validation. Both remain `PENDING`,
+and unset selects the legacy arm on them. Issue
+[#2598](https://github.com/mudler/vllm.cpp/issues/2598) is `CLOSED` as a
+duplicate of #1876. The owning `BACKEND-ROCM` row remains `ACTIVE`.
 
 ## Issue ownership
 
-Live issue #1876 remains `OPEN` and lacks a canonical `Row:` line. Under the
-current derived policy, the full issue link in this spec's `## Owed` section
-supplies `BACKEND-ROCM` ownership. The retired issue index and its historical
-`perf` classification do not supply current ownership.
+Issue [#1876](https://github.com/mudler/vllm.cpp/issues/1876) is `OPEN` with
+state reason `REOPENED`. Its body starts with `Row: BACKEND-ROCM`, the
+canonical `BACKEND-ROCM` ownership line. It owns the `gfx1200` and `gfx1201`
+runtime and default acceptance.
 
-The proposed pull request lands the accepted gfx1100 slice and addresses #1876
-without closing it. Issue #1876 remains open because gfx1200 and gfx1201
-runtime and default acceptance are still owed.
+Pull request [#2472](https://github.com/mudler/vllm.cpp/pull/2472) merged the
+accepted `gfx1100` slice as
+`9f96b74465441ebbee3651f4b316cdb0bf183715`. Issue #1876 stays open because
+the two external architecture gates remain `PENDING`. Issue
+[#2598](https://github.com/mudler/vllm.cpp/issues/2598) is `CLOSED` as a
+duplicate of #1876 and owns no separate validation arm. Issue #2599 owns only
+this record reconciliation.
 
 ## Git integration
 
@@ -683,9 +694,15 @@ The clean pinned llama.cpp `b10451` floor remains secondary and cannot alter
 the Q8_K byte oracle or this default decision. Gfx1200 and gfx1201 runtime and
 default validation remain `PENDING` external hardware, including gfx1201
 validation from @bakon11. Pull request #2270 landed as `5575f689f`, so the
-tracked prompt and publication ordering prerequisite are satisfied. The Q8_K
-implementation in this pull request is not yet upstream. The broader
-`BACKEND-ROCM` row therefore remains `ACTIVE`.
+tracked prompt and publication ordering prerequisite are satisfied. Pull
+request [#2472](https://github.com/mudler/vllm.cpp/pull/2472) merged the
+accepted Q8_K implementation as
+`9f96b74465441ebbee3651f4b316cdb0bf183715`. The implementation is upstream.
+Issue #1876 is `OPEN` with state reason `REOPENED` and canonical
+`BACKEND-ROCM` row ownership. It owns the `PENDING` `gfx1200` and `gfx1201`
+runtime and default gates. Unset stays legacy on both architectures. Issue
+#2598 is `CLOSED` as a duplicate and owns no separate validation arm. The
+broader `BACKEND-ROCM` row remains `ACTIVE`.
 
 ## Risks
 
@@ -703,9 +720,14 @@ implementation in this pull request is not yet upstream. The broader
 
 ## Owed
 
-- [Issue #1876](https://github.com/mudler/vllm.cpp/issues/1876) owns gfx1200 and
-  gfx1201 runtime and default validation. Both remain `PENDING` external
-  hardware, and the gfx1201 scope includes validation from @bakon11.
+- [Issue #1876](https://github.com/mudler/vllm.cpp/issues/1876) is `OPEN` with
+  state reason `REOPENED` and canonical `BACKEND-ROCM` row ownership. It owns
+  `gfx1200` and `gfx1201` runtime and default validation. Both remain `PENDING`
+  external hardware, and the `gfx1201` scope includes validation from @bakon11.
+- Unset stays legacy on `gfx1200` and `gfx1201` until each architecture has its
+  own accepted evidence.
+- Issue [#2598](https://github.com/mudler/vllm.cpp/issues/2598) is `CLOSED` as a
+  duplicate of #1876 and owns no work.
 - A llama.cpp floor measurement is owed if a clean pinned build cannot run in
   this implementation flow.
 

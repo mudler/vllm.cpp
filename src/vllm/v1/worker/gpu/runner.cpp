@@ -438,10 +438,16 @@ GPUModelRunner::GPUModelRunner(
       draft_model_(std::move(draft_model)),
       draft_attn_kv_(std::move(draft_kv)),
       queue_(queue),
+      // SPEC-DFLASH2 A2-3 (#2911): size the per-req_state draft buffer's row by
+      // this runner's resolved k, mirroring `RequestStates(..., num_speculative_
+      // steps)` (states.py:34,71-77). `num_spec()` reads `spec_config_` only,
+      // which is declared (and so initialized) above `input_batch_`. 0 without a
+      // speculator, which leaves the buffer empty and every non-speculative
+      // runner byte-identical.
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
                    group_block_sizes(kv_cache_config),
-                   group_block_sizes(kv_cache_config)) {
+                   group_block_sizes(kv_cache_config), num_spec()) {
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
@@ -468,20 +474,41 @@ GPUModelRunner::GPUModelRunner(
   // waiting on the async sampler either — that half has landed too, and its arm
   // is UNREACHED precisely because this line stands (spec `## Owed`).
   //
-  // ONE reason keeps it standing, and A2-3 owns it:
-  //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
-  //   per-request, so the draft_tokens argument A2-1's scatter reads does not
-  //   exist yet, and propose_drafts still consumes host num_sampled /
-  //   num_rejected. A2-3 supplies it, and until it does the async input-combine
-  //   call site refuses any step that scheduled drafts.
-  // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
-  // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
-  // (29 assertions, exit 1). Every one of the five throws at that call site's
-  // own VT_CHECK ("the draft buffer the combine scatters from is not wired
-  // yet"), which fires ahead of the combine, so no verify block is reached and
-  // the async sampler's own arm never gets the chance to run. The wave
-  // order and the gates are in
-  // .agents/specs/dflash2-async-spec-sampler.md.
+  // SPEC-DFLASH2 A2-3 (#2911) removed the reason this comment carried LAST. The
+  // draft buffer is wired: `input_batch_.draft_tokens` is a per-req_state
+  // [max_num_reqs, k] buffer that `set_draft_tokens` produces and that BOTH the
+  // async placeholder fill and all three combine call sites read. The combine's
+  // "not wired yet" refusal is gone, replaced by the sizing invariant that makes
+  // the CUDA scatter's unbounded row read safe. Do not read the veto as waiting
+  // on the draft buffer either. Its repair also gave the two CUDA arms the real
+  // per-request `cu_num_logits` the host arm always had; they passed a null,
+  // which those kernels read as an arange, and an arange is reason A on the
+  // first verify step this line would admit.
+  //
+  // ONE reason keeps it standing, and it is NOT this wave's:
+  //   `sample_tokens_async`'s DECODE arm never proposes. Its verify arm calls
+  //   `propose_after_verify` (A2-2), but the arm that runs when the step drafts
+  //   nothing — which is every spec engine's FIRST step, before any drafts exist
+  //   — has no `spec_on()` branch at all, where the synchronous `sample_tokens`
+  //   has one. So with this line deleted a spec engine on the `AsyncLLM` front
+  //   proposes nothing on its first decode step and the next step's fill refuses.
+  //   That is an unreached arm's gap, not a draft-buffer gap; the row's spec
+  //   lists it under `## Owed` against #2911 and A2-5 cannot flip this line until
+  //   it is closed.
+  // Measured on the CPU tier at THIS head, deleting !spec_config_.has_value() at
+  // both construction sites: test_mtp_depth goes to 9 of 10 cases passed, 1
+  // failed, 118 assertions passed, exit 1 — against 5 of 10 failed on 29
+  // assertions at the A2-2 head. "async input combine:" does not appear in the
+  // output at all, so the combine now accepts the verify step and its scatter
+  // runs. The single remaining failure is the W7 sync-vs-async identity case
+  // throwing the FILL's refusal, "proposed 0 drafts but the scheduler placed 2
+  // placeholders", which is the decode-arm gap above. The wave order and the
+  // gates are in .agents/specs/dflash2-async-spec-sampler.md.
+  // The A2-3 repair moved that message, not that count: with the fill's
+  // freshness refusal restored the same case throws "async draft fill: no drafts
+  // proposed for request 'req' (placeholders scheduled without a matching
+  // propose)" from this file instead, still 9 of 10 on 118 assertions, and the
+  // new wording names the decode-arm gap rather than its downstream symptom.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
   // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
@@ -516,10 +543,16 @@ GPUModelRunner::GPUModelRunner(
       draft_model_(std::move(draft_model)),
       draft_attn_kv_(std::move(draft_kv)),
       queue_(queue),
+      // SPEC-DFLASH2 A2-3 (#2911): size the per-req_state draft buffer's row by
+      // this runner's resolved k, mirroring `RequestStates(..., num_speculative_
+      // steps)` (states.py:34,71-77). `num_spec()` reads `spec_config_` only,
+      // which is declared (and so initialized) above `input_batch_`. 0 without a
+      // speculator, which leaves the buffer empty and every non-speculative
+      // runner byte-identical.
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
                    group_block_sizes(kv_cache_config),
-                   group_block_sizes(kv_cache_config)) {
+                   group_block_sizes(kv_cache_config), num_spec()) {
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
@@ -546,20 +579,41 @@ GPUModelRunner::GPUModelRunner(
   // waiting on the async sampler either — that half has landed too, and its arm
   // is UNREACHED precisely because this line stands (spec `## Owed`).
   //
-  // ONE reason keeps it standing, and A2-3 owns it:
-  //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
-  //   per-request, so the draft_tokens argument A2-1's scatter reads does not
-  //   exist yet, and propose_drafts still consumes host num_sampled /
-  //   num_rejected. A2-3 supplies it, and until it does the async input-combine
-  //   call site refuses any step that scheduled drafts.
-  // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
-  // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
-  // (29 assertions, exit 1). Every one of the five throws at that call site's
-  // own VT_CHECK ("the draft buffer the combine scatters from is not wired
-  // yet"), which fires ahead of the combine, so no verify block is reached and
-  // the async sampler's own arm never gets the chance to run. The wave
-  // order and the gates are in
-  // .agents/specs/dflash2-async-spec-sampler.md.
+  // SPEC-DFLASH2 A2-3 (#2911) removed the reason this comment carried LAST. The
+  // draft buffer is wired: `input_batch_.draft_tokens` is a per-req_state
+  // [max_num_reqs, k] buffer that `set_draft_tokens` produces and that BOTH the
+  // async placeholder fill and all three combine call sites read. The combine's
+  // "not wired yet" refusal is gone, replaced by the sizing invariant that makes
+  // the CUDA scatter's unbounded row read safe. Do not read the veto as waiting
+  // on the draft buffer either. Its repair also gave the two CUDA arms the real
+  // per-request `cu_num_logits` the host arm always had; they passed a null,
+  // which those kernels read as an arange, and an arange is reason A on the
+  // first verify step this line would admit.
+  //
+  // ONE reason keeps it standing, and it is NOT this wave's:
+  //   `sample_tokens_async`'s DECODE arm never proposes. Its verify arm calls
+  //   `propose_after_verify` (A2-2), but the arm that runs when the step drafts
+  //   nothing — which is every spec engine's FIRST step, before any drafts exist
+  //   — has no `spec_on()` branch at all, where the synchronous `sample_tokens`
+  //   has one. So with this line deleted a spec engine on the `AsyncLLM` front
+  //   proposes nothing on its first decode step and the next step's fill refuses.
+  //   That is an unreached arm's gap, not a draft-buffer gap; the row's spec
+  //   lists it under `## Owed` against #2911 and A2-5 cannot flip this line until
+  //   it is closed.
+  // Measured on the CPU tier at THIS head, deleting !spec_config_.has_value() at
+  // both construction sites: test_mtp_depth goes to 9 of 10 cases passed, 1
+  // failed, 118 assertions passed, exit 1 — against 5 of 10 failed on 29
+  // assertions at the A2-2 head. "async input combine:" does not appear in the
+  // output at all, so the combine now accepts the verify step and its scatter
+  // runs. The single remaining failure is the W7 sync-vs-async identity case
+  // throwing the FILL's refusal, "proposed 0 drafts but the scheduler placed 2
+  // placeholders", which is the decode-arm gap above. The wave order and the
+  // gates are in .agents/specs/dflash2-async-spec-sampler.md.
+  // The A2-3 repair moved that message, not that count: with the fill's
+  // freshness refusal restored the same case throws "async draft fill: no drafts
+  // proposed for request 'req' (placeholders scheduled without a matching
+  // propose)" from this file instead, still 9 of 10 on 118 assertions, and the
+  // new wording names the decode-arm gap rather than its downstream symptom.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
   // SPEC-DFLASH2 W7 (#1824): async SCHEDULING capability is the same
@@ -2289,14 +2343,18 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   //
   // (b) PLACEHOLDER FILL. The scheduler ships -1 placeholders
   //     (async_scheduler.py:43-45); the real values are the drafts THIS
-  //     runner proposed at the previous step's sampling (pending_drafts_,
-  //     host-resident because our propose is host-synchronous — the
-  //     device-resident variant is the row's owed A2). The fill patches a
+  //     runner proposed at the previous step's sampling. The fill patches a
   //     LOCAL copy for the splice: the engine-side SchedulerOutput keeps its
   //     placeholders, exactly as upstream's worker-side scatter leaves the
-  //     scheduler's copy untouched (gpu_input_batch.py:520-523). Reads the
-  //     stash WITHOUT consuming it — take_draft_token_ids (the deferred-
-  //     grammar pull) stays the only mover.
+  //     scheduler's copy untouched (gpu_input_batch.py:520-523).
+  //
+  //     SPEC-DFLASH2 A2-3 (#2911) changed WHERE it reads them from. It used to
+  //     read `pending_drafts_` — host, ragged, req_id-keyed, and the same object
+  //     `take_draft_token_ids` moves out to the scheduler. It now reads the
+  //     per-req_state `input_batch_.draft_tokens`, which is the buffer the
+  //     combine's draft scatter reads and which survives the out-of-band pull.
+  //     One residence, one producer (`set_draft_tokens`), two readers, which is
+  //     upstream's shape (model_runner.py:1548,1553-1556).
   if (spec_on()) {
     if (use_async_scheduling_) {
       const CachedRequestData& cached = scheduler_output.scheduled_cached_reqs;
@@ -2331,34 +2389,37 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     const std::map<std::string, std::vector<int32_t>>* sched_spec =
         &scheduler_output.scheduled_spec_decode_tokens;
     std::map<std::string, std::vector<int32_t>> filled_spec;
-    if (use_async_scheduling_ && !sched_spec->empty()) {
-      std::map<std::string, const std::vector<int32_t>*> own;
-      if (pending_drafts_.has_value()) {
-        const std::size_t n = std::min(pending_drafts_->req_ids.size(),
-                                       pending_drafts_->draft_token_ids.size());
-        for (std::size_t i = 0; i < n; ++i) {
-          own[pending_drafts_->req_ids[i]] = &pending_drafts_->draft_token_ids[i];
-        }
-      }
-      for (const auto& [req_id, placeholders] : *sched_spec) {
-        const auto own_it = own.find(req_id);
-        // Placeholders are only ever assigned to requests this runner sampled
-        // AND proposed for on the previous step (update_after_schedule skips
-        // prefill chunks; preemption clears them), so a miss is a defect and
-        // must say so rather than embed a -1.
-        VT_CHECK(own_it != own.end(),
-                 "async draft fill: no drafts proposed for request '" + req_id +
-                     "' (placeholders scheduled without a matching propose)");
-        VT_CHECK(own_it->second->size() >= placeholders.size(),
-                 "async draft fill: request '" + req_id + "' proposed " +
-                     std::to_string(own_it->second->size()) +
-                     " drafts but the scheduler placed " +
-                     std::to_string(placeholders.size()) + " placeholders");
-        filled_spec[req_id] = std::vector<int32_t>(
-            own_it->second->begin(),
-            own_it->second->begin() +
-                static_cast<std::ptrdiff_t>(placeholders.size()));
-      }
+    if (use_async_scheduling_) {
+      // SPEC-DFLASH2 A2-3 (#2911): THE FILL READS THE DRAFT BUFFER, not the
+      // out-of-band stash. `pending_drafts_` is a delivery to the scheduler and
+      // `take_draft_token_ids` MOVES it out, so it can never be the residence two
+      // in-step readers share; `input_batch_.draft_tokens` survives the pull and
+      // is the same buffer `combine_sampled_and_draft_tokens`' draft scatter
+      // reads. That is upstream's arrangement (`req_states.draft_tokens` for the
+      // workers, the `DraftTokensHandler` copy for the scheduler,
+      // model_runner.py:1548,1553-1556) and it is what stops the fill and the
+      // scatter from disagreeing about what this runner drafted — a disagreement
+      // that costs acceptance and raises nothing, verify being lossless.
+      //
+      // THE WHOLE STEP IS ONE CALL, and this is the A2-3 repair-round-3 shape.
+      // The per-request rule is `FillDraftsForRow` and the STEP rule —
+      // freshness, the slot lookup, and the ledger's consume — is
+      // `FillDraftsForStep` (both in prepare_inputs.h), so the loop and the
+      // consume cannot be separated by an edit here. They were: the consume used
+      // to sit inside `use_async_scheduling_ && !sched_spec->empty()`, so a step
+      // with no placeholders consumed nothing and left the ledger answering for
+      // a propose two steps old — the exact state this design exists to make
+      // unrepresentable, and one no suite in this tree could see. The mechanism
+      // it replaced never behaved that way: `take_draft_token_ids` moves
+      // `pending_drafts_` out on EVERY deferred-batch step (core_proc.cpp:234).
+      //
+      // Called on every async-scheduling step, EMPTY MAP INCLUDED. That is not
+      // an accident of structure: the empty step is precisely the one that must
+      // still consume.
+      filled_spec = FillDraftsForStep(
+          proposed_drafts_, *sched_spec, input_batch_.draft_tokens,
+          input_batch_.num_speculative_steps, input_batch_.req_id_to_index,
+          input_batch_.num_valid_draft_tokens);
       sched_spec = &filled_spec;
     }
 
@@ -2397,39 +2458,122 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // embeds the spliced ids instead of the (deliberately stale) host vector.
   const int32_t* device_input_ids = nullptr;
   if (async_input_combine_ && num_reqs > 0) {
-    // SPEC-DFLASH2 A2-1 made combine_sampled_and_draft_tokens draft-aware, but
-    // the buffer it scatters FROM is still owed: `pending_drafts_` is host-
-    // resident and per-request, and wave A2-3 (row SPEC-DFLASH2, #2644) is what
-    // turns it into the [num_req_states, k] draft_tokens buffer these calls
-    // would pass. Today the veto below at the `async_input_combine_`
-    // construction site keeps every speculative engine off this path, so
-    // step.num_draft_tokens is always 0 here and every call passes an empty
-    // draft buffer with an arange cu_num_logits. Refuse loudly rather than
-    // combine a verify step against a draft buffer that is not there, if that
-    // veto ever moves before A2-3 lands.
-    // The refusal reads the ROUTE predicate itself, negated, rather than a
-    // re-derivation of it (SPEC-DFLASH2 A2-2, #2802). A refusal whose predicate
-    // is a second reading of its route's predicate is the shape this tree has
-    // already shipped once (#2710). Negation is exact: the route is `> 0` and
-    // this is its complement on the same per-STEP total, so the two partition
-    // every input and no value routes and refuses, or does neither.
-    //
-    // THAT IS NOT THE SAME AS THE REFUSAL THIS REPLACED, and the difference is
-    // one class of input. The pre-A2-2 check was `step.num_draft_tokens == 0`,
-    // which refused a NEGATIVE total; `!StepRoutesToVerify` is `<= 0`, which
-    // admits one. A negative total is not constructible — `prepare_inputs.cpp`
-    // builds it by summing per-request draft counts, which are sizes — so the
-    // change is unreachable rather than harmless, and the check below restores
-    // the strictly stronger refusal without splitting the route predicate in
-    // two. A count that went negative is a corrupt step, not a decode step.
+    // The step's draft-token total is a sum of per-request counts, which are
+    // sizes. A negative total is a corrupt step, not a decode step
+    // (SPEC-DFLASH2 A2-2, #2802).
     VT_CHECK(step.num_draft_tokens >= 0,
              "async input combine: the step's draft-token total is negative, which "
              "is a corrupt step (it is a sum of per-request counts)");
-    VT_CHECK(!StepRoutesToVerify(step.num_draft_tokens),
-             "async input combine: this step scheduled draft tokens, but the "
-             "draft buffer the combine scatters from is not wired yet "
-             "(SPEC-DFLASH2 A2-3, #2644)");
+    // ─── SPEC-DFLASH2 A2-3 (#2911): WHAT REPLACED THE "NOT WIRED YET" REFUSAL ──
+    //
+    // A2-1 made `combine_sampled_and_draft_tokens` draft-aware and A2-2 left the
+    // refusal below reading `!StepRoutesToVerify(step.num_draft_tokens)` — a
+    // BLANKET refusal of every verify step, because the buffer its scatter reads
+    // did not exist and every call site passed an empty one. A2-3 supplies that
+    // buffer, so the refusal's stated reason is now FALSE and it cannot stand as
+    // written. It is not deleted, because the precondition it stood in for did
+    // not go away; it CHANGED, from "a verify step is impossible here" to "a
+    // verify step must arrive with a draft buffer that covers every req_state row
+    // it will read", and that is what is asserted instead.
+    //
+    // THE INVARIANT IS THE ONE THAT MAKES THE CUDA ARM SAFE. That arm's kernel
+    // reads `draft_tokens[req_state_idx * stride + b]` with NOTHING bounding it
+    // (the row's spec records the gap and tells this wave to close it by sizing).
+    // A buffer sized by this step's request count lets a high req_state slot
+    // index past the allocation with every host check satisfied; the quiet
+    // outcome is garbage drafts, which costs acceptance and nothing else. The
+    // check below is that sizing, stated where the unbounded read is issued.
+    //
+    // The condition still reads the ROUTE predicate itself, negated, rather than
+    // a re-derivation of it: `StepRoutesToVerify` is the same per-STEP function
+    // `sample_tokens` routes on, so no input can route one way here and another
+    // way there — the split shape #2710 shipped.
+    VT_CHECK(
+        !StepRoutesToVerify(step.num_draft_tokens) ||
+            (input_batch_.num_speculative_steps > 0 &&
+             input_batch_.draft_tokens.size() >=
+                 static_cast<std::size_t>(input_batch_.max_num_reqs) *
+                     static_cast<std::size_t>(
+                         input_batch_.num_speculative_steps)),
+        "async input combine: this step scheduled draft tokens, but the draft "
+        "buffer the combine scatters from does not cover the req_state pool "
+        "(SPEC-DFLASH2 A2-3, #2911) — the CUDA scatter's row read is unbounded, "
+        "so a buffer sized by num_reqs is an out-of-bounds device read");
+    // ─── SPEC-DFLASH2 A2-3 REPAIR (#2911): ONE cu_num_logits FOR EVERY ARM ───
+    //
+    // A2-3 wired the draft buffer into all three arms and left the two CUDA arms
+    // passing `/*cu_num_logits=*/nullptr` while the host arm passed the real
+    // `step.cu_num_logits`. A `## Owed` entry called that "the same call with a
+    // different residence", and it was not: same buffer, DIFFERENT per-request
+    // count, and the difference is silent.
+    //
+    // WHAT THE NULL DOES. `cuda_combine_tokens.cu` reads a null `cu_num_logits`
+    // as arange(num_reqs + 1), so `num_logits` is 1 and `num_draft_tokens` is 0
+    // for every row. On a decode step that is the right answer. On a VERIFY step
+    // `logits_start` becomes `query_end - 1`, which IS the last draft slot: the
+    // committed token lands on top of the last draft and NOTHING is scattered,
+    // while the host arm writes it at `query_end - (1 + k)` and scatters the k
+    // drafts. Reason A, measured on this branch as `draft=[ 6 18 5 ]` ->
+    // `[ 6 18 22 ]` and `[ 5 ]` -> `[ 3 ]` — the previous step's `emit` — with
+    // the `emit=` column unchanged OVER THOSE ROWS and the suite's identity
+    // assertions passing 118 of 118 in both arms.
+    //
+    // "ONLY ACCEPTANCE FALLS" IS SCOPED TO THOSE ROWS AND IS NOT A GLOBAL CLAIM.
+    // A round-3 review measured the whole run and it moves both ways: at `k=1`,
+    // positions 9 and 11, the pre-repair shape reads `ns=2 acc=1
+    // draft=[ 1 ] emit=[ 1 1 ]` where the repaired shape reads `ns=1 acc=0
+    // emit=[ 1 ]`, because the corrupted slot holds the COMMITTED token, which
+    // then matches and is ACCEPTED. Flattened, the pre-repair run emits 198
+    // tokens against the repaired run's 197 — one inserted `1`, the rest
+    // identical, verify being lossless — and `[SPECTRACE]` prints 185 lines
+    // against 192. So acceptance and tokens-per-step at a fixed step budget do
+    // differ, and a claim that nothing but per-row acceptance moves is wrong.
+    //
+    // That discriminator is NOT a gate this tree can ship, which is why the
+    // guard below exists instead: reaching the pre-repair shape at all needs
+    // mutation M — the veto deleted at BOTH `async_input_combine_` assignments —
+    // so the difference is only observable under a mutation and never on a
+    // committed configuration. What IS committed is the size guard below plus
+    // `test_combine_tokens.cpp`'s G2, which drives the combine directly and
+    // compares against the proposer's own ids. No END-TO-END token gate in this
+    // tree sees the class (#1366).
+    //
+    // WHY IT IS FIXED AND NOT REFUSED. A refusal would be UNBUILT here (no nvcc
+    // on this box), so its correctness would rest on reading, and it would leave
+    // A2-5 having to make exactly this edit at exactly these two call sites with
+    // no mutation to check it against. Passing the value removes the shape
+    // instead of deferring it: `step.cu_num_logits` is the arange on the
+    // non-speculative path (prepare_inputs.cpp:213), so this is INERT for every
+    // engine running today and correct for the first verify step A2-5 admits.
+    //
+    // THE GUARD IS NOT THIS COMMENT. `cu_num_logits` is the ONLY source of a
+    // row's `num_logits` in all three arms, and a short or absent one degenerates
+    // every row to 1 — the same corruption by another route. That is asserted
+    // here, on the host, where the CPU tier builds and gates it, ahead of the
+    // arm selection so no arm can be reached without it.
+    VT_CHECK(static_cast<int>(step.cu_num_logits.size()) == num_reqs + 1,
+             "async input combine: cu_num_logits must hold num_reqs + 1 entries "
+             "and holds " + std::to_string(step.cu_num_logits.size()) +
+                 " for " + std::to_string(num_reqs) +
+                 " requests (it is every arm's only source of a row's "
+                 "num_logits; a short one degenerates every row to 1, which on a "
+                 "verify step splices the committed token over the LAST DRAFT "
+                 "SLOT and scatters no drafts — SPEC-DFLASH2 reason A, which "
+                 "costs acceptance and raises nothing)");
 #ifdef VLLM_CPP_CUDA
+    // The host-side source both device arms start from. It is NOT true that they
+    // therefore cannot be edited apart, and the round-3 review was right to say
+    // so: only the UMA arm passes this pointer through. The mirror arm passes
+    // `dev->cu_num_logits`, a DEVICE buffer that equals it only while the
+    // `stage_upload(*dev, dev->cu_num_logits, cu_num_logits_host, num_reqs + 1)`
+    // below is present and correctly sized. Delete or mis-size that upload and
+    // the mirror arm alone reverts to reason A — unbuilt on this box and caught
+    // by nothing. What the shared local does buy is that neither arm can pick up
+    // a DIFFERENT host source than the host arm below, which takes the same
+    // vector by reference. Inside the #ifdef because only the device arms
+    // want a pointer; the assertion above it is outside, where the CPU tier
+    // builds and gates it.
+    const int32_t* const cu_num_logits_host = step.cu_num_logits.data();
     // W4 device-resident sampled tokens. Preferred whenever engaged
     // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR
     // DISCRETE). `last_sampled` is already on the device (the previous step's
@@ -2465,14 +2609,29 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       stage_upload(*dev, dev->seq_lens, step.seq_lens.data(), num_reqs);
       stage_upload(*dev, dev->prefill_len, input_batch_.prefill_len.data(),
                    num_reqs);
-      // draft_tokens / cu_num_logits null: no draft buffer on the device yet
-      // (A2-3), and a null cu_num_logits is the arange the non-speculative path
-      // produces, which the VT_CHECK above has already established.
+      // SPEC-DFLASH2 A2-3 (#2911): the draft buffer is wired. It is uploaded the
+      // way `prefill_len` is — the host array is authoritative because our
+      // propose is host-synchronous — and the WHOLE req_state pool goes up, not
+      // this step's `num_reqs` rows, because the kernel indexes it by req_state
+      // slot and a slot above `num_reqs` is addressable after any abort or
+      // finish reorder. Inert without a speculator: the stride is 0, the pointer
+      // is null, and the kernel degenerates to the single splice exactly as
+      // before.
+      if (dev->draft_stride > 0 && dev->draft_tokens != nullptr) {
+        stage_upload(*dev, dev->draft_tokens, input_batch_.draft_tokens.data(),
+                     static_cast<int64_t>(dev->max_reqs) * dev->draft_stride);
+      }
+      // SPEC-DFLASH2 A2-3 REPAIR (#2911): cu_num_logits is UPLOADED and PASSED,
+      // exactly like query_start_loc two calls up and for the same `num_reqs + 1`
+      // extent. It used to be null here, which the kernel reads as arange and
+      // which is reason A on any verify step — see the block above the #ifdef.
+      stage_upload(*dev, dev->cu_num_logits, cu_num_logits_host,
+                   static_cast<int64_t>(num_reqs) + 1);
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, dev->input_ids, /*idx_mapping=*/nullptr, dev->last_sampled,
           dev->query_start_loc, dev->seq_lens, dev->prefill_len,
-          /*draft_tokens=*/nullptr, /*draft_tokens_stride=*/0,
-          /*cu_num_logits=*/nullptr, num_reqs,
+          dev->draft_tokens, dev->draft_stride,
+          dev->cu_num_logits, num_reqs,
           /*num_new_sampled_tokens=*/1);
       device_input_ids = dev->input_ids;
     } else if (vllm::platforms::GetPlatform(queue_.device.type)
@@ -2490,25 +2649,46 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // is_integrated_gpu() decouples a future discrete GPU (answers false → host
       // combine below, the right path there since its host arrays are not
       // device-addressable).
-      // draft_tokens / cu_num_logits null for the same reason as the mirror arm
-      // above: A2-3 owns the draft buffer, and null cu_num_logits is the arange
-      // this non-speculative path produces.
+      // SPEC-DFLASH2 A2-3 (#2911): the draft buffer is wired here too, and on
+      // this arm it is the HOST array read directly — device-addressable on a
+      // UMA part, which is the same reason `last_sampled_tokens` and
+      // `prefill_len` are passed as host pointers two lines up. It is an
+      // `InputBatch` member, so it outlives the async launch exactly as they do.
+      // Null and zero-strided without a speculator, which is every engine on
+      // this path while the veto stands.
+      //
+      // SPEC-DFLASH2 A2-3 REPAIR (#2911): cu_num_logits is the SAME host vector
+      // the host arm below reads, handed over as a pointer for the same reason
+      // `last_sampled_tokens` and `prefill_len` are — device-addressable on a UMA
+      // part, and living in `step`, which outlives the async launch. It used to
+      // be null here, which the kernel reads as arange; this is GB10's
+      // production default, so that null was reason A on the integrated
+      // production path from the first verify step A2-5 would admit.
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
           input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
           step.seq_lens.data(), input_batch_.prefill_len.data(),
-          /*draft_tokens=*/nullptr, /*draft_tokens_stride=*/0,
-          /*cu_num_logits=*/nullptr, num_reqs,
+          input_batch_.draft_tokens.empty()
+              ? nullptr
+              : input_batch_.draft_tokens.data(),
+          input_batch_.num_speculative_steps,
+          cu_num_logits_host, num_reqs,
           /*num_new_sampled_tokens=*/1);
     } else
 #endif
     {
       std::vector<int32_t> idx_mapping(static_cast<size_t>(num_reqs));
       std::iota(idx_mapping.begin(), idx_mapping.end(), 0);
+      // SPEC-DFLASH2 A2-3 (#2911): the host arm reads the same per-req_state
+      // buffer the two device arms above read, and this is the arm the CPU tier
+      // actually builds and gates. Since the A2-3 repair it also reads the same
+      // `cu_num_logits`: the two device arms passed a null here, and this is the
+      // arm whose mutation to that shape reproduces reason A.
       combine_sampled_and_draft_tokens(
           step.input_token_ids, idx_mapping, input_batch_.last_sampled_tokens,
           step.query_start_loc, step.seq_lens, input_batch_.prefill_len,
-          /*draft_tokens=*/{}, /*draft_tokens_stride=*/0, step.cu_num_logits,
+          input_batch_.draft_tokens, input_batch_.num_speculative_steps,
+          step.cu_num_logits,
           /*num_new_sampled_tokens=*/1);
     }
   }
@@ -3785,6 +3965,84 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   return out;
 }
 
+// ─── SPEC-DFLASH2 A2-3 (#2911): the drafts' ONE producer seam ───────────────
+//
+// Mirrors `self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens`
+// (gpu/model_runner.py:1548) immediately followed by
+// `self.draft_tokens_handler.set_draft_tokens(input_batch, ...)` (:1553-1556) @
+// pin 5559679229bc961848b121ccdeaa8fa5d79bec98. Upstream writes both in the same
+// place for the same reason we do: the workers read the per-req_state buffer and
+// the scheduler reads the handler's copy, and a propose arm that wrote one and
+// forgot the other would leave the two disagreeing about what was drafted —
+// which, verify being lossless, costs acceptance and raises nothing.
+//
+// The scatter is BY req_state SLOT, resolved through `req_id_to_index`. Our
+// persistent batch is condensed-dense so the slot equals the batch row today,
+// but the lookup is the `idx_mapping` indirection upstream applies and it is what
+// stays correct after an abort or finish reorders req_states against the batch.
+// A request that is not in the persistent batch is skipped rather than refused:
+// the propose runs over `exec_state_.req_ids`, and a request can finish between
+// the sampling and this call. Its drafts still ride out in `pending_drafts_`,
+// where `update_draft_token_ids` skips a finished request by name
+// (scheduler.cpp, mirroring scheduler.py:2082-2085).
+//
+// WHY IT DOES NOT ZERO THE SLOTS IT DID NOT WRITE, which is the question a
+// reader arrives at: every propose arm builds `out` over the WHOLE step batch,
+// `i` in [0, exec_state_.num_reqs), giving a discarded row an empty list rather
+// than omitting it. So every slot the fill can reach is refreshed here each
+// step, because the fill resolves a slot through `req_id_to_index` and that only
+// yields slots below `num_reqs`. A slot above the batch has no live request; it
+// is zeroed when `add_request` hands it out. Zeroing the rest unconditionally
+// would cost per-step work for an unreachable state AND would mask a real defect
+// if a propose arm ever stopped covering the batch, so the count is maintained
+// per slot instead — seeded at admission, moved by `condense`, swapped by
+// `swap_states`, which is upstream's arrangement.
+void GPUModelRunner::set_draft_tokens(DraftTokenIds&& drafts) {
+  const int stride = input_batch_.num_speculative_steps;
+  if (stride > 0) {
+    const std::size_t n =
+        std::min(drafts.req_ids.size(), drafts.draft_token_ids.size());
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto slot_it = input_batch_.req_id_to_index.find(drafts.req_ids[i]);
+      if (slot_it == input_batch_.req_id_to_index.end()) continue;
+      const int slot = slot_it->second;
+      // THE ROW WRITE IS ONE NAMED RULE (A2-3 repair round 3, #2911). Payload
+      // and count used to be two adjacent statements here, and deleting the
+      // PAYLOAD one left every target in this row green: verify is lossless, so
+      // a zeroed draft costs acceptance and raises nothing, while deleting the
+      // COUNT reds loudly at the fill's refusal. `WriteDraftRow`
+      // (prepare_inputs.h) makes them one call, which
+      // `tests/vllm/v1/worker/test_draft_fill.cpp` gates as a round trip against
+      // `FillDraftsForRow` — the producer's write read back by the consumer.
+      WriteDraftRow(input_batch_.draft_tokens,
+                    input_batch_.num_valid_draft_tokens, stride, slot,
+                    drafts.draft_token_ids[i], drafts.req_ids[i]);
+    }
+  }
+  // SPEC-DFLASH2 A2-3 repair (#2911): the FILL'S FRESHNESS SOURCE. Recorded
+  // OUTSIDE the `stride > 0` block above, because it answers "did a propose run
+  // for this request" and not "what did it write" — the two questions used to be
+  // one only because both were read off `pending_drafts_`, and the fill needs
+  // the first one to stay askable after `take_draft_token_ids` has moved that
+  // object out. See the member's declaration for the freshness the pre-A2-3
+  // refusal had and this restores.
+  proposed_drafts_.Record(drafts.req_ids);
+  pending_drafts_ = std::move(drafts);
+}
+
+void GPUModelRunner::clear_draft_tokens() {
+  pending_drafts_.reset();
+  // This propose produced nothing, so nothing is fresh: the fill must refuse
+  // every placeholder by name rather than read a row an earlier step wrote.
+  proposed_drafts_.Clear();
+  // Zero the COUNTS and not the rows: a stale count is what would make the next
+  // fill read a row this step did not write, and upstream governs the same way —
+  // `req_states.draft_tokens` is left holding whatever it held and the valid
+  // count decides how much of it is real.
+  std::fill(input_batch_.num_valid_draft_tokens.begin(),
+            input_batch_.num_valid_draft_tokens.end(), 0);
+}
+
 // SPEC-MTP I5d: the k=1 MTP propose, run after each step's sampling
 // (gpu/model_runner.py:1455-1489 speculator.propose + set_draft_tokens). Uses the
 // stashed target hidden tap + this step's verify attention metadata; the draft
@@ -3814,7 +4072,7 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
     return;
   }
   if (num_reqs == 0 || draft_model_ == nullptr || draft_attn_kv_.empty()) {
-    pending_drafts_.reset();
+    clear_draft_tokens();
     return;
   }
   VT_CHECK(exec_state_.spec_hidden.tensor.data != nullptr,
@@ -3922,7 +4180,7 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
           drafts.begin() + static_cast<std::ptrdiff_t>(base) + k);
     }
   }
-  pending_drafts_ = std::move(out);
+  set_draft_tokens(std::move(out));
 }
 
 // SPEC-DFLASH D5: the DFlash branch — the shared block body with the 1 + k
@@ -3934,7 +4192,7 @@ void GPUModelRunner::propose_drafts_dflash(
   // num_rejected_in drives the append.
   (void)num_sampled_in;
   if (dflash_weights_ == nullptr) {
-    pending_drafts_.reset();
+    clear_draft_tokens();
     return;
   }
   const int k = dflash_k_;
@@ -3968,7 +4226,7 @@ void GPUModelRunner::propose_drafts_dspark(
     const std::vector<int32_t>& num_rejected_in) {
   (void)num_sampled_in;
   if (dspark_weights_ == nullptr) {
-    pending_drafts_.reset();
+    clear_draft_tokens();
     return;
   }
   vllm::v1::DsparkBlockLayout layout;
@@ -3999,7 +4257,7 @@ void GPUModelRunner::propose_drafts_ngram(
     const std::vector<int32_t>& /*num_rejected_in*/) {
   const int num_reqs = exec_state_.num_reqs;
   if (num_reqs == 0) {
-    pending_drafts_.reset();
+    clear_draft_tokens();
     return;
   }
   // valid_ngram_requests filter: a row proposes only if it committed >= 1 token
@@ -4039,7 +4297,7 @@ void GPUModelRunner::propose_drafts_ngram(
     out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
     out.draft_token_ids.push_back(std::move(drafts[static_cast<size_t>(i)]));
   }
-  pending_drafts_ = std::move(out);
+  set_draft_tokens(std::move(out));
 }
 
 // SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION): wire the separately-loaded z-lab DFlash
@@ -4143,7 +4401,7 @@ void GPUModelRunner::propose_drafts_block(
         const std::vector<float>&, int, const std::vector<int32_t>&)>& sample) {
   const int num_reqs = exec_state_.num_reqs;
   if (num_reqs == 0) {
-    pending_drafts_.reset();
+    clear_draft_tokens();
     return;
   }
   VT_CHECK(exec_state_.spec_aux.tensor.data != nullptr,
@@ -4667,7 +4925,7 @@ void GPUModelRunner::propose_drafts_block(
     std::fprintf(stderr, "[spec-propose] NO proposing rows this step (num_reqs=%d)\n",
                  num_reqs);
   }
-  pending_drafts_ = std::move(out);
+  set_draft_tokens(std::move(out));
 }
 
 GPUModelRunner::~GPUModelRunner() {
@@ -4688,12 +4946,52 @@ GPUModelRunner::~GPUModelRunner() {
   // are per-runner, and a serving process can construct more than one runner.
   if (async_device_inputs_ != nullptr) {
     vt::Backend& b = vt::GetBackend(queue_.device.type);
+    // DRAIN BEFORE THE FREE (SPEC-DFLASH2 A2-3 repair, #2911). This is the ONLY
+    // site that frees any of them, and until this repair it argued its own
+    // safety from "the runner and therefore its queue are going away". That is
+    // not an argument: the runner does not own `queue_` and does not destroy it,
+    // only `async_copy_queue_` is destroyed here, and a combine or a forward
+    // queued against these buffers is still queued when this destructor runs.
+    // Freeing memory a queued kernel reads is exactly what `20d225e54` repaired
+    // in `RejectionSamplerDeviceOutput::Release` one level down; `main` sets
+    // that standard and this is the same tree's other half of it.
+    //
+    // WHAT IT COSTS: one full drain of the main queue per runner destruction,
+    // once in a process's life for the ordinary single-runner server, and it is
+    // paid at TEARDOWN with no request in flight. That is the same trade the
+    // `Release` repair took — an observable stall instead of an unobservable
+    // wrong answer — and here the stall is off every serving path entirely.
+    //
+    // IT IS EXECUTED ON NEITHER TIER, and the commit that landed it said "the
+    // mirror's allocation and its entry in the destructor's free list are
+    // outside the `#ifdef` and ARE compiled here", which is true and reads as
+    // coverage it does not have. `async_device_mirror()` has its whole body
+    // inside `#ifdef VLLM_CPP_CUDA`, so on the CPU build it always answers false,
+    // `async_device_inputs_` is always null, and this entire block — the
+    // `Synchronize` included — never runs. On the CUDA build it would run and is
+    // not compiled here (no nvcc on this box). Deleting the drain leaves all
+    // eleven of this row's targets green. It rests on READING: sole destruction
+    // path, `queue_` is the queue `stage_upload` and both combine launches use,
+    // correctly scoped, no double drain, no deadlock.
+    //
+    // PRE-EXISTING ORDERING SMELL, recorded and NOT repaired by this wave because
+    // it is not this repair's defect: `DestroyQueue(async_copy_queue_)` above and
+    // the two `DestroyEvent` calls above it run BEFORE this drain, so the drain
+    // protects the mirror's buffers and protects neither of them. Closing it
+    // needs the same GPU tier that would exercise the drain at all. It is filed
+    // under this row's spec `## Owed`.
+    b.Synchronize(queue_);
+    // `draft_tokens` and `cu_num_logits` are in the list because they are in the
+    // struct; see the struct's declaration for why A2-4 must not move a free
+    // here by moving a wait.
     for (int32_t* p : {async_device_inputs_->last_sampled,
                        async_device_inputs_->prefill_len,
                        async_device_inputs_->query_start_loc,
                        async_device_inputs_->seq_lens,
                        async_device_inputs_->input_ids,
-                       async_device_inputs_->ops}) {
+                       async_device_inputs_->ops,
+                       async_device_inputs_->draft_tokens,
+                       async_device_inputs_->cu_num_logits}) {
       if (p != nullptr) b.Free(p);
     }
   }
@@ -4870,9 +5168,25 @@ GPUModelRunner::get_or_create_async_device_inputs() {
   dev->last_sampled = alloc_i32(reqs);
   dev->prefill_len = alloc_i32(reqs);
   dev->query_start_loc = alloc_i32(static_cast<int64_t>(reqs) + 1);
+  // SPEC-DFLASH2 A2-3 REPAIR (#2911): the same shape as query_start_loc, and
+  // allocated unconditionally for the same reason — on a decode step it holds
+  // the arange a null used to stand for, so the arm has one expression for
+  // every step instead of one that is only correct while the veto stands.
+  dev->cu_num_logits = alloc_i32(static_cast<int64_t>(reqs) + 1);
   dev->seq_lens = alloc_i32(reqs);
   dev->input_ids = alloc_i32(toks);
   dev->ops = alloc_i32(4LL * reqs);
+  // SPEC-DFLASH2 A2-3 (#2911): the device mirror of the per-req_state draft
+  // buffer. Sized by the req_state POOL for the reason the header states — the
+  // kernel's row read is unbounded — and allocated once, freed only in the
+  // destructor, so no later wave can free it by moving a wait. Nothing is
+  // allocated without a speculator: `num_speculative_steps` is 0 and both the
+  // pointer and the stride stay at their inert defaults.
+  dev->draft_stride = input_batch_.num_speculative_steps;
+  if (dev->draft_stride > 0) {
+    dev->draft_tokens =
+        alloc_i32(static_cast<int64_t>(reqs) * dev->draft_stride);
+  }
 
   // The mirror starts from whatever the host array already holds. In production
   // that is all zeros (no request has been admitted yet), but seeding from the

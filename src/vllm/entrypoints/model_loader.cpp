@@ -3,6 +3,7 @@
 // C ABI. Mirrors the M1.8 LLMEngine __init__ (vllm/v1/engine/llm_engine.py @
 // e24d1b24) as exercised by examples/server/main.cpp and the test harness.
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/model_executor/layers/attention/attention.h"
 #include "vllm/model_executor/models/qwen3_dflash_gguf.h"
 
 #include <algorithm>
@@ -2258,6 +2259,17 @@ LoadedEngine::LoadedEngine(HfConfig config,
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // ENG-ATTENTION-WINDOW W3 (#2388): install the model-level sliding-window
+  // switch, mirroring `ModelConfig.disable_sliding_window`
+  // (`vllm/config/model.py:248` @ `5559679229`). UNCONDITIONAL, so a second load
+  // in one process overwrites the first model's answer instead of inheriting it
+  // -- the same hazard the MoE placement plan carried until #2382, and the same
+  // fix. `value_or(false)` is upstream's own default.
+  //
+  // NO ENVIRONMENT VARIABLE, deliberately. This replaces `VT_GEMMA2_SLIDING` and
+  // `VT_GEMMA3_SLIDING`, and adding a third env spelling would re-create the
+  // surface W3 exists to remove. Upstream has no env var here to mirror.
+  vllm::SetDisableSlidingWindow(params.disable_sliding_window.value_or(false));
   // FOUR consumers page at `block_size_`: the KV config, the max-model-len fit,
   // the scheduler's block table, and the prefix-cache hasher. Before the floor
   // existed each spelled the same fallback expression and so could not disagree;

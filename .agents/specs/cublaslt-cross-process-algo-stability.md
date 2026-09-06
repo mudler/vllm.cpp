@@ -144,6 +144,19 @@ The commands are exact. They are run **by the operator, under a lease**; this
 row's author has never held the device.
 
 ```sh
+# 0. THE REHEARSAL, FIRST, IN THE SAME LEASE (#2972). Same phases, same
+#    preconditions, same judge, at one draw and one scoring leg over four short
+#    prompts. It pays the ~20-minute build once and walks everything after it in
+#    minutes, which is where all three sequencing defects found so far were
+#    sitting: #2912's artefact check, the checkpoint with no SHA256SUMS, and
+#    #2967's phase [A]. Its REPORT.json carries `smoke: true`, reports no speed
+#    verdict, and pins no draw: it is a rehearsal and never a measurement.
+bash scripts/dgx-gemm-tactic-draw-survey.sh \
+     --evidence /workspace/gemm-draw-survey/<stamp>-smoke \
+     --src /workspace/gemm-draw-survey/src.tar.gz \
+     --model /workspace/ckpt/<nvfp4-checkpoint> \
+     --smoke
+
 # 1. one job, all phases, resumable. --tactic-set defaults to `full`, which is
 #    what the product ships (Fp4FullTacticsEnabled is on unless the value starts
 #    with '0'); this row's question does not depend on the arm, but the arm is
@@ -194,7 +207,7 @@ name exactly which shapes were observed. Four shapes are four shapes.
 | Slice | State | Content |
 |---|---|---|
 | W1 harness + gates | **THIS CHANGE** | the driver, the judge, the mutation battery, and these thresholds, written before the run |
-| W2 the run | owed to the operator | one lease, the command above, evidence under `/workspace` |
+| W2 the run | owed to the operator | one lease, the commands above, evidence under `/workspace`. Three attempts have died in phase `[A]`, `[D]` and `[E]` on preconditions a freshly recreated pod does not satisfy; `[F]` (draws) and `[G]` (scoring legs) have still never executed |
 | W3 the verdict | blocked on W2 | close #2750 on `STABLE`, or re-scope this row on `UNSTABLE` |
 | W4 record repair | rides with W3 | the two stale comments #2750 names, repaired in the flow that lands the answer |
 
@@ -227,6 +240,18 @@ name exactly which shapes were observed. Four shapes are four shapes.
 
 `KERNEL-GEMM-BF16` does not change lifecycle state in this change. The harness
 and the thresholds land; the measurement is owed.
+
+**Every defect this harness has shown so far was a SEQUENCING one, and each cost
+a lease.** Phase N could not start because something phase N-1 assumed was
+absent, and none of them was visible to the CPU suite, which writes
+`phase/build.ok` and skips the build phase outright. #2912 was the artefact
+check requiring a shared `libvllm.so.*` the build never emits; #2967 was the
+same predicate surviving in the resume guard, plus a phase `[A]` that searched
+for a CUDA toolkit and never installed one, on a pod whose image carries none.
+Both are repaired, `--smoke` (#2972) walks the whole sequence at rehearsal size,
+and the apt install itself is the one part no CPU suite can execute: what the
+gate holds is the postcondition it must satisfy and the canonical recipe it must
+carry.
 
 ## Owed
 

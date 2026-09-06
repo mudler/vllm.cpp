@@ -98,13 +98,23 @@ namespace vt::cuda {
 // here). Launched on the MAIN queue BEFORE the forward (outside any decode-graph
 // capture — input prep always precedes the graph replay).
 //
-// REACHABILITY: the draft lane is UNREACHED on `main`, exactly as on the host
-// side. `async_input_combine_` is vetoed for every speculative engine, at BOTH
-// GPUModelRunner constructors (src/vllm/v1/worker/gpu/runner.cpp:480 and :553 —
-// the assignment, not the comment above it), so both call sites pass a null
-// draft_tokens and a null cu_num_logits and the kernel degenerates to the
-// pre-A2-1 single splice. Row `SPEC-DFLASH2` owns the wiring (waves A2-2, A2-3),
-// issue #2644 tracks it, and the row's spec lists it under `## Owed`.
+// REACHABILITY: the draft lane is UNREACHED, exactly as on the host side, and
+// this paragraph now says so for a DIFFERENT reason than it used to.
+// `async_input_combine_` is vetoed for every speculative engine at both
+// `src/vllm/v1/worker/gpu/runner.cpp::async_input_combine_` assignments (cited by
+// symbol: the line numbers this comment carried, :480 and :553, had already gone
+// stale twice), so no verify step reaches either call site and every step arrives
+// with `num_draft_tokens == 0`. Row `SPEC-DFLASH2` owns the wiring, issue #2911
+// tracks the current wave, and the row's spec lists it under `## Owed`.
+//
+// WHAT IS NO LONGER TRUE: that "both call sites pass a null draft_tokens and a
+// null cu_num_logits". A2-3 (#2911) wired the draft buffer into both, and its
+// repair wired `cu_num_logits` into both. Neither argument is null now, and the
+// degeneration to the pre-A2-1 single splice is a property of the STEP's
+// `num_logits` being 1 rather than of a null pointer. Reading it the old way is
+// what let the two device arms keep passing a null `cu_num_logits` while the host
+// arm passed the real vector — on a verify step that null is arange, and arange
+// puts the committed token in the last draft slot.
 void LaunchCombineSampledAndDraftTokens(
     Queue& queue, int32_t* input_ids, const int32_t* idx_mapping,
     const int32_t* last_sampled_tokens, const int32_t* query_start_loc,

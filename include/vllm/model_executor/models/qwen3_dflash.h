@@ -184,6 +184,27 @@ struct Qwen3DFlashLayerWeights {
   Exl3Weight gate_proj_exl3;  // [K=H, N=I]
   Exl3Weight up_proj_exl3;    // [K=H, N=I]
   Exl3Weight down_proj_exl3;  // [K=I, N=H]
+  // MODEL-DFLASH2-NVFP4 (#2758): the SEVEN per-layer NVFP4 weights of a
+  // ModelOpt-quantized draft, in the same shape and for the same reason as the
+  // seven trellises above. All EMPTY on a bf16, GGUF or EXL3 draft.
+  //
+  // SEVEN AND NOT FIVE, and here the argument is the producer's rather than the
+  // format's. NVFP4 CAN row-stack -- `dense_loaders::LoadMergedCtNvfp4W4A16`
+  // does it for compressed-tensors, where a merged operand is what the producer
+  // emits -- but it costs a `max()` over the shards' DIVISORS and a rescale of
+  // every group scale, and `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal`
+  // @ `bd7a9342` ships q, k and v as three modules with three independently
+  // fitted `weight_scale_2` scalars. The target's own ModelOpt path in this tree
+  // reads q/k/v/o unmerged for the same reason (`LoadDenseAttn`'s
+  // `load_projection`, qwen3_5_dense_weights.cpp), so this is the tree's
+  // established NVFP4 ownership shape and not a deferral.
+  Nvfp4Weight q_proj_fp4;     // [N=Hq*Dh, K=H]
+  Nvfp4Weight k_proj_fp4;     // [N=Hkv*Dh, K=H]
+  Nvfp4Weight v_proj_fp4;     // [N=Hkv*Dh, K=H]
+  Nvfp4Weight o_proj_fp4;     // [N=H, K=Hq*Dh]
+  Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
+  Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
+  Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
 };
 
 // Whole DFlash draft weights. The draft owns the fc aux-combine, the
@@ -318,6 +339,21 @@ struct Qwen3DFlashWeights {
   // trellis throws `tensor not found` at load. `IsExl3()` true therefore
   // implies every forward site has one to read.
   bool IsExl3() const { return !fc_exl3.Empty(); }
+  // MODEL-DFLASH2-NVFP4 (#2758): the same one-field question for the NVFP4 arm,
+  // and it CANNOT be asked of `fc`. `fc` is the one projection every DFlash
+  // draft carries, which is what makes it the EXL3 classifier -- and it is
+  // exactly the projection the published NVFP4 drafter EXCLUDES from
+  // quantization, so on that artifact `fc` is BF16 and says nothing. The
+  // question is therefore asked of a projection the artifact really quantizes.
+  //
+  // DERIVED AND NOT STORED, so it cannot disagree with the owners it describes.
+  // The loader reads all seven per-layer weights unconditionally once the
+  // draft's `quantization_config` classified the checkpoint, and refuses by name
+  // when a module the declaration says is quantized ships no NVFP4 operands --
+  // so a populated `layers[0].q_proj_fp4` means all of them are populated.
+  bool IsNvfp4() const {
+    return !layers.empty() && !layers.front().q_proj_fp4.Empty();
+  }
 };
 
 // Load the z-lab DFlash draft checkpoint. The on-disk names follow vLLM's

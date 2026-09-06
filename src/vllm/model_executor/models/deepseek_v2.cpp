@@ -945,8 +945,10 @@ struct DeepseekV2DecodeGraph::Impl {
     const char* local = std::getenv("VT_DEEPSEEK_CUDAGRAPH");
     const bool local_on = (local == nullptr) || local[0] != '0';
     Backend& b = vt::GetBackend(queue.device.type);
+    // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
     enabled = vt::GraphCaptureEnabled() && local_on &&
               platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+              !platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {

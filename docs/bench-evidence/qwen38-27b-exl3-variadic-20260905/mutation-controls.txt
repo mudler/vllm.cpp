@@ -1,0 +1,51 @@
+MUTATION CONTROLS for benchmarks/variadic/, against tests/scripts/test_variadic_harness.py
+==========================================================================================
+
+THIS FILE IS A SUMMARY, NOT A CAPTURE. An earlier capture is deliberately not
+kept: it was taken at a head whose suite ran 19 tests (the suite now runs 28), it
+recorded no result at all for one of its seven mutations, and several of its
+listed failures were the flaky mock later fixed in `ef2c714cf` rather than the
+mutation under test. A stale capture that reads as evidence is worse than a
+summary that says what it is.
+
+ROUND 1, by the implementer, 7 mutations at `2ec2f216a`. Each reverted
+byte-for-byte and the tree verified clean afterwards.
+
+  percentile -> nearest rank                       RED, 2 cases
+  warmup phase merged into the measured window     RED, 6 cases
+  concurrency ignored: always one worker           DEADLOCK (see below)
+  token count taken from the chunk count           RED, 4 cases
+  absent acceptance reported as zero               RED, 3 cases
+  TTFT chunking correction dropped                 RED, 1 case
+  corpus seed ignored                              RED, 1 case
+
+The concurrency mutation does not fail an assertion: it deadlocks against the
+start barrier, which is sized from the REQUESTED concurrency, so a worker-count
+mismatch cannot run at all rather than running and reporting a wrong number.
+That is a stronger property than detection, and it is why the suite times out
+under that mutation instead of going red.
+
+ROUND 2, by a fresh reviewer at `ef2c714cf`, 13 mutations, full suite each time,
+tree restored and verified with `git status --porcelain` and `git diff` after
+every one. Ten went red. FOUR CAME BACK GREEN, and those four are the finding:
+
+  M4   measured_wall_s = warm + measured           GREEN -> repaired, see below
+  M11  tpot divided by n instead of n-1            GREEN -> repaired
+  M14  PCTS = (50,50,50,50)                        GREEN -> repaired
+  M15  cold-start min(ttft) -> max(ttft)           GREEN -> repaired
+
+Each of the four is now held by a control that goes red without it, added in
+`29bd08a6a`:
+
+  M4   ThroughputDenominatorExcludesWarmup   (warmup made 4x the measured phase)
+  M11  TpotMatchesUpstream                   (exact arithmetic against the mock)
+  M14  PercentileHeaderMatchesWhatIsComputed (header derived from PCTS)
+  M15  ColdStartNamesTheFirstRequest         (synthetic leg, first != cheapest)
+
+The reviewer also cross-checked `report.percentile` against `numpy.percentile`
+over n = 1..59 with 60 random draws each at eleven percentiles: maximum absolute
+difference 1.36e-12. An independent 27,000-pair cross-check by the implementer is
+in `numpy-percentile-crosscheck.txt`.
+
+The suite runs 28 tests at this head and is registered in
+`scripts/agent-preflight.sh` and `.github/workflows/ci.yml`.

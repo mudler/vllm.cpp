@@ -188,6 +188,57 @@ Audio-only generation fixes modality guidance at `1.0` because it has no video
 stream. The prompt-embeds path needs a text tower for negative conditioning
 unless you set audio CFG to `1.0`.
 
+## Auto duration
+
+The duration head predicts how long the shot implied by the caption should be,
+so a request need not state a frame count. Point the load at the head and pass
+the window per generation:
+
+```
+--duration-head /path/to/duration_head.safetensors
+```
+
+reaches the `duration_head_path` load extra; `auto_duration` is a
+per-generation extra spelled `"MIN,MAX"` in seconds, which mirrors upstream's
+`--auto-duration MIN_SECONDS MAX_SECONDS`. `MIN` greater than `MAX` is refused,
+as it is upstream, and combining it with an explicit `--frames` or `duration` is
+refused rather than letting one silently win.
+
+**Omitting every frame source auto-predicts, but only when a head is loaded.**
+That is upstream's own default -- its `num_frames` defaults to `AutoDuration` --
+reached without changing any existing caller: an engine loaded without
+`duration_head_path` keeps the recipe default exactly as before.
+
+The predicted seconds are clamped to the window and converted to a frame count
+snapped down to the VAE's causal `8k + 1` temporal grid. Two consequences are
+upstream's and are worth stating because they surprise people. The clamp is
+applied BEFORE the snap, so a prediction outside the window lands on the grid
+point below the bound rather than on the bound. And when the window itself
+cannot sit on the grid -- `MIN` and `MAX` equal, at a value that is not
+`8k + 1` -- the window wins and the returned count is off-grid.
+
+**A checkpoint with no duration head is not an error.** Every LTX-2 checkpoint
+predating 2.5 / gemma4 lacks one, and `duration_head_path` pointed at such a
+file loads normally and simply leaves no predictor; a head missing some of its
+tensors behaves the same way. Only a tensor present at the wrong shape is
+refused. Asking for an auto duration when no predictor is available fails
+immediately, at the top of the call, before any prompt encoding or diffusion
+work is paid for.
+
+**The WINDOW is ABI-only.** `--duration-head` is a command-line flag and
+omitting `--frames` is how the command line asks for an auto duration, so the
+capability itself is reachable from the CLI on its defaults. Overriding the
+window is not: `auto_duration` has no flag of its own and is set only through
+the C ABI's per-generation extras (`vllm_video_params`). A command-line render
+against a loaded head therefore uses upstream's own defaults, 1 s and 20 s.
+
+`/v1/videos` does not carry `auto_duration` either: that endpoint forwards no
+per-generation extra to any engine yet (#928).
+
+The head runs in f32 here where upstream builds it in bfloat16. That arm is
+owed under `## Owed` in `.agents/specs/ltx25-duration-head-wire.md`, as the
+eighth component of gap A24.
+
 ## Dynamic frame-rate temporal rounds
 
 `--temporal-upsample-rounds N` on a `dfr` render drives the temporal x2 latent

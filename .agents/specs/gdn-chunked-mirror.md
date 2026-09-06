@@ -970,7 +970,17 @@ Not done, and each is a gate rather than a nicety:
   All three CPU arms agreeing left T4's exact ambiguity — a flag whose two arms
   coincide, or an arm that is not reached — and no log line names the arm. The
   committed `VT_Q4EXP_LAYER_FP` fingerprint settled it: `VT_GDN_CHUNKED` moves
-  `L00 blk` by `3.702e-04` from a bit-identical input, 26 of 42 taps differ, and
+  `L00 blk` by `3.702e-04` from a bit-identical input, 26 of 42 taps differ
+  (**annotation 2026-09-04, [#2877](https://github.com/mudler/vllm.cpp/issues/2877):
+  `42` is not model coverage — the instrument printed 1311 taps and the differ's
+  `load()` collapsed them to 14 tags x 3 steps because it splits on `'='` while the
+  tap prints `L%+03lld`. It is not "layer-0 coverage" either, which is how this
+  line first put it: 11 of the 14 tags are tapped inside the decoder loop and keep
+  layer 0, but `emb`, `wide` and `out` are tapped at `il = -1` and are never layer
+  0 — the differ's own largest value is at `('2', None, 'out')`. The routing
+  conclusion survives, since it needs one moved tap and not 42, but read nothing
+  about layers 1..47 into it**),
+  and
   the CPU arm lands `1.772e-05` from CUDA where the sequential arm sat
   `3.525e-04` away — **19.9x**, with `s.attn` 24.1x and `mhc.mix` 11.6x. The
   CPU-sequential and CUDA `L00 blk` readings reproduce PREFILLDIV's to the
@@ -981,6 +991,60 @@ Not done, and each is a gate rather than a nicety:
   DeltaNet source closed, that residue is the whole-model divergence. Scope's
   refusal to promise token agreement is vindicated in both directions: agreement
   did not improve, and it did not degrade either.
+
+  **ANNOTATION 2026-09-04 — EVERY RATIO IN THE BULLET ABOVE IS WITHDRAWN, IN BOTH
+  DIRECTIONS** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), full
+  reasoning, both framings and the committed control in [the ARMTOKENS evidence
+  file](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md)). The
+  sentences are kept so the shape of the error stays visible. The replacement claim
+  is NOT "the residue did not grow" — that is the same overreach with its sign
+  flipped. (a) **THE ONE THAT SURVIVES:** `LayerFp` returns early on
+  `s.step >= s.budget` (`qwen4_exp_forward.cpp:118`), so `VT_Q4EXP_LAYER_FP=3`
+  covers forwards 0, 1, 2 = tokens `11751 13 15767`, which **agree on both arms**,
+  while the three disagreeing ids are emitted at forwards 4, 6 and 7. **No
+  `VT_Q4EXP_LAYER_FP` fingerprint has yet observed a disagreeing step.** Those
+  forwards are causally upstream of forward 4 through the recurrent state, so the
+  taps are not irrelevant to the disagreement; they simply never observe it.
+  **CORRECTION 2026-09-05
+  ([#2969](https://github.com/mudler/vllm.cpp/issues/2969)): this bullet said "no
+  instrument", which is wrong for the other tap.** `VT_MOE_SEL_FP` counts MoE
+  block invocations and not forwards, and `qwen4_exp` runs 48 MoE blocks in each
+  forward, so wave MOEDIV's 384 calls reached forwards 4, 6 and 7. That reading is
+  VOID for a different reason: its CUDA arm answered the degenerate pre-#2550
+  sequence `11751 271 271 271 271 271 0 0`. **A non-degenerate arm is what is
+  missing, not a wider window.** (b) `rel(sumabs)`
+  is a difference of NORMS, not a norm of DIFFERENCES, and its under-report is a
+  DISTRIBUTION rather than the `~122x` single seed draw this line first quoted: at
+  `n = 12800` over 400 seeds the median is 75x (sigma 1e-3) to 140x (sigma 1e-4),
+  p05..p95 34..1500, and at a **fixed** true divergence two readings differ by a
+  median **2.1x** and **24x** at p95 — 400 seeds, not the six this annotation's
+  own first version (`c51c484db`) read `4.64x` from. Two significant figures is
+  what 400 draws buy; the three-figure set this line carried until #2879 came from
+  a script that was never committed. `MetricSpread` now READS this spec off disk
+  and compares every figure quoted here to the value it draws
+  (`test_the_PUBLISHER_reproduces_both_specs`), so the two cannot move apart.
+  (c) **One framing, applied to every tap.** `3.525e-04` and `1.269e-04` are the
+  same PREFILLDIV column, so a comparison that is mismatched for the MoE row is
+  mismatched for the block row. Read as algorithm-**matched** CPU-vs-CUDA pairs,
+  `L00 blk` moved **16.7x FURTHER** (1.062e-06 seq/seq -> 1.772e-05
+  chunked/chunked) where the bullet claims 19.9x closer, and every other layer-0
+  tap moved further too (`s.attn` 1.71x, `mhc.mix` 2.02x, `moe` 3.15x, `s.mlp`
+  2.34x, `out` 2.29x; `mhc.inj` alone to exactly zero). That direction is what the
+  chunked decomposition's larger reassociation freedom predicts — it lands
+  `2.29e-04` from the exact answer where sequential lands `1.15e-08` — and it is
+  not a defect. Against (b): 19.9x and 16.7x sit at 6% and 7% of the metric's
+  own no-change distribution, and no change at all produces 1.80x, 2.02x, 2.34x
+  and 3.15x in **59%, 52%, 45% and 33%** of draws — this line first called that
+  "between its 33rd and 59th percentile", which states the complement and inverts
+  the ranking: 3.15x sits at the **67th** percentile of no change, not the 33rd.
+  **Nothing here is ranked, in either direction.** The
+  residue's mechanism was already named by
+  [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
+  expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
+  both floors, both faithful mirrors and neither a defect. **NOT CLOSED:** the
+  matched pair's `4.324e-05` lands inside #2552's layer-0 flip bracket
+  (2.139e-05 no flip .. 4.999e-04 flip) and `VT_MOE_SEL_FP` was never run on it.
+  That run is the next traceable step; it needs the 68 GB artifact and a GPU.
 
 - **`main` did not compile with CUDA, and that is how this wave found out**
   ([#2861](https://github.com/mudler/vllm.cpp/issues/2861), fixed in the same

@@ -74,17 +74,44 @@ class TenstorrentPlatform final : public Platform {
   // (VT_TT_HOST_FREE_DECODE unset or any value except "0"). Set
   // VT_TT_HOST_FREE_DECODE=0 to opt out and restore the pre-flip default path.
   //
-  // CAPTURE stays opt-in via VT_TT_DECODE_CAPTURE: the captured 27.1 tok/s arm
-  // hangs deterministically on the FIRST multi-request run (16-prompt
-  // test_qwen3_paged_engine, plain and VT_TT_RECAPTURE_EVERY=8 alike; one
-  // tt-metal worker spins at 100%, main thread blocked), while single-request
-  // captured legs and the whole host-free EAGER path (11.0 tok/s warm, gate
-  // green in 35 s) never hit it. Declining capture by default keeps the
-  // default hang-free; flipping THIS default belongs to the capture-hang
-  // issue.
+  // CAPTURE FLIP (#1625): the captured arm is now the DEFAULT too — same
+  // polarity, VT_TT_DECODE_CAPTURE=0 opts out and restores the eager
+  // host-free arm. Capture stayed opt-in while this comment said: the
+  // captured arm "hangs deterministically on the FIRST multi-request run
+  // (16-prompt test_qwen3_paged_engine, plain and VT_TT_RECAPTURE_EVERY=8
+  // alike; one tt-metal worker spins at 100%, main thread blocked), while
+  // single-request captured legs and the whole host-free EAGER path never
+  // hit it." The hang was the short-chunk device KV push clobber (#2669):
+  // prefill chunks shorter than kPagedFillMinTokens ran the batched device
+  // update per-token over one shared physical block, and the last writer
+  // won, leaving the captured decode to attend a dead request's rows. With
+  // that repaired, the captured multi-request battery is 16/16 green and
+  // hang-free, and the captured arm is the fastest measured arm (28.61 tok/s
+  // warm median against 12.21 eager host-free, same-binary A/B, #2566
+  // recipe), so the default ships it.
   bool support_static_graph_mode() const override {
     return vt::tenstorrent::HostFreeDecodeEnabled() &&
-           std::getenv("VT_TT_DECODE_CAPTURE") != nullptr;
+           vt::tenstorrent::DecodeCaptureEnabled();
+  }
+
+  // #1625/#2812: the default-on above is EVIDENCE-SCOPED to the families with
+  // committed TT captured-arm gate evidence (Qwen3-dense, Mistral-7B,
+  // Qwen3.5-GDN). Every other decode driver conjuncts this query and keeps
+  // the pre-flip explicit opt-in until its own captured arm is brought up
+  // and gated.
+  bool static_graph_requires_opt_in() const override {
+    return !vt::tenstorrent::DecodeCaptureRequested();
+  }
+
+  // Architecture-scoped carve-out for the evidence families (Qwen3-dense,
+  // Mistral-7B, Qwen3.5-GDN): they capture by default — each gates its
+  // captured arm against its own committed teacher-forced pair (#2812);
+  // Llama and InternLM2, which construct the same class, keep the explicit
+  // opt-in until their captured arms are brought up.
+  bool static_graph_requires_opt_in(
+      const std::vector<std::string>& architectures) const override {
+    if (vt::tenstorrent::DecodeCaptureRequested()) return false;
+    return !vt::tenstorrent::DecodeCaptureDefaultArch(architectures);
   }
 };
 

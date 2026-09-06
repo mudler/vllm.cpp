@@ -1,0 +1,64 @@
+=== IDENTITY ===
+[hb x1 elided: 07:10:43 .. 07:10:43]
+rc-worker-lcjhd
+RC_JOB_ID=a77aa104-9332-47e2-95e1-6a3aedcb7474
+7.2.4
+overlay         1.9T  668G  1.1T  38% /
+Mem:              62           3          12           0          46          58
+HIPCC=/opt/rocm/llvm/bin/clang++
+=== SOURCE ===
+BASE_SHA=56fd248e9909e0d68381b92fd0c29d64ac0618a5
+fda70eb022eb11abdd3ecff81c1969ea09bdb01073b260e04e63dd97f93bfd31  src/vt/rocm/rocm_mla_attn.hip
+bdb39623349a8229b64e49752e6729229f51fbb83e909f97a13464a862fdc02e  src/vt/rocm/rocm_ops.hip
+=== CONFIGURE ===
+CMAKE_RC=0
+=== BUILD ===
+[hb x2 elided: 07:12:43 .. 07:14:43]
+NINJA[base] rc=0
+TESTBIN=/tmp/mla2926_j7/build/tests/test_backend_cross_device
+CLI=/tmp/mla2926_j7/build/examples/vllm-cli
+GATE1[base] rc=0
+[doctest] test cases:   3 |   3 passed | 0 failed | 38 skipped
+[doctest] assertions: 117 | 117 passed | 0 failed |
+=== MUT-N1 - prefill bottom-right causal shift forced to 0 (operands stay USED) ===
+MUTATED /tmp/mla2926_j7/src/src/vt/rocm/rocm_mla_attn.hip (1 site(s))
+NINJA[N1] rc=0
+GATE1[N1] rc=1
+[doctest] test cases:   3 |   2 passed | 1 failed | 38 skipped
+[doctest] assertions: 117 | 113 passed | 4 failed |
+MUT[N1] VERDICT: build=0 gate=1 (gate!=0 means the TEST caught it)
+=== MUT-N3 - decode sliding-window start neutralised (win_left stays USED) ===
+MUTATED /tmp/mla2926_j7/src/src/vt/rocm/rocm_mla_attn.hip (1 site(s))
+NINJA[N3] rc=0
+GATE1[N3] rc=1
+[doctest] test cases:   3 |   2 passed | 1 failed | 38 skipped
+[doctest] assertions: 117 | 115 passed | 2 failed |
+MUT[N3] VERDICT: build=0 gate=1 (gate!=0 means the TEST caught it)
+=== MUT-N4 - decode ignores the DSA selection (sel/sel_s0 stay USED) ===
+MUTATED /tmp/mla2926_j7/src/src/vt/rocm/rocm_mla_attn.hip (1 site(s))
+NINJA[N4] rc=0
+GATE1[N4] rc=1
+[doctest] test cases:   3 |   2 passed | 1 failed | 38 skipped
+[doctest] assertions: 117 | 113 passed | 4 failed |
+MUT[N4] VERDICT: build=0 gate=1 (gate!=0 means the TEST caught it)
+=== RESTORE + prove it ===
+ALL FILES RESTORED BYTE-FOR-BYTE
+NINJA[final] rc=0
+GATE1[final] rc=0
+[doctest] test cases:   3 |   3 passed | 0 failed | 38 skipped
+[doctest] assertions: 117 | 117 passed | 0 failed |
+=== LEG A - MANAGED allocation (VT_ROCM_MANAGED_ALLOC=1), the pre-#2511 behaviour ===
+--- LEG[managed] env='VT_ROCM_MANAGED_ALLOC=1' starting 07:15:13 ---
+[hb x34 elided: 07:16:43 .. 08:22:43]
+LEG[managed] rc=0 wall=4118s
+--- first op-provider line marks the END OF LOAD ---
+[  4118s] [vt op-provider] op=4 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+--- generated text / refusal ---
+[  4118s] vllm-cli: loading model from /workspace/glm53-firstload/derived/GLM-5.3-UD-IQ1_S-00001-of-00006.gguf
+[  4118s] engine: device placement INSTALLED: 78 layers run their routed experts on cpu, the rest on rocm (resolved against 78 layers, origin stated)
+[  4118s] INFO auto-fit max_model_len: reduced from 1048576 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+[  4118s] engine: device placement: engine device rocm, 1 override placing to cpu
+[  4118s] vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[  4118s] timeout: the monitored command dumped core
+/workspace/rocm-mla-2926/job7.sh: error reading input file: Host is down
+[hb x203 elided: 08:24:43 .. 15:08:44]

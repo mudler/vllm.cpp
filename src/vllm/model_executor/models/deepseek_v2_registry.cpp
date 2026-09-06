@@ -113,8 +113,10 @@ ForwardLogits ForwardDeepseekV2ForCausalLM(LoadedModel& model,
   // from max_num_reqs_ regardless of whether the model has GDN layers), so this
   // pure-MLA model reads its capture-size cap from it unchanged — the same seam
   // Qwen3-Coder uses.
+  // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
   if (input.pure_decode &&
-      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode() &&
+      !platforms::GetPlatform(input.queue.device.type).static_graph_requires_opt_in()) {
     if (!ds.decode_graph()) {
       ds.decode_graph() = std::make_unique<DeepseekV2DecodeGraph>(
           weights, input.queue, input.gdn_state_slots);

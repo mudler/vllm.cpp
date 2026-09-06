@@ -14,6 +14,9 @@ measurement evidence remains in [the benchmark record](../.agents/benchmark-reco
 | `dwarfstar-gguf` | GGUF comparison with DwarfStar | Measured | [Details](benchmarks/dwarfstar-gguf.md) |
 | `speculative-decoding` | Speculative decoding measurements | Mixed | [Details](benchmarks/speculative-decoding.md) |
 | `qwen38-27b-exl3-gb10` | Qwen3.8-27B EXL3 3.5bpw with its DFlash2 draft, on GB10 | Measured | [Details](benchmarks/qwen38-27b-exl3-gb10.md) |
+| `qwen38-27b-exl3-variadic-gb10` | Qwen3.8-27B EXL3 3.5bpw under a mixed-length serving load, swept over concurrency, on GB10 | Measured | [Details](benchmarks/qwen38-27b-exl3-variadic-gb10.md) |
+| `tt-capture-default-decode` | Tenstorrent decode rate, capture default vs opt-out, on the P150 | Measured | [Details](benchmarks/tt-capture-default-decode.md) |
 | `how-we-measure` | Benchmark method and acceptance rules | Method | [Details](benchmarks/how-we-measure.md) |
+| `variadic-load-methodology` | How the mixed-length, swept-concurrency serving benchmark works | Method | [Details](benchmarks/variadic-load-methodology.md) |
 | `open-gaps` | Pending, failed, void, and superseded measurements | Open | [Details](benchmarks/open-gaps.md) |
 | `reproduce` | Reproduction commands and artifacts | Method | [Details](benchmarks/reproduce.md) |

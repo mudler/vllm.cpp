@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v2.h"
+#include "vllm/model_executor/models/glm4_moe_lite.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
@@ -56,6 +57,25 @@
 #include "vt/dtype.h"
 
 namespace vllm {
+
+// The ONE place this port says what GLM's MoE block is. Declared in
+// glm4_moe_lite.h, which carries the upstream anchors and the reason
+// `ParseDeepseekV2Params` is not the place for this.
+DeepseekV2Params ParseGlm4MoeLiteParams(const HfConfig& config) {
+  DeepseekV2Params p = ParseDeepseekV2Params(config, /*allow_mtp_tail=*/true);
+  // `Glm4MoeLite` IS `Glm4MoE` (glm4_moe_lite.py:86-87), whose gate is
+  // `nn.Linear(..., dtype=torch.float32)` fed `hidden_states.to(torch.float32)`
+  // and declared `router_logits_dtype=torch.float32` (glm4_moe.py:141-146, :218,
+  // :205). fp32 is a property of the class, so no config key can withhold it —
+  // and the published GLM-4.7-Flash config.json ships no `moe_router_dtype`,
+  // which is exactly the value `ParseDeepseekV2Params` correctly reads for the
+  // architecture IT serves. Rounding the logits to bf16 in front of a
+  // top-4-of-64 `noaux_tc` selection changes which experts run
+  // (tests/vllm/models/test_glm4_moe_lite_router_dtype.cpp measures it).
+  p.router_dtype_is_f32 = true;
+  return p;
+}
+
 namespace {
 
 // registry.py _ModelInfo for GLM-4.7-Flash: text generation, NOT hybrid (MLA is
@@ -98,9 +118,14 @@ std::unique_ptr<LoadedModel> LoadGlm4MoeLiteForCausalLM(
   }
   // allow_mtp_tail = true: GLM-4.7-Flash ships `num_nextn_predict_layers: 1`; the
   // loader pulls only the main layers, so the MTP tail is skipped, not refused.
-  return std::make_unique<Glm4MoeLiteLoadedModel>(
-      registration, LoadDeepseekV2ForCausalLMWeights(*source.safetensors, config,
-                                                     /*allow_mtp_tail=*/true));
+  DeepseekV2Weights weights = LoadDeepseekV2ForCausalLMWeights(
+      *source.safetensors, config, /*allow_mtp_tail=*/true);
+  // The loader resolves `w.params` through `ParseDeepseekV2Params`, which answers
+  // for `DeepseekV2MoE`. GLM-4.7-Flash's MoE block is `Glm4MoE`, so the params
+  // the FORWARD reads must be GLM's. Same bytes, same function, one extra step.
+  weights.params = ParseGlm4MoeLiteParams(config);
+  return std::make_unique<Glm4MoeLiteLoadedModel>(registration,
+                                                  std::move(weights));
 }
 
 void PrepareGlm4MoeLiteForCausalLM(LoadedModel& model, const HfConfig& config,
@@ -132,8 +157,10 @@ ForwardLogits ForwardGlm4MoeLiteForCausalLM(LoadedModel& model,
   // prefill/mixed/over-cap/CPU fall back to eager INSIDE the driver. Real-row
   // output is bit-identical to eager. `gdn_state_slots` carries max_num_reqs for
   // every arch, so this pure-MLA model reads its capture-size cap from it.
+  // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
   if (input.pure_decode &&
-      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode() &&
+      !platforms::GetPlatform(input.queue.device.type).static_graph_requires_opt_in()) {
     if (!glm.decode_graph()) {
       glm.decode_graph() = std::make_unique<DeepseekV2DecodeGraph>(
           weights, input.queue, input.gdn_state_slots);
@@ -158,7 +185,7 @@ ForwardLogits ForwardGlm4MoeLiteForCausalLM(LoadedModel& model,
 // GLM-4.7-Flash's `num_nextn_predict_layers: 1` is accepted (tail skipped); every
 // other unsupported field still throws with a precise message.
 void ParseGlm4MoeLiteConfig(const HfConfig& config) {
-  (void)ParseDeepseekV2Params(config, /*allow_mtp_tail=*/true);
+  (void)ParseGlm4MoeLiteParams(config);
 }
 
 // MLA KV-cache spec: exactly ONE `MLAAttentionSpec` group, 1 head,
@@ -166,7 +193,7 @@ void ParseGlm4MoeLiteConfig(const HfConfig& config) {
 // DeepSeek-V2) wide, NO factor-2 and NO separate V.
 v1::KVCacheConfig MakeGlm4MoeLiteKVCache(const HfConfig& config, int block_size,
                                          int num_blocks) {
-  const DeepseekV2Params p = ParseDeepseekV2Params(config, /*allow_mtp_tail=*/true);
+  const DeepseekV2Params p = ParseGlm4MoeLiteParams(config);
   const int head_size = static_cast<int>(p.mla.head_size());
 
   v1::KVCacheConfig kv;

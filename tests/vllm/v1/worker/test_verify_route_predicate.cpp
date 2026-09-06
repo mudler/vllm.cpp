@@ -136,28 +136,37 @@ TEST_CASE("a step where EVERY row drafted nothing does not route to verify") {
   CHECK_FALSE(StepRoutesToVerify(StepTotal(per_req)));
 }
 
-TEST_CASE("the refusal at the async input combine fires on the MIXED step too") {
-  // `runner.cpp`'s async input-combine site refuses a step that scheduled draft
-  // tokens, because the draft buffer its combine scatters from is not wired yet
-  // (A2-3, #2644). It asks `!StepRoutesToVerify(step.num_draft_tokens)` — the
-  // route's own function, negated, rather than a second reading of the rule.
+TEST_CASE("the MIXED step routes to verify, which is what the input combine asks") {
+  // WHAT THE SITE ASKS TODAY, because the text here described a tree that no
+  // longer exists. `runner.cpp`'s async input-combine site used to refuse EVERY
+  // verify step, on the ground that the draft buffer its combine scatters from
+  // was not wired. A2-3 (#2911 — not #2644, which owned A2-1) wired that buffer,
+  // so the site's condition is now
+  //   !StepRoutesToVerify(step.num_draft_tokens) || <the draft buffer covers the
+  //   req_state pool>
+  // and a verify step is ADMITTED when the buffer is sized correctly. Route and
+  // refusal therefore no longer partition the input, and this case no longer
+  // claims they do.
   //
-  // NOTHING HERE CAN PROVE THAT SHARING, and this case does not pretend to: two
+  // NOTHING HERE CAN PROVE THE SHARING, and this case does not pretend to: two
   // source sites calling one function is a property of the source, and the
-  // instrument for it is the reviewer's mutation (change one site's predicate
-  // and this file must go red for the route half; the refusal half is
-  // unreachable today and is recorded as owed in the row's spec). What this case
-  // DOES pin is that route and refusal PARTITION the input: on the mixed step
-  // the route fires and the refusal does not, and there is no value of the total
-  // for which both or neither hold. The refusal site carries one check the route
-  // does not — a separate `>= 0` on the total — because negating `> 0` admits a
-  // negative total that the pre-A2-2 `== 0` refusal rejected; that check is a
-  // structural guard beside the predicate, not a second reading of it.
+  // instrument for it is the reviewer's mutation (change one site's predicate and
+  // this file must go red). What this case pins is that `StepRoutesToVerify` is
+  // the ONE function deciding whether that site demands the sizing invariant at
+  // all, and it is the same function `sample_tokens` routes on. The site carries
+  // one check the route does not — a separate `>= 0` on the total — because
+  // negating `> 0` admits a negative total that the pre-A2-2 `== 0` refusal
+  // rejected; that is a structural guard beside the predicate, not a second
+  // reading of it.
+  //
+  // IT ALSO STOPPED RE-DERIVING THE PREDICATE. This case used to compute
+  // `!StepRoutesToVerify(StepTotal(mixed))` into a second local and assert it
+  // false. That was a SECOND expression of the rule this file exists to keep
+  // single (#2710) — the exact shape it was written against — and since A2-3 it
+  // was not even the site's rule any more. One reading only.
   const std::vector<int32_t> mixed{0, 2, 0};
   const bool routes = StepRoutesToVerify(StepTotal(mixed));
-  const bool refuses = !StepRoutesToVerify(StepTotal(mixed));
   CHECK(routes);
-  CHECK_FALSE(refuses);
 
   // The per-request reading a re-derivation would have used, made explicit. The
   // OR over the rows agrees with the step answer — it must, for non-negative

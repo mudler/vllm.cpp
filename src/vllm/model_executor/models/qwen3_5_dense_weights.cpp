@@ -186,14 +186,6 @@ void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
   (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
 }
 
-// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
-// divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
-// GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift.
-bool ModelOptW4A4OptIn() {
-  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
-  return w4a4 != nullptr && w4a4[0] == '1';
-}
-
 // One compressed-tensors NVFP4 W4A4 Linear -> RAW fp4-resident Nvfp4Weight kept
 // in the on-disk [N=out, K=in] orientation vt::MatmulNvfp4 reads directly (notes
 // §5 step-6a — the throughput path; NO bf16 materialization). Reads the CT
@@ -380,8 +372,6 @@ OwnedTensor LoadLmHeadAnyDtype(const TensorResolver& get, const TensorExists& ha
   return OwnedTensor{};
 }
 
-namespace {
-
 // compressed-tensors and ModelOpt both ship NVFP4, with different names AND a
 // different global-scale convention:
 //
@@ -395,11 +385,20 @@ namespace {
 // the first U8 tensor. LoadCtNvfp4Raw already reciprocates internally, so the
 // ModelOpt scale is passed through as 1/weight_scale_2 to land on the same math
 // (identical to the lm_head conversion in LoadLmHeadAnyDtype).
-bool IsNvfp4Projection(const TensorExists& has, const std::string& proj) {
+//
+// MODEL-DFLASH2-NVFP4 (#2758): EXPORTED, and no longer file-local. The DFlash2
+// draft loader asks the SAME question about the SAME spelling for its own
+// weights, and a second copy of this probe is the "two descriptions of one
+// rule" failure AGENTS.md `## Changing the rules or a checker` names. It is the
+// argument `DenseLmHeadTakesNvfp4` already makes one screen down, for the same
+// consumer. Declared in `qwen3_5_dense.h`; the bodies are unchanged.
+bool IsNvfp4Projection(const std::function<bool(const std::string&)>& has,
+                       const std::string& proj) {
   return has(proj + ".weight_packed") || has(proj + ".weight_scale_2");
 }
 
-Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& has,
+Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get,
+                               const std::function<bool(const std::string&)>& has,
                                const std::string& proj) {
   if (has(proj + ".weight_packed")) return LoadCtNvfp4Raw(get, proj);
 
@@ -481,6 +480,8 @@ Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get, const TensorExists& ha
   }
   return r;
 }
+
+namespace {
 
 // MODEL-FP8-BLOCK-WEIGHT (#1189 M3), spec
 // `.agents/specs/model-fp8-block-weight.md`. Does this projection take the
@@ -788,6 +789,16 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
 }
 
 }  // namespace
+
+// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
+// divisor, setting `alpha` and so flipping `IsTrueW4A4()` to the fp4-ACTIVATION
+// GEMM (docs/ENVIRONMENT.md). ONE reader, so the spellings cannot drift --
+// which is why MODEL-DFLASH2-NVFP4 (#2758) exported it rather than reading the
+// same variable a second time from the DFlash draft loader.
+bool ModelOptW4A4OptIn() {
+  const char* w4a4 = std::getenv("VT_MODELOPT_W4A4");
+  return w4a4 != nullptr && w4a4[0] == '1';
+}
 
 bool DenseLmHeadFp4Enabled() {
   const char* v = std::getenv("VT_LMHEAD_FP4");

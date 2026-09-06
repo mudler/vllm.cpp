@@ -8,7 +8,7 @@
 
 <p align="center">
   <b>Same tokens as vLLM. Same throughput. 140x less to install.</b><br>
-  <sub>Continuous batching, paged KV, 43 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
+  <sub>Continuous batching, paged KV, 44 registered architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
 <p align="center">
@@ -107,7 +107,7 @@ Where that stands today:
   ahead at all six concurrencies but only c1 outside our noise band. Also **1.18x llama.cpp's
   prefill** on the same GGUF file (denominator SUPERSEDED, see below), and **ahead of MLX-LM on
   prefill** on Apple Silicon. Most other architectures are speed-pending, and say so.
-- **Everything.** 43 registered architectures, 38 tool-parser families, structured output including
+- **Everything.** 44 registered architectures, 38 tool-parser families, structured output including
   GBNF, three speculative decoders, image, video, and audio input, music generation, external KV
   offload, Prometheus metrics, and the SGLang knobs, all in a library you can `dlopen`. Multimodal
   input runs on the single-sequence drivers. No multimodal request is served over HTTP yet
@@ -283,7 +283,7 @@ InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus Qwen3-VL and Qwen3.6-27B vision
 and Voxtral (audio).
 
 <details>
-<summary><b>The full architecture matrix</b> (43 registered architectures grouped by family)</summary>
+<summary><b>The full architecture matrix</b> (44 registered architectures grouped by family)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -330,7 +330,7 @@ sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning mod
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
 sliding-window attention are gated feature-positive. The authoritative per-architecture list, bound
-to the C++ registry (all 43 registered architectures with their tested checkpoint and gate, plus the
+to the C++ registry (all 44 registered architectures with their tested checkpoint and gate, plus the
 standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
 [docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
 hardware-blocked and why, is linked from [Project status](#project-status).

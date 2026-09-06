@@ -148,10 +148,16 @@ computed from the same timings on both engines and both put us ahead.
    A and 15,253 over 19,680 in leg B, which is 0.774 and 0.775 per output token.
    No ratio is available until [#2770](https://github.com/mudler/vllm.cpp/issues/2770)
    lands.
-3. **Time to first token goes to them.** Mean TTFT 954.2 ms theirs against
-   1059.0 ms ours, median 762.7 ms against 863.3 ms, and both of their legs beat
-   both of ours on both statistics. The size is not established: their own two
-   legs differ by 15.2% on mean TTFT, against 0.73% between ours.
+3. **Time to first token splits between the median and the tail.** This item read
+   "goes to them" when the row published, on the mean over all 164 requests of
+   every leg: 954.2 ms theirs against 1059.0 ms ours. Request `i = 0` of every leg
+   is a cold start, and the page discards run 1 elsewhere, so those two means
+   broke the page's own rule. Warm, they read 929.8 ms theirs against 904.0 ms
+   ours. The median stays theirs, 762.7 ms against 863.1 ms pooled. p90, p95 and
+   p99 are ours, at 1.427x, 1.429x and 1.856x. Their own two legs still move
+   15.2% on the mean against 0.73% between ours, so the mean is close rather than
+   won. The correction is
+   [#2968](https://github.com/mudler/vllm.cpp/issues/2968).
 4. **No text-quality comparison is available.** Their streamed text drops spaces
    at chunk boundaries, which is their wrapper's `HOLD_BACK` buffering, so the
    assembled strings cannot be compared as text. Both first completions do open
@@ -200,3 +206,8 @@ nobody should quote.
   draft route rather than `VT_DFLASH_PAGED=0`.
 - A repeat on a second boot. Four legs in one lease control drift inside that
   window and say nothing about boot-to-boot movement.
+- A per-token timestamp on both sides. Time to first token here is time to the
+  first streamed chunk, and our chunk holds 4.47 completion tokens against their
+  1.08, so the median on that axis is not a matched comparison.
+- An explanation for the first request of each of our legs, which cost 27.5 s and
+  25.2 s. Their engine paid 7.9 s on its first leg and 1.9 s on its second.

@@ -339,7 +339,7 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
     pa.window_size = ResolveAttentionWindow(
         /*per_layer=*/std::nullopt, sliding_window,
         v1::AttentionType::kDecoder,
-        /*disable_model_sliding_window=*/false);
+        /*disable_model_sliding_window=*/DisableSlidingWindowActive());
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

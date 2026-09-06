@@ -46,6 +46,9 @@
 // scripts/gen-ltx2-pipeline-goldens.py and edited by several concurrent rows of
 // this campaign, and a per-row file is the shape `AGENTS.md ## Records` asks for.
 #include "ltx2_res2s_goldens.inc"
+// Row LTX25-DURATION-HEAD-WIRE (#2900), in its own file for the same reason:
+// one file per row is the shape `AGENTS.md ## Records` asks for.
+#include "ltx2_duration_wire_goldens.inc"
 
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_samplers.h"
@@ -5494,5 +5497,191 @@ TEST_CASE("ltx2 checkpoint class: the refusal accepts exactly the upstream combi
     CHECK(msg.find("lora_path") != std::string::npos);
     // The adapter is what flips it, and nothing else: same recipe, same class.
     CHECK(vllm::Ltx2CheckpointClassRefusal(either, "retake", "full", true).empty());
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 10 — THE DURATION HEAD'S DRIVER (row LTX25-DURATION-HEAD-WIRE, #2900)
+//
+// Section 9 above gates the head's forward. This section gates everything
+// upstream wraps around it to turn a predicted duration into the frame count a
+// render uses: `snap_frames_to_grid`, `seconds_to_clamped_num_frames` and
+// `DurationPredictor.__call__`. Every value comes from
+// `ltx2_duration_wire_goldens.inc`, which EXECUTES those three at the pin.
+//
+// EACH CASE CARRIES THE REJECTED RULE BESIDE UPSTREAM'S ANSWER, and the
+// separating counters are asserted non-zero. A single-hypothesis check cannot
+// see an error that lands equidistant from the right rule and a wrong one, and
+// a fixture that quietly stopped discriminating would read as a pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("ltx2 duration driver: the frame grid, the clamp order and the head, vs upstream") {
+  SUBCASE("snap_frames_to_grid floors to 8k + 1") {
+    // The FLOOR, against a ceiling to the same grid. The two agree on every
+    // input that is already a grid point, so the count of cases where they part
+    // is asserted rather than assumed.
+    int separating = 0;
+    for (const vllm_test::Ltx2SnapCase& c : vllm_test::kLtx2SnapCases) {
+      INFO("frames = " << c.frames);
+      CHECK(vllm::Ltx2SnapFramesToGrid(c.frames, 8) == c.expected);
+      if (c.expected != c.rejected_ceil) ++separating;
+    }
+    CHECK(separating == vllm_test::kLtx2SnapSeparatingCases);
+    CHECK(separating > 0);
+  }
+
+  SUBCASE("snap_frames_to_grid refuses a count below 1") {
+    // Upstream raises (helpers.py:560-561) rather than returning a degenerate
+    // count, and that guard is also what keeps C++'s truncating division
+    // agreeing with Python's flooring `//`.
+    CHECK_THROWS_AS(vllm::Ltx2SnapFramesToGrid(0, 8), std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2SnapFramesToGrid(-7, 8), std::runtime_error);
+  }
+
+  SUBCASE("seconds_to_clamped_num_frames, against its four nearest wrong rules") {
+    int sep_snap_first = 0, sep_no_repair = 0, sep_truncate = 0, sep_half_away = 0;
+    for (const vllm_test::Ltx2ClampCase& c : vllm_test::kLtx2ClampCases) {
+      INFO("seconds = " << c.seconds << " fps = " << c.frame_rate << " window = [" << c.min_frames
+                        << ", " << c.max_frames << "]");
+      const int64_t got = vllm::Ltx2SecondsToClampedNumFrames(c.seconds, c.frame_rate,
+                                                              c.min_frames, c.max_frames, 8);
+      CHECK(got == c.expected);
+      if (c.expected != c.rejected_snap_first) ++sep_snap_first;
+      if (c.expected != c.rejected_no_repair) ++sep_no_repair;
+      if (c.expected != c.rejected_truncate) ++sep_truncate;
+      if (c.expected != c.rejected_half_away) ++sep_half_away;
+    }
+    // THE DISCRIMINATION, asserted rather than hoped for. Each counter is what
+    // the generator measured against upstream; a table that stopped separating a
+    // rule fails here instead of passing quietly.
+    CHECK(sep_snap_first == vllm_test::kLtx2ClampSeparatingSnapFirst);
+    CHECK(sep_no_repair == vllm_test::kLtx2ClampSeparatingNoRepair);
+    CHECK(sep_truncate == vllm_test::kLtx2ClampSeparatingTruncate);
+    CHECK(sep_half_away == vllm_test::kLtx2ClampSeparatingHalfAway);
+    CHECK(sep_snap_first > 0);
+    CHECK(sep_no_repair > 0);
+    CHECK(sep_truncate > 0);
+    // The one a port reaching for `std::llround` gets wrong. 0.34 s at 25 fps is
+    // exactly 8.5: upstream takes the even 8 and returns frame 1, `llround`
+    // takes 9 and returns frame 9.
+    CHECK(sep_half_away > 0);
+  }
+
+  SUBCASE("a min_frames below 1 is upstream's to serve, and its zero is upstream's to RAISE") {
+    // EXECUTED AT THE PIN, not read off `helpers.py`. `AutoDurationAction`
+    // (utils/args.py:117-122) refuses `min > max` and NOTHING else, so
+    // `AutoDuration(min_seconds=0.0, max_seconds=20.0)` constructs, and
+    //
+    //   seconds_to_clamped_num_frames(3.0, frame_rate=25.0,
+    //                                 min_frames=0, max_frames=500) == 73
+    //
+    // is what upstream returns for it. This port refused that request by name,
+    // which made `--auto-duration 0 20` -- a working upstream invocation -- an
+    // error here.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(3.0, 25.0, 0, 500, 8) == 73);
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(1.0, 25.0, 0, 500, 8) == 25);
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(30.0, 25.0, 0, 500, 8) == 497);
+    // And the raise is upstream's too, from `snap_frames_to_grid` rather than
+    // from a bound check: at the pin,
+    //
+    //   seconds_to_clamped_num_frames(0.005, frame_rate=25.0,
+    //                                 min_frames=0, max_frames=500)
+    //     -> ValueError: frames must be >= 1, got 0
+    //
+    // A port that floors `min_frames` to 1 returns 1 instead, which is a
+    // one-frame render where upstream refuses. THAT is the direction this pair
+    // gates: the acceptance above and the refusal below have to move together,
+    // because accepting the bound without honouring the raise is the silent half.
+    CHECK_THROWS(
+        (void)vllm::Ltx2SecondsToClampedNumFrames(0.005, 25.0, 0, 500, 8));
+    // The same seconds WITH upstream's default bound is 1 rather than a raise,
+    // so the case above cannot pass by refusing everything.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(0.005, 25.0, 1, 500, 8) == 1);
+  }
+
+  SUBCASE("the window is honoured over the grid when both cannot hold") {
+    // min == max == 5 returns 5, which is NOT on the 8k+1 grid. That is upstream
+    // (helpers.py:581-584 takes `min` with `max_frames` after ceiling back onto
+    // the grid), and it is the case an implementation that trusted the grid
+    // unconditionally gets wrong.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(0.01, 25.0, 5, 5, 8) == 5);
+  }
+
+  SUBCASE("DurationPredictor.__call__ end to end") {
+    // The SAME synthetic head the generator built, from the same closed form, so
+    // a disagreement here is the driver rather than the weights.
+    vllm::Ltx2DurationHeadConfig cfg;
+    cfg.prefix = "";
+    vllm::Ltx2VaeWeights weights;
+    int slot = 0;
+    for (const vllm::Ltx2DurationHeadTensorSpec& spec :
+         vllm::EnumerateLtx2DurationHeadTensors(cfg)) {
+      int64_t numel = 1;
+      for (const int64_t d : spec.shape) numel *= d;
+      std::vector<float> values(static_cast<size_t>(numel));
+      for (int64_t i = 0; i < numel; ++i) {
+        values[static_cast<size_t>(i)] = static_cast<float>(
+            std::sin(static_cast<double>(i) * 0.7391 + static_cast<double>(slot) * 1.13) * 0.2);
+      }
+      weights.tensors[spec.name] = std::move(values);
+      ++slot;
+    }
+    for (const vllm_test::Ltx2PredictCase& c : vllm_test::kLtx2PredictCases) {
+      INFO("video_tokens = " << c.video_tokens << " audio_tokens = " << c.audio_tokens
+                             << " fps = " << c.frame_rate);
+      std::vector<float> video(static_cast<size_t>(c.video_tokens * cfg.video_cross_attention_dim));
+      for (size_t i = 0; i < video.size(); ++i) {
+        video[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.013) * 0.5);
+      }
+      std::vector<float> audio(static_cast<size_t>(c.audio_tokens * cfg.audio_cross_attention_dim));
+      for (size_t i = 0; i < audio.size(); ++i) {
+        audio[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.013 + 1.7) * 0.5);
+      }
+      float seconds = 0.0F;
+      const int64_t frames = vllm::Ltx2DurationPredictFrames(
+          cfg, weights, c.video_tokens != 0 ? video.data() : nullptr, c.video_tokens,
+          c.audio_tokens != 0 ? audio.data() : nullptr, c.audio_tokens, c.frame_rate,
+          c.min_seconds, c.max_seconds, 8, &seconds);
+      // THE FRAME COUNT IS THE CONTRACT AND IT IS EXACT. It is an integer, it is
+      // what the render uses, and every case here matches upstream's to the unit
+      // -- including the clamped one, which is where the two implementations
+      // could most easily have parted.
+      CHECK(frames == c.frames);
+      // The RAW prediction rides beside it as a LOCALIZER, so a frame-count
+      // mismatch says whether the forward or the snapping moved rather than
+      // arriving as one wrong integer. Its tolerance is looser than the goldens
+      // elsewhere in this file and the reason is measured, not assumed: the
+      // default config projects from 4096 and 2048 channels, so the two
+      // implementations accumulate a 4096-long f32 dot product in different
+      // orders, and the head then EXPONENTIATES the result -- which turns an
+      // absolute error in the log-duration into a relative one in seconds. The
+      // observed spread is 3.6e-5 relative, consistently signed because it is the
+      // same computation on every case. 1e-4 admits that and nothing larger: a
+      // real defect in this chain moves the value by percent, not by parts per
+      // ten thousand, and it would have to move the frame count above to hide.
+      CHECK(seconds == doctest::Approx(c.seconds).epsilon(1e-4));
+    }
+    // The table has to be able to SEE the head. Four distinct frame counts over
+    // five cases; a fixture whose head went input-insensitive would collapse
+    // these and the generator refuses to emit it, but the constant travels here
+    // so the C++ side states the same requirement.
+    CHECK(vllm_test::kLtx2PredictDistinctFrameCounts >= 3);
+  }
+
+  SUBCASE("require_num_frames_source mirrors upstream in BOTH directions") {
+    // A guard that always raised would pass a one-sided check, so both polarities
+    // are asserted -- and both were executed against upstream at generation time.
+    CHECK_THROWS_AS(vllm::Ltx2RequireNumFramesSource(true, false), std::runtime_error);
+    CHECK_NOTHROW(vllm::Ltx2RequireNumFramesSource(true, true));
+    CHECK_NOTHROW(vllm::Ltx2RequireNumFramesSource(false, false));
+    CHECK(vllm_test::kLtx2RequireNumFramesAllowsAutoWithHead);
+    CHECK(vllm_test::kLtx2RequireNumFramesAllowsExplicitWithoutHead);
+    try {
+      vllm::Ltx2RequireNumFramesSource(true, false);
+    } catch (const std::exception& e) {
+      // UPSTREAM'S OWN MESSAGE, byte for byte, so the port's refusal says what
+      // the reference's says rather than something equivalent.
+      CHECK(std::string(e.what()) == std::string(vllm_test::kLtx2RequireNumFramesMessage));
+    }
   }
 }

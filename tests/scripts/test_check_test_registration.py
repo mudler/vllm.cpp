@@ -53,6 +53,9 @@ PASSING_CI = """jobs:
       - name: The committed LTX-2 oracle goldens still hash to what records them
         run: |
           python3 tests/scripts/test_ltx2_oracle_goldens.py
+      - name: The layer-fingerprint comparator parses every tap the instrument prints
+        run: |
+          python3 tests/scripts/test_q4exp_layerfp_diff.py
 """
 
 PASSING_PREFLIGHT = """CHECKERS=(
@@ -62,6 +65,7 @@ SUITES=(
   test_check_test_registration
   test_sglang_lease_identity
   test_ltx2_oracle_goldens
+  test_q4exp_layerfp_diff
 )
 for checker in "${CHECKERS[@]}"; do
   python3 "scripts/$checker.py"
@@ -369,6 +373,31 @@ class WiringMutationTests(unittest.TestCase):
             mutated,
             self.ci,
             "test_ltx2_oracle_goldens is missing from preflight SUITES",
+        )
+
+    # The THIRD pinned suite (#2877), on the pattern the two cases above set.
+    # Same reasoning: adding it to `PASSING_CI` and `PASSING_PREFLIGHT` alone is
+    # symmetric and additive, so the base checker stays green either way and the
+    # widening would carry no evidence. Deleting one lane's registration must
+    # name THIS suite. Not `test_M*`, for the manifest-digest reason above.
+    def test_pinned_layerfp_diff_suite_absent_from_ci_is_named(self) -> None:
+        mutated = self.ci.replace(
+            "          python3 tests/scripts/test_q4exp_layerfp_diff.py\n", ""
+        )
+        self.assertNotEqual(mutated, self.ci)
+        self.assert_wiring_error(
+            self.preflight,
+            mutated,
+            "test_q4exp_layerfp_diff is missing from the CI suite lane",
+        )
+
+    def test_pinned_layerfp_diff_suite_absent_from_preflight_is_named(self) -> None:
+        mutated = self.preflight.replace("  test_q4exp_layerfp_diff\n", "")
+        self.assertNotEqual(mutated, self.preflight)
+        self.assert_wiring_error(
+            mutated,
+            self.ci,
+            "test_q4exp_layerfp_diff is missing from preflight SUITES",
         )
 
     def test_M18_ci_commands_behind_false_shell_branch_fail(self) -> None:

@@ -90,6 +90,15 @@ REQUIRED_SUITE_REGISTRATIONS = {
     # suite at a time. It is NOT the symmetric population rule, which still
     # belongs to #408 and #1509.
     "test_ltx2_oracle_goldens": "tests/scripts/test_ltx2_oracle_goldens.py",
+    # #2877, added in the change that first gave the suite a lane at all. It had
+    # landed in NEITHER lane, and the tool it gates had never been run on a real
+    # fingerprint: `taps=N END` is a cumulative counter and the comparator read
+    # it per-step, so it refused every genuine multi-step capture while eleven
+    # single-step cases -- the only shape its fixtures could express -- passed.
+    # Pinning it here is the same one-suite-at-a-time widening #2553 made, and
+    # the two named cases in the mutation suite are what make it a semantic
+    # change rather than a fixture edit.
+    "test_q4exp_layerfp_diff": "tests/scripts/test_q4exp_layerfp_diff.py",
 }
 
 def _without_line_comments(text: str) -> str:

@@ -25,6 +25,10 @@
 // dense_attn`, so it has none of the ADL collision that made `qwen3_5.cpp`
 // reach the scheme through a translation-unit boundary (`dense_exl3_linear.h`).
 #include "vllm/model_executor/layers/quantization/exl3.h"  // MakeLinearMethod / MakeMlpGateUpMethod
+// MODEL-DFLASH2-NVFP4 (#2758): the NVFP4 W4A16 arms of the SAME two seams. The
+// three overloads live in one namespace and are picked apart by the packed
+// weight's type, so a draft binds exactly one method per projection.
+#include "vllm/model_executor/layers/quantization/compressed_tensors/schemes/nvfp4.h"
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // #1628: the shared NVFP4 W4A16 logits GEMM
 #include "vllm/model_executor/models/dense_exl3_linear.h"  // #2495 item 6: the ONE EXL3 linear seam
@@ -245,6 +249,36 @@ struct ContextKVDev {
   int64_t num_ctx = 0;
 };
 
+// MODEL-DFLASH2-NVFP4 (#2758): the THREE-ARM method choice, in ONE place.
+//
+// `layers::MakeLinearMethod` has an overload per quantization and each answers
+// "unquantized" when its own packed weight is empty, so calling two of them in
+// sequence is how a third arm is added without either overload learning about
+// the other. The order is `exl3 -> nvfp4 -> bf16`, which is the order the
+// loader's rungs run in and the order `LoadDflashSharedLmHead` already uses for
+// the shared head.
+//
+// WHY A FUNCTION AND NOT A BRANCH REPEATED NINE TIMES: #2202 records what the
+// three-copies-of-one-choice shape cost this file already -- the merged qkv
+// seam landed in the cold body and the two hot ones kept re-reading the
+// activation for a year. A third arm copied into all three bodies is the same
+// defect waiting.
+std::unique_ptr<layers::LinearMethodBase> DflashLinear(const OwnedTensor& bf16,
+                                                       const Exl3Weight& exl3,
+                                                       const Nvfp4Weight& fp4) {
+  if (!exl3.Empty()) return layers::MakeLinearMethod(bf16, exl3);
+  return layers::MakeLinearMethod(bf16, fp4);
+}
+
+std::unique_ptr<layers::MlpGateUpMethodBase> DflashMlpGateUp(
+    const OwnedTensor& bf16_gate_up, const Exl3Weight& gate_exl3,
+    const Exl3Weight& up_exl3, const Nvfp4Weight& gate_fp4,
+    const Nvfp4Weight& up_fp4, int64_t intermediate) {
+  if (!gate_exl3.Empty())
+    return layers::MakeMlpGateUpMethod(bf16_gate_up, gate_exl3, up_exl3, intermediate);
+  return layers::MakeMlpGateUpMethod(bf16_gate_up, gate_fp4, up_fp4, intermediate);
+}
+
 // MODEL-DFLASH2-EXL3 (#2495 item 7): the draft's q/k/v projections, for all
 // three inline layer bodies.
 //
@@ -272,12 +306,19 @@ void ProjectDflashQkv(Dev d, const Qwen3DFlashWeights& weights,
                       const Qwen3DFlashLayerWeights& layer, const Tensor& x,
                       int64_t qdim, int64_t kdim, DBuf* q, DBuf* k, DBuf* v) {
   const int64_t T = x.shape[0];
-  if (weights.IsExl3()) {
-    *q = layers::MakeLinearMethod(layer.qkv_proj, layer.q_proj_exl3)
+  // MODEL-DFLASH2-NVFP4 (#2758) joins this arm rather than adding a second one:
+  // an NVFP4 draft has no merged `qkv_proj` operand either. NVFP4 CAN row-stack
+  // -- `dense_loaders::LoadMergedCtNvfp4W4A16` does it where the producer emits
+  // a merged operand -- but this producer emitted q, k and v as three modules
+  // with three independently fitted `weight_scale_2` scalars, and the target's
+  // own ModelOpt path in this tree reads q/k/v/o unmerged for the same reason.
+  // So `MergedQkvEnabled()` is not asked on either packed arm.
+  if (weights.IsExl3() || weights.IsNvfp4()) {
+    *q = DflashLinear(layer.qkv_proj, layer.q_proj_exl3, layer.q_proj_fp4)
              ->Apply(d, x, DType::kBF16);
-    *k = layers::MakeLinearMethod(layer.qkv_proj, layer.k_proj_exl3)
+    *k = DflashLinear(layer.qkv_proj, layer.k_proj_exl3, layer.k_proj_fp4)
              ->Apply(d, x, DType::kBF16);
-    *v = layers::MakeLinearMethod(layer.qkv_proj, layer.v_proj_exl3)
+    *v = DflashLinear(layer.qkv_proj, layer.v_proj_exl3, layer.v_proj_fp4)
              ->Apply(d, x, DType::kBF16);
     return;
   }
@@ -328,12 +369,13 @@ ContextKVDev PrecomputeContextKVDeviceBf16(Dev d, const Tensor& ctxb_bf16,
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     DBuf k, v;
-    if (weights.IsExl3()) {
-      // MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 draft has no merged qkv
-      // owner to slice, so k and v are their own trellises and their own GEMMs.
-      k = layers::MakeLinearMethod(layer.qkv_proj, layer.k_proj_exl3)
+    if (weights.IsExl3() || weights.IsNvfp4()) {
+      // MODEL-DFLASH2-EXL3 (#2495 item 7) and MODEL-DFLASH2-NVFP4 (#2758):
+      // neither packed draft has a merged qkv owner to slice, so k and v are
+      // their own packed weights and their own GEMMs.
+      k = DflashLinear(layer.qkv_proj, layer.k_proj_exl3, layer.k_proj_fp4)
               ->Apply(d, normed.t(), DType::kBF16);
-      v = layers::MakeLinearMethod(layer.qkv_proj, layer.v_proj_exl3)
+      v = DflashLinear(layer.qkv_proj, layer.v_proj_exl3, layer.v_proj_fp4)
               ->Apply(d, normed.t(), DType::kBF16);
     } else {
       Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
@@ -626,7 +668,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       // MODEL-DFLASH2-EXL3 (#2495 item 7): ONE call site, both arms. On a bf16
       // draft `MakeLinearMethod` binds `UnquantizedLinearMethod`, whose `Apply`
       // IS the ResidentWeight + DBuf + MatmulBT triple this replaces.
-      return layers::MakeLinearMethod(layer.o_proj, layer.o_proj_exl3)
+      return DflashLinear(layer.o_proj, layer.o_proj_exl3, layer.o_proj_fp4)
           ->Apply(d, o_in, DType::kBF16);
     }();
 
@@ -655,10 +697,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     // MODEL-DFLASH2-EXL3 (#2495 item 7): the SAME seam, now selected by the
     // factory rather than hard-bound. On a bf16 draft it binds the identical
     // `UnquantizedMlpGateUpMethod` and nothing about the ops moves.
-    DBuf act = layers::MakeMlpGateUpMethod(layer.gate_up_proj, layer.gate_proj_exl3,
-                                           layer.up_proj_exl3, I)
+    DBuf act = DflashMlpGateUp(layer.gate_up_proj, layer.gate_proj_exl3,
+                                    layer.up_proj_exl3, layer.gate_proj_fp4,
+                                    layer.up_proj_fp4, I)
                    ->Apply(d, dh2.t());
-    DBuf down = layers::MakeLinearMethod(layer.down_proj, layer.down_proj_exl3)
+    DBuf down = DflashLinear(layer.down_proj, layer.down_proj_exl3, layer.down_proj_fp4)
                     ->Apply(d, act.t(), DType::kBF16);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
@@ -986,7 +1029,7 @@ static std::vector<float> ForwardWithCtxKVDev(
     // That is the more honest attribution and it is recorded rather than
     // silent, because a phase table nobody warned is a phase table somebody
     // will read as a regression.
-    DBuf attn = layers::MakeLinearMethod(layer.o_proj, layer.o_proj_exl3)
+    DBuf attn = DflashLinear(layer.o_proj, layer.o_proj_exl3, layer.o_proj_fp4)
                     ->Apply(d, a.t(), DType::kBF16);
     ops.Lap(ops.o_proj);
 
@@ -1011,10 +1054,11 @@ static std::vector<float> ForwardWithCtxKVDev(
     // hand-roll. Its closing sentence said the point was that "a quantized
     // gate-up arm can now reach these bodies at all"; MODEL-DFLASH2-EXL3
     // (#2495 item 7) is the arm that does, and the factory is what selects it.
-    DBuf act = layers::MakeMlpGateUpMethod(layer.gate_up_proj, layer.gate_proj_exl3,
-                                           layer.up_proj_exl3, I)
+    DBuf act = DflashMlpGateUp(layer.gate_up_proj, layer.gate_proj_exl3,
+                                    layer.up_proj_exl3, layer.gate_proj_fp4,
+                                    layer.up_proj_fp4, I)
                    ->Apply(d, dh2.t());
-    DBuf down = layers::MakeLinearMethod(layer.down_proj, layer.down_proj_exl3)
+    DBuf down = DflashLinear(layer.down_proj, layer.down_proj_exl3, layer.down_proj_fp4)
                     ->Apply(d, act.t(), DType::kBF16);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
@@ -1697,7 +1741,7 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
                                     store.seq_lens->t(), store.block_table->t(), pa);
     }
     Tensor a = Reshape(a3.t(), {Tq, Hq * Dh});
-    DBuf attn = layers::MakeLinearMethod(layer.o_proj, layer.o_proj_exl3)
+    DBuf attn = DflashLinear(layer.o_proj, layer.o_proj_exl3, layer.o_proj_fp4)
                     ->Apply(d, a, DType::kBF16);
 
     // SPEC-DFLASH2 W2: attention_conv.finish.
@@ -1719,10 +1763,11 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
     // hand-roll. Its closing sentence said the point was that "a quantized
     // gate-up arm can now reach these bodies at all"; MODEL-DFLASH2-EXL3
     // (#2495 item 7) is the arm that does, and the factory is what selects it.
-    DBuf act = layers::MakeMlpGateUpMethod(layer.gate_up_proj, layer.gate_proj_exl3,
-                                           layer.up_proj_exl3, I)
+    DBuf act = DflashMlpGateUp(layer.gate_up_proj, layer.gate_proj_exl3,
+                                    layer.up_proj_exl3, layer.gate_proj_fp4,
+                                    layer.up_proj_fp4, I)
                    ->Apply(d, dh2.t());
-    DBuf down = layers::MakeLinearMethod(layer.down_proj, layer.down_proj_exl3)
+    DBuf down = DflashLinear(layer.down_proj, layer.down_proj_exl3, layer.down_proj_fp4)
                     ->Apply(d, act.t(), DType::kBF16);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
@@ -1792,9 +1837,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // Not wrong, just wasteful, which is exactly the kind of defect that
     // survives a token gate. Asking here makes the switch select this driver's
     // existing single-forward eager path, which is what it means everywhere else.
+    // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
     const bool graph_ok =
         UseDflashGraph() && vt::GraphCaptureEnabled() && d.b.SupportsGraphCapture() &&
-        platforms::GetPlatform(queue.device.type).support_static_graph_mode();
+        platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+        !platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in();
 
     // --- Eager paged path (VT_DFLASH_GRAPH=0, VLLM_CPP_CUDAGRAPH=0, or capture
     //     unsupported) --------------------------------------------------------

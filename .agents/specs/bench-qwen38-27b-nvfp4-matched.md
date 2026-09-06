@@ -230,7 +230,7 @@ hash is the check that the reassembly is the file.
 |---|---|
 | B | sha256 of every shard, recomputed **on the device** against those four |
 | E | does `RadixArk` load and decode coherently? The device answer nothing in this tree has ever taken for a Qwen3.8-27B NVFP4 artifact |
-| F | the verbatim failure of the NVFP4 DFlash2 drafter |
+| F | **does the NVFP4 DFlash2 drafter load and draft?** It has an arm as of [#2758](https://github.com/mudler/vllm.cpp/issues/2758); nothing has run it |
 | I | **the saturation question**, on the EXL3 pair alone, so a target that refuses does not cost it |
 | G | target-only decode, NVFP4 and EXL3, **interleaved on one binary and one boot** |
 | H | NVFP4 target with the EXL3 DFlash2 drafter at budgets 7, 12 and 16 |
@@ -255,6 +255,40 @@ ceiling is in our propose-and-verify loop rather than in the checkpoint, and tha
 is a defect in this engine that no amount of quantization matching would have
 found. The two outcomes are more than 2x apart, so one sample per rung separates
 them.
+
+## 5b. Leg F, now that the drafter has an arm
+
+Until [#2758](https://github.com/mudler/vllm.cpp/issues/2758) leg F could only
+record a refusal. The loader-side arm landed with row `MODEL-DFLASH2-NVFP4`
+([spec](model-dflash2-nvfp4.md)) and is gated hermetically at 14/14 cases and
+317/317 assertions through the production pair `MakeQwen3DFlashDraftConfig` +
+`LoadQwen3DFlash`. What no gate in this tree can reach is the FORWARD: the
+branch that binds `Nvfp4W4A16LinearMethod` needs `vt::MatmulNvfp4`, which is
+registered for CUDA only. Leg F is therefore the first execution of that branch
+anywhere, and it is the one leg on this job whose result cannot be predicted
+from a host run.
+
+Written so the lease is one submission:
+
+| step | command shape | pass condition |
+|---|---|---|
+| F1 | `vllm-cli` on `RadixArk` + `--speculative-config '{"method":"dflash","model":<maurienne-ai dir>,"num_speculative_tokens":7}'`, `VT_DFLASH_PAGED=0` | `rc=0` and a coherent continuation. A wrong `weight_scale_2` on this format yields a correctly distributed and entirely wrong weight, so coherent factual text IS the evidence |
+| F2 | the same, `--output-token-ids`, against the SAME target with the drafter DISABLED | **token-identical.** The DFlash verify is lossless, so a correct draft cannot change the emitted tokens at any acceptance rate. A divergence here is a verify defect and not a drafter-quality result, and it stops the leg |
+| F3 | the same pair at budgets 7, 12 and 16, accepted-tokens-per-pass recorded | a NUMBER, compared to pangoleen's 6.8-8.1 at budget 16 on this exact drafter architecture. This is the axis the whole comparison turns on, and it is the first time it can be taken on a drafter whose quantization matches theirs |
+| F4 | the load's own stderr, captured verbatim | the W4A4-declared / W4A16-executed notice fires, naming 35 modules. If it does not, the arm was not taken and F1-F3 measured the bf16 path |
+
+**F2 IS THE GATE and F3 is the measurement.** Recording F3 without F2 would
+publish an acceptance number off an unverified drafter, which is the shape
+`AGENTS.md` §Gates refuses.
+
+**Three things leg F does NOT settle.** The drafter declares `quant_algo:
+"NVFP4"` (W4A4) and this build runs it W4A16, so F3's acceptance is the
+weight-only arm's; the matched-arm acceptance is behind #2760 ask 2. Its
+`kv_cache_quant_algo: "FP8"` is a checked non-divergence at default settings
+(`BaseKVCacheMethod` gates on `kv_cache_dtype`, `kv_cache.py:95-140`; the file
+ships zero `k_scale`/`v_scale`), not something leg F verifies. And EOS with a
+chat template is still [#2759](https://github.com/mudler/vllm.cpp/issues/2759),
+so their protocol is still not matched.
 
 ## 6. Gates
 
@@ -281,10 +315,12 @@ them.
 
 ## Now
 
-`SPIKE`. Sections 2, 3 and 4 are established. The device job is queued on
-`dgx:gpu0` at position 10 behind a 10-hour job, so no measurement exists.
-Next action: read `/workspace/nvfp4-sota/out1/results.txt` when the job lands,
-starting with leg E.
+`SPIKE`. Sections 2, 3 and 4 are established, and leg F now has something to
+run: the drafter's ModelOpt NVFP4 arm landed with `MODEL-DFLASH2-NVFP4`
+([#2758](https://github.com/mudler/vllm.cpp/issues/2758)), so leg F changes from
+recording a refusal to F1-F4 in section 5b. No measurement exists. Next action:
+read `/workspace/nvfp4-sota/out1/results.txt` when the job lands, starting with
+leg E, and re-cut the job's source tarball so leg F carries the arm.
 
 ## Owed
 
@@ -292,9 +328,13 @@ starting with leg E.
   than taken from pangoleen's bandwidth figure.
 - A harness that can honour EOS and apply a chat template, without which their
   protocol cannot be matched: [#2759](https://github.com/mudler/vllm.cpp/issues/2759).
-- A ModelOpt NVFP4 arm for the DFlash2 draft weights, without which the drafter
-  half of the comparison cannot be matched at all:
-  [#2758](https://github.com/mudler/vllm.cpp/issues/2758).
-- The declared-W4A4-runs-as-W4A16 divergence on this target, which no output
-  names: [#2760](https://github.com/mudler/vllm.cpp/issues/2760).
+- ~~A ModelOpt NVFP4 arm for the DFlash2 draft weights~~ **PAID on the loader
+  side** by [#2758](https://github.com/mudler/vllm.cpp/issues/2758) / row
+  `MODEL-DFLASH2-NVFP4`. What is still owed is its EXECUTION: no device has run
+  the packed draft forward, and leg F above is the leg that would.
+- The declared-W4A4-runs-as-W4A16 divergence on this target. The load now NAMES
+  it, on the target since `8cd2e1632` and on the drafter since #2758; running
+  what the producer declared is [#2760](https://github.com/mudler/vllm.cpp/issues/2760)
+  asks 2 and 3, whose runnable plan is in
+  [`qwen38-27b-quant-arms.md`](qwen38-27b-quant-arms.md).
 - The `## Outcome` section this spec owes at `DONE`.

@@ -114,8 +114,10 @@ ForwardLogits ForwardQwen3MoeForCausalLM(LoadedModel& model,
   // gdn_state_slots carries max_num_reqs for EVERY arch (runner.cpp:374 sets it
   // from max_num_reqs_ regardless of whether the model has GDN layers), so a
   // pure full-attention model reads its capture-size cap from it unchanged.
+  // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
   if (input.pure_decode &&
-      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode() &&
+      !platforms::GetPlatform(input.queue.device.type).static_graph_requires_opt_in()) {
     if (!qwen.decode_graph()) {
       qwen.decode_graph() = std::make_unique<Qwen3MoeDecodeGraph>(
           weights, input.config, input.queue, input.gdn_state_slots);

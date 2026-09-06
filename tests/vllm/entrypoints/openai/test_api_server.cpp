@@ -17,8 +17,10 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <cmath>
 #include <mutex>
 #include <cstdint>
@@ -60,6 +62,7 @@
 
 #include "vllm/config/device.h"
 #include "vllm/config/scheduler.h"
+#include "vllm/config/speculative.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
@@ -85,6 +88,8 @@
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/metrics/loggers.h"
+#include "vllm/v1/spec_decode/metrics.h"
+#include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -555,6 +560,184 @@ int AcceptedSocketTcpNoDelay(int server_port, int client_port) {
   return result;
 }
 #endif  // defined(__linux__)
+
+// ─── SPEC-DECODE /metrics (SERVE-METRICS, #2770) ─────────────────────────────
+// A serving stack whose engine actually SPECULATES, so the exposition the
+// server hands a scraper can be compared against what the drafter really did.
+//
+// The runner is a stub rather than the GPUModelRunner the other harness uses:
+// drafting needs an MTP head, the synthetic checkpoint above has none, and a
+// harness that cannot draft would make the acceptance counter read zero for a
+// reason that has nothing to do with the wiring under test.
+
+// Deterministic drafting model double. Request output position `p` is Tok(p);
+// the drafter proposes the true token except at every third position, so
+// acceptance is partial and num_accepted_tokens != num_draft_tokens. Every id
+// stays inside the fixture vocab (0..21) so the detokenizer can decode it.
+class DraftingRunnerStub : public vllm::v1::ModelRunnerBase {
+ public:
+  explicit DraftingRunnerStub(int k) : k_(k) {}
+
+  static int32_t Tok(int p) { return static_cast<int32_t>((p * 7 + 3) % 10); }
+  int32_t Draft(int p) const { return (p % 3 == 2) ? Tok(p) + 1 : Tok(p); }
+
+  std::optional<vllm::v1::ModelRunnerOutput> execute_model(
+      const vllm::v1::SchedulerOutput& scheduler_output) override {
+    stashed_ = scheduler_output;
+    return std::nullopt;
+  }
+
+  vllm::v1::ModelRunnerOutput sample_tokens(
+      const std::optional<vllm::v1::GrammarOutput>&) override {
+    vllm::v1::ModelRunnerOutput mro;
+    int idx = 0;
+    vllm::v1::DraftTokenIds fresh;
+    for (const auto& [req_id, n] : stashed_.num_scheduled_tokens) {
+      (void)n;
+      mro.req_ids.push_back(req_id);
+      mro.req_id_to_index[req_id] = idx++;
+      int& pos = out_pos_[req_id];
+
+      std::vector<int32_t> drafts;
+      const auto it = stashed_.scheduled_spec_decode_tokens.find(req_id);
+      if (it != stashed_.scheduled_spec_decode_tokens.end()) drafts = it->second;
+
+      std::vector<int32_t> emitted;
+      if (drafts.empty()) {
+        emitted.push_back(Tok(pos));
+      } else {
+        int accepted = 0;
+        for (std::size_t j = 0; j < drafts.size(); ++j) {
+          if (drafts[j] != Tok(pos + static_cast<int>(j))) break;
+          ++accepted;
+        }
+        // What the ENGINE should end up reporting, counted at the only place
+        // that knows the truth. The scrape is compared against these.
+        drafts_verified.fetch_add(1);
+        draft_tokens_verified.fetch_add(static_cast<int64_t>(drafts.size()));
+        draft_tokens_accepted.fetch_add(accepted);
+        for (int d = 0; d < accepted && d < kMaxTrackedDepth; ++d) {
+          accepted_per_pos[static_cast<std::size_t>(d)].fetch_add(1);
+        }
+        for (int i = 0; i <= accepted; ++i) emitted.push_back(Tok(pos + i));
+      }
+      pos += static_cast<int>(emitted.size());
+      mro.sampled_token_ids.push_back(std::move(emitted));
+
+      std::vector<int32_t> next;
+      next.reserve(static_cast<std::size_t>(k_));
+      for (int i = 0; i < k_; ++i) next.push_back(Draft(pos + i));
+      fresh.req_ids.push_back(req_id);
+      fresh.draft_token_ids.push_back(std::move(next));
+    }
+    pending_ = std::move(fresh);
+    return mro;
+  }
+
+  std::optional<vllm::v1::DraftTokenIds> take_draft_token_ids() override {
+    std::optional<vllm::v1::DraftTokenIds> out = std::move(pending_);
+    pending_.reset();
+    return out;
+  }
+
+  // Written on the ENGINE thread and read by the TEST thread while the engine
+  // is still alive, so atomic rather than plain: the sanitizer build runs this
+  // suite and a plain int64_t here would be a genuine data race, not a
+  // pedantic one.
+  static constexpr int kMaxTrackedDepth = 8;
+  std::atomic<int64_t> drafts_verified{0};
+  std::atomic<int64_t> draft_tokens_verified{0};
+  std::atomic<int64_t> draft_tokens_accepted{0};
+  std::array<std::atomic<int64_t>, kMaxTrackedDepth> accepted_per_pos{};
+
+ private:
+  const int k_;
+  vllm::v1::SchedulerOutput stashed_;
+  std::map<std::string, int> out_pos_;
+  std::optional<vllm::v1::DraftTokenIds> pending_;
+};
+
+// The same serving stack as ServerHarness, over a speculative scheduler and the
+// drafting stub, with the ONE PrometheusStatLogger constructed the way
+// server_main.cpp constructs it: k from the resolved speculative config.
+struct SpecServerHarness {
+  explicit SpecServerHarness(const HfConfig& c, const Tokenizer& tok, int k)
+        // server_main.cpp:1340-1342 declares the logger BEFORE the engine, so
+        // reverse destruction order joins AsyncLLM before the non-owning
+        // pointer it holds is released. Same order here, for the same reason.
+      : logger("test-model", kSpecMaxModelLen, /*engine_index=*/0, k),
+        scheduler(MakeSpecSchedulerConfig(), MakeSpecKvConfig(), kSpecBlockSize,
+                  /*enable_caching=*/true,
+                  /*structured_output_manager=*/nullptr,
+                  vllm::SpeculativeConfig::ResolveMtp(
+                      /*mtp_num_hidden_layers=*/1, k)),
+        runner(k),
+        executor(runner),
+        input_processor(tok, c),
+        output_processor(&tok),
+        async_engine(input_processor, scheduler, executor, output_processor,
+                     get_request_block_hasher(kSpecBlockSize, sha256_cbor),
+                     /*shutdown_timeout_s=*/0, /*max_concurrent_batches=*/1,
+                     /*structured_output_manager=*/nullptr,
+                     /*check_for_draft_tokens=*/true),
+        models("test-model"),
+        completion(async_engine, "test-model", false),
+        chat(async_engine, "test-model", InVocabChatPrompt, "hermes",
+             /*reasoning_parser_name=*/std::string(), false),
+        server(completion, chat, models, "9.9.9",
+               ApiServer::kDefaultMaxConcurrentStreams) {
+    async_engine.set_stat_logger(&logger);
+    server.set_metrics_logger(&logger);
+  }
+
+  static constexpr int kSpecBlockSize = 16;
+  static constexpr int kSpecMaxModelLen = 512;
+
+  static SchedulerConfig MakeSpecSchedulerConfig() {
+    SchedulerConfig cfg;
+    cfg.max_num_seqs = 8;
+    cfg.max_num_batched_tokens = 2048;
+    cfg.enable_chunked_prefill = true;
+    cfg.max_model_len = kSpecMaxModelLen;
+    cfg.watermark = 0.0;
+    return cfg;
+  }
+  static KVCacheConfig MakeSpecKvConfig() {
+    KVCacheConfig kv;
+    kv.num_blocks = 512;
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"layer"},
+        std::make_shared<FullAttentionSpec>(kSpecBlockSize, /*num_kv_heads=*/1,
+                                            /*head_size=*/1, DType::kF32));
+    return kv;
+  }
+
+  // The ONE logger, constructed the way server_main.cpp constructs it:
+  // served_model_name, max_model_len, engine 0, and the RESOLVED
+  // num_speculative_tokens. Declared first so it outlives the engine.
+  vllm::v1::metrics::PrometheusStatLogger logger;
+  Scheduler scheduler;
+  DraftingRunnerStub runner;
+  Executor executor;
+  InputProcessor input_processor;
+  OutputProcessor output_processor;
+  AsyncLLM async_engine;
+  OpenAIServingModels models;
+  OpenAIServingCompletion completion;
+  OpenAIServingChat chat;
+  ApiServer server;
+};
+
+// The value of `name{...}` as it appears in a prometheus text exposition, or
+// -1 when the series is absent. A counter renders as `<name>_total`.
+double ScrapeSeries(const std::string& body, const std::string& series) {
+  const std::size_t at = body.find("\n" + series);
+  if (at == std::string::npos) return -1.0;
+  const std::size_t start = at + 1 + series.size();
+  const std::size_t end = body.find('\n', start);
+  if (end == std::string::npos) return -1.0;
+  return std::stod(body.substr(start, end - start));
+}
 
 }  // namespace
 
@@ -1569,6 +1752,142 @@ TEST_CASE("api_server: /metrics exposition through the server handler") {
   CHECK(m.body.find("vllm:num_requests_running") != std::string::npos);
   CHECK(m.body.find("vllm:prompt_tokens_total") != std::string::npos);
   CHECK(m.body.find("vllm:time_to_first_token_seconds_bucket") !=
+        std::string::npos);
+}
+
+// ─── SERVE-METRICS residual: spec decode (#2770) ─────────────────────────────
+// THE REACHABILITY GATE. The production entry point is GET /metrics on the
+// shipped server; the value has to arrive there from a real engine step, not
+// from a hand-fed SchedulerStats. This case drives a completion through
+// ApiServer::handle_completions over a SPECULATING engine and then reads the
+// counters back through ApiServer::handle_metrics, comparing them against what
+// the drafter itself recorded.
+//
+// It reds if ANY of the three new production call sites is removed: the
+// make_spec_decoding_stats call in Scheduler::update_from_output, the
+// make_stats() republish, or the Record() fold in PrometheusStatLogger.
+TEST_CASE(
+    "api_server: /metrics exports the spec_decode families a speculating "
+    "engine actually produced") {
+  const HfConfig c = MakeConfig();
+  constexpr int kK = 3;
+  SpecServerHarness h(c, Fixture(), kK);
+
+  // Long enough to run many verify steps, so acceptance is non-trivial.
+  const std::string body =
+      R"({"model":"test-model","prompt":"hello","max_tokens":24,)"
+      R"("temperature":0.0})";
+  ApiServer::DispatchResult r = h.server.handle_completions(body);
+  REQUIRE(r.status == 200);
+  CHECK(json::parse(r.body).at("usage").at("completion_tokens") == 24);
+
+  // The engine really speculated. Without this the assertions below could all
+  // hold at zero, which is the "well-formed catalog that never moved" failure
+  // this row exists to end.
+  REQUIRE(h.runner.drafts_verified.load() > 0);
+  REQUIRE(h.runner.draft_tokens_accepted.load() > 0);
+  CHECK(h.runner.draft_tokens_accepted.load() <
+        h.runner.draft_tokens_verified.load());
+
+  const std::string kLabels = R"({model_name="test-model",engine="0"})";
+  // The last step's Record runs on the output-handler thread after the
+  // collector was woken, so the scrape can legitimately race the final fold.
+  // Poll to the drafter's own totals rather than sleeping a fixed interval.
+  std::string metrics;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  for (;;) {
+    ApiServer::DispatchResult m = h.server.handle_metrics();
+    REQUIRE(m.status == 200);
+    metrics = m.body;
+    if (ScrapeSeries(metrics,
+                     "vllm:spec_decode_num_drafts_total" + kLabels) ==
+            static_cast<double>(h.runner.drafts_verified.load()) &&
+        ScrapeSeries(metrics,
+                     "vllm:spec_decode_num_draft_tokens_total" + kLabels) ==
+            static_cast<double>(h.runner.draft_tokens_verified.load()) &&
+        ScrapeSeries(metrics,
+                     "vllm:spec_decode_num_accepted_tokens_total" + kLabels) ==
+            static_cast<double>(h.runner.draft_tokens_accepted.load())) {
+      break;
+    }
+    if (std::chrono::steady_clock::now() > deadline) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  // The four family names, in the spelling a scraper sees.
+  CHECK(metrics.find("# TYPE vllm:spec_decode_num_drafts counter") !=
+        std::string::npos);
+  CHECK(metrics.find("# TYPE vllm:spec_decode_num_draft_tokens counter") !=
+        std::string::npos);
+  CHECK(metrics.find("# TYPE vllm:spec_decode_num_accepted_tokens counter") !=
+        std::string::npos);
+  CHECK(metrics.find(
+            "# TYPE vllm:spec_decode_num_accepted_tokens_per_pos counter") !=
+        std::string::npos);
+  CHECK(metrics.find("# HELP vllm:spec_decode_num_accepted_tokens Number of "
+                     "accepted tokens.") != std::string::npos);
+
+  // The VALUES. Equality, not `> 0`: a fold that dropped the per-request
+  // aggregation or double-counted a step still passes a positivity check.
+  CHECK(ScrapeSeries(metrics, "vllm:spec_decode_num_drafts_total" + kLabels) ==
+        static_cast<double>(h.runner.drafts_verified.load()));
+  CHECK(ScrapeSeries(metrics,
+                     "vllm:spec_decode_num_draft_tokens_total" + kLabels) ==
+        static_cast<double>(h.runner.draft_tokens_verified.load()));
+  CHECK(ScrapeSeries(metrics,
+                     "vllm:spec_decode_num_accepted_tokens_total" + kLabels) ==
+        static_cast<double>(h.runner.draft_tokens_accepted.load()));
+
+  // Per-position: k series, labelled 0..k-1, each carrying that depth's
+  // acceptance count. This is the vector an acceptance-driven depth policy
+  // reads, and the aggregate cannot substitute for it.
+  for (int pos = 0; pos < kK; ++pos) {
+    const std::string series =
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"test-"
+        "model\",engine=\"0\",position=\"" + std::to_string(pos) + "\"}";
+    CHECK(ScrapeSeries(metrics, series) ==
+          static_cast<double>(
+              h.runner.accepted_per_pos[static_cast<std::size_t>(pos)].load()));
+  }
+  // ...and no series for a depth the config never allowed.
+  CHECK(metrics.find("position=\"" + std::to_string(kK) + "\"") ==
+        std::string::npos);
+
+  // Acceptance is derivable from the scrape alone, which is the whole point:
+  // rate(accepted) / rate(draft_tokens) is vLLM's documented PromQL
+  // (spec_decode/metrics.py:180-184).
+  const double accepted =
+      ScrapeSeries(metrics, "vllm:spec_decode_num_accepted_tokens_total" + kLabels);
+  const double drafted =
+      ScrapeSeries(metrics, "vllm:spec_decode_num_draft_tokens_total" + kLabels);
+  REQUIRE(drafted > 0.0);
+  CHECK(accepted / drafted > 0.0);
+  CHECK(accepted / drafted < 1.0);
+}
+
+// The upstream GATE, mirrored: with no speculative config the families are not
+// registered at all (spec_decode/metrics.py:211-213), so /metrics is silent
+// about speculation rather than reporting four counters frozen at zero. A
+// dashboard can then tell "this engine does not speculate" from "this engine
+// speculates and accepts nothing", which are opposite findings.
+TEST_CASE("api_server: /metrics omits the spec_decode families with no "
+          "speculative config") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  // Constructed exactly as server_main.cpp constructs it for a non-speculative
+  // engine: the default num_speculative_tokens of 0.
+  vllm::v1::metrics::PrometheusStatLogger logger("test-model", kMaxModelLen);
+  h.server.set_metrics_logger(&logger);
+
+  ApiServer::DispatchResult m = h.server.handle_metrics();
+  REQUIRE(m.status == 200);
+  CHECK(m.body.find("vllm:num_requests_running") != std::string::npos);
+  CHECK(m.body.find("vllm:spec_decode_num_drafts") == std::string::npos);
+  CHECK(m.body.find("vllm:spec_decode_num_draft_tokens") == std::string::npos);
+  CHECK(m.body.find("vllm:spec_decode_num_accepted_tokens") ==
+        std::string::npos);
+  CHECK(m.body.find("vllm:spec_decode_num_accepted_tokens_per_pos") ==
         std::string::npos);
 }
 

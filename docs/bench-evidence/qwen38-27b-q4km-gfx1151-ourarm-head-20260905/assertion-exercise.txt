@@ -1,0 +1,38 @@
+THE ASSERTION CHAIN, EXECUTED
+#2944, 2026-09-05, on the real staged bundle, before the lease ran.
+
+#2933 exists because survey.sh PRINTED our revision where it ASSERTED
+llama.cpp's manifest. An assertion nobody has run is the same shape of claim as
+a printf nobody reads, so this exercises job.sh's PHASE 2 block verbatim against
+the actual staged /workspace/strix-arm-2933/repo.bundle.
+
+Declared constants under test:
+  revision  c796fea41f74fe90b8cf78190eeb2a5b4c977449
+  tree      018178f3bf1fca3983d9bc0cfd42f5ea4bf130b1
+  bundle    044dec44ebd8f153f25e13bfbeffd45ca7ba33d6342bdc99fdc63e348b6ca2b8
+
+CASE                                                       EXIT
+1 declared constants                                       0  (want 0)
+2 pre-#2511 revision declared                              24 (want 24)
+3 wrong declared tree                                      24 (want 24)
+4 bundle bytes wrong                                       22 (want 22)
+5 modified worktree                                        24 (want 24)
+
+Case 1 prints:
+  REVISION_ASSERTION=OK  TREE_ASSERTION=OK  CLEAN=OK  SOURCE_CARRIES_FIX=OK
+
+Case 2 is the #2933 scenario driven backwards: declare the exact pre-fix
+revision the survey measured. The bundle carries only c796fea41, so the checkout
+cannot reach 11fed3ba5 and HEAD stays put -- and the revision assertion catches
+the mismatch rather than proceeding on a tree that is not what was declared:
+  FATAL: REVISION ASSERTION FAILED: got c796fea41..., want 11fed3ba5...
+That is the failure mode the survey could not detect, now detected.
+
+Case 5 matters because a clean LABEL over a dirty TREE is the same lie in a
+different place: the revision and tree hashes both still read correct, and only
+`git status --porcelain` catches it.
+
+NOT covered here, and covered only in the lease, because they need the build:
+the built-bytes links -- mtime after the emptied build directory, the
+`cannot take a recoverable page fault` literal in libvllm.so, and the refusal of
+vllm-cli sha256 a703b83d...d646f. Those exit 27, 28 and 29 respectively.

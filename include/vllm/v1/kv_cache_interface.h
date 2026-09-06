@@ -103,16 +103,11 @@ enum class KVCacheSpecKind {
   kUnknown,
 };
 
-// Upstream KVQuantMode (IntEnum). Carried on AttentionSpec for field fidelity;
-// only kNone participates in the ported page-size math (see header note).
-enum class KVQuantMode : uint8_t {
-  kNone = 0,
-  kFp8PerTensor = 1,
-  kInt8PerTokenHead = 2,
-  kFp8PerTokenHead = 3,
-  kInt4PerTokenHead = 4,
-  kNvfp4 = 5,
-};
+// KVQuantMode moved to `kv_cache_dtype.h` (included above) with
+// KV-NVFP4-TURBO W0 (#2620), which gave it the `get_kv_quant_mode` map it never
+// had here. One definition, in the header that resolves the CacheDType string.
+// Only kNone participates in the ported page-size math (see header note); the
+// nvfp4 page formula is owed, `.agents/specs/nvfp4-kv-cache.md` `## Owed`.
 
 // A base class for specifying the KV cache format of one layer.
 // (Upstream: @dataclass(frozen=True) KVCacheSpec.)

@@ -209,6 +209,28 @@ void LoadDenseLmHead(const TensorResolver& get,
 bool DenseLmHeadTakesNvfp4(const std::function<bool(const std::string&)>& has,
                            const std::string& proj);
 
+// MODEL-DFLASH2-NVFP4 (#2758). The per-projection NVFP4 probe and reader,
+// exported for the DFlash2 draft loader, which reads the SAME ModelOpt spelling
+// from a DIFFERENT checkpoint.
+//
+// `IsNvfp4Projection` answers `has(<proj>.weight_packed) ||
+// has(<proj>.weight_scale_2)`, which is the union of the two spellings a
+// producer emits: compressed-tensors writes `.weight_packed` plus a
+// `.weight_global_scale` DIVISOR, ModelOpt writes `.weight` plus a
+// `.weight_scale_2` SCALE. `LoadNvfp4AnyNaming` reads whichever of the two the
+// checkpoint ships and normalises both onto one `Nvfp4Weight`, including the
+// W4A16-unless-VT_MODELOPT_W4A4 activation decision.
+//
+// EXPORTED RATHER THAN RE-DERIVED, for the reason stated on
+// `DenseLmHeadTakesNvfp4` above: the draft and the target must not be able to
+// disagree about what an NVFP4 projection IS. `proj` omits the trailing
+// ".weight".
+bool IsNvfp4Projection(const std::function<bool(const std::string&)>& has,
+                       const std::string& proj);
+Nvfp4Weight LoadNvfp4AnyNaming(const TensorResolver& get,
+                               const std::function<bool(const std::string&)>& has,
+                               const std::string& proj);
+
 // True when the checkpoint ships an EXPLICIT head under either naming
 // (`<proj>.weight`, or `<proj>.weight_packed` for compressed-tensors NVFP4);
 // false means `tie_word_embeddings`.
@@ -218,6 +240,14 @@ bool DenseCheckpointHasLmHead(const std::function<bool(const std::string&)>& has
 // VT_LMHEAD_FP4 (default ON): the in-binary rollback for the packed head. `0`
 // restores the dequantize-at-load owner, so the A/B is same-binary.
 bool DenseLmHeadFp4Enabled();
+
+// VT_MODELOPT_W4A4 (default 0): consume a projection's on-disk activation
+// divisor, so `Nvfp4Weight::IsTrueW4A4()` flips and the weight routes to the
+// fp4-ACTIVATION GEMM instead of the weight-only one (docs/ENVIRONMENT.md).
+// ONE reader in the tree, exported by MODEL-DFLASH2-NVFP4 (#2758) so the DFlash
+// draft loader reports the arm this build actually takes rather than reading
+// the same environment variable a second time.
+bool ModelOptW4A4OptIn();
 
 Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj);
 

@@ -235,8 +235,12 @@ All eight ops have a CPU registration — verified individually:
 (`kConcatAndCacheMla`), `cpu_ops.cpp:3959` (`kConcatMlaNopeRope`),
 `cpu_dsa_indexer.cpp:183` and `:185` (`kDsaIndexerLogits`, `kDsaTopkSelect`),
 `cpu_ops.cpp:4017` (`kFusedNormRope`), `cpu_mla_prefill.cpp:277`
-(`kGatherMlaCache`), `cpu_mla_attn.cpp:222` (`kMlaDecodeAttention`). None is
-registered for ROCm.
+(`kGatherMlaCache`), `cpu_mla_attn.cpp:222` (`kMlaDecodeAttention`). None was
+registered for ROCm when this was written. Six of the eight are now:
+[#2715](https://github.com/mudler/vllm.cpp/issues/2715) W1 landed four and
+[#2926](https://github.com/mudler/vllm.cpp/issues/2926) landed
+`kMlaDecodeAttention` and `kMlaPrefillAttention`. The DSA indexer pair is
+still owed.
 
 So the forward reaches them, they install host kernels, and they run. Generation
 would be correct at host speed for that arm, and `docs/ROCM.md:60-61` forbids any

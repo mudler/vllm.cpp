@@ -22,7 +22,7 @@ no per-row change needs to touch this file at all.
 
 Token-exact (or ratified distributional) vs pinned vLLM; ≥ throughput and ≤
 latency/memory on every axis, both gate models, reproduced 2–3x idle. See
-[verification](verification.md). Pin: vLLM `e126687a9a` (0.28.1rc1.dev132) since
+[verification](verification.md). Pin: vLLM <!--pin:commit-->`e126687a9a`<!--/pin--> (<!--pin:label-->0.28.1rc1.dev132<!--/pin-->) since
 2026-09-03 (#2817). **A gate HAS now run at it and it PASSED** (2026-09-04, job
 `7386f034-246a-4af5-9a04-f98aafffce54`, `dgx:gpu0`, 2h15m): the OPT candidate
 captured at the target is byte-identical to the committed bar --

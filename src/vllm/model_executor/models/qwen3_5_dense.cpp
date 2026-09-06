@@ -176,8 +176,13 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
   // vLLM's CUDA-graph selection is independent of weight quantization. The
   // driver below already captures the shared dense forward, so restricting it
   // to the 27B FP4 checkpoint left ordinary BF16 Qwen3.5 decode eager.
+  // #2812/#1625 gate: the ARCH-SCOPED overload, so the evidence families
+  // (Qwen3.5-GDN included) capture ambient while every other family keeps
+  // the explicit opt-in — the same shape as the qwen3 driver's gate.
   const bool graph_cuda =
-      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode();
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode() &&
+      !platforms::GetPlatform(input.queue.device.type)
+           .static_graph_requires_opt_in(input.config.architectures);
   constexpr int kMaxDecodeGraphBatch = 64;
 
   // SPEC-DSPARK W8 (#442): mirror vLLM's UNIFORM-decode predicate instead of

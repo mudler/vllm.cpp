@@ -10,7 +10,7 @@
 #include <string>
 
 #include "vt/ops.h"
-
+#include "vt/sample_common.h"
 namespace vt::rocm {
 namespace {
 
@@ -29,18 +29,13 @@ unsigned GridFor(int64_t n) {
   return static_cast<unsigned>(blocks < 4096 ? blocks : 4096);
 }
 
-__device__ inline uint64_t SplitMix64(uint64_t x) {
-  x += 0x9E3779B97F4A7C15ULL;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-  return x ^ (x >> 31);
-}
-__device__ inline double ExpNoise(uint64_t seed, int64_t row, int64_t col) {
-  const uint64_t row_key = SplitMix64(seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row));
-  const uint64_t r = SplitMix64(row_key + static_cast<uint64_t>(col));
-  const double u = static_cast<double>((r >> 11) + 1ULL) * (1.0 / 9007199254740993.0);
-  return -log(u);
-}
+// The RNG and the argmax reduce come from vt/sample_common.h, which cpu_sample.cpp
+// and cuda_sample.cu also include -- so "bit-identical to the CPU reference" is a
+// property of the build rather than of two copies staying in step.
+using vt::sample::ArgReduce;
+using vt::sample::GumbelScore;
+using vt::sample::kArgSentinel;
+
 
 // --- temperature ------------------------------------------------------------
 __global__ void ApplyTemperatureK(float* logits, const float* temp, int64_t n, int64_t v,
@@ -92,7 +87,24 @@ __global__ void SoftmaxK(float* out, const float* logits, int64_t v, bool log_so
 }
 
 // --- random sample (gumbel-max / exp noise) ---------------------------------
-__global__ void RandomSampleK(int64_t* out, const float* probs, const int64_t* seeds, int64_t v) {
+// Upstream is `probs.div_(q).argmax(dim=-1)` (topk_topp_sampler.py::
+// sample_with_exponential_noise), i.e. fully parallel. Ours was `<<<n, 1>>>`
+// with `if (threadIdx.x != 0) return;` and a serial walk of the vocabulary --
+// ~225 ms/step on a 248k vocab (4.3 tok/s vs 119 tok/s greedy). It now uses a
+// block-cooperative argmax reduction with the Gumbel score substituted for the
+// logit, mirroring the CUDA fix from #1984 and the ROCm greedy ArgmaxK pattern.
+//
+// The output is BIT-IDENTICAL, not merely equivalent: every element's score is
+// `GumbelScore(probs[row][j], seed, row, j)` on both paths, evaluated by the
+// same device libm, so the reduction sees the same floats and differs only in
+// the order it combines them -- and ArgReduce is order-independent
+// (vt/sample_common.h).
+//
+// The serial kernel below is RETAINED, reachable as VT_FAST_RANDOM_SAMPLE=0,
+// mirroring the VT_FAST_ARGMAX lever the greedy rewrite kept. It is what makes
+// the equality gate a same-binary A/B.
+__global__ void RandomSampleKernelSlow(int64_t* out, const float* probs, const int64_t* seeds,
+                                       int64_t v) {
   const int64_t row = blockIdx.x;
   if (threadIdx.x != 0) return;
   const float* r = probs + row * v;
@@ -100,14 +112,49 @@ __global__ void RandomSampleK(int64_t* out, const float* probs, const int64_t* s
   int64_t best = 0;
   float best_v = kNegInf;
   for (int64_t j = 0; j < v; ++j) {
-    const float qn = static_cast<float>(ExpNoise(seed, row, j));
-    const float score = r[j] / qn;
+    const float score = GumbelScore(r[j], seed, row, j);
     if (score > best_v) {
       best_v = score;
       best = j;
     }
   }
   out[row] = best;
+}
+
+__global__ void RandomSampleK(int64_t* out, const float* probs, const int64_t* seeds, int64_t v) {
+  const int64_t row = blockIdx.x;
+  const float* r = probs + row * v;
+  const uint64_t seed = static_cast<uint64_t>(seeds[row]);
+
+  __shared__ float sh_score[kBlock];
+  __shared__ int64_t sh_idx[kBlock];
+
+  // Each thread scans its strided slice of the vocab.
+  float local_best_v = kNegInf;
+  int64_t local_best_j = kArgSentinel;
+  for (int64_t j = threadIdx.x; j < v; j += kBlock)
+    ArgReduce(local_best_v, local_best_j, GumbelScore(r[j], seed, row, j), j);
+
+  // Block-level argmax reduction with lowest-index tie-break.
+  sh_score[threadIdx.x] = local_best_v;
+  sh_idx[threadIdx.x] = local_best_j;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sh_score[threadIdx.x], sh_idx[threadIdx.x],
+                sh_score[threadIdx.x + s], sh_idx[threadIdx.x + s]);
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) out[row] = (sh_idx[0] == kArgSentinel) ? 0 : sh_idx[0];
+}
+
+bool FastRandomSampleEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FAST_RANDOM_SAMPLE");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
 }
 
 // --- top-k / top-p (sort-free threshold, from cuda_sample) ------------------
@@ -373,14 +420,20 @@ void ComputeLogprobsKernelRocm(Queue& q, Tensor& logprobs, const Tensor& logits)
       logprobs.Ptr<float>(), logits.Ptr<float>(), v, true);
   Check(hipGetLastError(), "compute_logprobs");
 }
-
 void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs,
                             const Tensor& seeds) {
   const int64_t n = probs.shape[0], v = probs.shape[1];
   if (n == 0 || v == 0) return;
-  RandomSampleK<<<static_cast<unsigned>(n), 1, 0, AsStream(q)>>>(
+  hipStream_t s = AsStream(q);
+  if (!FastRandomSampleEnabled()) {
+    RandomSampleKernelSlow<<<static_cast<unsigned>(n), 1, 0, s>>>(
+        token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
+    Check(hipGetLastError(), "random_sample launch (slow)");
+    return;
+  }
+  RandomSampleK<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
       token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
-  Check(hipGetLastError(), "random_sample");
+  Check(hipGetLastError(), "random_sample launch");
 }
 
 void ApplyPenaltiesKernelRocm(Queue& q, Tensor& logits, const Tensor& prompt_mask,

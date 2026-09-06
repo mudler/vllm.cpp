@@ -10,6 +10,7 @@
 | Metal vs MLX-LM | Paired A/B harness, interleaved runs, cold legs discarded |
 | Vulkan vs llama.cpp Vulkan | Same GGUF both arms: ours `-DVLLM_CPP_VULKAN=ON`, llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96`, SUPERSEDED, via `llama-bench`; clean legs only, one `flock $HOME/gpu.lock`. GEMV sweep: `benchmarks/vulkan_gemv_ab.cpp` |
 | Qwen3.8-27B EXL3 on GB10 | Step-by-step in [`qwen38-27b-exl3-gb10.md`](qwen38-27b-exl3-gb10.md#reproduce-this-run): both checkpoints pinned by revision and sha256, the 164-problem HumanEval set, and both arms on one binary. `VT_DFLASH_PAGED=0` is required ([#2274](https://github.com/mudler/vllm.cpp/issues/2274)) |
+| Variadic serving load, either engine | `benchmarks/variadic/`, method in [`variadic-load-methodology.md`](variadic-load-methodology.md#running-it): `build_corpus.py` from three sha256-pinned corpora, `client.py` closed-loop at a chosen concurrency, `report.py` for the tables, `job.sh` for the whole sweep inside an `rc` lease. The report recomputes every number from the per-request records, so a corrected statistic needs no GPU |
 | Which llama.cpp a figure ran | Three revisions on this page, all SUPERSEDED (#1003): fork `237ad9b96` (GB10 CPU, Vulkan, x86, kernel matrix), stock `b9892` (Pi 5), stock `7044859` (Muse Glimmer, #391). Pin is stock `b10451`, unbuilt (#857) |
 | Revisions repo-wide | **Five**, not three, enumerated in the [spec](../../.agents/specs/oracle-llamacpp-repin-stock.md). Absent here: stock `030ebb5` (NON-BINDING) and a Poolside fork BRANCH with no commit recorded, behind Laguna's `27.8 tok/s` |
 

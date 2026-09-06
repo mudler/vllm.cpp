@@ -1,0 +1,69 @@
+SUBMISSION RECORD, #2944 vllm.cpp arm on strix:gpu0
+
+probe job
+  rc job id      fc852bc4-df23-4737-b425-0eeab6ef137c
+  command        bash /workspace/strix-arm-2933/probe.sh
+  client         pid=2461973 ppid=1 sid=2461973   (setsid guard TOOK)
+  submitted      2026-09-05T02:32Z, queue position #1 at submission
+
+measurement job
+  rc job id      5efb6fb1-e56c-4ad8-8206-03278caa0900
+  command        bash /workspace/strix-arm-2933/job.sh
+  client         pid=3290639 ppid=1 sid=3290639   (setsid guard TOOK)
+  submitted      2026-09-05T02:40Z, queue position #3 at submission
+  max-runtime    5h, queue timeout 10h
+
+fleet at submission (rc devices / rc ps, 2026-09-05T02:40Z)
+  dgx:gpu0    busy  mudler@mudler-ubuntu-box  dflash2-8k-recovery/job.sh   (+3 queued)
+  orin:gpu0   ready
+  strix:gpu0  busy  mudler@mudler-ubuntu-box  rocm-mla-2926/job3.sh
+              queued #1 strix-arm-2933/probe.sh      (this campaign)
+              queued #2 extpr-gate-20260905/gate.sh  (another session)
+              queued #3 strix-arm-2933/job.sh        (this campaign)
+  thor:gpu0   busy  mudler@q4exp-apex  q4exp-apex/probe_table.sh
+
+  A third party's job sits between our probe and our measurement. The lease
+  serialises them, so no two of them are on the board at once; the ONLY effect
+  is on when ours runs, and the measurement records its own contention state
+  from inside the lease.
+
+---------------------------------------------------------------------------
+CORRECTION, 2026-09-05 (recorded because it nearly cost the measurement)
+
+A report reached this session saying both rc jobs were "gone", cancelled with
+their submitting client, on the evidence that `rc logs <id>` returned
+`not_found` and `out/` was empty. Acting on it would have meant resubmitting.
+
+THAT READING WAS WRONG, and re-submitting would have CORRUPTED the run:
+two copies of job.sh share one staging directory /tmp/strixarm2944, and the
+second would `rm -rf "$SRC"` and `rm -rf "$BLD"` underneath the first.
+
+What the controller actually reports, captured directly:
+
+  $ rc ps | grep -E 'fc852bc4|5efb6fb1'
+  fc852bc4-...  strix:gpu0  queued (#1)  bash /workspace/strix-arm-2933/probe.sh
+  5efb6fb1-...  strix:gpu0  queued (#2)  bash /workspace/strix-arm-2933/job.sh
+
+  $ rc jobs | grep -E 'fc852bc4|5efb6fb1'     -> state `queued` for both
+
+  $ out=$(rc logs <id> 2>&1); echo $?  ${#out}
+  fc852bc4  exit=0  bytes=0
+  5efb6fb1  exit=0  bytes=0
+
+  $ ps -o pid,ppid -p 2461973 -p 3290639   -> both PPID 1, both alive
+
+`rc logs` on a QUEUED job exits 0 and prints NOTHING, because the job has
+produced no output yet. Zero bytes is not `not_found`, and an empty `out/`
+directory is the expected state of a job that has not started. Both signals
+are indistinguishable from a cancelled job if the job's STATE is not read.
+
+THE LESSON, and it is the repository's own: an absence is not a verdict. Read
+the state the controller reports (`rc ps` / `rc jobs`), never the emptiness of
+a log. This is `never-assert-absence-from-a-failed-grep` wearing rc's clothes.
+
+Neither job was resubmitted. Both are the original submissions.
+
+Board contention: `strix:gpu0` has been held by another session's
+`rocm-mla-2926/job3.sh` since 2026-09-05T02:32:33Z. That job's two previous
+iterations failed at 6m0s and 6m1s; this third one has run past 15m, so it is
+getting further than they did. Our two jobs queue behind it, in that order.

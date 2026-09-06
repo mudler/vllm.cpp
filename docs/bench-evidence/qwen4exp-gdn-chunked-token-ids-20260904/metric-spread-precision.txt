@@ -1,0 +1,68 @@
+MetricSpread precision study (#2879). sigma 0.001, n = 12800, 400 seeds per block.
+draw() is tests/scripts/test_q4exp_layerfp_diff.py::metric_draw, read by import.
+
+1. SIX DISJOINT 400-SEED BLOCKS OF THE SAME ESTIMATOR
+figure                    committed        min        max  withdrawn  withdrawn in range?
+under-report p05              33.97      29.86      33.97      31.40  yes
+under-report median           74.64      70.77      80.26      69.20  NO (-2.2%)
+under-report p95             769.13     573.76     840.80     568.20  NO (-1.0%)
+P(no change >= 1.80x) %       58.86      57.57      59.74      58.70  yes
+P(no change >= 2.02x) %       52.30      51.12      53.05      52.20  yes
+P(no change >= 2.34x) %       45.08      43.73      45.40      44.90  yes
+P(no change >= 3.15x) %       33.49      31.89      33.59      32.80  yes
+P(no change >= 11.6x) %        9.39       6.86       9.48       7.60  yes
+P(no change >= 16.7x) %        6.82       4.51       7.04       5.40  yes
+P(no change >= 19.9x) %        5.87       3.46       6.21       4.60  yes
+P(no change >= 24.1x) %        5.04       2.56       5.42       3.90  yes
+pair ratio median              2.11       2.07       2.13       2.10  yes
+pair ratio p75                 4.22       3.97       4.22       4.00  yes
+pair ratio p90                10.81       8.61      10.89       8.90  yes
+pair ratio p95                24.35      15.25      27.22      18.20  yes
+
+2. BOOTSTRAP OVER THE COMMITTED BLOCK (seeds 0..399, 200 resamples,
+   random.Random(12345)) -- an interval on each published figure
+figure                    committed   boot2.5%  boot97.5%  withdrawn  inside 95% CI?
+under-report p05              33.97      31.59      36.24      31.40  NO
+under-report median           74.64      69.01      83.35      69.20  yes
+under-report p95             769.13     526.68    1345.37     568.20  yes
+P(no change >= 1.80x) %       58.86      54.82      62.73      58.70  yes
+P(no change >= 2.02x) %       52.30      47.93      56.53      52.20  yes
+P(no change >= 2.34x) %       45.08      40.31      49.62      44.90  yes
+P(no change >= 3.15x) %       33.49      28.62      38.37      32.80  yes
+P(no change >= 11.6x) %        9.39       6.27      13.28       7.60  yes
+P(no change >= 16.7x) %        6.82       4.13      10.17       5.40  yes
+P(no change >= 19.9x) %        5.87       3.25       8.95       4.60  yes
+P(no change >= 24.1x) %        5.04       2.71       7.82       3.90  yes
+pair ratio median              2.11       1.95       2.32       2.10  yes
+pair ratio p75                 4.22       3.53       5.19       4.00  yes
+pair ratio p90                10.81       8.08      17.17       8.90  yes
+pair ratio p95                24.35      14.04      46.93      18.20  yes
+
+14 of 15 withdrawn figures lie inside the committed control's own 95% interval.
+The construction is not falsified by them. The third significant figure is.
+
+3. EVERY PREFIX OF THE COMMITTED SEED STREAM (seeds 0..n-1), which is
+   the other way the withdrawn set could have arisen: the same stream,
+   read short. n in (64, 80, 100, 120, 128, 150, 160, 200, 240, 256, 300, 320, 360, 400)
+figure                    committed        min        max  withdrawn  withdrawn vs every prefix
+under-report p05              33.97      33.97      36.24      31.40  below all
+under-report median           74.64      74.64      89.65      69.20  below all
+under-report p95             769.13     687.89    1035.51     568.20  below all
+P(no change >= 1.80x) %       58.86      58.86      62.47      58.70  below all
+P(no change >= 2.02x) %       52.30      52.30      56.04      52.20  below all
+P(no change >= 2.34x) %       45.08      45.08      48.54      44.90  below all
+P(no change >= 3.15x) %       33.49      33.26      35.54      32.80  below all
+P(no change >= 11.6x) %        9.39       7.74      10.54       7.60  below all
+P(no change >= 16.7x) %        6.82       5.26       7.85       5.40  inside (n=64 nearest)
+P(no change >= 19.9x) %        5.87       4.37       6.94       4.60  inside (n=64 nearest)
+P(no change >= 24.1x) %        5.04       3.52       6.26       3.90  inside (n=64 nearest)
+pair ratio median              2.11       2.11       2.27       2.10  below all
+pair ratio p75                 4.22       4.10       4.59       4.00  below all
+pair ratio p90                10.81       9.36      12.38       8.90  below all
+pair ratio p95                24.35      17.23      44.58      18.20  inside (n=64 nearest)
+
+0 of 14 prefixes reproduce the withdrawn set within 5% on all 15 figures.
+11 of 15 withdrawn figures sit below EVERY prefix. The ordering is not
+universal -- at n = 64, 3 of the 4 tail shares sit ABOVE the withdrawn
+value -- so the set is a different SAMPLE, and it is not a short read of
+this one.

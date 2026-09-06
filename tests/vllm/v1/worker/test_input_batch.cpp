@@ -46,12 +46,14 @@ CachedRequestState make_req(const std::string& req_id,
   return state;
 }
 
-InputBatch make_batch(int max_num_reqs = 8, int max_model_len = 64) {
+InputBatch make_batch(int max_num_reqs = 8, int max_model_len = 64,
+                      int num_speculative_steps = 0) {
   return InputBatch(/*max_num_reqs=*/max_num_reqs,
                     /*max_model_len=*/max_model_len,
                     /*max_num_batched_tokens=*/max_model_len,
                     /*vocab_size=*/1024, /*block_sizes=*/{16},
-                    /*kernel_block_sizes=*/{16});
+                    /*kernel_block_sizes=*/{16},
+                    /*num_speculative_steps=*/num_speculative_steps);
 }
 
 }  // namespace
@@ -265,6 +267,155 @@ TEST_CASE("swap_states swaps last_sampled_tokens + prefill_len") {
   CHECK(batch.prefill_len[1] == 3);
   CHECK(batch.last_sampled_tokens[0] == 0);
   CHECK(batch.prefill_len[0] == 1);
+}
+
+// ─── SPEC-DFLASH2 A2-3: the per-req_state DRAFT BUFFER ──────────────────────
+//
+// Mirrors `RequestStates.draft_tokens` (vllm/v1/worker/gpu/states.py:71-77 @ pin
+// 5559679229bc961848b121ccdeaa8fa5d79bec98), the persistent
+// [num_req_states, num_speculative_steps] tensor the combine's draft scatter
+// reads. The per-slot valid count beside it is OURS and has no upstream twin:
+// the anchor A2-3 gave for it, `gpu_model_runner.py:883-895`, is the LEGACY
+// runner's n-gram-GPU D2H buffer set at that pin, and the new runner takes each
+// row's draft length from the scheduler's list instead
+// (`vllm/v1/worker/gpu/model_runner.py:941-949`) — which we cannot, because
+// under async scheduling that list is `-1` placeholders.
+//
+// WHY THE SIZING IS AN ASSERTION AND NOT AN IMPLEMENTATION DETAIL. The combine's
+// scatter indexes `draft_tokens[req_state_idx * stride + b]`, and its CUDA
+// counterpart (`src/vt/cuda/cuda_combine_tokens.cu`) has NOTHING bounding that
+// read — the row spec records that gap and tells this wave to close it by sizing
+// the buffer by the req_state POOL. A buffer sized by this step's REQUEST COUNT
+// lets a high slot index past the allocation with every host check satisfied.
+// The loud outcome is an illegal access; the quiet one is garbage in the draft
+// slots, which costs acceptance and NOTHING ELSE because speculative decoding is
+// lossless — the class of defect no token gate in this tree can see.
+TEST_CASE("A2-3: the draft buffer is sized by the req_state POOL, not by num_reqs") {
+  InputBatch batch = make_batch(/*max_num_reqs=*/8, /*max_model_len=*/64,
+                                /*num_speculative_steps=*/3);
+  // Nothing admitted yet: the rows exist for every slot the pool can hand out.
+  CHECK(batch.num_reqs() == 0);
+  CHECK(batch.num_speculative_steps == 3);
+  CHECK(batch.draft_tokens.size() == 8u * 3u);
+  CHECK(batch.num_valid_draft_tokens.size() == 8u);
+
+  // One request admitted does not shrink it, which is the whole point: the
+  // scatter reads by req_state slot and slot 7 stays addressable.
+  CachedRequestState r0 = make_req("r0", {1, 2}, {}, {10});
+  r0.num_computed_tokens = 0;
+  batch.add_request(r0);
+  CHECK(batch.num_reqs() == 1);
+  CHECK(batch.draft_tokens.size() == 8u * 3u);
+}
+
+// A runner with no speculator carries a ZERO-WIDTH buffer, exactly as upstream
+// builds `torch.zeros(max_num_reqs, 0)` when num_speculative_steps is 0. The
+// non-speculative path therefore allocates nothing and reads nothing, which is
+// what keeps this wave byte-identical for every model shipping today.
+TEST_CASE("A2-3: a non-speculative batch carries a zero-width draft buffer") {
+  InputBatch batch = make_batch();  // num_speculative_steps defaults to 0
+  CHECK(batch.num_speculative_steps == 0);
+  CHECK(batch.draft_tokens.empty());
+  CHECK(batch.num_valid_draft_tokens.size() == 8u);
+}
+
+// states.py:113 — `self.draft_tokens[req_idx].zero_()` in add_request. A freed
+// slot is handed to the NEXT request, and without this the new request inherits
+// the previous occupant's drafts. Those drafts verify against a sequence they
+// were never proposed for: lossless verify means they are simply rejected, so
+// the emitted tokens stay correct and only acceptance falls. Nothing raises.
+TEST_CASE("A2-3: add_request zeroes the slot's draft row and its valid count") {
+  InputBatch batch = make_batch(/*max_num_reqs=*/4, /*max_model_len=*/64,
+                                /*num_speculative_steps=*/2);
+  CachedRequestState first = make_req("first", {1, 2}, {}, {10});
+  first.num_computed_tokens = 0;
+  const int slot = batch.add_request(first);
+  REQUIRE(slot == 0);
+
+  // Give the slot drafts, as a propose would.
+  batch.draft_tokens[0] = 77;
+  batch.draft_tokens[1] = 88;
+  batch.num_valid_draft_tokens[0] = 2;
+
+  batch.remove_request("first");
+  batch.condense();
+  CachedRequestState second = make_req("second", {5, 6}, {}, {20});
+  second.num_computed_tokens = 0;
+  const int reused = batch.add_request(second);
+  REQUIRE(reused == 0);  // the freed hole is refilled first
+
+  CHECK(batch.draft_tokens[0] == 0);
+  CHECK(batch.draft_tokens[1] == 0);
+  CHECK(batch.num_valid_draft_tokens[0] == 0);
+}
+
+// The abort/finish reorder the combine's `idx_mapping` indirection exists for.
+// After a condense the surviving request occupies a DIFFERENT req_state slot, and
+// the scatter reads its drafts by slot. A row left behind is the previous
+// occupant's drafts read for this request — again lossless, again invisible.
+TEST_CASE("A2-3: condense moves the draft row and its count with the request") {
+  InputBatch batch = make_batch(/*max_num_reqs=*/4, /*max_model_len=*/64,
+                                /*num_speculative_steps=*/2);
+  CachedRequestState r0 = make_req("r0", {100}, {}, {10});
+  r0.num_computed_tokens = 1;
+  CachedRequestState r1 = make_req("r1", {200}, {}, {20});
+  r1.num_computed_tokens = 1;
+  CachedRequestState r2 = make_req("r2", {300}, {}, {30});
+  r2.num_computed_tokens = 1;
+  batch.add_request(r0);
+  batch.add_request(r1);
+  batch.add_request(r2);
+
+  // Distinct drafts per slot so a row that fails to move is not mistaken for one
+  // that moved to an identical value.
+  batch.draft_tokens[0] = 10;
+  batch.draft_tokens[1] = 11;
+  batch.num_valid_draft_tokens[0] = 2;
+  batch.draft_tokens[2] = 20;
+  batch.draft_tokens[3] = 21;
+  batch.num_valid_draft_tokens[1] = 2;
+  batch.draft_tokens[4] = 30;
+  batch.draft_tokens[5] = 31;
+  batch.num_valid_draft_tokens[2] = 1;
+
+  batch.remove_request("r1");
+  batch.condense();  // r2 (slot 2) slides into freed slot 1
+
+  REQUIRE(batch.req_id_to_index.at("r2") == 1);
+  CHECK(batch.draft_tokens[2] == 30);
+  CHECK(batch.draft_tokens[3] == 31);
+  CHECK(batch.num_valid_draft_tokens[1] == 1);
+  // Slot 0 untouched.
+  CHECK(batch.draft_tokens[0] == 10);
+  CHECK(batch.num_valid_draft_tokens[0] == 2);
+}
+
+TEST_CASE("A2-3: swap_states swaps the draft rows and their counts") {
+  InputBatch batch = make_batch(/*max_num_reqs=*/4, /*max_model_len=*/64,
+                                /*num_speculative_steps=*/2);
+  CachedRequestState a = make_req("a", {1}, {}, {10});
+  a.num_computed_tokens = 1;
+  CachedRequestState b = make_req("b", {5}, {}, {20});
+  b.num_computed_tokens = 1;
+  batch.add_request(a);  // slot 0
+  batch.add_request(b);  // slot 1
+
+  batch.draft_tokens[0] = 41;
+  batch.draft_tokens[1] = 42;
+  batch.num_valid_draft_tokens[0] = 2;
+  batch.draft_tokens[2] = 51;
+  batch.draft_tokens[3] = 52;
+  batch.num_valid_draft_tokens[1] = 1;
+
+  batch.swap_states(0, 1);
+
+  CHECK(batch.req_id_to_index.at("a") == 1);
+  CHECK(batch.draft_tokens[2] == 41);
+  CHECK(batch.draft_tokens[3] == 42);
+  CHECK(batch.num_valid_draft_tokens[1] == 2);
+  CHECK(batch.draft_tokens[0] == 51);
+  CHECK(batch.draft_tokens[1] == 52);
+  CHECK(batch.num_valid_draft_tokens[0] == 1);
 }
 
 // ─── ENG-ASYNC-SCHED W4: the structural-op log a device mirror replays ───────

@@ -655,8 +655,16 @@ struct Qwen3DenseDecodeGraph::Impl {
     // for themselves before this stage, and there was no one switch that turned
     // capture off. This driver no longer owns a copy of it.
     Backend& b = vt::GetBackend(queue.device.type);
+    // #1625/#2812: this ONE graph class serves the Qwen3-dense registries AND
+    // the Mistral/Llama/InternLM2 registries. The architecture-aware overload
+    // defaults capture for exactly Qwen3ForCausalLM (the evidence family: the
+    // 0.6B capture pair, the deterministic 4B) and keeps the explicit opt-in
+    // for the rest until their captured arms are brought up (#2812 — Mistral's
+    // captured arm drifts from its committed eager pair at p[1] t=8 today).
     enabled = vt::GraphCaptureEnabled() &&
               platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+              !platforms::GetPlatform(queue.device.type)
+                   .static_graph_requires_opt_in(config.architectures) &&
               b.SupportsGraphCapture();
   }
   ~Impl() {

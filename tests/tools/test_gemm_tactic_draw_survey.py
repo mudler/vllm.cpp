@@ -323,6 +323,7 @@ def _draw_record(
     algo_id: str = "21",
     tactic_set: str = "full",
     mean_us: float = 120.0,
+    smoke: bool = False,
 ) -> dict:
     algo = {}
     for n in (3072, 2048):
@@ -357,6 +358,7 @@ def _draw_record(
         "cache_sha256": "abc",
         "cache_bytes": 12,
         "binary_sha256": "bin",
+        "smoke": smoke,
     }
 
 
@@ -1417,13 +1419,19 @@ class ShellDriverTest(unittest.TestCase):
     )
 
     def fake_tree(
-        self, tmp: str, *, with_binary: bool = True, local_evidence: bool = True
+        self, tmp: str, *, with_binary: bool = True, local_evidence: bool = True,
+        with_shared_library: bool = True,
     ) -> tuple[pathlib.Path, pathlib.Path]:
         """A resumed local root plus its share, with no compiler in sight.
 
         `local_evidence=False` is the wiped-`/tmp` shape: the share survived the
         box going down and `$LOCAL_ROOT` did not, which is the state `mirror_in`
         exists to restore from.
+
+        `with_shared_library=False` is the shape EVERY build this harness
+        performs actually leaves behind (#2967 B): plain Release with no
+        `BUILD_SHARED_LIBS` emits a static `libvllm.a`, so `$BIN` holds the
+        binary and nothing else.
         """
 
         root = pathlib.Path(tmp) / "gtds"
@@ -1465,10 +1473,12 @@ class ShellDriverTest(unittest.TestCase):
                 encoding="utf-8",
             )
             binary.chmod(0o755)
-            # The build stages the shared library beside the binary and points
-            # LD_LIBRARY_PATH at it, so a resume that finds one without the
-            # other has not got a runnable binary either.
-            (binary.parent / "libvllm.so.0.9.0").write_text("not an ELF\n", encoding="utf-8")
+            if with_shared_library:
+                # A SHARED build stages the library beside the binary and points
+                # LD_LIBRARY_PATH at it. The static build stages neither, which
+                # is what the case below is about.
+                (binary.parent / "libvllm.so.0.9.0").write_text(
+                    "not an ELF\n", encoding="utf-8")
         return root, share
 
     def run_driver(self, *args: str, timeout: int = 90) -> subprocess.CompletedProcess:
@@ -1557,6 +1567,23 @@ class ShellDriverTest(unittest.TestCase):
         # never resume at all.
         with tempfile.TemporaryDirectory() as tmp:
             root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share),
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("skipping", done.stdout)
+
+    def test_a_static_build_resumes_instead_of_dying_on_its_own_library(self) -> None:
+        # #2967 B: this is #2912 again, in the RESUME guard. `resolve_artefacts`
+        # was corrected to treat a shared library as optional and this copy was
+        # not, so every resume of a static build -- which is every build this
+        # harness performs -- died with the `E_ARTEFACT` message about a wiped
+        # `/tmp`, naming a cause that is not the real one. The binary is here,
+        # the recorded source is here, and only `libvllm.so.*` is absent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp, with_shared_library=False)
+            self.assertFalse(sorted((root / "bin").glob("libvllm.so*")))
             done = self.run_driver(
                 "--phase", "build", "--evidence", str(share),
                 "--model", tmp, "--local-root", str(root),
@@ -1688,6 +1715,96 @@ class ShellDriverTest(unittest.TestCase):
             self.assertIsNotNone(match, provenance)
             self.assertGreaterEqual(int(match.group(1)), min_legs, provenance)
 
+    # --- #2972: --smoke walks every phase, and cannot be quoted -------------
+
+    def test_smoke_refuses_a_size_that_would_make_it_look_like_a_measurement(self) -> None:
+        # `--smoke` is a SIZE, and a size that can be argued back up is not a
+        # marker of anything. A run given both has asked for two different
+        # things, so it is refused rather than silently resolved.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share), "--smoke",
+                "--draws", "8", "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+            self.assertIn("--draws", done.stderr)
+            self.assertIn("--smoke", done.stderr)
+
+    def test_smoke_records_the_sizes_it_ran_at_in_the_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share), "--smoke",
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            provenance = (root / "evidence" / "PROVENANCE").read_text(encoding="utf-8")
+            self.assertIn("smoke=1", provenance)
+            self.assertIn("draws=1 ", provenance)
+            self.assertIn("score_reps=1 ", provenance)
+
+    def test_without_smoke_the_sizes_are_the_measurement_ones(self) -> None:
+        # THE CONTROL: the smoke sizes must not become the defaults.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share),
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            provenance = (root / "evidence" / "PROVENANCE").read_text(encoding="utf-8")
+            self.assertIn("smoke=0", provenance)
+            self.assertIn("draws=8 ", provenance)
+
+    def test_a_smoke_run_walks_the_phases_and_its_report_ships_nothing(self) -> None:
+        # The end-to-end shape #2972 asks for: the marker set on the driver's
+        # command line has to survive the draw phase, the record, the mirror and
+        # the reduction, and come out the far end as a report no draw can be
+        # pinned from. Nothing here is a measurement -- the bench is the
+        # module's own instrument fixture.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            shutil.rmtree(share / "draws")
+            shutil.rmtree(root / "evidence" / "draws")
+            witness = pathlib.Path(tmp) / "witness"
+            self.recording_bench(root, share, witness, pathlib.Path(tmp) / "src")
+            drawn = self.run_driver(
+                "--phase", "draw", "--evidence", str(share), "--smoke",
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(drawn.returncode, 0, drawn.stdout + drawn.stderr)
+            reduced = self.run_driver(
+                "--phase", "reduce", "--evidence", str(share), "--smoke",
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(reduced.returncode, 0, reduced.stdout + reduced.stderr)
+            report = json.loads(
+                (share / "REPORT.json").read_text(encoding="utf-8"))
+            self.assertTrue(report["smoke"], report)
+            self.assertNotIn("verdict", report["issue_2751_speed"])
+            self.assertIsNone(report["issue_2752"]["ship"])
+
+    def test_the_draw_invocations_pass_the_marker_the_judge_records(self) -> None:
+        # Same obligation as `--mirror` above, and the same reason it is stated
+        # over EVERY `draw` invocation: the preflight draw is a draw, its record
+        # is read by `reduce` like any other, and a preflight that dropped the
+        # marker would leave a report that says `smoke: false` over draws taken
+        # at four prompts.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        commands, current = [], None
+        for line in text.splitlines():
+            if current is not None:
+                current.append(line)
+            elif '"$SURVEY" draw' in line:
+                current = [line]
+            if current is not None and not line.rstrip().endswith("\\"):
+                commands.append(" ".join(current))
+                current = None
+        self.assertEqual(len(commands), 2, commands)
+        for command in commands:
+            self.assertIn("$SMOKE_ARG", command, command)
+
     def test_a_refused_reduce_does_not_mark_the_phase_complete(self) -> None:
         # Same polarity as the resume cases: a marker that a FAILED phase writes
         # makes the next run skip the work that did not happen.
@@ -1756,6 +1873,291 @@ class ArtefactResolutionTest(unittest.TestCase):
         done = self._run(tree)
         self.assertEqual(done.returncode, 35, done.stdout)
         self.assertIn("no vllm-bench", done.stderr)
+
+
+class ToolkitPostconditionTest(unittest.TestCase):
+    """#2967 A: what [A] must accept, and what it must refuse.
+
+    `.agents/environment.md` is explicit that `command -v nvcc` is NOT a
+    sufficient precondition -- a partial leftover puts `nvcc` on PATH while the
+    headers and libraries are missing, and CMake then dies with "Could NOT find
+    CUDA (missing: CUDA_INCLUDE_DIRS CUDA_CUDART_LIBRARY)", which names the
+    version and denies the toolkit in one line. These drive `--check-toolkit`,
+    which runs the SAME `toolkit_ok` phase [A] runs, on trees this host can
+    build; the apt install itself needs a pod and is gated statically below.
+    """
+
+    SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts/dgx-gemm-tactic-draw-survey.sh"
+
+    def _run(self, root: pathlib.Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), "--evidence", "/unused", "--model",
+             "/unused", "--check-toolkit", str(root)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def _tree(
+        self, name: str, *,
+        nvcc: str = "exec",
+        libs: Sequence[str] = ("libcudart.so", "libcudart.so.13",
+                               "libcublasLt.so", "libcublasLt.so.13"),
+        headers: str = "root",
+    ) -> pathlib.Path:
+        root = pathlib.Path(tempfile.mkdtemp()) / name
+        (root / "bin").mkdir(parents=True)
+        if nvcc != "absent":
+            binary = root / "bin" / "nvcc"
+            binary.write_text("#!/bin/bash\necho 'release 13.0'\n", encoding="utf-8")
+            # `/workspace` is CIFS with `nounix` and serves file_mode=0664, so a
+            # toolkit copied off the share arrives non-executable -- and an
+            # `nvcc` that cannot run is an `nvcc` that is absent.
+            binary.chmod(0o755 if nvcc == "exec" else 0o644)
+        lib = root / "targets" / "sbsa-linux" / "lib"
+        lib.mkdir(parents=True)
+        for name_ in libs:
+            (lib / name_).write_text("", encoding="utf-8")
+        if headers == "root":
+            (root / "include").mkdir(parents=True)
+            (root / "include" / "cuda_runtime.h").write_text("", encoding="utf-8")
+        elif headers == "targets":
+            # The same header where a CIFS copy leaves it: `/usr/local/cuda`
+            # normally reaches it through an `include -> targets/.../include`
+            # symlink, and CIFS with `nounix` stores no symlink.
+            target = root / "targets" / "sbsa-linux" / "include"
+            target.mkdir(parents=True)
+            (target / "cuda_runtime.h").write_text("", encoding="utf-8")
+        return root
+
+    def test_a_complete_toolkit_is_accepted(self) -> None:
+        done = self._run(self._tree("complete"))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("nvcc", done.stdout)
+
+    def test_a_toolkit_whose_headers_are_only_under_targets_is_accepted(self) -> None:
+        # The CONTROL for the header assertion below: refusing this shape would
+        # refuse a toolkit staged off the share, which is a staging path this
+        # harness supports (`$LOCAL_ROOT/cudatk`).
+        done = self._run(self._tree("targets-include", headers="targets"))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_no_nvcc_at_all_is_refused(self) -> None:
+        done = self._run(self._tree("no-nvcc", nvcc="absent"))
+        self.assertEqual(done.returncode, 38, done.stdout + done.stderr)
+
+    def test_an_nvcc_that_cannot_run_is_refused(self) -> None:
+        done = self._run(self._tree("nonexec", nvcc="noexec"))
+        self.assertEqual(done.returncode, 38, done.stdout + done.stderr)
+
+    def test_nvcc_without_the_headers_the_build_needs_is_refused(self) -> None:
+        # The partial-leftover shape the environment doc names: `command -v
+        # nvcc` passes and `find_package(CUDAToolkit REQUIRED)` then fails.
+        done = self._run(self._tree("no-headers", headers="absent"))
+        self.assertEqual(done.returncode, 38, done.stdout + done.stderr)
+
+    def test_a_missing_soname_link_is_refused(self) -> None:
+        # A staged toolkit that satisfies `find_package` can still fail 21
+        # minutes later with undefined references against `@libcudart.so.13`,
+        # because the SONAME is a THIRD name CIFS did not carry (#2220).
+        done = self._run(self._tree(
+            "no-soname", libs=("libcudart.so", "libcublasLt.so")))
+        self.assertEqual(done.returncode, 38, done.stdout + done.stderr)
+
+    def test_a_missing_development_link_is_refused(self) -> None:
+        done = self._run(self._tree(
+            "no-devlink", libs=("libcudart.so.13", "libcublasLt.so.13")))
+        self.assertEqual(done.returncode, 38, done.stdout + done.stderr)
+
+    def test_cublaslt_is_required_as_well_as_cudart(self) -> None:
+        done = self._run(self._tree(
+            "no-cublaslt", libs=("libcudart.so", "libcudart.so.13")))
+        self.assertEqual(done.returncode, 38, done.stdout + done.stderr)
+
+
+class ToolkitInstallRecipeTest(unittest.TestCase):
+    """#2967 A: [A] must INSTALL a toolkit, with the canonical recipe.
+
+    The install writes `/usr/local` as root on a leased pod and cannot be
+    executed by this suite, so what is gated here is that the driver carries the
+    recipe the tree already documents and implements rather than a variant of
+    it. `scripts/rc-sglang-oracle-lease.sh` is that implementation, and reading
+    the tokens out of BOTH files means a drift in either one reddens: a keyring
+    URL that quietly became the `x86_64` one resolves and installs nothing
+    usable on this fleet, and `cuda-nvcc-13-0` satisfies `command -v nvcc` and
+    then fails at `find_package(CUDAToolkit REQUIRED)`.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[2]
+    SCRIPT = ROOT / "scripts/dgx-gemm-tactic-draw-survey.sh"
+    CANONICAL = ROOT / "scripts/rc-sglang-oracle-lease.sh"
+
+    def setUp(self) -> None:
+        self.text = self.SCRIPT.read_text(encoding="utf-8")
+        self.canonical = self.CANONICAL.read_text(encoding="utf-8")
+
+    def _function_body(self, name: str) -> str:
+        lines = self.text.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith(f"{name}() {{"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+        return "\n".join(lines[start + 1:end])
+
+    def test_the_package_is_the_metapackage_the_canonical_script_installs(self) -> None:
+        package = "cuda-toolkit-13-0"
+        self.assertIn(package, self.canonical)
+        self.assertIn(package, self._function_body("install_toolkit"))
+
+    def test_a_compiler_only_package_is_not_installed_instead(self) -> None:
+        # `cuda-nvcc-13-0` is not a usable fallback: it satisfies `command -v
+        # nvcc` and supplies neither `CUDA::cudart` nor `CUDA::cublasLt`.
+        self.assertNotIn("cuda-nvcc-13-0", self._function_body("install_toolkit"))
+
+    def test_the_keyring_url_is_the_canonical_sbsa_one(self) -> None:
+        pattern = r"https://developer\.download\.nvidia\.com/\S+cuda-keyring\S*\.deb"
+        canonical = re.findall(pattern, self.canonical)
+        self.assertTrue(canonical, "the canonical script no longer fetches a keyring")
+        mine = re.findall(pattern, self.text)
+        self.assertEqual(sorted(set(mine)), sorted(set(canonical)))
+        self.assertIn("/sbsa/", mine[0])
+
+    def test_the_resolver_cannot_fail_without_attempting_an_install(self) -> None:
+        # The whole of #2967 A. `resolve_toolkit` searched, tried an
+        # `ldconfig`/symlink repair, and returned 1 -- so a freshly recreated
+        # pod died at [A] in one second, and the run that DID build 857/857
+        # succeeded only because an earlier job's global install was still in
+        # the container.
+        body = self._function_body("resolve_toolkit")
+        self.assertIn("install_toolkit", body)
+        before = body.split("install_toolkit")[0]
+        self.assertNotIn("return 1", before, body)
+
+    def test_the_install_is_not_skipped_on_a_binary_that_is_on_PATH(self) -> None:
+        # `command -v nvcc` is the guard the environment doc names as
+        # insufficient. The search-first guard is `toolkit_ok`, the complete
+        # postcondition, which is a different predicate.
+        self.assertNotIn("command -v nvcc", self._function_body("resolve_toolkit"))
+        self.assertNotIn("command -v nvcc", self._function_body("install_toolkit"))
+
+
+class SmokeModeTest(unittest.TestCase):
+    """#2972: a smoke run walks every phase and can never be quoted.
+
+    Three precondition defects were each found by a separate GPU lease, each
+    blocking the phase after the one before it, and none was visible to the CPU
+    suite because the shell tests write `phase/build.ok` and skip the build
+    phase outright. `--smoke` pays the build once and walks what is left in
+    minutes -- so it is a run whose SIZES are chosen to reach phase [R], and a
+    verdict computed over four prompts at one leg per draw is not a measurement
+    of anything. The marker is what keeps the two apart, and it is carried the
+    way the tuner's own timing already is: a `state`, with deliberately no
+    `verdict` key.
+    """
+
+    def evidence(self, tmp: str, *, smoke: bool, legs: int = 3) -> pathlib.Path:
+        root = pathlib.Path(tmp) / "ev"
+        arms = ("draw00", "draw01")
+        for index, label in enumerate(arms):
+            home = root / "draws" / label
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "record.json").write_text(
+                json.dumps(_draw_record(label, tactic_offset=index * 7, smoke=smoke)),
+                encoding="utf-8",
+            )
+        rows, controls = [], []
+        for leg in range(legs):
+            for arm_index, arm in enumerate(arms):
+                rows.append(json.dumps({
+                    "arm": arm, "boot_id": "b", "rc": 0,
+                    "total_token_throughput": 100.0 + arm_index * 0.1 + leg * 0.05,
+                }))
+                controls.append((arm, leg + 1))
+        ledger = root / "score" / "legs.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        for arm, index in controls:
+            home = root / "score" / f"{arm}-{index}"
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "frozen.json").write_text(json.dumps({
+                "leg": f"{arm}-{index}", "frozen": True,
+                "why": "frozen: tuned=0 loaded=2", "expected_plans": 2,
+            }), encoding="utf-8")
+        return root
+
+    def reduce(self, root: pathlib.Path):
+        return reduce_evidence(
+            root, metric="total_token_throughput", ratification_bar=1.02
+        )
+
+    def test_the_marker_reaches_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, report = self.reduce(self.evidence(tmp, smoke=True))
+            self.assertEqual(code, EXIT_OK)
+            self.assertTrue(report["smoke"])
+
+    def test_an_ordinary_run_is_not_marked(self) -> None:
+        # THE CONTROL. Without it the marker could be hard-wired true and every
+        # case above would still pass, which would refuse every real run.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, report = self.reduce(self.evidence(tmp, smoke=False))
+            self.assertEqual(code, EXIT_OK)
+            self.assertFalse(report["smoke"])
+            self.assertIn("verdict", report["issue_2751_speed"])
+
+    def test_a_smoke_report_carries_no_speed_verdict_at_all(self) -> None:
+        # Not a verdict of REFUSED or NOT RUN: no `verdict` key, so a reader
+        # -- or a script -- that goes looking for one finds nothing to quote.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.reduce(self.evidence(tmp, smoke=True))
+            self.assertNotIn("verdict", report["issue_2751_speed"])
+            self.assertEqual(report["issue_2751_speed"]["state"], "SMOKE")
+
+    def test_a_smoke_run_ships_no_draw(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.reduce(self.evidence(tmp, smoke=True))
+            self.assertIsNone(report["issue_2752"]["ship"])
+            self.assertIn("smoke", report["issue_2752"]["reason"])
+
+    def test_the_same_evidence_without_the_marker_does_ship_one(self) -> None:
+        # THE CONTROL for the case above: these draws ARE equivalent, so the
+        # refusal has to come from the marker and not from the numbers.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.reduce(self.evidence(tmp, smoke=False))
+            self.assertEqual(report["issue_2751_speed"]["verdict"], "EQUIVALENT")
+            self.assertEqual(report["issue_2752"]["ship"], "draw00")
+
+    def test_select_shipping_draw_refuses_a_smoke_run_by_name(self) -> None:
+        equivalent = {"verdict": "EQUIVALENT"}
+        self.assertEqual(
+            select_shipping_draw(equivalent, ["draw00"])["ship"], "draw00")
+        refused = select_shipping_draw(equivalent, ["draw00"], smoke=True)
+        self.assertIsNone(refused["ship"])
+        self.assertIn("smoke", refused["reason"])
+
+    def test_a_draw_records_the_marker_it_was_taken_under(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            cfg = {"num_prompts": 4, "input_len": 32, "output_len": 8,
+                   "concurrency": 1, "seed": 0, "max_num_batched_tokens": 1}
+            record = survey.run_draw(
+                0, root, root / "bench", "/model", cfg, dry_run=True, smoke=True)
+            self.assertTrue(record["smoke"])
+            on_disk = json.loads(
+                (root / "draws" / "draw00" / "record.json").read_text(encoding="utf-8"))
+            self.assertTrue(on_disk["smoke"])
+
+    def test_the_draw_subcommand_carries_the_marker_into_the_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "ev"
+            code = survey.main([
+                "draw", "--evidence", str(root), "--bench", str(root / "bench"),
+                "--model", "/model", "--draws", "2", "--dry-run", "--smoke",
+            ])
+            self.assertEqual(code, EXIT_OK)
+            for label in ("draw00", "draw01"):
+                record = json.loads(
+                    (root / "draws" / label / "record.json").read_text(encoding="utf-8"))
+                self.assertTrue(record["smoke"], label)
+            config = json.loads(
+                (root / "draw-config.json").read_text(encoding="utf-8"))
+            self.assertTrue(config["smoke"])
 
 
 if __name__ == "__main__":

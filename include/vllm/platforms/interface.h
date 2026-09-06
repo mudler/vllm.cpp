@@ -343,6 +343,27 @@ class Platform {
   // platform POLICY gate, mirroring upstream.
   virtual bool support_static_graph_mode() const { return false; }
 
+  // #1625/#2812: whether a decode family needs the EXPLICIT capture opt-in on
+  // this platform. TT's static-graph mode is default-on since the #1625 flip,
+  // but only the Qwen3-dense family carries committed captured-arm gate
+  // evidence (the 0.6B capture pair; deterministic 4B and Mistral runs).
+  // Every OTHER driver conjuncts this policy query and keeps the pre-flip
+  // opt-in polarity until its captured arm is brought up (#2812 — the
+  // Qwen3.5-GDN arm TT_FATALs mid-capture today). Qwen3-dense does not call
+  // it. Trivially false elsewhere: CUDA's captured decode is the proven
+  // standard arm.
+  virtual bool static_graph_requires_opt_in() const { return false; }
+
+  // Architecture-aware overload for drivers whose ONE graph class serves
+  // several model families: the Qwen3-dense graph also serves the Mistral,
+  // Llama and InternLM2 registries, so the driver passes its checkpoint's
+  // `architectures` and the platform carves default capture to exactly the
+  // evidence family. The base ignores the architectures.
+  virtual bool static_graph_requires_opt_in(
+      const std::vector<std::string>& /*architectures*/) const {
+    return static_graph_requires_opt_in();
+  }
+
   // --- Residency / attention fast-path POLICY (accelerator-seam S7) -----------
   //
   // Two more capability predicates the shared layer branches on TODAY via a raw

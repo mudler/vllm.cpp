@@ -14,8 +14,15 @@ Counted decode only, ours reads 53.63 tok/s against their 44.82, a ratio of
 33.26, a ratio of **1.123x**. Both conventions put us ahead, and neither reads
 anything off their card.
 
-Their engine reaches the first token sooner: 954.2 ms against our 1059.0 ms,
-averaged over both legs of each. That axis goes to them.
+Time to first token needs a correction. This page published it on 5 September
+2026 as 954.2 ms for their engine against 1059.0 ms for ours, and gave the axis
+to them. Those means keep the first request of every leg, which is cold. The
+[method](#method) for the other measurements on this page discards run 1 as
+cold, and these means did not. Discard it here too and the means read 904.0 ms
+for us against 929.8 ms for them. Their engine still returns the first chunk
+sooner at the median. Ours returns it sooner at p90, p95 and p99, and the two
+sides do not stream at the same granularity. The axis is
+[below](#time-to-first-token), with both sets of figures.
 
 Two things this run does not establish. No correctness gate covers these four
 legs, because both engines sampled at T = 0.6 and nothing scored what either of
@@ -83,12 +90,15 @@ whole-run rate   = sum(completion_tokens) / wall clock of the whole leg
 
 ### The four legs
 
-| leg | order | decode-only tok/s | whole-run tok/s | mean TTFT ms | output tokens | wall s |
+| leg | order | decode-only tok/s | whole-run tok/s | mean TTFT ms, all 164 | output tokens | wall s |
 |---|---|---|---|---|---|---|
 | `THEIRS-A` | 1 | 44.63 | 32.54 | 1021.7 | 19,680 | 604.9 |
 | `OURS-A` | 2 | **53.68** | **37.33** | 1062.8 | 20,992 | 562.3 |
 | `THEIRS-B` | 3 | 45.01 | 33.99 | 886.6 | 19,680 | 579.1 |
 | `OURS-B` | 4 | **53.57** | **37.36** | 1055.1 | 20,992 | 561.8 |
+
+The TTFT column keeps the cold first request of each leg. Read that axis in
+[time to first token](#time-to-first-token), which discards it.
 
 Every leg completed 164 of 164 requests with no failures. The job's own verdict
 lines, each the mean of that engine's two legs:
@@ -146,16 +156,87 @@ at the acceptance they publish, so these legs are not a comparison against a
 misconfigured competitor. The conversion assumes that accounting; the counters
 are what the file holds.
 
-### Time to first token goes to them
+### Time to first token
 
-| arm | mean TTFT ms, leg A / leg B | median TTFT ms, leg A / leg B |
+**This section replaces the one published on 5 September 2026.** That section
+read "Time to first token goes to them" and quoted 954.2 ms against our 1059.0
+ms, a ratio of 1.11x. Both figures are arithmetic means over all 164 requests of
+both legs. Request `i = 0` of every leg is a cold start, and the
+[method](#method) for the other measurements on this page discards run 1 as
+cold. These two means did not. Two requests out of 328 per engine
+decided the result. The correction is
+[#2968](https://github.com/mudler/vllm.cpp/issues/2968).
+
+The first request of each leg, in milliseconds:
+
+| leg | order | `i = 0` | mean, all 164 | mean, 163 warm |
+|---|---|---|---|---|
+| `THEIRS-A` | 1 | 7919.7 | 1021.7 | 979.4 |
+| `OURS-A` | 2 | 27455.6 | 1062.8 | 900.9 |
+| `THEIRS-B` | 3 | 1934.7 | 886.6 | 880.2 |
+| `OURS-B` | 4 | 25178.6 | 1055.1 | 907.1 |
+
+`i = 0` lifts our pooled mean by 155.0 ms and theirs by 24.4 ms. Remove both and
+the 104.8 ms gap in their favour becomes 25.8 ms in ours.
+
+`i = 0` is the slowest request of its leg in three legs of four. In `THEIRS-B` it
+ranks fifth of 164, because their server had already served leg 1. Ours costs 25
+to 27 seconds at the start of both of its legs, and this page does not say why.
+The discard rule is positional either way. It drops `i = 0` whether or not
+`i = 0` is the extreme value of its leg.
+
+Both conventions follow, pooled over each engine's two legs. Warm discards
+`i = 0` and holds 326 requests per engine. With warmup holds 328. Percentiles
+interpolate linearly between order statistics. A ratio above 1 favours ours.
+
+| TTFT ms | ours, warm | theirs, warm | theirs / ours | ours, with warmup | theirs, with warmup |
+|---|---|---|---|---|---|
+| mean | 904.0 | 929.8 | 1.029 | 1059.0 | 954.2 |
+| p50 | 863.1 | 762.7 | 0.884 | 863.2 | 763.5 |
+| p90 | 1219.0 | 1739.2 | 1.427 | 1224.9 | 1771.1 |
+| p95 | 1371.6 | 1959.9 | 1.429 | 1377.5 | 1964.2 |
+| p99 | 1535.8 | 2850.8 | 1.856 | 1697.1 | 2964.4 |
+
+The median goes to them by 11.6%. Every tail percentile goes to us: 42.7% at
+p90, 42.9% at p95, and 85.6% at p99. The warm means sit 25.8 ms apart on 904.0,
+which is 2.9% in our favour. Their own two legs move 15.2% on the mean and ours
+move 0.73%, so 2.9% is inside their spread.
+
+Discarding `i = 0` does not move the median on either side, so the median result
+holds under both conventions. It moves the means and the far tail, which is
+where a single 27-second request lands.
+
+### The median does not measure the same thing on both sides
+
+The client stamps `ttft` on the first chunk that carries text and skips a
+role-only opening delta, at
+[`client.py:69-85`](../bench-evidence/qwen38-27b-exl3-headtohead-20260903/client.py).
+`n_chunks` counts those same chunks, and every one of the 656 records holds
+`n_chunks - 1` inter-token latencies. The client's own comment at line 111 says
+that a chunk is not always a token. On our side it is not:
+
+| arm | completion tokens per chunk, mean over warm requests | pooled over all warm tokens and chunks |
 |---|---|---|
-| theirs | 1021.7 / 886.6 | 765.8 / 759.5 |
-| ours | 1062.8 / 1055.1 | 863.2 / 863.4 |
+| ours | 4.47 | 4.30 |
+| theirs | 1.08 | 1.08 |
 
-Both of their legs beat both of ours on both statistics, so the direction holds.
-The size does not: their mean TTFT moves 15.2% between their own two legs,
-against 0.73% between ours. Read 1.11x as a direction, not as a factor.
+Our streaming handler emits one frame per `RequestOutput` and adds that output's
+whole `token_ids` to the running count, at
+`src/vllm/entrypoints/openai/serving_chat.cpp:418-467`. That file has not changed
+since `5649e07d`, the tree these legs ran on. One `RequestOutput` under
+speculation carries the target token together with its accepted drafts, and our
+arm ran a `dflash` draft at `num_speculative_tokens: 7`, so our first text chunk
+holds an accepted block. Their wrapper emits about one token per chunk, so their
+stamp lands on the first token of theirs.
+
+The median difference is therefore not evidence that our prefill is slower. It is
+not evidence that it is faster either.
+
+These records hold `n_chunks` and a completion-token total, and no per-token
+timestamp. The size of the first chunk on its own is not recoverable from them,
+so this section names the difference and does not correct for it. A first-token
+comparison that survives it needs a per-token timestamp on both sides, and that
+is owed.
 
 ### What no gate covers here
 
@@ -638,7 +719,36 @@ measurement, and the matched HumanEval run exists to remove it.
    any number on this page was measured on contains that fix.
 
 **One prompt, one length, one device, one boot.** 64 tokens, five runs per leg,
-two legs per arm. No multi-request batching, no long context, no second box.
+two legs per arm. No multi-request batching, no second box. Every headline number
+here is short-context, and the section below says what happens when it is not.
+
+### Acceptance falls with context, so do not carry these figures to long prompts
+
+The speculative figures on this page are taken at 64 input tokens. Acceptance is
+not flat in context length, so they do not transfer. Measured on `dgx:gpu0` in a
+separate job, real HumanEval-shaped prompts, `VT_DFLASH_PAGED=0` on every leg as
+above, two passes per arm:
+
+| input tokens | no-draft tok/s | drafted tok/s | acceptance rate |
+|---|---|---|---|
+| 324 | 16.99 | 57.07 / 57.27 | 0.49 |
+| 2307 | 16.73 | 52.60 / 52.56 | 0.45 |
+| 8159 | 16.22 | 42.05 / 42.00 | 0.37 |
+
+Speculation still pays at every length here, but the margin narrows from 3.37x
+over no draft at 324 tokens to 2.59x at 8159, and acceptance falls from 0.49 to
+0.37. Quote the short-context numbers as short-context numbers.
+
+This was worse until recently. Attention was gated on `causal &&` at nine sites,
+so a config with `is_causal: false` and `sliding_window: 2048` -- which this pair
+uses -- ran unwindowed past the window. On the same 8159 rung the pre-fix tree
+measured 16.51 and 16.54 tok/s at acceptance 0.10, against a 16.22 no-draft
+floor, so speculation bought 1.8% and nothing more. On a synthetic 8159 prompt it
+was an outright loss: 12.60 against 16.34. That is
+[#2784](https://github.com/mudler/vllm.cpp/issues/2784), fixed and then measured;
+the issue carries the full leg table. No number in the tables above this section
+was affected, because at 324 and 2307 tokens the pre-fix and post-fix trees agree
+to 1.0% and 1.6% with identical acceptance.
 
 ## Owed
 
@@ -653,6 +763,14 @@ two legs per arm. No multi-request batching, no long context, no second box.
   ([#2770](https://github.com/mudler/vllm.cpp/issues/2770)). Their side of the
   head-to-head reports 0.774 accepted draft tokens per output token and ours
   reports nothing, so the mechanism half of that comparison has one side only.
+- **A per-token timestamp on both sides of the head-to-head.** Time to first
+  token there is time to the first streamed chunk, and our chunk holds 4.47
+  completion tokens against their 1.08, so the median on that axis is not a
+  matched comparison.
+- **An explanation for the first request of each of our head-to-head legs**,
+  which cost 27.5 s and 25.2 s. Their engine paid 7.9 s on its first leg and
+  1.9 s on its second. Both figures are discarded from every statistic on this
+  page, and neither is explained by it.
 - **A matched-configuration head-to-head leg.** Each engine ran its own published
   recipe. A leg at one context length and one KV dtype needs
   [#2620](https://github.com/mudler/vllm.cpp/issues/2620).
@@ -666,9 +784,8 @@ two legs per arm. No multi-request batching, no long context, no second box.
 - For the earlier `vllm-bench` runs, the unmatched axes against the upstream
   recipe: context (8192 here against their `-cs 262144`) and KV dtype (bf16 here
   against their `-cq nvfp4`, which this engine refuses by name —
-  [#2620](https://github.com/mudler/vllm.cpp/issues/2620), whose named owner row
-  did not exist). `vllm-bench` had no way to select a KV dtype when those runs
-  were taken, so no number on this page states the KV dtype it was measured on.
+  [#2620](https://github.com/mudler/vllm.cpp/issues/2620)). `vllm-bench` had no
+  way to select a KV dtype when those runs were taken, so no number on this page states the KV dtype it was measured on.
   It has taken `--kv-cache-dtype` since `89bfd79b0`, which closed
   [#2619](https://github.com/mudler/vllm.cpp/issues/2619), so a rerun can now
   state it.
@@ -677,6 +794,17 @@ two legs per arm. No multi-request batching, no long context, no second box.
   [#2274](https://github.com/mudler/vllm.cpp/issues/2274), and no number on this
   page was measured on a tree that contains the fix. Every arm here ran
   `VT_DFLASH_PAGED=0` instead.
+- **The nvfp4 KV axis will not close by configuration, and the spike that measured
+  why is [`nvfp4-kv-cache.md`](../../.agents/specs/nvfp4-kv-cache.md).** vLLM
+  serves `nvfp4` KV only on FlashInfer's trtllm-gen path, admitted at compute
+  capability family 100; this box is `sm_121a`, so the pinned oracle refuses the
+  dtype here too and there is no oracle run to gate a port against. What their
+  `-cq nvfp4` denotes is not established either: the pinned exllamav3 has no
+  `tools/serve_openai.py`, its `-cq` takes a bit count rather than a format name
+  (`eval/model_diff.py:475`), and `nvfp4` appears there only in weight handling.
+  So this axis is not one engine lacking a switch the other has, until somebody
+  reads the revision that recipe was written against. Closing it on our side
+  means implementing the arm under `KV-NVFP4-TURBO`, which the spike now owns.
 - [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
   GEMV. When this page was first written it instantiated `(3,1)` only, and this
   checkpoint has no `(3,1)` tensor at all, so the arm was dead on it. `(3,2)`

@@ -55,6 +55,7 @@
 
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_duration_head.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
@@ -1437,6 +1438,71 @@ inline void WritePromptEmbeds(const std::string& path, const std::string& tag, i
 }
 
 // The whole set, as an engine would be pointed at it.
+// ── The DURATION HEAD (row LTX25-DURATION-HEAD-WIRE, #2900) ─────────────────
+//
+// The tensor set is not written out here: it is ENUMERATED from
+// `EnumerateLtx2DurationHeadTensors`, the same function the loader plans
+// against. A hand-written list would be a second statement of the contract and
+// the two would drift; deriving it means a config change breaks the fixture and
+// the loader together, which is the only way this file can gate the loader
+// rather than agree with it.
+//
+// THE PREFIX IS THE POINT. Upstream's `DURATION_HEAD_KEY_OPS`
+// (duration_head/model_configurator.py:9-11) matches `duration_head.` and
+// STRIPS it, so a shipped checkpoint stores the prefixed spelling. `prefix`
+// therefore travels through the config rather than being baked in, and the
+// bare-name file below exists so both spellings are covered.
+inline vllm::Ltx2DurationHeadConfig ReducedDurationHeadConfig(const vllm::Ltx2DitParams& dit,
+                                                              const std::string& prefix) {
+  vllm::Ltx2DurationHeadConfig cfg;
+  // The two cross-attention dims MIRROR the DiT's, exactly as
+  // `DurationHeadConfigurator.from_metadata` reads them off the transformer
+  // config (model_configurator.py:28-29). Everything else keeps upstream's
+  // placeholder defaults, which is what that configurator does too.
+  cfg.video_cross_attention_dim = dit.cross_attention_dim;
+  cfg.audio_cross_attention_dim = dit.audio_cross_attention_dim;
+  cfg.pooler_hidden_dim = 12;
+  cfg.num_queries = 2;
+  cfg.num_pooler_heads = 3;
+  cfg.mlp_hidden = 10;
+  cfg.prefix = prefix;
+  return cfg;
+}
+
+// `omit` drops one tensor by name, which is how the PARTIAL-head case is built.
+// Upstream loads with `strict=False` and then asks whether any parameter is
+// still on the meta device (blocks.py:838), so a partial head is `None` and not
+// an error -- a polarity a complete-or-absent fixture cannot gate.
+inline void WriteReducedDurationHead(const vllm::Ltx2DitParams& dit, const std::string& path,
+                                     const std::string& prefix = "duration_head.",
+                                     const std::string& omit = {}) {
+  const vllm::Ltx2DurationHeadConfig cfg = ReducedDurationHeadConfig(dit, prefix);
+  std::vector<Entry> entries;
+  for (const vllm::Ltx2DurationHeadTensorSpec& spec :
+       vllm::EnumerateLtx2DurationHeadTensors(cfg)) {
+    if (!omit.empty() && spec.name == omit) continue;
+    int64_t numel = 1;
+    for (const int64_t d : spec.shape) numel *= d;
+    entries.push_back(Entry{spec.name, "F32", spec.shape, Param(spec.name, numel, 0.2), {}});
+  }
+  // THE HEAD CARRIES ITS OWN CONFIG, as every shipped LTX-2.5 component does.
+  // `DurationHeadConfigurator.from_metadata` reads the four pooler
+  // hyperparameters out of a `duration_head` sub-dict and the two cross-attention
+  // dims out of `transformer` (model_configurator.py:24-35), so a fixture that
+  // wrote tensors and no config would be loadable only by an engine that ignored
+  // the config -- which is the defect this file exists to catch.
+  nlohmann::json config;
+  config["transformer"]["cross_attention_dim"] = cfg.video_cross_attention_dim;
+  config["transformer"]["audio_cross_attention_dim"] = cfg.audio_cross_attention_dim;
+  config["duration_head"]["pooler_hidden_dim"] = cfg.pooler_hidden_dim;
+  config["duration_head"]["num_queries"] = cfg.num_queries;
+  config["duration_head"]["num_pooler_heads"] = cfg.num_pooler_heads;
+  config["duration_head"]["mlp_hidden"] = cfg.mlp_hidden;
+  nlohmann::json metadata;
+  metadata["config"] = config.dump();
+  WriteSafetensors(entries, metadata.dump(), path);
+}
+
 struct Paths {
   std::string dit, video_vae, audio_vae, upsampler, video_embeds, audio_embeds;
   // The NEGATIVE half of the embeds fallback (row LTX25-GUIDED-VIDEO, #1092).
@@ -1449,6 +1515,13 @@ struct Paths {
   // carry. Written by every fixture; POINTING the engine at them is opt-in,
   // because a load that materializes a tower is not what most cases here gate.
   std::string encoder, encoder_config;
+  // Row LTX25-DURATION-HEAD-WIRE (#2900). Four files, because the loader's
+  // contract has four outcomes and a single well-formed head can only gate one
+  // of them: a complete prefixed head, the same head under BARE names, a head
+  // missing one tensor (upstream's `None`), and a head whose tensor is present
+  // at the WRONG SHAPE (the one case that refuses instead of returning `None`).
+  // The absent case needs no file at all -- `dit` carries no `duration_head.*`.
+  std::string duration_head, duration_head_bare, duration_head_partial, duration_head_wrong_shape;
 };
 
 // `prompt_tokens` defaults to 4, not 3: the connector's register table is TILED
@@ -1470,12 +1543,45 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   p.negative_audio_embeds = dir + "/negative_audio_prompt_embeds.f32";
   p.encoder = dir + "/text_encoder.safetensors";
   p.encoder_config = dir + "/gemma_config.json";
+  p.duration_head = dir + "/duration_head.safetensors";
+  p.duration_head_bare = dir + "/duration_head_bare.safetensors";
+  p.duration_head_partial = dir + "/duration_head_partial.safetensors";
+  p.duration_head_wrong_shape = dir + "/duration_head_wrong_shape.safetensors";
   WriteReducedTextEncoder(dit, p.encoder);
   WriteGemmaConfigJson(p.encoder_config);
   WriteReducedDit(dit, p.dit);
   WriteReducedVideoVae(ReducedVideoDecoderConfig(dit.in_channels), p.video_vae);
   WriteReducedAudioVae(ReducedAudioDecoderConfig(), ReducedVocoderBweConfig(), p.audio_vae);
   WriteReducedUpsampler(ReducedUpsamplerConfig(dit.in_channels), p.upsampler);
+  WriteReducedDurationHead(dit, p.duration_head);
+  WriteReducedDurationHead(dit, p.duration_head_bare, /*prefix=*/"");
+  WriteReducedDurationHead(dit, p.duration_head_partial, /*prefix=*/"duration_head.",
+                           /*omit=*/"duration_head.mlp_out.weight");
+  {
+    // One tensor at the wrong width. Present, so it is not the `None` path; the
+    // wrong shape, so binding it would run the head on a silently different
+    // module.
+    const vllm::Ltx2DurationHeadConfig cfg = ReducedDurationHeadConfig(dit, "duration_head.");
+    std::vector<Entry> entries;
+    for (const vllm::Ltx2DurationHeadTensorSpec& spec :
+         vllm::EnumerateLtx2DurationHeadTensors(cfg)) {
+      std::vector<int64_t> shape = spec.shape;
+      if (spec.name == "duration_head.mlp_out.weight") shape.back() += 1;
+      int64_t numel = 1;
+      for (const int64_t d : shape) numel *= d;
+      entries.push_back(Entry{spec.name, "F32", shape, Param(spec.name, numel, 0.2), {}});
+    }
+    nlohmann::json config;
+    config["transformer"]["cross_attention_dim"] = cfg.video_cross_attention_dim;
+    config["transformer"]["audio_cross_attention_dim"] = cfg.audio_cross_attention_dim;
+    config["duration_head"]["pooler_hidden_dim"] = cfg.pooler_hidden_dim;
+    config["duration_head"]["num_queries"] = cfg.num_queries;
+    config["duration_head"]["num_pooler_heads"] = cfg.num_pooler_heads;
+    config["duration_head"]["mlp_hidden"] = cfg.mlp_hidden;
+    nlohmann::json metadata;
+    metadata["config"] = config.dump();
+    WriteSafetensors(entries, metadata.dump(), p.duration_head_wrong_shape);
+  }
   WritePromptEmbeds(p.video_embeds, "ltx2.embeds.video", prompt_tokens, dit.cross_attention_dim);
   WritePromptEmbeds(p.audio_embeds, "ltx2.embeds.audio", prompt_tokens,
                     dit.audio_cross_attention_dim);

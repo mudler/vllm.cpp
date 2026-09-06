@@ -63,8 +63,11 @@
 #include <vector>
 
 #include "vllm/model_executor/models/ltx2_audio_vae.h"  // Ltx2VaeWeights
+#include "vt/dtype.h"                                  // vt::DType
 
 namespace vllm {
+
+class SafetensorsFile;
 
 // DurationHead.__init__ defaults (duration_head.py:63-71), which are also
 // DurationHeadConfigurator.from_metadata's `config.get` fallbacks
@@ -105,5 +108,78 @@ std::vector<float> Ltx2DurationPredict(const Ltx2DurationHeadConfig& config,
                                        const Ltx2VaeWeights& weights, const float* video_tokens,
                                        int64_t video_token_count, const float* audio_tokens,
                                        int64_t audio_token_count, int64_t batch);
+
+
+// ─── THE DRIVER (row LTX25-DURATION-HEAD-WIRE, #2900) ────────────────────────
+//
+// Everything above is the head's ARITHMETIC. What follows is what upstream wraps
+// around it to turn a predicted duration into the frame count a render uses.
+// Ported from packages/ltx-pipelines/src/ltx_pipelines/utils/, which is a
+// different package from the head itself — kept together here because the two
+// are useless apart, and because the port has no `ltx-pipelines` layer to mirror.
+//
+//   OURS                          <-  UPSTREAM
+//   Ltx2SnapFramesToGrid          <-  utils/helpers.py:554-562
+//   Ltx2SecondsToClampedNumFrames <-  utils/helpers.py:565-585
+//   Ltx2DurationPredictFrames     <-  utils/blocks.py:850-889 (DurationPredictor.__call__)
+//   Ltx2RequireNumFramesSource    <-  utils/blocks.py:894-905
+//   Ltx2LoadDurationHeadWeights   <-  utils/blocks.py:816-848 (from_checkpoint)
+//
+// ─── THE FOUR RULES THAT FAIL SILENTLY HERE ──────────────────────────────────
+//  * THE CLAMP PRECEDES THE SNAP (helpers.py:579-580). Both orders type-check
+//    and they disagree whenever the floored grid point leaves the window.
+//  * THE UNDERSHOOT REPAIR SNAPS UP AND IS ITSELF CAPPED (:581-584). Snapping
+//    FLOORS, so a `min_frames` off the grid lands BELOW the window; upstream
+//    ceils back onto the grid, then takes `min` with `max_frames`. That `min` is
+//    why a min == max == 5 request returns 5, which is NOT on the 8k+1 grid:
+//    upstream honours the window over the grid when both cannot hold.
+//  * THE ROUNDING IS PYTHON'S, WHICH IS HALF-TO-EVEN, NOT `std::llround`.
+//    0.34 s at 25 fps is exactly 8.5: upstream takes 8 and returns frame 1,
+//    `llround` takes 9 and returns frame 9.
+//  * A MISSING HEAD IS `None`, NOT AN ERROR, AND SO IS A PARTIAL ONE
+//    (blocks.py:838-844). Every checkpoint predating LTX-2.5 / gemma4 has no
+//    head, and upstream runs those happily.
+//
+// All four are gated against upstream's OWN answers, with the rejected rule
+// beside each, in tests/vllm/models/ltx2_duration_wire_goldens.inc.
+
+// `snap_frames_to_grid` (utils/helpers.py:554-562). Floors to `k * time_scale + 1`
+// and refuses `frames < 1`, which is also what keeps the C++ division agreeing
+// with Python's flooring `//`.
+int64_t Ltx2SnapFramesToGrid(int64_t frames, int64_t time_scale);
+
+// `seconds_to_clamped_num_frames` (utils/helpers.py:565-585). Clamps BEFORE
+// snapping and repairs an undershoot upward; see the header note above.
+int64_t Ltx2SecondsToClampedNumFrames(double seconds, double frame_rate, int64_t min_frames,
+                                      int64_t max_frames, int64_t time_scale);
+
+// `DurationPredictor.__call__` (utils/blocks.py:850-889). Either token stream may
+// be null and both being null throws, exactly as the forward does. Upstream's
+// single-item-batch refusal (:857-861) is expressed as a CONTRACT rather than a
+// check: there is no `batch` parameter, so the shape it rejects cannot be asked
+// for. `predicted_seconds`, when non-null, receives the head's raw prediction so
+// a caller can log what upstream logs at `:881-888`.
+int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
+                                  const Ltx2VaeWeights& weights, const float* video_tokens,
+                                  int64_t video_token_count, const float* audio_tokens,
+                                  int64_t audio_token_count, double frame_rate, double min_seconds,
+                                  double max_seconds, int64_t time_scale,
+                                  float* predicted_seconds);
+
+// `require_num_frames_source` (utils/blocks.py:894-905). THE POSITION IS PART OF
+// THE BEHAVIOUR: upstream calls this at the very top of `__call__`, before prompt
+// encoding or any other work, so a checkpoint with no head fails fast instead of
+// paying for work whose result is discarded. A caller that moves it later refuses
+// the same requests and is still a different pipeline.
+void Ltx2RequireNumFramesSource(bool auto_requested, bool has_predictor);
+
+// `DurationPredictor.from_checkpoint` (utils/blocks.py:816-848). Returns FALSE —
+// upstream's `None` — when the file carries no head or only part of one, and
+// refuses only a tensor that is PRESENT at the wrong shape. `compute_dtype`
+// exists so the owed bf16 arm (A24's eighth component) is a call-site change
+// rather than a signature change; anything but f32/bf16 refuses by name.
+bool Ltx2LoadDurationHeadWeights(const SafetensorsFile& file,
+                                 const Ltx2DurationHeadConfig& config, vt::DType compute_dtype,
+                                 Ltx2VaeWeights* out);
 
 }  // namespace vllm

@@ -27,6 +27,33 @@ std::optional<vt::AttentionWindow> ResolveAttentionWindow(
     v1::AttentionType attention_type,
     bool disable_model_sliding_window = false);
 
+// The MODEL-LEVEL sliding-window kill switch, mirroring vLLM's
+// `ModelConfig.disable_sliding_window` (`vllm/config/model.py:248` @ pin
+// `5559679229`). One switch for every model, because upstream's is one field on
+// `ModelConfig` rather than a per-architecture toggle, and its own docstring
+// settles the asymmetry: "If the model does not support sliding window, this
+// argument is ignored." A model with no window needs no opt-out, so covering
+// every family costs nothing at the sites that have nothing to disable.
+//
+// WHY A PROCESS-LEVEL SWITCH AND NOT A CONFIG FIELD, which is what upstream
+// mutates. `config/model.py:766-769` sets `hf_text_config.sliding_window = None`
+// and every layer inherits it. That mechanism CANNOT work here, and the reason is
+// a bypass rather than a missing field: `gemma2.cpp:103`, `gemma3.cpp:101`,
+// `gemma4.cpp:139` and `laguna_weights.cpp:117` each read
+//
+//   cfg.sliding_window.value_or(RawInt(cfg.raw, "sliding_window", 0))
+//
+// and `cfg.raw` is the FULL UNTOUCHED checkpoint document
+// (`hf_config.cpp:598`). Nulling the typed field leaves the raw one, so the
+// window would survive the switch silently. Tracked as its own defect; this
+// switch is consumed where the window is USED instead, through
+// `ResolveAttentionWindow`'s `disable_model_sliding_window` parameter, which has
+// carried this exact meaning since W1 and has never had a caller that passes
+// anything but the default.
+void SetDisableSlidingWindow(bool disabled);
+bool DisableSlidingWindowActive();
+void ResetDisableSlidingWindowForTesting();
+
 // Build the shared vt operator arguments from a generic AttentionLayer. Future
 // model ports set layer.window_size with ResolveAttentionWindow; backend code
 // does not reinterpret W or clone model-specific window logic.

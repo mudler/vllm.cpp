@@ -997,6 +997,15 @@ of this tree reports acceptance for an EOS-terminated generation** — which is
 what every published comparison measures. Not fixed where it was found because
 it is a server-surface wave, not a change to the speculator.
 
+**OWNED ELSEWHERE SINCE 2026-09-05.** #2770 now names `SERVE-METRICS`, whose own
+recorded residual is "config-gated families (spec-decode/kv-connector/mm/LoRA)",
+and the port is specified in
+[spec-decode-metrics.md](spec-decode-metrics.md). This entry stays for the
+provenance — the gap was found here — and is no longer owed by this row. One
+detail above is also false at `c796fea41` and is corrected there: `bench_core.h`
+is not the only non-test reader, because `src/capi/spec_acceptance.h` and
+`examples/cli/main.cpp` read the same accessors.
+
 **W2 DISCHARGED O1, O2, O3 and O4.** They are kept below, struck through in
 prose rather than deleted, because the reason each existed is what a later reader
 needs and `.agents/completed/` is for superseded documents rather than for four

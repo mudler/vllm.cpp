@@ -9,10 +9,14 @@
 // test_metrics.py::EXPECTED_METRICS_V1, a substring assertion over the
 // exposition), so this mirrors those names 1:1.
 //
+// ALSO REGISTERED, config-gated exactly as upstream (SERVE-METRICS residual,
+// #2770): the four spec-decoding families, when and only when a speculative
+// config resolved a non-zero k. See vllm/v1/spec_decode/metrics.h.
+//
 // DEFERRED (config-gated in vLLM, so NOT part of the always-on core): the
 // kv-connector prefix-cache counters, mm-cache counters, LoRA info gauge,
-// spec-decoding metrics, kv-block-lifetime histograms, corrupted-request
-// counter, prompt_tokens_by_source, engine_sleep_state, and per-reason waiting
+// kv-block-lifetime histograms, corrupted-request counter,
+// prompt_tokens_by_source, engine_sleep_state, and per-reason waiting
 // breakdown values. vllm:num_requests_waiting_by_reason IS registered (name
 // parity) but recorded at the aggregate only.
 #ifndef VLLM_V1_METRICS_LOGGERS_H_
@@ -25,6 +29,7 @@
 
 #include "vllm/v1/metrics/prometheus.h"
 #include "vllm/v1/metrics/stats.h"
+#include "vllm/v1/spec_decode/metrics.h"
 
 namespace vllm::v1::metrics {
 
@@ -43,8 +48,15 @@ class PrometheusStatLogger {
   // `served_model_name` == vLLM served_model_name (the `model_name` label);
   // `max_model_len` drives the 1-2-5 request-token histogram buckets;
   // `engine_index` labels a single engine (`engine` label, default 0).
+  //
+  // `num_speculative_tokens` is speculative_config.num_speculative_tokens
+  // (loggers.py:477-481 passes `vllm_config.speculative_config` straight into
+  // SpecDecodingProm, which registers nothing when it is None). 0 — the DEFAULT,
+  // so every construction that predates #2770 keeps today's exposition — means
+  // no speculative config, and the four spec_decode families are then absent
+  // from /metrics rather than present and frozen at zero.
   PrometheusStatLogger(std::string served_model_name, int64_t max_model_len,
-                       int engine_index = 0);
+                       int engine_index = 0, int num_speculative_tokens = 0);
 
   // record() (loggers.py:1100-1257): fold one step's scheduler + iteration
   // stats into the registry. Either argument may be default-constructed.
@@ -76,6 +88,9 @@ class PrometheusStatLogger {
 
   mutable std::mutex mu_;
   PromRegistry registry_;
+  // loggers.py:447,477-481 self.spec_decoding_prom. Disabled (registers and
+  // records nothing) unless a speculative config resolved a non-zero k.
+  spec_decode::SpecDecodingProm spec_decoding_prom_;
   std::string model_name_;
   std::string engine_str_;
   std::vector<std::string> labelvalues_;  // {model_name, engine}

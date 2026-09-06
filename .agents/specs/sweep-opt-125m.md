@@ -484,3 +484,95 @@ with no fusion into the surrounding GEMMs. Per
 [[benchmark-gate-statistics]] and the acceptance rule, a speed claim requires the
 full every-axis grid vs a graphed vLLM denominator on an idle box; that is a
 separate increment.
+
+---
+
+## 8. The STRICT bar's licence now fails closed (#2805, 2026-09-05)
+
+§5 records why a strict token-exact bar with no near-tie band is honest here:
+the oracle's own greedy was MEASURED deterministic. The test re-asserted that
+measurement from the committed `greedy_dist.npy` — but **inside
+`if (fs::exists(...))`, with `multi_cells` initialised to `-1`**. Removing the
+evidence removed the check instead of failing it. The sibling guard eleven lines
+earlier was already correct: a missing *golden* emits a loud SKIP and returns.
+The selector got weaker treatment than the bar, and it is the selector that
+decides which bar applies.
+
+### 8a. What the mutation showed BEFORE the repair
+
+The gate runs end to end on the developer box (CPU, `~/models/opt-125m-bf16-st`
+staged), so the whole matrix below is measured, not argued. Baseline before the
+repair: **6/6 prompts, 96/96 tokens, 36 assertions, 0 skipped, SUCCESS**.
+
+| Mutation of the licence file | Before | After |
+|---|---|---|
+| removed | **SUCCESS**, 34 assertions, rc 0 | FAILURE at `REQUIRE(fs::exists(...))` |
+| truncated header | FAILURE (`LoadNpy` throws) | FAILURE, unchanged |
+| rewritten `[N,T,1]` | **SUCCESS**, 36 assertions, rc 0 | FAILURE at `REQUIRE(DK >= 5)` |
+| rewritten `[3,T,K]` | **SUCCESS**, 36 assertions, rc 0 | FAILURE at `REQUIRE(DN == N)` |
+| rewritten `<i8` | FAILURE — but INCIDENTALLY, `AsI32` reinterpreting the wider buffer yields 96 "multi-valued" cells | FAILURE at `REQUIRE(d.dtype == "<i4")` |
+| one cell `-1` in every run | **SUCCESS**, 36 assertions, rc 0 | FAILURE at `REQUIRE(unmeasured_values == 0)` |
+| run 0 shifted off the bar | **SUCCESS**, 36 assertions, rc 0 | FAILURE at `REQUIRE(bar_mismatches == 0)` |
+| one cell genuinely multi-valued (positive control) | FAILURE at `CHECK(multi_cells == 0)` | FAILURE, unchanged |
+
+The removed-file row is the whole defect in one line. The run printed
+`opt-125m STRICT correctness gate: 6/6 prompts token-exact (96/96 tokens) …
+(vLLM self-determinism: **-1** multi-valued cells)` and exited 0. The sentinel
+reached the report and nothing looked at it; the only trace of the missing
+licence was two fewer assertions, which nothing counts.
+
+The `<i8` row is why "it reds already" was not enough: it red for the wrong
+reason, on a garbage count, and a slightly different width could have red for no
+reason at all.
+
+### 8b. What changed
+
+- `REQUIRE_MESSAGE(fs::exists(gdir / "greedy_dist.npy"), …)` replaces the
+  existence guard. `parity::LoadNpy` throws on a malformed file and doctest
+  reports the throw as a failed test case, so *unreadable* reds by the same
+  route as *absent*.
+- `multi_cells` has no `-1` sentinel any more. The count is unconditional, so
+  the number the closing `MESSAGE` prints is always taken from the file.
+- Five further REQUIREs, one per way the count could read clean while measuring
+  nothing: `DK >= kMinDeterminismRuns` (5, the value the capture script
+  documents and never enforces — `K = max(1, args.runs)` makes `--runs 1` a
+  well-formed capture whose every cell is single-valued by construction),
+  `DN == N`, `DT == T`, `d.dtype == "<i4"`, `unmeasured_values == 0` (the
+  capture pads a short generation with `-1` in every run, and a padded position
+  agrees with itself), and `bar_mismatches == 0` (run 0 of the dist must BE the
+  bar, so a licence from some other capture cannot license this one).
+- The golden-set section moved ABOVE the checkpoint guard. The goldens are bytes
+  in this repository; their completeness does not depend on a host having the
+  checkpoint staged. Left behind that guard the new licence would be unexecuted
+  on every host that skips — including CI, which is exactly where a bad
+  re-capture arrives. A host without the checkpoint now runs 8 assertions
+  instead of 0, which also retires this gate's share of the
+  `assertions: 0 | Status: SUCCESS` problem that `vllm_cpp_add_test` documents.
+
+`CHECK(multi_cells == 0)` stays a `CHECK`. It is not a mute switch: the positive
+control above shows it fires, fails the case, and prints "re-derive it". The
+defect was a licence that could go missing, not one that could be refuted.
+
+### 8c. The bar was not weakened
+
+The diff has five hunks and the last ends at the engine load. The strict
+comparison, the first-bad-position divergence report,
+`REQUIRE(exact_prompts == N)`, the `prompt_token_ids` cross-check and the
+op-provider selection/decline proof are byte-unchanged.
+
+Measured, not just read: shifting one BAR token (and the licence with it, so the
+licence stays consistent and only the comparison can red) produces the SAME two
+failures on the pre-repair and post-repair binaries — `CHECK(exact)` for
+prompt[3] and `REQUIRE(exact_prompts == N)` with `5 == 6` — and the same
+diagnosis line, `DIVERGENCE prompt[3] first bad tok=7 ours=5 vLLM=6`. Only the
+line numbers moved.
+
+Clean post-repair gate: **6/6 prompts, 96/96 tokens, 43 assertions
+(36 + 7 preconditions), 0 failed, 0 skipped**. The golden bytes were restored
+and `sha256sum -c`-verified after every mutation.
+
+### 8d. Not measured here
+
+The engine leg ran on **CPU** on the developer box. This change touches no
+device path, and the CUDA and Metal legs of §5/§5a are unaffected by it, but
+they were not re-run: no GPU lease was taken for this repair.

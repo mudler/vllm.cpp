@@ -95,19 +95,20 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
     // fast refusal, raised at the TOP of `__call__` before prompt encoding, so
     // an unsatisfiable auto-duration costs no work.
     //
-    // WHAT IS *NOT* THE REASON: not the duration head's ARITHMETIC.
-    // `Ltx2DurationHeadForward` is ported and gated, including the audio-only
-    // case this pipeline would use — `test_ltx2_pipeline` runs it against
-    // `kLtx2DurAudioOnlyGolden`, generated from executed upstream. What is
-    // missing is a CONSTRUCTED head: nothing in this engine builds one, and
-    // `duration_head_path` is refused by name at load (#611). So the arithmetic
-    // exists and the object does not.
+    // WHAT IS *NOT* THE REASON: not the duration head's ARITHMETIC, and no
+    // longer a missing object either. Row LTX25-DURATION-HEAD-WIRE (#2900)
+    // builds a predictor from `duration_head_path` and resolves the count
+    // ABOVE this function, mirroring `resolve_num_frames` at the position
+    // `t2a_one_stage.py:103,123` calls it from. So a request arriving here
+    // with no count is one whose engine has no head to predict from — either
+    // no `duration_head_path` was named, or the file it named carries none.
     Fail("this request carries no frame count, and audio-only generation derives its DURATION "
          "from one: `AudioLatentShape.from_video_pixel_shape` reads `frames` and `fps` off the "
          "pixel shape (ltx-core types.py:184-200), which is why upstream passes a 512x512 "
          "PLACEHOLDER resolution and a real frame count (t2a_one_stage.py:37-40, :163-166). "
-         "Auto duration needs a DurationHead this engine does not construct. Pass num_frames or "
-         "duration_seconds.");
+         "Auto duration needs a DurationHead, and this engine was loaded without one: pass "
+         "`duration_head_path` at load to predict the duration, or pass num_frames or "
+         "duration_seconds here.");
   }
   if (req.frame_rate <= 0.0) Fail("frame_rate must be positive");
   if (req.context == nullptr || req.context_tokens < 1) {

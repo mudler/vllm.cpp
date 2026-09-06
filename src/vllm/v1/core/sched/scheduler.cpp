@@ -1173,6 +1173,12 @@ EngineCoreOutputs Scheduler::update_from_output(
   std::set<Request*> stopped_preempted_reqs;
   std::vector<std::string> finished_ids_to_erase;
 
+  // scheduler.py:1828 `spec_decoding_stats: SpecDecodingStats | None = None`.
+  // Lazily constructed by the first request that verified a draft this step and
+  // stashed for make_stats() at the end (#2770). Stays empty on every
+  // non-speculative step, which is the polarity SchedulerStats carries.
+  std::optional<spec_decode::SpecDecodingStats> spec_decoding_stats;
+
   // NOTE(woosuk): upstream iterates num_scheduled_tokens.items() (dict/schedule
   // order); std::map iterates in sorted key order. The set of outputs is the
   // same — only their order in the returned vector differs, which is benign
@@ -1234,7 +1240,14 @@ EngineCoreOutputs Scheduler::update_from_output(
       if (request->num_output_placeholders > 0) {
         request->num_output_placeholders -= num_rejected;
       }
-      // (make_spec_decoding_stats telemetry is deferred — no SpecDecodingStats.)
+      // scheduler.py:1918-1924 make_spec_decoding_stats: the SAME num_draft_tokens
+      // and num_accepted the rollback above just computed, folded into this
+      // step's aggregate. This is the production call site the /metrics
+      // spec_decode families are fed from (#2770); delete it and the exposition
+      // never moves.
+      spec_decoding_stats = make_spec_decoding_stats(
+          std::move(spec_decoding_stats), num_draft_tokens, num_accepted,
+          scheduler_output.num_invalid_spec_tokens, req_id);
     }
     // Free encoder inputs only AFTER the step has actually executed
     // (scheduler.py:1699-1701). Freeing at schedule time would drop an entry the
@@ -1410,9 +1423,43 @@ EngineCoreOutputs Scheduler::update_from_output(
     kv_event_publisher_->publish(batch);
   }
 
+  // scheduler.py:2211 hands spec_decoding_stats to make_stats in the same call.
+  // EngineCore calls our make_stats() AFTER this function returns, so the value
+  // is stashed instead — the identical arrangement schedule() already uses for
+  // the prefix-cache delta. Unconditional, so a step that verified no draft
+  // CLEARS the stash and cannot re-report the previous step's aggregate.
+  last_spec_decoding_stats_ = std::move(spec_decoding_stats);
+
   EngineCoreOutputs engine_core_outputs;
   engine_core_outputs.outputs = std::move(outputs);
   return engine_core_outputs;
+}
+
+std::optional<spec_decode::SpecDecodingStats> Scheduler::make_spec_decoding_stats(
+    std::optional<spec_decode::SpecDecodingStats> spec_decoding_stats,
+    int num_draft_tokens, int num_accepted_tokens,
+    const std::map<std::string, int>& num_invalid_spec_tokens,
+    const std::string& request_id) const {
+  // scheduler.py:2722-2723 `if not self.log_stats or not num_draft_tokens:
+  // return None`. Returning EMPTY rather than the accumulated value is upstream's
+  // own shape, and it is load-bearing: a step whose only drafted request was
+  // dropped reports nothing at all instead of a zero-valued draft.
+  if (!log_stats_ || num_draft_tokens <= 0) {
+    return std::nullopt;
+  }
+  if (!spec_decoding_stats.has_value()) {
+    // scheduler.py:2724-2725 SpecDecodingStats.new(self.num_spec_tokens).
+    spec_decoding_stats = spec_decode::SpecDecodingStats::New(num_spec_tokens_);
+  }
+  // scheduler.py:2726-2727: a draft position the drafter could not fill was
+  // scheduled as a -1 placeholder and must not count as drafted.
+  const auto invalid = num_invalid_spec_tokens.find(request_id);
+  if (invalid != num_invalid_spec_tokens.end()) {
+    num_draft_tokens -= invalid->second;
+  }
+  // scheduler.py:2728-2730 observe_draft.
+  spec_decoding_stats->ObserveDraft(num_draft_tokens, num_accepted_tokens);
+  return spec_decoding_stats;
 }
 
 CachedRequestData Scheduler::make_cached_request_data(
@@ -1619,6 +1666,10 @@ SchedulerStats Scheduler::make_stats() const {
   stats.num_waiting_reqs = static_cast<int64_t>(waiting->size());
   stats.kv_cache_usage = kv_cache_manager->usage();
   stats.prefix_cache_stats = last_prefix_cache_stats_;
+  // scheduler.py:2696,2708 `spec_stats = spec_decoding_stats` ->
+  // SchedulerStats(spec_decoding_stats=spec_stats). Empty unless
+  // update_from_output verified a draft this step (#2770).
+  stats.spec_decoding_stats = last_spec_decoding_stats_;
   return stats;
 }
 

@@ -948,6 +948,54 @@ TEST_CASE("ROCm apply_min_p / penalties surface matches CPU mask pattern") {
   }
 }
 
+TEST_CASE("ROCm random_sample agrees with CPU on the vast majority of rows") {
+  // Same contract as the CUDA case above: host and device compute q = -log(U)
+  // in double via different libm (host libm vs ROCm device libm), so ~1 ULP
+  // differences can flip a near-tied argmax. Statistical >=98% agreement, not
+  // bit-exact. The parallel kernel uses the same GumbelScore and ArgReduce as
+  // the CPU reference, so the agreement is a property of the shared header.
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  const int64_t N = 64, V = 128;
+  auto logits = RandomLogits(static_cast<size_t>(N * V), 909);
+  std::vector<float> probs(static_cast<size_t>(N * V));
+  for (int64_t i = 0; i < N; ++i) {
+    float mx = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < V; ++j) mx = std::max(mx, logits[static_cast<size_t>(i * V + j)]);
+    float sum = 0.0f;
+    for (int64_t j = 0; j < V; ++j) {
+      const float e = std::exp(logits[static_cast<size_t>(i * V + j)] - mx);
+      probs[static_cast<size_t>(i * V + j)] = e;
+      sum += e;
+    }
+    for (int64_t j = 0; j < V; ++j) probs[static_cast<size_t>(i * V + j)] /= sum;
+  }
+  std::vector<int64_t> seeds(static_cast<size_t>(N));
+  for (int64_t i = 0; i < N; ++i) seeds[static_cast<size_t>(i)] = 700 + i;
+
+  std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+  Tensor tp = MakeT(probs.data(), DType::kF32, Cpu(), {N, V});
+  Tensor ts = MakeT(seeds.data(), DType::kI64, Cpu(), {N});
+  Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+  Queue cq = Q();
+  vt::RandomSample(cq, ti, tp, ts);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  QueueGuard gq(gpu);
+  RocmDeviceTensor dp(gpu, gq.q, DType::kF32, {N, V}, probs.data());
+  RocmDeviceTensor ds(gpu, gq.q, DType::kI64, {N}, seeds.data());
+  RocmDeviceTensor did(gpu, gq.q, DType::kI64, {N});
+  vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
+  std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+  did.Download(gq.q, id_gpu.data());
+  size_t agree = 0;
+  for (size_t i = 0; i < id_cpu.size(); ++i)
+    if (id_gpu[i] == id_cpu[i]) ++agree;
+  CHECK(agree >= static_cast<size_t>(0.98 * static_cast<double>(N)));
+}
+
 // ===========================================================================
 // #1984 — the parallel Gumbel draw selects the SAME token as the serial scan.
 //
@@ -1305,6 +1353,93 @@ TEST_CASE("CUDA random_sample: the parallel path is BIT-IDENTICAL to the serial 
   REQUIRE_FALSE(parallel.empty());
   REQUIRE(parallel.find("IDS v=248320") != std::string::npos);
   // Only the arm label may differ.
+  std::string a = parallel, b = serial;
+  const auto strip_arm = [](std::string& t) {
+    const size_t p = t.find("IDS arm=");
+    if (p == std::string::npos) return;
+    t.erase(p, t.find('\n', p) - p + 1);
+  };
+  strip_arm(a);
+  strip_arm(b);
+  CHECK(a == b);
+}
+
+// ---------------------------------------------------------------------------
+// ROCm: the same A/B contract as CUDA above. The child re-execs with
+// VT_FAST_RANDOM_SAMPLE=0 and =1 and the token ids must be byte-identical,
+// because both arms use the same device libm and ArgReduce is order-independent.
+TEST_CASE("random_sample_ab_child_rocm" * doctest::skip()) {
+  if (!HasRocm()) {
+    std::cout << "IDS no-rocm\n" << std::flush;
+    std::exit(0);
+  }
+  const char* arm = std::getenv("VT_FAST_RANDOM_SAMPLE");
+  std::cout << "IDS arm=" << (arm == nullptr ? "unset(fast)" : arm) << "\n";
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  const std::vector<RowKind> kinds = {RowKind::kAllEqual, RowKind::kTopKMasked,
+                                      RowKind::kSoftmax, RowKind::kAllZero};
+  for (const int64_t v : kAbWidths) {
+    const int64_t n = 4;
+    std::vector<float> probs(static_cast<size_t>(n * v));
+    std::vector<int64_t> seeds(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      seeds[static_cast<size_t>(i)] = 700 + i;
+      const std::vector<float> row =
+          MakeProbRow(kinds[static_cast<size_t>(i)], v, static_cast<uint32_t>(v + i));
+      std::copy(row.begin(), row.end(), probs.begin() + static_cast<size_t>(i * v));
+    }
+    QueueGuard gq(gpu);
+    RocmDeviceTensor dp(gpu, gq.q, DType::kF32, {n, v}, probs.data());
+    RocmDeviceTensor ds(gpu, gq.q, DType::kI64, {n}, seeds.data());
+    RocmDeviceTensor did(gpu, gq.q, DType::kI64, {n});
+    vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
+    std::vector<int64_t> ids(static_cast<size_t>(n));
+    did.Download(gq.q, ids.data());
+    std::cout << "IDS v=" << v;
+    for (const int64_t id : ids) std::cout << " " << id;
+    std::cout << "\n";
+  }
+  std::cout << std::flush;
+  std::exit(0);
+}
+
+TEST_CASE("ROCm random_sample: the parallel path is BIT-IDENTICAL to the serial one") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  char exe[4096];
+  const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  REQUIRE(n > 0);
+  exe[n] = '\0';
+  auto run = [&](const char* arm) {
+    const std::string cmd = "VT_FAST_RANDOM_SAMPLE=" + std::string(arm) + " " +
+                            std::string(exe) +
+                            " --no-skip --test-case='random_sample_ab_child_rocm' 2>&1";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    REQUIRE(pipe != nullptr);
+    std::string out;
+    std::array<char, 4096> buf{};
+    while (std::fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) out += buf.data();
+    REQUIRE(::pclose(pipe) != -1);
+    std::string ids;
+    size_t pos = 0;
+    while (pos < out.size()) {
+      const size_t eol = out.find('\n', pos);
+      const std::string line = out.substr(pos, eol == std::string::npos ? eol : eol - pos);
+      if (line.rfind("IDS ", 0) == 0) ids += line + "\n";
+      if (eol == std::string::npos) break;
+      pos = eol + 1;
+    }
+    return ids;
+  };
+  const std::string parallel = run("1");
+  const std::string serial = run("0");
+  MESSAGE("compared VT_FAST_RANDOM_SAMPLE=1 (the block-cooperative reduction) against "
+          "VT_FAST_RANDOM_SAMPLE=0 (the retained single-thread scan), same binary");
+  INFO("parallel arm:\n" << parallel << "serial arm:\n" << serial);
+  REQUIRE_FALSE(parallel.empty());
+  REQUIRE(parallel.find("IDS v=248320") != std::string::npos);
   std::string a = parallel, b = serial;
   const auto strip_arm = [](std::string& t) {
     const size_t p = t.find("IDS arm=");

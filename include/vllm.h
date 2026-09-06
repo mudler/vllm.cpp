@@ -342,7 +342,16 @@ extern "C" {
  * ours and a 0.928x deficit could not be attributed to execution speed or to
  * acceptance. A NEW ENTRY POINT, so every existing struct and call is
  * byte-identical. */
-#define VLLM_ABI_VERSION 25
+/* v26 — vllm_model_params.disable_sliding_window, the MODEL-LEVEL SLIDING-WINDOW
+ * KILL SWITCH (row `ENG-ATTENTION-WINDOW` W3, issue #2388). Mirrors vLLM's
+ * `ModelConfig.disable_sliding_window` (`vllm/config/model.py:248` @ pin
+ * `5559679229`), which is ONE model-agnostic field rather than a per-architecture
+ * toggle. It replaces `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING`, two
+ * kernel-internal environment knobs that gave this control to two of the five
+ * model families that have a window and to none of the other three. A new
+ * TRAILING field on a struct whose callers zero-initialize, and 0 is the existing
+ * default, so a zero-initialized v25 struct is byte-identical. */
+#define VLLM_ABI_VERSION 26
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -574,6 +583,20 @@ typedef struct vllm_model_params {
    * SGLang's cache-aware LPM) is a SEPARATE knob — the v9 string field
    * .scheduling_policy = "lpm", not an int here. */
   int32_t enable_jump_forward;
+  /* ── Sliding window (ABI v26) ──────────────────────────────────────────────
+   * Disables the MODEL-LEVEL sliding window for every model that has one,
+   * mirroring vLLM's ModelConfig.disable_sliding_window
+   * (vllm/config/model.py:248). Upstream's own docstring settles what happens to
+   * a model without one: "If the model does not support sliding window, this
+   * argument is ignored."
+   *   0 => DEFAULT: sliding window enabled (upstream's `= False`, and the
+   *        byte-identical behaviour of every release before v26).
+   *   1 => disable it.
+   *   2 => explicitly enable it.
+   * Any other value fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT.
+   * A per-layer window still wins over this switch, which is upstream's
+   * precedence (attention.py:204-236): the flag clears the MODEL-level value. */
+  int32_t disable_sliding_window;
   /* ── Device selection (ABI v14) ────────────────────────────────────────────
    * Which device the text-generation engine serves on, mirroring vLLM's
    * DeviceConfig.device names (vllm/config/device.py:13 — Device =

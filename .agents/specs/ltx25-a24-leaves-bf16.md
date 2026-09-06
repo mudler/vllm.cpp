@@ -597,11 +597,16 @@ C++-side half is actually covered.
   shipped checkpoint is not on the NAS** (`ltx2_upsampler.h:39-44`), so that arm
   has no real-weight result on any dtype.
 * **The DURATION HEAD's bf16 arm** (`ltx2_duration_head.h:55-58`,
-  `DurationPredictor` at `distilled.py:163-165`). **Blocked on reachability, not
-  on arithmetic**: zero production call sites, and `ltx2_video.cpp:573-583`
-  refuses its own `duration_head_path` extra by name. It must be WIRED first
-  (#611, `.agents/specs/ltx25-retire-dead-arms.md`) before a dtype arm for it can
-  be gated at all, because the reachability mutation has no call site to delete.
+  `DurationPredictor` at `distilled.py:163-165`). **No longer blocked on
+  reachability.** When this was written the head had zero production call sites
+  and `duration_head_path` was refused by name, so a dtype arm could not be gated
+  at all — the reachability mutation had no call site to delete. Row
+  `LTX25-DURATION-HEAD-WIRE`
+  ([#2900](https://github.com/mudler/vllm.cpp/issues/2900),
+  `.agents/specs/ltx25-duration-head-wire.md`) supplied the wiring, and
+  `Ltx2LoadDurationHeadWeights` already takes the `compute_dtype` the arm needs,
+  so what remains is a call-site change plus its fixture. Still owed, and still
+  not this row's.
 * **§A.7's anchor for the latent upsampler has ROTTED.** The scope doc cites
   `ltx2_upsampler.h:66-70` for that header's DTYPE record; at `72858451d` the
   block is at `:108-112` and line 66 is a bare `//`. The file last moved at
@@ -609,6 +614,19 @@ C++-side half is actually covered.
   resolve (`ltx2_video_vae_encoder.h:52` and `ltx2_duration_head.h:55`), so this
   is one stale cell and not a systematic drift. The scope doc is operator-owned
   and this row does not edit it.
+* **[#2855](https://github.com/mudler/vllm.cpp/issues/2855) — `gen-ltx2-vae-goldens.py`
+  emits THREAD-COUNT-DEPENDENT goldens.** Regenerating the committed file at
+  `OMP_NUM_THREADS=2` moves 4970 lines; at this box's default core count it is
+  byte-identical. So "the goldens regenerate byte-identically" is a check only
+  one machine can run, which is not what a golden is for. It is listed HERE
+  because this row's own fresh review is what found it, and this row deliberately
+  left it out of scope: §6e was checked at both thread counts and is
+  thread-invariant, so nothing this row landed depends on it. It needs its own
+  spec, because it decides what a golden MEANS here — pin the thread count and
+  accept a one-time diff, make the reductions order-independent, or fold the
+  thread count into the oracle's identity so a mismatched regeneration refuses.
+  Recorded rather than left orphaned: an issue nobody owns is how 701 of them
+  accumulated.
 * **Whether the audio VAE's argued f32 extends above the vocoder.** §A.7 names
   this as a bound on A24's population and returns it; this row does not resolve
   it.

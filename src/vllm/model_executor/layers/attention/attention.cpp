@@ -4,6 +4,7 @@
 // @ e24d1b24fe96.
 #include "vllm/model_executor/layers/attention/attention.h"
 
+#include <atomic>
 #include <limits>
 #include <stdexcept>
 
@@ -29,6 +30,25 @@ std::optional<vt::AttentionWindow> ResolveAttentionWindow(
   }
   return vt::AttentionWindow{radius, 0};
 }
+
+namespace {
+// Resolved ONCE at load and read on the decode path, so this is a plain relaxed
+// flag rather than a mutex: it is written before any forward runs and only read
+// afterwards. `std::atomic` because a test writes it between cases on one thread
+// while nothing else is running, and because a future multi-engine process must
+// not have a data race here by construction.
+std::atomic<bool> g_disable_sliding_window{false};
+}  // namespace
+
+void SetDisableSlidingWindow(bool disabled) {
+  g_disable_sliding_window.store(disabled, std::memory_order_relaxed);
+}
+
+bool DisableSlidingWindowActive() {
+  return g_disable_sliding_window.load(std::memory_order_relaxed);
+}
+
+void ResetDisableSlidingWindowForTesting() { SetDisableSlidingWindow(false); }
 
 vt::PagedAttentionArgs MakePagedAttentionArgs(float scale, bool causal,
                                                const v1::AttentionLayer& layer) {

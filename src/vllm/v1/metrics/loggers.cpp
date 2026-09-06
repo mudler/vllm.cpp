@@ -59,7 +59,8 @@ const std::vector<double>& RequestLatencyBuckets() {
 
 PrometheusStatLogger::PrometheusStatLogger(std::string served_model_name,
                                            int64_t max_model_len,
-                                           int engine_index)
+                                           int engine_index,
+                                           int num_speculative_tokens)
     : model_name_(std::move(served_model_name)),
       engine_str_(std::to_string(engine_index)),
       labelvalues_({model_name_, std::to_string(engine_index)}) {
@@ -193,6 +194,14 @@ PrometheusStatLogger::PrometheusStatLogger(std::string served_model_name,
   // reason); prime the common "stop" reason for exposition presence.
   registry_.Prime("vllm:request_success",
                   {model_name_, engine_str_, "stop"});
+
+  // ── Speculative decoding (config-gated) ───────────────────────────────────
+  // loggers.py:477-481. Registers the four spec_decode families and primes
+  // their series, or does nothing at all when k == 0. Last, so the always-on
+  // catalog's registration order — which is the exposition order — is
+  // unchanged for a non-speculative server.
+  spec_decoding_prom_.Register(&registry_, num_speculative_tokens, labels,
+                               labelvalues_);
 }
 
 void PrometheusStatLogger::Inc(const std::string& name, double v) {
@@ -223,6 +232,13 @@ void PrometheusStatLogger::Record(const SchedulerStats& s,
       static_cast<double>(s.prefix_cache_stats.queries));
   Inc("vllm:prefix_cache_hits",
       static_cast<double>(s.prefix_cache_stats.hits));
+
+  // Speculative decoding (loggers.py:1140-1143). Present only on a step that
+  // verified a draft; Observe is itself a no-op while the family is
+  // unregistered, so the guard mirrors upstream rather than substituting for it.
+  if (s.spec_decoding_stats.has_value()) {
+    spec_decoding_prom_.Observe(*s.spec_decoding_stats);
+  }
 
   // Iteration counters (loggers.py:1191-1205).
   Inc("vllm:num_preemptions", static_cast<double>(it.num_preempted_reqs));

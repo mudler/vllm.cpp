@@ -1,0 +1,46 @@
+WHY THE PIN STAYS AT c796fea41 THOUGH main HAS MOVED
+#2944, checked 2026-09-05 after the queue wait
+
+At submission (02:34Z) `origin/main` was c796fea41f74fe90b8cf78190eeb2a5b4c977449,
+and that is the revision the job asserts and the bundle carries. By 03:0xZ main
+had advanced 15 commits to 26084e8e4. The brief says "built from main's current
+head", so the question is whether to re-pin.
+
+MEASURED, not assumed. My base is still an ancestor (fast-forward only):
+
+    git merge-base --is-ancestor c796fea41 origin/main   -> 0
+    git rev-list --left-right --count origin/main...HEAD -> 15 behind, 1 ahead
+    (the 1 ahead is my spec; git diff --name-only origin/main...HEAD
+     lists exactly .agents/specs/bench-rocm-strix-vllmcpp-arm-head.md)
+
+The 15 commits, by area:  5 .agents/specs, 1 .agents/NOW.md, 2 examples/bench,
+2 tests, 1 tests/CMakeLists.txt, 1 CMakeLists.txt.
+
+THE MEASURED PATH IS UNTOUCHED:
+
+    git diff --name-only c796fea41..origin/main \
+      -- src/vt/rocm include/vt/rocm src/vt/op_provider.cpp examples/cli
+    -> EMPTY
+
+The whole product surface differs by ONE hunk, and it is inert for this build:
+
+    +if(TARGET test_bench_eos_chat_template AND TARGET vllm-bench)
+    +  add_dependencies(test_bench_eos_chat_template vllm-bench)
+    +endif()
+
+This job configures with -DVLLM_CPP_BUILD_TESTS=OFF, so `test_bench_eos_chat_template`
+is not a target and the block never fires. It also only orders two TEST targets;
+it touches neither `vllm-cli` nor `libvllm.so`.
+
+CONCLUSION. For this build configuration the two revisions produce the same
+`vllm-cli` and the same `libvllm.so`. Re-pinning would rebuild an 88 MB bundle,
+re-declare three constants and surrender the queue slot, to measure identical
+bytes -- and main would move again during the rebuild. This repository has
+already recorded that a full gate cannot finish between main moves.
+
+What matters for #2933 is not that the pin is the LATEST head; it is that the
+pin is ASSERTED and RECORDED, and that it is after the #2511 fix. c796fea41 is
+3 days after that fix reached main as 27da7787e (2026-09-02 15:11 UTC).
+
+So the pin stays, and this file is why. The published figure names c796fea41,
+never "main", because "main" is not a reproducible identifier.

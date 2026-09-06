@@ -457,8 +457,10 @@ struct VoxtralDecodeGraph::Impl {
     // for themselves before this row, and there was no one switch that turned
     // capture off. This driver no longer owns a copy of it.
     Backend& b = vt::GetBackend(queue.device.type);
+    // The TT captured arm of this family is not gated (#2812): explicit opt-in only.
     enabled = vt::GraphCaptureEnabled() &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+              !vllm::platforms::GetPlatform(queue.device.type).static_graph_requires_opt_in() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {

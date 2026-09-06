@@ -219,10 +219,26 @@ TEST_CASE("combine: num_new_sampled_tokens==0 writes no sampled id, empty logits
 // text and NOT on a golden, for a measured reason: speculative decoding is
 // lossless, so a destroyed draft costs acceptance and nothing else. The spec's
 // recorded mutation run corrupted the last draft of EVERY verify block in every
-// arm and the emitted tokens did not move, the identity assertions passed, and
-// the synthetic head's acceptance signal had zero dynamic range (`ns=1 acc=0`
-// in the baseline too). Reason A shipped once already as #1366. Only a
-// comparison against the proposer's own ids discriminates.
+// arm and the emitted tokens did not move OVER THOSE ROWS, and the identity
+// assertions passed. Reason A shipped once already as #1366.
+//
+// THE "ZERO DYNAMIC RANGE" HALF OF THAT PARAGRAPH WAS TOO STRONG, and a round-3
+// review measured it (SPEC-DFLASH2 A2-3, #2911). The synthetic head's acceptance
+// is not uniformly `ns=1 acc=0`: under the corrupted shape, at `k=1`, positions
+// 9 and 11 read `ns=2 acc=1 draft=[ 1 ] emit=[ 1 1 ]` where the correct shape
+// reads `ns=1 acc=0 emit=[ 1 ]`, because the slot the committed token lands on
+// then MATCHES and is accepted. Over the whole run the corrupted shape emits 198
+// tokens against 197 — one inserted, the rest identical — so acceptance can RISE
+// and the emitted stream is not byte-identical end to end.
+//
+// THAT DOES NOT MAKE AN ACCEPTANCE GATE THE INSTRUMENT HERE, for two reasons and
+// both of them are why this file is written on ids. The difference is only
+// reachable under mutation M (the veto deleted at both `async_input_combine_`
+// assignments), which no committed configuration reaches, and its SIGN is an
+// artefact of the corruption coinciding with the committed token rather than a
+// property of the defect. A comparison against the proposer's own ids
+// discriminates on every input, on the committed tree, and says which id is
+// wrong.
 //
 // The instrument drives the draft-aware combine DIRECTLY rather than through the
 // runner, because the runner cannot reach it: `async_input_combine_` is vetoed

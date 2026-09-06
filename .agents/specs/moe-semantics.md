@@ -26,8 +26,11 @@ Pinned sources read:
 - `tests/kernels/moe/test_fused_topk.py::torch_topk` and
   `tests/kernels/utils.py::torch_experts` (the pinned torch-native
   references — our golden oracles, see §7)
-- `vllm/model_executor/layers/fused_moe/cpu_fused_moe.py::select_experts`
-  (pinned torch-native production path, used as dump-time cross-check)
+- `vllm/model_executor/layers/fused_moe/experts/cpu_moe.py::select_experts`
+  (pinned torch-native production path, used as dump-time cross-check; MOVED
+  here from `fused_moe/cpu_fused_moe.py` by vLLM `0a6446005d`, vllm#50133
+  "[CPU] Migrate unquantized MoE to the modular-kernel experts structure",
+  same signature and same semantics)
 - `vllm/model_executor/layers/activation.py` (`SiluAndMul.forward_native`)
 - `vllm/model_executor/layers/quantization/modelopt.py` +
   `.../quantization/utils/nvfp4_emulation_utils.py` +

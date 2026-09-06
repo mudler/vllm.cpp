@@ -59,7 +59,7 @@ class TenstorrentBackend final : public Backend {
   void OnScratchBlockAcquired(void* p) override { MarkScratchAcquired(p); }
   void Memset(Queue&, void* p, int value, size_t bytes) override {
     // HOST-FREE-FORWARD R3: on-device zero-fill when capturing.
-    if (MemsetDeviceIfCapture(p, value)) return;
+    if (MemsetDeviceIfCapture(p, value, bytes)) return;
     // W7 (#2282): an eager FULL-slot zero of a device-resident slot fills the
     // shadow and keeps it — the next device read serves the shadow instead of
     // restaging the zeros. The host bytes are still memset here.
@@ -73,7 +73,7 @@ class TenstorrentBackend final : public Backend {
   void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
     // HOST-FREE-FORWARD R2: when capturing, prefer a device->device copy so the
     // captured region has no host readback (which ttnn trace prohibits).
-    if (CopyDeviceDeviceIfCapture(dst, src)) return;
+    if (CopyDeviceDeviceIfCapture(dst, src, bytes)) return;
     // W7 (#2282): outside capture, a device-resident source copied into a
     // slot that already owns a persistent buffer goes device->device — the
     // host path would download, memcpy, drop the shadow, and re-upload the

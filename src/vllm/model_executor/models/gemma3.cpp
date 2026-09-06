@@ -64,19 +64,6 @@ int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   return it->get<int64_t>();
 }
 
-// VT_GEMMA3_SLIDING (default ON): thread the per-layer sliding window into paged
-// attention on sliding layers (faithful to vLLM). Inert for contexts <
-// sliding_window (the gate battery is short), so the SACRED gate is unaffected;
-// the toggle exists only for a same-binary A/B if the windowed kernel path ever
-// perturbs bf16 rounding. Read once (process-stable).
-bool SlidingWindowEnabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_GEMMA3_SLIDING");
-    return !(e != nullptr && e[0] == '0');
-  }();
-  return on;
-}
-
 // Per-layer Gemma-3 routing derived from the config.
 struct Gemma3Layout {
   int64_t sliding_window_pattern;  // 1-in-N layers are full attention
@@ -195,7 +182,7 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
     pa.window_size = ResolveAttentionWindow(
         /*per_layer=*/std::nullopt, sliding_window,
         v1::AttentionType::kDecoder,
-        /*disable_model_sliding_window=*/!SlidingWindowEnabled());
+        /*disable_model_sliding_window=*/DisableSlidingWindowActive());
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

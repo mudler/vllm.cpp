@@ -61,7 +61,7 @@ def default_out_dir():
     )
 
 
-def parse_args():
+def _parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=os.environ.get("QWEN3_MODEL", "Qwen/Qwen3-0.6B"))
     ap.add_argument("--out-dir", default=None,
@@ -77,7 +77,25 @@ def parse_args():
                     help="decode each prompt in its OWN generate() call (batch size 1) "
                          "to match the paged-engine gate's single-request decode "
                          "regime; otherwise all prompts are batched in one call")
-    return ap.parse_args()
+    ap.add_argument("--enforce-eager", action="store_true",
+                    help="use eager execution for diagnostics instead of the "
+                         "production execution mode")
+    return ap.parse_args(argv)
+
+
+def _llm_kwargs(args):
+    return {
+        "model": args.model,
+        "dtype": "bfloat16",
+        "enforce_eager": args.enforce_eager,
+        "gpu_memory_utilization": args.gpu_mem,
+    }
+
+
+def _mode_narration(args):
+    eager = args.enforce_eager
+    mode = "eager diagnostic" if eager else "production"
+    return f"oracle execution mode: {mode} (enforce_eager={eager})"
 
 
 def generate_all(llm, sp, per_prompt):
@@ -94,7 +112,7 @@ def generate_all(llm, sp, per_prompt):
 
 
 def main():
-    args = parse_args()
+    args = _parse_args()
     from vllm import LLM, SamplingParams
 
     out_dir = args.out_dir or default_out_dir()
@@ -103,8 +121,8 @@ def main():
     T = args.max_tokens
     K = max(1, args.runs)
 
-    llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
-              gpu_memory_utilization=args.gpu_mem)
+    print(_mode_narration(args), flush=True)
+    llm = LLM(**_llm_kwargs(args))
     sp = SamplingParams(temperature=0.0, max_tokens=T)
 
     # runs[k][i] = list of token ids for prompt i on run k (padded to T with -1).

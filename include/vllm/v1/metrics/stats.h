@@ -41,9 +41,15 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
+
+// stats.py:12 `from vllm.v1.spec_decode.metrics import SpecDecodingStats` — the
+// spec-decode aggregate is defined beside the counters that consume it, and
+// SchedulerStats only carries it.
+#include "vllm/v1/spec_decode/metrics.h"
 
 namespace vllm::v1 {
 
@@ -167,9 +173,10 @@ class CachingMetrics {
 
 // Ported from: @dataclass SchedulerStats (vllm/v1/metrics/stats.py:186-215).
 // The always-on subset the Prometheus scheduler-state metrics read (loggers.py
-// PrometheusStatLogger.record). Advanced fields (DP wave, cudagraph, spec-decode,
-// kv-connector, lora, eviction events) are deferred with their config-gated
-// metric families and are not part of the SERVE-METRICS core.
+// PrometheusStatLogger.record), plus spec_decoding_stats. The remaining advanced
+// fields (DP wave, cudagraph, kv-connector, lora, eviction events) are deferred
+// with their config-gated metric families and are not part of the SERVE-METRICS
+// core.
 struct SchedulerStats {
   // Number of requests currently in a model-execution batch.
   int64_t num_running_reqs = 0;
@@ -179,6 +186,13 @@ struct SchedulerStats {
   double kv_cache_usage = 0.0;
   // This step's take-and-swap prefix-cache observation (TOKEN counts).
   PrefixCacheStats prefix_cache_stats;
+  // stats.py:206 `spec_decoding_stats: SpecDecodingStats | None = None`.
+  // SET ONLY on a step that verified at least one draft token (#2770): an
+  // engine with no speculator never sets it, and neither does a speculative
+  // engine's prefill step, which is why it is an optional rather than a
+  // zero-valued aggregate. `PrometheusStatLogger::Record` folds it into the
+  // spec_decode counter families when it is present (loggers.py:1140-1143).
+  std::optional<spec_decode::SpecDecodingStats> spec_decoding_stats;
 };
 
 // Ported from: @dataclass FinishedRequestStats (vllm/v1/metrics/stats.py:236-259).

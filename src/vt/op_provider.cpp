@@ -585,6 +585,8 @@ const char* OpNameImpl(OpId op) {
       return "Exl3Gemm";
     case OpId::kExl3MoeMlp:
       return "Exl3MoeMlp";
+    case OpId::kKeepQuantDecode:
+      return "KeepQuantDecode";
     case OpId::kCount:
       break;
   }

@@ -19,6 +19,13 @@
 // predicate and the F16 remainder conversion. Nothing here re-derives them.
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 
+// MODEL-DFLASH2-NVFP4 (#2758): the SHARED ModelOpt/compressed-tensors NVFP4
+// probe and reader, and the one reader of VT_MODELOPT_W4A4. The draft and the
+// target must not be able to disagree about what an NVFP4 projection is.
+#include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
+
+#include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
@@ -174,6 +181,192 @@ bool DeclaredCausal(const nlohmann::json& obj, const char* key, bool* out) {
                "bool(), and the GGUF arm reads the same value as an integer)");
   *out = v.is_boolean() ? v.get<bool>() : (v.get<double>() != 0.0);
   return true;
+}
+
+// ── MODEL-DFLASH2-NVFP4 (#2758): the DRAFT'S OWN quantization declaration ────
+//
+// Upstream reads it and this loader did not even carry it.
+// `DFlashQwen3Model.__init__` resolves `self.quant_config =
+// get_draft_quant_config(vllm_config)` (qwen3_dflash.py:410 @ the parity pin
+// `e126687a9a828d513c01a07cd69f025f27d63280`) and hands it to every Linear it
+// builds -- `qkv_proj` and `o_proj` at `:216-230`, the two sublayers at `:339`
+// and `:348`, `fc` at `:456-464`. `get_draft_quant_config`
+// (`vllm/model_executor/models/utils.py:929-948`) exists for exactly one reason,
+// which its own docstring states: "Draft models should use their own
+// quantization config instead of the verifier/target model's config."
+//
+// THE ARM QUESTION IS THEREFORE THE DECLARATION, not a tensor-name probe, and
+// on this artifact it could not have been a probe. The EXL3 rung asks about
+// `fc` because `fc` is the one projection every DFlash draft carries -- and
+// `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` @ `bd7a9342` EXCLUDES `fc`
+// from quantization, so `fc` is BF16 there and answers nothing. The tensors are
+// still read, as a CROSS-CHECK in both directions; see `ModuleTakesNvfp4`.
+enum class DraftQuantArm { kNone, kNvfp4 };
+
+struct DraftQuant {
+  DraftQuantArm arm = DraftQuantArm::kNone;
+  // UPPER-cased, as every upstream `quant_algo` return is
+  // (modelopt.py:240-263, :317-323).
+  std::string quant_algo;
+  std::vector<std::string> exclude;
+  // `NVFP4` is 4-bit weights AND 4-bit activations; `W4A16_NVFP4` is
+  // weight-only. This build executes both W4A16 unless VT_MODELOPT_W4A4=1, so
+  // the first spelling is a divergence the load has to SAY. See the notice.
+  bool declares_w4a4 = false;
+
+  // modelopt.py:139-175 `is_layer_excluded`. Exact match, then the legacy
+  // substring rule kept for pre-0.39 ModelOpt exports, then wildcards.
+  //
+  // The `packed_modules_mapping` half of upstream's `is_layer_skipped` is NOT
+  // mirrored, and the reason is structural rather than an omission: that half
+  // unfuses a fused module name into its shards before comparing, and it needs
+  // a mapping the model registers. A DFlash draft registers none, and this
+  // loader never asks the question about a fused name -- it asks about
+  // `layers.N.self_attn.q_proj`, which is what the checkpoint stores and what
+  // upstream's `prefix` is. With an empty mapping upstream's own
+  // `is_layer_skipped` reduces to the exact comparison below.
+  bool Excluded(const std::string& prefix) const {
+    if (exclude.empty()) return false;
+    for (const std::string& e : exclude) {
+      if (e == prefix) return true;
+    }
+    for (const std::string& e : exclude) {
+      if (e != prefix && prefix.find(e) != std::string::npos) return true;
+    }
+    for (const std::string& e : exclude) {
+      // The ONE wildcard implementation in this tree, shared with
+      // `MixedPrecisionConfig::IsLayerExcluded`. A second copy of one rule is
+      // the "two descriptions" failure AGENTS.md `## Changing the rules or a
+      // checker` names.
+      if (layers::modelopt::detail::FnMatch(prefix, e)) return true;
+    }
+    return false;
+  }
+};
+
+// The list key, picked apart exactly as `from_config` picks the two config
+// SHAPES apart (modelopt.py:283-318): `exclude_modules` inside a nested
+// `{"quantization": {...}}` document, `ignore` in a flat one. The published
+// drafter's `config.json` carries the flat shape and ships BOTH keys with
+// identical content; reading only the one upstream reads is what keeps a file
+// that ships them DIFFERENTLY from being resolved one way here and another way
+// there.
+DraftQuant ResolveDraftQuant(const HfConfig& config) {
+  DraftQuant out;
+  if (!config.raw.is_object() || !config.raw.contains("quantization_config")) {
+    return out;
+  }
+  const nlohmann::json& q = config.raw.at("quantization_config");
+  if (!q.is_object()) return out;
+
+  const bool nested = q.contains("quantization") && q.at("quantization").is_object();
+  const nlohmann::json& section = nested ? q.at("quantization") : q;
+  const auto upper = [](std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+  };
+  const auto str = [](const nlohmann::json& o, const char* k) {
+    return (o.contains(k) && o.at(k).is_string()) ? o.at(k).get<std::string>()
+                                                  : std::string();
+  };
+
+  // The METHOD is the selection hook, and it is asked before the algorithm --
+  // upstream's `override_quantization_method` reads `quant_method` to decide
+  // whether a `quantization_config` is ModelOpt's at all (modelopt.py:2333-2339),
+  // because a compressed-tensors document sits in the same field of the same
+  // config.json.
+  const std::string method = upper(str(q, "quant_method"));
+  VT_CHECK(method == "MODELOPT",
+           "qwen3_dflash: this draft's config.json declares quantization_config."
+           "quant_method \"" +
+               str(q, "quant_method") +
+               "\", and this engine implements no arm for it on a DFlash draft. "
+               "The only quantized draft arms are ModelOpt/compressed-tensors "
+               "NVFP4 (quant_method \"modelopt\") and exllamav3 EXL3 (which "
+               "declares no quantization_config and is recognised from its "
+               "tensors). Owed by row MODEL-DFLASH2-NVFP4 "
+               "(.agents/specs/model-dflash2-nvfp4.md `## Owed`), issue #2758 "
+               "(https://github.com/mudler/vllm.cpp/issues/2758).");
+
+  out.quant_algo = upper(str(section, "quant_algo"));
+  VT_CHECK(!out.quant_algo.empty(),
+           "qwen3_dflash: this draft declares quantization_config.quant_method "
+           "\"modelopt\" and no quant_algo, so there is nothing to route on "
+           "(modelopt.py:315 raises the same ValueError). Issue #2758 "
+           "(https://github.com/mudler/vllm.cpp/issues/2758).");
+  VT_CHECK(out.quant_algo == "NVFP4" || out.quant_algo == "W4A16_NVFP4",
+           "qwen3_dflash: this draft declares ModelOpt quant_algo \"" +
+               out.quant_algo +
+               "\", and this engine has NO arm for it on a DFlash draft. The "
+               "implemented draft arms are NVFP4 and W4A16_NVFP4 (packed fp4 "
+               "weights, read into Nvfp4Weight) and exllamav3 EXL3. Loading "
+               "without the arm would refuse later on a dtype and name the wrong "
+               "thing. Owed by row MODEL-DFLASH2-NVFP4 "
+               "(.agents/specs/model-dflash2-nvfp4.md `## Owed`), issue #2758 "
+               "(https://github.com/mudler/vllm.cpp/issues/2758).");
+  out.arm = DraftQuantArm::kNvfp4;
+  out.declares_w4a4 = out.quant_algo == "NVFP4";
+
+  const char* exclude_key = nested ? "exclude_modules" : "ignore";
+  if (section.contains(exclude_key)) {
+    const nlohmann::json& ex = section.at(exclude_key);
+    VT_CHECK(ex.is_array(), std::string("qwen3_dflash: quantization_config.") +
+                                exclude_key + " must be a list");
+    for (const auto& e : ex) {
+      VT_CHECK(e.is_string(),
+               std::string("qwen3_dflash: quantization_config.") + exclude_key +
+                   " entries must be strings");
+      out.exclude.push_back(e.get<std::string>());
+    }
+  }
+  return out;
+}
+
+// The one-line NOTICE for a draft that declares W4A4 and runs W4A16.
+//
+// `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` declares `quant_algo:
+// "NVFP4"` -- 4-bit weights AND 4-bit activations -- and ships
+// `<proj>.input_scale` on all 35 of its quantized modules, and this build reads
+// that divisor only under `VT_MODELOPT_W4A4=1`, which defaults to 0. So we run
+// the weight-only arm against a checkpoint whose producer declared static fp4
+// activations. The weight bytes swept per step are the same either way, so no
+// throughput axis moves; the activation path and the numerics differ, and no
+// token gate can see that, because the verify is LOSSLESS -- the draft's tokens
+// are the target's whatever the draft computes, and only ACCEPTANCE falls.
+//
+// This does NOT reuse `layers::modelopt::ActivationArmNotice`, which is scoped
+// to MIXED_PRECISION configs and answers "" on a plain NVFP4 one. Widening that
+// function is #2760's change and it moves a gate model's arm, so it is not made
+// here. Returns "" when there is nothing to say.
+std::string DraftActivationArmNotice(const DraftQuant& quant,
+                                     const std::vector<std::string>& quantized_modules,
+                                     std::size_t with_divisor, bool w4a4_opt_in) {
+  if (quant.arm != DraftQuantArm::kNvfp4 || !quant.declares_w4a4) return std::string();
+  if (quantized_modules.empty()) return std::string();
+  if (w4a4_opt_in && with_divisor == quantized_modules.size()) return std::string();
+  std::string out =
+      "this DFlash draft's quantization_config declares quant_algo \"NVFP4\" -- "
+      "4-bit weights AND 4-bit ACTIVATIONS -- on " +
+      std::to_string(quantized_modules.size()) +
+      " module(s), and this build executes them W4A16: 4-bit weights, bf16 "
+      "activations. The weight bytes swept per draft step are the same either "
+      "way, so no throughput axis moves. The ACTIVATION path and the numerics "
+      "differ, and no token gate can see that, because the DFlash verify is "
+      "lossless: the emitted tokens are the target's and only ACCEPTANCE falls.";
+  out += "\n  " + std::to_string(with_divisor) +
+         " of them ship the activation divisor <module>.input_scale that the "
+         "W4A4 arm would read";
+  out += with_divisor == 0
+             ? ", so this build could not take that arm even with VT_MODELOPT_W4A4=1."
+             : ", and VT_MODELOPT_W4A4 is unset, so it is dropped "
+               "(docs/ENVIRONMENT.md records consuming it producing incoherent "
+               "text on nvidia/Qwen3.6-27B-NVFP4).";
+  out +=
+      "\n  This is a NOTICE and not a refusal: the draft loads. Owed by row "
+      "QUANT-QWEN38-27B-NVFP4-ARM (.agents/specs/qwen38-27b-quant-arms.md "
+      "`## Owed`), issue #2760 "
+      "(https://github.com/mudler/vllm.cpp/issues/2760).";
+  return out;
 }
 
 }  // namespace
@@ -398,6 +591,26 @@ HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c) {
   if (c.contains("is_causal") && !c.at("is_causal").is_null()) {
     cfg.raw["is_causal"] = c.at("is_causal");
   }
+  // MODEL-DFLASH2-NVFP4 (#2758): THE DRAFT'S OWN QUANTIZATION DECLARATION, and
+  // this line is what makes the arm reachable at all.
+  //
+  // Upstream reads the DRAFT's config and never the target's:
+  // `self.quant_config = get_draft_quant_config(vllm_config)`
+  // (qwen3_dflash.py:410 @ the parity pin e126687a9a828d513c01a07cd69f025f27d63280),
+  // whose whole job is stated in its own docstring -- "Draft models should use
+  // their own quantization config instead of the verifier/target model's
+  // config" (vllm/model_executor/models/utils.py:929-948). This builder copies
+  // NAMED keys, so a key it drops is a key the resolution can never see; that
+  // is the same reason `is_causal` and `block_size` are carried above, and it
+  // is why `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` died on a BF16 dtype
+  // complaint about `layers.0.self_attn.q_proj.weight` instead of taking an arm.
+  //
+  // Carried WHENEVER DECLARED and in whatever shape, exactly as `is_causal` is:
+  // the builder plumbs and `ResolveDraftQuant` decides. Absent from every
+  // published bf16 and EXL3 draft, so their loads are byte-unchanged.
+  if (c.contains("quantization_config") && c.at("quantization_config").is_object()) {
+    cfg.raw["quantization_config"] = c.at("quantization_config");
+  }
   return cfg;
 }
 
@@ -421,6 +634,102 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
   // backbone -- gets `false` and the byte-unchanged bf16 path. Neither format
   // can carry a trellis.
   const bool exl3 = static_cast<bool>(has) && dense_loaders::IsExl3Projection(has, "fc");
+
+  // MODEL-DFLASH2-NVFP4 (#2758): THE THIRD RUNG, and it is asked of the
+  // DECLARATION rather than of a tensor name -- see `ResolveDraftQuant`.
+  const DraftQuant quant = ResolveDraftQuant(config);
+  const bool nvfp4 = quant.arm == DraftQuantArm::kNvfp4;
+  VT_CHECK(!(exl3 && nvfp4),
+           "qwen3_dflash: this draft stores `fc` as an exllamav3 trellis AND "
+           "declares a ModelOpt quantization_config. Those are two different "
+           "quantizations of one checkpoint and this loader cannot take both "
+           "arms; refusing rather than silently preferring one. Issue #2758 "
+           "(https://github.com/mudler/vllm.cpp/issues/2758).");
+  // A LANE THAT OFFERS NO PRESENCE PREDICATE cannot take this arm, and it says
+  // so rather than falling into the cross-check below and reporting "ships NO
+  // NVFP4 operands" -- which would name the tensors when the missing thing is
+  // the probe. `has` is empty for the GGUF draft builder and the DSpark
+  // backbone; neither container can carry a packed ModelOpt module, and neither
+  // should grow a probe for one.
+  VT_CHECK(!nvfp4 || static_cast<bool>(has),
+           "qwen3_dflash: this draft declares a ModelOpt " + quant.quant_algo +
+               " quantization_config, and it is being loaded through a lane that "
+               "supplies no tensor-presence predicate (the GGUF draft builder or "
+               "the DSpark backbone). Neither container carries a packed ModelOpt "
+               "module, so this arm is not reachable from here. Owed by row "
+               "MODEL-DFLASH2-NVFP4 (.agents/specs/model-dflash2-nvfp4.md "
+               "`## Owed`), issue #2758 "
+               "(https://github.com/mudler/vllm.cpp/issues/2758).");
+
+  // The CROSS-CHECK, in both directions, for a module this build CAN read
+  // packed. Returns whether the packed arm is taken.
+  //
+  // WHY BOTH DIRECTIONS. An NVFP4 module read as BF16 dies loudly on a dtype,
+  // which is the failure this row removes. The other two are SILENT: a BF16
+  // module read as NVFP4, or a quantized module skipped because the declaration
+  // excluded it, both produce a correctly shaped and entirely wrong weight, and
+  // the draft would still emit the TARGET's tokens because the DFlash verify is
+  // lossless. Only acceptance falls, and no token gate can see it. That is the
+  // defect class this loader's refusals exist for.
+  std::vector<std::string> quantized_modules;
+  std::size_t with_divisor = 0;
+  const auto module_takes_nvfp4 = [&](const std::string& proj) -> bool {
+    const bool shipped = static_cast<bool>(has) && IsNvfp4Projection(has, proj);
+    if (!nvfp4) {
+      VT_CHECK(!shipped,
+               "qwen3_dflash: \"" + proj +
+                   "\" ships NVFP4 operands (.weight_packed or .weight_scale_2) "
+                   "and this draft's config.json declares NO quantization_config, "
+                   "so nothing selects an arm for it. Upstream would resolve "
+                   "quant_config=None for this draft and refuse it too "
+                   "(get_draft_quant_config, "
+                   "vllm/model_executor/models/utils.py:929-948). Issue #2758 "
+                   "(https://github.com/mudler/vllm.cpp/issues/2758).");
+      return false;
+    }
+    const bool declared = !quant.Excluded(proj);
+    VT_CHECK(declared == shipped,
+             "qwen3_dflash: \"" + proj + "\" is declared " +
+                 (declared ? "QUANTIZED (" + quant.quant_algo +
+                             ", it is not in quantization_config's exclude list) "
+                             "and ships NO NVFP4 operands"
+                           : "EXCLUDED from quantization and ships NVFP4 "
+                             "operands") +
+                 ". The declaration and the tensors disagree, and taking either "
+                 "one on its own loads a correctly shaped and entirely wrong "
+                 "weight that no token gate can see, because the DFlash verify "
+                 "is lossless and only acceptance falls. Issue #2758 "
+                 "(https://github.com/mudler/vllm.cpp/issues/2758).");
+    if (declared) {
+      quantized_modules.push_back(proj);
+      if (has(proj + ".input_scale")) ++with_divisor;
+    }
+    return declared;
+  };
+
+  // The modules this build has NO packed owner for. All four are EXCLUDED by
+  // the published artifact, so an owner for them would land unreached -- the
+  // shape AGENTS.md `## Nothing lands dead` refuses -- and they are refused by
+  // NAME instead, at the arm question rather than 400 lines later.
+  const auto refuse_unowned = [&](const std::string& proj, const char* owner) {
+    const bool shipped = static_cast<bool>(has) && IsNvfp4Projection(has, proj);
+    const bool declared = nvfp4 && !quant.Excluded(proj);
+    if (!shipped && !declared) return;
+    throw std::runtime_error(
+        "qwen3_dflash: \"" + proj +
+        "\" is " + (declared ? "declared quantized (" + quant.quant_algo + ")"
+                            : "stored as an NVFP4 module") +
+        ", and this engine has NO packed owner for it: it is read into " + owner +
+        ", a dense BF16 tensor, and no NVFP4 GEMM is bound to it in any of the "
+        "three DFlash forward bodies. Every published DFlash2 NVFP4 drafter "
+        "EXCLUDES this module (maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal @ "
+        "bd7a934213c47a9e7ef69eef36bb3325f47fd1f1 lists all four of fc, "
+        "candidate_selector.hidden_projection and both conv kernel_projections "
+        "in exclude_modules), so an owner for it would land UNREACHED. Owed by "
+        "row MODEL-DFLASH2-NVFP4 (.agents/specs/model-dflash2-nvfp4.md "
+        "`## Owed`), issue #2758 "
+        "(https://github.com/mudler/vllm.cpp/issues/2758).");
+  };
 
   Qwen3DFlashWeights out;
   out.num_taps = num_taps;
@@ -548,6 +857,9 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
   if (exl3) {
     out.fc_exl3 = dense_loaders::LoadExl3(get, has, "fc");
   } else {
+    // MODEL-DFLASH2-NVFP4 (#2758): asked BEFORE the read, so a quantized `fc`
+    // is named as the missing arm rather than reported as a BF16 dtype.
+    refuse_unowned("fc", "Qwen3DFlashWeights::fc");
     out.fc = LoadBf16RawNK(get, "fc.weight");
   }
   out.hidden_norm = LoadBf16Direct(get, "hidden_norm.weight");
@@ -608,12 +920,77 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
       want("mlp.up_proj", layer.up_proj_exl3, H, I);
       want("mlp.down_proj", layer.down_proj_exl3, I, H);
     } else {
-      layer.qkv_proj = ConcatRawNK(
-          get, {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"}, "qkv");
-      layer.o_proj = LoadBf16RawNK(get, attn + "o_proj.weight");
-      layer.gate_up_proj =
-          ConcatRawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"}, "gate_up");
-      layer.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
+      // MODEL-DFLASH2-NVFP4 (#2758): the NVFP4 rung, asked per MODULE and then
+      // required to be UNIFORM across the seven.
+      //
+      // UNIFORM, because two of the bf16 owners are MERGED. `qkv_proj` is one
+      // row-stack of q|k|v and `gate_up_proj` one row-stack of gate|up, and a
+      // layer that quantized q and excluded k has no expressible owner here:
+      // the merged tensor would have to hold two of three shards. Upstream has
+      // no such problem -- its `QKVParallelLinear` is one module with one
+      // resolved method -- so this is a shape of this port and it is refused by
+      // name rather than half-loaded. No published artifact mixes them: all 35
+      // quantized modules of the published drafter are the seven of each layer.
+      const bool q_fp4 = module_takes_nvfp4(attn + "q_proj");
+      const bool k_fp4 = module_takes_nvfp4(attn + "k_proj");
+      const bool v_fp4 = module_takes_nvfp4(attn + "v_proj");
+      const bool o_fp4 = module_takes_nvfp4(attn + "o_proj");
+      const bool g_fp4 = module_takes_nvfp4(mlp + "gate_proj");
+      const bool u_fp4 = module_takes_nvfp4(mlp + "up_proj");
+      const bool d_fp4 = module_takes_nvfp4(mlp + "down_proj");
+      const int packed = static_cast<int>(q_fp4) + static_cast<int>(k_fp4) +
+                         static_cast<int>(v_fp4) + static_cast<int>(o_fp4) +
+                         static_cast<int>(g_fp4) + static_cast<int>(u_fp4) +
+                         static_cast<int>(d_fp4);
+      VT_CHECK(packed == 0 || packed == 7,
+               "qwen3_dflash: " + base + " declares " + std::to_string(packed) +
+                   " of its 7 projections quantized and the rest excluded. This "
+                   "loader owns q|k|v as ONE merged bf16 tensor and gate|up as "
+                   "another, so a partially quantized layer has no expressible "
+                   "owner; refusing rather than loading two thirds of a merged "
+                   "operand. Issue #2758 "
+                   "(https://github.com/mudler/vllm.cpp/issues/2758).");
+      if (packed == 7) {
+        layer.q_proj_fp4 = LoadNvfp4AnyNaming(get, has, attn + "q_proj");
+        layer.k_proj_fp4 = LoadNvfp4AnyNaming(get, has, attn + "k_proj");
+        layer.v_proj_fp4 = LoadNvfp4AnyNaming(get, has, attn + "v_proj");
+        layer.o_proj_fp4 = LoadNvfp4AnyNaming(get, has, attn + "o_proj");
+        layer.gate_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "gate_proj");
+        layer.up_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "up_proj");
+        layer.down_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "down_proj");
+        // GEOMETRY, asserted rather than assumed, for the same reason the EXL3
+        // arm asserts it: the bf16 arm gets an equivalent check for free from
+        // `ConcatRawNK` agreeing the shards' K, and this arm has no such
+        // incidental check. An NVFP4 weight loaded the wrong way round runs and
+        // returns a confidently wrong answer.
+        const int64_t H = config.hidden_size;
+        const int64_t qdim = config.num_attention_heads * config.head_dim;
+        const int64_t kvdim = config.num_key_value_heads * config.head_dim;
+        const int64_t I = config.intermediate_size;
+        const auto want = [&](const char* what, const Nvfp4Weight& w, int64_t n,
+                              int64_t k) {
+          VT_CHECK(w.n == n && w.k == k,
+                   std::string("qwen3_dflash: ") + base + what + " is [n=" +
+                       std::to_string(w.n) + ", k=" + std::to_string(w.k) +
+                       "], expected [n=" + std::to_string(n) + ", k=" +
+                       std::to_string(k) + "]");
+        };
+        want("self_attn.q_proj", layer.q_proj_fp4, qdim, H);
+        want("self_attn.k_proj", layer.k_proj_fp4, kvdim, H);
+        want("self_attn.v_proj", layer.v_proj_fp4, kvdim, H);
+        want("self_attn.o_proj", layer.o_proj_fp4, H, qdim);
+        want("mlp.gate_proj", layer.gate_proj_fp4, I, H);
+        want("mlp.up_proj", layer.up_proj_fp4, I, H);
+        want("mlp.down_proj", layer.down_proj_fp4, H, I);
+      } else {
+        layer.qkv_proj = ConcatRawNK(
+            get, {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"},
+            "qkv");
+        layer.o_proj = LoadBf16RawNK(get, attn + "o_proj.weight");
+        layer.gate_up_proj =
+            ConcatRawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"}, "gate_up");
+        layer.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
+      }
     }
     // The two per-head norms are BF16 on BOTH arms: the repack quantizes and
     // re-dtypes LINEARS and leaves every norm at the model dtype.
@@ -634,6 +1011,9 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
         // the SAME checkpoint. The repack re-dtyped the LINEAR and left the
         // kernel alone, so this is one of exactly three names that reach the
         // scheme-aware read.
+        // MODEL-DFLASH2-NVFP4 (#2758): no packed owner, refused by name.
+        refuse_unowned(cp + "kernel_projection",
+                       "Qwen3DFlashConvWeights::kernel_projection");
         conv.kernel_projection =
             LoadRawNKForScheme(get, exl3, cp + "kernel_projection.weight");
         // SHAPES, asserted rather than assumed. `base_kernel` is
@@ -671,6 +1051,9 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
     // MODEL-DFLASH2-EXL3 (#2495 item 7): F16 on an EXL3 draft, while the two
     // codebooks below stay BF16. The selector is NOT quantized -- the model card
     // says it is, and the checkpoint's own `tensor_storage` does not list it.
+    // MODEL-DFLASH2-NVFP4 (#2758): no packed owner, refused by name.
+    refuse_unowned("candidate_selector.hidden_projection",
+                   "Dflash2SelectorWeights::hidden_projection");
     sel.hidden_projection =
         LoadRawNKForScheme(get, exl3, "candidate_selector.hidden_projection.weight");
     sel.predecessor_codebook = LoadBf16Direct(get, "candidate_selector.predecessor_codebook");
@@ -706,6 +1089,15 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
     VT_CHECK(out.fc.shape[0] == config.hidden_size &&
                  out.fc.shape[1] == config.hidden_size * num_taps,
              "qwen3_dflash: fc.weight must be [H, H*num_taps]");
+  }
+  // MODEL-DFLASH2-NVFP4 (#2758): say it once, after every module has been
+  // classified, so the count is the file's and not a guess. Emitted here rather
+  // than at the arm question because `quantized_modules` is not complete until
+  // the last layer has been read.
+  const std::string notice = DraftActivationArmNotice(
+      quant, quantized_modules, with_divisor, ModelOptW4A4OptIn());
+  if (!notice.empty()) {
+    std::fprintf(stderr, "qwen3_dflash: %s\n", notice.c_str());
   }
   return out;
 }

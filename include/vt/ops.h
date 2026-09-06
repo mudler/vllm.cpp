@@ -820,6 +820,11 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kGlm5NextKpoolCompress,
   kGlm5NextKpoolSelect,
+  // Packed k-quant block decode: packed {rows, blocks} (dtype carries the
+  // encoding; bytes per row = blocks * BlockBytes) -> f32 {rows,
+  // blocks * BlockElems}. Decode-only (BACKEND-TENSTORRENT-KEEPQUANT W1);
+  // the dot provider and the keep-quant predicate arm ride W2.
+  kKeepQuantDecode,
   kCount
 };
 
@@ -2292,6 +2297,7 @@ using LayerNormFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor*, cons
 using ReluFn = void (*)(Queue&, Tensor&, const Tensor&);
 using AddFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using KeepQuantDecodeFn = void (*)(Queue&, Tensor& out, const Tensor& packed);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
 using RopeFromCacheFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&,
                                  const Tensor&, const RopeArgs&);

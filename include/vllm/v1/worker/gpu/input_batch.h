@@ -157,9 +157,14 @@ class InputBatch {
   // max_num_batched_tokens, (device dropped), vocab_size, block_sizes,
   // kernel_block_sizes, (trailing knobs DEFERRED). block_sizes /
   // kernel_block_sizes are per KV cache group.
+  // num_speculative_steps sizes the per-slot draft buffer's row (upstream's
+  // `RequestStates.__init__(..., num_speculative_steps)`, states.py:34,71-77).
+  // 0 — the default and every non-speculative runner — makes the buffer
+  // zero-width, which is upstream's `torch.zeros(max_num_reqs, 0)` exactly.
   InputBatch(int max_num_reqs, int max_model_len, int max_num_batched_tokens,
              int vocab_size, std::vector<int> block_sizes,
-             std::vector<int> kernel_block_sizes);
+             std::vector<int> kernel_block_sizes,
+             int num_speculative_steps = 0);
 
   // add_request: place `request` into a slot (a freed hole if one exists, else
   // append at num_reqs), fill the per-slot arrays from it, add the block-table
@@ -292,6 +297,70 @@ class InputBatch {
   // lifetime. combine gates on seq_len > prefill_len to tell a decode row (splice
   // the sampled token) from a prefill/chunked-prefill row (keep the prompt).
   std::vector<int32_t> prefill_len;
+
+  // ─── SPEC-DFLASH2 A2-3 (#2911): the per-req_state DRAFT BUFFER ────────────
+  // Mirror of `RequestStates.draft_tokens`
+  // (vllm/v1/worker/gpu/states.py:71-77, zeroed at :113) @ pin
+  // 5559679229bc961848b121ccdeaa8fa5d79bec98.
+  //
+  // `num_valid_draft_tokens` BESIDE IT HAS NO UPSTREAM COUNTERPART, and the
+  // anchor this comment used to give for it was wrong. A2-3 cited
+  // `gpu_model_runner.py:883-895`; at the pin those lines are the LEGACY
+  // runner's n-gram-GPU async D2H buffer set (`_num_valid_draft_tokens`,
+  // `_num_valid_draft_tokens_cpu`, its event and its copy stream), allocated
+  // only when `speculative_config.use_ngram_gpu()`, and they are not a
+  // per-req_state count paralleling `states.draft_tokens` at all. The NEW
+  // runner keeps no such count: it takes each row's draft length from the
+  // scheduler's own `scheduled_spec_decode_tokens`
+  // (`vllm/v1/worker/gpu/model_runner.py:941-949`), which we cannot, because
+  // under async scheduling that list is `-1` placeholders and the count of what
+  // this runner actually proposed is exactly what the fill needs. It is our
+  // construct, named after upstream's, and it is recorded as a divergence here
+  // rather than dressed as a mirror.
+  //
+  // WHAT IT IS FOR. Two consumers need to agree on what this runner drafted:
+  // the async placeholder fill in `execute_model`, and
+  // `combine_sampled_and_draft_tokens`'s draft scatter (A2-1). Before A2-3 the
+  // fill read `pending_drafts_` — host, ragged, req_id-keyed — and the scatter
+  // had no buffer at all, so its call sites passed an empty one and refused any
+  // step that scheduled drafts. This is the single residence both now read, with
+  // `propose_drafts` as the one producer, which is upstream's shape.
+  //
+  // WHO OWNS IT AND FOR HOW LONG. The `InputBatch` owns it, and the InputBatch
+  // is a by-value member of `GPUModelRunner`: it is allocated once at runner
+  // construction and released only when the runner is destroyed. It is NEVER a
+  // per-step allocation and never block-scoped. That distinction is deliberate
+  // and it is the reason this wave does not repeat the hazard the row has now
+  // been bitten by twice: a buffer a kernel still has queued against it must not
+  // be freed by a scope exit, and a wave that MOVES A WAIT later (A2-4 moves the
+  // verify wait past the propose) must not thereby move a free. Nothing here can
+  // be freed by moving a wait, because nothing frees it until the runner dies.
+  // Its device mirror (`GPUModelRunner::AsyncDeviceInputs::draft_tokens`) has the
+  // same lifetime and the same reason, stated again at its own declaration.
+  //
+  // SIZED BY THE req_state POOL, NOT BY `num_reqs`, and that is a correctness
+  // requirement rather than a convenience. The scatter indexes
+  // `draft_tokens[req_state_idx * stride + b]`; the CUDA counterpart
+  // (`src/vt/cuda/cuda_combine_tokens.cu`) has NOTHING bounding that read. A
+  // buffer sized by this step's request count lets a high req_state slot index
+  // past the allocation with every host check satisfied, and the quiet outcome —
+  // garbage in the draft slots — costs acceptance and nothing else, because
+  // speculative decoding is lossless. `.agents/specs/dflash2-async-spec-sampler.md`
+  // names this and requires exactly this sizing.
+  //
+  // draft_tokens: [max_num_reqs * num_speculative_steps] ROW-MAJOR per req_state
+  // slot, the flattened form of upstream's 2-D tensor. Empty when
+  // num_speculative_steps is 0.
+  std::vector<int32_t> draft_tokens;
+  // num_valid_draft_tokens[slot]: how many of that row's entries this runner
+  // actually proposed for the request in that slot. The row is padded to the
+  // stride, so the count is what tells a 2-draft row in a k=3 buffer from a
+  // 3-draft one. [max_num_reqs].
+  std::vector<int32_t> num_valid_draft_tokens;
+  // The draft buffer's row stride == upstream's `draft_tokens.stride(0)`
+  // (input_batch.py:381,396). The speculator's MAX draft length, so a shorter
+  // row is padded rather than short.
+  int num_speculative_steps = 0;
 
   // The per-request KV-cache block table (one BlockTable per group).
   MultiGroupBlockTable block_table;

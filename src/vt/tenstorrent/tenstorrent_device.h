@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <string_view>
 
 // ttnn::MeshDevice (ttnn/api/ttnn/device.hpp) is a `using` alias for this real
@@ -41,6 +42,49 @@ bool DeviceAvailable();
 inline bool HostFreeDecodeEnabled() {
   const char* e = std::getenv("VT_TT_HOST_FREE_DECODE");
   return e == nullptr || std::string_view(e) != "0";
+}
+
+// True iff captured decode is enabled. Default ON since the #1625 flip — same
+// parse as HostFreeDecodeEnabled ("0" opts out and restores the eager
+// host-free arm) — where before the flip capture additionally required the
+// env to be present, because the captured arm hung on the first multi-request
+// run. That hang was the short-chunk device KV push clobber (#2669), repaired
+// on this row; the captured multi-request battery is 16/16 green and
+// hang-free. The parity test's golden selection calls this same function, so
+// the gate can never adjudicate a different arm than the engine runs. No
+// function-local static caching: tests toggle this env per case in one
+// process.
+inline bool DecodeCaptureEnabled() {
+  const char* e = std::getenv("VT_TT_DECODE_CAPTURE");
+  return e == nullptr || std::string_view(e) != "0";
+}
+
+// The pre-flip polarity: capture only when EXPLICITLY requested. The decode
+// graph drivers whose TT captured arm has no committed gate evidence conjunct
+// this, so the #1625 default-on flips only the arm classes with evidence
+// (Qwen3-dense, Mistral-7B and, since the GDN device-pure wave, the
+// Qwen3.5-GDN dense driver: its captured arm resolves the #2812 blocker —
+// the GDN ops are device-resident under capture — and gates against its own
+// committed teacher-forced pair).
+inline bool DecodeCaptureRequested() {
+  const char* e = std::getenv("VT_TT_DECODE_CAPTURE");
+  return e != nullptr && std::string_view(e) != "0";
+}
+
+// The #1625 flip's evidence families: Qwen3 dense causal-LM, Mistral
+// checkpoints and the Qwen3.5 GDN dense driver. Each captured arm gates
+// against its own committed teacher-forced pair (0.6B/4B, Mistral-7B,
+// Qwen3.5-0.8B — #2812); Llama and InternLM2 construct the SAME graph class
+// and keep the explicit opt-in until their captured arms are brought up
+// (#2812).
+inline bool DecodeCaptureDefaultArch(
+    const std::vector<std::string>& architectures) {
+  for (const auto& a : architectures) {
+    if (a == "Qwen3ForCausalLM") return true;
+    if (a == "MistralForCausalLM") return true;
+    if (a == "Qwen3_5ForConditionalGeneration") return true;
+  }
+  return false;
 }
 
 // Opens (lazily, once) and returns the single process-wide mesh device this
@@ -98,13 +142,13 @@ void EnsureHostBytes(void* host);
 // current device shadow, do a device->device copy (ttnn) instead of staging
 // through host. Returns true if it performed a device copy, false if the
 // caller should fall back to host memcpy.
-bool CopyDeviceDeviceIfCapture(void* dst, const void* src);
+bool CopyDeviceDeviceIfCapture(void* dst, const void* src, size_t bytes);
 // HOST-FREE-FORWARD R3: when capture/host-free is active, fill the buffer's
 // device shadow on-device (ttnn::zeros, matching the shadow's own
 // shape/dtype) instead of host memset. Only value==0 is handled; every other
 // value declines so Backend::Memset falls back to host memset. Requires the
 // buffer to already carry a current device shadow.
-bool MemsetDeviceIfCapture(void* p, int value);
+bool MemsetDeviceIfCapture(void* p, int value, size_t bytes);
 // BACKEND-TENSTORRENT-QWEN35 W7 (#2282): the EAGER arms of the same two
 // primitives, for steps that run outside capture and outside host-free decode.
 // MemsetDeviceFill zero-fills a device-resident slot's shadow on-device for a
@@ -138,6 +182,21 @@ void WarmPagedKvShadow(void* k_cache_data, void* v_cache_data,
 #else
 inline void WarmPagedKvShadow(void*, void*, int64_t, int64_t, int64_t, int64_t,
                               int64_t) {}
+#endif
+
+// GDN conv-state shadow serveability (decode side): true when the transposed
+// [sl+1, slots*C] f32 TILE shadow that the captured CausalConv1dUpdate
+// fast-path serves is current for this buffer. A prefill-bearing step's
+// ssm/cache role transition (GdnStateGather) clears it; the decode driver
+// must then run the step eagerly — which rebuilds the shadow — BEFORE any
+// graph may capture or replay against the buffer again.
+#ifdef VLLM_CPP_TENSTORRENT
+bool ConvShadowServeable(const void* conv_state_data, int64_t slots,
+                         int64_t conv_dim, int64_t state_len);
+#else
+inline bool ConvShadowServeable(const void*, int64_t, int64_t, int64_t) {
+  return true;
+}
 #endif
 
 // ITEM 5 (RAC): stage the persistent device update-idx / page-table tensors
@@ -233,6 +292,17 @@ void WarmRopeCosSin(const int32_t* positions, int64_t tokens, int64_t hq,
 #else
 inline void WarmRopeCosSin(const int32_t*, int64_t, int64_t, int64_t, int64_t,
                            double) {}
+#endif
+
+// Fused-preamble cos|sin table (kAttnQkNormRopeGate): the dense decode-graph
+// driver refreshes the persistent device [T, rot] table OUTSIDE capture every
+// step so the captured preamble serves the step's content (WarmRopeCosSin
+// pattern). No-op off the TT host-free-decode lane.
+#ifdef VLLM_CPP_TENSTORRENT
+void WarmAttnCosSin(const int32_t* positions, int64_t tokens, int64_t rot,
+                    double base);
+#else
+inline void WarmAttnCosSin(const int32_t*, int64_t, int64_t, double) {}
 #endif
 
 // ---- ttnn mesh-trace capture (Backend graph-capture mapping) --------------

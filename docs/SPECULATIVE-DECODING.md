@@ -313,6 +313,7 @@ evidence here.
 | Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q8_0.gguf` | 2 056 414 752 | `7f1c9a31a6ed40044c69f6508b50fd63b87abd8e1fb7fe4290303df549153751` |
 | Draft, GGUF — DRAFTS | same | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | 1 143 006 752 | `18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594` |
 | Draft, EXL3 safetensors — LOADS | `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` @ `4f0436269bca761b071f05319e8e04a87cc633f9` | `model.safetensors` | 1 470 916 078 | `6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56` |
+| Draft, ModelOpt NVFP4 safetensors — LOADS | `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` @ `bd7a934213c47a9e7ef69eef36bb3325f47fd1f1` | `model.safetensors` | 1 550 153 248 | `2228b9b22e93a88d84556419c879448ab6c490ae65c4c0b166f4962190ddbf26` |
 | Target the draft heads | `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | published shards | — | — |
 
 **The EXL3 draft row says LOADS and not DRAFTS, and the difference is exact.**
@@ -330,6 +331,26 @@ is not in the CUDA instantiation list, so the published pair cannot run on a CUD
 queue at all ([#2574](https://github.com/mudler/vllm.cpp/issues/2574)). This
 draft's own 36 modules are bits 5, which is instantiated; it is the target half
 that refuses.
+
+**The NVFP4 draft row says LOADS for the same reason, and one more.** Its arm is
+the DECLARATION: the loader reads the DRAFT's own `quantization_config`, as
+upstream's `get_draft_quant_config` does
+(`vllm/model_executor/models/utils.py:929-948` at the parity pin), honours
+`exclude_modules` / `ignore` module by module, and cross-checks the declaration
+against the shipped tensors in both directions. All 35 of its quantized modules
+come back packed with the geometry its `config.json` declares
+([#2758](https://github.com/mudler/vllm.cpp/issues/2758),
+[spec](../.agents/specs/model-dflash2-nvfp4.md)). Four modules have NO packed
+owner here -- `fc`, `candidate_selector.hidden_projection` and both conv
+`kernel_projection`s -- and this artifact excludes all four; a draft that
+quantized any of them is refused by name naming the module and the missing
+owner. **No device has run it.** `vt::MatmulNvfp4` is CUDA-only, so the gate is
+a load gate and the forward branch that binds the packed method has never
+executed; leg F of `BENCH-QWEN38-27B-SOTA`
+([#2761](https://github.com/mudler/vllm.cpp/issues/2761)) is the leg that would.
+It also declares `quant_algo: "NVFP4"` -- W4A4 -- on all 35 and this build runs
+them W4A16, which the load prints one line about
+([#2760](https://github.com/mudler/vllm.cpp/issues/2760)).
 
 A repo id alone is not a pin, because checkpoints get re-quantized in place
 under an unchanged name. The revisions above are what these results describe.

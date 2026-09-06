@@ -2193,8 +2193,12 @@ them:
   being applied to 193 modules that artifact declares `W4A16_NVFP4` and never
   asked for. And whether the arm should follow the DECLARATION rather than the
   knob, which is #1597's change and moves a gate model's arm. Both need a
-  same-binary A/B on `nvidia/Qwen3.6-27B-NVFP4` and a token gate against the
-  pinned vLLM, so both need a lease and neither is loader-side. Owned by
+  same-binary A/B and a token gate against the pinned vLLM, so both need a lease
+  and neither is loader-side. **The runnable plan for both is now written**, in
+  [The device plan for #2760 asks 2 and 3](#the-device-plan-for-2760-asks-2-and-3):
+  five arms, the decision table, and the reading that reframes them -- upstream
+  has NO knob and dispatches on the declaration alone (`modelopt.py:1040-1050`),
+  and under that rule the gate model's arm does NOT move. Owned by
   `QUANT-QWEN38-27B-NVFP4-ARM`, tracked by
   [#2760](https://github.com/mudler/vllm.cpp/issues/2760).
 - **The FP8 KV-cache arm on the ModelOpt artifacts.**
@@ -2212,6 +2216,139 @@ them:
   [#1593](https://github.com/mudler/vllm.cpp/issues/1593) — named here rather
   than refused, because refusing it would refuse a gate model this tree loads
   and measures today.
+
+## The device plan for #2760 asks 2 and 3
+
+W7 paid ask 1. Asks 2 and 3 both need a lease, and neither is loader-side. This
+section is written so that the lease is ONE submission and not a design session:
+the arms, the commands, what is compared, and what each outcome falsifies.
+Nothing here has been measured.
+
+### The reading that reframes both asks: upstream HAS NO KNOB
+
+`VT_MODELOPT_W4A4` is a local invention. At the parity pin
+`e126687a9a828d513c01a07cd69f025f27d63280`, `ModelOptNvFp4Config.__init__`
+dispatches on the DECLARED algorithm and on nothing else
+(`modelopt.py:1040-1050`), in a comment that states the rule in the file:
+
+```text
+# NVFP4         -> W4A4: cutlass NVFP4 GEMM with input quantization
+# W4A16_NVFP4   -> W4A16: FP4 Marlin GEMM with bf16/fp16 activations
+if quant_method == "NVFP4":
+    self.LinearMethodCls = ModelOptNvFp4LinearMethod       # :1126
+elif quant_method == "W4A16_NVFP4":
+    self.LinearMethodCls = ModelOptNvFp4W4A16LinearMethod  # :1260
+else:
+    raise ValueError(...)
+```
+
+Two consequences follow and they change the shape of the work.
+
+**Ask 3 is not "a change", it is the mirror.** Routing by the declaration IS
+upstream's rule, and the knob is the divergence. So the change owed is
+`modelopt.py:1042-1045` transcribed onto `LoadNvfp4AnyNaming`, with
+`VT_MODELOPT_W4A4` retained only as a same-binary override for the A/B.
+
+**The blast radius is TWO artifacts and the gate model is NOT one of them.**
+The issue says ask 3 "moves a gate model's arm"; read against the four ModelOpt
+artifacts this tree knows, it does not.
+
+| artifact | declared on its NVFP4 modules | ships `input_scale` | today (knob off) | under declaration routing |
+|---|---|---|---|---|
+| `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160` | `W4A16_NVFP4` ×193 | yes | W4A16 | W4A16 — **NO MOVE** |
+| `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` | `W4A16_NVFP4` ×193 | no | W4A16 | W4A16 — **NO MOVE** |
+| `RadixArk/Qwen3.8-27B-NVFP4` @ `554ebba9` | `NVFP4` ×193 | yes, all | W4A16 | **W4A4** |
+| `maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal` @ `bd7a9342` | `NVFP4` ×35 | yes, all | W4A16 | **W4A4** |
+
+What moves the gate model's arm is the KNOB, not the declaration:
+`VT_MODELOPT_W4A4=1` flips 193 modules of `nvidia/Qwen3.6-27B-NVFP4` that the
+producer declared weight-only. Declaration routing makes the knob a no-op there.
+That is the confound sitting under ask 2, and it is why ask 2 comes first.
+
+### Ask 2 — is `VT_MODELOPT_W4A4=1` correct at all?
+
+`docs/ENVIRONMENT.md` records one observation: setting it on
+`nvidia/Qwen3.6-27B-NVFP4` produced incoherent text. That observation cannot
+separate two explanations, because it was taken on an artifact that declares
+`W4A16_NVFP4`: either our fp4-activation GEMM is wrong on a shipped format, or
+the knob applied an activation quantization the producer never calibrated for.
+`RadixArk/Qwen3.8-27B-NVFP4` is the de-confounder, and it is staged: it DECLARES
+`NVFP4` and ships the divisor on every module, so upstream's own arm for it is
+`ModelOptNvFp4LinearMethod`.
+
+**Five arms, one binary, one boot each, interleaved in this order** so a box
+drift shows up as a disagreement between the two runs of A0:
+
+| arm | checkpoint | `VT_MODELOPT_W4A4` | what it is |
+|---|---|---|---|
+| A0 | `RadixArk` | `0` | today's default: W4A16 on a W4A4 declaration |
+| A1 | `RadixArk` | `1` | the declared arm, which is upstream's arm for it |
+| B0 | `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160` | `0` | the gate model, unchanged |
+| B1 | same | `1` | the ENVIRONMENT.md observation, re-taken on the current binary |
+| A0' | `RadixArk` | `0` | the repeat, and the drift control |
+
+The ORACLE is pinned vLLM on `RadixArk` in its production configuration, never
+`--enforce-eager`. Note which arm it is: upstream runs `RadixArk` **W4A4**, so
+the oracle is A1's denominator by construction and A0 is the divergent arm.
+A comparison of A0 against A1 for "which reads better" is not a gate and must
+not be recorded as one — both produce plausible text, which is the whole reason
+this divergence went unseen.
+
+**Assert the binary before believing any arm.** Print the compiled feature set
+and confirm the fp4 GEMM is present; an arm that silently declined would read as
+"W4A4 is fine" and it would be measuring W4A16 twice.
+
+**The token gate**, the same protocol W3 used: six raw completion prompts, no
+chat template, greedy on both sides, 48 tokens each, concurrency 1,
+`ignore_eos` so both emit exactly 48. Compare `vllm-bench --output-token-ids`
+against the oracle's ids, and record the first differing index per prompt. The
+tokenizer half is asserted separately, because a tokenizer divergence would
+present as a generation divergence.
+
+**No throughput axis is expected to move, and if one does that is a finding.**
+The weight bytes swept per decode step are identical on both arms; only the
+activation path changes.
+
+**The decision table, written before the run so the answer cannot be fitted:**
+
+| A1 vs oracle | B1 | reading | next |
+|---|---|---|---|
+| token-exact | incoherent | the fp4-activation GEMM is RIGHT; the knob was being applied to a checkpoint that declared W4A16 | ask 3 becomes the work, and it is the mirror |
+| divergent / incoherent | incoherent | our fp4-activation path is wrong on a shipped format. That is a correctness gap on a format we claim, not a lever that is off | `VT_MODELOPT_W4A4=1` must REFUSE rather than default off, and the kernel owes an investigation with its own row |
+| divergent / incoherent | coherent | the failure is artifact-specific | re-read `RadixArk`'s `input_scale` convention (divisor vs scale) against `modelopt.py:1126-1259` BEFORE touching a kernel |
+| token-exact | coherent | the ENVIRONMENT.md observation is stale and predates a repair | find it with `git log -S 'input_global_scale_inv'` before changing any default; do not re-derive the history |
+
+### Ask 3 — route by the declaration (#1597), AFTER ask 2
+
+Ordered second on purpose: if ask 2 lands in row 2 of that table, declaration
+routing would move `RadixArk` and the DFlash2 drafter onto a broken arm, and
+both are artifacts nothing else gates.
+
+**The change.** `LoadNvfp4AnyNaming` consumes `input_scale` when the module's
+resolved algorithm is `NVFP4` and never when it is `W4A16_NVFP4`, mirroring
+`modelopt.py:1042-1045`. That needs the per-module resolution the loader does
+not have today for a plain (non-`MIXED_PRECISION`) config; the DFlash2 draft
+loader's `ResolveDraftQuant`
+(`src/vllm/model_executor/models/qwen3_dflash_weights.cpp`, row
+`MODEL-DFLASH2-NVFP4`) is the same parse for the same document and is the
+obvious thing to lift rather than write twice. `VT_MODELOPT_W4A4` survives as an
+explicit override in BOTH directions so the A/B stays same-binary; W7's notice
+then fires only when the override is what causes the divergence.
+
+**The A/B it owes**, on `nvidia/Qwen3.6-27B-NVFP4` as #1597 states: before and
+after, same binary, token gate. The expected result is BYTE-IDENTICAL output,
+because that artifact declares `W4A16_NVFP4` and is already on the W4A16 arm.
+A difference there falsifies the table above and stops the change.
+
+**The second A/B, on the artifact that actually moves**: `RadixArk` before
+(W4A16) and after (W4A4), token gate against the oracle both times. After must
+agree with the oracle at least as well as before, and ask 2's A1 has already
+measured what "after" produces.
+
+**`IsQwen27QuantizedLinear` is the other half of #1597 and is unrelated to
+this one.** It hard-codes one artifact's answer and has no production caller,
+only `tests/vllm/models/test_qwen27_dense_forward.cpp`. It is a delete-or-fix
+decision, not a device question, and it does not need a lease.
 
 ## Now
 

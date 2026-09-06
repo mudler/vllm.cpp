@@ -387,10 +387,14 @@ python3 scripts/agent-pr-body.py --pr <N>
 
 ## Owed
 
-* **The duration head's bf16 arm.** `Ltx2DurationPredict` still has zero
-  production call sites, so it can only be gated by a unit test constructing the
-  type by hand. Wiring is [#611](https://github.com/mudler/vllm.cpp/issues/611);
-  the dtype follows the wiring and not the reverse. Unchanged from wave 4's §0.3.
+* **The duration head's bf16 arm.** When this was written `Ltx2DurationPredict`
+  had zero production call sites, so it could only be gated by a unit test
+  constructing the type by hand, and the wiring had to come first. That wiring
+  landed as row `LTX25-DURATION-HEAD-WIRE`
+  ([#2900](https://github.com/mudler/vllm.cpp/issues/2900)) — the issue number
+  cited here before, #611, is one of the three that 404
+  ([#2899](https://github.com/mudler/vllm.cpp/issues/2899)). The dtype arm is
+  still owed and still follows the wiring, but it is now gateable.
 * **The real-weight temporal render.** Blocked on
   `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`, absent from the NAS
   since #2580. This row's temporal arm is gated against the executed module only.

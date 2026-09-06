@@ -898,9 +898,16 @@ reader:
   row. The derived split gates the beta arm because there is a function to count
   callers of; the other three markers have nothing to derive from, so their kind
   is still asserted rather than proven. #691 stays open for exactly that gap.
-- **A duration head is still not constructed** —
-  [#611](https://github.com/mudler/vllm.cpp/issues/611), owned by this row. Its
-  user-visible half, silent substitution of the recipe default, is closed.
+- ~~**A duration head is still not constructed**~~ — **CLOSED** by row
+  `LTX25-DURATION-HEAD-WIRE`, [#2900](https://github.com/mudler/vllm.cpp/issues/2900),
+  spec `.agents/specs/ltx25-duration-head-wire.md`. `Ltx2VideoEngine::Load` now
+  opens the file `duration_head_path` names and builds a predictor from it, so
+  the key is SERVED and `CheckUnservedExtras` — which existed for this one key —
+  is gone with it. The issue number this entry used to carry, #611, does not
+  exist ([#2899](https://github.com/mudler/vllm.cpp/issues/2899) tracks that
+  class of dead reference); the live record is #2900.
+  What remains owed there and not here is the head's **bf16 arm**, gap A24's
+  eighth component.
 - **`.agents/specs/ltx-2-5.md` §2 "Out" still lists `multishot`** —
   [#692](https://github.com/mudler/vllm.cpp/issues/692). Operator-owned file.
 

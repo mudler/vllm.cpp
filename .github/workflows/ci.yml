@@ -263,6 +263,19 @@ jobs:
         # would trip, so it has to run on a lane nobody has to remember.
         run: |
           python3 tests/scripts/test_env_agnostic_tooling.py
+      - name: The layer-fingerprint comparator parses every tap the instrument prints
+        # Registered in TWO places, like the bring-up suite above: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`, and pinned in
+        # `REQUIRED_SUITE_REGISTRATIONS` so deleting either one reds
+        # `check-test-registration.py` rather than passing at rc=0 (#1833).
+        #
+        # It ran on NO lane when it landed (#2877), and the defect that cost is
+        # exactly what a lane would have caught: `taps=N END` is a RUNNING TOTAL
+        # and the tool read it per-step, so it exited 2 on every genuine
+        # multi-step fingerprint while eleven single-step cases stayed green.
+        # Standard library only, no artifact and no GPU.
+        run: |
+          python3 tests/scripts/test_q4exp_layerfp_diff.py
       - name: The docs site's content invariants hold
         # `hugo version` first, deliberately. It is the one line that fails
         # LEGIBLY when the setup step above stopped providing a binary, and it
@@ -486,6 +499,10 @@ jobs:
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_agent_issue_index.py
           python3 tests/scripts/test_ab_arms_differ.py
+          # The variadic-load harness's controls (#2970). Standard
+          # library plus a loopback mock server: no numpy, no GPU, no
+          # network beyond 127.0.0.1.
+          python3 tests/scripts/test_variadic_harness.py
           # The ROCM-TIER-DIVERGENCE (#2590) attribution suite stays HERE, and
           # its two siblings do not (#2705). This one drives
           # `scripts/tier-delta-attribution.py`, which imports `statistics` and

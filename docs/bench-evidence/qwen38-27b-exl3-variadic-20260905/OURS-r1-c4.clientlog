@@ -1,0 +1,8 @@
+[OURS-r1-c4] warmup 4 at c=4
+[OURS-r1-c4] measured 128 at c=4
+  [OURS-r1-c4/measured] 25/128 t=21s
+  [OURS-r1-c4/measured] 50/128 t=7s
+  [OURS-r1-c4/measured] 75/128 t=19s
+  [OURS-r1-c4/measured] 100/128 t=10s
+  [OURS-r1-c4/measured] 125/128 t=11s
+CLIENT_RESULT {"leg": "OURS-r1-c4", "arm": "OURS", "round": 1, "concurrency": 4, "warmup_requests": 4, "measured_requests": 128, "warm_wall_s": 12.554035862000092, "measured_wall_s": 438.7683809900009, "headline_warm": {"ok": 128, "requests": 128, "wall_s": 438.7683809900009, "output_tokens": 23335, "output_tok_s": 53.18295713868175, "mean_ttft_ms": 2701.4336909921326, "median_ttft_ms": 1266.864293499566, "mean_tpot_ms": 60.29983719667025, "decode_only_tok_s": 16.58379270143734}, "headline_all": {"ok": 132, "requests": 132, "wall_s": 451.32241685200097, "output_tokens": 24052, "output_tok_s": 53.29227865029183, "mean_ttft_ms": 2756.75906539388, "median_ttft_ms": 1318.6355155003184, "mean_tpot_ms": 59.54177990232006, "decode_only_tok_s": 16.79492957114362}}

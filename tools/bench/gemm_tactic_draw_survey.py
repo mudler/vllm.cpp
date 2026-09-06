@@ -850,7 +850,7 @@ def speed_spread(
 
 
 def select_shipping_draw(
-    spread: Mapping[str, Any], draw_order: Sequence[str]
+    spread: Mapping[str, Any], draw_order: Sequence[str], *, smoke: bool = False
 ) -> dict[str, Any]:
     """#2752: which draw, if any, may be committed as the pinned GB10 artifact.
 
@@ -867,6 +867,22 @@ def select_shipping_draw(
     NOT equivalent, this returns NO draw and names #2751 as the blocker, which
     is what #2752's own "blocked-by consideration" paragraph asks for.
     """
+
+    if smoke:
+        # A SMOKE RUN CANNOT PIN ANYTHING, WHATEVER ITS NUMBERS SAY (#2972).
+        # Its sizes were chosen to reach phase [R] in minutes -- one draw, one
+        # leg, four short prompts -- so "the draws are performance-equivalent"
+        # is a statement about a fixture and not about this device. The refusal
+        # is BY NAME rather than by the absent verdict below, so a smoke run
+        # that somehow carried one is still refused.
+        return {
+            "ship": None,
+            "reason": (
+                "this evidence root was produced by a smoke run, whose sizes "
+                "are chosen to walk the phase sequence and not to measure "
+                "anything; no draw is pinned from it"
+            ),
+        }
 
     verdict = spread.get("verdict")
     if verdict == "EQUIVALENT":
@@ -1046,6 +1062,7 @@ def run_draw(
     *,
     tactic_set: str = "full",
     dry_run: bool = False,
+    smoke: bool = False,
     mirror: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """One fresh process: its own cache path, its own stderr, its own evidence.
@@ -1120,6 +1137,11 @@ def run_draw(
             "dry-run" if dry_run else (sha256_file(bench) if bench.is_file() else None)
         ),
         "dry_run": bool(dry_run),
+        # THE MARKER TRAVELS WITH THE DRAW, not with the command line that read
+        # the evidence back (#2972). `reduce` is run separately, often on
+        # another day, and a marker held only in the reducer's arguments is one
+        # a later reduction silently drops.
+        "smoke": bool(smoke),
     }
     write_json(home / "record.json", record)
     if rc == 0:
@@ -1445,9 +1467,14 @@ def reduce_evidence(
 ) -> tuple[int, dict[str, Any]]:
     records = read_draw_records(evidence)
     code, problems = check_draw_preconditions(records)
+    smoke = any(r.get("smoke") for r in records)
     report: dict[str, Any] = {
         "evidence": str(evidence),
         "dry_run": any(r.get("dry_run") for r in records),
+        # TOP-LEVEL, and set from the DRAWS. A report gets read out of the
+        # directory it was written in, and a smoke run's numbers are legible
+        # long after the command line that produced them is gone.
+        "smoke": smoke,
         # The arm is a TOP-LEVEL field because a draw-spread number that does
         # not say which selection rule produced it is not interpretable, and a
         # report gets read out of the directory it was written in.
@@ -1514,21 +1541,37 @@ def reduce_evidence(
                 ),
             }
             return EXIT_LEG_NOT_FROZEN, report
-        report["issue_2751_speed"] = speed_spread(
+        speed: dict[str, Any] = speed_spread(
             per_draw, ratification_bar=ratification_bar, noise_ceiling=noise_ceiling
         )
-        report["issue_2752"] = select_shipping_draw(
-            report["issue_2751_speed"], [r["label"] for r in records]
-        )
     else:
-        report["issue_2751_speed"] = {
+        speed = {
             "verdict": "NOT RUN",
             "reason": "no scoring ledger at score/legs.jsonl",
         }
-        report["issue_2752"] = {
-            "ship": None,
-            "reason": "the speed half has not run, so #2752 stays blocked",
+
+    if smoke:
+        # CARRIED THE WAY THE TUNER'S OWN TIMING IS: a `state`, and deliberately
+        # NO `verdict` key. A `verdict` of REFUSED or NOT RUN is still a verdict
+        # field, and a reader -- or a script -- that goes looking for one would
+        # find something to quote. The spread itself is not reported at all: a
+        # ratio over one leg per draw at four prompts describes the fixture.
+        report["issue_2751_speed"] = {
+            "state": "SMOKE",
+            "legs_per_draw": {label: len(v) for label, v in per_draw.items()},
+            "not_a_measurement": (
+                "This run was taken with --smoke, whose sizes exist to walk the "
+                "phase sequence in minutes: one draw, one scoring leg, four "
+                "short prompts, and the tuning warmup at the engine's own "
+                "minimum token budget. Nothing here is comparable to a run at "
+                "the survey's own sizes, and no number from it may be quoted."
+            ),
         }
+    else:
+        report["issue_2751_speed"] = speed
+    report["issue_2752"] = select_shipping_draw(
+        report["issue_2751_speed"], [r["label"] for r in records], smoke=smoke
+    )
 
     clock = evidence / "score" / "clock-windows.json"
     if clock.is_file():
@@ -1579,6 +1622,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                            "survives the box going down mid-phase")
     draw.add_argument("--dry-run", action="store_true",
                       help="walk the resume/record path with no subprocess and no device")
+    draw.add_argument("--smoke", action="store_true",
+                      help="mark every record this run writes as a SMOKE draw. "
+                           "The driver sets it; it changes no size here and no "
+                           "threshold anywhere. `reduce` reports it, reports no "
+                           "speed verdict for it, and refuses to pin a draw "
+                           "from it (#2972)")
 
     frozen = sub.add_parser(
         "check-frozen", help="assert one scoring leg replayed a frozen map"
@@ -1619,14 +1668,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         write_json(
             args.evidence / "draw-config.json",
-            dict(cfg, tactic_set=args.tactic_set),
+            dict(cfg, tactic_set=args.tactic_set, smoke=bool(args.smoke)),
         )
         records: list[dict[str, Any]] = []
         for index in range(args.draws):
             record = run_draw(
                 index, args.evidence, args.bench, args.model, cfg,
                 tactic_set=args.tactic_set, dry_run=args.dry_run,
-                mirror=args.mirror,
+                smoke=args.smoke, mirror=args.mirror,
             )
             records.append(record)
             keys = len([k for k in record.get("algo", {}) if not k.startswith("_")])

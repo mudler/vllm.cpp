@@ -3719,9 +3719,8 @@ TEST_CASE("ROCm registers the W1 MLA ops natively rather than serving them from 
       (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM) ? "1" : "0") +
       " kDsaTopkSelect=" +
       (vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM) ? "1" : "0") +
-      " kMlaDecodeAttention=" +
-      (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM) ? "1" : "0") +
-      " — the GLM-5.3 speed axis stays VOID while any of these is 0";
+      " — the GLM-5.3 speed axis stays VOID while either is 0. "
+      "kMlaDecodeAttention left this list when #2926 landed it.";
   MESSAGE(owed);
 }
 
@@ -4075,26 +4074,336 @@ TEST_CASE("what an unregistered ROCm op actually does on this board: tier, or re
       (eligible ? "1" : "0");
   MESSAGE(tier);
 
-  // The probe op must be one ROCm does not register. `kMlaDecodeAttention` is
-  // that today and W3 is what changes it; when it does, there is nothing left
-  // to probe here and this case has no business failing for that reason.
-  if (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM)) {
-    MESSAGE("kMlaDecodeAttention is now registered on ROCm (W3 landed) — probe skipped");
+  // The probe op must be one ROCm does not register. It USED to be
+  // `kMlaDecodeAttention`; #2926 registered that one, so the probe moved to
+  // `kDsaIndexerLogits`, which is still owed. When that one lands too there is
+  // nothing left to probe here and this case has no business failing for it.
+  //
+  // MOVING THE PROBE IS NOT A WEAKENING. The quantity under test is what the
+  // BOARD does with an unregistered op, not which op happens to be
+  // unregistered, so any op with no ROCm kernel answers the same question.
+  if (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM)) {
+    MESSAGE("kDsaIndexerLogits is now registered on ROCm — nothing left to probe");
     return;
   }
 
   const unsigned long long before = vt::GetReferenceTierHits();
   if (eligible) {
     // The tier is live: the miss installs a host kernel and counts itself.
-    CHECK_NOTHROW((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK_NOTHROW((void)vt::GetOp(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM));
     CHECK(vt::GetReferenceTierHits() > before);
     MESSAGE("VERDICT: the tier is LIVE here — the missing MLA ops are a SPEED cost");
   } else {
     // No tier: `GetOp` refuses by name rather than handing a host kernel a
     // pointer the host may not dereference.
-    CHECK_THROWS((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK_THROWS((void)vt::GetOp(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM));
     CHECK(vt::GetReferenceTierHits() == before);
     MESSAGE("VERDICT: the tier is WITHDRAWN here — the missing MLA ops are a REFUSAL, "
             "so W2/W3 block GENERATION and not only measurement");
   }
+}
+
+// ─── #2926: the two attention ops GLM-5.3 non-flash reaches ─────────────────
+//
+// These are the two ops that, before `src/vt/rocm/rocm_mla_attn.hip`, had no
+// ROCm registration and therefore REFUSED on `gfx1151` — the reference tier is
+// withdrawn on a part reporting `PageableMemoryAccess = 0`
+// (`docs/ROCM.md:83-85`), so an unregistered op is not a slow path. The
+// oracle-equality assertions below are the numerics; the `OpRegistered` case
+// further down is what can tell a native kernel from the tier, because on a
+// board where the tier IS live it computes the same answer on the host.
+
+TEST_CASE("MlaPrefillAttention matches the CPU oracle: causal, non-causal, windowed") {
+  // UNEQUAL query and key lengths on the FIRST request, which is the whole
+  // point. FlashAttention's causal mask is BOTTOM-RIGHT aligned — query `i`
+  // sees keys `j <= i + (len_k - len_q)` (`flash_attn.py:223`,
+  // `cpu_mla_prefill.cpp`'s `causal_shift`) — so a TOP-LEFT implementation is
+  // green on a square request and wrong here. Request 0 is 3 queries over 5
+  // keys (shift 2); request 1 is 2 over 2 (shift 0), so both alignments are in
+  // the same call.
+  constexpr int64_t kHeads = 3, kQkDim = 9, kVDim = 6;
+  constexpr int64_t kTotalQ = 5, kTotalK = 7, kReqs = 2;
+  const std::vector<int32_t> cu_q = {0, 3, 5};
+  const std::vector<int32_t> cu_k = {0, 5, 7};
+
+  const std::vector<float> query = RandomVec(static_cast<size_t>(kTotalQ * kHeads * kQkDim), 51001);
+  const std::vector<float> key = RandomVec(static_cast<size_t>(kTotalK * kHeads * kQkDim), 51002);
+  const std::vector<float> value = RandomVec(static_cast<size_t>(kTotalK * kHeads * kVDim), 51003);
+  const std::vector<float> out_seed(static_cast<size_t>(kTotalQ * kHeads * kVDim), -7.25f);
+  const std::vector<float> lse_seed(static_cast<size_t>(kHeads * kTotalQ), -7.25f);
+
+  // arm 0 causal, arm 1 NON-causal (the context-chunk call, "Context is
+  // unmasked", `flash_attn.py:246`), arm 2 causal + sliding window. A window
+  // with `causal=false` is refused by ops.cpp, so the pair is not spelled.
+  for (int arm = 0; arm < 3; ++arm) {
+    CAPTURE(arm);
+    vt::MlaPrefillAttentionArgs args;
+    args.scale = 0.37f;
+    args.causal = arm != 1;
+    args.max_seqlen_q = 3;
+    args.max_seqlen_k = 5;
+    if (arm == 2) args.window_size = vt::AttentionWindow{1, 0};
+
+    std::vector<float> ref(out_seed), ref_lse(lse_seed);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> qh = query, kh = key, vh = value;
+      std::vector<int32_t> cqh = cu_q, ckh = cu_k;
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kTotalQ, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(ref_lse.data(), DType::kF32, cd, {kHeads, kTotalQ});
+      Tensor tq = Tensor::Contiguous(qh.data(), DType::kF32, cd, {kTotalQ, kHeads, kQkDim});
+      Tensor tk = Tensor::Contiguous(kh.data(), DType::kF32, cd, {kTotalK, kHeads, kQkDim});
+      Tensor tv = Tensor::Contiguous(vh.data(), DType::kF32, cd, {kTotalK, kHeads, kVDim});
+      Tensor tcq = Tensor::Contiguous(cqh.data(), DType::kI32, cd, {kReqs + 1});
+      Tensor tck = Tensor::Contiguous(ckh.data(), DType::kI32, cd, {kReqs + 1});
+      vt::MlaPrefillAttention(cq, to, &tl, tq, tk, tv, tcq, tck, args);
+      cpu.DestroyQueue(cq);
+    }
+    // The oracle actually wrote: a seeded buffer that came back unchanged would
+    // make every comparison below vacuous.
+    REQUIRE(ref != out_seed);
+    REQUIRE(ref_lse != lse_seed);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMlaPrefillAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, query.size()), dk(dev, q, key.size()), dv(dev, q, value.size()),
+          dout(dev, q, out_seed.size()), dlse(dev, q, lse_seed.size());
+      dq.Upload(query);
+      dk.Upload(key);
+      dv.Upload(value);
+      dout.Upload(out_seed);
+      dlse.Upload(lse_seed);
+      void* dcq = dev.Alloc(cu_q.size() * sizeof(int32_t));
+      void* dck = dev.Alloc(cu_k.size() * sizeof(int32_t));
+      dev.Copy(q, dcq, cu_q.data(), cu_q.size() * sizeof(int32_t));
+      dev.Copy(q, dck, cu_k.data(), cu_k.size() * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kTotalQ, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(dlse.ptr(), DType::kF32, d, {kHeads, kTotalQ});
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kTotalQ, kHeads, kQkDim});
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTotalK, kHeads, kQkDim});
+      Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {kTotalK, kHeads, kVDim});
+      Tensor tcq = Tensor::Contiguous(dcq, DType::kI32, d, {kReqs + 1});
+      Tensor tck = Tensor::Contiguous(dck, DType::kI32, d, {kReqs + 1});
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::MlaPrefillAttention(q, to, &tl, tq, tk, tv, tcq, tck, args);
+      dev.Synchronize(q);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_lse, dlse.Download()) <= kNmseTol);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      dev.Free(dcq);
+      dev.Free(dck);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("MlaDecodeAttention matches the CPU oracle: dense, windowed, selected, sink") {
+  // A SHUFFLED block table, so a kernel that read page `i` for logical block `i`
+  // is green on an identity table and wrong here. `kVDim < kHeadSize` is the MLA
+  // shape: the QK dot spans the FULL row and V is its LEADING slice
+  // (`triton_mla.py:236`).
+  constexpr int64_t kBatch = 2, kHeads = 3, kHeadSize = 9, kVDim = 6;
+  constexpr int64_t kBlocks = 8, kBlockSize = 4, kMaxBlocks = 2;
+  const std::vector<int32_t> block_table = {6, 1,   //
+                                            3, 7};
+  const std::vector<int32_t> seq_lens = {7, 3};
+  constexpr int64_t kTopk = 4;
+
+  const std::vector<float> query =
+      RandomVec(static_cast<size_t>(kBatch * kHeads * kHeadSize), 52001);
+  const std::vector<float> cache =
+      RandomVec(static_cast<size_t>(kBlocks * kBlockSize * kHeadSize), 52002);
+  const std::vector<float> sink = RandomVec(static_cast<size_t>(kHeads), 52003);
+  const std::vector<float> out_seed(static_cast<size_t>(kBatch * kHeads * kVDim), -6.5f);
+  const std::vector<float> lse_seed(static_cast<size_t>(kBatch * kHeads), -6.5f);
+
+  // A `-1` INSIDE the live count (upstream's "no token" sentinel,
+  // sparse_attn_indexer.py:431-432) and a count SHORTER than the row, so both
+  // the sentinel skip and the count clamp are exercised.
+  const std::vector<int32_t> sel = {5, 1, -1, 3,   //
+                                    0, 2, -1, -1};
+  const std::vector<int32_t> sel_cnt = {4, 2};
+
+  // arm 0 dense, 1 windowed, 2 selected, 3 sink, 4 selected + sink.
+  for (int arm = 0; arm < 5; ++arm) {
+    CAPTURE(arm);
+    const bool selected = arm == 2 || arm == 4;
+    const bool sinked = arm == 3 || arm == 4;
+
+    // Shared, POINTER-FREE settings. The two Tensor* members are set per side
+    // (host oracle / device) against tensors that live on that side, so no
+    // pointer here ever outlives its tensor.
+    vt::MlaDecodeAttentionArgs base;
+    base.scale = 0.41f;
+    base.num_kv_splits = 0;
+    base.max_seq_len = 7;
+    if (arm == 1) base.window_size = vt::AttentionWindow{2, 0};
+
+    std::vector<float> ref(out_seed), ref_lse(lse_seed);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> qh = query, ch = cache, sh = sink;
+      std::vector<int32_t> bth = block_table, slh = seq_lens, selh = sel, cnth = sel_cnt;
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kBatch, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(ref_lse.data(), DType::kF32, cd, {kBatch, kHeads});
+      Tensor tq =
+          Tensor::Contiguous(qh.data(), DType::kF32, cd, {kBatch, kHeads, kHeadSize});
+      Tensor tc =
+          Tensor::Contiguous(ch.data(), DType::kF32, cd, {kBlocks, kBlockSize, kHeadSize});
+      Tensor tb = Tensor::Contiguous(bth.data(), DType::kI32, cd, {kBatch, kMaxBlocks});
+      Tensor ts = Tensor::Contiguous(slh.data(), DType::kI32, cd, {kBatch});
+      Tensor ti = Tensor::Contiguous(selh.data(), DType::kI32, cd, {kBatch, kTopk});
+      Tensor tn = Tensor::Contiguous(cnth.data(), DType::kI32, cd, {kBatch});
+      Tensor tk = Tensor::Contiguous(sh.data(), DType::kF32, cd, {kHeads});
+      vt::MlaDecodeAttentionArgs cargs = base;
+      if (selected) {
+        cargs.topk_indices = &ti;
+        cargs.valid_counts = &tn;
+      }
+      if (sinked) cargs.attn_sink = &tk;
+      vt::MlaDecodeAttention(cq, to, &tl, tq, tc, tb, ts, cargs);
+      cpu.DestroyQueue(cq);
+    }
+    // The oracle actually wrote: a seeded buffer that came back unchanged would
+    // make every comparison below vacuous.
+    REQUIRE(ref != out_seed);
+    REQUIRE(ref_lse != lse_seed);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMlaDecodeAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, query.size()), dc(dev, q, cache.size()),
+          dout(dev, q, out_seed.size()), dlse(dev, q, lse_seed.size()),
+          dsink(dev, q, sink.size());
+      dq.Upload(query);
+      dc.Upload(cache);
+      dout.Upload(out_seed);
+      dlse.Upload(lse_seed);
+      dsink.Upload(sink);
+      void* dbt = dev.Alloc(block_table.size() * sizeof(int32_t));
+      void* dsl = dev.Alloc(seq_lens.size() * sizeof(int32_t));
+      void* dsel = dev.Alloc(sel.size() * sizeof(int32_t));
+      void* dcnt = dev.Alloc(sel_cnt.size() * sizeof(int32_t));
+      dev.Copy(q, dbt, block_table.data(), block_table.size() * sizeof(int32_t));
+      dev.Copy(q, dsl, seq_lens.data(), seq_lens.size() * sizeof(int32_t));
+      dev.Copy(q, dsel, sel.data(), sel.size() * sizeof(int32_t));
+      dev.Copy(q, dcnt, sel_cnt.data(), sel_cnt.size() * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kBatch, kHeads, kVDim});
+      Tensor tl = Tensor::Contiguous(dlse.ptr(), DType::kF32, d, {kBatch, kHeads});
+      Tensor tq =
+          Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kBatch, kHeads, kHeadSize});
+      Tensor tc =
+          Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kBlocks, kBlockSize, kHeadSize});
+      Tensor tb = Tensor::Contiguous(dbt, DType::kI32, d, {kBatch, kMaxBlocks});
+      Tensor ts = Tensor::Contiguous(dsl, DType::kI32, d, {kBatch});
+      Tensor ti = Tensor::Contiguous(dsel, DType::kI32, d, {kBatch, kTopk});
+      Tensor tn = Tensor::Contiguous(dcnt, DType::kI32, d, {kBatch});
+      Tensor tk = Tensor::Contiguous(dsink.ptr(), DType::kF32, d, {kHeads});
+      vt::MlaDecodeAttentionArgs dargs = base;
+      if (selected) {
+        dargs.topk_indices = &ti;
+        dargs.valid_counts = &tn;
+      }
+      if (sinked) dargs.attn_sink = &tk;
+
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::MlaDecodeAttention(q, to, &tl, tq, tc, tb, ts, dargs);
+      dev.Synchronize(q);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_lse, dlse.Download()) <= kNmseTol);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+
+      // THE FULL-SELECTION IDENTITY, on the DENSE arm's own device and asserted
+      // BIT FOR BIT. `ops.h` states it as a contract: "A SELECTION LISTING EVERY
+      // CAUSAL KEY IS BIT-FOR-BIT the unselected call", because the list is
+      // walked in ascending order and the f32 online softmax therefore sees the
+      // identical summation order. An NMSE bound against the CPU oracle cannot
+      // see a reordered reduction, which is the whole thing this identity is
+      // about — so it is a device-against-itself equality and not an oracle
+      // comparison.
+      //
+      // Only REQUEST 1 is compared: its 3 keys fit inside `topk == 4`, so its
+      // list can name every causal key. Request 0 has 7 keys and cannot, and its
+      // rows are EXCLUDED rather than fudged into the bound.
+      if (arm == 0) {
+        const std::vector<float> dense = dout.Download();
+        const std::vector<int32_t> full = {0, 1, 2, 3,   // request 0: truncated, unused
+                                           0, 1, 2, -1};
+        const std::vector<int32_t> full_cnt = {4, 3};
+        dev.Copy(q, dsel, full.data(), full.size() * sizeof(int32_t));
+        dev.Copy(q, dcnt, full_cnt.data(), full_cnt.size() * sizeof(int32_t));
+        dout.Upload(out_seed);
+        dev.Synchronize(q);
+        vt::MlaDecodeAttentionArgs fargs = base;
+        fargs.topk_indices = &ti;
+        fargs.valid_counts = &tn;
+        vt::MlaDecodeAttention(q, to, &tl, tq, tc, tb, ts, fargs);
+        dev.Synchronize(q);
+        const std::vector<float> got_full = dout.Download();
+        for (size_t i = static_cast<size_t>(kHeads * kVDim); i < got_full.size(); ++i) {
+          CHECK(got_full[i] == dense[i]);
+        }
+      }
+
+      dev.Free(dbt);
+      dev.Free(dsl);
+      dev.Free(dsel);
+      dev.Free(dcnt);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("ROCm registers the two attention ops GLM-5.3 non-flash reaches (#2926)") {
+  // The load-bearing assertion of this wave, and the one the numeric cases
+  // above CANNOT make. `OpRegistered` is a native-only probe
+  // (`src/vt/op_provider.cpp:788-806`): on a board where the portable reference
+  // tier is live it is FALSE while the op still computes the right answer on
+  // the host, so an oracle-equality assertion is green with no kernel at all.
+  // That is measured, not argued — four of #2715's RED cases passed on their
+  // `REQUIRE` guards alone.
+  //
+  // On `gfx1151` the tier is withdrawn (`docs/ROCM.md:83-85`), so a false here
+  // is not a slow path: it is GLM-5.3 non-flash unable to emit a token.
+  bool rocm_built = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) rocm_built = true;
+  }
+  if (!rocm_built) return;  // not a ROCm build — nothing to assert about ROCm
+
+  CHECK(vt::OpRegistered(vt::OpId::kMlaPrefillAttention, DeviceType::kROCM));
+  CHECK(vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+
+  // Still owed after this wave (spec § Owed). RECORDED, not asserted: asserting
+  // their absence would be a lock on the next wave. A SPARSE step — a prompt
+  // longer than `index_topk` — still refuses while either is 0.
+  const std::string owed =
+      std::string("still owed on ROCm (#2926) — kDsaIndexerLogits=") +
+      (vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM) ? "1" : "0") +
+      " kDsaTopkSelect=" +
+      (vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM) ? "1" : "0") +
+      " kMergeAttnStates=" +
+      (vt::OpRegistered(vt::OpId::kMergeAttnStates, DeviceType::kROCM) ? "1" : "0") +
+      " — a SPARSE GLM-5.3 step still refuses while the indexer pair is 0, and "
+      "the speed axis stays VOID";
+  MESSAGE(owed);
 }

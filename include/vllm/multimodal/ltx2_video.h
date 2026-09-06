@@ -622,6 +622,15 @@ inline constexpr char kLtx2NegativeAudioPromptEmbedsExtra[] =
 // already gated. Until that lands, this trace is a change detector and the
 // composition's VALUES rest on the per-brick oracles either side of it.
 struct Ltx2ConditioningTrace {
+  // ── WHAT THE DURATION HEAD SAID (row LTX25-DURATION-HEAD-WIRE, #2900) ─────
+  //
+  // `duration_frames` is 0 when no auto duration was resolved, which is every
+  // request that named its own count and every engine loaded without a head.
+  // Both fields exist so a test can assert the count CAME FROM THE HEAD rather
+  // than inferring it from a frame count that a recipe could also have produced;
+  // upstream logs the same two numbers at blocks.py:881-888.
+  double duration_seconds = 0.0;
+  int64_t duration_frames = 0;
   // True when the text tower encoded the request's own prompt; false when the
   // conditioning came from `prompt_embeds_path`.
   bool from_prompt = false;
@@ -1458,8 +1467,14 @@ class Ltx2VideoEngine : public VideoEngine {
   // half of the prompt encoding, after the connector. Passing it in rather than
   // re-encoding is what keeps the audio-only arm from owning a second copy of
   // the connector composition.
+  // `video_encoding` is deliberately absent, not forgotten: this mirrors
+  // `T2AOneStagePipeline`, whose duration call passes `video_encoding=None`
+  // (t2a_one_stage.py:103-107). `auto_min_seconds`/`auto_max_seconds` carry the
+  // AutoDuration window; `wants_auto` false means the caller gave a count.
   static VideoResult GenerateAudioOnly(Impl& im, const VideoGenParams& gen,
-                                       const float* audio_context, int64_t context_tokens);
+                                       const float* audio_context, int64_t context_tokens,
+                                       bool wants_auto_duration, double auto_min_seconds,
+                                       double auto_max_seconds);
 };
 
 // Does this checkpoint set hold an LTX-2.5 DiT? Exposed for the registry and for

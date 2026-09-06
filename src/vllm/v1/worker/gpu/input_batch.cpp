@@ -115,11 +115,13 @@ MultiGroupBlockTable make_block_table(int max_num_reqs, int max_model_len,
 InputBatch::InputBatch(int max_num_reqs, int max_model_len,
                        int max_num_batched_tokens, int vocab_size,
                        std::vector<int> block_sizes,
-                       std::vector<int> kernel_block_sizes)
+                       std::vector<int> kernel_block_sizes,
+                       int num_speculative_steps)
     : max_num_reqs(max_num_reqs),
       max_model_len(max_model_len),
       max_num_batched_tokens(max_num_batched_tokens),
       vocab_size(vocab_size),
+      num_speculative_steps(num_speculative_steps),
       block_table(make_block_table(max_num_reqs, max_model_len,
                                    max_num_batched_tokens, std::move(block_sizes),
                                    std::move(kernel_block_sizes))) {
@@ -130,6 +132,14 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len,
   num_computed_tokens_cpu.assign(n, 0);
   last_sampled_tokens.assign(n, 0);
   prefill_len.assign(n, 0);
+  // SPEC-DFLASH2 A2-3 (#2911): sized by the req_state POOL and not by any step's
+  // request count (states.py:71-77). See the header for why that is the
+  // correctness requirement rather than the convenient choice: the scatter's
+  // CUDA arm indexes this by req_state slot with nothing bounding the read.
+  // num_speculative_steps == 0 leaves it empty, which is upstream's zero-width
+  // tensor and what keeps every non-speculative runner unchanged.
+  draft_tokens.assign(n * static_cast<size_t>(num_speculative_steps), 0);
+  num_valid_draft_tokens.assign(n, 0);
   temperature_cpu.assign(n, 0.0f);
   top_p_cpu.assign(n, 0.0f);
   top_k_cpu.assign(n, 0);
@@ -216,6 +226,21 @@ int InputBatch::add_request(const CachedRequestState& request) {
   last_sampled_ops.push_back(LastSampledOp{
       LastSampledOp::kSeed, req_index, 0,
       last_sampled_tokens[static_cast<size_t>(req_index)]});
+  // SPEC-DFLASH2 A2-3 (#2911): `self.draft_tokens[req_idx].zero_()`
+  // (states.py:113). A freed slot is handed to the NEXT request, so without this
+  // the new occupant inherits the previous one's drafts. Those verify against a
+  // sequence they were never proposed for; lossless verify then REJECTS them, so
+  // the emitted tokens stay correct and only acceptance falls — nothing raises,
+  // which is why it is zeroed here rather than left to a reader to notice.
+  if (num_speculative_steps > 0) {
+    const size_t draft_row = static_cast<size_t>(req_index) *
+                             static_cast<size_t>(num_speculative_steps);
+    std::fill(draft_tokens.begin() + static_cast<std::ptrdiff_t>(draft_row),
+              draft_tokens.begin() + static_cast<std::ptrdiff_t>(draft_row) +
+                  num_speculative_steps,
+              0);
+  }
+  num_valid_draft_tokens[static_cast<size_t>(req_index)] = 0;
 
   // Sampling metadata (pooling DEFERRED — T0 always has sampling_params).
   const SamplingParams& sp = request.sampling_params;
@@ -706,6 +731,28 @@ void InputBatch::condense() {
         LastSampledOp{LastSampledOp::kMove, empty_index, last_req_index, 0});
     prefill_len[static_cast<size_t>(empty_index)] =
         prefill_len[static_cast<size_t>(last_req_index)];
+    // SPEC-DFLASH2 A2-3 (#2911): the draft row moves with the request, for the
+    // same reason as every array above it — the combine's scatter and the async
+    // placeholder fill both read it by req_state slot, and a row left behind is
+    // the PREVIOUS occupant's drafts read for this request. Upstream needs no
+    // equivalent because it never condenses (states.py:132 returns the slot to a
+    // free list and the index is stable for the request's life); this is the
+    // price of our condensed-dense batch, not a difference in what the state
+    // means. Unlike `last_sampled_tokens` the values are host-known here — the
+    // propose writes them on the host — so this is a plain row copy and needs no
+    // replay-log entry.
+    if (num_speculative_steps > 0) {
+      const size_t to = static_cast<size_t>(empty_index) *
+                        static_cast<size_t>(num_speculative_steps);
+      const size_t from = static_cast<size_t>(last_req_index) *
+                          static_cast<size_t>(num_speculative_steps);
+      for (int c = 0; c < num_speculative_steps; ++c) {
+        draft_tokens[to + static_cast<size_t>(c)] =
+            draft_tokens[from + static_cast<size_t>(c)];
+      }
+    }
+    num_valid_draft_tokens[static_cast<size_t>(empty_index)] =
+        num_valid_draft_tokens[static_cast<size_t>(last_req_index)];
     block_table.move_row(last_req_index, empty_index);
 
     // Sampling metadata (LoRA / generators / allowed-token-ids / bad-words
@@ -806,6 +853,22 @@ void InputBatch::swap_states(int i1, int i2) {
   last_sampled_ops.push_back(LastSampledOp{LastSampledOp::kSwap, i1, i2, 0});
   std::swap(prefill_len[static_cast<size_t>(i1)],
             prefill_len[static_cast<size_t>(i2)]);
+  // SPEC-DFLASH2 A2-3 (#2911): the draft rows swap with their requests. The
+  // decode-first reorder runs on a SPECULATIVE step by construction (it is the
+  // spec-as-decode split), so this is the reorder most likely to move a row that
+  // actually carries drafts.
+  if (num_speculative_steps > 0) {
+    const size_t d1 =
+        static_cast<size_t>(i1) * static_cast<size_t>(num_speculative_steps);
+    const size_t d2 =
+        static_cast<size_t>(i2) * static_cast<size_t>(num_speculative_steps);
+    for (int c = 0; c < num_speculative_steps; ++c) {
+      std::swap(draft_tokens[d1 + static_cast<size_t>(c)],
+                draft_tokens[d2 + static_cast<size_t>(c)]);
+    }
+  }
+  std::swap(num_valid_draft_tokens[static_cast<size_t>(i1)],
+            num_valid_draft_tokens[static_cast<size_t>(i2)]);
 
   // Swap the active token prefix of the two rows (upstream copies only
   // max_active_token_count columns).

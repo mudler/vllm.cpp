@@ -414,3 +414,64 @@ consistency. Each is a command, not a description.
   The pinned registry is unreconciled in both directions. Filed by this wave,
   owned by no row yet, and listed here as AGENTS.md §"Every change starts from an
   issue" requires.
+  **Citations REPAIRED 2026-09-05, wave MATRIX** (this file's `## Owed` keeps the
+  entry because the issue's items 1 and 4 are not discharged). What landed: all
+  fifteen re-anchored by symbol at the pin, plus five citations #2819 never
+  reported. Three of those five were already stale at `5559679229` and so fall
+  outside its before/after delta (`olmo.py`, `ouro.py`, `persimmon.py`,
+  `plamo2.py`, `fuyu.py` were deleted upstream between 2026-07-09 and 2026-07-25,
+  and `_unify_hybrid_kv_cache_specs` lost its leading underscore before that pin
+  too); one more is a SECOND `gritlm.py::GritLM` site on the `MODEL-EMBED` row,
+  which `scripts/check-symbol-anchors.py` reports only once because its `seen`
+  set is keyed on `(path, symbol)`.
+  **#2819's own third characterisation is also wrong.** It says the anchor
+  checker "cannot see" the OLMo divergence because "our row cites `olmo2.py`,
+  which still exists". `olmo2.py` exists at NEITHER pin — vLLM `b83be00cdd`
+  (vllm#48100) deleted it on 2026-07-09 — and the checker reports the row at both
+  pins. It was absent from the delta only because it was stale before the advance,
+  not because the instrument is blind to it.
+  **Still owed, and NOT discharged here:** item 1's behaviour question (what
+  `Olmo3ForCausalLM` routing to `TransformersForCausalLM` means for our
+  Olmo2-alias implementation, and what moved with `KimiLinearForCausalLM` into
+  `vllm/models/kimi_k3/`) needs its own row; item 4's registry-coverage
+  re-derivation at `e126687a9a` needs its own wave, and until it runs this
+  matrix's header still names `5559679229` as the pinned oracle source and its
+  355-row at-the-pin claim is unre-derived.
+- [#2971](https://github.com/mudler/vllm.cpp/issues/2971) —
+  `scripts/check-symbol-anchors.py` keys its report on `(path, symbol)`, so a
+  citation repeated at N sites is reported once and its summary count reads as a
+  site count when it is not. After the repairs above the tree carries **9 stale
+  sites and reports 8**: the checker's own summary line reads
+  `stale 3, file absent 6` while it prints eight FAILs, because
+  `.agents/specs/fp8-kv-cache.md:127` and `.agents/parity-ledger.md:845` cite the
+  same symbol — `test_reshape_and_cache` in the upstream `test_cache.py`, written
+  there as one citation this entry deliberately does NOT repeat, because a tenth
+  site is the last thing a report about masked sites should add — and only the
+  second of the two is printed. The same masking hid a second stale
+  `gritlm.py::GritLM` site in the matrix, and two more in
+  `.agents/sync/2026-09-03-e126687-advance.md` that appeared only once the
+  spec-side copies were repaired.
+  **The count CAN rise as you fix things, and it can also stay flat while the
+  tree gets worse.** The second is what this change measured, because it is the
+  demonstrable one. Reverting the `moe-semantics.md:29` repair in a scratch copy
+  restores a citation to a file that is absent at the pin, which takes the tree
+  from 9 stale sites to 10 (`stale 3, file absent 6` becomes
+  `stale 3, file absent 7`) — and the reported count stays **8**, with
+  `.agents/sync/2026-09-03-e126687-advance.md:268` dropping out of the report and
+  `moe-semantics.md:29` taking its place. A strictly worse tree reads identically
+  to this one. The file was restored sha256-identical after the mutation.
+  Found by wave MATRIX while repairing #2819, not fixed there because it changes
+  a checker's reporting contract. Owned by no row yet.
+- [#2985](https://github.com/mudler/vllm.cpp/issues/2985) — `check_model_invariants`
+  in `scripts/check-agent-record.py` stores a measurement of
+  `.agents/model-matrix.md`, and its `targets`/`modules` terms are derived from
+  the Upstream cell, so re-anchoring a citation moves them. This change is the
+  proof: it added, removed, merged and re-aliased no row, and still had to edit
+  `scripts/check-agent-record.py` and `tests/scripts/test_agent_record.py` to stay
+  green. That is the coupling AGENTS.md §"Records" forbids
+  (*"Never store a measurement of one file inside another file"*), and the same
+  section names the remedy — *"a gate often creates the lock … the checker is
+  defective. Move the obligation to a per-row surface. Do not delete the
+  obligation."* Left as found by this change, because removing the coupling
+  changes a gate's semantics and needs its own spec and red-before evidence.
+  Owned by no row yet.

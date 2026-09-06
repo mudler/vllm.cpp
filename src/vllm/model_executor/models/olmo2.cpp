@@ -198,7 +198,7 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
     pa.window_size = ResolveAttentionWindow(
         /*per_layer=*/std::nullopt, sliding_window,
         v1::AttentionType::kDecoder,
-        /*disable_model_sliding_window=*/false);
+        /*disable_model_sliding_window=*/DisableSlidingWindowActive());
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

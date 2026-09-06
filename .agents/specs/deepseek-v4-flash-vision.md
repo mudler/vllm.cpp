@@ -972,6 +972,18 @@ THE CHAIN, from the entry point down:
 | the codec catch re-throwing `std::runtime_error` | RED, 3 assertions: the refusals reached the client as 500 |
 | `REGISTER_VLLM_MM_CHAT` repointed at an architecture nothing loads | RED, 14 assertions across every case in the suite |
 | the pinned C-ABI contract case, before its own rewrite | RED, `REQUIRE( st == VLLM_OK )` -- the ABI now refuses by name |
+| the `InstallMultiModalChatSeam` call deleted from `EnsureChatServing` | RED, 4 assertions: the C ABI dropped the image again |
+| `mm_ctx.mmproj_path = args.mmproj_path` deleted from `server_main.cpp` | RED, 4 assertions through the real `VllmServerMain` |
+| `mm_ctx.config = &loaded->config()` deleted from `server_main.cpp` | RED, 5 assertions across both serve cases |
+
+THE LAST TWO ARE THE ONES THIS WAVE NEARLY SHIPPED UNHELD. The two fields added
+to `MultiModalChatContext` are assigned in `server_main.cpp` and nowhere else
+on the server path, and `test_deepseek_v4_mm_chat` fills the context in itself,
+so deleting either left it green. That is the UNPASSED PARAMETER shape
+`.agents/reachability.md` names.
+`tests/vllm/entrypoints/openai/test_serve_deepseek_v4_mm.cpp` holds them
+through the real `VllmServerMain`, in the subprocess harness
+`test_serve_kv_cache_dtype.cpp` uses.
 
 The RED-BEFORE for the seam itself was a compile failure naming the three
 surfaces the wave adds: `oai::DefaultImageCodec`,
@@ -1026,13 +1038,14 @@ On a Release CPU build with `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON`:
 
 | Suite | Cases | Assertions | Was |
 |---|---|---|---|
-| `test_deepseek_v4_mm_chat` (new) | 7 | 643 | -- |
+| `test_deepseek_v4_mm_chat` (new) | 8 | 650 | -- |
+| `test_serve_deepseek_v4_mm` (new) | 2 | 21 | -- |
 | `test_deepseek_v4_image_processor` | 23 | 128 | 20 / 112 |
 | `test_deepseek_v4_dsa` | 19 | 109 | 19 / 106 |
 | `test_deepseek_v4_mm_reach` | 14 | 110 | 13 / 79 |
 | `test_capi` | 69 | 685 | 69 / 676 |
 
-`ctest -R 'deepseek_v4|clip_mmproj_gguf' -E cuda` is 25 of 25, one more suite
+`ctest -R 'deepseek_v4|clip_mmproj_gguf' -E cuda` is 26 of 26, two more suites
 than W4's 24. `ctest -R 'capi|chat_mm|api_server|serving|model_registry|
 model_loader' -E cuda` is 11 of 11, which is where the Qwen3-VL and dots3-note
 seams are held byte-unchanged: `test_chat_mm` 11/126, `test_openai_api_server_

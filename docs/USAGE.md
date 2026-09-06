@@ -727,6 +727,40 @@ the renderer supplies (`messages`, `tools`, `chat_template`, `tokenize`) is
 refused with `VLLM_ERR_INVALID_ARGUMENT` rather than honoured, so no request can
 replace the conversation the caller passed in `messages`.
 
+### Send an image through the C ABI
+
+`vllm_chat` and `vllm_chat_stream` accept an OpenAI `image_url` content part in
+the same request JSON. There is no ABI symbol and no struct field for media:
+the bytes travel in the request body, and `vllm_model_params.mmproj_path` names
+the second GGUF that carries the vision tower.
+
+```json
+{"messages":[{"role":"user","content":[
+  {"type":"text","text":"what is in this picture?"},
+  {"type":"image_url","image_url":{"url":"data:image/x-raw-rgb;base64,..."}}
+]}],"max_tokens":64}
+```
+
+A chat request carrying an image gets one of three answers, and never a silent
+text one:
+
+| The loaded architecture | What happens |
+|---|---|
+| declares no multimodal support | nothing is installed and the chat path is byte-identical to a text-only engine |
+| declares it and has a registered chat seam | the image is served, subject to `limit_mm_per_prompt` and `language_model_only` |
+| declares it and has no seam, or its factory refuses | `VLLM_ERR_INVALID_ARGUMENT`, with `vllm_last_error()` naming the architecture and the missing part |
+
+Before this the C ABI installed no multimodal chat seam at all, so an
+`image_url` part was dropped and the request was answered as text. That made
+every shipped multimodal capability reachable only from the bundled HTTP
+server.
+
+**Only raw RGB decodes.** The one image codec this library ships takes
+`image/x-raw-rgb` — a square `H*W*3` byte buffer, base64 in a `data:` URI — and
+refuses PNG, JPEG and every other container BY NAME. Fetching an `http(s)`
+image URL is not implemented either. Both are named residuals; a request that
+hits one is reported as a caller error rather than as a server fault.
+
 ## Use the internal C++ library in the source tree
 
 The headers under [`include/vllm/`](../include/vllm/) are source-tree

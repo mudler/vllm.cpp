@@ -458,10 +458,46 @@ __device__ inline void DequantQ6KGroup16(const BlockQ6_K* xb, int grp, int8_t ou
 // shared by every WMMA-format kernel in this file (Q4_K's below included),
 // so it lives at file scope rather than once per kernel body.
 constexpr int kQuantWmmaWarpsPerBlock = 4;
+// KERNEL-QUANT-CIQ-GEMM-ROCM-WIDEBLOCK (issue #3032): llama.cpp's `mul_mat_q`
+// runs the same 16x16x16 int8 WMMA tile at 8 warps/block (256 threads) and
+// finishes each launch 15-45x faster than this kernel's 4-warp/block arm at
+// matching shapes, per a same-tool `rocprofv3` trace. Each warp here already
+// owns a fully independent output tile with its own shared-memory slice
+// (indexed by `wy` throughout both kernel bodies below) and loops the whole
+// `nsb` reduction alone, so widening the block was tested as a launch-count
+// lever: does packing more independent warps per launch (half as many
+// blocks, same total work) close any of the gap?
+//
+// MEASURED AND REJECTED (`examples/quant-gemm-bench`, RX 9060 XT, gfx1200,
+// best-of-4, idle host): geomean -4.3% across the six Q4_K/Q6_K prefill
+// shapes (range -9.6% to +2.6%), i.e. a net regression, not a win. Each warp
+// here shares NO data with any other warp in its block -- no activation row,
+// no dequantized weight tile -- so a wider block only adds independent warps
+// to the SAME occupancy budget the LDS footprint already caps (4 warps at
+// this kernel's ~6.4 KiB/warp already uses two blocks' worth of the same
+// 64 KiB/CU two 4-warp blocks would use resident together), which is why
+// this axis alone does not move the needle: llama.cpp's block is not merely
+// wider, it very likely shares loaded/dequantized data ACROSS its tiles in a
+// way this kernel's per-warp-independent design does not. That is the
+// sharper, still-open hypothesis issue #3032 records as the next thing to
+// try, not this one. `kQuantWmmaWideWarpsPerBlock` and
+// `VT_ROCM_QUANT_WMMA_WIDE` stay in the tree, default OFF, as a ready-made
+// A/B for re-checking this specific axis on different hardware (gfx1201) or
+// a future ROCm/ toolchain revision, rather than re-deriving it from
+// scratch — matching this file's own `Q6KSmallPrivateEnabled` precedent for
+// a measured-and-rejected diagnostic arm.
+constexpr int kQuantWmmaWideWarpsPerBlock = 8;
 constexpr int kGroupGemmBatch = 2;
 static_assert(16 % kGroupGemmBatch == 0, "16 scale-groups must divide evenly into batches");
+// LDS budget check for the widest arm actually instantiated below (Q4_K is
+// the larger of the two: w_stage 4096B + row_scales/row_mins 128B each +
+// raw_tile 2048B = 6400B per warp slot). At kQuantWmmaWideWarpsPerBlock == 8
+// that is 51200B, comfortably under the 64KiB/block LDS limit this project's
+// other WMMA kernels stay inside (see `rocm_paged_attn.hip`'s own note).
+static_assert(kQuantWmmaWideWarpsPerBlock * 6400 <= 65536,
+             "widened WMMA block must stay under the 64KiB LDS budget");
 
-template <typename OutT>
+template <typename OutT, int WarpsPerBlock>
 __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                                    const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
                                    int64_t nsb, int64_t n_tiles) {
@@ -476,7 +512,7 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
   return;
 #else
   using namespace rocwmma;
-  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kQuantWmmaWarpsPerBlock +
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock +
                        static_cast<int64_t>(threadIdx.y);
   const int64_t m_tiles = m / 16;
   if (tile >= m_tiles * n_tiles) return;
@@ -493,14 +529,15 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
   // for that step alone), and every lane sat idle half the time doing it
   // (only 16 of 32 lanes filled one row each). Spreading the same total work
   // over all 32 lanes across all 16 groups removes both costs in one change.
-  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
+  __shared__ int8_t w_stage[WarpsPerBlock][16][16][16];
   // raw_tile holds kGroupGemmBatch groups' raw WMMA tiles at once, so a
   // whole batch's compute+store is one barrier and its scale-fold is
   // another, rather than a barrier per single group each way. 16 KiB
-  // (w_stage) + 8 KiB (this, at batch 2) = 24 KiB/block, comfortably under
-  // the 64 KiB LDS budget this project's other WMMA kernels stay inside
-  // (rocm_paged_attn.hip's own BM=16 BN=64 d=256 note).
-  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
+  // (w_stage) + 8 KiB (this, at batch 2, WarpsPerBlock==4) = 24 KiB/block,
+  // comfortably under the 64 KiB LDS budget this project's other WMMA
+  // kernels stay inside (rocm_paged_attn.hip's own BM=16 BN=64 d=256 note);
+  // see the file-scope `static_assert` above for the widened-block budget.
+  __shared__ int32_t raw_tile[WarpsPerBlock][kGroupGemmBatch][16][16];
 
   const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
   const BlockQ6_K* w_row_base[16];
@@ -651,7 +688,7 @@ __device__ inline void UnpackQ4KScalesMins(const BlockQ4_K* xb, uint8_t scales[8
 }
 #endif  // VT_ROCM_QUANT_WMMA_OK
 
-template <typename OutT>
+template <typename OutT, int WarpsPerBlock>
 __global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                                    const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
                                    int64_t nsb, int64_t n_tiles) {
@@ -660,7 +697,7 @@ __global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __rest
   return;
 #else
   using namespace rocwmma;
-  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kQuantWmmaWarpsPerBlock +
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock +
                        static_cast<int64_t>(threadIdx.y);
   const int64_t m_tiles = m / 16;
   if (tile >= m_tiles * n_tiles) return;
@@ -671,12 +708,12 @@ __global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __rest
   const int lane = static_cast<int>(threadIdx.x);
   const int wy = static_cast<int>(threadIdx.y);
 
-  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
-  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
+  __shared__ int8_t w_stage[WarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[WarpsPerBlock][kGroupGemmBatch][16][16];
   // Unpacked once per (row, superblock): 8 scales + 8 mins, tiny next to the
   // tile buffers above.
-  __shared__ uint8_t row_scales[kQuantWmmaWarpsPerBlock][16][8];
-  __shared__ uint8_t row_mins[kQuantWmmaWarpsPerBlock][16][8];
+  __shared__ uint8_t row_scales[WarpsPerBlock][16][8];
+  __shared__ uint8_t row_mins[WarpsPerBlock][16][8];
 
   const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ4_K);
   const BlockQ4_K* w_row_base[16];
@@ -1246,6 +1283,21 @@ bool Q6KSmallPrivateEnabled() {
   return on;
 }
 
+// VT_ROCM_QUANT_WMMA_WIDE=1 — the A/B arm for issue #3032, MEASURED AND
+// REJECTED as a net regression (geomean -4.3%, `examples/quant-gemm-bench`,
+// RX 9060 XT): see `kQuantWmmaWideWarpsPerBlock`'s own comment for the full
+// result and why. Default OFF, permanently, and not expected to flip; kept
+// as a ready-made A/B for re-checking this specific axis on different
+// hardware or a future toolchain revision, the same posture
+// `Q6KSmallPrivateEnabled` above ships with.
+bool QuantWmmaWideBlockEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ROCM_QUANT_WMMA_WIDE");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 }  // namespace
 
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
@@ -1392,11 +1444,18 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         g_kq_wmma_dispatches.fetch_add(1, std::memory_order_relaxed);
         const int64_t n_tiles = n / 16;
         const int64_t m_tiles = m / 16;
-        const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
-                                  kQuantWmmaWarpsPerBlock;
-        KQuantGemmKWmmaQ6K<OutT><<<static_cast<unsigned>(grid_wmma),
-                                   dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
-            o, w, qact, m, n, nsb, n_tiles);
+        const int wpb = QuantWmmaWideBlockEnabled() ? kQuantWmmaWideWarpsPerBlock
+                                                    : kQuantWmmaWarpsPerBlock;
+        const int64_t grid_wmma = (m_tiles * n_tiles + wpb - 1) / wpb;
+        if (wpb == kQuantWmmaWideWarpsPerBlock) {
+          KQuantGemmKWmmaQ6K<OutT, kQuantWmmaWideWarpsPerBlock>
+              <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles);
+        } else {
+          KQuantGemmKWmmaQ6K<OutT, kQuantWmmaWarpsPerBlock>
+              <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles);
+        }
         const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
         if (m_aligned < m || n_aligned < n) {
           // Remainder cell count: the bottom strip [m_aligned,m)x[0,n) plus
@@ -1414,11 +1473,18 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         g_kq_wmma_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);
         const int64_t n_tiles = n / 16;
         const int64_t m_tiles = m / 16;
-        const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
-                                  kQuantWmmaWarpsPerBlock;
-        KQuantGemmKWmmaQ4K<OutT><<<static_cast<unsigned>(grid_wmma),
-                                   dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
-            o, w, qact, m, n, nsb, n_tiles);
+        const int wpb = QuantWmmaWideBlockEnabled() ? kQuantWmmaWideWarpsPerBlock
+                                                    : kQuantWmmaWarpsPerBlock;
+        const int64_t grid_wmma = (m_tiles * n_tiles + wpb - 1) / wpb;
+        if (wpb == kQuantWmmaWideWarpsPerBlock) {
+          KQuantGemmKWmmaQ4K<OutT, kQuantWmmaWideWarpsPerBlock>
+              <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles);
+        } else {
+          KQuantGemmKWmmaQ4K<OutT, kQuantWmmaWarpsPerBlock>
+              <<<static_cast<unsigned>(grid_wmma), dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
+                  o, w, qact, m, n, nsb, n_tiles);
+        }
         const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
         if (m_aligned < m || n_aligned < n) {
           const int64_t remainder = (m - m_aligned) * n + m_aligned * (n - n_aligned);

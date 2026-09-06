@@ -258,6 +258,32 @@ scale layout through the tile op.
   this row gates against (`Q4_K_M`) never invokes Q5_K at all — it is a
   `Q5_K_M`/`Q5_K_S`-only format — so porting it would not move this row's own
   gate (c) measurement, only a differently-quantized checkpoint's.
+- Cross-warp data reuse in the WMMA kernel body (issue #3032). **CONFIRMED
+  by reading the actual source**, not inferred: llama.cpp's Q4_K config at
+  this row's shapes (`ggml/src/ggml-cuda/mmq-config-rdna4.cuh:127`,
+  `GGML_TYPE_Q4_K, 256, ..., 128, 128, ...`) gives ONE BLOCK an I=128 (weight
+  rows) x J=128 (activation columns) output tile — 8-64x the area our
+  4-8-warp block covers, since each of OUR warps independently owns only a
+  16x16 tile. That whole I x J tile is loaded ONCE per block, not once per
+  warp: `ggml_cuda_mmq_load_tiles_q4_K`
+  (`ggml/src/ggml-cuda/mmq-load-tiles.cuh:703-741`) stripes the I=128 rows
+  across every warp's threads (`i0 += nrows*nwarps`, each warp taking a
+  DIFFERENT row range), dequantizing each row exactly once into one shared
+  `x_tile`; `mmq_get_nbytes_shared` (`mmq.cuh:1379-1383`) sizes the
+  activation-tile allocation by `J` alone, not `J*nwarps`, confirming one
+  shared activation copy too. The compute phase
+  (`ggml_cuda_mmq_write_back_mma`, `mmq.cuh:476-500`) then splits the I
+  dimension across warps (`rows_per_warp = I/nwarps`), each warp looping the
+  FULL J range doing 16x16 MMA ops against that one shared load. This
+  kernel's per-warp-independent design (own `w_stage`/`raw_tile` slice, own
+  `load_matrix_sync` call, zero sharing even when two warps in one block
+  share the same M-tile) is the actual mechanism gap the wider-block
+  experiment above could not touch, because widening never introduced
+  sharing — it only added more independent warps to the same per-warp-load
+  pattern. Matching this (cooperative tile load + row-split compute over a
+  much larger shared tile) is a real kernel redesign, materially bigger than
+  the block-width experiment, and is the next traceable step — not attempted
+  in this row.
 
 ## Stop conditions
 
@@ -549,3 +575,41 @@ W1.5 tail-fill landing, both fixed in the same follow-up commit:
    than a single cherry-picked run. Q8_0 (a different, unrelated launch
    path that carries no tail-fill mechanism) was measured alongside as a
    control and is flat before/after (~2065-2083 GFLOP/s), as expected.
+
+**Wider WMMA block (issue #3032): MEASURED AND REJECTED.** A same-tool
+`rocprofv3` trace of `KQuantGemmKWmmaQ4K`/`Q6K` against llama.cpp's own
+`mul_mat_q` on the identical model/prompt found this kernel 4.9x (Q6_K) to
+10.6x (Q4_K) slower per-kernel, and llama.cpp's launch configuration uses
+double the warps per block (256 vs 128 threads) and 16-48x fewer blocks per
+launch yet finishes 15-45x faster. The obvious hypothesis — that packing
+more of this kernel's already-independent warps into fewer, bigger blocks
+would close some of that gap — does not hold: each warp here owns a fully
+independent output tile with its own shared-memory slice, so widening only
+changes how many independent warps share one launch's LDS budget, not how
+much work any one warp does.
+
+Templated `KQuantGemmKWmmaQ6K`/`KQuantGemmKWmmaQ4K` on `WarpsPerBlock` and
+added an 8-warp instantiation behind `VT_ROCM_QUANT_WMMA_WIDE=1` (default
+off). Hardware-verified correct (`ctest -R rocm|cross_device`, both configs,
+46/46 cases, 84066/84066 assertions, zero regression). Op-level A/B
+(`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle host), 4-warp
+(current default) vs 8-warp, all six Q4_K/Q6_K prefill shapes:
+
+| Shape | 4-warp (current) | 8-warp | ratio |
+|---|---:|---:|---:|
+| Q4_K N=3072 K=2048 | 1948.5 GFLOP/s | 1827.9 GFLOP/s | -6.2% |
+| Q4_K N=12288 K=2048 | 2242.7 GFLOP/s | 2027.9 GFLOP/s | -9.6% |
+| Q4_K N=2048 K=6144 | 1941.3 GFLOP/s | 1966.1 GFLOP/s | +1.3% |
+| Q6_K N=3072 K=2048 | 1874.0 GFLOP/s | 1775.9 GFLOP/s | -5.2% |
+| Q6_K N=12288 K=2048 | 2159.1 GFLOP/s | 1981.4 GFLOP/s | -8.2% |
+| Q6_K N=2048 K=6144 | 1885.0 GFLOP/s | 1933.5 GFLOP/s | +2.6% |
+
+Geomean -4.3%: a net regression, not a win. `VT_ROCM_QUANT_WMMA_WIDE` stays
+in the tree default-off, the same posture `VT_ROCM_Q6K_SMALL_PRIVATE` above
+ships with, as a ready-made A/B for re-checking this specific axis on
+different hardware (gfx1201) or a future toolchain revision rather than
+re-deriving it from scratch — not carried forward as an open question. The
+sharper, still-open hypothesis this measurement points at — cross-warp data
+reuse llama.cpp's kernel may have that this one's per-warp-independent
+design does not — is recorded in `## Owed` above, unread and unconfirmed,
+not assumed.

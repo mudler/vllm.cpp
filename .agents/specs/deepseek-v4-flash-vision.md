@@ -703,11 +703,40 @@ above as its red-before input.
   it does for every other tensor, so its W2b residual covers this one too.
   Nothing selects the bias. Three behaviours stay owed by issue #2411 and W4,
   and row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring:
-  per-token selection between the two biases in `deepseek_v4_moe.cpp`; the
-  hash-layer replacement at forward time, where an image row takes
-  `exp_probs_b_vl` while a text row takes `tid2eid` and no bias; and the
-  non-causal image-span sliding-window change. The loaded bias is a staged slice
-  until W4 lands, in the sense of `AGENTS.md` "Nothing lands dead".
+  selection between the two biases in `deepseek_v4_moe.cpp`; the hash-layer
+  replacement at forward time; and the non-causal image-span sliding-window
+  change. The loaded bias is a staged slice until W4 lands, in the sense of
+  `AGENTS.md` "Nothing lands dead".
+
+  **WHAT THE ORACLE DOES, and where our intent differs from it.** An earlier
+  wording of this entry described the first two as "per-token selection" and as
+  "an image row takes `exp_probs_b_vl` while a text row takes `tid2eid`", and
+  attributed that shape to the oracle. It is not the oracle's shape. In
+  `llama_model_deepseek4::graph::graph` at `llama-cpp-dsv4vision`
+  (`pr28154.diff`, the hunk at `@@ -1275,7 +1280,14 @@`) the selection is PER
+  UBATCH: `const bool is_media = ubatch.embd != nullptr;` and, when it is set,
+  every layer takes `ffn_exp_probs_b_vl` if the layer has one and the
+  `il < hparams.dsv4_hash_layer_count` branch is SKIPPED ENTIRELY, so
+  `ffn_gate_tid2eid` is never consulted. The image-row/text-row split on one
+  batch does not happen there, because a media ubatch carries no text rows.
+
+  Per-token may still be the right adaptation for a continuously-batched engine,
+  where one batch mixes image and text rows and llama.cpp's whole-ubatch flag has
+  no meaning. That is W4's decision, not this entry's, and it is not made here.
+  What W4 owes is the choice, stated: mirror the per-ubatch predicate, or adopt a
+  per-token one and justify the divergence against the oracle's own selection,
+  including what a per-token image row does about the hash layers the oracle skips
+  wholesale.
+
+  **The refusal ORDER W4 must preserve.** `RefuseUnsupportedDeepSeekV4ClipMmproj`
+  runs BEFORE `RefuseUnaccountedDeepSeekV4ClipMmproj`, and today only
+  `ThrownBy` in `tests/vllm/models/test_deepseek_v4_mmproj.cpp` enforces that.
+  There is no production call site, so nothing makes W4 reproduce it. Reversed,
+  a correctly-converted fused-qkv projector -- which is what the pinned
+  `convert_hf_to_gguf.py` emits -- is told it "carries tensors we never read"
+  instead of being told this build does not implement its arm, which is exactly
+  the outcome the W3B refusal exists to prevent. W4 owns the call site and owes
+  this order.
 - `scripts/check-dsv4-gguf-namemap.py` is owed the vision manifest. It generates
   1328 expected names and asserts exact set-equality against the TEXT artifact,
   so the 1371-name vision artifact fails it by construction and no gate covers
@@ -1154,6 +1183,11 @@ degenerate fixture it exists to prevent. Setting the new fixture's theta back to
 the 10000.0 default and regenerating reds the frequency guard at `0 >= 1`, and
 replacing its grids with a single (2,5) reds the row-order guard. The tree was
 restored and re-run at 14 of 14 cases and 7376 of 7376 assertions after both.
+SUPERSEDED: that sentence landed in `c211c50fd`, the same commit that added a
+fifteenth case, so it was stale on arrival. The head is at 15 cases and 7409
+assertions -- 7404 at `c211c50fd`, plus 3 for the multi-row exact-erf probe and 2
+for the pool cap, both above. The two guards are unchanged and still
+non-vacuous; only the totals moved.
 
 **W4 must size against the geometry cache.** The `IndexSelect` gather index is
 `aligned_rows * hidden_size * downsample_ratio^2` i32 values per cached geometry.

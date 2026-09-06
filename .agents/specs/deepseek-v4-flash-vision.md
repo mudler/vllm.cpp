@@ -736,13 +736,37 @@ above as its red-before input.
   `ffn_gate_tid2eid` is never consulted. The image-row/text-row split on one
   batch does not happen there, because a media ubatch carries no text rows.
 
-  Per-token may still be the right adaptation for a continuously-batched engine,
-  where one batch mixes image and text rows and llama.cpp's whole-ubatch flag has
-  no meaning. That is W4's decision, not this entry's, and it is not made here.
-  What W4 owes is the choice, stated: mirror the per-ubatch predicate, or adopt a
-  per-token one and justify the divergence against the oracle's own selection,
-  including what a per-token image row does about the hash layers the oracle skips
-  wholesale.
+  **W4 CHOSE PER TOKEN, and this is the argument.** Three grounds, in order of
+  weight:
+
+  1. It AGREES with the oracle on every input the oracle can express. A media
+     ubatch carries no text rows, so "every row is media" and "this row is
+     media" select identically at `llama-cpp-dsv4vision`. The divergence is
+     therefore an EXTENSION to inputs llama.cpp cannot build, not a
+     contradiction of it.
+  2. Our step is not a ubatch. This engine batches continuously, and one step
+     mixes an image request's prefill rows with other requests' decode rows.
+     `MultiModalForwardInput` is set for the whole step, so a whole-step flag
+     would route another request's TEXT tokens on the vision bias -- which the
+     oracle never does on any batch it can construct.
+  3. The hash question has a per-row answer, and it is the SAME answer the
+     oracle gives wholesale. A hash layer carries `exp_probs_b_vl` and no
+     `exp_probs_b`; an image row has no identifier worth hashing, so it takes
+     the vision bias and the learned top-k route, and a text row in the same
+     step still hashes through `tid2eid`. The oracle skips the hash branch for
+     the whole ubatch only because no text row is there to keep it.
+
+  WHICH ROWS ARE IMAGE ROWS is read from the step's own identifiers. The
+  processor writes `vocab_size + DeepSeekV4ImageTokenType` at every position of
+  an image block, so `MoeBlock` needs no new forward channel and a text step,
+  whose identifiers are all below the vocabulary, is byte-identical.
+
+  The two DEVICE routers take one bias pointer per call and have no per-row
+  selector, so `DispRoute` REFUSES a step carrying image rows on those arms by
+  name rather than routing them on the text bias. The kernel change is owed by
+  issue #2411 and W7-CUDA. The two resident single-token decode arms refuse an
+  out-of-vocabulary identifier for the same reason, and they also read `embed`
+  with no bound, which that refusal now closes.
 
   **The refusal ORDER, CLOSED BY W4.** `RefuseDeepSeekV4ClipMmprojArm` holds it
   in one function and `model_loader.cpp` calls that function rather than its

@@ -139,7 +139,12 @@ struct BiasWidths {
 inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
                                int64_t vision_from = 0,
                                int64_t head_dim = kHeadDim,
-                               bool with_tokenizer = false) {
+                               bool with_tokenizer = false,
+                               // Multiplies every `exp_probs_b_vl` value. Two
+                               // files that differ ONLY in this number are what
+                               // a gate needs to ask whether the forward READS
+                               // the vision bias, and on which rows.
+                               float vision_bias_scale = 1.0f) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -238,7 +243,9 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
     }
     if (vision && l >= vision_from) {
       b.AddTensor(Blk(l, "exp_probs_b_vl.bias"), GgmlDims({bw.vision}), /*F32=*/0,
-                  F32Data(bw.vision, [l](int64_t i) { return VisionBiasFill(l, i); }));
+                  F32Data(bw.vision, [l, vision_bias_scale](int64_t i) {
+                    return vision_bias_scale * VisionBiasFill(l, i);
+                  }));
     }
   }
   return b.Build();

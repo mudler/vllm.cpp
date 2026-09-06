@@ -413,7 +413,27 @@ deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<flo
                                       int64_t T, int64_t E, int64_t topk,
                                       const std::vector<float>& bias, bool renorm, float scale,
                                       const std::vector<int64_t>& in_tokens,
-                                      const std::vector<int32_t>& hashtab, int64_t vocab) {
+                                      const std::vector<int32_t>& hashtab, int64_t vocab,
+                                      const std::vector<float>& vision_bias,
+                                      const std::vector<char>& is_media_token) {
+  // MODEL-MM-deepseek-v4 W4 (#2411): the two DEVICE routers below take ONE bias
+  // pointer for the whole call and have no per-row selector, so an image row
+  // reaching them would be routed on the TEXT bias -- fluently, and wrong. The
+  // kernel change is W7-CUDA's, so the arm is refused BY NAME here rather than
+  // served from the wrong bias. This is the same predicate the host arm routes
+  // on, not a second copy of it: both read `is_media_token`.
+  const bool any_media = [&] {
+    for (const char m : is_media_token) {
+      if (m != 0) return true;
+    }
+    return false;
+  }();
+  VT_CHECK(!any_media || !(be.device || GlueDev(be)),
+           "deepseek-v4 MoE: this step carries image rows, which route on the "
+           "vision bias `exp_probs_b_vl`, and the device router takes one bias "
+           "for the whole call with no per-row selector. Refused by name rather "
+           "than routed on the text bias. The device arm is owed by issue #2411 "
+           "(row MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, W7-CUDA)");
   if (be.device)
     return deepseek_v4::MoeDevice()->route(*be.q, gating, T, E, topk, bias, renorm, scale,
                                            in_tokens, hashtab, vocab);
@@ -430,7 +450,8 @@ deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<flo
     SyncDeviceGemm(be);
     return out;
   }
-  return SqrtSoftplusRouteTopk(gating, T, E, topk, bias, renorm, scale, in_tokens, hashtab, vocab);
+  return SqrtSoftplusRouteTopk(gating, T, E, topk, bias, renorm, scale, in_tokens,
+                               hashtab, vocab, vision_bias, is_media_token);
 }
 std::vector<float> DispClampedSwiGLU(const V4Backend& be, const std::vector<float>& gate_up,
                                      int64_t d, float limit, float alpha, float beta) {
@@ -1750,6 +1771,47 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   } else {
     bias = L.gate_bias;  // may be empty (then plain top-k on the unbiased scores)
   }
+  // MODEL-MM-deepseek-v4 W4 (#2411): WHICH ROWS ARE IMAGE ROWS.
+  //
+  // The processor writes `vocab_size + DeepSeekV4ImageTokenType` at every
+  // position of an image block, so the step's own identifiers say it and no new
+  // forward channel is needed. On a text step every identifier is below the
+  // vocabulary -- the embedding lookup refuses otherwise -- so the mask is
+  // empty and this layer is byte-identical.
+  std::vector<char> is_media_token;
+  std::vector<float> vision_bias;
+  int64_t media_rows = 0;
+  for (int64_t t = 0; t < T; ++t) {
+    if (token_ids[static_cast<size_t>(t)] >= p.vocab_size) ++media_rows;
+  }
+  if (media_rows > 0) {
+    // A text checkpoint carries no `exp_probs_b_vl`, and routing an image row on
+    // the TEXT bias would be fluent and wrong. Refuse by name; the same
+    // predicate that selects the bias is the one that refuses its absence.
+    VT_CHECK(!L.gate_bias_vl.empty(),
+             "deepseek-v4 MoE: layer " + std::to_string(layer) +
+                 " was handed " + std::to_string(media_rows) +
+                 " image row(s) and carries no `exp_probs_b_vl` "
+                 "(`layers.N.ffn.gate.bias_vl`). That tensor is present on every "
+                 "layer of a Flash-Vision checkpoint and on none of a text one, "
+                 "so this is a text checkpoint being asked to route an image");
+    VT_CHECK(static_cast<int64_t>(L.gate_bias_vl.size()) == ne,
+             "deepseek-v4 MoE: `exp_probs_b_vl` on layer " +
+                 std::to_string(layer) + " is " +
+                 std::to_string(L.gate_bias_vl.size()) + " wide and the router "
+                 "indexes it by expert, of which there are " +
+                 std::to_string(ne));
+    is_media_token.assign(static_cast<size_t>(T), 0);
+    for (int64_t t = 0; t < T; ++t) {
+      is_media_token[static_cast<size_t>(t)] =
+          token_ids[static_cast<size_t>(t)] >= p.vocab_size ? 1 : 0;
+    }
+    vision_bias = L.gate_bias_vl;
+    // A hash layer keeps its table on a media step, because the ROW decides and
+    // the layer no longer does: a text row in the same step still hashes. It is
+    // already set above whenever `hash_route` holds, which is the only state in
+    // which the router would read it, so nothing is added here.
+  }
   if (std::getenv("VT_DUMP_ACT") != nullptr && layer == 34) {  // #188 router logits/bias
     DumpAct("ours_gating_L34", std::vector<float>(gating.begin(), gating.begin() + ne));
     DumpAct("ours_gatebias_L34", bias.empty() ? std::vector<float>(ne, 0.0f) : bias);
@@ -1758,7 +1820,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   }
   const MoeRouteResult route =
       DispRoute(be, gating, T, ne, topk, bias, p.norm_topk_prob,
-                static_cast<float>(p.routed_scaling_factor), in_tokens, hashtab, p.vocab_size);
+                static_cast<float>(p.routed_scaling_factor), in_tokens, hashtab,
+                p.vocab_size, vision_bias, is_media_token);
   if (trace != nullptr) {
     trace->layer_is_hash[static_cast<size_t>(layer)] = cfg_hash ? 1 : 0;
     trace->layer_hash_routed[static_cast<size_t>(layer)] = hash_route ? 1 : 0;
@@ -2470,6 +2533,21 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
   float* res_nxt = resB.data();
 
   // embed (host; the token hidden is the only host-written input, before any device op).
+  // MODEL-MM-deepseek-v4 W4 (#2411): this arm cannot serve an IMAGE row, and it
+  // must say so rather than read past the embedding table.
+  //
+  // The expanded prompt spells an image position `vocab_size + type`, and this
+  // decode path indexes `embed` with the identifier and no bound. It is also
+  // the arm whose device router takes ONE bias for the whole call, so an image
+  // row would route on the TEXT bias. Neither is reachable in practice --
+  // decode receives vocabulary identifiers only, because the image span is
+  // consumed whole during prefill -- and "not reachable" is why it needs a
+  // message rather than an out-of-bounds read.
+  VT_CHECK(tok >= 0 && tok < p.vocab_size,
+           "deepseek-v4 resident decode: token id " + std::to_string(tok) +
+               " is outside the vocabulary of " + std::to_string(p.vocab_size) +
+               ". An image sentinel reaches this arm only through a step the "
+               "prefill should have consumed whole (issue #2411)");
   for (int64_t h = 0; h < H; ++h) x[static_cast<size_t>(h)] = hw.embed[tok * H + h];
 
   // MHC-pre on a (hc*H) residual → writes layer_input(x), post_mix, res_mix; reads `residual`.
@@ -2826,6 +2904,15 @@ struct V4Graph {
   // token's deck to the fixed-cap cache (on-stream, between replays), read logits.
   std::vector<float> Step(const V4Backend& be, int32_t token, int32_t pos) {
     VT_CHECK(kv_base + 1 <= max_cap, "deepseek-v4 decode graph: KV capacity exceeded");
+    // MODEL-MM-deepseek-v4 W4 (#2411): the same guard as the eager resident arm.
+    // A captured graph indexes `embed` with the identifier and no bound, and its
+    // device router takes one bias for the whole call.
+    VT_CHECK(token >= 0 && token < p->vocab_size,
+             "deepseek-v4 decode graph: token id " + std::to_string(token) +
+                 " is outside the vocabulary of " +
+                 std::to_string(p->vocab_size) +
+                 ". An image sentinel reaches this arm only through a step the "
+                 "prefill should have consumed whole (issue #2411)");
     for (int64_t h = 0; h < H; ++h) x[static_cast<size_t>(h)] = hw->embed[token * H + h];  // embed
     std::fill(pos_buf.begin(), pos_buf.end(), pos);
     in_tokens[0] = token;

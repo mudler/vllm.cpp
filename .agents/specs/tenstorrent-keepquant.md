@@ -127,6 +127,50 @@ the rows>=32 boundary).
 | — (local; the predicate is the GLM-5.3 W10 lesson made structural) | OWED W2: the `kTENSTORRENT` arm of `DeviceKeepQuantSupported` (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:136-148`) | Admits exactly the encodings whose device kernels are registered; never wider, because the `default:` arm's CPU fallback does not exist on a discrete P150. |
 | — (local; the #2812/#2907 capture discipline applied to a new weight path) | OWED W3: capture-safe residency of the decode path | No mid-capture host download; CHECK-before-download ordering; capture dump ×2 byte-identity as the gate. |
 
+## The vehicle falsified the W3/W4 split (found 2026-09-06)
+
+The Q4_K_M artifact is mixed-quant, not uniform Q4_K. The tensor histogram
+of the fetched vehicle (unsloth/Qwen3.5-0.8B-GGUF at `6ab46149`, sha256
+`bd258782...`): `token_embd.weight` **Q6_K** (the tied LM head reads the
+same tensor), `attn_qkv` and `ssm_out` **Q5_K** (18 each), `ssm_alpha` and
+`ssm_beta` **Q8_0** (18 each), `ffn_down` Q6_K x12 / Q4_K x12, `attn_v`
+Q6_K x4 / Q4_K x2, everything else Q4_K or F32. A first forward on TT under
+the W2 predicate refuses by name — correctly. Consequence: the e2e vehicle
+battery needs the Q5_K/Q6_K/Q8_0 decodes first. The decode set moves from
+W4 into W3; W4 keeps the int8-dot lever and the 27B arm. The predicate
+widens `{Q4_K}` to exactly the registered four in the same change as the
+kernels — never before.
+
+The Q6_K token embedding is a design point, not a footnote: kEmbedding on
+TT must reach a Q6_K weight either by a device gather that decodes rows
+on-core, or by staging the decoded table (248320 x 1024 bf16, ~0.5 GiB —
+bounded here, unlike the 27B expansion the design thesis forbids). Decide
+at implementation against the CPU arm's behavior.
+
+## W3 capture-safe staging (design, from the W2 survey)
+
+`DecodeQ4KBlocksF32` today EnsureHosts the packed tensor, repacks to i32
+words on host, and `from_vector`-uploads per call — a per-call host round
+trip that inside a capture is the #2812 class. The fix keeps the residency
+thesis (packed stays the resident master; a decoded-bf16 cache would triple
+the 0.8B and blow the 27B budget): stage the **i32 word form once per
+weight** through the existing persistent-shadow machinery
+(`EnsureMatmulWeightDevice`'s keyed-slot pattern, built for the view-staging
+fatality — 36 i32 words are exactly 144 packed bytes, zero expansion), and
+run the on-core decode chain from the resident words every call. Captured
+replay recomputes deterministically from fixed device bytes; a cache miss
+during capture CHECKs ("warm the keep-quant arm eagerly first"), the
+zero-cache precedent. Red-first leg: with W2 code the captured vehicle run
+traces staging writes during capture and must fail the dump x2 byte-identity
+leg; after, zero writes during capture and dumps byte-identical across two
+reset runs.
+
+The gap golden for the q4km arm teacher-forces `transformers` on the
+DEQUANTIZED artifact — `from_pretrained(gguf_file=...)` if the pinned
+transformers 5.14.1 parses qwen35 GGUF, otherwise our own bit-exact decoder
+(W1-proven) writing a safetensors dir first. Never teacher-force against
+the bf16 safetensors checkpoint: those logits are a different model's.
+
 ## Tests to port
 
 vLLM has no TT backend and no keep-quant test to port; the oracle chain is the
@@ -155,10 +199,14 @@ a scratch copy), capture dump ×2 byte-identity with reset between, and the
 - **W2**: the dot provider + `kTENSTORRENT` predicate arm + registration;
   predicate mutation red (admit one encoding too many → first-forward throw
   reproduced in a scratch copy).
-- **W3**: capture leg (dump ×2 byte-identity with reset between) + the e2e
-  vehicle battery on the P150 vs the bf16 pair.
-- **W4** (owed): Q5_K / Q6_K / Q8_0; the int8-dot perf lever; the 27B Q4_K_M
-  arm as the first qwen3.8 artifact on TT.
+- **W3**: Q5_K / Q6_K / Q8_0 decodes (bit-exact vs `BlockToFloat` sweeps,
+  the W1 template generalizes); the predicate widening to exactly the
+  registered four in the same change; capture-safe resident-word staging;
+  the capture leg (dump ×2 byte-identity with reset between); the e2e
+  vehicle battery on the P150 vs its own captured pair under the committed
+  near-tie conventions.
+- **W4** (owed): the int8-dot perf lever; the 27B Q4_K_M arm as the first
+  qwen3.8 artifact on TT.
 
 ## Risks
 
@@ -210,5 +258,7 @@ reds any widening past the registered set. Both red-first: the registration
 REQUIRE and the six wrongly-admitted encodings reded before the
 implementation. Next: W3, the capture leg (dump ×2 byte-identity, capture-
 safe staging for the per-call decode upload) + the e2e vehicle battery on
-the P150 (vehicle fetched and hashed). W4 owed: Q5_K/Q6_K/Q8_0, the int8
-lever, the 27B arm.
+the P150 (vehicle fetched and hashed). AMENDED 2026-09-06: the vehicle is
+mixed-quant, so W3 now carries the Q5_K/Q6_K/Q8_0 decodes and the predicate
+widening before the capture leg and the e2e battery (see the falsification
+section). W4 owed: the int8 lever, the 27B arm.

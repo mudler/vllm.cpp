@@ -872,6 +872,56 @@ void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
 DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
 
+// ── MODEL-MM-deepseek-v4 W4 (#2411): IMAGE-SPAN ATTENTION VISIBILITY ────────
+//
+// `deepseek4.attention.sliding_window` is 128 and one image block is up to 384
+// tokens, so a window applied inside an image span hides more than half of it.
+// The pinned reference lets the tokens of one span attend across the WHOLE span
+// and window-clips only what lies below the span's start.
+//
+// Two upstream statements of the same rule. llama.cpp calls it
+// `swa_full_non_causal` (`llama-hparams.h`, and the `set_input_kq_mask_impl`
+// hunk in `llama-kv-cache.cpp` at `llama-cpp-dsv4vision`): a non-causally
+// decoded batch skips the window mask at and above the span start and applies
+// it normally below. The model author writes the same thing as an index list,
+// `get_window_topk_idxs_visible` (`inference/model.py:289-299`).
+//
+// A TOKEN GATE CANNOT SEE THIS, which is why the two functions below are pure
+// and gated on their INDICES. A 128-token window against a 384-token span is
+// exactly the case where the argmax stays plausible while two thirds of the
+// span is invisible.
+struct DeepseekV4ImageSpan {
+  int64_t begin = 0;  // first GLOBAL position of the span, inclusive
+  int64_t end = 0;    // one past its last GLOBAL position
+};
+
+// The image spans a step carries, read from the step's OWN identifiers.
+//
+// `PrepareDeepSeekV4Inputs` writes `vocab_size + DeepSeekV4ImageTokenType` at
+// every position of an image block, and the block opens with `kImageStart` (0)
+// and closes with `kImageEnd` (4). `base` is the global position of row 0.
+//
+// A block whose start is never closed is REFUSED rather than truncated: the
+// spec requires an image span to fall inside one prefill chunk, and a span cut
+// by a chunk boundary would otherwise be silently half-visible.
+std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
+    const std::vector<int32_t>& token_ids, int64_t vocab_size, int64_t base = 0);
+
+// The KV rows global position `query` may attend, appended to `out` in
+// ascending order.
+//
+//   * the causal prefix `[lo, query]`, where `lo` is `query - (window - 1)`
+//     when a window applies and 0 when it does not;
+//   * PLUS the whole span containing `query`, when it is inside one -- which is
+//     the only part that is not causal, and the only part a token gate cannot
+//     see.
+//
+// A query OUTSIDE every span takes the ordinary window, including a query after
+// one: llama.cpp exempts the media ubatch, and a later text token is not in it.
+void DeepseekV4VisibleRows(int64_t query, int64_t num_keys, int64_t sliding_window,
+                           const std::vector<DeepseekV4ImageSpan>& spans,
+                           std::vector<int64_t>* out);
+
 // The DeepSeek-V4 forward. STUB (W3-W8): composes the 512-wide MLA block + DSA
 // indexer/compressor + MHC hyper-connections + sqrtsoftplus/hash MoE, none of
 // which are ported yet — both entrypoints VT_CHECK(false, ...) so a forward

@@ -144,7 +144,12 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
                                // files that differ ONLY in this number are what
                                // a gate needs to ask whether the forward READS
                                // the vision bias, and on which rows.
-                               float vision_bias_scale = 1.0f) {
+                               float vision_bias_scale = 1.0f,
+                               // `deepseek4.attention.sliding_window`. 0 is the
+                               // absent key, which is what every suite before W4
+                               // built and what keeps them byte-identical; the
+                               // released artifact declares 128.
+                               int64_t sliding_window = 0) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -165,6 +170,10 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
   b.AddKv(U32Kv(p + "expert_shared_count", 1));
   b.AddKv(U32Kv(p + "expert_feed_forward_length", kInter));
   b.AddKv(U32Kv(p + "hash_layer_count", kHashLayers));
+  if (sliding_window > 0) {
+    b.AddKv(U32Kv(p + "attention.sliding_window",
+                  static_cast<uint32_t>(sliding_window)));
+  }
   b.AddKv(F32Kv(p + "swiglu_clamp", 10.0f));
   b.AddKv(U32Kv(p + "hyper_connection.count", kHc));
   b.AddKv(U32Kv(p + "hyper_connection.sinkhorn_iterations", kSinkhorn));

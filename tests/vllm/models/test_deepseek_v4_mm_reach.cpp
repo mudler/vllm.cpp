@@ -740,3 +740,190 @@ TEST_CASE("REACH: the vision bias moves the image rows and leaves the text rows 
   // The row whose prefix contains the span moves: the bias was read.
   CHECK(tail_moved > 0);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// (10) THE IMAGE SPAN IS NON-CAUSAL, at the forward.
+//
+// The index rule is gated on its indices in `test_deepseek_v4_dsa`. This case
+// asks the other question: does `ForwardComposeImpl` READ it? An EARLY row of
+// the span is asked for logits while a LATE row of the same span is perturbed.
+// Causally the early row cannot see the late one, so under the dense causal
+// list this branch built before W4 the logits do not move. Under the span rule
+// they must.
+TEST_CASE("REACH: a row early in the image span attends a row after it") {
+  auto loaded = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                    /*with_mmproj=*/true);
+  const DeepSeekV4VisionConfig vcfg =
+      vllm::DeepSeekV4ClipMmprojVisionConfig(*loaded->proj_gguf);
+  const auto image = MakeImage(vcfg);
+  const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
+      {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
+      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
+      *loaded->model, loaded->config, queue, mm.mm_features[0]);
+  const int64_t tokens = static_cast<int64_t>(mm.prompt_token_ids.size());
+  const int64_t span_begin = mm.mm_features[0].offset;
+  const int64_t span_len = mm.mm_features[0].length;
+  REQUIRE(span_len >= 4);
+  std::vector<char> is_mm(static_cast<size_t>(tokens), 0);
+  for (int i = 0; i < span_len; ++i) {
+    is_mm[static_cast<size_t>(span_begin + i)] = 1;
+  }
+  const std::vector<vt::Tensor> slices{enc.embeds};
+  vllm::MmEmbedInputs embed_in;
+  embed_in.token_ids = &mm.prompt_token_ids;
+  embed_in.mm_embeds = &slices;
+  embed_in.is_mm_embed = &is_mm;
+  vllm::MmForwardBuffers buffers =
+      vllm::ModelRegistry::EmbedMm(*loaded->model, loaded->config, queue, embed_in);
+
+  std::vector<int32_t> positions(static_cast<size_t>(tokens));
+  for (int64_t t = 0; t < tokens; ++t) {
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+  // The EARLY row of the span, one past its start marker.
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(span_begin + 1)};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+  const auto forward = [&]() {
+    vllm::ModelForwardInput in{.token_ids = mm.prompt_token_ids,
+                               .positions = positions,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = loaded->config,
+                               .queue = queue,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    in.mm = buffers.mm;
+    return vllm::ModelRegistry::Forward(*loaded->model, in).host;
+  };
+
+  const std::vector<float> before = forward();
+  REQUIRE(before.size() == static_cast<size_t>(kVocab));
+
+  // Perturb a LATE row of the SAME span. It is after the queried row, so only
+  // the non-causal half of the rule can carry it.
+  const int64_t late = span_begin + span_len - 2;
+  REQUIRE(late > span_begin + 1);
+  std::vector<uint16_t> saved(static_cast<size_t>(tokens * kH));
+  const size_t bytes = saved.size() * sizeof(uint16_t);
+  backend.Copy(queue, saved.data(), buffers.mm.inputs_embeds.data, bytes);
+  backend.Synchronize(queue);
+  std::vector<uint16_t> nudged = saved;
+  for (int64_t c = 0; c < kH; ++c) {
+    const size_t at = static_cast<size_t>(late * kH + c);
+    nudged[at] = vt::F32ToBF16(vt::BF16ToF32(saved[at]) + 2.0F);
+  }
+  backend.Copy(queue, buffers.mm.inputs_embeds.data, nudged.data(), bytes);
+  backend.Synchronize(queue);
+  const std::vector<float> after = forward();
+  int64_t moved = 0;
+  for (size_t i = 0; i < after.size(); ++i) {
+    if (after[i] != before[i]) ++moved;
+  }
+  CHECK(moved > 0);
+
+  // THE CONTROL. Perturbing a row OUTSIDE the span and after the queried row
+  // must NOT move it: the exemption is the span's, not a blanket
+  // non-causality. Without this the case above is also satisfied by an
+  // implementation that made the whole step bidirectional.
+  backend.Copy(queue, buffers.mm.inputs_embeds.data, saved.data(), bytes);
+  backend.Synchronize(queue);
+  std::vector<uint16_t> outside = saved;
+  const int64_t after_span = tokens - 1;
+  REQUIRE(after_span >= span_begin + span_len);
+  for (int64_t c = 0; c < kH; ++c) {
+    const size_t at = static_cast<size_t>(after_span * kH + c);
+    outside[at] = vt::F32ToBF16(vt::BF16ToF32(saved[at]) + 2.0F);
+  }
+  backend.Copy(queue, buffers.mm.inputs_embeds.data, outside.data(), bytes);
+  backend.Synchronize(queue);
+  const std::vector<float> control = forward();
+  int64_t control_moved = 0;
+  for (size_t i = 0; i < control.size(); ++i) {
+    if (control[i] != before[i]) ++control_moved;
+  }
+  CHECK(control_moved == 0);
+
+  backend.Copy(queue, buffers.mm.inputs_embeds.data, saved.data(), bytes);
+  backend.Synchronize(queue);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// (11) THE WINDOW ITSELF, at the forward.
+//
+// The image-span rule is an exemption FROM the sliding window, so the window
+// has to be reachable for the exemption to mean anything. `deepseek4.attention
+// .sliding_window` is 128 on the released artifact, and this branch of the
+// forward attended the FULL prefix regardless until W4 -- which #2323 already
+// recorded as a divergence for the paged arm: "attending the full prefix there
+// diverges above the window".
+//
+// Two models differing in NOTHING but that key answer the same prompt. Under a
+// window of 4 a token ten rows back is invisible, so changing it cannot move
+// the last row's logits; with the key absent it must.
+TEST_CASE("REACH: the sliding window reaches the registered forward") {
+  const auto run = [&](int64_t window, int32_t first_token) {
+    TempFile lang(BuildDeepseek4Gguf(
+        /*vision=*/false, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
+        /*head_dim=*/512, /*with_tokenizer=*/false, /*vision_bias_scale=*/1.0F,
+        window));
+    const vllm::GgufFile gguf = vllm::GgufFile::Open(lang.path());
+    const vllm::HfConfig config = vllm::DeepseekV4HfConfigFromGguf(gguf);
+    std::unique_ptr<vllm::LoadedModel> model = vllm::ModelRegistry::Load(
+        config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kCPU));
+    vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+    vt::Queue queue = backend.CreateQueue();
+    std::vector<int32_t> ids(12);
+    std::vector<int32_t> positions(12);
+    for (int32_t t = 0; t < 12; ++t) {
+      ids[static_cast<size_t>(t)] = 1 + (t % 5);
+      positions[static_cast<size_t>(t)] = t;
+    }
+    ids[0] = first_token;
+    const std::vector<int32_t> logits_indices{11};
+    std::vector<vllm::PagedKvCache> attn_kv;
+    std::vector<vllm::GdnStateCache> gdn_state;
+    const vllm::v1::GDNAttentionMetadata gdn_meta{};
+    vllm::v1::CommonAttentionMetadata attn_meta{};
+    attn_meta.num_reqs = 1;
+    attn_meta.num_computed_tokens_cpu = {0};
+    vllm::ModelForwardInput in{.token_ids = ids,
+                               .positions = positions,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = config,
+                               .queue = queue,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    return vllm::ModelRegistry::Forward(*model, in).host;
+  };
+
+  const auto moved = [](const std::vector<float>& a, const std::vector<float>& b) {
+    int64_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i]) ++n;
+    }
+    return n;
+  };
+
+  // With NO window the row eleven positions back is part of the prefix.
+  CHECK(moved(run(/*window=*/0, /*first_token=*/1),
+              run(/*window=*/0, /*first_token=*/6)) > 0);
+  // With a window of four it is not, and the same edit cannot be seen.
+  CHECK(moved(run(/*window=*/4, /*first_token=*/1),
+              run(/*window=*/4, /*first_token=*/6)) == 0);
+}

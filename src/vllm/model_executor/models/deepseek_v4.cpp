@@ -38,6 +38,7 @@
 // quant_block == nope_head_dim (one block) at tiny width. Each reuses the SAME
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/multimodal/deepseek_v4_processor.h"  // DeepSeekV4ImageTokenType
 #include "vllm/model_executor/models/deepseek_v4_dspark.h"
 #include "vllm/model_executor/models/deepseek_v4_rope.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
@@ -137,6 +138,11 @@ struct V4Backend {
   // NULL on every text step, which is every step of every other model, so those
   // are byte-identical.
   const std::vector<float>* inputs_embeds = nullptr;
+  // MODEL-MM-deepseek-v4 W4 (#2411): the image spans this step carries, in
+  // GLOBAL positions, derived once per forward from the step's identifiers.
+  // Null or empty on every text step, which is what keeps the visible-row rule
+  // byte-identical there.
+  const std::vector<DeepseekV4ImageSpan>* image_spans = nullptr;
   // Incremental-decode KV cache (Stage 1). Null = stateless full-recompute (the
   // default / --gpu path). When set, AttentionBlock appends each token's per-layer
   // `deck` latent to cache.deck[layer] and attends over the full cached KV; the
@@ -1145,9 +1151,20 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           T > 0 ? static_cast<int>(sel[static_cast<size_t>(T - 1)].size()) : 0;
     }
   } else {
+    // MODEL-MM-deepseek-v4 W4 (#2411): the visible-row rule, in ONE place.
+    //
+    // The window value is the one the paged arm derives -- a layer WITH a
+    // compressor attends the full prefix here, because its window-plus-
+    // compressed-history composition belongs to MODEL-DSV4-DSA-COMPOSE (#2286)
+    // and refuses above. With no image span and no window this is the dense
+    // causal list this branch always built.
+    static const std::vector<DeepseekV4ImageSpan> kNoSpans;
+    const std::vector<DeepseekV4ImageSpan>& spans =
+        be.image_spans != nullptr ? *be.image_spans : kNoSpans;
+    const int64_t window = p.has_compressor(layer) ? 0 : p.sliding_window;
     for (int64_t t = 0; t < T; ++t) {
-      const int64_t g = kv_base + t;  // this query's GLOBAL position
-      for (int64_t s = 0; s <= g; ++s) sel[static_cast<size_t>(t)].push_back(s);
+      DeepseekV4VisibleRows(kv_base + t, kv_base + T, window, spans,
+                            &sel[static_cast<size_t>(t)]);
     }
   }
 
@@ -2994,7 +3011,13 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& positions,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
-                                             const V4Backend& be,
+                                             // MODEL-MM-deepseek-v4 W4 (#2411):
+                                             // BY VALUE, so this function can
+                                             // bind the image spans it derives
+                                             // without every caller having to
+                                             // derive them first. The struct is
+                                             // a handful of pointers.
+                                             V4Backend be,
                                              std::vector<float>* mtp_residual_out = nullptr,
                                              dspark::TapRequest* taps = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -3047,6 +3070,17 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     }
   }
   DumpAct("ours_embed", Slice(x, 0, H));  // t=0 embed plain [H] (coherence-debug #188)
+
+  // MODEL-MM-deepseek-v4 W4 (#2411): the image spans, derived ONCE from the
+  // step's own identifiers and read by every layer's visible-row rule. Empty on
+  // a text step, so the rule reduces to the dense causal list it always built.
+  //
+  // `be` is taken by const reference, so the spans live here and the pointer is
+  // rebound on a copy -- which is also what keeps a caller that supplied its own
+  // spans from being overwritten.
+  const std::vector<DeepseekV4ImageSpan> image_spans =
+      DeepseekV4ImageSpans(token_ids, V, /*base=*/be.kv_base);
+  if (be.image_spans == nullptr) be.image_spans = &image_spans;
 
   // MHC residual manifold [T,hc,H] + the per-token post/comb mixes.
   std::vector<float> residual(static_cast<size_t>(T) * hc * H, 0.0f);
@@ -4027,6 +4061,83 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
   be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
+std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
+    const std::vector<int32_t>& token_ids, int64_t vocab_size, int64_t base) {
+  std::vector<DeepseekV4ImageSpan> spans;
+  const int64_t start_id =
+      vocab_size + static_cast<int64_t>(multimodal::kImageStart);
+  const int64_t end_id = vocab_size + static_cast<int64_t>(multimodal::kImageEnd);
+  int64_t open_at = -1;
+  for (int64_t t = 0; t < static_cast<int64_t>(token_ids.size()); ++t) {
+    const int64_t id = token_ids[static_cast<size_t>(t)];
+    if (id == start_id) {
+      VT_CHECK(open_at < 0,
+               "deepseek-v4 image span: a second image-start identifier at row " +
+                   std::to_string(t) + " while the span opened at row " +
+                   std::to_string(open_at) + " is still open");
+      open_at = t;
+      continue;
+    }
+    if (id == end_id) {
+      VT_CHECK(open_at >= 0,
+               "deepseek-v4 image span: an image-end identifier at row " +
+                   std::to_string(t) + " with no open span");
+      spans.push_back({base + open_at, base + t + 1});
+      open_at = -1;
+    }
+  }
+  // The spec requires an image span to fall inside ONE prefill chunk. A span cut
+  // by a chunk boundary would be half-visible and would answer fluently, so it
+  // is refused rather than truncated.
+  VT_CHECK(open_at < 0,
+           "deepseek-v4 image span: the span opened at row " +
+               std::to_string(open_at) +
+               " is not closed inside this step. An image block must be "
+               "scheduled whole (.agents/specs/deepseek-v4-flash-vision.md, "
+               "issue #2411)");
+  return spans;
+}
+
+void DeepseekV4VisibleRows(int64_t query, int64_t num_keys, int64_t sliding_window,
+                           const std::vector<DeepseekV4ImageSpan>& spans,
+                           std::vector<int64_t>* out) {
+  VT_CHECK(out != nullptr, "DeepseekV4VisibleRows: `out` must not be null");
+  const int64_t last = query < num_keys - 1 ? query : num_keys - 1;
+  if (last < 0) return;
+  // The causal window. `sliding_window` is an INCLUSIVE count of positions, so
+  // the oldest visible row is `query - (window - 1)`; 0 keeps the full prefix.
+  int64_t lo = 0;
+  if (sliding_window > 0) {
+    lo = query - (sliding_window - 1);
+    if (lo < 0) lo = 0;
+  }
+  // The span containing this query, if any. Inside it the rule is NON-CAUSAL:
+  // every position of the span sees every other one. Below the span's start the
+  // window still applies, which is what `swa_full_non_causal` means by
+  // "applied normally below it".
+  int64_t span_begin = -1, span_end = -1;
+  for (const DeepseekV4ImageSpan& s : spans) {
+    if (query >= s.begin && query < s.end) {
+      span_begin = s.begin;
+      span_end = s.end < num_keys ? s.end : num_keys;
+      break;
+    }
+  }
+  if (span_begin < 0) {
+    for (int64_t r = lo; r <= last; ++r) out->push_back(r);
+    return;
+  }
+  // Emit ascending and without duplicates: the span may start below `lo`, may
+  // start above it, and always reaches past `query`.
+  const int64_t first = lo < span_begin ? lo : span_begin;
+  const int64_t stop = last > span_end - 1 ? last : span_end - 1;
+  for (int64_t r = first; r <= stop; ++r) {
+    const bool in_span = r >= span_begin && r < span_end;
+    const bool in_window = r >= lo && r <= last;
+    if (in_span || in_window) out->push_back(r);
+  }
 }
 
 std::vector<float> DeepseekV4Model::Forward(

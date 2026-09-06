@@ -717,12 +717,10 @@ above as its red-before input.
   in the two that materialize a tower, the GGUF arm and the EXL3 carried arm.
   The official dense safetensors arm accounts without materializing, exactly as
   it does for every other tensor, so its W2b residual covers this one too.
-  Nothing selects the bias. Three behaviours stay owed by issue #2411 and W4,
-  and row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring:
-  selection between the two biases in `deepseek_v4_moe.cpp`; the hash-layer
-  replacement at forward time; and the non-causal image-span sliding-window
-  change. The loaded bias is a staged slice until W4 lands, in the sense of
-  `AGENTS.md` "Nothing lands dead".
+  **ALL THREE ARE CLOSED BY W4.** `SqrtSoftplusRouteTopk` selects between the
+  two biases per token, an image row on a hash layer takes the vision bias in
+  place of `tid2eid`, and `DeepseekV4VisibleRows` carries the non-causal
+  image-span rule. The remaining device-arm gaps are listed below.
 
   **WHAT THE ORACLE DOES, and where our intent differs from it.** An earlier
   wording of this entry described the first two as "per-token selection" and as
@@ -859,6 +857,54 @@ above as its red-before input.
   the gate does not cover. Widening the fixture is owed by issue #2411 and W3;
   it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
   test uses, so it is not made inside a W3A repair.
+
+### W4 evidence — stage 3, image-span attention visibility
+
+`deepseek4.attention.sliding_window` is 128 and one image block reaches 384
+tokens, so a window applied inside a span hides more than half of it. The rule
+is stated twice upstream and W4 ports both statements as ONE index rule:
+llama.cpp's `swa_full_non_causal` skips the window mask at and above the span
+start and applies it normally below, and the model author writes the same thing
+as an index list in `get_window_topk_idxs_visible` (`inference/model.py:289-299`).
+
+`DeepseekV4ImageSpans` reads the spans from the step's OWN identifiers -- the
+processor writes `vocab_size + kImageStart` and `... + kImageEnd` -- so no new
+forward channel is needed and a text step derives none. A span not closed inside
+the step is REFUSED rather than truncated, because a half-visible span answers
+fluently.
+
+`DeepseekV4VisibleRows` is the whole rule and it is gated on its INDICES, at the
+released numbers: a 384-token span, a 128-token window, 2000 keys. A causal-only
+implementation gives a query ten rows into the span ELEVEN visible span rows
+instead of 384, and the case states that number so the assertion is a
+measurement rather than a restatement. Three more index cases hold the other
+edges: the window still clips below the span start, the exemption does NOT leak
+to a query after the span, and with no span and no window the list is the dense
+causal one this branch always built.
+
+THE FORWARD READS IT, and two cases say so through `ModelRegistry::Forward`. A
+row EARLY in the span is asked for logits while a LATE row of the same span is
+perturbed -- causally invisible, so only the span rule can carry it -- with a
+CONTROL that perturbs a row outside the span and must not move it. And two
+models differing in nothing but `attention.sliding_window` answer the same
+prompt: with a window of four a token eleven rows back cannot be seen, and with
+the key absent it can.
+
+THIS BRANCH IGNORED THE WINDOW BEFORE W4, and that is a correctness change
+rather than a side effect. `#2323` already recorded the same divergence for the
+paged arm -- "attending the full prefix there diverges above the window" -- and
+the host arm now derives the same value the paged arm does, including the
+full-prefix exception for a layer with a compressor. No existing gate
+distinguished the two, which is why the new case exists.
+
+Four mutations, each restored byte-for-byte and verified with `sha256sum -c`:
+
+| Mutation | Result |
+|---|---|
+| the span rule is never applied (dense causal only) | RED, 2 index cases / 5 assertions, and the forward case |
+| the window term is dropped | RED, 2 index cases / 7 assertions |
+| the forward never derives the spans | RED, the forward case; the index suite stays green, correctly, because it is a pure-function suite |
+| the forward passes window 0, which is the pre-W4 behaviour | RED, the window case, 16 logits |
 
 ### W4 evidence — stage 1, reachability
 

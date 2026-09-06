@@ -659,7 +659,8 @@ std::vector<float> DeepseekV4ForwardHost(
     const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
-    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
+    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr,
+    const std::vector<float>* inputs_embeds = nullptr);
 
 // W2C — the GGUF keep-quant forward. Runs the SAME composition as
 // DeepseekV4ForwardHost but the big 512-wide MLA linears + the 256 routed/shared
@@ -675,7 +676,8 @@ std::vector<float> DeepseekV4ForwardGguf(
     const DeepseekV4Weights& weights, vt::Queue& queue,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
-    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
+    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr,
+    const std::vector<float>* inputs_embeds = nullptr);
 
 // The MLA compressed-latent KV cache for INCREMENTAL decode (ForwardDevice
 // campaign, Stage 1). For the real dense-MLA run (num_key_value_heads=1, no
@@ -789,7 +791,14 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               // enable the `compress_ratio == 128`
                                               // arm. Null keeps the refusal.
                                               DeepseekV4CompressorState* compressor =
-                                                  nullptr);
+                                                  nullptr,
+                                              // MODEL-MM-deepseek-v4 W4 (#2411):
+                                              // the already-merged [T, H] f32
+                                              // token stream, replacing the
+                                              // embedding lookup. Null on a text
+                                              // step.
+                                              const std::vector<float>*
+                                                  inputs_embeds = nullptr);
 
 // MODEL-DSV4-DSA-COMPOSE W1 (#2286): the paged NON-GGUF forward. The GGUF paged
 // arm binds `gguf`, which forces `dsa_dense` and makes `is_comp` false on every
@@ -801,7 +810,8 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
-    DeepseekV4CompressorState* compressor = nullptr);
+    DeepseekV4CompressorState* compressor = nullptr,
+    const std::vector<float>* inputs_embeds = nullptr);
 
 // MODEL-DSV4-PAGED-ENTRY (#2447): the same composition, returning the runner's
 // `ForwardLogits` instead of a flat host vector.
@@ -818,7 +828,14 @@ ForwardLogits DeepseekV4ForwardExl3PagedLogits(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor);
+    DeepseekV4CompressorState* compressor,
+    // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
+    // row-major f32 token stream, or null on a text step. When present it
+    // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already
+    // embedded the ordinary identifiers and scattered the vision rows over the
+    // image span, and the expanded prompt's sentinel identifiers are out of
+    // vocabulary so no lookup could serve them.
+    const std::vector<float>* inputs_embeds = nullptr);
 
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,
@@ -865,13 +882,27 @@ class DeepseekV4Model {
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+    // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
+    // row-major f32 token stream, or null on a text step. When present it
+    // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already
+    // embedded the ordinary identifiers and scattered the vision rows over the
+    // image span, and the expanded prompt's sentinel identifiers are out of
+    // vocabulary so no lookup could serve them.
+      const std::vector<float>* inputs_embeds = nullptr);
 
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+    // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
+    // row-major f32 token stream, or null on a text step. When present it
+    // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already
+    // embedded the ordinary identifiers and scattered the vision rows over the
+    // image span, and the expanded prompt's sentinel identifiers are out of
+    // vocabulary so no lookup could serve them.
+      const std::vector<float>* inputs_embeds = nullptr);
 };
 
 // ─── MTP (Multi-Token Prediction) self-speculative draft head ────────────────

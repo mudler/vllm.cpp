@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_mm.h"
 #include "vllm/model_executor/models/host_token_ids.h"  // ResolveHostTokenIds
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
@@ -52,45 +53,24 @@ inline constexpr ModelInfo kDeepseekV4Info{
     .is_pooling_model = false,
     .is_hybrid = false,
     .has_inner_state = false,
-    .supports_multimodal = false,
+    // MODEL-MM-deepseek-v4 W4 (#2411): TRUE, and the architecture string is
+    // why it cannot be conditional. `DeepseekV4ForCausalLM` names both the TEXT
+    // checkpoint and the Flash-Vision one, so the registration advertises that
+    // this architecture CAN accept multimodal input, and a load with no
+    // `deepseek4v` projector keeps `DeepseekV4LoadedModel::has_vision()` false
+    // and stays byte-identical. What actually gates the runner's multimodal arm
+    // is `encode_mm` and `embed_mm` being non-null (`SupportsMmInputs`); this
+    // flag gates the OpenAI server's chat seam, which W5 owns.
+    .supports_multimodal = true,
     .score_type = "bi-encoder",
 };
 
-class DeepseekV4LoadedModel final : public LoadedModel {
- public:
-  DeepseekV4LoadedModel(const ModelRegistration& registration,
-                        DeepseekV4Weights weights)
-      : LoadedModel(registration), weights_(std::move(weights)) {}
-  const DeepseekV4Weights& weights() const { return weights_; }
-
-  // MODEL-DSV4-PAGED-ENTRY (#2447): the compressor's carried state, which must
-  // survive between steps -- it pools a CLOSED window into one row, so a state
-  // rebuilt per call has seen nothing and `CompressorLayerStep` refuses on the
-  // first decode step. Sized on first use, because the layer count comes from
-  // the parsed params rather than from the registration.
-  //
-  // A STAGED SHORTCUT, DECLARED AS ONE. Upstream keeps this state in the
-  // runner's KV-cache pool, and `MakeDeepseekV4KVCache` below ALREADY publishes
-  // three compressor-state groups (`c4_attn_state`, `c4_indexer_state`,
-  // `c128_attn_state`) that nothing reads yet. A model-object member is ONE
-  // sequence's state by construction, which is also why the route refuses
-  // `num_reqs > 1`. Consuming the published groups is the correct end state and
-  // is owed in `.agents/specs/model-dsv4-paged-entry.md` `## Owed`.
-  //
-  // No `mutable` is needed: the forward hook takes `LoadedModel&` non-const and
-  // `ModelAs<T>` returns non-const. Precedent: `Qwen3MoeLoadedModel::decode_graph()`.
-  DeepseekV4CompressorState& compressor_state(int64_t num_hidden_layers) {
-    if (static_cast<int64_t>(compressor_.state_kv.size()) != num_hidden_layers) {
-      compressor_.Resize(num_hidden_layers);
-    }
-    return compressor_;
-  }
-
- private:
-  DeepseekV4Weights weights_;
-  DeepseekV4CompressorState compressor_;
-};
-
+// MODEL-MM-deepseek-v4 W4 (#2411): `DeepseekV4LoadedModel` moved to
+// `include/vllm/model_executor/models/deepseek_v4_mm.h`, where it grew the
+// vision runtime this wave attaches. The class kept every member it had; the
+// reason it is no longer private to this translation unit is that a text
+// checkpoint's tower-free state has to be assertable, and the base class cannot
+// answer that question.
 std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
@@ -114,13 +94,29 @@ std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     // CUDA-capable process, and this hook is where the disagreement reached the
     // loader.
     const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
+    // MODEL-MM-deepseek-v4 W4 (#2411): THE PRODUCTION READ of the second file.
+    // It runs BEFORE the language weights for the reason the projector refusal
+    // sits early in `model_loader.cpp`: a `--mmproj` this build cannot load
+    // must cost the user a message rather than a 91 GiB map followed by one.
+    std::unique_ptr<DeepseekV4VisionRuntime> vision =
+        LoadDeepseekV4VisionRuntime(source, config);
     return std::make_unique<DeepseekV4LoadedModel>(
         registration,
-        LoadDeepseekV4FromGguf(*source.gguf, config, &gguf_policy));
+        LoadDeepseekV4FromGguf(*source.gguf, config, &gguf_policy),
+        std::move(vision));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
   }
+  // THE SAFETENSORS ARM STAYS TOWER-FREE, and it is not this wave's oversight.
+  // `--mmproj` is refused for a safetensors checkpoint by name in
+  // `model_loader.cpp` ("a multimodal projector attaches to a .gguf language
+  // file"), so no production path can put a projector on a safetensors source
+  // and a branch that read one here would be unreachable. The official arm
+  // carries `vision.*` and `aligner.*` in its own shards; ACCOUNTING for them
+  // landed with W3, MATERIALISING them is owed by issue #2411 and row
+  // `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, and until it lands an
+  // image request on this arm refuses in `encode_mm` rather than answering.
   return std::make_unique<DeepseekV4LoadedModel>(
       registration, LoadDeepseekV4ForCausalLMWeights(*source.safetensors, config));
 }
@@ -157,6 +153,44 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
   std::vector<int32_t> device_ids;
   const std::vector<int32_t>& ids =
       ResolveHostTokenIds(input, &device_ids, "DeepseekV4ForCausalLM");
+  // MODEL-MM-deepseek-v4 W4 (#2411): THE PRODUCTION CALL SITE for the merged
+  // image embeddings, and the line the reachability mutation deletes.
+  //
+  // `MultiModalForwardInput::inputs_embeds` is the model/runner boundary the
+  // spec names: `ModelRegistry::EmbedMm` has already embedded the ordinary
+  // identifiers and scattered the vision rows over the image span, and this
+  // step consumes the result. There is no fallback, because there cannot be
+  // one: the expanded prompt spells every image position `vocab_size + type`,
+  // so a forward that dropped this branch would refuse the step rather than
+  // answer it from the embedding table.
+  //
+  // The tensor is a BORROWED device view and this copies it down, because every
+  // DeepSeek-V4 arm composes on a host f32 residual stream today. That is the
+  // same download `ForwardComposeImpl` would do for its own embed lookup, and
+  // the device-resident merge is owed with the device path (#2411 W7-CUDA).
+  std::vector<float> merged;
+  const std::vector<float>* inputs_embeds = nullptr;
+  if (input.mm.has_value()) {
+    const vt::Tensor& t = input.mm->inputs_embeds;
+    VT_CHECK(t.data != nullptr && t.rank == 2 &&
+                 t.dtype == vt::DType::kBF16,
+             "DeepseekV4ForCausalLM: a multimodal step must carry a 2-D BF16 "
+             "`inputs_embeds`, which is what ModelRegistry::EmbedMm builds");
+    VT_CHECK(t.shape[0] == static_cast<int64_t>(ids.size()) &&
+                 t.shape[1] == weights.params.hidden_size,
+             "DeepseekV4ForCausalLM: `inputs_embeds` is [" +
+                 std::to_string(t.shape[0]) + ", " + std::to_string(t.shape[1]) +
+                 "] and this step is " + std::to_string(ids.size()) +
+                 " tokens of " + std::to_string(weights.params.hidden_size));
+    vt::Backend& backend = vt::GetBackend(input.queue.device.type);
+    std::vector<uint16_t> words(static_cast<size_t>(t.shape[0] * t.shape[1]));
+    backend.Copy(input.queue, words.data(), t.data,
+                 words.size() * sizeof(uint16_t));
+    backend.Synchronize(input.queue);
+    merged.resize(words.size());
+    for (size_t i = 0; i < words.size(); ++i) merged[i] = vt::BF16ToF32(words[i]);
+    inputs_embeds = &merged;
+  }
   // MODEL-DSV4-PAGED-ENTRY (#2447): THE EXL3 PAGED ARM, and it is FIRST for the
   // reason the row exists. `ModelForwardInput::gather_logits` defaults to true
   // and the runner leaves it true on every default step, so a branch placed
@@ -186,12 +220,13 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
     return DeepseekV4ForwardExl3PagedLogits(
         weights, input.queue, pages, kv_base, ids, input.positions,
         input.logits_indices,
-        &ds.compressor_state(weights.params.num_hidden_layers));
+        &ds.compressor_state(weights.params.num_hidden_layers), inputs_embeds);
   }
   if (input.gather_logits) {
     return DeepseekV4Model::ForwardDevice(ids, input.positions,
                                           input.attn_meta, input.attn_kv, weights,
-                                          input.queue, input.logits_indices);
+                                          input.queue, input.logits_indices,
+                                          inputs_embeds);
   }
   // KV-DSV4-MULTICACHE W5 (#2323): the runner handed us a name-keyed cache set,
   // so consume it instead of recomputing the prefix every step.
@@ -213,13 +248,15 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
             : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
     return HostLogits(
         DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, ids,
-                                   input.positions, input.logits_indices),
+                                   input.positions, input.logits_indices,
+                                   /*kv_prewritten=*/false,
+                                   /*compressor=*/nullptr, inputs_embeds),
         weights.params.vocab_size);
   }
   return HostLogits(
       DeepseekV4Model::Forward(ids, input.positions, input.attn_meta,
                                input.attn_kv, weights, input.queue,
-                               input.logits_indices),
+                               input.logits_indices, inputs_embeds),
       weights.params.vocab_size);
 }
 
@@ -229,6 +266,14 @@ const ModelFactory kDeepseekV4Factory{
     .prepare = &PrepareDeepseekV4ForCausalLM,
     .forward = &ForwardDeepseekV4ForCausalLM,
     .make_kv_cache = &MakeDeepseekV4KVCache,
+    // MODEL-MM-deepseek-v4 W4 (#2411): the two hooks `GPUModelRunner`
+    // dispatches through. `ModelRegistry::SupportsMmInputs` is true only when
+    // BOTH are set, and that predicate is what turns the runner's multimodal
+    // arm on for this architecture. `mrope_prompt_positions` stays null, which
+    // is upstream's `uses_mrope == False`: DeepSeek-V4 reads the ordinary
+    // one-dimensional positions.
+    .encode_mm = &EncodeMmDeepseekV4ForCausalLM,
+    .embed_mm = &EmbedMmDeepseekV4ForCausalLM,
     // Upstream derives `[256 // compress_ratio, head_dim]` everywhere
     // (`sparse_swa.py:76-83`, `compressor.py:174-178`), and a
     // `compress_ratio == 128` layer cannot be paged below 256: at the engine's
@@ -242,7 +287,17 @@ const ModelFactory kDeepseekV4Factory{
     // the topology -- and the adapter above refuses by name every shape it
     // cannot serve, so the guard moves rather than disappearing.
     .consumes_multi_kv = true,
+    // MODEL-MM-deepseek-v4 W4 (#2411): this loader READS `ModelSource::mmproj`.
+    // `ModelRegistry::Load` refuses a projector handed to an architecture that
+    // does not, so a `--mmproj` paired with the wrong language model costs a
+    // message rather than loading a tower-free engine that answers every image
+    // request as text.
+    .consumes_mmproj = true,
     .consumes_device_token_ids = true,
+    // The embed hook takes `MmEmbedInputs::device_token_ids` when the
+    // asynchronous runner marks the host vector stale, which is what lets
+    // `ModelRegistry::EmbedMm` hand this model such a step at all.
+    .embed_mm_consumes_device_token_ids = true,
 };
 
 }  // namespace

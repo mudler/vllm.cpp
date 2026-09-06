@@ -129,8 +129,17 @@ struct BiasWidths {
 // `vision_from` is the first layer that carries `exp_probs_b_vl.bias`. 0 is the
 // whole artifact, which is what the pinned build holds; a higher value builds
 // the PARTIALLY converted file that llama.cpp's `TENSOR_NOT_REQUIRED` accepts.
+// `head_dim` defaults to the deliberately tiny `kHeadDim`, which is what the
+// W3B loader gate uses because it calls `LoadDeepseekV4FromGguf` directly. A
+// caller that enters through `ModelRegistry::Load` instead has to pass 512:
+// `ParseDeepseekV4Config` runs there and refuses every other MLA width by name
+// ("only the 512-wide MLA geometry (448 NoPE + 64 RoPE) is scoped"). Every
+// attention shape below is DERIVED from this argument, so the two files differ
+// in one number rather than in a second builder.
 inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
-                               int64_t vision_from = 0) {
+                               int64_t vision_from = 0,
+                               int64_t head_dim = kHeadDim,
+                               bool with_tokenizer = false) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -138,7 +147,7 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
   b.AddKv(U32Kv(p + "block_count", kLayers));
   b.AddKv(U32Kv(p + "attention.head_count", kHeads));
   b.AddKv(U32Kv(p + "attention.head_count_kv", 1));
-  b.AddKv(U32Kv(p + "attention.key_length", kHeadDim));
+  b.AddKv(U32Kv(p + "attention.key_length", head_dim));
   b.AddKv(U32Kv(p + "rope.dimension_count", kRope));
   b.AddKv(U32Kv(p + "attention.q_lora_rank", kQLora));
   b.AddKv(U32Kv(p + "attention.output_lora_rank", kOLora));
@@ -157,6 +166,24 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
   b.AddKv(F32Kv(p + "hyper_connection.epsilon", 1e-6f));
   b.AddKv(I32ArrayKv(p + "attention.compress_ratios",
                      std::vector<int32_t>(static_cast<size_t>(kLayers), 0)));
+  // `LoadedEngine::FromModelDir` opens the tokenizer between the projector
+  // block and `ModelRegistry::Load`, so a fixture without these keys stops
+  // there. A caller that needs the loader to get PAST the tokenizer asks for
+  // them; the W3B gate does not, and stays byte-identical without them.
+  if (with_tokenizer) {
+    b.AddKv(StrKv("tokenizer.ggml.model", "gpt2"));
+    b.AddKv(StrKv("tokenizer.ggml.pre", "llama-bpe"));
+    std::vector<std::string> toks;
+    std::vector<int32_t> types;
+    for (int64_t i = 0; i < kVocab; ++i) {
+      toks.push_back(std::string(1, static_cast<char>('a' + i)));
+      types.push_back(1);
+    }
+    b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.tokens", toks));
+    b.AddKv(I32ArrayKv("tokenizer.ggml.token_type", types));
+    b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.merges", {}));
+    b.AddKv(U32Kv("tokenizer.ggml.eos_token_id", static_cast<uint32_t>(kVocab - 1)));
+  }
 
   const auto f32 = [&](const std::string& name, const std::vector<int64_t>& shape) {
     b.AddTensor(name, GgmlDims(shape), /*F32=*/0, F32Data(Prod(shape), WFill));
@@ -177,14 +204,14 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
 
   for (int64_t l = 0; l < kLayers; ++l) {
     q8(Blk(l, "attn_q_a.weight"), {kQLora, kH});
-    q8(Blk(l, "attn_q_b.weight"), {kHeads * kHeadDim, kQLora});
-    q8(Blk(l, "attn_kv.weight"), {kHeadDim, kH});
+    q8(Blk(l, "attn_q_b.weight"), {kHeads * head_dim, kQLora});
+    q8(Blk(l, "attn_kv.weight"), {head_dim, kH});
     q8(Blk(l, "attn_output_a.weight"),
-       {kOGroups * kOLora, kHeads * kHeadDim / kOGroups});
+       {kOGroups * kOLora, kHeads * head_dim / kOGroups});
     q8(Blk(l, "attn_output_b.weight"), {kH, kOGroups * kOLora});
     f32(Blk(l, "attn_norm.weight"), {kH});
     f32(Blk(l, "attn_q_a_norm.weight"), {kQLora});
-    f32(Blk(l, "attn_kv_a_norm.weight"), {kHeadDim});
+    f32(Blk(l, "attn_kv_a_norm.weight"), {head_dim});
     f32(Blk(l, "attn_sinks.weight"), {kHeads});
     f32(Blk(l, "ffn_norm.weight"), {kH});
     f32(Blk(l, "hc_attn_base.weight"), {hcf});

@@ -58,11 +58,29 @@ struct Dims {
 // index its own bf16 word. A plain `base + i` series would not: bf16's ULP at
 // 20000 is 128, so hundreds of indices would share a word and an off-by-one
 // permutation would pass every check below.
-inline float Series(int family, int64_t i) {
+// FOLD, when set, wraps the exponent into `[-fold/2, fold/2)` instead of letting
+// it run with the family index.
+//
+// The W3A reader gate wants the unfolded form: each family gets its own binade,
+// so a swapped slot (q for k, gate for up) lands in a different one and cannot
+// hide. It never RUNS the tower, so a `2^104` weight costs it nothing.
+//
+// The W4 reachability gate does run it, and a 32-layer product of `2^104`
+// weights is infinity before anything can be compared with it -- which shows up
+// as every image row differing, because a NaN is unequal to itself. Folding is
+// modular, so distinct families still land on distinct words inside the fold
+// and a swap is still visible; what it gives up is the guarantee that two
+// families can never collide.
+inline float Series(int family, int64_t i, int fold) {
   const int64_t k = i % 128;
-  const int exponent = family + static_cast<int>(i / 128);
+  int exponent = family + static_cast<int>(i / 128);
+  if (fold > 0) {
+    exponent = ((exponent % fold) + fold) % fold - fold / 2;
+  }
   return std::ldexp(1.0F + static_cast<float>(k) / 128.0F, exponent);
 }
+
+inline float Series(int family, int64_t i) { return Series(family, i, 0); }
 
 // Each tensor gets its own exponent family, so a swapped slot (q for k,
 // gate for up, ln1 for ln2) lands in a different binade and cannot hide.
@@ -126,15 +144,17 @@ inline int64_t Numel(const std::vector<uint64_t>& dims) {
 
 // `dims` are ggml order (ne0 = fastest). A torch [A, B] tensor is {B, A}.
 inline void AddF32(gguf_test::GgufModelBuilder& b, const std::string& name,
-            const std::vector<uint64_t>& dims, int family) {
+            const std::vector<uint64_t>& dims, int family, int fold = 0) {
   b.AddTensor(name, dims, /*ggml_type=*/0,
-              F32Bytes(Numel(dims), [family](int64_t i) { return Series(family, i); }));
+              F32Bytes(Numel(dims),
+                       [family, fold](int64_t i) { return Series(family, i, fold); }));
 }
 
 inline void AddBf16(gguf_test::GgufModelBuilder& b, const std::string& name,
-             const std::vector<uint64_t>& dims, int family) {
+             const std::vector<uint64_t>& dims, int family, int fold = 0) {
   b.AddTensor(name, dims, /*ggml_type=*/30,
-              Bf16Bytes(Numel(dims), [family](int64_t i) { return Series(family, i); }));
+              Bf16Bytes(Numel(dims),
+                        [family, fold](int64_t i) { return Series(family, i, fold); }));
 }
 
 // Every refusal case is a file a user can actually hold: a projector for
@@ -168,6 +188,10 @@ struct Options {
   // bare `std::bad_alloc` rather than a named refusal, and at patch_size 1 it
   // stays about 1.6 MB while doing it.
   bool only_before_qkv = false;
+  // Fold every tensor's exponent into `[-fold/2, fold/2)`. 0 keeps the
+  // per-family binades the reader gate needs; a small positive value is what a
+  // gate that actually RUNS this tower has to ask for. See `Series` above.
+  int fold_exponents = 0;
 };
 
 // The declared geometry for `key`, or the case's own raw override for it.
@@ -222,12 +246,12 @@ inline std::string Build(const Dims& d, const Options& o = Options{}) {
   const auto f32 = [&](const std::string& name, std::vector<uint64_t> dims,
                        int family) {
     if (o.transpose_tensor == name) std::reverse(dims.begin(), dims.end());
-    AddF32(b, name, dims, family);
+    AddF32(b, name, dims, family, o.fold_exponents);
   };
   const auto bf16 = [&](const std::string& name, std::vector<uint64_t> dims,
                         int family) {
     if (o.transpose_tensor == name) std::reverse(dims.begin(), dims.end());
-    AddBf16(b, name, dims, family);
+    AddBf16(b, name, dims, family, o.fold_exponents);
   };
 
   // The aligner projection. `mm.1` is the 3x3 unfold's consumer and `mm.2`

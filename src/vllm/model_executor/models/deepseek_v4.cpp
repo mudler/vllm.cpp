@@ -124,6 +124,19 @@ struct V4Backend {
   bool device = false;
   vt::Queue* q = nullptr;
   const DeepseekV4GgufWeights* gguf = nullptr;
+  // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[T, H]` token stream,
+  // row-major f32, replacing the embedding lookup for this call.
+  //
+  // It is carried here rather than passed down the parameter list because this
+  // struct is already the per-call context every arm shares, and because the
+  // merge has to reach EVERY arm. An arm that silently ignored it would embed
+  // the expanded prompt's out-of-vocabulary sentinel identifiers, which is a
+  // refusal rather than a wrong answer -- but an arm that ignored it on a
+  // prompt whose sentinels happened to be in range would be fluent and wrong.
+  //
+  // NULL on every text step, which is every step of every other model, so those
+  // are byte-identical.
+  const std::vector<float>* inputs_embeds = nullptr;
   // Incremental-decode KV cache (Stage 1). Null = stateless full-recompute (the
   // default / --gpu path). When set, AttentionBlock appends each token's per-layer
   // `deck` latent to cache.deck[layer] and attends over the full cached KV; the
@@ -2924,11 +2937,27 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
   }
 
   // embed lookup -> the [T,H] token hidden stream.
+  //
+  // MODEL-MM-deepseek-v4 W4 (#2411): a multimodal step arrives ALREADY MERGED.
+  // `ModelRegistry::EmbedMm` embedded the ordinary identifiers and scattered the
+  // vision rows over the image span, so this call takes the result instead of
+  // running the lookup -- which it could not run anyway, because the expanded
+  // prompt's sentinel identifiers are `vocab_size + type` and out of range by
+  // construction.
   std::vector<float> x(static_cast<size_t>(T) * H);
-  for (int64_t t = 0; t < T; ++t) {
-    const int64_t tok = token_ids[static_cast<size_t>(t)];
-    VT_CHECK(tok >= 0 && tok < V, "token id out of range");
-    for (int64_t h = 0; h < H; ++h) x[t * H + h] = hw.embed[tok * H + h];
+  if (be.inputs_embeds != nullptr) {
+    VT_CHECK(static_cast<int64_t>(be.inputs_embeds->size()) == T * H,
+             "deepseek-v4 multimodal forward: inputs_embeds is " +
+                 std::to_string(be.inputs_embeds->size()) +
+                 " values, and this step needs num_tokens * hidden_size = " +
+                 std::to_string(T * H));
+    x = *be.inputs_embeds;
+  } else {
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t tok = token_ids[static_cast<size_t>(t)];
+      VT_CHECK(tok >= 0 && tok < V, "token id out of range");
+      for (int64_t h = 0; h < H; ++h) x[t * H + h] = hw.embed[tok * H + h];
+    }
   }
   DumpAct("ours_embed", Slice(x, 0, H));  // t=0 embed plain [H] (coherence-debug #188)
 
@@ -3130,9 +3159,12 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          const std::vector<int32_t>& token_ids,
                                          const std::vector<int32_t>& positions,
                                          const std::vector<int32_t>& logits_indices,
-                                         V4Miswire miswire, V4ForwardTrace* trace) {
+                                         V4Miswire miswire, V4ForwardTrace* trace,
+                                         const std::vector<float>* inputs_embeds) {
+  V4Backend be{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr};
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
-                            V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+                            be);
 }
 
 // DSV4-DSPARK-DRAFTER W-3: one block's KV rows, derived from the projected taps.
@@ -3481,7 +3513,8 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
                                          const std::vector<int32_t>& token_ids,
                                          const std::vector<int32_t>& positions,
                                          const std::vector<int32_t>& logits_indices,
-                                         V4Miswire miswire, V4ForwardTrace* trace) {
+                                         V4Miswire miswire, V4ForwardTrace* trace,
+                                         const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGguf: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3489,6 +3522,7 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
            "absent");
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.grouped_moe = GroupedMoeEnabled();
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                             miswire, trace, be);
 }
@@ -3574,7 +3608,8 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               const std::vector<int32_t>& positions,
                                               const std::vector<int32_t>& logits_indices,
                                               bool kv_prewritten,
-                                              DeepseekV4CompressorState* compressor) {
+                                              DeepseekV4CompressorState* compressor,
+                                              const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3588,6 +3623,7 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
   be.compressor = compressor;
   be.kv_base = kv_base;
   be.grouped_moe = GroupedMoeEnabled();
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
@@ -3843,7 +3879,8 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
                                                 vt::Queue& queue,
                                                 const std::vector<int32_t>& token_ids,
                                                 const std::vector<int32_t>& positions,
-                                                const std::vector<int32_t>& logits_indices) {
+                                                const std::vector<int32_t>& logits_indices,
+                                                const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3: no EXL3 tower (the load did not take that arm)");
   // W1b's EXL3-specific `has_host_weights` refusal stood HERE and is DELETED as
@@ -3862,6 +3899,7 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
   (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                             V4Miswire::kNone, /*trace=*/nullptr, be);
 }
@@ -3882,7 +3920,8 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor) {
+    DeepseekV4CompressorState* compressor,
+    const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
   VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
@@ -3898,6 +3937,7 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
   be.paged_kv = &paged_kv;
   be.kv_base = kv_base;
   be.compressor = compressor;
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
@@ -3906,24 +3946,29 @@ std::vector<float> DeepseekV4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const std::vector<float>* inputs_embeds) {
   (void)attn_meta;
   (void)attn_kv;
   // EXL3 source: the routed experts are trellis linears and dispatch through the
   // W2 kernels. Checked FIRST because an EXL3 load carries no GGUF tower and its
   // refusals must name this row rather than the generic host-tower one.
   if (weights.has_exl3_weights) {
-    return DeepseekV4ForwardExl3(weights, queue, token_ids, positions, logits_indices);
+    return DeepseekV4ForwardExl3(weights, queue, token_ids, positions,
+                                 logits_indices, inputs_embeds);
   }
   // GGUF source: consume the keep-quant tower (memory-bounded — no ~1 TiB f32
   // tower). Safetensors/NVFP4 + the tiny-synthetic gate: the f32 host oracle.
   if (weights.has_gguf_weights) {
-    return DeepseekV4ForwardGguf(weights, queue, token_ids, positions, logits_indices);
+    return DeepseekV4ForwardGguf(weights, queue, token_ids, positions,
+                                 logits_indices, V4Miswire::kNone,
+                                 /*trace=*/nullptr, inputs_embeds);
   }
   (void)queue;
   VT_CHECK(weights.has_host_weights, kHostPending);
   return DeepseekV4ForwardHost(weights.host, weights.params, token_ids, positions,
-                               logits_indices);
+                               logits_indices, V4Miswire::kNone,
+                               /*trace=*/nullptr, inputs_embeds);
 }
 
 // FRAMEWORK-CONFORMANCE (device-resident logits): wrap the composed
@@ -3966,10 +4011,12 @@ ForwardLogits DeepseekV4ForwardExl3PagedLogits(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor) {
+    DeepseekV4CompressorState* compressor,
+    const std::vector<float>* inputs_embeds) {
   std::vector<float> flat =
       DeepseekV4ForwardExl3Paged(weights, queue, paged_kv, kv_base, token_ids,
-                                 positions, logits_indices, compressor);
+                                 positions, logits_indices, compressor,
+                                 inputs_embeds);
   const int64_t vocab = weights.params.vocab_size;
   const int64_t rows = vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;
   return WrapV4DeviceLogits(std::move(flat), rows, vocab, queue);
@@ -3994,7 +4041,8 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const std::vector<float>* inputs_embeds) {
   (void)attn_meta;
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
@@ -4006,6 +4054,7 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   // `Exl3Linear`'s refusal from "this arm cannot run on a GPU" into a
   // precondition that is already satisfied.
   V4Backend dev_be{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr};
+  dev_be.inputs_embeds = inputs_embeds;
   if (weights.has_exl3_weights) {
     (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
     dev_be.exl3 = &weights.exl3;

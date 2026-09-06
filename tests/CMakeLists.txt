@@ -1606,6 +1606,12 @@ vllm_cpp_add_test(test_deepseek_v4_mmproj
                   vllm/models/test_deepseek_v4_mmproj.cpp)
 target_include_directories(test_deepseek_v4_mmproj PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+vllm_cpp_add_test(test_deepseek_v4_mm_reach
+                  vllm/models/test_deepseek_v4_mm_reach.cpp)
+target_include_directories(test_deepseek_v4_mm_reach PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 # Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
 # (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
 # 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).

@@ -763,37 +763,32 @@ above as its red-before input.
 - CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
   W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
   any of the three.
-- The W2 vision tower and aligner are unreachable from a production entry
-  point. `DeepSeekV4Vision`, its `Forward`, `VisionForward` and
-  `AlignerForward` seams, `DeepSeekV4VisionRopeCosSin` and the
-  `DeepSeekV4VisionCapture` type have no production call site: nothing in
-  `include/vllm.h`, the loader, `ModelRegistry::Forward` or a registered server
-  or command-line path constructs the class, and the stage goldens reach it by
-  building it in the test. The only non-test file that includes the W2 header is
-  `clip_mmproj_gguf.h`, for the `DeepSeekV4VisionConfig` and
-  `DeepSeekV4VisionWeights` types W3A's reader fills, and that reader is
-  unreached for its own reason below. Row
-  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring in W4, which
-  routes the tower through the registered model forward, and issue #2411 tracks
-  it. W2's own commit body claimed this entry was already here when it was not,
-  which is the omission the W2 repair closes.
-- W1 prompt encoding and image preprocessing remain unreachable from a
-  production entry point. W4 wires them into the registered model forward, and
+- **CLOSED BY W4.** The W2 vision tower and aligner were unreachable from a
+  production entry point, and are not any more. `DeepseekV4LoadedModel::
+  vision_tower` builds `DeepSeekV4Vision` and `EncodeMmDeepseekV4ForCausalLM`
+  runs its `Forward`, reached from `ModelRegistry::EncodeMm`.
+  `DeepSeekV4VisionCapture` and `DeepSeekV4VisionRopeCosSin` stay test-only, and
+  deliberately: the first is a parity-gate tap and the second is a host oracle
+  for one, so neither is a capability a user arrives at. `VisionForward` and
+  `AlignerForward` are reached through `Forward`, which composes them.
+- W1 is PARTLY reached by W4, and the half that is not is named here.
+  `BuildDeepSeekV4ImageBlock` is reached: `EncodeMmDeepseekV4ForCausalLM`
+  recomputes the block from the feature's own offset and grid, which is how the
+  encoder emits one row per sentinel token. `EncodeDeepSeekV4Messages`,
+  `ParseDeepSeekV4TaggedText`, `DeepSeekV4ImageProcessor::ProcessImage` and
+  `PrepareDeepSeekV4Inputs` are STILL unreached: they belong to the REQUEST
+  path, and nothing between an HTTP body and `MultiModalInputs` calls them yet.
   W5 wires the runner, public ABI and OpenAI server for row
-  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`; issue #2411 tracks both
-  waves.
-- The W3A `deepseek4v` mmproj reader is unreachable for the same reason.
-  `RefuseUnsupportedDeepSeekV4ClipMmproj`,
-  `DeepSeekV4ClipMmprojVisionConfig`, `LoadDeepSeekV4VisionFromClipMmproj`,
-  `DeepSeekV4ClipMmprojExpectedTensors` and
-  `RefuseUnaccountedDeepSeekV4ClipMmproj` have no production call site: the one
-  `clip` mmproj call site, `src/vllm/entrypoints/model_loader.cpp`, still calls
-  the Qwen3-VL arm only, and that arm's refusal deliberately keeps rejecting
-  `deepseek4v` so a DeepSeek projector cannot reach a Qwen3-VL reader. Row
-  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring in W4 and
-  issue #2411 tracks it. The four sentinel vectors this reader returns
-  (`image_start`, `image_end`, `image_pad`, `image_newline`) also have no
-  consumer until W4 assembles the token block.
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`; issue #2411 tracks it.
+- **CLOSED BY W4.** The W3A `deepseek4v` mmproj reader is reached.
+  `src/vllm/entrypoints/model_loader.cpp` branches on `clip.projector_type` and
+  calls `RefuseDeepSeekV4ClipMmprojArm` before the tokenizer, and
+  `LoadDeepseekV4ForCausalLM` calls `LoadDeepSeekV4ClipMmprojArm` through
+  `ModelSource::mmproj`. The Qwen3-VL discriminator still refuses `deepseek4v`
+  and the W3A gate still asserts that it does; the branch is what stops it being
+  reached. The four sentinel vectors are consumed by
+  `EncodeMmDeepseekV4ForCausalLM`, which places one under each marker token of
+  the image block.
 - The pinned `mmproj-BF16.gguf` has never been read by this code. W3A gates the
   name map, the metadata map and the four layout joins against a synthetic
   fixture built to the artifact's measured header; the real 934,462,656-byte
@@ -841,6 +836,61 @@ above as its red-before input.
   the gate does not cover. Widening the fixture is owed by issue #2411 and W3;
   it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
   test uses, so it is not made inside a W3A repair.
+
+### W4 evidence — stage 1, reachability
+
+W4 makes an image reach `ModelRegistry::Forward`. Four production call sites
+carry it, and each one is proved by deleting it.
+
+The RED-BEFORE was a compile failure. `tests/vllm/models/test_deepseek_v4_mm_reach.cpp`
+was written first and named the three surfaces this wave adds:
+
+```text
+test_deepseek_v4_mm_reach.cpp:131: error: 'struct vllm::ModelSource' has no member named 'mmproj'
+test_deepseek_v4_mm_reach.cpp:132: error: 'struct vllm::ModelSource' has no member named 'mmproj_path'
+test_deepseek_v4_mm_reach.cpp:327: error: 'DeepseekV4LoadedModel' is not a member of 'vllm'
+```
+
+THE CHAIN, from the entry point down:
+
+1. `LoadedEngine::FromModelDir` branches on `clip.projector_type` and calls
+   `RefuseDeepSeekV4ClipMmprojArm` before the tokenizer;
+2. it sets `ModelSource::mmproj`, which `LoadDeepseekV4ForCausalLM` reads;
+3. that hook calls `LoadDeepseekV4VisionRuntime`, which runs
+   `LoadDeepSeekV4ClipMmprojArm` and attaches the projector to the model;
+4. `ModelRegistry::EncodeMm` builds the tower and runs it,
+   `ModelRegistry::EmbedMm` merges its rows, and
+   `ForwardDeepseekV4ForCausalLM` consumes `MultiModalForwardInput::inputs_embeds`.
+
+THE REACHABILITY MUTATION, and it is the headline. Disabling the `input.mm`
+branch in `ForwardDeepseekV4ForCausalLM` turns the focused gate RED:
+
+```text
+test_deepseek_v4_mm_reach.cpp:372: ERROR: test case THREW exception:
+  vt: token id out of range at src/vllm/model_executor/models/deepseek_v4.cpp:2958
+```
+
+That is the predicted failure and not an incidental one. The expanded prompt
+spells every image position `vocab_size + type`, so a forward with no merged
+embeddings cannot answer the step from the embedding table at all.
+
+Three further call-site mutations, each restored byte-for-byte and verified with
+`sha256sum -c`:
+
+| Mutation | Result |
+|---|---|
+| the loader's projector-type branch never selects the DeepSeek arm | RED, 4 assertions |
+| the loader sets `gguf_source.mmproj = nullptr` | RED, 3 assertions |
+| `LoadDeepseekV4ForCausalLM` never builds the vision runtime | RED, 3 cases |
+
+The third mutation was GREEN on the first attempt, and that was the finding: no
+case drove a load past the tokenizer, so the one line handing the projector down
+was unobserved. The fixture gained `tokenizer.ggml.*` keys and a case that pairs
+a projector of the WRONG aligner width with the language model, whose refusal
+exists only if the file arrived.
+
+The focused gate is `test_deepseek_v4_mm_reach`, 7 cases and 50 assertions on a
+Release CPU build with `-DVLLM_CPP_CUDA=OFF`.
 
 ### W3A evidence
 

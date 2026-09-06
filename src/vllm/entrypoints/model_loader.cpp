@@ -2999,45 +2999,75 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // freed" (the same distinction the Muse Glimmer text-only case draws).
     bool mmproj_tower_skipped = false;
     std::optional<vllm::GgufFile> mmproj;
+    // MODEL-MM-deepseek-v4 W4 (#2411): the `deepseek4v` arm, and the ONE thing
+    // this function does for it is decide which reader gets the file.
+    //
+    // A DeepSeek-V4 projector is NOT read here. Its reader fills the W2 vision
+    // types, and the tower has to end up on the LANGUAGE model rather than on
+    // the engine, because the registered `encode_mm` hook reaches it through
+    // `LoadedModel`. The engine's own `vision_tower_` is typed
+    // `Qwen3VLVisionWeights`, which is exactly why it could not carry a second
+    // architecture's tower. So the file travels down on `ModelSource::mmproj`
+    // and `LoadDeepseekV4ForCausalLM` opens it -- a family's on-disk name map
+    // living inside that family's `load_weights`, as everywhere else here.
+    //
+    // `RefuseUnsupportedClipMmproj` below keeps refusing `deepseek4v` and the
+    // W3A gate keeps asserting that it does. Widening it would send a DeepSeek
+    // projector into the Qwen3-VL reader and build a tower that runs and is
+    // wrong; the branch is what stops it being reached at all.
+    const vllm::GgufFile* deepseek_v4_mmproj = nullptr;
     if (!params.mmproj_path.empty()) {
       mmproj = vllm::GgufFile::Open(params.mmproj_path);
-      vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
-      vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
-      // QUANT-QWEN38-27B-GGUF-ARM (#821): the projector's own accounting, and
-      // it runs BEFORE the read, so a file this reader would only partly
-      // consume costs a message rather than a silently incomplete tower.
-      vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
-                                        params.mmproj_path);
-      // #607 L3, the THIRD production tower load, and the one the first cut of
-      // this row missed. It is a tower like the other two: `--mmproj` names a
-      // projector, this reads every one of its tensors into owned host f32, and
-      // the engine holds them for the process lifetime. So
-      // `--language-model-only` zeroed every limit, refused every image request,
-      // AND STILL PAID FOR THE PROJECTOR — the exact L2 failure this row exists
-      // to close, surviving on the one architecture nothing was looking at.
-      //
-      // Gated on the same predicate and the same modality set as the two
-      // safetensors sites ({"image","video"} — interfaces.py:293 and
-      // qwen3_vl.py:1747), because this projector IS the Qwen3-VL tower, read
-      // out of a `clip` GGUF instead of out of the model's own shards. `image:
-      // 0` alone must therefore not skip it here either.
-      //
-      // ONLY THE READ IS CONDITIONAL. `GgufFile::Open`, both refusals and
-      // `ClipMmprojVisionConfig` above still run: that is the construct half of
-      // construct-without-initialise (utils.py:762), so the geometry resolves
-      // either way and a `--mmproj` this build cannot load is still refused by
-      // name rather than accepted in silence at zero limits. What stops is the
-      // storage — and with it the reader's own missing-tensor refusals, which is
-      // the mirror of `StageMissingLayer` keeping a skipped stage out of the
-      // loader's key accounting (utils.py:693-695).
-      //
-      // `vision_tower` stays nullopt, which is already a supported engine state:
-      // it is what every load that named no `--mmproj` produces.
-      if (vllm::SkipTowerForModalities(&params.multimodal, {"image", "video"})) {
-        mmproj_tower_skipped = true;
+      if (vllm::IsClipMmprojGguf(*mmproj) &&
+          vllm::ClipProjectorType(*mmproj) == vllm::kClipProjectorDeepSeekV4) {
+        deepseek_v4_mmproj = &*mmproj;
+        // REFUSE HERE, before the tokenizer and every weight byte, for the same
+        // reason the Qwen3-VL arm below refuses here: a projector this build
+        // cannot load must cost the user a message, not a 91 GiB map followed
+        // by one. Only the READ is deferred, and it happens inside
+        // `LoadDeepseekV4ForCausalLM` because the tower belongs on the model.
+        multimodal::DeepSeekV4VisionConfig deepseek_v4_vision_config;
+        vllm::RefuseDeepSeekV4ClipMmprojArm(*mmproj, params.mmproj_path,
+                                            &deepseek_v4_vision_config);
       } else {
-        vision_tower =
-            vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+        vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
+        vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
+        // QUANT-QWEN38-27B-GGUF-ARM (#821): the projector's own accounting, and
+        // it runs BEFORE the read, so a file this reader would only partly
+        // consume costs a message rather than a silently incomplete tower.
+        vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
+                                          params.mmproj_path);
+        // #607 L3, the THIRD production tower load, and the one the first cut of
+        // this row missed. It is a tower like the other two: `--mmproj` names a
+        // projector, this reads every one of its tensors into owned host f32, and
+        // the engine holds them for the process lifetime. So
+        // `--language-model-only` zeroed every limit, refused every image request,
+        // AND STILL PAID FOR THE PROJECTOR — the exact L2 failure this row exists
+        // to close, surviving on the one architecture nothing was looking at.
+        //
+        // Gated on the same predicate and the same modality set as the two
+        // safetensors sites ({"image","video"} — interfaces.py:293 and
+        // qwen3_vl.py:1747), because this projector IS the Qwen3-VL tower, read
+        // out of a `clip` GGUF instead of out of the model's own shards. `image:
+        // 0` alone must therefore not skip it here either.
+        //
+        // ONLY THE READ IS CONDITIONAL. `GgufFile::Open`, both refusals and
+        // `ClipMmprojVisionConfig` above still run: that is the construct half of
+        // construct-without-initialise (utils.py:762), so the geometry resolves
+        // either way and a `--mmproj` this build cannot load is still refused by
+        // name rather than accepted in silence at zero limits. What stops is the
+        // storage — and with it the reader's own missing-tensor refusals, which is
+        // the mirror of `StageMissingLayer` keeping a skipped stage out of the
+        // loader's key accounting (utils.py:693-695).
+        //
+        // `vision_tower` stays nullopt, which is already a supported engine state:
+        // it is what every load that named no `--mmproj` produces.
+        if (vllm::SkipTowerForModalities(&params.multimodal, {"image", "video"})) {
+          mmproj_tower_skipped = true;
+        } else {
+          vision_tower =
+              vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+        }
       }
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
@@ -3084,6 +3114,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // (see `gguf_device`).
     ModelSource gguf_source = ModelSource::FromGguf(gguf, gguf_device);
     gguf_source.multimodal = &params.multimodal;
+    // MODEL-MM-deepseek-v4 W4 (#2411): hand the projector to the architecture's
+    // own loader. Null for every other arm, and `ModelRegistry::Load` refuses a
+    // non-null one whose registration does not declare `consumes_mmproj`, so a
+    // DeepSeek projector named beside another family's language file costs a
+    // message rather than a tower-free engine that answers images as text.
+    gguf_source.mmproj = deepseek_v4_mmproj;
+    if (deepseek_v4_mmproj != nullptr) {
+      gguf_source.mmproj_path = params.mmproj_path;
+    }
     const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
     ReportLoadPhase("weights", SecondsSince(t_gguf_weights));

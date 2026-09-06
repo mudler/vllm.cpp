@@ -931,4 +931,25 @@ void RefuseUnaccountedDeepSeekV4ClipMmproj(
                "runs and is wrong");
 }
 
+void RefuseDeepSeekV4ClipMmprojArm(const GgufFile& gguf, const std::string& path,
+                                   multimodal::DeepSeekV4VisionConfig* config) {
+  VT_CHECK(config != nullptr,
+           "RefuseDeepSeekV4ClipMmprojArm: `config` returns the resolved "
+           "geometry and must not be null");
+  // ORDER IS THE POINT OF THIS FUNCTION, and the header says why. The
+  // unsupported-arm refusal speaks first, so a correctly converted FUSED-qkv
+  // projector is told this build does not implement its arm rather than being
+  // blamed for carrying tensors this reader never reads.
+  RefuseUnsupportedDeepSeekV4ClipMmproj(gguf, path);
+  *config = DeepSeekV4ClipMmprojVisionConfig(gguf);
+  RefuseUnaccountedDeepSeekV4ClipMmproj(gguf, *config, path);
+}
+
+DeepSeekV4ClipMmproj LoadDeepSeekV4ClipMmprojArm(
+    const GgufFile& gguf, const std::string& path,
+    multimodal::DeepSeekV4VisionConfig* config) {
+  RefuseDeepSeekV4ClipMmprojArm(gguf, path, config);
+  return LoadDeepSeekV4VisionFromClipMmproj(gguf, *config);
+}
+
 }  // namespace vllm

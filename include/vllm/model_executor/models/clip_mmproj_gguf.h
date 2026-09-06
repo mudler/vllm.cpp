@@ -331,4 +331,34 @@ void RefuseUnaccountedDeepSeekV4ClipMmproj(
     const GgufFile& gguf, const multimodal::DeepSeekV4VisionConfig& cfg,
     const std::string& path);
 
+// THE `deepseek4v` ARM OF `--mmproj`, in the ONE order its two refusals may run
+// in (row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` W4, issue #2411).
+//
+// The four calls above are separable, and until W4 nothing but a test ran them
+// together, so nothing held the order. Reversed, a projector converted by the
+// pinned oracle's OWN `convert_hf_to_gguf.py` -- which emits the FUSED
+// `v.blk.{bid}.attn_qkv` this build does not implement -- is told it "carries
+// tensors we never read", because the fused names are not in the enumerated
+// set. That file is CORRECT and this build is the one with the gap, so the
+// unsupported-arm refusal has to speak first.
+//
+// Keeping the order in one function is what stops a second caller from getting
+// it wrong. The production loader calls THIS, not the four parts.
+//
+// `config` receives the geometry the read resolved, so a caller that needs it
+// afterwards does not resolve it a second time.
+void RefuseDeepSeekV4ClipMmprojArm(const GgufFile& gguf, const std::string& path,
+                                   multimodal::DeepSeekV4VisionConfig* config);
+
+// The same arm, followed by the read. `LoadDeepseekV4ForCausalLM` calls this,
+// because the tower belongs on the model rather than on the engine; the loader
+// calls the refusal half above FIRST, before the tokenizer and every weight
+// byte, so a projector this build cannot load costs a message rather than a
+// 91 GiB map followed by one. Running the refusals twice is a second pass over
+// metadata and tensor NAMES and reads no weight, which is the price of keeping
+// the order in one function instead of writing it out at each call site.
+DeepSeekV4ClipMmproj LoadDeepSeekV4ClipMmprojArm(
+    const GgufFile& gguf, const std::string& path,
+    multimodal::DeepSeekV4VisionConfig* config);
+
 }  // namespace vllm

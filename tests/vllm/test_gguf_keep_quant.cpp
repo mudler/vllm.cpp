@@ -274,15 +274,17 @@ TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #
   CHECK(!pol.keep_f16);
 }
 
-TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decodes (KEEPQUANT W2)") {
+TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decodes (KEEPQUANT W3)") {
   // The P150 is discrete with no CPU fallback tier, so the same #523 shape as
   // ROCm applies: the TT arm may admit only what tenstorrent_ops.cpp has a
-  // registered decode for. W2 registers Q4_K (MatmulBTQuantKernel, decoding
-  // through the W1 bit-exact chain); Q5_K/Q6_K/Q8_0 are owed by the row's W4
-  // and MUST keep the pre-existing expand-bf16 residency until their kernels
-  // land — admitting one early throws at first forward with the model
-  // resident. This is the mutation red made structural: a reviewer who
-  // widens the TT arm past the registered set reds this case.
+  // registered decode for. W1 registered the Q4_K decode, W2 its dot; W3
+  // generalizes the decode chain to Q5_K/Q6_K/Q8_0 (the q4km vehicle's actual
+  // histogram: token_embd Q6_K, attn_qkv/ssm_out Q5_K, ssm_alpha/ssm_beta
+  // Q8_0) and the arm widens to exactly those four IN THE SAME CHANGE — the
+  // routing test still reds any widening PAST the registered set: kQ4_0 has
+  // no TT arm at all, and kQ2_K/kQ3_K stay owed. Admitting an encoding
+  // without its kernel throws at first forward with the model resident, the
+  // exact failure this predicate exists to prevent.
   const std::vector<int64_t> shape = {4, 256};  // [out, in]: whole blocks
   const auto route = [&](uint32_t ty) {
     return RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/true,
@@ -291,9 +293,9 @@ TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decod
                            vt::DeviceType::kTENSTORRENT);
   };
   CHECK(route(kQ4_K) == GgufResidency::kKeepQuant);
-  CHECK(route(kQ8_0) == GgufResidency::kExpandBf16);  // owed W4
-  CHECK(route(kQ5_K) == GgufResidency::kExpandBf16);  // owed W4
-  CHECK(route(kQ6_K) == GgufResidency::kExpandBf16);  // owed W4
+  CHECK(route(kQ8_0) == GgufResidency::kKeepQuant);  // W3 decode set
+  CHECK(route(kQ5_K) == GgufResidency::kKeepQuant);  // W3 decode set
+  CHECK(route(kQ6_K) == GgufResidency::kKeepQuant);  // W3 decode set
   CHECK(route(kQ4_0) == GgufResidency::kExpandBf16);  // no TT arm at all
   CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);
   CHECK(route(kQ3_K) == GgufResidency::kExpandBf16);

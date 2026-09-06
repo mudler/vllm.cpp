@@ -142,15 +142,21 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
              dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
     case vt::DeviceType::kTENSTORRENT:
-      // KEEPQUANT W2: the P150 is discrete with no CPU fallback tier, so this
+      // KEEPQUANT W3: the P150 is discrete with no CPU fallback tier, so this
       // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a
-      // registered decode for — MatmulBTQuantKernel implements Q4_K (through
-      // the W1 bit-exact DecodeQ4KBlocksF32 chain). Q5_K/Q6_K/Q8_0 are the
-      // row's W4; admitting them here before their kernels land throws at
-      // first forward with the model resident, which is the exact failure
-      // this predicate exists to prevent. tests/vllm/test_gguf_keep_quant.cpp
-      // pins the set; widening the arm without widening the kernel reds it.
-      return dt == vt::DType::kQ4_K;
+      // registered decode for — MatmulBTQuantKernel decodes Q4_K/Q5_K/Q6_K/
+      // Q8_0 through the bit-exact DecodeKeepQuantBlocksF32 chains, staged as
+      // the per-weight resident i32 word shadow. The vehicle's own histogram
+      // (the q4km artifact: token_embd Q6_K, attn_qkv/ssm_out Q5_K,
+      // ssm_alpha/ssm_beta Q8_0) is what pulled Q5_K/Q6_K/Q8_0 from W4 into
+      // W3 — kernels and predicate widened IN THE SAME CHANGE. kQ4_0 has no
+      // TT arm at all and kQ2_K/kQ3_K stay owed; admitting an encoding
+      // without its kernel throws at first forward with the model resident,
+      // the exact failure this predicate exists to prevent.
+      // tests/vllm/test_gguf_keep_quant.cpp pins the set; widening the arm
+      // without widening the kernel reds it.
+      return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
+             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.

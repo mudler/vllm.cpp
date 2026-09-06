@@ -728,6 +728,31 @@ TEST_CASE("DeepSeek-V4 aligner emits merged cells in llama.cpp row-major order")
 // pinned `apply_rotary` widens q and k before multiplying by its f32 cos/sin
 // table and narrows once afterward. The RoPE cos/sin cache itself is f32 for the
 // same reason and lives in the geometry cache, not in this per-call list.
+//
+// THE RECORDED LIST ALONE IS A HAND-MAINTAINED MIRROR, and a fresh review proved
+// it cannot see the defect it was written for. `RecordScratch` is called by hand
+// at each allocation site, so a buffer that calls it is described and a buffer
+// that does not is invisible: the review hoisted an f32 attention buffer and
+// round-tripped the attention output through `CastF32`/`CastBf16` -- identical
+// values, twice the bytes on the model path -- WITHOUT a `RecordScratch` call,
+// and the whole suite stayed green at 15 of 15 cases and 7407 of 7407
+// assertions. `f32_entries == 2` counts recorded entries only, and the pool
+// slope case below measures traffic per layer, which a hoisted buffer does not
+// change.
+//
+// So the list is bounded by something the code cannot drift from: the BYTES the
+// pool hands this forward. Every `DBuf` in the forward comes from
+// `vllm::Pool(backend)`, recorded or not, so one Forward from a drained pool
+// prices the whole model path in one number. Measured on this tree at this
+// fixture, 13 driver allocations totalling 2680 class-rounded bytes; under the
+// review's mutation, 14 and 3000. The bound is stated as a CAP rather than an
+// equality because a pool block is class-rounded and an unrelated backend may
+// serve the same forward from fewer blocks, while every way of widening the
+// model path can only push it up.
+//
+// If this cap reds, the forward's scratch footprint changed. Find which buffer
+// and why before touching the number: re-baselining it is how the mirror above
+// stopped measuring anything.
 TEST_CASE("DeepSeek-V4 vision keeps the model path bf16 except the rotary scratch") {
   Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   Queue queue = backend.CreateQueue();
@@ -743,7 +768,14 @@ TEST_CASE("DeepSeek-V4 vision keeps the model path bf16 except the rotary scratc
   std::vector<vllm::multimodal::DeepSeekV4VisionScratchDType> scratch;
   DeepSeekV4VisionCapture capture;
   capture.scratch_dtypes = &scratch;
+
+  // Drain AFTER the weights are staged so the reading covers the forward only,
+  // exactly as the pool-slope case below does.
+  vllm::Pool(backend).Drain(backend);
+  const auto pool_before = vllm::Pool(backend).stats();
   model.Forward(queue, output, patches, 2, 5, &capture);
+  backend.Synchronize(queue);
+  const auto pool_after = vllm::Pool(backend).stats();
 
   const std::vector<std::pair<std::string, DType>> expected = {
       {"vision.hidden_state", DType::kBF16},
@@ -770,10 +802,18 @@ TEST_CASE("DeepSeek-V4 vision keeps the model path bf16 except the rotary scratc
     CHECK(scratch[i].dtype == expected[i].second);
     if (scratch[i].dtype == DType::kF32) ++f32_entries;
   }
-  // Stated from the other end so a NEW f32 buffer cannot be added silently:
-  // exactly two, and both are the rotary pair.
+  // Stated from the other end: exactly two recorded f32 entries, and both are
+  // the rotary pair. This holds the list it can see; the cap below is what holds
+  // the buffers it cannot.
   CHECK(f32_entries == 2);
   CHECK(model.config().compute_dtype == DType::kBF16);
+
+  // One Forward, priced in driver allocations and in bytes. See the header.
+  constexpr uint64_t kForwardDriverAllocations = 13;
+  constexpr size_t kForwardPoolBytes = 2680;
+  CHECK(pool_after.misses - pool_before.misses <= kForwardDriverAllocations);
+  CHECK(pool_after.retained_bytes - pool_before.retained_bytes <=
+        kForwardPoolBytes);
   backend.DestroyQueue(queue);
 }
 

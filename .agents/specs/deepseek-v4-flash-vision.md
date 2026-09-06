@@ -1074,6 +1074,37 @@ allocation order, through a capture field production never sets, and the test
 asserts the exact sequence and the count of f32 entries. The two f32 entries are
 the rotary pair and keep their reason.
 
+**That recorded list is a hand-maintained mirror, and on its own it does NOT
+hold the guarantee `34f175fb4` claimed for it.** SUPERSEDES that commit's "a new
+wide buffer cannot be added without the case failing", which is withdrawn:
+`RecordScratch` is called by hand at each allocation site, so a buffer that does
+not call it is invisible to the list. A fresh review hoisted an f32 attention
+buffer and round-tripped the attention output through `CastF32`/`CastBf16` --
+identical values, twice the bytes on the model path -- with no `RecordScratch`
+call, and the whole suite stayed green at 15 of 15 cases and 7407 of 7407
+assertions. `f32_entries == 2` counts recorded entries only; the pool-slope case
+measures traffic per layer, which a hoisted buffer does not change; and
+`at_deep.misses == at_shallow.misses` is an equality across depths that a
+constant +1 satisfies. Reproduced here rather than taken from the report.
+
+The list is now bounded by something the code cannot drift from: the bytes the
+pool hands one Forward. Every `DBuf` in the forward draws from
+`vllm::Pool(backend)` whether or not anything records it, so one Forward from a
+drained pool prices the whole model path in two numbers. Measured on this tree at
+fixture 0, deterministic over three runs and at both depths: 13 driver
+allocations totalling 2680 class-rounded bytes. Under the review's mutation, 14
+and 3000, and 3000 - 2680 = 320 is exactly the [10, 8] f32 buffer it added. The
+gate is a CAP rather than an equality, because a pool block is class-rounded and
+another backend may serve the same forward from fewer blocks, while every way of
+widening the model path can only push it up. Red before: the mutation is green on
+the whole suite and now reds both assertions at `14 <= 13` and `3000 <= 2680`.
+Green after: 15 of 15 cases and 7409 of 7409 assertions with the tree restored
+and verified by SHA-256.
+
+What the cap does NOT see is a new buffer the pool serves from a block that was
+already free, which adds no driver allocation and no retained bytes. That is
+narrower than the withdrawn claim and is stated rather than assumed.
+
 For the per-layer scratch the review proposed bounding pool `misses` after a
 single Forward independently of depth. That bound is true but CANNOT see the
 defect, and this is measured rather than argued. One Forward from a drained

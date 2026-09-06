@@ -18,7 +18,8 @@
 // value here is a guess dressed as a decision.
 #include "vllm/platforms/interface.h"
 
-#include <cstddef>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "vt/backend.h"
@@ -88,13 +89,45 @@ class RocmPlatform final : public Platform {
   // supports_fp8() stays false: gfx942/gfx950 have hardware fp8 and rocm.py lists
   //   "fp8" in supported_quantization (rocm.py:457-467), but we have no ROCm fp8
   //   kernel, and this predicate gates a fused path that would then not exist.
-  // support_static_graph_mode() stays false: the vt::Backend hipGraph capture
-  //   seam is implemented as of BACKEND-ROCM W1 (rocm_backend.hip; see
-  //   .agents/specs/rocm-decode-graph.md) and the address-baking concern that
-  //   used to justify leaving this false is now an assertion, not a worry —
-  //   the mutate-src-then-replay test step fails if replay ever returns a
-  //   snapshot. This flag still stays false because flipping it to engage a
-  //   real model's decode-graph path is W2, not W1.
+  // GFX1100-TG200 (T2b): support_static_graph_mode() is now TRUE. The W1 note
+  //   below recorded the two conditions for this flip: the vt::Backend hipGraph
+  //   capture seam is implemented (rocm_backend.hip; BeginCapture/EndCaptureGraph/
+  //   ReplayGraph mirror cuda_backend.cu call for call, and the mutate-src-then-
+  //   replay test asserts replay never returns a snapshot), and a real model's
+  //   decode-graph path had to be exercised. The Qwen3_5 dense decode driver
+  //   (Qwen3_5DenseDecodeGraph) gates on this predicate plus SupportsGraphCapture()
+  //   plus VLLM_CPP_CUDAGRAPH; with all three true it captures the uniform decode
+  //   step per padded batch size and replays it. The keep-quant scratch pool is
+  //   already capture-safe (hipMallocAsync, stream-ordered, never freed).
+  //   The flip is PER-ARCH OPT-IN: static_graph_requires_opt_in() below returns
+  //   false only on gfx1100 (the evidence arch) so the decode-graph gate engages
+  //   there and stays eager everywhere else. See
+  //   .agents/specs/gfx1100-tg200-t2b-static-graph-opt-in.md.
+  bool support_static_graph_mode() const override { return true; }
+  // GFX1100-TG200 (T2b): per-arch opt-in, mirroring #2910's Tenstorrent pattern.
+  //   The decode-graph gate in qwen3_5_dense.cpp is:
+  //     support_static_graph_mode() && !static_graph_requires_opt_in()
+  //   so returning false here admits capture and returning true keeps it eager.
+  //   gfx1100 (RX 7900 XTX, RDNA3) is the evidence arch — its captured arm has
+  //   committed A/B evidence (docs/bench-evidence/gfx1100-tg200-t2b-20260823.md).
+  //   Every other ROCm arch (gfx1151, gfx1103, gfx1200, gfx1201) returns true
+  //   until it carries its own captured-arm evidence. The arch is read through
+  //   the HIP-free vt::rocm::DeviceArchName(0) probe (same prefix-match
+  //   discipline GcnArchNameIsGfx12PrefillWmma uses in rocm_arch.h); an empty
+  //   string — no device present — does not match and degrades to opt-in (eager),
+  //   the conservative answer.
+  bool static_graph_requires_opt_in() const override {
+    const std::string arch = vt::rocm::DeviceArchName(0);
+    return !IsGfx1100(arch);
+  }
+  // Architecture-aware overload: ROCm's evidence dimension is the GPU arch, not
+  //   the model family (unlike Tenstorrent, whose DecodeCaptureDefaultArch
+  //   scopes by model architecture). So this delegates to the no-arg overload.
+  //   A future arch that needs per-model scoping can override this independently.
+  bool static_graph_requires_opt_in(
+      const std::vector<std::string>& /*architectures*/) const override {
+    return static_graph_requires_opt_in();
+  }
   // needs_weight_staging() stays false: this is the memory-model POLICY that
   //   selects the FULLY-OPTIMIZED device-resident forward (indexed GDN state
   //   I/O with no op-registration fallback for a couple of its consumers,
@@ -164,6 +197,19 @@ class RocmPlatform final : public Platform {
   }
 
  private:
+  // True iff `arch` is the gfx1100 gcnArchName prefix (e.g. "gfx1100" or
+  // "gfx1100:sramecc+:xnack-"). Prefix, not substring: after the six-char stem
+  // the next character must be end-of-string or a non-digit, so "gfx11000" does
+  // not match. Same discipline as GcnArchNameIsGfx12PrefillWmma (rocm_arch.h).
+  static bool IsGfx1100(std::string_view arch) {
+    constexpr std::string_view kStem = "gfx1100";
+    if (arch.size() < kStem.size()) return false;
+    if (arch.substr(0, kStem.size()) != kStem) return false;
+    if (arch.size() == kStem.size()) return true;
+    const char c = arch[kStem.size()];
+    return c < '0' || c > '9';
+  }
+
   size_t device_memory_total_bytes_ = 0;
 };
 

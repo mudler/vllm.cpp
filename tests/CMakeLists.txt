@@ -2659,6 +2659,12 @@ vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # the multiply, matching the CPU oracle RoundThrough and upstream vLLM silu_kernel.
 # Self-skipping without a ROCm device, mirroring test_rocm_backend.cpp guard.
 vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp)
+# KERNEL-QUANT-CIQ-GEMM-ROCM: the ROCm keep-quant GEMM (kROCM provider for
+# kMatmulBTQuant/kMatmulBTQuantGrouped). Gates the device dequant-in-kernel dot
+# against the CPU keep-quant oracle + an f64 dequant reference on the ten
+# Q8_K-family encodings. Skips coherently with no AMD GPU.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
@@ -2673,6 +2679,14 @@ else()
     vllm::vllm vllm_test_main)
 endif()
 vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
+# GFX1100-TG200-T2b: ROCm decode-graph capture through ModelRegistry::Forward.
+# Self-skips without a ROCm device (vt::rocm::DeviceAvailable()) and on non-
+# gfx1100 arches (per-arch opt-in keeps the path eager). On gfx1100 it enters
+# the production forward and exercises the captured decode-graph path.
+vllm_cpp_add_test(test_rocm_decode_graph_forward
+  vllm/models/test_rocm_decode_graph_forward.cpp)
+target_include_directories(test_rocm_decode_graph_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)

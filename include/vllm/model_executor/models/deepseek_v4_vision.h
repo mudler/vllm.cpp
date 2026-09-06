@@ -88,10 +88,22 @@ struct DeepSeekV4VisionCapture {
   vt::Tensor* aligner_gelu = nullptr;           // [aligned_rows, output]
 
   // Non-null: the forward appends one entry per internal scratch buffer it
-  // allocates, in allocation order, so a test can assert the memory format of
-  // the model path. The vision stage CLEARS it and the aligner stage APPENDS,
-  // so a whole Forward records both stages as one sequence and an aligner call
-  // on its own adds to whatever the caller's vector already holds.
+  // allocates, so a test can assert the memory format of the model path. The
+  // vision stage CLEARS it and the aligner stage APPENDS, so a whole Forward
+  // records both stages as one sequence and an aligner call on its own adds to
+  // whatever the caller's vector already holds.
+  //
+  // The sequence is allocation order WITHIN each stage. `Forward`'s own
+  // `vision` buffer is allocated before either stage but recorded between them,
+  // because the vision stage's clear would otherwise erase it.
+  //
+  // THIS LIST IS A DECLARATION, NOT A MEASUREMENT. `RecordScratch` is called by
+  // hand at each allocation site, so a buffer that does not call it is invisible
+  // here: a review added a hoisted f32 buffer with no call and every assertion
+  // over this list stayed green. What bounds the buffers the list cannot see is
+  // the pool byte cap in `test_deepseek_v4_vision.cpp`, which prices one Forward
+  // in driver allocations and bytes that no call site can bypass. Read the two
+  // together; neither is sufficient alone.
   std::vector<DeepSeekV4VisionScratchDType>* scratch_dtypes = nullptr;
 };
 

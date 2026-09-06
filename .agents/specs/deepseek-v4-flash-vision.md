@@ -1134,6 +1134,18 @@ What the cap does NOT see is a new buffer the pool serves from a block that was
 already free, which adds no driver allocation and no retained bytes. That is
 narrower than the withdrawn claim and is stated rather than assumed.
 
+A second review found the specific buffer the list had always missed:
+`DeepSeekV4Vision::Forward`'s own `vision` DBuf, the tower output it hands to
+the aligner. Widening it was already caught, by the shape and dtype check
+`VisionForward` runs on the tensor it is passed, so nothing was unguarded; but
+the capture struct said the list held one entry per internal scratch buffer and
+it did not. It is now recorded as `forward.vision`, BETWEEN the two stages
+rather than first, because the vision stage is what clears the list and a record
+ahead of it would be erased. Deleting that one call reds the case on
+`REQUIRE(scratch.size() == expected.size())`. The struct's comment now says the
+list is a declaration rather than a measurement, and points at the pool cap for
+the buffers a declaration cannot cover.
+
 For the per-layer scratch the review proposed bounding pool `misses` after a
 single Forward independently of depth. That bound is true but CANNOT see the
 defect, and this is measured rather than argued. One Forward from a drained

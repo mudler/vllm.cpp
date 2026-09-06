@@ -788,6 +788,9 @@ TEST_CASE("DeepSeek-V4 vision keeps the model path bf16 except the rotary scratc
       {"vision.rope_query_f32", DType::kF32},
       {"vision.rope_key_f32", DType::kF32},
       {"vision.mlp_gate_up_activated", DType::kBF16},
+      // `Forward`'s own buffer, recorded between the stages. See the capture
+      // struct's comment for why it is not first.
+      {"forward.vision", DType::kBF16},
       {"aligner.padded", DType::kBF16},
       {"aligner.unfolded", DType::kBF16},
       {"aligner.hidden_state", DType::kBF16},

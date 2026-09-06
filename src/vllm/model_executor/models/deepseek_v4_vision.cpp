@@ -823,6 +823,14 @@ void DeepSeekV4Vision::Forward(Queue& queue, Tensor& output,
   Dev device{impl_->backend(), queue};
   DBuf vision(device, config.compute_dtype, {tokens, config.hidden_size});
   impl_->VisionForward(queue, vision.t(), patches, height, width, capture);
+  // RECORDED AFTER THE VISION STAGE, not before it. This buffer is allocated
+  // first, but the vision stage is what CLEARS the list, so a record here would
+  // be erased; a review found it as the one scratch buffer the list never
+  // described. Widening it is caught either way, by the `Tensor& output` shape
+  // and dtype check `VisionForward` runs on it, but the list said it described
+  // every buffer and it did not. It sits between the two stages in the sequence,
+  // which is also where it sits in the dataflow.
+  RecordScratch(capture, "forward.vision", vision.t());
   impl_->AlignerForward(queue, output, vision.t(), height, width, capture);
 }
 

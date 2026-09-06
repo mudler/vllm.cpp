@@ -807,15 +807,86 @@ above as its red-before input.
   deliberately: the first is a parity-gate tap and the second is a host oracle
   for one, so neither is a capability a user arrives at. `VisionForward` and
   `AlignerForward` are reached through `Forward`, which composes them.
-- W1 is PARTLY reached by W4, and the half that is not is named here.
-  `BuildDeepSeekV4ImageBlock` is reached: `EncodeMmDeepseekV4ForCausalLM`
-  recomputes the block from the feature's own offset and grid, which is how the
-  encoder emits one row per sentinel token. `EncodeDeepSeekV4Messages`,
-  `ParseDeepSeekV4TaggedText`, `DeepSeekV4ImageProcessor::ProcessImage` and
-  `PrepareDeepSeekV4Inputs` are STILL unreached: they belong to the REQUEST
-  path, and nothing between an HTTP body and `MultiModalInputs` calls them yet.
-  W5 wires the runner, public ABI and OpenAI server for row
-  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`; issue #2411 tracks it.
+- **CLOSED BY W5, except one function.** W1's request path is reached.
+  `MakeDeepSeekV4ChatSeam` is registered for `DeepseekV4ForCausalLM` in the
+  per-architecture multimodal chat registry, so `InstallMultiModalChatSeam` --
+  the ONE production caller of `set_multimodal_chat_fn`, reached from
+  `server_main.cpp` and now from `vllm_chat` -- builds it, and its chat function
+  calls `EncodeDeepSeekV4Messages`, `DeepSeekV4ImageProcessor::ProcessImage`,
+  `DeepSeekV4ImageProcessor::HashImage` and `PrepareDeepSeekV4Inputs` on every
+  image request. `BuildDeepSeekV4ImageBlock` was already reached by W4.
+
+  `ParseDeepSeekV4TaggedText` is STILL UNREACHED, and deliberately. It converts
+  the compact `<image>path</image>` syntax into content blocks, where `path` is
+  a FILESYSTEM PATH the encoder would then be asked to open. Wiring that into a
+  chat body would let a request name a local file, which is a different feature
+  with a different threat model from an inline `data:` URI, and this wave did
+  not add it. Owed by issue #2411 and row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`.
+
+- **THE MULTIMODAL CHAT PATH IGNORES `--chat-template` ON THIS ARCHITECTURE.**
+  The other two registered seams inject a marker string and render through
+  `ctx.prompt_fn`, the server's Jinja template. This one calls the pinned
+  `encode_messages` port instead, because `encoding_dsv4.py` is where this
+  model's prompt is defined and its image handling is inseparable from the rest
+  of it: the placeholder replaces the content block in place, a text block that
+  already carries the placeholder is refused there, tool results are sorted and
+  merged around it, and the thinking-mode elision decides which turns survive to
+  carry it. The TEXT path still renders through the server's template, so a
+  conversation carrying both kinds of turn can be templated two ways. Reconciling
+  them is owed by issue #2411.
+
+- **THE PNG/JPEG CODEC AND THE `http(s)` FETCH ARE STILL NOT IMPLEMENTED**, and
+  W5 refused them rather than vendoring a decoder. The codec is the LIBRARY's --
+  `oai::DefaultImageCodec`, consumed by three architectures and now by the C ABI
+  -- so implementing it inside a model row would land a cross-model capability
+  under a model row. What W5 did change is the STATUS a user meets on the
+  DeepSeek path: `DefaultImageCodec` and `DecodeDataUri` throw
+  `std::runtime_error`, which `api_server.cpp:373` maps to HTTP 500
+  "InternalServerError", so a `data:image/png;base64,...` body read as a server
+  fault. The DeepSeek seam re-throws them as `InputValidationError`, which maps
+  to 400 with each residual's own message intact. **The Qwen3-VL and dots3-note
+  seams still answer 500 for the same body**, which is a defect this wave found
+  and did not widen its scope to fix; it needs an issue of its own and is owed
+  by issue #2411 until one exists.
+
+- **IMAGE PREFILL IS NOT ATOMIC AT THE SCHEDULER, and the step is refused
+  instead.** The spec's data flow requires an image span to fall inside one
+  prefill chunk. `Scheduler::try_schedule_encoder_inputs` can do that -- it
+  rolls a step back to before an item when
+  `SchedulerConfig::disable_chunked_mm_input` is set -- but that flag defaults
+  to false and NOTHING in this tree can turn it on: no command-line flag, no
+  `include/vllm.h` field, and no per-architecture channel through which a model
+  could ask for it. Adding one is a shared scheduler-policy seam rather than a
+  model change. Until it lands, `DeepseekV4ImageSpans` refuses by name any step
+  whose media rows are not all inside complete blocks, which W5 extended to the
+  INTERIOR chunk (see the W5 evidence below). Owed by issue #2411 and row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`.
+
+- **THE SERVED PATH CANNOT GENERATE ON A CPU BUILD, and a TEXT request on the
+  synthetic fixture is UNSTABLE.** Two separate facts, measured together while
+  gating W5's server surface.
+
+  `DeepseekV4Model::ForwardDevice` is what the runner's gather-logits path
+  reaches for EVERY request on this architecture, and a CPU build carries no V4
+  device kernels, so every served request -- text or image -- is refused by name
+  at `deepseek_v4.cpp:4345`. That refusal is W5's own reachability evidence at
+  the server surface, because nothing short of the registered forward can
+  produce it, and serving this architecture on a device is W7-CUDA's.
+
+  Separately, a TEXT request on the synthetic `deepseek4` GGUF is unstable: the
+  same binary segfaulted in `InputBatch::add_request` on three of six runs and
+  otherwise died in `GPUModelRunner::gather_block_table`, at a one-token prompt
+  as readily as at a 260-token one. The multimodal request reached the forward
+  on eight runs of eight. Nothing in W5 touches that path, and the case does not
+  gate on it. Two further engine conditions had to be pinned for the fixture to
+  load at all and each is a gap rather than a preference: the file carries no
+  `deepseek4.context_length`, so the engine resolves `max_model_len = 0` and
+  `InputBatch`'s per-request token row has no width (a SIGSEGV, not an error);
+  and prefix caching must be off, because this architecture's KV topology gives
+  the block pool a hash-block size that differs from its block size and
+  `BlockPool::cache_full_blocks` refuses that pair by name. All of it is owed by
+  issue #2411.
 - **CLOSED BY W4.** The W3A `deepseek4v` mmproj reader is reached.
   `src/vllm/entrypoints/model_loader.cpp` branches on `clip.projector_type` and
   calls `RefuseDeepSeekV4ClipMmprojArm` before the tokenizer, and
@@ -872,6 +943,101 @@ above as its red-before input.
   the gate does not cover. Widening the fixture is owed by issue #2411 and W3;
   it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
   test uses, so it is not made inside a W3A repair.
+
+### W5 evidence — the request path, and what each mutation proved
+
+W5 makes a USER able to send an image. Five production call sites carry it, and
+each is proved by deleting or inverting it. Every mutation ran in a scratch copy
+and the tree was restored byte-for-byte and verified with `sha256sum -c`.
+
+THE CHAIN, from the entry point down:
+
+1. `LoadedEngine::FromModelDir` loads the language `.gguf` and the `--mmproj`
+   second file (the W4 chain);
+2. `InstallMultiModalChatSeam` -- the ONE production caller of
+   `set_multimodal_chat_fn`, reached from `server_main.cpp` and, since W5, from
+   `EnsureChatServing` on the `vllm_chat` path -- resolves the architecture in
+   `MultiModalChatRegistry` and builds `MakeDeepSeekV4ChatSeam`;
+3. `OpenAIServingChat::create_chat_completion` calls the installed seam, which
+   runs `EncodeDeepSeekV4Messages`, `DeepSeekV4ImageProcessor::ProcessImage`,
+   `HashImage` and `PrepareDeepSeekV4Inputs`;
+4. the engine's `generate(MultiModalInputs, ...)` overload carries the features
+   onto the request, and the runner reaches `ModelRegistry::EncodeMm`,
+   `EmbedMm` and `Forward`.
+
+| Mutation | Result |
+|---|---|
+| `feature.mm_hash = item.content_hash` (Qwen3-VL's content-only key) | RED, 2 assertions: one image at two offsets got ONE key |
+| the three chunk-atomicity predicates back to their pre-W5 silence | RED, the forward THREW NOTHING and the two unit cases did not throw |
+| the codec catch re-throwing `std::runtime_error` | RED, 3 assertions: the refusals reached the client as 500 |
+| `REGISTER_VLLM_MM_CHAT` repointed at an architecture nothing loads | RED, 14 assertions across every case in the suite |
+| the pinned C-ABI contract case, before its own rewrite | RED, `REQUIRE( st == VLLM_OK )` -- the ABI now refuses by name |
+
+The RED-BEFORE for the seam itself was a compile failure naming the three
+surfaces the wave adds: `oai::DefaultImageCodec`,
+`MultiModalChatContext::config` and `MultiModalChatContext::mmproj_path`.
+
+WHAT THE ORDER CASE MEASURES, because a count would not. Two images with
+DIFFERENT grids (10x10 aligner cells against 14x14), DIFFERENT content, and TEXT
+between them. A swap changes both span lengths, both keys, and the five tokens
+between the spans; a fixture with two identical images could express none of the
+three, and `build_image_block`'s `compress_pad = 3 - offset % 4` means the two
+lengths differ at the two offsets even for one image.
+
+THREE DEFECTS FOUND WHILE GATING, each invisible in production:
+
+1. **Every feature carried an empty `mm_hash`.** The scheduler's per-step dedup,
+   the `EncoderCacheManager` and the runner's `encoder_cache_` are all keyed on
+   that string alone, so every DeepSeek image in the process was the same image:
+   a second placeholder never ran the tower and was filled with the first
+   image's rows. Nothing raises. The key is now the shared hasher's digest over
+   the raw bytes PLUS the grid and the block's leading compression padding,
+   because the encoder output is a function of `(content, grid, offset mod 4)`
+   and a content-only key would splice a block of the wrong length.
+2. **An interior prefill chunk returned zero spans.** W4 refused a chunk with a
+   start and no end, and one with an end and no start; a chunk cut from the
+   MIDDLE of a block carries neither. The visible-row rule then fell back to the
+   ordinary sliding window over image rows AND the paged arm's refusal, keyed on
+   a non-empty span list, did not fire, while the routing bias still applied
+   because it reads the identifiers. The rule is now accounting over every media
+   row, and it had to allow the leading `compress_pad` rows, which sit BEFORE
+   the start identifier -- the first version refused every correct prompt and
+   the existing W4 cases caught it.
+3. **A PNG or `http(s)` image reached the client as HTTP 500.** The codec and
+   the data-URI decoder throw `std::runtime_error`, which `api_server.cpp:373`
+   maps to "InternalServerError". The DeepSeek seam re-throws them as
+   `InputValidationError`. The other two seams still answer 500, which `## Owed`
+   records.
+
+TWO SEAM FIELDS WERE ADDED, because `MultiModalChatContext` could not represent
+a two-file GGUF vehicle. `config` is the engine's RESOLVED model config, since
+`config_path` names no file for a `.gguf` and this processor is keyed on
+`vocab_size` -- it spells every image position `vocab_size + type`, so a guessed
+default would put the sentinels inside the vocabulary. `mmproj_path` is the
+second file, and it is the only thing at install time that can say whether the
+vision half arrived, because `DeepseekV4ForCausalLM` names both the text
+checkpoint and the Flash-Vision one. Without it a tower-free load refuses inside
+`encode_mm`, which runs in the engine's busy loop: that stops `AsyncLLM` and
+500s every LATER request, text ones included.
+
+### W5 gate totals
+
+On a Release CPU build with `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON`:
+
+| Suite | Cases | Assertions | Was |
+|---|---|---|---|
+| `test_deepseek_v4_mm_chat` (new) | 7 | 643 | -- |
+| `test_deepseek_v4_image_processor` | 23 | 128 | 20 / 112 |
+| `test_deepseek_v4_dsa` | 19 | 109 | 19 / 106 |
+| `test_deepseek_v4_mm_reach` | 14 | 110 | 13 / 79 |
+| `test_capi` | 69 | 685 | 69 / 676 |
+
+`ctest -R 'deepseek_v4|clip_mmproj_gguf' -E cuda` is 25 of 25, one more suite
+than W4's 24. `ctest -R 'capi|chat_mm|api_server|serving|model_registry|
+model_loader' -E cuda` is 11 of 11, which is where the Qwen3-VL and dots3-note
+seams are held byte-unchanged: `test_chat_mm` 11/126, `test_openai_api_server_
+mm_forward` 9/73, `test_openai_api_server_dots3_mm_forward` 28/16467 and
+`test_openai_serving` 48/1365 all keep their exact counts.
 
 ### W4 evidence — stage 4, the vision routing bias
 
@@ -1123,7 +1289,36 @@ the row that owns the wiring and issue #2411.
 
 ## Now
 
-`ACTIVE`. W1, W2, W3 and W4 have landed on the row branch.
+`ACTIVE`. W1, W2, W3, W4 and W5 have landed on the row branch.
+
+W5 IS THE WAVE THAT MADE A USER ABLE TO SEND AN IMAGE. W4 made one reach
+`ModelRegistry::Forward`; every seam above it was still unwired, and
+`MultiModalChatRegistry::Find("DeepseekV4ForCausalLM")` was null, so the
+server's install answered every image request for this architecture with a
+REFUSING seam. `src/vllm/entrypoints/openai/mm_chat_deepseek_v4.cpp` registers
+the factory, and its chat function runs the pinned `encode_messages` port, the
+W1 image processor and `PrepareDeepSeekV4Inputs` on every image request.
+Several interleaved images are served in source order with the ceiling coming
+from `MultiModalConfig`. `vllm_chat` installs the same seam, so the capability
+is on `include/vllm.h` and the server is a client of it rather than the only
+door.
+
+Three defects were found and fixed on the way, each of which would have been
+invisible in production. Every feature carried an EMPTY `mm_hash`, which the
+scheduler and both encoder caches key on, so a second image in one request
+never ran the tower and was filled with the first one's rows. An INTERIOR
+prefill chunk of an image block carried neither structural identifier, so
+`DeepseekV4ImageSpans` returned zero spans and the step was served from the
+ordinary sliding window with the paged-arm refusal unarmed. And a PNG or
+`http(s)` image reached the client as HTTP 500 rather than 400.
+
+WHAT W5 DID NOT DO. `ParseDeepSeekV4TaggedText` is still unreached, image
+prefill is still not atomic at the scheduler, the container codec is still
+refused rather than implemented, and no served request can GENERATE on a CPU
+build because the runner's gather-logits path reaches
+`DeepseekV4Model::ForwardDevice`. All four are named under `## Owed` above.
+No real artifact has been read or run: W6 owns the first load and generation,
+and W7 owns the device paths.
 
 W4 IS THE WAVE THAT MADE THE ROW REACHABLE. An image now travels from
 `--mmproj` through `ModelSource::mmproj` into `LoadDeepseekV4ForCausalLM`, which
@@ -1135,12 +1330,11 @@ original spec missed are implemented with it: the vision routing bias is
 selected PER TOKEN, with the argument for that divergence recorded above, and an
 image span attends across itself while the window still clips below its start.
 
-WHAT W4 DID NOT DO. The REQUEST path is still unwired -- nothing between an HTTP
-body and `MultiModalInputs` calls the W1 encoder or processor -- and W5 owns it
-together with the runner and the public ABI. The paged attention arms and the
-two device routers refuse an image step by name rather than serving it wrongly;
-both are listed under `## Owed`. No real artifact has been read or run: W6 owns
-the first load and generation, and W7 owns the device paths.
+WHAT W4 DID NOT DO, AND W5 DID. The REQUEST path was unwired -- nothing between
+an HTTP body and `MultiModalInputs` called the W1 encoder or processor -- and
+W5 owns the wiring; see `## Now` above. The paged attention arms and the two
+device routers refuse an image step by name rather than serving it wrongly;
+both are listed under `## Owed`.
 
 ### W1 evidence
 

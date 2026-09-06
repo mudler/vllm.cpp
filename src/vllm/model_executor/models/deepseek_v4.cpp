@@ -4124,6 +4124,45 @@ std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
                " is not closed inside this step. An image block must be "
                "scheduled whole (.agents/specs/deepseek-v4-flash-vision.md, "
                "issue #2411)");
+  // THE THIRD CHUNK SHAPE, and it used to return silently. The two checks above
+  // catch a chunk holding a START with no END and a chunk holding an END with
+  // no START. A chunk holding NEITHER -- the interior of a long image block --
+  // matched no branch at all: the loop found nothing, `open_at` stayed -1, and
+  // the function returned ZERO spans for a step whose every row is an image row.
+  //
+  // What that costs is not an exception, it is silence. With no span the
+  // visible-row rule falls back to the ordinary sliding window OVER IMAGE ROWS,
+  // and the paged arm's refusal keys on a non-empty `image_spans` so it does not
+  // fire either. `media_rows > 0` still holds in `MoeBlock`, so the vision
+  // routing bias is still applied and the answer stays fluent. That is the same
+  // failure the other two refuse, minus every signal that it happened.
+  //
+  // It is not hypothetical: `SchedulerConfig::disable_chunked_mm_input` defaults
+  // to FALSE and `gather_mm_embeddings` handles a partial span, so the request
+  // path W5 is wiring can produce exactly this step. This is defence in depth
+  // behind whatever the scheduler decides -- if image prefill is made atomic
+  // there, this never fires; if it is not, this is the only thing between a user
+  // and a half-visible image.
+  //
+  // THE CONDITION IS "no span at all", not "every image row is inside a span".
+  // `BuildDeepSeekV4ImageBlock` writes `compress_pad` PAD rows BEFORE the start
+  // marker, so a perfectly ordinary whole block carries image identifiers
+  // outside every span it opens, and the stricter reading refuses the step this
+  // suite's own reachability cases drive.
+  if (spans.empty()) {
+    for (int64_t t = 0; t < static_cast<int64_t>(token_ids.size()); ++t) {
+      VT_CHECK(token_ids[static_cast<size_t>(t)] < vocab_size,
+               "deepseek-v4 image span: this step carries the image identifier " +
+                   std::to_string(token_ids[static_cast<size_t>(t)]) + " at row " +
+                   std::to_string(t) +
+                   " and NO image-start or image-end marker, so it opened no span "
+                   "at all. That is the interior of an image block cut out of its "
+                   "own prefill chunk: it would be served with the ordinary "
+                   "sliding window over image rows and would answer fluently. An "
+                   "image block must be scheduled whole "
+                   "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
+    }
+  }
   return spans;
 }
 

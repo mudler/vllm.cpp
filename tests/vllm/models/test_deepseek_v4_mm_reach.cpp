@@ -988,6 +988,125 @@ TEST_CASE("REACH: a row early in the image span attends a row after it") {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// (10b) A CHUNK CARRYING THE INTERIOR OF AN IMAGE BLOCK IS REFUSED, at the
+// forward.
+//
+// `DeepseekV4ImageSpans` refused two of the three chunk shapes and returned
+// SILENTLY on the third. A chunk holding a START with no END, and one holding
+// an END with no START, each threw. A chunk holding NEITHER -- the middle rows
+// of a long image block -- opened no span, closed none, and produced an empty
+// list for a step whose every row is an image row.
+//
+// The consequence is not an exception, it is silence: with no span the
+// visible-row rule falls back to the ordinary sliding window OVER IMAGE ROWS,
+// and the paged refusal keys on a non-empty span list so it does not fire
+// either, while `media_rows > 0` still applies the vision routing bias. The
+// answer stays fluent and half the image is invisible.
+//
+// It is reachable from the request path W5 is wiring:
+// `SchedulerConfig::disable_chunked_mm_input` defaults to FALSE and
+// `gather_mm_embeddings` handles a partial span. This case drives the shape
+// through `ModelRegistry::Forward` rather than through the helper, because
+// `test_deepseek_v4_dsa` already holds the helper and what is owed here is that
+// a served step meets the refusal.
+TEST_CASE("REACH: a chunk holding only the INTERIOR of an image block is refused") {
+  auto loaded = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                    /*with_mmproj=*/true);
+  const DeepSeekV4VisionConfig vcfg =
+      vllm::DeepSeekV4ClipMmprojVisionConfig(*loaded->proj_gguf);
+  const auto image = MakeImage(vcfg);
+  const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
+      {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
+      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
+      *loaded->model, loaded->config, queue, mm.mm_features[0]);
+
+  // THE CHUNK: the rows strictly BETWEEN the two markers, which is exactly what
+  // a prefill split inside the block hands the model. The markers are found
+  // rather than assumed to be first and last, because
+  // `BuildDeepSeekV4ImageBlock` writes `compress_pad` PAD rows ahead of the
+  // start marker -- so "drop the first row" would leave the marker in and this
+  // case would read the OTHER refusal.
+  const int64_t block_begin = mm.mm_features[0].offset;
+  const int64_t block_len = mm.mm_features[0].length;
+  const int32_t start_id = static_cast<int32_t>(
+      kVocab + static_cast<int64_t>(vllm::multimodal::kImageStart));
+  const int32_t end_id = static_cast<int32_t>(
+      kVocab + static_cast<int64_t>(vllm::multimodal::kImageEnd));
+  int64_t start_at = -1, end_at = -1;
+  for (int64_t i = 0; i < block_len; ++i) {
+    const int32_t id = mm.prompt_token_ids[static_cast<size_t>(block_begin + i)];
+    if (id == start_id) start_at = block_begin + i;
+    if (id == end_id) end_at = block_begin + i;
+  }
+  REQUIRE(start_at >= 0);
+  REQUIRE(end_at > start_at + 1);
+  const int64_t chunk_begin = start_at + 1;
+  const int64_t chunk = end_at - chunk_begin;
+  std::vector<int32_t> ids(
+      mm.prompt_token_ids.begin() + static_cast<long>(chunk_begin),
+      mm.prompt_token_ids.begin() + static_cast<long>(chunk_begin + chunk));
+  for (const int32_t id : ids) {
+    REQUIRE(id >= static_cast<int32_t>(kVocab));
+    REQUIRE(id != start_id);
+    REQUIRE(id != end_id);
+  }
+
+  // Its embeddings, taken from the encoder rows that belong to those positions.
+  const std::vector<char> is_mm(static_cast<size_t>(chunk), 1);
+  const vt::Tensor slice = vt::Tensor::Contiguous(
+      enc.embeds.Ptr<uint16_t>() + (chunk_begin - block_begin) * kH,
+      vt::DType::kBF16, queue.device, {chunk, kH});
+  const std::vector<vt::Tensor> slices{slice};
+  vllm::MmEmbedInputs embed_in;
+  embed_in.token_ids = &ids;
+  embed_in.mm_embeds = &slices;
+  embed_in.is_mm_embed = &is_mm;
+  vllm::MmForwardBuffers buffers = vllm::ModelRegistry::EmbedMm(
+      *loaded->model, loaded->config, queue, embed_in);
+
+  std::vector<int32_t> positions(static_cast<size_t>(chunk));
+  for (int64_t t = 0; t < chunk; ++t) {
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(chunk_begin + t);
+  }
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(chunk - 1)};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+  vllm::ModelForwardInput in{.token_ids = ids,
+                             .positions = positions,
+                             .attn_meta = attn_meta,
+                             .gdn_meta = gdn_meta,
+                             .attn_kv = attn_kv,
+                             .gdn_state = gdn_state,
+                             .config = loaded->config,
+                             .queue = queue,
+                             .logits_indices = logits_indices,
+                             .num_reqs = 1};
+  in.gather_logits = false;
+  in.mm = buffers.mm;
+
+  std::string message;
+  try {
+    (void)vllm::ModelRegistry::Forward(*loaded->model, in);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  // It names the identifier, the row, the atomicity requirement and the issue.
+  CHECK(message.find("image span") != std::string::npos);
+  CHECK(message.find("opened no span") != std::string::npos);
+  CHECK(message.find("scheduled whole") != std::string::npos);
+  CHECK(message.find("2411") != std::string::npos);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // (11) THE WINDOW ITSELF, at the forward.
 //
 // The image-span rule is an exemption FROM the sliding window, so the window

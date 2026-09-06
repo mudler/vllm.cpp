@@ -4,6 +4,8 @@
 #include "vllm/entrypoints/openai/chat_mm.h"
 
 #include <array>
+#include <cmath>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <optional>
@@ -184,6 +186,34 @@ multimodal::MultiModalInputs RouteImageRgb(
     out.mm_features.push_back(std::move(spec));
   }
   return out;
+}
+
+ImageCodecFn DefaultImageCodec() {
+  return [](const DecodedMedia& media) -> DecodedImageRgb {
+    // Raw-RGB passthrough (image/x-raw-rgb): the single-sequence e2e / gate
+    // fixture format. A square raw-RGB payload is decoded directly; any
+    // container format (PNG/JPEG) is the NAMED codec residual.
+    if (media.media_type == "image/x-raw-rgb") {
+      const std::size_t n = media.bytes.size();
+      const std::size_t px = n / 3;
+      const auto side = static_cast<int64_t>(
+          std::llround(std::sqrt(static_cast<double>(px))));
+      if (side <= 0 ||
+          static_cast<std::size_t>(side) * static_cast<std::size_t>(side) * 3 !=
+              n) {
+        throw std::runtime_error(
+            "image/x-raw-rgb payload is not a square HxWx3 buffer");
+      }
+      DecodedImageRgb out;
+      out.rgb = media.bytes;
+      out.height = side;
+      out.width = side;
+      return out;
+    }
+    throw std::runtime_error(
+        "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
+        "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
+  };
 }
 
 std::string ImagePlaceholderString() {

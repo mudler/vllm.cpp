@@ -2442,6 +2442,13 @@ if(VLLM_CPP_SERVER)
   # added tokens are dots3-note's own image markers).
   vllm_cpp_add_test(test_openai_api_server_dots3_mm_forward
     vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp)
+  # MODEL-MM-deepseek-v4 W5 (#2411): the REQUEST path for the third multimodal
+  # architecture. Its own target for the reason the two above have one: a
+  # different tokenizer fixture (one whose added tokens are the pinned DeepSeek
+  # chat template's markers and the `<|deepseek_image|>` placeholder) and a
+  # different processor.
+  vllm_cpp_add_test(test_deepseek_v4_mm_chat
+    vllm/entrypoints/openai/test_deepseek_v4_mm_chat.cpp)
   target_compile_definitions(test_openai_api_server_dots3_mm_forward PRIVATE
     DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
   # The tiny-checkpoint fixture header lives beside the model gates, and

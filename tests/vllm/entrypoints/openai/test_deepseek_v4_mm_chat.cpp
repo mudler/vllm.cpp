@@ -1,0 +1,513 @@
+// MODEL-MM-deepseek-v4 W5 (#2411) — CAN A USER SEND AN IMAGE?
+//
+// W4 made an image reach `ModelRegistry::Forward`. It entered through
+// `ModelRegistry::Load`, `EncodeMm`, `EmbedMm` and `Forward`, and every one of
+// those is a component seam: the REQUEST path above them was still unwired, and
+// the row's spec listed `EncodeDeepSeekV4Messages`,
+// `DeepSeekV4ImageProcessor::ProcessImage` and `PrepareDeepSeekV4Inputs` under
+// `## Owed` as reached by nothing.
+//
+// This suite enters through the two production surfaces a user actually arrives
+// at, and through nothing else:
+//
+//   `MultiModalChatRegistry::MakeSeam`   the per-architecture dispatch
+//   `InstallMultiModalChatSeam`          the ONE production install
+//                                        (`server_main.cpp`, `vllm_c.cpp`)
+//
+// It never calls `MakeDeepSeekV4ChatSeam` by name and never constructs
+// `DeepSeekV4ImageProcessor`. Where it needs to say what an answer SHOULD be it
+// builds an oracle, which is a different job: an oracle that agrees with the
+// production seam proves the seam ran the same composition, and an oracle that
+// IS the seam proves nothing.
+#include <doctest/doctest.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "vllm/config/multimodal.h"
+#include "vllm/entrypoints/openai/chat_mm.h"
+#include "vllm/entrypoints/openai/mm_chat_registry.h"
+#include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/multimodal/deepseek_v4_processor.h"
+#include "vllm/multimodal/hasher.h"
+#include "vllm/multimodal/inputs.h"
+#include "vllm/tokenizer/bpe.h"
+#include "vllm/tokenizer/tokenizer.h"
+#include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/engine/input_processor.h"  // InputValidationError
+
+namespace oai = vllm::entrypoints::openai;
+namespace mm = vllm::multimodal;
+
+namespace {
+
+using json = nlohmann::ordered_json;
+
+constexpr const char* kArch = "DeepseekV4ForCausalLM";
+
+// The architecture's own vocabulary size in this suite. The processor writes
+// `vocab_size + type` at every image position, so this number is what makes a
+// sentinel identifier OUT OF VOCABULARY, and the fixture tokenizer below is
+// built to exactly it.
+constexpr int32_t kVocabSize = 16;
+
+// ─── The tokenizer ──────────────────────────────────────────────────────────
+//
+// A real `vllm::tok::Tokenizer`, because the seam resolves the image
+// placeholder to an id BY STRING through the tokenizer it was handed, and the
+// whole claim "the marker this encoder emits is the id the expansion counts" is
+// only true if one object does both.
+//
+// The added tokens are the pinned DeepSeek chat template's own markers plus the
+// image placeholder. The plain vocabulary is three letters and the byte-level
+// newline, which is all the prompt text below needs; `\n\n` between content
+// blocks is `RenderContentBlocks`'s own separator, so it has to encode.
+constexpr int32_t kImageTokenId = 4;
+
+vllm::tok::Tokenizer BuildTokenizer() {
+  static int counter = 0;
+  const std::string path =
+      (std::filesystem::temp_directory_path() /
+       ("vllm_dsv4_mmchat_tok_" + std::to_string(counter++) + ".json"))
+          .string();
+  json doc;
+  doc["version"] = "1.0";
+  doc["added_tokens"] = json::array({
+      {{"id", 0}, {"content", "<｜begin▁of▁sentence｜>"}, {"special", true}},
+      {{"id", 1}, {"content", "<｜end▁of▁sentence｜>"}, {"special", true}},
+      {{"id", 2}, {"content", "<｜User｜>"}, {"special", true}},
+      {{"id", 3}, {"content", "<｜Assistant｜>"}, {"special", true}},
+      {{"id", kImageTokenId},
+       {"content", mm::kDeepSeekV4ImagePlaceholder},
+       {"special", true}},
+      {{"id", 5}, {"content", "</think>"}, {"special", true}},
+      {{"id", 6}, {"content", "<think>"}, {"special", true}},
+  });
+  doc["normalizer"] = nullptr;
+  doc["pre_tokenizer"] = {
+      {"type", "Sequence"},
+      {"pretokenizers",
+       json::array(
+           {{{"type", "Split"},
+             {"pattern",
+              {{"Regex",
+                R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"}}},
+             {"behavior", "Isolated"},
+             {"invert", false}},
+            {{"type", "ByteLevel"},
+             {"add_prefix_space", false},
+             {"trim_offsets", false},
+             {"use_regex", false}}})}};
+  json vocab = json::object();
+  vocab["a"] = 7;
+  vocab["b"] = 8;
+  vocab["c"] = 9;
+  vocab[vllm::tok::MapBytesToUnicode("\n")] = 10;
+  doc["model"] = {{"type", "BPE"},
+                  {"ignore_merges", false},
+                  {"vocab", vocab},
+                  {"merges", json::array()}};
+  std::ofstream(path, std::ios::binary) << doc.dump();
+  vllm::tok::Tokenizer tok = vllm::tok::Tokenizer::FromHfJson(path);
+  std::remove(path.c_str());
+  return tok;
+}
+
+const vllm::tok::Tokenizer& Tok() {
+  static const vllm::tok::Tokenizer t = BuildTokenizer();
+  return t;
+}
+
+// ─── The context the SERVER fills in ────────────────────────────────────────
+//
+// Field for field what `server_main.cpp` assigns, so a factory that reads
+// something the server does not supply fails here rather than in production.
+struct Ctx {
+  vllm::HfConfig config;
+  vllm::MultiModalConfig mm_config;
+  oai::MultiModalChatContext ctx;
+
+  explicit Ctx(bool with_mmproj = true) {
+    config.vocab_size = kVocabSize;
+    config.hidden_size = 32;
+    ctx.architecture = kArch;
+    ctx.model_dir = "/nonexistent/deepseek-v4-flash-vision";
+    ctx.config_path = ctx.model_dir + "/config.json";
+    ctx.served_model_name = "deepseek-v4-flash-vision";
+    ctx.tokenizer = &Tok();
+    // The server's chat renderer. This architecture does NOT use it (see the
+    // seam's own header for why), and a factory that silently started to would
+    // be caught by this: it throws.
+    ctx.prompt_fn = [](const std::vector<oai::ChatMessage>&, bool,
+                       const std::vector<oai::ChatCompletionToolsParam>&,
+                       const json&) -> std::string {
+      throw std::runtime_error(
+          "the DeepSeek-V4 seam must render with its own pinned encoder");
+    };
+    ctx.codec = oai::DefaultImageCodec();
+    ctx.config = &config;
+    ctx.mm_config = &mm_config;
+    if (with_mmproj) ctx.mmproj_path = "/nonexistent/mmproj-BF16.gguf";
+  }
+};
+
+// ─── Requests ───────────────────────────────────────────────────────────────
+
+oai::ChatContentPart TextPart(const std::string& text) {
+  oai::ChatContentPart p;
+  p.type = "text";
+  p.text = text;
+  return p;
+}
+
+// A raw-RGB data URI, which is the ONE container the server's codec decodes.
+// `side` is the square side; `seed` changes the bytes so two images are
+// distinguishable by content and not only by position.
+std::string RawRgbDataUri(int64_t side, int seed) {
+  static const char* kB64 =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::vector<uint8_t> rgb(static_cast<size_t>(side * side * 3));
+  for (size_t i = 0; i < rgb.size(); ++i) {
+    rgb[i] = static_cast<uint8_t>((i * 7 + static_cast<size_t>(seed) * 53) %
+                                  251);
+  }
+  std::string out;
+  for (size_t i = 0; i < rgb.size(); i += 3) {
+    const uint32_t v = (static_cast<uint32_t>(rgb[i]) << 16) |
+                       (i + 1 < rgb.size()
+                            ? static_cast<uint32_t>(rgb[i + 1]) << 8
+                            : 0U) |
+                       (i + 2 < rgb.size() ? static_cast<uint32_t>(rgb[i + 2])
+                                           : 0U);
+    out.push_back(kB64[(v >> 18) & 63]);
+    out.push_back(kB64[(v >> 12) & 63]);
+    out.push_back(i + 1 < rgb.size() ? kB64[(v >> 6) & 63] : '=');
+    out.push_back(i + 2 < rgb.size() ? kB64[v & 63] : '=');
+  }
+  return "data:image/x-raw-rgb;base64," + out;
+}
+
+oai::ChatContentPart ImagePart(int64_t side, int seed) {
+  oai::ChatContentPart p;
+  p.type = "image_url";
+  p.url = RawRgbDataUri(side, seed);
+  return p;
+}
+
+oai::ChatMessage UserWith(std::vector<oai::ChatContentPart> parts) {
+  oai::ChatMessage m;
+  m.role = "user";
+  m.content_parts = std::move(parts);
+  return m;
+}
+
+[[maybe_unused]] std::string Threw(const std::function<void()>& body) {
+  try {
+    body();
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return std::string();
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// (1) THE REGISTRATION. Before W5 `Find(kArch)` was null, so the server's
+//     install answered every DeepSeek image request with a REFUSING seam.
+// ---------------------------------------------------------------------------
+TEST_CASE("dsv4 mm chat: the architecture has a registered chat seam") {
+  const oai::MultiModalChatRegistration* reg =
+      oai::MultiModalChatRegistry::Find(kArch);
+  REQUIRE(reg != nullptr);
+  CHECK(reg->architecture == kArch);
+  CHECK(reg->make_seam != nullptr);
+
+  // Reached through the static library's --whole-archive, so a link that
+  // dropped the translation unit reads as an EMPTY registry rather than as a
+  // subtly wrong one.
+  const std::vector<std::string_view> archs =
+      oai::MultiModalChatRegistry::SupportedArchs();
+  CHECK(std::find(archs.begin(), archs.end(), std::string_view(kArch)) !=
+        archs.end());
+}
+
+// ---------------------------------------------------------------------------
+// (2) THE REQUEST PATH, entered through the registry's own dispatch.
+//
+//     Everything W1 landed and nothing reached is on this line: the pinned
+//     `encode_messages` renders the prompt and places the placeholder, the
+//     tokenizer resolves it to one id, `ProcessImage` preprocesses the bytes
+//     and `PrepareDeepSeekV4Inputs` expands the placeholder into the block of
+//     `vocab_size + type` sentinels the W4 forward consumes.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The processor's own geometry, so the oracle below is a statement about the
+// PINNED numbers rather than a copy of whatever the seam happened to build.
+// `min_pixels` is 384*384, so a smaller image is scaled UP to it; both sides
+// here are already at or above it and stay where they are.
+constexpr int64_t kSideA = 384;  // -> 392 padded -> 28x28 patches -> 10x10 cells
+constexpr int64_t kSideB = 560;  // -> 560        -> 40x40 patches -> 14x14 cells
+
+// The block one image occupies at a given prompt offset, computed from the
+// PINNED `build_image_block` rather than from the seam's answer.
+int64_t OracleBlockLength(int64_t n_llm, int64_t offset) {
+  return static_cast<int64_t>(
+      mm::BuildDeepSeekV4ImageBlock(n_llm, n_llm, offset).types.size());
+}
+
+std::vector<uint8_t> RawRgb(int64_t side, int seed) {
+  std::vector<uint8_t> rgb(static_cast<size_t>(side * side * 3));
+  for (size_t i = 0; i < rgb.size(); ++i) {
+    rgb[i] = static_cast<uint8_t>((i * 7 + static_cast<size_t>(seed) * 53) %
+                                  251);
+  }
+  return rgb;
+}
+
+}  // namespace
+
+TEST_CASE("dsv4 mm chat: one image reaches MultiModalInputs through the registry") {
+  Ctx c;
+  const oai::MultiModalChatSeam seam =
+      oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+  REQUIRE(seam.chat_fn);
+
+  // A text-only conversation NEVER enters the multimodal path, and the seam
+  // says so by declining. Without this the claim below could be satisfied by a
+  // seam that rewrote every request.
+  oai::ChatMessage text;
+  text.role = "user";
+  text.content = std::string("a");
+  CHECK_FALSE(seam.chat_fn({text}).has_value());
+
+  const std::optional<mm::MultiModalInputs> mm =
+      seam.chat_fn({UserWith({TextPart("a"), ImagePart(kSideA, 1)})});
+  REQUIRE(mm.has_value());
+  REQUIRE(mm->mm_features.size() == 1);
+
+  const mm::MultiModalFeatureSpec& f = mm->mm_features[0];
+  CHECK(f.modality == "image");
+  REQUIRE(f.data != nullptr);
+  // The PINNED preprocessor ran: 384 is already at `min_pixels`, so it pads to
+  // the next multiple of 14 and yields a 28x28 patch grid at a 3*14*14 feature
+  // width. A seam that skipped `ProcessImage` could not produce these.
+  CHECK(f.data->image_grid_thw == std::array<int64_t, 3>{1, 28, 28});
+  CHECK(f.data->num_patches == 28 * 28);
+  CHECK(f.data->patch_feature_dim == 3 * 14 * 14);
+
+  // The PINNED prompt encoder ran: `<bos><User>` then the joined content, so
+  // the placeholder sits after the leading text and the block replaces it in
+  // place. The oracle is `build_image_block` at the same offset.
+  CHECK(f.offset == 5);
+  CHECK(static_cast<int64_t>(f.length) == OracleBlockLength(10, 5));
+
+  // ...and the span really is out-of-vocabulary sentinel identifiers, which is
+  // the property `ForwardDeepseekV4ForCausalLM` depends on: a forward that
+  // ignored `inputs_embeds` refuses rather than answering.
+  for (int i = 0; i < f.length; ++i) {
+    const int32_t id = mm->prompt_token_ids[static_cast<size_t>(f.offset + i)];
+    CHECK(id >= kVocabSize);
+    CHECK(id < kVocabSize + 5);
+  }
+  // Everything outside the span is ordinary vocabulary, so the expansion did
+  // not smear over the prompt.
+  for (size_t i = 0; i < mm->prompt_token_ids.size(); ++i) {
+    if (static_cast<int>(i) >= f.offset &&
+        static_cast<int>(i) < f.offset + f.length) {
+      continue;
+    }
+    CHECK(mm->prompt_token_ids[i] < kVocabSize);
+  }
+  // The key, which the scheduler and both encoder caches are keyed on. It is
+  // the shared hasher's digest over the RAW bytes this request carried,
+  // namespaced by the served model name, and it is non-empty.
+  const std::vector<uint8_t> rgb = RawRgb(kSideA, 1);
+  const std::string content = mm::MultiModalHasher::HashImageRGB(
+      c.ctx.served_model_name, rgb.data(), kSideA, kSideA);
+  CHECK_FALSE(content.empty());
+  CHECK(f.mm_hash.rfind(content, 0) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// (3) TWO INTERLEAVED IMAGES, AND WHICH ONE LANDED WHERE.
+//
+//     The pinned encoder and the model author's own example both take several
+//     images in source order, so the count is the easy half. The half that
+//     matters is the ORDER: image 2 must land in the second placeholder, and a
+//     seam that swapped the two would still emit two features, two spans and
+//     two plausible blocks.
+//
+//     THREE THINGS MAKE A SWAP VISIBLE HERE, and one alone would not:
+//       * the two images have DIFFERENT GRIDS (10x10 cells against 14x14), so
+//         a swap changes both span LENGTHS;
+//       * they have DIFFERENT CONTENT, so a swap changes both KEYS;
+//       * they are separated by TEXT, so a swap that preserved the lengths
+//         would still move the text between them.
+//     A fixture with two identical images could express none of the three.
+// ---------------------------------------------------------------------------
+TEST_CASE("dsv4 mm chat: two interleaved images land in source order") {
+  Ctx c;
+  const oai::MultiModalChatSeam seam =
+      oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+  REQUIRE(seam.chat_fn);
+
+  // "a" <imgA> "b" <imgB> "c" -- `RenderContentBlocks` joins the blocks with
+  // "\n\n", so the rendered prompt is
+  //   <bos><User> a \n\n <img> \n\n b \n\n <img> \n\n c <Assistant></think>
+  // and the fixture tokenizer gives each of those exactly one id.
+  const std::optional<mm::MultiModalInputs> mm = seam.chat_fn(
+      {UserWith({TextPart("a"), ImagePart(kSideA, 1), TextPart("b"),
+                 ImagePart(kSideB, 2), TextPart("c")})});
+  REQUIRE(mm.has_value());
+  REQUIRE(mm->mm_features.size() == 2);
+
+  const mm::MultiModalFeatureSpec& f0 = mm->mm_features[0];
+  const mm::MultiModalFeatureSpec& f1 = mm->mm_features[1];
+
+  // THE PREMISE, asserted rather than assumed: the two images really are
+  // distinguishable. Without this the three claims below could all hold on a
+  // fixture where a swap is a no-op.
+  REQUIRE(f0.data != nullptr);
+  REQUIRE(f1.data != nullptr);
+  REQUIRE(f0.data->image_grid_thw != f1.data->image_grid_thw);
+  REQUIRE(f0.length != f1.length);
+  REQUIRE(f0.mm_hash != f1.mm_hash);
+
+  // (a) CONTENT. Feature 0 carries the bytes of the FIRST `image_url` part and
+  //     feature 1 the second, keyed by the shared hasher over the raw request
+  //     bytes. This is the assertion a swap fails first.
+  const std::vector<uint8_t> rgb_a = RawRgb(kSideA, 1);
+  const std::vector<uint8_t> rgb_b = RawRgb(kSideB, 2);
+  const std::string hash_a = mm::MultiModalHasher::HashImageRGB(
+      c.ctx.served_model_name, rgb_a.data(), kSideA, kSideA);
+  const std::string hash_b = mm::MultiModalHasher::HashImageRGB(
+      c.ctx.served_model_name, rgb_b.data(), kSideB, kSideB);
+  CHECK(f0.mm_hash.rfind(hash_a, 0) == 0);
+  CHECK(f1.mm_hash.rfind(hash_b, 0) == 0);
+
+  // (b) GEOMETRY. The first is the 384-wide image (28x28 patches, 10x10 cells)
+  //     and the second the 560-wide one (40x40 patches, 14x14 cells).
+  CHECK(f0.data->image_grid_thw == std::array<int64_t, 3>{1, 28, 28});
+  CHECK(f1.data->image_grid_thw == std::array<int64_t, 3>{1, 40, 40});
+
+  // (c) POSITION. The placeholders sit at prompt indices 5 and 11 --
+  //     `<bos> <User> a \n \n <img> \n \n b \n \n <img>` -- so the first span
+  //     opens at 5, and the second opens five ordinary tokens after the first
+  //     span closes. `build_image_block` at each offset is the oracle for both
+  //     lengths, and its answer differs at the two offsets because
+  //     `compress_pad` reads the start position.
+  CHECK(f0.offset == 5);
+  CHECK(static_cast<int64_t>(f0.length) == OracleBlockLength(10, 5));
+  const int second_offset = f0.offset + f0.length + 5;
+  CHECK(f1.offset == second_offset);
+  CHECK(static_cast<int64_t>(f1.length) ==
+        OracleBlockLength(14, second_offset));
+
+  // ...and the five tokens BETWEEN the two spans are the rendered text, in
+  // order: newline, newline, "b", newline, newline. A swap that happened to
+  // preserve the two lengths would still have to move these.
+  const std::vector<int32_t> between(
+      mm->prompt_token_ids.begin() + f0.offset + f0.length,
+      mm->prompt_token_ids.begin() + f1.offset);
+  CHECK(between == std::vector<int32_t>{10, 10, 8, 10, 10});
+
+  // Both spans are out-of-vocabulary sentinels and they do not overlap.
+  CHECK(f0.offset + f0.length <= f1.offset);
+  for (const mm::MultiModalFeatureSpec* f : {&f0, &f1}) {
+    for (int i = 0; i < f->length; ++i) {
+      CHECK(mm->prompt_token_ids[static_cast<size_t>(f->offset + i)] >=
+            kVocabSize);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// (4) THE CEILING COMES FROM `MultiModalConfig`, and this seam declares none.
+//
+//     `MakeQwen3VLImageChatFn` caps image at 1 because its body locates ONE
+//     part; the spec forbids a lower hard-coded ceiling here, so the honest
+//     number is "unlimited" and every limit a user meets is the engine's.
+// ---------------------------------------------------------------------------
+TEST_CASE("dsv4 mm chat: the image ceiling is the engine's, not this seam's") {
+  {
+    // The DEFAULT engine: no `--limit-mm-per-prompt`, so the fold leaves
+    // upstream's own per-modality default and three images are served.
+    Ctx c;
+    const oai::MultiModalChatSeam seam =
+        oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+    REQUIRE(seam.allowed_limits.count("image") == 1);
+    CHECK(seam.allowed_limits.at("image") > 1);
+    const std::optional<mm::MultiModalInputs> mm = seam.chat_fn(
+        {UserWith({ImagePart(kSideA, 1), TextPart("a"), ImagePart(kSideA, 2),
+                   TextPart("b"), ImagePart(kSideB, 3)})});
+    REQUIRE(mm.has_value());
+    CHECK(mm->mm_features.size() == 3);
+    // Three DISTINCT keys, so the scheduler runs the tower three times. Two of
+    // the three are the same GRID, which is exactly the pair a length check
+    // could not tell apart.
+    CHECK(mm->mm_features[0].mm_hash != mm->mm_features[1].mm_hash);
+    CHECK(mm->mm_features[1].mm_hash != mm->mm_features[2].mm_hash);
+    CHECK(mm->mm_features[0].mm_hash != mm->mm_features[2].mm_hash);
+  }
+  {
+    // `--limit-mm-per-prompt image=2`: the fold takes the engine's number and
+    // the third image is REFUSED with upstream's own message, as HTTP 400.
+    Ctx c;
+    c.mm_config.limit_per_prompt["image"] = 2;
+    const oai::MultiModalChatSeam seam =
+        oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+    CHECK(seam.allowed_limits.at("image") == 2);
+    const std::string what = Threw([&] {
+      (void)seam.chat_fn({UserWith({ImagePart(kSideA, 1), ImagePart(kSideA, 2),
+                                    ImagePart(kSideA, 3)})});
+    });
+    INFO("what: ", what);
+    CHECK(what.find("At most 2 image(s)") != std::string::npos);
+    // Two still pass, so the number is a LIMIT and not a refusal of the
+    // multi-image arm.
+    CHECK(seam.chat_fn({UserWith({ImagePart(kSideA, 1), ImagePart(kSideA, 2)})})
+              ->mm_features.size() == 2);
+  }
+  {
+    // `--language-model-only` drives every modality to 0, so the first image is
+    // refused before anything is decoded.
+    Ctx c;
+    c.mm_config.language_model_only = true;
+    const oai::MultiModalChatSeam seam =
+        oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+    CHECK(seam.allowed_limits.at("image") == 0);
+    const std::string what = Threw(
+        [&] { (void)seam.chat_fn({UserWith({ImagePart(kSideA, 1)})}); });
+    INFO("what: ", what);
+    CHECK(what.find("At most 0 image(s)") != std::string::npos);
+  }
+  {
+    // Every other modality is ABSENT from the declared map, which
+    // `context.py:414-415` reads as limit 0. DeepSeek-V4-Flash-Vision is an
+    // image-only model and `EncodeMmDeepseekV4ForCausalLM` refuses any other
+    // modality by name; this is the same statement one component earlier.
+    Ctx c;
+    const oai::MultiModalChatSeam seam =
+        oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+    CHECK(seam.allowed_limits.count("audio") == 0);
+    CHECK(seam.allowed_limits.count("video") == 0);
+    oai::ChatContentPart audio;
+    audio.type = "input_audio";
+    const std::string what =
+        Threw([&] { (void)seam.chat_fn({UserWith({audio})}); });
+    INFO("what: ", what);
+    CHECK(what.find("audio") != std::string::npos);
+  }
+}

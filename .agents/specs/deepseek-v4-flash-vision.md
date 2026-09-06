@@ -744,15 +744,14 @@ above as its red-before input.
   including what a per-token image row does about the hash layers the oracle skips
   wholesale.
 
-  **The refusal ORDER W4 must preserve.** `RefuseUnsupportedDeepSeekV4ClipMmproj`
-  runs BEFORE `RefuseUnaccountedDeepSeekV4ClipMmproj`, and today only
-  `ThrownBy` in `tests/vllm/models/test_deepseek_v4_mmproj.cpp` enforces that.
-  There is no production call site, so nothing makes W4 reproduce it. Reversed,
-  a correctly-converted fused-qkv projector -- which is what the pinned
-  `convert_hf_to_gguf.py` emits -- is told it "carries tensors we never read"
-  instead of being told this build does not implement its arm, which is exactly
-  the outcome the W3B refusal exists to prevent. W4 owns the call site and owes
-  this order.
+  **The refusal ORDER, CLOSED BY W4.** `RefuseDeepSeekV4ClipMmprojArm` holds it
+  in one function and `model_loader.cpp` calls that function rather than its
+  parts, so a second call site cannot get it wrong. The order is gated at the
+  production call site: `test_deepseek_v4_mm_reach` drives
+  `LoadedEngine::FromModelDir` with a FUSED-qkv projector -- the layout the
+  pinned `convert_hf_to_gguf.py` actually emits -- and asserts the message names
+  `attn_qkv` and issue #2411 rather than blaming the file for carrying tensors
+  the reader never reads. Swapping the two calls reddens it.
 - `scripts/check-dsv4-gguf-namemap.py` is owed the vision manifest. It generates
   1328 expected names and asserts exact set-equality against the TEXT artifact,
   so the 1371-name vision artifact fails it by construction and no gate covers

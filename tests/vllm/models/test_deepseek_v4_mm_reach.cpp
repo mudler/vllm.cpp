@@ -579,7 +579,45 @@ TEST_CASE("REACH: --mmproj sends a deepseek4v projector past the Qwen3-VL reader
   CHECK(unaccounted.find("tokenizer") == std::string::npos);
 }
 
-// (7) THE PROJECTOR REACHES THE MODEL'S OWN LOADER, and this is the case that
+// (7) THE REFUSAL ORDER, at the production call site.
+//
+// `RefuseUnsupportedDeepSeekV4ClipMmproj` must speak BEFORE
+// `RefuseUnaccountedDeepSeekV4ClipMmproj`, and until W4 nothing but a helper
+// inside the W3A suite ran the two together, so nothing held the order.
+//
+// The file that makes the order matter is not hypothetical. The pinned oracle's
+// own `convert_hf_to_gguf.py` emits the FUSED `v.blk.{bid}.attn_qkv` -- nothing
+// splits it for this family -- and this build does not implement that arm. Its
+// names are not in the enumerated set, so the unaccounted refusal fires on it
+// too. Reversed, a user with a CORRECTLY converted projector is told it
+// "carries tensors we never read" and re-converts a file that was already
+// right, which is exactly the outcome the W3B refusal exists to prevent.
+//
+// Swap the two calls in `RefuseDeepSeekV4ClipMmprojArm` and this case goes red.
+TEST_CASE("REACH: a FUSED-qkv projector is told the arm is missing, not that it is unaccounted") {
+  TempFile lang(BuildDeepseek4Gguf(/*vision=*/true, dsv4_lang_test::BiasWidths{},
+                                   /*vision_from=*/0, /*head_dim=*/512));
+  dsv4_mmproj_test::Options fused = ProjOptions();
+  fused.fused_qkv = true;
+  TempFile proj(dsv4_mmproj_test::Build(ProjDims(), fused));
+
+  vllm::entrypoints::EngineParams params;
+  params.mmproj_path = proj.path();
+  std::string message;
+  try {
+    vllm::entrypoints::LoadedEngine::FromModelDir(lang.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  // It names the LAYOUT this build does not implement...
+  CHECK(message.find("attn_qkv") != std::string::npos);
+  // ...and the issue that owes the arm, so the user does not re-convert.
+  CHECK(message.find("2411") != std::string::npos);
+  // ...and it is NOT the unaccounted-tensor refusal, which blames the file.
+  CHECK(message.find("NEVER reads") == std::string::npos);
+}
+
+// (8) THE PROJECTOR REACHES THE MODEL'S OWN LOADER, and this is the case that
 // reads the one line handing it down. `ModelSource::mmproj` is what
 // `LoadDeepseekV4ForCausalLM` opens, and it is set in `model_loader.cpp` after
 // the tokenizer -- so a fixture that stops AT the tokenizer, as every case

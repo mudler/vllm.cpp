@@ -915,13 +915,41 @@ above as its red-before input.
   the server surface, because nothing short of the registered forward can
   produce it, and serving this architecture on a device is W7-CUDA's.
 
-  Separately, a TEXT request on the synthetic `deepseek4` GGUF is unstable: the
-  same binary segfaulted in `InputBatch::add_request` on three of six runs and
+  Separately, a request on the synthetic `deepseek4` GGUF is unstable: the same
+  binary segfaulted in `InputBatch::add_request` on three of six runs and
   otherwise died in `GPUModelRunner::gather_block_table`, at a one-token prompt
-  as readily as at a 260-token one. The multimodal request reached the forward
-  on eight runs of eight. Nothing in W5 touches that path, and the case does not
-  gate on it. Two further engine conditions had to be pinned for the fixture to
-  load at all and each is a gap rather than a preference: the file carries no
+  as readily as at a 260-token one, and the case does not gate on the text
+  prompts. Both signatures are issue
+  [#3027](https://github.com/mudler/vllm.cpp/issues/3027).
+
+  **The `gather_block_table` signature is root-caused and repaired**, in the
+  W4/W5 reconciliation. `full_attn_group_id_` is a -1 sentinel meaning "this
+  model published no `kFullAttention` or `kMlaAttention` group", which is TRUE
+  OF THIS ARCHITECTURE ON EVERY REQUEST, and the full-attention gather passed it
+  straight to `MultiGroupBlockTable::operator[]`, which casts its index to
+  `size_t`. Every served DeepSeek-V4 step therefore read a `BlockTable` object
+  that does not exist, and the `max_num_blocks_per_req` it found decided the
+  step: a garbage zero gathered an empty table and the request went on to the
+  forward, a garbage negative made `num_reqs * cols` a ~1.8e19-element
+  allocation and the engine's busy loop died with `std::length_error`. The
+  outcome moved with the BINARY'S LAYOUT rather than with the request, which is
+  why the W5 measurement read eight of eight and the merged branch read zero of
+  five: merging W4 flipped it, and so did running one earlier case of the suite
+  first. `gather_block_table` now answers an out-of-range group with an empty
+  table, which is what `MakeCommonAttentionMetadata` is already written against
+  for the same sentinel, and is byte-neutral for every model that publishes a
+  full-attention group. Whether this architecture's group should be CLASSIFIED
+  as the target attention group is a different question, owed by row
+  `KV-DSV4-MULTICACHE` W3 (#2068).
+
+  **The `InputBatch::add_request` signature is not explained and not repaired.**
+  #3027 stays open for it. It also means W5's "the served image request reaches
+  `ModelRegistry::Forward`" evidence rested on an out-of-bounds read returning a
+  convenient zero; the claim itself survives, and is now deterministic, but it
+  was not measured until this repair.
+
+  Two further engine conditions had to be pinned for the fixture to load at all,
+  and each is a gap rather than a preference: the file carries no
   `deepseek4.context_length`, so the engine resolves `max_model_len = 0` and
   `InputBatch`'s per-request token row has no width (a SIGSEGV, not an error);
   and prefix caching must be off, because this architecture's KV topology gives
@@ -1011,6 +1039,7 @@ THE CHAIN, from the entry point down:
 | `feature.mm_hash = item.content_hash` (Qwen3-VL's content-only key) | RED, 2 assertions: one image at two offsets got ONE key |
 | the three chunk-atomicity predicates back to their pre-W5 silence | RED, the forward THREW NOTHING and the two unit cases did not throw |
 | the trailing `pad_run` rule deleted (W4/W5 reconciliation) | RED, 2 assertions: a step ending on the leading pads of the NEXT block was refused by NOTHING and returned an empty span list |
+| `gather_block_table` handed the -1 no-full-attention-group sentinel again | RED, 2 assertions: the served image request died in the engine loop with `std::length_error` instead of reaching the forward |
 | the codec catch re-throwing `std::runtime_error` | RED, 3 assertions: the refusals reached the client as 500 |
 | `REGISTER_VLLM_MM_CHAT` repointed at an architecture nothing loads | RED, 14 assertions across every case in the suite |
 | the pinned C-ABI contract case, before its own rewrite | RED, `REQUIRE( st == VLLM_OK )` -- the ABI now refuses by name |

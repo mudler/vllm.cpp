@@ -854,15 +854,30 @@ TEST_CASE("dsv4 mm chat: two images reach the server through the production inst
   //     A generated answer is therefore not available here, and the case
   //     upgrades itself to one the moment the engine can produce it.
   //
+  //     AND IT IS THE REGISTERED FORWARD IT STOPS AT ON EVERY RUN, which it
+  //     was not when this case first landed. Half of issue #3027 sat under this
+  //     assertion: `GPUModelRunner::gather_block_table` indexed
+  //     `MultiGroupBlockTable` with the -1 "this model published no
+  //     full-attention group" sentinel that this architecture carries on every
+  //     request, and the garbage row stride it read back decided whether the
+  //     step ran at all. A garbage zero gathered an empty table and the request
+  //     went on to the forward; a garbage negative made the gather a ~1.8e19
+  //     element allocation and the engine died with `std::length_error` before
+  //     any forward ran. Which one came up moved with the BINARY'S LAYOUT and
+  //     not with the request: merging W4 into this branch flipped it, and so
+  //     did running one earlier case of this suite ahead of this one. The
+  //     sentinel now means what it says, so the stop asserted below is the
+  //     seam's rather than the allocator's.
+  //
   //     ONLY THE IMAGE REQUEST IS DRIVEN. Earlier versions of this case also
   //     served a one-token and a 260-token TEXT prompt on their own engines,
-  //     to attribute the stop. Both are UNSTABLE on this synthetic checkpoint:
-  //     the same binary segfaults in `InputBatch::add_request` on roughly half
-  //     of its runs and otherwise dies in `GPUModelRunner::gather_block_table`,
-  //     while the multimodal request reaches the forward on every run of eight.
-  //     A flaky probe in a gate measures the scheduler rather than the seam, so
-  //     the text instability is recorded in the row's spec under `## Owed` with
-  //     that measurement instead of being asserted here.
+  //     to attribute the stop. Those stay UNSTABLE on this synthetic
+  //     checkpoint: the same binary segfaults in `InputBatch::add_request` on
+  //     roughly half of its runs, which is the OTHER half of #3027 and is
+  //     neither explained nor repaired here. A flaky probe in a gate measures
+  //     the scheduler rather than the seam, so the text instability is recorded
+  //     in the row's spec under `## Owed` with that measurement instead of
+  //     being asserted here.
   MESSAGE("image: " << (image_run.error.empty() ? std::string("served")
                                                 : image_run.error));
   if (image_run.error.empty()) {

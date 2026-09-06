@@ -68,13 +68,9 @@ Rewrite the SHARED body only: unswitch ActDT, vectorize loads (elem0 is a
 multiple of 256 → 16 B alignment guaranteed for bf16/f32), keep the amax scan
 in strict element order (first-occurrence lowest-index tie-break preserved
 exactly), quant pass element-independent, bsums integer-exact. Byte-exact vs
-CPU oracle asserted by the existing `tests/vt/test_rocm_quant_dot.cpp`.
-A fresh configure and build at source commit
-`09da0553c880a9233dc80aba26ae8aab97aaa825` recorded 841 assertions across
-19 cases. The earlier 132,094-assertion claim came from a stale ROCm 7.14-era
-binary whose test lattice no longer matched the source; it is historical
-provenance, not a current gate count. Expected: epilogue + standalone quant
-drop from ~50µs toward ~10µs ⇒ up to ~4.5 ms/tok.
+CPU oracle asserted by the existing `tests/vt/test_rocm_quant_dot.cpp`
+(132k assertions incl. tied-amax adversarial). Expected: epilogue + standalone
+quant drop from ~50µs toward ~10µs ⇒ up to ~4.5 ms/tok.
 
 ## Honest notes
 
@@ -112,120 +108,3 @@ Acceptance workload, only `VT_NORM_QUANT_FUSED` varied, other levers ON:
 New position: **~61.6 tok/s median** (16.2 ms/tok) against the 200 tok/s /
 5.00 ms/tok target. Next attribution re-take prices what the ~3 ms/tok of
 killed pathology left at the top.
-
-## T5a re-attribution and T5b — the attention fallback
-
-Fresh rocpd capture at a5bfddb0 (512 tokens): GPU busy 15.21 ms/tok.
-Top items: wvSplitKSml bf16 o_proj 2.31 (408 GB/s ≈ 68% of the ~598 GB/s
-board peak with the donor-tuned split-K kernel — recorded near-roofline, no
-ceiling declared); PagedAttnOnlineIf 2.20; KQuantGemvMmvq Li0 big-grid 1.81
-(194 GB/s effective); GdnScanK 1.45.
-
-The attention item was NOT a kernel deficiency but a ROUTING hole: the GGUF
-dense path feeds f32 queries, which excludes every bf16 decode kernel, and
-the f32-Q DecodeGqa arm (T3a) hard-required d == 256 while this model has
-d == 128. T5b (`5b71c8a4`) adds the EPL=4 instantiation behind the existing
-opt-in `VT_ATTN_DECODE_GQA4=1`. 276µs/call of serial per-key __syncthreads
-walk replaced by the warp-strided geometry.
-
-## T5b result — acceptance A/B, interleaved x5 pairs
-
-| Arm | warm runs | median |
-|---|---|---|
-| GQA4=1 | 69.851, 69.902, 67.660, 69.764, 69.780 | **69.780** |
-| GQA4 unset | 61.519, 61.468, 61.475, 61.441, 60.661 | 61.468 |
-
-ON wins all five pairs, **+13.5% median**. Near-tie adjudication: the ON
-arm's 256-token gate-prompt output is BYTE-IDENTICAL to the original
-pre-campaign baseline output (cmp over completion bodies) — zero tie flips
-on this workload despite the reduction-order change. Owed before any
-DEFAULT flip of `VT_ATTN_DECODE_GQA4`: the full teacher-forced logprob-band
-ceremony per `.agents/specs/rocm-m4-oracle.md` on a gate model; until then
-the flag rides the campaign config like its siblings.
-
-Pre-existing-failure note: `test_gguf_keep_quant` (7 cases) and one
-`test_backend_cross_device` case fail identically on the pristine head
-without T5b — native-build configuration issues owned separately from this
-lever.
-
-Position after T5b: **69.8 tok/s median** (14.3 ms/tok) vs the 200 tok/s /
-5.00 ms/tok target. Next budget: GemvMmvq weight-streaming efficiency,
-GdnScan latency, RmsNorm epilogue residue (~18µs × 65/tok).
-
-## T5c — nontemporal weight loads in KQuantGemvMmvqRow: CLOSED NEGATIVE
-
-Hypothesis: the donor wvSplitKSml streams weights with
-__builtin_nontemporal_load; the MMVQ row body's memcpy weight loads might
-gain the same way (weights stream once per token). Implementation touched
-only load policy (Wq/Wh/W0-W2 nontemporal; shared activation q8 temporal);
-bit-exact by construction, test_rocm_quant_dot 12/12·797 green.
-
-Acceptance window x5 (same config as T5b ON): 69.358, 69.247, 67.775,
-69.294, 69.218 → median **69.294** vs T5b's 69.780 — no win (-0.7%,
-cross-window noise at best). REVERTED (byte-restored via git checkout,
-rebuilt clean). The donor's policy does not transfer: the MMVQ row body is
-dp4a/reduction-latency bound, not L2-capacity bound. Next attack on this
-family would need a geometry change (row-per-wavefront coalesced ki walk),
-which is a rewrite, not a lever.
-
-## T6a result — cooperative GDN scan (VT_GDN_SCAN_COOP=1)
-
-Warp-per-row remap of GdnScanK (commit 640d9418): lanes walk ki coalesced,
-dots reduce through a fixed shfl_down tree, rows iterate warp-strided.
-Acceptance A/B interleaved x5:
-
-| Arm | warm runs | median |
-|---|---|---|
-| COOP=1 | 73.017, 73.061, 73.068, 71.863, 73.144 | **73.061** |
-| donor walk | 69.942, 66.846, 69.641, 69.823, 69.820 | 69.820 |
-
-COOP wins all five pairs, +4.6%. cross_device recurrence NMSE green under
-the flag (24/25; the one failure is the pre-existing native-build case).
-Near-tie adjudication: gate-prompt output diverges at char 204
-("Transformers process input..." vs baseline "it processes input...") — a
-greedy tie flip from the changed dot-reduction order; both streams are
-coherent analytic prose with identical structure. Full teacher-forced
-logprob-band ceremony owed before any default flip; until then the flag
-rides the campaign config.
-
-Position: **73.1 tok/s median** (13.7 ms/tok wall). Next budget:
-AttnQkNormRopeGateK (8 calls/tok @ 88us on one 256-thread block),
-RmsNormRow fused-epilogue residue (~18us x 65/tok), GemvMmvq geometry.
-
-## T6b result — cooperative attention preamble (VT_ATTN_PREAMBLE_COOP=1)
-
-Warp-per-item remap of AttnQkNormRopeGateK. Acceptance A/B interleaved x5:
-
-| Arm | warm runs | median |
-|---|---|---|
-| COOP=1 | 76.667, 76.595, 76.396, 76.334, 76.204 | **76.595** |
-| donor walk | 73.220, 73.196, 73.176, 73.022, 73.205 | 73.196 |
-
-ON wins all five pairs, +4.6%. cross_device green under the flag.
-Near-tie adjudication: output diverges from the T6a stream at char 285
-("...mechanism to weigh the import..." vs "...to capture long-ran...") —
-another greedy tie flip, coherent prose both sides. Teacher-forced
-ceremony remains owed before default flips of the three opt-in arms
-(GQA4 / GDN_SCAN_COOP / PREAMBLE_COOP).
-
-## Session-close attribution (T6b config, rocpd 512 tokens)
-
-GPU busy **12.13 ms/tok** (wall ~13.1 = 76.6 tok/s); dispatch gap ~1 ms.
-Next-session starting table:
-
-| Kernel | ms/tok | note |
-|---|---|---|
-| wvSplitKSml<1,bf16> o_proj | 2.30 | 408 GB/s of ~598 peak; donor-tuned; near-roofline |
-| KQuantGemvMmvqK Li0 big-grid | 1.81 | 56.8us/call; dp4a-tuned; needs GEOMETRY rewrite (coalesced ki walk) not a load-policy tweak |
-| RmsNormRowKernel fused | 1.18 | epilogue residue: nsb threads still serial-ish per row |
-| GdnScanCoopK | 0.78 | was 1.46 pre-T6a |
-| KQuantGemmK lm_head class | ~1.17 total | large-grid GEMMs |
-| GdnPostConvChunkedK | 0.65 | |
-| GemvMmvq other grids | ~1.48 | |
-| QuantizeQ8KK standalone | 0.53 | post-T5a |
-
-Session ledger: baseline 49.97 -> 76.60 tok/s median (+53%). Adopted:
-T5a shared-quant-body vectorization (+23%), T5b d128 f32-Q DecodeGqa arm
-(+13.5%), T6a cooperative GDN scan (+4.6%), T6b cooperative attn preamble
-(+4.6%). Closed negative: T5c MMVQ nontemporal loads (wash, reverted).
-Failed-attempt count against the goal's cap: 1 of 10.

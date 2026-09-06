@@ -5193,6 +5193,18 @@ void CastF16(Queue& q, Tensor& out, const Tensor& in) {
   reinterpret_cast<CastF16Fn>(GetOp(OpId::kCastF16, q.device.type))(q, out, in);
 }
 
+void PermuteVHeads(Queue& q, Tensor& out, const Tensor& in,
+                   int64_t T, int64_t num_k, int64_t rpk, int64_t dv) {
+  VT_CHECK(out.dtype == DType::kBF16 && in.dtype == DType::kBF16,
+           "permute_v_heads: both tensors must be bf16");
+  VT_CHECK(out.Numel() == in.Numel(),
+           "permute_v_heads: out/in must have the same element count");
+  VT_CHECK(out.device == q.device && in.device == q.device,
+           "permute_v_heads: device mismatch");
+  reinterpret_cast<PermuteVHeadsFn>(GetOp(OpId::kPermuteVHeads, q.device.type))(
+      q, out, in, T, num_k, rpk, dv);
+}
+
 void CastF32(Queue& q, Tensor& out, const Tensor& in) {
   VT_CHECK(out.dtype == DType::kF32, "cast_f32: out must be f32");
   VT_CHECK(in.dtype == DType::kBF16, "cast_f32: in must be bf16");

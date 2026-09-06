@@ -310,15 +310,24 @@ Two changes, two pull requests (developer decision 2026-09-06):
 **W4a — the 27B arm ([#3030](https://github.com/mudler/vllm.cpp/issues/3030)).**
 (1) Production residency flip: `MatmulBTQuantKernel` consumes the per-call
 on-core decode from the resident word shadow for {Q4_K,Q5_K,Q6_K,Q8_0}; the
-twin survives for the embedding gather only. Red-first: the 0.8B vehicle
-gate re-run under the flipped residency (the W3 gate stays green — the OOM
-it memorized was twin construction). (2) `kMatmulBTQuantGrouped` on
+twin survives where the operand is **threshold-class**: weights above 128M
+elements keep the memoized bf16 twin (embedding gather, logits-head-class
+weights), because a per-call decode transient costs ~16 B/elem peak against
+the twin's 2 B/elem permanent, and a head runs every step so per-step unpack
+compute is wasted. Wave-1 falsified the blanket flip on the 0.8B vehicle:
+the head is TIED ([248320,1024] Q6_K, 254,274,560 elems) and its per-call
+decode re-materializes the 4,068,474,880 B `ttnn::where`. Red-first: the
+0.8B vehicle gate re-run under the flipped residency (the W3 gate stays
+green — the OOM it memorized was twin construction, and under the threshold
+it stays so for the head). (2) `kMatmulBTQuantGrouped` on
 kTENSTORRENT beside the W3 dense decode chains, consuming the existing
 stacked tower. (3) MTP `blk.64.*` skip/refuse by name. (4) 27B e2e greedy
 near-tie gate, checkpoint-gated opt-in loud-skip (#2811 precedent), goldens
 vs the pinned llama.cpp b10451 oracle, 500-mnat band + 0 forward-divergent.
-(5) `docs/USAGE.md` pin in the same change. Memory axis recorded: ~16 GiB
-word shadows + 2.37 GiB embedding twin + activations on 32 GB.
+(5) `docs/USAGE.md` pin in the same change. Memory axis recorded on 27B:
+~16 GiB word shadows (all four encodings; 210/34-byte blocks pad to 53/9
+words) + 2.37 GiB embedding twin + 2.37 GiB output-head twin (threshold-
+class) + activations on 32 GB; the expert tower stays packed.
 
 **W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
 Quantized-domain integer vec_dot behind the same seam; profile-first
@@ -342,4 +351,8 @@ W3 EVIDENCE COMPLETE on the row branch (see `## Evidence`): capture dump x2
 byte-identity, staging counter 0, READY gate 16/16 PASS (11 strict / 5
 near-tie, 0 forward-divergent), backend proof 0 declines. W3 LANDED
 2026-09-06 (025c6ed90..f98b63867, #3028). W4 scope committed (see `## W4`,
-issues #3030, #3031); arm implementation not started.
+issues #3030, #3031). AMENDED 2026-09-06 (second): wave-1's blanket flip is
+falsified on the 0.8B vehicle — the tied Q6_K head's per-call decode
+re-materializes the 4 GB `ttnn::where` — so W4a(1) is threshold-class
+(twin above 128M elements, shadow decode below); wave-1b implements the
+threshold on top of wave-1's uncommitted red-first test, probes, and flip.

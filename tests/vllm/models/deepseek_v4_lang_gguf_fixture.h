@@ -149,7 +149,22 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
                                // absent key, which is what every suite before W4
                                // built and what keeps them byte-identical; the
                                // released artifact declares 128.
-                               int64_t sliding_window = 0) {
+                               int64_t sliding_window = 0,
+                               // `deepseek4.hash_layer_count`. The default is
+                               // the file every suite before this argument
+                               // built: one hash layer and two gated ones.
+                               //
+                               // A case passes `kLayers` to make EVERY layer a
+                               // hash layer, and that is the only shape in which
+                               // the router's `is_hash && !media` condition is
+                               // observable end to end. With a gated layer in
+                               // the file, an image row still reads the vision
+                               // bias THERE, so dropping `!media` moves the
+                               // logits by less than it changes and a
+                               // capability-level assertion cannot see it. With
+                               // every layer hashed, dropping `!media` means the
+                               // vision bias is never read at all.
+                               int64_t hash_layers = kHashLayers) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -169,7 +184,7 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
   b.AddKv(U32Kv(p + "expert_used_count", kUsed));
   b.AddKv(U32Kv(p + "expert_shared_count", 1));
   b.AddKv(U32Kv(p + "expert_feed_forward_length", kInter));
-  b.AddKv(U32Kv(p + "hash_layer_count", kHashLayers));
+  b.AddKv(U32Kv(p + "hash_layer_count", static_cast<uint32_t>(hash_layers)));
   if (sliding_window > 0) {
     b.AddKv(U32Kv(p + "attention.sliding_window",
                   static_cast<uint32_t>(sliding_window)));
@@ -241,7 +256,7 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
     q8(Blk(l, "ffn_gate_shexp.weight"), {kInter, kH});
     q8(Blk(l, "ffn_up_shexp.weight"), {kInter, kH});
     q8(Blk(l, "ffn_down_shexp.weight"), {kH, kInter});
-    if (l < kHashLayers) {
+    if (l < hash_layers) {
       b.AddTensor(Blk(l, "ffn_gate_tid2eid.weight"), GgmlDims({kVocab, kUsed}),
                   /*F32=*/0, F32Data(kVocab * kUsed, [](int64_t i) {
                     return static_cast<float>(i % kExperts);

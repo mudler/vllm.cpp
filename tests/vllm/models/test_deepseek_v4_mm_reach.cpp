@@ -935,6 +935,123 @@ TEST_CASE("REACH: the vision bias moves the image rows and leaves the text rows 
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// (9b) THE HASH-LAYER SKIP, at the forward.
+//
+// `deepseek_v4_moe.cpp` routes an image row on the vision bias and the learned
+// top-k EVEN ON A HASH LAYER, because that row has no token identifier worth
+// hashing. `test_deepseek_v4_moe` gates the condition at the router; nothing
+// gated it at a forward, and dropping `!media` left case (9) above GREEN even
+// though its language fixture has a hash layer and the forward runs it with
+// image rows.
+//
+// It stays green because case (9) has two GATED layers as well, and an image
+// row reads the vision bias on those whichever way the hash layer routes. So
+// `tail_moved > 0` survives, and `text_moved == 0` was never about this.
+// Meanwhile the failure is silent and plausible rather than loud: the hash route
+// is `hash_indices_table[(tok % vocab_size) * topk]`, so an image identifier
+// `vocab + type` wraps to `tid2eid[type]` -- in bounds, a real expert, and the
+// wrong one.
+//
+// THE FIXTURE IS THE WHOLE POINT HERE. Every layer of this file is a hash layer,
+// so there is no gated layer left to read the vision bias on an image row. Two
+// files differing in NOTHING but their `exp_probs_b_vl` values must still move
+// the logits of a row whose prefix contains the image span -- and under the
+// mutation they cannot, because the bias is then never read at all.
+TEST_CASE("REACH: an image row leaves the hash route on a file whose every layer hashes") {
+  const auto run = [&](float scale) {
+    auto loaded = std::make_unique<Loaded>();
+    loaded->lang = std::make_unique<TempFile>(BuildDeepseek4Gguf(
+        /*vision=*/true, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
+        /*head_dim=*/512, /*with_tokenizer=*/false, scale,
+        /*sliding_window=*/0, /*hash_layers=*/dsv4_lang_test::kLayers));
+    loaded->proj = std::make_unique<TempFile>(
+        dsv4_mmproj_test::Build(ProjDims(), ProjOptions()));
+    loaded->lang_gguf = std::make_unique<vllm::GgufFile>(
+        vllm::GgufFile::Open(loaded->lang->path()));
+    loaded->proj_gguf = std::make_unique<vllm::GgufFile>(
+        vllm::GgufFile::Open(loaded->proj->path()));
+    loaded->config = vllm::DeepseekV4HfConfigFromGguf(*loaded->lang_gguf);
+    // EVERY layer hashes, which is what makes the assertion below possible.
+    REQUIRE(vllm::ParseDeepseekV4Params(loaded->config).num_hash_layers ==
+            dsv4_lang_test::kLayers);
+    vllm::ModelSource source =
+        vllm::ModelSource::FromGguf(*loaded->lang_gguf, vt::DeviceType::kCPU);
+    source.mmproj = loaded->proj_gguf.get();
+    source.mmproj_path = loaded->proj->path();
+    loaded->model = vllm::ModelRegistry::Load(loaded->config, source);
+
+    const DeepSeekV4VisionConfig vcfg =
+        vllm::DeepSeekV4ClipMmprojVisionConfig(*loaded->proj_gguf);
+    const auto image = MakeImage(vcfg);
+    const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
+        {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
+        static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+    vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+    vt::Queue queue = backend.CreateQueue();
+    const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
+        *loaded->model, loaded->config, queue, mm.mm_features[0]);
+    const int64_t tokens = static_cast<int64_t>(mm.prompt_token_ids.size());
+    std::vector<char> is_mm(static_cast<size_t>(tokens), 0);
+    for (int i = 0; i < mm.mm_features[0].length; ++i) {
+      is_mm[static_cast<size_t>(mm.mm_features[0].offset + i)] = 1;
+    }
+    const std::vector<vt::Tensor> slices{enc.embeds};
+    vllm::MmEmbedInputs embed_in;
+    embed_in.token_ids = &mm.prompt_token_ids;
+    embed_in.mm_embeds = &slices;
+    embed_in.is_mm_embed = &is_mm;
+    vllm::MmForwardBuffers buffers = vllm::ModelRegistry::EmbedMm(
+        *loaded->model, loaded->config, queue, embed_in);
+
+    std::vector<int32_t> positions(static_cast<size_t>(tokens));
+    for (int64_t t = 0; t < tokens; ++t) {
+      positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+    }
+    const std::vector<int32_t> logits_indices{0,
+                                              static_cast<int32_t>(tokens - 1)};
+    std::vector<vllm::PagedKvCache> attn_kv;
+    std::vector<vllm::GdnStateCache> gdn_state;
+    const vllm::v1::GDNAttentionMetadata gdn_meta{};
+    vllm::v1::CommonAttentionMetadata attn_meta{};
+    attn_meta.num_reqs = 1;
+    attn_meta.num_computed_tokens_cpu = {0};
+    vllm::ModelForwardInput in{.token_ids = mm.prompt_token_ids,
+                               .positions = positions,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = loaded->config,
+                               .queue = queue,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    in.mm = buffers.mm;
+    const vllm::ForwardLogits out =
+        vllm::ModelRegistry::Forward(*loaded->model, in);
+    REQUIRE(out.host.size() == static_cast<size_t>(2 * kVocab));
+    return out.host;
+  };
+
+  const std::vector<float> a = run(1.0F);
+  const std::vector<float> b = run(-4.0F);
+  REQUIRE(a.size() == b.size());
+  int64_t text_moved = 0, tail_moved = 0;
+  for (int64_t v = 0; v < kVocab; ++v) {
+    if (a[static_cast<size_t>(v)] != b[static_cast<size_t>(v)]) ++text_moved;
+    const size_t tail = static_cast<size_t>(kVocab + v);
+    if (a[tail] != b[tail]) ++tail_moved;
+  }
+  // A text row keeps the hash route on every layer, so the vision bias cannot
+  // reach it -- the per-token claim, on a file where the hash branch is the
+  // only other arm.
+  CHECK(text_moved == 0);
+  // And the row whose prefix contains the span moves, which on THIS file is
+  // possible only if an image row left the hash route.
+  CHECK(tail_moved > 0);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // (10) THE IMAGE SPAN IS NON-CAUSAL, at the forward.
 //
 // The index rule is gated on its indices in `test_deepseek_v4_dsa`. This case

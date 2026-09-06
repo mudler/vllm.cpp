@@ -711,6 +711,20 @@ above as its red-before input.
 - CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
   W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
   any of the three.
+- The W2 vision tower and aligner are unreachable from a production entry
+  point. `DeepSeekV4Vision`, its `Forward`, `VisionForward` and
+  `AlignerForward` seams, `DeepSeekV4VisionRopeCosSin` and the
+  `DeepSeekV4VisionCapture` type have no production call site: nothing in
+  `include/vllm.h`, the loader, `ModelRegistry::Forward` or a registered server
+  or command-line path constructs the class, and the stage goldens reach it by
+  building it in the test. The only non-test file that includes the W2 header is
+  `clip_mmproj_gguf.h`, for the `DeepSeekV4VisionConfig` and
+  `DeepSeekV4VisionWeights` types W3A's reader fills, and that reader is
+  unreached for its own reason below. Row
+  `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` owns the wiring in W4, which
+  routes the tower through the registered model forward, and issue #2411 tracks
+  it. W2's own commit body claimed this entry was already here when it was not,
+  which is the omission the W2 repair closes.
 - W1 prompt encoding and image preprocessing remain unreachable from a
   production entry point. W4 wires them into the registered model forward, and
   W5 wires the runner, public ABI and OpenAI server for row
@@ -939,8 +953,148 @@ call, and the checker reads the call line or the 20 lines above it. The reason
 now sits on the call. The checker reports 9 of 9 marked sites, and its mutation
 suite `tests/scripts/test_check_attention_rung_consistency.py` passes 39/39.
 
-A fresh reviewer has not yet mutated W2's claimed guarantees. That review is
-owed before this row's pull request is opened.
+### W2 repair evidence
+
+A fresh reviewer mutated W2's claimed guarantees and returned seven findings.
+All seven are repaired. Each mutation below was applied to the tree, rebuilt
+(ninja always did work, never zero steps, so no result is a stale build), run,
+and restored byte-for-byte; the source file's sha256 after every restore is
+`6006b685da095ade85c2c353083860f81b04f183f3d0491bacc85899617b3aa0`, and the tree
+was rebuilt and re-run green after each one.
+
+**Two reduced fixtures had degenerated the axes they were believed to gate.**
+`heads2_depth2` and `heads4_depth1` are both head_dim 4, so `rope_dim` is 2 and
+`get_vision_cos_sin` has EXACTLY ONE frequency per axis at exponent
+`2*0/rope_dim = 0`. `inv_freq[0]` is therefore `theta**0 = 1.0` for every theta,
+and both pinning `rope_theta` to a literal 10000.0 and halving the exponent
+denominator left every golden byte unchanged. Separately, every fixture grid
+((2,5), (3,3), (3,4)) aligns to ONE merged row at ratio 3, where a row-major and
+a column-major walk of the merged grid are the same sequence, so swapping the
+`block_row` and `block_column` loops was invisible; the dedicated unfold case
+could not catch it either, because it builds its expectation with the same loop
+nesting as the implementation.
+
+`heads1_headdim16_theta7919` closes both. head_dim 16 gives four frequencies at
+exponents 0, 1/4, 1/2 and 3/4, its theta is neither the default nor either other
+fixture's, and its grids 4x5 and 7x4 merge to 2x2 and 3x2.
+
+**The fixtures were regenerated with the committed generator, which is the only
+available option, and that limit is stated rather than hidden.** There is no
+local checkout of `86f746b36186f0e567729a5c06a8c918caba82a9` and no network
+access to it, so the formulas cannot be re-derived from source, and a
+transcription error shared between the generator and a new fixture would NOT be
+caught by adding fixtures from that generator. What could be checked was: the
+local torch is `2.11.0+cu130`, exactly the version the fixture records, and
+re-running the generator before the change reproduced the committed goldens
+byte-for-byte. The regenerated file is a pure insertion of 7448 lines, so the two
+original fixtures are untouched.
+
+**The row order is confirmed by a second, independent oracle, so the code was
+correct and merely ungated.** llama.cpp release `b10766` =
+`9400c8946e4da5e7694f2c26d6d4e50e14b690fa` (oracle `llama-cpp-dsv4vision`) maps
+merged cell (row r, column c) to aligner output row `r * n_llm_w + c` in
+`clip.cpp`'s `set_input` for `PROJECTOR_TYPE_DEEPSEEK4V`, and its graph in
+`tools/mtmd/models/deepseek4v.cpp` (blob `ffe8f59d9997` at that pin) reaches the
+same order through `ggml_im2col` over a `[x, y, n_embd]` tensor reshaped
+`[ne0, ne1*ne2]`, which flattens `[OW, OH]` with OW fastest. The new row-order
+case takes its destination index from that formula rather than from our loop
+nesting, so it is not a second copy of the implementation.
+
+**One tolerance was changed, and it is a correction rather than a concession.**
+The `gelu` stage carried a declared bound of 0.01 that was LOWER than the 0.016
+allowed for the `aligner_hidden` buffer feeding it. That ordering is not
+derivable: `sup|GELU'|` is about 1.0839, so GELU can amplify the error it is
+handed by about 8.4% and can never be relied on to shrink it. Measured per case,
+input to output: 0.0078125 to 0.0078125, 0.0078125 to 0.0078125, 0.015625 to
+0.00878906, 0.0078125 to 0.00390625, and 0.0136719 to 0.0117188. Every case
+ATTENUATES and none approaches the ceiling, so no divergence enters at this
+stage. The pre-existing `heads4_depth1` case already ran at 0.015625 against
+0.016, one bf16 ulp from failing, which is how close the declared value always
+was. The bound is now `max(0.004, 1.084 * the case's own aligner_hidden error)`,
+which is TIGHTER than the old 0.01 for three of the five cases, and
+`aligner_hidden` keeps its absolute cap so the stage stays transitively bounded
+at 0.0173.
+
+Every stage upstream of GELU on the case that first failed is at or below what
+the pre-existing fixtures already produce: patch 0.00195312 against 0.004, vision
+and unfold 0.015625 against 0.024 where an existing case reaches 0.0234375, and
+aligner_hidden 0.0136719 against 0.016 where an existing case reaches 0.015625.
+The new geometry is not worse anywhere.
+
+**A dtype that is too wide, and per-layer scratch, both needed observables that
+no value gate provides.** Widening the attention-output buffer to f32 was fully
+green, exactly as `AGENTS.md` warns under "Inherit vLLM defaults". The forward
+now reports the dtype of every internal scratch buffer it allocates, in
+allocation order, through a capture field production never sets, and the test
+asserts the exact sequence and the count of f32 entries. The two f32 entries are
+the rotary pair and keep their reason.
+
+For the per-layer scratch the review proposed bounding pool `misses` after a
+single Forward independently of depth. That bound is true but CANNOT see the
+defect, and this is measured rather than argued. One Forward from a drained
+pool, hoisted against un-hoisted:
+
+| depth | hoisted | un-hoisted |
+|---|---|---|
+| 2 | 17 gets (13 misses, 4 hits) | 18 gets (13 misses, 5 hits) |
+| 4 | 21 gets (13 misses, 8 hits) | 24 gets (13 misses, 11 hits) |
+| 8 | 29 gets (13 misses, 16 hits) | 36 gets (13 misses, 23 hits) |
+
+`misses` is 13 in BOTH forms at every depth: the fixed working set is identical
+and the pool serves every extra request from its own free list. The observable
+that separates them is pool GET traffic PER LAYER, 2 hoisted against 3
+un-hoisted. The gate measures one Forward at two depths and asserts that slope is
+2, the two buffers `UnquantizedMlpGateUpMethod::Apply` legitimately owns. The
+depth-independent `misses` bound is kept beside it because it is true, not
+because it can see this.
+
+**`BorrowResidentWeight` had re-introduced the #2031 marker loss.** It copied
+dtype, rank, shape, `nk`, bytes and `d_dev` and dropped `repacked`,
+`q8_0_aligned` and `elem_kn_repacked`. That is the defect `main` fixed at
+`7a937db8a` in the shared `dense_attn::ResidentWeight`, where an i8mm-interleaved
+`block_q8_0x4` buffer (136-byte blocks) reached the quant GEMM flagged as flat
+`q8_0` (34-byte blocks), decoded to NaN, then all-zero logits, then token id 0,
+with nothing logged because the `lm_head` GEMM swallowed the NaN. The markers are
+now PROPAGATED rather than refused: a fail-closed check would remove the CPU
+i8mm fast path instead of fixing the loss. It is host-conditional
+(`vt::cpu::QuantRepackActive()` is true only on aarch64 i8mm) so no golden can
+move here, and W3A's mmproj reader is what makes it live rather than latent.
+
+**`ValidateTensor` has 21 call sites, not 15, and both groups are now driven.**
+Fifteen are the weight checks; five more sit behind `ValidateCaptureTensor`,
+whose entire body could be replaced by a no-op with the suite staying green,
+because the stage goldens pass CORRECT captures and exercise only the happy
+path. Neutering that helper now reds 13 of the 14 capture rows. The fourteenth,
+the block-capture count, stays green under that mutation and correctly so: it is
+a separate check in `ValidateVisionIo` rather than a `ValidateCaptureTensor`
+call. Those refusals are gate-facing rather than production-facing, since
+production passes nullptr and copies nothing, which is exactly why they needed
+driving: a capture contract nothing checks lets a future parity gate read a
+wrongly shaped buffer and compare whatever is in it.
+
+**Both coverage guards were proved non-vacuous rather than assumed to be.**
+A guard that passes because it asserts nothing is the same failure as the
+degenerate fixture it exists to prevent. Setting the new fixture's theta back to
+the 10000.0 default and regenerating reds the frequency guard at `0 >= 1`, and
+replacing its grids with a single (2,5) reds the row-order guard. The tree was
+restored and re-run at 14 of 14 cases and 7376 of 7376 assertions after both.
+
+**W4 must size against the geometry cache.** The `IndexSelect` gather index is
+`aligned_rows * hidden_size * downsample_ratio^2` i32 values per cached geometry.
+At the production `hidden_size` 1024 and ratio 3, a 73x73 patch grid gives
+`aligned_rows` 625 and an index of 5,760,000 i32 = 23.04 MB, and
+`kGeometryCacheCapacity` is 8, so a full cache holds 184.32 MB of gather indices
+alone. The other two per-geometry tensors are small beside it: the f32 RoPE cache
+is 1.36 MB and the positions vector 21.3 kB at that grid. W4 owns whether eight
+distinct geometries is the right capacity for the image sizes the server admits,
+and whether the index should be computed rather than cached at that size.
+
+**One gap stays open and is not this row's to close.** `ResidentWeight`'s
+device-staging arm returns `MakeTensor(w.d_dev.get(), ...)`, which carries no
+markers at all, so `q8_0_aligned` cannot reach a CUDA Q8_0 GEMM through that arm
+for ANY model that uses the shared helper. That is a shared-seam gap in
+`dense_attn_block.h`, outside this repair's scope, and it is recorded here rather
+than repaired.
 
 ### W3B evidence
 

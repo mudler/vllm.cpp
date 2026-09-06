@@ -289,6 +289,31 @@ def main() -> None:
                 2412,
                 [(3, 4)],
             ),
+            # W2 repair fixture (issue #2411). The two fixtures above are both
+            # head_dim 4, so rope_dim is 2 and get_vision_cos_sin has EXACTLY
+            # ONE frequency per axis at exponent 2*0/rope_dim = 0. inv_freq[0]
+            # is theta**0 = 1.0 for every theta, so neither vision_rope_theta
+            # nor the exponent denominator can be measured from them: pinning
+            # theta to a literal and halving the denominator both leave the
+            # goldens unchanged. This one is head_dim 16, so rope_dim is 8 and
+            # there are FOUR frequencies at exponents 0, 1/4, 1/2 and 3/4, and
+            # its theta is neither the 10000.0 default nor either other
+            # fixture's value. One head is deliberate: the two fixtures above
+            # already cover head counts 2 and 4, and holding hidden_size at 16
+            # keeps every stage inside the committed absolute tolerances.
+            #
+            # Its grids are the other half of the repair. Every grid above
+            # aligns to ONE merged row at downsample_ratio 3, where row-major
+            # and column-major over the merged grid are the same sequence, so
+            # the aligner's output ROW ORDER was unmeasurable too. 4x5 merges
+            # to 2x2 and 7x4 merges to 3x2, and both distinguish the two
+            # orders.
+            make_fixture(
+                "heads1_headdim16_theta7919",
+                Args(1, 16, 1, 1, 8, 7919.0, 3, 6),
+                2413,
+                [(4, 5), (7, 4)],
+            ),
         ]
         gelu_probe_input = torch.tensor(
             [-5.5, -3.0, -1.0, -0.25, 0.0, 0.25, 1.0, 2.15625, 3.0, 5.5],

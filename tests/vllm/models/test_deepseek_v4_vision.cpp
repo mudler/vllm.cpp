@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -152,6 +153,15 @@ DeepSeekV4VisionWeights Weights(const json& fixture, const DeepSeekV4VisionConfi
   return weights;
 }
 
+// sup|GELU'| = 1.08386..., attained near x = 1.5216. The GELU stage can
+// therefore amplify its input's error by up to 8.4% and can never be assumed to
+// reduce it, which is what makes a stage bound below its input's bound wrong.
+constexpr float kGeluLipschitz = 1.084f;
+// Floor for a case whose input error is zero: our GeluErf and torch F.gelu may
+// still differ by one rounding step on identical bf16 input. One bf16 ulp at
+// the magnitudes this stage reaches, which is the patch-embedding stage's bound.
+constexpr float kGeluErrorFloor = 0.004f;
+
 float MaxAbsDiff(const std::vector<float>& actual, const json& expected_json) {
   const std::vector<float> expected = Floats(expected_json);
   REQUIRE(actual.size() == expected.size());
@@ -283,9 +293,31 @@ TEST_CASE("DeepSeek-V4 ViT and aligner match pinned BF16 stage goldens") {
       }
       CHECK(MaxAbsDiff(store.Download(captures.final_norm), expected.at("vision")) <= 0.024f);
       CHECK(MaxAbsDiff(store.Download(captures.unfold), expected.at("unfold")) <= 0.024f);
-      CHECK(MaxAbsDiff(store.Download(captures.aligner_hidden),
-                       expected.at("aligner_hidden")) <= 0.016f);
-      CHECK(MaxAbsDiff(store.Download(captures.gelu), expected.at("gelu")) <= 0.01f);
+      const float aligner_hidden_diff = MaxAbsDiff(
+          store.Download(captures.aligner_hidden), expected.at("aligner_hidden"));
+      CHECK(aligner_hidden_diff <= 0.016f);
+      // THE GELU BOUND IS DERIVED FROM ITS INPUT, not declared beside it.
+      //
+      // A declared 0.01f here was LOWER than the 0.016f allowed for the
+      // aligner_hidden buffer that feeds this stage, and that ordering is not
+      // derivable: sup|GELU'| is about 1.0839 (at x about 1.5216), so GELU can
+      // amplify the error it is handed by about 8.4% and can never be relied on
+      // to shrink it. The declared value held only because the first two
+      // fixtures happened to hand it half their allowance, and heads4_depth1
+      // already ran at 0.015625 against 0.016, one bf16 ulp from failing.
+      //
+      // Measured on the fixture set, per case, aligner_hidden -> gelu:
+      //   heads2_depth2 2x5              0.0078125  -> 0.0078125
+      //   heads2_depth2 3x3              0.0078125  -> 0.0078125
+      //   heads4_depth1 3x4              0.015625   -> 0.00878906
+      //   heads1_headdim16 4x5           0.0078125  -> 0.00390625
+      //   heads1_headdim16 7x4           0.0136719  -> 0.0117188
+      // Every case ATTENUATES, and no case reaches the Lipschitz ceiling. The
+      // derived bound is TIGHTER than the old 0.01f for three of the five, and
+      // aligner_hidden keeps its own absolute cap above, so this stage stays
+      // transitively bounded at 0.0173f rather than floating free.
+      CHECK(MaxAbsDiff(store.Download(captures.gelu), expected.at("gelu")) <=
+            std::max(kGeluErrorFloor, kGeluLipschitz * aligner_hidden_diff));
       CHECK(MaxAbsDiff(store.Download(output), expected.at("output")) <= 0.01f);
       CHECK(output.dtype == DType::kBF16);
       CHECK(output.IsContiguous());
@@ -468,5 +500,730 @@ TEST_CASE("DeepSeek-V4 repeated shape reuses scratch and 2-D RoPE allocation") {
   CHECK(pool_after_repeat.hits > pool_after_warmup.hits);
   CHECK(model.cached_geometry_count() == 1);
 
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F2 (#2411). A REDUCED FIXTURE CAN DEGENERATE THE AXIS IT GATES.
+//
+// get_vision_cos_sin builds inv_freq[i] = theta ** -(2i / rope_dim) for
+// i in [0, rope_dim/2), and at rope_dim 2 that set is the single element
+// theta ** -0 = 1.0 FOR EVERY THETA. The first two fixtures are head_dim 4, so
+// both were in exactly that state: pinning rope_theta to a literal 10000.0 and
+// halving the exponent denominator each left every golden byte unchanged.
+// Production is head_dim 64, i.e. 16 frequencies.
+//
+// This case fails if the fixture set ever loses the geometry that makes those
+// two mutations observable, so the coverage cannot be removed silently.
+TEST_CASE("DeepSeek-V4 vision goldens can measure rope_theta and the frequency decay") {
+  const DeepSeekV4VisionConfig defaults;
+  REQUIRE(defaults.rope_theta == 10000.0);
+
+  int measuring_fixtures = 0;
+  for (const json& fixture : Goldens().at("fixtures")) {
+    const DeepSeekV4VisionConfig config = Config(fixture);
+    const int64_t frequencies = config.head_dim() / 4;
+    // One frequency means every exponent is 0, so theta cancels entirely.
+    // Two or more make theta and the denominator both observable; require four
+    // so the decay is a curve rather than a single ratio.
+    if (frequencies >= 4 && config.rope_theta != defaults.rope_theta) {
+      ++measuring_fixtures;
+      CAPTURE(fixture.at("name"));
+      // Prove the frequencies really do differ from each other at this
+      // geometry: an equal set would cancel the decay law again.
+      std::vector<float> cosine;
+      std::vector<float> sine;
+      DeepSeekV4VisionRopeCosSin(1, 2, config, &cosine, &sine);
+      const int64_t rope_width = config.head_dim() / 2;
+      // Token 1 is (row 0, column 1), so its WIDTH half carries position 1 and
+      // its values are cos(inv_freq[i]) across the frequency ladder.
+      const size_t width_half = static_cast<size_t>(rope_width + frequencies);
+      CHECK(cosine[width_half + 0] != cosine[width_half + 1]);
+      CHECK(cosine[width_half + 1] != cosine[width_half + 2]);
+      CHECK(cosine[width_half + 2] != cosine[width_half + 3]);
+    }
+  }
+  CHECK(measuring_fixtures >= 1);
+}
+
+// W2 repair, F3 (#2411). The same degeneracy on the aligner's ROW ORDER.
+//
+// Every original fixture grid ((2,5), (3,3), (3,4)) aligns to ONE merged row at
+// downsample_ratio 3, and with block_rows == 1 a row-major and a column-major
+// walk of the merged grid are the same sequence. Swapping the two loops was
+// therefore invisible, although the order fixes the spatial arrangement of the
+// image tokens W4 hands the language model: a 448x448 image is a 32x32 patch
+// grid, 11x11 merged, and would emit transposed rows with the token count, the
+// dtype and every golden unchanged.
+TEST_CASE("DeepSeek-V4 vision goldens can measure the aligner row order") {
+  int measuring_cases = 0;
+  for (const json& fixture : Goldens().at("fixtures")) {
+    const DeepSeekV4VisionConfig config = Config(fixture);
+    const int64_t ratio = config.downsample_ratio;
+    for (const json& test_case : fixture.at("cases")) {
+      const int64_t height = test_case.at("grid").at(0).get<int64_t>();
+      const int64_t width = test_case.at("grid").at(1).get<int64_t>();
+      const int64_t block_rows = 1 + (height - 1) / ratio;
+      const int64_t block_columns = 1 + (width - 1) / ratio;
+      if (block_rows > 1 && block_columns > 1) ++measuring_cases;
+    }
+  }
+  CHECK(measuring_cases >= 1);
+}
+
+// W2 repair, F3 (#2411). The row order itself, at a merged grid that can show it
+// and WITHOUT rebuilding the expectation from the implementation's own loop
+// nesting.
+//
+// The dedicated unfold case above walks block_row then block_column exactly as
+// the implementation does, so on this axis it is a tautology and cannot rescue
+// the order. This one takes the destination row index from the SECONDARY ORACLE
+// instead. llama.cpp release `b10766` = `9400c8946e4da5e7694f2c26d6d4e50e14b690fa`
+// (oracle `llama-cpp-dsv4vision`) builds the same 3x3 patch merge and then maps
+// merged cell (row r, column c) to aligner output row `r * n_llm_w + c` in
+// `clip.cpp`'s `set_input` for `PROJECTOR_TYPE_DEEPSEEK4V`. Its graph in
+// `tools/mtmd/models/deepseek4v.cpp` (blob `ffe8f59d9997` at that pin) reaches
+// the same order through `ggml_im2col` over a [x, y, n_embd] tensor reshaped
+// `[ne0, ne1*ne2]`, which flattens [OW, OH] with OW fastest.
+//
+// So the merged grid is ROW-MAJOR, our loop nesting is right, and this case
+// exists to hold it rather than to change it.
+TEST_CASE("DeepSeek-V4 aligner emits merged cells in llama.cpp row-major order") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  TensorStore store(backend, queue);
+  DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+
+  // 7x4 merges to 3x2 at ratio 3: both dimensions exceed one and they differ,
+  // so a transposed walk is a genuine permutation and not a relabelling.
+  const int64_t height = 7;
+  const int64_t width = 4;
+  const int64_t ratio = config.downsample_ratio;
+  const int64_t hidden = config.hidden_size;
+  const int64_t merged_rows = 1 + (height - 1) / ratio;
+  const int64_t merged_columns = 1 + (width - 1) / ratio;
+  REQUIRE(merged_rows == 3);
+  REQUIRE(merged_columns == 2);
+
+  const int64_t patch_rows = height * width;
+  const int64_t output_rows = config.aligned_rows(height, width);
+  REQUIRE(output_rows == merged_rows * merged_columns);
+
+  // Every element gets its own value. The largest is 7*4*8 = 224, and every
+  // integer up to 256 is exact in bf16, so nothing here is a rounding artefact.
+  std::vector<float> source(static_cast<size_t>(patch_rows * hidden));
+  for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<float>(i + 1);
+  REQUIRE(source.back() <= 256.0f);
+
+  Tensor vision = store.Make(json(source), config.compute_dtype, {patch_rows, hidden});
+  Tensor output = store.Empty(config.compute_dtype, {output_rows, config.output_size});
+  Tensor unfold = store.Empty(config.compute_dtype,
+                              {output_rows, config.aligner_input_size()});
+  DeepSeekV4VisionCapture capture;
+  capture.aligner_unfold = &unfold;
+  model.AlignerForward(queue, output, vision, height, width, &capture);
+  const std::vector<float> actual = store.Download(unfold);
+  const int64_t unfold_width = config.aligner_input_size();
+
+  for (int64_t merged_row = 0; merged_row < merged_rows; ++merged_row) {
+    for (int64_t merged_column = 0; merged_column < merged_columns;
+         ++merged_column) {
+      // The oracle's index, not ours: r * n_llm_w + c.
+      const int64_t destination = merged_row * merged_columns + merged_column;
+      CAPTURE(merged_row);
+      CAPTURE(merged_column);
+      CAPTURE(destination);
+      for (int64_t channel = 0; channel < hidden; ++channel) {
+        for (int64_t local_row = 0; local_row < ratio; ++local_row) {
+          for (int64_t local_column = 0; local_column < ratio; ++local_column) {
+            const int64_t row = merged_row * ratio + local_row;
+            const int64_t column = merged_column * ratio + local_column;
+            const float expected =
+                row < height && column < width
+                    ? source[static_cast<size_t>((row * width + column) * hidden +
+                                                 channel)]
+                    : 0.0f;
+            const size_t offset = static_cast<size_t>(
+                destination * unfold_width + channel * ratio * ratio +
+                local_row * ratio + local_column);
+            REQUIRE(actual[offset] == expected);
+          }
+        }
+      }
+    }
+  }
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F4 (#2411). THE MEMORY FORMAT OF THE MODEL PATH.
+//
+// AGENTS.md, "Inherit vLLM defaults": a token gate CANNOT detect a dtype that is
+// too wide. Widening the attention-output buffer to f32 left every stage golden
+// green, because `vt::MatmulBT` and `vt::Add` accept the mix and the VALUES are
+// unchanged while the path moves twice the bytes. This case reads the dtypes the
+// forward actually allocated, so the width is asserted rather than assumed.
+//
+// The two f32 entries are the documented exceptions and keep their reason: the
+// pinned `apply_rotary` widens q and k before multiplying by its f32 cos/sin
+// table and narrows once afterward. The RoPE cos/sin cache itself is f32 for the
+// same reason and lives in the geometry cache, not in this per-call list.
+TEST_CASE("DeepSeek-V4 vision keeps the model path bf16 except the rotary scratch") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  TensorStore store(backend, queue);
+  DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+  Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                              {10, config.patch_dim()});
+  Tensor output = store.Empty(config.compute_dtype, {2, config.output_size});
+
+  std::vector<vllm::multimodal::DeepSeekV4VisionScratchDType> scratch;
+  DeepSeekV4VisionCapture capture;
+  capture.scratch_dtypes = &scratch;
+  model.Forward(queue, output, patches, 2, 5, &capture);
+
+  const std::vector<std::pair<std::string, DType>> expected = {
+      {"vision.hidden_state", DType::kBF16},
+      {"vision.normalized", DType::kBF16},
+      {"vision.query", DType::kBF16},
+      {"vision.key", DType::kBF16},
+      {"vision.value", DType::kBF16},
+      {"vision.attention", DType::kBF16},
+      {"vision.projected", DType::kBF16},
+      {"vision.rope_query_f32", DType::kF32},
+      {"vision.rope_key_f32", DType::kF32},
+      {"vision.mlp_gate_up_activated", DType::kBF16},
+      {"aligner.padded", DType::kBF16},
+      {"aligner.unfolded", DType::kBF16},
+      {"aligner.hidden_state", DType::kBF16},
+  };
+  REQUIRE(scratch.size() == expected.size());
+  int f32_entries = 0;
+  for (size_t i = 0; i < expected.size(); ++i) {
+    CAPTURE(i);
+    CAPTURE(expected[i].first);
+    REQUIRE(scratch[i].name != nullptr);
+    CHECK(std::string(scratch[i].name) == expected[i].first);
+    CHECK(scratch[i].dtype == expected[i].second);
+    if (scratch[i].dtype == DType::kF32) ++f32_entries;
+  }
+  // Stated from the other end so a NEW f32 buffer cannot be added silently:
+  // exactly two, and both are the rotary pair.
+  CHECK(f32_entries == 2);
+  CHECK(model.config().compute_dtype == DType::kBF16);
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F5 (#2411). PER-LAYER SCRATCH IS HOISTED, and that is now measured
+// at the only observable that can see it.
+//
+// The allocation case above compares driver Alloc counts and pool statistics
+// across TWO Forward calls at one shape. A per-layer pooled Get/Put inside a
+// single call reuses the same warm block, so moving a buffer into the block loop
+// changes neither, and it stayed green. Measured on this tree, one Forward from
+// a drained pool, hoisted against un-hoisted:
+//
+//   depth 2   17 gets (13 misses, 4 hits)   vs   18 gets (13 misses,  5 hits)
+//   depth 4   21 gets (13 misses, 8 hits)   vs   24 gets (13 misses, 11 hits)
+//   depth 8   29 gets (13 misses, 16 hits)  vs   36 gets (13 misses, 23 hits)
+//
+// `misses` is 13 in BOTH forms at every depth, so bounding misses alone cannot
+// see this defect: the fixed working set is the same either way and the pool
+// serves every extra request from its own free list. What separates them is the
+// pool GET traffic PER LAYER, which is 2 hoisted and 3 un-hoisted. At the
+// production depth of 32 the un-hoisted form is 32 extra pool round trips per
+// image, invisibly.
+//
+// The slope is 2 because the shared MlpGateUpMethodBase seam legitimately owns
+// two per-layer buffers, the merged gate_up output and the activation it returns
+// (`UnquantizedMlpGateUpMethod::Apply`). Everything this file allocates is
+// hoisted, so it contributes 0 to the slope.
+TEST_CASE("DeepSeek-V4 vision allocates no per-layer scratch of its own") {
+  // The two per-layer buffers the shared MLP seam owns, and nothing else.
+  constexpr uint64_t kPerLayerPooledBuffers = 2;
+
+  Backend& inner = vt::GetBackend(vt::DeviceType::kCPU);
+  CountingBackend backend(inner);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+
+  struct Reading {
+    uint64_t gets = 0;
+    uint64_t misses = 0;
+  };
+  auto measure = [&](int64_t depth) {
+    DeepSeekV4VisionConfig config = Config(fixture);
+    TensorStore store(backend, queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    while (static_cast<int64_t>(weights.blocks.size()) < depth) {
+      weights.blocks.push_back(weights.blocks[0]);
+    }
+    config.depth = depth;
+    DeepSeekV4Vision model(backend, config, std::move(weights));
+    Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                                {10, config.patch_dim()});
+    Tensor output = store.Empty(config.compute_dtype, {2, config.output_size});
+    // Drain AFTER the weights are staged so the reading covers the forward only.
+    vllm::Pool(backend).Drain(backend);
+    const auto before = vllm::Pool(backend).stats();
+    model.Forward(queue, output, patches, 2, 5);
+    backend.Synchronize(queue);
+    const auto after = vllm::Pool(backend).stats();
+    Reading reading;
+    reading.misses = after.misses - before.misses;
+    reading.gets = reading.misses + (after.hits - before.hits);
+    return reading;
+  };
+
+  const int64_t shallow = Config(fixture).depth;
+  REQUIRE(shallow >= 1);
+  const Reading at_shallow = measure(shallow);
+  const Reading at_deep = measure(2 * shallow);
+
+  // The fixed working set does not scale with depth. This is the bound the
+  // review asked for, and it holds; it is kept because it is true and useful,
+  // not because it can see the defect below.
+  CHECK(at_deep.misses == at_shallow.misses);
+
+  // The bound that CAN see it: pool traffic per layer.
+  REQUIRE(at_deep.gets >= at_shallow.gets);
+  const uint64_t per_layer =
+      (at_deep.gets - at_shallow.gets) / static_cast<uint64_t>(shallow);
+  CHECK(per_layer == kPerLayerPooledBuffers);
+  // Exactly divisible, so the slope is a real per-layer count and not a rounded
+  // one.
+  CHECK((at_deep.gets - at_shallow.gets) %
+            static_cast<uint64_t>(shallow) == 0);
+
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F7 (#2411). THE BORROW MUST NOT DROP THE REPACK MARKERS.
+//
+// `BorrowResidentWeight` hands each block's gate-up weight to the shared
+// MlpGateUpMethodBase seam as an OwnedTensor. It copied dtype, rank, shape, `nk`,
+// bytes and `d_dev` and stopped there, so `repacked`, `q8_0_aligned` and
+// `elem_kn_repacked` were lost. Those three say the BYTES were rewritten at load
+// into a different block interleave or orientation while the byte count and the
+// [N,K] shape stayed the same, so nothing downstream can notice: `ValidateTensor`
+// does not check them and no value gate can see them.
+//
+// THIS IS THE SAME DEFECT `main` FIXED AT `7a937db8a` (#2031), in the shared
+// `dense_attn::ResidentWeight`, re-introduced in a private helper. There it cost
+// a debugging campaign: an i8mm-interleaved `block_q8_0x4` buffer (136-byte
+// blocks) reached the quant GEMM flagged as flat `q8_0` (34-byte blocks) and
+// decoded to NaN, then all-zero logits, then token id 0, with nothing logged
+// because the `lm_head` GEMM swallowed the NaN.
+//
+// It is HOST-CONDITIONAL: `vt::cpu::QuantRepackActive()` is true only on an
+// aarch64 i8mm host, so this x86 box can never show it as a wrong number. That is
+// exactly why the markers are asserted structurally instead. W3A's mmproj reader
+// is what turns it from latent into live, because it can now hand this tower
+// block-quantized weights.
+//
+// The forward is deliberately NOT run here. `elem_kn_repacked` claims the bytes
+// are physically [K,N], and this fixture's bytes are not, so a forward would read
+// a genuinely mislabelled buffer. The markers are metadata and the assertion is
+// about whether they survive the borrow.
+TEST_CASE("DeepSeek-V4 vision carries the load-time repack markers into the MLP seam") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  REQUIRE(config.depth >= 2);
+
+  SUBCASE("every marker survives, and an unmarked block stays unmarked") {
+    TensorStore store(backend, queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    weights.blocks[0].mlp_w1_weight.repacked = true;
+    weights.blocks[0].mlp_w1_weight.q8_0_aligned = true;
+    weights.blocks[0].mlp_w1_weight.elem_kn_repacked = true;
+    DeepSeekV4Vision model(backend, config, std::move(weights));
+
+    const auto marked = model.mlp_gate_up_markers(0);
+    CHECK(marked.repacked);
+    CHECK(marked.q8_0_aligned);
+    CHECK(marked.elem_kn_repacked);
+
+    // Opposite polarity, so a stub that answers true cannot pass either.
+    const auto plain = model.mlp_gate_up_markers(1);
+    CHECK_FALSE(plain.repacked);
+    CHECK_FALSE(plain.q8_0_aligned);
+    CHECK_FALSE(plain.elem_kn_repacked);
+  }
+
+  SUBCASE("each marker travels on its own") {
+    for (int which = 0; which < 3; ++which) {
+      CAPTURE(which);
+      TensorStore store(backend, queue);
+      DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+      if (which == 0) weights.blocks[0].mlp_w1_weight.repacked = true;
+      if (which == 1) weights.blocks[0].mlp_w1_weight.q8_0_aligned = true;
+      if (which == 2) weights.blocks[0].mlp_w1_weight.elem_kn_repacked = true;
+      DeepSeekV4Vision model(backend, config, std::move(weights));
+      const auto markers = model.mlp_gate_up_markers(0);
+      CHECK(markers.repacked == (which == 0));
+      CHECK(markers.q8_0_aligned == (which == 1));
+      CHECK(markers.elem_kn_repacked == (which == 2));
+    }
+  }
+
+  SUBCASE("the accessor refuses a block that does not exist") {
+    TensorStore store(backend, queue);
+    DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+    CHECK_THROWS_WITH_AS(model.mlp_gate_up_markers(-1),
+                         "DeepSeek-V4 vision block index is out of range",
+                         std::invalid_argument);
+    CHECK_THROWS_WITH_AS(model.mlp_gate_up_markers(config.depth),
+                         "DeepSeek-V4 vision block index is out of range",
+                         std::invalid_argument);
+  }
+  backend.DestroyQueue(queue);
+}
+
+
+// W2 repair, F6 (#2411). THE WEIGHT-SHAPE REFUSALS ARE NOW LOAD-BEARING.
+//
+// `ValidateWeights` makes fifteen `ValidateTensor` calls and NONE of them was
+// exercised. Deleting the `aligner_w2_weight` refusal outright left the suite
+// green, and the header's "RMSNorm weights stay f32" claim rested on three
+// refusals nothing drove, so relaxing one to accept the model dtype was green
+// too. A refusal nothing reaches is not a contract, it is a comment.
+//
+// One table rather than thirty-five cases, but every row is INDIVIDUALLY
+// falsifiable: deleting any one `ValidateTensor` call reds exactly the two rows
+// that name it, and relaxing one from f32 to the model dtype reds that tensor's
+// dtype row. The dtypes are driven in both directions, a model-dtype weight
+// offered as f32 and an f32 norm offered as bf16, so the polarity cannot be
+// flipped silently either. Two blocks are covered rather than only block 0,
+// because these checks sit inside a loop over every block.
+TEST_CASE("DeepSeek-V4 vision refuses every mis-declared weight tensor") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  REQUIRE(config.depth >= 2);
+
+  struct Sizes {
+    int64_t h;
+    int64_t inter;
+    int64_t out;
+    int64_t patch_dim;
+    int64_t aligner_input;
+    DType model;
+    DType f32;
+  };
+  const Sizes z{config.hidden_size,  config.intermediate_size,
+                config.output_size,  config.patch_dim(),
+                config.aligner_input_size(), config.compute_dtype,
+                DType::kF32};
+
+  struct Case {
+    const char* label;
+    const char* message;
+    void (*corrupt)(DeepSeekV4VisionWeights&, TensorStore&, const Sizes&);
+  };
+
+  const std::vector<Case> cases = {
+      {"patch weight dtype", "DeepSeek-V4 vision patch weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_weight = s.Empty(z.f32, {z.h, z.patch_dim});
+       }},
+      {"patch weight shape", "DeepSeek-V4 vision patch weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_weight = s.Empty(z.model, {z.h + 1, z.patch_dim});
+       }},
+      {"patch bias dtype", "DeepSeek-V4 vision patch bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_bias = s.Empty(z.f32, {z.h});
+       }},
+      {"patch bias shape", "DeepSeek-V4 vision patch bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_bias = s.Empty(z.model, {z.h + 1});
+       }},
+      {"block 0 norm1 dtype", "DeepSeek-V4 vision norm1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm1_weight = s.Empty(z.model, {z.h});
+       }},
+      {"block 0 norm1 shape", "DeepSeek-V4 vision norm1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm1_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"block 1 norm1 dtype", "DeepSeek-V4 vision norm1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].norm1_weight = s.Empty(z.model, {z.h});
+       }},
+      {"block 1 norm1 shape", "DeepSeek-V4 vision norm1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].norm1_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"block 0 qkv weight dtype", "DeepSeek-V4 vision qkv weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_weight = s.Empty(z.f32, {3 * z.h, z.h});
+       }},
+      {"block 0 qkv weight shape", "DeepSeek-V4 vision qkv weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_weight = s.Empty(z.model, {3 * z.h, z.h + 1});
+       }},
+      {"block 0 qkv bias dtype", "DeepSeek-V4 vision qkv bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_bias = s.Empty(z.f32, {3 * z.h});
+       }},
+      {"block 0 qkv bias shape", "DeepSeek-V4 vision qkv bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].qkv_bias = s.Empty(z.model, {3 * z.h + 1});
+       }},
+      {"block 0 attn out weight dtype", "DeepSeek-V4 vision attention output weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_weight = s.Empty(z.f32, {z.h, z.h});
+       }},
+      {"block 0 attn out weight shape", "DeepSeek-V4 vision attention output weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_weight = s.Empty(z.model, {z.h, z.h + 1});
+       }},
+      {"block 0 attn out bias dtype", "DeepSeek-V4 vision attention output bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_bias = s.Empty(z.f32, {z.h});
+       }},
+      {"block 0 attn out bias shape", "DeepSeek-V4 vision attention output bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].out_bias = s.Empty(z.model, {z.h + 1});
+       }},
+      {"block 0 norm2 dtype", "DeepSeek-V4 vision norm2 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm2_weight = s.Empty(z.model, {z.h});
+       }},
+      {"block 0 norm2 shape", "DeepSeek-V4 vision norm2 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].norm2_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"block 1 MLP w1 dtype", "DeepSeek-V4 vision MLP w1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].mlp_w1_weight = s.Empty(z.f32, {2 * z.inter, z.h});
+       }},
+      {"block 1 MLP w1 shape", "DeepSeek-V4 vision MLP w1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[1].mlp_w1_weight = s.Empty(z.model, {2 * z.inter, z.h + 1});
+       }},
+      {"block 0 MLP w2 dtype", "DeepSeek-V4 vision MLP w2 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].mlp_w2_weight = s.Empty(z.f32, {z.h, z.inter});
+       }},
+      {"block 0 MLP w2 shape", "DeepSeek-V4 vision MLP w2 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.blocks[0].mlp_w2_weight = s.Empty(z.model, {z.h, z.inter + 1});
+       }},
+      {"final norm dtype", "DeepSeek-V4 vision final norm weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.final_norm_weight = s.Empty(z.model, {z.h});
+       }},
+      {"final norm shape", "DeepSeek-V4 vision final norm weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.final_norm_weight = s.Empty(z.f32, {z.h + 1});
+       }},
+      {"aligner w1 weight dtype", "DeepSeek-V4 vision aligner w1 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_weight = s.Empty(z.f32, {z.out, z.aligner_input});
+       }},
+      {"aligner w1 weight shape", "DeepSeek-V4 vision aligner w1 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_weight = s.Empty(z.model, {z.out, z.aligner_input + 1});
+       }},
+      {"aligner w1 bias dtype", "DeepSeek-V4 vision aligner w1 bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_bias = s.Empty(z.f32, {z.out});
+       }},
+      {"aligner w1 bias shape", "DeepSeek-V4 vision aligner w1 bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w1_bias = s.Empty(z.model, {z.out + 1});
+       }},
+      {"aligner w2 weight dtype", "DeepSeek-V4 vision aligner w2 weight has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_weight = s.Empty(z.f32, {z.out, z.out});
+       }},
+      {"aligner w2 weight shape", "DeepSeek-V4 vision aligner w2 weight has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_weight = s.Empty(z.model, {z.out, z.out + 1});
+       }},
+      {"aligner w2 bias dtype", "DeepSeek-V4 vision aligner w2 bias has the wrong dtype",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_bias = s.Empty(z.f32, {z.out});
+       }},
+      {"aligner w2 bias shape", "DeepSeek-V4 vision aligner w2 bias has the wrong shape",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.aligner_w2_bias = s.Empty(z.model, {z.out + 1});
+       }},
+      // The two remaining ValidateTensor branches, on one representative tensor
+      // each: a rank that does not match, and storage that is absent.
+      {"patch weight rank", "DeepSeek-V4 vision patch weight has the wrong rank",
+       [](DeepSeekV4VisionWeights& w, TensorStore& s, const Sizes& z) {
+         w.patch_weight = s.Empty(z.model, {z.h});
+       }},
+      {"qkv weight contiguity",
+       "DeepSeek-V4 vision qkv weight must be contiguous",
+       [](DeepSeekV4VisionWeights& w, TensorStore&, const Sizes&) {
+         w.blocks[0].qkv_weight.stride[0] += 1;
+       }},
+      {"aligner w2 weight storage",
+       "DeepSeek-V4 vision aligner w2 weight has no storage",
+       [](DeepSeekV4VisionWeights& w, TensorStore&, const Sizes&) {
+         w.aligner_w2_weight.data = nullptr;
+       }},
+  };
+
+  for (const Case& one : cases) {
+    // As a std::string: doctest stringifies a bare const char* as a pointer,
+    // which makes a failing row unidentifiable.
+    const std::string label(one.label);
+    CAPTURE(label);
+    TensorStore store(backend, queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    one.corrupt(weights, store, z);
+    bool refused = false;
+    try {
+      DeepSeekV4Vision model(backend, config, std::move(weights));
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      CHECK(std::string(error.what()) == std::string(one.message));
+    }
+    CHECK(refused);
+  }
+  backend.DestroyQueue(queue);
+}
+
+// W2 repair, F6 continued (#2411). THE CAPTURE VALIDATIONS TOO.
+//
+// `ValidateTensor` has 21 call sites. Fifteen are the weight checks the table
+// above drives; five more sit behind `ValidateCaptureTensor`, and the whole body
+// of that helper could be replaced by a no-op with the suite staying green. The
+// stage goldens pass CORRECT captures, so they exercise the happy path and no
+// refusal.
+//
+// These are gate-facing rather than production-facing, because production passes
+// nullptr and copies nothing. That is precisely why they need driving: a capture
+// contract nothing checks lets a future parity gate read a wrongly shaped buffer
+// and compare whatever happens to be in it.
+TEST_CASE("DeepSeek-V4 vision refuses every mis-declared capture tensor") {
+  Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue queue = backend.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+  const DeepSeekV4VisionConfig config = Config(fixture);
+  const int64_t height = 2;
+  const int64_t width = 5;
+  const int64_t patch_rows = height * width;
+  const int64_t output_rows = config.aligned_rows(height, width);
+
+  struct Case {
+    const char* label;
+    const char* message;
+    void (*corrupt)(CaptureTensors&, TensorStore&,
+                    const DeepSeekV4VisionConfig&, int64_t, int64_t);
+  };
+  const std::vector<Case> cases = {
+      {"patch capture dtype",
+       "DeepSeek-V4 vision patch capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) { c.patch = s.Empty(DType::kF32, {p, f.hidden_size}); }},
+      {"patch capture shape",
+       "DeepSeek-V4 vision patch capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.patch = s.Empty(f.compute_dtype, {p + 1, f.hidden_size});
+       }},
+      {"patch capture device",
+       "DeepSeek-V4 vision patch capture is on the wrong device",
+       [](CaptureTensors& c, TensorStore&, const DeepSeekV4VisionConfig&,
+          int64_t, int64_t) { c.patch.device.type = vt::DeviceType::kCUDA; }},
+      {"block capture dtype",
+       "DeepSeek-V4 vision block capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.blocks[1] = s.Empty(DType::kF32, {p, f.hidden_size});
+       }},
+      {"block capture shape",
+       "DeepSeek-V4 vision block capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.blocks[0] = s.Empty(f.compute_dtype, {p, f.hidden_size + 1});
+       }},
+      {"block capture count",
+       "DeepSeek-V4 vision block capture count must match depth",
+       [](CaptureTensors& c, TensorStore&, const DeepSeekV4VisionConfig&,
+          int64_t, int64_t) { c.capture.block_outputs.push_back(&c.patch); }},
+      {"final norm capture dtype",
+       "DeepSeek-V4 vision final norm capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.final_norm = s.Empty(DType::kF32, {p, f.hidden_size});
+       }},
+      {"final norm capture shape",
+       "DeepSeek-V4 vision final norm capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t p, int64_t) {
+         c.final_norm = s.Empty(f.compute_dtype, {p + 1, f.hidden_size});
+       }},
+      {"unfold capture dtype",
+       "DeepSeek-V4 vision unfold capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.unfold = s.Empty(DType::kF32, {o, f.aligner_input_size()});
+       }},
+      {"unfold capture shape",
+       "DeepSeek-V4 vision unfold capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.unfold = s.Empty(f.compute_dtype, {o, f.aligner_input_size() + 1});
+       }},
+      {"aligner hidden capture dtype",
+       "DeepSeek-V4 vision aligner hidden capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.aligner_hidden = s.Empty(DType::kF32, {o, f.output_size});
+       }},
+      {"aligner hidden capture shape",
+       "DeepSeek-V4 vision aligner hidden capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.aligner_hidden = s.Empty(f.compute_dtype, {o + 1, f.output_size});
+       }},
+      {"aligner GELU capture dtype",
+       "DeepSeek-V4 vision aligner GELU capture has the wrong dtype",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.gelu = s.Empty(DType::kF32, {o, f.output_size});
+       }},
+      {"aligner GELU capture shape",
+       "DeepSeek-V4 vision aligner GELU capture has the wrong shape",
+       [](CaptureTensors& c, TensorStore& s, const DeepSeekV4VisionConfig& f,
+          int64_t, int64_t o) {
+         c.gelu = s.Empty(f.compute_dtype, {o, f.output_size + 1});
+       }},
+  };
+
+  for (const Case& one : cases) {
+    const std::string label(one.label);
+    CAPTURE(label);
+    TensorStore store(backend, queue);
+    DeepSeekV4Vision model(backend, config, Weights(fixture, config, store));
+    Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                                {patch_rows, config.patch_dim()});
+    Tensor output = store.Empty(config.compute_dtype,
+                                {output_rows, config.output_size});
+    CaptureTensors captures(store, config, patch_rows, output_rows);
+    one.corrupt(captures, store, config, patch_rows, output_rows);
+    bool refused = false;
+    try {
+      model.Forward(queue, output, patches, height, width, &captures.capture);
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      CHECK(std::string(error.what()) == std::string(one.message));
+    }
+    CHECK(refused);
+  }
   backend.DestroyQueue(queue);
 }

@@ -66,6 +66,16 @@ struct DeepSeekV4VisionWeights {
   vt::Tensor aligner_w2_bias;    // model dtype [output]
 };
 
+// One internal scratch buffer's declared storage dtype, recorded in allocation
+// order. AGENTS.md, "Inherit vLLM defaults": a token gate CANNOT detect a dtype
+// that is too wide, because the values still match while the path moves twice
+// the bytes. Widening the attention-output buffer to f32 left every stage
+// golden green, so the memory format needs its own assertion.
+struct DeepSeekV4VisionScratchDType {
+  const char* name = nullptr;
+  vt::DType dtype = vt::DType::kBF16;
+};
+
 // Optional device-tensor captures for parity gates. Production passes nullptr
 // and performs no stage copies. A non-null tensor must have the documented
 // contiguous shape, the model dtype, and the queue device.
@@ -76,6 +86,32 @@ struct DeepSeekV4VisionCapture {
   vt::Tensor* aligner_unfold = nullptr;         // [aligned_rows, hidden*r^2]
   vt::Tensor* aligner_hidden = nullptr;         // [aligned_rows, output]
   vt::Tensor* aligner_gelu = nullptr;           // [aligned_rows, output]
+
+  // Non-null: the forward appends one entry per internal scratch buffer it
+  // allocates, in allocation order, so a test can assert the memory format of
+  // the model path. The vision stage CLEARS it and the aligner stage APPENDS,
+  // so a whole Forward records both stages as one sequence and an aligner call
+  // on its own adds to whatever the caller's vector already holds.
+  std::vector<DeepSeekV4VisionScratchDType>* scratch_dtypes = nullptr;
+};
+
+// The load-time storage-layout markers the shared MlpGateUpMethodBase seam
+// actually holds for one block's gate-up weight.
+//
+// Observable because a borrow that DROPS them is invisible to every value gate
+// on this host: dtype, rank, shape and byte count are all unchanged, and
+// `vt::cpu::QuantRepackActive()` is true only on an aarch64 i8mm host, so the
+// wrongly-decoded weight is not even wrong here. It was wrong on `thor`: the
+// shared `dense_attn::ResidentWeight` dropped `repacked` and an i8mm-interleaved
+// `block_q8_0x4` buffer (136-byte blocks) was decoded as flat `q8_0` (34-byte
+// blocks), which produced NaN, then all-zero logits, then token id 0, with
+// nothing logged because the `lm_head` GEMM swallowed the NaN. Fixed on `main`
+// at `7a937db8a` (#2031); this accessor is what keeps the same loss from being
+// re-introduced by a private borrow helper here.
+struct DeepSeekV4VisionStorageMarkers {
+  bool repacked = false;
+  bool q8_0_aligned = false;
+  bool elem_kn_repacked = false;
 };
 
 // Host f32 oracle helper. For each patch row it returns head_dim/2 values per
@@ -116,6 +152,10 @@ class DeepSeekV4Vision {
   // Observable cache size for allocation-stability tests. Geometry entries hold
   // reusable f32 RoPE data, positions, and exact unfold indices by shape/device.
   size_t cached_geometry_count() const;
+
+  // Observable storage-layout markers for the gate-up weight this model handed
+  // to the shared MLP seam. See DeepSeekV4VisionStorageMarkers.
+  DeepSeekV4VisionStorageMarkers mlp_gate_up_markers(int64_t block) const;
 
  private:
   class Impl;

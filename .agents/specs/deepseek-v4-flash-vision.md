@@ -1010,6 +1010,7 @@ THE CHAIN, from the entry point down:
 |---|---|
 | `feature.mm_hash = item.content_hash` (Qwen3-VL's content-only key) | RED, 2 assertions: one image at two offsets got ONE key |
 | the three chunk-atomicity predicates back to their pre-W5 silence | RED, the forward THREW NOTHING and the two unit cases did not throw |
+| the trailing `pad_run` rule deleted (W4/W5 reconciliation) | RED, 2 assertions: a step ending on the leading pads of the NEXT block was refused by NOTHING and returned an empty span list |
 | the codec catch re-throwing `std::runtime_error` | RED, 3 assertions: the refusals reached the client as 500 |
 | `REGISTER_VLLM_MM_CHAT` repointed at an architecture nothing loads | RED, 14 assertions across every case in the suite |
 | the pinned C-ABI contract case, before its own rewrite | RED, `REQUIRE( st == VLLM_OK )` -- the ABI now refuses by name |
@@ -1386,6 +1387,31 @@ build because the runner's gather-logits path reaches
 `DeepseekV4Model::ForwardDevice`. All four are named under `## Owed` above.
 No real artifact has been read or run: W6 owns the first load and generation,
 and W7 owns the device paths.
+
+THE W4/W5 MERGE CARRIED A REDUNDANT REFUSAL, and it is removed. Both waves
+closed the chunk-atomicity gap from opposite sides and the merge took both, so
+`DeepseekV4ImageSpans` ran a `spans.empty()` loop refusing any out-of-vocabulary
+row AHEAD of the trailing `pad_run` rule. That loop refused nothing the trailing
+rule does not: an empty span list means no START identifier was ever read, so
+`pad_run` was never reset and every pad the step carries is still counted at the
+end -- its condition is a SUBSET of the trailing rule's. Its only effect was to
+answer FIRST and with a different message, and that is what left the trailing
+rule ungated: deleting the trailing rule kept every case in the suite green. The
+loop is gone, and `test_deepseek_v4_dsa` now drives the pad-only chunk it was
+shadowing.
+
+SETTLED BY CONSTRUCTION AND NOT BY READING. Every token sequence of length 1 to
+6 over `{two ordinary ids, kImageStart, kImagePad, kImage, kImageNewLine,
+kImageEnd}` -- 137,256 of them -- was run through `DeepseekV4ImageSpans` with
+the loop present and with it deleted. The two agree on every single one: 134,405
+refuse either way, and the 2,851 that do not return the same span count. There
+is no input that reaches the loop and nothing else.
+
+The merge also pointed one case at a message that no longer fires --
+`test_deepseek_v4_mm_reach`'s interior chunk is refused where the loop READS the
+row, not after it -- and left one asserting that this architecture has no
+registered chat seam, which W5 gave it. Both are replaced rather than repaired,
+because each pinned a premise another wave superseded.
 
 W4 IS THE WAVE THAT MADE THE ROW REACHABLE. An image now travels from
 `--mmproj` through `ModelSource::mmproj` into `LoadDeepseekV4ForCausalLM`, which

@@ -426,6 +426,31 @@ TEST_CASE("dsv4 image spans: read from the step's OWN sentinel identifiers") {
       sentinel(vllm::multimodal::kImage)};
   CHECK_THROWS(vllm::DeepseekV4ImageSpans(trailing, vocab));
 
+  // THE PAD-ONLY CHUNK, and it is the boundary a chunked prefill cuts most
+  // often. `BuildDeepSeekV4ImageBlock` writes `compress_pad` PAD rows AHEAD of
+  // the START identifier, so a chunk that ends between those pads and the START
+  // carries NEITHER identifier and no image row that is not a pad: every
+  // in-loop check passes it and it opens no span. Only the trailing `pad_run`
+  // rule refuses it, and until this case nothing drove that rule -- a second,
+  // redundant refusal ran ahead of it and answered for it, so deleting the
+  // trailing rule left every case in this suite green.
+  //
+  // The count is asserted because it is what identifies WHICH rule fired: the
+  // trailing rule reports how many pads the step ends on, and no other refusal
+  // in this function reports a count.
+  const std::vector<int32_t> pad_only{7,
+                                      sentinel(vllm::multimodal::kImagePad),
+                                      sentinel(vllm::multimodal::kImagePad)};
+  std::string pad_only_message;
+  try {
+    (void)vllm::DeepseekV4ImageSpans(pad_only, vocab);
+  } catch (const std::exception& e) {
+    pad_only_message = e.what();
+  }
+  INFO("pad-only: ", pad_only_message);
+  CHECK(pad_only_message.find("2 image-pad row(s)") != std::string::npos);
+  CHECK(pad_only_message.find("scheduled whole") != std::string::npos);
+
   // THE NEGATIVE CONTROL, from the W4 repair round. A row that is out of
   // vocabulary but INSIDE a span this step closed is NOT refused. Without this
   // every refusal above is satisfiable by refusing everything.

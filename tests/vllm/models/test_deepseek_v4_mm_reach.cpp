@@ -271,27 +271,27 @@ TEST_CASE("REACH: a deepseek4v projector handed to a non-consuming architecture 
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// (1c) WHAT THE `supports_multimodal` FLIP DOES TO THE SERVER TODAY.
+// (1c) WHICH CHAT ARM THE SERVER'S INSTALL LANDS ON FOR THIS ARCHITECTURE.
 //
-// W4 turned `ModelInfo::supports_multimodal` on for this architecture and
-// recorded it as gating "the OpenAI server's chat seam, which W5 owns". W5 does
-// not own the consequence: `LoadedEngine::is_multimodal_model()` reads that flag
-// NOW and hands it to `InstallMultiModalChatSeam`, so the flip already moved
-// this architecture from `kTextOnlyModel`, where NOTHING is installed and the
-// chat path is byte-identical to a text-only server, to `kRefusing`, where an
-// image chat request gets HTTP 400 naming the architecture.
+// `InstallMultiModalChatSeam` reads exactly two inputs:
+// `LoadedEngine::is_multimodal_model()`, which is `ModelInfo::supports_multimodal`
+// off the loaded registration, and `MultiModalChatRegistry::Find(architecture)`.
+// The pair picks one of three arms -- `kTextOnlyModel`, where nothing is
+// installed and an image request is answered from the TEXT path; `kRefusing`,
+// an HTTP 400 naming the architecture; and `kInstalled`.
 //
-// That is very probably an improvement -- a refusal beats an image request
-// answered from the text path -- but it is a landed user-visible change, and
-// nothing drove it.
+// W4 flipped the flag while no factory was registered, which moved this
+// architecture from `kTextOnlyModel` to `kRefusing`, and an earlier version of
+// this case pinned that intermediate state by asserting `Find(arch) == nullptr`
+// and reading the `REGISTER_VLLM_MM_CHAT` message off it. W5 then registered
+// `mm_chat_deepseek_v4.cpp`, so that assertion described a tree that no longer
+// exists: both inputs are positive now and the arm is `kInstalled`. What it
+// meant is kept below on an architecture for which it is still true.
 //
-// The generic composition is already gated in `test_api_server_mm_forward`
-// ("an architecture with no registered seam REFUSES the image request by
-// name"), which drives the real install and reads the 400. What was missing is
-// the two DeepSeek-specific inputs that decide which arm this architecture
-// lands on, and this case measures both of them off the LOADED model rather
-// than off a hand-built registration.
-TEST_CASE("REACH: the multimodal flag puts DeepSeek-V4 on the REFUSING chat arm, not the text-only one") {
+// This case measures both inputs off the LOADED model rather than off a
+// hand-built registration. `test_deepseek_v4_mm_chat` drives the install itself
+// and reads the arm it returns.
+TEST_CASE("REACH: the multimodal flag and the registered seam put DeepSeek-V4 on the INSTALLED chat arm") {
   auto loaded = LoadThroughRegistry(/*vision_checkpoint=*/true,
                                     /*with_mmproj=*/true);
   const std::string_view arch = loaded->model->registration().architecture;
@@ -302,15 +302,23 @@ TEST_CASE("REACH: the multimodal flag puts DeepSeek-V4 on the REFUSING chat arm,
   // would install nothing and answer image requests from the text path.
   CHECK(loaded->model->registration().info.supports_multimodal);
 
-  // (b) No factory is registered for this architecture, so the lookup refuses.
-  // Only `mm_chat_qwen3vl.cpp` and `mm_chat_dots3note.cpp` call
-  // `REGISTER_VLLM_MM_CHAT`, and the DeepSeek request path is W5's.
+  // (b) A factory IS registered for this architecture. It is reached through
+  // the static library's `--whole-archive`, so a link that dropped
+  // `mm_chat_deepseek_v4.cpp` reads as an absent registration HERE rather than
+  // as a 400 in front of a user.
   namespace oai = vllm::entrypoints::openai;
-  CHECK(oai::MultiModalChatRegistry::Find(arch) == nullptr);
+  const oai::MultiModalChatRegistration* reg =
+      oai::MultiModalChatRegistry::Find(arch);
+  REQUIRE(reg != nullptr);
+  CHECK(reg->architecture == arch);
+  CHECK(reg->make_seam != nullptr);
 
-  // Which together are the `kRefusing` arm, and the message a user meets names
-  // the architecture and what to register. Read from `MakeSeam`, which is the
-  // one function the install calls.
+  // And that factory REFUSES BY NAME an install context it cannot serve rather
+  // than half-installing: it needs the tokenizer, the multimodal config, the
+  // resolved model config and the image codec, and an empty context carries
+  // none of them. The install's catch turns this into the refusing arm, so a
+  // misconfigured server still answers 400 and never answers an image from the
+  // text path.
   oai::MultiModalChatContext ctx;
   ctx.architecture = arch;
   std::string message;
@@ -320,14 +328,30 @@ TEST_CASE("REACH: the multimodal flag puts DeepSeek-V4 on the REFUSING chat arm,
     message = e.what();
   }
   INFO("message: ", message);
-  CHECK(message.find(std::string(arch)) != std::string::npos);
-  CHECK(message.find("REGISTER_VLLM_MM_CHAT") != std::string::npos);
+  CHECK(message.find("DeepSeek-V4") != std::string::npos);
+  CHECK(message.find("install context is incomplete") != std::string::npos);
 
-  // And the refusing chat function that install builds from it refuses a
-  // multimodal request while leaving a text one alone -- the property that makes
-  // this arm an improvement on `kTextOnlyModel` rather than a regression.
-  const oai::MultiModalChatFn refuse =
-      oai::MakeRefusingMultiModalChatFn(std::string(arch), message);
+  // THE NEGATIVE CONTROL, and it carries what the replaced assertion meant. An
+  // architecture with no registered factory still gets the refusal that names
+  // the architecture and names what to register -- which is what this case read
+  // off DeepSeek-V4 before W5 gave it a seam.
+  oai::MultiModalChatContext none;
+  none.architecture = "NotARegisteredArchForCausalLM";
+  std::string unregistered;
+  try {
+    (void)oai::MultiModalChatRegistry::MakeSeam(none);
+  } catch (const std::exception& e) {
+    unregistered = e.what();
+  }
+  INFO("unregistered: ", unregistered);
+  CHECK(unregistered.find("NotARegisteredArchForCausalLM") != std::string::npos);
+  CHECK(unregistered.find("REGISTER_VLLM_MM_CHAT") != std::string::npos);
+
+  // And the refusing chat function the install builds from such a message
+  // refuses a multimodal request while leaving a text one alone -- the property
+  // that makes the refusing arm an improvement on `kTextOnlyModel`.
+  const oai::MultiModalChatFn refuse = oai::MakeRefusingMultiModalChatFn(
+      "NotARegisteredArchForCausalLM", unregistered);
   vllm::entrypoints::openai::ChatMessage text;
   text.role = "user";
   text.content = "hello";
@@ -575,7 +599,7 @@ TEST_CASE("REACH: a masked row carrying an in-vocabulary id is refused by EmbedM
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -1058,7 +1082,7 @@ TEST_CASE("REACH: an image row leaves the hash route on a file whose every layer
     const auto image = MakeImage(vcfg);
     const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
         {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-        static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+        static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
     vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
     vt::Queue queue = backend.CreateQueue();
     const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
@@ -1272,7 +1296,7 @@ TEST_CASE("REACH: a chunk holding only the INTERIOR of an image block is refused
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -1354,9 +1378,18 @@ TEST_CASE("REACH: a chunk holding only the INTERIOR of an image block is refused
     message = e.what();
   }
   INFO("message: ", message);
-  // It names the identifier, the row, the atomicity requirement and the issue.
+  // It names the row, why the step cannot be answered, the atomicity
+  // requirement and the issue.
+  //
+  // THE WORDING IS THE IN-LOOP RULE's, and it is asserted rather than left
+  // loose because it says WHICH rule refused. This chunk's first row is an
+  // `kImage` sentinel, not a pad, so it is refused where the loop reads it --
+  // at row 0, before any trailing accounting can run. A message that spoke of
+  // the step as a whole would mean the loop had passed the row and something
+  // later caught it, which is a different guarantee.
   CHECK(message.find("image span") != std::string::npos);
-  CHECK(message.find("opened no span") != std::string::npos);
+  CHECK(message.find("the image row at row 0") != std::string::npos);
+  CHECK(message.find("outside every complete image block") != std::string::npos);
   CHECK(message.find("scheduled whole") != std::string::npos);
   CHECK(message.find("2411") != std::string::npos);
 }

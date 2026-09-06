@@ -4232,50 +4232,27 @@ std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
                " is not closed inside this step. An image block must be "
                "scheduled whole (.agents/specs/deepseek-v4-flash-vision.md, "
                "issue #2411)");
-  // THE THIRD CHUNK SHAPE, and it used to return silently. The two checks above
-  // catch a chunk holding a START with no END and a chunk holding an END with
-  // no START. A chunk holding NEITHER -- the interior of a long image block --
-  // matched no branch at all: the loop found nothing, `open_at` stayed -1, and
-  // the function returned ZERO spans for a step whose every row is an image row.
+  // THE CHUNK THAT ENDS ON PADS, which is the third shape a boundary cuts and
+  // the only one the two checks above cannot see. `BuildDeepSeekV4ImageBlock`
+  // writes `compress_pad` PAD rows AHEAD of the START identifier, so a step can
+  // end on the leading pads of a block whose START is in the NEXT chunk: it
+  // carries neither identifier, every pad passes the in-loop rule that only
+  // asks a media row to BE a pad, and the loop finishes with nothing said.
   //
-  // What that costs is not an exception, it is silence. With no span the
-  // visible-row rule falls back to the ordinary sliding window OVER IMAGE ROWS,
-  // and the paged arm's refusal keys on a non-empty `image_spans` so it does not
-  // fire either. `media_rows > 0` still holds in `MoeBlock`, so the vision
-  // routing bias is still applied and the answer stays fluent. That is the same
-  // failure the other two refuse, minus every signal that it happened.
+  // What that costs is not an exception, it is silence. The pads belong to a
+  // block this step will never see, so the span never opens; the visible-row
+  // rule then falls back to the ordinary sliding window and the paged arm's
+  // refusal keys on a NON-EMPTY span list, so neither fires, while
+  // `media_rows > 0` still applies the vision routing bias in `MoeBlock` and
+  // the answer stays fluent.
   //
-  // It is not hypothetical: `SchedulerConfig::disable_chunked_mm_input` defaults
-  // to FALSE and `gather_mm_embeddings` handles a partial span, so the request
-  // path W5 is wiring can produce exactly this step. This is defence in depth
-  // behind whatever the scheduler decides -- if image prefill is made atomic
-  // there, this never fires; if it is not, this is the only thing between a user
-  // and a half-visible image.
-  //
-  // THE CONDITION IS "no span at all", not "every image row is inside a span".
-  // `BuildDeepSeekV4ImageBlock` writes `compress_pad` PAD rows BEFORE the start
-  // marker, so a perfectly ordinary whole block carries image identifiers
-  // outside every span it opens, and the stricter reading refuses the step this
-  // suite's own reachability cases drive.
-  if (spans.empty()) {
-    for (int64_t t = 0; t < static_cast<int64_t>(token_ids.size()); ++t) {
-      VT_CHECK(token_ids[static_cast<size_t>(t)] < vocab_size,
-               "deepseek-v4 image span: this step carries the image identifier " +
-                   std::to_string(token_ids[static_cast<size_t>(t)]) + " at row " +
-                   std::to_string(t) +
-                   " and NO image-start or image-end marker, so it opened no span "
-                   "at all. That is the interior of an image block cut out of its "
-                   "own prefill chunk: it would be served with the ordinary "
-                   "sliding window over image rows and would answer fluently. An "
-                   "image block must be scheduled whole "
-                   "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
-    }
-  }
-
-  // W5's trailing-pad check below is NOT the same shape and both are needed. This
-  // one fires when the chunk opened NO span at all; that one fires when a chunk
-  // ends with the leading pads of the NEXT block, which happens with a non-empty
-  // `spans` and so slips past the check above.
+  // It is not hypothetical: `SchedulerConfig::disable_chunked_mm_input`
+  // defaults to FALSE and nothing in this tree can turn it on, and
+  // `gather_mm_embeddings` hands a partial span through, so the served request
+  // path can produce exactly this step. Refused by name until image prefill is
+  // made atomic in the scheduler, which is a shared scheduler-policy seam owed
+  // by issue #2411 and row
+  // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm.
   VT_CHECK(pad_run == 0,
            "deepseek-v4 image span: this step ends with " +
                std::to_string(pad_run) +

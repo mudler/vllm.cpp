@@ -4096,24 +4096,89 @@ std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
   const int64_t start_id =
       vocab_size + static_cast<int64_t>(multimodal::kImageStart);
   const int64_t end_id = vocab_size + static_cast<int64_t>(multimodal::kImageEnd);
+  const int64_t pad_id =
+      vocab_size + static_cast<int64_t>(multimodal::kImagePad);
   int64_t open_at = -1;
+  // THE LEADING COMPRESSION PAD. `build_image_block` writes
+  // `3 - start_position % 4` pad rows BEFORE the start identifier, so a whole
+  // block's media rows are not all between START and END and an accounting
+  // that assumed they were would refuse every correct prompt. A run of pad
+  // rows outside a span is legal only while it is still on its way to a START
+  // in this same step, which is what `pad_run` tracks.
+  int64_t pad_run = 0;
   for (int64_t t = 0; t < static_cast<int64_t>(token_ids.size()); ++t) {
     const int64_t id = token_ids[static_cast<size_t>(t)];
-    if (id == start_id) {
-      VT_CHECK(open_at < 0,
+    if (open_at >= 0) {
+      // Inside an open block: every row of it is a sentinel and belongs to the
+      // span, so only the two structural identifiers are read here.
+      VT_CHECK(id != start_id,
                "deepseek-v4 image span: a second image-start identifier at row " +
                    std::to_string(t) + " while the span opened at row " +
                    std::to_string(open_at) + " is still open");
-      open_at = t;
+      if (id == end_id) {
+        spans.push_back({base + open_at, base + t + 1});
+        open_at = -1;
+      }
       continue;
     }
-    if (id == end_id) {
-      VT_CHECK(open_at >= 0,
-               "deepseek-v4 image span: an image-end identifier at row " +
-                   std::to_string(t) + " with no open span");
-      spans.push_back({base + open_at, base + t + 1});
-      open_at = -1;
+    if (id == start_id) {
+      open_at = t;
+      pad_run = 0;  // the pads that led here are this block's own
+      continue;
     }
+    VT_CHECK(id != end_id,
+             "deepseek-v4 image span: an image-end identifier at row " +
+                 std::to_string(t) + " with no open span");
+    if (id >= vocab_size) {
+      // A MEDIA ROW OUTSIDE ANY BLOCK. The only one that can legally be here is
+      // a leading compression pad; an image or newline row outside a block is
+      // the INTERIOR of a block whose start and end both fell in other chunks.
+      //
+      // W4 enforced atomicity for the two shapes that carry ONE of the two
+      // identifiers. A chunk cut from the middle carries NEITHER, so both of
+      // those checks stayed silent and this function returned zero spans on a
+      // step made entirely of image rows. Two things then went wrong at once
+      // and neither was observable: the visible-row rule fell back to the
+      // ordinary sliding window over image rows, which is half a visible span
+      // answering fluently; and the paged arm's refusal is keyed on a NON-EMPTY
+      // span list, so it did not fire either. The routing bias still applied,
+      // because it reads the identifiers rather than the spans, so every other
+      // signal looked right.
+      //
+      // WHY A REFUSAL AND NOT ATOMIC SCHEDULING. The scheduler can keep a span
+      // whole: `Scheduler::try_schedule_encoder_inputs` rolls a step back to
+      // before an item when `SchedulerConfig::disable_chunked_mm_input` is set.
+      // That flag defaults to false and NOTHING can turn it on -- no
+      // command-line flag, no `include/vllm.h` field, and no per-architecture
+      // channel through which a model could ask for it. Adding one is a shared
+      // scheduler-policy seam rather than a model change, so it is owed by
+      // issue #2411 and row
+      // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, and until it lands the
+      // step is refused by name rather than answered from a window that has
+      // seen a third of the picture.
+      VT_CHECK(id == pad_id,
+               "deepseek-v4 image span: the image row at row " +
+                   std::to_string(t) +
+                   " is outside every complete image block in this step. A "
+                   "prefill chunk cut from the middle of a block carries "
+                   "neither its start nor its end identifier, so the span is "
+                   "invisible to the visibility rule and to the paged-arm "
+                   "refusal, and the step would be answered from the ordinary "
+                   "sliding window over image rows. An image block must be "
+                   "scheduled whole "
+                   "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
+      ++pad_run;
+      continue;
+    }
+    // An ordinary text row. Any pad run before it never reached a start, so it
+    // is the tail of a block cut by a chunk boundary.
+    VT_CHECK(pad_run == 0,
+             "deepseek-v4 image span: " + std::to_string(pad_run) +
+                 " image-pad row(s) before row " + std::to_string(t) +
+                 " are followed by a text row rather than by an image-start "
+                 "identifier, so the block they lead is not in this step. An "
+                 "image block must be scheduled whole "
+                 "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
   }
   // The spec requires an image span to fall inside ONE prefill chunk. A span cut
   // by a chunk boundary would be half-visible and would answer fluently, so it
@@ -4124,6 +4189,12 @@ std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
                " is not closed inside this step. An image block must be "
                "scheduled whole (.agents/specs/deepseek-v4-flash-vision.md, "
                "issue #2411)");
+  VT_CHECK(pad_run == 0,
+           "deepseek-v4 image span: this step ends with " +
+               std::to_string(pad_run) +
+               " image-pad row(s) whose image-start identifier is in another "
+               "chunk. An image block must be scheduled whole "
+               "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
   return spans;
 }
 

@@ -398,4 +398,31 @@ TEST_CASE("dsv4 image spans: read from the step's OWN sentinel identifiers") {
   const std::vector<int32_t> cut{7, sentinel(vllm::multimodal::kImageStart),
                                  sentinel(vllm::multimodal::kImage)};
   CHECK_THROWS(vllm::DeepseekV4ImageSpans(cut, vocab));
+
+  // THE TAIL of the same cut: an END with no START before it.
+  const std::vector<int32_t> tail{sentinel(vllm::multimodal::kImage),
+                                  sentinel(vllm::multimodal::kImageEnd), 9};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(tail, vocab));
+
+  // AND THE MIDDLE, which the two above cannot see. A chunk cut from inside one
+  // block carries NEITHER identifier, so both partial checks stay silent; this
+  // used to return zero spans on a step made entirely of image rows, which left
+  // the visibility rule on the ordinary sliding window AND left the paged arm's
+  // non-empty-span refusal unarmed. `disable_chunked_mm_input` defaults to
+  // false and nothing in this tree can turn it on, so the shape is reachable
+  // from a served request the moment one exists.
+  const std::vector<int32_t> interior{sentinel(vllm::multimodal::kImage),
+                                      sentinel(vllm::multimodal::kImagePad),
+                                      sentinel(vllm::multimodal::kImage)};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(interior, vocab));
+
+  // A block followed by a LOOSE image row is refused too: the accounting is
+  // over every media row, not merely over the outermost pair, so a step that
+  // closed one block and then began another mid-way is not read as whole.
+  const std::vector<int32_t> trailing{
+      sentinel(vllm::multimodal::kImageStart),
+      sentinel(vllm::multimodal::kImage),
+      sentinel(vllm::multimodal::kImageEnd),
+      sentinel(vllm::multimodal::kImage)};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(trailing, vocab));
 }

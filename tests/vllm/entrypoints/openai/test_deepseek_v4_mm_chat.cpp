@@ -444,6 +444,43 @@ TEST_CASE("dsv4 mm chat: two interleaved images land in source order") {
   }
 }
 
+// A CONVERSATION, not a single turn. `MessageToJson` has two arms -- a
+// bare-string `content` and a content-part array -- and the pinned encoder
+// renders the whole history around the image. A seam that dropped the earlier
+// turns, or that fed the encoder only the message carrying the image, would
+// still produce a well-formed block at a plausible offset.
+TEST_CASE("dsv4 mm chat: an earlier bare-string turn survives into the prompt") {
+  Ctx c;
+  const oai::MultiModalChatSeam seam =
+      oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+
+  oai::ChatMessage user0;
+  user0.role = "user";
+  user0.content = std::string("b");
+  oai::ChatMessage assistant;
+  assistant.role = "assistant";
+  assistant.content = std::string("c");
+
+  const std::optional<mm::MultiModalInputs> mm = seam.chat_fn(
+      {user0, assistant, UserWith({TextPart("a"), ImagePart(kSideA, 1)})});
+  REQUIRE(mm.has_value());
+  REQUIRE(mm->mm_features.size() == 1);
+
+  // The first turn's "b" (id 8) and the assistant's "c" (id 9) are both in the
+  // prompt, and both BEFORE the image span. The single-turn case above puts the
+  // span at offset 5; here the two earlier turns push it further out, which is
+  // what a dropped history could not do.
+  const std::vector<int32_t>& ids = mm->prompt_token_ids;
+  const auto pos = [&](int32_t id) {
+    return std::find(ids.begin(), ids.end(), id) - ids.begin();
+  };
+  CHECK(std::count(ids.begin(), ids.end(), 8) == 1);
+  CHECK(std::count(ids.begin(), ids.end(), 9) == 1);
+  CHECK(pos(8) < mm->mm_features[0].offset);
+  CHECK(pos(9) < mm->mm_features[0].offset);
+  CHECK(mm->mm_features[0].offset > 5);
+}
+
 // ---------------------------------------------------------------------------
 // (4) THE CEILING COMES FROM `MultiModalConfig`, and this seam declares none.
 //

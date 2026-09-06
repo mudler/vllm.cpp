@@ -2552,6 +2552,16 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_kv_cache_dtype
     vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp)
   target_include_directories(test_serve_kv_cache_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # MODEL-MM-deepseek-v4 W5 (#2411): --mmproj and the resolved model config
+  # reaching the multimodal chat install through the REAL VllmServerMain. Same
+  # shape and the same reason as the two rows above; it also needs the GGUF
+  # fixtures beside the model gates, because the two lines it holds are only
+  # observable on a checkpoint whose architecture declares multimodal support.
+  vllm_cpp_add_test(test_serve_deepseek_v4_mm
+    vllm/entrypoints/openai/test_serve_deepseek_v4_mm.cpp)
+  target_include_directories(test_serve_deepseek_v4_mm PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm
+    ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

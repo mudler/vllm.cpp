@@ -219,10 +219,12 @@ MultiModalChatFn MakeDeepSeekV4ChatFn(
         tokenizer.EncodeWithSpecialTokens(encoded.prompt);
 
     // 3. Decode and preprocess every image IN SOURCE ORDER. The pinned
-    //    encoder's own image records are what is walked, not `image_parts`, so
-    //    an image nested inside a `tool_result` block -- which the encoder
-    //    reaches and this file's flat loop does not -- is decoded in the
-    //    position the encoder gave it.
+    //    ENCODER'S OWN image records are what is walked, not `image_parts`, so
+    //    the bytes that get preprocessed are the ones the encoder placed a
+    //    placeholder for. The two walks agree today -- `ChatContentPart` has no
+    //    nested-content form, so no image can reach the encoder that this
+    //    file's flat loop misses -- and the count check above is what says so
+    //    rather than a comment.
     std::vector<multimodal::DeepSeekV4ImageItem> images;
     images.reserve(encoded.images.size());
     for (const json& record : encoded.images) {

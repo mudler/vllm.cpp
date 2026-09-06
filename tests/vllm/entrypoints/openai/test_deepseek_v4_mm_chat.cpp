@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -33,10 +34,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include "deepseek_v4_lang_gguf_fixture.h"
+#include "deepseek_v4_mmproj_fixture.h"
 #include "vllm/config/multimodal.h"
+#include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/mm_chat_registry.h"
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/multimodal/deepseek_v4_processor.h"
 #include "vllm/multimodal/hasher.h"
 #include "vllm/multimodal/inputs.h"
@@ -651,4 +656,201 @@ TEST_CASE("dsv4 mm chat: the factory refuses an install it cannot serve") {
     CHECK(Threw([&] { (void)oai::MultiModalChatRegistry::MakeSeam(c.ctx); })
               .find("install context is incomplete") != std::string::npos);
   }
+}
+
+// ---------------------------------------------------------------------------
+// (7) THE SERVER SURFACE. `InstallMultiModalChatSeam` is the ONE production
+//     caller of `set_multimodal_chat_fn`, and `create_chat_completion` is what
+//     an HTTP request reaches. Everything above this case tests the seam BODY;
+//     this one tests that a user arrives at it.
+//
+//     It enters through `LoadedEngine::FromModelDir` -- the entry point every
+//     server and command line takes for a `.gguf` argument -- with a `--mmproj`
+//     second file, and drives a chat request carrying two `image_url` parts
+//     through the real `OpenAIServingChat`.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The projector geometry, at the PINNED processor's patch size. `output` must
+// be the language model's hidden width (the aligner's rows go straight into the
+// residual stream) and `patch` must be 14, because the seam's processor is the
+// pinned one and `EncodeMmDeepseekV4ForCausalLM` refuses a feature width the
+// projector does not want.
+dsv4_mmproj_test::Dims ServerProjDims() {
+  dsv4_mmproj_test::Dims d;
+  d.output = dsv4_lang_test::kH;
+  d.patch = 14;
+  return d;
+}
+
+dsv4_mmproj_test::Options ServerProjOptions() {
+  dsv4_mmproj_test::Options o;
+  o.fold_exponents = 7;  // this suite RUNS the tower
+  return o;
+}
+
+// ONE SERVED REQUEST, on its own engine. A failed step stops `AsyncLLM`, so a
+// second request on the same engine reports "submitted to a stopped AsyncLLM"
+// and any comparison across the two would measure the ORDER rather than the
+// paths. Each call therefore builds the whole production stack again.
+struct Served {
+  oai::MultiModalChatInstall install = oai::MultiModalChatInstall::kTextOnlyModel;
+  std::string install_log;
+  std::string error;   // empty when the engine answered
+  int prompt_tokens = 0;
+  std::string role;
+};
+
+Served ServeOnce(std::vector<oai::ChatMessage> messages) {
+  // SYNCHRONOUS SCHEDULING, and it is load-bearing rather than tidy. With the
+  // default asynchronous scheduler this engine dies non-deterministically in
+  // `GPUModelRunner::gather_block_table` -- observed on a ONE-TOKEN TEXT prompt
+  // as often as on an image one, and swapping between runs of the same binary,
+  // so it is neither a multimodal condition nor a prompt-length one. A gate
+  // that reports a different failure each run measures the scheduler, not the
+  // seam. The instability itself is recorded under `## Owed`.
+  setenv("VT_ASYNC_SCHED", "0", /*overwrite=*/1);
+  gguf_test::TempFile lang(dsv4_lang_test::BuildDeepseek4Gguf(
+      /*vision=*/true, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
+      /*head_dim=*/512, /*with_tokenizer=*/true));
+  gguf_test::TempFile proj(
+      dsv4_mmproj_test::Build(ServerProjDims(), ServerProjOptions()));
+
+  vllm::entrypoints::EngineParams params;
+  params.mmproj_path = proj.path();
+  // OFF, and not incidentally. This architecture's KV topology gives the block
+  // pool a hash-block size that differs from its block size, and
+  // `BlockPool::cache_full_blocks` refuses that combination by name. That is a
+  // prefix-cache gap outside this row; leaving it on kills the engine's busy
+  // loop before anything here can be measured.
+  params.enable_prefix_caching = false;
+  // The fixture GGUF carries no `deepseek4.context_length`, so the engine would
+  // resolve `max_model_len = 0` and `InputBatch`'s per-request token row would
+  // have no width at all.
+  params.max_model_len = 1024;
+
+  Served out;
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> engine =
+      vllm::entrypoints::LoadedEngine::FromModelDir(lang.path(), params);
+  REQUIRE(engine != nullptr);
+  CHECK(engine->architecture() == kArch);
+  CHECK(engine->is_multimodal_model());
+
+  oai::OpenAIServingChat chat(
+      engine->async_engine(), "deepseek-v4-flash-vision",
+      [](const std::vector<oai::ChatMessage>& ms, bool,
+         const std::vector<oai::ChatCompletionToolsParam>&,
+         const json&) -> std::string {
+        // The TEXT path's renderer. An image request never reaches it: this
+        // architecture renders with its own pinned encoder.
+        std::string t;
+        for (const oai::ChatMessage& m : ms) t += m.content.value_or(std::string());
+        return t;
+      });
+
+  // THE PRODUCTION INSTALL, field for field as `server_main.cpp` fills it in.
+  oai::MultiModalChatContext ctx;
+  ctx.architecture = std::string(engine->architecture());
+  ctx.model_dir = std::filesystem::path(lang.path()).parent_path().string();
+  ctx.config_path = ctx.model_dir + "/config.json";  // a .gguf has none
+  ctx.served_model_name = "deepseek-v4-flash-vision";
+  ctx.tokenizer = &engine->tokenizer();
+  ctx.prompt_fn = [](const std::vector<oai::ChatMessage>&, bool,
+                     const std::vector<oai::ChatCompletionToolsParam>&,
+                     const json&) -> std::string { return std::string(); };
+  ctx.codec = oai::DefaultImageCodec();
+  ctx.mm_config = &engine->mm_config();
+  ctx.config = &engine->config();
+  ctx.mmproj_path = params.mmproj_path;
+  std::ostringstream log;
+  out.install = oai::InstallMultiModalChatSeam(
+      chat, engine->is_multimodal_model(), ctx, log);
+  out.install_log = log.str();
+
+  oai::ChatCompletionRequest req;
+  req.messages = std::move(messages);
+  req.max_completion_tokens = 2;
+  req.temperature = 0.0;
+  req.stream = false;
+  oai::ChatCompletionResult result;
+  out.error = Threw([&] { result = chat.create_chat_completion(req); });
+  if (out.error.empty() && result.response.has_value() &&
+      !result.response->choices.empty()) {
+    out.prompt_tokens = result.response->usage.prompt_tokens;
+    out.role = result.response->choices[0].message.role;
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("dsv4 mm chat: two images reach the server through the production install") {
+  oai::ChatMessage text;
+  text.role = "user";
+  text.content = std::string("a");
+  const Served text_run = ServeOnce({text});
+  oai::ChatMessage long_text;
+  long_text.role = "user";
+  long_text.content = std::string(260, 'a');
+  const Served long_run = ServeOnce({long_text});
+  MESSAGE("LONG TEXT: " << (long_run.error.empty() ? std::string("served")
+                                                   : long_run.error));
+  const Served image_run = ServeOnce(
+      {UserWith({TextPart("a"), ImagePart(kSideA, 1), TextPart("b"),
+                 ImagePart(kSideB, 2)})});
+
+  // (a) THE INSTALL. `InstallMultiModalChatSeam` is the ONE production caller
+  //     of `set_multimodal_chat_fn`, and it reached the DeepSeek factory. NOT
+  //     `kRefusing`, which is what this architecture got before W5 registered
+  //     one: `Find("DeepseekV4ForCausalLM")` was null, so the install caught
+  //     `RaiseForUnregistered` and wired a seam that answered every image
+  //     request with HTTP 400.
+  CHECK(image_run.install == oai::MultiModalChatInstall::kInstalled);
+  INFO("install log: ", image_run.install_log);
+  CHECK(image_run.install_log.find("DeepSeek-V4") != std::string::npos);
+  CHECK(image_run.install_log.find("deepseek4v") != std::string::npos);
+
+  // (b) WHERE THE SERVED IMAGE REQUEST GETS TO, and this is the wave's own
+  //     reachability claim at the server surface.
+  //
+  //     The message is the REGISTERED FORWARD's own named W7-device residual,
+  //     raised inside `deepseek_v4.cpp`. So the request travelled
+  //     `create_chat_completion` -> the installed seam -> `AsyncLLM` ->
+  //     `Scheduler` -> `GPUModelRunner::execute_model` ->
+  //     `ModelRegistry::Forward`, and was refused THERE. Nothing short of the
+  //     registered forward can produce it, which is what makes it evidence
+  //     rather than a disappointment: `DeepseekV4Model::ForwardDevice` is what
+  //     the runner's gather-logits path reaches for EVERY request on this
+  //     architecture, and a CPU build carries no V4 device kernels. Serving
+  //     this architecture on a device is W7-CUDA's and issue #2411 owns it.
+  //
+  //     A generated answer is therefore not available here, and the case
+  //     upgrades itself to one the moment the engine can produce it.
+  MESSAGE("image: " << (image_run.error.empty() ? std::string("served")
+                                                : image_run.error));
+  MESSAGE("text:  " << (text_run.error.empty() ? std::string("served")
+                                               : text_run.error));
+  MESSAGE("long:  " << (long_run.error.empty() ? std::string("served")
+                                               : long_run.error));
+  if (image_run.error.empty()) {
+    // The engine answers. Then the multimodal claim is the PROMPT the request
+    // was expanded to: two image blocks of ~120 sentinel tokens each, not the
+    // four content parts a seam-less path would have rendered.
+    CHECK(image_run.role == "assistant");
+    CHECK(image_run.prompt_tokens > 200);
+  } else {
+    CHECK(image_run.error.find("deepseek_v4.cpp") != std::string::npos);
+    CHECK(image_run.error.find("W7-device") != std::string::npos);
+  }
+
+  // (c) THE TEXT PATH ON THIS FIXTURE STOPS EARLIER, and it is recorded rather
+  //     than asserted away. Both text requests -- one token and 260 -- die in
+  //     `GPUModelRunner::gather_block_table` before the forward, on a
+  //     synthetic checkpoint whose KV topology gives `block_size = 256`
+  //     against `max_model_len = 1024`. No change in this wave touches that
+  //     path: the multimodal request, which does reach the forward, is the one
+  //     that exercises what W5 added. The row's spec lists it under `## Owed`
+  //     with the measurement, because a case that ASSERTED the failure would
+  //     redden the day somebody fixed it. The `MESSAGE` lines above carry the
+  //     observation into every run's output instead.
 }

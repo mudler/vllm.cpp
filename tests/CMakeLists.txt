@@ -2449,6 +2449,10 @@ if(VLLM_CPP_SERVER)
   # different processor.
   vllm_cpp_add_test(test_deepseek_v4_mm_chat
     vllm/entrypoints/openai/test_deepseek_v4_mm_chat.cpp)
+  # The language and projector GGUF fixtures live beside the model gates, and
+  # they are shared with the W3B/W4 suites so the artifact is described once.
+  target_include_directories(test_deepseek_v4_mm_chat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vllm ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
   target_compile_definitions(test_openai_api_server_dots3_mm_forward PRIVATE
     DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
   # The tiny-checkpoint fixture header lives beside the model gates, and

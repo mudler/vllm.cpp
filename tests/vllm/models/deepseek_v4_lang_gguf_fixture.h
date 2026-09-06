@@ -14,7 +14,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gguf_builder.h"
@@ -187,16 +189,45 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
   if (with_tokenizer) {
     b.AddKv(StrKv("tokenizer.ggml.model", "gpt2"));
     b.AddKv(StrKv("tokenizer.ggml.pre", "llama-bpe"));
+    // THE PINNED CHAT TEMPLATE'S OWN MARKERS, plus the image placeholder, as
+    // token_type 3 (control -> added token). `EncodeDeepSeekV4Messages` writes
+    // exactly these strings and the multimodal chat seam resolves
+    // `<|deepseek_image|>` BY STRING through this tokenizer, so a fixture of
+    // single letters could not tokenize a rendered DeepSeek prompt at all.
+    //
+    // The plain half is three letters and the byte-level newline, which is what
+    // `RenderContentBlocks`'s "\n\n" separator needs; the rest is filler that
+    // keeps the id count at `kVocab`, because the model's embedding table has
+    // that many rows and the image sentinels are spelled `kVocab + type`.
+    const std::vector<std::pair<std::string, int32_t>> vocab{
+        {"<｜begin▁of▁sentence｜>", 3},
+        {"<｜end▁of▁sentence｜>", 3},
+        {"<｜User｜>", 3},
+        {"<｜Assistant｜>", 3},
+        {"<｜deepseek_image｜>", 3},
+        {"</think>", 3},
+        {"<think>", 3},
+        {"a", 1}, {"b", 1}, {"c", 1},
+        {"Ċ", 1},  // the byte-level newline
+        {"d", 1}, {"e", 1}, {"f", 1}, {"g", 1}, {"h", 1},
+    };
     std::vector<std::string> toks;
     std::vector<int32_t> types;
-    for (int64_t i = 0; i < kVocab; ++i) {
-      toks.push_back(std::string(1, static_cast<char>('a' + i)));
-      types.push_back(1);
+    for (const auto& [text, type] : vocab) {
+      toks.push_back(text);
+      types.push_back(type);
+    }
+    if (static_cast<int64_t>(toks.size()) != kVocab) {
+      throw std::runtime_error(
+          "deepseek-v4 fixture tokenizer: the vocabulary must have exactly "
+          "kVocab entries, because the embedding table has that many rows and "
+          "the image sentinels are spelled kVocab + type");
     }
     b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.tokens", toks));
     b.AddKv(I32ArrayKv("tokenizer.ggml.token_type", types));
     b.AddKv(gguf_test::StrArrayKv("tokenizer.ggml.merges", {}));
-    b.AddKv(U32Kv("tokenizer.ggml.eos_token_id", static_cast<uint32_t>(kVocab - 1)));
+    b.AddKv(U32Kv("tokenizer.ggml.eos_token_id", 1));
+    b.AddKv(U32Kv("tokenizer.ggml.bos_token_id", 0));
   }
 
   const auto f32 = [&](const std::string& name, const std::vector<int64_t>& shape) {

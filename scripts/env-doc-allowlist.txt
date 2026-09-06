@@ -3,6 +3,7 @@ VLLM_GEMMA4_MM_DEBUG
 VLLM_MM_TOWER_PROFILE
 VT_ACT_F32
 VT_ARCH_TACTIC_STATS
+VT_ASYNC_DEBUG
 VT_ASYNC_EXECUTOR_NO_DBUF
 VT_ASYNC_EXECUTOR_POISON
 VT_ASYNC_EXECUTOR_TRACE
@@ -218,6 +219,8 @@ VT_V4_RESIDENT_W
 VT_V4_ROPE_FLOAT
 VT_V4_ROUTE_WARP_TOPK
 VT_W4A4_TRUE
+VT_WVSPLIT_PRGRP
+VT_WVSPLIT_YTILE
 # (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
 # Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
 # Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,

@@ -399,24 +399,36 @@ TEST_CASE("dsv4 image spans: read from the step's OWN sentinel identifiers") {
                                  sentinel(vllm::multimodal::kImage)};
   CHECK_THROWS(vllm::DeepseekV4ImageSpans(cut, vocab));
 
-  // AND SO IS THE THIRD SHAPE. START-with-no-END is the case above and
-  // END-with-no-START is refused by the open-span check; a chunk carrying
-  // NEITHER marker -- the INTERIOR of a long image block -- matched no branch
-  // and returned ZERO spans silently. With no span the visible-row rule falls
-  // back to the ordinary sliding window over image rows and the paged arm's
-  // refusal, which keys on a non-empty span list, does not fire either, so the
-  // step is served half-visible and fluent.
+  // THE TAIL of the same cut: an END with no START before it.
+  const std::vector<int32_t> tail{sentinel(vllm::multimodal::kImage),
+                                  sentinel(vllm::multimodal::kImageEnd), 9};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(tail, vocab));
+
+  // AND THE MIDDLE, which the two above cannot see. A chunk cut from inside one
+  // block carries NEITHER identifier, so both partial checks stay silent; this
+  // used to return zero spans on a step made entirely of image rows, which left
+  // the visibility rule on the ordinary sliding window AND left the paged arm's
+  // non-empty-span refusal unarmed. `disable_chunked_mm_input` defaults to
+  // false and nothing in this tree can turn it on, so the shape is reachable
+  // from a served request the moment one exists.
   const std::vector<int32_t> interior{sentinel(vllm::multimodal::kImage),
                                       sentinel(vllm::multimodal::kImagePad),
                                       sentinel(vllm::multimodal::kImage)};
-  CHECK_THROWS(vllm::DeepseekV4ImageSpans(interior, vocab, /*base=*/128));
-  // END with no START is the mirror, and it was already refused. Asserted here
-  // so the three chunk shapes stand together and none can be dropped alone.
-  const std::vector<int32_t> tail_only{sentinel(vllm::multimodal::kImage),
-                                       sentinel(vllm::multimodal::kImageEnd)};
-  CHECK_THROWS(vllm::DeepseekV4ImageSpans(tail_only, vocab));
-  // A row that is out of vocabulary but INSIDE a span this step closed is not
-  // refused, which is what keeps the ordinary whole-block step working.
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(interior, vocab));
+
+  // A block followed by a LOOSE image row is refused too: the accounting is
+  // over every media row, not merely over the outermost pair, so a step that
+  // closed one block and then began another mid-way is not read as whole.
+  const std::vector<int32_t> trailing{
+      sentinel(vllm::multimodal::kImageStart),
+      sentinel(vllm::multimodal::kImage),
+      sentinel(vllm::multimodal::kImageEnd),
+      sentinel(vllm::multimodal::kImage)};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(trailing, vocab));
+
+  // THE NEGATIVE CONTROL, from the W4 repair round. A row that is out of
+  // vocabulary but INSIDE a span this step closed is NOT refused. Without this
+  // every refusal above is satisfiable by refusing everything.
   const std::vector<int32_t> whole{7, sentinel(vllm::multimodal::kImageStart),
                                    sentinel(vllm::multimodal::kImage),
                                    sentinel(vllm::multimodal::kImageEnd), 9};

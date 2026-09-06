@@ -2442,6 +2442,17 @@ if(VLLM_CPP_SERVER)
   # added tokens are dots3-note's own image markers).
   vllm_cpp_add_test(test_openai_api_server_dots3_mm_forward
     vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp)
+  # MODEL-MM-deepseek-v4 W5 (#2411): the REQUEST path for the third multimodal
+  # architecture. Its own target for the reason the two above have one: a
+  # different tokenizer fixture (one whose added tokens are the pinned DeepSeek
+  # chat template's markers and the `<|deepseek_image|>` placeholder) and a
+  # different processor.
+  vllm_cpp_add_test(test_deepseek_v4_mm_chat
+    vllm/entrypoints/openai/test_deepseek_v4_mm_chat.cpp)
+  # The language and projector GGUF fixtures live beside the model gates, and
+  # they are shared with the W3B/W4 suites so the artifact is described once.
+  target_include_directories(test_deepseek_v4_mm_chat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vllm ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
   target_compile_definitions(test_openai_api_server_dots3_mm_forward PRIVATE
     DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
   # The tiny-checkpoint fixture header lives beside the model gates, and
@@ -2541,6 +2552,16 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_kv_cache_dtype
     vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp)
   target_include_directories(test_serve_kv_cache_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # MODEL-MM-deepseek-v4 W5 (#2411): --mmproj and the resolved model config
+  # reaching the multimodal chat install through the REAL VllmServerMain. Same
+  # shape and the same reason as the two rows above; it also needs the GGUF
+  # fixtures beside the model gates, because the two lines it holds are only
+  # observable on a checkpoint whose architecture declares multimodal support.
+  vllm_cpp_add_test(test_serve_deepseek_v4_mm
+    vllm/entrypoints/openai/test_serve_deepseek_v4_mm.cpp)
+  target_include_directories(test_serve_deepseek_v4_mm PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm
+    ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

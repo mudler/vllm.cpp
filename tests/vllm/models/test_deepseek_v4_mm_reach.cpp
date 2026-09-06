@@ -345,7 +345,7 @@ TEST_CASE("REACH: ModelRegistry::EncodeMm runs the W2 tower on the W3A projector
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
   REQUIRE(mm.mm_features.size() == 1);
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
@@ -487,7 +487,7 @@ TEST_CASE("REACH: ModelRegistry::EmbedMm merges the encoder rows into inputs_emb
   const auto image = MakeImage(vcfg);
   const std::vector<int32_t> prompt{1, 2, static_cast<int32_t>(kVocab) - 1, 3};
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
-      prompt, static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      prompt, static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -643,7 +643,7 @@ TEST_CASE("REACH: an image reaches ModelRegistry::Forward and moves the logits")
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -941,7 +941,7 @@ TEST_CASE("REACH: the vision bias moves the image rows and leaves the text rows 
     const auto image = MakeImage(vcfg);
     const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
         {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-        static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+        static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
     vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
     vt::Queue queue = backend.CreateQueue();
     const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
@@ -1141,7 +1141,7 @@ TEST_CASE("REACH: a row early in the image span attends a row after it") {
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -1635,7 +1635,7 @@ TEST_CASE("REACH: the paged arm refuses an image span it would clip to the windo
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -1709,5 +1709,124 @@ TEST_CASE("REACH: the paged arm refuses an image span it would clip to the windo
   }
   CHECK(message.find("image span") != std::string::npos);
   CHECK(message.find("sliding_window 4") != std::string::npos);
+  CHECK(message.find("2411") != std::string::npos);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// (14) AN INTERIOR PREFILL CHUNK IS REFUSED AT `ModelRegistry::Forward`.
+//
+// W4 enforced chunk atomicity for two of the three shapes a cut produces: a
+// chunk with START and no END, and one with END and no START. A chunk cut from
+// the MIDDLE of one block carries NEITHER, so both checks were silent and the
+// step was served with zero spans -- which put the visibility rule back on the
+// ordinary sliding window over image rows, AND left the paged arm's
+// non-empty-span refusal unarmed, while the routing bias still applied because
+// it reads the identifiers. Every signal but the answer looked right.
+//
+// It is reachable rather than hypothetical: `disable_chunked_mm_input` defaults
+// to false, `Scheduler::try_schedule_encoder_inputs` only rolls a step back
+// when it is set, and nothing in this tree can set it. W5 wires the request
+// path, so a long prompt carrying an image produces exactly this step.
+//
+// This case enters through `ModelRegistry::Forward` on the SAME merged buffers
+// case (4) uses, with the token slice a middle chunk would carry.
+TEST_CASE("REACH: an interior prefill chunk of an image block is refused") {
+  auto loaded = LoadThroughRegistry(true, true);
+  const DeepSeekV4VisionConfig vcfg =
+      vllm::DeepSeekV4ClipMmprojVisionConfig(*loaded->proj_gguf);
+  const auto image = MakeImage(vcfg);
+  const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
+      {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
+  const vllm::multimodal::MultiModalFeatureSpec& f = mm.mm_features[0];
+  // The PREMISE: the block is long enough to have an interior at all, so the
+  // slice below really does drop both the start and the end identifier.
+  REQUIRE(f.length >= 4);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
+      *loaded->model, loaded->config, queue, f);
+
+  // The chunk a scheduler hands the runner when the boundary falls inside the
+  // block: the rows strictly BETWEEN the start and the end identifier. The two
+  // are located rather than assumed, because `build_image_block` writes
+  // `3 - offset % 4` leading pad rows before the start, so their indices are a
+  // function of the offset.
+  const int32_t start_id =
+      static_cast<int32_t>(kVocab) +
+      static_cast<int32_t>(vllm::multimodal::kImageStart);
+  const int32_t end_id = static_cast<int32_t>(kVocab) +
+                         static_cast<int32_t>(vllm::multimodal::kImageEnd);
+  int64_t start_at = -1, end_at = -1;
+  for (int i = 0; i < f.length; ++i) {
+    const int32_t id = mm.prompt_token_ids[static_cast<size_t>(f.offset + i)];
+    if (id == start_id) start_at = f.offset + i;
+    if (id == end_id) end_at = f.offset + i;
+  }
+  REQUIRE(start_at >= 0);
+  REQUIRE(end_at > start_at + 1);
+  const int64_t begin = start_at + 1;
+  const int64_t end = end_at;
+  const std::vector<int32_t> chunk(mm.prompt_token_ids.begin() + begin,
+                                   mm.prompt_token_ids.begin() + end);
+  const int64_t tokens = static_cast<int64_t>(chunk.size());
+  REQUIRE(tokens > 0);
+  for (const int32_t id : chunk) {
+    REQUIRE(id >= static_cast<int32_t>(kVocab));  // every row is an image row
+    REQUIRE(id != start_id);
+    REQUIRE(id != end_id);
+  }
+
+  // The merged rows for exactly this chunk, produced by the production hook
+  // over the encoder-output SLICE the runner would gather for it
+  // (`gather_mm_embeddings` narrows the item's rows to the chunk with its own
+  // start/end index; this is that narrowing, by hand, on the same tensor).
+  vt::Tensor slice = enc.embeds;
+  slice.data = static_cast<uint16_t*>(enc.embeds.data) +
+               (begin - f.offset) * kH;
+  slice.shape[0] = tokens;
+  std::vector<char> is_mm(static_cast<size_t>(tokens), 1);
+  const std::vector<vt::Tensor> slices{slice};
+  vllm::MmEmbedInputs embed_in;
+  embed_in.token_ids = &chunk;
+  embed_in.mm_embeds = &slices;
+  embed_in.is_mm_embed = &is_mm;
+  vllm::MmForwardBuffers buffers = vllm::ModelRegistry::EmbedMm(
+      *loaded->model, loaded->config, queue, embed_in);
+
+  std::vector<int32_t> positions(static_cast<size_t>(tokens));
+  for (int64_t t = 0; t < tokens; ++t) {
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(begin + t);
+  }
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(tokens - 1)};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {static_cast<int32_t>(begin)};
+  vllm::ModelForwardInput in{.token_ids = chunk,
+                             .positions = positions,
+                             .attn_meta = attn_meta,
+                             .gdn_meta = gdn_meta,
+                             .attn_kv = attn_kv,
+                             .gdn_state = gdn_state,
+                             .config = loaded->config,
+                             .queue = queue,
+                             .logits_indices = logits_indices,
+                             .num_reqs = 1};
+  in.gather_logits = false;
+  in.mm = buffers.mm;
+
+  std::string message;
+  try {
+    (void)vllm::ModelRegistry::Forward(*loaded->model, in);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find("image row") != std::string::npos);
+  CHECK(message.find("outside every complete image block") != std::string::npos);
   CHECK(message.find("2411") != std::string::npos);
 }

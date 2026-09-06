@@ -1438,23 +1438,24 @@ TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
   }
 }
 
-// The PIN for the ABI v19 paragraph in include/vllm.h. That paragraph is a
-// permanent public contract, and the thing it must not claim is that setting
-// these fields makes a C-ABI call REFUSE a multimodal request. It does not:
-// ValidateNumItems is reached only behind the multimodal chat seam, and
-// server_main.cpp's InstallMultiModalChatSeam is the sole PRODUCTION caller of
-// set_multimodal_chat_fn (#2475) — vllm_chat and
-// vllm_chat_stream never install one, so serving_chat.cpp's `if (mm_chat_fn_)`
-// gate is never taken on this path and no MultiModalInputs is ever built.
+// The PIN for the ABI v19 / v22 multimodal paragraphs in include/vllm.h. Those
+// paragraphs are a permanent public contract, and they must say exactly what a
+// C-ABI chat call does with an `image_url` content part.
 //
-// What a C-ABI caller gets today, asserted rather than described: the request
-// PARSES (protocol.cpp does read `image_url` content parts), the image part is
-// DROPPED, its text siblings still form the prompt, and the answer is an
-// ordinary 200-shaped chat.completion — with language_model_only set, which on
-// the server path would be an HTTP 400. Wire the seam into the ABI without
-// revisiting that paragraph and this case goes red, which is the point.
-TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
-          "multimodal request path to enforce them on") {
+// WHAT CHANGED, and it is the whole of MODEL-MM-deepseek-v4 W5 (#2411) at this
+// surface. Until then `server_main.cpp` was the SOLE production caller of
+// `InstallMultiModalChatSeam`: `vllm_chat` and `vllm_chat_stream` installed no
+// seam, `serving_chat.cpp`'s `if (mm_chat_fn_)` gate was never taken on this
+// path, and an image part was silently DROPPED and the request answered as
+// text. That made every shipped multimodal capability reachable only from the
+// bundled HTTP server, which AGENTS.md "Shared seams" does not allow: the ABI
+// is the surface and the server is a client of it. `EnsureChatServing` now
+// calls the SAME install with the SAME context, including the same
+// `DefaultImageCodec`.
+//
+// What a C-ABI caller gets now, asserted rather than described.
+TEST_CASE("capi: a multimodal chat request is ANSWERED or REFUSED, never "
+          "silently served as text") {
   EngineParams p = SyntheticParams();
   p.multimodal.language_model_only = true;  // every modality limit => 0
   vllm_engine* eng = MakeSyntheticChatEngine(p);
@@ -1469,23 +1470,42 @@ TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
       "]}],\"temperature\":0,\"max_tokens\":6}";
   char* response = nullptr;
   const vllm_status st = vllm_chat(eng, request, &response);
-  CAPTURE(std::string(vllm_last_error() == nullptr ? "" : vllm_last_error()));
-  REQUIRE(st == VLLM_OK);
-  REQUIRE(response != nullptr);
-  const json body = json::parse(response);
-  CAPTURE(std::string(response));
-  // NOT a refusal: served as text, exactly as if the image part were absent.
-  CHECK(body.at("object") == "chat.completion");
-  CHECK(body.at("choices").size() == 1);
-  CHECK(!body.at("choices").at(0).at("message").at("content")
+  const std::string err =
+      vllm_last_error() == nullptr ? std::string() : vllm_last_error();
+  CAPTURE(err);
+  // REFUSED, and by name. This synthetic engine's architecture DECLARES
+  // multimodal support and has no registered chat seam, so the install wires a
+  // REFUSING one -- upstream's own shape for "this server does not accept
+  // images for this model". The message names the architecture and the missing
+  // part, which is what an image answered as text could never do.
+  CHECK(st == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(response == nullptr);
+  CHECK(err.find("Qwen3_5MoeForConditionalGeneration") != std::string::npos);
+  CHECK(err.find("REGISTER_VLLM_MM_CHAT") != std::string::npos);
+
+  // A TEXT request on the SAME handle is untouched. The install cannot rewrite
+  // the text path: `serving_chat.cpp` consults the seam only when a message
+  // carries a non-text content part.
+  const char* text_request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":6}";
+  char* text_response = nullptr;
+  REQUIRE(vllm_chat(eng, text_request, &text_response) == VLLM_OK);
+  REQUIRE(text_response != nullptr);
+  const json text_body = json::parse(text_response);
+  CHECK(text_body.at("object") == "chat.completion");
+  CHECK(text_body.at("choices").size() == 1);
+  CHECK(!text_body.at("choices").at(0).at("message").at("content")
              .get<std::string>()
              .empty());
-  CHECK(body.count("error") == 0);
-  vllm_string_free(response);
+  vllm_string_free(text_response);
   vllm_engine_free(eng);
 
-  // The limits ARE on the config all the same — recorded, just not consulted by
-  // anything this ABI can reach. That is the exact wording include/vllm.h owes.
+  // The limits are still recorded on the engine's own config, and NOW they are
+  // reachable: a registered multimodal architecture folds them into its seam's
+  // ceiling, so `--language-model-only` answers an image request with
+  // "At most 0 image(s) may be provided in one prompt." on this ABI as well as
+  // on the server.
   const HfConfig c = MakeConfig();
   LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
   CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);

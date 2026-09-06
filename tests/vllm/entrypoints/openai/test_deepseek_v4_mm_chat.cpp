@@ -73,6 +73,25 @@ constexpr int32_t kVocabSize = 16;
 // blocks is `RenderContentBlocks`'s own separator, so it has to encode.
 constexpr int32_t kImageTokenId = 4;
 
+// The one pre-tokenizer both fixtures below use. It is the GPT-2 byte-level
+// split this tree's loader accepts; a shorter pattern is rejected by name.
+json ByteLevelPreTokenizer() {
+  return json{
+      {"type", "Sequence"},
+      {"pretokenizers",
+       json::array(
+           {{{"type", "Split"},
+             {"pattern",
+              {{"Regex",
+                R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"}}},
+             {"behavior", "Isolated"},
+             {"invert", false}},
+            {{"type", "ByteLevel"},
+             {"add_prefix_space", false},
+             {"trim_offsets", false},
+             {"use_regex", false}}})}};
+}
+
 vllm::tok::Tokenizer BuildTokenizer() {
   static int counter = 0;
   const std::string path =
@@ -93,20 +112,7 @@ vllm::tok::Tokenizer BuildTokenizer() {
       {{"id", 6}, {"content", "<think>"}, {"special", true}},
   });
   doc["normalizer"] = nullptr;
-  doc["pre_tokenizer"] = {
-      {"type", "Sequence"},
-      {"pretokenizers",
-       json::array(
-           {{{"type", "Split"},
-             {"pattern",
-              {{"Regex",
-                R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"}}},
-             {"behavior", "Isolated"},
-             {"invert", false}},
-            {{"type", "ByteLevel"},
-             {"add_prefix_space", false},
-             {"trim_offsets", false},
-             {"use_regex", false}}})}};
+  doc["pre_tokenizer"] = ByteLevelPreTokenizer();
   json vocab = json::object();
   vocab["a"] = 7;
   vocab["b"] = 8;
@@ -509,5 +515,140 @@ TEST_CASE("dsv4 mm chat: the image ceiling is the engine's, not this seam's") {
         Threw([&] { (void)seam.chat_fn({UserWith({audio})}); });
     INFO("what: ", what);
     CHECK(what.find("audio") != std::string::npos);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// (5) THE CONTAINER CODEC AND THE URI SCHEME ARE REFUSED, AND A USER CAN TELL.
+//
+//     No PNG/JPEG decoder is vendored and no http(s) fetch exists. Both are
+//     NAMED MM-SERVE residuals belonging to the LIBRARY rather than to this
+//     architecture, so this wave refuses them rather than implementing a
+//     cross-model capability under a model row.
+//
+//     What it does own is the STATUS. `DefaultImageCodec` and `DecodeDataUri`
+//     both throw `std::runtime_error`, and `api_server.cpp:373` maps that to
+//     HTTP 500 "InternalServerError" -- so a `data:image/png;base64,...` body
+//     read as a server fault rather than as a request this server cannot
+//     serve. This seam re-throws them as `InputValidationError`, the type
+//     `api_server.cpp:357-360` maps to 400, with the residual's own message
+//     intact.
+// ---------------------------------------------------------------------------
+TEST_CASE("dsv4 mm chat: a PNG or an http(s) image is refused as a CLIENT error") {
+  Ctx c;
+  const oai::MultiModalChatSeam seam =
+      oai::MultiModalChatRegistry::MakeSeam(c.ctx);
+
+  const auto refuse = [&](const std::string& url) {
+    oai::ChatContentPart p;
+    p.type = "image_url";
+    p.url = url;
+    CHECK_THROWS_AS((void)seam.chat_fn({UserWith({p})}),
+                    vllm::v1::InputValidationError);
+    return Threw([&] { (void)seam.chat_fn({UserWith({p})}); });
+  };
+
+  // (a) A container format. The message names the missing part, which is what
+  //     AGENTS.md asks of an unimplemented arm.
+  const std::string png = refuse("data:image/png;base64,iVBORw0KGgo=");
+  INFO("png: ", png);
+  CHECK(png.find("PNG/JPEG") != std::string::npos);
+  CHECK(png.find("image/x-raw-rgb") != std::string::npos);
+
+  // (b) An http(s) URL never reaches the codec: the fetch is its own residual
+  //     and `DecodeDataUri` names it.
+  const std::string http = refuse("https://example.invalid/cat.jpg");
+  INFO("http: ", http);
+  CHECK(http.find("data: URI") != std::string::npos);
+
+  // (c) A raw-RGB payload that is not a square buffer is a client error too,
+  //     and it is the codec's own message rather than a generic failure. Six
+  //     bytes are two pixels, and no square HxWx3 buffer has that extent.
+  //     (Three bytes WOULD be a valid 1x1 image, which is why the payload is
+  //     eight base64 characters and not four.)
+  const std::string ragged = refuse("data:image/x-raw-rgb;base64,AAAAAAAA");
+  INFO("ragged: ", ragged);
+  CHECK(ragged.find("square") != std::string::npos);
+
+  // (d) ...and the RIGHT container still works, so (a)-(c) are refusals of the
+  //     unimplemented arms and not of images.
+  CHECK(seam.chat_fn({UserWith({ImagePart(kSideA, 1)})}).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// (6) WHAT THE FACTORY REFUSES AT INSTALL, and why each one is at install.
+//
+//     `InstallMultiModalChatSeam` catches a throwing factory and installs a
+//     REFUSING seam: HTTP 400 naming the architecture, text path untouched.
+//     Every condition below is therefore answered before the engine's busy
+//     loop can meet it, which is the difference between one 400 and every
+//     later request -- text ones included -- becoming a 500.
+// ---------------------------------------------------------------------------
+TEST_CASE("dsv4 mm chat: the factory refuses an install it cannot serve") {
+  {
+    // NO SECOND FILE. `DeepseekV4ForCausalLM` names both the text checkpoint
+    // and the Flash-Vision one, so the architecture cannot answer this and
+    // `--mmproj` is the only thing that can.
+    Ctx c(/*with_mmproj=*/false);
+    const std::string what =
+        Threw([&] { (void)oai::MultiModalChatRegistry::MakeSeam(c.ctx); });
+    INFO("what: ", what);
+    CHECK(what.find("--mmproj") != std::string::npos);
+    CHECK(what.find("deepseek4v") != std::string::npos);
+    CHECK(what.find("2411") != std::string::npos);
+  }
+  {
+    // NO PLACEHOLDER TOKEN. The encoder writes the string at every image
+    // position and the expansion counts the id it resolves to, so a default
+    // would be a guess that surfaces as an image-count mismatch naming the
+    // wrong thing.
+    Ctx c;
+    const vllm::tok::Tokenizer bare = [] {
+      // A tokenizer with the template markers but NOT the image placeholder.
+      static int counter = 0;
+      const std::string path =
+          (std::filesystem::temp_directory_path() /
+           ("vllm_dsv4_mmchat_bare_" + std::to_string(counter++) + ".json"))
+              .string();
+      json doc;
+      doc["version"] = "1.0";
+      doc["added_tokens"] = json::array(
+          {{{"id", 0}, {"content", "<｜User｜>"}, {"special", true}}});
+      doc["normalizer"] = nullptr;
+      doc["pre_tokenizer"] = ByteLevelPreTokenizer();
+      doc["model"] = {{"type", "BPE"},
+                      {"ignore_merges", false},
+                      {"vocab", json{{"a", 1}}},
+                      {"merges", json::array()}};
+      std::ofstream(path, std::ios::binary) << doc.dump();
+      vllm::tok::Tokenizer t = vllm::tok::Tokenizer::FromHfJson(path);
+      std::remove(path.c_str());
+      return t;
+    }();
+    c.ctx.tokenizer = &bare;
+    const std::string what =
+        Threw([&] { (void)oai::MultiModalChatRegistry::MakeSeam(c.ctx); });
+    INFO("what: ", what);
+    CHECK(what.find("deepseek_image") != std::string::npos);
+    CHECK(what.find("added token") != std::string::npos);
+  }
+  {
+    // NO RESOLVED VOCABULARY SIZE. Every image position is `vocab_size + type`,
+    // so a zero would put the sentinels at 0..4 -- INSIDE the vocabulary --
+    // and the merge would splice image rows over real tokens with no shape
+    // error anywhere.
+    Ctx c;
+    c.config.vocab_size = 0;
+    const std::string what =
+        Threw([&] { (void)oai::MultiModalChatRegistry::MakeSeam(c.ctx); });
+    INFO("what: ", what);
+    CHECK(what.find("vocab_size") != std::string::npos);
+  }
+  {
+    // AN INCOMPLETE CONTEXT is refused by name rather than dereferenced.
+    Ctx c;
+    c.ctx.config = nullptr;
+    CHECK(Threw([&] { (void)oai::MultiModalChatRegistry::MakeSeam(c.ctx); })
+              .find("install context is incomplete") != std::string::npos);
   }
 }

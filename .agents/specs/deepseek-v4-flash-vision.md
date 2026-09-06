@@ -1483,6 +1483,21 @@ the key itself, so the seventh field and any future one costs a map entry rather
 than a struct field. `test_deepseek_v4_mmproj` now reports 19 cases and 2218
 assertions.
 
+**The geometry guard does NOT run on a user-supplied `--mmproj` today, and
+`750cc6626` said it does.** SUPERSEDES that sentence. No file under `src/`,
+`include/`, `examples/` or `tools/` calls `DeepSeekV4ClipMmprojVisionConfig`,
+`RefuseUnsupportedDeepSeekV4ClipMmproj`, `RefuseUnaccountedDeepSeekV4ClipMmproj`
+or `LoadDeepSeekV4VisionFromClipMmproj`. The whole deepseek4v mmproj arm is a
+staged slice whose wiring `## Owed` gives to W4, so the untrusted header reaches
+the guard through the test suite and nowhere else. The guard is right and W4 is
+what makes the claim true. The arm where the claim is ALREADY true is the
+production-reachable Qwen3-VL `ClipMmprojVisionConfig` beside it, which reads
+`block_count` from a user-supplied `--mmproj` into an unbounded `resize`, and
+[#2995](https://github.com/mudler/vllm.cpp/issues/2995) owns that. It is not
+repaired here: it is a different arm, outside this row, and it is recorded rather
+than fixed for the same reason
+[#2992](https://github.com/mudler/vllm.cpp/issues/2992) is.
+
 **After.** `test_deepseek_v4_mmproj` reports 18 cases and 2198 assertions, up
 from 13 and 999. `test_clip_mmproj_gguf` reports 9 cases and 272 assertions,
 unchanged, because the Qwen3-VL arm is deliberately untouched. `ctest

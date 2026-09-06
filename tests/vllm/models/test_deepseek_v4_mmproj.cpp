@@ -712,10 +712,19 @@ TEST_CASE("deepseek4v mmproj: a wrong-shaped tensor names BOTH shapes") {
 }
 
 TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
-  // `clip.vision.block_count` is read from a user-supplied `--mmproj` and then
-  // becomes a `resize` argument and a loop bound. `KvInt` widens every integer
-  // spelling, so a signed one can be negative and an unsigned one can be four
-  // billion; both reach `std::vector::resize` as a `size_t`.
+  // `clip.vision.block_count` becomes a `resize` argument and a loop bound.
+  // `KvInt` widens every integer spelling, so a signed one can be negative and
+  // an unsigned one can be four billion; both reach `std::vector::resize` as a
+  // `size_t`.
+  //
+  // NOT, TODAY, ON A USER-SUPPLIED `--mmproj`, and `750cc6626`'s body said it
+  // was. Nothing in `src/`, `include/`, `examples/` or `tools/` calls
+  // `DeepSeekV4ClipMmprojVisionConfig`: this arm is a staged slice that W4 owns
+  // the wiring for, so the untrusted input reaches it through this test and
+  // nowhere else. The guard is still right -- W4 is what makes the sentence true
+  // -- but the arm where it is ALREADY true is the production-reachable Qwen3-VL
+  // `ClipMmprojVisionConfig` beside it, and
+  // https://github.com/mudler/vllm.cpp/issues/2995 owns that one.
   //
   // THE VALUES HERE ARE DELIBERATELY SMALL, and that is the point rather than
   // a convenience. A red-first case for an unbounded allocation performs the

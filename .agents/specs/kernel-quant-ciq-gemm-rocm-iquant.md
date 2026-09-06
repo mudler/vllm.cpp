@@ -11,7 +11,8 @@
   2026-09-05).
 - Pull request shape: separate spec and implementation pull requests
   (developer decision 2026-09-05, recorded in
-  `.agents/developer-preferences.md`). This pull request lands the spec only.
+  `.agents/developer-preferences.md`). The spec landed in its own pull
+  request first; this implementation is the second.
 
 ## Scope
 
@@ -112,26 +113,31 @@ llama.cpp, pin `b10451` per `.agents/upstream-sync.md`.
 
 ## Risks
 
-- **FMA contraction on IQ4_XS's float-accumulation body.** IQ4_XS's dot is
-  the one format in this row (and in the whole quant-dot family) whose core
-  is not a single integer accumulator: it forms `d1`/`d2` as f32 and folds
-  in per-sub-block `sumf +=` steps, eight per super-block
-  (`cuda_quant_dot.cu:606-680`, extensively commented on exactly this
-  point). On CUDA that required `__fmul_rn`/`__fadd_rn` in place of ordinary
-  `*`/`+`, because nvcc's default `-fmad=true` silently contracts the
-  textual two-rounding sequence into a single-rounding FMA and two of eight
-  real super-blocks then disagreed with the oracle by 1-4 ULP. **This may
-  not reproduce on ROCm**: `CMakeLists.txt:414` already applies
-  `-ffp-contract=off` to `$<COMPILE_LANGUAGE:HIP>` project-wide, unlike CUDA
-  where the project's `-ffp-contract=off` is CXX-only and never reaches
-  `.cu`/`.cuh` translation units. Verify this empirically before assuming it
-  (a W0-style probe: compile the naive `sumf += d1 * x` form, diff against
-  the CPU oracle on the same real super-blocks CUDA's golden vectors use,
-  and inspect the generated ISA for `v_fma_f32` if any block disagrees) —
-  do not carry the CUDA workaround over unexamined, and do not assume the
-  flag alone is sufficient without a measured check, matching how the CUDA
-  side only added the intrinsics after measuring a real disagreement rather
-  than as a precaution.
+- **FMA contraction on IQ4_XS's float-accumulation body — MEASURED, RESOLVED
+  IN FAVOR OF THE SIMPLER PATH.** IQ4_XS's dot is the one format in this row
+  (and in the whole quant-dot family) whose core is not a single integer
+  accumulator: it forms `d1`/`d2` as f32 and folds in per-sub-block
+  `sumf +=` steps, eight per super-block (`cuda_quant_dot.cu:606-680`,
+  extensively commented on exactly this point). On CUDA that required
+  `__fmul_rn`/`__fadd_rn` in place of ordinary `*`/`+`, because nvcc's
+  default `-fmad=true` silently contracts the textual two-rounding sequence
+  into a single-rounding FMA and two of eight real super-blocks then
+  disagreed with the oracle by 1-4 ULP. **W0/W1 measured this directly on
+  the target hardware (RX 9060 XT, gfx1200, ROCm 7.2, `isravale`):** plain
+  `*`/`+` (no non-fused intrinsics) in `DotIQ4XS` is BIT-EXACT against the
+  oracle's own per-super-block numbers, over the SAME four real
+  `unsloth/GLM-5.3-Flash-GGUF` super-blocks and the SAME expected bits
+  (`iq2xs_iq4xs_dot_golden.h`) CUDA's gate uses, both isolated (k=256, one
+  contributing lane, zero reassociation possible) and combined (k=1024,
+  four lanes, the same `__shfl_down_sync` tree CUDA's comment derives) —
+  `tests/vt/test_backend_cross_device.cpp`, "ROCm IQ4_XS dots the ORACLE's
+  own numbers on REAL checkpoint bytes", 13/13 assertions green. The
+  hypothesis held: `CMakeLists.txt:414`'s project-wide
+  `-ffp-contract=off` on `$<COMPILE_LANGUAGE:HIP>` is sufficient on its own,
+  so `DotIQ4XS` on ROCm uses plain `*`/`+` and does **not** carry CUDA's
+  `__fmul_rn`/`__fadd_rn` workaround. This is a measured result, not an
+  assumption carried over — the whole point of naming this as a risk was to
+  force the check rather than inherit the CUDA fix by habit.
 - **The nwarps=8 decode table (`ROCM-KQUANT-NWARPS-DECODE`) may not transfer.**
   IQ4_XS shares the existing `nsb = K/256` decomposition, so it compiles
   against the current launch shape. Re-measure the `nwarps=8` choice rather
@@ -149,28 +155,88 @@ llama.cpp, pin `b10451` per `.agents/upstream-sync.md`.
 
 ## Tests
 
-- Extend `test_ops_quant_dot.cpp`'s existing IQ4_XS `vec_dot`
-  golden-vector gates (`iq2xs_iq4xs_dot_golden.h`, already committed and
-  sourced from real `unsloth/GLM-5.3-Flash-GGUF` checkpoint bytes) to a new
-  `test_rocm_quant_dot.cpp`, same shape as the CUDA gate
-  (`test_cuda_quant_dot.cpp`): bit-exact for IQ4_XS against the same
-  real-checkpoint golden values CUDA's gate uses, since
-  bit-exactness is the property the FMA-contraction risk above is actually
-  about.
-- `test_backend_cross_device.cpp`: add IQ4_XS to the CPU-vs-ROCM cross-check.
-- Rerun `ROCM-KQUANT-NWARPS-DECODE`'s own measurement recipe
-  (`rocprofv3 --kernel-trace` on a real quant-matched trace workload) for
-  IQ4_XS specifically, to answer the nwarps question this issue was
-  filed to test — record the result (transfers / does not transfer) rather
-  than assuming either.
-- `ctest -R 'rocm|cross_device'`, zero regression on the four existing
-  formats' numerics.
-- End-to-end: reload the motivating checkpoint (or a same-format synthetic
-  fixture if the real 35B-A3B artifact is not staged on the gate host) on
-  `isravale` (RX 9060 XT, gfx1200) or an `rc`-leased ROCm fleet device, and
-  confirm keep-quant residency replaces the prior bf16 SIGSEGV — this is
-  the row's actual acceptance criterion, not merely the unit-level dot
-  gates.
+Landed, on `isravale` (RX 9060 XT, gfx1200, ROCm 7.2.3), GPU work under
+`flock ${GPU_LOCK:-$HOME/gpu.lock}` throughout:
+
+- **`test_backend_cross_device.cpp`**, three cases touched/added, run
+  standalone and as part of the full file (41/42 cases, 83998/83999
+  assertions — the one failure is `MoeSiluMul matches the CPU oracle within
+  NMSE <= 5e-4`, confirmed PRE-EXISTING and unrelated: byte-identical
+  mismatch reproduced on an independent binary built from the sibling
+  `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1` worktree, which touches neither this
+  kernel nor this dtype):
+  - "non-grouped keep-quant GEMM (...IQ4_XS/IQ3_XXS) matches the CPU
+    oracle" — both new formats added to the existing table-driven CPU-vs-
+    ROCm case, NMSE ≤ 5e-4, random valid blocks (unconstrained lookup
+    indices need no in-range fixture change).
+  - "grouped quant expert GEMM (...IQ4_XS/IQ3_XXS) matches the CPU oracle"
+    — same extension on the grouped/MoE path, the one the motivating
+    checkpoint's routed experts actually use.
+  - "ROCm IQ4_XS dots the ORACLE's own numbers on REAL checkpoint bytes"
+    (NEW) — the bit-exact gate the FMA-contraction risk needed, ported from
+    `test_cuda_quant_dot.cpp`'s `CheckCudaOracleDot` shape onto the same
+    golden vectors: bit-exact per-superblock (k=256, one contributing lane)
+    and warp-reduction-order-exact combined (k=1024, four lanes, primary
+    bit-equality + secondary reassociation-bound check). 13/13 assertions.
+- **`test_gguf_keep_quant.cpp`**: the exhaustive per-device totality table's
+  hand-mirrored ROCm predicate and its `gemm_kept` constant (8 → 10) updated
+  to admit IQ4_XS; IQ3_XXS is not in this test's `all_types` enumeration
+  (a pre-existing gap shared with Q2_K, not closed by this row) and is left
+  to the cross-device gate above. 52/52 cases, 10325/10325 assertions.
+- **`test_gguf_device_fit.cpp`**: `#2516`'s two ROCm residency pins split
+  per-tensor (IQ4_XS's `down_exps` now expects `kKeepQuant` on ROCm;
+  IQ2_XS's `gate_exps` is unaffected and still expects `kExpandBf16`,
+  since #1940's other five formats stay owed); the all-or-nothing
+  "NO PLAN" case is unchanged in outcome (`CHECK_FALSE` still holds, because
+  the still-unsupported IQ2_XS tower alone fails the lane) with its comment
+  corrected to say why. 24/24 cases, 182/182 assertions.
+- `ctest -R 'rocm|cross_device'` (plus the individually-run ROCm suites
+  `test_rocm_arch`/`test_rocm_backend`/`test_exl3_rocm`/
+  `test_gemma4_rocm_fp8_seams`/`test_rocm_fp8_kv_cache`): zero regression,
+  all green.
+
+**End-to-end reload — the row's actual acceptance criterion — LANDED.**
+`Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` (19.39 GB on disk, `isravale`
+`/home/justin/Nail/`) is the real motivating checkpoint, not a stand-in: its
+own header histogram is `{BF16: 2, F32: 308, IQ4_XS: 391, Q5_K: 51,
+Q6_K: 1}` — every quantized tensor in the file is one of the three dtypes
+this row's target hardware now has a keep-quant kernel for (read with
+`docs/bench-evidence/limb3-vehicle-search-20260904/gguf_header.py` before
+running anything, not assumed from the filename).
+
+```
+VT_DEVICE_WEIGHT_BUDGET_BYTES=13000000000 \
+./build-hip/examples/vllm-cli --model /home/justin/Nail/Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf \
+  --device auto --max-num-seqs 1 --kv-cache-dtype fp8 --kv-cache-memory 2000000000 \
+  --prompt "The capital of France is" --max-tokens 16
+```
+
+```
+engine: device placement INSTALLED: 15 layers run their routed experts on cpu, the rest on rocm (resolved against 40 layers, origin fit)
+engine: device placement: --fit placed 15 layer(s) (6417285120 B) to bring a 19333564672 B footprint under a 13000000000 B budget
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=5 completion_tokens=16 secs=3.919 tok_s=4.083
+ Paris. The capital of Germany is Berlin. The capital of Italy is Rome.
+```
+
+The decisive number is the **19,333,564,672 B (~19.33 GiB) footprint** --
+it matches the file's on-disk size, not the ~70 GiB a bf16 expansion of
+these tensors would produce. That is the keep-quant residency actually
+taking effect on ROCm, not merely compiling: before this row,
+`DeviceKeepQuantSupported` routed every IQ4_XS tower to `kExpandBf16` here
+and the streamed-expert lane's blow-up SIGSEGV'd this same box on this
+family of checkpoint (`vllm-cpp-rocm-crash-iq4xs` session memory). Clean
+exit, coherent completion, zero crash. Not a synthetic fixture, not a
+narrower stand-in geometry -- the actual artifact the row exists for.
+
+Not done in this wave (see Owed):
+
+- The `ROCM-KQUANT-NWARPS-DECODE` re-measurement (`rocprofv3 --kernel-trace`
+  on a real quant-matched trace workload) — this issue's own stated reason
+  for existing beyond plain coverage. `isravale` has no `rocprofv3` profiling
+  set up in this session; the correctness gates above stand on their own,
+  but the nwarps question is still open. The 4.083 tok/s figure above is NOT
+  a substitute measurement for it: it is a mixed CPU+ROCm run at a
+  CPU-offload-heavy split, not an isolated ROCm-kernel throughput number.
 
 ## Owed
 
@@ -178,10 +244,11 @@ llama.cpp, pin `b10451` per `.agents/upstream-sync.md`.
   MXFP4): tracked by #1940 and left for a follow-on row.
 - A WMMA/tensor-core tile for IQ4_XS, if the scalar tier's measured
   throughput warrants one (mirroring how `KERNEL-QUANT-CIQ-GEMM-ROCM`
-  followed the existing scalar formats): not attempted here.
-- The nwarps re-measurement itself, if it is not completed within this
-  row's implementation wave for lack of GPU time: record as `PENDING` on a
-  named lease/box, never silently dropped.
+  followed the existing four formats' scalar tier): not attempted here.
+- The nwarps re-measurement itself: `PENDING`, not completed within this
+  implementation wave for lack of a `rocprofv3` profiling setup on
+  `isravale`, not silently dropped. The correctness gates (Tests) are
+  unaffected by this being open.
 
 ## Stop conditions
 
@@ -197,7 +264,24 @@ llama.cpp, pin `b10451` per `.agents/upstream-sync.md`.
 
 ## Now
 
-`SPIKE`. This pull request lands the spec only; no product code changes in
-this change. The GFX1100 reconstruction supplies the former IQ3_XXS scope.
-Next: W0 probes the FMA-contraction question on gfx1200, then W1 ports
-`DotIQ4XS` with its focused gate before the combined `ctest` sweep.
+`ACTIVE`. W0 (FMA-contraction probe), W1 (`DotIQ4XS`) and W2 (`DotIQ3XXS`)
+are LANDED in this pull request, on both the plain (`MatmulBTQuantKernelRocm`
+/ `KQuantGemmK`) and grouped/MoE (`MatmulBTQuantGroupedKernelRocm` /
+`GroupedKQ8K`) arms, plus `DeviceKeepQuantSupported`'s ROCm admission list.
+Gated per the Tests section above, on target hardware (`isravale`,
+RX 9060 XT / gfx1200), zero regression. The FMA-contraction risk resolved in
+favor of the simpler path: HIP's project-wide `-ffp-contract=off` is
+sufficient, no CUDA-style non-fused-multiply workaround needed.
+
+**The real-checkpoint end-to-end reload also LANDED**, after this pull
+request was first drafted: `Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` loads and
+generates coherent tokens on `isravale`, with the resident footprint
+(~19.33 GiB) matching the on-disk size rather than a bf16 blow-up — see
+Tests. That was the row's actual acceptance criterion, and it is now
+satisfied on the artifact that motivated the row, not a synthetic
+stand-in.
+
+Remaining before `DONE`: only the `ROCM-KQUANT-NWARPS-DECODE`
+re-measurement (`PENDING`, see Owed) — it does not block this pull request,
+since the row's own scope is coverage and correctness, and it is named
+rather than silently dropped.

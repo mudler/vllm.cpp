@@ -47,6 +47,12 @@
 #include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_runtime.h"
 
+// KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940): the real-checkpoint IQ4_XS
+// blocks and llama.cpp's own vec_dot output for them, shared with the CUDA
+// gate in test_cuda_quant_dot.cpp.
+#include "iq2xs_iq4xs_dot_golden.h"
+#include "iq2xs_iq4xs_golden_vectors.h"
+
 namespace {
 
 using vt::Device;
@@ -2541,13 +2547,20 @@ TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
   }
 }
 
-TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU oracle") {
+TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_XXS) matches the CPU oracle") {
   // kMatmulBTQuant (op 74) on ROCm vs the CPU keep-quant reference. The
   // non-grouped arm carries PR #523's headline mechanism and had NO coverage
   // (review sweep 2026-08-13); the ROCm dispatcher's src-vs-out dtype mix-up
   // in the fused preamble (the 0.8B divergence, row/ROCM-GDN-08B-FIX) is
   // exactly the class an untested-but-registered op hides. REQUIRE (not skip)
   // on ROCm so a dropped RegisterOp can never pass silently.
+  //
+  // IQ4_XS/IQ3_XXS added by KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940). Their
+  // `qs`/grid-index bytes are read as unconstrained lookup indices (4-bit
+  // nibbles into a 16-entry codebook for IQ4_XS, a full byte into a 256-entry
+  // grid for IQ3_XXS), so the same random-byte block this table already
+  // builds for the four linear-scale formats is a valid block for these two
+  // as well -- no in-range constraint to add.
   constexpr int64_t M = 3, N = 8, K = 512;
   struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
   const Fmt fmts[] = {
@@ -2560,6 +2573,8 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
     // Qwen3.8-Flash-Next quant stores its ffn_down_exps and its n-gram table
     // in, so a ROCm arm that lacks it cannot multiply those experts at all.
     {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
+    {vt::DType::kIQ4_XS, 136, 0, -1, "iq4_xs"},
+    {vt::DType::kIQ3_XXS, 98, 0, -1, "iq3_xxs"},
   };
   const bool rocm_present = OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM);
   const bool any_rocm = [&] {
@@ -3913,11 +3928,17 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misali
 }
 #endif  // VLLM_CPP_HIP
 
-TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
+TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K/IQ4_XS/IQ3_XXS) matches the CPU oracle") {
   // kMatmulBTQuantGrouped on ROCm vs the CPU keep-quant reference
   // (cpu_quant_gemm.cpp:305). Valid random blocks (valid f16 deltas, random
   // quants) at a real expert-MLP shape. Integer cores are bit-exact ports;
   // the f16/f32 scale sum reassociates across lanes, so NMSE <= 5e-4.
+  //
+  // IQ4_XS/IQ3_XXS added by KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940) -- the
+  // MOTIVATING arm: these are ROUTED-EXPERT weights on a real checkpoint
+  // (unsloth/GLM-5.3-Flash-GGUF-style IQ4_XS gate/up + IQ3_XXS down), so the
+  // grouped path is the one a real load actually exercises, not the
+  // non-grouped table above.
   constexpr int64_t P = 3, N = 8, K = 512;         // K%256==0 (K-quant superblocks)
   constexpr int64_t E = 4;                          // experts
   const std::vector<int32_t> eids = {2, 0, 3};      // routed experts (non-sorted)
@@ -3935,6 +3956,8 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
     // provider, so the single-matrix arm alone would still throw at the first
     // expert forward with the model already resident.
     {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
+    {vt::DType::kIQ4_XS, 136, 0, -1, "iq4_xs"},   // {d,scales_h,scales_l,qs} superblocks of 256
+    {vt::DType::kIQ3_XXS, 98, 0, -1, "iq3_xxs"},  // {d,qs[3*QK_K/8]}         superblocks of 256
   };
 
   // REQUIRE-proven registration on ROCm (never a silent skip — review sweep
@@ -4180,6 +4203,132 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
       }
     }
   }
+// ─── KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940): the risk this row's spec ────
+// named -- CUDA needed __fmul_rn/__fadd_rn in DotIQ4XS to stay bit-exact
+// against the oracle, because nvcc's default -fmad=true silently contracted
+// the two-rounding accumulation into a single-rounding FMA and two of eight
+// real super-blocks then disagreed by 1-4 ULP (cuda_quant_dot.cu). This
+// project's CMakeLists.txt already passes -ffp-contract=off to
+// $<COMPILE_LANGUAGE:HIP> project-wide, unlike its CXX-only reach on CUDA, so
+// DotIQ4XS on ROCm uses plain `*`/`+` rather than carrying that workaround
+// over unexamined (see the function's own comment). This is the gate that
+// proves whether that bet paid off, over the SAME real checkpoint bytes and
+// the SAME expected oracle bits the CUDA gate uses -- reused, not
+// re-derived, so a drift between the two device gates cannot hide.
+namespace {
+// test_cuda_quant_dot.cpp's MakeDotActivation, restated rather than shared
+// (no cross-file dependency): every value is an integer in [-1024, 1023] over
+// 64, exact in binary32 on any compiler, so the same bytes come out of any
+// build and the golden's provenance carries over unchanged.
+void MakeIq4xsDotActivation(int n, uint32_t seed, float* x) {
+  uint32_t st = seed;
+  for (int i = 0; i < n; ++i) {
+    st = st * 1664525U + 1013904223U;
+    const int32_t v = static_cast<int32_t>((st >> 16) & 0x7ffU) - 1024;
+    x[i] = static_cast<float>(v) / 64.0F;
+  }
+}
+uint32_t FloatBitsOf(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, sizeof(u));
+  return u;
+}
+float BitsFloat(uint32_t u) {
+  float f = 0.0F;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+}  // namespace
+
+TEST_CASE("ROCm IQ4_XS dots the ORACLE's own numbers on REAL checkpoint bytes") {
+  const bool any_rocm = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!any_rocm) {
+    MESSAGE("no ROCm backend on this host; ROCm IQ4_XS oracle-dot gate skipped");
+    return;
+  }
+  REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM),
+                  "kMatmulBTQuant must be registered on ROCm");
+
+  constexpr int kBlocks = 4;
+  constexpr int kK = 256 * kBlocks;
+  REQUIRE(vt::cpu::QuantTraits(DType::kIQ4_XS).vec_dot_type == DType::kQ8_K);
+  const size_t wbytes = std::size(vllm_test::kIq4xsGoldenBlocks);
+  const size_t block_bytes = wbytes / kBlocks;
+  REQUIRE(block_bytes * kBlocks == wbytes);
+
+  std::vector<float> act(kK);
+  MakeIq4xsDotActivation(kK, 0x4247U, act.data());
+
+  vt::Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const Device gd{DeviceType::kROCM, 0};
+  DevBuf da(gpu, gq, act.size());
+  DevBufBytes dwt(gpu, gq, wbytes);
+  DevBuf dout(gpu, gq, kBlocks);
+  da.Upload(act);
+  dwt.Upload(vllm_test::kIq4xsGoldenBlocks);
+
+  // k=256, one super-block at a time: ONE contributing lane, so BIT FOR BIT
+  // against the oracle's own per-block number -- no reassociation exists to
+  // explain a difference away.
+  for (int b = 0; b < kBlocks; ++b) {
+    CAPTURE(b);
+    Tensor at = Tensor::Contiguous(static_cast<uint8_t*>(da.ptr()) + b * 256 * sizeof(float),
+                                   DType::kF32, gd, {1, 256});
+    Tensor wt = Tensor::Contiguous(static_cast<uint8_t*>(dwt.ptr()) + b * block_bytes,
+                                   DType::kIQ4_XS, gd, {1, 256});
+    Tensor ot = Tensor::Contiguous(static_cast<uint8_t*>(dout.ptr()) + b * sizeof(float),
+                                   DType::kF32, gd, {1, 1});
+    vt::MatmulBTQuant(gq, ot, at, wt);
+    float got = 0.0F;
+    gpu.Synchronize(gq);
+    gpu.Copy(gq, &got, static_cast<uint8_t*>(dout.ptr()) + b * sizeof(float), sizeof(float));
+    gpu.Synchronize(gq);
+    REQUIRE(std::isfinite(got));
+    CHECK(FloatBitsOf(got) == vllm_test::kIq4xsDotPerBlockBits[b]);
+  }
+
+  // k=1024, all four super-blocks in one warp: the SAME __shfl_down_sync
+  // offsets (16,8,4,2,1) as the CUDA gate, over four live lanes, giving the
+  // same (v0+v2)+(v1+v3) grouping the CUDA gate's comment derives -- so the
+  // PRIMARY assertion is bit equality against the oracle's four numbers
+  // recombined in that order, and a SECONDARY one bounds the difference from
+  // the oracle's own sequential total by the reassociation error.
+  {
+    Tensor at = T2(da.ptr(), gd, 1, kK);
+    Tensor wt = Tensor::Contiguous(dwt.ptr(), DType::kIQ4_XS, gd, {1, kK});
+    Tensor ot = T2(dout.ptr(), gd, 1, 1);
+    vt::MatmulBTQuant(gq, ot, at, wt);
+    float got = 0.0F;
+    gpu.Synchronize(gq);
+    gpu.Copy(gq, &got, dout.ptr(), sizeof(float));
+    gpu.Synchronize(gq);
+    REQUIRE(std::isfinite(got));
+
+    const float p0 = BitsFloat(vllm_test::kIq4xsDotPerBlockBits[0]);
+    const float p1 = BitsFloat(vllm_test::kIq4xsDotPerBlockBits[1]);
+    const float p2 = BitsFloat(vllm_test::kIq4xsDotPerBlockBits[2]);
+    const float p3 = BitsFloat(vllm_test::kIq4xsDotPerBlockBits[3]);
+    const float tree = (p0 + p2) + (p1 + p3);
+    CAPTURE(got);
+    CAPTURE(tree);
+    CHECK(FloatBitsOf(got) == FloatBitsOf(tree));
+
+    const float seq = BitsFloat(vllm_test::kIq4xsDotExpectedBits);
+    const double mag = static_cast<double>(std::fabs(p0)) + std::fabs(p1) +
+                       std::fabs(p2) + std::fabs(p3);
+    const double bound = 4.0 * 1.1920929e-7 * mag;
+    const double margin = std::fabs(static_cast<double>(got) - seq);
+    CAPTURE(seq);
+    CAPTURE(margin);
+    CAPTURE(bound);
+    CHECK(margin <= bound);
+  }
+
+  gpu.DestroyQueue(gq);
 }
 
 TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {

@@ -17,6 +17,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -167,7 +168,97 @@ __global__ void AttnQkNormRopeGateK(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
     }
   }
 }
-
+// ── Cooperative preamble (TG200 T6b, opt-in VT_ATTN_PREAMBLE_COOP=1) ───────
+// Donor mapping prices decode at ~88us/call: items = t*(hq+hkv) = 24 at
+// batch 1, so 24 of 256 threads run, each doing three serial dh-loops
+// (gate copy, sumsq, rope/norm store) through private cache lines. Here one
+// WARP handles one item: lanes stride j for the gate copy and the stores,
+// the sumsq reduces through a fixed shfl_down tree and inv is broadcast.
+// NUMERIC CONTRACT: every element's math is the donor's given inv; only the
+// ss summation ORDER changes (tree vs serial), so outputs are NMSE-equal,
+// not bit-exact — op is cross_device NMSE-gated, engine A/B records near-tie
+// adjudication per campaign doctrine.
+template <typename Tsrc, typename Tqk, typename Tgate>
+__global__ void AttnQkNormRopeGateCoopK(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
+                                        const Tsrc* qgate, const Tsrc* kf,
+                                        const float* q_norm, const float* k_norm,
+                                        const float* cos_sin, int64_t t, int64_t hq,
+                                        int64_t hkv, int64_t dh, int64_t qgate_stride,
+                                        int64_t kf_stride, int rot, float eps,
+                                        bool gemma) {
+  constexpr int NWARPS = kBlock / 32;
+  const int64_t half = rot / 2;
+  const int64_t items = t * (hq + hkv);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  for (int64_t item = warp; item < items; item += NWARPS) {
+    const int64_t tok = item / (hq + hkv);
+    const int64_t h = item % (hq + hkv);
+    const float* cs = cos_sin + tok * rot;
+    if (h < hq) {
+      const int64_t src_off = tok * qgate_stride + h * 2 * dh;
+      const int64_t out_off = (tok * hq + h) * dh;
+      for (int64_t j = lane; j < dh; j += 32)
+        St(gate_out, out_off + j, Ld(qgate, src_off + dh + j));
+      float ss = 0.0f;
+      for (int64_t j = lane; j < dh; j += 32) {
+        const float v = Ld(qgate, src_off + j);
+        ss += v * v;
+      }
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1) ss += __shfl_down(ss, off);
+      const float inv =
+          1.0f / sqrtf(__shfl(ss, 0) / static_cast<float>(dh) + eps);
+      for (int64_t j = lane; j < dh; j += 32) {
+        if (j < half) {
+          const float ni = GemmaNormElem(Ld(qgate, src_off + j), inv, q_norm[j], gemma);
+          const float nih =
+              GemmaNormElem(Ld(qgate, src_off + j + half), inv, q_norm[j + half], gemma);
+          St(q_out, out_off + j, ni * cs[j] - nih * cs[half + j]);
+        } else if (j < rot) {
+          const int64_t i = j - half;
+          const float ni = GemmaNormElem(Ld(qgate, src_off + i), inv, q_norm[i], gemma);
+          const float nih =
+              GemmaNormElem(Ld(qgate, src_off + i + half), inv, q_norm[i + half], gemma);
+          St(q_out, out_off + j, ni * cs[half + i] + nih * cs[i]);
+        } else {
+          St(q_out, out_off + j,
+             GemmaNormElem(Ld(qgate, src_off + j), inv, q_norm[j], gemma));
+        }
+      }
+    } else {
+      const int64_t hk_i = h - hq;
+      const int64_t src_off = tok * kf_stride + hk_i * dh;
+      const int64_t out_off = (tok * hkv + hk_i) * dh;
+      float ss = 0.0f;
+      for (int64_t j = lane; j < dh; j += 32) {
+        const float v = Ld(kf, src_off + j);
+        ss += v * v;
+      }
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1) ss += __shfl_down(ss, off);
+      const float inv =
+          1.0f / sqrtf(__shfl(ss, 0) / static_cast<float>(dh) + eps);
+      for (int64_t j = lane; j < dh; j += 32) {
+        if (j < half) {
+          const float ni = GemmaNormElem(Ld(kf, src_off + j), inv, k_norm[j], gemma);
+          const float nih =
+              GemmaNormElem(Ld(kf, src_off + j + half), inv, k_norm[j + half], gemma);
+          St(k_out, out_off + j, ni * cs[j] - nih * cs[half + j]);
+        } else if (j < rot) {
+          const int64_t i = j - half;
+          const float ni = GemmaNormElem(Ld(kf, src_off + i), inv, k_norm[i], gemma);
+          const float nih =
+              GemmaNormElem(Ld(kf, src_off + i + half), inv, k_norm[i + half], gemma);
+          St(k_out, out_off + j, ni * cs[half + i] + nih * cs[i]);
+        } else {
+          St(k_out, out_off + j,
+             GemmaNormElem(Ld(kf, src_off + j), inv, k_norm[j], gemma));
+        }
+      }
+    }
+  }
+}
 }  // namespace
 
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
@@ -243,10 +334,25 @@ void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor
     using Tsrc = decltype(src_tag);
     using Tqk = decltype(qk_tag);
     using Tgate = decltype(gate_tag);
-    AttnQkNormRopeGateK<Tsrc, Tqk, Tgate><<<GridFor(items), kBlock, 0, s>>>(
-        q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
-        kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(),
-        t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps, na.gemma);
+    // T6b opt-in (read once per process like the sibling arms): warp-per-item
+    // cooperative mapping. Default OFF keeps the donor walk.
+    static const bool preamble_coop = [] {
+      const char* e = std::getenv("VT_ATTN_PREAMBLE_COOP");
+      return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    if (preamble_coop) {
+      AttnQkNormRopeGateCoopK<Tsrc, Tqk, Tgate><<<GridFor(items), kBlock, 0, s>>>(
+          q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
+          kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(),
+          t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps,
+          na.gemma);
+    } else {
+      AttnQkNormRopeGateK<Tsrc, Tqk, Tgate><<<GridFor(items), kBlock, 0, s>>>(
+          q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
+          kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(),
+          t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps,
+          na.gemma);
+    }
   };
   // Dispatch on the OUTPUT dtype like the CUDA lane (cuda_ops.cu
   // LaunchAttnPreambleOut): the caller picks f32 out (token-exact path) or bf16

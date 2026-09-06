@@ -1074,8 +1074,8 @@ Release CPU build with `-DVLLM_CPP_CUDA=OFF` at the end of W4:
 
 | Suite | Cases | Assertions |
 |---|---|---|
-| `test_deepseek_v4_mm_reach` (new) | 13 | 79 |
-| `test_deepseek_v4_dsa` | 19 | 106 |
+| `test_deepseek_v4_mm_reach` (new) | 19 | 142 |
+| `test_deepseek_v4_dsa` | 19 | 109 |
 | `test_deepseek_v4_moe` | 14 | 731 |
 | `test_deepseek_v4_vision` | 15 | 7412 |
 | `test_deepseek_v4_mmproj` | 20 | 2211 |
@@ -1089,6 +1089,19 @@ Release CPU build with `-DVLLM_CPP_CUDA=OFF` at the end of W4:
 The six suites this row already owned keep their counts exactly. `ctest -R
 'deepseek_v4|clip_mmproj|model_registry|model_loader'` is 28 of 28, with
 `test_cuda_deepseek_v4` skipped for want of a CUDA backend.
+
+**THE W4 REPAIR ROUND MOVED TWO OF THOSE ROWS, and the table above already
+carries the new numbers.** `test_deepseek_v4_mm_reach` went from 13 cases and
+79 assertions to 19 and 142; `test_deepseek_v4_dsa` kept its 19 cases and went
+from 106 assertions to 109. Every other row is unchanged and
+`ctest -R 'deepseek_v4|clip_mmproj_gguf' -E cuda` is 24 of 24. What the six new
+cases hold is listed in `## Owed` and in each repair commit: the projector
+pairing refusal, the paged arm in the direction that must NOT refuse, the
+`supports_multimodal` flip's effect on the chat seam, the two image-row
+predicates agreeing, the hash-layer skip at a forward, and a chunk that opens no
+image span. The aligner-row permutation assertion was also VACUOUS until this
+round -- every aligner row of the fixture was bit-identical -- and its repair is
+the one change here that alters an existing case rather than adding one.
 
 ### W3A evidence
 

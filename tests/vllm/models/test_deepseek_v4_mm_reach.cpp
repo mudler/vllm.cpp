@@ -37,6 +37,7 @@
 #include "deepseek_v4_lang_gguf_fixture.h"
 #include "deepseek_v4_mmproj_fixture.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/mm_chat_registry.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
@@ -267,6 +268,70 @@ TEST_CASE("REACH: a deepseek4v projector handed to a non-consuming architecture 
   CHECK(vllm::ModelAs<vllm::DeepseekV4LoadedModel>(*again->model,
                                                    "DeepseekV4ForCausalLM")
             .has_vision());
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// (1c) WHAT THE `supports_multimodal` FLIP DOES TO THE SERVER TODAY.
+//
+// W4 turned `ModelInfo::supports_multimodal` on for this architecture and
+// recorded it as gating "the OpenAI server's chat seam, which W5 owns". W5 does
+// not own the consequence: `LoadedEngine::is_multimodal_model()` reads that flag
+// NOW and hands it to `InstallMultiModalChatSeam`, so the flip already moved
+// this architecture from `kTextOnlyModel`, where NOTHING is installed and the
+// chat path is byte-identical to a text-only server, to `kRefusing`, where an
+// image chat request gets HTTP 400 naming the architecture.
+//
+// That is very probably an improvement -- a refusal beats an image request
+// answered from the text path -- but it is a landed user-visible change, and
+// nothing drove it.
+//
+// The generic composition is already gated in `test_api_server_mm_forward`
+// ("an architecture with no registered seam REFUSES the image request by
+// name"), which drives the real install and reads the 400. What was missing is
+// the two DeepSeek-specific inputs that decide which arm this architecture
+// lands on, and this case measures both of them off the LOADED model rather
+// than off a hand-built registration.
+TEST_CASE("REACH: the multimodal flag puts DeepSeek-V4 on the REFUSING chat arm, not the text-only one") {
+  auto loaded = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                    /*with_mmproj=*/true);
+  const std::string_view arch = loaded->model->registration().architecture;
+  CHECK(arch == "DeepseekV4ForCausalLM");
+
+  // (a) The flag `LoadedEngine::is_multimodal_model()` returns. True here is
+  // what makes `InstallMultiModalChatSeam` look for a factory at all; false
+  // would install nothing and answer image requests from the text path.
+  CHECK(loaded->model->registration().info.supports_multimodal);
+
+  // (b) No factory is registered for this architecture, so the lookup refuses.
+  // Only `mm_chat_qwen3vl.cpp` and `mm_chat_dots3note.cpp` call
+  // `REGISTER_VLLM_MM_CHAT`, and the DeepSeek request path is W5's.
+  namespace oai = vllm::entrypoints::openai;
+  CHECK(oai::MultiModalChatRegistry::Find(arch) == nullptr);
+
+  // Which together are the `kRefusing` arm, and the message a user meets names
+  // the architecture and what to register. Read from `MakeSeam`, which is the
+  // one function the install calls.
+  oai::MultiModalChatContext ctx;
+  ctx.architecture = arch;
+  std::string message;
+  try {
+    (void)oai::MultiModalChatRegistry::MakeSeam(ctx);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  CHECK(message.find(std::string(arch)) != std::string::npos);
+  CHECK(message.find("REGISTER_VLLM_MM_CHAT") != std::string::npos);
+
+  // And the refusing chat function that install builds from it refuses a
+  // multimodal request while leaving a text one alone -- the property that makes
+  // this arm an improvement on `kTextOnlyModel` rather than a regression.
+  const oai::MultiModalChatFn refuse =
+      oai::MakeRefusingMultiModalChatFn(std::string(arch), message);
+  vllm::entrypoints::openai::ChatMessage text;
+  text.role = "user";
+  text.content = "hello";
+  CHECK_FALSE(refuse({text}).has_value());
 }
 
 // ───────────────────────────────────────────────────────────────────────────

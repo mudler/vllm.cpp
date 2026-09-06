@@ -59,8 +59,21 @@ inline constexpr ModelInfo kDeepseekV4Info{
     // this architecture CAN accept multimodal input, and a load with no
     // `deepseek4v` projector keeps `DeepseekV4LoadedModel::has_vision()` false
     // and stays byte-identical. What actually gates the runner's multimodal arm
-    // is `encode_mm` and `embed_mm` being non-null (`SupportsMmInputs`); this
-    // flag gates the OpenAI server's chat seam, which W5 owns.
+    // is `encode_mm` and `embed_mm` being non-null (`SupportsMmInputs`).
+    //
+    // THIS FLAG IS READ BY THE SERVER TODAY, and an earlier wording of this
+    // comment said it gates a chat seam "which W5 owns". W5 owns the seam; it
+    // does not own the consequence of the flip, which already landed.
+    // `LoadedEngine::is_multimodal_model()` returns exactly this value and hands
+    // it to `InstallMultiModalChatSeam`, and no `REGISTER_VLLM_MM_CHAT` names
+    // this architecture -- only `mm_chat_qwen3vl.cpp` and
+    // `mm_chat_dots3note.cpp` register one. So the install moved from
+    // `kTextOnlyModel`, where nothing is installed and the chat path is
+    // byte-identical to a text-only server, to `kRefusing`, where an image chat
+    // request gets HTTP 400 naming the architecture. That is an improvement --
+    // a refusal beats an image answered from the text path -- and it is a
+    // user-visible change, so `test_deepseek_v4_mm_reach` drives both inputs
+    // that decide the arm and `docs/FEATURES.md` says so.
     .supports_multimodal = true,
     .score_type = "bi-encoder",
 };

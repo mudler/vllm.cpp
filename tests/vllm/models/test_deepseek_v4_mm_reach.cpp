@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "deepseek_v4_lang_gguf_fixture.h"
@@ -181,6 +182,77 @@ TEST_CASE("REACH: DeepSeek-V4 advertises a multimodal input path to the runner")
   // ordinary one-dimensional ones.
   CHECK(reg.factory->mrope_prompt_positions == nullptr);
   CHECK_FALSE(vllm::ModelRegistry::UsesMrope(*loaded->model));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// (1b) A PROJECTOR HANDED TO AN ARCHITECTURE THAT READS NONE IS REFUSED.
+//
+// `ModelRegistry::Load` is the production call `model_loader.cpp:3126` makes,
+// and the projector reaches it from a branch that keys on the PROJECTOR TYPE
+// alone (`model_loader.cpp:3020-3023`): `--mmproj <deepseek4v>.gguf` sets
+// `gguf_source.mmproj` whatever the language file's architecture is. Nothing
+// downstream of that point would notice. A `load_weights` that does not read
+// `ModelSource::mmproj` ignores it, the load SUCCEEDS, no tower exists, and the
+// first image request is answered as text -- the failure the check's own
+// comment names.
+//
+// Until this case the flag was asserted (case (1) and the scaffold suite) and
+// the refusal was not: removing the `VT_CHECK` in `ModelRegistry::Load` left
+// all 24 tests of this family green.
+//
+// The other architecture is DISCOVERED rather than named, because naming one
+// pins this case to a model that may be renamed or retired, and what is being
+// gated is the property and not the model.
+TEST_CASE("REACH: a deepseek4v projector handed to a non-consuming architecture is REFUSED") {
+  auto loaded = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                    /*with_mmproj=*/true);
+  REQUIRE(loaded->model != nullptr);
+
+  // An architecture registered by THIS build whose loader reads no projector.
+  std::string_view other;
+  for (const std::string_view name :
+       vllm::ModelRegistry::SupportedArchs()) {
+    vllm::HfConfig probe;
+    probe.architectures = {std::string(name)};
+    if (!vllm::ModelRegistry::Resolve(probe).factory->consumes_mmproj) {
+      other = name;
+      break;
+    }
+  }
+  REQUIRE_FALSE(other.empty());
+  INFO("other architecture: ", other);
+
+  // The SAME source the DeepSeek load above took, retargeted by config alone.
+  // The refusal sits AFTER `Resolve` and BEFORE `parse_config`/`load_weights`,
+  // so the language bytes are never read and the message is about the pairing
+  // rather than about the first tensor whose name does not resolve.
+  vllm::ModelSource source =
+      vllm::ModelSource::FromGguf(*loaded->lang_gguf, vt::DeviceType::kCPU);
+  source.mmproj = loaded->proj_gguf.get();
+  source.mmproj_path = loaded->proj->path();
+  vllm::HfConfig foreign;
+  foreign.architectures = {std::string(other)};
+  std::string message;
+  try {
+    (void)vllm::ModelRegistry::Load(foreign, source);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  // It names WHICH file, WHICH architecture, and what would have happened.
+  CHECK(message.find(loaded->proj->path()) != std::string::npos);
+  CHECK(message.find(std::string(other)) != std::string::npos);
+  CHECK(message.find("NO vision tower") != std::string::npos);
+
+  // THE DISCRIMINATION IS REAL. The identical source on the architecture that
+  // DOES read a projector is not refused -- without this half, a `VT_CHECK`
+  // that refused every projector would pass the assertions above.
+  auto again = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                   /*with_mmproj=*/true);
+  CHECK(again->model != nullptr);
+  CHECK(vllm::ModelAs<vllm::DeepseekV4LoadedModel>(*again->model,
+                                                   "DeepseekV4ForCausalLM")
+            .has_vision());
 }
 
 // ───────────────────────────────────────────────────────────────────────────

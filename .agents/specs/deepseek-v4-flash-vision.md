@@ -684,6 +684,21 @@ manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
 ## Owed
+- **The PAGED attention arms cannot express the image-span exemption, and they
+  REFUSE it.** `vt::AttentionWindow` carries one window per call, so the mask is
+  per-call while the exemption is per-position. With `sliding_window = 128` and a
+  384-token block, clipping the span away leaves two thirds of it invisible and
+  the argmax plausible. `AttentionBlock` therefore refuses a step that carries an
+  image span on a windowed paged layer, by name, and
+  `test_deepseek_v4_mm_reach` drives that refusal through
+  `ModelRegistry::Forward`. THIS IS THE ARM A REAL ENGINE TAKES, because
+  DeepSeek-V4 publishes a multi-cache topology, so the image path is served on
+  the non-paged branch only until the per-position mask lands. Issue #2411 and
+  row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` own it.
+- **The two DEVICE routers take one bias pointer per call.** `DispRoute` refuses
+  a step carrying image rows on the `be.device` and glue arms rather than routing
+  them on the text bias, and the two resident single-token decode arms refuse an
+  out-of-vocabulary identifier. Owed by issue #2411 and W7-CUDA.
 - `ResidentWeight`'s device-staging arm in
   `include/vllm/model_executor/models/dense_attn_block.h` drops `q8_0_aligned`
   and `repacked` while guarding `elem_kn_repacked`, so the shared seam cannot
@@ -858,6 +873,59 @@ above as its red-before input.
   it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
   test uses, so it is not made inside a W3A repair.
 
+### W4 evidence — stage 4, the vision routing bias
+
+The DECISION and its argument are recorded above, beside the `exp_probs_b_vl`
+entry in `## Owed`, because that is where the premise this wave was handed was
+corrected. This section records what was measured.
+
+Two SELECTION cases in `test_deepseek_v4_moe` are built so the text bias, the
+vision bias and the hash table each name a DIFFERENT expert, so a bias that
+changed the weights but not the choice would be invisible: a mixed row of three
+tokens routes text, image, text onto the text bias, the vision bias and the text
+bias again, and on a hash layer a text row keeps `tid2eid` while an image row
+leaves it. An EMPTY mask is asserted byte-identical to the call that carries no
+vision bias at all, which is every text step.
+
+At the forward, two language files differ in NOTHING but the VALUES of
+`exp_probs_b_vl`, and the same image runs through both. The row read for logits
+is a TEXT row BEFORE the image span, whose causal prefix is text only: under the
+per-token rule it cannot move, and under llama.cpp's per-ubatch rule it would.
+That assertion is what makes the choice a decision rather than a preference.
+
+| Mutation | Result |
+|---|---|
+| llama.cpp's per-UBATCH selection (`media = any_media`) | RED: the pre-span text row moves by 16 logits, and 5 assertions in the selection cases |
+| the vision bias is never selected | RED: the post-span row stops moving |
+| the bias is keyed on the CHECKPOINT rather than on the row | RED: 16 logits on both the per-token case and the inertness case |
+
+### W4 evidence — stage 2, the projector refusal order
+
+`RefuseDeepSeekV4ClipMmprojArm` holds the order in one function and
+`model_loader.cpp` calls that function rather than its parts, so a second call
+site cannot get it wrong. The gate drives `LoadedEngine::FromModelDir` -- where
+a user meets the message -- with a projector carrying the FUSED
+`v.blk.{bid}.attn_qkv` the pinned `convert_hf_to_gguf.py` actually emits, and
+asserts the message names `attn_qkv` and issue #2411 rather than blaming the
+file for carrying tensors the reader never reads. Reversing the two calls
+reddens it on two assertions.
+
+### W4 evidence — stage 5, text inertness
+
+A DeepSeek-V4 TEXT checkpoint must be exactly what it was before this wave, and
+that cannot be checked against code that no longer exists. It is checked against
+the OTHER checkpoint instead: a vision file differs from a text file in nothing
+but its 43 `exp_probs_b_vl` tensors and its projector, and a text-only prompt
+gets the same logits from both, bit for bit. The case also asserts that the text
+model's `has_vision()` is false and that its `gate_bias_vl` is empty, so the two
+files really are different files.
+
+THE MUTATION IT ANSWERS TO is a real shape of the defect rather than an
+arbitrary edit: key the vision bias on the CHECKPOINT -- `!L.gate_bias_vl.empty()`
+-- instead of on the row's identifier. The bias is a property of the file and
+the rows are not, and the two are easy to confuse. It reddens the inertness case
+by 16 logits and the per-token case beside it by the same 16.
+
 ### W4 evidence — stage 3, image-span attention visibility
 
 `deepseek4.attention.sliding_window` is 128 and one image block reaches 384
@@ -958,8 +1026,28 @@ was unobserved. The fixture gained `tokenizer.ggml.*` keys and a case that pairs
 a projector of the WRONG aligner width with the language model, whose refusal
 exists only if the file arrived.
 
-The focused gate is `test_deepseek_v4_mm_reach`, 7 cases and 50 assertions on a
-Release CPU build with `-DVLLM_CPP_CUDA=OFF`.
+### W4 gate totals
+
+One place, so no section carries a number that another edit makes stale. On a
+Release CPU build with `-DVLLM_CPP_CUDA=OFF` at the end of W4:
+
+| Suite | Cases | Assertions |
+|---|---|---|
+| `test_deepseek_v4_mm_reach` (new) | 13 | 79 |
+| `test_deepseek_v4_dsa` | 19 | 106 |
+| `test_deepseek_v4_moe` | 14 | 731 |
+| `test_deepseek_v4_vision` | 15 | 7412 |
+| `test_deepseek_v4_mmproj` | 20 | 2211 |
+| `test_clip_mmproj_gguf` | 9 | 272 |
+| `test_deepseek_v4_mm_loader` | 9 | 105 |
+| `test_deepseek_v4_encoding` | 21 | 54 |
+| `test_deepseek_v4_image_processor` | 20 | 112 |
+| `test_deepseek_v4_scaffold` | 10 | 684 |
+| `test_model_registry` | 24 | 993 |
+
+The six suites this row already owned keep their counts exactly. `ctest -R
+'deepseek_v4|clip_mmproj|model_registry|model_loader'` is 28 of 28, with
+`test_cuda_deepseek_v4` skipped for want of a CUDA backend.
 
 ### W3A evidence
 
@@ -1035,16 +1123,24 @@ the row that owns the wiring and issue #2411.
 
 ## Now
 
-`ACTIVE`. W1 and W2 have landed on the row branch, and this spec was amended on
-2026-09-05: the quantized vehicle is now the pinned
-`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`, `llama-cpp-dsv4vision` is
-registered as a runnable reference for it, and two language-side vision
-behaviours the original spec missed (`exp_probs_b_vl` and the non-causal
-image-span window) are specified and owed. W2 adds the standalone
-32-layer-capable ViT and the downsample-3 aligner as a config-driven composition
-over public `vt` operations. Neither wave is reachable from production: W3 owns
-weights, W4 owns the registered forward and image-span visibility, and W5 owns
-the runner, public ABI and server.
+`ACTIVE`. W1, W2, W3 and W4 have landed on the row branch.
+
+W4 IS THE WAVE THAT MADE THE ROW REACHABLE. An image now travels from
+`--mmproj` through `ModelSource::mmproj` into `LoadDeepseekV4ForCausalLM`, which
+attaches the `deepseek4v` projector to the model; `ModelRegistry::EncodeMm` runs
+the W2 tower and emits one row per sentinel token, `ModelRegistry::EmbedMm`
+merges those rows over the image span, and the registered forward consumes
+`MultiModalForwardInput::inputs_embeds`. The two language-side behaviours the
+original spec missed are implemented with it: the vision routing bias is
+selected PER TOKEN, with the argument for that divergence recorded above, and an
+image span attends across itself while the window still clips below its start.
+
+WHAT W4 DID NOT DO. The REQUEST path is still unwired -- nothing between an HTTP
+body and `MultiModalInputs` calls the W1 encoder or processor -- and W5 owns it
+together with the runner and the public ABI. The paged attention arms and the
+two device routers refuse an image step by name rather than serving it wrongly;
+both are listed under `## Owed`. No real artifact has been read or run: W6 owns
+the first load and generation, and W7 owns the device paths.
 
 ### W1 evidence
 

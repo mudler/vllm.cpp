@@ -1185,6 +1185,33 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // tensor, one op call for the whole step. Proven equal to the loop below by
     // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
     // several `kv_base` values, with both off-by-one directions mutation-proven.
+    // MODEL-MM-deepseek-v4 W4 (#2411): THE PAGED ARMS CANNOT EXPRESS THE
+    // IMAGE-SPAN EXEMPTION, and they say so rather than clipping it away.
+    //
+    // Both paged branches below hand `vt::AttentionWindow` ONE window for the
+    // whole call, so the mask is per-call and the exemption is per-position.
+    // With `sliding_window = 128` and a 384-token block, clipping it away leaves
+    // two thirds of the span invisible AND leaves the argmax plausible, which is
+    // precisely the failure a token gate cannot see. Refused by name; the
+    // per-position mask is owed by issue #2411 with the device path.
+    //
+    // The guard is the SAME predicate the host branch routes on -- a non-empty
+    // `be.image_spans` and a non-zero window -- rather than a second copy of it.
+    if (be.image_spans != nullptr && !be.image_spans->empty()) {
+      const int64_t win = p.has_compressor(layer) ? 0 : p.sliding_window;
+      VT_CHECK(win == 0,
+               "deepseek-v4 attention: this step carries " +
+                   std::to_string(be.image_spans->size()) +
+                   " image span(s) and layer " + std::to_string(layer) +
+                   " runs the PAGED arm at sliding_window " +
+                   std::to_string(win) +
+                   ". Inside an image span every position must see every other "
+                   "one, and the paged attention op takes one window for the "
+                   "whole call, so the span would be clipped to the window and "
+                   "the answer would stay plausible. Refused by name. The "
+                   "per-position mask is owed by issue #2411 (row "
+                   "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm)");
+    }
     if (is_comp && be.compressor != nullptr &&
         (p.compress_ratio(layer) == 128 || p.compress_ratio(layer) == 4)) {
       // The compressor arm. `deck` is this step's latents, `x` the hidden state the

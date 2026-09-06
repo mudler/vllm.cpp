@@ -927,3 +927,185 @@ TEST_CASE("REACH: the sliding window reaches the registered forward") {
   CHECK(moved(run(/*window=*/4, /*first_token=*/1),
               run(/*window=*/4, /*first_token=*/6)) == 0);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// (12) TEXT INERTNESS, measured rather than read.
+//
+// A DeepSeek-V4 TEXT checkpoint must be exactly what it was before this wave.
+// The claim cannot be checked against code that no longer exists, so it is
+// checked against the OTHER checkpoint: a vision file differs from a text file
+// in nothing but its 43 `exp_probs_b_vl` tensors and its projector, and a
+// text-only prompt must get the same logits from both, bit for bit.
+//
+// THE MUTATION THIS CASE ANSWERS TO. Key the vision bias on the CHECKPOINT --
+// `!L.gate_bias_vl.empty()` -- instead of on the row's identifier, and the
+// vision model's text answer moves while the text model's does not. That is a
+// real shape of this defect: the bias is a property of the file, the rows are
+// not, and the two are easy to confuse.
+TEST_CASE("REACH: a text prompt is bit-identical on a text and a vision checkpoint") {
+  auto text = LoadThroughRegistry(/*vision_checkpoint=*/false,
+                                  /*with_mmproj=*/false);
+  auto vision = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                    /*with_mmproj=*/true);
+  const auto& text_model = vllm::ModelAs<vllm::DeepseekV4LoadedModel>(
+      *text->model, "DeepseekV4ForCausalLM");
+  const auto& vision_model = vllm::ModelAs<vllm::DeepseekV4LoadedModel>(
+      *vision->model, "DeepseekV4ForCausalLM");
+  // NO VISION ALLOCATION on the text side, and one on the other -- which is
+  // what makes the comparison below a comparison of two different files.
+  CHECK_FALSE(text_model.has_vision());
+  CHECK(vision_model.has_vision());
+  CHECK(text_model.weights().host.layers[0].gate_bias_vl.empty());
+  CHECK_FALSE(vision_model.weights().host.layers[0].gate_bias_vl.empty());
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const std::vector<int32_t> prompt{1, 2, 3, 4, 5, 6};
+  const std::vector<int32_t> positions{0, 1, 2, 3, 4, 5};
+  const std::vector<int32_t> logits_indices{5};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+  const auto answer = [&](Loaded& loaded) {
+    vllm::ModelForwardInput in{.token_ids = prompt,
+                               .positions = positions,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = loaded.config,
+                               .queue = queue,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    in.gather_logits = false;
+    // `mm` stays unset, which is every text step.
+    return vllm::ModelRegistry::Forward(*loaded.model, in).host;
+  };
+  const std::vector<float> a = answer(*text);
+  const std::vector<float> b = answer(*vision);
+  REQUIRE(a.size() == static_cast<size_t>(kVocab));
+  REQUIRE(b.size() == a.size());
+  int64_t differing = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) ++differing;
+  }
+  CHECK(differing == 0);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// (13) THE PAGED ARM REFUSES AN IMAGE SPAN IT CANNOT SERVE.
+//
+// The paged attention op takes ONE `vt::AttentionWindow` for the whole call, so
+// it cannot express a per-position exemption. With the released
+// `sliding_window = 128` against a 384-token block, clipping the span away
+// leaves two thirds of it invisible and the argmax plausible -- the failure no
+// token gate can see. It is refused by name instead, and the per-position mask
+// is owed with the device path.
+//
+// The case matters because the paged arm is the one a REAL engine takes:
+// DeepSeek-V4 publishes a multi-cache topology, so `ModelRegistry::Forward`
+// routes a served step here and not to the branch cases (4) and (10) drive.
+TEST_CASE("REACH: the paged arm refuses an image span it would clip to the window") {
+  auto loaded = std::make_unique<Loaded>();
+  loaded->lang = std::make_unique<TempFile>(BuildDeepseek4Gguf(
+      /*vision=*/true, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
+      /*head_dim=*/512, /*with_tokenizer=*/false, /*vision_bias_scale=*/1.0F,
+      /*sliding_window=*/4));
+  loaded->proj = std::make_unique<TempFile>(
+      dsv4_mmproj_test::Build(ProjDims(), ProjOptions()));
+  loaded->lang_gguf =
+      std::make_unique<vllm::GgufFile>(vllm::GgufFile::Open(loaded->lang->path()));
+  loaded->proj_gguf =
+      std::make_unique<vllm::GgufFile>(vllm::GgufFile::Open(loaded->proj->path()));
+  loaded->config = vllm::DeepseekV4HfConfigFromGguf(*loaded->lang_gguf);
+  vllm::ModelSource source =
+      vllm::ModelSource::FromGguf(*loaded->lang_gguf, vt::DeviceType::kCPU);
+  source.mmproj = loaded->proj_gguf.get();
+  source.mmproj_path = loaded->proj->path();
+  loaded->model = vllm::ModelRegistry::Load(loaded->config, source);
+  REQUIRE(loaded->config.raw.at("sliding_window").get<int64_t>() == 4);
+
+  const DeepSeekV4VisionConfig vcfg =
+      vllm::DeepSeekV4ClipMmprojVisionConfig(*loaded->proj_gguf);
+  const auto image = MakeImage(vcfg);
+  const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
+      {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
+      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
+      *loaded->model, loaded->config, queue, mm.mm_features[0]);
+  const int64_t tokens = static_cast<int64_t>(mm.prompt_token_ids.size());
+  std::vector<char> is_mm(static_cast<size_t>(tokens), 0);
+  for (int i = 0; i < mm.mm_features[0].length; ++i) {
+    is_mm[static_cast<size_t>(mm.mm_features[0].offset + i)] = 1;
+  }
+  const std::vector<vt::Tensor> slices{enc.embeds};
+  vllm::MmEmbedInputs embed_in;
+  embed_in.token_ids = &mm.prompt_token_ids;
+  embed_in.mm_embeds = &slices;
+  embed_in.is_mm_embed = &is_mm;
+  vllm::MmForwardBuffers buffers =
+      vllm::ModelRegistry::EmbedMm(*loaded->model, loaded->config, queue, embed_in);
+
+  // The pages the runner publishes, under the names `MakeDeepseekV4KVCache`
+  // publishes them under. Every layer of this fixture has `compress_ratio 0`,
+  // so the SWA group is the whole topology.
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(loaded->config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t nb = 4, bs = 8;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+  std::vector<std::string> names;
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const size_t i = static_cast<size_t>(l);
+    storage[i].assign(static_cast<size_t>(nb * bs * params.head_dim), 0.0F);
+    attn_kv[i].data = storage[i].data();
+    attn_kv[i].dtype = vt::DType::kF32;
+    attn_kv[i].num_blocks = nb;
+    attn_kv[i].block_size = bs;
+    attn_kv[i].num_kv_heads = 1;
+    attn_kv[i].head_size = static_cast<int>(params.head_dim);
+    names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  }
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+
+  std::vector<int32_t> positions(static_cast<size_t>(tokens));
+  for (int64_t t = 0; t < tokens; ++t) {
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(tokens - 1)};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+  vllm::ModelForwardInput in{.token_ids = mm.prompt_token_ids,
+                             .positions = positions,
+                             .attn_meta = attn_meta,
+                             .gdn_meta = gdn_meta,
+                             .attn_kv = attn_kv,
+                             .gdn_state = gdn_state,
+                             .config = loaded->config,
+                             .queue = queue,
+                             .logits_indices = logits_indices,
+                             .num_reqs = 1};
+  in.gather_logits = false;
+  in.multi_kv = &mk;
+  in.mm = buffers.mm;
+
+  std::string message;
+  try {
+    (void)vllm::ModelRegistry::Forward(*loaded->model, in);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  CHECK(message.find("image span") != std::string::npos);
+  CHECK(message.find("sliding_window 4") != std::string::npos);
+  CHECK(message.find("2411") != std::string::npos);
+}

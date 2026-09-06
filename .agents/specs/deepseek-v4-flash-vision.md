@@ -692,6 +692,22 @@ above as its red-before input.
   shared-seam gap outside this row, and
   [#2992](https://github.com/mudler/vllm.cpp/issues/2992) owns it.
 
+- `V4GgufCtx::Vec` is still GEOMETRY-BLIND for four more per-layer vectors in
+  the GGUF arm: `ffn_gate_tid2eid.weight`, `hc_ffn_base.weight`,
+  `hc_ffn_fn.weight` and `hc_ffn_scale.weight`. `Vec` validates residency and
+  role and no shape at all, which is exactly the F2 weakness `Vec1D` closed for
+  the two router biases. W3B correctly did not chase them, since each has its
+  own expected width and the safetensors arm already gets one from
+  `carried.Float(..., {ne})`; nothing recorded them either, and this does.
+  Issue #2411 and W4 own giving each its declared width.
+
+- `608f403a3` changes product code in the W2 tower, which nothing reaches, and
+  its body does not carry the `AGENTS.md` §"Nothing lands dead" declaration. The
+  substance is met -- the subject carries the row ID and the issue, and this
+  section covers the whole tower -- so this is a record note and not a rewrite of
+  history. It is the same omission `435942c0d` was written to close for the
+  commit before it.
+
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
 - The unsloth GGUF arm's first load and generation, on the pinned revision and
   hashes above, is owed by issue #2411 and W3.

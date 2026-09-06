@@ -699,6 +699,23 @@ above as its red-before input.
   a step carrying image rows on the `be.device` and glue arms rather than routing
   them on the text bias, and the two resident single-token decode arms refuse an
   out-of-vocabulary identifier. Owed by issue #2411 and W7-CUDA.
+- **The DEVICE decode attention kernel takes no per-key index list, and W4 made
+  that a divergence.** `deepseek_v4.cpp`'s `dev_attn` arm calls
+  `DsaDevice()->decode_attn`, which derives its own key range from `kv_base + t`
+  and attends the whole causal prefix. Until W4 that was the same list the host
+  arm built. It is not any more: W4 made `sel` windowed and span-aware, so on a
+  layer with no compressor at the released `sliding_window = 128` the host arm
+  attends 128 rows while the kernel attends every one, and inside an image span
+  the host arm attends forward while the kernel does not. The arm's own comment
+  asserted the opposite and has been corrected. Neither existing refusal covers
+  it -- `dev_attn` is independent of `be.device` and of `GlueDev`, so
+  `DispRoute`'s media refusal does not reach it, and `paged_attn` is false in
+  that branch -- so both conditions are now REFUSED BY NAME there.
+  **THE REFUSAL IS UNMEASURED, and this entry is the record of that.** `dev_attn`
+  needs a non-CPU queue, `VT_V4_DEVICE_ATTN` and the V4 device kernels together,
+  so no CPU build can execute either check and the W4 repair claims no gate for
+  them. The windowed and span-aware device kernel, and the device run that would
+  gate the refusal, are owed by issue #2411 and W7-CUDA.
 - `ResidentWeight`'s device-staging arm in
   `include/vllm/model_executor/models/dense_attn_block.h` drops `q8_0_aligned`
   and `repacked` while guarding `elem_kn_repacked`, so the shared seam cannot

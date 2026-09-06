@@ -1293,8 +1293,51 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
         // to MODEL-DSV4-DSA-COMPOSE (#2286) and they refuse above.
         /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
   } else if (dev_attn) {
-    // kv_keys holds the cached deck [n_keys_total, hd]; sel is dense-causal, so the
-    // device kernel derives it from kv_base+t (no per-key index list needed).
+    // kv_keys holds the cached deck [n_keys_total, hd] and the device kernel
+    // derives its own key range from `kv_base + t`, taking no per-key index
+    // list. It therefore attends the DENSE CAUSAL prefix, and `sel` is
+    // discarded here.
+    //
+    // MODEL-MM-deepseek-v4 W4 repair (#2411): THAT IS NO LONGER ALWAYS THE SAME
+    // THING, and the comment this replaces asserted that it was. W4 made `sel`
+    // windowed and span-aware in the branch above, so on a layer with no
+    // compressor at the released `sliding_window = 128` the host arm attends
+    // 128 rows while this kernel attends the whole prefix, and inside an image
+    // span the host arm attends forward while this kernel does not. Both are
+    // silent numeric divergences that W4 introduced.
+    //
+    // Neither is covered by an existing refusal: `dev_attn` is independent of
+    // `be.device` and of `GlueDev`, so `DispRoute`'s media refusal does not
+    // reach it, and `paged_attn` is false in this branch so the paged refusal
+    // does not either. Refused by name instead, and the kernel is owed by issue
+    // #2411 W7-CUDA.
+    //
+    // NOT EXECUTABLE ON A CPU BUILD, and no gate here claims otherwise:
+    // `dev_attn` needs a non-CPU queue, `VT_V4_DEVICE_ATTN` and the V4 device
+    // kernels together. The spec's `## Owed` records it as unmeasured.
+    const int64_t dev_window = p.has_compressor(layer) ? 0 : p.sliding_window;
+    VT_CHECK(dev_window == 0,
+             "deepseek-v4 attention: layer " + std::to_string(layer) +
+                 " runs the DEVICE decode kernel at sliding_window " +
+                 std::to_string(dev_window) +
+                 ". That kernel derives its own key range from kv_base+t and "
+                 "attends the whole causal prefix, so it would diverge from the "
+                 "host arm by exactly the rows the window excludes -- silently, "
+                 "with a plausible argmax. Refused by name; the windowed device "
+                 "kernel is owed by issue #2411 (row "
+                 "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, W7-CUDA). "
+                 "Unset VT_V4_DEVICE_ATTN to take the host arm");
+    VT_CHECK(be.image_spans == nullptr || be.image_spans->empty(),
+             "deepseek-v4 attention: layer " + std::to_string(layer) +
+                 " runs the DEVICE decode kernel on a step carrying " +
+                 std::to_string(be.image_spans == nullptr
+                                    ? size_t{0}
+                                    : be.image_spans->size()) +
+                 " image span(s). That kernel takes no per-key index list, so "
+                 "the non-causal image-span exemption cannot reach it and every "
+                 "row of the span would see only what precedes it. Refused by "
+                 "name; owed by issue #2411 (row "
+                 "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, W7-CUDA)");
     deepseek_v4::DsaDevice()->decode_attn(
         *be.q, o.data(), q.data(), kv_keys->data(), L.attn_sink.data(), nh, hd, kv_base, T,
         scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink);

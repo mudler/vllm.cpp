@@ -689,8 +689,10 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // IQ2_S (256-elem, Q8_K-act) and MXFP4 (32-elem, Q8_0-act) are keep-quant
         // capable as of the UD-IQ2_M vehicle, so they route like the others.
         // The DEVICE axis (review #523): the running device's kernel set can be
-        // narrower than the loader's CPU-derived list. This row gives ROCm the
-        // seven Q8_K-activation formats in addition to its four prior formats.
+        // narrower than the loader's CPU-derived list — ROCm now serves 12
+        // formats: Q8_0/Q4_K/Q5_K/Q6_K, the seven Q8_K-activation formats
+        // (IQ2_XXS, Q2_K, Q3_K, IQ2_S, IQ1_S, IQ1_XXXS, IQ3_XXS), and IQ4_XS
+        // via KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940).
         // QUANT-GGUF-IQ-VECDOT (#2247) put IQ2_XS and IQ4_XS in this list.
         // They were gather-only between #2245 and #2247 — decoder, no vec_dot —
         // and the `vec_dot` rows are what moved them onto the GEMM arm.
@@ -718,7 +720,8 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
             !rocm || type == kQ8_0 || type == kQ2_K || type == kQ3_K ||
             type == kQ4_K || type == kQ5_K || type == kQ6_K ||
             type == kIQ2_XXS || type == kIQ3_XXS || type == kIQ2_S ||
-            type == kIQ1_S || type == kIQ1_XXXS || type == kIQ4_NL;
+            type == kIQ1_S || type == kIQ1_XXXS || type == kIQ4_NL ||
+            type == kIQ4_XS;
         const bool block_capable = cpu_capable && device_capable;
         const int64_t blk = (type == kQ4_0 || type == kQ5_0 || type == kQ8_0 ||
                              type == kMXFP4 || type == kIQ4_NL)
@@ -804,12 +807,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
   // device-dependent (review #523): 18 block-capable encodings x 2 keep-capable
-  // GEMM roles where the device covers the CPU list; 12 x 2 on ROCm. The
-  // GATHER role adds 19 more (the 18, plus Q8_K) on a device that
-  // REGISTERS the block
-  // gather, and nothing on a device that does not. Written as named terms
-  // rather than one number so a future change to any one of them says which one
-  // moved. Both moves are now on record and they are mirror images:
+  // GEMM roles where the device covers the CPU list; 13 x 2 on ROCm (the
+  // 11 Q8_K-activation and base formats, plus IQ4_NL via QUANT-GGUF-IQ4_NL
+  // and IQ4_XS via KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT #1940). The GATHER
+  // role adds 19 more (the 18, plus Q8_K) on a device that REGISTERS the
+  // block gather, and nothing on a device that does not. Written as named
+  // terms rather than one number so a future change to any one of them says
+  // which one moved. Both moves are now on record and they are mirror images:
   // LOADER-GGUF-IQ (#2240) moved the GATHER term 11 -> 13 and left GEMM at 20,
   // the shape of a decode-only port; QUANT-GGUF-IQ-VECDOT (#2247) moves the
   // GEMM term 20 -> 24 and leaves GATHER at 13, the shape of a dot-only port.
@@ -836,12 +840,15 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // term at 34, because IQ4_NL was already in the CPU list and only the DEVICE
   // set was narrower. That is the shape of a device-arm port: one encoding, two
   // keep-capable GEMM roles, and no change to either gather term.
+  // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940) moves the ROCm GEMM term 24 -> 26
+  // (IQ4_XS, same shape: one encoding, two keep-capable GEMM roles). IQ3_XXS was
+  // already in ROCm's Q8_K-activation set, so it does not move this number.
   //
   // tenstorrent-gsq-keepquant wave 1 (aa85e9484) moved the CPU/CUDA GEMM term
   // 34 -> 36 and left the ROCm and gather terms where they were: IQ3_S gained
   // a CPU `vec_dot`, so it joined the GEMM arm (one encoding x two keep-capable
   // GEMM roles) on the devices that cover the CPU list.
-  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 24 : 36;
+  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 26 : 36;
   const int gather_kept =
       vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 19 : 0;
   CHECK(kept == gemm_kept + gather_kept);

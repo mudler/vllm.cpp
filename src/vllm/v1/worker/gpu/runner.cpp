@@ -48,6 +48,61 @@
 #ifdef VLLM_CPP_CUDA
 #include "vt/cuda/combine_tokens.h"  // W3 device combine/scatter (removes the sync)
 #endif
+#ifdef VLLM_CPP_HIP
+#include "vt/rocm/combine_tokens.h"  // W3 device combine/scatter (ROCm port)
+#endif
+
+// Device-agnostic dispatch for the combine/scatter/ops kernels. The CUDA and
+// ROCm backends expose identical signatures in vt::cuda and vt::rocm; this
+// dispatch compiles the right one in at build time. On a CPU-only build both
+// backends are absent, so the entire block is compiled out — an empty anonymous
+// namespace with three unused functions is a -Werror=unused-function break
+// there (same treatment as AsyncDeviceMirrorEnvDefault below). No runtime
+// device-type check: the build is single-backend, so the #if selects
+// unconditionally.
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
+namespace {
+void DispatchCombineSampledAndDraftTokens(
+    vt::Queue& q, int32_t* input_ids, const int32_t* idx_mapping,
+    const int32_t* last_sampled_tokens, const int32_t* query_start_loc,
+    const int32_t* seq_lens, const int32_t* prefill_len,
+    const int32_t* draft_tokens, int draft_tokens_stride,
+    const int32_t* cu_num_logits, int num_reqs, int num_new_sampled_tokens) {
+#if defined(VLLM_CPP_CUDA)
+  vt::cuda::LaunchCombineSampledAndDraftTokens(
+      q, input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
+      seq_lens, prefill_len, draft_tokens, draft_tokens_stride, cu_num_logits,
+      num_reqs, num_new_sampled_tokens);
+#elif defined(VLLM_CPP_HIP)
+  vt::rocm::LaunchCombineSampledAndDraftTokens(
+      q, input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
+      seq_lens, prefill_len, draft_tokens, draft_tokens_stride, cu_num_logits,
+      num_reqs, num_new_sampled_tokens);
+#endif
+}
+
+void DispatchScatterLastSampled(vt::Queue& q, int32_t* last_sampled_tokens,
+                                const int64_t* sampled_ids,
+                                const int32_t* idx_mapping, int num_reqs) {
+#if defined(VLLM_CPP_CUDA)
+  vt::cuda::LaunchScatterLastSampled(q, last_sampled_tokens, sampled_ids,
+                                     idx_mapping, num_reqs);
+#elif defined(VLLM_CPP_HIP)
+  vt::rocm::LaunchScatterLastSampled(q, last_sampled_tokens, sampled_ids,
+                                     idx_mapping, num_reqs);
+#endif
+}
+
+void DispatchApplyLastSampledOps(vt::Queue& q, int32_t* last_sampled_tokens,
+                                 const int32_t* ops, int num_ops) {
+#if defined(VLLM_CPP_CUDA)
+  vt::cuda::LaunchApplyLastSampledOps(q, last_sampled_tokens, ops, num_ops);
+#elif defined(VLLM_CPP_HIP)
+  vt::rocm::LaunchApplyLastSampledOps(q, last_sampled_tokens, ops, num_ops);
+#endif
+}
+}  // namespace
+#endif  // VLLM_CPP_CUDA || VLLM_CPP_HIP
 
 namespace vllm::v1 {
 
@@ -102,12 +157,14 @@ static bool AsyncRunnerEnvDefault() {
 // steps. Whether that read is VALID is a backend CAPABILITY, not a device name:
 // ask the backend (vt::Backend::SupportsAsyncSampledTokenReadback, backend.h),
 // which answers true for CPU (host and device memory are one allocation) and
-// CUDA (the sampled id is device-mirrored, async_device_mirror()), and false for
-// a DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) whose sample_tokens_async leg
-// host-dereferences a device Alloc — the root cause of the "!" tokens on the lab
-// R9700 (2026-08-07). An absent backend (device not built into this binary)
-// yields nullptr and therefore false, which also subsumes the old
-// #ifdef VLLM_CPP_CUDA guard. Keeping the question on the backend is what stops
+// CUDA and ROCm (the sampled id is device-mirrored, async_device_mirror() — the
+// W3/W4 combine/scatter kernels ported to both backends), and false for a
+// DISCRETE GPU whose backend has not ported those kernels, whose
+// sample_tokens_async leg host-dereferences a device Alloc — the root cause of
+// the "!" tokens on the lab R9700 (2026-08-07). An absent backend (device not
+// built into this binary) yields nullptr and therefore false, which also
+// subsumes the old #if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP) guard.
+// Keeping the question on the backend is what stops
 // this device-agnostic shared layer from naming a device (check-device-leakage).
 static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
   const vt::Backend* backend = vt::TryGetBackend(queue.device.type);
@@ -2611,7 +2668,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
                  "verify step splices the committed token over the LAST DRAFT "
                  "SLOT and scatters no drafts — SPEC-DFLASH2 reason A, which "
                  "costs acceptance and raises nothing)");
-#ifdef VLLM_CPP_CUDA
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
     // The host-side source both device arms start from. It is NOT true that they
     // therefore cannot be edited apart, and the round-3 review was right to say
     // so: only the UMA arm passes this pointer through. The mirror arm passes
@@ -2678,7 +2735,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // which is reason A on any verify step — see the block above the #ifdef.
       stage_upload(*dev, dev->cu_num_logits, cu_num_logits_host,
                    static_cast<int64_t>(num_reqs) + 1);
-      vt::cuda::LaunchCombineSampledAndDraftTokens(
+      DispatchCombineSampledAndDraftTokens(
           queue_, dev->input_ids, /*idx_mapping=*/nullptr, dev->last_sampled,
           dev->query_start_loc, dev->seq_lens, dev->prefill_len,
           dev->draft_tokens, dev->draft_stride,
@@ -2715,7 +2772,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // be null here, which the kernel reads as arange; this is GB10's
       // production default, so that null was reason A on the integrated
       // production path from the first verify step A2-5 would admit.
-      vt::cuda::LaunchCombineSampledAndDraftTokens(
+      DispatchCombineSampledAndDraftTokens(
           queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
           input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
           step.seq_lens.data(), input_batch_.prefill_len.data(),
@@ -5288,7 +5345,7 @@ AsyncOutputPool& GPUModelRunner::get_or_create_async_output_pool() {
 // Distinct from VT_ASYNC_RUNNER, which would also turn off async scheduling
 // itself; keeping them separate is what makes an honest A/B of W4 alone possible —
 // same binary, same scheduler, one mechanism.
-#ifdef VLLM_CPP_CUDA
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
 // Guarded with its only use below: on a CPU build the mirror cannot exist, and
 // an unused static function is a -Werror=unused-function break there. DEFAULT ON:
 // on unless VT_ASYNC_DEVICE_MIRROR is explicitly "0" (the rollback), mirroring the
@@ -5302,7 +5359,7 @@ static bool AsyncDeviceMirrorEnvDefault() {
 bool GPUModelRunner::async_device_mirror() const {
   if (async_device_mirror_cached_ >= 0) return async_device_mirror_cached_ != 0;
   bool on = false;
-#ifdef VLLM_CPP_CUDA
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
   // Engage on any real CUDA GPU, integrated OR discrete — NOT the CPU backend.
   //  - DISCRETE (separate memory, !UnifiedMemory): the mirror is REQUIRED, because
   //    the host fallback would main-stream Synchronize to read the sampled ids.
@@ -5336,7 +5393,7 @@ bool GPUModelRunner::async_device_mirror() const {
 bool GPUModelRunner::async_executor() const {
   if (async_executor_cached_ >= 0) return async_executor_cached_ != 0;
   bool on = false;
-#ifdef VLLM_CPP_CUDA
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
   const char* value = std::getenv("VT_ASYNC_EXECUTOR");
   on = value != nullptr && value[0] == '1' && value[1] == '\0' &&
        async_device_mirror();
@@ -5419,7 +5476,7 @@ void GPUModelRunner::stage_upload(AsyncDeviceInputs& dev, int32_t* dst,
 }
 
 void GPUModelRunner::replay_last_sampled_ops(AsyncDeviceInputs& dev) {
-#ifdef VLLM_CPP_CUDA
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
   std::vector<InputBatch::LastSampledOp>& ops = input_batch_.last_sampled_ops;
   if (ops.empty()) return;
   // Flatten to (kind, a, b, value) quads. The log is bounded by the number of
@@ -5444,7 +5501,7 @@ void GPUModelRunner::replay_last_sampled_ops(AsyncDeviceInputs& dev) {
     VT_CHECK(static_cast<int64_t>(flat.size()) <= cap_ops,
              "async device mirror: structural-op chunk exceeds its buffer");
     stage_upload(dev, dev.ops, flat.data(), static_cast<int64_t>(flat.size()));
-    vt::cuda::LaunchApplyLastSampledOps(queue_, dev.last_sampled, dev.ops,
+    DispatchApplyLastSampledOps(queue_, dev.last_sampled, dev.ops,
                                         static_cast<int>(chunk));
     done += chunk;
   }
@@ -5579,7 +5636,7 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // a fourth one cannot forget to. The branches keep their write-backs (the
   // mirror and the device array are what the NEXT step's combine reads); what
   // they no longer own is the propose's view of them.
-#ifdef VLLM_CPP_CUDA
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
   // W4 device-resident scatter. Preferred whenever the mirror is engaged
   // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR DISCRETE):
   // write each row's sampled id into the DEVICE mirror (dinp->last_sampled) on the
@@ -5593,7 +5650,7 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // async output's own copy, as upstream does). Runs OUTSIDE any CUDA-graph capture.
   if (AsyncDeviceInputs* dinp = get_or_create_async_device_inputs();
       dinp != nullptr) {
-    vt::cuda::LaunchScatterLastSampled(queue_, dinp->last_sampled,
+    DispatchScatterLastSampled(queue_, dinp->last_sampled,
                                        static_cast<const int64_t*>(dev_ids),
                                        /*idx_mapping=*/nullptr, num_reqs);
     for (int i = 0; i < num_reqs; ++i) {
@@ -5617,7 +5674,7 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
     // this is the array condense reorders, its scatter pins the drain to
     // execute_model's top (the mirror path lifts that). is_integrated_gpu()
     // decouples a future discrete GPU (false -> host bookkeeping below).
-    vt::cuda::LaunchScatterLastSampled(
+    DispatchScatterLastSampled(
         queue_, input_batch_.last_sampled_tokens.data(),
         static_cast<const int64_t*>(dev_ids), /*idx_mapping=*/nullptr, num_reqs);
     for (int i = 0; i < num_reqs; ++i) {

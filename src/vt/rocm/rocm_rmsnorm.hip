@@ -1,28 +1,7 @@
 // ROCm RmsNorm — the ONE op the W0 skeleton registers (BACKEND-ROCM, W0).
 //
-// BUILD STATE, kept honest per issue #41, in the shape rocm_backend.hip uses.
-// **THIS TU COMPILES.** `hipcc` (ROCm 7.2.4) built it clean for `gfx1151` with
-// ZERO warnings on `strix:gpu0`, under `rc` job
-// `d99a30fa-3336-4b90-bc9e-877717c9b54e`, from tree
-// `2d1fdc19bd60cffec64fd2e66eb8abb5b5c1e1c5` -- the revision that gave this file
-// its independent gamma type `Tw` (#2492).
-//
-// This line used to read "**UNBUILT.** Never compiled: no AMD GPU on the
-// authoring machine", and that half is STILL TRUE of the authoring machine:
-// there is no `hipcc` and no HIP header there, and no lane in
-// `.github/workflows/` sets `VLLM_CPP_HIP`, which defaults to `AUTO` = OFF
-// (CMakeLists.txt:124). The compile came from a leased device, not from CI, so
-// this is a DATED REPORT ABOUT ONE REVISION and not a standing gate: if this
-// file changes again, the report does not follow it, and the next editor is in
-// the same position the previous one was.
-//
-// It is a COMPILE report and nothing more. No kernel in this file has been RUN
-// on an AMD device. What makes even the compile mean something is the negative
-// control the job ran: it broke the `case DType::kF16` arm, asserted the break
-// applied, and required `hipcc` to REJECT the rebuild -- because a green `ninja`
-// can otherwise mean "nothing to do". That, the five source guards, and the
-// absent-object precondition are recorded in
-// `.agents/specs/rmsnorm-gamma-dtype-twins.md`.
+// **UNBUILT.** Never compiled: no AMD GPU on the authoring machine. See the
+// header of rocm_backend.hip.
 //
 // PORTED FROM: src/vt/cuda/cuda_ops.cu:96-126 `RmsNormRowKernel` (one block per
 // row, shared-memory f32 tree reduction), whose own upstream counterpart is
@@ -51,12 +30,20 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
 #include <string>
+#include <type_traits>
+
+#include "vt/cpu/cpu_quant_blocks.h"
+#include "vt/rocm/rocm_act_quant.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 
 namespace vt::rocm {
+
+using vt::cpu::kQK_K;
 namespace {
 
 // Block width, from cuda_ops.cu:24. Kept at 256 rather than raised to a multiple
@@ -69,13 +56,6 @@ __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __hip_bfloat16* p, int64_t i) {
   return __bfloat162float(p[i]);
 }
-// GAMMA-ONLY element type. `vt::RmsNorm` admits `IsFloat(weight.dtype)`
-// (ops.cpp:24, :1030), which includes kF16, and the CPU sibling widens a kF16
-// gamma like any other (`WidenRowToF32`, cpu_ops.cpp:554-557) -- so a device arm
-// that refused it would be a divergence to record (cuda_qwen4_exp.cu:60-62). It
-// is NOT admitted as an ACTIVATION (`Tin`) or as an output: `RmsNormKernelRocm`
-// still refuses a kF16 `x`, which is a SEPARATE divergence of the same class,
-// recorded rather than fixed here (#2542).
 __device__ inline float Load(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__hip_bfloat16* p, int64_t i, float v) {
@@ -97,21 +77,17 @@ __device__ inline float ResRound<__hip_bfloat16>(float v) {
   return __bfloat162float(__float2bfloat16(v));
 }
 
-// `Tw` is the GAMMA's own dtype and is INDEPENDENT of `Tin` (#2492, the ROCm twin
-// of #2477). It used to be `Tin`, which welded the two and forced
-// `RmsNormKernelRocm` to refuse `w.dtype != x.dtype` -- a refusal that is a
-// property of THIS kernel's signature and of nothing upstream. vLLM never couples
-// them (`GemmaRMSNorm` reads `normalized * (1.0 + self.weight.float())`,
-// vllm/models/qwen4_exp/nvidia/ple_layer.py:80 at vLLM origin/main cdefd9d499,
-// which is AHEAD of this project's pin 5559679229 -- a forward reference, see
-// #2502), this tree's CPU sibling widens `w` and `x` separately
-// (cpu_ops.cpp:554-557, :576), and the CUDA sibling was decoupled by #2493
-// (cuda_ops.cu `RmsNormRowKernel`). `Load()` is overloaded for every gamma element
-// type below, so the body is unchanged and its f32 arithmetic is bit-identical for
-// every pairing that already worked.
+// Lever C: `q8_out` (nullptr on every pre-existing path) turns the kernel into
+// a PRODUCER of Q8_K activation scratch: after the output row is stored, one
+// thread per 256-wide superblock requantizes the STORED bf16/f32 row through
+// the SAME shared QuantQ8KSBlock body the standalone QuantizeQ8KK uses, so
+// the scratch is byte-identical to the standalone path by construction
+// (asserted in tests/vt/test_rocm_quant_dot.cpp). Requires nsb <= kBlock: one
+// thread per superblock within this single-row block.
 template <typename Tin, typename Tw, typename Tout, typename Tres>
 __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual, int64_t h,
-                                 float eps, bool gemma) {
+                                 float eps, bool gemma, vt::cpu::BlockQ8_K* q8_out, int nsb,
+                                 ActDT q8_adt) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
   Tout* orow = out + row * h;
@@ -140,20 +116,311 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* res
     if (gemma) wj += 1.0f;
     Store(orow, j, v * inv * wj);
   }
+  if (q8_out != nullptr) {
+    // Barrier first: the epilogue reads the WHOLE stored row (written by all
+    // 256 threads) back from global memory, exactly as the standalone
+    // QuantizeQ8KK would -- same bytes, same serial per-superblock walk, so
+    // the amax first-occurrence tie-break and every scale bit match.
+    __syncthreads();
+    const int sb = static_cast<int>(threadIdx.x);
+    if (sb < nsb)
+      QuantQ8KSBlock(q8_out[static_cast<int64_t>(row) * nsb + sb], orow, q8_adt,
+                     static_cast<int64_t>(sb) * kQK_K);
+  }
+}
+
+// --- T8 (GFX1100-TG200): cooperative single-row remap -----------------------
+// Decode launches ONE 256-thread block per row; the ported body chains three
+// strided scalar passes, a nine-step __syncthreads shared-memory tree, and a
+// fused-q8 epilogue whose per-superblock QuantQ8KSBlock walks 256 elements
+// serially on ONE thread (nsb<=10 of 256 threads active). rocpd prices the
+// fused instantiation at 65 launches/tok x 18.1us = 1.178 ms/tok against a
+// microsecond-class floor. This arm keeps the grid shape and the byte
+// contracts but rebuilds the internals, behind VT_RMSNORM_ROW_COOP=1
+// (default OFF leaves every path byte-unchanged):
+//
+//   1. Reduction: two wavefront shfl_down trees + one cross-wavefront
+//      combine through shared memory -- TWO __syncthreads instead of nine.
+//      The float association CHANGES (recorded adjudication required; the
+//      opt-in flag rides the campaign config like GDN_SCAN_COOP).
+//   2. Vector passes: 16-byte loads/stores where the row base allows,
+//      scalar fallback otherwise (uniform per launch).
+//   3. Cooperative q8 epilogue: the whole block quantizes ONE superblock
+//      at a time, thread i owning element i. BYTE CONTRACT PRESERVED BY
+//      CONSTRUCTION: the (mx, amax) pair comes from a LEFT-BIASED max over
+//      ascending element positions (shfl trees keep the earlier element on
+//      magnitude ties, which is exactly the scalar scan's first-occurrence
+//      rule), iscale/DNearestInt/clamp arithmetic is verbatim, and bsums
+//      stay exact integer sums. Asserted against the standalone quantizer
+//      by the focused test under BOTH flag states.
+template <typename Tin, typename Tw, typename Tout, typename Tres>
+__global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual,
+                                     int64_t h, float eps, bool gemma,
+                                     vt::cpu::BlockQ8_K* q8_out, int nsb, ActDT q8_adt,
+                                     bool lds_quant) {
+  const int64_t row = blockIdx.x;
+  const int tid = static_cast<int>(threadIdx.x);
+  const Tin* xrow = x + row * h;
+  Tout* orow = out + row * h;
+  Tres* rrow = residual == nullptr ? nullptr : residual + row * h;
+  const int waveSz = warpSize;  // runtime width (32 on RDNA default); never hardcode
+  const int kWaves = kBlock / waveSz;
+  __shared__ float partial[kBlock];
+  // Statically sized for the narrowest wavefront (32); kWaves is runtime.
+  __shared__ float wave_mx[kBlock / 32];
+  __shared__ float wave_amax[kBlock / 32];
+  extern __shared__ char dyn_smem[];
+  Tout* lds_out = reinterpret_cast<Tout*>(dyn_smem);
+  // The vector body decodes the gamma as 8 bf16 halves per uint4, so a
+  // non-bf16 gamma (kF32/kF16 are admitted by DispatchRmsNormWeight,
+  // independent of Tin) MUST take the scalar path, whose Load() overloads
+  // decode per dtype. sizeof(Tw)==2 alone would still misread an f16 gamma.
+  const bool vec =
+                   std::is_same_v<Tw, __hip_bfloat16> && sizeof(Tin) == 2 &&
+                   (rrow == nullptr || sizeof(Tres) == 2) &&
+                   (reinterpret_cast<uintptr_t>(xrow) & 15u) == 0 &&
+                   (reinterpret_cast<uintptr_t>(orow) & 15u) == 0 &&
+                   (rrow == nullptr || (reinterpret_cast<uintptr_t>(rrow) & 15u) == 0);
+
+  // Pass 1: sum of squares (+ residual fold-in). Per-thread element set is
+  // the plain kernel's; the vector path regroups WITHIN a thread's step.
+  float acc = 0.0f;
+  if (vec && sizeof(Tin) == 2) {
+    const uint4* xv = reinterpret_cast<const uint4*>(xrow);
+    uint4* rv = reinterpret_cast<uint4*>(rrow);
+    const int step8 = kBlock * 8;  // elements per block-step (bf16)
+    for (int j8 = tid * 8; j8 < static_cast<int>(h); j8 += step8) {
+      const int elems = j8 + 8 <= static_cast<int>(h) ? 8 : static_cast<int>(h) - j8;
+      if (elems == 8) {
+        const uint4 rawx = xv[j8 / 8];
+        uint16_t hx[8] = {static_cast<uint16_t>(rawx.x & 0xFFFF), static_cast<uint16_t>(rawx.x >> 16),
+                          static_cast<uint16_t>(rawx.y & 0xFFFF), static_cast<uint16_t>(rawx.y >> 16),
+                          static_cast<uint16_t>(rawx.z & 0xFFFF), static_cast<uint16_t>(rawx.z >> 16),
+                          static_cast<uint16_t>(rawx.w & 0xFFFF), static_cast<uint16_t>(rawx.w >> 16)};
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          float fv = DBF16ToF32(hx[u]);
+          if (rrow != nullptr) {
+            fv = ResRound<Tres>(fv + Load(rrow, j8 + u));
+          }
+          v[u] = fv;
+        }
+        if (rrow != nullptr) {
+          uint4 rout;
+          uint16_t hout[8];
+          for (int u = 0; u < 8; ++u) hout[u] = DF32ToBF16(v[u]);
+          rout.x = static_cast<unsigned>(hout[0]) | (static_cast<unsigned>(hout[1]) << 16);
+          rout.y = static_cast<unsigned>(hout[2]) | (static_cast<unsigned>(hout[3]) << 16);
+          rout.z = static_cast<unsigned>(hout[4]) | (static_cast<unsigned>(hout[5]) << 16);
+          rout.w = static_cast<unsigned>(hout[6]) | (static_cast<unsigned>(hout[7]) << 16);
+          rv[j8 / 8] = rout;
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) acc += v[u] * v[u];
+      } else {
+        for (int j = j8; j < j8 + elems; ++j) {
+          float v = Load(xrow, j);
+          if (rrow != nullptr) {
+            v = ResRound<Tres>(v + Load(rrow, j));
+            Store(rrow, j, v);
+          }
+          acc += v * v;
+        }
+      }
+    }
+  } else {
+    for (int64_t j = tid; j < h; j += kBlock) {
+      float v = Load(xrow, j);
+      if (rrow != nullptr) {
+        v = ResRound<Tres>(v + Load(rrow, j));
+        Store(rrow, j, v);
+      }
+      acc += v * v;
+    }
+  }
+
+  // Two-level reduction: wavefront shfl trees, one cross-wavefront combine.
+  float wacc = acc;
+#pragma unroll
+  for (int off = waveSz / 2; off > 0; off >>= 1)
+    wacc += __shfl_down_sync(0xffffffffULL, wacc, off);
+  if (tid % waveSz == 0) partial[tid / waveSz] = wacc;
+  __syncthreads();
+  if (tid == 0) {
+    float t = partial[0];
+#pragma unroll
+    for (int wv = 1; wv < kWaves; ++wv) t += partial[wv];
+    partial[0] = t;
+  }
+  __syncthreads();
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(h) + eps);
+
+  // Pass 3: scaled output.
+  if (vec && sizeof(Tin) == 2 && sizeof(Tout) == 2) {
+    const uint4* xv = reinterpret_cast<const uint4*>(
+        rrow != nullptr ? static_cast<const void*>(rrow) : static_cast<const void*>(xrow));
+    uint4* ov = reinterpret_cast<uint4*>(orow);
+    const uint4* wv = reinterpret_cast<const uint4*>(w);
+    const bool waligned = (reinterpret_cast<uintptr_t>(w) & 15u) == 0;
+    for (int j8 = tid * 8; j8 < static_cast<int>(h); j8 += kBlock * 8) {
+      const int elems = j8 + 8 <= static_cast<int>(h) ? 8 : static_cast<int>(h) - j8;
+      if (elems == 8 && waligned) {
+        const uint4 rawx = xv[j8 / 8];
+        const uint4 raww = wv[j8 / 8];
+        uint16_t hx[8] = {static_cast<uint16_t>(rawx.x & 0xFFFF), static_cast<uint16_t>(rawx.x >> 16),
+                          static_cast<uint16_t>(rawx.y & 0xFFFF), static_cast<uint16_t>(rawx.y >> 16),
+                          static_cast<uint16_t>(rawx.z & 0xFFFF), static_cast<uint16_t>(rawx.z >> 16),
+                          static_cast<uint16_t>(rawx.w & 0xFFFF), static_cast<uint16_t>(rawx.w >> 16)};
+        uint16_t hw[8] = {static_cast<uint16_t>(raww.x & 0xFFFF), static_cast<uint16_t>(raww.x >> 16),
+                          static_cast<uint16_t>(raww.y & 0xFFFF), static_cast<uint16_t>(raww.y >> 16),
+                          static_cast<uint16_t>(raww.z & 0xFFFF), static_cast<uint16_t>(raww.z >> 16),
+                          static_cast<uint16_t>(raww.w & 0xFFFF), static_cast<uint16_t>(raww.w >> 16)};
+        uint16_t ho[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          float wj = DBF16ToF32(hw[u]);
+          if (gemma) wj += 1.0f;
+          ho[u] = DF32ToBF16(DBF16ToF32(hx[u]) * inv * wj);
+        }
+        uint4 o;
+        o.x = static_cast<unsigned>(ho[0]) | (static_cast<unsigned>(ho[1]) << 16);
+        o.y = static_cast<unsigned>(ho[2]) | (static_cast<unsigned>(ho[3]) << 16);
+        o.z = static_cast<unsigned>(ho[4]) | (static_cast<unsigned>(ho[5]) << 16);
+        o.w = static_cast<unsigned>(ho[6]) | (static_cast<unsigned>(ho[7]) << 16);
+        ov[j8 / 8] = o;
+      } else {
+        for (int j = j8; j < j8 + elems; ++j) {
+          const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
+          float wj = Load(w, j);
+          if (gemma) wj += 1.0f;
+          Store(orow, j, v * inv * wj);
+        }
+      }
+    }
+  } else {
+    for (int64_t j = tid; j < h; j += kBlock) {
+      const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
+      float wj = Load(w, j);
+      if (gemma) wj += 1.0f;
+      Store(orow, j, v * inv * wj);
+    }
+  }
+
+  if (q8_out != nullptr) {
+    // Barrier: the epilogue reads the WHOLE stored row back, exactly as the
+    // standalone QuantizeQ8KK would.
+    __syncthreads();
+    __shared__ int8_t sq[kQK_K];
+    __shared__ float lead_iscale;
+    const void* quant_src = lds_quant ? static_cast<const void*>(lds_out)
+                                      : static_cast<const void*>(orow);
+    for (int sb = 0; sb < nsb; ++sb) {
+      vt::cpu::BlockQ8_K& y = q8_out[static_cast<int64_t>(row) * nsb + sb];
+      const float x = DLoadAct(quant_src, q8_adt, static_cast<int64_t>(sb) * kQK_K + tid);
+      // Seed 0 like the standalone QuantizeQ8KK (strict > keeps the first
+      // occurrence and rejects NaN): seeding from x let a NaN element poison
+      // d and diverge from the scalar contract's zero block.
+      float mx = 0.0f, amax = 0.0f;
+      if (x == x) { mx = x; amax = fabsf(x); }
+      for (int off = waveSz / 2; off > 0; off >>= 1) {
+        const float ox = __shfl_down_sync(0xffffffffULL, mx, off);
+        const float oa = __shfl_down_sync(0xffffffffULL, amax, off);
+        if (oa > amax) { amax = oa; mx = ox; }
+      }
+      if (tid % waveSz == 0) {
+        wave_mx[tid / waveSz] = mx;
+        wave_amax[tid / waveSz] = amax;
+      }
+      __syncthreads();
+      if (tid == 0) {
+        float bmx = wave_mx[0], bamax = wave_amax[0];
+#pragma unroll
+        for (int wv = 1; wv < kWaves; ++wv) {
+          if (wave_amax[wv] > bamax) { bamax = wave_amax[wv]; bmx = wave_mx[wv]; }
+        }
+        lead_iscale = bamax == 0.0f ? 0.0f : -127.0f / bmx;
+      }
+      __syncthreads();
+      if (lead_iscale == 0.0f) {
+        if (tid < kQK_K) y.qs[tid] = 0;
+        if (tid < kQK_K / 16) y.bsums[tid] = 0;
+        if (tid == 0) y.d = 0.0f;
+      } else {
+        const int qv = DNearestInt(lead_iscale * x);
+        const int8_t q = static_cast<int8_t>(qv < 127 ? qv : 127);
+        y.qs[tid] = q;
+        sq[tid] = q;
+        __syncthreads();
+        if (tid < kQK_K / 16) {
+          int sum = 0;
+#pragma unroll
+          for (int ii = 0; ii < 16; ++ii) sum += sq[tid * 16 + ii];
+          y.bsums[tid] = static_cast<int16_t>(sum);
+        }
+        if (tid == 0) y.d = 1.0f / lead_iscale;
+      }
+      __syncthreads();  // sq reuse guard across superblocks
+    }
+  }
 }
 
 template <typename Tin, typename Tw, typename Tout>
 void LaunchRmsNormRes(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                      const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h) {
+                      const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h,
+                      vt::cpu::BlockQ8_K* q8_out) {
+  const int nsb = q8_out != nullptr ? static_cast<int>(h / kQK_K) : 0;
+  // T8 opt-in arm (read PER CALL like the sibling flags): the cooperative
+  // remap requires one 256-wide superblock per thread and h a multiple of
+  // kQK_K; anything else falls back to the ported body.
+  const char* coop_e = std::getenv("VT_RMSNORM_ROW_COOP");
+  const bool coop = coop_e != nullptr && coop_e[0] == '1' && coop_e[1] == '\0' &&
+                    h % kQK_K == 0 && h / kQK_K <= kBlock;
+  if (coop) {
+    // T24: LDS-buffered quant epilogue (VT_RMSNORM_LDS_QUANT, default ON).
+    // Stores the normalized row to LDS during Pass 3 so the Q8_K quant
+    // epilogue reads from LDS instead of re-reading global memory.
+    const char* lds_e = std::getenv("VT_RMSNORM_LDS_QUANT");
+    const bool lds_quant =
+        lds_e == nullptr || lds_e[0] == '1';  // default ON when q8_out active
+    const size_t smem =
+        (q8_out != nullptr && lds_quant) ? static_cast<size_t>(h) * sizeof(Tout) : 0;
+    if (residual != nullptr && residual->dtype == DType::kBF16) {
+      RmsNormRowCoopKernel<Tin, Tw, Tout, __hip_bfloat16><<<rows, kBlock, smem, s>>>(
+          out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__hip_bfloat16>(), h,
+          args.eps, args.gemma, q8_out, nsb, ActDtOf(out.dtype), lds_quant);
+    } else {
+      float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
+      RmsNormRowCoopKernel<Tin, Tw, Tout, float><<<rows, kBlock, smem, s>>>(
+          out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma, q8_out,
+          nsb, ActDtOf(out.dtype), lds_quant);
+    }
+    return;
+  }
   if (residual != nullptr && residual->dtype == DType::kBF16) {
     RmsNormRowKernel<Tin, Tw, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__hip_bfloat16>(), h, args.eps,
-        args.gemma);
+        args.gemma, q8_out, nsb, ActDtOf(out.dtype));
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
     RmsNormRowKernel<Tin, Tw, Tout, float><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma);
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma, q8_out,
+        nsb, ActDtOf(out.dtype));
   }
+}
+
+// Lever C opt-in gate: VT_NORM_QUANT_FUSED=1 (read PER CALL like the sibling
+// arms' flags so in-process tests and graph capture pick it up at dispatch
+// time), dense rows, whole Q8_K superblocks, and at most one thread's worth of
+// superblocks per row. Default OFF leaves every path byte-unchanged.
+vt::cpu::BlockQ8_K* NormQuantEpilogueFor(int64_t rows, int64_t h, hipStream_t s,
+                                         size_t* scratch_bytes) {
+  const char* e = std::getenv("VT_NORM_QUANT_FUSED");
+  if (e == nullptr || e[0] != '1' || e[1] != '\0') return nullptr;
+  if (rows <= 0 || h % kQK_K != 0 || h / kQK_K > kBlock) return nullptr;
+  *scratch_bytes = static_cast<size_t>(rows) * static_cast<size_t>(h / kQK_K) *
+                   sizeof(vt::cpu::BlockQ8_K);
+  return static_cast<vt::cpu::BlockQ8_K*>(NormQuantProducerScratch(*scratch_bytes, s));
 }
 
 template <typename Tin, typename Tw>
@@ -162,15 +429,21 @@ void LaunchRmsNorm(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
+  size_t q8_bytes = 0;
+  vt::cpu::BlockQ8_K* q8_out =
+      NormQuantEpilogueFor(t, h, s, &q8_bytes);  // nullptr unless opt-in flag
   switch (out.dtype) {
     case DType::kF32:
-      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h, q8_out);
       break;
     case DType::kBF16:
-      LaunchRmsNormRes<Tin, Tw, __hip_bfloat16>(s, out, x, w, args, residual, rows, h);
+      LaunchRmsNormRes<Tin, Tw, __hip_bfloat16>(s, out, x, w, args, residual, rows, h, q8_out);
       break;
     default:
       VT_CHECK(false, "rocm rmsnorm: unsupported out dtype (f32/bf16 only)");
+  }
+  if (q8_out != nullptr) {
+    NormQuantRecordProducer(out.data, t, h, /*row_stride=*/h, out.dtype, q8_out, s);
   }
 }
 
@@ -237,6 +510,7 @@ void RmsNormKernelRocm(Queue& q,
  Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
   EnsureQueueDevice(q);
+  VT_CHECK(w.dtype == x.dtype, "rocm rmsnorm: weight dtype must match x");
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   switch (x.dtype) {
     case DType::kF32:

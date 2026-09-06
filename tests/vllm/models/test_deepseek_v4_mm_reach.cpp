@@ -554,6 +554,79 @@ TEST_CASE("REACH: ModelRegistry::EmbedMm merges the encoder rows into inputs_emb
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// (3b) THE TWO "IS THIS AN IMAGE ROW" PREDICATES MUST AGREE.
+//
+// `EmbedMm` reads the runner's `is_mm_embed` MASK. `MoeBlock` and
+// `DeepseekV4ImageSpans` read the IDENTIFIER, `id >= vocab_size`. They agree
+// only because `PrepareDeepSeekV4Inputs` writes `vocab_size + type` at exactly
+// the masked positions, and until this case nothing said so.
+//
+// One direction was already refused: an UNMASKED row carrying an
+// out-of-vocabulary id meets the bounds check, because the embedding table has
+// no row for it. The other was silent, and it is the dangerous one -- a MASKED
+// row carrying a real token id takes the tower's vector into the residual
+// stream while the router reads the TEXT bias for it and no image span opens
+// over it. Everything downstream stays in range and the answer stays fluent.
+TEST_CASE("REACH: a masked row carrying an in-vocabulary id is refused by EmbedMm") {
+  auto loaded = LoadThroughRegistry(/*vision_checkpoint=*/true,
+                                    /*with_mmproj=*/true);
+  const DeepSeekV4VisionConfig vcfg =
+      vllm::DeepSeekV4ClipMmprojVisionConfig(*loaded->proj_gguf);
+  const auto image = MakeImage(vcfg);
+  const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
+      {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
+      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
+      *loaded->model, loaded->config, queue, mm.mm_features[0]);
+  const int64_t tokens = static_cast<int64_t>(mm.prompt_token_ids.size());
+
+  // The mask the runner would build, SHIFTED BY ONE. Every row it marks is
+  // still marked in the right number, so the encoder/mask balance below still
+  // holds and only the predicate disagreement can catch it. Row 1 is a text
+  // token of the original prompt.
+  std::vector<char> is_mm(static_cast<size_t>(tokens), 0);
+  for (int i = 0; i < mm.mm_features[0].length; ++i) {
+    is_mm[static_cast<size_t>(mm.mm_features[0].offset + i - 1)] = 1;
+  }
+  REQUIRE(mm.mm_features[0].offset >= 1);
+  REQUIRE(mm.prompt_token_ids[static_cast<size_t>(mm.mm_features[0].offset - 1)] <
+          static_cast<int32_t>(kVocab));
+
+  const std::vector<vt::Tensor> slices{enc.embeds};
+  vllm::MmEmbedInputs in;
+  in.token_ids = &mm.prompt_token_ids;
+  in.mm_embeds = &slices;
+  in.is_mm_embed = &is_mm;
+  std::string message;
+  try {
+    (void)vllm::ModelRegistry::EmbedMm(*loaded->model, loaded->config, queue, in);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("message: ", message);
+  // Phrases unique to THIS refusal. "multimodal placeholder" alone is in the
+  // bounds message too, so it would still match with the check removed.
+  CHECK(message.find("is marked as a multimodal placeholder but carries token id") !=
+        std::string::npos);
+  CHECK(message.find("inside the vocabulary") != std::string::npos);
+  CHECK(message.find("routed on the text") != std::string::npos);
+
+  // THE CONTROL. The mask the processor's own layout implies is accepted, so
+  // the check above is a disagreement test and not a refusal of every mask.
+  std::vector<char> right(static_cast<size_t>(tokens), 0);
+  for (int i = 0; i < mm.mm_features[0].length; ++i) {
+    right[static_cast<size_t>(mm.mm_features[0].offset + i)] = 1;
+  }
+  in.is_mm_embed = &right;
+  const vllm::MmForwardBuffers ok =
+      vllm::ModelRegistry::EmbedMm(*loaded->model, loaded->config, queue, in);
+  CHECK(ok.mm.inputs_embeds.data != nullptr);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // (4) THE REACHABILITY CASE. One step through `ModelRegistry::Forward` on the
 // expanded prompt.
 //

@@ -308,14 +308,39 @@ MmForwardBuffers EmbedMmDeepseekV4ForCausalLM(LoadedModel& model,
                                static_cast<size_t>(hidden), 0);
   int64_t masked = 0;
   for (int64_t t = 0; t < tokens; ++t) {
+    const int64_t id = ids[static_cast<size_t>(t)];
     if ((*inputs.is_mm_embed)[static_cast<size_t>(t)] != 0) {
       // A masked row EMBEDS TO ZERO and the merge replaces it. It is never
       // looked up: the expanded prompt spells it `vocab_size + type`, which no
       // embedding table has a row for.
+      //
+      // MODEL-MM-deepseek-v4 W4 repair (#2411): AND THAT SENTENCE IS NOW
+      // ASSERTED. This hook decides "image row" from the runner's
+      // `is_mm_embed` mask; `MoeBlock` and `DeepseekV4ImageSpans` decide it from
+      // `id >= vocab_size`. The two agree only because the processor writes
+      // `vocab_size + type` at exactly the masked positions, and nothing said
+      // so. This repository has a named failure shape for a refusal and its
+      // route predicate diverging, and this is the same pair.
+      //
+      // The other direction is already refused below: an UNMASKED row with an
+      // out-of-vocabulary id gets the bounds message. This is the half that was
+      // missing, and it is the silent one -- a masked row carrying a real token
+      // id takes the tower's vector into the residual stream while the router
+      // reads the TEXT bias for it and no image span opens over it.
+      VT_CHECK(id >= vocab,
+               "DeepseekV4ForCausalLM embed: position " + std::to_string(t) +
+                   " is marked as a multimodal placeholder but carries token id " +
+                   std::to_string(id) +
+                   ", which is inside the vocabulary of " +
+                   std::to_string(vocab) +
+                   ". The router and the image-span rule read the IDENTIFIER "
+                   "and this hook reads the MASK, so the two would disagree "
+                   "about which rows are image rows: the tower's vector would "
+                   "enter the residual stream while the row routed on the text "
+                   "bias and no image span opened over it");
       ++masked;
       continue;
     }
-    const int64_t id = ids[static_cast<size_t>(t)];
     VT_CHECK(id >= 0 && id < vocab,
              "DeepseekV4ForCausalLM embed: token id " + std::to_string(id) +
                  " at position " + std::to_string(t) +

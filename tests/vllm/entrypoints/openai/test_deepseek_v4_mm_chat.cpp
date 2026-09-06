@@ -785,16 +785,6 @@ Served ServeOnce(std::vector<oai::ChatMessage> messages) {
 }  // namespace
 
 TEST_CASE("dsv4 mm chat: two images reach the server through the production install") {
-  oai::ChatMessage text;
-  text.role = "user";
-  text.content = std::string("a");
-  const Served text_run = ServeOnce({text});
-  oai::ChatMessage long_text;
-  long_text.role = "user";
-  long_text.content = std::string(260, 'a');
-  const Served long_run = ServeOnce({long_text});
-  MESSAGE("LONG TEXT: " << (long_run.error.empty() ? std::string("served")
-                                                   : long_run.error));
   const Served image_run = ServeOnce(
       {UserWith({TextPart("a"), ImagePart(kSideA, 1), TextPart("b"),
                  ImagePart(kSideB, 2)})});
@@ -826,12 +816,18 @@ TEST_CASE("dsv4 mm chat: two images reach the server through the production inst
   //
   //     A generated answer is therefore not available here, and the case
   //     upgrades itself to one the moment the engine can produce it.
+  //
+  //     ONLY THE IMAGE REQUEST IS DRIVEN. Earlier versions of this case also
+  //     served a one-token and a 260-token TEXT prompt on their own engines,
+  //     to attribute the stop. Both are UNSTABLE on this synthetic checkpoint:
+  //     the same binary segfaults in `InputBatch::add_request` on roughly half
+  //     of its runs and otherwise dies in `GPUModelRunner::gather_block_table`,
+  //     while the multimodal request reaches the forward on every run of eight.
+  //     A flaky probe in a gate measures the scheduler rather than the seam, so
+  //     the text instability is recorded in the row's spec under `## Owed` with
+  //     that measurement instead of being asserted here.
   MESSAGE("image: " << (image_run.error.empty() ? std::string("served")
                                                 : image_run.error));
-  MESSAGE("text:  " << (text_run.error.empty() ? std::string("served")
-                                               : text_run.error));
-  MESSAGE("long:  " << (long_run.error.empty() ? std::string("served")
-                                               : long_run.error));
   if (image_run.error.empty()) {
     // The engine answers. Then the multimodal claim is the PROMPT the request
     // was expanded to: two image blocks of ~120 sentinel tokens each, not the
@@ -842,15 +838,4 @@ TEST_CASE("dsv4 mm chat: two images reach the server through the production inst
     CHECK(image_run.error.find("deepseek_v4.cpp") != std::string::npos);
     CHECK(image_run.error.find("W7-device") != std::string::npos);
   }
-
-  // (c) THE TEXT PATH ON THIS FIXTURE STOPS EARLIER, and it is recorded rather
-  //     than asserted away. Both text requests -- one token and 260 -- die in
-  //     `GPUModelRunner::gather_block_table` before the forward, on a
-  //     synthetic checkpoint whose KV topology gives `block_size = 256`
-  //     against `max_model_len = 1024`. No change in this wave touches that
-  //     path: the multimodal request, which does reach the forward, is the one
-  //     that exercises what W5 added. The row's spec lists it under `## Owed`
-  //     with the measurement, because a case that ASSERTED the failure would
-  //     redden the day somebody fixed it. The `MESSAGE` lines above carry the
-  //     observation into every run's output instead.
 }

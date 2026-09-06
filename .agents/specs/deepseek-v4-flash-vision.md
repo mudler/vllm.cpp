@@ -684,6 +684,13 @@ manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
 ## Owed
+- `ResidentWeight`'s device-staging arm in
+  `include/vllm/model_executor/models/dense_attn_block.h` drops `q8_0_aligned`
+  and `repacked` while guarding `elem_kn_repacked`, so the shared seam cannot
+  carry a device-relevant storage layout for any model that inherits it. Found
+  while repairing this row's own private copy of the same defect. It is a
+  shared-seam gap outside this row, and
+  [#2992](https://github.com/mudler/vllm.cpp/issues/2992) owns it.
 
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
 - The unsloth GGUF arm's first load and generation, on the pinned revision and

@@ -1191,10 +1191,14 @@ image span attends across itself while the window still clips below its start.
 
 WHAT W4 DID NOT DO. The REQUEST path is still unwired -- nothing between an HTTP
 body and `MultiModalInputs` calls the W1 encoder or processor -- and W5 owns it
-together with the runner and the public ABI. The paged attention arms and the
-two device routers refuse an image step by name rather than serving it wrongly;
-both are listed under `## Owed`. No real artifact has been read or run: W6 owns
-the first load and generation, and W7 owns the device paths.
+together with the runner and the public ABI. FOUR arms refuse rather than serve
+a step they would answer wrongly, and every one of them is listed under
+`## Owed`: the paged attention arms and the two device routers refuse an image
+step, the device decode attention kernel refuses an image step AND a windowed
+one, and `DeepseekV4ImageSpans` refuses a prefill chunk that carries part of an
+image block without its markers. The device decode refusal is the one this build
+cannot execute, and its entry says so. No real artifact has been read or run: W6
+owns the first load and generation, and W7 owns the device paths.
 
 ### W1 evidence
 

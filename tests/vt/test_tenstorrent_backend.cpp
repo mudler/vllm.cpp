@@ -654,6 +654,61 @@ TEST_CASE("kTENSTORRENT kSiluAndMul matches host F32 within BF16 envelope") {
   CHECK(max_abs_diff < 0.05f);
 }
 
+// Split-operand sibling of the case above: the GGUF dense MLP arm reaches
+// vt::MoeSiluMul (qwen3_5.cpp DenseMlpBlock tail) with gate/up as TWO separate
+// [T,I] GEMM outputs, so this op must be registered for the Qwen3.5 GGUF
+// vehicle to run at all — the captured e2e previously fatalled on it
+// ("no kernel for op MoeSiluMul ... on device tenstorrent").
+TEST_CASE("kTENSTORRENT kMoeSiluMul matches host F32 within BF16 envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMoeSiluMul, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 7, D = 16;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto moe_silu_mul = reinterpret_cast<vt::MoeSiluMulFn>(
+      vt::GetOp(vt::OpId::kMoeSiluMul, DeviceType::kTENSTORRENT));
+
+  std::vector<float> host_g(T * D), host_u(T * D), host_out(T * D, 0.0f);
+  for (size_t i = 0; i < host_g.size(); ++i)
+    host_g[i] = (static_cast<float>(i % 13) - 6.0f) * 0.2f;
+  for (size_t i = 0; i < host_u.size(); ++i)
+    host_u[i] = (static_cast<float>(i % 7) - 3.0f) * 0.3f;
+
+  void* mem_g = backend.Alloc(host_g.size() * sizeof(float));
+  void* mem_u = backend.Alloc(host_u.size() * sizeof(float));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_g, host_g.data(), host_g.size() * sizeof(float));
+  backend.Copy(q, mem_u, host_u.data(), host_u.size() * sizeof(float));
+
+  Tensor g = Tensor::Contiguous(mem_g, vt::DType::kF32,
+                                Device{DeviceType::kTENSTORRENT, 0}, {T, D});
+  Tensor u = Tensor::Contiguous(mem_u, vt::DType::kF32,
+                                Device{DeviceType::kTENSTORRENT, 0}, {T, D});
+  Tensor out = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {T, D});
+  moe_silu_mul(q, out, g, u);
+  backend.Copy(q, host_out.data(), mem_out, host_out.size() * sizeof(float));
+  backend.Free(mem_g);
+  backend.Free(mem_u);
+  backend.Free(mem_out);
+
+  float max_abs_diff = 0.0f;
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t j = 0; j < D; ++j) {
+      const float gate = host_g[static_cast<size_t>(i * D + j)];
+      const float up = host_u[static_cast<size_t>(i * D + j)];
+      const float ref = (gate / (1.0f + std::exp(-gate))) * up;
+      max_abs_diff = std::max(max_abs_diff, std::fabs(host_out[static_cast<size_t>(i * D + j)] - ref));
+    }
+  }
+  // BF16 tile storage + silu; same envelope as the kSiluAndMul sibling.
+  CHECK(max_abs_diff < 0.05f);
+}
+
 // Cast pair used by Qwen3 K/V cache dtype and logits paths.
 TEST_CASE("kTENSTORRENT kCastBf16 / kCastF32 round-trip F32 values") {
   if (!TenstorrentPresent()) {
@@ -5316,5 +5371,386 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant Q4_K via vt::MatmulBT matches the decode-
       MESSAGE("kMatmulBTQuant M=", M, " K=", K,
               ": worst_abs=", worst, " worst bound-ratio=", worst_ratio);
     }
+  }
+}
+
+// KEEPQUANT W3 (issue #2959): the decode set generalizes to the other GGUF
+// k-quants the q4km vehicle actually stores — Q5_K (attn_qkv/ssm_out), Q6_K
+// (token_embd, tied LM head, half of ffn_down/attn_v) and Q8_0 (ssm_alpha/
+// ssm_beta). The numerics bar is W1's, unchanged: the f32 decode is BIT-EXACT
+// against the CPU decoder `vt::cpu::BlockToFloat` (cpu_quant_dequant.cpp —
+// dequantize_row_q5_K:1673, q6_K:1881, q8_0:495 at the pinned llama.cpp
+// b10451), because these are the blocks the dot consumes and a band here is
+// unattributable downstream. Same sweep shape as W1: rows {1,3,17} x blocks
+// {1,2,16}, deterministic weights, both signs, plus the zero corners the
+// device decode must repair (signed-zero products from a zero scale byte or
+// a +/-0 d; q6's -32 bias crossing zero; q8_0's full int8 range).
+TEST_CASE("kTENSTORRENT kKeepQuantDecode matches vt::cpu::BlockToFloat bit-exactly (Q5_K/Q6_K/Q8_0 sweep)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kKeepQuantDecode, vt::DeviceType::kTENSTORRENT));
+
+  const vt::DType encodings[] = {vt::DType::kQ5_K, vt::DType::kQ6_K,
+                                 vt::DType::kQ8_0};
+  for (const vt::DType enc : encodings) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    REQUIRE(kBlockElems * kBlockBytes > 0);
+    if (enc == vt::DType::kQ5_K) {
+      REQUIRE(kBlockBytes == 176);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kQ6_K) {
+      REQUIRE(kBlockBytes == 210);
+      REQUIRE(kBlockElems == 256);
+    } else {
+      REQUIRE(kBlockBytes == 34);
+      REQUIRE(kBlockElems == 32);
+    }
+
+    Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+    auto decode = reinterpret_cast<vt::KeepQuantDecodeFn>(
+        vt::GetOp(vt::OpId::kKeepQuantDecode, vt::DeviceType::kTENSTORRENT));
+    Queue q = backend.CreateQueue();
+
+    // Deterministic packed blocks with structural variety (the W1 generator,
+    // generalized): PRNG bytes for quants and scales, d (and dmin where the
+    // encoding has one) drawn from finite f16 magnitudes with both signs —
+    // random BYTES would make the f16 scales NaN/Inf and the bit comparison
+    // vacuous against a NaN-propagating decode. Every 7th block pins a
+    // signed-zero corner (d = +/-0, dmin = the other zero), every 11th an
+    // all-zero scale byte set (d*sc = +/-0, the signed-zero repair path).
+    std::mt19937 rng(20260907u);
+    auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+
+    const int64_t rows_list[] = {1, 3, 17};
+    const int64_t nb_list[] = {1, 2, 16};
+    for (int64_t rows : rows_list) {
+      for (int64_t nb : nb_list) {
+        const int64_t k = nb * kBlockElems;
+        std::vector<uint8_t> packed(rows * nb * kBlockBytes);
+        for (int64_t b = 0; b < rows * nb; ++b) {
+          uint8_t* blk = packed.data() + b * kBlockBytes;
+          const bool zero_d = (b % 7) == 3;
+          const bool zero_scales = (b % 11) == 5;
+          auto put_f16 = [&](int64_t off, float v) {
+            const uint16_t bits = vt::F32ToF16(v);
+            std::memcpy(blk + off, &bits, sizeof(bits));
+          };
+          auto put_scales = [&](int64_t off, int64_t n) {
+            for (int64_t i = 0; i < n; ++i)
+              blk[off + i] = zero_scales ? 0u : rand_byte();
+          };
+          if (enc == vt::DType::kQ5_K) {
+            // block_q5_K = { f16 d; f16 dmin; u8 scales[12]; u8 qh[32];
+            //                u8 qs[128]; } (176 bytes)
+            const float d = zero_d ? ((b % 2) ? -0.0f : 0.0f)
+                                   : (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                                         ((rng() % 2) != 0 ? 1.0f : -1.0f);
+            const float dmin = zero_d ? ((b % 2) ? 0.0f : -0.0f)
+                                      : (0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f) *
+                                            ((rng() % 2) != 0 ? 1.0f : -1.0f);
+            put_f16(0, d);
+            put_f16(2, dmin);
+            put_scales(4, 12);
+            for (int i = 0; i < 32; ++i) blk[16 + i] = rand_byte();  // qh
+            for (int i = 0; i < 128; ++i) blk[48 + i] = rand_byte();  // qs
+          } else if (enc == vt::DType::kQ6_K) {
+            // block_q6_K = { u8 ql[128]; u8 qh[64]; i8 scales[16]; f16 d; }
+            // (210 bytes)
+            for (int i = 0; i < 128; ++i) blk[0 + i] = rand_byte();    // ql
+            for (int i = 0; i < 64; ++i) blk[128 + i] = rand_byte();   // qh
+            put_scales(192, 16);
+            const float d = zero_d ? ((b % 2) ? -0.0f : 0.0f)
+                                   : (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                                         ((rng() % 2) != 0 ? 1.0f : -1.0f);
+            put_f16(208, d);
+          } else {
+            // block_q8_0 = { f16 d; i8 qs[32]; } (34 bytes)
+            const float d = zero_d ? ((b % 2) ? -0.0f : 0.0f)
+                                   : (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                                         ((rng() % 2) != 0 ? 1.0f : -1.0f);
+            put_f16(0, d);
+            for (int i = 0; i < 32; ++i)
+              blk[2 + i] = zero_scales ? 0u : rand_byte();  // full int8 range
+          }
+        }
+
+        std::vector<float> oracle(rows * k);
+        vt::cpu::BlockToFloat(enc)(packed.data(), oracle.data(), rows * k);
+
+        void* mem_packed = backend.Alloc(packed.size());
+        void* mem_out = backend.Alloc(oracle.size() * sizeof(float));
+        backend.Copy(q, mem_packed, packed.data(), packed.size());
+
+        Tensor packed_t =
+            Tensor::Contiguous(mem_packed, enc,
+                               Device{vt::DeviceType::kTENSTORRENT, 0}, {rows, nb});
+        Tensor out_t = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {rows, k});
+        decode(q, out_t, packed_t);
+
+        std::vector<float> device_out(rows * k, 0.0f);
+        backend.Copy(q, device_out.data(), mem_out, oracle.size() * sizeof(float));
+        backend.Free(mem_packed);
+        backend.Free(mem_out);
+
+        INFO("enc=", static_cast<int>(enc), " rows=", rows, " nb=", nb, " K=", k);
+        if (std::memcmp(device_out.data(), oracle.data(),
+                        oracle.size() * sizeof(float)) != 0) {
+          const float* dev = device_out.data();
+          int64_t bad = 0;
+          for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+            if (std::memcmp(&dev[i], &oracle[i], sizeof(float)) != 0) {
+              if (bad < 4)
+                MESSAGE("diff i=", i, " (blk=", i / kBlockElems, " col=", i % kBlockElems,
+                        ") dev=", dev[i], " oracle=", oracle[i]);
+              ++bad;
+            }
+          }
+          MESSAGE("total bad: ", bad, " / ", oracle.size());
+        }
+        CHECK(std::memcmp(device_out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+      }
+    }
+  }
+}
+
+// KEEPQUANT W3: the DOT admits the whole registered set. Enters through
+// vt::MatmulBT's public dispatch (the entry a GGUF load actually takes), one
+// shape per encoding — the per-encoding numerics authority is the bit-exact
+// decode proven above, so the dot needs one envelope check each, not a sweep.
+// Also pins the REFUSE side: an encoding outside the registered set must
+// throw naming itself and the registered four, never fall through to a
+// misread.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant admits the registered keep-quant set via vt::MatmulBT") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+
+  constexpr int64_t M = 4, N = 8;
+  std::mt19937 rng(20260908u);
+  const vt::DType encodings[] = {vt::DType::kQ4_K, vt::DType::kQ5_K,
+                                 vt::DType::kQ6_K, vt::DType::kQ8_0};
+  for (const vt::DType enc : encodings) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    const int64_t K = 2 * kBlockElems;  // two whole blocks per row
+    std::vector<uint8_t> packed(N * 2 * kBlockBytes);
+    for (int64_t b = 0; b < N * 2; ++b) {
+      uint8_t* blk = packed.data() + b * kBlockBytes;
+      auto put_f16 = [&](int64_t off, float v) {
+        const uint16_t bits = vt::F32ToF16(v);
+        std::memcpy(blk + off, &bits, sizeof(bits));
+      };
+      if (enc == vt::DType::kQ8_0) {
+        put_f16(0, 0.1f + 0.2f * static_cast<float>(rng() % 16) / 16.0f);
+        for (int i = 0; i < 32; ++i) blk[2 + i] = static_cast<uint8_t>(rng() & 0xFF);
+      } else if (enc == vt::DType::kQ6_K) {
+        for (int i = 0; i < 128; ++i) blk[0 + i] = static_cast<uint8_t>(rng() & 0xFF);
+        for (int i = 0; i < 64; ++i) blk[128 + i] = static_cast<uint8_t>(rng() & 0xFF);
+        for (int i = 0; i < 16; ++i) blk[192 + i] = static_cast<uint8_t>(rng() & 0xFF);
+        put_f16(208, 0.1f + 0.2f * static_cast<float>(rng() % 16) / 16.0f);
+      } else {
+        put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+        if (enc == vt::DType::kQ5_K) {
+          put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+          for (int i = 0; i < 32; ++i) blk[16 + i] = static_cast<uint8_t>(rng() & 0xFF);
+          for (int i = 0; i < 128; ++i) blk[48 + i] = static_cast<uint8_t>(rng() & 0xFF);
+        } else {
+          put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+          for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<uint8_t>(rng() & 0xFF);
+        }
+        for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<uint8_t>(rng() & 0xFF);
+      }
+    }
+    std::vector<float> a_f32(M * K);
+    for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+
+    // Oracle: bit-exact decode -> round ONCE to bf16 -> f32 accumulate in
+    // ascending k; plus the analytic bf16 operand-rounding envelope (the W2
+    // bound, unchanged).
+    std::vector<float> w_f32(N * K);
+    vt::cpu::BlockToFloat(enc)(packed.data(), w_f32.data(), N * K);
+    std::vector<uint16_t> a_bf(M * K), w_bf(N * K);
+    for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+    for (size_t i = 0; i < w_f32.size(); ++i) w_bf[i] = vt::F32ToBF16(w_f32[i]);
+    std::vector<float> ref(M * N), bound(M * N);
+    for (int64_t m = 0; m < M; ++m)
+      for (int64_t n = 0; n < N; ++n) {
+        float acc = 0.0f, mag = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+          const float p = widen(a_bf[static_cast<size_t>(m) * K + k]) *
+                          widen(w_bf[static_cast<size_t>(n) * K + k]);
+          acc += p;
+          mag += std::fabs(p);
+        }
+        ref[static_cast<size_t>(m) * N + n] = acc;
+        bound[static_cast<size_t>(m) * N + n] =
+            1.05f * std::ldexp(1.0f, -8) * (mag + std::fabs(acc));
+      }
+
+    void* mem_a = backend.Alloc(M * K * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(M * N * sizeof(float));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, packed.data(), packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+    vt::MatmulBT(q, o_t, a_t, b_t);
+    std::vector<float> out(M * N, 0.0f);
+    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+
+    float worst = 0.0f, worst_ratio = 0.0f;
+    for (int64_t i = 0; i < M * N; ++i) {
+      const float diff = std::fabs(out[static_cast<size_t>(i)] - ref[static_cast<size_t>(i)]);
+      worst = std::max(worst, diff);
+      worst_ratio = std::max(worst_ratio, diff / bound[static_cast<size_t>(i)]);
+      CHECK(std::isfinite(out[static_cast<size_t>(i)]));
+      CHECK_MESSAGE(diff <= bound[static_cast<size_t>(i)],
+                    "enc=" << static_cast<int>(enc) << " i=" << i
+                           << " out=" << out[i] << " ref=" << ref[i]
+                           << " bound=" << bound[i]);
+    }
+    MESSAGE("kMatmulBTQuant enc=", static_cast<int>(enc),
+            ": worst_abs=", worst, " worst bound-ratio=", worst_ratio);
+  }
+
+  // THE REFUSE SIDE: an unregistered encoding must throw naming ITSELF (and
+  // the registered four), never fall through to a misread. kQ4_0 has no TT
+  // arm anywhere.
+  {
+    const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_0);
+    const int64_t kBlockElems = vt::BlockElems(vt::DType::kQ4_0);
+    const int64_t K = 2 * kBlockElems;
+    std::vector<uint8_t> packed(N * 2 * kBlockBytes, 0u);
+    void* mem_a = backend.Alloc(M * K * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(M * N * sizeof(float));
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_0,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+    bool threw = false;
+    std::string what;
+    try {
+      vt::MatmulBT(q, o_t, a_t, b_t);
+    } catch (const std::exception& e) {
+      threw = true;
+      what = e.what();
+    }
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+    CHECK_MESSAGE(threw, "kQ4_0 must refuse on TENSTORRENT, not misread");
+    CHECK_MESSAGE(what.find("kQ4_0") != std::string::npos,
+                  "the refusal must name the encoding, got: ", what);
+    CHECK_MESSAGE(what.find("kQ8_0") != std::string::npos,
+                  "the refusal must name the registered set, got: ", what);
+  }
+}
+
+// KEEPQUANT W3, THE CAPTURE LEG (red-first): the decode's staging must not
+// write during a trace capture. Pre-staging, every decoded call EnsureHosts
+// the packed bytes, repacks them to i32 words on the host and from_vector-
+// uploads them — a per-call host round trip that inside a capture is the
+// #2812 class (the captured graph pins capture-time bytes its replay cannot
+// refresh). The counter (KeepQuantCaptureStagingWrites) is the observable:
+// warm eagerly, reset, capture + replay, require ZERO staging writes and
+// replay bytes identical to the eager run.
+TEST_CASE("kTENSTORRENT keep-quant decode stages zero words during capture") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  REQUIRE(backend.SupportsGraphCapture());
+  auto decode = reinterpret_cast<vt::KeepQuantDecodeFn>(
+      vt::GetOp(vt::OpId::kKeepQuantDecode, vt::DeviceType::kTENSTORRENT));
+  Queue q = backend.CreateQueue();
+
+  const vt::DType encodings[] = {vt::DType::kQ4_K, vt::DType::kQ8_0};
+  for (const vt::DType enc : encodings) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    constexpr int64_t kRows = 3, kNb = 2;
+    const int64_t k = kNb * kBlockElems;
+    std::mt19937 rng(20260909u);
+    std::vector<uint8_t> packed(kRows * kNb * kBlockBytes);
+    for (int64_t b = 0; b < kRows * kNb; ++b) {
+      uint8_t* blk = packed.data() + b * kBlockBytes;
+      const float d = (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                      ((rng() % 2) != 0 ? 1.0f : -1.0f);
+      const uint16_t d_bits = vt::F32ToF16(d);
+      std::memcpy(blk, &d_bits, sizeof(d_bits));
+      if (enc == vt::DType::kQ4_K) {
+        // dmin must stay a FINITE f16 (the W1 generator's rule): random f16
+        // bits go NaN and the bit-exact comparison dies on the device's
+        // NaN-payload canonicalization, not on a real decode defect.
+        const float dmin = (0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f) *
+                           ((rng() % 2) != 0 ? 1.0f : -1.0f);
+        const uint16_t dmin_bits = vt::F32ToF16(dmin);
+        std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
+        for (int i = 4; i < kBlockBytes; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+      } else {
+        for (int i = 2; i < kBlockBytes; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+      }
+    }
+    std::vector<float> oracle(kRows * k);
+    vt::cpu::BlockToFloat(enc)(packed.data(), oracle.data(), kRows * k);
+
+    void* mem_packed = backend.Alloc(packed.size());
+    void* mem_out = backend.Alloc(oracle.size() * sizeof(float));
+    backend.Copy(q, mem_packed, packed.data(), packed.size());
+    Tensor packed_t =
+        Tensor::Contiguous(mem_packed, enc, Device{vt::DeviceType::kTENSTORRENT, 0}, {kRows, kNb});
+    Tensor out_t = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {kRows, k});
+
+    // Eager warm: populates the word shadow + program cache, and proves the
+    // decode before it is captured.
+    decode(q, out_t, packed_t);
+    std::vector<float> eager(oracle.size(), 0.0f);
+    backend.Copy(q, eager.data(), mem_out, eager.size() * sizeof(float));
+    CHECK(std::memcmp(eager.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+
+    vt::tenstorrent::ResetKeepQuantCaptureStagingWritesForTest();
+    backend.BeginCapture(q);
+    decode(q, out_t, packed_t);
+    backend.EndCapture(q);
+    const int64_t writes = vt::tenstorrent::KeepQuantCaptureStagingWrites();
+    CHECK_MESSAGE(writes == 0,
+                  "keep-quant decode staged ", writes,
+                  " word uploads DURING capture (the #2812 class) for enc=",
+                  static_cast<int>(enc));
+
+    backend.Replay(q);
+    std::vector<float> after(oracle.size(), 0.0f);
+    backend.Copy(q, after.data(), mem_out, after.size() * sizeof(float));
+    INFO("enc=", static_cast<int>(enc));
+    CHECK(std::memcmp(after.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+    backend.Free(mem_packed);
+    backend.Free(mem_out);
   }
 }

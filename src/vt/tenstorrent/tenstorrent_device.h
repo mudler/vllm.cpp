@@ -162,6 +162,23 @@ bool MemsetDeviceIfCapture(void* p, int value, size_t bytes);
 bool MemsetDeviceFill(void* p, int value, size_t bytes);
 bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes);
 
+// BACKEND-TENSTORRENT-KEEPQUANT W3 capture-safety probe: how many staging
+// writes (host repack + from_vector upload) the keep-quant decode path has
+// performed while a trace capture was active. The staged arm performs ZERO —
+// the i32 word shadow is resident before capture and the per-call decode
+// recomputes from it — so any positive count inside a captured run is the
+// #2812 class (a captured graph reading a buffer its replay cannot refresh).
+// The reset hook exists for the op-level red-first test only. Defined only
+// when the backend is built (tenstorrent_ops.cpp); inline no-ops otherwise,
+// the WarmPagedKvShadow pattern, so device-agnostic TUs may call them.
+#ifdef VLLM_CPP_TENSTORRENT
+int64_t KeepQuantCaptureStagingWrites();
+void ResetKeepQuantCaptureStagingWritesForTest();
+#else
+inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
+inline void ResetKeepQuantCaptureStagingWritesForTest() {}
+#endif
+
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device
 // cos/sin tensors for the step's positions BEFORE BeginCapture (the
 // SizeSlot::Refresh slot), so the captured rope cache-HITs. No-op unless

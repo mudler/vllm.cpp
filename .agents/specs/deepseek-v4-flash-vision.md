@@ -1007,20 +1007,58 @@ same order through `ggml_im2col` over a `[x, y, n_embd]` tensor reshaped
 case takes its destination index from that formula rather than from our loop
 nesting, so it is not a second copy of the implementation.
 
-**One tolerance was changed, and it is a correction rather than a concession.**
+**One tolerance was changed. It is a correction AND a concession, and the first
+telling of it said only the first half.** SUPERSEDES the W2 repair evidence
+committed at `d825a5133`, whose claim of "a correction rather than a concession"
+is withdrawn here; the numbers below replace its constant and its per-case
+comparison.
+
 The `gelu` stage carried a declared bound of 0.01 that was LOWER than the 0.016
 allowed for the `aligner_hidden` buffer feeding it. That ordering is not
-derivable: `sup|GELU'|` is about 1.0839, so GELU can amplify the error it is
-handed by about 8.4% and can never be relied on to shrink it. Measured per case,
-input to output: 0.0078125 to 0.0078125, 0.0078125 to 0.0078125, 0.015625 to
-0.00878906, 0.0078125 to 0.00390625, and 0.0136719 to 0.0117188. Every case
-ATTENUATES and none approaches the ceiling, so no divergence enters at this
-stage. The pre-existing `heads4_depth1` case already ran at 0.015625 against
-0.016, one bf16 ulp from failing, which is how close the declared value always
-was. The bound is now `max(0.004, 1.084 * the case's own aligner_hidden error)`,
-which is TIGHTER than the old 0.01 for three of the five cases, and
-`aligner_hidden` keeps its absolute cap so the stage stays transitively bounded
-at 0.0173.
+derivable, and that part of the original observation stands. What was wrong was
+the constant and the accounting.
+
+THE CONSTANT. GELU(x) = x*Phi(x), so GELU'(x) = Phi(x) + x*phi(x) and
+GELU''(x) = phi(x) * (2 - x^2), which is zero at x = sqrt(2). Therefore
+`sup|GELU'| = Phi(sqrt2) + sqrt2*phi(sqrt2) = 1.1289041452` at x = 1.41421, and a
+brute-force sweep of [-10, 10] at 1e-5 agrees to seven figures. The committed
+value of 1.084 "attained near x = 1.5216" was wrong twice: 1.0833155 is
+GELU'(1.0), the derivative at 1 rather than at the stationary point, and
+GELU'(1.5216) is 1.1266919, so the stated value and the stated maximizer did not
+agree with each other either. GELU can amplify the error it is handed by 12.9%,
+not by 8.4%.
+
+THE ACCOUNTING. Measured per case, `aligner_hidden` to `gelu`: 0.0078125 to
+0.0078125, 0.0078125 to 0.0078125, 0.015625 to 0.00878906, 0.0078125 to
+0.00390625, and 0.0136719 to 0.0117188. Every case attenuates and none reaches
+the ceiling. Against the 0.01 it replaced, `max(0.004, 1.1289042 * the case's own
+aligner_hidden error)` is TIGHTER for the three cases at 0.0078125, which give
+0.008820, and LOOSER for the two above them: 0.015625 gives 0.017639, a 76%
+widening, and 0.0136719 gives 0.015434, a 54% widening. The first telling
+reported the three that tightened and not the two that widened.
+
+WHAT THE WIDENING COST, MEASURED. A `vt::GeluErf` that scales its output by
+1.004f -- one bf16 ulp at these magnitudes -- when and only when it is called on
+more than one row is a real defect. It is invisible to the single-row
+`gelu_probe`, because that probe never enters the branch, and under the derived
+bound the whole suite stayed green at 15 of 15 cases and 7404 of 7404 assertions.
+Under the 0.01 it replaced, that same mutation reds two assertions rather than
+one: `heads4_depth1 / 3x4` at 0.0117188, a case that caught it BEFORE the change,
+and the new `heads1_headdim16_theta7919 / 7x4`. Reverting the bound to 0.01
+without the mutation reds exactly one assertion, the new fixture's, at 0.0117188
+-- so a new fixture failing the old bound is what drove the change.
+
+WHY THE WIDENING IS KEPT, AND WHAT PAYS FOR IT. A stage bound below its own
+input's bound is not derivable, and `heads1_headdim16_theta7919 / 7x4` is handed
+0.0136719 by `aligner_hidden`, so no absolute ceiling at or below 0.01 can stand
+here. The coverage the widening removed is restored at the observable that owns
+it: the exact-erf probe now runs at `aligned_rows(downsample_ratio + 1, 1) = 2`
+rows as well as at 1, comparing bit-exactly against the pinned golden on every
+row. Red before: the 1.004f multi-row mutation, which was green on the whole
+suite and now reds `DeepSeek-V4 aligner uses exact erf GELU` at `rows := 2`.
+Green after: 15 of 15 cases and 7407 of 7407 assertions with the tree restored.
+`aligner_hidden` keeps its absolute cap, so the stage stays transitively bounded
+at 0.016 * 1.1289042 = 0.0180625.
 
 Every stage upstream of GELU on the case that first failed is at or below what
 the pre-existing fixtures already produce: patch 0.00195312 against 0.004, vision

@@ -153,10 +153,18 @@ DeepSeekV4VisionWeights Weights(const json& fixture, const DeepSeekV4VisionConfi
   return weights;
 }
 
-// sup|GELU'| = 1.08386..., attained near x = 1.5216. The GELU stage can
-// therefore amplify its input's error by up to 8.4% and can never be assumed to
-// reduce it, which is what makes a stage bound below its input's bound wrong.
-constexpr float kGeluLipschitz = 1.084f;
+// sup|GELU'|, DERIVED rather than sampled. GELU(x) = x*Phi(x), so
+// GELU'(x) = Phi(x) + x*phi(x) and GELU''(x) = phi(x) * (2 - x^2), which is zero
+// at x = sqrt(2). The supremum is therefore
+//   Phi(sqrt2) + sqrt2*phi(sqrt2) = 0.9213503965 + 0.2075516 = 1.1289041452,
+// confirmed by a brute-force sweep of [-10, 10] at 1e-5, which peaks at
+// x = 1.41421. An earlier value of 1.084 "near x = 1.5216" was wrong twice over:
+// it is GELU'(1.0) = 1.0833155, the derivative at 1 rather than at the stationary
+// point, and GELU'(1.5216) is 1.1266919, so the stated pair did not even agree
+// with itself. The GELU stage can amplify its input's error by up to 12.9% and
+// can never be assumed to reduce it, which is what makes a stage bound below its
+// input's bound wrong.
+constexpr float kGeluLipschitz = 1.1289042f;
 // Floor for a case whose input error is zero: our GeluErf and torch F.gelu may
 // still differ by one rounding step on identical bf16 input. One bf16 ulp at
 // the magnitudes this stage reaches, which is the patch-embedding stage's bound.
@@ -312,10 +320,26 @@ TEST_CASE("DeepSeek-V4 ViT and aligner match pinned BF16 stage goldens") {
       //   heads4_depth1 3x4              0.015625   -> 0.00878906
       //   heads1_headdim16 4x5           0.0078125  -> 0.00390625
       //   heads1_headdim16 7x4           0.0136719  -> 0.0117188
-      // Every case ATTENUATES, and no case reaches the Lipschitz ceiling. The
-      // derived bound is TIGHTER than the old 0.01f for three of the five, and
+      // Every case ATTENUATES, and no case reaches the Lipschitz ceiling.
       // aligner_hidden keeps its own absolute cap above, so this stage stays
-      // transitively bounded at 0.0173f rather than floating free.
+      // transitively bounded at 0.016f * kGeluLipschitz = 0.0180625f rather than
+      // floating free.
+      //
+      // THIS BOUND IS PARTLY A WIDENING, and saying otherwise was the defect a
+      // fresh review found. Against the 0.01f it replaced it is tighter for the
+      // three cases at 0.0078125 (0.008820) and LOOSER for the two above them:
+      // 0.015625 -> 0.017639 (+76%) and 0.0136719 -> 0.015434 (+54%). The
+      // widening is not free. A GELU that scales its output by 1.004f -- one
+      // bf16 ulp at these magnitudes -- when and only when it is called on more
+      // than one row is a REAL defect, it is fully green here, and under the old
+      // 0.01f it reds `heads4_depth1 / 3x4` as well as the case below.
+      //
+      // The widening is kept because a stage bound BELOW its own input's bound
+      // is not derivable and the `heads1_headdim16_theta7919 / 7x4` fixture is
+      // handed 0.0136719 by `aligner_hidden`. What pays for it is the exact-erf
+      // probe further down, which now runs at more than one row and compares
+      // BIT-EXACTLY, so that mutation is caught where it belongs -- on the GELU
+      // itself rather than on a fixture's leftover error budget.
       CHECK(MaxAbsDiff(store.Download(captures.gelu), expected.at("gelu")) <=
             std::max(kGeluErrorFloor, kGeluLipschitz * aligner_hidden_diff));
       CHECK(MaxAbsDiff(store.Download(output), expected.at("output")) <= 0.01f);
@@ -383,6 +407,23 @@ TEST_CASE("DeepSeek-V4 aligner preserves F.unfold channel-major order and zero p
   backend.DestroyQueue(queue);
 }
 
+// AT ONE ROW AND AT MORE THAN ONE, because a GELU defect can be confined to
+// either and this probe is the only BIT-EXACT observable on the activation.
+//
+// `vt::GeluErf`'s CPU kernel splits its work by ROW (`ParallelForRows` in
+// `src/vt/cpu/cpu_layernorm.cpp`), so a defect that fires only when `rows > 1`
+// never enters a single-row probe. A fresh review scaled that kernel's output by
+// 1.004f -- one bf16 ulp at the magnitudes this stage reaches -- under exactly
+// that condition, and the whole suite stayed green at 15 of 15 cases and 7404 of
+// 7404 assertions: the probe above never took the branch, and the stage goldens
+// carry a per-case tolerance derived from their own input error, which at two of
+// the five cases is wider than the defect. That widening is argued where it is
+// declared; this case is what pays for it.
+//
+// The grid is chosen for the ROW COUNT rather than for the geometry:
+// `aligned_rows(downsample_ratio + 1, 1)` is 2, and `aligner_w1` is zeroed, so
+// every output row is the same bias vector and must carry the same exact-erf
+// answer to the bit.
 TEST_CASE("DeepSeek-V4 aligner uses exact erf GELU") {
   Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   Queue queue = backend.CreateQueue();
@@ -401,20 +442,39 @@ TEST_CASE("DeepSeek-V4 aligner uses exact erf GELU") {
       store.Make(probe.at("input"), config.compute_dtype, {config.output_size});
   DeepSeekV4Vision model(backend, config, std::move(weights));
 
-  const std::vector<float> vision_zeros(
-      static_cast<size_t>(config.hidden_size), 0.0f);
-  Tensor vision = store.Make(json(vision_zeros), config.compute_dtype,
-                             {1, config.hidden_size});
-  Tensor output = store.Empty(config.compute_dtype, {1, config.output_size});
-  Tensor hidden = store.Empty(config.compute_dtype, {1, config.output_size});
-  Tensor gelu = store.Empty(config.compute_dtype, {1, config.output_size});
-  DeepSeekV4VisionCapture capture;
-  capture.aligner_hidden = &hidden;
-  capture.aligner_gelu = &gelu;
-  model.AlignerForward(queue, output, vision, 1, 1, &capture);
+  const std::vector<float> input = Floats(probe.at("input"));
+  const std::vector<float> expected = Floats(probe.at("expected"));
+  const auto probe_at = [&](int64_t height, int64_t width) {
+    const int64_t rows = config.aligned_rows(height, width);
+    const int64_t tokens = height * width;
+    CAPTURE(rows);
+    const std::vector<float> vision_zeros(
+        static_cast<size_t>(tokens * config.hidden_size), 0.0f);
+    Tensor vision = store.Make(json(vision_zeros), config.compute_dtype,
+                               {tokens, config.hidden_size});
+    Tensor output =
+        store.Empty(config.compute_dtype, {rows, config.output_size});
+    Tensor hidden =
+        store.Empty(config.compute_dtype, {rows, config.output_size});
+    Tensor gelu = store.Empty(config.compute_dtype, {rows, config.output_size});
+    DeepSeekV4VisionCapture capture;
+    capture.aligner_hidden = &hidden;
+    capture.aligner_gelu = &gelu;
+    model.AlignerForward(queue, output, vision, height, width, &capture);
 
-  CHECK(store.Download(hidden) == Floats(probe.at("input")));
-  CHECK(store.Download(gelu) == Floats(probe.at("expected")));
+    std::vector<float> input_rows;
+    std::vector<float> expected_rows;
+    for (int64_t r = 0; r < rows; ++r) {
+      input_rows.insert(input_rows.end(), input.begin(), input.end());
+      expected_rows.insert(expected_rows.end(), expected.begin(),
+                           expected.end());
+    }
+    CHECK(store.Download(hidden) == input_rows);
+    CHECK(store.Download(gelu) == expected_rows);
+  };
+  probe_at(1, 1);
+  REQUIRE(config.aligned_rows(config.downsample_ratio + 1, 1) > 1);
+  probe_at(config.downsample_ratio + 1, 1);
   backend.DestroyQueue(queue);
 }
 

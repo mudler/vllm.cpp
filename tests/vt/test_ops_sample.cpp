@@ -996,6 +996,66 @@ TEST_CASE("ROCm random_sample agrees with CPU on the vast majority of rows") {
   CHECK(agree >= static_cast<size_t>(0.98 * static_cast<double>(N)));
 }
 
+TEST_CASE("ROCm random_sample: the split-phase path agrees with CPU") {
+  // The case above runs V=128, which is below the v>=4096 bar in
+  // RandomSampleKernelRocm, so it takes the single-block kernel and never
+  // reaches RandomSampleSplitAK/BK at all. This case picks V and N to select
+  // the split path (v >= 4096 && n <= 64), which is the default for a
+  // production vocab, so the two-phase reduction has coverage of its own.
+  //
+  // Same statistical contract as the single-block case: host and device
+  // compute q = -log(U) in double through different libm, so ~1 ULP can flip
+  // a near-tied argmax. >=98% agreement, not bit-exact.
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  const int64_t N = 8, V = 8192;  // v >= 4096 and n <= 64 selects the split path
+  auto logits = RandomLogits(static_cast<size_t>(N * V), 4243);
+  std::vector<float> probs(static_cast<size_t>(N * V));
+  for (int64_t i = 0; i < N; ++i) {
+    float mx = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < V; ++j) mx = std::max(mx, logits[static_cast<size_t>(i * V + j)]);
+    float sum = 0.0f;
+    for (int64_t j = 0; j < V; ++j) {
+      const float e = std::exp(logits[static_cast<size_t>(i * V + j)] - mx);
+      probs[static_cast<size_t>(i * V + j)] = e;
+      sum += e;
+    }
+    for (int64_t j = 0; j < V; ++j) probs[static_cast<size_t>(i * V + j)] /= sum;
+  }
+  std::vector<int64_t> seeds(static_cast<size_t>(N));
+  for (int64_t i = 0; i < N; ++i) seeds[static_cast<size_t>(i)] = 4300 + i;
+
+  std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+  Tensor tp = MakeT(probs.data(), DType::kF32, Cpu(), {N, V});
+  Tensor ts = MakeT(seeds.data(), DType::kI64, Cpu(), {N});
+  Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+  Queue cq = Q();
+  vt::RandomSample(cq, ti, tp, ts);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  QueueGuard gq(gpu);
+  RocmDeviceTensor dp(gpu, gq.q, DType::kF32, {N, V}, probs.data());
+  RocmDeviceTensor ds(gpu, gq.q, DType::kI64, {N}, seeds.data());
+  RocmDeviceTensor did(gpu, gq.q, DType::kI64, {N});
+  vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
+  std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+  did.Download(gq.q, id_gpu.data());
+
+  // Every id the split reduction emits must at least be a legal column. The
+  // overflow this case was written for wrote a float bit pattern over
+  // sh_idx[0], so the emitted id landed far outside [0, V).
+  for (int64_t i = 0; i < N; ++i) {
+    CHECK(id_gpu[static_cast<size_t>(i)] >= 0);
+    CHECK(id_gpu[static_cast<size_t>(i)] < V);
+  }
+  size_t agree = 0;
+  for (size_t i = 0; i < id_cpu.size(); ++i)
+    if (id_gpu[i] == id_cpu[i]) ++agree;
+  CHECK(agree >= static_cast<size_t>(0.98 * static_cast<double>(N)));
+}
+
 // ===========================================================================
 // #1984 — the parallel Gumbel draw selects the SAME token as the serial scan.
 //

@@ -15,6 +15,11 @@ namespace vt::rocm {
 namespace {
 
 constexpr int kBlock = 256;
+// Per-row sampling kernels (top-k/top-p, softmax, random sample) launch one
+// block per request. With kBlock=256 that is 4 wavefronts on 1 CU — not enough
+// to hide memory latency over a ~152K vocab, costing ~3.3 ms/tok. 1024 threads
+// (16 wavefronts) gives 4× more latency hiding on the same CU.
+constexpr int kVocabBlock = 1024;
 constexpr float kNegInf = -INFINITY;
 constexpr int kThreshMaxIter = 64;
 
@@ -56,13 +61,13 @@ __global__ void SoftmaxK(float* out, const float* logits, int64_t v, bool log_so
   const int64_t row = blockIdx.x;
   const float* r = logits + row * v;
   float* o = out + row * v;
-  __shared__ float red[kBlock];
+  __shared__ float red[kVocabBlock];
 
   float m = kNegInf;
   for (int64_t j = threadIdx.x; j < v; j += blockDim.x) m = fmaxf(m, r[j]);
   red[threadIdx.x] = m;
   __syncthreads();
-  for (int s = kBlock / 2; s > 0; s /= 2) {
+  for (int s = kVocabBlock / 2; s > 0; s /= 2) {
     if (static_cast<int>(threadIdx.x) < s)
       red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
     __syncthreads();
@@ -74,7 +79,7 @@ __global__ void SoftmaxK(float* out, const float* logits, int64_t v, bool log_so
   for (int64_t j = threadIdx.x; j < v; j += blockDim.x) acc += expf(r[j] - mx);
   red[threadIdx.x] = acc;
   __syncthreads();
-  for (int s = kBlock / 2; s > 0; s /= 2) {
+  for (int s = kVocabBlock / 2; s > 0; s /= 2) {
     if (static_cast<int>(threadIdx.x) < s) red[threadIdx.x] += red[threadIdx.x + s];
     __syncthreads();
   }
@@ -126,20 +131,20 @@ __global__ void RandomSampleK(int64_t* out, const float* probs, const int64_t* s
   const float* r = probs + row * v;
   const uint64_t seed = static_cast<uint64_t>(seeds[row]);
 
-  __shared__ float sh_score[kBlock];
-  __shared__ int64_t sh_idx[kBlock];
+  __shared__ float sh_score[kVocabBlock];
+  __shared__ int64_t sh_idx[kVocabBlock];
 
   // Each thread scans its strided slice of the vocab.
   float local_best_v = kNegInf;
   int64_t local_best_j = kArgSentinel;
-  for (int64_t j = threadIdx.x; j < v; j += kBlock)
+  for (int64_t j = threadIdx.x; j < v; j += kVocabBlock)
     ArgReduce(local_best_v, local_best_j, GumbelScore(r[j], seed, row, j), j);
 
   // Block-level argmax reduction with lowest-index tie-break.
   sh_score[threadIdx.x] = local_best_v;
   sh_idx[threadIdx.x] = local_best_j;
   __syncthreads();
-  for (int s = kBlock / 2; s > 0; s >>= 1) {
+  for (int s = kVocabBlock / 2; s > 0; s >>= 1) {
     if (static_cast<int>(threadIdx.x) < s)
       ArgReduce(sh_score[threadIdx.x], sh_idx[threadIdx.x],
                 sh_score[threadIdx.x + s], sh_idx[threadIdx.x + s]);
@@ -147,6 +152,84 @@ __global__ void RandomSampleK(int64_t* out, const float* probs, const int64_t* s
   }
 
   if (threadIdx.x == 0) out[row] = (sh_idx[0] == kArgSentinel) ? 0 : sh_idx[0];
+}
+
+// ── Split-phase random sample (VT_SAMPLE_SPLIT=1) ───────────────────────────
+// The single-block RandomSampleK above uses 1 CU for the full vocab: each
+// thread computes ~148 GumbelScore evaluations (each with a double-precision
+// log inside ExpNoise), taking ~1.6 ms/tok.  This arm splits each row across
+// kSampleSplitBlocks blocks so the work spans all 96 CUs.  Phase A writes
+// per-block (score, index) partials to scratch; Phase B reduces them.  The
+// ArgReduce comparator is associative and order-independent, so the result is
+// bit-identical to the single-block kernel for every input, ties included.
+constexpr int kSampleSplitBlocks = 128;
+
+__global__ void RandomSampleSplitAK(float* __restrict__ part_score,
+                                    int64_t* __restrict__ part_idx,
+                                    const float* __restrict__ probs,
+                                    const int64_t* __restrict__ seeds,
+                                    int64_t v, int blocks_per_row) {
+  const int64_t row = blockIdx.x / blocks_per_row;
+  const int part = static_cast<int>(blockIdx.x % blocks_per_row);
+  const int64_t slab = (v + blocks_per_row - 1) / blocks_per_row;
+  const int64_t lo = part * slab;
+  const int64_t hi = lo + slab < v ? lo + slab : v;
+  const float* r = probs + row * v;
+  const uint64_t seed = static_cast<uint64_t>(seeds[row]);
+
+  float local_best_v = kNegInf;
+  int64_t local_best_j = kArgSentinel;
+  for (int64_t j = lo + threadIdx.x; j < hi; j += kVocabBlock)
+    ArgReduce(local_best_v, local_best_j, GumbelScore(r[j], seed, row, j), j);
+
+  __shared__ float sh_score[kVocabBlock];
+  __shared__ int64_t sh_idx[kVocabBlock];
+  sh_score[threadIdx.x] = local_best_v;
+  sh_idx[threadIdx.x] = local_best_j;
+  __syncthreads();
+  for (int s = kVocabBlock / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sh_score[threadIdx.x], sh_idx[threadIdx.x],
+                sh_score[threadIdx.x + s], sh_idx[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    part_score[blockIdx.x] = sh_score[0];
+    part_idx[blockIdx.x] = sh_idx[0];
+  }
+}
+
+__global__ void RandomSampleSplitBK(int64_t* __restrict__ out,
+                                    const float* __restrict__ part_score,
+                                    const int64_t* __restrict__ part_idx,
+                                    int blocks_per_row) {
+  const int64_t row = blockIdx.x;
+  __shared__ float sh_score[kSampleSplitBlocks];
+  __shared__ int64_t sh_idx[kSampleSplitBlocks];
+  float best_v = kNegInf;
+  int64_t best_j = kArgSentinel;
+  if (static_cast<int>(threadIdx.x) < blocks_per_row) {
+    best_v = part_score[row * blocks_per_row + threadIdx.x];
+    best_j = part_idx[row * blocks_per_row + threadIdx.x];
+  }
+  sh_score[threadIdx.x] = best_v;
+  sh_idx[threadIdx.x] = best_j;
+  __syncthreads();
+  for (int s = kSampleSplitBlocks / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sh_score[threadIdx.x], sh_idx[threadIdx.x],
+                sh_score[threadIdx.x + s], sh_idx[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[row] = (sh_idx[0] == kArgSentinel) ? 0 : sh_idx[0];
+}
+
+bool SampleSplitEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_SAMPLE_SPLIT");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
 }
 
 bool FastRandomSampleEnabled() {
@@ -162,7 +245,7 @@ __device__ inline float BlockRedMaxF(float v, float* s) {
   const int t = threadIdx.x;
   s[t] = v;
   __syncthreads();
-  for (int o = kBlock / 2; o > 0; o >>= 1) {
+  for (int o = blockDim.x / 2; o > 0; o >>= 1) {
     if (t < o) s[t] = fmaxf(s[t], s[t + o]);
     __syncthreads();
   }
@@ -174,7 +257,7 @@ __device__ inline float BlockRedMinF(float v, float* s) {
   const int t = threadIdx.x;
   s[t] = v;
   __syncthreads();
-  for (int o = kBlock / 2; o > 0; o >>= 1) {
+  for (int o = blockDim.x / 2; o > 0; o >>= 1) {
     if (t < o) s[t] = fminf(s[t], s[t + o]);
     __syncthreads();
   }
@@ -186,7 +269,7 @@ __device__ inline float BlockRedSumF(float v, float* s) {
   const int t = threadIdx.x;
   s[t] = v;
   __syncthreads();
-  for (int o = kBlock / 2; o > 0; o >>= 1) {
+  for (int o = blockDim.x / 2; o > 0; o >>= 1) {
     if (t < o) s[t] += s[t + o];
     __syncthreads();
   }
@@ -198,7 +281,7 @@ __device__ inline int BlockRedSumI(int v, int* s) {
   const int t = threadIdx.x;
   s[t] = v;
   __syncthreads();
-  for (int o = kBlock / 2; o > 0; o >>= 1) {
+  for (int o = blockDim.x / 2; o > 0; o >>= 1) {
     if (t < o) s[t] += s[t + o];
     __syncthreads();
   }
@@ -213,8 +296,8 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
   float* r = logits + row * v;
   const int t = threadIdx.x;
 
-  __shared__ float red[kBlock];
-  __shared__ int redi[kBlock];
+  __shared__ float red[kVocabBlock];
+  __shared__ int redi[kVocabBlock];
   __shared__ float sh_thr_k;
   __shared__ float sh_low;
 
@@ -224,7 +307,7 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
   const float p = has_p ? p_arr[row] : 1.0f;
 
   float lmax = kNegInf, lmin = INFINITY;
-  for (int64_t j = t; j < v; j += kBlock) {
+  for (int64_t j = t; j < v; j += kVocabBlock) {
     const float x = r[j];
     lmax = fmaxf(lmax, x);
     if (x != kNegInf) lmin = fminf(lmin, x);
@@ -236,7 +319,7 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
   float thr_k = kNegInf;
   if (topk_active) {
     int lc = 0;
-    for (int64_t j = t; j < v; j += kBlock)
+    for (int64_t j = t; j < v; j += kVocabBlock)
       if (r[j] > mn) ++lc;
     const int cnt_gt_min = BlockRedSumI(lc, redi);
     if (cnt_gt_min < k) {
@@ -248,7 +331,7 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
         const float p1 = (low + 2.0f * high) / 3.0f;
         int l0 = 0, l1 = 0;
         float lmglow = high, lmleh = low;
-        for (int64_t j = t; j < v; j += kBlock) {
+        for (int64_t j = t; j < v; j += kVocabBlock) {
           const float x = r[j];
           if (x > p0) ++l0;
           if (x > p1) ++l1;
@@ -280,7 +363,7 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
   const bool topp_active = has_p && (p < 1.0f);
   if (topp_active) {
     float lden = 0.0f;
-    for (int64_t j = t; j < v; j += kBlock)
+    for (int64_t j = t; j < v; j += kVocabBlock)
       if (r[j] >= thr_k) lden += expf(r[j] - mx);
     const float denom = BlockRedSumF(lden, red);
     const float target = p * denom;
@@ -289,7 +372,7 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
       const float p0 = (2.0f * lo + hi) / 3.0f;
       const float p1 = (lo + 2.0f * hi) / 3.0f;
       float la0 = 0.0f, la1 = 0.0f, lmglow = hi, lmleh = lo;
-      for (int64_t j = t; j < v; j += kBlock) {
+      for (int64_t j = t; j < v; j += kVocabBlock) {
         if (r[j] < thr_k) continue;
         const float e = expf(r[j] - mx);
         if (e > p0) la0 += e;
@@ -317,7 +400,7 @@ __global__ void ApplyTopKTopPRowK(float* logits, const int32_t* k_arr, const flo
   __syncthreads();
   low = sh_low;
 
-  for (int64_t j = t; j < v; j += kBlock) {
+  for (int64_t j = t; j < v; j += kVocabBlock) {
     const float x = r[j];
     const bool keep = (x >= thr_k) && (low < 0.0f || expf(x - mx) > low);
     if (!keep) r[j] = kNegInf;
@@ -350,13 +433,13 @@ __global__ void ApplyMinPK(float* logits, const float* min_p, int64_t v) {
   const float m = min_p[row];
   if (m <= 0.0f) return;
   float* r = logits + row * v;
-  __shared__ float red[kBlock];
+  __shared__ float red[kVocabBlock];
 
   float mx = kNegInf;
   for (int64_t j = threadIdx.x; j < v; j += blockDim.x) mx = fmaxf(mx, r[j]);
   red[threadIdx.x] = mx;
   __syncthreads();
-  for (int s = kBlock / 2; s > 0; s /= 2) {
+  for (int s = kVocabBlock / 2; s > 0; s /= 2) {
     if (static_cast<int>(threadIdx.x) < s)
       red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
     __syncthreads();
@@ -368,7 +451,7 @@ __global__ void ApplyMinPK(float* logits, const float* min_p, int64_t v) {
   for (int64_t j = threadIdx.x; j < v; j += blockDim.x) acc += expf(r[j] - rowmax);
   red[threadIdx.x] = acc;
   __syncthreads();
-  for (int s = kBlock / 2; s > 0; s /= 2) {
+  for (int s = kVocabBlock / 2; s > 0; s /= 2) {
     if (static_cast<int>(threadIdx.x) < s) red[threadIdx.x] += red[threadIdx.x + s];
     __syncthreads();
   }
@@ -399,7 +482,7 @@ void ApplyTemperatureKernelRocm(Queue& q, Tensor& logits, const Tensor& temp, bo
 void ApplyTopKTopPKernelRocm(Queue& q, Tensor& logits, const Tensor* k, const Tensor* p) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
-  ApplyTopKTopPRowK<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(
+  ApplyTopKTopPRowK<<<static_cast<unsigned>(n), kVocabBlock, 0, AsStream(q)>>>(
       logits.Ptr<float>(), k != nullptr ? k->Ptr<int32_t>() : nullptr,
       p != nullptr ? p->Ptr<float>() : nullptr, v);
   Check(hipGetLastError(), "top_k_top_p");
@@ -408,7 +491,7 @@ void ApplyTopKTopPKernelRocm(Queue& q, Tensor& logits, const Tensor* k, const Te
 void ComputeProbsKernelRocm(Queue& q, Tensor& probs, const Tensor& logits) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
-  SoftmaxK<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(probs.Ptr<float>(),
+  SoftmaxK<<<static_cast<unsigned>(n), kVocabBlock, 0, AsStream(q)>>>(probs.Ptr<float>(),
                                                                    logits.Ptr<float>(), v, false);
   Check(hipGetLastError(), "compute_probs");
 }
@@ -416,7 +499,7 @@ void ComputeProbsKernelRocm(Queue& q, Tensor& probs, const Tensor& logits) {
 void ComputeLogprobsKernelRocm(Queue& q, Tensor& logprobs, const Tensor& logits) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
-  SoftmaxK<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(
+  SoftmaxK<<<static_cast<unsigned>(n), kVocabBlock, 0, AsStream(q)>>>(
       logprobs.Ptr<float>(), logits.Ptr<float>(), v, true);
   Check(hipGetLastError(), "compute_logprobs");
 }
@@ -431,7 +514,37 @@ void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs,
     Check(hipGetLastError(), "random_sample launch (slow)");
     return;
   }
-  RandomSampleK<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
+  // Split-phase path: spread the Gumbel-score argmax across all CUs.
+  // Gated by VT_SAMPLE_SPLIT (default ON). Falls back to single-block when
+  // the vocab is small or the batch is large enough to fill the GPU already.
+  if (SampleSplitEnabled() && v >= 4096 && n <= 64) {
+    constexpr int kBpr = kSampleSplitBlocks;
+    // Grow-only scratch (hipMallocAsync, stream-ordered — legal inside graph
+    // capture, same pattern as the greedy argmax split in rocm_dense_basic.hip).
+    static float* part_score = nullptr;
+    static int64_t* part_idx = nullptr;
+    static int64_t part_rows = 0;
+    if (part_rows < n) {
+      Check(hipMallocAsync(reinterpret_cast<void**>(&part_score),
+                           static_cast<size_t>(n) * kBpr * sizeof(float), s),
+            "sample_split scratch");
+      Check(hipMallocAsync(reinterpret_cast<void**>(&part_idx),
+                           static_cast<size_t>(n) * kBpr * sizeof(int64_t), s),
+            "sample_split scratch");
+      part_rows = n;
+    }
+    RandomSampleSplitAK<<<static_cast<unsigned>(n * kBpr), kVocabBlock, 0, s>>>(
+        part_score, part_idx, probs.Ptr<float>(), seeds.Ptr<int64_t>(), v, kBpr);
+    // Phase B reduces kBpr partials in shared arrays sized kSampleSplitBlocks,
+    // so it must launch exactly that many threads. Launching kVocabBlock here
+    // put 1024 threads on 128-entry arrays: sh_score[128] aliases sh_idx[0],
+    // which is the value written to out[row].
+    RandomSampleSplitBK<<<static_cast<unsigned>(n), kSampleSplitBlocks, 0, s>>>(
+        token_ids.Ptr<int64_t>(), part_score, part_idx, kBpr);
+    Check(hipGetLastError(), "random_sample launch (split)");
+    return;
+  }
+  RandomSampleK<<<static_cast<unsigned>(n), kVocabBlock, 0, s>>>(
       token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
   Check(hipGetLastError(), "random_sample launch");
 }
@@ -452,7 +565,7 @@ void ApplyPenaltiesKernelRocm(Queue& q, Tensor& logits, const Tensor& prompt_mas
 void ApplyMinPKernelRocm(Queue& q, Tensor& logits, const Tensor& min_p) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
-  ApplyMinPK<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(logits.Ptr<float>(),
+  ApplyMinPK<<<static_cast<unsigned>(n), kVocabBlock, 0, AsStream(q)>>>(logits.Ptr<float>(),
                                                                      min_p.Ptr<float>(), v);
   Check(hipGetLastError(), "apply_min_p");
 }

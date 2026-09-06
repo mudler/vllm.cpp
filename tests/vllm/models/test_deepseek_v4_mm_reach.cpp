@@ -1068,6 +1068,106 @@ TEST_CASE("REACH: a text prompt is bit-identical on a text and a vision checkpoi
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// (12b) THE PAGED ARM SERVES A WINDOWED TEXT STEP, AND MUST KEEP SERVING IT.
+//
+// Case (13) below drives the refusal in the direction that fires. This case
+// drives the direction that MUST NOT, and until it existed nothing did: no test
+// ran a paged DeepSeek-V4 step at a non-zero `sliding_window` on a text prompt.
+//
+// The consequence of that hole is not hypothetical. Detach the refusal in
+// `deepseek_v4.cpp` from `be.image_spans` -- refuse on the WINDOW alone -- and
+// the whole family stays green while every TEXT step of the multi-KV arm is
+// refused at the released `sliding_window = 128`. That arm is the one a real
+// engine takes, because DeepSeek-V4 publishes a multi-cache topology, so the
+// widened predicate would take the served text path down with it.
+//
+// A TEXT checkpoint and a text prompt, so `image_spans` is empty by
+// construction and the refusal has nothing to key on but the window.
+TEST_CASE("REACH: the paged arm SERVES a windowed text step") {
+  TempFile lang(BuildDeepseek4Gguf(
+      /*vision=*/false, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
+      /*head_dim=*/512, /*with_tokenizer=*/false, /*vision_bias_scale=*/1.0F,
+      /*sliding_window=*/4));
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(lang.path());
+  const vllm::HfConfig config = vllm::DeepseekV4HfConfigFromGguf(gguf);
+  REQUIRE(config.raw.at("sliding_window").get<int64_t>() == 4);
+  std::unique_ptr<vllm::LoadedModel> model = vllm::ModelRegistry::Load(
+      config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kCPU));
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+
+  // The SAME page publication case (13) uses, so the two differ in the prompt
+  // and in nothing else.
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t nb = 4, bs = 8;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+  std::vector<std::string> names;
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const size_t i = static_cast<size_t>(l);
+    storage[i].assign(static_cast<size_t>(nb * bs * params.head_dim), 0.0F);
+    attn_kv[i].data = storage[i].data();
+    attn_kv[i].dtype = vt::DType::kF32;
+    attn_kv[i].num_blocks = nb;
+    attn_kv[i].block_size = bs;
+    attn_kv[i].num_kv_heads = 1;
+    attn_kv[i].head_size = static_cast<int>(params.head_dim);
+    names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  }
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+
+  const int64_t tokens = 12;
+  std::vector<int32_t> ids(static_cast<size_t>(tokens));
+  std::vector<int32_t> positions(static_cast<size_t>(tokens));
+  for (int64_t t = 0; t < tokens; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(1 + (t % 5));
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(tokens - 1)};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+  vllm::ModelForwardInput in{.token_ids = ids,
+                             .positions = positions,
+                             .attn_meta = attn_meta,
+                             .gdn_meta = gdn_meta,
+                             .attn_kv = attn_kv,
+                             .gdn_state = gdn_state,
+                             .config = config,
+                             .queue = queue,
+                             .logits_indices = logits_indices,
+                             .num_reqs = 1};
+  in.gather_logits = false;
+  in.multi_kv = &mk;
+  // `mm` stays unset, which is every text step.
+  CHECK_FALSE(in.mm.has_value());
+
+  // It SERVES. Asserting the answer rather than only the absence of a throw:
+  // an arm that returned an empty or non-finite row would satisfy a bare
+  // `CHECK_NOTHROW` and would not be serving anything.
+  std::string thrown;
+  vllm::ForwardLogits out;
+  try {
+    out = vllm::ModelRegistry::Forward(*model, in);
+  } catch (const std::exception& e) {
+    thrown = e.what();
+  }
+  INFO("thrown: ", thrown);
+  CHECK(thrown.empty());
+  REQUIRE(out.host.size() == static_cast<size_t>(kVocab));
+  int64_t nonfinite = 0;
+  for (const float v : out.host) {
+    if (!std::isfinite(v)) ++nonfinite;
+  }
+  CHECK(nonfinite == 0);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // (13) THE PAGED ARM REFUSES AN IMAGE SPAN IT CANNOT SERVE.
 //
 // The paged attention op takes ONE `vt::AttentionWindow` for the whole call, so

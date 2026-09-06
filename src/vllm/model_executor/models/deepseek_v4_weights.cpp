@@ -1670,10 +1670,21 @@ struct V4GgufCtx {
   //
   // The width is read from the FILE HEADER and refused BEFORE the value is
   // materialized. Checking it on the loaded tensor instead would dequantize
-  // first and refuse second, so a corrupt or absurd declared width would surface
-  // as a failed allocation rather than as this named refusal. A guard whose only
-  // failure mode is `bad_alloc` is a crash, not a gate, and an allocation that
-  // large takes the whole machine down with it rather than one test.
+  // first and refuse second.
+  //
+  // AN EARLIER VERSION OF THIS COMMENT SAID A DECLARED WIDTH COULD OTHERWISE
+  // TAKE THE MACHINE DOWN. It cannot, and a fresh review was right to ask for
+  // the gate that would prove it. `GgufFile::Open` already bounds every tensor:
+  // `gguf_reader.cpp` refuses a byte size that overflows and then refuses any
+  // span that leaves the data section, so a tensor declaring four billion
+  // elements never reaches this function -- Open refuses the file by name first.
+  // What a materialize-first guard would really cost is the dequantization of a
+  // tensor whose FILE bytes already fit, at most about 4x the bytes on disk for
+  // a Q8_0 vector and 1x for the f32 these two biases actually are. Both router
+  // biases are ALSO checked before the loader is asked to do that work, which is
+  // the reason to keep this ordering. It is a preference for refusing early, not
+  // a bound, and the two NARROW cases in `test_deepseek_v4_mm_loader` gate the
+  // check itself rather than the order in which it runs.
   OwnedTensor Vec1D(const std::string& name, GgufTensorRole role, int64_t n) {
     const std::vector<int64_t>& s = g.Get(name).shape;  // throws when missing
     VT_CHECK(s.size() == 1 && s[0] == n,

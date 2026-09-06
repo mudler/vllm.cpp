@@ -1277,13 +1277,32 @@ width and refuses. This mirrors what the safetensors arm already gets from
 `glm_moe_dsa_loader.cpp` already get from `LoadVecF32(g, name, e)`.
 
 `Vec1D` reads that width from the FILE HEADER and refuses before the value is
-materialized. A guard that reads the width off the LOADED tensor dequantizes
-first and refuses second, so a corrupt or absurd declared width surfaces as a
-failed allocation rather than as the named refusal. A guard whose only failure
-mode is `bad_alloc` is a crash and not a gate, and an allocation sized from an
-unvalidated header takes the machine down rather than one test. Mutation:
-deleting the `VT_CHECK` makes both `NARROW` cases fail together against an empty
-message, four assertions, which is the red the guard was introduced against.
+materialized. Mutation: deleting the `VT_CHECK` makes both `NARROW` cases fail
+together against an empty message, four assertions, which is the red the guard
+was introduced against.
+
+**The ORDERING is not gated, and the reason `e21dd054e` gave for it is wrong.**
+SUPERSEDES that commit's account. A fresh review replaced `Vec1D` with the
+materialize-first form -- `OwnedTensor t = Vec(name, role)` and then a check on
+`t.rank` and `t.shape[0]`, with an identical message -- and
+`test_deepseek_v4_mm_loader` stayed green at 9 cases and 105 assertions.
+Reproduced here rather than taken from the report.
+
+The finding is real and its remedy is not a new gate, because the danger the
+commit named does not exist. `e21dd054e` said an absurd declared width would
+surface as a failed allocation and take the machine down. It cannot:
+`GgufFile::Open` in `src/vllm/model_executor/model_loader/gguf_reader.cpp`
+refuses a tensor whose byte size overflows and then refuses any tensor span that
+leaves the data section, so a header declaring four billion elements is refused
+by name at Open and never reaches `Vec1D` at all. The real cost of
+materialize-first is dequantizing a tensor whose file bytes already fit, which is
+at most about 4x the bytes on disk for a Q8_0 vector and 1x for the f32 these two
+biases are.
+
+So the ordering is a preference for refusing early, not a correctness bound, and
+no observable separates the two forms. Writing a case that pretends otherwise
+would be the failure this repair exists to correct. The comment in
+`deepseek_v4_weights.cpp` now says this, and nothing is owed.
 
 **Both router biases are now checked, not only the vision one.** The text
 `exp_probs_b.bias` beside it carried the identical weakness. It is a

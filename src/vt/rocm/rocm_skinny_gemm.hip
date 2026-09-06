@@ -214,14 +214,18 @@ void WvSplitKBTDispatch(hipStream_t s, void* out, const void* a, const void* b,
         default: wvSplitKSml<3, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       break;
-    default:
+    case 4:
       switch (yt) {
         case 1: wvSplitKSml<4, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
         case 2: wvSplitKSml<4, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
         default: wvSplitKSml<4, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       break;
+    default:
+      throw std::runtime_error("vt rocm: wvSplitK unsupported M=" + std::to_string(M));
   }
+  if (hipGetLastError() != hipSuccess)
+    throw std::runtime_error("vt rocm: wvSplitK launch failed");
 }
 
 template <class OutT>

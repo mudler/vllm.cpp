@@ -194,7 +194,7 @@ TEST_CASE("REACH: ModelRegistry::EncodeMm runs the W2 tower on the W3A projector
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
   REQUIRE(mm.mm_features.size() == 1);
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
@@ -294,7 +294,7 @@ TEST_CASE("REACH: ModelRegistry::EmbedMm merges the encoder rows into inputs_emb
   const auto image = MakeImage(vcfg);
   const std::vector<int32_t> prompt{1, 2, static_cast<int32_t>(kVocab) - 1, 3};
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
-      prompt, static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      prompt, static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -377,7 +377,7 @@ TEST_CASE("REACH: an image reaches ModelRegistry::Forward and moves the logits")
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -675,7 +675,7 @@ TEST_CASE("REACH: the vision bias moves the image rows and leaves the text rows 
     const auto image = MakeImage(vcfg);
     const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
         {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-        static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+        static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
     vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
     vt::Queue queue = backend.CreateQueue();
     const vllm::MmEncoderOutput enc = vllm::ModelRegistry::EncodeMm(
@@ -758,7 +758,7 @@ TEST_CASE("REACH: a row early in the image span attends a row after it") {
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
@@ -1033,7 +1033,7 @@ TEST_CASE("REACH: the paged arm refuses an image span it would clip to the windo
   const auto image = MakeImage(vcfg);
   const MultiModalInputs mm = vllm::multimodal::PrepareDeepSeekV4Inputs(
       {1, 2, static_cast<int32_t>(kVocab) - 1, 3},
-      static_cast<int32_t>(kVocab) - 1, {image}, ProcCfg(vcfg));
+      static_cast<int32_t>(kVocab) - 1, {{image, "reach-image"}}, ProcCfg(vcfg));
 
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();

@@ -16,6 +16,8 @@
 #include "doctest/doctest.h"
 #include "vllm/multimodal/deepseek_v4_processor.h"
 
+#include "vllm/multimodal/hasher.h"
+
 namespace allocation_probe {
 
 thread_local bool enabled = false;
@@ -24,6 +26,13 @@ thread_local size_t bytes = 0;
 
 }  // namespace allocation_probe
 
+// NOT INLINED, for two reasons that point the same way. A probe the optimizer
+// inlines is a probe it can elide, and an uncounted allocation reads as a
+// PASS on the very assertion these operators exist to make. And GCC pairs the
+// inlined `std::malloc` here with the inlined `std::free` below across an
+// unrelated caller and reports `-Wmismatched-new-delete`, which is a false
+// positive on a deliberate replacement rather than a defect to silence.
+__attribute__((noinline))
 void* operator new(std::size_t size) {
   if (void* pointer = std::malloc(size == 0 ? 1 : size)) {
     if (allocation_probe::enabled) {
@@ -39,6 +48,7 @@ void* operator new[](std::size_t size) {
   return ::operator new(size);
 }
 
+__attribute__((noinline))
 void operator delete(void* pointer) noexcept {
   std::free(pointer);
 }
@@ -61,6 +71,7 @@ using vllm::multimodal::BuildDeepSeekV4ImageBlock;
 using vllm::multimodal::DeepSeekV4ImageProcessor;
 using vllm::multimodal::DeepSeekV4ProcessorConfig;
 using vllm::multimodal::GridTokens;
+using vllm::multimodal::MakeDeepSeekV4MmHash;
 using vllm::multimodal::PrepareDeepSeekV4Inputs;
 using vllm::multimodal::SafeResize;
 using vllm::multimodal::SolveResizeRatio;
@@ -446,8 +457,12 @@ TEST_CASE("deepseek-v4 placeholders expand multiple images in source order") {
       processor.ProcessImage(std::span<const uint8_t>(rgb1), 2, 2));
   auto image2 = std::make_shared<vllm::multimodal::ImageKwargs>(
       processor.ProcessImage(std::span<const uint8_t>(rgb2), 2, 2));
+  const std::string hash1 = processor.HashImage(
+      std::span<const uint8_t>(rgb1), 2, 2);
+  const std::string hash2 = processor.HashImage(
+      std::span<const uint8_t>(rgb2), 2, 2);
   const auto inputs = PrepareDeepSeekV4Inputs(
-      {7, 42, 8, 42, 9}, 42, {image1, image2}, cfg);
+      {7, 42, 8, 42, 9}, 42, {{image1, hash1}, {image2, hash2}}, cfg);
   CHECK(inputs.prompt_token_ids ==
         std::vector<int32_t>{7, 101, 101, 100, 102, 101, 103, 101, 104,
                              8, 101, 100, 102, 101, 103, 101, 104, 9});
@@ -458,15 +473,96 @@ TEST_CASE("deepseek-v4 placeholders expand multiple images in source order") {
   CHECK(inputs.mm_features[1].offset == 10);
   CHECK(inputs.mm_features[1].length == 7);
   CHECK(inputs.mm_features[1].data == image2);
+
+  // THE KEY, and this is the assertion the two images exist to make.
+  // `Scheduler::try_schedule_encoder_inputs` skips a feature whose `mm_hash` it
+  // already scheduled this step, and the runner's `encoder_cache_` is a global
+  // map on the same string, so two features that share a key are ONE image to
+  // both: the second placeholder is filled from the first image's rows and the
+  // answer is fluent. `rgb2` differs from `rgb1` in ONE byte, which is the
+  // smallest difference a content hash has to see.
+  CHECK_FALSE(hash1.empty());
+  CHECK(hash1 != hash2);
+  CHECK(inputs.mm_features[0].mm_hash != inputs.mm_features[1].mm_hash);
+  CHECK(inputs.mm_features[0].mm_hash.rfind(hash1, 0) == 0);
+  CHECK(inputs.mm_features[1].mm_hash.rfind(hash2, 0) == 0);
+}
+
+// THE OTHER HALF OF THE KEY, and it is why this architecture cannot use
+// Qwen3-VL's content-only one. `BuildDeepSeekV4ImageBlock` reads
+// `compress_pad = 3 - start_position % 4`, so ONE image at two offsets is two
+// different blocks -- here 8 tokens and 7. A key that did not carry the offset
+// term would make the scheduler serve the 8-token block's rows under the
+// 7-token span.
+TEST_CASE("deepseek-v4 one image at two offsets gets two DIFFERENT feature keys") {
+  auto cfg = TinyConfig();
+  const auto rgb = IdentityRgb();
+  DeepSeekV4ImageProcessor processor(cfg);
+  auto image = std::make_shared<vllm::multimodal::ImageKwargs>(
+      processor.ProcessImage(std::span<const uint8_t>(rgb), 2, 2));
+  const std::string content =
+      processor.HashImage(std::span<const uint8_t>(rgb), 2, 2);
+
+  const auto inputs = PrepareDeepSeekV4Inputs(
+      {7, 42, 8, 42, 9}, 42, {{image, content}, {image, content}}, cfg);
+  REQUIRE(inputs.mm_features.size() == 2);
+  // The PREMISE: the two spans really are different lengths, so a shared key
+  // would be a length error and not merely a content one.
+  REQUIRE(inputs.mm_features[0].length != inputs.mm_features[1].length);
+  CHECK(inputs.mm_features[0].mm_hash != inputs.mm_features[1].mm_hash);
+
+  // ...and the SAME image at the SAME residue is the same key, which is the
+  // cache hit that makes the scheduler's dedup correct rather than merely safe.
+  CHECK(MakeDeepSeekV4MmHash(content, 2, 2, 3) ==
+        MakeDeepSeekV4MmHash(content, 2, 2, 3));
+  CHECK(MakeDeepSeekV4MmHash(content, 2, 2, 3) !=
+        MakeDeepSeekV4MmHash(content, 2, 2, 2));
+  CHECK(MakeDeepSeekV4MmHash(content, 2, 2, 3) !=
+        MakeDeepSeekV4MmHash(content, 3, 2, 3));
+  CHECK(MakeDeepSeekV4MmHash(content, 2, 2, 3) !=
+        MakeDeepSeekV4MmHash(content, 2, 3, 3));
+}
+
+// A feature with no key is refused where it is BUILT, not discovered three
+// components downstream as a wrong answer.
+TEST_CASE("deepseek-v4 an image item with no content hash is refused by name") {
+  auto cfg = TinyConfig();
+  const auto rgb = IdentityRgb();
+  DeepSeekV4ImageProcessor processor(cfg);
+  auto image = std::make_shared<vllm::multimodal::ImageKwargs>(
+      processor.ProcessImage(std::span<const uint8_t>(rgb), 2, 2));
+  CHECK_THROWS_AS(
+      PrepareDeepSeekV4Inputs({42}, 42, {{image, ""}}, cfg),
+      std::invalid_argument);
+}
+
+// The content key is the hasher's, over the same bytes, and the model_id is a
+// NAMESPACE: two engines serving different checkpoints must not collide in a
+// process-global cache.
+TEST_CASE("deepseek-v4 the content hash is the shared hasher's, keyed on model_id") {
+  const auto rgb = IdentityRgb();
+  auto cfg = TinyConfig();
+  cfg.model_id = "deepseek-a";
+  const DeepSeekV4ImageProcessor a(cfg);
+  cfg.model_id = "deepseek-b";
+  const DeepSeekV4ImageProcessor b(cfg);
+  const std::string ha = a.HashImage(std::span<const uint8_t>(rgb), 2, 2);
+  CHECK(ha == vllm::multimodal::MultiModalHasher::HashImageRGB(
+                  "deepseek-a", rgb.data(), 2, 2));
+  CHECK(ha != b.HashImage(std::span<const uint8_t>(rgb), 2, 2));
+  // And a buffer that does not match its declared dimensions is refused rather
+  // than read past its end.
+  CHECK_THROWS_AS(a.HashImage(std::span<const uint8_t>(rgb), 2, 3),
+                  std::invalid_argument);
 }
 
 TEST_CASE("deepseek-v4 placeholder and image counts must match") {
   const auto image = std::make_shared<vllm::multimodal::ImageKwargs>();
   CHECK_THROWS_WITH_AS(
-      PrepareDeepSeekV4Inputs({1, 2}, 42, {image}, TinyConfig()),
+      PrepareDeepSeekV4Inputs({1, 2}, 42, {{image, "c0"}}, TinyConfig()),
       "Found 0 image tokens but got 1 images", std::invalid_argument);
   CHECK_THROWS_WITH_AS(
-      PrepareDeepSeekV4Inputs({42, 42}, 42, {image}, TinyConfig()),
+      PrepareDeepSeekV4Inputs({42, 42}, 42, {{image, "c0"}}, TinyConfig()),
       "Found 2 image tokens but got 1 images", std::invalid_argument);
 }
 
@@ -486,7 +582,7 @@ TEST_CASE("deepseek-v4 placeholder expansion validates image shape and extent") 
   wrong_shape->patch_feature_dim = 12;
   wrong_shape->pixel_values_bf16 = {0, 0};
   CHECK_THROWS_WITH_AS(
-      PrepareDeepSeekV4Inputs({42}, 42, {wrong_shape}, TinyConfig()),
+      PrepareDeepSeekV4Inputs({42}, 42, {{wrong_shape, "c0"}}, TinyConfig()),
       "DeepSeek-V4 image input shape is invalid", std::invalid_argument);
 
   auto wrong_feature_width =
@@ -496,7 +592,7 @@ TEST_CASE("deepseek-v4 placeholder expansion validates image shape and extent") 
   wrong_feature_width->patch_feature_dim = 1;
   wrong_feature_width->pixel_values_bf16 = {0};
   CHECK_THROWS_WITH_AS(
-      PrepareDeepSeekV4Inputs({42}, 42, {wrong_feature_width}, TinyConfig()),
+      PrepareDeepSeekV4Inputs({42}, 42, {{wrong_feature_width, "c0"}}, TinyConfig()),
       "DeepSeek-V4 image feature width does not match patch size",
       std::invalid_argument);
 
@@ -505,7 +601,7 @@ TEST_CASE("deepseek-v4 placeholder expansion validates image shape and extent") 
   wrong_extent->num_patches = 1;
   wrong_extent->patch_feature_dim = 12;
   CHECK_THROWS_WITH_AS(
-      PrepareDeepSeekV4Inputs({42}, 42, {wrong_extent}, TinyConfig()),
+      PrepareDeepSeekV4Inputs({42}, 42, {{wrong_extent, "c0"}}, TinyConfig()),
       "DeepSeek-V4 image BF16 extent does not match shape",
       std::invalid_argument);
 }
@@ -516,7 +612,7 @@ TEST_CASE("deepseek-v4 placeholder expansion narrows before block allocation") {
   huge->num_patches = huge->image_grid_thw[2];
   huge->patch_feature_dim = 12;
   CHECK_THROWS_WITH_AS(
-      PrepareDeepSeekV4Inputs({42}, 42, {huge}, TinyConfig()),
+      PrepareDeepSeekV4Inputs({42}, 42, {{huge, "c0"}}, TinyConfig()),
       "DeepSeek-V4 image feature length exceeds int range",
       std::overflow_error);
 }

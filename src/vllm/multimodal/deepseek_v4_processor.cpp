@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/multimodal/hasher.h"
 #include "vt/dtype.h"
 
 namespace vllm::multimodal {
@@ -1238,6 +1239,23 @@ DeepSeekV4ImageProcessor::DeepSeekV4ImageProcessor(
   ValidateProcessorConfig(config_);
 }
 
+std::string DeepSeekV4ImageProcessor::HashImage(std::span<const uint8_t> rgb,
+                                                int64_t height,
+                                                int64_t width) const {
+  if (height <= 0 || width <= 0) {
+    throw std::invalid_argument("DeepSeek-V4 image dimensions must be positive");
+  }
+  const int64_t expected = CheckedMul(
+      CheckedMul(height, width, "DeepSeek-V4 image extent overflow"), 3,
+      "DeepSeek-V4 image extent overflow");
+  if (static_cast<int64_t>(rgb.size()) != expected) {
+    throw std::invalid_argument(
+        "DeepSeek-V4 image RGB extent does not match its dimensions");
+  }
+  return MultiModalHasher::HashImageRGB(config_.model_id, rgb.data(), height,
+                                        width);
+}
+
 ImageKwargs DeepSeekV4ImageProcessor::ProcessImage(
     std::span<const uint8_t> rgb, int64_t height, int64_t width) const {
   ValidateGeometry(height, width, config_.patch_size,
@@ -1405,9 +1423,22 @@ DeepSeekV4ImageBlock BuildDeepSeekV4ImageBlock(int64_t n_llm_h,
   return block;
 }
 
+std::string MakeDeepSeekV4MmHash(const std::string& content_hash,
+                                 int64_t n_llm_h, int64_t n_llm_w,
+                                 int64_t compress_pad) {
+  if (content_hash.empty()) {
+    throw std::invalid_argument(
+        "DeepSeek-V4 image item carries no content hash. The scheduler and "
+        "both encoder caches are keyed on this string alone, so an empty one "
+        "makes every image in the process the same image");
+  }
+  return content_hash + "-" + std::to_string(n_llm_h) + "x" +
+         std::to_string(n_llm_w) + "+" + std::to_string(compress_pad);
+}
+
 MultiModalInputs PrepareDeepSeekV4Inputs(
     const std::vector<int32_t>& prompt_token_ids, int32_t image_token_id,
-    const std::vector<std::shared_ptr<ImageKwargs>>& images,
+    const std::vector<DeepSeekV4ImageItem>& images,
     const DeepSeekV4ProcessorConfig& config) {
   ValidateProcessorConfig(config);
   const int64_t expected_feature_dim = CheckedMul(
@@ -1431,7 +1462,7 @@ MultiModalInputs PrepareDeepSeekV4Inputs(
       expanded_size = CheckedAdd(expanded_size, 1, kPromptError);
       continue;
     }
-    const auto& image = images[image_index++];
+    const auto& image = images[image_index++].kwargs;
     if (!image || image->empty()) {
       throw std::invalid_argument("DeepSeek-V4 image input must not be empty");
     }
@@ -1481,7 +1512,8 @@ MultiModalInputs PrepareDeepSeekV4Inputs(
       result.prompt_token_ids.push_back(token);
       continue;
     }
-    const auto& image = images[image_index++];
+    const DeepSeekV4ImageItem& item = images[image_index++];
+    const auto& image = item.kwargs;
     const int64_t n_llm_h = CheckedCeilDiv(
         image->image_grid_thw[1], config.downsample_ratio,
         "DeepSeek-V4 image block dimensions overflow");
@@ -1506,6 +1538,14 @@ MultiModalInputs PrepareDeepSeekV4Inputs(
         static_cast<int64_t>(block.types.size()),
         "DeepSeek-V4 image feature length exceeds int range");
     feature.data = image;
+    // The KEY, composed here because this is the only place that knows the
+    // block's start position. `compress_pad` is `GetImageBlockShape`'s own
+    // expression, restated rather than returned so the two cannot drift
+    // silently: if it does drift, `EncodeMmDeepseekV4ForCausalLM`'s
+    // block-length check is what reports it.
+    feature.mm_hash = MakeDeepSeekV4MmHash(
+        item.content_hash, n_llm_h, n_llm_w,
+        kCompressPadTo - 1 - static_cast<int64_t>(offset) % kCompressPadTo);
     result.mm_features.push_back(std::move(feature));
   }
   return result;

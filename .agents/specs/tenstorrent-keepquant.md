@@ -274,22 +274,26 @@ to make a failure pass.
 
 ## Owed
 
-- MoE grouped keep-quant GEMM (follow-up row; vehicle pickable after W2).
+- MoE grouped keep-quant GEMM — MOVED INTO W4 SCOPE (#3030): the seam
+  exists (`ops.cpp:220`, `weight[E*N,K]`) with a production ROCm kernel
+  (`MatmulBTQuantGroupedKernelRocm`, native Q8_0/Q4_K/Q6_K) fed by the
+  stacked keep-quant tower (`qwen3_5_gguf_weights.cpp:1287`); the TT
+  backend registers only `kMoeSiluMul`. "Vehicle pickable after W2" is
+  literally true.
 - Block-decoding n-gram gather ([#2394](https://github.com/mudler/vllm.cpp/issues/2394)).
 - IQ-family / sub-IQ1_S encodings (unsloth fork formats).
-- The int8-dot perf lever; llama.cpp-comparable throughput numbers.
+- The int8-dot perf lever (#3031); llama.cpp-comparable throughput numbers.
 - `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
   capture leg hashes the local bytes); 27B arm entry at W4.
-- Residency reconciliation (NEEDS_DECISION): the spec's residency thesis
-  expected per-call on-core decode from the resident i32 word shadow and no
-  bf16 twin; W3 ships a host-side decode + bf16 pre-round + single
-  `from_vector<float>` upload per weight (`DecodedWeightShadow` memoizes it
-  per host buffer, dropped in `UnregisterHostBuffer`), because the device-side
-  twin decode OOM-fatalled the vehicle (4,068,474,880 B `ttnn::where`). The
-  word-shadow machinery and `kKeepQuantDecode` stay registered, tested, and
-  capture-guarded, but no production path reads them now. Decide before W4:
-  keep the twin as the shipped path and retire the shadow, or restore
-  on-core decode for the 27B arm where the twin's memory cost is real.
+- Residency reconciliation (RESOLVED BY ARITHMETIC, 2026-09-06, #3030):
+  the twin residency is a 0.8B-only shape. Measured on the pinned 27B
+  artifact: non-expert keep-quant twins need 18.47 GiB, the expert tower
+  32.37 GiB, token_embd's twin 2.37 GiB — against a 32 GB device whose
+  packed total is 15.92 GiB. W4 promotes the word-shadow on-core decode to
+  the production matmul residency and narrows the twin to the embedding
+  gather. The vehicle's OOM history (device-side twin construction,
+  4,068,474,880 B `ttnn::where`) judged twin CONSTRUCTION, not shadow use;
+  the shadow path's per-call decode is compute, not allocation.
 - No eager/ambient TT pair is owed for this arm: the READY gate keys on
   `DecodeCaptureEnabled()` and adjudicates the capture leg; the eager arm is
   covered by the op-level eager decode-equality suites (E1). The ladder's
@@ -298,6 +302,28 @@ to make a failure pass.
 - No manifest.json: the committed golden convention (`qwen3_greedy_0_6b`)
   carries per-arm `.npy` pairs + `p{i}_prompt.i32` only; the recipe lives in
   this Evidence section and the landing commit body.
+
+## W4
+
+Two changes, two pull requests (developer decision 2026-09-06):
+
+**W4a — the 27B arm ([#3030](https://github.com/mudler/vllm.cpp/issues/3030)).**
+(1) Production residency flip: `MatmulBTQuantKernel` consumes the per-call
+on-core decode from the resident word shadow for {Q4_K,Q5_K,Q6_K,Q8_0}; the
+twin survives for the embedding gather only. Red-first: the 0.8B vehicle
+gate re-run under the flipped residency (the W3 gate stays green — the OOM
+it memorized was twin construction). (2) `kMatmulBTQuantGrouped` on
+kTENSTORRENT beside the W3 dense decode chains, consuming the existing
+stacked tower. (3) MTP `blk.64.*` skip/refuse by name. (4) 27B e2e greedy
+near-tie gate, checkpoint-gated opt-in loud-skip (#2811 precedent), goldens
+vs the pinned llama.cpp b10451 oracle, 500-mnat band + 0 forward-divergent.
+(5) `docs/USAGE.md` pin in the same change. Memory axis recorded: ~16 GiB
+word shadows + 2.37 GiB embedding twin + activations on 32 GB.
+
+**W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
+Quantized-domain integer vec_dot behind the same seam; profile-first
+attribution; recorded-only throughput floor. Sequenced after W4a, never
+bundled.
 
 ## Now
 
@@ -314,6 +340,6 @@ carried the Q5_K/Q6_K/Q8_0 decodes and the predicate widening before the
 capture leg and the e2e battery (see the falsification section).
 W3 EVIDENCE COMPLETE on the row branch (see `## Evidence`): capture dump x2
 byte-identity, staging counter 0, READY gate 16/16 PASS (11 strict / 5
-near-tie, 0 forward-divergent), backend proof 0 declines. Pending: fresh
-review, preflight, landing. W4 owed: the int8 lever, the 27B arm, and the
-residency reconciliation in `## Owed`.
+near-tie, 0 forward-divergent), backend proof 0 declines. W3 LANDED
+2026-09-06 (025c6ed90..f98b63867, #3028). W4 scope committed (see `## W4`,
+issues #3030, #3031); arm implementation not started.

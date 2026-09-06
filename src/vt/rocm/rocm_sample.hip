@@ -535,7 +535,11 @@ void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs,
     }
     RandomSampleSplitAK<<<static_cast<unsigned>(n * kBpr), kVocabBlock, 0, s>>>(
         part_score, part_idx, probs.Ptr<float>(), seeds.Ptr<int64_t>(), v, kBpr);
-    RandomSampleSplitBK<<<static_cast<unsigned>(n), kVocabBlock, 0, s>>>(
+    // Phase B reduces kBpr partials in shared arrays sized kSampleSplitBlocks,
+    // so it must launch exactly that many threads. Launching kVocabBlock here
+    // put 1024 threads on 128-entry arrays: sh_score[128] aliases sh_idx[0],
+    // which is the value written to out[row].
+    RandomSampleSplitBK<<<static_cast<unsigned>(n), kSampleSplitBlocks, 0, s>>>(
         token_ids.Ptr<int64_t>(), part_score, part_idx, kBpr);
     Check(hipGetLastError(), "random_sample launch (split)");
     return;

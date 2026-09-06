@@ -308,26 +308,39 @@ to make a failure pass.
 Two changes, two pull requests (developer decision 2026-09-06):
 
 **W4a — the 27B arm ([#3030](https://github.com/mudler/vllm.cpp/issues/3030)).**
-(1) Production residency flip: `MatmulBTQuantKernel` consumes the per-call
-on-core decode from the resident word shadow for {Q4_K,Q5_K,Q6_K,Q8_0}; the
-twin survives where the operand is **threshold-class**: weights above 128M
-elements keep the memoized bf16 twin (embedding gather, logits-head-class
-weights), because a per-call decode transient costs ~16 B/elem peak against
-the twin's 2 B/elem permanent, and a head runs every step so per-step unpack
-compute is wasted. Wave-1 falsified the blanket flip on the 0.8B vehicle:
-the head is TIED ([248320,1024] Q6_K, 254,274,560 elems) and its per-call
-decode re-materializes the 4,068,474,880 B `ttnn::where`. Red-first: the
-0.8B vehicle gate re-run under the flipped residency (the W3 gate stays
-green — the OOM it memorized was twin construction, and under the threshold
-it stays so for the head). (2) `kMatmulBTQuantGrouped` on
-kTENSTORRENT beside the W3 dense decode chains, consuming the existing
-stacked tower. (3) MTP `blk.64.*` skip/refuse by name. (4) 27B e2e greedy
+(1) RESIDENCY: the flip waves are CANCELLED 2026-09-06 — two falsifications.
+Wave-1's blanket flip OOM'd the vehicle at the tied head's per-call decode
+(4,068,474,880 B `ttnn::where`). Wave-1b's threshold flip (twin above 128M
+elements, shadow decode below) passed focused + suite (59/59, 6704/6704)
+but the vehicle capture demanded 425,754,624 B of trace region against the
+52,428,800 B allocated (TT_FATAL, mesh_trace.cpp:81) — a weight decoded per
+call persists as a bf16 tile inside the captured graph, and replay re-runs
+the decode every step, a throughput regression with no compensating win.
+The twin-for-all diagnostic re-ran the same gate 16/16 PASS 147/147 (11
+strict / 5 near-tie, max 0.188 nats, 0 forward-divergent), isolating the
+cause to the flipped weights. Rejected repairs: trace-region enlargement
+(~18 GB on 27B), capture-mode twins (words would feed only the eager arm —
+dead in production), persistent decode scratch (defeats the arithmetic),
+no-capture fallback (breaks the capture model). Production dense keep-quant
+matmuls KEEP the memoized twin (the landed W3 behavior). Packed-word
+residency pays off only where a kernel consumes the words natively: (2) the TT provider for `vt::MatmulBTQuantGrouped`
+(ops.cpp:220, weight[E*N,K], expert_ids[P]) ports the ROCm reference's
+native packed-word dequant (rocm_grouped_gemm.hip:1456, Q8_0/Q4_K/Q6_K —
+extend to Q5_K with the W3 chain; the 27B pin carries 48 Q5_K tensors).
+E=1 covers dense; E=N covers experts fed by the stacked tower
+(qwen3_5_gguf_weights.cpp:1282). Twins remain for gather-class operands
+(embedding; the vehicle's tied head shares the table). Capture
+compatibility of the grouped arm is wave-3's committed obligation. (3) MTP `blk.64.*` skip/refuse by name. (4) 27B e2e greedy
 near-tie gate, checkpoint-gated opt-in loud-skip (#2811 precedent), goldens
 vs the pinned llama.cpp b10451 oracle, 500-mnat band + 0 forward-divergent.
-(5) `docs/USAGE.md` pin in the same change. Memory axis recorded on 27B:
-~16 GiB word shadows (all four encodings; 210/34-byte blocks pad to 53/9
-words) + 2.37 GiB embedding twin + 2.37 GiB output-head twin (threshold-
-class) + activations on 32 GB; the expert tower stays packed.
+(5) `docs/USAGE.md` pin in the same change. Memory axis on 27B at steady
+state: 9.81 GiB experts packed + 6.01 GB non-expert packed (both through
+the native grouped kernel) + 2.37 GiB embedding twin + 2.37 GiB output
+twin ≈ 20.6 GB + activations on 32 GB. Interim (experts alone): non-expert
+twins 18.47 GB push the total to ~33 GB, so the 27B gate (wave-3) is
+reachable only behind the dense E=1 arm. The 0.8B vehicle carries no
+experts: its gate guards the dense twin path and must stay green
+throughout.
 
 **W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
 Quantized-domain integer vec_dot behind the same seam; profile-first
@@ -351,8 +364,12 @@ W3 EVIDENCE COMPLETE on the row branch (see `## Evidence`): capture dump x2
 byte-identity, staging counter 0, READY gate 16/16 PASS (11 strict / 5
 near-tie, 0 forward-divergent), backend proof 0 declines. W3 LANDED
 2026-09-06 (025c6ed90..f98b63867, #3028). W4 scope committed (see `## W4`,
-issues #3030, #3031). AMENDED 2026-09-06 (second): wave-1's blanket flip is
-falsified on the 0.8B vehicle — the tied Q6_K head's per-call decode
-re-materializes the 4 GB `ttnn::where` — so W4a(1) is threshold-class
-(twin above 128M elements, shadow decode below); wave-1b implements the
-threshold on top of wave-1's uncommitted red-first test, probes, and flip.
+issues #3030, #3031). AMENDED 2026-09-06 (third): the threshold flip's capture leg
+falsified the mechanism itself (trace region 425,754,624 B vs 52,428,800 B,
+mesh_trace.cpp:81; per-step decode compute at replay; the twin-for-all
+diagnostic ran the same gate 147/147 green). The flip waves are cancelled;
+the branch diff reverted; dense twins are the shipped behavior. W4a(1)
+re-anchors on the TT `kMatmulBTQuantGrouped` provider (wave-2: packed
+tower, native in-kernel dequant, E=1 dense + E=N experts, Q4_K/Q8_0 first,
+Q5_K extension owed, staged slice owed to wave-3 wiring and the 27B gate).
+The 128M threshold dissolves.

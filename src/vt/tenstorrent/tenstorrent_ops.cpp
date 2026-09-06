@@ -1945,11 +1945,18 @@ ttnn::Tensor Neg0CacheGet(const ttnn::Shape& shape, MeshDevice& device) {
   return it->second;
 }
 
-ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
-                                      int64_t rows, int64_t nb,
-                                      MeshDevice& device) {
-  const uint32_t B = static_cast<uint32_t>(rows * nb);
-  const ttnn::Tensor w = EnsureKeepQuantWords(packed, enc, rows, nb, device);
+// Decode `slice_rows` packed rows (nb blocks each) ALREADY staged as the
+// resident i32 word tensor w ([slice_rows*nb, wpb]) into the repaired f32
+// {slice_rows, nb*elems} in ROW_MAJOR — the W3 chains, one encoding each, run
+// on a word RANGE instead of a whole packed tensor. DecodeKeepQuantBlocksF32
+// below is the whole-tensor form; the grouped keep-quant matmul
+// (MatmulBTQuantGroupedKernel) slices the tower's words to the P selected
+// [N,K] row-ranges per call and runs THIS. Same chain, same numerics, so the
+// W1/W3 bit-exact pins carry over unchanged.
+ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
+                                     int64_t slice_rows, int64_t nb,
+                                     MeshDevice& device) {
+  const uint32_t B = static_cast<uint32_t>(slice_rows * nb);
 
   // f16 bit pattern (held in INT32) -> f32 value, the integer chain of
   auto f16_bits_to_f32 = [](ttnn::Tensor t) {
@@ -2181,7 +2188,7 @@ ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
           neg0_full(ttnn::Shape({B, 8u, 32u})));
       return ttnn::reshape(
           std::move(y),
-          ttnn::Shape({static_cast<uint32_t>(rows),
+          ttnn::Shape({static_cast<uint32_t>(slice_rows),
                        static_cast<uint32_t>(nb) * 256u}));
     }
     case DType::kQ6_K: {
@@ -2294,7 +2301,7 @@ ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
                     neg0_full(ttnn::Shape({B, 16u, 16u})));
       return ttnn::reshape(
           prod,
-          ttnn::Shape({static_cast<uint32_t>(rows),
+          ttnn::Shape({static_cast<uint32_t>(slice_rows),
                        static_cast<uint32_t>(nb) * 256u}));
     }
     case DType::kQ8_0: {
@@ -2324,7 +2331,7 @@ ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
                     neg0_full(ttnn::Shape({B, 32u})));
       return ttnn::reshape(
           prod,
-          ttnn::Shape({static_cast<uint32_t>(rows),
+          ttnn::Shape({static_cast<uint32_t>(slice_rows),
                        static_cast<uint32_t>(nb) * 32u}));
     }
     default:
@@ -2332,6 +2339,15 @@ ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
       VT_CHECK(false, "tenstorrent keep-quant decode: unsupported encoding");
       return w;
   }
+}
+
+// The whole-tensor form: stage the packed [rows, nb] tensor once (EnsureKeepQuantWords)
+// and run the chains on all of it — the W1/W3 keep-quant decode entry.
+ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
+                                      int64_t rows, int64_t nb,
+                                      MeshDevice& device) {
+  const ttnn::Tensor w = EnsureKeepQuantWords(packed, enc, rows, nb, device);
+  return DecodeKeepQuantWordsF32(w, enc, rows, nb, device);
 }
 
 void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
@@ -2496,6 +2512,165 @@ void MatmulBTQuantKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) 
   ttnn::Tensor dev_c = ttnn::operations::matmul::matmul(
       dev_a, w_bf16, /*transpose_a=*/false, /*transpose_b=*/true);
   CommitDevice2D(out, std::move(dev_c));
+}
+
+// kMatmulBTQuantGrouped (KEEPQUANT W4a wave-2, #3030): out[P,N], act[Pa,K]
+// (Pa==1 broadcast), weight[E*N,K] PACKED block-quant, expert_ids[P] i32 —
+// the expert-batched analog of MatmulBTQuantKernel above, mirroring the ROCm
+// reference's native packed-weight grouped GEMM
+// (rocm_grouped_gemm.hip MatmulBTQuantGroupedKernelRocm). The tower sits on
+// device in its i32 WORD form (EnsureKeepQuantWords — the PACKED residency,
+// never a bf16 twin), and each call decodes ONLY the P selected [N,K]
+// row-slices (per group p: word rows [e*N*nb, (e+1)*N*nb)) through the
+// bit-exact W3 chain on the slice (DecodeKeepQuantWordsF32), rounds the
+// decoded weight ONCE to bf16 (the device's round-once convention), and runs
+// the kMatmulBT tile matmul per group — the CPU provider's per-group
+// structure (cpu_quant_gemm.cpp, the comparison oracle) with the decode
+// on-core. The whole tower is NEVER decoded; no twin is built.
+//
+// REGISTERED SET: exactly {Q4_K, Q8_0} on kTENSTORRENT. Q5_K/Q6_K refuse BY
+// NAME (the owed grouped extension — the 27B pin carries 48 Q5_K tensors;
+// recorded under the spec's W4 plan); any other encoding refuses the same
+// way. Never a silent wrong answer — the ROCm refusal precedent.
+//
+// NOT capture-safe yet, and staged UNREACHED: the per-call EnsureHost of the
+// routing ids and the per-group decode writes are eager-path constructs;
+// capture compatibility of the grouped arm is wave-3's committed obligation,
+// and no production entry point reaches this kernel yet (the wiring row is
+// W4a wave-3, dense E=1 + the 27B gate).
+void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
+                                const Tensor& weight,
+                                const Tensor& expert_ids) {
+  TT_OP_TRACE("MatmulBTQuantGrouped");
+  VT_CHECK(act.rank == 2 && weight.rank == 2 && out.rank == 2,
+           "tenstorrent kMatmulBTQuantGrouped: rank-2 act/weight/out required");
+  const DType enc = weight.dtype;
+  // vt::Name() emits the lowercase storage name ("q4_0"); the refusal must
+  // name the ENUM the caller passed, so the k-prefix and capital go on here
+  // (the MatmulBTQuantKernel convention).
+  const std::string enc_lower = Name(enc);
+  const std::string enc_name =
+      std::string("k") + static_cast<char>(enc_lower[0] - 'a' + 'A') +
+      enc_lower.substr(1);
+  VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ8_0,
+           std::string("tenstorrent kMatmulBTQuantGrouped: ") + enc_name +
+               " has no GROUPED keep-quant decode on TENSTORRENT; the "
+               "registered set is kQ4_K/kQ8_0 (BACKEND-TENSTORRENT-"
+               "KEEPQUANT W4a; the Q5_K/Q6_K grouped extension is owed)");
+  const int64_t elems = BlockElems(enc);
+  VT_CHECK(weight.shape[1] % elems == 0,
+           std::string("tenstorrent kMatmulBTQuantGrouped: K must be a whole "
+                       "number of ") +
+               Name(enc) + " blocks (" + std::to_string(elems) + " elems)");
+  VT_CHECK(IsFloatDType(act.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMatmulBTQuantGrouped: float activation, f32/bf16 out");
+  VT_CHECK(act.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kMatmulBTQuantGrouped: strided tensors are not "
+           "supported in W4a wave-2");
+  const int64_t P = out.shape[0];
+  const int64_t N = out.shape[1];
+  const int64_t K = act.shape[1];
+  const int64_t Pa = act.shape[0];
+  VT_CHECK(Pa == P || Pa == 1,
+           "tenstorrent kMatmulBTQuantGrouped: act rows must be P (per-expert) "
+           "or 1 (broadcast)");
+  VT_CHECK(weight.shape[1] == K,
+           "tenstorrent kMatmulBTQuantGrouped: act/weight inner dim mismatch");
+  VT_CHECK(weight.shape[0] % N == 0,
+           "tenstorrent kMatmulBTQuantGrouped: weight rows must be a whole "
+           "multiple of N");
+  VT_CHECK(out.shape[0] == P && out.shape[1] == N,
+           "tenstorrent kMatmulBTQuantGrouped: out shape mismatch");
+  const int64_t E = weight.shape[0] / N;
+  const int64_t nb = K / elems;
+  if (P == 0 || N == 0) return;
+
+  MeshDevice& device = SharedMeshDevice();
+  // The routing ids are small; the established TT index-tensor contract is
+  // EnsureHost + a host read (EmbeddingKernel), range-checked like the
+  // embedding gather.
+  EnsureHost(expert_ids);
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  for (int64_t p = 0; p < P; ++p)
+    VT_CHECK(eids[p] >= 0 && eids[p] < E,
+             "tenstorrent kMatmulBTQuantGrouped: expert id out of range (id " +
+                 std::to_string(eids[p]) + ", E " + std::to_string(E) + ")");
+
+  // Stage the PACKED tower once — the resident i32 word shadow keyed by the
+  // host weight pointer, served forever after (the dense arm's pattern). The
+  // per-call decode reads word ROW-RANGES of it; a capture-time miss refuses
+  // inside EnsureKeepQuantWords, as on the dense arm.
+  const ttnn::Tensor words = EnsureKeepQuantWords(weight, enc, E * N, nb, device);
+
+  // Activation: the MatmulBTQuantKernel convention — one device-side bf16
+  // round of an f32 master, TILE layout, shared by every group. Pa > 1 takes
+  // the per-group row view from the ROW_MAJOR form (the proven slice domain);
+  // Pa == 1 IS the single row.
+  ttnn::Tensor dev_a = EnsureDevice2D(act, device);
+  if (act.dtype == DType::kF32)
+    dev_a = ttnn::to_layout(
+        ttnn::typecast(std::move(dev_a), ttnn::DataType::BFLOAT16),
+        ttnn::Layout::TILE);
+  ttnn::Tensor a_rows;
+  if (Pa > 1)
+    a_rows = ttnn::to_layout(std::move(dev_a), ttnn::Layout::ROW_MAJOR);
+
+  const uint32_t wpb = static_cast<uint32_t>(KeepQuantWordsPerBlock(enc));
+  // The selected [N,K] slice for group p: word rows [e*N*nb, (e+1)*N*nb) —
+  // decode, one bf16 RNE, TILE — the dense dot's exact weight convention.
+  auto slice_decode = [&](int64_t p) {
+    const int64_t w0 = eids[p] * N * nb;
+    ttnn::Tensor sl = ttnn::slice(
+        words, ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(w0), 0u},
+        ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(w0 + N * nb), wpb},
+        ttsl::SmallVector<uint32_t>{1u, 1u});
+    ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, N, nb, device);
+    return ttnn::to_layout(
+        ttnn::typecast(std::move(wf), ttnn::DataType::BFLOAT16),
+        ttnn::Layout::TILE);
+  };
+
+  std::vector<ttnn::Tensor> outs;
+  outs.reserve(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p) {
+    ttnn::Tensor a_p;
+    if (Pa == 1) {
+      a_p = dev_a;
+    } else {
+      a_p = ttnn::to_layout(
+          ttnn::slice(a_rows,
+                      ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(p), 0u},
+                      ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(p + 1),
+                                                  static_cast<uint32_t>(K)},
+                      ttsl::SmallVector<uint32_t>{1u, 1u}),
+          ttnn::Layout::TILE);
+    }
+    outs.push_back(ttnn::operations::matmul::matmul(
+        std::move(a_p), slice_decode(p), /*transpose_a=*/false,
+        /*transpose_b=*/true));
+  }
+  // Assemble [P,N] and commit ONCE (the slot is per host pointer, so the
+  // commit must be a single whole-output store). The tile matmul output is
+  // bf16, committed as the dense arm commits it; the P > 1 assembly goes
+  // through ROW_MAJOR f32 (the chains' commit form) and lands out.dtype.
+  ttnn::Tensor assembled;
+  if (P == 1) {
+    assembled = std::move(outs[0]);
+  } else {
+    std::vector<ttnn::Tensor> rows_f;
+    rows_f.reserve(outs.size());
+    for (auto& t : outs)
+      rows_f.push_back(ttnn::to_layout(
+          ttnn::typecast(std::move(t), ttnn::DataType::FLOAT32),
+          ttnn::Layout::ROW_MAJOR));
+    assembled = ttnn::concat(std::move(rows_f), /*dim=*/0);
+    if (out.dtype == DType::kBF16)
+      assembled =
+          ttnn::typecast(std::move(assembled), ttnn::DataType::BFLOAT16);
+  }
+  CommitDeviceLogical2D(out, std::move(assembled), static_cast<uint32_t>(P),
+                        static_cast<uint32_t>(N));
 }
 
 // Upload a rank-1 affine vector as TILE BFLOAT16 [1, d], caching on the weight's
@@ -7213,6 +7388,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<KeepQuantDecodeFn>(&KeepQuantDecodeKernel)));
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernel)));
+    RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<MatmulBTQuantGroupedFn>(
+                   &MatmulBTQuantGroupedKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kTENSTORRENT,

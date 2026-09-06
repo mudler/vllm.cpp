@@ -5754,3 +5754,381 @@ TEST_CASE("kTENSTORRENT keep-quant decode stages zero words during capture") {
     backend.Free(mem_out);
   }
 }
+
+// KEEPQUANT W4a wave-2 (#3030): the GROUPED keep-quant GEMM on the P150 —
+// vt::MatmulBTQuantGrouped (ops.cpp:220) with the packed [E*N,K] tower resident
+// in its i32 word form, the P selected [N,K] row-slices decoded on-core per
+// call (the W3 chains on a word slice), and the kMatmulBT tile matmul per
+// group. No bf16 twin, never a full-tower decode. This case is the ROUTING
+// leg, red-first: before the provider was registered the first REQUIRE reded,
+// and the seam refused through GetOp's no-provider path ("no kernel for op
+// MatmulBTQuantGrouped ... on device TENSTORRENT") — never a silent wrong
+// answer. The registered encoding set is EXACTLY {Q4_K, Q8_0}: Q5_K and Q6_K
+// must refuse BY NAME (the owed grouped extension, recorded in the spec's W4
+// plan), so a wrongly-widened kernel reds the refusal legs below.
+TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q8_0} and refuses the rest") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped,
+                           vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  // One Q4_K block per row: K = 256. The block generator is the W3 one:
+  // d/dmin are finite f16 (random f16 bits go NaN and the device's
+  // NaN-payload canonicalization would mask a real defect as a decode
+  // failure), payload bytes are random.
+  auto fill_block = [](uint8_t* blk, vt::DType enc, std::mt19937& rng) {
+    auto put_f16 = [&](int64_t off, float v) {
+      const uint16_t bits = vt::F32ToF16(v);
+      std::memcpy(blk + off, &bits, sizeof(bits));
+    };
+    if (enc == vt::DType::kQ8_0) {
+      put_f16(0, 0.1f + 0.2f * static_cast<float>(rng() % 16) / 16.0f);
+      for (int i = 2; i < 34; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    } else {  // Q4_K
+      put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+      put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+      for (int i = 4; i < 144; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    }
+  };
+
+  // THE ADMITTED ARMS: one call each, E=2 tower, both encodings. Only
+  // reachability is pinned here — the numerics have their own sweep below.
+  for (const vt::DType enc : {vt::DType::kQ4_K, vt::DType::kQ8_0}) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    constexpr int64_t kE = 2, kN = 8, kP = 3;
+    const int64_t k = 1 * kBlockElems;
+    std::mt19937 rng(20260910u);
+    std::vector<uint8_t> packed(kE * kN * (k / kBlockElems) * kBlockBytes);
+    for (size_t b = 0; b < packed.size() / kBlockBytes; ++b)
+      fill_block(packed.data() + b * kBlockBytes, enc, rng);
+    std::vector<uint16_t> a_bf(kP * k);
+    for (auto& v : a_bf) v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+    std::vector<int32_t> ids(kP);
+    for (auto& e : ids) e = static_cast<int32_t>(rng() % kE);
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_w = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(kP * kN * sizeof(float));
+    void* mem_i = backend.Alloc(ids.size() * sizeof(int32_t));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_w, packed.data(), packed.size());
+    backend.Copy(q, mem_i, ids.data(), ids.size() * sizeof(int32_t));
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, k});
+    Tensor w_t = Tensor::Contiguous(mem_w, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kE * kN, k});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, kN});
+    Tensor i_t = Tensor::Contiguous(mem_i, vt::DType::kI32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP});
+    bool threw = false;
+    std::string what;
+    try {
+      vt::MatmulBTQuantGrouped(q, o_t, a_t, w_t, i_t);
+    } catch (const std::exception& e) {
+      threw = true;
+      what = e.what();
+    }
+    backend.Free(mem_a);
+    backend.Free(mem_w);
+    backend.Free(mem_o);
+    backend.Free(mem_i);
+    const std::string enc_ok = vt::Name(enc);
+    CHECK_MESSAGE(!threw, "the registered encoding ", enc_ok,
+                  " must answer on the TENSTORRENT grouped arm, threw: ", what);
+  }
+
+  // THE REFUSE SIDE: Q5_K / Q6_K (the owed grouped extension) and kQ4_0 (no
+  // TT arm anywhere) must throw naming THEMSELVES and the registered set —
+  // never fall through to a misread, never silently widen.
+  for (const vt::DType enc : {vt::DType::kQ5_K, vt::DType::kQ6_K,
+                              vt::DType::kQ4_0}) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    constexpr int64_t kE = 2, kN = 8, kP = 3;
+    const int64_t k = 1 * kBlockElems;
+    std::vector<uint8_t> packed(kE * kN * (k / kBlockElems) * kBlockBytes, 0u);
+    std::vector<uint16_t> a_bf(kP * k, 0u);
+    std::vector<int32_t> ids(kP, 0);
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_w = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(kP * kN * sizeof(float));
+    void* mem_i = backend.Alloc(ids.size() * sizeof(int32_t));
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, k});
+    Tensor w_t = Tensor::Contiguous(mem_w, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kE * kN, k});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, kN});
+    Tensor i_t = Tensor::Contiguous(mem_i, vt::DType::kI32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP});
+    bool threw = false;
+    std::string what;
+    try {
+      vt::MatmulBTQuantGrouped(q, o_t, a_t, w_t, i_t);
+    } catch (const std::exception& e) {
+      threw = true;
+      what = e.what();
+    }
+    backend.Free(mem_a);
+    backend.Free(mem_w);
+    backend.Free(mem_o);
+    backend.Free(mem_i);
+    CHECK_MESSAGE(threw, "unregistered encoding ", static_cast<int>(enc),
+                  " must refuse on the TENSTORRENT grouped arm, not misread");
+    const std::string enc_lower = vt::Name(enc);
+    const std::string enc_name = std::string("k") +
+        static_cast<char>(enc_lower[0] - 'a' + 'A') + enc_lower.substr(1);
+    CHECK_MESSAGE(what.find(enc_name) != std::string::npos,
+                  "the refusal must name the encoding (", enc_name,
+                  "), got: ", what);
+    CHECK_MESSAGE(what.find("kQ4_K/kQ8_0") != std::string::npos,
+                  "the refusal must name the registered set, got: ", what);
+  }
+}
+
+// THE NUMERICS LEG (W4a wave-2, red-first): the grouped op against the CPU
+// grouped provider (cpu_quant_gemm.cpp MatmulBTQuantGroupedKernel — the SAME
+// kMatmulBTQuant integer-dot core once per group) across shapes sweeping P, N,
+// K, E: the E=1 dense arm (ids all zero), the E=N expert tower arm, P=1, a
+// broadcast activation ([1,K]), a non-tile-multiple N, both registered
+// encodings, and a 27B-mirroring slice (K = the Qwen3.8-27B hidden_size,
+// N a production-like per-group intermediate). The bar is the W2-ratified
+// analytic operand-rounding envelope — bf16-round-once both operands, f32
+// ascending-k accumulate, bound = 1.05 * 2^-8 * (mag + |acc|) — unchanged
+// from the dense W2/W3 pin; the reported bound ratios are the wave evidence.
+// Decode bit-exactness on the SLICE path is pinned separately below: a Q8_0
+// tower with power-of-two scales and one-hot activations makes every dot term
+// exact, so the grouped output must be BIT-EQUAL to the dequantized weight
+// element the slice selection picked.
+TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped matches the CPU grouped provider inside the ratified envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped,
+                           vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  vt::Queue qcpu{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+  auto fill_block = [](uint8_t* blk, vt::DType enc, std::mt19937& rng) {
+    auto put_f16 = [&](int64_t off, float v) {
+      const uint16_t bits = vt::F32ToF16(v);
+      std::memcpy(blk + off, &bits, sizeof(bits));
+    };
+    if (enc == vt::DType::kQ8_0) {
+      put_f16(0, 0.1f + 0.2f * static_cast<float>(rng() % 16) / 16.0f);
+      for (int i = 2; i < 34; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    } else {  // Q4_K
+      put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+      put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+      for (int i = 4; i < 144; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    }
+  };
+
+  struct Shape {
+    int64_t p, n, k_blocks, e, act_rows;
+    vt::DType enc;
+    const char* note;
+  };
+  const Shape shapes[] = {
+      {3, 8, 1, 1, -1, vt::DType::kQ4_K, "E=1 dense arm, ids all zero"},
+      {4, 8, 2, 4, -1, vt::DType::kQ4_K, "E=N expert tower arm, permuted ids"},
+      {1, 16, 1, 2, -1, vt::DType::kQ4_K, "P=1"},
+      {4, 33, 1, 4, 1, vt::DType::kQ4_K, "broadcast [1,K] act, non-tile N=33"},
+      {3, 8, 2, 2, -1, vt::DType::kQ8_0, "Q8_0 tower arm"},
+      {4, 33, 1, 4, -1, vt::DType::kQ8_0, "Q8_0, non-tile N=33"},
+      {2, 1024, 20, 1, -1, vt::DType::kQ4_K,
+       "27B mirror: K=5120 (Qwen3.8-27B hidden_size), N=1024 per-group slice"},
+  };
+  for (const Shape& s : shapes) {
+    const int64_t kBlockBytes = vt::BlockBytes(s.enc);
+    const int64_t kBlockElems = vt::BlockElems(s.enc);
+    const int64_t P = s.p, N = s.n, K = s.k_blocks * kBlockElems, E = s.e;
+    const int64_t Pa = s.act_rows == -1 ? P : s.act_rows;
+    const int64_t nb = K / kBlockElems;
+    std::mt19937 rng(static_cast<uint32_t>(20260911u + P * 7 + N * 13 + E * 3));
+
+    std::vector<uint8_t> packed(E * N * nb * kBlockBytes);
+    for (size_t b = 0; b < packed.size() / kBlockBytes; ++b)
+      fill_block(packed.data() + b * kBlockBytes, s.enc, rng);
+    std::vector<float> a_f32(Pa * K);
+    for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+    std::vector<uint16_t> a_bf(a_f32.size());
+    for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+    std::vector<int32_t> ids(P);
+    for (auto& e : ids) e = static_cast<int32_t>(rng() % E);
+    if (E == 1) std::fill(ids.begin(), ids.end(), 0);
+
+    // ---- the CPU grouped provider on the IDENTICAL bytes ----
+    std::vector<float> cpu_out(P * N, 0.0f);
+    {
+      Tensor at = Tensor::Contiguous(a_bf.data(), vt::DType::kBF16, qcpu.device, {Pa, K});
+      Tensor ot = Tensor::Contiguous(cpu_out.data(), vt::DType::kF32, qcpu.device, {P, N});
+      Tensor it = Tensor::Contiguous(ids.data(), vt::DType::kI32, qcpu.device, {P});
+      Tensor wt = Tensor::Contiguous(packed.data(), vt::DType::kF32, qcpu.device, {E * N, K});
+      wt.dtype = s.enc;  // block dtype: elementwise strides are inert
+      vt::MatmulBTQuantGrouped(qcpu, ot, at, wt, it);
+    }
+
+    // ---- the analytic bf16-operand reference + the W2 bound ----
+    std::vector<float> w_f32(E * N * K);
+    vt::cpu::BlockToFloat(s.enc)(packed.data(), w_f32.data(), E * N * K);
+    std::vector<uint16_t> w_bf(w_f32.size());
+    for (size_t i = 0; i < w_f32.size(); ++i) w_bf[i] = vt::F32ToBF16(w_f32[i]);
+    std::vector<float> ref(P * N), bound(P * N);
+    for (int64_t p = 0; p < P; ++p) {
+      const int64_t e = ids[p];
+      const int64_t pa = Pa == 1 ? 0 : p;
+      for (int64_t n = 0; n < N; ++n) {
+        float acc = 0.0f, mag = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+          const float prod = widen(a_bf[pa * K + k]) *
+                             widen(w_bf[(e * N + n) * K + k]);
+          acc += prod;
+          mag += std::fabs(prod);
+        }
+        ref[p * N + n] = acc;
+        bound[p * N + n] = 1.05f * std::ldexp(1.0f, -8) * (mag + std::fabs(acc));
+      }
+    }
+
+    // ---- the device grouped call ----
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_w = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(P * N * sizeof(float));
+    void* mem_i = backend.Alloc(ids.size() * sizeof(int32_t));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_w, packed.data(), packed.size());
+    backend.Copy(q, mem_i, ids.data(), ids.size() * sizeof(int32_t));
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {Pa, K});
+    Tensor w_t = Tensor::Contiguous(mem_w, s.enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {E * N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {P, N});
+    Tensor i_t = Tensor::Contiguous(mem_i, vt::DType::kI32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {P});
+    vt::MatmulBTQuantGrouped(q, o_t, a_t, w_t, i_t);
+    std::vector<float> tt_out(P * N, 0.0f);
+    backend.Copy(q, tt_out.data(), mem_o, tt_out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_w);
+    backend.Free(mem_o);
+    backend.Free(mem_i);
+
+    float worst_cpu = 0.0f, worst_ref = 0.0f;
+    for (int64_t i = 0; i < P * N; ++i) {
+      const float d_cpu = std::fabs(tt_out[i] - cpu_out[i]);
+      const float d_ref = std::fabs(tt_out[i] - ref[i]);
+      worst_cpu = std::max(worst_cpu, d_cpu / bound[i]);
+      worst_ref = std::max(worst_ref, d_ref / bound[i]);
+      CHECK(std::isfinite(tt_out[i]));
+      CHECK_MESSAGE(d_cpu <= bound[i],
+                    "P=" << P << " N=" << N << " K=" << K << " E=" << E
+                         << " enc=" << static_cast<int>(s.enc) << " i=" << i
+                         << " tt=" << tt_out[i] << " cpu=" << cpu_out[i]
+                         << " bound=" << bound[i]);
+      CHECK_MESSAGE(d_ref <= bound[i],
+                    "P=" << P << " N=" << N << " K=" << K << " E=" << E
+                         << " enc=" << static_cast<int>(s.enc) << " i=" << i
+                         << " tt=" << tt_out[i] << " ref=" << ref[i]
+                         << " bound=" << bound[i]);
+    }
+    MESSAGE("grouped P=", P, " N=", N, " K=", K, " E=", E, " Pa=", Pa,
+            " enc=", static_cast<int>(s.enc), " (", s.note,
+            "): worst bound-ratio vs cpu=", worst_cpu,
+            " vs analytic-bf16-ref=", worst_ref);
+  }
+
+  // ---- THE SLICE-DECODE BIT-EXACT LEG ----
+  // Q8_0, d = +2^-6, qs = full int8: every dequantized element qs*2^-6 is
+  // exactly representable in bf16, so the on-core decode -> one bf16 RNE ->
+  // tile matmul (bf16 output) chain is LOSSLESS for one-hot activations, and
+  // the grouped output must be BIT-EQUAL to the dequant of the row-slice the
+  // routing picked — any slice-selection defect (wrong expert row-range,
+  // whole-tower misindex, bf16-twin aliasing) lands on a DIFFERENT grid value
+  // and cannot hide. The CPU grouped provider is NOT the bit oracle here: its
+  // dot is the INTEGER-dot core (the activation is quantized to q8 on the CPU
+  // side), so TT-vs-CPU agreement is the envelope's job — the sweep above.
+  {
+    constexpr int64_t kE = 3, kN = 8, kP = 5, kNb = 2;
+    const int64_t K = kNb * 32;
+    const uint16_t d_bits = vt::F32ToF16(std::ldexp(1.0f, -6));
+    std::mt19937 rng(20260912u);
+    std::vector<uint8_t> packed(kE * kN * kNb * 34);
+    std::vector<int8_t> qs(kE * kN * kNb * 32);
+    for (int64_t b = 0; b < kE * kN * kNb; ++b) {
+      uint8_t* blk = packed.data() + b * 34;
+      std::memcpy(blk, &d_bits, sizeof(d_bits));
+      for (int i = 0; i < 32; ++i) {
+        const int8_t q = static_cast<int8_t>(rng() % 255 - 127);  // [-127,127]
+        blk[2 + i] = static_cast<uint8_t>(q);
+        qs[b * 32 + i] = q;
+      }
+    }
+    // One-hot activations: row p selects column (p % K); the group may repeat
+    // (two rows route to the same expert) and the ids are NOT ascending, so
+    // every selected slice is exercised independently.
+    std::vector<uint16_t> a_bf(kP * K, 0u);
+    for (int64_t p = 0; p < kP; ++p) a_bf[p * K + (p % K)] = vt::F32ToBF16(1.0f);
+    std::vector<int32_t> ids = {2, 0, 2, 1, 0};
+
+    // The true dequant of the selected slice: out[p,n] = w_dec[ids[p], n,
+    // p%K]. Block b's qs live at qs[b*32 + i]; bf16(w_dec) == w_dec exactly,
+    // and the device commits the bf16 matmul output widened to f32, so the
+    // comparison is memcmp over the widened bits.
+    std::vector<float> dequant(kP * kN);
+    for (int64_t p = 0; p < kP; ++p)
+      for (int64_t n = 0; n < kN; ++n) {
+        const int64_t c = p % K;
+        const int64_t b = (ids[p] * kN + n) * kNb + c / 32;
+        dequant[p * kN + n] =
+            static_cast<float>(qs[b * 32 + c % 32]) * std::ldexp(1.0f, -6);
+      }
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_w = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(kP * kN * sizeof(float));
+    void* mem_i = backend.Alloc(ids.size() * sizeof(int32_t));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_w, packed.data(), packed.size());
+    backend.Copy(q, mem_i, ids.data(), ids.size() * sizeof(int32_t));
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, K});
+    Tensor w_t = Tensor::Contiguous(mem_w, vt::DType::kQ8_0,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kE * kN, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, kN});
+    Tensor i_t = Tensor::Contiguous(mem_i, vt::DType::kI32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP});
+    vt::MatmulBTQuantGrouped(q, o_t, a_t, w_t, i_t);
+    std::vector<float> tt_out(kP * kN, 0.0f);
+    backend.Copy(q, tt_out.data(), mem_o, tt_out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_w);
+    backend.Free(mem_o);
+    backend.Free(mem_i);
+    for (int64_t i = 0; i < kP * kN; ++i) {
+      const uint16_t got_bf = vt::F32ToBF16(tt_out[i]);
+      const uint16_t want_bf = vt::F32ToBF16(dequant[i]);
+      CHECK_MESSAGE(got_bf == want_bf,
+                    "slice-decode bit-exact: p=" << i / kN << " n=" << i % kN
+                                                 << " tt=" << tt_out[i]
+                                                 << " dequant=" << dequant[i]);
+    }
+  }
+}

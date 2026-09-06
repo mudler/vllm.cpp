@@ -1409,6 +1409,27 @@ the guard it allocates a few megabytes and fails on the message. A test whose
 only failure mode is `bad_alloc` is a crash, not a gate. Every test run in this
 repair was made under `ulimit -v 6000000`.
 
+**Five of the seven geometry bounds were held by no test, and the W3A evidence
+did not distinguish the code from the gate.** SUPERSEDES the counts below and
+`750cc6626`'s account of the geometry guard. `DeepSeekV4ClipMmprojVisionConfig`
+calls `RequireGeometry` on seven `clip.vision.*` fields, and only `block_count`
+and `embedding_length` had a case. A fresh review deleted the bounds on
+`head_count`, `feed_forward_length`, `projection_dim`, `projector.scale_factor`
+and `patch_size` and the suite stayed green; reproduced here by deleting all five
+at once, which left 18 cases and 2198 assertions passing. Two of the five are
+worse than a tower that runs and is wrong: `projector.scale_factor` at 0 divides
+by zero in `aligned_rows`, and `head_count` at 0 divides by zero in `head_dim`.
+
+Each of the five now has a case at both ends -- 0, which is absent-in-effect, and
+`1 << 21`, which is above `kMaxGeometry` -- and each bound is held individually.
+Deleting any ONE of the five reds 4 assertions in
+`every clip.* geometry key is bounded BY NAME`; the file was restored and
+verified against `ee7b510e6a9eea39a57d8dcab95a7cadfac10eba4e069ae55f07b26acc0feed6`
+after each. The `Options` override moved from one field per key to a map keyed by
+the key itself, so the seventh field and any future one costs a map entry rather
+than a struct field. `test_deepseek_v4_mmproj` now reports 19 cases and 2218
+assertions.
+
 **After.** `test_deepseek_v4_mmproj` reports 18 cases and 2198 assertions, up
 from 13 and 999. `test_clip_mmproj_gguf` reports 9 cases and 272 assertions,
 unchanged, because the Qwen3-VL arm is deliberately untouched. `ctest

@@ -60,6 +60,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -200,12 +201,23 @@ struct Options {
   // transpose of the same element count. Nothing about the numel changes, so
   // only the reader's shape guard can catch it.
   std::string transpose_tensor;
-  // Replace the `clip.vision.block_count` kv with these raw bytes, so a case
-  // can hand the reader a geometry no `U32Kv` can spell.
-  std::string block_count_kv;
-  // The same, for `clip.vision.embedding_length`.
-  std::string embedding_length_kv;
+  // Replace one `clip.vision.*` geometry kv with these raw bytes, keyed by the
+  // key itself, so a case can hand the reader a geometry no `U32Kv` can spell.
+  // Keyed rather than one field per key: the reader bounds SEVEN of these and
+  // every one of them is a `Require` shape, a loop bound or a `resize` argument.
+  std::map<std::string, std::string> geometry_kv;
 };
+
+// The declared geometry for `key`, or the case's own raw override for it.
+void AddGeometry(gguf_test::GgufModelBuilder& b, const Options& o,
+                 const char* key, int64_t declared) {
+  const auto it = o.geometry_kv.find(key);
+  if (it != o.geometry_kv.end()) {
+    b.AddKv(it->second);
+    return;
+  }
+  b.AddKv(gguf_test::U32Kv(key, static_cast<uint32_t>(declared)));
+}
 
 // The builder has no signed-integer kv encoder and it is shared with every
 // other GGUF test, so this one stays local: GGUF type 5 is i32.
@@ -223,21 +235,13 @@ std::string Build(const Dims& d, const Options& o = Options{}) {
     b.AddKv(gguf_test::StrKv("general.type", o.general_type));
   if (!o.projector_type.empty())
     b.AddKv(gguf_test::StrKv("clip.projector_type", o.projector_type));
-  if (o.embedding_length_kv.empty()) {
-    b.AddKv(gguf_test::U32Kv("clip.vision.embedding_length", static_cast<uint32_t>(d.hidden)));
-  } else {
-    b.AddKv(o.embedding_length_kv);
-  }
-  b.AddKv(gguf_test::U32Kv("clip.vision.feed_forward_length", static_cast<uint32_t>(d.inter)));
-  if (o.block_count_kv.empty()) {
-    b.AddKv(gguf_test::U32Kv("clip.vision.block_count", static_cast<uint32_t>(d.depth)));
-  } else {
-    b.AddKv(o.block_count_kv);
-  }
-  b.AddKv(gguf_test::U32Kv("clip.vision.projection_dim", static_cast<uint32_t>(d.output)));
-  b.AddKv(gguf_test::U32Kv("clip.vision.attention.head_count", static_cast<uint32_t>(d.heads)));
-  b.AddKv(gguf_test::U32Kv("clip.vision.patch_size", static_cast<uint32_t>(d.patch)));
-  b.AddKv(gguf_test::U32Kv("clip.vision.projector.scale_factor", static_cast<uint32_t>(d.ratio)));
+  AddGeometry(b, o, "clip.vision.embedding_length", d.hidden);
+  AddGeometry(b, o, "clip.vision.feed_forward_length", d.inter);
+  AddGeometry(b, o, "clip.vision.block_count", d.depth);
+  AddGeometry(b, o, "clip.vision.projection_dim", d.output);
+  AddGeometry(b, o, "clip.vision.attention.head_count", d.heads);
+  AddGeometry(b, o, "clip.vision.patch_size", d.patch);
+  AddGeometry(b, o, "clip.vision.projector.scale_factor", d.ratio);
   b.AddKv(gguf_test::F32Kv("clip.vision.attention.layer_norm_epsilon", d.eps));
   if (o.emit_use_silu) b.AddKv(gguf_test::BoolKv("clip.use_silu", o.use_silu));
 
@@ -726,13 +730,15 @@ TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
   // down.
   const Dims d;
   Options negative;
-  negative.block_count_kv = I32Kv("clip.vision.block_count", -1);
+  negative.geometry_kv["clip.vision.block_count"] =
+      I32Kv("clip.vision.block_count", -1);
   const std::string neg = ThrownBy(Build(d, negative), /*load_weights=*/false);
   CHECK(Contains(neg, "clip.vision.block_count"));
   CHECK(Contains(neg, "-1"));
 
   Options huge;
-  huge.block_count_kv = gguf_test::U32Kv("clip.vision.block_count", 4096U);
+  huge.geometry_kv["clip.vision.block_count"] =
+      gguf_test::U32Kv("clip.vision.block_count", 4096U);
   const std::string big = ThrownBy(Build(d, huge), /*load_weights=*/false);
   CHECK(Contains(big, "clip.vision.block_count"));
   CHECK(Contains(big, "4096"));
@@ -741,10 +747,56 @@ TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
   // consequence: a zero `embedding_length` makes every `Require` shape `[0, 0]`
   // and a tower of empty matrices runs and is wrong.
   Options zero_embd;
-  zero_embd.embedding_length_kv =
+  zero_embd.geometry_kv["clip.vision.embedding_length"] =
       gguf_test::U32Kv("clip.vision.embedding_length", 0U);
   const std::string zero = ThrownBy(Build(d, zero_embd), /*load_weights=*/false);
   CHECK(Contains(zero, "clip.vision.embedding_length"));
+}
+
+// THE OTHER FIVE BOUNDS, which the case above did not hold. A fresh review
+// deleted `RequireGeometry` from `head_count`, `feed_forward_length`,
+// `projection_dim`, `projector.scale_factor` and `patch_size` -- all five at
+// once -- and the suite stayed green at 18 cases and 2198 assertions. The reader
+// bounded seven fields and two of them were gated, so the spec and the commit
+// that said every field is bounded were true of the code and false of the gate.
+//
+// Two of the five are worse than "runs and is wrong". `projector.scale_factor`
+// at 0 divides by zero in `DeepSeekV4VisionConfig::aligned_rows`, and
+// `head_count` at 0 divides by zero in `head_dim()`. The other three build a
+// tower of empty matrices that runs and produces fluent nonsense.
+//
+// Both ends of every bound, because a case for 0 alone leaves the ceiling free
+// to be widened to anything. `1 << 21` is above `kMaxGeometry`, which is
+// `1 << 20`; if that constant is ever raised past this value the over case stops
+// throwing and reds here, which is the argument somebody should have to make.
+TEST_CASE("deepseek4v mmproj: every clip.* geometry key is bounded BY NAME") {
+  const Dims d;
+  const char* keys[] = {
+      "clip.vision.attention.head_count",
+      "clip.vision.feed_forward_length",
+      "clip.vision.projection_dim",
+      "clip.vision.projector.scale_factor",
+      "clip.vision.patch_size",
+  };
+  constexpr uint32_t kAboveMaxGeometry = 1U << 21;
+  for (const char* key : keys) {
+    CAPTURE(key);
+
+    // Absent in effect. A declared 0 is not a smaller tower, it is no tower.
+    Options zero;
+    zero.geometry_kv[key] = gguf_test::U32Kv(key, 0U);
+    const std::string absent = ThrownBy(Build(d, zero), /*load_weights=*/false);
+    CHECK(Contains(absent, key));
+    CHECK(Contains(absent, " is 0,"));
+
+    // Absurd. Refused on the PARSED VALUE, before anything is sized from it,
+    // for the reason the block_count case above records at length.
+    Options over;
+    over.geometry_kv[key] = gguf_test::U32Kv(key, kAboveMaxGeometry);
+    const std::string big = ThrownBy(Build(d, over), /*load_weights=*/false);
+    CHECK(Contains(big, key));
+    CHECK(Contains(big, std::to_string(kAboveMaxGeometry)));
+  }
 }
 
 TEST_CASE("deepseek4v mmproj: the attention OUTPUT projection lands value-exact in its own slot") {

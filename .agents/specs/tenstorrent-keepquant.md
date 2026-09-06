@@ -230,6 +230,41 @@ inside the committed near-tie band, `RESULT PASS` form); GPU legs under the
 at the e2e is adjudicated against the committed pair only — never re-captured
 to make a failure pass.
 
+## Evidence (W3, 2026-09-06, P150 under the local flock mutex)
+
+- Op-level suites (E1): `test_tenstorrent_backend` keep-quant decode equality,
+  registration, staging, capture-safety cases 37/37; `test_gguf_keep_quant`
+  predicate cases 7/7; layout/reference cases 260/260; parser cases
+  10333/10333. Focused keep-quant battery (E2): 57/57 cases, 6685 assertions;
+  the twin-build repair suite re-run after the fix: 6/6 cases, 703 assertions
+  (filter `*MatmulBTQuant*,*kKeepQuantDecode*,*stages zero words*,*kMoeSiluMul*`).
+- Capture determinism (E3): two bootstrap runs with `tt-smi -r 0` between;
+  `our_ids_tenstorrent_capture.i32` byte-identical (md5
+  `eb8fb9894c3e4e05504f769b4119f443`, 16x16 i32), 105/105 assertions each,
+  keep-quant capture-staging counter 0 across both captured e2e runs.
+- Teacher-forced goldens (E4): `transformers` (venv: python 3.12, torch
+  2.7.1+cpu, transformers 5.8.1) on the dequantized artifact `/tmp/q4km-dequant`,
+  bf16, 16 tokens, prompts from `p{i}_prompt.i32`. Generic anchor pair
+  (`our_ids.npy`/`neartie_gap_mnats.npy`): 0 token-divergent, max gap
+  0.125 nats. TT capture pair (`our_ids_tenstorrent_capture.npy`/
+  `neartie_gap_mnats_tenstorrent_capture.npy`): 51/256 near-tie divergences,
+  max gap 0.1875 nats — all inside the 500 mnats band (kNearTieMnats,
+  test_qwen35_paged_engine.cpp:83).
+- READY adjudication: 147/147 assertions; 16/16 prompts PASS — 11/16 STRICT
+  token-exact vs oracle per-prompt greedy, 5/16 near-tie-band only, max gap
+  0.188 nats, 0 forward-divergent; backend proof 16/16 ops selections>0 with
+  0 declines (kPagedAttention 1536, kGdnDecode 4320, kCausalConv1dUpdate 4320
+  among them), staging counter 0. The ladder's `kGdnOps` proof list is
+  arm-aware now: the keep-quant vehicle dispatches `kMatmulBTQuant` +
+  `kMoeSiluMul`, never `kMatmulBT` + `kSiluAndMul` (bf16 arm unchanged).
+- Recipe: `VLLM_CPP_QWEN35_Q4KM_GGUF=<local Q4_K_M>` (+ `VT_DUMP_IDS=1` for
+  bootstrap only), `TT_METAL_RUNTIME_ROOT=/home/lu_zero/Sources/tt/tt-metal`,
+  build dir first in `LD_LIBRARY_PATH`, `tt-smi -r 0` before each batch,
+  `timeout -k 10 3300 ./build/tests/test_qwen35_paged_engine -tc="*GGUF Q4_K_M*"`.
+- Vehicle: unsloth/Qwen3.5-0.8B-GGUF @ 6ab46149, `Qwen3.5-0.8B-Q4_K_M.gguf`,
+  sha256 `bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517`,
+  532517120 bytes (local copy hashed).
+
 ## Stop conditions
 
 - No red-first evidence for a landed kernel.
@@ -245,6 +280,24 @@ to make a failure pass.
 - The int8-dot perf lever; llama.cpp-comparable throughput numbers.
 - `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
   capture leg hashes the local bytes); 27B arm entry at W4.
+- Residency reconciliation (NEEDS_DECISION): the spec's residency thesis
+  expected per-call on-core decode from the resident i32 word shadow and no
+  bf16 twin; W3 ships a host-side decode + bf16 pre-round + single
+  `from_vector<float>` upload per weight (`DecodedWeightShadow` memoizes it
+  per host buffer, dropped in `UnregisterHostBuffer`), because the device-side
+  twin decode OOM-fatalled the vehicle (4,068,474,880 B `ttnn::where`). The
+  word-shadow machinery and `kKeepQuantDecode` stay registered, tested, and
+  capture-guarded, but no production path reads them now. Decide before W4:
+  keep the twin as the shipped path and retire the shadow, or restore
+  on-core decode for the 27B arm where the twin's memory cost is real.
+- No eager/ambient TT pair is owed for this arm: the READY gate keys on
+  `DecodeCaptureEnabled()` and adjudicates the capture leg; the eager arm is
+  covered by the op-level eager decode-equality suites (E1). The ladder's
+  `*_tenstorrent.npy` eager names stay available if a later row wants the
+  second leg gated e2e.
+- No manifest.json: the committed golden convention (`qwen3_greedy_0_6b`)
+  carries per-arm `.npy` pairs + `p{i}_prompt.i32` only; the recipe lives in
+  this Evidence section and the landing commit body.
 
 ## Now
 
@@ -256,9 +309,11 @@ operand-rounding envelope (bound ratios 0.28-0.53, M=1 GEMV included); the
 `kTENSTORRENT` predicate arm admits exactly `{Q4_K}` and the routing test
 reds any widening past the registered set. Both red-first: the registration
 REQUIRE and the six wrongly-admitted encodings reded before the
-implementation. Next: W3, the capture leg (dump ×2 byte-identity, capture-
-safe staging for the per-call decode upload) + the e2e vehicle battery on
-the P150 (vehicle fetched and hashed). AMENDED 2026-09-06: the vehicle is
-mixed-quant, so W3 now carries the Q5_K/Q6_K/Q8_0 decodes and the predicate
-widening before the capture leg and the e2e battery (see the falsification
-section). W4 owed: the int8 lever, the 27B arm.
+implementation. AMENDED 2026-09-06: the vehicle is mixed-quant, so W3
+carried the Q5_K/Q6_K/Q8_0 decodes and the predicate widening before the
+capture leg and the e2e battery (see the falsification section).
+W3 EVIDENCE COMPLETE on the row branch (see `## Evidence`): capture dump x2
+byte-identity, staging counter 0, READY gate 16/16 PASS (11 strict / 5
+near-tie, 0 forward-divergent), backend proof 0 declines. Pending: fresh
+review, preflight, landing. W4 owed: the int8 lever, the 27B arm, and the
+residency reconciliation in `## Owed`.

@@ -758,8 +758,10 @@ above as its red-before input.
   wording of this entry described the first two as "per-token selection" and as
   "an image row takes `exp_probs_b_vl` while a text row takes `tid2eid`", and
   attributed that shape to the oracle. It is not the oracle's shape. In
-  `llama_model_deepseek4::graph::graph` at `llama-cpp-dsv4vision`
-  (`pr28154.diff`, the hunk at `@@ -1275,7 +1280,14 @@`) the selection is PER
+  `llama_model_deepseek4::graph::graph` in `src/models/deepseek4.cpp` at
+  `llama-cpp-dsv4vision`, which is release `b10766` -- the merge commit
+  `9400c8946e4da5e7694f2c26d6d4e50e14b690fa` of "model: correctly support input
+  vision for deepseek4 (#28154)" -- the selection is PER
   UBATCH: `const bool is_media = ubatch.embd != nullptr;` and, when it is set,
   every layer takes `ffn_exp_probs_b_vl` if the layer has one and the
   `il < hparams.dsv4_hash_layer_count` branch is SKIPPED ENTIRELY, so
@@ -785,6 +787,28 @@ above as its red-before input.
      the vision bias and the learned top-k route, and a text row in the same
      step still hashes through `tid2eid`. The oracle skips the hash branch for
      the whole ubatch only because no text row is there to keep it.
+
+  **A SECOND DIVERGENCE FROM THE ORACLE, RECORDED RATHER THAN CHANGED.** On a
+  media batch whose layer carries NO `exp_probs_b_vl`, the oracle still skips the
+  hash branch and takes plain unbiased top-k -- its selection is
+  `layer.ffn_exp_probs_b_vl ? that : nullptr`, and a null bias is simply not
+  added. `deepseek_v4.cpp` REFUSES that layer by name instead, because a layer
+  that was handed an image row and has no vision bias is a TEXT checkpoint being
+  asked to route an image, and routing it on the text bias or on no bias at all
+  would be fluent and wrong. It is not live for the released 43-layer file,
+  which carries the tensor on every layer, and it is the first thing to
+  reconsider if a partially converted vision file has to load. Issue #2411 owns
+  it.
+
+  **AND W4'S VISIBILITY RULE IS STRICTER THAN THE ORACLE'S.** llama.cpp's
+  `set_input_kq_mask_impl` exempts a key from the window when
+  `p0 >= seq_pos_min[seq_id]`, with no upper bound; `DeepseekV4VisibleRows`
+  bounds the exemption at `span_end`. The two agree on every input the oracle can
+  build, because a media ubatch IS the span there and nothing follows it inside
+  the batch. Ours is the narrower rule on a mixed step, which is the same
+  argument the per-token bias choice rests on: this engine batches continuously
+  and one step can carry rows after the span that must stay causal. Recorded so
+  the difference is a decision rather than a discovery.
 
   WHICH ROWS ARE IMAGE ROWS is read from the step's own identifiers. The
   processor writes `vocab_size + DeepSeekV4ImageTokenType` at every position of

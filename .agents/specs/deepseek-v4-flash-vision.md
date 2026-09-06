@@ -1101,8 +1101,8 @@ it: the exact-erf probe now runs at `aligned_rows(downsample_ratio + 1, 1) = 2`
 rows as well as at 1, comparing bit-exactly against the pinned golden on every
 row. Red before: the 1.004f multi-row mutation, which was green on the whole
 suite and now reds `DeepSeek-V4 aligner uses exact erf GELU` at `rows := 2`.
-Green after: 15 of 15 cases and 7407 of 7407 assertions with the tree restored.
-`aligner_hidden` keeps its absolute cap, so the stage stays transitively bounded
+Green after at `78ecaf034`: 15 of 15 cases and 7407 of 7407 assertions with the
+tree restored. `aligner_hidden` keeps its absolute cap, so the stage stays transitively bounded
 at 0.016 * 1.1289042 = 0.0180625.
 
 Every stage upstream of GELU on the case that first failed is at or below what
@@ -1143,8 +1143,8 @@ gate is a CAP rather than an equality, because a pool block is class-rounded and
 another backend may serve the same forward from fewer blocks, while every way of
 widening the model path can only push it up. Red before: the mutation is green on
 the whole suite and now reds both assertions at `14 <= 13` and `3000 <= 2680`.
-Green after: 15 of 15 cases and 7409 of 7409 assertions with the tree restored
-and verified by SHA-256.
+Green after at `18e6aad8b`: 15 of 15 cases and 7409 of 7409 assertions with the
+tree restored and verified by SHA-256.
 
 What the cap does NOT see is a new buffer the pool serves from a block that was
 already free, which adds no driver allocation and no retained bytes. That is
@@ -1212,10 +1212,10 @@ the 10000.0 default and regenerating reds the frequency guard at `0 >= 1`, and
 replacing its grids with a single (2,5) reds the row-order guard. The tree was
 restored and re-run at 14 of 14 cases and 7376 of 7376 assertions after both.
 SUPERSEDED: that sentence landed in `c211c50fd`, the same commit that added a
-fifteenth case, so it was stale on arrival. The head is at 15 cases and 7409
-assertions -- 7404 at `c211c50fd`, plus 3 for the multi-row exact-erf probe and 2
-for the pool cap, both above. The two guards are unchanged and still
-non-vacuous; only the totals moved.
+fifteenth case, so it was stale on arrival. The two guards are unchanged and
+still non-vacuous; only the totals moved, and the totals now live in one place at
+the end of this section rather than beside each measurement, because a count
+written beside a measurement is stale the next time anybody adds a case.
 
 **W4 must size against the geometry cache.** The `IndexSelect` gather index is
 `aligned_rows * hidden_size * downsample_ratio^2` i32 values per cached geometry.
@@ -1508,8 +1508,8 @@ Deleting any ONE of the five reds 4 assertions in
 verified against `ee7b510e6a9eea39a57d8dcab95a7cadfac10eba4e069ae55f07b26acc0feed6`
 after each. The `Options` override moved from one field per key to a map keyed by
 the key itself, so the seventh field and any future one costs a map entry rather
-than a struct field. `test_deepseek_v4_mmproj` now reports 19 cases and 2218
-assertions.
+than a struct field. `test_deepseek_v4_mmproj` reported 19 cases and 2218
+assertions at `8f44e7bbc`; see the head counts at the end of this section.
 
 **BOUNDING THE FACTORS WAS NOT BOUNDING THE PRODUCT, and a second independent
 review EXECUTED the falsification.** SUPERSEDES the claim in
@@ -1592,3 +1592,25 @@ the owner of the wiring. Three further gaps are recorded there and not fixed:
 the unkeyed vision `rope_theta`, the four `clip.vision.image_*` preprocessor
 keys, and the `general.alignment` fallback the shared fixture cannot yet
 exercise.
+
+### Repair round 2 head counts
+
+ONE PLACE, DELIBERATELY. Every count above is dated to the commit that measured
+it, because a total written beside a measurement is stale the next time anybody
+adds a case -- which is what happened to the W3A sentence this round superseded,
+and it went stale inside the same commit that wrote it.
+
+Measured on a CLEAN Release CPU build (`-DVLLM_CPP_CUDA=OFF`, `-j 4`, no
+warnings), every run under `ulimit -v 6000000`:
+
+| Suite | Cases | Assertions |
+|---|---|---|
+| `test_deepseek_v4_vision` | 15 | 7412 |
+| `test_deepseek_v4_mmproj` | 20 | 2211 |
+| `test_clip_mmproj_gguf` | 9 | 272 |
+| `test_deepseek_v4_mm_loader` | 9 | 105 |
+| `test_deepseek_v4_encoding` | 21 | 54 |
+| `test_deepseek_v4_image_processor` | 20 | 112 |
+
+`ctest -R 'deepseek_v4_(vision|encoding|image_processor|mmproj|mm_loader)|clip_mmproj_gguf'`
+passes 6 of 6.

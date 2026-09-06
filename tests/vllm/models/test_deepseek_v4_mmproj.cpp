@@ -206,6 +206,12 @@ struct Options {
   // Keyed rather than one field per key: the reader bounds SEVEN of these and
   // every one of them is a `Require` shape, a loop bound or a `resize` argument.
   std::map<std::string, std::string> geometry_kv;
+  // Emit ONLY the four tensors the loader reads before it sizes the fused qkv
+  // buffer: the patch embedding's weight and bias, and layer 0's two norms.
+  // A projector this shape is what turns an absurd `embedding_length` into a
+  // bare `std::bad_alloc` rather than a named refusal, and at patch_size 1 it
+  // stays about 1.6 MB while doing it.
+  bool only_before_qkv = false;
 };
 
 // The declared geometry for `key`, or the case's own raw override for it.
@@ -245,7 +251,16 @@ std::string Build(const Dims& d, const Options& o = Options{}) {
   b.AddKv(gguf_test::F32Kv("clip.vision.attention.layer_norm_epsilon", d.eps));
   if (o.emit_use_silu) b.AddKv(gguf_test::BoolKv("clip.use_silu", o.use_silu));
 
-  const auto skip = [&o](const char* name) { return o.omit_tensor == name; };
+  const auto skip = [&o](const char* name) {
+    if (o.only_before_qkv) {
+      for (const char* kept : {"v.patch_embd.weight", "v.patch_embd.bias",
+                               "v.blk.0.ln1.weight", "v.blk.0.ln2.weight"}) {
+        if (std::strcmp(kept, name) == 0) return false;
+      }
+      return true;
+    }
+    return o.omit_tensor == name;
+  };
   // Every tensor goes through these so ONE named tensor can be written with its
   // ggml dims reversed; the shape guard is the only thing that can see it.
   const auto f32 = [&](const std::string& name, std::vector<uint64_t> dims,
@@ -350,6 +365,18 @@ std::string ThrownBy(const std::string& bytes, bool load_weights) {
 
 bool Contains(const std::string& haystack, const std::string& needle) {
   return haystack.find(needle) != std::string::npos;
+}
+
+// `RequireGeometry`'s refusal, spelled out.
+//
+// `Contains(message, key)` and `Contains(message, value)` are each satisfiable
+// by ACCIDENT, and one of them was: with every bound deleted, the fallback
+// unaccounted-tensor message prints "enumerated for depth -1", so
+// `Contains(neg, "-1")` passed while measuring nothing. Asserting the whole
+// phrase ties the case to the refusal it names.
+bool RefusedByBound(const std::string& message, const char* key, int64_t value) {
+  return Contains(message, std::string(key) + " is " + std::to_string(value) +
+                               ", and this reader accepts 1 to ");
 }
 
 }  // namespace
@@ -742,15 +769,15 @@ TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
   negative.geometry_kv["clip.vision.block_count"] =
       I32Kv("clip.vision.block_count", -1);
   const std::string neg = ThrownBy(Build(d, negative), /*load_weights=*/false);
-  CHECK(Contains(neg, "clip.vision.block_count"));
-  CHECK(Contains(neg, "-1"));
+  CAPTURE(neg);
+  CHECK(RefusedByBound(neg, "clip.vision.block_count", -1));
 
   Options huge;
   huge.geometry_kv["clip.vision.block_count"] =
       gguf_test::U32Kv("clip.vision.block_count", 4096U);
   const std::string big = ThrownBy(Build(d, huge), /*load_weights=*/false);
-  CHECK(Contains(big, "clip.vision.block_count"));
-  CHECK(Contains(big, "4096"));
+  CAPTURE(big);
+  CHECK(RefusedByBound(big, "clip.vision.block_count", 4096));
 
   // The other geometry keys are the same class of input and the same class of
   // consequence: a zero `embedding_length` makes every `Require` shape `[0, 0]`
@@ -759,7 +786,8 @@ TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
   zero_embd.geometry_kv["clip.vision.embedding_length"] =
       gguf_test::U32Kv("clip.vision.embedding_length", 0U);
   const std::string zero = ThrownBy(Build(d, zero_embd), /*load_weights=*/false);
-  CHECK(Contains(zero, "clip.vision.embedding_length"));
+  CAPTURE(zero);
+  CHECK(RefusedByBound(zero, "clip.vision.embedding_length", 0));
 }
 
 // THE OTHER FIVE BOUNDS, which the case above did not hold. A fresh review
@@ -778,6 +806,43 @@ TEST_CASE("deepseek4v mmproj: an out-of-range block_count is refused BY NAME") {
 // to be widened to anything. `1 << 21` is above `kMaxGeometry`, which is
 // `1 << 20`; if that constant is ever raised past this value the over case stops
 // throwing and reds here, which is the argument somebody should have to make.
+// BOUNDING THE FACTORS IS NOT BOUNDING THE PRODUCT, and the difference is a
+// `std::bad_alloc` on the path the header calls user-supplied.
+//
+// `kMaxGeometry` admits an `embedding_length` of 65536, which is a sixteenth of
+// what it allows. `3 * hidden * hidden` at that width is 12,884,901,888
+// elements, and the loader reserves that BEFORE the first file-shaped read, so
+// nothing about the file bounds it; at the permitted maximum it asks for about
+// 6.6 TB. This file is about 1.6 MB. It declares 65536 at `patch_size` 1 and
+// carries only the four tensors the loader reads before that point, and before
+// the product bound it passed `RefuseUnsupportedDeepSeekV4ClipMmproj`, passed
+// every `RequireGeometry`, and threw a bare `std::bad_alloc` naming neither the
+// file nor the key -- exactly what
+// `include/vllm/model_executor/models/clip_mmproj_gguf.h` promises cannot
+// happen. Third time in this row for this defect class, one multiplication
+// removed from the bound each time.
+TEST_CASE("deepseek4v mmproj: a geometry whose PRODUCT is absurd is refused BY NAME") {
+  Dims d;
+  d.hidden = 65536;  // inside kMaxGeometry, and 3 * hidden^2 is 12.9G elements
+  d.patch = 1;       // keeps the file that this case writes at about 1.6 MB
+  d.depth = 1;
+  Options minimal;
+  minimal.only_before_qkv = true;
+  const std::string bytes = Build(d, minimal);
+  // The file is small. It is the DECLARED geometry that is not.
+  CHECK(bytes.size() < 4u * 1024u * 1024u);
+
+  const std::string message = ThrownBy(bytes, /*load_weights=*/true);
+  CAPTURE(message);
+  // Named by the keys that multiplied into it, and refused on the PARSED VALUES
+  // before anything is reserved -- so a regression is this assertion rather than
+  // a machine death.
+  CHECK(Contains(message, "clip.vision.embedding_length"));
+  CHECK(Contains(message, "per tensor"));
+  CHECK(!Contains(message, "bad_alloc"));
+  CHECK(!message.empty());
+}
+
 TEST_CASE("deepseek4v mmproj: every clip.* geometry key is bounded BY NAME") {
   const Dims d;
   const char* keys[] = {
@@ -787,7 +852,7 @@ TEST_CASE("deepseek4v mmproj: every clip.* geometry key is bounded BY NAME") {
       "clip.vision.projector.scale_factor",
       "clip.vision.patch_size",
   };
-  constexpr uint32_t kAboveMaxGeometry = 1U << 21;
+  constexpr int64_t kAboveMaxGeometry = 1 << 21;
   for (const char* key : keys) {
     CAPTURE(key);
 
@@ -795,16 +860,17 @@ TEST_CASE("deepseek4v mmproj: every clip.* geometry key is bounded BY NAME") {
     Options zero;
     zero.geometry_kv[key] = gguf_test::U32Kv(key, 0U);
     const std::string absent = ThrownBy(Build(d, zero), /*load_weights=*/false);
-    CHECK(Contains(absent, key));
-    CHECK(Contains(absent, " is 0,"));
+    CAPTURE(absent);
+    CHECK(RefusedByBound(absent, key, 0));
 
     // Absurd. Refused on the PARSED VALUE, before anything is sized from it,
     // for the reason the block_count case above records at length.
     Options over;
-    over.geometry_kv[key] = gguf_test::U32Kv(key, kAboveMaxGeometry);
+    over.geometry_kv[key] =
+        gguf_test::U32Kv(key, static_cast<uint32_t>(kAboveMaxGeometry));
     const std::string big = ThrownBy(Build(d, over), /*load_weights=*/false);
-    CHECK(Contains(big, key));
-    CHECK(Contains(big, std::to_string(kAboveMaxGeometry)));
+    CAPTURE(big);
+    CHECK(RefusedByBound(big, key, kAboveMaxGeometry));
   }
 }
 

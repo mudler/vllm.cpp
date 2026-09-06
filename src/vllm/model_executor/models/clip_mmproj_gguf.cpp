@@ -468,6 +468,37 @@ constexpr int64_t kMaxDeepSeekV4Depth = 1024;
 // hidden * ratio^2), so an unbounded pair is the same defect one step removed.
 constexpr int64_t kMaxGeometry = 1 << 20;
 
+// The largest element count any ONE tensor this reader materializes may have.
+//
+// BOUNDING THE FACTORS IS NOT BOUNDING THE PRODUCT, and the comment above named
+// that defect and then chose a bound that does not contain it. `kMaxGeometry`
+// admits an `embedding_length` of 65536, a sixteenth of what it allows, and the
+// fused qkv buffer was reserved at `3 * hidden * hidden` BEFORE the first
+// file-shaped read, so nothing about the file bounded it: 12,884,901,888
+// elements at 65536, and about 6.6 TB at the permitted maximum. A 1.6 MB
+// projector declaring 65536 at `patch_size` 1, carrying only the four tensors
+// read before that point, passed every refusal in this file and threw a bare
+// `std::bad_alloc`.
+//
+// The shipped artifact's largest tensor is `mm.1` at 4096 * 1024 * 9 =
+// 37,748,736 elements, so this ceiling is about seven times the real thing. A
+// projector above it is corrupt or hostile rather than new, and it is refused
+// with the keys whose product produced it.
+constexpr int64_t kMaxTensorElements = 1 << 28;
+
+// The product of `factors`, SATURATED at one past the ceiling rather than
+// wrapped. Four factors at `kMaxGeometry` is 2^80, which overflows int64 and
+// silently becomes a small positive number -- the same defect this bound exists
+// to refuse, one step further removed again.
+int64_t SaturatingElements(std::initializer_list<int64_t> factors) {
+  int64_t product = 1;
+  for (int64_t f : factors) {
+    if (f <= 0 || f > kMaxTensorElements / product) return kMaxTensorElements + 1;
+    product *= f;
+  }
+  return product;
+}
+
 std::string DeepSeekV4BlockPrefix(int64_t layer) {
   return "v.blk." + std::to_string(layer) + ".";
 }
@@ -492,6 +523,20 @@ void RequireGeometry(int64_t value, const char* key, int64_t max,
                std::to_string(value) + ", and this reader accepts 1 to " +
                std::to_string(max) + " (" + what +
                "). A projector declaring that is corrupt, not new");
+}
+
+// One tensor's element count, refused on the PARSED VALUES before anything is
+// reserved or resized from them. `elements` is saturated, so it is a lower
+// bound on the real product rather than the product itself, which is why the
+// message says "or more".
+void RequireTensorElements(int64_t elements, const std::string& keys,
+                           const std::string& what) {
+  VT_CHECK(elements <= kMaxTensorElements,
+           "clip mmproj gguf: the geometry from " + keys + " sizes " + what +
+               " at " + std::to_string(elements) +
+               " elements or more, and this reader accepts up to " +
+               std::to_string(kMaxTensorElements) +
+               " per tensor. A projector declaring that is corrupt, not new");
 }
 
 // A contiguous HOST view over `data`. W4 owns the upload, so this wave keeps
@@ -665,6 +710,31 @@ multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
                   "it squares into the aligner's input width");
   RequireGeometry(config.patch_size, kKvPatch, kMaxGeometry,
                   "it squares into the patch embedding's input width");
+  // EVERY PRODUCT THE LOADER FORMS, bounded here rather than at the allocation
+  // it becomes. Each of these is the element count of one tensor the loader
+  // materializes; the first is the one that reached `reserve` with nothing
+  // file-shaped in front of it. `patch_dim()` is 3 * patch^2 and
+  // `aligner_input_size()` is hidden * ratio^2, both spelled out so the factors
+  // this refusal names are the keys that carried them.
+  constexpr int64_t kRgbChannels = 3;
+  RequireTensorElements(
+      SaturatingElements({3, config.hidden_size, config.hidden_size}), kKvEmbd,
+      "the fused qkv weight");
+  RequireTensorElements(
+      SaturatingElements({config.hidden_size, kRgbChannels, config.patch_size,
+                          config.patch_size}),
+      std::string(kKvEmbd) + " and " + kKvPatch, "the patch embedding weight");
+  RequireTensorElements(
+      SaturatingElements({2, config.intermediate_size, config.hidden_size}),
+      std::string(kKvFf) + " and " + kKvEmbd, "the merged gate/up weight");
+  RequireTensorElements(
+      SaturatingElements({config.output_size, config.hidden_size,
+                          config.downsample_ratio, config.downsample_ratio}),
+      std::string(kKvProjDim) + ", " + kKvEmbd + " and " + kKvScaleFactor,
+      "the aligner's first projection");
+  RequireTensorElements(
+      SaturatingElements({config.output_size, config.output_size}), kKvProjDim,
+      "the aligner's second projection");
   // READ, never assumed: this projector's eps is the vision RMSNorm's torch
   // default rather than the language model's, and a reader that kept the W2
   // default would agree with this artifact by luck.
@@ -744,10 +814,13 @@ DeepSeekV4ClipMmproj LoadDeepSeekV4VisionFromClipMmproj(
     // with `RowSlice(layer.qkv_weight, 0, hidden)`, K at `hidden`, V at
     // `2 * hidden`, and the matching `VectorSlice`s for the bias. Permuting the
     // three swaps which projection each head attends with and stays fluent.
+    // NOT RESERVED FROM THE DECLARED GEOMETRY. A `reserve` here ran ahead of
+    // every file-shaped read, so it sized an allocation from a number no file
+    // had yet had to justify; the product bound above refuses the absurd case
+    // by name, and growing on `insert` keeps this site bounded by the bytes
+    // `read.Bf16` actually returns even if that bound is ever widened.
     std::vector<uint16_t> qkv_weight;
-    qkv_weight.reserve(static_cast<size_t>(3 * hidden * hidden));
     std::vector<uint16_t> qkv_bias;
-    qkv_bias.reserve(static_cast<size_t>(3 * hidden));
     for (const char* part : {"attn_q", "attn_k", "attn_v"}) {
       const std::vector<uint16_t> weight =
           read.Bf16(p + part + ".weight", {hidden, hidden});

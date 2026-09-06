@@ -237,11 +237,26 @@ void RefuseUnsupportedDeepSeekV4ClipMmproj(const GgufFile& gguf,
 // different one would be silently mis-read by llama.cpp too. The spec lists it
 // under `## Owed`.
 //
-// Every field this reads is BOUNDED before it is returned. Each becomes a
-// `Require` shape, a loop bound or a `resize` argument, `KvInt` widens any
-// integer spelling a converter chose, and this path runs on a user-supplied
-// `--mmproj`, so an out-of-range value is refused with the key that carried it
-// rather than surfacing as `length_error` or `bad_alloc`.
+// Every field this reads is BOUNDED before it is returned, AND SO IS EVERY
+// PRODUCT THE LOADER FORMS FROM THEM. Each field becomes a `Require` shape, a
+// loop bound or a `resize` argument, and `KvInt` widens any integer spelling a
+// converter chose, so an out-of-range value is refused with the key that
+// carried it rather than surfacing as `length_error` or `bad_alloc`.
+//
+// THE SECOND HALF OF THAT SENTENCE WAS ADDED BECAUSE THE FIRST HALF ALONE WAS
+// FALSE. Bounding each field left `3 * hidden * hidden` free: at an
+// `embedding_length` of 65536, a sixteenth of what the field bound allows, the
+// fused qkv buffer was reserved at 12,884,901,888 elements before any
+// file-shaped read, and a 1.6 MB projector declaring it threw a bare
+// `std::bad_alloc` past every refusal here. `kMaxTensorElements` now bounds the
+// element count of each tensor the loader materializes, on the parsed values,
+// and `tests/vllm/models/test_deepseek_v4_mmproj.cpp` carries that file.
+//
+// This arm is NOT reached from production today -- nothing outside the tests
+// calls it, and the spec's `## Owed` gives W4 the wiring. The Qwen3-VL
+// `ClipMmprojVisionConfig` beside it IS reached, reads `block_count` from a
+// user-supplied `--mmproj` into an unbounded `resize`, and
+// https://github.com/mudler/vllm.cpp/issues/2995 owns that.
 multimodal::DeepSeekV4VisionConfig DeepSeekV4ClipMmprojVisionConfig(
     const GgufFile& gguf);
 

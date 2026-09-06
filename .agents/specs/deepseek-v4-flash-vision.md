@@ -1483,6 +1483,61 @@ the key itself, so the seventh field and any future one costs a map entry rather
 than a struct field. `test_deepseek_v4_mmproj` now reports 19 cases and 2218
 assertions.
 
+**BOUNDING THE FACTORS WAS NOT BOUNDING THE PRODUCT, and a second independent
+review EXECUTED the falsification.** SUPERSEDES the claim in
+`include/vllm/model_executor/models/clip_mmproj_gguf.h` that an out-of-range
+value is refused with the key that carried it "rather than surfacing as
+`length_error` or `bad_alloc`". It surfaced as exactly that.
+
+`kMaxGeometry` is `1 << 20`, and the loader reserved the fused qkv buffer at
+`3 * hidden * hidden` BEFORE its first file-shaped read, so nothing about the
+file bounded it. At an `embedding_length` of 65536 -- a sixteenth of what the
+field bound allows -- that is 12,884,901,888 elements, and at the permitted
+maximum about 6.6 TB. Reproduced here rather than taken from the report: a
+1.6 MB projector declaring 65536 at `patch_size` 1, carrying only
+`v.patch_embd.weight`, `v.patch_embd.bias`, `v.blk.0.ln1.weight` and
+`v.blk.0.ln2.weight`, passed `RefuseUnsupportedDeepSeekV4ClipMmproj`, passed
+every `RequireGeometry`, and threw `std::bad_alloc` under
+`ulimit -v 6000000`. Third time in this row for this defect class, one
+multiplication further from the bound each time, and the `kMaxGeometry` comment
+had named the shape ("the same defect one step removed") while choosing a bound
+that does not contain it.
+
+Two changes, and the second does not depend on the first. `kMaxTensorElements`
+(`1 << 28`, about seven times the shipped artifact's largest tensor at
+`mm.1` = 4096 * 1024 * 9 = 37,748,736 elements) now bounds the ELEMENT COUNT of
+every tensor the loader materializes -- the fused qkv weight, the patch
+embedding weight, the merged gate/up weight and the aligner's two projections --
+on the parsed values, before anything is reserved, and names the keys whose
+product produced it. `SaturatingElements` clamps rather than multiplies, because
+four factors at `kMaxGeometry` is 2^80 and would wrap int64 into a small
+positive number, which is the same defect one step further removed again. And
+the `reserve` is gone: it ran ahead of every file-shaped read, and growing on
+`insert` keeps that site bounded by the bytes `read.Bf16` returns even if the
+ceiling is ever widened.
+
+Red before: the case reports `message := std::bad_alloc` and reds three of its
+assertions. Green after: the same file is refused by name with
+"clip.vision.embedding_length ... 268435457 elements or more ... 268435456 per
+tensor". Deleting the qkv product bound reds it again. The rest of the file was
+re-read for the same shape: `patch_weight`, `gate_up` and the aligner all size
+from a `read.Bf16` that has already been matched against the file, and
+`blocks.resize` is bounded by `kMaxDeepSeekV4Depth`. The two remaining unbounded
+sites are `vw.blocks.resize(cfg.depth)` and `patch_proj_w.assign` in the
+PRODUCTION-REACHABLE Qwen3-VL arm, which
+[#2995](https://github.com/mudler/vllm.cpp/issues/2995) owns and which is not
+touched here.
+
+**One assertion in the `block_count` case measured nothing.**
+`CHECK(Contains(neg, "-1"))` passed with every geometry bound deleted, because
+the fallback unaccounted-tensor message prints "enumerated for depth -1". So
+`750cc6626`'s "failed on all four of its message assertions" read consistent
+while the case carried five, one of them vacuous. Every geometry case now
+asserts the whole refusal through `RefusedByBound`, which spells
+"<key> is <value>, and this reader accepts 1 to ". With the `block_count` and
+`embedding_length` bounds deleted, all three of that case's assertions red
+rather than four of five.
+
 **The geometry guard does NOT run on a user-supplied `--mmproj` today, and
 `750cc6626` said it does.** SUPERSEDES that sentence. No file under `src/`,
 `include/`, `examples/` or `tools/` calls `DeepSeekV4ClipMmprojVisionConfig`,

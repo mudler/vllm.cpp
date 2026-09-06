@@ -73,9 +73,23 @@ dsv4_mmproj_test::Dims ProjDims() {
 // This suite RUNS the tower, so it asks for the folded value series. The reader
 // gate's unfolded one puts weights at `2^104`, and a two-layer product of those
 // is infinity before any comparison can read it.
+//
+// THE VALUE IS 13 AND IT IS MEASURED, not chosen for looks. The fold decides
+// how far the weights spread along the aligner's 72-wide contraction axis, and
+// that spread is the only thing that makes one aligner cell's answer differ
+// from another's: bf16 keeps 8 significant bits, so a cell-to-cell difference
+// below about 0.4% of the row's own magnitude is not representable at all. At
+// this fixture's geometry the six aligner rows come out
+//   fold  7 -> 5 of 6 distinct
+//   fold 11 -> 6 of 6, largest column spread 0.93% of the column maximum
+//   fold 13 -> 6 of 6, largest column spread 2.4%
+// so 13 is the first value with a margin over the representable floor rather
+// than the first value that happens to pass. The case below ASSERTS the six are
+// pairwise distinct, so a later change that collapses them again is red rather
+// than vacuously green.
 dsv4_mmproj_test::Options ProjOptions() {
   dsv4_mmproj_test::Options o;
-  o.fold_exponents = 7;
+  o.fold_exponents = 13;
   return o;
 }
 
@@ -354,6 +368,48 @@ TEST_CASE("REACH: ModelRegistry::EncodeMm runs the W2 tower on the W3A projector
   CHECK(marker_rows > 0);
   CHECK(image_bad == 0);
   CHECK(marker_bad == 0);
+
+  // THE ASSERTION THAT MAKES THE PERMUTATION GATED, and it is here because
+  // without it the four above are satisfied by a fixture that says nothing.
+  //
+  // `image_bad == 0` reads "this image row is the aligner row the permutation
+  // names". If the aligner rows are all the same vector it degenerates to "this
+  // image row is SOME aligner row", and identity, reversal and a constant index
+  // all satisfy it -- as does a row/column transposition inside the aligner,
+  // which is what the fixture's own grid comment claims to catch. That is
+  // exactly what this suite shipped: every one of the six rows was bit
+  // identical, non-zero and finite, so nothing looked wrong.
+  //
+  // Pairwise distinctness is the property the permutation assertion needs, so
+  // it is measured rather than assumed. It is a property of the FIXTURE and the
+  // tower's arithmetic, not of the code under test, which is why it is a
+  // separate assertion and not a stricter comparison.
+  int64_t equal_pairs = 0;
+  for (int64_t a = 0; a < aligned_rows; ++a) {
+    for (int64_t b = a + 1; b < aligned_rows; ++b) {
+      bool same = true;
+      for (int64_t c = 0; c < ocfg.output_size && same; ++c) {
+        same = aligner[static_cast<size_t>(a * ocfg.output_size + c)] ==
+               aligner[static_cast<size_t>(b * ocfg.output_size + c)];
+      }
+      if (same) ++equal_pairs;
+    }
+  }
+  CHECK(equal_pairs == 0);
+
+  // And the four MARKER vectors are pairwise distinct too, so a hook that put
+  // the start vector under every marker row would be visible rather than
+  // averaged into `marker_bad`.
+  const std::vector<const std::vector<float>*> markers{
+      &oracle_weights.image_start, &oracle_weights.image_end,
+      &oracle_weights.image_pad, &oracle_weights.image_newline};
+  int64_t equal_markers = 0;
+  for (size_t a = 0; a < markers.size(); ++a) {
+    for (size_t b = a + 1; b < markers.size(); ++b) {
+      if (*markers[a] == *markers[b]) ++equal_markers;
+    }
+  }
+  CHECK(equal_markers == 0);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

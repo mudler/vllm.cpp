@@ -59,7 +59,8 @@ struct Dims {
 // 20000 is 128, so hundreds of indices would share a word and an off-by-one
 // permutation would pass every check below.
 // FOLD, when set, wraps the exponent into `[-fold/2, fold/2)` instead of letting
-// it run with the family index.
+// it run with the family index, AND advances it once per ELEMENT instead of
+// once per 128.
 //
 // The W3A reader gate wants the unfolded form: each family gets its own binade,
 // so a swapped slot (q for k, gate for up) lands in a different one and cannot
@@ -71,11 +72,26 @@ struct Dims {
 // modular, so distinct families still land on distinct words inside the fold
 // and a swap is still visible; what it gives up is the guarantee that two
 // families can never collide.
+//
+// THE PER-ELEMENT STRIDE IS LOAD-BEARING, and it is a repair. The unfolded
+// exponent advances every 128 indices, so a folded tensor was 128-long runs of
+// `(1 + k/128) * 2^e` -- an almost-CONSTANT ramp along the contraction axis.
+// A dot product against an almost-constant vector is a sum of its inputs, and a
+// sum is PERMUTATION-INVARIANT: every 3x3 aligner cell of the W4 fixture gathers
+// the same nine vision rows in a different order, so every aligner row came out
+// bit-identical while nothing looked broken (they were non-zero, finite and
+// plausible). That made `test_deepseek_v4_mm_reach`'s permutation assertion
+// vacuous -- identity, reversal and a constant index all passed. With the
+// exponent advancing per element the weights span the whole fold, the largest
+// terms dominate, and which row landed in which slot decides the answer.
+// `REACH: ModelRegistry::EncodeMm ...` asserts the rows are pairwise distinct,
+// so this cannot silently regress.
 inline float Series(int family, int64_t i, int fold) {
   const int64_t k = i % 128;
   int exponent = family + static_cast<int>(i / 128);
   if (fold > 0) {
-    exponent = ((exponent % fold) + fold) % fold - fold / 2;
+    exponent = static_cast<int>(
+        ((static_cast<int64_t>(family) + i) % fold + fold) % fold - fold / 2);
   }
   return std::ldexp(1.0F + static_cast<float>(k) / 128.0F, exponent);
 }

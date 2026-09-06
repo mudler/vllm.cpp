@@ -1467,6 +1467,12 @@ target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}
 # is the property the Q4_K_M token gate is decided by and which no token gate we
 # own can see. Public headers only, so no extra include directory.
 vllm_cpp_add_test(test_qwen35_gguf_logits_f32 vllm/models/test_qwen35_gguf_logits_f32.cpp)
+# BACKEND-TENSTORRENT-KEEPQUANT W3 (#2959): the q4km vehicle's dequantized-
+# artifact dump — the teacher-forcing oracle input the row spec prescribes
+# (our bit-exact loader writes a safetensors dir; the pinned transformers
+# cannot parse the `qwen35` GGUF arch). Env-gated: skips loudly unless
+# VLLM_CPP_QWEN35_Q4KM_GGUF and VLLM_CPP_QWEN35_Q4KM_DUMP_DIR are both set.
+vllm_cpp_add_test(test_qwen35_gguf_q4km_dequant_dump vllm/models/test_qwen35_gguf_q4km_dequant_dump.cpp)
 # #2534. `detail::ActDType` caches its getenv in a function-local static, so one
 # process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
 # resolver that READS the lever from one hardwired to its default answer. Re-run

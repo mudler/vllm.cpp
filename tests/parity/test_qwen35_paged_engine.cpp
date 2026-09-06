@@ -159,14 +159,22 @@ GateArtifactState RequireGateArtifacts(const fs::path& gdir, const char* label,
                       "qwen3-neartie-gap.py");
 }
 
-void RunGate(const std::string& golden_subdir, const char* label) {
+// `model` is the checkpoint the gate loads: the bf16 HF snapshot for the
+// SACRED ROCm pair, the q4km GGUF path for the keep-quant vehicle arm.
+// `keep_quant` selects the dispatch set the backend-proof block asserts: the
+// bf16 vehicle dispatches plain kMatmulBT and kSiluAndMul, while the
+// keep-quant vehicle swaps those two for the W3 decode surface — every matmul
+// weight stays block-encoded and decodes on-core (kMatmulBTQuant) and the
+// split gate/up dense MLP routes through kMoeSiluMul (qwen3_5.cpp:7610) — so
+// the same selections>0/declines==0 proof covers the quant path's e2e reach.
+void RunGate(const std::string& golden_subdir, const char* label,
+             const std::string& model, const bool keep_quant = false) {
   const char* probe_dir = std::getenv("VT_QWEN35_GATE_PREREQ_PROBE_DIR");
   const bool probe = probe_dir != nullptr;
-  const std::string snap = probe ? std::string() : parity::Qwen35_08BSnapshot();
+  const std::string snap = probe ? std::string() : model;
   if (!probe && snap.empty()) {
-    SkipGate(label, "models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision "
-                    "2fc06364 not cached — this gate runs where the ROCm oracle "
-                    "was captured (gfx1100)");
+    SkipGate(label, "model artifact not cached — resolve the snapshot or GGUF "
+                    "path this gate is pinned to first");
   }
   const fs::path gdir = probe ? fs::path(probe_dir)
                               : fs::path(PARITY_GOLDENS_DIR) / golden_subdir;
@@ -255,16 +263,20 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   }
 
   // The GDN op set this model dispatches — all must be proven on the running
-  // device (selections > 0, declines == 0; fan-out spike Risk 4).
+  // device (selections > 0, declines == 0; fan-out spike Risk 4). The last two
+  // entries are the GEMM/MLP pair that differs per arm (see RunGate's
+  // keep_quant comment).
   const std::vector<vt::OpId> kGdnOps = {
-      vt::OpId::kEmbedding,        vt::OpId::kMatmulBT,
-      vt::OpId::kRmsNorm,          vt::OpId::kRmsNormGated,
+      vt::OpId::kEmbedding,        vt::OpId::kRmsNorm,
+      vt::OpId::kRmsNormGated,
       vt::OpId::kCausalConv1dFwd,  vt::OpId::kCausalConv1dUpdate,
       vt::OpId::kGdnPrefill,       vt::OpId::kGdnDecode,
       vt::OpId::kGdnPostConv,      vt::OpId::kSigmoidGateBf16,
       vt::OpId::kAttnQkNormRopeGate,
       vt::OpId::kReshapeAndCache,  vt::OpId::kPagedAttention,
-      vt::OpId::kSiluAndMul,       vt::OpId::kGreedyArgmax};
+      vt::OpId::kGreedyArgmax,
+      keep_quant ? vt::OpId::kMatmulBTQuant : vt::OpId::kMatmulBT,
+      keep_quant ? vt::OpId::kMoeSiluMul : vt::OpId::kSiluAndMul};
   if (rocm || device_golden) {
     for (vt::OpId op : kGdnOps) {
       CHECK(vt::OpRegistered(op, run_dev));
@@ -367,6 +379,16 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   const int32_t* anchor_ids = od;
   const int32_t* gap_ids = gapd;
 
+  // KEEPQUANT W3 capture-safety probe: the staging counter counts ONLY
+  // capture-active word-shadow misses (EnsureKeepQuantWords refuses a
+  // capture-time arrival by name, so a miss would have CHECK-aborted before
+  // this point). The engine's pre-capture eager step warms every shadow, so
+  // across a captured run the count must read ZERO — a positive count is the
+  // #2812 class surviving the W3 fix. On the bf16 arm no keep-quant weight
+  // exists and the count is trivially zero; the invariant costs one atomic read.
+  if (tenstorrent && tt_capture)
+    vt::tenstorrent::ResetKeepQuantCaptureStagingWritesForTest();
+
   int strict_exact = 0;
   int neartie_only = 0;
   int fail = 0;
@@ -440,6 +462,15 @@ void RunGate(const std::string& golden_subdir, const char* label) {
     CHECK(prompt_ok);
   }
 
+  if (tenstorrent && tt_capture) {
+    const int64_t staged = vt::tenstorrent::KeepQuantCaptureStagingWrites();
+    CHECK_MESSAGE(staged == 0,
+                  label << ": keep-quant decode staged " << staged
+                        << " word uploads DURING the captured e2e (the #2812 "
+                           "class — a captured graph reading bytes its replay "
+                           "cannot refresh)");
+  }
+
   // Backend proof: token equality alone does not prove which device ran.
   // The bootstrap dump path does not exercise the full op set to a comparison,
   // so its stats prove reachability only (still selections > 0, declines == 0).
@@ -502,5 +533,31 @@ void RunGate(const std::string& golden_subdir, const char* label) {
 // Qwen3.5-0.8B (GDN hybrid: linear-attention recurrence + full-attention
 // layers) — the first GDN-architecture gate, ROCm-oracle-backed (issue #41 M4).
 TEST_CASE("qwen3.5-0.8B GDN paged-engine greedy near-tie correctness gate (ROCm, SACRED)") {
-  RunGate("qwen35_greedy_0_8b", "qwen3.5-0.8B");
+  RunGate("qwen35_greedy_0_8b", "qwen3.5-0.8B", parity::Qwen35_08BSnapshot());
+}
+
+// KEEPQUANT W3 (issue #2959): the SAME gate shape driven through the
+// quantized vehicle — unsloth's Qwen3.5-0.8B Q4_K_M GGUF, the mixed-quant
+// artifact that forced W3's decode set (Q6_K token_embd, Q5_K attn_qkv/
+// ssm_out, Q8_0 ssm_alpha/ssm_beta; see the row spec's falsification
+// section). On Tenstorrent the matmul weights keep their blocks (the
+// widened kTENSTORRENT predicate) and every GEMM decodes on-core from the
+// resident i32 word shadow; the Q6_K embedding table still expands (the
+// gather arm needs kEmbeddingQuant, unregistered on TT) — bounded at 0.8B.
+// The Tenstorrent lane gates against its OWN captured pair with the
+// teacher-forced near-tie band, exactly the bf16 gate's treatment; the
+// oracle is `transformers` on the DEQUANTIZED artifact (never the bf16
+// safetensors checkpoint: those logits are a different model's).
+// Checkpoint-gated: absent VLLM_CPP_QWEN35_Q4KM_GGUF -> loud SKIP.
+TEST_CASE("qwen3.5-0.8B GGUF Q4_K_M paged-engine greedy near-tie gate (Tenstorrent, checkpoint-gated)") {
+  const char* gguf = std::getenv("VLLM_CPP_QWEN35_Q4KM_GGUF");
+  if (gguf == nullptr || gguf[0] == '\0') {
+    SkipGate("qwen35-gguf-q4km",
+             "VLLM_CPP_QWEN35_Q4KM_GGUF is absent — set it to the local "
+             "Qwen3.5-0.8B-Q4_K_M.gguf (unsloth/Qwen3.5-0.8B-GGUF @ 6ab46149, "
+             "sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a0"
+             "6121dc517, 532517120 bytes) to run the keep-quant vehicle gate");
+  }
+  RunGate("qwen35_gguf_q4km", "qwen35-gguf-q4km", std::string(gguf),
+          /*keep_quant=*/true);
 }

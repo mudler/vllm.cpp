@@ -9,8 +9,10 @@ Base: `e2fb2f06d9944c4bbe66531034479d370df67815`
 The developer approved the sequence on 7 September 2026: current-pin
 baseline, packed decode, then GGUF optimization. This change establishes
 the first prerequisite. It does not implement the inference optimization.
-Current-pin model gateability on Strix remains PENDING until the worker
-builds and emits the specified tokens. The row lifecycle remains unchanged.
+The isolated current-pin vLLM and GGUF plugin build on Strix is complete.
+Its build state records `BUILT` after dependency, source, compiler, and
+extension checks. Six-prompt generation and eight upstream packed-test cases
+remain PENDING. Model gateability remains PENDING. The row lifecycle is unchanged.
 
 ## Scope and exclusions
 
@@ -159,9 +161,9 @@ that records measurements, rejected choices, and remaining obligations.
 
 ## Risks and stop conditions
 
-The new pin changes dependencies and model code. Plugin compatibility is
-unmeasured. A dependency or compiler failure can block the run, but does not
-prove the architecture unsupported. Resolve packaging failures in isolation.
+The new pin changes dependencies and model code. Model execution with the
+plugin remains unmeasured. A dependency or compiler failure can block the run,
+but does not prove the architecture unsupported. Resolve packaging failures in isolation.
 Stop for missing authority, unavailable assets, lost lease, GPU fault,
 unhealthy device, identity mismatch, or required changes outside this scope.
 No compiler success establishes performance or numerical parity.
@@ -211,7 +213,9 @@ oracle: operator wheel metadata showed that torchvision 0.29 requires Torch
 manifest binds the compatible candidate versions. Overlap between plain
 `triton` and `triton-rocm` requires the explicit byte-provenance envelope below;
 without that envelope it remains a refusal, not an ignored pip-check error.
-The current upstream runtime dependency closure is still unmeasured.
+The captured build resolved the runtime dependencies and passed `pip check`
+before and after compiler selection. Execution on the required model remains
+unmeasured.
 
 The packed-test adaptation copies the pinned file byte-for-byte to an isolated
 test directory, avoiding unrelated repository-root conftest dependencies.
@@ -223,9 +227,35 @@ the projection output dtype; that capture remains explicitly PENDING.
 
 ## Outcome
 
-The harness implementation establishes CPU-tested orchestration, not measured
-oracle gateability. The six-prompt model run, dependency closure, current-pin
-GPU build, and packed numerical tests remain PENDING for the operator's lease.
+The harness establishes CPU-tested orchestration and a completed current-pin
+GPU build. Build job `435bc0f3-638a-4812-87bc-8d44619e6d1b` exited 0.
+Its evidence directory is
+`/mnt/nas_share/rc/strix-vllm-3043.GkMABu/build-9624441-04/`.
+`build-state.json` records `BUILT`. The worker and runtime hashes match
+commit `9624441824915226c9412155ddffc6e3cf45d185`.
+
+`build-identity.json` records ROCm on `gfx1151`, vLLM runtime
+`0.28.1rc1.dev132+ge126687a9`, distribution
+`0.28.1rc1.dev132+ge126687a9.rocm724`, and GGUF plugin `0.0.5`.
+Both wheel builds and both `pip check` commands exited 0.
+The compiler probes resolved
+`/tmp/strix-vllm3043-7r3dipwh/venv/lib/python3.12/site-packages`.
+Selected Triton `3.8.0` passed namespace verification. `triton-rocm=3.7.1`
+remains nonauthoritative metadata. All three extension-target checks passed.
+The command logs, exit records, source inventories, and wheel hashes remain
+in the evidence directory.
+
+The build state binds the normalized manifest SHA256
+`c7c358b46c73cd2e170281e42cea11fafca54a8f5ea9c53fad6ce1a7d434ff0b`.
+The retained `manifest.json` has raw-file SHA256
+`499725007bd7b423265405e5dcd59439ed834a6a968feed06de14ea4b9a32472`.
+These hashes cover different bytes. Only the normalized digest binds the state.
+
+Runtime job `112a91ad-e51a-4627-aeae-61e2c0ed9643` uses this build state.
+At 23:09 UTC on 7 September 2026, sibling output `run-9624441-01/`
+contained runtime identity evidence but no `result.json`.
+The six-prompt model run and eight packed numerical cases remain PENDING.
+Issue #3043 remains open for these runtime acceptance requirements.
 No throughput, token-parity, or model-dtype result is accepted by this change.
 Production compilation remains enabled because it defines the denominator.
 The token gate remains FAIL from the survey; successful counts cannot repair it.
@@ -424,6 +454,13 @@ The complete focused gate and immutable-head preflight are reported in the
 implementer handoff. GPU execution remains the operator's obligation.
 
 ## Owed
+
+Issue #3043 still owes production-mode generation for all six specified prompts,
+with 48 tokens each. Eight upstream packed-test cases must execute without
+errors, failures, or skips. The operator must retain the resolved configuration,
+compiler provenance, output tokens, projection metadata, and exit statuses.
+Successful generation counts establish no token parity. The token gate remains
+FAIL under #2534.
 
 The packed ROCm port follows under its own issue and committed spec after
 this prerequisite. Its tests must follow current vLLM rather than old CUDA

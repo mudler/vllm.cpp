@@ -5766,7 +5766,7 @@ TEST_CASE("kTENSTORRENT keep-quant decode stages zero words during capture") {
 // answer. The registered encoding set is EXACTLY {Q4_K, Q8_0}: Q5_K and Q6_K
 // must refuse BY NAME (the owed grouped extension, recorded in the spec's W4
 // plan), so a wrongly-widened kernel reds the refusal legs below.
-TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q8_0} and refuses the rest") {
+TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q5_K,Q6_K,Q8_0} and refuses the rest") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
@@ -5789,16 +5789,29 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q8_0} and refuses 
     if (enc == vt::DType::kQ8_0) {
       put_f16(0, 0.1f + 0.2f * static_cast<float>(rng() % 16) / 16.0f);
       for (int i = 2; i < 34; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
-    } else {  // Q4_K
+    } else if (enc == vt::DType::kQ4_K) {
       put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
       put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
       for (int i = 4; i < 144; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    } else if (enc == vt::DType::kQ5_K) {
+      // block_q5_k: f16 d, f16 dmin, u8 scales[12], qh[32], ql[128]. All
+      // payload bytes are integers the decode reads exactly; only the two
+      // f16 scales need finite values.
+      put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+      put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+      for (int i = 4; i < 176; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    } else {  // Q6_K
+      // block_q6_k: ql[128], qh[64], i8 scales[16], f16 d. Same reasoning.
+      for (int i = 0; i < 208; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+      put_f16(208, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
     }
   };
 
-  // THE ADMITTED ARMS: one call each, E=2 tower, both encodings. Only
+  // THE ADMITTED ARMS: one call each, E=2 tower, all four encodings. Only
   // reachability is pinned here — the numerics have their own sweep below.
-  for (const vt::DType enc : {vt::DType::kQ4_K, vt::DType::kQ8_0}) {
+  for (const vt::DType enc :
+       {vt::DType::kQ4_K, vt::DType::kQ5_K, vt::DType::kQ6_K,
+        vt::DType::kQ8_0}) {
     const int64_t kBlockBytes = vt::BlockBytes(enc);
     const int64_t kBlockElems = vt::BlockElems(enc);
     constexpr int64_t kE = 2, kN = 8, kP = 3;
@@ -5844,11 +5857,10 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q8_0} and refuses 
                   " must answer on the TENSTORRENT grouped arm, threw: ", what);
   }
 
-  // THE REFUSE SIDE: Q5_K / Q6_K (the owed grouped extension) and kQ4_0 (no
-  // TT arm anywhere) must throw naming THEMSELVES and the registered set —
-  // never fall through to a misread, never silently widen.
-  for (const vt::DType enc : {vt::DType::kQ5_K, vt::DType::kQ6_K,
-                              vt::DType::kQ4_0}) {
+  // THE REFUSE SIDE: kQ4_0 (no TT arm anywhere) must throw naming ITSELF and
+  // the four-encoding registered set — never fall through to a misread, never
+  // silently widen past the set.
+  for (const vt::DType enc : {vt::DType::kQ4_0}) {
     const int64_t kBlockBytes = vt::BlockBytes(enc);
     const int64_t kBlockElems = vt::BlockElems(enc);
     constexpr int64_t kE = 2, kN = 8, kP = 3;
@@ -5888,7 +5900,7 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q8_0} and refuses 
     CHECK_MESSAGE(what.find(enc_name) != std::string::npos,
                   "the refusal must name the encoding (", enc_name,
                   "), got: ", what);
-    CHECK_MESSAGE(what.find("kQ4_K/kQ8_0") != std::string::npos,
+    CHECK_MESSAGE(what.find("kQ4_K/kQ5_K/kQ6_K/kQ8_0") != std::string::npos,
                   "the refusal must name the registered set, got: ", what);
   }
 }
@@ -5897,7 +5909,7 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped registers {Q4_K,Q8_0} and refuses 
 // grouped provider (cpu_quant_gemm.cpp MatmulBTQuantGroupedKernel — the SAME
 // kMatmulBTQuant integer-dot core once per group) across shapes sweeping P, N,
 // K, E: the E=1 dense arm (ids all zero), the E=N expert tower arm, P=1, a
-// broadcast activation ([1,K]), a non-tile-multiple N, both registered
+// broadcast activation ([1,K]), a non-tile-multiple N, all four registered
 // encodings, and a 27B-mirroring slice (K = the Qwen3.8-27B hidden_size,
 // N a production-like per-group intermediate). The bar is the W2-ratified
 // analytic operand-rounding envelope — bf16-round-once both operands, f32
@@ -5932,10 +5944,21 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped matches the CPU grouped provider i
     if (enc == vt::DType::kQ8_0) {
       put_f16(0, 0.1f + 0.2f * static_cast<float>(rng() % 16) / 16.0f);
       for (int i = 2; i < 34; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
-    } else {  // Q4_K
+    } else if (enc == vt::DType::kQ4_K) {
       put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
       put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
       for (int i = 4; i < 144; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    } else if (enc == vt::DType::kQ5_K) {
+      // block_q5_k: f16 d, f16 dmin, u8 scales[12], qh[32], ql[128]. The
+      // payload bytes are integers the decode reads exactly; only the two
+      // f16 scales need finite values.
+      put_f16(0, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+      put_f16(2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+      for (int i = 4; i < 176; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+    } else {  // Q6_K
+      // block_q6_k: ql[128], qh[64], i8 scales[16], f16 d. Same reasoning.
+      for (int i = 0; i < 208; ++i) blk[i] = static_cast<uint8_t>(rng() & 0xFF);
+      put_f16(208, 0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
     }
   };
 
@@ -5953,6 +5976,26 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped matches the CPU grouped provider i
       {4, 33, 1, 4, -1, vt::DType::kQ8_0, "Q8_0, non-tile N=33"},
       {2, 1024, 20, 1, -1, vt::DType::kQ4_K,
        "27B mirror: K=5120 (Qwen3.8-27B hidden_size), N=1024 per-group slice"},
+      // W4a wave-2b: the Q5_K/Q6_K grouped extension. No ROCm grouped
+      // reference exists for Q5_K (rocm_grouped_gemm.hip admits
+      // Q8_0/Q4_K/Q6_K); the decode is the W3 dense chain, bit-exact vs
+      // vt::cpu::BlockToFloat — the same numerics authority for both arms.
+      {3, 8, 1, 1, -1, vt::DType::kQ5_K, "Q5_K E=1 dense arm, ids all zero"},
+      {4, 8, 2, 4, -1, vt::DType::kQ5_K,
+       "Q5_K E=N expert tower arm, permuted ids"},
+      {4, 33, 1, 4, 1, vt::DType::kQ5_K,
+       "Q5_K broadcast [1,K] act, non-tile N=33"},
+      {2, 1024, 20, 1, -1, vt::DType::kQ5_K,
+       "Q5_K 27B mirror: K=5120, N=1024 per-group slice (the 27B pin carries "
+       "48 Q5_K tensors)"},
+      {3, 8, 1, 1, -1, vt::DType::kQ6_K, "Q6_K E=1 dense arm, ids all zero"},
+      {4, 8, 2, 4, -1, vt::DType::kQ6_K,
+       "Q6_K E=N expert tower arm, permuted ids"},
+      {4, 33, 1, 4, 1, vt::DType::kQ6_K,
+       "Q6_K broadcast [1,K] act, non-tile N=33"},
+      {2, 1024, 20, 1, -1, vt::DType::kQ6_K,
+       "Q6_K 27B mirror: K=5120, N=1024 per-group slice (the 27B pin carries "
+       "67 Q6_K tensors)"},
   };
   for (const Shape& s : shapes) {
     const int64_t kBlockBytes = vt::BlockBytes(s.enc);
@@ -6129,6 +6172,92 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuantGrouped matches the CPU grouped provider i
                     "slice-decode bit-exact: p=" << i / kN << " n=" << i % kN
                                                  << " tt=" << tt_out[i]
                                                  << " dequant=" << dequant[i]);
+    }
+  }
+
+  // ---- THE Q5_K/Q6_K SLICE-DECODE BIT-EXACT LEGS (W4a wave-2b) ----
+  // The Q8_0 leg above pins slice selection on a bf16-exact grid. These two
+  // pin the W3 dense chains — the only Q5_K/Q6_K decode there is: the ROCm
+  // grouped kernel has no Q5_K arm to mirror, so the decode derives from the
+  // W3 chain and its bit-exactness vs vt::cpu::BlockToFloat — through the
+  // SLICE path: with one-hot activations the grouped output is exactly
+  // bf16(decode(selected row, col)), and decode is W3-pinned bit-exact vs
+  // BlockToFloat, so the expected bits are bf16(BlockToFloat) at the routed
+  // element. A slice-selection or staging defect (wrong expert row-range,
+  // word-lane misindex, a read past the 210-byte block into the pad) lands on
+  // a different value and cannot hide.
+  for (const vt::DType enc : {vt::DType::kQ5_K, vt::DType::kQ6_K}) {
+    constexpr int64_t kE = 3, kN = 8, kP = 5, kNb = 1;
+    const int64_t elems = vt::BlockElems(enc);  // 256 per K-quant block
+    const int64_t bb = vt::BlockBytes(enc);     // 176 (Q5_K) / 210 (Q6_K)
+    const int64_t K = kNb * elems;
+    std::mt19937 rng(static_cast<uint32_t>(20260913u));
+    std::vector<uint8_t> packed(kE * kN * kNb * bb);
+    for (int64_t b = 0; b < kE * kN * kNb; ++b) {
+      uint8_t* blk = packed.data() + b * bb;
+      fill_block(blk, enc, rng);
+      if (enc == vt::DType::kQ6_K) {
+        // Q6_K dequant y = (d*sc)*(q-32): a NEGATIVE or zero scale meeting a
+        // zero q makes the true dequant -0, which any dot then flattens to
+        // +0 in the f32 accumulate (IEEE (+0)+(-0) = +0) — the DECODE keeps
+        // the -0 (the W3 pin, or_sign repair at the Q6_K arm), but a matmul
+        // cannot carry it through a sum. The bit-exact leg, exactly like the
+        // Q8_0 leg above, therefore constrains its data to the -0-free
+        // class: strictly positive scales make sign(y) = sign(q-32) with
+        // q = 32 giving +0.
+        for (int i = 192; i < 208; ++i)
+          blk[i] = static_cast<uint8_t>(1 + rng() % 127);
+      }
+    }
+    // One-hot activations with repeated, non-ascending ids — every selected
+    // slice exercised independently, exactly as the Q8_0 leg above.
+    std::vector<uint16_t> a_bf(kP * K, 0u);
+    for (int64_t p = 0; p < kP; ++p) a_bf[p * K + (p % K)] = vt::F32ToBF16(1.0f);
+    std::vector<int32_t> ids = {2, 0, 2, 1, 0};
+
+    // The decode oracle: BlockToFloat over the IDENTICAL bytes (the W3 bit
+    // authority), then the ONE bf16 RNE the device applies after the slice
+    // decode. Every payload is an exact f32 integer product under finite
+    // positive scales, so no -0/NaN ambiguity survives the chain.
+    std::vector<float> w_f32(kE * kN * K);
+    vt::cpu::BlockToFloat(enc)(packed.data(), w_f32.data(), kE * kN * K);
+    std::vector<float> dequant(kP * kN);
+    for (int64_t p = 0; p < kP; ++p)
+      for (int64_t n = 0; n < kN; ++n)
+        dequant[p * kN + n] = w_f32[(ids[p] * kN + n) * K + (p % K)];
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_w = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(kP * kN * sizeof(float));
+    void* mem_i = backend.Alloc(ids.size() * sizeof(int32_t));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_w, packed.data(), packed.size());
+    backend.Copy(q, mem_i, ids.data(), ids.size() * sizeof(int32_t));
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, K});
+    Tensor w_t = Tensor::Contiguous(mem_w, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kE * kN, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP, kN});
+    Tensor i_t = Tensor::Contiguous(mem_i, vt::DType::kI32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kP});
+    vt::MatmulBTQuantGrouped(q, o_t, a_t, w_t, i_t);
+    std::vector<float> tt_out(kP * kN, 0.0f);
+    backend.Copy(q, tt_out.data(), mem_o, tt_out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_w);
+    backend.Free(mem_o);
+    backend.Free(mem_i);
+    for (int64_t i = 0; i < kP * kN; ++i) {
+      const uint16_t got_bf = vt::F32ToBF16(tt_out[i]);
+      const uint16_t want_bf = vt::F32ToBF16(dequant[i]);
+      const std::string msg = std::string("slice-decode bit-exact (") +
+                              vt::Name(enc) + "): p=" +
+                              std::to_string(i / kN) + " n=" +
+                              std::to_string(i % kN) + " tt=" +
+                              std::to_string(tt_out[i]) + " dequant=" +
+                              std::to_string(dequant[i]);
+      CHECK_MESSAGE(got_bf == want_bf, msg);
     }
   }
 }

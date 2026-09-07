@@ -2528,10 +2528,15 @@ void MatmulBTQuantKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) 
 // structure (cpu_quant_gemm.cpp, the comparison oracle) with the decode
 // on-core. The whole tower is NEVER decoded; no twin is built.
 //
-// REGISTERED SET: exactly {Q4_K, Q8_0} on kTENSTORRENT. Q5_K/Q6_K refuse BY
-// NAME (the owed grouped extension — the 27B pin carries 48 Q5_K tensors;
-// recorded under the spec's W4 plan); any other encoding refuses the same
-// way. Never a silent wrong answer — the ROCm refusal precedent.
+// REGISTERED SET: exactly {Q4_K, Q5_K, Q6_K, Q8_0} on kTENSTORRENT (W4a
+// wave-2b widened the wave-2 pair: the 27B pin carries 67 Q6_K + 48 Q5_K
+// tensors, so the tower is not servable without them). The two K-quant
+// decodes are the W3 dense chains verbatim, run on the selected word slice —
+// Q6_K mirrors the ROCm grouped kernel's native dequant
+// (rocm_grouped_gemm.hip:1456), and Q5_K has NO ROCm grouped reference (the
+// ROCm set is Q8_0/Q4_K/Q6_K), so its decode derives from the W3 dense Q5_K
+// chain, bit-exact vs vt::cpu::BlockToFloat. Any other encoding refuses BY
+// NAME. Never a silent wrong answer — the ROCm refusal precedent.
 //
 // NOT capture-safe yet, and staged UNREACHED: the per-call EnsureHost of the
 // routing ids and the per-group decode writes are eager-path constructs;
@@ -2552,11 +2557,12 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
   const std::string enc_name =
       std::string("k") + static_cast<char>(enc_lower[0] - 'a' + 'A') +
       enc_lower.substr(1);
-  VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ8_0,
+  VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ5_K ||
+               enc == DType::kQ6_K || enc == DType::kQ8_0,
            std::string("tenstorrent kMatmulBTQuantGrouped: ") + enc_name +
                " has no GROUPED keep-quant decode on TENSTORRENT; the "
-               "registered set is kQ4_K/kQ8_0 (BACKEND-TENSTORRENT-"
-               "KEEPQUANT W4a; the Q5_K/Q6_K grouped extension is owed)");
+               "registered set is kQ4_K/kQ5_K/kQ6_K/kQ8_0 (BACKEND-"
+               "TENSTORRENT-KEEPQUANT W4a)");
   const int64_t elems = BlockElems(enc);
   VT_CHECK(weight.shape[1] % elems == 0,
            std::string("tenstorrent kMatmulBTQuantGrouped: K must be a whole "

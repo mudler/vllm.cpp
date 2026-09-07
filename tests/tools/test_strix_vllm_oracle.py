@@ -89,6 +89,18 @@ class OracleCliTests(unittest.TestCase):
             "triton/backends/nvidia/bin/compiler-tool": b"#!/bin/sh\necho selected-compiler-tool\n",
             metadata + "/METADATA": b"Name: triton\nVersion: 3.8.0\n",
         }
+        if defect == "metadata-name":
+            files[metadata + "/METADATA"] = b"Name: triton-rocm\nVersion: 3.8.0\n"
+        elif defect == "metadata-version":
+            files[metadata + "/METADATA"] = b"Name: triton\nVersion: 3.7.1\n"
+        elif defect == "metadata-missing":
+            del files[metadata + "/METADATA"]
+        elif defect == "compiler-init-missing":
+            del files["triton/__init__.py"]
+        elif defect == "amd-missing":
+            files = {name: data for name, data in files.items() if not name.startswith("triton/backends/amd/")}
+        elif defect == "native-missing":
+            files = {name: data for name, data in files.items() if not name.endswith(".so")}
         records = io.StringIO()
         writer = csv.writer(records)
         for name, data in files.items():
@@ -97,6 +109,10 @@ class OracleCliTests(unittest.TestCase):
                 sha = "A" * 43
             writer.writerow([name, "sha256=" + sha, len(data) + int(defect == "record-size")])
         writer.writerow([metadata + "/RECORD", "", ""])
+        if defect == "record-row":
+            writer.writerow(["malformed"])
+        elif defect == "record-duplicate":
+            writer.writerow([metadata + "/RECORD", "", ""])
         files[metadata + "/RECORD"] = records.getvalue().encode()
         if defect == "unrecorded":
             files["triton/extra.py"] = b"unbound"
@@ -113,6 +129,8 @@ class OracleCliTests(unittest.TestCase):
                     info.create_system = 3
                     info.external_attr = (0o120777 << 16)
                 archive.writestr(info, data)
+                if defect == "duplicate" and name == "triton/__init__.py":
+                    archive.writestr(name, data)
         record = self.artifact("triton-3.8.0-fixture.whl", stream.getvalue())
         self.selected_sha = record["sha256"]
         self.manifest["dependencies"]["selected_triton"] = dict(
@@ -318,11 +336,50 @@ class OracleCliTests(unittest.TestCase):
         for name in ("triton-3.8.0.dist-info", "triton_rocm-3.7.1.dist-info"):
             self.assertEqual((namespace.parent / name / "METADATA").read_bytes(), b"resolver metadata unchanged")
 
+    def test_cli_preserves_controller_visibility_in_children_and_evidence(self):
+        self.fixture()
+        result = self.cli(CUDA_VISIBLE_DEVICES="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.tmp / "out/build-state.json"
+        result = self.cli(phase="run", output="visible-run", state=state, CUDA_VISIBLE_DEVICES="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for output in ("out", "visible-run"):
+            evidence = json.loads((self.tmp / output / "environment.json").read_text())
+            self.assertEqual(evidence.get("CUDA_VISIBLE_DEVICES"), "0")
+        commands = [json.loads(line) for line in (self.tmp / "commands.jsonl").read_text().splitlines()]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertEqual(command["cuda_visible_devices"], "0", command["argv"])
+
+    def test_cli_refuses_other_visibility_values_and_experimental_settings(self):
+        self.fixture()
+        for index, value in enumerate(("", "1", "0,1", "all", " 0", "00")):
+            with self.subTest(value=value):
+                result = self.cli(output=f"visibility-{index}", CUDA_VISIBLE_DEVICES=value)
+                self.assert_refused(result, f"visibility-{index}", "inherited tuning", "venv")
+        for name in ("CUDA_LAUNCH_BLOCKING", "CUDA_DEVICE_ORDER", "HSA_OVERRIDE_GFX_VERSION", "HIP_VISIBLE_DEVICES"):
+            with self.subTest(name=name):
+                result = self.cli(output=name, CUDA_VISIBLE_DEVICES="0", **{name: "0"})
+                self.assert_refused(result, name, "inherited tuning", "venv")
+        result = self.cli(output="wrong-lease", CUDA_VISIBLE_DEVICES="0", RC_DEVICE="other:gpu0")
+        self.assert_refused(result, "wrong-lease", "requires a strix:gpu0 lease", "venv")
+        result = self.cli(output="missing-job", CUDA_VISIBLE_DEVICES="0", RC_JOB_ID="")
+        self.assert_refused(result, "missing-job", "requires a strix:gpu0 lease", "venv")
+
     def test_cli_refuses_unsafe_selected_wheels_before_runtime_import(self):
         self.fixture()
         for defect, diagnostic in (("record-hash", "RECORD hash or size"),
                 ("record-size", "RECORD hash or size"), ("unrecorded", "RECORD coverage"),
-                ("escape", "unsafe"), ("symlink", "unsafe")):
+                ("escape", "unsafe"), ("symlink", "unsafe"),
+                ("metadata-name", "selected Triton wheel metadata mismatch"),
+                ("metadata-version", "selected Triton wheel metadata mismatch"),
+                ("metadata-missing", "selected Triton wheel metadata missing"),
+                ("duplicate", "duplicate selected Triton wheel member"),
+                ("record-row", "invalid selected Triton RECORD"),
+                ("record-duplicate", "invalid selected Triton RECORD"),
+                ("compiler-init-missing", "selected Triton compiler/backend files missing"),
+                ("amd-missing", "selected Triton compiler/backend files missing"),
+                ("native-missing", "selected Triton compiler/backend files missing")):
             with self.subTest(defect=defect):
                 self.selected_compiler(defect)
                 result = self.cli(output=defect)
@@ -358,19 +415,37 @@ class OracleCliTests(unittest.TestCase):
                 elif defect == "mode": native.chmod(0o755)
                 elif defect == "missing": native.unlink()
                 elif defect == "symlink":
+                    donor = self.tmp / "same-native.so"
+                    shutil.copy2(native, donor)
                     native.unlink()
-                    native.symlink_to(Path(proof["quarantine"]) / "resolver.py")
+                    native.symlink_to(donor)
                 else:
                     extra.parent.mkdir(exist_ok=True)
                     extra.write_bytes(b"unbound executable code")
                 try:
                     result = self.cli(phase="run", output=defect, state=state)
-                    self.assert_refused(result, defect, "selected Triton", "run-identity")
+                    diagnostic = "unsafe selected Triton namespace member" if defect == "symlink" else "selected Triton"
+                    self.assert_refused(result, defect, diagnostic, "run-identity")
                 finally:
                     if native.is_symlink(): native.unlink()
                     native.write_bytes(original)
                     native.chmod(proof["modes"]["backends/amd/libtriton_amd.so"])
                     if extra.exists(): extra.unlink()
+
+    def test_cli_refuses_symlinked_compiler_root_before_runtime_import(self):
+        self.fixture()
+        self.selected_compiler()
+        state = self.built()
+        namespace = Path(json.loads(state.read_text())["triton_selection"]["namespace"])
+        relocated = namespace.with_name("same-compiler")
+        namespace.rename(relocated)
+        namespace.symlink_to(relocated, target_is_directory=True)
+        try:
+            result = self.cli(phase="run", output="root-symlink", state=state)
+            self.assert_refused(result, "root-symlink", "unsafe selected Triton namespace", "run-identity")
+        finally:
+            namespace.unlink()
+            relocated.rename(namespace)
 
     def test_cli_refuses_selected_compiler_state_and_import_path_tampering(self):
         self.fixture()
@@ -385,6 +460,38 @@ class OracleCliTests(unittest.TestCase):
         state.write_bytes(original)
         result = self.cli(phase="run", output="compiler-import", state=state, STRIX_TEST_FAIL="outside-triton")
         self.assert_refused(result, "compiler-import", "imported path/version mismatch", "generation")
+
+    def test_cli_refuses_quarantine_outside_owned_root_and_changed_bytes(self):
+        self.fixture()
+        self.selected_compiler()
+        state = self.built()
+        original = state.read_bytes()
+        data = json.loads(original)
+        quarantine = Path(data["triton_selection"]["quarantine"])
+        relocated = self.tmp / "same-quarantine"
+        shutil.copytree(quarantine, relocated, copy_function=shutil.copy2)
+        data["triton_selection"]["quarantine"] = str(relocated)
+        state.write_text(json.dumps(data))
+        with self.subTest(defect="outside"):
+            result = self.cli(phase="run", output="quarantine-outside", state=state)
+            self.assert_refused(result, "quarantine-outside", "selected Triton quarantine mismatch", "run-identity")
+        state.write_bytes(original)
+        retained = quarantine / "resolver.py"
+        retained.write_bytes(b"changed retained bytes")
+        with self.subTest(defect="changed"):
+            result = self.cli(phase="run", output="quarantine-changed", state=state)
+            self.assert_refused(result, "quarantine-changed", "selected Triton quarantine mismatch", "run-identity")
+
+    def test_cli_refuses_compiler_site_outside_venv_without_changing_donor(self):
+        self.fixture()
+        self.selected_compiler()
+        donor = self.tmp / "donor-site/triton"
+        donor.mkdir(parents=True)
+        (donor / "resolver.py").write_bytes(b"untouched donor")
+        result = self.cli(STRIX_TEST_COMPILER_SITE=str(donor.parent))
+        self.assert_refused(result, "out", "selected Triton namespace outside isolated venv", "build-identity")
+        self.assertEqual(sorted(path.name for path in donor.iterdir()), ["resolver.py"])
+        self.assertEqual((donor / "resolver.py").read_bytes(), b"untouched donor")
 
     def test_cli_rechecks_compiler_after_generation_and_tests(self):
         self.fixture()
@@ -569,6 +676,14 @@ class OracleCliTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     data = json.loads(output.read_text())
                     self.assertEqual(len(data["records"]), 6)
+                    # Historical gen_rocm.py at #2740, independent of runtime.py.
+                    self.assertEqual([r["prompt_ids"] for r in data["records"]], [
+                        [760, 6511, 3177, 314, 9338, 369],
+                        [760, 2250, 5839, 7736, 513],
+                        [27336, 85895, 506, 264, 9039, 314],
+                        [760, 5187, 92068, 43687, 55877, 5134, 421],
+                        [623, 220, 16, 24, 21, 24, 11, 12313, 1118, 14428, 383],
+                        [32, 9944, 1324, 369, 264, 5629, 1324]])
                     self.assertTrue(all(len(r["gen_ids"]) == 48 for r in data["records"]))
                     self.assertEqual(data["resolved_config"]["dtype"], "bfloat16")
                     self.assertEqual(len(data["projection_metadata"]), 1)
@@ -702,6 +817,7 @@ with log.open('a') as stream:
                              'pip_target':os.environ.get('PIP_TARGET'),
                              'pip_config':os.environ.get('PIP_CONFIG_FILE'),
                              'dontwritebytecode':os.environ.get('PYTHONDONTWRITEBYTECODE'),
+                             'cuda_visible_devices':os.environ.get('CUDA_VISIBLE_DEVICES'),
                              'python_userbase':os.environ.get('PYTHONUSERBASE')}) + '\n')
 mode = os.environ.get('STRIX_TEST_FAIL', '')
 if mode == 'flood':
@@ -738,7 +854,7 @@ elif args[:2] == ['-m', 'pip']:
             folder=packages/name; folder.mkdir(exist_ok=True)
             (folder/'METADATA').write_bytes(b'resolver metadata unchanged')
 elif args[:4] == ['-I', '-S', '-c', "import sys, sysconfig; print(sysconfig.get_path('purelib', vars={'base': sys.argv[1], 'platbase': sys.argv[1]}))"]:
-    print(pathlib.Path(__file__).parent.parent/'lib/site-packages')
+    print(os.environ.get('STRIX_TEST_COMPILER_SITE', pathlib.Path(__file__).parent.parent/'lib/site-packages'))
 elif '--mode' in args:
     env = pathlib.Path(__file__).parent.parent
     packages = env/'lib/site-packages'

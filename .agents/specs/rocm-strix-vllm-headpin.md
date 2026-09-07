@@ -330,6 +330,37 @@ restore its bytes. This envelope does not advance source pins, waive tests,
 or establish GPU gateability. The worker and runtime changes are limited to
 this envelope and the finite-limit repair; dependency choices remain explicit.
 
+## Launch and review repair evidence
+
+The controller's measured visibility value triggered the blanket `CUDA_`
+refusal before manifest loading. The test-first failure is
+`/tmp/strix3043-repair2-visibility-red.log`. The worker now accepts exactly
+`CUDA_VISIBLE_DEVICES=0` after checking the named lease and job identity.
+Both phases retain this value in their environment evidence and child processes.
+Other visibility values and inherited experimental settings remain refusals.
+
+Fresh review identified nine compiler provenance guards without mutation
+coverage. Valid tiny-wheel fixtures now isolate metadata presence and identity,
+duplicate archive members, malformed or duplicate RECORD rows, and required
+compiler files. Same-byte, same-mode links isolate both namespace link guards.
+The run tests refuse a changed quarantine and quarantine outside owned storage.
+The build test refuses an installation site outside the new environment and
+checks that the donor remains intact. The runtime test binds all six prompt-ID
+lists independently to historical `gen_rocm.py` at #2740.
+
+Original-suite survivor reproductions are retained in
+`/tmp/strix3043-repair2-baseline-*.log`. Scratch mutation programs are
+`/tmp/strix3043-repair2-mutations.py` and
+`/tmp/strix3043-repair2-launch-mutations.py`. Each program asserts byte-for-byte
+restoration after each mutation. Guard removals, broader visibility acceptance,
+lost child visibility, omitted environment evidence, and changed historical IDs
+fail their focused assertions. The focused suite has 42 tests. Final focused
+evidence is `/tmp/strix3043-repair2-focused-final-v2.log`. The immutable-head
+preflight result and argument-dependent skips remain in the implementer handoff.
+
+No runtime production code, compiler packaging contract, source pin, or model
+workload changes in this repair. GPU gateability remains PENDING.
+
 ## Owed
 
 The packed ROCm port follows under its own issue and committed spec after

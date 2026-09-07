@@ -247,7 +247,7 @@ class Session:
             path = self.local / folder
             path.mkdir(exist_ok=True)
             self.env[variable] = str(path)
-        save(output / "environment.json", {k: self.env[k] for k in self.env if k not in os.environ or k in ("RC_DEVICE", "RC_JOB_ID")})
+        save(output / "environment.json", {k: self.env[k] for k in self.env if k not in os.environ or k in ("RC_DEVICE", "RC_JOB_ID", "CUDA_VISIBLE_DEVICES")})
 
     def headroom(self):
         match = re.search(r"^MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text(), re.M)
@@ -576,7 +576,9 @@ def main():
         raise RuntimeError(f"termination signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
-    tuning = sorted(k for k in os.environ if k.startswith(TUNING) or k in INJECTION)
+    tuning = sorted(k for k, value in os.environ.items()
+                    if (k.startswith(TUNING) or k in INJECTION)
+                    and not (k == "CUDA_VISIBLE_DEVICES" and value == "0"))
     if tuning:
         raise ValueError(f"inherited tuning: {tuning}")
     if args.output.exists() or args.output.is_symlink():

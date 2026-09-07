@@ -361,6 +361,43 @@ preflight result and argument-dependent skips remain in the implementer handoff.
 No runtime production code, compiler packaging contract, source pin, or model
 workload changes in this repair. GPU gateability remains PENDING.
 
+## Explicit virtual-environment scheme repair
+
+The developer approved autonomous repair after the namespace diagnosis.
+Lease `4ade5e61-c10a-4e98-8b1b-3da36018dc97` measured Python 3.12 on Strix.
+Normal isolated startup resolves `purelib` through the `venv` scheme.
+Startup with `-I -S` instead selects Ubuntu's `posix_local` scheme.
+Passing `base` and `platbase` does not change that selected scheme.
+The worker therefore checks `venv/local/lib/python3.12/dist-packages/triton`.
+The installed directory is `venv/lib/python3.12/site-packages/triton`.
+An explicit `scheme="venv"` produces the installed path with `-I -S` intact.
+Evidence: `/tmp/strix3043-namespace-diagnosis.log`.
+
+Repair only `Session.compiler_namespace` and its CPU regression coverage.
+Select the `venv` scheme explicitly and retain the supplied environment bases.
+Keep `-I -S`, path ownership checks, and all compiler provenance checks.
+Do not import unverified runtime modules to discover their installation path.
+Do not add fallback directories, bypass symlink checks, or relax wheel checks.
+
+The failing regression must execute the actual emitted Python expression.
+Model a distribution whose default scheme differs from its virtual-environment
+scheme without computing the expected path from the worker under test.
+Exercise the production worker entry point and preserve the existing CLI cases.
+Capture the wrong-path failure before implementation, then focused green.
+Independently remove the explicit scheme and require the regression to fail.
+Mutate loss of `-I`, `-S`, or either supplied base and test the intended guard.
+Restore scratch bytes after every mutation. Run the full preflight on the
+immutable repair head, obtain fresh review, and let the operator repeat gates.
+
+Build attempt `c53f6048-ae96-4097-8ed6-29e8d9118e7f` built vLLM and its
+GGUF plugin, installed dependencies, and passed `pip check` before this failure.
+Its artifacts remain evidence, not a successful build-state certificate.
+This repair adds no resume mode and never fabricates that certificate.
+The operator retains the wheels and can run the repaired worker in a fresh
+environment with verified read-only dependency inputs. Source identity,
+extension targets, compiler provenance, model outputs, and upstream tests
+remain mandatory. Model gateability and performance remain PENDING.
+
 ## Owed
 
 The packed ROCm port follows under its own issue and committed spec after

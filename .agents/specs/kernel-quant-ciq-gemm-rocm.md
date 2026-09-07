@@ -857,7 +857,7 @@ one -- weight-side reuse Shared did not have either.
 Correctness as first reported: `ctest -R rocm|cross_device`, 48/48 cases,
 84084/84084 assertions, zero regression, both configs. **That claim was
 true of the assertions and false of the kernel.** Two review passes have
-since found real defects behind it -- an out-of-bounds device read and a
+since found real defects behind it -- an out-of-range device read and a
 cross-warp race -- neither of which any of those assertions could see. The
 "Review cycle" section below is the current statement of what is verified;
 read it rather than this paragraph.
@@ -889,7 +889,9 @@ default and vs the rejected 8-warp arm:
 Geomean over the same six non-tail shapes the first cut used: **+16.0%**,
 against the first cut's +16.8%. Over all eight including the two ragged
 non-16-aligned tail shapes: **+17.2%**. Against the rejected 8-warp arm:
-+24.3%. The ragged tail shapes did not merely hold, they came in slightly
++24.3% over all eight and +21.9% over the same six -- this line quoted
+the eight-shape figure without saying so until pass 4 asked which geomean
+it was. The ragged tail shapes did not merely hold, they came in slightly
 ahead of the aligned ones, so this is still not an artifact of
 perfectly-aligned synthetic shapes. `q8_0`, an unrelated launch path
 carried through the same runs as a control, is flat (+0.3% to +2.5%).
@@ -927,13 +929,16 @@ artifact. Still default OFF behind `VT_ROCM_QUANT_WMMA_WIDE=1
 VT_ROCM_QUANT_WMMA_BIGTILE=1`; whether to flip the default is a decision
 for after review, not made in this wave.
 
-### Review cycle on #3036 (three passes, nine findings, all repaired)
+### Review cycle on #3036 (four passes, eleven findings, all repaired)
 
-The PR has now been through three independent fresh reviews. The first
+The PR has now been through four independent fresh reviews. The first
 two each found a real defect that every green assertion in this tree was
 structurally incapable of seeing, which is the durable lesson of this
-section. The third found no correctness defect, and three ways this
-record and the code's own comments had drifted from the code.
+section. The third and fourth found no correctness defect, and five more
+ways this record and the code's own comments had drifted from the code.
+Two of those five were drift in a CORRECTION of earlier drift, which is
+this row's own failure mode and the reason each claim below now cites the
+`file:line` it was checked against.
 
 **Pass 1, against head `bc5d494ce` -- verdict FAIL, one HIGH.** An
 out-of-range device read in BigTile's activation staging: for the ragged
@@ -945,18 +950,42 @@ never consumed -- so the whole suite was green with the read in it. Found
 by tracing address arithmetic, not by a crash. Fixed in `35f9400bd`:
 staging clamped to `min(ItGroup*16, (m_tiles - it_base)*16)`.
 
-The original statement of this finding said the read went past the end of
-`EnsureQuantScratch`'s buffer. Pass 3 showed that is true only when the
-pool happens to be exactly sized. The request at the Q8_K dispatch is
+This finding has now been stated three ways, and the third is the one to
+read. Pass 1 said the read went past the end of `EnsureQuantScratch`'s
+buffer. Pass 3 said that holds only when the pool happens to be exactly
+sized, because the request at the Q8_K dispatch is
 `m * nsb * sizeof(BlockQ8_K)` -- `m` rows, and m >= m_tiles*16 strictly
-whenever m % 16 != 0 -- and `vt::GrowOnlyStreamScratch` never shrinks, so
-live capacity is the high-water mark over every prior call on the stream.
-Against a grown pool the unclamped read was therefore a read of stale
-in-pool rows, not an allocation overrun. What was violated in every case
-is the LOGICAL bound: the kernel is defined over m_tiles*16 activation
-rows, and it read beyond them. That is the invariant the clamp restores
-and the invariant the probe below tests, which is why the probe fires
-reliably rather than only when the pool is exactly sized.
+whenever m % 16 != 0 -- and `vt::GrowOnlyStreamScratch` never shrinks
+(`src/vt/grow_only_stream_scratch.h:57-71`), so live capacity is the
+high-water mark over every prior call on the stream. Pass 4 showed that
+correction is itself too narrow in both directions, and the accurate
+statement is this one.
+
+The unclamped loop ran to global row
+`ceil(m_tiles/ItGroup)*ItGroup*16 - 1`, because the dispatch rounds
+`grid_y` UP: `grid_y = (m_tiles + ItGroup - 1) / ItGroup` at both BigTile
+dispatches (`src/vt/rocm/rocm_grouped_gemm.hip:2383-2384` for Q6_K,
+`:2440-2441` for Q4_K), and `it_base = blockIdx.y * ItGroup` (`:885`).
+That is up to `(ItGroup-1)*16` = 32 rows past `m_tiles*16` at the shipped
+`ItGroup=3`. The high-water mark is kept in BYTES, so in rows at a given
+call's `nsb` it reaches that overrun end only when some earlier call on
+the stream asked for that many. An exactly-sized pool never does. A GROWN
+pool need not either: reachable
+through `MatmulBTQuant` on one stream at fixed `nsb`, a prior `m=85` call
+publishes 85 rows, and a later `m=80` call has `m_tiles=5`, `grid_y=2`
+and a maximum `it_base` of 3, so the unclamped read reaches row 95 -- the
+pool had grown, and the read is still 11 rows past the allocation. The
+allocation was therefore overrun in the exactly-sized case AND in every
+insufficiently-grown one; the read was in-pool-but-stale only where
+capacity happened to cover the overrun end.
+
+What was violated in every case is the LOGICAL bound: the kernel is
+defined over `m_tiles*16` activation rows, and it read beyond them. That
+is the invariant the clamp restores and the invariant the probe below
+tests, which is why the probe fires reliably rather than only on some
+pool states. What none of the three statements changes is the
+consequence: the read never corrupted output, because the `it_i` bounds
+check never consumes those rows.
 
 **Pass 2, against head `8b25f30c8` -- five findings, repaired here.**
 
@@ -1077,5 +1106,58 @@ shipping instantiation's resource usage is byte-identical before and
 after (`KQuantGemmKWmmaQ4KBigTile<f32,8,3,false>` 65,216 B, VGPRs and
 occupancy unchanged), so the measurements above stand without a retake.
 Post-repair gate: `ctest -R 'rocm|cross_device'` 8/8, and the focused
+cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
+assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).
+
+**Pass 4, against head `cff373abe` -- no correctness finding, two record
+findings plus a phrasing note, all in the pass-3 repair itself.**
+
+1. **MEDIUM, a superseded figure carried as current.** The handover's
+   "what's NOT done" entry argued for finer K-chunking by the size of
+   "the remaining 6.98x gap". 6.98x is the FIRST CUT's ratio. The same
+   handover section records the re-measurement as 8.89x -> 7.12x, and this
+   spec's real-model table records 7.12x as current. The handover's own
+   line was authored at `bc5d494ce`, when 6.98x was the live number, and
+   the re-measurement commit never came back for it. Now states 7.12x and
+   names 6.98x as superseded.
+
+2. **LOW, the "grown pool" dichotomy was not exhaustive, and understated
+   the overrun.** The pass-3 correction above said the unclamped read was
+   in-pool but stale whenever the pool had grown, and past the allocation
+   only when the pool was exactly sized. Both halves are false, because
+   the two quantities are not commensurable: `GrowOnlyStreamScratch` keeps
+   a BYTE high-water mark of `m * nsb * sizeof(BlockQ8_K)`
+   (`src/vt/grow_only_stream_scratch.h:57-71`), while the unclamped loop
+   reaches global row `ceil(m_tiles/ItGroup)*ItGroup*16 - 1` because
+   `grid_y` rounds UP (`src/vt/rocm/rocm_grouped_gemm.hip:2383-2384`), up
+   to 32 rows past `m_tiles*16` at `ItGroup=3`. A grown pool therefore
+   overruns too whenever it did not grow far enough: at fixed `nsb`, a
+   prior `m=85` call followed by `m=80` reads row 95, 11 rows past an
+   allocation that HAD grown. Restated in the pass-1 paragraph above, in
+   `KQuantGemmKWmmaQ6KBigTile`'s staging comment (the one both BigTile
+   kernels point at), and in the handover's index entry. The consequence
+   is unchanged and was already stated correctly: the read never corrupted
+   output.
+
+3. **Sub-LOW, folded into (2): the phrase pass 3 set out to fix survived
+   in two places.** `cff373abe` reworded the pass-1 defect from
+   "out-of-bounds" to "out-of-range" everywhere except this section's
+   own summary paragraph and the handover's caveat bullet. Both now say
+   out-of-range. The `OobProbe`/"OOB" identifier keeps its spelling,
+   because it names the probe in the code.
+
+Also corrected while in the file, flagged by pass 4 as pre-existing: the
+"+24.3% against the rejected 8-warp arm" above is the eight-shape
+geomean (24.33%), not the six-shape one (21.93%) the two sentences before
+it are about. Both figures are now given and attributed.
+
+**Nothing executable changed in this pass.** It edits comments and
+records only -- no kernel, no dispatch, no `static_assert`, no bound. The
+measurements above stand untouched and were not retaken. The comment-only
+edit is proven non-behavioural: `rocm_grouped_gemm.hip.o` recompiles to
+the identical sha256 with and without it
+(`ad352c053118bcaf81b4bacffebd9044149912946fb22511ea156d5787c14a5c`,
+Release, no `-g`). Post-repair gate, on a rebuilt binary:
+`ctest --test-dir build-hip -R 'rocm|cross_device'` 8/8, and the focused
 cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
 assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).

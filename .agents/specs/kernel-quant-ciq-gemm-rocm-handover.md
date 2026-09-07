@@ -35,26 +35,34 @@ remaining gap, one measured hypothesis at a time.
 |---|---|---|
 | [#3033](https://github.com/mudler/vllm.cpp/pull/3033) | Widen the WMMA block 4→8 warps, alone | **REJECTED**: geomean -4.3% |
 | [#3035](https://github.com/mudler/vllm.cpp/pull/3035) | Spec only: cooperative activation share design | Landed as a spec; its own implementation (below) came back negative |
-| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **three review passes, nine findings, all repaired** |
+| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **four review passes, eleven findings, all repaired** |
 
-**#3036 has been through THREE full review→fix cycles; check `gh pr view
+**#3036 has been through FOUR full review→fix cycles; check `gh pr view
 3036` for anything that has happened since.** The first two reviewers
 (protocol: `.agents/prompts/reviewer.md`, static read plus real mutation
 testing, not just reading the diff) found real defects that the green
-suite was structurally incapable of seeing. The third found no
-correctness defect. The full account, with every number, is the spec's
-`### Review cycle on #3036` section — read that, this is the index entry.
+suite was structurally incapable of seeing. The third and fourth found no
+correctness defect, only drift between this record, the code's comments
+and the code. Twice that drift was inside a CORRECTION of earlier drift.
+The full account, with every number, is the spec's
+`### Review cycle on #3036` section. Read that; this is the index entry.
 
 - **Pass 1, head `bc5d494ce`, verdict FAIL, one HIGH**: an out-of-range
   device read in `BigTile`'s activation staging for the ragged last M-block
   (`m_tiles % ItGroup != 0`, the common case). It never corrupted *output*
   — those rows are never consumed — so every test was green; found by
   tracing address arithmetic. Fixed in `35f9400bd` (staging clamped to
-  `min(ItGroup*16, (m_tiles-it_base)*16)`). Pass 3 corrected the statement
-  of it: what it broke is the LOGICAL bound — the kernel is defined over
-  `m_tiles*16` activation rows — and not the allocation, because the quant
-  scratch holds `m >= m_tiles*16` rows and grows only, so against a grown
-  pool the read was of stale in-pool rows.
+  `min(ItGroup*16, (m_tiles-it_base)*16)`). The STATEMENT of it has since
+  been corrected twice, and pass 4's is the one to read. What it broke in
+  every case is the LOGICAL bound: the kernel is defined over
+  `m_tiles*16` activation rows. Whether it ALSO left the allocation
+  depended on the pool. The unclamped read ran up to `(ItGroup-1)*16` = 32
+  rows past `m_tiles*16`, and the grow-only scratch keeps its high-water
+  mark in BYTES. So the read was past the allocation in the exactly-sized
+  case and in every insufficiently-grown one, and in-pool-but-stale only
+  where capacity happened to cover that overrun. Pass 3's "not the
+  allocation, because the pool had grown" was too narrow. The full
+  statement, with the counterexample, is the spec's pass-1 paragraph.
 - **Pass 2, head `8b25f30c8`, five findings**: a HIGH cross-warp
   write-after-read race on the block-shared `act_stage` (no barrier at the
   end of the `sb` loop, affecting all FOUR cooperative kernels), two
@@ -71,11 +79,21 @@ correctness defect. The full account, with every number, is the spec's
   actually enforces. Repaired without changing kernel behaviour: the only
   executable change is the LDS budget `static_assert`, which now bounds
   the probe instantiation, the tightest one this file emits.
+- **Pass 4, head `cff373abe`, one MEDIUM and one LOW, no correctness
+  finding**: both findings landed on pass 3's own repair. This file still
+  argued the K-chunking case from the superseded 6.98x gap rather than the
+  re-measured 7.12x. Pass 3's replacement for the clamp justification drew
+  a "grown pool means in-pool, exactly-sized means overrun" dichotomy that
+  is false in both directions, which the pass-1 bullet earlier now states
+  correctly. Repaired with no executable change at all.
 
 **If you are picking this up fresh:** `bc5d494ce` has a real OOB read and
 `8b25f30c8` has a real race. The head after pass 2 is the first one no
-review pass has found a defect in — and a third review of *that* has not
-happened, so do not treat it as exhaustively proven.
+review pass has found a correctness defect in, and two further passes
+have since read it without finding one. What those two passes DID find,
+every time, is drift between this record, the kernel comments and the
+kernel. Treat the correctness as reviewed. Re-derive any load-bearing
+sentence here from the code before you rely on it.
 
 ## What's proven, in the order it was learned
 
@@ -157,7 +175,7 @@ happened, so do not treat it as exhaustively proven.
      configurations, via the real (N=128/M=80) tests, not the stale N=48
      ones.
    - **Two caveats this section did not know when it was first written:
-     `bc5d494ce` had a real out-of-bounds read and `8b25f30c8` a real
+     `bc5d494ce` had a real out-of-range read and `8b25f30c8` a real
      cross-warp race, both invisible to every assertion above. See "State
      of the four PRs" up top.**
    - Still default OFF, behind `VT_ROCM_QUANT_WMMA_WIDE=1
@@ -171,7 +189,9 @@ happened, so do not treat it as exhaustively proven.
 only shrank the *reuse width* (`ItGroup`) to fit budget. It never adopted
 llama.cpp's actual lever — staging narrower K-slices (item 5 above) — which
 would shrink BOTH operands' per-load footprint and could afford `ItGroup`
-much closer to llama.cpp's 8, closing more of the remaining 6.98x gap.
+much closer to llama.cpp's 8, closing more of the remaining 7.12x gap.
+7.12x is the re-measured figure recorded earlier in this section. This
+line quoted the superseded first cut's 6.98x until pass 4.
 
 This is a **materially bigger change than BigTile was**: it means
 restructuring `w_stage`/`DequantQ6KGroup16`/`DequantQ4KTile16` (the

@@ -946,9 +946,24 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
     // prior call on this stream. m_tiles*16 <= m <= capacity, so this
     // clamp is conservative against the allocation and exact against the
     // definition, which is why the `OobProbe` below tests it against the
-    // logical row count. Unclamped, the read was in-pool but stale
-    // whenever the pool had grown, and past the allocation only when the
-    // pool happened to be exactly sized.
+    // logical row count.
+    //
+    // Where the UNCLAMPED read reached is a separate question, and it has
+    // its own answer. `grid_y` rounds UP (dispatch below), so the last
+    // block's it_base is (ceil(m_tiles/ItGroup) - 1) * ItGroup and an
+    // unconditional ItGroup*16 copy runs to global row
+    // ceil(m_tiles/ItGroup)*ItGroup*16 - 1 -- up to (ItGroup-1)*16 = 32
+    // rows past m_tiles*16. Whether that also left the ALLOCATION depends
+    // on the high-water mark, which `GrowOnlyStreamScratch` keeps in
+    // BYTES: in rows at THIS call's `nsb` it covers the overrun only when
+    // some earlier call on this stream happened to ask for that many. An
+    // exactly-sized pool never does, and a grown one need not -- a prior
+    // m=85 call at this nsb publishes 85 rows, and a later m=80 call has
+    // m_tiles=5, grid_y=2, max it_base=3 and reads row 95, so the pool had
+    // grown and the read was still 11 rows past it. Past the allocation is
+    // therefore the exactly-sized case AND every insufficiently-grown one;
+    // in-pool-but-stale is only the case where capacity happens to reach
+    // the overrun end.
     //
     // Either way it never corrupted OUTPUT, because the `it_i` bounds
     // check below already skips every row this loop would otherwise not

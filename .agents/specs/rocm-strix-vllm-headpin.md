@@ -234,6 +234,31 @@ worker CLI and a separately tested runtime CLI.
 
 ## Owed
 
+## Review repair: guard coverage and finite limits
+
+Fresh review of `799901422` found ten guards that the complete CPU suite
+did not detect when removed. Add CLI refusal cases for schema, worker/runtime
+state hashes, changed extracted sources, fixed model identity, corruption
+after model copying, missing required assets, imports outside the virtual
+environment, local-state boundaries, copied upstream-test integrity, and
+missing resolved dtype. Assert the specific refusal and absence of later
+commands. Copy-corruption fixtures alter the destination after a real copy;
+they do not substitute a pre-copy checksum failure.
+
+The review also found that nonfinite numeric limits pass the positive-number
+check. JSON accepts NaN and Infinity, and `1e309` parses as infinity. These
+values disable comparisons that enforce deadlines and resource bounds.
+Capture real CLI failures for these values before adding finite-number
+validation. Preserve positive integer and finite fractional limits. Do not
+change defaults, dependency policy, or runtime behavior beyond this guard.
+
+Record original-suite mutation survivors, focused green, and scratch failures
+for every repaired guarantee. Restore scratch bytes after each mutation.
+Run the full preflight on the final immutable head after review findings are
+complete. The operator still owns dependency decisions and hardware execution.
+
+## Remaining work
+
 The packed ROCm port follows under its own issue and committed spec after
 this prerequisite. Its tests must follow current vLLM rather than old CUDA
 goldens. GGUF optimization remains #3016/#3017/#3018. Valid matched profiler

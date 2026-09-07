@@ -266,12 +266,26 @@ complete. The operator still owns dependency decisions and hardware execution.
 
 The operator selected this bounded packaging mechanism for #3043. The manifest
 adds `dependencies.selected_triton`: a hashed wheel record with
-`distribution=triton-rocm` and `version=3.7.1`. Its measured wheel is
-`triton_rocm-3.7.1-cp312-cp312-linux_x86_64.whl`, 311,741,985 bytes, SHA256
-`b200ade2418b8450e4e3e69c33c804e2cc07d1e36dc9678ac8ac1dd65f9e10e1`.
-The archive contains only `triton/` and `triton_rocm-3.7.1.dist-info/`, with
-no symlinks. Optional `expected_versions.triton=3.8.0` binds plain Triton's
-resolver metadata. It does not identify the imported compiler code.
+`distribution=triton` and `version=3.8.0`. Its measured wheel is
+`triton-3.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl`,
+247,972,921 bytes, SHA256
+`e91ffa46d095b252248297292dd22bcbacd53a125a0c2eefbbbf74925a320bc3`.
+The operator verified all 419 signed RECORD entries and 414 namespace files,
+with only `triton/` and `triton-3.8.0.dist-info/` roots and no symlinks.
+`expected_versions.triton=3.8.0` and `triton_runtime=3.8.0` bind the selected
+compiler. `triton-rocm=3.7.1` remains installed resolver metadata only and is
+nonauthoritative for imported compiler bytes.
+
+The initially selected ROCm 3.7.1 wheel (311,741,985 bytes, SHA256
+`b200ade2418b8450e4e3e69c33c804e2cc07d1e36dc9678ac8ac1dd65f9e10e1`)
+fails strict RECORD validation. It contains unrecorded AMD libraries
+`libelf.so`, `libnuma.so`, and `libtinfo.so`, while RECORD names absent
+`libelf.so.1`, `libnuma.so.1`, and `libtinfo.so.6`. Actual versus recorded
+sizes are 114625/109000, 57297/51400, and 194537/187552 bytes, respectively;
+hashes differ too. Reject that wheel rather than renaming files or weakening
+RECORD validation. The operator selected the valid plain 3.8.0 wheel instead;
+this changes the hash-bound input and metadata roles, not the provenance
+mechanism or vLLM source pin.
 
 After runtime dependency installation and successful `pip check`, validate
 the selected wheel hash, metadata, RECORD hashes and sizes, and every archive

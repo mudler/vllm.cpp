@@ -200,8 +200,9 @@ pip/Python installation destinations and pip configuration cannot redirect
 installation into a donor environment. Old packages are not a compatibility
 oracle: operator wheel metadata showed that torchvision 0.29 requires Torch
 2.14, whereas torchvision 0.28 accepts the required Torch 2.13. The operator
-manifest binds the compatible candidate versions, and overlap between plain
-`triton` and `triton-rocm` remains a refusal, not an ignored pip-check error.
+manifest binds the compatible candidate versions. Overlap between plain
+`triton` and `triton-rocm` requires the explicit byte-provenance envelope below;
+without that envelope it remains a refusal, not an ignored pip-check error.
 The current upstream runtime dependency closure is still unmeasured.
 
 The packed-test adaptation copies the pinned file byte-for-byte to an isolated
@@ -260,6 +261,43 @@ Record original-suite mutation survivors, focused green, and scratch failures
 for every repaired guarantee. Restore scratch bytes after each mutation.
 Run the full preflight on the final immutable head after review findings are
 complete. The operator still owns dependency decisions and hardware execution.
+
+## Selected Triton compiler provenance
+
+The operator selected this bounded packaging mechanism for #3043. The manifest
+adds `dependencies.selected_triton`: a hashed wheel record with
+`distribution=triton-rocm` and `version=3.7.1`. Its measured wheel is
+`triton_rocm-3.7.1-cp312-cp312-linux_x86_64.whl`, 311,741,985 bytes, SHA256
+`b200ade2418b8450e4e3e69c33c804e2cc07d1e36dc9678ac8ac1dd65f9e10e1`.
+The archive contains only `triton/` and `triton_rocm-3.7.1.dist-info/`, with
+no symlinks. Optional `expected_versions.triton=3.8.0` binds plain Triton's
+resolver metadata. It does not identify the imported compiler code.
+
+After runtime dependency installation and successful `pip check`, validate
+the selected wheel hash, metadata, RECORD hashes and sizes, and every archive
+path. Reject escaping paths, symlinks, missing records, and unexpected roots.
+Before importing any runtime package, move the resolver-created `triton`
+namespace intact into unique quarantine under the newly owned local build.
+Retain its provenance and populate a fresh namespace only from the selected
+wheel. Do not alter distribution metadata or any donor environment. Run
+`pip check` again after this selection.
+
+Verify every installed compiler file against the wheel, including native
+backend files. Reject missing, changed, additional, or symlinked files;
+generated Python cache files are the only exception. Record the selected
+wheel identity, full namespace inventory, imported module path and version,
+AMD backend/native identities, and both distribution metadata versions.
+Explicitly label nonselected metadata as nonauthoritative for imported bytes.
+Recheck compiler state before run imports and after generation and tests.
+Overlap without this complete proof remains a failure.
+
+Use tiny wheels with valid RECORD metadata in CPU CLI tests. Capture a red
+successful-selection fixture with overlapping metadata before implementation.
+Cover wrong wheel, malformed RECORD, namespace changes, extra files, symlinks,
+wrong import paths, and changed state. Mutate every guarantee in scratch and
+restore its bytes. This envelope does not advance source pins, waive tests,
+or establish GPU gateability. The worker and runtime changes are limited to
+this envelope and the finite-limit repair; dependency choices remain explicit.
 
 ## Owed
 

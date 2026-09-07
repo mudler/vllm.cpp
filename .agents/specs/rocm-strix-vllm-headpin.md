@@ -73,6 +73,14 @@ The worker requires `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`.
 Reject architecture overrides and inherited experimental tuning. Do not
 silently reuse an output directory or a success marker from another run.
 
+The controller supplies `CUDA_VISIBLE_DEVICES=0` on this named lease.
+The operator measured this value in job `33bb569e-d273-4268-a1ea-90445c5cf0c4`.
+Accept exactly this inherited visibility value after validating the lease.
+Preserve it in every child and record it in `environment.json` for both phases.
+Reject every other supplied value and every other inherited `CUDA_` setting.
+The existing `HSA_`, `HIP_`, and other experimental-setting refusals remain.
+An absent visibility variable remains accepted for existing controlled fixtures.
+
 The manifest binds each source archive's revision, SHA256, and path. Verify
 the vLLM archive's git-archive commit marker as well as its hash. Verify the
 plugin archive against its recorded hash. Extract without path traversal or

@@ -2667,6 +2667,10 @@ int KQuantDecodeCoopWarps(vt::DType wdt, int64_t m, int64_t nsb);
 uint64_t KQuantCoopDispatchCount();
 uint64_t KQuantWmmaDispatchCount();
 uint64_t KQuantWmmaQ4KDispatchCount();
+uint64_t KQuantWmmaShareDispatchCount();
+uint64_t KQuantWmmaShareQ4KDispatchCount();
+uint64_t KQuantWmmaBigTileDispatchCount();
+uint64_t KQuantWmmaBigTileQ4KDispatchCount();
 void Q8KQuantizeForTest(vt::Queue& q, void* scratch, const void* act, vt::DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate);
 bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
@@ -3484,6 +3488,207 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
     }
     const uint64_t wmma_after = vt::rocm::KQuantWmmaQ4KDispatchCount();
     CHECK(wmma_after > wmma_before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+// Cooperative-tile arms (issue #3034), gated on VT_ROCM_QUANT_WMMA_BIGTILE /
+// VT_ROCM_QUANT_WMMA_SHARE_ACT (both default off, unproven experiments, not
+// exercised by the shipping default) so this case is a no-op MESSAGE rather
+// than silent when neither is set. N=128 (n_tiles=8) satisfies the
+// n_tiles%WarpsPerBlock==0 precondition BOTH arms need (the existing WMMA
+// tests above use N=48, n_tiles=3, which never satisfies it -- those tests
+// have never actually exercised Shared or BigTile's own code, only their
+// fallback). M=80 (m_tiles=5) is deliberately NOT a multiple of
+// ItGroup=3, so BigTile's ragged last it-group block (2 of 3 iterations
+// valid) is exercised, not just the full blocks. Per-variant dispatch
+// counters (not the generic ones the tests above use, which cannot tell
+// these variants apart from the plain kernel) prove the SPECIFIC kernel
+// under test actually launched.
+TEST_CASE("keep-quant Q6_K WMMA cooperative-tile arms match the CPU oracle") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  const bool bigtile = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE") != nullptr;
+  const bool share = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT") != nullptr;
+  if (!bigtile && !share) {
+    MESSAGE("neither VT_ROCM_QUANT_WMMA_BIGTILE nor _SHARE_ACT set; "
+            "cooperative-tile arms not exercised this run");
+    return;
+  }
+
+  constexpr int64_t M = 80, N = 128, K = 512;
+  constexpr int64_t kBlockBytes = 210;  // sizeof(BlockQ6_K)
+  constexpr int kDOff = 208;
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(3034);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      const uint16_t h = vt::F32ToF16(0.0125f * jitter);
+      std::memcpy(blk + kDOff, &h, 2);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 3035, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ6_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ6_K, d, {N, K});
+
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t before =
+        bigtile ? vt::rocm::KQuantWmmaBigTileDispatchCount() : vt::rocm::KQuantWmmaShareDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t after =
+        bigtile ? vt::rocm::KQuantWmmaBigTileDispatchCount() : vt::rocm::KQuantWmmaShareDispatchCount();
+    CHECK(after > before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+TEST_CASE("keep-quant Q4_K WMMA cooperative-tile arms match the CPU oracle") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  const bool bigtile = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE") != nullptr;
+  const bool share = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT") != nullptr;
+  if (!bigtile && !share) {
+    MESSAGE("neither VT_ROCM_QUANT_WMMA_BIGTILE nor _SHARE_ACT set; "
+            "cooperative-tile arms not exercised this run");
+    return;
+  }
+
+  constexpr int64_t M = 80, N = 128, K = 512;
+  constexpr int64_t kBlockBytes = 144;  // sizeof(BlockQ4_K)
+  constexpr int kDOff = 0, kDminOff = 2;
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(3036);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      auto put16 = [&](int off, float v) {
+        const uint16_t h = vt::F32ToF16(v);
+        std::memcpy(blk + off, &h, 2);
+      };
+      put16(kDOff, 0.0125f * jitter);
+      put16(kDminOff, 0.0075f * jitter);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 3037, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ4_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ4_K, d, {N, K});
+
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t before = bigtile ? vt::rocm::KQuantWmmaBigTileQ4KDispatchCount()
+                                     : vt::rocm::KQuantWmmaShareQ4KDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t after = bigtile ? vt::rocm::KQuantWmmaBigTileQ4KDispatchCount()
+                                    : vt::rocm::KQuantWmmaShareQ4KDispatchCount();
+    CHECK(after > before);
   }
   rocm.DestroyQueue(q);
 }
